@@ -2870,7 +2870,7 @@ async function createReviewWorkingDirectory(): Promise<string> {
 }
 
 async function removeReviewWorkingDirectory(directory: string): Promise<void> {
-  const base = resolve(tmpdir());
+  const base = await realpath(tmpdir());
   const candidate = resolve(directory);
   const relativePath = relative(base, candidate);
   if (relativePath.length === 0

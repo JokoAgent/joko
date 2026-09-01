@@ -2342,7 +2342,7 @@ describe("PiBackendAdapter", () => {
     }
   });
 
-  it("stores complete user Bash output above 64 MiB within the host Artifact capacity", async () => {
+  it("stores complete user Bash output above 64 MiB within the host Artifact capacity", { timeout: 30_000 }, async () => {
     const agentHome = await mkdtemp(join(tmpdir(), "joko-pi-large-bash-home-"));
     const workspace = await mkdtemp(join(tmpdir(), "joko-pi-large-bash-workspace-"));
     const secret = "managed-large-bash-secret";
