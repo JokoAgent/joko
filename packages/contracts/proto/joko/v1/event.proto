@@ -1,0 +1,565 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+import "joko/v1/common.proto";
+import "joko/v1/interaction.proto";
+import "joko/v1/model.proto";
+import "joko/v1/operation.proto";
+import "joko/v1/pi.proto";
+import "joko/v1/runtime.proto";
+import "joko/v1/review.proto";
+import "joko/v1/settings.proto";
+import "joko/v1/subagent.proto";
+import "joko/v1/tool.proto";
+import "joko/v1/workspace.proto";
+
+message Event {
+  string event_id = 1;
+  EventCursor cursor = 2;
+  EventIdentity identity = 3;
+  google.protobuf.Timestamp occurred_at = 4;
+  ActorRef actor = 5;
+  EventPayload payload = 6;
+  // Optional Pi-only detail. Public projection correctness cannot depend on it.
+  PiEventMetadata pi = 100;
+}
+
+message EventPayload {
+  oneof kind {
+    ProjectionInvalidatedEvent projection_invalidated = 1;
+    ConnectionChangedEvent connection_changed = 2;
+    BackendChangedEvent backend_changed = 3;
+    TargetChangedEvent target_changed = 4;
+    SessionChangedEvent session_changed = 5;
+    RunChangedEvent run_changed = 6;
+    AttemptChangedEvent attempt_changed = 7;
+    QueueItemChangedEvent queue_item_changed = 8;
+    ScheduleChangedEvent schedule_changed = 9;
+    OperationChangedEvent operation_changed = 10;
+    DeviceChangedEvent device_changed = 11;
+    ProviderChangedEvent provider_changed = 12;
+    QueueControlChangedEvent queue_control_changed = 13;
+    WorkspaceChangedEvent workspace_changed = 14;
+    MessageStartedEvent message_started = 20;
+    TextDeltaEvent text_delta = 21;
+    ThinkingDeltaEvent thinking_delta = 22;
+    StatusStreamEvent status_stream = 23;
+    MessageCompletedEvent message_completed = 24;
+    ToolCallStartedEvent tool_call_started = 30;
+    ToolCallUpdatedEvent tool_call_updated = 31;
+    ToolCallCompletedEvent tool_call_completed = 32;
+    ImageProducedEvent image_produced = 33;
+    ArtifactProducedEvent artifact_produced = 34;
+    WorkspaceDiffProducedEvent workspace_diff_produced = 35;
+    InteractionChangedEvent interaction_changed = 40;
+    BackgroundTaskChangedEvent background_task_changed = 41;
+    RetryChangedEvent retry_changed = 42;
+    CompactionChangedEvent compaction_changed = 43;
+    ContextUsageChangedEvent context_usage_changed = 44;
+    NativeSessionChangedEvent native_session_changed = 45;
+    NativeBranchChangedEvent native_branch_changed = 46;
+    RuntimeCommandsChangedEvent runtime_commands_changed = 47;
+    ResourceChangedEvent resource_changed = 48;
+    ExtensionWidgetChangedEvent extension_widget_changed = 49;
+    BrowserChangedEvent browser_changed = 50;
+    BrowserPageChangedEvent browser_page_changed = 51;
+    BrowserActivityEvent browser_activity = 52;
+    ToolProviderChangedEvent tool_provider_changed = 53;
+    McpServerChangedEvent mcp_server_changed = 54;
+    SettingsChangedEvent settings_changed = 55;
+    BrowserTransferChangedEvent browser_transfer_changed = 56;
+    ExtensionStatusChangedEvent extension_status_changed = 57;
+    MessageDeletedEvent message_deleted = 58;
+    SessionResetEvent session_reset = 59;
+    RunDoneEvent run_done = 60;
+    RunAbortedEvent run_aborted = 61;
+    RecoverableErrorEvent recoverable_error = 62;
+    TerminalErrorEvent terminal_error = 63;
+    ReviewRunChangedEvent review_run_changed = 64;
+    SessionAttentionChangedEvent session_attention_changed = 65;
+    SubagentRunChangedEvent subagent_run_changed = 66;
+    SubagentTranscriptAppendedEvent subagent_transcript_appended = 67;
+    ContextRebuiltEvent context_rebuilt = 68;
+    DeviceControlChangedEvent device_control_changed = 69;
+    ExtensionUiEffectEvent extension_ui_effect = 70;
+    RuntimeRecoveryChangedEvent runtime_recovery_changed = 71;
+    HistoryPrunedEvent history_pruned = 72;
+  }
+}
+
+message ProjectionInvalidatedEvent {
+  SnapshotInvalidationReason reason = 1;
+  string scope = 2;
+  Revision minimum_revision = 3;
+}
+
+enum SnapshotInvalidationReason {
+  SNAPSHOT_INVALIDATION_REASON_UNSPECIFIED = 0;
+  SNAPSHOT_INVALIDATION_REASON_EVENT_GAP = 1;
+  SNAPSHOT_INVALIDATION_REASON_CURSOR_EXPIRED = 2;
+  SNAPSHOT_INVALIDATION_REASON_GENERATION_MISMATCH = 3;
+  SNAPSHOT_INVALIDATION_REASON_PROJECTION_REBUILT = 4;
+}
+
+message ConnectionChangedEvent {
+  Connection connection = 1;
+}
+
+message DeviceChangedEvent {
+  Device device = 1;
+}
+
+message DeviceControlChangedEvent {
+  DeviceControlRelation relation = 1;
+}
+
+// Includes authentication, rate-limit and provider/account usage changes so a
+// client can update the Provider panel without an untyped side channel.
+message ProviderChangedEvent {
+  ProviderDescriptor provider = 1;
+}
+
+message BackendChangedEvent {
+  BackendDescriptor backend = 1;
+}
+
+message TargetChangedEvent {
+  Target target = 1;
+}
+
+message SessionChangedEvent {
+  Session session = 1;
+}
+
+message RunChangedEvent {
+  Run run = 1;
+}
+
+message AttemptChangedEvent {
+  Attempt attempt = 1;
+}
+
+message QueueItemChangedEvent {
+  QueueItem queue_item = 1;
+}
+
+message QueueControlChangedEvent {
+  QueueControl queue_control = 1;
+}
+
+message ScheduleChangedEvent {
+  Schedule schedule = 1;
+}
+
+message OperationChangedEvent {
+  Operation operation = 1;
+}
+
+message WorkspaceChangedEvent {
+  WorkspaceDescriptor workspace = 1;
+  Revision entries_revision = 2;
+  repeated WorkspaceEntry upserted_entries = 3;
+  repeated string removed_relative_paths = 4;
+}
+
+enum MessageRole {
+  MESSAGE_ROLE_UNSPECIFIED = 0;
+  MESSAGE_ROLE_USER = 1;
+  MESSAGE_ROLE_ASSISTANT = 2;
+  MESSAGE_ROLE_SYSTEM = 3;
+  MESSAGE_ROLE_TOOL = 4;
+}
+
+enum MessageInputDelivery {
+  MESSAGE_INPUT_DELIVERY_UNSPECIFIED = 0;
+  MESSAGE_INPUT_DELIVERY_PROMPT = 1;
+  MESSAGE_INPUT_DELIVERY_STEER = 2;
+  MESSAGE_INPUT_DELIVERY_FOLLOW_UP = 3;
+  MESSAGE_INPUT_DELIVERY_SCHEDULER = 4;
+}
+
+message MessageStartedEvent {
+  string message_id = 1;
+  string turn_id = 2;
+  MessageRole role = 3;
+  InputContent user_input = 4;
+  // Persisted end-to-end from the accepted SendInput. Only true permits quote
+  // marker parsing/stripping in a client projection.
+  bool quotes_encoded = 5;
+  MessageAutomationOrigin automation_origin = 6;
+  // UNSPECIFIED is reserved for untyped imported native history whose original
+  // accepted-input delivery cannot be proven.
+  MessageInputDelivery input_delivery = 7;
+  NativeMessageIdentity native_identity = 8;
+  // True only for a service-owned continuation. Clients replace this hidden
+  // prompt with the matching RuntimeRecoveryChangedEvent activity row.
+  bool automatic_continuation = 9;
+  string runtime_recovery_id = 10;
+}
+
+enum RuntimeRecoveryState {
+  RUNTIME_RECOVERY_STATE_UNSPECIFIED = 0;
+  RUNTIME_RECOVERY_STATE_WAITING = 1;
+  RUNTIME_RECOVERY_STATE_RUNNING = 2;
+  RUNTIME_RECOVERY_STATE_SUCCEEDED = 3;
+  RUNTIME_RECOVERY_STATE_FAILED = 4;
+  RUNTIME_RECOVERY_STATE_EXHAUSTED = 5;
+  RUNTIME_RECOVERY_STATE_CANCELLED = 6;
+}
+
+message RuntimeRecoveryChangedEvent {
+  string recovery_id = 1;
+  string source_run_id = 2;
+  string continuation_run_id = 3;
+  RuntimeRecoveryState state = 4;
+  uint32 attempt = 5;
+  uint32 maximum_attempts = 6;
+  uint32 session_total = 7;
+  uint32 delay_ms = 8;
+  bool route_changed = 9;
+  ErrorInfo error = 10;
+}
+
+// Opaque Backend-owned message/tree identity. Shared clients may retain this
+// identity for branch navigation but must never interpret its contents.
+message NativeMessageIdentity {
+  string entry_id = 1;
+  string parent_entry_id = 2;
+}
+
+message SessionAttentionChangedEvent {
+  SessionAttention attention = 1;
+}
+
+message MessageAutomationOrigin {
+  string schedule_id = 1;
+  string schedule_name = 2;
+  string run_id = 3;
+}
+
+message ReviewRunChangedEvent {
+  ReviewRun review_run = 1;
+}
+
+message TextDeltaEvent {
+  string message_id = 1;
+  uint32 content_index = 2;
+  string delta = 3;
+}
+
+message ThinkingDeltaEvent {
+  string message_id = 1;
+  uint32 content_index = 2;
+  string delta = 3;
+  bool hidden = 4;
+}
+
+message StatusStreamEvent {
+  string status_id = 1;
+  string label = 2;
+  string detail = 3;
+  double progress_ratio = 4;
+  bool terminal = 5;
+}
+
+message MessageCompletedEvent {
+  string message_id = 1;
+  string turn_id = 2;
+  MessageRole role = 3;
+  Usage usage = 4;
+  string stop_reason = 5;
+  // Generation-only time for this assistant message. This must never contain
+  // turn wall-clock time because tool execution and user waits would corrupt TPS.
+  optional uint64 generation_duration_ms = 6;
+  // Explicit false means the producer observed usage but could not prove a
+  // compatible generation-only duration. Absence is reserved for untyped
+  // imported native history.
+  optional bool generation_reliable = 7;
+  NativeMessageIdentity native_identity = 8;
+  // Authoritative, Backend-neutral final message content. Stream deltas are
+  // transient hints only; clients reconcile them against these ordered blocks.
+  repeated MessageBlock blocks = 9;
+}
+
+message MessageBlock {
+  oneof content {
+    string text = 1;
+    MessageThinkingBlock thinking = 2;
+    ImageRef image = 3;
+    MessageArtifactBlock artifact = 4;
+    MessageToolCallBlock tool_call = 5;
+    MessageToolResultBlock tool_result = 6;
+  }
+}
+
+message MessageThinkingBlock {
+  string text = 1;
+  bool redacted = 2;
+}
+
+message MessageArtifactBlock {
+  BlobRef blob = 1;
+  string label = 2;
+}
+
+message MessageToolCallBlock {
+  string call_id = 1;
+  string name = 2;
+  string input = 3;
+}
+
+message MessageToolResultBlock {
+  string call_id = 1;
+  string output = 2;
+  bool is_error = 3;
+}
+
+enum ExtensionUiEffectKind {
+  EXTENSION_UI_EFFECT_KIND_UNSPECIFIED = 0;
+  EXTENSION_UI_EFFECT_KIND_NOTIFICATION = 1;
+  EXTENSION_UI_EFFECT_KIND_TITLE = 2;
+  EXTENSION_UI_EFFECT_KIND_EDITOR_TEXT = 3;
+}
+
+enum ExtensionNotificationKind {
+  EXTENSION_NOTIFICATION_KIND_UNSPECIFIED = 0;
+  EXTENSION_NOTIFICATION_KIND_INFO = 1;
+  EXTENSION_NOTIFICATION_KIND_WARNING = 2;
+  EXTENSION_NOTIFICATION_KIND_ERROR = 3;
+}
+
+// One-shot, already-redacted UI effect emitted by any capable Backend. Native
+// request IDs and extension details remain in the owning Adapter namespace.
+message ExtensionUiEffectEvent {
+  ExtensionUiEffectKind kind = 1;
+  string text = 2;
+  ExtensionNotificationKind notification_kind = 3;
+}
+
+message ToolCallStartedEvent {
+  ToolCall tool_call = 1;
+}
+
+enum ToolCallOutputMode {
+  TOOL_CALL_OUTPUT_MODE_UNSPECIFIED = 0;
+  TOOL_CALL_OUTPUT_MODE_APPEND = 1;
+  TOOL_CALL_OUTPUT_MODE_REPLACE = 2;
+}
+
+message ToolCallUpdatedEvent {
+  ToolCall tool_call = 1;
+  ToolResult incremental_result = 2;
+  // Only APPEND treats incremental_result text as a delta. REPLACE and
+  // UNSPECIFIED make this update's text authoritative.
+  ToolCallOutputMode output_mode = 3;
+}
+
+message ToolCallCompletedEvent {
+  ToolCall tool_call = 1;
+}
+
+message ImageProducedEvent {
+  string message_id = 1;
+  ImageRef image = 2;
+}
+
+message ArtifactProducedEvent {
+  Artifact artifact = 1;
+}
+
+message WorkspaceDiffProducedEvent {
+  string turn_id = 1;
+  WorkspaceChangeSet change_set = 2;
+  WorkspaceDiff diff = 3;
+  // Resulting workspace/Git projection plus an entry-tree delta. These fields
+  // let Web apply the event directly; removals are explicit because an absent
+  // WorkspaceEntry cannot distinguish deletion from an omitted delta.
+  WorkspaceDescriptor workspace = 4;
+  Revision entries_revision = 5;
+  repeated WorkspaceEntry upserted_entries = 6;
+  repeated string removed_relative_paths = 7;
+}
+
+message InteractionChangedEvent {
+  Interaction interaction = 1;
+}
+
+message BackgroundTaskChangedEvent {
+  BackgroundTask background_task = 1;
+}
+
+message SubagentRunChangedEvent {
+  SubagentRunDetail run = 1;
+}
+
+message SubagentTranscriptAppendedEvent {
+  string subagent_run_id = 1;
+  SubagentTranscriptEntry entry = 2;
+}
+
+message ExtensionWidgetChangedEvent {
+  ExtensionWidget widget = 1;
+}
+
+message ExtensionStatusChangedEvent {
+  ExtensionStatus status = 1;
+}
+
+enum RetryState {
+  RETRY_STATE_UNSPECIFIED = 0;
+  RETRY_STATE_WAITING = 1;
+  RETRY_STATE_STARTED = 2;
+  RETRY_STATE_ABORTED = 3;
+  RETRY_STATE_SUCCEEDED = 4;
+  RETRY_STATE_EXHAUSTED = 5;
+}
+
+message RetryChangedEvent {
+  string run_id = 1;
+  string attempt_id = 2;
+  RetryState state = 3;
+  uint32 attempt_number = 4;
+  google.protobuf.Timestamp retry_at = 5;
+  ErrorInfo error = 6;
+  optional uint32 max_attempts = 7;
+}
+
+enum CompactionState {
+  COMPACTION_STATE_UNSPECIFIED = 0;
+  COMPACTION_STATE_STARTED = 1;
+  COMPACTION_STATE_COMPLETED = 2;
+  COMPACTION_STATE_NO_OP = 3;
+  COMPACTION_STATE_ABORTED = 4;
+  COMPACTION_STATE_FAILED = 5;
+}
+
+message CompactionChangedEvent {
+  string compaction_id = 1;
+  CompactionState state = 2;
+  string boundary_id = 3;
+  uint64 tokens_before = 4;
+  uint64 tokens_after = 5;
+  bool automatic = 6;
+  ErrorInfo error = 7;
+  // Native trigger reason when known (for Pi: manual, threshold, or overflow).
+  string reason = 8;
+  // Whether the interrupted agent lifecycle continues after compaction.
+  optional bool will_retry = 9;
+}
+
+message ContextUsageChangedEvent {
+  ContextUsage context = 1;
+}
+
+enum ContextRebuildReason {
+  CONTEXT_REBUILD_REASON_UNSPECIFIED = 0;
+  CONTEXT_REBUILD_REASON_CONTEXT_OVERFLOW = 1;
+  CONTEXT_REBUILD_REASON_PROMPT_TIMEOUT = 2;
+}
+
+// Hidden same-Backend boundary. `handoff` is the exact redacted text injected
+// into the fresh native context and is projected as a system timeline card.
+message ContextRebuiltEvent {
+  string product_session_id = 1;
+  ContextRebuildReason reason = 2;
+  string handoff = 3;
+  string source_run_id = 4;
+  bool replay_scheduled = 5;
+}
+
+message NativeSessionChangedEvent {
+  string product_session_id = 1;
+  string previous_opaque_native_reference = 2;
+  string opaque_native_reference = 3;
+  NativeSessionChangeKind change = 4;
+}
+
+message MessageDeletedEvent {
+  string product_session_id = 1;
+  string requested_event_id = 2;
+  repeated string deleted_event_ids = 3;
+}
+
+message SessionResetEvent {
+  string product_session_id = 1;
+}
+
+message HistoryPrunedEvent {
+  string product_session_id = 1;
+  bool active_context_reset = 2;
+}
+
+enum NativeSessionChangeKind {
+  NATIVE_SESSION_CHANGE_KIND_UNSPECIFIED = 0;
+  NATIVE_SESSION_CHANGE_KIND_CREATED = 1;
+  NATIVE_SESSION_CHANGE_KIND_RESUMED = 2;
+  NATIVE_SESSION_CHANGE_KIND_SWITCHED = 3;
+  NATIVE_SESSION_CHANGE_KIND_DETACHED = 4;
+  NATIVE_SESSION_CHANGE_KIND_CLOSED = 5;
+  NATIVE_SESSION_CHANGE_KIND_FORKED = 6;
+  NATIVE_SESSION_CHANGE_KIND_CLONED = 7;
+}
+
+message NativeBranchChangedEvent {
+  string product_session_id = 1;
+  string previous_entry_id = 2;
+  string active_entry_id = 3;
+  NativeSessionTree tree = 4;
+  bool timeline_rebuilt = 5;
+}
+
+message RuntimeCommandsChangedEvent {
+  repeated RuntimeCommand commands = 1;
+}
+
+message ResourceChangedEvent {
+  ManagedResource resource = 1;
+}
+
+message BrowserChangedEvent {
+  BrowserProvider browser = 1;
+}
+
+message BrowserPageChangedEvent {
+  BrowserPage page = 1;
+}
+
+message BrowserActivityEvent {
+  BrowserActivity activity = 1;
+}
+
+message ToolProviderChangedEvent {
+  ToolProviderDescriptor provider = 1;
+}
+
+message McpServerChangedEvent {
+  McpServerDescriptor server = 1;
+}
+
+message SettingsChangedEvent {
+  SettingsSnapshot settings = 1;
+}
+
+message BrowserTransferChangedEvent {
+  BrowserTransfer transfer = 1;
+}
+
+message RunDoneEvent {
+  string run_id = 1;
+  Usage usage = 2;
+}
+
+message RunAbortedEvent {
+  string run_id = 1;
+  string reason = 2;
+}
+
+message RecoverableErrorEvent {
+  ErrorInfo error = 1;
+}
+
+message TerminalErrorEvent {
+  ErrorInfo error = 1;
+}

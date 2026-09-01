@@ -1,0 +1,293 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+import "joko/v1/capability.proto";
+import "joko/v1/common.proto";
+
+// Authenticated, owner-bound Remote Host catalog and connection control.
+// The owner identity is derived from the service context and is intentionally
+// absent from every request so a client cannot select another owner's scope.
+service RemoteHostService {
+  rpc GetRemoteHostCapabilities(GetRemoteHostCapabilitiesRequest) returns (GetRemoteHostCapabilitiesResponse);
+  rpc ListRemoteHosts(ListRemoteHostsRequest) returns (ListRemoteHostsResponse);
+  rpc GetRemoteHost(GetRemoteHostRequest) returns (GetRemoteHostResponse);
+  // Emits one authoritative initial catalog snapshot, then ordered changes for
+  // this authenticated owner and exact target until the stream ends.
+  rpc WatchRemoteHosts(WatchRemoteHostsRequest) returns (stream WatchRemoteHostsResponse);
+  rpc RefreshRemoteHostCatalog(RefreshRemoteHostCatalogRequest) returns (RefreshRemoteHostCatalogResponse);
+  rpc CreateRemoteHost(CreateRemoteHostRequest) returns (CreateRemoteHostResponse);
+  rpc UpdateRemoteHost(UpdateRemoteHostRequest) returns (UpdateRemoteHostResponse);
+  rpc DeleteRemoteHost(DeleteRemoteHostRequest) returns (DeleteRemoteHostResponse);
+  rpc ConnectRemoteHost(ConnectRemoteHostRequest) returns (ConnectRemoteHostResponse);
+  rpc DisconnectRemoteHost(DisconnectRemoteHostRequest) returns (DisconnectRemoteHostResponse);
+  rpc TestRemoteHostConnection(TestRemoteHostConnectionRequest) returns (TestRemoteHostConnectionResponse);
+  rpc ClearRemoteHostTrust(ClearRemoteHostTrustRequest) returns (ClearRemoteHostTrustResponse);
+}
+
+// Catalog and management remain usable when a connector is unavailable. This
+// closed descriptor lets clients gate each public behavior independently.
+enum RemoteHostCapabilityKind {
+  REMOTE_HOST_CAPABILITY_KIND_UNSPECIFIED = 0;
+  REMOTE_HOST_CAPABILITY_KIND_CATALOG = 1;
+  REMOTE_HOST_CAPABILITY_KIND_MANAGEMENT = 2;
+  REMOTE_HOST_CAPABILITY_KIND_CONNECTION_CONTROL = 3;
+  REMOTE_HOST_CAPABILITY_KIND_CONNECTION_TEST = 4;
+  REMOTE_HOST_CAPABILITY_KIND_TRUST_RESET = 5;
+  REMOTE_HOST_CAPABILITY_KIND_COMMAND_EXECUTION = 6;
+  REMOTE_HOST_CAPABILITY_KIND_PROCESS_STREAMING = 7;
+  REMOTE_HOST_CAPABILITY_KIND_FILE_TRANSFER = 8;
+  REMOTE_HOST_CAPABILITY_KIND_TCP_FORWARDING = 9;
+}
+
+message RemoteHostCapabilityDescriptor {
+  RemoteHostCapabilityKind kind = 1;
+  string name = 2;
+  CapabilitySupport support = 3;
+}
+
+enum RemoteHostSource {
+  REMOTE_HOST_SOURCE_UNSPECIFIED = 0;
+  REMOTE_HOST_SOURCE_MANUAL = 1;
+  REMOTE_HOST_SOURCE_SSH_CONFIG = 2;
+}
+
+enum RemoteHostAuthenticationMode {
+  REMOTE_HOST_AUTHENTICATION_MODE_UNSPECIFIED = 0;
+  // Uses only the service-owned agent endpoint; no endpoint path crosses this contract.
+  REMOTE_HOST_AUTHENTICATION_MODE_SYSTEM_AGENT = 1;
+  // Resolves credential_reference_id only inside the authenticated Orchestrator runtime.
+  REMOTE_HOST_AUTHENTICATION_MODE_PRIVATE_KEY = 2;
+}
+
+enum RemoteHostStatus {
+  REMOTE_HOST_STATUS_UNSPECIFIED = 0;
+  REMOTE_HOST_STATUS_DISCONNECTED = 1;
+  REMOTE_HOST_STATUS_CONNECTING = 2;
+  REMOTE_HOST_STATUS_AUTHENTICATING = 3;
+  REMOTE_HOST_STATUS_READY = 4;
+  REMOTE_HOST_STATUS_FAILED = 5;
+}
+
+// Closed, content-free failure taxonomy. Retryability is derived by the
+// service from this code; connector text and diagnostics are not representable.
+enum RemoteHostFailureCode {
+  REMOTE_HOST_FAILURE_CODE_UNSPECIFIED = 0;
+  REMOTE_HOST_FAILURE_CODE_ABORTED = 1;
+  REMOTE_HOST_FAILURE_CODE_AUTHENTICATION_FAILED = 2;
+  REMOTE_HOST_FAILURE_CODE_CONNECTION_FAILED = 3;
+  REMOTE_HOST_FAILURE_CODE_CONNECTION_TIMEOUT = 4;
+  REMOTE_HOST_FAILURE_CODE_CONNECTOR_PROTOCOL = 5;
+  REMOTE_HOST_FAILURE_CODE_CONNECTOR_UNAVAILABLE = 6;
+  REMOTE_HOST_FAILURE_CODE_HOST_KEY_CHANGED = 7;
+  REMOTE_HOST_FAILURE_CODE_HOST_KEY_CONFLICT = 8;
+  REMOTE_HOST_FAILURE_CODE_HOST_KEY_INVALID = 9;
+  REMOTE_HOST_FAILURE_CODE_HOST_KEY_MISSING = 10;
+  REMOTE_HOST_FAILURE_CODE_HOST_KEY_STORE_CORRUPT = 11;
+  REMOTE_HOST_FAILURE_CODE_HOST_KEY_STORE_MISSING = 12;
+  REMOTE_HOST_FAILURE_CODE_HOST_KEY_STORE_UNREADABLE = 13;
+  REMOTE_HOST_FAILURE_CODE_HOST_KEY_STORE_WRITE_FAILED = 14;
+}
+
+message RemoteHostFailure {
+  RemoteHostFailureCode code = 1;
+  bool retryable = 2;
+}
+
+message RemoteHostTrustPin {
+  string algorithm = 1;
+  // Public SHA256 fingerprint only. The presented host key is never exposed.
+  string sha256_fingerprint = 2;
+  google.protobuf.Timestamp pinned_at = 3;
+}
+
+message RemoteHostStatusSnapshot {
+  RemoteHostStatus state = 1;
+  google.protobuf.Timestamp changed_at = 2;
+  // Present only while state is FAILED.
+  RemoteHostFailure failure = 3;
+}
+
+message RemoteHost {
+  string target_id = 1;
+  string host_id = 2;
+  string hostname = 3;
+  uint32 port = 4;
+  string user = 5;
+  RemoteHostSource source = 6;
+  // Opaque reference only; credential material uses the credential channel.
+  optional string credential_reference_id = 7;
+  RemoteHostTrustPin trust = 8;
+  RemoteHostStatusSnapshot status = 9;
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp updated_at = 11;
+  Revision revision = 12;
+  RemoteHostAuthenticationMode authentication_mode = 13;
+}
+
+message GetRemoteHostCapabilitiesRequest {
+  string target_id = 1;
+}
+
+message GetRemoteHostCapabilitiesResponse {
+  repeated RemoteHostCapabilityDescriptor capabilities = 1;
+  google.protobuf.Timestamp observed_at = 2;
+}
+
+message ListRemoteHostsRequest {
+  string target_id = 1;
+  PageRequest page = 2;
+}
+
+message ListRemoteHostsResponse {
+  repeated RemoteHost hosts = 1;
+  PageInfo page = 2;
+}
+
+message GetRemoteHostRequest {
+  string target_id = 1;
+  string host_id = 2;
+}
+
+message GetRemoteHostResponse {
+  RemoteHost host = 1;
+}
+
+message WatchRemoteHostsRequest {
+  string target_id = 1;
+}
+
+message RemoteHostCatalogSnapshot {
+  repeated RemoteHost hosts = 1;
+  google.protobuf.Timestamp observed_at = 2;
+}
+
+enum RemoteHostChangeKind {
+  REMOTE_HOST_CHANGE_KIND_UNSPECIFIED = 0;
+  REMOTE_HOST_CHANGE_KIND_UPSERTED = 1;
+  REMOTE_HOST_CHANGE_KIND_DELETED = 2;
+}
+
+message RemoteHostChange {
+  RemoteHostChangeKind kind = 1;
+  // The last complete public projection, including for a deletion.
+  RemoteHost host = 2;
+  google.protobuf.Timestamp observed_at = 3;
+}
+
+message WatchRemoteHostsResponse {
+  oneof update {
+    RemoteHostCatalogSnapshot snapshot = 1;
+    RemoteHostChange change = 2;
+  }
+  // Strictly increasing within one stream. Reconnects begin with a new
+  // authoritative snapshot, so clients never need an opaque resume token.
+  uint64 sequence = 3;
+}
+
+// Re-reads the service-owned catalog source. No client-selected path crosses
+// the contract boundary.
+message RefreshRemoteHostCatalogRequest {
+  string target_id = 1;
+  string request_id = 2;
+}
+
+message RefreshRemoteHostCatalogResponse {
+  repeated RemoteHost hosts = 1;
+  google.protobuf.Timestamp refreshed_at = 2;
+}
+
+message CreateRemoteHostRequest {
+  string request_id = 1;
+  string target_id = 2;
+  string host_id = 3;
+  string hostname = 4;
+  uint32 port = 5;
+  string user = 6;
+  optional string credential_reference_id = 7;
+  RemoteHostAuthenticationMode authentication_mode = 8;
+}
+
+message CreateRemoteHostResponse {
+  RemoteHost host = 1;
+}
+
+// Full routing replacement. An absent credential reference explicitly clears
+// the previous opaque reference; endpoint changes can require trust reset.
+message UpdateRemoteHostRequest {
+  string target_id = 1;
+  string host_id = 2;
+  string hostname = 3;
+  uint32 port = 4;
+  string user = 5;
+  optional string credential_reference_id = 6;
+  Revision expected_revision = 7;
+  RemoteHostAuthenticationMode authentication_mode = 8;
+}
+
+message UpdateRemoteHostResponse {
+  RemoteHost host = 1;
+}
+
+message DeleteRemoteHostRequest {
+  string target_id = 1;
+  string host_id = 2;
+  Revision expected_revision = 3;
+}
+
+message DeleteRemoteHostResponse {
+  RemoteHost host = 1;
+}
+
+message ConnectRemoteHostRequest {
+  string target_id = 1;
+  string host_id = 2;
+  Revision expected_revision = 3;
+}
+
+message ConnectRemoteHostResponse {
+  RemoteHost host = 1;
+}
+
+message DisconnectRemoteHostRequest {
+  string target_id = 1;
+  string host_id = 2;
+  Revision expected_revision = 3;
+}
+
+message DisconnectRemoteHostResponse {
+  RemoteHost host = 1;
+}
+
+enum RemoteHostConnectionTestOutcome {
+  REMOTE_HOST_CONNECTION_TEST_OUTCOME_UNSPECIFIED = 0;
+  REMOTE_HOST_CONNECTION_TEST_OUTCOME_SUCCEEDED = 1;
+  REMOTE_HOST_CONNECTION_TEST_OUTCOME_FAILED = 2;
+}
+
+message TestRemoteHostConnectionRequest {
+  string target_id = 1;
+  string host_id = 2;
+  Revision expected_revision = 3;
+}
+
+message RemoteHostConnectionTestResult {
+  RemoteHostConnectionTestOutcome outcome = 1;
+  RemoteHost host = 2;
+  google.protobuf.Timestamp tested_at = 3;
+}
+
+message TestRemoteHostConnectionResponse {
+  RemoteHostConnectionTestResult result = 1;
+}
+
+message ClearRemoteHostTrustRequest {
+  string target_id = 1;
+  string host_id = 2;
+  Revision expected_revision = 3;
+}
+
+message ClearRemoteHostTrustResponse {
+  RemoteHost host = 1;
+}

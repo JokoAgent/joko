@@ -1,0 +1,29 @@
+{
+  "extends": "./tsconfig.base.json",
+  "files": [],
+  "references": [
+    { "path": "./packages/contracts" },
+    { "path": "./packages/core" },
+    { "path": "./packages/git-safety" },
+    { "path": "./packages/outbound-network" },
+    { "path": "./packages/local-model-runtime" },
+    { "path": "./packages/remote-ssh" },
+    { "path": "./packages/runtime-governance" },
+    { "path": "./packages/store" },
+    { "path": "./packages/adapter-dictation-refinement" },
+    { "path": "./packages/adapter-pi" },
+    { "path": "./packages/adapter-transcription-openai" },
+    { "path": "./packages/adapter-transcription-realtime" },
+    { "path": "./packages/tool-android" },
+    { "path": "./packages/tool-browser" },
+    { "path": "./packages/tool-computer" },
+    { "path": "./packages/tool-lsp" },
+    { "path": "./packages/voice-input" },
+    { "path": "./packages/worktree" },
+    { "path": "./apps/orchestrator" },
+    { "path": "./apps/web" },
+    { "path": "./apps/desktop" },
+    { "path": "./packages/testkit" },
+    { "path": "./apps/e2e" }
+  ]
+}

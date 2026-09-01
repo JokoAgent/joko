@@ -1,0 +1,37 @@
+{
+  "name": "@joko/contracts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "files": [
+    "dist",
+    "proto"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./gen/*": {
+      "types": "./dist/gen/*.d.ts",
+      "import": "./dist/gen/*.js"
+    },
+    "./desktop-bootstrap": {
+      "types": "./dist/desktop-bootstrap.d.ts",
+      "import": "./dist/desktop-bootstrap.js"
+    },
+    "./managed-outbound-proxy": {
+      "types": "./dist/managed-outbound-proxy.d.ts",
+      "import": "./dist/managed-outbound-proxy.js"
+    },
+    "./proto/*": "./proto/*"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "pnpm build && node --test test/contract-surface.test.mjs test/managed-outbound-proxy.test.mjs test/protobuf-tree-wire.test.mjs"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "2.14.0"
+  }
+}

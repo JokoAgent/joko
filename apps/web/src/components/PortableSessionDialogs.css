@@ -1,0 +1,46 @@
+.modal.portable-session-dialog--export { max-width: 440px; }
+.modal.portable-session-dialog--import { max-width: 480px; }
+.portable-session-form { display: grid; gap: 12px; }
+.portable-session-form p { margin: 0; }
+.portable-session-form__hint { color: var(--text-soft); font-size: var(--text-12); line-height: 1.5; }
+.portable-session-form__error { color: var(--red); font-size: var(--text-11); line-height: 1.45; }
+.portable-session-check { display: flex; align-items: flex-start; gap: 8px; color: var(--text); font-size: var(--text-12); cursor: pointer; }
+.portable-session-check > input { flex: 0 0 auto; margin-top: 2px; accent-color: var(--accent); }
+.portable-session-check--detail > span { display: grid; gap: 2px; }
+.portable-session-check--detail strong { font-size: var(--text-12); font-weight: 600; }
+.portable-session-check--detail small { color: var(--text-faint); font-size: var(--text-10); line-height: 1.45; }
+.portable-session-passwords { display: grid; gap: 8px; }
+.portable-session-passwords > label { position: relative; display: block; }
+.portable-session-passwords input, .portable-session-select .select-control { width: 100%; min-height: 34px; border: 1px solid var(--line); border-radius: 7px; padding: 6px 9px; outline: 0; background: transparent; color: var(--text); font: inherit; font-size: var(--text-12); }
+.portable-session-passwords > label input { padding-right: 34px; }
+.portable-session-passwords input:focus, .portable-session-select .select-control:focus-visible { border-color: var(--accent-edge); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent); }
+.portable-session-passwords input[aria-invalid="true"] { border-color: var(--red); }
+.portable-session-passwords > label > button { position: absolute; top: 50%; right: 8px; width: 22px; height: 22px; display: grid; place-items: center; border: 0; padding: 0; transform: translateY(-50%); background: transparent; color: var(--text-faint); }
+.portable-session-passwords > label > button:hover { color: var(--text); }
+.portable-session-passwords > label > button svg { width: 14px; height: 14px; }
+.portable-session-picker { min-height: 108px; display: grid; place-items: center; border: 1px dashed var(--line-strong); border-radius: 10px; background: var(--surface-subtle); }
+.portable-session-picker > input { position: absolute; width: 1px; height: 1px; overflow: hidden; opacity: 0; pointer-events: none; }
+.portable-session-preview { min-width: 0; display: grid; gap: 4px; border-radius: 9px; padding: 12px; background: var(--surface-subtle); }
+.portable-session-preview strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--text-12); }
+.portable-session-preview span { color: var(--text-faint); font-size: var(--text-10); line-height: 1.4; }
+.portable-session-risk { display: flex; align-items: flex-start; gap: 8px; border-radius: 7px; padding: 9px 11px; background: color-mix(in srgb, var(--amber) 12%, transparent); color: var(--text-soft); }
+.portable-session-risk svg { width: 14px; height: 14px; flex: 0 0 auto; margin-top: 2px; }
+.portable-session-risk p { font-size: var(--text-10); line-height: 1.5; }
+.portable-session-select { display: grid; gap: 6px; color: var(--text-soft); font-size: var(--text-11); font-weight: 600; }
+.portable-session-conflict, .portable-session-done { display: grid; gap: 8px; color: var(--text); }
+.portable-session-conflict strong, .portable-session-done strong { font-size: var(--text-12); }
+.portable-session-conflict p, .portable-session-done p { color: var(--text-soft); font-size: var(--text-11); line-height: 1.5; }
+.portable-session-done--warning { padding: 10px 12px; border: 1px solid color-mix(in srgb, var(--amber) 38%, transparent); border-radius: var(--radius-10); background: color-mix(in srgb, var(--amber) 9%, transparent); }
+.portable-session-dialog .modal__actions { margin-top: 8px; }
+.portable-session-dialog .modal__actions > .button { min-width: 0; min-height: 32px; padding: 6px 12px; }
+.portable-session-dialog .modal__actions svg { width: 14px; height: 14px; }
+.portable-session-drop-overlay { position: fixed; inset: 0; z-index: 10020; display: grid; place-items: center; pointer-events: none; border: 2px dashed var(--accent-edge); background: color-mix(in srgb, var(--surface) 82%, transparent); }
+.portable-session-drop-overlay > span { display: inline-flex; align-items: center; gap: 8px; max-width: min(440px, calc(100vw - 32px)); border: 1px solid var(--line); border-radius: 999px; padding: 9px 14px; background: var(--surface-raised); box-shadow: var(--shadow-lg); color: var(--text); font-size: var(--text-12); }
+.portable-session-drop-overlay svg { width: 15px; height: 15px; }
+@media (max-width: 520px) {
+  .modal.portable-session-dialog { max-width: none; }
+  .portable-session-dialog .modal__actions { flex-wrap: wrap; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .portable-session-dialog, .modal-layer:has(.portable-session-dialog), .portable-session-drop-overlay { animation: none; }
+}

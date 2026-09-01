@@ -1,0 +1,130 @@
+.text-attachment-lightbox-open { overflow: hidden; }
+.message-attachment__preview--text { cursor: zoom-in; color: var(--blue); }
+.message-attachment__preview--text svg { width: 19px; height: 19px; }
+.text-attachment-lightbox {
+  position: fixed;
+  z-index: 9999;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 32px;
+}
+.text-attachment-lightbox__backdrop {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  padding: 0;
+  background: rgb(0 0 0 / .85);
+}
+.text-attachment-lightbox__card {
+  position: relative;
+  z-index: 1;
+  width: min(80vw, 1600px);
+  height: min(80dvh, 1200px);
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow: 0 24px 80px rgb(0 0 0 / .5);
+  outline: 0;
+}
+.text-attachment-lightbox__header {
+  min-width: 0;
+  min-height: 52px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid var(--line);
+  padding: 7px 9px 7px 14px;
+  background: var(--surface-raised, var(--surface));
+}
+.text-attachment-lightbox__filename {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+}
+.text-attachment-lightbox__filename > svg { width: 18px; height: 18px; flex: 0 0 auto; color: var(--blue); }
+.text-attachment-lightbox__filename > span { min-width: 0; display: grid; gap: 1px; }
+.text-attachment-lightbox__filename strong,
+.text-attachment-lightbox__filename small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.text-attachment-lightbox__filename strong { font-size: var(--text-13); font-weight: 500; }
+.text-attachment-lightbox__filename small { color: var(--text-faint); font-size: var(--text-10); }
+.text-attachment-lightbox__actions { display: flex; align-items: center; gap: 3px; }
+.text-attachment-lightbox__actions button {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 7px;
+  padding: 0;
+  background: transparent;
+  color: var(--text-soft);
+}
+.text-attachment-lightbox__actions button:hover { background: var(--surface-sunken); color: var(--text); }
+.text-attachment-lightbox__actions svg { width: 16px; height: 16px; }
+.text-attachment-lightbox__body { min-width: 0; min-height: 0; overflow: auto; background: var(--surface-sunken); }
+.text-attachment-lightbox__body pre {
+  min-width: 100%;
+  min-height: 100%;
+  width: max-content;
+  margin: 0;
+  padding: 18px 20px 36px;
+  background: transparent;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--code-size, 12px);
+  line-height: 1.55;
+  tab-size: 2;
+  white-space: pre;
+}
+.text-attachment-lightbox__status {
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  padding: 32px;
+  color: var(--text-soft);
+  text-align: center;
+}
+.text-attachment-lightbox__status > svg { width: 24px; height: 24px; color: var(--amber); }
+.text-attachment-lightbox__status > button { display: inline-flex; align-items: center; gap: 7px; margin-top: 5px; }
+.text-attachment-lightbox__status > button svg { width: 15px; height: 15px; }
+.text-attachment-lightbox__feedback {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 7px 11px;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 8px 24px rgb(0 0 0 / .2);
+  font-size: var(--text-11);
+}
+.text-attachment-lightbox__feedback svg { width: 14px; height: 14px; color: var(--green); }
+@media (max-width: 700px) {
+  .text-attachment-lightbox { padding: 10px; }
+  .text-attachment-lightbox__card { width: 100%; height: calc(100dvh - 20px); border-radius: 10px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .text-attachment-lightbox *, .text-attachment-lightbox *::before, .text-attachment-lightbox *::after { scroll-behavior: auto !important; }
+}

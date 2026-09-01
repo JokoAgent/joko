@@ -1,0 +1,135 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/duration.proto";
+import "joko/v1/common.proto";
+
+enum CapabilitySupport {
+  CAPABILITY_SUPPORT_UNSPECIFIED = 0;
+  CAPABILITY_SUPPORT_SUPPORTED = 1;
+  CAPABILITY_SUPPORT_UPSTREAM_MISSING = 2;
+  CAPABILITY_SUPPORT_NOT_IMPLEMENTED = 3;
+  CAPABILITY_SUPPORT_PLATFORM_LIMITED = 4;
+  CAPABILITY_SUPPORT_DISABLED_BY_POLICY = 5;
+  CAPABILITY_SUPPORT_TEMPORARILY_UNAVAILABLE = 6;
+}
+
+message Capability {
+  // Stable extensible identifier, for example "turn.steer" or "tool.browser".
+  string name = 1;
+  CapabilitySupport support = 2;
+  string reason = 3;
+  CapabilityOptions options = 4;
+}
+
+message CapabilityManifest {
+  string schema_version = 1;
+  repeated Capability capabilities = 2;
+  Revision revision = 3;
+}
+
+message CapabilityOptions {
+  oneof kind {
+    SessionCapabilityOptions session = 1;
+    TurnCapabilityOptions turn = 2;
+    InputCapabilityOptions input = 3;
+    ModelCapabilityOptions model = 4;
+    PermissionCapabilityOptions permission = 5;
+    ContextCapabilityOptions context = 6;
+    WorkspaceCapabilityOptions workspace = 7;
+    InteractionCapabilityOptions interaction = 8;
+    RuntimeCapabilityOptions runtime = 9;
+    ToolCapabilityOptions tool = 10;
+  }
+}
+
+message SessionCapabilityOptions {
+  bool supports_native_tree = 1;
+  bool supports_in_place_navigation = 2;
+  bool creates_new_native_session = 3;
+  bool supports_detach = 4;
+  bool supports_naming = 5;
+  bool supports_delete = 6;
+}
+
+message TurnCapabilityOptions {
+  bool same_turn = 1;
+  bool accepts_images = 2;
+  bool accepts_files = 3;
+  repeated QueueDeliveryMode delivery_modes = 4;
+}
+
+enum QueueDeliveryMode {
+  QUEUE_DELIVERY_MODE_UNSPECIFIED = 0;
+  QUEUE_DELIVERY_MODE_PROMPT = 1;
+  QUEUE_DELIVERY_MODE_STEER = 2;
+  QUEUE_DELIVERY_MODE_FOLLOW_UP = 3;
+}
+
+message InputCapabilityOptions {
+  repeated string media_types = 1;
+  uint64 maximum_bytes = 2;
+  uint32 maximum_items = 3;
+}
+
+message ModelCapabilityOptions {
+  bool provider_aware = 1;
+  bool switch_during_session = 2;
+  bool supports_effort = 3;
+  bool supports_fast_mode = 4;
+  repeated string effort_ids = 5;
+}
+
+message PermissionCapabilityOptions {
+  repeated PermissionMode modes = 1;
+  bool mutable_during_session = 2;
+  bool supports_per_turn_policy = 3;
+  bool supports_plan_mode = 4;
+}
+
+enum PermissionMode {
+  PERMISSION_MODE_UNSPECIFIED = 0;
+  PERMISSION_MODE_ASK = 1;
+  PERMISSION_MODE_AUTO = 2;
+  PERMISSION_MODE_BYPASS_PERMISSIONS = 3;
+}
+
+message ContextCapabilityOptions {
+  bool automatic = 1;
+  bool manual = 2;
+  bool custom_instructions = 3;
+  bool reports_boundary = 4;
+  bool reports_cost = 5;
+}
+
+message WorkspaceCapabilityOptions {
+  bool remote_files = 1;
+  bool search = 2;
+  bool git_status = 3;
+  bool git_diff = 4;
+  bool turn_change_sets = 5;
+  bool rewind_preview = 6;
+  bool extra_directories = 7;
+}
+
+message InteractionCapabilityOptions {
+  bool supports_timeout = 1;
+  bool supports_dismissal = 2;
+  bool supports_multi_client_resolution = 3;
+}
+
+message RuntimeCapabilityOptions {
+  bool reports_commands = 1;
+  bool reports_resources = 2;
+  bool background_tasks = 3;
+  google.protobuf.Duration minimum_poll_interval = 4;
+}
+
+message ToolCapabilityOptions {
+  bool supports_streaming_updates = 1;
+  bool supports_large_result_artifacts = 2;
+  bool supports_human_takeover = 3;
+  bool supports_upload = 4;
+  bool supports_download = 5;
+}

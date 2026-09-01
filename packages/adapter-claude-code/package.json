@@ -1,0 +1,27 @@
+{
+  "name": "@joko/adapter-claude-code",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./testing": "./src/testing.ts"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:real:probe": "vitest run src/real-probe.real.test.ts",
+    "test:real:paid-smoke": "vitest run src/real-provider.opt-in.test.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.239",
+    "@joko/core": "workspace:*",
+    "@joko/runtime-governance": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "24.12.4",
+    "typescript": "5.9.3",
+    "vitest": "4.1.9"
+  }
+}

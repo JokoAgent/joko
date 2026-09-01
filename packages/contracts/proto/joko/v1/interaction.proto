@@ -1,0 +1,359 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+import "joko/v1/capability.proto";
+import "joko/v1/common.proto";
+
+enum InteractionKind {
+  INTERACTION_KIND_UNSPECIFIED = 0;
+  INTERACTION_KIND_PERMISSION = 1;
+  INTERACTION_KIND_QUESTION = 2;
+  INTERACTION_KIND_PLAN_REVIEW = 3;
+  INTERACTION_KIND_EXTENSION_UI = 4;
+}
+
+enum InteractionState {
+  INTERACTION_STATE_UNSPECIFIED = 0;
+  INTERACTION_STATE_PENDING = 1;
+  INTERACTION_STATE_RESOLVED = 2;
+  INTERACTION_STATE_DISMISSED = 3;
+  INTERACTION_STATE_EXPIRED = 4;
+  INTERACTION_STATE_CANCELLED = 5;
+}
+
+message Interaction {
+  string interaction_id = 1;
+  InteractionKind kind = 2;
+  InteractionState state = 3;
+  string backend_id = 4;
+  string target_id = 5;
+  string session_id = 6;
+  string run_id = 7;
+  string attempt_id = 8;
+  uint64 generation = 9;
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp expires_at = 11;
+  oneof request {
+    PermissionRequest permission = 20;
+    QuestionRequest question = 21;
+    PlanReviewRequest plan_review = 22;
+    ExtensionUiInteraction extension_ui = 23;
+  }
+  InteractionResolution resolution = 30;
+  EntityVersion version = 31;
+}
+
+message PermissionRequest {
+  PermissionMode active_mode = 1;
+  PermissionRisk risk = 2;
+  string title = 3;
+  string explanation = 4;
+  PermissionSubject subject = 5;
+  repeated PermissionDecisionKind allowed_decisions = 6;
+  bool auto_review_attempted = 7;
+  string policy_rule_id = 8;
+}
+
+enum PermissionRisk {
+  PERMISSION_RISK_UNSPECIFIED = 0;
+  PERMISSION_RISK_READ_ONLY = 1;
+  PERMISSION_RISK_LOW = 2;
+  PERMISSION_RISK_MEDIUM = 3;
+  PERMISSION_RISK_HIGH = 4;
+  PERMISSION_RISK_CRITICAL = 5;
+}
+
+message PermissionSubject {
+  oneof kind {
+    FilePermissionSubject file = 1;
+    CommandPermissionSubject command = 2;
+    McpPermissionSubject mcp = 3;
+    BrowserPermissionSubject browser = 4;
+    CustomToolPermissionSubject custom_tool = 5;
+    ResourcePermissionSubject resource = 6;
+  }
+}
+
+message FilePermissionSubject {
+  string workspace_id = 1;
+  repeated string relative_paths = 2;
+  FilePermissionAction action = 3;
+  bool outside_primary_workspace = 4;
+}
+
+enum FilePermissionAction {
+  FILE_PERMISSION_ACTION_UNSPECIFIED = 0;
+  FILE_PERMISSION_ACTION_READ = 1;
+  FILE_PERMISSION_ACTION_CREATE = 2;
+  FILE_PERMISSION_ACTION_UPDATE = 3;
+  FILE_PERMISSION_ACTION_DELETE = 4;
+  FILE_PERMISSION_ACTION_MOVE = 5;
+}
+
+message CommandPermissionSubject {
+  string executable = 1;
+  repeated string arguments = 2;
+  string working_directory_display = 3;
+  bool network_access = 4;
+  bool writes_outside_workspace = 5;
+  bool uses_shell = 6;
+}
+
+message McpPermissionSubject {
+  string server_id = 1;
+  string tool_name = 2;
+  repeated DisplayArgument arguments = 3;
+}
+
+message BrowserPermissionSubject {
+  string browser_provider_id = 1;
+  string page_id = 2;
+  BrowserPermissionAction action = 3;
+  string origin = 4;
+}
+
+enum BrowserPermissionAction {
+  BROWSER_PERMISSION_ACTION_UNSPECIFIED = 0;
+  BROWSER_PERMISSION_ACTION_READ_PAGE = 1;
+  BROWSER_PERMISSION_ACTION_NAVIGATE = 2;
+  BROWSER_PERMISSION_ACTION_INTERACT = 3;
+  BROWSER_PERMISSION_ACTION_UPLOAD = 4;
+  BROWSER_PERMISSION_ACTION_DOWNLOAD = 5;
+  BROWSER_PERMISSION_ACTION_TAKE_OVER = 6;
+}
+
+message CustomToolPermissionSubject {
+  string tool_id = 1;
+  string display_name = 2;
+  repeated DisplayArgument arguments = 3;
+}
+
+message ResourcePermissionSubject {
+  string resource_id = 1;
+  string source_path_display = 2;
+  ResourcePermissionAction action = 3;
+}
+
+enum ResourcePermissionAction {
+  RESOURCE_PERMISSION_ACTION_UNSPECIFIED = 0;
+  RESOURCE_PERMISSION_ACTION_APPROVE = 1;
+  RESOURCE_PERMISSION_ACTION_INSTALL = 2;
+  RESOURCE_PERMISSION_ACTION_UPDATE = 3;
+  RESOURCE_PERMISSION_ACTION_ENABLE = 4;
+}
+
+// A flattened, typed argument suitable for display and audit. Nested inputs use
+// one composite marker plus leaf arguments whose field_path identifies the
+// child. A redacted argument MUST omit value.
+message DisplayArgument {
+  string field_path = 1;
+  oneof value {
+    string text = 2;
+    double number = 3;
+    sint64 integer = 4;
+    bool boolean = 5;
+    BlobRef blob = 6;
+    NullArgument null = 7;
+    CompositeArgument composite = 8;
+  }
+  bool redacted = 9;
+  string redacted_placeholder = 10;
+}
+
+message NullArgument {}
+
+message CompositeArgument {
+  CompositeArgumentKind kind = 1;
+  uint32 child_count = 2;
+}
+
+enum CompositeArgumentKind {
+  COMPOSITE_ARGUMENT_KIND_UNSPECIFIED = 0;
+  COMPOSITE_ARGUMENT_KIND_OBJECT = 1;
+  COMPOSITE_ARGUMENT_KIND_ARRAY = 2;
+}
+
+enum PermissionDecisionKind {
+  PERMISSION_DECISION_KIND_UNSPECIFIED = 0;
+  PERMISSION_DECISION_KIND_ALLOW_ONCE = 1;
+  PERMISSION_DECISION_KIND_ALLOW_FOR_TURN = 2;
+  PERMISSION_DECISION_KIND_ALLOW_FOR_SESSION = 3;
+  PERMISSION_DECISION_KIND_DENY_ONCE = 4;
+  PERMISSION_DECISION_KIND_DENY_FOR_SESSION = 5;
+  PERMISSION_DECISION_KIND_ABORT_RUN = 6;
+}
+
+message QuestionRequest {
+  string title = 1;
+  string prompt = 2;
+  repeated QuestionField fields = 3;
+}
+
+message QuestionField {
+  string field_id = 1;
+  string label = 2;
+  string description = 3;
+  bool required = 4;
+  oneof input {
+    QuestionTextInput text = 10;
+    QuestionSingleChoiceInput single_choice = 11;
+    QuestionMultipleChoiceInput multiple_choice = 12;
+    QuestionBooleanInput boolean = 13;
+  }
+}
+
+message QuestionTextInput {
+  string placeholder = 1;
+  string default_value = 2;
+  bool multiline = 3;
+  QuestionAnswerHandling answer_handling = 4;
+}
+
+enum QuestionAnswerHandling {
+  QUESTION_ANSWER_HANDLING_UNSPECIFIED = 0;
+  QUESTION_ANSWER_HANDLING_NORMAL = 1;
+  // The answer is uploaded through the credential channel and the durable
+  // interaction carries only SensitiveAnswerRef.
+  QUESTION_ANSWER_HANDLING_CREDENTIAL_CHANNEL = 2;
+}
+
+message QuestionChoice {
+  string choice_id = 1;
+  string label = 2;
+  string description = 3;
+}
+
+message QuestionSingleChoiceInput {
+  repeated QuestionChoice choices = 1;
+  string default_choice_id = 2;
+}
+
+message QuestionMultipleChoiceInput {
+  repeated QuestionChoice choices = 1;
+  repeated string default_choice_ids = 2;
+  uint32 minimum_selections = 3;
+  uint32 maximum_selections = 4;
+}
+
+message QuestionBooleanInput {
+  bool default_value = 1;
+}
+
+message PlanReviewRequest {
+  string title = 1;
+  string markdown = 2;
+  repeated PlanStep steps = 3;
+  repeated PlanReviewDecisionKind allowed_decisions = 4;
+}
+
+message PlanStep {
+  string step_id = 1;
+  string title = 2;
+  string description = 3;
+  PlanStepState state = 4;
+}
+
+enum PlanStepState {
+  PLAN_STEP_STATE_UNSPECIFIED = 0;
+  PLAN_STEP_STATE_PENDING = 1;
+  PLAN_STEP_STATE_IN_PROGRESS = 2;
+  PLAN_STEP_STATE_COMPLETED = 3;
+  PLAN_STEP_STATE_SKIPPED = 4;
+}
+
+enum PlanReviewDecisionKind {
+  PLAN_REVIEW_DECISION_KIND_UNSPECIFIED = 0;
+  PLAN_REVIEW_DECISION_KIND_EXECUTE = 1;
+  PLAN_REVIEW_DECISION_KIND_STAY_IN_PLAN_MODE = 2;
+  PLAN_REVIEW_DECISION_KIND_REFINE = 3;
+}
+
+message ExtensionUiInteraction {
+  string request_id = 1;
+  string extension_id = 2;
+  oneof request {
+    ExtensionSelectRequest select = 10;
+    ExtensionConfirmRequest confirm = 11;
+    ExtensionInputRequest input = 12;
+    ExtensionEditorRequest editor = 13;
+  }
+}
+
+message ExtensionSelectRequest {
+  string title = 1;
+  repeated string options = 2;
+}
+
+message ExtensionConfirmRequest {
+  string title = 1;
+  string message = 2;
+}
+
+message ExtensionInputRequest {
+  string title = 1;
+  string placeholder = 2;
+}
+
+message ExtensionEditorRequest {
+  string title = 1;
+  string prefill = 2;
+}
+
+message InteractionResolution {
+  string connection_id = 1;
+  ActorRef actor = 2;
+  google.protobuf.Timestamp resolved_at = 3;
+  oneof decision {
+    PermissionResolution permission = 10;
+    QuestionResolution question = 11;
+    PlanReviewResolution plan_review = 12;
+    ExtensionUiResolution extension_ui = 13;
+    DismissalResolution dismissal = 14;
+  }
+}
+
+message PermissionResolution {
+  PermissionDecisionKind decision = 1;
+}
+
+message QuestionResolution {
+  repeated QuestionAnswer answers = 1;
+}
+
+message QuestionAnswer {
+  string field_id = 1;
+  oneof value {
+    string text = 10;
+    string choice_id = 11;
+    StringList choice_ids = 12;
+    bool boolean = 13;
+    SensitiveAnswerRef sensitive = 14;
+  }
+}
+
+message SensitiveAnswerRef {
+  string credential_upload_ticket_id = 1;
+}
+
+message StringList {
+  repeated string values = 1;
+}
+
+message PlanReviewResolution {
+  PlanReviewDecisionKind decision = 1;
+  string feedback = 2;
+}
+
+message ExtensionUiResolution {
+  oneof result {
+    string value = 1;
+    bool confirmed = 2;
+    bool cancelled = 3;
+  }
+}
+
+message DismissalResolution {
+  string reason = 1;
+}

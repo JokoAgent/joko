@@ -1,0 +1,160 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+import "joko/v1/capability.proto";
+
+enum VoiceInputState {
+  VOICE_INPUT_STATE_UNSPECIFIED = 0;
+  VOICE_INPUT_STATE_IDLE = 1;
+  VOICE_INPUT_STATE_LISTENING = 2;
+  VOICE_INPUT_STATE_SUBMITTING = 3;
+  VOICE_INPUT_STATE_REFINING = 4;
+  VOICE_INPUT_STATE_DONE = 5;
+  VOICE_INPUT_STATE_ERROR = 6;
+}
+
+enum VoiceInputTerminalOutcome {
+  VOICE_INPUT_TERMINAL_OUTCOME_UNSPECIFIED = 0;
+  VOICE_INPUT_TERMINAL_OUTCOME_SUCCESS = 1;
+  VOICE_INPUT_TERMINAL_OUTCOME_NO_SPEECH = 2;
+  VOICE_INPUT_TERMINAL_OUTCOME_FAILED = 3;
+  VOICE_INPUT_TERMINAL_OUTCOME_CANCELLED = 4;
+}
+
+enum VoiceInputTextSource {
+  VOICE_INPUT_TEXT_SOURCE_UNSPECIFIED = 0;
+  VOICE_INPUT_TEXT_SOURCE_PARTIAL = 1;
+  VOICE_INPUT_TEXT_SOURCE_STABLE = 2;
+}
+
+enum VoiceInputFailureCode {
+  VOICE_INPUT_FAILURE_CODE_UNSPECIFIED = 0;
+  VOICE_INPUT_FAILURE_CODE_CONNECTION_INTERRUPTED = 1;
+  VOICE_INPUT_FAILURE_CODE_EMPTY_TRANSCRIPT = 2;
+  VOICE_INPUT_FAILURE_CODE_HOST_SUBMISSION_FAILED = 3;
+  VOICE_INPUT_FAILURE_CODE_PROVIDER_AUTHENTICATION = 4;
+  VOICE_INPUT_FAILURE_CODE_PROVIDER_CLOSE_FAILED = 5;
+  VOICE_INPUT_FAILURE_CODE_PROVIDER_ERROR = 6;
+  VOICE_INPUT_FAILURE_CODE_PROVIDER_FLUSH_FAILED = 7;
+  VOICE_INPUT_FAILURE_CODE_PROVIDER_PROTOCOL = 8;
+  VOICE_INPUT_FAILURE_CODE_PROVIDER_QUOTA = 9;
+  VOICE_INPUT_FAILURE_CODE_PROVIDER_START_FAILED = 10;
+}
+
+message VoiceInputLimits {
+  repeated string supported_mime_types = 1;
+  uint64 maximum_audio_chunk_bytes = 2;
+  uint64 maximum_audio_bytes = 3;
+  google.protobuf.Duration maximum_audio_chunk_duration = 4;
+  google.protobuf.Duration maximum_audio_duration = 5;
+  uint32 maximum_locale_characters = 6;
+  google.protobuf.Duration stable_wait = 7;
+  uint32 maximum_concurrent_sessions = 8;
+}
+
+message VoiceInputCapabilityProfile {
+  Capability capability = 1;
+  VoiceInputLimits limits = 2;
+  bool supports_locale = 3;
+  bool supports_live_drafts = 4;
+  bool supports_refinement = 5;
+}
+
+// Text-bearing values exist only in the authenticated, in-memory Voice input
+// session. They are never Event, Snapshot, diagnostic, or Store payloads.
+message VoiceInputDraft {
+  string text = 1;
+  VoiceInputTextSource source = 2;
+}
+
+message VoiceInputResult {
+  string text = 1;
+  VoiceInputTextSource source = 2;
+  bool salvaged = 3;
+  // Present only when refinement changed the submitted ASR text. Like text,
+  // this field is confined to the authenticated in-memory Voice session.
+  optional string raw_transcript_text = 4;
+}
+
+enum VoiceInputDictionaryEntrySource {
+  VOICE_INPUT_DICTIONARY_ENTRY_SOURCE_UNSPECIFIED = 0;
+  VOICE_INPUT_DICTIONARY_ENTRY_SOURCE_MANUAL = 1;
+  VOICE_INPUT_DICTIONARY_ENTRY_SOURCE_AUTOMATIC = 2;
+}
+
+message VoiceInputDictionaryAliasState {
+  string text = 1;
+  uint32 count = 2;
+}
+
+message VoiceInputDictionaryEntryState {
+  string term = 1;
+  VoiceInputDictionaryEntrySource source = 2;
+  uint32 frequency = 3;
+  repeated VoiceInputDictionaryAliasState aliases = 4;
+}
+
+message VoiceInputDictionaryCandidateState {
+  string term = 1;
+  uint32 evidence_count = 2;
+  repeated VoiceInputDictionaryAliasState aliases = 3;
+}
+
+enum VoiceInputDictionaryLearningActionType {
+  VOICE_INPUT_DICTIONARY_LEARNING_ACTION_TYPE_UNSPECIFIED = 0;
+  VOICE_INPUT_DICTIONARY_LEARNING_ACTION_TYPE_ADD_CANDIDATE = 1;
+  VOICE_INPUT_DICTIONARY_LEARNING_ACTION_TYPE_ADD_ENTRY = 2;
+  VOICE_INPUT_DICTIONARY_LEARNING_ACTION_TYPE_UPDATE_ENTRY = 3;
+}
+
+enum VoiceInputDictionaryTermType {
+  VOICE_INPUT_DICTIONARY_TERM_TYPE_UNSPECIFIED = 0;
+  VOICE_INPUT_DICTIONARY_TERM_TYPE_PRODUCT_NAME = 1;
+  VOICE_INPUT_DICTIONARY_TERM_TYPE_PROJECT_NAME = 2;
+  VOICE_INPUT_DICTIONARY_TERM_TYPE_TECHNICAL_TERM = 3;
+  VOICE_INPUT_DICTIONARY_TERM_TYPE_PERSON_NAME = 4;
+  VOICE_INPUT_DICTIONARY_TERM_TYPE_TEAM_NAME = 5;
+  VOICE_INPUT_DICTIONARY_TERM_TYPE_CODE_NAME = 6;
+  VOICE_INPUT_DICTIONARY_TERM_TYPE_PHRASE = 7;
+  VOICE_INPUT_DICTIONARY_TERM_TYPE_OTHER = 8;
+}
+
+enum VoiceInputDictionaryLearningConfidence {
+  VOICE_INPUT_DICTIONARY_LEARNING_CONFIDENCE_UNSPECIFIED = 0;
+  VOICE_INPUT_DICTIONARY_LEARNING_CONFIDENCE_MEDIUM = 1;
+  VOICE_INPUT_DICTIONARY_LEARNING_CONFIDENCE_HIGH = 2;
+}
+
+message VoiceInputDictionaryLearningAction {
+  VoiceInputDictionaryLearningActionType action = 1;
+  string term = 2;
+  repeated string aliases = 3;
+  VoiceInputDictionaryTermType term_type = 4;
+  VoiceInputDictionaryLearningConfidence confidence = 5;
+}
+
+// Failure projection is intentionally closed and content-free. Provider error
+// text, audio, credentials, and transcripts are not representable here.
+message VoiceInputFailure {
+  VoiceInputFailureCode code = 1;
+  bool transcript_kept = 2;
+}
+
+message VoiceInputSession {
+  string voice_input_id = 1;
+  VoiceInputState state = 2;
+  VoiceInputTerminalOutcome outcome = 3;
+  VoiceInputDraft draft = 4;
+  VoiceInputResult result = 5;
+  VoiceInputFailure failure = 6;
+  uint64 next_chunk_sequence = 7;
+  uint64 accepted_audio_bytes = 8;
+  google.protobuf.Duration accepted_audio_duration = 9;
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp updated_at = 11;
+  uint32 recovery_attempts = 12;
+  bool stall_warning = 13;
+}

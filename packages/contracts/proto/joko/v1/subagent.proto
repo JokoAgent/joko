@@ -1,0 +1,179 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+import "joko/v1/common.proto";
+
+enum SubagentRunState {
+  SUBAGENT_RUN_STATE_UNSPECIFIED = 0;
+  SUBAGENT_RUN_STATE_QUEUED = 1;
+  SUBAGENT_RUN_STATE_RUNNING = 2;
+  SUBAGENT_RUN_STATE_COMPLETED = 3;
+  SUBAGENT_RUN_STATE_FAILED = 4;
+  SUBAGENT_RUN_STATE_STOPPED = 5;
+}
+
+enum SubagentActivityKind {
+  SUBAGENT_ACTIVITY_KIND_UNSPECIFIED = 0;
+  SUBAGENT_ACTIVITY_KIND_STARTED = 1;
+  SUBAGENT_ACTIVITY_KIND_PROGRESS = 2;
+  SUBAGENT_ACTIVITY_KIND_MESSAGE = 3;
+  SUBAGENT_ACTIVITY_KIND_QUESTION = 4;
+  SUBAGENT_ACTIVITY_KIND_DECISION = 5;
+  SUBAGENT_ACTIVITY_KIND_RESUMED = 6;
+  SUBAGENT_ACTIVITY_KIND_STEERED = 7;
+  SUBAGENT_ACTIVITY_KIND_FOLLOWED_UP = 8;
+  SUBAGENT_ACTIVITY_KIND_COMPLETED = 9;
+  SUBAGENT_ACTIVITY_KIND_FAILED = 10;
+  SUBAGENT_ACTIVITY_KIND_STOPPED = 11;
+}
+
+enum SubagentParentContext {
+  SUBAGENT_PARENT_CONTEXT_UNSPECIFIED = 0;
+  SUBAGENT_PARENT_CONTEXT_NONE = 1;
+  SUBAGENT_PARENT_CONTEXT_SNAPSHOT = 2;
+  SUBAGENT_PARENT_CONTEXT_LIVE = 3;
+}
+
+message SubagentCapabilities {
+  bool view_activity = 1;
+  bool view_returned_result = 2;
+  bool view_full_transcript = 3;
+  bool stop = 4;
+  bool steer = 5;
+  bool follow_up = 6;
+  bool resume = 7;
+  SubagentParentContext parent_context = 8;
+}
+
+message SubagentUsage {
+  optional uint64 input_tokens = 1;
+  optional uint64 output_tokens = 2;
+  optional uint64 cache_read_tokens = 3;
+  optional uint64 cache_write_tokens = 4;
+  optional uint64 total_tokens = 5;
+  optional uint64 tool_uses = 6;
+  google.protobuf.Duration duration = 7;
+  optional double cost_usd = 8;
+}
+
+message SubagentRoute {
+  string provider_id = 1;
+  string model_id = 2;
+  string thinking_level = 3;
+}
+
+message SubagentActivity {
+  uint64 sequence = 1;
+  SubagentActivityKind kind = 2;
+  SubagentRunState state = 3;
+  string summary = 4;
+  string last_tool_name = 5;
+  google.protobuf.Timestamp occurred_at = 6;
+}
+
+message SubagentChildRun {
+  string child_id = 1;
+  string parent_child_id = 2;
+  repeated string identity_aliases = 3;
+  string role = 4;
+  string title = 5;
+  string assignment = 6;
+  SubagentRunState state = 7;
+  SubagentRoute route = 8;
+  SubagentUsage usage = 9;
+  optional bool awaiting_approval = 10;
+  optional string result = 11;
+  optional bool result_truncated = 12;
+  ErrorInfo error = 13;
+  google.protobuf.Timestamp started_at = 14;
+  google.protobuf.Timestamp ended_at = 15;
+  optional bool read_only = 16;
+}
+
+message SubagentRun {
+  string subagent_run_id = 1;
+  string session_id = 2;
+  string parent_run_id = 3;
+  string parent_subagent_run_id = 4;
+  string parent_task_id = 5;
+  string logical_agent_id = 6;
+  repeated string identity_aliases = 7;
+  repeated string provider_run_ids = 8;
+  SubagentRunState state = 9;
+  string title = 10;
+  string description = 11;
+  string assignment = 12;
+  string summary = 13;
+  SubagentRoute route = 14;
+  SubagentUsage usage = 15;
+  SubagentCapabilities capabilities = 16;
+  google.protobuf.Timestamp started_at = 17;
+  google.protobuf.Timestamp updated_at = 18;
+  google.protobuf.Timestamp ended_at = 19;
+  ErrorInfo error = 20;
+  EntityVersion version = 21;
+  string parent_tool_call_id = 22;
+  optional bool read_only = 23;
+}
+
+message SubagentRunDetail {
+  SubagentRun run = 1;
+  repeated SubagentActivity activity = 2;
+  repeated SubagentChildRun children = 3;
+  optional string returned_result = 4;
+  optional bool returned_result_truncated = 5;
+  optional bool children_observed = 6;
+}
+
+enum SubagentTranscriptRole {
+  SUBAGENT_TRANSCRIPT_ROLE_UNSPECIFIED = 0;
+  SUBAGENT_TRANSCRIPT_ROLE_PARENT = 1;
+  SUBAGENT_TRANSCRIPT_ROLE_SUBAGENT = 2;
+  SUBAGENT_TRANSCRIPT_ROLE_TOOL = 3;
+  SUBAGENT_TRANSCRIPT_ROLE_SYSTEM = 4;
+}
+
+enum SubagentToolPhase {
+  SUBAGENT_TOOL_PHASE_UNSPECIFIED = 0;
+  SUBAGENT_TOOL_PHASE_START = 1;
+  SUBAGENT_TOOL_PHASE_UPDATE = 2;
+  SUBAGENT_TOOL_PHASE_END = 3;
+}
+
+enum SubagentControlAction {
+  SUBAGENT_CONTROL_ACTION_UNSPECIFIED = 0;
+  SUBAGENT_CONTROL_ACTION_STOP = 1;
+  SUBAGENT_CONTROL_ACTION_STEER = 2;
+  SUBAGENT_CONTROL_ACTION_FOLLOW_UP = 3;
+  SUBAGENT_CONTROL_ACTION_RESUME = 4;
+}
+
+message SubagentSystemEvent {
+  string kind = 1;
+  repeated SubagentSystemParameter params = 2;
+}
+
+message SubagentSystemParameter {
+  string key = 1;
+  string value = 2;
+}
+
+message SubagentTranscriptEntry {
+  string entry_id = 1;
+  uint64 sequence = 2;
+  SubagentTranscriptRole role = 3;
+  string content = 4;
+  google.protobuf.Timestamp occurred_at = 5;
+  string child_id = 6;
+  string child_title = 7;
+  string tool_name = 8;
+  string tool_call_id = 9;
+  SubagentToolPhase tool_phase = 10;
+  string tool_input_json = 11;
+  optional bool is_error = 12;
+  SubagentControlAction control_action = 13;
+  SubagentSystemEvent system_event = 14;
+}

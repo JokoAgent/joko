@@ -1,0 +1,96 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+import "joko/v1/common.proto";
+
+// Backend-neutral public state for one isolated, read-only review task.
+message ReviewRun {
+  string review_run_id = 1;
+  string source_session_id = 2;
+  string reviewer_session_id = 3;
+  ReviewRunState state = 4;
+  ReviewTargetKind target_kind = 5;
+  ReviewFailureCode failure_code = 6;
+  string result_markdown = 7;
+  google.protobuf.Timestamp created_at = 8;
+  google.protobuf.Timestamp updated_at = 9;
+  google.protobuf.Timestamp ended_at = 10;
+  Revision revision = 11;
+  // Freshness is independent from execution state: a completed Review can
+  // later be observed as stale without rewriting its terminal conclusion.
+  ReviewFreshness freshness = 12;
+  // Immutable, bounded provenance for the evidence captured by this run.
+  ReviewEvidenceSummary evidence = 13;
+}
+
+message ReviewFreshness {
+  ReviewFreshnessState state = 1;
+  google.protobuf.Timestamp checked_at = 2;
+}
+
+enum ReviewFreshnessState {
+  REVIEW_FRESHNESS_STATE_UNSPECIFIED = 0;
+  REVIEW_FRESHNESS_STATE_CURRENT = 1;
+  REVIEW_FRESHNESS_STATE_STALE = 2;
+  REVIEW_FRESHNESS_STATE_UNAVAILABLE = 3;
+}
+
+// Safe, immutable evidence identity. It intentionally contains no workspace
+// path, evidence body, BlobRef, provider identity, or credential-bearing data.
+message ReviewEvidenceSummary {
+  string seal_sha256_hex = 1;
+  ReviewSourceRevision source_revision = 2;
+  ReviewTargetKind target_kind = 3;
+  google.protobuf.Timestamp captured_at = 4;
+}
+
+message ReviewSourceRevision {
+  uint32 seal_version = 1;
+  string conversation_sha256_hex = 2;
+  string workspace_sha256_hex = 3;
+  string files_sha256_hex = 4;
+  string artifacts_sha256_hex = 5;
+}
+
+enum ReviewRunState {
+  REVIEW_RUN_STATE_UNSPECIFIED = 0;
+  REVIEW_RUN_STATE_RUNNING = 1;
+  REVIEW_RUN_STATE_COMPLETED = 2;
+  REVIEW_RUN_STATE_FAILED = 3;
+}
+
+enum ReviewTargetKind {
+  REVIEW_TARGET_KIND_UNSPECIFIED = 0;
+  REVIEW_TARGET_KIND_CHANGES = 1;
+  REVIEW_TARGET_KIND_ARTIFACTS = 2;
+  REVIEW_TARGET_KIND_TASK = 3;
+  REVIEW_TARGET_KIND_MIXED = 4;
+}
+
+enum ReviewFailureCode {
+  REVIEW_FAILURE_CODE_UNSPECIFIED = 0;
+  REVIEW_FAILURE_CODE_NO_VISIBLE_RESULT = 1;
+  REVIEW_FAILURE_CODE_REVIEWER_CLOSED = 2;
+  REVIEW_FAILURE_CODE_CANCELLED_BEFORE_START = 3;
+  REVIEW_FAILURE_CODE_INTERRUPTED = 4;
+  REVIEW_FAILURE_CODE_SOURCE_WORKSPACE_CHANGED = 5;
+  REVIEW_FAILURE_CODE_SOURCE_CONVERSATION_CHANGED = 6;
+  REVIEW_FAILURE_CODE_SOURCE_FILES_CHANGED = 7;
+  REVIEW_FAILURE_CODE_ARTIFACT_CHANGED = 8;
+  REVIEW_FAILURE_CODE_ARTIFACT_UNAVAILABLE = 9;
+  REVIEW_FAILURE_CODE_PROVIDER_FAILED = 10;
+}
+
+enum ReviewAttachmentKind {
+  REVIEW_ATTACHMENT_KIND_UNSPECIFIED = 0;
+  REVIEW_ATTACHMENT_KIND_IMAGE = 1;
+  REVIEW_ATTACHMENT_KIND_FILE = 2;
+}
+
+message ReviewAttachmentInput {
+  ReviewAttachmentKind kind = 1;
+  string display_name = 2;
+  BlobRef blob = 3;
+}

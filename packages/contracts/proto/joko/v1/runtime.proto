@@ -1,0 +1,999 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+import "joko/v1/capability.proto";
+import "joko/v1/code_host.proto";
+import "joko/v1/common.proto";
+import "joko/v1/model.proto";
+import "joko/v1/workspace.proto";
+
+message ServerInfo {
+  string server_id = 1;
+  string display_name = 2;
+  string version = 3;
+  string api_version = 4;
+  google.protobuf.Timestamp server_time = 5;
+  ServerHealth health = 6;
+  bool pairing_enabled = 7;
+}
+
+// Deliberately public bootstrap metadata. This message must never grow fields
+// containing pairing codes, authentication keys, credentials, or diagnostics.
+message DiscoveredNode {
+  string server_id = 1;
+  string display_name = 2;
+  string origin = 3;
+  string version = 4;
+  string api_version = 5;
+  bool pairing_enabled = 6;
+  google.protobuf.Timestamp last_seen = 7;
+}
+
+enum LanDiscoveryDatagramKind {
+  LAN_DISCOVERY_DATAGRAM_KIND_UNSPECIFIED = 0;
+  LAN_DISCOVERY_DATAGRAM_KIND_QUERY = 1;
+  LAN_DISCOVERY_DATAGRAM_KIND_ANNOUNCE = 2;
+}
+
+// Bounded, unauthenticated UDP bootstrap envelope. Receivers validate every
+// field and fail closed before accepting a peer into the short-lived cache.
+message LanDiscoveryDatagram {
+  bytes magic = 1;
+  uint32 protocol_version = 2;
+  bytes nonce = 3;
+  LanDiscoveryDatagramKind kind = 4;
+  DiscoveredNode node = 5;
+}
+
+enum ServerHealth {
+  SERVER_HEALTH_UNSPECIFIED = 0;
+  SERVER_HEALTH_STARTING = 1;
+  SERVER_HEALTH_HEALTHY = 2;
+  SERVER_HEALTH_DEGRADED = 3;
+  SERVER_HEALTH_UNAVAILABLE = 4;
+}
+
+enum ConnectionState {
+  CONNECTION_STATE_UNSPECIFIED = 0;
+  CONNECTION_STATE_PAIRING = 1;
+  CONNECTION_STATE_CONNECTED = 2;
+  CONNECTION_STATE_DISCONNECTED = 3;
+  CONNECTION_STATE_REVOKED = 4;
+  CONNECTION_STATE_LOGGED_OUT = 5;
+}
+
+message Connection {
+  string connection_id = 1;
+  string connection_profile_id = 2;
+  // Durable owning Device identity. It must equal PairingResult.device.device_id
+  // and must not be replaced by a transient client-instance identifier.
+  string device_id = 3;
+  string display_name = 4;
+  ConnectionState state = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp last_seen_at = 7;
+  EntityVersion version = 8;
+}
+
+message Device {
+  string device_id = 1;
+  string display_name = 2;
+  DeviceKind kind = 3;
+  string platform = 4;
+  string app_version = 5;
+  bool revoked = 6;
+  google.protobuf.Timestamp paired_at = 7;
+  google.protobuf.Timestamp last_seen_at = 8;
+  repeated string connection_ids = 9;
+  EntityVersion version = 10;
+  // Explicit owner consent for another paired Device to control this Device's
+  // service node. Pairing alone does not enable inbound control.
+  bool remote_control_enabled = 11;
+  DevicePresenceState presence = 12;
+}
+
+enum DevicePresenceState {
+  DEVICE_PRESENCE_STATE_UNSPECIFIED = 0;
+  DEVICE_PRESENCE_STATE_OFFLINE = 1;
+  DEVICE_PRESENCE_STATE_ONLINE = 2;
+}
+
+// Two-sided consent between paired Devices. A route is effective only while
+// the target opted in globally and both per-Device decisions remain enabled.
+message DeviceControlRelation {
+  string relation_id = 1;
+  string controller_device_id = 2;
+  string target_device_id = 3;
+  bool outbound_enabled = 4;
+  bool inbound_allowed = 5;
+  bool effective = 6;
+  google.protobuf.Timestamp updated_at = 7;
+  EntityVersion version = 8;
+}
+
+enum DeviceKind {
+  DEVICE_KIND_UNSPECIFIED = 0;
+  DEVICE_KIND_WEB = 1;
+  DEVICE_KIND_DESKTOP = 2;
+  DEVICE_KIND_SERVICE = 3;
+}
+
+message PairingChallenge {
+  string challenge_id = 1;
+  string human_code = 2;
+  string verification_uri = 3;
+  google.protobuf.Timestamp expires_at = 4;
+}
+
+message PairingResult {
+  Connection connection = 1;
+  Device device = 2;
+  // connection.device_id and device.device_id are required to be identical.
+  // Present exactly once on successful pairing. Clients must put it in their
+  // prescribed local credential store; Orchestrator stores only its digest.
+  string auth_key = 3;
+}
+
+enum BackendHealth {
+  BACKEND_HEALTH_UNSPECIFIED = 0;
+  BACKEND_HEALTH_STARTING = 1;
+  BACKEND_HEALTH_HEALTHY = 2;
+  BACKEND_HEALTH_DEGRADED = 3;
+  BACKEND_HEALTH_UNAVAILABLE = 4;
+  BACKEND_HEALTH_STOPPED = 5;
+}
+
+enum InstallationState {
+  INSTALLATION_STATE_UNSPECIFIED = 0;
+  INSTALLATION_STATE_NOT_INSTALLED = 1;
+  INSTALLATION_STATE_INSTALLING = 2;
+  INSTALLATION_STATE_INSTALLED = 3;
+  INSTALLATION_STATE_UPDATE_AVAILABLE = 4;
+  INSTALLATION_STATE_ERROR = 5;
+}
+
+message BackendDescriptor {
+  string backend_id = 1;
+  string display_name = 2;
+  string version = 3;
+  BackendHealth health = 4;
+  InstallationState installation_state = 5;
+  AuthenticationState authentication_state = 6;
+  CapabilityManifest capabilities = 7;
+  EntityVersion entity_version = 8;
+  ErrorInfo error = 9;
+}
+
+enum TargetState {
+  TARGET_STATE_UNSPECIFIED = 0;
+  TARGET_STATE_ACTIVE = 1;
+  TARGET_STATE_ARCHIVED = 2;
+  TARGET_STATE_DELETING = 3;
+  TARGET_STATE_ERROR = 4;
+}
+
+message Target {
+  string target_id = 1;
+  string backend_id = 2;
+  string display_name = 3;
+  string workspace_id = 4;
+  TargetState state = 5;
+  bool pinned = 6;
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp last_activity_at = 8;
+  EntityVersion version = 9;
+  ErrorInfo error = 10;
+  // Present only when process and file capabilities are routed through an
+  // authenticated Remote Host rather than the service node.
+  RemoteWorkspaceBinding remote_workspace = 11;
+}
+
+enum SessionState {
+  SESSION_STATE_UNSPECIFIED = 0;
+  SESSION_STATE_CREATING = 1;
+  SESSION_STATE_IDLE = 2;
+  SESSION_STATE_RUNNING = 3;
+  SESSION_STATE_WAITING = 4;
+  SESSION_STATE_DETACHED = 5;
+  SESSION_STATE_RECOVERING = 6;
+  SESSION_STATE_ARCHIVED = 7;
+  SESSION_STATE_CLOSING = 8;
+  SESSION_STATE_CLOSED = 9;
+  SESSION_STATE_ERROR = 10;
+}
+
+message NativeSessionBinding {
+  string backend_id = 1;
+  // Opaque outside the owning adapter; never interpreted by UI or Orchestrator Core.
+  string opaque_reference = 2;
+  uint64 runtime_generation = 3;
+  bool runtime_attached = 4;
+}
+
+// Backend-neutral, point-in-time authority for work that would be interrupted
+// if the owning Orchestrator runtime stopped now. It intentionally reports only
+// coarse public categories: native identifiers and user content never cross
+// this diagnostic boundary.
+enum RuntimeActivityKind {
+  RUNTIME_ACTIVITY_KIND_UNSPECIFIED = 0;
+  RUNTIME_ACTIVITY_KIND_RUN = 1;
+  RUNTIME_ACTIVITY_KIND_QUEUE_DISPATCH = 2;
+  RUNTIME_ACTIVITY_KIND_INTERACTION = 3;
+  RUNTIME_ACTIVITY_KIND_TOOL_LEASE = 4;
+  RUNTIME_ACTIVITY_KIND_BACKGROUND_TASK = 5;
+  RUNTIME_ACTIVITY_KIND_COMPACTION = 6;
+  RUNTIME_ACTIVITY_KIND_USER_SHELL = 7;
+  RUNTIME_ACTIVITY_KIND_SESSION_LIFECYCLE = 8;
+  RUNTIME_ACTIVITY_KIND_SCHEDULE = 9;
+  RUNTIME_ACTIVITY_KIND_REVIEW = 10;
+  RUNTIME_ACTIVITY_KIND_OPERATION = 11;
+  RUNTIME_ACTIVITY_KIND_BROWSER_TRANSFER = 12;
+}
+
+message RuntimeActivitySummary {
+  bool blocks_shutdown = 1;
+  repeated RuntimeActivityKind blocking_kinds = 2;
+  Revision revision = 3;
+  EventCursor cursor = 4;
+  google.protobuf.Timestamp observed_at = 5;
+  // Most recent authority-observed activity boundary that could have belonged
+  // to shutdown-blocking work. Background auto-relaunch uses this timestamp to
+  // Preserve the post-task quiet period without treating recent-but-ended
+  // work as currently blocking a user-confirmed manual relaunch.
+  google.protobuf.Timestamp last_blocking_activity_at = 6;
+}
+
+enum NativeSessionCandidateState {
+  NATIVE_SESSION_CANDIDATE_STATE_UNSPECIFIED = 0;
+  NATIVE_SESSION_CANDIDATE_STATE_READY = 1;
+  NATIVE_SESSION_CANDIDATE_STATE_ERROR = 2;
+}
+
+// Backend-neutral discovery result. native_reference remains opaque outside
+// the owning Adapter and is accepted only by the generic session attach flow.
+message NativeSessionCandidate {
+  string native_session_id = 1;
+  string native_reference = 2;
+  string name = 3;
+  string workspace_root = 4;
+  uint64 message_count = 5;
+  google.protobuf.Timestamp modified_at = 6;
+  NativeSessionCandidateState state = 7;
+  optional string bound_session_id = 8;
+}
+
+enum NativeSessionPlacement {
+  NATIVE_SESSION_PLACEMENT_UNSPECIFIED = 0;
+  NATIVE_SESSION_PLACEMENT_PROJECT = 1;
+  NATIVE_SESSION_PLACEMENT_DIALOGUE = 2;
+}
+
+// A task found while scanning one local Backend profile. Working directory is
+// retained separately from its stable navigation grouping root.
+message NativeSessionCatalogEntry {
+  string native_session_id = 1;
+  string native_reference = 2;
+  string title = 3;
+  optional string working_directory = 4;
+  optional string project_directory = 5;
+  google.protobuf.Timestamp modified_at = 6;
+  bool archived = 7;
+  NativeSessionPlacement placement = 8;
+  optional string target_id = 9;
+  optional string project_target_id = 10;
+  optional string existing_session_id = 11;
+  google.protobuf.Timestamp created_at = 12;
+}
+
+message Session {
+  string session_id = 1;
+  string backend_id = 2;
+  string target_id = 3;
+  string display_name = 4;
+  SessionState state = 5;
+  NativeSessionBinding native_binding = 6;
+  ModelSelection model = 7;
+  PermissionMode permission_mode = 8;
+  bool plan_mode = 9;
+  bool pinned = 10;
+  bool archived = 11;
+  ContextUsage context = 12;
+  string active_native_entry_id = 13;
+  google.protobuf.Timestamp created_at = 14;
+  google.protobuf.Timestamp last_activity_at = 15;
+  EntityVersion version = 16;
+  ErrorInfo error = 17;
+  SessionAttention attention = 18;
+  SessionWorktree worktree = 19;
+  // Immutable creation-time snapshot. A later Target rebind cannot retarget
+  // an already-created task or its native runtime.
+  RemoteWorkspaceBinding remote_workspace = 20;
+  // Bounded generated navigation aid. Empty means no current summary.
+  string task_summary = 21;
+  // Navigation-only project placement. Absence means the dialogue group;
+  // target_id remains the immutable runtime/filesystem identity.
+  optional string project_id = 22;
+  // Durable scheduler ownership retained on the task until that Schedule
+  // incarnation is deleted. Navigation never depends on bounded recent_runs.
+  SessionAutomationOrigin automation_origin = 23;
+  // Backend-neutral, observation-fenced context runtime/control state. Each
+  // optional field is absent when the service cannot prove an authoritative
+  // value for this Session or its configured Backend defaults.
+  SessionContextState context_state = 24;
+  // Immutable product-level lineage. Native entry identities never cross this
+  // boundary; message/event IDs address the generated product timeline.
+  SessionDerivationOrigin derivation_origin = 25;
+  // Session-owner-bound references. A projection with observed=false has been
+  // extracted safely but has no configured capability-owned provider snapshot.
+  repeated CodeHostPullRequestProjection code_host_pull_requests = 26;
+}
+
+message SessionContextState {
+  optional bool compacting = 1;
+  optional bool auto_compaction = 2;
+  optional bool auto_retry = 3;
+}
+
+message SessionAutomationOrigin {
+  string schedule_id = 1;
+  string schedule_name = 2;
+  string run_id = 3;
+}
+
+enum SessionDerivationKind {
+  SESSION_DERIVATION_KIND_UNSPECIFIED = 0;
+  SESSION_DERIVATION_KIND_FORK = 1;
+  SESSION_DERIVATION_KIND_CLONE = 2;
+}
+
+message SessionDerivationOrigin {
+  SessionDerivationKind kind = 1;
+  string source_session_id = 2;
+  optional string source_message_id = 3;
+  optional string source_event_id = 4;
+  bool source_session_available = 5;
+  bool source_message_available = 6;
+}
+
+enum SessionWorktreeState {
+  SESSION_WORKTREE_STATE_UNSPECIFIED = 0;
+  SESSION_WORKTREE_STATE_ACTIVE = 1;
+  // The checkout contains changes or an external branch transition and is
+  // deliberately retained for owner recovery rather than force-deleted.
+  SESSION_WORKTREE_STATE_PRESERVED = 2;
+}
+
+enum WorktreeSourceStrategy {
+  WORKTREE_SOURCE_STRATEGY_UNSPECIFIED = 0;
+  WORKTREE_SOURCE_STRATEGY_EXPLICIT = 1;
+  WORKTREE_SOURCE_STRATEGY_REMOTE_DEFAULT_REFRESHED = 2;
+  WORKTREE_SOURCE_STRATEGY_REMOTE_DEFAULT_LOCAL = 3;
+  WORKTREE_SOURCE_STRATEGY_CURRENT_BRANCH = 4;
+  WORKTREE_SOURCE_STRATEGY_LOCAL_DEFAULT = 5;
+  WORKTREE_SOURCE_STRATEGY_HEAD = 6;
+}
+
+message SessionWorktree {
+  string lease_id = 1;
+  string workspace_id = 2;
+  string working_path_display = 3;
+  string repository_root_display = 4;
+  string branch = 5;
+  string source_ref = 6;
+  string source_commit = 7;
+  WorktreeSourceStrategy source_strategy = 8;
+  bool source_refreshed = 9;
+  optional string source_remote = 10;
+  SessionWorktreeState state = 11;
+  google.protobuf.Timestamp acquired_at = 12;
+  google.protobuf.Timestamp updated_at = 13;
+}
+
+enum SessionAttentionKind {
+  SESSION_ATTENTION_KIND_UNSPECIFIED = 0;
+  SESSION_ATTENTION_KIND_DONE = 1;
+  SESSION_ATTENTION_KIND_AWAITING = 2;
+  SESSION_ATTENTION_KIND_ERROR = 3;
+}
+
+// Durable, content-free attention/read receipt. Both cursors address Session
+// Events and make acknowledgement an exact compare-and-swap operation.
+message SessionAttention {
+  SessionAttentionKind kind = 1;
+  bool unread = 2;
+  EventCursor attention_cursor = 3;
+  EventCursor read_through_cursor = 4;
+  google.protobuf.Timestamp updated_at = 5;
+  // Source Event that established `kind`; distinct from the monotonic CAS
+  // fence when a higher-priority kind survives newer lifecycle observations.
+  EventCursor subject_cursor = 6;
+}
+
+message NativeSessionTree {
+  string session_id = 1;
+  string active_entry_id = 2;
+  // Stack-safe preorder representation. Every node declares its direct child
+  // count in `child_count`.
+  repeated NativeSessionTreeNode flat_nodes = 3;
+  uint32 root_count = 4;
+  Revision revision = 5;
+}
+
+message NativeSessionTreeNode {
+  string entry_id = 1;
+  string parent_entry_id = 2;
+  NativeEntryKind kind = 3;
+  string summary = 4;
+  google.protobuf.Timestamp created_at = 5;
+  bool active = 6;
+  uint32 child_count = 7;
+}
+
+enum NativeEntryKind {
+  NATIVE_ENTRY_KIND_UNSPECIFIED = 0;
+  NATIVE_ENTRY_KIND_USER_MESSAGE = 1;
+  NATIVE_ENTRY_KIND_ASSISTANT_MESSAGE = 2;
+  NATIVE_ENTRY_KIND_TOOL_RESULT = 3;
+  NATIVE_ENTRY_KIND_COMPACTION = 4;
+  NATIVE_ENTRY_KIND_BRANCH_SUMMARY = 5;
+  NATIVE_ENTRY_KIND_MODEL_CHANGE = 6;
+  NATIVE_ENTRY_KIND_CUSTOM = 7;
+}
+
+message SessionStatistics {
+  string session_id = 1;
+  uint64 message_count = 2;
+  uint64 turn_count = 3;
+  uint64 branch_count = 4;
+  uint64 compaction_count = 5;
+  Usage usage = 6;
+  ContextUsage context = 7;
+  google.protobuf.Duration active_duration = 8;
+}
+
+enum RunState {
+  RUN_STATE_UNSPECIFIED = 0;
+  RUN_STATE_ACCEPTED = 1;
+  RUN_STATE_QUEUED = 2;
+  RUN_STATE_DISPATCHING = 3;
+  RUN_STATE_DISPATCH_UNKNOWN = 4;
+  RUN_STATE_RUNNING = 5;
+  RUN_STATE_WAITING = 6;
+  RUN_STATE_RETRYING = 7;
+  RUN_STATE_SUCCEEDED = 8;
+  RUN_STATE_ABORTED = 9;
+  RUN_STATE_FAILED = 10;
+  RUN_STATE_CANCELLED = 11;
+}
+
+message Run {
+  string run_id = 1;
+  string session_id = 2;
+  string target_id = 3;
+  string backend_id = 4;
+  string source_queue_item_id = 5;
+  string retry_of_run_id = 6;
+  RunState state = 7;
+  repeated Attempt attempts = 8;
+  string active_attempt_id = 9;
+  Usage usage = 10;
+  google.protobuf.Timestamp accepted_at = 11;
+  google.protobuf.Timestamp started_at = 12;
+  google.protobuf.Timestamp ended_at = 13;
+  EntityVersion version = 14;
+  ErrorInfo error = 15;
+}
+
+enum AttemptState {
+  ATTEMPT_STATE_UNSPECIFIED = 0;
+  ATTEMPT_STATE_CREATED = 1;
+  ATTEMPT_STATE_DISPATCHING = 2;
+  ATTEMPT_STATE_RUNNING = 3;
+  ATTEMPT_STATE_WAITING = 4;
+  ATTEMPT_STATE_SUCCEEDED = 5;
+  ATTEMPT_STATE_ABORTED = 6;
+  ATTEMPT_STATE_FAILED = 7;
+  ATTEMPT_STATE_SUPERSEDED = 8;
+}
+
+message Attempt {
+  string attempt_id = 1;
+  string run_id = 2;
+  uint32 attempt_number = 3;
+  AttemptState state = 4;
+  uint64 generation = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp started_at = 7;
+  google.protobuf.Timestamp ended_at = 8;
+  google.protobuf.Timestamp retry_at = 9;
+  Usage usage = 10;
+  ErrorInfo error = 11;
+  // Backend process instance selected by durable dispatch admission. Absent
+  // while an accepted run has not acquired a Backend dispatch claim.
+  optional uint64 backend_instance_generation = 12;
+}
+
+enum QueueItemState {
+  QUEUE_ITEM_STATE_UNSPECIFIED = 0;
+  QUEUE_ITEM_STATE_ACCEPTED = 1;
+  QUEUE_ITEM_STATE_QUEUED = 2;
+  QUEUE_ITEM_STATE_DISPATCHING = 3;
+  QUEUE_ITEM_STATE_BACKEND_ACCEPTED = 4;
+  QUEUE_ITEM_STATE_DISPATCH_UNKNOWN = 5;
+  QUEUE_ITEM_STATE_RUNNING = 6;
+  QUEUE_ITEM_STATE_WAITING = 7;
+  QUEUE_ITEM_STATE_COMPLETED = 8;
+  QUEUE_ITEM_STATE_ABORTED = 9;
+  QUEUE_ITEM_STATE_FAILED = 10;
+  QUEUE_ITEM_STATE_CANCELLED = 11;
+}
+
+enum QueueSourceKind {
+  QUEUE_SOURCE_KIND_UNSPECIFIED = 0;
+  QUEUE_SOURCE_KIND_UI = 1;
+  QUEUE_SOURCE_KIND_SCHEDULE = 2;
+  QUEUE_SOURCE_KIND_BACKEND = 3;
+  QUEUE_SOURCE_KIND_RETRY = 4;
+}
+
+message QueueItem {
+  string queue_item_id = 1;
+  string backend_id = 2;
+  string target_id = 3;
+  string session_id = 4;
+  string run_id = 5;
+  QueueSourceKind source_kind = 6;
+  string source_id = 7;
+  QueueDeliveryMode delivery_mode = 8;
+  QueueItemState state = 9;
+  uint64 ordinal = 10;
+  google.protobuf.Timestamp accepted_at = 11;
+  google.protobuf.Timestamp dispatched_at = 12;
+  EntityVersion version = 13;
+  ErrorInfo error = 14;
+  InputContent input = 15;
+  // Set atomically when an accepted item becomes dispatching. It remains the
+  // authority for accepted/unknown outcome recovery after instance replacement.
+  optional uint64 backend_instance_generation = 16;
+  // Transient presentation state only. Lock authority and ownership remain
+  // server-private; snapshots and Events expose only this boolean.
+  bool edit_locked = 17;
+}
+
+// Durable dispatch control for the serialized queue owned by one product
+// Session. Queue items remain QUEUED while this control is paused; pausing does
+// not rewrite their individual lifecycle state or abort an active Run.
+message QueueControl {
+  string session_id = 1;
+  string backend_id = 2;
+  string target_id = 3;
+  QueueDispatchState dispatch_state = 4;
+  string pause_reason = 5;
+  google.protobuf.Timestamp paused_at = 6;
+  ActorRef paused_by = 7;
+  uint64 queued_item_count = 8;
+  EntityVersion version = 9;
+  // Transient presentation state only. The authority token remains private.
+  bool interaction_locked = 10;
+}
+
+enum QueueDispatchState {
+  QUEUE_DISPATCH_STATE_UNSPECIFIED = 0;
+  QUEUE_DISPATCH_STATE_ACTIVE = 1;
+  QUEUE_DISPATCH_STATE_PAUSED = 2;
+}
+
+message InputContent {
+  repeated InputPart parts = 1;
+  // Durable product truth for Joko-owned inline selected-text quotes.
+  // Renderers must not infer this flag from marker-looking user text.
+  bool quotes_encoded = 2;
+  // Ordered, non-overlapping UTF-16 source spans for compact sent-paste UI.
+  // Receivers must reject malformed offsets instead of reordering or clipping.
+  repeated InlineTextRange pasted_text_ranges = 3;
+}
+
+message InlineTextRange {
+  uint32 start = 1;
+  uint32 end = 2;
+  string display = 3;
+}
+
+message InputPart {
+  oneof content {
+    string text = 1;
+    ImageRef image = 2;
+    BlobRef file = 3;
+    ResourceMention resource_mention = 4;
+    WorkspaceMention workspace_mention = 5;
+  }
+}
+
+message ResourceMention {
+  string resource_id = 1;
+  string display_text = 2;
+}
+
+message WorkspaceMention {
+  string workspace_id = 1;
+  string relative_path = 2;
+  string display_text = 3;
+  FileRevision revision = 4;
+}
+
+enum ScheduleState {
+  SCHEDULE_STATE_UNSPECIFIED = 0;
+  SCHEDULE_STATE_ENABLED = 1;
+  SCHEDULE_STATE_DISABLED = 2;
+  SCHEDULE_STATE_RUNNING = 3;
+  SCHEDULE_STATE_ERROR = 4;
+  SCHEDULE_STATE_DELETING = 5;
+}
+
+// Defines how a schedule resolves its product Session before each fire.
+// FRESH creates a new Session for every occurrence, PERSISTENT creates one on
+// first use and durably reuses it, and BOUND always targets a user-selected
+// existing Session.
+enum ScheduleSessionMode {
+  SCHEDULE_SESSION_MODE_UNSPECIFIED = 0;
+  SCHEDULE_SESSION_MODE_FRESH = 1;
+  SCHEDULE_SESSION_MODE_PERSISTENT = 2;
+  SCHEDULE_SESSION_MODE_BOUND = 3;
+}
+
+// Identifies whether a Schedule is owned by the user database or reconciled
+// from the selected project's checked-in automation configuration.
+enum ScheduleSource {
+  SCHEDULE_SOURCE_UNSPECIFIED = 0;
+  SCHEDULE_SOURCE_USER = 1;
+  SCHEDULE_SOURCE_PROJECT = 2;
+}
+
+message Schedule {
+  string schedule_id = 1;
+  string display_name = 2;
+  ScheduleState state = 3;
+  string backend_id = 4;
+  string target_id = 5;
+  string session_id = 6;
+  ScheduleRecurrence recurrence = 7;
+  string time_zone = 8;
+  InputContent input = 9;
+  ScheduleExecutionSnapshot execution = 10;
+  ScheduleOverlapPolicy overlap_policy = 11;
+  ScheduleMisfirePolicy misfire_policy = 12;
+  google.protobuf.Timestamp next_trigger_at = 13;
+  google.protobuf.Timestamp last_triggered_at = 14;
+  repeated ScheduleRunHistory recent_runs = 15;
+  EntityVersion version = 16;
+  ErrorInfo error = 17;
+  ScheduleSessionMode session_mode = 18;
+  ScheduleSource source = 19;
+  string project_config_id = 20;
+  string project_config_path = 21;
+  uint32 unread_run_count = 22;
+}
+
+message ScheduleRecurrence {
+  oneof kind {
+    OneShotRecurrence one_shot = 1;
+    CronRecurrence cron = 2;
+    IntervalRecurrence interval = 3;
+    ManualRecurrence manual = 4;
+  }
+}
+
+message OneShotRecurrence {
+  google.protobuf.Timestamp trigger_at = 1;
+}
+
+message CronRecurrence {
+  string expression = 1;
+}
+
+message IntervalRecurrence {
+  google.protobuf.Duration interval = 1;
+  google.protobuf.Timestamp anchor_at = 2;
+}
+
+message ManualRecurrence {}
+
+enum ScheduleOverlapPolicy {
+  SCHEDULE_OVERLAP_POLICY_UNSPECIFIED = 0;
+  SCHEDULE_OVERLAP_POLICY_QUEUE = 1;
+  SCHEDULE_OVERLAP_POLICY_SKIP = 2;
+}
+
+enum ScheduleMisfirePolicy {
+  SCHEDULE_MISFIRE_POLICY_UNSPECIFIED = 0;
+  SCHEDULE_MISFIRE_POLICY_RUN_ONCE = 1;
+  SCHEDULE_MISFIRE_POLICY_SKIP = 2;
+}
+
+message ScheduleExecutionSnapshot {
+  ModelSelection model = 1;
+  PermissionMode permission_mode = 2;
+  bool plan_mode = 3;
+  repeated string extra_directory_ids = 4;
+  ScheduleExecutionMode execution_mode = 5;
+  ScheduleScriptExecution script = 6;
+  bool silent_when_idle = 7;
+  ScheduleNotification notify = 8;
+  google.protobuf.Timestamp expire_at = 9;
+  SchedulePreRunHook pre_run_hook = 10;
+  // Isolated scheduling is intentionally valid only with FRESH Session mode,
+  // giving every occurrence its own checkout and cleanup lifecycle.
+  bool use_worktree = 11;
+  optional string worktree_source_ref = 12;
+  bool refresh_worktree_remote = 13;
+}
+
+enum ScheduleExecutionMode {
+  SCHEDULE_EXECUTION_MODE_UNSPECIFIED = 0;
+  SCHEDULE_EXECUTION_MODE_AGENT = 1;
+  SCHEDULE_EXECUTION_MODE_SCRIPT = 2;
+}
+
+enum ScheduleScriptCapability {
+  SCHEDULE_SCRIPT_CAPABILITY_UNSPECIFIED = 0;
+  SCHEDULE_SCRIPT_CAPABILITY_SESSIONS_DISPATCH = 1;
+}
+
+message ScheduleScriptExecution {
+  string command = 1;
+  google.protobuf.Duration timeout = 2;
+  repeated ScheduleScriptCapability capabilities = 3;
+}
+
+message ScheduleNotification {
+  bool desktop = 1;
+}
+
+message SchedulePreRunHook {
+  string command = 1;
+  string file_path = 2;
+  google.protobuf.Duration timeout = 3;
+}
+
+message ScheduleRunHistory {
+  string trigger_id = 1;
+  string run_id = 2;
+  google.protobuf.Timestamp scheduled_for = 3;
+  google.protobuf.Timestamp triggered_at = 4;
+  RunState state = 5;
+  ErrorInfo error = 6;
+  // The concrete product Session used by this occurrence. It is independent
+  // of the schedule's current binding so historical task links stay stable.
+  string session_id = 7;
+  google.protobuf.Timestamp finished_at = 8;
+  string result_text = 9;
+  bool zero_cost = 10;
+  // Exact Scheduler outcome. RunState remains for generic run rendering, but
+  // cannot distinguish an application restart from an explicit abort.
+  ScheduleRunOutcome outcome = 11;
+  ScheduleRunCostAttribution cost_attribution = 12;
+  ScheduleRunMoney cost = 13;
+  ScheduleRunMoney estimated_value = 14;
+  SchedulePreRunResult pre_run = 15;
+  google.protobuf.Timestamp read_at = 16;
+  google.protobuf.Duration duration = 17;
+}
+
+enum ScheduleRunPhase {
+  SCHEDULE_RUN_PHASE_UNSPECIFIED = 0;
+  SCHEDULE_RUN_PHASE_LOADING = 1;
+  SCHEDULE_RUN_PHASE_CLAIMING = 2;
+  SCHEDULE_RUN_PHASE_PERSISTING = 3;
+  SCHEDULE_RUN_PHASE_RUNNING = 4;
+  SCHEDULE_RUN_PHASE_QUEUED = 5;
+  SCHEDULE_RUN_PHASE_CANCELLING = 6;
+  SCHEDULE_RUN_PHASE_FINALIZING = 7;
+  SCHEDULE_RUN_PHASE_STALLED = 8;
+  SCHEDULE_RUN_PHASE_RECOVERING = 9;
+}
+
+enum ScheduleFireSource {
+  SCHEDULE_FIRE_SOURCE_UNSPECIFIED = 0;
+  SCHEDULE_FIRE_SOURCE_AUTOMATIC = 1;
+  SCHEDULE_FIRE_SOURCE_RUN_NOW = 2;
+}
+
+message ScheduleInflightRun {
+  string schedule_id = 1;
+  string schedule_name = 2;
+  string run_id = 3;
+  ScheduleFireSource source = 4;
+  ScheduleExecutionMode execution_mode = 5;
+  google.protobuf.Timestamp started_at = 6;
+  google.protobuf.Duration slot_wait = 7;
+  ScheduleRunPhase phase = 8;
+  google.protobuf.Timestamp last_progress_at = 9;
+}
+
+message ScheduleWaitingTask {
+  string schedule_id = 1;
+  string schedule_name = 2;
+  google.protobuf.Timestamp waiting_since = 3;
+}
+
+message SchedulerRuntimeSnapshot {
+  string scheduler_instance_id = 1;
+  optional uint32 process_id = 2;
+  uint32 in_flight = 3;
+  uint32 slots_in_use = 4;
+  uint32 max_concurrent_runs = 5;
+  repeated ScheduleInflightRun in_flight_runs = 6;
+  repeated ScheduleWaitingTask waiting_tasks = 7;
+}
+
+enum BackgroundTaskState {
+  BACKGROUND_TASK_STATE_UNSPECIFIED = 0;
+  BACKGROUND_TASK_STATE_QUEUED = 1;
+  BACKGROUND_TASK_STATE_RUNNING = 2;
+  BACKGROUND_TASK_STATE_WAITING = 3;
+  BACKGROUND_TASK_STATE_SUCCEEDED = 4;
+  BACKGROUND_TASK_STATE_FAILED = 5;
+  BACKGROUND_TASK_STATE_ABORTED = 6;
+}
+
+message BackgroundTask {
+  string background_task_id = 1;
+  string parent_task_id = 2;
+  string backend_id = 3;
+  string target_id = 4;
+  string session_id = 5;
+  string run_id = 6;
+  string display_name = 7;
+  BackgroundTaskState state = 8;
+  string status_text = 9;
+  optional double progress_ratio = 10;
+  google.protobuf.Timestamp started_at = 11;
+  google.protobuf.Timestamp ended_at = 12;
+  EntityVersion version = 13;
+  ErrorInfo error = 14;
+  // First and latest durable observations for this task identity. Event
+  // payloads set both to that observation; history projections preserve the
+  // first value while advancing the latter.
+  google.protobuf.Timestamp created_at = 15;
+  google.protobuf.Timestamp updated_at = 16;
+}
+
+enum ExtensionWidgetPlacement {
+  EXTENSION_WIDGET_PLACEMENT_UNSPECIFIED = 0;
+  EXTENSION_WIDGET_PLACEMENT_ABOVE_EDITOR = 1;
+  EXTENSION_WIDGET_PLACEMENT_BELOW_EDITOR = 2;
+}
+
+// Durable graphical state published by a headless Backend extension. `removed`
+// distinguishes an explicit clear from a valid widget with zero text lines.
+message ExtensionWidget {
+  string session_id = 1;
+  string widget_key = 2;
+  repeated string lines = 3;
+  ExtensionWidgetPlacement placement = 4;
+  google.protobuf.Timestamp updated_at = 5;
+  bool removed = 6;
+}
+
+message ExtensionStatus {
+  string session_id = 1;
+  string status_key = 2;
+  optional string status_text = 3;
+  google.protobuf.Timestamp updated_at = 4;
+}
+
+message RuntimeCommand {
+  string command_id = 1;
+  string name = 2;
+  string description = 3;
+  RuntimeCommandSource source = 4;
+  string resource_id = 5;
+  bool loaded = 6;
+  // Product Session owning this live catalog observation. Required in owner
+  // snapshots, where commands from multiple Sessions share one collection.
+  string session_id = 7;
+}
+
+// Display-safe service-node resource usage for one Adapter-owned runtime.
+// Command lines, executable paths, native references, and environment values
+// are deliberately not representable. The opaque instance id is a spawn fence,
+// not an OS birth identity.
+message RuntimeProcessUsage {
+  string backend_id = 1;
+  string session_id = 2;
+  uint64 runtime_generation = 3;
+  uint64 process_id = 4;
+  double cpu_percent = 5;
+  uint64 memory_kb = 6;
+  uint32 process_count = 7;
+  bool terminable = 8;
+  optional string process_instance_id = 9;
+}
+
+enum RuntimeCommandSource {
+  RUNTIME_COMMAND_SOURCE_UNSPECIFIED = 0;
+  RUNTIME_COMMAND_SOURCE_EXTENSION = 1;
+  RUNTIME_COMMAND_SOURCE_PROMPT = 2;
+  RUNTIME_COMMAND_SOURCE_SKILL = 3;
+  RUNTIME_COMMAND_SOURCE_BACKEND = 4;
+}
+
+enum SessionMessageSearchRole {
+  SESSION_MESSAGE_SEARCH_ROLE_UNSPECIFIED = 0;
+  SESSION_MESSAGE_SEARCH_ROLE_USER = 1;
+  SESSION_MESSAGE_SEARCH_ROLE_ASSISTANT = 2;
+}
+
+enum SessionMessageSearchKind {
+  SESSION_MESSAGE_SEARCH_KIND_UNSPECIFIED = 0;
+  SESSION_MESSAGE_SEARCH_KIND_TEXT_MESSAGE = 1;
+}
+
+enum SessionMessageSearchSemanticMode {
+  SESSION_MESSAGE_SEARCH_SEMANTIC_MODE_UNSPECIFIED = 0;
+  SESSION_MESSAGE_SEARCH_SEMANTIC_MODE_HYBRID = 1;
+  SESSION_MESSAGE_SEARCH_SEMANTIC_MODE_KEYWORD = 2;
+}
+
+// One completed, user-visible message matching a bounded full-text query.
+// Tool/thinking/streaming content is deliberately not representable here.
+message SessionMessageSearchMatch {
+  string session_id = 1;
+  string event_id = 2;
+  string timeline_item_id = 3;
+  SessionMessageSearchRole role = 4;
+  SessionMessageSearchKind kind = 5;
+  string snippet = 6;
+  google.protobuf.Timestamp created_at = 7;
+  double score = 8;
+  // One-based retrieval provenance. Absence means that arm did not recall the
+  // message; zero is never emitted by Orchestrator.
+  optional uint32 fts_rank = 9;
+  optional uint32 vector_rank = 10;
+}
+
+enum ScheduleRunOutcome {
+  SCHEDULE_RUN_OUTCOME_UNSPECIFIED = 0;
+  SCHEDULE_RUN_OUTCOME_QUEUED = 1;
+  SCHEDULE_RUN_OUTCOME_RUNNING = 2;
+  SCHEDULE_RUN_OUTCOME_SUCCEEDED = 3;
+  SCHEDULE_RUN_OUTCOME_SKIPPED = 4;
+  SCHEDULE_RUN_OUTCOME_ABORTED = 5;
+  SCHEDULE_RUN_OUTCOME_INTERRUPTED = 6;
+  SCHEDULE_RUN_OUTCOME_FAILED = 7;
+}
+
+enum ScheduleRunCostAttribution {
+  SCHEDULE_RUN_COST_ATTRIBUTION_UNSPECIFIED = 0;
+  SCHEDULE_RUN_COST_ATTRIBUTION_EXACT = 1;
+  SCHEDULE_RUN_COST_ATTRIBUTION_DIRECT = 2;
+  SCHEDULE_RUN_COST_ATTRIBUTION_MIXED = 3;
+  SCHEDULE_RUN_COST_ATTRIBUTION_ZERO = 4;
+  SCHEDULE_RUN_COST_ATTRIBUTION_UNAVAILABLE = 5;
+}
+
+message ScheduleRunMoney {
+  int64 amount_micros = 1;
+  string currency_code = 2;
+  bool approximate = 3;
+  string kind = 4;
+  repeated string estimate_reasons = 5;
+}
+
+message SchedulePreRunResult {
+  string status = 1;
+  string decision = 2;
+  optional int32 exit_code = 3;
+  google.protobuf.Duration duration = 4;
+  string stdout = 5;
+  string stderr = 6;
+  bool stdout_truncated = 7;
+  bool stderr_truncated = 8;
+  bool timed_out = 9;
+  bool aborted = 10;
+  string spawn_error = 11;
+  string error = 12;
+}

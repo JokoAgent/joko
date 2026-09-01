@@ -1,0 +1,63 @@
+.prompt-recommendation-editor {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  width: 100%;
+  flex: 1 1 auto;
+}
+
+.prompt-recommendation-editor[data-recommendation-active="true"]
+  .composer-rich-editor__content[data-empty="true"] > p:first-child::before {
+  content: none;
+}
+
+.prompt-recommendation-editor__overlay {
+  position: absolute;
+  z-index: 1;
+  top: 12px;
+  right: 14px;
+  left: 14px;
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  max-width: calc(100% - 28px);
+  color: var(--text-faint);
+  font: inherit;
+  line-height: 1.5;
+  pointer-events: none;
+}
+
+.prompt-recommendation-editor__text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.prompt-recommendation-editor__key {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  min-width: 24px;
+  height: 18px;
+  margin-left: 6px;
+  padding: 0 5px;
+  border: 1px solid currentColor;
+  border-radius: 9px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1;
+}
+
+.prompt-recommendation-editor__key--action {
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.prompt-recommendation-editor__key--action:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}

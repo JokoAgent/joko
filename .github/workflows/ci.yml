@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: ${{ matrix.os }} / Node 22.19
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install pnpm 11.22.0
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.22.0
+          run_install: false
+
+      - name: Install Node.js 22.19.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+
+      - name: Use the canonical temporary directory
+        run: |
+          node -e "const fs=require('node:fs'); const os=require('node:os'); const canonical=fs.realpathSync(os.tmpdir()); fs.appendFileSync(process.env.GITHUB_ENV, ['TMPDIR='+canonical, 'TMP='+canonical, 'TEMP='+canonical, ''].join('\n'));"
+
+      - name: Install Linux test dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes ripgrep xvfb
+
+      - name: Install Windows test dependencies
+        if: runner.os == 'Windows'
+        run: choco install ripgrep --no-progress --yes
+
+      - name: Install macOS test dependencies
+        if: runner.os == 'macOS'
+        run: brew install ripgrep
+
+      - name: Install dependencies from lockfile
+        id: dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check build, boundaries, generated contracts, and types
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
+        run: pnpm check
+
+      - name: Run workspace test suite, including Connect end-to-end coverage
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
+        run: pnpm test:ci
+
+      - name: Amplify the short queue soak and fault matrix
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
+        run: pnpm test:soak
+        env:
+          JOKO_E2E_SOAK_ITERATIONS: "2"
+          JOKO_E2E_SOAK_DURATION_MS: "3000"
+          JOKO_E2E_FAULTS: clean,crash,dispatch_unknown,hang
+
+      - name: Build and verify isolated Desktop Orchestrator runtime
+        id: desktop_runtime
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
+        timeout-minutes: 15
+        run: pnpm stage:desktop:orchestrator-runtime
+
+      - name: Run Electron development-host smoke (Linux)
+        if: ${{ !cancelled() && steps.desktop_runtime.outcome == 'success' && runner.os == 'Linux' }}
+        timeout-minutes: 5
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm test:desktop:host
+        env:
+          JOKO_DESKTOP_SMOKE_NO_SANDBOX: "1"
+
+      - name: Run Electron development-host smoke (Windows/macOS)
+        if: ${{ !cancelled() && steps.desktop_runtime.outcome == 'success' && runner.os != 'Linux' }}
+        timeout-minutes: 5
+        run: pnpm test:desktop:host

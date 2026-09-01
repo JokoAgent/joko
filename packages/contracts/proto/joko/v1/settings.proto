@@ -1,0 +1,971 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+import "joko/v1/capability.proto";
+import "joko/v1/common.proto";
+import "joko/v1/interaction.proto";
+import "joko/v1/model.proto";
+import "joko/v1/tool.proto";
+
+enum ThemePreference {
+  THEME_PREFERENCE_UNSPECIFIED = 0;
+  THEME_PREFERENCE_SYSTEM = 1;
+  THEME_PREFERENCE_LIGHT = 2;
+  THEME_PREFERENCE_DARK = 3;
+}
+
+message AppearanceSettings {
+  string locale = 1;
+  ThemePreference theme = 2;
+  bool reduced_motion = 3;
+  bool high_contrast = 4;
+  bool show_thinking = 5;
+}
+
+message ConnectionProfileSettings {
+  string connection_profile_id = 1;
+  string display_name = 2;
+  string server_origin = 3;
+  bool reconnect_automatically = 4;
+  bool desktop_notifications = 5;
+  google.protobuf.Timestamp last_connected_at = 6;
+}
+
+message CredentialDescriptor {
+  string credential_reference_id = 1;
+  string display_name = 2;
+  CredentialKind kind = 3;
+  string provider_id = 4;
+  bool configured = 5;
+  google.protobuf.Timestamp expires_at = 6;
+  google.protobuf.Timestamp last_refreshed_at = 7;
+  ErrorInfo error = 8;
+}
+
+enum CredentialKind {
+  CREDENTIAL_KIND_UNSPECIFIED = 0;
+  CREDENTIAL_KIND_API_KEY = 1;
+  CREDENTIAL_KIND_OAUTH = 2;
+  CREDENTIAL_KIND_SUBSCRIPTION = 3;
+  CREDENTIAL_KIND_LOCAL_KEYLESS = 4;
+  CREDENTIAL_KIND_HEADER_SECRET = 5;
+  CREDENTIAL_KIND_SSH_PRIVATE_KEY = 6;
+}
+
+enum VoiceInputTranscriptionProtocol {
+  VOICE_INPUT_TRANSCRIPTION_PROTOCOL_UNSPECIFIED = 0;
+  VOICE_INPUT_TRANSCRIPTION_PROTOCOL_OPENAI_COMPATIBLE_BATCH = 1;
+  VOICE_INPUT_TRANSCRIPTION_PROTOCOL_OPENAI_COMPATIBLE_REALTIME = 2;
+  VOICE_INPUT_TRANSCRIPTION_PROTOCOL_QWEN_COMPATIBLE_REALTIME = 3;
+}
+
+// Service-node configuration only. The credential value is deliberately not
+// representable; clients see only whether an encrypted reference is usable.
+message VoiceInputServiceSettings {
+  bool enabled = 1;
+  VoiceInputTranscriptionProtocol protocol = 2;
+  string endpoint = 3;
+  string model = 4;
+  bool keyless = 5;
+  bool credential_configured = 6;
+  EntityVersion version = 7;
+  bool refinement_enabled = 8;
+  string refiner_provider_id = 9;
+  string refiner_model_id = 10;
+  string refiner_fallback_provider_id = 11;
+  string refiner_fallback_model_id = 12;
+  bool fallback_enabled = 13;
+  VoiceInputTranscriptionProtocol fallback_protocol = 14;
+  string fallback_endpoint = 15;
+  string fallback_model = 16;
+  bool fallback_keyless = 17;
+  bool fallback_credential_configured = 18;
+}
+
+message VoiceInputServiceSettingsPatch {
+  optional bool enabled = 1;
+  optional VoiceInputTranscriptionProtocol protocol = 2;
+  optional string endpoint = 3;
+  optional string model = 4;
+  optional bool keyless = 5;
+  // A short-lived ticket from CredentialService. Its plaintext never enters
+  // this mutation, Operation storage, diagnostics, or generated snapshots.
+  optional string credential_upload_ticket_id = 6;
+  optional bool clear_credential = 7;
+  Revision expected_revision = 8;
+  optional bool refinement_enabled = 9;
+  optional string refiner_provider_id = 10;
+  optional string refiner_model_id = 11;
+  optional string refiner_fallback_provider_id = 12;
+  optional string refiner_fallback_model_id = 13;
+  optional bool fallback_enabled = 14;
+  optional VoiceInputTranscriptionProtocol fallback_protocol = 15;
+  optional string fallback_endpoint = 16;
+  optional string fallback_model = 17;
+  optional bool fallback_keyless = 18;
+  optional string fallback_credential_upload_ticket_id = 19;
+  optional bool clear_fallback_credential = 20;
+}
+
+message ProviderConfiguration {
+  string provider_id = 1;
+  string display_name = 2;
+  ProviderKind kind = 3;
+  ProviderApiCompatibility api_compatibility = 4;
+  // Canonical endpoint without URL user-info, tokens, or secret query values.
+  string endpoint = 5;
+  string credential_reference_id = 6;
+  bool enabled = 7;
+  EntityVersion version = 8;
+  string api_key_environment = 9;
+  bool keyless = 10;
+  bool auth_header = 11;
+  repeated ProviderHeaderConfiguration headers = 12;
+  repeated ProviderModelConfiguration models = 13;
+}
+
+message ProviderHeaderConfiguration {
+  string header_name = 1;
+  string environment_name = 2;
+  string credential_reference_id = 3;
+}
+
+message ProviderModelConfiguration {
+  string model_id = 1;
+  string display_name = 2;
+  optional ProviderApiCompatibility api_compatibility = 3;
+  bool reasoning = 4;
+  repeated ModelInputModality input_modalities = 5;
+  uint64 context_window_tokens = 6;
+  uint64 maximum_output_tokens = 7;
+  int64 input_cost_micros_per_million = 8;
+  int64 output_cost_micros_per_million = 9;
+  int64 cache_read_cost_micros_per_million = 10;
+  int64 cache_write_cost_micros_per_million = 11;
+  repeated ProviderThinkingLevelMapping thinking_levels = 12;
+  ProviderSamplingConfiguration sampling = 13;
+  ProviderCompatibilityConfiguration compatibility = 14;
+  // Explicit BYOM declaration. False/absent is conservatively unsupported.
+  bool supports_fast_mode = 15;
+  optional bool default_visible = 16;
+}
+
+message ProviderThinkingLevelMapping {
+  string effort_id = 1;
+  optional string native_level = 2;
+}
+
+message ProviderSamplingConfiguration {
+  optional double temperature = 1;
+  optional double top_p = 2;
+  optional int32 top_k = 3;
+  optional double min_p = 4;
+  optional double repetition_penalty = 5;
+  optional double frequency_penalty = 6;
+  optional double presence_penalty = 7;
+  optional uint64 seed = 8;
+}
+
+message ProviderCompatibilityConfiguration {
+  optional bool supports_developer_role = 1;
+  optional bool supports_reasoning_effort = 2;
+  optional bool supports_usage_in_streaming = 3;
+  optional bool supports_finish_reason = 4;
+  optional bool requires_reasoning_content_on_assistant_messages = 5;
+  optional bool supports_store = 6;
+  optional bool supports_strict_mode = 7;
+  optional bool supports_openai_grammar_tools = 8;
+  optional bool supports_eager_tool_input_streaming = 9;
+  optional bool supports_long_cache_retention = 10;
+  optional bool supports_cache_control_on_tools = 11;
+  optional bool supports_strict_tools = 12;
+  optional string thinking_format = 13;
+  optional string cache_control_format = 14;
+}
+
+message BackendSettings {
+  string backend_id = 1;
+  ModelSelection default_model = 2;
+  PermissionMode default_permission_mode = 3;
+  bool default_plan_mode = 4;
+  bool enabled = 5;
+  BackendModelAccessSettings model_access = 6;
+}
+
+message BackendModelAccessSettings {
+  repeated string disabled_provider_ids = 1;
+  repeated ModelKey disabled_models = 2;
+}
+
+message BackendModelAccessUpdate {
+  string provider_id = 1;
+  optional string model_id = 2;
+  bool enabled = 3;
+}
+
+message PiSettings {
+  string backend_id = 1;
+  bool auto_compaction = 2;
+  bool auto_retry = 3;
+  PiQueueMode steering_mode = 4;
+  PiQueueMode follow_up_mode = 5;
+  repeated ManagedResource resources = 6;
+  EntityVersion version = 7;
+  uint32 auto_compaction_threshold_percent = 8;
+  // True only when the owner has a durable threshold override. The effective
+  // value above is always populated, including when it comes from Pi defaults.
+  bool auto_compaction_threshold_customized = 9;
+}
+
+enum PiQueueMode {
+  PI_QUEUE_MODE_UNSPECIFIED = 0;
+  PI_QUEUE_MODE_ALL = 1;
+  PI_QUEUE_MODE_ONE_AT_A_TIME = 2;
+}
+
+enum ResourceKind {
+  RESOURCE_KIND_UNSPECIFIED = 0;
+  RESOURCE_KIND_EXTENSION = 1;
+  RESOURCE_KIND_SKILL = 2;
+  RESOURCE_KIND_PROMPT_TEMPLATE = 3;
+  RESOURCE_KIND_PACKAGE = 4;
+  RESOURCE_KIND_THEME = 5;
+}
+
+enum ResourceCompatibility {
+  RESOURCE_COMPATIBILITY_UNSPECIFIED = 0;
+  RESOURCE_COMPATIBILITY_SUPPORTED = 1;
+  RESOURCE_COMPATIBILITY_PARTIAL = 2;
+  RESOURCE_COMPATIBILITY_UNSUPPORTED = 3;
+  RESOURCE_COMPATIBILITY_UNKNOWN = 4;
+}
+
+enum ResourceCompatibilityIssue {
+  RESOURCE_COMPATIBILITY_ISSUE_UNSPECIFIED = 0;
+  RESOURCE_COMPATIBILITY_ISSUE_WORKING_INDICATOR = 1;
+  RESOURCE_COMPATIBILITY_ISSUE_WIDGET_COMPONENT = 2;
+  RESOURCE_COMPATIBILITY_ISSUE_EDITOR_INTEGRATION = 3;
+  RESOURCE_COMPATIBILITY_ISSUE_TUI_LAYOUT = 4;
+  RESOURCE_COMPATIBILITY_ISSUE_CUSTOM_UI = 5;
+  RESOURCE_COMPATIBILITY_ISSUE_THEME_CONTROL = 6;
+  RESOURCE_COMPATIBILITY_ISSUE_TERMINAL_INPUT = 7;
+  RESOURCE_COMPATIBILITY_ISSUE_TUI_RENDERING = 8;
+  RESOURCE_COMPATIBILITY_ISSUE_CLI_FLAGS = 9;
+  RESOURCE_COMPATIBILITY_ISSUE_ANALYSIS_INCOMPLETE = 10;
+}
+
+enum ResourceUiApi {
+  RESOURCE_UI_API_UNSPECIFIED = 0;
+  RESOURCE_UI_API_SELECT = 1;
+  RESOURCE_UI_API_CONFIRM = 2;
+  RESOURCE_UI_API_INPUT = 3;
+  RESOURCE_UI_API_EDITOR = 4;
+  RESOURCE_UI_API_NOTIFY = 5;
+  RESOURCE_UI_API_SET_STATUS = 6;
+  RESOURCE_UI_API_SET_WORKING_MESSAGE = 7;
+  RESOURCE_UI_API_SET_WORKING_VISIBLE = 8;
+  RESOURCE_UI_API_SET_WORKING_INDICATOR = 9;
+  RESOURCE_UI_API_SET_HIDDEN_THINKING_LABEL = 10;
+  RESOURCE_UI_API_SET_WIDGET = 11;
+  RESOURCE_UI_API_SET_TITLE = 12;
+  RESOURCE_UI_API_SET_EDITOR_TEXT = 13;
+  RESOURCE_UI_API_GET_EDITOR_TEXT = 14;
+  RESOURCE_UI_API_PASTE_TO_EDITOR = 15;
+  RESOURCE_UI_API_GET_EDITOR_COMPONENT = 16;
+  RESOURCE_UI_API_ADD_AUTOCOMPLETE_PROVIDER = 17;
+  RESOURCE_UI_API_SET_EDITOR_COMPONENT = 18;
+  RESOURCE_UI_API_SET_FOOTER = 19;
+  RESOURCE_UI_API_SET_HEADER = 20;
+  RESOURCE_UI_API_SET_TOOLS_EXPANDED = 21;
+  RESOURCE_UI_API_GET_TOOLS_EXPANDED = 22;
+  RESOURCE_UI_API_CUSTOM = 23;
+  RESOURCE_UI_API_GET_ALL_THEMES = 24;
+  RESOURCE_UI_API_GET_THEME = 25;
+  RESOURCE_UI_API_SET_THEME = 26;
+  RESOURCE_UI_API_THEME = 27;
+  RESOURCE_UI_API_ON_TERMINAL_INPUT = 28;
+  RESOURCE_UI_API_REGISTER_SHORTCUT = 29;
+  RESOURCE_UI_API_REGISTER_FLAG = 30;
+  RESOURCE_UI_API_REGISTER_MESSAGE_RENDERER = 31;
+  RESOURCE_UI_API_REGISTER_MARKDOWN_TRANSFORMER = 32;
+  RESOURCE_UI_API_REGISTER_ENTRY_RENDERER = 33;
+}
+
+enum ResourceRuntimeRequirementStatus {
+  RESOURCE_RUNTIME_REQUIREMENT_STATUS_UNSPECIFIED = 0;
+  RESOURCE_RUNTIME_REQUIREMENT_STATUS_COMPATIBLE = 1;
+  RESOURCE_RUNTIME_REQUIREMENT_STATUS_INCOMPATIBLE = 2;
+  RESOURCE_RUNTIME_REQUIREMENT_STATUS_UNKNOWN = 3;
+}
+
+enum ResourcePackageWarning {
+  RESOURCE_PACKAGE_WARNING_UNSPECIFIED = 0;
+  RESOURCE_PACKAGE_WARNING_NO_RESOURCES = 1;
+  RESOURCE_PACKAGE_WARNING_INSPECTION_FAILED = 2;
+  RESOURCE_PACKAGE_WARNING_INSPECTION_LIMIT = 3;
+  RESOURCE_PACKAGE_WARNING_LIFECYCLE_SCRIPTS_DISABLED = 4;
+}
+
+message ResourceCompatibilityDetail {
+  ResourceKind kind = 1;
+  string name = 2;
+  ResourceCompatibility compatibility = 3;
+  repeated ResourceCompatibilityIssue issues = 4;
+  repeated ResourceUiApi detected_apis = 5;
+  repeated ResourceUiApi adapted_apis = 6;
+  repeated ResourceUiApi unsupported_apis = 7;
+}
+
+message ResourceRuntimeRequirement {
+  string package_name = 1;
+  string range = 2;
+  optional string current_version = 3;
+  ResourceRuntimeRequirementStatus status = 4;
+}
+
+enum ResourceScope {
+  RESOURCE_SCOPE_UNSPECIFIED = 0;
+  RESOURCE_SCOPE_USER = 1;
+  RESOURCE_SCOPE_GLOBAL = 2;
+  RESOURCE_SCOPE_PROJECT = 3;
+  RESOURCE_SCOPE_MANAGED = 4;
+}
+
+enum ResourceState {
+  RESOURCE_STATE_UNSPECIFIED = 0;
+  RESOURCE_STATE_DISCOVERED = 1;
+  RESOURCE_STATE_AWAITING_APPROVAL = 2;
+  RESOURCE_STATE_APPROVED = 3;
+  RESOURCE_STATE_INSTALLING = 4;
+  RESOURCE_STATE_INSTALLED = 5;
+  RESOURCE_STATE_LOADED = 6;
+  RESOURCE_STATE_DISABLED = 7;
+  RESOURCE_STATE_UPDATE_AVAILABLE = 8;
+  RESOURCE_STATE_ERROR = 9;
+  RESOURCE_STATE_REMOVED = 10;
+}
+
+enum ResourceAcquisitionKind {
+  RESOURCE_ACQUISITION_KIND_UNSPECIFIED = 0;
+  RESOURCE_ACQUISITION_KIND_LOCAL = 1;
+  RESOURCE_ACQUISITION_KIND_NPM = 2;
+  RESOURCE_ACQUISITION_KIND_GIT = 3;
+}
+
+message LocalResourceAcquisition {
+  // Canonicalized and inspected only on the Orchestrator service node.
+  string server_path = 1;
+}
+
+message NpmResourceAcquisition {
+  string package_name = 1;
+  string version_spec = 2;
+}
+
+message GitResourceAcquisition {
+  string repository_url = 1;
+  string ref = 2;
+  string subdirectory = 3;
+}
+
+message ResourceAcquisitionSource {
+  oneof source {
+    LocalResourceAcquisition local = 1;
+    NpmResourceAcquisition npm = 2;
+    GitResourceAcquisition git = 3;
+  }
+}
+
+message ResourceSource {
+  ResourceScope scope = 1;
+  string source_display = 2;
+  string canonical_path_fingerprint = 3;
+  bool symbolic_link_detected = 4;
+  bool special_file_detected = 5;
+  ResourceAcquisitionKind acquisition_kind = 6;
+  // Stable identity deliberately excludes npm versions and git refs so a
+  // project-scoped package can override the same global package.
+  string source_identity = 7;
+}
+
+message ManagedResource {
+  string resource_id = 1;
+  string backend_id = 2;
+  string target_id = 3;
+  ResourceKind kind = 4;
+  string name = 5;
+  string version = 6;
+  ResourceSource source = 7;
+  ResourceState state = 8;
+  bool enabled = 9;
+  google.protobuf.Timestamp approved_at = 10;
+  string approved_by_connection_id = 11;
+  EntityVersion entity_version = 12;
+  ErrorInfo error = 13;
+  // Immutable content revision reviewed by the owner. This is intentionally
+  // distinct from entity_version, which tracks catalog mutations.
+  string discovered_revision = 14;
+  repeated ResourceCompatibilityDetail compatibility_details = 15;
+  repeated ResourceRuntimeRequirement runtime_requirements = 16;
+  repeated ResourcePackageWarning warnings = 17;
+  repeated string disabled_lifecycle_scripts = 18;
+  bool can_toggle = 19;
+  bool requires_extension_approval = 20;
+  string extension_content_fingerprint = 21;
+  bool post_mutation_notice = 22;
+}
+
+message PolicySettings {
+  PermissionMode default_mode = 1;
+  repeated PolicyRule rules = 2;
+  bool project_trust_required = 3;
+  bool redact_credentials = 4;
+  bool strip_child_process_credentials = 5;
+  EntityVersion version = 6;
+}
+
+enum PolicyEffect {
+  POLICY_EFFECT_UNSPECIFIED = 0;
+  POLICY_EFFECT_ALLOW = 1;
+  POLICY_EFFECT_DENY = 2;
+  POLICY_EFFECT_ASK = 3;
+}
+
+enum PolicySubjectKind {
+  POLICY_SUBJECT_KIND_UNSPECIFIED = 0;
+  POLICY_SUBJECT_KIND_FILE_READ = 1;
+  POLICY_SUBJECT_KIND_FILE_WRITE = 2;
+  POLICY_SUBJECT_KIND_COMMAND = 3;
+  POLICY_SUBJECT_KIND_NETWORK = 4;
+  POLICY_SUBJECT_KIND_MCP = 5;
+  POLICY_SUBJECT_KIND_BROWSER = 6;
+  POLICY_SUBJECT_KIND_RESOURCE = 7;
+  POLICY_SUBJECT_KIND_EXTRA_DIRECTORY = 8;
+}
+
+message PolicyRule {
+  string policy_rule_id = 1;
+  string display_name = 2;
+  PolicyEffect effect = 3;
+  PolicySubjectKind subject_kind = 4;
+  string backend_id = 5;
+  string target_id = 6;
+  string workspace_relative_path_prefix = 7;
+  string tool_provider_id = 8;
+  string tool_name = 9;
+  PermissionRisk ceiling = 10;
+  bool enabled = 11;
+  uint32 priority = 12;
+}
+
+message BrowserSettings {
+  string browser_provider_id = 1;
+  string profile_display_name = 2;
+  google.protobuf.Duration takeover_timeout = 3;
+  bool allow_uploads = 4;
+  bool allow_downloads = 5;
+  EntityVersion version = 6;
+  BrowserAutomationTarget automation_target = 7;
+  CapabilitySupport support = 8;
+  string support_reason = 9;
+  string detected_browser = 10;
+  repeated BrowserTargetSettings target_settings = 11;
+  BrowserBackendHealth backend_health = 12;
+}
+
+// Browser tools are frozen into newly-created Agent runtimes per Target.
+// Service-level Browser placement, profile, and transfer policy remain in
+// BrowserSettings and do not override this project-scoped activation.
+message BrowserTargetSettings {
+  string target_id = 1;
+  bool enabled = 2;
+  EntityVersion version = 3;
+}
+
+enum BrowserBackendStatus {
+  BROWSER_BACKEND_STATUS_UNSPECIFIED = 0;
+  BROWSER_BACKEND_STATUS_READY = 1;
+  BROWSER_BACKEND_STATUS_RECOVERING = 2;
+  BROWSER_BACKEND_STATUS_DISCONNECTED = 3;
+  BROWSER_BACKEND_STATUS_UNAVAILABLE = 4;
+  BROWSER_BACKEND_STATUS_ERROR = 5;
+}
+
+enum BrowserBackendFailureReason {
+  BROWSER_BACKEND_FAILURE_REASON_UNSPECIFIED = 0;
+  BROWSER_BACKEND_FAILURE_REASON_DISPOSING = 1;
+  BROWSER_BACKEND_FAILURE_REASON_HOST_UNAVAILABLE = 2;
+  BROWSER_BACKEND_FAILURE_REASON_START_FAILED = 3;
+  BROWSER_BACKEND_FAILURE_REASON_STATUS_FAILED = 4;
+  BROWSER_BACKEND_FAILURE_REASON_RECOVERY_FAILED = 5;
+}
+
+message BrowserBackendHealth {
+  bool active = 1;
+  BrowserBackendStatus status = 2;
+  bool can_recover = 3;
+  BrowserBackendFailureReason reason = 4;
+}
+
+// Browser placement is owner policy, independent from whether browser tools
+// are enabled for newly-created Agent sessions.
+enum BrowserAutomationTarget {
+  BROWSER_AUTOMATION_TARGET_UNSPECIFIED = 0;
+  BROWSER_AUTOMATION_TARGET_SIDEBAR = 1;
+  BROWSER_AUTOMATION_TARGET_EXTERNAL = 2;
+}
+
+enum AutomationPermissionState {
+  AUTOMATION_PERMISSION_STATE_UNSPECIFIED = 0;
+  AUTOMATION_PERMISSION_STATE_GRANTED = 1;
+  AUTOMATION_PERMISSION_STATE_MISSING = 2;
+  AUTOMATION_PERMISSION_STATE_UNKNOWN = 3;
+  AUTOMATION_PERMISSION_STATE_NOT_REQUIRED = 4;
+}
+
+enum ComputerAutomationRuntimeState {
+  COMPUTER_AUTOMATION_RUNTIME_STATE_UNSPECIFIED = 0;
+  COMPUTER_AUTOMATION_RUNTIME_STATE_DISABLED = 1;
+  COMPUTER_AUTOMATION_RUNTIME_STATE_CHECKING = 2;
+  COMPUTER_AUTOMATION_RUNTIME_STATE_READY = 3;
+  COMPUTER_AUTOMATION_RUNTIME_STATE_UNAVAILABLE = 4;
+  COMPUTER_AUTOMATION_RUNTIME_STATE_ERROR = 5;
+}
+
+enum ComputerAutomationUpdatePhase {
+  COMPUTER_AUTOMATION_UPDATE_PHASE_UNSPECIFIED = 0;
+  COMPUTER_AUTOMATION_UPDATE_PHASE_DOWNLOADING = 1;
+  COMPUTER_AUTOMATION_UPDATE_PHASE_INSTALLING = 2;
+  COMPUTER_AUTOMATION_UPDATE_PHASE_DONE = 3;
+}
+
+// A credential-free projection of the local computer Tool Provider. Service
+// paths and process output deliberately remain private to Orchestrator.
+message ComputerAutomationSettings {
+  bool enabled = 1;
+  CapabilitySupport support = 2;
+  string support_reason = 3;
+  bool installed = 4;
+  string driver_version = 5;
+  bool daemon_running = 6;
+  AutomationPermissionState accessibility_permission = 7;
+  AutomationPermissionState screen_recording_permission = 8;
+  bool screen_recording_capturable = 9;
+  bool ready = 10;
+  ComputerAutomationRuntimeState runtime_state = 11;
+  string failure_reason = 12;
+  string platform = 13;
+  EntityVersion version = 14;
+  string update_current_version = 15;
+  string update_latest_version = 16;
+  bool update_available = 17;
+  bool update_in_progress = 18;
+  ComputerAutomationUpdatePhase update_phase = 19;
+  optional uint64 update_downloaded_bytes = 20;
+  optional uint64 update_total_bytes = 21;
+}
+
+enum AndroidAutomationRuntimeState {
+  ANDROID_AUTOMATION_RUNTIME_STATE_UNSPECIFIED = 0;
+  ANDROID_AUTOMATION_RUNTIME_STATE_DISABLED = 1;
+  ANDROID_AUTOMATION_RUNTIME_STATE_CHECKING = 2;
+  ANDROID_AUTOMATION_RUNTIME_STATE_PREPARING = 3;
+  ANDROID_AUTOMATION_RUNTIME_STATE_READY = 4;
+  ANDROID_AUTOMATION_RUNTIME_STATE_UNAVAILABLE = 5;
+  ANDROID_AUTOMATION_RUNTIME_STATE_ERROR = 6;
+}
+
+enum AndroidAdbPathSource {
+  ANDROID_ADB_PATH_SOURCE_UNSPECIFIED = 0;
+  ANDROID_ADB_PATH_SOURCE_CUSTOM = 1;
+  ANDROID_ADB_PATH_SOURCE_ENVIRONMENT = 2;
+  ANDROID_ADB_PATH_SOURCE_PREPARED = 3;
+  ANDROID_ADB_PATH_SOURCE_BUNDLED = 4;
+  ANDROID_ADB_PATH_SOURCE_SDK = 5;
+  ANDROID_ADB_PATH_SOURCE_PATH = 6;
+  ANDROID_ADB_PATH_SOURCE_FALLBACK = 7;
+}
+
+enum AndroidAutomationIssue {
+  ANDROID_AUTOMATION_ISSUE_UNSPECIFIED = 0;
+  ANDROID_AUTOMATION_ISSUE_ADB_NOT_FOUND = 1;
+  ANDROID_AUTOMATION_ISSUE_NO_DEVICE = 2;
+  ANDROID_AUTOMATION_ISSUE_MULTIPLE_DEVICES = 3;
+  ANDROID_AUTOMATION_ISSUE_DEVICE_UNAUTHORIZED = 4;
+  ANDROID_AUTOMATION_ISSUE_DEVICE_OFFLINE = 5;
+  ANDROID_AUTOMATION_ISSUE_UI_DUMP_FAILED = 6;
+  ANDROID_AUTOMATION_ISSUE_SCREENSHOT_FAILED = 7;
+  ANDROID_AUTOMATION_ISSUE_INVALID_NODE = 8;
+  ANDROID_AUTOMATION_ISSUE_DRIVER_ERROR = 9;
+}
+
+message AndroidDeviceDescriptor {
+  string device_serial = 1;
+  string state = 2;
+  string product = 3;
+  string model = 4;
+  string device = 5;
+  string transport_id = 6;
+  string usb = 7;
+}
+
+// Machine-global owner choices plus a bounded, credential-free ADB projection.
+// The active binary path is shown because the owner may explicitly replace it.
+message AndroidAutomationSettings {
+  bool enabled = 1;
+  CapabilitySupport support = 2;
+  string support_reason = 3;
+  bool adb_available = 4;
+  string adb_path = 5;
+  AndroidAdbPathSource adb_path_source = 6;
+  bool preparation_supported = 7;
+  bool preparation_ready = 8;
+  string preparation_error = 9;
+  string adb_version = 10;
+  repeated AndroidDeviceDescriptor devices = 11;
+  string default_device_serial = 12;
+  string configured_default_device_serial = 13;
+  string adb_path_override = 14;
+  AndroidAutomationIssue issue = 15;
+  string failure_reason = 16;
+  string platform = 17;
+  AndroidAutomationRuntimeState runtime_state = 18;
+  EntityVersion version = 19;
+  bool status_observed = 20;
+}
+
+message DiagnosticSettings {
+  DiagnosticLevel level = 1;
+  google.protobuf.Duration retention = 2;
+  bool include_sanitized_backend_payloads = 3;
+  bool include_performance_metrics = 4;
+}
+
+message MessageSearchSettings {
+  bool semantic_index_enabled = 1;
+  bool vector_available = 2;
+  string model_id = 3;
+  uint64 pending_count = 4;
+  uint64 running_count = 5;
+  uint64 done_count = 6;
+  uint64 failed_count = 7;
+  // True only when Orchestrator can resolve the configured model to an authenticated
+  // embedding route. No endpoint, credential reference, or secret is exposed.
+  bool embedding_provider_available = 8;
+  bool customized = 9;
+}
+
+// One exact Backend-owned Provider model route. Credentials and endpoints
+// deliberately remain inside Orchestrator.
+message ModelRouteRef {
+  string backend_id = 1;
+  string provider_id = 2;
+  string model_id = 3;
+}
+
+message ModelRouteRefList {
+  repeated ModelRouteRef values = 1;
+}
+
+message VisionBridgeSettings {
+  bool enabled = 1;
+  repeated ModelRouteRef target_models = 2;
+  optional ModelRouteRef primary = 3;
+  optional ModelRouteRef fallback = 4;
+  // Runtime capability, kept separate from the owner's durable choice.
+  bool available = 5;
+  string unavailable_reason = 6;
+  bool customized = 7;
+  repeated string customized_fields = 8;
+}
+
+message PromptRecommendationSettings {
+  // Defaults on. Prediction results remain ephemeral.
+  bool enabled = 1;
+  bool available = 2;
+  string unavailable_reason = 3;
+  bool customized = 4;
+}
+
+message LanguageToolSettings {
+  // Experimental and deliberately opt-in. The value is sampled only when a
+  // new Session runtime freezes its direct tool catalog.
+  bool enabled = 1;
+}
+
+enum ManagedProcessPriority {
+  MANAGED_PROCESS_PRIORITY_UNSPECIFIED = 0;
+  MANAGED_PROCESS_PRIORITY_NORMAL = 1;
+  MANAGED_PROCESS_PRIORITY_LOW = 2;
+  MANAGED_PROCESS_PRIORITY_LOWEST = 3;
+}
+
+// Machine-global local Agent resource policy. A zero command limit is
+// intentionally represented as unlimited; credentials and process IDs are
+// never projected through settings.
+message AgentResourceSettings {
+  uint32 max_concurrent_commands = 1;
+  ManagedProcessPriority process_priority = 2;
+  bool cap_toolchain_threads = 3;
+  bool customized = 4;
+  EntityVersion version = 5;
+}
+
+// Machine-global managed-worker capacity policy. Limits are sampled by new
+// local runtimes and idle release never discards the durable worker record.
+message CollaborationSettings {
+  uint32 worker_soft_limit = 1;
+  uint32 worker_hard_limit = 2;
+  uint32 worker_idle_release_minutes = 3;
+  bool customized = 4;
+  EntityVersion version = 5;
+}
+
+// Automatic workspace savepoints are opt-in. Counts are bounded operational
+// status only; repository paths, filenames, and commit contents stay private.
+message GitSafetySettings {
+  bool auto_snapshot_enabled = 1;
+  uint32 pending_turns = 2;
+  uint32 tracked_sessions = 3;
+  uint32 tracked_repositories = 4;
+  bool cleanup_available = 5;
+  bool customized = 6;
+  EntityVersion version = 7;
+}
+
+enum ToolPolicyEffectiveSource {
+  TOOL_POLICY_EFFECTIVE_SOURCE_UNSPECIFIED = 0;
+  TOOL_POLICY_EFFECTIVE_SOURCE_PRODUCT_DEFAULT = 1;
+  TOOL_POLICY_EFFECTIVE_SOURCE_USER_DEFAULT = 2;
+  TOOL_POLICY_EFFECTIVE_SOURCE_PROJECT_OVERRIDE = 3;
+}
+
+message ToolPolicyOverride {
+  bool enabled = 1;
+}
+
+message ToolPolicyTargetSettings {
+  string target_id = 1;
+  bool effective_enabled = 2;
+  ToolPolicyEffectiveSource effective_source = 3;
+  ToolPolicyOverride project_override = 4;
+  EntityVersion version = 5;
+}
+
+message ToolPolicySettings {
+  string tool_provider_id = 1;
+  string display_name = 2;
+  string description = 3;
+  bool product_default_enabled = 4;
+  bool user_effective_enabled = 5;
+  ToolPolicyEffectiveSource user_effective_source = 6;
+  ToolPolicyOverride user_override = 7;
+  repeated ToolPolicyTargetSettings target_settings = 8;
+  EntityVersion version = 9;
+}
+
+enum DiagnosticLevel {
+  DIAGNOSTIC_LEVEL_UNSPECIFIED = 0;
+  DIAGNOSTIC_LEVEL_ERRORS = 1;
+  DIAGNOSTIC_LEVEL_STANDARD = 2;
+  DIAGNOSTIC_LEVEL_VERBOSE = 3;
+}
+
+message SettingsSnapshot {
+  AppearanceSettings appearance = 1;
+  repeated ConnectionProfileSettings connection_profiles = 2;
+  repeated BackendSettings backends = 3;
+  repeated ProviderConfiguration providers = 4;
+  repeated CredentialDescriptor credentials = 5;
+  repeated McpServerDescriptor mcp_servers = 6;
+  repeated BrowserSettings browsers = 7;
+  repeated PiSettings pi = 8;
+  PolicySettings policy = 9;
+  DiagnosticSettings diagnostics = 10;
+  Revision revision = 11;
+  MessageSearchSettings message_search = 12;
+  PersonalizationSettings personalization = 13;
+  MemorySettings memory = 14;
+  VisionBridgeSettings vision_bridge = 20;
+  PromptRecommendationSettings prompt_recommendation = 21;
+  ComputerAutomationSettings computer_automation = 22;
+  AndroidAutomationSettings android_automation = 23;
+  LanguageToolSettings language_tools = 24;
+  AgentResourceSettings agent_resource = 25;
+  CollaborationSettings collaboration = 26;
+  GitSafetySettings git_safety = 27;
+  repeated ToolPolicySettings tool_policies = 28;
+  VoiceInputServiceSettings voice_input = 29;
+}
+
+message AppearanceSettingsPatch {
+  optional string locale = 1;
+  optional ThemePreference theme = 2;
+  optional bool reduced_motion = 3;
+  optional bool high_contrast = 4;
+  optional bool show_thinking = 5;
+}
+
+message BackendSettingsPatch {
+  string backend_id = 1;
+  optional ModelSelection default_model = 2;
+  optional PermissionMode default_permission_mode = 3;
+  optional bool default_plan_mode = 4;
+  optional bool enabled = 5;
+  bool clear_default_model = 6;
+  BackendModelAccessUpdate model_access_update = 7;
+}
+
+message PiSettingsPatch {
+  string backend_id = 1;
+  optional bool auto_compaction = 2;
+  optional bool auto_retry = 3;
+  optional PiQueueMode steering_mode = 4;
+  optional PiQueueMode follow_up_mode = 5;
+  optional uint32 auto_compaction_threshold_percent = 6;
+  // Deletes the durable threshold override and hot-applies the effective Pi
+  // default to active runtimes. It cannot be combined with a threshold value.
+  bool reset_auto_compaction_threshold_percent = 7;
+}
+
+message BrowserSettingsPatch {
+  string browser_provider_id = 1;
+  optional bool enabled = 2;
+  optional string profile_display_name = 3;
+  optional google.protobuf.Duration takeover_timeout = 4;
+  optional bool allow_uploads = 5;
+  optional bool allow_downloads = 6;
+  optional BrowserAutomationTarget automation_target = 7;
+  // Required when enabled is present; ignored for service-level fields.
+  string target_id = 8;
+}
+
+message ComputerAutomationSettingsPatch {
+  optional bool enabled = 1;
+}
+
+message AndroidAutomationSettingsPatch {
+  optional bool enabled = 1;
+}
+
+message AndroidDeviceSelection {
+  oneof choice {
+    bool automatic = 1;
+    string device_serial = 2;
+  }
+}
+
+message AndroidAdbPathSelection {
+  oneof choice {
+    bool automatic = 1;
+    // Interpreted and validated only on the Orchestrator service node.
+    string server_path = 2;
+  }
+}
+
+enum ComputerAutomationPermissionKind {
+  COMPUTER_AUTOMATION_PERMISSION_KIND_UNSPECIFIED = 0;
+  COMPUTER_AUTOMATION_PERMISSION_KIND_ACCESSIBILITY = 1;
+  COMPUTER_AUTOMATION_PERMISSION_KIND_SCREEN_RECORDING = 2;
+  COMPUTER_AUTOMATION_PERMISSION_KIND_ALL = 3;
+}
+
+message DiagnosticSettingsPatch {
+  optional DiagnosticLevel level = 1;
+  optional google.protobuf.Duration retention = 2;
+  optional bool include_sanitized_backend_payloads = 3;
+  optional bool include_performance_metrics = 4;
+}
+
+message MessageSearchSettingsPatch {
+  optional bool semantic_index_enabled = 1;
+  bool reset_semantic_index_enabled = 2;
+}
+
+message BackendMemorySettings {
+  string backend_id = 1;
+  bool enabled = 2;
+  CapabilitySupport support = 3;
+  string reason = 4;
+  uint64 entry_count = 5;
+}
+
+message MemorySettings {
+  bool maker_enabled = 1;
+  CapabilitySupport maker_support = 2;
+  string maker_reason = 3;
+  bool customized = 4;
+  uint64 entry_count = 5;
+  repeated BackendMemorySettings backends = 6;
+}
+
+message MemorySettingsPatch {
+  optional bool maker_enabled = 1;
+  string backend_id = 2;
+  optional bool backend_enabled = 3;
+}
+
+message PersonalizationSettings {
+  bool silent_encrypted_retry_enabled = 1;
+  bool silent_encrypted_retry_customized = 2;
+  bool session_runtime_fallback_enabled = 3;
+  bool session_runtime_fallback_customized = 4;
+}
+
+message PersonalizationSettingsPatch {
+  optional bool silent_encrypted_retry_enabled = 1;
+  bool reset_silent_encrypted_retry = 2;
+  optional bool session_runtime_fallback_enabled = 3;
+  bool reset_session_runtime_fallback = 4;
+}
+
+message VisionBridgeSettingsPatch {
+  optional bool enabled = 1;
+  // Presence distinguishes preserve-current from an explicit empty list.
+  ModelRouteRefList target_models = 2;
+  // A present reference with empty IDs clears that slot.
+  optional ModelRouteRef primary = 3;
+  optional ModelRouteRef fallback = 4;
+  // Reset operations delete durable overrides instead of serializing today's
+  // defaults, so future Provider catalog changes still flow through.
+  bool reset_all = 5;
+  bool reset_target_models = 6;
+}
+
+message PromptRecommendationSettingsPatch {
+  optional bool enabled = 1;
+  bool reset_enabled = 2;
+}
+
+message LanguageToolSettingsPatch {
+  optional bool enabled = 1;
+}
+
+message AgentResourceSettingsPatch {
+  optional uint32 max_concurrent_commands = 1;
+  optional ManagedProcessPriority process_priority = 2;
+  optional bool cap_toolchain_threads = 3;
+  bool reset_all = 4;
+}
+
+message CollaborationSettingsPatch {
+  optional uint32 worker_soft_limit = 1;
+  optional uint32 worker_hard_limit = 2;
+  optional uint32 worker_idle_release_minutes = 3;
+  bool reset_all = 4;
+}
+
+message GitSafetySettingsPatch {
+  optional bool auto_snapshot_enabled = 1;
+  bool reset_all = 2;
+}
+
+message ToolPolicySettingsPatch {
+  string tool_provider_id = 1;
+  string target_id = 2;
+  optional bool enabled = 3;
+  bool reset = 4;
+}

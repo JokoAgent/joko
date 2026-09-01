@@ -1,0 +1,1380 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+import "joko/v1/capability.proto";
+import "joko/v1/common.proto";
+import "joko/v1/interaction.proto";
+import "joko/v1/model.proto";
+import "joko/v1/review.proto";
+import "joko/v1/runtime.proto";
+import "joko/v1/settings.proto";
+import "joko/v1/subagent.proto";
+import "joko/v1/tool.proto";
+import "joko/v1/workspace.proto";
+
+enum OperationState {
+  OPERATION_STATE_UNSPECIFIED = 0;
+  OPERATION_STATE_ACCEPTED = 1;
+  OPERATION_STATE_RUNNING = 2;
+  OPERATION_STATE_WAITING = 3;
+  OPERATION_STATE_SUCCEEDED = 4;
+  OPERATION_STATE_FAILED = 5;
+  OPERATION_STATE_CANCELLED = 6;
+  OPERATION_STATE_CONFLICT = 7;
+}
+
+message Operation {
+  string operation_id = 1;
+  string connection_id = 2;
+  string request_sha256_hex = 3;
+  OperationState state = 4;
+  OperationMutation mutation = 5;
+  OperationResult result = 6;
+  ErrorInfo error = 7;
+  ActorRef actor = 8;
+  uint64 generation = 9;
+  google.protobuf.Timestamp accepted_at = 10;
+  google.protobuf.Timestamp started_at = 11;
+  google.protobuf.Timestamp completed_at = 12;
+  EntityVersion version = 13;
+}
+
+message OperationPrecondition {
+  EntityRef entity = 1;
+  Revision expected_revision = 2;
+  uint64 expected_generation = 3;
+}
+
+message OperationMutation {
+  repeated OperationPrecondition preconditions = 1;
+  oneof payload {
+    RevokeDeviceMutation revoke_device = 10;
+    LogoutConnectionMutation logout_connection = 11;
+    RestartBackendMutation restart_backend = 12;
+    CreateTargetMutation create_target = 13;
+    UpdateTargetMutation update_target = 14;
+    ArchiveTargetMutation archive_target = 15;
+    DeleteTargetMutation delete_target = 16;
+    CreateSessionMutation create_session = 20;
+    ResumeSessionMutation resume_session = 21;
+    DetachSessionMutation detach_session = 22;
+    CloseSessionMutation close_session = 23;
+    RenameSessionMutation rename_session = 24;
+    PinSessionMutation pin_session = 25;
+    ArchiveSessionMutation archive_session = 26;
+    DeleteSessionMutation delete_session = 27;
+    ForkSessionMutation fork_session = 28;
+    CloneSessionMutation clone_session = 29;
+    NavigateSessionBranchMutation navigate_session_branch = 30;
+    CompactSessionMutation compact_session = 31;
+    ExportSessionMutation export_session = 32;
+    SetSessionModelMutation set_session_model = 33;
+    SetSessionPermissionMutation set_session_permission = 34;
+    SetSessionPlanModeMutation set_session_plan_mode = 35;
+    MoveSessionProjectMutation move_session_project = 36;
+    SendInputMutation send_input = 40;
+    AbortRunMutation abort_run = 41;
+    RetryRunMutation retry_run = 42;
+    AbortRetryMutation abort_retry = 43;
+    CancelQueueItemMutation cancel_queue_item = 44;
+    EditQueueItemMutation edit_queue_item = 45;
+    ReorderQueueItemMutation reorder_queue_item = 46;
+    PauseQueueMutation pause_queue = 47;
+    ResumeQueueMutation resume_queue = 48;
+    SetQueueItemEditLockMutation set_queue_item_edit_lock = 49;
+    SetQueueInteractionLockMutation set_queue_interaction_lock = 66;
+    CreateScheduleMutation create_schedule = 50;
+    UpdateScheduleMutation update_schedule = 51;
+    DeleteScheduleMutation delete_schedule = 52;
+    TriggerScheduleMutation trigger_schedule = 53;
+    SetScheduleEnabledMutation set_schedule_enabled = 54;
+    ReconcileProjectAutomationsMutation reconcile_project_automations = 55;
+    PromoteScheduleToProjectMutation promote_schedule_to_project = 56;
+    CloneProjectScheduleToUserMutation clone_project_schedule_to_user = 57;
+    RemoveProjectScheduleMutation remove_project_schedule = 58;
+    MarkScheduleRunReadMutation mark_schedule_run_read = 59;
+    DeleteScheduleRunMutation delete_schedule_run = 62;
+    RestartScheduleRunMutation restart_schedule_run = 63;
+    MarkScheduleRunsReadMutation mark_schedule_runs_read = 64;
+    MarkAllScheduleRunsReadMutation mark_all_schedule_runs_read = 65;
+    ResolveInteractionMutation resolve_interaction = 60;
+    DismissInteractionMutation dismiss_interaction = 61;
+    SetWorkspaceTrustMutation set_workspace_trust = 70;
+    AddExtraDirectoryMutation add_extra_directory = 71;
+    RemoveExtraDirectoryMutation remove_extra_directory = 72;
+    ExecuteWorkspaceRewindMutation execute_workspace_rewind = 73;
+    DeleteArtifactMutation delete_artifact = 74;
+    UpdateAppearanceSettingsMutation update_appearance_settings = 80;
+    UpdateBackendSettingsMutation update_backend_settings = 81;
+    UpdatePiSettingsMutation update_pi_settings = 82;
+    ReplacePolicySettingsMutation replace_policy_settings = 83;
+    UpdateDiagnosticSettingsMutation update_diagnostic_settings = 84;
+    UpsertProviderMutation upsert_provider = 85;
+    DeleteProviderMutation delete_provider = 86;
+    CommitCredentialMutation commit_credential = 87;
+    DeleteCredentialMutation delete_credential = 88;
+    BeginProviderLoginMutation begin_provider_login = 89;
+    UpsertMcpServerMutation upsert_mcp_server = 90;
+    DeleteMcpServerMutation delete_mcp_server = 91;
+    RestartMcpServerMutation restart_mcp_server = 92;
+    ApproveResourceMutation approve_resource = 93;
+    InstallResourceMutation install_resource = 94;
+    UpdateResourceMutation update_resource = 95;
+    SetResourceEnabledMutation set_resource_enabled = 96;
+    RemoveResourceMutation remove_resource = 97;
+    AbortToolCallMutation abort_tool_call = 100;
+    RestartBrowserMutation restart_browser = 101;
+    BeginBrowserTakeoverMutation begin_browser_takeover = 102;
+    EndBrowserTakeoverMutation end_browser_takeover = 103;
+    CaptureBrowserScreenshotMutation capture_browser_screenshot = 104;
+    RecoverBrowserMutation recover_browser = 105;
+    RefreshProviderCredentialMutation refresh_provider_credential = 106;
+    LogoutProviderMutation logout_provider = 107;
+    CreateDiagnosticsBundleMutation create_diagnostics_bundle = 108;
+    UploadBrowserFileMutation upload_browser_file = 111;
+    UpdateBrowserSettingsMutation update_browser_settings = 112;
+    DiscoverProjectResourcesMutation discover_project_resources = 113;
+    AddResourceMutation add_resource = 114;
+    BrowserTakeoverActionMutation browser_takeover_action = 115;
+    ExecuteUserShellMutation execute_user_shell = 116;
+    AbortUserShellMutation abort_user_shell = 117;
+    UpdateMessageSearchSettingsMutation update_message_search_settings = 118;
+    DeleteSessionMessageMutation delete_session_message = 119;
+    ApplyWorkspaceDiffHunkMutation apply_workspace_diff_hunk = 120;
+    ResetSessionMutation reset_session = 121;
+    CommitWorkspaceDiffMutation commit_workspace_diff = 122;
+    UpdateMemorySettingsMutation update_memory_settings = 140;
+    ResetMemoryMutation reset_memory = 141;
+    UpdateVisionBridgeSettingsMutation update_vision_bridge_settings = 142;
+    UpdatePromptRecommendationSettingsMutation update_prompt_recommendation_settings = 143;
+    PushWorkspaceBranchMutation push_workspace_branch = 123;
+    StartReviewMutation start_review = 124;
+    CreateWorkspaceEntryMutation create_workspace_entry = 125;
+    MoveWorkspaceEntryMutation move_workspace_entry = 126;
+    DeleteWorkspaceEntryMutation delete_workspace_entry = 127;
+    CopyWorkspaceEntryMutation copy_workspace_entry = 128;
+    AcknowledgeSessionAttentionMutation acknowledge_session_attention = 129;
+    OpenBrowserPageMutation open_browser_page = 130;
+    UpdatePersonalizationSettingsMutation update_personalization_settings = 144;
+    UpdateComputerAutomationSettingsMutation update_computer_automation_settings = 145;
+    InstallComputerAutomationMutation install_computer_automation = 146;
+    ProbeComputerAutomationMutation probe_computer_automation = 147;
+    RequestComputerAutomationPermissionMutation request_computer_automation_permission = 148;
+    ShowBrowserAutomationMutation show_browser_automation = 149;
+    UpdateAndroidAutomationSettingsMutation update_android_automation_settings = 150;
+    ProbeAndroidAutomationMutation probe_android_automation = 151;
+    PrepareAndroidAutomationMutation prepare_android_automation = 152;
+    SelectAndroidAutomationDeviceMutation select_android_automation_device = 153;
+    SetAndroidAdbPathMutation set_android_adb_path = 154;
+    CheckComputerAutomationUpdateMutation check_computer_automation_update = 155;
+    UpdateComputerAutomationDriverMutation update_computer_automation_driver = 156;
+    CancelComputerAutomationPermissionMutation cancel_computer_automation_permission = 157;
+    OpenComputerAutomationPermissionSettingsMutation open_computer_automation_permission_settings = 158;
+    CancelBackgroundTaskMutation cancel_background_task = 159;
+    ControlSubagentMutation control_subagent = 160;
+    UpdateLanguageToolSettingsMutation update_language_tool_settings = 161;
+    TerminateRuntimeProcessMutation terminate_runtime_process = 162;
+    UpdateAgentResourceSettingsMutation update_agent_resource_settings = 163;
+    UpdateCollaborationSettingsMutation update_collaboration_settings = 164;
+    UpdateGitSafetySettingsMutation update_git_safety_settings = 165;
+    CleanupGitSafetySavepointsMutation cleanup_git_safety_savepoints = 166;
+    RenameDeviceMutation rename_device = 167;
+    SetDeviceRemoteControlEnabledMutation set_device_remote_control_enabled = 168;
+    SetDeviceControlTargetEnabledMutation set_device_control_target_enabled = 169;
+    SetDeviceControllerAllowedMutation set_device_controller_allowed = 170;
+    UpdateToolPolicySettingsMutation update_tool_policy_settings = 171;
+    FocusBrowserPageMutation focus_browser_page = 172;
+    CloseBrowserPageMutation close_browser_page = 173;
+    RefreshProviderModelsMutation refresh_provider_models = 174;
+    UpdateVoiceInputServiceSettingsMutation update_voice_input_service_settings = 175;
+    ReobserveReviewMutation reobserve_review = 176;
+    CommitProviderCredentialSurfaceMutation commit_provider_credential_surface = 177;
+    ClearProviderCredentialSurfaceMutation clear_provider_credential_surface = 178;
+  }
+}
+
+message UpdateVoiceInputServiceSettingsMutation {
+  VoiceInputServiceSettingsPatch patch = 1;
+}
+
+message AcknowledgeSessionAttentionMutation {
+  string session_id = 1;
+  EventCursor through_cursor = 2;
+  SessionAttentionAcknowledgementIntent intent = 3;
+}
+
+enum SessionAttentionAcknowledgementIntent {
+  SESSION_ATTENTION_ACKNOWLEDGEMENT_INTENT_UNSPECIFIED = 0;
+  // Passive viewing may consume normal done/awaiting attention, never errors.
+  SESSION_ATTENTION_ACKNOWLEDGEMENT_INTENT_VIEWED = 1;
+  // A deliberate error-tail disposition; only valid for error attention.
+  SESSION_ATTENTION_ACKNOWLEDGEMENT_INTENT_EXPLICIT = 2;
+}
+
+message RevokeDeviceMutation {
+  string device_id = 1;
+  string reason = 2;
+}
+
+message LogoutConnectionMutation {
+  string connection_id = 1;
+}
+
+message RestartBackendMutation {
+  string backend_id = 1;
+}
+
+message CreateTargetMutation {
+  string backend_id = 1;
+  string display_name = 2;
+  TargetWorkspaceInput workspace = 3;
+}
+
+message TargetWorkspaceInput {
+  WorkspaceKind kind = 1;
+  // Interpreted and canonicalized only on the service node.
+  string server_path = 2;
+  bool create_if_missing = 3;
+}
+
+message UpdateTargetMutation {
+  string target_id = 1;
+  optional string display_name = 2;
+  optional bool pinned = 3;
+  oneof workspace_location_update {
+    RemoteWorkspaceBinding remote_workspace = 4;
+    // Must be true. Clears a Remote binding and restores the Target's durable
+    // service-node workspace root for subsequently-created Sessions.
+    bool service_node_workspace = 5;
+  }
+}
+
+message RenameDeviceMutation {
+  string device_id = 1;
+  string display_name = 2;
+}
+
+message SetDeviceRemoteControlEnabledMutation {
+  bool enabled = 1;
+}
+
+message SetDeviceControlTargetEnabledMutation {
+  string target_device_id = 1;
+  bool enabled = 2;
+}
+
+message SetDeviceControllerAllowedMutation {
+  string controller_device_id = 1;
+  bool allowed = 2;
+}
+
+message ArchiveTargetMutation {
+  string target_id = 1;
+  bool archived = 2;
+}
+
+message DeleteTargetMutation {
+  string target_id = 1;
+  bool delete_managed_workspace = 2;
+  bool delete_product_sessions = 3;
+}
+
+message CreateSessionMutation {
+  string backend_id = 1;
+  string target_id = 2;
+  string display_name = 3;
+  NativeSessionStart native_start = 4;
+  ModelSelection model = 5;
+  PermissionMode permission_mode = 6;
+  bool plan_mode = 7;
+  // Private creation-time snapshot appended to fresh Pi system instructions.
+  // Orchestrator rejects values longer than 8,000 characters or containing NUL and
+  // never projects it through Session snapshots, Events, logs, or diagnostics.
+  optional string append_system_prompt = 8;
+  // Valid only for a fresh native Session. Orchestrator resolves the Target path;
+  // clients never submit an arbitrary working directory.
+  bool use_worktree = 9;
+  optional string worktree_source_ref = 10;
+  bool refresh_worktree_remote = 11;
+  // Initial sidebar placement, committed atomically with product task creation.
+  NativeSessionPlacement initial_placement = 12;
+  // Catalog import presentation is committed with an attached native task so
+  // grouping, archive state, and native ordering never require client repairs.
+  NativeCatalogImportPresentation catalog_import = 13;
+}
+
+message NativeCatalogImportPresentation {
+  optional string project_id = 1;
+  bool archived = 2;
+  google.protobuf.Timestamp modified_at = 3;
+  string snapshot_token = 4;
+  google.protobuf.Timestamp created_at = 5;
+}
+
+message NativeSessionStart {
+  oneof kind {
+    NewNativeSession new_session = 1;
+    AttachNativeSession attach = 2;
+    CloneNativeSession clone = 3;
+    ForkNativeSession fork = 4;
+  }
+}
+
+message NewNativeSession {
+  string parent_native_reference = 1;
+}
+
+message AttachNativeSession {
+  string opaque_native_reference = 1;
+}
+
+message CloneNativeSession {
+  string source_product_session_id = 1;
+  optional string source_message_id = 2;
+  optional string source_event_id = 3;
+}
+
+message ForkNativeSession {
+  string source_product_session_id = 1;
+  string native_entry_id = 2;
+  optional string source_message_id = 3;
+  optional string source_event_id = 4;
+}
+
+message ResumeSessionMutation {
+  string session_id = 1;
+}
+
+message DetachSessionMutation {
+  string session_id = 1;
+}
+
+message CloseSessionMutation {
+  string session_id = 1;
+}
+
+message RenameSessionMutation {
+  string session_id = 1;
+  string display_name = 2;
+}
+
+message PinSessionMutation {
+  string session_id = 1;
+  bool pinned = 2;
+}
+
+message ArchiveSessionMutation {
+  string session_id = 1;
+  bool archived = 2;
+}
+
+message DeleteSessionMutation {
+  string session_id = 1;
+  bool delete_native_session = 2;
+  bool delete_artifacts = 3;
+}
+
+message ForkSessionMutation {
+  string source_session_id = 1;
+  string native_entry_id = 2;
+  string new_display_name = 3;
+  optional string source_message_id = 4;
+  optional string source_event_id = 5;
+}
+
+message CloneSessionMutation {
+  string source_session_id = 1;
+  string new_display_name = 2;
+  optional string source_message_id = 3;
+  optional string source_event_id = 4;
+}
+
+message NavigateSessionBranchMutation {
+  string session_id = 1;
+  string native_entry_id = 2;
+  bool summarize = 3;
+  string custom_instructions = 4;
+}
+
+message StartReviewMutation {
+  string source_session_id = 1;
+  string focus = 2;
+  repeated ReviewAttachmentInput attachments = 3;
+}
+
+message ReobserveReviewMutation {
+  string review_run_id = 1;
+}
+
+message CompactSessionMutation {
+  string session_id = 1;
+  string custom_instructions = 2;
+}
+
+message ExportSessionMutation {
+  string session_id = 1;
+  SessionExportFormat format = 2;
+}
+
+enum SessionExportFormat {
+  SESSION_EXPORT_FORMAT_UNSPECIFIED = 0;
+  SESSION_EXPORT_FORMAT_HTML = 1;
+}
+
+message SetSessionModelMutation {
+  string session_id = 1;
+  ModelSelection model = 2;
+}
+
+message SetSessionPermissionMutation {
+  string session_id = 1;
+  PermissionMode permission_mode = 2;
+}
+
+message SetSessionPlanModeMutation {
+  string session_id = 1;
+  bool enabled = 2;
+}
+
+message MoveSessionProjectMutation {
+  string session_id = 1;
+  // Presence selects a navigation project. Absence moves the task to the
+  // projectless dialogue group without changing its immutable Target/runtime.
+  optional string project_id = 2;
+  NativeCatalogImportPresentation catalog_import = 3;
+}
+
+message SendInputMutation {
+  string session_id = 1;
+  InputContent input = 2;
+  QueueDeliveryMode delivery_mode = 3;
+  PerTurnOverrides overrides = 4;
+}
+
+message PerTurnOverrides {
+  optional ModelSelection model = 1;
+  optional PermissionMode permission_mode = 2;
+  optional bool plan_mode = 3;
+  repeated string extra_directory_ids = 4;
+}
+
+message AbortRunMutation {
+  string run_id = 1;
+}
+
+message RetryRunMutation {
+  string run_id = 1;
+}
+
+message AbortRetryMutation {
+  string run_id = 1;
+}
+
+message CancelQueueItemMutation {
+  string queue_item_id = 1;
+}
+
+// Editing is valid only before backend dispatch. The service must reject a
+// stale generation/precondition rather than mutating an already accepted
+// native queue entry.
+message EditQueueItemMutation {
+  string queue_item_id = 1;
+  InputContent input = 2;
+  optional QueueDeliveryMode delivery_mode = 3;
+  string lock_token = 4;
+}
+
+message ReorderQueueItemMutation {
+  string queue_item_id = 1;
+  QueuePlacement placement = 2;
+  string interaction_lock_token = 3;
+}
+
+message QueuePlacement {
+  oneof anchor {
+    string before_queue_item_id = 1;
+    string after_queue_item_id = 2;
+    QueueEdge edge = 3;
+  }
+}
+
+enum QueueEdge {
+  QUEUE_EDGE_UNSPECIFIED = 0;
+  QUEUE_EDGE_FIRST = 1;
+  QUEUE_EDGE_LAST = 2;
+}
+
+// Pausing affects future dispatch for one Session queue. It does not abort the
+// active Run and does not claim to retract an item already accepted by Pi.
+message PauseQueueMutation {
+  string session_id = 1;
+  string reason = 2;
+}
+
+message ResumeQueueMutation {
+  string session_id = 1;
+}
+
+// Short-lived authority used while a queued input editor is open. The lock is
+// durable so a response retry cannot accidentally release dispatch, and it is
+// bounded by a service-owned expiry so an abandoned client cannot stall a
+// Session queue indefinitely.
+message SetQueueItemEditLockMutation {
+  string queue_item_id = 1;
+  string lock_token = 2;
+  bool locked = 3;
+}
+
+// Short-lived queue-wide authority used for pointer reordering. While held,
+// the service must not claim the next accepted item for Backend dispatch.
+message SetQueueInteractionLockMutation {
+  string session_id = 1;
+  string lock_token = 2;
+  bool locked = 3;
+}
+
+message ScheduleInput {
+  string display_name = 1;
+  string backend_id = 2;
+  string target_id = 3;
+  string session_id = 4;
+  ScheduleRecurrence recurrence = 5;
+  string time_zone = 6;
+  InputContent input = 7;
+  ScheduleExecutionSnapshot execution = 8;
+  ScheduleOverlapPolicy overlap_policy = 9;
+  ScheduleMisfirePolicy misfire_policy = 10;
+  bool enabled = 11;
+  ScheduleSessionMode session_mode = 12;
+}
+
+message CreateScheduleMutation {
+  ScheduleInput schedule = 1;
+}
+
+message UpdateScheduleMutation {
+  string schedule_id = 1;
+  ScheduleInput schedule = 2;
+}
+
+message DeleteScheduleMutation {
+  string schedule_id = 1;
+  ScheduleGeneratedSessionDisposition generated_session_disposition = 2;
+}
+
+enum ScheduleGeneratedSessionDisposition {
+  SCHEDULE_GENERATED_SESSION_DISPOSITION_UNSPECIFIED = 0;
+  SCHEDULE_GENERATED_SESSION_DISPOSITION_KEEP = 1;
+  SCHEDULE_GENERATED_SESSION_DISPOSITION_ARCHIVE = 2;
+  SCHEDULE_GENERATED_SESSION_DISPOSITION_DELETE = 3;
+}
+
+message TriggerScheduleMutation {
+  string schedule_id = 1;
+}
+
+message SetScheduleEnabledMutation {
+  string schedule_id = 1;
+  bool enabled = 2;
+}
+
+message ReconcileProjectAutomationsMutation {
+  string target_id = 1;
+}
+
+message PromoteScheduleToProjectMutation {
+  string schedule_id = 1;
+}
+
+message CloneProjectScheduleToUserMutation {
+  string schedule_id = 1;
+  string display_name = 2;
+}
+
+message RemoveProjectScheduleMutation {
+  string schedule_id = 1;
+  bool keep_personal_copy = 2;
+}
+
+message ResolveInteractionMutation {
+  string interaction_id = 1;
+  uint64 interaction_generation = 2;
+  InteractionResolution resolution = 3;
+}
+
+message DismissInteractionMutation {
+  string interaction_id = 1;
+  uint64 interaction_generation = 2;
+  string reason = 3;
+}
+
+message SetWorkspaceTrustMutation {
+  string workspace_id = 1;
+  bool trusted = 2;
+}
+
+message AddExtraDirectoryMutation {
+  string workspace_id = 1;
+  string server_path = 2;
+  ExtraDirectoryAccess access = 3;
+}
+
+message RemoveExtraDirectoryMutation {
+  string extra_directory_id = 1;
+}
+
+message ExecuteWorkspaceRewindMutation {
+  string workspace_id = 1;
+  string preview_id = 2;
+  string change_set_id = 3;
+  bool confirm_file_restore = 4;
+  bool allow_dialogue_only = 5;
+}
+
+message DeleteArtifactMutation {
+  string artifact_id = 1;
+}
+
+enum WorkspaceEntryCreateKind {
+  WORKSPACE_ENTRY_CREATE_KIND_UNSPECIFIED = 0;
+  WORKSPACE_ENTRY_CREATE_KIND_FILE = 1;
+  WORKSPACE_ENTRY_CREATE_KIND_DIRECTORY = 2;
+}
+
+// Creation is fenced by an atomic non-existence check at relative_path. Parent
+// directories must already exist and are canonicalized again immediately
+// before the effect.
+message CreateWorkspaceEntryMutation {
+  string workspace_id = 1;
+  string relative_path = 2;
+  WorkspaceEntryCreateKind kind = 3;
+  // Must be the public workspaceEntryAbsentRevision sentinel. The filesystem
+  // effect then enforces that absence atomically with wx/mkdir semantics.
+  string expected_revision = 4;
+}
+
+message MoveWorkspaceEntryMutation {
+  string workspace_id = 1;
+  string source_relative_path = 2;
+  string destination_relative_path = 3;
+  string expected_revision = 4;
+}
+
+message DeleteWorkspaceEntryMutation {
+  string workspace_id = 1;
+  string relative_path = 2;
+  string expected_revision = 3;
+  // Required when the selected entry is a directory. The Files UI shows the
+  // Destructive confirmation is required before setting this bit.
+  bool confirm_recursive = 4;
+}
+
+message CopyWorkspaceEntryMutation {
+  string workspace_id = 1;
+  string source_relative_path = 2;
+  string destination_relative_path = 3;
+  string expected_revision = 4;
+}
+
+message UpdateAppearanceSettingsMutation {
+  AppearanceSettingsPatch patch = 1;
+}
+
+message UpdateBackendSettingsMutation {
+  BackendSettingsPatch patch = 1;
+}
+
+message UpdatePiSettingsMutation {
+  PiSettingsPatch patch = 1;
+}
+
+message UpdateLanguageToolSettingsMutation {
+  LanguageToolSettingsPatch patch = 1;
+}
+
+message UpdateAgentResourceSettingsMutation {
+  AgentResourceSettingsPatch patch = 1;
+}
+
+message UpdateCollaborationSettingsMutation {
+  CollaborationSettingsPatch patch = 1;
+}
+
+message UpdateGitSafetySettingsMutation {
+  GitSafetySettingsPatch patch = 1;
+}
+
+message UpdateToolPolicySettingsMutation {
+  ToolPolicySettingsPatch patch = 1;
+}
+
+message CleanupGitSafetySavepointsMutation {}
+
+message UpdateMemorySettingsMutation {
+  MemorySettingsPatch patch = 1;
+  bool restore_defaults = 2;
+}
+
+enum MemoryResetScope {
+  MEMORY_RESET_SCOPE_UNSPECIFIED = 0;
+  // All curated Maker Memory across Targets; Backend-owned digests are retained.
+  MEMORY_RESET_SCOPE_CURATED = 1;
+  // Digests owned by backend_id across Targets; curated Maker Memory is retained.
+  MEMORY_RESET_SCOPE_BACKEND = 2;
+}
+
+message ResetMemoryMutation {
+  MemoryResetScope scope = 1;
+  string backend_id = 2;
+}
+
+message UpdateBrowserSettingsMutation {
+  BrowserSettingsPatch patch = 1;
+}
+
+message UpdateComputerAutomationSettingsMutation {
+  ComputerAutomationSettingsPatch patch = 1;
+}
+
+message InstallComputerAutomationMutation {}
+
+message ProbeComputerAutomationMutation {
+  bool fresh = 1;
+}
+
+message RequestComputerAutomationPermissionMutation {
+  ComputerAutomationPermissionKind permission = 1;
+}
+
+message CheckComputerAutomationUpdateMutation {
+  bool fresh = 1;
+}
+
+message UpdateComputerAutomationDriverMutation {
+  bool join_only = 1;
+}
+
+message CancelComputerAutomationPermissionMutation {}
+
+message OpenComputerAutomationPermissionSettingsMutation {
+  ComputerAutomationPermissionKind permission = 1;
+}
+
+message ShowBrowserAutomationMutation {
+  string browser_provider_id = 1;
+  string target_id = 2;
+}
+
+message UpdateAndroidAutomationSettingsMutation {
+  AndroidAutomationSettingsPatch patch = 1;
+}
+
+message ProbeAndroidAutomationMutation {
+  bool fresh = 1;
+}
+
+message PrepareAndroidAutomationMutation {}
+
+message SelectAndroidAutomationDeviceMutation {
+  AndroidDeviceSelection selection = 1;
+}
+
+message SetAndroidAdbPathMutation {
+  AndroidAdbPathSelection selection = 1;
+}
+
+message ReplacePolicySettingsMutation {
+  PolicySettings policy = 1;
+}
+
+message UpdateDiagnosticSettingsMutation {
+  DiagnosticSettingsPatch patch = 1;
+}
+
+message UpsertProviderMutation {
+  ProviderConfiguration provider = 1;
+}
+
+message DeleteProviderMutation {
+  string provider_id = 1;
+}
+
+message RefreshProviderModelsMutation {
+  string backend_id = 1;
+  // Empty refreshes every eligible, currently usable Provider.
+  string provider_id = 2;
+  // Automatic hints obey the service cooldown and suppress source failures.
+  bool automatic = 3;
+}
+
+// A one-time ticket is uploaded through the credential channel; the secret is
+// never embedded in this durable operation.
+message CommitCredentialMutation {
+  string credential_upload_ticket_id = 1;
+  string credential_reference_id = 2;
+  string display_name = 3;
+  CredentialKind kind = 4;
+  string provider_id = 5;
+  string environment_name = 6;
+}
+
+message DeleteCredentialMutation {
+  string credential_reference_id = 1;
+}
+
+message BeginProviderLoginMutation {
+  string backend_id = 1;
+  string provider_id = 2;
+  ProviderLoginMethod method = 3;
+}
+
+message RefreshProviderCredentialMutation {
+  string backend_id = 1;
+  string provider_id = 2;
+}
+
+message LogoutProviderMutation {
+  string backend_id = 1;
+  string provider_id = 2;
+}
+
+message CommitProviderCredentialSurfaceMutation {
+  string backend_id = 1;
+  string provider_id = 2;
+  string surface_id = 3;
+  string credential_upload_ticket_id = 4;
+}
+
+message ClearProviderCredentialSurfaceMutation {
+  string backend_id = 1;
+  string provider_id = 2;
+  string surface_id = 3;
+}
+
+message CreateDiagnosticsBundleMutation {
+  DiagnosticLevel level = 1;
+  repeated string diagnostic_ids = 2;
+}
+
+message ApplyWorkspaceDiffHunkMutation {
+  string workspace_id = 1;
+  WorkspaceDiffAction action = 2;
+  GitDiffSource source = 3;
+  string relative_path = 4;
+  string old_relative_path = 5;
+  // Zero-based index in the exact diff returned with expected_repository_revision.
+  uint32 hunk_index = 6;
+  string expected_repository_revision = 7;
+  bool ignore_whitespace = 8;
+  // Required for the destructive REVERT action; ignored for other actions.
+  bool confirm_revert = 9;
+  // Callers must choose FILE or HUNK explicitly.
+  WorkspaceDiffTarget target = 10;
+}
+
+message CommitWorkspaceDiffMutation {
+  string workspace_id = 1;
+  string message = 2;
+  string expected_repository_revision = 3;
+  // Explicit "include unstaged" choice. When false, only the index is
+  // committed. When true, Git stages the current workspace before commit.
+  bool include_unstaged = 4;
+}
+
+message PushWorkspaceBranchMutation {
+  string workspace_id = 1;
+  // A configured remote name, never a URL.
+  string remote = 2;
+  // Fully qualified refs/heads/... destination.
+  string remote_ref = 3;
+  string expected_repository_revision = 4;
+  string expected_head_revision = 5;
+  // Set only after a prior NEEDS_FORCE result and explicit user confirmation.
+  // Orchestrator permits force-with-lease only; a bare force push is never exposed.
+  bool confirm_force_with_lease = 6;
+  // Remote OID returned by the prior NEEDS_FORCE result. It is re-read before
+  // dispatch and embedded in --force-with-lease=<ref>:<oid>.
+  string expected_remote_oid = 7;
+}
+
+// Deletes only the selected visible product message (or, for an assistant
+// target, the AI output group in its real user turn). Native context rebuild
+// is deferred until the next dispatch.
+message DeleteSessionMessageMutation {
+  string session_id = 1;
+  string event_id = 2;
+}
+
+// Explicit clear boundary. The Product Session identity remains
+// stable while the Backend replaces its native context with a truly empty
+// session and old Product projections become invisible atomically.
+message ResetSessionMutation {
+  string session_id = 1;
+}
+
+message UpdateMessageSearchSettingsMutation {
+  MessageSearchSettingsPatch patch = 1;
+}
+
+message UpdatePersonalizationSettingsMutation {
+  PersonalizationSettingsPatch patch = 1;
+}
+
+message UpdateVisionBridgeSettingsMutation {
+  VisionBridgeSettingsPatch patch = 1;
+}
+
+message UpdatePromptRecommendationSettingsMutation {
+  PromptRecommendationSettingsPatch patch = 1;
+}
+
+// Backend-neutral user shell surface.
+message ExecuteUserShellMutation {
+  string session_id = 1;
+  string command = 2;
+  bool exclude_from_context = 3;
+}
+
+message AbortUserShellMutation {
+  string session_id = 1;
+}
+
+message CancelBackgroundTaskMutation {
+  string session_id = 1;
+  string background_task_id = 2;
+}
+
+message ControlSubagentMutation {
+  string session_id = 1;
+  string subagent_run_id = 2;
+  string child_id = 3;
+  SubagentControlAction action = 4;
+  string message = 5;
+}
+
+// Full public fence for a process instance previously returned by
+// BackendService.ListRuntimeProcesses. Orchestrator and the Adapter both repeat the
+// Session/generation/ownership validation before an OS signal is allowed.
+message TerminateRuntimeProcessMutation {
+  string backend_id = 1;
+  string session_id = 2;
+  uint64 runtime_generation = 3;
+  uint64 process_id = 4;
+  string process_instance_id = 5;
+}
+
+message UploadBrowserFileMutation {
+  string browser_provider_id = 1;
+  string page_id = 2;
+  BlobRef blob = 3;
+  string input_hint = 4;
+}
+
+message UpsertMcpServerMutation {
+  string mcp_server_id = 1;
+  McpServerInput server = 2;
+  // Zero fences creation to an absent ID; edits carry the descriptor revision.
+  Revision expected_revision = 3;
+}
+
+message DeleteMcpServerMutation {
+  string mcp_server_id = 1;
+}
+
+message RestartMcpServerMutation {
+  string mcp_server_id = 1;
+}
+
+message ApproveResourceMutation {
+  string resource_id = 1;
+  string discovered_revision = 2;
+}
+
+message InstallResourceMutation {
+  string resource_id = 1;
+}
+
+message UpdateResourceMutation {
+  string resource_id = 1;
+  string requested_version = 2;
+  ResourceAcquisitionSource acquisition = 3;
+}
+
+message SetResourceEnabledMutation {
+  string resource_id = 1;
+  bool enabled = 2;
+}
+
+message RemoveResourceMutation {
+  string resource_id = 1;
+}
+
+message DiscoverProjectResourcesMutation {
+  string target_id = 1;
+}
+
+message AddResourceMutation {
+  string backend_id = 1;
+  // Required only for project-scoped resources. The source must remain inside
+  // this trusted Target's canonical workspace root.
+  string target_id = 2;
+  ResourceKind kind = 3;
+  ResourceScope scope = 4;
+  string name = 6;
+  string version = 7;
+  ResourceAcquisitionSource acquisition = 5;
+}
+
+message AbortToolCallMutation {
+  string tool_call_id = 1;
+}
+
+message RestartBrowserMutation {
+  string browser_provider_id = 1;
+}
+
+// Opens one new Browser page for an authenticated human and atomically moves
+// that Connection's takeover to the new page. The optional Session scope keeps
+// message-link opens attributable without exposing a service-local path.
+message OpenBrowserPageMutation {
+  string browser_provider_id = 1;
+  string session_id = 2;
+  string url = 3;
+  // Provider generation observed by the authenticated client. Zero is valid
+  // only while the Provider is stopped and has never started.
+  uint64 expected_generation = 4;
+  // When a takeover exists, all three source-fence fields are mandatory.
+  string current_page_id = 5;
+  string takeover_id = 6;
+  // Optional durable lost-page descriptor replaced by this new page.
+  string recovery_page_id = 7;
+}
+
+// Transfers one exact owned human capability to another live page.
+message FocusBrowserPageMutation {
+  string browser_provider_id = 1;
+  string page_id = 2;
+  string current_page_id = 3;
+  string takeover_id = 4;
+  uint64 generation = 5;
+}
+
+// Closes one target page while authorization remains bound to the exact
+// current owned human capability in this Provider generation.
+message CloseBrowserPageMutation {
+  string browser_provider_id = 1;
+  string page_id = 2;
+  string current_page_id = 3;
+  string takeover_id = 4;
+  uint64 generation = 5;
+}
+
+message BeginBrowserTakeoverMutation {
+  string browser_provider_id = 1;
+  string page_id = 2;
+}
+
+message EndBrowserTakeoverMutation {
+  string takeover_id = 1;
+}
+
+// One remotely-authoritative input against one exact human-takeover capability.
+// The complete fence is repeated on every input so stale pages, generations,
+// owners, and takeover IDs can never be confused with the current capability.
+message BrowserTakeoverActionMutation {
+  string browser_provider_id = 1;
+  string page_id = 2;
+  string takeover_id = 3;
+  uint64 generation = 4;
+  oneof action {
+    BrowserTakeoverMouseClick mouse_click = 10;
+    BrowserTakeoverScroll scroll = 11;
+    BrowserTakeoverKeyPress key_press = 12;
+    BrowserTakeoverTextInput text_input = 13;
+    BrowserTakeoverNavigate navigate = 14;
+    BrowserTakeoverNavigationCommand navigation_command = 15;
+    BrowserTakeoverMouseMove mouse_move = 16;
+    BrowserTakeoverMouseDrag mouse_drag = 17;
+  }
+}
+
+message BrowserTakeoverMouseClick {
+  // Coordinates are ratios over the screenshot presented to the human. 0 is
+  // the left/top edge and 1 is the right/bottom edge. The Provider maps these
+  // ratios to the current page's CSS viewport, independent of UI/image scale.
+  double normalized_x = 1;
+  double normalized_y = 2;
+  BrowserTakeoverMouseButton button = 3;
+  uint32 click_count = 4;
+}
+
+message BrowserTakeoverMouseMove {
+  double normalized_x = 1;
+  double normalized_y = 2;
+}
+
+message BrowserTakeoverMouseDrag {
+  double start_normalized_x = 1;
+  double start_normalized_y = 2;
+  double end_normalized_x = 3;
+  double end_normalized_y = 4;
+  BrowserTakeoverMouseButton button = 5;
+}
+
+enum BrowserTakeoverMouseButton {
+  BROWSER_TAKEOVER_MOUSE_BUTTON_UNSPECIFIED = 0;
+  BROWSER_TAKEOVER_MOUSE_BUTTON_PRIMARY = 1;
+  BROWSER_TAKEOVER_MOUSE_BUTTON_MIDDLE = 2;
+  BROWSER_TAKEOVER_MOUSE_BUTTON_SECONDARY = 3;
+}
+
+message BrowserTakeoverScroll {
+  // Playwright wheel deltas expressed in CSS pixels.
+  sint32 delta_x_css_pixels = 1;
+  sint32 delta_y_css_pixels = 2;
+}
+
+message BrowserTakeoverKeyPress {
+  BrowserTakeoverKey key = 1;
+  // Printable accelerator keys are carried separately from the named-key
+  // enum. Exactly one of key or character must be populated.
+  string character = 2;
+  repeated BrowserTakeoverKeyModifier modifiers = 3;
+}
+
+enum BrowserTakeoverKeyModifier {
+  BROWSER_TAKEOVER_KEY_MODIFIER_UNSPECIFIED = 0;
+  BROWSER_TAKEOVER_KEY_MODIFIER_ALT = 1;
+  BROWSER_TAKEOVER_KEY_MODIFIER_CONTROL = 2;
+  BROWSER_TAKEOVER_KEY_MODIFIER_META = 3;
+  BROWSER_TAKEOVER_KEY_MODIFIER_SHIFT = 4;
+}
+
+enum BrowserTakeoverKey {
+  BROWSER_TAKEOVER_KEY_UNSPECIFIED = 0;
+  BROWSER_TAKEOVER_KEY_ENTER = 1;
+  BROWSER_TAKEOVER_KEY_TAB = 2;
+  BROWSER_TAKEOVER_KEY_ESCAPE = 3;
+  BROWSER_TAKEOVER_KEY_BACKSPACE = 4;
+  BROWSER_TAKEOVER_KEY_DELETE = 5;
+  BROWSER_TAKEOVER_KEY_ARROW_UP = 6;
+  BROWSER_TAKEOVER_KEY_ARROW_DOWN = 7;
+  BROWSER_TAKEOVER_KEY_ARROW_LEFT = 8;
+  BROWSER_TAKEOVER_KEY_ARROW_RIGHT = 9;
+  BROWSER_TAKEOVER_KEY_HOME = 10;
+  BROWSER_TAKEOVER_KEY_END = 11;
+  BROWSER_TAKEOVER_KEY_PAGE_UP = 12;
+  BROWSER_TAKEOVER_KEY_PAGE_DOWN = 13;
+  BROWSER_TAKEOVER_KEY_SPACE = 14;
+}
+
+message BrowserTakeoverTextInput {
+  string text = 1;
+}
+
+message BrowserTakeoverNavigate {
+  // Human-entered HTTP(S) URL (or about:blank). Orchestrator rejects embedded
+  // credentials and durable credential-shaped URL material before dispatch.
+  string url = 1;
+}
+
+message BrowserTakeoverNavigationCommand {
+  BrowserTakeoverNavigationCommandKind command = 1;
+}
+
+enum BrowserTakeoverNavigationCommandKind {
+  BROWSER_TAKEOVER_NAVIGATION_COMMAND_KIND_UNSPECIFIED = 0;
+  BROWSER_TAKEOVER_NAVIGATION_COMMAND_KIND_BACK = 1;
+  BROWSER_TAKEOVER_NAVIGATION_COMMAND_KIND_FORWARD = 2;
+  BROWSER_TAKEOVER_NAVIGATION_COMMAND_KIND_RELOAD = 3;
+  BROWSER_TAKEOVER_NAVIGATION_COMMAND_KIND_STOP = 4;
+}
+
+message CaptureBrowserScreenshotMutation {
+  string browser_provider_id = 1;
+  string page_id = 2;
+  bool full_page = 3;
+}
+
+message RecoverBrowserMutation {
+  string browser_provider_id = 1;
+}
+
+message OperationResult {
+  oneof payload {
+    Acknowledgement acknowledgement = 1;
+    Connection connection = 2;
+    Device device = 3;
+    BackendDescriptor backend = 4;
+    Target target = 5;
+    Session session = 6;
+    Run run = 7;
+    QueueItem queue_item = 8;
+    Schedule schedule = 9;
+    Interaction interaction = 10;
+    WorkspaceDescriptor workspace = 11;
+    WorkspaceRewindResult workspace_rewind = 12;
+    Artifact artifact = 13;
+    SettingsSnapshot settings = 14;
+    ProviderDescriptor provider = 15;
+    CredentialDescriptor credential = 16;
+    McpServerDescriptor mcp_server = 17;
+    ManagedResource resource = 18;
+    ToolCall tool_call = 19;
+    BrowserProvider browser = 20;
+    BrowserTakeover browser_takeover = 21;
+    ImageRef screenshot = 22;
+    ProviderLoginFlow provider_login = 23;
+    Artifact diagnostics_bundle = 24;
+    BrowserTransfer browser_transfer = 25;
+    QueueControl queue_control = 26;
+    CompactSessionResult compact_session = 27;
+    WorkspaceGitPushResult workspace_git_push = 28;
+    ReviewRun review_run = 29;
+    SessionAttention session_attention = 30;
+    MemoryResetResult memory_reset = 31;
+    DeviceControlRelation device_control_relation = 32;
+    ScheduleRunsReadResult schedule_runs_read = 33;
+    ScheduleDeletionResult schedule_deletion = 34;
+  }
+}
+
+message ScheduleRunsReadResult {
+  uint64 updated_count = 1;
+}
+
+message ScheduleDeletionFailure {
+  string session_id = 1;
+  string message = 2;
+}
+
+message ScheduleDeletionResult {
+  string schedule_id = 1;
+  ScheduleGeneratedSessionDisposition generated_session_disposition = 2;
+  repeated string generated_session_ids = 3;
+  repeated string completed_session_ids = 4;
+  repeated ScheduleDeletionFailure failures = 5;
+  uint32 inflight_count = 6;
+}
+
+message MemoryResetResult {
+  uint64 removed_entries = 1;
+  uint64 removed_targets = 2;
+}
+
+message Acknowledgement {
+  bool accepted = 1;
+}
+
+enum WorkspaceGitPushOutcome {
+  WORKSPACE_GIT_PUSH_OUTCOME_UNSPECIFIED = 0;
+  WORKSPACE_GIT_PUSH_OUTCOME_PUSHED = 1;
+  WORKSPACE_GIT_PUSH_OUTCOME_NEEDS_FORCE = 2;
+}
+
+message WorkspaceGitPushResult {
+  WorkspaceGitPushOutcome outcome = 1;
+  string remote = 2;
+  string remote_ref = 3;
+  // Populated only for NEEDS_FORCE and used as the second-phase lease fence.
+  string remote_oid = 4;
+  uint32 ahead = 5;
+  uint32 behind = 6;
+  string repository_revision = 7;
+  string head_revision = 8;
+}
+
+enum CompactSessionOutcome {
+  COMPACT_SESSION_OUTCOME_UNSPECIFIED = 0;
+  COMPACT_SESSION_OUTCOME_COMPACTED = 1;
+  COMPACT_SESSION_OUTCOME_NOOP = 2;
+}
+
+message CompactSessionResult {
+  CompactSessionOutcome outcome = 1;
+}
+
+message WorkspaceRewindResult {
+  string workspace_id = 1;
+  string change_set_id = 2;
+  repeated string restored_paths = 3;
+  repeated RewindGap remaining_gaps = 4;
+  bool dialogue_rewound = 5;
+  bool files_rewound = 6;
+}
+
+message CredentialUploadTicket {
+  string ticket_id = 1;
+  string relative_endpoint = 2;
+  google.protobuf.Timestamp expires_at = 3;
+  uint64 maximum_bytes = 4;
+}
+
+message ProviderLoginFlow {
+  string login_flow_id = 1;
+  string provider_id = 2;
+  ProviderLoginMethod method = 3;
+  string verification_uri = 4;
+  string user_code = 5;
+  google.protobuf.Timestamp expires_at = 6;
+  ProviderLoginFlowState state = 7;
+  ProviderLoginPrompt pending_prompt = 8;
+  google.protobuf.Timestamp updated_at = 9;
+  ErrorInfo error = 10;
+}
+
+enum ProviderLoginFlowState {
+  PROVIDER_LOGIN_FLOW_STATE_UNSPECIFIED = 0;
+  PROVIDER_LOGIN_FLOW_STATE_STARTING = 1;
+  PROVIDER_LOGIN_FLOW_STATE_PENDING = 2;
+  PROVIDER_LOGIN_FLOW_STATE_COMPLETED = 3;
+  PROVIDER_LOGIN_FLOW_STATE_CANCELLED = 4;
+  PROVIDER_LOGIN_FLOW_STATE_TIMED_OUT = 5;
+  PROVIDER_LOGIN_FLOW_STATE_OUTCOME_UNKNOWN = 6;
+  PROVIDER_LOGIN_FLOW_STATE_FAILED = 7;
+}
+
+message ProviderLoginPrompt {
+  string prompt_id = 1;
+  ProviderLoginPromptKind kind = 2;
+  string message = 3;
+  string placeholder = 4;
+  repeated ProviderLoginPromptOption options = 5;
+}
+
+enum ProviderLoginPromptKind {
+  PROVIDER_LOGIN_PROMPT_KIND_UNSPECIFIED = 0;
+  PROVIDER_LOGIN_PROMPT_KIND_TEXT = 1;
+  PROVIDER_LOGIN_PROMPT_KIND_SECRET = 2;
+  PROVIDER_LOGIN_PROMPT_KIND_MANUAL_CODE = 3;
+  PROVIDER_LOGIN_PROMPT_KIND_SELECT = 4;
+}
+
+message ProviderLoginPromptOption {
+  string option_id = 1;
+  string label = 2;
+  string description = 3;
+}
+
+message MarkScheduleRunReadMutation {
+  string schedule_id = 1;
+  string trigger_id = 2;
+}
+
+message DeleteScheduleRunMutation {
+  string schedule_id = 1;
+  string trigger_id = 2;
+}
+
+message RestartScheduleRunMutation {
+  string schedule_id = 1;
+  string trigger_id = 2;
+}
+
+message MarkScheduleRunsReadMutation {
+  string schedule_id = 1;
+}
+
+message MarkAllScheduleRunsReadMutation {}

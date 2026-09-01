@@ -1,0 +1,163 @@
+.workspace-model-viewer {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border-radius: 8px;
+  background:
+    radial-gradient(circle at 50% 38%, color-mix(in srgb, var(--surface-hover) 82%, transparent), transparent 62%),
+    var(--surface-sunken);
+}
+
+.workspace-model-viewer > model-viewer {
+  width: 100%;
+  height: 100%;
+  display: block;
+  background: transparent;
+  outline: 0;
+}
+
+.workspace-model-viewer > model-viewer:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+
+.workspace-model-viewer__state {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 24px;
+  color: var(--text-faint);
+  font-size: var(--text-12);
+  text-align: center;
+  pointer-events: none;
+}
+
+.workspace-model-viewer__state > svg { width: 28px; height: 28px; }
+.workspace-model-viewer__state.is-error { flex-direction: column; }
+
+.workspace-model-lightbox-open { overflow: hidden; }
+
+.workspace-model-lightbox {
+  position: fixed;
+  z-index: 9999;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  padding: 40px;
+  background: rgb(0 0 0 / .88);
+  opacity: 0;
+  outline: 0;
+  transition: opacity 200ms ease;
+}
+
+.workspace-model-lightbox.is-visible { opacity: 1; }
+
+.workspace-model-lightbox__stage {
+  position: relative;
+  width: min(85vw, 1024px);
+  height: min(85dvh, 768px);
+  max-width: 100%;
+  max-height: 100%;
+}
+
+.workspace-model-lightbox__viewer {
+  border: 1px solid rgb(255 255 255 / .16);
+  border-radius: 12px;
+  background: radial-gradient(circle at 50% 38%, #3b3b3a 0, #171717 72%);
+  box-shadow: 0 24px 70px rgb(0 0 0 / .42);
+}
+
+.workspace-model-lightbox__viewer > model-viewer:focus-visible { box-shadow: inset 0 0 0 2px #fff; }
+
+.workspace-model-lightbox__title {
+  position: absolute;
+  top: 14px;
+  left: 14px;
+  max-width: calc(100% - 28px);
+  display: grid;
+  gap: 2px;
+  border: 1px solid rgb(255 255 255 / .14);
+  border-radius: 8px;
+  padding: 7px 10px;
+  background: rgb(24 24 24 / .72);
+  color: #fff;
+  font-size: var(--text-11);
+  pointer-events: none;
+  backdrop-filter: blur(12px);
+}
+
+.workspace-model-lightbox__title strong {
+  overflow: hidden;
+  font-size: var(--text-12);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-model-lightbox__title span { color: rgb(255 255 255 / .65); }
+
+.workspace-model-lightbox__toolbar {
+  position: fixed;
+  z-index: 10000;
+  bottom: 24px;
+  left: 50%;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid rgb(255 255 255 / .18);
+  border-radius: 999px;
+  padding: 4px 8px;
+  background: rgb(28 28 28 / .76);
+  box-shadow: 0 12px 36px rgb(0 0 0 / .34);
+  backdrop-filter: blur(14px);
+  transform: translateX(-50%);
+}
+
+.workspace-model-lightbox__toolbar button {
+  width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 999px;
+  padding: 0;
+  background: transparent;
+  color: rgb(255 255 255 / .88);
+}
+
+.workspace-model-lightbox__toolbar button:hover:not(:disabled) { background: rgb(255 255 255 / .14); color: #fff; }
+.workspace-model-lightbox__toolbar button:focus-visible { box-shadow: inset 0 0 0 2px #fff; }
+.workspace-model-lightbox__toolbar button:disabled { opacity: .38; }
+.workspace-model-lightbox__toolbar button svg { width: 16px; height: 16px; }
+.workspace-model-lightbox__toolbar > span { width: 1px; height: 20px; margin-inline: 4px; background: rgb(255 255 255 / .18); }
+
+.workspace-model-lightbox__feedback {
+  position: fixed;
+  z-index: 10001;
+  top: 22px;
+  left: 50%;
+  border-radius: 999px;
+  padding: 7px 12px;
+  background: rgb(24 24 24 / .86);
+  color: #fff;
+  font-size: var(--text-12);
+  transform: translateX(-50%);
+}
+
+@media (max-width: 560px) {
+  .workspace-model-lightbox { padding: 14px 14px 84px; }
+  .workspace-model-lightbox__stage { width: 100%; height: 100%; }
+  .workspace-model-lightbox__title span { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .workspace-model-lightbox { transition: none; }
+}

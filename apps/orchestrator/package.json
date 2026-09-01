@@ -1,0 +1,67 @@
+{
+  "name": "@joko/orchestrator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "joko-orchestrator": "./dist/main.js"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "dev": "tsx watch src/main.ts",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "@babel/parser": "7.29.8",
+    "@bufbuild/protobuf": "2.14.0",
+    "@connectrpc/connect": "2.1.2",
+    "@connectrpc/connect-fastify": "2.1.2",
+    "@connectrpc/connect-node": "2.1.2",
+    "@earendil-works/pi-coding-agent": "0.84.4",
+    "@fastify/cors": "11.1.0",
+    "@fastify/static": "8.3.0",
+    "@joko/adapter-claude-code": "workspace:*",
+    "@joko/adapter-codex": "workspace:*",
+    "@joko/code-host": "workspace:*",
+    "@joko/adapter-dictation-refinement": "workspace:*",
+    "@joko/adapter-pi": "workspace:*",
+    "@joko/adapter-transcription-openai": "workspace:*",
+    "@joko/adapter-transcription-realtime": "workspace:*",
+    "@joko/contracts": "workspace:*",
+    "@joko/core": "workspace:*",
+    "@joko/git-safety": "workspace:*",
+    "@joko/local-model-runtime": "workspace:*",
+    "@joko/outbound-network": "workspace:*",
+    "@joko/remote-ssh": "workspace:*",
+    "@joko/runtime-governance": "workspace:*",
+    "@joko/store": "workspace:*",
+    "@joko/tool-android": "workspace:*",
+    "@joko/tool-browser": "workspace:*",
+    "@joko/tool-computer": "workspace:*",
+    "@joko/tool-lsp": "workspace:*",
+    "@joko/voice-input": "workspace:*",
+    "@joko/worktree": "workspace:*",
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "croner": "9.1.0",
+    "extract-zip": "2.0.1",
+    "fastify": "5.6.2",
+    "ignore": "7.0.5",
+    "minimatch": "10.2.6",
+    "npm": "11.13.0",
+    "semver": "7.8.0",
+    "sqlite-vec": "0.1.9",
+    "undici": "6.28.0"
+  },
+  "devDependencies": {
+    "@joko/testkit": "workspace:*",
+    "@types/node": "24.12.4",
+    "tsx": "4.22.1",
+    "typescript": "5.9.3",
+    "vitest": "4.1.9"
+  }
+}

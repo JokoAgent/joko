@@ -1,0 +1,1811 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+import "joko/v1/capability.proto";
+import "joko/v1/common.proto";
+import "joko/v1/event.proto";
+import "joko/v1/interaction.proto";
+import "joko/v1/managed_model_runtime.proto";
+import "joko/v1/model.proto";
+import "joko/v1/operation.proto";
+import "joko/v1/pi.proto";
+import "joko/v1/portable_session.proto";
+import "joko/v1/runtime.proto";
+import "joko/v1/review.proto";
+import "joko/v1/settings.proto";
+import "joko/v1/snapshot.proto";
+import "joko/v1/subagent.proto";
+import "joko/v1/tool.proto";
+import "joko/v1/voice.proto";
+import "joko/v1/workspace.proto";
+
+service ConnectionService {
+  rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
+  // Public, credential-free bootstrap metadata used by the connection screen.
+  rpc ListDiscoveredNodes(ListDiscoveredNodesRequest) returns (ListDiscoveredNodesResponse);
+  rpc BeginPairing(BeginPairingRequest) returns (BeginPairingResponse);
+  rpc CompletePairing(CompletePairingRequest) returns (CompletePairingResponse);
+  rpc ListConnections(ListConnectionsRequest) returns (ListConnectionsResponse);
+  rpc GetConnection(GetConnectionRequest) returns (GetConnectionResponse);
+  rpc ListDevices(ListDevicesRequest) returns (ListDevicesResponse);
+  rpc GetDevice(GetDeviceRequest) returns (GetDeviceResponse);
+  rpc ListDeviceControlRelations(ListDeviceControlRelationsRequest) returns (ListDeviceControlRelationsResponse);
+}
+
+service EventService {
+  rpc GetSnapshot(GetSnapshotRequest) returns (GetSnapshotResponse);
+  // Re-sampled at the destructive-action boundary; callers must fail closed
+  // when this probe is unavailable rather than infer activity from UI caches.
+  rpc GetRuntimeActivity(GetRuntimeActivityRequest) returns (GetRuntimeActivityResponse);
+  rpc StreamEvents(StreamEventsRequest) returns (stream StreamEventsResponse);
+}
+
+service OperationService {
+  rpc SubmitOperation(SubmitOperationRequest) returns (SubmitOperationResponse);
+  rpc GetOperation(GetOperationRequest) returns (GetOperationResponse);
+  rpc ListOperations(ListOperationsRequest) returns (ListOperationsResponse);
+  rpc WatchOperation(WatchOperationRequest) returns (stream WatchOperationResponse);
+}
+
+service BackendService {
+  rpc ListBackends(ListBackendsRequest) returns (ListBackendsResponse);
+  rpc GetBackend(GetBackendRequest) returns (GetBackendResponse);
+  rpc ListRuntimeProcesses(ListRuntimeProcessesRequest) returns (ListRuntimeProcessesResponse);
+  rpc ListProviders(ListProvidersRequest) returns (ListProvidersResponse);
+  rpc GetProvider(GetProviderRequest) returns (GetProviderResponse);
+  rpc GetProviderUsage(GetProviderUsageRequest) returns (GetProviderUsageResponse);
+  rpc GetUsageHistory(GetUsageHistoryRequest) returns (GetUsageHistoryResponse);
+  rpc GetModelPriceOverride(GetModelPriceOverrideRequest) returns (GetModelPriceOverrideResponse);
+  rpc SetModelPriceOverride(SetModelPriceOverrideRequest) returns (SetModelPriceOverrideResponse);
+  rpc ResetModelPriceOverride(ResetModelPriceOverrideRequest) returns (ResetModelPriceOverrideResponse);
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+  rpc GetProviderLoginFlow(GetProviderLoginFlowRequest) returns (GetProviderLoginFlowResponse);
+}
+
+service TargetService {
+  rpc ListTargets(ListTargetsRequest) returns (ListTargetsResponse);
+  rpc GetTarget(GetTargetRequest) returns (GetTargetResponse);
+}
+
+service SessionService {
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
+  rpc DiscoverNativeSessions(DiscoverNativeSessionsRequest) returns (DiscoverNativeSessionsResponse);
+  rpc ScanNativeSessionCatalog(ScanNativeSessionCatalogRequest) returns (ScanNativeSessionCatalogResponse);
+  rpc GetNativeSessionTree(GetNativeSessionTreeRequest) returns (GetNativeSessionTreeResponse);
+  rpc GetSessionStatistics(GetSessionStatisticsRequest) returns (GetSessionStatisticsResponse);
+  rpc ListRuntimeCommands(ListRuntimeCommandsRequest) returns (ListRuntimeCommandsResponse);
+  rpc ListBackgroundTasks(ListBackgroundTasksRequest) returns (ListBackgroundTasksResponse);
+  rpc ListSessionTimeline(ListSessionTimelineRequest) returns (ListSessionTimelineResponse);
+  rpc SearchSessionMessages(SearchSessionMessagesRequest) returns (SearchSessionMessagesResponse);
+  // Ephemeral one-shot prediction. It never appends to Backend/native history.
+  rpc PredictNextPrompt(PredictNextPromptRequest) returns (PredictNextPromptResponse);
+  // Ephemeral one-shot title generation. Conversation material never crosses
+  // the renderer boundary and the generated title is not committed here.
+  rpc SuggestSessionTitle(SuggestSessionTitleRequest) returns (SuggestSessionTitleResponse);
+}
+
+// Authenticated portable task transfer. Passwords cross only the transient
+// RPC methods; the commit refers to a connection-bound, ten-minute draft.
+service PortableSessionService {
+  rpc ExportPortableSession(ExportPortableSessionRequest) returns (ExportPortableSessionResponse);
+  rpc InspectPortableSessionImport(InspectPortableSessionImportRequest) returns (InspectPortableSessionImportResponse);
+  rpc UnlockPortableSessionImport(UnlockPortableSessionImportRequest) returns (UnlockPortableSessionImportResponse);
+  rpc CancelPortableSessionImport(CancelPortableSessionImportRequest) returns (CancelPortableSessionImportResponse);
+  rpc CommitPortableSessionImport(CommitPortableSessionImportRequest) returns (CommitPortableSessionImportResponse);
+  rpc RetryPortableSessionActivation(RetryPortableSessionActivationRequest) returns (RetryPortableSessionActivationResponse);
+}
+
+service RunService {
+  rpc ListRuns(ListRunsRequest) returns (ListRunsResponse);
+  rpc GetRun(GetRunRequest) returns (GetRunResponse);
+}
+
+service QueueService {
+  rpc ListQueueItems(ListQueueItemsRequest) returns (ListQueueItemsResponse);
+  rpc GetQueueControl(GetQueueControlRequest) returns (GetQueueControlResponse);
+}
+
+service SchedulerService {
+  rpc ListSchedules(ListSchedulesRequest) returns (ListSchedulesResponse);
+  rpc GetSchedule(GetScheduleRequest) returns (GetScheduleResponse);
+  rpc ListScheduleRunHistory(ListScheduleRunHistoryRequest) returns (ListScheduleRunHistoryResponse);
+  rpc GetSchedulerRuntime(GetSchedulerRuntimeRequest) returns (GetSchedulerRuntimeResponse);
+}
+
+service InteractionService {
+  rpc ListInteractions(ListInteractionsRequest) returns (ListInteractionsResponse);
+  rpc GetInteraction(GetInteractionRequest) returns (GetInteractionResponse);
+}
+
+service WorkspaceService {
+  rpc ListWorkspaces(ListWorkspacesRequest) returns (ListWorkspacesResponse);
+  rpc GetWorkspace(GetWorkspaceRequest) returns (GetWorkspaceResponse);
+  rpc WatchWorkspaceFileChanges(WatchWorkspaceFileChangesRequest) returns (stream WatchWorkspaceFileChangesResponse);
+  rpc ListWorkspaceEntries(ListWorkspaceEntriesRequest) returns (ListWorkspaceEntriesResponse);
+  // Lazy filename index (`rg --files --hidden`, 30k cap).
+  rpc ListWorkspaceFiles(ListWorkspaceFilesRequest) returns (ListWorkspaceFilesResponse);
+  rpc ReadWorkspaceFile(ReadWorkspaceFileRequest) returns (ReadWorkspaceFileResponse);
+  rpc WriteWorkspaceTextFile(WriteWorkspaceTextFileRequest) returns (WriteWorkspaceTextFileResponse);
+  rpc SearchWorkspace(SearchWorkspaceRequest) returns (SearchWorkspaceResponse);
+  // Fixed-string project search. Match records arrive while
+  // ripgrep is running; cancelling the RPC terminates that owned process.
+  rpc StreamWorkspaceSearch(StreamWorkspaceSearchRequest) returns (stream StreamWorkspaceSearchResponse);
+  rpc GetGitStatus(GetGitStatusRequest) returns (GetGitStatusResponse);
+  rpc GetWorkspaceDiff(GetWorkspaceDiffRequest) returns (GetWorkspaceDiffResponse);
+  rpc ReadWorkspaceDiffFile(ReadWorkspaceDiffFileRequest) returns (ReadWorkspaceDiffFileResponse);
+  rpc ReadWorkspaceDiffImage(ReadWorkspaceDiffImageRequest) returns (ReadWorkspaceDiffImageResponse);
+  rpc ListWorkspaceChangeSets(ListWorkspaceChangeSetsRequest) returns (ListWorkspaceChangeSetsResponse);
+  rpc PreviewWorkspaceRewind(PreviewWorkspaceRewindRequest) returns (PreviewWorkspaceRewindResponse);
+}
+
+service ArtifactService {
+  rpc ListArtifacts(ListArtifactsRequest) returns (ListArtifactsResponse);
+  rpc GetArtifact(GetArtifactRequest) returns (GetArtifactResponse);
+  rpc BeginBlobUpload(BeginBlobUploadRequest) returns (BeginBlobUploadResponse);
+  rpc CompleteBlobUpload(CompleteBlobUploadRequest) returns (CompleteBlobUploadResponse);
+  rpc GetBlobDownloadTicket(GetBlobDownloadTicketRequest) returns (GetBlobDownloadTicketResponse);
+  rpc GetArtifactStorageStats(GetArtifactStorageStatsRequest) returns (GetArtifactStorageStatsResponse);
+  rpc ScanArtifactStorage(ScanArtifactStorageRequest) returns (ScanArtifactStorageResponse);
+  rpc ReconcileArtifactStorage(ReconcileArtifactStorageRequest) returns (ReconcileArtifactStorageResponse);
+  rpc CleanupArtifactStorage(CleanupArtifactStorageRequest) returns (CleanupArtifactStorageResponse);
+}
+
+service HistoryMaintenanceService {
+  rpc GetHistoryMaintenanceSupport(GetHistoryMaintenanceSupportRequest) returns (GetHistoryMaintenanceSupportResponse);
+  rpc ScanTaskHistory(ScanTaskHistoryRequest) returns (ScanTaskHistoryResponse);
+  rpc BeginTaskHistoryCleanup(BeginTaskHistoryCleanupRequest) returns (BeginTaskHistoryCleanupResponse);
+  rpc GetTaskHistoryCleanup(GetTaskHistoryCleanupRequest) returns (GetTaskHistoryCleanupResponse);
+  rpc CancelTaskHistoryCleanup(CancelTaskHistoryCleanupRequest) returns (CancelTaskHistoryCleanupResponse);
+}
+
+service CredentialService {
+  rpc BeginCredentialUpload(BeginCredentialUploadRequest) returns (BeginCredentialUploadResponse);
+  rpc ListCredentials(ListCredentialsRequest) returns (ListCredentialsResponse);
+  rpc BeginProviderLoginInputUpload(BeginProviderLoginInputUploadRequest) returns (BeginProviderLoginInputUploadResponse);
+  rpc SubmitProviderLoginInput(SubmitProviderLoginInputRequest) returns (SubmitProviderLoginInputResponse);
+  rpc CancelProviderLogin(CancelProviderLoginRequest) returns (CancelProviderLoginResponse);
+}
+
+service SettingsService {
+  rpc GetSettings(GetSettingsRequest) returns (GetSettingsResponse);
+}
+
+// Orchestrator-node-owned local inference runtimes. Shared clients discover every
+// action through ManagedModelRuntimeCapabilities and never infer behavior from
+// a concrete runtime_id.
+service ManagedModelRuntimeService {
+  rpc ListManagedModelRuntimes(ListManagedModelRuntimesRequest) returns (ListManagedModelRuntimesResponse);
+  rpc GetManagedModelRuntime(GetManagedModelRuntimeRequest) returns (GetManagedModelRuntimeResponse);
+  rpc StartManagedModelRuntime(StartManagedModelRuntimeRequest) returns (StartManagedModelRuntimeResponse);
+  rpc InstallManagedModelRuntime(InstallManagedModelRuntimeRequest) returns (InstallManagedModelRuntimeResponse);
+  rpc CancelManagedModelRuntimeInstall(CancelManagedModelRuntimeInstallRequest) returns (CancelManagedModelRuntimeInstallResponse);
+  rpc PullManagedModel(PullManagedModelRequest) returns (PullManagedModelResponse);
+  rpc PauseManagedModelPull(PauseManagedModelPullRequest) returns (PauseManagedModelPullResponse);
+  rpc ResumeManagedModelPull(ResumeManagedModelPullRequest) returns (ResumeManagedModelPullResponse);
+  rpc CancelManagedModelPull(CancelManagedModelPullRequest) returns (CancelManagedModelPullResponse);
+  rpc DeleteManagedModel(DeleteManagedModelRequest) returns (DeleteManagedModelResponse);
+  rpc GetManagedModelPreflight(GetManagedModelPreflightRequest) returns (GetManagedModelPreflightResponse);
+}
+
+service ToolService {
+  rpc ListToolProviders(ListToolProvidersRequest) returns (ListToolProvidersResponse);
+  rpc GetToolProvider(GetToolProviderRequest) returns (GetToolProviderResponse);
+  rpc GetRuntimeToolCatalog(GetRuntimeToolCatalogRequest) returns (GetRuntimeToolCatalogResponse);
+  rpc GetToolCall(GetToolCallRequest) returns (GetToolCallResponse);
+  rpc ListToolCalls(ListToolCallsRequest) returns (ListToolCallsResponse);
+  rpc ListToolLeases(ListToolLeasesRequest) returns (ListToolLeasesResponse);
+  rpc ListMcpServers(ListMcpServersRequest) returns (ListMcpServersResponse);
+}
+
+service BrowserService {
+  rpc ListBrowserProviders(ListBrowserProvidersRequest) returns (ListBrowserProvidersResponse);
+  rpc GetBrowserProvider(GetBrowserProviderRequest) returns (GetBrowserProviderResponse);
+  rpc ListBrowserPages(ListBrowserPagesRequest) returns (ListBrowserPagesResponse);
+  rpc GetBrowserPage(GetBrowserPageRequest) returns (GetBrowserPageResponse);
+  rpc ListBrowserActivity(ListBrowserActivityRequest) returns (ListBrowserActivityResponse);
+  rpc ListBrowserTransfers(ListBrowserTransfersRequest) returns (ListBrowserTransfersResponse);
+  // Service-device authentication is mandatory for both remote automation
+  // methods. Public LAN discovery grants no execution authority.
+  rpc ListBrowserAutomationNodes(ListBrowserAutomationNodesRequest) returns (ListBrowserAutomationNodesResponse);
+  rpc ExecuteBrowserAutomationAction(ExecuteBrowserAutomationActionRequest) returns (ExecuteBrowserAutomationActionResponse);
+  // Authenticated, ephemeral page-annotation control. Page evidence and live
+  // design previews never enter Event, Operation, Snapshot, or log surfaces.
+  rpc InspectBrowserCommentTarget(InspectBrowserCommentTargetRequest) returns (InspectBrowserCommentTargetResponse);
+  rpc UpdateBrowserCommentDesign(UpdateBrowserCommentDesignRequest) returns (UpdateBrowserCommentDesignResponse);
+}
+
+service WorktreeService {
+  rpc ProbeTargetWorktree(ProbeTargetWorktreeRequest) returns (ProbeTargetWorktreeResponse);
+  rpc ListTargetWorktreeSources(ListTargetWorktreeSourcesRequest) returns (ListTargetWorktreeSourcesResponse);
+}
+
+service SubagentService {
+  rpc ListSubagentRuns(ListSubagentRunsRequest) returns (ListSubagentRunsResponse);
+  rpc GetSubagentRun(GetSubagentRunRequest) returns (GetSubagentRunResponse);
+  rpc ListSubagentTranscript(ListSubagentTranscriptRequest) returns (ListSubagentTranscriptResponse);
+}
+
+// Authenticated, ephemeral speech-to-text control. Audio and text-bearing
+// responses never enter the durable Event/Snapshot surfaces.
+service VoiceInputService {
+  rpc GetVoiceInputCapabilities(GetVoiceInputCapabilitiesRequest) returns (GetVoiceInputCapabilitiesResponse);
+  rpc TestVoiceInputConnection(TestVoiceInputConnectionRequest) returns (TestVoiceInputConnectionResponse);
+  rpc AdviseVoiceInputDictionaryEdit(AdviseVoiceInputDictionaryEditRequest) returns (AdviseVoiceInputDictionaryEditResponse);
+  rpc StartVoiceInput(StartVoiceInputRequest) returns (StartVoiceInputResponse);
+  rpc AppendVoiceAudio(AppendVoiceAudioRequest) returns (AppendVoiceAudioResponse);
+  rpc StopVoiceInput(StopVoiceInputRequest) returns (StopVoiceInputResponse);
+  rpc CancelVoiceInput(CancelVoiceInputRequest) returns (CancelVoiceInputResponse);
+  rpc GetVoiceInputSession(GetVoiceInputSessionRequest) returns (GetVoiceInputSessionResponse);
+}
+
+// Pi-only reads for namespaced panels. Shared UI and reducers use the services
+// above and must gate these calls on capabilities.
+service PiService {
+  rpc GetPiSessionState(GetPiSessionStateRequest) returns (GetPiSessionStateResponse);
+  rpc GetPiSessionTree(GetPiSessionTreeRequest) returns (GetPiSessionTreeResponse);
+  rpc ListPiMessages(ListPiMessagesRequest) returns (ListPiMessagesResponse);
+  rpc ListPiEntries(ListPiEntriesRequest) returns (ListPiEntriesResponse);
+  rpc ListPiForkCandidates(ListPiForkCandidatesRequest) returns (ListPiForkCandidatesResponse);
+  rpc ListPiCommands(ListPiCommandsRequest) returns (ListPiCommandsResponse);
+  rpc ListPiResources(ListPiResourcesRequest) returns (ListPiResourcesResponse);
+}
+
+service ReviewService {
+  rpc ListReviewRuns(ListReviewRunsRequest) returns (ListReviewRunsResponse);
+  rpc GetReviewRun(GetReviewRunRequest) returns (GetReviewRunResponse);
+}
+
+message GetServerInfoRequest {}
+
+message GetVoiceInputCapabilitiesRequest {}
+
+message GetVoiceInputCapabilitiesResponse {
+  VoiceInputCapabilityProfile profile = 1;
+}
+
+message TestVoiceInputConnectionRequest {}
+
+message TestVoiceInputConnectionResponse {
+  bool ok = 1;
+  VoiceInputConnectionTestFailure failure = 2;
+}
+
+// Text is processed only for this authenticated request and is never written
+// to Operation, Event, Snapshot, Session, diagnostics, or logs.
+message AdviseVoiceInputDictionaryEditRequest {
+  string before_text = 1;
+  string after_text = 2;
+  optional string raw_transcript_text = 3;
+  optional string locale = 4;
+  repeated VoiceInputDictionaryEntryState existing_entries = 5;
+  repeated VoiceInputDictionaryCandidateState existing_candidates = 6;
+}
+
+message AdviseVoiceInputDictionaryEditResponse {
+  repeated VoiceInputDictionaryLearningAction actions = 1;
+}
+
+enum VoiceInputConnectionTestFailure {
+  VOICE_INPUT_CONNECTION_TEST_FAILURE_UNSPECIFIED = 0;
+  VOICE_INPUT_CONNECTION_TEST_FAILURE_CREDENTIALS_MISSING = 1;
+  VOICE_INPUT_CONNECTION_TEST_FAILURE_AUTHENTICATION_FAILED = 2;
+  VOICE_INPUT_CONNECTION_TEST_FAILURE_ROUTE_UNAVAILABLE = 3;
+  VOICE_INPUT_CONNECTION_TEST_FAILURE_TIMEOUT = 4;
+  VOICE_INPUT_CONNECTION_TEST_FAILURE_NETWORK = 5;
+  VOICE_INPUT_CONNECTION_TEST_FAILURE_SERVICE_ERROR = 6;
+}
+
+message StartVoiceInputRequest {
+  // Caller-generated idempotency key scoped to the authenticated Connection.
+  string request_id = 1;
+  string mime_type = 2;
+  optional string locale = 3;
+  // Ephemeral cleanup preferences. These fields are bounded at the service
+  // edge and never enter Operation, Event, Snapshot, Session, or log storage.
+  optional string refinement_instructions = 4;
+  repeated string dictionary_terms = 5;
+}
+
+message StartVoiceInputResponse {
+  VoiceInputSession session = 1;
+}
+
+message AppendVoiceAudioRequest {
+  string voice_input_id = 1;
+  // Strictly increasing, starts at one, and is accepted exactly once.
+  uint64 chunk_sequence = 2;
+  bytes audio = 3;
+  uint32 duration_ms = 4;
+  bool voiced = 5;
+}
+
+message AppendVoiceAudioResponse {
+  VoiceInputSession session = 1;
+}
+
+message StopVoiceInputRequest {
+  string voice_input_id = 1;
+  // Fences Stop behind every acknowledged audio chunk.
+  uint64 expected_next_chunk_sequence = 2;
+}
+
+message StopVoiceInputResponse {
+  VoiceInputSession session = 1;
+}
+
+message CancelVoiceInputRequest {
+  string voice_input_id = 1;
+}
+
+message CancelVoiceInputResponse {
+  VoiceInputSession session = 1;
+}
+
+message GetVoiceInputSessionRequest {
+  string voice_input_id = 1;
+}
+
+message GetVoiceInputSessionResponse {
+  VoiceInputSession session = 1;
+}
+
+message GetServerInfoResponse {
+  ServerInfo server = 1;
+}
+
+message ListDiscoveredNodesRequest {}
+
+message ListDiscoveredNodesResponse {
+  repeated DiscoveredNode nodes = 1;
+}
+
+message BeginPairingRequest {
+  string device_display_name = 1;
+  DeviceKind device_kind = 2;
+  string platform = 3;
+  string app_version = 4;
+}
+
+message BeginPairingResponse {
+  PairingChallenge challenge = 1;
+}
+
+message CompletePairingRequest {
+  string challenge_id = 1;
+  string human_code = 2;
+  string device_display_name = 3;
+  DeviceKind device_kind = 4;
+  string platform = 5;
+  string app_version = 6;
+  // Optional only for adding another Connection to an existing Device. Orchestrator
+  // must honor it exclusively for an authenticated caller whose current
+  // Connection already belongs to this same Device. Anonymous pairing omits
+  // the field and always creates a new Device.
+  optional string device_id = 7;
+}
+
+message CompletePairingResponse {
+  PairingResult result = 1;
+}
+
+message ListConnectionsRequest {
+  PageRequest page = 1;
+  optional ConnectionState state = 2;
+}
+
+message ListConnectionsResponse {
+  repeated Connection connections = 1;
+  PageInfo page = 2;
+}
+
+message GetConnectionRequest {
+  string connection_id = 1;
+}
+
+message GetConnectionResponse {
+  Connection connection = 1;
+}
+
+message ListDevicesRequest {
+  PageRequest page = 1;
+  optional bool revoked = 2;
+}
+
+message ListDevicesResponse {
+  repeated Device devices = 1;
+  PageInfo page = 2;
+}
+
+message GetDeviceRequest {
+  string device_id = 1;
+}
+
+message GetDeviceResponse {
+  Device device = 1;
+}
+
+message ListDeviceControlRelationsRequest {
+  PageRequest page = 1;
+  // Empty lists all relations visible to the owner. A Device ID narrows the
+  // result to relations where it is either controller or target.
+  string device_id = 2;
+}
+
+message ListDeviceControlRelationsResponse {
+  repeated DeviceControlRelation relations = 1;
+  PageInfo page = 2;
+}
+
+message GetSnapshotRequest {
+  SnapshotScope scope = 1;
+}
+
+message GetSnapshotResponse {
+  Snapshot snapshot = 1;
+}
+
+message GetRuntimeActivityRequest {}
+
+message GetRuntimeActivityResponse {
+  RuntimeActivitySummary summary = 1;
+}
+
+message StreamEventsRequest {
+  SnapshotScope scope = 1;
+  EventCursor after_cursor = 2;
+}
+
+message StreamEventsResponse {
+  Event event = 1;
+}
+
+message SubmitOperationRequest {
+  // Generated by the client. Reuse is valid only with the identical mutation.
+  string operation_id = 1;
+  string connection_id = 2;
+  OperationMutation mutation = 3;
+}
+
+message SubmitOperationResponse {
+  Operation operation = 1;
+}
+
+message GetOperationRequest {
+  string operation_id = 1;
+}
+
+message GetOperationResponse {
+  Operation operation = 1;
+}
+
+message ListOperationsRequest {
+  PageRequest page = 1;
+  optional OperationState state = 2;
+  string session_id = 3;
+  string target_id = 4;
+}
+
+message ListOperationsResponse {
+  repeated Operation operations = 1;
+  PageInfo page = 2;
+}
+
+message WatchOperationRequest {
+  string operation_id = 1;
+  Revision after_revision = 2;
+}
+
+message WatchOperationResponse {
+  Operation operation = 1;
+}
+
+message ListBackendsRequest {
+  PageRequest page = 1;
+}
+
+message ListBackendsResponse {
+  repeated BackendDescriptor backends = 1;
+  PageInfo page = 2;
+}
+
+message GetBackendRequest {
+  string backend_id = 1;
+}
+
+message GetBackendResponse {
+  BackendDescriptor backend = 1;
+}
+
+message ListRuntimeProcessesRequest {
+  string backend_id = 1;
+}
+
+message ListRuntimeProcessesResponse {
+  repeated RuntimeProcessUsage processes = 1;
+  google.protobuf.Timestamp captured_at = 2;
+}
+
+message ListProvidersRequest {
+  string backend_id = 1;
+  PageRequest page = 2;
+}
+
+message ListProvidersResponse {
+  repeated ProviderDescriptor providers = 1;
+  PageInfo page = 2;
+}
+
+message GetProviderRequest {
+  string backend_id = 1;
+  string provider_id = 2;
+}
+
+message GetProviderResponse {
+  ProviderDescriptor provider = 1;
+}
+
+message GetProviderUsageRequest {
+  string backend_id = 1;
+  string provider_id = 2;
+}
+
+message GetProviderUsageResponse {
+  ProviderUsageSummary usage = 1;
+  RateLimitState rate_limit = 2;
+  ProviderAccountUsageSnapshot account_usage = 3;
+}
+
+message ListModelsRequest {
+  string backend_id = 1;
+  string provider_id = 2;
+  bool available_only = 3;
+  PageRequest page = 4;
+}
+
+message ListModelsResponse {
+  repeated ModelDescriptor models = 1;
+  PageInfo page = 2;
+}
+
+message GetProviderLoginFlowRequest {
+  string login_flow_id = 1;
+}
+
+message GetProviderLoginFlowResponse {
+  ProviderLoginFlow login_flow = 1;
+  AuthenticationState authentication_state = 2;
+  ErrorInfo error = 3;
+}
+
+message ListTargetsRequest {
+  string backend_id = 1;
+  optional TargetState state = 2;
+  string search_query = 3;
+  PageRequest page = 4;
+}
+
+message ListTargetsResponse {
+  repeated Target targets = 1;
+  PageInfo page = 2;
+}
+
+message GetTargetRequest {
+  string target_id = 1;
+}
+
+message GetTargetResponse {
+  Target target = 1;
+}
+
+message ListSessionsRequest {
+  string backend_id = 1;
+  string target_id = 2;
+  optional SessionState state = 3;
+  optional bool archived = 4;
+  string search_query = 5;
+  PageRequest page = 6;
+}
+
+message ListSessionsResponse {
+  repeated Session sessions = 1;
+  PageInfo page = 2;
+}
+
+message GetUsageHistoryRequest {
+  // Zero selects 140 days. Values above 366 are rejected.
+  uint32 days = 1;
+  string backend_id = 2;
+  string provider_id = 3;
+}
+
+message GetUsageHistoryResponse {
+  UsageHistory history = 1;
+}
+
+message GetModelPriceOverrideRequest {
+  string backend_id = 1;
+  string provider_id = 2;
+  string model_id = 3;
+}
+
+message GetModelPriceOverrideResponse {
+  ModelPriceOverrideView price = 1;
+}
+
+message SetModelPriceOverrideRequest {
+  string backend_id = 1;
+  string provider_id = 2;
+  string model_id = 3;
+  ModelPriceQuote desired = 4;
+}
+
+message SetModelPriceOverrideResponse {
+  ModelPriceOverrideView price = 1;
+}
+
+message ResetModelPriceOverrideRequest {
+  string backend_id = 1;
+  string provider_id = 2;
+  string model_id = 3;
+}
+
+message ResetModelPriceOverrideResponse {
+  ModelPriceOverrideView price = 1;
+}
+
+message ListReviewRunsRequest {
+  optional string source_session_id = 1;
+  optional string reviewer_session_id = 2;
+  optional ReviewRunState state = 3;
+  PageRequest page = 4;
+}
+
+message ListReviewRunsResponse {
+  repeated ReviewRun review_runs = 1;
+  PageInfo page = 2;
+}
+
+message GetReviewRunRequest {
+  string review_run_id = 1;
+}
+
+message GetReviewRunResponse {
+  ReviewRun review_run = 1;
+}
+
+message DiscoverNativeSessionsRequest {
+  string target_id = 1;
+  PageRequest page = 2;
+}
+
+message DiscoverNativeSessionsResponse {
+  repeated NativeSessionCandidate sessions = 1;
+  PageInfo page = 2;
+}
+
+message ScanNativeSessionCatalogRequest {
+  string backend_id = 1;
+  bool force = 2;
+}
+
+message ScanNativeSessionCatalogResponse {
+  repeated NativeSessionCatalogEntry entries = 1;
+  uint64 rejected_count = 2;
+  uint64 existing_count = 3;
+  string snapshot_token = 4;
+}
+
+message GetSessionRequest {
+  string session_id = 1;
+}
+
+message GetSessionResponse {
+  Session session = 1;
+}
+
+message GetNativeSessionTreeRequest {
+  string session_id = 1;
+}
+
+message GetNativeSessionTreeResponse {
+  NativeSessionTree tree = 1;
+}
+
+message GetSessionStatisticsRequest {
+  string session_id = 1;
+}
+
+message GetSessionStatisticsResponse {
+  SessionStatistics statistics = 1;
+}
+
+message ListBackgroundTasksRequest {
+  string session_id = 1;
+  optional BackgroundTaskState state = 2;
+  PageRequest page = 3;
+}
+
+message ListBackgroundTasksResponse {
+  // One latest durable projection per task identity. Non-terminal tasks come
+  // first by started_at/created_at ascending; terminal tasks follow by
+  // ended_at/updated_at/created_at descending. Task ID is the final tie-break.
+  repeated BackgroundTask background_tasks = 1;
+  PageInfo page = 2;
+}
+
+message ListSubagentRunsRequest {
+  string session_id = 1;
+  optional SubagentRunState state = 2;
+  PageRequest page = 3;
+}
+
+message ListSubagentRunsResponse {
+  repeated SubagentRun runs = 1;
+  PageInfo page = 2;
+}
+
+message GetSubagentRunRequest {
+  string session_id = 1;
+  string subagent_run_id = 2;
+}
+
+message GetSubagentRunResponse {
+  SubagentRunDetail run = 1;
+}
+
+message ListSubagentTranscriptRequest {
+  string session_id = 1;
+  string subagent_run_id = 2;
+  string child_id = 3;
+  PageRequest page = 4;
+}
+
+message ListSubagentTranscriptResponse {
+  repeated SubagentTranscriptEntry entries = 1;
+  PageInfo page = 2;
+  // May be supplied again as page.page_token to fetch entries appended later.
+  string tail_page_token = 3;
+}
+
+message ListSessionTimelineRequest {
+  string session_id = 1;
+  EventCursor before_cursor = 2;
+  uint32 limit = 3;
+  // Returns a bounded ordered window centered as closely as possible on this
+  // durable Event ID. This is mutually exclusive with before_cursor.
+  string around_event_id = 4;
+}
+
+message ListSessionTimelineResponse {
+  repeated Event events = 1;
+  EventCursor next_before_cursor = 2;
+}
+
+message SearchSessionMessagesRequest {
+  oneof scope {
+    string session_id = 1;
+    string target_id = 2;
+    OwnerSessionMessageSearchScope owner = 5;
+  }
+  string query = 3;
+  PageRequest page = 4;
+  // Unspecified preserves the default hybrid behavior. Keyword is an
+  // explicit, per-request opt-out and never disables the durable index.
+  SessionMessageSearchSemanticMode semantic_mode = 6;
+  SessionMessageSearchFilters filters = 7;
+}
+
+message OwnerSessionMessageSearchScope {}
+
+enum SessionMessageSearchSessionStatus {
+  SESSION_MESSAGE_SEARCH_SESSION_STATUS_UNSPECIFIED = 0;
+  SESSION_MESSAGE_SEARCH_SESSION_STATUS_ACTIVE = 1;
+  SESSION_MESSAGE_SEARCH_SESSION_STATUS_ARCHIVED = 2;
+}
+
+// Presence distinguishes "any" from an explicitly empty set: absent means
+// any; present with no values means no Session can match.
+message SessionMessageSearchIdSet {
+  repeated string values = 1;
+}
+
+// Capability-neutral structured predicates shared by the FTS and vector
+// arms. Unspecified scalar fields mean "any".
+message SessionMessageSearchFilters {
+  SessionMessageSearchIdSet target_ids = 1;
+  SessionMessageSearchIdSet session_ids = 2;
+  SessionMessageSearchIdSet backend_ids = 3;
+  SessionMessageSearchSessionStatus session_status = 4;
+  google.protobuf.Timestamp session_activity_from = 5;
+  google.protobuf.Timestamp message_created_from = 6;
+  google.protobuf.Timestamp message_created_before = 7;
+}
+
+message SearchSessionMessagesResponse {
+  repeated SessionMessageSearchMatch matches = 1;
+  PageInfo page = 2;
+  Revision revision = 3;
+  bool vector_used = 4;
+  string vector_skip_reason = 5;
+  bool pool_capped = 6;
+}
+
+message PredictNextPromptRequest {
+  string session_id = 1;
+  // The UI snapshot that made this completed turn eligible. Orchestrator rechecks
+  // it immediately before the paid Provider dispatch and again before return.
+  google.protobuf.Timestamp expected_last_activity_at = 2;
+  uint64 expected_generation = 3;
+}
+
+message PredictNextPromptResponse {
+  // Empty means deliberately unavailable, stale, cancelled, or no safe
+  // prediction. Failures are quiet and never invent fallback text.
+  string prompt = 1;
+}
+
+message SuggestSessionTitleRequest {
+  string session_id = 1;
+}
+
+enum SessionTitleSuggestionStatus {
+  SESSION_TITLE_SUGGESTION_STATUS_UNSPECIFIED = 0;
+  SESSION_TITLE_SUGGESTION_STATUS_OK = 1;
+  SESSION_TITLE_SUGGESTION_STATUS_NO_MATERIAL = 2;
+  SESSION_TITLE_SUGGESTION_STATUS_PROVIDER_UNAVAILABLE = 3;
+  SESSION_TITLE_SUGGESTION_STATUS_GENERATION_FAILED = 4;
+}
+
+message SuggestSessionTitleResponse {
+  string title = 1;
+  SessionTitleSuggestionStatus status = 2;
+}
+
+message ListRunsRequest {
+  string session_id = 1;
+  string target_id = 2;
+  optional RunState state = 3;
+  PageRequest page = 4;
+}
+
+message ListRunsResponse {
+  repeated Run runs = 1;
+  PageInfo page = 2;
+}
+
+message GetRunRequest {
+  string run_id = 1;
+}
+
+message GetRunResponse {
+  Run run = 1;
+}
+
+message ListQueueItemsRequest {
+  string session_id = 1;
+  string target_id = 2;
+  optional QueueItemState state = 3;
+  PageRequest page = 4;
+}
+
+message ListQueueItemsResponse {
+  repeated QueueItem queue_items = 1;
+  PageInfo page = 2;
+}
+
+message GetQueueControlRequest {
+  string session_id = 1;
+}
+
+message GetQueueControlResponse {
+  QueueControl queue_control = 1;
+}
+
+message ListSchedulesRequest {
+  string backend_id = 1;
+  string target_id = 2;
+  string session_id = 3;
+  optional ScheduleState state = 4;
+  PageRequest page = 5;
+}
+
+message ListSchedulesResponse {
+  repeated Schedule schedules = 1;
+  PageInfo page = 2;
+}
+
+message GetScheduleRequest {
+  string schedule_id = 1;
+}
+
+message GetScheduleResponse {
+  Schedule schedule = 1;
+}
+
+message ListScheduleRunHistoryRequest {
+  string schedule_id = 1;
+  PageRequest page = 2;
+}
+
+message ListScheduleRunHistoryResponse {
+  repeated ScheduleRunHistory history = 1;
+  PageInfo page = 2;
+}
+
+message GetSchedulerRuntimeRequest {}
+
+message GetSchedulerRuntimeResponse {
+  SchedulerRuntimeSnapshot runtime = 1;
+}
+
+message ListInteractionsRequest {
+  string session_id = 1;
+  string run_id = 2;
+  optional InteractionKind kind = 3;
+  optional InteractionState state = 4;
+  PageRequest page = 5;
+}
+
+message ListInteractionsResponse {
+  repeated Interaction interactions = 1;
+  PageInfo page = 2;
+}
+
+message GetInteractionRequest {
+  string interaction_id = 1;
+}
+
+message GetInteractionResponse {
+  Interaction interaction = 1;
+}
+
+enum WorktreeEligibility {
+  WORKTREE_ELIGIBILITY_UNSPECIFIED = 0;
+  WORKTREE_ELIGIBILITY_ELIGIBLE = 1;
+  WORKTREE_ELIGIBILITY_NOT_GIT_REPOSITORY = 2;
+  WORKTREE_ELIGIBILITY_ALREADY_LINKED = 3;
+  WORKTREE_ELIGIBILITY_UNSAFE = 4;
+  WORKTREE_ELIGIBILITY_UNAVAILABLE = 5;
+}
+
+message ProbeTargetWorktreeRequest {
+  string target_id = 1;
+}
+
+message ProbeTargetWorktreeResponse {
+  string target_id = 1;
+  WorktreeEligibility eligibility = 2;
+  string repository_root_display = 3;
+  string current_branch = 4;
+  string head_commit = 5;
+  bool can_refresh_remote = 6;
+}
+
+message ListTargetWorktreeSourcesRequest {
+  string target_id = 1;
+  PageRequest page = 2;
+}
+
+message WorktreeSourceOption {
+  string ref = 1;
+  string commit = 2;
+  string display_name = 3;
+  bool remote = 4;
+  bool current = 5;
+}
+
+message ListTargetWorktreeSourcesResponse {
+  repeated WorktreeSourceOption sources = 1;
+  PageInfo page = 2;
+}
+
+message ListWorkspacesRequest {
+  string target_id = 1;
+  PageRequest page = 2;
+}
+
+message ListWorkspacesResponse {
+  repeated WorkspaceDescriptor workspaces = 1;
+  PageInfo page = 2;
+}
+
+message GetWorkspaceRequest {
+  string workspace_id = 1;
+}
+
+message GetWorkspaceResponse {
+  WorkspaceDescriptor workspace = 1;
+}
+
+message OwnerWorkspaceFileChangeScope {}
+
+message WorkspaceFileChangeWorkspaceScope {
+  string workspace_id = 1;
+}
+
+message WorkspaceFileChangeScope {
+  oneof kind {
+    OwnerWorkspaceFileChangeScope owner = 1;
+    WorkspaceFileChangeWorkspaceScope workspace = 2;
+  }
+}
+
+message WatchWorkspaceFileChangesRequest {
+  WorkspaceFileChangeScope scope = 1;
+}
+
+message WatchWorkspaceFileChangesResponse {
+  WorkspaceFileChange change = 1;
+}
+
+enum WorkspaceEntryListingPolicy {
+  // Default VCS-aware workspace view.
+  WORKSPACE_ENTRY_LISTING_POLICY_UNSPECIFIED = 0;
+  WORKSPACE_ENTRY_LISTING_POLICY_DEFAULT = 1;
+  // Files tree: show real project entries regardless of VCS ignores,
+  // while retaining the fixed cache/.meta exclusions and path safety rules.
+  WORKSPACE_ENTRY_LISTING_POLICY_DOCUMENT_TREE = 2;
+}
+
+message ListWorkspaceEntriesRequest {
+  string workspace_id = 1;
+  string parent_relative_path = 2;
+  bool include_hidden = 3;
+  PageRequest page = 4;
+  WorkspaceEntryListingPolicy listing_policy = 5;
+}
+
+message ListWorkspaceEntriesResponse {
+  repeated WorkspaceEntry entries = 1;
+  PageInfo page = 2;
+  Revision revision = 3;
+}
+
+message ListWorkspaceFilesRequest {
+  string workspace_id = 1;
+}
+
+message ListWorkspaceFilesResponse {
+  repeated string relative_paths = 1;
+  bool truncated = 2;
+  Revision revision = 3;
+}
+
+message ReadWorkspaceFileRequest {
+  string workspace_id = 1;
+  string relative_path = 2;
+  uint64 start_byte = 3;
+  uint64 maximum_bytes = 4;
+  FileRevision expected_revision = 5;
+}
+
+message ReadWorkspaceFileResponse {
+  FilePreview preview = 1;
+}
+
+message WriteWorkspaceTextFileRequest {
+  string workspace_id = 1;
+  string relative_path = 2;
+  string utf8_text = 3;
+  FileRevision expected_revision = 4;
+}
+
+message WriteWorkspaceTextFileResponse {
+  WorkspaceEntry entry = 1;
+  FileRevision previous_revision = 2;
+  FileRevision new_revision = 3;
+}
+
+message SearchWorkspaceRequest {
+  string workspace_id = 1;
+  string query = 2;
+  string relative_path_prefix = 3;
+  bool case_sensitive = 4;
+  bool regular_expression = 5;
+  PageRequest page = 6;
+}
+
+message SearchWorkspaceResponse {
+  repeated WorkspaceSearchMatch matches = 1;
+  PageInfo page = 2;
+  Revision revision = 3;
+  bool truncated = 4;
+  // Exact distinct relative-path count across the complete stable result set,
+  // not merely the files represented on this page.
+  uint64 total_files = 5;
+}
+
+message StreamWorkspaceSearchRequest {
+  string workspace_id = 1;
+  string query = 2;
+  bool case_sensitive = 3;
+}
+
+message WorkspaceSearchEnd {
+  bool truncated = 1;
+  uint64 total_matches = 2;
+  uint64 total_files = 3;
+  Revision revision = 4;
+}
+
+message StreamWorkspaceSearchResponse {
+  oneof event {
+    WorkspaceSearchMatch match = 1;
+    WorkspaceSearchEnd end = 2;
+    // Terminal, sanitized failure with a stable code and user-visible reason.
+    ErrorInfo error = 3;
+  }
+}
+
+message GetGitStatusRequest {
+  string workspace_id = 1;
+}
+
+message GetGitStatusResponse {
+  GitRepositoryState git = 1;
+}
+
+message GetWorkspaceDiffRequest {
+  string workspace_id = 1;
+  repeated string relative_paths = 2;
+  bool ignore_whitespace = 3;
+  GitDiffSource source = 4;
+  // Required for COMMIT (commit/ref) and BRANCH (base ref); ignored for the
+  // two mutable layers. The response returns its resolved immutable OID.
+  string source_revision = 5;
+  // Optional refresh fence. When non-empty the read fails if Review changed.
+  string expected_repository_revision = 6;
+  // Required on fenced BRANCH refreshes so a moving base cannot silently
+  // change the comparison.
+  string expected_merge_base_revision = 7;
+}
+
+message GetWorkspaceDiffResponse {
+  WorkspaceDiff diff = 1;
+}
+
+message ReadWorkspaceDiffFileRequest {
+  string workspace_id = 1;
+  string relative_path = 2;
+  GitDiffSource source = 3;
+  string expected_repository_revision = 4;
+  uint64 maximum_bytes = 5;
+  // Resolved immutable OID returned by WorkspaceDiff for COMMIT or BRANCH.
+  string source_revision = 6;
+  // Required for BRANCH previews in addition to the repository fence.
+  string expected_merge_base_revision = 7;
+}
+
+message ReadWorkspaceDiffFileResponse {
+  TextFilePreview text = 1;
+  bool truncated = 2;
+  string repository_revision = 3;
+  string merge_base_revision = 4;
+}
+
+message ReadWorkspaceDiffImageRequest {
+  string workspace_id = 1;
+  string relative_path = 2;
+  string old_relative_path = 3;
+  GitDiffSource source = 4;
+  string expected_repository_revision = 5;
+  // Resolved immutable commit/base OID returned by WorkspaceDiff.
+  string source_revision = 6;
+  // Required for BRANCH previews.
+  string expected_merge_base_revision = 7;
+}
+
+message WorkspaceDiffImageSide {
+  bool present = 1;
+  bool too_large = 2;
+  // Always a service-registered, authenticated BlobRef. Raw paths, data URLs,
+  // and SVG payloads are never returned by this API.
+  ImageRef image = 3;
+}
+
+message ReadWorkspaceDiffImageResponse {
+  WorkspaceDiffImageSide old_image = 1;
+  WorkspaceDiffImageSide new_image = 2;
+  string repository_revision = 3;
+  string merge_base_revision = 4;
+  uint64 maximum_bytes = 5;
+}
+
+message ListWorkspaceChangeSetsRequest {
+  string workspace_id = 1;
+  string session_id = 2;
+  PageRequest page = 3;
+}
+
+message ListWorkspaceChangeSetsResponse {
+  repeated WorkspaceChangeSet change_sets = 1;
+  PageInfo page = 2;
+}
+
+message PreviewWorkspaceRewindRequest {
+  string workspace_id = 1;
+  string change_set_id = 2;
+}
+
+message PreviewWorkspaceRewindResponse {
+  WorkspaceRewindPreview preview = 1;
+}
+
+message ListArtifactsRequest {
+  string session_id = 1;
+  string run_id = 2;
+  optional ArtifactKind kind = 3;
+  PageRequest page = 4;
+}
+
+message ListArtifactsResponse {
+  repeated Artifact artifacts = 1;
+  PageInfo page = 2;
+}
+
+message GetArtifactRequest {
+  string artifact_id = 1;
+}
+
+message GetArtifactResponse {
+  Artifact artifact = 1;
+}
+
+message BeginBlobUploadRequest {
+  string file_name = 1;
+  string media_type = 2;
+  uint64 byte_size = 3;
+  string sha256_hex = 4;
+  BlobDisposition disposition = 5;
+}
+
+message BeginBlobUploadResponse {
+  PendingBlobUpload upload = 1;
+}
+
+message CompleteBlobUploadRequest {
+  string upload_id = 1;
+}
+
+message CompleteBlobUploadResponse {
+  BlobRef blob = 1;
+}
+
+message GetBlobDownloadTicketRequest {
+  string blob_id = 1;
+}
+
+message GetBlobDownloadTicketResponse {
+  BlobTransferTicket ticket = 1;
+}
+
+message ArtifactStorageStats {
+  uint64 reference_count = 1;
+  uint64 unique_blob_count = 2;
+  uint64 total_bytes = 3;
+  uint64 cache_reference_count = 4;
+  uint64 cache_bytes = 5;
+  uint64 temporary_file_count = 6;
+  uint64 temporary_bytes = 7;
+}
+
+message GetArtifactStorageStatsRequest {
+  repeated string protected_sha256 = 1;
+}
+
+message GetArtifactStorageStatsResponse {
+  CapabilitySupport support = 1;
+  string support_reason = 2;
+  ArtifactStorageStats stats = 3;
+}
+
+message ArtifactStorageScan {
+  string token = 1;
+  google.protobuf.Timestamp expires_at = 2;
+  uint64 protected_reference_count = 3;
+  uint64 expired_reference_count = 4;
+  uint64 orphan_blob_count = 5;
+  uint64 orphan_blob_bytes = 6;
+  uint64 temporary_file_count = 7;
+  uint64 temporary_bytes = 8;
+  uint64 missing_blob_count = 9;
+  uint64 unsafe_entry_count = 10;
+  uint64 cleanable_bytes = 11;
+}
+
+message ScanArtifactStorageRequest {
+  repeated string protected_sha256 = 1;
+}
+
+message ScanArtifactStorageResponse {
+  ArtifactStorageScan scan = 1;
+}
+
+message ReconcileArtifactStorageRequest {
+  repeated string protected_sha256 = 1;
+}
+
+message ArtifactStorageReconcileResult {
+  bool healthy = 1;
+  uint64 missing_blob_count = 2;
+  uint64 orphan_blob_count = 3;
+  uint64 unsafe_entry_count = 4;
+}
+
+message ReconcileArtifactStorageResponse {
+  ArtifactStorageReconcileResult result = 1;
+}
+
+message CleanupArtifactStorageRequest {
+  string scan_token = 1;
+  repeated string protected_sha256 = 2;
+}
+
+enum ArtifactStorageCleanupOutcome {
+  ARTIFACT_STORAGE_CLEANUP_OUTCOME_UNSPECIFIED = 0;
+  ARTIFACT_STORAGE_CLEANUP_OUTCOME_COMPLETED = 1;
+  ARTIFACT_STORAGE_CLEANUP_OUTCOME_SCAN_EXPIRED = 2;
+  ARTIFACT_STORAGE_CLEANUP_OUTCOME_STORAGE_CHANGED = 3;
+}
+
+message ArtifactStorageCleanupResult {
+  uint64 expired_references_deleted = 1;
+  uint64 blobs_removed = 2;
+  uint64 temporary_files_removed = 3;
+  uint64 freed_bytes = 4;
+  uint64 skipped = 5;
+}
+
+message CleanupArtifactStorageResponse {
+  ArtifactStorageCleanupOutcome outcome = 1;
+  ArtifactStorageCleanupResult result = 2;
+}
+
+enum TaskHistoryRetention {
+  TASK_HISTORY_RETENTION_UNSPECIFIED = 0;
+  TASK_HISTORY_RETENTION_SEVEN_DAYS = 1;
+  TASK_HISTORY_RETENTION_ONE_MONTH = 2;
+  TASK_HISTORY_RETENTION_THREE_MONTHS = 3;
+  TASK_HISTORY_RETENTION_SIX_MONTHS = 4;
+}
+
+message GetHistoryMaintenanceSupportRequest {}
+
+message GetHistoryMaintenanceSupportResponse {
+  CapabilitySupport support = 1;
+  string support_reason = 2;
+}
+
+message ScanTaskHistoryRequest {
+  TaskHistoryRetention retention = 1;
+  bool include_active_tasks = 2;
+}
+
+message TaskHistoryScan {
+  string scan_id = 1;
+  TaskHistoryRetention retention = 2;
+  bool include_active_tasks = 3;
+  google.protobuf.Timestamp scanned_at = 4;
+  google.protobuf.Timestamp older_than = 5;
+  google.protobuf.Timestamp expires_at = 6;
+  uint64 active_task_count = 7;
+  uint64 deleted_task_count = 8;
+  uint64 archived_task_count = 9;
+  uint64 message_count = 10;
+  uint64 estimated_history_bytes = 11;
+  uint64 database_bytes = 12;
+  uint64 temporary_bytes_required = 13;
+  optional uint64 database_volume_free_bytes = 14;
+}
+
+message ScanTaskHistoryResponse {
+  TaskHistoryScan scan = 1;
+}
+
+message TaskHistoryCleanupResult {
+  uint64 active_task_count = 1;
+  uint64 deleted_task_count = 2;
+  uint64 archived_task_count = 3;
+  uint64 message_count = 4;
+  uint64 before_bytes = 5;
+  uint64 after_bytes = 6;
+  uint64 reclaimed_bytes = 7;
+  bool backup_created = 8;
+  uint64 skipped_task_count = 9;
+}
+
+enum TaskHistoryMaintenanceStatus {
+  TASK_HISTORY_MAINTENANCE_STATUS_UNSPECIFIED = 0;
+  TASK_HISTORY_MAINTENANCE_STATUS_RUNNING = 1;
+  TASK_HISTORY_MAINTENANCE_STATUS_COMPLETED = 2;
+  TASK_HISTORY_MAINTENANCE_STATUS_SCAN_EXPIRED = 3;
+  TASK_HISTORY_MAINTENANCE_STATUS_STORAGE_CHANGED = 4;
+  TASK_HISTORY_MAINTENANCE_STATUS_CANCELLED = 5;
+  TASK_HISTORY_MAINTENANCE_STATUS_FAILED = 6;
+}
+
+enum TaskHistoryMaintenancePhase {
+  TASK_HISTORY_MAINTENANCE_PHASE_UNSPECIFIED = 0;
+  TASK_HISTORY_MAINTENANCE_PHASE_PREPARING = 1;
+  TASK_HISTORY_MAINTENANCE_PHASE_COPYING = 2;
+  TASK_HISTORY_MAINTENANCE_PHASE_CLEANING = 3;
+  TASK_HISTORY_MAINTENANCE_PHASE_COMPACTING = 4;
+  TASK_HISTORY_MAINTENANCE_PHASE_VERIFYING = 5;
+  TASK_HISTORY_MAINTENANCE_PHASE_INSTALLING = 6;
+}
+
+message TaskHistoryMaintenanceProgress {
+  string maintenance_id = 1;
+  TaskHistoryMaintenanceStatus status = 2;
+  TaskHistoryMaintenancePhase phase = 3;
+  uint32 percent = 4;
+  bool cancellable = 5;
+  google.protobuf.Timestamp updated_at = 6;
+  TaskHistoryCleanupResult result = 7;
+}
+
+message BeginTaskHistoryCleanupRequest {
+  string scan_id = 1;
+  bool backup_enabled = 2;
+}
+
+message BeginTaskHistoryCleanupResponse {
+  TaskHistoryMaintenanceProgress progress = 1;
+}
+
+message GetTaskHistoryCleanupRequest {
+  string maintenance_id = 1;
+}
+
+message GetTaskHistoryCleanupResponse {
+  TaskHistoryMaintenanceProgress progress = 1;
+}
+
+message CancelTaskHistoryCleanupRequest {
+  string maintenance_id = 1;
+}
+
+message CancelTaskHistoryCleanupResponse {
+  TaskHistoryMaintenanceProgress progress = 1;
+}
+
+message BeginCredentialUploadRequest {
+  CredentialKind kind = 1;
+  string provider_id = 2;
+  string backend_id = 3;
+  string credential_surface_id = 4;
+}
+
+message BeginCredentialUploadResponse {
+  CredentialUploadTicket ticket = 1;
+}
+
+message ListCredentialsRequest {
+  string provider_id = 1;
+  PageRequest page = 2;
+}
+
+message ListCredentialsResponse {
+  repeated CredentialDescriptor credentials = 1;
+  PageInfo page = 2;
+}
+
+message BeginProviderLoginInputUploadRequest {
+  string login_flow_id = 1;
+  string prompt_id = 2;
+}
+
+message BeginProviderLoginInputUploadResponse {
+  CredentialUploadTicket ticket = 1;
+}
+
+message SubmitProviderLoginInputRequest {
+  string login_flow_id = 1;
+  string prompt_id = 2;
+  oneof input {
+    string choice_id = 3;
+    string text = 4;
+    string credential_input_ticket_id = 5;
+  }
+}
+
+message SubmitProviderLoginInputResponse {
+  ProviderLoginFlow login_flow = 1;
+}
+
+message CancelProviderLoginRequest {
+  string login_flow_id = 1;
+}
+
+message CancelProviderLoginResponse {
+  ProviderLoginFlow login_flow = 1;
+}
+
+message GetSettingsRequest {}
+
+message GetSettingsResponse {
+  SettingsSnapshot settings = 1;
+}
+
+message ListToolProvidersRequest {
+  optional ToolProviderKind kind = 1;
+  PageRequest page = 2;
+}
+
+message ListToolProvidersResponse {
+  repeated ToolProviderDescriptor providers = 1;
+  PageInfo page = 2;
+}
+
+message GetToolProviderRequest {
+  string tool_provider_id = 1;
+}
+
+message GetToolProviderResponse {
+  ToolProviderDescriptor provider = 1;
+}
+
+message GetRuntimeToolCatalogRequest {
+  string session_id = 1;
+}
+
+message GetRuntimeToolCatalogResponse {
+  RuntimeToolCatalog catalog = 1;
+}
+
+message GetToolCallRequest {
+  string tool_call_id = 1;
+}
+
+message GetToolCallResponse {
+  ToolCall tool_call = 1;
+}
+
+message ListToolCallsRequest {
+  string session_id = 1;
+  string run_id = 2;
+  optional ToolCallState state = 3;
+  PageRequest page = 4;
+}
+
+message ListToolCallsResponse {
+  repeated ToolCall tool_calls = 1;
+  PageInfo page = 2;
+}
+
+message ListToolLeasesRequest {
+  string session_id = 1;
+  string run_id = 2;
+  optional ToolLeaseState state = 3;
+  PageRequest page = 4;
+}
+
+message ListToolLeasesResponse {
+  repeated ToolLease tool_leases = 1;
+  PageInfo page = 2;
+}
+
+message ListMcpServersRequest {
+  optional McpServerState state = 1;
+  PageRequest page = 2;
+}
+
+message ListMcpServersResponse {
+  repeated McpServerDescriptor servers = 1;
+  PageInfo page = 2;
+}
+
+message ListBrowserProvidersRequest {
+  PageRequest page = 1;
+}
+
+message ListBrowserProvidersResponse {
+  repeated BrowserProvider providers = 1;
+  PageInfo page = 2;
+}
+
+message GetBrowserProviderRequest {
+  string browser_provider_id = 1;
+}
+
+message GetBrowserProviderResponse {
+  BrowserProvider provider = 1;
+}
+
+message ListBrowserPagesRequest {
+  string browser_provider_id = 1;
+  optional BrowserPageState state = 2;
+  PageRequest page = 3;
+}
+
+message ListBrowserPagesResponse {
+  repeated BrowserPage pages = 1;
+  PageInfo page = 2;
+}
+
+message GetBrowserPageRequest {
+  string page_id = 1;
+}
+
+message GetBrowserPageResponse {
+  BrowserPage page = 1;
+}
+
+message ListBrowserActivityRequest {
+  string browser_provider_id = 1;
+  string page_id = 2;
+  PageRequest page = 3;
+}
+
+message ListBrowserActivityResponse {
+  repeated BrowserActivity activities = 1;
+  PageInfo page = 2;
+}
+
+message ListBrowserTransfersRequest {
+  string browser_provider_id = 1;
+  string page_id = 2;
+  optional TransferDirection direction = 3;
+  optional BrowserTransferState state = 4;
+  PageRequest page = 5;
+}
+
+message ListBrowserTransfersResponse {
+  repeated BrowserTransfer transfers = 1;
+  PageInfo page = 2;
+}
+
+message ListBrowserAutomationNodesRequest {}
+
+message ListBrowserAutomationNodesResponse {
+  repeated BrowserAutomationNode nodes = 1;
+}
+
+message ExecuteBrowserAutomationActionRequest {
+  string node_id = 1;
+  uint64 expected_generation = 2;
+  string action = 3;
+  string arguments_json = 4;
+  repeated BrowserAutomationBinary input_artifacts = 5;
+}
+
+message ExecuteBrowserAutomationActionResponse {
+  BrowserAutomationNode node = 1;
+  bool ok = 2;
+  string data_json = 3;
+  string error_code = 4;
+  string message = 5;
+  BrowserAutomationBinary binary = 6;
+}
+
+enum BrowserCommentInspectionIntent {
+  BROWSER_COMMENT_INSPECTION_INTENT_UNSPECIFIED = 0;
+  BROWSER_COMMENT_INSPECTION_INTENT_ELEMENT = 1;
+  BROWSER_COMMENT_INSPECTION_INTENT_REGION = 2;
+  BROWSER_COMMENT_INSPECTION_INTENT_EXISTING_TEXT = 3;
+}
+
+message InspectBrowserCommentTargetRequest {
+  string browser_provider_id = 1;
+  string page_id = 2;
+  string takeover_id = 3;
+  uint64 generation = 4;
+  BrowserCommentInspectionIntent intent = 5;
+  BrowserCommentPoint point = 6;
+  BrowserCommentRegion region = 7;
+  uint32 marker_number = 8;
+}
+
+message InspectBrowserCommentTargetResponse {
+  BrowserCommentTarget target = 1;
+  // Opaque, generation-scoped capability for a selected live page target.
+  // It is never persisted into the composer draft.
+  string target_token = 2;
+}
+
+enum BrowserCommentDesignAction {
+  BROWSER_COMMENT_DESIGN_ACTION_UNSPECIFIED = 0;
+  BROWSER_COMMENT_DESIGN_ACTION_APPLY = 1;
+  BROWSER_COMMENT_DESIGN_ACTION_RESET = 2;
+  BROWSER_COMMENT_DESIGN_ACTION_COMMIT = 3;
+  BROWSER_COMMENT_DESIGN_ACTION_RECONCILE = 4;
+  BROWSER_COMMENT_DESIGN_ACTION_RESET_ALL = 5;
+}
+
+message UpdateBrowserCommentDesignRequest {
+  string browser_provider_id = 1;
+  string page_id = 2;
+  string takeover_id = 3;
+  uint64 generation = 4;
+  BrowserCommentDesignAction action = 5;
+  string target_token = 6;
+  repeated BrowserCommentStringEntry styles = 7;
+  optional string text = 8;
+  uint32 marker_number = 9;
+  repeated uint32 valid_marker_numbers = 10;
+}
+
+message UpdateBrowserCommentDesignResponse {
+  // Reconciliation returns the authoritative, ephemeral projection for the
+  // current live document. These placements are never durable state.
+  repeated BrowserCommentPlacement placements = 1;
+}
+
+message GetPiSessionStateRequest {
+  string session_id = 1;
+}
+
+message GetPiSessionStateResponse {
+  PiSessionState state = 1;
+  PiStateObservation observation = 2;
+}
+
+message GetPiSessionTreeRequest {
+  string session_id = 1;
+}
+
+message GetPiSessionTreeResponse {
+  PiSessionTreeUpdate tree = 1;
+}
+
+message ListPiMessagesRequest {
+  string session_id = 1;
+  PageRequest page = 2;
+}
+
+message ListPiMessagesResponse {
+  repeated PiNativeMessage messages = 1;
+  PageInfo page = 2;
+}
+
+message ListPiEntriesRequest {
+  string session_id = 1;
+  string since_entry_id = 2;
+  PageRequest page = 3;
+}
+
+message ListPiEntriesResponse {
+  repeated PiSessionEntry entries = 1;
+  string active_leaf_id = 2;
+  PageInfo page = 3;
+}
+
+message ListPiForkCandidatesRequest {
+  string session_id = 1;
+}
+
+message ListPiForkCandidatesResponse {
+  repeated PiForkCandidate candidates = 1;
+}
+
+message ListPiCommandsRequest {
+  string session_id = 1;
+}
+
+message ListPiCommandsResponse {
+  repeated PiSlashCommand commands = 1;
+}
+
+message ListPiResourcesRequest {
+  string backend_id = 1;
+  string target_id = 2;
+  optional ResourceKind kind = 3;
+  optional ResourceState state = 4;
+  PageRequest page = 5;
+}
+
+message ListPiResourcesResponse {
+  repeated ManagedResource resources = 1;
+  PageInfo page = 2;
+}
+
+message ListRuntimeCommandsRequest {
+  string session_id = 1;
+}
+
+message ListRuntimeCommandsResponse {
+  repeated RuntimeCommand commands = 1;
+}

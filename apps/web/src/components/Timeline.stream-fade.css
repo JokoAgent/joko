@@ -1,0 +1,23 @@
+.stream-word {
+  animation: stream-word-in 150ms ease-out var(--wf-delay, 0ms) both;
+}
+
+[data-stream-marker]::marker {
+  animation: stream-marker-in 150ms ease-out var(--wf-delay, 0ms) both;
+}
+
+@keyframes stream-word-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes stream-marker-in {
+  from { color: transparent; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .stream-word,
+  [data-stream-marker]::marker {
+    animation: none !important;
+  }
+}

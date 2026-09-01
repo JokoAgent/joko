@@ -1,0 +1,129 @@
+{
+  "$schema": "https://raw.githubusercontent.com/electron-userland/electron-builder/v26.15.3/packages/app-builder-lib/scheme.json",
+  "appId": "app.joko.desktop",
+  "productName": "Joko",
+  "electronVersion": "39.2.7",
+  "asar": false,
+  "compression": "normal",
+  "npmRebuild": false,
+  "publish": null,
+  "artifactName": "Joko-${version}-${os}-${arch}.${ext}",
+  "protocols": [
+    {
+      "name": "Joko task link",
+      "schemes": [
+        "joko"
+      ]
+    }
+  ],
+  "fileAssociations": [
+    {
+      "ext": "jshare",
+      "name": "Joko task package",
+      "description": "Portable Joko task package",
+      "mimeType": "application/vnd.joko.session",
+      "role": "Editor"
+    }
+  ],
+  "directories": {
+    "output": "release",
+    "buildResources": "../web/src"
+  },
+  "files": [
+    "dist/**/*.js",
+    "dist/**/*.cjs",
+    "dist/web/**/*",
+    "!dist/orchestrator-runtime/**",
+    "!dist/.orchestrator-runtime-backup-*/**",
+    "!**/*.{map,ts,tsx,cts,mts,proto,tsbuildinfo,c,cc,cpp,cxx,h,hh,hpp,hxx,rs,swift,m,mm,java,go,py,pyi,rb,cs,fs,fsx,scala,kt,kts,jsdoc,keep}",
+    "!**/{test,tests,__tests__,coverage,fixtures,workspace}/**",
+    "!**/WORKSPACE",
+    "!**/WORKSPACE/**",
+    "!**/{.env,.env.*,*.db,*.db-shm,*.db-wal,*.log}",
+    "!node_modules/**/{README,README.*,CHANGELOG,CHANGELOG.*,docs}/**"
+  ],
+  "extraResources": [
+    {
+      "from": "resources/app-update.yml",
+      "to": "app-update.yml"
+    },
+    {
+      "from": "resources/native-task-status-sounds",
+      "to": "native-task-status-sounds",
+      "filter": [
+        "*.mp3"
+      ]
+    },
+    {
+      "from": "dist/native-voice-shortcut",
+      "to": "native-voice-shortcut",
+      "filter": [
+        "manifest.json",
+        "joko-macos-key-listener",
+        "joko-windows-function-key-listener.exe"
+      ]
+    },
+    {
+      "from": "dist/orchestrator-runtime",
+      "to": "orchestrator-runtime",
+      "filter": [
+        "**/*",
+        "!node_modules/**",
+        "!**/*.{map,ts,tsx,cts,mts,proto,tsbuildinfo,c,cc,cpp,cxx,h,hh,hpp,hxx,rs,swift,m,mm,java,go,py,pyi,rb,cs,fs,fsx,scala,kt,kts,jsdoc,keep}",
+        "!**/{test,tests,__tests__,coverage,fixtures,workspace}/**",
+        "!**/WORKSPACE",
+        "!**/WORKSPACE/**",
+        "!**/{.env,.env.*,*.db,*.db-shm,*.db-wal,*.log}"
+      ]
+    },
+    {
+      "from": "dist/orchestrator-runtime/node_modules",
+      "to": "orchestrator-runtime/node_modules",
+      "filter": [
+        "**/*",
+        "!**/*.{map,ts,tsx,cts,mts,proto,tsbuildinfo,c,cc,cpp,cxx,h,hh,hpp,hxx,rs,swift,m,mm,java,go,py,pyi,rb,cs,fs,fsx,scala,kt,kts,jsdoc,keep}",
+        "!**/{test,tests,__tests__,coverage,fixtures,workspace}/**",
+        "!**/WORKSPACE",
+        "!**/WORKSPACE/**",
+        "!**/{.env,.env.*,*.db,*.db-shm,*.db-wal,*.log}"
+      ]
+    }
+  ],
+  "afterPack": "scripts/audit-packaged.cjs",
+  "win": {
+    "icon": "icon-light.svg",
+    "forceCodeSigning": false,
+    "target": [
+      "nsis",
+      "zip"
+    ]
+  },
+  "nsis": {
+    "oneClick": false,
+    "perMachine": false,
+    "allowElevation": false,
+    "allowToChangeInstallationDirectory": true,
+    "deleteAppDataOnUninstall": false
+  },
+  "mac": {
+    "icon": "icon-light.svg",
+    "identity": null,
+    "hardenedRuntime": false,
+    "extendInfo": {
+      "NSMicrophoneUsageDescription": "Joko uses the microphone only while you choose to dictate into the composer."
+    },
+    "target": [
+      "dmg",
+      "zip"
+    ]
+  },
+  "linux": {
+    "icon": "icon-light.svg",
+    "category": "Development",
+    "executableName": "joko",
+    "target": [
+      "AppImage",
+      "tar.gz"
+    ]
+  }
+}

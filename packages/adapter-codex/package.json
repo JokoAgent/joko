@@ -1,0 +1,25 @@
+{
+  "name": "@joko/adapter-codex",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./testing": "./src/testing.ts"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:real:probe": "vitest run src/real-probe.real.test.ts"
+  },
+  "dependencies": {
+    "@joko/core": "workspace:*",
+    "@joko/runtime-governance": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "24.12.4",
+    "typescript": "5.9.3",
+    "vitest": "4.1.9"
+  }
+}

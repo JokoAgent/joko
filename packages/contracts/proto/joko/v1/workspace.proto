@@ -1,0 +1,381 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+import "joko/v1/common.proto";
+
+enum WorkspaceKind {
+  WORKSPACE_KIND_UNSPECIFIED = 0;
+  WORKSPACE_KIND_USER_PROJECT = 1;
+  WORKSPACE_KIND_MANAGED_DIALOGUE = 2;
+}
+
+message WorkspaceDescriptor {
+  string workspace_id = 1;
+  string target_id = 2;
+  string display_name = 3;
+  WorkspaceKind kind = 4;
+  string server_path_display = 5;
+  bool trusted = 6;
+  GitRepositoryState git = 7;
+  EntityVersion version = 8;
+  // Mirrors the owning Target location so file clients can gate local-only
+  // affordances without interpreting Backend identity.
+  RemoteWorkspaceBinding remote_workspace = 9;
+}
+
+enum FileKind {
+  FILE_KIND_UNSPECIFIED = 0;
+  FILE_KIND_REGULAR = 1;
+  FILE_KIND_DIRECTORY = 2;
+  FILE_KIND_SYMBOLIC_LINK = 3;
+  FILE_KIND_SPECIAL = 4;
+}
+
+message FileRevision {
+  string sha256_hex = 1;
+  uint64 byte_size = 2;
+  google.protobuf.Timestamp modified_at = 3;
+  string opaque_revision = 4;
+}
+
+message WorkspaceEntry {
+  string workspace_id = 1;
+  string relative_path = 2;
+  string display_name = 3;
+  FileKind kind = 4;
+  FileRevision revision = 5;
+  bool generated = 6;
+  bool ignored = 7;
+  bool hidden = 8;
+  string media_type = 9;
+}
+
+message FilePreview {
+  WorkspaceEntry entry = 1;
+  oneof content {
+    TextFilePreview text = 2;
+    ImageRef image = 3;
+    BlobRef blob = 4;
+    BinaryFilePreview binary = 5;
+  }
+  bool truncated = 6;
+}
+
+message TextFilePreview {
+  string utf8_text = 1;
+  string language_id = 2;
+  uint64 start_byte = 3;
+  uint64 end_byte = 4;
+  uint32 total_lines = 5;
+}
+
+message BinaryFilePreview {
+  string media_type = 1;
+  string summary = 2;
+}
+
+message WorkspaceSearchMatch {
+  string relative_path = 1;
+  TextRange range = 2;
+  string line_preview = 3;
+  FileRevision revision = 4;
+  repeated WorkspaceSearchSubmatch submatches = 5;
+}
+
+// Ordered, owner-authorized workspace filesystem notifications. These events
+// never contain a server absolute path. Consumers must fetch a fresh listing
+// after RESYNC or OVERFLOW instead of treating the stream as a filesystem log.
+enum WorkspaceFileChangeKind {
+  WORKSPACE_FILE_CHANGE_KIND_UNSPECIFIED = 0;
+  WORKSPACE_FILE_CHANGE_KIND_CREATED = 1;
+  WORKSPACE_FILE_CHANGE_KIND_MODIFIED = 2;
+  WORKSPACE_FILE_CHANGE_KIND_DELETED = 3;
+  WORKSPACE_FILE_CHANGE_KIND_RENAMED = 4;
+  WORKSPACE_FILE_CHANGE_KIND_OVERFLOW = 5;
+  WORKSPACE_FILE_CHANGE_KIND_RESYNC = 6;
+}
+
+message WorkspaceFileChange {
+  string workspace_id = 1;
+  WorkspaceFileChangeKind kind = 2;
+  // Canonical workspace-relative POSIX path. Empty only for OVERFLOW/RESYNC.
+  string relative_path = 3;
+  // RENAMED-only canonical source path.
+  string previous_relative_path = 4;
+  // Current metadata/content fence when the destination still exists.
+  FileRevision revision = 5;
+  // Monotonic owner-wide cursor assigned after durable persistence.
+  uint64 sequence = 6;
+  // Hash-chained opaque cursor that fences service restarts and stale streams.
+  string stream_revision = 7;
+  google.protobuf.Timestamp observed_at = 8;
+}
+
+enum GitFileStatus {
+  GIT_FILE_STATUS_UNSPECIFIED = 0;
+  GIT_FILE_STATUS_UNMODIFIED = 1;
+  GIT_FILE_STATUS_ADDED = 2;
+  GIT_FILE_STATUS_MODIFIED = 3;
+  GIT_FILE_STATUS_DELETED = 4;
+  GIT_FILE_STATUS_RENAMED = 5;
+  GIT_FILE_STATUS_COPIED = 6;
+  GIT_FILE_STATUS_UNTRACKED = 7;
+  GIT_FILE_STATUS_IGNORED = 8;
+  GIT_FILE_STATUS_CONFLICTED = 9;
+}
+
+message GitRepositoryState {
+  bool repository = 1;
+  string branch_name = 2;
+  string head_commit = 3;
+  bool detached_head = 4;
+  bool dirty = 5;
+  bool operation_in_progress = 6;
+  repeated GitFileChange changes = 7;
+  ErrorInfo error = 8;
+}
+
+message GitFileChange {
+  string relative_path = 1;
+  string old_relative_path = 2;
+  GitFileStatus index_status = 3;
+  GitFileStatus working_tree_status = 4;
+  bool binary = 5;
+}
+
+enum DiffLineKind {
+  DIFF_LINE_KIND_UNSPECIFIED = 0;
+  DIFF_LINE_KIND_CONTEXT = 1;
+  DIFF_LINE_KIND_ADDED = 2;
+  DIFF_LINE_KIND_REMOVED = 3;
+  DIFF_LINE_KIND_NO_NEWLINE = 4;
+}
+
+enum GitDiffSource {
+  GIT_DIFF_SOURCE_UNSPECIFIED = 0;
+  // Worktree compared with the index.
+  GIT_DIFF_SOURCE_UNSTAGED = 1;
+  // Index compared with HEAD.
+  GIT_DIFF_SOURCE_STAGED = 2;
+  // One immutable commit compared with its first parent (or the empty tree).
+  GIT_DIFF_SOURCE_COMMIT = 3;
+  // Current HEAD compared with the merge-base of an explicitly selected base.
+  GIT_DIFF_SOURCE_BRANCH = 4;
+  // UI-derived path filter over STAGED plus UNSTAGED using the last turn's
+  // persisted workspace change sets. This is not a separate Git layer.
+  GIT_DIFF_SOURCE_LAST_TURN = 5;
+  // Persisted turn change-set evidence. This is read through
+  // ListWorkspaceChangeSets and is not a mutable Git layer.
+  GIT_DIFF_SOURCE_TURN_SET = 6;
+}
+
+enum WorkspaceDiffAction {
+  WORKSPACE_DIFF_ACTION_UNSPECIFIED = 0;
+  WORKSPACE_DIFF_ACTION_STAGE = 1;
+  WORKSPACE_DIFF_ACTION_UNSTAGE = 2;
+  WORKSPACE_DIFF_ACTION_REVERT = 3;
+}
+
+enum WorkspaceDiffTarget {
+  WORKSPACE_DIFF_TARGET_UNSPECIFIED = 0;
+  // A whole file diff, including binary/mode-only changes.
+  WORKSPACE_DIFF_TARGET_FILE = 1;
+  // One zero-based textual hunk for a Review section action.
+  WORKSPACE_DIFF_TARGET_HUNK = 2;
+}
+
+message DiffLine {
+  DiffLineKind kind = 1;
+  uint32 old_line = 2;
+  uint32 new_line = 3;
+  string text = 4;
+}
+
+message DiffHunk {
+  uint32 old_start = 1;
+  uint32 old_count = 2;
+  uint32 new_start = 3;
+  uint32 new_count = 4;
+  string heading = 5;
+  repeated DiffLine lines = 6;
+}
+
+message FileDiff {
+  string relative_path = 1;
+  string old_relative_path = 2;
+  GitFileStatus status = 3;
+  bool binary = 4;
+  repeated DiffHunk hunks = 5;
+  BlobRef full_diff = 6;
+  GitDiffSource source = 7;
+}
+
+message WorkspaceDiff {
+  string workspace_id = 1;
+  repeated FileDiff files = 2;
+  bool truncated = 3;
+  BlobRef complete_diff = 4;
+  // A content-derived fence covering HEAD, index, worktree status and both
+  // staged/unstaged patches. Git Review mutations must present this value.
+  optional string repository_revision = 5;
+  // Resolved immutable commit OIDs for a base/head comparison.
+  optional string base_revision = 6;
+  optional string head_revision = 7;
+  optional string merge_base_revision = 8;
+  // Exact Review source identity. LAST_TURN and TURN_SET are UI-derived and
+  // therefore never returned by the Git diff RPC itself.
+  optional GitDiffSource source = 9;
+  // Resolved immutable commit/base OID for COMMIT or BRANCH.
+  optional string source_revision = 10;
+  // BRANCH-only source identity. The immutable source_revision remains the
+  // execution fence while these fields explain default/fallback resolution.
+  optional string requested_base_ref = 11;
+  optional string resolved_base_ref = 12;
+  WorkspaceBranchBaseWarning branch_base_warning = 13;
+}
+
+enum WorkspaceBranchBaseWarningCode {
+  WORKSPACE_BRANCH_BASE_WARNING_CODE_UNSPECIFIED = 0;
+  // The requested base no longer resolved, so the safe default candidate was
+  // selected. The resolved ref/OID are returned for an explicit UI warning.
+  WORKSPACE_BRANCH_BASE_WARNING_CODE_REQUESTED_BASE_MISSING = 1;
+}
+
+message WorkspaceBranchBaseWarning {
+  WorkspaceBranchBaseWarningCode code = 1;
+  string requested_base_ref = 2;
+  string resolved_base_ref = 3;
+}
+
+message WorkspaceChangeSet {
+  string change_set_id = 1;
+  string workspace_id = 2;
+  string session_id = 3;
+  string run_id = 4;
+  string turn_id = 5;
+  string baseline_id = 6;
+  repeated FileChange changes = 7;
+  bool complete_baseline = 8;
+  repeated RewindGap gaps = 9;
+  google.protobuf.Timestamp captured_at = 10;
+}
+
+enum FileChangeKind {
+  FILE_CHANGE_KIND_UNSPECIFIED = 0;
+  FILE_CHANGE_KIND_CREATED = 1;
+  FILE_CHANGE_KIND_UPDATED = 2;
+  FILE_CHANGE_KIND_DELETED = 3;
+  FILE_CHANGE_KIND_RENAMED = 4;
+}
+
+message FileChange {
+  string relative_path = 1;
+  string old_relative_path = 2;
+  FileChangeKind kind = 3;
+  FileRevision before_revision = 4;
+  FileRevision after_revision = 5;
+  FileDiff diff = 6;
+}
+
+enum RewindGapKind {
+  REWIND_GAP_KIND_UNSPECIFIED = 0;
+  REWIND_GAP_KIND_MISSING_BASELINE = 1;
+  REWIND_GAP_KIND_CAPTURE_FAILED = 2;
+  REWIND_GAP_KIND_UNSUPPORTED_FILE = 3;
+  REWIND_GAP_KIND_EXTERNAL_WRITER = 4;
+  REWIND_GAP_KIND_CONCURRENT_CHANGE = 5;
+}
+
+message RewindGap {
+  RewindGapKind kind = 1;
+  string relative_path = 2;
+  string explanation = 3;
+}
+
+enum RewindSafety {
+  REWIND_SAFETY_UNSPECIFIED = 0;
+  REWIND_SAFETY_SAFE = 1;
+  REWIND_SAFETY_REQUIRES_CONFIRMATION = 2;
+  REWIND_SAFETY_BLOCKED = 3;
+}
+
+message WorkspaceRewindPreview {
+  string preview_id = 1;
+  string change_set_id = 2;
+  string workspace_id = 3;
+  RewindSafety safety = 4;
+  repeated FileChange inverse_changes = 5;
+  repeated RewindGap gaps = 6;
+  repeated WorkspaceConflict conflicts = 7;
+  WorkspaceDiff diff = 8;
+  google.protobuf.Timestamp expires_at = 9;
+  bool dialogue_only_available = 10;
+}
+
+message WorkspaceConflict {
+  string relative_path = 1;
+  FileRevision expected_revision = 2;
+  FileRevision actual_revision = 3;
+  string explanation = 4;
+}
+
+message ExtraDirectory {
+  string extra_directory_id = 1;
+  string workspace_id = 2;
+  string server_path_display = 3;
+  ExtraDirectoryAccess access = 4;
+  bool trusted = 5;
+  EntityVersion version = 6;
+}
+
+enum ExtraDirectoryAccess {
+  EXTRA_DIRECTORY_ACCESS_UNSPECIFIED = 0;
+  EXTRA_DIRECTORY_ACCESS_READ_ONLY = 1;
+  EXTRA_DIRECTORY_ACCESS_READ_WRITE = 2;
+}
+
+message Artifact {
+  string artifact_id = 1;
+  string session_id = 2;
+  string run_id = 3;
+  ArtifactKind kind = 4;
+  string title = 5;
+  string description = 6;
+  BlobRef blob = 7;
+  google.protobuf.Timestamp created_at = 8;
+  google.protobuf.Timestamp expires_at = 9;
+}
+
+enum TransferDirection {
+  TRANSFER_DIRECTION_UNSPECIFIED = 0;
+  TRANSFER_DIRECTION_UPLOAD = 1;
+  TRANSFER_DIRECTION_DOWNLOAD = 2;
+}
+
+// An opaque, short-lived ticket consumed by the authenticated Blob API.
+message BlobTransferTicket {
+  string ticket_id = 1;
+  string blob_id = 2;
+  TransferDirection direction = 3;
+  string relative_endpoint = 4;
+  google.protobuf.Timestamp expires_at = 5;
+  uint64 maximum_bytes = 6;
+  string required_media_type = 7;
+}
+
+message PendingBlobUpload {
+  string upload_id = 1;
+  BlobTransferTicket ticket = 2;
+  string expected_sha256_hex = 3;
+  uint64 expected_byte_size = 4;
+}
+
+// One authoritative ripgrep submatch within line_preview. Offsets are UTF-8
+// byte offsets relative to the untrimmed preview line, exactly as emitted by
+// ripgrep; clients must not infer additional matches by re-running the query.
+message WorkspaceSearchSubmatch {
+  uint64 start_byte = 1;
+  uint64 end_byte = 2;
+}

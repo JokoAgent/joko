@@ -1,0 +1,101 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+import "joko/v1/common.proto";
+import "joko/v1/event.proto";
+import "joko/v1/interaction.proto";
+import "joko/v1/model.proto";
+import "joko/v1/operation.proto";
+import "joko/v1/pi.proto";
+import "joko/v1/runtime.proto";
+import "joko/v1/review.proto";
+import "joko/v1/settings.proto";
+import "joko/v1/tool.proto";
+import "joko/v1/workspace.proto";
+
+message SnapshotScope {
+  oneof kind {
+    OwnerSnapshotScope owner = 1;
+    BackendSnapshotScope backend = 2;
+    TargetSnapshotScope target = 3;
+    SessionSnapshotScope session = 4;
+    WorkspaceSnapshotScope workspace = 5;
+    ScheduleSnapshotScope schedule = 6;
+    ToolSnapshotScope tool = 7;
+  }
+}
+
+message OwnerSnapshotScope {}
+
+message BackendSnapshotScope {
+  string backend_id = 1;
+}
+
+message TargetSnapshotScope {
+  string target_id = 1;
+}
+
+message SessionSnapshotScope {
+  string session_id = 1;
+  uint32 recent_timeline_items = 2;
+}
+
+message WorkspaceSnapshotScope {
+  string workspace_id = 1;
+}
+
+message ScheduleSnapshotScope {
+  string schedule_id = 1;
+}
+
+message ToolSnapshotScope {
+  string tool_provider_id = 1;
+}
+
+// A self-consistent projection at revision/cursor. Fields not relevant to the
+// requested scope are empty; client caches never override this authority.
+message Snapshot {
+  string snapshot_id = 1;
+  SnapshotScope scope = 2;
+  Revision revision = 3;
+  EventCursor resume_cursor = 4;
+  uint64 generation = 5;
+  google.protobuf.Timestamp created_at = 6;
+  ServerInfo server = 10;
+  repeated Connection connections = 11;
+  repeated Device devices = 12;
+  repeated BackendDescriptor backends = 13;
+  repeated Target targets = 14;
+  repeated Session sessions = 15;
+  repeated Run runs = 16;
+  repeated QueueItem queue_items = 17;
+  repeated Schedule schedules = 18;
+  repeated Operation operations = 19;
+  repeated Interaction interactions = 20;
+  repeated WorkspaceDescriptor workspaces = 21;
+  repeated Artifact artifacts = 22;
+  repeated ProviderDescriptor providers = 23;
+  repeated ModelDescriptor models = 24;
+  repeated ToolProviderDescriptor tool_providers = 25;
+  repeated ToolLease tool_leases = 26;
+  repeated McpServerDescriptor mcp_servers = 27;
+  repeated BrowserProvider browsers = 28;
+  repeated BackgroundTask background_tasks = 29;
+  repeated RuntimeCommand runtime_commands = 30;
+  repeated ManagedResource resources = 31;
+  SettingsSnapshot settings = 32;
+  NativeSessionTree native_session_tree = 33;
+  repeated Event timeline = 34;
+  repeated BrowserTransfer browser_transfers = 35;
+  repeated ExtraDirectory extra_directories = 36;
+  repeated ExtensionWidget extension_widgets = 37;
+  repeated ExtensionStatus extension_statuses = 38;
+  repeated QueueControl queue_controls = 39;
+  repeated ReviewRun review_runs = 40;
+  repeated DeviceControlRelation device_control_relations = 41;
+  // Optional Pi-native authority for Pi-capable scopes. Public fields above
+  // remain the backend-neutral source consumed by shared reducers.
+  PiSnapshot pi = 100;
+}

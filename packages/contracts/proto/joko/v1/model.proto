@@ -1,0 +1,295 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+import "joko/v1/capability.proto";
+import "joko/v1/common.proto";
+
+enum ProviderKind {
+  PROVIDER_KIND_UNSPECIFIED = 0;
+  PROVIDER_KIND_MANAGED = 1;
+  PROVIDER_KIND_API_KEY = 2;
+  PROVIDER_KIND_OAUTH = 3;
+  PROVIDER_KIND_SUBSCRIPTION = 4;
+  PROVIDER_KIND_LOCAL_KEYLESS = 5;
+  PROVIDER_KIND_CUSTOM_ENDPOINT = 6;
+}
+
+enum ProviderApiCompatibility {
+  PROVIDER_API_COMPATIBILITY_UNSPECIFIED = 0;
+  PROVIDER_API_COMPATIBILITY_ANTHROPIC_MESSAGES = 1;
+  PROVIDER_API_COMPATIBILITY_OPENAI_RESPONSES = 2;
+  PROVIDER_API_COMPATIBILITY_OPENAI_CHAT_COMPLETIONS = 3;
+  PROVIDER_API_COMPATIBILITY_OPENAI_COMPLETIONS = 4;
+  PROVIDER_API_COMPATIBILITY_NATIVE = 5;
+  PROVIDER_API_COMPATIBILITY_GOOGLE_GENERATIVE_AI = 6;
+}
+
+enum AuthenticationState {
+  AUTHENTICATION_STATE_UNSPECIFIED = 0;
+  AUTHENTICATION_STATE_NOT_REQUIRED = 1;
+  AUTHENTICATION_STATE_SIGNED_OUT = 2;
+  AUTHENTICATION_STATE_PENDING = 3;
+  AUTHENTICATION_STATE_AUTHENTICATED = 4;
+  AUTHENTICATION_STATE_EXPIRED = 5;
+  AUTHENTICATION_STATE_REFRESHING = 6;
+  AUTHENTICATION_STATE_ERROR = 7;
+}
+
+enum ProviderLoginMethod {
+  PROVIDER_LOGIN_METHOD_UNSPECIFIED = 0;
+  PROVIDER_LOGIN_METHOD_OAUTH_BROWSER = 1;
+  PROVIDER_LOGIN_METHOD_DEVICE_CODE = 2;
+  PROVIDER_LOGIN_METHOD_SUBSCRIPTION = 3;
+  PROVIDER_LOGIN_METHOD_API_KEY = 4;
+}
+
+enum ModelPriceSource {
+  MODEL_PRICE_SOURCE_UNSPECIFIED = 0;
+  MODEL_PRICE_SOURCE_PROVIDER_REFERENCE = 1;
+  MODEL_PRICE_SOURCE_UPSTREAM = 2;
+}
+
+enum ProviderCredentialSurfaceKind {
+  PROVIDER_CREDENTIAL_SURFACE_KIND_UNSPECIFIED = 0;
+  PROVIDER_CREDENTIAL_SURFACE_KIND_API_KEY = 1;
+}
+
+enum ProviderCredentialSurfaceCapability {
+  PROVIDER_CREDENTIAL_SURFACE_CAPABILITY_UNSPECIFIED = 0;
+  PROVIDER_CREDENTIAL_SURFACE_CAPABILITY_IMAGE_GENERATION = 1;
+}
+
+message ProviderCapabilityModelDescriptor {
+  string model_id = 1;
+  string display_name = 2;
+}
+
+message ProviderCredentialSurface {
+  string surface_id = 1;
+  ProviderCredentialSurfaceCapability capability = 2;
+  ProviderCredentialSurfaceKind kind = 3;
+  bool configured = 4;
+  repeated ProviderCapabilityModelDescriptor models = 5;
+}
+
+message ProviderDescriptor {
+  string backend_id = 1;
+  string provider_id = 2;
+  string display_name = 3;
+  ProviderKind kind = 4;
+  ProviderApiCompatibility api_compatibility = 5;
+  AuthenticationState authentication_state = 6;
+  string endpoint_display = 7;
+  bool owner_managed = 8;
+  bool supports_login = 9;
+  bool supports_logout = 10;
+  bool supports_refresh = 11;
+  repeated ProviderLoginMethod login_methods = 12;
+  google.protobuf.Timestamp credential_expires_at = 13;
+  RateLimitState rate_limit = 14;
+  EntityVersion version = 15;
+  ErrorInfo error = 16;
+  ProviderUsageSummary usage = 17;
+  bool supports_model_refresh = 18;
+  CapabilityManifest capabilities = 19;
+  ProviderAccountUsageSnapshot account_usage = 20;
+  optional string access_product = 21;
+  repeated ProviderCredentialSurface credential_surfaces = 22;
+}
+
+message RateLimitState {
+  bool limited = 1;
+  google.protobuf.Timestamp resets_at = 2;
+  uint64 request_limit = 3;
+  uint64 requests_remaining = 4;
+  uint64 token_limit = 5;
+  uint64 tokens_remaining = 6;
+}
+
+message ModelKey {
+  string provider_id = 1;
+  string model_id = 2;
+}
+
+message ModelDescriptor {
+  string backend_id = 1;
+  ModelKey key = 2;
+  string display_name = 3;
+  string family = 4;
+  uint64 context_window_tokens = 5;
+  uint64 maximum_output_tokens = 6;
+  repeated ModelInputModality input_modalities = 7;
+  repeated ModelOutputModality output_modalities = 8;
+  repeated EffortLevel effort_levels = 9;
+  bool supports_fast_mode = 10;
+  bool available = 11;
+  int64 input_cost_micros_per_million = 12;
+  int64 output_cost_micros_per_million = 13;
+  string currency_code = 14;
+  ErrorInfo error = 15;
+  int64 cache_read_cost_micros_per_million = 16;
+  int64 cache_write_cost_micros_per_million = 17;
+  optional bool default_visible = 18;
+  ModelPriceSource price_source = 19;
+  google.protobuf.Timestamp price_updated_at = 20;
+  // Stable cross-runtime identity. The route-specific ModelKey remains authoritative for mutations.
+  string logical_id = 21;
+}
+
+enum ModelInputModality {
+  MODEL_INPUT_MODALITY_UNSPECIFIED = 0;
+  MODEL_INPUT_MODALITY_TEXT = 1;
+  MODEL_INPUT_MODALITY_IMAGE = 2;
+  MODEL_INPUT_MODALITY_FILE = 3;
+  MODEL_INPUT_MODALITY_AUDIO = 4;
+}
+
+enum ModelOutputModality {
+  MODEL_OUTPUT_MODALITY_UNSPECIFIED = 0;
+  MODEL_OUTPUT_MODALITY_TEXT = 1;
+  MODEL_OUTPUT_MODALITY_IMAGE = 2;
+  MODEL_OUTPUT_MODALITY_AUDIO = 3;
+}
+
+message EffortLevel {
+  string effort_id = 1;
+  string display_name = 2;
+  uint32 order = 3;
+  bool default_level = 4;
+}
+
+message ModelSelection {
+  ModelKey model = 1;
+  string effort_id = 2;
+  bool fast_mode = 3;
+}
+
+message ModelUsageSummary {
+  ModelKey model = 1;
+  Usage usage = 2;
+  google.protobuf.Timestamp period_started_at = 3;
+  google.protobuf.Timestamp period_ended_at = 4;
+}
+
+// Provider-scoped usage is deliberately separate from Session ContextUsage:
+// the former is the provider/account view and may span many product Sessions.
+message ProviderUsageSummary {
+  string provider_id = 1;
+  Usage usage = 2;
+  repeated ModelUsageSummary models = 3;
+  google.protobuf.Timestamp period_started_at = 4;
+  google.protobuf.Timestamp period_ended_at = 5;
+  google.protobuf.Timestamp measured_at = 6;
+  bool estimated = 7;
+  repeated UsageCurrencyTotal currency_totals = 8;
+}
+
+// Provider-authoritative account quota. This is not token/cost usage and must
+// never be synthesized from Session usage or reactive Provider errors.
+message ProviderAccountUsageWindow {
+  double used_percent = 1;
+  optional uint32 window_minutes = 2;
+  google.protobuf.Timestamp reset_at = 3;
+}
+
+message ProviderAccountCreditsSnapshot {
+  optional bool has_credits = 1;
+  optional bool unlimited = 2;
+  optional string balance = 3;
+  google.protobuf.Timestamp observed_at = 4;
+}
+
+message ProviderAccountUsageSnapshot {
+  string provider_id = 1;
+  ProviderAccountUsageWindow primary_window = 2;
+  ProviderAccountUsageWindow secondary_window = 3;
+  optional bool limit_reached = 4;
+  optional string plan_type = 5;
+  ProviderAccountCreditsSnapshot credits = 6;
+  google.protobuf.Timestamp observed_at = 7;
+}
+
+enum ModelPriceCurrency {
+  MODEL_PRICE_CURRENCY_UNSPECIFIED = 0;
+  MODEL_PRICE_CURRENCY_USD = 1;
+  MODEL_PRICE_CURRENCY_CNY = 2;
+}
+
+message ModelPriceQuote {
+  ModelPriceCurrency currency = 1;
+  int64 input_cost_micros_per_million = 2;
+  int64 output_cost_micros_per_million = 3;
+  optional int64 cache_read_cost_micros_per_million = 4;
+  optional int64 cache_write_cost_micros_per_million = 5;
+}
+
+message ModelPriceOverrideView {
+  string backend_id = 1;
+  ModelKey model = 2;
+  ModelPriceQuote reference = 3;
+  ModelPriceQuote effective = 4;
+  ModelPriceQuote override = 5;
+  repeated ModelPriceCurrency allowed_currencies = 6;
+  google.protobuf.Timestamp updated_at = 7;
+  EntityVersion version = 8;
+  bool reference_available = 9;
+  google.protobuf.Timestamp registry_updated_at = 10;
+}
+
+message UsageCurrencyTotal {
+  string currency_code = 1;
+  Usage usage = 2;
+  bool cost_complete = 3;
+  bool estimated = 4;
+}
+
+message UsageHistoryDay {
+  string day = 1;
+  Usage usage = 2;
+  repeated UsageCurrencyTotal currency_totals = 3;
+  bool cost_complete = 4;
+  bool estimated = 5;
+  google.protobuf.Timestamp measured_at = 6;
+}
+
+message ModelUsageHistoryDay {
+  string day = 1;
+  string backend_id = 2;
+  ModelKey model = 3;
+  Usage usage = 4;
+  repeated UsageCurrencyTotal currency_totals = 5;
+  bool cost_complete = 6;
+  bool estimated = 7;
+}
+
+message ModelUsageHistorySummary {
+  string backend_id = 1;
+  ModelKey model = 2;
+  Usage usage = 3;
+  repeated UsageCurrencyTotal currency_totals = 4;
+  bool cost_complete = 5;
+  bool estimated = 6;
+}
+
+message UsageHistorySummary {
+  Usage usage = 1;
+  repeated UsageCurrencyTotal currency_totals = 2;
+  bool cost_complete = 3;
+  bool estimated = 4;
+}
+
+message UsageHistory {
+  repeated UsageHistoryDay days = 1;
+  repeated ModelUsageHistoryDay model_daily = 2;
+  repeated ModelUsageHistorySummary models = 3;
+  UsageHistorySummary today = 4;
+  UsageHistorySummary last_30_days = 5;
+  uint32 current_streak_days = 6;
+  uint32 longest_streak_days = 7;
+  bool today_anomalous = 8;
+  google.protobuf.Timestamp generated_at = 9;
+  google.protobuf.Timestamp measured_at = 10;
+  bool estimated = 11;
+}

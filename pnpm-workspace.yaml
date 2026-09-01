@@ -1,0 +1,25 @@
+packages:
+  - apps/*
+  - packages/*
+
+minimumReleaseAge: 10080
+
+minimumReleaseAgeExclude:
+  - '@earendil-works/*'
+  - '@joko/*'
+
+allowBuilds:
+  '@bufbuild/buf': true
+  '@earendil-works/pi-coding-agent': true
+  '@google/genai': false
+  better-sqlite3: true
+  electron: true
+  # Squirrel is a transitive electron-builder peer, but Joko emits NSIS/ZIP.
+  # Its install hook only selects a vendored 7-Zip binary and is not needed.
+  electron-winstaller: false
+  esbuild: true
+  protobufjs: false
+  sharp: true
+  # The transport has a complete pure-JavaScript fallback. Do not run optional native probes.
+  cpu-features: false
+  ssh2: false

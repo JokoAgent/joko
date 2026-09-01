@@ -1,0 +1,33 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "rootDir": "src",
+    "outDir": "dist",
+    "tsBuildInfoFile": "dist/.tsbuildinfo"
+  },
+  "references": [
+    { "path": "../../packages/contracts" },
+    { "path": "../../packages/core" },
+    { "path": "../../packages/git-safety" },
+    { "path": "../../packages/local-model-runtime" },
+    { "path": "../../packages/outbound-network" },
+    { "path": "../../packages/remote-ssh" },
+    { "path": "../../packages/runtime-governance" },
+    { "path": "../../packages/store" },
+    { "path": "../../packages/adapter-claude-code" },
+    { "path": "../../packages/adapter-codex" },
+    { "path": "../../packages/adapter-dictation-refinement" },
+    { "path": "../../packages/adapter-pi" },
+    { "path": "../../packages/adapter-transcription-openai" },
+    { "path": "../../packages/adapter-transcription-realtime" },
+    { "path": "../../packages/testkit" },
+    { "path": "../../packages/tool-android" },
+    { "path": "../../packages/tool-browser" },
+    { "path": "../../packages/tool-computer" },
+    { "path": "../../packages/tool-lsp" },
+    { "path": "../../packages/voice-input" },
+    { "path": "../../packages/worktree" }
+  ],
+  "include": ["src/**/*.ts"]
+}

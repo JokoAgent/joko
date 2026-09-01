@@ -1,0 +1,49 @@
+.vision-bridge-toasts {
+  position: fixed;
+  z-index: 10100;
+  top: 20px;
+  left: 50%;
+  display: grid;
+  width: min(560px, calc(100vw - 24px));
+  gap: 10px;
+  pointer-events: none;
+  transform: translateX(-50%);
+}
+
+.vision-bridge-toast {
+  display: flex;
+  min-height: 40px;
+  align-items: center;
+  justify-self: center;
+  gap: 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  padding: 10px 16px;
+  background: var(--surface-raised);
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.375;
+  opacity: 0;
+  pointer-events: auto;
+  transition: opacity 300ms ease;
+}
+
+.vision-bridge-toast > svg {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
+  color: var(--accent-strong);
+}
+
+.vision-bridge-toast.is-fallback > svg,
+.vision-bridge-toast.is-unavailable > svg {
+  color: var(--amber);
+}
+
+.vision-bridge-toast.is-entered { opacity: 1; }
+.vision-bridge-toast.is-exiting { opacity: 0; }
+
+@media (prefers-reduced-motion: reduce) {
+  .vision-bridge-toast { transition: none; }
+}

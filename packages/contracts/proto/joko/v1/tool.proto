@@ -1,0 +1,519 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+import "joko/v1/common.proto";
+import "joko/v1/interaction.proto";
+import "joko/v1/workspace.proto";
+
+enum ToolProviderKind {
+  TOOL_PROVIDER_KIND_UNSPECIFIED = 0;
+  TOOL_PROVIDER_KIND_BACKEND_BUILT_IN = 1;
+  TOOL_PROVIDER_KIND_CUSTOM = 2;
+  TOOL_PROVIDER_KIND_MCP = 3;
+  TOOL_PROVIDER_KIND_BROWSER = 4;
+  TOOL_PROVIDER_KIND_COMPUTER = 5;
+  TOOL_PROVIDER_KIND_ANDROID = 6;
+}
+
+enum ToolHealth {
+  TOOL_HEALTH_UNSPECIFIED = 0;
+  TOOL_HEALTH_STARTING = 1;
+  TOOL_HEALTH_HEALTHY = 2;
+  TOOL_HEALTH_DEGRADED = 3;
+  TOOL_HEALTH_UNAVAILABLE = 4;
+  TOOL_HEALTH_STOPPED = 5;
+}
+
+message ToolProviderDescriptor {
+  string tool_provider_id = 1;
+  string display_name = 2;
+  ToolProviderKind kind = 3;
+  string version = 4;
+  ToolHealth health = 5;
+  repeated ToolDescriptor tools = 6;
+  EntityVersion entity_version = 7;
+  ErrorInfo error = 8;
+}
+
+message ToolDescriptor {
+  string tool_id = 1;
+  string tool_provider_id = 2;
+  string name = 3;
+  string display_name = 4;
+  string description = 5;
+  ToolInputSchema input_schema = 6;
+  bool requires_permission = 7;
+  bool streaming_updates = 8;
+  bool enabled = 9;
+}
+
+enum RuntimeToolSourceScope {
+  RUNTIME_TOOL_SOURCE_SCOPE_UNSPECIFIED = 0;
+  RUNTIME_TOOL_SOURCE_SCOPE_USER = 1;
+  RUNTIME_TOOL_SOURCE_SCOPE_PROJECT = 2;
+  RUNTIME_TOOL_SOURCE_SCOPE_TEMPORARY = 3;
+}
+
+enum RuntimeToolSourceOrigin {
+  RUNTIME_TOOL_SOURCE_ORIGIN_UNSPECIFIED = 0;
+  RUNTIME_TOOL_SOURCE_ORIGIN_PACKAGE = 1;
+  RUNTIME_TOOL_SOURCE_ORIGIN_TOP_LEVEL = 2;
+}
+
+message RuntimeToolSourceInfo {
+  string path = 1;
+  string source = 2;
+  RuntimeToolSourceScope scope = 3;
+  RuntimeToolSourceOrigin origin = 4;
+  optional string base_dir = 5;
+}
+
+// Session-scoped registry observed from the live Backend runtime. Permission
+// and streaming flags are intentionally absent because live registries may
+// expose only schemas and active membership.
+message RuntimeToolDescriptor {
+  string name = 1;
+  string description = 2;
+  ToolInputSchema input_schema = 3;
+  repeated string prompt_guidelines = 4;
+  bool active = 5;
+  RuntimeToolSourceInfo source_info = 6;
+}
+
+message RuntimeToolCatalog {
+  uint64 runtime_generation = 1;
+  google.protobuf.Timestamp observed_at = 2;
+  repeated RuntimeToolDescriptor tools = 3;
+}
+
+message ToolInputSchema {
+  repeated ToolInputField fields = 1;
+  bool allows_additional_fields = 2;
+}
+
+message ToolInputField {
+  string field_path = 1;
+  string title = 2;
+  string description = 3;
+  ToolFieldType type = 4;
+  bool required = 5;
+  bool secret = 6;
+  repeated string enum_values = 7;
+  ToolFieldConstraints constraints = 8;
+}
+
+enum ToolFieldType {
+  TOOL_FIELD_TYPE_UNSPECIFIED = 0;
+  TOOL_FIELD_TYPE_STRING = 1;
+  TOOL_FIELD_TYPE_NUMBER = 2;
+  TOOL_FIELD_TYPE_INTEGER = 3;
+  TOOL_FIELD_TYPE_BOOLEAN = 4;
+  TOOL_FIELD_TYPE_OBJECT = 5;
+  TOOL_FIELD_TYPE_ARRAY = 6;
+  TOOL_FIELD_TYPE_BLOB = 7;
+}
+
+message ToolFieldConstraints {
+  uint32 minimum_length = 1;
+  uint32 maximum_length = 2;
+  double minimum_number = 3;
+  double maximum_number = 4;
+  string pattern = 5;
+  string item_field_path = 6;
+}
+
+enum ToolCallState {
+  TOOL_CALL_STATE_UNSPECIFIED = 0;
+  TOOL_CALL_STATE_REQUESTED = 1;
+  TOOL_CALL_STATE_WAITING_PERMISSION = 2;
+  TOOL_CALL_STATE_RUNNING = 3;
+  TOOL_CALL_STATE_SUCCEEDED = 4;
+  TOOL_CALL_STATE_FAILED = 5;
+  TOOL_CALL_STATE_ABORTED = 6;
+}
+
+message ToolCall {
+  string tool_call_id = 1;
+  string tool_id = 2;
+  string tool_provider_id = 3;
+  string session_id = 4;
+  string run_id = 5;
+  string attempt_id = 6;
+  ToolCallState state = 7;
+  repeated DisplayArgument arguments = 8;
+  google.protobuf.Timestamp started_at = 9;
+  google.protobuf.Timestamp ended_at = 10;
+  ToolResult result = 11;
+  ErrorInfo error = 12;
+}
+
+message ToolResult {
+  repeated ToolResultPart parts = 1;
+  bool truncated = 2;
+  BlobRef complete_output = 3;
+}
+
+message ToolResultPart {
+  oneof content {
+    string text = 1;
+    ImageRef image = 2;
+    ArtifactRef artifact = 3;
+    CommandOutput command = 4;
+    ToolFileChange file_change = 5;
+    ToolTable table = 6;
+  }
+}
+
+message CommandOutput {
+  string command_display = 1;
+  string stdout_preview = 2;
+  string stderr_preview = 3;
+  int32 exit_code = 4;
+  bool completed = 5;
+  BlobRef full_stdout = 6;
+  BlobRef full_stderr = 7;
+}
+
+message ToolFileChange {
+  string workspace_id = 1;
+  string relative_path = 2;
+  ToolFileAction action = 3;
+  string revision_before = 4;
+  string revision_after = 5;
+}
+
+enum ToolFileAction {
+  TOOL_FILE_ACTION_UNSPECIFIED = 0;
+  TOOL_FILE_ACTION_READ = 1;
+  TOOL_FILE_ACTION_CREATED = 2;
+  TOOL_FILE_ACTION_UPDATED = 3;
+  TOOL_FILE_ACTION_DELETED = 4;
+}
+
+message ToolTable {
+  repeated string columns = 1;
+  repeated ToolTableRow rows = 2;
+}
+
+message ToolTableRow {
+  repeated string cells = 1;
+}
+
+message ToolLease {
+  string tool_lease_id = 1;
+  string tool_provider_id = 2;
+  string backend_id = 3;
+  string session_id = 4;
+  string run_id = 5;
+  uint64 generation = 6;
+  ToolLeaseState state = 7;
+  google.protobuf.Timestamp acquired_at = 8;
+  google.protobuf.Timestamp expires_at = 9;
+  EntityVersion version = 10;
+}
+
+enum ToolLeaseState {
+  TOOL_LEASE_STATE_UNSPECIFIED = 0;
+  TOOL_LEASE_STATE_PENDING = 1;
+  TOOL_LEASE_STATE_ACTIVE = 2;
+  TOOL_LEASE_STATE_RELEASED = 3;
+  TOOL_LEASE_STATE_EXPIRED = 4;
+  TOOL_LEASE_STATE_FENCED = 5;
+}
+
+enum McpTransport {
+  MCP_TRANSPORT_UNSPECIFIED = 0;
+  MCP_TRANSPORT_LOOPBACK_BRIDGE = 1;
+  MCP_TRANSPORT_HTTPS_STREAMABLE_HTTP = 2;
+  MCP_TRANSPORT_STDIO = 3;
+}
+
+enum McpServerState {
+  MCP_SERVER_STATE_UNSPECIFIED = 0;
+  MCP_SERVER_STATE_DISABLED = 1;
+  MCP_SERVER_STATE_STARTING = 2;
+  MCP_SERVER_STATE_CONNECTED = 3;
+  MCP_SERVER_STATE_DEGRADED = 4;
+  MCP_SERVER_STATE_DISCONNECTED = 5;
+  MCP_SERVER_STATE_ERROR = 6;
+}
+
+message McpServerDescriptor {
+  string mcp_server_id = 1;
+  string display_name = 2;
+  McpTransport transport = 3;
+  string endpoint_display = 4;
+  McpServerState state = 5;
+  uint64 runtime_generation = 6;
+  repeated ToolDescriptor tools = 7;
+  repeated CredentialBinding credential_bindings = 8;
+  EntityVersion version = 9;
+  ErrorInfo error = 10;
+  bool enabled = 11;
+  // Safe, editable transport configuration. Secret values are represented
+  // only by credential_bindings and are never included here.
+  oneof transport_config {
+    StdioMcpConfiguration stdio = 12;
+    StreamableHttpMcpConfiguration streamable_http = 13;
+  }
+}
+
+// Refers to a secret held by the credential channel; never contains its value.
+message CredentialBinding {
+  string header_name = 1;
+  string credential_reference_id = 2;
+  bool configured = 3;
+  McpCredentialTarget target = 4;
+  string target_name = 5;
+}
+
+enum McpCredentialTarget {
+  MCP_CREDENTIAL_TARGET_UNSPECIFIED = 0;
+  MCP_CREDENTIAL_TARGET_HEADER = 1;
+  MCP_CREDENTIAL_TARGET_ENVIRONMENT = 2;
+}
+
+message McpServerInput {
+  string display_name = 1;
+  McpTransport transport = 2;
+  // Canonical endpoint without URL user-info, tokens, or secret query values.
+  string endpoint = 3;
+  repeated CredentialBinding credential_bindings = 4;
+  bool enabled = 5;
+  oneof transport_config {
+    StdioMcpConfiguration stdio = 6;
+    StreamableHttpMcpConfiguration streamable_http = 7;
+  }
+}
+
+message StdioMcpConfiguration {
+  string command = 1;
+  repeated string arguments = 2;
+  string working_directory = 3;
+  repeated McpEnvironmentVariable environment = 4;
+}
+
+message StreamableHttpMcpConfiguration {
+  // Canonical endpoint without URL user-info, tokens, or secret query values.
+  string endpoint = 1;
+}
+
+message McpEnvironmentVariable {
+  string name = 1;
+  string value = 2;
+}
+
+enum BrowserProviderState {
+  BROWSER_PROVIDER_STATE_UNSPECIFIED = 0;
+  BROWSER_PROVIDER_STATE_STOPPED = 1;
+  BROWSER_PROVIDER_STATE_STARTING = 2;
+  BROWSER_PROVIDER_STATE_READY = 3;
+  BROWSER_PROVIDER_STATE_DEGRADED = 4;
+  BROWSER_PROVIDER_STATE_DISCONNECTED = 5;
+  BROWSER_PROVIDER_STATE_RECOVERING = 6;
+  BROWSER_PROVIDER_STATE_ERROR = 7;
+}
+
+message BrowserProvider {
+  string browser_provider_id = 1;
+  string display_name = 2;
+  string version = 3;
+  BrowserProviderState state = 4;
+  uint64 generation = 5;
+  string profile_display_name = 6;
+  repeated BrowserPage pages = 7;
+  BrowserTakeover takeover = 8;
+  EntityVersion entity_version = 9;
+  ErrorInfo error = 10;
+  // Logical page selected by the last persisted human lifecycle operation.
+  string active_page_id = 11;
+}
+
+// Authenticated service-to-service Browser execution projection. Discovery
+// origins remain credential-free; authority is established by the Connection
+// credential on each RPC and capabilities are fenced by generation.
+message BrowserAutomationNode {
+  string node_id = 1;
+  string display_name = 2;
+  bool available = 3;
+  uint64 generation = 4;
+  repeated string capabilities = 5;
+  ErrorInfo error = 6;
+}
+
+// Bounded binary envelope used only after RPC authentication. Local paths and
+// credential-bearing URLs are never part of this contract.
+message BrowserAutomationBinary {
+  string artifact_id = 1;
+  string file_name = 2;
+  string media_type = 3;
+  uint64 byte_size = 4;
+  string sha256_hex = 5;
+  bytes data = 6;
+}
+
+enum BrowserPageState {
+  BROWSER_PAGE_STATE_UNSPECIFIED = 0;
+  BROWSER_PAGE_STATE_LOADING = 1;
+  BROWSER_PAGE_STATE_READY = 2;
+  BROWSER_PAGE_STATE_CRASHED = 3;
+  BROWSER_PAGE_STATE_CLOSED = 4;
+}
+
+message BrowserPage {
+  string page_id = 1;
+  string browser_provider_id = 2;
+  string title = 3;
+  string url = 4;
+  string origin = 5;
+  BrowserPageState state = 6;
+  ImageRef latest_screenshot = 7;
+  google.protobuf.Timestamp last_activity_at = 8;
+  string active_tool_call_id = 9;
+  EntityVersion version = 10;
+  bool can_go_back = 11;
+  bool can_go_forward = 12;
+  // True when the live page was lost across close/crash/restart but a safe,
+  // credential-free descriptor remains available for explicit restoration.
+  bool recoverable = 13;
+  uint64 last_known_generation = 14;
+  // Durable owning Session for human-opened pages. Empty only for global
+  // automation/tool pages that are intentionally not projected in a Session
+  // Inspector.
+  string session_id = 15;
+}
+
+enum BrowserCommentTargetKind {
+  BROWSER_COMMENT_TARGET_KIND_UNSPECIFIED = 0;
+  BROWSER_COMMENT_TARGET_KIND_ELEMENT = 1;
+  BROWSER_COMMENT_TARGET_KIND_REGION = 2;
+  BROWSER_COMMENT_TARGET_KIND_TEXT = 3;
+}
+
+enum BrowserCommentThemeVariant {
+  BROWSER_COMMENT_THEME_VARIANT_UNSPECIFIED = 0;
+  BROWSER_COMMENT_THEME_VARIANT_LIGHT = 1;
+  BROWSER_COMMENT_THEME_VARIANT_DARK = 2;
+}
+
+message BrowserCommentPoint {
+  double x = 1;
+  double y = 2;
+}
+
+message BrowserCommentViewport {
+  double width = 1;
+  double height = 2;
+}
+
+message BrowserCommentRegion {
+  double x = 1;
+  double y = 2;
+  double width = 3;
+  double height = 4;
+}
+
+message BrowserCommentStringEntry {
+  string key = 1;
+  string value = 2;
+}
+
+message BrowserCommentDesignBaseline {
+  repeated BrowserCommentStringEntry styles = 1;
+  optional string editable_text = 2;
+  repeated BrowserCommentStringEntry provenance = 3;
+}
+
+message BrowserCommentTarget {
+  BrowserCommentTargetKind kind = 1;
+  BrowserCommentPoint point = 2;
+  BrowserCommentViewport viewport = 3;
+  BrowserCommentRegion region = 4;
+  string selected_text = 5;
+  string target_tag = 6;
+  string target_label = 7;
+  string target_role = 8;
+  string target_selector = 9;
+  string target_path = 10;
+  string nearby_text = 11;
+  BrowserCommentThemeVariant theme_variant = 12;
+  BrowserCommentDesignBaseline design_baseline = 13;
+  repeated BrowserCommentRegion text_regions = 14;
+}
+
+// Ephemeral placement projected from document coordinates after page layout
+// has settled. Committed entries expose only their marker point; pending
+// entries may additionally expose selection geometry.
+message BrowserCommentPlacement {
+  uint32 marker_number = 1;
+  BrowserCommentPoint point = 2;
+  BrowserCommentViewport viewport = 3;
+  bool pending = 4;
+  BrowserCommentRegion region = 5;
+  repeated BrowserCommentRegion text_regions = 6;
+}
+
+enum BrowserTakeoverState {
+  BROWSER_TAKEOVER_STATE_UNSPECIFIED = 0;
+  BROWSER_TAKEOVER_STATE_INACTIVE = 1;
+  BROWSER_TAKEOVER_STATE_REQUESTED = 2;
+  BROWSER_TAKEOVER_STATE_ACTIVE = 3;
+  BROWSER_TAKEOVER_STATE_RELEASING = 4;
+  BROWSER_TAKEOVER_STATE_FENCED = 5;
+}
+
+message BrowserTakeover {
+  string takeover_id = 1;
+  string page_id = 2;
+  string connection_id = 3;
+  BrowserTakeoverState state = 4;
+  uint64 generation = 5;
+  google.protobuf.Timestamp started_at = 6;
+  google.protobuf.Timestamp expires_at = 7;
+}
+
+message BrowserActivity {
+  string activity_id = 1;
+  string page_id = 2;
+  string tool_call_id = 3;
+  BrowserActivityKind kind = 4;
+  string description = 5;
+  google.protobuf.Timestamp occurred_at = 6;
+}
+
+enum BrowserTransferState {
+  BROWSER_TRANSFER_STATE_UNSPECIFIED = 0;
+  BROWSER_TRANSFER_STATE_PENDING = 1;
+  BROWSER_TRANSFER_STATE_RUNNING = 2;
+  BROWSER_TRANSFER_STATE_COMPLETED = 3;
+  BROWSER_TRANSFER_STATE_FAILED = 4;
+  BROWSER_TRANSFER_STATE_CANCELLED = 5;
+}
+
+message BrowserTransfer {
+  string browser_transfer_id = 1;
+  string browser_provider_id = 2;
+  string page_id = 3;
+  string tool_call_id = 4;
+  TransferDirection direction = 5;
+  BrowserTransferState state = 6;
+  BlobRef blob = 7;
+  ArtifactRef artifact = 8;
+  google.protobuf.Timestamp started_at = 9;
+  google.protobuf.Timestamp completed_at = 10;
+  ErrorInfo error = 11;
+}
+
+enum BrowserActivityKind {
+  BROWSER_ACTIVITY_KIND_UNSPECIFIED = 0;
+  BROWSER_ACTIVITY_KIND_NAVIGATION = 1;
+  BROWSER_ACTIVITY_KIND_INTERACTION = 2;
+  BROWSER_ACTIVITY_KIND_SCREENSHOT = 3;
+  BROWSER_ACTIVITY_KIND_UPLOAD = 4;
+  BROWSER_ACTIVITY_KIND_DOWNLOAD = 5;
+  BROWSER_ACTIVITY_KIND_LOGIN = 6;
+  BROWSER_ACTIVITY_KIND_TAKEOVER = 7;
+  BROWSER_ACTIVITY_KIND_RECOVERY = 8;
+}
