@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import { unicodeCorpus, longPunctuationRun } from "../i18n/test-corpus.js";
 import { Editor } from "@tiptap/core";
 import Document from "@tiptap/extension-document";
 import Paragraph from "@tiptap/extension-paragraph";
@@ -39,10 +40,10 @@ describe("Composer CJK punctuation rendering", () => {
       .map((index) => text[index])
       .join("");
 
-    expect(selected("中文, () 内容")).toBe(",()");
+    expect(selected(unicodeCorpus.cjkWithAsciiPunctuation)).toBe(",()");
     expect(selected("《Latin》")).toBe("《》");
     expect(selected("Latin, () text")).toBe("");
-    expect(composerCjkContextPunctuationIndexes(`${"(".repeat(16 * 1024)}中`)).toHaveLength(16 * 1024);
+    expect(composerCjkContextPunctuationIndexes(longPunctuationRun(16 * 1024))).toHaveLength(16 * 1024);
   });
 
   it("keeps list and atom rendering stable while composition defers new decorations", () => {
@@ -70,9 +71,9 @@ describe("Composer CJK punctuation rendering", () => {
             content: [{
               type: "paragraph",
               content: [
-                { type: "text", text: "中文," },
+                { type: "text", text: unicodeCorpus.cjkWithComma },
                 { type: "composerPastedText", attrs: { text: "payload", display: "Pasted text" } },
-                { type: "text", text: "《旧》" }
+                { type: "text", text: unicodeCorpus.quotedCjkWord }
               ]
             }]
           }]
@@ -88,7 +89,7 @@ describe("Composer CJK punctuation rendering", () => {
     editor.view.dom.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
     expect(editor.view.composing).toBe(true);
     const insertion = TextSelection.atEnd(editor.state.doc).from;
-    editor.view.dispatch(editor.state.tr.insertText(",中", insertion).setMeta("composition", 1));
+    editor.view.dispatch(editor.state.tr.insertText(unicodeCorpus.compositionWithComma, insertion).setMeta("composition", 1));
 
     expect(decoratedText()).toBe(",《》");
     expect(editor.getJSON().content?.[0]?.type).toBe("bulletList");

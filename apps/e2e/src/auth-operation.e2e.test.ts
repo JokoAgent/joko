@@ -69,6 +69,35 @@ describe("remote connection auth and durable operations", () => {
     expect((await second.clients.session.getSession({ sessionId })).session?.displayName).not.toBe("stale write must fail");
   });
 
+  it("requires the captured Target revision and rejects stale edits without changing the target", async () => {
+    fixture = await OrchestratorE2eFixture.start();
+    const first = await fixture.pair("first target editor");
+    const second = await fixture.pair("second target editor");
+    const targetId = fixture.targetId();
+    const initial = fixture.application.store.getTarget(targetId);
+    const edit = (patch: { readonly displayName?: string; readonly pinned?: boolean }, revision?: bigint) => create(OperationMutationSchema, {
+      payload: { case: "updateTarget", value: { targetId, ...patch } },
+      preconditions: revision === undefined ? [] : [{ entity: { kind: EntityKind.TARGET, id: targetId }, expectedRevision: { value: revision } }]
+    });
+    await expect(submit(first.clients.operation, first.connectionId, edit({ displayName: "missing authority" }))).rejects.toMatchObject({ code: Code.InvalidArgument });
+    const mutation = edit({ displayName: "second editor", pinned: true }, initial.revision);
+    const operationId = randomUUID();
+    await submit(second.clients.operation, second.connectionId, mutation, operationId);
+    const current = fixture.application.store.getTarget(targetId);
+    expect(current.revision).toBeGreaterThan(initial.revision);
+    expect(current.descriptor.displayName).toBe("second editor");
+    await expect(submit(first.clients.operation, first.connectionId, edit({ displayName: "stale edit", pinned: false }, initial.revision))).rejects.toMatchObject({ code: Code.Aborted });
+    await expect(submit(first.clients.operation, first.connectionId, create(OperationMutationSchema, {
+      payload: { case: "updateTarget", value: { targetId, workspaceLocationUpdate: { case: "serviceNodeWorkspace", value: true } } },
+      preconditions: [{ entity: { kind: EntityKind.TARGET, id: targetId }, expectedRevision: { value: initial.revision } }]
+    }))).rejects.toMatchObject({ code: Code.Aborted });
+    expect(fixture.application.store.getTarget(targetId)).toEqual(current);
+    await submit(second.clients.operation, second.connectionId, mutation, operationId);
+    expect(fixture.application.store.getTarget(targetId)).toEqual(current);
+    await submit(first.clients.operation, first.connectionId, edit({ displayName: "reviewed current edit" }, current.revision));
+    expect(fixture.application.store.getTarget(targetId).descriptor.displayName).toBe("reviewed current edit");
+  });
+
   it("preflights every task before a Backend-wide restart changes any runtime generation", async () => {
     fixture = await OrchestratorE2eFixture.start();
     const paired = await fixture.pair("atomic Backend restart");
@@ -87,7 +116,7 @@ describe("remote connection auth and durable operations", () => {
     await submit(
       paired.clients.operation,
       paired.connectionId,
-      sendInputMutation(firstSessionId, "keep this runtime busy")
+      sendInputMutation(firstSessionId, BigInt(fixture!.application.store.getSession(firstSessionId).descriptor.binding.generation), "keep this runtime busy")
     );
     const [firstBefore, secondBefore] = await Promise.all([
       paired.clients.session.getSession({ sessionId: firstSessionId }),

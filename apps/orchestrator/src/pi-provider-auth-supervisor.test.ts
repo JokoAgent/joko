@@ -88,9 +88,10 @@ async function fixture(providerId = "openai-codex", seedManagedProvider = true, 
   });
   await credentials.initialize();
   const store = new OperationalStore(join(root, "orchestrator.db"), { now: () => NOW });
-  const providers = new ProviderCatalogManager({ store, credentials, now: () => NOW });
+  const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "managed-runtime", now: () => NOW });
   providers.initialize();
   if (seedManagedProvider) await providers.upsert({
+    backendId: "managed-runtime", credentialOrigin: "",
     provider: {
       id: providerId,
       api: "openai-responses",
@@ -284,7 +285,7 @@ describe("PiProviderAuthSupervisor", () => {
     expect(runtime.refreshCount).toBe(1);
     expect(supervisor.listNativeModels().map((model) => model.modelId)).toContain("refreshed-native-model");
     expect(generationRefreshes).toBe(1);
-    expect(providers.get(providerId).supportsModelRefresh).toBe(true);
+    expect(providers.get("managed-runtime", providerId).supportsModelRefresh).toBe(true);
     await supervisor.close();
     store.close();
   });
@@ -352,7 +353,16 @@ describe("PiProviderAuthSupervisor", () => {
     expect(nativeModels.some((model) => model.cost.input > 0 && model.cost.output > 0)).toBe(true);
     expect(nativeModels.some((model) => model.supportsFastMode === true)).toBe(true);
     expect(nativeModels.filter((model) => model.supportsFastMode === true).every((model) =>
-      model.api === "openai-codex-responses")).toBe(true);
+      model.api === "openai-codex-responses" || (model.providerId === "openai" && model.modelId === "gpt-6-astra"))).toBe(true);
+    for (const [providerId, contextWindow] of [["openai", 1_050_000], ["openai-codex", 272_000]] as const) {
+      expect(nativeModels.find((model) => model.providerId === providerId && model.modelId === "gpt-6-astra")).toMatchObject({
+        contextWindow,
+        maxOutputTokens: 128_000,
+        thinkingLevels: ["low", "medium", "high", "xhigh", "max"],
+        supportsFastMode: true,
+        pricing: { source: "providerReference", fastModeMultiplier: 2, longContext: { inputTokenThreshold: 272_000 } }
+      });
+    }
     for (const model of nativeModels) {
       expect(model.api).not.toBe("");
       expect(model.contextWindow).toBeGreaterThan(0);
@@ -371,7 +381,7 @@ describe("PiProviderAuthSupervisor", () => {
       "radius",
       "xai"
     ]));
-    expect(providers.get("openai-codex")).toMatchObject({
+    expect(providers.get("managed-runtime", "openai-codex")).toMatchObject({
       kind: "subscription",
       authenticationState: "signed_out",
       enabled: false,
@@ -379,7 +389,7 @@ describe("PiProviderAuthSupervisor", () => {
       supportsRefresh: true,
       supportsLogout: true
     });
-    expect(providers.get("amazon-bedrock")).toMatchObject({
+    expect(providers.get("managed-runtime", "amazon-bedrock")).toMatchObject({
       kind: "api_key",
       authenticationState: "signed_out",
       enabled: false,
@@ -387,9 +397,9 @@ describe("PiProviderAuthSupervisor", () => {
       supportsRefresh: false,
       supportsLogout: true
     });
-    expect(providers.get("openai-codex").capabilities?.has(PROVIDER_ACCOUNT_USAGE_CAPABILITY)).toBe(true);
+    expect(providers.get("managed-runtime", "openai-codex").capabilities?.has(PROVIDER_ACCOUNT_USAGE_CAPABILITY)).toBe(true);
     for (const providerId of ["amazon-bedrock", "azure-openai-responses", "google-vertex"]) {
-      expect(providers.get(providerId)).toMatchObject({
+      expect(providers.get("managed-runtime", providerId)).toMatchObject({
         kind: "api_key",
         authenticationState: "signed_out",
         supportsLogin: true,
@@ -483,11 +493,11 @@ describe("PiProviderAuthSupervisor", () => {
     });
     expect(runtime.selections).toEqual(["device_code"]);
     expect(supervisor.getFlow(flow.opaqueFlowId)?.state).toBe("pending");
-    expect(providers.get(providerId).authenticationState).toBe("pending");
+    expect(providers.get("managed-runtime", providerId).authenticationState).toBe("pending");
 
     runtime.completeLogin();
     await expectFlowState(supervisor, flow.opaqueFlowId, "completed");
-    expect(providers.get(providerId)).toMatchObject({ authenticationState: "authenticated" });
+    expect(providers.get("managed-runtime", providerId)).toMatchObject({ authenticationState: "authenticated" });
     const authenticatedSnapshot = await providers.createPiGenerationSnapshot({
       snapshotsRoot: join(root, "authenticated-generations")
     });
@@ -512,7 +522,7 @@ describe("PiProviderAuthSupervisor", () => {
     expect(operational).toContain(flow.opaqueFlowId);
 
     await supervisor.close();
-    const reloadedProviders = new ProviderCatalogManager({ store, credentials, now: () => NOW });
+    const reloadedProviders = new ProviderCatalogManager({ store, credentials, nativeBackendId: "managed-runtime", now: () => NOW });
     reloadedProviders.initialize();
     const reloadedSupervisor = await PiProviderAuthSupervisor.create({
       store,
@@ -522,7 +532,7 @@ describe("PiProviderAuthSupervisor", () => {
       refreshPiGeneration: async () => undefined,
       runtimeFactory: async (credentialStore) => new FakePiRuntime(credentialStore, providerId)
     });
-    expect(reloadedProviders.get(providerId)).toMatchObject({ authenticationState: "authenticated" });
+    expect(reloadedProviders.get("managed-runtime", providerId)).toMatchObject({ authenticationState: "authenticated" });
     expect(JSON.parse(reloadedProviders.readNativeCredential(providerId)?.serializedCredential ?? "{}")).toMatchObject({
       refresh: "refresh-token-never-public"
     });
@@ -534,6 +544,7 @@ describe("PiProviderAuthSupervisor", () => {
   it("activates only the authenticated managed Provider and preserves a later manual disable", async () => {
     const { credentials, store, providers, providerId } = await fixture("managed-disabled", true, false);
     await providers.upsert({
+      backendId: "managed-runtime", credentialOrigin: "",
       provider: {
         id: "unrelated-disabled",
         api: "openai-responses",
@@ -564,19 +575,20 @@ describe("PiProviderAuthSupervisor", () => {
     runtime.completeLogin();
     await expectFlowState(supervisor, flow.opaqueFlowId, "completed");
 
-    expect(providers.get(providerId)).toMatchObject({ enabled: true, authenticationState: "authenticated" });
-    expect(providers.get("unrelated-disabled").enabled).toBe(false);
+    expect(providers.get("managed-runtime", providerId)).toMatchObject({ enabled: true, authenticationState: "authenticated" });
+    expect(providers.get("managed-runtime", "unrelated-disabled").enabled).toBe(false);
     expect(providers.generation).toBe(generationBeforeLogin + 2);
     expect(generationRefreshes).toBe(1);
-    const activatedReload = new ProviderCatalogManager({ store, credentials, now: () => NOW });
+    const activatedReload = new ProviderCatalogManager({ store, credentials, nativeBackendId: "managed-runtime", now: () => NOW });
     activatedReload.initialize();
-    expect(activatedReload.get(providerId)).toMatchObject({
+    expect(activatedReload.get("managed-runtime", providerId)).toMatchObject({
       enabled: true,
       authenticationState: "authenticated"
     });
-    expect(activatedReload.get("unrelated-disabled").enabled).toBe(false);
+    expect(activatedReload.get("managed-runtime", "unrelated-disabled").enabled).toBe(false);
 
     await providers.upsert({
+      backendId: "managed-runtime", credentialOrigin: "",
       provider: {
         id: providerId,
         api: "openai-responses",
@@ -591,17 +603,17 @@ describe("PiProviderAuthSupervisor", () => {
       supportsRefresh: true
     });
     await providers.refreshCredential(providerId);
-    expect(providers.get(providerId)).toMatchObject({ enabled: false, authenticationState: "authenticated" });
-    expect(providers.get("unrelated-disabled").enabled).toBe(false);
+    expect(providers.get("managed-runtime", providerId)).toMatchObject({ enabled: false, authenticationState: "authenticated" });
+    expect(providers.get("managed-runtime", "unrelated-disabled").enabled).toBe(false);
 
     await supervisor.close();
-    const reloadedProviders = new ProviderCatalogManager({ store, credentials, now: () => NOW });
+    const reloadedProviders = new ProviderCatalogManager({ store, credentials, nativeBackendId: "managed-runtime", now: () => NOW });
     reloadedProviders.initialize();
-    expect(reloadedProviders.get(providerId)).toMatchObject({
+    expect(reloadedProviders.get("managed-runtime", providerId)).toMatchObject({
       enabled: false,
       authenticationState: "authenticated"
     });
-    expect(reloadedProviders.get("unrelated-disabled").enabled).toBe(false);
+    expect(reloadedProviders.get("managed-runtime", "unrelated-disabled").enabled).toBe(false);
     store.close();
   });
 
@@ -634,7 +646,7 @@ describe("PiProviderAuthSupervisor", () => {
       answer: { case: "text", text: "engineering-profile-private" }
     });
     await expectFlowState(supervisor, flow.opaqueFlowId, "completed");
-    expect(providers.get(providerId)).toMatchObject({
+    expect(providers.get("managed-runtime", providerId)).toMatchObject({
       kind: "api_key",
       enabled: true,
       authenticationState: "authenticated",
@@ -660,7 +672,7 @@ describe("PiProviderAuthSupervisor", () => {
     expect(generationRefreshes).toBe(1);
 
     await supervisor.close();
-    const reloadedProviders = new ProviderCatalogManager({ store, credentials, now: () => NOW });
+    const reloadedProviders = new ProviderCatalogManager({ store, credentials, nativeBackendId: "managed-runtime", now: () => NOW });
     reloadedProviders.initialize();
     const reloaded = await PiProviderAuthSupervisor.create({
       store,
@@ -670,7 +682,7 @@ describe("PiProviderAuthSupervisor", () => {
       refreshPiGeneration: async () => { generationRefreshes += 1; },
       runtimeFactory: async (credentialStore) => new FakeApiKeyRuntime(credentialStore, providerId)
     });
-    expect(reloadedProviders.get(providerId)).toMatchObject({ enabled: true, authenticationState: "authenticated" });
+    expect(reloadedProviders.get("managed-runtime", providerId)).toMatchObject({ enabled: true, authenticationState: "authenticated" });
     expect(reloaded.loadNativeAuth({
       providerIds: [providerId],
       expectedCatalogGeneration: reloadedProviders.generation
@@ -802,7 +814,7 @@ describe("PiProviderAuthSupervisor", () => {
     await first.close();
     expect(first.getFlow(flow.opaqueFlowId)).toMatchObject({ state: "outcome_unknown" });
 
-    const reloadedProviders = new ProviderCatalogManager({ store, credentials, now: () => NOW });
+    const reloadedProviders = new ProviderCatalogManager({ store, credentials, nativeBackendId: "managed-runtime", now: () => NOW });
     reloadedProviders.initialize();
     const second = await PiProviderAuthSupervisor.create({
       store,
@@ -863,7 +875,7 @@ describe("PiProviderAuthSupervisor", () => {
     expect(stringify(durable?.value)).toContain(flows[0]!.opaqueFlowId);
 
     await supervisor.close();
-    const reloadedProviders = new ProviderCatalogManager({ store, credentials, now: () => NOW });
+    const reloadedProviders = new ProviderCatalogManager({ store, credentials, nativeBackendId: "managed-runtime", now: () => NOW });
     reloadedProviders.initialize();
     const reloaded = await PiProviderAuthSupervisor.create({
       store,
@@ -908,7 +920,7 @@ describe("PiProviderAuthSupervisor", () => {
     await expectFlowState(supervisor, flow.opaqueFlowId, "cancelled");
     expect(() => supervisor.cancel(flow.opaqueFlowId)).toThrow(/not active/u);
     expect(credentials.list({ providerId })).toEqual([]);
-    expect(providers.get(providerId).authenticationState).toBe("error");
+    expect(providers.get("managed-runtime", providerId).authenticationState).toBe("error");
     await supervisor.close();
     store.close();
   });
@@ -927,7 +939,7 @@ describe("PiProviderAuthSupervisor", () => {
     const flow = await supervisor.beginLogin(providerId, "device_code");
     await expectFlowState(supervisor, flow.opaqueFlowId, "timed_out");
     expect(credentials.list({ providerId })).toEqual([]);
-    expect(providers.get(providerId)).toMatchObject({
+    expect(providers.get("managed-runtime", providerId)).toMatchObject({
       authenticationState: "error",
       error: "Provider login timed out."
     });

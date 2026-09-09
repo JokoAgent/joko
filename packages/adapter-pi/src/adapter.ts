@@ -23,7 +23,10 @@ import {
   type DurableNativeDispatchPreparation,
   type NativeSessionBinding,
   type NativeSessionCandidate,
+  type NativeSessionDerivation,
   type NativeSessionForkResult,
+  type NativeSessionNavigation,
+  type NativeSessionNavigationResult,
   type NativeHistoryProjection,
   type ImportPortableNativeSessionInput,
   type NativeSessionState,
@@ -703,6 +706,11 @@ export class PiBackendAdapter implements BackendAdapter {
       installationState: installed ? "installed" : "not_installed",
       authenticationState: authenticated ? "authenticated" : "signed_out",
       capabilities: this.#capabilities(compatibility),
+      providerRuntimeSupport: {
+        protocols: ["anthropic-messages", "openai-responses", "openai-completions", "google-generative-ai"],
+        fields: ["models_endpoint", "headers", "keyless", "auth_header", "model_limits", "model_costs",
+          "model_input_modalities", "model_thinking_levels", "model_sampling", "model_compatibility", "model_fast_mode"]
+      },
       models: mergeProviderModels(catalog.models, this.#options.nativeModels ?? []),
       tools: [...tools, ASK_USER_QUESTION_TOOL, ...MANAGED_SUBAGENT_TOOL_DESCRIPTORS],
       diagnostics
@@ -1021,7 +1029,7 @@ export class PiBackendAdapter implements BackendAdapter {
   }
 
   supportsDetachedSessionDeletion(context: AdapterContext): boolean {
-    return context.target.remoteWorkspace !== undefined
+    return context.target.backendId === this.id
       && context.runtimePolicy !== "review_read_only";
   }
 
@@ -1090,6 +1098,11 @@ export class PiBackendAdapter implements BackendAdapter {
     onVisionStart: () => void,
     persistFence?: (preparation: DurableNativeDispatchPreparation) => Promise<void>
   ): Promise<void> {
+    if (input.mentions.some((mention) => mention.kind === "workspace_directory" || mention.lineRange !== undefined)) {
+      throw piError("PI_MENTION_KIND_UNSUPPORTED", "Directory and source line range mentions are unavailable for this native input", "dispatch", {
+        recovery: "Choose a regular workspace file mention."
+      });
+    }
     const runtime = this.#runtime(context);
     const options = runtime.generationLease.generation.options;
     const imageState = input.images.length > 0 ? await this.#requestState(runtime, context) : undefined;
@@ -2268,12 +2281,15 @@ export class PiBackendAdapter implements BackendAdapter {
   }
 
   async navigateTree(
-    entryId: string,
+    target: import("@joko/core").NativeNavigationTarget,
     summarize: boolean,
     context: AdapterContext,
-    customInstructions?: string
-  ): Promise<void> {
+    customInstructions: string | undefined,
+    _navigation: NativeSessionNavigation
+  ): Promise<NativeSessionNavigationResult> {
+    if (target.kind === "session_start") throw piError("PI_REWIND_START_UNAVAILABLE", "Durable navigation to the native Session start is unavailable", "dispatch");
     this.#assertReviewOperationAllowed(context, "navigate native history");
+    const entryId = target.entryId;
     if (!entryId) throw piError("PI_TREE_ENTRY_REQUIRED", "Native entry id is required", "dispatch");
     const summaryFocus = customInstructions?.trim();
     if (summaryFocus !== undefined && summaryFocus.length > 4_000) {
@@ -2308,9 +2324,10 @@ export class PiBackendAdapter implements BackendAdapter {
     });
     // SessionHost performs a persistence-confirmed get_entries sync and emits
     // the leaf marker only after every newly visible native entry is durable.
+    return { kind: "in_place" };
   }
 
-  async fork(entryId: string, context: AdapterContext): Promise<NativeSessionForkResult> {
+  async fork(entryId: string, context: AdapterContext, derivation: NativeSessionDerivation): Promise<NativeSessionForkResult> {
     this.#assertReviewOperationAllowed(context, "fork native history");
     if (!entryId) throw piError("PI_FORK_ENTRY_REQUIRED", "Native fork entry id is required", "dispatch");
     const runtime = this.#runtime(context);
@@ -2381,6 +2398,7 @@ export class PiBackendAdapter implements BackendAdapter {
             recovery: "Inspect the detached fork runtime and retry from the unchanged source Session."
           });
         }
+        derivation.recordBinding(binding);
         if (
           this.#runtimes.get(runtime.key) !== runtime
           || runtime.transport.closed
@@ -2389,7 +2407,7 @@ export class PiBackendAdapter implements BackendAdapter {
         ) {
           throw piError("PI_SESSION_FORK_SOURCE_FENCE_CHANGED", "The source Pi Session changed while its detached fork was being created", "session", {
             retryable: true,
-            stateMayHaveChanged: false,
+            stateMayHaveChanged: true,
             recovery: "Reload the source Session binding before retrying the fork."
           });
         }
@@ -2401,7 +2419,7 @@ export class PiBackendAdapter implements BackendAdapter {
         ) {
           throw piError("PI_SESSION_FORK_SOURCE_IDENTITY_CHANGED", "Pi did not preserve the source native Session during detached fork", "session", {
             retryable: true,
-            stateMayHaveChanged: false,
+            stateMayHaveChanged: true,
             recovery: "Reload the source Session identity before retrying the fork."
           });
         }
@@ -2472,7 +2490,7 @@ export class PiBackendAdapter implements BackendAdapter {
     }
   }
 
-  async clone(context: AdapterContext): Promise<NativeSessionBinding> {
+  async clone(context: AdapterContext, derivation: NativeSessionDerivation): Promise<NativeSessionBinding> {
     this.#assertReviewOperationAllowed(context, "clone native history");
     const runtime = this.#runtime(context);
     return this.#runExclusiveSessionMutation(runtime, context, async () => {
@@ -2568,6 +2586,7 @@ export class PiBackendAdapter implements BackendAdapter {
             recovery: "Inspect the detached clone runtime and retry from the unchanged source Session."
           });
         }
+        derivation.recordBinding(binding);
         if (
           this.#runtimes.get(runtime.key) !== runtime
           || runtime.transport.closed
@@ -2576,7 +2595,7 @@ export class PiBackendAdapter implements BackendAdapter {
         ) {
           throw piError("PI_SESSION_CLONE_SOURCE_FENCE_CHANGED", "The source Pi Session changed while its detached clone was being created", "session", {
             retryable: true,
-            stateMayHaveChanged: false,
+            stateMayHaveChanged: true,
             recovery: "Reload the source Session binding before retrying the clone."
           });
         }
@@ -2588,7 +2607,7 @@ export class PiBackendAdapter implements BackendAdapter {
         ) {
           throw piError("PI_SESSION_CLONE_SOURCE_IDENTITY_CHANGED", "Pi did not preserve the source native Session during detached clone", "session", {
             retryable: true,
-            stateMayHaveChanged: false,
+            stateMayHaveChanged: true,
             recovery: "Reload the source Session identity before retrying the clone."
           });
         }

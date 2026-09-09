@@ -6,6 +6,7 @@ export interface DiscoveredProviderModel {
 
 export interface ProviderModelDiscoverySpec {
   readonly baseUrl: string;
+  readonly modelsEndpoint?: string;
   readonly api?: string;
   readonly apiKey?: string;
   readonly headers?: Readonly<Record<string, string>>;
@@ -96,9 +97,12 @@ export async function fetchProviderModels(
   }
   let response: Response;
   try {
-    response = await fetchImpl(deriveProviderModelsUrl(baseUrl.toString()), {
+    const endpoint = spec.modelsEndpoint === undefined ? new URL(deriveProviderModelsUrl(baseUrl.toString())) : new URL(spec.modelsEndpoint);
+    if (endpoint.origin !== baseUrl.origin || endpoint.username !== "" || endpoint.password !== "" || endpoint.hash !== "" || endpoint.search !== "") throw new Error("Model catalog authority differs.");
+    response = await fetchImpl(endpoint.toString(), {
       method: "GET",
       headers,
+      redirect: "error",
       signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS)
     });
   } catch {
@@ -114,11 +118,8 @@ export async function fetchProviderModels(
   }
   let body: string;
   try {
-    body = await response.text();
+    body = await readBoundedResponse(response);
   } catch {
-    throw new ProviderModelDiscoveryError("invalid_response");
-  }
-  if (Buffer.byteLength(body, "utf8") > MAXIMUM_RESPONSE_BYTES) {
     throw new ProviderModelDiscoveryError("invalid_response");
   }
   let value: unknown;
@@ -130,6 +131,31 @@ export async function fetchProviderModels(
   const models = parseProviderModels(value);
   if (models.length === 0) throw new ProviderModelDiscoveryError("invalid_response");
   return models;
+}
+
+async function readBoundedResponse(response: Response): Promise<string> {
+  if (response.body === null) return "";
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let byteLength = 0;
+  let completed = false;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) {
+        completed = true;
+        return Buffer.concat(chunks, byteLength).toString("utf8");
+      }
+      byteLength += value.byteLength;
+      if (byteLength > MAXIMUM_RESPONSE_BYTES) {
+        throw new ProviderModelDiscoveryError("invalid_response");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    if (!completed) await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+  }
 }
 
 function discoveryHeaders(spec: ProviderModelDiscoverySpec): Record<string, string> {

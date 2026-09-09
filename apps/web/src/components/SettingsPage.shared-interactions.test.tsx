@@ -112,14 +112,14 @@ describe("shared settings interactions", () => {
     const container = await renderAppearance(controller, onSuccess);
     const language = required(container.querySelector<HTMLButtonElement>('[role="combobox"][aria-label="Language"]'));
 
-    await chooseOption(language, "简体中文");
+    await chooseOption(language, translate("en", "language.zh-CN"));
     expect(language.disabled).toBe(true);
     expect(language.getAttribute("aria-busy")).toBe("true");
     await act(async () => failed.reject(new Error("disk unavailable")));
     expect(language.disabled).toBe(false);
     expect(container.querySelector('[role="alert"]')?.textContent).toContain("Could not save the language setting.");
 
-    await chooseOption(language, "简体中文");
+    await chooseOption(language, translate("en", "language.zh-CN"));
     expect(onSuccess).toHaveBeenCalledWith("Language saved.");
     expect(controller.setLocale).toHaveBeenNthCalledWith(2, "zh-CN");
   });

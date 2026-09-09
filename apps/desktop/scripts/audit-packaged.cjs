@@ -53,6 +53,8 @@ module.exports = async function auditPackaged(context) {
   const {
     ORCHESTRATOR_BUNDLED_NPM_RUNTIME,
     ORCHESTRATOR_RUNTIME_PACKAGES,
+    auditClaudeSessionRuntimeAssets,
+    auditTerminalRuntimeAssets,
     sqliteVecElectronBuilderArchitecture,
     sqliteVecRuntimeTarget
   } = await import(
@@ -128,8 +130,10 @@ module.exports = async function auditPackaged(context) {
   }
   const npmRuntime = await auditBundledNpmRuntime(runtimeRoot, ORCHESTRATOR_BUNDLED_NPM_RUNTIME);
   const sqliteVec = await auditSqliteVecRuntime(runtimeRoot, sqliteVecTarget);
+  const terminal = await auditTerminalRuntimeAssets(runtimeRoot, context.electronPlatformName, targetArch);
+  const claudeSession = await auditClaudeSessionRuntimeAssets(runtimeRoot);
   process.stdout.write(
-    `JOKO_DESKTOP_ARTIFACT_AUDIT_OK appFiles=${applicationAudit.files} runtimeFiles=${runtimeAudit.files} runtimeBytes=${runtimeAudit.bytes} npm=${npmRuntime.version} sqliteVec=${sqliteVec.version} voiceShortcut=${nativeVoiceShortcut} target=${context.electronPlatformName}-${targetArch}\n`
+    `JOKO_DESKTOP_ARTIFACT_AUDIT_OK appFiles=${applicationAudit.files} runtimeFiles=${runtimeAudit.files} runtimeBytes=${runtimeAudit.bytes} npm=${npmRuntime.version} sqliteVec=${sqliteVec.version} terminal=${terminal.version} sessionSdk=${claudeSession.version} voiceShortcut=${nativeVoiceShortcut} target=${context.electronPlatformName}-${targetArch}\n`
   );
 };
 
@@ -406,6 +410,7 @@ function assertDistributionPath(path, options) {
   }
   const lowerBase = basename(normalized).toLowerCase();
   const extension = extname(lowerBase);
+  if (/\.test\.[^/]+$/u.test(lowerBase)) throw new Error(`Distribution contains a test file: ${normalized}`);
   if (FORBIDDEN_EXTENSIONS.has(extension) || lowerBase.endsWith(".db-shm") || lowerBase.endsWith(".db-wal")) {
     throw new Error(`Distribution contains a forbidden source or state file: ${normalized}`);
   }

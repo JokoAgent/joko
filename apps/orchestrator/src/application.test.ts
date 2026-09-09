@@ -44,30 +44,35 @@ describe("Orchestrator application composition", () => {
       { provider: { id: "managed-disabled" }, enabled: false, authenticationState: "authenticated" as const },
       { provider: { id: "managed-signed-out" }, enabled: true, authenticationState: "signed_out" as const },
       { provider: { id: "managed-route-disabled" }, enabled: true, authenticationState: "authenticated" as const }
-    ];
+    ].map((entry) => ({ ...entry, backendId: "managed" }));
+    managedCatalog.push({ backendId: "other", provider: { id: "foreign-only" }, enabled: true, authenticationState: "authenticated" });
     const managedBackend = availableBackendProviderIds({
+      id: "managed",
+      providers: [provider("native-authenticated", "authenticated"), provider("managed-disabled", "authenticated")],
       capabilities: new Map([["provider.managed_catalog", {
         key: "provider.managed_catalog",
         supported: true
       }]])
     }, managedCatalog, (providerId) => providerId !== "managed-route-disabled");
     const signedOutNativeBackend = availableBackendProviderIds({
+      id: "native",
       capabilities: new Map(),
       providers: [
         provider("shared-provider", "signed_out")
       ]
     }, managedCatalog);
     const authenticatedNativeBackend = availableBackendProviderIds({
+      id: "native",
       capabilities: new Map(),
       providers: [
         provider("shared-provider", "authenticated"),
         provider("local", "not_required"),
         provider("native-route-disabled", "authenticated")
       ]
-    }, [{ provider: { id: "shared-provider" }, enabled: false, authenticationState: "signed_out" }],
+    }, [{ backendId: "managed", provider: { id: "shared-provider" }, enabled: false, authenticationState: "signed_out" }],
     (providerId) => providerId !== "native-route-disabled");
 
-    expect(managedBackend).toEqual(new Set(["managed-authenticated", "managed-keyless"]));
+    expect(managedBackend).toEqual(new Set(["managed-authenticated", "managed-keyless", "native-authenticated"]));
     expect(signedOutNativeBackend).toEqual(new Set());
     expect(authenticatedNativeBackend).toEqual(new Set(["shared-provider", "local"]));
   });
@@ -78,8 +83,12 @@ describe("Orchestrator application composition", () => {
       kind?: "managed" | "api_key" | "oauth" | "subscription" | "local_keyless" | "custom_endpoint"
     ) =>
       providerUsageMoneyKind({
-        list: () => kind === undefined ? [] : [{ provider: { id: "provider" }, kind } as never]
+        list: backendId => {
+          expect(backendId).toBe("owned-backend");
+          return kind === undefined ? [] : [{ backendId, provider: { id: "provider" }, kind } as never];
+        }
       }, {
+        id: "owned-backend",
         capabilities: managedCatalog
           ? new Map([["provider.managed_catalog", { key: "provider.managed_catalog", supported: true }]])
           : new Map()
@@ -240,7 +249,7 @@ describe("Orchestrator application composition", () => {
     });
     const claudeCapabilities = application.store.getBackend("claude-code").descriptor.capabilities;
     expect(claudeCapabilities.get("workspace.extra_dirs")?.supported).toBe(true);
-    expect(claudeCapabilities.get("session.ai_rename")?.supported).toBe(false);
+    expect(claudeCapabilities.get("session.ai_rename")?.supported).toBe(true);
     expect(claudeCapabilities.get("tool.browser")?.supported).toBe(false);
     expect(claudeCapabilities.get("tool.computer")?.supported).toBe(false);
     expect(claudeCapabilities.get("tool.android")?.supported).toBe(false);

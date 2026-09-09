@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import type { OperationalStore } from "@joko/store";
 import type { ProviderModel } from "@joko/core";
-import type { PiSupportedApi } from "@joko/adapter-pi";
+import { createPiModelCatalogAdditions, type PiSupportedApi } from "@joko/adapter-pi";
 
 import {
   ProviderAuthUnsupportedError,
@@ -83,6 +83,7 @@ export interface PiNativeOAuthProvider {
     readonly name?: string;
     readonly api?: string;
     readonly provider?: string;
+    readonly baseUrl?: string;
     readonly reasoning?: boolean;
     readonly input?: readonly string[];
     readonly thinkingLevelMap?: Readonly<Record<string, string | null>>;
@@ -259,6 +260,9 @@ export class PiProviderAuthSupervisor implements ProviderNativeAuthSupervisor {
   private constructor(options: PiProviderAuthSupervisorOptions) {
     this.#store = options.store;
     this.#backendId = options.backendId;
+    if (options.backendId !== options.providers.nativeAuthenticationBackendId) {
+      throw new Error("The native authentication supervisor belongs to a different Backend.");
+    }
     this.#providers = options.providers;
     this.#refreshPiGeneration = options.refreshPiGeneration;
     this.#now = options.now ?? Date.now;
@@ -284,7 +288,7 @@ export class PiProviderAuthSupervisor implements ProviderNativeAuthSupervisor {
   canHandle(providerId: string): boolean {
     if (this.#closed || this.#runtime === undefined) return false;
     try {
-      const managed = this.#providers.get(providerId);
+      const managed = this.#providers.get(this.#backendId, providerId);
       const provider = this.#runtime.getProvider(providerId);
       if (managed.kind === "api_key") return provider?.auth.apiKey !== undefined;
       if (managed.kind !== "oauth" && managed.kind !== "subscription") return false;
@@ -301,7 +305,7 @@ export class PiProviderAuthSupervisor implements ProviderNativeAuthSupervisor {
 
   supportsModelRefresh(providerId: string): boolean {
     if (this.#closed || this.#runtime === undefined) return false;
-    if (this.#providers.canDiscoverProviderModels(providerId)) return true;
+    if (this.#providers.canDiscoverProviderModels(this.#backendId, providerId)) return true;
     return this.#supportsAutomaticModelRefresh(providerId);
   }
 
@@ -311,10 +315,10 @@ export class PiProviderAuthSupervisor implements ProviderNativeAuthSupervisor {
   }): Promise<ProviderModelCatalogRefreshResult> {
     this.#assertDataPlaneOpen();
     const selected = input.providerId === undefined
-      ? this.#providers.list().filter((provider) => input.automatic
+      ? this.#providers.list(this.#backendId).filter((provider) => input.automatic
         ? this.#supportsAutomaticModelRefresh(provider.provider.id)
         : this.supportsModelRefresh(provider.provider.id))
-      : [this.#providers.get(input.providerId)];
+      : [this.#providers.get(this.#backendId, input.providerId)];
     if (input.providerId !== undefined && !this.supportsModelRefresh(input.providerId)) {
       throw new Error("This Provider does not expose model catalog refresh.");
     }
@@ -956,8 +960,8 @@ export class PiProviderAuthSupervisor implements ProviderNativeAuthSupervisor {
     this.#modelRefreshAttempts.set(providerId, now);
     const operation = (async (): Promise<{ readonly added: number; readonly activate: boolean }> => {
       try {
-        if (this.#providers.canDiscoverProviderModels(providerId)) {
-          const result = await this.#providers.discoverProviderModels(providerId);
+        if (this.#providers.canDiscoverProviderModels(this.#backendId, providerId)) {
+          const result = await this.#providers.discoverProviderModels(this.#backendId, providerId);
           this.#modelRefreshFailures.delete(providerId);
           return { added: result.addedModelIds.length, activate: result.addedModelIds.length > 0 };
         }
@@ -1008,12 +1012,18 @@ export class PiProviderAuthSupervisor implements ProviderNativeAuthSupervisor {
 
 async function createNativePiRuntime(credentials: PiCredentialStore): Promise<PiProviderAuthRuntime> {
   const { ModelRuntime } = await import("@earendil-works/pi-coding-agent");
-  return await ModelRuntime.create({
+  const runtime = await ModelRuntime.create({
     credentials,
     modelsPath: null,
     allowModelNetwork: false,
     refreshOnCreate: false
-  }) as unknown as PiProviderAuthRuntime;
+  });
+  const additions = createPiModelCatalogAdditions();
+  for (const provider of runtime.getProviders()) {
+    const extended = additions.extendProvider(provider);
+    if (extended !== provider) runtime.registerNativeProvider(extended);
+  }
+  return runtime as unknown as PiProviderAuthRuntime;
 }
 
 function nativeProviderRegistrations(runtime: PiProviderAuthRuntime): readonly NativeProviderAuthRegistration[] {
@@ -1070,6 +1080,7 @@ function commonNativeProviderApi(models: ReturnType<PiNativeOAuthProvider["getMo
 }
 
 function nativeModelCatalog(runtime: PiProviderAuthRuntime): readonly ProviderModel[] {
+  const additions = createPiModelCatalogAdditions();
   const models: ProviderModel[] = [];
   const seen = new Set<string>();
   for (const provider of runtime.getProviders()) {
@@ -1095,6 +1106,7 @@ function nativeModelCatalog(runtime: PiProviderAuthRuntime): readonly ProviderMo
         cacheRead: nonNegativeNativeModelNumber(model.cost?.cacheRead ?? 0, "cache-read cost"),
         cacheWrite: nonNegativeNativeModelNumber(model.cost?.cacheWrite ?? 0, "cache-write cost")
       };
+      const pricing = additions.referencePricing(model);
       models.push({
         providerId,
         modelId,
@@ -1106,9 +1118,10 @@ function nativeModelCatalog(runtime: PiProviderAuthRuntime): readonly ProviderMo
         // This is authoritative installed Pi registry metadata, not an
         // endpoint heuristic. Pi's openai-codex-responses implementation
         // exposes serviceTier and maps it to the Provider request payload.
-        supportsFastMode: api === "openai-codex-responses",
+        supportsFastMode: api === "openai-codex-responses" || pricing?.fastModeMultiplier !== undefined,
         thinkingLevels: nativeThinkingLevels(model.reasoning === true, model.thinkingLevelMap),
-        cost
+        cost,
+        ...(pricing === undefined ? {} : { pricing })
       });
     }
   }

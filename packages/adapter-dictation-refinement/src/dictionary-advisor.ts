@@ -60,6 +60,15 @@ export interface ManagedDictionaryAdvisorOptions {
   }) => Promise<string>;
 }
 
+export class DictationDictionaryResponseError extends Error {
+  readonly code = "invalid_response";
+
+  constructor() {
+    super("The dictionary model returned an invalid response.");
+    this.name = "DictationDictionaryResponseError";
+  }
+}
+
 const MAXIMUM_TEXT_CHARACTERS = 2_000;
 const MAXIMUM_CONTEXT_ITEMS = 80;
 const MAXIMUM_ALIASES_PER_TERM = 5;
@@ -139,8 +148,8 @@ function parseActions(
 ): readonly DictationDictionaryLearningAction[] {
   let value: unknown;
   try { value = JSON.parse(output); }
-  catch { return []; }
-  if (!isRecord(value) || !Array.isArray(value["actions"])) return [];
+  catch { throw new DictationDictionaryResponseError(); }
+  if (!isRecord(value) || !Array.isArray(value["actions"])) throw new DictationDictionaryResponseError();
   const beforeEvidence = `${input.beforeText}\n${input.rawTranscriptText ?? ""}`;
   const seen = new Set<string>();
   const actions: DictationDictionaryLearningAction[] = [];

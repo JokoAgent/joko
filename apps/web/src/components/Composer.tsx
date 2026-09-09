@@ -1,5 +1,5 @@
 import type { DragEvent, JSX, ReactNode } from "react";
-import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { JSONContent } from "@tiptap/core";
 import {
   AlertTriangle,
@@ -10,7 +10,6 @@ import {
   GripVertical,
   Image as ImageIcon,
   MessageSquarePlus,
-  Mic,
   Paperclip,
   Pause,
   Pencil,
@@ -23,7 +22,8 @@ import {
 } from "lucide-react";
 import type { AppController } from "../controller.js";
 import type { ComposerSendShortcutPreference } from "../local-state.js";
-import { isConversationModel } from "../model-capabilities.js";
+import { modelSourceAccess } from "../model-source-access.js";
+import { ModelSourceNotice } from "./ModelSourceNotice.js";
 import type { AttachmentDraft, BackendView, BrowserCommentDraftItem, ComposerDraft, ComposerMentionDraft, ComposerMessageMentionDraft, ComposerSelectionQuoteDraft, DeliveryMode, ExtraDirectoryView, QueueControlView, QueueItemView, ResourceView, RuntimeCommandView, SessionView, UsageTokensView, WorkspaceView } from "../model.js";
 import { browserCommentPreviewTag, removeBrowserCommentAndRepairChains } from "../browser-comment-draft.js";
 import { appendQuoteToComposerDocument, appendTextToComposerDocument, composerDocumentIsEmpty, composerDocumentKeepingQuotes, composerDocumentPlainText, composerDocumentQuotes, emptyComposerDocument, joinComposerDocuments, normalizeComposerDocument, plainTextToComposerDocument } from "../composer-quote-document.js";
@@ -50,14 +50,13 @@ import { shouldAutoFocusComposer } from "./composer-auto-focus.js";
 import { isPromptRecommendationAcceptKey, PromptRecommendationEditorFrame, shouldShowPromptRecommendation } from "./PromptRecommendationOverlay.js";
 import type { RunAction, Translator } from "./types.js";
 import { Button, IconButton, Modal, Pill, SegmentedControl, cx, CheckboxControl, SelectControl, formatBytes } from "./ui.js";
-import { supportsVoiceMediaCapture, VoiceInputMediaSession, type VoiceMediaError, type VoiceMediaSessionUpdate } from "../voice-input-media.js";
-import { matchesVoiceInputShortcut, readVoiceInputPreferences, releasesVoiceInputShortcut, subscribeVoiceInputPreferences, voiceInputLocale, writeVoiceInputPreferences } from "../voice-input-preferences.js";
+import { useDraftVoiceInput } from "./use-draft-voice-input.js";
+import { useHeldVoiceInput } from "./use-held-voice-input.js";
+import { VoiceInputButton } from "./VoiceInputButton.js";
 import { VoiceInputOverlay } from "./VoiceInputOverlay.js";
-import { applyVoiceDraftResult, createVoiceDraftFence, type VoiceDraftFence } from "./voice-draft-fence.js";
-import { recordVoiceInputSession } from "../voice-input-history.js";
-import { VoiceInputMicrophonePrewarmer } from "../voice-input-prewarm.js";
-import { applyVoiceDictionaryAdvice, voiceDictionaryAdviceDraft } from "../voice-input-dictionary.js";
-import { createVoiceInsertedEditTracker, inspectVoiceInsertedEdit, type VoiceInsertedEditTracker } from "./voice-inserted-edit.js";
+import { applyVoiceDraftResult, createVoiceDraftFence } from "./voice-draft-fence.js";
+import { createVoiceInsertedEditTracker } from "./voice-inserted-edit.js";
+import { useVoiceDictionaryLearning } from "./use-voice-dictionary-learning.js";
 
 export interface ComposerHistoryEntry {
   readonly text: string;
@@ -72,15 +71,7 @@ interface ComposerWorkspaceMentionIndex {
   readonly error?: string;
 }
 
-interface PendingVoiceDictionaryEdit {
-  readonly tracker: VoiceInsertedEditTracker;
-  readonly generation: number;
-  timer?: number;
-  request?: AbortController;
-  evidenceKey?: string;
-}
-
-export function Composer({ controller, session, backend, sessionUsage, readOnly = false, autoFocus = true, focusRequest = 0, queue, queueControl, workspace, extraDirectories, resources, commands, messageHistory, controls, runningStatus, messageMentionInsertion, selectionQuoteInsertion, attachmentInsertion, draftReplacement, t, runAction, onLocalSend, onStop, stopInFlight = false, onCompact }: {
+export function Composer({ controller, session, backend, sessionUsage, readOnly = false, autoFocus = true, focusRequest = 0, queue, queueControl, workspace, extraDirectories, resources, commands, messageHistory, controls, runningStatus, messageMentionInsertion, selectionQuoteInsertion, attachmentInsertion, draftReplacement, t, runAction, onLocalSend, onDraftMutation, onStop, stopInFlight = false, onCompact }: {
   readonly controller: AppController;
   readonly session: SessionView;
   readonly backend?: BackendView;
@@ -106,6 +97,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   readonly t: Translator;
   readonly runAction: RunAction;
   readonly onLocalSend: (sessionId: string) => void;
+  readonly onDraftMutation?: () => void;
   readonly onStop?: () => void;
   readonly stopInFlight?: boolean;
   readonly onCompact?: () => void;
@@ -132,14 +124,17 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   const [bashExcluded, setBashExcluded] = useState(false);
   const [submissionKind, setSubmissionKind] = useState<ComposerSubmissionKind>();
   const [historyIndex, setHistoryIndex] = useState(-1);
-  const [voiceSupport, setVoiceSupport] = useState<"loading" | "supported" | "unavailable">("loading");
-  const [voiceUpdate, setVoiceUpdate] = useState<VoiceMediaSessionUpdate>();
-  const [voicePreferences, setVoicePreferences] = useState(readVoiceInputPreferences);
+
   const [pastedTextTarget, setPastedTextTarget] = useState<ComposerPastedTextDialogTarget>();
   const [commandHelpOpen, setCommandHelpOpen] = useState(false);
   const richEditorRef = useRef<ComposerRichTextEditorHandle>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const composerStackRef = useRef<HTMLDivElement>(null);
+  const [voiceRoot, setVoiceRoot] = useState<HTMLDivElement>();
+  const bindComposer = useCallback((node: HTMLDivElement | null) => { composerStackRef.current = node; setVoiceRoot(node ?? undefined); }, []);
+  const [voiceSendTarget, setVoiceSendTarget] = useState<HTMLButtonElement>();
+  const bindVoiceSend = useCallback((node: HTMLButtonElement | null) => setVoiceSendTarget(node ?? undefined), []);
+  const voiceCaretRef = useRef<number | undefined>(undefined);
   const focusAnchorRef = useRef<Element | null>(null);
   const controllerRef = useRef(controller);
   controllerRef.current = controller;
@@ -149,8 +144,14 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   browserCommentsRef.current = browserComments;
   const mentionsRef = useRef(mentions);
   mentionsRef.current = mentions;
-  const operationGuardRef = useRef(new ComposerOperationGuard());
+  const operationGuard = useMemo(() => new ComposerOperationGuard(), [controller.getArtifactUrl, session.generation]);
+  const operationGuardRef = useRef(operationGuard);
+  operationGuardRef.current = operationGuard;
   operationGuardRef.current.activate(session.id);
+  const markDraftEdited = (sessionId: string): void => {
+    operationGuardRef.current.markDraftEdited(sessionId);
+    onDraftMutation?.();
+  };
   const draftSaveChainRef = useRef<Promise<void>>(Promise.resolve());
   const typedPaletteTriggerRef = useRef<"/" | "@" | undefined>(undefined);
   const textRef = useRef(text);
@@ -158,13 +159,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   const editorDocumentRef = useRef(editorDocument);
   editorDocumentRef.current = editorDocument;
   const editorRevisionRef = useRef(0);
-  const voiceSessionRef = useRef<VoiceInputMediaSession | undefined>(undefined);
-  const voicePrewarmerRef = useRef<VoiceInputMicrophonePrewarmer | undefined>(undefined);
-  const voiceShortcutHeldRef = useRef(false);
-  const voiceFenceRef = useRef<VoiceDraftFence | undefined>(undefined);
-  const appliedVoiceResultRef = useRef<string | undefined>(undefined);
-  const voiceDictionaryEditRef = useRef<PendingVoiceDictionaryEdit | undefined>(undefined);
-  const voiceDictionaryEditGenerationRef = useRef(0);
+
   const inlineMentionRangesRef = useRef(inlineMentionRanges);
   inlineMentionRangesRef.current = inlineMentionRanges;
   const inlineMentionActivationRef = useRef(inlineMentionActivation);
@@ -219,8 +214,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     return () => requestController.abort();
   }, [t, workspace?.id, workspace?.revision, workspaceMentionReload]);
 
-  const modelRouteUnavailable = session.model !== undefined
-    && (!isConversationModel(session.model) || !session.model.available || session.model.routingEnabled === false);
+  const modelRouteUnavailable = !modelSourceAccess(backend, session.model, session.model, controller.state.snapshot.providers).available;
   const supportedModes = useMemo(
     () => modelRouteUnavailable ? [] : deliveryModesFor(session, backend),
     [backend, modelRouteUnavailable, session]
@@ -251,11 +245,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   const turnRunning = session.state === "running" || session.state === "waiting" || session.state === "retrying";
   const stopCapability = session.state === "retrying" ? "context.auto_retry" : "turn.abort";
   const canStop = turnRunning && session.activeRunId !== undefined && backend?.capabilities.get(stopCapability)?.supported === true && onStop !== undefined;
-  const voiceActive = voiceUpdate?.state === "starting" || voiceUpdate?.state === "listening" || voiceUpdate?.state === "submitting";
-  const desktopGlobalVoiceShortcut = typeof window !== "undefined"
-    && window.jokoDesktop?.capabilities.includes("voice.globalDictation") === true;
-  const composerLocked = readOnly || submissionKind !== undefined || voiceActive;
-  const composerEditorLocked = readOnly || (submissionKind !== undefined && submissionKind !== "send") || voiceActive;
+
   const sendShortcut = controller.state.preferences.composerSendShortcut;
   const composerPlatform = currentComposerPlatform();
 
@@ -284,307 +274,103 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     closePalette(restoreFocus);
   };
 
-  useEffect(() => subscribeVoiceInputPreferences(setVoicePreferences), []);
-
-  useEffect(() => {
-    if (
-      readOnly
-      || voiceSupport !== "supported"
-      || !voicePreferences.fastActivationEnabled
-      || typeof navigator === "undefined"
-      || navigator.mediaDevices?.getUserMedia === undefined
-    ) {
-      voicePrewarmerRef.current?.release();
-      voicePrewarmerRef.current = undefined;
-      return;
-    }
-    const prewarmer = new VoiceInputMicrophonePrewarmer(navigator.mediaDevices);
-    voicePrewarmerRef.current = prewarmer;
-    const warm = (): void => { void prewarmer.warm(voicePreferences.deviceId); };
-    warm();
-    const releaseForHost = (): void => prewarmer.release();
-    const visibilityChanged = (): void => {
-      if (document.visibilityState === "visible") warm();
-      else prewarmer.release();
-    };
-    const microphoneRelease = window.jokoDesktop?.microphone?.onRelease(releaseForHost);
-    window.addEventListener("focus", warm);
-    document.addEventListener("visibilitychange", visibilityChanged);
-    return () => {
-      microphoneRelease?.();
-      window.removeEventListener("focus", warm);
-      document.removeEventListener("visibilitychange", visibilityChanged);
-      prewarmer.release();
-      if (voicePrewarmerRef.current === prewarmer) voicePrewarmerRef.current = undefined;
-    };
-  }, [readOnly, voicePreferences.deviceId, voicePreferences.fastActivationEnabled, voiceSupport]);
-
-  useEffect(() => {
-    if (readOnly || typeof navigator === "undefined" || navigator.mediaDevices?.getUserMedia === undefined || typeof MediaRecorder === "undefined") {
-      setVoiceSupport("unavailable");
-      return;
-    }
-    const request = new AbortController();
-    setVoiceSupport("loading");
-    void controllerRef.current.getVoiceInputCapabilities(request.signal).then((capability) => {
-      if (!request.signal.aborted) setVoiceSupport(supportsVoiceMediaCapture(capability, globalThis.MediaRecorder) ? "supported" : "unavailable");
-    }).catch(() => {
-      if (!request.signal.aborted) setVoiceSupport("unavailable");
-    });
-    return () => request.abort();
-  }, [readOnly, session.id]);
-
-  useEffect(() => () => {
-    const active = voiceSessionRef.current;
-    voiceSessionRef.current = undefined;
-    void active?.dispose();
-    const dictionaryEdit = voiceDictionaryEditRef.current;
-    if (dictionaryEdit?.timer !== undefined) window.clearTimeout(dictionaryEdit.timer);
-    dictionaryEdit?.request?.abort();
-    voiceDictionaryEditRef.current = undefined;
-  }, []);
-
-  const clearVoiceDictionaryEdit = (): void => {
-    const current = voiceDictionaryEditRef.current;
-    if (current?.timer !== undefined) window.clearTimeout(current.timer);
-    current?.request?.abort();
-    voiceDictionaryEditRef.current = undefined;
-  };
-
-  const observeVoiceDictionaryEdit = (nextText: string, isComposing: boolean): void => {
-    const current = voiceDictionaryEditRef.current;
-    if (current === undefined || isComposing) return;
-    if (
-      current.tracker.sessionId !== session.id
-      || !voicePreferences.autoDictionaryEnabled
-      || !controller.state.snapshot.settings.voiceInput.refinementEnabled
-    ) {
-      clearVoiceDictionaryEdit();
-      return;
-    }
-    const inspection = inspectVoiceInsertedEdit(current.tracker, nextText);
-    if (!inspection.edited) {
-      if (current.timer !== undefined) window.clearTimeout(current.timer);
-      current.timer = undefined;
-      current.evidenceKey = undefined;
-      current.request?.abort();
-      current.request = undefined;
-      return;
-    }
-    const evidenceKey = JSON.stringify(inspection);
-    if (current.evidenceKey === evidenceKey && (current.timer !== undefined || current.request !== undefined)) return;
-    if (current.timer !== undefined) window.clearTimeout(current.timer);
-    current.request?.abort();
-    current.request = undefined;
-    current.evidenceKey = evidenceKey;
-    const generation = current.generation;
-    current.timer = window.setTimeout(() => {
-      const pending = voiceDictionaryEditRef.current;
-      if (pending === undefined || pending.generation !== generation || pending.evidenceKey !== evidenceKey) return;
-      pending.timer = undefined;
-      const preferences = readVoiceInputPreferences();
-      if (!preferences.autoDictionaryEnabled) {
-        voiceDictionaryEditRef.current = undefined;
-        return;
-      }
-      const request = new AbortController();
-      pending.request = request;
-      const locale = voiceInputLocale(preferences);
-      void controllerRef.current.adviseVoiceInputDictionaryEdit(voiceDictionaryAdviceDraft(preferences.dictionary, {
-        beforeText: inspection.beforeText,
-        afterText: inspection.afterText,
-        ...(inspection.rawTranscriptText === undefined ? {} : { rawTranscriptText: inspection.rawTranscriptText }),
-        ...(locale === undefined ? {} : { locale })
-      }), request.signal).then((advice) => {
-        const active = voiceDictionaryEditRef.current;
-        if (request.signal.aborted || active?.generation !== generation || active.evidenceKey !== evidenceKey) return;
-        const latest = readVoiceInputPreferences();
-        if (!latest.autoDictionaryEnabled) return;
-        const dictionary = applyVoiceDictionaryAdvice(latest.dictionary, advice.actions);
-        if (dictionary !== latest.dictionary) writeVoiceInputPreferences({ dictionary });
-      }).catch(() => undefined).finally(() => {
-        const active = voiceDictionaryEditRef.current;
-        if (active?.generation === generation && active.evidenceKey === evidenceKey) {
-          voiceDictionaryEditRef.current = undefined;
-        }
-      });
-    }, 1_200);
-  };
-
-  const applyVoiceTranscript = (voiceSession: NonNullable<VoiceMediaSessionUpdate["session"]>): boolean => {
-    const result = voiceSession?.result;
-    const fence = voiceFenceRef.current;
-    if (result === undefined || fence === undefined || appliedVoiceResultRef.current === voiceSession.id) return false;
-    appliedVoiceResultRef.current = voiceSession.id;
-    const applied = applyVoiceDraftResult({
-      fence,
-      sessionId: session.id,
-      revision: editorRevisionRef.current,
-      document: editorDocumentRef.current,
-      text: textRef.current,
-      transcript: result.text
-    });
-    if (!applied.applied) {
-      if (applied.reason !== "empty") setAttachmentError(t("voice.errors.draftChanged"));
-      return false;
-    }
-    operationGuardRef.current.markDraftEdited(session.id);
-    editorRevisionRef.current += 1;
-    const nextRanges = remapComposerInlineMentionRanges(textRef.current, applied.text, inlineMentionRangesRef.current);
-    editorDocumentRef.current = applied.document;
-    setEditorDocument(applied.document);
-    textRef.current = applied.text;
-    setText(applied.text);
-    replaceInlineMentionRanges(nextRanges);
-    setMentions((current) => composerMentionsFromRanges(current, nextRanges));
-    if (voicePreferences.autoDictionaryEnabled && controller.state.snapshot.settings.voiceInput.refinementEnabled) {
-      voiceDictionaryEditRef.current = {
-        tracker: createVoiceInsertedEditTracker({
-          fence,
-          insertedText: result.text,
-          ...(result.rawTranscriptText === undefined ? {} : { rawTranscriptText: result.rawTranscriptText })
-        }),
-        generation: ++voiceDictionaryEditGenerationRef.current
-      };
-    } else {
-      clearVoiceDictionaryEdit();
-    }
-    resetHistoryNavigation();
-    requestAnimationFrame(() => {
+  const voiceDictionaryOwnerKey = JSON.stringify([controller.state.activeProfile?.serverId, controller.state.activeProfile?.id, session.id, String(session.generation)]);
+  const voiceDictionaryLearning = useVoiceDictionaryLearning({
+    controller, ownerKey: voiceDictionaryOwnerKey,
+    enabled: !readOnly && controller.state.snapshot.settings.voiceInput.refinementEnabled
+  });
+  const clearVoiceDictionaryEdit = voiceDictionaryLearning.clear;
+  const observeVoiceDictionaryEdit = voiceDictionaryLearning.observe;
+  const voice = useDraftVoiceInput({
+    controller, ownerKey: voiceDictionaryOwnerKey, root: voiceRoot,
+    enabled: !readOnly && !effectiveBashMode && submissionKind === undefined && hydratedSession === session.id, t,
+    focus: () => {
       richEditorRef.current?.focus();
-      const root = composerStackRef.current?.querySelector<HTMLElement>(".composer-rich-editor__content") ?? null;
-      setComposerCaretTextOffset(root, window.getSelection(), applied.caret);
-    });
-    return true;
-  };
-
-  const acceptVoiceUpdate = (update: VoiceMediaSessionUpdate): void => {
-    setVoiceUpdate(update);
-    if ((update.state === "done" || update.state === "error") && update.session?.outcome !== undefined) {
-      recordVoiceInputSession(update.session);
-    }
-    if (update.state === "done" && update.session !== undefined) applyVoiceTranscript(update.session);
-  };
-
-  const startVoiceInput = (): void => {
-    if (voiceSupport !== "supported" || composerLocked || hydratedSession !== session.id) return;
-    clearVoiceDictionaryEdit();
-    const root = composerStackRef.current?.querySelector<HTMLElement>(".composer-rich-editor__content") ?? null;
-    voiceFenceRef.current = createVoiceDraftFence({
-      sessionId: session.id,
-      revision: editorRevisionRef.current,
-      text: textRef.current,
-      selection: composerSelectionTextRange(root, window.getSelection())
-    });
-    appliedVoiceResultRef.current = undefined;
-    setAttachmentError(undefined);
-    closePalette();
-    const active = voiceSessionRef.current;
-    voiceSessionRef.current = undefined;
-    void active?.cancel();
-    let media: VoiceInputMediaSession;
-    try {
-      const locale = voiceInputLocale(voicePreferences);
-      media = new VoiceInputMediaSession({
-        api: controllerRef.current,
-        preferences: {
-          ...(locale === undefined ? {} : { locale }),
-          ...(voicePreferences.deviceId === undefined ? {} : { deviceId: voicePreferences.deviceId }),
-          ...(voicePreferences.refinementInstructions === ""
-            ? {}
-            : { refinementInstructions: voicePreferences.refinementInstructions }),
-          dictionaryTerms: voicePreferences.dictionaryTerms,
-          playInteractionSound: voicePreferences.playInteractionSound
-        },
-        prewarmedStream: voicePrewarmerRef.current?.checkout(),
-        onUpdate: acceptVoiceUpdate
+      const root = voiceRoot?.querySelector<HTMLElement>(".composer-rich-editor__content") ?? null;
+      if (voiceCaretRef.current !== undefined) setComposerCaretTextOffset(root, root?.ownerDocument.getSelection() ?? null, voiceCaretRef.current);
+    },
+    capture: () => {
+      clearVoiceDictionaryEdit(); closePalette(); setAttachmentError(undefined);
+      const root = voiceRoot?.querySelector<HTMLElement>(".composer-rich-editor__content") ?? null;
+      const fence = createVoiceDraftFence({
+        sessionId: session.id, revision: editorRevisionRef.current, text: textRef.current,
+        selection: composerSelectionTextRange(root, root?.ownerDocument.getSelection() ?? null)
       });
-    } catch (error) {
-      const failure = error as VoiceMediaError;
-      setVoiceUpdate({ state: "error", error: failure });
-      return;
+      return (transcript, rawTranscriptText) => {
+        const applied = applyVoiceDraftResult({ fence, sessionId: session.id, revision: editorRevisionRef.current,
+          document: editorDocumentRef.current, text: textRef.current, transcript });
+        if (!applied.applied) return undefined;
+        markDraftEdited(session.id); editorRevisionRef.current += 1;
+        const ranges = remapComposerInlineMentionRanges(textRef.current, applied.text, inlineMentionRangesRef.current);
+        editorDocumentRef.current = applied.document; textRef.current = applied.text;
+        setEditorDocument(applied.document); setText(applied.text); replaceInlineMentionRanges(ranges);
+        const nextMentions = composerMentionsFromRanges(mentionsRef.current, ranges);
+        mentionsRef.current = nextMentions; setMentions(nextMentions);
+        voiceCaretRef.current = applied.caret;
+        voiceDictionaryLearning.track(createVoiceInsertedEditTracker({ fence, insertedText: transcript,
+          ...(rawTranscriptText === undefined ? {} : { rawTranscriptText }) }), voiceDictionaryOwnerKey);
+        resetHistoryNavigation();
+        return applied;
+      };
     }
-    voiceSessionRef.current = media;
-    void media.start().catch(() => undefined);
+  });
+  const voiceUpdate = voice.update;
+  const voiceActive = voice.active;
+  const composerLocked = readOnly || submissionKind !== undefined || voiceActive;
+  const composerEditorLocked = readOnly || (submissionKind !== undefined && submissionKind !== "send") || voiceActive;
+  const cancelVoiceInput = voice.cancel;
+  const stopVoiceInput = (): void => { void voice.finish(); };
+  const retryVoiceInput = (): void => { voice.start(); };
+  const useRetainedVoiceTranscript = voice.useTranscript;
+  const sendRouteKey = JSON.stringify([session.backendId, session.targetId, session.model?.providerId, session.model?.modelId]);
+  const sendOwner = useMemo(() => ({}), [voiceDictionaryOwnerKey, controller.getArtifactUrl, controller.state.snapshot.generation, sendRouteKey]);
+  const sendEpochRef = useRef<object | undefined>(undefined);
+  useLayoutEffect(() => {
+    const ownerWindow = voiceRoot?.ownerDocument.defaultView;
+    const activate = (): void => { sendEpochRef.current = {}; };
+    const retire = (): void => { sendEpochRef.current = undefined; };
+    activate();
+    ownerWindow?.addEventListener("pagehide", retire); ownerWindow?.addEventListener("pageshow", activate);
+    return () => { retire(); ownerWindow?.removeEventListener("pagehide", retire); ownerWindow?.removeEventListener("pageshow", activate); };
+  }, [voiceDictionaryOwnerKey, controller.getArtifactUrl, voiceRoot]);
+  const sendStateRef = useRef({ owner: sendOwner, readOnly, connected: controller.state.connectionState === "connected", supportedModes, attachmentPolicy, route: sendRouteKey });
+  sendStateRef.current = { owner: sendOwner, readOnly, connected: controller.state.connectionState === "connected", supportedModes, attachmentPolicy, route: sendRouteKey };
+  const voiceSendFlight = useRef<object | undefined>(undefined);
+  const sendDraftRef = useRef<(mode?: DeliveryMode, completedDocument?: JSONContent) => void>(() => undefined);
+  const canFinishVoiceSend = !readOnly && controller.state.connectionState === "connected" && submissionKind === undefined && !effectiveBashMode && !modelRouteUnavailable && supportedModes.includes(deliveryMode)
+    && attachmentsAllowed([...attachments, ...browserComments.map(item => item.screenshot)], attachmentPolicy);
+  const finishVoiceAndSend = (event?: KeyboardEvent): void => {
+    if (!canFinishVoiceSend || voiceSendFlight.current !== undefined) return;
+    const intent = event === undefined ? null : resolveComposerEnterIntent({ key: event.key, shiftKey: event.shiftKey, ctrlKey: event.ctrlKey, metaKey: event.metaKey, altKey: event.altKey, isComposing: event.isComposing, repeat: event.repeat }, sendShortcut, { platform: composerPlatform, turnRunning });
+    const mode = intent === "steer" ? "steer" : intent === "queue" ? queueDeliveryMode(turnRunning, supportedModes) : deliveryMode;
+    const flight = {}; voiceSendFlight.current = flight;
+    const owner = sendOwner; const route = sendRouteKey;
+    void voice.finish().then((result) => {
+      if (voiceSendFlight.current !== flight || result.kind !== "applied" || !result.isCurrent() || sendStateRef.current.owner !== owner || sendStateRef.current.route !== route) return;
+      clearVoiceDictionaryEdit();
+      sendDraftRef.current(mode, result.value.document);
+    }).finally(() => { if (voiceSendFlight.current === flight) voiceSendFlight.current = undefined; });
   };
-
-  const stopVoiceInput = (): void => {
-    void voiceSessionRef.current?.stop().catch(() => undefined);
-  };
-
-  const cancelVoiceInput = (): void => {
-    const active = voiceSessionRef.current;
-    voiceSessionRef.current = undefined;
-    voiceFenceRef.current = undefined;
-    appliedVoiceResultRef.current = undefined;
-    setVoiceUpdate(undefined);
-    setPastedTextTarget(undefined);
-    void active?.cancel().finally(() => requestAnimationFrame(() => richEditorRef.current?.focus()));
-  };
-
-  const retryVoiceInput = (): void => {
-    const active = voiceSessionRef.current;
-    voiceSessionRef.current = undefined;
-    voiceFenceRef.current = undefined;
-    setVoiceUpdate(undefined);
-    void (active?.cancel() ?? Promise.resolve()).finally(startVoiceInput);
-  };
-
-  const useRetainedVoiceTranscript = (): void => {
-    const retained = voiceUpdate?.session;
-    if (retained === undefined || retained.result === undefined || !applyVoiceTranscript(retained)) return;
-    const active = voiceSessionRef.current;
-    voiceSessionRef.current = undefined;
-    voiceFenceRef.current = undefined;
-    setVoiceUpdate(undefined);
-    void active?.cancel();
-  };
-
-  useEffect(() => {
-    if (voiceSupport !== "supported" || readOnly || desktopGlobalVoiceShortcut) return;
-    const platform = typeof navigator === "undefined" ? "" : navigator.platform;
-    const onVoiceShortcutDown = (event: KeyboardEvent): void => {
-      if (event.isComposing || !matchesVoiceInputShortcut(event, voicePreferences.shortcut)) return;
-      event.preventDefault();
-      event.stopImmediatePropagation();
-      if (event.repeat || voiceShortcutHeldRef.current || voiceActive) return;
-      voiceShortcutHeldRef.current = true;
-      startVoiceInput();
-    };
-    const onVoiceShortcutUp = (event: KeyboardEvent): void => {
-      if (!voiceShortcutHeldRef.current || !releasesVoiceInputShortcut(event, voicePreferences.shortcut, platform)) return;
-      event.preventDefault();
-      event.stopImmediatePropagation();
-      voiceShortcutHeldRef.current = false;
-      stopVoiceInput();
-    };
-    const onWindowBlur = (): void => {
-      if (!voiceShortcutHeldRef.current) return;
-      voiceShortcutHeldRef.current = false;
-      stopVoiceInput();
-    };
-    window.addEventListener("keydown", onVoiceShortcutDown, true);
-    window.addEventListener("keyup", onVoiceShortcutUp, true);
-    window.addEventListener("blur", onWindowBlur);
-    return () => {
-      window.removeEventListener("keydown", onVoiceShortcutDown, true);
-      window.removeEventListener("keyup", onVoiceShortcutUp, true);
-      window.removeEventListener("blur", onWindowBlur);
-    };
-  }, [desktopGlobalVoiceShortcut, readOnly, voiceActive, voicePreferences, voiceSupport, voiceUpdate?.state, hydratedSession, session.id]);
+  useLayoutEffect(() => () => { voiceSendFlight.current = undefined; }, [sendOwner]);
+  const heldVoice = useHeldVoiceInput({
+    scope: voice.scope, root: voiceRoot, sendTarget: voiceSendTarget, canSend: canFinishVoiceSend,
+    enabled: voice.supported && !readOnly && submissionKind === undefined && !effectiveBashMode && hydratedSession === session.id,
+    phase: voice.phase, shortcut: voice.preferences.shortcut,
+    nativeShortcut: window.jokoDesktop?.capabilities.includes("voice.globalDictation") === true,
+    isActive: voice.isActive, start: voice.start, finish: voice.finish, cancel: voice.cancel, onSend: finishVoiceAndSend,
+    isSendKey: (event) => {
+      if (palette !== undefined) return false;
+      const intent = resolveComposerEnterIntent({ key: event.key, shiftKey: event.shiftKey, ctrlKey: event.ctrlKey, metaKey: event.metaKey, altKey: event.altKey, isComposing: event.isComposing, repeat: event.repeat }, sendShortcut, { platform: composerPlatform, turnRunning });
+      return intent === "queue" || intent === "steer";
+    }
+  });
 
   useLayoutEffect(() => {
     let cancelled = false;
     focusAnchorRef.current = document.activeElement;
     const owner = operationGuardRef.current.capture(session.id);
     editorRevisionRef.current += 1;
-    appliedVoiceResultRef.current = undefined;
-    voiceFenceRef.current = undefined;
     clearVoiceDictionaryEdit();
-    const previousVoice = voiceSessionRef.current;
-    voiceSessionRef.current = undefined;
-    void previousVoice?.cancel();
-    setVoiceUpdate(undefined);
     setHydratedSession(undefined);
     textRef.current = "";
     setText("");
@@ -633,7 +419,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       }
     });
     return () => { cancelled = true; };
-  }, [session.id]); // supported modes are intentionally reconciled below without re-reading storage.
+  }, [controller.readDraft, session.id, session.generation]); // Delivery capability updates are reconciled without re-reading storage.
 
   useEffect(() => {
     const container = composerStackRef.current;
@@ -684,7 +470,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       appliedEditorEffectRef.current === editorTextUpdate.eventId
     ) return;
     appliedEditorEffectRef.current = editorTextUpdate.eventId;
-    operationGuardRef.current.markDraftEdited(session.id);
+    markDraftEdited(session.id);
     editorRevisionRef.current += 1;
     resetHistoryNavigation();
     closePalette();
@@ -707,7 +493,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       appliedMessageMentionInsertionRef.current === messageMentionInsertion.id
     ) return;
     appliedMessageMentionInsertionRef.current = messageMentionInsertion.id;
-    operationGuardRef.current.markDraftEdited(session.id);
+    markDraftEdited(session.id);
     editorRevisionRef.current += 1;
     resetHistoryNavigation();
     closePalette();
@@ -726,7 +512,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     appliedSelectionQuoteInsertionRef.current = selectionQuoteInsertion.id;
     const quote = normalizeSelectionQuoteDrafts([selectionQuoteInsertion.quote])[0];
     if (quote === undefined) return;
-    operationGuardRef.current.markDraftEdited(session.id);
+    markDraftEdited(session.id);
     editorRevisionRef.current += 1;
     resetHistoryNavigation();
     closePalette();
@@ -750,7 +536,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       || appliedDraftReplacementRef.current === draftReplacement.id
     ) return;
     appliedDraftReplacementRef.current = draftReplacement.id;
-    operationGuardRef.current.markDraftEdited(session.id);
+    markDraftEdited(session.id);
     editorRevisionRef.current += 1;
     resetHistoryNavigation();
     closePalette();
@@ -786,20 +572,22 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       browserComments,
       ...(extraDirectoriesSupported && extraDirectoryIds !== undefined ? { extraDirectoryIds } : {})
     } satisfies ComposerDraft;
+    const sourceControllerRef = { current: controllerRef.current };
+    let cancelled = false;
     const timer = window.setTimeout(() => {
-      if (!operationGuardRef.current.ownsActivation(owner) || !operationGuardRef.current.draftUnchanged(owner)) return;
-      void enqueueDraftSave(draftSaveChainRef, controllerRef, session.id, draft).then(() => {
-        if (!operationGuardRef.current.ownsActivation(owner) || !operationGuardRef.current.draftUnchanged(owner)) return;
+      if (cancelled || !operationGuardRef.current.ownsActivation(owner) || !operationGuardRef.current.draftUnchanged(owner)) return;
+      void enqueueDraftSave(draftSaveChainRef, sourceControllerRef, session.id, draft).then(() => {
+        if (cancelled || !operationGuardRef.current.ownsActivation(owner) || !operationGuardRef.current.draftUnchanged(owner)) return;
         setSaved(true);
         window.setTimeout(() => {
-          if (operationGuardRef.current.ownsActivation(owner)) setSaved(false);
+          if (!cancelled && operationGuardRef.current.ownsActivation(owner)) setSaved(false);
         }, 1200);
       }).catch((error: unknown) => {
-        if (operationGuardRef.current.ownsActivation(owner)) setAttachmentError(messageOf(error));
+        if (!cancelled && operationGuardRef.current.ownsActivation(owner)) setAttachmentError(messageOf(error));
       });
     }, 420);
-    return () => window.clearTimeout(timer);
-  }, [attachments, browserComments, deliveryMode, editorDocument, extraDirectoriesSupported, extraDirectoryIds, hydratedSession, mentions, readOnly, session.id, submissionKind, text]);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [controller.saveDraft, attachments, browserComments, deliveryMode, editorDocument, extraDirectoriesSupported, extraDirectoryIds, hydratedSession, mentions, readOnly, session.id, submissionKind, text]);
 
   useEffect(() => () => {
     revokeAttachments(attachmentsRef.current);
@@ -807,7 +595,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   }, []);
 
   const updateDocument = (nextDocument: JSONContent, isComposing: boolean): void => {
-    operationGuardRef.current.markDraftEdited(session.id);
+    markDraftEdited(session.id);
     editorRevisionRef.current += 1;
     resetHistoryNavigation();
     const next = composerDocumentPlainText(nextDocument);
@@ -891,7 +679,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     if (nextEntry === undefined) return false;
     event.preventDefault();
     if (historyIndex < 0) historyDraftRef.current = { text, mentions, inlineMentionRanges, editorDocument: activeDocument };
-    operationGuardRef.current.markDraftEdited(session.id);
+    markDraftEdited(session.id);
     setHistoryIndex(intent.index);
     textRef.current = nextEntry.text;
     setText(nextEntry.text);
@@ -934,7 +722,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     if (maximumItems !== undefined && [...files].length > available) setAttachmentError(t("composer.attachmentCount", { count: maximumItems }));
     if (next.length > 0) {
       promptRecommendationStore.dismiss(session.id);
-      operationGuardRef.current.markDraftEdited(session.id);
+      markDraftEdited(session.id);
       setAttachments((current) => [...current, ...next]);
     }
   };
@@ -966,17 +754,15 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     if (operationGuardRef.current.activeSessionId === sessionId) setSubmissionKind(operationGuardRef.current.activeSubmission(sessionId));
   };
 
-  const sendDraft = (modeOverride?: DeliveryMode): void => {
+  const sendDraft = (modeOverride?: DeliveryMode, completedDocument?: JSONContent): void => {
     if (readOnly) return;
-    const recommendationAtSend = recommendationVisible !== undefined && composerDocumentIsEmpty(editorDocument)
+    const recommendationAtSend = completedDocument === undefined && recommendationVisible !== undefined && composerDocumentIsEmpty(editorDocument)
       ? recommendationVisible
       : undefined;
-    const draftText = recommendationAtSend ?? text;
-    const draftDocument = recommendationAtSend === undefined
-      ? editorDocument
-      : plainTextToComposerDocument(recommendationAtSend);
+    const draftDocument = completedDocument ?? (recommendationAtSend === undefined ? editorDocument : plainTextToComposerDocument(recommendationAtSend));
+    const draftText = composerDocumentPlainText(draftDocument);
     if (recommendationAtSend !== undefined) {
-      operationGuardRef.current.markDraftEdited(session.id);
+      markDraftEdited(session.id);
       promptRecommendationStore.dismiss(session.id);
       editorDocumentRef.current = draftDocument;
       setEditorDocument(draftDocument);
@@ -1232,9 +1018,17 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       });
       return;
     }
+    const sourceController = controllerRef.current;
+    const sourceControllerRef = { current: sourceController };
+    const sourceSend = sourceController.send;
+    const sourceGeneration = session.generation;
+    const sourceGuard = operationGuardRef.current;
+    const sourceSendOwner = sendOwner;
+    const sourceRoute = sendRouteKey;
+    const sourceEpoch = sendEpochRef.current;
     const sourceDeliveryMode = modeOverride ?? deliveryMode;
     const draftMedia = [...attachments, ...browserComments.map((item) => item.screenshot)];
-    if (!(browserComments.length > 0 || canSend(draftText, attachments, mentions, composerDocumentQuotes(draftDocument), supportedModes, sourceDeliveryMode)) || !attachmentsAllowed(draftMedia, attachmentPolicy)) return;
+    if (modelRouteUnavailable || !(browserComments.length > 0 || canSend(draftText, attachments, mentions, composerDocumentQuotes(draftDocument), supportedModes, sourceDeliveryMode)) || !attachmentsAllowed(draftMedia, attachmentPolicy)) return;
     const sourceSessionId = session.id;
     const owner = operationGuardRef.current.capture(sourceSessionId);
     if (!operationGuardRef.current.beginSubmission(sourceSessionId, "send")) return;
@@ -1278,10 +1072,10 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       attachments: [],
       browserComments: []
     } satisfies ComposerDraft;
-    const clearSave = enqueueDraftSave(draftSaveChainRef, controllerRef, sourceSessionId, clearedDraft);
+    const clearSave = enqueueDraftSave(draftSaveChainRef, sourceControllerRef, sourceSessionId, clearedDraft);
 
     const restoreRejectedDraft = async (): Promise<void> => {
-      const ownsLiveComposer = operationGuardRef.current.ownsActivation(clearedOwner);
+      const ownsLiveComposer = operationGuardRef.current === sourceGuard && sourceGuard.ownsActivation(clearedOwner) && sourceEpoch !== undefined && sendEpochRef.current === sourceEpoch;
       const current: ComposerDraft = ownsLiveComposer
         ? {
             text: textRef.current,
@@ -1291,7 +1085,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
             attachments: attachmentsRef.current,
             browserComments: browserCommentsRef.current
           } satisfies ComposerDraft
-        : await controllerRef.current.readDraft(sourceSessionId) ?? clearedDraft;
+        : await sourceController.readDraft(sourceSessionId) ?? clearedDraft;
       const restoredDocument = joinComposerDocuments(sourceEditorDocument, current.editorDocument);
       const restoredText = composerDocumentPlainText(restoredDocument);
       const restoredMentions = mergeDraftItemsById(sourceMentions, current.mentions);
@@ -1309,7 +1103,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
           : { extraDirectoryIds: current.extraDirectoryIds ?? sourceExtraDirectoryIds })
       } satisfies ComposerDraft;
       if (ownsLiveComposer) {
-        operationGuardRef.current.markDraftEdited(sourceSessionId);
+        markDraftEdited(sourceSessionId);
         editorRevisionRef.current += 1;
         editorDocumentRef.current = restoredDocument;
         textRef.current = restoredText;
@@ -1325,13 +1119,15 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
         setBrowserComments(restoredBrowserComments);
         requestAnimationFrame(() => richEditorRef.current?.focus("end"));
       }
-      await enqueueDraftSave(draftSaveChainRef, controllerRef, sourceSessionId, restoredDraft);
+      await enqueueDraftSave(draftSaveChainRef, sourceControllerRef, sourceSessionId, restoredDraft);
     };
 
     runAction(`send:${sourceSessionId}`, async () => {
       try {
         await clearSave;
-        await controllerRef.current.send(sourceSessionId, {
+        const current = sendStateRef.current;
+        if (sourceEpoch === undefined || sendEpochRef.current !== sourceEpoch || current.owner !== sourceSendOwner || current.readOnly || !current.connected || current.route !== sourceRoute || !current.supportedModes.includes(sourceDeliveryMode) || !attachmentsAllowed(draftMedia, current.attachmentPolicy)) throw new Error(t("composer.inputUnavailable"));
+        await sourceSend(sourceSessionId, {
           text: sourceText,
           editorDocument: sourceEditorDocument,
           attachments: sourceAttachments,
@@ -1339,21 +1135,24 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
           mentions: sourceMentions,
           deliveryMode: sourceDeliveryMode,
           ...(sourceExtraDirectoryIds === undefined ? {} : { extraDirectoryIds: sourceExtraDirectoryIds })
-        });
+        }, { expectedGeneration: sourceGeneration });
         revokeAttachments(sourceAttachments);
         revokeBrowserCommentPreviews(sourceBrowserComments);
       } catch (error) {
         await restoreRejectedDraft();
         throw error;
       } finally {
-        finishSubmission(sourceSessionId, "send");
+        if (operationGuardRef.current === sourceGuard) finishSubmission(sourceSessionId, "send");
+        else sourceGuard.finishSubmission(sourceSessionId, "send");
       }
     });
   };
 
+  sendDraftRef.current = sendDraft;
+
   const insert = (item: ComposerPaletteItem): void => {
     if (composerLocked) return;
-    operationGuardRef.current.markDraftEdited(session.id);
+    markDraftEdited(session.id);
     resetHistoryNavigation();
     const typedTrigger = typedPaletteTriggerRef.current;
     const nextText = insertComposerPaletteValue(text, typedTrigger, item);
@@ -1373,18 +1172,18 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     requestAnimationFrame(() => richEditorRef.current?.focus());
   };
 
-  const selectInlineMention = (item: ComposerMentionCatalogItem): void => {
+  const selectInlineMention = (item: ComposerMentionCatalogItem, reference = false): void => {
     if (composerLocked || item.disabled === true) return;
     const activation = inlineMentionActivationRef.current;
     if (activation === undefined) return;
-    const directoryToken = item.kind === "directory" ? composerDirectoryQueryToken(item.path) : undefined;
+    const directoryToken = item.kind === "directory" && !reference ? composerDirectoryQueryToken(item.path) : undefined;
     const mention = item.mention;
     if (directoryToken === undefined && mention === undefined) return;
     const existingSeparator = /\s/u.test(textRef.current[activation.to] ?? "");
     const replacement = directoryToken ?? `${mention!.token}${existingSeparator ? "" : " "}`;
     const nextDocument = replaceComposerDocumentTextRange(editorDocument, activation.from, activation.to, replacement);
     if (nextDocument === undefined) return;
-    operationGuardRef.current.markDraftEdited(session.id);
+    markDraftEdited(session.id);
     resetHistoryNavigation();
     const previousText = textRef.current;
     const nextText = composerDocumentPlainText(nextDocument);
@@ -1453,7 +1252,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
 
   const changeDeliveryMode = (mode: DeliveryMode): void => {
     if (composerLocked || mode === deliveryMode) return;
-    operationGuardRef.current.markDraftEdited(session.id);
+    markDraftEdited(session.id);
     setDeliveryMode(mode);
   };
 
@@ -1465,6 +1264,15 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   const matchingWorkspaceMentionIndex = workspaceMentionIndex?.workspaceId === workspace?.id
     ? workspaceMentionIndex
     : undefined;
+  const mentionCapability = backend?.capabilities.get("input.mention");
+  const mentionReferenceOptions = {
+    directory: mentionCapability?.supported === true && mentionCapability.options?.includes("workspace_directory") === true,
+    lineRange: mentionCapability?.supported === true && mentionCapability.options?.includes("workspace_line_range") === true,
+    directoryLabel: t("composer.referenceDirectory"),
+    startLineLabel: t("composer.referenceStartLine"),
+    endLineLabel: t("composer.referenceEndLine"),
+    lineRangeLabel: t("composer.referenceLines")
+  };
   const mentionCatalogItems = useMemo(
     () => composerMentionCatalog(
       workspace?.entries ?? [],
@@ -1556,7 +1364,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     || browserComments.length > 0
     || canSend(text, attachments, mentions, selectionQuotes, supportedModes, deliveryMode))
     && attachmentsAllowed(draftMedia, attachmentPolicy);
-  const mainSlotIsStop = canStop && (!draftCanSend || submissionKind === "send");
+  const mainSlotIsStop = canStop && !voiceActive && (!draftCanSend || submissionKind === "send");
   const showSecondaryStop = canStop && draftCanSend && submissionKind !== "send";
 
   useEffect(() => {
@@ -1565,7 +1373,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       session.id,
       session.generation,
       session.updatedAt,
-      (fence) => controller.predictNextPrompt(fence.sessionId, fence.updatedAt, fence.generation)
+      (fence, signal) => controller.predictNextPrompt(fence.sessionId, fence.updatedAt, fence.generation, signal)
     );
   }, [controller, promptRecommendationRevision, recommendationEligible, session.generation, session.id, session.updatedAt]);
 
@@ -1599,10 +1407,11 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     <div className="composer-region">
       {runningStatus}
       <div
-        ref={composerStackRef}
+        ref={bindComposer}
         className={cx("composer-stack", showQueue && "composer-stack--with-queue")}
         onKeyDownCapture={(event) => {
-          if (event.key === "Escape" && (voiceActive || voiceUpdate?.state === "error")) {
+          if (event.key === "Escape" && event.target instanceof Element && event.target.closest(".queue-strip__editor") !== null) return;
+          if (!event.defaultPrevented && !event.nativeEvent.isComposing && event.key === "Escape" && (voiceActive || voiceUpdate?.state === "error")) {
             event.preventDefault();
             event.stopPropagation();
             cancelVoiceInput();
@@ -1636,6 +1445,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
             runAction(`user-shell-abort:${session.id}`, () => controller.abortUserShell(session.id));
           } else {
             const retained = composerDocumentKeepingQuotes(editorDocument);
+            if (text.length > 0 || mentions.length > 0) markDraftEdited(session.id);
             setEditorDocument(retained);
             textRef.current = "";
             setText("");
@@ -1677,7 +1487,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
                 <span><strong>{mention.label}</strong><small>{mention.role === "user" ? t("composer.userMessageReference") : t("composer.agentMessageReference")}</small></span>
                 <IconButton label={t("composer.removeMessageReference", { name: mention.label })} onClick={() => {
                   if (composerLocked) return;
-                  operationGuardRef.current.markDraftEdited(session.id);
+                  markDraftEdited(session.id);
                   setMentions((current) => current.filter((item) => item.id !== mention.id));
                 }} disabled={composerLocked}><X aria-hidden="true" /></IconButton>
               </div>
@@ -1694,7 +1504,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
                   <span><strong><b>{item.markerNumber}</b>{browserCommentPreviewTag(item)}</strong><small title={item.pageUrl}>{browserCommentPageLabel(item.pageUrl)}</small><p>{item.comment || t("composer.browserCommentNoText")}</p></span>
                   <IconButton label={t("composer.removeBrowserComment", { number: item.markerNumber })} disabled={composerLocked} onClick={() => {
                     if (composerLocked) return;
-                    operationGuardRef.current.markDraftEdited(session.id);
+                    markDraftEdited(session.id);
                     revokeAttachments([item.screenshot]);
                     setBrowserComments((current) => removeBrowserCommentAndRepairChains(current, item.id));
                   }}><X aria-hidden="true" /></IconButton>
@@ -1702,7 +1512,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
               ))}
               <Button tone="ghost" disabled={composerLocked} onClick={() => {
                 if (composerLocked) return;
-                operationGuardRef.current.markDraftEdited(session.id);
+                markDraftEdited(session.id);
                 revokeBrowserCommentPreviews(browserComments);
                 setBrowserComments([]);
               }}>{t("composer.clearBrowserComments")}</Button>
@@ -1711,12 +1521,13 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
         )}
         {attachments.length > 0 && (
           <ComposerAttachmentTray
+            ownerKey={voiceDictionaryOwnerKey}
             attachments={attachments}
             removeDisabled={composerLocked}
             t={t}
             onRemove={(attachment) => {
               if (composerLocked) return;
-              operationGuardRef.current.markDraftEdited(session.id);
+              markDraftEdited(session.id);
               if (attachment.previewUrl !== undefined) URL.revokeObjectURL(attachment.previewUrl);
               setAttachments((current) => current.filter((item) => item.id !== attachment.id));
             }}
@@ -1728,7 +1539,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
           acceptLabel="Tab"
           {...(recommendationVisible === undefined ? {} : { onAccept: () => {
             const accepted = plainTextToComposerDocument(recommendationVisible);
-            operationGuardRef.current.markDraftEdited(session.id);
+            markDraftEdited(session.id);
             promptRecommendationStore.dismiss(session.id);
             editorDocumentRef.current = accepted;
             setEditorDocument(accepted);
@@ -1754,7 +1565,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
               ) {
                 event.preventDefault();
                 const accepted = plainTextToComposerDocument(recommendationVisible);
-                operationGuardRef.current.markDraftEdited(session.id);
+                markDraftEdited(session.id);
                 promptRecommendationStore.dismiss(session.id);
                 editorDocumentRef.current = accepted;
                 setEditorDocument(accepted);
@@ -1778,11 +1589,13 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
             resolveRouteReference={(target) => resolveComposerRouteReferenceFromRuntime(controllerRef.current, target, t("session.unnamed"))}
           />
         </PromptRecommendationEditorFrame>
+        {voice.draftError !== undefined && <p className="composer__error" role="alert">{voice.draftError}</p>}
+        {!readOnly && <ModelSourceNotice key={JSON.stringify([voiceDictionaryOwnerKey, sendRouteKey])} controller={controller} backend={backend} selection={session.model} model={session.model} t={t} />}
         {voiceUpdate !== undefined && voiceUpdate.state !== "idle" && voiceUpdate.state !== "done" && voiceUpdate.state !== "cancelled" && (
           <VoiceInputOverlay
-            state={voiceUpdate.state}
+            state={voice.phase ?? voiceUpdate.state}
             transcript={voiceUpdate.session?.result?.text ?? voiceUpdate.session?.draft?.text ?? ""}
-            error={voiceInputErrorMessage(voiceUpdate, t)}
+            error={voice.error}
             stallWarning={voiceUpdate.session?.stallWarning === true}
             canUseTranscript={voiceUpdate.session?.result !== undefined && (voiceUpdate.session.failure?.transcriptKept === true || voiceUpdate.session.result.salvaged)}
             t={t}
@@ -1823,12 +1636,12 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
                   {selectableExtraDirectories.map((directory) => {
                     const effective = extraDirectoryIds ?? selectableExtraDirectories.map((candidate) => candidate.id);
                     return <label key={directory.id}><CheckboxControl disabled={composerLocked} checked={effective.includes(directory.id)} onChange={(event) => {
-                      operationGuardRef.current.markDraftEdited(session.id);
+                      markDraftEdited(session.id);
                       const current = extraDirectoryIds ?? selectableExtraDirectories.map((candidate) => candidate.id);
                       setExtraDirectoryIds(event.target.checked ? [...new Set([...current, directory.id])] : current.filter((id) => id !== directory.id));
                     }} /><span><strong>{directory.serverPath}</strong><small>{directory.access === "readWrite" ? t("projects.readWrite") : t("projects.readOnly")}</small></span></label>;
                   })}
-                  <button className="composer-add-menu__directory-reset" type="button" disabled={composerLocked || extraDirectoryIds === undefined} onClick={() => { operationGuardRef.current.markDraftEdited(session.id); setExtraDirectoryIds(undefined); }}>{t("composer.extraDirectoriesUseDefault")}</button>
+                  <button className="composer-add-menu__directory-reset" type="button" disabled={composerLocked || extraDirectoryIds === undefined} onClick={() => { markDraftEdited(session.id); setExtraDirectoryIds(undefined); }}>{t("composer.extraDirectoriesUseDefault")}</button>
                 </fieldset>}</>}
                 {palette === "mention" && inlineMentionActivation !== undefined && paletteInAddMenu && <ComposerInlineMentionPanel
                   embedded
@@ -1840,6 +1653,8 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
                   labels={{ close: t("common.close"), loading: t("common.loading"), empty: t("composer.noMentions"), more: t("common.more"), retry: t("common.retry") }}
                   onActiveIndexChange={setInlineMentionActiveIndex}
                   onSelect={selectInlineMention}
+                  onReference={(item) => selectInlineMention(item, true)}
+                  referenceOptions={mentionReferenceOptions}
                   onClose={() => closeInlineMention(true, true)}
                   onRetry={() => setWorkspaceMentionReload((current) => current + 1)}
                 />}
@@ -1854,12 +1669,14 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
                 labels={{ close: t("common.close"), loading: t("common.loading"), empty: t("composer.noMentions"), more: t("common.more"), retry: t("common.retry") }}
                 onActiveIndexChange={setInlineMentionActiveIndex}
                 onSelect={selectInlineMention}
+                onReference={(item) => selectInlineMention(item, true)}
+                referenceOptions={mentionReferenceOptions}
                 onClose={() => closeInlineMention(true, true)}
                 onRetry={() => setWorkspaceMentionReload((current) => current + 1)}
               />}
               {palette === "commands" && !paletteInAddMenu && <ComposerPalette title={t("composer.commands")} items={availableCommandItems} empty={t("composer.noCommands")} t={t} onSelect={insert} onClose={() => closePalette(true)} />}
             </div>}
-            {!effectiveBashMode && voiceSupport === "supported" && <IconButton label={t("voice.start")} disabled={composerLocked || hydratedSession !== session.id} onClick={startVoiceInput}><Mic aria-hidden="true" /></IconButton>}
+            {!effectiveBashMode && voice.supported && <VoiceInputButton phase={voice.phase} held={heldVoice.held} sendTargetActive={heldVoice.sendTargetActive} startedAt={voice.startedAt} ownerWindow={voice.ownerWindow} enabled={!readOnly && submissionKind === undefined && hydratedSession === session.id} buttonProps={heldVoice.buttonProps} t={t} />}
             {bashCapable && <IconButton label={effectiveBashMode ? t("composer.shellExit") : t("composer.shellEnter")} disabled={composerLocked} aria-pressed={effectiveBashMode} onClick={() => { setBashMode((current) => !current); requestAnimationFrame(() => richEditorRef.current?.focus()); }}><Terminal aria-hidden="true" /></IconButton>}
             {effectiveBashMode && <label className="composer__bash-option"><CheckboxControl checked={shellDraft?.excludeFromContext ?? bashExcluded} disabled={composerLocked || shellDraft?.prefix === "exclude"} onChange={(event) => setBashExcluded(event.target.checked)} />{t("composer.shellExclude")}</label>}
             {saved && <span className="draft-saved" role="status"><CircleCheck aria-hidden="true" />{t("composer.saved")}</span>}
@@ -1879,10 +1696,12 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
             {effectiveBashMode && submissionKind === "bash" && <IconButton className="send-button send-button--stop" label={t("composer.shellAbort")} onClick={() => runAction(`user-shell-abort:${session.id}`, () => controller.abortUserShell(session.id))}><CircleStop aria-hidden="true" /></IconButton>}
             {!effectiveBashMode && mainSlotIsStop && <ComposerStopButton label={t("common.stop")} disabled={stopInFlight} onStop={onStop} />}
             {((!effectiveBashMode && !mainSlotIsStop) || (effectiveBashMode && submissionKind !== "bash")) && <IconButton
-              className="send-button"
-              label={effectiveBashMode ? t("composer.shellEnter") : deliveryLabel(deliveryMode, t)}
-              tip={effectiveBashMode ? `${t("composer.shellEnter")} (${shortcutLabel})` : `${deliveryLabel(deliveryMode, t)} (${shortcutLabel})`}
-              disabled={composerLocked || (effectiveBashMode ? !bashPermitted || (shellDraft?.command.length ?? 0) === 0 || attachments.length > 0 : !draftCanSend)}
+              buttonRef={bindVoiceSend}
+              className={cx("send-button", heldVoice.sendTargetActive && "is-voice-target")}
+              tooltipOpen={heldVoice.sendTargetActive ? true : undefined}
+              label={voiceActive ? t(heldVoice.sendTargetActive ? "voice.releaseToSend" : "voice.finishAndSend") : effectiveBashMode ? t("composer.shellEnter") : deliveryLabel(deliveryMode, t)}
+              tip={voiceActive ? t(heldVoice.sendTargetActive ? "voice.releaseToSend" : "voice.finishAndSend") : effectiveBashMode ? `${t("composer.shellEnter")} (${shortcutLabel})` : `${deliveryLabel(deliveryMode, t)} (${shortcutLabel})`}
+              disabled={voiceActive ? !canFinishVoiceSend : composerLocked || (effectiveBashMode ? !bashPermitted || (shellDraft?.command.length ?? 0) === 0 || attachments.length > 0 : !draftCanSend)}
               disabledReason={composerLocked
                 ? t("composer.inputUnavailable")
                 : effectiveBashMode && !bashPermitted
@@ -1892,7 +1711,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
                     : effectiveBashMode
                       ? t("composer.shellPlaceholder")
                       : t("composer.placeholder")}
-              onClick={() => sendDraft()}
+              onClick={() => { if (voice.isActive()) finishVoiceAndSend(); else sendDraft(); }}
             >
               {effectiveBashMode ? <Terminal aria-hidden="true" /> : deliveryMode === "steer" ? <Zap aria-hidden="true" /> : deliveryMode === "followUp" ? <Clock3 aria-hidden="true" /> : <Send aria-hidden="true" />}
             </IconButton>}
@@ -1972,6 +1791,8 @@ function QueueStrip({ sessionId, items, control, supportedDispositions, controll
   const [dragTargetQueueItemId, setDragTargetQueueItemId] = useState<string>();
   const [pendingItemIds, setPendingItemIds] = useState<ReadonlySet<string>>(() => new Set());
   const [queueControlPending, setQueueControlPending] = useState(false);
+  const queueRootRef = useRef<HTMLDivElement>(null);
+  const restoreEditorFocusRef = useRef<{ readonly row: HTMLElement; readonly queueItemId: string } | undefined>(undefined);
   const pendingItemIdsRef = useRef(new Set<string>());
   const queueControlPendingRef = useRef(false);
   const controllerRef = useRef(controller);
@@ -1990,6 +1811,16 @@ function QueueStrip({ sessionId, items, control, supportedDispositions, controll
   const unknown = ordered.some((item) => item.state === "dispatchUnknown");
   const paused = control?.state === "paused";
   const interactionLocked = control?.interactionLocked === true && dragLockRef.current === undefined;
+  useLayoutEffect(() => {
+    const target = restoreEditorFocusRef.current;
+    if (editingId !== undefined || target === undefined || pendingItemIds.has(target.queueItemId)) return;
+    restoreEditorFocusRef.current = undefined;
+    if (!target.row.isConnected) return;
+    const active = target.row.ownerDocument.activeElement;
+    if (active !== target.row.ownerDocument.body && active !== null && !target.row.contains(active)) return;
+    const editButton = target.row.querySelector<HTMLButtonElement>("[data-queue-edit]:not(:disabled)");
+    (editButton ?? target.row).focus();
+  }, [editingId, pendingItemIds]);
   useEffect(() => {
     if (!queueWindow.collapsible && expanded) onExpandedChange(false);
   }, [expanded, onExpandedChange, queueWindow.collapsible]);
@@ -2012,8 +1843,17 @@ function QueueStrip({ sessionId, items, control, supportedDispositions, controll
   };
   const closeEditor = (): void => {
     const lock = editLockRef.current;
+    rememberEditorFocus();
     setEditingId(undefined);
     if (lock !== undefined) void releaseEditLock(lock).catch(() => undefined);
+  };
+  const rememberEditorFocus = (): void => {
+    const active = queueRootRef.current?.ownerDocument.activeElement;
+    const editor = active?.closest(".queue-strip__editor");
+    const row = editor?.closest("article");
+    restoreEditorFocusRef.current = editingId !== undefined && row instanceof HTMLElement && queueRootRef.current?.contains(row)
+      ? { row, queueItemId: editingId }
+      : undefined;
   };
   const beginEdit = (item: QueueItemView): void => {
     if (editLockRef.current?.queueItemId === item.id) return;
@@ -2126,7 +1966,7 @@ function QueueStrip({ sessionId, items, control, supportedDispositions, controll
   const steerSupported = supportedDispositions.includes("steer");
   const deliveryUnavailable = supportedDispositions.length === 0;
   return (
-    <div className={cx("queue-strip", unknown && "queue-strip--warning", paused && "queue-strip--paused")} aria-label={t("context.queue")}>
+    <div ref={queueRootRef} className={cx("queue-strip", unknown && "queue-strip--warning", paused && "queue-strip--paused")} aria-label={t("context.queue")}>
       <div className="queue-strip__title">{unknown ? <AlertTriangle aria-hidden="true" /> : paused ? <Pause aria-hidden="true" /> : <Clock3 aria-hidden="true" />}<strong>{t("composer.queueCount", { count: ordered.length })}</strong>{paused && <Pill tone="warning">{t("queue.paused")}</Pill>}{interactionLocked && <Pill tone="warning">{t("queue.interactionLocked")}</Pill>}<IconButton label={paused ? t("queue.resume") : t("queue.pause")} disabled={queueControlPending} onClick={() => {
         if (queueControlPendingRef.current) return;
         queueControlPendingRef.current = true;
@@ -2160,6 +2000,16 @@ function QueueStrip({ sessionId, items, control, supportedDispositions, controll
           <article
             key={item.id}
             className={cx(editingId === item.id && "is-editing", draggingQueueItemId === item.id && "is-dragging", dragTargetQueueItemId === item.id && "is-drag-target")}
+            tabIndex={userEditable && steerSupported && editingId !== item.id && !blocked ? 0 : -1}
+            aria-keyshortcuts={userEditable && steerSupported ? "Meta+Enter Control+Enter" : undefined}
+            onKeyDown={(event) => {
+              if (event.key !== "Enter" || !(event.metaKey || event.ctrlKey) || event.shiftKey || event.altKey
+                || event.repeat || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229
+                || !userEditable || !steerSupported || blocked || editingId === item.id) return;
+              event.preventDefault();
+              event.stopPropagation();
+              runWithEditLock(item, `steer-now:${item.id}`, (lockToken) => controller.steerQueueItemNow(item.id, item.text, lockToken));
+            }}
             onDragOver={(event) => {
               if (draggingQueueItemId === undefined || draggingQueueItemId === item.id || !mutable || pending) return;
               event.preventDefault();
@@ -2220,9 +2070,22 @@ function QueueStrip({ sessionId, items, control, supportedDispositions, controll
               {item.source !== "user" && <Pill tone="neutral">{queueSourceLabel(item.source, t)}</Pill>}
               {editLocked && <Pill tone="warning">{t("queue.editLocked")}</Pill>}
               <span className="queue-strip__text">{item.text}</span>
-              {mutable && editingId !== item.id && <div className="queue-strip__actions">{userEditable && <IconButton label={t("queue.edit")} disabled={blocked || itemDeliveryUnavailable} disabledReason={lockReason ?? (itemDeliveryUnavailable ? t("queue.deliveryUnavailable") : undefined)} onClick={() => beginEdit(item)}><Pencil aria-hidden="true" /></IconButton>}{userEditable && steerSupported && <IconButton label={t("queue.steerNow")} disabled={blocked} disabledReason={lockReason} onClick={() => runWithEditLock(item, `steer-now:${item.id}`, (lockToken) => controller.steerQueueItemNow(item.id, item.text, lockToken))}><Zap aria-hidden="true" /></IconButton>}<IconButton label={t("queue.cancel")} disabled={blocked} disabledReason={lockReason} onClick={() => { const promise = trackItemAction(item.id, `cancel-queue:${item.id}`, () => controller.cancelQueueItem(item.id)); void promise?.catch(() => undefined); }}><X aria-hidden="true" /></IconButton></div>}
+              {mutable && editingId !== item.id && <div className="queue-strip__actions">{userEditable && <IconButton data-queue-edit label={t("queue.edit")} disabled={blocked || itemDeliveryUnavailable} disabledReason={lockReason ?? (itemDeliveryUnavailable ? t("queue.deliveryUnavailable") : undefined)} onClick={() => beginEdit(item)}><Pencil aria-hidden="true" /></IconButton>}{userEditable && steerSupported && <IconButton label={t("queue.steerNow")} disabled={blocked} disabledReason={lockReason} onClick={() => runWithEditLock(item, `steer-now:${item.id}`, (lockToken) => controller.steerQueueItemNow(item.id, item.text, lockToken))}><Zap aria-hidden="true" /></IconButton>}<IconButton label={t("queue.cancel")} disabled={blocked} disabledReason={lockReason} onClick={() => { const promise = trackItemAction(item.id, `cancel-queue:${item.id}`, () => controller.cancelQueueItem(item.id)); void promise?.catch(() => undefined); }}><X aria-hidden="true" /></IconButton></div>}
             </div>
-            {editingId === item.id && <form className="queue-strip__editor" onSubmit={(event) => { event.preventDefault(); if (itemDeliveryUnavailable || pending || interactionLocked) return; const lock = editLockRef.current; if (lock?.queueItemId !== item.id) return; const promise = trackItemAction(item.id, `edit-queue:${item.id}`, async () => { await controller.editQueueItem(item.id, editingText, item.mode, lock.token); setEditingId(undefined); await releaseEditLock(lock); }); void promise?.catch(() => undefined); }}><textarea rows={2} value={editingText} disabled={pending || interactionLocked} onChange={(event) => setEditingText(event.target.value)} aria-label={t("queue.editText")} /><Button disabled={pending} onClick={closeEditor}>{t("common.cancel")}</Button><Button type="submit" tone="primary" disabled={pending || interactionLocked || editingText.trim().length === 0 || itemDeliveryUnavailable}>{t("common.save")}</Button></form>}
+            {editingId === item.id && <form className="queue-strip__editor" onSubmit={(event) => { event.preventDefault(); if (itemDeliveryUnavailable || pending || interactionLocked || editingText.trim().length === 0) return; const lock = editLockRef.current; if (lock?.queueItemId !== item.id) return; rememberEditorFocus(); const promise = trackItemAction(item.id, `edit-queue:${item.id}`, async () => { await controller.editQueueItem(item.id, editingText, item.mode, lock.token); setEditingId(undefined); await releaseEditLock(lock); }); void promise?.catch(() => undefined); }} onKeyDown={(event) => {
+              if (event.key === "Escape" && !event.repeat && !event.nativeEvent.isComposing && event.nativeEvent.keyCode !== 229 && !pending && !interactionLocked) {
+                event.preventDefault();
+                event.stopPropagation();
+                closeEditor();
+              }
+            }}><textarea rows={2} autoFocus value={editingText} disabled={pending || interactionLocked} onChange={(event) => setEditingText(event.target.value)} aria-label={t("queue.editText")} onKeyDown={(event) => {
+              if (event.repeat || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229 || pending || interactionLocked) return;
+              if (event.key === "Enter" && !event.shiftKey) {
+                event.preventDefault();
+                event.stopPropagation();
+                event.currentTarget.form?.requestSubmit();
+              }
+            }} /><Button disabled={pending} onClick={closeEditor}>{t("common.cancel")}</Button><Button type="submit" tone="primary" disabled={pending || interactionLocked || editingText.trim().length === 0 || itemDeliveryUnavailable}>{t("common.save")}</Button></form>}
           </article>
         );
       })}</div>
@@ -2372,7 +2235,8 @@ function enqueueDraftSave(
   sessionId: string,
   draft: ComposerDraft
 ): Promise<void> {
-  const operation = chainRef.current.then(() => controllerRef.current.saveDraft(sessionId, draft));
+  const saveDraft = controllerRef.current.saveDraft;
+  const operation = chainRef.current.then(() => saveDraft(sessionId, draft));
   chainRef.current = operation.catch(() => undefined);
   return operation;
 }
@@ -2408,26 +2272,6 @@ function browserCommentPageLabel(value: string): string {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : "Could not save the durable draft.";
-}
-
-function voiceInputErrorMessage(update: VoiceMediaSessionUpdate, t: Translator): string | undefined {
-  switch (update.error?.code) {
-    case "unsupported": return t("voice.errors.unsupported");
-    case "permissionDenied": return t("voice.errors.permissionDenied");
-    case "deviceUnavailable": return t("voice.errors.deviceUnavailable");
-    case "deviceBusy": return t("voice.errors.deviceBusy");
-    case "captureFailed": return t("voice.errors.captureFailed");
-    case "audioLimit": return t("voice.errors.audioLimit");
-    case "serviceUnavailable": return t("voice.errors.serviceUnavailable");
-    case "cancelled": return undefined;
-    case undefined: break;
-  }
-  const failure = update.session?.failure?.code;
-  if (update.session?.outcome === "noSpeech") return t("voice.errors.noSpeech");
-  if (failure === "emptyTranscript") return t("voice.errors.noSpeech");
-  if (failure === "providerAuthentication") return t("voice.errors.providerAuthentication");
-  if (failure === "providerQuota") return t("voice.errors.providerQuota");
-  return failure === undefined ? undefined : t("voice.errors.serviceUnavailable");
 }
 
 function workspaceEntryPaths(entries: WorkspaceView["entries"]): readonly string[] {

@@ -4,6 +4,7 @@ import {
   currentDesktopUpdateBannerDismiss,
   deferDesktopUpdateBannerBecauseBusy,
   desktopUpdateBannerDecidedFor,
+  desktopUpdateBannerPinnedFor,
   desktopUpdateDismissKey,
   desktopUpdateIsPending,
   markDesktopUpdateBannerAutoShown,
@@ -16,7 +17,9 @@ export const DESKTOP_UPDATE_BUSY_POLL_MS = 15_000;
 
 /**
  * Gates the automatic appearance of the full update banner on the same
- * authoritative activity answer used by relaunch. Probe failures fail closed.
+ * authoritative activity answer used by relaunch. Continue observing automatically
+ * shown banners, so later activity can defer them again. An explicit user restore
+ * pins only the current update. Probe failures fail closed.
  */
 export function useDesktopUpdateBusyDeferral(
   status: JokoDesktopUpdateStatus | undefined,
@@ -25,6 +28,8 @@ export function useDesktopUpdateBusyDeferral(
   const dismiss = useDesktopUpdateBannerDismiss();
   const probeRef = useRef(probeRuntimeActivity);
   probeRef.current = probeRuntimeActivity;
+  const statusRef = useRef(status);
+  statusRef.current = status;
   const statusKey = status === undefined ? undefined : desktopUpdateDismissKey(status);
   const hideUntilDecided = status !== undefined
     && desktopUpdateIsPending(status)
@@ -32,11 +37,11 @@ export function useDesktopUpdateBusyDeferral(
     && dismiss.decisionKey !== statusKey;
 
   useEffect(() => {
-    if (status === undefined || !desktopUpdateIsPending(status)) return;
+    const pendingStatus = statusRef.current;
+    if (pendingStatus === undefined || !desktopUpdateIsPending(pendingStatus)) return;
 
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const pendingStatus = status;
 
     const schedulePoll = (): void => {
       timer = setTimeout(() => { void runProbe(); }, DESKTOP_UPDATE_BUSY_POLL_MS);
@@ -53,39 +58,26 @@ export function useDesktopUpdateBusyDeferral(
       if (cancelled) return;
 
       const latest = currentDesktopUpdateBannerDismiss();
-      if (latest.reason === "user") return;
-      if (!latest.dismissed && desktopUpdateBannerDecidedFor(pendingStatus)) {
-        // The user explicitly reopened a busy-deferred banner while this probe
-        // was in flight. That visible choice must not be reversed.
-        return;
-      }
+      if (latest.reason === "user" || desktopUpdateBannerPinnedFor(pendingStatus)) return;
 
-      if (!busy) {
-        markDesktopUpdateBannerAutoShown(pendingStatus);
-        return;
-      }
-
-      const changed = deferDesktopUpdateBannerBecauseBusy(pendingStatus);
+      const changed = busy
+        ? deferDesktopUpdateBannerBecauseBusy(pendingStatus)
+        : markDesktopUpdateBannerAutoShown(pendingStatus);
       if (!changed) schedulePoll();
     };
 
     const beforePrepare = currentDesktopUpdateBannerDismiss();
     const prepared = prepareDesktopUpdateBannerStatus(pendingStatus);
     if (prepared !== beforePrepare) return;
-    if (prepared.reason === "user") return;
-    if (!prepared.dismissed && desktopUpdateBannerDecidedFor(pendingStatus)) return;
-    if (
-      prepared.dismissed
-      && prepared.reason === "busy"
-      && desktopUpdateBannerDecidedFor(pendingStatus)
-    ) schedulePoll();
+    if (prepared.reason === "user" || desktopUpdateBannerPinnedFor(pendingStatus)) return;
+    if (desktopUpdateBannerDecidedFor(pendingStatus)) schedulePoll();
     else void runProbe();
 
     return () => {
       cancelled = true;
       if (timer !== undefined) clearTimeout(timer);
     };
-  }, [dismiss.decisionKey, dismiss.dismissed, dismiss.reason, dismiss.updateKey, status, statusKey]);
+  }, [dismiss.decisionKey, dismiss.dismissed, dismiss.reason, dismiss.updateKey, dismiss.pinnedKey, statusKey]);
 
   return hideUntilDecided;
 }

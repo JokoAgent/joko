@@ -24,6 +24,24 @@ afterEach(() => {
 });
 
 describe("durable task lifecycle cleanup", () => {
+  it("waits for terminal process closure before releasing a task workspace and retries uncertain closure", async () => {
+    vi.useFakeTimers();
+    const fixture = createFixture();
+    fixture.closeTerminals.mockRejectedValueOnce(new Error("Terminal process closure is uncertain."));
+    const services = servicesFor(fixture);
+    const operationId = "delete-task-terminal-close";
+    const pending = await services.operation.submitOperation(deleteRequest(fixture.connection.id, operationId, fixture.sessionId), context());
+    expect(pending.operation?.state).toBe(contract.OperationState.RUNNING);
+    expect(fixture.closeTerminals).toHaveBeenCalledExactlyOnceWith(fixture.sessionId);
+    expect(fixture.releaseWorktree).not.toHaveBeenCalled();
+    expect(fixture.deleteNativeSession).not.toHaveBeenCalled();
+    expect(fixture.store.getSessionLifecycleCleanup(operationId).closeCompleted).toBe(false);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(fixture.closeTerminals).toHaveBeenCalledTimes(2);
+    expect(fixture.releaseWorktree).toHaveBeenCalledOnce();
+    expect(fixture.store.getSession(fixture.sessionId).descriptor.deletedAt).toBeDefined();
+  });
+
   it("continues after native deletion when workspace release fails without repeating completed phases", async () => {
     vi.useFakeTimers();
     const fixture = createFixture();
@@ -232,6 +250,7 @@ function servicesFor(fixture: ReturnType<typeof createFixture>) {
       release: fixture.releaseWorktree
     },
     gitSafety: { closeSession: fixture.closeGitSafety },
+    terminals: { closeSession: fixture.closeTerminals },
     scheduler: {
       beginScheduleDeletion: async () => [],
       releaseScheduleDeletion: () => undefined
@@ -408,6 +427,7 @@ function createFixture() {
   });
   const releaseWorktree = vi.fn(async (_id: string) => undefined);
   const closeGitSafety = vi.fn(async (_id: string) => undefined);
+  const closeTerminals = vi.fn(async (_id: string) => undefined);
   const host = durableMutationHost(store, connection, {
     closeIfActive,
     deleteNativeSession,
@@ -425,6 +445,7 @@ function createFixture() {
     archiveWorktree,
     releaseWorktree,
     closeGitSafety,
+    closeTerminals,
     serviceCleanups,
     disposeServices() {
       for (const cleanup of [...serviceCleanups]) cleanup();

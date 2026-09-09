@@ -7,7 +7,8 @@ import { OperationalStore } from "@joko/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { ProviderCatalogManager, ProviderInferenceRoute } from "./credential-manager.js";
-import { createModelRouteCatalog, PromptPredictionService, VisionBridgeCoordinator, type VisionBridgeCoordinatorOptions } from "./personalization-inference.js";
+import { AuxiliaryTextRouting } from "./auxiliary-text-routing.js";
+import { createModelRouteCatalog, PromptPredictionService, requestManagedTextInference, VisionBridgeCoordinator, type ModelRouteCatalog, type VisionBridgeCoordinatorOptions } from "./personalization-inference.js";
 
 const stores: OperationalStore[] = [];
 const tempRoots: string[] = [];
@@ -21,7 +22,8 @@ describe("VisionBridgeCoordinator", () => {
   it("keeps Backend identity when two Backend instances expose the same Provider model", () => {
     const store = fixtureStore();
     const vision = coordinator(store, providerCatalog([
-      provider("provider-a", [{ id: "same-model", input: ["text"] }])
+      provider("backend-a", "provider-a", [{ id: "same-model", input: ["text"] }]),
+      provider("backend-b", "provider-a", [{ id: "same-model", input: ["text"] }])
     ]), undefined, undefined, undefined, ["backend-a", "backend-b"]);
 
     expect(vision.state().targetModels).toEqual([
@@ -42,8 +44,8 @@ describe("VisionBridgeCoordinator", () => {
       choices: [{ message: { content: `description-${++responseIndex}` } }]
     }), { status: 200, headers: { "content-type": "application/json" } })) as unknown as typeof globalThis.fetch;
     const vision = coordinator(store, providerCatalog([
-      provider("provider-a", [{ id: "text-model", input: ["text"] }]),
-      provider("vision-provider", [{ id: "vision-model", input: ["text", "image"] }])
+      provider("pi", "provider-a", [{ id: "text-model", input: ["text"] }]),
+      provider("pi", "vision-provider", [{ id: "vision-model", input: ["text", "image"] }])
     ], inferenceRoute()), fetch);
     const shared = "x".repeat(600);
     const image = { blob: { id: "focus-cache", sha256: "f".repeat(64), byteLength: 12, mimeType: "image/png" } };
@@ -68,8 +70,9 @@ describe("VisionBridgeCoordinator", () => {
       choices: [{ message: { content: "A factual image description." } }]
     }), { status: 200, headers: { "content-type": "application/json" } })) as unknown as typeof globalThis.fetch;
     const vision = coordinator(store, providerCatalog([
-      provider("provider-a", [{ id: "same-model", input: ["text"] }]),
-      provider("vision-provider", [{ id: "vision-model", input: ["text", "image"] }])
+      provider("pi", "provider-a", [{ id: "same-model", input: ["text"] }]),
+      provider("backend-b", "provider-a", [{ id: "same-model", input: ["text"] }]),
+      provider("pi", "vision-provider", [{ id: "vision-model", input: ["text", "image"] }])
     ], inferenceRoute()), fetch, undefined, undefined, ["pi", "backend-b"]);
     const image = { blob: { id: "blob-1", sha256: "a".repeat(64), byteLength: 12, mimeType: "image/png" } };
 
@@ -103,8 +106,8 @@ describe("VisionBridgeCoordinator", () => {
     });
     const fetch = vi.fn(async () => new Response("upstream payload must not leak", { status: 503 })) as unknown as typeof globalThis.fetch;
     const vision = coordinator(store, providerCatalog([
-      provider("provider-a", [{ id: "text-model", input: ["text"] }]),
-      provider("vision-provider", [{ id: "vision-model", input: ["text", "image"] }])
+      provider("pi", "provider-a", [{ id: "text-model", input: ["text"] }]),
+      provider("pi", "vision-provider", [{ id: "vision-model", input: ["text", "image"] }])
     ], inferenceRoute()), fetch);
     const result = await vision.transform({
       backendId: "pi",
@@ -131,8 +134,8 @@ describe("VisionBridgeCoordinator", () => {
     }), { status: 200, headers: { "content-type": "application/json" } }));
     const fetch = fetchMock as unknown as typeof globalThis.fetch;
     const providers = providerCatalog([
-      provider("provider-a", [{ id: "text-model", input: ["text"] }]),
-      provider("vision-provider", [{ id: "vision-model", input: ["text", "image"] }])
+      provider("pi", "provider-a", [{ id: "text-model", input: ["text"] }]),
+      provider("pi", "vision-provider", [{ id: "vision-model", input: ["text", "image"] }])
     ], inferenceRoute());
     const input = (id: string, byteLength: number) => ({
       backendId: "pi",
@@ -192,9 +195,9 @@ describe("VisionBridgeCoordinator", () => {
           });
     }) as unknown as typeof globalThis.fetch;
     const vision = coordinator(store, providerCatalog([
-      provider("provider-a", [{ id: "text-model", input: ["text"] }]),
-      provider("vision-primary", [{ id: "primary-model", input: ["text", "image"] }]),
-      provider("vision-fallback", [{ id: "fallback-model", input: ["text", "image"] }])
+      provider("pi", "provider-a", [{ id: "text-model", input: ["text"] }]),
+      provider("pi", "vision-primary", [{ id: "primary-model", input: ["text", "image"] }]),
+      provider("pi", "vision-fallback", [{ id: "fallback-model", input: ["text", "image"] }])
     ], routes), fetch);
 
     await expect(vision.transform({
@@ -228,8 +231,8 @@ describe("VisionBridgeCoordinator", () => {
       });
     }) as unknown as typeof globalThis.fetch;
     const vision = coordinator(store, providerCatalog([
-      provider("provider-a", [{ id: "text-model", input: ["text"] }]),
-      provider("vision-provider", [{ id: "vision-model", input: ["text", "image"] }])
+      provider("pi", "provider-a", [{ id: "text-model", input: ["text"] }]),
+      provider("pi", "vision-provider", [{ id: "vision-model", input: ["text", "image"] }])
     ], inferenceRoute()), fetch);
     const pending = vision.transform({
       backendId: "pi",
@@ -267,8 +270,8 @@ describe("VisionBridgeCoordinator", () => {
         init?.signal?.addEventListener("abort", () => reject(new DOMException("Timed out", "AbortError")), { once: true });
       })) as unknown as typeof globalThis.fetch;
     const vision = coordinator(store, providerCatalog([
-      provider("provider-a", [{ id: "text-model", input: ["text"] }]),
-      provider("vision-provider", [{ id: "vision-model", input: ["text", "image"] }])
+      provider("pi", "provider-a", [{ id: "text-model", input: ["text"] }]),
+      provider("pi", "vision-provider", [{ id: "vision-model", input: ["text", "image"] }])
     ], inferenceRoute()), fetch, 5);
 
     await expect(vision.transform({
@@ -300,7 +303,7 @@ describe("VisionBridgeCoordinator", () => {
       choices: [{ message: { content: "Approved file description." } }]
     }), { status: 200, headers: { "content-type": "application/json" } })) as unknown as typeof globalThis.fetch;
     const vision = coordinator(store, providerCatalog([
-      provider("vision-provider", [{ id: "vision-model", input: ["text", "image"] }])
+      provider("pi", "vision-provider", [{ id: "vision-model", input: ["text", "image"] }])
     ], inferenceRoute()), fetch);
 
     await expect(vision.describeFile({ path: approvedImage, focus: "", allowedRoots: [approvedRoot] }))
@@ -328,8 +331,7 @@ describe("PromptPredictionService", () => {
     }), { status: 200, headers: { "content-type": "application/json" } })) as unknown as typeof globalThis.fetch;
     const prediction = new PromptPredictionService({
       store,
-      routes: predictionRoutes(store),
-      fetch
+      auxiliary: predictionAuxiliary(store, fetch)
     });
     const session = store.getSession("session-a").descriptor;
 
@@ -352,24 +354,27 @@ describe("PromptPredictionService", () => {
     expect(fetch).toHaveBeenCalledOnce();
   });
 
-  it("does not route a native Backend Session through a managed Backend with the same Provider and model IDs", async () => {
+  it("uses an independent auxiliary route for a native Backend Session", async () => {
     const store = fixtureStore({ providerId: "provider-a", modelId: "text-model" });
     appendMessage(store, "event-user", "user", "Keep this conversation on its native Backend.", 10);
     appendMessage(store, "event-assistant", "assistant", "The native result is complete.", 20);
     appendDone(store, "completed", 30);
-    const providers = providerCatalog([provider("provider-a", [{ id: "text-model", input: ["text"] }])], {
+    const providers = providerCatalog([
+      provider("pi", "provider-a", [{ id: "text-model", input: ["text"] }]),
+      provider("managed-backend", "provider-a", [{ id: "text-model", input: ["text"] }])
+    ], {
       ...inferenceRoute(),
+      backendId: "managed-backend",
       providerId: "provider-a",
       modelId: "text-model",
       supportsImages: false
     });
     configureModelBackend(store, providers, "pi", false);
     configureModelBackend(store, providers, "managed-backend", true);
-    const fetch = vi.fn() as unknown as typeof globalThis.fetch;
+    const fetch = vi.fn(async () => predictionResponse("Continue the task.")) as unknown as typeof globalThis.fetch;
     const prediction = new PromptPredictionService({
       store,
-      routes: createModelRouteCatalog(store, providers),
-      fetch
+      auxiliary: predictionAuxiliary(store, fetch, createModelRouteCatalog(store, providers))
     });
     const session = store.getSession("session-a").descriptor;
 
@@ -379,8 +384,8 @@ describe("PromptPredictionService", () => {
       expectedLastActivityAt: session.updatedAt,
       expectedGeneration: session.binding.generation,
       locale: "en"
-    })).resolves.toBe("");
-    expect(fetch).not.toHaveBeenCalled();
+    })).resolves.toBe("Continue the task.");
+    expect(fetch).toHaveBeenCalledOnce();
   });
 
   it("finds the latest conversation and terminal outcome beyond every fixed event window", async () => {
@@ -455,8 +460,7 @@ describe("PromptPredictionService", () => {
     const fetch = vi.fn() as unknown as typeof globalThis.fetch;
     const prediction = new PromptPredictionService({
       store,
-      routes: predictionRoutes(store),
-      fetch
+      auxiliary: predictionAuxiliary(store, fetch)
     });
     const session = store.getSession("session-a").descriptor;
 
@@ -607,6 +611,89 @@ describe("PromptPredictionService", () => {
         .not.toContain("This result is stale.");
     }
   );
+
+  it.each(["locale", "auxiliary revision", "credential generation", "preference ABA", "conversation cursor", "active run"] as const)(
+    "does not reuse cached predictions after %s changes",
+    async (fence) => {
+      const store = fixtureStore();
+      appendMessage(store, "cache-user", "user", "Review the change", 10);
+      appendDone(store, "completed", 20);
+      let identity = "credential-one";
+      const fetch = vi.fn(async () => predictionResponse(`Prediction ${fetch.mock.calls.length}`));
+      const auxiliary = predictionAuxiliary(store, fetch as typeof globalThis.fetch, predictionRoutes(store), () => identity);
+      const prediction = new PromptPredictionService({ store, auxiliary });
+      const session = store.getSession("session-a").descriptor;
+      const input = { sessionId: session.id, expectedLastActivityAt: session.updatedAt, expectedGeneration: 0, locale: "en" };
+      await expect(prediction.predict(input)).resolves.toBe("Prediction 1");
+      await expect(prediction.predict(input)).resolves.toBe("Prediction 1");
+      if (fence === "locale") {
+        input.locale = "zh";
+        store.setSetting("service", "orchestrator", "settings.appearance", { locale: "zh" });
+      } else if (fence === "auxiliary revision") auxiliary.replace([], 0n);
+      else if (fence === "credential generation") identity = "credential-two";
+      else if (fence === "preference ABA") {
+        store.setSetting("service", "orchestrator", "settings.prompt_recommendation", { enabled: false });
+        store.setSetting("service", "orchestrator", "settings.prompt_recommendation", {});
+      } else if (fence === "conversation cursor") appendMessage(store, "cache-next-user", "user", "Review another change", 30);
+      else store.createRun({ id: "cache-active", sessionId: "session-a", source: "user", state: "running", createdAt: 30 });
+
+      await expect(prediction.predict(input)).resolves.toBe(fence === "active run" ? "" : "Prediction 2");
+      expect(fetch).toHaveBeenCalledTimes(fence === "active run" ? 1 : 2);
+    }
+  );
+
+  it.each(["locale", "auxiliary revision", "credential generation", "preference reset", "disabled"] as const)(
+    "discards late predictions after %s changes",
+    async (fence) => {
+      const store = fixtureStore();
+      appendMessage(store, "late-user", "user", "Review the change", 10);
+      appendDone(store, "completed", 20);
+      let identity = "credential-one";
+      const delayed = deferred<Response>();
+      const fetch = vi.fn().mockImplementationOnce(() => delayed.promise).mockImplementation(async () => predictionResponse("Current result"));
+      const auxiliary = predictionAuxiliary(store, fetch as typeof globalThis.fetch, predictionRoutes(store), () => identity);
+      const prediction = new PromptPredictionService({ store, auxiliary });
+      const session = store.getSession("session-a").descriptor;
+      const input = { sessionId: session.id, expectedLastActivityAt: session.updatedAt, expectedGeneration: 0, locale: "en" };
+      const pending = prediction.predict(input);
+      await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce());
+      if (fence === "locale") store.setSetting("service", "orchestrator", "settings.appearance", { locale: "zh" });
+      else if (fence === "auxiliary revision") auxiliary.replace([], 0n);
+      else if (fence === "credential generation") identity = "credential-two";
+      else {
+        store.setSetting("service", "orchestrator", "settings.prompt_recommendation", { enabled: false });
+        if (fence === "preference reset") store.setSetting("service", "orchestrator", "settings.prompt_recommendation", {});
+      }
+      delayed.resolve(predictionResponse("Old result"));
+      await expect(pending).resolves.toBe("");
+      if (fence === "disabled") store.setSetting("service", "orchestrator", "settings.prompt_recommendation", { enabled: true });
+      await expect(prediction.predict(input)).resolves.toBe("Current result");
+      expect(fetch).toHaveBeenCalledTimes(2);
+    }
+  );
+
+  it("gives concurrent prediction callers separate cancellation ownership", async () => {
+    const store = fixtureStore();
+    appendMessage(store, "caller-user", "user", "Review the change", 10);
+    appendDone(store, "completed", 20);
+    const first = deferred<Response>();
+    const second = deferred<Response>();
+    const fetch = vi.fn().mockImplementationOnce(() => first.promise).mockImplementationOnce(() => second.promise);
+    const prediction = predictionService(store, fetch as typeof globalThis.fetch);
+    const session = store.getSession("session-a").descriptor;
+    const input = { sessionId: session.id, expectedLastActivityAt: session.updatedAt, expectedGeneration: 0, locale: "en" };
+    const firstCaller = new AbortController();
+    const firstRequest = prediction.predict({ ...input, signal: firstCaller.signal });
+    const secondRequest = prediction.predict(input);
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+    firstCaller.abort();
+    first.resolve(predictionResponse("Cancelled result"));
+    second.resolve(predictionResponse("Second result"));
+    await expect(firstRequest).resolves.toBe("");
+    await expect(secondRequest).resolves.toBe("Second result");
+    await expect(prediction.predict(input)).resolves.toBe("Second result");
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
 });
 
 function coordinator(
@@ -633,13 +720,36 @@ function coordinator(
 function predictionService(store: OperationalStore, fetch: typeof globalThis.fetch): PromptPredictionService {
   return new PromptPredictionService({
     store,
-    routes: predictionRoutes(store),
-    fetch
+    auxiliary: predictionAuxiliary(store, fetch)
+  });
+}
+
+function predictionAuxiliary(
+  store: OperationalStore,
+  fetch: typeof globalThis.fetch,
+  routes: ModelRouteCatalog = predictionRoutes(store),
+  identity: () => string = () => "provider-generation"
+): AuxiliaryTextRouting {
+  return new AuxiliaryTextRouting({
+    store, routes,
+    infer: (input) => requestManagedTextInference({ ...input, fetch }),
+    providers: {
+      generation: 0,
+      describeInferenceRoute: (backendId, providerId, modelId) => routes.list()
+        .some((candidate) => candidate.backendId === backendId && candidate.providerId === providerId && candidate.modelId === modelId && candidate.credentialRoute)
+        ? { generationId: identity() } : undefined
+    }
+  });
+}
+
+function predictionResponse(prompt: string): Response {
+  return new Response(JSON.stringify({ choices: [{ message: { content: prompt } }] }), {
+    status: 200, headers: { "content-type": "application/json" }
   });
 }
 
 function predictionRoutes(store: OperationalStore) {
-  const providers = providerCatalog([provider("provider-a", [{ id: "text-model", input: ["text"] }])], {
+  const providers = providerCatalog([provider("pi", "provider-a", [{ id: "text-model", input: ["text"] }])], {
     ...inferenceRoute(),
     providerId: "provider-a",
     modelId: "text-model",
@@ -649,34 +759,33 @@ function predictionRoutes(store: OperationalStore) {
   return createModelRouteCatalog(store, providers);
 }
 
-function provider(id: string, models: readonly { readonly id: string; readonly input: readonly string[] }[]): unknown {
+function provider(backendId: string, id: string, models: readonly { readonly id: string; readonly input: readonly ("text" | "image")[] }[]): ReturnType<ProviderCatalogManager["list"]>[number] {
   return {
-    provider: { id, models },
-    displayName: id,
-    enabled: true,
-    authenticationState: "authenticated"
+    backendId, credentialOrigin: "", provider: { id, models }, displayName: id,
+    kind: "custom_endpoint", enabled: true, supportsLogin: false, supportsLogout: false, supportsRefresh: false,
+    version: 1n, updatedAt: 1, credentialReferenceIds: [], authenticationState: "authenticated"
   };
 }
 
 function providerCatalog(
-  descriptors: readonly unknown[],
+  descriptors: ReturnType<ProviderCatalogManager["list"]>,
   route?: ProviderInferenceRoute | readonly ProviderInferenceRoute[]
 ): Pick<ProviderCatalogManager, "list" | "hasInferenceModel" | "resolveInferenceRoute"> {
-  const catalog = descriptors as ReturnType<ProviderCatalogManager["list"]>;
+  const catalog = descriptors;
   const routes: readonly ProviderInferenceRoute[] = route === undefined
     ? []
     : "providerId" in route
       ? [route]
       : route;
   return {
-    list: () => catalog,
-    hasInferenceModel: (providerId, modelId, options) => catalog.some((descriptor) =>
-      descriptor.provider.id === providerId && descriptor.provider.models.some((model) =>
+    list: (backendId) => catalog.filter((descriptor) => backendId === undefined || descriptor.backendId === backendId),
+    hasInferenceModel: (backendId, providerId, modelId, options) => catalog.some((descriptor) =>
+      descriptor.backendId === backendId && descriptor.provider.id === providerId && descriptor.provider.models.some((model) =>
         model.id === modelId && (options?.requireImages !== true || model.input?.includes("image") === true)
       )
     ),
-    resolveInferenceRoute: (providerId, modelId, options) => routes.find((candidate) =>
-      candidate.providerId === providerId && candidate.modelId === modelId &&
+    resolveInferenceRoute: (backendId, providerId, modelId, options) => routes.find((candidate) =>
+      candidate.backendId === backendId && candidate.providerId === providerId && candidate.modelId === modelId &&
       (options?.requireImages !== true || candidate.supportsImages)
     )
   };
@@ -696,7 +805,7 @@ function configureModelBackend(
   backendId: string,
   managedCatalog: boolean
 ): void {
-  const models = providers.list().flatMap((descriptor) => descriptor.provider.models.map((model) => ({
+  const models = providers.list(backendId).flatMap((descriptor) => descriptor.provider.models.map((model) => ({
     providerId: descriptor.provider.id,
     modelId: model.id,
     displayName: model.name ?? model.id,
@@ -732,6 +841,7 @@ function configureModelBackend(
 
 function inferenceRoute(overrides: Partial<ProviderInferenceRoute> = {}): ProviderInferenceRoute {
   return {
+    backendId: "pi",
     providerId: "vision-provider",
     generationId: "generation-1",
     modelId: "vision-model",

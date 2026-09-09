@@ -11,6 +11,7 @@ import type {
   RemoteSshSnapshot,
   RemoteSshStatus,
   RemoteSshTransportLease,
+  RemoteTerminalStartRequest,
   RemoteSshTestOptions,
   RemoteSshTestResult,
   RemoteSshExecutionOptions,
@@ -180,6 +181,14 @@ export class RemoteSshConnectionController {
     }
   }
 
+  transportGeneration(scope: RemoteSshOwnerScope): number {
+    this.assertScope(scope);
+    if (this.#status !== "ready" || this.#connection === undefined) {
+      throw new RemoteSshError("CONNECTION_FAILED", "The SSH connection is not ready.", true);
+    }
+    return this.#generation;
+  }
+
   transports(scope: RemoteSshOwnerScope): RemoteSshTransportLease {
     this.assertScope(scope);
     const connection = this.#connection;
@@ -189,13 +198,41 @@ export class RemoteSshConnectionController {
     const capabilities = Object.freeze({
       commandExecution: connection.capabilities?.commandExecution === true,
       processStreaming: connection.capabilities?.processStreaming === true,
+      interactiveTerminal: connection.capabilities?.interactiveTerminal === true && connection.terminals !== undefined,
       fileTransfer: connection.capabilities?.fileTransfer === true,
       tcpForwarding: connection.capabilities?.tcpForwarding === true
     });
+    const generation = this.#generation;
+    const terminals = connection.terminals;
     return Object.freeze({
       capabilities,
       ...(capabilities.processStreaming && connection.processes !== undefined
         ? { processes: connection.processes }
+        : {}),
+      ...(capabilities.interactiveTerminal && terminals !== undefined
+        ? { terminals: Object.freeze({ open: async (request: RemoteTerminalStartRequest) => {
+          if (this.#generation !== generation || this.#connection !== connection || this.#status !== "ready") {
+            throw new RemoteSshError("TERMINAL_UNAVAILABLE", "The SSH terminal connection is no longer current.", false);
+          }
+          if (request.signal?.aborted === true) {
+            throw new RemoteSshError("ABORTED", "Remote terminal creation was cancelled.", true);
+          }
+          const handle = await terminals.open(request);
+          if (this.#generation !== generation || this.#connection !== connection || this.#status !== "ready" || Boolean(request.signal?.aborted)) {
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            try {
+              await Promise.race([
+                Promise.resolve().then(() => handle.kill()).catch(() => undefined),
+                new Promise<void>((resolve) => { timer = setTimeout(resolve, 2_500); })
+              ]);
+            } finally {
+              clearTimeout(timer);
+            }
+            throw new RemoteSshError("TERMINAL_UNKNOWN", "The SSH connection changed while the terminal was starting.", false,
+              { stateMayHaveChanged: true });
+          }
+          return handle;
+        } }) }
         : {}),
       ...(capabilities.fileTransfer && connection.files !== undefined
         ? { files: connection.files }
@@ -241,6 +278,7 @@ export class RemoteSshConnectionController {
       port: this.#host.port,
       user: this.#host.user,
       ...(this.#host.credentialRef === undefined ? {} : { credentialRef: this.#host.credentialRef }),
+      ...(this.#host.nodeKey === undefined ? {} : { nodeKey: this.#host.nodeKey }),
       signal,
       onAuthenticating: () => {
         authenticating = true;
@@ -342,7 +380,7 @@ export class RemoteSshConnectionController {
   }
 
   private currentSnapshot(): RemoteSshSnapshot {
-    const { credentialRef: _credentialRef, ...safeHost } = this.#host;
+    const { credentialRef: _credentialRef, nodeKey: _nodeKey, ...safeHost } = this.#host;
     return Object.freeze({
       host: Object.freeze(safeHost),
       status: this.#status,
@@ -391,6 +429,11 @@ export function normalizeRemoteSshHost(input: RemoteSshHostInput): RemoteSshHost
   const credentialRefId = input.credentialRef === undefined
     ? undefined
     : validateIdentifier(input.credentialRef.id, "credentialRef", 512);
+  if (input.nodeKey !== undefined && (credentialRefId !== undefined ||
+    !/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/u.test(input.nodeKey.id) ||
+    !/^SHA256:[A-Za-z0-9+/]{43}$/u.test(input.nodeKey.expectedFingerprint))) {
+    throw new RemoteSshError("INVALID_ARGUMENT", "Node key identity is invalid.", false);
+  }
   return Object.freeze({
     ownerId,
     targetId,
@@ -399,6 +442,7 @@ export function normalizeRemoteSshHost(input: RemoteSshHostInput): RemoteSshHost
     port,
     user,
     ...(credentialRefId === undefined ? {} : { credentialRef: Object.freeze({ id: credentialRefId }) }),
+    ...(input.nodeKey === undefined ? {} : { nodeKey: Object.freeze({ ...input.nodeKey }) }),
     source: "manual"
   });
 }
@@ -631,6 +675,9 @@ function normalizeConnectionFailure(
   if (timedOut) return abortError(true);
   if (aborted) return abortError(false);
   if (isRemoteSshError(error) && error.code === "ABORTED") return abortError(false);
+  if (isRemoteSshError(error) && (error.code === "NODE_KEY_CHANGED" || error.code === "NODE_KEY_UNAVAILABLE")) {
+    return new RemoteSshError(error.code, "The selected node key cannot authenticate.", false);
+  }
   if (error instanceof ConnectorFailure) {
     if (error.code === "AUTHENTICATION_FAILED") {
       return new RemoteSshError(

@@ -1,5 +1,6 @@
 export {
   ClaudeCodeAdapter,
+  CLAUDE_MANAGED_PROVIDER_SUPPORT,
   createClaudeCodeAdapter,
   type ClaudeCodeAdapterOptions
 } from "./adapter.js";

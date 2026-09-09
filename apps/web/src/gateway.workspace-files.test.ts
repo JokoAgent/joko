@@ -1,3 +1,4 @@
+import { unicodeCorpus } from "./i18n/test-corpus.js";
 import { create } from "@bufbuild/protobuf";
 import type { Transport } from "@connectrpc/connect";
 import {
@@ -349,7 +350,7 @@ describe("formal Workspace Files gateway", () => {
               value: {
                 relativePath: "src/App.tsx",
                 range: { startByte: 8n, endByte: 14n, startLine: 2, startColumn: 3, endLine: 2, endColumn: 9 },
-                linePreview: "  前🐾后🐾",
+                linePreview: unicodeCorpus.utf8SearchPreview,
                 submatches: [
                   { startByte: 5n, endByte: 9n },
                   { startByte: 12n, endByte: 16n }
@@ -388,7 +389,7 @@ describe("formal Workspace Files gateway", () => {
         match: {
           path: "src/App.tsx",
           line: 2,
-          preview: "  前🐾后🐾",
+          preview: unicodeCorpus.utf8SearchPreview,
           submatches: [
             { startByte: 5, endByte: 9 },
             { startByte: 12, endByte: 16 }

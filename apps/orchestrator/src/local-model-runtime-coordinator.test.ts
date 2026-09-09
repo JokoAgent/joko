@@ -16,6 +16,8 @@ function model(id: string, overrides: Partial<ManagedRuntimeModel> = {}): Manage
 
 function descriptor(provider: PiManagedProvider, overrides: Partial<ProviderDescriptor> = {}): ProviderDescriptor {
   return {
+    backendId: "pi",
+    credentialOrigin: "",
     provider,
     displayName: "Ollama (Local)",
     kind: "local_keyless",
@@ -36,32 +38,35 @@ class FakeProviders implements LocalModelProviderCatalog {
   readonly deletes = vi.fn();
   values: ProviderDescriptor[] = [];
 
-  list(): readonly ProviderDescriptor[] {
-    return this.values;
+  list(backendId: string): readonly ProviderDescriptor[] {
+    return this.values.filter((value) => value.backendId === backendId);
   }
 
   async upsert(input: Parameters<LocalModelProviderCatalog["upsert"]>[0], options?: Parameters<LocalModelProviderCatalog["upsert"]>[1]): Promise<ProviderDescriptor> {
     if (options?.stillActive?.() === false) throw new Error("stale");
     const next = descriptor(input.provider, {
+      backendId: input.backendId,
+      credentialOrigin: input.credentialOrigin,
       displayName: input.displayName,
       kind: input.kind,
       enabled: input.enabled,
       supportsLogin: input.supportsLogin,
       supportsLogout: input.supportsLogout,
       supportsRefresh: input.supportsRefresh,
-      version: (this.values.find((item) => item.provider.id === input.provider.id)?.version ?? 0n) + 1n
+      version: (this.values.find((item) => item.backendId === input.backendId && item.provider.id === input.provider.id)?.version ?? 0n) + 1n
     });
-    this.values = [...this.values.filter((item) => item.provider.id !== input.provider.id), next];
+    this.values = [...this.values.filter((item) => item.backendId !== input.backendId || item.provider.id !== input.provider.id), next];
     this.upserts(input, options);
     return next;
   }
 
-  async delete(providerId: string, options?: Parameters<LocalModelProviderCatalog["delete"]>[1]): Promise<boolean> {
-    if (options?.stillActive?.() === false) throw new Error("stale");
-    const found = this.values.some((item) => item.provider.id === providerId);
-    this.values = this.values.filter((item) => item.provider.id !== providerId);
-    this.deletes(providerId, options);
-    return found;
+  async deleteRuntime(backendId: string, providerId: string, options: Parameters<LocalModelProviderCatalog["deleteRuntime"]>[2]): Promise<boolean> {
+    if (options.stillActive?.() === false) throw new Error("stale");
+    const found = this.values.find((item) => item.backendId === backendId && item.provider.id === providerId);
+    if (found !== undefined && found.version !== options.expectedVersion) throw new Error("changed concurrently");
+    this.values = this.values.filter((item) => item.backendId !== backendId || item.provider.id !== providerId);
+    this.deletes(backendId, providerId, options);
+    return found !== undefined;
   }
 }
 
@@ -69,7 +74,7 @@ describe("LocalModelProviderCoordinator", () => {
   it("creates one owner-managed keyless Provider without inventing prices", async () => {
     const owner = { ownerId: "owner-a", generation: 1 };
     const providers = new FakeProviders();
-    const coordinator = new LocalModelProviderCoordinator({ providers, currentOwner: () => owner });
+    const coordinator = new LocalModelProviderCoordinator({ providers, backendId: "pi", currentOwner: () => owner });
     await coordinator.sync(owner, [model("model-a", { contextWindow: 32768, supportsTools: true, supportsImages: true })]);
 
     const created = providers.values[0]!;
@@ -92,7 +97,7 @@ describe("LocalModelProviderCoordinator", () => {
   it("preserves an explicit owner price while replacing runtime-owned metadata", async () => {
     const owner = { ownerId: "owner-a", generation: 1 };
     const providers = new FakeProviders();
-    const coordinator = new LocalModelProviderCoordinator({ providers, currentOwner: () => owner });
+    const coordinator = new LocalModelProviderCoordinator({ providers, backendId: "pi", currentOwner: () => owner });
     await coordinator.sync(owner, [model("model-a")]);
     const current = providers.values[0]!;
     providers.values = [descriptor({
@@ -112,11 +117,14 @@ describe("LocalModelProviderCoordinator", () => {
   it("removes the managed Provider when its final installed model disappears", async () => {
     const owner = { ownerId: "owner-a", generation: 1 };
     const providers = new FakeProviders();
-    const coordinator = new LocalModelProviderCoordinator({ providers, currentOwner: () => owner });
+    const coordinator = new LocalModelProviderCoordinator({ providers, backendId: "pi", currentOwner: () => owner });
     await coordinator.sync(owner, [model("model-a")]);
+    const foreign = descriptor(providers.values[0]!.provider, { backendId: "foreign-backend" });
+    providers.values.push(foreign);
     await coordinator.sync(owner, []);
-    expect(providers.values).toEqual([]);
-    expect(providers.deletes).toHaveBeenCalledWith(MANAGED_LOCAL_PROVIDER_ID, expect.objectContaining({ stillActive: expect.any(Function) }));
+    expect(providers.values).toEqual([foreign]);
+    expect(providers.deletes).toHaveBeenCalledWith("pi", MANAGED_LOCAL_PROVIDER_ID,
+      expect.objectContaining({ expectedVersion: 1n, stillActive: expect.any(Function) }));
   });
 
   it("records and removes the durable Provider ownership binding", async () => {
@@ -128,7 +136,7 @@ describe("LocalModelProviderCoordinator", () => {
       put: vi.fn(async (_owner: typeof owner, value: typeof binding) => { binding = value; }),
       remove: vi.fn(async () => { binding = undefined; })
     };
-    const coordinator = new LocalModelProviderCoordinator({ providers, currentOwner: () => owner, bindings });
+    const coordinator = new LocalModelProviderCoordinator({ providers, backendId: "pi", currentOwner: () => owner, bindings });
     await coordinator.sync(owner, [model("model-a")]);
     expect(binding).toEqual({
       providerId: MANAGED_LOCAL_PROVIDER_ID,
@@ -150,7 +158,7 @@ describe("LocalModelProviderCoordinator", () => {
       keyless: true,
       models: [{ id: "custom" }]
     }, { kind: "custom_endpoint" })];
-    const coordinator = new LocalModelProviderCoordinator({ providers, currentOwner: () => owner });
+    const coordinator = new LocalModelProviderCoordinator({ providers, backendId: "pi", currentOwner: () => owner });
     await expect(coordinator.sync(owner, [model("model-a")])).rejects.toMatchObject({ code: "RUNTIME_ERROR" });
     expect(providers.upserts).not.toHaveBeenCalled();
   });
@@ -164,7 +172,7 @@ describe("LocalModelProviderCoordinator", () => {
       if (options?.stillActive?.() === false) throw new Error("stale");
       return descriptor(input.provider);
     };
-    const coordinator = new LocalModelProviderCoordinator({ providers, currentOwner: () => activeOwner });
+    const coordinator = new LocalModelProviderCoordinator({ providers, backendId: "pi", currentOwner: () => activeOwner });
     await expect(coordinator.sync(owner, [model("model-a")])).rejects.toThrow("stale");
     expect(providers.values).toEqual([]);
   });
@@ -172,7 +180,7 @@ describe("LocalModelProviderCoordinator", () => {
   it("rejects invalid and duplicate model aliases before any Provider write", async () => {
     const owner = { ownerId: "owner-a", generation: 1 };
     const providers = new FakeProviders();
-    const coordinator = new LocalModelProviderCoordinator({ providers, currentOwner: () => owner });
+    const coordinator = new LocalModelProviderCoordinator({ providers, backendId: "pi", currentOwner: () => owner });
     await expect(coordinator.sync(owner, [model("../escape")])).rejects.toMatchObject({ code: "MODEL_INVALID" });
     await expect(coordinator.sync(owner, [model("model-a"), model("model-a:latest")])).rejects.toMatchObject({ code: "MODEL_INVALID" });
     expect(providers.upserts).not.toHaveBeenCalled();

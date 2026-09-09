@@ -40,16 +40,16 @@ describe("RuntimeRecoveryBlock", () => {
     const row = container.querySelector<HTMLElement>(".runtime-recovery-row")!;
     const trigger = row.querySelector<HTMLButtonElement>("button")!;
     expect(row.dataset.state).toBe("running");
-    expect(trigger.textContent).toContain("重新连接中 2/5…");
+    expect(trigger.textContent).toContain(chinese("timeline.runtimeRecoveryPending", { attempt: 2, total: 5 }));
     expect(trigger.textContent).toContain("stream disconnected.");
-    expect(row.querySelector('[role="status"]')?.getAttribute("aria-label")).toBe("重新连接中 2/5…");
+    expect(row.querySelector('[role="status"]')?.getAttribute("aria-label")).toBe(chinese("timeline.runtimeRecoveryPending", { attempt: 2, total: 5 }));
     expect(row.querySelector("pre")).toBeNull();
 
     await act(async () => trigger.click());
     expect(trigger.getAttribute("aria-expanded")).toBe("true");
     expect(row.querySelector("pre")?.textContent).toBe("API Error: stream disconnected. Full provider detail.");
-    expect(row.textContent).toContain("本次重试 2/5");
-    expect(row.textContent).toContain("本任务累计重连 4 次");
+    expect(row.textContent).toContain(chinese("timeline.runtimeRecoveryAttempt", { attempt: 2, total: 5 }));
+    expect(row.textContent).toContain(chinese("timeline.runtimeRecoverySessionTotal", { count: 4 }));
 
     await act(async () => root.render(<RuntimeRecoveryBlock item={recoveryItem("succeeded")} t={english} />));
     expect(container.querySelector(".runtime-recovery-row")?.textContent).toContain("Reconnected");

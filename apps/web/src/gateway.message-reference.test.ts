@@ -43,7 +43,7 @@ describe("structured message-reference gateway wiring", () => {
         sourceEventId: "event/9"
       }],
       deliveryMode: "prompt"
-    });
+    }, { expectedGeneration: 1n });
 
     expect(payloads[0]?.value.input.parts.map((part: any) => ({ content: part.content }))).toEqual([{
       content: {
@@ -51,6 +51,17 @@ describe("structured message-reference gateway wiring", () => {
         value: "https://joko.test/app?profile=local#/tasks/task%2Fone?event=event%2F9&message=entry%3A42"
       }
     }]);
+    await gateway.send("session-current", {
+      text: "@src/ @main.ts:2–5", attachments: [], deliveryMode: "prompt",
+      mentions: [
+        { id: "directory", kind: "workspace", reference: "src", label: "src", token: "@src/", directory: true },
+        { id: "lines", kind: "workspace", reference: "src/main.ts", label: "main.ts:2–5", token: "@main.ts:2–5", lineRange: { startLine: 2, endLine: 5 } }
+      ]
+    }, { expectedGeneration: 1n });
+    expect(payloads[1]?.value.input.parts.filter((part: any) => part.content.case === "workspaceMention").map((part: any) => part.content.value)).toMatchObject([
+      { relativePath: "src", directory: true },
+      { relativePath: "src/main.ts", directory: false, lineRange: { startLine: 2, endLine: 5 } }
+    ]);
     gateway.disconnect();
   });
 });

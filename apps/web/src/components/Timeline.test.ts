@@ -1,3 +1,4 @@
+import { unicodeCorpus } from "../i18n/test-corpus.js";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
@@ -106,12 +107,12 @@ describe("long user messages", () => {
 
   it("leaves short user messages unwrapped by collapse affordances", () => {
     const markup = renderToStaticMarkup(createElement(CollapsibleUserMessageContent, {
-      measureText: "short English 中文",
-      children: "short English 中文",
+      measureText: unicodeCorpus.shortMixedScriptText,
+      children: unicodeCorpus.shortMixedScriptText,
       t: (key, values) => translate("en", key, values)
     }));
 
-    expect(markup).toContain("short English 中文");
+    expect(markup).toContain(unicodeCorpus.shortMixedScriptText);
     expect(markup).not.toContain("<button");
   });
 
@@ -152,9 +153,9 @@ describe("typed compaction timeline copy", () => {
     const english = (key: Parameters<typeof translate>[1], values?: Readonly<Record<string, string | number>>) => translate("en", key, values);
     const chinese = (key: Parameters<typeof translate>[1], values?: Readonly<Record<string, string | number>>) => translate("zh-CN", key, values);
     expect(compactionTimelineCopy(compactionItem("completed"), "en", english).title).toBe("Context compacted");
-    expect(compactionTimelineCopy(compactionItem("noOp"), "zh-CN", chinese).title).toBe("无需压缩上下文");
+    expect(compactionTimelineCopy(compactionItem("noOp"), "zh-CN", chinese).title).toBe(chinese("timeline.compactionNoOp"));
     expect(compactionTimelineCopy(compactionItem("aborted"), "en", english).title).toBe("Compaction aborted");
-    expect(compactionTimelineCopy(compactionItem("failed"), "zh-CN", chinese).title).toBe("上下文压缩失败");
+    expect(compactionTimelineCopy(compactionItem("failed"), "zh-CN", chinese).title).toBe(chinese("timeline.compactionFailed"));
   });
 
   it("formats typed token metadata at render time", () => {

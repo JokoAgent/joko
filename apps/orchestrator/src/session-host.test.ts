@@ -25,6 +25,7 @@ import {
   type NativeSessionBinding,
   type NativeSessionCatalogEntry,
   type NativeSessionCatalogResult,
+  type NativeSessionDerivation,
   type NativeSessionForkResult,
   type NativeSessionState,
   type PermissionMode,
@@ -36,7 +37,8 @@ import {
   type SubagentControlInput,
   type SubagentRunDetail,
   type UserShellInput,
-  type UserShellResult
+  type UserShellResult,
+  type UsageSnapshot
 } from "@joko/core";
 import {
   CODEX_LIKE_PROFILE,
@@ -197,6 +199,34 @@ afterEach(async () => {
 });
 
 describe("SessionHost", () => {
+  it.each([undefined, ["workspace_file"], ["workspace_directory", "workspace_line_range"]])(
+    "gates structured workspace references on explicit native mention options: %j", async (options) => {
+      const adapter = new FakeBackendAdapter({
+        ...PI_LIKE_PROFILE,
+        capabilities: [
+          ...PI_LIKE_PROFILE.capabilities.filter((capability) => capability.key !== "input.mention"),
+          { key: "input.mention", supported: true, ...(options === undefined ? {} : { options }) }
+        ]
+      });
+      const fixture = await createFixture(adapter);
+      const created = await fixture.host.createSession({
+        operationId: "create-mention-options", connection: fixture.connection,
+        targetId: "target-one", title: "Workspace references", fastMode: false,
+        permissionMode: "ask", planMode: false
+      });
+      for (const mention of [
+        { kind: "workspace_directory", label: "sources", reference: "src" },
+        { kind: "workspace_file", label: "lines", reference: "src/main.ts", lineRange: { startLine: 1, endLine: 2 } }
+      ] as const) {
+        const check = () => fixture.host.assertInputCapabilities(created.value.sessionId, {
+          text: "", images: [], files: [], mentions: [mention], disposition: "prompt"
+        });
+        if (options?.includes("workspace_directory")) expect(check).not.toThrow();
+        else expect(check).toThrow("does not support");
+      }
+    }
+  );
+
   it("rejects new task admission before native effects when its Backend is disabled", async () => {
     const adapter = new FakeBackendAdapter(PI_LIKE_PROFILE);
     const createNative = vi.spyOn(adapter, "createSession");
@@ -1579,7 +1609,8 @@ describe("SessionHost", () => {
       sessionId,
       prompt: { text: "must not queue", images: [], files: [], mentions: [], disposition: "prompt" }
     })).toThrow("process instance is being replaced");
-    expect(fixture.store.findOperation("admission-during-backend-replacement")).toBeUndefined();
+    expect(fixture.store.getOperation("admission-during-backend-replacement").status).toBe("failed");
+    expect(fixture.store.listQueueItems({ sessionId }).some(item => item.operationId === "admission-during-backend-replacement")).toBe(false);
 
     candidateGate.release();
     await replacing;
@@ -2077,7 +2108,7 @@ describe("SessionHost", () => {
         path: "projection/messages.json",
         kind: "projection",
         mediaType: "application/json",
-        bytes: encodePortableSessionProjection({ format: 1, messages: [] })
+        bytes: encodePortableSessionProjection({ format: 1, messages: [], artifacts: [] })
       }]
     });
     const portablePackage = await fixture.artifacts.ingestBytes(encoded, {
@@ -2576,6 +2607,41 @@ describe("SessionHost", () => {
     expect(fixture.store.listEvents({ sessionId }).at(-1)?.payload.type).toBe("queue_update");
   });
 
+  it.each([
+    { name: "standard at the threshold", requestInput: 272_000, fastMode: false, costMicros: 3_750_000 },
+    { name: "fast at the threshold", requestInput: 272_000, fastMode: true, costMicros: 7_500_000 },
+    { name: "standard above the threshold", requestInput: 272_001, fastMode: false, costMicros: 7_450_040 },
+    { name: "fast above the threshold", requestInput: 272_001, fastMode: true, costMicros: 14_900_080 },
+    { name: "unobserved fast mode", requestInput: 272_000, fastMode: undefined, costMicros: 3_750_000 },
+    { name: "unobserved request size", requestInput: 272_001, fastMode: true, omitPricingContext: true, costMicros: 3_750_020 },
+    { name: "owner price override", requestInput: 272_001, fastMode: true, override: true, costMicros: 546_002 },
+    { name: "reported cost", requestInput: 272_001, fastMode: true, reportedCost: true, costMicros: 500_000 }
+  ])("prices $name from request observations without multiplying cumulative usage or duplicate events", async (testCase) => {
+    const fixture = await createFixture(new TieredUsageFakeAdapter(testCase), {
+      usageMoneyKind: () => "reference-value"
+    });
+    if (testCase.override) fixture.store.upsertModelPriceOverride({
+      ownerId: "orchestrator", backendId: fixture.adapter.id, providerId: "test", modelId: "text", currencyCode: "USD",
+      inputCostMicrosPerMillion: 1_000_000, outputCostMicrosPerMillion: 1_000_000,
+      cacheReadCostMicrosPerMillion: 1_000_000, cacheWriteCostMicrosPerMillion: 1_000_000
+    });
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-tiered-usage", connection: fixture.connection, targetId: "target-one", title: "Tiered usage",
+      providerId: "test", modelId: "text", fastMode: true, permissionMode: "ask", planMode: false
+    })).value.sessionId;
+    const queued = fixture.host.enqueueInput({
+      operationId: "send-tiered-usage", connection: fixture.connection, sessionId,
+      prompt: { text: "measure", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    await eventually(() => fixture.store.getRun(queued.value.runId).descriptor.state === "completed");
+    expect(fixture.store.listUsageLedger({ ownerId: "orchestrator" })).toEqual([expect.objectContaining({
+      inputTokens: (testCase.requestInput - 102_000) * 2,
+      outputTokens: 2_000, cacheReadTokens: 200_000, cacheWriteTokens: 4_000,
+      totalTokens: (testCase.requestInput + 1_000) * 2,
+      costMicros: testCase.costMicros, estimated: true
+    })]);
+  });
+
   it("applies a model price override only to the matching Backend identity", async () => {
     const primary = new TokenPricedScheduleUsageFakeAdapter("priced-backend-primary");
     const secondary = new TokenPricedScheduleUsageFakeAdapter("priced-backend-secondary");
@@ -2944,7 +3010,8 @@ describe("SessionHost", () => {
         pastedTextRanges: [{ start: 1, end: 2, display: "split" }]
       }
     })).toThrow("ordered, non-overlapping UTF-16 spans");
-    expect(fixture.store.findOperation("send-invalid-paste-range")).toBeUndefined();
+    expect(fixture.store.getOperation("send-invalid-paste-range").status).toBe("failed");
+    expect(fixture.store.listQueueItems({ sessionId }).some(item => item.operationId === "send-invalid-paste-range")).toBe(false);
   });
 
   it("buffers a synchronous terminal until Backend acceptance commits, then settles Queue and Run", async () => {
@@ -6708,6 +6775,10 @@ describe("SessionHost", () => {
       role: "assistant",
       blocks: [{ kind: "text", text: "Source boundary" }]
     });
+    const sourceBinding = fixture.store.getSession(sourceId).descriptor.binding;
+    const sourceResume = vi.spyOn(adapter, "resumeSession");
+    const sourceDetach = vi.spyOn(adapter, "detachSession");
+    const sourceClose = vi.spyOn(adapter, "closeSession");
     const gate = adapter.holdFork();
     const input = {
       operationId: "derive-claimed-first",
@@ -6720,6 +6791,7 @@ describe("SessionHost", () => {
     } as const;
     const pending = fixture.host.deriveSession(input);
     await gate.entered;
+    await adapter.forkContext!.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Source during derivation" }] });
 
     expect(fixture.store.getOperation(input.operationId)).toMatchObject({
       status: "started",
@@ -6740,6 +6812,18 @@ describe("SessionHost", () => {
     expect(fixture.store.listSessions({ includeArchived: true, includeDeleted: true })).toHaveLength(1);
     gate.release();
     const derived = await pending;
+    await adapter.forkContext!.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Source after derivation" }] });
+    expect(fixture.store.getSession(sourceId).descriptor.binding).toEqual(sourceBinding);
+    expect(sourceResume).not.toHaveBeenCalled();
+    expect(sourceDetach).not.toHaveBeenCalled();
+    expect(sourceClose).not.toHaveBeenCalled();
+    expect(fixture.store.listEvents({ sessionId: sourceId }).flatMap((event) =>
+      event.payload.type === "message_complete" ? event.payload.blocks : []))
+      .toEqual(expect.arrayContaining([
+        { kind: "text", text: "Source during derivation" },
+        { kind: "text", text: "Source after derivation" }
+      ]));
+    expect(fixture.store.findNativeSessionDerivation(input.operationId)?.state).toBe("adopted");
     expect(frozen).toEqual([
       { sessionId: sourceId, targetId: "target-one" },
       { sessionId: derived.value.sessionId, targetId: "target-one" }
@@ -6776,6 +6860,309 @@ describe("SessionHost", () => {
     expect(fixture.store.listEvents({ sessionId: derived.value.sessionId })
       .filter((event) => event.payload.type === "extension_ui_effect" && event.payload.effect === "editor_text"))
       .toHaveLength(1);
+  });
+
+  it.each(["native_validation", "authorization", "source_deleted", "store_commit"] as const)(
+    "cleans only the registered derived binding after %s fails and preserves source emissions",
+    async (failurePoint) => {
+      const adapter = new GatedFakeAdapter();
+      const fixture = await createFixture(adapter);
+      const sourceId = (await fixture.host.createSession({
+        operationId: `cleanup-source-${failurePoint}`,
+        connection: fixture.connection,
+        targetId: "target-one", title: "Source", fastMode: false, permissionMode: "ask", planMode: false
+      })).value.sessionId;
+      const sourceBinding = fixture.store.getSession(sourceId).descriptor.binding;
+      appendSessionEvent(fixture.store, sourceId, `cleanup-message-${failurePoint}`, 10, {
+        type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Durable boundary" }]
+      });
+      const deleteNative = vi.spyOn(adapter, "deleteSession");
+      const resumeNative = vi.spyOn(adapter, "resumeSession");
+      adapter.afterFork = async () => {
+        if (failurePoint === "native_validation") throw new Error("Derived native validation failed.");
+        if (failurePoint === "authorization") fixture.store.revokeConnection(fixture.connection.id);
+        if (failurePoint === "source_deleted") fixture.store.updateSession(sourceId, { deletedAt: Date.now() });
+        if (failurePoint === "store_commit") {
+          vi.spyOn(fixture.store, "createSession").mockImplementationOnce(() => { throw new Error("Derived product commit failed."); });
+        }
+      };
+      const input = {
+        operationId: `cleanup-derive-${failurePoint}`, connection: fixture.connection,
+        sourceSessionId: sourceId, title: "Derived", kind: "fork" as const, entryId: "root",
+        sourceMessage: { messageId: `cleanup-message-${failurePoint}`, eventId: `cleanup-message-${failurePoint}` }
+      };
+      await expect(fixture.host.deriveSession(input)).rejects.toBeInstanceOf(OperationPreviouslyFailedError);
+      const receipt = fixture.store.findNativeSessionDerivation(input.operationId)!;
+      expect(receipt.state).toBe("cleaned");
+      expect(receipt.binding.opaqueRef).not.toBe(sourceBinding.opaqueRef);
+      expect(deleteNative).toHaveBeenCalledOnce();
+      expect(deleteNative).toHaveBeenCalledWith(receipt.binding, expect.objectContaining({
+        sessionId: receipt.sessionId, binding: receipt.binding, generation: receipt.binding.generation,
+        operationId: input.operationId, target: expect.objectContaining({ workspaceRoot: fixture.directory })
+      }));
+      expect(fixture.store.listSessions({ includeDeleted: true, includeArchived: true })).toHaveLength(1);
+      expect(fixture.store.getSession(sourceId).descriptor.binding).toEqual(sourceBinding);
+      expect(resumeNative).not.toHaveBeenCalled();
+      if (failurePoint !== "source_deleted") {
+        await adapter.forkContext!.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Source remains attached" }] });
+        expect(fixture.store.listEvents({ sessionId: sourceId }).some((event) =>
+          event.payload.type === "message_complete" && event.payload.blocks.some((block) =>
+            block.kind === "text" && block.text === "Source remains attached")))
+          .toBe(true);
+      }
+    }
+  );
+
+  it("retains an unknown derived cleanup without repeating the native fork or delete", async () => {
+    const adapter = new GatedFakeAdapter();
+    const fixture = await createFixture(adapter);
+    const sourceId = (await fixture.host.createSession({
+      operationId: "unknown-cleanup-source", connection: fixture.connection,
+      targetId: "target-one", title: "Source", fastMode: false, permissionMode: "ask", planMode: false
+    })).value.sessionId;
+    appendSessionEvent(fixture.store, sourceId, "unknown-cleanup-message", 10, {
+      type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Durable boundary" }]
+    });
+    adapter.afterFork = async () => { throw new Error("Native validation failed."); };
+    const deleteNative = vi.spyOn(adapter, "deleteSession").mockRejectedValue(new Error("Delete result was lost."));
+    const input = {
+      operationId: "unknown-cleanup-derive", connection: fixture.connection,
+      sourceSessionId: sourceId, title: "Derived", kind: "fork" as const, entryId: "root",
+      sourceMessage: { messageId: "unknown-cleanup-message", eventId: "unknown-cleanup-message" }
+    };
+    await expect(fixture.host.deriveSession(input)).rejects.toMatchObject({ storedError: { message: "Native validation failed." } });
+    expect(fixture.store.findNativeSessionDerivation(input.operationId)?.state).toBe("cleanup_unknown");
+    await expect(fixture.host.deriveSession(input)).rejects.toBeInstanceOf(OperationPreviouslyFailedError);
+    expect(adapter.forkCalls).toBe(1);
+    expect(deleteNative).toHaveBeenCalledOnce();
+  });
+
+  it("cleans a known unadopted derivation during startup without resuming the source or replaying clone", async () => {
+    const fixture = await createFixture();
+    const sourceId = (await fixture.host.createSession({
+      operationId: "recovery-derive-source", connection: fixture.connection,
+      targetId: "target-one", title: "Source", fastMode: false, permissionMode: "ask", planMode: false
+    })).value.sessionId;
+    const source = fixture.store.getSession(sourceId).descriptor;
+    const operationId = "recovery-known-derivation";
+    const claim = fixture.store.claimAuthorizedDeferredEffectOperation(
+      fixture.connection.id, fixture.connection.authKeyDigest,
+      { id: operationId, kind: "clone_session", body: { sourceSessionId: sourceId } }
+    );
+    const receipt = fixture.store.recordNativeSessionDerivation({
+      operationId, expectedBodyHash: claim.operation.bodyHash,
+      sourceSessionId: sourceId, sourceBinding: source.binding, sessionId: "recovery-new-product",
+      backendId: source.backendId,
+      backendInstanceGeneration: fixture.store.getBackend(source.backendId).descriptor.instanceGeneration,
+      targetId: source.targetId, effectiveWorkspaceRoot: fixture.directory,
+      binding: { opaqueRef: "fake://recovery-new-native", nativeSessionId: "recovery-new-native", generation: 1 }
+    });
+    await fixture.host.dispose();
+    const adapter = new FakeBackendAdapter(PI_LIKE_PROFILE);
+    const deleteNative = vi.spyOn(adapter, "deleteSession");
+    const cloneNative = vi.spyOn(adapter, "clone");
+    const resumeNative = vi.spyOn(adapter, "resumeSession");
+    const restarted = new SessionHost(fixture.store, fixture.artifacts, [adapter]);
+    try {
+      await restarted.initialize();
+      expect(fixture.store.getOperation(operationId)).toMatchObject({ status: "failed", error: { code: "EFFECT_OUTCOME_UNKNOWN" } });
+      expect(fixture.store.findNativeSessionDerivation(operationId)?.state).toBe("cleaned");
+      expect(deleteNative).toHaveBeenCalledWith(receipt.binding, expect.objectContaining({ sessionId: receipt.sessionId }));
+      expect(cloneNative).not.toHaveBeenCalled();
+      expect(resumeNative).not.toHaveBeenCalled();
+      expect(fixture.store.getSession(sourceId).descriptor.binding).toEqual(source.binding);
+    } finally {
+      await restarted.dispose();
+    }
+  });
+
+  it.each(["activation", "native", "target_aba"] as const)(
+    "fences a derivation against a target authority change during %s",
+    async (stage) => {
+      const adapter = new GatedFakeAdapter();
+      const fixture = await createFixture(adapter);
+      const sourceId = (await fixture.host.createSession({
+        operationId: `target-fence-source-${stage}`, connection: fixture.connection,
+        targetId: "target-one", title: "Source", fastMode: false, permissionMode: "ask", planMode: false
+      })).value.sessionId;
+      appendSessionEvent(fixture.store, sourceId, "target-fence-message", 10, {
+        type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Durable boundary" }]
+      });
+      const target = fixture.store.getTarget("target-one");
+      const changeTarget = () => {
+        fixture.store.upsertTarget({ ...target.descriptor, workspaceRoot: join(fixture.directory, "other-root") });
+        if (stage === "target_aba") fixture.store.upsertTarget(target.descriptor);
+      };
+      if (stage === "activation") {
+        await fixture.host.close(sourceId);
+        const resume = adapter.resumeSession.bind(adapter);
+        vi.spyOn(adapter, "resumeSession").mockImplementationOnce(async (...args) => {
+          const result = await resume(...args);
+          changeTarget();
+          return result;
+        });
+      } else {
+        adapter.afterFork = async () => { changeTarget(); };
+      }
+      const deleteNative = vi.spyOn(adapter, "deleteSession");
+      const operationId = `target-fence-derive-${stage}`;
+      await expect(fixture.host.deriveSession({
+        operationId, connection: fixture.connection, sourceSessionId: sourceId,
+        title: "Derived", kind: "fork", entryId: "root",
+        sourceMessage: { messageId: "target-fence-message", eventId: "target-fence-message" }
+      })).rejects.toMatchObject({ storedError: { message: expect.stringContaining("revision") } });
+      expect(fixture.store.listSessions({ includeArchived: true, includeDeleted: true })).toHaveLength(1);
+      const receipt = fixture.store.findNativeSessionDerivation(operationId);
+      if (stage === "activation") {
+        expect(adapter.forkCalls).toBe(0);
+        expect(receipt).toBeUndefined();
+      } else {
+        expect(adapter.forkCalls).toBe(1);
+        expect(receipt?.effectiveWorkspaceRoot).toBe(fixture.directory);
+        expect(receipt?.state).toBe(stage === "target_aba" ? "cleaned" : "recorded");
+      }
+      expect(deleteNative).toHaveBeenCalledTimes(stage === "target_aba" ? 1 : 0);
+    }
+  );
+
+  it.each(["deadline", "shutdown"] as const)(
+    "bounds derived native cleanup at %s and ignores its result after Store closure",
+    async (interruption) => {
+      const adapter = new GatedFakeAdapter();
+      const fixture = await createFixture(adapter);
+      const sourceId = (await fixture.host.createSession({
+        operationId: `bounded-cleanup-source-${interruption}`, connection: fixture.connection,
+        targetId: "target-one", title: "Source", fastMode: false, permissionMode: "ask", planMode: false
+      })).value.sessionId;
+      appendSessionEvent(fixture.store, sourceId, "bounded-cleanup-message", 10, {
+        type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Durable boundary" }]
+      });
+      adapter.afterFork = async () => { throw new Error("Original derived validation failure."); };
+      const deleteGate = new AsyncGate();
+      let cleanupSignal: AbortSignal | undefined;
+      let resolveDelete!: () => void;
+      let rejectDelete!: (error: Error) => void;
+      const deletion = new Promise<void>((resolve, reject) => { resolveDelete = resolve; rejectDelete = reject; });
+      const deleteNative = vi.spyOn(adapter, "deleteSession").mockImplementation((_binding, context) => {
+        cleanupSignal = context.signal;
+        deleteGate.enter();
+        return deletion;
+      });
+      const finish = vi.spyOn(fixture.store, "finishNativeSessionDerivationCleanup");
+      const diagnostic = vi.spyOn(fixture.store, "appendDiagnostic");
+      const input = {
+        operationId: `bounded-cleanup-derive-${interruption}`, connection: fixture.connection,
+        sourceSessionId: sourceId, title: "Derived", kind: "fork" as const, entryId: "root",
+        sourceMessage: { messageId: "bounded-cleanup-message", eventId: "bounded-cleanup-message" }
+      };
+      vi.useFakeTimers();
+      try {
+        const failure = expect(fixture.host.deriveSession(input)).rejects.toMatchObject({
+          storedError: { message: "Original derived validation failure." }
+        });
+        await deleteGate.entered;
+        expect(fixture.store.findNativeSessionDerivation(input.operationId)?.state).toBe("cleanup_claimed");
+        if (interruption === "deadline") {
+          await vi.advanceTimersByTimeAsync(4_999);
+          expect(cleanupSignal?.aborted).toBe(false);
+          await vi.advanceTimersByTimeAsync(1);
+          await failure;
+          const current = fixture.store.getBackend(adapter.id).descriptor;
+          const perform = vi.fn(async () => undefined);
+          await expect(fixture.host.replaceBackendInstance({
+            backendId: adapter.id, expectedCurrentGeneration: current.instanceGeneration, perform
+          })).rejects.toThrow("derived native cleanup has not settled");
+          expect(perform).not.toHaveBeenCalled();
+          await expect(fixture.host.deriveSession(input)).rejects.toBeInstanceOf(OperationPreviouslyFailedError);
+        }
+        await fixture.host.dispose();
+        await failure;
+        expect(cleanupSignal?.aborted).toBe(true);
+        expect(fixture.store.findNativeSessionDerivation(input.operationId)?.state).toBe("cleanup_unknown");
+        expect(adapter.forkCalls).toBe(1);
+        expect(deleteNative).toHaveBeenCalledOnce();
+        expect(finish).toHaveBeenCalledOnce();
+        const diagnosticCount = diagnostic.mock.calls.length;
+        fixture.store.close();
+        if (interruption === "deadline") resolveDelete();
+        else rejectDelete(new Error("Late native deletion failure."));
+        await vi.advanceTimersByTimeAsync(0);
+        expect(finish).toHaveBeenCalledOnce();
+        expect(diagnostic).toHaveBeenCalledTimes(diagnosticCount);
+      } finally {
+        resolveDelete();
+        vi.useRealTimers();
+      }
+    }
+  );
+
+  it.each(["resolved", "rejected"] as const)(
+    "preserves the derive failure when %s cleanup cannot persist its finish or diagnostic",
+    async (cleanupOutcome) => {
+      const adapter = new GatedFakeAdapter();
+      const fixture = await createFixture(adapter);
+      const sourceId = (await fixture.host.createSession({
+        operationId: `finish-failure-source-${cleanupOutcome}`, connection: fixture.connection,
+        targetId: "target-one", title: "Source", fastMode: false, permissionMode: "ask", planMode: false
+      })).value.sessionId;
+      appendSessionEvent(fixture.store, sourceId, "finish-failure-message", 10, {
+        type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Durable boundary" }]
+      });
+      adapter.afterFork = async () => { throw new Error("Original derived validation failure."); };
+      const deleteNative = vi.spyOn(adapter, "deleteSession");
+      if (cleanupOutcome === "rejected") deleteNative.mockRejectedValue(new Error("Native cleanup failed."));
+      const finish = vi.spyOn(fixture.store, "finishNativeSessionDerivationCleanup").mockImplementation(() => {
+        throw new Error("Receipt write unavailable.");
+      });
+      const diagnostic = vi.spyOn(fixture.store, "appendDiagnostic").mockImplementation(() => {
+        throw new Error("Diagnostic write unavailable.");
+      });
+      const input = {
+        operationId: `finish-failure-derive-${cleanupOutcome}`, connection: fixture.connection,
+        sourceSessionId: sourceId, title: "Derived", kind: "fork" as const, entryId: "root",
+        sourceMessage: { messageId: "finish-failure-message", eventId: "finish-failure-message" }
+      };
+      await expect(fixture.host.deriveSession(input)).rejects.toMatchObject({
+        storedError: { message: "Original derived validation failure." }
+      });
+      expect(fixture.store.findNativeSessionDerivation(input.operationId)?.state).toBe("cleanup_claimed");
+      finish.mockRestore();
+      diagnostic.mockRestore();
+      fixture.store.recoverStartup();
+      expect(fixture.store.findNativeSessionDerivation(input.operationId)?.state).toBe("cleanup_unknown");
+      await expect(fixture.host.deriveSession(input)).rejects.toMatchObject({
+        storedError: { message: "Original derived validation failure." }
+      });
+      expect(deleteNative).toHaveBeenCalledOnce();
+      expect(adapter.forkCalls).toBe(1);
+    }
+  );
+
+  it.each(["active", "preserved"] as const)("rejects a %s isolated checkout before any native derivation", async (state) => {
+    const adapter = new GatedFakeAdapter();
+    const fixture = await createFixture(adapter);
+    const baseId = (await fixture.host.createSession({
+      operationId: `worktree-base-${state}`, connection: fixture.connection,
+      targetId: "target-one", title: "Base", fastMode: false, permissionMode: "ask", planMode: false
+    })).value.sessionId;
+    const base = fixture.store.getSession(baseId).descriptor;
+    const source = fixture.store.createSession({
+      ...base, id: `isolated-source-${state}`,
+      binding: { opaqueRef: `fake://isolated/${state}`, generation: 1 },
+      worktree: {
+        leaseId: `lease-${state}`, workspaceId: `workspace-${state}`, path: join(fixture.directory, "isolated"),
+        repositoryRoot: fixture.directory, branch: "task-branch", sourceRef: "main", sourceCommit: "a".repeat(40),
+        sourceStrategy: "explicit", sourceRefreshed: false, state, acquiredAt: 1, updatedAt: 1
+      }
+    });
+    const cloneNative = vi.spyOn(adapter, "clone");
+    await expect(fixture.host.deriveSession({
+      operationId: `worktree-derive-${state}`, connection: fixture.connection,
+      sourceSessionId: source.descriptor.id, title: "Derived", kind: "clone"
+    })).rejects.toMatchObject({ publicError: { code: "SESSION_DERIVATION_WORKTREE_UNAVAILABLE", stateMayHaveChanged: false } });
+    expect(cloneNative).not.toHaveBeenCalled();
+    expect(adapter.forkCalls).toBe(0);
+    expect(fixture.store.getSession(source.descriptor.id).descriptor.worktree).toEqual(source.descriptor.worktree);
   });
 
   it("snapshots a private append prompt for fresh creation, restart, and derivation", async () => {
@@ -7339,6 +7726,42 @@ describe("SessionHost", () => {
       ]));
   });
 
+  it("persists an explicit start rewind and fences stale generations without changing the native binding", async () => {
+    const adapter = new ManagedAttachFakeAdapter({ ...PI_LIKE_PROFILE, capabilities: [...PI_LIKE_PROFILE.capabilities, { key: "session.rewind_to_start", supported: true }] });
+    adapter.history = { events: [{ ...fakeHistoryEvent("first-user", "message_user", { type: "message_complete", role: "user", blocks: [{ kind: "text", text: "First" }] }), nativeRewindBefore: { kind: "session_start" } }], activeEntryId: "first-user", activeLineage: [{ entryId: "first-user" }] };
+    const fixture = await createFixture(adapter);
+    const sessionId = (await fixture.host.createSession({ operationId: "start-history", connection: fixture.connection, targetId: "target-one", title: "Start", fastMode: false, permissionMode: "ask", planMode: false, nativeStart: { kind: "attach", nativeReference: "managed://start-history" } })).value.sessionId;
+    const binding = fixture.store.getSession(sessionId).descriptor.binding;
+    expect(fixture.store.listEvents({ sessionId }).find((event) => event.payload.type === "message_complete")?.payload)
+      .toMatchObject({ nativeHistory: { identity: { entryId: "first-user", rewindBefore: { kind: "session_start" } } } });
+    const navigate = vi.spyOn(adapter, "navigateTree").mockImplementation(async () => {
+      adapter.history = { events: [], activeLineage: [], activeNavigationTarget: { kind: "session_start" } };
+      return { kind: "in_place" };
+    });
+    await expect(fixture.host.navigateTree(sessionId, { kind: "session_start" }, false, undefined, binding.generation + 1, { connection: fixture.connection, operationId: "native-navigation-1", protocol: { kind: "internal" } })).rejects.toThrow();
+    expect(navigate).not.toHaveBeenCalled();
+    await fixture.host.navigateTree(sessionId, { kind: "session_start" }, false, undefined, binding.generation, { connection: fixture.connection, operationId: "native-navigation-2", protocol: { kind: "internal" } });
+    expect(fixture.store.getSession(sessionId).descriptor.binding).toEqual(binding);
+    const marker = fixture.store.listEvents({ sessionId }).filter((event) => event.payload.type === "native_session_changed").at(-1);
+    expect(marker?.payload).toEqual({ type: "native_session_changed", opaqueRef: binding.opaqueRef, nativeSessionId: binding.nativeSessionId });
+    expect(materializedSessionRuntimeState(fixture.store.getSetting("session", sessionId, SESSION_RUNTIME_STATE_SETTING_KEY).value)?.activeNativeEntryId).toBeUndefined();
+  });
+
+  it.each(["start", "entry", "unavailable"] as const)("captures a typed %s dialogue anchor through native history without requiring a tree capability", async (boundary) => {
+    const adapter = new ManagedAttachFakeAdapter({ ...PI_LIKE_PROFILE, capabilities: [...PI_LIKE_PROFILE.capabilities.filter((capability) => capability.key !== "session.tree"), { key: "session.rewind_to_start", supported: true }] });
+    const getTree = vi.spyOn(adapter, "getTree").mockRejectedValue(new Error("No native tree surface"));
+    const captureBeforeRun = vi.fn(async (_input: Parameters<WorkspaceRunCapture["captureBeforeRun"]>[0]) => undefined);
+    const fixture = await createFixture(adapter, { workspaceCapture: { captureBeforeRun, captureAfterRun: async () => undefined } });
+    const sessionId = (await fixture.host.createSession({ operationId: `capture-${boundary}`, connection: fixture.connection, targetId: "target-one", title: "Capture", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    if (boundary === "unavailable") adapter.historyFailure = new Error("History unavailable");
+    else adapter.history = { events: [], activeNavigationTarget: boundary === "start" ? { kind: "session_start" } : { kind: "native_entry", entryId: "observed-leaf" } };
+    fixture.host.enqueueInput({ operationId: `send-capture-${boundary}`, connection: fixture.connection, sessionId, prompt: { text: "Capture boundary", images: [], files: [], mentions: [], disposition: "prompt" } });
+    await vi.waitFor(() => expect(captureBeforeRun).toHaveBeenCalledOnce());
+    const anchor = captureBeforeRun.mock.calls[0]?.[0].navigationAnchor;
+    expect(anchor).toEqual(boundary === "unavailable" ? undefined : { target: adapter.history.activeNavigationTarget, generation: fixture.store.getSession(sessionId).descriptor.binding.generation });
+    expect(getTree).not.toHaveBeenCalled();
+  });
+
   it("hydrates attached native history before success and keeps repeated branch syncs idempotent", async () => {
     const adapter = new ManagedAttachFakeAdapter();
     adapter.history = {
@@ -7399,19 +7822,31 @@ describe("SessionHost", () => {
     expect(initial.find((event) => event.payload.type === "native_session_changed")?.payload)
       .toMatchObject({ type: "native_session_changed", leafId: "custom-message" });
 
-    await fixture.host.navigateTree(sessionId, "custom-message", false);
+    await fixture.host.navigateTree(sessionId, { kind: "native_entry", entryId: "custom-message" }, false, undefined, undefined, { connection: fixture.connection, operationId: "native-navigation-3", protocol: { kind: "internal" } });
     expect(fixture.store.listEvents({ sessionId, limit: 100 })).toHaveLength(initial.length);
 
     adapter.history = { ...adapter.history, activeEntryId: "branch-b" };
-    await fixture.host.navigateTree(sessionId, "branch-b", false);
+    await fixture.host.navigateTree(sessionId, { kind: "native_entry", entryId: "branch-b" }, false, undefined, undefined, { connection: fixture.connection, operationId: "native-navigation-4", protocol: { kind: "internal" } });
     const switched = fixture.store.listEvents({ sessionId, limit: 100 });
     expect(switched).toHaveLength(initial.length + 1);
     expect(switched.at(-1)?.payload).toMatchObject({ type: "native_session_changed", leafId: "branch-b" });
     expect(switched.some((event) => event.metadata?.fields["nativeEntryId"] === "branch-a")).toBe(true);
 
-    adapter.historyFailure = new Error("invalid native history response");
-    await expect(fixture.host.navigateTree(sessionId, "root-user", false))
-      .rejects.toThrow("invalid native history response");
+    adapter.historyFailure = new JokoError({ code: "NATIVE_HISTORY_STALE", message: "The history read changed.", phase: "probe", retryable: false, stateMayHaveChanged: false, recovery: "Read current history." });
+    await expect(fixture.host.navigateTree(sessionId, { kind: "native_entry", entryId: "root-user" }, false, undefined, undefined, { connection: fixture.connection, operationId: "native-navigation-5", protocol: { kind: "internal" } }))
+      .rejects.toMatchObject({ storedError: { code: "NATIVE_NAVIGATION_SYNC_UNKNOWN", stateMayHaveChanged: true, retryable: false } });
+    let navigationEffects = 0;
+    const mutation = {
+      operationId: "navigation-sync-unknown",
+      connection: fixture.connection,
+      kind: "navigate_session_branch",
+      body: { sessionId, entryId: "root-user" },
+      effect: async () => { navigationEffects++; await fixture.host.navigateTree(sessionId, { kind: "native_entry", entryId: "root-user" }, false, undefined, undefined, { connection: fixture.connection, operationId: "native-navigation-6", protocol: { kind: "internal" } }); },
+      commit: () => ({ accepted: true })
+    };
+    for (let attempt = 0; attempt < 2; attempt++) await expect(fixture.host.mutate(mutation))
+      .rejects.toMatchObject({ storedError: { code: "NATIVE_NAVIGATION_SYNC_UNKNOWN", stateMayHaveChanged: true, retryable: false } });
+    expect(navigationEffects).toBe(1);
     const afterRejectedSync = fixture.store.listEvents({ sessionId, limit: 100 });
     expect(afterRejectedSync).toHaveLength(switched.length);
     expect(afterRejectedSync.at(-1)?.payload).toMatchObject({ type: "native_session_changed", leafId: "branch-b" });
@@ -7485,7 +7920,7 @@ describe("SessionHost", () => {
       return [];
     });
     try {
-      await fixture.host.navigateTree(sessionId, nativeEntryId, false);
+      await fixture.host.navigateTree(sessionId, { kind: "native_entry", entryId: nativeEntryId }, false, undefined, undefined, { connection: fixture.connection, operationId: "native-navigation-7", protocol: { kind: "internal" } });
     } finally {
       history.mockRestore();
     }
@@ -7542,7 +7977,7 @@ describe("SessionHost", () => {
     expect(restarted.filter((event) => event.payload.type === "artifact")).toHaveLength(1);
     expect(restarted.filter((event) => event.payload.type === "tool_result")).toHaveLength(2);
 
-    await fixture.host.navigateTree(sessionId, "native-tool-image", false);
+    await fixture.host.navigateTree(sessionId, { kind: "native_entry", entryId: "native-tool-image" }, false, undefined, undefined, { connection: fixture.connection, operationId: "native-navigation-8", protocol: { kind: "internal" } });
     const reconnected = fixture.store.listEvents({ sessionId, limit: 100 });
     expect(reconnected.filter((event) => event.payload.type === "artifact")).toHaveLength(1);
     expect(reconnected.filter((event) => event.payload.type === "tool_result")).toHaveLength(2);
@@ -8770,9 +9205,10 @@ describe("SessionHost", () => {
       operationId: "delete-admission-racing-input",
       connection: fixture.connection,
       sessionId,
-      prompt: { text: "must be rejected before persistence", images: [], files: [], mentions: [], disposition: "prompt" }
+      prompt: { text: "must be rejected before queue admission", images: [], files: [], mentions: [], disposition: "prompt" }
     })).toThrowError(expect.objectContaining({ publicError: expect.objectContaining({ code: "SESSION_MESSAGE_DELETE_IN_PROGRESS" }) }));
-    expect(() => fixture.store.getOperation("delete-admission-racing-input")).toThrow();
+    expect(fixture.store.getOperation("delete-admission-racing-input").status).toBe("failed");
+    expect(fixture.store.listQueueItems({ sessionId }).some(item => item.operationId === "delete-admission-racing-input")).toBe(false);
     close.release();
     await expect(deletion).resolves.toMatchObject({ value: ["delete-admission-user"] });
   });
@@ -8901,7 +9337,8 @@ describe("SessionHost", () => {
       sessionId,
       prompt: { text: "must not be queued", images: [], files: [], mentions: [], disposition: "prompt" }
     })).toThrowError(expect.objectContaining({ publicError: expect.objectContaining({ code: "SESSION_RESET_IN_PROGRESS" }) }));
-    expect(() => fixture.store.getOperation("clear-session-racing-input")).toThrow();
+    expect(fixture.store.getOperation("clear-session-racing-input").status).toBe("failed");
+    expect(fixture.store.listQueueItems({ sessionId }).some(item => item.operationId === "clear-session-racing-input")).toBe(false);
     resetGate.release();
     await expect(reset).resolves.toMatchObject({ value: sessionId });
   });
@@ -9817,6 +10254,55 @@ class ScheduleUsageFakeAdapter extends FakeBackendAdapter {
         usage: { inputTokens: 4, outputTokens: 2, totalTokens: 6, costUsd: 0.1 }
       }
     });
+    await context.emit({ type: "done", outcome: "completed" });
+  }
+}
+
+class TieredUsageFakeAdapter extends FakeBackendAdapter {
+  constructor(readonly observation: {
+    readonly requestInput: number;
+    readonly fastMode: boolean | undefined;
+    readonly omitPricingContext?: boolean;
+    readonly reportedCost?: boolean;
+  }) {
+    super({
+      ...PI_LIKE_PROFILE,
+      id: "tiered-usage-fake",
+      capabilities: PI_LIKE_PROFILE.capabilities.map((capability) => capability.key === "model.fast_mode"
+        ? { key: "model.fast_mode", supported: true } : capability),
+      models: PI_LIKE_PROFILE.models.map((model) => ({
+        ...model,
+        supportsFastMode: true,
+        cost: { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 },
+        pricing: {
+          source: "providerReference", currencyCode: "USD", fastModeMultiplier: 2,
+          longContext: { inputTokenThreshold: 272_000, inputMultiplier: 2, outputMultiplier: 1.5, cacheReadMultiplier: 2, cacheWriteMultiplier: 2 }
+        }
+      }))
+    });
+  }
+
+  override async inspectSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState> {
+    const { usage: _initialUsage, ...state } = await super.inspectSession(binding, context);
+    return state;
+  }
+
+  override async send(_input: PromptInput, context: AdapterContext): Promise<void> {
+    for (const count of [1, 2]) {
+      const usage: UsageSnapshot = {
+        inputTokens: (this.observation.requestInput - 102_000) * count,
+        outputTokens: 1_000 * count, cacheReadTokens: 100_000 * count, cacheWriteTokens: 2_000 * count,
+        totalTokens: (this.observation.requestInput + 1_000) * count,
+        ...(this.observation.omitPricingContext ? {} : { pricingContext: {
+          inputTokens: this.observation.requestInput,
+          ...(this.observation.fastMode === undefined ? {} : { fastMode: this.observation.fastMode })
+        } }),
+        cost: this.observation.reportedCost ? 0.25 * count : 0
+      };
+      await context.emit({ type: "usage", usage });
+      await context.emit({ type: "usage", usage });
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
     await context.emit({ type: "done", outcome: "completed" });
   }
 }
@@ -10804,7 +11290,7 @@ class DetachedSessionDeletionFakeAdapter extends FakeBackendAdapter {
     return super.resumeSession(binding, context);
   }
 
-  supportsDetachedSessionDeletion(): boolean {
+  override supportsDetachedSessionDeletion(): boolean {
     return true;
   }
 
@@ -10942,6 +11428,8 @@ class GatedFakeAdapter extends FakeBackendAdapter {
   failCreates = false;
   forkEditorText: string | undefined;
   forkFailure: Error | undefined;
+  forkContext: AdapterContext | undefined;
+  afterFork: (() => Promise<void>) | undefined;
   #createGate: AsyncGate | undefined;
   #forkGate: AsyncGate | undefined;
 
@@ -10977,8 +11465,9 @@ class GatedFakeAdapter extends FakeBackendAdapter {
     return binding;
   }
 
-  override async fork(entryId: string, context: AdapterContext): Promise<NativeSessionForkResult> {
+  override async fork(entryId: string, context: AdapterContext, derivation: NativeSessionDerivation): Promise<NativeSessionForkResult> {
     this.forkCalls += 1;
+    this.forkContext = context;
     const gate = this.#forkGate;
     this.#forkGate = undefined;
     if (gate !== undefined) {
@@ -10986,7 +11475,8 @@ class GatedFakeAdapter extends FakeBackendAdapter {
       await gate.wait;
     }
     if (this.forkFailure !== undefined) throw this.forkFailure;
-    const result = await super.fork(entryId, context);
+    const result = await super.fork(entryId, context, derivation);
+    await this.afterFork?.();
     return this.forkEditorText === undefined ? result : { ...result, editorText: this.forkEditorText };
   }
 }
@@ -11017,8 +11507,9 @@ class ManagedAttachFakeAdapter extends GatedFakeAdapter {
     return this.history;
   }
 
-  override async navigateTree(entryId: string, _summarize: boolean, _context: AdapterContext): Promise<void> {
-    this.history = { ...this.history, activeEntryId: entryId };
+  override async navigateTree(target: import("@joko/core").NativeNavigationTarget, _summarize: boolean, _context: AdapterContext, _instructions: string | undefined, _navigation: import("@joko/core").NativeSessionNavigation): Promise<import("@joko/core").NativeSessionNavigationResult> {
+    this.history = { ...this.history, activeEntryId: target.kind === "native_entry" ? target.entryId : undefined };
+    return { kind: "in_place" };
   }
 }
 
@@ -11142,7 +11633,7 @@ class ToolImageHistoryFakeAdapter extends FakeBackendAdapter {
     };
   }
 
-  override async navigateTree(_entryId: string, _summarize: boolean, _context: AdapterContext): Promise<void> {}
+  override async navigateTree(_target: import("@joko/core").NativeNavigationTarget, _summarize: boolean, _context: AdapterContext, _instructions: string | undefined, _navigation: import("@joko/core").NativeSessionNavigation): Promise<import("@joko/core").NativeSessionNavigationResult> { return { kind: "in_place" }; }
 }
 
 class PolicyFakeAdapter extends FakeBackendAdapter {

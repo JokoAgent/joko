@@ -2,7 +2,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
-import { timelineExportScale, timelineMathToLatex } from "./TimelineCopyAsImageBlock.js";
+import { timelineExportScale, timelineMathToLatex } from "./timeline-image-export.js";
 import { StreamingMarkdown } from "./Timeline.js";
 import { isLooseTimelineInlineMath, normalizeTimelineMathDelimiters } from "./timeline-markdown-math.js";
 import { repairTimelineMermaidSource } from "./timeline-mermaid-autofix.js";

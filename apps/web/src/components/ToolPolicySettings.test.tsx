@@ -32,6 +32,7 @@ describe("ToolPolicySettings", () => {
         backendId: "pi",
         name: "Project A",
         workspaceId: "workspace-a",
+        revision: 1n,
         workspaceName: "Project A",
         trusted: true,
         pinned: false,
@@ -90,8 +91,4 @@ describe("ToolPolicySettings", () => {
     expect(updateToolPolicySettings).toHaveBeenCalledWith("joko-ordinary-tools", undefined, { enabled: true });
   });
 
-  it("provides the new-task policy explanation in Chinese", () => {
-    expect(translate("zh-CN", "settings.toolPolicies.newTasksOnly")).toContain("现有任务");
-    expect(translate("zh-CN", "settings.toolPolicies.source.project")).toBe("项目覆盖");
-  });
 });

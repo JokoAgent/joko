@@ -50,6 +50,7 @@ import {
   TriggerScheduleMutationSchema,
   type Event,
   type EventCursor,
+  type NativeNavigationTarget,
   type Operation,
   type OperationMutation,
   type QueueItem,
@@ -111,10 +112,12 @@ export function createSessionMutation(input: {
 
 export function sendInputMutation(
   sessionId: string,
+  expectedGeneration: bigint,
   text: string,
   deliveryMode: QueueDeliveryMode = QueueDeliveryMode.PROMPT
 ): OperationMutation {
   return create(OperationMutationSchema, {
+    preconditions: [{ entity: { kind: EntityKind.SESSION, id: sessionId }, expectedGeneration }],
     payload: {
       case: "sendInput",
       value: create(SendInputMutationSchema, {
@@ -265,11 +268,16 @@ export function restartBackendMutation(backendId: string): OperationMutation {
   });
 }
 
-export function navigateMutation(sessionId: string, entryId: string): OperationMutation {
+export function navigateMutation(
+  sessionId: string,
+  target: NativeNavigationTarget,
+  expectedGeneration: bigint
+): OperationMutation {
   return create(OperationMutationSchema, {
+    preconditions: [{ entity: { kind: EntityKind.SESSION, id: sessionId }, expectedGeneration }],
     payload: {
       case: "navigateSessionBranch",
-      value: create(NavigateSessionBranchMutationSchema, { sessionId, nativeEntryId: entryId })
+      value: create(NavigateSessionBranchMutationSchema, { sessionId, target })
     }
   });
 }

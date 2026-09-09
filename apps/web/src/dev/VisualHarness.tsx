@@ -1,13 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { JSX } from "react";
+import { visualSamples } from "../i18n/visual-samples.js";
 import { AppWithController } from "../App.js";
-import { automaticConnectionTargetForProfile } from "../controller.js";
+import { automaticConnectionTargetForProfile, resolveLinkOpenPreference } from "../controller.js";
 import type { AppController, AppRoute, ControllerState } from "../controller.js";
 import {
   DEFAULT_UI_PREFERENCES,
+  LINK_OPEN_DEFAULTS,
   personalizationPromptForOwner,
   withPersonalizationPrompt,
-  type ComposerSendShortcutPreference
+  type ComposerSendShortcutPreference,
+  type LinkOpenKind,
+  type LinkOpenPreference
 } from "../local-state.js";
 import { withAppShortcutOverride } from "../app-shortcuts.js";
 import type { NavigationLayout } from "../navigation-layout.js";
@@ -15,10 +19,12 @@ import { emptySnapshot } from "../model.js";
 import { workspaceFilesHash } from "../workspace-files-navigation.js";
 import type {
   AppSnapshot,
+  ArtifactView,
   BackendView,
   ComposerDraft,
   InteractionResolutionDraft,
   InteractionView,
+  McpServerView,
   NewSessionDraft,
   PermissionMode,
   ProviderLoginFlowView,
@@ -49,6 +55,11 @@ import type {
   WorkspaceTextFileWriteResultView
 } from "../model.js";
 import { workspaceOpenTabsStore } from "../workspace-open-tabs.js";
+import { VisualTerminalFixture } from "./VisualTerminalFixture.js";
+import { VisualRemoteHostFixture } from "./VisualRemoteHostFixture.js";
+import { VisualUsageHistoryFixture } from "./VisualUsageHistoryFixture.js";
+import { UsageHistorySection } from "../components/UsageHistorySection.js";
+import { translate } from "../i18n.js";
 import { applyAppearanceTypography, clampCodeSize, clampUiSize, normalizeFontFamily } from "../appearance-settings.js";
 
 const FIXED_NOW = Date.UTC(2026, 7, 22, 4, 0, 0);
@@ -65,11 +76,24 @@ const VISUAL_SUBAGENT_TRANSCRIPT_PAGE_SIZE = 3;
 export function VisualHarness(): JSX.Element {
   const scenario = useMemo(() => harnessParameters(), []);
   const files = useMemo(() => new VisualWorkspaceFiles(), []);
+  const artifactActions = useMemo(() => ({
+    getArtifactUrl: async (blobId: string): Promise<string> => files.acquireArtifactUrl(blobId),
+    releaseArtifactUrl: (blobId: string): void => files.releaseArtifactUrl(blobId)
+  }), [files]);
   const subagents = useMemo(() => new VisualSubagentFixture(), []);
+  const terminals = useMemo(() => new VisualTerminalFixture(), []);
+  const usageHistory = useMemo(() => new VisualUsageHistoryFixture(scenario.usageState), []);
   const drafts = useRef(new Map<string, ComposerDraft>());
+  const draftActions = useMemo(() => ({
+    readDraft: async (sessionId: string): Promise<ComposerDraft | undefined> => drafts.current.get(sessionId),
+    saveDraft: async (sessionId: string, draft: ComposerDraft): Promise<void> => { drafts.current.set(sessionId, draft); }
+  }), []);
   const providerLoginFlows = useRef(new Map<string, ProviderLoginFlowView>());
   const sequence = useRef(100);
   const [state, setState] = useState<ControllerState>(() => initialControllerState(scenario, files));
+  const remoteHosts = useMemo(() => new VisualRemoteHostFixture(state.snapshot.targets, target => {
+    setState(current => ({ ...current, snapshot: { ...current.snapshot, targets: current.snapshot.targets.map(value => value.id === target.id ? target : value) } }));
+  }), []);
   const automationSettingsEnteredRef = useRef(false);
 
   useEffect(() => {
@@ -113,6 +137,24 @@ export function VisualHarness(): JSX.Element {
   const updateSnapshot = (change: (snapshot: AppSnapshot) => AppSnapshot): void => {
     setState((current) => ({ ...current, snapshot: change(current.snapshot) }));
   };
+  const providerStateRef = useRef(state);
+  providerStateRef.current = state;
+  const providerActions = useMemo(() => ({
+    saveProvider: async (draft: Parameters<AppController["saveProvider"]>[0], signal?: AbortSignal): Promise<void> => {
+      signal?.throwIfAborted();
+      const current = providerStateRef.current.snapshot.settings.providers.find((provider) => provider.id === draft.id);
+      if ((current?.revision ?? 0n) !== draft.revision) throw new Error("Provider configuration changed.");
+      const provider = { ...draft, revision: draft.revision + 1n };
+      updateSnapshot((snapshot) => ({ ...snapshot, settings: { ...snapshot.settings,
+        providers: [...snapshot.settings.providers.filter((item) => item.id !== provider.id), provider] } }));
+    },
+    saveCredential: async (draft: Parameters<AppController["saveCredential"]>[0], signal?: AbortSignal): Promise<void> => {
+      signal?.throwIfAborted();
+      const { id, name, kind, providerId } = draft;
+      updateSnapshot((snapshot) => ({ ...snapshot, settings: { ...snapshot.settings,
+        credentials: [...snapshot.settings.credentials.filter((item) => item.id !== id), { id, name, kind, providerId, configured: true }] } }));
+    }
+  }), []);
   const updateSession = (sessionId: string, change: (session: SessionView) => SessionView): void => {
     updateSnapshot((snapshot) => ({
       ...snapshot,
@@ -139,9 +181,69 @@ export function VisualHarness(): JSX.Element {
     }));
   };
 
+  const mcpActions = useMemo(() => {
+    const servers = new Map<string, McpServerView>();
+    const publish = (): void => updateSnapshot((snapshot) => ({
+      ...snapshot, settings: { ...snapshot.settings, mcpServers: [...servers.values()] }
+    }));
+    return {
+      saveMcpServer: async (draft: Parameters<AppController["saveMcpServer"]>[0]): Promise<void> => {
+        const id = draft.id || `visual-mcp-${++sequence.current}`;
+        const previous = servers.get(id);
+        if (draft.revision !== (previous?.revision ?? 0n)) throw new Error("The tool server configuration changed.");
+        servers.set(id, {
+          ...draft, id, revision: (previous?.revision ?? 0n) + 1n,
+          generation: (previous?.generation ?? 0n) + 1n,
+          state: draft.enabled ? "disconnected" : "disabled", toolCount: 0,
+          credentialIds: draft.credentialBindings.map((binding) => binding.credentialId),
+          credentialBindings: draft.credentialBindings.map((binding) => ({ ...binding, configured: true }))
+        });
+        publish(); record("mcp:saved");
+      },
+      deleteMcpServer: async (id: string): Promise<void> => { servers.delete(id); publish(); record("mcp:deleted"); },
+      restartMcpServer: async (id: string): Promise<void> => {
+        const previous = servers.get(id);
+        if (previous !== undefined) servers.set(id, { ...previous, state: "disconnected", generation: previous.generation + 1n });
+        publish(); record("mcp:restart");
+      }
+    };
+  }, []);
+
   const controller = useMemo(() => {
     const implemented = {
       state,
+      ...mcpActions,
+      ...draftActions,
+      getRemoteHostCapabilities: remoteHosts.getRemoteHostCapabilities,
+      listSshKeys: remoteHosts.listSshKeys,
+      generateSshKey: remoteHosts.generateSshKey,
+      addSshKeyToAgent: remoteHosts.addSshKeyToAgent,
+      readSshPublicKey: remoteHosts.readSshPublicKey,
+      getSshKeyInstallCommand: remoteHosts.getSshKeyInstallCommand,
+      listRemoteHosts: remoteHosts.listRemoteHosts,
+      watchRemoteHosts: remoteHosts.watchRemoteHosts,
+      refreshRemoteHostCatalog: remoteHosts.refreshRemoteHostCatalog,
+      createRemoteHost: remoteHosts.createRemoteHost,
+      updateRemoteHost: remoteHosts.updateRemoteHost,
+      deleteRemoteHost: remoteHosts.deleteRemoteHost,
+      connectRemoteHost: remoteHosts.connectRemoteHost,
+      disconnectRemoteHost: remoteHosts.disconnectRemoteHost,
+      testRemoteHostConnection: remoteHosts.testRemoteHostConnection,
+      clearRemoteHostTrust: remoteHosts.clearRemoteHostTrust,
+      saveCredential: scenario.scenario === "providers" ? providerActions.saveCredential : remoteHosts.saveCredential,
+      saveProvider: providerActions.saveProvider,
+      updateTarget: remoteHosts.updateTarget,
+      getTerminalCapabilities: terminals.getTerminalCapabilities,
+      getUsageReport: usageHistory.getUsageReport,
+      listTerminals: terminals.listTerminals,
+      createTerminal: terminals.createTerminal,
+      getTerminal: terminals.getTerminal,
+      watchTerminal: terminals.watchTerminal,
+      updateTerminalAppearance: terminals.updateTerminalAppearance,
+      writeTerminal: terminals.writeTerminal,
+      resizeTerminal: terminals.resizeTerminal,
+      restartTerminal: terminals.restartTerminal,
+      closeTerminal: terminals.closeTerminal,
       connect: async (profile, options): Promise<void> => {
         record(`connection-connect:${profile.id}:${options?.automatic === true ? "automatic" : "current"}`);
       },
@@ -260,11 +362,25 @@ export function VisualHarness(): JSX.Element {
           stableWaitMs: 500,
           maximumConcurrentSessions: 8
         },
-        supportsLocale: true,
+        supportsLocale: state.snapshot.settings.voiceInput.protocol !== "volcengineSauc"
+          && (!state.snapshot.settings.voiceInput.fallbackEnabled || state.snapshot.settings.voiceInput.fallbackProtocol !== "volcengineSauc"),
         supportsLiveDrafts: true,
         supportsRefinement: true
       }),
       testVoiceInputConnection: async () => ({ ok: true } as const),
+      updateVoiceInputServiceSettings: async (draft: Parameters<AppController["updateVoiceInputServiceSettings"]>[0]): Promise<void> => {
+        const { secret, fallbackSecret, clearCredential, clearFallbackCredential, expectedRevision, ...settings } = draft;
+        updateSnapshot((snapshot) => {
+          const current = snapshot.settings.voiceInput;
+          if (current.revision !== expectedRevision) throw new Error("Transcription settings changed. Reload before saving.");
+          return { ...snapshot, settings: { ...snapshot.settings, voiceInput: {
+            ...current, ...settings, revision: current.revision + 1n,
+            credentialConfigured: clearCredential ? false : secret !== undefined || current.credentialConfigured,
+            fallbackCredentialConfigured: clearFallbackCredential ? false : fallbackSecret !== undefined || current.fallbackCredentialConfigured
+          } } };
+        });
+        record("voice:settings");
+      },
       cancelAutomaticConnectionAttempt: (): void => { record("cancel-automatic-attempt"); },
       setAutomaticConnectionEnabled: async (enabled: boolean): Promise<void> => {
         if (enabled && state.activeProfile === undefined) throw new Error("The visual Orchestrator owner is unavailable.");
@@ -439,6 +555,31 @@ export function VisualHarness(): JSX.Element {
           }
         }));
       },
+      updateAuxiliaryTextSettings: async (models, expectedRevision): Promise<void> => {
+        updateSnapshot((snapshot) => {
+          const current = snapshot.settings.auxiliaryText;
+          if (current.revision !== expectedRevision) throw new Error("Auxiliary text settings changed. Reload before saving.");
+          const keys = models.map((route) => JSON.stringify([route.backendId, route.providerId, route.modelId]));
+          if (models.length > 3 || new Set(keys).size !== keys.length) throw new Error("Choose up to three different models.");
+          const revision = current.revision + 1n;
+          return { ...snapshot, settings: { ...snapshot.settings, auxiliaryText: {
+            ...current, models: models.map((route) => ({ ...route })), revision,
+            runtimeRevision: `visual-auxiliary:${revision}`
+          } } };
+        });
+        record("auxiliary-text:saved");
+      },
+      updateSubagentModelSettings: async (backendId, model, expectedRevision): Promise<void> => {
+        updateSnapshot((snapshot) => ({ ...snapshot, settings: { ...snapshot.settings,
+          subagentModels: snapshot.settings.subagentModels.map((setting) => {
+            if (setting.backendId !== backendId) return setting;
+            if (setting.revision !== expectedRevision) throw new Error("Subagent model settings changed. Reload before saving.");
+            const { model: _previous, ...current } = setting;
+            return { ...current, ...(model === undefined ? {} : { model: { ...model } }), revision: setting.revision + 1n };
+          })
+        } }));
+        record("subagent-model:saved");
+      },
       resetPromptRecommendationSettings: async (): Promise<void> => {
         record("prompt-recommendation:reset");
         updateSnapshot((snapshot) => ({
@@ -513,13 +654,13 @@ export function VisualHarness(): JSX.Element {
           }
         }));
       },
-      setLinkOpenPreference: async (linkOpenPreference: ControllerState["preferences"]["linkOpenPreference"]): Promise<void> => {
-        record(`link-open:${linkOpenPreference}`);
-        setState((current) => ({ ...current, preferences: { ...current.preferences, linkOpenPreference } }));
+      setLinkOpenPreference: async (kind: LinkOpenKind, preference: LinkOpenPreference): Promise<void> => {
+        record(`link-open:${kind}:${preference}`);
+        setState((current) => ({ ...current, preferences: { ...current.preferences, ...(kind === "web" ? { webLinkOpenPreference: preference } : { localLinkOpenPreference: preference }) } }));
       },
-      resetLinkOpenPreference: async (): Promise<void> => {
-        record("link-open:reset");
-        setState((current) => ({ ...current, preferences: { ...current.preferences, linkOpenPreference: "sidebar" } }));
+      resetLinkOpenPreference: async (kind: LinkOpenKind): Promise<void> => {
+        record(`link-open:${kind}:reset`);
+        setState((current) => ({ ...current, preferences: { ...current.preferences, ...(kind === "web" ? { webLinkOpenPreference: LINK_OPEN_DEFAULTS.web } : { localLinkOpenPreference: LINK_OPEN_DEFAULTS.local }) } }));
       },
       setStreamFadeEnabled: async (streamFadeEnabled: boolean): Promise<void> => {
         record(`stream-fade:${streamFadeEnabled ? "on" : "off"}`);
@@ -530,9 +671,7 @@ export function VisualHarness(): JSX.Element {
         setState((current) => ({ ...current, preferences: { ...current.preferences, streamFadeEnabled: true } }));
       },
       openHttpLink: async (url: string, options?: { readonly forceExternal?: boolean; readonly forceSidebar?: boolean; readonly sessionId?: string }): Promise<void> => {
-        const destination = options?.forceExternal === true
-          ? "external"
-          : options?.forceSidebar === true ? "sidebar" : state.preferences.linkOpenPreference;
+        const destination = resolveLinkOpenPreference(state.preferences, url, options);
         record(`open-link:${destination}:${new URL(url).origin}`);
         if (destination === "external") return;
         const browser = state.snapshot.browsers.find((candidate) => candidate.state === "ready");
@@ -608,11 +747,10 @@ export function VisualHarness(): JSX.Element {
         }));
       },
       dismissExtensionNotification: (): void => undefined,
-      readDraft: async (sessionId: string): Promise<ComposerDraft | undefined> => drafts.current.get(sessionId),
-      saveDraft: async (sessionId: string, draft: ComposerDraft): Promise<void> => {
-        drafts.current.set(sessionId, draft);
-      },
-      send: async (sessionId: string, draft: ComposerDraft): Promise<void> => {
+      send: async (sessionId: string, draft: ComposerDraft, admission: { readonly expectedGeneration: bigint }): Promise<void> => {
+        if (state.snapshot.sessions.find(session => session.id === sessionId)?.generation !== admission.expectedGeneration) {
+          throw new Error("The source task generation has changed.");
+        }
         record(`send:${sessionId}:${draft.deliveryMode}`);
         updateSnapshot((snapshot) => {
           const current = snapshot.timelineBySession.get(sessionId) ?? [];
@@ -1146,7 +1284,15 @@ export function VisualHarness(): JSX.Element {
       cancelQueueItem: async (queueItemId: string): Promise<void> => { record(`queue-cancel:${queueItemId}`); },
       setQueueItemEditLock: async (queueItemId: string, _lockToken: string, locked: boolean): Promise<void> => { record(`queue-edit-lock:${queueItemId}:${String(locked)}`); },
       setQueueInteractionLock: async (sessionId: string, _lockToken: string, locked: boolean): Promise<void> => { record(`queue-interaction-lock:${sessionId}:${String(locked)}`); },
-      editQueueItem: async (queueItemId: string): Promise<void> => { record(`queue-edit:${queueItemId}`); },
+      editQueueItem: async (queueItemId, text, mode): Promise<void> => {
+        record(`queue-edit:${queueItemId}`);
+        updateSnapshot((snapshot) => ({
+          ...snapshot,
+          queue: snapshot.queue.map((item) => item.id === queueItemId
+            ? { ...item, text, mode, revision: item.revision + 1n }
+            : item)
+        }));
+      },
       reorderQueueItem: async (queueItemId: string): Promise<void> => { record(`queue-reorder:${queueItemId}`); },
       steerQueueItemNow: async (queueItemId: string): Promise<void> => { record(`queue-steer:${queueItemId}`); },
       pauseQueue: async (sessionId: string): Promise<void> => { record(`pause-queue:${sessionId}`); },
@@ -1232,9 +1378,9 @@ export function VisualHarness(): JSX.Element {
           inflightCount: 1
         };
       },
-      getArtifactUrl: async (blobId: string): Promise<string> => files.acquireArtifactUrl(blobId),
-      releaseArtifactUrl: (blobId: string): void => files.releaseArtifactUrl(blobId),
-      downloadArtifact: async (blobId: string, name: string): Promise<void> => { record(`artifact-download:${blobId}:${name}`); },
+      getArtifactUrl: artifactActions.getArtifactUrl,
+      releaseArtifactUrl: artifactActions.releaseArtifactUrl,
+      downloadArtifact: async (blobId, name, context) => { context.signal.throwIfAborted(); record(`artifact-download:${blobId}:${name}`); return "dispatched"; },
       listSubagentRuns: async (
         sessionId: string,
         runState?: SubagentRunStateView,
@@ -1328,7 +1474,7 @@ export function VisualHarness(): JSX.Element {
           snapshotToken: "visual-catalog-snapshot"
         };
       },
-      createSession: async (draft: NewSessionDraft): Promise<string> => {
+      createSession: async (draft: NewSessionDraft): ReturnType<AppController["createSession"]> => {
         const id = `session-${sequence.current++}`;
         const next: SessionView = {
           id,
@@ -1348,7 +1494,7 @@ export function VisualHarness(): JSX.Element {
         };
         updateSnapshot((snapshot) => ({ ...snapshot, sessions: [...snapshot.sessions, next] }));
         record(`session-create:${id}`);
-        return id;
+        return { sessionId: id, generation: next.generation };
       }
     } satisfies Partial<AppController>;
     return new Proxy(implemented, {
@@ -1357,7 +1503,11 @@ export function VisualHarness(): JSX.Element {
         return async (): Promise<undefined> => undefined;
       }
     }) as unknown as AppController;
-  }, [state]);
+  }, [artifactActions, draftActions, mcpActions, remoteHosts, state, usageHistory]);
+
+  if (scenario.scenario === "usage") return <main style={{ maxWidth: 1040, margin: "0 auto" }}>
+    <UsageHistorySection controller={controller} t={(key, values) => translate(state.preferences.locale, key, values)} />
+  </main>;
 
   return <AppWithController
     controller={controller}
@@ -1871,6 +2021,8 @@ class VisualWorkspaceFiles {
     this.#seedBinary("assets/preview.png", visualBase64Bytes(VISUAL_PNG_BASE64), "image/png");
     this.#seedBinary("assets/manual.pdf", visualPdfBytes(), "application/pdf");
     this.#seedBinary("assets/clip.webm", visualBase64Bytes(VISUAL_WEBM_BASE64), "video/webm");
+    this.#seedBinary("assets/tone.wav", visualAudioBytes(), "audio/wav");
+    this.#seedBinary("assets/pyramid.glb", visualModelBytes(), "model/gltf-binary");
     this.#seedBinary("assets/archive.bin", new Uint8Array([0, 1, 2, 3, 127, 128, 254, 255]), "application/octet-stream");
     this.#seedFile("assets/architecture.drawio", visualDrawioXml(), "application/xml");
     this.#seedFile("docs/RICH_PREVIEW.md", [
@@ -2235,6 +2387,43 @@ function visualBase64Bytes(value: string): Uint8Array {
   return Uint8Array.from(binary, (character) => character.charCodeAt(0));
 }
 
+/** An original eight-second PCM tone, decoded by the real browser audio element. */
+function visualAudioBytes(): Uint8Array {
+  const sampleRate = 22_050;
+  const samples = sampleRate * 8;
+  const bytes = new Uint8Array(44 + samples * 2);
+  const view = new DataView(bytes.buffer);
+  for (const [offset, text] of [[0, "RIFF"], [8, "WAVE"], [12, "fmt "], [36, "data"]] as const) {
+    bytes.set(new TextEncoder().encode(text), offset);
+  }
+  view.setUint32(4, bytes.length - 8, true);
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  view.setUint32(40, samples * 2, true);
+  for (let index = 0; index < samples; index += 1) {
+    const fade = Math.min(1, index / 220, (samples - index) / 220);
+    view.setInt16(44 + index * 2, Math.round(Math.sin(index * 2 * Math.PI * 220 / sampleRate) * 2_000 * fade), true);
+  }
+  return bytes;
+}
+
+function visualAudioArtifact(): ArtifactView {
+  return {
+    id: "audio-preview", blobId: "visual-blob:assets/tone.wav", kind: "file", title: "Gentle tone",
+    description: "An original eight-second tone for checking playback, seeking, and media ownership.",
+    fileName: "tone.wav", mediaType: "audio/wav", byteSize: 44 + 22_050 * 8 * 2,
+    audioMetadata: {
+      kind: "music", title: "Gentle tone", description: "Piano · Gentle melody", durationSeconds: 12,
+      artwork: { blobId: "visual-blob:assets/preview.png", width: 320, height: 200, alt: "Tone artwork" }
+    }
+  };
+}
+
 function visualPdfBytes(): Uint8Array {
   const firstPage = "BT /F1 24 Tf 72 720 Td (Joko Files PDF page 1) Tj ET";
   const secondPage = "BT /F1 24 Tf 72 720 Td (Every PDF page renders) Tj ET";
@@ -2265,7 +2454,39 @@ function visualDrawioXml(): string {
 }
 
 const VISUAL_PNG_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAUAAAADICAIAAAAWZq/8AAAACXBIWXMAAAABAAAAAQBPJcTWAAAFPUlEQVR4nO3dXY7cRBSGYRcMygULYNfccMcGWADLg+SgGSVoEKD8TLuqvlPPo76YtJTutN2vj+0k9rgWqblvN+rjG9aY+8Z//wHWvO1Viz7wss87/mOlz3jfa42n6wAzVyT7qDHar/r+AbdfhZzccPOAe688vkTvhjsH3Hi18VWqb8NtA+66wvg21bThngG3XFW8UXVsuGHA/VYSj1LtGu4WcLPVw8NVr4ZbBdxpxXCfatRwn4DbrBImqC4NNwm4x8pgpmrRcIeAG6wGlqj8huMDTl8BrFXhDWcHHL3o2UQlNxwccO5CZzcV23BqwKGLm21VZsORAScuaPZXgQ1HBgykBhy3jSRIpQ3hsICzFi6JKqrhpICDFivRKqfhpICB1IBTtoj0UCFDOCPgiEVJM5XQcEDA+y9EuqrtGw4IGEgNePPtH+3V3kN464B3XnCcozZueOuAgdSAt93mcaDadQhvGvCeC4uT1ZYNbxowkBrwhts5uLYcwjsGDKQGvNsWDnYewnsFvNWigf0b3itgIDXgfbZqkDKENwoYSA14k+0ZZA3hXQIGUgPeYUsGiUN4i4CB1ICXb8MgdwivDxhIDdj4JV0tHcImMARbGbDxSw81xrVoCJvAEEzAEGxZwPaf6WQ8n8lasBdtAkOwNQFX1VjyxtBrCJvAEEzAEGxBwEuO9aHlXrQJDMFmB2z80tuYO4RNYAgmYAg2NWD7z5xgTNyLNoEhmIAhmIAh2LyAHQBzjjHrMNgEhmAChmAChmCTAnYAzGnGlMNgExiCCRiCCRiCzQjYATBnGvcfBpvAHG28+vlNsY01l2kUMAQTMAQTMAS7PWBnsNhZvTruHW84jv2/17n7PJYJDMEEDMEEDMEEDMEEDMHuDdgpaBh3nog2gSGYgCGYgCGYgCGYgCGYgCGYgCGYgCGYgCGYgCGYgCGYgCGYgCGYgDnaeND1nB/1Ol9LwBBMwBBMwBBMwBytbr4u9N0EDMEEDMEEDMEEDMEEDMEEDMEEDMEEDMEEDMEEDMEEDMEEDMEEDMGecm9tDBFuTcAEhmAChmAChmAChmAC5mjj1fWr3nK2qe11oZ2I5mR189/CmMAQTMAQTMAcrV7/YtFx7FsIGILNCNh5LM5U9/87YhMYggkYggkYgk0K2GEwp6kp/5HWBIZgAoZgAoZg8wJ2GMw5ataVpExgCCZgCCZgCDY1YIfBnKAmXkrZBIZgAoZgswO2F01vNfdWJCYwBFsQsCFMVzX9TmAmMAQTMARbE/DzZezddpReasVX2gSGYE/PG42nfz5+mPLMb+ONr/NhXH9eHx9/fPrhs8/8Xt/yu97+zI+ffnj/stinLehx/fqwV/4wpi6yb3pm/PSvZ97P+Dr/fF2/jAe/8suX5TMf3gSGYAKGYAKGYAKGYAKGYAKGYAKGYAKGYAKGYAKGYAKGYAKGYAKGYAKGYAKGYAKGYAKGYAKGYAKGYAKGYAKGYAKGYAKGYAKGYAKGYE/j+nSd97m+6jYy43F3nannD7zAore96oEf+Lvrevfy2Pnzjke+2pd/8e65LdL3L4938RO4Xu4pvPpPwVlGwlcuI2ANM9lIqDcpYCA7YDvSzDFCxm9YwBpmgpFTb17AGuZWI6reyICB7IAdDHOHkTZ+UwPWMA83AusNDljDPFBovdkBa5jD640PWMOcXG+HgDXMsfU2CVjDnFlvn4A1zIH1tgpYw5xWb7eANcxR9TYMWMOcU2/PgDXMIfW2DVjDnFBv54A1TPt6mwesYa7W9fYPWMOHG63rva7rL2iOQ+wT+qBUAAAAAElFTkSuQmCC";
-const VISUAL_WEBM_BASE64 = "GkXfo59ChoEBQveBAULygQRC84EIQoKEd2VibUKHgQJChYECGFOAZwEAAAAAAAJrEU2bdLpNu4tTq4QVSalmU6yBoU27i1OrhBZUrmtTrIHYTbuMU6uEElTDZ1OsggElTbuMU6uEHFO7a1OsggJV7AEAAAAAAABZAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVSalmsirXsYMPQkBNgI1MYXZmNjIuMTIuMTAxV0GNTGF2ZjYyLjEyLjEwMUSJiEB/QAAAAAAAFlSua8iuAQAAAAAAAD/XgQFzxYhzuhrsgip0M5yBACK1nIN1bmSIgQCGhVZfVlA5g4EBI+ODhAT3kNXgkLCBoLqBWpqBAlWwhFW5gQESVMNnQIBzc6BjwIBnyJpFo4dFTkNPREVSRIeNTGF2ZjYyLjEyLjEwMXNz2mPAi2PFiHO6GuyCKnQzZ8ilRaOHRU5DT0RFUkSHmExhdmM2Mi4yOC4xMDEgbGlidnB4LXZwOWfIoUWjiERVUkFUSU9ORIeTMDA6MDA6MDAuNTAwMDAwMDAwAB9DtnVApOeBAKOsgQAAgIJJg0IACfAFlgA4JBwYQgAAMGAAAGf7///o7/f//+fZ/lNRUyilzwCjlYEAUwCGAECSnABJQAADIAAAWfmG4KOVgQCnAIYAQJKcAErAAAMgAABZ+Ybgo5WBAPoAhgBAkpwAScAAAyAAAFn5huCjlYEBTQCGAECSnABIoAADIAAAWfmG4KOVgQGhAIYAQJKcAEeAAAMgAABZ+YbgHFO7a5G7j7OBALeK94EB8YIBq/CBAw==";
+/** A self-contained tetrahedron exercises the real local model renderer. */
+function visualModelBytes(): Uint8Array {
+  const positions = new Float32Array([-1, 0, -1, 1, 0, -1, 0, 0, 1, 0, 1.8, 0]);
+  const indices = new Uint16Array([0, 2, 1, 0, 1, 3, 1, 2, 3, 2, 0, 3]);
+  const binary = new Uint8Array(positions.byteLength + indices.byteLength);
+  binary.set(new Uint8Array(positions.buffer));
+  binary.set(new Uint8Array(indices.buffer), positions.byteLength);
+  const source = new TextEncoder().encode(JSON.stringify({
+    asset: { version: "2.0" }, scene: 0, scenes: [{ nodes: [0] }], nodes: [{ mesh: 0 }],
+    meshes: [{ primitives: [{ attributes: { POSITION: 0 }, indices: 1, material: 0 }] }],
+    materials: [{ pbrMetallicRoughness: { baseColorFactor: [0.95, 0.58, 0.16, 1], metallicFactor: 0, roughnessFactor: 0.8 }, doubleSided: true }],
+    buffers: [{ byteLength: binary.byteLength }],
+    bufferViews: [{ buffer: 0, byteOffset: 0, byteLength: positions.byteLength, target: 34962 }, { buffer: 0, byteOffset: positions.byteLength, byteLength: indices.byteLength, target: 34963 }],
+    accessors: [{ bufferView: 0, componentType: 5126, count: 4, type: "VEC3", min: [-1, 0, -1], max: [1, 1.8, 1] }, { bufferView: 1, componentType: 5123, count: 12, type: "SCALAR" }]
+  }));
+  const jsonLength = Math.ceil(source.byteLength / 4) * 4;
+  const bytes = new Uint8Array(12 + 8 + jsonLength + 8 + binary.byteLength);
+  const header = new DataView(bytes.buffer);
+  header.setUint32(0, 0x46546c67, true);
+  header.setUint32(4, 2, true);
+  header.setUint32(8, bytes.byteLength, true);
+  header.setUint32(12, jsonLength, true);
+  header.setUint32(16, 0x4e4f534a, true);
+  bytes.fill(32, 20, 20 + jsonLength);
+  bytes.set(source, 20);
+  header.setUint32(20 + jsonLength, binary.byteLength, true);
+  header.setUint32(24 + jsonLength, 0x004e4942, true);
+  bytes.set(binary, 28 + jsonLength);
+  return bytes;
+}
+
+// Six seconds with seek points exercise looping and native seek controls in the browser.
+const VISUAL_WEBM_BASE64 = "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";
 
 function abortError(): Error {
   return typeof DOMException === "undefined"
@@ -2274,8 +2495,11 @@ function abortError(): Error {
 }
 
 interface HarnessParameters {
-  readonly scenario: "session" | "question" | "long-question" | "files" | "review" | "personalization" | "providers" | "voice" | "automation" | "scheduler" | "connection" | "connections" | "browser" | "background" | "subagents";
+  readonly scenario: "session" | "question" | "long-question" | "files" | "audio" | "review" | "personalization" | "providers" | "voice" | "automation" | "scheduler" | "connection" | "connections" | "browser" | "background" | "subagents" | "usage";
+  readonly usageState: "ready" | "empty" | "error";
   readonly theme: Theme;
+  readonly richCopy: boolean;
+  readonly markdown: boolean;
   readonly running: boolean;
   readonly queue: boolean;
   readonly queueLock: "none" | "edit" | "interaction";
@@ -2296,6 +2520,7 @@ function harnessParameters(): HarnessParameters {
     scenario: scenarioValue === "question"
       || scenarioValue === "long-question"
       || scenarioValue === "files"
+      || scenarioValue === "audio"
       || scenarioValue === "review"
       || scenarioValue === "personalization"
       || scenarioValue === "providers"
@@ -2307,9 +2532,13 @@ function harnessParameters(): HarnessParameters {
       || scenarioValue === "browser"
       || scenarioValue === "background"
       || scenarioValue === "subagents"
+      || scenarioValue === "usage"
       ? scenarioValue
       : "session",
     theme: themeValue === "dark" ? "dark" : "light",
+    usageState: query.get("usageState") === "empty" ? "empty" : query.get("usageState") === "error" ? "error" : "ready",
+    richCopy: query.get("richCopy") === "1",
+    markdown: query.get("markdown") === "1",
     running: query.get("running") === "1",
     queue: query.get("queue") === "1",
     queueLock: query.get("queueLock") === "edit"
@@ -2321,7 +2550,7 @@ function harnessParameters(): HarnessParameters {
         ? "backend"
         : query.get("queueSource") === "retry" ? "retry" : "user",
     interaction: query.get("interaction") !== "0",
-    composerSendShortcut: shortcutValue === "modifier-enter" || shortcutValue === "modifierEnter" ? "modifier-enter" : "enter",
+    composerSendShortcut: shortcutValue === "modifier-enter" ? "modifier-enter" : "enter",
     computerUpdate: updateValue === "available" || updateValue === "downloading" || updateValue === "installing"
       ? updateValue
       : "none",
@@ -2463,6 +2692,7 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
     ["session.resume", capability("session.resume")],
     ["background.tasks", capability("background.tasks")],
     ["subagents.list", capability("subagents.list")],
+    ["subagents.default_model", capability("subagents.default_model")],
     ["subagents.detail", capability("subagents.detail")],
     ["subagents.transcript", capability("subagents.transcript")],
     ["subagents.control", capability("subagents.control")],
@@ -2473,16 +2703,10 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
     id: "api",
     name: "api",
     kind: "apiKey",
-    compatibility: "openaiResponses",
-    endpoint: "",
-    credentialId: "",
     enabled: false,
-    keyless: false,
-    authHeader: false,
-    environmentName: "",
-    modelCount: 0,
-    headers: [],
-    models: []
+    revision: 1n,
+    runtimes: [{ backendId: "visual-pi", compatibility: "openaiResponses", endpoint: "", credentialId: "", credentialOrigin: "",
+      keyless: false, authHeader: false, environmentName: "", headers: [], models: [] }]
   };
   const providerCatalogModel = (
     backendId: string,
@@ -2520,7 +2744,7 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
       name: "OpenAI",
       kind: "subscription",
       accessProduct: "ChatGPT",
-      compatibility: providerConfiguration.compatibility,
+      compatibility: "openaiResponses",
       authenticationState: "authenticated" as const,
       endpoint: "",
       ownerManaged: false,
@@ -2545,7 +2769,7 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
       name: providerConfiguration.name,
       kind: providerConfiguration.kind,
       accessProduct: "API",
-      compatibility: providerConfiguration.compatibility,
+      compatibility: "openaiResponses",
       authenticationState: "signedOut",
       endpoint: "",
       ownerManaged: true,
@@ -2579,9 +2803,12 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
     }
   ];
   const providerBackends: AppSnapshot["backends"] = [
-    { id: "visual-code", name: "Codex", version: "dev", health: "healthy", installationState: "installed", capabilities },
-    { id: "visual-pi", name: "Pi", version: "dev", health: "healthy", installationState: "installed", capabilities },
-    { id: "visual-local-cli", name: "Claude Code", version: "dev", health: "healthy", installationState: "installed", capabilities }
+    { id: "visual-code", name: "Codex", version: "dev", health: "healthy", installationState: "installed", capabilities: new Map([...capabilities, ["provider.managed_catalog", capability("provider.managed_catalog")]]),
+      providerRuntimeSupport: { protocols: ["openaiResponses"], fields: ["requestPath", "modelsEndpoint", "headers", "keyless", "modelCosts", "modelInputModalities", "modelFastMode"] } },
+    { id: "visual-pi", name: "Pi", version: "dev", health: "healthy", installationState: "installed", capabilities: new Map([...capabilities, ["provider.managed_catalog", capability("provider.managed_catalog")]]),
+      providerRuntimeSupport: { protocols: ["anthropic", "openaiResponses", "openaiCompletions", "google"], fields: ["modelsEndpoint", "headers", "keyless", "authHeader", "modelLimits", "modelCosts", "modelInputModalities", "modelThinkingLevels", "modelSampling", "modelCompatibility", "modelFastMode"] } },
+    { id: "visual-local-cli", name: "Claude Code", version: "dev", health: "healthy", installationState: "installed", capabilities: new Map([...capabilities, ["provider.managed_catalog", capability("provider.managed_catalog")]]),
+      providerRuntimeSupport: { protocols: ["anthropic"], fields: ["requestPath", "modelsEndpoint", "headers", "keyless", "authHeader", "modelCosts", "modelInputModalities", "modelThinkingLevels"] } }
   ];
   const filesSessionNames = ["End-to-end visual verification", "Polish file browser interactions", "Verify Pi RPC contract"];
   const sessions: SessionView[] = Array.from({ length: parameters.scenario === "files" ? filesSessionNames.length : 9 }, (_, index) => ({
@@ -2612,8 +2839,45 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
   }));
   const timelineBySession = new Map(base.timelineBySession);
   timelineBySession.set("session-1", [
-    { id: "message-1", sequence: 1n, kind: "user", createdAt: FIXED_NOW - 4_000, text: "Inspect the coding interface across runtime, interaction, and recovery surfaces." },
-    { id: "message-2", sequence: 2n, kind: "assistant", createdAt: FIXED_NOW - 2_000, text: "The deterministic harness renders the real Joko components.\n\n- Keyboard behavior\n- Responsive geometry\n- Question wizard", streaming: parameters.running },
+    { id: "message-1", sequence: 1n, kind: "user", createdAt: FIXED_NOW - 4_000, text: "Inspect the coding interface across runtime, interaction, and recovery surfaces.", ...(parameters.scenario === "files" ? { attachments: [visualAudioArtifact()] } : {}) },
+    { id: "message-2", sequence: 2n, kind: "assistant", createdAt: FIXED_NOW - 2_000, text: parameters.richCopy ? [
+      "### Copy and annotate",
+      "",
+      "| Surface | Format | State |",
+      "| :--- | :---: | ---: |",
+      visualSamples.mixedScriptTableRow,
+      "| Formula | PNG + LaTeX | Ready |",
+      "",
+      "$$",
+      "\\int_0^1 x^2\\,dx = \\frac{1}{3}",
+      "$$",
+      "",
+      "```typescript",
+      "const message = 'Joko keeps the selected source together.';",
+      "```",
+      "",
+      "```mermaid",
+      "flowchart LR",
+      "  A[Source] --> B[Image] --> C[Annotation]",
+      "```"
+    ].join("\n") : "The deterministic harness renders the real Joko components.\n\n- Keyboard behavior\n- Responsive geometry\n- Question wizard", streaming: parameters.running },
+    ...(parameters.scenario === "files" ? [{
+      id: "model-preview", sequence: 3n, kind: "artifact" as const, createdAt: FIXED_NOW - 1_000,
+      artifact: { id: "model-preview", blobId: "visual-blob:assets/pyramid.glb", kind: "file" as const, title: "Pyramid model", fileName: "pyramid.glb", mediaType: "model/gltf-binary", byteSize: visualModelBytes().byteLength }
+    }, {
+      id: "audio-preview", sequence: 4n, kind: "artifact" as const, createdAt: FIXED_NOW - 500,
+      artifact: visualAudioArtifact()
+    }] : []),
+    ...(parameters.scenario === "audio" ? ["music", "missing-artwork", "sound-effect"].map((kind, index) => {
+      const artifact = visualAudioArtifact();
+      const title = kind === "music" ? artifact.title : kind === "missing-artwork" ? "Quiet melody · Artwork unavailable" : "Soft chime";
+      return {
+        id: `audio-${kind}`, sequence: BigInt(index + 3), kind: "artifact" as const, createdAt: FIXED_NOW - 1000 + index,
+        artifact: { ...artifact, id: `audio-${kind}`, title, audioMetadata: kind === "music" ? artifact.audioMetadata : kind === "missing-artwork"
+          ? { ...artifact.audioMetadata!, title: "Quiet melody · Artwork unavailable", artwork: { ...artifact.audioMetadata!.artwork!, blobId: "visual-blob:assets/unavailable.png" } }
+          : { kind: "sound_effect" as const, title: "Soft chime", description: "", durationSeconds: 8 } }
+      };
+    }) : []),
     ...(parameters.scenario === "subagents" ? [{
       id: "subagent-running",
       sequence: 3n,
@@ -2796,6 +3060,15 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
           customized: true,
           customizedFields: ["enabled", "primary"]
         },
+        auxiliaryText: {
+          models: [],
+          automaticModels: [{ backendId: textModel.backendId, providerId: textModel.providerId, modelId: textModel.modelId }],
+          options: [textModel, model].map(({ backendId, providerId, modelId }) => ({
+            route: { backendId, providerId, modelId }, available: true, unavailableReason: ""
+          })),
+          available: true, unavailableReason: "", revision: 1n, runtimeRevision: "visual-auxiliary:1"
+        },
+        subagentModels: [{ backendId: model.backendId, available: true, unavailableReason: "", revision: 1n }],
         promptRecommendation: {
           enabled: true,
           available: true,
@@ -2811,14 +3084,17 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
             id: "visual-text-provider",
             name: "Visual text provider",
             kind: "managed" as const,
+            enabled: true,
+            revision: 1n,
+            runtimes: [{
+            backendId: "visual-backend",
             compatibility: "openaiResponses" as const,
             endpoint: "https://provider.invalid/v1",
             credentialId: "",
-            enabled: true,
             keyless: true,
             authHeader: false,
             environmentName: "",
-            modelCount: 1,
+            credentialOrigin: "",
             headers: [],
             models: [{
               modelId: "visual-refiner",
@@ -2833,7 +3109,7 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
               cacheWriteCostMicrosPerMillion: 0,
               thinkingLevels: [],
               supportsFastMode: false
-            }]
+            }] }]
           }],
           voiceInput: {
             ...base.settings.voiceInput,
@@ -2843,8 +3119,7 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
             model: "gpt-realtime-whisper",
             keyless: true,
             refinementEnabled: true,
-            refinerProviderId: "visual-text-provider",
-            refinerModelId: "visual-refiner",
+            refinerModel: { backendId: "visual-backend", providerId: "visual-text-provider", modelId: "visual-refiner" },
             revision: 1n
           }
         }
@@ -2920,6 +3195,14 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
       : parameters.scenario === "browser"
         ? { ...base.settings, revision: 1n, browsers: [browserSettings] }
         : base.settings;
+  if (parameters.markdown) {
+    const diff = ["--- a/example.ts", "+++ b/example.ts", "@@ -1,2 +1,2 @@", " context line", "- previous value", `+ ${visualSamples.mixedScriptDiffValue.repeat(45)}`, "+ short addition", "- short removal", " context tail"].join("\n");
+    timelineBySession.set("session-1", [
+      { id: "markdown-user", sequence: 1n, kind: "user", createdAt: FIXED_NOW - 4000, text: "Check diff rows, long lines, and Markdown links." },
+      { id: "markdown-thinking", sequence: 2n, kind: "thinking", createdAt: FIXED_NOW - 3000, text: `\`\`\`diff\n${diff}\n\`\`\`` },
+      { id: "markdown-assistant", sequence: 3n, kind: "assistant", createdAt: FIXED_NOW - 2000, text: ["### Diff and link boundaries", "", `\`\`\`diff\n${diff}\n\`\`\``, "", visualSamples.internationalLinkProse, "", visualSamples.internationalMarkdownLinks, "", "Final paragraph stays readable after the long code line."].join("\n") }
+    ]);
+  }
   return {
     ...base,
     revision: 1n,
@@ -2977,7 +3260,7 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
       transfers: [],
       revision: 0n
     }] : [],
-    targets: [{ id: "visual-target", backendId: "visual-backend", name: "Joko workspace", workspaceId: "visual-workspace", workspaceName: "Joko workspace", trusted: true, pinned: true, archived: false }],
+    targets: [{ id: "visual-target", backendId: "visual-backend", name: "Joko workspace", workspaceId: "visual-workspace", revision: 1n, workspaceName: "Joko workspace", trusted: true, pinned: true, archived: false }],
     sessions,
     schedules: parameters.scenario === "scheduler" ? visualSchedulerSchedules() : [],
     timelineBySession,

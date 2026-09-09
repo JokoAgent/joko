@@ -1,0 +1,221 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+import "joko/v1/capability.proto";
+
+// Interactive user processes belong to the service. Disconnecting a client or
+// ending a stream never closes a terminal. Input and output are volatile and
+// must not be copied into Events, Operations, logs, or diagnostic bundles.
+service TerminalService {
+  rpc GetTerminalCapabilities(GetTerminalCapabilitiesRequest) returns (GetTerminalCapabilitiesResponse);
+  rpc ListTerminals(ListTerminalsRequest) returns (ListTerminalsResponse);
+  rpc CreateTerminal(CreateTerminalRequest) returns (CreateTerminalResponse);
+  rpc GetTerminal(GetTerminalRequest) returns (GetTerminalResponse);
+  rpc WatchTerminal(WatchTerminalRequest) returns (stream WatchTerminalResponse);
+  rpc UpdateTerminalAppearance(UpdateTerminalAppearanceRequest) returns (UpdateTerminalAppearanceResponse);
+  rpc WriteTerminal(WriteTerminalRequest) returns (WriteTerminalResponse);
+  rpc ResizeTerminal(ResizeTerminalRequest) returns (ResizeTerminalResponse);
+  rpc RestartTerminal(RestartTerminalRequest) returns (RestartTerminalResponse);
+  rpc CloseTerminal(CloseTerminalRequest) returns (CloseTerminalResponse);
+}
+
+enum TerminalStatus {
+  TERMINAL_STATUS_UNSPECIFIED = 0;
+  TERMINAL_STATUS_RUNNING = 1;
+  TERMINAL_STATUS_EXITED = 2;
+  TERMINAL_STATUS_FAILED = 3;
+  TERMINAL_STATUS_CLOSED = 4;
+}
+
+message TerminalShell {
+  // Opaque catalog identity, never an arbitrary client-supplied executable.
+  string id = 1;
+  string label = 2;
+}
+
+message Terminal {
+  string id = 1;
+  string session_id = 2;
+  string target_id = 3;
+  uint64 generation = 4;
+  TerminalStatus status = 5;
+  string shell_id = 6;
+  string shell_label = 7;
+  // The initial directory is resolved by Session/Workspace authority. It is
+  // not an OS sandbox and does not constrain later interactive shell commands.
+  string cwd = 8;
+  uint32 columns = 9;
+  uint32 rows = 10;
+  optional int32 exit_code = 11;
+  google.protobuf.Timestamp created_at = 12;
+  google.protobuf.Timestamp updated_at = 13;
+  optional int32 exit_signal = 14;
+  // False after transport loss until the process owner confirms termination.
+  bool exit_confirmed = 15;
+  // Stable service-owned code. Never includes process output or connector text.
+  string failure_code = 16;
+}
+
+message GetTerminalCapabilitiesRequest {
+  // Empty queries the service shell catalog without creating a task.
+  string session_id = 1;
+}
+
+message GetTerminalCapabilitiesResponse {
+  CapabilitySupport support = 1;
+  string reason = 2;
+  repeated TerminalShell shells = 3;
+  string default_shell_id = 4;
+  uint32 maximum_terminals = 5;
+  uint32 maximum_input_bytes = 6;
+  uint32 maximum_columns = 7;
+  uint32 maximum_rows = 8;
+}
+
+message ListTerminalsRequest {
+  string session_id = 1;
+}
+
+message ListTerminalsResponse {
+  repeated Terminal terminals = 1;
+}
+
+message CreateTerminalRequest {
+  string session_id = 1;
+  string request_id = 2;
+  // Empty selects the discovered default for this creation only.
+  string shell_id = 3;
+  uint32 columns = 4;
+  uint32 rows = 5;
+  TerminalPalette initial_palette = 6;
+}
+
+message TerminalPalette {
+  // Exactly sixteen opaque RGB integers in ANSI index order; all <= 0xFFFFFF.
+  repeated uint32 ansi_rgb = 1;
+  uint32 foreground_rgb = 2;
+  uint32 background_rgb = 3;
+  uint32 cursor_rgb = 4;
+}
+
+message TerminalViewAppearance {
+  // Fresh identity for each Watch incarnation on the authenticated connection.
+  string view_id = 1;
+  uint64 view_revision = 2;
+  TerminalPalette palette = 3;
+}
+
+message UpdateTerminalAppearanceRequest {
+  string session_id = 1;
+  string terminal_id = 2;
+  uint64 generation = 3;
+  TerminalViewAppearance appearance = 4;
+  bool claim_focus = 5;
+  uint64 expected_appearance_revision = 6;
+}
+
+message UpdateTerminalAppearanceResponse {
+  uint64 accepted_view_revision = 1;
+  uint64 appearance_revision = 2;
+  bool owns_defaults = 3;
+  // False is an uncommitted focus CAS conflict, with current authority above.
+  bool accepted = 4;
+}
+
+message CreateTerminalResponse {
+  Terminal terminal = 1;
+}
+
+message GetTerminalRequest {
+  string session_id = 1;
+  string terminal_id = 2;
+  // Zero observes the current generation; mutations always require an exact one.
+  uint64 generation = 3;
+}
+
+message GetTerminalResponse {
+  Terminal terminal = 1;
+  uint64 sequence = 2;
+  string serialized = 3;
+  string active_color_overrides = 4;
+  uint64 appearance_revision = 5;
+}
+
+message WatchTerminalRequest {
+  string session_id = 1;
+  string terminal_id = 2;
+  uint64 generation = 3;
+  // Absent starts with a complete screen checkpoint. A cursor older than the
+  // retained output also receives RESET before current-generation increments.
+  optional uint64 after_sequence = 4;
+  TerminalViewAppearance appearance = 5;
+}
+
+enum TerminalUpdateKind {
+  TERMINAL_UPDATE_KIND_UNSPECIFIED = 0;
+  TERMINAL_UPDATE_KIND_OUTPUT = 1;
+  TERMINAL_UPDATE_KIND_STATE = 2;
+  TERMINAL_UPDATE_KIND_RESET = 3;
+}
+
+message WatchTerminalResponse {
+  TerminalUpdateKind kind = 1;
+  Terminal terminal = 2;
+  uint64 sequence = 3;
+  // OUTPUT is raw VT data. RESET replaces the screen with a serialized
+  // checkpoint; clients must reset their emulator before writing it.
+  string data = 4;
+  // RESET always includes this field, even when empty. OUTPUT includes it when
+  // explicit process overrides changed; absent on other frames means unchanged.
+  optional string active_color_overrides = 5;
+  uint64 appearance_revision = 6;
+}
+
+message WriteTerminalRequest {
+  string session_id = 1;
+  string terminal_id = 2;
+  uint64 generation = 3;
+  // One ephemeral writer per mounted view; sequence begins at 1 and advances
+  // only in a FIFO input stream. Repeated acknowledged sequences never write
+  // twice. A lost response must not cause a new sequence with the same bytes.
+  string writer_id = 4;
+  uint64 input_sequence = 5;
+  string data = 6;
+}
+
+message WriteTerminalResponse {
+  uint64 next_input_sequence = 1;
+}
+
+message ResizeTerminalRequest {
+  string session_id = 1;
+  string terminal_id = 2;
+  uint64 generation = 3;
+  uint32 columns = 4;
+  uint32 rows = 5;
+}
+
+message ResizeTerminalResponse {
+  Terminal terminal = 1;
+}
+
+message RestartTerminalRequest {
+  string session_id = 1;
+  string terminal_id = 2;
+  uint64 generation = 3;
+  string request_id = 4;
+}
+
+message RestartTerminalResponse {
+  Terminal terminal = 1;
+}
+
+message CloseTerminalRequest {
+  string session_id = 1;
+  string terminal_id = 2;
+  uint64 generation = 3;
+}
+
+message CloseTerminalResponse {}

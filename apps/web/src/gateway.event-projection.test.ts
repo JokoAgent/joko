@@ -1,6 +1,7 @@
 import { create } from "@bufbuild/protobuf";
 import {
   ArtifactKind,
+  AudioArtifactKind,
   AuthenticationState,
   BackendHealth,
   BackgroundTaskState,
@@ -1303,6 +1304,7 @@ describe("incremental event projection", () => {
       artifact: {
         artifactId: "image-1",
         title: "tool preview",
+        description: "The tool's actual preview description",
         kind: ArtifactKind.IMAGE,
         blob: {
           blobId: "image-1",
@@ -1313,6 +1315,16 @@ describe("incremental event projection", () => {
         }
       }
     } });
+    expect(snapshot.timelineBySession.get("session-1")?.find((item) => item.artifact?.blobId === "image-1")?.artifact?.description)
+      .toBe("The tool's actual preview description");
+    apply({ case: "artifactProduced", value: { artifact: {
+      artifactId: "track-1", title: "Track", description: "Strings", kind: ArtifactKind.FILE,
+      blob: { blobId: "track-1", fileName: "audio.wav", mediaType: "audio/wav", byteSize: 204n, sha256Hex: "b".repeat(64) },
+      audioMetadata: { kind: AudioArtifactKind.MUSIC, title: "Track", description: "Strings", durationSeconds: 18,
+        artwork: { blob: { blobId: "cover-1", mediaType: "image/png", byteSize: 99n, sha256Hex: "c".repeat(64) }, widthPixels: 2, heightPixels: 2, altText: "Artwork" } }
+    } } });
+    expect(snapshot.timelineBySession.get("session-1")?.find((item) => item.artifact?.blobId === "track-1")?.artifact?.audioMetadata)
+      .toEqual({ kind: "music", title: "Track", description: "Strings", durationSeconds: 18, artwork: { blobId: "cover-1", width: 2, height: 2, alt: "Artwork" } });
     apply({ case: "toolCallCompleted", value: {
       toolCall: {
         toolCallId: "tool-1",
@@ -1528,6 +1540,7 @@ describe("incremental event projection", () => {
             turnId: "turn-one",
             changeSet: {
               changeSetId: "change-set-one",
+              runId: "run-one",
               workspaceId: "workspace-one",
               completeBaseline: true,
               changes: [
@@ -1545,6 +1558,7 @@ describe("incremental event projection", () => {
     });
 
     const projected = projectSnapshotEvent(raw, mapSnapshot(raw), event);
+    expect(projected.snapshot.timelineBySession.get("session-one")?.[0]?.runId).toBe("run-one");
     expect(projected.snapshot.timelineBySession.get("session-one")?.[0]?.workspaceDiff).toMatchObject({
       files: [expect.objectContaining({ path: "reports/output.pdf" })],
       generatedFiles: [{ relativePath: "reports/output.pdf", displayName: "output.pdf" }]
@@ -1928,6 +1942,12 @@ describe("incremental event projection", () => {
       .not.toHaveProperty("inputDelivery");
   });
 
+  it("refreshes observer views from authority when a native marker changes or clears the active prefix", () => {
+    const raw = create(SnapshotSchema, { generation: 1n, resumeCursor: { generation: 1n, sequence: 0n } });
+    const event = create(EventSchema, { eventId: "branch-marker", cursor: { generation: 1n, sequence: 1n }, identity: { sessionId: "session-1" }, payload: { kind: { case: "nativeSessionChanged", value: { productSessionId: "session-1", opaqueNativeReference: "native-ref" } } } });
+    expect(projectSnapshotEvent(raw, mapSnapshot(raw), event).refresh).toBe("authoritative");
+  });
+
   it("retains exact opaque message entry boundaries from the Backend-neutral event payload", () => {
     const raw = create(SnapshotSchema, { generation: 1n, resumeCursor: { generation: 1n, sequence: 0n } });
     const started = create(EventSchema, {
@@ -1938,13 +1958,14 @@ describe("incremental event projection", () => {
         messageId: "message-1",
         role: MessageRole.USER,
         userInput: { parts: [{ content: { case: "text", value: "Question" } }] },
-        nativeIdentity: { entryId: "user-entry", parentEntryId: "parent-entry" }
+        nativeIdentity: { entryId: "user-entry", parentEntryId: "parent-entry", rewindBefore: { kind: { case: "nativeEntryId", value: "parent-entry" } } }
       } } }
     });
     const projected = projectSnapshotEvent(raw, mapSnapshot(raw), started);
     expect(projected.snapshot.timelineBySession.get("session-1")?.[0]).toMatchObject({
       nativeEntryId: "user-entry",
-      nativeParentEntryId: "parent-entry"
+      nativeParentEntryId: "parent-entry",
+      nativeRewindBefore: { kind: "native_entry", entryId: "parent-entry" }
     });
 
     const completed = create(EventSchema, {
@@ -1954,13 +1975,14 @@ describe("incremental event projection", () => {
       payload: { kind: { case: "messageCompleted", value: {
         messageId: "message-1",
         role: MessageRole.USER,
-        nativeIdentity: { entryId: "user-entry", parentEntryId: "parent-entry" }
+        nativeIdentity: { entryId: "user-entry", parentEntryId: "parent-entry", rewindBefore: { kind: { case: "nativeEntryId", value: "parent-entry" } } }
       } } }
     });
     expect(projectSnapshotEvent(projected.rawSnapshot, projected.snapshot, completed).snapshot.timelineBySession.get("session-1")?.[0]).toMatchObject({
       sourceEventId: "message-completed",
       nativeEntryId: "user-entry",
       nativeParentEntryId: "parent-entry",
+      nativeRewindBefore: { kind: "native_entry", entryId: "parent-entry" },
       streaming: false
     });
   });
@@ -1971,11 +1993,11 @@ describe("provider and model projection", () => {
     const snapshot = mapSnapshot(create(SnapshotSchema, {
       providers: [{ backendId: "backend-custom", providerId: "custom", displayName: "Custom", kind: ProviderKind.CUSTOM_ENDPOINT, apiCompatibility: ProviderApiCompatibility.OPENAI_RESPONSES, authenticationState: AuthenticationState.AUTHENTICATED, endpointDisplay: "https://example.test/v1", supportsLogin: true, loginMethods: [ProviderLoginMethod.API_KEY], supportsLogout: true, supportsRefresh: true, capabilities: { schemaVersion: "joko.provider.v1", capabilities: [{ name: "provider.account_usage", support: CapabilitySupport.SUPPORTED }] }, accountUsage: { providerId: "custom", primaryWindow: { usedPercent: 42, windowMinutes: 300, resetAt: { seconds: 1_800_003_600n } }, secondaryWindow: { usedPercent: 75, windowMinutes: 10_080 }, limitReached: false, planType: "pro", credits: { hasCredits: true, unlimited: false, balance: "4.50", observedAt: { seconds: 1_800_000_000n } }, observedAt: { seconds: 1_800_000_000n } }, rateLimit: { limited: false, requestLimit: 100n, requestsRemaining: 77n, tokenLimit: 1_000n, tokensRemaining: 800n }, usage: { providerId: "custom", usage: { inputTokens: 12n, outputTokens: 8n, costMicros: 25_000n, currencyCode: "USD" }, estimated: true } }],
       models: [{ backendId: "backend-custom", key: { providerId: "custom", modelId: "model-a" }, displayName: "Model A", contextWindowTokens: 128_000n, maximumOutputTokens: 16_000n, inputModalities: [ModelInputModality.TEXT, ModelInputModality.IMAGE, ModelInputModality.FILE], outputModalities: [ModelOutputModality.TEXT], supportsFastMode: true, available: true, inputCostMicrosPerMillion: 10n, outputCostMicrosPerMillion: 20n, currencyCode: "USD", effortLevels: [{ effortId: "high", order: 1 }] }],
-      settings: { agentResource: {}, collaboration: {}, gitSafety: {}, providers: [{ providerId: "custom", displayName: "Custom", kind: ProviderKind.CUSTOM_ENDPOINT, apiCompatibility: ProviderApiCompatibility.OPENAI_RESPONSES, endpoint: "https://example.test/v1", enabled: true, authHeader: true, headers: [{ headerName: "X-Key", environmentName: "CUSTOM_KEY" }], models: [{ modelId: "model-a", displayName: "Model A", reasoning: true, inputModalities: [ModelInputModality.TEXT, ModelInputModality.IMAGE], contextWindowTokens: 128_000n, maximumOutputTokens: 16_000n, inputCostMicrosPerMillion: 10n, outputCostMicrosPerMillion: 20n, cacheReadCostMicrosPerMillion: 2n, cacheWriteCostMicrosPerMillion: 3n, thinkingLevels: [{ effortId: "high", nativeLevel: "xhigh" }], sampling: { temperature: 0.2, topP: 0.9, seed: 4n }, compatibility: { supportsDeveloperRole: true, supportsStrictTools: false, thinkingFormat: "openai" }, supportsFastMode: true }] }] }
+      settings: { auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" }, agentResource: {}, collaboration: {}, gitSafety: {}, providers: [{ providerId: "custom", displayName: "Custom", kind: ProviderKind.CUSTOM_ENDPOINT, enabled: true, version: { revision: { value: 3n } }, runtimes: [{ backendId: "backend-custom", credentialOrigin: "https://example.test", apiCompatibility: ProviderApiCompatibility.OPENAI_RESPONSES, endpoint: "https://example.test/v1", authHeader: true, headers: [{ headerName: "X-Key", environmentName: "CUSTOM_KEY" }], models: [{ modelId: "model-a", displayName: "Model A", reasoning: true, inputModalities: [ModelInputModality.TEXT, ModelInputModality.IMAGE], contextWindowTokens: 128_000n, maximumOutputTokens: 16_000n, inputCostMicrosPerMillion: 10n, outputCostMicrosPerMillion: 20n, cacheReadCostMicrosPerMillion: 2n, cacheWriteCostMicrosPerMillion: 3n, thinkingLevels: [{ effortId: "high", nativeLevel: "xhigh" }], sampling: { temperature: 0.2, topP: 0.9, seed: 4n }, compatibility: { supportsDeveloperRole: true, supportsStrictTools: false, thinkingFormat: "openai" }, supportsFastMode: true }] }] }] }
     }));
     expect(snapshot.providers[0]).toMatchObject({ backendId: "backend-custom", authenticationState: "authenticated", supportsLogin: true, loginMethods: ["apiKey"], supportsLogout: true, supportsRefresh: true, capabilities: new Set(["provider.account_usage"]), accountUsage: { planType: "pro", limitReached: false, primaryWindow: { usedPercent: 42, windowMinutes: 300, resetAt: 1_800_003_600_000 }, secondaryWindow: { usedPercent: 75, windowMinutes: 10_080 }, credits: { hasCredits: true, unlimited: false, balance: "4.50", observedAt: 1_800_000_000_000 } }, rateLimit: { requestLimit: 100, requestsRemaining: 77 }, usage: { inputTokens: 12, outputTokens: 8, cost: 0.025, currency: "USD", estimated: true } });
     expect(snapshot.models[0]).toMatchObject({ backendId: "backend-custom", inputModalities: ["text", "image", "file"], outputModalities: ["text"], maximumOutputTokens: 16_000, inputCostMicrosPerMillion: 10, supportsFast: true });
-    expect(snapshot.settings.providers[0]).toMatchObject({ headers: [{ headerName: "X-Key", environmentName: "CUSTOM_KEY" }], models: [{ modelId: "model-a", reasoning: true, inputModalities: ["text", "image"], contextWindowTokens: 128_000, maximumOutputTokens: 16_000, thinkingLevels: [{ effortId: "high", nativeLevel: "xhigh" }], sampling: { temperature: 0.2, topP: 0.9, seed: 4 }, compatibilityOptions: { supportsDeveloperRole: true, supportsStrictTools: false, thinkingFormat: "openai" }, supportsFastMode: true }] });
+    expect(snapshot.settings.providers[0]).toMatchObject({ revision: 3n, runtimes: [{ backendId: "backend-custom", credentialOrigin: "https://example.test", headers: [{ headerName: "X-Key", environmentName: "CUSTOM_KEY" }], models: [{ modelId: "model-a", reasoning: true, inputModalities: ["text", "image"], contextWindowTokens: 128_000, maximumOutputTokens: 16_000, thinkingLevels: [{ effortId: "high", nativeLevel: "xhigh" }], sampling: { temperature: 0.2, topP: 0.9, seed: 4 }, compatibilityOptions: { supportsDeveloperRole: true, supportsStrictTools: false, thinkingFormat: "openai" }, supportsFastMode: true }] }] });
   });
 
   it("projects subscription access and missing upstream pricing onto model rows", () => {
@@ -2015,7 +2037,7 @@ describe("provider and model projection", () => {
         { backendId: "backend-access", key: { providerId: "provider-enabled", modelId: "model-b" }, displayName: "Model B", available: true }
       ],
       settings: {
-        agentResource: {},
+        auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" }, agentResource: {},
         collaboration: {},
         gitSafety: {},
         backends: [{
@@ -2044,14 +2066,15 @@ describe("provider and model projection", () => {
       providers: [{ backendId: "backend-access", providerId: "provider-disabled", displayName: "Disabled Provider", ownerManaged: true }],
       models: [{ backendId: "backend-access", key: { providerId: "provider-disabled", modelId: "model-a" }, displayName: "Model A", available: true }],
       settings: {
-        agentResource: {},
+        auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" }, agentResource: {},
         collaboration: {},
         gitSafety: {},
         providers: [{
           providerId: "provider-disabled",
           displayName: "Disabled Provider",
           kind: ProviderKind.CUSTOM_ENDPOINT,
-          apiCompatibility: ProviderApiCompatibility.OPENAI_RESPONSES,
+          version: { revision: { value: 1n } },
+          runtimes: [{ backendId: "backend-access", apiCompatibility: ProviderApiCompatibility.OPENAI_RESPONSES }],
           enabled: false
         }]
       }
@@ -2066,7 +2089,8 @@ describe("provider and model projection", () => {
       providerId: "provider-event",
       displayName: "Event Provider",
       kind: ProviderKind.CUSTOM_ENDPOINT,
-      apiCompatibility: ProviderApiCompatibility.OPENAI_RESPONSES,
+      version: { revision: { value: 1n } },
+      runtimes: [{ backendId: "backend-event", apiCompatibility: ProviderApiCompatibility.OPENAI_RESPONSES }],
       enabled: true
     };
     const raw = create(SnapshotSchema, {
@@ -2074,16 +2098,16 @@ describe("provider and model projection", () => {
       resumeCursor: { generation: 1n, sequence: 0n },
       providers: [{ backendId: "backend-event", providerId: provider.providerId, displayName: provider.displayName, ownerManaged: true }],
       models: [{ backendId: "backend-event", key: { providerId: provider.providerId, modelId: "model-event" }, displayName: "Event Model", available: true }],
-      settings: { agentResource: {}, collaboration: {}, gitSafety: {}, providers: [provider] }
+      settings: { auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" }, agentResource: {}, collaboration: {}, gitSafety: {}, providers: [provider] }
     });
     const event = create(EventSchema, {
       eventId: "settings-provider-disabled",
       cursor: { generation: 1n, sequence: 1n },
       payload: { kind: { case: "settingsChanged", value: { settings: {
-        agentResource: {},
+        auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" }, agentResource: {},
         collaboration: {},
         gitSafety: {},
-        providers: [{ ...provider, enabled: false }]
+        providers: [{ ...provider, enabled: false, version: { revision: { value: 2n } } }]
       } } } }
     });
 
@@ -2104,14 +2128,15 @@ describe("provider and model projection", () => {
         { backendId: "backend-native", key: { providerId: "provider-shared", modelId: "native-model" }, displayName: "Native Model", available: true }
       ],
       settings: {
-        agentResource: {},
+        auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" }, agentResource: {},
         collaboration: {},
         gitSafety: {},
         providers: [{
           providerId: "provider-shared",
           displayName: "Managed Provider",
           kind: ProviderKind.CUSTOM_ENDPOINT,
-          apiCompatibility: ProviderApiCompatibility.OPENAI_RESPONSES,
+          version: { revision: { value: 1n } },
+          runtimes: [{ backendId: "backend-managed", apiCompatibility: ProviderApiCompatibility.OPENAI_RESPONSES }],
           enabled: false
         }]
       }
@@ -2132,7 +2157,8 @@ describe("provider and model projection", () => {
       providerId: "provider-shared-event",
       displayName: "Managed Provider",
       kind: ProviderKind.CUSTOM_ENDPOINT,
-      apiCompatibility: ProviderApiCompatibility.OPENAI_RESPONSES,
+      version: { revision: { value: 1n } },
+      runtimes: [{ backendId: "backend-managed", apiCompatibility: ProviderApiCompatibility.OPENAI_RESPONSES }],
       enabled: true
     };
     const raw = create(SnapshotSchema, {
@@ -2146,16 +2172,16 @@ describe("provider and model projection", () => {
         { backendId: "backend-managed", key: { providerId: configuredProvider.providerId, modelId: "managed-model" }, displayName: "Managed Model", available: true },
         { backendId: "backend-native", key: { providerId: configuredProvider.providerId, modelId: "native-model" }, displayName: "Native Model", available: true }
       ],
-      settings: { agentResource: {}, collaboration: {}, gitSafety: {}, providers: [configuredProvider] }
+      settings: { auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" }, agentResource: {}, collaboration: {}, gitSafety: {}, providers: [configuredProvider] }
     });
     const event = create(EventSchema, {
       eventId: "settings-shared-provider-disabled",
       cursor: { generation: 1n, sequence: 1n },
       payload: { kind: { case: "settingsChanged", value: { settings: {
-        agentResource: {},
+        auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" }, agentResource: {},
         collaboration: {},
         gitSafety: {},
-        providers: [{ ...configuredProvider, enabled: false }]
+        providers: [{ ...configuredProvider, enabled: false, version: { revision: { value: 2n } } }]
       } } } }
     });
 

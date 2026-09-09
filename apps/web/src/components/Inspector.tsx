@@ -1,4 +1,9 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { ArtifactDownloadButton } from "./ArtifactDownloadButton.js";
+import { readTerminalAppearance } from "../terminal-appearance.js";
+import type { TerminalPaletteView } from "../model.js";
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import "@xterm/xterm/css/xterm.css";
+import "./interactive-terminal.css";
 import type { DragEvent as ReactDragEvent, JSX, KeyboardEvent as ReactKeyboardEvent } from "react";
 import { createPortal } from "react-dom";
 import { useVirtualizer } from "@tanstack/react-virtual";
@@ -50,6 +55,9 @@ import {
   X
 } from "lucide-react";
 import type { AppController, BrowserInspectorFocusRequest } from "../controller.js";
+import type { TerminalCapabilitiesView, TerminalView } from "../model.js";
+import { randomUuid } from "../web-crypto.js";
+import { readTerminalShellPreference } from "../terminal-preferences.js";
 import { useLiveBrowserTakeover, withLiveBrowserTakeover } from "../browser-takeover-expiry.js";
 import { browserPageKey } from "../browser-page-key.js";
 import type { AppSnapshot, BackendView, BackgroundTaskHistoryView, BrowserView, ComposerFileSelectionQuoteDraft, ComposerSelectionQuoteDraft, NativeSessionTreeNodeView, NativeSessionTreeView, QueueItemView, ResourceView, RuntimeToolCatalogView, SessionView, TimelineItemView, WorkspaceChangeSetView, WorkspaceDiffHunkView, WorkspaceDiffImageView, WorkspaceDiffView, WorkspaceEntryView, WorkspaceFileDiffView, WorkspaceFilePreviewView, WorkspaceGitPushResultView, WorkspaceRewindPreviewView, WorkspaceSearchMatchView, WorkspaceSearchPageView, WorkspaceView } from "../model.js";
@@ -58,9 +66,8 @@ import { INSPECTOR_DEFAULT_RATIO, INSPECTOR_MIN_WIDTH, SESSION_MAIN_MIN_WIDTH, i
 import {
   activateInspectorTab,
   addInspectorTab,
+  addInspectorTerminalTab,
   closeInspectorTab,
-  closeOtherInspectorTabs,
-  closeVisibleInspectorTabs,
   createInitialInspectorTabBucket,
   cycleInspectorTabId,
   moveVisibleInspectorTab,
@@ -91,7 +98,7 @@ import { BrowserCanvas } from "./ToolsPage.js";
 import { BrowserLostPageCard, BrowserPageRail } from "./BrowserPageRail.js";
 import { resolveComposerAttachmentPolicy } from "./composer-behavior.js";
 import { WorkspaceTextEditor, type WorkspaceEditorSelection, type WorkspaceTextEditorHandle } from "./WorkspaceTextEditor.js";
-import { buildReviewDiffTree, buildReviewSplitRows, filterReviewFileJumpResults, filterReviewFiles, flattenReviewDiffTree, inlineWordDiff, isPreviewableReviewImageDiff, isReviewMarkdownPath, isSafeReviewRef, moveReviewFileJumpSelection, reviewFileKey, type InlineWordSegment, type ReviewDiffTreeFlatNode, type ReviewDiffTreeNode, type ReviewSplitRow } from "./review-diff.js";
+import { buildReviewDiffTree, buildReviewSplitRows, createReviewInlineDiff, filterReviewFileJumpResults, filterReviewFiles, flattenReviewDiffTree, inlineWordDiff, isPreviewableReviewImageDiff, isReviewMarkdownPath, isSafeReviewRef, moveReviewFileJumpSelection, reviewFileKey, type InlineWordSegment, type ReviewDiffTreeFlatNode, type ReviewDiffTreeNode, type ReviewSplitRow } from "./review-diff.js";
 import { latestTurnChangeSets, loadReviewSourceDiff } from "./review-data.js";
 import { reviewSourceCapabilities, type ReviewSourceDescriptor } from "./review-source.js";
 import { reviewGitWriteBlock } from "./review-write-gate.js";
@@ -123,6 +130,7 @@ const INSPECTOR_WORKSPACE_SEARCH_PAGE_SIZE = 500;
 const INSPECTOR_WORKSPACE_SEARCH_MAX_PAGES = 10_000;
 
 type InspectorMenu = "add" | "more";
+const InteractiveTerminalPanel = lazy(() => import("./InteractiveTerminalPanel.js").then((module) => ({ default: module.InteractiveTerminalPanel })));
 
 export function Inspector({ controller, snapshot, session, workspace, timeline, open, subagentFocusRequest, turnReviewFocusRequest, browserFocusRequest, t, runAction, onClose, onDetachedChange, onSelectionQuote }: {
   readonly controller: AppController;
@@ -153,6 +161,7 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
   const onDetachedChangeRef = useRef(onDetachedChange);
   onDetachedChangeRef.current = onDetachedChange;
   const inspectorRef = useRef<HTMLElement>(null);
+  const tabListRef = useRef<HTMLDivElement>(null);
   const lastMainWindowInteractionRef = useRef(false);
   const lastDetachedWindowInteractionRef = useRef(false);
   const ratioRef = useRef(readInspectorRatio());
@@ -167,6 +176,19 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
   const [backgroundHistoryState, setBackgroundHistoryState] = useState<"idle" | "loading" | "ready" | "error">("idle");
   const [backgroundHistoryError, setBackgroundHistoryError] = useState<string>();
   const [backgroundHistoryRefresh, setBackgroundHistoryRefresh] = useState(0);
+  const [terminalCatalog, setTerminalCatalog] = useState<{ readonly owner: string; readonly value: TerminalCapabilitiesView }>();
+  const [terminalRecords, setTerminalRecords] = useState<Readonly<Record<string, TerminalView>>>({});
+  const [terminalPending, setTerminalPending] = useState(false);
+  const terminalPendingRef = useRef(false);
+  const terminalCreationRef = useRef<{ readonly owner: string; readonly requestId: string; readonly shellId: string; readonly initialPalette: TerminalPaletteView } | undefined>(undefined);
+  const [terminalError, setTerminalError] = useState<string>();
+  const [terminalRefresh, setTerminalRefresh] = useState(0);
+  const [terminalCatalogPending, setTerminalCatalogPending] = useState(false);
+  const terminalOwner = `${controller.state.activeProfile?.serverId ?? ""}\u0000${controller.state.activeProfile?.id ?? ""}\u0000${session.id}`;
+  const terminalOwnerRef = useRef<string | undefined>(terminalOwner);
+  terminalOwnerRef.current = terminalOwner;
+  const terminalCapabilities = terminalCatalog?.owner === terminalOwner ? terminalCatalog.value : undefined;
+  const canTerminal = terminalCapabilities?.support === "supported";
   const inspectorControllerRef = useRef(controller);
   inspectorControllerRef.current = controller;
   const inspectorMinimum = Math.min(INSPECTOR_MIN_WIDTH, inspectorMaximum);
@@ -224,15 +246,101 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
     ...(canDiff || canRewind ? ["changes" as const] : []),
     ...(canBackgroundTasks ? ["background" as const] : []),
     ...(canSubagents ? ["subagents" as const] : []),
-    ...(canUserShell ? ["terminal" as const] : []),
+    ...(canUserShell ? ["shell" as const] : []),
+    "terminal",
     "tools",
     ...(canBrowser ? ["browser" as const] : [])
   ]), [canBackgroundTasks, canBrowser, canDiff, canFiles, canRewind, canSubagents, canTree, canUserShell]);
   const storedBucket = tabBuckets[session.id] ?? createInitialInspectorTabBucket();
   const bucket = useMemo(() => projectInspectorTabBucket(storedBucket, availableKinds), [availableKinds, storedBucket]);
   const activeTab = bucket.tabs.find((tab) => tab.id === bucket.activeTabId);
-  const visibleTabIds = useMemo(() => new Set(bucket.tabs.map((tab) => tab.id)), [bucket.tabs]);
-  const addableKinds = inspectorTabKindsInMenuOrder().filter((kind) => availableKinds.has(kind) && !bucket.tabs.some((tab) => tab.kind === kind));
+  const storedBucketRef = useRef(storedBucket);
+  storedBucketRef.current = storedBucket;
+  const addableKinds = inspectorTabKindsInMenuOrder().filter((kind) => availableKinds.has(kind) && (kind === "terminal" || !bucket.tabs.some((tab) => tab.kind === kind)));
+
+  useEffect(() => {
+    terminalOwnerRef.current = terminalOwner;
+    setTerminalError(undefined);
+    setTerminalRecords({});
+    terminalCreationRef.current = undefined;
+    terminalPendingRef.current = false;
+    setTerminalPending(false);
+    return () => { terminalOwnerRef.current = undefined; };
+  }, [terminalOwner]);
+  useEffect(() => {
+    if (controller.state.connectionState !== "connected") return;
+    const request = new AbortController();
+    const source = inspectorControllerRef.current;
+    setTerminalCatalogPending(true);
+    void Promise.allSettled([
+      Promise.resolve().then(() => source.getTerminalCapabilities(session.id, request.signal)).then((capability) => {
+        if (!request.signal.aborted) setTerminalCatalog({ owner: terminalOwner, value: capability });
+      }),
+      Promise.resolve().then(() => source.listTerminals(session.id, request.signal)).then((records) => {
+        if (request.signal.aborted) return;
+        setTerminalRecords(Object.fromEntries(records.map((record) => [record.id, record])));
+        setTabBuckets((current) => {
+          let next = current[session.id] ?? createInitialInspectorTabBucket();
+          const ids = new Set(records.filter((record) => record.status !== "closed").map((record) => record.id));
+          for (const tab of next.tabs) if (tab.kind === "terminal" && !ids.has(tab.id)) next = closeInspectorTab(next, tab.id);
+          for (const record of records) if (record.status !== "closed" && !next.tabs.some((tab) => tab.id === record.id)) {
+            const activeTabId = next.activeTabId;
+            next = addInspectorTerminalTab(next, record.id);
+            if (activeTabId !== undefined) next = activateInspectorTab(next, activeTabId);
+          }
+          return { ...current, [session.id]: next };
+        });
+      })
+    ]).then((results) => {
+      if (request.signal.aborted) return;
+      const failure = results.find((result) => result.status === "rejected");
+      setTerminalError(failure?.status === "rejected" ? messageOf(failure.reason) : undefined);
+    }).finally(() => { if (!request.signal.aborted) setTerminalCatalogPending(false); });
+    return () => request.abort();
+  }, [controller.state.connectionState, controller.getTerminalCapabilities, session.id, terminalOwner, terminalRefresh]);
+
+  const openTerminal = (preferExisting: boolean): void => {
+    if (terminalPendingRef.current) return;
+    const existing = preferExisting ? bucket.tabs.find((tab) => tab.kind === "terminal") : undefined;
+    if (existing !== undefined) {
+      setSessionBucket(activateInspectorTab(storedBucket, existing.id));
+      void controller.setInspectorOpen(true);
+      activeDetachedHost?.window.focus();
+      const ownerDocument = inspectorRef.current?.ownerDocument;
+      ownerDocument?.defaultView?.requestAnimationFrame(() => {
+        if (terminalOwnerRef.current !== terminalOwner) return;
+        ownerDocument.getElementById(`inspector-panel-${existing.id}`)?.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea")?.focus();
+      });
+      return;
+    }
+    if (!canTerminal || controller.state.connectionState !== "connected") return;
+    if (bucket.tabs.filter((tab) => tab.kind === "terminal").length >= terminalCapabilities.maximumTerminals) return;
+    const preferredShellId = readTerminalShellPreference();
+    const shellId = terminalCapabilities.shells.some((shell) => shell.id === preferredShellId) ? preferredShellId : "auto";
+    let creation = terminalCreationRef.current?.owner === terminalOwner ? terminalCreationRef.current : undefined;
+    if (creation === undefined) {
+      try {
+        if (inspectorRef.current === null) return;
+        creation = { owner: terminalOwner, shellId, requestId: randomUuid(), initialPalette: readTerminalAppearance(inspectorRef.current).palette };
+      } catch (error) { setTerminalError(messageOf(error)); return; }
+    }
+    terminalCreationRef.current = creation;
+    terminalPendingRef.current = true;
+    setTerminalPending(true);
+    setTerminalError(undefined);
+    void (async () => {
+      const value = await controller.createTerminal(session.id, creation.requestId, creation.shellId, 80, 24, creation.initialPalette);
+      if (terminalOwnerRef.current !== creation.owner) return;
+      terminalCreationRef.current = undefined;
+      setTerminalRecords((current) => ({ ...current, [value.id]: value }));
+      setTabBuckets((current) => ({ ...current, [session.id]: addInspectorTerminalTab(current[session.id] ?? createInitialInspectorTabBucket(), value.id) }));
+      setMenu(undefined);
+      await inspectorControllerRef.current.setInspectorOpen(true);
+      activeDetachedHost?.window.focus();
+    })().catch((error) => { if (terminalOwnerRef.current === creation.owner) setTerminalError(messageOf(error)); }).finally(() => {
+      if (terminalOwnerRef.current === creation.owner) { terminalPendingRef.current = false; setTerminalPending(false); }
+    });
+  };
 
   useEffect(() => {
     setRuntimeToolCatalog(undefined);
@@ -380,6 +488,28 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
     setSessionBucket(activateInspectorTab(storedBucket, bucket.activeTabId));
   }, [bucket.activeTabId, setSessionBucket, storedBucket]);
 
+  useLayoutEffect(() => {
+    const list = tabListRef.current;
+    const pill = list?.querySelector('[role="tab"][aria-selected="true"]')?.parentElement;
+    if (!open || list === null || pill === undefined || pill === null) return;
+    const reveal = (): void => {
+      if (list.clientWidth === 0) return;
+      const bounds = list.getBoundingClientRect();
+      const target = pill.getBoundingClientRect();
+      const left = bounds.left + list.clientLeft;
+      const right = left + list.clientWidth;
+      if (target.left < left && target.right <= right) list.scrollLeft += Math.max(target.left - left, target.right - right);
+      else if (target.right > right && target.left >= left) list.scrollLeft += Math.min(target.left - left, target.right - right);
+    };
+    reveal();
+    const Observer = list.ownerDocument.defaultView?.ResizeObserver;
+    if (Observer === undefined) return;
+    const observer = new Observer(reveal);
+    observer.observe(list);
+    observer.observe(pill);
+    return () => observer.disconnect();
+  }, [bucket.activeTabId, bucket.tabs, open, activeDetachedHost]);
+
   useEffect(() => {
     if (menu === undefined) return;
     const ownerDocument = activeDetachedHost?.window.document ?? document;
@@ -442,7 +572,6 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
   const applyWidth = useCallback((ratio: number): void => {
     const available = inspectorAvailableWidth(inspectorRef.current);
     const width = inspectorWidthForRatio(available, ratio);
-    ratioRef.current = inspectorRatioForWidth(available, width);
     document.documentElement.style.setProperty("--inspector-width", `${width}px`);
     setInspectorWidth(width);
     setInspectorMaximum(Math.max(0, available - SESSION_MAIN_MIN_WIDTH));
@@ -494,32 +623,55 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
   const resizeByKeyboard = (nextWidth: number): void => {
     const available = inspectorAvailableWidth(inspectorRef.current);
     const ratio = inspectorRatioForWidth(available, nextWidth);
+    ratioRef.current = ratio;
     applyWidth(ratio);
     try { window.localStorage.setItem(INSPECTOR_RATIO_KEY, String(ratioRef.current)); } catch { /* Client storage can be unavailable. */ }
   };
 
   const closeTab = (tabId: string): void => {
-    const next = closeInspectorTab(storedBucket, tabId);
-    const visibleNext = projectInspectorTabBucket(next, availableKinds);
-    setSessionBucket(next);
-    if (visibleNext.tabs.length === 0) {
-      setMaximized(false);
-      onClose();
-    } else if (visibleNext.activeTabId !== undefined) {
-      focusInspectorTab(visibleNext.activeTabId);
-    }
+    closeTabs([tabId]);
   };
 
   const closeOtherTabs = (tabId: string): void => {
-    setSessionBucket(closeOtherInspectorTabs(storedBucket, tabId, visibleTabIds));
+    closeTabs(bucket.tabs.filter((tab) => tab.id !== tabId).map((tab) => tab.id));
     setMenu(undefined);
   };
 
   const closeAllTabs = (): void => {
-    setSessionBucket(closeVisibleInspectorTabs(storedBucket, visibleTabIds));
+    closeTabs(bucket.tabs.map((tab) => tab.id));
     setMenu(undefined);
-    setMaximized(false);
-    onClose();
+  };
+
+  const closeTabs = (tabIds: readonly string[]): void => {
+    if (terminalPendingRef.current) return;
+    const owner = terminalOwner;
+    const tabs = storedBucket.tabs.filter((tab) => tabIds.includes(tab.id));
+    const finish = (closed: readonly string[]): void => {
+      if (terminalOwnerRef.current !== owner) return;
+      const next = closed.reduce(closeInspectorTab, storedBucketRef.current);
+      const visibleNext = projectInspectorTabBucket(next, availableKinds);
+      setSessionBucket(next);
+      if (visibleNext.tabs.length === 0) { setMaximized(false); onClose(); }
+      else if (visibleNext.activeTabId !== undefined) focusInspectorTab(visibleNext.activeTabId);
+    };
+    if (!tabs.some((tab) => tab.kind === "terminal")) { finish(tabIds); return; }
+    terminalPendingRef.current = true;
+    setTerminalPending(true);
+    setTerminalError(undefined);
+    void (async () => {
+      const closed: string[] = [];
+      for (const tab of tabs) {
+        if (terminalOwnerRef.current !== owner) return;
+        if (tab.kind !== "terminal") { closed.push(tab.id); continue; }
+        try {
+          const value = terminalRecords[tab.id] ?? await inspectorControllerRef.current.getTerminal(session.id, tab.id, 0n);
+          if (terminalOwnerRef.current !== owner) return;
+          await inspectorControllerRef.current.closeTerminal(session.id, tab.id, value.generation);
+          closed.push(tab.id);
+        } catch (error) { if (terminalOwnerRef.current === owner) setTerminalError(messageOf(error)); }
+      }
+      finish(closed);
+    })().finally(() => { if (terminalOwnerRef.current === owner) { terminalPendingRef.current = false; setTerminalPending(false); } });
   };
 
   const focusInspectorTab = (tabId: string): void => {
@@ -576,6 +728,13 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
   };
 
   const shortcutOverrides = controller.state.preferences.appShortcutOverrides;
+  const openTerminalFromShortcut = (): boolean => {
+    if ((!canTerminal && !bucket.tabs.some((tab) => tab.kind === "terminal")) || document.body.classList.contains("modal-open")) return false;
+    openTerminal(true);
+    return true;
+  };
+  useAppShortcut("open-terminal", shortcutOverrides, openTerminalFromShortcut, { stopImmediate: true });
+  useAppShortcut("open-terminal", shortcutOverrides, openTerminalFromShortcut, { enabled: activeDetachedHost !== undefined, target: activeDetachedHost?.window ?? null, stopImmediate: true });
   useAppShortcut("right-tab-prev", shortcutOverrides, () => cycleTabsFromShortcut(-1), { stopImmediate: true });
   useAppShortcut("right-tab-next", shortcutOverrides, () => cycleTabsFromShortcut(1), { stopImmediate: true });
   useAppShortcut("right-tab-prev", shortcutOverrides, () => cycleTabsFromShortcut(-1), {
@@ -711,13 +870,13 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
         }}
       />}
       <header className="inspector__header" data-panel-drag-handle="">
-        <div className="inspector-tabs" role="tablist" aria-label={t("a11y.inspectorTabs")}>
+        <div ref={tabListRef} className="inspector-tabs" role="tablist" aria-label={t("a11y.inspectorTabs")}>
           {bucket.tabs.map((tab) => <InspectorTabPill
             key={tab.id}
             tab={tab}
             active={tab.id === bucket.activeTabId}
-            label={inspectorTabLabel(tab.kind, t)}
-            closeLabel={t("inspector.closeNamedTab", { name: inspectorTabLabel(tab.kind, t) })}
+            label={tab.kind === "terminal" ? terminalRecords[tab.id]?.shellLabel ?? t("terminal.title") : inspectorTabLabel(tab.kind, t)}
+            closeLabel={tab.kind === "terminal" ? t("terminal.close") : t("inspector.closeNamedTab", { name: inspectorTabLabel(tab.kind, t) })}
             onActivate={() => activateTab(tab.id)}
             onClose={() => closeTab(tab.id)}
             onKeyDown={(event) => handleTabKey(event, tab.id)}
@@ -731,9 +890,9 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
           />)}
         </div>
         <div className="inspector-menu">
-          <IconButton buttonRef={addMenuTriggerRef} label={t("inspector.addTab")} aria-haspopup="menu" aria-expanded={menu === "add"} disabled={addableKinds.length === 0} onClick={() => setMenu((current) => current === "add" ? undefined : "add")}><Plus aria-hidden="true" /></IconButton>
+          <IconButton buttonRef={addMenuTriggerRef} label={t("inspector.addTab")} aria-haspopup="menu" aria-expanded={menu === "add"} disabled={terminalPending || addableKinds.length === 0} onClick={() => setMenu((current) => current === "add" ? undefined : "add")}><Plus aria-hidden="true" /></IconButton>
           {menu === "add" && <div ref={menuPopoverRef} className="inspector-menu__popover" role="menu" aria-label={t("inspector.addTab")}>
-            {addableKinds.map((kind) => <button key={kind} type="button" role="menuitem" onClick={() => { setSessionBucket(addInspectorTab(storedBucket, kind)); setMenu(undefined); }}>{inspectorTabIcon(kind)}<span>{inspectorTabLabel(kind, t)}</span></button>)}
+            {addableKinds.map((kind) => <button key={kind} type="button" role="menuitem" title={kind === "terminal" && !canTerminal ? terminalCapabilities?.reason ?? t("terminal.unavailable") : undefined} disabled={kind === "terminal" && (!canTerminal || terminalPending || controller.state.connectionState !== "connected" || bucket.tabs.filter((tab) => tab.kind === "terminal").length >= (terminalCapabilities?.maximumTerminals ?? 0))} onClick={() => { if (kind === "terminal") openTerminal(false); else { setSessionBucket(addInspectorTab(storedBucket, kind)); setMenu(undefined); } }}>{inspectorTabIcon(kind)}<span>{kind === "terminal" ? t("terminal.new") : inspectorTabLabel(kind, t)}</span></button>)}
           </div>}
         </div>
         <div className="inspector-menu">
@@ -749,6 +908,9 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
         {!detached && <IconButton label={t("a11y.closeInspector")} onClick={closeInspector}><PanelRightClose className={panelSide === "left" ? "is-mirrored" : undefined} aria-hidden="true" /></IconButton>}
       </header>
       <div className="inspector__body">
+        {terminalPending && <p role="status" className="muted">{t("common.working")}</p>}
+        {terminalError !== undefined && <div role="alert" className="inline-error"><p>{terminalError}</p><Button disabled={terminalPending || terminalCatalogPending || controller.state.connectionState !== "connected"} onClick={() => { if (canTerminal && terminalCreationRef.current?.owner === terminalOwner) openTerminal(false); else setTerminalRefresh((value) => value + 1); }}>{t("common.retry")}</Button></div>}
+        {terminalCapabilities !== undefined && !canTerminal && <div className="inline-error" role="status"><p>{terminalCapabilities.reason ?? t("terminal.unavailable")}</p><Button disabled={terminalCatalogPending || controller.state.connectionState !== "connected"} onClick={() => setTerminalRefresh((value) => value + 1)}>{t("common.retry")}</Button></div>}
         {bucket.tabs.length === 0 && <div className="inspector-empty"><Gauge aria-hidden="true" /><h2>{t("inspector.emptyTitle")}</h2><p>{t("inspector.emptyBody")}</p>{addableKinds.length > 0 && <Button onClick={() => setMenu("add")}><Plus aria-hidden="true" />{t("inspector.addTab")}</Button>}</div>}
         {bucket.tabs.map((tab) => <div id={`inspector-panel-${tab.id}`} key={`${session.id}:${tab.id}`} className={cx("inspector-tab-panel", tab.id === bucket.activeTabId && "is-active")} data-tab-kind={tab.kind} role="tabpanel" aria-labelledby={`inspector-tab-${tab.id}`} aria-hidden={tab.id !== bucket.activeTabId} hidden={tab.id !== bucket.activeTabId} tabIndex={0}><InspectorTabErrorBoundary resetKey={`${session.id}:${tab.id}:${tab.kind}`} t={t}>
           {tab.kind === "context" && <ContextPanel controller={controller} backend={backend} session={session} queue={sessionQueue} tasks={tasks} t={t} runAction={runAction} />}
@@ -767,7 +929,8 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
             t={t}
           />}
           {tab.kind === "subagents" && canSubagents && <SubagentsPanel controller={controller} sessionId={session.id} focusRunId={subagentFocusRequest?.sessionId === session.id ? subagentFocusRequest.runId : undefined} focusRequestId={subagentFocusRequest?.sessionId === session.id ? subagentFocusRequest.requestId : undefined} locale={controller.state.preferences.locale} t={t} runAction={runAction} />}
-          {tab.kind === "terminal" && canUserShell && <InspectorShellPanel controller={controller} session={session} timeline={timeline} t={t} runAction={runAction} />}
+          {tab.kind === "shell" && canUserShell && <InspectorShellPanel controller={controller} session={session} timeline={timeline} t={t} runAction={runAction} />}
+          {tab.kind === "terminal" && terminalCapabilities !== undefined && <Suspense fallback={<p role="status">{t("terminal.connecting")}</p>}><InteractiveTerminalPanel controller={controller} sessionId={session.id} terminalId={tab.id} active={open && tab.id === bucket.activeTabId} capabilities={terminalCapabilities} t={t} onState={(value) => setTerminalRecords((current) => current[value.id]?.generation === value.generation && current[value.id]?.status === value.status && current[value.id]?.shellLabel === value.shellLabel ? current : { ...current, [value.id]: value })} /></Suspense>}
           {tab.kind === "tools" && <ToolPanel
             toolItems={toolItems}
             resources={snapshot.resources}
@@ -833,7 +996,7 @@ function InspectorTabPill({ tab, active, label, closeLabel, onActivate, onClose,
 }
 
 function inspectorTabKindsInMenuOrder(): readonly InspectorTabKind[] {
-  return ["context", "files", "changes", "branches", "background", "subagents", "browser", "terminal", "tools"];
+  return ["context", "files", "changes", "branches", "background", "subagents", "browser", "terminal", "shell", "tools"];
 }
 
 function inspectorTabLabel(kind: InspectorTabKind, t: Translator): string {
@@ -844,7 +1007,8 @@ function inspectorTabLabel(kind: InspectorTabKind, t: Translator): string {
     case "changes": return t("workspace.diff");
     case "background": return t("background.title");
     case "subagents": return t("subagents.title");
-    case "terminal": return t("composer.shell");
+    case "shell": return t("composer.shell");
+    case "terminal": return t("terminal.title");
     case "tools": return t("nav.tools");
     case "browser": return t("tools.browser");
   }
@@ -858,6 +1022,7 @@ function inspectorTabIcon(kind: InspectorTabKind): JSX.Element {
     case "changes": return <FileDiff aria-hidden="true" />;
     case "background": return <ListTodo aria-hidden="true" />;
     case "subagents": return <Bot aria-hidden="true" />;
+    case "shell":
     case "terminal": return <Terminal aria-hidden="true" />;
     case "tools": return <Wrench aria-hidden="true" />;
     case "browser": return <Globe2 aria-hidden="true" />;
@@ -909,7 +1074,7 @@ function ContextPanel({ controller, backend, session, queue, tasks, t, runAction
             {(context.autoRetry !== undefined || context.autoCompact !== undefined) && <div className="context-flags">{context.autoRetry !== undefined && <span><StatusDot state={context.autoRetry ? "healthy" : "muted"} label={context.autoRetry ? t("context.on") : t("context.off")} />{t("context.autoRetry")}</span>}{context.autoCompact !== undefined && <span><StatusDot state={context.autoCompact ? "healthy" : "muted"} label={context.autoCompact ? t("context.on") : t("context.off")} />{t("context.autoCompact")}</span>}</div>}
           </>
         )}
-        <div className="inspector-actions">{backend?.capabilities.get("session.export")?.supported === true && <Button onClick={() => runAction("export", () => controller.exportSession(session.id))}><SquareArrowOutUpRight aria-hidden="true" />{t("session.export")}</Button>}</div>
+        <div className="inspector-actions">{backend?.capabilities.get("session.export")?.supported === true && <ArtifactDownloadButton ownerKey={session.id} connectionOwner={controller.exportSession} label={t("session.export")} errorLabel={t("portable.exportFailed")} action={(context) => controller.exportSession(session.id, context)}><SquareArrowOutUpRight aria-hidden="true" />{t("session.export")}</ArtifactDownloadButton>}</div>
       </section>
 
       <section className="inspector-section">
@@ -971,7 +1136,7 @@ export function BranchesPanel({ controller, backend, session, t, runAction }: { 
         {loading && <Spinner label={t("session.branchLoad")} />}
         {error !== undefined && <p className="inline-error" role="alert">{error}</p>}
         {!loading && tree !== undefined && tree.roots.length === 0 && <p className="muted">{t("session.branchEmpty")}</p>}
-        {tree !== undefined && <div ref={treeNavigation.ref} className="native-tree" role="tree" aria-label={t("session.branch")} onFocusCapture={treeNavigation.onFocusCapture} onKeyDown={treeNavigation.onKeyDown}>{tree.roots.map((node) => <NativeTreeNode key={node.id} node={node} level={1} activeLeafId={tree.activeLeafId} busy={busy} canFork={canFork} t={t} onNavigate={(entryId) => runAction(`branch:${entryId}`, async () => { await controller.navigateSessionBranch(session.id, entryId, { summarize, ...(summarize && summaryFocus.trim() ? { customInstructions: summaryFocus.trim() } : {}) }); await load(); })} onFork={(entryId) => runAction(`fork:${entryId}`, async () => { const sessionId = await controller.forkSession(session.id, entryId, t("session.branchSuffix", { name: session.name })); controller.navigate({ kind: "session", sessionId }); })} />)}</div>}
+        {tree !== undefined && <div ref={treeNavigation.ref} className="native-tree" role="tree" aria-label={t("session.branch")} onFocusCapture={treeNavigation.onFocusCapture} onKeyDown={treeNavigation.onKeyDown}>{tree.roots.map((node) => <NativeTreeNode key={node.id} node={node} level={1} activeLeafId={tree.activeLeafId} busy={busy} canFork={canFork} t={t} onNavigate={(entryId) => runAction(`branch:${entryId}`, async () => { await controller.navigateSessionBranch(session.id, { kind: "native_entry", entryId }, { expectedGeneration: session.generation, summarize, ...(summarize && summaryFocus.trim() ? { customInstructions: summaryFocus.trim() } : {}) }); await load(); })} onFork={(entryId) => runAction(`fork:${entryId}`, async () => { const sessionId = await controller.forkSession(session.id, entryId, t("session.branchSuffix", { name: session.name })); controller.navigate({ kind: "session", sessionId }); })} />)}</div>}
         <div className="branch-navigation-options">
           <label>
             <CheckboxControl checked={summarize} onChange={(event) => setSummarize(event.currentTarget.checked)} />
@@ -2215,13 +2380,13 @@ function WorkspaceReviewFile({ file, t, viewMode, wordWrap, wordDiff, expanded, 
     {activeImage?.loading === true && <Spinner label={t("workspace.loadingPreview")} />}
     {activeImage?.error !== undefined && <p className="inline-error" role="alert">{activeImage.error}</p>}
     {activeImage?.value !== undefined && getArtifactUrl !== undefined && <ReviewImageDiffPreview value={activeImage.value} getArtifactUrl={getArtifactUrl} t={t} />}
-    {file.binary ? activeImage?.value === undefined && <p className="muted review-binary-notice">{t("workspace.binary")}</p> : file.hunks.length === 0 ? <p className="muted review-binary-notice">{t("timeline.noTextDiff")}</p> : <ReviewFileHunks file={file} t={t} viewMode={viewMode} wordWrap={wordWrap} wordDiff={wordDiff} stageable={stageable} unstageable={unstageable} revertable={revertable} pending={pendingHunkKey !== undefined} onDiffAction={onDiffAction} />}
+    {expanded && (file.binary ? activeImage?.value === undefined && <p className="muted review-binary-notice">{t("workspace.binary")}</p> : file.hunks.length === 0 ? <p className="muted review-binary-notice">{t("timeline.noTextDiff")}</p> : <ReviewFileHunks file={file} t={t} viewMode={viewMode} wordWrap={wordWrap} wordDiff={wordDiff} stageable={stageable} unstageable={unstageable} revertable={revertable} pending={pendingHunkKey !== undefined} onDiffAction={onDiffAction} />)}
   </details>;
 }
 
 type ReviewVirtualRow =
   | { readonly kind: "header"; readonly key: string; readonly hunk: WorkspaceDiffHunkView; readonly hunkIndex: number }
-  | { readonly kind: "unified"; readonly key: string; readonly line: WorkspaceDiffHunkView["lines"][number]; readonly segments?: readonly InlineWordSegment[] }
+  | { readonly kind: "unified"; readonly key: string; readonly line: WorkspaceDiffHunkView["lines"][number]; readonly lineIndex: number; readonly inline?: ReturnType<typeof createReviewInlineDiff> }
   | { readonly kind: "split"; readonly key: string; readonly row: ReviewSplitRow };
 
 function ReviewFileHunks({ file, t, viewMode, wordWrap, wordDiff, stageable, unstageable, revertable, pending, onDiffAction }: {
@@ -2239,6 +2404,8 @@ function ReviewFileHunks({ file, t, viewMode, wordWrap, wordDiff, stageable, uns
   const parentRef = useRef<HTMLDivElement | null>(null);
   const rendered = useMemo(() => {
     const rows: ReviewVirtualRow[] = [];
+    const sourceLineCount = file.hunks.reduce((total, hunk) => total + hunk.lines.length, 0);
+    if (!shouldVirtualizeReviewDiffRows(sourceLineCount)) return { rows, lineCount: sourceLineCount };
     let lineCount = 0;
     file.hunks.forEach((hunk, hunkIndex) => {
       rows.push({ kind: "header", key: `header:${hunkIndex}:${hunk.oldStart}:${hunk.newStart}`, hunk, hunkIndex });
@@ -2249,9 +2416,9 @@ function ReviewFileHunks({ file, t, viewMode, wordWrap, wordDiff, stageable, uns
         }
         return;
       }
-      const inline = wordDiff ? inlineSegmentsForHunk(hunk) : new Map<number, readonly InlineWordSegment[]>();
+      const inline = wordDiff ? createReviewInlineDiff(hunk) : undefined;
       hunk.lines.forEach((line, lineIndex) => {
-        rows.push({ kind: "unified", key: `line:${hunkIndex}:${lineIndex}:${line.oldLine}:${line.newLine}`, line, segments: inline.get(lineIndex) });
+        rows.push({ kind: "unified", key: `line:${hunkIndex}:${lineIndex}:${line.oldLine}:${line.newLine}`, line, lineIndex, inline });
         lineCount += 1;
       });
     });
@@ -2295,7 +2462,7 @@ function ReviewFileHunks({ file, t, viewMode, wordWrap, wordDiff, stageable, uns
         : undefined;
       return <div className="review-split-row"><ReviewSplitCell line={row.row.left} side="left" wordWrap={wordWrap} segments={pair?.before} /><ReviewSplitCell line={row.row.right} side="right" wordWrap={wordWrap} segments={pair?.after} /></div>;
     }
-    return <div className={`review-diff-line review-diff-line--${row.line.kind}`}><span>{row.line.oldLine || ""}</span><span>{row.line.newLine || ""}</span><i aria-hidden="true">{diffLineCharacter(row.line.kind)}</i><code className={wordWrap ? "is-wrapped" : undefined}><ReviewLineContent text={row.line.text} segments={row.segments} /></code></div>;
+    return <div className={`review-diff-line review-diff-line--${row.line.kind}`}><span>{row.line.oldLine || ""}</span><span>{row.line.newLine || ""}</span><i aria-hidden="true">{diffLineCharacter(row.line.kind)}</i><code className={wordWrap ? "is-wrapped" : undefined}><ReviewLineContent text={row.line.text} segments={row.inline?.get(row.lineIndex)} /></code></div>;
   };
 
   return <div ref={parentRef} className={cx("review-hunks", "review-hunks--virtual", wordWrap && "is-wrapped", `is-${viewMode}`)} data-virtualized-diff="true">
@@ -2354,7 +2521,7 @@ function ReviewImageSide({ label, side, getArtifactUrl, t }: {
 }
 
 function ReviewUnifiedHunk({ hunk, wordWrap, wordDiff }: { readonly hunk: WorkspaceDiffHunkView; readonly wordWrap: boolean; readonly wordDiff: boolean }): JSX.Element {
-  const inline = wordDiff ? inlineSegmentsForHunk(hunk) : new Map<number, readonly InlineWordSegment[]>();
+  const inline = useMemo(() => wordDiff ? createReviewInlineDiff(hunk) : new Map<number, readonly InlineWordSegment[]>(), [hunk, wordDiff]);
   return <div className="review-diff-table review-diff-table--unified">{hunk.lines.map((line, index) => <div className={`review-diff-line review-diff-line--${line.kind}`} key={`${line.oldLine}:${line.newLine}:${index}`}><span>{line.oldLine || ""}</span><span>{line.newLine || ""}</span><i aria-hidden="true">{diffLineCharacter(line.kind)}</i><code className={wordWrap ? "is-wrapped" : undefined}><ReviewLineContent text={line.text} segments={inline.get(index)} /></code></div>)}</div>;
 }
 
@@ -2372,26 +2539,6 @@ function ReviewSplitCell({ line, side, wordWrap, segments }: { readonly line?: W
 function ReviewLineContent({ text, segments }: { readonly text: string; readonly segments?: readonly InlineWordSegment[] }): JSX.Element {
   if (segments === undefined || segments.length === 0) return <>{text}</>;
   return <>{segments.map((segment, index) => <span className={segment.changed ? "inline-word-change" : undefined} key={`${index}:${segment.text}`}>{segment.text}</span>)}</>;
-}
-
-function inlineSegmentsForHunk(hunk: WorkspaceDiffHunkView): ReadonlyMap<number, readonly InlineWordSegment[]> {
-  const result = new Map<number, readonly InlineWordSegment[]>();
-  let index = 0;
-  while (index < hunk.lines.length) {
-    if (hunk.lines[index]!.kind !== "removed") { index += 1; continue; }
-    const removed: number[] = [];
-    const added: number[] = [];
-    while (index < hunk.lines.length && hunk.lines[index]!.kind === "removed") { removed.push(index); index += 1; }
-    while (index < hunk.lines.length && hunk.lines[index]!.kind === "added") { added.push(index); index += 1; }
-    for (let pairIndex = 0; pairIndex < Math.min(removed.length, added.length); pairIndex += 1) {
-      const leftIndex = removed[pairIndex]!;
-      const rightIndex = added[pairIndex]!;
-      const pair = inlineWordDiff(hunk.lines[leftIndex]!.text, hunk.lines[rightIndex]!.text);
-      result.set(leftIndex, pair.before);
-      result.set(rightIndex, pair.after);
-    }
-  }
-  return result;
 }
 
 function diffLineCharacter(kind: WorkspaceDiffHunkView["lines"][number]["kind"]): string {

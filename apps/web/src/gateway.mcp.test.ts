@@ -17,7 +17,7 @@ describe("MCP gateway", () => {
   it("maps a complete editable configuration without projecting credential values", () => {
     const projected = mapSnapshot(create(SnapshotSchema, {
       settings: {
-        agentResource: {},
+        auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" }, agentResource: {},
         collaboration: {},
         gitSafety: {},
         mcpServers: [{
@@ -76,7 +76,7 @@ describe("MCP gateway", () => {
     expect(safeStringify(projected.settings.mcpServers)).not.toContain("secret-material");
   });
 
-  it("keeps the saved ID and submits ordered bindings behind an exact revision fence", async () => {
+  it.each(["https", "sse"] as const)("keeps the saved ID and submits %s bindings behind an exact revision fence", async (transport) => {
     const payloads: any[] = [];
     const gateway = createOrchestratorGateway(
       { id: "connection", deviceId: "device-test", name: "Desktop", origin: "https://orchestrator.example" , serverId: "server-test" },
@@ -90,7 +90,7 @@ describe("MCP gateway", () => {
       id: "saved-server",
       revision: 12n,
       name: "Saved server",
-      transport: "https",
+      transport,
       endpoint: "https://mcp.example.test/rpc",
       command: "",
       arguments: [],
@@ -111,6 +111,8 @@ describe("MCP gateway", () => {
         expectedRevision: { value: 12n },
         server: {
           displayName: "Saved server",
+          transport: transport === "sse" ? McpTransport.HTTP_SSE : McpTransport.HTTPS_STREAMABLE_HTTP,
+          transportConfig: { case: transport === "sse" ? "sse" : "streamableHttp", value: { endpoint: "https://mcp.example.test/rpc" } },
           credentialBindings: [
             { target: McpCredentialTarget.HEADER, targetName: "Authorization", credentialReferenceId: "credential-reference-token" },
             { target: McpCredentialTarget.HEADER, targetName: "X-Tenant", credentialReferenceId: "credential-reference-tenant" }
@@ -150,6 +152,44 @@ describe("MCP gateway", () => {
     })).rejects.toThrow(/unique/u);
     expect(payloads).toHaveLength(0);
     gateway.disconnect();
+  });
+
+  it.each(["https", "sse"] as const)("allows an IPv6 loopback endpoint for explicit %s transport", async (transport) => {
+    const payloads: any[] = [];
+    const gateway = createOrchestratorGateway(
+      { id: "connection", deviceId: "device-test", name: "Desktop", origin: "https://orchestrator.example", serverId: "server-test" },
+      "auth-key", {}, () => operationTransport(payloads)
+    );
+    await gateway.connect();
+    try {
+      await gateway.saveMcpServer({
+        id: "local-tools", revision: 0n, name: "Local tools", transport,
+        endpoint: "http://[::1]:4319/events/", command: "", arguments: [],
+        workingDirectory: "", environment: [], credentialBindings: [], enabled: true
+      });
+      expect(payloads).toHaveLength(1);
+      expect(payloads[0].value.server.transportConfig).toEqual({
+        case: transport === "sse" ? "sse" : "streamableHttp",
+        value: expect.objectContaining({ endpoint: "http://[::1]:4319/events/" })
+      });
+    } finally { gateway.disconnect(); }
+  });
+
+  it.each(["#player", "?session=configuration"])("rejects the configured endpoint suffix %s before submitting an operation", async (suffix) => {
+    const payloads: any[] = [];
+    const gateway = createOrchestratorGateway(
+      { id: "connection", deviceId: "device-test", name: "Desktop", origin: "https://orchestrator.example", serverId: "server-test" },
+      "auth-key", {}, () => operationTransport(payloads)
+    );
+    await gateway.connect();
+    try {
+      await expect(gateway.saveMcpServer({
+        id: "remote-tools", revision: 0n, name: "Remote tools", transport: "sse",
+        endpoint: `https://mcp.example.test/events${suffix}`, command: "", arguments: [],
+        workingDirectory: "", environment: [], credentialBindings: [], enabled: true
+      })).rejects.toThrow(/MCP endpoint/u);
+      expect(payloads).toHaveLength(0);
+    } finally { gateway.disconnect(); }
   });
 });
 

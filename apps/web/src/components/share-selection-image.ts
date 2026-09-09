@@ -1,4 +1,6 @@
 import type { TimelineItemView } from "../model.js";
+import { downloadArtifactBlob } from "../artifact-download.js";
+import { assertBrowserActionCurrent, type BrowserActionContext } from "../browser-action.js";
 import { visibleSelectionQuoteMessageText } from "../selection-quote.js";
 import {
   MAXIMUM_SHARE_IMAGE_EDGE_PIXELS,
@@ -8,6 +10,7 @@ import {
   ShareMessageImageEncodingError,
   ShareMessageImageTooLargeError,
   assertPngBlob,
+  canvasPngBlob,
   redactShareMessageText,
   shareMessageImageFilename,
   wrapShareMessageText
@@ -156,113 +159,118 @@ export function layoutShareSelectionImage(
 
 export async function buildShareSelectionImagePng(
   content: ShareSelectionImageContent,
-  palette = readPalette()
+  action: BrowserActionContext,
+  palette = readPalette(action)
 ): Promise<Blob> {
-  const canvas = document.createElement("canvas");
-  const context = canvas.getContext("2d");
-  if (context === null) throw new ShareMessageImageEncodingError();
-  context.font = `400 17px ${palette.fontFamily}`;
-  const layout = layoutShareSelectionImage(content, (value) => context.measureText(value).width);
-  canvas.width = layout.width * layout.scale;
-  canvas.height = layout.height * layout.scale;
-  context.scale(layout.scale, layout.scale);
-  context.textBaseline = "top";
-  context.fillStyle = palette.background;
-  context.fillRect(0, 0, layout.width, layout.height);
-
-  context.fillStyle = palette.accent;
-  roundedRect(context, HORIZONTAL_PADDING, 43, 34, 7, 3.5);
-  context.fill();
-  context.fillStyle = palette.text;
-  context.font = `650 25px ${palette.fontFamily}`;
-  context.fillText(layout.title, HORIZONTAL_PADDING, 65, layout.width - HORIZONTAL_PADDING * 2);
-  context.fillStyle = palette.secondaryText;
-  context.font = `400 13px ${palette.fontFamily}`;
-  context.fillText("Joko", HORIZONTAL_PADDING, 101);
-
-  const cardLeft = HORIZONTAL_PADDING;
-  const cardWidth = layout.width - HORIZONTAL_PADDING * 2;
-  for (const [index, card] of layout.cards.entries()) {
-    if (index > 0 && card.gapBefore) {
-      context.fillStyle = palette.secondaryText;
-      context.font = `600 18px ${palette.fontFamily}`;
-      context.textAlign = "center";
-      context.fillText("•••", layout.width / 2, card.top - 29);
-      context.textAlign = "left";
-    }
-    roundedRect(context, cardLeft, card.top, cardWidth, card.height, 18);
-    context.fillStyle = palette.surface;
-    context.fill();
-    context.strokeStyle = palette.line;
-    context.lineWidth = 1;
-    context.stroke();
-
-    const roleLabel = card.roleLabel || (card.role === "user" ? "You" : "Agent");
-    context.font = `600 13px ${palette.fontFamily}`;
-    const pillWidth = Math.min(220, Math.max(62, context.measureText(roleLabel).width + 24));
-    roundedRect(context, cardLeft + CARD_PADDING, card.top + CARD_PADDING, pillWidth, 28, 14);
-    context.fillStyle = palette.accent;
-    context.fill();
-    context.fillStyle = palette.accentInk;
-    context.fillText(roleLabel, cardLeft + CARD_PADDING + 12, card.top + CARD_PADDING + 6, pillWidth - 24);
-    if (card.createdAtLabel !== undefined) {
-      context.fillStyle = palette.secondaryText;
-      context.font = `400 12px ${palette.fontFamily}`;
-      const timeWidth = Math.min(cardWidth / 2, context.measureText(card.createdAtLabel).width);
-      context.fillText(card.createdAtLabel, cardLeft + cardWidth - CARD_PADDING - timeWidth, card.top + CARD_PADDING + 7, timeWidth);
-    }
-
-    context.fillStyle = palette.text;
+  assertBrowserActionCurrent(action);
+  const canvas = action.ownerDocument.createElement("canvas");
+  try {
+    const context = canvas.getContext("2d");
+    if (context === null) throw new ShareMessageImageEncodingError();
     context.font = `400 17px ${palette.fontFamily}`;
-    let lineTop = card.top + CARD_PADDING + 44;
-    for (const line of card.lines) {
-      context.fillText(line, cardLeft + CARD_PADDING, lineTop, cardWidth - CARD_PADDING * 2);
-      lineTop += BODY_LINE_HEIGHT;
+    const layout = layoutShareSelectionImage(content, (value) => context.measureText(value).width);
+    canvas.width = layout.width * layout.scale;
+    canvas.height = layout.height * layout.scale;
+    context.scale(layout.scale, layout.scale);
+    context.textBaseline = "top";
+    context.fillStyle = palette.background;
+    context.fillRect(0, 0, layout.width, layout.height);
+
+    context.fillStyle = palette.accent;
+    roundedRect(context, HORIZONTAL_PADDING, 43, 34, 7, 3.5);
+    context.fill();
+    context.fillStyle = palette.text;
+    context.font = `650 25px ${palette.fontFamily}`;
+    context.fillText(layout.title, HORIZONTAL_PADDING, 65, layout.width - HORIZONTAL_PADDING * 2);
+    context.fillStyle = palette.secondaryText;
+    context.font = `400 13px ${palette.fontFamily}`;
+    context.fillText("Joko", HORIZONTAL_PADDING, 101);
+
+    const cardLeft = HORIZONTAL_PADDING;
+    const cardWidth = layout.width - HORIZONTAL_PADDING * 2;
+    for (const [index, card] of layout.cards.entries()) {
+      if (index > 0 && card.gapBefore) {
+        context.fillStyle = palette.secondaryText;
+        context.font = `600 18px ${palette.fontFamily}`;
+        context.textAlign = "center";
+        context.fillText("•••", layout.width / 2, card.top - 29);
+        context.textAlign = "left";
+      }
+      roundedRect(context, cardLeft, card.top, cardWidth, card.height, 18);
+      context.fillStyle = palette.surface;
+      context.fill();
+      context.strokeStyle = palette.line;
+      context.lineWidth = 1;
+      context.stroke();
+
+      const roleLabel = card.roleLabel || (card.role === "user" ? "You" : "Agent");
+      context.font = `600 13px ${palette.fontFamily}`;
+      const pillWidth = Math.min(220, Math.max(62, context.measureText(roleLabel).width + 24));
+      roundedRect(context, cardLeft + CARD_PADDING, card.top + CARD_PADDING, pillWidth, 28, 14);
+      context.fillStyle = palette.accent;
+      context.fill();
+      context.fillStyle = palette.accentInk;
+      context.fillText(roleLabel, cardLeft + CARD_PADDING + 12, card.top + CARD_PADDING + 6, pillWidth - 24);
+      if (card.createdAtLabel !== undefined) {
+        context.fillStyle = palette.secondaryText;
+        context.font = `400 12px ${palette.fontFamily}`;
+        const timeWidth = Math.min(cardWidth / 2, context.measureText(card.createdAtLabel).width);
+        context.fillText(card.createdAtLabel, cardLeft + cardWidth - CARD_PADDING - timeWidth, card.top + CARD_PADDING + 7, timeWidth);
+      }
+
+      context.fillStyle = palette.text;
+      context.font = `400 17px ${palette.fontFamily}`;
+      let lineTop = card.top + CARD_PADDING + 44;
+      for (const line of card.lines) {
+        context.fillText(line, cardLeft + CARD_PADDING, lineTop, cardWidth - CARD_PADDING * 2);
+        lineTop += BODY_LINE_HEIGHT;
+      }
     }
+
+    const footerTop = layout.cards.at(-1)!.top + layout.cards.at(-1)!.height + 44;
+    context.strokeStyle = palette.line;
+    context.beginPath();
+    context.moveTo(HORIZONTAL_PADDING, footerTop);
+    context.lineTo(layout.width - HORIZONTAL_PADDING, footerTop);
+    context.stroke();
+    context.fillStyle = palette.accent;
+    context.font = `700 18px ${palette.fontFamily}`;
+    context.fillText("Joko", HORIZONTAL_PADDING, footerTop + 18);
+
+    const blob = await canvasPngBlob(canvas, action.signal);
+    assertBrowserActionCurrent(action);
+    await assertPngBlob(blob, action);
+    assertBrowserActionCurrent(action);
+    return blob;
+  } finally {
+    canvas.width = 0;
+    canvas.height = 0;
   }
-
-  const footerTop = layout.cards.at(-1)!.top + layout.cards.at(-1)!.height + 44;
-  context.strokeStyle = palette.line;
-  context.beginPath();
-  context.moveTo(HORIZONTAL_PADDING, footerTop);
-  context.lineTo(layout.width - HORIZONTAL_PADDING, footerTop);
-  context.stroke();
-  context.fillStyle = palette.accent;
-  context.font = `700 18px ${palette.fontFamily}`;
-  context.fillText("Joko", HORIZONTAL_PADDING, footerTop + 18);
-
-  const blob = await canvasPngBlob(canvas);
-  await assertPngBlob(blob);
-  return blob;
 }
 
-export async function copyShareSelectionImagePng(blob: Blob): Promise<void> {
-  await assertPngBlob(blob);
-  if (typeof ClipboardItem === "undefined" || typeof navigator.clipboard?.write !== "function") {
+export async function copyShareSelectionImagePng(blob: Blob, action: BrowserActionContext): Promise<void> {
+  await assertPngBlob(blob, action);
+  assertBrowserActionCurrent(action);
+  const ownerWindow = action.ownerDocument.defaultView!;
+  if (typeof ownerWindow.ClipboardItem === "undefined" || typeof ownerWindow.navigator.clipboard?.write !== "function") {
     throw new ShareMessageImageEncodingError();
   }
-  await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+  const item = new ownerWindow.ClipboardItem({ "image/png": blob });
+  assertBrowserActionCurrent(action);
+  // The issued clipboard operation has its own outcome even if the view then closes.
+  await ownerWindow.navigator.clipboard.write([item]);
 }
 
-export async function downloadShareSelectionImagePng(blob: Blob, sessionName: string, createdAt: number): Promise<void> {
-  await assertPngBlob(blob);
-  const url = URL.createObjectURL(blob);
-  try {
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = shareMessageImageFilename(sessionName, createdAt);
-    anchor.rel = "noopener";
-    anchor.hidden = true;
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-  } finally {
-    window.setTimeout(() => URL.revokeObjectURL(url), 0);
-  }
+export async function downloadShareSelectionImagePng(blob: Blob, sessionName: string, createdAt: number, action: BrowserActionContext): Promise<"dispatched"> {
+  await assertPngBlob(blob, action);
+  assertBrowserActionCurrent(action);
+  downloadArtifactBlob(blob, shareMessageImageFilename(sessionName, createdAt), action);
+  return "dispatched";
 }
 
-function readPalette(): ShareSelectionImagePalette {
-  const styles = getComputedStyle(document.documentElement);
+function readPalette(action: BrowserActionContext): ShareSelectionImagePalette {
+  assertBrowserActionCurrent(action);
+  const styles = action.ownerDocument.defaultView!.getComputedStyle(action.ownerDocument.documentElement);
   const required = (name: string): string => {
     const value = styles.getPropertyValue(name).trim();
     if (value.length === 0) throw new ShareMessageImageEncodingError();
@@ -278,15 +286,6 @@ function readPalette(): ShareSelectionImagePalette {
     accentInk: required("--accent-ink"),
     fontFamily: styles.fontFamily || "sans-serif"
   };
-}
-
-function canvasPngBlob(canvas: HTMLCanvasElement): Promise<Blob> {
-  return new Promise((resolve, reject) => {
-    canvas.toBlob((blob) => {
-      if (blob === null) reject(new ShareMessageImageEncodingError());
-      else resolve(blob);
-    }, "image/png");
-  });
 }
 
 function normalizeMultiline(value: string): string {

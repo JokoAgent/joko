@@ -12,6 +12,7 @@ import {
   type Response
 } from "playwright-core";
 import { isWithin } from "@joko/core/policy";
+import { installHtmlSnapshot, validateHtmlSnapshot, type BrowserHtmlSnapshot } from "./html-preview.js";
 import {
   BrowserLeaseConflictError,
   BrowserLeaseRegistry,
@@ -437,6 +438,7 @@ export class BrowserProvider {
   readonly #leases = new BrowserLeaseRegistry();
   readonly #takeovers: BrowserTakeoverRegistry;
   #context: BrowserContext | undefined;
+  readonly #htmlContexts = new Set<BrowserContext>();
   readonly #profileDirectories: BrowserTargetProfileDirectories;
   readonly #maximumScreenshotBytes: number;
   readonly #maximumPdfBytes: number;
@@ -668,6 +670,8 @@ export class BrowserProvider {
   private detachContext(): BrowserContext | undefined {
     const context = this.#context;
     this.#context = undefined;
+    for (const htmlContext of this.#htmlContexts) void htmlContext.close().catch(() => undefined);
+    this.#htmlContexts.clear();
     if (!this.#generationAbort.signal.aborted) {
       this.#generationAbort.abort(new BrowserLeaseConflictError("Browser generation was interrupted."));
     }
@@ -740,85 +744,119 @@ export class BrowserProvider {
    * it. Navigation completes before the previous page is released, so a failed
    * link open never destroys the currently presented page.
    */
-  openHumanPage(request: BrowserHumanPageRequest, ttlMs = 15 * 60 * 1_000): Promise<BrowserTakeover> {
-    const requested = {
-      providerId: request.providerId,
-      generation: request.generation,
-      owner: request.owner,
-      url: validateTakeoverNavigationUrl(request.url)
+  openHumanPage(request: BrowserHumanPageRequest, ttlMs = 15 * 60 * 1_000, htmlSnapshot?: BrowserHtmlSnapshot): Promise<BrowserTakeover> {
+    const releaseReadOwner = htmlSnapshot?.dispose;
+    let snapshotDisposed = false;
+    const disposeSnapshot = (): void => {
+      if (snapshotDisposed) return;
+      snapshotDisposed = true;
+      try { releaseReadOwner?.(); } catch { /* A released read owner cannot interrupt Browser cleanup. */ }
     };
-    if (requested.providerId !== this.id || !Number.isSafeInteger(requested.generation) || requested.generation < 1) {
-      throw new BrowserTakeoverConflictError("Browser page-open request has a stale Provider or generation fence.");
-    }
-    if (requested.owner.trim() === "" || requested.owner.length > 512 || requested.owner.includes("\u0000")) {
-      throw new BrowserTakeoverConflictError("A Browser page-open request requires a bounded owner.");
-    }
-    validateTakeoverTtl(ttlMs);
-    if (this.#takeoverRequestPending) {
-      return Promise.reject(new BrowserTakeoverConflictError("A Browser takeover transition is already pending."));
-    }
-    this.#takeoverRequestPending = true;
-    const result = this.queueLifecycle(async () => {
-      const context = this.requireContext();
-      if (requested.providerId !== this.id || requested.generation !== this.#generation) {
+    try {
+      const requested = {
+        providerId: request.providerId,
+        generation: request.generation,
+        owner: request.owner,
+        url: validateTakeoverNavigationUrl(request.url)
+      };
+      if (requested.providerId !== this.id || !Number.isSafeInteger(requested.generation) || requested.generation < 1) {
         throw new BrowserTakeoverConflictError("Browser page-open request has a stale Provider or generation fence.");
       }
-      if (this.#leases.current() !== undefined) {
-        throw new BrowserTakeoverConflictError("Browser Provider has an active agent control lease.");
+      if (requested.owner.trim() === "" || requested.owner.length > 512 || requested.owner.includes("\u0000")) {
+        throw new BrowserTakeoverConflictError("A Browser page-open request requires a bounded owner.");
       }
-      const previous = this.#takeovers.current();
-      if (previous !== undefined && previous.owner !== requested.owner) {
-        throw new BrowserTakeoverConflictError("Browser Provider already has a human takeover owned by another Connection.");
+      validateTakeoverTtl(ttlMs);
+      validateHtmlSnapshot(requested.url, htmlSnapshot);
+      if (this.#takeoverRequestPending) {
+        disposeSnapshot();
+        return Promise.reject(new BrowserTakeoverConflictError("A Browser takeover transition is already pending."));
       }
+      this.#takeoverRequestPending = true;
+      const result = this.queueLifecycle(async () => {
+        const context = this.requireContext();
+        if (requested.providerId !== this.id || requested.generation !== this.#generation) {
+          throw new BrowserTakeoverConflictError("Browser page-open request has a stale Provider or generation fence.");
+        }
+        if (this.#leases.current() !== undefined) {
+          throw new BrowserTakeoverConflictError("Browser Provider has an active agent control lease.");
+        }
+        const previous = this.#takeovers.current();
+        if (previous !== undefined && previous.owner !== requested.owner) {
+          throw new BrowserTakeoverConflictError("Browser Provider already has a human takeover owned by another Connection.");
+        }
 
-      let page: Page | undefined;
-      let takeover: BrowserTakeover | undefined;
-      try {
-        page = await context.newPage();
-        this.#pageStates.set(page, "loading");
-        await page.goto(requested.url, { waitUntil: "domcontentloaded" });
-        const pageId = this.idFor(page);
-        if (previous !== undefined) {
-          await this.resetHumanCommentDesigns(this.requirePageNow(previous.pageId));
-          this.#takeovers.end(previous);
-          this.#takeoverRateWindow = undefined;
+        let page: Page | undefined;
+        let takeover: BrowserTakeover | undefined;
+        let htmlContext: BrowserContext | undefined;
+        const assertOpeningCurrent = (): void => {
+          if (this.#context !== context || this.#generation !== requested.generation) throw new BrowserTakeoverConflictError("The Browser page-open generation changed.");
+          htmlSnapshot?.assertCurrent();
+        };
+        try {
+          if (htmlSnapshot === undefined) page = await context.newPage();
+          else {
+            const browser = context.browser();
+            if (browser === null) throw new Error("The Browser runtime cannot isolate HTML previews.");
+            htmlContext = await browser.newContext({ acceptDownloads: false, serviceWorkers: "block" });
+            assertOpeningCurrent();
+            this.#htmlContexts.add(htmlContext);
+            const isolated = htmlContext;
+            isolated.once("close", () => { this.#htmlContexts.delete(isolated); disposeSnapshot(); });
+            page = await isolated.newPage();
+            this.bindPage(page);
+            page.once("close", () => { void isolated.close().catch(() => undefined); });
+          }
+          this.#pageStates.set(page, "loading");
+          if (htmlSnapshot !== undefined) await installHtmlSnapshot(page, requested.url, { ...htmlSnapshot, dispose: disposeSnapshot });
+          assertOpeningCurrent();
+          await page.goto(requested.url, { waitUntil: "domcontentloaded" });
+          assertOpeningCurrent();
+          const pageId = this.idFor(page);
+          if (previous !== undefined) {
+            await this.resetHumanCommentDesigns(this.requirePageNow(previous.pageId));
+            assertOpeningCurrent();
+            this.#takeovers.end(previous);
+            this.#takeoverRateWindow = undefined;
+            await this.emit({
+              at: Date.now(),
+              type: "takeover",
+              pageId: previous.pageId,
+              detail: `Human takeover ${previous.takeoverId} ended.`
+            });
+          }
+          takeover = this.#takeovers.begin({
+            providerId: this.id,
+            pageId,
+            generation: this.#generation,
+            owner: requested.owner
+          }, ttlMs);
+          await page.bringToFront();
+          assertOpeningCurrent();
+          this.assertHumanTakeover(takeover);
           await this.emit({
             at: Date.now(),
             type: "takeover",
-            pageId: previous.pageId,
-            detail: `Human takeover ${previous.takeoverId} ended.`
+            pageId,
+            detail: `Human takeover ${takeover.takeoverId} started.`
           });
-        }
-        takeover = this.#takeovers.begin({
-          providerId: this.id,
-          pageId,
-          generation: this.#generation,
-          owner: requested.owner
-        }, ttlMs);
-        await page.bringToFront();
-        this.assertHumanTakeover(takeover);
-        await this.emit({
-          at: Date.now(),
-          type: "takeover",
-          pageId,
-          detail: `Human takeover ${takeover.takeoverId} started.`
-        });
-        return takeover;
-      } catch (error) {
-        if (takeover !== undefined) {
-          try {
-            this.#takeovers.end(takeover);
-          } catch {
-            // Closing the new page may already have fenced the failed takeover.
+          return takeover;
+        } catch (error) {
+          if (takeover !== undefined) {
+            try {
+              this.#takeovers.end(takeover);
+            } catch {
+              // Closing the new page may already have fenced the failed takeover.
+            }
           }
+          await page?.close().catch(() => undefined);
+          await htmlContext?.close().catch(() => undefined);
+          throw error;
         }
-        await page?.close().catch(() => undefined);
-        throw error;
-      }
-    });
-    return result.finally(() => {
-      this.#takeoverRequestPending = false;
-    });
+      });
+      return result.catch((error: unknown) => { disposeSnapshot(); throw error; }).finally(() => {
+        this.#takeoverRequestPending = false;
+      });
+    } catch (error) { disposeSnapshot(); throw error; }
   }
 
   /**
@@ -903,7 +941,7 @@ export class BrowserProvider {
         return current;
       }
 
-      const replacement = this.requireContext().pages().find((candidate) => candidate !== target && !candidate.isClosed());
+      const replacement = this.allPages().find((candidate) => candidate !== target && !candidate.isClosed());
       if (replacement !== undefined) await replacement.bringToFront();
       this.assertHumanTakeover(expected);
       await this.resetHumanCommentDesigns(target);
@@ -1198,8 +1236,7 @@ export class BrowserProvider {
   }
 
   async listPages(): Promise<readonly BrowserPageState[]> {
-    const context = this.requireContext();
-    return Promise.all(context.pages().map((page) => this.pageState(page)));
+    return Promise.all(this.allPages().map((page) => this.pageState(page)));
   }
 
   createPage(lease: BrowserLeaseFence, url?: string, label?: string): Promise<BrowserPageState> {
@@ -1220,11 +1257,11 @@ export class BrowserProvider {
     }
     if (label !== undefined) {
       const safeLabel = validateBoundedString(label, "Browser page label", 256);
-      const page = this.requireContext().pages().find((candidate) => this.#pageLabels.get(candidate) === safeLabel);
+      const page = this.allPages().find((candidate) => this.#pageLabels.get(candidate) === safeLabel);
       if (page === undefined) throw new Error(`Browser page label '${safeLabel}' does not exist.`);
       return this.idFor(page);
     }
-    const page = this.requireContext().pages().at(-1);
+    const page = this.allPages().at(-1);
     if (page === undefined) throw new Error("Browser has no open pages.");
     return this.idFor(page);
   }
@@ -1860,7 +1897,7 @@ export class BrowserProvider {
   }
 
   private requirePageNow(pageId: string): Page {
-    const page = this.requireContext().pages().find((candidate) => this.idFor(candidate) === pageId);
+    const page = this.allPages().find((candidate) => this.idFor(candidate) === pageId);
     if (page === undefined) throw new Error(`Browser page ${pageId} does not exist.`);
     return page;
   }
@@ -1901,6 +1938,10 @@ export class BrowserProvider {
   private requireContext(): BrowserContext {
     if (this.#context === undefined) throw new Error("Browser provider is not running.");
     return this.#context;
+  }
+
+  private allPages(): Page[] {
+    return [this.requireContext(), ...this.#htmlContexts].flatMap((context) => context.pages()).filter((page) => !page.isClosed());
   }
 
   private async pageState(page: Page): Promise<BrowserPageState> {

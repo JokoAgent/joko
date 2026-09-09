@@ -1,9 +1,11 @@
+import { ArtifactDownloadButton } from "./ArtifactDownloadButton.js";
 import { Download, File, FileCode2, FileImage, FileText, ImageOff, Maximize2 } from "lucide-react";
 import {
   forwardRef,
   useCallback,
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -41,6 +43,8 @@ import { WorkspaceMarkdownImageHost } from "./WorkspaceMarkdownImageHost.js";
 import { WorkspaceMermaidHosts, type WorkspaceMermaidHostLabels } from "./WorkspaceMermaidHosts.js";
 import { WorkspacePdfCanvas } from "./WorkspacePdfCanvas.js";
 import { SelectionQuoteButton } from "./SelectionQuoteButton.js";
+import { VideoPreview } from "./VideoPreview.js";
+import { AudioPreview } from "./AudioPreview.js";
 import {
   WorkspaceTextEditor,
   type WorkspaceEditorSearchState,
@@ -174,7 +178,12 @@ export interface WorkspaceFileBodyHandle {
  * a server filesystem path, and every editable document joins the shared
  * route/session/window dirty-document registry.
  */
-export const WorkspaceFileBody = forwardRef<WorkspaceFileBodyHandle, WorkspaceFileBodyProps>(function WorkspaceFileBody({
+export const WorkspaceFileBody = forwardRef<WorkspaceFileBodyHandle, WorkspaceFileBodyProps>(function WorkspaceFileBody(props, forwardedRef) {
+  const ownerKey = JSON.stringify([props.controller.state.activeProfile?.serverId, props.controller.state.activeProfile?.id, props.sessionId, props.workspaceId]);
+  return <WorkspaceFileBodyContent key={ownerKey} {...props} ref={forwardedRef} />;
+});
+
+const WorkspaceFileBodyContent = forwardRef<WorkspaceFileBodyHandle, WorkspaceFileBodyProps>(function WorkspaceFileBodyContent({
   controller,
   sessionId,
   workspaceId,
@@ -192,6 +201,11 @@ export const WorkspaceFileBody = forwardRef<WorkspaceFileBodyHandle, WorkspaceFi
   labels: labelOverrides,
   className
 }, forwardedRef) {
+  const artifactOwnerRef = useRef({ acquire: controller.getArtifactUrl, release: controller.releaseArtifactUrl, generation: 0 });
+  if (artifactOwnerRef.current.acquire !== controller.getArtifactUrl || artifactOwnerRef.current.release !== controller.releaseArtifactUrl) {
+    artifactOwnerRef.current = { acquire: controller.getArtifactUrl, release: controller.releaseArtifactUrl, generation: artifactOwnerRef.current.generation + 1 };
+  }
+  const imageOwnerKey = JSON.stringify([controller.state.activeProfile?.serverId, controller.state.activeProfile?.id, sessionId, workspaceId, path, artifactOwnerRef.current.generation]);
   const labels = useWorkspaceFileBodyLabels(controller.state.preferences.locale, labelOverrides);
   const controllerRef = useRef(controller);
   controllerRef.current = controller;
@@ -201,11 +215,20 @@ export const WorkspaceFileBody = forwardRef<WorkspaceFileBodyHandle, WorkspaceFi
   selectedWorkspaceIdRef.current = workspaceId;
   const editorRef = useRef<WorkspaceFileEditorPaneHandle>(null);
   const readOnlyEditorRef = useRef<WorkspaceTextEditorHandle>(null);
+  const markdownImageRootRef = useRef<HTMLElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
-  const markdownImageBlobIdCountsRef = useRef(new Map<string, number>());
-  const markdownImageObjectUrlsRef = useRef(new Set<string>());
-  const markdownImageRequestsRef = useRef(new Map<string, ReturnType<WorkspaceMarkdownImageResolver>>());
-  const markdownImageGenerationRef = useRef(0);
+  const markdownImageOwner = useMemo(() => ({
+    active: true,
+    generation: 0,
+    abort: new AbortController(),
+    acquire: controller.getArtifactUrl,
+    release: controller.releaseArtifactUrl,
+    blobIdCounts: new Map<string, number>(),
+    objectUrls: new Set<string>(),
+    requests: new Map<string, ReturnType<WorkspaceMarkdownImageResolver>>()
+  }), [path, controller.getArtifactUrl, controller.releaseArtifactUrl]);
+  const markdownImageOwnerRef = useRef(markdownImageOwner);
+  markdownImageOwnerRef.current = markdownImageOwner;
   const [localPreview, setLocalPreview] = useState<WorkspaceFilePreviewView | undefined>(preview);
   const [documentSearchOpen, setDocumentSearchOpen] = useState(false);
   const [documentSearchState, setDocumentSearchState] = useState<WorkspaceEditorSearchState>(EMPTY_DOCUMENT_SEARCH_STATE);
@@ -229,16 +252,22 @@ export const WorkspaceFileBody = forwardRef<WorkspaceFileBodyHandle, WorkspaceFi
   }, [path]);
 
   useEffect(() => () => onDirtyChangeRef.current?.(false), []);
-  useEffect(() => () => {
-    markdownImageGenerationRef.current += 1;
-    markdownImageRequestsRef.current.clear();
-    for (const [blobId, count] of markdownImageBlobIdCountsRef.current) {
-      for (let index = 0; index < count; index += 1) controllerRef.current.releaseArtifactUrl(blobId);
-    }
-    markdownImageBlobIdCountsRef.current.clear();
-    for (const url of markdownImageObjectUrlsRef.current) URL.revokeObjectURL(url);
-    markdownImageObjectUrlsRef.current.clear();
-  }, [path]);
+  useLayoutEffect(() => {
+    markdownImageOwner.active = true;
+    if (markdownImageOwner.abort.signal.aborted) markdownImageOwner.abort = new AbortController();
+    return () => {
+      markdownImageOwner.active = false;
+      markdownImageOwner.generation += 1;
+      markdownImageOwner.abort.abort();
+      markdownImageOwner.requests.clear();
+      for (const [blobId, count] of markdownImageOwner.blobIdCounts) {
+        for (let index = 0; index < count; index += 1) markdownImageOwner.release(blobId);
+      }
+      markdownImageOwner.blobIdCounts.clear();
+      for (const url of markdownImageOwner.objectUrls) URL.revokeObjectURL(url);
+      markdownImageOwner.objectUrls.clear();
+    };
+  }, [markdownImageOwner]);
 
   const activePreview = localPreview?.path === path ? localPreview : undefined;
   const model = path !== null && path !== undefined && isModelPath(path);
@@ -314,10 +343,15 @@ export const WorkspaceFileBody = forwardRef<WorkspaceFileBodyHandle, WorkspaceFi
     loadFailed: labels.imageUnavailable
   }), [labels.imageOpen, labels.imageUnavailable, labels.loading]);
   const markdownImageResolver = useCallback<WorkspaceMarkdownImageResolver>(async (source) => {
-    if (textPreview === undefined || !markdown) return undefined;
-    const generation = markdownImageGenerationRef.current;
+    const generation = markdownImageOwner.generation;
+    const current = (): boolean => markdownImageOwner.active && markdownImageOwnerRef.current === markdownImageOwner && markdownImageOwner.generation === generation;
+    const requestController = controllerRef.current;
+    // Editor layout may run before its parent owner mounts. Keep the captured
+    // generation while allowing that owner setup to finish before admission.
+    await Promise.resolve();
+    if (textPreview === undefined || !markdown || !current()) return undefined;
     const requestKey = `${textPreview.path}\u0000${source}`;
-    const existing = markdownImageRequestsRef.current.get(requestKey);
+    const existing = markdownImageOwner.requests.get(requestKey);
     if (existing !== undefined) return existing;
     const request = (async () => {
     const resolved = resolveWorkspaceMarkdownImageSource(textPreview.path, source);
@@ -329,16 +363,14 @@ export const WorkspaceFileBody = forwardRef<WorkspaceFileBodyHandle, WorkspaceFi
     };
     if (resolved.kind === "remote") {
       try {
-        const response = await fetch(resolved.url, { credentials: "omit", referrerPolicy: "no-referrer" });
+        const response = await fetch(resolved.url, { credentials: "omit", referrerPolicy: "no-referrer", signal: markdownImageOwner.abort.signal });
+        if (!current()) return undefined;
         if (response.ok) {
           const blob = await response.blob();
+          if (!current()) return undefined;
           if (blob.type.toLocaleLowerCase().startsWith("image/")) {
             const url = URL.createObjectURL(blob);
-            if (generation !== markdownImageGenerationRef.current) {
-              URL.revokeObjectURL(url);
-              return undefined;
-            }
-            markdownImageObjectUrlsRef.current.add(url);
+            markdownImageOwner.objectUrls.add(url);
             return { url, name: workspaceImageName(new URL(resolved.url).pathname), mediaType: blob.type };
           }
         }
@@ -347,46 +379,42 @@ export const WorkspaceFileBody = forwardRef<WorkspaceFileBodyHandle, WorkspaceFi
         // still previews it through <img>; retain that display path while
         // credentialed copy/annotation actions remain fail-closed.
       }
-      return generation === markdownImageGenerationRef.current
+      return current()
         ? { url: resolved.url, name: workspaceImageName(new URL(resolved.url).pathname) }
         : undefined;
     }
-    const image = await controllerRef.current.readWorkspaceFile(workspaceId, resolved.path);
-    if (generation !== markdownImageGenerationRef.current) return undefined;
+    const image = await requestController.readWorkspaceFile(workspaceId, resolved.path);
+    if (!current()) return undefined;
     if (image.path !== resolved.path) return undefined;
     if (image.kind === "text" && /\.svg$/iu.test(image.path) && image.text !== undefined) {
       const url = URL.createObjectURL(new Blob([image.text], { type: "image/svg+xml" }));
-      if (generation !== markdownImageGenerationRef.current) {
-        URL.revokeObjectURL(url);
-        return undefined;
-      }
-      markdownImageObjectUrlsRef.current.add(url);
+      markdownImageOwner.objectUrls.add(url);
       return { url, name: image.name, mediaType: "image/svg+xml" };
     }
     if (image.blobId === undefined || image.blobId === "") return undefined;
-    const url = await controllerRef.current.getArtifactUrl(image.blobId);
-    if (generation !== markdownImageGenerationRef.current) {
-      controllerRef.current.releaseArtifactUrl(image.blobId);
+    const url = await markdownImageOwner.acquire(image.blobId);
+    if (!current()) {
+      markdownImageOwner.release(image.blobId);
       return undefined;
     }
-    markdownImageBlobIdCountsRef.current.set(
+    markdownImageOwner.blobIdCounts.set(
       image.blobId,
-      (markdownImageBlobIdCountsRef.current.get(image.blobId) ?? 0) + 1
+      (markdownImageOwner.blobIdCounts.get(image.blobId) ?? 0) + 1
     );
     return { url, name: image.name, mediaType: image.mediaType };
     })();
-    markdownImageRequestsRef.current.set(requestKey, request);
+    markdownImageOwner.requests.set(requestKey, request);
     try {
       const result = await request;
-      if (result === undefined && markdownImageRequestsRef.current.get(requestKey) === request) {
-        markdownImageRequestsRef.current.delete(requestKey);
+      if (result === undefined && markdownImageOwner.requests.get(requestKey) === request) {
+        markdownImageOwner.requests.delete(requestKey);
       }
       return result;
     } catch (cause) {
-      if (markdownImageRequestsRef.current.get(requestKey) === request) markdownImageRequestsRef.current.delete(requestKey);
+      if (markdownImageOwner.requests.get(requestKey) === request) markdownImageOwner.requests.delete(requestKey);
       throw cause;
     }
-  }, [markdown, textPreview?.path, workspaceId]);
+  }, [markdown, textPreview?.path, workspaceId, markdownImageOwner]);
 
   const saveWorkspaceText = useCallback(async (draft: WorkspaceFileSaveDraft) => {
     try {
@@ -557,7 +585,7 @@ export const WorkspaceFileBody = forwardRef<WorkspaceFileBodyHandle, WorkspaceFi
         onRetry={() => reloadDrawioPreview(textPreview.path)}
       />
     </section>;
-    return <section className={cx("workspace-file-body", className)} data-file-kind={markdown ? "markdown" : "text"} data-file-path={path} data-local-page-search-owner="true">
+    return <section ref={markdownImageRootRef} className={cx("workspace-file-body", className)} data-file-kind={markdown ? "markdown" : "text"} data-file-path={path} data-local-page-search-owner="true">
       {textPreview.truncated && <div className="workspace-file-body__truncated" role="status">{labels.truncated}</div>}
       <div className="workspace-file-body__text-stage">
         <div className="workspace-file-body__source">
@@ -638,20 +666,25 @@ export const WorkspaceFileBody = forwardRef<WorkspaceFileBodyHandle, WorkspaceFi
         onNext={() => setDocumentSearchState(activateDocumentSearch(documentSearchState.query, documentSearchState.activeIndex + 1))}
         onClose={() => clearDocumentSearch()}
       />}
-      {markdown && <WorkspaceMermaidHosts labels={markdownMermaidHostLabels} />}
-      {markdown && <WorkspaceMarkdownImageHost key={path} labels={imageLightboxLabels(labels)} onSendToChat={onImageToChat} />}
+      {markdown && <WorkspaceMermaidHosts key={imageOwnerKey} ownerKey={imageOwnerKey} rootRef={markdownImageRootRef} labels={markdownMermaidHostLabels} annotationLabels={{ ...imageLightboxLabels(labels), prepareFailed: labels.imageUnavailable }} onSendToChat={onImageToChat} />}
+      {markdown && <WorkspaceMarkdownImageHost key={imageOwnerKey} ownerKey={imageOwnerKey} rootRef={markdownImageRootRef} labels={imageLightboxLabels(labels)} onSendToChat={onImageToChat} />}
     </section>;
   }
 
   const mediaType = activePreview.mediaType?.split(";", 1)[0]?.trim().toLowerCase() ?? "";
   if (!isSvgPath(path) && (activePreview.kind === "image" || isRasterImagePath(path) || isRasterImageMediaType(mediaType))) {
-    return <AuthenticatedImagePreview controller={controller} preview={activePreview} labels={labels} onSendToChat={onImageToChat} className={className} />;
+    return <AuthenticatedImagePreview key={imageOwnerKey} ownerKey={imageOwnerKey} controller={controller} preview={activePreview} labels={labels} onSendToChat={onImageToChat} className={className} />;
   }
   if (isPdfPath(path) || mediaType === "application/pdf") {
     return <AuthenticatedPdfPreview controller={controller} preview={activePreview} labels={labels} className={className} />;
   }
   if (isVideoPath(path) || mediaType.startsWith("video/")) {
-    return <AuthenticatedVideoPreview controller={controller} preview={activePreview} labels={labels} className={className} />;
+    const ownerKey = JSON.stringify([controller.state.activeProfile?.serverId, controller.state.activeProfile?.id, sessionId, workspaceId, path, activePreview.blobId]);
+    return <AuthenticatedVideoPreview key={ownerKey} ownerKey={ownerKey} controller={controller} preview={activePreview} labels={labels} className={className} />;
+  }
+  if (isAudioPath(path) || /^audio\/[^/\s]+$/u.test(mediaType)) {
+    const ownerKey = JSON.stringify([imageOwnerKey, activePreview.blobId]);
+    return <AuthenticatedAudioPreview key={ownerKey} ownerKey={ownerKey} controller={controller} preview={activePreview} labels={labels} className={className} />;
   }
   return <BinaryFilePlaceholder controller={controller} preview={activePreview} labels={labels} className={className} />;
 });
@@ -705,7 +738,8 @@ const ReadOnlyWorkspaceEditor = forwardRef<WorkspaceTextEditorHandle, {
   </div>;
 });
 
-function AuthenticatedImagePreview({ controller, preview, labels, onSendToChat, className }: {
+function AuthenticatedImagePreview({ ownerKey, controller, preview, labels, onSendToChat, className }: {
+  readonly ownerKey: string;
   readonly controller: WorkspaceFileBodyController;
   readonly preview: WorkspaceFilePreviewView;
   readonly labels: WorkspaceFileBodyLabels;
@@ -730,21 +764,47 @@ function AuthenticatedImagePreview({ controller, preview, labels, onSendToChat, 
     <FileMeta preview={preview} locale={controller.state.preferences.locale} />
     <DownloadAction controller={controller} preview={preview} labels={labels} />
     {open && artifact.status === "ready" && <WorkspaceImageLightbox
+      ownerKey={JSON.stringify([ownerKey, preview.blobId])}
       src={artifact.url}
       name={preview.name}
       mediaType={preview.mediaType}
       labels={imageLightboxLabels(labels)}
       returnFocus={openButtonRef.current}
       onClose={() => setOpen(false)}
-      onDownload={() => preview.blobId === undefined
+      onDownload={(context) => preview.blobId === undefined
         ? Promise.reject(new Error(labels.downloadUnavailable))
-        : controller.downloadArtifact(preview.blobId, preview.name)}
+        : controller.downloadArtifact(preview.blobId, preview.name, context)}
       onSendToChat={onSendToChat}
     />}
   </section>;
 }
 
-function AuthenticatedVideoPreview({ controller, preview, labels, className }: {
+function AuthenticatedAudioPreview({ ownerKey, controller, preview, labels, className }: {
+  readonly ownerKey: string;
+  readonly controller: WorkspaceFileBodyController;
+  readonly preview: WorkspaceFilePreviewView;
+  readonly labels: WorkspaceFileBodyLabels;
+  readonly className?: string;
+}): JSX.Element {
+  const artifact = useAuthenticatedArtifactUrl(controller, preview.blobId);
+  const locale = controller.state.preferences.locale;
+  return <section className={cx("workspace-file-body workspace-file-body--media", className)} data-file-kind="audio">
+    <div className="workspace-file-body__media-stage">
+      {artifact.status === "error" ? <span className="audio-preview__feedback is-error" role="alert">{labels.unavailable}</span>
+        : artifact.status === "loading" ? <Spinner label={labels.loading} /> : <AudioPreview
+        src={artifact.url}
+        ownerKey={ownerKey}
+        name={preview.name}
+        labels={{ player: translate(locale, "timeline.audioPlayer", { name: preview.name }), loading: labels.loading, unavailable: labels.unavailable, copyDescription: translate(locale, "media.copyDescription"), copying: translate(locale, "media.copyingDescription"), copied: translate(locale, "media.descriptionCopied"), copyFailed: translate(locale, "media.descriptionCopyFailed") }}
+      />}
+    </div>
+    <FileMeta preview={preview} locale={locale} />
+    <DownloadAction controller={controller} preview={preview} labels={labels} />
+  </section>;
+}
+
+function AuthenticatedVideoPreview({ ownerKey, controller, preview, labels, className }: {
+  readonly ownerKey: string;
   readonly controller: WorkspaceFileBodyController;
   readonly preview: WorkspaceFilePreviewView;
   readonly labels: WorkspaceFileBodyLabels;
@@ -752,18 +812,17 @@ function AuthenticatedVideoPreview({ controller, preview, labels, className }: {
 }): JSX.Element {
   const artifact = useAuthenticatedArtifactUrl(controller, preview.blobId);
   const [failedUrl, setFailedUrl] = useState<string>();
+  const locale = controller.state.preferences.locale;
   if (artifact.status === "error" || (artifact.status === "ready" && failedUrl === artifact.url)) {
     return <BinaryFilePlaceholder controller={controller} preview={preview} labels={labels} className={className} />;
   }
   return <section className={cx("workspace-file-body workspace-file-body--media", className)} data-file-kind="video">
     <div className="workspace-file-body__media-stage">
       {artifact.status === "loading" && <Spinner label={labels.loading} />}
-      {artifact.status === "ready" && <video
+      {artifact.status === "ready" && <VideoPreview
         src={artifact.url}
-        controls
-        playsInline
-        preload="metadata"
-        aria-label={preview.name}
+        ownerKey={ownerKey}
+        labels={{ open: translate(locale, "media.openVideo", { name: preview.name }), player: translate(locale, "timeline.videoPlayer", { name: preview.name }), loading: labels.loading, unavailable: labels.unavailable, close: labels.close, playBlocked: translate(locale, "media.playBlocked") }}
         onError={() => setFailedUrl(artifact.url)}
       />}
     </div>
@@ -814,9 +873,9 @@ function AuthenticatedModelPreview({ controller, workspaceId, preview, labels, c
       labels={modelLightboxLabels(labels)}
       returnFocus={openButtonRef.current}
       onClose={() => setOpen(false)}
-      onDownload={() => preview.blobId === undefined
+      onDownload={(context) => preview.blobId === undefined
         ? Promise.reject(new Error(labels.downloadUnavailable))
-        : controller.downloadArtifact(preview.blobId, preview.name)}
+        : controller.downloadArtifact(preview.blobId, preview.name, context)}
     />}
   </section>;
 }
@@ -878,20 +937,16 @@ function DownloadAction({ controller, preview, labels }: {
   readonly labels: WorkspaceFileBodyLabels;
 }): JSX.Element {
   const available = preview.blobId !== undefined && preview.blobId !== "";
-  const [failed, setFailed] = useState(false);
-  return <><Button
-      tone="secondary"
-      className="workspace-file-body__download"
-      disabled={!available}
-      title={available ? labels.download : labels.downloadUnavailable}
-      onClick={() => {
-        if (preview.blobId === undefined) return;
-        setFailed(false);
-        void controller.downloadArtifact(preview.blobId, preview.name).catch(() => setFailed(true));
-      }}
-    ><Download aria-hidden="true" />{labels.download}</Button>
-    {failed && <span className="workspace-file-body__download-error" role="alert">{labels.downloadUnavailable}</span>}
-  </>;
+  return <ArtifactDownloadButton
+    ownerKey={JSON.stringify([preview.path, preview.blobId, preview.name])}
+    connectionOwner={controller.getArtifactUrl}
+    tone="secondary"
+    className="workspace-file-body__download"
+    disabled={!available}
+    label={labels.download}
+    errorLabel={labels.downloadUnavailable}
+    action={(context) => controller.downloadArtifact(preview.blobId as string, preview.name, context)}
+  />;
 }
 
 function FileMeta({ preview, locale, includeName = true, fallbackType }: {
@@ -943,30 +998,40 @@ type ArtifactUrlState =
   | { readonly status: "error" };
 
 function useAuthenticatedArtifactUrl(controller: WorkspaceFileBodyController, blobId: string | undefined): ArtifactUrlState {
-  const [state, setState] = useState<ArtifactUrlState>({ status: "loading" });
-  const controllerRef = useRef(controller);
-  controllerRef.current = controller;
+  const acquire = controller.getArtifactUrl;
+  const release = controller.releaseArtifactUrl;
+  const owner = useMemo(() => ({}), [acquire, release, blobId]);
+  const ownerRef = useRef(owner);
+  ownerRef.current = owner;
+  const [state, setState] = useState<{ readonly owner: object; readonly value: ArtifactUrlState }>({ owner, value: { status: "loading" } });
   useEffect(() => {
     let active = true;
     let acquired = false;
-    setState({ status: "loading" });
+    let released = false;
+    const current = (): boolean => active && ownerRef.current === owner;
+    const releaseAcquired = (): void => {
+      if (!acquired || released || blobId === undefined) return;
+      released = true;
+      release(blobId);
+    };
+    setState({ owner, value: { status: "loading" } });
     if (blobId === undefined || blobId === "") {
-      setState({ status: "error" });
+      setState({ owner, value: { status: "error" } });
       return () => { active = false; };
     }
-    void controllerRef.current.getArtifactUrl(blobId).then((url) => {
+    void acquire(blobId).then((url) => {
       acquired = true;
-      if (active) setState({ status: "ready", url });
-      else controllerRef.current.releaseArtifactUrl(blobId);
+      if (current()) setState({ owner, value: { status: "ready", url } });
+      else releaseAcquired();
     }).catch(() => {
-      if (active) setState({ status: "error" });
+      if (current()) setState({ owner, value: { status: "error" } });
     });
     return () => {
       active = false;
-      if (acquired) controllerRef.current.releaseArtifactUrl(blobId);
+      releaseAcquired();
     };
-  }, [blobId]);
-  return state;
+  }, [acquire, release, blobId, owner]);
+  return state.owner === owner ? state.value : { status: "loading" };
 }
 
 function useWorkspaceModelArtifactUrl(
@@ -975,53 +1040,79 @@ function useWorkspaceModelArtifactUrl(
   preview: WorkspaceFilePreviewView
 ): ArtifactUrlState {
   const source = useAuthenticatedArtifactUrl(controller, preview.blobId);
-  const [gltf, setGltf] = useState<ArtifactUrlState>({ status: "loading" });
+  const sourceUrl = source.status === "ready" ? source.url : undefined;
+  const acquire = controller.getArtifactUrl;
+  const release = controller.releaseArtifactUrl;
+  const owner = useMemo(() => ({}), [acquire, release, source.status, sourceUrl, preview.path, preview.truncated, workspaceId]);
+  const ownerRef = useRef(owner);
+  ownerRef.current = owner;
+  const [gltf, setGltf] = useState<{ readonly owner: object; readonly value: ArtifactUrlState }>({ owner, value: { status: "loading" } });
   const controllerRef = useRef(controller);
   controllerRef.current = controller;
   useEffect(() => {
     let active = true;
+    const abort = new AbortController();
+    const requestController = controllerRef.current;
+    const current = (): boolean => active && ownerRef.current === owner;
+    const assertCurrent = (): void => {
+      if (!current()) throw new Error("The model resource request is no longer active.");
+    };
     let materialized: Awaited<ReturnType<typeof materializeWorkspaceModelSource>> | undefined;
-    if (source.status !== "ready" || preview.truncated) {
-      setGltf(preview.truncated ? { status: "error" } : { status: "loading" });
+    if (sourceUrl === undefined || preview.truncated) {
+      setGltf({ owner, value: preview.truncated ? { status: "error" } : { status: "loading" } });
       return () => { active = false; };
     }
-    setGltf({ status: "loading" });
+    setGltf({ owner, value: { status: "loading" } });
     void materializeWorkspaceModelSource({
-      sourceUrl: source.url,
+      sourceUrl,
       modelPath: preview.path,
+      fetchSource: async (input, init) => {
+        assertCurrent();
+        const response = await fetch(input, { ...init, signal: abort.signal });
+        assertCurrent();
+        return response;
+      },
+      createObjectUrl: (blob) => { assertCurrent(); return URL.createObjectURL(blob); },
       loadResource: async (path) => {
-        const dependency = await controllerRef.current.readWorkspaceFile(workspaceId, path);
+        assertCurrent();
+        const dependency = await requestController.readWorkspaceFile(workspaceId, path);
+        assertCurrent();
         if (dependency.path !== path || dependency.truncated) throw new Error("The model resource is unavailable.");
         if (dependency.kind === "text" && dependency.text !== undefined) {
           return new Blob([dependency.text], { type: dependency.mediaType || workspaceModelResourceMediaType(path) });
         }
         if (dependency.blobId === undefined || dependency.blobId === "") throw new Error("The model resource is unavailable.");
-        const url = await controllerRef.current.getArtifactUrl(dependency.blobId);
+        const url = await acquire(dependency.blobId);
         try {
-          const response = await fetch(url, { credentials: "omit", referrerPolicy: "no-referrer" });
+          assertCurrent();
+          const response = await fetch(url, { credentials: "omit", referrerPolicy: "no-referrer", signal: abort.signal });
+          assertCurrent();
           if (!response.ok) throw new Error("The model resource could not be read.");
-          return await response.blob();
+          const blob = await response.blob();
+          assertCurrent();
+          return blob;
         } finally {
-          controllerRef.current.releaseArtifactUrl(dependency.blobId);
+          release(dependency.blobId);
         }
       }
     }).then((result) => {
       materialized = result;
-      if (active) setGltf({ status: "ready", url: result.url });
+      if (current()) setGltf({ owner, value: { status: "ready", url: result.url } });
       else result.dispose();
     }, () => {
-      if (active) setGltf({ status: "error" });
+      if (current()) setGltf({ owner, value: { status: "error" } });
     });
     return () => {
       active = false;
+      abort.abort();
       materialized?.dispose();
     };
-  }, [preview.path, preview.truncated, source.status, source.status === "ready" ? source.url : undefined, workspaceId]);
+  }, [acquire, release, owner, preview.path, preview.truncated, sourceUrl, workspaceId]);
   if (preview.truncated) return { status: "error" };
-  return source.status === "error" ? source : gltf;
+  return source.status === "error" ? source : gltf.owner === owner ? gltf.value : { status: "loading" };
 }
 
-export function workspaceFileBodyKind(path: string, preview: WorkspaceFilePreviewView): "text" | "markdown" | "drawio" | "image" | "model" | "pdf" | "video" | "binary" {
+export function workspaceFileBodyKind(path: string, preview: WorkspaceFilePreviewView): "text" | "markdown" | "drawio" | "image" | "model" | "pdf" | "video" | "audio" | "binary" {
   if (isModelPath(path)) return "model";
   if (preview.kind === "text") {
     if (isWorkspaceMarkdownPath(path)) return "markdown";
@@ -1032,6 +1123,7 @@ export function workspaceFileBodyKind(path: string, preview: WorkspaceFilePrevie
   if (!isSvgPath(path) && (preview.kind === "image" || isRasterImagePath(path) || isRasterImageMediaType(mediaType))) return "image";
   if (isPdfPath(path) || mediaType === "application/pdf") return "pdf";
   if (isVideoPath(path) || mediaType.startsWith("video/")) return "video";
+  if (isAudioPath(path) || /^audio\/[^/\s]+$/u.test(mediaType)) return "audio";
   return "binary";
 }
 
@@ -1049,6 +1141,10 @@ function isPdfPath(path: string): boolean {
 
 function isVideoPath(path: string): boolean {
   return /\.(?:mp4|m4v|mov|webm)$/iu.test(path);
+}
+
+function isAudioPath(path: string): boolean {
+  return /\.(?:mp3|wav|ogg|oga|m4a|aac|flac|opus)$/iu.test(path);
 }
 
 function isModelPath(path: string): boolean {

@@ -96,7 +96,8 @@ describe("RemoteHostToolBridgeProvider", () => {
         commandExecution: true,
         processStreaming: false,
         fileTransfer: false,
-        tcpForwarding: false
+        tcpForwarding: false,
+        interactiveTerminal: false
       },
       async connect(request: ResolvedAgentAuthConnectorRequest): Promise<AgentAuthConnection> {
         if (request.authentication.kind !== "private_key") throw new Error("unexpected authentication mode");
@@ -165,7 +166,8 @@ describe("RemoteHostToolBridgeProvider", () => {
         commandExecution: true,
         processStreaming: false,
         fileTransfer: false,
-        tcpForwarding: false
+        tcpForwarding: false,
+        interactiveTerminal: false
       },
       async connect(request) {
         request.onAuthenticating();

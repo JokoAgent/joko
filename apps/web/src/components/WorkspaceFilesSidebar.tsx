@@ -216,6 +216,7 @@ export interface WorkspaceFilesSidebarHandle {
   readonly revealPath: (path: string) => Promise<void>;
   readonly openSearch: () => void;
   readonly retryRoot: () => Promise<void>;
+  /** Resolves after invalidation is registered; directory refreshes are coalesced. */
   readonly invalidateChange: (change: WorkspaceFilesExternalChange) => Promise<void>;
 }
 
@@ -237,6 +238,11 @@ interface DirectoryTreeController {
   readonly afterRename: (oldPath: string, newPath: string, directory: boolean) => Promise<void>;
   readonly afterDelete: (path: string, directory: boolean) => Promise<void>;
   readonly invalidateChange: (change: WorkspaceFilesExternalChange) => Promise<void>;
+}
+
+interface DirectoryLoadFlight {
+  readonly promise: Promise<boolean>;
+  phase: "queued" | "running";
 }
 
 interface ContextMenuState {
@@ -843,7 +849,9 @@ function useWorkspaceDirectoryTree(input: {
   const generationRef = useRef(0);
   const revealTokenRef = useRef(0);
   const requestTokens = useRef(new Map<string, number>());
-  const inflightRequests = useRef(new Map<string, Promise<boolean>>());
+  const inflightRequests = useRef(new Map<string, DirectoryLoadFlight>());
+  const pendingEventParents = useRef(new Set<string>());
+  const eventRefreshTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   const replaceDirectories = useCallback((update: (current: ReadonlyMap<string, WorkspaceDirectoryView>) => ReadonlyMap<string, WorkspaceDirectoryView>): void => {
     setDirectories((current) => {
@@ -869,7 +877,7 @@ function useWorkspaceDirectoryTree(input: {
     const existing = directoriesRef.current.get(parentPath);
     if (!force && existing?.status === "loaded") return true;
     const inflight = inflightRequests.current.get(parentPath);
-    if (!force && inflight !== undefined) return await inflight;
+    if (inflight !== undefined && (!force || inflight.phase === "queued")) return await inflight.promise;
     const generation = generationRef.current;
     const token = (requestTokens.current.get(parentPath) ?? 0) + 1;
     requestTokens.current.set(parentPath, token);
@@ -878,32 +886,40 @@ function useWorkspaceDirectoryTree(input: {
       next.set(parentPath, { status: "loading", entries: current.get(parentPath)?.entries ?? [] });
       return next;
     });
-    const request = (async (): Promise<boolean> => {
-      try {
-        const values = await input.loadDirectory({ workspaceId: input.workspaceId, parentPath });
-        const entries = normalizeWorkspaceDirectoryEntries(parentPath, values);
-        if (generationRef.current !== generation || requestTokens.current.get(parentPath) !== token) return false;
-        replaceDirectories((current) => {
-          const next = new Map(current);
-          next.set(parentPath, { status: "loaded", entries });
-          return next;
-        });
-        return true;
-      } catch {
-        if (generationRef.current !== generation || requestTokens.current.get(parentPath) !== token) return false;
-        replaceDirectories((current) => {
-          const next = new Map(current);
-          next.set(parentPath, { status: "error", entries: current.get(parentPath)?.entries ?? [], error: "load_failed" });
-          return next;
-        });
-        return false;
-      }
-    })();
-    inflightRequests.current.set(parentPath, request);
+    const flight: DirectoryLoadFlight = {
+      phase: inflight === undefined ? "running" : "queued",
+      promise: Promise.resolve().then(async (): Promise<boolean> => {
+        if (inflight !== undefined) {
+          await inflight.promise;
+          if (generationRef.current !== generation || requestTokens.current.get(parentPath) !== token) return false;
+          flight.phase = "running";
+        }
+        try {
+          const values = await input.loadDirectory({ workspaceId: input.workspaceId, parentPath });
+          const entries = normalizeWorkspaceDirectoryEntries(parentPath, values);
+          if (generationRef.current !== generation || requestTokens.current.get(parentPath) !== token) return false;
+          replaceDirectories((current) => {
+            const next = new Map(current);
+            next.set(parentPath, { status: "loaded", entries });
+            return next;
+          });
+          return true;
+        } catch {
+          if (generationRef.current !== generation || requestTokens.current.get(parentPath) !== token) return false;
+          replaceDirectories((current) => {
+            const next = new Map(current);
+            next.set(parentPath, { status: "error", entries: current.get(parentPath)?.entries ?? [], error: "load_failed" });
+            return next;
+          });
+          return false;
+        }
+      })
+    };
+    inflightRequests.current.set(parentPath, flight);
     try {
-      return await request;
+      return await flight.promise;
     } finally {
-      if (inflightRequests.current.get(parentPath) === request) inflightRequests.current.delete(parentPath);
+      if (inflightRequests.current.get(parentPath) === flight) inflightRequests.current.delete(parentPath);
     }
   }, [input.loadDirectory, input.workspaceId, replaceDirectories]);
 
@@ -952,6 +968,33 @@ function useWorkspaceDirectoryTree(input: {
     const targets = new Set(["", ...directoriesRef.current.keys(), ...expandedRef.current]);
     await Promise.all([...targets].map((path) => load(path, true)));
   }, [load]);
+
+  const queueEventRefresh = useCallback((parents: Iterable<string>): void => {
+    for (const parent of parents) {
+      pendingEventParents.current.add(parent);
+      if (inflightRequests.current.get(parent)?.phase === "running") {
+        requestTokens.current.set(parent, (requestTokens.current.get(parent) ?? 0) + 1);
+      }
+    }
+    if (eventRefreshTimer.current !== undefined) return;
+    eventRefreshTimer.current = setTimeout(() => {
+      eventRefreshTimer.current = undefined;
+      const targets = [...pendingEventParents.current];
+      pendingEventParents.current.clear();
+      for (const parent of targets) {
+        if (parent === "" || directoriesRef.current.has(parent) || expandedRef.current.has(parent)) void load(parent, true);
+      }
+    }, 50);
+  }, [load]);
+
+  useEffect(() => () => {
+    generationRef.current += 1;
+    requestTokens.current.clear();
+    inflightRequests.current.clear();
+    pendingEventParents.current.clear();
+    clearTimeout(eventRefreshTimer.current);
+    eventRefreshTimer.current = undefined;
+  }, [input.workspaceId]);
 
   const revealPath = useCallback(async (requestedPath: string): Promise<void> => {
     const generation = generationRef.current;
@@ -1015,7 +1058,7 @@ function useWorkspaceDirectoryTree(input: {
 
   const invalidateChange = useCallback(async (change: WorkspaceFilesExternalChange): Promise<void> => {
     if (change.kind === "overflow" || change.kind === "resync") {
-      await refresh();
+      queueEventRefresh(new Set(["", ...directoriesRef.current.keys(), ...expandedRef.current]));
       return;
     }
     const paths = [change.path, change.previousPath].filter((path): path is string => path !== undefined);
@@ -1033,10 +1076,9 @@ function useWorkspaceDirectoryTree(input: {
       }
     }
     const parents = new Set(paths.map(workspacePathParent));
-    await Promise.all([...parents]
-      .filter((parent) => parent === "" || directoriesRef.current.has(parent) || expandedRef.current.has(parent))
-      .map((parent) => load(parent, true)));
-  }, [load, refresh, replaceDirectories]);
+    queueEventRefresh([...parents]
+      .filter((parent) => parent === "" || directoriesRef.current.has(parent) || expandedRef.current.has(parent)));
+  }, [queueEventRefresh, replaceDirectories]);
 
   return {
     directories,

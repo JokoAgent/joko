@@ -179,6 +179,10 @@ export class ClaudeNativeTaskProjection {
       .map((task) => task.rawId);
   }
 
+  hasActiveTasks(): boolean {
+    return [...this.#tasks.values()].some((task) => activeState(task.state));
+  }
+
   taskState(rawTaskId: string): SubagentRunState | undefined {
     return this.#tasks.get(rawTaskId)?.state;
   }

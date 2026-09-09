@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { CodexNativeTaskProjection, type CodexNativeTaskEffects } from "./native-task-projection.js";
+import type { NativeThread, NativeThreadItem } from "./protocol.js";
 
 function projection(): CodexNativeTaskProjection {
   return new CodexNativeTaskProjection({
@@ -14,6 +15,39 @@ function latestRun(effects: CodexNativeTaskEffects) {
 }
 
 describe("CodexNativeTaskProjection", () => {
+  it("discovers history without replacing newer child completion with an old spawn snapshot", () => {
+    const tasks = projection();
+    const spawn = delegatedSpawn("retained-spawn", "child-one", "running");
+    tasks.observeRootNotification("item/completed", { item: spawn });
+    tasks.observeDescendantNotification("child-one", "turn/started", { turn: { id: "child-turn", status: "inProgress" } });
+    tasks.observeDescendantNotification("child-one", "turn/completed", { turn: { id: "child-turn", status: "completed" } });
+    expect(tasks.hasActiveTasks()).toBe(false);
+    expect(tasks.mergeHistory(taskHistory(spawn))).toEqual([{ childThreadId: "child-one", parentThreadId: "root-thread" }]);
+    expect(tasks.hasActiveTasks()).toBe(false);
+    tasks.mergeHistory(taskHistory(spawn, delegatedSpawn("unseen-spawn", "unseen-child", "running")));
+    expect(tasks.hasActiveTasks()).toBe(true);
+  });
+
+  it("retains the complete known subtree of a retained parent and drops removed branches", () => {
+    const tasks = projection();
+    const retained = delegatedSpawn("retained-spawn", "retained-child", "done");
+    const removed = delegatedSpawn("removed-spawn", "removed-child", "done");
+    tasks.seed(taskHistory(retained, removed));
+    tasks.observeDescendantNotification("retained-child", "item/completed", { item: delegatedSpawn("nested-retained", "retained-grandchild", "done") });
+    tasks.observeDescendantNotification("removed-child", "item/completed", { item: delegatedSpawn("nested-removed", "removed-grandchild", "done") });
+    expect(tasks.replaceHistory(taskHistory(retained))).toEqual([
+      { childThreadId: "retained-child", parentThreadId: "root-thread" },
+      { childThreadId: "retained-grandchild", parentThreadId: "retained-child" }
+    ]);
+    expect(tasks.hasActiveTasks()).toBe(false);
+    expect(latestRun(tasks.observeDescendantNotification("retained-grandchild", "turn/started", {
+      turn: { id: "resumed-child", status: "inProgress" }
+    }))).toMatchObject({ state: "running" });
+    expect(tasks.observeDescendantNotification("removed-grandchild", "turn/started", {
+      turn: { id: "removed-child", status: "inProgress" }
+    }).emissions).toEqual([]);
+  });
+
   it("accepts the native completed-only done spelling", () => {
     const tasks = projection();
     const effects = tasks.observeRootNotification("item/completed", {
@@ -110,3 +144,11 @@ describe("CodexNativeTaskProjection", () => {
     })).toThrow(/safe limit/u);
   });
 });
+
+function delegatedSpawn(id: string, childId: string, status: string): NativeThreadItem {
+  return { id, type: "collabAgentToolCall", tool: "spawnAgent", status: "completed", receiverThreadIds: [childId], agentsStates: { [childId]: { status, message: null } } };
+}
+
+function taskHistory(...items: NativeThreadItem[]): NativeThread {
+  return { id: "root-thread", turns: [{ id: "retained-turn", status: "completed", items }] };
+}

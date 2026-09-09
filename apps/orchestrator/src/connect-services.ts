@@ -34,6 +34,8 @@ import {
   StaleGenerationError,
   StoreClosedError,
   StoreError,
+  UsageReportQueryError,
+  UsageReportCapacityError,
   MESSAGE_SEARCH_EMBEDDING_MODEL_ID,
   operationBodyHash
 } from "@joko/store";
@@ -61,6 +63,8 @@ import {
   BrowserTakeoverInputError,
   BrowserTakeoverRateLimitError,
   sameTakeoverFence,
+  workspaceHtmlPreviewUrl,
+  isWorkspaceHtmlPreviewUrl,
   validateTakeoverInput,
   validateTakeoverNavigationUrl,
   type BrowserActivity as NativeBrowserActivity,
@@ -74,6 +78,7 @@ import {
   type BrowserTakeoverInput
 } from "@joko/tool-browser";
 import type { ArtifactRecord, ArtifactRepository, ArtifactStore } from "./artifact-store.js";
+import { readWorkspaceHtmlSnapshot } from "./workspace-html-snapshot.js";
 import {
   ArtifactMaintenanceScanChangedError,
   ArtifactMaintenanceScanExpiredError,
@@ -110,6 +115,8 @@ import type {
   CredentialKind as NativeCredentialKind,
   CredentialManager,
   ManagedProviderEntry,
+  ManagedProviderRuntimeInput,
+  ProviderConfigurationDescriptor,
   ProviderCatalogManager,
   ProviderDescriptor as NativeProviderDescriptor,
   ProviderLoginFlow as NativeProviderLoginFlow
@@ -147,6 +154,7 @@ import {
   fromProtoInputContent,
   fromProtoInteractionDecision,
   fromProtoRevision,
+  fromProtoNativeNavigationTarget,
   fromProtoRemoteWorkspace,
   fromProtoTimestamp,
   mapErrorToProto,
@@ -257,6 +265,8 @@ import {
   type VisionBridgeCoordinator
 } from "./personalization-inference.js";
 import type { SessionNavigationCoordinator } from "./session-navigation-coordinator.js";
+import type { AuxiliaryTextRouting } from "./auxiliary-text-routing.js";
+import type { SubagentModelSettings } from "./subagent-model-settings.js";
 import {
   evaluateSessionProjectPlacement,
   SessionProjectPlacementError,
@@ -267,6 +277,9 @@ import {
 import { ReviewStartError, type ReviewCoordinator } from "./review-coordinator.js";
 import type { RuntimeActivityTracker } from "./runtime-activity-tracker.js";
 import { createRemoteHostConnectService } from "./remote-host-connect-service.js";
+import { createSshKeyConnectService } from "./ssh-key-connect-service.js";
+import { createTerminalConnectService } from "./terminal-connect-service.js";
+import type { TerminalProvider } from "@joko/tool-terminal";
 import { createManagedModelRuntimeConnectService } from "./managed-model-runtime-connect-service.js";
 import type { ManagedModelRuntimeController } from "./managed-model-runtime-controller.js";
 import { PortableSessionPackageError } from "./portable-session-package.js";
@@ -351,9 +364,13 @@ interface ConnectServiceDependencies {
   readonly makerMemory?: MakerMemoryController;
   readonly visionBridge?: VisionBridgeCoordinator;
   readonly promptPrediction?: PromptPredictionService;
+  readonly auxiliaryText?: AuxiliaryTextRouting;
+  readonly subagentModels?: SubagentModelSettings;
   readonly sessionNavigation?: SessionNavigationCoordinator;
   readonly reviewCoordinator?: ReviewCoordinator;
   readonly remoteHosts?: RemoteHostRegistry;
+  readonly sshKeys?: OrchestratorApplication["sshKeys"];
+  readonly terminals?: TerminalProvider;
   readonly voiceInput?: VoiceInputCoordinator;
   readonly voiceInputSettings?: VoiceInputSettingsController;
   readonly refreshPiGeneration?: () => Promise<void>;
@@ -495,7 +512,9 @@ export interface ConnectServiceSet {
   readonly tool: ServiceImpl<typeof contract.ToolService>;
   readonly browser: ServiceImpl<typeof contract.BrowserService>;
   readonly remoteHost: ServiceImpl<typeof contract.RemoteHostService>;
+  readonly sshKey: ServiceImpl<typeof contract.SshKeyService>;
   readonly voiceInput: ServiceImpl<typeof contract.VoiceInputService>;
+  readonly terminal: ServiceImpl<typeof contract.TerminalService>;
   readonly pi: ServiceImpl<typeof contract.PiService>;
 }
 
@@ -547,6 +566,8 @@ function toConnectError(error: unknown): ConnectError {
   }
   if (error instanceof OperationInProgressError) return new ConnectError(error.message, Code.Aborted);
   if (error instanceof InvalidStateTransitionError) return new ConnectError(error.message, Code.FailedPrecondition);
+  if (error instanceof UsageReportQueryError) return new ConnectError(error.message, Code.InvalidArgument);
+  if (error instanceof UsageReportCapacityError) return new ConnectError(error.message, Code.ResourceExhausted);
   if (error instanceof RevisionConflictError || error instanceof StaleGenerationError) {
     return new ConnectError(error.message, Code.Aborted);
   }
@@ -801,7 +822,9 @@ export function registerConnectServices(router: ConnectRouter, application: Orch
   router.service(contract.ToolService, withConnectErrors(services.tool));
   router.service(contract.BrowserService, withConnectErrors(services.browser));
   router.service(contract.RemoteHostService, withConnectErrors(services.remoteHost));
+  router.service(contract.SshKeyService, withConnectErrors(services.sshKey));
   router.service(contract.VoiceInputService, withConnectErrors(services.voiceInput));
+  router.service(contract.TerminalService, withConnectErrors(services.terminal));
   router.service(contract.PiService, withConnectErrors(services.pi));
 }
 
@@ -861,9 +884,13 @@ export function createConnectServices(application: OrchestratorApplication): Con
     ...(application.makerMemory === undefined ? {} : { makerMemory: application.makerMemory }),
     ...(application.visionBridge === undefined ? {} : { visionBridge: application.visionBridge }),
     ...(application.promptPrediction === undefined ? {} : { promptPrediction: application.promptPrediction }),
+    ...(application.auxiliaryText === undefined ? {} : { auxiliaryText: application.auxiliaryText }),
+    ...(application.subagentModels === undefined ? {} : { subagentModels: application.subagentModels }),
     ...(application.sessionNavigation === undefined ? {} : { sessionNavigation: application.sessionNavigation }),
     ...(application.reviewCoordinator === undefined ? {} : { reviewCoordinator: application.reviewCoordinator }),
     ...(application.remoteHosts === undefined ? {} : { remoteHosts: application.remoteHosts }),
+    ...(application.sshKeys === undefined ? {} : { sshKeys: application.sshKeys }),
+    ...(application.terminals === undefined ? {} : { terminals: application.terminals }),
     ...(application.voiceInput === undefined ? {} : { voiceInput: application.voiceInput }),
     ...(application.voiceInputSettings === undefined ? {} : { voiceInputSettings: application.voiceInputSettings }),
     ...(application.refreshPiGeneration === undefined ? {} : { refreshPiGeneration: application.refreshPiGeneration }),
@@ -924,6 +951,21 @@ export function createConnectServices(application: OrchestratorApplication): Con
   const operationOutcomes = new Map<string, OperationOutcome>();
 
   const authenticate = (context: HandlerContext): ConnectionRecord => requireAuthentication(dependencies, context);
+  const terminal = createTerminalConnectService({
+    ...(dependencies.terminals === undefined ? {} : { terminals: dependencies.terminals }),
+    store: dependencies.store,
+    ...(dependencies.sessionWorktrees === undefined ? {} : { effectiveTarget: (session) => dependencies.sessionWorktrees!.effectiveTarget(session) }),
+    authenticate,
+    onRevoked: (connectionId, listener) => dependencies.connections.onRevoked(connectionId, listener),
+    ...(application.registerServiceCleanup === undefined ? {} : { registerCleanup: (cleanup) => application.registerServiceCleanup!(cleanup) })
+  });
+  const sshKey = createSshKeyConnectService({
+    ...(dependencies.sshKeys === undefined ? {} : { keys: dependencies.sshKeys }),
+    ...(dependencies.credentials === undefined ? {} : { credentials: dependencies.credentials }),
+    ...(dependencies.remoteHosts === undefined ? {} : { hosts: dependencies.remoteHosts }),
+    authenticate: context => ({ connectionId: authenticate(context).id }),
+    onRevoked: (connectionId, listener) => dependencies.connections.onRevoked(connectionId, listener)
+  });
   const remoteHost = createRemoteHostConnectService(
     dependencies.remoteHosts,
     (context) => ({ connectionId: authenticate(context).id }),
@@ -1109,6 +1151,9 @@ export function createConnectServices(application: OrchestratorApplication): Con
       }
       if (dependencies.browserTransfers?.hasInFlightActivity() === true) {
         kinds.add(contract.RuntimeActivityKind.BROWSER_TRANSFER);
+      }
+      if (dependencies.terminals?.hasActiveTerminals() === true) {
+        kinds.add(contract.RuntimeActivityKind.USER_SHELL);
       }
       sampleSessionHost();
 
@@ -1354,16 +1399,16 @@ export function createConnectServices(application: OrchestratorApplication): Con
       const providers: contract.ProviderDescriptor[] = [];
       for (const record of records) {
         if (managedProviderCatalogApplies(dependencies, record.descriptor.id)) {
-          providers.push(...await Promise.all(dependencies.providers.list().map(async (provider) => mapProviderDescriptor(
+          providers.push(...await Promise.all(dependencies.providers.list(record.descriptor.id).map(async (provider) => mapProviderDescriptor(
             record.descriptor.id,
             provider,
             providerUsageSummary(dependencies, provider.provider.id, record.descriptor.id),
             providerRateLimit(dependencies, record.descriptor.id, provider.provider.id),
             await providerAccountUsageSnapshot(dependencies, provider, context.signal)
           ))));
-          continue;
         }
         const providerIds = new Set<string>();
+        for (const provider of providers) if (provider.backendId === record.descriptor.id) providerIds.add(provider.providerId);
         for (const provider of record.descriptor.providers ?? []) {
           if (providerIds.has(provider.providerId)) continue;
           providerIds.add(provider.providerId);
@@ -1424,16 +1469,13 @@ export function createConnectServices(application: OrchestratorApplication): Con
     getProvider: async (request, context) => {
       authenticate(context);
       const records = request.backendId === ""
-        ? dependencies.store.listBackends().filter((record) => managedProviderCatalogApplies(dependencies, record.descriptor.id)
-          ? dependencies.providers.list().some((provider) => provider.provider.id === request.providerId)
-          : (record.descriptor.providers?.some((provider) => provider.providerId === request.providerId) === true
-            || record.descriptor.models.some((model) => model.providerId === request.providerId)))
+        ? dependencies.store.listBackends().filter((record) => backendOwnsUsageProvider(dependencies, record.descriptor, request.providerId))
         : [dependencies.store.getBackend(request.backendId)];
       if (records.length === 0) throw new NotFoundError("Provider", request.providerId);
       if (records.length > 1) throw invalidArgument("backend_id is required when a Provider ID belongs to multiple Backend instances");
       const record = records[0]!;
-      if (managedProviderCatalogApplies(dependencies, record.descriptor.id)) {
-        const provider = dependencies.providers.get(request.providerId);
+      if (managedProviderCatalogApplies(dependencies, record.descriptor.id, request.providerId)) {
+        const provider = dependencies.providers.get(record.descriptor.id, request.providerId);
         return { provider: mapProviderDescriptor(
           record.descriptor.id,
           provider,
@@ -1484,18 +1526,15 @@ export function createConnectServices(application: OrchestratorApplication): Con
     getProviderUsage: async (request, context) => {
       authenticate(context);
       const records = request.backendId === ""
-        ? dependencies.store.listBackends().filter((record) => managedProviderCatalogApplies(dependencies, record.descriptor.id)
-          ? dependencies.providers.list().some((provider) => provider.provider.id === request.providerId)
-          : (record.descriptor.providers?.some((provider) => provider.providerId === request.providerId) === true
-            || record.descriptor.models.some((model) => model.providerId === request.providerId)))
+        ? dependencies.store.listBackends().filter((record) => backendOwnsUsageProvider(dependencies, record.descriptor, request.providerId))
         : [dependencies.store.getBackend(request.backendId)];
       if (records.length === 0) throw new NotFoundError("Provider", request.providerId);
       if (records.length > 1) throw invalidArgument("backend_id is required when a Provider ID belongs to multiple Backend instances");
       const backend = records[0]!;
-      const managedProvider = managedProviderCatalogApplies(dependencies, backend.descriptor.id);
+      const managedProvider = managedProviderCatalogApplies(dependencies, backend.descriptor.id, request.providerId);
       let provider: NativeProviderDescriptor | undefined;
       if (managedProvider) {
-        provider = dependencies.providers.get(request.providerId);
+        provider = dependencies.providers.get(backend.descriptor.id, request.providerId);
       } else if (backend.descriptor.providers?.some((item) => item.providerId === request.providerId) !== true
         && !backend.descriptor.models.some((model) => model.providerId === request.providerId)) {
         throw new NotFoundError("Provider", request.providerId);
@@ -1525,6 +1564,34 @@ export function createConnectServices(application: OrchestratorApplication): Con
       if (request.backendId !== "") dependencies.store.getBackend(request.backendId);
       if (request.providerId !== "") assertUsageProvider(dependencies, request.providerId, request.backendId || undefined);
       return { history: usageHistory(dependencies, days, request.backendId || undefined, request.providerId || undefined) };
+    },
+    getUsageReport: (request, context) => {
+      authenticate(context);
+      const groups = new Map<contract.UsageReportGroup, import("@joko/store").UsageReportGroup>([
+        [contract.UsageReportGroup.TASK, "task"], [contract.UsageReportGroup.MODEL, "model"],
+        [contract.UsageReportGroup.PROVIDER, "provider"], [contract.UsageReportGroup.BACKEND, "backend"]
+      ]);
+      const group = groups.get(request.group);
+      if (group === undefined) throw invalidArgument("A usage report group is required.");
+      const report = dependencies.store.getUsageReport({
+        ownerId: usageOwnerId(dependencies), group, pageSize: request.page?.pageSize || 25,
+        ...(request.page?.pageToken ? { pageToken: request.page.pageToken } : {}),
+        ...(request.fromDay === "" ? {} : { fromDay: request.fromDay }),
+        ...(request.throughDay === "" ? {} : { throughDay: request.throughDay }),
+        ...(request.backendId === undefined ? {} : { backendId: request.backendId }),
+        ...(request.providerId === undefined ? {} : { providerId: request.providerId }),
+        ...(request.modelId === undefined ? {} : { modelId: request.modelId }),
+        ...(request.sessionId === undefined ? {} : { sessionId: request.sessionId })
+      });
+      return { summary: usageHistorySummary(report.totals),
+        entries: report.entries.map((entry) => create(contract.UsageReportEntrySchema, {
+          key: entry.key, sessionId: entry.sessionId, backendId: entry.backendId,
+          providerId: entry.providerId, modelId: entry.modelId, title: entry.title,
+          referenceAvailable: entry.referenceAvailable, summary: usageHistorySummary(entry.totals),
+          measuredAt: toProtoTimestamp(Math.max(...entry.totals.map((total) => total.lastMeasuredAt)))
+        })),
+        page: create(contract.PageInfoSchema, { nextPageToken: report.nextPageToken, totalSize: BigInt(report.totalGroups) })
+      };
     },
     getModelPriceOverride: (request, context) => {
       authenticate(context);
@@ -1600,14 +1667,14 @@ export function createConnectServices(application: OrchestratorApplication): Con
         ? dependencies.store.listBackends()
         : [dependencies.store.getBackend(request.backendId)];
       const providerAuthentication = new Map(
-        dependencies.providers?.list().map((provider) => [provider.provider.id, provider.authenticationState] as const) ?? []
+        dependencies.providers?.list().map((provider) => [providerDescriptorKey(provider.backendId, provider.provider.id), provider.authenticationState] as const) ?? []
       );
       const values = records.flatMap((record) => backendCatalogModels(dependencies, record.descriptor)
         .filter((model) => request.providerId === "" || model.providerId === request.providerId)
         .map((model) => {
           const descriptor = toProtoModelDescriptor(record.descriptor.id, model);
           const authenticationState = managedProviderCatalogApplies(dependencies, record.descriptor.id)
-            ? providerAuthentication.get(model.providerId)
+            ? providerAuthentication.get(providerDescriptorKey(record.descriptor.id, model.providerId))
             : undefined;
           descriptor.available = authenticationState === undefined
             ? backendAuthenticationAvailable(record.descriptor.authenticationState)
@@ -1635,7 +1702,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
       }
       const flow = currentProviderLoginFlow(dependencies, request.loginFlowId);
       if (flow !== undefined && dependencies.providers !== undefined) {
-        const provider = dependencies.providers.get(flow.providerId);
+        const provider = dependencies.providers.get(dependencies.providers.nativeAuthenticationBackendId, flow.providerId);
         return {
           loginFlow: mapProviderLoginFlow(request.loginFlowId, flow),
           authenticationState: mapAuthenticationState(provider.authenticationState),
@@ -2371,6 +2438,18 @@ export function createConnectServices(application: OrchestratorApplication): Con
       }
       return { preview: await mapFilePreview(dependencies.artifactStore, request.workspaceId, preview, start, maximum, materialized) };
     },
+    readWorkspaceHtmlSnapshot: async (request, context) => {
+      const connection = authenticate(context);
+      if (request.file === undefined) throw invalidArgument("An HTML workspace reference is required.");
+      const owner = captureHtmlConnectionRead(dependencies.connections, connection);
+      try {
+        const snapshot = await readWorkspaceHtmlSnapshot({
+          store: dependencies.store, workspaces: dependencies.workspaceService, sessionId: request.sessionId,
+          source: request.file, signal: AbortSignal.any([owner.signal, context.signal]), assertConnection: () => { dependencies.connections.fence(connection); }
+        });
+        return { file: snapshot.file, utf8Html: snapshot.html };
+      } finally { owner.dispose(); }
+    },
     writeWorkspaceTextFile: async (request, context) => {
       authenticate(context);
       try {
@@ -2610,9 +2689,11 @@ export function createConnectServices(application: OrchestratorApplication): Con
       const session = dependencies.store.listSessions({ includeArchived: true, includeDeleted: true })
         .find((candidate) => candidate.descriptor.id === changeSet.sessionId);
       const backend = session === undefined ? undefined : dependencies.store.getBackend(session.descriptor.backendId).descriptor;
-      const dialogueOnlyAvailable = changeSet.dialogueEntryId !== undefined &&
+      const dialogueOnlyAvailable = changeSet.dialogueAnchor !== undefined &&
         session !== undefined &&
-        backend?.capabilities.get("session.rewind")?.supported === true;
+        session.descriptor.binding.generation === changeSet.dialogueAnchor.generation &&
+        backend?.capabilities.get("session.rewind")?.supported === true &&
+        (changeSet.dialogueAnchor.target.kind !== "session_start" || backend.capabilities.get("session.rewind_to_start")?.supported === true);
       return {
         preview: mapWorkspaceRewindPreview(
           changeSet,
@@ -3459,7 +3540,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
     }
   } satisfies ServiceImpl<typeof contract.PiService>;
 
-  return { connection, event, operation, backend, target, session, portableSession, run, subagent, review, queue, scheduler, interaction, workspace, worktree, artifact, historyMaintenance, credential, settings, managedModelRuntime, tool, browser, remoteHost, voiceInput, pi };
+  return { connection, event, operation, backend, target, session, portableSession, run, subagent, review, queue, scheduler, interaction, workspace, worktree, artifact, historyMaintenance, credential, settings, managedModelRuntime, tool, browser, remoteHost, sshKey, voiceInput, terminal, pi };
 }
 
 function requireAuthentication(dependencies: ConnectServiceDependencies, context: HandlerContext): ConnectionRecord {
@@ -3784,7 +3865,7 @@ function sessionLifecycleOperationOutcome(
 }
 
 async function advanceSessionLifecycleCleanup(
-  dependencies: Pick<ConnectServiceDependencies, "store" | "sessionHost" | "sessionWorktrees" | "gitSafety" | "now">,
+  dependencies: Pick<ConnectServiceDependencies, "store" | "sessionHost" | "sessionWorktrees" | "gitSafety" | "terminals" | "now">,
   initial: SessionLifecycleCleanupRecord
 ): Promise<SessionLifecycleCleanupRecord> {
   let cleanup = initial;
@@ -3802,6 +3883,7 @@ async function advanceSessionLifecycleCleanup(
         cleanup.disposition
       );
       await dependencies.sessionHost.closeIfActive(cleanup.sessionId);
+      await dependencies.terminals?.closeSession(cleanup.sessionId);
       advance("close");
     }
     if (!cleanup.nativeCompleted) {
@@ -4408,8 +4490,8 @@ function operationResult(
       case "artifact": payload = { case: "artifact", value: toProtoArtifact(dependencies.store.getArtifact(outcome.entityId)) }; break;
       case "settings": payload = { case: "settings", value: settingsSnapshot(dependencies) }; break;
       case "provider": {
-        const item = dependencies.providers?.get(outcome.entityId);
-        const backendId = managedProviderBackendIds(dependencies)[0];
+        const backendId = dependencies.providers?.nativeAuthenticationBackendId;
+        const item = backendId === undefined ? undefined : dependencies.providers?.get(backendId, outcome.entityId);
         if (item !== undefined && backendId !== undefined) payload = { case: "provider", value: mapProviderDescriptor(
           backendId,
           item,
@@ -6524,10 +6606,12 @@ function backendInstallationAvailable(state: BackendDescriptor["installationStat
 
 function managedProviderCatalogApplies(
   dependencies: ConnectServiceDependencies,
-  backendId: string
+  backendId: string,
+  providerId?: string
 ): dependencies is ConnectServiceDependencies & { readonly providers: ProviderCatalogManager } {
   if (dependencies.providers === undefined) return false;
-  if (backendId === "") return true;
+  if (backendId === "") return false;
+  if (providerId !== undefined && !dependencies.providers.list(backendId).some((provider) => provider.provider.id === providerId)) return false;
   return dependencies.store.getBackend(backendId).descriptor.capabilities
     .get(MANAGED_PROVIDER_CATALOG_CAPABILITY)?.supported === true;
 }
@@ -6544,13 +6628,13 @@ function backendCatalogModels(
     `${model.providerId}\u0000${model.modelId}`,
     model
   ]));
-  for (const provider of dependencies.providers.list()) {
+  for (const provider of dependencies.providers.list(backend.id)) {
     for (const model of provider.provider.models ?? []) {
       const projected = piProviderModel(provider.provider, model);
       models.set(`${projected.providerId}\u0000${projected.modelId}`, projected);
     }
   }
-  for (const model of dependencies.providerAuth?.listNativeModels() ?? []) {
+  for (const model of backend.id === dependencies.providers.nativeAuthenticationBackendId ? dependencies.providerAuth?.listNativeModels() ?? [] : []) {
     models.set(`${model.providerId}\u0000${model.modelId}`, model);
   }
   return [...models.values()];
@@ -6769,6 +6853,7 @@ function mapProviderAccountUsageSnapshot(
 }
 
 type UsageLedgerRow = ReturnType<OperationalStore["listUsageLedger"]>[number];
+type UsageReportTotal = import("@joko/store").UsageReportTotal;
 
 interface AggregatedUsage {
   readonly inputTokens: number;
@@ -6807,7 +6892,7 @@ function backendOwnsUsageProvider(
   if (backend.providers?.some((provider) => provider.providerId === providerId) === true
     || backend.models.some((model) => model.providerId === providerId)) return true;
   return managedProviderCatalogApplies(dependencies, backend.id)
-    && dependencies.providers.list().some((provider) => provider.provider.id === providerId);
+    && dependencies.providers.list(backend.id).some((provider) => provider.provider.id === providerId);
 }
 
 function usageHistory(
@@ -6894,7 +6979,7 @@ function usageHistoryDay(day: string, rows: readonly UsageLedgerRow[]): contract
   });
 }
 
-function usageHistorySummary(rows: readonly UsageLedgerRow[]): contract.UsageHistorySummary {
+function usageHistorySummary(rows: readonly UsageReportTotal[]): contract.UsageHistorySummary {
   const aggregate = aggregateUsageRows(rows);
   return create(contract.UsageHistorySummarySchema, {
     usage: aggregateUsageMessage(aggregate),
@@ -6904,14 +6989,14 @@ function usageHistorySummary(rows: readonly UsageLedgerRow[]): contract.UsageHis
   });
 }
 
-function aggregateUsageRows(rows: readonly UsageLedgerRow[]): AggregatedUsage {
+function aggregateUsageRows(rows: readonly UsageReportTotal[]): AggregatedUsage {
   const currencies = new Set(rows.map((row) => row.currencyCode));
   const onlyCurrency = currencies.size === 1 ? rows[0]?.currencyCode ?? "" : "";
-  const add = (select: (row: UsageLedgerRow) => number): number => {
+  const add = (select: (row: UsageReportTotal) => number): number => {
     let value = 0;
     for (const row of rows) {
       value += select(row);
-      if (!Number.isSafeInteger(value) || value < 0) throw new StoreError("Usage history exceeds the safe integer range.");
+      if (!Number.isSafeInteger(value) || value < 0) throw new UsageReportCapacityError("Usage history exceeds the safe integer range.");
     }
     return value;
   };
@@ -6945,7 +7030,7 @@ function aggregateUsageMessage(value: AggregatedUsage): contract.Usage {
   });
 }
 
-function aggregateCurrencyTotals(rows: readonly UsageLedgerRow[]): contract.UsageCurrencyTotal[] {
+function aggregateCurrencyTotals(rows: readonly UsageReportTotal[]): contract.UsageCurrencyTotal[] {
   return groupUsageRows(rows, (row) => row.currencyCode).map(([currencyCode, currencyRows]) => {
     const aggregate = aggregateUsageRows(currencyRows);
     return create(contract.UsageCurrencyTotalSchema, {
@@ -6957,11 +7042,11 @@ function aggregateCurrencyTotals(rows: readonly UsageLedgerRow[]): contract.Usag
   });
 }
 
-function groupUsageRows(
-  rows: readonly UsageLedgerRow[],
-  key: (row: UsageLedgerRow) => string
-): Array<[string, UsageLedgerRow[]]> {
-  const groups = new Map<string, UsageLedgerRow[]>();
+function groupUsageRows<T>(
+  rows: readonly T[],
+  key: (row: T) => string
+): Array<[string, T[]]> {
+  const groups = new Map<string, T[]>();
   for (const row of rows) groups.set(key(row), [...(groups.get(key(row)) ?? []), row]);
   return [...groups.entries()];
 }
@@ -7194,23 +7279,30 @@ function safeUnsignedBigInt(value: unknown): bigint | undefined {
   return parsed !== undefined && parsed >= 0n && parsed <= 0xffff_ffff_ffff_ffffn ? parsed : undefined;
 }
 
-function mapProviderConfiguration(item: NativeProviderDescriptor): contract.ProviderConfiguration {
+function mapProviderConfiguration(item: ProviderConfigurationDescriptor): contract.ProviderConfiguration {
+  return create(contract.ProviderConfigurationSchema, {
+    providerId: item.providerId, displayName: item.displayName, kind: protoProviderKind(item.kind), enabled: item.enabled,
+    version: toProtoEntityVersion(item.version, 0, item.updatedAt),
+    runtimes: item.runtimes.map(mapProviderRuntimeConfiguration)
+  });
+}
+
+function mapProviderRuntimeConfiguration(item: NativeProviderDescriptor): contract.ProviderRuntimeConfiguration {
   const bindings = (item as NativeProviderDescriptor & {
     readonly credentialBindings?: Readonly<Record<string, string>>;
   }).credentialBindings ?? {};
   const provider = item.provider;
-  return create(contract.ProviderConfigurationSchema, {
-    providerId: provider.id,
-    displayName: item.displayName,
-    kind: protoProviderKind(item.kind),
+  return create(contract.ProviderRuntimeConfigurationSchema, {
+    backendId: item.backendId,
     apiCompatibility: protoProviderApi(provider.api),
     endpoint: provider.baseUrl ?? "",
     credentialReferenceId: provider.apiKeyEnv === undefined ? "" : bindings[provider.apiKeyEnv] ?? "",
-    enabled: item.enabled,
-    version: toProtoEntityVersion(item.version, 0, item.updatedAt),
     apiKeyEnvironment: provider.apiKeyEnv ?? "",
     keyless: provider.keyless ?? false,
     authHeader: provider.authHeader ?? false,
+    credentialOrigin: item.credentialOrigin,
+    ...(item.requestPath === undefined ? {} : { requestPath: item.requestPath }),
+    ...(item.modelsEndpoint === undefined ? {} : { modelsEndpoint: item.modelsEndpoint }),
     headers: Object.entries(provider.headers ?? {}).map(([headerName, value]) => create(contract.ProviderHeaderConfigurationSchema, {
       headerName,
       environmentName: value.env,
@@ -7270,8 +7362,63 @@ function mapProviderModelConfiguration(item: PiManagedModel): contract.ProviderM
   });
 }
 
-function providerEntryFromProto(input: contract.ProviderConfiguration): Omit<ManagedProviderEntry, "version" | "updatedAt"> & { readonly expectedVersion?: bigint } {
+function assertProviderRuntimeSupport(dependencies: ConnectServiceDependencies, entry: Parameters<ProviderCatalogManager["upsertConfiguration"]>[0]): void {
+  for (const runtime of entry.runtimes) {
+    const backend = dependencies.store.getBackend(runtime.backendId).descriptor;
+    const support = backend.providerRuntimeSupport;
+    if (backend.capabilities.get("provider.managed_catalog")?.supported !== true || support === undefined
+      || runtime.provider.api === undefined || !support.protocols.includes(runtime.provider.api)) {
+      throw invalidArgument("Provider runtime does not support the selected protocol.");
+    }
+    if (!dependencies.providers!.hasManagedProvider(runtime.backendId, entry.providerId)
+      && (backend.providers?.some((provider) => provider.providerId === entry.providerId)
+        || backend.models.some((model) => model.providerId === entry.providerId))) {
+      throw invalidArgument("Provider identity is already owned by the native runtime.");
+    }
+    const requireField = (field: import("@joko/core").ProviderConfigurationField, configured: boolean) => {
+      if (configured && !support.fields.includes(field)) throw invalidArgument(`Provider runtime does not support ${field}.`);
+    };
+    requireField("request_path", runtime.requestPath !== undefined);
+    requireField("models_endpoint", runtime.modelsEndpoint !== undefined);
+    requireField("headers", Object.keys(runtime.provider.headers ?? {}).length > 0);
+    requireField("keyless", runtime.provider.keyless === true);
+    requireField("auth_header", runtime.provider.authHeader === true);
+    for (const model of runtime.provider.models) {
+      if (!support.protocols.includes(model.api ?? runtime.provider.api)) throw invalidArgument("Provider model protocol is not supported by this runtime.");
+      requireField("model_limits", model.contextWindow !== undefined || model.maxTokens !== undefined);
+      requireField("model_costs", model.cost !== undefined);
+      requireField("model_input_modalities", model.input?.some((value) => value !== "text") === true);
+      requireField("model_thinking_levels", model.reasoning === true || Object.keys(model.thinkingLevelMap ?? {}).length > 0);
+      requireField("model_sampling", Object.keys(model.samplingParams ?? {}).length > 0);
+      requireField("model_compatibility", Object.keys(model.compat ?? {}).length > 0);
+      requireField("model_fast_mode", model.supportsFastMode === true);
+    }
+  }
+}
+
+async function refreshManagedProviderBackends(dependencies: ConnectServiceDependencies, backendIds: ReadonlySet<string>): Promise<void> {
+  for (const backendId of backendIds) {
+    try {
+      if (backendId === dependencies.providers?.nativeAuthenticationBackendId) await dependencies.refreshPiGeneration?.();
+      else await dependencies.refreshBackendDescriptor?.(backendId);
+    } catch {
+      dependencies.store.appendDiagnostic({ severity: "warning", component: "provider", code: "PROVIDER_CONFIGURATION_PROJECTION_REFRESH_FAILED",
+        message: "Provider configuration was saved, but its runtime catalog could not be refreshed.", details: { backendId } });
+    }
+  }
+}
+
+function providerEntryFromProto(input: contract.ProviderConfiguration): Parameters<ProviderCatalogManager["upsertConfiguration"]>[0] {
   if (input.providerId.trim() === "") throw invalidArgument("provider.provider_id is required");
+  if (input.version?.revision === undefined) throw invalidArgument("provider.version.revision is required");
+  return {
+    providerId: input.providerId, displayName: input.displayName || input.providerId, kind: nativeProviderKind(input.kind),
+    enabled: input.enabled, expectedVersion: fromProtoRevision(input.version.revision, "provider.version.revision"),
+    runtimes: input.runtimes.map((runtime) => providerRuntimeFromProto(runtime, input.providerId))
+  };
+}
+
+function providerRuntimeFromProto(input: contract.ProviderRuntimeConfiguration, providerId: string): ManagedProviderRuntimeInput {
   const api = nativeProviderApi(input.apiCompatibility, true);
   const headers: Record<string, { readonly env: string }> = {};
   const credentialBindings: Record<string, string> = {};
@@ -7281,12 +7428,20 @@ function providerEntryFromProto(input: contract.ProviderConfiguration): Omit<Man
   }
   for (const header of input.headers) {
     if (header.headerName === "" || header.environmentName === "") throw invalidArgument("provider.headers require header_name and environment_name");
-    if (headers[header.headerName] !== undefined) throw invalidArgument(`provider header '${header.headerName}' is duplicated`);
+    const declaredNames = [input.apiKeyEnvironment, ...Object.values(headers).map((value) => value.env)];
+    if (declaredNames.some((name) => name !== header.environmentName && name.toUpperCase() === header.environmentName.toUpperCase())) {
+      throw invalidArgument("Provider environment names must not differ only by case.");
+    }
+    if (Object.keys(headers).some((name) => name.toLowerCase() === header.headerName.toLowerCase())) throw invalidArgument("Provider header is duplicated.");
     headers[header.headerName] = { env: header.environmentName };
-    if (header.credentialReferenceId !== "") credentialBindings[header.environmentName] = header.credentialReferenceId;
+    if (header.credentialReferenceId !== "") {
+      const current = credentialBindings[header.environmentName];
+      if (current !== undefined && current !== header.credentialReferenceId) throw invalidArgument("Provider environment has conflicting credential references.");
+      credentialBindings[header.environmentName] = header.credentialReferenceId;
+    }
   }
   const provider: PiManagedProvider = {
-    id: input.providerId,
+    id: providerId,
     ...(input.endpoint === "" ? {} : { baseUrl: input.endpoint }),
     ...(api === undefined ? {} : { api }),
     ...(input.apiKeyEnvironment === "" ? {} : { apiKeyEnv: input.apiKeyEnvironment }),
@@ -7296,17 +7451,13 @@ function providerEntryFromProto(input: contract.ProviderConfiguration): Omit<Man
     models: input.models.map(providerModelFromProto)
   };
   if (provider.models.length === 0) throw invalidArgument("provider.models must contain at least one model");
-  const kind = nativeProviderKind(input.kind);
   return {
+    backendId: nonBlankRequest(input.backendId, "provider.runtimes.backend_id"),
     provider,
-    displayName: input.displayName || input.providerId,
-    kind,
     credentialBindings,
-    enabled: input.enabled,
-    supportsLogin: kind === "oauth" || kind === "subscription",
-    supportsLogout: Object.keys(credentialBindings).length > 0 || kind === "oauth" || kind === "subscription",
-    supportsRefresh: kind === "oauth" || kind === "subscription",
-    ...(input.version?.revision === undefined ? {} : { expectedVersion: fromProtoRevision(input.version.revision, "provider.version.revision") })
+    credentialOrigin: input.credentialOrigin,
+    ...(input.requestPath === undefined ? {} : { requestPath: input.requestPath }),
+    ...(input.modelsEndpoint === undefined ? {} : { modelsEndpoint: input.modelsEndpoint })
   };
 }
 
@@ -7315,7 +7466,7 @@ function providerModelFromProto(input: contract.ProviderModelConfiguration): PiM
   const modalities = input.inputModalities.length === 0 ? undefined : input.inputModalities.map((value): "text" | "image" => {
     if (value === contract.ModelInputModality.TEXT) return "text";
     if (value === contract.ModelInputModality.IMAGE) return "image";
-    throw invalidArgument("Pi BYOM supports only text and image input modalities");
+    throw invalidArgument("Provider models support only text and image input modalities.");
   });
   const thinkingLevelMap = input.thinkingLevels.length === 0 ? undefined : Object.fromEntries(input.thinkingLevels.map((item) => [
     item.effortId,
@@ -7398,6 +7549,7 @@ function nativeProviderApi(value: contract.ProviderApiCompatibility, optional: b
     case contract.ProviderApiCompatibility.ANTHROPIC_MESSAGES: return "anthropic-messages";
     case contract.ProviderApiCompatibility.OPENAI_RESPONSES: return "openai-responses";
     case contract.ProviderApiCompatibility.OPENAI_CHAT_COMPLETIONS:
+      throw invalidArgument("The selected Provider protocol is not supported by this runtime configuration.");
     case contract.ProviderApiCompatibility.OPENAI_COMPLETIONS: return "openai-completions";
     case contract.ProviderApiCompatibility.GOOGLE_GENERATIVE_AI: return "google-generative-ai";
     case contract.ProviderApiCompatibility.UNSPECIFIED:
@@ -7956,13 +8108,12 @@ function mapMcpServerDescriptor(item: NativeMcpServerDescriptor): contract.McpSe
   return create(contract.McpServerDescriptorSchema, {
     mcpServerId: item.id,
     displayName: item.displayName,
-    transport: item.transport === "stdio" ? contract.McpTransport.STDIO : contract.McpTransport.HTTPS_STREAMABLE_HTTP,
+    transport: item.transport === "stdio" ? contract.McpTransport.STDIO : item.transport === "sse" ? contract.McpTransport.HTTP_SSE : contract.McpTransport.HTTPS_STREAMABLE_HTTP,
     endpointDisplay: item.endpointDisplay,
     state: protoMcpState(item.state),
     runtimeGeneration: BigInt(item.runtimeGeneration),
     tools: item.tools.map((tool) => mapMcpToolDescriptor(tool)),
     credentialBindings: item.credentialBindings.map((binding) => create(contract.CredentialBindingSchema, {
-      headerName: binding.target === "header" ? binding.name : "",
       credentialReferenceId: binding.credentialReferenceId,
       configured: binding.configured,
       target: binding.target === "header" ? contract.McpCredentialTarget.HEADER : contract.McpCredentialTarget.ENVIRONMENT,
@@ -7981,7 +8132,10 @@ function mapMcpServerDescriptor(item: NativeMcpServerDescriptor): contract.McpSe
             .map(([name, value]) => create(contract.McpEnvironmentVariableSchema, { name, value }))
         })
       }
-      : {
+      : item.configuration.case === "sse" ? {
+        case: "sse",
+        value: create(contract.SseMcpConfigurationSchema, { endpoint: item.configuration.endpoint })
+      } : {
         case: "streamableHttp",
         value: create(contract.StreamableHttpMcpConfigurationSchema, { endpoint: item.configuration.endpoint })
       },
@@ -8219,7 +8373,6 @@ function nativeMcpServerInput(id: string, input: contract.McpServerInput): Nativ
   const credentialBindings = input.credentialBindings.map(nativeMcpCredentialBinding);
   if (input.transport === contract.McpTransport.STDIO) {
     if (input.transportConfig.case !== "stdio") throw invalidArgument("server.stdio transport_config is required for STDIO");
-    if (input.endpoint !== "") throw invalidArgument("server.endpoint is not valid for STDIO");
     const config = input.transportConfig.value;
     if (config.command.trim() === "") throw invalidArgument("server.stdio.command is required");
     const environment: Record<string, string> = {};
@@ -8240,20 +8393,17 @@ function nativeMcpServerInput(id: string, input: contract.McpServerInput): Nativ
       ...(Object.keys(environment).length === 0 ? {} : { environment })
     };
   }
-  if (input.transport === contract.McpTransport.HTTPS_STREAMABLE_HTTP) {
-    if (input.transportConfig.case !== "streamableHttp") throw invalidArgument("server.streamable_http transport_config is required for HTTPS Streamable HTTP");
-    const configuredEndpoint = input.transportConfig.value.endpoint;
-    if (input.endpoint !== "" && configuredEndpoint !== "" && input.endpoint !== configuredEndpoint) {
-      throw invalidArgument("server.endpoint and server.streamable_http.endpoint do not match");
-    }
-    const endpoint = configuredEndpoint || input.endpoint;
-    if (endpoint.trim() === "") throw invalidArgument("server.streamable_http.endpoint is required");
+  if (input.transport === contract.McpTransport.HTTPS_STREAMABLE_HTTP || input.transport === contract.McpTransport.HTTP_SSE) {
+    const expectedCase = input.transport === contract.McpTransport.HTTP_SSE ? "sse" : "streamableHttp";
+    if (input.transportConfig.case !== expectedCase) throw invalidArgument("MCP transport_config must match the selected HTTP transport");
+    const endpoint = input.transportConfig.value.endpoint;
+    if (endpoint.trim() === "") throw invalidArgument("MCP transport_config.endpoint is required");
     return {
       id: serverId,
       displayName,
       enabled: input.enabled,
       credentialBindings,
-      transport: "streamable_http",
+      transport: input.transport === contract.McpTransport.HTTP_SSE ? "sse" : "streamable_http",
       endpoint
     };
   }
@@ -8266,16 +8416,12 @@ function nativeMcpServerInput(id: string, input: contract.McpServerInput): Nativ
 function nativeMcpCredentialBinding(input: contract.CredentialBinding): NativeMcpCredentialBinding {
   if (input.credentialReferenceId.trim() === "") throw invalidArgument("server.credential_bindings.credential_reference_id is required");
   if (input.target === contract.McpCredentialTarget.HEADER) {
-    const name = input.targetName || input.headerName;
+    const name = input.targetName;
     if (name.trim() === "") throw invalidArgument("header credential binding target_name is required");
-    if (input.headerName !== "" && input.targetName !== "" && input.headerName !== input.targetName) {
-      throw invalidArgument("header credential binding header_name and target_name do not match");
-    }
     return { target: "header", name, credentialReferenceId: input.credentialReferenceId };
   }
   if (input.target === contract.McpCredentialTarget.ENVIRONMENT) {
     if (input.targetName.trim() === "") throw invalidArgument("environment credential binding target_name is required");
-    if (input.headerName !== "") throw invalidArgument("environment credential binding cannot set header_name");
     return { target: "environment", name: input.targetName, credentialReferenceId: input.credentialReferenceId };
   }
   throw invalidArgument("server.credential_bindings.target is required");
@@ -8516,6 +8662,11 @@ function settingsSnapshot(dependencies: ConnectServiceDependencies): contract.Se
     customizedFields: []
   };
   const promptRecommendationOverride = normalizePromptRecommendationSettings(read<unknown>("settings.prompt_recommendation"));
+  const auxiliaryText = dependencies.auxiliaryText?.snapshot() ?? {
+    models: [], automaticModels: [], options: [], available: false,
+    unavailableReason: "Auxiliary text routing is unavailable on this Orchestrator node.",
+    revision: 0n, runtimeRevision: ""
+  };
   const promptRecommendation = dependencies.promptPrediction?.state() ?? {
     enabled: promptRecommendationOverride.enabled ?? true,
     available: false,
@@ -8578,7 +8729,7 @@ function settingsSnapshot(dependencies: ConnectServiceDependencies): contract.Se
         modelAccess: readBackendModelAccess(dependencies.store, item.descriptor.id)
       });
     }),
-    providers: dependencies.providers?.list().map(mapProviderConfiguration) ?? [],
+    providers: dependencies.providers?.listConfigurations().map(mapProviderConfiguration) ?? [],
     credentials: dependencies.credentials?.list().map(mapCredentialDescriptor) ?? [],
     mcpServers: dependencies.mcpRouter?.list().map(mapMcpServerDescriptor) ?? [],
     browsers: [dependencies.browserProvider === undefined
@@ -8765,9 +8916,12 @@ function settingsSnapshot(dependencies: ConnectServiceDependencies): contract.Se
       failedCount: BigInt(messageSearchStatus.failedCount),
       embeddingProviderAvailable: dependencies.providers !== undefined &&
         typeof dependencies.providers.resolveOpenAiEmbeddingRoute === "function" &&
+        ((messageSearchStatus.backendId === undefined) === (messageSearchStatus.providerId === undefined)) &&
         dependencies.providers.resolveOpenAiEmbeddingRoute(
           MESSAGE_SEARCH_EMBEDDING_MODEL_ID,
-          messageSearchStatus.providerId
+          messageSearchStatus.providerId === undefined ? undefined : {
+            backendId: messageSearchStatus.backendId!, providerId: messageSearchStatus.providerId
+          }
         ) !== undefined,
       customized: messageSearchOverride?.semanticIndexEnabled !== undefined
     }),
@@ -8797,6 +8951,26 @@ function settingsSnapshot(dependencies: ConnectServiceDependencies): contract.Se
       customized: visionBridge.customizedFields.length > 0,
       customizedFields: [...visionBridge.customizedFields]
     }),
+    auxiliaryText: create(contract.AuxiliaryTextSettingsSchema, {
+      models: auxiliaryText.models.map((route) => create(contract.ModelRouteRefSchema, route)),
+      automaticModels: auxiliaryText.automaticModels.map((route) => create(contract.ModelRouteRefSchema, route)),
+      options: auxiliaryText.options.map((option) => create(contract.AuxiliaryTextRouteOptionSchema, {
+        route: create(contract.ModelRouteRefSchema, option.route),
+        available: option.available,
+        unavailableReason: option.unavailableReason
+      })),
+      available: auxiliaryText.available,
+      unavailableReason: auxiliaryText.unavailableReason,
+      revision: toProtoRevision(auxiliaryText.revision),
+      runtimeRevision: auxiliaryText.runtimeRevision
+    }),
+    subagentModels: (dependencies.subagentModels?.snapshot() ?? []).map((setting) => create(contract.SubagentModelSettingsSchema, {
+      backendId: setting.backendId,
+      ...(setting.model === undefined ? {} : { model: create(contract.ModelKeySchema, setting.model) }),
+      available: setting.available,
+      unavailableReason: setting.unavailableReason,
+      revision: toProtoRevision(setting.revision)
+    })),
     promptRecommendation: create(contract.PromptRecommendationSettingsSchema, {
       enabled: promptRecommendation.enabled,
       available: promptRecommendation.available,
@@ -8892,7 +9066,7 @@ async function enrichSnapshot(
   ] as const));
   await Promise.all([...authoritativeProviderMap].map(async ([key, provider]) => {
     const record = backendRecords.get(provider.backendId);
-    if (record === undefined || managedProviderCatalogApplies(dependencies, provider.backendId)) return;
+    if (record === undefined || managedProviderCatalogApplies(dependencies, provider.backendId, provider.providerId)) return;
     authoritativeProviderMap.set(key, await backendProviderDescriptorWithAccountUsage(
       dependencies,
       record.descriptor,
@@ -8905,6 +9079,7 @@ async function enrichSnapshot(
   if (providerRecords !== undefined) {
     for (const backendId of managedProviderBackendIds(dependencies)) {
       for (const provider of providerRecords) {
+        if (provider.backendId !== backendId) continue;
         const key = providerDescriptorKey(backendId, provider.provider.id);
         if (!owner && !visibleProviderKeys.has(key)) continue;
         authoritativeProviderMap.set(key, mapProviderDescriptor(
@@ -10943,6 +11118,7 @@ async function dispatchMutation(
       return presented(execution);
     }
     case "updateTarget": {
+      requireEntityVersionPrecondition(mutation, contract.EntityKind.TARGET, payload.value.targetId, "update_target");
       const existing = dependencies.store.getTarget(payload.value.targetId);
       const metadata = asRecord(existing.metadata);
       const { remoteWorkspace: _previousRemoteWorkspace, ...serviceNodeDescriptor } = existing.descriptor;
@@ -11592,24 +11768,25 @@ async function dispatchMutation(
     }
     case "navigateSessionBranch": {
       if (payload.value.sessionId.trim() === "") throw invalidArgument("navigate_session_branch.session_id is required");
-      if (payload.value.nativeEntryId.trim() === "") throw invalidArgument("navigate_session_branch.native_entry_id is required");
+      let navigationTarget: import("@joko/core").NativeNavigationTarget;
+      try { navigationTarget = fromProtoNativeNavigationTarget(payload.value.target); }
+      catch { throw invalidArgument("navigate_session_branch.target is invalid"); }
+      const generation = mutation.preconditions.find((value) => value.entity?.kind === contract.EntityKind.SESSION && value.entity.id === payload.value.sessionId)?.expectedGeneration;
+      if (generation === undefined || generation < 1n || generation > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw invalidArgument("navigate_session_branch requires the source Session generation precondition");
+      }
       const customInstructions = payload.value.customInstructions.trim();
       if (customInstructions.length > 4_000) {
         throw invalidArgument("navigate_session_branch.custom_instructions must not exceed 4000 characters");
       }
-      return ackOperation(
-        dependencies,
-        operationId,
-        connection,
-        mutation,
-        payload.case,
-        () => host.navigateTree(
+      return presented(await host.navigateTree(
           payload.value.sessionId,
-          payload.value.nativeEntryId,
+          navigationTarget,
           payload.value.summarize,
-          payload.value.summarize && customInstructions !== "" ? customInstructions : undefined
-        )
-      );
+          payload.value.summarize && customInstructions !== "" ? customInstructions : undefined,
+          Number(generation),
+          { connection, operationId, protocol: { kind: "connect", body: mutation, precondition: (store) => validatePreconditions(store, mutation) } }
+        ));
     }
     case "compactSession": {
       let compactSessionOutcome: "compacted" | "noop" | undefined;
@@ -11838,29 +12015,37 @@ async function dispatchMutation(
       return presented(execution);
     }
     case "sendInput": {
+      const generation = mutation.preconditions.find((item) => item.entity?.kind === contract.EntityKind.SESSION && item.entity.id === payload.value.sessionId)?.expectedGeneration;
+      if (generation === undefined || generation < 1n || generation > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw invalidArgument("send_input requires the source Session generation precondition");
+      }
       const disposition = deliveryMode(payload.value.deliveryMode);
       const prompt = fromProtoInputContent(payload.value.input, disposition);
       const overrides = coreTurnOverrides(payload.value.overrides);
-      const nestedId = nestedOperationId(payload.case, operationId);
-      const queueItemId = stableId("queue", nestedId);
       const execution = await host.mutate({
         operationId,
         connection,
         kind: payload.case,
         body: mutation,
-        commit: () => ({ accepted: true, resultCase: "queueItem", entityId: queueItemId } satisfies OperationOutcome),
-        effect: async () => {
-          const nested = dependencies.sessionHost.enqueueInput({
-            operationId: nestedId,
-            connection,
+        commit: (store) => {
+          const queued = host.commitQueuedInput(store, {
+            operationId,
             sessionId: payload.value.sessionId,
             prompt,
             ...(overrides === undefined ? {} : { overrides })
           });
-          if (nested.value.queueItemId !== queueItemId) throw new Error("SendInput returned a non-deterministic Queue Item ID.");
-          dependencies.sessionNavigation?.observeAcceptedPrompt(payload.value.sessionId, prompt);
+          return { accepted: true, resultCase: "queueItem", entityId: queued.queueItemId } satisfies OperationOutcome;
         }
+      }).catch((error: unknown): OperationExecution<OperationOutcome> => {
+        if (!(error instanceof JokoError)) throw error;
+        const record = dependencies.store.getOperation<OperationOutcome>(operationId);
+        if (record.status !== "failed" || record.connectionId !== connection.id) throw error;
+        return { replayed: false, operation: record, value: { accepted: false } };
       });
+      if (!execution.replayed && execution.value.accepted) {
+        host.drainQueuedInput(payload.value.sessionId);
+        dependencies.sessionNavigation?.observeAcceptedPrompt(payload.value.sessionId, prompt);
+      }
       return presented(execution);
     }
     case "abortRun": {
@@ -13022,7 +13207,7 @@ async function dispatchMutation(
             throw new ConnectError("Workspace rewind change set changed before apply.", Code.FailedPrecondition);
           }
           if (dialogueOnly) {
-            if (currentChangeSet.dialogueEntryId === undefined) {
+            if (currentChangeSet.dialogueAnchor === undefined) {
               throw new ConnectError("Dialogue-only rewind is unavailable for this change set.", Code.FailedPrecondition);
             }
             const currentSession = dependencies.store.listSessions({ includeArchived: true, includeDeleted: true })
@@ -13036,8 +13221,16 @@ async function dispatchMutation(
             if (currentSession === undefined || currentWorkspaceId !== currentChangeSet.workspaceId) {
               throw new ConnectError("The task owning this dialogue rewind is unavailable or moved.", Code.FailedPrecondition);
             }
+            const anchor = currentChangeSet.dialogueAnchor;
+            const backend = dependencies.store.getBackend(currentSession.descriptor.backendId).descriptor;
+            if (currentSession.descriptor.binding.generation !== anchor.generation
+              || backend.capabilities.get("session.rewind")?.supported !== true
+              || (anchor.target.kind === "session_start" && backend.capabilities.get("session.rewind_to_start")?.supported !== true)) {
+              throw new ConnectError("The dialogue rewind anchor is no longer available.", Code.FailedPrecondition);
+            }
             await dependencies.workspaceChanges.consumeDialogueOnlyRewind(currentPreview.id);
-            await dependencies.sessionHost.navigateTree(currentSession.descriptor.id, currentChangeSet.dialogueEntryId, false);
+            await dependencies.sessionHost.navigateTree(currentSession.descriptor.id, anchor.target, false, undefined, anchor.generation,
+              { connection, operationId: stableId("operation", `${operationId}:native-navigation`), protocol: { kind: "internal" } });
           } else {
             await dependencies.workspaceChanges.applyRewind(currentPreview.id);
           }
@@ -14182,6 +14375,44 @@ async function dispatchMutation(
       }
       return presented(execution);
     }
+    case "updateAuxiliaryTextSettings": {
+      const routing = dependencies.auxiliaryText;
+      const expectedRevision = payload.value.expectedRevision?.value;
+      if (expectedRevision === undefined) throw invalidArgument("update_auxiliary_text_settings.expected_revision is required");
+      if (routing === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case,
+          "Auxiliary text routing is not configured on this Orchestrator node.");
+      }
+      const models = payload.value.models.map(({ backendId, providerId, modelId }) => ({ backendId, providerId, modelId }));
+      const execution = await host.mutate({
+        operationId, connection, kind: payload.case, body: mutation,
+        commit: () => {
+          routing.replace(models, expectedRevision);
+          return { accepted: true, resultCase: "settings" } satisfies OperationOutcome;
+        }
+      });
+      if (!execution.replayed) routing.invalidate();
+      return presented(execution);
+    }
+    case "updateSubagentModelSettings": {
+      const owner = dependencies.subagentModels;
+      const expectedRevision = payload.value.expectedRevision?.value;
+      if (expectedRevision === undefined) throw invalidArgument("update_subagent_model_settings.expected_revision is required");
+      if (owner === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case,
+          "Subagent model settings are not configured on this Orchestrator node.");
+      }
+      const { backendId, model } = payload.value;
+      const selection = model === undefined ? undefined : { providerId: model.providerId, modelId: model.modelId };
+      const execution = await host.mutate({
+        operationId, connection, kind: payload.case, body: mutation,
+        commit: () => {
+          owner.replace(backendId, selection, expectedRevision);
+          return { accepted: true, resultCase: "settings" } satisfies OperationOutcome;
+        }
+      });
+      return presented(execution);
+    }
     case "updatePromptRecommendationSettings": {
       const patch = payload.value.patch;
       if (patch === undefined || patch.resetEnabled === (patch.enabled !== undefined)) {
@@ -14204,8 +14435,7 @@ async function dispatchMutation(
         kind: payload.case,
         body: mutation,
         commit: (store) => {
-          if (patch.resetEnabled) store.deleteSetting("service", "orchestrator", "settings.prompt_recommendation");
-          else store.setSetting("service", "orchestrator", "settings.prompt_recommendation", { enabled });
+          store.setSetting("service", "orchestrator", "settings.prompt_recommendation", patch.resetEnabled ? {} : { enabled });
           return { accepted: true, resultCase: "settings" } satisfies OperationOutcome;
         }
       });
@@ -14319,26 +14549,31 @@ async function dispatchMutation(
       if (dependencies.providers === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The managed Provider catalog is not configured.");
       if (payload.value.provider === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Provider configuration is required.");
       const entry = providerEntryFromProto(payload.value.provider);
+      assertProviderRuntimeSupport(dependencies, entry);
+      const changedBackends = new Set([
+        ...entry.runtimes.map((runtime) => runtime.backendId),
+        ...dependencies.providers.list().filter((runtime) => runtime.provider.id === entry.providerId).map((runtime) => runtime.backendId)
+      ]);
       return effectOperation(dependencies, operationId, connection, mutation, payload.case, {
         accepted: true,
-        resultCase: "provider",
-        entityId: entry.provider.id
+        resultCase: "settings"
       }, async () => {
-        await dependencies.providers!.upsert(entry);
-        clearManagedProviderRateLimit(dependencies, entry.provider.id);
-        await dependencies.refreshPiGeneration?.();
+        await dependencies.providers!.upsertConfiguration(entry);
+        clearManagedProviderRateLimit(dependencies, entry.providerId);
+        await refreshManagedProviderBackends(dependencies, changedBackends);
         dependencies.messageSearch?.reconcileAvailability();
       });
     }
     case "deleteProvider": {
       if (dependencies.providers === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The managed Provider catalog is not configured.");
+      const changedBackends = new Set(dependencies.providers.list().filter((runtime) => runtime.provider.id === payload.value.providerId).map((runtime) => runtime.backendId));
       return effectOperation(dependencies, operationId, connection, mutation, payload.case, {
         accepted: true,
         resultCase: "acknowledgement"
       }, async () => {
         if (!await dependencies.providers!.delete(payload.value.providerId)) throw new ConnectError("Provider not found.", Code.NotFound);
         clearManagedProviderRateLimit(dependencies, payload.value.providerId);
-        await dependencies.refreshPiGeneration?.();
+        await refreshManagedProviderBackends(dependencies, changedBackends);
         dependencies.messageSearch?.reconcileAvailability();
       });
     }
@@ -14347,18 +14582,27 @@ async function dispatchMutation(
       const rawProviderId = payload.value.providerId;
       const providerId = rawProviderId.trim();
       if (rawProviderId !== "" && providerId === "") throw invalidArgument("provider_id is invalid");
-      if (managedProviderCatalogApplies(dependencies, backendId)) {
-        if (dependencies.providerAuth === undefined) {
+      if (managedProviderCatalogApplies(dependencies, backendId, providerId || undefined)) {
+        if (backendId === dependencies.providers.nativeAuthenticationBackendId && dependencies.providerAuth === undefined) {
           return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Provider model catalog refresh is not configured.");
         }
         return effectOperation(dependencies, operationId, connection, mutation, payload.case, {
           accepted: true,
           resultCase: "acknowledgement"
         }, async () => {
-          await dependencies.providerAuth!.refreshModelCatalogs({
-            ...(providerId === "" ? {} : { providerId }),
-            automatic: payload.value.automatic
-          });
+          if (backendId === dependencies.providers!.nativeAuthenticationBackendId) {
+            await dependencies.providerAuth!.refreshModelCatalogs({
+              ...(providerId === "" ? {} : { providerId }), automatic: payload.value.automatic
+            });
+          } else {
+            const entries = dependencies.providers!.listManaged(backendId).filter((entry) => providerId === "" || entry.provider.id === providerId);
+            for (const entry of entries) {
+              if (!dependencies.providers!.canDiscoverProviderModels(backendId, entry.provider.id)) continue;
+              try { await dependencies.providers!.discoverProviderModels(backendId, entry.provider.id); }
+              catch (error) { if (!payload.value.automatic) throw error; }
+            }
+            await dependencies.refreshBackendDescriptor?.(backendId);
+          }
           dependencies.messageSearch?.reconcileAvailability();
         });
       }
@@ -14390,36 +14634,19 @@ async function dispatchMutation(
       if (dependencies.credentials === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The managed Credential channel is not configured.");
       const kind = nativeCredentialKind(payload.value.kind, false)!;
       const reference = payload.value.credentialReferenceId || `cred_${createHash("sha256").update(operationId).digest("hex").slice(0, 24)}`;
-      if (payload.value.providerId !== "" && dependencies.providers === undefined) {
-        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The Provider catalog required to bind this credential is not configured.");
-      }
       return effectOperation(dependencies, operationId, connection, mutation, payload.case, {
         accepted: true,
         resultCase: "credential",
         entityId: reference
       }, async () => {
-        if (payload.value.providerId !== "") {
-          await dependencies.providers!.commitCredential({
-            providerId: payload.value.providerId,
-            ...(payload.value.environmentName === "" ? {} : { environmentName: payload.value.environmentName }),
-            credentialUploadTicketId: payload.value.credentialUploadTicketId,
-            credentialReferenceId: reference,
-            displayName: payload.value.displayName,
-            kind,
-            connectionId: connection.id
-          });
-          clearManagedProviderRateLimit(dependencies, payload.value.providerId);
-          await dependencies.refreshPiGeneration?.();
-          dependencies.messageSearch?.reconcileAvailability();
-        } else {
-          await dependencies.credentials!.commitUpload({
-            credentialUploadTicketId: payload.value.credentialUploadTicketId,
-            credentialReferenceId: reference,
-            displayName: payload.value.displayName,
-            kind,
-            connectionId: connection.id
-          });
-        }
+        await dependencies.credentials!.commitUpload({
+          credentialUploadTicketId: payload.value.credentialUploadTicketId,
+          credentialReferenceId: reference,
+          displayName: payload.value.displayName,
+          kind,
+          ...(payload.value.providerId === "" ? {} : { providerId: payload.value.providerId }),
+          connectionId: connection.id
+        });
       });
     }
     case "commitProviderCredentialSurface": {
@@ -14503,7 +14730,8 @@ async function dispatchMutation(
       const backendId = nonBlankRequest(payload.value.backendId, "backend_id");
       const providerId = nonBlankRequest(payload.value.providerId, "provider_id");
       const method = nativeProviderLoginMethod(payload.value.method);
-      if (managedProviderCatalogApplies(dependencies, backendId)) {
+      if (managedProviderCatalogApplies(dependencies, backendId, providerId)) {
+        if (backendId !== dependencies.providers.nativeAuthenticationBackendId) throw new ConnectError("Managed runtime credentials are configured in Provider settings.", Code.Unimplemented);
         let flow: NativeProviderLoginFlow | undefined;
         return presented(await host.mutate({
           operationId,
@@ -14625,7 +14853,10 @@ async function dispatchMutation(
     case "refreshProviderCredential": {
       const backendId = nonBlankRequest(payload.value.backendId, "backend_id");
       const providerId = nonBlankRequest(payload.value.providerId, "provider_id");
-      if (!managedProviderCatalogApplies(dependencies, backendId)) {
+      if (dependencies.providers?.hasManagedProvider(backendId, providerId) && backendId !== dependencies.providers.nativeAuthenticationBackendId) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "This Provider uses explicitly managed credentials.");
+      }
+      if (!managedProviderCatalogApplies(dependencies, backendId, providerId)) {
         backendProviderAccountOperations(dependencies, backendId, providerId, "provider.refresh");
         return effectOperation(dependencies, operationId, connection, mutation, payload.case, {
           accepted: true,
@@ -14676,7 +14907,10 @@ async function dispatchMutation(
     case "logoutProvider": {
       const backendId = nonBlankRequest(payload.value.backendId, "backend_id");
       const providerId = nonBlankRequest(payload.value.providerId, "provider_id");
-      if (!managedProviderCatalogApplies(dependencies, backendId)) {
+      if (dependencies.providers?.hasManagedProvider(backendId, providerId) && backendId !== dependencies.providers.nativeAuthenticationBackendId) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "This Provider uses explicitly managed credentials.");
+      }
+      if (!managedProviderCatalogApplies(dependencies, backendId, providerId)) {
         backendProviderAccountOperations(dependencies, backendId, providerId, "provider.logout");
         return effectOperation(dependencies, operationId, connection, mutation, payload.case, {
           accepted: true,
@@ -15069,7 +15303,14 @@ async function dispatchMutation(
         throw invalidArgument("Expected Browser generation must be a non-negative safe integer.");
       }
       const expectedGeneration = Number(payload.value.expectedGeneration);
-      const requestedUrl = validateTakeoverNavigationUrl(payload.value.url);
+      const htmlSource = payload.value.workspaceHtml;
+      if (htmlSource !== undefined && (payload.value.url !== "" || payload.value.recoveryPageId !== "" || htmlSource.expectedRevision === "")) {
+        throw invalidArgument("HTML page opens require an exact file revision and cannot include a URL or recovery page.");
+      }
+      const requestedUrl = htmlSource === undefined ? validateTakeoverNavigationUrl(payload.value.url) : workspaceHtmlPreviewUrl(randomUUID(), htmlSource.relativePath);
+      if (htmlSource === undefined && isWorkspaceHtmlPreviewUrl(requestedUrl)) {
+        throw new ConnectError("This HTML snapshot cannot be recovered by URL. Open the source file again.", Code.FailedPrecondition);
+      }
       const recovery = payload.value.recoveryPageId === ""
         ? undefined
         : dependencies.browserState?.findRecoverablePage(payload.value.browserProviderId, payload.value.recoveryPageId);
@@ -15150,14 +15391,28 @@ async function dispatchMutation(
             throw new ConnectError("The Browser page is still live and does not need recovery.", Code.FailedPrecondition);
           }
           await provider.start();
-          const requestedGeneration = provider.generation;
-          takeover = await provider.openHumanPage({
-            providerId: provider.id,
-            generation: requestedGeneration,
-            owner: connection.id,
-            url: targetUrl
-          }, dependencies.browserSettings?.takeoverTimeout());
-          openedPage = (await provider.listPages()).find((page) => page.id === takeover?.pageId);
+          const assertHtmlOwner = (): void => {
+            dependencies.connections.fence(connection);
+            requireActiveBrowserSessionAuthority(dependencies.browserState, requestedPageOwner);
+          };
+          const htmlOwner = htmlSource === undefined ? undefined : captureHtmlConnectionRead(dependencies.connections, connection);
+          let pageOwnsRead = false;
+          try {
+            const htmlSnapshot = htmlSource === undefined ? undefined : await readWorkspaceHtmlSnapshot({
+              store: dependencies.store, workspaces: dependencies.workspaceService, sessionId: payload.value.sessionId,
+              source: htmlSource, assertConnection: assertHtmlOwner, signal: htmlOwner!.signal
+            });
+            htmlSnapshot?.assertCurrent();
+            const requestedGeneration = provider.generation;
+            takeover = await provider.openHumanPage({
+              providerId: provider.id,
+              generation: requestedGeneration,
+              owner: connection.id,
+              url: targetUrl
+            }, dependencies.browserSettings?.takeoverTimeout(), htmlSnapshot === undefined ? undefined : { ...htmlSnapshot, dispose: htmlOwner!.dispose });
+            pageOwnsRead = true;
+            openedPage = (await provider.listPages()).find((page) => page.id === takeover?.pageId);
+          } finally { if (!pageOwnsRead) htmlOwner?.dispose(); }
         },
         commit: () => {
           if (takeover === undefined || openedPage === undefined) throw new Error("Browser page open completed without a live page takeover.");
@@ -16285,6 +16540,15 @@ function coreInteractionDecision(value: unknown): InteractionDecision {
     return { kind: "question", answers };
   }
   return { kind: "selected", value: safeJson(value) };
+}
+
+function captureHtmlConnectionRead(connections: ConnectionManager, connection: ConnectionRecord): { readonly signal: AbortSignal; readonly dispose: () => void } {
+  const abort = new AbortController();
+  const unsubscribe = connections.onRevoked(connection.id, () => abort.abort());
+  let disposed = false;
+  const dispose = (): void => { if (disposed) return; disposed = true; unsubscribe(); abort.abort(); };
+  try { connections.fence(connection); } catch (error) { dispose(); throw error; }
+  return { signal: abort.signal, dispose };
 }
 
 function stableConnection(connection: ConnectionRecord): ConnectionRecord {

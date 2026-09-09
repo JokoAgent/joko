@@ -1,8 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
+import { resolveDesktopTrayMenuLabels } from "../src/i18n/tray-menu.js";
+import { TRAY_MENU_CASES } from "./i18n/menu-corpus.js";
 
 import {
   popUpDesktopTrayMenu,
-  resolveDesktopTrayMenuLabels,
   usesJavaScriptTrayMenuPopup,
   type DesktopTrayPopupMenu
 } from "../src/tray-menu.js";
@@ -25,14 +26,7 @@ function popupMenu() {
 }
 
 describe("Desktop tray menu", () => {
-  it.each([
-    ["en", false, "Open Joko", "Quit Joko"],
-    ["en", true, "Open Joko", "Quit Joko and local Orchestrator"],
-    ["zh-CN", false, "打开 Joko", "退出 Joko"],
-    ["zh-CN", true, "打开 Joko", "退出 Joko 和本地 Orchestrator"],
-    ["en-XA", false, "［Öpën Jõkõ··］", "［Qüït Jõkõ··］"],
-    ["en-XA", true, "［Öpën Jõkõ··］", "［Qüït Jõkõ ànd lõcàl Örchëstràtõr··］"]
-  ] as const)("localizes %s tray labels with managed runtime=%s", (locale, managesLocalOrchestrator, open, quit) => {
+  it.each(TRAY_MENU_CASES)("localizes %s tray labels with managed runtime=%s", (locale, managesLocalOrchestrator, open, quit) => {
     expect(resolveDesktopTrayMenuLabels(locale, managesLocalOrchestrator)).toEqual({ open, quit });
   });
 

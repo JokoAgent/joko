@@ -1,8 +1,10 @@
 import { Check, Clipboard, FileText, ListChecks, Maximize2, X } from "lucide-react";
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type JSX } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type JSX } from "react";
 import { createPortal } from "react-dom";
+import { writeClipboardText } from "../clipboard-action.js";
+import { useClipboardAction } from "./use-clipboard-action.js";
 import { toolPayloadDiffFiles, type ToolPayloadSection } from "./tool-payload.js";
-import { IconButton, SelectControl } from "./ui.js";
+import { IconButton, SelectControl, modalOwnsKeyboardEvent, selectControlOwnsEscape } from "./ui.js";
 import "./tool-payload-lightbox.css";
 
 const FOCUSABLE = "button:not([disabled]), select:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex='-1'])";
@@ -10,6 +12,7 @@ const FOCUSABLE = "button:not([disabled]), select:not([disabled]), textarea:not(
 export interface ToolPayloadLightboxLabels {
   readonly close: string;
   readonly copy: string;
+  readonly copyTitle: string;
   readonly copied: string;
   readonly copyFailed: string;
   readonly selectAll: string;
@@ -28,7 +31,8 @@ export function ToolPayloadOpenButton({ label, onClick }: {
   ><Maximize2 aria-hidden="true" /></IconButton>;
 }
 
-export function ToolPayloadLightbox({ title, sections, initialSectionId, labels, returnFocus, onClose }: {
+export function ToolPayloadLightbox({ ownerKey, title, sections, initialSectionId, labels, returnFocus, onClose }: {
+  readonly ownerKey: string;
   readonly title: string;
   readonly sections: readonly ToolPayloadSection[];
   readonly initialSectionId: ToolPayloadSection["id"];
@@ -39,32 +43,60 @@ export function ToolPayloadLightbox({ title, sections, initialSectionId, labels,
   const titleId = useId();
   const dialogRef = useRef<HTMLDivElement>(null);
   const textRef = useRef<HTMLTextAreaElement>(null);
+  const ownerDocument = returnFocus?.ownerDocument ?? document;
+  const ownerWindow = ownerDocument.defaultView;
   const closingRef = useRef(false);
-  const closeTimerRef = useRef<number | undefined>(undefined);
-  const feedbackTimerRef = useRef<number | undefined>(undefined);
-  const onCloseRef = useRef(onClose);
-  onCloseRef.current = onClose;
+  const closeTimerRef = useRef<{ readonly ownerWindow: Window; readonly timer: number } | undefined>(undefined);
+  const closeTargetRef = useRef({ onClose, returnFocus });
+  closeTargetRef.current = { onClose, returnFocus };
+  const scopeRef = useRef<object | undefined>(undefined);
   const [visible, setVisible] = useState(false);
   const [sectionId, setSectionId] = useState(initialSectionId);
   const [fileId, setFileId] = useState("");
-  const [feedback, setFeedback] = useState<"copied" | "failed">();
 
   const activeSection = sections.find((section) => section.id === sectionId) ?? sections[0];
   const files = useMemo(() => toolPayloadDiffFiles(activeSection?.text ?? ""), [activeSection?.text]);
   const activeFile = files.find((file) => file.id === fileId);
   const displayedText = activeFile?.text ?? activeSection?.text ?? "";
+  const sourceKey = JSON.stringify([title, sections.map((section) => [section.id, section.text])]);
+  const copy = useClipboardAction({ ownerKey, sourceKey: JSON.stringify([title, activeSection?.id, fileId, displayedText]), ownerDocument, connectionOwner: returnFocus });
+  const cancelClose = useCallback((): void => {
+    const pending = closeTimerRef.current;
+    closeTimerRef.current = undefined;
+    if (pending !== undefined) pending.ownerWindow.clearTimeout(pending.timer);
+  }, []);
 
   const close = useCallback((): void => {
-    if (closingRef.current) return;
+    const scope = scopeRef.current;
+    if (scope === undefined || closingRef.current || ownerWindow === null) return;
     closingRef.current = true;
+    copy.cancel();
     setVisible(false);
-    closeTimerRef.current = window.setTimeout(() => onCloseRef.current(), 200);
-  }, []);
+    const target = closeTargetRef.current;
+    closeTimerRef.current = { ownerWindow, timer: ownerWindow.setTimeout(() => {
+      if (scopeRef.current !== scope) return;
+      closeTimerRef.current = undefined;
+      if (target.returnFocus?.isConnected === true) target.returnFocus.focus({ preventScroll: true });
+      target.onClose();
+    }, 200) };
+  }, [ownerWindow, copy.cancel]);
 
-  useEffect(() => {
-    const frame = window.requestAnimationFrame(() => setVisible(true));
-    return () => window.cancelAnimationFrame(frame);
-  }, []);
+  useLayoutEffect(() => {
+    const scope = {};
+    scopeRef.current = scope;
+    closingRef.current = false;
+    const frame = ownerWindow?.requestAnimationFrame(() => { if (scopeRef.current === scope) setVisible(true); });
+    const onPageHide = (): void => { cancelClose(); closingRef.current = false; setVisible(true); };
+    ownerWindow?.addEventListener("pagehide", onPageHide);
+    return () => {
+      if (scopeRef.current === scope) scopeRef.current = undefined;
+      if (frame !== undefined) ownerWindow?.cancelAnimationFrame(frame);
+      ownerWindow?.removeEventListener("pagehide", onPageHide);
+      cancelClose();
+    };
+  }, [ownerKey, sourceKey, ownerWindow, returnFocus, cancelClose]);
+
+  useLayoutEffect(() => { setSectionId(initialSectionId); setFileId(""); }, [ownerKey, initialSectionId]);
 
   useEffect(() => {
     setFileId("");
@@ -73,14 +105,14 @@ export function ToolPayloadLightbox({ title, sections, initialSectionId, labels,
   useEffect(() => {
     textRef.current?.focus({ preventScroll: true });
     textRef.current?.setSelectionRange(0, 0);
-  }, [fileId, sectionId]);
+  }, [fileId, sectionId, ownerDocument, ownerKey]);
 
   useEffect(() => {
-    const body = document.body;
+    const body = ownerDocument.body;
     const ownsModalLock = !body.classList.contains("modal-open");
     body.classList.add("tool-payload-lightbox-open", "modal-open");
     const onKeyDown = (event: KeyboardEvent): void => {
-      if (event.isComposing) return;
+      if (event.isComposing || event.defaultPrevented || dialogRef.current === null || !modalOwnsKeyboardEvent(event, dialogRef.current) || selectControlOwnsEscape(event, ownerDocument)) return;
       if (event.key === "Escape") {
         event.preventDefault();
         event.stopImmediatePropagation();
@@ -102,16 +134,13 @@ export function ToolPayloadLightbox({ title, sections, initialSectionId, labels,
         (event.shiftKey ? focusable.at(-1) : focusable[0])?.focus({ preventScroll: true });
       }
     };
-    document.addEventListener("keydown", onKeyDown, true);
+    ownerDocument.addEventListener("keydown", onKeyDown, true);
     return () => {
-      document.removeEventListener("keydown", onKeyDown, true);
+      ownerDocument.removeEventListener("keydown", onKeyDown, true);
       body.classList.remove("tool-payload-lightbox-open");
-      if (ownsModalLock && document.querySelector(".image-lightbox, .workspace-image-lightbox, .text-attachment-lightbox") === null) body.classList.remove("modal-open");
-      if (closeTimerRef.current !== undefined) window.clearTimeout(closeTimerRef.current);
-      if (feedbackTimerRef.current !== undefined) window.clearTimeout(feedbackTimerRef.current);
-      if (returnFocus?.isConnected === true) returnFocus.focus({ preventScroll: true });
+      if (ownsModalLock && ownerDocument.querySelector(".image-lightbox, .workspace-image-lightbox, .text-attachment-lightbox, .tool-payload-lightbox") === null) body.classList.remove("modal-open");
     };
-  }, [close, returnFocus]);
+  }, [close, ownerDocument]);
 
   const selectAll = (): void => {
     const text = textRef.current;
@@ -120,22 +149,18 @@ export function ToolPayloadLightbox({ title, sections, initialSectionId, labels,
     text.select();
   };
 
-  const copy = (): void => {
-    void navigator.clipboard.writeText(displayedText).then(() => {
-      setFeedback("copied");
-      if (feedbackTimerRef.current !== undefined) window.clearTimeout(feedbackTimerRef.current);
-      feedbackTimerRef.current = window.setTimeout(() => setFeedback(undefined), 1_600);
-    }, () => setFeedback("failed"));
+  const copyText = (value: string, initiatingDocument: Document): void => {
+    if (!closingRef.current) copy.run(initiatingDocument, (context) => writeClipboardText(value, context));
   };
 
   return createPortal(<div className={`tool-payload-lightbox${visible ? " is-visible" : ""}`} role="presentation">
     <button className="tool-payload-lightbox__backdrop" type="button" aria-label={labels.close} onClick={close} />
     <div ref={dialogRef} className="tool-payload-lightbox__card" role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1}>
       <header className="tool-payload-lightbox__header">
-        <div className="tool-payload-lightbox__title"><FileText aria-hidden="true" /><span><strong id={titleId}>{title}</strong><small>{activeSection?.label}</small></span></div>
+        <button type="button" className="tool-payload-lightbox__title" aria-label={labels.copyTitle} title={title} aria-disabled={copy.pending} aria-busy={copy.pending} onClick={(event) => copyText(title, event.currentTarget.ownerDocument)}><FileText aria-hidden="true" /><span><strong id={titleId}>{title}</strong><small>{activeSection?.label}</small></span></button>
         <div className="tool-payload-lightbox__actions">
           <IconButton label={labels.selectAll} onClick={selectAll}><ListChecks aria-hidden="true" /></IconButton>
-          <IconButton label={labels.copy} onClick={copy}>{feedback === "copied" ? <Check aria-hidden="true" /> : <Clipboard aria-hidden="true" />}</IconButton>
+          <IconButton label={labels.copy} aria-disabled={copy.pending} aria-busy={copy.pending} onClick={(event) => copyText(displayedText, event.currentTarget.ownerDocument)}>{copy.state === "copied" ? <Check aria-hidden="true" /> : <Clipboard aria-hidden="true" />}</IconButton>
           <IconButton label={labels.close} onClick={close}><X aria-hidden="true" /></IconButton>
         </div>
       </header>
@@ -152,7 +177,7 @@ export function ToolPayloadLightbox({ title, sections, initialSectionId, labels,
       <main className="tool-payload-lightbox__body">
         <textarea ref={textRef} value={displayedText} readOnly spellCheck={false} wrap="off" aria-label={`${title} · ${activeSection?.label ?? ""}`} />
       </main>
-      {feedback !== undefined && <div className="tool-payload-lightbox__feedback" role={feedback === "failed" ? "alert" : "status"}><Check aria-hidden="true" />{feedback === "failed" ? labels.copyFailed : labels.copied}</div>}
+      {(copy.state === "copied" || copy.state === "failed") && <div className="tool-payload-lightbox__feedback" role={copy.state === "failed" ? "alert" : "status"}><Check aria-hidden="true" />{copy.state === "failed" ? labels.copyFailed : labels.copied}</div>}
     </div>
-  </div>, document.body);
+  </div>, ownerDocument.body);
 }

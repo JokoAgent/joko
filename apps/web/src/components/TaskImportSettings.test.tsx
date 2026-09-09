@@ -178,7 +178,7 @@ describe("TaskImportSettings", () => {
       })
     ]));
     const createTarget = vi.fn(async (draft: Parameters<AppController["createTarget"]>[0]) => `target:${draft.serverPath}`);
-    const createSession = vi.fn(async (draft: Parameters<AppController["createSession"]>[0]) => `session:${draft.name}`);
+    const createSession = vi.fn(async (draft: Parameters<AppController["createSession"]>[0]) => ({ sessionId: `session:${draft.name}`, generation: 1n }));
     const moveSessionProject = vi.fn<AppController["moveSessionProject"]>(async () => undefined);
     const archiveTarget = vi.fn<AppController["archiveTarget"]>(async () => undefined);
     const archiveSession = vi.fn<AppController["archiveSession"]>(async () => undefined);
@@ -309,7 +309,7 @@ function controller(options: {
     scanNativeSessionCatalog: vi.fn(options.scanNativeSessionCatalog),
     createTarget: vi.fn(options.createTarget ?? (async () => "target-created")),
     refresh: vi.fn(options.refresh ?? (async () => undefined)),
-    createSession: vi.fn(options.createSession ?? (async () => "session-created")),
+    createSession: vi.fn(options.createSession ?? (async () => ({ sessionId: "session-created", generation: 1n }))),
     moveSessionProject: vi.fn(options.moveSessionProject ?? (async () => undefined)),
     archiveTarget: vi.fn(options.archiveTarget ?? (async () => undefined)),
     archiveSession: vi.fn(options.archiveSession ?? (async () => undefined))

@@ -183,6 +183,8 @@ export function createDesktopGlobalVoiceSession(
   const locale = voiceInputLocale(preferences);
   return new VoiceInputMediaSession({
     api: controller,
+    ownerWindow: window,
+    subscribeMicrophoneRelease: window.jokoDesktop?.microphone?.onRelease,
     preferences: {
       ...(locale === undefined ? {} : { locale }),
       ...(preferences.deviceId === undefined ? {} : { deviceId: preferences.deviceId }),

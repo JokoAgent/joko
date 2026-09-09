@@ -7,12 +7,14 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
 import { translate } from "../i18n.js";
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
-import { emptySnapshot, type BackendView, type BrowserView, type SessionView } from "../model.js";
+import { readTerminalShellPreference, writeTerminalShellPreference } from "../terminal-preferences.js";
+import { emptySnapshot, type BackendView, type BrowserView, type SessionView, type TerminalCapabilitiesView } from "../model.js";
 import { Inspector } from "./Inspector.js";
 import type { Translator } from "./types.js";
 
 const roots: Root[] = [];
 const t: Translator = (key, values) => translate("en", key, values);
+vi.mock("./InteractiveTerminalPanel.js", () => ({ InteractiveTerminalPanel: ({ terminalId }: { terminalId: string }) => <textarea aria-label={terminalId} className="xterm-helper-textarea" /> }));
 
 beforeAll(() => {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -26,6 +28,113 @@ afterEach(async () => {
 });
 
 describe("Inspector menus", () => {
+  it("observes existing terminals while creation is unavailable and selects the session's automatic shell without changing the saved preference", async () => {
+    const colors = vi.spyOn(window, "getComputedStyle").mockReturnValue({ getPropertyValue: () => "#123456" } as unknown as CSSStyleDeclaration);
+    writeTerminalShellPreference("powershell-local");
+    let capability: TerminalCapabilitiesView = { support: "platformLimited", reason: "Remote host is disconnected.", shells: [], defaultShellId: "",
+      maximumTerminals: 16, maximumInputBytes: 65_536, maximumColumns: 500, maximumRows: 200 };
+    const record = (id: string) => ({ id, sessionId: "session-one", targetId: "target-one", generation: 1n, status: "running", exitConfirmed: false,
+      shellId: "/bin/bash", shellLabel: "Bash", cwd: "/workspace", columns: 80, rows: 24, createdAt: 1, updatedAt: 1 });
+    const records = [record("existing-terminal")];
+    const listTerminals = vi.fn(async () => [...records]);
+    const createTerminal = vi.fn(async () => { const value = record("new-terminal"); records.push(value); return value; });
+    const api = { state: { connectionState: "connected", preferences: DEFAULT_UI_PREFERENCES },
+      getTerminalCapabilities: vi.fn(async () => capability), listTerminals, createTerminal, setInspectorOpen: vi.fn(async () => undefined), releaseArtifactUrl: vi.fn()
+    } as unknown as AppController;
+    const host = document.body.appendChild(document.createElement("div"));
+    const root = createRoot(host); roots.push(root);
+    const render = async (connected = true) => act(async () => root.render(<Inspector controller={{ ...api, state: { ...api.state, connectionState: connected ? "connected" : "reconnecting" } }}
+      snapshot={emptySnapshot()} session={session()} timeline={[]} open t={t} runAction={() => undefined} onClose={vi.fn()} onSelectionQuote={vi.fn()} />));
+    const openMenu = async () => act(async () => host.querySelector<HTMLButtonElement>(`button[aria-label="${t("inspector.addTab")}"]`)!.click());
+    const createButton = () => [...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find((button) => button.textContent === t("terminal.new"))!;
+    await render();
+    expect(listTerminals).toHaveBeenCalledOnce();
+    const screen = host.querySelector('textarea[aria-label="existing-terminal"]');
+    expect(screen).not.toBeNull();
+    expect(host.textContent).toContain("Remote host is disconnected.");
+    await openMenu();
+    expect(createButton().disabled).toBe(true);
+    await act(async () => createButton().click());
+    expect(createTerminal).not.toHaveBeenCalled();
+    await openMenu();
+    capability = { ...capability, support: "supported", reason: undefined, shells: [{ id: "/bin/bash", label: "Bash" }], defaultShellId: "/bin/bash" };
+    await act(async () => [...host.querySelectorAll("button")].find((button) => button.textContent === t("common.retry"))!.click());
+    expect(host.querySelector('textarea[aria-label="existing-terminal"]')).toBe(screen);
+    expect(host.textContent).not.toContain("Remote host is disconnected.");
+    await openMenu();
+    await act(async () => createButton().click());
+    expect(createTerminal).toHaveBeenCalledExactlyOnceWith("session-one", expect.any(String), "auto", 80, 24, expect.anything());
+    expect(readTerminalShellPreference()).toBe("powershell-local");
+    capability = { ...capability, support: "platformLimited", reason: "Remote host is disconnected.", shells: [] };
+    await render(false); await render(true);
+    expect(listTerminals).toHaveBeenCalledTimes(3);
+    expect(host.querySelectorAll('[data-tab-kind="terminal"]')).toHaveLength(2);
+    expect(host.querySelector('textarea[aria-label="existing-terminal"]')).toBe(screen);
+    await act(async () => window.dispatchEvent(new KeyboardEvent("keydown", { code: "Backquote", key: "`", ctrlKey: true, bubbles: true, cancelable: true })));
+    expect(host.querySelector('[data-tab-kind="terminal"]:not([hidden])')?.id).toBe("inspector-panel-existing-terminal");
+    expect(createTerminal).toHaveBeenCalledOnce();
+    colors.mockRestore();
+  });
+
+  it("creates independent terminals, focuses an existing terminal by shortcut, and kills only an explicitly closed tab", async () => {
+    writeTerminalShellPreference("shell");
+    let color = "#123456";
+    const colors = vi.spyOn(window, "getComputedStyle").mockReturnValue({ getPropertyValue: () => color } as unknown as CSSStyleDeclaration);
+    const host = document.body.appendChild(document.createElement("div"));
+    const root = createRoot(host);
+    roots.push(root);
+    const record = (id: string) => ({ id, sessionId: "session-one", targetId: "target-one", generation: 1n, status: "running", exitConfirmed: false, shellId: "shell", shellLabel: "Shell", cwd: "/workspace", columns: 80, rows: 24, createdAt: 1, updatedAt: 1 });
+    const createTerminal = vi.fn().mockRejectedValueOnce(new Error("spawn unavailable")).mockResolvedValueOnce(record("pty-one")).mockResolvedValueOnce(record("pty-two"));
+    const closeTerminal = vi.fn().mockRejectedValueOnce(new Error("close unavailable")).mockResolvedValue(undefined);
+    const controller = {
+      state: { connectionState: "connected", preferences: DEFAULT_UI_PREFERENCES },
+      getTerminalCapabilities: vi.fn(async () => ({ support: "supported", shells: [{ id: "shell", label: "Shell" }], defaultShellId: "shell", maximumTerminals: 16, maximumInputBytes: 65536, maximumColumns: 500, maximumRows: 200 })),
+      listTerminals: vi.fn(async () => []), createTerminal, closeTerminal, setInspectorOpen: vi.fn(async () => undefined), releaseArtifactUrl: vi.fn()
+    } as unknown as AppController;
+    const render = async (open: boolean) => act(async () => root.render(<Inspector controller={{ ...controller }} snapshot={{ ...emptySnapshot(), backends: [backend(false)] }} session={session()} timeline={[]} open={open} t={t} runAction={(_key, action) => { void action(); }} onClose={vi.fn()} onSelectionQuote={vi.fn()} />));
+    const shortcut = async () => act(async () => window.dispatchEvent(new KeyboardEvent("keydown", { code: "Backquote", key: "`", ctrlKey: true, bubbles: true, cancelable: true })));
+    await render(true);
+    await shortcut();
+    expect(host.textContent).toContain("spawn unavailable");
+    color = "#654321";
+    writeTerminalShellPreference("auto");
+    await act(async () => [...host.querySelectorAll("button")].find((button) => button.textContent === t("common.retry"))!.click());
+    await settle();
+    expect(createTerminal.mock.calls[0]?.[1]).toBe(createTerminal.mock.calls[1]?.[1]);
+    expect(createTerminal.mock.calls[0]?.[2]).toBe("shell");
+    expect(createTerminal.mock.calls[1]?.[2]).toBe("shell");
+    expect(createTerminal.mock.calls[0]?.[5]).toBe(createTerminal.mock.calls[1]?.[5]);
+    expect(createTerminal.mock.calls[1]?.[5].foregroundRgb).toBe(0x123456);
+    expect(host.querySelectorAll('[data-tab-kind="terminal"]')).toHaveLength(1);
+    await shortcut();
+    expect(createTerminal).toHaveBeenCalledTimes(2);
+    await act(async () => host.querySelector<HTMLButtonElement>(`button[aria-label="${t("inspector.addTab")}"]`)!.click());
+    await act(async () => [...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find((button) => button.textContent === t("terminal.new"))!.click());
+    await settle();
+    expect(host.querySelectorAll('[data-tab-kind="terminal"]')).toHaveLength(2);
+    expect(createTerminal.mock.calls[2]?.[2]).toBe("auto");
+    await render(false);
+    expect(closeTerminal).not.toHaveBeenCalled();
+    await render(true);
+    await shortcut();
+    await act(async () => new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve())));
+    expect(host.querySelector('[data-tab-kind="terminal"]:not([hidden])')?.id).toBe("inspector-panel-pty-one");
+    expect(document.activeElement?.getAttribute("aria-label")).toBe("pty-one");
+    expect(createTerminal).toHaveBeenCalledTimes(3);
+    expect(controller.getTerminalCapabilities).toHaveBeenCalledTimes(1);
+    const close = () => host.querySelector<HTMLButtonElement>(`button[aria-label="${t("terminal.close")}"]`)!;
+    await act(async () => close().click());
+    expect(host.querySelectorAll('[data-tab-kind="terminal"]')).toHaveLength(2);
+    expect(host.textContent).toContain("close unavailable");
+    await act(async () => close().click());
+    expect(closeTerminal).toHaveBeenLastCalledWith("session-one", "pty-one", 1n);
+    expect(host.querySelectorAll('[data-tab-kind="terminal"]')).toHaveLength(1);
+    await act(async () => root.unmount());
+    roots.splice(roots.indexOf(root), 1);
+    expect(closeTerminal).toHaveBeenCalledTimes(2);
+    colors.mockRestore();
+  });
+
   it("focuses menu items, supports arrow navigation, and restores focus on Escape", async () => {
     const host = document.body.appendChild(document.createElement("div"));
     const root = createRoot(host);

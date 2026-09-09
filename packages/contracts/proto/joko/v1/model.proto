@@ -37,6 +37,28 @@ enum AuthenticationState {
   AUTHENTICATION_STATE_ERROR = 7;
 }
 
+enum ProviderConfigurationField {
+  PROVIDER_CONFIGURATION_FIELD_UNSPECIFIED = 0;
+  PROVIDER_CONFIGURATION_FIELD_REQUEST_PATH = 1;
+  PROVIDER_CONFIGURATION_FIELD_MODELS_ENDPOINT = 2;
+  PROVIDER_CONFIGURATION_FIELD_HEADERS = 3;
+  PROVIDER_CONFIGURATION_FIELD_KEYLESS = 4;
+  PROVIDER_CONFIGURATION_FIELD_AUTH_HEADER = 5;
+  PROVIDER_CONFIGURATION_FIELD_MODEL_LIMITS = 6;
+  PROVIDER_CONFIGURATION_FIELD_MODEL_COSTS = 7;
+  PROVIDER_CONFIGURATION_FIELD_MODEL_INPUT_MODALITIES = 8;
+  PROVIDER_CONFIGURATION_FIELD_MODEL_THINKING_LEVELS = 9;
+  PROVIDER_CONFIGURATION_FIELD_MODEL_SAMPLING = 10;
+  PROVIDER_CONFIGURATION_FIELD_MODEL_COMPATIBILITY = 11;
+  PROVIDER_CONFIGURATION_FIELD_MODEL_FAST_MODE = 12;
+}
+
+message ProviderRuntimeSupport {
+  repeated ProviderApiCompatibility protocols = 1;
+  // Provider identity, endpoint and model identity are always required.
+  repeated ProviderConfigurationField fields = 2;
+}
+
 enum ProviderLoginMethod {
   PROVIDER_LOGIN_METHOD_UNSPECIFIED = 0;
   PROVIDER_LOGIN_METHOD_OAUTH_BROWSER = 1;
@@ -292,4 +314,24 @@ message UsageHistory {
   google.protobuf.Timestamp generated_at = 9;
   google.protobuf.Timestamp measured_at = 10;
   bool estimated = 11;
+}
+
+enum UsageReportGroup {
+  USAGE_REPORT_GROUP_UNSPECIFIED = 0;
+  USAGE_REPORT_GROUP_TASK = 1;
+  USAGE_REPORT_GROUP_MODEL = 2;
+  USAGE_REPORT_GROUP_PROVIDER = 3;
+  USAGE_REPORT_GROUP_BACKEND = 4;
+}
+
+message UsageReportEntry {
+  string key = 1;
+  string session_id = 2;
+  string backend_id = 3;
+  string provider_id = 4;
+  string model_id = 5;
+  string title = 6;
+  bool reference_available = 7;
+  UsageHistorySummary summary = 8;
+  google.protobuf.Timestamp measured_at = 9;
 }

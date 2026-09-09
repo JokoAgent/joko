@@ -20,6 +20,7 @@ import {
   subscribeGlobalVoiceShortcutRegistration
 } from "../global-voice-shortcut-store.js";
 import type {
+  ModelRouteRefView,
   VoiceInputCapabilityView,
   VoiceInputConnectionTestFailureView,
   VoiceInputTranscriptionProtocolView
@@ -53,7 +54,7 @@ import {
   addManualVoiceDictionaryTerm,
   deleteVoiceDictionaryEntry,
   mergeManualVoiceDictionaryTerms,
-  renameVoiceDictionaryEntry,
+  editVoiceDictionaryEntry,
   voiceDictionaryTermKey,
   type VoiceInputDictionaryState
 } from "../voice-input-dictionary.js";
@@ -70,8 +71,12 @@ type MicrophonePermissionState = "granted" | "denied" | "prompt" | "unknown";
 const VOICE_INPUT_PROTOCOLS = [
   "openAiCompatibleBatch",
   "openAiCompatibleRealtime",
-  "qwenCompatibleRealtime"
+  "qwenCompatibleRealtime",
+  "elevenLabsScribeRealtime",
+  "volcengineSauc"
 ] as const satisfies readonly VoiceInputTranscriptionProtocolView[];
+
+const SAUC_RESOURCES = ["volc.seedasr.sauc.duration", "volc.seedasr.sauc.concurrent", "volc.bigasr.sauc.duration", "volc.bigasr.sauc.concurrent"] as const;
 
 export function VoiceInputSettings({ controller, t }: {
   readonly controller: AppController;
@@ -87,6 +92,7 @@ export function VoiceInputSettings({ controller, t }: {
   const [serviceProtocol, setServiceProtocol] = useState(service.protocol);
   const [serviceEndpoint, setServiceEndpoint] = useState(service.endpoint);
   const [serviceModel, setServiceModel] = useState(service.model);
+  const [serviceResourceId, setServiceResourceId] = useState(service.resourceId);
   const [serviceKeyless, setServiceKeyless] = useState(service.keyless);
   const [serviceSecret, setServiceSecret] = useState("");
   const [clearServiceCredential, setClearServiceCredential] = useState(false);
@@ -94,25 +100,32 @@ export function VoiceInputSettings({ controller, t }: {
   const [fallbackProtocol, setFallbackProtocol] = useState(service.fallbackProtocol);
   const [fallbackEndpoint, setFallbackEndpoint] = useState(service.fallbackEndpoint);
   const [fallbackModel, setFallbackModel] = useState(service.fallbackModel);
+  const [fallbackResourceId, setFallbackResourceId] = useState(service.fallbackResourceId);
   const [fallbackKeyless, setFallbackKeyless] = useState(service.fallbackKeyless);
   const [fallbackSecret, setFallbackSecret] = useState("");
   const [clearFallbackCredential, setClearFallbackCredential] = useState(false);
   const [refinementEnabled, setRefinementEnabled] = useState(service.refinementEnabled);
-  const [refinerProviderId, setRefinerProviderId] = useState(service.refinerProviderId);
-  const [refinerModelId, setRefinerModelId] = useState(service.refinerModelId);
-  const [refinerFallbackProviderId, setRefinerFallbackProviderId] = useState(service.refinerFallbackProviderId);
-  const [refinerFallbackModelId, setRefinerFallbackModelId] = useState(service.refinerFallbackModelId);
+  const [refinerModel, setRefinerModel] = useState(service.refinerModel);
+  const [refinerFallbackModel, setRefinerFallbackModel] = useState(service.refinerFallbackModel);
   const [savingService, setSavingService] = useState(false);
   const [serviceSaveError, setServiceSaveError] = useState<string>();
   const [serviceSaved, setServiceSaved] = useState(false);
   const [connectionTest, setConnectionTest] = useState<"idle" | "testing" | "success" | VoiceInputConnectionTestFailureView>("idle");
   const connectionTestRequestRef = useRef(0);
+  const invalidateConnectionTest = useCallback((): void => {
+    connectionTestRequestRef.current += 1;
+    setConnectionTest("idle");
+  }, []);
   const [dictionaryDraft, setDictionaryDraft] = useState("");
   const [dictionarySearch, setDictionarySearch] = useState("");
   const [dictionaryFilter, setDictionaryFilter] = useState<"all" | "manual" | "automatic">("all");
   const [editingDictionaryEntryId, setEditingDictionaryEntryId] = useState<string>();
   const [editingDictionaryDraft, setEditingDictionaryDraft] = useState("");
+  const [editingDictionaryAliasesDraft, setEditingDictionaryAliasesDraft] = useState("");
   const [dictionaryMessage, setDictionaryMessage] = useState<{ readonly error: boolean; readonly text: string }>();
+  const dictionaryListRef = useRef<HTMLDivElement>(null);
+  const dictionarySearchRef = useRef<HTMLInputElement>(null);
+  const dictionaryFocusRef = useRef<string | undefined>(undefined);
   const [usage, setUsage] = useState(readVoiceInputUsage);
   const [historyExpanded, setHistoryExpanded] = useState(false);
   const [historyMessage, setHistoryMessage] = useState<string>();
@@ -133,6 +146,14 @@ export function VoiceInputSettings({ controller, t }: {
   useEffect(() => subscribeVoiceInputPreferences(setPreferences), []);
   useEffect(() => subscribeVoiceInputUsage(setUsage), []);
   useEffect(() => () => { connectionTestRequestRef.current += 1; }, []);
+  useEffect(() => {
+    const id = dictionaryFocusRef.current;
+    if (id === undefined) return;
+    dictionaryFocusRef.current = undefined;
+    const entry = [...(dictionaryListRef.current?.querySelectorAll<HTMLElement>("article") ?? [])]
+      .find((item) => item.dataset["dictionaryEntryId"] === id);
+    (entry?.querySelector<HTMLButtonElement>("[data-dictionary-edit]") ?? dictionarySearchRef.current)?.focus();
+  }, [preferences.dictionary, editingDictionaryEntryId]);
 
   const saveShortcutPreference = useCallback((shortcut: VoiceInputShortcutCombo | "disabled"): void => {
     setShortcutError(undefined);
@@ -325,6 +346,7 @@ export function VoiceInputSettings({ controller, t }: {
     setServiceProtocol(service.protocol);
     setServiceEndpoint(service.endpoint);
     setServiceModel(service.model);
+    setServiceResourceId(service.resourceId);
     setServiceKeyless(service.keyless);
     setServiceSecret("");
     setClearServiceCredential(false);
@@ -332,17 +354,16 @@ export function VoiceInputSettings({ controller, t }: {
     setFallbackProtocol(service.fallbackProtocol);
     setFallbackEndpoint(service.fallbackEndpoint);
     setFallbackModel(service.fallbackModel);
+    setFallbackResourceId(service.fallbackResourceId);
     setFallbackKeyless(service.fallbackKeyless);
     setFallbackSecret("");
     setClearFallbackCredential(false);
     setRefinementEnabled(service.refinementEnabled);
-    setRefinerProviderId(service.refinerProviderId);
-    setRefinerModelId(service.refinerModelId);
-    setRefinerFallbackProviderId(service.refinerFallbackProviderId);
-    setRefinerFallbackModelId(service.refinerFallbackModelId);
+    setRefinerModel(service.refinerModel);
+    setRefinerFallbackModel(service.refinerFallbackModel);
     setServiceSaveError(undefined);
-    setConnectionTest("idle");
-  }, [service.enabled, service.endpoint, service.fallbackEnabled, service.fallbackEndpoint, service.fallbackKeyless, service.fallbackModel, service.fallbackProtocol, service.keyless, service.model, service.protocol, service.refinementEnabled, service.refinerFallbackModelId, service.refinerFallbackProviderId, service.refinerModelId, service.refinerProviderId, service.revision]);
+    invalidateConnectionTest();
+  }, [controller, invalidateConnectionTest, service.enabled, service.endpoint, service.fallbackEnabled, service.fallbackEndpoint, service.fallbackKeyless, service.fallbackModel, service.fallbackResourceId, service.fallbackProtocol, service.keyless, service.model, service.resourceId, service.protocol, service.refinementEnabled, service.refinerFallbackModel, service.refinerModel, service.revision]);
 
   useEffect(() => {
     const mediaDevices = typeof navigator === "undefined" ? undefined : navigator.mediaDevices;
@@ -400,25 +421,23 @@ export function VoiceInputSettings({ controller, t }: {
   const selectedDeviceExists = preferences.deviceId === undefined || devices.some((device) => device.deviceId === preferences.deviceId);
   const refinementModels = controller.state.snapshot.settings.providers
     .filter((provider) => provider.enabled)
-    .flatMap((provider) => provider.models
-      .filter((model) => supportsManagedTextInference(model.compatibility ?? provider.compatibility))
+    .flatMap((provider) => provider.runtimes.flatMap((runtime) => runtime.models
+      .filter((model) => supportsManagedTextInference(model.compatibility ?? runtime.compatibility))
       .map((model) => ({
-        key: refinementModelKey(provider.id, model.modelId),
+        key: refinementModelKey({ backendId: runtime.backendId, providerId: provider.id, modelId: model.modelId }),
+        backendId: runtime.backendId,
         providerId: provider.id,
         modelId: model.modelId,
-        label: `${provider.name} · ${model.name}`
-      })));
-  const selectedRefinementModel = refinerProviderId === "" || refinerModelId === ""
-    ? ""
-    : refinementModelKey(refinerProviderId, refinerModelId);
-  const selectedRefinementFallbackModel = refinerFallbackProviderId === "" || refinerFallbackModelId === ""
-    ? ""
-    : refinementModelKey(refinerFallbackProviderId, refinerFallbackModelId);
+        label: `${provider.name} · ${model.name} · ${controller.state.snapshot.backends.find((backend) => backend.id === runtime.backendId)?.name ?? runtime.backendId}`
+      }))));
+  const selectedRefinementModel = refinementModelKey(refinerModel);
+  const selectedRefinementFallbackModel = refinementModelKey(refinerFallbackModel);
   const refinementFallbackModels = refinementModels.filter((model) => model.key !== selectedRefinementModel);
   const serviceFormDirty = serviceEnabled !== service.enabled
     || serviceProtocol !== service.protocol
     || serviceEndpoint.trim() !== service.endpoint
     || serviceModel.trim() !== service.model
+    || serviceResourceId !== service.resourceId
     || serviceKeyless !== service.keyless
     || serviceSecret.trim() !== ""
     || clearServiceCredential
@@ -426,14 +445,13 @@ export function VoiceInputSettings({ controller, t }: {
     || fallbackProtocol !== service.fallbackProtocol
     || fallbackEndpoint.trim() !== service.fallbackEndpoint
     || fallbackModel.trim() !== service.fallbackModel
+    || fallbackResourceId !== service.fallbackResourceId
     || fallbackKeyless !== service.fallbackKeyless
     || fallbackSecret.trim() !== ""
     || clearFallbackCredential
     || refinementEnabled !== service.refinementEnabled
-    || refinerProviderId !== service.refinerProviderId
-    || refinerModelId !== service.refinerModelId
-    || refinerFallbackProviderId !== service.refinerFallbackProviderId
-    || refinerFallbackModelId !== service.refinerFallbackModelId;
+    || selectedRefinementModel !== refinementModelKey(service.refinerModel)
+    || selectedRefinementFallbackModel !== refinementModelKey(service.refinerFallbackModel);
   const dictionaryCounts = preferences.dictionary.entries.reduce((counts, entry) => ({
     all: counts.all + 1,
     manual: counts.manual + (entry.source === "manual" ? 1 : 0),
@@ -464,13 +482,17 @@ export function VoiceInputSettings({ controller, t }: {
     setDictionaryDraft("");
   };
 
-  const saveDictionaryRename = (entryId: string): void => {
-    const next = renameVoiceDictionaryEntry(preferences.dictionary, entryId, editingDictionaryDraft);
+  const saveDictionaryEdit = (entryId: string): void => {
+    const next = editVoiceDictionaryEntry(preferences.dictionary, entryId, editingDictionaryDraft, editingDictionaryAliasesDraft);
     if (next === undefined) {
-      setDictionaryMessage({ error: true, text: t("settings.voiceInputDictionaryInvalidOrDuplicate") });
+      setDictionaryMessage({ error: true, text: t("settings.voiceInputDictionaryEditInvalid") });
       return;
     }
-    persistDictionary(next, t("settings.voiceInputDictionaryRenamed"));
+    const deleted = editingDictionaryDraft.trim() === "";
+    dictionaryFocusRef.current = deleted ? entryId
+      : next.entries.find((entry) => voiceDictionaryTermKey(entry.text) === voiceDictionaryTermKey(editingDictionaryDraft))?.id;
+    persistDictionary(next, t(deleted ? "settings.voiceInputDictionaryDeleted"
+      : next.entries.length < preferences.dictionary.entries.length ? "settings.voiceInputDictionaryMerged" : "settings.voiceInputDictionaryUpdated"));
     setEditingDictionaryEntryId(undefined);
     setEditingDictionaryDraft("");
   };
@@ -504,10 +526,20 @@ export function VoiceInputSettings({ controller, t }: {
   };
 
   const saveService = async (): Promise<void> => {
+    invalidateConnectionTest();
     setServiceSaveError(undefined);
     setServiceSaved(false);
     const replacingCredential = serviceSecret.trim() !== "";
     const replacingFallbackCredential = fallbackSecret.trim() !== "";
+    if (
+      (service.credentialConfigured && !replacingCredential && !clearServiceCredential
+        && transcriptionAuthorityChanged(service.protocol, service.endpoint, serviceProtocol, serviceEndpoint))
+      || (service.fallbackCredentialConfigured && !replacingFallbackCredential && !clearFallbackCredential
+        && transcriptionAuthorityChanged(service.fallbackProtocol, service.fallbackEndpoint, fallbackProtocol, fallbackEndpoint))
+    ) {
+      setServiceSaveError(t("settings.voiceInputCredentialRouteChanged"));
+      return;
+    }
     if (serviceEnabled && !serviceKeyless && !replacingCredential && (!service.credentialConfigured || clearServiceCredential)) {
       setServiceSaveError(t("settings.voiceInputCredentialRequired"));
       return;
@@ -528,7 +560,7 @@ export function VoiceInputSettings({ controller, t }: {
       setServiceSaveError(t("settings.voiceInputCredentialReplaceOrClear"));
       return;
     }
-    if (refinementEnabled && (refinerProviderId === "" || refinerModelId === "")) {
+    if (refinementEnabled && refinerModel === undefined) {
       setServiceSaveError(t("settings.voiceInputRefinementModelRequired"));
       return;
     }
@@ -539,18 +571,18 @@ export function VoiceInputSettings({ controller, t }: {
         protocol: serviceProtocol,
         endpoint: serviceEndpoint,
         model: serviceModel,
+        resourceId: serviceResourceId,
         keyless: serviceKeyless,
         ...(replacingCredential ? { secret: serviceSecret } : {}),
         ...(clearServiceCredential ? { clearCredential: true } : {}),
         refinementEnabled,
-        refinerProviderId,
-        refinerModelId,
-        refinerFallbackProviderId,
-        refinerFallbackModelId,
+        refinerModel,
+        refinerFallbackModel,
         fallbackEnabled,
         fallbackProtocol,
         fallbackEndpoint,
         fallbackModel,
+        fallbackResourceId,
         fallbackKeyless,
         ...(replacingFallbackCredential ? { fallbackSecret } : {}),
         ...(clearFallbackCredential ? { clearFallbackCredential: true } : {}),
@@ -589,33 +621,41 @@ export function VoiceInputSettings({ controller, t }: {
     <section className="settings-card voice-input-settings voice-input-service-settings">
       <div className="setting-row">
         <div><strong>{t("settings.voiceInputServiceEnabled")}</strong><span>{t("settings.voiceInputServiceEnabledHint")}</span></div>
-        <SwitchControl checked={serviceEnabled} disabled={savingService} aria-label={t("settings.voiceInputServiceEnabled")} onChange={(event) => setServiceEnabled(event.target.checked)} />
+        <SwitchControl checked={serviceEnabled} disabled={savingService} aria-label={t("settings.voiceInputServiceEnabled")} onChange={(event) => { invalidateConnectionTest(); setServiceEnabled(event.target.checked); }} />
       </div>
       <div className="setting-row">
         <div><strong>{t("settings.voiceInputServiceProtocol")}</strong><span>{t("settings.voiceInputServiceProtocolHint")}</span></div>
         <SelectControl value={serviceProtocol} disabled={savingService} aria-label={t("settings.voiceInputServiceProtocol")} onChange={(event) => {
+          invalidateConnectionTest();
           const protocol = event.target.value as VoiceInputTranscriptionProtocolView;
           const route = defaultVoiceInputRoute(protocol);
           setServiceProtocol(protocol);
           setServiceEndpoint(route.endpoint);
           setServiceModel(route.model);
-          setConnectionTest("idle");
+          setServiceResourceId(route.resourceId);
+          setServiceKeyless(false);
+          setServiceSecret("");
         }}>
           {VOICE_INPUT_PROTOCOLS.map((protocol) => <option key={protocol} value={protocol}>{t(voiceInputProtocolLabel(protocol))}</option>)}
         </SelectControl>
       </div>
       <div className="setting-row">
         <div><strong>{t("settings.voiceInputServiceEndpoint")}</strong><span>{t("settings.voiceInputServiceEndpointHint")}</span></div>
-        <input type="url" value={serviceEndpoint} disabled={savingService} aria-label={t("settings.voiceInputServiceEndpoint")} spellCheck={false} onChange={(event) => setServiceEndpoint(event.target.value)} />
+        <input type="url" value={serviceEndpoint} disabled={savingService} aria-label={t("settings.voiceInputServiceEndpoint")} spellCheck={false} onChange={(event) => { invalidateConnectionTest(); setServiceEndpoint(event.target.value); }} />
       </div>
-      <div className="setting-row">
+      {serviceProtocol === "volcengineSauc" ? <div className="setting-row">
+        <div><strong>{t("settings.voiceInputServiceResourceId")}</strong><span>{t("settings.voiceInputSaucResourceHint")}</span></div>
+        <SelectControl value={serviceResourceId} disabled={savingService} aria-label={t("settings.voiceInputServiceResourceId")} onChange={(event) => { invalidateConnectionTest(); setServiceResourceId(event.target.value); }}>
+          {SAUC_RESOURCES.map((id) => <option key={id} value={id}>{id}</option>)}
+        </SelectControl>
+      </div> : <div className="setting-row">
         <div><strong>{t("settings.voiceInputServiceModel")}</strong><span>{t("settings.voiceInputServiceModelHint")}</span></div>
-        <input value={serviceModel} disabled={savingService} aria-label={t("settings.voiceInputServiceModel")} spellCheck={false} onChange={(event) => setServiceModel(event.target.value)} />
-      </div>
-      <div className="setting-row">
+        <input value={serviceModel} disabled={savingService} aria-label={t("settings.voiceInputServiceModel")} spellCheck={false} onChange={(event) => { invalidateConnectionTest(); setServiceModel(event.target.value); }} />
+      </div>}
+      {serviceProtocol !== "volcengineSauc" && <div className="setting-row">
         <div><strong>{t("settings.voiceInputServiceKeyless")}</strong><span>{t("settings.voiceInputServiceKeylessHint")}</span></div>
-        <SwitchControl checked={serviceKeyless} disabled={savingService} aria-label={t("settings.voiceInputServiceKeyless")} onChange={(event) => setServiceKeyless(event.target.checked)} />
-      </div>
+        <SwitchControl checked={serviceKeyless} disabled={savingService} aria-label={t("settings.voiceInputServiceKeyless")} onChange={(event) => { invalidateConnectionTest(); setServiceKeyless(event.target.checked); }} />
+      </div>}
       <div className="setting-row">
         <div><strong>{t("settings.voiceInputServiceApiKey")}</strong><span>{service.credentialConfigured ? t("settings.voiceInputCredentialStored") : t("settings.voiceInputCredentialNotStored")}</span></div>
         <input
@@ -626,47 +666,58 @@ export function VoiceInputSettings({ controller, t }: {
           aria-label={t("settings.voiceInputServiceApiKey")}
           placeholder={service.credentialConfigured ? t("settings.voiceInputCredentialUnchanged") : t("settings.voiceInputCredentialPlaceholder")}
           onChange={(event) => {
+            invalidateConnectionTest();
             setServiceSecret(event.target.value);
             if (event.target.value !== "") setClearServiceCredential(false);
           }}
         />
       </div>
       {service.credentialConfigured && <div className="setting-row">
-        <div><strong>{t("settings.voiceInputClearCredential")}</strong><span>{t("settings.voiceInputClearCredentialHint")}</span></div>
+        <div><strong>{t("settings.voiceInputClearCredential")}</strong><span>{t(serviceProtocol === "volcengineSauc" ? "settings.voiceInputClearRequiredCredentialHint" : "settings.voiceInputClearCredentialHint")}</span></div>
         <SwitchControl checked={clearServiceCredential} disabled={savingService} aria-label={t("settings.voiceInputClearCredential")} onChange={(event) => {
+          invalidateConnectionTest();
           setClearServiceCredential(event.target.checked);
           if (event.target.checked) setServiceSecret("");
         }} />
       </div>}
       <div className="setting-row">
         <div><strong>{t("settings.voiceInputFallbackEnabled")}</strong><span>{t("settings.voiceInputFallbackEnabledHint")}</span></div>
-        <SwitchControl checked={fallbackEnabled} disabled={savingService} aria-label={t("settings.voiceInputFallbackEnabled")} onChange={(event) => setFallbackEnabled(event.target.checked)} />
+        <SwitchControl checked={fallbackEnabled} disabled={savingService} aria-label={t("settings.voiceInputFallbackEnabled")} onChange={(event) => { invalidateConnectionTest(); setFallbackEnabled(event.target.checked); }} />
       </div>
       {fallbackEnabled && <>
         <div className="setting-row">
           <div><strong>{t("settings.voiceInputFallbackProtocol")}</strong><span>{t("settings.voiceInputFallbackProtocolHint")}</span></div>
           <SelectControl value={fallbackProtocol} disabled={savingService} aria-label={t("settings.voiceInputFallbackProtocol")} onChange={(event) => {
+            invalidateConnectionTest();
             const protocol = event.target.value as VoiceInputTranscriptionProtocolView;
             const route = defaultVoiceInputRoute(protocol);
             setFallbackProtocol(protocol);
             setFallbackEndpoint(route.endpoint);
             setFallbackModel(route.model);
+            setFallbackResourceId(route.resourceId);
+            setFallbackKeyless(false);
+            setFallbackSecret("");
           }}>
             {VOICE_INPUT_PROTOCOLS.map((protocol) => <option key={protocol} value={protocol}>{t(voiceInputProtocolLabel(protocol))}</option>)}
           </SelectControl>
         </div>
         <div className="setting-row">
           <div><strong>{t("settings.voiceInputFallbackEndpoint")}</strong><span>{t("settings.voiceInputFallbackEndpointHint")}</span></div>
-          <input type="url" value={fallbackEndpoint} disabled={savingService} aria-label={t("settings.voiceInputFallbackEndpoint")} spellCheck={false} onChange={(event) => setFallbackEndpoint(event.target.value)} />
+          <input type="url" value={fallbackEndpoint} disabled={savingService} aria-label={t("settings.voiceInputFallbackEndpoint")} spellCheck={false} onChange={(event) => { invalidateConnectionTest(); setFallbackEndpoint(event.target.value); }} />
         </div>
-        <div className="setting-row">
+        {fallbackProtocol === "volcengineSauc" ? <div className="setting-row">
+          <div><strong>{t("settings.voiceInputFallbackResourceId")}</strong><span>{t("settings.voiceInputSaucResourceHint")}</span></div>
+          <SelectControl value={fallbackResourceId} disabled={savingService} aria-label={t("settings.voiceInputFallbackResourceId")} onChange={(event) => { invalidateConnectionTest(); setFallbackResourceId(event.target.value); }}>
+            {SAUC_RESOURCES.map((id) => <option key={id} value={id}>{id}</option>)}
+          </SelectControl>
+        </div> : <div className="setting-row">
           <div><strong>{t("settings.voiceInputFallbackModel")}</strong><span>{t("settings.voiceInputServiceModelHint")}</span></div>
-          <input value={fallbackModel} disabled={savingService} aria-label={t("settings.voiceInputFallbackModel")} spellCheck={false} onChange={(event) => setFallbackModel(event.target.value)} />
-        </div>
-        <div className="setting-row">
+          <input value={fallbackModel} disabled={savingService} aria-label={t("settings.voiceInputFallbackModel")} spellCheck={false} onChange={(event) => { invalidateConnectionTest(); setFallbackModel(event.target.value); }} />
+        </div>}
+        {fallbackProtocol !== "volcengineSauc" && <div className="setting-row">
           <div><strong>{t("settings.voiceInputFallbackKeyless")}</strong><span>{t("settings.voiceInputServiceKeylessHint")}</span></div>
-          <SwitchControl checked={fallbackKeyless} disabled={savingService} aria-label={t("settings.voiceInputFallbackKeyless")} onChange={(event) => setFallbackKeyless(event.target.checked)} />
-        </div>
+          <SwitchControl checked={fallbackKeyless} disabled={savingService} aria-label={t("settings.voiceInputFallbackKeyless")} onChange={(event) => { invalidateConnectionTest(); setFallbackKeyless(event.target.checked); }} />
+        </div>}
         <div className="setting-row">
           <div><strong>{t("settings.voiceInputFallbackApiKey")}</strong><span>{service.fallbackCredentialConfigured ? t("settings.voiceInputCredentialStored") : t("settings.voiceInputCredentialNotStored")}</span></div>
           <input
@@ -677,14 +728,16 @@ export function VoiceInputSettings({ controller, t }: {
             aria-label={t("settings.voiceInputFallbackApiKey")}
             placeholder={service.fallbackCredentialConfigured ? t("settings.voiceInputCredentialUnchanged") : t("settings.voiceInputCredentialPlaceholder")}
             onChange={(event) => {
+              invalidateConnectionTest();
               setFallbackSecret(event.target.value);
               if (event.target.value !== "") setClearFallbackCredential(false);
             }}
           />
         </div>
         {service.fallbackCredentialConfigured && <div className="setting-row">
-          <div><strong>{t("settings.voiceInputClearFallbackCredential")}</strong><span>{t("settings.voiceInputClearCredentialHint")}</span></div>
+          <div><strong>{t("settings.voiceInputClearFallbackCredential")}</strong><span>{t(fallbackProtocol === "volcengineSauc" ? "settings.voiceInputClearRequiredCredentialHint" : "settings.voiceInputClearCredentialHint")}</span></div>
           <SwitchControl checked={clearFallbackCredential} disabled={savingService} aria-label={t("settings.voiceInputClearFallbackCredential")} onChange={(event) => {
+            invalidateConnectionTest();
             setClearFallbackCredential(event.target.checked);
             if (event.target.checked) setFallbackSecret("");
           }} />
@@ -692,7 +745,7 @@ export function VoiceInputSettings({ controller, t }: {
       </>}
       <div className="setting-row">
         <div><strong>{t("settings.voiceInputRefinementEnabled")}</strong><span>{t("settings.voiceInputRefinementEnabledHint")}</span></div>
-        <SwitchControl checked={refinementEnabled} disabled={savingService} aria-label={t("settings.voiceInputRefinementEnabled")} onChange={(event) => setRefinementEnabled(event.target.checked)} />
+        <SwitchControl checked={refinementEnabled} disabled={savingService} aria-label={t("settings.voiceInputRefinementEnabled")} onChange={(event) => { invalidateConnectionTest(); setRefinementEnabled(event.target.checked); }} />
       </div>
       {refinementEnabled && <div className="setting-row">
         <div><strong>{t("settings.voiceInputRefinementModel")}</strong><span>{refinementModels.length === 0 ? t("settings.voiceInputRefinementNoModels") : t("settings.voiceInputRefinementModelHint")}</span></div>
@@ -701,12 +754,11 @@ export function VoiceInputSettings({ controller, t }: {
           disabled={savingService || refinementModels.length === 0}
           aria-label={t("settings.voiceInputRefinementModel")}
           onChange={(event) => {
+            invalidateConnectionTest();
             const selected = refinementModels.find((model) => model.key === event.target.value);
-            setRefinerProviderId(selected?.providerId ?? "");
-            setRefinerModelId(selected?.modelId ?? "");
+            setRefinerModel(selected === undefined ? undefined : { backendId: selected.backendId, providerId: selected.providerId, modelId: selected.modelId });
             if (selected?.key === selectedRefinementFallbackModel) {
-              setRefinerFallbackProviderId("");
-              setRefinerFallbackModelId("");
+              setRefinerFallbackModel(undefined);
             }
           }}
         >
@@ -721,9 +773,9 @@ export function VoiceInputSettings({ controller, t }: {
           disabled={savingService || selectedRefinementModel === "" || refinementFallbackModels.length === 0}
           aria-label={t("settings.voiceInputRefinementFallbackModel")}
           onChange={(event) => {
+            invalidateConnectionTest();
             const selected = refinementFallbackModels.find((model) => model.key === event.target.value);
-            setRefinerFallbackProviderId(selected?.providerId ?? "");
-            setRefinerFallbackModelId(selected?.modelId ?? "");
+            setRefinerFallbackModel(selected === undefined ? undefined : { backendId: selected.backendId, providerId: selected.providerId, modelId: selected.modelId });
           }}
         >
           <option value="">{t("settings.voiceInputRefinementFallbackNone")}</option>
@@ -751,22 +803,22 @@ export function VoiceInputSettings({ controller, t }: {
       </div>
       <div className="setting-row">
         <div><strong>{t("settings.voiceInputService")}</strong><span>{t("settings.voiceInputServiceHint")}</span></div>
-        <span className="setting-row__value">{service.enabled ? `${service.model} · ${t(voiceInputProtocolLabel(service.protocol))}` : t("settings.voiceInputServiceDisabled")}</span>
+        <span className="setting-row__value">{service.enabled ? `${service.protocol === "volcengineSauc" ? service.resourceId : service.model} · ${t(voiceInputProtocolLabel(service.protocol))}` : t("settings.voiceInputServiceDisabled")}</span>
       </div>
       <div className="setting-row">
         <div><strong>{t("settings.voiceInputPermission")}</strong><span>{permissionLabel(permission, t)}</span></div>
         {desktopMicrophone !== undefined && permission !== "granted" && <Button tone="ghost" onClick={() => void desktopMicrophone.openSettings()}>{t("settings.voiceInputOpenPermissionSettings")}</Button>}
       </div>
       <div className="setting-row">
-        <div><strong>{t("settings.voiceInputLocale")}</strong><span>{supported && capability.kind === "ready" && !capability.value.supportsLocale ? t("settings.voiceInputServiceManaged") : t("settings.voiceInputBody")}</span></div>
+        <div><strong>{t("settings.voiceInputLocale")}</strong><span>{capability.kind === "ready" && !capability.value.supportsLocale ? t("settings.voiceInputLocaleAutomaticHint") : t("settings.voiceInputBody")}</span></div>
         <SelectControl
           aria-label={t("settings.voiceInputLocale")}
-          value={preferences.locale}
+          value={capability.kind === "ready" && !capability.value.supportsLocale ? "auto" : preferences.locale}
           disabled={capability.kind === "ready" && !capability.value.supportsLocale}
           onChange={(event) => setPreferences(writeVoiceInputPreferences({ locale: event.target.value }))}
         >
           <option value="auto">{t("settings.voiceInputLocaleAuto")}</option>
-          {VOICE_INPUT_LOCALES.map((locale) => <option key={locale} value={locale}>{voiceInputLocaleLabel(locale)}</option>)}
+          {VOICE_INPUT_LOCALES.map((locale) => <option key={locale} value={locale}>{t(voiceInputLocaleLabelKey(locale))}</option>)}
         </SelectControl>
       </div>
       <div className="setting-row">
@@ -852,6 +904,7 @@ export function VoiceInputSettings({ controller, t }: {
           <div className="voice-input-dictionary-toolbar">
             <input
               type="search"
+              ref={dictionarySearchRef}
               value={dictionarySearch}
               aria-label={t("settings.voiceInputDictionarySearch")}
               placeholder={t("settings.voiceInputDictionarySearch")}
@@ -878,15 +931,15 @@ export function VoiceInputSettings({ controller, t }: {
               }}
             />
           </div>
-          <div className="voice-input-dictionary-list">
+          <div className="voice-input-dictionary-list" ref={dictionaryListRef}>
             {visibleDictionaryEntries.length === 0
               ? <p className="voice-input-dictionary-empty">{t(normalizedDictionarySearch === "" && dictionaryFilter === "all"
                   ? "settings.voiceInputDictionaryEmpty"
                   : "settings.voiceInputDictionaryNoMatches")}</p>
-              : visibleDictionaryEntries.map((entry) => <article key={entry.id}>
+              : visibleDictionaryEntries.map((entry) => <article key={entry.id} data-dictionary-entry-id={entry.id}>
                   <div className="voice-input-dictionary-entry-copy">
                     {editingDictionaryEntryId === entry.id
-                      ? <input
+                      ? <><input
                           autoFocus
                           value={editingDictionaryDraft}
                           maxLength={MAXIMUM_VOICE_DICTIONARY_TERM_CHARACTERS}
@@ -898,10 +951,28 @@ export function VoiceInputSettings({ controller, t }: {
                               setEditingDictionaryDraft("");
                             } else if (event.key === "Enter" && !event.nativeEvent.isComposing) {
                               event.preventDefault();
-                              saveDictionaryRename(entry.id);
+                              saveDictionaryEdit(entry.id);
                             }
                           }}
-                        />
+                        />{preferences.dictionary.entries.some((candidate) => candidate.id !== entry.id
+                          && voiceDictionaryTermKey(candidate.text) === voiceDictionaryTermKey(editingDictionaryDraft))
+                          && <small role="status">{t("settings.voiceInputDictionaryMergeHint")}</small>}<label className="field">
+                          <span>{t("settings.voiceInputDictionaryEditAliases")}</span>
+                          <textarea
+                            rows={3}
+                            value={editingDictionaryAliasesDraft}
+                            aria-label={t("settings.voiceInputDictionaryEditAliases")}
+                            onChange={(event) => setEditingDictionaryAliasesDraft(event.target.value)}
+                            onKeyDown={(event) => {
+                              if (event.key === "Escape") {
+                                setEditingDictionaryEntryId(undefined);
+                                setEditingDictionaryDraft("");
+                                setEditingDictionaryAliasesDraft("");
+                              }
+                            }}
+                          />
+                          <small>{t("settings.voiceInputDictionaryEditAliasesHint")}</small>
+                        </label></>
                       : <><strong>{entry.text}</strong>{entry.aliases.length > 0 && <small>{t("settings.voiceInputDictionaryAliases", { aliases: entry.aliases.map((alias) => alias.text).join(", ") })}</small>}</>}
                   </div>
                   <div className="voice-input-dictionary-entry-meta">
@@ -911,16 +982,18 @@ export function VoiceInputSettings({ controller, t }: {
                   <div className="voice-input-dictionary-entry-actions">
                     {editingDictionaryEntryId === entry.id
                       ? <>
-                          <Button tone="primary" disabled={editingDictionaryDraft.trim() === ""} onClick={() => saveDictionaryRename(entry.id)}>{t("common.save")}</Button>
+                          <Button tone="primary" onClick={() => saveDictionaryEdit(entry.id)}>{t("common.save")}</Button>
                           <Button tone="ghost" onClick={() => {
                             setEditingDictionaryEntryId(undefined);
                             setEditingDictionaryDraft("");
+                            setEditingDictionaryAliasesDraft("");
                           }}>{t("common.cancel")}</Button>
                         </>
                       : <>
-                          <Button tone="ghost" onClick={() => {
+                          <Button tone="ghost" data-dictionary-edit onClick={() => {
                             setEditingDictionaryEntryId(entry.id);
                             setEditingDictionaryDraft(entry.text);
+                            setEditingDictionaryAliasesDraft(entry.aliases.map((alias) => alias.text).join("\n"));
                             setDictionaryMessage(undefined);
                           }}>{t("common.edit")}</Button>
                           <Button tone="ghost" onClick={() => {
@@ -1002,20 +1075,36 @@ function voiceInputProtocolLabel(protocol: VoiceInputTranscriptionProtocolView):
     case "openAiCompatibleBatch": return "settings.voiceInputProtocolBatch";
     case "openAiCompatibleRealtime": return "settings.voiceInputProtocolOpenAiRealtime";
     case "qwenCompatibleRealtime": return "settings.voiceInputProtocolQwenRealtime";
+    case "elevenLabsScribeRealtime": return "settings.voiceInputProtocolScribeRealtime";
+    case "volcengineSauc": return "settings.voiceInputProtocolSauc";
   }
+}
+
+function transcriptionAuthorityChanged(
+  previousProtocol: VoiceInputTranscriptionProtocolView, previousEndpoint: string,
+  protocol: VoiceInputTranscriptionProtocolView, endpoint: string
+): boolean {
+  if (protocol !== previousProtocol) return true;
+  try { return new URL(previousEndpoint).origin !== new URL(endpoint).origin; }
+  catch { return true; }
 }
 
 function defaultVoiceInputRoute(protocol: VoiceInputTranscriptionProtocolView): {
   readonly endpoint: string;
   readonly model: string;
+  readonly resourceId: string;
 } {
   switch (protocol) {
     case "openAiCompatibleBatch":
-      return { endpoint: "https://api.openai.com/v1/audio/transcriptions", model: "whisper-1" };
+      return { endpoint: "https://api.openai.com/v1/audio/transcriptions", model: "whisper-1", resourceId: "" };
     case "openAiCompatibleRealtime":
-      return { endpoint: "wss://api.openai.com/v1/realtime?intent=transcription", model: "gpt-realtime-whisper" };
+      return { endpoint: "wss://api.openai.com/v1/realtime?intent=transcription", model: "gpt-realtime-whisper", resourceId: "" };
     case "qwenCompatibleRealtime":
-      return { endpoint: "wss://dashscope.aliyuncs.com/api-ws/v1/realtime", model: "qwen3-asr-flash-realtime" };
+      return { endpoint: "wss://dashscope.aliyuncs.com/api-ws/v1/realtime", model: "qwen3-asr-flash-realtime", resourceId: "" };
+    case "elevenLabsScribeRealtime":
+      return { endpoint: "wss://api.elevenlabs.io/v1/speech-to-text/realtime", model: "scribe_v2_realtime", resourceId: "" };
+    case "volcengineSauc":
+      return { endpoint: "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async", model: "", resourceId: "volc.seedasr.sauc.duration" };
   }
 }
 
@@ -1036,13 +1125,13 @@ function voiceInputConnectionFailureKey(value: VoiceInputConnectionTestFailureVi
   }
 }
 
-function voiceInputLocaleLabel(locale: typeof VOICE_INPUT_LOCALES[number]): string {
+function voiceInputLocaleLabelKey(locale: typeof VOICE_INPUT_LOCALES[number]): Parameters<Translator>[0] {
   switch (locale) {
-    case "zh-CN": return "简体中文";
-    case "zh-TW": return "繁體中文";
-    case "en": return "English";
-    case "ja": return "日本語";
-    case "ko": return "한국어";
+    case "zh-CN": return "language.zh-CN";
+    case "zh-TW": return "language.zh-TW";
+    case "en": return "language.en";
+    case "ja": return "language.ja";
+    case "ko": return "language.ko";
   }
 }
 
@@ -1051,8 +1140,8 @@ function supportsManagedTextInference(compatibility: string): boolean {
     || compatibility === "openaiChat" || compatibility === "openaiCompletions";
 }
 
-function refinementModelKey(providerId: string, modelId: string): string {
-  return `${encodeURIComponent(providerId)}/${encodeURIComponent(modelId)}`;
+function refinementModelKey(model: ModelRouteRefView | undefined): string {
+  return model === undefined ? "" : [model.backendId, model.providerId, model.modelId].map(encodeURIComponent).join("/");
 }
 
 function voiceShortcutConflict(

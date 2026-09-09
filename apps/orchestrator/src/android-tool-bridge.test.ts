@@ -53,7 +53,7 @@ describe("AndroidToolBridgeProvider", () => {
             name: { type: "string", description: "Tool name from list_tools" },
             args: {
               type: "object",
-              description: "Arguments object for the selected tool（传 JSON 对象本身，不要序列化成字符串）",
+              description: "Arguments object for the selected tool (pass the JSON object itself, not a serialized string)",
               additionalProperties: {}
             }
           },

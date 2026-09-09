@@ -1,5 +1,8 @@
 import { Facet, RangeSetBuilder, StateEffect, StateField, type Extension, type Text } from "@codemirror/state";
 import { Decoration, EditorView, WidgetType, type DecorationSet } from "@codemirror/view";
+import { writeClipboardText } from "../clipboard-action.js";
+import { mermaidDocumentTheme, renderMermaid } from "./mermaid-render.js";
+import { copyMermaid } from "./mermaid-image-export.js";
 
 export interface WorkspaceMarkdownMermaidLabels {
   readonly zoom: string;
@@ -18,14 +21,21 @@ export interface WorkspaceMarkdownMermaidBlock {
   readonly source: string;
 }
 
-export interface WorkspaceMermaidOpenDetail {
+export interface WorkspaceMermaidLifetime {
+  readonly returnFocus: HTMLElement;
+  readonly signal: AbortSignal;
+  readonly isCurrent: () => boolean;
+}
+
+export interface WorkspaceMermaidOpenDetail extends WorkspaceMermaidLifetime {
   readonly svg: string;
   readonly source: string;
 }
 
-export interface WorkspaceMermaidEditDetail {
+export interface WorkspaceMermaidEditDetail extends WorkspaceMermaidLifetime {
   readonly source: string;
   readonly apply: (source: string) => "applied" | "target-missing";
+  readonly restoreFocus: () => void;
 }
 
 export const WORKSPACE_MERMAID_OPEN_EVENT = "joko-workspace-mermaid-open";
@@ -107,209 +117,169 @@ export function findWorkspaceMarkdownMermaidBlocks(doc: Text): readonly Workspac
   return blocks;
 }
 
-type MermaidApi = typeof import("mermaid")["default"];
-let mermaidModule: Promise<MermaidApi> | undefined;
-let initializedTheme: "dark" | "default" | undefined;
-const renderCache = new Map<string, string>();
-
-function darkTheme(): boolean {
-  const theme = document.documentElement.dataset.theme;
-  return theme === "dark" || (theme === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
-}
-
-async function mermaid(): Promise<MermaidApi> {
-  mermaidModule ??= import("mermaid").then((module) => module.default);
-  const api = await mermaidModule;
-  const theme = darkTheme() ? "dark" : "default";
-  if (initializedTheme !== theme) {
-    api.initialize({
-      startOnLoad: false,
-      securityLevel: "strict",
-      fontFamily: "inherit",
-      theme,
-      flowchart: { useMaxWidth: false },
-      sequence: { useMaxWidth: false },
-      class: { useMaxWidth: false },
-      state: { useMaxWidth: false },
-      er: { useMaxWidth: false },
-      gantt: { useMaxWidth: false },
-      journey: { useMaxWidth: false },
-      pie: { useMaxWidth: false }
-    });
-    initializedTheme = theme;
-  }
-  return api;
-}
-
-function cachedSvg(key: string): string | undefined {
-  const value = renderCache.get(key);
-  if (value === undefined) return undefined;
-  renderCache.delete(key);
-  renderCache.set(key, value);
-  return value;
-}
-
-function rememberSvg(key: string, svg: string): void {
-  renderCache.delete(key);
-  renderCache.set(key, svg);
-  while (renderCache.size > 64) {
-    const oldest = renderCache.keys().next();
-    if (oldest.done) return;
-    renderCache.delete(oldest.value);
-  }
-}
+const mountedWidgets = new WeakMap<HTMLElement, () => void>();
 
 class WorkspaceMermaidWidget extends WidgetType {
   constructor(
     private readonly source: string,
     private readonly hostEditable: boolean,
-    private readonly labels: WorkspaceMarkdownMermaidLabels
-  ) {
-    super();
-  }
+    private readonly labels: WorkspaceMarkdownMermaidLabels,
+    private readonly themeEpoch: object
+  ) { super(); }
 
   override eq(other: WorkspaceMermaidWidget): boolean {
-    return other.source === this.source
-      && other.hostEditable === this.hostEditable
-      && JSON.stringify(other.labels) === JSON.stringify(this.labels);
+    return other.source === this.source && other.hostEditable === this.hostEditable
+      && other.themeEpoch === this.themeEpoch && JSON.stringify(other.labels) === JSON.stringify(this.labels);
   }
 
   override toDOM(view: EditorView): HTMLElement {
-    const wrapper = document.createElement("div");
+    const ownerDocument = view.dom.ownerDocument;
+    const ownerWindow = ownerDocument.defaultView!;
+    const request = new AbortController();
+    const context = { ownerDocument, signal: request.signal };
+    const wrapper = ownerDocument.createElement("div");
     wrapper.className = "cm-md-mermaid-widget";
     wrapper.contentEditable = "false";
-    const card = document.createElement("div");
+    const card = ownerDocument.createElement("div");
     card.className = "cm-md-mermaid-card cm-md-mermaid-loading";
-    const fallback = document.createElement("pre");
+    const fallback = ownerDocument.createElement("pre");
     fallback.className = "cm-md-mermaid-fallback";
     fallback.textContent = this.source;
     card.append(fallback);
     wrapper.append(card);
-    this.attachToolbar(view, card);
-
-    const key = `${darkTheme() ? "dark" : "default"}|${this.source}`;
-    const cached = cachedSvg(key);
-    if (cached !== undefined) this.showSvg(view, card, cached);
-    else void this.render(view, card, fallback, key);
-    return wrapper;
-  }
-
-  private async render(view: EditorView, card: HTMLElement, fallback: HTMLElement, key: string): Promise<void> {
-    if (this.source.trim() === "") {
-      this.showError(card, fallback, "empty source");
-      return;
-    }
-    try {
-      const api = await mermaid();
-      await api.parse(this.source.trim());
-      const { svg } = await api.render(`joko-mermaid-${crypto.randomUUID()}`, this.source.trim());
-      if (!card.isConnected) return;
-      rememberSvg(key, svg);
-      this.showSvg(view, card, svg);
-    } catch (cause) {
-      this.showError(card, fallback, cause instanceof Error ? cause.message : String(cause));
-    }
-  }
-
-  private showSvg(view: EditorView, card: HTMLElement, svg: string): void {
-    const parsed = parseSvg(svg);
-    if (parsed === undefined) {
-      const fallback = card.querySelector<HTMLElement>(".cm-md-mermaid-fallback") ?? document.createElement("pre");
-      this.showError(card, fallback, "invalid SVG");
-      return;
-    }
-    card.classList.remove("cm-md-mermaid-loading", "cm-md-mermaid-error");
-    card.classList.add("cm-md-mermaid-clickable");
-    card.replaceChildren(parsed);
-    this.attachToolbar(view, card, svg);
-    card.setAttribute("role", "button");
-    card.tabIndex = 0;
-    const open = (event: Event): void => {
-      if (event.target instanceof Element && event.target.closest(".cm-md-mermaid-toolbar") !== null) return;
-      event.preventDefault();
-      event.stopPropagation();
-      window.dispatchEvent(new CustomEvent<WorkspaceMermaidOpenDetail>(WORKSPACE_MERMAID_OPEN_EVENT, {
-        detail: { svg, source: this.source }
+    const current = (): boolean => !request.signal.aborted && wrapper.isConnected
+      && wrapper.ownerDocument === ownerDocument && card.ownerDocument === ownerDocument && view.dom.ownerDocument === ownerDocument;
+    const retire = (): void => request.abort();
+    const resume = (): void => {
+      if (request.signal.aborted && wrapper.isConnected && wrapper.ownerDocument === ownerDocument && view.dom.ownerDocument === ownerDocument) {
+        view.dispatch({ effects: workspaceMarkdownMermaidThemeChanged.of(undefined) });
+      }
+    };
+    ownerWindow.addEventListener("pagehide", retire);
+    ownerWindow.addEventListener("pageshow", resume);
+    mountedWidgets.set(wrapper, () => {
+      request.abort();
+      ownerWindow.removeEventListener("pagehide", retire);
+      ownerWindow.removeEventListener("pageshow", resume);
+    });
+    const dispatchOpen = (trigger: HTMLElement, svg: string): void => {
+      if (!current()) return;
+      trigger.dispatchEvent(new ownerWindow.CustomEvent<WorkspaceMermaidOpenDetail>(WORKSPACE_MERMAID_OPEN_EVENT, {
+        bubbles: true, detail: { svg, source: this.source, returnFocus: trigger, signal: request.signal, isCurrent: current }
       }));
     };
-    card.addEventListener("click", open);
-    card.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" || event.key === " ") open(event);
-    });
-  }
-
-  private showError(card: HTMLElement, fallback: HTMLElement, message: string): void {
-    if (!card.isConnected) return;
-    card.classList.remove("cm-md-mermaid-loading");
-    card.classList.add("cm-md-mermaid-error");
-    fallback.className = "cm-md-mermaid-fallback";
-    fallback.textContent = this.source;
-    const error = document.createElement("div");
-    error.className = "cm-md-mermaid-error-banner";
-    error.textContent = `${this.labels.renderFailed}${message}`;
-    const toolbar = card.querySelector<HTMLElement>(".cm-md-mermaid-toolbar");
-    card.replaceChildren(error, fallback, ...(toolbar === null ? [] : [toolbar]));
-  }
-
-  private attachToolbar(view: EditorView, card: HTMLElement, svg?: string): void {
-    card.querySelector(".cm-md-mermaid-toolbar")?.remove();
-    const toolbar = document.createElement("div");
-    toolbar.className = "cm-md-mermaid-toolbar";
-    if (svg !== undefined) {
-      toolbar.append(iconButton(this.labels.zoom, EXPAND_ICON, () => {
-        window.dispatchEvent(new CustomEvent<WorkspaceMermaidOpenDetail>(WORKSPACE_MERMAID_OPEN_EVENT, {
-          detail: { svg, source: this.source }
-        }));
-      }));
-      const copy = iconButton(this.labels.copy, COPY_ICON, () => {
+    const attachToolbar = (svg?: string): void => {
+      card.querySelector(".cm-md-mermaid-toolbar")?.remove();
+      const toolbar = ownerDocument.createElement("div");
+      toolbar.className = "cm-md-mermaid-toolbar";
+      if (svg !== undefined) toolbar.append(iconButton(ownerDocument, this.labels.zoom, EXPAND_ICON, (trigger) => dispatchOpen(trigger, svg)));
+      const feedback = ownerDocument.createElement("span");
+      feedback.className = "cm-md-mermaid-copy-feedback";
+      feedback.setAttribute("role", "alert");
+      let pending = false;
+      let timer: number | undefined;
+      const copy = iconButton(ownerDocument, this.labels.copy, COPY_ICON, () => {
+        if (!current() || pending) return;
+        pending = true;
         feedback.textContent = "";
-        copy.disabled = true;
-        void copyWorkspaceMermaid(svg, this.source, card).then(() => {
+        copy.setAttribute("aria-busy", "true");
+        copy.setAttribute("aria-disabled", "true");
+        if (timer !== undefined) ownerWindow.clearTimeout(timer);
+        const action = svg === undefined ? writeClipboardText(this.source, context) : copyMermaid(svg, this.source, card, context);
+        void action.then(() => {
+          if (!current() || !copy.isConnected) return;
           copy.innerHTML = CHECK_ICON;
           copy.title = this.labels.copied;
           copy.setAttribute("aria-label", this.labels.copied);
-          window.setTimeout(() => {
-            if (!copy.isConnected) return;
+          timer = ownerWindow.setTimeout(() => {
+            if (!current() || !copy.isConnected) return;
             copy.innerHTML = COPY_ICON;
             copy.title = this.labels.copy;
             copy.setAttribute("aria-label", this.labels.copy);
-            copy.disabled = false;
           }, 1_500);
         }).catch(() => {
+          if (!current() || !copy.isConnected) return;
           copy.title = this.labels.copyFailed;
           copy.setAttribute("aria-label", this.labels.copyFailed);
           feedback.textContent = this.labels.copyFailed;
-          copy.disabled = false;
+        }).finally(() => {
+          pending = false;
+          if (!current() || !copy.isConnected) return;
+          copy.removeAttribute("aria-busy");
+          copy.removeAttribute("aria-disabled");
         });
       });
-      const feedback = document.createElement("span");
-      feedback.className = "cm-md-mermaid-copy-feedback";
-      feedback.setAttribute("role", "alert");
-      feedback.setAttribute("aria-live", "assertive");
-      feedback.setAttribute("aria-atomic", "true");
-      toolbar.append(copy);
-      toolbar.append(feedback);
-    }
-    if (this.hostEditable) toolbar.append(iconButton(this.labels.editSource, CODE_ICON, () => {
-      window.dispatchEvent(new CustomEvent<WorkspaceMermaidEditDetail>(WORKSPACE_MERMAID_EDIT_EVENT, {
-        detail: {
-          source: this.source,
-          apply: (source) => {
-            const block = resolveLiveBlock(view, card, this.source);
-            if (block === undefined) return "target-missing";
-            const normalized = source.replace(/\r?\n+$/u, "");
-            view.dispatch({ changes: { from: block.bodyFrom, to: block.bodyTo, insert: normalized === "" ? "" : `${normalized}\n` } });
-            return "applied";
+      request.signal.addEventListener("abort", () => { if (timer !== undefined) ownerWindow.clearTimeout(timer); }, { once: true });
+      toolbar.append(copy, feedback);
+      if (this.hostEditable) toolbar.append(iconButton(ownerDocument, this.labels.editSource, CODE_ICON, (trigger) => {
+        if (!current()) return;
+        trigger.dispatchEvent(new ownerWindow.CustomEvent<WorkspaceMermaidEditDetail>(WORKSPACE_MERMAID_EDIT_EVENT, {
+          bubbles: true,
+          detail: {
+            source: this.source, returnFocus: trigger, signal: request.signal, isCurrent: current,
+            restoreFocus: () => {
+              if (!view.dom.isConnected || view.dom.ownerDocument !== ownerDocument) return;
+              if (current() && trigger.isConnected) trigger.focus({ preventScroll: true });
+              else view.focus();
+            },
+            apply: (source) => {
+              if (!current()) return "target-missing";
+              const block = resolveLiveBlock(view, card, this.source);
+              if (block === undefined) return "target-missing";
+              const normalized = source.replace(/\r?\n+$/u, "");
+              view.dispatch({ changes: { from: block.bodyFrom, to: block.bodyTo, insert: normalized === "" ? "" : `${normalized}\n` } });
+              return "applied";
+            }
           }
-        }
+        }));
       }));
-    }));
-    card.append(toolbar);
+      card.append(toolbar);
+    };
+    attachToolbar();
+    void renderMermaid(this.source.trim(), mermaidDocumentTheme(ownerDocument), context).then((svg) => {
+      if (!current()) return;
+      const host = ownerDocument.createElement("div");
+      host.innerHTML = svg;
+      const parsed = host.firstElementChild;
+      if (parsed?.localName !== "svg") throw new Error("Invalid SVG.");
+      card.classList.remove("cm-md-mermaid-loading", "cm-md-mermaid-error");
+      card.classList.add("cm-md-mermaid-clickable");
+      card.replaceChildren(parsed);
+      attachToolbar(svg);
+      card.setAttribute("role", "button");
+      card.setAttribute("aria-label", this.labels.zoom);
+      card.tabIndex = 0;
+      const open = (event: Event): void => {
+        if (event.target instanceof ownerWindow.Element && event.target.closest(".cm-md-mermaid-toolbar") !== null) return;
+        event.preventDefault();
+        event.stopPropagation();
+        dispatchOpen(card, svg);
+      };
+      card.addEventListener("click", open);
+      card.addEventListener("keydown", (event) => {
+        if (!event.defaultPrevented && !event.isComposing && (event.key === "Enter" || event.key === " ")) open(event);
+      });
+    }).catch((cause: unknown) => {
+      if (!current()) return;
+      card.classList.remove("cm-md-mermaid-loading");
+      card.classList.add("cm-md-mermaid-error");
+      const error = ownerDocument.createElement("div");
+      error.className = "cm-md-mermaid-error-banner";
+      error.textContent = `${this.labels.renderFailed}${cause instanceof Error ? cause.message : String(cause)}`;
+      card.replaceChildren(error, fallback);
+      attachToolbar();
+    });
+    return wrapper;
+  }
+
+  override destroy(dom: HTMLElement): void {
+    mountedWidgets.get(dom)?.();
+    mountedWidgets.delete(dom);
   }
 }
 
-function iconButton(label: string, icon: string, action: () => void): HTMLButtonElement {
-  const button = document.createElement("button");
+function iconButton(ownerDocument: Document, label: string, icon: string, action: (button: HTMLButtonElement) => void): HTMLButtonElement {
+  const button = ownerDocument.createElement("button");
   button.type = "button";
   button.className = "cm-md-mermaid-toolbar-btn";
   button.title = label;
@@ -318,15 +288,9 @@ function iconButton(label: string, icon: string, action: () => void): HTMLButton
   button.addEventListener("click", (event) => {
     event.preventDefault();
     event.stopPropagation();
-    action();
+    action(button);
   });
   return button;
-}
-
-function parseSvg(source: string): SVGElement | undefined {
-  const host = document.createElement("div");
-  host.innerHTML = source;
-  return host.firstElementChild instanceof SVGElement ? host.firstElementChild : undefined;
 }
 
 function resolveLiveBlock(view: EditorView, element: HTMLElement, source: string): WorkspaceMarkdownMermaidBlock | undefined {
@@ -341,64 +305,33 @@ function resolveLiveBlock(view: EditorView, element: HTMLElement, source: string
   );
 }
 
-const mermaidField = StateField.define<DecorationSet>({
-  create: (state) => mermaidDecorations(state.doc, state.facet(EditorView.editable), state.facet(labelsFacet)),
+const mermaidField = StateField.define<{ readonly decorations: DecorationSet; readonly themeEpoch: object }>({
+  create: (state) => {
+    const themeEpoch = {};
+    return { themeEpoch, decorations: mermaidDecorations(state.doc, state.facet(EditorView.editable), state.facet(labelsFacet), themeEpoch) };
+  },
   update(value, transaction) {
     const editableChanged = transaction.startState.facet(EditorView.editable) !== transaction.state.facet(EditorView.editable);
     const labelsChanged = transaction.startState.facet(labelsFacet) !== transaction.state.facet(labelsFacet);
     const themeChanged = transaction.effects.some((effect) => effect.is(workspaceMarkdownMermaidThemeChanged));
-    return transaction.docChanged || editableChanged || labelsChanged || themeChanged
-      ? mermaidDecorations(transaction.state.doc, transaction.state.facet(EditorView.editable), transaction.state.facet(labelsFacet))
-      : value;
+    if (!transaction.docChanged && !editableChanged && !labelsChanged && !themeChanged) return value;
+    const themeEpoch = themeChanged ? {} : value.themeEpoch;
+    return { themeEpoch, decorations: mermaidDecorations(transaction.state.doc, transaction.state.facet(EditorView.editable), transaction.state.facet(labelsFacet), themeEpoch) };
   },
-  provide: (field) => EditorView.decorations.from(field)
+  provide: (field) => EditorView.decorations.from(field, (value) => value.decorations)
 });
 
-function mermaidDecorations(doc: Text, editable: boolean, labels: WorkspaceMarkdownMermaidLabels): DecorationSet {
+function mermaidDecorations(doc: Text, editable: boolean, labels: WorkspaceMarkdownMermaidLabels, themeEpoch: object): DecorationSet {
   const builder = new RangeSetBuilder<Decoration>();
   for (const block of findWorkspaceMarkdownMermaidBlocks(doc)) builder.add(block.from, block.to, Decoration.replace({
     block: true,
-    widget: new WorkspaceMermaidWidget(block.source, editable, labels)
+    widget: new WorkspaceMermaidWidget(block.source, editable, labels, themeEpoch)
   }));
   return builder.finish();
 }
 
 export function workspaceMarkdownMermaidExtensions(labels: WorkspaceMarkdownMermaidLabels): readonly Extension[] {
   return [labelsFacet.of(labels), mermaidField];
-}
-
-export async function copyWorkspaceMermaid(svg: string, source: string, card: HTMLElement): Promise<void> {
-  if (typeof ClipboardItem === "undefined" || navigator.clipboard?.write === undefined) throw new Error("Clipboard unavailable.");
-  const png = await renderWorkspaceMermaidPng(svg, getComputedStyle(card).backgroundColor);
-  await navigator.clipboard.write([new ClipboardItem({
-    "image/png": png,
-    "text/plain": new Blob([source], { type: "text/plain" })
-  })]);
-}
-
-export async function renderWorkspaceMermaidPng(svg: string, background: string): Promise<Blob> {
-  const parsed = new DOMParser().parseFromString(svg, "image/svg+xml").documentElement;
-  const viewBox = parsed.getAttribute("viewBox")?.trim().split(/\s+/u).map(Number);
-  const baseWidth = Number(parsed.getAttribute("width")) || (viewBox?.[2] ?? 1_024);
-  const baseHeight = Number(parsed.getAttribute("height")) || (viewBox?.[3] ?? 768);
-  const scale = Math.min(3, 4_096 / Math.max(baseWidth, baseHeight));
-  const canvas = document.createElement("canvas");
-  canvas.width = Math.max(1, Math.round(baseWidth * scale));
-  canvas.height = Math.max(1, Math.round(baseHeight * scale));
-  const context = canvas.getContext("2d");
-  if (context === null) throw new Error("Canvas unavailable.");
-  context.fillStyle = background === "rgba(0, 0, 0, 0)" ? (darkTheme() ? "#1f1f1d" : "#ffffff") : background;
-  context.fillRect(0, 0, canvas.width, canvas.height);
-  const url = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml" }));
-  try {
-    const image = new Image();
-    image.src = url;
-    await image.decode();
-    context.drawImage(image, 0, 0, canvas.width, canvas.height);
-  } finally {
-    URL.revokeObjectURL(url);
-  }
-  return new Promise((resolve, reject) => canvas.toBlob((blob) => blob === null ? reject(new Error("PNG encoding failed.")) : resolve(blob), "image/png"));
 }
 
 const EXPAND_ICON = '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21 21-6-6m6 6v-4.8m0 4.8h-4.8"/><path d="M3 16.2V21m0 0h4.8M3 21l6-6"/><path d="M21 7.8V3m0 0h-4.8M21 3l-6 6"/><path d="M3 7.8V3m0 0h4.8M3 3l6 6"/></svg>';

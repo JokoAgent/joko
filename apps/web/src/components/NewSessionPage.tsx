@@ -1,5 +1,5 @@
 import type { JSONContent } from "@tiptap/core";
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent, DragEvent, JSX } from "react";
 import {
   AlertTriangle,
@@ -40,7 +40,7 @@ import type {
   WorktreeSourceView,
   WorkspaceEntryView
 } from "../model.js";
-import type { DelayedNewSessionDraft } from "../new-session-flow.js";
+import type { DelayedNewSessionDraft, NewSessionSubmissionOwner } from "../new-session-flow.js";
 import { randomUuid } from "../web-crypto.js";
 import {
   currentComposerPlatform,
@@ -67,12 +67,22 @@ import {
 } from "./new-session-options.js";
 import { nativeSessionDiscoveryAvailability } from "./session-discovery.js";
 import { ModelPicker, type ModelPickerSelection } from "./ModelPicker.js";
+import { ModelSourceNotice } from "./ModelSourceNotice.js";
+import { modelSourceAccess, type ModelSourceSelection } from "../model-source-access.js";
 import { PermissionSelector, permissionLabel } from "./PermissionSelector.js";
 import { ComposerAddMenu } from "./ComposerAddMenu.js";
 import { ComposerAttachmentTray } from "./ComposerAttachmentTray.js";
 import { HomeUsageDashboard } from "./HomeUsageDashboard.js";
 import { ComposerPastedTextDialog, type ComposerPastedTextDialogTarget } from "./ComposerPastedTextDialog.js";
 import { ComposerRichTextEditor, type ComposerRichTextEditorHandle } from "./ComposerRichTextEditor.js";
+import { VoiceInputOverlay } from "./VoiceInputOverlay.js";
+import { useDraftVoiceInput } from "./use-draft-voice-input.js";
+import { useHeldVoiceInput } from "./use-held-voice-input.js";
+import { VoiceInputButton } from "./VoiceInputButton.js";
+import { applyVoiceDraftResult, createVoiceDraftFence } from "./voice-draft-fence.js";
+import { createVoiceInsertedEditTracker } from "./voice-inserted-edit.js";
+import { useVoiceDictionaryLearning } from "./use-voice-dictionary-learning.js";
+import { composerSelectionTextRange, setComposerCaretTextOffset } from "./composer-inline-mention.js";
 import { isComposerBlankPointerTarget } from "./composer-blank-focus.js";
 import { resolveComposerRouteReferenceFromRuntime } from "./composer-route-reference-runtime.js";
 import { hasComposerInternalDrop, resolveComposerInternalDrop } from "./composer-internal-drop.js";
@@ -88,7 +98,7 @@ interface NewSessionPageProps {
   readonly t: Translator;
   readonly onOpenNavigation: () => void;
   readonly onClose: () => void;
-  readonly onSubmit: (session: DelayedNewSessionDraft, input: ComposerDraft) => Promise<void>;
+  readonly onSubmit: (session: DelayedNewSessionDraft, input: ComposerDraft, owner: NewSessionSubmissionOwner) => Promise<void>;
 }
 
 interface NewTaskWorkspaceMentionIndex {
@@ -155,11 +165,19 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const [hydrated, setHydrated] = useState(false);
   const [hydrationRevision, setHydrationRevision] = useState(0);
   const richEditorRef = useRef<ComposerRichTextEditorHandle>(null);
+  const composerRootRef = useRef<HTMLDivElement>(null);
+  const [voiceRoot, setVoiceRoot] = useState<HTMLDivElement>();
+  const bindComposer = useCallback((node: HTMLDivElement | null) => { composerRootRef.current = node; setVoiceRoot(node ?? undefined); }, []);
+  const [voiceSendTarget, setVoiceSendTarget] = useState<HTMLButtonElement>();
+  const bindVoiceSend = useCallback((node: HTMLButtonElement | null) => setVoiceSendTarget(node ?? undefined), []);
+  const voiceCaretRef = useRef<number | undefined>(undefined);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const editorDocumentRef = useRef(editorDocument);
   const textRef = useRef(text);
   const attachmentsRef = useRef(attachments);
-  const submissionRef = useRef(false);
+  const submissionRef = useRef<object | undefined>(undefined);
+  const submissionAbortRef = useRef<AbortController | undefined>(undefined);
+  const submissionOriginRef = useRef<NewSessionSubmissionOwner | undefined>(undefined);
   const mountedRef = useRef(true);
   const controllerRef = useRef(controller);
   const draftSaveChainRef = useRef<Promise<void>>(Promise.resolve());
@@ -187,7 +205,9 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     && selectedNativeSession.state !== "error"
     && selectedNativeSession.boundSessionId === undefined;
   const execution = resolveNewSessionExecutionOptions(backend, snapshot.models, modelKey);
-  const selectedModel = execution.selectedModel;
+  const modelSelection = backend === undefined ? undefined : modelSelectionFor(backend.id, modelKey);
+  const selectedModel = execution.selectedModel ?? snapshot.models.find((model) => model.backendId === backend?.id
+    && modelKeyFor(model.providerId, model.modelId) === modelKey);
   const pickerOwnerId = modelPreferenceOwnerId(controller.state.activeProfile?.serverId);
   const pickerBackendDefaults = snapshot.settings.backendSettings.find((settings) => settings.backendId === backend?.id);
   const pickerDefaultModel = pickerBackendDefaults?.model === undefined
@@ -247,6 +267,48 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const effectiveWorktreeEnabled = worktreeRequested && worktreeEligible;
 
   const profileScope = `${controller.state.activeProfile?.serverId ?? ""}\u0000${controller.state.activeProfile?.id ?? ""}`;
+  const voiceOwnerKey = `${profileScope}\u0000${selectionKey}\u0000${startKind}`;
+  const voiceDictionaryLearning = useVoiceDictionaryLearning({
+    controller,
+    ownerKey: voiceOwnerKey,
+    enabled: hydrated && !submitting && snapshot.settings.voiceInput.refinementEnabled
+  });
+  const voice = useDraftVoiceInput({
+    controller,
+    ownerKey: voiceOwnerKey,
+    root: voiceRoot,
+    enabled: hydrated && !submitting && controller.state.connectionState === "connected",
+    t,
+    focus: () => {
+      richEditorRef.current?.focus();
+      const editor = voiceRoot?.querySelector<HTMLElement>(".composer-rich-editor__content") ?? null;
+      if (voiceCaretRef.current !== undefined) setComposerCaretTextOffset(editor, editor?.ownerDocument.getSelection() ?? null, voiceCaretRef.current);
+    },
+    capture: () => {
+      voiceDictionaryLearning.clear();
+      setPalette(undefined);
+      const sourceDocument = editorDocumentRef.current;
+      const editor = composerRootRef.current?.querySelector<HTMLElement>(".composer-rich-editor__content") ?? null;
+      const fence = createVoiceDraftFence({ sessionId: voiceOwnerKey, revision: 0, text: textRef.current, selection: composerSelectionTextRange(editor, editor?.ownerDocument.getSelection() ?? null) });
+      return (transcript, rawTranscriptText) => {
+        if (editorDocumentRef.current !== sourceDocument) return undefined;
+        const applied = applyVoiceDraftResult({ fence, sessionId: voiceOwnerKey, revision: 0, document: sourceDocument, text: textRef.current, transcript });
+        if (!applied.applied) return undefined;
+        editorDocumentRef.current = applied.document;
+        textRef.current = applied.text;
+        setEditorDocument(applied.document);
+        setText(applied.text);
+        setMentions((current) => mentionsStillPresent(applied.text, current));
+        voiceDictionaryLearning.track(createVoiceInsertedEditTracker({
+          fence,
+          insertedText: transcript,
+          ...(rawTranscriptText === undefined ? {} : { rawTranscriptText })
+        }), voiceOwnerKey);
+        voiceCaretRef.current = applied.caret;
+        return applied;
+      };
+    }
+  });
 
   useEffect(() => {
     mountedRef.current = true;
@@ -352,12 +414,13 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
         ? modelKeyFor(restored.providerId, restored.modelId)
         : "";
       const restoredOptions = resolveNewSessionExecutionOptions(backend, snapshot.models, restoredModelKey);
-      const restoredModel = restoredOptions.selectedModel;
-      setModelKey(restoredModel === undefined ? "" : restoredModelKey);
-      setEffort(restoredOptions.effortSelectable && restored.effort !== undefined && restoredModel?.efforts.includes(restored.effort)
+      const restoredModel = snapshot.models.find((model) => model.backendId === backend.id
+        && modelKeyFor(model.providerId, model.modelId) === restoredModelKey);
+      setModelKey(restoredModelKey);
+      setEffort(restoredModel === undefined ? restored.effort ?? "" : restoredOptions.effortSupported && restored.effort !== undefined && restoredModel.efforts.includes(restored.effort)
         ? restored.effort
-        : restoredOptions.effortSelectable ? restoredModel?.efforts[0] ?? "" : "");
-      setFastMode(restoredOptions.fastModeSelectable && restored.fastMode);
+        : restoredOptions.effortSupported ? restoredModel?.efforts[0] ?? "" : "");
+      setFastMode(restoredModel === undefined ? restored.fastMode : restoredOptions.fastModeSupported && restoredModel.supportsFast && restored.fastMode);
       setPermissionMode(restoredOptions.permissionModes.includes(restored.permissionMode)
         ? restored.permissionMode
         : restoredOptions.permissionModes[0] ?? "ask");
@@ -383,9 +446,12 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
           model.providerId === defaults.model?.providerId && model.modelId === defaults.model.modelId);
     const options = resolveNewSessionExecutionOptions(backend, snapshot.models, defaultModel === undefined ? "" : modelKeyFor(defaultModel.providerId, defaultModel.modelId));
     const initialModel = options.modelSwitchSupported ? options.selectedModel : undefined;
-    setModelKey(initialModel === undefined ? "" : modelKeyFor(initialModel.providerId, initialModel.modelId));
+    setModelKey(!options.modelSwitchSupported ? "" : defaults?.model !== undefined
+      ? modelKeyFor(defaults.model.providerId, defaults.model.modelId)
+      : initialModel === undefined ? "" : modelKeyFor(initialModel.providerId, initialModel.modelId));
     setEffort(options.effortSupported ? defaults?.model?.effort ?? initialModel?.efforts[0] ?? "" : "");
-    setFastMode(options.fastModeSupported && initialModel?.supportsFast === true && (defaults?.model?.fastMode ?? false));
+    setFastMode(initialModel === undefined && defaults?.model !== undefined ? defaults.model.fastMode
+      : options.fastModeSupported && initialModel?.supportsFast === true && (defaults?.model?.fastMode ?? false));
     const defaultPermission = defaults?.permissionMode ?? snapshot.settings.policy.defaultMode;
     setPermissionMode(options.permissionModes.includes(defaultPermission) ? defaultPermission : options.permissionModes[0] ?? "ask");
     setPlanMode(options.planModeSupported && (defaults?.planMode ?? false));
@@ -474,13 +540,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   }, [selected?.id, startKind]);
 
   useEffect(() => {
-    if (selectedModel === undefined) {
-      if (modelKey.length > 0) {
-        setEffort("");
-        setFastMode(false);
-      }
-      return;
-    }
+    if (selectedModel === undefined) return;
     if (!selectedModel.efforts.includes(effort)) setEffort(selectedModel.efforts[0] ?? "");
     if (!selectedModel.supportsFast) setFastMode(false);
   }, [modelKey, selectedModel?.modelId, selectedModel?.providerId]);
@@ -492,10 +552,10 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       nativeStart: startKind === "attach" && selected !== undefined && nativeReference.length > 0
         ? { kind: "attach", reference: nativeReference }
         : { kind: "fresh" },
-      providerId: selectedModel?.providerId ?? "",
-      modelId: selectedModel?.modelId ?? "",
-      ...(execution.effortSelectable && effort.length > 0 ? { effort } : {}),
-      fastMode: execution.fastModeSelectable && fastMode,
+      providerId: modelSelection?.providerId ?? "",
+      modelId: modelSelection?.modelId ?? "",
+      ...((selectedModel === undefined ? effort.length > 0 : execution.effortSupported && selectedModel.efforts.includes(effort)) ? { effort } : {}),
+      fastMode: selectedModel === undefined ? fastMode : execution.fastModeSupported && selectedModel.supportsFast && fastMode,
       permissionMode: execution.permissionModes.includes(permissionMode) ? permissionMode : execution.permissionModes[0] ?? "ask",
       planMode: execution.planModeSupported && planMode,
       worktree: {
@@ -509,21 +569,63 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       attachments,
       ...(canSelectExtraDirectories ? { extraDirectoryIds } : {})
     };
+    const sourceControllerRef = { current: controllerRef.current };
+    let cancelled = false;
     const timer = window.setTimeout(() => {
-      void enqueueNewSessionDraftSave(draftSaveChainRef, controllerRef, draft).then(() => setDraftError(undefined)).catch((error: unknown) => setDraftError(messageOf(error)));
+      void enqueueNewSessionDraftSave(draftSaveChainRef, sourceControllerRef, draft).then(() => { if (!cancelled) setDraftError(undefined); }).catch((error: unknown) => { if (!cancelled) setDraftError(messageOf(error)); });
     }, 420);
-    return () => window.clearTimeout(timer);
-  }, [attachments, canSelectExtraDirectories, editorDocument, effort, execution.effortSelectable, execution.fastModeSelectable, execution.permissionModes, execution.planModeSupported, extraDirectoryIds, fastMode, hydrated, mentions, modelKey, nativeReference, permissionMode, planMode, refreshWorktreeRemote, selected?.id, selectionKey, startKind, submitting, text, worktreeEnabled, worktreeSourceRef]);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [controller.saveNewSessionDraft, attachments, canSelectExtraDirectories, editorDocument, effort, execution.effortSupported, execution.fastModeSupported, execution.permissionModes, execution.planModeSupported, extraDirectoryIds, fastMode, hydrated, mentions, modelKey, nativeReference, permissionMode, planMode, refreshWorktreeRemote, selected?.id, selectedModel?.efforts, selectedModel?.supportsFast, selectionKey, startKind, submitting, text, worktreeEnabled, worktreeSourceRef]);
 
   const attachmentsAllowed = attachments.every((attachment) => attachment.kind === "image" ? attachmentPolicy.images : attachmentPolicy.files);
   const hasInput = !composerDocumentIsEmpty(editorDocument) || attachments.length > 0;
   const validContext = selection !== undefined && backend !== undefined
     && (startKind === "fresh" || (selected !== undefined && nativeSelectionReady));
-  const modelRouteReady = !execution.modelSwitchSupported || selectedModel !== undefined;
+  const modelRouteReady = modelSourceAccess(backend, modelSelection, selectedModel, snapshot.providers).available;
   const worktreeDecisionReady = !worktreeRequested || (
     !worktreeLoading && worktreeError === undefined && worktreeProbe?.targetId === selected?.id
   );
-  const canSend = validContext && modelRouteReady && hasInput && attachmentsAllowed && worktreeDecisionReady && !submitting;
+  const canFinishVoiceSend = hydrated && controller.state.connectionState === "connected" && validContext && modelRouteReady && attachmentsAllowed && worktreeDecisionReady && !submitting;
+  const canSend = canFinishVoiceSend && hasInput && !voice.active;
+  const submissionScope = useMemo(() => ({}), [profileScope, selectionKey, startKind, nativeReference, modelKey, selectedModel?.providerId, selectedModel?.modelId, effort, fastMode, permissionMode, planMode, effectiveWorktreeEnabled, worktreeSourceRef, refreshWorktreeRemote, snapshot.generation, controller.getArtifactUrl, voiceRoot]);
+  const submissionEpochRef = useRef<object | undefined>(undefined);
+  const submissionScopeRef = useRef(submissionScope); submissionScopeRef.current = submissionScope;
+  const submissionValidityRef = useRef(false);
+  submissionValidityRef.current = hydrated && validContext && modelRouteReady && attachmentsAllowed && worktreeDecisionReady && controller.state.connectionState === "connected";
+  useLayoutEffect(() => {
+    const ownerWindow = voiceRoot?.ownerDocument.defaultView;
+    const activate = (): void => { submissionEpochRef.current = {}; };
+    const retire = (): void => { submissionEpochRef.current = undefined; submissionRef.current = undefined; submissionAbortRef.current?.abort(); submissionAbortRef.current = undefined; submissionOriginRef.current = undefined; setSubmitting(false); };
+    activate();
+    ownerWindow?.addEventListener("pagehide", retire); ownerWindow?.addEventListener("pageshow", activate);
+    return () => { retire(); ownerWindow?.removeEventListener("pagehide", retire); ownerWindow?.removeEventListener("pageshow", activate); };
+  }, [submissionScope, voiceRoot]);
+  useLayoutEffect(() => {
+    if (submissionOriginRef.current !== undefined && !submissionOriginRef.current.isCurrent()) submissionAbortRef.current?.abort();
+  });
+  const submitRef = useRef<(document?: JSONContent) => Promise<void>>(async () => undefined);
+  const voiceSendFlight = useRef<object | undefined>(undefined);
+  const finishVoiceAndSend = (): void => {
+    if (!canFinishVoiceSend || voiceSendFlight.current !== undefined) return;
+    const flight = {}; voiceSendFlight.current = flight;
+    const scope = submissionScope; const epoch = submissionEpochRef.current;
+    void voice.finish().then(async (result) => {
+      if (voiceSendFlight.current !== flight || result.kind !== "applied" || !result.isCurrent() || submissionScopeRef.current !== scope || submissionEpochRef.current !== epoch || !submissionValidityRef.current) return;
+      await submitRef.current(result.value.document);
+    }).finally(() => { if (voiceSendFlight.current === flight) voiceSendFlight.current = undefined; });
+  };
+  useLayoutEffect(() => () => { voiceSendFlight.current = undefined; }, [submissionScope]);
+  const heldVoice = useHeldVoiceInput({
+    scope: voice.scope, root: voiceRoot, sendTarget: voiceSendTarget, canSend: canFinishVoiceSend,
+    enabled: voice.supported && hydrated && !submitting, phase: voice.phase,
+    shortcut: voice.preferences.shortcut, nativeShortcut: window.jokoDesktop?.capabilities.includes("voice.globalDictation") === true,
+    isActive: voice.isActive, start: voice.start, finish: voice.finish, cancel: voice.cancel, onSend: finishVoiceAndSend,
+    isSendKey: (event) => {
+      if (palette !== undefined) return false;
+      const intent = resolveComposerEnterIntent(event, controller.state.preferences.composerSendShortcut, { turnRunning: false, platform: currentComposerPlatform() });
+      return intent === "queue" || intent === "steer";
+    }
+  });
 
   const closePalette = (restoreFocus = false): void => {
     typedPaletteTriggerRef.current = undefined;
@@ -534,6 +636,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const updateDocument = (nextDocument: JSONContent, isComposing = false): void => {
     const normalizedDocument = normalizeComposerDocument(nextDocument);
     const nextText = composerDocumentPlainText(normalizedDocument);
+    voiceDictionaryLearning.observe(nextText, isComposing);
     editorDocumentRef.current = normalizedDocument;
     setEditorDocument(normalizedDocument);
     textRef.current = nextText;
@@ -553,6 +656,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   };
 
   const insertPaletteItem = (item: ComposerPaletteItem): void => {
+    voiceDictionaryLearning.clear();
     const typedTrigger = typedPaletteTriggerRef.current;
     const next = insertNewSessionPaletteDocument(editorDocumentRef.current, typedTrigger, item);
     editorDocumentRef.current = next.document;
@@ -614,9 +718,26 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       && (!composerDocumentIsEmpty(sourceEditorDocument) || attachments.length > 0)
       && attachmentsAllowed
       && worktreeDecisionReady
-      && !submitting;
+      && !submitting && !voice.isActive();
     if (!activeCanSend || selection === undefined || submissionRef.current) return;
-    submissionRef.current = true;
+    voiceDictionaryLearning.clear();
+    const sourceScope = submissionScope;
+    const sourceEpoch = submissionEpochRef.current;
+    const ownerDocument = voiceRoot?.ownerDocument;
+    const ownerWindow = ownerDocument?.defaultView;
+    if (ownerDocument === undefined || ownerWindow === null || ownerWindow === undefined || sourceEpoch === undefined) return;
+    const sourceDraft = editorDocumentRef.current;
+    const sourceAttachments = attachmentsRef.current;
+    const attempt = {}; submissionRef.current = attempt;
+    const request = new AbortController(); submissionAbortRef.current = request;
+    const owner: NewSessionSubmissionOwner = {
+      ownerDocument,
+      signal: request.signal,
+      isCurrent: () => submissionScopeRef.current === sourceScope && submissionEpochRef.current === sourceEpoch && submissionRef.current === attempt
+        && !request.signal.aborted && submissionValidityRef.current && voiceRoot?.isConnected === true && voiceRoot.ownerDocument === ownerDocument && !ownerWindow.closed
+        && editorDocumentRef.current === sourceDraft && attachmentsRef.current === sourceAttachments
+    };
+    submissionOriginRef.current = owner;
     setSubmitting(true);
     const allowedPermissions = execution.permissionModes;
     const resolvedPermission = allowedPermissions.includes(permissionMode) ? permissionMode : allowedPermissions[0] ?? "ask";
@@ -628,6 +749,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       : undefined;
     try {
       await draftSaveChainRef.current;
+      if (!owner.isCurrent()) return;
       await onSubmit({
         selection,
         name: t("session.newName"),
@@ -648,14 +770,19 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
         mentions: mentionsStillPresent(sourceText, mentions),
         deliveryMode: "prompt",
         ...(canSelectExtraDirectories ? { extraDirectoryIds } : {})
-      });
+      }, owner);
     } catch {
       // App owns the operation banner; the persistent draft intentionally remains.
     } finally {
-      submissionRef.current = false;
-      if (mountedRef.current) setSubmitting(false);
+      if (submissionRef.current === attempt) {
+        submissionRef.current = undefined;
+        submissionOriginRef.current = undefined; submissionAbortRef.current = undefined; request.abort();
+        if (mountedRef.current) setSubmitting(false);
+      }
     }
   };
+
+  submitRef.current = submit;
 
   const handleEditorKeyDown = (event: KeyboardEvent, activeDocument: JSONContent): boolean => {
     const intent = resolveComposerEnterIntent({
@@ -764,6 +891,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
         <div className="new-task-composer-wrap">
           {submitting && effectiveWorktreeEnabled && <div className="new-task-worktree__creating" role="status" aria-live="polite" aria-atomic="true"><GitBranch aria-hidden="true" /><span><strong>{t("worktree.creating")}</strong><small>{t("worktree.creatingDescription")}</small></span></div>}
           <div
+            ref={bindComposer}
             className={cx("composer new-task-composer", dragging && "is-dragging")}
             aria-busy={submitting}
             onMouseDown={(event) => {
@@ -785,6 +913,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
           >
             {dragging && <div className="composer__drop"><Paperclip aria-hidden="true" /><span>{t("composer.drop")}</span></div>}
             {attachments.length > 0 && <ComposerAttachmentTray
+              ownerKey={voiceOwnerKey}
               attachments={attachments}
               removeDisabled={submitting}
               t={t}
@@ -798,7 +927,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
             <ComposerRichTextEditor
               ref={richEditorRef}
               document={editorDocument}
-              editable={!submitting}
+              editable={!submitting && !voice.active}
               disabled={false}
               placeholder={t("composer.placeholder")}
               onDocumentChange={updateDocument}
@@ -810,6 +939,20 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
               knownWorkspacePaths={knownWorkspacePaths}
               resolveRouteReference={(target) => resolveComposerRouteReferenceFromRuntime(controller, target, t("session.unnamed"))}
             />
+            {voice.draftError !== undefined && <p className="composer__error" role="alert">{voice.draftError}</p>}
+            <ModelSourceNotice key={JSON.stringify([profileScope, selectionKey, modelKey])} controller={controller} backend={backend} selection={modelSelection} model={selectedModel} t={t} />
+            {voice.update !== undefined && voice.update.state !== "done" && voice.update.state !== "cancelled" && voice.update.state !== "idle" && <VoiceInputOverlay
+              state={voice.phase ?? voice.update.state}
+              transcript={voice.update.session?.result?.text ?? voice.update.session?.draft?.text ?? ""}
+              error={voice.error}
+              stallWarning={voice.update.session?.stallWarning === true}
+              canUseTranscript={voice.update.session?.result !== undefined && (voice.update.session.failure?.transcriptKept === true || voice.update.session.result.salvaged)}
+              onStop={() => { void voice.finish(); }}
+              onCancel={voice.cancel}
+              onRetry={voice.start}
+              onUseTranscript={voice.useTranscript}
+              t={t}
+            />}
             <div className="composer__toolbar new-task-composer__toolbar">
               <div className="composer__tools">
                 <input ref={fileInputRef} className="sr-only" type="file" multiple disabled={submitting} accept={attachmentPolicy.images && !attachmentPolicy.files ? "image/*" : undefined} onChange={handleFiles} />
@@ -872,19 +1015,18 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
                 </div>}
               </div>
               <div className="new-task-composer__controls">
+                {voice.supported && <VoiceInputButton phase={voice.phase} held={heldVoice.held} sendTargetActive={heldVoice.sendTargetActive} startedAt={voice.startedAt} ownerWindow={voice.ownerWindow} enabled={hydrated && !submitting} buttonProps={heldVoice.buttonProps} t={t} />}
                 {execution.modelSwitchSupported && <ModelPicker
                   className="new-task-composer__select--model"
-                  models={execution.availableModels}
+                  models={snapshot.models.filter((model) => model.backendId === backend?.id)}
                   ownerId={pickerOwnerId}
-                  value={selectedModel === undefined ? undefined : {
-                    backendId: selectedModel.backendId,
-                    providerId: selectedModel.providerId,
-                    modelId: selectedModel.modelId,
+                  value={modelSelection === undefined ? undefined : {
+                    ...modelSelection,
                     ...(effort.length === 0 ? {} : { effort }),
-                    fastMode: execution.fastModeSelectable && fastMode
+                    fastMode
                   }}
                   allowDefault
-                  defaultLabel={t("scheduler.taskDefault")}
+                  defaultLabel={t("settings.backendNativeDefault")}
                   seedDefault={pickerDefaultSelection}
                   disabled={submitting}
                   disabledReason={submitting ? t("common.working") : undefined}
@@ -915,7 +1057,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
                 {execution.permissionSelectable ? <PermissionSelector value={permissionMode} modes={execution.permissionModes} disabled={submitting} disabledReason={submitting ? t("common.working") : undefined} onChange={setPermissionMode} t={t} /> : <Pill tone="neutral"><Shield aria-hidden="true" />{permissionLabel(execution.permissionModes[0] ?? "ask", t)}</Pill>}
                 {execution.planModeSupported && <button className={cx("new-task-composer__toggle", planMode && "is-active")} type="button" disabled={submitting} aria-pressed={planMode} onClick={() => setPlanMode((value) => !value)}><Sparkles aria-hidden="true" />{t("controls.plan")}</button>}
               </div>
-              <IconButton className="send-button" label={t("composer.send")} disabled={!canSend} disabledReason={!canSend ? submitting ? t("common.working") : !hasInput ? t("composer.placeholder") : t("composer.inputUnavailable") : undefined} onClick={() => void submit()}><Send aria-hidden="true" /></IconButton>
+              <IconButton buttonRef={bindVoiceSend} className={cx("send-button", heldVoice.sendTargetActive && "is-voice-target")} tooltipOpen={heldVoice.sendTargetActive ? true : undefined} label={voice.active ? t(heldVoice.sendTargetActive ? "voice.releaseToSend" : "voice.finishAndSend") : t("composer.send")} disabled={voice.active ? !canFinishVoiceSend : !canSend} disabledReason={!canSend ? submitting ? t("common.working") : !hasInput ? t("composer.placeholder") : t("composer.inputUnavailable") : undefined} onClick={() => { if (voice.isActive()) finishVoiceAndSend(); else void submit(); }}><Send aria-hidden="true" /></IconButton>
             </div>
           </div>
           <div className="new-task-composer__meta"><span>{selection?.kind === "dialogue" ? t("newTask.dialogue") : selected?.workspaceName ?? t("session.noProjects")}</span><span>{backend?.name ?? ""}</span></div>
@@ -925,6 +1067,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
           <h2 id="new-task-quick-title">{t("newTask.quickStart")}</h2>
           <div className="new-task-quick__grid">
             {QUICK_STARTS.map(({ key, label, icon: Icon }) => <button type="button" key={key} disabled={submitting} onClick={() => {
+              voiceDictionaryLearning.clear();
               const nextDocument = plainTextToComposerDocument(t(label));
               const nextText = composerDocumentPlainText(nextDocument);
               editorDocumentRef.current = nextDocument;
@@ -1018,6 +1161,12 @@ function modelKeyFor(providerId: string, modelId: string): string {
   return `${providerId}\u0000${modelId}`;
 }
 
+function modelSelectionFor(backendId: string, modelKey: string): ModelSourceSelection | undefined {
+  if (modelKey.length === 0) return undefined;
+  const separator = modelKey.indexOf("\u0000");
+  return { backendId, providerId: modelKey.slice(0, separator), modelId: modelKey.slice(separator + 1) };
+}
+
 function worktreeEligibilityMessage(
   value: Exclude<WorktreeEligibilityView, "eligible">
 ): "worktree.ineligible.notGitRepository" | "worktree.ineligible.alreadyLinked" | "worktree.ineligible.unsafe" | "worktree.ineligible.unavailable" {
@@ -1040,7 +1189,8 @@ function enqueueNewSessionDraftSave(
   controllerRef: { current: AppController },
   draft: NewSessionLocalDraft
 ): Promise<void> {
-  const operation = chainRef.current.then(() => controllerRef.current.saveNewSessionDraft(draft));
+  const saveDraft = controllerRef.current.saveNewSessionDraft;
+  const operation = chainRef.current.then(() => saveDraft(draft));
   chainRef.current = operation.catch(() => undefined);
   return operation;
 }

@@ -18,6 +18,7 @@ import type {
 } from "./types.js";
 import type { SubagentRunDetail, SubagentTranscriptEntry } from "./subagents.js";
 import type { RuntimeCommand } from "./adapter.js";
+import type { AudioArtifactMetadata } from "./audio-artifact.js";
 
 export interface EventEnvelope {
   readonly id: EventId;
@@ -112,7 +113,7 @@ export type EventPayload =
       readonly artifact?: BlobRef;
       readonly nativeHistory?: NativeHistoryEventContext;
     }
-  | { readonly type: "artifact"; readonly artifact: BlobRef; readonly purpose: string }
+  | { readonly type: "artifact"; readonly artifact: BlobRef; readonly purpose: string; readonly audioMetadata?: AudioArtifactMetadata }
   | WorkspaceDiffEventPayload
   | { readonly type: "interaction_opened"; readonly interaction: InteractionPayload }
   | { readonly type: "interaction_resolved"; readonly interactionId: InteractionId; readonly decision: string }
@@ -270,7 +271,7 @@ export type MessageBlock =
   | { readonly kind: "text"; readonly text: string }
   | { readonly kind: "thinking"; readonly text: string; readonly redacted: boolean }
   | { readonly kind: "image"; readonly blob: BlobRef; readonly alt?: string }
-  | { readonly kind: "artifact"; readonly blob: BlobRef; readonly label: string }
+  | { readonly kind: "artifact"; readonly blob: BlobRef; readonly label: string; readonly audioMetadata?: AudioArtifactMetadata }
   | { readonly kind: "tool_call"; readonly callId: string; readonly name: string; readonly input: string }
   | { readonly kind: "tool_result"; readonly callId: string; readonly output: string; readonly isError: boolean };
 
@@ -278,7 +279,7 @@ export type MessageBlock =
 export type ToolResultContentPart =
   | { readonly kind: "text"; readonly text: string }
   | { readonly kind: "image"; readonly blob: BlobRef; readonly alt?: string }
-  | { readonly kind: "artifact"; readonly blob: BlobRef; readonly label: string };
+  | { readonly kind: "artifact"; readonly blob: BlobRef; readonly label: string; readonly audioMetadata?: AudioArtifactMetadata };
 
 /** A redacted, durable workspace projection captured with a run. */
 export interface WorkspaceDiffEventPayload {
@@ -464,6 +465,8 @@ export type InteractionPayload =
 export interface NativeMessageIdentity {
   readonly entryId: string;
   readonly parentEntryId?: string;
+  /** Exact rewind position confirmed by the native history owner. */
+  readonly rewindBefore?: import("./types.js").NativeNavigationTarget;
 }
 
 export interface NativeHistoryEventContext {

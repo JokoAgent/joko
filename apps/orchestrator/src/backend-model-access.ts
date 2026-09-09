@@ -58,7 +58,7 @@ export function modelRoutingEnabled(
 }
 
 export function writeBackendModelAccess(
-  store: Pick<OperationalStore, "findSetting" | "setSetting" | "deleteSetting">,
+  store: Pick<OperationalStore, "findSetting" | "setSetting">,
   backendId: string,
   update: BackendModelAccessUpdate
 ): BackendModelAccessSettings {
@@ -84,11 +84,8 @@ export function writeBackendModelAccess(
       left.providerId.localeCompare(right.providerId) || left.modelId.localeCompare(right.modelId))
   });
   const key = backendModelAccessSettingKey(backendId);
-  if (next.disabledProviderIds.length === 0 && next.disabledModels.length === 0) {
-    store.deleteSetting("service", "orchestrator", key);
-  } else {
-    store.setSetting("service", "orchestrator", key, next);
-  }
+  // Keep the current setting revision when restoring access so old routing plans stay retired.
+  store.setSetting("service", "orchestrator", key, next);
   return next;
 }
 

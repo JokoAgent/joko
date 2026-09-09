@@ -52,17 +52,17 @@ describe("review prompt", () => {
 
   it("is deterministic, carries coverage gaps, and states the non-plan hard lock", () => {
     const input = base({
-      focus: "检查取消竞态",
-      coverageGaps: ["未运行 Windows 集成测试", "图片只检查了缩略图"],
+      focus: "Check cancellation races",
+      coverageGaps: ["Windows integration tests were not run", "Only image thumbnails were inspected"],
       artifacts: [{ kind: "image", alias: "[review-artifact]/screen.png" }],
-      artifactWarnings: [{ alias: "[review-artifact]/screen.png", message: "没有 2x 图" }]
+      artifactWarnings: [{ alias: "[review-artifact]/screen.png", message: "No 2x image available" }]
     });
     const first = buildReviewPrompt(input);
     const second = buildReviewPrompt(input);
     expect(first).toEqual(second);
-    expect(first.prompt).toContain("不是 plan mode");
-    expect(first.prompt).toContain("不得被 auto、bypassPermissions");
-    expect(first.prompt).toContain("未运行 Windows 集成测试");
+    expect(first.prompt).toContain("not plan mode");
+    expect(first.prompt).toContain("cannot be overridden by auto, bypassPermissions");
+    expect(first.prompt).toContain("Windows integration tests were not run");
     expect(first.prompt).toContain("[review-artifact]/screen.png");
   });
 
@@ -154,8 +154,8 @@ describe("review prompt", () => {
       }
     }));
     expect([...built.prompt].length).toBeLessThanOrEqual(MAX_REVIEW_PROMPT_CHARACTERS);
-    expect(built.prompt).toContain("证据已按长度上限截断");
-    expect(built.prompt).toContain("## 输出格式");
+    expect(built.prompt).toContain("evidence truncated at the length limit");
+    expect(built.prompt).toContain("## Output format");
     expect(built.prompt).not.toContain("\ufffd");
     expect(built.truncated).toBe(true);
   });

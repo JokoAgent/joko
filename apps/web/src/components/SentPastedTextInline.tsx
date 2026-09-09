@@ -1,15 +1,18 @@
 import { FileText } from "lucide-react";
-import { useState, type JSX } from "react";
+import { useMemo, useState, type JSX } from "react";
 import type { Translator } from "./types.js";
 import type { SentPastedTextMessageSegment } from "./sent-pasted-text.js";
 import { SentPastedTextLightbox } from "./SentPastedTextLightbox.js";
 import "./sent-pasted-text.css";
 
-export function SentPastedTextInline({ segment, t }: {
+export function SentPastedTextInline({ ownerKey, segment, t }: {
+  readonly ownerKey: string;
   readonly segment: SentPastedTextMessageSegment;
   readonly t: Translator;
 }): JSX.Element {
+  const sourceOwner = useMemo(() => ({}), [ownerKey, segment.text]);
   const [preview, setPreview] = useState<{
+    readonly owner: object;
     readonly text: string;
     readonly display: string;
     readonly trigger: HTMLElement;
@@ -25,10 +28,11 @@ export function SentPastedTextInline({ segment, t }: {
             aria-label={token.display}
             title={token.display}
             key={`pasted:${index}`}
-            onClick={(event) => setPreview({ text: token.text, display: token.display, trigger: event.currentTarget })}
+            onClick={(event) => setPreview({ owner: sourceOwner, text: token.text, display: token.display, trigger: event.currentTarget })}
           ><FileText aria-hidden="true" /><span>{token.display}</span></button>)}
     </span>
-    {preview !== undefined && <SentPastedTextLightbox
+    {preview !== undefined && preview.owner === sourceOwner && <SentPastedTextLightbox
+      ownerKey={ownerKey}
       text={preview.text}
       display={preview.display}
       labels={{

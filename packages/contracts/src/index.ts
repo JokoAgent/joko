@@ -17,6 +17,7 @@ export * from "./gen/joko/v1/settings_pb.js";
 export * from "./gen/joko/v1/subagent_pb.js";
 export * from "./gen/joko/v1/snapshot_pb.js";
 export * from "./gen/joko/v1/tool_pb.js";
+export * from "./gen/joko/v1/terminal_pb.js";
 export * from "./gen/joko/v1/voice_pb.js";
 export * from "./gen/joko/v1/workspace_pb.js";
 export * from "./well-known.js";

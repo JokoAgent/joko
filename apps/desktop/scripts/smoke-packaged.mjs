@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { sqliteVecElectronSmokeSource } from "../dist/runtime-staging.js";
+import { claudeSessionElectronSmokeSource, sqliteVecElectronSmokeSource, terminalElectronSmokeSource } from "../dist/runtime-staging.js";
 
 // Without arguments this exercises the staged development host. `--unpacked`
 // launches electron-builder's real app.isPackaged output with its external
@@ -25,15 +25,40 @@ if (process.platform === "linux" && !process.env.DISPLAY && !process.env.WAYLAND
   throw new Error("Packaged desktop smoke requires a display server on Linux. Run it under `xvfb-run -a` in headless environments.");
 }
 let sqliteVecSmoke;
+let terminalSmoke;
+let claudeSessionSmoke;
 try {
   // Electron's app.setPath throws when its directory does not already exist.
   // Create the isolated smoke profile before the main module receives it.
   mkdirSync(smokeUserDataPath, { recursive: false, mode: 0o700 });
-  sqliteVecSmoke = await runSqliteVecElectronSmoke(
+  sqliteVecSmoke = await runNativeElectronSmoke(
     executable,
     resolveOrchestratorRuntimeRoot(executable, useUnpackedArtifact),
-    markerDirectory
+    markerDirectory,
+    "sqlite-vec",
+    sqliteVecElectronSmokeSource(process.platform, process.arch)
   );
+  terminalSmoke = await runNativeElectronSmoke(
+    executable,
+    resolveOrchestratorRuntimeRoot(executable, useUnpackedArtifact),
+    markerDirectory,
+    "terminal",
+    terminalElectronSmokeSource(process.platform, process.arch)
+  );
+  if (terminalSmoke.tty !== true || terminalSmoke.input !== true || terminalSmoke.resized !== true || terminalSmoke.exitCode !== 0 || terminalSmoke.hostCleanup !== true) {
+    throw new Error("Electron-Node terminal smoke returned an invalid PTY handshake.");
+  }
+  claudeSessionSmoke = await runNativeElectronSmoke(
+    executable,
+    resolveOrchestratorRuntimeRoot(executable, useUnpackedArtifact),
+    markerDirectory,
+    "session-sdk",
+    claudeSessionElectronSmokeSource(process.platform, process.arch)
+  );
+  if (claudeSessionSmoke.missingSession !== true || claudeSessionSmoke.workerRetired !== true || claudeSessionSmoke.isolatedProfileUnchanged !== true) {
+    throw new Error("Electron-Node Session SDK smoke returned an invalid Worker result.");
+  }
+  process.stdout.write(`${JSON.stringify({ event: "JOKO_DESKTOP_NATIVE_RUNTIME_SMOKE_OK", sqliteVec: sqliteVecSmoke, terminal: terminalSmoke, claudeSession: claudeSessionSmoke })}\n`);
 } catch (error) {
   rmSync(markerDirectory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   throw error;
@@ -114,9 +139,9 @@ if (
   );
 }
 
-async function runSqliteVecElectronSmoke(electronExecutable, runtimeRoot, temporaryRoot) {
-  const smokePath = resolve(temporaryRoot, "sqlite-vec-runtime-smoke.mjs");
-  writeFileSync(smokePath, `${sqliteVecElectronSmokeSource(process.platform, process.arch)}\n`, {
+async function runNativeElectronSmoke(electronExecutable, runtimeRoot, temporaryRoot, name, source) {
+  const smokePath = resolve(temporaryRoot, `${name}-runtime-smoke.mjs`);
+  writeFileSync(smokePath, `${source}\n`, {
     encoding: "utf8",
     flag: "wx",
     mode: 0o600
@@ -132,18 +157,18 @@ async function runSqliteVecElectronSmoke(electronExecutable, runtimeRoot, tempor
     });
     if (result.code !== 0 || result.signal !== null || result.timedOut) {
       throw new Error(
-        `Electron-Node sqlite-vec smoke failed (code=${String(result.code)}, signal=${String(result.signal)}): ${result.stderr.slice(-2_000)}`
+        `Electron-Node ${name} smoke failed (code=${String(result.code)}, signal=${String(result.signal)}): ${result.stderr.slice(-2_000)}`
       );
     }
     let parsed;
     try {
       parsed = JSON.parse(result.stdout);
     } catch {
-      throw new Error(`Electron-Node sqlite-vec smoke returned invalid JSON: ${result.stdout.slice(-1_000)}`);
+      throw new Error(`Electron-Node ${name} smoke returned invalid JSON: ${result.stdout.slice(-1_000)}`);
     }
     if (parsed?.ok !== true || parsed.runtimeRoot !== realpathSync(runtimeRoot) ||
         typeof parsed.version !== "string" || typeof parsed.electronVersion !== "string") {
-      throw new Error("Electron-Node sqlite-vec smoke returned an invalid result identity.");
+      throw new Error(`Electron-Node ${name} smoke returned an invalid result identity.`);
     }
     return parsed;
   } finally {
@@ -172,7 +197,7 @@ function runBoundedChild(executablePath, arguments_, options) {
     timeout.unref();
     child.once("error", (error) => {
       clearTimeout(timeout);
-      reject(new Error("Electron-Node sqlite-vec smoke could not start.", { cause: error }));
+      reject(new Error("Electron-Node native smoke could not start.", { cause: error }));
     });
     child.once("close", (code, signal) => {
       clearTimeout(timeout);

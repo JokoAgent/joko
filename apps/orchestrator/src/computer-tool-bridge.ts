@@ -29,7 +29,7 @@ const LIST_TOOLS_DESCRIPTION =
 const CALL_TOOL_DESCRIPTION =
   "Invoke a local desktop computer-use tool. Arguments are validated before dispatching to the host driver.";
 const COMPUTER_TOOL_WORKFLOW =
-  "Start with status and check_permissions. Use get_accessibility_tree/list_windows, optionally narrow list_windows with query/workspace_root/process_name (for example, {\"process_name\":\"Simulator\"}), inspect a target with get_window_state, perform one action, and call get_window_state again to verify. Targeted actions such as click/type_text require pid; include window_id whenever the target window is known, and always for coordinates. Use get_window_state with {\"capture_mode\":\"vision\"} for screenshots and normally omit screenshot_out_file. Element indices are only valid for the latest snapshot of the same pid/window_id: pass the snapshot_id from get_window_state along with element_index, and re-observe when an action is rejected with STALE_SNAPSHOT. Use start_recording/stop_recording/replay_trajectory only when the user explicitly asks for recording or replay.";
+  "Start with status and check_permissions. Use get_accessibility_tree/list_windows, optionally narrow list_windows with query/workspace_root/process_name (for example, {\"process_name\":\"Simulator\"}), and inspect the exact target with get_window_state. Targeted actions such as click/type_text require pid; include window_id whenever the target window is known, and always for coordinates. Use get_window_state with {\"include_screenshot\":true} for screenshots and leave screenshot_out_file unset for a managed temporary image. Element references only identify the latest observation of the same pid/window_id: use its element_token, or snapshot_id together with element_index. Re-observe after a stale reference or failed observation. After an action, use verify_state for bounded postconditions; only satisfied and stable confirms success. Verification invalidates previous element references, so get_window_state again before another element action. Use start_recording/stop_recording/replay_trajectory only when the user explicitly asks for recording or replay.";
 const EMPTY_OBJECT_SCHEMA = Object.freeze({
   $schema: "https://json-schema.org/draft/2020-12/schema",
   type: "object",
@@ -256,7 +256,7 @@ function createBridgeToolDescriptors(catalog: readonly ComputerToolDescriptor[])
           }),
           args: Object.freeze({
             type: "object",
-            description: "Arguments object for the selected tool（传 JSON 对象本身，不要序列化成字符串）",
+            description: "Arguments object for the selected tool (pass the JSON object itself, not a serialized string)",
             additionalProperties: Object.freeze({})
           })
         }),

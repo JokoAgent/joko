@@ -1,8 +1,9 @@
 import { redactSecrets, type PromptInput } from "@joko/core";
 import type { OperationalStore, PersistedEvent, StoredSession } from "@joko/store";
 
-import type { CredentialManager, ProviderInferenceRoute } from "./credential-manager.js";
-import { requestManagedTextInference, type ModelRouteCatalog } from "./personalization-inference.js";
+import type { CredentialManager } from "./credential-manager.js";
+import type { AuxiliaryTextPlan, AuxiliaryTextRouting } from "./auxiliary-text-routing.js";
+import { hasGeneratedLineLabel } from "./i18n/orchestration-language.js";
 
 const MATERIAL_PAGE_SIZE = 128;
 const SUMMARY_THROTTLE_MS = 20_000;
@@ -20,9 +21,8 @@ export interface SessionTitleSuggestion {
 
 interface SessionNavigationCoordinatorOptions {
   readonly store: OperationalStore;
-  readonly routes: ModelRouteCatalog;
+  readonly auxiliary: AuxiliaryTextRouting;
   readonly credentials?: Pick<CredentialManager, "redactText">;
-  readonly infer?: typeof requestManagedTextInference;
   readonly now?: () => number;
 }
 
@@ -50,9 +50,9 @@ interface MaterialMessage {
  */
 export class SessionNavigationCoordinator {
   readonly #store: OperationalStore;
-  readonly #routes: ModelRouteCatalog;
+  readonly #auxiliary: AuxiliaryTextRouting;
   readonly #credentials?: Pick<CredentialManager, "redactText">;
-  readonly #infer: typeof requestManagedTextInference;
+  readonly #lifetime = new AbortController();
   readonly #now: () => number;
   readonly #titleTails = new Map<string, Promise<void>>();
   readonly #summaryRuns = new Map<string, Promise<void>>();
@@ -62,9 +62,8 @@ export class SessionNavigationCoordinator {
 
   constructor(options: SessionNavigationCoordinatorOptions) {
     this.#store = options.store;
-    this.#routes = options.routes;
+    this.#auxiliary = options.auxiliary;
     this.#credentials = options.credentials;
-    this.#infer = options.infer ?? requestManagedTextInference;
     this.#now = options.now ?? Date.now;
   }
 
@@ -78,6 +77,7 @@ export class SessionNavigationCoordinator {
 
   dispose(): void {
     this.#disposed = true;
+    this.#lifetime.abort();
     this.#unsubscribe?.();
     this.#unsubscribe = undefined;
   }
@@ -85,10 +85,26 @@ export class SessionNavigationCoordinator {
   /** Called only after SessionHost has durably accepted and queued the input. */
   observeAcceptedPrompt(sessionId: string, prompt: PromptInput): void {
     if (this.#disposed || prompt.disposition !== "prompt") return;
+    let source: StoredSession;
+    try { source = this.#store.getSession(sessionId); } catch { return; }
+    const plan = this.#auxiliary.capture();
+    const locale = this.#locale();
+    const localeRevision = this.#localeRevision();
+    const admissionCurrent = (): boolean => {
+      if (this.#disposed || !this.#auxiliary.isCurrent(plan) || this.#localeRevision() !== localeRevision) return false;
+      try {
+        const current = this.#store.getSession(sessionId).descriptor;
+        return current.backendId === source.descriptor.backendId && current.targetId === source.descriptor.targetId
+          && current.binding.generation === source.descriptor.binding.generation
+          && current.binding.opaqueRef === source.descriptor.binding.opaqueRef;
+      } catch {
+        return false;
+      }
+    };
     const previous = this.#titleTails.get(sessionId) ?? Promise.resolve();
     const next = previous
       .catch(() => undefined)
-      .then(() => this.#autoTitle(sessionId, prompt))
+      .then(() => this.#autoTitle(sessionId, prompt, plan, locale, admissionCurrent))
       .catch(() => undefined)
       .finally(() => {
         if (this.#titleTails.get(sessionId) === next) this.#titleTails.delete(sessionId);
@@ -98,27 +114,32 @@ export class SessionNavigationCoordinator {
 
   async suggestTitle(sessionId: string, locale: string, signal?: AbortSignal): Promise<SessionTitleSuggestion> {
     const session = this.#store.getSession(sessionId);
-    if (!this.#supports(session, "session.ai_rename")) {
+    if (!this.#isCurrent(session, "session.ai_rename")) {
       return { title: "", status: "provider_unavailable" };
     }
     const material = this.#conversationMaterial(sessionId, true);
     if (material.text === "") return { title: "", status: "no_material" };
-    const route = this.#route(session);
-    if (route === undefined) return { title: "", status: "provider_unavailable" };
+    const plan = this.#auxiliary.capture();
+    const localeRevision = this.#localeRevision();
+    const ownedSignal = AbortSignal.any([this.#lifetime.signal, ...(signal === undefined ? [] : [signal])]);
+    const stillCurrent = (): boolean => !ownedSignal.aborted
+      && this.#auxiliary.isCurrent(plan)
+      && this.#localeRevision() === localeRevision
+      && this.#isCurrent(session, "session.ai_rename")
+      && this.#sameMaterial(sessionId, material, true);
     try {
-      const raw = await this.#infer({
-        route,
+      const result = await this.#auxiliary.run(plan, {
         system: titleSystemPrompt(locale),
         user: titleUserPrompt(material.text),
         maxTokens: 64,
-        ...(signal === undefined ? {} : { signal }),
-        timeoutMs: 20_000
+        signal: ownedSignal,
+        timeoutMs: 20_000,
+        stillCurrent,
+        validate: (raw) => sanitizeGeneratedLine(this.#redact(raw), 20) || undefined
       });
-      if (signal?.aborted) return { title: "", status: "generation_failed" };
-      const title = sanitizeGeneratedLine(this.#redact(raw), 20);
-      return title === ""
-        ? { title: "", status: "generation_failed" }
-        : { title, status: "ok" };
+      if (!stillCurrent()) return { title: "", status: "generation_failed" };
+      return result.status === "ok" ? { title: result.text, status: "ok" }
+        : { title: "", status: result.status === "unavailable" ? "provider_unavailable" : "generation_failed" };
     } catch {
       return { title: "", status: "generation_failed" };
     }
@@ -160,10 +181,17 @@ export class SessionNavigationCoordinator {
     }
   }
 
-  async #autoTitle(sessionId: string, prompt: PromptInput): Promise<void> {
+  async #autoTitle(
+    sessionId: string,
+    prompt: PromptInput,
+    plan: AuxiliaryTextPlan,
+    locale: string,
+    admissionCurrent: () => boolean
+  ): Promise<void> {
+    if (!admissionCurrent()) return;
     let session: StoredSession;
     try { session = this.#store.getSession(sessionId); } catch { return; }
-    if (!this.#supports(session, "session.auto_title")) return;
+    if (!this.#isCurrent(session, "session.auto_title")) return;
     const source = session.descriptor.titleSource ?? "manual";
     if (source === "manual" || source === "automatic") return;
 
@@ -188,35 +216,34 @@ export class SessionNavigationCoordinator {
       expectedRevision: session.revision
     });
     if (placeholder === undefined) return;
-    const route = this.#route(placeholder);
-    if (route === undefined) {
-      this.#store.finalizeAutomaticSessionTitle(sessionId, placeholder.revision);
-      return;
-    }
-    let raw: string;
+    const stillCurrent = (): boolean => admissionCurrent()
+      && this.#isCurrent(placeholder, "session.auto_title");
     try {
-      raw = await this.#infer({
-        route,
-        system: titleSystemPrompt(this.#locale()),
+      const result = await this.#auxiliary.run(plan, {
+        system: titleSystemPrompt(locale),
         user: titleUserPrompt(safeText),
         maxTokens: 64,
-        timeoutMs: 20_000
+        timeoutMs: 20_000,
+        signal: this.#lifetime.signal,
+        stillCurrent,
+        validate: (raw) => sanitizeGeneratedLine(this.#redact(raw), 20) || undefined
+      });
+      if (!stillCurrent()) return;
+      if (result.status === "unavailable" || result.status === "exhausted") {
+        this.#store.finalizeAutomaticSessionTitle(sessionId, placeholder.revision);
+        return;
+      }
+      if (result.status !== "ok") return;
+      this.#store.updateAutomaticSessionTitle({
+        sessionId,
+        title: result.text,
+        source: "automatic",
+        expectedRevision: placeholder.revision
       });
     } catch {
-      this.#store.finalizeAutomaticSessionTitle(sessionId, placeholder.revision);
+      if (stillCurrent()) this.#store.finalizeAutomaticSessionTitle(sessionId, placeholder.revision);
       return;
     }
-    const title = sanitizeGeneratedLine(this.#redact(raw), 20);
-    if (title === "") {
-      this.#store.finalizeAutomaticSessionTitle(sessionId, placeholder.revision);
-      return;
-    }
-    this.#store.updateAutomaticSessionTitle({
-      sessionId,
-      title,
-      source: "automatic",
-      expectedRevision: placeholder.revision
-    });
   }
 
   async #generateSummary(sessionId: string, force: boolean): Promise<void> {
@@ -224,7 +251,7 @@ export class SessionNavigationCoordinator {
     try { session = this.#store.getSession(sessionId); } catch { return; }
     if (
       !session.descriptor.pinned || session.descriptor.archived || session.descriptor.deletedAt !== undefined ||
-      !this.#supports(session, "session.summary")
+      !this.#isCurrent(session, "session.summary")
     ) return;
     if (
       !force && session.descriptor.summaryUpdatedAt !== undefined &&
@@ -235,32 +262,35 @@ export class SessionNavigationCoordinator {
       this.#store.clearSessionSummary(sessionId);
       return;
     }
-    const route = this.#route(session);
-    if (route === undefined) return;
+    const plan = this.#auxiliary.capture();
+    const locale = this.#locale();
+    const localeRevision = this.#localeRevision();
+    const stillCurrent = (): boolean => !this.#disposed && this.#auxiliary.isCurrent(plan)
+      && this.#localeRevision() === localeRevision
+      && this.#isCurrent(session, "session.summary")
+      && this.#sameMaterial(sessionId, material, false);
     const maximum = summaryMaximum(material, this.#now());
-    let raw: string;
     try {
-      raw = await this.#infer({
-        route,
-        system: summarySystemPrompt(this.#locale(), maximum),
+      const result = await this.#auxiliary.run(plan, {
+        system: summarySystemPrompt(locale, maximum),
         user: summaryUserPrompt(material.text),
         maxTokens: 64,
-        timeoutMs: 20_000
+        timeoutMs: 20_000,
+        signal: this.#lifetime.signal,
+        stillCurrent,
+        validate: (raw) => sanitizeGeneratedLine(this.#redact(raw), maximum) || undefined
+      });
+      if (result.status !== "ok" || !stillCurrent()) return;
+      this.#store.updateGeneratedSessionSummary({
+        sessionId,
+        summary: result.text,
+        sourceCursor: material.sourceCursor,
+        expectedRevision: session.revision,
+        generatedAt: this.#now()
       });
     } catch {
       return;
     }
-    const summary = sanitizeGeneratedLine(this.#redact(raw), maximum);
-    if (summary === "") return;
-    const fresh = this.#conversationMaterial(sessionId, false);
-    if (fresh.sourceCursor !== material.sourceCursor || fresh.text === "") return;
-    this.#store.updateGeneratedSessionSummary({
-      sessionId,
-      summary,
-      sourceCursor: material.sourceCursor,
-      expectedRevision: session.revision,
-      generatedAt: this.#now()
-    });
   }
 
   #conversationMaterial(sessionId: string, excludeActiveRuns: boolean): ConversationMaterial {
@@ -344,12 +374,26 @@ export class SessionNavigationCoordinator {
     }
   }
 
-  #route(session: StoredSession): ProviderInferenceRoute | undefined {
-    const providerId = session.descriptor.providerId;
-    const modelId = session.descriptor.modelId;
-    return providerId === undefined || modelId === undefined
-      ? undefined
-      : this.#routes.resolve({ backendId: session.descriptor.backendId, providerId, modelId });
+  #isCurrent(session: StoredSession, capability: "session.auto_title" | "session.ai_rename" | "session.summary"): boolean {
+    if (this.#disposed) return false;
+    try {
+      const current = this.#store.getSession(session.descriptor.id);
+      return current.revision === session.revision
+        && current.descriptor.binding.generation === session.descriptor.binding.generation
+        && !current.descriptor.archived && current.descriptor.deletedAt === undefined
+        && this.#supports(current, capability);
+    } catch {
+      return false;
+    }
+  }
+
+  #sameMaterial(sessionId: string, expected: ConversationMaterial, excludeActiveRuns: boolean): boolean {
+    const current = this.#conversationMaterial(sessionId, excludeActiveRuns);
+    return current.sourceCursor === expected.sourceCursor && current.text === expected.text;
+  }
+
+  #localeRevision(): bigint {
+    return this.#store.findSetting("service", "orchestrator", "settings.appearance")?.revision ?? 0n;
   }
 
   #redact(value: string): string {
@@ -379,7 +423,7 @@ function sanitizeGeneratedLine(value: string, maximumCodePoints: number): string
   const trimmed = value.trim().replace(/^["'“”‘’]+|["'“”‘’]+$/gu, "").trim();
   if (
     trimmed === "" || /[\r\n]/u.test(trimmed) || /```|<\/?recent_|<\/?conversation/iu.test(trimmed) ||
-    /^(?:title|summary|user|assistant|system|标题|摘要)\s*[:：]/iu.test(trimmed)
+    hasGeneratedLineLabel(trimmed)
   ) return "";
   const normalized = trimmed.replace(/\s+/gu, " ");
   return [...normalized].length <= maximumCodePoints ? normalized : "";

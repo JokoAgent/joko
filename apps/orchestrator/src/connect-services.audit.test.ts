@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { mkdtempSync } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 
 import { Code, ConnectError, type ConnectRouter } from "@connectrpc/connect";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
@@ -740,6 +741,22 @@ describe("Connect security and protocol audit", () => {
       { backendId: "backend-usage", providerId: "provider-usage", modelId: "model-usage", totalTokens: 38n },
       { backendId: "backend-usage-secondary", providerId: "provider-usage", modelId: "model-usage", totalTokens: 17n }
     ]);
+    const report = await invoke(services.backend.getUsageReport, create(contract.GetUsageReportRequestSchema, {
+      group: contract.UsageReportGroup.MODEL, providerId: "provider-usage", modelId: "model-usage", page: { pageSize: 1 }
+    }), context()) as contract.GetUsageReportResponse;
+    expect(report.summary?.usage?.totalTokens).toBe(155n);
+    expect(report.page?.totalSize).toBe(2n);
+    expect(report.entries).toHaveLength(1);
+    expect(report.entries[0]).toMatchObject({ backendId: "backend-usage", providerId: "provider-usage", modelId: "model-usage", referenceAvailable: false });
+    const nextReport = await invoke(services.backend.getUsageReport, create(contract.GetUsageReportRequestSchema, {
+      group: contract.UsageReportGroup.MODEL, providerId: "provider-usage", modelId: "model-usage", page: { pageSize: 1, pageToken: report.page!.nextPageToken }
+    }), context()) as contract.GetUsageReportResponse;
+    expect(nextReport.entries[0]?.backendId).toBe("backend-usage-secondary");
+    expect(nextReport.page?.nextPageToken).toBe("");
+    const noUsage = await invoke(services.backend.getUsageReport, create(contract.GetUsageReportRequestSchema, {
+      group: contract.UsageReportGroup.TASK, providerId: "removed-provider"
+    }), context()) as contract.GetUsageReportResponse;
+    expect(noUsage.entries).toEqual([]);
     await expect(invoke(services.backend.getUsageHistory, { days: 367 }, context())).rejects.toMatchObject({ code: Code.InvalidArgument });
 
     const reference = await invoke(services.backend.getModelPriceOverride, {
@@ -887,7 +904,7 @@ describe("Connect security and protocol audit", () => {
         timelineItemId: "entry-search",
         role: "assistant" as const,
         kind: "text_message" as const,
-        snippet: "可见的 release plan",
+        snippet: "Visible release plan",
         createdAt: 1_234,
         score: 0.75
       }],
@@ -938,7 +955,7 @@ describe("Connect security and protocol audit", () => {
       timelineItemId: "entry-search",
       role: contract.SessionMessageSearchRole.ASSISTANT,
       kind: contract.SessionMessageSearchKind.TEXT_MESSAGE,
-      snippet: "可见的 release plan",
+      snippet: "Visible release plan",
       score: 0.75
     })]);
     expect(response.page).toMatchObject({ nextPageToken: "next-message-page", totalSize: 3n });
@@ -1848,7 +1865,7 @@ describe("Connect security and protocol audit", () => {
     expect(reconnect.snapshot?.backgroundTasks).toEqual([]);
   });
 
-  it("re-samples content-free runtime activity around independent coordinator probes", async () => {
+  it.each(["session", "terminal"])("re-samples content-free runtime activity including %s shell processes", async (owner) => {
     const directory = mkdtempSync(join(tmpdir(), "joko-connect-runtime-activity-"));
     const store = new OperationalStore(join(directory, "orchestrator.db"));
     cleanups.push(() => {
@@ -1865,7 +1882,7 @@ describe("Connect security and protocol audit", () => {
     };
     const inspectRuntimeActivity = vi.fn()
       .mockReturnValueOnce([])
-      .mockReturnValueOnce(["user_shell"]);
+      .mockReturnValueOnce(owner === "session" ? ["user_shell"] : []);
     const markBlockingActivity = vi.fn();
     const services = createConnectServices(stubApplication({
       store,
@@ -1878,7 +1895,8 @@ describe("Connect security and protocol audit", () => {
       },
       scheduler: { hasInFlightActivity: () => false },
       reviewCoordinator: { hasInFlightActivity: () => false },
-      browserTransfers: { hasInFlightActivity: () => true }
+      browserTransfers: { hasInFlightActivity: () => true },
+      terminals: { hasActiveTerminals: () => owner === "terminal" }
     }));
 
     const response = await invoke(services.event.getRuntimeActivity, {}, context()) as {
@@ -2797,8 +2815,13 @@ describe("Connect security and protocol audit", () => {
     expect(beginHumanTakeover).toHaveBeenCalledOnce();
   });
 
-  it("starts a cold Browser after claiming the page-open effect and freezes the started generation", async () => {
+  it.each(["http", "html"] as const)("claims a cold %s Browser page before reading or opening and freezes the started generation", async (sourceKind) => {
     const order: string[] = [];
+    const request = new AbortController();
+    let revoke = (): void => undefined;
+    const unsubscribe = vi.fn();
+    let readSignal: AbortSignal | undefined;
+    let pageSnapshot: Parameters<import("@joko/tool-browser").BrowserProvider["openHumanPage"]>[2];
     let generation = 0;
     let takeover: {
       readonly providerId: string;
@@ -2818,8 +2841,9 @@ describe("Connect security and protocol audit", () => {
       readonly generation: number;
       readonly owner: string;
       readonly url: string;
-    }) => {
+    }, _ttl?: number, snapshot?: Parameters<import("@joko/tool-browser").BrowserProvider["openHumanPage"]>[2]) => {
       order.push("open");
+      pageSnapshot = snapshot;
       takeover = {
         providerId: binding.providerId,
         pageId: "page-opened",
@@ -2862,7 +2886,8 @@ describe("Connect security and protocol audit", () => {
       payload: { case: "openBrowserPage", value: create(contract.OpenBrowserPageMutationSchema, {
         browserProviderId: "browser",
         sessionId: "session-browser-open",
-        url: "https://example.test/open"
+        url: sourceKind === "http" ? "https://example.test/open" : "",
+        ...(sourceKind === "html" ? { workspaceHtml: { workspaceId: "workspace-html", relativePath: "index.html", expectedRevision: `workspace-html:${createHash("sha256").update(JSON.stringify(["workspace-authority", "index.html", "revision-html"])).digest("hex")}` } } : {})
       }) }
     });
     const assertHumanTakeover = vi.fn((expected: typeof takeover) => {
@@ -2872,6 +2897,7 @@ describe("Connect security and protocol audit", () => {
       store: {
         findOperation: () => undefined,
         findPendingSessionLifecycleCleanup: () => undefined,
+        getTarget: () => ({ descriptor: { id: "target-browser-open" }, metadata: { workspaceId: "workspace-html" }, revision: 1n }),
         getSession: () => ({ descriptor: {
           id: "session-browser-open",
           targetId: "target-browser-open",
@@ -2881,6 +2907,12 @@ describe("Connect security and protocol audit", () => {
         } })
       },
       sessionHost: { mutate },
+      workspaces: { capturePreviewAuthority: async (_workspaceId: string, signal?: AbortSignal) => { readSignal = signal; return { identity: "workspace-authority", assertCurrent: () => undefined, preview: vi.fn(async () => {
+        expect(order).toEqual(["claim", "start"]);
+        order.push("read");
+        expect(JSON.stringify(mutation, (_key, value) => typeof value === "bigint" ? value.toString() : value)).not.toContain("Private HTML bytes");
+        return { entry: { path: "index.html", revision: "revision-html" }, mediaType: "text/html", text: "<p>Private HTML bytes</p>", truncated: false };
+      }) }; } },
       browser: {
         id: "browser",
         get generation() { return generation; },
@@ -2898,23 +2930,75 @@ describe("Connect security and protocol audit", () => {
         findRecoverablePage: () => undefined,
         recordHumanPage: vi.fn()
       },
-      connections: { authenticate: () => ({ id: "connection", authKeyDigest: "digest", state: "active" }) }
+      connections: {
+        authenticate: () => ({ id: "connection", authKeyDigest: "digest", state: "active" }), fence: () => undefined,
+        onRevoked: (_id: string, listener: () => void) => { revoke = listener; return unsubscribe; }
+      }
     }));
 
     await invoke(services.operation.submitOperation, {
       operationId: record.id,
       connectionId: "connection",
       mutation
-    }, context());
+    }, context(request.signal));
 
-    expect(order).toEqual(["claim", "start", "open", "commit"]);
+    expect(order).toEqual(sourceKind === "html" ? ["claim", "start", "read", "open", "commit"] : ["claim", "start", "open", "commit"]);
     expect(openHumanPage).toHaveBeenCalledWith({
       providerId: "browser",
       generation: 1,
       owner: "connection",
-      url: "https://example.test/open"
-    }, 42_000);
+      url: sourceKind === "html" ? expect.stringMatching(/^https:\/\/[a-z0-9-]+\.preview\.joko\.invalid\/index\.html$/u) : "https://example.test/open"
+    }, 42_000, sourceKind === "html" ? expect.objectContaining({ html: "<p>Private HTML bytes</p>", assertCurrent: expect.any(Function) }) : undefined);
     expect(assertHumanTakeover).toHaveBeenCalledOnce();
+    expect(unsubscribe).not.toHaveBeenCalled();
+    if (sourceKind === "html") {
+      request.abort();
+      expect(readSignal?.aborted).toBe(false);
+      revoke();
+      expect(readSignal?.aborted).toBe(true);
+      pageSnapshot!.dispose!();
+      pageSnapshot!.dispose!();
+      expect(unsubscribe).toHaveBeenCalledOnce();
+    }
+  });
+
+  it.each(["request", "connection"] as const)("cancels an in-flight HTML snapshot read with its original %s and releases the subscription", async (cause) => {
+    const connections = revocableConnections();
+    const unsubscribe = vi.fn();
+    const onRevoked = connections.onRevoked;
+    connections.onRevoked = vi.fn((id, listener) => {
+      const remove = onRevoked(id, listener);
+      return () => { unsubscribe(); return remove(); };
+    });
+    const request = new AbortController();
+    let started!: () => void;
+    const reading = new Promise<void>((resolve) => { started = resolve; });
+    let readSignal: AbortSignal | undefined;
+    const services = createConnectServices(stubApplication({
+      connections,
+      store: {
+        findPendingSessionLifecycleCleanup: () => undefined,
+        getSession: () => ({ descriptor: { id: "session-html", targetId: "target-html", binding: { generation: 1 }, archived: false } }),
+        getTarget: () => ({ descriptor: { id: "target-html" }, metadata: { workspaceId: "workspace-html" }, revision: 1n })
+      },
+      workspaces: { capturePreviewAuthority: async () => ({
+        identity: "workspace-authority", assertCurrent: () => undefined,
+        preview: async (_path: string, _textBytes: number, _fileBytes: number, signal: AbortSignal) => {
+          readSignal = signal;
+          started();
+          await new Promise<void>((_resolve, reject) => { signal.addEventListener("abort", () => reject(signal.reason), { once: true }); });
+        }
+      }) }
+    }));
+    const pending = invoke(services.workspace.readWorkspaceHtmlSnapshot, {
+      sessionId: "session-html", file: { workspaceId: "workspace-html", relativePath: "index.html", expectedRevision: "" }
+    }, context(request.signal));
+    const rejected = expect(pending).rejects.toThrow();
+    await reading;
+    if (cause === "request") request.abort(); else connections.revoke();
+    expect(readSignal?.aborted).toBe(true);
+    await rejected;
+    expect(unsubscribe).toHaveBeenCalledOnce();
   });
 
   it("rejects cross-task Browser page recovery before observing or mutating the provider", async () => {

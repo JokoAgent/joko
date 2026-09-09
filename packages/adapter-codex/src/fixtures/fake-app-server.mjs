@@ -1,11 +1,32 @@
 import { createInterface } from "node:readline";
 
 const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
+const receivedMethods = [];
 
 lines.on("line", (line) => {
   if (line.length === 0) return;
   const message = JSON.parse(line);
+  receivedMethods.push(message.method);
   if (message.id === undefined) return;
+  if (message.method === "pause-input") {
+    process.stdin.pause();
+    write({ id: message.id, result: {} });
+    setTimeout(() => process.stdin.resume(), 250);
+    return;
+  }
+  if (message.method === "received-methods") {
+    write({ id: message.id, result: receivedMethods });
+    return;
+  }
+  if (message.method === "initialize") {
+    write({ id: message.id, result: { userAgent: "codex/0.153.4", platformFamily: "fixture", platformOs: "fixture" } });
+    return;
+  }
+  if (message.method === "notifications-before-response") {
+    for (const notification of message.params.notifications) write(notification);
+    write({ id: message.id, result: { data: [], nextCursor: null, backwardsCursor: null } });
+    return;
+  }
   if (message.method === "late") {
     setTimeout(() => write({ id: message.id, result: { late: true } }), 60);
     return;

@@ -114,7 +114,7 @@ describe("Inspector production trees", () => {
     await press(items[0], "ArrowRight");
     expect(document.activeElement).toBe(items[1]);
     await press(items[1], "Enter", true);
-    expect(navigateSessionBranch).toHaveBeenCalledWith("session-one", "child", { summarize: false });
+    expect(navigateSessionBranch).toHaveBeenCalledWith("session-one", { kind: "native_entry", entryId: "child" }, { expectedGeneration: 1n, summarize: false });
   });
 
   it("moves through Review hierarchy and collapses its parent with standard tree keys", async () => {

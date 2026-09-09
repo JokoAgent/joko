@@ -1,4 +1,5 @@
 import type { BrowserLease, BrowserProvider, BrowserRemoteNodeRouter } from "@joko/tool-browser";
+import { runInNewContext } from "node:vm";
 import { OperationalStore } from "@joko/store";
 import { describe, expect, it, vi } from "vitest";
 
@@ -7,6 +8,7 @@ import { BUILTIN_BROWSER_RECIPES, BUILTIN_BROWSER_SITE_GUIDES } from "./browser-
 import { BrowserToolBridgeProvider, type BrowserUserKnowledgeLayer } from "./browser-tool-bridge.js";
 import type { BrowserTransferCoordinator } from "./browser-transfers.js";
 import { OperationalBrowserState } from "./operational-browser-state.js";
+import { MULTILINGUAL_FIXTURES } from "./i18n/multilingual-fixtures.js";
 
 function fixture(
   remoteNodes?: BrowserRemoteNodeRouter,
@@ -507,7 +509,7 @@ describe("BrowserToolBridgeProvider", () => {
     })).rejects.toThrow(/unsafe/u);
   });
 
-  it("ships the complete built-in recipe and site-guide catalog without runtime reference dependencies", async () => {
+  it("validates and exposes the built-in recipe and site-guide catalog", async () => {
     expect(BUILTIN_BROWSER_RECIPES).toHaveLength(56);
     expect(BUILTIN_BROWSER_SITE_GUIDES).toHaveLength(56);
     const { bridge, actions, browser } = fixture();
@@ -548,6 +550,30 @@ describe("BrowserToolBridgeProvider", () => {
       expect.stringContaining("document.cookie"),
       undefined
     );
+  });
+
+  it.each([
+    { id: "douban-search", body: MULTILINGUAL_FIXTURES.browserSite.doubanVerification, error: /requires verification/u },
+    { id: "douban-search", body: MULTILINGUAL_FIXTURES.browserSite.doubanEmptyResults, result: [] },
+    { id: "facebook-search", body: MULTILINGUAL_FIXTURES.browserSite.facebookSignIn, error: /requires authentication/u },
+    { id: "xiaohongshu-search", body: MULTILINGUAL_FIXTURES.browserSite.xiaohongshuSignIn, error: /requires authentication/u },
+    { id: "jd-item", body: MULTILINGUAL_FIXTURES.browserSite.jdSpecifications, result: { sku: "123", specs: { Material: "Cotton" } } }
+  ])("recognizes localized page text in the executable $id recipe", async ({ id, body, error, result }) => {
+    const recipes = BUILTIN_BROWSER_RECIPES as readonly { id: string; steps: readonly { action: string; fn?: string }[] }[];
+    const fn = recipes.find((recipe) => recipe.id === id)?.steps.filter((step) => step.action === "evaluate").at(-1)?.fn;
+    expect(fn).toBeDefined();
+    const execution = Promise.resolve().then(() => runInNewContext(`(${fn})()`, {
+      document: {
+        body: { innerText: body },
+        title: "Product",
+        querySelector: () => null,
+        querySelectorAll: () => []
+      },
+      location: { pathname: "/123.html" },
+      setTimeout: (callback: () => void) => callback()
+    }));
+    if (error !== undefined) await expect(execution).rejects.toThrow(error);
+    else await expect(execution).resolves.toMatchObject(result!);
   });
 
   it("hydrates and durably saves the user recipe layer before publishing overrides", async () => {

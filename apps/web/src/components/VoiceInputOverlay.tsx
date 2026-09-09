@@ -5,7 +5,7 @@ import type { Translator } from "./types.js";
 import { IconButton } from "./ui.js";
 
 export function VoiceInputOverlay({ state, transcript, error, stallWarning, canUseTranscript = false, t, onStop, onCancel, onRetry, onUseTranscript }: {
-  readonly state: VoiceMediaState;
+  readonly state: VoiceMediaState | "refining";
   readonly transcript: string;
   readonly error?: string;
   readonly stallWarning: boolean;
@@ -16,7 +16,7 @@ export function VoiceInputOverlay({ state, transcript, error, stallWarning, canU
   readonly onRetry: () => void;
   readonly onUseTranscript?: () => void;
 }): JSX.Element {
-  const processing = state === "starting" || state === "submitting";
+  const processing = state === "starting" || state === "submitting" || state === "refining";
   const failed = state === "error";
   return <section className="voice-input-overlay" aria-live="polite" aria-busy={processing} data-state={state}>
     <header>
@@ -25,7 +25,7 @@ export function VoiceInputOverlay({ state, transcript, error, stallWarning, canU
       </span>
       <strong>{voiceStatusLabel(state, t)}</strong>
       <span className="voice-input-overlay__actions">
-        {state === "listening" && <IconButton label={t("voice.stop")} onClick={onStop}><Check aria-hidden="true" /></IconButton>}
+        {(state === "starting" || state === "listening") && <IconButton label={t("voice.stop")} onClick={onStop}><Check aria-hidden="true" /></IconButton>}
         {failed && canUseTranscript && onUseTranscript !== undefined && <IconButton label={t("voice.stop")} onClick={onUseTranscript}><Check aria-hidden="true" /></IconButton>}
         {failed && <IconButton label={t("common.retry")} onClick={onRetry}><RotateCcw aria-hidden="true" /></IconButton>}
         <IconButton label={t("voice.cancel")} onClick={onCancel}><X aria-hidden="true" /></IconButton>
@@ -42,7 +42,8 @@ export function VoiceInputOverlay({ state, transcript, error, stallWarning, canU
   </section>;
 }
 
-function voiceStatusLabel(state: VoiceMediaState, t: Translator): string {
+function voiceStatusLabel(state: VoiceMediaState | "refining", t: Translator): string {
+  if (state === "refining") return t("voice.refining");
   if (state === "starting") return t("voice.starting");
   if (state === "listening") return t("voice.listening");
   if (state === "submitting") return t("voice.submitting");

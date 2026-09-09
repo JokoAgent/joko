@@ -4,7 +4,7 @@ import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
-import type { AdapterContext, BlobRef, EventPayload, SessionTreeNode, TargetDescriptor } from "@joko/core";
+import type { AdapterContext, BlobRef, EventPayload, NativeSessionBinding, SessionTreeNode, TargetDescriptor } from "@joko/core";
 import { describe, expect, it } from "vitest";
 import { createPiAdapter } from "./adapter.js";
 import { mkdtemp } from "./test-paths.js";
@@ -132,7 +132,7 @@ describe("real Pi managed generation smoke", () => {
       if (navigationTarget === undefined) throw new Error("Pi did not expose the first user entry for branch navigation");
       const navigationNode = findTreeNode(linearTree.roots, navigationTarget);
       if (navigationNode === undefined) throw new Error("Pi fork candidate was missing from the native tree");
-      await adapter.navigateTree(navigationTarget, false, first);
+      await adapter.navigateTree({ kind: "native_entry", entryId: navigationTarget }, false, first, undefined, navigationAuthority);
       await expect(adapter.getTree(first)).resolves.toMatchObject({ leafId: navigationNode.parentId });
       await adapter.send({ text: "workflow branch turn", images: [], files: [], mentions: [], disposition: "prompt" }, first);
       await firstSink.waitForDone(3);
@@ -168,7 +168,12 @@ describe("real Pi managed generation smoke", () => {
 
       const branchMessage = (await adapter.getForkMessages(first)).find((message) => message.text === "workflow branch turn");
       if (branchMessage === undefined) throw new Error("Pi did not expose the branched user entry for forking");
-      const forkResult = await adapter.fork(branchMessage.entryId, first);
+      const forkReceipt: NativeSessionBinding[] = [];
+      const forkResult = await adapter.fork(branchMessage.entryId, first, {
+        sessionId: "real-pi-workflow-fork",
+        recordBinding: (binding) => { forkReceipt.push(binding); }
+      });
+      expect(forkReceipt).toEqual([forkResult.binding]);
       const forkBinding = forkResult.binding;
       expect(forkBinding).toMatchObject({ generation: 1 });
       expect(forkBinding.opaqueRef).not.toBe(firstBinding.opaqueRef);
@@ -181,7 +186,12 @@ describe("real Pi managed generation smoke", () => {
       // untouched fork is intentionally rejected by the native runtime.
       await adapter.send({ text: "workflow fork continuation", images: [], files: [], mentions: [], disposition: "prompt" }, forkContext);
       await forkSink.waitForDone(1);
-      const cloneBinding = await adapter.clone(forkContext);
+      const cloneReceipt: NativeSessionBinding[] = [];
+      const cloneBinding = await adapter.clone(forkContext, {
+        sessionId: "real-pi-workflow-clone",
+        recordBinding: (binding) => { cloneReceipt.push(binding); }
+      });
+      expect(cloneReceipt).toEqual([cloneBinding]);
       expect(cloneBinding).toMatchObject({ generation: 1 });
       expect(cloneBinding.opaqueRef).not.toBe(forkBinding.opaqueRef);
       await expect(adapter.setName("fork binding write", forkContext)).resolves.toBeUndefined();
@@ -785,3 +795,5 @@ async function startOpenAiResponsesServer(requests: Record<string, unknown>[]): 
 async function closeServer(server: Server): Promise<void> {
   await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
 }
+
+const navigationAuthority = { recordBinding: (): never => { throw new Error("Unexpected native context replacement."); } };

@@ -2,7 +2,8 @@ import { OperationalStore } from "@joko/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { ProviderInferenceRoute } from "./credential-manager.js";
-import { createModelRouteCatalog, type ModelRouteCatalog } from "./personalization-inference.js";
+import { AuxiliaryTextRouting } from "./auxiliary-text-routing.js";
+import { createModelRouteCatalog, type ModelRouteCatalog, type requestManagedTextInference } from "./personalization-inference.js";
 import { SessionNavigationCoordinator } from "./session-navigation-coordinator.js";
 
 const stores: OperationalStore[] = [];
@@ -18,8 +19,7 @@ describe("SessionNavigationCoordinator", () => {
     const infer = vi.fn(() => generated.promise);
     const coordinator = new SessionNavigationCoordinator({
       store,
-      routes: modelRouteCatalog(store, route()),
-      infer
+      auxiliary: auxiliaryRouting(store, infer)
     });
     const observed: string[] = [];
     store.subscribe((event) => {
@@ -45,7 +45,7 @@ describe("SessionNavigationCoordinator", () => {
   it("uses an attachment-only placeholder without paid inference and lets later text advance it", async () => {
     const store = fixtureStore();
     const infer = vi.fn(async () => "Readable title");
-    const coordinator = new SessionNavigationCoordinator({ store, routes: modelRouteCatalog(store, route()), infer });
+    const coordinator = new SessionNavigationCoordinator({ store, auxiliary: auxiliaryRouting(store, infer) });
 
     coordinator.observeAcceptedPrompt("session-a", {
       ...prompt(""),
@@ -87,7 +87,7 @@ describe("SessionNavigationCoordinator", () => {
       expect(input.user).toContain("Latest result");
       return "Title\nExplanation";
     });
-    const coordinator = new SessionNavigationCoordinator({ store, routes: modelRouteCatalog(store, route()), infer });
+    const coordinator = new SessionNavigationCoordinator({ store, auxiliary: auxiliaryRouting(store, infer) });
 
     await expect(coordinator.suggestTitle("session-a", "en")).resolves.toEqual({
       title: "",
@@ -127,7 +127,7 @@ describe("SessionNavigationCoordinator", () => {
       );
     }
     const infer = vi.fn(async () => "Pinned summary");
-    const coordinator = new SessionNavigationCoordinator({ store, routes: modelRouteCatalog(store, route()), infer });
+    const coordinator = new SessionNavigationCoordinator({ store, auxiliary: auxiliaryRouting(store, infer) });
 
     coordinator.start();
 
@@ -144,7 +144,7 @@ describe("SessionNavigationCoordinator", () => {
     const responses = [Promise.resolve("Release repaired"), delayedSummary.promise] as const;
     let call = 0;
     const infer = vi.fn(() => responses[call++]!);
-    const coordinator = new SessionNavigationCoordinator({ store, routes: modelRouteCatalog(store, route()), infer, now: () => 100 });
+    const coordinator = new SessionNavigationCoordinator({ store, auxiliary: auxiliaryRouting(store, infer), now: () => 100 });
 
     coordinator.refreshSummary("session-a", true);
     await vi.waitFor(() => expect(store.getSession("session-a").descriptor.summary).toBe("Release repaired"));
@@ -169,9 +169,8 @@ describe("SessionNavigationCoordinator", () => {
     });
     const coordinator = new SessionNavigationCoordinator({
       store,
-      routes: modelRouteCatalog(store, route()),
-      credentials: { redactText: (value) => value.replaceAll("secret-value", "[redacted]") },
-      infer
+      auxiliary: auxiliaryRouting(store, infer),
+      credentials: { redactText: (value) => value.replaceAll("secret-value", "[redacted]") }
     });
 
     coordinator.observeAcceptedPrompt("session-a", prompt("Inspect secret-value deployment"));
@@ -206,19 +205,22 @@ describe("SessionNavigationCoordinator", () => {
       expect(input.user).not.toContain("Internal continuation must stay hidden");
       return "Release repaired";
     });
-    const coordinator = new SessionNavigationCoordinator({ store, routes: modelRouteCatalog(store, route()), infer, now: () => 13 });
+    const coordinator = new SessionNavigationCoordinator({ store, auxiliary: auxiliaryRouting(store, infer), now: () => 13 });
 
     coordinator.refreshSummary("session-a", true);
     await vi.waitFor(() => expect(store.getSession("session-a").descriptor.summary).toBe("Release repaired"));
     coordinator.dispose();
   });
 
-  it("never sends native Backend navigation content to a managed route with the same Provider and model IDs", async () => {
+  it("uses the auxiliary route for native Sessions without borrowing their inference credentials", async () => {
     const store = fixtureStore();
     appendMessage(store, "native-user", "user", "Keep this task on the native Backend", 10);
     store.updateSession("session-a", { pinned: true });
-    const infer = vi.fn(async () => "Must never be used");
-    const routes = modelRouteCatalog(store, route(), [
+    const infer = vi.fn(async (input: Parameters<typeof requestManagedTextInference>[0]) => {
+      expect(input.route).toMatchObject({ backendId: "managed-backend" });
+      return "Auxiliary title";
+    });
+    const routes = modelRouteCatalog(store, [route("managed-backend")], [
       { backendId: "pi", managedCatalog: false },
       { backendId: "managed-backend", managedCatalog: true }
     ]);
@@ -228,27 +230,145 @@ describe("SessionNavigationCoordinator", () => {
     ]);
     const coordinator = new SessionNavigationCoordinator({
       store,
-      routes,
-      infer
+      auxiliary: auxiliaryRouting(store, infer, routes),
+      now: () => 13
     });
 
     await expect(coordinator.suggestTitle("session-a", "en")).resolves.toEqual({
-      title: "",
-      status: "provider_unavailable"
+      title: "Auxiliary title",
+      status: "ok"
     });
     coordinator.observeAcceptedPrompt("session-a", prompt("Do not cross the Backend boundary"));
     await vi.waitFor(() => expect(store.getSession("session-a").descriptor).toMatchObject({
-      title: "Do not cross the Backend boundary",
+      title: "Auxiliary title",
       titleSource: "automatic"
     }));
     coordinator.refreshSummary("session-a", true);
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    expect(infer).not.toHaveBeenCalled();
-    expect(store.getSession("session-a").descriptor.summary).toBeUndefined();
+    expect(infer).toHaveBeenCalledTimes(3);
+    expect(store.getSession("session-a").descriptor.summary).toBe("Auxiliary title");
     coordinator.dispose();
   });
+
+  it("validates every title and summary candidate before using the configured fallback", async () => {
+    const store = fixtureStore();
+    appendMessage(store, "fallback-user", "user", "Repair the release", 10);
+    store.updateSession("session-a", { pinned: true });
+    const routes = modelRouteCatalog(store, [route("primary"), route("secondary")], [
+      { backendId: "primary", managedCatalog: true },
+      { backendId: "secondary", managedCatalog: true }
+    ]);
+    const infer = vi.fn(async (input: Parameters<typeof requestManagedTextInference>[0]) =>
+      "backendId" in input.route && input.route.backendId === "primary" ? "Title: invalid" : "Good result"
+    );
+    const auxiliary = auxiliaryRouting(store, infer, routes);
+    auxiliary.replace([
+      { backendId: "primary", providerId: "provider-a", modelId: "model-a" },
+      { backendId: "secondary", providerId: "provider-a", modelId: "model-a" }
+    ], 0n);
+    const coordinator = new SessionNavigationCoordinator({ store, auxiliary, now: () => 13 });
+
+    await expect(coordinator.suggestTitle("session-a", "en")).resolves.toEqual({ title: "Good result", status: "ok" });
+    coordinator.observeAcceptedPrompt("session-a", prompt("Repair the release"));
+    await vi.waitFor(() => expect(store.getSession("session-a").descriptor.title).toBe("Good result"));
+    coordinator.refreshSummary("session-a");
+    await vi.waitFor(() => expect(store.getSession("session-a").descriptor.summary).toBe("Good result"));
+    expect(infer.mock.calls.map(([input]) => "backendId" in input.route ? input.route.backendId : undefined))
+      .toEqual(["primary", "secondary", "primary", "secondary", "primary", "secondary"]);
+    coordinator.dispose();
+  });
+
+  it.each(["automatic title", "title suggestion", "summary"] as const)(
+    "does not publish an old %s after auxiliary settings change",
+    async (consumer) => {
+      const store = fixtureStore();
+      appendMessage(store, "pending-user", "user", "Repair the release", 10);
+      store.updateSession("session-a", { pinned: true });
+      const delayed = deferred<string>();
+      const infer = vi.fn(() => delayed.promise);
+      const auxiliary = auxiliaryRouting(store, infer);
+      const coordinator = new SessionNavigationCoordinator({ store, auxiliary, now: () => 13 });
+      let suggestion: Promise<unknown> | undefined;
+      if (consumer === "automatic title") coordinator.observeAcceptedPrompt("session-a", prompt("Repair the release"));
+      else if (consumer === "summary") coordinator.refreshSummary("session-a");
+      else suggestion = coordinator.suggestTitle("session-a", "en");
+      await vi.waitFor(() => expect(infer).toHaveBeenCalledOnce());
+
+      auxiliary.replace([], 0n);
+      auxiliary.invalidate();
+      delayed.resolve("Outdated result");
+      if (suggestion !== undefined) await expect(suggestion).resolves.toEqual({ title: "", status: "generation_failed" });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(store.getSession("session-a").descriptor.summary).toBeUndefined();
+      expect(store.getSession("session-a").descriptor.title).not.toBe("Outdated result");
+      if (consumer === "automatic title") expect(store.getSession("session-a").descriptor.titleSource).toBe("placeholder");
+      expect(infer).toHaveBeenCalledOnce();
+      coordinator.dispose();
+    }
+  );
+
+  it.each(["generation", "material", "locale", "dispose", "caller cancellation"] as const)(
+    "discards a title suggestion after its %s changes",
+    async (fence) => {
+      const store = fixtureStore();
+      appendMessage(store, "suggestion-user", "user", "Repair the release", 10);
+      const delayed = deferred<string>();
+      const infer = vi.fn(() => delayed.promise);
+      const coordinator = new SessionNavigationCoordinator({ store, auxiliary: auxiliaryRouting(store, infer) });
+      const caller = new AbortController();
+      const pending = coordinator.suggestTitle("session-a", "en", caller.signal);
+      await vi.waitFor(() => expect(infer).toHaveBeenCalledOnce());
+      if (fence === "generation") {
+        const current = store.getSession("session-a");
+        store.updateSession("session-a", { binding: { ...current.descriptor.binding, generation: 1 } }, current.revision);
+      } else if (fence === "material") appendMessage(store, "suggestion-new-user", "user", "A new task", 11);
+      else if (fence === "locale") store.setSetting("service", "orchestrator", "settings.appearance", { locale: "zh" });
+      else if (fence === "dispose") coordinator.dispose();
+      else caller.abort();
+      delayed.resolve("Outdated title");
+      await expect(pending).resolves.toEqual({ title: "", status: "generation_failed" });
+      coordinator.dispose();
+    }
+  );
+
+  it.each(["auxiliary revision", "generation", "locale"] as const)(
+    "does not redirect an accepted automatic title after %s changes before its first continuation",
+    async (fence) => {
+      const store = fixtureStore();
+      const infer = vi.fn(async () => "Stale title");
+      const auxiliary = auxiliaryRouting(store, infer);
+      const coordinator = new SessionNavigationCoordinator({ store, auxiliary });
+      coordinator.observeAcceptedPrompt("session-a", prompt("Original request"));
+      if (fence === "auxiliary revision") auxiliary.replace([], 0n);
+      else if (fence === "locale") store.setSetting("service", "orchestrator", "settings.appearance", { locale: "zh" });
+      else {
+        const current = store.getSession("session-a");
+        store.updateSession("session-a", { binding: { ...current.descriptor.binding, generation: 1 } }, current.revision);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(infer).not.toHaveBeenCalled();
+      expect(store.getSession("session-a").descriptor.title).toBe("New task");
+      coordinator.dispose();
+    }
+  );
 });
+
+function auxiliaryRouting(
+  store: OperationalStore,
+  infer: typeof requestManagedTextInference,
+  routes: ModelRouteCatalog = modelRouteCatalog(store, [route("pi")])
+): AuxiliaryTextRouting {
+  return new AuxiliaryTextRouting({
+    store, routes, infer,
+    providers: {
+      generation: 0,
+      describeInferenceRoute: (backendId, providerId, modelId) => routes.list()
+        .some((candidate) => candidate.backendId === backendId && candidate.providerId === providerId && candidate.modelId === modelId && candidate.credentialRoute)
+        ? { generationId: "provider-generation" } : undefined
+    }
+  });
+}
 
 function fixtureStore(): OperationalStore {
   const store = new OperationalStore(":memory:");
@@ -323,8 +443,9 @@ function appendMessage(
   });
 }
 
-function route(): ProviderInferenceRoute {
+function route(backendId: string): ProviderInferenceRoute {
   return {
+    backendId,
     providerId: "provider-a",
     generationId: "provider-generation",
     modelId: "model-a",
@@ -337,11 +458,12 @@ function route(): ProviderInferenceRoute {
 
 function modelRouteCatalog(
   store: OperationalStore,
-  inferenceRoute: ProviderInferenceRoute,
+  inferenceRoutes: readonly ProviderInferenceRoute[],
   backends: readonly { readonly backendId: string; readonly managedCatalog: boolean }[] = [
     { backendId: "pi", managedCatalog: true }
   ]
 ): ModelRouteCatalog {
+  const catalogModel = inferenceRoutes[0]!;
   for (const { backendId, managedCatalog } of backends) {
     const existing = store.listBackends().find((record) => record.descriptor.id === backendId)?.descriptor;
     store.upsertBackend({
@@ -361,13 +483,13 @@ function modelRouteCatalog(
         ] as const] : [])
       ]),
       models: [{
-        providerId: inferenceRoute.providerId,
-        modelId: inferenceRoute.modelId,
-        displayName: inferenceRoute.modelId,
-        api: inferenceRoute.api,
+        providerId: catalogModel.providerId,
+        modelId: catalogModel.modelId,
+        displayName: catalogModel.modelId,
+        api: catalogModel.api,
         contextWindow: 128_000,
         maxOutputTokens: 16_000,
-        supportsImages: inferenceRoute.supportsImages,
+        supportsImages: catalogModel.supportsImages,
         thinkingLevels: [],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
       }],
@@ -376,12 +498,10 @@ function modelRouteCatalog(
     });
   }
   return createModelRouteCatalog(store, {
-    hasInferenceModel: (providerId, modelId) =>
-      providerId === inferenceRoute.providerId && modelId === inferenceRoute.modelId,
-    resolveInferenceRoute: (providerId, modelId) =>
-      providerId === inferenceRoute.providerId && modelId === inferenceRoute.modelId
-        ? inferenceRoute
-        : undefined
+    hasInferenceModel: (backendId, providerId, modelId) => inferenceRoutes.some((candidate) =>
+      candidate.backendId === backendId && candidate.providerId === providerId && candidate.modelId === modelId),
+    resolveInferenceRoute: (backendId, providerId, modelId) => inferenceRoutes.find((candidate) =>
+      candidate.backendId === backendId && candidate.providerId === providerId && candidate.modelId === modelId)
   });
 }
 

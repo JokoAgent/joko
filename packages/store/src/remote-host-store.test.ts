@@ -351,11 +351,20 @@ describe("owner-scoped Remote Host persistence", () => {
       id: "bad-agent",
       authenticationMode: "system_agent",
       credentialReferenceId: "credential:not-allowed"
-    })).toThrow(/cannot persist a credential reference/u);
+    })).toThrow(/authentication metadata is inconsistent/u);
     expect(() => createHost(fixture.store, {
       id: "bad-key",
       authenticationMode: "private_key"
-    })).toThrow(/requires a credential reference/u);
+    })).toThrow(/authentication metadata is inconsistent/u);
+    const nodeKey = { id: "id_build_ed25519", expectedFingerprint: `SHA256:${"a".repeat(43)}` };
+    const selected = createHost(fixture.store, { id: "selected-key", authenticationMode: "node_key", nodeKey });
+    expect(selected.nodeKey).toEqual(nodeKey);
+    expect(selected.credentialReferenceId).toBeUndefined();
+    for (const invalid of [
+      { authenticationMode: "system_agent" as const, nodeKey },
+      { authenticationMode: "node_key" as const },
+      { authenticationMode: "node_key" as const, nodeKey, credentialReferenceId: "credential:unexpected" }
+    ]) expect(() => createHost(fixture.store, { id: "invalid-selected-key", ...invalid })).toThrow(/authentication metadata is inconsistent/u);
 
     const target = fixture.store.upsertTarget({
       id: "target-a",
@@ -399,6 +408,9 @@ describe("owner-scoped Remote Host persistence", () => {
       hostId: "build",
       workspaceRoot: "/srv/next"
     });
+    expect(restarted.getRemoteHost("owner-a", "target-a", "selected-key").nodeKey).toEqual(nodeKey);
+    const cleared = restarted.updateRemoteHost({ ownerId: selected.ownerId, targetId: selected.targetId, id: selected.id, expectedRevision: selected.revision, authenticationMode: "system_agent", nodeKey: null });
+    expect(cleared.nodeKey).toBeUndefined();
     expect(restarted.getSession("remote-session").descriptor.remoteWorkspace).toEqual({
       hostId: "build",
       workspaceRoot: "/srv/project"
@@ -509,7 +521,7 @@ describe("owner-scoped Remote Host persistence", () => {
         .map((row) => String(row["name"]));
       expect(columns).toEqual([
         "owner_id", "target_id", "host_id", "hostname", "port", "username", "source",
-        "credential_reference_id", "trust_algorithm", "trust_fingerprint", "trust_pinned_at",
+        "credential_reference_id", "node_key_id", "node_key_fingerprint", "trust_algorithm", "trust_fingerprint", "trust_pinned_at",
         "status", "status_changed_at", "failure_code", "failure_retryable",
         "created_at", "updated_at", "revision", "authentication_mode"
       ]);

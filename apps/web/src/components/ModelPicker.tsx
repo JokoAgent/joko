@@ -440,7 +440,7 @@ export function ModelPicker({
     }
   };
 
-  const selectedLabel = connectSourceRequired
+  const selectedLabel = connectSourceRequired && value === undefined
     ? t("modelPicker.connectSource")
     : selectedModel?.name ?? (value === undefined ? defaultLabel ?? t("modelPicker.default") : value.modelId);
   const selectedEffortLabel = effortEnabled && selectedModel !== undefined && value?.effort !== undefined
@@ -541,10 +541,9 @@ export function ModelPicker({
       ref={triggerRef}
       type="button"
       className={cx("model-picker-trigger", className)}
-      aria-label={connectSourceRequired
-        ? t("modelPicker.connectSource")
-        : selectedModelUnavailable
+      aria-label={selectedModelUnavailable
         ? `${ariaLabel ?? t("controls.model")}: ${selectedLabel} · ${t("modelPicker.sourceDisconnected")}`
+        : connectSourceRequired ? t("modelPicker.connectSource")
         : ariaLabel ?? t("controls.model")}
       aria-haspopup="dialog"
       aria-expanded={open}
@@ -556,7 +555,7 @@ export function ModelPicker({
       }}
     >
       <span className="model-picker-trigger__mark">{providerMark(selectedModel?.providerName ?? "", selectedModel?.providerId ?? value?.providerId ?? "")}</span>
-      <span className={cx("model-picker-trigger__label", selectedModelUnavailable && !connectSourceRequired && "is-unavailable")}><strong>{selectedLabel}</strong>{value !== undefined && !connectSourceRequired && <small>{selectedModel?.providerName ?? value.providerId}{selectedModelUnavailable ? ` · ${t("modelPicker.sourceDisconnected")}` : ""}</small>}</span>
+      <span className={cx("model-picker-trigger__label", selectedModelUnavailable && "is-unavailable")}><strong>{selectedLabel}</strong>{value !== undefined && <small>{selectedModel?.providerName ?? value.providerId}{selectedModelUnavailable ? ` · ${t("modelPicker.sourceDisconnected")}` : ""}</small>}</span>
       <span className="model-picker-trigger__configuration">
         {selectedEffortLabel !== undefined && <small>{selectedEffortLabel}</small>}
         {fastEnabled && selectedModel !== undefined && value !== undefined && value.fastMode && selectedModel.supportsFast && <Zap aria-label={t("controls.fast")} />}

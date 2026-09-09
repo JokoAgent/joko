@@ -41,7 +41,7 @@ describe("Orchestrator restart recovery and unattended schedules", () => {
     const queued = await submit(
       paired.clients.operation,
       paired.connectionId,
-      sendInputMutation(sessionId, "may already have external effects"),
+      sendInputMutation(sessionId, BigInt(fixture!.application.store.getSession(sessionId).descriptor.binding.generation), "may already have external effects"),
       operationId
     );
     const queueItemId = queueItemIdFrom(queued);
@@ -102,7 +102,7 @@ describe("Orchestrator restart recovery and unattended schedules", () => {
     const queued = await submit(
       paired.clients.operation,
       paired.connectionId,
-      sendInputMutation(sessionId, "durable before dispatch")
+      sendInputMutation(sessionId, BigInt(fixture!.application.store.getSession(sessionId).descriptor.binding.generation), "durable before dispatch")
     );
     const queueItemId = queueItemIdFrom(queued);
     const runId = queueRunIdFrom(queued);

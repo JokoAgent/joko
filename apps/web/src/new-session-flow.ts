@@ -8,6 +8,13 @@ export interface DelayedNewSessionDraft extends Omit<NewSessionDraft, "targetId"
   readonly selection: NewSessionDraftSelection;
 }
 
+/** The initiating draft activation; a later route with the same values is a new owner. */
+export interface NewSessionSubmissionOwner {
+  readonly ownerDocument: Document;
+  readonly signal: AbortSignal;
+  readonly isCurrent: () => boolean;
+}
+
 /**
  * A draft route has no product session until its first real input. Once the
  * session exists, expose it before dispatching the durable input so a failed
@@ -19,9 +26,15 @@ export async function createSessionFromFirstInput(
   input: ComposerDraft,
   onCreated: (sessionId: string) => void | Promise<void>
 ): Promise<string> {
-  const sessionId = await api.createSession(session);
-  await onCreated(sessionId);
-  await api.send(sessionId, input);
+  const { sessionId, generation } = await api.createSession(session);
+  let presentationFailure: { readonly error: unknown } | undefined;
+  try {
+    await onCreated(sessionId);
+  } catch (error) {
+    presentationFailure = { error };
+  }
+  await api.send(sessionId, input, { expectedGeneration: generation });
+  if (presentationFailure !== undefined) throw presentationFailure.error;
   return sessionId;
 }
 

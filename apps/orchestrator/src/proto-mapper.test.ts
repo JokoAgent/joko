@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { ProviderApiCompatibility, ProviderConfigurationField } from "@joko/contracts";
 import { AuthenticationState, BackgroundTaskState, CompactionState, ContextRebuildReason, EventSchema, InlineTextRangeSchema, InputContentSchema, InstallationState, InteractionState, MessageInputDelivery, ModelPriceSource, QueueSourceKind, ReviewFreshnessState, RetryState, RunState, ScheduleExecutionMode, ScheduleFireSource, ScheduleRunPhase, ScheduleSessionMode, ToolCallOutputMode } from "@joko/contracts";
 import type { EventPayload, PiEventMetadata, ProviderModel, SubagentRunDetail, SubagentTranscriptEntry } from "@joko/core";
 import { OperationConflictError, type InteractionRecord, type PersistedEvent, type QueueItemRecord, type ScheduleRecord, type ScheduleRunRecord, type StoredAttempt, type StoredBackend, type StoredRun, type StoredSession } from "@joko/store";
@@ -56,6 +57,11 @@ describe("proto mapper", () => {
           recovery: "Authenticate again."
         },
         capabilities: new Map(),
+        providerRuntimeSupport: {
+          protocols: ["anthropic-messages", "openai-responses", "openai-completions", "google-generative-ai"],
+          fields: ["request_path", "models_endpoint", "headers", "keyless", "auth_header", "model_limits",
+            "model_costs", "model_input_modalities", "model_thinking_levels", "model_sampling", "model_compatibility", "model_fast_mode"]
+        },
         models: [],
         tools: [],
         diagnostics: []
@@ -74,6 +80,17 @@ describe("proto mapper", () => {
       authenticationState: AuthenticationState.EXPIRED,
       error: { code: "AUTH_EXPIRED" }
     });
+    expect(proto.providerRuntimeSupport).toMatchObject({
+      protocols: [ProviderApiCompatibility.ANTHROPIC_MESSAGES, ProviderApiCompatibility.OPENAI_RESPONSES,
+        ProviderApiCompatibility.OPENAI_COMPLETIONS, ProviderApiCompatibility.GOOGLE_GENERATIVE_AI],
+      fields: [ProviderConfigurationField.REQUEST_PATH, ProviderConfigurationField.MODELS_ENDPOINT,
+        ProviderConfigurationField.HEADERS, ProviderConfigurationField.KEYLESS, ProviderConfigurationField.AUTH_HEADER,
+        ProviderConfigurationField.MODEL_LIMITS, ProviderConfigurationField.MODEL_COSTS,
+        ProviderConfigurationField.MODEL_INPUT_MODALITIES, ProviderConfigurationField.MODEL_THINKING_LEVELS,
+        ProviderConfigurationField.MODEL_SAMPLING, ProviderConfigurationField.MODEL_COMPATIBILITY, ProviderConfigurationField.MODEL_FAST_MODE]
+    });
+    const { providerRuntimeSupport: _support, ...withoutProviderSupport } = stored.descriptor;
+    expect(toProtoBackend({ ...stored, descriptor: withoutProviderSupport }).providerRuntimeSupport).toBeUndefined();
   });
 
   it("keeps product and Backend instance generations independent on Attempt and Queue projections", () => {
@@ -681,7 +698,7 @@ describe("proto mapper", () => {
       images: [{
         blob: {
           id: "image-1",
-          sha256: `sha256:${"a".repeat(64)}`,
+          sha256: "a".repeat(64),
           byteLength: 12,
           mimeType: "image/png",
           fileName: "image.png"
@@ -691,7 +708,7 @@ describe("proto mapper", () => {
       files: [{
         blob: {
           id: "file-1",
-          sha256: `sha256:${"b".repeat(64)}`,
+          sha256: "b".repeat(64),
           byteLength: 8,
           mimeType: "text/plain",
           fileName: "notes.txt"
@@ -699,6 +716,8 @@ describe("proto mapper", () => {
       }],
       mentions: [
         { kind: "workspace_file" as const, label: "README", reference: "README.md" },
+        { kind: "workspace_file" as const, label: "selected lines", reference: "README.md", lineRange: { startLine: 2, endLine: 5 } },
+        { kind: "workspace_directory" as const, label: "sources", reference: "src" },
         { kind: "resource" as const, label: "Docs", reference: "resource-1" }
       ],
       disposition: "steer" as const,
@@ -707,6 +726,16 @@ describe("proto mapper", () => {
     };
 
     expect(fromProtoInputContent(toProtoInputContent(input), "steer")).toEqual(input);
+  });
+
+  it.each([
+    { directory: true, lineRange: { startLine: 1, endLine: 2 } },
+    { directory: false, lineRange: { startLine: 0, endLine: 2 } },
+    { directory: false, lineRange: { startLine: 3, endLine: 2 } }
+  ])("rejects invalid workspace mention ranges at the wire boundary: %j", (metadata) => {
+    expect(() => fromProtoInputContent(create(InputContentSchema, {
+      parts: [{ content: { case: "workspaceMention", value: { relativePath: "src/main.ts", ...metadata } } }]
+    }))).toThrow("Line ranges require a file");
   });
 
   it("rejects malformed pasted-text UTF-16 ranges instead of repairing them", () => {
@@ -747,7 +776,7 @@ describe("proto mapper", () => {
       pastedTextRanges: [{ start: 44, end: 49, display: "Pasted text (1 line)" }],
       automationOrigin: { kind: "scheduler", scheduleId: "schedule-1", scheduleName: "Nightly", runId: "run-1" },
       inputDelivery: "scheduler",
-      nativeHistory: { identity: { entryId: "entry-user", parentEntryId: "entry-parent" } }
+      nativeHistory: { identity: { entryId: "entry-user", rewindBefore: { kind: "session_start" } } }
     };
     const event: PersistedEvent = {
       id: "event-user-quote",
@@ -772,7 +801,7 @@ describe("proto mapper", () => {
         userInput: { quotesEncoded: true },
         inputDelivery: MessageInputDelivery.SCHEDULER,
         automationOrigin: { scheduleId: "schedule-1", scheduleName: "Nightly", runId: "run-1" },
-        nativeIdentity: { entryId: "entry-user", parentEntryId: "entry-parent" }
+        nativeIdentity: { entryId: "entry-user", rewindBefore: { kind: { case: "sessionStart", value: {} } } }
       }
     });
     expect(fromProtoEvent(proto).payload).toEqual(payload);
@@ -847,7 +876,7 @@ describe("proto mapper", () => {
           kind: "image",
           blob: {
             id: "assistant-image",
-            sha256: `sha256:${"a".repeat(64)}`,
+            sha256: "a".repeat(64),
             byteLength: 42,
             mimeType: "image/png",
             fileName: "answer.png"
@@ -858,7 +887,7 @@ describe("proto mapper", () => {
           kind: "artifact",
           blob: {
             id: "assistant-file",
-            sha256: `sha256:${"b".repeat(64)}`,
+            sha256: "b".repeat(64),
             byteLength: 64,
             mimeType: "text/plain",
             fileName: "answer.txt"
@@ -974,7 +1003,7 @@ describe("proto mapper", () => {
   it("round-trips typed tool-result images without embedding binary data in text output", () => {
     const image = {
       id: "tool-image",
-      sha256: `sha256:${"a".repeat(64)}`,
+      sha256: "a".repeat(64),
       byteLength: 12,
       mimeType: "image/png",
       fileName: "preview.png"
@@ -1021,6 +1050,25 @@ describe("proto mapper", () => {
     });
     expect(fromProtoEvent(proto).payload).toEqual(payload);
     expect(JSON.stringify(proto, (_key, value) => typeof value === "bigint" ? value.toString() : value)).not.toContain("base64");
+  });
+
+  it("preserves audio metadata and independent artwork through each binary event shape", () => {
+    const blob = { id: "track", sha256: "a".repeat(64), byteLength: 204, mimeType: "audio/wav", fileName: "track.wav" };
+    const audioMetadata = { kind: "music" as const, title: "A title", description: "Piano", durationSeconds: 12,
+      artwork: { blob: { id: "cover", sha256: "b".repeat(64), byteLength: 99, mimeType: "image/png" }, width: 2, height: 2, alt: "Independent cover" } };
+    const artifact = { kind: "artifact" as const, blob, label: "Track", audioMetadata };
+    const payloads: EventPayload[] = [
+      { type: "artifact", artifact: blob, purpose: "audio", audioMetadata },
+      { type: "message_complete", role: "assistant", blocks: [artifact] },
+      { type: "tool_result", callId: "tracks", name: "tracks", output: "Published", parts: [{ kind: "text", text: "Published" }, artifact], isError: false }
+    ];
+    for (const payload of payloads) {
+      const event: PersistedEvent = { id: "event", sequence: 1n, globalCursor: 1n, revision: 1n, emittedAt: 1000,
+        backendId: "backend", targetId: "target", sessionId: "session", generation: 1, traceId: "trace", payload };
+      const restored = fromProtoEvent(fromBinary(EventSchema, toBinary(EventSchema, toProtoEvent(event)))).payload;
+      if (restored.type === "artifact") expect(restored).toMatchObject({ artifact: blob, audioMetadata });
+      else expect(restored).toEqual(payload);
+    }
   });
 
   it("round-trips append and replace semantics for live tool output", () => {

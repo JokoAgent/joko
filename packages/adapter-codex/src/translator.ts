@@ -58,6 +58,7 @@ const MAXIMUM_TRACKED_TOOL_ITEMS = 2_048;
 export interface TranslatorState {
   activeTurnId?: string;
   usage?: UsageSnapshot;
+  observedFastMode?: boolean;
   readonly itemNames: Map<string, string>;
   readonly terminalTurnIds: Set<string>;
 }
@@ -74,6 +75,14 @@ export async function translatePromptInput(
   context: AdapterContext,
   resolvers: CodexInputResolvers
 ): Promise<readonly NativeUserInput[]> {
+  if (input.mentions.some((mention) => mention.kind === "workspace_directory" || mention.lineRange !== undefined)) {
+    throw adapterError({
+      code: "CODEX_MENTION_KIND_UNSUPPORTED",
+      message: "Directory and source line range mentions are unavailable for this native input.",
+      phase: "dispatch",
+      recovery: "Choose a regular workspace file mention."
+    });
+  }
   const result: NativeUserInput[] = [];
   const maximumPromptTextBytes = positiveBound(
     resolvers.maximumPromptTextBytes,
@@ -296,7 +305,7 @@ export class CodexEventTranslator {
       case "item/completed":
         return this.#itemCompleted(params, state);
       case "thread/tokenUsage/updated": {
-        const usage = usageFromNotification(params);
+        const usage = usageFromNotification(params, state.observedFastMode);
         state.usage = usage;
         return [{ type: "usage", usage }];
       }
@@ -556,21 +565,28 @@ function toolResult(item: NativeThreadItem, state: TranslatorState, output: stri
   };
 }
 
-function usageFromNotification(params: JsonValue): UsageSnapshot {
+function usageFromNotification(params: JsonValue, observedFastMode: boolean | undefined): UsageSnapshot {
   const record = objectValue(params, "token usage");
   const tokenUsage = objectValue(record["tokenUsage"], "thread token usage");
   const last = objectValue(tokenUsage["last"], "last token usage");
-  const inputTokens = finiteToken(last["inputTokens"]);
-  const outputTokens = finiteToken(last["outputTokens"]);
-  const cacheReadTokens = finiteToken(last["cachedInputTokens"]);
-  const cacheWriteTokens = finiteToken(last["cacheWriteInputTokens"]);
+  const total = objectValue(tokenUsage["total"], "total token usage");
+  const totalInputTokens = finiteToken(total["inputTokens"]);
+  const outputTokens = finiteToken(total["outputTokens"]);
+  const cacheReadTokens = finiteToken(total["cachedInputTokens"]);
+  const cacheWriteTokens = finiteToken(total["cacheWriteInputTokens"]);
+  const inputTokens = Math.max(0, totalInputTokens - cacheReadTokens - cacheWriteTokens);
   return {
     inputTokens,
     outputTokens,
     cacheReadTokens,
     cacheWriteTokens,
-    totalTokens: finiteToken(last["totalTokens"]) || inputTokens + outputTokens,
+    totalTokens: finiteToken(total["totalTokens"]) || totalInputTokens + outputTokens,
+    contextTokens: finiteToken(last["totalTokens"]),
     ...(finiteToken(tokenUsage["modelContextWindow"]) === 0 ? {} : { contextWindow: finiteToken(tokenUsage["modelContextWindow"]) }),
+    pricingContext: {
+      inputTokens: finiteToken(last["inputTokens"]),
+      ...(observedFastMode === undefined ? {} : { fastMode: observedFastMode })
+    },
     cost: 0
   };
 }

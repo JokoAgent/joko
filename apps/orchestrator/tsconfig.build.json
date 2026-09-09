@@ -1,5 +1,5 @@
 {
   "extends": "./tsconfig.json",
   "compilerOptions": { "noEmit": false },
-  "exclude": ["src/**/*.test.ts", "src/test-paths.ts"]
+  "exclude": ["src/**/*.test.ts", "src/test-paths.ts", "src/i18n/multilingual-fixtures.ts"]
 }

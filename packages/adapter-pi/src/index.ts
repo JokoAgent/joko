@@ -8,6 +8,7 @@ export * from "./managed-durable-store.js";
 export * from "./managed-subagent-process-inspector.js";
 export * from "./managed-subagent-runner-source.js";
 export * from "./managed-subagent-source.js";
+export * from "./model-catalog-additions.js";
 export * from "./protocol.js";
 export * from "./resources.js";
 export * from "./runtime-process.js";

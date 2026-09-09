@@ -3,6 +3,24 @@ import { projectCodexNativeHistory } from "./native-history.js";
 import type { NativeThread } from "./protocol.js";
 
 describe("Codex native history projection", () => {
+  it("publishes explicit pre-turn targets without treating a mid-turn user or an unavailable history as start", () => {
+    const thread: NativeThread = { id: "turn-boundaries", historyMode: "paginated", turns: [
+      { id: "first", status: "completed", items: [
+        { id: "first-user", type: "userMessage", content: [{ type: "text", text: "First" }] },
+        { id: "steer", type: "userMessage", content: [{ type: "text", text: "Steer" }] },
+        { id: "first-answer", type: "agentMessage", text: "Answer" }
+      ] },
+      { id: "second", status: "completed", items: [{ id: "second-user", type: "userMessage", content: [{ type: "text", text: "Second" }] }] }
+    ] };
+    const result = projectCodexNativeHistory(thread, { maximumEvents: 20 });
+    expect(result.events.find((event) => event.nativeEntryId === "first-user")?.nativeRewindBefore).toEqual({ kind: "session_start" });
+    expect(result.events.find((event) => event.nativeEntryId === "steer")?.nativeRewindBefore).toBeUndefined();
+    expect(result.events.find((event) => event.nativeEntryId === "second-user")?.nativeRewindBefore).toEqual({ kind: "native_entry", entryId: "first-answer" });
+    expect(projectCodexNativeHistory({ ...thread, turns: [] }, { maximumEvents: 20 }).activeNavigationTarget).toEqual({ kind: "session_start" });
+    const unavailable = projectCodexNativeHistory({ id: "unavailable", turns: [] }, { maximumEvents: 20 });
+    expect(unavailable.activeNavigationTarget).toBeUndefined();
+  });
+
   it("projects messages, reasoning, tools, turn state, and unknown items without leaking raw persistence", () => {
     const thread: NativeThread = {
       id: "thread-history",

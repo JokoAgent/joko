@@ -339,7 +339,7 @@ describe("Personalization visual harness", () => {
     const external = buttonWithText(container, "System browser");
     await act(async () => external.click());
     expect(external.getAttribute("aria-checked")).toBe("true");
-    expect(document.documentElement.dataset.harnessLastAction).toBe("link-open:external");
+    expect(document.documentElement.dataset.harnessLastAction).toBe("link-open:web:external");
 
     const streamFade = required(container.querySelector<HTMLButtonElement>('button[aria-label="Toggle streaming fade-in motion"]'));
     await act(async () => streamFade.click());

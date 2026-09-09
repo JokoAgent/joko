@@ -16,7 +16,7 @@ describe("runtime governance gateway", () => {
   it("projects resource, collaboration, and savepoint settings without losing versions or status", () => {
     const snapshot = mapSnapshot(create(SnapshotSchema, {
       settings: {
-        agentResource: {
+        auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" }, agentResource: {
           maxConcurrentCommands: 4,
           processPriority: ManagedProcessPriority.LOW,
           capToolchainThreads: true,

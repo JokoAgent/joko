@@ -20,35 +20,40 @@ afterEach(async () => {
 describe("timeline artifact URL cache", () => {
   it("deduplicates acquisitions and releases each owner lease on task switch and unmount", async () => {
     const acquire = vi.fn(async (blobId: string) => `blob:${blobId}`);
-    const release = vi.fn();
-    const rendered = await renderProbe("session-one", acquire, release);
+    const releaseFirst = vi.fn();
+    const releaseSecond = vi.fn();
+    const rendered = await renderProbe("session-one", acquire, releaseFirst);
     expect(acquire).toHaveBeenCalledOnce();
 
-    await rendered.rerender("session-two");
-    expect(release).toHaveBeenNthCalledWith(1, "artifact");
+    await rendered.rerender("session-two", acquire, releaseSecond);
+    expect(releaseFirst).toHaveBeenCalledWith("artifact");
+    expect(releaseSecond).not.toHaveBeenCalled();
     expect(acquire).toHaveBeenCalledTimes(2);
     await act(async () => rendered.root.unmount());
     roots.splice(roots.indexOf(rendered.root), 1);
-    expect(release).toHaveBeenNthCalledWith(2, "artifact");
+    expect(releaseFirst).toHaveBeenCalledOnce();
+    expect(releaseSecond).toHaveBeenCalledWith("artifact");
   });
 
   it("releases a pending acquisition that finishes after its owner has switched", async () => {
     const first = deferred<string>();
     const second = deferred<string>();
-    const acquire = vi.fn()
-      .mockReturnValueOnce(first.promise)
-      .mockReturnValueOnce(second.promise);
-    const release = vi.fn();
-    const rendered = await renderProbe("session-one", acquire, release);
+    const acquireFirst = vi.fn(() => first.promise);
+    const acquireSecond = vi.fn(() => second.promise);
+    const releaseFirst = vi.fn();
+    const releaseSecond = vi.fn();
+    const rendered = await renderProbe("profile-one:session", acquireFirst, releaseFirst);
 
-    await rendered.rerender("session-two");
-    expect(release).not.toHaveBeenCalled();
-    await act(async () => first.resolve("blob:first"));
-    expect(release).toHaveBeenCalledWith("artifact");
+    await rendered.rerender("profile-two:session", acquireSecond, releaseSecond);
+    expect(releaseFirst).not.toHaveBeenCalled();
     await act(async () => second.resolve("blob:second"));
+    await act(async () => first.resolve("blob:first"));
+    expect(releaseFirst).toHaveBeenCalledWith("artifact");
+    expect(releaseSecond).not.toHaveBeenCalled();
     await act(async () => rendered.root.unmount());
     roots.splice(roots.indexOf(rendered.root), 1);
-    expect(release).toHaveBeenCalledTimes(2);
+    expect(releaseFirst).toHaveBeenCalledOnce();
+    expect(releaseSecond).toHaveBeenCalledOnce();
   });
 });
 
@@ -67,7 +72,7 @@ function Probe({ ownerKey, acquire, release }: {
 
 async function renderProbe(ownerKey: string, acquire: (blobId: string) => Promise<string>, release: (blobId: string) => void): Promise<{
   readonly root: Root;
-  readonly rerender: (nextOwnerKey: string) => Promise<void>;
+  readonly rerender: (nextOwnerKey: string, nextAcquire?: typeof acquire, nextRelease?: typeof release) => Promise<void>;
 }> {
   const container = document.createElement("div");
   document.body.append(container);
@@ -76,7 +81,7 @@ async function renderProbe(ownerKey: string, acquire: (blobId: string) => Promis
   await act(async () => root.render(<Probe ownerKey={ownerKey} acquire={acquire} release={release} />));
   return {
     root,
-    rerender: async (nextOwnerKey) => act(async () => root.render(<Probe ownerKey={nextOwnerKey} acquire={acquire} release={release} />))
+    rerender: async (nextOwnerKey, nextAcquire = acquire, nextRelease = release) => act(async () => root.render(<Probe ownerKey={nextOwnerKey} acquire={nextAcquire} release={nextRelease} />))
   };
 }
 

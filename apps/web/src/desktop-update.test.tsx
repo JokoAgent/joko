@@ -92,13 +92,14 @@ describe("Desktop update renderer bridge", () => {
     expect(currentDesktopUpdateBannerDismiss()).toBe(userDismiss);
   });
 
-  it("preserves the automatic decision when the user explicitly restores a busy banner", () => {
+  it("pins the current update when the user explicitly restores a busy banner", () => {
     const ready = { status: "ready", version: "2.0.0" } as const;
     deferDesktopUpdateBannerBecauseBusy(ready);
     restoreDesktopUpdateBanner();
     expect(currentDesktopUpdateBannerDismiss()).toEqual({
       dismissed: false,
-      decisionKey: "ready\0" + ready.version
+      decisionKey: "ready\0" + ready.version,
+      pinnedKey: "ready\0" + ready.version
     });
   });
 

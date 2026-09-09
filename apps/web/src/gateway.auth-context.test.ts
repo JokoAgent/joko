@@ -13,6 +13,7 @@ import {
   ListBackgroundTasksResponseSchema,
   NativeSessionCandidateState,
   NativeSessionPlacement,
+  PredictNextPromptResponseSchema,
   RuntimeCommandSource,
   RuntimeToolSourceOrigin,
   RuntimeToolSourceScope,
@@ -34,6 +35,53 @@ afterEach(() => {
 });
 
 describe("connection credential lifecycle", () => {
+  it.each(["caller", "connection"] as const)(
+    "rejects a late prediction after %s cancellation even when transport ignores its signal",
+    async (cancellation) => {
+      let resolvePrediction!: (prompt: string) => void;
+      let dispatchedSignal: AbortSignal | undefined;
+      const transport = {
+        unary: vi.fn(async (method: any, signal: AbortSignal | undefined) => {
+          if (method.localName === "getSnapshot") return response(method, create(GetSnapshotResponseSchema, {
+            snapshot: create(SnapshotSchema, { generation: 1n, resumeCursor: { generation: 1n, sequence: 0n } })
+          }));
+          if (method.localName !== "predictNextPrompt") throw new Error(`Unexpected method: ${method.localName}`);
+          dispatchedSignal = signal;
+          const prompt = await new Promise<string>((resolve) => { resolvePrediction = resolve; });
+          return response(method, create(PredictNextPromptResponseSchema, { prompt }));
+        }),
+        stream: vi.fn(async (method: any) => response(method, idleStream(), true))
+      } as unknown as Transport;
+      const gateway = createOrchestratorGateway(
+        { id: "prediction-connection", deviceId: "prediction-device", serverId: "server-test", name: "Browser", origin: "https://orchestrator.example" },
+        "secret", {}, () => transport
+      );
+      await gateway.connect();
+      try {
+        const cancelledBeforeDispatch = new AbortController();
+        cancelledBeforeDispatch.abort();
+        await expect(gateway.predictNextPrompt("session-1", 100, 1n, cancelledBeforeDispatch.signal))
+          .rejects.toMatchObject({ name: "AbortError" });
+        expect(vi.mocked(transport.unary).mock.calls.filter(([method]) => method.localName === "predictNextPrompt"))
+          .toHaveLength(0);
+
+        const caller = new AbortController();
+        const pending = gateway.predictNextPrompt("session-1", 100, 1n, caller.signal);
+        await vi.waitFor(() => expect(dispatchedSignal).toBeDefined());
+        expect(dispatchedSignal!.aborted).toBe(false);
+        if (cancellation === "caller") caller.abort();
+        else gateway.disconnect();
+        expect(dispatchedSignal!.aborted).toBe(true);
+        resolvePrediction("Outdated recommendation");
+        await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+        expect(vi.mocked(transport.unary).mock.calls.filter(([method]) => method.localName === "predictNextPrompt"))
+          .toHaveLength(1);
+      } finally {
+        gateway.disconnect();
+      }
+    }
+  );
+
   it("classifies an unauthenticated stream failure through an error cause as terminal", () => {
     const revoked = new ConnectError("revoked", Code.Unauthenticated);
     expect(isUnauthenticatedError(revoked)).toBe(true);
@@ -665,7 +713,7 @@ describe("Backend-neutral native session discovery", () => {
 });
 
 describe("authoritative session context state", () => {
-  const governance = { agentResource: {}, collaboration: {}, gitSafety: {} } as const;
+  const governance = { auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" }, agentResource: {}, collaboration: {}, gitSafety: {} } as const;
   const session = {
     sessionId: "session-1",
     backendId: "pi-1",

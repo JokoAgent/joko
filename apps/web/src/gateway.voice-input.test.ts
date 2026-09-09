@@ -21,7 +21,8 @@ import {
   VoiceInputDictionaryLearningConfidence,
   VoiceInputDictionaryTermType,
   VoiceInputTerminalOutcome,
-  VoiceInputTextSource
+  VoiceInputTextSource,
+  VoiceInputTranscriptionProtocol
 } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createOrchestratorGateway } from "./gateway.js";
@@ -188,20 +189,20 @@ describe("voice input gateway", () => {
 
     await gateway.updateVoiceInputServiceSettings({
       enabled: true,
-      protocol: "openAiCompatibleBatch",
-      endpoint: "https://speech.example/v1/audio/transcriptions",
-      model: "voice-model",
+      protocol: "volcengineSauc",
+      endpoint: "wss://speech.example/api/v3/sauc/bigmodel_async",
+      model: "",
+      resourceId: "volc.seedasr.sauc.duration",
       keyless: false,
       secret: "replacement-key",
       refinementEnabled: false,
-      refinerProviderId: "",
-      refinerModelId: "",
-      refinerFallbackProviderId: "",
-      refinerFallbackModelId: "",
+      refinerModel: { backendId: "text-one", providerId: "same-provider", modelId: "same-model" },
+      refinerFallbackModel: { backendId: "text-two", providerId: "same-provider", modelId: "same-model" },
       fallbackEnabled: false,
       fallbackProtocol: "openAiCompatibleBatch",
       fallbackEndpoint: "https://api.openai.com/v1/audio/transcriptions",
       fallbackModel: "whisper-1",
+      fallbackResourceId: "",
       fallbackKeyless: false,
       expectedRevision: 4n
     });
@@ -213,8 +214,13 @@ describe("voice input gateway", () => {
       value: {
         patch: {
           enabled: true,
-          endpoint: "https://speech.example/v1/audio/transcriptions",
-          model: "voice-model",
+          protocol: VoiceInputTranscriptionProtocol.VOLCENGINE_SAUC,
+          endpoint: "wss://speech.example/api/v3/sauc/bigmodel_async",
+          model: "",
+          resourceId: "volc.seedasr.sauc.duration",
+          refinerModel: { backendId: "text-one", providerId: "same-provider", modelId: "same-model" },
+          refinerFallbackModel: { backendId: "text-two", providerId: "same-provider", modelId: "same-model" },
+          fallbackResourceId: "",
           keyless: false,
           credentialUploadTicketId: "voice-ticket",
           expectedRevision: { value: 4n }

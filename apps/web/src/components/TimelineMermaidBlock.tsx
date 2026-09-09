@@ -1,171 +1,111 @@
 import { Check, Code2, Copy, Expand, Eye } from "lucide-react";
-import { memo, useEffect, useId, useMemo, useRef, useState, type JSX } from "react";
-
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type JSX } from "react";
+import { writeClipboardText } from "../clipboard-action.js";
 import { WorkspaceMermaidLightbox, type WorkspaceMermaidHostLabels } from "./WorkspaceMermaidHosts.js";
-import { copyWorkspaceMermaid } from "./workspace-markdown-mermaid.js";
+import type { WorkspaceMermaidOpenDetail } from "./workspace-markdown-mermaid.js";
+import { renderMermaid } from "./mermaid-render.js";
+import { copyMermaid } from "./mermaid-image-export.js";
+import { generatedImageAnnotationLabels } from "./GeneratedImageAnnotationButton.js";
+import { useMermaidTheme } from "./use-mermaid-theme.js";
+import { useClipboardAction } from "./use-clipboard-action.js";
 import { repairTimelineMermaidSource } from "./timeline-mermaid-autofix.js";
 import type { Translator } from "./types.js";
 import { IconButton } from "./ui.js";
 
-type MermaidApi = typeof import("mermaid")["default"];
-let mermaidModule: Promise<MermaidApi> | undefined;
-
-function loadMermaid(): Promise<MermaidApi> {
-  mermaidModule ??= import("mermaid").then((module) => module.default);
-  return mermaidModule;
-}
-
-function darkMermaidTheme(): boolean {
-  const theme = document.documentElement.dataset.theme;
-  return theme === "dark" || (theme === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
-}
-
-function useMermaidTheme(): "dark" | "default" {
-  const read = (): "dark" | "default" => darkMermaidTheme() ? "dark" : "default";
-  const [theme, setTheme] = useState(read);
-  useEffect(() => {
-    const update = (): void => setTheme((current) => {
-      const next = read();
-      return next === current ? current : next;
-    });
-    const observer = new MutationObserver(update);
-    observer.observe(document.documentElement, { attributes: true, attributeFilter: ["class", "data-theme"] });
-    const media = window.matchMedia("(prefers-color-scheme: dark)");
-    media.addEventListener("change", update);
-    return () => {
-      observer.disconnect();
-      media.removeEventListener("change", update);
-    };
-  }, []);
-  return theme;
-}
-
-export const TimelineMermaidBlock = memo(function TimelineMermaidBlock({ source, t }: {
+export const TimelineMermaidBlock = memo(function TimelineMermaidBlock({ ownerKey, source, onSendToChat, t }: {
+  readonly ownerKey: string;
   readonly source: string;
+  readonly onSendToChat?: (file: File) => void | Promise<void>;
   readonly t: Translator;
 }): JSX.Element {
-  const reactId = useId().replace(/[^A-Za-z0-9]/gu, "");
-  const theme = useMermaidTheme();
-  const [svg, setSvg] = useState<string>();
-  const [error, setError] = useState<string>();
-  const [showSource, setShowSource] = useState(false);
-  const [lightboxOpen, setLightboxOpen] = useState(false);
-  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
+  const rootRef = useRef<HTMLDivElement | null>(null);
   const cardRef = useRef<HTMLDivElement>(null);
-  const copyTimerRef = useRef<number | undefined>(undefined);
-
+  const [ownerDocument, setOwnerDocument] = useState<Document>();
+  const bindRoot = useCallback((node: HTMLDivElement | null): void => { rootRef.current = node; setOwnerDocument(node?.ownerDocument); }, []);
+  const theme = useMermaidTheme(ownerDocument);
+  const [pageEpoch, setPageEpoch] = useState(0);
+  const scope = useMemo(() => ({ request: undefined as AbortController | undefined }), [ownerKey, source, theme, ownerDocument, pageEpoch]);
+  const scopeRef = useRef<object | undefined>(undefined);
+  const [result, setResult] = useState<{ readonly scope: object; readonly svg?: string; readonly error?: string }>();
+  const [sourceViewScope, setSourceViewScope] = useState<object>();
+  const [opened, setOpened] = useState<{ readonly scope: object; readonly detail: WorkspaceMermaidOpenDetail }>();
+  const copy = useClipboardAction({ ownerKey, sourceKey: JSON.stringify([source, theme, result?.scope === scope ? result.svg : undefined]), ownerDocument, connectionOwner: scope });
+  useLayoutEffect(() => {
+    const request = new AbortController();
+    scope.request = request;
+    scopeRef.current = scope;
+    const retire = (): void => { request.abort(); setOpened(undefined); };
+    const resume = (): void => { if (request.signal.aborted) setPageEpoch((value) => value + 1); };
+    ownerDocument?.defaultView?.addEventListener("pagehide", retire);
+    ownerDocument?.defaultView?.addEventListener("pageshow", resume);
+    return () => {
+      if (scopeRef.current === scope) scopeRef.current = undefined;
+      request.abort();
+      ownerDocument?.defaultView?.removeEventListener("pagehide", retire);
+      ownerDocument?.defaultView?.removeEventListener("pageshow", resume);
+    };
+  }, [scope, ownerDocument]);
   useEffect(() => {
-    let cancelled = false;
-    const trimmed = source.trim();
-    if (trimmed === "") {
-      setSvg(undefined);
-      setError(undefined);
-      return;
-    }
-    void loadMermaid().then(async (api) => {
-      api.initialize({
-        startOnLoad: false,
-        securityLevel: "strict",
-        fontFamily: "inherit",
-        theme,
-        flowchart: { useMaxWidth: false },
-        sequence: { useMaxWidth: false },
-        class: { useMaxWidth: false },
-        state: { useMaxWidth: false },
-        er: { useMaxWidth: false },
-        gantt: { useMaxWidth: false },
-        journey: { useMaxWidth: false },
-        pie: { useMaxWidth: false }
-      });
-      const attempt = async (candidate: string, suffix: string): Promise<string> => {
-        await api.parse(candidate);
-        return (await api.render(`joko-chat-mermaid-${reactId}-${suffix}`, candidate)).svg;
-      };
+    const request = scope.request;
+    if (ownerDocument === undefined || request === undefined || source.trim() === "") return;
+    const context = { ownerDocument, signal: request.signal };
+    void (async () => {
       try {
-        const rendered = await attempt(trimmed, "source");
-        if (!cancelled) {
-          setSvg(rendered);
-          setError(undefined);
+        let svg: string;
+        try { svg = await renderMermaid(source.trim(), theme, context); }
+        catch (cause) {
+          context.signal.throwIfAborted();
+          const repaired = repairTimelineMermaidSource(source.trim());
+          if (repaired === source.trim()) throw cause;
+          try { svg = await renderMermaid(repaired, theme, context); }
+          catch { throw cause; }
         }
+        if (scopeRef.current === scope && !context.signal.aborted) setResult({ scope, svg });
       } catch (cause) {
-        const repaired = repairTimelineMermaidSource(trimmed);
-        if (repaired !== trimmed) {
-          try {
-            const rendered = await attempt(repaired, "repaired");
-            if (!cancelled) {
-              setSvg(rendered);
-              setError(undefined);
-            }
-            return;
-          } catch {
-            // Preserve the original parser error for a source-faithful fallback.
-          }
-        }
-        if (!cancelled) setError(cause instanceof Error ? cause.message : String(cause));
+        if (scopeRef.current === scope && !context.signal.aborted) setResult({ scope, error: cause instanceof Error ? cause.message : String(cause) });
       }
-    }).catch((cause: unknown) => {
-      if (!cancelled) setError(cause instanceof Error ? cause.message : String(cause));
-    });
-    return () => { cancelled = true; };
-  }, [reactId, source, theme]);
-
-  useEffect(() => () => {
-    if (copyTimerRef.current !== undefined) window.clearTimeout(copyTimerRef.current);
-  }, []);
-
+    })();
+  }, [scope, source, theme, ownerDocument]);
+  const svg = result?.scope === scope ? result.svg : undefined;
+  const error = result?.scope === scope ? result.error : undefined;
+  const sourceView = sourceViewScope === scope || svg === undefined && error !== undefined;
+  const open = (trigger: HTMLElement): void => {
+    const request = scope.request;
+    if (svg === undefined || request === undefined || ownerDocument === undefined || trigger.ownerDocument !== ownerDocument || scopeRef.current !== scope || request.signal.aborted) return;
+    setOpened({ scope, detail: { svg, source, returnFocus: trigger, signal: request.signal,
+      isCurrent: () => scopeRef.current === scope && scope.request === request && !request.signal.aborted && rootRef.current?.isConnected === true && rootRef.current.ownerDocument === ownerDocument
+    } });
+  };
   const labels = useMemo<WorkspaceMermaidHostLabels>(() => ({
-    editTitle: t("workspace.mermaidEditTitle"),
-    source: t("workspace.mermaidSource"),
-    cancel: t("common.cancel"),
-    apply: t("workspace.mermaidApply"),
-    targetMissing: t("workspace.mermaidTargetMissing"),
-    zoomOut: t("workspace.mermaidZoomOut"),
-    zoomIn: t("workspace.mermaidZoomIn"),
-    copy: t("timeline.mermaidCopy"),
-    copied: t("timeline.mermaidCopied"),
-    copyFailed: t("timeline.mermaidCopyFailed"),
-    close: t("common.close")
+    editTitle: t("workspace.mermaidEditTitle"), source: t("workspace.mermaidSource"), cancel: t("common.cancel"),
+    apply: t("workspace.mermaidApply"), targetMissing: t("workspace.mermaidTargetMissing"), zoomOut: t("workspace.mermaidZoomOut"),
+    zoomIn: t("workspace.mermaidZoomIn"), copy: t("timeline.mermaidCopy"), copied: t("timeline.mermaidCopied"),
+    copyFailed: t("timeline.mermaidCopyFailed"), close: t("common.close")
   }), [t]);
-  const sourceView = showSource || svg === undefined && error !== undefined;
-  const settleCopy = (next: "copied" | "failed"): void => {
-    setCopyState(next);
-    if (copyTimerRef.current !== undefined) window.clearTimeout(copyTimerRef.current);
-    copyTimerRef.current = window.setTimeout(() => setCopyState("idle"), 1_500);
-  };
-  const copy = (): void => {
-    const card = cardRef.current;
-    if (svg === undefined || card === null) {
-      void navigator.clipboard.writeText(source).then(() => settleCopy("copied")).catch(() => settleCopy("failed"));
-      return;
-    }
-    void copyWorkspaceMermaid(svg, source, card).then(() => settleCopy("copied")).catch(() => settleCopy("failed"));
-  };
-
-  return <div className="timeline-mermaid">
+  const copyLabel = copy.state === "copied" ? labels.copied : copy.state === "failed" ? labels.copyFailed : labels.copy;
+  return <div ref={bindRoot} className="timeline-mermaid">
     {sourceView ? <pre className="timeline-mermaid__source"><code className="language-mermaid">{source}</code></pre> : svg !== undefined ? (
-      <div
-        ref={cardRef}
-        className="timeline-mermaid__diagram"
-        role="button"
-        tabIndex={0}
-        aria-label={t("timeline.mermaidZoom")}
-        title={t("timeline.mermaidZoom")}
-        onClick={() => setLightboxOpen(true)}
+      <div ref={cardRef} className="timeline-mermaid__diagram" role="button" tabIndex={0} aria-label={t("timeline.mermaidZoom")} title={t("timeline.mermaidZoom")}
+        onClick={(event) => open(event.currentTarget)}
         onKeyDown={(event) => {
-          if (event.key !== "Enter" && event.key !== " ") return;
-          event.preventDefault();
-          setLightboxOpen(true);
+          if (event.defaultPrevented || event.nativeEvent.isComposing || event.key !== "Enter" && event.key !== " ") return;
+          event.preventDefault(); open(event.currentTarget);
         }}
         dangerouslySetInnerHTML={{ __html: svg }}
       />
     ) : <pre className="timeline-mermaid__source is-loading"><code className="language-mermaid">{source}</code></pre>}
-    {error !== undefined && svg === undefined && <p className="timeline-mermaid__error" title={error}>{t("timeline.mermaidRenderFailed")}</p>}
+    {error !== undefined && <p className="timeline-mermaid__error" title={error}>{t("timeline.mermaidRenderFailed")}</p>}
     <div className="timeline-mermaid__toolbar">
-      {svg !== undefined && !sourceView && <IconButton label={t("timeline.mermaidZoom")} onClick={() => setLightboxOpen(true)}><Expand aria-hidden="true" /></IconButton>}
-      {svg !== undefined && <IconButton label={sourceView ? t("timeline.mermaidViewDiagram") : t("timeline.mermaidViewSource")} onClick={() => setShowSource((value) => !value)}>{sourceView ? <Eye aria-hidden="true" /> : <Code2 aria-hidden="true" />}</IconButton>}
-      <IconButton label={copyState === "copied" ? t("timeline.mermaidCopied") : copyState === "failed" ? t("timeline.mermaidCopyFailed") : t("timeline.mermaidCopy")} onClick={copy}>{copyState === "copied" ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}</IconButton>
+      {svg !== undefined && !sourceView && <IconButton label={t("timeline.mermaidZoom")} onClick={(event) => open(event.currentTarget)}><Expand aria-hidden="true" /></IconButton>}
+      {svg !== undefined && <IconButton label={sourceView ? t("timeline.mermaidViewDiagram") : t("timeline.mermaidViewSource")} onClick={() => setSourceViewScope(sourceView ? undefined : scope)}>{sourceView ? <Eye aria-hidden="true" /> : <Code2 aria-hidden="true" />}</IconButton>}
+      <IconButton label={copyLabel} aria-busy={copy.pending} aria-disabled={copy.pending} onClick={(event) => {
+        const card = cardRef.current ?? rootRef.current;
+        copy.run(event.currentTarget.ownerDocument, (context) => svg === undefined || card === null
+          ? writeClipboardText(source, context) : copyMermaid(svg, source, card, context));
+      }}>{copy.state === "copied" ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}</IconButton>
     </div>
-    {copyState === "failed" && <span className="sr-only" role="alert">{t("timeline.mermaidCopyFailed")}</span>}
-    {lightboxOpen && svg !== undefined && <WorkspaceMermaidLightbox detail={{ svg, source }} labels={labels} onClose={() => setLightboxOpen(false)} />}
+    {copy.state === "failed" && <span className="sr-only" role="alert">{copyLabel}</span>}
+    {opened?.scope === scope && <WorkspaceMermaidLightbox ownerKey={ownerKey} detail={opened.detail} labels={labels}
+      annotationLabels={generatedImageAnnotationLabels(t)} onSendToChat={onSendToChat} onClose={() => setOpened(undefined)} />}
   </div>;
 });

@@ -20,6 +20,7 @@ import {
   ORCHESTRATOR_RUNTIME_CRITICAL_IMPORTS,
   ORCHESTRATOR_RUNTIME_PACKAGES,
   auditRegularRuntimeTree,
+  claudeSessionElectronSmokeSource,
   copyRegularTree,
   digestFile,
   removeSafeTemporaryDirectory,
@@ -27,7 +28,8 @@ import {
   rewriteRuntimePackageManifestFile,
   runtimeBuildEnvironment,
   runtimeExecutablePath,
-  sqliteVecElectronSmokeSource
+  sqliteVecElectronSmokeSource,
+  terminalElectronSmokeSource
 } from "../dist/runtime-staging.js";
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
@@ -96,6 +98,8 @@ try {
   const optionalDependency = await assertOptionalDependencyPreserved(candidateRoot);
   const importSmoke = await runCandidateImportSmoke(candidateRoot);
   const sqliteVecSmoke = await runCandidateSqliteVecSmoke(candidateRoot);
+  const terminalSmoke = await runCandidateTerminalSmoke(candidateRoot);
+  const claudeSessionSmoke = await runCandidateClaudeSessionSmoke(candidateRoot);
   const orchestratorSmoke = await runCandidateOrchestratorSmoke(candidateRoot);
   const audit = await auditRegularRuntimeTree(candidateRoot);
   const rootStateAfter = await assertRepositoryStateUnchanged();
@@ -121,6 +125,8 @@ try {
     piCliResolvedWithinCandidate: importSmoke.piCli,
     npmRuntime: importSmoke.npmRuntime,
     sqliteVec: sqliteVecSmoke,
+    terminal: terminalSmoke,
+    claudeSession: claudeSessionSmoke,
     orchestratorHealth: orchestratorSmoke.health,
     orchestratorExitObserved: orchestratorSmoke.exitObserved,
     rootWorkspaceState: rootStatePaths.map((path, index) => ({
@@ -293,6 +299,52 @@ async function runCandidateSqliteVecSmoke(root) {
       nativePackageRoot: parsed.nativePackageRoot,
       nativeBinary: parsed.nativeBinary
     };
+  } finally {
+    await rm(smokePath, { force: false });
+  }
+}
+
+async function runCandidateTerminalSmoke(root) {
+  const smokePath = join(root, ".joko-runtime-terminal-smoke.mjs");
+  await writeFile(smokePath, terminalElectronSmokeSource(process.platform, process.arch), { flag: "wx", mode: 0o600 });
+  try {
+    const result = await runCommand(electronExecutable(), [smokePath, root], {
+      cwd: root,
+      environment: electronNodeEnvironment(),
+      timeoutMs: 45_000,
+      label: "isolated Electron-Node terminal smoke"
+    });
+    const parsed = JSON.parse(result.stdout);
+    if (parsed?.ok !== true || typeof parsed.runtimeRoot !== "string" ||
+        parsed.tty !== true || parsed.input !== true || parsed.resized !== true || parsed.exitCode !== 0 || parsed.hostCleanup !== true ||
+        typeof parsed.electronVersion !== "string" || typeof parsed.nativeBinary !== "string" ||
+        !samePath(await realpath(parsed.runtimeRoot), root)) {
+      throw new Error("The isolated terminal smoke returned an invalid runtime identity.");
+    }
+    return parsed;
+  } finally {
+    await rm(smokePath, { force: false });
+  }
+}
+
+async function runCandidateClaudeSessionSmoke(root) {
+  const smokePath = join(root, ".joko-runtime-session-sdk-smoke.mjs");
+  await writeFile(smokePath, claudeSessionElectronSmokeSource(process.platform, process.arch), { flag: "wx", mode: 0o600 });
+  try {
+    const result = await runCommand(electronExecutable(), [smokePath, root], {
+      cwd: root,
+      environment: electronNodeEnvironment(),
+      timeoutMs: 45_000,
+      label: "isolated Electron-Node Session SDK Worker smoke"
+    });
+    const parsed = JSON.parse(result.stdout);
+    if (parsed?.ok !== true || typeof parsed.runtimeRoot !== "string" ||
+        parsed.missingSession !== true || parsed.workerRetired !== true || parsed.isolatedProfileUnchanged !== true ||
+        typeof parsed.electronVersion !== "string" || typeof parsed.workerEntry !== "string" ||
+        !samePath(await realpath(parsed.runtimeRoot), root)) {
+      throw new Error("The isolated Session SDK smoke returned an invalid runtime identity.");
+    }
+    return parsed;
   } finally {
     await rm(smokePath, { force: false });
   }

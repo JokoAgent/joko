@@ -39,8 +39,9 @@ export class PiEventTranslator {
   readonly #wasAbortRequested: () => boolean;
   readonly #redactValues: readonly string[];
   readonly #artifactCache: Map<string, BlobRef>;
+  readonly #messageNamespace = randomUUID();
   #assistantMessageOrdinal = 0;
-  #activeMessageBlockPrefix = "assistant-0";
+  #activeMessageBlockPrefix = `assistant-${this.#messageNamespace}-0`;
   #activeCompactionId: string | undefined;
   #latestSummarizationRetryAttempt: number | undefined;
   readonly #privateMemoryToolCalls = new Set<string>();
@@ -187,7 +188,7 @@ export class PiEventTranslator {
       case "message_start":
         if (isRecord(record.message) && record.message.role === "assistant") {
           this.#assistantMessageOrdinal += 1;
-          this.#activeMessageBlockPrefix = `assistant-${this.#assistantMessageOrdinal}`;
+          this.#activeMessageBlockPrefix = `assistant-${this.#messageNamespace}-${this.#assistantMessageOrdinal}`;
         }
         return;
       case "message_update":

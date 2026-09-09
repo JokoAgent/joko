@@ -72,7 +72,7 @@ describe("Browser page comments at the send boundary", () => {
         comment: `Annotation ${index + 1}`,
         screenshot: { id: `screen-${index + 1}`, kind: "image" as const, file: new File(["png"], `browser-comment-${index + 1}.png`, { type: "image/png" }) }
       }))
-    });
+    }, { expectedGeneration: 1n });
 
     expect(calls).toEqual([...Array.from({ length: 17 }, () => ["begin", "put", "complete"]).flat(), "submit"]);
     expect(payloads[0]?.value.input.parts).toHaveLength(18);

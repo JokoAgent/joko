@@ -34,6 +34,10 @@ import type {
 } from "@joko/core";
 import {
   JokoError,
+  assertAudioArtifactMetadata,
+  type AudioArtifactMetadata,
+  type BlobRef,
+  isNativeNavigationTarget,
   NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD,
   NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD,
   nativeHistoryEventContext,
@@ -55,6 +59,7 @@ import {
   StoreError
 } from "./errors.js";
 import { configureDatabase, initializeDatabase, SCHEMA_VERSION } from "./schema.js";
+import { readUsageReport, type UsageReportQuery, type UsageReportPage } from "./usage-report.js";
 import {
   assertSafeSettingKey,
   operationBodyHash,
@@ -110,6 +115,8 @@ import type {
   MessageEmbeddingJob,
   MessageEmbeddingStatus,
   ModelPriceOverrideRecord,
+  NativeSessionDerivationRecord,
+  RecordNativeSessionDerivationInput,
   OpenInteractionInput,
   OperationExecution,
   OperationInput,
@@ -535,6 +542,7 @@ export class OperationalStore {
   private readonly operationSubscribers = new Set<(operationId: string) => void>();
   private readonly pendingPublications: PersistedEvent[] = [];
   private readonly transactionFrames: TransactionFrame[] = [];
+  private readonly deferredEffectCompletions: string[] = [];
   private activeRevision: bigint | undefined;
   private nextSavepoint = 0;
   private publishing = false;
@@ -843,7 +851,7 @@ export class OperationalStore {
   messageEmbeddingStatus(): MessageEmbeddingStatus {
     this.assertOpen();
     const state = this.database.prepare(
-      `SELECT enabled, provider_id, provider_generation_id, model_id, dimensions
+      `SELECT enabled, backend_id, provider_id, provider_generation_id, model_id, dimensions
        FROM message_embedding_state WHERE singleton = 1`
     ).get() as Row | undefined;
     if (state === undefined) throw new StoreError("Message embedding state is missing.");
@@ -856,6 +864,7 @@ export class OperationalStore {
     return {
       enabled: Number(state["enabled"]) === 1,
       vectorAvailable: this.messageVectorAvailable,
+      ...(state["backend_id"] === null ? {} : { backendId: String(state["backend_id"]) }),
       ...(typeof state["provider_id"] === "string" && state["provider_id"] !== ""
         ? { providerId: String(state["provider_id"]) }
         : {}),
@@ -871,24 +880,25 @@ export class OperationalStore {
     };
   }
 
-  bindMessageEmbeddingProvider(providerId: string, providerGenerationId: string): MessageEmbeddingStatus {
+  bindMessageEmbeddingProvider(backendId: string, providerId: string, providerGenerationId: string): MessageEmbeddingStatus {
     this.assertOpen();
     this.assertDerivedIndexWorkerBoundary();
+    const normalizedBackendId = nonBlank(backendId, "Message embedding Backend ID");
     const normalizedProviderId = nonBlank(providerId, "Message embedding Provider ID");
     const normalizedGenerationId = nonBlank(
       providerGenerationId,
       "Message embedding Provider generation ID"
     );
     const state = this.database.prepare(
-      `SELECT provider_id, provider_generation_id
+      `SELECT backend_id, provider_id, provider_generation_id
        FROM message_embedding_state WHERE singleton = 1`
     ).get() as Row | undefined;
     if (state === undefined) throw new StoreError("Message embedding state is missing.");
     const current = typeof state["provider_id"] === "string" && state["provider_id"] !== ""
       ? String(state["provider_id"])
       : undefined;
-    if (current !== undefined && current !== normalizedProviderId) {
-      throw new StoreError("Message embedding Provider does not match the durable vector generation.");
+    if (current !== undefined && (current !== normalizedProviderId || state["backend_id"] !== normalizedBackendId)) {
+      throw new StoreError("Message embedding Backend or Provider does not match the durable vector generation.");
     }
     const currentGeneration = typeof state["provider_generation_id"] === "string" &&
       state["provider_generation_id"] !== ""
@@ -910,9 +920,9 @@ export class OperationalStore {
         `).run();
         this.database.prepare(`
           UPDATE message_embedding_state
-          SET provider_id = ?, provider_generation_id = ?, model_id = ?
+          SET backend_id = ?, provider_id = ?, provider_generation_id = ?, model_id = ?
           WHERE singleton = 1
-        `).run(normalizedProviderId, normalizedGenerationId, MESSAGE_SEARCH_VECTOR_MODEL);
+        `).run(normalizedBackendId, normalizedProviderId, normalizedGenerationId, MESSAGE_SEARCH_VECTOR_MODEL);
       });
     }
     return this.messageEmbeddingStatus();
@@ -2072,16 +2082,17 @@ export class OperationalStore {
       const authenticationMode = input.authenticationMode === undefined
         ? credentialReferenceId === undefined ? "system_agent" : "private_key"
         : remoteHostAuthenticationMode(input.authenticationMode);
-      assertRemoteHostAuthentication(authenticationMode, credentialReferenceId);
+      const nodeKey = input.nodeKey === undefined ? undefined : remoteHostNodeKey(input.nodeKey);
+      assertRemoteHostAuthentication(authenticationMode, credentialReferenceId, nodeKey);
       const createdAt = remoteHostTimestamp(input.createdAt ?? this.now(), "creation time");
       this.database.prepare(`
         INSERT INTO remote_hosts(
           owner_id, target_id, host_id, hostname, port, username, source,
-          authentication_mode, credential_reference_id,
+          authentication_mode, credential_reference_id, node_key_id, node_key_fingerprint,
           trust_algorithm, trust_fingerprint, trust_pinned_at,
           status, status_changed_at, failure_code, failure_retryable,
           created_at, updated_at, revision
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'disconnected', ?, NULL, NULL, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'disconnected', ?, NULL, NULL, ?, ?, ?)
       `).run(
         ownerId,
         targetId,
@@ -2092,6 +2103,8 @@ export class OperationalStore {
         source,
         authenticationMode,
         credentialReferenceId ?? null,
+        nodeKey?.id ?? null,
+        nodeKey?.expectedFingerprint ?? null,
         createdAt,
         createdAt,
         createdAt,
@@ -2158,7 +2171,9 @@ export class OperationalStore {
           ? current.authenticationMode
           : credentialReferenceId === undefined ? "system_agent" : "private_key"
         : remoteHostAuthenticationMode(input.authenticationMode);
-      assertRemoteHostAuthentication(authenticationMode, credentialReferenceId);
+      const nodeKey = input.nodeKey === undefined ? current.nodeKey
+        : input.nodeKey === null ? undefined : remoteHostNodeKey(input.nodeKey);
+      assertRemoteHostAuthentication(authenticationMode, credentialReferenceId, nodeKey);
       if (current.trust !== undefined && (hostname !== current.hostname || port !== current.port)) {
         throw new StoreError("Clear the Remote Host trust pin before changing its endpoint.");
       }
@@ -2167,6 +2182,7 @@ export class OperationalStore {
       const result = this.database.prepare(`
         UPDATE remote_hosts SET
           hostname = ?, port = ?, username = ?, source = ?, authentication_mode = ?, credential_reference_id = ?,
+          node_key_id = ?, node_key_fingerprint = ?,
           updated_at = ?, revision = ?
         WHERE owner_id = ? AND target_id = ? AND host_id = ? AND revision = ?
       `).run(
@@ -2176,6 +2192,8 @@ export class OperationalStore {
         source,
         authenticationMode,
         credentialReferenceId ?? null,
+        nodeKey?.id ?? null,
+        nodeKey?.expectedFingerprint ?? null,
         updatedAt,
         asSqlInteger(this.requireActiveRevision()),
         current.ownerId,
@@ -2362,9 +2380,10 @@ export class OperationalStore {
 
   createSession(
     descriptor: SessionDescriptor,
-    options: { readonly nativeSessionBlank?: boolean } = {}
+    options: { readonly nativeSessionBlank?: boolean; readonly derivationOperationId?: string } = {}
   ): StoredSession {
     return this.write(() => {
+      const derivation = this.assertNativeBindingAdoptionAllowed(descriptor, options.derivationOperationId);
       const target = this.getTarget(descriptor.targetId);
       if (target.descriptor.backendId !== descriptor.backendId) {
         throw new StoreError("Session backend does not match its target backend.");
@@ -2504,6 +2523,13 @@ export class OperationalStore {
       }
       if (options.nativeSessionBlank === true) {
         this.setSetting("session", descriptor.id, NATIVE_BLANK_RECOVERY_SETTING_KEY, true, descriptor.createdAt);
+      }
+      this.recordNativeBindingAdoption(descriptor.id, descriptor.backendId, descriptor.binding, descriptor.createdAt);
+      if (derivation !== undefined) {
+        this.database.prepare(`
+          UPDATE native_session_derivations SET state = 'adopted', adopted_at = ?, updated_at = ?, revision = ?
+          WHERE operation_id = ? AND state = 'recorded'
+        `).run(this.now(), this.now(), asSqlInteger(this.requireActiveRevision()), derivation.operationId);
       }
       return this.getSession(descriptor.id);
     });
@@ -2906,6 +2932,200 @@ export class OperationalStore {
     );
   }
 
+  recordNativeSessionDerivation(input: RecordNativeSessionDerivationInput): NativeSessionDerivationRecord {
+    this.assertOpen();
+    const normalized = normalizeNativeSessionDerivation(input);
+    const existing = this.findNativeSessionDerivation(normalized.operationId);
+    if (existing !== undefined) {
+      assertSameNativeSessionDerivation(existing, normalized);
+      return existing;
+    }
+    return this.write(() => {
+      const operation = this.getOperation(normalized.operationId);
+      assertEffectOperation(operation, normalized.expectedBodyHash);
+      const navigation = operation.kind === "navigate_session" || operation.kind === "navigateSessionBranch";
+      const body = isRecord(operation.body) ? operation.body : undefined;
+      const payload = body !== undefined && isRecord(body["payload"]) ? body["payload"] : undefined;
+      const value = payload !== undefined && isRecord(payload["value"]) ? payload["value"] : undefined;
+      const sourceId = operation.kind === "navigateSessionBranch"
+        ? payload?.["case"] === "navigateSessionBranch" ? value?.["sessionId"] : undefined
+        : body?.["sourceSessionId"];
+      if (operation.status === "completed" || !["fork_session", "clone_session", "navigate_session", "navigateSessionBranch"].includes(operation.kind)
+        || sourceId !== normalized.sourceSessionId) {
+        throw new StoreError("The native derivation does not match its claimed operation.");
+      }
+      if (navigation
+        ? normalized.sourceSessionId !== normalized.sessionId
+          || normalized.binding.generation !== normalized.sourceBinding.generation + 1
+        : normalized.sourceSessionId === normalized.sessionId) {
+        throw new StoreError("The native derivation has an invalid product identity or generation.");
+      }
+      const source = this.getSession(normalized.sourceSessionId).descriptor;
+      const target = this.getTarget(normalized.targetId).descriptor;
+      if (source.backendId !== normalized.backendId || source.targetId !== normalized.targetId
+        || target.backendId !== normalized.backendId) {
+        throw new StoreError("The native derivation source owner does not match its admission.");
+      }
+      const sourceAdoption = this.database.prepare(`
+        SELECT first_generation FROM native_binding_adoptions
+        WHERE backend_id = ? AND native_opaque_ref = ? COLLATE NOCASE AND session_id = ?
+      `).get(normalized.backendId, normalized.sourceBinding.opaqueRef, normalized.sourceSessionId) as Row | undefined;
+      if (sourceAdoption === undefined || numberValue(sourceAdoption["first_generation"]) > normalized.sourceBinding.generation) {
+        throw new StoreError("The native derivation source binding has no product adoption authority.");
+      }
+      const sameSource = this.database.prepare("SELECT ? = ? COLLATE NOCASE AS same")
+        .get(normalized.sourceBinding.opaqueRef, normalized.binding.opaqueRef) as Row;
+      if (numberValue(sameSource["same"]) === 1
+        || (normalized.sourceBinding.nativeSessionId !== undefined && normalized.binding.nativeSessionId !== undefined
+          && normalized.sourceBinding.nativeSessionId.toLowerCase() === normalized.binding.nativeSessionId.toLowerCase())) {
+        throw new StoreError("A native derivation must return a distinct binding.");
+      }
+      this.assertNativeBindingNeverAdopted(normalized.backendId, normalized.binding.opaqueRef);
+      const conflict = this.database.prepare(`
+        SELECT operation_id FROM native_session_derivations
+        WHERE backend_id = ? AND native_opaque_ref = ? COLLATE NOCASE
+      `).get(normalized.backendId, normalized.binding.opaqueRef) as Row | undefined;
+      if (conflict !== undefined) throw new OperationInProgressError(stringValue(conflict["operation_id"]));
+      const at = this.now();
+      this.database.prepare(`
+        INSERT INTO native_session_derivations(
+          operation_id, body_hash, source_session_id, derived_session_id, backend_id, backend_instance_generation,
+          target_id, source_native_opaque_ref, source_native_session_id, source_generation,
+          effective_workspace_root, remote_host_id, remote_workspace_root, native_opaque_ref, native_session_id,
+          generation, state, created_at, updated_at, revision
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'recorded', ?, ?, ?)
+      `).run(
+        normalized.operationId, normalized.expectedBodyHash, normalized.sourceSessionId, normalized.sessionId,
+        normalized.backendId, normalized.backendInstanceGeneration, normalized.targetId,
+        normalized.sourceBinding.opaqueRef, normalized.sourceBinding.nativeSessionId ?? null,
+        normalized.sourceBinding.generation, normalized.effectiveWorkspaceRoot,
+        normalized.remoteWorkspace?.hostId ?? null, normalized.remoteWorkspace?.workspaceRoot ?? null,
+        normalized.binding.opaqueRef, normalized.binding.nativeSessionId ?? null, normalized.binding.generation,
+        at, at, asSqlInteger(this.requireActiveRevision())
+      );
+      return this.findNativeSessionDerivation(normalized.operationId)!;
+    });
+  }
+
+  findNativeSessionDerivation(operationId: string): NativeSessionDerivationRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare("SELECT * FROM native_session_derivations WHERE operation_id = ?")
+      .get(operationId) as Row | undefined;
+    return row === undefined ? undefined : nativeSessionDerivationFromRow(row);
+  }
+
+  listUnadoptedNativeSessionDerivations(): NativeSessionDerivationRecord[] {
+    this.assertOpen();
+    return (this.database.prepare(`
+      SELECT * FROM native_session_derivations
+      WHERE state IN ('recorded', 'cleanup_claimed', 'cleanup_unknown') ORDER BY created_at, operation_id
+    `).all() as Row[]).map(nativeSessionDerivationFromRow);
+  }
+
+  claimNativeSessionDerivationCleanup(input: {
+    readonly operationId: string; readonly expectedRevision: bigint;
+  }): { readonly record: NativeSessionDerivationRecord; readonly token: string } {
+    return this.write(() => {
+      const record = this.findNativeSessionDerivation(input.operationId);
+      if (record === undefined) throw new NotFoundError("Native derivation", input.operationId);
+      if (record.revision !== input.expectedRevision) {
+        throw new RevisionConflictError("Native derivation", record.operationId, input.expectedRevision, record.revision);
+      }
+      if (record.state !== "recorded" || this.getOperation(record.operationId).status !== "failed") {
+        throw new StoreError("Only an unadopted failed derivation can begin native cleanup.");
+      }
+      this.assertNativeBindingNeverAdopted(record.backendId, record.binding.opaqueRef);
+      const token = randomUUID();
+      const at = this.now();
+      this.database.prepare(`
+        UPDATE native_session_derivations
+        SET state = 'cleanup_claimed', cleanup_token = ?, cleanup_started_at = ?, updated_at = ?, revision = ?
+        WHERE operation_id = ? AND state = 'recorded' AND revision = ?
+      `).run(token, at, at, asSqlInteger(this.requireActiveRevision()), record.operationId, asSqlInteger(record.revision));
+      return { record: this.findNativeSessionDerivation(record.operationId)!, token };
+    });
+  }
+
+  finishNativeSessionDerivationCleanup(input: {
+    readonly operationId: string; readonly token: string;
+    readonly outcome: "cleaned" | "cleanup_unknown"; readonly failureCode?: string;
+  }): NativeSessionDerivationRecord {
+    if (input.outcome !== "cleaned" && input.outcome !== "cleanup_unknown") throw new StoreError("Native cleanup outcome is invalid.");
+    if (input.failureCode !== undefined && !/^[a-z][a-z0-9_]{0,63}$/u.test(input.failureCode)) {
+      throw new StoreError("Native cleanup failure code is invalid.");
+    }
+    if (input.outcome === "cleaned" && input.failureCode !== undefined) throw new StoreError("Confirmed native cleanup cannot contain a failure.");
+    const existing = this.findNativeSessionDerivation(input.operationId);
+    if (existing === undefined) throw new NotFoundError("Native derivation", input.operationId);
+    if (existing.cleanupToken === input.token && existing.state === input.outcome
+      && existing.failureCode === input.failureCode) return existing;
+    return this.write(() => {
+      const record = this.findNativeSessionDerivation(input.operationId)!;
+      if (record.state !== "cleanup_claimed" || record.cleanupToken !== input.token) {
+        throw new StoreError("The native derivation cleanup owner is stale.");
+      }
+      this.assertNativeBindingNeverAdopted(record.backendId, record.binding.opaqueRef);
+      const at = this.now();
+      this.database.prepare(`
+        UPDATE native_session_derivations
+        SET state = ?, cleaned_at = ?, failure_code = ?, updated_at = ?, revision = ?
+        WHERE operation_id = ? AND state = 'cleanup_claimed' AND cleanup_token = ?
+      `).run(input.outcome, input.outcome === "cleaned" ? at : null, input.failureCode ?? null,
+        at, asSqlInteger(this.requireActiveRevision()), record.operationId, input.token);
+      return this.findNativeSessionDerivation(record.operationId)!;
+    });
+  }
+
+  private assertNativeBindingNeverAdopted(backendId: string, opaqueRef: string): void {
+    const adopted = this.database.prepare(`
+      SELECT session_id FROM native_binding_adoptions WHERE backend_id = ? AND native_opaque_ref = ? COLLATE NOCASE
+      UNION ALL
+      SELECT id AS session_id FROM product_sessions WHERE backend_id = ? AND native_opaque_ref = ? COLLATE NOCASE
+      LIMIT 1
+    `).get(backendId, opaqueRef, backendId, opaqueRef) as Row | undefined;
+    if (adopted !== undefined) throw new StoreError("An adopted native binding cannot belong to derivation cleanup.");
+  }
+
+  private assertNativeBindingAdoptionAllowed(
+    descriptor: SessionDescriptor, derivationOperationId?: string
+  ): NativeSessionDerivationRecord | undefined {
+    const row = this.database.prepare(`
+      SELECT * FROM native_session_derivations WHERE backend_id = ? AND native_opaque_ref = ? COLLATE NOCASE
+    `).get(descriptor.backendId, descriptor.binding.opaqueRef) as Row | undefined;
+    const receipt = row === undefined ? undefined : nativeSessionDerivationFromRow(row);
+    if (derivationOperationId !== undefined) {
+      const operation = this.getOperation(derivationOperationId);
+      const navigation = operation.kind === "navigate_session" || operation.kind === "navigateSessionBranch";
+      if (this.deferredEffectCompletions.at(-1) !== derivationOperationId || receipt?.operationId !== derivationOperationId
+        || receipt.state !== "recorded" || receipt.sessionId !== descriptor.id || receipt.targetId !== descriptor.targetId
+        || !sameNativeBinding(receipt.binding, descriptor.binding)
+        || (navigation
+          ? receipt.sourceSessionId !== descriptor.id
+            || !sameNativeBinding(this.getSession(descriptor.id).descriptor.binding, receipt.sourceBinding)
+            || receipt.binding.generation !== receipt.sourceBinding.generation + 1
+          : receipt.sourceSessionId !== descriptor.derivationOrigin?.sourceSessionId
+            || operation.kind !== `${descriptor.derivationOrigin?.kind}_session`)
+        || !sameRemoteWorkspace(receipt.remoteWorkspace, descriptor.remoteWorkspace)) {
+        throw new StoreError("Native derivation adoption requires its exact authorized product transaction.");
+      }
+      this.assertNativeBindingNeverAdopted(descriptor.backendId, descriptor.binding.opaqueRef);
+      return receipt;
+    }
+    if (receipt !== undefined && ["recorded", "cleanup_claimed", "cleanup_unknown"].includes(receipt.state)) {
+      throw new OperationInProgressError(receipt.operationId);
+    }
+    return undefined;
+  }
+
+  private recordNativeBindingAdoption(sessionId: string, backendId: string, binding: NativeSessionBinding, at: number): void {
+    this.database.prepare(`
+      INSERT OR IGNORE INTO native_binding_adoptions(
+        backend_id, native_opaque_ref, session_id, native_session_id, first_generation, adopted_at, revision
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(backendId, binding.opaqueRef, sessionId, binding.nativeSessionId ?? null,
+      binding.generation, at, asSqlInteger(this.requireActiveRevision()));
+  }
+
   getSessionAttention(sessionId: string): SessionAttentionRecord {
     const attention = this.findSessionAttention(sessionId);
     if (attention === undefined) throw new NotFoundError("Session attention", sessionId);
@@ -3082,7 +3302,8 @@ export class OperationalStore {
         readonly effort?: string | null;
       },
     expectedRevision?: bigint,
-    now = this.now()
+    now = this.now(),
+    adoption?: { readonly derivationOperationId: string }
   ): StoredSession {
     return this.write(() => {
       const current = this.getSession(id);
@@ -3100,7 +3321,13 @@ export class OperationalStore {
       if (nativeBindingChanged && binding.generation <= descriptor.binding.generation) {
         throw new StoreError("Changing a native session binding requires a higher generation.");
       }
-      const clearSummary = patch.pinned === false || patch.archived === true || patch.deletedAt !== undefined;
+      if (adoption !== undefined && (patch.binding === undefined
+        || !["navigate_session", "navigateSessionBranch"].includes(this.getOperation(adoption.derivationOperationId).kind))) {
+        throw new StoreError("Native navigation adoption requires a replacement binding.");
+      }
+      const derivation = patch.binding === undefined ? undefined
+        : this.assertNativeBindingAdoptionAllowed({ ...descriptor, binding }, adoption?.derivationOperationId);
+      const clearSummary = nativeBindingChanged || patch.pinned === false || patch.archived === true || patch.deletedAt !== undefined;
       this.database.prepare(`
         UPDATE product_sessions SET
           title = ?, title_source = ?, native_opaque_ref = ?, native_binding_fingerprint = ?, native_session_id = ?, generation = ?,
@@ -3175,8 +3402,15 @@ export class OperationalStore {
       if (updated.revision === current.revision) {
         throw new RevisionConflictError("Session", id, current.revision, updated.revision);
       }
+      if (nativeBindingChanged) this.recordNativeBindingAdoption(id, descriptor.backendId, binding, now);
+      if (derivation !== undefined) {
+        this.database.prepare(`
+          UPDATE native_session_derivations SET state = 'adopted', adopted_at = ?, updated_at = ?, revision = ?
+          WHERE operation_id = ? AND state = 'recorded'
+        `).run(now, now, asSqlInteger(this.requireActiveRevision()), derivation.operationId);
+      }
       if (
-        patch.title !== undefined || patch.pinned !== undefined || patch.archived !== undefined ||
+        nativeBindingChanged || patch.title !== undefined || patch.pinned !== undefined || patch.archived !== undefined ||
         patch.deletedAt !== undefined
       ) this.appendSessionProjectionEvent(updated, `session-update:${id}:${updated.revision.toString(10)}`);
       return updated;
@@ -3583,7 +3817,13 @@ export class OperationalStore {
         return { replayed: true, value: operation.response as T, operation };
       }
 
-      const value = callback(this, connection);
+      let value: T;
+      this.deferredEffectCompletions.push(operationId);
+      try {
+        value = callback(this, connection);
+      } finally {
+        this.deferredEffectCompletions.pop();
+      }
       if (isPromiseLike(value)) throw new AsyncTransactionError();
       const result = this.database.prepare(`
         UPDATE operations
@@ -6503,6 +6743,15 @@ export class OperationalStore {
         OR (
           NULLIF(json_extract(${eventAlias}.payload_json, '$.payload.nativeHistory.identity.entryId'), '') IS NULL
           AND (
+            json_extract(${eventAlias}.metadata_json, '${bindingPath}') IS NULL
+            OR EXISTS (
+              SELECT 1 FROM product_sessions AS current_session
+              WHERE current_session.id = ${eventAlias}.session_id
+                AND current_session.deleted_at IS NULL
+                AND json_extract(${eventAlias}.metadata_json, '${bindingPath}') = current_session.native_binding_fingerprint
+            )
+          )
+          AND (
             (
               NOT EXISTS (
                 SELECT 1 FROM current_native_marker AS marker
@@ -6512,7 +6761,8 @@ export class OperationalStore {
                 SELECT 1 FROM product_sessions AS current_session
                 WHERE current_session.id = ${eventAlias}.session_id
                   AND current_session.deleted_at IS NULL
-                  AND ${eventAlias}.generation = current_session.generation
+                  AND (${eventAlias}.generation = current_session.generation
+                    OR json_extract(${eventAlias}.metadata_json, '${bindingPath}') IS NOT NULL)
               )
             )
             OR EXISTS (
@@ -6529,7 +6779,8 @@ export class OperationalStore {
                   )
                   OR (
                     marker.binding_current = 0
-                    AND ${eventAlias}.generation = marker.current_generation
+                    AND (${eventAlias}.generation = marker.current_generation
+                      OR json_extract(${eventAlias}.metadata_json, '${bindingPath}') IS NOT NULL)
                   )
                 )
             )
@@ -7182,6 +7433,9 @@ export class OperationalStore {
 
   private indexNativeHistory(event: PersistedEvent): void {
     const identity = nativeHistoryEventContext(event.payload)?.identity;
+    if (identity?.rewindBefore !== undefined && !isNativeNavigationTarget(identity.rewindBefore)) {
+      throw new StoreError("Native history requires a valid typed rewind target.");
+    }
     const fingerprintValue = event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD];
     if (identity !== undefined && typeof fingerprintValue === "string" && nativeBindingFingerprintIsValid(fingerprintValue)) {
       const entryId = nativeHistoryIdentityText(identity.entryId, "entry ID");
@@ -7704,7 +7958,11 @@ export class OperationalStore {
     const pendingReviews = this.database.prepare(`
       SELECT id FROM review_runs WHERE state = 'running' ORDER BY created_at, id
     `).all() as Row[];
-    if (pending.length === 0 && pendingRuns.length === 0 && pendingEffects.length === 0 && pendingReviews.length === 0) {
+    const pendingDerivationCleanup = this.database.prepare(
+      "SELECT operation_id FROM native_session_derivations WHERE state = 'cleanup_claimed' LIMIT 1"
+    ).get() as Row | undefined;
+    if (pending.length === 0 && pendingRuns.length === 0 && pendingEffects.length === 0 && pendingReviews.length === 0
+      && pendingDerivationCleanup === undefined) {
       return {
         recoveredQueueItemIds: [],
         affectedRunIds: [],
@@ -7726,6 +7984,11 @@ export class OperationalStore {
       const recoveredReviewRuns: ReviewRunRecord[] = [];
       const error = dispatchUnknownError();
       const at = this.now();
+      this.database.prepare(`
+        UPDATE native_session_derivations
+        SET state = 'cleanup_unknown', failure_code = 'interrupted', updated_at = ?, revision = ?
+        WHERE state = 'cleanup_claimed'
+      `).run(at, asSqlInteger(this.requireActiveRevision()));
       for (const row of rows) {
         const id = stringValue(row["id"]);
         const item = this.getQueueItem(id);
@@ -8876,6 +9139,7 @@ export class OperationalStore {
       } else if (session.descriptor.deletedAt === undefined) {
         this.updateSession(cleanup.sessionId, { archived: true, deletedAt: at }, session.revision, at);
         if (cleanup.deleteArtifacts) {
+          this.database.prepare("DELETE FROM artifact_relations WHERE parent_id IN (SELECT id FROM artifacts WHERE session_id = ?)").run(cleanup.sessionId);
           for (;;) {
             const artifacts = this.listArtifacts({ sessionId: cleanup.sessionId, limit: 100 });
             for (const artifact of artifacts) this.deleteArtifact(artifact.blob.id);
@@ -9138,6 +9402,7 @@ export class OperationalStore {
             this.updateSession(sessionId, { archived: true }, session.revision, at);
           } else if (manifest.disposition === "delete" && session.descriptor.deletedAt === undefined) {
             this.updateSession(sessionId, { archived: true, deletedAt: at }, session.revision, at);
+            this.database.prepare("DELETE FROM artifact_relations WHERE parent_id IN (SELECT id FROM artifacts WHERE session_id = ?)").run(sessionId);
             for (;;) {
               const artifacts = this.listArtifacts({ sessionId, limit: 100 });
               for (const artifact of artifacts) this.deleteArtifact(artifact.blob.id);
@@ -10194,6 +10459,7 @@ export class OperationalStore {
         AND file_name IS ?
         AND deleted_at IS NULL
         AND json_type(metadata_json, '$.expiresAt') IS NULL
+        AND session_id IS NULL
       ORDER BY created_at, id
       LIMIT 1
     `).get(storageKey, mimeType, fileName ?? null) as Row | undefined;
@@ -10204,6 +10470,58 @@ export class OperationalStore {
     const artifact = this.findArtifact(id, includeDeleted);
     if (artifact === undefined) throw new NotFoundError("Artifact", id);
     return artifact;
+  }
+
+  /** Adopt a freshly materialized, expiring Blob into one durable Session. */
+  adoptSessionArtifact(input: {
+    readonly blob: BlobRef;
+    readonly sessionId: string;
+    readonly runId?: string;
+    readonly audioMetadata?: AudioArtifactMetadata;
+  }): ArtifactRecord {
+    this.requireActiveRevision();
+    const current = this.getArtifact(input.blob.id);
+    if (operationBodyHash(current.blob) !== operationBodyHash(input.blob)) throw new StoreError("Artifact adoption identity does not match.");
+    const session = this.getSession(input.sessionId).descriptor;
+    if (session.archived || session.deletedAt !== undefined || this.findPendingSessionLifecycleCleanup(session.id) !== undefined) {
+      throw new StoreError("Artifact Session is unavailable.");
+    }
+    if (input.runId !== undefined && this.getRun(input.runId).descriptor.sessionId !== session.id) throw new StoreError("Artifact Run belongs to another Session.");
+    const audio = input.audioMetadata;
+    if (audio !== undefined) {
+      assertAudioArtifactMetadata(audio);
+      if (!/^audio\/[a-z0-9.+-]+$/u.test(current.blob.mimeType)) throw new StoreError("Audio metadata requires an audio Artifact.");
+      if (audio.artwork !== undefined) {
+        const cover = this.getArtifact(audio.artwork.blob.id);
+        if (cover.sessionId !== session.id || cover.deletedAt !== undefined
+          || operationBodyHash(cover.blob) !== operationBodyHash(audio.artwork.blob)
+          || (cover.metadata as { expiresAt?: unknown }).expiresAt !== undefined) throw new StoreError("Audio artwork must be a permanent Artifact in the same Session.");
+      }
+    }
+    const metadata = audio === undefined ? {} : { audio };
+    if (current.sessionId !== undefined) {
+      if (current.sessionId !== input.sessionId || current.runId !== input.runId
+        || operationBodyHash(current.metadata) !== operationBodyHash(metadata)) throw new StoreError("Artifact is already adopted with different ownership or metadata.");
+      return current;
+    }
+    const expiresAt = (current.metadata as { expiresAt?: unknown }).expiresAt;
+    if (typeof expiresAt !== "number" || !Number.isSafeInteger(expiresAt) || expiresAt <= this.now()) throw new StoreError("Artifact staging has expired or is not available for adoption.");
+    this.database.prepare(`UPDATE artifacts SET session_id = ?, run_id = ?, metadata_json = ?, revision = ? WHERE id = ?`).run(
+      input.sessionId, input.runId ?? null, serializeJson(metadata), asSqlInteger(this.requireActiveRevision()), input.blob.id
+    );
+    if (audio?.artwork !== undefined) this.database.prepare("INSERT INTO artifact_relations(parent_id, child_id, role) VALUES (?, ?, 'audio_artwork')").run(input.blob.id, audio.artwork.blob.id);
+    return this.getArtifact(input.blob.id);
+  }
+
+  /** Only unadopted staging owned by the caller is made due for normal GC. */
+  releaseArtifactStaging(ids: readonly string[]): void {
+    this.write(() => {
+      for (const id of ids) this.database.prepare(`
+        UPDATE artifacts SET metadata_json = json_set(metadata_json, '$.expiresAt', 0), revision = ?
+        WHERE id = ? AND session_id IS NULL AND deleted_at IS NULL
+          AND json_type(metadata_json, '$.expiresAt') IN ('integer', 'real')
+      `).run(asSqlInteger(this.requireActiveRevision()), id);
+    });
   }
 
   findArtifact(id: string, includeDeleted = false): ArtifactRecord | undefined {
@@ -10286,6 +10604,10 @@ export class OperationalStore {
     return this.write(() => {
       const current = this.getArtifact(id, true);
       if (current.deletedAt !== undefined) return current;
+      if (this.database.prepare("SELECT 1 FROM artifact_relations WHERE child_id = ? LIMIT 1").get(id) !== undefined) {
+        throw new StoreError("Artifact is still used as audio artwork.");
+      }
+      this.database.prepare("DELETE FROM artifact_relations WHERE parent_id = ?").run(id);
       this.database.prepare(`
         UPDATE artifacts SET deleted_at = ?, revision = ? WHERE id = ? AND deleted_at IS NULL
       `).run(deletedAt, asSqlInteger(this.requireActiveRevision()), id);
@@ -10956,6 +11278,11 @@ export class OperationalStore {
       }
       return { changed, ...delta, costMicros, costComplete, estimated, day };
     });
+  }
+
+  getUsageReport(input: UsageReportQuery): UsageReportPage {
+    this.assertOpen();
+    return this.readConsistent(() => readUsageReport(this.database, this.readRevision(), input));
   }
 
   listUsageLedger(input: UsageLedgerQuery): UsageLedgerDailyRecord[] {
@@ -12317,8 +12644,8 @@ function writeBackendDescriptorRow(
     INSERT INTO backends(
       id, adapter_kind, instance_generation, display_name, version, health,
       installation_state, authentication_state, error_json,
-      capabilities_json, providers_json, models_json, tools_json, diagnostics_json, created_at, updated_at, revision
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      capabilities_json, providers_json, provider_runtime_support_json, models_json, tools_json, diagnostics_json, created_at, updated_at, revision
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       adapter_kind = excluded.adapter_kind,
       instance_generation = excluded.instance_generation,
@@ -12330,6 +12657,7 @@ function writeBackendDescriptorRow(
       error_json = excluded.error_json,
       capabilities_json = excluded.capabilities_json,
       providers_json = excluded.providers_json,
+      provider_runtime_support_json = excluded.provider_runtime_support_json,
       models_json = excluded.models_json,
       tools_json = excluded.tools_json,
       diagnostics_json = excluded.diagnostics_json,
@@ -12347,6 +12675,7 @@ function writeBackendDescriptorRow(
     descriptor.error === undefined ? null : serializeJson(descriptor.error),
     serializeJson(capabilities),
     serializeJson(descriptor.providers ?? []),
+    descriptor.providerRuntimeSupport === undefined ? null : serializeJson(descriptor.providerRuntimeSupport),
     serializeJson(descriptor.models),
     serializeJson(descriptor.tools),
     serializeJson(descriptor.diagnostics),
@@ -12394,6 +12723,9 @@ function backendFromRow(row: Row): StoredBackend {
       ...(row["error_json"] === null ? {} : { error: parseJson<NonNullable<BackendDescriptor["error"]>>(stringValue(row["error_json"])) }),
       capabilities: new Map(entries),
       providers: parseJson<NonNullable<BackendDescriptor["providers"]>>(stringValue(row["providers_json"])),
+      ...(row["provider_runtime_support_json"] === null ? {} : {
+        providerRuntimeSupport: parseJson<NonNullable<BackendDescriptor["providerRuntimeSupport"]>>(stringValue(row["provider_runtime_support_json"]))
+      }),
       models: parseJson<BackendDescriptor["models"]>(stringValue(row["models_json"])),
       tools: parseJson<BackendDescriptor["tools"]>(stringValue(row["tools_json"])),
       diagnostics: parseJson<BackendDescriptor["diagnostics"]>(stringValue(row["diagnostics_json"]))
@@ -12488,7 +12820,9 @@ function remoteHostFromRow(row: Row): RemoteHostRecord {
   const credentialReferenceId = row["credential_reference_id"] === null
     ? undefined
     : remoteHostCredentialReference(stringValue(row["credential_reference_id"]));
-  assertRemoteHostAuthentication(authenticationMode, credentialReferenceId);
+  const nodeKey = row["node_key_id"] === null && row["node_key_fingerprint"] === null ? undefined
+    : remoteHostNodeKey({ id: stringValue(row["node_key_id"]), expectedFingerprint: stringValue(row["node_key_fingerprint"]) });
+  assertRemoteHostAuthentication(authenticationMode, credentialReferenceId, nodeKey);
 
   return {
     ownerId: remoteHostIdentity(stringValue(row["owner_id"]), "stored owner id", 256),
@@ -12500,6 +12834,7 @@ function remoteHostFromRow(row: Row): RemoteHostRecord {
     source: remoteHostSource(stringValue(row["source"])),
     authenticationMode,
     ...(credentialReferenceId === undefined ? {} : { credentialReferenceId }),
+    ...(nodeKey === undefined ? {} : { nodeKey }),
     ...(trustAlgorithm === undefined || trustFingerprint === undefined || trustPinnedAt === undefined
       ? {}
       : {
@@ -12833,6 +13168,93 @@ function queueItemFromRow(row: Row, at: number): QueueItemRecord {
     ...optionalNumber("completedAt", row["completed_at"]),
     ...optionalJson<PublicError, "error">("error", row["error_json"]),
     editLocked: editLockExpiresAt !== undefined && editLockExpiresAt > at,
+    revision: toBigInt(row["revision"])
+  };
+}
+
+function sameNativeBinding(left: NativeSessionBinding, right: NativeSessionBinding): boolean {
+  return left.opaqueRef === right.opaqueRef && left.nativeSessionId === right.nativeSessionId && left.generation === right.generation;
+}
+
+function normalizeNativeSessionDerivation(input: RecordNativeSessionDerivationInput): RecordNativeSessionDerivationInput {
+  const identity = (value: string, label: string): string => {
+    if (typeof value !== "string" || value.length > 256 || value.includes("\0")) throw new StoreError(`${label} is invalid.`);
+    return nonBlank(value, label);
+  };
+  const binding = (value: NativeSessionBinding): NativeSessionBinding => {
+    if (!Number.isSafeInteger(value.generation) || value.generation < 0) throw new StoreError("Native derivation generation is invalid.");
+    return {
+      opaqueRef: nativeBindingReference(value.opaqueRef),
+      ...(value.nativeSessionId === undefined ? {} : { nativeSessionId: identity(value.nativeSessionId, "Native Session ID") }),
+      generation: value.generation
+    };
+  };
+  if (!Number.isSafeInteger(input.backendInstanceGeneration) || input.backendInstanceGeneration < 0) {
+    throw new StoreError("Native derivation backend generation is invalid.");
+  }
+  if (!/^sha256:[a-f0-9]{64}$/u.test(input.expectedBodyHash)) throw new StoreError("Native derivation body hash is invalid.");
+  const sourceSessionId = identity(input.sourceSessionId, "Source Session ID");
+  const sessionId = identity(input.sessionId, "Derived Session ID");
+  return {
+    operationId: identity(input.operationId, "Operation ID"),
+    expectedBodyHash: input.expectedBodyHash,
+    sourceSessionId,
+    sourceBinding: binding(input.sourceBinding),
+    sessionId,
+    backendId: identity(input.backendId, "Backend ID"),
+    backendInstanceGeneration: input.backendInstanceGeneration,
+    targetId: identity(input.targetId, "Target ID"),
+    effectiveWorkspaceRoot: nativeBindingReference(input.effectiveWorkspaceRoot),
+    ...(input.remoteWorkspace === undefined ? {} : { remoteWorkspace: {
+      hostId: remoteHostAlias(input.remoteWorkspace.hostId),
+      workspaceRoot: remoteWorkspaceRoot(input.remoteWorkspace.workspaceRoot)
+    } }),
+    binding: binding(input.binding)
+  };
+}
+
+function assertSameNativeSessionDerivation(record: NativeSessionDerivationRecord, input: RecordNativeSessionDerivationInput): void {
+  if (record.operationId !== input.operationId || record.expectedBodyHash !== input.expectedBodyHash
+    || record.sourceSessionId !== input.sourceSessionId || record.sessionId !== input.sessionId
+    || record.backendId !== input.backendId || record.backendInstanceGeneration !== input.backendInstanceGeneration
+    || record.targetId !== input.targetId || record.effectiveWorkspaceRoot !== input.effectiveWorkspaceRoot
+    || !sameNativeBinding(record.sourceBinding, input.sourceBinding) || !sameNativeBinding(record.binding, input.binding)
+    || !sameRemoteWorkspace(record.remoteWorkspace, input.remoteWorkspace)) {
+    throw new StoreError("The native derivation receipt does not match its original effect.");
+  }
+}
+
+function nativeSessionDerivationFromRow(row: Row): NativeSessionDerivationRecord {
+  return {
+    operationId: stringValue(row["operation_id"]),
+    expectedBodyHash: stringValue(row["body_hash"]),
+    sourceSessionId: stringValue(row["source_session_id"]),
+    sourceBinding: {
+      opaqueRef: stringValue(row["source_native_opaque_ref"]),
+      ...(row["source_native_session_id"] === null ? {} : { nativeSessionId: stringValue(row["source_native_session_id"]) }),
+      generation: numberValue(row["source_generation"])
+    },
+    sessionId: stringValue(row["derived_session_id"]),
+    backendId: stringValue(row["backend_id"]),
+    backendInstanceGeneration: numberValue(row["backend_instance_generation"]),
+    targetId: stringValue(row["target_id"]),
+    effectiveWorkspaceRoot: stringValue(row["effective_workspace_root"]),
+    ...(row["remote_host_id"] === null ? {} : { remoteWorkspace: {
+      hostId: stringValue(row["remote_host_id"]), workspaceRoot: stringValue(row["remote_workspace_root"])
+    } }),
+    binding: {
+      opaqueRef: stringValue(row["native_opaque_ref"]),
+      ...(row["native_session_id"] === null ? {} : { nativeSessionId: stringValue(row["native_session_id"]) }),
+      generation: numberValue(row["generation"])
+    },
+    state: enumValue(row["state"], ["recorded", "adopted", "cleanup_claimed", "cleaned", "cleanup_unknown"] as const),
+    ...(row["cleanup_token"] === null ? {} : { cleanupToken: stringValue(row["cleanup_token"]) }),
+    ...(row["cleanup_started_at"] === null ? {} : { cleanupStartedAt: numberValue(row["cleanup_started_at"]) }),
+    ...(row["adopted_at"] === null ? {} : { adoptedAt: numberValue(row["adopted_at"]) }),
+    ...(row["cleaned_at"] === null ? {} : { cleanedAt: numberValue(row["cleaned_at"]) }),
+    ...(row["failure_code"] === null ? {} : { failureCode: stringValue(row["failure_code"]) }),
+    createdAt: numberValue(row["created_at"]),
+    updatedAt: numberValue(row["updated_at"]),
     revision: toBigInt(row["revision"])
   };
 }
@@ -13583,6 +14005,7 @@ function replayOperation<T>(operation: OperationRecord<T>, bodyHash: string): Op
 }
 
 function errorForStorage(error: unknown): unknown {
+  if (error instanceof JokoError) return effectFailureError(error);
   if (error instanceof Error) {
     return {
       name: error.name,
@@ -13999,7 +14422,7 @@ function remoteHostSource(value: string): RemoteHostSource {
 }
 
 function remoteHostAuthenticationMode(value: string): RemoteHostAuthenticationMode {
-  if (value !== "system_agent" && value !== "private_key") {
+  if (value !== "system_agent" && value !== "private_key" && value !== "node_key") {
     throw new StoreError("Remote Host authentication mode is invalid.");
   }
   return value;
@@ -14007,14 +14430,21 @@ function remoteHostAuthenticationMode(value: string): RemoteHostAuthenticationMo
 
 function assertRemoteHostAuthentication(
   mode: RemoteHostAuthenticationMode,
-  credentialReferenceId: string | undefined
+  credentialReferenceId: string | undefined,
+  nodeKey: RemoteHostRecord["nodeKey"]
 ): void {
-  if (mode === "system_agent" && credentialReferenceId !== undefined) {
-    throw new StoreError("System-agent authentication cannot persist a credential reference.");
+  if ((mode === "private_key") !== (credentialReferenceId !== undefined) ||
+    (mode === "node_key") !== (nodeKey !== undefined)) {
+    throw new StoreError("Remote Host authentication metadata is inconsistent.");
   }
-  if (mode === "private_key" && credentialReferenceId === undefined) {
-    throw new StoreError("Private-key authentication requires a credential reference.");
+}
+
+function remoteHostNodeKey(value: NonNullable<RemoteHostRecord["nodeKey"]>): NonNullable<RemoteHostRecord["nodeKey"]> {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/u.test(value.id) ||
+    !/^SHA256:[A-Za-z0-9+/]{43}$/u.test(value.expectedFingerprint)) {
+    throw new StoreError("Remote Host node key identity is invalid.");
   }
+  return { id: value.id, expectedFingerprint: value.expectedFingerprint };
 }
 
 function remoteWorkspaceRoot(value: string): string {

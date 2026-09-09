@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { WorkspaceDiffHunkView, WorkspaceFileDiffView } from "../model.js";
-import { buildReviewDiffTree, buildReviewSplitRows, filterReviewFileJumpResults, filterReviewFiles, flattenReviewDiffTree, inlineWordDiff, isPreviewableReviewImageDiff, isReviewMarkdownPath, isSafeReviewRef, moveReviewFileJumpSelection, reviewFileKey } from "./review-diff.js";
+import { buildReviewDiffTree, buildReviewSplitRows, createReviewInlineDiff, filterReviewFileJumpResults, filterReviewFiles, flattenReviewDiffTree, inlineWordDiff, isPreviewableReviewImageDiff, isReviewMarkdownPath, isSafeReviewRef, moveReviewFileJumpSelection, reviewFileKey } from "./review-diff.js";
 
 const file = (path: string, source: WorkspaceFileDiffView["source"]): WorkspaceFileDiffView => ({
   path,
@@ -45,6 +45,40 @@ describe("workspace Review diff helpers", () => {
     expect(inlineWordDiff("return oldValue;", "return newValue;")).toEqual({
       before: [{ text: "return ", changed: false }, { text: "oldValue", changed: true }, { text: ";", changed: false }],
       after: [{ text: "return ", changed: false }, { text: "newValue", changed: true }, { text: ";", changed: false }]
+    });
+  });
+
+  it("derives word spans only for requested replacement pairs and preserves unpaired lines", () => {
+    let reads = 0;
+    const hunk: WorkspaceDiffHunkView = {
+      oldStart: 1, oldCount: 301, newStart: 1, newCount: 300, heading: "",
+      lines: [
+        ...Array.from({ length: 300 }, (_, index) => [
+          { kind: "removed" as const, oldLine: index + 1, newLine: 0, get text() { reads += 1; return `old value ${index}`; } },
+          { kind: "added" as const, oldLine: 0, newLine: index + 1, get text() { reads += 1; return `new value ${index}`; } }
+        ]).flat(),
+        { kind: "removed", oldLine: 301, newLine: 0, text: "unpaired" },
+        { kind: "noNewline", oldLine: 0, newLine: 0, text: "No newline at end of file" }
+      ]
+    };
+    const inline = createReviewInlineDiff(hunk);
+    expect(reads).toBe(0);
+    expect(inline.get(598)).toEqual([{ text: "old", changed: true }, { text: " value 299", changed: false }]);
+    expect(inline.get(599)).toEqual([{ text: "new", changed: true }, { text: " value 299", changed: false }]);
+    expect(reads).toBe(2);
+    expect(inline.get(600)).toBeUndefined();
+    expect(inline.get(601)).toBeUndefined();
+    for (let index = 0; index < 600; index += 2) inline.get(index);
+    expect(inline.get(0)?.map((span) => span.text).join("")).toBe("old value 0");
+  });
+
+  it("keeps very long lines intact with bounded whole-line highlighting", () => {
+    const before = "value ".repeat(20_000);
+    expect(inlineWordDiff(before, before)).toEqual({
+      before: [{ text: before, changed: false }], after: [{ text: before, changed: false }]
+    });
+    expect(inlineWordDiff(before, `${before} changed`)).toEqual({
+      before: [{ text: before, changed: true }], after: [{ text: `${before} changed`, changed: true }]
     });
   });
 

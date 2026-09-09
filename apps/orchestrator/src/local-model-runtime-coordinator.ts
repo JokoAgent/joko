@@ -19,13 +19,14 @@ type ProviderUpsertInput = Parameters<ProviderCatalogManager["upsert"]>[0];
 type ProviderWriteOptions = Parameters<ProviderCatalogManager["upsert"]>[1];
 
 export interface LocalModelProviderCatalog {
-  list(): readonly ProviderDescriptor[];
+  list(backendId: string): readonly ProviderDescriptor[];
   upsert(input: ProviderUpsertInput, options?: ProviderWriteOptions): Promise<ProviderDescriptor>;
-  delete(providerId: string, options?: ProviderWriteOptions): Promise<boolean>;
+  deleteRuntime: ProviderCatalogManager["deleteRuntime"];
 }
 
 export interface LocalModelProviderCoordinatorOptions {
   readonly providers: LocalModelProviderCatalog;
+  readonly backendId: string;
   readonly currentOwner: () => RuntimeOwnerGeneration | undefined;
   readonly bindings?: LocalModelProviderBindings;
 }
@@ -48,14 +49,14 @@ export class LocalModelProviderCoordinator {
   async sync(owner: RuntimeOwnerGeneration, inputModels: readonly ManagedRuntimeModel[]): Promise<void> {
     this.assertOwner(owner);
     const models = validateModels(inputModels);
-    const existing = this.options.providers.list().find((item) => item.provider.id === MANAGED_LOCAL_PROVIDER_ID);
+    const existing = this.options.providers.list(this.options.backendId).find((item) => item.provider.id === MANAGED_LOCAL_PROVIDER_ID);
     if (existing !== undefined && !isOwnedProvider(existing)) {
       throw new LocalRuntimeError("RUNTIME_ERROR", "The managed local Provider ID is already used by a custom Provider.");
     }
     const stillActive = () => sameOwner(this.options.currentOwner(), owner);
     if (models.length === 0) {
       if (existing !== undefined) {
-        await this.options.providers.delete(MANAGED_LOCAL_PROVIDER_ID, { stillActive });
+        await this.options.providers.deleteRuntime(this.options.backendId, MANAGED_LOCAL_PROVIDER_ID, { expectedVersion: existing.version, stillActive });
         this.assertOwner(owner);
       }
       await this.options.bindings?.remove(owner);
@@ -65,6 +66,8 @@ export class LocalModelProviderCoordinator {
 
     const provider = managedProvider(models, existing?.provider);
     const next: ProviderUpsertInput = {
+      backendId: this.options.backendId,
+      credentialOrigin: "",
       provider,
       displayName: "Ollama (Local)",
       kind: "local_keyless",

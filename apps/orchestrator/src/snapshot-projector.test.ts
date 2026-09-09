@@ -529,7 +529,7 @@ describe("SnapshotProjector", () => {
     expect(timelineIds).not.toContain("old-binding-entry");
   });
 
-  it("keeps same-binding ancestors across runtime generations", () => {
+  it("keeps same-binding ancestors and durable Artifacts across runtime generations", () => {
     const fixture = createFixture();
     const nativeReference = fixture.store.getSession("session-1").descriptor.binding.opaqueRef;
     const bindingFingerprint = nativeBindingFingerprint(nativeReference);
@@ -552,10 +552,15 @@ describe("SnapshotProjector", () => {
       }
     });
     appendNative("root", undefined, 7);
+    fixture.store.appendEvent({ id: "durable-audio", backendId: "pi", targetId: "target-1", sessionId: "session-1", generation: 7, traceId: "audio",
+      payload: { type: "artifact", artifact: fixture.store.getArtifact("artifact-1").blob, purpose: "audio" },
+      metadata: { namespace: "joko.audio_artifact", fields: { [NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD]: bindingFingerprint } }
+    });
     const stored = fixture.store.getSession("session-1");
     fixture.store.updateSession("session-1", {
       binding: { ...stored.descriptor.binding, generation: 8 }
     }, stored.revision);
+    expect(createProjector(fixture.store).projectSessionSnapshot("session-1").timeline.map((event) => event.eventId)).toContain("durable-audio");
     appendNative("leaf", "root", 8);
     fixture.store.appendEvent({
       id: "cross-generation-marker",
@@ -570,7 +575,10 @@ describe("SnapshotProjector", () => {
     const timelineIds = createProjector(fixture.store)
       .projectSessionSnapshot({ sessionId: "session-1", recentTimelineItems: 100 })
       .timeline.map((event) => event.eventId);
-    expect(timelineIds).toEqual(expect.arrayContaining(["cross-generation-root", "cross-generation-leaf"]));
+    expect(timelineIds).toEqual(expect.arrayContaining(["cross-generation-root", "cross-generation-leaf", "durable-audio"]));
+    const current = fixture.store.getSession("session-1");
+    fixture.store.updateSession("session-1", { binding: { opaqueRef: "opaque:new-audio-task", generation: 9 } }, current.revision);
+    expect(createProjector(fixture.store).projectSessionSnapshot("session-1").timeline.map((event) => event.eventId)).not.toContain("durable-audio");
   });
 
   it("routes all seven protobuf scopes with store-authoritative filtering", () => {

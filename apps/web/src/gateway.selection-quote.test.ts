@@ -56,7 +56,7 @@ describe("selected-text quote gateway wiring", () => {
       attachments: [],
       mentions: [],
       deliveryMode: "prompt"
-    });
+    }, { expectedGeneration: 1n });
 
     expect(payloads[0]?.value.input.quotesEncoded).toBe(true);
     expect(payloads[0]?.value.input.parts.map((part: any) => ({ content: part.content }))).toEqual([{
@@ -71,7 +71,7 @@ describe("selected-text quote gateway wiring", () => {
       attachments: [],
       mentions: [],
       deliveryMode: "prompt"
-    });
+    }, { expectedGeneration: 1n });
     expect(payloads[1]?.value.input.quotesEncoded).toBe(false);
     expect(payloads[1]?.value.input.parts[0]?.content.value).toBe("> <!-- joko-selection-quote -->\n> typed marker");
 
@@ -94,7 +94,7 @@ describe("selected-text quote gateway wiring", () => {
       attachments: [],
       mentions: [],
       deliveryMode: "prompt"
-    });
+    }, { expectedGeneration: 1n });
     expect(payloads[2]?.value.input).toMatchObject({
       parts: [{ content: { case: "text", value: "prefix alpha\nbeta suffix" } }],
       pastedTextRanges: [{ start: 7, end: 17, display: "Pasted text (2 lines)" }]

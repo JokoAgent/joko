@@ -45,6 +45,21 @@ function event(overrides: Partial<PersistedEvent> = {}): PersistedEvent {
 }
 
 describe("portable Session message projection", () => {
+  it("retains source order across simultaneous messages, Artifacts and missing-media markers", () => {
+    const artifact = event({ payload: { type: "artifact", artifact: sourceBlob, purpose: "preview" } });
+    const message = event();
+    const projection = projectPortableSessionMessages([artifact, message, artifact]);
+    const restored = decodePortableSessionProjection(encodePortableSessionProjection(projection));
+    expect(portableProjectionEventPayloads(restored).map((entry) => entry.payload.type)).toEqual(["artifact", "message_complete", "artifact"]);
+    const missing = omitUnavailablePortableProjectionBlobs(restored, new Set());
+    expect(portableProjectionEventPayloads(missing).map((entry) => entry.payload.type)).toEqual(["status", "message_complete", "status"]);
+    for (const sourceOrder of [undefined, -1, 0]) {
+      expect(() => decodePortableSessionProjection(Buffer.from(JSON.stringify({ ...restored,
+        messages: [{ ...restored.messages[0], sourceOrder }]
+      })))).toThrowError(PortableSessionProjectionError);
+    }
+  });
+
   it("accepts exactly the format message limit and rejects the 100001st message", { timeout: 20_000 }, () => {
     const source = event();
     const exact = Array<PersistedEvent>(MAXIMUM_PORTABLE_SESSION_MESSAGES).fill(source);

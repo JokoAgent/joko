@@ -1,7 +1,19 @@
 import { describe, expect, it } from "vitest";
-import { messageKeys, translate } from "./i18n.js";
+import { messageKeys, translate } from "../i18n.js";
 
 describe("translate", () => {
+  it("localizes model settings, interaction placeholders, recovery, and tool policy explanations", () => {
+    expect(translate("en-XA", "settings.auxiliaryText.conflict")).toMatch(/^［.+］$/u);
+    expect(translate("zh-CN", "settings.auxiliaryText.title")).toBe("辅助文本模型");
+    expect(translate("en", "interaction.waitForReply")).toBe("Waiting for your reply in the document area…");
+    expect(translate("zh-CN", "interaction.waitForReply")).toBe("等待你在文档区回复…");
+    expect(translate("zh-CN", "review.reobserve")).toBe("重新检查证据");
+    expect(translate("zh-CN", "settings.toolPolicies.newTasksOnly")).toContain("现有任务");
+    expect(translate("zh-CN", "settings.toolPolicies.source.project")).toBe("项目覆盖");
+    expect(translate("zh-CN", "timeline.errorCapacityMessage")).toContain("没有可用容量");
+    expect(translate("zh-CN", "timeline.errorCapacityRecovery")).toContain("另一个可用模型");
+  });
+
   it("serves English and Simplified Chinese from the same typed catalog", () => {
     expect(translate("en", "nav.newTask")).toBe("New task");
     expect(translate("zh-CN", "nav.newTask")).toBe("新任务");

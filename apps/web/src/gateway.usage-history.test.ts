@@ -4,6 +4,8 @@ import {
   GetModelPriceOverrideResponseSchema,
   GetSnapshotResponseSchema,
   GetUsageHistoryResponseSchema,
+  GetUsageReportResponseSchema,
+  UsageReportGroup,
   ModelPriceCurrency,
   ResetModelPriceOverrideResponseSchema,
   SetModelPriceOverrideResponseSchema,
@@ -19,6 +21,12 @@ describe("usage history gateway", () => {
     const transport = usageTransport((method, input) => {
       calls.push({ method: method.localName, input });
       if (method.localName === "getUsageHistory") return create(GetUsageHistoryResponseSchema, { history: protoHistory(input.days) });
+      if (method.localName === "getUsageReport") return create(GetUsageReportResponseSchema, {
+        summary: protoHistory(1).today,
+        entries: [{ key: "row-1", backendId: "backend-one", providerId: "provider-one", modelId: "model-one",
+          summary: protoHistory(1).today, measuredAt: { seconds: 1n, nanos: 0 } }],
+        page: { totalSize: 26n, nextPageToken: "next-page" }
+      });
       if (method.localName === "getModelPriceOverride") return create(GetModelPriceOverrideResponseSchema, { price: protoPrice(input.backendId, input.providerId, input.modelId) });
       if (method.localName === "setModelPriceOverride") return create(SetModelPriceOverrideResponseSchema, { price: { ...protoPrice(input.backendId, input.providerId, input.modelId), override: input.desired, effective: input.desired } });
       if (method.localName === "resetModelPriceOverride") return create(ResetModelPriceOverrideResponseSchema, { price: { ...protoPrice(input.backendId, input.providerId, input.modelId), override: undefined } });
@@ -43,6 +51,15 @@ describe("usage history gateway", () => {
         { backendId: "backend-two", providerId: "provider-one", modelId: "model-one" }
       ]);
     expect(calls.find((call) => call.method === "getUsageHistory")?.input).toEqual({ days: 140, backendId: "backend-one", providerId: "provider-one" });
+    const report = await gateway.getUsageReport({ group: "model", providerId: "provider-one", modelId: "model-one", fromDay: "2026-08-01" }, new AbortController().signal);
+    expect(report).toMatchObject({ totalGroups: 26, nextPageToken: "next-page", entries: [{ key: "row-1", measuredAt: 1000 }] });
+    expect(report.summary.currencyTotals.map((total) => total.currencyCode)).toEqual(["USD", "CNY"]);
+    expect(calls.find((call) => call.method === "getUsageReport")?.input).toMatchObject({ group: UsageReportGroup.MODEL,
+      providerId: "provider-one", modelId: "model-one", fromDay: "2026-08-01", page: { pageSize: 25, pageToken: "" } });
+    const cancelled = new AbortController();
+    cancelled.abort();
+    await expect(gateway.getUsageReport({ group: "task" }, cancelled.signal)).rejects.toThrow();
+    expect(calls.filter((call) => call.method === "getUsageReport")).toHaveLength(1);
 
     const reference = await gateway.getModelPriceOverride(" backend-one ", " provider-one ", " model-one ");
     expect(reference).toMatchObject({ backendId: "backend-one", providerId: "provider-one", modelId: "model-one", effective: { currency: "USD", inputPerMillion: 2, outputPerMillion: 6 }, revision: 9n });

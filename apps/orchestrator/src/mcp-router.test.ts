@@ -12,7 +12,7 @@ import {
   type AndroidToolDescriptor,
   type AndroidToolProvider
 } from "@joko/tool-android";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { ANDROID_BRIDGE_PROVIDER_ID, AndroidToolBridgeProvider } from "./android-tool-bridge.js";
 import { OperationalArtifactRepository } from "./artifact-repository.js";
@@ -38,6 +38,20 @@ import {
   type RemoteNativeAuthRunnerAttestation
 } from "./native-auth-recovery.js";
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+const AUDIO_ARTWORK_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAAFElEQVQImWP4P4Ph/wwGEP4/gwEAMI4GXTG6t9EAAAAASUVORK5CYII=";
+
+function audioWave(): Buffer {
+  const wav = Buffer.alloc(46);
+  wav.write("RIFF"); wav.writeUInt32LE(38, 4); wav.write("WAVEfmt ", 8); wav.writeUInt32LE(16, 16); wav.writeUInt16LE(1, 20); wav.writeUInt16LE(1, 22); wav.writeUInt32LE(8000, 24); wav.writeUInt32LE(16000, 28); wav.writeUInt16LE(2, 32); wav.writeUInt16LE(16, 34); wav.write("data", 36); wav.writeUInt32LE(2, 40);
+  return wav;
+}
+
 class FakeMcpFactory implements McpClientFactory {
   readonly inputs: McpClientFactoryInput[] = [];
   readonly closed: number[] = [];
@@ -45,6 +59,8 @@ class FakeMcpFactory implements McpClientFactory {
   readonly listSignals: AbortSignal[] = [];
   readonly calledTools: string[] = [];
   result: McpCallResult | undefined;
+  readonly resourceReads: { uri: string; generation: number; signal: AbortSignal }[] = [];
+  readResourceHandler: ((uri: string, signal: AbortSignal) => Promise<{ readonly contents: readonly unknown[] }>) | undefined;
   toolDescription = "Return the fenced generation";
   listToolsHandler: ((cursor: string | undefined, signal: AbortSignal) => Promise<McpToolListPage>) | undefined;
 
@@ -69,6 +85,11 @@ class FakeMcpFactory implements McpClientFactory {
         owner.calledTools.push(name);
         if (owner.result !== undefined) return owner.result;
         return { content: [{ type: "text", text: `${generation}:${String(arguments_["value"] ?? "")}` }], isError: false };
+      },
+      async readResource(uri, signal) {
+        owner.resourceReads.push({ uri, generation, signal });
+        if (owner.readResourceHandler === undefined) throw new Error("Fixture resource is unavailable.");
+        return owner.readResourceHandler(uri, signal);
       },
       close: async () => { this.closed.push(generation); }
     };
@@ -206,6 +227,198 @@ async function fixture(options: FixtureOptions = {}) {
 }
 
 describe("McpRouter", () => {
+  it("adopts standard MCP embedded and linked audio with explicit artwork through the producing resource connection", async () => {
+    const { root, store, router, factory, artifacts } = await fixture();
+    const audioUri = "https://media.example.test/track?access=ephemeral-value";
+    const artworkUri = "asset://cover";
+    const wav = audioWave();
+    const cover = AUDIO_ARTWORK_PNG;
+    try {
+      await router.upsert({ id: "audio", displayName: "Audio", enabled: true, transport: "streamable_http", endpoint: "http://127.0.0.1:4321/mcp", credentialBindings: [] });
+      const snapshot = router.createPiBridgeSnapshot({ endpoint: "http://127.0.0.1:4318/internal/mcp", sessionId: "session-1", targetId: "target-1", expectedPiGeneration: 1 });
+      const request = { authorization: `Bearer ${snapshot.mcpBridge.token}`, requestId: "resource-tracks", generation: 1, sessionId: "session-1", targetId: "target-1", serverId: "audio", toolName: "echo" };
+      factory.result = { content: [
+        { type: "resource_link", uri: audioUri, name: "unrelated-file-name", mimeType: "audio/wav" },
+        { type: "resource", resource: { uri: "asset://embedded", mimeType: "audio/wav", blob: wav.toString("base64") } },
+        { type: "resource_link", uri: artworkUri, name: "cover", mimeType: "image/png" },
+        { type: "text", text: "Completed" }
+      ], structuredContent: { jokoAudioArtifacts: [{ audioContentIndex: 0, kind: "music", title: "Morning", artwork: { imageContentIndex: 2, alt: "Garden" } }] }, isError: false };
+      factory.readResourceHandler = async (uri) => ({ contents: [{ uri, mimeType: uri === audioUri ? "audio/wav" : "image/png", blob: uri === audioUri ? wav.toString("base64") : cover }] });
+      expect(await router.executeBridgeCall(request)).toMatchObject({ isError: false });
+      const records = store.listArtifacts({ sessionId: "session-1" });
+      expect(records).toHaveLength(3);
+      const music = records.find((entry) => (entry.metadata as { audio?: { kind: string } }).audio?.kind === "music")!;
+      expect(music.metadata).toMatchObject({ audio: { title: "Morning", artwork: { alt: "Garden", width: 2, height: 2 } } });
+      expect((await artifacts.readBlob(music.blob)).data).toEqual(wav);
+      expect(records.map((entry) => entry.metadata)).toContainEqual({ audio: { kind: "generic", title: "", description: "" } });
+      expect(factory.resourceReads.map(({ uri }) => uri)).toEqual([audioUri, artworkUri]);
+      const durable = JSON.stringify({ operations: store.listOperations(), events: store.listEvents({ sessionId: "session-1" }), records }, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value);
+      expect(durable).not.toContain(audioUri);
+      expect(durable).not.toContain(artworkUri);
+      expect(durable).not.toContain(wav.toString("base64"));
+      expect(await router.executeBridgeCall(request)).toMatchObject({ isError: false });
+      expect(factory.resourceReads).toHaveLength(2);
+      expect(factory.calledTools).toHaveLength(1);
+    } finally { await router.dispose(); store.close(); await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("removes adopted resource identities from copied result text, nested data and durable audio metadata", async () => {
+    const { root, store, router, factory } = await fixture();
+    const audioUri = "asset://track";
+    const secondUri = `${audioUri}?access=ephemeral-track`;
+    const artworkUri = "asset://cover?access=ephemeral-cover";
+    const publicImage = { type: "resource_link", uri: "https://media.example.test/public-cover", name: "Unassociated image", mimeType: "image/png" };
+    try {
+      await router.upsert({ id: "audio", displayName: "Audio", enabled: true, transport: "streamable_http", endpoint: "http://127.0.0.1:4321/mcp", credentialBindings: [] });
+      const snapshot = router.createPiBridgeSnapshot({ endpoint: "http://127.0.0.1:4318/internal/mcp", sessionId: "session-1", targetId: "target-1", expectedPiGeneration: 1 });
+      const request = { authorization: `Bearer ${snapshot.mcpBridge.token}`, requestId: "private-resource-identities", generation: 1, sessionId: "session-1", targetId: "target-1", serverId: "audio", toolName: "echo" };
+      factory.result = {
+        content: [
+          { type: "resource_link", uri: audioUri, name: "First", mimeType: "audio/wav" },
+          { type: "resource_link", uri: secondUri, name: "Second", mimeType: "audio/wav", title: artworkUri },
+          { type: "resource_link", uri: artworkUri, name: "Cover", mimeType: "image/png" },
+          { type: "text", text: `Created ${secondUri} using ${artworkUri}` },
+          publicImage
+        ],
+        structuredContent: {
+          jokoAudioArtifacts: [{ audioContentIndex: 0, kind: "music", title: secondUri, description: artworkUri, artwork: { imageContentIndex: 2, alt: secondUri } }],
+          nested: [{ description: `Download ${secondUri}`, [audioUri]: artworkUri, [secondUri]: "second record" }]
+        },
+        isError: false
+      };
+      factory.readResourceHandler = async (uri) => ({ contents: [{ uri, mimeType: uri === artworkUri ? "image/png" : "audio/wav", blob: uri === artworkUri ? AUDIO_ARTWORK_PNG : audioWave().toString("base64") }] });
+      const result = await router.executeBridgeCall(request);
+      expect(result.isError).toBe(false);
+      expect(result.content).toContainEqual(publicImage);
+      expect(result.details).toMatchObject({ mcpStructuredContent: { nested: [{
+        description: "Download [private resource]", "[private resource]": "[private resource]", "[private resource]#2": "second record"
+      }] } });
+      const records = store.listArtifacts({ sessionId: "session-1" });
+      expect(records.find((entry) => (entry.metadata as { audio?: { kind: string } }).audio?.kind === "music")?.metadata).toMatchObject({ audio: {
+        title: "[private resource]", description: "[private resource]", artwork: { alt: "[private resource]" }
+      } });
+      const durable = JSON.stringify({ result, records, operations: store.listOperations(), events: store.listEvents({ sessionId: "session-1" }) }, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value);
+      for (const privateValue of [audioUri, secondUri, artworkUri, "ephemeral-track", "ephemeral-cover"]) expect(durable).not.toContain(privateValue);
+      expect(await router.executeBridgeCall(request)).toEqual(result);
+      expect(factory.resourceReads).toHaveLength(3);
+      expect(factory.calledTools).toHaveLength(1);
+    } finally { await router.dispose(); store.close(); await rm(root, { recursive: true, force: true }); }
+  });
+
+  it.each(["cancel", "retire", "timeout"] as const)("fences a %s during resource reading and never moves a late result to another runtime", async (boundary) => {
+    const { root, store, router, factory, artifacts } = await fixture();
+    const pendingResource = deferred<{ readonly contents: readonly unknown[] }>();
+    const started = deferred<void>();
+    try {
+      const config = { id: "audio", displayName: "Audio", enabled: true, transport: "streamable_http" as const, endpoint: "http://127.0.0.1:4321/mcp", credentialBindings: [] };
+      await router.upsert(config);
+      const snapshot = router.createPiBridgeSnapshot({ endpoint: "http://127.0.0.1:4318/internal/mcp", sessionId: "session-1", targetId: "target-1", expectedPiGeneration: 1 });
+      const controller = new AbortController();
+      const request = { authorization: `Bearer ${snapshot.mcpBridge.token}`, requestId: "pending-resource", generation: 1, sessionId: "session-1", targetId: "target-1", serverId: "audio", toolName: "echo", signal: controller.signal };
+      factory.result = { content: [{ type: "resource_link", uri: "asset://audio", name: "audio", mimeType: "audio/wav" }], isError: false };
+      factory.readResourceHandler = async () => { started.resolve(); return pendingResource.promise; };
+      const ingest = vi.spyOn(artifacts, "ingestBytes");
+      if (boundary === "timeout") vi.useFakeTimers();
+      const call = router.executeBridgeCall(request);
+      await started.promise;
+      if (boundary === "cancel" || boundary === "timeout") {
+        if (boundary === "cancel") controller.abort();
+        else await vi.advanceTimersByTimeAsync(30_000);
+        expect(await call).toMatchObject({ isError: true, errorCode: "invalid_result" });
+        expect(factory.resourceReads[0]!.signal.aborted).toBe(true);
+      } else snapshot.revoke();
+      vi.useRealTimers();
+      await router.upsert({ ...config, endpoint: "http://127.0.0.1:4322/mcp" });
+      pendingResource.resolve({ contents: [{ uri: "asset://audio", mimeType: "audio/wav", blob: audioWave().toString("base64") }] });
+      expect(await call).toMatchObject({ isError: true });
+      expect(ingest).not.toHaveBeenCalled();
+      expect(store.listArtifacts({ sessionId: "session-1" })).toHaveLength(0);
+      expect(factory.resourceReads).toHaveLength(1);
+      expect(factory.resourceReads[0]!.generation).toBe(factory.inputs[0]!.generation);
+      if (boundary === "cancel") {
+        expect(await router.executeBridgeCall({ ...request, signal: new AbortController().signal })).toMatchObject({ isError: true });
+        expect(factory.calledTools).toHaveLength(1);
+      }
+    } finally { vi.useRealTimers(); await router.dispose(); store.close(); await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("rejects mismatched, ambiguous and oversized resource responses without publishing partial tracks or leaking URI failures", async () => {
+    const { root, store, router, factory } = await fixture({ maximumBlobBytes: 2048 });
+    try {
+      await router.upsert({ id: "audio", displayName: "Audio", enabled: true, transport: "streamable_http", endpoint: "http://127.0.0.1:4321/mcp", credentialBindings: [] });
+      const snapshot = router.createPiBridgeSnapshot({ endpoint: "http://127.0.0.1:4318/internal/mcp", sessionId: "session-1", targetId: "target-1", expectedPiGeneration: 1 });
+      const request = { authorization: `Bearer ${snapshot.mcpBridge.token}`, requestId: "resource-failure", generation: 1, sessionId: "session-1", targetId: "target-1", serverId: "audio", toolName: "echo" };
+      const resource = { uri: "asset://audio", mimeType: "audio/wav", blob: audioWave().toString("base64") };
+      factory.result = { content: [{ type: "resource_link", uri: resource.uri, name: "audio", mimeType: resource.mimeType }], isError: false };
+      const cases = [
+        { contents: [{ ...resource, uri: "asset://another" }] },
+        { contents: [{ ...resource, mimeType: "audio/mpeg" }] },
+        { contents: [resource, resource] },
+        { contents: [{ ...resource, text: "ambiguous" }] },
+        { contents: [{ ...resource, blob: "Z".repeat(2048) }] }
+      ];
+      for (const [index, response] of cases.entries()) {
+        factory.readResourceHandler = async () => response;
+        expect(await router.executeBridgeCall({ ...request, requestId: `resource-invalid-${index}` })).toMatchObject({ isError: true, errorCode: index === 4 ? "resource_exhausted" : "invalid_result" });
+      }
+      factory.readResourceHandler = async () => { throw new Error("https://media.example.test/audio?secret=unregistered-credential"); };
+      const failed = await router.executeBridgeCall(request);
+      expect(failed).toMatchObject({ isError: true, errorCode: "invalid_result" });
+      expect(JSON.stringify(failed)).not.toContain("unregistered-credential");
+      factory.result = { content: [0, 1].map((index) => ({ type: "resource_link", uri: `asset://track-${index}`, name: "track", mimeType: "audio/wav" })), isError: false };
+      factory.readResourceHandler = async (uri) => ({ contents: [{ uri, mimeType: "audio/wav", blob: Buffer.concat([audioWave(), Buffer.alloc(654)]).toString("base64") }] });
+      expect(await router.executeBridgeCall({ ...request, requestId: "aggregate-resource-budget" })).toMatchObject({ isError: true, errorCode: "resource_exhausted" });
+      expect(store.listArtifacts({ sessionId: "session-1" })).toHaveLength(0);
+    } finally { await router.dispose(); store.close(); await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("rejects malformed audio declarations, preserves generic audio and isolates optional artwork failures", async () => {
+    const { root, store, router, factory, artifacts } = await fixture();
+    try {
+      await router.upsert({ id: "audio", displayName: "Audio", enabled: true, transport: "streamable_http", endpoint: "http://127.0.0.1:4321/mcp", credentialBindings: [] });
+      const snapshot = router.createPiBridgeSnapshot({ endpoint: "http://127.0.0.1:4318/internal/mcp", sessionId: "session-1", targetId: "target-1", expectedPiGeneration: 1 });
+      const request = { authorization: `Bearer ${snapshot.mcpBridge.token}`, requestId: "audio-first", generation: 1, sessionId: "session-1", targetId: "target-1", serverId: "audio", toolName: "echo" };
+      const wav = audioWave();
+      const audio = { type: "audio", data: wav.toString("base64"), mimeType: "audio/wav" };
+      const declared = (value: unknown): McpCallResult => ({ content: [audio, { type: "image", data: "broken", mimeType: "image/png" }], structuredContent: { jokoAudioArtifacts: value }, isError: false });
+      for (const [index, value] of [null, {}, [{ audioContentIndex: 0 }], [{ audioContentIndex: 0, kind: "unknown" }], [{ audioContentIndex: 1, kind: "music" }], [{ audioContentIndex: 0, kind: "music", durationSeconds: -1 }], [{ audioContentIndex: 0, kind: "music", title: null }], [{ audioContentIndex: 0, kind: "music" }, { audioContentIndex: 0, kind: "generic" }]].entries()) {
+        factory.result = declared(value);
+        expect(await router.executeBridgeCall({ ...request, requestId: `invalid-${index}` })).toMatchObject({ isError: true, errorCode: "invalid_result" });
+      }
+      expect(store.listEvents({ sessionId: "session-1" }).filter((event) => event.payload.type === "artifact")).toHaveLength(0);
+      factory.result = declared([{ audioContentIndex: 0, kind: "music", title: "Title mcp-header-secret-value", description: "mcp-tenant-secret-value", artwork: { imageContentIndex: 1 } }]);
+      expect(await router.executeBridgeCall(request)).toMatchObject({ isError: false });
+      const first = store.listArtifacts({ sessionId: "session-1" })[0]!;
+      expect(first.metadata).toMatchObject({ audio: { kind: "music" } });
+      expect(JSON.stringify(first.metadata)).not.toContain("mcp-header-secret-value");
+      expect(JSON.stringify(first.metadata)).not.toContain("mcp-tenant-secret-value");
+      expect((first.metadata as { audio: { artwork?: unknown } }).audio.artwork).toBeUndefined();
+      factory.result = { content: [audio], isError: false };
+      expect(await router.executeBridgeCall({ ...request, requestId: "generic" })).toMatchObject({ isError: false });
+      const generic = store.listArtifacts({ sessionId: "session-1" }).find((record) => record.blob.id !== first.blob.id)!;
+      expect(generic.blob.fileName).toBe(first.blob.fileName);
+      expect(generic.blob.sha256).toBe(first.blob.sha256);
+      expect(generic.metadata).toEqual({ audio: { kind: "generic", title: "", description: "" } });
+      const before = factory.calledTools.length;
+      expect(await router.executeBridgeCall(request)).toMatchObject({ isError: false });
+      expect(factory.calledTools).toHaveLength(before);
+      expect(await router.executeBridgeCall({ ...request, arguments: { changed: true } })).toMatchObject({ isError: true });
+      const staged = deferred<void>();
+      const waiting = deferred<void>();
+      const ingest = artifacts.ingestBytes.bind(artifacts);
+      const spy = vi.spyOn(artifacts, "ingestBytes").mockImplementation(async (...args) => { const blob = await ingest(...args); staged.resolve(); await waiting.promise; return blob; });
+      const pending = router.executeBridgeCall({ ...request, requestId: "retired" });
+      await staged.promise;
+      snapshot.revoke();
+      waiting.resolve();
+      expect(await pending).toMatchObject({ isError: true });
+      spy.mockRestore();
+      expect(store.listArtifacts({ sessionId: "session-1" })).toHaveLength(2);
+      await artifacts.garbageCollect();
+      expect((await artifacts.readBlob(first.blob)).data).toEqual(wav);
+    } finally { await router.dispose(); store.close(); await rm(root, { recursive: true, force: true }); }
+  });
+
   it("leases native auth only to the exact account generation and runner fence", async () => {
     let now = 10_000;
     let accountId = "vault-account-one";
@@ -1224,12 +1437,12 @@ describe("McpRouter", () => {
     }
   });
 
-  it("resolves header references only at transport creation and never persists the value", async () => {
+  it.each(["streamable_http", "sse"] as const)("resolves %s header references only at transport creation and never persists the value", async (transport) => {
     const { store, factory, router } = await fixture();
     const descriptor = await router.upsert({
       id: "search",
       displayName: "Search MCP",
-      transport: "streamable_http",
+      transport,
       endpoint: "https://mcp.example.test/rpc",
       enabled: true,
       credentialBindings: [
@@ -1243,7 +1456,7 @@ describe("McpRouter", () => {
       { target: "header", name: "Authorization", credentialReferenceId: "cred_mcp_header", configured: true },
       { target: "header", name: "X-Tenant", credentialReferenceId: "cred_mcp_tenant", configured: true }
     ]);
-    expect(descriptor.configuration).toEqual({ case: "streamableHttp", endpoint: "https://mcp.example.test/rpc" });
+    expect(descriptor.configuration).toEqual({ case: transport === "sse" ? "sse" : "streamableHttp", endpoint: "https://mcp.example.test/rpc" });
     expect(factory.inputs[0]?.credentials).toEqual({
       "header:Authorization": "mcp-header-secret-value",
       "header:X-Tenant": "mcp-tenant-secret-value"

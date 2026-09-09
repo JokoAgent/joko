@@ -1,3 +1,4 @@
+import { APPLICATION_MENU_LABELS } from "./i18n/menu-corpus.js";
 import type { MenuItemConstructorOptions } from "electron";
 import { describe, expect, it, vi } from "vitest";
 
@@ -20,18 +21,18 @@ describe("macOS application menu", () => {
       onCommand,
       roleLabel: (role) => `native:${role}`
     });
-    const viewMenu = template?.find((item) => item.label === "显示");
+    const viewMenu = template?.find((item) => item.label === APPLICATION_MENU_LABELS.simplified.view);
     const submenu = viewMenu?.submenu as MenuItemConstructorOptions[] | undefined;
 
     expect(template?.map((item) => item.role ?? item.label)).toEqual([
       "Joko",
-      "文件",
+      APPLICATION_MENU_LABELS.simplified.file,
       "editMenu",
-      "显示",
+      APPLICATION_MENU_LABELS.simplified.view,
       "window"
     ]);
     expect(submenu?.map((item) => item.role ?? item.label ?? item.type)).toEqual([
-      "切换侧边栏",
+      APPLICATION_MENU_LABELS.simplified.sidebar,
       "separator",
       "native:resetZoom",
       "native:zoomIn",
@@ -138,12 +139,12 @@ describe("macOS application menu", () => {
 
   it("uses localized View and Toggle Sidebar labels for supported locale families", () => {
     expect(resolveMacViewMenuLabel("en-US")).toBe("View");
-    expect(resolveMacViewMenuLabel("zh_CN")).toBe("显示");
-    expect(resolveMacViewMenuLabel("zh-TW")).toBe("顯示方式");
-    expect(resolveMacViewMenuLabel("ja-JP")).toBe("表示");
+    expect(resolveMacViewMenuLabel("zh_CN")).toBe(APPLICATION_MENU_LABELS.simplified.view);
+    expect(resolveMacViewMenuLabel("zh-TW")).toBe(APPLICATION_MENU_LABELS.traditional.view);
+    expect(resolveMacViewMenuLabel("ja-JP")).toBe(APPLICATION_MENU_LABELS.japanese.view);
     expect(resolveMacViewMenuLabel("ko-KR")).toBe("보기");
     expect(resolveMacToggleSidebarLabel("en-US")).toBe("Toggle Sidebar");
-    expect(resolveMacToggleSidebarLabel("zh-CN")).toBe("切换侧边栏");
+    expect(resolveMacToggleSidebarLabel("zh-CN")).toBe(APPLICATION_MENU_LABELS.simplified.sidebar);
   });
 
   it("accepts only canonical, bindable Darwin accelerator strings", () => {

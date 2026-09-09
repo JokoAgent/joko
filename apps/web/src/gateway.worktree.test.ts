@@ -78,7 +78,7 @@ describe("isolated-workspace gateway", () => {
           result: {
             payload: {
               case: "session",
-              value: { sessionId: "session-isolated", backendId: "pi", targetId: "target-1", displayName: "Isolated" }
+              value: { sessionId: "session-isolated", backendId: "pi", targetId: "target-1", displayName: "Isolated", nativeBinding: { runtimeGeneration: 1n } }
             }
           }
         }
@@ -97,7 +97,7 @@ describe("isolated-workspace gateway", () => {
       permissionMode: "ask",
       planMode: false,
       worktree: { sourceRef: "refs/remotes/origin/release", refreshRemote: true }
-    })).resolves.toBe("session-isolated");
+    })).resolves.toEqual({ sessionId: "session-isolated", generation: 1n });
     expect(payloads[0]).toMatchObject({
       case: "createSession",
       value: {
@@ -138,7 +138,7 @@ function transportWithSnapshot(
           snapshot: create(SnapshotSchema, {
             generation: 1n,
             resumeCursor: { generation: 1n, sequence: 0n },
-            targets: [{ targetId: "target-1", backendId: "pi", displayName: "Workspace", workspaceId: "workspace-1" }]
+            targets: [{ targetId: "target-1", backendId: "pi", displayName: "Workspace", workspaceId: "workspace-1", version: { revision: { value: 1n } } }]
           })
         }));
       }

@@ -13,11 +13,13 @@ import type {
   RemoteProcessTransportPort,
   RemoteSshTransportLease
 } from "@joko/remote-ssh";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { RemoteHostRegistry } from "./remote-host-registry.js";
 import { RemoteWorkspaceService } from "./remote-workspace-service.js";
 import { WorkspaceService } from "./workspace-service.js";
+import { readWorkspaceHtmlSnapshot } from "./workspace-html-snapshot.js";
+import type { OperationalStore } from "@joko/store";
 
 describe("RemoteWorkspaceService", () => {
   it("routes bounded files, CAS mutations, search, and Git state through owner-scoped transports", async () => {
@@ -63,7 +65,8 @@ describe("RemoteWorkspaceService", () => {
         commandExecution: true,
         processStreaming: true,
         fileTransfer: true,
-        tcpForwarding: false
+        tcpForwarding: false,
+        interactiveTerminal: false
       },
       files,
       processes
@@ -95,6 +98,15 @@ describe("RemoteWorkspaceService", () => {
     expect(model).toMatchObject({ mediaType: "model/gltf+json", truncated: false });
     expect(model.text).toBeUndefined();
     expect(model.bytes).toBeUndefined();
+    await files.write({ path: "/workspace/page.html", content: Buffer.from("<p>Remote HTML</p>"), mode: 0o644 });
+    expect(await workspaces.preview("workspace-a", "page.html")).toMatchObject({ mediaType: "text/html", text: "<p>Remote HTML</p>", truncated: false });
+    await expect(workspaces.preview("workspace-a", "page.html", 2 * 1024 * 1024, 4)).rejects.toMatchObject({ kind: "unsupported" });
+    await files.write({ path: "/workspace/page.html", content: Buffer.from([0xff, 0xfe]), mode: 0o644 });
+    await expect(workspaces.preview("workspace-a", "page.html")).rejects.toMatchObject({ kind: "unsupported" });
+    const realpath = vi.spyOn(files, "realpath");
+    realpath.mockResolvedValueOnce("/outside/page.html");
+    await expect(workspaces.preview("workspace-a", "page.html")).rejects.toMatchObject({ kind: "invalid" });
+    realpath.mockRestore();
     await expect(workspaces.writeTextFile("workspace-a", {
       path: "README.md",
       text: "changed",
@@ -142,6 +154,75 @@ describe("RemoteWorkspaceService", () => {
     await workspaces.close();
   });
 
+  it("keeps HTML resources and reloads on the original remote lease and registration across delayed reads", async () => {
+    const files = new MemoryRemoteFiles();
+    await files.mkdir("/workspace", { recursive: true });
+    await files.write({ path: "/workspace/page.html", content: Buffer.from("<p>First</p>"), mode: 0o644 });
+    await files.write({ path: "/workspace/script.js", content: Buffer.from("globalThis.value = 1"), mode: 0o644 });
+    let generation = 1;
+    const lease = { capabilities: { fileTransfer: true, processStreaming: true }, files, processes: {} };
+    const capture = vi.fn(async (_targetId: string, _hostId: string, _signal?: AbortSignal) => {
+      const captured = generation;
+      return { hostRevision: BigInt(captured), leaseGeneration: captured, lease,
+        assertCurrent: () => { if (generation !== captured) throw new Error("Remote lease changed"); } };
+    });
+    const registry = { transports: async () => ({ lease }), captureTransportAuthority: capture } as unknown as RemoteHostRegistry;
+    const workspaces = new WorkspaceService({ remoteDelegate: new RemoteWorkspaceService(registry) });
+    const registration = { id: "workspace", root: "/workspace", displayName: "Remote", trusted: true,
+      remote: { targetId: "target", hostId: "host", workspaceRoot: "/workspace" } };
+    await workspaces.register(registration);
+    const store = { getSession: () => ({ descriptor: { id: "session", targetId: "target", binding: { generation: 1, opaqueRef: "native" } } }),
+      getTarget: () => ({ descriptor: { id: "target" }, metadata: { workspaceId: "workspace" }, revision: 1n }), findPendingSessionLifecycleCleanup: () => undefined } as unknown as OperationalStore;
+    const input = { store, workspaces, sessionId: "session", source: { workspaceId: "workspace", relativePath: "page.html", expectedRevision: "" }, assertConnection: () => undefined };
+    const snapshot = await readWorkspaceHtmlSnapshot(input);
+    expect(snapshot.html).toBe("<p>First</p>");
+    const signal = new AbortController().signal;
+    await writeRemoteHtml("Second");
+    const reloaded = await snapshot.reload(signal);
+    expect(reloaded.html).toBe("<p>Second</p>");
+    expect((await reloaded.readResource("script.js", signal)).mediaType).toBe("text/javascript");
+    expect(capture).toHaveBeenCalledOnce();
+    let finish!: () => void;
+    let started!: () => void;
+    const entered = new Promise<void>((resolve) => { started = resolve; });
+    const blocked = new Promise<void>((resolve) => { finish = resolve; });
+    const read = files.read.bind(files);
+    const readSpy = vi.spyOn(files, "read").mockImplementationOnce(async (request) => { const value = await read(request); started(); await blocked; return value; });
+    const late = reloaded.readResource("script.js", signal);
+    await entered;
+    generation = 2; finish();
+    await expect(late).rejects.toThrow("Remote lease changed");
+    await expect(reloaded.reload(signal)).rejects.toThrow("Remote lease changed");
+    expect(capture).toHaveBeenCalledOnce();
+    readSpy.mockRestore();
+    await expect(readWorkspaceHtmlSnapshot({ ...input, source: reloaded.file })).rejects.toMatchObject({ kind: "stale" });
+    const fresh = await readWorkspaceHtmlSnapshot(input);
+    expect(fresh.html).toContain("Second");
+    expect(capture).toHaveBeenCalledTimes(3);
+    expect(fresh.file.expectedRevision).not.toBe(reloaded.file.expectedRevision);
+    await workspaces.register(registration);
+    await expect(fresh.readResource("script.js", signal)).rejects.toMatchObject({ kind: "stale" });
+    const connectAbort = new AbortController();
+    let connecting!: () => void;
+    const connectEntered = new Promise<void>((resolve) => { connecting = resolve; });
+    capture.mockImplementationOnce(async (_targetId, _hostId, requestSignal) => {
+      connecting();
+      await new Promise<void>((resolve) => requestSignal!.addEventListener("abort", () => resolve(), { once: true }));
+      requestSignal!.throwIfAborted();
+      throw new Error("Cancelled capture cannot return an authority.");
+    });
+    const cancelledCapture = readWorkspaceHtmlSnapshot({ ...input, signal: connectAbort.signal });
+    await connectEntered;
+    expect(capture).toHaveBeenLastCalledWith("target", "host", connectAbort.signal);
+    connectAbort.abort();
+    await expect(cancelledCapture).rejects.toMatchObject({ name: "AbortError" });
+    await workspaces.close();
+
+    async function writeRemoteHtml(value: string): Promise<void> {
+      await files.write({ path: "/workspace/page.html", content: Buffer.from(`<p>${value}</p>`), mode: 0o644 });
+    }
+  });
+
   it("fails registration closed for non-canonical or missing transport capabilities", async () => {
     const files = new MemoryRemoteFiles();
     await files.mkdir("/canonical", { recursive: true });
@@ -153,7 +234,8 @@ describe("RemoteWorkspaceService", () => {
             commandExecution: false,
             processStreaming: false,
             fileTransfer: true,
-            tcpForwarding: false
+            tcpForwarding: false,
+            interactiveTerminal: false
           },
           files
         }

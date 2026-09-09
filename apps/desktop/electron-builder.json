@@ -37,6 +37,7 @@
     "!dist/.orchestrator-runtime-backup-*/**",
     "!**/*.{map,ts,tsx,cts,mts,proto,tsbuildinfo,c,cc,cpp,cxx,h,hh,hpp,hxx,rs,swift,m,mm,java,go,py,pyi,rb,cs,fs,fsx,scala,kt,kts,jsdoc,keep}",
     "!**/{test,tests,__tests__,coverage,fixtures,workspace}/**",
+    "!**/*.test.*",
     "!**/WORKSPACE",
     "!**/WORKSPACE/**",
     "!**/{.env,.env.*,*.db,*.db-shm,*.db-wal,*.log}",
@@ -71,6 +72,7 @@
         "!node_modules/**",
         "!**/*.{map,ts,tsx,cts,mts,proto,tsbuildinfo,c,cc,cpp,cxx,h,hh,hpp,hxx,rs,swift,m,mm,java,go,py,pyi,rb,cs,fs,fsx,scala,kt,kts,jsdoc,keep}",
         "!**/{test,tests,__tests__,coverage,fixtures,workspace}/**",
+        "!**/*.test.*",
         "!**/WORKSPACE",
         "!**/WORKSPACE/**",
         "!**/{.env,.env.*,*.db,*.db-shm,*.db-wal,*.log}"
@@ -83,6 +85,7 @@
         "**/*",
         "!**/*.{map,ts,tsx,cts,mts,proto,tsbuildinfo,c,cc,cpp,cxx,h,hh,hpp,hxx,rs,swift,m,mm,java,go,py,pyi,rb,cs,fs,fsx,scala,kt,kts,jsdoc,keep}",
         "!**/{test,tests,__tests__,coverage,fixtures,workspace}/**",
+        "!**/*.test.*",
         "!**/WORKSPACE",
         "!**/WORKSPACE/**",
         "!**/{.env,.env.*,*.db,*.db-shm,*.db-wal,*.log}"

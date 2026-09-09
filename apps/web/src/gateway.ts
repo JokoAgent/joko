@@ -1,8 +1,15 @@
 import { create, type MessageInitShape } from "@bufbuild/protobuf";
 import { createClient, ConnectError, Code, type Interceptor, type Transport } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-web";
+import { createTerminalGateway } from "./terminal-gateway.js";
+import { UsageReportGroup } from "@joko/contracts";
+import { SshKeyService, SshAgentState, SshKeyPassphrasePurpose, SshInstallShell, type SshKey, type CredentialUploadTicket } from "@joko/contracts";
+import type { SshKeyView, SshKeyCatalogView, SshKeyGenerateDraft, SshKeyInstallCommandDraft } from "./model.js";
+import type { UsageReportQueryView, UsageReportView } from "./model.js";
 import {
   ArtifactKind,
+  AudioArtifactKind,
+  type AudioArtifactMetadata,
   ArtifactService,
   ArtifactStorageCleanupOutcome,
   AndroidAdbPathSource,
@@ -121,6 +128,8 @@ import {
   ProviderConfigurationSchema,
   ProviderHeaderConfigurationSchema,
   ProviderApiCompatibility,
+  ProviderConfigurationField,
+  ProviderRuntimeConfigurationSchema,
   ProviderCredentialSurfaceCapability,
   ProviderCredentialSurfaceKind,
   ProviderKind,
@@ -265,6 +274,7 @@ import {
   type Operation,
   type ProviderDescriptor,
   type ProviderConfiguration,
+  type ProviderRuntimeConfiguration,
   type ProviderLoginFlow,
   type QueueItem,
   type QueueControl,
@@ -307,9 +317,11 @@ import {
   type WorkspaceChangeSet,
   type WorkspaceRewindPreview
 } from "@joko/contracts";
-import { presentJokoServiceTerminology } from "./user-facing-terminology.js";
+import { presentJokoServiceTerminology } from "./i18n/service-terminology.js";
 import { projectTimelineGeneratedFiles } from "./generated-files.js";
 import { emptySnapshot } from "./model.js";
+import { saveArtifactBlob } from "./artifact-download.js";
+import { captureNativeFileCopy, copyNativeArtifactFile, NATIVE_FILE_COPY_MAXIMUM_BYTES } from "./native-file-actions.js";
 import type {
   AppSnapshot,
   ArtifactStorageCleanupView,
@@ -318,6 +330,8 @@ import type {
   ArtifactStorageReconcileView,
   ArtifactStorageScanView,
   ArtifactView,
+  ArtifactDownloadContext,
+  ArtifactDownloadOutcome,
   AttachmentDraft,
   BackgroundTaskHistoryView,
   TaskHistoryCleanupView,
@@ -570,6 +584,12 @@ interface ArtifactUrlLease {
   refs: number;
   pending?: Promise<string>;
   url?: string;
+}
+
+interface GatewayActionScope {
+  readonly transport: Transport;
+  readonly authKey: string;
+  readonly signal: AbortSignal;
 }
 
 class ConnectOrchestratorGateway implements OrchestratorGateway {
@@ -877,6 +897,17 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return taskHistoryCleanupProgress(response.progress);
   }
 
+  getTerminalCapabilities(...args: Parameters<OperationApi["getTerminalCapabilities"]>) { return createTerminalGateway(this.requireTransport(), this.#abort?.signal).getTerminalCapabilities(...args); }
+  listTerminals(...args: Parameters<OperationApi["listTerminals"]>) { return createTerminalGateway(this.requireTransport(), this.#abort?.signal).listTerminals(...args); }
+  createTerminal(...args: Parameters<OperationApi["createTerminal"]>) { return createTerminalGateway(this.requireTransport(), this.#abort?.signal).createTerminal(...args); }
+  getTerminal(...args: Parameters<OperationApi["getTerminal"]>) { return createTerminalGateway(this.requireTransport(), this.#abort?.signal).getTerminal(...args); }
+  watchTerminal(...args: Parameters<OperationApi["watchTerminal"]>) { return createTerminalGateway(this.requireTransport(), this.#abort?.signal).watchTerminal(...args); }
+  updateTerminalAppearance(...args: Parameters<OperationApi["updateTerminalAppearance"]>) { return createTerminalGateway(this.requireTransport(), this.#abort?.signal).updateTerminalAppearance(...args); }
+  writeTerminal(...args: Parameters<OperationApi["writeTerminal"]>) { return createTerminalGateway(this.requireTransport(), this.#abort?.signal).writeTerminal(...args); }
+  resizeTerminal(...args: Parameters<OperationApi["resizeTerminal"]>) { return createTerminalGateway(this.requireTransport(), this.#abort?.signal).resizeTerminal(...args); }
+  restartTerminal(...args: Parameters<OperationApi["restartTerminal"]>) { return createTerminalGateway(this.requireTransport(), this.#abort?.signal).restartTerminal(...args); }
+  closeTerminal(...args: Parameters<OperationApi["closeTerminal"]>) { return createTerminalGateway(this.requireTransport(), this.#abort?.signal).closeTerminal(...args); }
+
   async getVoiceInputCapabilities(signal?: AbortSignal): Promise<VoiceInputCapabilityView> {
     const client = createClient(VoiceInputService, this.requireTransport());
     const response = await client.getVoiceInputCapabilities({}, voiceRpcOptions(this.#abort?.signal, signal));
@@ -1018,7 +1049,12 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     this.#callbacks.onSnapshot?.(mapped);
   }
 
-  async send(sessionId: string, draft: ComposerDraft): Promise<void> {
+  async send(sessionId: string, draft: ComposerDraft, admission: { readonly expectedGeneration: bigint }): Promise<void> {
+    const scope = this.captureActionScope();
+    const expectedGeneration = admission.expectedGeneration;
+    if (expectedGeneration < 1n || expectedGeneration > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new GatewayError("Input requires the source task generation.");
+    }
     if (draft.extraDirectoryIds?.some((id) => id.length === 0) === true) {
       throw new GatewayError("Extra-directory selections must use non-empty IDs.");
     }
@@ -1031,7 +1067,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const text = formatBrowserCommentsForSend(browserComments, serialized.text);
     if (text.length > 0) parts.push({ content: { case: "text", value: text } });
     for (const attachment of draft.attachments) {
-      const blob = await this.uploadAttachment(attachment.file);
+      const blob = await this.uploadAttachment(attachment.file, scope);
+      scope.signal.throwIfAborted();
       parts.push(attachment.kind === "image"
         ? { content: { case: "image", value: { blob, altText: attachment.file.name } } }
         : { content: { case: "file", value: blob } });
@@ -1040,13 +1077,18 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       if (mention.kind === "message") {
         parts.push({ content: { case: "text", value: messageMentionWireText(mention, window.location.href) } });
       } else if (mention.kind === "workspace") {
-        parts.push({ content: { case: "workspaceMention", value: { workspaceId: mention.workspaceId ?? "", relativePath: mention.reference, displayText: mention.label } } });
+        parts.push({ content: { case: "workspaceMention", value: {
+          workspaceId: mention.workspaceId ?? "", relativePath: mention.reference, displayText: mention.label,
+          directory: mention.directory === true,
+          ...(mention.lineRange === undefined ? {} : { lineRange: mention.lineRange })
+        } } });
       } else {
         parts.push({ content: { case: "resourceMention", value: { resourceId: mention.reference, displayText: mention.label } } });
       }
     }
     for (const item of browserComments) {
-      const blob = await this.uploadAttachment(item.screenshot.file);
+      const blob = await this.uploadAttachment(item.screenshot.file, scope);
+      scope.signal.throwIfAborted();
       parts.push({ content: { case: "image", value: { blob, altText: item.screenshot.file.name } } });
     }
     if (parts.length === 0) throw new GatewayError("A task input cannot be empty.");
@@ -1068,18 +1110,20 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           ? {}
           : { overrides: { extraDirectoryIds: [...new Set(draft.extraDirectoryIds)] } })
       }
-    });
+    }, false, [{ entity: { kind: EntityKind.SESSION, id: sessionId }, expectedGeneration }], scope.signal);
   }
 
   async startReview(sourceSessionId: string, focus: string, attachments: readonly AttachmentDraft[]): Promise<string> {
+    const scope = this.captureActionScope();
     // Snapshot this invocation before the first await. A later edit or file
     // picker action must never change what the accepted /review inspects.
     const sourceAttachments = [...attachments];
     const uploaded = await Promise.all(sourceAttachments.map(async (attachment) => ({
       kind: attachment.kind === "image" ? ReviewAttachmentKind.IMAGE : ReviewAttachmentKind.FILE,
       displayName: attachment.file.name,
-      blob: await this.uploadAttachment(attachment.file)
+      blob: await this.uploadAttachment(attachment.file, scope)
     })));
+    scope.signal.throwIfAborted();
     const operation = await this.submit({
       case: "startReview",
       value: {
@@ -1087,7 +1131,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         focus: focus.trim(),
         attachments: uploaded
       }
-    }, true);
+    }, true, [], scope.signal);
     const payload = operation.result?.payload;
     const reviewRunId = payload?.case === "reviewRun" ? payload.value.reviewRunId : "";
     if (reviewRunId.length === 0) throw new GatewayError("Orchestrator accepted the review without a review task.");
@@ -1269,8 +1313,12 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       readonly workspaceLocation?:
         | { readonly kind: "remote"; readonly hostId: string; readonly workspaceRoot: string }
         | { readonly kind: "serviceNode" };
-    }
+    },
+    expectedRevision: bigint
   ): Promise<void> {
+    if (typeof expectedRevision !== "bigint" || expectedRevision < 1n) {
+      throw new GatewayError("A current Target revision is required.");
+    }
     const remoteWorkspaceRoot = patch.workspaceLocation?.kind === "remote"
       ? patch.workspaceLocation.workspaceRoot.trim()
       : undefined;
@@ -1296,7 +1344,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         ...(patch.pinned === undefined ? {} : { pinned: patch.pinned }),
         workspaceLocationUpdate
       }
-    }, true);
+    }, true, [{ entity: { kind: EntityKind.TARGET, id: targetId }, expectedRevision: { value: expectedRevision } }]);
   }
 
   async archiveTarget(targetId: string, archived: boolean): Promise<void> {
@@ -1321,7 +1369,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     await this.submit({ case: "removeExtraDirectory", value: { extraDirectoryId } }, true);
   }
 
-  async createSession(draft: NewSessionDraft): Promise<string> {
+  async createSession(draft: NewSessionDraft): Promise<{ readonly sessionId: string; readonly generation: bigint }> {
     const targetId = draft.targetId;
     const target = this.#rawSnapshot?.targets.find((candidate) => candidate.targetId === targetId);
     if (target === undefined) throw new GatewayError("The selected target is no longer available.");
@@ -1383,7 +1431,11 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     if (payload?.case !== "session" || payload.value.sessionId.length === 0) {
       throw new GatewayError("Orchestrator completed task creation without a typed task result.");
     }
-    return payload.value.sessionId;
+    const generation = payload.value.nativeBinding?.runtimeGeneration;
+    if (generation === undefined || generation < 1n || generation > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new GatewayError("Orchestrator completed task creation without a valid task generation.");
+    }
+    return { sessionId: payload.value.sessionId, generation };
   }
 
   async discoverNativeSessions(targetId: string): Promise<readonly NativeSessionCandidateView[]> {
@@ -1512,7 +1564,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     throw new GatewayError("Worktree source discovery exceeded the safe pagination limit.");
   }
 
-  async exportSession(sessionId: string): Promise<void> {
+  async exportSession(sessionId: string, context: ArtifactDownloadContext): Promise<ArtifactDownloadOutcome> {
+    const ownedContext = this.artifactDownloadContext(context);
     const operation = await this.submit(
       { case: "exportSession", value: { sessionId, format: SessionExportFormat.HTML } },
       true
@@ -1528,20 +1581,24 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     if (blob.mediaType.split(";", 1)[0]?.trim().toLowerCase() !== "text/html") {
       throw new GatewayError("Orchestrator returned a non-HTML Session export Artifact.");
     }
-    await this.downloadArtifact(blob.blobId, blob.fileName || payload.value.title || "session-export.html");
+    ownedContext.signal.throwIfAborted();
+    return this.downloadArtifact(blob.blobId, blob.fileName || payload.value.title || "session-export.html", ownedContext);
   }
 
   async exportPortableSession(
     sessionId: string,
-    options: { readonly password?: string; readonly excludeMedia: boolean }
+    options: { readonly password?: string; readonly excludeMedia: boolean },
+    context: ArtifactDownloadContext
   ): Promise<PortableSessionExportOutcomeView> {
+    const ownedContext = this.artifactDownloadContext(context);
     const client = createClient(PortableSessionService, this.requireTransport());
     try {
       const response = await client.exportPortableSession({
         sessionId,
         ...(options.password === undefined ? {} : { password: options.password }),
         excludeMedia: options.excludeMedia
-      }, this.#abort === undefined ? undefined : { signal: this.#abort.signal });
+      }, { signal: ownedContext.signal });
+      ownedContext.signal.throwIfAborted();
       const artifact = response.artifact;
       if (artifact === undefined || artifact.blobId.trim() === "") {
         throw new GatewayError("Orchestrator completed portable task export without an Artifact.");
@@ -1549,8 +1606,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       if (artifact.mediaType.split(";", 1)[0]?.trim().toLowerCase() !== "application/vnd.joko.session") {
         throw new GatewayError("Orchestrator returned an invalid portable task Artifact.");
       }
-      const saved = await this.saveArtifact(artifact.blobId, artifact.fileName || "task.jshare");
-      return saved
+      const saved = await this.downloadArtifact(artifact.blobId, artifact.fileName || "task.jshare", ownedContext);
+      return saved !== "cancelled"
         ? { status: "exported", fidelity: mapPortableSessionFidelity(response.fidelity) }
         : { status: "cancelled" };
     } catch (error) {
@@ -1572,15 +1629,19 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     if (file.size <= 0 || file.size > MAX_PORTABLE_SESSION_PACKAGE_BYTES) {
       throw new GatewayError("The portable task package has an invalid size.", { code: "PORTABLE_SESSION_IMPORT_INVALID" });
     }
-    const client = createClient(PortableSessionService, this.requireTransport());
+    const scope = this.captureActionScope();
+    const client = createClient(PortableSessionService, scope.transport);
     try {
-      const packageBlob = await this.uploadBlob(file, BlobDisposition.ATTACHMENT);
+      const packageBlob = await this.uploadBlob(file, BlobDisposition.ATTACHMENT, scope);
+      scope.signal.throwIfAborted();
       const response = await client.inspectPortableSessionImport(
         { package: packageBlob },
-        this.#abort === undefined ? undefined : { signal: this.#abort.signal }
+        { signal: scope.signal }
       );
+      scope.signal.throwIfAborted();
       return mapPortableSessionImportDraft(response.draft);
     } catch (error) {
+      scope.signal.throwIfAborted();
       if (error instanceof GatewayError) throw error;
       throw new GatewayError(ConnectError.from(error).rawMessage, {
         cause: error,
@@ -1737,19 +1798,20 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
 
   async navigateSessionBranch(
     sessionId: string,
-    entryId: string,
-    options: { readonly summarize?: boolean; readonly customInstructions?: string } = {}
+    target: import("./model.js").NativeNavigationTargetView,
+    options: { readonly expectedGeneration: bigint; readonly summarize?: boolean; readonly customInstructions?: string }
   ): Promise<void> {
+    if (options.expectedGeneration < 1n) throw new GatewayError("A source task generation is required for navigation.");
     const customInstructions = options.customInstructions?.trim().slice(0, 4_000) ?? "";
     await this.submit({
       case: "navigateSessionBranch",
       value: {
         sessionId,
-        nativeEntryId: entryId,
+        target: { kind: target.kind === "session_start" ? { case: "sessionStart", value: {} } : { case: "nativeEntryId", value: target.entryId } },
         summarize: options.summarize === true,
         customInstructions: options.summarize === true ? customInstructions : ""
       }
-    }, true);
+    }, true, [{ entity: { kind: EntityKind.SESSION, id: sessionId }, expectedGeneration: options.expectedGeneration }]);
   }
 
   async forkSession(
@@ -1793,8 +1855,11 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   }
 
   async resolveInteraction(interaction: InteractionView, resolution: InteractionResolutionDraft): Promise<void> {
+    const scope = this.captureActionScope();
     const raw = this.#rawSnapshot?.interactions.find((candidate) => candidate.interactionId === interaction.id);
     if (raw === undefined) throw new GatewayError("This interaction is no longer pending.");
+    const decision = await interactionDecision(raw, resolution, (secret) => this.uploadCredential(secret, CredentialKind.UNSPECIFIED, "", scope));
+    scope.signal.throwIfAborted();
     await this.submit({
       case: "resolveInteraction",
       value: {
@@ -1802,10 +1867,10 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         interactionGeneration: interaction.generation,
         resolution: {
           connectionId: this.#profile?.id ?? "",
-          decision: await interactionDecision(raw, resolution, (secret) => this.uploadSensitiveAnswer(secret))
+          decision
         }
       }
-    });
+    }, false, [], scope.signal);
   }
 
   async dismissInteraction(interaction: InteractionView): Promise<void> {
@@ -2051,7 +2116,10 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     await this.submit({ case: "restartBrowser", value: { browserProviderId: browserId } });
   }
 
-  async openBrowserPage(browserId: string, sessionId: string, url: string, recoveryPageId = ""): Promise<string> {
+  async openBrowserPage(browserId: string, sessionId: string, url: string, recoveryPageId = "", workspaceHtml?: { readonly workspaceId: string; readonly relativePath: string; readonly expectedRevision: string }): Promise<string> {
+    if (workspaceHtml !== undefined && (url !== "" || recoveryPageId !== "" || workspaceHtml.expectedRevision === "")) {
+      throw new GatewayError("HTML page opens require an exact file revision without a URL or recovery page.");
+    }
     const browser = this.#rawSnapshot?.browsers.find((candidate) => candidate.browserProviderId === browserId);
     if (browser === undefined) throw new GatewayError("The Browser Provider is unavailable.");
     const takeover = browser.takeover;
@@ -2069,11 +2137,12 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       value: {
         browserProviderId: browserId,
         sessionId,
-        url: durableBrowserTakeoverUrl(url),
+        url: workspaceHtml === undefined ? durableBrowserTakeoverUrl(url) : "",
         expectedGeneration: browser.generation,
         currentPageId: takeover?.pageId ?? "",
         takeoverId: takeover?.takeoverId ?? "",
-        recoveryPageId
+        recoveryPageId,
+        ...(workspaceHtml === undefined ? {} : { workspaceHtml })
       }
     }, true);
     const payload = operation.result?.payload;
@@ -2279,11 +2348,13 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   }
 
   async uploadBrowserFile(browserId: string, pageId: string, file: File, inputHint = "input[type=file]"): Promise<void> {
-    const blob = await this.uploadAttachment(file);
+    const scope = this.captureActionScope();
+    const blob = await this.uploadAttachment(file, scope);
+    scope.signal.throwIfAborted();
     await this.submit({
       case: "uploadBrowserFile",
       value: { browserProviderId: browserId, pageId, blob, inputHint }
-    }, true);
+    }, true, [], scope.signal);
   }
 
   async captureBrowserScreenshot(browserId: string, pageId: string, fullPage: boolean): Promise<string> {
@@ -2393,6 +2464,30 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       };
     });
     return { capturedAt, processes };
+  }
+
+  async getUsageReport(query: UsageReportQueryView, signal: AbortSignal): Promise<UsageReportView> {
+    const client = createClient(BackendService, this.requireTransport());
+    const requestSignal = this.#abort === undefined ? signal : AbortSignal.any([signal, this.#abort.signal]);
+    requestSignal.throwIfAborted();
+    const group = { task: UsageReportGroup.TASK, model: UsageReportGroup.MODEL,
+      provider: UsageReportGroup.PROVIDER, backend: UsageReportGroup.BACKEND }[query.group];
+    const response = await client.getUsageReport({ ...query, group,
+      page: { pageSize: 25, pageToken: query.pageToken ?? "" } }, { signal: requestSignal });
+    requestSignal.throwIfAborted();
+    if (response.summary === undefined || response.page === undefined) throw new GatewayError("Joko returned an incomplete usage report.");
+    const totalGroups = Number(response.page.totalSize);
+    if (!Number.isSafeInteger(totalGroups) || totalGroups < 0 || response.entries.length > 25) throw new GatewayError("Joko returned an invalid usage report page.");
+    const keys = new Set<string>();
+    return { summary: mapUsageSummary(response.summary), totalGroups, nextPageToken: response.page.nextPageToken,
+      entries: response.entries.map((entry) => {
+        if (entry.key === "" || keys.has(entry.key) || entry.summary === undefined || entry.measuredAt === undefined
+          || (entry.referenceAvailable && entry.sessionId === "")) throw new GatewayError("Joko returned an invalid usage report entry.");
+        keys.add(entry.key);
+        return { key: entry.key, sessionId: entry.sessionId, backendId: entry.backendId, providerId: entry.providerId,
+          modelId: entry.modelId, title: entry.title, referenceAvailable: entry.referenceAvailable,
+          summary: mapUsageSummary(entry.summary), measuredAt: timestampMs(entry.measuredAt) };
+      }) };
   }
 
   async getUsageHistory(days = 140, backendId = "", providerId = "", signal?: AbortSignal): Promise<UsageHistoryView> {
@@ -2855,6 +2950,21 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     }
   }
 
+  async readWorkspaceHtmlSnapshot(sessionId: string, workspaceId: string, path: string, signal: AbortSignal): Promise<{ readonly file: { readonly workspaceId: string; readonly relativePath: string; readonly expectedRevision: string }; readonly html: string }> {
+    const transport = this.requireTransport();
+    const requestSignal = this.#abort === undefined ? signal : AbortSignal.any([signal, this.#abort.signal]);
+    requestSignal.throwIfAborted();
+    const response = await createClient(WorkspaceService, transport).readWorkspaceHtmlSnapshot({
+      sessionId, file: { workspaceId, relativePath: path, expectedRevision: "" }
+    }, { signal: requestSignal });
+    requestSignal.throwIfAborted();
+    if (this.requireTransport() !== transport || response.file === undefined || response.file.expectedRevision === ""
+      || response.file.workspaceId !== workspaceId || response.file.relativePath !== path) {
+      throw new GatewayError("The HTML preview source is no longer available.");
+    }
+    return { file: response.file, html: response.utf8Html };
+  }
+
   async readWorkspaceFile(workspaceId: string, path: string): Promise<WorkspaceFilePreviewView> {
     const client = createClient(WorkspaceService, this.requireTransport());
     const response = await client.readWorkspaceFile({
@@ -3305,10 +3415,14 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     await this.submit({ case: "logoutConnection", value: { connectionId } }, true);
   }
 
-  async saveProvider(draft: ProviderDraft): Promise<void> {
-    const existing = this.#rawSnapshot?.settings?.providers.find((provider) => provider.providerId === draft.id);
-    if (draft.models.length === 0) throw new GatewayError("A provider must declare at least one model.");
-    const headers = draft.headers.map((header) => ({
+  async saveProvider(draft: ProviderDraft, signal?: AbortSignal): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    if (draft.runtimes.length === 0 || new Set(draft.runtimes.map((runtime) => runtime.backendId)).size !== draft.runtimes.length) {
+      throw new GatewayError("A provider must configure distinct runtime identities.");
+    }
+    const runtimes = draft.runtimes.map((runtime) => {
+    if (runtime.models.length === 0) throw new GatewayError("Each provider runtime must declare at least one model.");
+    const headers = runtime.headers.map((header) => ({
       headerName: header.headerName.trim(),
       environmentName: header.environmentName.trim(),
       credentialReferenceId: header.credentialId
@@ -3316,7 +3430,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     if (headers.some((header) => header.headerName.length === 0 || (header.environmentName.length === 0 && header.credentialReferenceId.length === 0))) {
       throw new GatewayError("Each provider header needs a name and an environment or credential binding.");
     }
-    const models = draft.models.map((model) => ({
+    const models = runtime.models.map((model) => ({
       modelId: model.modelId.trim(),
       displayName: model.name.trim(),
       ...(model.compatibility === undefined ? {} : { apiCompatibility: protoProviderCompatibility(model.compatibility) }),
@@ -3345,27 +3459,31 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       supportsFastMode: model.supportsFastMode,
       ...(model.defaultVisible === undefined ? {} : { defaultVisible: model.defaultVisible })
     }));
-    if (models.some((model) => model.modelId.length === 0 || model.displayName.length === 0 || model.inputModalities.length === 0 || model.contextWindowTokens <= 0n || model.maximumOutputTokens <= 0n)) {
-      throw new GatewayError("Every model needs an ID, name, input modality, context window, and maximum output size.");
+    if (models.some((model) => model.modelId.length === 0 || model.displayName.length === 0 || model.inputModalities.length === 0)) {
+      throw new GatewayError("Every model needs an ID, name, and input modality.");
     }
     if (new Set(models.map((model) => model.modelId)).size !== models.length) throw new GatewayError("Model IDs must be unique within a provider.");
-    const provider = existing === undefined
-      ? create(ProviderConfigurationSchema)
-      : create(ProviderConfigurationSchema, existing);
-    provider.providerId = draft.id.trim();
-    provider.displayName = draft.name.trim();
-    provider.kind = protoProviderKind(draft.kind);
-    provider.apiCompatibility = protoProviderCompatibility(draft.compatibility);
-    provider.endpoint = canonicalProviderEndpoint(draft.endpoint);
-    provider.credentialReferenceId = draft.credentialId;
-    provider.enabled = draft.enabled;
-    provider.apiKeyEnvironment = draft.environmentName.trim();
-    provider.keyless = draft.keyless;
-    provider.authHeader = draft.authHeader;
-    provider.headers = headers.map((header) => create(ProviderHeaderConfigurationSchema, header));
-    provider.models = models.map((model) => create(ProviderModelConfigurationSchema, model));
+    return create(ProviderRuntimeConfigurationSchema, {
+      backendId: runtime.backendId,
+      apiCompatibility: protoProviderCompatibility(runtime.compatibility),
+      endpoint: canonicalProviderEndpoint(runtime.endpoint),
+      credentialReferenceId: runtime.credentialId,
+      apiKeyEnvironment: runtime.environmentName.trim(),
+      keyless: runtime.keyless,
+      authHeader: runtime.authHeader,
+      credentialOrigin: runtime.credentialOrigin,
+      ...(runtime.requestPath === undefined ? {} : { requestPath: runtime.requestPath }),
+      ...(runtime.modelsEndpoint === undefined ? {} : { modelsEndpoint: canonicalProviderEndpoint(runtime.modelsEndpoint) }),
+      headers: headers.map((header) => create(ProviderHeaderConfigurationSchema, header)),
+      models: models.map((model) => create(ProviderModelConfigurationSchema, model))
+    });
+    });
+    const provider = create(ProviderConfigurationSchema, {
+      providerId: draft.id.trim(), displayName: draft.name.trim(), kind: protoProviderKind(draft.kind),
+      enabled: draft.enabled, version: { revision: { value: draft.revision } }, runtimes
+    });
     if (provider.providerId.length === 0 || provider.displayName.length === 0) throw new GatewayError("Provider ID and name are required.");
-    await this.submit({ case: "upsertProvider", value: { provider } }, true);
+    await this.submit({ case: "upsertProvider", value: { provider } }, true, [], scope.signal);
   }
 
   async deleteProvider(providerId: string): Promise<void> {
@@ -3516,10 +3634,12 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     if (backendId.trim() === "" || providerId.trim() === "" || surfaceId.trim() === "" || secret.length === 0) {
       throw new GatewayError("Provider credential surface and value are required.");
     }
-    const ticketId = await this.uploadCredential(secret, CredentialKind.API_KEY, providerId, {
+    const scope = this.captureActionScope();
+    const ticketId = await this.uploadCredential(secret, CredentialKind.API_KEY, providerId, scope, {
       backendId,
       surfaceId
     });
+    scope.signal.throwIfAborted();
     await this.submit({
       case: "commitProviderCredentialSurface",
       value: {
@@ -3528,7 +3648,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         surfaceId,
         credentialUploadTicketId: ticketId
       }
-    }, true);
+    }, true, [], scope.signal);
   }
 
   async clearProviderCredentialSurface(
@@ -3542,10 +3662,12 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     }, true);
   }
 
-  async saveCredential(draft: CredentialDraft): Promise<void> {
+  async saveCredential(draft: CredentialDraft, signal?: AbortSignal): Promise<void> {
     if (draft.id.trim().length === 0 || draft.name.trim().length === 0 || draft.secret.length === 0) throw new GatewayError("Credential ID, name, and value are required.");
     const kind = protoCredentialKind(draft.kind);
-    const ticketId = await this.uploadCredential(draft.secret, kind, draft.providerId);
+    const scope = this.captureActionScope(signal);
+    const ticketId = await this.uploadCredential(draft.secret, kind, draft.providerId, scope);
+    scope.signal.throwIfAborted();
     await this.submit({
       case: "commitCredential",
       value: {
@@ -3553,10 +3675,9 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         credentialReferenceId: draft.id.trim(),
         displayName: draft.name.trim(),
         kind,
-        providerId: draft.providerId,
-        environmentName: draft.environmentName.trim()
+        providerId: draft.providerId
       }
-    }, true);
+    }, true, [], scope.signal);
   }
 
   async deleteCredential(credentialId: string): Promise<void> {
@@ -3586,6 +3707,62 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       fileTransfer: supported.has(RemoteHostCapabilityKind.FILE_TRANSFER),
       tcpForwarding: supported.has(RemoteHostCapabilityKind.TCP_FORWARDING)
     };
+  }
+
+  async listSshKeys(signal: AbortSignal): Promise<SshKeyCatalogView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SshKeyService, scope.transport).listSshKeys({}, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return { keys: response.keys.map(mapSshKey), generationSupported: response.generationSupported,
+      agentState: response.agentState === SshAgentState.READY ? "ready" : response.agentState === SshAgentState.UNAVAILABLE ? "unavailable" : "failed" };
+  }
+
+  async generateSshKey(draft: SshKeyGenerateDraft, signal: AbortSignal): Promise<SshKeyView> {
+    const scope = this.captureActionScope(signal);
+    const client = createClient(SshKeyService, scope.transport);
+    const ticketId = draft.passphrase === undefined ? undefined : await this.uploadSshKeyPassphrase(draft.passphrase, SshKeyPassphrasePurpose.GENERATE, scope);
+    scope.signal.throwIfAborted();
+    const response = await client.generateSshKey({ name: draft.name, comment: draft.comment,
+      ...(ticketId === undefined ? {} : { passphraseUploadTicketId: ticketId }) }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (response.key === undefined) throw new GatewayError("The SSH key creation result is unavailable.");
+    return mapSshKey(response.key);
+  }
+
+  async addSshKeyToAgent(keyId: string, expectedFingerprint: string, passphrase: string | undefined, signal: AbortSignal): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    const client = createClient(SshKeyService, scope.transport);
+    const ticketId = passphrase === undefined ? undefined : await this.uploadSshKeyPassphrase(passphrase, SshKeyPassphrasePurpose.AGENT_ADD, scope, { keyId, expectedFingerprint });
+    scope.signal.throwIfAborted();
+    await client.addSshKeyToAgent({ keyId, expectedFingerprint, ...(ticketId === undefined ? {} : { passphraseUploadTicketId: ticketId }) }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+  }
+
+  async readSshPublicKey(keyId: string, expectedFingerprint: string, signal: AbortSignal): Promise<string> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SshKeyService, scope.transport).readSshPublicKey({ keyId, expectedFingerprint }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return response.publicKey;
+  }
+
+  async getSshKeyInstallCommand(draft: SshKeyInstallCommandDraft, signal: AbortSignal): Promise<string> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SshKeyService, scope.transport).getSshKeyInstallCommand({
+      keyId: draft.keyId, expectedFingerprint: draft.expectedFingerprint,
+      destination: draft.destination.kind === "savedHost"
+        ? { case: "savedHost", value: { targetId: draft.destination.targetId, hostId: draft.destination.hostId, expectedRevision: { value: draft.destination.expectedRevision } } }
+        : { case: "draftHost", value: { hostname: draft.destination.hostname, user: draft.destination.user, port: draft.destination.port } },
+      shell: draft.shell === "posix" ? SshInstallShell.POSIX : SshInstallShell.POWERSHELL
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return response.command;
+  }
+
+  private async uploadSshKeyPassphrase(secret: string, purpose: SshKeyPassphrasePurpose, scope: GatewayActionScope, key?: { keyId: string; expectedFingerprint: string }): Promise<string> {
+    scope.signal.throwIfAborted();
+    const response = await createClient(SshKeyService, scope.transport).beginSshKeyPassphraseUpload({ purpose, ...key }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return this.uploadSensitiveTicket(secret, response.ticket, scope);
   }
 
   async listRemoteHosts(targetId: string, signal?: AbortSignal): Promise<readonly RemoteHostView[]> {
@@ -3622,6 +3799,9 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     let sequence = 0n;
     let hosts: RemoteHostView[] = [];
     for await (const response of stream) {
+      if (sequence === 0n && response.update.case !== "snapshot") {
+        throw new GatewayError("Orchestrator returned no initial Remote Host snapshot.");
+      }
       if (response.sequence <= sequence) throw new GatewayError("Orchestrator returned an out-of-order Remote Host stream.");
       sequence = response.sequence;
       if (response.update.case === "snapshot") {
@@ -3662,6 +3842,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       port: draft.port,
       user: draft.user.trim(),
       authenticationMode: protoRemoteHostAuthentication(draft.authentication),
+      ...(draft.authentication === "nodeKey" ? { nodeKey: draft.nodeKey } : {}),
       ...(draft.authentication === "privateKey"
         ? { credentialReferenceId: draft.credentialReferenceId?.trim() ?? "" }
         : {})
@@ -3683,6 +3864,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       port: draft.port,
       user: draft.user.trim(),
       authenticationMode: protoRemoteHostAuthentication(draft.authentication),
+      ...(draft.authentication === "nodeKey" ? { nodeKey: draft.nodeKey } : {}),
       ...(draft.authentication === "privateKey"
         ? { credentialReferenceId: draft.credentialReferenceId?.trim() ?? "" }
         : {}),
@@ -3738,7 +3920,6 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   async saveMcpServer(draft: McpServerDraft): Promise<void> {
     const id = draft.id.trim() || randomUuid();
     const credentialBindings = draft.credentialBindings.map((binding) => ({
-      headerName: binding.target === "header" ? binding.name.trim() : "",
       credentialReferenceId: binding.credentialId.trim(),
       target: binding.target === "header" ? McpCredentialTarget.HEADER : McpCredentialTarget.ENVIRONMENT,
       targetName: binding.name.trim()
@@ -3765,28 +3946,26 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       if (environmentNames.has(key)) throw new GatewayError("MCP environment variable names must be unique.");
       environmentNames.add(key);
     }
-    const endpoint = draft.transport === "https" ? canonicalProviderEndpoint(draft.endpoint) : "";
+    const endpoint = draft.transport !== "stdio" ? canonicalMcpEndpoint(draft.endpoint) : "";
     const server = create(
       McpServerInputSchema,
       draft.transport === "stdio"
         ? {
           displayName: draft.name.trim(),
           transport: McpTransport.STDIO,
-          endpoint: "",
           credentialBindings,
           enabled: draft.enabled,
           transportConfig: { case: "stdio", value: { command: draft.command.trim(), arguments: [...draft.arguments], workingDirectory: draft.workingDirectory.trim(), environment } }
           }
         : {
           displayName: draft.name.trim(),
-          transport: McpTransport.HTTPS_STREAMABLE_HTTP,
-          endpoint,
+          transport: draft.transport === "sse" ? McpTransport.HTTP_SSE : McpTransport.HTTPS_STREAMABLE_HTTP,
           credentialBindings,
           enabled: draft.enabled,
-          transportConfig: { case: "streamableHttp", value: { endpoint } }
+          transportConfig: { case: draft.transport === "sse" ? "sse" : "streamableHttp", value: { endpoint } }
           }
     );
-    if (server.displayName.length === 0 || (draft.transport === "stdio" ? draft.command.trim().length === 0 : server.endpoint.length === 0)) throw new GatewayError("MCP name and transport configuration are required.");
+    if (server.displayName.length === 0 || (draft.transport === "stdio" ? draft.command.trim().length === 0 : endpoint.length === 0)) throw new GatewayError("MCP name and transport configuration are required.");
     await this.submit({ case: "upsertMcpServer", value: { mcpServerId: id, server, expectedRevision: { value: draft.revision } } }, true);
   }
 
@@ -3870,14 +4049,17 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   }
 
   async updateVoiceInputServiceSettings(draft: VoiceInputServiceSettingsDraft): Promise<void> {
+    const scope = this.captureActionScope();
     const secret = draft.secret?.trim();
     const fallbackSecret = draft.fallbackSecret?.trim();
     const credentialUploadTicketId = secret === undefined || secret === ""
       ? undefined
-      : await this.uploadCredential(secret, CredentialKind.API_KEY, "");
+      : await this.uploadCredential(secret, CredentialKind.API_KEY, "", scope);
+    scope.signal.throwIfAborted();
     const fallbackCredentialUploadTicketId = fallbackSecret === undefined || fallbackSecret === ""
       ? undefined
-      : await this.uploadCredential(fallbackSecret, CredentialKind.API_KEY, "");
+      : await this.uploadCredential(fallbackSecret, CredentialKind.API_KEY, "", scope);
+    scope.signal.throwIfAborted();
     await this.submit({
       case: "updateVoiceInputServiceSettings",
       value: {
@@ -3886,25 +4068,25 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           protocol: protoVoiceInputProtocol(draft.protocol),
           endpoint: draft.endpoint.trim(),
           model: draft.model.trim(),
+          resourceId: draft.resourceId.trim(),
           keyless: draft.keyless,
           ...(credentialUploadTicketId === undefined ? {} : { credentialUploadTicketId }),
           ...(draft.clearCredential === undefined ? {} : { clearCredential: draft.clearCredential }),
           refinementEnabled: draft.refinementEnabled,
-          refinerProviderId: draft.refinerProviderId,
-          refinerModelId: draft.refinerModelId,
-          refinerFallbackProviderId: draft.refinerFallbackProviderId,
-          refinerFallbackModelId: draft.refinerFallbackModelId,
+          refinerModel: draft.refinerModel ?? { backendId: "", providerId: "", modelId: "" },
+          refinerFallbackModel: draft.refinerFallbackModel ?? { backendId: "", providerId: "", modelId: "" },
           fallbackEnabled: draft.fallbackEnabled,
           fallbackProtocol: protoVoiceInputProtocol(draft.fallbackProtocol),
           fallbackEndpoint: draft.fallbackEndpoint.trim(),
           fallbackModel: draft.fallbackModel.trim(),
+          fallbackResourceId: draft.fallbackResourceId.trim(),
           fallbackKeyless: draft.fallbackKeyless,
           ...(fallbackCredentialUploadTicketId === undefined ? {} : { fallbackCredentialUploadTicketId }),
           ...(draft.clearFallbackCredential === undefined ? {} : { clearFallbackCredential: draft.clearFallbackCredential }),
           expectedRevision: { value: draft.expectedRevision }
         }
       }
-    }, true);
+    }, true, [], scope.signal);
   }
 
   async showBrowserAutomation(browserProviderId: string, targetId: string): Promise<void> {
@@ -4083,10 +4265,27 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     }, true);
   }
 
+  async updateAuxiliaryTextSettings(models: Parameters<OperationApi["updateAuxiliaryTextSettings"]>[0], expectedRevision: bigint): Promise<void> {
+    await this.submit({
+      case: "updateAuxiliaryTextSettings",
+      value: {
+        models: models.map((route) => ({ ...route })),
+        expectedRevision: { value: expectedRevision }
+      }
+    }, true);
+  }
+
   async updatePromptRecommendationSettings(enabled: boolean): Promise<void> {
     await this.submit({
       case: "updatePromptRecommendationSettings",
       value: { patch: { enabled } }
+    }, true);
+  }
+
+  async updateSubagentModelSettings(backendId: string, model: Parameters<OperationApi["updateSubagentModelSettings"]>[1], expectedRevision: bigint): Promise<void> {
+    await this.submit({
+      case: "updateSubagentModelSettings",
+      value: { backendId, ...(model === undefined ? {} : { model: { ...model } }), expectedRevision: { value: expectedRevision } }
     }, true);
   }
 
@@ -4198,14 +4397,19 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   async predictNextPrompt(
     sessionId: string,
     expectedLastActivityAt: number,
-    expectedGeneration: bigint
+    expectedGeneration: bigint,
+    signal: AbortSignal
   ): Promise<string> {
+    signal.throwIfAborted();
     const client = createClient(SessionService, this.requireTransport());
+    const requestSignal = this.#abort === undefined ? signal : AbortSignal.any([signal, this.#abort.signal]);
+    requestSignal.throwIfAborted();
     const response = await client.predictNextPrompt({
       sessionId,
       expectedLastActivityAt: timestampFromMs(expectedLastActivityAt),
       expectedGeneration
-    }, this.#abort === undefined ? undefined : { signal: this.#abort.signal });
+    }, { signal: requestSignal });
+    requestSignal.throwIfAborted();
     return response.prompt;
   }
 
@@ -4299,31 +4503,33 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     this.#artifactUrls.delete(blobId);
   }
 
-  async downloadArtifact(blobId: string, fileName: string): Promise<void> {
-    await this.saveArtifact(blobId, fileName);
+  private artifactDownloadContext(context: ArtifactDownloadContext): ArtifactDownloadContext {
+    this.requireTransport();
+    const connection = this.#abort;
+    if (connection === undefined) throw new GatewayError("Connect to Joko before downloading an artifact.");
+    const signal = AbortSignal.any([context.signal, connection.signal]);
+    signal.throwIfAborted();
+    return { ownerDocument: context.ownerDocument, signal };
   }
 
-  private async saveArtifact(blobId: string, fileName: string): Promise<boolean> {
-    const blob = await this.fetchArtifact(blobId);
+  async downloadArtifact(blobId: string, fileName: string, context: ArtifactDownloadContext): Promise<ArtifactDownloadOutcome> {
+    const ownedContext = this.artifactDownloadContext(context);
+    // The trusted host capability is separate from a detached view's Document.
+    // Inspector windows do not receive filesystem IPC authority.
     const desktop = typeof window === "undefined" ? undefined : window.jokoDesktop;
-    if (desktop !== undefined) {
-      return desktop.saveFile({
-        name: fileName || "artifact",
-        mediaType: blob.type || "application/octet-stream",
-        bytes: new Uint8Array(await blob.arrayBuffer())
-      });
-    }
-    const url = URL.createObjectURL(blob);
-    try {
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = fileName || "artifact";
-      link.rel = "noopener";
-      link.click();
-    } finally {
-      setTimeout(() => URL.revokeObjectURL(url), 1_000);
-    }
-    return true;
+    const nativeSave = desktop?.saveFile.bind(desktop);
+    const blob = await this.fetchArtifact(blobId, ownedContext.signal);
+    ownedContext.signal.throwIfAborted();
+    return saveArtifactBlob(blob, fileName, ownedContext, nativeSave);
+  }
+
+  async copyArtifactFile(blobId: string, fileName: string, byteSize: number, context: ArtifactDownloadContext): Promise<import("./native-file-actions.js").NativeFileCopyOutcome> {
+    const ownedContext = this.artifactDownloadContext(context);
+    const host = captureNativeFileCopy();
+    if (host === undefined) return { status: "unavailable" };
+    if (!Number.isSafeInteger(byteSize) || byteSize < 0 || byteSize > NATIVE_FILE_COPY_MAXIMUM_BYTES) return { status: "failed", reason: "capacity" };
+    const blob = await this.fetchArtifact(blobId, ownedContext.signal);
+    return copyNativeArtifactFile(blob, fileName, ownedContext, host);
   }
 
   private async consumeEvents(signal: AbortSignal): Promise<void> {
@@ -4448,8 +4654,10 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   private async submit(
     payload: MutationPayload,
     waitForTerminal = false,
-    preconditions: readonly MutationPrecondition[] = []
+    preconditions: readonly MutationPrecondition[] = [],
+    callerSignal?: AbortSignal
   ): Promise<Operation> {
+    callerSignal?.throwIfAborted();
     const transport = this.requireTransport();
     const client = createClient(OperationService, transport);
     const operationId = randomUuid();
@@ -4458,8 +4666,9 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       connectionId: this.#profile?.id ?? "",
       mutation: create(OperationMutationSchema, { payload, preconditions: [...preconditions] })
     };
-    const options = this.#abort === undefined ? undefined : { signal: this.#abort.signal };
-    const submitOnce = () => client.submitOperation(request, options);
+    const signal = combinedAbortSignal(callerSignal, this.#abort?.signal);
+    const options = signal === undefined ? undefined : { signal };
+    const submitOnce = () => { signal?.throwIfAborted(); return client.submitOperation(request, options); };
     let response;
     try {
       response = await submitOnce();
@@ -4467,9 +4676,10 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       // A dropped unary response does not say whether Orchestrator durably claimed
       // the effect. Re-submit the exact request under the same idempotency key;
       // never mint a second operation ID inside one user attempt.
-      if (this.#abort?.signal.aborted === true || !isUncertainOperationSubmissionError(error)) throw error;
+      if (signal?.aborted === true || !isUncertainOperationSubmissionError(error)) throw error;
       response = await submitOnce();
     }
+    callerSignal?.throwIfAborted();
     if (response.operation === undefined) throw new GatewayError("Orchestrator accepted no operation.");
     let operation = response.operation;
     if (waitForTerminal && !TERMINAL_OPERATION_STATES.has(operation.state)) {
@@ -4477,13 +4687,16 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       for await (const update of client.watchOperation({
         operationId,
         afterRevision: operation.version?.revision
-      }, { signal: timeout })) {
+      }, { signal: combinedAbortSignal(callerSignal, timeout) })) {
+        callerSignal?.throwIfAborted();
         if (update.operation === undefined) continue;
         operation = update.operation;
         if (TERMINAL_OPERATION_STATES.has(operation.state)) break;
       }
       if (!TERMINAL_OPERATION_STATES.has(operation.state)) {
-        const reconciled = await client.getOperation({ operationId });
+        callerSignal?.throwIfAborted();
+        const reconciled = await client.getOperation({ operationId }, options);
+        callerSignal?.throwIfAborted();
         if (reconciled.operation !== undefined) operation = reconciled.operation;
       }
       if (!TERMINAL_OPERATION_STATES.has(operation.state)) {
@@ -4495,70 +4708,91 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         ...(operation.error?.code ? { code: operation.error.code } : {})
       });
     }
-    void this.refresh().catch((error: unknown) => this.#callbacks.onError?.(normalizeError(error)));
+    callerSignal?.throwIfAborted();
+    void this.refresh().catch((error: unknown) => { if (!signal?.aborted) this.#callbacks.onError?.(normalizeError(error)); });
     return operation;
   }
 
-  private async uploadAttachment(file: File): Promise<Record<string, unknown>> {
-    return this.uploadBlob(file, BlobDisposition.ATTACHMENT);
+  private async uploadAttachment(file: File, scope: GatewayActionScope): Promise<Record<string, unknown>> {
+    return this.uploadBlob(file, BlobDisposition.ATTACHMENT, scope);
   }
 
-  private async uploadBlob(file: File, disposition: BlobDisposition): Promise<Record<string, unknown>> {
-    const transport = this.requireTransport();
-    const client = createClient(ArtifactService, transport);
-    const digest = await sha256Hex(await file.arrayBuffer());
+  private async uploadBlob(file: File, disposition: BlobDisposition, scope: GatewayActionScope): Promise<Record<string, unknown>> {
+    scope.signal.throwIfAborted();
+    const client = createClient(ArtifactService, scope.transport);
+    const bytes = await file.arrayBuffer();
+    scope.signal.throwIfAborted();
+    const digest = await sha256Hex(bytes);
+    scope.signal.throwIfAborted();
     const response = await client.beginBlobUpload({
       fileName: file.name,
       mediaType: file.type || "application/octet-stream",
       byteSize: BigInt(file.size),
       sha256Hex: digest,
       disposition
-    });
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
     const upload = response.upload;
     const endpoint = upload?.ticket?.relativeEndpoint;
     if (upload === undefined || endpoint === undefined || endpoint.length === 0) throw new GatewayError("Orchestrator returned no upload ticket.");
     const uploadResponse = await fetch(this.authorizedEndpoint(endpoint), {
       method: "PUT",
       headers: {
-        authorization: `Bearer ${this.#authKey ?? ""}`,
+        authorization: `Bearer ${scope.authKey}`,
         "content-type": "application/octet-stream"
       },
       body: file,
-      signal: this.#abort?.signal
+      signal: scope.signal
     });
+    scope.signal.throwIfAborted();
     if (!uploadResponse.ok) throw new GatewayError(`Attachment upload failed (${uploadResponse.status}).`);
-    const completed = await client.completeBlobUpload({ uploadId: upload.uploadId });
+    const completed = await client.completeBlobUpload({ uploadId: upload.uploadId }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
     if (completed.blob === undefined) throw new GatewayError("Orchestrator did not commit the uploaded attachment.");
     return completed.blob as unknown as Record<string, unknown>;
   }
 
-  private async fetchArtifact(blobId: string): Promise<Blob> {
+  private async fetchArtifact(blobId: string, callerSignal?: AbortSignal): Promise<Blob> {
     const transport = this.requireTransport();
+    const signal = combinedAbortSignal(callerSignal, this.#abort?.signal);
+    signal?.throwIfAborted();
+    const authKey = this.#authKey;
     const client = createClient(ArtifactService, transport);
-    const response = await client.getBlobDownloadTicket({ blobId });
+    const response = await client.getBlobDownloadTicket({ blobId }, { signal });
+    signal?.throwIfAborted();
     const endpoint = response.ticket?.relativeEndpoint;
     if (endpoint === undefined || endpoint.length === 0) throw new GatewayError("Orchestrator returned no download ticket.");
     const download = await fetch(this.authorizedEndpoint(endpoint), {
-      headers: { authorization: `Bearer ${this.#authKey ?? ""}` },
+      headers: { authorization: `Bearer ${authKey ?? ""}` },
       cache: "no-store",
-      signal: this.#abort?.signal
+      signal
     });
+    signal?.throwIfAborted();
     if (!download.ok) throw new GatewayError(`Artifact download failed (${download.status}).`);
-    return download.blob();
+    const blob = await download.blob();
+    signal?.throwIfAborted();
+    return blob;
   }
 
-  private async uploadSensitiveAnswer(secret: string): Promise<string> {
-    return this.uploadCredential(secret, CredentialKind.UNSPECIFIED, "");
+  private captureActionScope(callerSignal?: AbortSignal): GatewayActionScope {
+    const transport = this.requireTransport();
+    if (this.#abort === undefined || this.#authKey === undefined) {
+      throw new GatewayError("Connect to Orchestrator before performing this action.", { offline: true });
+    }
+    const signal = callerSignal === undefined ? this.#abort.signal : AbortSignal.any([callerSignal, this.#abort.signal]);
+    signal.throwIfAborted();
+    return { transport, authKey: this.#authKey, signal };
   }
 
   private async uploadCredential(
     secret: string,
     kind: CredentialKind,
     providerId: string,
+    scope: GatewayActionScope,
     surface?: { readonly backendId: string; readonly surfaceId: string }
   ): Promise<string> {
-    const transport = this.requireTransport();
-    const client = createClient(CredentialService, transport);
+    scope.signal.throwIfAborted();
+    const client = createClient(CredentialService, scope.transport);
     const response = await client.beginCredentialUpload({
       kind,
       providerId,
@@ -4566,25 +4800,32 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         backendId: surface.backendId,
         credentialSurfaceId: surface.surfaceId
       })
-    }, this.#abort === undefined ? undefined : { signal: this.#abort.signal });
-    const ticket = response.ticket;
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return this.uploadSensitiveTicket(secret, response.ticket, scope);
+  }
+
+  private async uploadSensitiveTicket(secret: string, ticket: CredentialUploadTicket | undefined, scope: GatewayActionScope): Promise<string> {
+    scope.signal.throwIfAborted();
     if (ticket === undefined || ticket.ticketId.length === 0 || ticket.relativeEndpoint.length === 0) {
       throw new GatewayError("Orchestrator has no credential channel available for this sensitive answer.");
     }
     const bytes = new TextEncoder().encode(secret);
-    if (ticket.maximumBytes > 0n && BigInt(bytes.byteLength) > ticket.maximumBytes) {
-      throw new GatewayError("The sensitive answer exceeds the credential channel limit.");
-    }
     try {
+      if (ticket.maximumBytes > 0n && BigInt(bytes.byteLength) > ticket.maximumBytes) {
+        throw new GatewayError("The sensitive answer exceeds the credential channel limit.");
+      }
+      scope.signal.throwIfAborted();
       const upload = await fetch(this.authorizedEndpoint(ticket.relativeEndpoint), {
         method: "PUT",
         headers: {
-          authorization: `Bearer ${this.#authKey ?? ""}`,
+          authorization: `Bearer ${scope.authKey}`,
           "content-type": "application/octet-stream"
         },
         body: bytes,
-        signal: this.#abort?.signal
+        signal: scope.signal
       });
+      scope.signal.throwIfAborted();
       if (!upload.ok) throw new GatewayError(`Sensitive answer upload failed (${upload.status}).`);
       return ticket.ticketId;
     } finally {
@@ -5192,8 +5433,12 @@ export function projectSnapshotEvent(
     case "imageProduced":
     case "recoverableError":
     case "contextRebuilt":
-    case "nativeSessionChanged":
     case "browserActivity":
+      break;
+    case "nativeSessionChanged":
+      // A marker can remove the whole active prefix; only the service owns
+      // which durable events remain visible on this native branch.
+      refresh = "authoritative";
       break;
   }
 
@@ -5265,9 +5510,12 @@ function remapSessionProjection(raw: Snapshot, snapshot: AppSnapshot, sessionId:
 }
 
 function mapTargetView(target: Snapshot["targets"][number], workspaces: readonly WorkspaceDescriptor[]): AppSnapshot["targets"][number] {
+  const revision = target.version?.revision?.value;
+  if (revision === undefined || revision < 1n) throw new GatewayError("Orchestrator returned a Target without a current revision.");
   const workspace = workspaces.find((candidate) => candidate.workspaceId === target.workspaceId);
   return {
     id: target.targetId,
+    revision,
     backendId: target.backendId,
     name: target.displayName,
     workspaceId: target.workspaceId,
@@ -5539,6 +5787,7 @@ function projectTimelineEvent(
         kind: "diff",
         createdAt,
         title: "Workspace changes",
+        ...(changeSet?.runId ? { runId: changeSet.runId } : {}),
         text: `${mapped.files.length} changed files`,
         workspaceDiff: {
           ...mapped,
@@ -5975,7 +6224,8 @@ function completedMessageAttachments(blocks: readonly ProtoMessageBlock[]): read
     return [{
       id: blob.blobId,
       blobId: blob.blobId,
-      title: image?.altText || artifact?.label || fileName,
+      title: artifact?.audioMetadata?.title.trim() || image?.altText || artifact?.label || fileName,
+      ...(artifact?.audioMetadata === undefined ? {} : { audioMetadata: mapAudioMetadata(artifact.audioMetadata) }),
       kind,
       fileName,
       mediaType: blob.mediaType || "application/octet-stream",
@@ -6543,6 +6793,8 @@ function protoVoiceInputProtocol(value: VoiceInputTranscriptionProtocolView): Vo
     case "openAiCompatibleBatch": return VoiceInputTranscriptionProtocol.OPENAI_COMPATIBLE_BATCH;
     case "openAiCompatibleRealtime": return VoiceInputTranscriptionProtocol.OPENAI_COMPATIBLE_REALTIME;
     case "qwenCompatibleRealtime": return VoiceInputTranscriptionProtocol.QWEN_COMPATIBLE_REALTIME;
+    case "elevenLabsScribeRealtime": return VoiceInputTranscriptionProtocol.ELEVENLABS_SCRIBE_REALTIME;
+    case "volcengineSauc": return VoiceInputTranscriptionProtocol.VOLCENGINE_SAUC;
   }
 }
 
@@ -6551,6 +6803,8 @@ function voiceInputProtocolView(value: VoiceInputTranscriptionProtocol): VoiceIn
     case VoiceInputTranscriptionProtocol.OPENAI_COMPATIBLE_BATCH: return "openAiCompatibleBatch";
     case VoiceInputTranscriptionProtocol.OPENAI_COMPATIBLE_REALTIME: return "openAiCompatibleRealtime";
     case VoiceInputTranscriptionProtocol.QWEN_COMPATIBLE_REALTIME: return "qwenCompatibleRealtime";
+    case VoiceInputTranscriptionProtocol.ELEVENLABS_SCRIBE_REALTIME: return "elevenLabsScribeRealtime";
+    case VoiceInputTranscriptionProtocol.VOLCENGINE_SAUC: return "volcengineSauc";
     case VoiceInputTranscriptionProtocol.UNSPECIFIED:
       throw new GatewayError("Orchestrator returned an unsupported voice input protocol.");
   }
@@ -6812,6 +7066,13 @@ function mapBackend(backend: BackendDescriptor): BackendView {
     instanceGeneration: numberValue(backend.entityVersion?.generation),
     installationState: backendInstallationState(backend.installationState),
     authenticationState: backendAuthenticationState(backend.authenticationState),
+    ...(backend.providerRuntimeSupport === undefined ? {} : { providerRuntimeSupport: {
+      protocols: backend.providerRuntimeSupport.protocols.map(providerCompatibility),
+      fields: backend.providerRuntimeSupport.fields.flatMap((field) => {
+        const mapped = providerConfigurationField(field);
+        return mapped === undefined ? [] : [mapped];
+      })
+    } }),
     ...(backend.error?.message ? { error: presentJokoServiceTerminology(backend.error.message) } : {}),
     capabilities: new Map((backend.capabilities?.capabilities ?? []).map((capability) => [capability.name, {
       name: capability.name,
@@ -7098,17 +7359,23 @@ function withTimelineHistoryInvalidation(
 
 function timelineNativeMessageIdentity(
   event: Event,
-  existing?: Pick<TimelineItemView, "nativeEntryId" | "nativeParentEntryId">
-): Pick<TimelineItemView, "nativeEntryId" | "nativeParentEntryId"> {
+  existing?: Pick<TimelineItemView, "nativeEntryId" | "nativeParentEntryId" | "nativeRewindBefore">
+): Pick<TimelineItemView, "nativeEntryId" | "nativeParentEntryId" | "nativeRewindBefore"> {
   const payload = event.payload?.kind;
   const identity = payload?.case === "messageStarted" || payload?.case === "messageCompleted"
     ? payload.value.nativeIdentity
     : undefined;
   const nativeEntryId = identity?.entryId || existing?.nativeEntryId;
   const nativeParentEntryId = identity?.parentEntryId || existing?.nativeParentEntryId;
+  const target = identity?.rewindBefore?.kind;
+  const nativeRewindBefore: import("./model.js").NativeNavigationTargetView | undefined = identity === undefined ? existing?.nativeRewindBefore
+    : target?.case === "sessionStart" ? { kind: "session_start" }
+      : target?.case === "nativeEntryId" && target.value.length > 0 && target.value.length <= 4_096 && !/[\u0000-\u001f\u007f]/u.test(target.value)
+        ? { kind: "native_entry", entryId: target.value } : undefined;
   return {
     ...(nativeEntryId === undefined || nativeEntryId.length === 0 ? {} : { nativeEntryId }),
-    ...(nativeParentEntryId === undefined || nativeParentEntryId.length === 0 ? {} : { nativeParentEntryId })
+    ...(nativeParentEntryId === undefined || nativeParentEntryId.length === 0 ? {} : { nativeParentEntryId }),
+    nativeRewindBefore
   };
 }
 
@@ -9070,6 +9337,9 @@ function mapSettings(settings: SettingsSnapshot | undefined): SettingsView {
   if (settings.agentResource === undefined || settings.collaboration === undefined || settings.gitSafety === undefined) {
     throw new Error("Orchestrator returned an incomplete governance settings snapshot.");
   }
+  if (settings.auxiliaryText?.revision === undefined) {
+    throw new Error("Orchestrator returned incomplete auxiliary text settings.");
+  }
   return {
     revision: settings?.revision?.value ?? 0n,
     providers: (settings?.providers ?? []).map(mapProviderConfiguration),
@@ -9197,17 +9467,15 @@ function mapSettings(settings: SettingsSnapshot | undefined): SettingsView {
           protocol: "openAiCompatibleBatch",
           endpoint: "https://api.openai.com/v1/audio/transcriptions",
           model: "whisper-1",
+          resourceId: "",
           keyless: false,
           credentialConfigured: false,
           refinementEnabled: false,
-          refinerProviderId: "",
-          refinerModelId: "",
-          refinerFallbackProviderId: "",
-          refinerFallbackModelId: "",
           fallbackEnabled: false,
           fallbackProtocol: "openAiCompatibleBatch",
           fallbackEndpoint: "https://api.openai.com/v1/audio/transcriptions",
           fallbackModel: "whisper-1",
+          fallbackResourceId: "",
           fallbackKeyless: false,
           fallbackCredentialConfigured: false,
           revision: 0n
@@ -9217,17 +9485,21 @@ function mapSettings(settings: SettingsSnapshot | undefined): SettingsView {
           protocol: voiceInputProtocolView(settings.voiceInput.protocol),
           endpoint: settings.voiceInput.endpoint,
           model: settings.voiceInput.model,
+          resourceId: settings.voiceInput.resourceId,
           keyless: settings.voiceInput.keyless,
           credentialConfigured: settings.voiceInput.credentialConfigured,
           refinementEnabled: settings.voiceInput.refinementEnabled,
-          refinerProviderId: settings.voiceInput.refinerProviderId,
-          refinerModelId: settings.voiceInput.refinerModelId,
-          refinerFallbackProviderId: settings.voiceInput.refinerFallbackProviderId,
-          refinerFallbackModelId: settings.voiceInput.refinerFallbackModelId,
+          ...(settings.voiceInput.refinerModel === undefined ? {} : { refinerModel: {
+            backendId: settings.voiceInput.refinerModel.backendId, providerId: settings.voiceInput.refinerModel.providerId, modelId: settings.voiceInput.refinerModel.modelId
+          } }),
+          ...(settings.voiceInput.refinerFallbackModel === undefined ? {} : { refinerFallbackModel: {
+            backendId: settings.voiceInput.refinerFallbackModel.backendId, providerId: settings.voiceInput.refinerFallbackModel.providerId, modelId: settings.voiceInput.refinerFallbackModel.modelId
+          } }),
           fallbackEnabled: settings.voiceInput.fallbackEnabled,
           fallbackProtocol: voiceInputProtocolView(settings.voiceInput.fallbackProtocol),
           fallbackEndpoint: settings.voiceInput.fallbackEndpoint,
           fallbackModel: settings.voiceInput.fallbackModel,
+          fallbackResourceId: settings.voiceInput.fallbackResourceId,
           fallbackKeyless: settings.voiceInput.fallbackKeyless,
           fallbackCredentialConfigured: settings.voiceInput.fallbackCredentialConfigured,
           revision: settings.voiceInput.version?.revision?.value ?? 0n
@@ -9311,6 +9583,29 @@ function mapSettings(settings: SettingsSnapshot | undefined): SettingsView {
       customized: settings?.visionBridge?.customized ?? false,
       customizedFields: settings?.visionBridge?.customizedFields ?? []
     },
+    subagentModels: settings.subagentModels.map((setting) => {
+      if (setting.backendId === "" || setting.revision === undefined) throw new Error("Orchestrator returned incomplete subagent model settings.");
+      return {
+        backendId: setting.backendId,
+        ...(setting.model === undefined ? {} : { model: { providerId: setting.model.providerId, modelId: setting.model.modelId } }),
+        available: setting.available,
+        unavailableReason: setting.unavailableReason,
+        revision: setting.revision.value
+      };
+    }),
+    auxiliaryText: {
+      models: settings.auxiliaryText.models.map(({ backendId, providerId, modelId }) => ({ backendId, providerId, modelId })),
+      automaticModels: settings.auxiliaryText.automaticModels.map(({ backendId, providerId, modelId }) => ({ backendId, providerId, modelId })),
+      options: settings.auxiliaryText.options.map((option) => {
+        if (option.route === undefined) throw new Error("Orchestrator returned an incomplete auxiliary text route.");
+        const { backendId, providerId, modelId } = option.route;
+        return { route: { backendId, providerId, modelId }, available: option.available, unavailableReason: option.unavailableReason };
+      }),
+      available: settings.auxiliaryText.available,
+      unavailableReason: settings.auxiliaryText.unavailableReason,
+      revision: settings.auxiliaryText.revision.value,
+      runtimeRevision: settings.auxiliaryText.runtimeRevision
+    },
     promptRecommendation: {
       enabled: settings?.promptRecommendation?.enabled ?? true,
       available: settings?.promptRecommendation?.available ?? false,
@@ -9360,14 +9655,24 @@ function mapProviderConfiguration(provider: ProviderConfiguration): SettingsView
     id: provider.providerId,
     name: provider.displayName,
     kind: providerKind(provider.kind),
+    enabled: provider.enabled,
+    revision: provider.version?.revision?.value ?? 0n,
+    runtimes: provider.runtimes.map(mapProviderRuntimeConfiguration)
+  };
+}
+
+function mapProviderRuntimeConfiguration(provider: ProviderRuntimeConfiguration): SettingsView["providers"][number]["runtimes"][number] {
+  return {
+    backendId: provider.backendId,
     compatibility: providerCompatibility(provider.apiCompatibility),
     endpoint: provider.endpoint,
     credentialId: provider.credentialReferenceId,
-    enabled: provider.enabled,
     keyless: provider.keyless,
     authHeader: provider.authHeader,
     environmentName: provider.apiKeyEnvironment,
-    modelCount: provider.models.length,
+    credentialOrigin: provider.credentialOrigin,
+    ...(provider.requestPath === undefined ? {} : { requestPath: provider.requestPath }),
+    ...(provider.modelsEndpoint === undefined ? {} : { modelsEndpoint: provider.modelsEndpoint }),
     headers: provider.headers.map((header) => ({
       headerName: header.headerName,
       environmentName: header.environmentName,
@@ -9432,11 +9737,17 @@ function mapCredential(credential: CredentialDescriptor): SettingsView["credenti
 }
 
 function mapMcpServer(server: McpServerDescriptor): McpServerView {
-  const transport = server.transport === McpTransport.STDIO ? "stdio" : server.transport === McpTransport.HTTPS_STREAMABLE_HTTP ? "https" : "loopback";
+  const transport = server.transport === McpTransport.STDIO ? "stdio"
+    : server.transport === McpTransport.HTTPS_STREAMABLE_HTTP ? "https"
+    : server.transport === McpTransport.HTTP_SSE ? "sse"
+    : server.transport === McpTransport.LOOPBACK_BRIDGE ? "loopback" : undefined;
+  if (transport === undefined) throw new GatewayError("Orchestrator returned an unknown MCP transport.");
   const stdio = server.transportConfig.case === "stdio" ? server.transportConfig.value : undefined;
   const streamableHttp = server.transportConfig.case === "streamableHttp" ? server.transportConfig.value : undefined;
+  const sse = server.transportConfig.case === "sse" ? server.transportConfig.value : undefined;
   if (transport === "stdio" && stdio === undefined) throw new GatewayError("Orchestrator returned an incomplete Stdio MCP configuration.");
   if (transport === "https" && streamableHttp === undefined) throw new GatewayError("Orchestrator returned an incomplete HTTP MCP configuration.");
+  if (transport === "sse" && sse === undefined) throw new GatewayError("Orchestrator returned an incomplete SSE MCP configuration.");
   const credentialBindings = server.credentialBindings.map((binding) => {
     const target = binding.target === McpCredentialTarget.HEADER
       ? "header" as const
@@ -9457,7 +9768,7 @@ function mapMcpServer(server: McpServerDescriptor): McpServerView {
     id: server.mcpServerId,
     name: server.displayName,
     transport,
-    endpoint: streamableHttp?.endpoint ?? (transport === "https" ? server.endpointDisplay : ""),
+    endpoint: transport === "https" ? streamableHttp!.endpoint : transport === "sse" ? sse!.endpoint : "",
     state: server.state === McpServerState.DISABLED ? "disabled" : server.state === McpServerState.STARTING ? "starting" : server.state === McpServerState.CONNECTED ? "connected" : server.state === McpServerState.DEGRADED ? "degraded" : server.state === McpServerState.ERROR ? "error" : "disconnected",
     generation: server.runtimeGeneration,
     toolCount: server.tools.length,
@@ -9557,10 +9868,13 @@ function mapRemoteHost(host: ProtoRemoteHost): RemoteHostView {
     ? "systemAgent" as const
     : host.authenticationMode === RemoteHostAuthenticationMode.PRIVATE_KEY
       ? "privateKey" as const
+      : host.authenticationMode === RemoteHostAuthenticationMode.NODE_KEY ? "nodeKey" as const
       : (() => { throw new GatewayError("Orchestrator returned an unknown Remote Host authentication mode."); })();
   if (
-    (authentication === "systemAgent" && host.credentialReferenceId !== undefined) ||
-    (authentication === "privateKey" && (host.credentialReferenceId?.trim() ?? "") === "")
+    ((authentication === "privateKey") !== (host.credentialReferenceId !== undefined)) ||
+    (authentication === "privateKey" && (host.credentialReferenceId?.trim() ?? "") === "") ||
+    ((authentication === "nodeKey") !== (host.nodeKey !== undefined)) ||
+    (host.nodeKey !== undefined && (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/u.test(host.nodeKey.id) || !/^SHA256:[A-Za-z0-9+/]{43}$/u.test(host.nodeKey.expectedFingerprint)))
   ) {
     throw new GatewayError("Orchestrator returned an inconsistent Remote Host authentication mode.");
   }
@@ -9583,6 +9897,7 @@ function mapRemoteHost(host: ProtoRemoteHost): RemoteHostView {
         : (() => { throw new GatewayError("Orchestrator returned an unknown Remote Host source."); })(),
     authentication,
     ...(host.credentialReferenceId === undefined ? {} : { credentialReferenceId: host.credentialReferenceId }),
+    ...(host.nodeKey === undefined ? {} : { nodeKey: { id: host.nodeKey.id, expectedFingerprint: host.nodeKey.expectedFingerprint } }),
     ...(host.trust === undefined ? {} : {
       trust: {
         algorithm: host.trust.algorithm,
@@ -9614,6 +9929,8 @@ function remoteHostFailureCode(value: RemoteHostFailureCode): string {
   switch (value) {
     case RemoteHostFailureCode.ABORTED: return "aborted";
     case RemoteHostFailureCode.AUTHENTICATION_FAILED: return "authenticationFailed";
+    case RemoteHostFailureCode.NODE_KEY_CHANGED: return "nodeKeyChanged";
+    case RemoteHostFailureCode.NODE_KEY_UNAVAILABLE: return "nodeKeyUnavailable";
     case RemoteHostFailureCode.CONNECTION_FAILED: return "connectionFailed";
     case RemoteHostFailureCode.CONNECTION_TIMEOUT: return "connectionTimeout";
     case RemoteHostFailureCode.CONNECTOR_PROTOCOL: return "connectorProtocol";
@@ -9631,9 +9948,15 @@ function remoteHostFailureCode(value: RemoteHostFailureCode): string {
 }
 
 function protoRemoteHostAuthentication(value: RemoteHostDraft["authentication"]): RemoteHostAuthenticationMode {
+  if (value === "nodeKey") return RemoteHostAuthenticationMode.NODE_KEY;
   return value === "privateKey"
     ? RemoteHostAuthenticationMode.PRIVATE_KEY
     : RemoteHostAuthenticationMode.SYSTEM_AGENT;
+}
+
+function mapSshKey(key: SshKey): SshKeyView {
+  return { id: key.id, name: key.name, algorithm: key.algorithm, comment: key.comment, sha256Fingerprint: key.sha256Fingerprint,
+    modifiedAt: timestampMs(key.modifiedAt), inAgent: key.inAgent };
 }
 
 function compareRemoteHosts(left: RemoteHostView, right: RemoteHostView): number {
@@ -10031,11 +10354,21 @@ function mapArtifact(artifact: Artifact): ArtifactView {
     id: artifact.artifactId,
     blobId: artifact.blob?.blobId ?? artifact.artifactId,
     title: artifact.title,
+    ...(artifact.audioMetadata === undefined ? {} : { audioMetadata: mapAudioMetadata(artifact.audioMetadata) }),
+    ...(artifact.description === "" ? {} : { description: artifact.description }),
     kind: artifactKind(artifact.kind),
     fileName: artifact.blob?.fileName ?? "artifact",
     mediaType: artifact.blob?.mediaType ?? "application/octet-stream",
     byteSize: numberValue(artifact.blob?.byteSize)
   };
+}
+
+function mapAudioMetadata(audio: AudioArtifactMetadata): NonNullable<ArtifactView["audioMetadata"]> {
+  const kind = audio.kind === AudioArtifactKind.GENERIC ? "generic" : audio.kind === AudioArtifactKind.MUSIC ? "music" : audio.kind === AudioArtifactKind.SOUND_EFFECT ? "sound_effect" : undefined;
+  if (kind === undefined) throw new Error("Audio Artifact kind is invalid.");
+  return { kind, title: audio.title, description: audio.description,
+    ...(audio.durationSeconds === undefined ? {} : { durationSeconds: audio.durationSeconds }),
+    ...(audio.artwork?.blob === undefined ? {} : { artwork: { blobId: audio.artwork.blob.blobId, width: audio.artwork.widthPixels, height: audio.artwork.heightPixels, alt: audio.artwork.altText } }) };
 }
 
 function collectDiagnostics(snapshot: Snapshot): readonly ErrorView[] {
@@ -10396,7 +10729,8 @@ function toolResultAttachments(result: any): readonly ArtifactView[] {
       attachments.push({
         id: artifact.artifactId || blob.blobId,
         blobId: blob.blobId,
-        title: artifact.title || blob.fileName || "Artifact",
+        title: artifact.audioMetadata?.title.trim() || artifact.title || blob.fileName || "Artifact",
+        ...(artifact.audioMetadata === undefined ? {} : { audioMetadata: mapAudioMetadata(artifact.audioMetadata) }),
         kind: artifactKind(artifact.kind),
         fileName: blob.fileName || "artifact",
         mediaType: blob.mediaType || "application/octet-stream",
@@ -10728,7 +11062,7 @@ function providerLoginState(value: ProviderLoginFlowState): ProviderLoginFlowVie
   return "starting";
 }
 
-function providerCompatibility(value: ProviderApiCompatibility): SettingsView["providers"][number]["compatibility"] {
+function providerCompatibility(value: ProviderApiCompatibility): SettingsView["providers"][number]["runtimes"][number]["compatibility"] {
   if (value === ProviderApiCompatibility.ANTHROPIC_MESSAGES) return "anthropic";
   if (value === ProviderApiCompatibility.OPENAI_RESPONSES) return "openaiResponses";
   if (value === ProviderApiCompatibility.OPENAI_CHAT_COMPLETIONS) return "openaiChat";
@@ -10737,7 +11071,7 @@ function providerCompatibility(value: ProviderApiCompatibility): SettingsView["p
   return "native";
 }
 
-function protoProviderCompatibility(value: ProviderDraft["compatibility"]): ProviderApiCompatibility {
+function protoProviderCompatibility(value: ProviderDraft["runtimes"][number]["compatibility"]): ProviderApiCompatibility {
   if (value === "anthropic") return ProviderApiCompatibility.ANTHROPIC_MESSAGES;
   if (value === "openaiResponses") return ProviderApiCompatibility.OPENAI_RESPONSES;
   if (value === "openaiChat") return ProviderApiCompatibility.OPENAI_CHAT_COMPLETIONS;
@@ -10774,6 +11108,43 @@ function protoDiagnosticLevel(value: SettingsView["diagnostics"]["level"]): Diag
   return value === "errors" ? DiagnosticLevel.ERRORS : value === "verbose" ? DiagnosticLevel.VERBOSE : DiagnosticLevel.STANDARD;
 }
 
+function canonicalMcpEndpoint(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return "";
+  let endpoint: URL;
+  try {
+    endpoint = new URL(trimmed);
+  } catch {
+    throw new GatewayError("Enter a valid MCP endpoint URL.");
+  }
+  const loopback = ["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname);
+  if (endpoint.protocol !== "https:" && !(endpoint.protocol === "http:" && loopback)) {
+    throw new GatewayError("MCP endpoints require HTTPS or an HTTP loopback address.");
+  }
+  if (endpoint.username || endpoint.password || endpoint.search || endpoint.hash) {
+    throw new GatewayError("MCP endpoints cannot contain credentials, query parameters, or fragments.");
+  }
+  return endpoint.href;
+}
+
+function providerConfigurationField(value: ProviderConfigurationField): NonNullable<BackendView["providerRuntimeSupport"]>["fields"][number] | undefined {
+  switch (value) {
+    case ProviderConfigurationField.REQUEST_PATH: return "requestPath";
+    case ProviderConfigurationField.MODELS_ENDPOINT: return "modelsEndpoint";
+    case ProviderConfigurationField.HEADERS: return "headers";
+    case ProviderConfigurationField.KEYLESS: return "keyless";
+    case ProviderConfigurationField.AUTH_HEADER: return "authHeader";
+    case ProviderConfigurationField.MODEL_LIMITS: return "modelLimits";
+    case ProviderConfigurationField.MODEL_COSTS: return "modelCosts";
+    case ProviderConfigurationField.MODEL_INPUT_MODALITIES: return "modelInputModalities";
+    case ProviderConfigurationField.MODEL_THINKING_LEVELS: return "modelThinkingLevels";
+    case ProviderConfigurationField.MODEL_SAMPLING: return "modelSampling";
+    case ProviderConfigurationField.MODEL_COMPATIBILITY: return "modelCompatibility";
+    case ProviderConfigurationField.MODEL_FAST_MODE: return "modelFastMode";
+    default: return undefined;
+  }
+}
+
 function canonicalProviderEndpoint(value: string): string {
   const trimmed = value.trim();
   if (trimmed.length === 0) return "";
@@ -10783,7 +11154,7 @@ function canonicalProviderEndpoint(value: string): string {
   } catch {
     throw new GatewayError("Enter a valid provider endpoint URL.");
   }
-  const loopback = ["127.0.0.1", "localhost", "::1"].includes(endpoint.hostname);
+  const loopback = ["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname);
   if (endpoint.protocol !== "https:" && !(endpoint.protocol === "http:" && loopback)) throw new GatewayError("Remote provider endpoints require HTTPS.");
   if (endpoint.username.length > 0 || endpoint.password.length > 0) throw new GatewayError("Provider endpoints cannot contain credentials.");
   for (const key of endpoint.searchParams.keys()) if (/(?:key|token|secret|auth|password)/iu.test(key)) throw new GatewayError("Provider endpoints cannot contain secret query parameters.");

@@ -3,6 +3,7 @@ import {
   MAXIMUM_POLICY_DECISION_ENVELOPE_CHARACTERS
 } from "./policy-decision-bridge.js";
 import { provisionManagedAutoReviewRuntime } from "./auto-review-runtime.js";
+import { provisionManagedModelCatalogRuntime } from "./model-catalog-runtime.js";
 import { atomicWriteFile } from "./config.js";
 import {
   MAXIMUM_PI_RUNTIME_TOOL_CATALOG_BYTES,
@@ -31,6 +32,7 @@ export function normalizeManagedBashTimeout(value: unknown): number {
 export async function provisionManagedBridge(agentHome: string): Promise<string> {
   const path = join(agentHome, "managed", BRIDGE_FILE_NAME);
   await provisionManagedAutoReviewRuntime(agentHome);
+  await provisionManagedModelCatalogRuntime(agentHome);
   await atomicWriteFile(path, MANAGED_BRIDGE_SOURCE);
   return path;
 }
@@ -44,10 +46,13 @@ export const MANAGED_BRIDGE_SOURCE = String.raw`
 import { createHash } from "node:crypto";
 import { lstatSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { createRequire } from "node:module";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createBashTool, createLocalBashOperations } from "@earendil-works/pi-coding-agent";
+import { createBashTool, createLocalBashOperations, getPackageDir, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { clampThinkingLevel } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { createPiAutoReviewer } from "./joko-managed-auto-review.mjs";
+import { createPiModelCatalogAdditions } from "./joko-managed-model-catalog.mjs";
 
 type ApprovedRoot = { path: string; access: "read_only" | "read_write" };
 type Control = { generation: number; policyGeneration: number; permissionMode: "ask" | "auto" | "bypassPermissions"; planMode: boolean; fastMode: boolean; approvedRoots: ApprovedRoot[]; runtimePolicy: "standard" | "review_read_only"; writtenAt: string };
@@ -416,16 +421,32 @@ async function readBoundedJson(response: Response): Promise<unknown> {
   return JSON.parse(new TextDecoder().decode(bytes));
 }
 
-export default function jokoManagedBridge(pi: ExtensionAPI): void {
+export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void> {
+  // Resolve the public helper with ESM conditions from the active published
+  // runtime, using its own extension loader dependency.
+  const runtimePackage = resolve(getPackageDir(), "package.json");
+  const nativeRequire = createRequire(runtimePackage);
+  const { createJiti } = nativeRequire("jiti");
+  const runtimeResolver = createJiti(runtimePackage);
+  const { buildBaseOptions } = await import(runtimeResolver.esmResolve("@earendil-works/pi-ai/api/simple-options"));
+  const modelCatalog = createPiModelCatalogAdditions({ buildBaseOptions, clampThinkingLevel });
+  const nativeModels = await ModelRuntime.create({
+    modelsPath: null, allowModelNetwork: false, refreshOnCreate: false,
+    credentials: { read: async () => undefined, list: async () => [], modify: async () => undefined, delete: async () => {} }
+  });
+  for (const provider of nativeModels.getProviders()) {
+    const extended = modelCatalog.extendProvider(provider, () => readControl().fastMode);
+    if (extended !== provider) pi.registerProvider(extended);
+  }
   // This hook runs on the final Provider-specific payload for every ordinary
   // prompt, steer, follow-up, retry, and queued turn. Orchestrator validates model
   // eligibility before toggling the generation-fenced control value.
-  pi.on("before_provider_request", (event) => {
+  pi.on("before_provider_request", (event, ctx) => {
     if (!event.payload || typeof event.payload !== "object" || Array.isArray(event.payload)) return event.payload;
     const payload = { ...(event.payload as Record<string, unknown>) };
     if (readControl().fastMode) payload.service_tier = "priority";
     else delete payload.service_tier;
-    return payload;
+    return modelCatalog.normalizeResponsesPayload(ctx.model, payload);
   });
 
   // Override model and direct-user bash execution so provider/MCP credentials

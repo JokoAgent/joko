@@ -1,5 +1,6 @@
 /// <reference types="node" />
 
+import { unicodeCorpus } from "../i18n/test-corpus.js";
 import { readFile, readdir, rm, stat } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -71,7 +72,7 @@ describe("WorkspacePdfCanvas pdf.js resources", () => {
       const page = await document.getPage(1);
       await page.getOperatorList();
       const text = await page.getTextContent();
-      expect(text.items.flatMap((item) => "str" in item ? [item.str] : [])).toContain("中文");
+      expect(text.items.flatMap((item) => "str" in item ? [item.str] : [])).toContain(unicodeCorpus.cjkWord);
       expect(requests).toEqual(expect.arrayContaining([
         "cMapUrl:UniGB-UTF16-H.bcmap",
         "cMapUrl:Adobe-GB1-UCS2.bcmap",

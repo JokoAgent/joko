@@ -2,7 +2,10 @@ import type {
   AdapterContext,
   BackendAdapter,
   CreateNativeSessionInput,
+  NativeSessionDerivation,
   NativeSessionForkResult,
+  NativeSessionNavigation,
+  NativeSessionNavigationResult,
   NativeSessionState,
   RuntimeCommand,
   RuntimeResource,
@@ -13,6 +16,7 @@ import type {
   BackendDescriptor,
   BlobRef,
   NativeSessionBinding,
+  NativeNavigationTarget,
   PermissionMode,
   PromptInput,
   ProviderModel,
@@ -88,19 +92,20 @@ export abstract class CapabilityDrivenBackendAdapter implements BackendAdapter {
   }
 
   navigateTree(
-    _entryId: string,
+    _target: NativeNavigationTarget,
     _summarize: boolean,
     _context: AdapterContext,
-    _customInstructions?: string
-  ): Promise<void> {
-    return this.unsupported("session.rewind");
+    _customInstructions: string | undefined,
+    _navigation: NativeSessionNavigation
+  ): Promise<NativeSessionNavigationResult> {
+    return this.unsupported(_target.kind === "session_start" ? "session.rewind_to_start" : "session.rewind");
   }
 
-  fork(_entryId: string, _context: AdapterContext): Promise<NativeSessionForkResult> {
+  fork(_entryId: string, _context: AdapterContext, _derivation: NativeSessionDerivation): Promise<NativeSessionForkResult> {
     return this.unsupported("session.fork");
   }
 
-  clone(_context: AdapterContext): Promise<NativeSessionBinding> {
+  clone(_context: AdapterContext, _derivation: NativeSessionDerivation): Promise<NativeSessionBinding> {
     return this.unsupported("session.clone");
   }
 

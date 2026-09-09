@@ -13,7 +13,7 @@ describe("Vision Bridge UI event projection", () => {
   it("preserves full Backend+Provider+Model identity in settings projection", () => {
     const snapshot = mapSnapshot(create(SnapshotSchema, {
       settings: {
-        agentResource: {},
+        auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" }, agentResource: {},
         collaboration: {},
         gitSafety: {},
         visionBridge: {

@@ -18,7 +18,9 @@ import type {
   NativeSessionCandidate,
   NativeSessionCatalogEntry,
   NativeSessionCatalogResult,
+  NativeSessionDerivation,
   NativeSessionForkResult,
+  NativeSessionNavigationResult,
   NativeHistoryProjection,
   NativeSessionState,
   NativeSessionStart,
@@ -27,6 +29,7 @@ import type {
   MessageInputDelivery,
   PermissionMode,
   PromptInput,
+  ProviderModel,
   PublicError,
   RuntimeCommand,
   RuntimeToolCatalog,
@@ -51,6 +54,7 @@ import {
 } from "@joko/store";
 import type {
   ConnectionRecord,
+  NativeSessionDerivationRecord,
   OperationExecution,
   OperationalStore,
   PendingContextRebuild,
@@ -105,6 +109,7 @@ import {
 } from "./session-worktree-coordinator.js";
 import {
   buildPortableSessionExport,
+  adoptPortableSessionArtifacts,
   materializePortableSessionImport,
   preparePortableSessionImport,
   type PortableSessionExportBuild,
@@ -155,6 +160,7 @@ const NATIVE_SESSION_CATALOG_SNAPSHOT_TTL_MS = 10 * 60_000;
 const MAXIMUM_NATIVE_SESSION_CATALOG_SNAPSHOTS = 32;
 const DEFAULT_RUN_SILENCE_TIMEOUT_MS = 45 * 60_000;
 const DEFAULT_BACKEND_RETIREMENT_TIMEOUT_MS = 10_000;
+const NATIVE_DERIVATION_CLEANUP_TIMEOUT_MS = 5_000;
 const RUN_SILENCE_WATCHDOG_SLICE_MS = 60_000;
 const RUN_SILENCE_SUSPEND_GAP_MS = 30_000;
 const SESSION_RUNTIME_USAGE_SOURCE_ID = "session-runtime";
@@ -473,6 +479,15 @@ export interface CreateServiceSessionInput {
 
 type SessionCreationInput = CreateSessionInput | CreateScheduledSessionInput | CreateServiceSessionInput;
 
+interface QueuedInput {
+  readonly operationId: string;
+  readonly sessionId: string;
+  readonly prompt: PromptInput;
+  readonly source?: "user" | "schedule" | "system";
+  readonly parentRunId?: string;
+  readonly overrides?: TurnExecutionOverrides;
+}
+
 export interface EnqueueResult {
   readonly sessionId: string;
   readonly runId: string;
@@ -494,7 +509,7 @@ export interface DeriveSessionInput {
 }
 
 export interface WorkspaceRunCapture {
-  captureBeforeRun(input: { readonly sessionId: string; readonly runId: string; readonly target: TargetDescriptor; readonly nativeLeafId?: string }): Promise<void>;
+  captureBeforeRun(input: { readonly sessionId: string; readonly runId: string; readonly target: TargetDescriptor; readonly navigationAnchor?: import("@joko/core").NativeNavigationAnchor }): Promise<void>;
   captureAfterRun(input: { readonly sessionId: string; readonly runId: string; readonly target: TargetDescriptor }): Promise<void>;
   abortRun?(input: { readonly sessionId: string; readonly runId: string }): void;
   closeSession?(sessionId: string): Promise<void>;
@@ -708,6 +723,7 @@ export class SessionHost {
   readonly #activeEffects = new Map<string, number>();
   readonly #activeEffectFlights = new Map<string, Set<Promise<void>>>();
   readonly #backendSideEffectFlights = new Map<string, Set<Promise<void>>>();
+  readonly #nativeDerivationCleanupCalls = new Map<string, Set<AbortController>>();
   readonly #backgroundTasks = new Map<string, Map<string, TrackedBackgroundTask>>();
   readonly #runSilenceWatchdogs = new Map<string, RunSilenceWatchdog>();
   readonly #runSilenceRecoveries = new Map<string, Promise<boolean>>();
@@ -925,6 +941,9 @@ export class SessionHost {
             tools: [],
             diagnostics: ["Backend instance probe failed during service startup."]
           });
+    }
+    for (const record of this.#store.listUnadoptedNativeSessionDerivations()) {
+      if (record.state === "recorded") await this.cleanupNativeSessionDerivation(record.operationId);
     }
     // Native runtimes are lazy. Accepted durable work below is sufficient to
     // reactivate its owning session; merely having a product Session must not
@@ -1943,22 +1962,34 @@ export class SessionHost {
     await this.closeReviewer(reviewerSessionId).catch(() => undefined);
   }
 
-  enqueueInput(input: {
-    readonly operationId: string;
-    readonly connection: ConnectionRecord;
-    readonly sessionId: string;
-    readonly prompt: PromptInput;
-    readonly source?: "user" | "schedule" | "system";
-    readonly parentRunId?: string;
-    readonly overrides?: TurnExecutionOverrides;
-  }): OperationExecution<EnqueueResult> {
+  enqueueInput(input: QueuedInput & { readonly connection: ConnectionRecord }): OperationExecution<EnqueueResult> {
     this.#assertOpen();
+    const execution = this.#store.runAuthorizedOperation(
+      input.connection.id, input.connection.authKeyDigest,
+      {
+        id: input.operationId, kind: "send_input",
+        body: {
+          sessionId: input.sessionId, prompt: input.prompt, source: input.source ?? "user",
+          ...(input.overrides === undefined ? {} : { overrides: input.overrides }),
+          ...(input.parentRunId === undefined ? {} : { parentRunId: input.parentRunId })
+        }
+      },
+      (store) => this.commitQueuedInput(store, input)
+    );
+    if (!execution.replayed) this.drainQueuedInput(input.sessionId, input.source);
+    return execution;
+  }
+
+  /** Called inside the caller's authorized Store transaction; no adapter effects run here. */
+  commitQueuedInput(store: OperationalStore, input: QueuedInput): EnqueueResult {
+    this.#assertOpen();
+    if (store !== this.#store) throw new StoreError("Input must be committed by its owning Store.");
     assertPromptInlineTextRanges(input.prompt);
     this.assertInputCapabilities(input.sessionId, input.prompt);
     if (this.isReviewReadOnlySession(input.sessionId)) {
       throw new StoreError("Reviewer input is admitted only through the host-owned Review queue.");
     }
-    this.assertBackendAdmissionOpen(this.#store.getSession(input.sessionId).descriptor.backendId);
+    this.assertBackendAdmissionOpen(store.getSession(input.sessionId).descriptor.backendId);
     this.assertSessionNotPendingScheduleDeletion(input.sessionId);
     this.assertMessageDeletionAdmission(input.sessionId);
     this.validateTurnOverrides(input.sessionId, input.overrides);
@@ -1966,46 +1997,25 @@ export class SessionHost {
     const runId = stableId("run", input.operationId);
     const attemptId = stableId("attempt", input.operationId);
     const queueItemId = stableId("queue", input.operationId);
-    const operationBody = {
-      sessionId: input.sessionId,
-      prompt: input.prompt,
-      source: input.source ?? "user",
-      ...(input.overrides === undefined ? {} : { overrides: input.overrides }),
-      ...(input.parentRunId === undefined ? {} : { parentRunId: input.parentRunId })
-    };
-    const execution = this.#store.runAuthorizedOperation(
-      input.connection.id,
-      input.connection.authKeyDigest,
-      { id: input.operationId, kind: "send_input", body: operationBody },
-      (store) => {
-        store.createRun({
-          id: runId,
-          sessionId: input.sessionId,
-          source: input.source ?? "user",
-          state: "queued",
-          ...(input.parentRunId === undefined ? {} : { parentRunId: input.parentRunId }),
-          createdAt: now
-        }, { operationId: input.operationId, traceId: `operation:${input.operationId}` });
-        store.createAttempt({ id: attemptId, runId, ordinal: 1, generation: store.getSession(input.sessionId).descriptor.binding.generation, startedAt: now });
-        store.enqueueQueueItem({
-          id: queueItemId,
-          sessionId: input.sessionId,
-          runId,
-          attemptId,
-          operationId: input.operationId,
-          disposition: input.prompt.disposition,
-          body: input.prompt,
-          ...(input.overrides === undefined ? {} : { executionOverrides: input.overrides }),
-          createdAt: now
-        });
-        return { sessionId: input.sessionId, runId, attemptId, queueItemId };
-      }
-    );
-    if (!execution.replayed) {
-      if ((input.source ?? "user") === "user") this.#clearSessionRuntimeRecovery(input.sessionId);
-      void this.drain(input.sessionId);
-    }
-    return execution;
+    store.createRun({
+      id: runId, sessionId: input.sessionId, source: input.source ?? "user", state: "queued",
+      ...(input.parentRunId === undefined ? {} : { parentRunId: input.parentRunId }),
+      createdAt: now
+    }, { operationId: input.operationId, traceId: `operation:${input.operationId}` });
+    store.createAttempt({ id: attemptId, runId, ordinal: 1, generation: store.getSession(input.sessionId).descriptor.binding.generation, startedAt: now });
+    store.enqueueQueueItem({
+      id: queueItemId, sessionId: input.sessionId, runId, attemptId, operationId: input.operationId,
+      disposition: input.prompt.disposition, body: input.prompt,
+      ...(input.overrides === undefined ? {} : { executionOverrides: input.overrides }),
+      createdAt: now
+    });
+    return { sessionId: input.sessionId, runId, attemptId, queueItemId };
+  }
+
+  /** Start runtime work only after admission and the public operation result have committed. */
+  drainQueuedInput(sessionId: string, source: QueuedInput["source"] = "user"): void {
+    if (source === "user") this.#clearSessionRuntimeRecovery(sessionId);
+    void this.drain(sessionId);
   }
 
   /** Host-owned input admission for service workflows such as a granted
@@ -3230,9 +3240,7 @@ export class SessionHost {
   }
 
   async deriveSession(input: DeriveSessionInput): Promise<OperationExecution<{ readonly sessionId: string }>> {
-    if (this.isReviewReadOnlySession(input.sourceSessionId)) {
-      throw new StoreError("Reviewer Sessions cannot be attached, forked, or cloned.");
-    }
+    this.#assertOpen();
     const persistedOperation = this.#store.findOperation(input.operationId);
     const persistedSourceMessage = derivationSourceMessageFromOperationBody(persistedOperation?.body);
     const sourceMessage = input.sourceMessage
@@ -3262,7 +3270,7 @@ export class SessionHost {
       { id: input.operationId, kind: `${input.kind}_session`, body: logicalBody },
       (store) => {
         const source = store.getSession(input.sourceSessionId);
-        if (source.descriptor.deletedAt !== undefined) throw new Error("A deleted task cannot be derived.");
+        this.assertSessionDerivationSource(source);
         if (input.kind === "fork") requiredEntryId(input.entryId);
         if (sourceMessage !== undefined) {
           const visible = store.findVisibleSessionMessageOrigin({
@@ -3279,20 +3287,23 @@ export class SessionHost {
       return { replayed: true, value: claim.value, operation: claim.operation };
     }
 
-    let restoreSource = false;
     let releaseBackendAdmission: (() => void) | undefined;
     let sideEffectLease: ActiveBackendSideEffectLease | undefined;
     try {
       const admittedSource = this.#store.getSession(input.sourceSessionId);
+      const admittedTarget = this.#store.getTarget(admittedSource.descriptor.targetId);
       this.assertInheritedSessionCreationReady(
         admittedSource.descriptor.backendId,
         {
-          ...(admittedSource.descriptor.providerId === undefined
-            ? {}
-            : { providerId: admittedSource.descriptor.providerId }),
+          // A native observation may know the Provider before the Query reports
+          // its selected model. That is not an explicit partial model selection;
+          // admit this same-Backend derivation only through the native-default gate.
           ...(admittedSource.descriptor.modelId === undefined
             ? {}
-            : { modelId: admittedSource.descriptor.modelId }),
+            : {
+                ...(admittedSource.descriptor.providerId === undefined ? {} : { providerId: admittedSource.descriptor.providerId }),
+                modelId: admittedSource.descriptor.modelId
+              }),
           fastMode: admittedSource.descriptor.fastMode
         },
         "The source task's model is unavailable for a new derived route."
@@ -3301,26 +3312,44 @@ export class SessionHost {
       const active = await this.activate(input.sourceSessionId);
       sideEffectLease = this.beginActiveBackendSideEffect(input.sourceSessionId, active, input.operationId);
       const source = sideEffectLease.stored;
+      this.assertSessionDerivationSource(source);
       const sourceContext = sideEffectLease.context;
-      // A native clone/fork may switch the current runtime to the derived history. Keep
-      // that transient binding out of the source product task's event stream.
-      const derivationContext: AdapterContext = { ...sourceContext, emit: async () => undefined };
+      this.assertSessionDerivationTarget(admittedTarget, source, sourceContext);
+      const sessionId = stableId("session", input.operationId);
+      const derivation: NativeSessionDerivation = {
+        sessionId,
+        recordBinding: (binding) => {
+          this.#store.recordNativeSessionDerivation({
+            operationId: claim.operation.id,
+            expectedBodyHash: claim.operation.bodyHash,
+            sourceSessionId: source.descriptor.id,
+            sourceBinding: source.descriptor.binding,
+            sessionId,
+            backendId: source.descriptor.backendId,
+            backendInstanceGeneration: active.backendInstanceGeneration,
+            targetId: source.descriptor.targetId,
+            effectiveWorkspaceRoot: sourceContext.target.workspaceRoot,
+            ...(sourceContext.target.remoteWorkspace === undefined
+              ? {}
+              : { remoteWorkspace: sourceContext.target.remoteWorkspace }),
+            binding
+          });
+        }
+      };
       const forkResult: NativeSessionForkResult | undefined = input.kind === "fork"
-        ? await active.adapter.fork(requiredEntryId(input.entryId), derivationContext)
+        ? await active.adapter.fork(requiredEntryId(input.entryId), sourceContext, derivation)
         : undefined;
-      this.assertActiveBackendSideEffectLease(sideEffectLease);
-      const binding = forkResult?.binding ?? await active.adapter.clone(derivationContext);
+      const binding = input.kind === "fork"
+        ? forkResult!.binding
+        : await active.adapter.clone(sourceContext, derivation);
+      const receipt = this.#store.findNativeSessionDerivation(claim.operation.id);
+      if (receipt === undefined || !sameNativeBinding(receipt.binding, binding)) {
+        throw new StoreError("The Backend did not register the returned derived native binding.");
+      }
       this.assertActiveBackendSideEffectLease(sideEffectLease);
       const forkEditorText = forkResult?.editorText === undefined
         ? undefined
         : redactSecrets(forkResult.editorText);
-      if (active.adapter.detachSession !== undefined) {
-        await active.adapter.detachSession(binding, { ...derivationContext, binding });
-      } else {
-        await active.adapter.closeSession(binding, { ...derivationContext, binding });
-      }
-      this.assertActiveBackendSideEffectLease(sideEffectLease);
-      const sessionId = stableId("session", input.operationId);
       this.#freezeToolPolicies?.(sessionId, source.descriptor.targetId);
       const now = Date.now();
       const execution = this.#store.completeAuthorizedDeferredEffectOperation(
@@ -3331,17 +3360,23 @@ export class SessionHost {
         (store) => {
           const currentSource = store.getSession(input.sourceSessionId);
           assertBindingFence(source, currentSource);
+          this.assertSessionDerivationSource(currentSource);
+          this.assertSessionDerivationTarget(admittedTarget, currentSource, sourceContext);
           if (
             store.getBackend(currentSource.descriptor.backendId).descriptor.instanceGeneration
             !== sideEffectLease!.backendInstanceGeneration
           ) throw staleBackendInstanceContextError();
-          if (currentSource.descriptor.deletedAt !== undefined) throw new Error("The source task was deleted while it was being derived.");
           const duplicate = store.findLiveSessionByNativeBinding(currentSource.descriptor.backendId, binding.opaqueRef);
           if (duplicate !== undefined) throw nativeBindingConflict(duplicate.descriptor.id);
           const created = store.createSession({
             ...currentSource.descriptor,
             id: sessionId,
             title: input.title.trim() || `${currentSource.descriptor.title} (${input.kind})`,
+            titleSource: "manual",
+            summary: undefined,
+            summarySourceCursor: undefined,
+            summaryUpdatedAt: undefined,
+            automationOrigin: undefined,
             binding,
             pinned: false,
             archived: false,
@@ -3356,7 +3391,7 @@ export class SessionHost {
             },
             createdAt: now,
             updatedAt: now
-          });
+          }, { derivationOperationId: claim.operation.id });
           store.appendEvent({
             id: stableId("event", `${input.operationId}:derived-session`),
             backendId: created.descriptor.backendId,
@@ -3394,19 +3429,141 @@ export class SessionHost {
           return { sessionId };
         }
       );
-      this.assertActiveBackendSideEffectLease(sideEffectLease);
-      if (this.#active.get(input.sourceSessionId) === active) this.#active.delete(input.sourceSessionId);
-      restoreSource = true;
       return execution;
     } catch (error) {
-      return this.failClaimedEffect(`${input.kind}_session`, claim.operation.id, claim.operation.bodyHash, error);
+      const failure = nestedOperationFailure(error);
+      const failed = this.#store.failEffectOperation(claim.operation.id, claim.operation.bodyHash, failure);
+      await this.cleanupNativeSessionDerivation(claim.operation.id);
+      this.recordDerivationFailure(`${input.kind}_session`, failure);
+      throw new OperationPreviouslyFailedError(claim.operation.id, failed.error);
     } finally {
       sideEffectLease?.release();
       releaseBackendAdmission?.();
-      if (restoreSource) {
-        void this.activate(input.sourceSessionId)
-          .catch((error: unknown) => this.recordFailure("restore_source_after_derive", error));
+    }
+  }
+
+  private assertSessionDerivationSource(source: StoredSession): void {
+    if (this.isReviewReadOnlySession(source.descriptor.id)) {
+      throw new StoreError("Reviewer Sessions cannot be attached, forked, or cloned.");
+    }
+    if (source.descriptor.deletedAt !== undefined) throw new StoreError("A deleted task cannot be derived.");
+    if (source.descriptor.worktree !== undefined) {
+      throw new JokoError({
+        code: "SESSION_DERIVATION_WORKTREE_UNAVAILABLE",
+        message: "Deriving a task in an isolated working copy is not available.",
+        phase: "session",
+        retryable: false,
+        stateMayHaveChanged: false,
+        recovery: "Choose a task outside an isolated working copy."
+      });
+    }
+  }
+
+  private assertSessionDerivationTarget(expected: StoredTarget, source: StoredSession, context: AdapterContext): void {
+    const current = this.#store.getTarget(expected.descriptor.id);
+    if (current.revision !== expected.revision) {
+      throw new RevisionConflictError("Target", expected.descriptor.id, expected.revision, current.revision);
+    }
+    if (
+      source.descriptor.targetId !== expected.descriptor.id
+      || source.descriptor.backendId !== expected.descriptor.backendId
+      || context.target.id !== expected.descriptor.id
+      || context.target.backendId !== expected.descriptor.backendId
+      || context.target.workspaceRoot !== expected.descriptor.workspaceRoot
+      || context.target.remoteWorkspace?.hostId !== expected.descriptor.remoteWorkspace?.hostId
+      || context.target.remoteWorkspace?.workspaceRoot !== expected.descriptor.remoteWorkspace?.workspaceRoot
+    ) throw new StoreError("The derivation workspace authority changed.");
+  }
+
+  private recordDerivationFailure(component: string, error: unknown): void {
+    try {
+      this.recordFailure(component, error);
+    } catch {
+      // Diagnostics are secondary to the already durable operation failure and
+      // cleanup receipt. A failed diagnostic must not replace that outcome.
+    }
+  }
+
+  private async cleanupNativeSessionDerivation(operationId: string): Promise<void> {
+    let claim: { readonly record: NativeSessionDerivationRecord; readonly token: string } | undefined;
+    let releaseAdmission: (() => void) | undefined;
+    try {
+      const current = this.#store.findNativeSessionDerivation(operationId);
+      if (current?.state !== "recorded") return;
+      const record = current;
+      const adapter = this.requireAdapter(record.backendId);
+      this.assertCurrentAdapterGeneration(record.backendId, adapter, record.backendInstanceGeneration);
+      // A failed live derivation still holds its original backend flight during
+      // shutdown. Startup cleanup instead acquires its own admission authority.
+      if (!this.#disposed) releaseAdmission = this.beginBackendAdmissionEffect(record.backendId);
+      const target = this.#store.getTarget(record.targetId).descriptor;
+      if (
+        target.backendId !== record.backendId
+        || target.workspaceRoot !== record.effectiveWorkspaceRoot
+        || target.remoteWorkspace?.hostId !== record.remoteWorkspace?.hostId
+        || target.remoteWorkspace?.workspaceRoot !== record.remoteWorkspace?.workspaceRoot
+      ) throw new StoreError("The derived native cleanup workspace authority changed.");
+      const controller = new AbortController();
+      const context: AdapterContext = {
+        sessionId: record.sessionId,
+        generation: record.binding.generation,
+        backendInstanceGeneration: record.backendInstanceGeneration,
+        target,
+        binding: record.binding,
+        operationId: record.operationId,
+        signal: controller.signal,
+        emit: async () => undefined,
+        requestInteraction: async () => {
+          throw new StoreError("Native derivation cleanup cannot request an interaction.");
+        },
+        artifactCapacityBytes: this.#artifactStore.maximumBlobBytes,
+        storeArtifact: async () => {
+          throw new StoreError("Native derivation cleanup cannot create an artifact.");
+        }
+      };
+      if (adapter.supportsDetachedSessionDeletion?.(context) !== true) {
+        throw new StoreError("The Backend cannot clean up a detached derived native task.");
       }
+      claim = this.#store.claimNativeSessionDerivationCleanup({ operationId, expectedRevision: current.revision });
+      const calls = this.#nativeDerivationCleanupCalls.get(record.backendId) ?? new Set<AbortController>();
+      calls.add(controller);
+      this.#nativeDerivationCleanupCalls.set(record.backendId, calls);
+      const releaseCall = () => {
+        calls.delete(controller);
+        if (calls.size === 0 && this.#nativeDerivationCleanupCalls.get(record.backendId) === calls) {
+          this.#nativeDerivationCleanupCalls.delete(record.backendId);
+        }
+      };
+      let deletion: Promise<void>;
+      try {
+        deletion = adapter.deleteSession(record.binding, context);
+      } catch (error) {
+        releaseCall();
+        throw error;
+      }
+      // A timed-out call still fences replacement until its native promise
+      // settles. Its late handlers only release this memory owner, never Store.
+      void deletion.then(releaseCall, releaseCall);
+      await nativeDerivationCleanupDeadline(deletion, controller);
+      controller.signal.throwIfAborted();
+      this.#store.finishNativeSessionDerivationCleanup({ operationId, token: claim.token, outcome: "cleaned" });
+    } catch (error) {
+      if (claim !== undefined) {
+        try {
+          this.#store.finishNativeSessionDerivationCleanup({
+            operationId,
+            token: claim.token,
+            outcome: "cleanup_unknown",
+            failureCode: "native_session_derivation_cleanup_unknown"
+          });
+        } catch {
+          // The durable claim remains reserved; startup converts an unfinished
+          // claim to unknown instead of repeating a possibly completed delete.
+        }
+      }
+      this.recordDerivationFailure("native_session_derivation_cleanup", error);
+    } finally {
+      releaseAdmission?.();
     }
   }
 
@@ -4200,6 +4357,13 @@ export class SessionHost {
     if (prompt.images.length > 0) required.add("input.image");
     if (prompt.files.length > 0) required.add("input.file");
     if (prompt.mentions.length > 0) required.add("input.mention");
+    for (const mention of prompt.mentions) {
+      const option = mention.kind === "workspace_directory" ? "workspace_directory"
+        : mention.kind === "workspace_file" && mention.lineRange !== undefined ? "workspace_line_range" : undefined;
+      if (option !== undefined && capabilities.get("input.mention")?.options?.includes(option) !== true) {
+        throw inputCapabilityError("INPUT_CAPABILITY_UNAVAILABLE", `The selected Backend does not support ${option} mentions.`);
+      }
+    }
     if (required.size === 0) {
       throw inputCapabilityError(
         "INPUT_EMPTY",
@@ -4569,9 +4733,13 @@ export class SessionHost {
       lease.release();
     }
     const events: PersistedEvent[] = [];
+    let portableMessageCount = 0;
     visitVisibleSessionEvents(this.#store, input.sessionId, (event) => {
-      if (event.payload.type !== "message_complete" || event.payload.automaticContinuation !== undefined) return;
-      if (events.length >= MAXIMUM_PORTABLE_SESSION_MESSAGES) {
+      if (event.payload.type === "message_complete") {
+        if (event.payload.automaticContinuation !== undefined) return;
+        portableMessageCount += 1;
+      } else if (event.payload.type !== "artifact" && !(event.payload.type === "status" && event.payload.key === "artifact_unavailable")) return;
+      if (portableMessageCount > MAXIMUM_PORTABLE_SESSION_MESSAGES || events.length >= MAXIMUM_PORTABLE_SESSION_MESSAGES + 10_000) {
         throw portableSessionProjectionLimitError();
       }
       events.push(event);
@@ -4831,25 +4999,149 @@ export class SessionHost {
 
   async navigateTree(
     sessionId: string,
-    entryId: string,
+    target: import("@joko/core").NativeNavigationTarget,
     summarize: boolean,
-    customInstructions?: string
-  ): Promise<void> {
-    if (this.isReviewReadOnlySession(sessionId)) throw new StoreError("Reviewer history navigation is disabled.");
-    const active = await this.activate(sessionId);
-    const lease = this.beginActiveBackendSideEffect(sessionId, active);
+    customInstructions: string | undefined,
+    expectedGeneration: number | undefined,
+    authority: {
+      readonly connection: ConnectionRecord;
+      readonly operationId: string;
+      readonly protocol: { readonly kind: "internal" }
+        | { readonly kind: "connect"; readonly body: unknown; readonly precondition: (store: OperationalStore) => void };
+    }
+  ): Promise<OperationExecution<{ readonly accepted: true; readonly resultCase: "acknowledgement" }>> {
+    let lease: ActiveBackendSideEffectLease | undefined;
+    let navigation: NativeSessionNavigationResult | undefined;
+    let admittedTarget: StoredTarget | undefined;
+    let nativeNavigationConfirmed = false;
+    const allowance = { lifecycleOperationId: authority.operationId };
+    const syncUnknown = () => new JokoError({
+      code: "NATIVE_NAVIGATION_SYNC_UNKNOWN",
+      message: "Native history navigation completed, but the resulting task history could not be confirmed.",
+      phase: "native_history_sync", retryable: false, stateMayHaveChanged: true,
+      recovery: "Refresh the task history before further changes. Do not repeat the native navigation automatically."
+    });
     try {
-      await active.adapter.navigateTree(entryId, summarize, lease.context, customInstructions);
-      this.assertActiveBackendSideEffectLease(lease);
-      await this.synchronizeNativeHistory(sessionId);
-      this.assertActiveBackendSideEffectLease(lease);
-      await this.refreshRuntimeCommands(sessionId, active)
-        .catch((error: unknown) => this.recordFailure("runtime_commands_navigation_sync", error));
-      this.assertActiveBackendSideEffectLease(lease);
-      await this.refreshNativeStateBestEffort(sessionId, active, "native_state_navigation_sync");
-      this.assertActiveBackendSideEffectLease(lease);
+      return await this.mutate({
+        connection: authority.connection, operationId: authority.operationId,
+        kind: authority.protocol.kind === "internal" ? "navigate_session" : "navigateSessionBranch",
+        body: authority.protocol.kind === "connect" ? authority.protocol.body
+          : { sourceSessionId: sessionId, target, summarize, customInstructions, expectedGeneration },
+        sessionLifecycleFenceId: sessionId,
+        precondition: (store) => {
+          if (authority.protocol.kind === "connect") authority.protocol.precondition(store);
+          if (this.isReviewReadOnlySession(sessionId)) throw new StoreError("Reviewer history navigation is disabled.");
+          const source = store.getSession(sessionId);
+          if (source.descriptor.deletedAt !== undefined) throw new StoreError("Deleted task history cannot be navigated.");
+          if (expectedGeneration !== undefined && source.descriptor.binding.generation !== expectedGeneration) {
+            throw new StaleGenerationError(source.descriptor.binding.generation, expectedGeneration);
+          }
+          const descriptor = store.getBackend(source.descriptor.backendId).descriptor;
+          const capability = target.kind === "session_start" ? "session.rewind_to_start" : "session.rewind";
+          if (descriptor.capabilities.get("session.rewind")?.supported !== true || descriptor.capabilities.get(capability)?.supported !== true) {
+            throw new StoreError("The requested native navigation target is unavailable.");
+          }
+          if (lease !== undefined) {
+            assertBindingFence(lease.stored, source);
+            const currentTarget = store.getTarget(admittedTarget!.descriptor.id);
+            if (currentTarget.revision !== admittedTarget!.revision) {
+              throw new RevisionConflictError("Target", currentTarget.descriptor.id, admittedTarget!.revision, currentTarget.revision);
+            }
+            if (descriptor.instanceGeneration !== lease.backendInstanceGeneration) throw staleBackendInstanceContextError();
+          }
+        },
+        effect: async () => {
+          const source = this.#store.getSession(sessionId);
+          if (this.#sessionRuntimeMutationMustDefer(sessionId)
+            || this.#store.listQueueItems({ sessionId, states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"], limit: 1 }).length > 0
+            || this.#store.listInteractions({ sessionId, status: "open", limit: 1 }).length > 0
+            || this.#store.hasActiveSessionBackgroundTasks(sessionId)) {
+            throw new StoreError("Native history navigation requires an idle task.");
+          }
+          admittedTarget = this.#store.getTarget(source.descriptor.targetId);
+          const active = await this.activateWithPolicy(sessionId, false, false, authority.operationId);
+          lease = this.beginActiveBackendSideEffect(sessionId, active, authority.operationId, allowance);
+          if (expectedGeneration !== undefined && lease.stored.descriptor.binding.generation !== expectedGeneration) {
+            throw new StaleGenerationError(lease.stored.descriptor.binding.generation, expectedGeneration);
+          }
+          if (this.#store.getTarget(admittedTarget.descriptor.id).revision !== admittedTarget.revision) {
+            throw new StoreError("The navigation workspace authority changed before dispatch.");
+          }
+          try {
+            navigation = await active.adapter.navigateTree(target, summarize, lease.context, customInstructions, {
+              recordBinding: (binding) => {
+                const operation = this.#store.getOperation(authority.operationId);
+                this.#store.recordNativeSessionDerivation({
+                  operationId: operation.id, expectedBodyHash: operation.bodyHash,
+                  sourceSessionId: sessionId, sessionId,
+                  sourceBinding: lease!.stored.descriptor.binding,
+                  backendId: lease!.backendId, backendInstanceGeneration: lease!.backendInstanceGeneration,
+                  targetId: lease!.stored.descriptor.targetId,
+                  effectiveWorkspaceRoot: lease!.context.target.workspaceRoot,
+                  ...(lease!.context.target.remoteWorkspace === undefined ? {} : { remoteWorkspace: lease!.context.target.remoteWorkspace }),
+                  binding
+                });
+              }
+            });
+            nativeNavigationConfirmed = true;
+            this.assertActiveBackendSideEffectLease(lease);
+            if (navigation.kind === "replacement") {
+              const receipt = this.#store.findNativeSessionDerivation(authority.operationId);
+              if (receipt === undefined || !sameNativeBinding(receipt.binding, navigation.binding)) {
+                throw new StoreError("Native navigation did not register its exact replacement binding.");
+              }
+              // Validate the projection before retiring the source runtime. Adoption
+              // and publication use these same SDK-confirmed entries in one transaction.
+              projectNativeHistory(sessionId, navigation.binding.opaqueRef, navigation.nativeHistory);
+              await active.adapter.closeSession(lease.stored.descriptor.binding, lease.context);
+              this.assertActiveBackendSideEffectLease(lease);
+              if (this.#active.get(sessionId) === active) this.#active.delete(sessionId);
+              this.#nativeCompactions.delete(sessionId);
+              this.clearTurnOverrideLeases(sessionId);
+              this.#releaseSessionTools(sessionId);
+              await Promise.all([
+                this.#nativeHistoryTails.get(sessionId) ?? Promise.resolve(),
+                this.#runtimeCommandTails.get(sessionId) ?? Promise.resolve(),
+                this.#nativeStateTails.get(sessionId) ?? Promise.resolve(),
+                ...(this.#inflightEmissions.get(sessionId) ?? [])
+              ]);
+            } else {
+              if (this.#store.findNativeSessionDerivation(authority.operationId) !== undefined) {
+                throw new StoreError("In-place navigation unexpectedly registered a replacement binding.");
+              }
+              await this.synchronizeNativeHistory(sessionId, allowance);
+              this.assertActiveBackendSideEffectLease(lease);
+              await this.refreshRuntimeCommands(sessionId, active, allowance)
+                .catch((error: unknown) => this.recordFailure("runtime_commands_navigation_sync", error));
+              await this.refreshNativeStateBestEffort(sessionId, active, "native_state_navigation_sync", allowance);
+              this.assertActiveBackendSideEffectLease(lease);
+            }
+          } catch (error) {
+            if (!nativeNavigationConfirmed) throw error;
+            throw syncUnknown();
+          }
+        },
+        commit: (store) => {
+          if (navigation === undefined) throw new StoreError("Native navigation has no confirmed outcome.");
+          if (navigation.kind === "replacement") {
+            const current = store.getSession(sessionId);
+            const replaced = store.updateSession(sessionId, { binding: navigation.binding }, current.revision, Date.now(), {
+              derivationOperationId: authority.operationId
+            });
+            this.appendNativeHistory(store, replaced.descriptor, navigation.nativeHistory, authority.operationId);
+          }
+          return { accepted: true, resultCase: "acknowledgement" } as const;
+        },
+        complete: async (commit) => {
+          try { return commit(); }
+          catch (error) { if (nativeNavigationConfirmed) throw syncUnknown(); throw error; }
+        }
+      });
+    } catch (error) {
+      await this.cleanupNativeSessionDerivation(authority.operationId);
+      throw error;
     } finally {
-      lease.release();
+      lease?.release();
     }
   }
 
@@ -5119,6 +5411,9 @@ export class SessionHost {
   }
 
   #assertBackendReplacementIdle(backendId: string): void {
+    if ((this.#nativeDerivationCleanupCalls.get(backendId)?.size ?? 0) > 0) {
+      throw new StoreError("A Backend cannot be replaced while a derived native cleanup has not settled.");
+    }
     if ((this.#backendSideEffectFlights.get(backendId)?.size ?? 0) > 0) {
       throw new StoreError("A Backend can be replaced only after every native side effect has settled.");
     }
@@ -6354,6 +6649,9 @@ export class SessionHost {
   async dispose(): Promise<void> {
     if (this.#disposed) return;
     this.#disposed = true;
+    for (const calls of this.#nativeDerivationCleanupCalls.values()) {
+      for (const controller of calls) controller.abort(new StoreError("Native derivation cleanup was interrupted by shutdown."));
+    }
     for (const pending of this.#pendingInteractions.values()) {
       clearPendingInteractionExpiry(pending);
       pending.resolve({ kind: "cancelled" });
@@ -6391,6 +6689,7 @@ export class SessionHost {
       [...this.#backendSideEffectFlights.values()].flatMap((flights) => [...flights])
     );
     this.#backendSideEffectFlights.clear();
+    this.#nativeDerivationCleanupCalls.clear();
     this.#activeEffectFlights.clear();
     this.#sessionLifecycleBackendAdmissions.clear();
     this.#backendAdmissionEffects.clear();
@@ -6527,6 +6826,7 @@ export class SessionHost {
     const sessionId = stableId("session", input.operationId);
     let createdBinding: NativeSessionBinding | undefined;
     let cleanupContext: AdapterContext | undefined;
+    const stagedPortableArtifacts: string[] = [];
     let acquiredWorktree = false;
     let createdLiveRuntime = false;
     let replaced: StoredSession | undefined;
@@ -6666,8 +6966,10 @@ export class SessionHost {
       const materialized = await materializePortableSessionImport(prepared, async (media) => {
         const stored = await this.#artifactStore.ingestBytes(media.bytes, {
           ...(media.fileName === undefined ? {} : { fileName: media.fileName }),
-          mimeType: media.mimeType
+          mimeType: media.mimeType,
+          expiresAt: Date.now() + 10 * 60_000
         });
+        stagedPortableArtifacts.push(stored.id);
         return {
           id: stored.id,
           sha256: stored.sha256,
@@ -6755,6 +7057,7 @@ export class SessionHost {
             initialActivation,
             now
           );
+          adoptPortableSessionArtifacts(store, materialized, sessionId);
           materialized.events.forEach((event, index) => {
             store.appendEvent({
               backendId: descriptor.backendId,
@@ -6767,7 +7070,8 @@ export class SessionHost {
               payload: event.payload,
               metadata: {
                 namespace: "joko.portable_import",
-                fields: { sourceSha256: input.package.sha256, messageIndex: index }
+                fields: { sourceSha256: input.package.sha256, messageIndex: index,
+                  [NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD]: nativeBindingFingerprint(descriptor.binding.opaqueRef) }
               }
             });
           });
@@ -6860,6 +7164,7 @@ export class SessionHost {
       }
       return this.failClaimedEffect("import_portable_session", claim.operation.id, claim.operation.bodyHash, error);
     } finally {
+      this.#store.releaseArtifactStaging(stagedPortableArtifacts);
       releaseBackendAdmission?.();
     }
   }
@@ -8535,26 +8840,26 @@ export class SessionHost {
           const stored = this.#store.getSession(sessionId);
           const target = this.targetForSession(stored);
           if (this.#workspaceCapture !== undefined && !reviewReadOnly) {
-            const nativeLeafId = active.adapter.getTree === undefined
-              ? undefined
-              : await active.adapter.getTree(this.contextFor(
-                  stored,
-                  run.descriptor.id,
-                  attemptId,
-                  item.operationId,
-                  undefined,
-                  item.backendInstanceGeneration
-                ))
-                .then((tree) => tree.leafId)
-                .catch((error: unknown) => {
-                  this.recordFailure("workspace-dialogue-baseline", error);
-                  return undefined;
-                });
+            let navigationAnchor: import("@joko/core").NativeNavigationAnchor | undefined;
+            if (active.adapter.getNativeHistoryProjection !== undefined) {
+              const captureLease = this.beginActiveBackendSideEffect(sessionId, active);
+              try {
+                const history = await active.adapter.getNativeHistoryProjection(captureLease.context);
+                this.assertActiveBackendSideEffectLease(captureLease);
+                const navigationTarget = history.activeNavigationTarget;
+                const backend = this.#store.getBackend(stored.descriptor.backendId).descriptor;
+                if (navigationTarget !== undefined && backend.capabilities.get("session.rewind")?.supported === true
+                  && (navigationTarget.kind !== "session_start" || backend.capabilities.get("session.rewind_to_start")?.supported === true)) {
+                  navigationAnchor = { target: navigationTarget, generation: captureLease.stored.descriptor.binding.generation };
+                }
+              } catch (error) { this.recordFailure("workspace-dialogue-baseline", error); }
+              finally { captureLease.release(); }
+            }
             await this.#workspaceCapture.captureBeforeRun({
               sessionId,
               runId: run.descriptor.id,
               target,
-              ...(nativeLeafId === undefined ? {} : { nativeLeafId })
+              ...(navigationAnchor === undefined ? {} : { navigationAnchor })
             })
               .catch((error: unknown) => this.recordFailure("workspace-baseline", error));
           }
@@ -8758,7 +9063,7 @@ export class SessionHost {
     backendInstanceGeneration?: number
   ): AdapterContext {
     const runtimePolicy = this.#store.findSessionRuntimePolicy(stored.descriptor.id)?.policy;
-    return this.makeContext(
+    const context = this.makeContext(
       stored.descriptor.id,
       this.targetForSession(stored),
       stored.descriptor.binding.generation,
@@ -8771,6 +9076,9 @@ export class SessionHost {
       stored.descriptor.appendSystemPrompt,
       backendInstanceGeneration
     );
+    const { providerId, modelId } = stored.descriptor;
+    return providerId === undefined || modelId === undefined ? context
+      : { ...context, modelSelection: { providerId, modelId } };
   }
 
   private provisionalContext(
@@ -9524,12 +9832,7 @@ export class SessionHost {
       ? Math.round(usage.cost * 1_000_000)
       : undefined;
     const costRates = priceOverride === undefined
-      ? model === undefined ? undefined : {
-          inputMicrosPerMillion: modelCostMicros(model.cost.input),
-          outputMicrosPerMillion: modelCostMicros(model.cost.output),
-          cacheReadMicrosPerMillion: modelCostMicros(model.cost.cacheRead),
-          cacheWriteMicrosPerMillion: modelCostMicros(model.cost.cacheWrite)
-        }
+      ? model === undefined ? undefined : modelUsageCostRates(model, usage)
       : {
           inputMicrosPerMillion: priceOverride.inputCostMicrosPerMillion,
           outputMicrosPerMillion: priceOverride.outputCostMicrosPerMillion,
@@ -11561,6 +11864,26 @@ function validateAppendSystemPrompt(value: string | undefined): void {
   });
 }
 
+async function nativeDerivationCleanupDeadline(task: Promise<void>, controller: AbortController): Promise<void> {
+  const { signal } = controller;
+  let onAbort: (() => void) | undefined;
+  const interrupted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
+  });
+  const timer = setTimeout(() => {
+    controller.abort(new StoreError("Native derivation cleanup exceeded its deadline."));
+  }, NATIVE_DERIVATION_CLEANUP_TIMEOUT_MS);
+  try {
+    await Promise.race([task, interrupted]);
+    signal.throwIfAborted();
+  } finally {
+    clearTimeout(timer);
+    if (onAbort !== undefined) signal.removeEventListener("abort", onAbort);
+  }
+}
+
 class BackendRetirementTimeoutError extends StoreError {}
 
 async function backendRetirementDeadline<T>(
@@ -11777,6 +12100,8 @@ function sameUsageSnapshot(left: UsageSnapshot | undefined, right: UsageSnapshot
     left.totalTokens === right.totalTokens &&
     left.contextTokens === right.contextTokens &&
     left.contextWindow === right.contextWindow &&
+    left.pricingContext?.inputTokens === right.pricingContext?.inputTokens &&
+    left.pricingContext?.fastMode === right.pricingContext?.fastMode &&
     left.cost === right.cost;
 }
 
@@ -11839,6 +12164,20 @@ function inputCapabilityError(code: string, message: string): JokoError {
     stateMayHaveChanged: false,
     recovery: "Refresh task capabilities and submit input supported by the selected Backend."
   });
+}
+
+function modelUsageCostRates(model: ProviderModel, usage: UsageSnapshot) {
+  const pricingContext = usage.pricingContext;
+  const longContext = model.pricing?.longContext;
+  const tier = longContext !== undefined && pricingContext !== undefined
+    && pricingContext.inputTokens > longContext.inputTokenThreshold ? longContext : undefined;
+  const fastMultiplier = pricingContext?.fastMode === true ? model.pricing?.fastModeMultiplier ?? 1 : 1;
+  return {
+    inputMicrosPerMillion: modelCostMicros(model.cost.input * fastMultiplier * (tier?.inputMultiplier ?? 1)),
+    outputMicrosPerMillion: modelCostMicros(model.cost.output * fastMultiplier * (tier?.outputMultiplier ?? 1)),
+    cacheReadMicrosPerMillion: modelCostMicros(model.cost.cacheRead * fastMultiplier * (tier?.cacheReadMultiplier ?? 1)),
+    cacheWriteMicrosPerMillion: modelCostMicros(model.cost.cacheWrite * fastMultiplier * (tier?.cacheWriteMultiplier ?? 1))
+  };
 }
 
 function modelCostMicros(value: number): number {

@@ -4,10 +4,43 @@ import {
   parseAccountRateLimits,
   parseModels,
   parseThreadList,
-  parseTurnSteer
+  parseThreadResult,
+  parseFullTurnPage,
+  parseTurnSteer,
+  type JsonValue
 } from "./protocol.js";
 
 describe("Codex stable protocol guards", () => {
+  it("preserves the published history mode and rejects unknown or null modes", () => {
+    for (const historyMode of ["paginated", "legacy"] as const) {
+      expect(parseThreadResult({ thread: { id: "thread", turns: [], historyMode } }).historyMode).toBe(historyMode);
+    }
+    expect(parseThreadResult({ thread: { id: "thread", turns: [] } }).historyMode).toBe("legacy");
+    for (const historyMode of [null, "unknown", 1]) expect(() => parseThreadResult({ thread: { id: "thread", turns: [], historyMode } })).toThrow();
+  });
+  it("accepts only bounded complete turn pages and preserves opaque direction cursors", () => {
+    const turn = { id: "turn", status: "completed", items: [{ type: "agentMessage", id: "item", text: "complete" }] };
+    const bounds = { maximumTurns: 1, maximumItems: 1 };
+    for (const full of [turn, { ...turn, itemsView: "full" }]) {
+      expect(parseFullTurnPage({ data: [full], nextCursor: "opaque-next", backwardsCursor: "opaque-anchor" }, bounds))
+        .toMatchObject({ turns: [turn], nextCursor: "opaque-next", backwardsCursor: "opaque-anchor" });
+    }
+    for (const incomplete of ["summary", "notLoaded", null, "unknown"]) {
+      expect(() => parseFullTurnPage({ data: [{ ...turn, itemsView: incomplete }] }, bounds)).toThrow();
+    }
+    const malformedPages: JsonValue[] = [
+      { data: [{ id: "turn", status: "completed" }] },
+      { data: [{ ...turn, id: "unsafe\u0000id" }] },
+      { data: [turn, { ...turn, id: "turn-two" }] },
+      { data: [{ ...turn, items: [...turn.items, { type: "agentMessage", id: "two" }] }] },
+      { data: [turn], nextCursor: "" },
+      { data: [], nextCursor: "unproven-continuation" },
+      { data: [turn], backwardsCursor: 3 }
+    ];
+    for (const malformed of malformedPages) expect(() => parseFullTurnPage(malformed, bounds)).toThrow();
+    expect(parseFullTurnPage({ data: [], nextCursor: null, backwardsCursor: null }, bounds)).toEqual({ turns: [] });
+  });
+
   it("bounds model and thread pages to the requested page size", () => {
     const model = {
       id: "record-one",

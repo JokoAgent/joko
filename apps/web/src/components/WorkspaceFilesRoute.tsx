@@ -776,7 +776,7 @@ export function WorkspaceFilesRoute({
         matches: (identity) => identity.sessionId === session.id
       });
       if (!allowed) return;
-      const sessionId = await controllerRef.current.createSession({
+      const { sessionId } = await controllerRef.current.createSession({
         targetId: target.id,
         name: t("session.newTaskName"),
         nativeStart: { kind: "fresh" },

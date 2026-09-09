@@ -60,6 +60,8 @@ export function projectCodexNativeHistory(
   return {
     events,
     ...(parentEntryId === undefined ? {} : { activeEntryId: parentEntryId }),
+    ...(thread.historyMode !== "paginated" ? {} : { activeNavigationTarget: parentEntryId === undefined
+      ? { kind: "session_start" as const } : { kind: "native_entry" as const, entryId: parentEntryId } }),
     activeLineage,
     activeEntryMetadata: activeEntryMetadata(parentEntryId)
   };
@@ -98,6 +100,11 @@ export function projectCodexNativeHistory(
       events.push({
         nativeEntryId: entryId,
         ...(parentId === undefined ? {} : { nativeParentEntryId: parentId }),
+        ...(thread.historyMode !== "paginated" || itemType !== "userMessage" || turn.items[0]?.id !== entryId ? {} : {
+          nativeRewindBefore: turn === thread.turns[0]
+            ? { kind: "session_start" as const }
+            : { kind: "native_entry" as const, entryId: parentId! }
+        }),
         projectionKind: projection.kind,
         contentIndex: projection.contentIndex,
         payload: projection.payload,

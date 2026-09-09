@@ -65,7 +65,6 @@ describe("isolated Review card", () => {
     expect(unavailable).toContain("Recheck evidence");
     expect(current).not.toContain("Recheck evidence");
     expect(running).not.toContain("Recheck evidence");
-    expect(translate("zh-CN", "review.reobserve")).toBe("重新检查证据");
   });
 
   it("keeps the durable conclusion visible and prevents duplicate checks while one is pending", async () => {

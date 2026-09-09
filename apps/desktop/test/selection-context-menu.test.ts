@@ -1,3 +1,4 @@
+import { SELECTION_MENU_LABELS } from "./i18n/menu-corpus.js";
 import { describe, expect, it, vi } from "vitest";
 import type { BrowserWindow, ContextMenuParams, MenuItemConstructorOptions } from "electron";
 
@@ -36,11 +37,11 @@ describe("selection context menu", () => {
 
     expect(template.map((item) => item.role ?? item.label ?? item.type)).toEqual([
       "copy",
-      "添加到对话",
+      SELECTION_MENU_LABELS.addToChat,
       "separator",
-      "在网页中搜索“selected words”"
+      SELECTION_MENU_LABELS.searchSelectedWords
     ]);
-    expect(template[0]?.label).toBe("复制");
+    expect(template[0]?.label).toBe(SELECTION_MENU_LABELS.copy);
     expect(template.some((item) => item.role === "reload" || item.role === "toggleDevTools")).toBe(false);
   });
 

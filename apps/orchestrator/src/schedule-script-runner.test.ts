@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { MULTILINGUAL_FIXTURES } from "./i18n/multilingual-fixtures.js";
 
 import {
   ScheduleScriptExecutionError,
@@ -190,19 +191,19 @@ describe("executeScheduleScript", () => {
 
   it("preserves UTF-8 characters split across stdout chunks", async () => {
     const result = await executeScheduleScript(baseInput(`
-      const output=Buffer.from(JSON.stringify({protocol:"${protocol}",type:"complete",resultText:"你好😀"})+"\\n","utf8");
+      const output=Buffer.from(JSON.stringify({protocol:"${protocol}",type:"complete",resultText:${JSON.stringify(MULTILINGUAL_FIXTURES.greeting)}})+"\\n","utf8");
       const marker=Buffer.from("😀","utf8");
       const split=output.indexOf(marker)+1;
       process.stdout.write(output.subarray(0,split));
       setTimeout(()=>process.stdout.write(output.subarray(split)),20);
     `));
-    expect(result.resultText).toBe("你好😀");
+    expect(result.resultText).toBe(MULTILINGUAL_FIXTURES.greeting);
   });
 
   it("caps and redacts result text and stderr without splitting output contracts", async () => {
     const result = await executeScheduleScript(baseInput(`
-      process.stderr.write("password=hunter2 "+"错".repeat(40000));
-      process.stdout.write(JSON.stringify({protocol:"${protocol}",type:"complete",resultText:"api_key=sk-abcdefghijklmnop "+"界".repeat(9000)})+"\\n");
+      process.stderr.write("password=hunter2 "+${JSON.stringify(MULTILINGUAL_FIXTURES.errorCharacter)}.repeat(40000));
+      process.stdout.write(JSON.stringify({protocol:"${protocol}",type:"complete",resultText:"api_key=sk-abcdefghijklmnop "+${JSON.stringify(MULTILINGUAL_FIXTURES.limitCharacter)}.repeat(9000)})+"\\n");
     `));
 
     expect(Buffer.byteLength(result.resultText ?? "", "utf8")).toBeLessThanOrEqual(8 * 1024);

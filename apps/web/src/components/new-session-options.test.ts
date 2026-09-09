@@ -6,7 +6,7 @@ describe("new-session target choices", () => {
   const capable = backend("capable", "healthy", true);
   const unavailable = backend("offline", "unavailable", true);
   const textless = backend("textless", "healthy", false);
-  const target = { id: "target-1", backendId: "capable", name: "Repo", workspaceId: "workspace-1", workspaceName: "Repo", trusted: true, pinned: false, archived: false } satisfies TargetView;
+  const target = { id: "target-1", backendId: "capable", name: "Repo", workspaceId: "workspace-1", revision: 1n, workspaceName: "Repo", trusted: true, pinned: false, archived: false } satisfies TargetView;
 
   it("offers managed dialogue only through available text-capable backends", () => {
     expect(dialogueBackends([unavailable, textless, capable]).map((item) => item.id)).toEqual(["capable"]);

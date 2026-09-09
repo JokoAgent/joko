@@ -47,6 +47,9 @@
 .desktop-page-search-bar .icon-button { width: 24px; height: 24px; }
 .desktop-page-search-bar .icon-button svg { width: 14px; height: 14px; }
 
+::highlight(joko-page-search) { background: var(--accent-soft); color: var(--text); }
+::highlight(joko-page-search-active) { background: var(--accent); color: var(--accent-contrast); }
+
 @media (max-width: 420px) {
   .desktop-page-search-bar { top: 48px; right: 10px; width: calc(100vw - 20px); }
 }

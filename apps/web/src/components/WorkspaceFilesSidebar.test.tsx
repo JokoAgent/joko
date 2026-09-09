@@ -1,12 +1,33 @@
+// @vitest-environment jsdom
+
+import { unicodeCorpus } from "../i18n/test-corpus.js";
+import { act, createRef } from "react";
+import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   WorkspaceFilesSidebar,
   clampWorkspaceFilesMenuPosition,
   splitWorkspaceSearchPreview,
-  workspaceSearchErrorText
+  workspaceSearchErrorText,
+  type WorkspaceFilesSidebarHandle
 } from "./WorkspaceFilesSidebar.js";
+import type { WorkspaceFilesEntryView } from "./workspace-tree-state.js";
+
+const roots: Root[] = [];
+
+beforeEach(() => {
+  (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+});
+
+afterEach(async () => {
+  for (const root of roots.splice(0)) await act(async () => root.unmount());
+  document.body.replaceChildren();
+  localStorage.clear();
+  Reflect.deleteProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT");
+  vi.useRealTimers();
+});
 
 async function* emptyWorkspaceSearch() {
   yield {
@@ -78,6 +99,90 @@ describe("WorkspaceFilesSidebar static document-host surface", () => {
   });
 });
 
+describe("WorkspaceFilesSidebar directory refresh lifecycle", () => {
+  it("coalesces watcher bursts and keeps one successor read without starving the active request", async () => {
+    vi.useFakeTimers();
+    const host = mountDirectoryHost();
+    await host.render("workspace-a");
+    expect(host.requests).toHaveLength(1);
+
+    await host.invalidateBurst();
+    expect(host.requests).toHaveLength(1);
+    await act(async () => vi.advanceTimersByTimeAsync(50));
+    await host.invalidateBurst();
+    await act(async () => vi.advanceTimersByTimeAsync(50));
+    expect(host.requests).toHaveLength(1);
+
+    await act(async () => host.requests[0]!.resolve([{ path: "stale.txt", name: "stale.txt", kind: "file" }]));
+    expect(host.requests).toHaveLength(2);
+    expect(host.container.textContent).not.toContain("stale.txt");
+
+    await host.invalidateBurst();
+    await act(async () => vi.advanceTimersByTimeAsync(50));
+    expect(host.requests).toHaveLength(2);
+    await act(async () => host.requests[1]!.resolve([]));
+    expect(host.requests).toHaveLength(3);
+    await act(async () => host.requests[2]!.resolve([{ path: "latest.txt", name: "latest.txt", kind: "file" }]));
+    expect(host.container.textContent).toContain("latest.txt");
+    await act(async () => vi.advanceTimersByTimeAsync(500));
+    expect(host.requests).toHaveLength(3);
+  });
+
+  it("discards a queued old-workspace refresh when the workspace changes", async () => {
+    vi.useFakeTimers();
+    const host = mountDirectoryHost();
+    await host.render("workspace-a");
+    await host.invalidateBurst();
+    await act(async () => vi.advanceTimersByTimeAsync(50));
+    await host.render("workspace-b");
+    expect(host.requests.map((request) => request.workspaceId)).toEqual(["workspace-a", "workspace-b"]);
+    await act(async () => host.requests[0]!.resolve([{ path: "old.txt", name: "old.txt", kind: "file" }]));
+    await act(async () => vi.advanceTimersByTimeAsync(500));
+    expect(host.requests).toHaveLength(2);
+    await act(async () => host.requests[1]!.resolve([{ path: "current.txt", name: "current.txt", kind: "file" }]));
+    expect(host.container.textContent).toContain("current.txt");
+    expect(host.container.textContent).not.toContain("old.txt");
+  });
+});
+
+function mountDirectoryHost() {
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  roots.push(root);
+  const ref = createRef<WorkspaceFilesSidebarHandle>();
+  const requests: Array<{
+    readonly workspaceId: string;
+    readonly resolve: (entries: readonly WorkspaceFilesEntryView[]) => void;
+  }> = [];
+  const loadDirectory = ({ workspaceId }: { readonly workspaceId: string }) => new Promise<readonly WorkspaceFilesEntryView[]>((resolve) => {
+    requests.push({ workspaceId, resolve });
+  });
+  return {
+    container,
+    requests,
+    render: async (workspaceId: string) => {
+      await act(async () => root.render(<WorkspaceFilesSidebar
+        ref={ref}
+        workspaceId={workspaceId}
+        workspaceDisplayName={workspaceId}
+        loadDirectory={loadDirectory}
+        searchWorkspace={emptyWorkspaceSearch}
+        onSelectFile={() => undefined}
+        onOpenSearchMatch={() => undefined}
+        onLeaveDocumentMode={() => undefined}
+      />));
+    },
+    invalidateBurst: async () => {
+      await act(async () => {
+        for (let index = 0; index < 25; index += 1) {
+          await ref.current!.invalidateChange({ kind: "created", path: `file-${index}.txt` });
+        }
+      });
+    }
+  };
+}
+
 describe("splitWorkspaceSearchPreview", () => {
   it("trims rg indentation and highlights every authoritative byte range", () => {
     expect(splitWorkspaceSearchPreview("   Foo foo FOO", [
@@ -99,11 +204,11 @@ describe("splitWorkspaceSearchPreview", () => {
   });
 
   it("maps UTF-8 offsets safely across CJK and astral Unicode without fake highlights", () => {
-    expect(splitWorkspaceSearchPreview("  前🐾后🐾", [{ startByte: 12, endByte: 16 }]).map(({ text, match }) => [text, match])).toEqual([
-      ["前🐾后", false],
+    expect(splitWorkspaceSearchPreview(unicodeCorpus.utf8SearchPreview, [{ startByte: 12, endByte: 16 }]).map(({ text, match }) => [text, match])).toEqual([
+      [unicodeCorpus.utf8SearchPrefix, false],
       ["🐾", true]
     ]);
-    expect(splitWorkspaceSearchPreview("前🐾后", [{ startByte: 4, endByte: 7 }]).every((segment) => !segment.match)).toBe(true);
+    expect(splitWorkspaceSearchPreview(unicodeCorpus.utf8SearchPrefix, [{ startByte: 4, endByte: 7 }]).every((segment) => !segment.match)).toBe(true);
   });
 
   it("shows a terminal provider reason and only falls back for an empty message", () => {

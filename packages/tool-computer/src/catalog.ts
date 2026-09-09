@@ -8,6 +8,7 @@ export const COMPUTER_TOOL_NAMES = [
   "list_apps",
   "list_windows",
   "get_window_state",
+  "verify_state",
   "click",
   "double_click",
   "right_click",
@@ -71,6 +72,8 @@ const session = stringValue();
 const snapshotId = stringValue(
   "snapshot_id returned by the get_window_state call this element_index comes from. Recommended whenever element_index is used: if the window has been observed again since, the action is rejected with STALE_SNAPSHOT so you can re-observe instead of acting on the wrong element."
 );
+const elementToken = stringValue("Exact element_token from the latest window observation. Re-observe after verification or a failed observation.");
+const deliveryMode = choice("background", "foreground");
 
 function tool(
   name: ComputerPublicToolName,
@@ -132,17 +135,18 @@ export const COMPUTER_PUBLIC_TOOLS: readonly ComputerToolDescriptor[] = Object.f
   ),
   tool(
     "get_window_state",
-    "Inspect one window and return its accessibility tree/screenshot state. Use {\"capture_mode\":\"vision\"} for a screenshot and normally omit screenshot_out_file so the driver uses its default path. Call before element-indexed actions. The result carries a snapshot_id; pass it to element-indexed actions so actions taken on an outdated view of the window are rejected as STALE_SNAPSHOT instead of hitting the wrong element.",
+    "Observe an exact window before acting. include_screenshot defaults to true; set false for an accessibility-only observation. Leave screenshot_out_file unset for a managed temporary image. Use an exact element_token, or snapshot_id together with element_index. Re-observe after verification, stale references or observation failure.",
     objectSchema({
       pid,
       window_id: windowId,
-      capture_mode: choice("som", "vision", "ax"),
+      include_screenshot: booleanValue(),
       query: stringValue(),
       screenshot_out_file: stringValue(),
       session,
       max_elements: numberValue({
         integer: true,
         minimum: 1,
+        maximum: 2_000,
         description: "Maximum number of accessibility tree elements to return. Use to limit context size for complex windows like Chrome."
       }),
       max_depth: numberValue({
@@ -153,6 +157,21 @@ export const COMPUTER_PUBLIC_TOOLS: readonly ComputerToolDescriptor[] = Object.f
     }, ["pid", "window_id"]),
     true
   ),
+  tool("verify_state", "Check bounded postconditions against an exact window. Only satisfied and stable proves success. This observation invalidates previous element references; get_window_state again before an element action.", objectSchema({
+    pid, window_id: windowId,
+    expect: { type: "array", minItems: 1, maxItems: 8, items: objectSchema({
+      element: objectSchema({
+        selector: objectSchema({ role: { type: "string", minLength: 1 }, label_contains: { type: "string", minLength: 1 } }),
+        exists: { type: "boolean", const: true }, enabled: booleanValue(), selected: booleanValue(), value_equals: stringValue()
+      }, ["selector"]),
+      window: objectSchema({ exists: booleanValue(), bounds: objectSchema({
+        x: numberValue(), y: numberValue(), width: numberValue(), height: numberValue(), tolerance_px: numberValue({ minimum: 0, maximum: 100 })
+      }, ["x", "y", "width", "height"]) })
+    }) },
+    stable_samples: numberValue({ integer: true, minimum: 1, maximum: 5 }),
+    timeout_ms: numberValue({ integer: true, minimum: 0, maximum: 10_000 }),
+    include_screenshot: { type: "boolean", const: false }
+  }, ["pid", "window_id", "expect"]), true),
   tool(
     "click",
     "Click a target app by element_index+window_id or by window-local coordinates. Always include pid and include window_id for coordinates. Requires a prior get_window_state for element indices.",
@@ -160,6 +179,8 @@ export const COMPUTER_PUBLIC_TOOLS: readonly ComputerToolDescriptor[] = Object.f
       pid,
       window_id: windowId,
       element_index: elementIndex,
+      element_token: elementToken,
+      delivery_mode: deliveryMode,
       x: numberValue(),
       y: numberValue(),
       action: stringValue(),
@@ -178,6 +199,8 @@ export const COMPUTER_PUBLIC_TOOLS: readonly ComputerToolDescriptor[] = Object.f
       pid,
       window_id: windowId,
       element_index: elementIndex,
+      element_token: elementToken,
+      delivery_mode: deliveryMode,
       x: numberValue(),
       y: numberValue(),
       snapshot_id: snapshotId,
@@ -191,6 +214,8 @@ export const COMPUTER_PUBLIC_TOOLS: readonly ComputerToolDescriptor[] = Object.f
       pid,
       window_id: windowId,
       element_index: elementIndex,
+      element_token: elementToken,
+      delivery_mode: deliveryMode,
       x: numberValue(),
       y: numberValue(),
       modifier: stringArray(),
@@ -205,6 +230,7 @@ export const COMPUTER_PUBLIC_TOOLS: readonly ComputerToolDescriptor[] = Object.f
       pid,
       window_id: windowId,
       from_x: numberValue(),
+      delivery_mode: deliveryMode,
       from_y: numberValue(),
       to_x: numberValue(),
       to_y: numberValue(),
@@ -223,6 +249,8 @@ export const COMPUTER_PUBLIC_TOOLS: readonly ComputerToolDescriptor[] = Object.f
       pid,
       text: stringValue(),
       element_index: elementIndex,
+      element_token: elementToken,
+      delivery_mode: deliveryMode,
       window_id: windowId,
       delay_ms: numberValue({ integer: true, minimum: 0, maximum: 200 }),
       snapshot_id: snapshotId,
@@ -237,9 +265,10 @@ export const COMPUTER_PUBLIC_TOOLS: readonly ComputerToolDescriptor[] = Object.f
       window_id: windowId,
       element_index: elementIndex,
       value: stringValue(),
+      element_token: elementToken,
       snapshot_id: snapshotId,
       session
-    }, ["pid", "window_id", "element_index", "value"])
+    }, ["pid", "window_id", "value"])
   ),
   tool(
     "press_key",
@@ -249,6 +278,8 @@ export const COMPUTER_PUBLIC_TOOLS: readonly ComputerToolDescriptor[] = Object.f
       key: stringValue(),
       modifiers: stringArray(),
       element_index: elementIndex,
+      element_token: elementToken,
+      delivery_mode: deliveryMode,
       window_id: windowId,
       snapshot_id: snapshotId,
       session
@@ -257,7 +288,7 @@ export const COMPUTER_PUBLIC_TOOLS: readonly ComputerToolDescriptor[] = Object.f
   tool(
     "hotkey",
     "Press a keyboard shortcut in the target app, e.g. [\"cmd\",\"c\"].",
-    objectSchema({ pid, keys: stringArray(2), window_id: windowId, session }, ["pid", "keys"])
+    objectSchema({ pid, keys: stringArray(2), window_id: windowId, delivery_mode: deliveryMode, session }, ["pid", "keys"])
   ),
   tool(
     "scroll",
@@ -267,6 +298,8 @@ export const COMPUTER_PUBLIC_TOOLS: readonly ComputerToolDescriptor[] = Object.f
       window_id: windowId,
       element_index: elementIndex,
       direction: choice("up", "down", "left", "right"),
+      element_token: elementToken,
+      delivery_mode: deliveryMode,
       amount: numberValue({ integer: true, minimum: 1, maximum: 50 }),
       by: choice("line", "page"),
       snapshot_id: snapshotId,
@@ -339,6 +372,14 @@ export function normalizeComputerToolArguments(
 ): Record<string, unknown> {
   const normalized = { ...input };
   validateAgainstSchema(normalized, computerPublicTool(name)!.inputSchema);
+  if (name === "set_value" && normalized["element_index"] === undefined && normalized["element_token"] === undefined) {
+    throw new ComputerToolArgumentError("element_token");
+  }
+  if (name === "verify_state") {
+    for (const predicate of normalized["expect"] as Record<string, unknown>[]) {
+      if ((predicate["element"] === undefined) === (predicate["window"] === undefined)) throw new ComputerToolArgumentError("expect");
+    }
+  }
   return normalized;
 }
 
@@ -364,6 +405,7 @@ function validateAgainstSchema(value: unknown, schema: JsonSchema, field = "argu
     if (!Array.isArray(value)) throw new ComputerToolArgumentError(field);
     const minimumItems = schema["minItems"];
     if (typeof minimumItems === "number" && value.length < minimumItems) throw new ComputerToolArgumentError(field);
+    if (typeof schema["maxItems"] === "number" && value.length > schema["maxItems"]) throw new ComputerToolArgumentError(field);
     const itemSchema = schema["items"];
     if (isRecord(itemSchema)) {
       for (const item of value) validateAgainstSchema(item, itemSchema, field);
@@ -372,6 +414,7 @@ function validateAgainstSchema(value: unknown, schema: JsonSchema, field = "argu
   }
   if (type === "string") {
     if (typeof value !== "string" || value.includes("\0")) throw new ComputerToolArgumentError(field);
+    if (typeof schema["minLength"] === "number" && value.length < schema["minLength"]) throw new ComputerToolArgumentError(field);
   } else if (type === "number" || type === "integer") {
     if (typeof value !== "number" || !Number.isFinite(value) || (type === "integer" && !Number.isInteger(value))) {
       throw new ComputerToolArgumentError(field);

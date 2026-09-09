@@ -70,7 +70,7 @@ export function formatTokenCount(value: number): string {
   return value.toString();
 }
 
-/** SDK/model/default precedence for the displayed context window. */
+/** An observed runtime window takes precedence over catalog estimates. */
 export function resolveDisplayContextWindow(sdkContextWindow: number, modelContextWindow?: number): number {
   const configured = Number.isFinite(modelContextWindow) && (modelContextWindow ?? 0) > 0
     ? Math.floor(modelContextWindow as number)
@@ -78,6 +78,5 @@ export function resolveDisplayContextWindow(sdkContextWindow: number, modelConte
   const sdk = Number.isFinite(sdkContextWindow) && sdkContextWindow > 0
     ? Math.floor(sdkContextWindow)
     : undefined;
-  if (configured !== undefined && (sdk === undefined || (sdk <= DEFAULT_CONTEXT_WINDOW && configured > sdk))) return configured;
   return sdk ?? configured ?? DEFAULT_CONTEXT_WINDOW;
 }

@@ -1,3 +1,4 @@
+import { unicodeCorpus } from "../i18n/test-corpus.js";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -19,8 +20,8 @@ describe("user-message visual-line collapse", () => {
   });
 
   it("counts CJK full-width text conservatively in the pre-layout estimate", () => {
-    expect(shouldInitiallyCollapseUserMessage("界".repeat(420))).toBe(false);
-    expect(shouldInitiallyCollapseUserMessage("界".repeat(421))).toBe(true);
+    expect(shouldInitiallyCollapseUserMessage(unicodeCorpus.wideCharacter.repeat(420))).toBe(false);
+    expect(shouldInitiallyCollapseUserMessage(unicodeCorpus.wideCharacter.repeat(421))).toBe(true);
   });
 
   it("keeps a narrow-screen long URL eligible for real measurement", () => {
@@ -40,6 +41,6 @@ describe("user-message visual-line collapse", () => {
 
   it("does not mount measurement work for empty or unconditionally short content", () => {
     expect(mayExceedUserMessageLineThreshold("   \n ")).toBe(false);
-    expect(mayExceedUserMessageLineThreshold("short English 中文")).toBe(false);
+    expect(mayExceedUserMessageLineThreshold(unicodeCorpus.shortMixedScriptText)).toBe(false);
   });
 });

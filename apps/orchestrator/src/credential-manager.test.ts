@@ -23,6 +23,55 @@ async function fixture(now = 1_800_000_000_000) {
 }
 
 describe("CredentialManager", () => {
+  it("claims new service credentials privately and leaves mismatched tickets with their original owner", async () => {
+    const { credentials, store } = await fixture();
+    try {
+      const ticket = credentials.createUploadTicket({ kind: "api_key", connectionId: "owner" });
+      credentials.upload(ticket.credentialUploadTicketId, "private-service-key", "owner");
+      const input = { credentialUploadTicketId: ticket.credentialUploadTicketId, displayName: "Voice input key",
+        kind: "api_key" as const, connectionId: "owner", onReserved: vi.fn() };
+      await expect(credentials.commitNewManagedUpload({ ...input, connectionId: "other" })).rejects.toThrow("does not authorize");
+      await expect(credentials.commitNewManagedUpload({ ...input, displayName: "" })).rejects.toThrow();
+      expect(input.onReserved).not.toHaveBeenCalled();
+      const committing = credentials.commitNewManagedUpload(input);
+      await expect(credentials.commitUpload({ credentialUploadTicketId: ticket.credentialUploadTicketId,
+        displayName: "Other surface", kind: "api_key", connectionId: "owner" })).rejects.toThrow("invalid, expired, or already consumed");
+      expect(credentials.list()).toEqual([]);
+      const credential = await committing;
+      expect(input.onReserved).toHaveBeenCalledExactlyOnceWith(credential.credentialReferenceId);
+      expect(credentials.resolve(credential.credentialReferenceId)).toBe("private-service-key");
+      await expect(credentials.delete(credential.credentialReferenceId)).rejects.toThrow("Adapter-owned");
+      await expect(credentials.retireManagedCredential(credential.credentialReferenceId, "different-generation")).resolves.toBe(false);
+      expect(credentials.find(credential.credentialReferenceId)).toBeDefined();
+      await expect(credentials.retireManagedCredential(credential.credentialReferenceId, credential.generation)).resolves.toBe(true);
+      expect(credentials.find(credential.credentialReferenceId)).toBeUndefined();
+      const other = credentials.createUploadTicket({ kind: "api_key", providerId: "provider-owner", connectionId: "owner" });
+      credentials.upload(other.credentialUploadTicketId, "provider-key", "owner");
+      await expect(credentials.commitNewManagedUpload({ ...input, credentialUploadTicketId: other.credentialUploadTicketId })).rejects.toThrow("does not authorize");
+      await expect(credentials.commitUpload({ credentialUploadTicketId: other.credentialUploadTicketId,
+        kind: "api_key", providerId: "provider-owner", displayName: "Provider", connectionId: "owner" })).resolves.toMatchObject({ configured: true });
+    } finally { store.close(); }
+  });
+
+  it("consumes SSH passphrases only once for the exact connection, purpose and key without a durable credential", async () => {
+    const { credentials, store } = await fixture();
+    const binding = { connectionId: "connection-a", purpose: "agent_add" as const, keyId: "id_joko", expectedFingerprint: "SHA256:identity" };
+    const ticket = credentials.createSshKeyPassphraseTicket(binding);
+    credentials.upload(ticket.credentialUploadTicketId, "ephemeral SSH passphrase", binding.connectionId);
+    const input = { ...binding, credentialUploadTicketId: ticket.credentialUploadTicketId };
+    for (const changed of [{ connectionId: "connection-b" }, { purpose: "generate" as const }, { keyId: "other" }, { expectedFingerprint: "SHA256:replacement" }]) {
+      expect(() => credentials.consumeSshKeyPassphrase({ ...input, ...changed })).toThrow("does not match");
+    }
+    await expect(credentials.commitUpload({ credentialUploadTicketId: ticket.credentialUploadTicketId, displayName: "SSH", kind: "api_key", connectionId: binding.connectionId })).rejects.toThrow("cannot be committed");
+    expect(credentials.consumeSshKeyPassphrase(input)).toBe("ephemeral SSH passphrase");
+    expect(() => credentials.consumeSshKeyPassphrase(input)).toThrow("invalid, expired, or already consumed");
+    expect(credentials.list()).toEqual([]);
+    const ordinary = credentials.createUploadTicket({ connectionId: binding.connectionId });
+    credentials.upload(ordinary.credentialUploadTicketId, "ordinary value", binding.connectionId);
+    expect(() => credentials.consumeSshKeyPassphrase({ ...input, credentialUploadTicketId: ordinary.credentialUploadTicketId })).toThrow("does not match");
+    store.close();
+  });
+
   it("uses a one-time upload ticket and persists ciphertext without plaintext", async () => {
     const { root, credentials, store } = await fixture();
     const secret = "test-provider-secret-with-entropy";
@@ -175,9 +224,62 @@ describe("CredentialManager", () => {
 });
 
 describe("ProviderCatalogManager", () => {
+  it("describes managed inference readiness without opening secrets and fences every credential replacement", async () => {
+    const { credentials, store, now } = await fixture();
+    const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" });
+    providers.initialize();
+    const upload = async (reference: string, value: string) => {
+      const ticket = credentials.createUploadTicket();
+      credentials.upload(ticket.credentialUploadTicketId, value);
+      await credentials.commitUpload({ credentialUploadTicketId: ticket.credentialUploadTicketId,
+        credentialReferenceId: reference, displayName: "Inference credential", kind: "api_key", providerId: "inference" });
+    };
+    await upload("cred_inference_key", "first-key-value");
+    await upload("cred_inference_header", "first-header-value");
+    const entry = {
+      backendId: "pi", credentialOrigin: "https://provider.invalid",
+      provider: { id: "inference", baseUrl: "https://provider.invalid/v1", api: "openai-completions" as const,
+        apiKeyEnv: "INFERENCE_API_KEY", headers: { "x-private-header": { env: "INFERENCE_HEADER" } },
+        models: [{ id: "text-model", input: ["text"] as const }] },
+      displayName: "Inference", kind: "custom_endpoint" as const, enabled: true,
+      credentialBindings: { INFERENCE_API_KEY: "cred_inference_key", INFERENCE_HEADER: "cred_inference_header" },
+      supportsLogin: false, supportsLogout: true, supportsRefresh: false
+    };
+    await providers.upsert(entry);
+    const resolve = vi.spyOn(credentials, "resolve");
+    const first = providers.describeInferenceRoute("pi", "inference", "text-model");
+    expect(first).toBeDefined();
+    expect(resolve).not.toHaveBeenCalled();
+    expect(JSON.stringify(first)).not.toContain("first-key-value");
+    expect(JSON.stringify(first)).not.toContain("cred_inference");
+    const catalogGeneration = providers.generation;
+    await credentials.replaceSecret("cred_inference_key", "second-key-value");
+    const second = providers.describeInferenceRoute("pi", "inference", "text-model");
+    expect(second).not.toEqual(first);
+    expect(providers.generation).toBe(catalogGeneration);
+    await credentials.replaceSecret("cred_inference_header", "second-header-value");
+    const third = providers.describeInferenceRoute("pi", "inference", "text-model");
+    expect(third).not.toEqual(second);
+    await credentials.delete("cred_inference_header");
+    expect(providers.describeInferenceRoute("pi", "inference", "text-model")).toBeUndefined();
+    await upload("cred_inference_header", "second-header-value");
+    expect(providers.describeInferenceRoute("pi", "inference", "text-model")).not.toEqual(third);
+    await credentials.replaceSecret("cred_inference_header", "expired-header-value", { expiresAt: now - 1, refreshedAt: now - 1_000 });
+    expect(providers.describeInferenceRoute("pi", "inference", "text-model")).toBeUndefined();
+    await credentials.replaceSecret("cred_inference_header", "current-header-value", { expiresAt: now + 60_000 });
+    const beforeDelete = providers.describeInferenceRoute("pi", "inference", "text-model");
+    await providers.delete("inference");
+    expect(providers.describeInferenceRoute("pi", "inference", "text-model")).toBeUndefined();
+    await providers.upsert(entry);
+    expect(providers.describeInferenceRoute("pi", "inference", "text-model")).not.toEqual(beforeDelete);
+    expect(resolve).not.toHaveBeenCalled();
+    resolve.mockRestore();
+    store.close();
+  });
+
   it("opens subscription account credentials only inside a generation-fenced callback", async () => {
     const { root, credentials, store, now } = await fixture();
-    const providers = new ProviderCatalogManager({ store, credentials, now: () => now });
+    const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi", now: () => now });
     providers.initialize();
     await providers.registerNativeAuthProviders([{
       provider: { id: "runtime-subscription", models: [] },
@@ -255,9 +357,18 @@ describe("ProviderCatalogManager", () => {
 
   it("adds only newly discovered models and keeps them hidden by default", async () => {
     const { credentials, store } = await fixture();
-    const providers = new ProviderCatalogManager({ store, credentials });
+    const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" });
     providers.initialize();
+    const ticket = credentials.createUploadTicket();
+    credentials.upload(ticket.credentialUploadTicketId, "discovery-secret-value");
+    await credentials.commitUpload({
+      credentialUploadTicketId: ticket.credentialUploadTicketId,
+      credentialReferenceId: "cred_discovery_test",
+      displayName: "Discovery key",
+      kind: "api_key"
+    });
     await providers.upsert({
+      backendId: "pi", credentialOrigin: "https://models.example.test",
       provider: {
         id: "discoverable",
         baseUrl: "https://models.example.test/v1",
@@ -267,20 +378,11 @@ describe("ProviderCatalogManager", () => {
       },
       displayName: "Discoverable",
       kind: "custom_endpoint",
-      credentialBindings: {},
+      credentialBindings: { DISCOVERY_API_KEY: "cred_discovery_test" },
       enabled: true,
       supportsLogin: false,
       supportsLogout: true,
       supportsRefresh: false
-    });
-    const ticket = credentials.createUploadTicket();
-    credentials.upload(ticket.credentialUploadTicketId, "discovery-secret-value");
-    await providers.commitCredential({
-      providerId: "discoverable",
-      credentialUploadTicketId: ticket.credentialUploadTicketId,
-      credentialReferenceId: "cred_discovery_test",
-      displayName: "Discovery key",
-      kind: "api_key"
     });
     const request = async (_url: string | URL | Request, init?: RequestInit) => {
       expect(new Headers(init?.headers).get("authorization")).toBe("Bearer discovery-secret-value");
@@ -290,17 +392,17 @@ describe("ProviderCatalogManager", () => {
       ] }), { status: 200 });
     };
 
-    await expect(providers.discoverProviderModels("discoverable", request as typeof fetch)).resolves.toEqual({
+    await expect(providers.discoverProviderModels("pi", "discoverable", request as typeof fetch)).resolves.toEqual({
       providerId: "discoverable",
       addedModelIds: ["new-model"],
       modelCount: 2
     });
-    expect(providers.get("discoverable")).toMatchObject({ supportsModelRefresh: true });
-    expect(providers.get("discoverable").provider.models).toEqual([
+    expect(providers.get("pi", "discoverable")).toMatchObject({ supportsModelRefresh: true });
+    expect(providers.get("pi", "discoverable").provider.models).toEqual([
       { id: "kept", name: "Kept", contextWindow: 32_000, maxTokens: 4_000 },
       { id: "new-model", name: "New model", contextWindow: 1_000_000, maxTokens: 16_384, defaultVisible: false }
     ]);
-    await expect(providers.discoverProviderModels("discoverable", request as typeof fetch)).resolves.toMatchObject({
+    await expect(providers.discoverProviderModels("pi", "discoverable", request as typeof fetch)).resolves.toMatchObject({
       addedModelIds: [],
       modelCount: 2
     });
@@ -309,10 +411,12 @@ describe("ProviderCatalogManager", () => {
   });
 
   it("requires an unambiguous pinned HTTPS embedding route, with loopback HTTP as the only exception", async () => {
-    const { credentials, store } = await fixture();
-    const providers = new ProviderCatalogManager({ store, credentials });
+    const { root, credentials, store } = await fixture();
+    const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "backend-a" });
     providers.initialize();
-    const upsertKeyless = async (id: string, baseUrl: string) => providers.upsert({
+    const upsertKeyless = async (backendId: string, id: string, baseUrl: string) => providers.upsert({
+      backendId,
+      credentialOrigin: "",
       provider: {
         id,
         baseUrl,
@@ -329,26 +433,52 @@ describe("ProviderCatalogManager", () => {
       supportsRefresh: true
     });
 
-    await upsertKeyless("remote-http", "http://embedding.example/v1");
+    await upsertKeyless("backend-a", "remote-http", "http://embedding.example/v1");
     expect(providers.resolveOpenAiEmbeddingRoute("voyage/voyage-4")).toBeUndefined();
-    await upsertKeyless("loopback", "http://127.0.0.1:11434/v1");
+    await upsertKeyless("backend-a", "loopback", "http://127.0.0.1:11434/v1");
     const firstLoopbackGeneration = providers.resolveOpenAiEmbeddingRoute("voyage/voyage-4");
     expect(firstLoopbackGeneration).toMatchObject({
+      backendId: "backend-a",
       providerId: "loopback",
       endpoint: "http://127.0.0.1:11434/v1/embeddings"
     });
     expect(firstLoopbackGeneration?.generationId).toMatch(/^[a-f0-9]{64}$/u);
-    await upsertKeyless("loopback", "http://127.0.0.1:11434/v1");
+    await upsertKeyless("backend-a", "loopback", "http://127.0.0.1:11434/v1");
     expect(providers.resolveOpenAiEmbeddingRoute("voyage/voyage-4")?.generationId)
       .not.toBe(firstLoopbackGeneration?.generationId);
-    await upsertKeyless("secure", "https://embedding.example/v1");
+    await upsertKeyless("backend-a", "secure", "https://embedding.example/v1");
     expect(providers.resolveOpenAiEmbeddingRoute("voyage/voyage-4")).toBeUndefined();
-    expect(providers.resolveOpenAiEmbeddingRoute("voyage/voyage-4", "secure")).toMatchObject({
+    expect(providers.resolveOpenAiEmbeddingRoute("voyage/voyage-4", { backendId: "backend-a", providerId: "secure" })).toMatchObject({
       providerId: "secure",
       endpoint: "https://embedding.example/v1/embeddings"
     });
-    expect(providers.resolveOpenAiEmbeddingRoute("voyage/voyage-4", "remote-http")).toBeUndefined();
+    expect(providers.resolveOpenAiEmbeddingRoute("voyage/voyage-4", { backendId: "backend-a", providerId: "remote-http" })).toBeUndefined();
+    await upsertKeyless("backend-b", "secure", "https://embedding.example/v1");
+    const first = providers.resolveOpenAiEmbeddingRoute("voyage/voyage-4", { backendId: "backend-a", providerId: "secure" });
+    const second = providers.resolveOpenAiEmbeddingRoute("voyage/voyage-4", { backendId: "backend-b", providerId: "secure" });
+    expect(first?.backendId).toBe("backend-a");
+    expect(second?.backendId).toBe("backend-b");
+    expect(first?.generationId).not.toBe(second?.generationId);
+    expect(providers.resolveOpenAiEmbeddingRoute("voyage/voyage-4", { backendId: "removed-backend", providerId: "secure" })).toBeUndefined();
+    const originalRevision = providers.get("backend-a", "secure").version;
+    const foreignRuntime = providers.get("backend-b", "secure");
+    await expect(providers.deleteRuntime("backend-a", "secure", { expectedVersion: originalRevision + 1n }))
+      .rejects.toThrow("changed concurrently");
+    expect(providers.get("backend-a", "secure").version).toBe(originalRevision);
+    await expect(providers.deleteRuntime("backend-a", "secure", { expectedVersion: originalRevision })).resolves.toBe(true);
+    expect(providers.listConfigurations().find((value) => value.providerId === "secure")?.runtimes.map((value) => value.backendId))
+      .toEqual(["backend-b"]);
+    expect(providers.get("backend-b", "secure").provider).toEqual(foreignRuntime.provider);
+    expect(providers.get("backend-b", "secure").version).toBeGreaterThan(foreignRuntime.version);
     store.close();
+    const reopenedStore = new OperationalStore(join(root, "orchestrator.db"));
+    try {
+      const reopened = new ProviderCatalogManager({ store: reopenedStore, credentials, nativeBackendId: "backend-a" });
+      reopened.initialize();
+      expect(reopened.resolveOpenAiEmbeddingRoute("voyage/voyage-4", { backendId: "backend-a", providerId: "secure" })).toBeUndefined();
+      expect(reopened.get("backend-b", "secure").provider).toEqual(foreignRuntime.provider);
+      expect(reopened.get("backend-b", "secure").version).toBeGreaterThan(foreignRuntime.version);
+    } finally { reopenedStore.close(); }
   });
 
   it("applies model access policy to every direct inference route and Pi generation", async () => {
@@ -358,11 +488,13 @@ describe("ProviderCatalogManager", () => {
     const providers = new ProviderCatalogManager({
       store,
       credentials,
+      nativeBackendId: "pi",
       providerEnabled: () => providerAllowed,
       modelEnabled: () => modelAllowed
     });
     providers.initialize();
     await providers.upsert({
+      backendId: "pi", credentialOrigin: "",
       provider: {
         id: "policy-route",
         baseUrl: "https://policy.example.test/v1",
@@ -379,35 +511,47 @@ describe("ProviderCatalogManager", () => {
       supportsRefresh: false
     });
 
-    expect(providers.resolveInferenceRoute("policy-route", "voyage/voyage-4")).toBeDefined();
-    expect(providers.resolveOpenAiEmbeddingRoute("voyage/voyage-4", "policy-route")).toBeDefined();
+    expect(providers.resolveInferenceRoute("pi", "policy-route", "voyage/voyage-4")).toBeDefined();
+    expect(providers.describeInferenceRoute("pi", "policy-route", "voyage/voyage-4")).toBeDefined();
+    expect(providers.resolveOpenAiEmbeddingRoute("voyage/voyage-4", { backendId: "pi", providerId: "policy-route" })).toBeDefined();
 
     providerAllowed = false;
-    expect(providers.resolveInferenceRoute("policy-route", "voyage/voyage-4")).toBeUndefined();
-    expect(providers.resolveOpenAiEmbeddingRoute("voyage/voyage-4", "policy-route")).toBeUndefined();
+    expect(providers.describeInferenceRoute("pi", "policy-route", "voyage/voyage-4")).toBeUndefined();
+    expect(providers.resolveInferenceRoute("pi", "policy-route", "voyage/voyage-4")).toBeUndefined();
+    expect(providers.resolveOpenAiEmbeddingRoute("voyage/voyage-4", { backendId: "pi", providerId: "policy-route" })).toBeUndefined();
     await expect(providers.createPiGenerationSnapshot({
       snapshotsRoot: join(root, "provider-disabled-snapshot")
     })).resolves.toMatchObject({ providers: [] });
 
     providerAllowed = true;
     modelAllowed = false;
-    expect(providers.hasInferenceModel("policy-route", "voyage/voyage-4")).toBe(false);
-    expect(providers.resolveOpenAiEmbeddingRoute("voyage/voyage-4", "policy-route")).toBeUndefined();
+    expect(providers.describeInferenceRoute("pi", "policy-route", "voyage/voyage-4")).toBeUndefined();
+    expect(providers.hasInferenceModel("pi", "policy-route", "voyage/voyage-4")).toBe(false);
+    expect(providers.resolveOpenAiEmbeddingRoute("voyage/voyage-4", { backendId: "pi", providerId: "policy-route" })).toBeUndefined();
     await expect(providers.createPiGenerationSnapshot({
       snapshotsRoot: join(root, "model-disabled-snapshot")
     })).resolves.toMatchObject({ providers: [] });
 
     modelAllowed = true;
-    expect(providers.resolveInferenceRoute("policy-route", "voyage/voyage-4")).toBeDefined();
-    expect(providers.resolveOpenAiEmbeddingRoute("voyage/voyage-4", "policy-route")).toBeDefined();
+    expect(providers.resolveInferenceRoute("pi", "policy-route", "voyage/voyage-4")).toBeDefined();
+    expect(providers.resolveOpenAiEmbeddingRoute("voyage/voyage-4", { backendId: "pi", providerId: "policy-route" })).toBeDefined();
     store.close();
   });
 
   it("joins opaque references only in memory and creates an immutable Pi generation snapshot", async () => {
     const { root, credentials, store } = await fixture();
-    const providers = new ProviderCatalogManager({ store, credentials });
+    const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" });
     providers.initialize();
+    const ticket = credentials.createUploadTicket();
+    credentials.upload(ticket.credentialUploadTicketId, "byom-secret-value");
+    await credentials.commitUpload({
+      credentialUploadTicketId: ticket.credentialUploadTicketId,
+      credentialReferenceId: "cred_byom_test",
+      displayName: "BYOM key",
+      kind: "api_key"
+    });
     await providers.upsert({
+      backendId: "pi", credentialOrigin: "http://127.0.0.1:11434",
       provider: {
         id: "byom",
         baseUrl: "http://127.0.0.1:11434/v1",
@@ -417,20 +561,11 @@ describe("ProviderCatalogManager", () => {
       },
       displayName: "Local BYOM",
       kind: "custom_endpoint",
-      credentialBindings: {},
+      credentialBindings: { BYOM_API_KEY: "cred_byom_test" },
       enabled: true,
       supportsLogin: false,
       supportsLogout: true,
       supportsRefresh: true
-    });
-    const ticket = credentials.createUploadTicket();
-    credentials.upload(ticket.credentialUploadTicketId, "byom-secret-value");
-    await providers.commitCredential({
-      providerId: "byom",
-      credentialUploadTicketId: ticket.credentialUploadTicketId,
-      credentialReferenceId: "cred_byom_test",
-      displayName: "BYOM key",
-      kind: "api_key"
     });
 
     const snapshot = await providers.createPiGenerationSnapshot({ snapshotsRoot: join(root, "provider-snapshots") });
@@ -438,47 +573,51 @@ describe("ProviderCatalogManager", () => {
     expect(modelsFile).toContain("$BYOM_API_KEY");
     expect(modelsFile).not.toContain("byom-secret-value");
     expect(snapshot.environment).toEqual({ BYOM_API_KEY: "byom-secret-value" });
-    expect(providers.get("byom").authenticationState).toBe("authenticated");
+    expect(providers.get("pi", "byom").authenticationState).toBe("authenticated");
     expect(stringify(store.listSettings())).not.toContain("byom-secret-value");
-    const reloaded = new ProviderCatalogManager({ store, credentials });
+    const reloaded = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" });
     reloaded.initialize();
-    expect(reloaded.get("byom")).toMatchObject({
+    expect(reloaded.get("pi", "byom")).toMatchObject({
       authenticationState: "authenticated",
       credentialReferenceIds: ["cred_byom_test"]
     });
     store.close();
   });
 
-  it("logs out without returning secret material", async () => {
+  it("unlinks the native Provider at logout without deleting independently owned credentials", async () => {
     const { credentials, store } = await fixture();
-    const providers = new ProviderCatalogManager({ store, credentials });
+    const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" });
     providers.initialize();
+    const ticket = credentials.createUploadTicket();
+    credentials.upload(ticket.credentialUploadTicketId, "initial-secret");
+    const committed = await credentials.commitUpload({
+      credentialUploadTicketId: ticket.credentialUploadTicketId,
+      credentialReferenceId: "cred_cloud_test",
+      displayName: "Cloud key",
+      kind: "api_key"
+    });
     await providers.upsert({
+      backendId: "pi", credentialOrigin: "https://cloud.example",
       provider: {
         id: "cloud",
+        baseUrl: "https://cloud.example/v1",
         api: "anthropic-messages",
         apiKeyEnv: "CLOUD_API_KEY",
         models: [{ id: "model", contextWindow: 10_000, maxTokens: 1_000 }]
       },
       displayName: "Cloud",
       kind: "api_key",
-      credentialBindings: {},
+      credentialBindings: { CLOUD_API_KEY: "cred_cloud_test" },
       enabled: true,
       supportsLogin: false,
       supportsLogout: true,
       supportsRefresh: false
     });
-    const ticket = credentials.createUploadTicket();
-    credentials.upload(ticket.credentialUploadTicketId, "initial-secret");
-    const committed = await providers.commitCredential({
-      providerId: "cloud",
-      credentialUploadTicketId: ticket.credentialUploadTicketId,
-      credentialReferenceId: "cred_cloud_test",
-      displayName: "Cloud key",
-      kind: "api_key"
-    });
-    expect(await providers.logout("cloud")).toMatchObject({ authenticationState: "signed_out" });
-    expect(credentials.find(committed.credentialReferenceId)).toBeUndefined();
+    const result = await providers.logout("cloud");
+    expect(result).toMatchObject({ authenticationState: "signed_out", credentialReferenceIds: [] });
+    expect(stringify(result)).not.toContain("initial-secret");
+    expect(credentials.find(committed.credentialReferenceId)).toMatchObject({ configured: true });
+    expect(credentials.resolve(committed.credentialReferenceId)).toBe("initial-secret");
     store.close();
   });
 });

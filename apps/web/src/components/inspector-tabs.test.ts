@@ -2,9 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   activateInspectorTab,
   addInspectorTab,
+  addInspectorTerminalTab,
   closeInspectorTab,
-  closeOtherInspectorTabs,
-  closeVisibleInspectorTabs,
   createInitialInspectorTabBucket,
   cycleInspectorTabId,
   moveVisibleInspectorTab,
@@ -16,7 +15,7 @@ import {
   type InspectorTabKind
 } from "./inspector-tabs.js";
 
-const ALL = new Set<InspectorTabKind>(["context", "branches", "files", "changes", "background", "subagents", "terminal", "tools", "browser"]);
+const ALL = new Set<InspectorTabKind>(["context", "branches", "files", "changes", "background", "subagents", "shell", "terminal", "tools", "browser"]);
 const BUCKET: InspectorTabBucket = {
   tabs: [
     { id: "context", kind: "context" },
@@ -30,22 +29,19 @@ describe("inspector tab buckets", () => {
   it("creates and activates singleton tabs without duplicating a kind", () => {
     expect(createInitialInspectorTabBucket()).toEqual({ tabs: [{ id: "context", kind: "context" }], activeTabId: "context" });
     expect(addInspectorTab(BUCKET, "browser").activeTabId).toBe("browser");
-    expect(addInspectorTab(BUCKET, "terminal").activeTabId).toBe("terminal");
+    expect(addInspectorTab(BUCKET, "shell").activeTabId).toBe("shell");
+    const terminals = addInspectorTerminalTab(addInspectorTerminalTab(BUCKET, "pty-one"), "pty-two");
+    expect(terminals.tabs.filter((tab) => tab.kind === "terminal").map((tab) => tab.id)).toEqual(["pty-one", "pty-two"]);
+    expect(addInspectorTerminalTab(terminals, "pty-one").activeTabId).toBe("pty-one");
+    expect(parseInspectorTabBuckets(serializeInspectorTabBuckets({ task: terminals }))).toEqual({ task: terminals });
     expect(addInspectorTab(BUCKET, "files")).toEqual(BUCKET);
     expect(activateInspectorTab(BUCKET, "tools").activeTabId).toBe("tools");
   });
 
-  it("chooses the adjacent active tab and supports closing other or all visible tabs", () => {
+  it("chooses the adjacent active tab when a closed tab is removed", () => {
     expect(closeInspectorTab(BUCKET, "files")).toEqual({
       tabs: [{ id: "context", kind: "context" }, { id: "tools", kind: "tools" }],
       activeTabId: "tools"
-    });
-    expect(closeOtherInspectorTabs(BUCKET, "files", new Set(["context", "files"]))).toEqual({
-      tabs: [{ id: "files", kind: "files" }, { id: "tools", kind: "tools" }],
-      activeTabId: "files"
-    });
-    expect(closeVisibleInspectorTabs(BUCKET, new Set(["context", "files"]))).toEqual({
-      tabs: [{ id: "tools", kind: "tools" }], activeTabId: "tools"
     });
   });
 

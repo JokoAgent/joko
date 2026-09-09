@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { presentJokoServiceTerminology } from "./user-facing-terminology.js";
+import { presentJokoServiceTerminology } from "./service-terminology.js";
 
 describe("presentJokoServiceTerminology", () => {
   it("uses the public node and local-service vocabulary without duplicating service words", () => {

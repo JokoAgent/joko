@@ -13,8 +13,8 @@ describe("timelineErrorCopy", () => {
 
     expect(capacity.kind).toBe("capacity");
     expect(translate("en", capacity.titleKey)).toBe("Model service is busy");
-    expect(translate("zh-CN", capacity.messageKey)).toContain("没有可用容量");
-    expect(translate("zh-CN", capacity.recoveryKey)).toContain("另一个可用模型");
+    expect(capacity.messageKey).toBe("timeline.errorCapacityMessage");
+    expect(capacity.recoveryKey).toBe("timeline.errorCapacityRecovery");
     expect(authentication.kind).toBe("authentication");
     expect(usage.kind).toBe("usage");
     expect(attachment.kind).toBe("attachment");

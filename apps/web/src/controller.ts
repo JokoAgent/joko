@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { assertBrowserActionCurrent, WorkspaceHtmlExternalUnavailableError, type HttpLinkOpenOptions } from "./browser-action.js";
+import { isWorkspaceHtmlPreviewVisible, WorkspaceHtmlAutoReload } from "./workspace-html-auto-reload.js";
 import {
   createOrchestratorGateway,
   discoverOrchestratorNodesAt,
@@ -11,10 +13,12 @@ import {
 } from "./gateway.js";
 import {
   DEFAULT_UI_PREFERENCES,
+  LINK_OPEN_DEFAULTS,
   LocalState,
   type AutomaticConnectionTarget,
   type ComposerSendShortcutPreference,
   type LinkOpenPreference,
+  type LinkOpenKind,
   type MessageSearchSortPreference,
   type UiPreferences,
   personalizationPromptForOwner,
@@ -161,13 +165,14 @@ export interface AppController extends OperationApi {
   getPersonalizationPrompt(): string;
   setPersonalizationPrompt(value: string): Promise<void>;
   resetPersonalizationPrompt(): Promise<void>;
-  setLinkOpenPreference(preference: LinkOpenPreference): Promise<void>;
-  resetLinkOpenPreference(): Promise<void>;
+  setLinkOpenPreference(kind: LinkOpenKind, preference: LinkOpenPreference): Promise<void>;
+  resetLinkOpenPreference(kind: LinkOpenKind): Promise<void>;
   setStreamFadeEnabled(enabled: boolean): Promise<void>;
   resetStreamFadeEnabled(): Promise<void>;
   setSessionNotificationsEnabled(enabled: boolean): Promise<void>;
   setNewSessionWorktreeEnabled(enabled: boolean): Promise<void>;
-  openHttpLink(url: string, options?: { readonly forceExternal?: boolean; readonly forceSidebar?: boolean; readonly sessionId?: string }): Promise<void>;
+  openHttpLink(url: string, options?: HttpLinkOpenOptions & { readonly sessionId?: string }): Promise<void>;
+  openWorkspaceHtml(sessionId: string, workspaceId: string, path: string, options?: HttpLinkOpenOptions): Promise<void>;
   setSidebarDisplayPreferences(patch: Partial<SidebarDisplayPreferences>): Promise<void>;
   setSidebarOwnerLayout(patch: Partial<SidebarOwnerLayout>): Promise<void>;
   /** Set a binding, null to disable it, or undefined to restore its default. */
@@ -181,6 +186,8 @@ export interface AppController extends OperationApi {
   dismissExtensionNotification(eventId: string): void;
   readDraft(sessionId: string): Promise<ComposerDraft | undefined>;
   saveDraft(sessionId: string, draft: ComposerDraft): Promise<void>;
+  readDraftSnapshot(sessionId: string): Promise<import("./local-state.js").ComposerDraftSnapshot>;
+  saveDraftIfRevision(sessionId: string, draft: ComposerDraft, expectedRevision: number): Promise<number | undefined>;
   readNewSessionDraft(): Promise<NewSessionLocalDraft | undefined>;
   saveNewSessionDraft(draft: NewSessionLocalDraft): Promise<void>;
   clearNewSessionDraft(): Promise<void>;
@@ -227,6 +234,11 @@ export function useAppController(): AppController {
   preferencesRef.current = state.preferences;
   const gatewayRef = useRef<OrchestratorGateway | undefined>(undefined);
   const gatewayGenerationRef = useRef(0);
+  const htmlPreviewsRef = useRef(new Map<string, {
+    gateway: OrchestratorGateway; gatewayGeneration: number; browserId: string; browserGeneration: bigint;
+    sessionId: string; targetId: string; sessionGeneration: bigint; ownerDocument: Document; ownerHash: string | undefined;
+    reload: WorkspaceHtmlAutoReload;
+  }>());
   const extensionUiEffectLedgerRef = useRef(new Map<string, true>());
   const latestExtensionEditorEffectRef = useRef(new Map<string, string>());
   const extensionTitleSessionRef = useRef<string | undefined>(undefined);
@@ -547,6 +559,7 @@ export function useAppController(): AppController {
           extensionTitleSessionRef.current = effect.sessionId;
         }
         applyExtensionUiEffect(effect, localRef.current, setState, {
+          serverId: profile.serverId,
           activeSessionId,
           isCurrent: () => gatewayGenerationRef.current === generation,
           isLatestEditorEffect: () => latestExtensionEditorEffectRef.current.get(editorScope) === effect.eventId
@@ -1426,6 +1439,306 @@ export function useAppController(): AppController {
     });
   }, []);
 
+  const artifactGateway = gatewayRef.current;
+  const linkGatewayGeneration = gatewayGenerationRef.current;
+  useEffect(() => {
+    for (const [pageId, preview] of htmlPreviewsRef.current) {
+      const browser = state.snapshot.browsers.find((value) => value.id === preview.browserId);
+      const session = state.snapshot.sessions.find((value) => value.id === preview.sessionId);
+      const ownerWindow = preview.ownerDocument.defaultView;
+      if (preview.gateway !== gatewayRef.current || preview.gatewayGeneration !== gatewayGenerationRef.current
+        || state.connectionState !== "connected" || browser?.generation !== preview.browserGeneration
+        || !browser.pages.some((page) => page.id === pageId && page.state !== "closed") || session === undefined
+        || session.targetId !== preview.targetId || session.generation !== preview.sessionGeneration || session.archived
+        || ownerWindow === null || ownerWindow.closed) {
+        htmlPreviewsRef.current.delete(pageId); continue;
+      }
+      const active = browser.state === "ready" && browser.takeover?.state === "active" && browser.takeover.pageId === pageId
+        && browser.pages.some((page) => page.id === pageId && page.state === "ready")
+        && ownerWindow.location.hash === preview.ownerHash && state.preferences.inspectorOpen
+        && isWorkspaceHtmlPreviewVisible(preview.ownerDocument, browser.id, pageId);
+      if (preview.reload.observe(session, state.snapshot.timelineBySession.get(session.id) ?? [], active)) {
+        void preview.gateway.performBrowserTakeoverAction(browser.id, pageId, { kind: "navigationCommand", command: "reload" })
+          .catch((error: unknown) => {
+            if (htmlPreviewsRef.current.get(pageId) === preview && gatewayRef.current === preview.gateway
+              && connectionStateRef.current === "connected" && isWorkspaceHtmlPreviewVisible(preview.ownerDocument, browser.id, pageId)) {
+              setState((current) => ({ ...current, error: messageOf(error) }));
+            }
+          });
+      }
+    }
+  }, [state.snapshot, state.connectionState, state.preferences.inspectorOpen]);
+  const openLink = useCallback(async (destination: string | { readonly workspaceId: string; readonly path: string }, options?: HttpLinkOpenOptions & { readonly sessionId?: string }): Promise<void> => {
+    const ownerDocument = options?.action?.ownerDocument ?? document;
+    const request = new AbortController();
+    const action = { ownerDocument, signal: options?.action === undefined ? request.signal : AbortSignal.any([request.signal, options.action.signal]) };
+    const ownerWindow = ownerDocument.defaultView;
+    const route = routeRef.current;
+    const initialHash = ownerWindow?.location.hash;
+    const assertCurrent = (): void => {
+      assertBrowserActionCurrent(action);
+      if (gatewayRef.current !== artifactGateway || gatewayGenerationRef.current !== linkGatewayGeneration
+        || (artifactGateway !== undefined && connectionStateRef.current !== "connected")
+        || routeRef.current !== route || ownerWindow?.location.hash !== initialHash) throw new Error("The link's source is no longer current.");
+    };
+    const retire = (): void => request.abort();
+    ownerWindow?.addEventListener("pagehide", retire);
+    const showBrowser = async (browserId: string, pageId: string, sessionId: string): Promise<void> => {
+      assertCurrent();
+      await updatePreferences({ inspectorOpen: true });
+      assertCurrent();
+      if (ownerWindow !== window && ownerWindow !== null) ownerWindow.location.hash = appRouteHash({ kind: "session", sessionId });
+      else if (route.kind !== "session" || route.sessionId !== sessionId) navigate({ kind: "session", sessionId });
+      const requestId = ++browserInspectorRequestRef.current;
+      setState((current) => ({ ...current, browserInspectorFocusRequest: { sessionId, browserId, pageId, requestId } }));
+    };
+    try {
+      if (typeof destination !== "string") {
+        assertCurrent();
+        if (artifactGateway === undefined || options?.sessionId === undefined) throw new Error("An active connected task is required to preview HTML.");
+        const preference = options.forceExternal === true ? "external" : options.forceSidebar === true ? "sidebar" : preferencesRef.current.localLinkOpenPreference;
+        if (preference === "external") throw new WorkspaceHtmlExternalUnavailableError();
+        const browser = snapshotRef.current.browsers.find((candidate) => candidate.state === "ready");
+        if (preference === "sidebar" && browser === undefined) throw new Error("The sidebar Browser is unavailable.");
+        const snapshot = await artifactGateway.readWorkspaceHtmlSnapshot(options.sessionId, destination.workspaceId, destination.path, action.signal);
+        assertCurrent();
+        const pageId = await artifactGateway.openBrowserPage(browser!.id, options.sessionId, "", "", snapshot.file);
+        await showBrowser(browser!.id, pageId, options.sessionId);
+        const session = snapshotRef.current.sessions.find((value) => value.id === options.sessionId);
+        if (session !== undefined) {
+          const reload = new WorkspaceHtmlAutoReload(snapshot.file.workspaceId, snapshot.file.relativePath);
+          reload.observe(session, [], true);
+          htmlPreviewsRef.current.set(pageId, { gateway: artifactGateway, gatewayGeneration: linkGatewayGeneration,
+            browserId: browser!.id, browserGeneration: browser!.generation, sessionId: session.id, targetId: session.targetId,
+            sessionGeneration: session.generation, ownerDocument, ownerHash: ownerWindow?.location.hash, reload });
+        }
+        return;
+      }
+      const url = destination;
+      await openHttpLinkWithPreference({
+        url, preference: resolveLinkOpenPreference(preferencesRef.current, url, options),
+        browsers: snapshotRef.current.browsers, sessionId: options?.sessionId, assertCurrent,
+        openPage: (browserId, sessionId, targetUrl) => {
+          assertCurrent();
+          if (artifactGateway === undefined) throw new Error("Connect to Joko before opening a Browser page.");
+          return artifactGateway.openBrowserPage(browserId, sessionId, targetUrl);
+        },
+        showBrowser,
+        openExternal: (targetUrl) => openExternalHttpUrl(targetUrl, ownerDocument)
+      });
+    } finally { ownerWindow?.removeEventListener("pagehide", retire); }
+  }, [artifactGateway, linkGatewayGeneration, navigate, updatePreferences]);
+  const openHttpLink = useCallback<AppController["openHttpLink"]>((url, options) => openLink(url, options), [openLink]);
+  const openWorkspaceHtml = useCallback<AppController["openWorkspaceHtml"]>((sessionId, workspaceId, path, options) => openLink({ workspaceId, path }, { ...options, sessionId }), [openLink]);
+  const draftStore = localRef.current;
+  const draftServerId = state.activeProfile?.serverId;
+  const newTaskDraftScope = state.activeProfile === undefined ? undefined : newSessionDraftScope(state.activeProfile);
+  const newTaskDraftApi = useMemo(() => {
+    const scope = (): string => {
+      if (newTaskDraftScope === undefined) throw new Error("Connect to Joko before using a new-task draft.");
+      return newTaskDraftScope;
+    };
+    return {
+      readNewSessionDraft: (): Promise<NewSessionLocalDraft | undefined> => requireLocal(draftStore).readNewSessionDraft(scope()),
+      saveNewSessionDraft: (draft: NewSessionLocalDraft): Promise<void> => requireLocal(draftStore).saveNewSessionDraft(scope(), draft),
+      clearNewSessionDraft: (): Promise<void> => requireLocal(draftStore).clearNewSessionDraft(scope())
+    };
+  }, [draftStore, newTaskDraftScope, artifactGateway]);
+  const readDraft = useCallback<AppController["readDraft"]>((sessionId) => {
+    if (draftServerId === undefined) return Promise.reject(new Error("Connect to Joko before reading a task draft."));
+    return requireLocal(draftStore).readDraft(draftServerId, sessionId);
+  }, [draftStore, draftServerId, artifactGateway]);
+  const saveDraft = useCallback<AppController["saveDraft"]>((sessionId, draft) => {
+    if (draftServerId === undefined) return Promise.reject(new Error("Connect to Joko before saving a task draft."));
+    return requireLocal(draftStore).saveDraft(draftServerId, sessionId, draft);
+  }, [draftStore, draftServerId, artifactGateway]);
+  const navigateSessionBranch = useCallback<AppController["navigateSessionBranch"]>((sessionId, target, options) => {
+    if (artifactGateway === undefined) return Promise.reject(new Error("Connect to Joko before navigating a task."));
+    return artifactGateway.navigateSessionBranch(sessionId, target, options);
+  }, [artifactGateway]);
+  const readDraftSnapshot = useCallback<AppController["readDraftSnapshot"]>((sessionId) => {
+    if (draftServerId === undefined) return Promise.reject(new Error("Connect to Joko before reading a task draft."));
+    return requireLocal(draftStore).readDraftSnapshot(draftServerId, sessionId);
+  }, [draftStore, draftServerId, artifactGateway]);
+  const saveDraftIfRevision = useCallback<AppController["saveDraftIfRevision"]>((sessionId, draft, revision) => {
+    if (draftServerId === undefined) return Promise.reject(new Error("Connect to Joko before saving a task draft."));
+    return requireLocal(draftStore).saveDraftIfRevision(draftServerId, sessionId, draft, revision);
+  }, [draftStore, draftServerId, artifactGateway]);
+  const listWorkspaceChangeSets = useCallback<AppController["listWorkspaceChangeSets"]>((workspaceId, sessionId) => {
+    if (artifactGateway === undefined) return Promise.reject(new Error("Connect to Joko before reading workspace changes."));
+    return artifactGateway.listWorkspaceChangeSets(workspaceId, sessionId);
+  }, [artifactGateway]);
+  const previewWorkspaceRewind = useCallback<AppController["previewWorkspaceRewind"]>((workspaceId, changeSetId) => {
+    if (artifactGateway === undefined) return Promise.reject(new Error("Connect to Joko before previewing workspace changes."));
+    return artifactGateway.previewWorkspaceRewind(workspaceId, changeSetId);
+  }, [artifactGateway]);
+  const executeWorkspaceRewind = useCallback<AppController["executeWorkspaceRewind"]>((workspaceId, previewId, changeSetId, dialogueOnly) => {
+    if (artifactGateway === undefined) return Promise.reject(new Error("Connect to Joko before restoring workspace changes."));
+    return artifactGateway.executeWorkspaceRewind(workspaceId, previewId, changeSetId, dialogueOnly);
+  }, [artifactGateway]);
+  const inputOwnerId = state.activeProfile?.serverId;
+  const remoteHostApi = useMemo(() => {
+    const original = (): OrchestratorGateway => {
+      if (artifactGateway === undefined) throw new Error("Connect to Joko before managing remote workspaces.");
+      return artifactGateway;
+    };
+    return {
+      updateTarget: async (...args: Parameters<OperationApi["updateTarget"]>) => original().updateTarget(...args),
+      saveCredential: async (...args: Parameters<OperationApi["saveCredential"]>) => original().saveCredential(...args),
+      getRemoteHostCapabilities: async (...args: Parameters<OperationApi["getRemoteHostCapabilities"]>) => original().getRemoteHostCapabilities(...args),
+      listRemoteHosts: async (...args: Parameters<OperationApi["listRemoteHosts"]>) => original().listRemoteHosts(...args),
+      watchRemoteHosts: (...args: Parameters<OperationApi["watchRemoteHosts"]>) => original().watchRemoteHosts(...args),
+      refreshRemoteHostCatalog: async (...args: Parameters<OperationApi["refreshRemoteHostCatalog"]>) => original().refreshRemoteHostCatalog(...args),
+      createRemoteHost: async (...args: Parameters<OperationApi["createRemoteHost"]>) => original().createRemoteHost(...args),
+      updateRemoteHost: async (...args: Parameters<OperationApi["updateRemoteHost"]>) => original().updateRemoteHost(...args),
+      deleteRemoteHost: async (...args: Parameters<OperationApi["deleteRemoteHost"]>) => original().deleteRemoteHost(...args),
+      connectRemoteHost: async (...args: Parameters<OperationApi["connectRemoteHost"]>) => original().connectRemoteHost(...args),
+      disconnectRemoteHost: async (...args: Parameters<OperationApi["disconnectRemoteHost"]>) => original().disconnectRemoteHost(...args),
+      testRemoteHostConnection: async (...args: Parameters<OperationApi["testRemoteHostConnection"]>) => original().testRemoteHostConnection(...args),
+      clearRemoteHostTrust: async (...args: Parameters<OperationApi["clearRemoteHostTrust"]>) => original().clearRemoteHostTrust(...args)
+    };
+  }, [artifactGateway]);
+  const mcpApi = useMemo(() => {
+    const original = (): OrchestratorGateway => {
+      if (artifactGateway === undefined) throw new Error("Connect to Joko before configuring tools.");
+      return artifactGateway;
+    };
+    return {
+      saveMcpServer: async (...args: Parameters<OperationApi["saveMcpServer"]>) => original().saveMcpServer(...args),
+      deleteMcpServer: async (...args: Parameters<OperationApi["deleteMcpServer"]>) => original().deleteMcpServer(...args),
+      restartMcpServer: async (...args: Parameters<OperationApi["restartMcpServer"]>) => original().restartMcpServer(...args)
+    };
+  }, [artifactGateway]);
+  const inputApi = useMemo(() => {
+    const original = (): OrchestratorGateway => {
+      if (artifactGateway === undefined) throw new Error("Connect to Joko before submitting task input.");
+      return artifactGateway;
+    };
+    return {
+      refresh: async () => original().refresh(),
+      send: async (...args: Parameters<OperationApi["send"]>) => original().send(...args),
+      createTarget: async (...args: Parameters<OperationApi["createTarget"]>) => original().createTarget(...args),
+      createSession: async (draft: NewSessionDraft) => original().createSession(sessionDraftWithPersonalization(
+        draft,
+        personalizationPromptForOwner(preferencesRef.current.personalizationPrompts, inputOwnerId)
+      ))
+    };
+  }, [artifactGateway, inputOwnerId]);
+  const voiceApi = useMemo(() => {
+    const original = () => { if (artifactGateway === undefined) throw new Error("Connect to Joko before using voice input."); return artifactGateway; };
+    return {
+      getVoiceInputCapabilities: (...args: Parameters<OperationApi["getVoiceInputCapabilities"]>) => original().getVoiceInputCapabilities(...args),
+      startVoiceInput: (...args: Parameters<OperationApi["startVoiceInput"]>) => original().startVoiceInput(...args),
+      appendVoiceAudio: (...args: Parameters<OperationApi["appendVoiceAudio"]>) => original().appendVoiceAudio(...args),
+      stopVoiceInput: (...args: Parameters<OperationApi["stopVoiceInput"]>) => original().stopVoiceInput(...args),
+      cancelVoiceInput: (...args: Parameters<OperationApi["cancelVoiceInput"]>) => original().cancelVoiceInput(...args),
+      getVoiceInputSession: (...args: Parameters<OperationApi["getVoiceInputSession"]>) => original().getVoiceInputSession(...args)
+    };
+  }, [artifactGateway]);
+  const providerLoginApi = useMemo(() => {
+    const original = (): OrchestratorGateway => {
+      if (artifactGateway === undefined || gatewayRef.current !== artifactGateway
+        || gatewayGenerationRef.current !== linkGatewayGeneration || connectionStateRef.current !== "connected") {
+        throw new Error("The provider authorization source is no longer current.");
+      }
+      return artifactGateway;
+    };
+    return {
+      beginProviderLogin: async (...args: Parameters<OperationApi["beginProviderLogin"]>) => original().beginProviderLogin(...args),
+      getProviderLoginFlow: async (...args: Parameters<OperationApi["getProviderLoginFlow"]>) => original().getProviderLoginFlow(...args),
+      submitProviderLoginInput: async (...args: Parameters<OperationApi["submitProviderLoginInput"]>) => original().submitProviderLoginInput(...args),
+      cancelProviderLogin: async (...args: Parameters<OperationApi["cancelProviderLogin"]>) => original().cancelProviderLogin(...args)
+    };
+  }, [artifactGateway, linkGatewayGeneration]);
+  const sshKeyApi = useMemo(() => {
+    const original = (): OrchestratorGateway => {
+      if (artifactGateway === undefined || gatewayRef.current !== artifactGateway
+        || gatewayGenerationRef.current !== linkGatewayGeneration || connectionStateRef.current !== "connected") {
+        throw new Error("The SSH key service connection is no longer current.");
+      }
+      return artifactGateway;
+    };
+    return {
+      listSshKeys: async (...args: Parameters<OperationApi["listSshKeys"]>) => original().listSshKeys(...args),
+      generateSshKey: async (...args: Parameters<OperationApi["generateSshKey"]>) => original().generateSshKey(...args),
+      addSshKeyToAgent: async (...args: Parameters<OperationApi["addSshKeyToAgent"]>) => original().addSshKeyToAgent(...args),
+      readSshPublicKey: async (...args: Parameters<OperationApi["readSshPublicKey"]>) => original().readSshPublicKey(...args),
+      getSshKeyInstallCommand: async (...args: Parameters<OperationApi["getSshKeyInstallCommand"]>) => original().getSshKeyInstallCommand(...args)
+    };
+  }, [artifactGateway, linkGatewayGeneration]);
+  const usageApi = useMemo(() => ({
+    getUsageReport: async (...args: Parameters<OperationApi["getUsageReport"]>) => {
+      if (artifactGateway === undefined || gatewayRef.current !== artifactGateway
+        || gatewayGenerationRef.current !== linkGatewayGeneration || connectionStateRef.current !== "connected") {
+        throw new Error("The usage history connection is no longer current.");
+      }
+      return artifactGateway.getUsageReport(...args);
+    }
+  }), [artifactGateway, linkGatewayGeneration]);
+  const terminalApi = useMemo(() => {
+    const original = () => { if (artifactGateway === undefined) throw new Error("Connect to Joko before using a terminal."); return artifactGateway; };
+    return {
+      getTerminalCapabilities: (...args: Parameters<OperationApi["getTerminalCapabilities"]>) => original().getTerminalCapabilities(...args),
+      listTerminals: (...args: Parameters<OperationApi["listTerminals"]>) => original().listTerminals(...args),
+      createTerminal: (...args: Parameters<OperationApi["createTerminal"]>) => original().createTerminal(...args),
+      getTerminal: (...args: Parameters<OperationApi["getTerminal"]>) => original().getTerminal(...args),
+      watchTerminal: (...args: Parameters<OperationApi["watchTerminal"]>) => original().watchTerminal(...args),
+      updateTerminalAppearance: (...args: Parameters<OperationApi["updateTerminalAppearance"]>) => original().updateTerminalAppearance(...args),
+      writeTerminal: (...args: Parameters<OperationApi["writeTerminal"]>) => original().writeTerminal(...args),
+      resizeTerminal: (...args: Parameters<OperationApi["resizeTerminal"]>) => original().resizeTerminal(...args),
+      restartTerminal: (...args: Parameters<OperationApi["restartTerminal"]>) => original().restartTerminal(...args),
+      closeTerminal: (...args: Parameters<OperationApi["closeTerminal"]>) => original().closeTerminal(...args)
+    };
+  }, [artifactGateway]);
+  const readWorkspaceFile = useCallback<AppController["readWorkspaceFile"]>(async (workspaceId, path) => {
+    if (artifactGateway === undefined) throw new Error("Connect to Joko before reading a workspace file.");
+    return artifactGateway.readWorkspaceFile(workspaceId, path);
+  }, [artifactGateway]);
+  const readWorkspaceHtmlSnapshot = useCallback<AppController["readWorkspaceHtmlSnapshot"]>((...args) => {
+    if (artifactGateway === undefined) return Promise.reject(new Error("Connect to Joko before reading HTML."));
+    return artifactGateway.readWorkspaceHtmlSnapshot(...args);
+  }, [artifactGateway]);
+  const getArtifactUrl = useCallback(async (blobId: string): Promise<string> => {
+    if (artifactGateway === undefined) throw new Error("Connect to Joko before loading an artifact.");
+    return artifactGateway.getArtifactUrl(blobId);
+  }, [artifactGateway]);
+  const releaseArtifactUrl = useCallback((blobId: string): void => artifactGateway?.releaseArtifactUrl(blobId), [artifactGateway]);
+  const downloadArtifact = useCallback<AppController["downloadArtifact"]>(async (blobId, fileName, context) => {
+    context.signal.throwIfAborted();
+    if (artifactGateway === undefined) throw new Error("Connect to Joko before downloading an artifact.");
+    return artifactGateway.downloadArtifact(blobId, fileName, context);
+  }, [artifactGateway]);
+  const copyArtifactFile = useCallback<AppController["copyArtifactFile"]>(async (blobId, fileName, byteSize, context) => {
+    context.signal.throwIfAborted();
+    if (artifactGateway === undefined) throw new Error("Connect to Joko before copying an artifact file.");
+    return artifactGateway.copyArtifactFile(blobId, fileName, byteSize, context);
+  }, [artifactGateway]);
+  const exportSession = useCallback<AppController["exportSession"]>(async (sessionId, context) => {
+    context.signal.throwIfAborted();
+    if (artifactGateway === undefined) throw new Error("Connect to Joko before exporting a task.");
+    return artifactGateway.exportSession(sessionId, context);
+  }, [artifactGateway]);
+  const exportPortableSession = useCallback<AppController["exportPortableSession"]>(async (sessionId, options, context) => {
+    context.signal.throwIfAborted();
+    if (artifactGateway === undefined) throw new Error("Connect to Joko before exporting a task.");
+    return artifactGateway.exportPortableSession(sessionId, options, context);
+  }, [artifactGateway]);
+  const updateAuxiliaryTextSettings = useCallback<AppController["updateAuxiliaryTextSettings"]>(async (models, expectedRevision) => {
+    if (artifactGateway === undefined) throw new Error("Connect to Joko before updating auxiliary text settings.");
+    return artifactGateway.updateAuxiliaryTextSettings(models, expectedRevision);
+  }, [artifactGateway]);
+  const saveProvider = useCallback<AppController["saveProvider"]>(async (draft, signal) => {
+    if (artifactGateway === undefined || gatewayRef.current !== artifactGateway
+      || gatewayGenerationRef.current !== linkGatewayGeneration || connectionStateRef.current !== "connected") {
+      throw new Error("The Provider configuration connection is no longer current.");
+    }
+    return artifactGateway.saveProvider(draft, signal);
+  }, [artifactGateway, linkGatewayGeneration]);
+  const predictNextPrompt = useCallback<AppController["predictNextPrompt"]>(async (sessionId, expectedLastActivityAt, expectedGeneration, signal) => {
+    signal.throwIfAborted();
+    if (artifactGateway === undefined) throw new Error("Connect to Joko before requesting a prompt recommendation.");
+    return artifactGateway.predictNextPrompt(sessionId, expectedLastActivityAt, expectedGeneration, signal);
+  }, [artifactGateway]);
   return useMemo<AppController>(() => ({
     state,
     probeRuntimeActivity,
@@ -1472,35 +1785,16 @@ export function useAppController(): AppController {
         personalizationPrompts: withPersonalizationPrompt(preferencesRef.current.personalizationPrompts, ownerId, "")
       });
     },
-    setLinkOpenPreference: (linkOpenPreference) => updatePreferences({ linkOpenPreference }),
-    resetLinkOpenPreference: () => updatePreferences({ linkOpenPreference: "sidebar" }),
+    setLinkOpenPreference: (kind, preference) => updatePreferences(kind === "web"
+      ? { webLinkOpenPreference: preference } : { localLinkOpenPreference: preference }),
+    resetLinkOpenPreference: (kind) => updatePreferences(kind === "web"
+      ? { webLinkOpenPreference: LINK_OPEN_DEFAULTS.web } : { localLinkOpenPreference: LINK_OPEN_DEFAULTS.local }),
     setStreamFadeEnabled: (streamFadeEnabled) => updatePreferences({ streamFadeEnabled }),
     resetStreamFadeEnabled: () => updatePreferences({ streamFadeEnabled: true }),
     setSessionNotificationsEnabled: (sessionNotificationsEnabled) => updatePreferences({ sessionNotificationsEnabled }),
     setNewSessionWorktreeEnabled: (newSessionWorktreeEnabled) => updatePreferences({ newSessionWorktreeEnabled }),
-    openHttpLink: (url, options) => openHttpLinkWithPreference({
-      url,
-      preference: resolveLinkOpenPreference(preferencesRef.current.linkOpenPreference, options),
-      browsers: snapshotRef.current.browsers,
-      sessionId: options?.sessionId,
-      openPage: (browserId, sessionId, targetUrl) => gateway().openBrowserPage(browserId, sessionId, targetUrl),
-      showBrowser: async (browserId, pageId, sessionId) => {
-        const route = routeRef.current;
-        if (route.kind !== "session" || route.sessionId !== sessionId) navigate({ kind: "session", sessionId });
-        await updatePreferences({ inspectorOpen: true });
-        const requestId = ++browserInspectorRequestRef.current;
-        setState((current) => ({
-          ...current,
-          browserInspectorFocusRequest: {
-            sessionId,
-            browserId,
-            pageId,
-            requestId
-          }
-        }));
-      },
-      openExternal: openExternalHttpUrl
-    }),
+    openHttpLink,
+    openWorkspaceHtml,
     setSidebarDisplayPreferences: (patch) => updatePreferences({
       sidebarDisplayPreferences: withSidebarDisplayPreferences(preferencesRef.current.sidebarDisplayPreferences, patch)
     }),
@@ -1552,12 +1846,12 @@ export function useAppController(): AppController {
       ...current,
       extensionNotifications: current.extensionNotifications.filter((notification) => notification.eventId !== eventId)
     })),
-    readDraft: (sessionId) => requireLocal(localRef.current).readDraft(sessionId),
-    saveDraft: (sessionId, draft) => requireLocal(localRef.current).saveDraft(sessionId, draft),
-    readNewSessionDraft: () => requireLocal(localRef.current).readNewSessionDraft(newSessionDraftScope(requireActiveProfile(state.activeProfile))),
-    saveNewSessionDraft: (draft) => requireLocal(localRef.current).saveNewSessionDraft(newSessionDraftScope(requireActiveProfile(state.activeProfile)), draft),
-    clearNewSessionDraft: () => requireLocal(localRef.current).clearNewSessionDraft(newSessionDraftScope(requireActiveProfile(state.activeProfile))),
-    refresh: () => gateway().refresh(),
+    readDraft,
+    saveDraft,
+    readDraftSnapshot,
+    saveDraftIfRevision,
+    ...newTaskDraftApi,
+    ...inputApi,
     refreshProviderAccountUsage: (backendId, providerId) => gateway().refreshProviderAccountUsage(backendId, providerId),
     getArtifactStorageStats: (protectedSha256) => gateway().getArtifactStorageStats(protectedSha256),
     scanArtifactStorage: (protectedSha256) => gateway().scanArtifactStorage(protectedSha256),
@@ -1568,17 +1862,10 @@ export function useAppController(): AppController {
     beginTaskHistoryCleanup: (scanId, backupEnabled) => gateway().beginTaskHistoryCleanup(scanId, backupEnabled),
     getTaskHistoryCleanup: (maintenanceId) => gateway().getTaskHistoryCleanup(maintenanceId),
     cancelTaskHistoryCleanup: (maintenanceId) => gateway().cancelTaskHistoryCleanup(maintenanceId),
-    getVoiceInputCapabilities: (signal) => gateway().getVoiceInputCapabilities(signal),
+    ...voiceApi,
+    ...terminalApi,
     testVoiceInputConnection: (signal) => gateway().testVoiceInputConnection(signal),
     adviseVoiceInputDictionaryEdit: (draft, signal) => gateway().adviseVoiceInputDictionaryEdit(draft, signal),
-    startVoiceInput: (requestId, mimeType, locale, refinement, signal) => gateway().startVoiceInput(requestId, mimeType, locale, refinement, signal),
-    appendVoiceAudio: (voiceInputId, chunkSequence, audio, durationMs, voiced, signal) =>
-      gateway().appendVoiceAudio(voiceInputId, chunkSequence, audio, durationMs, voiced, signal),
-    stopVoiceInput: (voiceInputId, expectedNextChunkSequence, signal) =>
-      gateway().stopVoiceInput(voiceInputId, expectedNextChunkSequence, signal),
-    cancelVoiceInput: (voiceInputId, signal) => gateway().cancelVoiceInput(voiceInputId, signal),
-    getVoiceInputSession: (voiceInputId, signal) => gateway().getVoiceInputSession(voiceInputId, signal),
-    send: (sessionId, draft) => gateway().send(sessionId, draft),
     startReview: (sourceSessionId, focus, attachments) => gateway().startReview(sourceSessionId, focus, attachments),
     reobserveReview: (reviewRunId) => gateway().reobserveReview(reviewRunId),
     abort: (runId) => gateway().abort(runId),
@@ -1594,19 +1881,10 @@ export function useAppController(): AppController {
     acknowledgeSessionAttention: (sessionId, throughCursor) => gateway().acknowledgeSessionAttention(sessionId, throughCursor),
     acknowledgeSessionError: (sessionId, throughCursor) => gateway().acknowledgeSessionError(sessionId, throughCursor),
     deleteSession: (sessionId, deleteNative) => gateway().deleteSession(sessionId, deleteNative),
-    createSession: (draft) => gateway().createSession(sessionDraftWithPersonalization(
-      draft,
-      personalizationPromptForOwner(
-        preferencesRef.current.personalizationPrompts,
-        state.activeProfile?.serverId
-      )
-    )),
     probeTargetWorktree: (targetId, signal) => gateway().probeTargetWorktree(targetId, signal),
     listTargetWorktreeSources: (targetId, signal) => gateway().listTargetWorktreeSources(targetId, signal),
     discoverNativeSessions: (targetId) => gateway().discoverNativeSessions(targetId),
     scanNativeSessionCatalog: (backendId, options) => gateway().scanNativeSessionCatalog(backendId, options),
-    createTarget: (draft) => gateway().createTarget(draft),
-    updateTarget: (targetId, patch) => gateway().updateTarget(targetId, patch),
     archiveTarget: (targetId, archived) => gateway().archiveTarget(targetId, archived),
     deleteTarget: (targetId, deleteManagedWorkspace, deleteProductSessions) => gateway().deleteTarget(targetId, deleteManagedWorkspace, deleteProductSessions),
     setWorkspaceTrust: (workspaceId, trusted) => gateway().setWorkspaceTrust(workspaceId, trusted),
@@ -1616,8 +1894,8 @@ export function useAppController(): AppController {
     setPermission: (sessionId, mode) => gateway().setPermission(sessionId, mode),
     setPlanMode: (sessionId, enabled) => gateway().setPlanMode(sessionId, enabled),
     compact: (sessionId, customInstructions) => gateway().compact(sessionId, customInstructions),
-    exportSession: (sessionId) => gateway().exportSession(sessionId),
-    exportPortableSession: (sessionId, options) => gateway().exportPortableSession(sessionId, options),
+    exportSession,
+    exportPortableSession,
     inspectPortableSessionImport: (file) => gateway().inspectPortableSessionImport(file),
     unlockPortableSessionImport: (draftId, password) => gateway().unlockPortableSessionImport(draftId, password),
     cancelPortableSessionImport: (draftId) => gateway().cancelPortableSessionImport(draftId),
@@ -1627,7 +1905,7 @@ export function useAppController(): AppController {
     abortUserShell: (sessionId) => gateway().abortUserShell(sessionId),
     getSessionStatistics: (sessionId, signal) => gateway().getSessionStatistics(sessionId, signal),
     getSessionTree: (sessionId): Promise<NativeSessionTreeView> => gateway().getSessionTree(sessionId),
-    navigateSessionBranch: (sessionId, entryId, options) => gateway().navigateSessionBranch(sessionId, entryId, options),
+    navigateSessionBranch,
     forkSession: (sessionId, entryId, name, sourceMessage) => gateway().forkSession(sessionId, entryId, name, sourceMessage),
     cloneSession: (sessionId, name, sourceMessage) => gateway().cloneSession(sessionId, name, sourceMessage),
     resolveInteraction: (interaction, value) => gateway().resolveInteraction(interaction, value),
@@ -1656,7 +1934,7 @@ export function useAppController(): AppController {
     pauseQueue: (sessionId, reason) => gateway().pauseQueue(sessionId, reason),
     resumeQueue: (sessionId) => gateway().resumeQueue(sessionId),
     restartBrowser: (browserId) => gateway().restartBrowser(browserId),
-    openBrowserPage: (browserId, sessionId, url) => gateway().openBrowserPage(browserId, sessionId, url),
+    openBrowserPage: (...args) => gateway().openBrowserPage(...args),
     recoverBrowserPage: (browserId, sessionId, pageId, url) => gateway().recoverBrowserPage(browserId, sessionId, pageId, url),
     focusBrowserPage: (browserId, pageId) => gateway().focusBrowserPage(browserId, pageId),
     closeBrowserPage: (browserId, pageId) => gateway().closeBrowserPage(browserId, pageId),
@@ -1676,6 +1954,8 @@ export function useAppController(): AppController {
     listCommands: (sessionId) => gateway().listCommands(sessionId),
     listRuntimeProcesses: (backendId, signal) => gateway().listRuntimeProcesses(backendId, signal),
     getUsageHistory: (days, backendId, providerId, signal) => gateway().getUsageHistory(days, backendId, providerId, signal),
+    getUsageReport: usageApi.getUsageReport,
+    ...sshKeyApi,
     getModelPriceOverride: (backendId, providerId, modelId, signal) =>
       gateway().getModelPriceOverride(backendId, providerId, modelId, signal),
     setModelPriceOverride: (backendId, providerId, modelId, desired, signal) =>
@@ -1699,7 +1979,8 @@ export function useAppController(): AppController {
     listWorkspaceEntryPage: (workspaceId, parentPath, pageToken, pageSize, options) => gateway().listWorkspaceEntryPage(workspaceId, parentPath, pageToken, pageSize, options),
     listWorkspaceFiles: (workspaceId, signal) => gateway().listWorkspaceFiles(workspaceId, signal),
     watchWorkspaceFileChanges: (scope, signal) => gateway().watchWorkspaceFileChanges(scope, signal),
-    readWorkspaceFile: (workspaceId, path) => gateway().readWorkspaceFile(workspaceId, path),
+    readWorkspaceFile,
+    readWorkspaceHtmlSnapshot,
     writeWorkspaceTextFile: (workspaceId, draft) => gateway().writeWorkspaceTextFile(workspaceId, draft),
     searchWorkspace: (workspaceId, query) => gateway().searchWorkspace(workspaceId, query),
     searchWorkspacePage: (workspaceId, request, signal) => gateway().searchWorkspacePage(workspaceId, request, signal),
@@ -1714,9 +1995,9 @@ export function useAppController(): AppController {
     applyWorkspaceDiffHunk: (workspaceId, draft) => gateway().applyWorkspaceDiffHunk(workspaceId, draft),
     commitWorkspaceDiff: (workspaceId, draft) => gateway().commitWorkspaceDiff(workspaceId, draft),
     pushWorkspaceBranch: (workspaceId, draft) => gateway().pushWorkspaceBranch(workspaceId, draft),
-    listWorkspaceChangeSets: (workspaceId, sessionId) => gateway().listWorkspaceChangeSets(workspaceId, sessionId),
-    previewWorkspaceRewind: (workspaceId, changeSetId) => gateway().previewWorkspaceRewind(workspaceId, changeSetId),
-    executeWorkspaceRewind: (workspaceId, previewId, changeSetId, dialogueOnly) => gateway().executeWorkspaceRewind(workspaceId, previewId, changeSetId, dialogueOnly),
+    listWorkspaceChangeSets,
+    previewWorkspaceRewind,
+    executeWorkspaceRewind,
     restartBackend: (backendId) => gateway().restartBackend(backendId),
     updateBackendSettings: (backendId, patch) => gateway().updateBackendSettings(backendId, patch),
     renameDevice: (deviceId, name) => gateway().renameDevice(deviceId, name),
@@ -1725,7 +2006,7 @@ export function useAppController(): AppController {
     setDeviceControllerAllowed: (controllerDeviceId, allowed) => gateway().setDeviceControllerAllowed(controllerDeviceId, allowed),
     revokeDevice,
     logoutConnection,
-    saveProvider: (draft) => gateway().saveProvider(draft),
+    saveProvider,
     deleteProvider: (providerId) => gateway().deleteProvider(providerId),
     refreshProviderModels: (backendId, providerId, automatic) => gateway().refreshProviderModels(backendId, providerId, automatic),
     refreshManagedModelRuntimes: (signal) => gateway().refreshManagedModelRuntimes(signal),
@@ -1737,36 +2018,14 @@ export function useAppController(): AppController {
     resumeManagedModelPull: (runtimeId, modelName) => gateway().resumeManagedModelPull(runtimeId, modelName),
     cancelManagedModelPull: (runtimeId, modelName) => gateway().cancelManagedModelPull(runtimeId, modelName),
     deleteManagedModel: (runtimeId, modelName) => gateway().deleteManagedModel(runtimeId, modelName),
-    beginProviderLogin: (backendId, providerId, method) => gateway().beginProviderLogin(backendId, providerId, method),
-    getProviderLoginFlow: (loginFlowId) => gateway().getProviderLoginFlow(loginFlowId),
-    submitProviderLoginInput: (flow, value) => gateway().submitProviderLoginInput(flow, value),
-    cancelProviderLogin: (loginFlowId) => gateway().cancelProviderLogin(loginFlowId),
+    ...providerLoginApi,
     refreshProviderCredential: (backendId, providerId) => gateway().refreshProviderCredential(backendId, providerId),
     logoutProvider: (backendId, providerId) => gateway().logoutProvider(backendId, providerId),
     saveProviderCredentialSurface: (backendId, providerId, surfaceId, secret) => gateway().saveProviderCredentialSurface(backendId, providerId, surfaceId, secret),
     clearProviderCredentialSurface: (backendId, providerId, surfaceId) => gateway().clearProviderCredentialSurface(backendId, providerId, surfaceId),
-    saveCredential: (draft) => gateway().saveCredential(draft),
     deleteCredential: (credentialId) => gateway().deleteCredential(credentialId),
-    getRemoteHostCapabilities: (targetId, signal) => gateway().getRemoteHostCapabilities(targetId, signal),
-    listRemoteHosts: (targetId, signal) => gateway().listRemoteHosts(targetId, signal),
-    watchRemoteHosts: (targetId, signal) => gateway().watchRemoteHosts(targetId, signal),
-    refreshRemoteHostCatalog: (targetId) => gateway().refreshRemoteHostCatalog(targetId),
-    createRemoteHost: (targetId, draft) => gateway().createRemoteHost(targetId, draft),
-    updateRemoteHost: (targetId, hostId, expectedRevision, draft) =>
-      gateway().updateRemoteHost(targetId, hostId, expectedRevision, draft),
-    deleteRemoteHost: (targetId, hostId, expectedRevision) =>
-      gateway().deleteRemoteHost(targetId, hostId, expectedRevision),
-    connectRemoteHost: (targetId, hostId, expectedRevision) =>
-      gateway().connectRemoteHost(targetId, hostId, expectedRevision),
-    disconnectRemoteHost: (targetId, hostId, expectedRevision) =>
-      gateway().disconnectRemoteHost(targetId, hostId, expectedRevision),
-    testRemoteHostConnection: (targetId, hostId, expectedRevision) =>
-      gateway().testRemoteHostConnection(targetId, hostId, expectedRevision),
-    clearRemoteHostTrust: (targetId, hostId, expectedRevision) =>
-      gateway().clearRemoteHostTrust(targetId, hostId, expectedRevision),
-    saveMcpServer: (draft) => gateway().saveMcpServer(draft),
-    deleteMcpServer: (serverId) => gateway().deleteMcpServer(serverId),
-    restartMcpServer: (serverId) => gateway().restartMcpServer(serverId),
+    ...remoteHostApi,
+    ...mcpApi,
     updatePiSettings: (backendId, patch) => gateway().updatePiSettings(backendId, patch),
     updateBrowserSettings: (browserProviderId, patch) => gateway().updateBrowserSettings(browserProviderId, patch),
     updateVoiceInputServiceSettings: (draft) => gateway().updateVoiceInputServiceSettings(draft),
@@ -1793,6 +2052,8 @@ export function useAppController(): AppController {
     resetMemory: (scope, backendId) => gateway().resetMemory(scope, backendId),
     updateVisionBridgeSettings: (patch) => gateway().updateVisionBridgeSettings(patch),
     updatePromptRecommendationSettings: (enabled) => gateway().updatePromptRecommendationSettings(enabled),
+    updateAuxiliaryTextSettings,
+    updateSubagentModelSettings: (backendId, model, expectedRevision) => gateway().updateSubagentModelSettings(backendId, model, expectedRevision),
     resetPromptRecommendationSettings: () => gateway().resetPromptRecommendationSettings(),
     updateLanguageToolSettings: (enabled) => gateway().updateLanguageToolSettings(enabled),
     updateToolPolicySettings: (toolProviderId, targetId, patch) => gateway().updateToolPolicySettings(toolProviderId, targetId, patch),
@@ -1800,8 +2061,7 @@ export function useAppController(): AppController {
     updateCollaborationSettings: (patch) => gateway().updateCollaborationSettings(patch),
     updateGitSafetySettings: (patch) => gateway().updateGitSafetySettings(patch),
     cleanupGitSafetySavepoints: () => gateway().cleanupGitSafetySavepoints(),
-    predictNextPrompt: (sessionId, expectedLastActivityAt, expectedGeneration) =>
-      gateway().predictNextPrompt(sessionId, expectedLastActivityAt, expectedGeneration),
+    predictNextPrompt,
     setSilentEncryptedRetryEnabled: (enabled) => gateway().setSilentEncryptedRetryEnabled(enabled),
     resetSilentEncryptedRetry: () => gateway().resetSilentEncryptedRetry(),
     setSessionRuntimeFallbackEnabled: (enabled) => gateway().setSessionRuntimeFallbackEnabled(enabled),
@@ -1810,10 +2070,11 @@ export function useAppController(): AppController {
     installResource: (resourceId) => gateway().installResource(resourceId),
     updateResource: (resourceId) => gateway().updateResource(resourceId),
     captureBrowserScreenshot: (browserId, pageId, fullPage) => gateway().captureBrowserScreenshot(browserId, pageId, fullPage),
-    getArtifactUrl: (blobId) => gateway().getArtifactUrl(blobId),
-    releaseArtifactUrl: (blobId) => gateway().releaseArtifactUrl(blobId),
-    downloadArtifact: (blobId, fileName) => gateway().downloadArtifact(blobId, fileName)
-  }), [cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, logoutConnection, logoutProfile, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setMachineSelection, state, switchMachine, updatePreferences]);
+    getArtifactUrl,
+    releaseArtifactUrl,
+    downloadArtifact,
+    copyArtifactFile
+  }), [saveProvider, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, readDraftSnapshot, saveDraftIfRevision, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, logoutConnection, logoutProfile, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setMachineSelection, state, switchMachine, updatePreferences]);
 }
 
 function upsertMachineCache(caches: readonly MachineCacheView[], cache: MachineCacheView): readonly MachineCacheView[] {
@@ -1951,6 +2212,7 @@ export function sessionDraftWithPersonalization(draft: NewSessionDraft, prompt: 
 }
 
 export interface OpenHttpLinkDependencies {
+  readonly assertCurrent: () => void;
   readonly url: string;
   readonly preference: LinkOpenPreference;
   readonly browsers: readonly BrowserView[];
@@ -1961,12 +2223,14 @@ export interface OpenHttpLinkDependencies {
 }
 
 export function resolveLinkOpenPreference(
-  configured: LinkOpenPreference,
+  configured: Pick<UiPreferences, "webLinkOpenPreference" | "localLinkOpenPreference">,
+  url: string,
   options?: { readonly forceExternal?: boolean; readonly forceSidebar?: boolean }
 ): LinkOpenPreference {
   if (options?.forceExternal === true) return "external";
   if (options?.forceSidebar === true) return "sidebar";
-  return configured;
+  const parsed = new URL(safeHttpUrl(url));
+  return isLoopbackHostname(parsed.hostname) ? configured.localLinkOpenPreference : configured.webLinkOpenPreference;
 }
 
 /**
@@ -1975,6 +2239,7 @@ export function resolveLinkOpenPreference(
  * visible error and never changes the user's chosen destination.
  */
 export async function openHttpLinkWithPreference(dependencies: OpenHttpLinkDependencies): Promise<void> {
+  dependencies.assertCurrent();
   const url = safeHttpUrl(dependencies.url);
   if (dependencies.preference === "external") {
     await dependencies.openExternal(url);
@@ -1987,16 +2252,19 @@ export async function openHttpLinkWithPreference(dependencies: OpenHttpLinkDepen
     throw new Error("A Session is required to open a sidebar Browser page.");
   }
   const pageId = await dependencies.openPage(browser.id, dependencies.sessionId, url);
+  dependencies.assertCurrent();
   await dependencies.showBrowser(browser.id, pageId, dependencies.sessionId);
 }
 
-async function openExternalHttpUrl(url: string): Promise<void> {
-  const desktop = typeof window === "undefined" ? undefined : window.jokoDesktop;
+async function openExternalHttpUrl(url: string, ownerDocument: Document): Promise<void> {
+  const ownerWindow = ownerDocument.defaultView;
+  if (ownerWindow === null) throw new Error("The initiating window is no longer available.");
+  const desktop = ownerWindow.jokoDesktop;
   if (desktop !== undefined) {
     await desktop.openExternal(url);
     return;
   }
-  const opened = window.open(url, "_blank", "noopener,noreferrer");
+  const opened = ownerWindow.open(url, "_blank", "noopener,noreferrer");
   if (opened !== null) opened.opener = null;
 }
 
@@ -2327,6 +2595,7 @@ export function applyExtensionUiEffect(
   local: LocalState | undefined,
   setState: (update: (current: ControllerState) => ControllerState) => void,
   options: {
+    readonly serverId?: string;
     readonly activeSessionId?: string;
     readonly isCurrent?: () => boolean;
     readonly isLatestEditorEffect?: () => boolean;
@@ -2370,10 +2639,11 @@ export function applyExtensionUiEffect(
       text: effect.text
     }
   }) : current);
-  if (local !== undefined) {
-    void local.readDraft(effect.sessionId).then((draft) => {
+  if (local !== undefined && options.serverId !== undefined) {
+    const serverId = options.serverId;
+    void local.readDraft(serverId, effect.sessionId).then((draft) => {
       if (!isCurrent() || options.isLatestEditorEffect?.() === false) return undefined;
-      return local.saveDraft(effect.sessionId, composerDraftWithEditorText(effect.text, draft));
+      return local.saveDraft(serverId, effect.sessionId, composerDraftWithEditorText(effect.text, draft));
     })
       .catch(() => {
         if (!isCurrent() || options.isLatestEditorEffect?.() === false) return;
@@ -2406,11 +2676,6 @@ export function composerDraftWithEditorText(text: string, draft: ComposerDraft |
 
 export function newSessionDraftScope(profile: ConnectionProfile): string {
   return `${profile.serverId}\u0000${profile.id}`;
-}
-
-function requireActiveProfile(profile: ConnectionProfile | undefined): ConnectionProfile {
-  if (profile === undefined) throw new Error("Connect to a Joko node before saving a new-task draft.");
-  return profile;
 }
 
 function routeFromLocation(): AppRoute {

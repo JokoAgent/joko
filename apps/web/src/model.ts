@@ -74,10 +74,15 @@ export interface BackendView {
   readonly authenticationState?: "notRequired" | "signedOut" | "pending" | "authenticated" | "expired" | "refreshing" | "error" | "unknown";
   readonly error?: string;
   readonly capabilities: ReadonlyMap<string, CapabilityView>;
+  readonly providerRuntimeSupport?: {
+    readonly protocols: readonly ProviderCompatibilityView[];
+    readonly fields: readonly ProviderConfigurationFieldView[];
+  };
 }
 
 export interface TargetView {
   readonly id: string;
+  readonly revision: bigint;
   readonly backendId: string;
   readonly name: string;
   readonly workspaceId: string;
@@ -265,7 +270,7 @@ export interface SessionAttentionView {
   readonly updatedAt: number;
 }
 
-export type RemoteHostAuthenticationView = "systemAgent" | "privateKey";
+export type RemoteHostAuthenticationView = "systemAgent" | "privateKey" | "nodeKey";
 export type RemoteHostStatusView = "disconnected" | "connecting" | "authenticating" | "ready" | "failed";
 
 export interface RemoteHostView {
@@ -277,6 +282,7 @@ export interface RemoteHostView {
   readonly source: "manual" | "sshConfig";
   readonly authentication: RemoteHostAuthenticationView;
   readonly credentialReferenceId?: string;
+  readonly nodeKey?: { readonly id: string; readonly expectedFingerprint: string };
   readonly trust?: {
     readonly algorithm: string;
     readonly sha256Fingerprint: string;
@@ -290,6 +296,37 @@ export interface RemoteHostView {
   readonly revision: bigint;
 }
 
+export interface SshKeyView {
+  readonly id: string;
+  readonly name: string;
+  readonly algorithm: string;
+  readonly comment: string;
+  readonly sha256Fingerprint: string;
+  readonly modifiedAt: number;
+  readonly inAgent: boolean;
+}
+
+export interface SshKeyCatalogView {
+  readonly keys: readonly SshKeyView[];
+  readonly agentState: "ready" | "unavailable" | "failed";
+  readonly generationSupported: boolean;
+}
+
+export interface SshKeyGenerateDraft {
+  readonly name: string;
+  readonly comment: string;
+  readonly passphrase?: string;
+}
+
+export interface SshKeyInstallCommandDraft {
+  readonly keyId: string;
+  readonly expectedFingerprint: string;
+  readonly destination:
+    | { readonly kind: "savedHost"; readonly targetId: string; readonly hostId: string; readonly expectedRevision: bigint }
+    | { readonly kind: "draftHost"; readonly hostname: string; readonly user: string; readonly port: number };
+  readonly shell: "posix" | "powershell";
+}
+
 export interface RemoteHostDraft {
   readonly id: string;
   readonly hostname: string;
@@ -297,6 +334,7 @@ export interface RemoteHostDraft {
   readonly user: string;
   readonly authentication: RemoteHostAuthenticationView;
   readonly credentialReferenceId?: string;
+  readonly nodeKey?: { readonly id: string; readonly expectedFingerprint: string };
 }
 
 export interface RemoteHostCapabilitiesView {
@@ -403,6 +441,36 @@ export interface UsageHistoryView {
   readonly estimated: boolean;
 }
 
+export interface UsageReportQueryView {
+  readonly group: "task" | "model" | "provider" | "backend";
+  readonly fromDay?: string;
+  readonly throughDay?: string;
+  readonly backendId?: string;
+  readonly providerId?: string;
+  readonly modelId?: string;
+  readonly sessionId?: string;
+  readonly pageToken?: string;
+}
+
+export interface UsageReportEntryView {
+  readonly key: string;
+  readonly sessionId: string;
+  readonly backendId: string;
+  readonly providerId: string;
+  readonly modelId: string;
+  readonly title: string;
+  readonly referenceAvailable: boolean;
+  readonly summary: UsageHistorySummaryView;
+  readonly measuredAt: number;
+}
+
+export interface UsageReportView {
+  readonly entries: readonly UsageReportEntryView[];
+  readonly summary: UsageHistorySummaryView;
+  readonly nextPageToken: string;
+  readonly totalGroups: number;
+}
+
 export type ModelPriceCurrencyView = "USD" | "CNY";
 
 export interface ModelPriceQuoteView {
@@ -479,6 +547,10 @@ export interface SessionView {
   readonly codeHostPullRequests?: readonly CodeHostPullRequestView[];
 }
 
+export type NativeNavigationTargetView =
+  | { readonly kind: "native_entry"; readonly entryId: string }
+  | { readonly kind: "session_start" };
+
 export interface CodeHostPullRequestView {
   readonly key: string;
   readonly host: string;
@@ -522,6 +594,7 @@ export interface TimelineItemView {
   readonly nativeEntryId?: string;
   /** Opaque native parent identity used to fork before a user prompt. */
   readonly nativeParentEntryId?: string;
+  readonly nativeRewindBefore?: NativeNavigationTargetView;
   /** Durable run ownership used by turn-scoped UI projections such as plans. */
   readonly runId?: string;
   /** Terminal outcome carried only by durable run-terminal timeline events. */
@@ -788,11 +861,21 @@ export interface ArtifactView {
   readonly id: string;
   readonly blobId: string;
   readonly title: string;
+  readonly description?: string;
   readonly kind: "file" | "image" | "export" | "tool" | "diff" | "diagnostics";
   readonly fileName: string;
   readonly mediaType: string;
   readonly byteSize: number;
   readonly downloadUrl?: string;
+  readonly audioMetadata?: AudioArtifactMetadataView;
+}
+
+export interface AudioArtifactMetadataView {
+  readonly kind: "generic" | "music" | "sound_effect";
+  readonly title: string;
+  readonly description: string;
+  readonly durationSeconds?: number;
+  readonly artwork?: { readonly blobId: string; readonly width: number; readonly height: number; readonly alt: string };
 }
 
 export interface ErrorView {
@@ -1957,16 +2040,28 @@ export interface ProviderConfigurationView {
   readonly id: string;
   readonly name: string;
   readonly kind: "managed" | "apiKey" | "oauth" | "subscription" | "localKeyless" | "customEndpoint";
-  readonly compatibility: "anthropic" | "openaiResponses" | "openaiChat" | "openaiCompletions" | "native" | "google";
+  readonly enabled: boolean;
+  readonly revision: bigint;
+  readonly runtimes: readonly ProviderRuntimeConfigurationView[];
+}
+
+export type ProviderCompatibilityView = "anthropic" | "openaiResponses" | "openaiChat" | "openaiCompletions" | "native" | "google";
+export type ProviderConfigurationFieldView = "requestPath" | "modelsEndpoint" | "headers" | "keyless" | "authHeader"
+  | "modelLimits" | "modelCosts" | "modelInputModalities" | "modelThinkingLevels" | "modelSampling" | "modelCompatibility" | "modelFastMode";
+
+export interface ProviderRuntimeConfigurationView {
+  readonly backendId: string;
+  readonly compatibility: ProviderCompatibilityView;
   readonly endpoint: string;
   readonly credentialId: string;
-  readonly enabled: boolean;
   readonly keyless: boolean;
   readonly authHeader: boolean;
   readonly environmentName: string;
-  readonly modelCount: number;
   readonly headers: readonly ProviderHeaderConfigurationView[];
   readonly models: readonly ProviderModelConfigurationView[];
+  readonly requestPath?: string;
+  readonly modelsEndpoint?: string;
+  readonly credentialOrigin: string;
 }
 
 export interface ProviderHeaderConfigurationView {
@@ -1983,7 +2078,7 @@ export interface ProviderThinkingLevelView {
 export interface ProviderModelConfigurationView {
   readonly modelId: string;
   readonly name: string;
-  readonly compatibility?: ProviderConfigurationView["compatibility"];
+  readonly compatibility?: ProviderCompatibilityView;
   readonly reasoning: boolean;
   readonly inputModalities: readonly ModelInputModalityView[];
   readonly contextWindowTokens: number;
@@ -2033,7 +2128,7 @@ export interface ProviderRuntimeView {
   readonly name: string;
   readonly kind: ProviderConfigurationView["kind"];
   readonly accessProduct?: string;
-  readonly compatibility: ProviderConfigurationView["compatibility"];
+  readonly compatibility: ProviderCompatibilityView;
   readonly authenticationState: "notRequired" | "signedOut" | "pending" | "authenticated" | "expired" | "refreshing" | "error" | "unknown";
   readonly endpoint: string;
   readonly ownerManaged: boolean;
@@ -2216,7 +2311,7 @@ export interface CredentialView {
 export interface McpServerView {
   readonly id: string;
   readonly name: string;
-  readonly transport: "loopback" | "https" | "stdio";
+  readonly transport: "loopback" | "https" | "sse" | "stdio";
   readonly endpoint: string;
   readonly state: "disabled" | "starting" | "connected" | "degraded" | "disconnected" | "error";
   readonly generation: bigint;
@@ -2374,6 +2469,28 @@ export interface ModelRouteRefView {
   readonly modelId: string;
 }
 
+export interface AuxiliaryTextSettingsView {
+  readonly models: readonly ModelRouteRefView[];
+  readonly automaticModels: readonly ModelRouteRefView[];
+  readonly options: readonly {
+    readonly route: ModelRouteRefView;
+    readonly available: boolean;
+    readonly unavailableReason: string;
+  }[];
+  readonly available: boolean;
+  readonly unavailableReason: string;
+  readonly revision: bigint;
+  readonly runtimeRevision: string;
+}
+
+export interface SubagentModelSettingsView {
+  readonly backendId: string;
+  readonly model?: { readonly providerId: string; readonly modelId: string };
+  readonly available: boolean;
+  readonly unavailableReason: string;
+  readonly revision: bigint;
+}
+
 export interface AgentResourceSettingsView {
   readonly maxConcurrentCommands: number;
   readonly processPriority: "normal" | "low" | "lowest";
@@ -2423,17 +2540,17 @@ export interface VoiceInputServiceSettingsView {
   readonly protocol: VoiceInputTranscriptionProtocolView;
   readonly endpoint: string;
   readonly model: string;
+  readonly resourceId: string;
   readonly keyless: boolean;
   readonly credentialConfigured: boolean;
   readonly refinementEnabled: boolean;
-  readonly refinerProviderId: string;
-  readonly refinerModelId: string;
-  readonly refinerFallbackProviderId: string;
-  readonly refinerFallbackModelId: string;
+  readonly refinerModel?: ModelRouteRefView;
+  readonly refinerFallbackModel?: ModelRouteRefView;
   readonly fallbackEnabled: boolean;
   readonly fallbackProtocol: VoiceInputTranscriptionProtocolView;
   readonly fallbackEndpoint: string;
   readonly fallbackModel: string;
+  readonly fallbackResourceId: string;
   readonly fallbackKeyless: boolean;
   readonly fallbackCredentialConfigured: boolean;
   readonly revision: bigint;
@@ -2442,25 +2559,27 @@ export interface VoiceInputServiceSettingsView {
 export type VoiceInputTranscriptionProtocolView =
   | "openAiCompatibleBatch"
   | "openAiCompatibleRealtime"
-  | "qwenCompatibleRealtime";
+  | "qwenCompatibleRealtime"
+  | "elevenLabsScribeRealtime"
+  | "volcengineSauc";
 
 export interface VoiceInputServiceSettingsDraft {
   readonly enabled: boolean;
   readonly protocol: VoiceInputTranscriptionProtocolView;
   readonly endpoint: string;
   readonly model: string;
+  readonly resourceId: string;
   readonly keyless: boolean;
   readonly secret?: string;
   readonly clearCredential?: boolean;
   readonly refinementEnabled: boolean;
-  readonly refinerProviderId: string;
-  readonly refinerModelId: string;
-  readonly refinerFallbackProviderId: string;
-  readonly refinerFallbackModelId: string;
+  readonly refinerModel?: ModelRouteRefView;
+  readonly refinerFallbackModel?: ModelRouteRefView;
   readonly fallbackEnabled: boolean;
   readonly fallbackProtocol: VoiceInputTranscriptionProtocolView;
   readonly fallbackEndpoint: string;
   readonly fallbackModel: string;
+  readonly fallbackResourceId: string;
   readonly fallbackKeyless: boolean;
   readonly fallbackSecret?: string;
   readonly clearFallbackCredential?: boolean;
@@ -2535,6 +2654,8 @@ export interface SettingsView {
     readonly customized: boolean;
     readonly customizedFields: readonly string[];
   };
+  readonly auxiliaryText: AuxiliaryTextSettingsView;
+  readonly subagentModels: readonly SubagentModelSettingsView[];
   readonly promptRecommendation: {
     readonly enabled: boolean;
     readonly available: boolean;
@@ -2553,15 +2674,9 @@ export interface ProviderDraft {
   readonly id: string;
   readonly name: string;
   readonly kind: ProviderConfigurationView["kind"];
-  readonly compatibility: ProviderConfigurationView["compatibility"];
-  readonly endpoint: string;
-  readonly credentialId: string;
   readonly enabled: boolean;
-  readonly keyless: boolean;
-  readonly authHeader: boolean;
-  readonly environmentName: string;
-  readonly headers: readonly ProviderHeaderConfigurationView[];
-  readonly models: readonly ProviderModelConfigurationView[];
+  readonly revision: bigint;
+  readonly runtimes: readonly ProviderRuntimeConfigurationView[];
 }
 
 export type ProviderLoginMethodView = "apiKey" | "oauthBrowser" | "deviceCode" | "subscription";
@@ -2597,7 +2712,6 @@ export interface CredentialDraft {
   readonly name: string;
   readonly kind: CredentialView["kind"];
   readonly providerId: string;
-  readonly environmentName: string;
   readonly secret: string;
 }
 
@@ -2605,7 +2719,7 @@ export interface McpServerDraft {
   readonly id: string;
   readonly revision: bigint;
   readonly name: string;
-  readonly transport: "https" | "stdio";
+  readonly transport: "https" | "sse" | "stdio";
   readonly endpoint: string;
   readonly command: string;
   readonly arguments: readonly string[];
@@ -2910,6 +3024,8 @@ export interface ComposerTokenMentionDraft {
   readonly label: string;
   readonly token: string;
   readonly workspaceId?: string;
+  readonly directory?: boolean;
+  readonly lineRange?: { readonly startLine: number; readonly endLine: number };
 }
 
 /**
@@ -3146,7 +3262,92 @@ export type PortableSessionExportOutcomeView =
   | { readonly status: "oversize"; readonly mediaBytes: number; readonly limitBytes: number }
   | { readonly status: "cancelled" };
 
+export interface TerminalShellView {
+  readonly id: string;
+  readonly label: string;
+}
+
+export interface TerminalCapabilitiesView {
+  readonly support: VoiceInputCapabilitySupportView;
+  readonly reason?: string;
+  readonly shells: readonly TerminalShellView[];
+  readonly defaultShellId: string;
+  readonly maximumTerminals: number;
+  readonly maximumInputBytes: number;
+  readonly maximumColumns: number;
+  readonly maximumRows: number;
+}
+
+export interface TerminalView {
+  readonly id: string;
+  readonly sessionId: string;
+  readonly targetId: string;
+  readonly generation: bigint;
+  readonly status: "running" | "exited" | "failed" | "closed";
+  readonly exitConfirmed: boolean;
+  readonly failureCode?: string;
+  readonly shellId: string;
+  readonly shellLabel: string;
+  readonly cwd: string;
+  readonly columns: number;
+  readonly rows: number;
+  readonly exitCode?: number;
+  readonly exitSignal?: number;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+
+export interface TerminalPaletteView {
+  readonly ansiRgb: readonly number[];
+  readonly foregroundRgb: number;
+  readonly backgroundRgb: number;
+  readonly cursorRgb: number;
+}
+export interface TerminalAppearanceView {
+  readonly viewId: string;
+  readonly viewRevision: bigint;
+  readonly palette: TerminalPaletteView;
+}
+export interface TerminalAppearanceResultView {
+  readonly accepted: boolean;
+  readonly acceptedViewRevision: bigint;
+  readonly appearanceRevision: bigint;
+  readonly ownsDefaults: boolean;
+}
+export type TerminalUpdateView = {
+  readonly appearanceRevision: bigint;
+  readonly activeColorOverrides?: string;
+} & ({
+  readonly kind: "output";
+  readonly terminal?: TerminalView;
+  readonly sequence: bigint;
+  readonly data: string;
+} | {
+  readonly kind: "state" | "reset";
+  readonly terminal: TerminalView;
+  readonly sequence: bigint;
+  readonly data: string;
+});
+
+export interface ArtifactDownloadContext {
+  readonly ownerDocument: Document;
+  readonly signal: AbortSignal;
+}
+
+/** Browser dispatch does not acknowledge that a file reached the user's disk. */
+export type ArtifactDownloadOutcome = "saved" | "dispatched" | "cancelled";
+
 export interface OperationApi {
+  getTerminalCapabilities(sessionId?: string, signal?: AbortSignal): Promise<TerminalCapabilitiesView>;
+  listTerminals(sessionId: string, signal?: AbortSignal): Promise<readonly TerminalView[]>;
+  createTerminal(sessionId: string, requestId: string, shellId: string, columns: number, rows: number, initialPalette: TerminalPaletteView, signal?: AbortSignal): Promise<TerminalView>;
+  getTerminal(sessionId: string, terminalId: string, generation?: bigint, signal?: AbortSignal): Promise<TerminalView>;
+  watchTerminal(sessionId: string, terminalId: string, generation: bigint, appearance: TerminalAppearanceView, onUpdate: (update: TerminalUpdateView) => void | Promise<void>, afterSequence?: bigint, signal?: AbortSignal): Promise<void>;
+  updateTerminalAppearance(sessionId: string, terminalId: string, generation: bigint, appearance: TerminalAppearanceView, claimFocus: boolean, expectedAppearanceRevision: bigint, signal?: AbortSignal): Promise<TerminalAppearanceResultView>;
+  writeTerminal(sessionId: string, terminalId: string, generation: bigint, writerId: string, inputSequence: bigint, data: string, signal?: AbortSignal): Promise<void>;
+  resizeTerminal(sessionId: string, terminalId: string, generation: bigint, columns: number, rows: number, signal?: AbortSignal): Promise<void>;
+  restartTerminal(sessionId: string, terminalId: string, generation: bigint, requestId: string, signal?: AbortSignal): Promise<TerminalView>;
+  closeTerminal(sessionId: string, terminalId: string, generation: bigint, signal?: AbortSignal): Promise<void>;
   refresh(): Promise<void>;
   refreshProviderAccountUsage(backendId: string, providerId: string): Promise<void>;
   getArtifactStorageStats(protectedSha256?: readonly string[]): Promise<ArtifactStorageMaintenanceView>;
@@ -3172,7 +3373,7 @@ export interface OperationApi {
   stopVoiceInput(voiceInputId: string, expectedNextChunkSequence: bigint, signal?: AbortSignal): Promise<VoiceInputSessionView>;
   cancelVoiceInput(voiceInputId: string, signal?: AbortSignal): Promise<VoiceInputSessionView>;
   getVoiceInputSession(voiceInputId: string, signal?: AbortSignal): Promise<VoiceInputSessionView>;
-  send(sessionId: string, draft: ComposerDraft): Promise<void>;
+  send(sessionId: string, draft: ComposerDraft, admission: { readonly expectedGeneration: bigint }): Promise<void>;
   startReview(sourceSessionId: string, focus: string, attachments: readonly AttachmentDraft[]): Promise<string>;
   reobserveReview(reviewRunId: string): Promise<void>;
   abort(runId: string): Promise<void>;
@@ -3192,7 +3393,7 @@ export interface OperationApi {
   acknowledgeSessionAttention(sessionId: string, throughCursor: TimelineHistoryCursorView): Promise<void>;
   acknowledgeSessionError(sessionId: string, throughCursor: TimelineHistoryCursorView): Promise<void>;
   deleteSession(sessionId: string, deleteNative: boolean): Promise<void>;
-  createSession(draft: NewSessionDraft): Promise<string>;
+  createSession(draft: NewSessionDraft): Promise<{ readonly sessionId: string; readonly generation: bigint }>;
   probeTargetWorktree(targetId: string, signal?: AbortSignal): Promise<TargetWorktreeProbeView>;
   listTargetWorktreeSources(targetId: string, signal?: AbortSignal): Promise<readonly WorktreeSourceView[]>;
   discoverNativeSessions(targetId: string): Promise<readonly NativeSessionCandidateView[]>;
@@ -3207,7 +3408,7 @@ export interface OperationApi {
     readonly workspaceLocation?:
       | { readonly kind: "remote"; readonly hostId: string; readonly workspaceRoot: string }
       | { readonly kind: "serviceNode" };
-  }): Promise<void>;
+  }, expectedRevision: bigint): Promise<void>;
   archiveTarget(targetId: string, archived: boolean): Promise<void>;
   deleteTarget(targetId: string, deleteManagedWorkspace: boolean, deleteProductSessions: boolean): Promise<void>;
   setWorkspaceTrust(workspaceId: string, trusted: boolean): Promise<void>;
@@ -3217,10 +3418,11 @@ export interface OperationApi {
   setPermission(sessionId: string, mode: PermissionMode): Promise<void>;
   setPlanMode(sessionId: string, enabled: boolean): Promise<void>;
   compact(sessionId: string, customInstructions?: string): Promise<CompactSessionOutcomeView>;
-  exportSession(sessionId: string): Promise<void>;
+  exportSession(sessionId: string, context: ArtifactDownloadContext): Promise<ArtifactDownloadOutcome>;
   exportPortableSession(
     sessionId: string,
-    options: { readonly password?: string; readonly excludeMedia: boolean }
+    options: { readonly password?: string; readonly excludeMedia: boolean },
+    context: ArtifactDownloadContext
   ): Promise<PortableSessionExportOutcomeView>;
   inspectPortableSessionImport(file: File): Promise<PortableSessionImportDraftView>;
   unlockPortableSessionImport(draftId: string, password: string): Promise<PortableSessionImportDraftView>;
@@ -3241,8 +3443,8 @@ export interface OperationApi {
   getSessionTree(sessionId: string): Promise<NativeSessionTreeView>;
   navigateSessionBranch(
     sessionId: string,
-    entryId: string,
-    options?: { readonly summarize?: boolean; readonly customInstructions?: string }
+    target: NativeNavigationTargetView,
+    options: { readonly expectedGeneration: bigint; readonly summarize?: boolean; readonly customInstructions?: string }
   ): Promise<void>;
   forkSession(
     sessionId: string,
@@ -3281,7 +3483,7 @@ export interface OperationApi {
   pauseQueue(sessionId: string, reason?: string): Promise<void>;
   resumeQueue(sessionId: string): Promise<void>;
   restartBrowser(browserId: string): Promise<void>;
-  openBrowserPage(browserId: string, sessionId: string, url: string): Promise<string>;
+  openBrowserPage(browserId: string, sessionId: string, url: string, recoveryPageId?: string, workspaceHtml?: { readonly workspaceId: string; readonly relativePath: string; readonly expectedRevision: string }): Promise<string>;
   recoverBrowserPage(browserId: string, sessionId: string, pageId: string, url: string): Promise<string>;
   focusBrowserPage(browserId: string, pageId: string): Promise<string>;
   closeBrowserPage(browserId: string, pageId: string): Promise<string | undefined>;
@@ -3301,6 +3503,12 @@ export interface OperationApi {
   listCommands(sessionId: string): Promise<readonly RuntimeCommandView[]>;
   listRuntimeProcesses(backendId: string, signal?: AbortSignal): Promise<RuntimeProcessUsageSnapshotView>;
   getUsageHistory(days?: number, backendId?: string, providerId?: string, signal?: AbortSignal): Promise<UsageHistoryView>;
+  getUsageReport(query: UsageReportQueryView, signal: AbortSignal): Promise<UsageReportView>;
+  listSshKeys(signal: AbortSignal): Promise<SshKeyCatalogView>;
+  generateSshKey(draft: SshKeyGenerateDraft, signal: AbortSignal): Promise<SshKeyView>;
+  addSshKeyToAgent(keyId: string, expectedFingerprint: string, passphrase: string | undefined, signal: AbortSignal): Promise<void>;
+  readSshPublicKey(keyId: string, expectedFingerprint: string, signal: AbortSignal): Promise<string>;
+  getSshKeyInstallCommand(draft: SshKeyInstallCommandDraft, signal: AbortSignal): Promise<string>;
   getModelPriceOverride(backendId: string, providerId: string, modelId: string, signal?: AbortSignal): Promise<ModelPriceOverrideView>;
   setModelPriceOverride(backendId: string, providerId: string, modelId: string, desired: ModelPriceQuoteView, signal?: AbortSignal): Promise<ModelPriceOverrideView>;
   resetModelPriceOverride(backendId: string, providerId: string, modelId: string, signal?: AbortSignal): Promise<ModelPriceOverrideView>;
@@ -3320,6 +3528,7 @@ export interface OperationApi {
   listWorkspaceEntryPage(workspaceId: string, parentPath: string, pageToken?: string, pageSize?: number, options?: WorkspaceEntryListingOptionsView): Promise<WorkspaceEntryPageView>;
   listWorkspaceFiles(workspaceId: string, signal?: AbortSignal): Promise<WorkspaceFileIndexView>;
   watchWorkspaceFileChanges(scope: WorkspaceFileChangeScopeView, signal?: AbortSignal): AsyncIterable<WorkspaceFileChangeView>;
+  readWorkspaceHtmlSnapshot(sessionId: string, workspaceId: string, path: string, signal: AbortSignal): Promise<{ readonly file: { readonly workspaceId: string; readonly relativePath: string; readonly expectedRevision: string }; readonly html: string }>;
   readWorkspaceFile(workspaceId: string, path: string): Promise<WorkspaceFilePreviewView>;
   writeWorkspaceTextFile(workspaceId: string, draft: WorkspaceTextFileWriteDraft): Promise<WorkspaceTextFileWriteResultView>;
   searchWorkspace(workspaceId: string, query: string): Promise<readonly WorkspaceSearchMatchView[]>;
@@ -3346,7 +3555,7 @@ export interface OperationApi {
   setDeviceControllerAllowed(controllerDeviceId: string, allowed: boolean): Promise<void>;
   revokeDevice(deviceId: string): Promise<void>;
   logoutConnection(connectionId: string): Promise<void>;
-  saveProvider(draft: ProviderDraft): Promise<void>;
+  saveProvider(draft: ProviderDraft, signal?: AbortSignal): Promise<void>;
   deleteProvider(providerId: string): Promise<void>;
   refreshProviderModels(backendId: string, providerId?: string, automatic?: boolean): Promise<void>;
   refreshManagedModelRuntimes(signal?: AbortSignal): Promise<readonly ManagedModelRuntimeView[]>;
@@ -3366,7 +3575,7 @@ export interface OperationApi {
   logoutProvider(backendId: string, providerId: string): Promise<void>;
   saveProviderCredentialSurface(backendId: string, providerId: string, surfaceId: string, secret: string): Promise<void>;
   clearProviderCredentialSurface(backendId: string, providerId: string, surfaceId: string): Promise<void>;
-  saveCredential(draft: CredentialDraft): Promise<void>;
+  saveCredential(draft: CredentialDraft, signal?: AbortSignal): Promise<void>;
   deleteCredential(credentialId: string): Promise<void>;
   getRemoteHostCapabilities(targetId: string, signal?: AbortSignal): Promise<RemoteHostCapabilitiesView>;
   listRemoteHosts(targetId: string, signal?: AbortSignal): Promise<readonly RemoteHostView[]>;
@@ -3422,6 +3631,8 @@ export interface OperationApi {
     readonly resetTargetModels?: boolean;
   }): Promise<void>;
   updatePromptRecommendationSettings(enabled: boolean): Promise<void>;
+  updateAuxiliaryTextSettings(models: readonly ModelRouteRefView[], expectedRevision: bigint): Promise<void>;
+  updateSubagentModelSettings(backendId: string, model: SubagentModelSettingsView["model"], expectedRevision: bigint): Promise<void>;
   resetPromptRecommendationSettings(): Promise<void>;
   updateLanguageToolSettings(enabled: boolean): Promise<void>;
   updateToolPolicySettings(
@@ -3435,7 +3646,7 @@ export interface OperationApi {
     "workerSoftLimit" | "workerHardLimit" | "workerIdleReleaseMinutes">> | { readonly resetAll: true }): Promise<void>;
   updateGitSafetySettings(patch: { readonly autoSnapshotEnabled: boolean } | { readonly resetAll: true }): Promise<void>;
   cleanupGitSafetySavepoints(): Promise<void>;
-  predictNextPrompt(sessionId: string, expectedLastActivityAt: number, expectedGeneration: bigint): Promise<string>;
+  predictNextPrompt(sessionId: string, expectedLastActivityAt: number, expectedGeneration: bigint, signal: AbortSignal): Promise<string>;
   setSilentEncryptedRetryEnabled(enabled: boolean): Promise<void>;
   resetSilentEncryptedRetry(): Promise<void>;
   setSessionRuntimeFallbackEnabled(enabled: boolean): Promise<void>;
@@ -3446,7 +3657,8 @@ export interface OperationApi {
   captureBrowserScreenshot(browserId: string, pageId: string, fullPage: boolean): Promise<string>;
   getArtifactUrl(blobId: string): Promise<string>;
   releaseArtifactUrl(blobId: string): void;
-  downloadArtifact(blobId: string, fileName: string): Promise<void>;
+  downloadArtifact(blobId: string, fileName: string, context: ArtifactDownloadContext): Promise<ArtifactDownloadOutcome>;
+  copyArtifactFile(blobId: string, fileName: string, byteSize: number, context: ArtifactDownloadContext): Promise<import("./native-file-actions.js").NativeFileCopyOutcome>;
 }
 
 export function emptySnapshot(): AppSnapshot {
@@ -3555,17 +3767,15 @@ export function emptySnapshot(): AppSnapshot {
         protocol: "openAiCompatibleBatch",
         endpoint: "https://api.openai.com/v1/audio/transcriptions",
         model: "whisper-1",
+        resourceId: "",
         keyless: false,
         credentialConfigured: false,
         refinementEnabled: false,
-        refinerProviderId: "",
-        refinerModelId: "",
-        refinerFallbackProviderId: "",
-        refinerFallbackModelId: "",
         fallbackEnabled: false,
         fallbackProtocol: "openAiCompatibleBatch",
         fallbackEndpoint: "https://api.openai.com/v1/audio/transcriptions",
         fallbackModel: "whisper-1",
+        fallbackResourceId: "",
         fallbackKeyless: false,
         fallbackCredentialConfigured: false,
         revision: 0n
@@ -3600,6 +3810,11 @@ export function emptySnapshot(): AppSnapshot {
         unavailableReason: "Vision Bridge is unavailable.",
         customized: false,
         customizedFields: []
+      },
+      subagentModels: [],
+      auxiliaryText: {
+        models: [], automaticModels: [], options: [], available: false,
+        unavailableReason: "Auxiliary text routing is unavailable.", revision: 0n, runtimeRevision: ""
       },
       promptRecommendation: {
         enabled: true,

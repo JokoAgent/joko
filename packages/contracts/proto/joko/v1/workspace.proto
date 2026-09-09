@@ -5,6 +5,23 @@ package joko.v1;
 import "google/protobuf/timestamp.proto";
 import "joko/v1/common.proto";
 
+message WorkspaceHtmlReference {
+  string workspace_id = 1;
+  string relative_path = 2;
+  string expected_revision = 3;
+}
+
+message ReadWorkspaceHtmlSnapshotRequest {
+  string session_id = 1;
+  WorkspaceHtmlReference file = 2;
+}
+
+// Complete UTF-8 only. This response must not be persisted as a Browser URL.
+message ReadWorkspaceHtmlSnapshotResponse {
+  WorkspaceHtmlReference file = 1;
+  string utf8_html = 2;
+}
+
 enum WorkspaceKind {
   WORKSPACE_KIND_UNSPECIFIED = 0;
   WORKSPACE_KIND_USER_PROJECT = 1;
@@ -346,6 +363,7 @@ message Artifact {
   BlobRef blob = 7;
   google.protobuf.Timestamp created_at = 8;
   google.protobuf.Timestamp expires_at = 9;
+  AudioArtifactMetadata audio_metadata = 10;
 }
 
 enum TransferDirection {

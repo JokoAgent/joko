@@ -26,6 +26,7 @@ import {
   fileHash,
   selectDiffFilePatch,
   selectDiffHunkPatch,
+  workspacePreviewRegistrationIdentity,
   type GitState,
   type RemoteWorkspaceDelegate,
   type WorkspaceEntryListingOptions,
@@ -33,6 +34,7 @@ import {
   type WorkspaceEntryRecord,
   type WorkspaceFileIndex,
   type WorkspaceFilePreview,
+  type WorkspacePreviewAuthority,
   type WorkspaceGitCommitResult,
   type WorkspaceGitDiff,
   type WorkspaceGitHunkMutation,
@@ -89,6 +91,29 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     this.#registrations.clear();
   }
 
+  async capturePreviewAuthority(workspaceId: string, signal?: AbortSignal): Promise<WorkspacePreviewAuthority> {
+    signal?.throwIfAborted();
+    this.#assertOpen();
+    const registration = this.#require(workspaceId);
+    const remote = registration.remote!;
+    const authority = await this.#registry.captureTransportAuthority(remote.targetId, remote.hostId, signal);
+    signal?.throwIfAborted();
+    const assertCurrent = (): void => {
+      signal?.throwIfAborted(); this.#assertOpen(); authority.assertCurrent();
+      if (this.#registrations.get(workspaceId) !== registration) throw new WorkspaceFilePreviewError("The remote workspace read authority changed. Open the source again.", "stale");
+    };
+    assertCurrent();
+    const files = authority.lease.files!;
+    const identity = createHash("sha256").update(JSON.stringify([workspacePreviewRegistrationIdentity(registration), authority.hostRevision.toString(), authority.leaseGeneration])).digest("hex");
+    return { identity, assertCurrent, preview: async (path, maximumBytes = WORKSPACE_TEXT_FILE_MAXIMUM_BYTES, maximumFileBytes, readSignal) => {
+      const currentSignal = signal === undefined ? readSignal : readSignal === undefined ? signal : AbortSignal.any([signal, readSignal]);
+      assertCurrent(); currentSignal?.throwIfAborted();
+      const result = await this.#preview(registration, files, path, maximumBytes, maximumFileBytes, currentSignal);
+      assertCurrent(); currentSignal?.throwIfAborted();
+      return result;
+    } };
+  }
+
   async invoke<Result>(workspaceId: string, method: string, args: readonly unknown[]): Promise<Result> {
     this.#assertOpen();
     const registration = this.#require(workspaceId);
@@ -96,7 +121,7 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     let result: unknown;
     switch (method) {
       case "list": result = await this.#list(registration, transports.files, args[0] as string, args[1] as WorkspaceEntryListingOptions | undefined); break;
-      case "preview": result = await this.#preview(registration, transports.files, args[0] as string, args[1] as number); break;
+      case "preview": result = await this.#preview(registration, transports.files, args[0] as string, args[1] as number, args[2] as number | undefined); break;
       case "materializeFile": result = await this.#materialize(registration, transports.files, args); break;
       case "listFiles": result = await this.#listFiles(registration, transports.files); break;
       case "writeTextFile": result = await this.#writeTextFile(registration, transports.files, args[0] as WorkspaceTextFileWriteInput); break;
@@ -188,15 +213,25 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     registration: WorkspaceRegistration,
     files: RemoteFileTransportPort,
     relativePath: string,
-    maximumBytes: number
+    maximumBytes: number,
+    maximumFileBytes?: number,
+    signal?: AbortSignal
   ): Promise<WorkspaceFilePreview> {
     const path = remoteWorkspacePath(registration.root, relativePath, false);
-    const before = await files.stat(path);
+    signal?.throwIfAborted();
+    if (await files.realpath(path, signal) !== path) throw new WorkspaceFilePreviewError("Remote preview path is not canonical.", "invalid");
+    signal?.throwIfAborted();
+    const before = await files.stat(path, signal);
+    signal?.throwIfAborted();
     if (before.kind !== "file") throw new WorkspaceFilePreviewError("Remote preview requires a regular file.", "unsupported");
+    if (maximumFileBytes !== undefined && (!Number.isSafeInteger(maximumFileBytes) || maximumFileBytes < 1 || before.size > maximumFileBytes)) {
+      throw new WorkspaceFilePreviewError("The file exceeds the complete preview budget.", "unsupported");
+    }
     const limit = Math.min(Math.max(maximumBytes, 1), 32 * 1024 * 1024);
     const mediaType = inferRemoteMediaType(relativePath);
     if (!isTextMediaType(mediaType) && before.size > limit) {
-      const after = await files.stat(path);
+      const after = await files.stat(path, signal);
+      signal?.throwIfAborted();
       if (remoteRevision(before) !== remoteRevision(after)) {
         throw new WorkspaceFilePreviewError("Remote file changed while it was read.", "stale");
       }
@@ -208,16 +243,23 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     }
     const bytes = Buffer.from(await files.read({
       path,
+      ...(signal === undefined ? {} : { signal }),
       maximumBytes: Math.min(Math.max(before.size, 1), limit),
       allowTruncated: true
     }));
-    const after = await files.stat(path);
-    if (remoteRevision(before) !== remoteRevision(after)) {
+    signal?.throwIfAborted();
+    const after = await files.stat(path, signal);
+    if (remoteRevision(before) !== remoteRevision(after) || await files.realpath(path, signal) !== path) {
       throw new WorkspaceFilePreviewError("Remote file changed while it was read.", "stale");
     }
+    signal?.throwIfAborted();
     const entry = remoteEntry(canonicalRelative(relativePath), after, contentRevision(bytes));
     if (isTextMediaType(mediaType)) {
       if (bytes.includes(0)) throw new WorkspaceFilePreviewError("Remote file is not valid text.", "unsupported");
+      if (mediaType === "text/html" || maximumFileBytes !== undefined) {
+        try { new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
+        catch { throw new WorkspaceFilePreviewError("Remote file is not complete UTF-8 text.", "unsupported"); }
+      }
       return { entry, mediaType, text: bytes.toString("utf8"), truncated: before.size > bytes.byteLength };
     }
     return { entry, mediaType, bytes, truncated: before.size > bytes.byteLength };
@@ -882,6 +924,7 @@ function mutableGitSource(source: WorkspaceGitHunkMutation["source"]): "unstaged
 function inferRemoteMediaType(value: string): string {
   const extension = remotePath.extname(value).toLowerCase();
   if ([".md", ".markdown", ".mdx"].includes(extension)) return "text/markdown";
+  if ([".html", ".htm"].includes(extension)) return "text/html";
   if ([".json", ".jsonc"].includes(extension)) return "application/json";
   if (extension === ".svg") return "image/svg+xml";
   if (extension === ".glb") return "model/gltf-binary";

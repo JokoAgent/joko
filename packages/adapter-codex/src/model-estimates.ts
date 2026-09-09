@@ -1,6 +1,11 @@
+import type { ProviderModel } from "@joko/core";
+
 export interface CodexModelEstimate {
   readonly contextWindow: number;
   readonly maximumOutputTokens: number;
+  readonly updatedAt?: number;
+  readonly fastModeMultiplier?: NonNullable<ProviderModel["pricing"]>["fastModeMultiplier"];
+  readonly longContext?: NonNullable<ProviderModel["pricing"]>["longContext"];
   readonly price?: {
     readonly input: number;
     readonly output: number;
@@ -12,6 +17,20 @@ export interface CodexModelEstimate {
 export const CODEX_MODEL_ESTIMATES_UPDATED_AT = Date.UTC(2026, 7, 29, 1, 20);
 
 const MODEL_ESTIMATES: Readonly<Record<string, CodexModelEstimate>> = Object.freeze({
+  // Native Codex catalog default; its reported active context takes precedence.
+  // API reference: https://developers.openai.com/api/docs/models/gpt-6-astra
+  "gpt-6-astra": {
+    ...estimate(272_000, 128_000, 10, 50, 1, 12.5),
+    updatedAt: Date.UTC(2026, 8, 8),
+    fastModeMultiplier: 2,
+    longContext: {
+      inputTokenThreshold: 272_000,
+      inputMultiplier: 2,
+      outputMultiplier: 1.5,
+      cacheReadMultiplier: 2,
+      cacheWriteMultiplier: 2
+    }
+  },
   "gpt-5.6-sol": estimate(272_000, 128_000, 4, 20, 0.4, 5),
   "gpt-5.6-terra": estimate(272_000, 128_000, 2, 12, 0.2, 2.5),
   "gpt-5.6-luna": estimate(272_000, 128_000, 0.2, 1.2, 0.02, 0.25),

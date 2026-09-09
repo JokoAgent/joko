@@ -76,9 +76,9 @@ function fixture(): Pick<AppSnapshot, "backends" | "models" | "settings" | "targ
     backends: [capable, limited],
     models: [model],
     targets: [
-      { id: "project-target", backendId: "capable", name: "Project", workspaceId: "project-workspace", workspaceName: "Workspace", trusted: true, pinned: false, archived: false },
-      { id: "dialogue-target", backendId: "capable", name: "Dialogue", workspaceId: "dialogue-workspace", workspaceName: "Dialogue", trusted: true, pinned: false, archived: false },
-      { id: "limited-target", backendId: "limited", name: "Limited", workspaceId: "limited-workspace", workspaceName: "Limited", trusted: true, pinned: false, archived: false }
+      { id: "project-target", backendId: "capable", name: "Project", workspaceId: "project-workspace", revision: 1n, workspaceName: "Workspace", trusted: true, pinned: false, archived: false },
+      { id: "dialogue-target", backendId: "capable", name: "Dialogue", workspaceId: "dialogue-workspace", revision: 1n, workspaceName: "Dialogue", trusted: true, pinned: false, archived: false },
+      { id: "limited-target", backendId: "limited", name: "Limited", workspaceId: "limited-workspace", revision: 1n, workspaceName: "Limited", trusted: true, pinned: false, archived: false }
     ],
     workspaces: [
       { id: "project-workspace", targetId: "project-target", name: "Workspace", kind: "userProject", serverPath: "D:/project", trusted: true, dirty: false, entries: [] },

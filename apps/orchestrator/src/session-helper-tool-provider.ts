@@ -23,6 +23,7 @@ import type {
 } from "./mcp-router.js";
 import type { SessionHost } from "./session-host.js";
 import type { SessionRuntimeProfile } from "./session-runtime-control.js";
+import { COLLABORATION_POLICY_LOCALIZATIONS } from "./i18n/orchestration-language.js";
 
 export const SESSION_HELPER_TOOL_PROVIDER_ID = "joko_session_helper";
 export const COLLABORATION_TOOL_POLICY_ID = "joko-collaboration-tools";
@@ -31,12 +32,7 @@ export const COLLABORATION_TOOL_POLICY: BridgeToolPolicyDeclaration = Object.fre
   displayName: "Collaboration",
   description: "Delegate background work and coordinate with other tasks.",
   productDefaultEnabled: true,
-  localizations: {
-    "zh-CN": {
-      displayName: "协同",
-      description: "委派后台工作，并与其他任务协同。"
-    }
-  }
+  localizations: COLLABORATION_POLICY_LOCALIZATIONS
 });
 
 const LIST_TOOLS_NAME = "list_tools";

@@ -12,6 +12,7 @@ import {
   type PiEventMetadata
 } from "@joko/core";
 import { afterEach, describe, expect, it } from "vitest";
+import { MESSAGE_SEARCH_CORPUS } from "./i18n/message-search.test-fixture.js";
 
 import { OperationalStore } from "./index.js";
 
@@ -26,6 +27,25 @@ afterEach(() => {
 });
 
 describe("OperationalStore visible message search", () => {
+  it("keeps imported messages in the same native binding across activation and hides them after rebind", () => {
+    const fixture = createFixture();
+    const initial = fixture.store.getSession("session-a");
+    const fingerprint = `sha256:${createHash("sha256").update(initial.descriptor.binding.opaqueRef).digest("hex")}`;
+    fixture.store.appendEvent({ id: "imported-audio-message", backendId: initial.descriptor.backendId, targetId: initial.descriptor.targetId,
+      sessionId: "session-a", generation: initial.descriptor.binding.generation, traceId: "portable-audio",
+      payload: { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "imported melody" }] },
+      metadata: { namespace: "joko.portable_import", fields: { [NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD]: fingerprint } }
+    });
+    fixture.store.updateSession("session-a", { binding: { ...initial.descriptor.binding, generation: 1 } }, initial.revision);
+    const search = () => fixture.store.searchSessionMessages({ scope: { sessionId: "session-a" }, query: "imported melody" }).matches;
+    expect(search()).toHaveLength(1);
+    expect(fixture.store.listEventsAround("session-a", "imported-audio-message", 5).map((event) => event.id)).toContain("imported-audio-message");
+    const current = fixture.store.getSession("session-a");
+    fixture.store.updateSession("session-a", { binding: { opaqueRef: "next.native", generation: 2 } }, current.revision);
+    expect(search()).toEqual([]);
+    expect(() => fixture.store.listEventsAround("session-a", "imported-audio-message", 5)).toThrow(/Event not found/u);
+  });
+
   it("loads a bounded centered timeline window without scanning a fixed event prefix", () => {
     const fixture = createFixture();
     for (let index = 1; index <= 9; index += 1) {
@@ -63,7 +83,7 @@ describe("OperationalStore visible message search", () => {
     appendMessage(fixture.store, "event-chinese", "session-c", 20, {
       type: "message_complete",
       role: "assistant",
-      blocks: [{ kind: "text", text: "这是中文消息，也可以精确搜索。" }]
+      blocks: [{ kind: "text", text: MESSAGE_SEARCH_CORPUS.message }]
     });
     appendMessage(fixture.store, "event-stream", "session-a", 30, {
       type: "text_delta",
@@ -169,15 +189,15 @@ describe("OperationalStore visible message search", () => {
 
     expect(fixture.store.searchSessionMessages({
       scope: { owner: true },
-      query: "中文消息"
+      query: MESSAGE_SEARCH_CORPUS.query
     }).matches.map((match) => match.sessionId)).toEqual(["session-c"]);
     expect(fixture.store.searchSessionMessages({
       scope: { targetId: "target-a" },
-      query: "中文消息"
+      query: MESSAGE_SEARCH_CORPUS.query
     }).matches).toEqual([]);
     expect(fixture.store.searchSessionMessages({
       scope: { targetId: "target-b" },
-      query: "中文消息"
+      query: MESSAGE_SEARCH_CORPUS.query
     }).matches).toHaveLength(1);
     expect(() => fixture.store.searchSessionMessages({
       scope: { owner: true },
@@ -231,7 +251,7 @@ describe("OperationalStore visible message search", () => {
   it("keeps service-owned continuation prompts out of search and embedding jobs", () => {
     const fixture = createFixture();
     fixture.store.setMessageEmbeddingEnabled(true);
-    fixture.store.bindMessageEmbeddingProvider("embedding-provider", EMBEDDING_GENERATION_ID);
+    fixture.store.bindMessageEmbeddingProvider("embedding-backend", "embedding-provider", EMBEDDING_GENERATION_ID);
     appendMessage(fixture.store, "event-internal-continuation", "session-a", 10, {
       type: "message_complete",
       role: "user",
@@ -257,7 +277,7 @@ describe("OperationalStore visible message search", () => {
       10,
       visible(`foo ${"distant ".repeat(20)}bar`)
     );
-    appendMessage(fixture.store, "event-short-cjk", "session-b", 20, visible("修复完成"));
+    appendMessage(fixture.store, "event-short-cjk", "session-b", 20, visible(MESSAGE_SEARCH_CORPUS.shortMessage));
     appendMessage(fixture.store, "event-term-31", "session-c", 30, visible("term31"));
     appendMessage(fixture.store, "event-term-32", "session-c", 40, visible("term32"));
 
@@ -271,7 +291,7 @@ describe("OperationalStore visible message search", () => {
     }).matches.map((match) => match.eventId)).toEqual(["event-separated"]);
     expect(fixture.store.searchSessionMessages({
       scope: { owner: true },
-      query: "修复，未命中!!!"
+      query: MESSAGE_SEARCH_CORPUS.mixedQuery
     }).matches.map((match) => match.eventId)).toEqual(["event-short-cjk"]);
     expect(fixture.store.searchSessionMessages({
       scope: { owner: true },
@@ -479,7 +499,7 @@ describe("OperationalStore visible message search", () => {
     const fixture = createFixture();
     appendMessage(fixture.store, "event-before-cutoff", "session-a", 5, visible("historical deployment note"));
     const enabled = fixture.store.setMessageEmbeddingEnabled(true);
-    fixture.store.bindMessageEmbeddingProvider("embedding-provider", EMBEDDING_GENERATION_ID);
+    fixture.store.bindMessageEmbeddingProvider("embedding-backend", "embedding-provider", EMBEDDING_GENERATION_ID);
     expect(enabled).toEqual(expect.objectContaining({
       enabled: true,
       vectorAvailable: true,
@@ -566,7 +586,7 @@ describe("OperationalStore visible message search", () => {
       nativeHistory: { identity: { entryId: "shared-entry" } }
     });
     fixture.store.setMessageEmbeddingEnabled(true);
-    fixture.store.bindMessageEmbeddingProvider("embedding-provider", EMBEDDING_GENERATION_ID);
+    fixture.store.bindMessageEmbeddingProvider("embedding-backend", "embedding-provider", EMBEDDING_GENERATION_ID);
     appendMessage(fixture.store, "identity-vector", "session-a", 20, {
       type: "message_complete",
       role: "assistant",
@@ -645,7 +665,7 @@ describe("OperationalStore visible message search", () => {
       updatedAt: 1
     });
     fixture.store.setMessageEmbeddingEnabled(true);
-    fixture.store.bindMessageEmbeddingProvider("embedding-provider", EMBEDDING_GENERATION_ID);
+    fixture.store.bindMessageEmbeddingProvider("embedding-backend", "embedding-provider", EMBEDDING_GENERATION_ID);
     appendMessageTo(
       fixture.store,
       "generic-event",
@@ -746,7 +766,7 @@ describe("OperationalStore visible message search", () => {
       updatedAt: 1
     });
     fixture.store.setMessageEmbeddingEnabled(true);
-    fixture.store.bindMessageEmbeddingProvider("embedding-provider", EMBEDDING_GENERATION_ID);
+    fixture.store.bindMessageEmbeddingProvider("embedding-backend", "embedding-provider", EMBEDDING_GENERATION_ID);
     const bindingFingerprint = `sha256:${createHash("sha256").update(nativeReference).digest("hex")}`;
     const append = (
       id: string,
@@ -1156,7 +1176,7 @@ describe("OperationalStore visible message search", () => {
 
     appendNative("knn-root", 10, "knn-root-entry", undefined, "root outside the embedding cutoff");
     fixture.store.setMessageEmbeddingEnabled(true);
-    fixture.store.bindMessageEmbeddingProvider("embedding-provider", EMBEDDING_GENERATION_ID);
+    fixture.store.bindMessageEmbeddingProvider("embedding-backend", "embedding-provider", EMBEDDING_GENERATION_ID);
     appendNative("knn-hidden-1", 20, "knn-hidden-entry", "knn-root-entry", "hidden sibling projection one");
     appendNative("knn-hidden-2", 30, "knn-hidden-entry", "knn-root-entry", "hidden sibling projection two");
     appendNative("knn-hidden-3", 40, "knn-hidden-entry", "knn-root-entry", "hidden sibling projection three");
@@ -1338,7 +1358,7 @@ describe("OperationalStore visible message search", () => {
   it("keeps the first enable cutoff, skips ineligible jobs, and fences recovered claims", () => {
     const fixture = createFixture();
     fixture.store.setMessageEmbeddingEnabled(true);
-    fixture.store.bindMessageEmbeddingProvider("embedding-provider", EMBEDDING_GENERATION_ID);
+    fixture.store.bindMessageEmbeddingProvider("embedding-backend", "embedding-provider", EMBEDDING_GENERATION_ID);
     appendMessage(fixture.store, "event-before-disable", "session-a", 10, visible("accepted before disable"));
 
     fixture.store.setMessageEmbeddingEnabled(false);
@@ -1398,9 +1418,11 @@ describe("OperationalStore visible message search", () => {
   });
 
   it("invalidates and rebuilds every vector when a pinned Provider generation changes", () => {
-    const fixture = createFixture();
+    const database = createDatabase();
+    const fixture = { store: database.open() };
+    seedFixture(fixture.store);
     fixture.store.setMessageEmbeddingEnabled(true);
-    fixture.store.bindMessageEmbeddingProvider("embedding-provider", EMBEDDING_GENERATION_ID);
+    fixture.store.bindMessageEmbeddingProvider("embedding-backend", "embedding-provider", EMBEDDING_GENERATION_ID);
     appendMessage(fixture.store, "event-old-generation", "session-a", 10, visible("old generation vector"));
     const [completed] = fixture.store.claimMessageEmbeddingJobs(1, 20);
     fixture.store.completeMessageEmbeddingJob(
@@ -1416,8 +1438,9 @@ describe("OperationalStore visible message search", () => {
     const [stale] = fixture.store.claimMessageEmbeddingJobs(1, 40);
 
     const nextGeneration = "embedding-generation-2";
-    const rebound = fixture.store.bindMessageEmbeddingProvider("embedding-provider", nextGeneration);
+    const rebound = fixture.store.bindMessageEmbeddingProvider("embedding-backend", "embedding-provider", nextGeneration);
     expect(rebound).toEqual(expect.objectContaining({
+      backendId: "embedding-backend",
       providerId: "embedding-provider",
       providerGenerationId: nextGeneration,
       pendingCount: 2,
@@ -1473,12 +1496,18 @@ describe("OperationalStore visible message search", () => {
       "event-old-generation",
       "event-stale-claim"
     ]));
+    fixture.store.close();
+    const reopened = database.open();
+    expect(reopened.messageEmbeddingStatus()).toMatchObject({ backendId: "embedding-backend", providerId: "embedding-provider", providerGenerationId: nextGeneration });
+    expect(() => reopened.bindMessageEmbeddingProvider("foreign-backend", "embedding-provider", nextGeneration))
+      .toThrow("Backend or Provider does not match");
+    expect(reopened.hasMessageEmbeddings("embedding-provider", nextGeneration, "voyage/voyage-4")).toBe(true);
   });
 
   it("keeps embedding failures credential-free, retryable, and outside a stable hybrid page", () => {
     const fixture = createFixture();
     fixture.store.setMessageEmbeddingEnabled(true);
-    fixture.store.bindMessageEmbeddingProvider("embedding-provider", EMBEDDING_GENERATION_ID);
+    fixture.store.bindMessageEmbeddingProvider("embedding-backend", "embedding-provider", EMBEDDING_GENERATION_ID);
     appendMessage(fixture.store, "event-retry", "session-a", 10, visible("retry vector message"));
     const [first] = fixture.store.claimMessageEmbeddingJobs(1, 20);
     expect(first).toBeDefined();
@@ -1502,7 +1531,7 @@ describe("OperationalStore visible message search", () => {
   it("applies Session scope inside KNN before the candidate limit", () => {
     const fixture = createFixture();
     fixture.store.setMessageEmbeddingEnabled(true);
-    fixture.store.bindMessageEmbeddingProvider("embedding-provider", EMBEDDING_GENERATION_ID);
+    fixture.store.bindMessageEmbeddingProvider("embedding-backend", "embedding-provider", EMBEDDING_GENERATION_ID);
     appendMessage(fixture.store, "event-in-scope", "session-a", 10, visible("the scoped semantic result"));
     for (let index = 0; index < 6; index += 1) {
       appendMessage(fixture.store, `event-closer-${index}`, "session-b", 20 + index, visible(`closer out of scope ${index}`));
@@ -1572,7 +1601,7 @@ describe("OperationalStore visible message search", () => {
       updatedAt: 9_000
     });
     fixture.store.setMessageEmbeddingEnabled(true);
-    fixture.store.bindMessageEmbeddingProvider("embedding-provider", EMBEDDING_GENERATION_ID);
+    fixture.store.bindMessageEmbeddingProvider("embedding-backend", "embedding-provider", EMBEDDING_GENERATION_ID);
     for (let index = 0; index < 760; index += 1) {
       appendMessage(fixture.store, `event-noise-${index}`, "session-a", 100 + index, visible("needle"));
     }
@@ -1911,7 +1940,7 @@ describe("OperationalStore visible message search", () => {
       generation: 1
     });
     expect(fixture.store.listEvents({ sessionId: "session-a" }).map((event) => event.payload.type))
-      .toEqual(["session_reset", "session_attention"]);
+      .toEqual(["session_changed", "session_reset", "session_attention"]);
     expect(fixture.store.listEvents({ sessionId: "session-a", includeTombstoned: true }).map((event) => event.id))
       .toEqual(expect.arrayContaining(["reset-old-message", execution.value.event.id]));
     expect(fixture.store.searchSessionMessages({ scope: { sessionId: "session-a" }, query: "pre clear marker" }).matches)

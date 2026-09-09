@@ -37,6 +37,8 @@ export class ScriptedRpcTransport implements RpcTransport {
 
   async request(method: string, params: JsonValue | undefined, options: RpcRequestOptions = {}): Promise<JsonValue> {
     if (!this.#running) throw new TransportFault("not_started", "The scripted transport is not running.");
+    if (options.signal?.aborted) throw new TransportFault("closed", "The scripted request was cancelled before dispatch.");
+    options.beforeDispatch?.();
     this.requests.push({ method, params, options });
     return this.#handler(method, params, options);
   }
@@ -67,7 +69,9 @@ export class ScriptedRpcTransport implements RpcTransport {
 
   async emitNotification(method: string, params: JsonValue): Promise<void> {
     if (!this.#running || this.#handlers === undefined) throw new TransportFault("not_started", "The scripted transport is not running.");
-    await this.#handlers.onNotification({ method, params });
+    const notification = { method, params };
+    this.#handlers.onNotificationObserved?.(notification);
+    await this.#handlers.onNotification(notification);
   }
 
   requestFromServer(method: string, params: JsonValue): Promise<JsonValue> {
@@ -101,6 +105,7 @@ export class ScriptedRpcTransport implements RpcTransport {
 
 interface FakeThread {
   readonly id: string;
+  historyMode: "paginated" | "legacy";
   readonly cwd: string;
   readonly ephemeral?: boolean;
   name: string | null;
@@ -136,7 +141,7 @@ export class FakeCodexAppServer {
   failNextAccountRead = false;
   failNextModelList = false;
   failNextThreadResumeCode: number | undefined;
-  userAgent = "codex/0.151.0-alpha.7.2";
+  userAgent = "joko/0.153.4 (Windows 10.0.26200; x86_64) unknown (joko; 0.1.0)";
   readonly reviewSkills: JsonObject[] = [];
   readonly reviewSkillErrors: JsonObject[] = [];
   reviewConfig: JsonObject = {};
@@ -300,6 +305,7 @@ export class FakeCodexAppServer {
         };
       case "thread/start": {
         const thread = this.#newThread(String(record["cwd"] ?? "/workspace"), record["ephemeral"] === true);
+        thread.historyMode = record["historyMode"] === "paginated" ? "paginated" : "legacy";
         await transport.emitNotification("thread/started", { thread: nativeThread(thread) });
         if (this.emitNameBeforeStartResponse) {
           await transport.emitNotification("thread/name/updated", { threadId: thread.id, threadName: "buffered" });
@@ -343,9 +349,28 @@ export class FakeCodexAppServer {
       }
       case "thread/turns/list": {
         const thread = this.#thread(String(record["threadId"]));
-        return { data: thread.turns.slice(-1), nextCursor: null, backwardsCursor: null };
+        const turns = record["sortDirection"] === "asc" ? [...thread.turns] : [...thread.turns].reverse();
+        const limit = typeof record["limit"] === "number" ? record["limit"] : 100;
+        const cursor = typeof record["cursor"] === "string" ? Number(record["cursor"].slice("turn-page-".length)) : 0;
+        if (!Number.isSafeInteger(cursor) || cursor < 0 || !Number.isSafeInteger(limit) || limit < 1) throw new RpcRemoteFault(-32602);
+        const itemsView = record["itemsView"] ?? "summary";
+        const data = turns.slice(cursor, cursor + limit).map((turn) => ({
+          ...turn, itemsView, ...(itemsView === "notLoaded" ? { items: [] } : {})
+        }));
+        return { data, nextCursor: cursor + limit < turns.length ? `turn-page-${cursor + limit}` : null, backwardsCursor: null };
       }
       case "thread/unsubscribe":
+        this.#thread(String(record["threadId"]));
+        return { status: "unsubscribed" };
+      case "thread/revert": {
+        const thread = this.#thread(String(record["threadId"]));
+        const index = thread.turns.findIndex((turn) => turn["id"] === record["beforeTurnId"]);
+        if (thread.historyMode !== "paginated" || index < 0 || thread.status["type"] !== "idle") throw new RpcRemoteFault(-32600);
+        thread.turns.splice(index);
+        thread.updatedAt = Math.trunc(Date.now() / 1_000);
+        await transport.emitNotification("thread/reverted", { threadId: thread.id });
+        return { thread: nativeThread(thread), turnsBackwardsCursor: null, itemsBackwardsCursor: null };
+      }
       case "thread/settings/update":
       case "thread/name/set": {
         const thread = this.#thread(String(record["threadId"]));
@@ -365,6 +390,7 @@ export class FakeCodexAppServer {
       case "thread/fork": {
         const source = this.#thread(String(record["threadId"]));
         const thread = this.#newThread(String(record["cwd"] ?? source.cwd));
+        thread.historyMode = source.historyMode;
         thread.turns.push(...source.turns.map((turn) => structuredClone(turn)));
         await transport.emitNotification("thread/started", { thread: nativeThread(thread) });
         return sessionResponse(thread, record);
@@ -400,7 +426,9 @@ export class FakeCodexAppServer {
       case "turn/steer": {
         const thread = this.#thread(String(record["threadId"]));
         const turn = thread.turns.at(-1);
-        if (turn === undefined) throw new RpcRemoteFault(-32602);
+        if (turn === undefined || turn["status"] !== "inProgress" || record["expectedTurnId"] !== turn["id"]) {
+          throw new RpcRemoteFault(-32602);
+        }
         const items = turn["items"] as JsonValue[];
         items.push({
           type: "userMessage",
@@ -425,6 +453,7 @@ export class FakeCodexAppServer {
     const now = Math.trunc(Date.now() / 1_000);
     const thread: FakeThread = {
       id: `thread-${this.#nextThread++}`,
+      historyMode: "paginated",
       cwd,
       ephemeral,
       name: null,
@@ -493,6 +522,7 @@ export class FakeCodexAppServer {
 function nativeThread(thread: FakeThread, includeTurns = false): JsonObject {
   return {
     id: thread.id,
+    historyMode: thread.historyMode,
     sessionId: thread.id,
     forkedFromId: null,
     parentThreadId: null,

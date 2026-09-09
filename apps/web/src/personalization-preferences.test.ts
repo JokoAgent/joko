@@ -8,6 +8,7 @@ import {
 import {
   PERSONALIZATION_PROMPT_MAX_LENGTH,
   PERSONALIZATION_PROMPT_MAX_OWNERS,
+  DEFAULT_UI_PREFERENCES,
   normalizeUiPreferences,
   personalizationPromptForOwner,
   withPersonalizationPrompt
@@ -36,7 +37,8 @@ describe("personalization preferences", () => {
   it("defaults link and fade choices and rejects malformed persisted prompt maps", () => {
     expect(normalizeUiPreferences({})).toMatchObject({
       personalizationPrompts: {},
-      linkOpenPreference: "sidebar",
+      webLinkOpenPreference: "external",
+      localLinkOpenPreference: "sidebar",
       streamFadeEnabled: true
     });
     expect(normalizeUiPreferences({
@@ -45,11 +47,12 @@ describe("personalization preferences", () => {
         "bad\nowner": "leak",
         "owner-too-long": "x".repeat(PERSONALIZATION_PROMPT_MAX_LENGTH + 1)
       },
-      linkOpenPreference: "system",
+      webLinkOpenPreference: "system",
       streamFadeEnabled: "false"
     })).toMatchObject({
       personalizationPrompts: {},
-      linkOpenPreference: "sidebar",
+      webLinkOpenPreference: "external",
+      localLinkOpenPreference: "sidebar",
       streamFadeEnabled: true
     });
   });
@@ -87,7 +90,7 @@ describe("personalization preferences", () => {
       .mockResolvedValueOnce("page-2");
     const showBrowser = vi.fn();
     const openExternal = vi.fn(async () => undefined);
-    const base = { browsers: [browser], sessionId: "session-1", openPage, showBrowser, openExternal };
+    const base = { browsers: [browser], sessionId: "session-1", openPage, showBrowser, openExternal, assertCurrent: () => undefined };
 
     await openHttpLinkWithPreference({ ...base, url: "https://example.test/docs", preference: "sidebar" });
     await openHttpLinkWithPreference({ ...base, url: "https://example.test/second", preference: "sidebar" });
@@ -99,18 +102,45 @@ describe("personalization preferences", () => {
 
     await expect(openHttpLinkWithPreference({ ...base, browsers: [], url: "https://unavailable.test", preference: "sidebar" })).rejects.toThrow(/unavailable/u);
     expect(openExternal).not.toHaveBeenCalled();
+    const { sessionId: _sessionId, ...sessionless } = base;
+    await expect(openHttpLinkWithPreference({ ...sessionless, url: "http://localhost:3000", preference: "sidebar" })).rejects.toThrow(/Session/u);
+    expect(openPage).toHaveBeenCalledTimes(2);
+    expect(openExternal).not.toHaveBeenCalled();
 
     await openHttpLinkWithPreference({ ...base, url: "https://openai.com", preference: "external" });
     expect(openExternal).toHaveBeenCalledWith("https://openai.com/");
     await expect(openHttpLinkWithPreference({ ...base, url: "javascript:alert(1)", preference: "external" })).rejects.toThrow(/HTTP/u);
     await expect(openHttpLinkWithPreference({ ...base, url: "https://secret@example.test", preference: "external" })).rejects.toThrow(/credential-free/u);
+
+    const request = new AbortController();
+    const assertCurrent = () => request.signal.throwIfAborted();
+    await expect(openHttpLinkWithPreference({ ...base, url: "https://example.test/retired", preference: "sidebar", assertCurrent,
+      openPage: async () => { request.abort(new Error("Retired source")); return "late-page"; }
+    })).rejects.toThrow("Retired source");
+    expect(showBrowser).toHaveBeenCalledTimes(2);
+    expect(openExternal).toHaveBeenCalledTimes(1);
   });
 
-  it("lets the right-click menu override the saved link destination for one open", () => {
-    expect(resolveLinkOpenPreference("sidebar")).toBe("sidebar");
-    expect(resolveLinkOpenPreference("external", { forceSidebar: true })).toBe("sidebar");
-    expect(resolveLinkOpenPreference("sidebar", { forceExternal: true })).toBe("external");
-    expect(resolveLinkOpenPreference("external", { forceExternal: true, forceSidebar: true })).toBe("external");
+  it.each([
+    ["https://example.test/docs", "external"],
+    ["http://192.168.1.20:8080/", "external"],
+    ["http://localhost.example.test/", "external"],
+    ["http://localhost:3000/app", "sidebar"],
+    ["http://LOCALHOST.:3000/app", "sidebar"],
+    ["https://preview.localhost/app", "sidebar"],
+    ["http://127.12.34.56:8000/", "sidebar"],
+    ["http://[::1]:3000/", "sidebar"]
+  ] as const)("selects the independent link destination for %s", (url, destination) => {
+    expect(resolveLinkOpenPreference(DEFAULT_UI_PREFERENCES, url)).toBe(destination);
+    const customized = { webLinkOpenPreference: "sidebar", localLinkOpenPreference: "external" } as const;
+    expect(resolveLinkOpenPreference(customized, url)).toBe(destination === "external" ? "sidebar" : "external");
+  });
+
+  it("lets the right-click menu override either saved destination for one open", () => {
+    expect(resolveLinkOpenPreference(DEFAULT_UI_PREFERENCES, "https://example.test", { forceSidebar: true })).toBe("sidebar");
+    expect(resolveLinkOpenPreference(DEFAULT_UI_PREFERENCES, "http://localhost", { forceExternal: true })).toBe("external");
+    expect(resolveLinkOpenPreference(DEFAULT_UI_PREFERENCES, "http://localhost", { forceExternal: true, forceSidebar: true })).toBe("external");
+    expect(DEFAULT_UI_PREFERENCES).toMatchObject({ webLinkOpenPreference: "external", localLinkOpenPreference: "sidebar" });
   });
 
   it("always disables stream fade for reduced-motion users", () => {
@@ -135,7 +165,7 @@ describe("personalization preferences", () => {
     const secondTree = markdownTree("hello world");
     rehypeTimelineStreamFade(second)(secondTree as never);
     const children = secondTree.children[0]?.children ?? [];
-    expect(children[0]).toMatchObject({ type: "text", value: "hello " });
+    expect(children[0]).toMatchObject({ type: "element", properties: { dataWfKey: "wf-0", dataWfStartedAt: 100 }, children: [{ type: "text", value: "hello " }] });
     expect(children[1]).toMatchObject({
       type: "element",
       tagName: "span",

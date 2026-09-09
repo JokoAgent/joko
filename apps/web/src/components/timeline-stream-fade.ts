@@ -236,11 +236,11 @@ function fadeLookupKey(segment: FadeSegment): string {
   return `${segment.kind}\u0000${segment.content}`;
 }
 
-function fadeDelay(key: string, state: TimelineWordFadeState, now: number): number {
+function fadeStart(key: string, state: TimelineWordFadeState, now: number): number {
   const existing = state.startAtByKey.get(key);
-  if (existing !== undefined) return Math.round(existing - now);
+  if (existing !== undefined) return existing;
   state.startAtByKey.set(key, now);
-  return 0;
+  return now;
 }
 
 function fadeNode(children: HastContent[], key: string, state: TimelineWordFadeState, now: number): HastElement {
@@ -249,22 +249,11 @@ function fadeNode(children: HastContent[], key: string, state: TimelineWordFadeS
     tagName: "span",
     properties: {
       className: ["stream-word"],
-      style: `--wf-delay:${fadeDelay(key, state, now)}ms`,
+      dataWfStartedAt: fadeStart(key, state, now),
       dataWfKey: key
     },
     children
   };
-}
-
-function slotIsSettled(slot: FadeSlot, keys: readonly string[], state: TimelineWordFadeState): boolean {
-  if (slot.kind === "inline-code") return state.settled.has(keys[slot.segmentStart] ?? "");
-  let segmentIndex = slot.segmentStart;
-  for (const word of slot.words) {
-    if (word.trim().length === 0) continue;
-    if (!state.settled.has(keys[segmentIndex] ?? "")) return false;
-    segmentIndex += 1;
-  }
-  return true;
 }
 
 function appendText(nodes: HastContent[], value: string): void {
@@ -285,8 +274,7 @@ function slotNodes(slot: FadeSlot, keys: readonly string[], state: TimelineWordF
     }
     const key = keys[segmentIndex] ?? "";
     segmentIndex += 1;
-    if (state.settled.has(key)) appendText(nodes, word);
-    else nodes.push(fadeNode([{ type: "text", value: word }], key, state, now));
+    nodes.push(fadeNode([{ type: "text", value: word }], key, state, now));
   }
   return nodes;
 }
@@ -301,17 +289,15 @@ export function rehypeTimelineStreamFade(state: TimelineWordFadeState): (tree: H
     const now = (state.now ?? (() => performance.now()))();
     for (let slotIndex = collection.slots.length - 1; slotIndex >= 0; slotIndex -= 1) {
       const slot = collection.slots[slotIndex]!;
-      if (slotIsSettled(slot, keys, state)) continue;
       slot.parent.children.splice(slot.index, 1, ...slotNodes(slot, keys, state, now));
     }
     for (const marker of collection.markers) {
       const key = marker.segmentEnd > marker.segmentStart ? keys[marker.segmentStart] : undefined;
-      if (key !== undefined && state.settled.has(key)) continue;
       marker.node.properties = {
         ...marker.node.properties,
         dataStreamMarker: true,
         ...(key === undefined ? {} : { dataWfKey: key }),
-        style: `--wf-delay:${key === undefined ? 0 : fadeDelay(key, state, now)}ms`
+        dataWfStartedAt: key === undefined ? now : fadeStart(key, state, now)
       };
     }
   };

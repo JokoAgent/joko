@@ -16,6 +16,11 @@ export interface RemoteSshCredentialRef {
   readonly id: string;
 }
 
+export interface RemoteSshNodeKeyRef {
+  readonly id: string;
+  readonly expectedFingerprint: string;
+}
+
 export type RemoteSshHostSource = "manual" | "ssh_config";
 
 export interface RemoteSshConfigHost extends RemoteSshOwnerScope {
@@ -33,6 +38,7 @@ export interface RemoteSshHostInput extends RemoteSshOwnerScope {
   readonly user: string;
   /** Opaque runtime reference for secret-backed auth; absent for system-agent auth. */
   readonly credentialRef?: RemoteSshCredentialRef;
+  readonly nodeKey?: RemoteSshNodeKeyRef;
 }
 
 export interface RemoteSshHost extends RemoteSshOwnerScope {
@@ -41,6 +47,7 @@ export interface RemoteSshHost extends RemoteSshOwnerScope {
   readonly port: number;
   readonly user: string;
   readonly credentialRef?: RemoteSshCredentialRef;
+  readonly nodeKey?: RemoteSshNodeKeyRef;
   readonly source: "manual";
 }
 
@@ -52,7 +59,7 @@ export type RemoteSshStatus =
   | "failed";
 
 export interface RemoteSshSnapshot {
-  readonly host: Omit<RemoteSshHost, "credentialRef">;
+  readonly host: Omit<RemoteSshHost, "credentialRef" | "nodeKey">;
   readonly status: RemoteSshStatus;
   readonly statusChangedAt: number;
   readonly error?: RemoteSshErrorShape;
@@ -97,6 +104,7 @@ export interface AgentAuthConnectorRequest {
   readonly port: number;
   readonly user: string;
   readonly credentialRef?: RemoteSshCredentialRef;
+  readonly nodeKey?: RemoteSshNodeKeyRef;
   readonly signal: AbortSignal;
   readonly verifyHostKey: (key: PresentedSshHostKey) => Promise<void>;
   readonly onAuthenticating: () => void;
@@ -110,6 +118,8 @@ export interface AgentAuthConnection {
   execute?(request: AgentAuthExecutionRequest): Promise<AgentAuthExecutionResult>;
   /** Optional long-lived remote process capability. */
   readonly processes?: RemoteProcessTransportPort;
+  /** Optional interactive PTY on the authenticated SSH user's environment. */
+  readonly terminals?: RemoteTerminalTransportPort;
   /** Optional remote filesystem capability. */
   readonly files?: RemoteFileTransportPort;
   /** Optional local-to-remote TCP stream capability. */
@@ -119,6 +129,7 @@ export interface AgentAuthConnection {
 export interface RemoteSshTransportCapabilities {
   readonly commandExecution: boolean;
   readonly processStreaming: boolean;
+  readonly interactiveTerminal: boolean;
   readonly fileTransfer: boolean;
   readonly tcpForwarding: boolean;
 }
@@ -127,11 +138,17 @@ export interface RemoteSshTransportCapabilities {
 export interface RemoteSshTransportLease {
   readonly capabilities: RemoteSshTransportCapabilities;
   readonly processes?: RemoteProcessTransportPort;
+  readonly terminals?: RemoteTerminalTransportPort;
   readonly files?: RemoteFileTransportPort;
   readonly forwarding?: RemoteForwardingTransportPort;
 }
 
 export type ResolvedSshAuthentication =
+  | {
+      readonly kind: "agent_key";
+      readonly publicKey: Uint8Array;
+      readonly endpoint?: string;
+    }
   | {
       readonly kind: "system_agent";
       /** Service-owned override. Requests and public contracts never select this path. */
@@ -144,7 +161,7 @@ export type ResolvedSshAuthentication =
       readonly passphrase?: Uint8Array;
     };
 
-export interface ResolvedAgentAuthConnectorRequest extends Omit<AgentAuthConnectorRequest, "credentialRef"> {
+export interface ResolvedAgentAuthConnectorRequest extends Omit<AgentAuthConnectorRequest, "credentialRef" | "nodeKey"> {
   readonly authentication: ResolvedSshAuthentication;
 }
 
@@ -196,6 +213,39 @@ export interface RemoteProcessHandle {
 
 export interface RemoteProcessTransportPort {
   open(request: RemoteProcessStartRequest): Promise<RemoteProcessHandle>;
+}
+
+/** No environment overrides: the remote SSH user owns the terminal environment. */
+export interface RemoteTerminalStartRequest {
+  readonly executable: string;
+  readonly args: readonly string[];
+  readonly cwd: string;
+  readonly cols: number;
+  readonly rows: number;
+  /** Cancels creation only; detached when the handle is delivered. */
+  readonly signal?: AbortSignal;
+}
+
+export interface RemoteTerminalExit {
+  readonly exitCode: number;
+  readonly signal?: number;
+  readonly failureCode?: string;
+  readonly processExitConfirmed?: boolean;
+}
+
+export interface RemoteTerminalHandle {
+  readonly pid?: number;
+  onData(listener: (data: string) => void): { dispose(): void };
+  onExit(listener: (event: RemoteTerminalExit) => void): { dispose(): void };
+  write(data: string): Promise<void>;
+  resize(cols: number, rows: number): Promise<void>;
+  kill(): Promise<void>;
+  pause(): void;
+  resume(): void;
+}
+
+export interface RemoteTerminalTransportPort {
+  open(request: RemoteTerminalStartRequest): Promise<RemoteTerminalHandle>;
 }
 
 export type RemoteFileKind = "file" | "directory" | "symbolic_link" | "other";

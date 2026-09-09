@@ -228,6 +228,7 @@ enum McpTransport {
   MCP_TRANSPORT_LOOPBACK_BRIDGE = 1;
   MCP_TRANSPORT_HTTPS_STREAMABLE_HTTP = 2;
   MCP_TRANSPORT_STDIO = 3;
+  MCP_TRANSPORT_HTTP_SSE = 4;
 }
 
 enum McpServerState {
@@ -257,12 +258,12 @@ message McpServerDescriptor {
   oneof transport_config {
     StdioMcpConfiguration stdio = 12;
     StreamableHttpMcpConfiguration streamable_http = 13;
+    SseMcpConfiguration sse = 14;
   }
 }
 
 // Refers to a secret held by the credential channel; never contains its value.
 message CredentialBinding {
-  string header_name = 1;
   string credential_reference_id = 2;
   bool configured = 3;
   McpCredentialTarget target = 4;
@@ -278,13 +279,12 @@ enum McpCredentialTarget {
 message McpServerInput {
   string display_name = 1;
   McpTransport transport = 2;
-  // Canonical endpoint without URL user-info, tokens, or secret query values.
-  string endpoint = 3;
   repeated CredentialBinding credential_bindings = 4;
   bool enabled = 5;
   oneof transport_config {
     StdioMcpConfiguration stdio = 6;
     StreamableHttpMcpConfiguration streamable_http = 7;
+    SseMcpConfiguration sse = 8;
   }
 }
 
@@ -303,6 +303,11 @@ message StreamableHttpMcpConfiguration {
 message McpEnvironmentVariable {
   string name = 1;
   string value = 2;
+}
+
+message SseMcpConfiguration {
+  // Canonical endpoint without URL user-info, tokens, or secret query values.
+  string endpoint = 1;
 }
 
 enum BrowserProviderState {

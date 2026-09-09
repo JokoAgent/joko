@@ -40,6 +40,7 @@ export const CAPABILITIES = [
   "session.detach",
   "session.fork",
   "session.rewind",
+  "session.rewind_to_start",
   "session.tree",
   "session.clone",
   "session.export",
@@ -97,6 +98,7 @@ export const CAPABILITIES = [
   "background.tasks",
   "background.tasks.cancel",
   "subagents.list",
+  "subagents.default_model",
   "subagents.detail",
   "subagents.transcript",
   "subagents.stop",
@@ -117,9 +119,29 @@ export const CAPABILITIES = [
 
 export type KnownCapability = (typeof CAPABILITIES)[number];
 
+export type NativeNavigationTarget =
+  | { readonly kind: "native_entry"; readonly entryId: string }
+  | { readonly kind: "session_start" };
+
+export interface NativeNavigationAnchor {
+  readonly target: NativeNavigationTarget;
+  readonly generation: number;
+}
+
+export function isNativeNavigationTarget(value: unknown): value is NativeNavigationTarget {
+  if (value === null || typeof value !== "object") return false;
+  const target = value as Record<string, unknown>;
+  return target["kind"] === "session_start"
+    ? Object.keys(target).length === 1
+    : target["kind"] === "native_entry" && Object.keys(target).length === 2
+      && typeof target["entryId"] === "string" && target["entryId"].length > 0
+      && target["entryId"].length <= 4_096 && !/[\u0000-\u001f\u007f]/u.test(target["entryId"]);
+}
+
 /** Capabilities implemented entirely by the product Host and safely composed onto any Adapter. */
 export const HOST_COMPOSED_CAPABILITIES = [
   "session.attention",
+  "session.ai_rename",
   "session.auto_title",
   "session.summary",
   "workspace.files",
@@ -161,6 +183,7 @@ export type RunState =
 
 export interface BlobRef {
   readonly id: ArtifactId;
+  /** Lowercase, 64-character hexadecimal digest without a prefix. */
   readonly sha256: string;
   readonly byteLength: number;
   readonly mimeType: string;
@@ -177,11 +200,21 @@ export interface FileInput {
   readonly workspacePath?: string;
 }
 
-export interface MentionInput {
-  readonly kind: "workspace_file" | "resource" | "artifact";
+export interface WorkspaceLineRange {
+  /** Inclusive, one-based source lines. */
+  readonly startLine: number;
+  readonly endLine: number;
+}
+
+interface MentionInputBase {
   readonly label: string;
   readonly reference: string;
 }
+
+export type MentionInput = MentionInputBase & (
+  | { readonly kind: "workspace_file"; readonly lineRange?: WorkspaceLineRange }
+  | { readonly kind: "workspace_directory" | "resource" | "artifact"; readonly lineRange?: never }
+);
 
 /** UTF-16 offsets identifying an inline source span with a compact display label. */
 export interface InlineTextRange {
@@ -283,6 +316,15 @@ export interface ProviderModel {
     readonly updatedAt?: number;
     readonly cacheReadAvailable?: boolean;
     readonly cacheWriteAvailable?: boolean;
+    readonly fastModeMultiplier?: number;
+    readonly longContext?: {
+      /** Applies to the whole request only when its input exceeds this limit. */
+      readonly inputTokenThreshold: number;
+      readonly inputMultiplier: number;
+      readonly outputMultiplier: number;
+      readonly cacheReadMultiplier: number;
+      readonly cacheWriteMultiplier: number;
+    };
   };
 }
 
@@ -385,6 +427,11 @@ export interface UsageSnapshot {
   readonly totalTokens: number;
   readonly contextTokens?: number;
   readonly contextWindow?: number;
+  /** Observed request scope for reference pricing; never cumulative token totals. */
+  readonly pricingContext?: {
+    readonly inputTokens: number;
+    readonly fastMode?: boolean;
+  };
   readonly cost: number;
 }
 
@@ -422,6 +469,33 @@ export interface BackendDescriptor {
   readonly models: readonly ProviderModel[];
   readonly tools: readonly BackendToolDescriptor[];
   readonly diagnostics: readonly string[];
+  /** Exact managed configuration accepted by this Adapter's production consumer. */
+  readonly providerRuntimeSupport?: ProviderRuntimeSupport;
+}
+
+export type ProviderRuntimeProtocol =
+  | "anthropic-messages"
+  | "openai-responses"
+  | "openai-completions"
+  | "google-generative-ai";
+
+export type ProviderConfigurationField =
+  | "request_path"
+  | "models_endpoint"
+  | "headers"
+  | "keyless"
+  | "auth_header"
+  | "model_limits"
+  | "model_costs"
+  | "model_input_modalities"
+  | "model_thinking_levels"
+  | "model_sampling"
+  | "model_compatibility"
+  | "model_fast_mode";
+
+export interface ProviderRuntimeSupport {
+  readonly protocols: readonly ProviderRuntimeProtocol[];
+  readonly fields: readonly ProviderConfigurationField[];
 }
 
 export interface TargetDescriptor {

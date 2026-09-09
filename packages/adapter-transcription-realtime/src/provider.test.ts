@@ -85,8 +85,8 @@ describe("RealtimeTranscriptionProvider", () => {
           socket.send(JSON.stringify({
             type: "conversation.item.input_audio_transcription.text",
             item_id: "item-1",
-            text: "你好",
-            stash: "呀"
+            text: "hello",
+            stash: " there"
           }));
         }
         if (message["type"] === "session.finish") socket.send(JSON.stringify({ type: "session.finished" }));
@@ -111,7 +111,7 @@ describe("RealtimeTranscriptionProvider", () => {
     expect(requestUrl).toContain("model=fresh-model");
     expect(inbound.map((message) => message["type"])).not.toContain("input_audio_buffer.commit");
     expect(inbound.map((message) => message["type"])).toContain("session.finish");
-    expect(events).toContainEqual({ type: "partial", text: "你好呀" });
+    expect(events).toContainEqual({ type: "partial", text: "hello there" });
   });
 
   it("classifies a rejected handshake without exposing response text", async () => {

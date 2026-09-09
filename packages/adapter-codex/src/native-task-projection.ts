@@ -177,6 +177,81 @@ export class CodexNativeTaskProjection {
     return child !== undefined && child.activeTurnId === turnId && activeState(child.state);
   }
 
+  hasActiveTasks(): boolean {
+    return [...this.#runs.values()].some((run) => activeState(run.state))
+      || [...this.#children.values()].some(({ child }) => activeState(child.state));
+  }
+
+  mergeHistory(thread: NativeThread): readonly CodexNativeTaskLineage[] {
+    return this.#mergeHistory(thread).lineages;
+  }
+
+  replaceHistory(thread: NativeThread): readonly CodexNativeTaskLineage[] {
+    const history = this.#mergeHistory(thread);
+    const retained = new Set(history.lineages.map((lineage) => lineage.childThreadId));
+    const byParent = new Map<string, string[]>();
+    for (const [id, { run }] of this.#children) {
+      const children = byParent.get(run.parentThreadId) ?? [];
+      children.push(id);
+      byParent.set(run.parentThreadId, children);
+    }
+    const queue = [...retained];
+    for (let index = 0; index < queue.length; index++) {
+      for (const child of byParent.get(queue[index]!) ?? []) {
+        if (retained.has(child)) continue;
+        retained.add(child);
+        queue.push(child);
+      }
+    }
+    for (const [id, run] of this.#runs) {
+      if (run.parentThreadId === this.#rootThreadId ? !history.rootRunIds.has(id) : !retained.has(run.parentThreadId)) {
+        this.#runs.delete(id);
+      }
+      for (const childId of run.children.keys()) {
+        if (retained.has(childId)) continue;
+        run.children.delete(childId);
+        this.#children.delete(childId);
+      }
+    }
+    this.#pendingMessages.clear();
+    return [...this.#children].map(([childThreadId, { run }]) => ({ childThreadId, parentThreadId: run.parentThreadId }));
+  }
+
+  #mergeHistory(thread: NativeThread): {
+    readonly lineages: readonly CodexNativeTaskLineage[];
+    readonly rootRunIds: ReadonlySet<string>;
+  } {
+    const history = new CodexNativeTaskProjection({
+      sessionId: this.#sessionId, rootThreadId: this.#rootThreadId, providerId: this.#providerId,
+      modelId: this.#fallbackModelId, thinkingLevel: this.#fallbackThinkingLevel, now: this.#now
+    });
+    const lineages = history.seed(thread);
+    if (new Set([...this.#runs.keys(), ...history.#runs.keys()]).size > MAXIMUM_RUNS
+      || new Set([...this.#children.keys(), ...history.#children.keys()]).size > MAXIMUM_CHILDREN) {
+      throw new Error("The Codex delegated history exceeded its safe limit.");
+    }
+    for (const [id, run] of history.#runs) {
+      const existing = this.#runs.get(id);
+      if (existing !== undefined && existing.parentThreadId !== run.parentThreadId) {
+        throw new Error("A Codex delegated run was claimed by conflicting parent threads.");
+      }
+      this.#assertLineageTargets(id, run.parentThreadId, [...run.children.keys()]);
+    }
+    // The root transcript describes an earlier child snapshot. Keep current
+    // child state and nested activity already observed by this live owner.
+    for (const [id, run] of history.#runs) {
+      const current = this.#runs.get(id) ?? run;
+      this.#runs.set(id, current);
+      for (const [childId, child] of run.children) {
+        if (this.#children.has(childId)) continue;
+        current.children.set(childId, child);
+        if (!current.identityAliases.includes(child.id)) current.identityAliases.push(child.id);
+        this.#children.set(childId, { run: current, child });
+      }
+    }
+    return { lineages, rootRunIds: new Set(history.#runs.keys()) };
+  }
+
   terminateActive(
     state: "failed" | "stopped",
     error?: PublicError

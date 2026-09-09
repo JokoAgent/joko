@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, realpath } from "node:fs/promises";
-import { isAbsolute, normalize, relative, resolve, sep } from "node:path";
+import { homedir } from "node:os";
+import { isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import {
   createChildRuntimeEnvironment,
   type DurableProcessOwnerOptions
@@ -22,9 +24,18 @@ import {
   type InteractionDecision,
   type InteractionPayload,
   type MessageBlock,
+  type ManagedProviderRuntimePort,
+  type ManagedProviderRouteBinding,
+  type ManagedProviderOperationLease,
+  type ProviderRuntimeSupport,
   type NativeHistoryProjectedEvent,
   type NativeHistoryProjection,
   type NativeSessionBinding,
+  type NativeSessionDerivation,
+  type NativeSessionForkResult,
+  type NativeSessionNavigation,
+  type NativeSessionNavigationResult,
+  type NativeNavigationTarget,
   type NativeSessionCatalogEntry,
   type NativeSessionCatalogResult,
   type NativeSessionCandidate,
@@ -39,6 +50,8 @@ import {
 } from "@joko/core";
 import { AsyncInputGate, deferred, type Deferred } from "./async-input-gate.js";
 import { claudeCodeError } from "./errors.js";
+import { SessionSdkFailure } from "./session-sdk-owner.js";
+import { prepareClaudePrompt, type ClaudeInputResolvers } from "./prompt-input.js";
 import {
   PartialMessageBuffer,
   ProjectionLimitError,
@@ -105,8 +118,11 @@ const MAX_PERMISSION_RULES = 256;
 const MAX_PERMISSION_RULE_CONTENT = 4_096;
 const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 const DEFAULT_SETTING_SOURCES = ["user", "project", "local"] as const;
-const ISOLATED_REVIEW_CLI_VERSION = [2, 1, 239] as const;
-const NATIVE_TASK_CLI_VERSION = [2, 1, 239] as const;
+const ISOLATED_REVIEW_CLI_VERSION = [2, 1, 259] as const;
+const NATIVE_TASK_CLI_VERSION = [2, 1, 259] as const;
+const SUBAGENT_DEFAULT_MODEL_CLI_VERSION = [2, 1, 259] as const;
+const STEER_CLI_VERSION = [2, 1, 259] as const;
+const MAX_TURN_INPUTS = 64;
 const REVIEW_READ_TOOLS = ["Read", "Glob", "Grep"] as const;
 const REVIEW_DISALLOWED_TOOLS = [
   "Bash",
@@ -279,13 +295,14 @@ function managedAuthEnvironmentOverrides(): Readonly<Record<string, string | und
   };
 }
 
-export interface ClaudeCodeAdapterOptions {
+export interface ClaudeCodeAdapterOptions extends ClaudeInputResolvers {
   readonly instanceGeneration: number;
   readonly id?: string;
   readonly runtime?: ClaudeSdkRuntime;
   readonly environment?: Readonly<Record<string, string | undefined>>;
   /** Opaque Orchestrator-owned persistence boundary for the native subscription account. */
   readonly credentialPort?: ClaudeCodeCredentialPort;
+  readonly managedProviders?: ManagedProviderRuntimePort;
   readonly oauthFetch?: typeof fetch;
   readonly oauthLoginTimeoutMs?: number;
   readonly oauthRefreshTimeoutMs?: number;
@@ -307,9 +324,12 @@ export interface ClaudeCodeAdapterOptions {
   readonly now?: () => number;
   /** Product Host capabilities that do not require Adapter runtime integration. */
   readonly hostCapabilities?: readonly HostComposedCapability[];
+  /** Reads the committed default for new native runtimes on this Provider. */
+  readonly resolveSubagentModel?: (providerId: string) => string | undefined;
 }
 
 interface ActiveTurn {
+  readonly providerLease?: ManagedProviderOperationLease;
   readonly context: AdapterContext;
   readonly sessionGeneration: number;
   readonly backendInstanceGeneration: number;
@@ -324,6 +344,9 @@ interface ActiveTurn {
   readonly seenToolStarts: Set<string>;
   readonly seenToolResults: Set<string>;
   readonly stream: PartialMessageBuffer;
+  readonly steers: Map<string, SteerAdmission>;
+  stopping: boolean;
+  interruptConfirmation?: Deferred<void>;
   inputConsumed: boolean;
   nativeIdentityConfirmed: boolean;
   terminalClaimed: boolean;
@@ -341,6 +364,17 @@ interface ActiveTurn {
   parentStreamUsage: UsageSnapshot;
   parentStreamSegment?: ParentStreamSegment;
   assistantError?: string;
+}
+
+interface SteerAdmission {
+  readonly context: AdapterContext;
+  readonly cancellation: AbortController;
+  readonly admission: Deferred<void>;
+  readonly eventsReady: Deferred<void>;
+  consumed: boolean;
+  accepted: boolean;
+  resultConfirmed: boolean;
+  terminalClaimed: boolean;
 }
 
 interface ParentStreamSegment {
@@ -362,6 +396,7 @@ interface PendingPermission {
 }
 
 interface NativeRuntime {
+  readonly managedRoute?: ManagedProviderRouteBinding;
   readonly productSessionId: string;
   readonly target: TargetDescriptor;
   readonly binding: NativeSessionBinding;
@@ -375,6 +410,7 @@ interface NativeRuntime {
   readonly baseContext: AdapterContext;
   readonly nativeTasks: ClaudeNativeTaskProjection;
   readonly runtimePolicy: "standard" | "review_read_only";
+  readonly subagentModel: string | undefined;
   readonly capabilities: Set<string>;
   readonly pendingPermissions: Map<string, PendingPermission>;
   readonly resolvedPermissions: Map<string, PermissionCacheEntry>;
@@ -382,10 +418,17 @@ interface NativeRuntime {
   consumer: Promise<void>;
   closed: boolean;
   nativeTaskProjectionEnabled: boolean;
+  steerEnabled: boolean;
+  inputPreparation?: AbortController;
+  pendingControl?: symbol;
+  controlUncertain: boolean;
   activeTurn?: ActiveTurn;
   initialization?: ClaudeSdkInitializationResult;
   modelId?: string;
   effort?: string;
+  fastMode: boolean;
+  fastModeObservation?: FastModeObservation;
+  publishedFastModeStatus?: string;
   permissionMode: PermissionMode;
   planMode: boolean;
   additionalDirectories: readonly ApprovedDirectory[];
@@ -403,6 +446,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
   readonly #runtime: ClaudeSdkRuntime;
   readonly #instanceGeneration: number;
   readonly #environment: Readonly<Record<string, string>>;
+  readonly #managedProviders: ManagedProviderRuntimePort | undefined;
   readonly #pathToExecutable: string | undefined;
   readonly #probeCwd: string;
   readonly #settingSources: readonly ("user" | "project" | "local")[];
@@ -414,6 +458,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
   readonly #maximumDiscoveredSessions: number;
   readonly #maximumCatalogSessions: number;
   readonly #hostCapabilities: ReadonlySet<HostComposedCapability>;
+  readonly #inputResolvers: ClaudeInputResolvers;
+  readonly #resolveSubagentModel: ClaudeCodeAdapterOptions["resolveSubagentModel"];
   readonly #projection: SafeProjection;
   readonly #now: () => number;
   readonly #oauthAccount: ClaudeCodeOAuthAccount | undefined;
@@ -436,12 +482,15 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     const id = options.id?.trim() ?? ADAPTER_ID;
     if (id.length === 0 || id.length > 256) throw new TypeError("id must be a non-empty bounded string.");
     this.id = id;
+    this.#managedProviders = options.managedProviders;
     this.#instanceGeneration = options.instanceGeneration;
     const childEnvironment = createChildRuntimeEnvironment({
       allowedKeys: CLAUDE_RUNTIME_ENVIRONMENT_KEYS,
       overrides: {
         ...options.environment,
         ...(options.credentialPort === undefined ? {} : managedAuthEnvironmentOverrides()),
+        CLAUDE_CODE_SUBAGENT_MODEL: undefined,
+        CLAUDE_CODE_SUBAGENT_MODEL_FORCE: undefined,
         CLAUDE_AGENT_SDK_CLIENT_APP: "joko/0.1.0"
       },
       sensitiveKeys: [
@@ -449,7 +498,10 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         ...Object.keys(options.environment ?? {})
       ]
     });
-    this.#environment = childEnvironment.environment;
+    const environmentHome = childEnvironment.environment[process.platform === "win32" ? "USERPROFILE" : "HOME"] ?? homedir();
+    const configDirectory = childEnvironment.environment["CLAUDE_CONFIG_DIR"] ?? join(environmentHome, ".claude");
+    if (!isAbsolute(configDirectory)) throw new TypeError("The native Session configuration directory must be absolute.");
+    this.#environment = Object.freeze({ ...childEnvironment.environment, CLAUDE_CONFIG_DIR: resolve(configDirectory).normalize("NFC") });
     this.#pathToExecutable = options.pathToClaudeCodeExecutable;
     if (options.probeCwd !== undefined && !isAbsolute(options.probeCwd)) {
       throw new TypeError("probeCwd must be an absolute path.");
@@ -461,7 +513,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     this.#teardownTimeoutMs = positiveTimeout(options.teardownTimeoutMs, DEFAULT_TEARDOWN_TIMEOUT_MS);
     this.#runtime = options.runtime ?? new DefaultClaudeSdkRuntime({
       ...(options.processOwner === undefined ? {} : { processOwner: options.processOwner }),
-      retirementTimeoutMs: this.#teardownTimeoutMs
+      retirementTimeoutMs: this.#teardownTimeoutMs,
+      environment: this.#environment,
+      sessionOperationTimeoutMs: this.#initializationTimeoutMs
     });
     this.#interruptTimeoutMs = positiveTimeout(options.interruptTimeoutMs, DEFAULT_INTERRUPT_TIMEOUT_MS);
     this.#nativeContinuationGraceMs = positiveTimeout(
@@ -479,9 +533,15 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       1_000
     );
     this.#hostCapabilities = validatedHostCapabilities(options.hostCapabilities);
+    this.#resolveSubagentModel = options.resolveSubagentModel;
+    this.#inputResolvers = {
+      ...(options.readBlob === undefined ? {} : { readBlob: options.readBlob }),
+      ...(options.resolveFile === undefined ? {} : { resolveFile: options.resolveFile })
+    };
     this.#now = options.now ?? Date.now;
     this.#projection = new SafeProjection([
       ...(options.redactValues ?? []),
+      ...Object.values(options.managedProviders?.environment ?? {}),
       ...childEnvironment.sensitiveValues
     ], () => this.#oauthAccount?.redactionValues() ?? []);
     this.#oauthAccount = options.credentialPort === undefined
@@ -612,11 +672,17 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         installed,
         supportsIsolatedReview(this.#lastCliVersion),
         supportsNativeTaskProjection(this.#lastCliVersion),
+        supportsSteer(this.#lastCliVersion),
+        supportsSubagentDefaultModel(this.#lastCliVersion),
+        this.#resolveSubagentModel !== undefined,
         catalogModels,
+        this.#managedModels().some((model) => model.thinkingLevels.length > 0),
         this.#hostCapabilities,
         supportsLogin,
-        supportsLogout
+        supportsLogout,
+        this.#inputResolvers
       ),
+      ...(this.#managedProviders === undefined ? {} : { providerRuntimeSupport: managedProviderSupport(this.#managedProviders.support) }),
       providers: [{
         providerId: PROVIDER_ID,
         displayName: "Anthropic",
@@ -630,8 +696,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         supportsLogout,
         supportsRefresh: installed,
         supportsModelRefresh: installed
-      }],
-      models: catalogModels.map((model) => providerModel(model, this.#projection)),
+      }, ...(this.#managedProviders?.listProviders() ?? [])],
+      models: [...catalogModels.map((model) => providerModel(model, this.#projection)), ...this.#managedModels()],
       tools: [...this.#toolNames].sort().map((name) => ({
         toolId: name,
         name,
@@ -645,6 +711,13 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       diagnostics
     };
     return descriptor;
+  }
+
+  #managedModels(): readonly ProviderModel[] {
+    return (this.#managedProviders?.listModels() ?? []).flatMap((model) => {
+      try { return [managedProviderModel(model, this.#managedProviders!.getThinkingLevelMap(model.providerId, model.modelId))]; }
+      catch { return []; }
+    });
   }
 
   async readAccount(refreshToken = false): Promise<ClaudeCodeAccountSnapshot> {
@@ -892,17 +965,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       return binding;
     }
     assertFullAccessTarget(input.permissionMode, context.target, "session_start");
-    if (input.fastMode) {
-      throw claudeCodeError("BACKEND_CAPABILITY_UNAVAILABLE", "Fast mode is not controllable through this Adapter.", "capability", {
-        recovery: "Create the Session without fast mode."
-      });
-    }
-    if (input.providerId !== undefined && input.providerId !== PROVIDER_ID) {
+    if (input.providerId !== undefined && input.providerId !== PROVIDER_ID && !this.#managedProviders?.hasProvider(input.providerId)) {
       throw claudeCodeError("PROVIDER_UNAVAILABLE", "The requested provider is not owned by this Backend.", "model", {
         recovery: "Use the Claude Code provider catalog."
       });
     }
-    const effort = normalizeEffort(input.effort);
+    const effort = normalizeProductEffort(input.effort);
     if (input.effort !== undefined && effort === undefined) {
       throw claudeCodeError("EFFORT_UNAVAILABLE", "The requested effort level is unsupported.", "model", {
         recovery: `Choose one of: ${EFFORT_LEVELS.join(", ")}.`
@@ -916,8 +984,10 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     const binding = bindingFor(randomUUID(), context.generation);
     await this.#startRuntime(binding, context, {
       resume: false,
+      providerId: input.providerId,
       modelId: input.modelId,
       effort,
+      fastMode: input.fastMode,
       permissionMode: input.permissionMode,
       title: input.name,
       appendSystemPrompt: input.appendSystemPrompt ?? context.appendSystemPrompt,
@@ -1061,13 +1131,35 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     await this.validateTarget(context.target);
     this.#assertBindingContext(binding, context);
     const nativeSessionId = parseBinding(binding);
+    if (this.#runtime.ownsSessionFork(nativeSessionId)
+      || [...this.#sessions.values()].some((runtime) => runtime.nativeSessionId === nativeSessionId && runtime.productSessionId !== context.sessionId)) {
+      throw claudeCodeError("NATIVE_SESSION_DELETE_BUSY", "The native Session still has an active owner.", "session_delete", {
+        retryable: true,
+        recovery: "Wait for the owning operation to retire before deleting native state."
+      });
+    }
     const runtime = this.#sessions.get(context.sessionId);
-    if (runtime !== undefined) {
+    if (runtime !== undefined && runtime.nativeSessionId === nativeSessionId) {
       this.#assertCurrent(runtime, context, binding);
       await this.#retireRuntime(runtime);
     }
+    if (context.signal.aborted) {
+      throw claudeCodeError("NATIVE_SESSION_DELETE_CANCELLED", "The native Session delete was cancelled before dispatch.", "session_delete");
+    }
     try {
-      await this.#runtime.deleteSession(nativeSessionId, { dir: context.target.workspaceRoot });
+      const info = await this.#runtime.getSessionInfo(nativeSessionId, { dir: context.target.workspaceRoot, signal: context.signal });
+      await this.validateTarget(context.target);
+      context.signal.throwIfAborted();
+      this.#assertBindingContext(binding, context);
+      if (this.#runtime.ownsSessionFork(nativeSessionId)
+        || [...this.#sessions.values()].some((active) => active.nativeSessionId === nativeSessionId)) {
+        throw new Error("The native Session acquired another runtime owner.");
+      }
+      // The SDK may search related worktree stores for this UUID. Metadata is
+      // the public authority for the exact workspace selected by this delete.
+      if (info === undefined) throw continuityGap();
+      assertSessionInfo(info, nativeSessionId, context.target.workspaceRoot);
+      await this.#runtime.deleteSession(nativeSessionId, { dir: context.target.workspaceRoot, signal: context.signal });
     } catch {
       throw claudeCodeError("NATIVE_SESSION_DELETE_UNKNOWN", "The native Session delete outcome is unknown.", "session_delete", {
         retryable: true,
@@ -1084,21 +1176,77 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
   }
 
   override async send(input: PromptInput, context: AdapterContext): Promise<void> {
-    const runtime = this.#requireRuntime(context);
-    if (runtime.activeTurn !== undefined) {
-      throw claudeCodeError("SESSION_BUSY", "The native Session already has an active turn.", "dispatch", {
-        retryable: true,
-        recovery: "Wait for the current Result before sending another prompt."
-      });
-    }
     validatePrompt(input);
+    if (input.disposition === "steer") return this.#steer(input, context);
+    let runtime = this.#requireIdleRuntime(context);
+    if (runtime.managedRoute !== undefined && (context.modelSelection?.providerId !== runtime.managedRoute.providerId
+      || context.modelSelection.modelId !== runtime.managedRoute.model.modelId)) throw managedRouteUnavailable();
     const operationId = context.operationId;
     if (operationId === undefined || operationId.length === 0) {
       throw claudeCodeError("OPERATION_ID_REQUIRED", "A durable operation identity is required before native dispatch.", "dispatch", {
         recovery: "Persist the queue item and retry with its operation identity."
       });
     }
+    if (input.images.length > 0 || input.files.length > 0 || input.mentions.length > 0) {
+      this.#assertStandardRuntime(runtime, "Attachment input");
+    }
+    if (runtime.managedRoute !== undefined) {
+      try { runtime.managedRoute.assertCurrent(); }
+      catch {
+        await this.#replaceModelRoute(runtime, runtime.managedRoute.providerId, runtime.managedRoute.model.modelId, context);
+        runtime = this.#requireIdleRuntime(context);
+      }
+    }
+    const preparation = new AbortController();
+    const preparationSignal = AbortSignal.any([context.signal, preparation.signal]);
+    runtime.inputPreparation = preparation;
+    let content: ClaudeSdkUserMessage["message"]["content"];
+    let providerLease: ManagedProviderOperationLease | undefined;
+    try {
+      preparationSignal.throwIfAborted();
+      content = await waitFor(
+        prepareClaudePrompt(input, context, this.#inputResolvers, preparationSignal),
+        this.#admissionTimeoutMs,
+        preparationSignal,
+        () => claudeCodeError("INPUT_PREPARATION_TIMEOUT", "Native input attachments could not be prepared in time.", "input", {
+          retryable: true,
+          recovery: "Restore the attachments and retry the prompt."
+        })
+      );
+      preparationSignal.throwIfAborted();
+      this.#assertCurrent(runtime, context, context.binding);
+      if (runtime.managedRoute !== undefined) {
+        runtime.managedRoute.assertCurrent();
+        const activation = runtime.managedRoute.activate({
+          operationId, signal: AbortSignal.any([context.signal, runtime.abortController.signal]),
+          assertCurrent: () => {
+            this.#assertCurrent(runtime, context, context.binding);
+            if (runtime.inputPreparation === preparation && !preparationSignal.aborted) return;
+            if (runtime.activeTurn?.operationId !== operationId || runtime.activeTurn.terminalClaimed || runtime.activeTurn.stopping) {
+              throw new Error("The managed model operation is no longer active.");
+            }
+          }
+        }).then((lease) => {
+          if (preparationSignal.aborted || runtime.inputPreparation !== preparation || !this.#isRuntimeCurrent(runtime)) {
+            lease.release();
+            throw new Error("The managed model admission was cancelled.");
+          }
+          return lease;
+        });
+        providerLease = await waitFor(activation, this.#admissionTimeoutMs, preparationSignal,
+          () => dispatchError("The managed model request authority could not be prepared in time.", false));
+      }
+    } catch (error) {
+      providerLease?.release();
+      throw error;
+    } finally {
+      if (runtime.inputPreparation === preparation) runtime.inputPreparation = undefined;
+      preparation.abort();
+    }
+    try { this.#requireIdleRuntime(context); }
+    catch (error) { providerLease?.release(); throw error; }
     const turn: ActiveTurn = {
+      ...(providerLease === undefined ? {} : { providerLease }),
       context,
       sessionGeneration: context.generation,
       backendInstanceGeneration: this.#instanceGeneration,
@@ -1113,6 +1261,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       seenToolStarts: new Set(),
       seenToolResults: new Set(),
       stream: new PartialMessageBuffer(),
+      steers: new Map(),
+      stopping: false,
       inputConsumed: false,
       nativeIdentityConfirmed: false,
       terminalClaimed: false,
@@ -1131,7 +1281,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     runtime.activeTurn = turn;
     const nativeInput: ClaudeSdkUserMessage = {
       type: "user",
-      message: { role: "user", content: input.text },
+      message: { role: "user", content },
       parent_tool_use_id: null,
       origin: { kind: "human" },
       uuid: turn.userMessageUuid
@@ -1165,10 +1315,97 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     }
   }
 
+  async #steer(input: PromptInput, context: AdapterContext): Promise<void> {
+    const runtime = this.#requireRuntime(context);
+    this.#assertStandardRuntime(runtime, "steer an active turn");
+    if (!runtime.steerEnabled || !runtime.capabilities.has("interrupt_receipt_v1")) {
+      throw claudeCodeError("BACKEND_CAPABILITY_UNAVAILABLE", "The native runtime cannot acknowledge same-turn input safely.", "dispatch");
+    }
+    const turn = runtime.activeTurn;
+    if (turn === undefined || !turn.nativeIdentityConfirmed || turn.terminalClaimed || turn.stopping
+      || turn.awaitingNativeContinuation) throw steerNotActive();
+    if (runtime.inputPreparation !== undefined || runtime.pendingControl !== undefined || runtime.controlUncertain) {
+      throw claudeCodeError("SESSION_BUSY", "Another native input or control is still being admitted.", "dispatch");
+    }
+    if (context.operationId === undefined || context.operationId.length === 0) {
+      throw claudeCodeError("OPERATION_ID_REQUIRED", "A durable operation identity is required before native dispatch.", "dispatch");
+    }
+    const uuid = operationUuid(context.operationId);
+    if (uuid === turn.userMessageUuid || turn.steers.has(uuid)) {
+      throw claudeCodeError("NATIVE_INPUT_ALREADY_DISPATCHED", "This operation already belongs to the active native turn.", "dispatch", {
+        stateMayHaveChanged: true, recovery: "Inspect the existing operation instead of dispatching it again."
+      });
+    }
+    if (turn.steers.size >= MAX_TURN_INPUTS - 1) {
+      throw claudeCodeError("NATIVE_INPUT_LIMIT_EXCEEDED", "The active turn has reached its bounded input limit.", "dispatch");
+    }
+    const cancellation = new AbortController();
+    const signal = AbortSignal.any([context.signal, turn.context.signal, runtime.abortController.signal, cancellation.signal]);
+    const steer: SteerAdmission = {
+      context, cancellation, admission: deferred<void>(), eventsReady: deferred<void>(),
+      consumed: false, accepted: false, resultConfirmed: false, terminalClaimed: false
+    };
+    // Retirement can reject admission while attachment preparation is still pending.
+    void steer.admission.promise.catch(() => undefined);
+    turn.steers.set(uuid, steer);
+    runtime.inputPreparation = cancellation;
+    try {
+      signal.throwIfAborted();
+      const content = await waitFor(
+        prepareClaudePrompt(input, context, this.#inputResolvers, signal), this.#admissionTimeoutMs, signal,
+        () => claudeCodeError("INPUT_PREPARATION_TIMEOUT", "Same-turn input could not be prepared in time.", "input")
+      );
+      signal.throwIfAborted();
+      this.#assertCurrent(runtime, context, context.binding);
+      if (!this.#isTurnCurrent(runtime, turn) || turn.stopping || turn.terminalClaimed || turn.awaitingNativeContinuation) {
+        throw steerNotActive();
+      }
+      await waitFor(runtime.gate.offer({
+        type: "user", message: { role: "user", content }, parent_tool_use_id: null, origin: { kind: "human" }, uuid
+      }, () => { steer.consumed = true; }, signal), this.#admissionTimeoutMs, signal,
+      () => dispatchError("The native input stream did not consume the same-turn input in time.", false));
+      await waitFor(steer.admission.promise, this.#admissionTimeoutMs, signal,
+        () => dispatchError("Native same-turn input admission could not be confirmed.", true));
+      setImmediate(() => steer.eventsReady.resolve(undefined));
+    } catch (error) {
+      if (steer.accepted) {
+        // A matching native ACK wins a simultaneous caller cancellation.
+        setImmediate(() => steer.eventsReady.resolve(undefined));
+        return;
+      }
+      steer.eventsReady.resolve(undefined);
+      cancellation.abort(error);
+      if (!steer.consumed) {
+        turn.steers.delete(uuid);
+        if (error instanceof JokoError) throw error;
+        throw claudeCodeError("INPUT_PREPARATION_ABORTED", "Same-turn input was cancelled before native dispatch.", "input");
+      }
+      const unknown = dispatchError("Native same-turn input admission could not be confirmed.", true);
+      if (this.#isTurnCurrent(runtime, turn) && !turn.terminalClaimed) await this.#handleStreamFailure(runtime, unknown);
+      throw unknown;
+    } finally {
+      if (runtime.inputPreparation === cancellation) runtime.inputPreparation = undefined;
+      cancellation.abort();
+    }
+  }
+
   override async abort(context: AdapterContext): Promise<void> {
     const runtime = this.#requireRuntime(context);
+    if (runtime.inputPreparation !== undefined) {
+      runtime.inputPreparation.abort(claudeCodeError(
+        "INPUT_PREPARATION_ABORTED",
+        "Input preparation was stopped before native dispatch.",
+        "input",
+        { recovery: "Send a new prompt when ready to continue." }
+      ));
+      if (runtime.activeTurn === undefined) return;
+    }
     const turn = runtime.activeTurn;
     if (turn === undefined) return;
+    turn.stopping = true;
+    turn.providerLease?.release();
+    turn.interruptConfirmation ??= deferred<void>();
+    void turn.interruptConfirmation.promise.catch(() => undefined);
     let wakeTaskIds: readonly string[] = [];
     let wakeStopResults = Promise.resolve<PromiseSettledResult<void>[]>([]);
     if (runtime.nativeTaskProjectionEnabled) {
@@ -1191,17 +1428,17 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         turnAbortUnknown("The native interrupt did not complete within its bounded deadline.")
       );
     } catch (error) {
-      await this.#retireRuntime(runtime);
+      await this.#retireAfterUncertainStop(runtime);
       if (error instanceof JokoError && error.publicError.code === "TURN_ABORT_UNKNOWN") throw error;
       throw turnAbortUnknown("The native interrupt outcome is unknown.")();
     }
     if (!this.#matchesContext(runtime, context)) {
-      await this.#retireRuntime(runtime);
+      await this.#retireAfterUncertainStop(runtime);
       throw turnAbortUnknown("The native runtime changed before interrupt confirmation.")();
     }
     if (receipt === undefined || !Array.isArray(receipt.still_queued)
       || receipt.still_queued.length > 0) {
-      await this.#retireRuntime(runtime);
+      await this.#retireAfterUncertainStop(runtime);
       throw turnAbortUnknown(
         receipt === undefined
           ? "The native interrupt did not return an authoritative receipt."
@@ -1210,14 +1447,168 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     }
     const stopResults = await wakeStopResults;
     if (stopResults.some((result) => result.status === "rejected")) {
-      await this.#retireRuntime(runtime);
+      await this.#retireAfterUncertainStop(runtime);
       throw turnAbortUnknown("One or more native wake tasks could not be stopped authoritatively.")();
     }
     for (const taskId of wakeTaskIds) {
       await this.#publishNativeTaskEmissions(runtime, runtime.nativeTasks.confirmStopped(taskId));
     }
+    turn.interruptConfirmation.resolve(undefined);
     if (turn.awaitingNativeContinuation) {
       await this.#settleNativeContinuation(runtime, turn, "aborted");
+    }
+  }
+
+  async #retireAfterUncertainStop(runtime: NativeRuntime): Promise<void> {
+    if (runtime.activeTurn !== undefined && [...runtime.activeTurn.steers.values()].some((steer) => steer.accepted)) {
+      await this.#handleStreamFailure(runtime, turnAbortUnknown("The native stop outcome is unknown.")());
+    } else {
+      await this.#retireRuntime(runtime);
+    }
+  }
+
+  override async clone(context: AdapterContext, derivation: NativeSessionDerivation): Promise<NativeSessionBinding> {
+    return (await this.#deriveSession(context, derivation)).binding;
+  }
+
+  override async fork(entryId: string, context: AdapterContext, derivation: NativeSessionDerivation): Promise<NativeSessionForkResult> {
+    if (!uuidPattern().test(entryId)) throw invalidForkBoundary();
+    return { binding: (await this.#deriveSession(context, derivation, entryId)).binding };
+  }
+
+  override async navigateTree(target: NativeNavigationTarget, summarize: boolean, context: AdapterContext,
+    customInstructions: string | undefined, navigation: NativeSessionNavigation): Promise<NativeSessionNavigationResult> {
+    if (target.kind === "session_start") return this.unsupported("session.rewind_to_start");
+    if (summarize || customInstructions !== undefined) return this.unsupported("session.tree.summary");
+    if (!uuidPattern().test(target.entryId)) throw invalidRewindBoundary();
+    const result = await this.#deriveSession(context, navigation, target.entryId, true);
+    if (result.nativeHistory === undefined) throw new Error("Native navigation lacks its confirmed history.");
+    return { kind: "replacement", binding: result.binding, nativeHistory: result.nativeHistory };
+  }
+
+  async #deriveSession(context: AdapterContext, derivation: NativeSessionNavigation, entryId?: string, replacement = false): Promise<{
+    readonly binding: NativeSessionBinding; readonly nativeHistory?: NativeHistoryProjection;
+  }> {
+    this.#assertUsable();
+    const runtime = this.#requireIdleRuntime(context);
+    const phase = replacement ? "session_navigation" : entryId === undefined ? "session_clone" : "session_fork";
+    this.#assertStandardRuntime(runtime, "derive native history");
+    if (context.signal.aborted) throw claudeCodeError(entryId === undefined ? "NATIVE_SESSION_CLONE_CANCELLED" : "NATIVE_SESSION_FORK_CANCELLED", "The native Session copy was cancelled.", phase);
+    if (runtime.nativeTasks.hasActiveTasks() || this.#runtime.ownsSessionFork(runtime.nativeSessionId)) {
+      throw claudeCodeError("SESSION_BUSY", "Native history still has an active writer.", phase, {
+        recovery: "Wait for native work to finish before copying this Session."
+      });
+    }
+    const token = Symbol();
+    runtime.pendingControl = token;
+    const signal = AbortSignal.any([context.signal, runtime.abortController.signal]);
+    let dispatched = false;
+    let registered: NativeSessionBinding | undefined;
+    let nativeHistory: NativeHistoryProjection | undefined;
+    try {
+      await this.validateTarget(runtime.target);
+      signal.throwIfAborted();
+      this.#assertCurrent(runtime, context, context.binding);
+      const info = await waitFor(this.#sessionInfo(runtime.nativeSessionId, runtime.target, signal), this.#initializationTimeoutMs, signal,
+        () => new SessionSdkFailure("TIMEOUT", false));
+      signal.throwIfAborted();
+      this.#assertCurrent(runtime, context, context.binding);
+      if (info === undefined) throw continuityGap();
+      assertSessionInfo(info, runtime.nativeSessionId, runtime.target.workspaceRoot);
+      let sourceHistory: readonly ValidatedHistoryMessage[] | undefined;
+      let boundaryId: string | undefined;
+      let prefix: readonly ValidatedHistoryMessage[] | undefined;
+      if (entryId !== undefined) {
+        const history = await this.#readForkHistory(runtime.nativeSessionId, runtime.target, signal);
+        sourceHistory = history.entries;
+        const selectedIndex = sourceHistory.findIndex((entry) => entry.uuid === entryId.toLowerCase());
+        const selected = sourceHistory[selectedIndex];
+        if (selected === undefined || selected.child || selected.type === "system") throw invalidForkBoundary();
+        if (replacement && rewindBeforeEntry(sourceHistory, selectedIndex + 1) !== selected.uuid) throw invalidRewindBoundary();
+        // The product stores normalized UUID identity; dispatch the exact spelling
+        // returned by the SDK, whose public boundary lookup is case-sensitive.
+        boundaryId = history.messages[selectedIndex]!.uuid;
+        prefix = sourceHistory.slice(0, selectedIndex + 1).filter((entry) => !entry.child && entry.type !== "system");
+        await this.#assertForkSourceUnchanged(runtime, context, info, signal);
+      }
+      signal.throwIfAborted();
+      this.#assertCurrent(runtime, context, context.binding);
+      if (runtime.nativeTasks.hasActiveTasks()) throw claudeCodeError("SESSION_BUSY", "Native history still has an active writer.", phase);
+      dispatched = true;
+      const result = await this.#runtime.forkSession(runtime.nativeSessionId, {
+        dir: runtime.target.workspaceRoot,
+        ...(boundaryId === undefined ? {} : { upToMessageId: boundaryId }),
+        signal,
+        recordSessionId: (sessionId) => {
+          if (!uuidPattern().test(sessionId)) throw new Error("Native Session copy returned an invalid identity.");
+          const binding = bindingFor(sessionId.toLowerCase(), context.generation + (replacement ? 1 : 0));
+          if (sessionId.toLowerCase() === runtime.nativeSessionId.toLowerCase()
+            || [...this.#sessions.values()].some((session) => session.nativeSessionId.toLowerCase() === sessionId.toLowerCase())) {
+            throw new Error("Native Session copy returned an owned identity.");
+          }
+          derivation.recordBinding(binding);
+          registered = binding;
+        }
+      });
+      signal.throwIfAborted();
+      this.#assertCurrent(runtime, context, context.binding);
+      if (registered === undefined || registered.nativeSessionId !== result.sessionId.toLowerCase()) throw new Error("Native Session copy lacks its receipt.");
+      const derivedInfo = await waitFor(this.#sessionInfo(result.sessionId, runtime.target, signal), this.#initializationTimeoutMs, signal,
+        () => new SessionSdkFailure("TIMEOUT", true));
+      signal.throwIfAborted();
+      this.#assertCurrent(runtime, context, context.binding);
+      if (derivedInfo === undefined) throw continuityGap();
+      assertSessionInfo(derivedInfo, result.sessionId, runtime.target.workspaceRoot);
+      if (sourceHistory !== undefined && prefix !== undefined) {
+        const derivedHistory = await this.#readForkHistory(result.sessionId, runtime.target, signal);
+        const derivedMessages = derivedHistory.entries.filter((entry) => entry.type !== "system");
+        const sourceIds = new Set(sourceHistory.map((entry) => entry.uuid));
+        if (derivedHistory.entries.some((entry) => entry.child || sourceIds.has(entry.uuid))
+          || derivedMessages.length !== prefix.length
+          || derivedMessages.some((entry, index) => entry.type !== prefix[index]!.type || !isDeepStrictEqual(entry.message, prefix[index]!.message))) {
+          throw new Error("The native Session fork did not preserve its inclusive message boundary.");
+        }
+        await this.#assertForkSourceUnchanged(runtime, context, info, signal);
+        nativeHistory = projectNativeHistory(derivedHistory.messages, result.sessionId.toLowerCase(), this.#projection);
+      }
+      return { binding: registered, ...(nativeHistory === undefined ? {} : { nativeHistory }) };
+    } catch (error) {
+      if (!dispatched && error instanceof JokoError) throw error;
+      throw claudeCodeError(replacement ? "NATIVE_NAVIGATION_UNKNOWN" : entryId === undefined ? "NATIVE_SESSION_CLONE_UNKNOWN" : "NATIVE_SESSION_FORK_UNKNOWN", "The native Session copy did not reach a confirmed result.", phase, {
+        stateMayHaveChanged: registered !== undefined || (dispatched && (!(error instanceof SessionSdkFailure) || error.stateMayHaveChanged)),
+        recovery: "Inspect native Session availability before explicitly creating another copy."
+      });
+    } finally {
+      if (runtime.pendingControl === token) runtime.pendingControl = undefined;
+    }
+  }
+
+  async #readForkHistory(nativeSessionId: string, target: TargetDescriptor, signal: AbortSignal): Promise<{
+    readonly messages: readonly ClaudeSdkSessionMessage[];
+    readonly entries: readonly ValidatedHistoryMessage[];
+  }> {
+    const messages = await waitFor(this.#runtime.getSessionMessages(nativeSessionId, {
+      dir: target.workspaceRoot, limit: MAX_NATIVE_HISTORY_MESSAGES + 1, offset: 0, includeSystemMessages: true, signal
+    }), this.#initializationTimeoutMs, signal, () => new SessionSdkFailure("TIMEOUT", false));
+    signal.throwIfAborted();
+    if (!Array.isArray(messages) || messages.length > MAX_NATIVE_HISTORY_MESSAGES) throw invalidNativeHistory();
+    const entries = messages.map((message) => validatedHistoryMessage(message, nativeSessionId));
+    if (new Set(entries.map((entry) => entry.uuid)).size !== entries.length) throw invalidNativeHistory();
+    return { messages, entries };
+  }
+
+  async #assertForkSourceUnchanged(runtime: NativeRuntime, context: AdapterContext, initialInfo: ClaudeSdkSessionInfo, signal: AbortSignal): Promise<void> {
+    await this.validateTarget(runtime.target);
+    signal.throwIfAborted();
+    this.#assertCurrent(runtime, context, context.binding);
+    const info = await waitFor(this.#sessionInfo(runtime.nativeSessionId, runtime.target, signal), this.#initializationTimeoutMs, signal,
+      () => new SessionSdkFailure("TIMEOUT", false));
+    signal.throwIfAborted();
+    this.#assertCurrent(runtime, context, context.binding);
+    if (info === undefined) throw continuityGap();
+    assertSessionInfo(info, runtime.nativeSessionId, runtime.target.workspaceRoot);
+    if (!Number.isFinite(initialInfo.lastModified) || info.lastModified !== initialInfo.lastModified || runtime.nativeTasks.hasActiveTasks()) {
+      throw claudeCodeError("NATIVE_SESSION_FORK_SOURCE_CHANGED", "Native history changed while its fork was being prepared.", "session_fork");
     }
   }
 
@@ -1291,26 +1682,91 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     modelId: string,
     context: AdapterContext
   ): Promise<ProviderModel> {
-    if (providerId !== PROVIDER_ID) {
+    const runtime = this.#requireIdleRuntime(context);
+    this.#assertStandardRuntime(runtime, "change the model");
+    if (providerId !== PROVIDER_ID && !this.#managedProviders?.hasProvider(providerId)) {
       throw claudeCodeError("PROVIDER_UNAVAILABLE", "The requested provider is not owned by this Backend.", "model", {
         recovery: "Choose a model from the Claude Code catalog."
       });
     }
-    const runtime = this.#requireIdleRuntime(context);
-    this.#assertStandardRuntime(runtime, "change the model");
+    if (providerId !== PROVIDER_ID || runtime.managedRoute !== undefined) {
+      return this.#replaceModelRoute(runtime, providerId, modelId, context);
+    }
     const model = findModel(runtime.initialization?.models ?? [], modelId);
     if (model === undefined) {
       throw claudeCodeError("MODEL_UNAVAILABLE", "The requested model is not in the native catalog.", "model", {
         recovery: "Refresh the Backend descriptor and select an available model."
       });
     }
-    await this.#runControl(runtime, context, "model", () => runtime.query.setModel(model.value));
-    runtime.modelId = model.value;
+    await this.#runIdleControl(runtime, context, "model", async (acknowledge) => {
+      if (runtime.fastMode && model.supportsFastMode !== true) {
+        await runtime.query.applyFlagSettings({ fastMode: false });
+        acknowledge();
+        runtime.fastMode = false;
+        clearFastModeObservation(runtime);
+      }
+      await runtime.query.setModel(model.value);
+      acknowledge();
+      runtime.modelId = model.value;
+      clearFastModeObservation(runtime);
+    });
     return providerModel(model, this.#projection);
   }
 
+  async #replaceModelRoute(runtime: NativeRuntime, providerId: string, modelId: string, context: AdapterContext): Promise<ProviderModel> {
+    const managed = providerId !== PROVIDER_ID;
+    const model = managed ? this.#managedProviders?.listModels().find((entry) => entry.providerId === providerId && entry.modelId === modelId)
+      : (() => { const native = findModel(runtime.initialization?.models ?? [], modelId); return native === undefined ? undefined : providerModel(native, this.#projection); })();
+    if (model === undefined) throw managedRouteUnavailable();
+    if (managed) validateManagedThinkingMap(this.#managedProviders!.getThinkingLevelMap(providerId, modelId));
+    if (runtime.managedRoute?.providerId === providerId && runtime.managedRoute.model.modelId === modelId) {
+      try {
+        runtime.managedRoute.assertCurrent();
+        return managedProviderModel(runtime.managedRoute.model, runtime.managedRoute.thinkingLevelMap);
+      } catch {
+        // Explicitly selecting the durable pair may refresh its route revision.
+        // The replacement still has to prove and resume the same native Session.
+      }
+    }
+    const token = Symbol();
+    runtime.pendingControl = token;
+    let retired = false;
+    try {
+      const info = await waitFor(this.#sessionInfo(runtime.nativeSessionId, runtime.target, context.signal),
+        this.#initializationTimeoutMs, context.signal, managedRouteUnavailable);
+      this.#assertCurrent(runtime, context, context.binding);
+      if (info === undefined) throw continuityGap();
+      assertSessionInfo(info, runtime.nativeSessionId, runtime.target.workspaceRoot);
+      retired = true;
+      await this.#retireRuntime(runtime);
+      await waitFor(this.#runtime.retireQuery(runtime.query, this.#teardownTimeoutMs), this.#teardownTimeoutMs,
+        context.signal, () => managedRouteUnavailable(true));
+      context.signal.throwIfAborted();
+      const retainedEffort = normalizeProductEffort(runtime.effort);
+      const replacement = await this.#startRuntime(runtime.binding, context, {
+        resume: true, providerId, modelId,
+        permissionMode: runtime.permissionMode, fastMode: false,
+        ...(retainedEffort !== undefined && model.thinkingLevels.includes(retainedEffort) ? { effort: retainedEffort } : {}),
+        additionalDirectories: runtime.additionalDirectories,
+        ...(context.appendSystemPrompt === undefined ? {} : { appendSystemPrompt: context.appendSystemPrompt }),
+        runtimePolicy: runtime.runtimePolicy
+      });
+      if (runtime.planMode) await this.setPlanMode(true, context);
+      return replacement.managedRoute === undefined ? model : managedProviderModel(replacement.managedRoute.model, replacement.managedRoute.thinkingLevelMap);
+    } catch (error) {
+      if (retired) {
+        const replacement = this.#sessions.get(context.sessionId);
+        if (replacement !== undefined && replacement !== runtime) await this.#retireRuntime(replacement);
+        throw managedRouteUnavailable(true);
+      }
+      throw error;
+    } finally {
+      if (runtime.pendingControl === token) runtime.pendingControl = undefined;
+    }
+  }
+
   override async setEffort(level: string, context: AdapterContext): Promise<void> {
-    const effort = normalizeEffort(level);
+    const effort = normalizeProductEffort(level);
     if (effort === undefined) {
       throw claudeCodeError("EFFORT_UNAVAILABLE", "The requested effort level is unsupported.", "model", {
         recovery: `Choose one of: ${EFFORT_LEVELS.join(", ")}.`
@@ -1318,27 +1774,46 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     }
     const runtime = this.#requireIdleRuntime(context);
     this.#assertStandardRuntime(runtime, "change reasoning effort");
-    assertEffortSupported(runtime, effort);
-    await this.#runControl(runtime, context, "effort", () => runtime.query.applyFlagSettings({ effortLevel: effort }));
-    runtime.effort = effort;
+    const nativeEffort = assertEffortSupported(runtime, effort);
+    await this.#runIdleControl(runtime, context, "effort", async (acknowledge) => {
+      await runtime.query.applyFlagSettings({ effortLevel: nativeEffort });
+      acknowledge();
+      runtime.effort = effort;
+    });
+  }
+
+  override async setFastMode(enabled: boolean, context: AdapterContext): Promise<void> {
+    const runtime = this.#requireIdleRuntime(context);
+    this.#assertStandardRuntime(runtime, "change Fast mode");
+    if (enabled) assertFastModeSupported(runtime);
+    await this.#runIdleControl(runtime, context, "fast_mode", async (acknowledge) => {
+      await runtime.query.applyFlagSettings({ fastMode: enabled });
+      acknowledge();
+      runtime.fastMode = enabled;
+      clearFastModeObservation(runtime);
+    });
   }
 
   override async setPermissionMode(mode: PermissionMode, context: AdapterContext): Promise<void> {
     assertFullAccessTarget(mode, context.target, "permission");
     const runtime = this.#requireIdleRuntime(context);
     this.#assertStandardRuntime(runtime, "change permission mode");
-    if (!runtime.planMode) {
-      await this.#runControl(runtime, context, "permission", () => runtime.query.setPermissionMode(toSdkPermissionMode(mode)));
-    }
-    runtime.permissionMode = mode;
+    await this.#runIdleControl(runtime, context, "permission", async (acknowledge) => {
+      if (!runtime.planMode) await runtime.query.setPermissionMode(toSdkPermissionMode(mode));
+      acknowledge();
+      runtime.permissionMode = mode;
+    });
   }
 
   override async setPlanMode(enabled: boolean, context: AdapterContext): Promise<void> {
     const runtime = this.#requireIdleRuntime(context);
     this.#assertStandardRuntime(runtime, "change Plan mode");
     const nativeMode: ClaudeSdkPermissionMode = enabled ? "plan" : toSdkPermissionMode(runtime.permissionMode);
-    await this.#runControl(runtime, context, "plan_mode", () => runtime.query.setPermissionMode(nativeMode));
-    runtime.planMode = enabled;
+    await this.#runIdleControl(runtime, context, "plan_mode", async (acknowledge) => {
+      await runtime.query.setPermissionMode(nativeMode);
+      acknowledge();
+      runtime.planMode = enabled;
+    });
   }
 
   async setExtraDirectories(
@@ -1349,15 +1824,22 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     this.#assertStandardRuntime(runtime, "change additional directories");
     const validated = await this.#validateExtraDirectories(directories);
     const paths = validated.map((directory) => directory.path);
-    await this.#runControl(runtime, context, "extra_directories", () => runtime.query.applyFlagSettings({
-      permissions: { additionalDirectories: paths }
-    }));
-    runtime.additionalDirectories = validated;
+    await this.#runIdleControl(runtime, context, "extra_directories", async (acknowledge) => {
+      await runtime.query.applyFlagSettings({ permissions: { additionalDirectories: paths } });
+      acknowledge();
+      runtime.additionalDirectories = validated;
+    });
   }
 
   override async dispose(): Promise<void> {
-    if (this.#disposed) return;
+    this.#managedProviders?.dispose();
+    if (this.#disposed) {
+      await Promise.all([this.#runtime.closeSessionOperations(), this.#runtime.retireOwnedProcesses?.(this.#teardownTimeoutMs)]);
+      return;
+    }
     this.#disposed = true;
+    const sessionRetirement = this.#runtime.closeSessionOperations();
+    void sessionRetirement.catch(() => undefined);
     let authorizationError: unknown;
     try {
       await this.#oauthAccount?.dispose();
@@ -1366,7 +1848,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     }
     const runtimes = [...this.#sessions.values()];
     await Promise.all(runtimes.map(async (runtime) => this.#retireRuntime(runtime)));
-    await this.#runtime.retireOwnedProcesses?.(this.#teardownTimeoutMs);
+    await Promise.all([sessionRetirement, this.#runtime.retireOwnedProcesses?.(this.#teardownTimeoutMs)]);
     if (authorizationError !== undefined) throw authorizationError;
   }
 
@@ -1375,7 +1857,10 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
   }
 
   async forceDispose(): Promise<void> {
+    this.#managedProviders?.dispose();
     this.#disposed = true;
+    const sessionRetirement = this.#runtime.closeSessionOperations();
+    void sessionRetirement.catch(() => undefined);
     let authorizationError: unknown;
     try {
       await this.#oauthAccount?.dispose();
@@ -1384,7 +1869,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     }
     const runtimes = [...this.#sessions.values()];
     await Promise.all(runtimes.map(async (runtime) => this.#retireRuntime(runtime, false)));
-    await this.#runtime.retireOwnedProcesses?.(this.#teardownTimeoutMs);
+    await Promise.all([sessionRetirement, this.#runtime.retireOwnedProcesses?.(this.#teardownTimeoutMs)]);
     if (authorizationError !== undefined) throw authorizationError;
   }
 
@@ -1393,8 +1878,10 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     context: AdapterContext,
     launch: {
       readonly resume: boolean;
+      readonly providerId?: string;
       readonly modelId?: string;
-      readonly effort?: typeof EFFORT_LEVELS[number];
+      readonly effort?: string;
+      readonly fastMode?: boolean;
       readonly permissionMode: PermissionMode;
       readonly title?: string;
       readonly appendSystemPrompt?: string;
@@ -1419,19 +1906,48 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       if (info === undefined) throw continuityGap();
       assertSessionInfo(info, nativeSessionId, context.target.workspaceRoot);
     }
+    const providerId = launch.providerId ?? context.modelSelection?.providerId;
+    const modelId = launch.modelId ?? context.modelSelection?.modelId;
+    launch = { ...launch, ...(modelId === undefined ? {} : { modelId }) };
+    let managedRoute: ManagedProviderRouteBinding | undefined;
+    if (providerId !== undefined && providerId !== PROVIDER_ID) {
+      if (!this.#managedProviders?.hasProvider(providerId) || modelId === undefined) throw managedRouteUnavailable();
+      let preparingCurrent = true;
+      const preparing = this.#managedProviders.prepare({
+        backendId: this.id, backendInstanceGeneration: this.#instanceGeneration,
+        targetId: context.target.id, sessionId: context.sessionId, sessionGeneration: context.generation,
+        providerId, modelId
+      }).then((route) => {
+        if (!preparingCurrent || context.signal.aborted || this.#disposed) { route.dispose(); throw managedRouteUnavailable(); }
+        return route;
+      });
+      try {
+        managedRoute = await waitFor(preparing, this.#initializationTimeoutMs, context.signal, managedRouteUnavailable);
+        if (managedRoute.protocol !== "anthropic-messages" || managedRoute.providerId !== providerId
+          || managedRoute.model.providerId !== providerId || managedRoute.model.modelId !== modelId
+          || managedRoute.model.api !== "anthropic-messages") throw managedRouteUnavailable();
+        managedRoute.assertCurrent();
+        validateManagedThinkingMap(managedRoute.thinkingLevelMap);
+        if (launch.effort !== undefined) managedNativeEffort(managedRoute.model, managedRoute.thinkingLevelMap, launch.effort);
+      } catch (error) {
+        managedRoute?.dispose();
+        throw error;
+      } finally { preparingCurrent = false; }
+    }
     const gate = new AsyncInputGate<ClaudeSdkUserMessage>();
     const abortController = new AbortController();
     let runtime: NativeRuntime | undefined;
-    const startedQuery = await this.#createQuery(gate, abortController, nativeSessionId, context, launch, (...args) => {
+    const startedQuery = await this.#createQuery(gate, abortController, nativeSessionId, context, launch, managedRoute, (...args) => {
       if (runtime === undefined) {
         return Promise.resolve({ behavior: "deny", message: "The native Session is not ready." });
       }
       return this.#canUseTool(runtime, ...args);
-    });
+    }).catch((error: unknown) => { managedRoute?.dispose(); throw error; });
     const query = startedQuery.query;
     try {
       runtime = {
         productSessionId: context.sessionId,
+        ...(managedRoute === undefined ? {} : { managedRoute }),
         target: context.target,
         binding,
         sessionGeneration: context.generation,
@@ -1448,6 +1964,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
           now: this.#now
         }),
         runtimePolicy: launch.runtimePolicy,
+        subagentModel: startedQuery.subagentModel,
         capabilities: new Set(),
         pendingPermissions: new Map(),
         resolvedPermissions: new Map(),
@@ -1455,8 +1972,11 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         consumer: Promise.resolve(),
         closed: false,
         nativeTaskProjectionEnabled: false,
+        steerEnabled: false,
+        controlUncertain: false,
         modelId: launch.modelId,
         effort: launch.effort,
+        fastMode: false,
         permissionMode: launch.permissionMode,
         planMode: false,
         additionalDirectories: launch.additionalDirectories,
@@ -1482,12 +2002,25 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       runtime.initialization = initialization;
       if (runtime.runtimePolicy === "review_read_only") assertReviewInitialization(initialization);
       this.#observeInitialization(initialization);
-      if (launch.modelId !== undefined && findModel(initialization.models, launch.modelId) === undefined) {
+      if (runtime.subagentModel !== undefined && (managedRoute === undefined
+        ? findModel(initialization.models, runtime.subagentModel) === undefined
+        : !this.#managedProviders!.listModels().some((model) => model.providerId === managedRoute.providerId && model.modelId === runtime!.subagentModel))) {
+        throw claudeCodeError("SUBAGENT_MODEL_UNAVAILABLE", "The configured subtask model is not in this native Provider catalog.", "session_start", {
+          recovery: "Refresh the native model catalog or clear the subtask model default in Settings, then explicitly retry."
+        });
+      }
+      if (managedRoute === undefined && launch.modelId !== undefined && findModel(initialization.models, launch.modelId) === undefined) {
         throw claudeCodeError("MODEL_UNAVAILABLE", "The requested model is not in the native catalog.", "model", {
           recovery: "Refresh the native model catalog and select an available model."
         });
       }
       if (launch.effort !== undefined) assertEffortSupported(runtime, launch.effort);
+      if (launch.fastMode === true) assertFastModeSupported(runtime);
+      // This is the acknowledged session selection, not a speed or billing claim.
+      // Resume restores the saved selection through the normal Fast control.
+      runtime.fastMode = launch.fastMode ?? false;
+      const initialFastModeObservation = readFastModeObservation(initialization);
+      runtime.fastModeObservation ??= initialFastModeObservation;
       return runtime;
     } catch (error) {
       await this.#retireRuntime(runtime);
@@ -1517,23 +2050,47 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     launch: {
       readonly resume: boolean;
       readonly modelId?: string;
-      readonly effort?: typeof EFFORT_LEVELS[number];
+      readonly effort?: string;
+      readonly fastMode?: boolean;
       readonly permissionMode: PermissionMode;
       readonly title?: string;
       readonly appendSystemPrompt?: string;
       readonly additionalDirectories: readonly ApprovedDirectory[];
       readonly runtimePolicy: "standard" | "review_read_only";
     },
+    managedRoute: ManagedProviderRouteBinding | undefined,
     canUseTool: (
       toolName: string,
       input: Readonly<Record<string, unknown>>,
       options: ClaudeCanUseToolOptions
     ) => Promise<ClaudePermissionResult>
-  ): Promise<{ readonly query: ClaudeSdkQuery; releaseAuthorization(): void }> {
+  ): Promise<{ readonly query: ClaudeSdkQuery; readonly subagentModel: string | undefined; releaseAuthorization(): void }> {
+    let subagentModel: string | undefined;
+    try {
+      subagentModel = launch.runtimePolicy === "standard" ? this.#resolveSubagentModel?.(managedRoute?.providerId ?? PROVIDER_ID) : undefined;
+    } catch (error) {
+      if (error instanceof JokoError) throw error;
+      throw claudeCodeError("SUBAGENT_MODEL_DEFAULT_READ_FAILED", "The subtask model setting could not be read.", "session_start", {
+        recovery: "Reload the subtask model setting and retry."
+      });
+    }
+    if (subagentModel !== undefined) {
+      if (typeof subagentModel !== "string" || subagentModel.length === 0 || subagentModel.length > 512
+        || /[\s\x00-\x1f\x7f]/u.test(subagentModel)) {
+        throw claudeCodeError("SUBAGENT_MODEL_INVALID", "The configured subtask model has an invalid identifier.", "session_start", {
+          recovery: "Choose an available subtask model in Settings, then retry."
+        });
+      }
+      if (this.#lastCliVersion === undefined) await this.describe();
+      if (!supportsSubagentDefaultModel(this.#lastCliVersion)) throw subagentDefaultModelUnavailable();
+      this.#assertUsable();
+      this.#assertBackendInstance(context);
+      context.signal.throwIfAborted();
+    }
     let runtimeAuthorization: Awaited<ReturnType<ClaudeCodeOAuthAccount["runtimeAuthorization"]>> = undefined;
     try {
-      runtimeAuthorization = await this.#oauthAccount?.runtimeAuthorization();
-      if (this.#oauthAccount !== undefined && runtimeAuthorization === undefined) {
+      runtimeAuthorization = managedRoute === undefined ? await this.#oauthAccount?.runtimeAuthorization() : undefined;
+      if (managedRoute === undefined && this.#oauthAccount !== undefined && runtimeAuthorization === undefined) {
         throw new Error("A Joko-owned subscription authorization is required for native startup.");
       }
       if (runtimeAuthorization !== undefined && !runtimeAuthorization.isCurrent()) {
@@ -1550,7 +2107,10 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
           cwd: context.target.workspaceRoot,
           env: {
             ...this.#environment,
-            ...runtimeAuthorization?.environment
+            ...runtimeAuthorization?.environment,
+            ...(managedRoute === undefined ? {} : managedQueryEnvironment(managedRoute, this.#managedProviders!, this.#environment)),
+            CLAUDE_CODE_SUBAGENT_MODEL: subagentModel,
+            CLAUDE_CODE_SUBAGENT_MODEL_FORCE: undefined
           },
           ...(launch.runtimePolicy === "review_read_only"
             ? {
@@ -1579,10 +2139,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
                   }
                 }
               }
-            : {}),
+            : launch.fastMode === undefined ? {} : { settings: { fastMode: launch.fastMode } }),
           ...(runtimeAuthorization === undefined ? {} : { getOAuthToken: runtimeAuthorization.getOAuthToken }),
-          ...(launch.effort === undefined ? {} : { effort: launch.effort }),
+          ...(launch.effort === undefined ? {} : { effort: managedRoute === undefined ? requiredNativeEffort(launch.effort)
+            : managedNativeEffort(managedRoute.model, managedRoute.thinkingLevelMap, launch.effort) }),
           ...(launch.runtimePolicy === "standard" ? { forwardSubagentText: true } : {}),
+          ...(launch.runtimePolicy === "standard" ? { extraArgs: { "replay-user-messages": null } } : {}),
           includePartialMessages: true,
           ...(launch.runtimePolicy === "review_read_only"
             ? {
@@ -1597,7 +2159,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
           permissionMode: toSdkPermissionMode(launch.permissionMode),
           persistSession: launch.runtimePolicy !== "review_read_only",
           ...(launch.resume ? { resume: nativeSessionId } : { sessionId: nativeSessionId }),
-          settingSources: launch.runtimePolicy === "review_read_only" ? [] : [...this.#settingSources],
+          settingSources: launch.runtimePolicy === "review_read_only" || managedRoute !== undefined ? [] : [...this.#settingSources],
           systemPrompt: {
             type: "preset",
             preset: "claude_code",
@@ -1616,6 +2178,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       }
       return {
         query,
+        subagentModel,
         releaseAuthorization: () => runtimeAuthorization?.release()
       };
     } catch {
@@ -1658,10 +2221,19 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       if (observedId === undefined || cliVersion === undefined || observedCwd === undefined) throw continuityGap();
       assertSessionTarget(observedCwd, runtime.target.workspaceRoot);
       this.#lastCliVersion = this.#projection.text(cliVersion, 128);
+      if (runtime.subagentModel !== undefined && !supportsSubagentDefaultModel(this.#lastCliVersion)) {
+        throw subagentDefaultModelUnavailable(true);
+      }
       runtime.nativeTaskProjectionEnabled = runtime.runtimePolicy === "standard"
         && supportsNativeTaskProjection(this.#lastCliVersion);
+      runtime.steerEnabled = runtime.runtimePolicy === "standard" && supportsSteer(this.#lastCliVersion);
+      if (runtime.managedRoute !== undefined && stringValue(envelope["model"]) !== runtime.managedRoute.model.modelId) throw managedRouteUnavailable(true);
       runtime.modelId = stringValue(envelope["model"]) ?? runtime.modelId;
-      runtime.effort = stringValue(envelope["effort"]) ?? runtime.effort;
+      if (runtime.managedRoute === undefined) runtime.effort = stringValue(envelope["effort"]) ?? runtime.effort;
+      else if (runtime.effort !== undefined && envelope["effort"] !== undefined && runtime.pendingControl === undefined
+        && envelope["effort"] !== managedNativeEffort(runtime.managedRoute.model, runtime.managedRoute.thinkingLevelMap, runtime.effort)) {
+        throw managedRouteUnavailable(true);
+      }
       const observedPermissionMode = stringValue(envelope["permissionMode"]);
       if (runtime.runtimePolicy === "review_read_only" && observedPermissionMode !== "default") {
         throw invalidReviewProfile();
@@ -1731,11 +2303,26 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       await this.#publishNativeTaskEmissions(runtime, emissions);
       return;
     }
-    if (turn === undefined) return;
+    if (turn === undefined) {
+      if (isTurnInitialization) {
+        runtime.fastModeObservation = readFastModeObservation(envelope) ?? runtime.fastModeObservation;
+      }
+      return;
+    }
+    // A transport replay can precede init. It cannot establish the CLI/cwd/session
+    // initialization fence required by the original prompt's admission.
+    if (type === "user" && envelope["isReplay"] === true && !turn.nativeIdentityConfirmed) {
+      if (nativeSessionId !== runtime.nativeSessionId || envelope["uuid"] !== turn.userMessageUuid
+        || envelope["parent_tool_use_id"] !== null || record(envelope["origin"])?.["kind"] !== "human") {
+        throw turnOwnershipGap();
+      }
+      return;
+    }
     const isTurnFrame = type === "stream_event" || type === "assistant" || type === "user"
       || type === "tool_progress" || type === "result";
     if (isTurnFrame && !turn.nativeIdentityConfirmed) throw continuityGap();
     if (!this.#isTurnCurrent(runtime, turn)) return;
+    if (isTurnInitialization) await this.#publishFastModeStatus(runtime, turn, envelope);
     if (turn.awaitingNativeContinuation
       && (type === "stream_event" || type === "assistant" || type === "result")) {
       if (this.#isKnownNativeContinuationPrelude(turn, type, envelope)) return;
@@ -1750,6 +2337,21 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     } else if (type === "assistant") {
       await this.#handleAssistant(runtime, turn, message);
     } else if (type === "user") {
+      if (envelope["isReplay"] === true) {
+        const uuid = stringValue(envelope["uuid"]);
+        if (nativeSessionId !== runtime.nativeSessionId || uuid === undefined
+          || envelope["parent_tool_use_id"] !== null || record(envelope["origin"])?.["kind"] !== "human") {
+          throw turnOwnershipGap();
+        }
+        const steer = turn.steers.get(uuid);
+        if (steer !== undefined) {
+          if (!steer.consumed) throw turnOwnershipGap();
+          if (!turn.stopping && !steer.cancellation.signal.aborted && this.#matchesContext(runtime, steer.context)) {
+            acknowledgeSteer(steer);
+          }
+        } else if (uuid !== turn.userMessageUuid) throw turnOwnershipGap();
+        return;
+      }
       await this.#handleUser(runtime, turn, message);
     } else if (type === "tool_progress") {
       await this.#handleToolProgress(runtime, turn, envelope);
@@ -1856,6 +2458,10 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     envelope: Readonly<Record<string, unknown>>
   ): Promise<void> {
     if (!this.#isTurnCurrent(runtime, turn)) return;
+    if (turn.interruptConfirmation !== undefined) {
+      await turn.interruptConfirmation.promise;
+      if (!this.#isTurnCurrent(runtime, turn)) return;
+    }
     assertResultOwnership(envelope, turn);
     if (turn.terminalClaimed) return;
     const uuid = stringValue(envelope["uuid"]);
@@ -1863,8 +2469,29 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       if (turn.seenFrameUuids.has(uuid)) return;
       addBoundedIdentity(turn.seenFrameUuids, uuid);
     }
+    // Claim the foreground result before any awaited publication or preparation can enqueue a steer.
+    turn.stopping = true;
+    for (const steer of turn.steers.values()) {
+      if (!steer.consumed) steer.cancellation.abort(steerNotActive());
+    }
+    if (runtime.runtimePolicy === "review_read_only") assertReviewFastModeDisabled(envelope["fast_mode_state"]);
+    await this.#publishFastModeStatus(runtime, turn, envelope);
+    if (!this.#isTurnCurrent(runtime, turn) || turn.terminalClaimed) return;
     await this.#projectPermissionDenials(runtime, turn, envelope["permission_denials"]);
+    if (!this.#isTurnCurrent(runtime, turn) || turn.terminalClaimed) return;
     const result = this.#projection.result(envelope, runtime.lastTotalCostUsd, turn.assistantError);
+    const consumedIds = resultInputIdentities(envelope, turn);
+    const interrupted = turn.interruptConfirmation?.settled() === true && result.outcome === "aborted";
+    for (const [inputId, steer] of turn.steers) {
+      if (!steer.consumed) continue;
+      if (!steer.resultConfirmed && !consumedIds.has(inputId) && !interrupted) throw steerOutcomeUnknown();
+      steer.resultConfirmed = true;
+      if (consumedIds.has(inputId) && !steer.cancellation.signal.aborted) acknowledgeSteer(steer);
+    }
+    const queuedCount = envelope["queued_turn_count"];
+    if (queuedCount !== undefined && (!Number.isSafeInteger(queuedCount) || (queuedCount as number) !== 0)) {
+      throw steerOutcomeUnknown();
+    }
     runtime.lastTotalCostUsd = result.totalCostUsd;
     runtime.lastUsage = result.usage;
     const hasText = turn.blocks.some((block) => block.kind === "text");
@@ -1883,13 +2510,16 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
           generationReliable: generation.reliable
         })
       });
+      if (!this.#isTurnCurrent(runtime, turn) || turn.terminalClaimed) return;
     }
     await this.#emit(runtime, turn, { type: "usage", usage: result.usage });
+    if (!this.#isTurnCurrent(runtime, turn) || turn.terminalClaimed) return;
     if (result.error !== undefined) {
       if (result.error.code === "CLAUDE_CODE_AUTHENTICATION_FAILED") {
         this.#authenticationState = "signed_out";
       }
       await this.#emit(runtime, turn, { type: "error", error: result.error, terminal: true });
+      if (!this.#isTurnCurrent(runtime, turn) || turn.terminalClaimed) return;
     } else if (result.outcome === "completed") {
       if (this.#authenticationState !== "not_required") this.#authenticationState = "authenticated";
     }
@@ -1903,6 +2533,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       return;
     }
     turn.terminalClaimed = true;
+    await this.#settleSteers(runtime, turn, result.outcome, result.error);
+    turn.providerLease?.release();
     await this.#emit(runtime, turn, { type: "done", outcome: result.outcome });
     if (this.#isTurnCurrent(runtime, turn)) {
       this.#clearNativeContinuation(turn);
@@ -1921,6 +2553,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     this.#clearNativeContinuationTimer(turn);
     turn.awaitingNativeContinuation = false;
     turn.nativeContinuationSegment = true;
+    turn.stopping = false;
+    turn.interruptConfirmation = undefined;
     turn.continuationTaskIds.clear();
     turn.blocks.splice(0);
     turn.stream.reset();
@@ -1982,6 +2616,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     if (!this.#isTurnCurrent(runtime, turn) || !turn.awaitingNativeContinuation || turn.terminalClaimed) return;
     turn.terminalClaimed = true;
     this.#clearNativeContinuation(turn);
+    turn.providerLease?.release();
+    await this.#settleSteers(runtime, turn, outcome);
     await this.#emit(runtime, turn, { type: "done", outcome });
     if (this.#isTurnCurrent(runtime, turn)) runtime.activeTurn = undefined;
   }
@@ -2041,6 +2677,13 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
           };
     try {
       if (turn !== undefined) {
+        turn.stopping = true;
+        for (const steer of turn.steers.values()) {
+          if (!steer.accepted) {
+            steer.admission.reject(dispatchError("Native same-turn input admission could not be confirmed.", steer.consumed));
+            steer.cancellation.abort(cause);
+          }
+        }
         const admissionError = claudeCodeError(
           "NATIVE_DISPATCH_UNKNOWN",
           "Native dispatch admission could not be confirmed.",
@@ -2056,6 +2699,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         } else if (this.#isTurnCurrent(runtime, turn) && !turn.terminalClaimed) {
           turn.terminalClaimed = true;
           await turn.eventsReady.promise;
+          await this.#settleSteers(runtime, turn, "failed", publicError);
           await this.#emit(runtime, turn, { type: "error", error: publicError, terminal: true });
           await this.#emit(runtime, turn, { type: "done", outcome: "failed" });
         }
@@ -2395,8 +3039,20 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     }
   }
 
-  async #emit(runtime: NativeRuntime, turn: ActiveTurn, payload: EventPayload): Promise<boolean> {
-    if (!this.#isTurnCurrent(runtime, turn)) return false;
+  async #settleSteers(
+    runtime: NativeRuntime, turn: ActiveTurn, outcome: "completed" | "aborted" | "failed", error?: PublicError
+  ): Promise<void> {
+    for (const steer of turn.steers.values()) {
+      if (!steer.accepted || steer.terminalClaimed) continue;
+      steer.terminalClaimed = true;
+      await steer.eventsReady.promise;
+      if (error !== undefined) await this.#emit(runtime, turn, { type: "error", error, terminal: true }, steer.context);
+      await this.#emit(runtime, turn, { type: "done", outcome }, steer.context);
+    }
+  }
+
+  async #emit(runtime: NativeRuntime, turn: ActiveTurn, payload: EventPayload, context = turn.context): Promise<boolean> {
+    if (!this.#isTurnCurrent(runtime, turn) || !this.#matchesContext(runtime, context)) return false;
     const fields: Record<string, string | number | boolean> = {
       queryGeneration: runtime.queryGeneration,
       sessionGeneration: runtime.sessionGeneration
@@ -2404,7 +3060,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     if (runtime.backendInstanceGeneration !== undefined) {
       fields["backendInstanceGeneration"] = runtime.backendInstanceGeneration;
     }
-    await turn.context.emit(payload, { namespace: "claude-code", fields });
+    await context.emit(payload, { namespace: "claude-code", fields });
     return this.#isTurnCurrent(runtime, turn);
   }
 
@@ -2426,12 +3082,83 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     this.#assertCurrent(runtime, context);
   }
 
+  async #runIdleControl(
+    runtime: NativeRuntime,
+    context: AdapterContext,
+    phase: string,
+    operation: (acknowledge: () => void) => Promise<void>
+  ): Promise<void> {
+    this.#requireIdleRuntime(context);
+    if (context.signal.aborted) {
+      throw claudeCodeError("NATIVE_CONTROL_ABORTED", "The native control was cancelled before dispatch.", phase);
+    }
+    const token = Symbol();
+    const lifetime = new AbortController();
+    const signal = AbortSignal.any([context.signal, runtime.abortController.signal, lifetime.signal]);
+    const unknownOutcome = () => claudeCodeError(
+      "NATIVE_CONTROL_UNKNOWN", "The native control outcome is unknown.", phase, {
+        retryable: true,
+        stateMayHaveChanged: true,
+        recovery: "Detach and resume the native Session before restoring its controls."
+      }
+    );
+    runtime.pendingControl = token;
+    const acknowledge = () => {
+      signal.throwIfAborted();
+      this.#assertCurrent(runtime, context, context.binding);
+      if (runtime.pendingControl !== token) throw unknownOutcome();
+    };
+    try {
+      await waitFor(operation(acknowledge), this.#initializationTimeoutMs, signal, unknownOutcome);
+      acknowledge();
+    } catch {
+      if (this.#isRuntimeCurrent(runtime)) runtime.controlUncertain = true;
+      throw unknownOutcome();
+    } finally {
+      lifetime.abort();
+      if (runtime.pendingControl === token) runtime.pendingControl = undefined;
+    }
+  }
+
+  async #publishFastModeStatus(
+    runtime: NativeRuntime,
+    turn: ActiveTurn,
+    envelope: Readonly<Record<string, unknown>>
+  ): Promise<void> {
+    if (!this.#isTurnCurrent(runtime, turn)) return;
+    const observation = readFastModeObservation(envelope) ?? runtime.fastModeObservation;
+    if (observation === undefined) return;
+    runtime.fastModeObservation = observation;
+    const text = fastModeStatusText(observation);
+    if (runtime.publishedFastModeStatus === text) return;
+    if (await this.#emit(runtime, turn, { type: "status", key: "claude-code.fast-mode", text })) {
+      runtime.publishedFastModeStatus = text;
+    }
+  }
+
   async #retireRuntime(
     runtime: NativeRuntime,
     waitForConsumer = true,
     taskFailure?: PublicError
   ): Promise<void> {
     if (runtime.closed) return;
+    runtime.managedRoute?.dispose();
+    const retiringTurn = runtime.activeTurn;
+    if (retiringTurn !== undefined) {
+      retiringTurn.stopping = true;
+      retiringTurn.terminalClaimed = true;
+      retiringTurn.interruptConfirmation?.reject(turnAbortUnknown("The runtime retired before interrupt confirmation.")());
+      for (const steer of retiringTurn.steers.values()) {
+        steer.admission.reject(dispatchError("The runtime retired before same-turn admission was confirmed.", steer.consumed));
+        steer.cancellation.abort(steerNotActive());
+      }
+    }
+    runtime.inputPreparation?.abort(claudeCodeError(
+      "BACKEND_GENERATION_MISMATCH",
+      "The native runtime was retired before input preparation finished.",
+      "generation",
+      { recovery: "Refresh Session state before retrying." }
+    ));
     if (runtime.activeTurn !== undefined) this.#clearNativeContinuation(runtime.activeTurn);
     if (runtime.nativeTaskProjectionEnabled) {
       try {
@@ -2466,9 +3193,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     await this.#runtime.retireOwnedProcesses?.(this.#teardownTimeoutMs);
   }
 
-  async #sessionInfo(nativeSessionId: string, target: TargetDescriptor) {
+  async #sessionInfo(nativeSessionId: string, target: TargetDescriptor, signal?: AbortSignal) {
     try {
-      return await this.#runtime.getSessionInfo(nativeSessionId, { dir: target.workspaceRoot });
+      return await this.#runtime.getSessionInfo(nativeSessionId, { dir: target.workspaceRoot, ...(signal === undefined ? {} : { signal }) });
     } catch {
       throw claudeCodeError("NATIVE_SESSION_INSPECTION_FAILED", "The native Session could not be inspected.", "session_inspect", {
         retryable: true,
@@ -2545,7 +3272,19 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
 
   #requireIdleRuntime(context: AdapterContext): NativeRuntime {
     const runtime = this.#requireRuntime(context);
-    if (runtime.activeTurn !== undefined) {
+    if (this.#runtime.ownsSessionFork(runtime.nativeSessionId)) {
+      throw claudeCodeError("SESSION_BUSY", "A native Session copy still owns this history.", "control", {
+        recovery: "Wait for the native Session copy to retire before continuing."
+      });
+    }
+    if (runtime.controlUncertain) {
+      throw claudeCodeError("NATIVE_CONTROL_UNKNOWN", "A previous native control outcome is unknown.", "control", {
+        retryable: true,
+        stateMayHaveChanged: true,
+        recovery: "Detach and resume the native Session before restoring its controls."
+      });
+    }
+    if (runtime.activeTurn !== undefined || runtime.inputPreparation !== undefined || runtime.pendingControl !== undefined) {
       throw claudeCodeError("SESSION_BUSY", "The native control requires an idle Session.", "control", {
         retryable: true,
         recovery: "Wait for the authoritative Result before changing Session controls."
@@ -2744,9 +3483,7 @@ function assertReviewInitEnvelope(
 
 function assertReviewFastModeDisabled(value: unknown): void {
   if (value === undefined) return;
-  if (typeof value !== "string" || !["off", "disabled", "unavailable"].includes(value.toLowerCase())) {
-    throw invalidReviewProfile();
-  }
+  if (value !== "off") throw invalidReviewProfile();
 }
 
 function supportsIsolatedReview(cliVersion: string | undefined): boolean {
@@ -2755,6 +3492,21 @@ function supportsIsolatedReview(cliVersion: string | undefined): boolean {
 
 function supportsNativeTaskProjection(cliVersion: string | undefined): boolean {
   return exactCliVersion(cliVersion, NATIVE_TASK_CLI_VERSION);
+}
+
+function supportsSteer(cliVersion: string | undefined): boolean {
+  return exactCliVersion(cliVersion, STEER_CLI_VERSION);
+}
+
+function supportsSubagentDefaultModel(cliVersion: string | undefined): boolean {
+  return exactCliVersion(cliVersion, SUBAGENT_DEFAULT_MODEL_CLI_VERSION);
+}
+
+function subagentDefaultModelUnavailable(stateMayHaveChanged = false): JokoError {
+  return claudeCodeError("SUBAGENT_MODEL_DEFAULT_UNAVAILABLE", "The native runtime cannot preserve the configured subtask model's default priority.", "session_start", {
+    stateMayHaveChanged,
+    recovery: "Refresh the supported native CLI or clear the subtask model default in Settings, then explicitly retry."
+  });
 }
 
 function exactCliVersion(cliVersion: string | undefined, expected: readonly number[]): boolean {
@@ -2860,19 +3612,21 @@ function projectNativeHistory(
     const validated = validatedHistoryMessage(message, nativeSessionId);
     if (seen.has(validated.uuid)) throw invalidNativeHistory();
     seen.add(validated.uuid);
-    if (!validated.child) entries.push(validated);
+    entries.push(validated);
   }
 
   const events: NativeHistoryProjectedEvent[] = [];
   const lineage: { entryId: string; parentEntryId?: string }[] = [];
   const toolNames = new Map<string, string>();
   let parentEntryId: string | undefined;
-  for (const entry of entries) {
+  for (const [entryIndex, entry] of entries.entries()) {
+    if (entry.child) continue;
     lineage.push({
       entryId: entry.uuid,
       ...(parentEntryId === undefined ? {} : { parentEntryId })
     });
     const projected = projectHistoryEntry(entry, projection, toolNames);
+    const rewindBefore = rewindBeforeEntry(entries, entryIndex);
     const metadata: AdapterEventMetadata = {
       namespace: "claude-code.native_history",
       fields: {
@@ -2884,6 +3638,7 @@ function projectNativeHistory(
       events.push({
         nativeEntryId: entry.uuid,
         ...(parentEntryId === undefined ? {} : { nativeParentEntryId: parentEntryId }),
+        ...(rewindBefore === undefined ? {} : { nativeRewindBefore: { kind: "native_entry" as const, entryId: rewindBefore } }),
         projectionKind: item.kind,
         contentIndex: item.contentIndex,
         payload: item.payload,
@@ -2905,6 +3660,33 @@ function projectNativeHistory(
       }
     }
   };
+}
+
+/** Only a public human message immediately following a text response boundary
+ * has an inclusive fork point that can represent "before this user message".
+ * End-turn tools, system/compaction entries and unknown carriers stay closed. */
+function rewindBeforeEntry(entries: readonly ValidatedHistoryMessage[], index: number): string | undefined {
+  const current = entries[index];
+  const previous = entries[index - 1];
+  if (current?.type !== "user" || current.child || previous?.type !== "assistant" || previous.child) return undefined;
+  const user = record(current.message);
+  const userContent = user?.["content"];
+  if (typeof userContent !== "string" && (!Array.isArray(userContent)
+    || userContent.length === 0 || userContent.some((block) => !["text", "image", "document"].includes(String(record(block)?.["type"]))))) return undefined;
+  const assistant = record(previous.message);
+  const content = assistant?.["content"];
+  if (!Array.isArray(content) || content.length === 0
+    || !content.some((block) => record(block)?.["type"] === "text")
+    || content.some((block) => !["text", "thinking", "redacted_thinking"].includes(String(record(block)?.["type"])))) return undefined;
+  const stop = assistant?.["stop_reason"];
+  if (stop !== undefined && stop !== null && stop !== "end_turn" && stop !== "stop_sequence") return undefined;
+  return previous.uuid;
+}
+
+function invalidRewindBoundary(): JokoError {
+  return claudeCodeError("NATIVE_NAVIGATION_BOUNDARY_UNAVAILABLE", "This native history boundary cannot be confirmed for conversation rewind.", "session_navigation", {
+    recovery: "Choose a user message with a confirmed preceding text response."
+  });
 }
 
 function validatedHistoryMessage(
@@ -3035,19 +3817,28 @@ function capabilityManifest(
   installed: boolean,
   isolatedReviewSupported: boolean,
   nativeTasksSupported: boolean,
+  steerSupported: boolean,
+  subagentDefaultModelSupported: boolean,
+  subagentDefaultModelConfigured: boolean,
   models: readonly ClaudeSdkModelInfo[],
+  managedEffortSupported: boolean,
   hostCapabilities: ReadonlySet<HostComposedCapability>,
   supportsLogin: boolean,
-  supportsLogout: boolean
+  supportsLogout: boolean,
+  inputResolvers: ClaudeInputResolvers
 ): ReadonlyMap<string, Capability> {
   const supported = new Set<string>([
     "session.resume",
+    "session.clone",
+    "session.fork",
+    "session.rewind",
     "session.detach",
     "session.discovery",
     "session.catalog",
     "turn.stream",
     "turn.abort",
     "input.text",
+    "input.mention",
     "model.list",
     "model.switch",
     "provider.refresh",
@@ -3061,6 +3852,8 @@ function capabilityManifest(
     "interaction.question",
     "interaction.plan_review"
   ]);
+  if (inputResolvers.readBlob !== undefined) supported.add("input.image");
+  if (inputResolvers.resolveFile !== undefined) supported.add("input.file");
   if (isolatedReviewSupported) supported.add("review.isolated");
   if (nativeTasksSupported) {
     for (const capability of [
@@ -3074,7 +3867,10 @@ function capabilityManifest(
   }
   if (supportsLogin) supported.add("provider.login");
   if (supportsLogout) supported.add("provider.logout");
-  if (models.some((model) => model.supportsEffort === true)) supported.add("model.effort");
+  if (steerSupported) supported.add("turn.steer");
+  if (subagentDefaultModelSupported && subagentDefaultModelConfigured) supported.add("subagents.default_model");
+  if (managedEffortSupported || models.some((model) => model.supportsEffort === true)) supported.add("model.effort");
+  if (models.some((model) => model.supportsFastMode === true)) supported.add("model.fast_mode");
   for (const capability of hostCapabilities) supported.add(capability);
   return new Map(CAPABILITIES.map((key): [string, Capability] => {
     const implemented = supported.has(key);
@@ -3085,12 +3881,18 @@ function capabilityManifest(
       ? ["ask", "auto", "bypassPermissions"]
       : key === "workspace.extra_dirs"
         ? ["read_write"]
+        : key === "input.mention"
+          ? ["workspace_file", "workspace_directory", "workspace_line_range"]
         : undefined;
     return [key, {
       key,
       supported: available,
       ...(!available && !installed ? { reason: "upstream_missing" as const }
+        : key === "model.fast_mode" && !available ? { reason: "upstream_missing" as const }
         : key === "review.isolated" && !isolatedReviewSupported ? { reason: "upstream_missing" as const }
+        : key === "turn.steer" && !steerSupported ? { reason: "upstream_missing" as const }
+        : key === "subagents.default_model" && !subagentDefaultModelSupported ? { reason: "upstream_missing" as const }
+        : key === "subagents.default_model" && !subagentDefaultModelConfigured ? { reason: "not_implemented" as const }
         : (key === "background.tasks"
           || key === "background.tasks.cancel"
           || key.startsWith("subagents.")) && !nativeTasksSupported
@@ -3107,11 +3909,11 @@ function nativeState(runtime: NativeRuntime): NativeSessionState {
     binding: runtime.binding,
     streaming: runtime.activeTurn !== undefined,
     compacting: false,
-    pendingMessages: 0,
-    providerId: PROVIDER_ID,
+    pendingMessages: runtime.inputPreparation === undefined ? 0 : 1,
+    providerId: runtime.managedRoute?.providerId ?? PROVIDER_ID,
     ...(runtime.modelId === undefined ? {} : { modelId: runtime.modelId }),
     ...(runtime.effort === undefined ? {} : { effort: runtime.effort }),
-    fastMode: false,
+    fastMode: runtime.fastMode,
     permissionMode: runtime.permissionMode,
     planMode: runtime.planMode,
     ...(runtime.lastUsage === undefined ? {} : { usage: runtime.lastUsage })
@@ -3195,6 +3997,13 @@ function continuityGap(): JokoError {
   );
 }
 
+function invalidForkBoundary(): JokoError {
+  return claudeCodeError("NATIVE_SESSION_FORK_BOUNDARY_INVALID", "The fork boundary is not a persisted top-level message in this native Session.", "session_fork", {
+    stateMayHaveChanged: false,
+    recovery: "Refresh native history and select a persisted user or assistant message."
+  });
+}
+
 function invalidNativeHistory(): JokoError {
   return claudeCodeError(
     "NATIVE_HISTORY_INVALID",
@@ -3257,20 +4066,60 @@ function assertResultOwnership(
   const originKind = stringValue(origin?.["kind"]);
   const userMessageUuid = stringValue(envelope["user_message_uuid"]);
   const subtype = stringValue(envelope["subtype"]);
+  const identities = resultInputIdentities(envelope, turn);
+  const belongsToTurn = userMessageUuid !== undefined && uuidPattern().test(userMessageUuid)
+    && (userMessageUuid.toLowerCase() === turn.userMessageUuid
+      || (turn.steers.get(userMessageUuid.toLowerCase())?.consumed === true && identities.has(turn.userMessageUuid)));
   if (turn.nativeContinuationSegment) {
     if (originKind !== undefined && originKind !== "human") throw turnOwnershipGap();
-    if (userMessageUuid !== undefined && (!uuidPattern().test(userMessageUuid)
-      || userMessageUuid.toLowerCase() !== turn.userMessageUuid)) throw turnOwnershipGap();
+    if (userMessageUuid !== undefined && !belongsToTurn) throw turnOwnershipGap();
     return;
   }
   if (originKind !== "human") throw turnOwnershipGap();
   if (subtype === "success") {
-    if (userMessageUuid === undefined || !uuidPattern().test(userMessageUuid)
-      || userMessageUuid.toLowerCase() !== turn.userMessageUuid) throw turnOwnershipGap();
+    if (!belongsToTurn) throw turnOwnershipGap();
     return;
   }
-  if (userMessageUuid !== undefined && (!uuidPattern().test(userMessageUuid)
-    || userMessageUuid.toLowerCase() !== turn.userMessageUuid)) throw turnOwnershipGap();
+  if (userMessageUuid !== undefined && !belongsToTurn) throw turnOwnershipGap();
+}
+
+function resultInputIdentities(envelope: Readonly<Record<string, unknown>>, turn: ActiveTurn): Set<string> {
+  const rawIds = envelope["user_message_uuids"];
+  const primary = stringValue(envelope["user_message_uuid"]);
+  const ids = new Set<string>();
+  if (rawIds === undefined) {
+    if (primary !== undefined) ids.add(primary.toLowerCase());
+    return ids;
+  }
+  if (!Array.isArray(rawIds) || rawIds.length === 0 || rawIds.length > MAX_TURN_INPUTS) throw turnOwnershipGap();
+  for (const id of rawIds) {
+    if (typeof id !== "string" || !uuidPattern().test(id)) throw turnOwnershipGap();
+    const normalized = id.toLowerCase();
+    if (ids.has(normalized) || (normalized !== turn.userMessageUuid && turn.steers.get(normalized)?.consumed !== true)) {
+      throw turnOwnershipGap();
+    }
+    ids.add(normalized);
+  }
+  if (primary === undefined || !ids.has(primary.toLowerCase())) throw turnOwnershipGap();
+  return ids;
+}
+
+function acknowledgeSteer(steer: SteerAdmission): void {
+  if (steer.accepted || steer.admission.settled()) return;
+  steer.accepted = true;
+  steer.admission.resolve(undefined);
+}
+
+function steerNotActive(): JokoError {
+  return claudeCodeError("NATIVE_STEER_NOT_ACTIVE", "The original foreground turn no longer accepts same-turn input.", "dispatch", {
+    recovery: "Keep the input and explicitly send a new prompt when ready."
+  });
+}
+
+function steerOutcomeUnknown(): JokoError {
+  return claudeCodeError("NATIVE_STEER_OUTCOME_UNKNOWN", "The native Result did not prove that all dispatched input belonged to the active turn.", "turn", {
+    stateMayHaveChanged: true, recovery: "Inspect the native Session before explicitly retrying the input."
+  });
 }
 
 function addBoundedIdentity(set: Set<string>, value: string): void {
@@ -3323,17 +4172,12 @@ function nativeSessionCandidate(
 }
 
 function validatePrompt(input: PromptInput): void {
-  if (input.disposition !== "prompt") {
-    throw claudeCodeError("BACKEND_CAPABILITY_UNAVAILABLE", "This Adapter does not support steering or follow-up queues.", "dispatch", {
+  if (input.disposition !== "prompt" && input.disposition !== "steer") {
+    throw claudeCodeError("BACKEND_CAPABILITY_UNAVAILABLE", "This Adapter does not support follow-up queues.", "dispatch", {
       recovery: "Wait for the current Result, then send a normal prompt."
     });
   }
-  if (input.images.length > 0 || input.files.length > 0 || input.mentions.length > 0) {
-    throw claudeCodeError("INPUT_KIND_UNSUPPORTED", "This Adapter currently accepts text-only prompts.", "input", {
-      recovery: "Remove binary, file, and mention inputs before retrying."
-    });
-  }
-  if (input.text.length === 0) {
+  if (input.text.length === 0 && input.images.length === 0 && input.files.length === 0 && input.mentions.length === 0) {
     throw claudeCodeError("PROMPT_EMPTY", "The prompt text is empty.", "input", {
       recovery: "Enter prompt text before sending."
     });
@@ -3459,16 +4303,161 @@ function findModel(models: readonly ClaudeSdkModelInfo[], modelId: string): Clau
   return models.find((model) => model.value === modelId || model.resolvedModel === modelId);
 }
 
-function assertEffortSupported(runtime: NativeRuntime, effort: typeof EFFORT_LEVELS[number]): void {
+function assertFastModeSupported(runtime: NativeRuntime): void {
+  if (runtime.managedRoute !== undefined) throw managedRouteUnavailable();
+  const model = runtime.modelId === undefined
+    ? undefined
+    : findModel(runtime.initialization?.models ?? [], runtime.modelId);
+  if (model?.supportsFastMode === true) return;
+  throw claudeCodeError("FAST_MODE_UNAVAILABLE", "The active model does not advertise Fast mode support.", "model", {
+    recovery: "Select a model whose native catalog explicitly supports Fast mode."
+  });
+}
+
+const FAST_MODE_DISABLED_TEXT = {
+  free: "Fast mode is unavailable for this account plan.",
+  preference: "Fast mode is disabled by the native preference.",
+  extra_usage_disabled: "Fast mode requires extra usage to be enabled.",
+  network_error: "Fast mode availability could not be checked because of a network error.",
+  unknown: "Fast mode is unavailable for an unspecified native reason.",
+  not_first_party: "Fast mode is unavailable through this provider.",
+  disabled_by_env: "Fast mode is disabled by the native environment.",
+  model_not_allowed: "The native service does not allow Fast mode for this model.",
+  sdk_opt_in_required: "Fast mode requires an SDK session opt-in.",
+  pending: "Fast mode availability is still being checked."
+} as const;
+
+interface FastModeObservation {
+  readonly state?: "off" | "on" | "cooldown";
+  readonly disabledReason?: keyof typeof FAST_MODE_DISABLED_TEXT;
+}
+
+function clearFastModeObservation(runtime: NativeRuntime): void {
+  runtime.fastModeObservation = undefined;
+  runtime.publishedFastModeStatus = undefined;
+}
+
+function readFastModeObservation(value: {
+  readonly fast_mode_state?: unknown;
+  readonly fast_mode_disabled_reason?: unknown;
+}): FastModeObservation | undefined {
+  const state = value.fast_mode_state;
+  const disabledReason = value.fast_mode_disabled_reason;
+  if (state === undefined && disabledReason === undefined) return undefined;
+  if ((state !== undefined && state !== "off" && state !== "on" && state !== "cooldown")
+    || (disabledReason !== undefined && (typeof disabledReason !== "string"
+      || !Object.hasOwn(FAST_MODE_DISABLED_TEXT, disabledReason)))) {
+    throw claudeCodeError("NATIVE_FAST_MODE_STATE_INVALID", "The native Fast mode observation is invalid.", "model", {
+      stateMayHaveChanged: true,
+      recovery: "Inspect the installed native runtime before continuing."
+    });
+  }
+  return {
+    ...(state === undefined ? {} : { state }),
+    ...(disabledReason === undefined ? {} : { disabledReason: disabledReason as keyof typeof FAST_MODE_DISABLED_TEXT })
+  };
+}
+
+function fastModeStatusText(observation: FastModeObservation): string {
+  const stateText = observation.state === "cooldown"
+    ? "Fast mode is cooling down; requests may use standard speed."
+    : observation.state === "on"
+      ? "The native service reports Fast mode is available; individual requests may still use standard speed."
+      : observation.state === "off" ? "The native service reports Fast mode is off." : undefined;
+  const reasonText = observation.disabledReason === undefined ? undefined : FAST_MODE_DISABLED_TEXT[observation.disabledReason];
+  return [stateText, reasonText].filter((text) => text !== undefined).join(" ");
+}
+
+function assertEffortSupported(runtime: NativeRuntime, effort: string): typeof EFFORT_LEVELS[number] {
+  if (runtime.managedRoute !== undefined) {
+    return managedNativeEffort(runtime.managedRoute.model, runtime.managedRoute.thinkingLevelMap, effort);
+  }
+  const nativeEffort = requiredNativeEffort(effort);
   const model = runtime.modelId === undefined
     ? undefined
     : findModel(runtime.initialization?.models ?? [], runtime.modelId);
   if (model?.supportsEffort === false
-    || (model?.supportedEffortLevels !== undefined && !model.supportedEffortLevels.includes(effort))) {
+    || (model?.supportedEffortLevels !== undefined && !model.supportedEffortLevels.includes(nativeEffort))) {
     throw claudeCodeError("EFFORT_UNAVAILABLE", "The active model does not support the requested effort level.", "model", {
       recovery: "Choose an effort level advertised for the active model."
     });
   }
+  return nativeEffort;
+}
+
+export const CLAUDE_MANAGED_PROVIDER_SUPPORT: ProviderRuntimeSupport = Object.freeze({
+  protocols: Object.freeze(["anthropic-messages"] as const),
+  fields: Object.freeze([
+    "request_path", "models_endpoint", "headers", "keyless", "auth_header",
+    "model_costs", "model_input_modalities", "model_thinking_levels"
+  ] as const)
+});
+
+function managedProviderSupport(support: ProviderRuntimeSupport): ProviderRuntimeSupport {
+  return { protocols: support.protocols.filter((protocol) => CLAUDE_MANAGED_PROVIDER_SUPPORT.protocols.includes(protocol)),
+    fields: support.fields.filter((field) => CLAUDE_MANAGED_PROVIDER_SUPPORT.fields.includes(field)) };
+}
+
+function normalizeProductEffort(value: string | undefined): string | undefined {
+  const level = value?.trim().toLowerCase();
+  return level !== undefined && ["off", "minimal", ...EFFORT_LEVELS].includes(level) ? level : undefined;
+}
+
+function requiredNativeEffort(value: string): typeof EFFORT_LEVELS[number] {
+  const effort = normalizeEffort(value);
+  if (effort === undefined) throw claudeCodeError("EFFORT_UNAVAILABLE", "The requested effort cannot be expressed by this runtime.", "model");
+  return effort;
+}
+
+function validateManagedThinkingMap(mapping: Readonly<Record<string, string | null>>): void {
+  if (Object.entries(mapping).some(([level, native]) => normalizeProductEffort(level) !== level
+    || native !== null && (typeof native !== "string" || normalizeEffort(native) !== native))) {
+    throw claudeCodeError("MANAGED_PROVIDER_EFFORT_MAPPING_INVALID", "The configured model effort mapping is not supported by this runtime.", "model", {
+      recovery: "Choose a supported native effort level or disable the declared effort."
+    });
+  }
+}
+
+function managedNativeEffort(model: ProviderModel, mapping: Readonly<Record<string, string | null>>, level: string): typeof EFFORT_LEVELS[number] {
+  validateManagedThinkingMap(mapping);
+  if (!model.thinkingLevels.includes(level) || mapping[level] === null) throw managedRouteUnavailable();
+  return requiredNativeEffort(mapping[level] ?? level);
+}
+
+function managedProviderModel(model: ProviderModel, mapping: Readonly<Record<string, string | null>>): ProviderModel {
+  validateManagedThinkingMap(mapping);
+  return { ...model, supportsFastMode: false, thinkingLevels: model.thinkingLevels.filter((level) => mapping[level] !== null && normalizeEffort(mapping[level] ?? level) !== undefined) };
+}
+
+function managedRouteUnavailable(stateMayHaveChanged = false): JokoError {
+  return claudeCodeError("MANAGED_PROVIDER_ROUTE_UNAVAILABLE", "The configured model route is unavailable or no longer owns this operation.", "model", {
+    stateMayHaveChanged,
+    recovery: "Refresh the exact Provider and model configuration before retrying. Native requests for other models require their own configured route."
+  });
+}
+
+function managedQueryEnvironment(route: ManagedProviderRouteBinding, port: ManagedProviderRuntimePort,
+  environment: Readonly<Record<string, string>>): Readonly<Record<string, string | undefined>> {
+  const token = port.environment[route.apiKeyEnvironment];
+  const endpoint = new URL(route.baseUrl);
+  if (route.protocol !== "anthropic-messages" || token === undefined || token.length === 0
+    || !port.secretEnvironmentNames.includes(route.apiKeyEnvironment)
+    || endpoint.protocol !== "http:" || !["127.0.0.1", "[::1]"].includes(endpoint.hostname)
+    || endpoint.username !== "" || endpoint.password !== "" || endpoint.search !== "" || endpoint.hash !== "") throw managedRouteUnavailable();
+  return {
+    ...managedAuthEnvironmentOverrides(),
+    ...Object.fromEntries(port.secretEnvironmentNames.map((key) => [key, undefined])),
+    CLAUDE_CONFIG_DIR: environment["CLAUDE_CONFIG_DIR"],
+    CLAUDE_CODE_GIT_BASH_PATH: environment["CLAUDE_CODE_GIT_BASH_PATH"],
+    CLAUDE_CODE_SHELL: environment["CLAUDE_CODE_SHELL"],
+    CLAUDE_CODE_TMPDIR: environment["CLAUDE_CODE_TMPDIR"],
+    HTTP_PROXY: undefined, HTTPS_PROXY: undefined, ALL_PROXY: undefined,
+    http_proxy: undefined, https_proxy: undefined, all_proxy: undefined,
+    NO_PROXY: "127.0.0.1,::1", no_proxy: "127.0.0.1,::1",
+    ANTHROPIC_API_KEY: token,
+    ANTHROPIC_BASE_URL: route.baseUrl,
+    CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
+  };
 }
 
 function operationUuid(operationId: string): string {

@@ -152,7 +152,8 @@ export function workspaceFileIndexCatalog(
       kind: "directory",
       name: parts.at(-1) ?? path,
       path: withDirectorySlash(path),
-      meta: withDirectorySlash(path)
+      meta: withDirectorySlash(path),
+      mention: directoryMention(path, parts.at(-1) ?? path, workspaceId)
     });
   }
   return uniqueCatalog(result);
@@ -475,6 +476,18 @@ function parseMentionRun(text: string, from: number, caret: number): ComposerInl
   return { from, to, query: afterAt, quoted: false };
 }
 
+function directoryMention(path: string, label: string, workspaceId: string | undefined): ComposerTokenMentionDraft {
+  return {
+    id: `workspace-directory:${workspaceId ?? ""}:${path}`,
+    kind: "workspace",
+    reference: path,
+    label,
+    token: serializeComposerMentionPath(path, true),
+    directory: true,
+    ...(workspaceId === undefined ? {} : { workspaceId })
+  };
+}
+
 function flattenWorkspaceCatalog(
   entries: readonly WorkspaceEntryView[],
   workspaceId: string | undefined,
@@ -489,7 +502,8 @@ function flattenWorkspaceCatalog(
         kind: "directory",
         name: entry.name.replace(/[\\/]+$/u, ""),
         path: withDirectorySlash(path),
-        meta: withDirectorySlash(path)
+        meta: withDirectorySlash(path),
+        mention: directoryMention(path, entry.name.replace(/[\\/]+$/u, ""), workspaceId)
       });
       result.push(...flattenWorkspaceCatalog(entry.children ?? [], workspaceId, path));
       continue;

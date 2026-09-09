@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { MULTILINGUAL_FIXTURES } from "./i18n/multilingual-fixtures.js";
 
 import {
   buildReviewEvidence,
@@ -43,7 +44,7 @@ function source(overrides: Partial<BuildReviewEvidenceInput> = {}): BuildReviewE
     changeSetEvidence: null,
     artifacts: [{
       kind: "file",
-      displayName: "Report 文档.txt",
+      displayName: MULTILINGUAL_FIXTURES.reportName,
       blob: { id: "blob-1", sha256: hash("e"), byteLength: 3, mimeType: "text/plain", fileName: "report.txt" },
       excerpt: { format: "text", coverage: "full", content: "result" }
     }],
@@ -64,7 +65,7 @@ describe("review evidence", () => {
       "src/a.ts",
       "src/b.ts"
     ]);
-    expect(first.promptInput.artifacts[0]?.alias).toBe("[review-artifact]/01-Report 文档.txt");
+    expect(first.promptInput.artifacts[0]?.alias).toBe(`[review-artifact]/01-${MULTILINGUAL_FIXTURES.reportName}`);
   });
 
   it("sorts artifact sets before assigning ordinal aliases and sealing", () => {
@@ -75,7 +76,7 @@ describe("review evidence", () => {
     expect(first.freshness.artifactsSha256).toBe(second.freshness.artifactsSha256);
     expect(first.promptInput.artifacts).toEqual(second.promptInput.artifacts);
     expect(first.promptInput.artifacts.map((artifact) => artifact.alias)).toEqual([
-      "[review-artifact]/01-Report 文档.txt",
+      `[review-artifact]/01-${MULTILINGUAL_FIXTURES.reportName}`,
       "[review-artifact]/02-image.png"
     ]);
   });

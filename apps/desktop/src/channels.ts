@@ -13,6 +13,9 @@ export const DESKTOP_CHANNELS = {
   windowInteractionGet: "joko:window-interaction:get",
   windowInteractionSet: "joko:window-interaction:set",
   windowInteractionChanged: "joko:window-interaction:changed",
+  mainWindowCloseSettingsGet: "joko:main-window-close-settings:get",
+  mainWindowCloseSettingsSet: "joko:main-window-close-settings:set",
+  mainWindowCloseSettingsChanged: "joko:main-window-close-settings:changed",
   pageSearchStart: "joko:page-search:start",
   pageSearchStop: "joko:page-search:stop",
   pageSearchResult: "joko:page-search:result",
@@ -70,6 +73,8 @@ export const DESKTOP_CHANNELS = {
   deepLinkTakePending: "joko:deep-link:take-pending",
   deepLinkNavigate: "joko:deep-link:navigate",
   saveFile: "joko:files:save",
+  copyFile: "joko:files:copy",
+  cancelFileCopy: "joko:files:copy-cancel",
   credentialGet: "joko:credential:get",
   credentialSet: "joko:credential:set",
   credentialDelete: "joko:credential:delete",
@@ -531,6 +536,27 @@ export type DesktopProviderModelRefreshLifecycleHint =
 
 export interface DesktopWindowInteractionSettings {
   readonly swallowActivationClick: boolean;
+}
+
+export interface DesktopCopyFileRequest {
+  readonly requestId: string;
+  readonly file: DesktopFile;
+}
+
+export type DesktopCopyFileResult =
+  | { readonly status: "copied" | "cancelled" | "unknown" | "unavailable" | "blocked" }
+  | { readonly status: "failed"; readonly reason: "capacity" | "storage" | "helper" };
+
+export type DesktopMainWindowCloseBehavior = "tray" | "minimize" | "quit";
+
+export interface DesktopMainWindowCloseSettings {
+  readonly behavior: DesktopMainWindowCloseBehavior | null;
+  readonly revision: number;
+}
+
+export interface DesktopMainWindowCloseSettingsChange {
+  readonly behavior: DesktopMainWindowCloseBehavior | null;
+  readonly expectedRevision: number;
 }
 
 export type DesktopMicrophonePermissionStatus = "granted" | "denied" | "prompt" | "unknown";

@@ -59,6 +59,8 @@ export function projectPiNativeHistory(
       return {
         nativeEntryId: entry.id,
         ...(entry.parentId === undefined ? {} : { nativeParentEntryId: entry.parentId }),
+        ...(entry.parentId === undefined || projection.payload.type !== "message_complete" || projection.payload.role !== "user"
+          ? {} : { nativeRewindBefore: { kind: "native_entry" as const, entryId: entry.parentId } }),
         projectionKind: projection.kind,
         contentIndex: projection.contentIndex,
         ...(emittedAt === undefined ? {} : { emittedAt }),
@@ -74,6 +76,7 @@ export function projectPiNativeHistory(
   return {
     events,
     ...(history.leafId === undefined ? {} : { activeEntryId: history.leafId }),
+    ...(history.leafId === undefined ? {} : { activeNavigationTarget: { kind: "native_entry" as const, entryId: history.leafId } }),
     activeLineage: entries.map((entry) => ({
       entryId: entry.id,
       ...(entry.parentId === undefined ? {} : { parentEntryId: entry.parentId })

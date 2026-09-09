@@ -21,6 +21,7 @@ import { ProviderAuthUnsupportedError } from "./credential-manager.js";
 import { nativeStateObservation, SESSION_NATIVE_STATE_OBSERVATION_SETTING_KEY } from "./native-state-observation.js";
 import { toProtoEventCursor, toProtoTimestamp } from "./proto-mapper.js";
 import { SESSION_RUNTIME_STATE_SETTING_KEY } from "./session-runtime-state.js";
+import type { SessionHost } from "./session-host.js";
 
 const connection = {
   id: "connection-features",
@@ -104,6 +105,13 @@ function immediateHost(store: object, extra: Record<string, unknown> = {}) {
 async function invoke<T>(handler: unknown, request: unknown): Promise<T> {
   if (typeof handler !== "function") throw new Error("RPC handler is missing.");
   return await (handler as (request: unknown, handlerContext: unknown) => T | Promise<T>)(request, context());
+}
+
+async function completedNavigation(...args: Parameters<SessionHost["navigateTree"]>) {
+  const authority = args[5];
+  const body = authority.protocol.kind === "connect" ? authority.protocol.body : { sourceSessionId: args[0] };
+  const value = { accepted: true, resultCase: "acknowledgement" } as const;
+  return { replayed: false, value, operation: completedRecord(authority.operationId, "navigateSessionBranch", body, value) };
 }
 
 describe("Connect typed feature boundaries", () => {
@@ -1021,7 +1029,7 @@ describe("Connect typed feature boundaries", () => {
 
   it("navigates native branches without silently requesting Pi summarization", async () => {
     const store = { findOperation: () => undefined };
-    const navigateTree = vi.fn(async () => undefined);
+    const navigateTree = vi.fn(completedNavigation);
     const services = createConnectServices(stubApplication({
       store,
       sessionHost: immediateHost(store, { navigateTree })
@@ -1031,23 +1039,42 @@ describe("Connect typed feature boundaries", () => {
       operationId: "operation-navigate-no-summary",
       connectionId: connection.id,
       mutation: create(contract.OperationMutationSchema, {
-        preconditions: [],
+        preconditions: [{ entity: { kind: contract.EntityKind.SESSION, id: "session-tree" }, expectedGeneration: 1n }],
         payload: {
           case: "navigateSessionBranch",
           value: create(contract.NavigateSessionBranchMutationSchema, {
             sessionId: "session-tree",
-            nativeEntryId: "native-user-entry"
+            target: { kind: { case: "nativeEntryId", value: "native-user-entry" } }
           })
         }
       })
     });
 
-    expect(navigateTree).toHaveBeenCalledWith("session-tree", "native-user-entry", false, undefined);
+    expect(navigateTree).toHaveBeenCalledWith("session-tree", { kind: "native_entry", entryId: "native-user-entry" }, false, undefined, 1,
+      expect.objectContaining({ operationId: "operation-navigate-no-summary", protocol: expect.objectContaining({ kind: "connect" }) }));
+  });
+
+  it("requires an explicit start target and its source generation before admitting native navigation", async () => {
+    const store = { findOperation: () => undefined };
+    const navigateTree = vi.fn(completedNavigation);
+    const services = createConnectServices(stubApplication({ store, sessionHost: immediateHost(store, { navigateTree }) }));
+    const payload = { case: "navigateSessionBranch" as const, value: { sessionId: "session-start", target: { kind: { case: "sessionStart" as const, value: {} } } } };
+    await invoke(services.operation.submitOperation, { operationId: "navigation-start", connectionId: connection.id, mutation: create(contract.OperationMutationSchema, {
+      preconditions: [{ entity: { kind: contract.EntityKind.SESSION, id: "session-start" }, expectedGeneration: 4n }], payload
+    }) });
+    expect(navigateTree).toHaveBeenCalledExactlyOnceWith("session-start", { kind: "session_start" }, false, undefined, 4,
+      expect.objectContaining({ operationId: "navigation-start", protocol: expect.objectContaining({ kind: "connect" }) }));
+    await expect(invoke(services.operation.submitOperation, { operationId: "navigation-no-generation", connectionId: connection.id, mutation: create(contract.OperationMutationSchema, { payload }) })).rejects.toMatchObject({ code: Code.InvalidArgument });
+    await expect(invoke(services.operation.submitOperation, { operationId: "navigation-no-target", connectionId: connection.id, mutation: create(contract.OperationMutationSchema, {
+      preconditions: [{ entity: { kind: contract.EntityKind.SESSION, id: "session-start" }, expectedGeneration: 4n }],
+      payload: { case: "navigateSessionBranch", value: { sessionId: "session-start" } }
+    }) })).rejects.toMatchObject({ code: Code.InvalidArgument });
+    expect(navigateTree).toHaveBeenCalledOnce();
   });
 
   it("passes bounded branch-summary options through to the Session Host", async () => {
     const store = { findOperation: () => undefined };
-    const navigateTree = vi.fn(async () => undefined);
+    const navigateTree = vi.fn(completedNavigation);
     const services = createConnectServices(stubApplication({
       store,
       sessionHost: immediateHost(store, { navigateTree })
@@ -1057,12 +1084,12 @@ describe("Connect typed feature boundaries", () => {
       operationId: "operation-navigate-with-summary",
       connectionId: connection.id,
       mutation: create(contract.OperationMutationSchema, {
-        preconditions: [],
+        preconditions: [{ entity: { kind: contract.EntityKind.SESSION, id: "session-tree" }, expectedGeneration: 1n }],
         payload: {
           case: "navigateSessionBranch",
           value: create(contract.NavigateSessionBranchMutationSchema, {
             sessionId: "session-tree",
-            nativeEntryId: "native-user-entry",
+            target: { kind: { case: "nativeEntryId", value: "native-user-entry" } },
             summarize: true,
             customInstructions: "  preserve decisions and API names  "
           })
@@ -1072,9 +1099,11 @@ describe("Connect typed feature boundaries", () => {
 
     expect(navigateTree).toHaveBeenCalledWith(
       "session-tree",
-      "native-user-entry",
+      { kind: "native_entry", entryId: "native-user-entry" },
       true,
-      "preserve decisions and API names"
+      "preserve decisions and API names",
+      1,
+      expect.objectContaining({ operationId: "operation-navigate-with-summary", protocol: expect.objectContaining({ kind: "connect" }) })
     );
   });
 
@@ -1165,8 +1194,16 @@ describe("Connect typed feature boundaries", () => {
     const providerUpsert = vi.fn(async (input: any) => {
       provider = {
         ...input,
-        credentialReferenceIds: Object.values(input.credentialBindings),
-        authenticationState: "authenticated",
+        runtimes: input.runtimes.map((runtime: any) => ({
+          ...runtime,
+          displayName: input.displayName,
+          kind: input.kind,
+          enabled: input.enabled,
+          credentialReferenceIds: Object.values(runtime.credentialBindings),
+          authenticationState: "authenticated",
+          supportsLogin: false, supportsLogout: false, supportsRefresh: false,
+          version: 3n, updatedAt: 30
+        })),
         version: 3n,
         updatedAt: 30
       };
@@ -1197,7 +1234,7 @@ describe("Connect typed feature boundaries", () => {
             workingDirectory: input.cwd ?? "",
             environment: { ...(input.environment ?? {}) }
           }
-          : { case: "streamableHttp", endpoint: input.endpoint },
+          : { case: input.transport === "sse" ? "sse" : "streamableHttp", endpoint: input.endpoint },
         version: 4n,
         updatedAt: 40
       };
@@ -1209,6 +1246,14 @@ describe("Connect typed feature boundaries", () => {
       findOperation: () => undefined,
       findSetting: () => undefined,
       deleteSetting: vi.fn(),
+      getBackend: (backendId: string) => ({ descriptor: {
+        id: backendId, models: [],
+        capabilities: new Map([["provider.managed_catalog", { key: "provider.managed_catalog", supported: true }]]),
+        providerRuntimeSupport: { protocols: ["google-generative-ai"], fields: [
+          "endpoint", "api_key", "headers", "auth_header", "model_limits", "model_costs", "model_input_modalities",
+          "model_thinking_levels", "model_sampling", "model_compatibility", "model_fast_mode"
+        ] }
+      } }),
       health: () => ({ schemaVersion: 1, journalMode: "wal", foreignKeys: true, revision: 1n, globalCursor: 0n }),
       listConnections: () => [],
       listBackends: () => [],
@@ -1228,9 +1273,12 @@ describe("Connect typed feature boundaries", () => {
       store,
       sessionHost: immediateHost(store),
       providers: {
-        list: () => provider === undefined ? [] : [provider],
-        get: () => provider,
-        upsert: providerUpsert,
+        list: () => provider?.runtimes ?? [],
+        listConfigurations: () => provider === undefined ? [] : [provider],
+        nativeAuthenticationBackendId: "pi",
+        hasManagedProvider: () => false,
+        get: () => provider?.runtimes[0],
+        upsertConfiguration: providerUpsert,
         resolveOpenAiEmbeddingRoute: () => undefined
       },
       credentials: { list: () => [], delete: credentialDelete },
@@ -1243,34 +1291,39 @@ describe("Connect typed feature boundaries", () => {
       providerId: "custom-google",
       displayName: "Custom Google",
       kind: contract.ProviderKind.CUSTOM_ENDPOINT,
-      apiCompatibility: contract.ProviderApiCompatibility.GOOGLE_GENERATIVE_AI,
-      endpoint: "https://models.example.test/v1",
-      credentialReferenceId: "credential-reference-1234",
       enabled: true,
-      apiKeyEnvironment: "CUSTOM_API_KEY",
-      keyless: false,
-      authHeader: true,
-      headers: [create(contract.ProviderHeaderConfigurationSchema, {
-        headerName: "X-Tenant",
-        environmentName: "CUSTOM_TENANT",
-        credentialReferenceId: "credential-reference-tenant"
-      })],
-      models: [create(contract.ProviderModelConfigurationSchema, {
-        modelId: "reasoner-1",
-        displayName: "Reasoner 1",
+      version: create(contract.EntityVersionSchema, { revision: create(contract.RevisionSchema, { value: 0n }) }),
+      runtimes: [create(contract.ProviderRuntimeConfigurationSchema, {
+        backendId: "pi",
+        credentialOrigin: "https://models.example.test",
         apiCompatibility: contract.ProviderApiCompatibility.GOOGLE_GENERATIVE_AI,
-        reasoning: true,
-        supportsFastMode: true,
-        inputModalities: [contract.ModelInputModality.TEXT, contract.ModelInputModality.IMAGE],
-        contextWindowTokens: 200_000n,
-        maximumOutputTokens: 16_000n,
-        inputCostMicrosPerMillion: 1_250_000n,
-        outputCostMicrosPerMillion: 5_000_000n,
-        cacheReadCostMicrosPerMillion: 250_000n,
-        cacheWriteCostMicrosPerMillion: 500_000n,
-        thinkingLevels: [create(contract.ProviderThinkingLevelMappingSchema, { effortId: "high", nativeLevel: "deep" })],
-        sampling: create(contract.ProviderSamplingConfigurationSchema, { temperature: 0.3, topP: 0.9, seed: 42n }),
-        compatibility: create(contract.ProviderCompatibilityConfigurationSchema, { supportsDeveloperRole: true, supportsStrictTools: true, thinkingFormat: "native" })
+        endpoint: "https://models.example.test/v1",
+        credentialReferenceId: "credential-reference-1234",
+        apiKeyEnvironment: "CUSTOM_API_KEY",
+        keyless: false,
+        authHeader: true,
+        headers: [create(contract.ProviderHeaderConfigurationSchema, {
+          headerName: "X-Tenant",
+          environmentName: "CUSTOM_TENANT",
+          credentialReferenceId: "credential-reference-tenant"
+        })],
+        models: [create(contract.ProviderModelConfigurationSchema, {
+          modelId: "reasoner-1",
+          displayName: "Reasoner 1",
+          apiCompatibility: contract.ProviderApiCompatibility.GOOGLE_GENERATIVE_AI,
+          reasoning: true,
+          supportsFastMode: true,
+          inputModalities: [contract.ModelInputModality.TEXT, contract.ModelInputModality.IMAGE],
+          contextWindowTokens: 200_000n,
+          maximumOutputTokens: 16_000n,
+          inputCostMicrosPerMillion: 1_250_000n,
+          outputCostMicrosPerMillion: 5_000_000n,
+          cacheReadCostMicrosPerMillion: 250_000n,
+          cacheWriteCostMicrosPerMillion: 500_000n,
+          thinkingLevels: [create(contract.ProviderThinkingLevelMappingSchema, { effortId: "high", nativeLevel: "deep" })],
+          sampling: create(contract.ProviderSamplingConfigurationSchema, { temperature: 0.3, topP: 0.9, seed: 42n }),
+          compatibility: create(contract.ProviderCompatibilityConfigurationSchema, { supportsDeveloperRole: true, supportsStrictTools: true, thinkingFormat: "native" })
+        })]
       })]
     });
     const providerRequest = create(contract.SubmitOperationRequestSchema, {
@@ -1287,29 +1340,27 @@ describe("Connect typed feature boundaries", () => {
     ));
 
     expect(providerUpsert).toHaveBeenCalledOnce();
-    expect(provider.provider.api).toBe("google-generative-ai");
-    expect(provider.provider.models[0]).toMatchObject({
+    expect(provider.runtimes[0].backendId).toBe("pi");
+    expect(provider.runtimes[0].provider.api).toBe("google-generative-ai");
+    expect(provider.runtimes[0].provider.models[0]).toMatchObject({
       id: "reasoner-1",
       contextWindow: 200_000,
       maxTokens: 16_000,
       supportsFastMode: true
     });
-    expect(provider.provider.models[0].samplingParams).toMatchObject({ temperature: 0.3, topP: 0.9, seed: 42 });
-    expect(provider.credentialBindings).toEqual({ CUSTOM_API_KEY: "credential-reference-1234", CUSTOM_TENANT: "credential-reference-tenant" });
+    expect(provider.runtimes[0].provider.models[0].samplingParams).toMatchObject({ temperature: 0.3, topP: 0.9, seed: 42 });
+    expect(provider.runtimes[0].credentialBindings).toEqual({ CUSTOM_API_KEY: "credential-reference-1234", CUSTOM_TENANT: "credential-reference-tenant" });
 
     const mcpInput = create(contract.McpServerInputSchema, {
       displayName: "Local MCP",
       transport: contract.McpTransport.STDIO,
-      endpoint: "",
       enabled: true,
       credentialBindings: [create(contract.CredentialBindingSchema, {
-        headerName: "",
         credentialReferenceId: "credential-reference-mcp",
         configured: true,
         target: contract.McpCredentialTarget.ENVIRONMENT,
         targetName: "MCP_TOKEN"
       }), create(contract.CredentialBindingSchema, {
-        headerName: "",
         credentialReferenceId: "credential-reference-tenant",
         target: contract.McpCredentialTarget.ENVIRONMENT,
         targetName: "MCP_TENANT"
@@ -1370,9 +1421,11 @@ describe("Connect typed feature boundaries", () => {
 
     const settingsResponse = await invoke<{ settings?: contract.SettingsSnapshot }>(services.settings.getSettings, {});
     const settings = fromBinary(contract.SettingsSnapshotSchema, toBinary(contract.SettingsSnapshotSchema, settingsResponse.settings!));
-    expect(settings.providers[0]?.models[0]?.sampling?.seed).toBe(42n);
-    expect(settings.providers[0]?.models[0]?.supportsFastMode).toBe(true);
-    expect(settings.providers[0]?.headers[0]).toMatchObject({ headerName: "X-Tenant", environmentName: "CUSTOM_TENANT" });
+    expect(settings.providers[0]?.version?.revision?.value).toBe(3n);
+    expect(settings.providers[0]?.runtimes[0]?.backendId).toBe("pi");
+    expect(settings.providers[0]?.runtimes[0]?.models[0]?.sampling?.seed).toBe(42n);
+    expect(settings.providers[0]?.runtimes[0]?.models[0]?.supportsFastMode).toBe(true);
+    expect(settings.providers[0]?.runtimes[0]?.headers[0]).toMatchObject({ headerName: "X-Tenant", environmentName: "CUSTOM_TENANT" });
     const mcpResponse = await invoke<{ servers: contract.McpServerDescriptor[]; page?: contract.PageInfo }>(services.tool.listMcpServers, {});
     const mcpWire = fromBinary(contract.ListMcpServersResponseSchema, toBinary(contract.ListMcpServersResponseSchema, create(contract.ListMcpServersResponseSchema, {
       servers: mcpResponse.servers,
@@ -1410,6 +1463,33 @@ describe("Connect typed feature boundaries", () => {
     expect(String(deleteFailure)).not.toContain("local-mcp");
     expect(String(deleteFailure)).not.toContain("MCP_TOKEN");
     expect(credentialDelete).not.toHaveBeenCalled();
+    for (const transport of [contract.McpTransport.HTTPS_STREAMABLE_HTTP, contract.McpTransport.HTTP_SSE]) {
+      const configCase = transport === contract.McpTransport.HTTP_SSE ? "sse" : "streamableHttp";
+      const server = create(contract.McpServerInputSchema, {
+        displayName: "HTTP tools", enabled: true, transport,
+        credentialBindings: [{ target: contract.McpCredentialTarget.HEADER, targetName: "Authorization", credentialReferenceId: "credential-reference-mcp" }],
+        transportConfig: { case: configCase, value: { endpoint: "https://mcp.example.test/events" } }
+      });
+      const request = create(contract.SubmitOperationRequestSchema, {
+        operationId: `mcp-http-${transport}`, connectionId: connection.id,
+        mutation: { payload: { case: "upsertMcpServer", value: { mcpServerId: "http-tools", server, expectedRevision: { value: 4n } } } }
+      });
+      await invoke(services.operation.submitOperation, fromBinary(contract.SubmitOperationRequestSchema, toBinary(contract.SubmitOperationRequestSchema, request)));
+      expect(mcpUpsert).toHaveBeenLastCalledWith(expect.objectContaining({
+        transport: configCase === "sse" ? "sse" : "streamable_http",
+        endpoint: "https://mcp.example.test/events",
+        credentialBindings: [{ target: "header", name: "Authorization", credentialReferenceId: "credential-reference-mcp" }]
+      }), 4n);
+      const saved = await invoke<{ servers: contract.McpServerDescriptor[] }>(services.tool.listMcpServers, {});
+      expect(saved.servers[0]).toMatchObject({ transport, transportConfig: { case: configCase, value: { endpoint: "https://mcp.example.test/events" } } });
+      const calls = mcpUpsert.mock.calls.length;
+      server.transportConfig = { case: "stdio", value: create(contract.StdioMcpConfigurationSchema, { command: "node" }) };
+      await expect(invoke(services.operation.submitOperation, {
+        ...request, operationId: `mcp-mismatch-${transport}`,
+        mutation: create(contract.OperationMutationSchema, { payload: { case: "upsertMcpServer", value: { mcpServerId: "http-tools", server, expectedRevision: { value: 4n } } } })
+      })).rejects.toMatchObject({ code: Code.InvalidArgument });
+      expect(mcpUpsert).toHaveBeenCalledTimes(calls);
+    }
   });
 
   it("deletes a native Provider credential through native logout and refreshes the Pi generation", async () => {
@@ -1418,6 +1498,7 @@ describe("Connect typed feature boundaries", () => {
     const credentialDelete = vi.fn(async () => true);
     const refreshPiGeneration = vi.fn(async () => undefined);
     const nativeProvider = {
+      backendId: "pi",
       provider: { id: "amazon-bedrock" },
       credentialReferenceIds: [credentialReferenceId],
       nativeCredentialReferenceId: credentialReferenceId
@@ -1460,6 +1541,11 @@ describe("Connect typed feature boundaries", () => {
     let configured: any;
     const store = {
       findOperation: () => undefined,
+      getBackend: (backendId: string) => ({ descriptor: {
+        id: backendId, models: [],
+        capabilities: new Map([["provider.managed_catalog", { key: "provider.managed_catalog", supported: true }]]),
+        providerRuntimeSupport: { protocols: ["openai-completions"], fields: ["endpoint", "keyless"] }
+      } }),
       listBackends: () => [],
       deleteSetting: vi.fn(),
       health: () => ({ schemaVersion: 1, journalMode: "wal", foreignKeys: true, revision: 1n, globalCursor: 0n })
@@ -1468,9 +1554,10 @@ describe("Connect typed feature boundaries", () => {
       store,
       sessionHost: immediateHost(store),
       providers: {
-        list: () => configured === undefined ? [] : [configured],
-        get: () => configured,
-        upsert: async (input: any) => {
+        list: () => configured?.runtimes ?? [],
+        hasManagedProvider: () => false,
+        get: () => configured?.runtimes[0],
+        upsertConfiguration: async (input: any) => {
           configured = { ...input, authenticationState: "not_required", version: 1n, updatedAt: 1 };
           return configured;
         }
@@ -1492,14 +1579,18 @@ describe("Connect typed feature boundaries", () => {
               providerId: "chat-endpoint",
               displayName: "Chat endpoint",
               kind: contract.ProviderKind.CUSTOM_ENDPOINT,
-              apiCompatibility: contract.ProviderApiCompatibility.OPENAI_CHAT_COMPLETIONS,
-              endpoint: "https://chat.example.test/v1",
               enabled: true,
-              keyless: true,
-              models: [create(contract.ProviderModelConfigurationSchema, {
-                modelId: "chat-model",
-                displayName: "Chat model",
-                apiCompatibility: contract.ProviderApiCompatibility.OPENAI_CHAT_COMPLETIONS
+              version: create(contract.EntityVersionSchema, { revision: create(contract.RevisionSchema, { value: 0n }) }),
+              runtimes: [create(contract.ProviderRuntimeConfigurationSchema, {
+                backendId: "pi", credentialOrigin: "",
+                apiCompatibility: contract.ProviderApiCompatibility.OPENAI_COMPLETIONS,
+                endpoint: "https://chat.example.test/v1",
+                keyless: true,
+                models: [create(contract.ProviderModelConfigurationSchema, {
+                  modelId: "chat-model",
+                  displayName: "Chat model",
+                  apiCompatibility: contract.ProviderApiCompatibility.OPENAI_COMPLETIONS
+                })]
               })]
             })
           })
@@ -1512,7 +1603,8 @@ describe("Connect typed feature boundaries", () => {
       toBinary(contract.SubmitOperationRequestSchema, request)
     ));
 
-    expect(configured.provider).toMatchObject({
+    expect(configured.runtimes[0].backendId).toBe("pi");
+    expect(configured.runtimes[0].provider).toMatchObject({
       id: "chat-endpoint",
       api: "openai-completions",
       models: [{ id: "chat-model", api: "openai-completions" }]
@@ -1551,8 +1643,8 @@ describe("Connect typed feature boundaries", () => {
       store: { listBackends: () => [backend], getBackend: () => backend },
       providers: {
         list: () => [
-          { provider: { id: "signed-out" }, authenticationState: "signed_out" },
-          { provider: { id: "ready" }, authenticationState: "authenticated" }
+          { backendId: "pi", provider: { id: "signed-out" }, authenticationState: "signed_out" },
+          { backendId: "pi", provider: { id: "ready" }, authenticationState: "authenticated" }
         ]
       }
     }));
@@ -2140,9 +2232,9 @@ describe("Connect typed feature boundaries", () => {
     expect(messageSearch.available).not.toHaveBeenCalled();
   });
 
-  it("restores prompt recommendations by deleting the durable override", async () => {
-    const deleteSetting = vi.fn();
-    const store = { findOperation: () => undefined, deleteSetting };
+  it("restores prompt recommendations while retaining the setting revision", async () => {
+    const setSetting = vi.fn();
+    const store = { findOperation: () => undefined, setSetting };
     const services = createConnectServices(stubApplication({
       store,
       sessionHost: immediateHost(store)
@@ -2162,7 +2254,7 @@ describe("Connect typed feature boundaries", () => {
       })
     });
 
-    expect(deleteSetting).toHaveBeenCalledWith("service", "orchestrator", "settings.prompt_recommendation");
+    expect(setSetting).toHaveBeenCalledWith("service", "orchestrator", "settings.prompt_recommendation", {});
   });
 
   it("restores optional personalization defaults while their runtime owners are absent", async () => {
@@ -2229,8 +2321,8 @@ describe("Connect typed feature boundaries", () => {
       sessionHost: immediateHost(store),
       visionBridge: {},
       providers: {
-        hasInferenceModel: (providerId: string, modelId: string) =>
-          providerId === model.providerId && modelId === model.modelId,
+        hasInferenceModel: (backendId: string, providerId: string, modelId: string) =>
+          (backendId === "backend-a" || backendId === "backend-b") && providerId === model.providerId && modelId === model.modelId,
         resolveInferenceRoute: () => undefined
       },
       refreshPiGeneration: vi.fn(async () => undefined)
@@ -3557,6 +3649,8 @@ describe("Connect typed feature boundaries", () => {
       store,
       sessionHost: immediateHost(store),
       providers: {
+        nativeAuthenticationBackendId: "managed-backend",
+        list: () => [{ backendId: "managed-backend", provider: { id: "unsupported-provider" } }],
         beginLogin: async () => {
           throw new ProviderAuthUnsupportedError("Provider login is unavailable in the installed Pi runtime.");
         }
@@ -3729,7 +3823,7 @@ describe("Connect typed feature boundaries", () => {
       complete: true,
       gaps: [],
       capturedAt: 20,
-      dialogueEntryId: "native-leaf-before-run"
+      dialogueAnchor: { target: { kind: "native_entry", entryId: "native-leaf-before-run" }, generation: 1 }
     };
     const preview = {
       id: "preview-dialogue",
@@ -3739,7 +3833,7 @@ describe("Connect typed feature boundaries", () => {
       safe: false,
       expiresAt: Date.now() + 60_000
     };
-    const navigateTree = vi.fn(async () => undefined);
+    const navigateTree = vi.fn(completedNavigation);
     const consumeDialogueOnlyRewind = vi.fn(async () => changeSet);
     const applyRewind = vi.fn(async () => changeSet);
     const store = {
@@ -3808,7 +3902,8 @@ describe("Connect typed feature boundaries", () => {
         }
       })
     });
-    expect(navigateTree).toHaveBeenCalledWith("session-dialogue", "native-leaf-before-run", false);
+    expect(navigateTree).toHaveBeenCalledWith("session-dialogue", { kind: "native_entry", entryId: "native-leaf-before-run" }, false, undefined, 1,
+      expect.objectContaining({ protocol: expect.objectContaining({ kind: "internal" }) }));
     expect(consumeDialogueOnlyRewind).toHaveBeenCalledWith(preview.id);
     expect(applyRewind).not.toHaveBeenCalled();
     expect(operation.operation?.result?.payload).toMatchObject({
@@ -4422,7 +4517,9 @@ describe("Connect typed feature boundaries", () => {
       deleteSetting
     };
     const providers = {
+      nativeAuthenticationBackendId: backend.id,
       list: () => [{
+        backendId: backend.id,
         provider: {
           id: "managed",
           api: "openai-responses",
@@ -4491,10 +4588,11 @@ describe("Connect typed feature boundaries", () => {
     });
 
     expect(response.operation).toMatchObject({ state: contract.OperationState.SUCCEEDED });
-    expect(deleteSetting).toHaveBeenCalledWith(
+    expect(store.setSetting).toHaveBeenCalledWith(
       "service",
       "orchestrator",
-      "settings.model_access.backend-managed-catalog"
+      "settings.model_access.backend-managed-catalog",
+      expect.objectContaining({ disabledProviderIds: [], disabledModels: [] })
     );
     expect(refreshPiGeneration).toHaveBeenCalledOnce();
   });
@@ -4550,10 +4648,11 @@ describe("Connect typed feature boundaries", () => {
     });
 
     expect(response.operation).toMatchObject({ state: contract.OperationState.SUCCEEDED });
-    expect(deleteSetting).toHaveBeenCalledWith(
+    expect(store.setSetting).toHaveBeenCalledWith(
       "service",
       "orchestrator",
-      "settings.model_access.backend-stale-model"
+      "settings.model_access.backend-stale-model",
+      expect.objectContaining({ disabledProviderIds: [], disabledModels: [] })
     );
     expect(refreshPiGeneration).toHaveBeenCalledOnce();
   });

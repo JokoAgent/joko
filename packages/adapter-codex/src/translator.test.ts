@@ -3,6 +3,35 @@ import type { JsonValue } from "./protocol.js";
 import { CodexEventTranslator, createTranslatorState, interactionFromServerRequest } from "./translator.js";
 
 describe("Codex interaction translation", () => {
+  it("separates cumulative uncached usage from the latest request pricing and context", () => {
+    const translator = new CodexEventTranslator();
+    const state = createTranslatorState();
+    const last = { inputTokens: 272_000, outputTokens: 1_000, cachedInputTokens: 100_000, cacheWriteInputTokens: 2_000, totalTokens: 273_000 };
+    const first = translator.translate("thread/tokenUsage/updated", {
+      threadId: "thread-one", turnId: "turn-one",
+      tokenUsage: { total: last, last, modelContextWindow: 872_000 }
+    }, state);
+    expect(first).toEqual([{ type: "usage", usage: {
+      inputTokens: 170_000, outputTokens: 1_000, cacheReadTokens: 100_000, cacheWriteTokens: 2_000,
+      totalTokens: 273_000, contextTokens: 273_000, contextWindow: 872_000,
+      pricingContext: { inputTokens: 272_000 }, cost: 0
+    } }]);
+    state.observedFastMode = true;
+    const second = translator.translate("thread/tokenUsage/updated", {
+      threadId: "thread-one", turnId: "turn-two",
+      tokenUsage: {
+        total: { inputTokens: 544_000, outputTokens: 2_000, cachedInputTokens: 200_000, cacheWriteInputTokens: 4_000, totalTokens: 546_000 },
+        last, modelContextWindow: 872_000
+      }
+    }, state);
+    expect(second).toEqual([{ type: "usage", usage: {
+      inputTokens: 340_000, outputTokens: 2_000, cacheReadTokens: 200_000, cacheWriteTokens: 4_000,
+      totalTokens: 546_000, contextTokens: 273_000, contextWindow: 872_000,
+      pricingContext: { inputTokens: 272_000, fastMode: true }, cost: 0
+    } }]);
+    expect(state.usage).toEqual(second[0]?.type === "usage" ? second[0].usage : undefined);
+  });
+
   it("preserves every completed native assistant item as a distinct message boundary", () => {
     const translator = new CodexEventTranslator();
     const state = createTranslatorState();

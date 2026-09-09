@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, JSX, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
 import { AlertTriangle, Bell, CircleAlert, CirclePlus, Info, Menu, RefreshCcw, ServerCrash, Sparkles, X } from "lucide-react";
 import { appRouteHash, useAppController } from "./controller.js";
@@ -37,7 +37,7 @@ import { SessionSplitView } from "./components/SessionSplitView.js";
 import { WorkspaceFilesRoute } from "./components/WorkspaceFilesRoute.js";
 import { createInspectorTurnReviewRequest, type InspectorTurnReviewRequest } from "./components/inspector-review-focus.js";
 import { requestWorkspaceDocumentLeave } from "./workspace-document-lifecycle.js";
-import { createDelayedSessionFromFirstInput, type DelayedNewSessionDraft } from "./new-session-flow.js";
+import { useNewSessionSubmission } from "./use-new-session-submission.js";
 import { currentAppShortcutPlatform, type AppShortcutId, type AppShortcutOverrides } from "./app-shortcuts.js";
 import {
   createDesktopApplicationMenuCommandQueue,
@@ -206,31 +206,38 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const [searchTimelineWindow, setSearchTimelineWindow] = useState<{ readonly sessionId: string; readonly items: readonly TimelineItemView[] }>();
   const [timelineHistory, setTimelineHistory] = useState<ActiveTimelineHistory>();
   const promptRecommendationOwnerRef = useRef<{ readonly initialized: boolean; readonly key?: string }>({ initialized: false });
-  const promptRecommendationOwner = promptRecommendationOwnerKey(state.activeProfile);
-  useEffect(() => {
+  const promptRecommendationConnectionOwner = state.activeProfile === undefined ? undefined : JSON.stringify([state.activeProfile.serverId, state.activeProfile.id]);
+  const promptRecommendationOwner = promptRecommendationOwnerKey(state.ready && state.connectionState === "connected" ? state.activeProfile : undefined, {
+    locale: state.preferences.locale,
+    revision: state.snapshot.settings.auxiliaryText.revision,
+    runtimeRevision: state.snapshot.settings.auxiliaryText.runtimeRevision,
+    enabled: state.snapshot.settings.promptRecommendation.enabled
+  });
+  useLayoutEffect(() => {
+    promptRecommendationStore.setOwner(promptRecommendationOwner);
     if (!promptRecommendationOwnerRef.current.initialized) {
       promptRecommendationOwnerRef.current = {
         initialized: true,
-        ...(promptRecommendationOwner === undefined ? {} : { key: promptRecommendationOwner })
+        ...(promptRecommendationConnectionOwner === undefined ? {} : { key: promptRecommendationConnectionOwner })
       };
-    } else if (promptRecommendationOwnerRef.current.key !== promptRecommendationOwner) {
-      promptRecommendationStore.reset();
+    } else if (promptRecommendationOwnerRef.current.key !== promptRecommendationConnectionOwner) {
       visionBridgeToastStore.reset();
       promptRecommendationOwnerRef.current = {
         initialized: true,
-        ...(promptRecommendationOwner === undefined ? {} : { key: promptRecommendationOwner })
+        ...(promptRecommendationConnectionOwner === undefined ? {} : { key: promptRecommendationConnectionOwner })
       };
       // connect() intentionally retains the previous owner's Snapshot while
       // the new transport is connecting. Never seed the new owner store from
       // that stale running edge; the next authoritative Snapshot observes it.
       return;
     }
+    if (promptRecommendationOwner === undefined) return;
     promptRecommendationStore.observe(
       state.snapshot.sessions,
       state.snapshot.settings.promptRecommendation,
       state.snapshot.backgroundTasks
     );
-  }, [promptRecommendationOwner, state.snapshot.backgroundTasks, state.snapshot.sessions, state.snapshot.settings.promptRecommendation.available, state.snapshot.settings.promptRecommendation.enabled]);
+  }, [promptRecommendationConnectionOwner, promptRecommendationOwner, state.snapshot.backgroundTasks, state.snapshot.sessions, state.snapshot.settings.promptRecommendation.available, state.snapshot.settings.promptRecommendation.enabled]);
   // AppController is a state-bearing facade and may receive a fresh identity
   // for one snapshot push. Reset only when this application owner unmounts.
   useEffect(() => () => {
@@ -562,24 +569,8 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     };
   }, [sessionApplicationWindow]);
 
-  const submitNewSession = useCallback(async (draft: DelayedNewSessionDraft, input: ComposerDraft): Promise<void> => {
-    const actionKey = "create-session";
-    setActionError(undefined);
-    setBusyAction(actionKey);
-    try {
-      await createDelayedSessionFromFirstInput(controller, draft, input, async (sessionId) => {
-        // Reveal the durable task before sendInput. If dispatch fails, the user
-        // lands on the created task and sees the recoverable operation error.
-        await controller.clearNewSessionDraft().catch((error: unknown) => setActionError(messageOf(error, t("error.unexpected"))));
-        controller.navigate({ kind: "session", sessionId });
-      });
-    } catch (error: unknown) {
-      setActionError(messageOf(error, t("error.unexpected")));
-      throw error;
-    } finally {
-      setBusyAction((current) => current === actionKey ? undefined : current);
-    }
-  }, [controller, t]);
+  const describeSubmissionError = useCallback((error: unknown) => messageOf(error, t("error.unexpected")), [t]);
+  const submitNewSession = useNewSessionSubmission(controller, setActionError, setBusyAction, describeSubmissionError);
 
   const activeSession = useMemo(() => {
     if (state.route.kind !== "session" && state.route.kind !== "files") return undefined;
@@ -1518,8 +1509,8 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         onNewDialogue={(backendId) => controller.navigate({ kind: "newSession", dialogueBackendId: backendId })}
         onRename={(session, name) => runAction(`rename:${session.id}`, () => controller.renameSession(session.id, name))}
         onPin={(session) => runAction(`pin:${session.id}`, () => controller.pinSession(session.id, !session.pinned))}
-        onPinTarget={(target) => runAction(`project-pin:${target.id}`, () => controller.updateTarget(target.id, { pinned: !target.pinned }))}
-        onRenameTarget={(target, name) => runAction(`project-rename:${target.id}`, () => controller.updateTarget(target.id, { name }))}
+        onPinTarget={(target) => runAction(`project-pin:${target.id}`, () => controller.updateTarget(target.id, { pinned: !target.pinned }, target.revision))}
+        onRenameTarget={(target, name) => runAction(`project-rename:${target.id}`, () => controller.updateTarget(target.id, { name }, target.revision))}
         onRemoveTarget={(target) => runAction(`project-archive:${target.id}`, () => controller.archiveTarget(target.id, true))}
         onSetTargetSessionsArchived={(target, sessions, archived) => runAction(`project-${archived ? "archive" : "unarchive"}-all:${target.id}`, async () => {
           for (const session of sessions) await controller.archiveSession(session.id, archived);

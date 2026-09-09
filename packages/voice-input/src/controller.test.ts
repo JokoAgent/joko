@@ -107,6 +107,34 @@ describe("VoiceInputController", () => {
     expect(submissions[0]).toMatchObject({ text: "latest partial", source: "partial", salvaged: false });
   });
 
+  it("clears withdrawn drafts and keeps an explicit empty confirmation from reviving an older partial", async () => {
+    const provider = new FakeAsrProvider();
+    const submissions: VoiceSubmission[] = [];
+    const drafts: string[] = [];
+    const failures: VoiceInputFailure[] = [];
+    const controller = new VoiceInputController({
+      provider,
+      callbacks: callbacks({
+        onSubmitted: (submission) => (submissions.push(submission), range()),
+        onDraftChanged: (text) => drafts.push(text),
+        onError: (failure) => failures.push(failure)
+      }),
+      createId: sequenceIds()
+    });
+    await controller.start({ mimeType: "audio/pcm" });
+    provider.emit({ type: "partial", text: "withdrawn draft" });
+    provider.emit({ type: "partial", text: "" });
+    expect(drafts).toEqual(["withdrawn draft", ""]);
+    provider.emit({ type: "partial", text: "withdrawn final draft" });
+    provider.emit({ type: "stable", text: "" });
+    expect(drafts.at(-1)).toBe("");
+    await controller.stop();
+    expect(submissions).toEqual([]);
+    expect(controller.terminalOutcome).toBe("failed");
+    expect(failures).toEqual([{ code: "empty_transcript", transcriptKept: false }]);
+    expect(provider.stopCalls).toBe(1);
+  });
+
   it("recovers only explicit transport failures and caps recovery at three attempts", async () => {
     const provider = new FakeAsrProvider();
     const submissions: VoiceSubmission[] = [];

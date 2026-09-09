@@ -2,6 +2,7 @@ import {
   AgentAuthConnectorFailure,
   RemoteSshConnectionController,
   RemoteSshError,
+  SshKeyError,
   TofuSshHostKeyVerifier,
   sshHostKeyPinId,
   type AgentAuthConnection,
@@ -38,12 +39,17 @@ export interface RemoteHostCredentialResolverPort {
   resolve(credentialReferenceId: string): string;
 }
 
+export interface RemoteHostNodeKeyResolverPort {
+  readPublic(id: string, expectedFingerprint: string, signal: AbortSignal): Promise<string>;
+}
+
 export type { ResolvedAgentAuthConnectorPort, ResolvedAgentAuthConnectorRequest } from "@joko/remote-ssh";
 
 export interface RemoteHostRegistryOptions {
   readonly store: OperationalStore;
   readonly ownerId: string;
   readonly credentials?: RemoteHostCredentialResolverPort;
+  readonly nodeKeys?: RemoteHostNodeKeyResolverPort;
   readonly connector?: ResolvedAgentAuthConnectorPort;
   /** Optional service-owned OpenSSH catalog. No request may select its path. */
   readonly sshConfig?: SshConfigFilePort;
@@ -96,6 +102,7 @@ export class RemoteHostRegistry {
   readonly #processStreamingSupported: boolean;
   readonly #fileTransferSupported: boolean;
   readonly #tcpForwardingSupported: boolean;
+  readonly #interactiveTerminalSupported: boolean;
   readonly #sshConfig: SshConfigFilePort | undefined;
   readonly #defaultSshUser: string | undefined;
   readonly #controllers = new Map<string, ManagedController>();
@@ -116,12 +123,14 @@ export class RemoteHostRegistry {
       options.connector?.capabilities.fileTransfer === true;
     this.#tcpForwardingSupported = this.#connectionTestSupported &&
       options.connector?.capabilities.tcpForwarding === true;
+    this.#interactiveTerminalSupported = this.#connectionTestSupported &&
+      options.connector?.capabilities.interactiveTerminal === true;
     this.#sshConfig = options.sshConfig;
     this.#defaultSshUser = options.sshConfig === undefined
       ? undefined
       : boundedIdentity(options.defaultSshUser ?? "", "default SSH user", 256);
     this.#connector = this.#connectionTestSupported
-      ? new RuntimeCredentialAgentAuthConnector(options.credentials, options.connector!)
+      ? new RuntimeCredentialAgentAuthConnector(options.credentials, options.nodeKeys, options.connector!)
       : new UnavailableAgentAuthConnector();
     this.reconcileStartup();
   }
@@ -138,6 +147,7 @@ export class RemoteHostRegistry {
     processStreaming: boolean;
     fileTransfer: boolean;
     tcpForwarding: boolean;
+    interactiveTerminal: boolean;
   }> {
     return Object.freeze({
       catalog: true,
@@ -146,7 +156,8 @@ export class RemoteHostRegistry {
       commandExecution: this.#commandExecutionSupported,
       processStreaming: this.#processStreamingSupported,
       fileTransfer: this.#fileTransferSupported,
-      tcpForwarding: this.#tcpForwardingSupported
+      tcpForwarding: this.#tcpForwardingSupported,
+      interactiveTerminal: this.#interactiveTerminalSupported
     });
   }
 
@@ -305,6 +316,32 @@ export class RemoteHostRegistry {
       host: this.get(targetId, id),
       lease: managed.controller.transports(managed.scope)
     });
+  }
+
+  /** Captures one ephemeral file-read lease; subsequent checks never reconnect. */
+  async captureTransportAuthority(targetId: string, id: string, signal?: AbortSignal): Promise<{
+    readonly hostRevision: bigint;
+    readonly leaseGeneration: number;
+    readonly lease: RemoteSshTransportLease;
+    readonly assertCurrent: () => void;
+  }> {
+    const { host, lease } = await this.transports(targetId, id, signal);
+    const managed = this.#controllers.get(controllerKey(targetId, id));
+    if (managed === undefined) throw new RemoteSshError("CONNECTION_FAILED", "The SSH read authority is unavailable.", false);
+    const leaseGeneration = managed.controller.transportGeneration(managed.scope);
+    const assertCurrent = (): void => {
+      this.assertOpen();
+      if (this.get(targetId, id).revision !== host.revision || this.#controllers.get(controllerKey(targetId, id)) !== managed
+        || managed.controller.transportGeneration(managed.scope) !== leaseGeneration) {
+        throw new RemoteSshError("CONNECTION_FAILED", "The SSH read authority changed. Open the source again.", false);
+      }
+      const current = managed.controller.transports(managed.scope);
+      if (!current.capabilities.fileTransfer || current.files === undefined || current.files !== lease.files) {
+        throw new RemoteSshError("CONNECTION_FAILED", "The SSH file-read capability is no longer active.", false);
+      }
+    };
+    assertCurrent();
+    return Object.freeze({ hostRevision: host.revision, leaseGeneration, lease, assertCurrent });
   }
 
   async disconnect(targetId: string, id: string, expectedRevision: bigint): Promise<RemoteHostRecord> {
@@ -489,6 +526,7 @@ export class RemoteHostRegistry {
       hostname: host.hostname,
       port: host.port,
       user: host.user,
+      ...(host.nodeKey === undefined ? {} : { nodeKey: host.nodeKey }),
       ...(host.credentialReferenceId === undefined
         ? {}
         : { credentialRef: { id: host.credentialReferenceId } })
@@ -596,16 +634,31 @@ export class RemoteHostRegistry {
 
 class RuntimeCredentialAgentAuthConnector implements AgentAuthConnectorPort {
   readonly #credentials: RemoteHostCredentialResolverPort | undefined;
+  readonly #nodeKeys: RemoteHostNodeKeyResolverPort | undefined;
   readonly #connector: ResolvedAgentAuthConnectorPort;
 
-  constructor(credentials: RemoteHostCredentialResolverPort | undefined, connector: ResolvedAgentAuthConnectorPort) {
+  constructor(credentials: RemoteHostCredentialResolverPort | undefined, nodeKeys: RemoteHostNodeKeyResolverPort | undefined, connector: ResolvedAgentAuthConnectorPort) {
     this.#credentials = credentials;
+    this.#nodeKeys = nodeKeys;
     this.#connector = connector;
   }
 
   async connect(request: AgentAuthConnectorRequest): Promise<AgentAuthConnection> {
+    const { credentialRef: _credentialReference, nodeKey: _nodeKey, ...safeRequest } = request;
+    if (request.nodeKey !== undefined) {
+      let publicKey: string;
+      try {
+        if (!this.#nodeKeys) throw new Error("Node key service unavailable.");
+        publicKey = await this.#nodeKeys.readPublic(request.nodeKey.id, request.nodeKey.expectedFingerprint, request.signal);
+      } catch (error) {
+        if (request.signal.aborted) throw new RemoteSshError("ABORTED", "SSH authentication was canceled.", true);
+        const changed = error instanceof SshKeyError && (error.code === "key_changed" || error.code === "not_found" || error.code === "invalid_key" || error.code === "invalid_name");
+        throw new RemoteSshError(changed ? "NODE_KEY_CHANGED" : "NODE_KEY_UNAVAILABLE", "The selected node key cannot authenticate.", false);
+      }
+      if (request.signal.aborted) throw new RemoteSshError("ABORTED", "SSH authentication was canceled.", true);
+      return this.#connector.connect({ ...safeRequest, authentication: { kind: "agent_key", publicKey: Buffer.from(publicKey) } });
+    }
     if (request.credentialRef === undefined) {
-      const { credentialRef: _credentialReference, ...safeRequest } = request;
       return this.#connector.connect({
         ...safeRequest,
         authentication: { kind: "system_agent" }
@@ -623,7 +676,6 @@ class RuntimeCredentialAgentAuthConnector implements AgentAuthConnectorPort {
     } catch {
       throw new AgentAuthConnectorFailure("AUTHENTICATION_FAILED");
     }
-    const { credentialRef: _credentialReference, ...safeRequest } = request;
     try {
       return await this.#connector.connect({
         ...safeRequest,
@@ -734,6 +786,8 @@ function storedFailureCode(code: RemoteSshErrorCode | undefined): RemoteHostFail
   switch (code) {
     case "ABORTED": return "aborted";
     case "AUTHENTICATION_FAILED": return "authentication_failed";
+    case "NODE_KEY_CHANGED": return "node_key_changed";
+    case "NODE_KEY_UNAVAILABLE": return "node_key_unavailable";
     case "CONNECTION_FAILED": return "connection_failed";
     case "CONNECTION_TIMEOUT": return "connection_timeout";
     case "CONNECTOR_PROTOCOL": return "connector_protocol";
@@ -759,6 +813,8 @@ function remoteFailureCode(code: RemoteHostFailureCode): RemoteSshErrorCode {
   switch (code) {
     case "aborted": return "ABORTED";
     case "authentication_failed": return "AUTHENTICATION_FAILED";
+    case "node_key_changed": return "NODE_KEY_CHANGED";
+    case "node_key_unavailable": return "NODE_KEY_UNAVAILABLE";
     case "connection_failed": return "CONNECTION_FAILED";
     case "connection_timeout": return "CONNECTION_TIMEOUT";
     case "connector_protocol": return "CONNECTOR_PROTOCOL";

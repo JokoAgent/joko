@@ -16,6 +16,8 @@ import type {
   DesktopGlobalVoiceShortcutResult,
   DesktopGlobalVoiceStatus,
   DesktopKeepAwakeSettings,
+  DesktopMainWindowCloseSettings,
+  DesktopMainWindowCloseSettingsChange,
   DesktopLocale,
   DesktopManagedOrchestratorConnection,
   DesktopManagedOrchestratorStatus,
@@ -34,6 +36,8 @@ import type {
   DesktopPageSearchStopAction,
   DesktopProviderModelRefreshLifecycleHint,
   DesktopSaveFileRequest,
+  DesktopCopyFileRequest,
+  DesktopCopyFileResult,
   DesktopRuntimeProcessMonitorOpenResult,
   DesktopSessionDragPreviewRequest,
   DesktopSessionWindowDropResult,
@@ -69,6 +73,9 @@ const DESKTOP_CHANNELS = {
   windowInteractionGet: "joko:window-interaction:get",
   windowInteractionSet: "joko:window-interaction:set",
   windowInteractionChanged: "joko:window-interaction:changed",
+  mainWindowCloseSettingsGet: "joko:main-window-close-settings:get",
+  mainWindowCloseSettingsSet: "joko:main-window-close-settings:set",
+  mainWindowCloseSettingsChanged: "joko:main-window-close-settings:changed",
   pageSearchStart: "joko:page-search:start",
   pageSearchStop: "joko:page-search:stop",
   pageSearchResult: "joko:page-search:result",
@@ -126,6 +133,8 @@ const DESKTOP_CHANNELS = {
   deepLinkTakePending: "joko:deep-link:take-pending",
   deepLinkNavigate: "joko:deep-link:navigate",
   saveFile: "joko:files:save",
+  copyFile: "joko:files:copy",
+  cancelFileCopy: "joko:files:copy-cancel",
   credentialGet: "joko:credential:get",
   credentialSet: "joko:credential:set",
   credentialDelete: "joko:credential:delete",
@@ -164,7 +173,9 @@ const desktopCapabilities = Object.freeze([
   "appearance.zoom",
   "application.menu",
   "inspector.detach",
+  ...((process.platform === "win32" || process.platform === "darwin") ? ["files.copy" as const] : []),
   "layout.reset",
+  ...((process.platform === "win32" || process.platform === "linux") ? ["window.mainCloseBehavior" as const] : []),
   "microphone.lifecycle",
   "notifications.session",
   "page.search",
@@ -228,6 +239,21 @@ const desktopApi = Object.freeze({
       const wrapped = (): void => listener();
       ipcRenderer.on(DESKTOP_CHANNELS.layoutResetBroadcast, wrapped);
       return () => ipcRenderer.removeListener(DESKTOP_CHANNELS.layoutResetBroadcast, wrapped);
+    }
+  }),
+  mainWindowClose: Object.freeze({
+    get: (): Promise<DesktopMainWindowCloseSettings> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.mainWindowCloseSettingsGet).then(parseDesktopMainWindowCloseSettings),
+    set: (change: DesktopMainWindowCloseSettingsChange): Promise<DesktopMainWindowCloseSettings> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.mainWindowCloseSettingsSet, change).then(parseDesktopMainWindowCloseSettings),
+    onChanged: (listener: (settings: DesktopMainWindowCloseSettings) => void): (() => void) => {
+      if (typeof listener !== "function") throw new TypeError("Main-window close settings listener must be a function.");
+      const wrapped = (_event: IpcRendererEvent, value: unknown): void => {
+        try { listener(parseDesktopMainWindowCloseSettings(value)); }
+        catch { /* A malformed observer message cannot change the current setting. */ }
+      };
+      ipcRenderer.on(DESKTOP_CHANNELS.mainWindowCloseSettingsChanged, wrapped);
+      return () => ipcRenderer.removeListener(DESKTOP_CHANNELS.mainWindowCloseSettingsChanged, wrapped);
     }
   }),
   windowInteraction: Object.freeze({
@@ -533,6 +559,14 @@ const desktopApi = Object.freeze({
   saveFile: (request: DesktopSaveFileRequest): Promise<boolean> => {
     if (!isDesktopSaveFileRequest(request)) return Promise.reject(new TypeError("The file save request is invalid."));
     return ipcRenderer.invoke(DESKTOP_CHANNELS.saveFile, request).then(parseDesktopBoolean);
+  },
+  copyFile: (request: DesktopCopyFileRequest): Promise<DesktopCopyFileResult> => {
+    if (typeof request !== "object" || request === null || Object.keys(request).sort().join(",") !== "file,requestId" || !isFileCopyId(request.requestId) || !isDesktopSaveFileRequest(request.file)) return Promise.reject(new TypeError("The file copy request is invalid."));
+    return ipcRenderer.invoke(DESKTOP_CHANNELS.copyFile, request).then(parseFileCopyResult);
+  },
+  cancelFileCopy: (requestId: string): Promise<void> => {
+    if (!isFileCopyId(requestId)) return Promise.reject(new TypeError("The file copy identity is invalid."));
+    return ipcRenderer.invoke(DESKTOP_CHANNELS.cancelFileCopy, requestId).then(() => undefined);
   },
   discovery: Object.freeze({
     scan: (): Promise<readonly DesktopDiscoveredNode[]> => ipcRenderer.invoke(DESKTOP_CHANNELS.discoveryScan)
@@ -1038,6 +1072,19 @@ function parseDesktopKeepAwakeSettings(value: unknown): DesktopKeepAwakeSettings
   return Object.freeze({ enabled: (value as { readonly enabled: boolean }).enabled });
 }
 
+function parseDesktopMainWindowCloseSettings(value: unknown): DesktopMainWindowCloseSettings {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new TypeError("Main-window close settings are invalid.");
+  const entry = value as Record<string, unknown>;
+  if (Object.keys(entry).sort().join(",") !== "behavior,revision" ||
+    !Number.isSafeInteger(entry["revision"]) || (entry["revision"] as number) < 0 ||
+    !(entry["behavior"] === null ||
+      ((process.platform === "win32" || process.platform === "linux") &&
+       (entry["behavior"] === "quit" || entry["behavior"] === (process.platform === "win32" ? "tray" : "minimize"))))) {
+    throw new TypeError("Main-window close settings are invalid.");
+  }
+  return Object.freeze({ behavior: entry["behavior"] as DesktopMainWindowCloseSettings["behavior"], revision: entry["revision"] as number });
+}
+
 function parseDesktopWindowInteractionSettings(value: unknown): DesktopWindowInteractionSettings {
   if (typeof value !== "object" || value === null || Array.isArray(value) ||
     Object.keys(value).join(",") !== "swallowActivationClick" ||
@@ -1080,6 +1127,18 @@ function isDesktopSaveFileRequest(value: unknown): value is DesktopSaveFileReque
 function parseDesktopBoolean(value: unknown): boolean {
   if (typeof value !== "boolean") throw new TypeError("Desktop boolean response is invalid.");
   return value;
+}
+
+function isFileCopyId(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/u.test(value);
+}
+
+function parseFileCopyResult(value: unknown): DesktopCopyFileResult {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new TypeError("Invalid file copy result.");
+  const result = value as Record<string, unknown>;
+  if (result["status"] === "copied" || result["status"] === "cancelled" || result["status"] === "unknown" || result["status"] === "unavailable" || result["status"] === "blocked") return { status: result["status"] };
+  if (result["status"] === "failed" && (result["reason"] === "capacity" || result["reason"] === "storage" || result["reason"] === "helper")) return { status: "failed", reason: result["reason"] };
+  throw new TypeError("Invalid file copy result.");
 }
 
 function isDesktopUpdateStatus(value: unknown): value is DesktopUpdateStatus {

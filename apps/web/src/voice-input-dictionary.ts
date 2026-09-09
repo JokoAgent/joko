@@ -126,22 +126,75 @@ export function addManualVoiceDictionaryTerm(
   return mergeManualVoiceDictionaryTerms(current, [...manual, text], now, createId);
 }
 
-export function renameVoiceDictionaryEntry(
+export function editVoiceDictionaryEntry(
   current: VoiceInputDictionaryState,
   id: string,
   text: string,
+  aliasDraft: string,
   now = Date.now()
 ): VoiceInputDictionaryState | undefined {
+  if (text.trim() === "") return deleteVoiceDictionaryEntry(current, id);
   const normalized = normalizeVoiceDictionaryTerm(text);
   if (normalized === undefined) return undefined;
   const index = current.entries.findIndex((entry) => entry.id === id);
   if (index < 0) return current;
-  const duplicate = current.entries.some((entry, candidateIndex) => candidateIndex !== index
-    && voiceDictionaryTermKey(entry.text) === voiceDictionaryTermKey(normalized));
-  if (duplicate) return undefined;
-  const entries = [...current.entries];
-  entries[index] = Object.freeze({ ...entries[index]!, text: normalized, updatedAt: now });
-  return freezeState({ ...current, entries });
+  const targetKey = voiceDictionaryTermKey(normalized);
+  const target = current.entries.find((entry, candidateIndex) => candidateIndex !== index
+    && voiceDictionaryTermKey(entry.text) === targetKey);
+  const candidate = current.candidates.find((value) => voiceDictionaryTermKey(value.text) === targetKey);
+  const entry = current.entries[index]!;
+  const aliases: VoiceInputDictionaryAlias[] = [];
+  const seen = new Set([voiceDictionaryTermKey(normalized)]);
+  for (const line of aliasDraft.replace(/\r\n?/gu, "\n").split("\n")) {
+    if (line.trim() === "") continue;
+    const aliasText = normalizeVoiceDictionaryTerm(line);
+    if (aliasText === undefined) return undefined;
+    const key = voiceDictionaryTermKey(aliasText);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const existing = entry.aliases.find((alias) => voiceDictionaryTermKey(alias.text) === key);
+    aliases.push(Object.freeze(existing === undefined
+      ? { text: aliasText, count: 1, lastSeenAt: now }
+      : { ...existing, text: aliasText }));
+    if (aliases.length === MAXIMUM_VOICE_DICTIONARY_ALIASES) break;
+  }
+  const targetAliases = target?.aliases ?? candidate?.aliases;
+  const merged = Object.freeze({
+    ...entry,
+    id: target?.id ?? entry.id,
+    text: normalized,
+    source: "manual" as const,
+    frequency: Math.min(Number.MAX_SAFE_INTEGER, entry.frequency + (target?.frequency ?? candidate?.evidenceCount ?? 0)),
+    aliases: targetAliases === undefined ? Object.freeze(aliases) : combineAliasEvidence(aliases, targetAliases, targetKey),
+    createdAt: Math.min(entry.createdAt, target?.createdAt ?? candidate?.createdAt ?? entry.createdAt),
+    updatedAt: Math.max(now, entry.updatedAt, target?.updatedAt ?? candidate?.updatedAt ?? 0)
+  });
+  return freezeState({
+    entries: current.entries.flatMap((value) => value.id === merged.id ? [merged] : value.id === id ? [] : [value]),
+    candidates: current.candidates.filter((value) => voiceDictionaryTermKey(value.text) !== targetKey),
+    suppressedAutomaticTexts: current.suppressedAutomaticTexts.filter((value) => voiceDictionaryTermKey(value) !== targetKey)
+  });
+}
+
+function combineAliasEvidence(
+  edited: readonly VoiceInputDictionaryAlias[],
+  target: readonly VoiceInputDictionaryAlias[],
+  primaryKey: string
+): readonly VoiceInputDictionaryAlias[] {
+  const combined = new Map<string, VoiceInputDictionaryAlias>();
+  for (const alias of [...target, ...edited]) {
+    const key = voiceDictionaryTermKey(alias.text);
+    if (key === primaryKey) continue;
+    const existing = combined.get(key);
+    combined.set(key, existing === undefined ? alias : Object.freeze({
+      text: alias.lastSeenAt >= existing.lastSeenAt ? alias.text : existing.text,
+      count: Math.min(Number.MAX_SAFE_INTEGER, existing.count + alias.count),
+      lastSeenAt: Math.max(existing.lastSeenAt, alias.lastSeenAt)
+    }));
+  }
+  return Object.freeze([...combined.values()]
+    .sort((left, right) => right.count - left.count || right.lastSeenAt - left.lastSeenAt)
+    .slice(0, MAXIMUM_VOICE_DICTIONARY_ALIASES));
 }
 
 export function deleteVoiceDictionaryEntry(
@@ -187,7 +240,7 @@ export function applyVoiceDictionaryAdvice(
         const entry = entries[entryIndex]!;
         entries[entryIndex] = Object.freeze({
           ...entry,
-          frequency: entry.frequency + 1,
+          frequency: Math.min(Number.MAX_SAFE_INTEGER, entry.frequency + 1),
           aliases: mergeAliases(entry.aliases, aliases, now),
           updatedAt: now
         });
@@ -195,7 +248,7 @@ export function applyVoiceDictionaryAdvice(
         if (suppressed.has(key) || entries.length >= MAXIMUM_VOICE_DICTIONARY_ENTRIES) continue;
         entries.push(Object.freeze({
           ...createEntry(text, "automatic", now, createId),
-          frequency: (candidate?.evidenceCount ?? 0) + 1,
+          frequency: Math.min(Number.MAX_SAFE_INTEGER, (candidate?.evidenceCount ?? 0) + 1),
           aliases: mergeAliases(candidate?.aliases ?? [], aliases, now)
         }));
       }
@@ -209,7 +262,7 @@ export function applyVoiceDictionaryAdvice(
       const existing = candidates[candidateIndex]!;
       candidates[candidateIndex] = Object.freeze({
         ...existing,
-        evidenceCount: existing.evidenceCount + 1,
+        evidenceCount: Math.min(Number.MAX_SAFE_INTEGER, existing.evidenceCount + 1),
         aliases: mergeAliases(existing.aliases, aliases, now),
         updatedAt: now
       });
@@ -360,7 +413,7 @@ function mergeAliases(
     const index = next.findIndex((alias) => voiceDictionaryTermKey(alias.text) === key);
     if (index >= 0) {
       const alias = next[index]!;
-      next[index] = Object.freeze({ ...alias, count: alias.count + 1, lastSeenAt: now });
+      next[index] = Object.freeze({ ...alias, count: Math.min(Number.MAX_SAFE_INTEGER, alias.count + 1), lastSeenAt: now });
     } else {
       next.push(Object.freeze({ text, count: 1, lastSeenAt: now }));
     }

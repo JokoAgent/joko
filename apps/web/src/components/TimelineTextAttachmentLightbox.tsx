@@ -1,6 +1,10 @@
+import { useArtifactDownload } from "./use-artifact-download.js";
+import type { ArtifactDownloadContext } from "../model.js";
 import { AlertTriangle, Check, Clipboard, Download, FileText, X } from "lucide-react";
-import { useCallback, useEffect, useId, useRef, useState, type JSX } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type JSX } from "react";
 import { createPortal } from "react-dom";
+import { writeClipboardText } from "../clipboard-action.js";
+import { useClipboardAction } from "./use-clipboard-action.js";
 
 import type { ArtifactView } from "../model.js";
 import { IconButton, formatBytes } from "./ui.js";
@@ -20,11 +24,12 @@ export interface TimelineTextAttachmentLightboxLabels {
 }
 
 export interface TimelineTextAttachmentLightboxProps {
+  readonly ownerKey: string;
   readonly artifact: ArtifactView;
   readonly labels: TimelineTextAttachmentLightboxLabels;
   readonly returnFocus?: HTMLElement | null;
   readonly loadUrl: (blobId: string) => Promise<string>;
-  readonly onDownload: (blobId: string, fileName: string) => void | Promise<void>;
+  readonly onDownload: (blobId: string, fileName: string, context: ArtifactDownloadContext) => unknown | Promise<unknown>;
   readonly onClose: () => void;
 }
 
@@ -37,6 +42,7 @@ type PreviewState =
 const FOCUSABLE = "button:not([disabled]), [href], [tabindex]:not([tabindex='-1'])";
 
 export function TimelineTextAttachmentLightbox({
+  ownerKey,
   artifact,
   labels,
   returnFocus,
@@ -44,46 +50,89 @@ export function TimelineTextAttachmentLightbox({
   onDownload,
   onClose
 }: TimelineTextAttachmentLightboxProps): JSX.Element {
+  const ownerDocument = returnFocus?.ownerDocument ?? document;
+  const ownerWindow = ownerDocument.defaultView;
+  const downloadOwner = useMemo(() => ({ loadUrl, ownerDocument, returnFocus }), [loadUrl, ownerDocument, returnFocus]);
+  const sourceOwner = useMemo(() => ({}), [ownerKey, artifact.blobId, artifact.fileName, artifact.byteSize, loadUrl, ownerDocument, returnFocus]);
+  const sourceRef = useRef<object | undefined>(undefined);
+  const previewRequestRef = useRef<AbortController | undefined>(undefined);
+  const download = useArtifactDownload(JSON.stringify([ownerKey, artifact.blobId, artifact.fileName]), downloadOwner);
   const titleId = useId();
   const dialogRef = useRef<HTMLDivElement>(null);
   const closingRef = useRef(false);
-  const onCloseRef = useRef(onClose);
-  onCloseRef.current = onClose;
-  const [state, setState] = useState<PreviewState>(() => artifact.byteSize > TIMELINE_TEXT_PREVIEW_LIMIT_BYTES
+  const closeTargetRef = useRef({ onClose, returnFocus });
+  closeTargetRef.current = { onClose, returnFocus };
+  const initialState: PreviewState = artifact.byteSize > TIMELINE_TEXT_PREVIEW_LIMIT_BYTES
     ? { phase: "oversize", byteSize: artifact.byteSize }
-    : { phase: "loading" });
-  const [feedback, setFeedback] = useState<string>();
-  const feedbackTimerRef = useRef<number | undefined>(undefined);
+    : { phase: "loading" };
+  const [preview, setPreview] = useState<{ readonly owner: object; readonly state: PreviewState }>();
+  const state = preview?.owner === sourceOwner ? preview.state : initialState;
+  const copy = useClipboardAction({
+    ownerKey,
+    sourceKey: JSON.stringify([artifact.blobId, artifact.fileName, artifact.byteSize]),
+    ownerDocument,
+    connectionOwner: downloadOwner
+  });
 
   const close = useCallback((): void => {
     if (closingRef.current) return;
     closingRef.current = true;
-    onCloseRef.current();
-  }, []);
+    download.cancel();
+    copy.cancel();
+    previewRequestRef.current?.abort();
+    const target = closeTargetRef.current;
+    if (target.returnFocus?.isConnected === true) target.returnFocus.focus({ preventScroll: true });
+    target.onClose();
+  }, [download.cancel, copy.cancel]);
 
-  useEffect(() => {
-    if (artifact.byteSize > TIMELINE_TEXT_PREVIEW_LIMIT_BYTES) return;
+  useLayoutEffect(() => {
+    sourceRef.current = sourceOwner;
+    closingRef.current = false;
     const request = new AbortController();
-    setState({ phase: "loading" });
-    void loadUrl(artifact.blobId).then(async (url) => {
-      const response = await fetch(url, { signal: request.signal });
-      if (!response.ok) throw new Error(`Artifact preview failed (${response.status}).`);
-      const blob = await response.blob();
-      if (blob.size > TIMELINE_TEXT_PREVIEW_LIMIT_BYTES) {
-        setState({ phase: "oversize", byteSize: blob.size });
-        return;
-      }
-      const text = await blob.text();
-      if (timelineTextPreviewLikelyBinary(text)) throw new Error("Artifact is not text.");
-      setState({ phase: "ready", text, byteSize: blob.size });
-    }).catch((error: unknown) => {
-      if (!request.signal.aborted && (error as { readonly name?: string }).name !== "AbortError") setState({ phase: "error" });
-    });
-    return () => request.abort();
-  }, [artifact.blobId, artifact.byteSize, loadUrl]);
+    previewRequestRef.current = request;
+    let pending = artifact.byteSize <= TIMELINE_TEXT_PREVIEW_LIMIT_BYTES;
+    const current = (): boolean => sourceRef.current === sourceOwner && !request.signal.aborted;
+    const setState = (next: PreviewState): void => {
+      if (!current()) return;
+      pending = next.phase === "loading";
+      setPreview({ owner: sourceOwner, state: next });
+    };
+    const onPageHide = (): void => { if (pending) setState({ phase: "error" }); request.abort(); };
+    ownerWindow?.addEventListener("pagehide", onPageHide);
+    if (artifact.byteSize <= TIMELINE_TEXT_PREVIEW_LIMIT_BYTES) {
+      setState({ phase: "loading" });
+      const fetchPreview = ownerWindow?.fetch?.bind(ownerWindow);
+      void (async () => {
+        try {
+          const url = await loadUrl(artifact.blobId);
+          if (!current()) return;
+          if (fetchPreview === undefined) throw new Error("Artifact preview unavailable.");
+          const response = await fetchPreview(url, { signal: request.signal });
+          if (!current()) return;
+          if (!response.ok) throw new Error("Artifact preview unavailable.");
+          const blob = await response.blob();
+          if (!current()) return;
+          if (blob.size > TIMELINE_TEXT_PREVIEW_LIMIT_BYTES) {
+            setState({ phase: "oversize", byteSize: blob.size });
+            return;
+          }
+          const text = await blob.text();
+          if (!current()) return;
+          if (timelineTextPreviewLikelyBinary(text)) throw new Error("Artifact is not text.");
+          setState({ phase: "ready", text, byteSize: blob.size });
+        } catch { setState({ phase: "error" }); }
+      })();
+    }
+    return () => {
+      ownerWindow?.removeEventListener("pagehide", onPageHide);
+      request.abort();
+      if (previewRequestRef.current === request) previewRequestRef.current = undefined;
+      if (sourceRef.current === sourceOwner) sourceRef.current = undefined;
+    };
+  }, [sourceOwner, artifact.blobId, artifact.byteSize, loadUrl, ownerWindow]);
 
   useEffect(() => {
-    const body = document.body;
+    const body = ownerDocument.body;
     const ownsModalLock = !body.classList.contains("modal-open");
     body.classList.add("text-attachment-lightbox-open", "modal-open");
     dialogRef.current?.focus({ preventScroll: true });
@@ -112,46 +161,36 @@ export function TimelineTextAttachmentLightbox({
         (event.shiftKey ? focusable.at(-1) : focusable[0])?.focus({ preventScroll: true });
       }
     };
-    document.addEventListener("keydown", onKeyDown, true);
+    ownerDocument.addEventListener("keydown", onKeyDown, true);
     return () => {
-      document.removeEventListener("keydown", onKeyDown, true);
+      ownerDocument.removeEventListener("keydown", onKeyDown, true);
       body.classList.remove("text-attachment-lightbox-open");
-      if (ownsModalLock && document.querySelector(".image-lightbox, .workspace-image-lightbox, .text-attachment-lightbox") === null) body.classList.remove("modal-open");
-      if (feedbackTimerRef.current !== undefined) window.clearTimeout(feedbackTimerRef.current);
-      if (returnFocus?.isConnected === true) returnFocus.focus({ preventScroll: true });
+      if (ownsModalLock && ownerDocument.querySelector(".image-lightbox, .workspace-image-lightbox, .text-attachment-lightbox") === null) body.classList.remove("modal-open");
     };
-  }, [close, returnFocus]);
-
-  const report = (message: string): void => {
-    if (feedbackTimerRef.current !== undefined) window.clearTimeout(feedbackTimerRef.current);
-    setFeedback(message);
-    feedbackTimerRef.current = window.setTimeout(() => setFeedback(undefined), 1_600);
-  };
-  const copy = (value: string): void => {
-    void navigator.clipboard.writeText(value).then(() => report(labels.copied), () => report(labels.copyFailed));
-  };
+  }, [close, ownerDocument]);
 
   return createPortal(<div className="text-attachment-lightbox" role="presentation">
     <button className="text-attachment-lightbox__backdrop" type="button" aria-label={labels.close} onClick={close} />
     <div ref={dialogRef} className="text-attachment-lightbox__card" role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1}>
       <header className="text-attachment-lightbox__header">
-        <button type="button" className="text-attachment-lightbox__filename" aria-label={`${labels.preview}: ${artifact.fileName}`} title={artifact.fileName} onClick={() => copy(artifact.fileName)}>
+        <button type="button" className="text-attachment-lightbox__filename" aria-label={`${labels.preview}: ${artifact.fileName}`} title={artifact.fileName} aria-disabled={copy.pending} aria-busy={copy.pending} onClick={(event) => { if (!closingRef.current) copy.run(event.currentTarget.ownerDocument, (context) => writeClipboardText(artifact.fileName, context)); }}>
           <FileText aria-hidden="true" />
           <span><strong id={titleId}>{artifact.title || artifact.fileName}</strong><small>{artifact.fileName} · {formatBytes(state.phase === "ready" || state.phase === "oversize" ? state.byteSize : artifact.byteSize)}</small></span>
         </button>
         <div className="text-attachment-lightbox__actions">
-          {state.phase === "ready" && <IconButton label={labels.copy} onClick={() => copy(state.text)}><Clipboard aria-hidden="true" /></IconButton>}
-          <IconButton label={labels.download} onClick={() => void onDownload(artifact.blobId, artifact.fileName)}><Download aria-hidden="true" /></IconButton>
+          {state.phase === "ready" && <IconButton label={labels.copy} aria-disabled={copy.pending} aria-busy={copy.pending} onClick={(event) => { if (!closingRef.current) copy.run(event.currentTarget.ownerDocument, (context) => writeClipboardText(state.text, context)); }}><Clipboard aria-hidden="true" /></IconButton>}
+          <IconButton label={labels.download} aria-disabled={download.pending} aria-busy={download.pending} onClick={(event) => download.run(event.currentTarget.ownerDocument, (context) => onDownload(artifact.blobId, artifact.fileName, context))}><Download aria-hidden="true" /></IconButton>
           <IconButton label={labels.close} onClick={close}><X aria-hidden="true" /></IconButton>
         </div>
       </header>
       <main className="text-attachment-lightbox__body">
         {state.phase === "loading" && <div className="text-attachment-lightbox__status" role="status"><span className="spinner" aria-hidden="true" /><strong>{labels.loading}</strong></div>}
         {state.phase === "error" && <div className="text-attachment-lightbox__status" role="alert"><AlertTriangle aria-hidden="true" /><strong>{labels.unavailable}</strong></div>}
-        {state.phase === "oversize" && <div className="text-attachment-lightbox__status"><AlertTriangle aria-hidden="true" /><strong>{labels.tooLarge}</strong><span>{formatBytes(state.byteSize)} · {formatBytes(TIMELINE_TEXT_PREVIEW_LIMIT_BYTES)}</span><button type="button" onClick={() => void onDownload(artifact.blobId, artifact.fileName)}><Download aria-hidden="true" />{labels.download}</button></div>}
+        {state.phase === "oversize" && <div className="text-attachment-lightbox__status"><AlertTriangle aria-hidden="true" /><strong>{labels.tooLarge}</strong><span>{formatBytes(state.byteSize)} · {formatBytes(TIMELINE_TEXT_PREVIEW_LIMIT_BYTES)}</span><button type="button" aria-disabled={download.pending} aria-busy={download.pending} onClick={(event) => download.run(event.currentTarget.ownerDocument, (context) => onDownload(artifact.blobId, artifact.fileName, context))}><Download aria-hidden="true" />{labels.download}</button></div>}
         {state.phase === "ready" && <pre tabIndex={0}>{state.text}</pre>}
       </main>
-      {feedback !== undefined && <div className="text-attachment-lightbox__feedback" role="status"><Check aria-hidden="true" />{feedback}</div>}
+      {download.failed && <div className="text-attachment-lightbox__feedback" role="alert">{labels.unavailable}</div>}
+      {(copy.state === "copied" || copy.state === "failed") && <div className="text-attachment-lightbox__feedback" role={copy.state === "failed" ? "alert" : "status"}><Check aria-hidden="true" />{copy.state === "failed" ? labels.copyFailed : labels.copied}</div>}
     </div>
-  </div>, document.body);
+  </div>, ownerDocument.body);
 }

@@ -61,6 +61,7 @@ describe("workspaceFilesProjectOptions", () => {
     backendId,
     name: `Project ${id}`,
     workspaceId: `workspace-${id}`,
+    revision: 1n,
     workspaceName: `Workspace ${id}`,
     trusted: true,
     pinned: false,

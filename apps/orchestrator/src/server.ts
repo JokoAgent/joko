@@ -254,6 +254,12 @@ export async function createInternalServer(application: OrchestratorApplication)
         (argumentsValue !== undefined && !isRecord(argumentsValue)) ||
         typeof headerGeneration !== "string" || Number(headerGeneration) !== generation
       ) return reply.code(400).send({ error: "MCP bridge request failed its generation or schema fence." });
+      const cancellation = new AbortController();
+      const cancel = (): void => { cancellation.abort(new Error("MCP bridge request was closed.")); };
+      const close = (): void => { if (!reply.raw.writableFinished) cancel(); };
+      request.raw.once("aborted", cancel);
+      reply.raw.once("close", close);
+      if (request.raw.aborted || reply.raw.destroyed) cancel();
       try {
         const result = await application.mcpRouter.executeBridgeCall({
           authorization: request.headers.authorization,
@@ -263,11 +269,15 @@ export async function createInternalServer(application: OrchestratorApplication)
           targetId,
           serverId,
           toolName,
+          signal: cancellation.signal,
           ...(argumentsValue === undefined ? {} : { arguments: argumentsValue })
         });
         return result;
       } catch {
         return reply.code(401).send({ error: "MCP bridge authorization or generation is invalid." });
+      } finally {
+        request.raw.removeListener("aborted", cancel);
+        reply.raw.removeListener("close", close);
       }
     }
   );

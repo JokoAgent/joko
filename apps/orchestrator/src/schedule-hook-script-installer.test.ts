@@ -2,15 +2,20 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { mkdtemp } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createServer } from "node:http";
+import { once } from "node:events";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   ScheduleHookScriptInstaller,
+  createScheduleHookScriptGenerator,
   extractScheduleHookScript,
   scheduleHookScriptCommand,
   scheduleHookScriptSlug
 } from "./schedule-hook-script-installer.js";
+import type { ProviderDescriptor, ProviderInferenceRoute } from "./credential-manager.js";
+import { MULTILINGUAL_FIXTURES } from "./i18n/multilingual-fixtures.js";
 
 const directories: string[] = [];
 afterEach(async () => {
@@ -22,6 +27,7 @@ describe("ScheduleHookScriptInstaller", () => {
     const workspace = await fixtureDirectory();
     const installer = new ScheduleHookScriptInstaller();
     const result = await installer.install({
+      backendId: "backend-a",
       workspaceRoot: workspace,
       scheduleId: "schedule-1",
       scheduleName: "PR Watch",
@@ -38,11 +44,13 @@ describe("ScheduleHookScriptInstaller", () => {
     const workspace = await fixtureDirectory();
     const installer = new ScheduleHookScriptInstaller();
     const first = await installer.install({
+      backendId: "backend-a",
       workspaceRoot: workspace,
       scheduleName: "CI Gate",
       script: "process.exit(0)"
     });
     const updated = await installer.install({
+      backendId: "backend-a",
       workspaceRoot: workspace,
       scheduleName: "Renamed",
       currentFilePath: first.filePath,
@@ -56,6 +64,7 @@ describe("ScheduleHookScriptInstaller", () => {
     const outside = join(workspace, "outside.mjs");
     await writeFile(outside, "process.exit(0)\n", "utf8");
     await expect(installer.install({
+      backendId: "backend-a",
       workspaceRoot: workspace,
       currentFilePath: outside,
       script: "process.exit(0)"
@@ -70,8 +79,9 @@ describe("ScheduleHookScriptInstaller", () => {
     await writeFile(join(directory, "check.mjs"), "existing\n", "utf8");
     const installer = new ScheduleHookScriptInstaller();
     const installed = await installer.install({
+      backendId: "backend-a",
       workspaceRoot: workspace,
-      scheduleName: "检查",
+      scheduleName: "Check",
       script: "process.exit(0)"
     });
     expect(installed.filePath).toBe(join(directory, "check-2.mjs"));
@@ -83,6 +93,7 @@ describe("ScheduleHookScriptInstaller", () => {
     const generate = vi.fn(async () => "Here is the gate:\n```js\nprocess.exit(0)\n```\n");
     const installer = new ScheduleHookScriptInstaller({ generate });
     const first = await installer.install({
+      backendId: "backend-a",
       workspaceRoot: workspace,
       scheduleName: "Generated",
       description: "Run only when checks fail",
@@ -92,6 +103,7 @@ describe("ScheduleHookScriptInstaller", () => {
     expect(first.test).toMatchObject({ decision: "run", exitCode: 0 });
     expect(generate).toHaveBeenCalledWith(expect.objectContaining({
       description: "Run only when checks fail",
+      backendId: "backend-a",
       workspaceRoot: workspace,
       providerId: "provider-a",
       modelId: "model-a"
@@ -99,6 +111,7 @@ describe("ScheduleHookScriptInstaller", () => {
 
     generate.mockResolvedValueOnce("```mjs\nprocess.exit(2)\n```");
     await installer.install({
+      backendId: "backend-a",
       workspaceRoot: workspace,
       scheduleName: "Generated",
       currentFilePath: first.filePath,
@@ -113,6 +126,7 @@ describe("ScheduleHookScriptInstaller", () => {
     const workspace = await fixtureDirectory();
     const installer = new ScheduleHookScriptInstaller();
     await expect(installer.install({
+      backendId: "backend-a",
       workspaceRoot: workspace,
       scheduleName: "Unavailable",
       description: "Generate a gate"
@@ -121,11 +135,64 @@ describe("ScheduleHookScriptInstaller", () => {
       .rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("generates through the authenticated Backend and never borrows a same-named foreign route", async () => {
+    const workspace = await fixtureDirectory();
+    const received: Array<{ path: string; authorization: string | undefined }> = [];
+    const server = createServer(async (request, response) => {
+      for await (const _chunk of request) { /* Consume the bounded generation request. */ }
+      received.push({ path: request.url!, authorization: request.headers.authorization });
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ output_text: "process.exit(0)" }));
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("No local fixture address.");
+    const baseUrl = `http://127.0.0.1:${address.port}`;
+    let routes: ProviderInferenceRoute[] = ["backend-a", "backend-b"].map((backendId) => ({
+      backendId, providerId: "shared", modelId: "same", generationId: `generation-${backendId}`,
+      api: "openai-responses", baseUrl: `${baseUrl}/${backendId}`, authorization: `Bearer ${backendId}-key`, headers: {}, supportsImages: false
+    }));
+    const list = vi.fn((backendId?: string): ProviderDescriptor[] => routes
+      .filter((route) => backendId === undefined || route.backendId === backendId)
+      .map((route) => ({
+        backendId: route.backendId, provider: { id: route.providerId, models: [{ id: route.modelId, name: route.modelId }] },
+        credentialOrigin: baseUrl, displayName: route.providerId, kind: "api_key", enabled: true,
+        supportsLogin: false, supportsLogout: false, supportsRefresh: false, version: 1n, updatedAt: 1,
+        credentialReferenceIds: [], authenticationState: "authenticated"
+      })));
+    const resolveInferenceRoute = vi.fn((backendId: string, providerId: string, modelId: string) => routes
+      .find((route) => route.backendId === backendId && route.providerId === providerId && route.modelId === modelId));
+    const installer = new ScheduleHookScriptInstaller({ generate: createScheduleHookScriptGenerator({ list, resolveInferenceRoute }) });
+    try {
+      const input = { backendId: "backend-a", workspaceRoot: workspace, description: "Run when the check succeeds" };
+      const explicit = await installer.install({ ...input, scheduleName: "Explicit", providerId: "shared", modelId: "same" });
+      expect(explicit.test).toMatchObject({ decision: "run", exitCode: 0 });
+      expect(await readFile(explicit.filePath, "utf8")).toBe("process.exit(0)\n");
+      expect(list).not.toHaveBeenCalled();
+      await installer.install({ ...input, scheduleName: "Automatic" });
+      expect(list).toHaveBeenCalledWith("backend-a");
+      expect(received).toEqual(Array.from({ length: 2 }, () => ({ path: "/backend-a/responses", authorization: "Bearer backend-a-key" })));
+      routes = routes.filter((route) => route.backendId === "backend-b");
+      await expect(installer.install({ ...input, providerId: "shared", modelId: "same" })).rejects.toThrow("cannot generate");
+      await expect(installer.install(input)).rejects.toThrow("exactly one eligible route");
+      await expect(installer.install({ ...input, providerId: "shared" })).rejects.toThrow("both Provider and model");
+      routes.push(...["first", "second"].map((modelId) => ({ ...routes[0]!, backendId: "backend-a", modelId })));
+      await expect(installer.install(input)).rejects.toThrow("exactly one eligible route");
+      expect(received).toHaveLength(2);
+      expect(resolveInferenceRoute.mock.calls.every(([backendId]) => backendId === "backend-a")).toBe(true);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   it("honors cancellation before any file is installed", async () => {
     const workspace = await fixtureDirectory();
     const controller = new AbortController();
     controller.abort();
     await expect(new ScheduleHookScriptInstaller().install({
+      backendId: "backend-a",
       workspaceRoot: workspace,
       scheduleName: "Cancelled",
       script: "process.exit(0)",
@@ -141,16 +208,19 @@ describe("ScheduleHookScriptInstaller", () => {
       generate: async () => "```js\nconst token = 'sk-abcdefghijklmnop';\nprocess.exit(0);\n```"
     });
     await expect(installer.install({
+      backendId: "backend-a",
       workspaceRoot: workspace,
       scheduleName: "Authored secret",
       script: "const token = 'sk-abcdefghijklmnop';\nprocess.exit(token ? 0 : 1);"
     })).rejects.toThrow(/credential material/u);
     await expect(installer.install({
+      backendId: "backend-a",
       workspaceRoot: workspace,
       scheduleName: "Description secret",
       description: "Call https://example.test/?token=abcdefghijklmnop"
     })).rejects.toThrow(/credential material/u);
     await expect(installer.install({
+      backendId: "backend-a",
       workspaceRoot: workspace,
       scheduleName: "Generated secret",
       description: "Run a local check"
@@ -171,8 +241,8 @@ describe("schedule hook script helpers", () => {
 
   it("normalizes names and shell-quotes installed paths", () => {
     expect(scheduleHookScriptSlug("Check New PRs")).toBe("check-new-prs");
-    expect(scheduleHookScriptSlug("检查新任务", "run when ci fails")).toBe("run-when-ci-fails");
-    expect(scheduleHookScriptSlug("检查新任务")).toBe("check");
+    expect(scheduleHookScriptSlug(MULTILINGUAL_FIXTURES.scheduleName, "run when ci fails")).toBe("run-when-ci-fails");
+    expect(scheduleHookScriptSlug(MULTILINGUAL_FIXTURES.scheduleName)).toBe("check");
     expect(scheduleHookScriptCommand("C:\\repo path\\check.mjs", "win32"))
       .toBe('joko-node "C:\\repo path\\check.mjs"');
     expect(scheduleHookScriptCommand("/tmp/a b/check.mjs", "linux"))

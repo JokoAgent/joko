@@ -1,45 +1,41 @@
 import { Check, Clipboard } from "lucide-react";
-import { useEffect, useMemo, useRef, useState, type JSX, type ReactNode } from "react";
+import { useCallback, useMemo, useState, type JSX, type ReactNode } from "react";
+import { writeClipboardText } from "../clipboard-action.js";
+import { useClipboardAction } from "./use-clipboard-action.js";
 import type { Translator } from "./types.js";
 import { IconButton } from "./ui.js";
 import { timelineCodeHighlight, timelineCodeLanguage, timelineCodeLanguageLabel } from "./timeline-code-highlighting.js";
+import { TimelineMarkdownDiffRows } from "./TimelineMarkdownDiffRows.js";
 import "./timeline-code-block.css";
 
-export function TimelineCodeBlock({ source, codeClassName, t }: {
+export function TimelineCodeBlock({ ownerKey, source, codeClassName, t }: {
+  readonly ownerKey: string;
   readonly source: string;
   readonly codeClassName?: string;
   readonly t: Translator;
 }): JSX.Element {
   const language = timelineCodeLanguage(codeClassName);
-  const tokens = useMemo(() => timelineCodeHighlight(source, language), [language, source]);
-  const timerRef = useRef<number | undefined>(undefined);
-  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
-  useEffect(() => () => {
-    if (timerRef.current !== undefined) window.clearTimeout(timerRef.current);
-  }, []);
-
-  const copy = (): void => {
-    void navigator.clipboard.writeText(source).then(() => {
-      setCopyState("copied");
-      if (timerRef.current !== undefined) window.clearTimeout(timerRef.current);
-      timerRef.current = window.setTimeout(() => setCopyState("idle"), 1_500);
-    }, () => setCopyState("failed"));
-  };
-  const label = copyState === "copied"
+  const tokens = useMemo(() => language === "diff" ? [] : timelineCodeHighlight(source, language), [language, source]);
+  const [ownerDocument, setOwnerDocument] = useState<Document>();
+  const attach = useCallback((node: HTMLDivElement | null): void => setOwnerDocument(node?.ownerDocument), []);
+  const copy = useClipboardAction({ ownerKey, sourceKey: source, ownerDocument, feedbackDurationMs: 1_500 });
+  const label = copy.state === "copied"
     ? t("timeline.codeCopied")
-    : copyState === "failed"
+    : copy.state === "failed"
       ? t("timeline.codeCopyFailed")
       : t("timeline.copyCode");
 
-  return <div className="timeline-code-block" data-language={language ?? "text"}>
+  return <div ref={attach} className="timeline-code-block" data-language={language ?? "text"}>
     <div className="timeline-code-block__toolbar">
       <span>{timelineCodeLanguageLabel(language, t("timeline.codePlainText"))}</span>
     </div>
-    <pre><code className={codeClassName}>{highlightedCode(source, tokens)}</code></pre>
-    <IconButton className="timeline-code-block__copy" label={label} onClick={copy}>
-      {copyState === "copied" ? <Check aria-hidden="true" /> : <Clipboard aria-hidden="true" />}
+    <pre className={language === "diff" ? "timeline-code-block__diff" : undefined} tabIndex={language === "diff" ? 0 : undefined} aria-label={language === "diff" ? timelineCodeLanguageLabel(language, t("timeline.codePlainText")) : undefined}>
+      <code className={codeClassName}>{language === "diff" ? <TimelineMarkdownDiffRows source={source} /> : highlightedCode(source, tokens)}</code>
+    </pre>
+    <IconButton className="timeline-code-block__copy" label={label} aria-disabled={copy.pending} aria-busy={copy.pending} onClick={(event) => copy.run(event.currentTarget.ownerDocument, (context) => writeClipboardText(source, context))}>
+      {copy.state === "copied" ? <Check aria-hidden="true" /> : <Clipboard aria-hidden="true" />}
     </IconButton>
-    {copyState === "failed" && <span className="sr-only" role="alert">{label}</span>}
+    {copy.state === "failed" && <span className="sr-only" role="alert">{label}</span>}
   </div>;
 }
 

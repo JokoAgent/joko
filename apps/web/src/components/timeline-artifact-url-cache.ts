@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef } from "react";
 
 interface ArtifactUrlCacheEntry {
   readonly blobId: string;
+  readonly release: (blobId: string) => void;
   promise: Promise<string>;
   acquired: boolean;
   releaseAfterAcquire: boolean;
@@ -26,7 +27,7 @@ export function useTimelineArtifactUrlCache(
     const entries = entriesRef.current;
     entriesRef.current = new Map();
     for (const entry of entries.values()) {
-      if (entry.acquired) releaseRef.current(entry.blobId);
+      if (entry.acquired) entry.release(entry.blobId);
       else entry.releaseAfterAcquire = true;
     }
   }, []);
@@ -37,13 +38,14 @@ export function useTimelineArtifactUrlCache(
 
     const entry = {
       blobId,
+      release: releaseRef.current,
       promise: Promise.resolve(""),
       acquired: false,
       releaseAfterAcquire: false
     } as ArtifactUrlCacheEntry;
     const pending = acquireRef.current(blobId).then((url) => {
       entry.acquired = true;
-      if (entry.releaseAfterAcquire) releaseRef.current(blobId);
+      if (entry.releaseAfterAcquire) entry.release(blobId);
       return url;
     }).catch((error: unknown) => {
       if (entriesRef.current.get(blobId) === entry) entriesRef.current.delete(blobId);

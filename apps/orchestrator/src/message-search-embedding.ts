@@ -109,7 +109,7 @@ export class MessageSearchEmbeddingCoordinator {
     const status = this.#store.messageEmbeddingStatus();
     return this.#providers.resolveOpenAiEmbeddingRoute(
       MESSAGE_SEARCH_EMBEDDING_MODEL_ID,
-      status.providerId
+      routeSelection(status)
     ) !== undefined;
   }
 
@@ -141,7 +141,7 @@ export class MessageSearchEmbeddingCoordinator {
     if (!this.#store.hasMessageEmbeddings(route.providerId, route.generationId, status.modelId)) {
       return { skipReason: "No completed chat vectors are available yet; keyword search was used." };
     }
-    const cacheKey = `${route.providerId}\0${route.generationId}\0${status.modelId}\0${query}`;
+    const cacheKey = `${route.backendId}\0${route.providerId}\0${route.generationId}\0${status.modelId}\0${query}`;
     const cached = this.#queryCache.get(cacheKey);
     if (cached !== undefined && cached.expiresAt > this.#now()) {
       this.#queryCache.delete(cacheKey);
@@ -278,10 +278,13 @@ export class MessageSearchEmbeddingCoordinator {
     readonly route?: OpenAiEmbeddingRoute;
   } {
     let status = this.#store.messageEmbeddingStatus();
-    const route = this.#providers.resolveOpenAiEmbeddingRoute(
+    let route = this.#providers.resolveOpenAiEmbeddingRoute(
       MESSAGE_SEARCH_EMBEDDING_MODEL_ID,
-      status.providerId
+      routeSelection(status)
     );
+    if (route !== undefined && (this.#configuredEnabled || status.backendId !== undefined)) {
+      ({ status, route } = this.#bindRoute(status, route));
+    }
     const shouldEnable = this.#configuredEnabled && route !== undefined;
     if (status.enabled !== shouldEnable) status = this.#store.setMessageEmbeddingEnabled(shouldEnable);
     if (route === undefined) return { status };
@@ -295,8 +298,9 @@ export class MessageSearchEmbeddingCoordinator {
     readonly status: ReturnType<OperationalStore["messageEmbeddingStatus"]>;
     readonly route?: OpenAiEmbeddingRoute;
   } {
-    const bound = this.#store.bindMessageEmbeddingProvider(route.providerId, route.generationId);
+    const bound = this.#store.bindMessageEmbeddingProvider(route.backendId, route.providerId, route.generationId);
     if (
+      bound.backendId !== route.backendId ||
       bound.providerId !== route.providerId ||
       bound.providerGenerationId !== route.generationId
     ) return { status: bound };
@@ -312,6 +316,12 @@ export class MessageSearchEmbeddingCoordinator {
       this.#queryCache.delete(oldest);
     }
   }
+}
+
+function routeSelection(status: ReturnType<OperationalStore["messageEmbeddingStatus"]>): Pick<OpenAiEmbeddingRoute, "backendId" | "providerId"> | undefined {
+  if (status.backendId === undefined && status.providerId === undefined) return undefined;
+  if (status.backendId === undefined || status.providerId === undefined) throw new Error("Message embedding route identity is incomplete.");
+  return { backendId: status.backendId, providerId: status.providerId };
 }
 
 class EmbeddingRequestError extends Error {

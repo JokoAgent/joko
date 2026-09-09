@@ -1,0 +1,18 @@
+.composer__source-notice {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
+.composer__source-notice > svg { width: 16px; height: 16px; flex: none; }
+.composer__source-notice > span { display: grid; gap: 2px; flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.composer__source-notice strong { color: var(--text); font-weight: 500; }
+.composer__source-notice > button { flex: none; }
+.composer__source-actions { grid-column: 2; display: flex; flex-wrap: wrap; gap: 8px; }

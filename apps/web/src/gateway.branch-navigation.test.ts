@@ -15,6 +15,7 @@ describe("Pi branch navigation gateway", () => {
   it("sends bounded summary options and bounds the optional focus", async () => {
     vi.stubGlobal("window", { location: { href: "https://joko.test/#/tasks/current" } });
     const payloads: any[] = [];
+    const preconditions: any[] = [];
     const transport = {
       unary: vi.fn(async (method: any, _signal: unknown, _timeout: unknown, _headers: unknown, input: any) => {
         if (method.localName === "getSnapshot") {
@@ -24,6 +25,7 @@ describe("Pi branch navigation gateway", () => {
         }
         if (method.localName === "submitOperation") {
           payloads.push(input.mutation?.payload);
+          preconditions.push(input.mutation?.preconditions);
           return response(method, create(SubmitOperationResponseSchema, {
             operation: { operationId: input.operationId, connectionId: input.connectionId, state: OperationState.SUCCEEDED }
           }));
@@ -40,11 +42,13 @@ describe("Pi branch navigation gateway", () => {
     );
     await gateway.connect();
 
-    await gateway.navigateSessionBranch("session-one", "entry-two", {
+    await gateway.navigateSessionBranch("session-one", { kind: "native_entry", entryId: "entry-two" }, {
+      expectedGeneration: 1n,
       summarize: true,
       customInstructions: `  ${"x".repeat(4_100)}  `
     });
-    await gateway.navigateSessionBranch("session-one", "entry-three", {
+    await gateway.navigateSessionBranch("session-one", { kind: "native_entry", entryId: "entry-three" }, {
+      expectedGeneration: 1n,
       summarize: false,
       customInstructions: "must not leak into an unsummarized navigation"
     });
@@ -53,7 +57,7 @@ describe("Pi branch navigation gateway", () => {
       case: "navigateSessionBranch",
       value: {
         sessionId: "session-one",
-        nativeEntryId: "entry-two",
+        target: { kind: { case: "nativeEntryId", value: "entry-two" } },
         summarize: true,
         customInstructions: "x".repeat(4_000)
       }
@@ -62,11 +66,16 @@ describe("Pi branch navigation gateway", () => {
       case: "navigateSessionBranch",
       value: {
         sessionId: "session-one",
-        nativeEntryId: "entry-three",
+        target: { kind: { case: "nativeEntryId", value: "entry-three" } },
         summarize: false,
         customInstructions: ""
       }
     });
+    await gateway.navigateSessionBranch("session-one", { kind: "session_start" }, { expectedGeneration: 7n });
+    expect(payloads[2]).toMatchObject({ case: "navigateSessionBranch", value: { sessionId: "session-one", target: { kind: { case: "sessionStart", value: {} } } } });
+    expect(preconditions[2]).toMatchObject([{ entity: { id: "session-one" }, expectedGeneration: 7n }]);
+    await expect(gateway.navigateSessionBranch("session-one", { kind: "session_start" }, { expectedGeneration: 0n })).rejects.toThrow(/generation/u);
+    expect(payloads).toHaveLength(3);
     gateway.disconnect();
   });
 });

@@ -50,13 +50,15 @@ describe("durable UI preferences", () => {
 
   it("rehydrates sparse non-default overrides without discarding them", () => {
     expect(normalizeUiPreferences({
-      linkOpenPreference: "external",
+      webLinkOpenPreference: "sidebar",
+      localLinkOpenPreference: "external",
       streamFadeEnabled: false,
       messageNavRailEnabled: false,
       personalizationPrompts: { "orchestrator-a": "Explain tradeoffs." }
     })).toEqual({
       ...DEFAULT_UI_PREFERENCES,
-      linkOpenPreference: "external",
+      webLinkOpenPreference: "sidebar",
+      localLinkOpenPreference: "external",
       streamFadeEnabled: false,
       messageNavRailEnabled: false,
       personalizationPrompts: { "orchestrator-a": "Explain tradeoffs." }
@@ -179,6 +181,19 @@ describe("owner-scoped delayed-create drafts", () => {
 });
 
 describe("structured composer message references", () => {
+  it("retains typed directory and line references and rejects invalid source ranges", () => {
+    const base = { id: "workspace:source", kind: "workspace", reference: "src/main.ts", label: "main.ts", token: "@main.ts" };
+    for (const metadata of [{ directory: true }, { lineRange: { startLine: 2, endLine: 7 } }]) {
+      const mention = { ...base, ...metadata };
+      expect(normalizeComposerMentions([mention])).toEqual([mention]);
+    }
+    for (const metadata of [
+      { directory: true, lineRange: { startLine: 1, endLine: 2 } },
+      { lineRange: { startLine: 0, endLine: 2 } },
+      { lineRange: { startLine: 2, endLine: 1 } }
+    ]) expect(normalizeComposerMentions([{ ...base, ...metadata }])).toEqual([]);
+  });
+
   it("restores bounded message identities while preserving existing mention kinds", () => {
     expect(normalizeComposerMentions([
       { id: "resource:one", kind: "resource", reference: "one", label: "One", token: "@One" },

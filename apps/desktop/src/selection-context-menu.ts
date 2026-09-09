@@ -6,13 +6,13 @@ import type {
 } from "electron";
 
 import { DESKTOP_CHANNELS, type DesktopLocale } from "./channels.js";
+import { EDIT_LABELS, resolveMenuLocale, selectionActionLabel } from "./i18n/selection-menu.js";
 
 const SEARCH_URL = "https://www.bing.com/search?q=";
 const LABEL_PREVIEW_CHARACTERS = 48;
 const SEARCH_QUERY_MAXIMUM_CHARACTERS = 2_000;
 
 type SupportedPlatform = "darwin" | "win32";
-type MenuLocale = "en" | "zh-CN";
 
 let currentLocale: DesktopLocale | undefined;
 
@@ -40,30 +40,6 @@ const QUOTE_CONTEXT_QUERY = `(() => {
   return Boolean(anchorContext && anchorContext === focusContext);
 })()`;
 
-const EDIT_LABELS = {
-  en: {
-    undo: "Undo",
-    redo: "Redo",
-    cut: "Cut",
-    copy: "Copy",
-    paste: "Paste",
-    pasteAsPlainText: "Paste and Match Style",
-    selectAll: "Select All"
-  },
-  "zh-CN": {
-    undo: "撤销",
-    redo: "重做",
-    cut: "剪切",
-    copy: "复制",
-    paste: "粘贴",
-    pasteAsPlainText: "粘贴为纯文本",
-    selectAll: "全选"
-  }
-} as const;
-
-function resolveMenuLocale(locale: string): MenuLocale {
-  return locale.toLowerCase().startsWith("zh") ? "zh-CN" : "en";
-}
 
 function compactSelectionLabel(text: string): string {
   const compact = text.replace(/\s+/gu, " ").trim();
@@ -77,14 +53,7 @@ function localizedActionLabel(
   locale: string,
   selectionText: string
 ): string {
-  const resolvedLocale = resolveMenuLocale(locale);
-  const preview = compactSelectionLabel(selectionText);
-  if (action === "addToChat") return resolvedLocale === "zh-CN" ? "添加到对话" : "Add to chat";
-  if (action === "copy") return EDIT_LABELS[resolvedLocale].copy;
-  if (action === "lookUp") return resolvedLocale === "zh-CN" ? `查询“${preview}”` : `Look Up “${preview}”`;
-  return resolvedLocale === "zh-CN"
-    ? `在网页中搜索“${preview}”`
-    : `Search the web for “${preview}”`;
+  return selectionActionLabel(action, locale, compactSelectionLabel(selectionText));
 }
 
 export function setSelectionContextMenuLocale(locale: DesktopLocale): void {

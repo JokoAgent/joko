@@ -77,7 +77,7 @@ describe("DurableWorkspaceRunCapture", () => {
     await service.initialize();
     const capture = new DurableWorkspaceRunCapture(store, service);
 
-    await capture.captureBeforeRun({ sessionId: session.id, runId: "run-one", target });
+    await capture.captureBeforeRun({ sessionId: session.id, runId: "run-one", target, navigationAnchor: { target: { kind: "session_start" }, generation: 1 } });
     await writeFile(file, "after\n");
     const created = join(workspace, "generated-report.txt");
     await writeFile(created, "new\n");
@@ -85,6 +85,11 @@ describe("DurableWorkspaceRunCapture", () => {
     await capture.captureAfterRun({ sessionId: session.id, runId: "run-one", target });
 
     const [changeSet] = await service.listChangeSets({ workspaceId: "workspace-one", sessionId: session.id });
+    expect(changeSet?.dialogueAnchor).toEqual({ target: { kind: "session_start" }, generation: 1 });
+    const reloaded = new WorkspaceChangeSetService({ snapshotDirectory: join(data, "snapshots"), repository: new OperationalWorkspaceSnapshotRepository(store) });
+    await reloaded.initialize();
+    expect((await reloaded.listChangeSets({ workspaceId: "workspace-one", sessionId: session.id }))[0]?.dialogueAnchor)
+      .toEqual({ target: { kind: "session_start" }, generation: 1 });
     expect(changeSet?.changes).toEqual(expect.arrayContaining([
       expect.objectContaining({ path: "value.txt", kind: "updated" }),
       expect.objectContaining({ path: "generated-report.txt", kind: "created" })

@@ -77,6 +77,7 @@ export interface WorkspaceRegistration {
 }
 
 export interface RemoteWorkspaceDelegate {
+  capturePreviewAuthority(workspaceId: string, signal?: AbortSignal): Promise<WorkspacePreviewAuthority>;
   register(input: WorkspaceRegistration): Promise<WorkspaceRegistration>;
   unregister(id: string): void;
   watchChanges(scope: WorkspaceFileChangeScope, signal?: AbortSignal): AsyncGenerator<WorkspaceFileChangeRecord>;
@@ -113,6 +114,12 @@ export interface WorkspaceFilePreview {
    */
   readonly bytes?: Buffer;
   readonly truncated: boolean;
+}
+
+export interface WorkspacePreviewAuthority {
+  readonly identity: string;
+  readonly assertCurrent: () => void;
+  readonly preview: (path: string, maximumBytes?: number, maximumFileBytes?: number, signal?: AbortSignal) => Promise<WorkspaceFilePreview>;
 }
 
 export type WorkspaceFilePreviewErrorCode =
@@ -609,12 +616,36 @@ export class WorkspaceService {
     }
   }
 
-  async preview(workspaceId: string, path: string, maximumBytes = 2 * 1024 * 1024): Promise<WorkspaceFilePreview> {
+  async capturePreviewAuthority(workspaceId: string, signal?: AbortSignal): Promise<WorkspacePreviewAuthority> {
+    signal?.throwIfAborted();
+    const registration = this.requireWorkspace(workspaceId);
+    const assertRegistration = (): void => {
+      if (this.#workspaces.get(workspaceId) !== registration) throw new WorkspaceFilePreviewError("The workspace read authority changed. Open the source again.", "stale");
+    };
+    const remote = registration.remote === undefined ? undefined : await this.#remoteDelegate!.capturePreviewAuthority(workspaceId, signal);
+    signal?.throwIfAborted();
+    const assertCurrent = (): void => { signal?.throwIfAborted(); assertRegistration(); remote?.assertCurrent(); };
+    assertCurrent();
+    const identity = createHash("sha256").update(JSON.stringify([workspacePreviewRegistrationIdentity(registration), remote?.identity ?? null])).digest("hex");
+    return { identity, assertCurrent, preview: async (path, maximumBytes = WORKSPACE_TEXT_FILE_MAXIMUM_BYTES, maximumFileBytes, readSignal) => {
+      const currentSignal = signal === undefined ? readSignal : readSignal === undefined ? signal : AbortSignal.any([signal, readSignal]);
+      assertCurrent(); currentSignal?.throwIfAborted();
+      const result = remote === undefined ? await this.preview(workspaceId, path, maximumBytes, maximumFileBytes)
+        : await remote.preview(path, maximumBytes, maximumFileBytes, currentSignal);
+      assertCurrent(); currentSignal?.throwIfAborted();
+      return result;
+    } };
+  }
+
+  async preview(workspaceId: string, path: string, maximumBytes = 2 * 1024 * 1024, maximumFileBytes?: number): Promise<WorkspaceFilePreview> {
     if (this.#isRemote(workspaceId)) {
-      return this.#remoteInvoke(workspaceId, "preview", [path, maximumBytes]);
+      return this.#remoteInvoke(workspaceId, "preview", maximumFileBytes === undefined ? [path, maximumBytes] : [path, maximumBytes, maximumFileBytes]);
     }
     const workspace = this.requireWorkspace(workspaceId);
     const resolved = await this.#resolveWorkspacePreviewFile(workspace, path);
+    if (maximumFileBytes !== undefined && (!Number.isSafeInteger(maximumFileBytes) || maximumFileBytes < 1 || resolved.info.size > maximumFileBytes)) {
+      throw new WorkspaceFilePreviewError("The file exceeds the complete preview budget.", "unsupported");
+    }
     const mediaType = inferMediaType(resolved.path);
     const mediaLimit = workspaceMediaPreviewLimit(resolved.path);
     if (mediaLimit !== undefined) {
@@ -3143,6 +3174,13 @@ export class WorkspaceService {
   }
 }
 
+const previewRegistrationIdentities = new WeakMap<WorkspaceRegistration, string>();
+export function workspacePreviewRegistrationIdentity(registration: WorkspaceRegistration): string {
+  let identity = previewRegistrationIdentities.get(registration);
+  if (identity === undefined) { identity = randomUUID(); previewRegistrationIdentities.set(registration, identity); }
+  return identity;
+}
+
 interface WorkspaceListCandidate {
   readonly absolute: string;
   readonly relativePath: string;
@@ -4141,6 +4179,7 @@ function inferMediaType(path: string): string {
   const fileName = basename(path).toLowerCase();
   if (fileName === "dockerfile" || fileName === "makefile") return "text/plain";
   if (WORKSPACE_MARKDOWN_EXTENSIONS.has(extension)) return "text/markdown";
+  if (extension === ".html" || extension === ".htm") return "text/html";
   if (extension === ".json" || extension === ".jsonc") return "application/json";
   if (WORKSPACE_KNOWN_TEXT_EXTENSIONS.has(extension)) return "text/plain";
   if (extension === ".xml" || extension === ".drawio") return "application/xml";

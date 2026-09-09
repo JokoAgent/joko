@@ -4,6 +4,7 @@ import type { ScheduleView, TargetView } from "../model.js";
 import { clampScheduleListWidth, countActiveSchedules, filterSchedules, groupSchedulesByProject, normalizeScheduleStatusFilter, reconcileScheduleHistory, scheduleDisplayStatus, scheduleRuntimeStatus, selectVisibleScheduleId } from "./scheduler-list.js";
 
 const target = (id: string, workspaceId: string, workspaceName: string): TargetView => ({
+  revision: 1n,
   id,
   backendId: "backend",
   name: workspaceName,

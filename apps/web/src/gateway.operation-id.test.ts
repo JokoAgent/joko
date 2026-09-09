@@ -26,7 +26,7 @@ describe("operation ID lifecycle", () => {
   it("maps language tools off by default and preserves an explicit owner opt-in", () => {
     expect(mapSnapshot(create(SnapshotSchema, {})).settings.languageTools).toEqual({ enabled: false });
     expect(mapSnapshot(create(SnapshotSchema, {
-      settings: { agentResource: {}, collaboration: {}, gitSafety: {}, languageTools: { enabled: true } }
+      settings: { auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" }, agentResource: {}, collaboration: {}, gitSafety: {}, languageTools: { enabled: true } }
     })).settings.languageTools).toEqual({ enabled: true });
   });
 
@@ -159,7 +159,7 @@ describe("operation ID lifecycle", () => {
     await gateway.connect();
 
     await expect(gateway.createSession(DRAFT)).rejects.toThrow("Pi startup failed.");
-    await expect(gateway.createSession(DRAFT)).resolves.toBe("session-after-user-retry");
+    await expect(gateway.createSession(DRAFT)).resolves.toEqual({ sessionId: "session-after-user-retry", generation: 7n });
     expect(operationIds).toHaveLength(2);
     expect(operationIds[1]).not.toBe(operationIds[0]);
     gateway.disconnect();
@@ -329,7 +329,8 @@ function operationTransport(
               targetId: "target-1",
               backendId: "pi",
               displayName: "Local workspace",
-              workspaceId: "workspace-1"
+              workspaceId: "workspace-1",
+              version: { revision: { value: 1n } }
             }],
             sessions
           })
@@ -358,7 +359,8 @@ function successfulSessionResponse(method: any, input: any, sessionId: string): 
             sessionId,
             backendId: "pi",
             targetId: "target-1",
-            displayName: "New task"
+            displayName: "New task",
+            nativeBinding: { runtimeGeneration: 7n }
           }
         }
       }

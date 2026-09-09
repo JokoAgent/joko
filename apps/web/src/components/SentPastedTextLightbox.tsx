@@ -1,6 +1,8 @@
 import { Check, Clipboard, FileText, X } from "lucide-react";
-import { useCallback, useEffect, useId, useRef, useState, type JSX } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, type JSX } from "react";
 import { createPortal } from "react-dom";
+import { writeClipboardText } from "../clipboard-action.js";
+import { useClipboardAction } from "./use-clipboard-action.js";
 import { countComposerPasteLines } from "./composer-paste-pipeline.js";
 import { IconButton } from "./ui.js";
 import "./timeline-text-attachment.css";
@@ -14,7 +16,8 @@ export interface SentPastedTextLightboxLabels {
   readonly close: string;
 }
 
-export function SentPastedTextLightbox({ text, display, labels, returnFocus, onClose }: {
+export function SentPastedTextLightbox({ ownerKey, text, display, labels, returnFocus, onClose }: {
+  readonly ownerKey: string;
   readonly text: string;
   readonly display: string;
   readonly labels: SentPastedTextLightboxLabels;
@@ -24,18 +27,22 @@ export function SentPastedTextLightbox({ text, display, labels, returnFocus, onC
   const titleId = useId();
   const dialogRef = useRef<HTMLDivElement>(null);
   const closingRef = useRef(false);
-  const onCloseRef = useRef(onClose);
-  onCloseRef.current = onClose;
-  const [feedback, setFeedback] = useState<string>();
-  const feedbackTimerRef = useRef<number | undefined>(undefined);
+  const ownerDocument = returnFocus?.ownerDocument ?? document;
+  const closeTargetRef = useRef({ onClose, returnFocus });
+  closeTargetRef.current = { onClose, returnFocus };
+  const copy = useClipboardAction({ ownerKey, sourceKey: JSON.stringify([text, display]), ownerDocument, connectionOwner: returnFocus });
+  useLayoutEffect(() => { closingRef.current = false; }, [ownerKey, text, display, ownerDocument, returnFocus]);
   const close = useCallback((): void => {
     if (closingRef.current) return;
     closingRef.current = true;
-    onCloseRef.current();
-  }, []);
+    copy.cancel();
+    const target = closeTargetRef.current;
+    if (target.returnFocus?.isConnected === true) target.returnFocus.focus({ preventScroll: true });
+    target.onClose();
+  }, [copy.cancel]);
 
   useEffect(() => {
-    const body = document.body;
+    const body = ownerDocument.body;
     const ownsModalLock = !body.classList.contains("modal-open");
     body.classList.add("text-attachment-lightbox-open", "modal-open");
     dialogRef.current?.focus({ preventScroll: true });
@@ -62,23 +69,13 @@ export function SentPastedTextLightbox({ text, display, labels, returnFocus, onC
         (event.shiftKey ? focusable.at(-1) : focusable[0])?.focus({ preventScroll: true });
       }
     };
-    document.addEventListener("keydown", onKeyDown, true);
+    ownerDocument.addEventListener("keydown", onKeyDown, true);
     return () => {
-      document.removeEventListener("keydown", onKeyDown, true);
+      ownerDocument.removeEventListener("keydown", onKeyDown, true);
       body.classList.remove("text-attachment-lightbox-open");
-      if (ownsModalLock && document.querySelector(".image-lightbox, .workspace-image-lightbox, .text-attachment-lightbox") === null) body.classList.remove("modal-open");
-      if (feedbackTimerRef.current !== undefined) window.clearTimeout(feedbackTimerRef.current);
-      if (returnFocus?.isConnected === true) returnFocus.focus({ preventScroll: true });
+      if (ownsModalLock && ownerDocument.querySelector(".image-lightbox, .workspace-image-lightbox, .text-attachment-lightbox") === null) body.classList.remove("modal-open");
     };
-  }, [close, returnFocus]);
-
-  const copy = (): void => {
-    void navigator.clipboard.writeText(text).then(() => {
-      setFeedback(labels.copied);
-      if (feedbackTimerRef.current !== undefined) window.clearTimeout(feedbackTimerRef.current);
-      feedbackTimerRef.current = window.setTimeout(() => setFeedback(undefined), 1_600);
-    }, () => setFeedback(labels.copyFailed));
-  };
+  }, [close, ownerDocument]);
 
   return createPortal(<div className="text-attachment-lightbox sent-pasted-text-lightbox" role="presentation">
     <button className="text-attachment-lightbox__backdrop" type="button" aria-label={labels.close} onClick={close} />
@@ -89,12 +86,12 @@ export function SentPastedTextLightbox({ text, display, labels, returnFocus, onC
           <span><strong id={titleId}>{labels.title}</strong><small>{display} · {labels.lines(countComposerPasteLines(text))}</small></span>
         </div>
         <div className="text-attachment-lightbox__actions">
-          <IconButton label={labels.copy} onClick={copy}><Clipboard aria-hidden="true" /></IconButton>
+          <IconButton label={labels.copy} aria-disabled={copy.pending} aria-busy={copy.pending} onClick={(event) => { if (!closingRef.current) copy.run(event.currentTarget.ownerDocument, (context) => writeClipboardText(text, context)); }}><Clipboard aria-hidden="true" /></IconButton>
           <IconButton label={labels.close} onClick={close}><X aria-hidden="true" /></IconButton>
         </div>
       </header>
       <main className="text-attachment-lightbox__body"><pre tabIndex={0}>{text}</pre></main>
-      {feedback !== undefined && <div className="text-attachment-lightbox__feedback" role={feedback === labels.copyFailed ? "alert" : "status"}><Check aria-hidden="true" />{feedback}</div>}
+      {(copy.state === "copied" || copy.state === "failed") && <div className="text-attachment-lightbox__feedback" role={copy.state === "failed" ? "alert" : "status"}><Check aria-hidden="true" />{copy.state === "failed" ? labels.copyFailed : labels.copied}</div>}
     </div>
-  </div>, document.body);
+  </div>, ownerDocument.body);
 }

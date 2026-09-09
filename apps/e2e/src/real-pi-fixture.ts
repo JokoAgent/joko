@@ -155,6 +155,7 @@ export class RealPiSystemFixture {
         throw new Error("Production Orchestrator composition did not expose managed Pi Provider generation.");
       }
       await application.providers.upsert({
+        backendId: "pi", credentialOrigin: "",
         provider,
         displayName: "Joko local E2E Provider",
         kind: "local_keyless",

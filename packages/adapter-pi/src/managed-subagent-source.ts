@@ -690,14 +690,15 @@ function extensionPaths() {
   const subagent = join(directory, "joko-managed-subagent.ts");
   const silentEncryptedRetry = join(directory, "joko-managed-silent-encrypted-retry.ts");
   const autoReview = join(directory, "joko-managed-auto-review.mjs");
+  const modelCatalog = join(directory, "joko-managed-model-catalog.mjs");
   const runner = join(directory, RUNNER_FILE_NAME);
-  for (const path of [bridge, subagent, silentEncryptedRetry, autoReview, runner]) {
+  for (const path of [bridge, subagent, silentEncryptedRetry, autoReview, modelCatalog, runner]) {
     const info = lstatSync(path);
     if (!info.isFile() || info.isSymbolicLink() || info.size > MAX_DURABLE_JSON_BYTES || !samePath(realpathSync(path), path)) {
       throw new Error("managed extension path is unsafe: " + basename(path));
     }
   }
-  return { bridge: bridge, subagent: subagent, silentEncryptedRetry: silentEncryptedRetry, autoReview: autoReview, runner: runner };
+  return { bridge: bridge, subagent: subagent, silentEncryptedRetry: silentEncryptedRetry, autoReview: autoReview, modelCatalog: modelCatalog, runner: runner };
 }
 
 function childEnvironment(childHome) {
@@ -1199,11 +1200,13 @@ async function launchReservedDurableJob(pi, job, message, resumeSessionPath, onU
     const subagentPath = join(runtimeDirectory, basename(paths.subagent));
     const retryPath = join(runtimeDirectory, basename(paths.silentEncryptedRetry));
     const autoReviewPath = join(runtimeDirectory, basename(paths.autoReview));
+    const modelCatalogPath = join(runtimeDirectory, basename(paths.modelCatalog));
     const runnerScript = join(runDirectory, RUNNER_FILE_NAME);
     copyPrivateSnapshot(paths.bridge, bridgePath, MAX_DURABLE_JSON_BYTES, true);
     copyPrivateSnapshot(paths.subagent, subagentPath, MAX_DURABLE_JSON_BYTES, true);
     copyPrivateSnapshot(paths.silentEncryptedRetry, retryPath, MAX_DURABLE_JSON_BYTES, true);
     copyPrivateSnapshot(paths.autoReview, autoReviewPath, MAX_DURABLE_JSON_BYTES, true);
+    copyPrivateSnapshot(paths.modelCatalog, modelCatalogPath, MAX_DURABLE_JSON_BYTES, true);
     copyPrivateSnapshot(paths.runner, runnerScript, MAX_DURABLE_JSON_BYTES, true);
     const runnerScriptSha256 = createHash("sha256").update(readFileSync(runnerScript)).digest("hex");
     let runnerReservation;

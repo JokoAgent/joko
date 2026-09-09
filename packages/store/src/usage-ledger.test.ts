@@ -4,7 +4,7 @@ import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { OperationalStore, StaleGenerationError, StoreError } from "./index.js";
+import { OperationalStore, StaleGenerationError, StoreError, UsageReportCapacityError, UsageReportQueryError } from "./index.js";
 
 const cleanups: Array<() => void> = [];
 
@@ -13,6 +13,82 @@ afterEach(() => {
 });
 
 describe("durable usage ledger", () => {
+  it("pages historical route totals without repricing or borrowing the current task model", () => {
+    const fixture = createFixture();
+    const record = (sourceId: string, providerId: string, modelId: string, tokens: number, day: number, currencyCode = "USD") => fixture.store.recordUsageObservation(observation({
+      sourceId, providerId, modelId, inputTokens: tokens, totalTokens: tokens, measuredAt: Date.UTC(2026, 7, day),
+      reportedCostMicros: tokens, currencyCode, costRates: undefined
+    }));
+    record("run:first", "provider-a", "model-a", 90, 21);
+    record("run:second", "provider-b", "model-a", 20, 22, "CNY");
+    record("run:third", "provider-a", "model-b", 40, 23);
+    const query = { ownerId: "owner-a", group: "model" as const, pageSize: 1 };
+    const first = fixture.store.getUsageReport(query);
+    expect(first).toMatchObject({ totalGroups: 3, entries: [{ providerId: "provider-a", modelId: "model-a", totals: [{ totalTokens: 90 }] }] });
+    expect(first.totals).toEqual(expect.arrayContaining([
+      expect.objectContaining({ currencyCode: "USD", totalTokens: 130 }), expect.objectContaining({ currencyCode: "CNY", totalTokens: 20 })
+    ]));
+    fixture.store.updateSession("session-1", { pinned: true }, fixture.store.getSession("session-1").revision);
+    fixture.reopen();
+    expect(fixture.store.getUsageReport({ ...query, pageToken: first.nextPageToken }).entries[0]).toMatchObject({ modelId: "model-b" });
+    expect(fixture.store.getUsageReport({ ...query, ownerId: "owner-b" }).entries).toEqual([]);
+    expect(fixture.store.getUsageReport({ ...query, providerId: "provider-b", modelId: "model-a", fromDay: "2026-08-22", throughDay: "2026-08-22" })).toMatchObject({ totalGroups: 1, totals: [{ totalTokens: 20 }] });
+    expect(() => fixture.store.getUsageReport({ ...query, providerId: "provider-b", pageToken: first.nextPageToken })).toThrow("cursor");
+    for (const invalid of [{ fromDay: "2026-02-30" }, { fromDay: "2026-08-23", throughDay: "2026-08-21" }, { pageSize: 101 }, { pageToken: "malformed" }]) {
+      expect(() => fixture.store.getUsageReport({ ...query, ...invalid })).toThrow(UsageReportQueryError);
+    }
+    const task = fixture.store.getUsageReport({ ...query, group: "task" });
+    expect(task.entries[0]).toMatchObject({ sessionId: "session-1", title: "Task", referenceAvailable: true, modelId: "", totals: expect.any(Array) });
+    record("run:fourth", "retired-provider", "retired-model", 5, 24);
+    expect(() => fixture.store.getUsageReport({ ...query, pageToken: first.nextPageToken })).toThrow("changed concurrently");
+    expect(fixture.store.getUsageReport({ ...query, providerId: "retired-provider" }).entries).toHaveLength(1);
+    const beforeDeletion = fixture.store.getUsageReport(query);
+    const session = fixture.store.getSession("session-1");
+    fixture.store.updateSession("session-1", { archived: true, deletedAt: Date.UTC(2026, 7, 25) }, session.revision);
+    const deletedTask = fixture.store.getUsageReport({ ...query, group: "task", sessionId: "session-1" });
+    expect(deletedTask.entries).toEqual([expect.objectContaining({ sessionId: "session-1", referenceAvailable: false, title: "" })]);
+    expect(deletedTask.totals).toEqual(beforeDeletion.totals);
+    expect(fixture.store.getUsageReport({ ...query, pageToken: beforeDeletion.nextPageToken }).entries).toHaveLength(1);
+  });
+
+  it("invalidates task pages when a referenced task is renamed or deleted", () => {
+    const fixture = createFixture();
+    const original = fixture.store.getSession("session-1").descriptor;
+    fixture.store.createSession({ ...original, id: "session-2", binding: { ...original.binding, opaqueRef: "native/second.jsonl" } });
+    for (const sessionId of ["session-1", "session-2"]) fixture.store.recordUsageObservation(observation({ sessionId, totalTokens: 1, inputTokens: 1 }));
+    const query = { ownerId: "owner-a", group: "task" as const, pageSize: 1 };
+    for (const patch of [{ title: "Renamed task" }, { archived: true, deletedAt: Date.UTC(2026, 7, 25) }]) {
+      const page = fixture.store.getUsageReport(query);
+      fixture.store.updateSession("session-2", patch, fixture.store.getSession("session-2").revision);
+      expect(() => fixture.store.getUsageReport({ ...query, pageToken: page.nextPageToken })).toThrow("changed concurrently");
+    }
+  });
+
+  it("bounds currency aggregation even for one task and allows a narrower report after a capacity failure", () => {
+    const fixture = createFixture();
+    for (let index = 0; index < 257; index += 1) {
+      fixture.store.recordUsageObservation(observation({
+        sourceId: `run:${index}`, providerId: `provider-${index}`, totalTokens: 1, inputTokens: 1,
+        currencyCode: `Q${String.fromCharCode(65 + Math.floor(index / 26))}${String.fromCharCode(65 + index % 26)}`,
+        reportedCostMicros: 1, costRates: undefined
+      }));
+    }
+    const query = { ownerId: "owner-a", group: "task" as const, pageSize: 1 };
+    expect(() => fixture.store.getUsageReport(query)).toThrow(UsageReportCapacityError);
+    expect(fixture.store.getUsageReport({ ...query, providerId: "provider-0" })).toMatchObject({ totalGroups: 1, totals: [{ currencyCode: "QAA", totalTokens: 1 }] });
+  });
+
+  it.each(["USD", "CNY"])("reports unsafe aggregates across a second %s route without losing exact bounded totals", (secondCurrency) => {
+    const fixture = createFixture();
+    for (const modelId of ["model-large-a", "model-large-b"]) fixture.store.recordUsageObservation(observation({
+      sourceId: `run:${modelId}`, modelId, totalTokens: Number.MAX_SAFE_INTEGER, inputTokens: Number.MAX_SAFE_INTEGER,
+      reportedCostMicros: 0, costRates: undefined, currencyCode: modelId === "model-large-a" ? "USD" : secondCurrency
+    }));
+    const query = { ownerId: "owner-a", group: "model" as const, pageSize: 1 };
+    expect(() => fixture.store.getUsageReport(query)).toThrow(UsageReportCapacityError);
+    expect(fixture.store.getUsageReport({ ...query, modelId: "model-large-a" }).totals[0]!.totalTokens).toBe(Number.MAX_SAFE_INTEGER);
+  });
+
   it("deduplicates cumulative observations across restarts and attributes only new deltas", () => {
     const fixture = createFixture();
     const first = fixture.store.recordUsageObservation(observation({

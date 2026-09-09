@@ -11,6 +11,7 @@ import {
   type CreateNativeSessionInput,
   type NativeSessionBinding,
   type NativeSessionCandidate,
+  type NativeSessionDerivation,
   type NativeSessionForkResult,
   type NativeSessionState,
   type PermissionMode,
@@ -48,7 +49,7 @@ interface FakeSession {
   compacting: boolean;
   aborted: boolean;
   messages: string[];
-  leafId: string;
+  leafId: string | undefined;
 }
 
 export class FakeBackendAdapter implements BackendAdapter {
@@ -194,6 +195,10 @@ export class FakeBackendAdapter implements BackendAdapter {
     this.#sessions.delete(context.sessionId);
   }
 
+  supportsDetachedSessionDeletion(context: AdapterContext): boolean {
+    return context.target.backendId === this.id && context.runtimePolicy !== "review_read_only";
+  }
+
   async send(input: PromptInput, context: AdapterContext): Promise<void> {
     const session = this.session(context.sessionId);
     const fault = this.#faults.get(context.sessionId);
@@ -285,30 +290,34 @@ export class FakeBackendAdapter implements BackendAdapter {
     return { roots: [{ entryId: "root", kind: "root", label: session.name, timestamp: 0, children: [] }], leafId: session.leafId };
   }
 
-  async navigateTree(entryId: string, _summarize: boolean, context: AdapterContext, _customInstructions?: string): Promise<void> {
+  async navigateTree(target: import("@joko/core").NativeNavigationTarget, _summarize: boolean, context: AdapterContext, _customInstructions: string | undefined, _navigation: import("@joko/core").NativeSessionNavigation): Promise<import("@joko/core").NativeSessionNavigationResult> {
     if (!supported(this.profile.capabilities, "session.rewind")) throw unsupported("session.rewind");
-    this.session(context.sessionId).leafId = entryId;
+    if (target.kind === "session_start" && !supported(this.profile.capabilities, "session.rewind_to_start")) throw unsupported("session.rewind_to_start");
+    this.session(context.sessionId).leafId = target.kind === "native_entry" ? target.entryId : undefined;
+    return { kind: "in_place" };
   }
 
-  async fork(entryId: string, context: AdapterContext): Promise<NativeSessionForkResult> {
+  async fork(entryId: string, context: AdapterContext, derivation: NativeSessionDerivation): Promise<NativeSessionForkResult> {
     if (!supported(this.profile.capabilities, "session.fork")) throw unsupported("session.fork");
-    return {
-      binding: {
-        opaqueRef: `fake://${this.id}/${context.sessionId}/fork/${entryId}`,
-        nativeSessionId: randomUUID(),
-        generation: context.generation
-      }
+    const binding = {
+      opaqueRef: `fake://${this.id}/${derivation.sessionId}/fork/${entryId}`,
+      nativeSessionId: randomUUID(),
+      generation: context.generation
     };
+    derivation.recordBinding(binding);
+    return { binding };
   }
 
-  async clone(context: AdapterContext): Promise<NativeSessionBinding> {
+  async clone(context: AdapterContext, derivation: NativeSessionDerivation): Promise<NativeSessionBinding> {
     if (!supported(this.profile.capabilities, "session.fork")) throw unsupported("session.clone");
     const nativeSessionId = randomUUID();
-    return {
-      opaqueRef: `fake://${this.id}/${context.sessionId}/clone/${nativeSessionId}`,
+    const binding = {
+      opaqueRef: `fake://${this.id}/${derivation.sessionId}/clone/${nativeSessionId}`,
       nativeSessionId,
       generation: context.generation
     };
+    derivation.recordBinding(binding);
+    return binding;
   }
 
   async rebuildContext(input: ContextRebuildInput, context: AdapterContext): Promise<NativeSessionBinding> {

@@ -6,6 +6,7 @@ import type { BlobRef, ImageInput } from "@joko/core";
 import type { OperationalStore, PersistedEvent } from "@joko/store";
 
 import type { ProviderCatalogManager, ProviderInferenceRoute } from "./credential-manager.js";
+import type { AuxiliaryTextPlan, AuxiliaryTextRouting } from "./auxiliary-text-routing.js";
 
 const VISION_REQUEST_TIMEOUT_MS = 30_000;
 const INFERENCE_RESPONSE_LIMIT = 1024 * 1024;
@@ -16,7 +17,7 @@ const PREDICTION_CACHE_LIMIT = 64;
 const SESSION_EVENT_SCAN_PAGE_SIZE = 10_000;
 const PREDICTION_CACHE_TTL_MS = 5 * 60_000;
 const IMAGE_UNAVAILABLE_TEXT =
-  "[Image unavailable / 图片不可用: Vision Bridge could not analyze this image. Do not infer or invent its contents; tell the user the image could not be inspected.]";
+  "[Image unavailable: Vision Bridge could not analyze this image. Do not infer or invent its contents; tell the user the image could not be inspected.]";
 const DEFAULT_VISION_PROMPT =
   "Describe this image precisely for a coding agent. Include visible text, UI state, layout, errors, and details relevant to the user's request. Do not guess hidden content.";
 
@@ -56,7 +57,7 @@ export function createModelRouteCatalog(
       providerId: model.providerId,
       modelId: model.modelId,
       supportsImages: model.supportsImages,
-      credentialRoute: managedCatalog && providers.hasInferenceModel(model.providerId, model.modelId)
+      credentialRoute: managedCatalog && providers.hasInferenceModel(record.descriptor.id, model.providerId, model.modelId)
     }));
   }).sort(compareModelRoutes);
   return {
@@ -64,7 +65,7 @@ export function createModelRouteCatalog(
     resolve: (reference, options = {}) => {
       const descriptor = list().find((candidate) => sameModelRoute(candidate, reference));
       if (descriptor?.credentialRoute !== true || (options.requireImages === true && !descriptor.supportsImages)) return undefined;
-      const route = providers.resolveInferenceRoute(reference.providerId, reference.modelId, options);
+      const route = providers.resolveInferenceRoute(reference.backendId, reference.providerId, reference.modelId, options);
       return route === undefined ? undefined : { ...route, backendId: reference.backendId };
     }
   };
@@ -339,8 +340,7 @@ export interface PromptRecommendationState {
 
 export interface PromptPredictionServiceOptions {
   readonly store: OperationalStore;
-  readonly routes: ModelRouteCatalog;
-  readonly fetch?: typeof globalThis.fetch;
+  readonly auxiliary: AuxiliaryTextRouting;
   readonly now?: () => number;
 }
 
@@ -348,16 +348,13 @@ export interface PromptPredictionServiceOptions {
  * from Orchestrator's durable Events, not trusted from a renderer request. */
 export class PromptPredictionService {
   readonly #store: OperationalStore;
-  readonly #routes: ModelRouteCatalog;
-  readonly #fetch: typeof globalThis.fetch;
+  readonly #auxiliary: AuxiliaryTextRouting;
   readonly #now: () => number;
   readonly #cache = new Map<string, { readonly prompt: string; readonly expiresAt: number }>();
-  readonly #inFlight = new Map<string, Promise<string>>();
 
   constructor(options: PromptPredictionServiceOptions) {
     this.#store = options.store;
-    this.#routes = options.routes;
-    this.#fetch = options.fetch ?? globalThis.fetch;
+    this.#auxiliary = options.auxiliary;
     this.#now = options.now ?? Date.now;
   }
 
@@ -367,13 +364,11 @@ export class PromptPredictionService {
       "orchestrator",
       "settings.prompt_recommendation"
     )?.value).enabled ?? true;
-    const available = this.#routes.list().some((model) =>
-      model.credentialRoute && this.#routes.resolve(model) !== undefined
-    );
+    const { available, unavailableReason } = this.#auxiliary.snapshot();
     return {
       enabled,
       available,
-      unavailableReason: available ? "" : "No authenticated managed Provider route is available for prompt prediction."
+      unavailableReason
     };
   }
 
@@ -385,17 +380,18 @@ export class PromptPredictionService {
     readonly signal?: AbortSignal;
   }): Promise<string> {
     const state = this.state();
-    if (!state.enabled || !state.available || input.signal?.aborted) return "";
-    const key = `${input.sessionId}\0${input.expectedLastActivityAt}\0${input.expectedGeneration}`;
+    if (!state.enabled || !state.available || input.signal?.aborted || this.#eligibleSession(input) === undefined) return "";
+    const plan = this.#auxiliary.capture();
+    const preferences = this.#preferencesIdentity();
+    const sourceCursor = this.#latestCursor(input.sessionId);
+    const key = JSON.stringify([
+      "next_prompt", input.sessionId, input.expectedLastActivityAt, input.expectedGeneration,
+      sourceCursor.toString(), input.locale, preferences, plan.revision.toString(), plan.runtimeRevision
+    ]);
     const cached = this.#cache.get(key);
     if (cached !== undefined && cached.expiresAt > this.#now()) return cached.prompt;
-    const running = this.#inFlight.get(key);
-    if (running !== undefined) return running;
-    const prediction = this.#predict({ ...input, key }).finally(() => {
-      if (this.#inFlight.get(key) === prediction) this.#inFlight.delete(key);
-    });
-    this.#inFlight.set(key, prediction);
-    return prediction;
+    // Each caller owns its cancellation. Only completed, current results are shared.
+    return this.#predict({ ...input, key, plan, preferences, sourceCursor });
   }
 
   async #predict(input: {
@@ -404,19 +400,21 @@ export class PromptPredictionService {
     readonly expectedGeneration: number;
     readonly locale: string;
     readonly key: string;
+    readonly plan: AuxiliaryTextPlan;
+    readonly preferences: string;
+    readonly sourceCursor: bigint;
     readonly signal?: AbortSignal;
   }): Promise<string> {
-    const session = this.#eligibleSession(input);
-    if (session === undefined || session.descriptor.providerId === undefined || session.descriptor.modelId === undefined) return "";
-    const route = this.#routes.resolve({
-      backendId: session.descriptor.backendId,
-      providerId: session.descriptor.providerId,
-      modelId: session.descriptor.modelId
-    });
-    if (route === undefined) return "";
+    const stillCurrent = (): boolean => !input.signal?.aborted
+      && this.state().enabled
+      && this.#auxiliary.isCurrent(input.plan)
+      && this.#preferencesIdentity() === input.preferences
+      && this.#eligibleSession(input) !== undefined
+      && this.#latestCursor(input.sessionId) === input.sourceCursor;
+    if (!stillCurrent()) return "";
     const context = conversationContext(recentConversationEvents(this.#store, input.sessionId));
     if (context.length === 0) return "";
-    if (this.#eligibleSession(input) === undefined) return "";
+    if (!stillCurrent()) return "";
     const system = [
       "You are a terse predictive text engine for a coding chat input.",
       "Return only the predicted next user message: no quotes, markdown, commentary, or multiple options.",
@@ -433,23 +431,23 @@ export class PromptPredictionService {
       "Match the user's tone, brevity, phrasing, and terminology.",
       "Do not copy a prior message verbatim. Return exactly one concise prompt."
     ].join("\n");
-    let raw: string;
+    let prompt: string;
     try {
-      raw = await requestInference({
-        fetch: this.#fetch,
-        route,
+      const result = await this.#auxiliary.run(input.plan, {
         system,
         user,
         maxTokens: 96,
-        signal: input.signal,
-        timeoutMs: 20_000
+        ...(input.signal === undefined ? {} : { signal: input.signal }),
+        timeoutMs: 20_000,
+        stillCurrent,
+        validate: (raw) => sanitizePrediction(raw) || undefined
       });
+      if (result.status !== "ok") return "";
+      prompt = result.text;
     } catch {
       return "";
     }
-    if (this.#eligibleSession(input) === undefined) return "";
-    const prompt = sanitizePrediction(raw);
-    if (prompt.length === 0) return "";
+    if (!stillCurrent()) return "";
     this.#cache.set(input.key, { prompt, expiresAt: this.#now() + PREDICTION_CACHE_TTL_MS });
     while (this.#cache.size > PREDICTION_CACHE_LIMIT) {
       const oldest = this.#cache.keys().next().value as string | undefined;
@@ -457,6 +455,16 @@ export class PromptPredictionService {
       this.#cache.delete(oldest);
     }
     return prompt;
+  }
+
+  #preferencesIdentity(): string {
+    return JSON.stringify(["settings.appearance", "settings.prompt_recommendation"].map((key) =>
+      this.#store.findSetting("service", "orchestrator", key)?.revision.toString() ?? "0"
+    ));
+  }
+
+  #latestCursor(sessionId: string): bigint {
+    return this.#store.listEvents({ sessionId, order: "desc", limit: 1 })[0]?.globalCursor ?? 0n;
   }
 
   #eligibleSession(input: {
@@ -713,7 +721,9 @@ async function requestInference(input: {
   readonly signal?: AbortSignal;
   readonly timeoutMs: number;
 }): Promise<string> {
-  const endpoint = inferenceEndpoint(input.route.baseUrl, input.route.api);
+  const endpoint = input.route.requestPath === undefined
+    ? inferenceEndpoint(input.route.baseUrl, input.route.api)
+    : new URL(input.route.requestPath, new URL(input.route.baseUrl).origin).toString();
   const timeout = AbortSignal.timeout(input.timeoutMs);
   const signal = input.signal === undefined ? timeout : AbortSignal.any([input.signal, timeout]);
   const body = inferenceBody(input);

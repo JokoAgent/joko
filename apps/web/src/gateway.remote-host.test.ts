@@ -1,8 +1,13 @@
-import { create } from "@bufbuild/protobuf";
+import { create, type MessageInitShape } from "@bufbuild/protobuf";
 import type { Transport } from "@connectrpc/connect";
 import {
   CapabilitySupport,
+  BeginCredentialUploadResponseSchema,
   CreateRemoteHostResponseSchema,
+  EntityKind,
+  InteractionKind,
+  InteractionState,
+  QuestionAnswerHandling,
   GetRemoteHostCapabilitiesResponseSchema,
   GetSnapshotResponseSchema,
   ListRemoteHostsResponseSchema,
@@ -14,14 +19,24 @@ import {
   RemoteHostStatus,
   SnapshotSchema,
   SubmitOperationResponseSchema,
-  TestRemoteHostConnectionResponseSchema
+  TestRemoteHostConnectionResponseSchema,
+  WatchRemoteHostsResponseSchema,
+  RemoteHostChangeKind
 } from "@joko/contracts";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { createOrchestratorGateway } from "./gateway.js";
+import { createOrchestratorGateway, mapSnapshot } from "./gateway.js";
 import type { AppSnapshot } from "./model.js";
 
 describe("Remote Host gateway", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it.each([undefined, 0n])("rejects a Target projection without a usable revision (%s)", (revision) => {
+    expect(() => mapSnapshot(create(SnapshotSchema, { targets: [{
+      targetId: "target-one", backendId: "backend", workspaceId: "workspace-one",
+      ...(revision === undefined ? {} : { version: { revision: { value: revision } } })
+    }] }))).toThrow("Target without a current revision");
+  });
   it("uses generated contracts for capability, CRUD, status, TOFU, and remote workspace binding", async () => {
     const requests: Array<{ readonly method: string; readonly input: any }> = [];
     let snapshot: AppSnapshot | undefined;
@@ -65,6 +80,7 @@ describe("Remote Host gateway", () => {
     );
     await gateway.connect();
 
+    expect(snapshot?.targets[0]?.revision).toBe(7n);
     expect(snapshot?.targets[0]?.remoteWorkspace).toEqual({
       hostId: "build-box",
       workspaceRoot: "/srv/project"
@@ -111,7 +127,7 @@ describe("Remote Host gateway", () => {
     await gateway.testRemoteHostConnection("target-one", "build-box", 4n);
     await gateway.updateTarget("target-one", {
       workspaceLocation: { kind: "remote", hostId: "build-box", workspaceRoot: "  /srv/project  " }
-    });
+    }, 7n);
 
     expect(requests.find((request) => request.method === "listRemoteHosts")?.input).toEqual({
       targetId: "target-one",
@@ -140,6 +156,138 @@ describe("Remote Host gateway", () => {
         }
       }
     });
+    expect(requests.find((request) => request.method === "submitOperation")?.input.mutation.preconditions).toMatchObject([{
+      entity: { kind: EntityKind.TARGET, id: "target-one" }, expectedRevision: { value: 7n }
+    }]);
+    gateway.disconnect();
+  });
+
+  it("requires a full initial Remote Host snapshot before accepting changes", async () => {
+    const transport = remoteTransport(() => { throw new Error("Unexpected unary request"); });
+    vi.mocked(transport.stream).mockImplementation(async (method: any) => response(method,
+      method.localName === "watchRemoteHosts" ? (async function* () {
+        yield create(WatchRemoteHostsResponseSchema, {
+          sequence: 1n,
+          update: { case: "change", value: { kind: RemoteHostChangeKind.UPSERTED, host: host() } }
+        });
+      })() : idleStream(), true));
+    const gateway = createOrchestratorGateway(
+      { id: "remote-watch", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" },
+      "auth-key", {}, () => transport
+    );
+    await gateway.connect();
+    await expect(gateway.watchRemoteHosts("target-one")[Symbol.asyncIterator]().next()).rejects.toThrow("initial Remote Host snapshot");
+    gateway.disconnect();
+  });
+
+  it.each(["ticket", "upload"] as const)("retires a credential action during %s without continuing on a replacement connection", async (stage) => {
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const submissions: unknown[] = [];
+    const fetch = vi.fn(async () => {
+      if (stage === "upload") { entered(); await pending; }
+      return new Response(undefined, { status: 204 });
+    });
+    vi.stubGlobal("fetch", fetch);
+    const transport = remoteTransport(async (method, input) => {
+      if (method === "beginCredentialUpload") {
+        if (stage === "ticket") { entered(); await pending; }
+        return create(BeginCredentialUploadResponseSchema, { ticket: {
+          ticketId: "original-ticket", relativeEndpoint: "/v1/credential-uploads/original-ticket", maximumBytes: 1024n
+        } });
+      }
+      if (method === "submitOperation") {
+        submissions.push(input);
+        return create(SubmitOperationResponseSchema, { operation: { operationId: input.operationId, state: OperationState.SUCCEEDED } });
+      }
+      throw new Error(`Unexpected method: ${method}`);
+    });
+    const gateway = createOrchestratorGateway(
+      { id: "remote-credential", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" },
+      "auth-key", {}, () => transport
+    );
+    await gateway.connect();
+    const action = gateway.saveCredential({ id: "key-reference", name: "Test key", kind: "sshPrivateKey", providerId: "", secret: "test-only-secret" });
+    const outcome = action.then(() => undefined, (error: unknown) => error);
+    await started;
+    await gateway.connect();
+    release();
+    expect(await outcome).toMatchObject({ name: "AbortError" });
+    expect(fetch).toHaveBeenCalledTimes(stage === "ticket" ? 0 : 1);
+    expect(submissions).toEqual([]);
+    gateway.disconnect();
+  });
+
+  it("honors caller retirement after key upload without committing its reference", async () => {
+    const caller = new AbortController();
+    const submissions: unknown[] = [];
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      caller.abort();
+      return new Response(undefined, { status: 204 });
+    }));
+    const transport = remoteTransport((method, input) => {
+      if (method === "beginCredentialUpload") return create(BeginCredentialUploadResponseSchema, { ticket: {
+        ticketId: "caller-ticket", relativeEndpoint: "/v1/credential-uploads/caller-ticket", maximumBytes: 1024n
+      } });
+      if (method !== "submitOperation") throw new Error(`Unexpected method: ${method}`);
+      submissions.push(input);
+      return create(SubmitOperationResponseSchema, { operation: { operationId: input.operationId, state: OperationState.SUCCEEDED } });
+    });
+    const gateway = createOrchestratorGateway(
+      { id: "remote-caller", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" },
+      "auth-key", {}, () => transport
+    );
+    await gateway.connect();
+    await expect(gateway.saveCredential({ id: "key-reference", name: "Test key", kind: "sshPrivateKey", providerId: "", secret: "test-only-secret" }, caller.signal)).rejects.toMatchObject({ name: "AbortError" });
+    expect(submissions).toEqual([]);
+    gateway.disconnect();
+  });
+
+  it.each(["provider", "voice", "interaction"] as const)("fences the %s continuation after its credential upload has returned", async (consumer) => {
+    const submissions: unknown[] = [];
+    let tickets = 0;
+    let snapshot: AppSnapshot | undefined;
+    const transport = remoteTransport((method, input) => {
+      if (method === "beginCredentialUpload") {
+        tickets += 1;
+        return create(BeginCredentialUploadResponseSchema, { ticket: {
+          ticketId: "owned-ticket", relativeEndpoint: "/v1/credential-uploads/owned-ticket", maximumBytes: 1024n
+        } });
+      }
+      if (method !== "submitOperation") throw new Error(`Unexpected method: ${method}`);
+      submissions.push(input);
+      return create(SubmitOperationResponseSchema, { operation: { operationId: input.operationId, state: OperationState.SUCCEEDED } });
+    }, { interactions: [{
+      interactionId: "question", sessionId: "task", kind: InteractionKind.QUESTION, state: InteractionState.PENDING,
+      request: { case: "question", value: { title: "Test credential", fields: [{
+        fieldId: "key", required: true, input: { case: "text", value: { answerHandling: QuestionAnswerHandling.CREDENTIAL_CHANNEL } }
+      }] } }
+    }] });
+    const gateway = createOrchestratorGateway(
+      { id: "credential-consumer", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" },
+      "auth-key", { onSnapshot: (value) => { snapshot = value; } }, () => transport
+    );
+    await gateway.connect();
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      const response = new Response(undefined, { status: 204 });
+      Object.defineProperty(response, "ok", { get: () => { gateway.disconnect(); return true; } });
+      return response;
+    }));
+    const action = consumer === "provider"
+      ? gateway.saveProviderCredentialSurface("backend", "provider", "apiKey", "test-only-secret")
+      : consumer === "interaction"
+        ? gateway.resolveInteraction(snapshot!.interactions[0]!, { kind: "question", answers: { key: "test-only-secret" } })
+        : gateway.updateVoiceInputServiceSettings({
+          enabled: true, protocol: "openAiCompatibleBatch", endpoint: "https://voice.example/transcribe", model: "model", resourceId: "", keyless: false,
+          secret: "test-only-secret", fallbackSecret: "test-only-fallback", fallbackEnabled: true,
+          fallbackProtocol: "openAiCompatibleBatch", fallbackEndpoint: "https://voice.example/fallback", fallbackModel: "fallback", fallbackResourceId: "", fallbackKeyless: false,
+          refinementEnabled: false, expectedRevision: 1n
+        });
+    await expect(action).rejects.toMatchObject({ name: "AbortError" });
+    expect(tickets).toBe(1);
+    expect(submissions).toEqual([]);
     gateway.disconnect();
   });
 
@@ -215,7 +363,7 @@ describe("Remote Host gateway", () => {
   });
 });
 
-function remoteTransport(handler: (method: string, input: any) => unknown): Transport {
+function remoteTransport(handler: (method: string, input: any) => unknown, snapshotFields: { readonly interactions?: MessageInitShape<typeof SnapshotSchema>["interactions"] } = {}): Transport {
   return {
     unary: vi.fn(async (method: any, _signal: unknown, _timeout: unknown, _headers: unknown, input: any) => {
       if (method.localName === "getSnapshot") {
@@ -228,12 +376,14 @@ function remoteTransport(handler: (method: string, input: any) => unknown): Tran
               backendId: "pi",
               displayName: "Project",
               workspaceId: "workspace-one",
+              version: { revision: { value: 7n } },
               remoteWorkspace: { hostId: "build-box", workspaceRootDisplay: "/srv/project" }
-            }]
+            }],
+            ...snapshotFields
           })
         }));
       }
-      return response(method, handler(method.localName, input));
+      return response(method, await handler(method.localName, input));
     }),
     stream: vi.fn(async (method: any) => response(method, idleStream(), true))
   } as unknown as Transport;

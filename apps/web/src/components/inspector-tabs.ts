@@ -1,4 +1,4 @@
-export const INSPECTOR_TAB_KINDS = ["context", "branches", "files", "changes", "background", "subagents", "terminal", "tools", "browser"] as const;
+export const INSPECTOR_TAB_KINDS = ["context", "branches", "files", "changes", "background", "subagents", "shell", "terminal", "tools", "browser"] as const;
 
 export type InspectorTabKind = (typeof INSPECTOR_TAB_KINDS)[number];
 
@@ -31,11 +31,16 @@ export function projectInspectorTabBucket(
   return { tabs, activeTabId };
 }
 
-export function addInspectorTab(bucket: InspectorTabBucket, kind: InspectorTabKind): InspectorTabBucket {
+export function addInspectorTab(bucket: InspectorTabBucket, kind: Exclude<InspectorTabKind, "terminal">): InspectorTabBucket {
   const existing = bucket.tabs.find((tab) => tab.kind === kind);
   if (existing !== undefined) return { ...bucket, activeTabId: existing.id };
   const tab = { id: kind, kind } as const;
   return { tabs: [...bucket.tabs, tab], activeTabId: tab.id };
+}
+
+export function addInspectorTerminalTab(bucket: InspectorTabBucket, terminalId: string): InspectorTabBucket {
+  if (bucket.tabs.some((tab) => tab.id === terminalId)) return { ...bucket, activeTabId: terminalId };
+  return { tabs: [...bucket.tabs, { id: terminalId, kind: "terminal" }], activeTabId: terminalId };
 }
 
 export function activateInspectorTab(bucket: InspectorTabBucket, tabId: string): InspectorTabBucket {
@@ -48,26 +53,6 @@ export function closeInspectorTab(bucket: InspectorTabBucket, tabId: string): In
   const tabs = bucket.tabs.filter((tab) => tab.id !== tabId);
   if (bucket.activeTabId !== tabId) return { ...bucket, tabs };
   return { tabs, activeTabId: tabs[Math.min(index, tabs.length - 1)]?.id };
-}
-
-export function closeOtherInspectorTabs(
-  bucket: InspectorTabBucket,
-  keepTabId: string,
-  visibleTabIds: ReadonlySet<string>
-): InspectorTabBucket {
-  const tabs = bucket.tabs.filter((tab) => tab.id === keepTabId || !visibleTabIds.has(tab.id));
-  return tabs.some((tab) => tab.id === keepTabId)
-    ? { tabs, activeTabId: keepTabId }
-    : bucket;
-}
-
-export function closeVisibleInspectorTabs(
-  bucket: InspectorTabBucket,
-  visibleTabIds: ReadonlySet<string>
-): InspectorTabBucket {
-  const tabs = bucket.tabs.filter((tab) => !visibleTabIds.has(tab.id));
-  const activeTabId = tabs.some((tab) => tab.id === bucket.activeTabId) ? bucket.activeTabId : tabs[0]?.id;
-  return { tabs, activeTabId };
 }
 
 export function reorderVisibleInspectorTabs(
@@ -124,7 +109,7 @@ export function parseInspectorTabBuckets(raw: string | null): InspectorTabBucket
     const kinds = new Set<InspectorTabKind>();
     const ids = new Set<string>();
     for (const rawTab of candidate.tabs) {
-      if (!isRecord(rawTab) || Object.keys(rawTab).sort().join(",") !== "id,kind" || !isInspectorTabKind(rawTab.kind) || kinds.has(rawTab.kind)) return {};
+      if (!isRecord(rawTab) || Object.keys(rawTab).sort().join(",") !== "id,kind" || !isInspectorTabKind(rawTab.kind) || rawTab.kind !== "terminal" && kinds.has(rawTab.kind)) return {};
       if (typeof rawTab.id !== "string" || rawTab.id.length === 0 || rawTab.id.length > 128 || ids.has(rawTab.id)) return {};
       const id = rawTab.id;
       kinds.add(rawTab.kind);

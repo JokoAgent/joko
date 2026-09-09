@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { MULTILINGUAL_FIXTURES } from "./i18n/multilingual-fixtures.js";
 
 import {
   ProviderModelDiscoveryError,
@@ -70,5 +71,38 @@ describe("Provider model discovery", () => {
       baseUrl: "https://api.example.test/v1",
       headers: { Authorization: "Custom safe-vault-value" }
     }, request as typeof fetch)).resolves.toEqual([{ id: "custom-model", name: "custom-model" }]);
+  });
+
+  it("cancels an oversized streaming response without buffering the remaining upstream body", async () => {
+    const cancel = vi.fn();
+    let pulls = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls += 1;
+        controller.enqueue(new Uint8Array(256 * 1024));
+      },
+      cancel
+    }, { highWaterMark: 0 });
+    await expect(fetchProviderModels({
+      baseUrl: "http://127.0.0.1:11434/v1"
+    }, vi.fn(async () => new Response(body)) as typeof fetch))
+      .rejects.toEqual(new ProviderModelDiscoveryError("invalid_response"));
+    expect(pulls).toBe(5);
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(body.locked).toBe(false);
+  });
+
+  it("parses UTF-8 model names split across bounded response chunks", async () => {
+    const bytes = new TextEncoder().encode(JSON.stringify({ data: [{ id: "model", name: MULTILINGUAL_FIXTURES.modelName }] }));
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const byte of bytes) controller.enqueue(Uint8Array.of(byte));
+        controller.close();
+      }
+    });
+    await expect(fetchProviderModels({
+      baseUrl: "http://127.0.0.1:11434/v1"
+    }, vi.fn(async () => new Response(body)) as typeof fetch)).resolves.toEqual([{ id: "model", name: MULTILINGUAL_FIXTURES.modelName }]);
+    expect(body.locked).toBe(false);
   });
 });

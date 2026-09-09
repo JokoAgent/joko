@@ -34,6 +34,7 @@ import {
   PermissionRisk,
   PlanReviewDecisionKind,
   ProviderApiCompatibility,
+  ProviderConfigurationField,
   ProviderCredentialSurfaceCapability,
   ProviderCredentialSurfaceKind,
   ProviderKind,
@@ -141,6 +142,7 @@ import {
   type ProviderCapabilityModelDescriptor,
   type ProviderCredentialSurface,
   type ProviderDescriptor,
+  type ProviderRuntimeSupport,
   type QuestionAnswer,
   QuestionAnswerHandling,
   type QuestionBooleanInput,
@@ -195,6 +197,7 @@ import {
   type RecoverableErrorEvent,
   type CompactionChangedEvent,
   type WorkspaceMention,
+  type WorkspaceLineRange,
   type WorkspaceChangeSet,
   type WorkspaceDescriptor,
   type WorkspaceDiff,
@@ -204,7 +207,7 @@ import {
 } from "@joko/contracts";
 import * as contract from "@joko/contracts";
 import type { CodeHostSessionReferenceProjection } from "@joko/code-host";
-import { redactSecrets, sanitizePublicError } from "@joko/core";
+import { assertAudioArtifactMetadata, redactSecrets, sanitizePublicError, type AudioArtifactMetadata } from "@joko/core";
 import { validatedProviderCredentialSurfaces } from "./provider-credential-surface.js";
 import {
   PROJECT_AUTOMATION_CONFIG_PATH,
@@ -535,6 +538,11 @@ export function toProtoBackend(record: StoredBackend): ProtoBackendDescriptor {
     health: toProtoBackendHealth(backend.health),
     installationState: toProtoBackendInstallationState(backend.installationState),
     authenticationState: toProtoBackendAuthenticationState(backend.authenticationState),
+    providerRuntimeSupport: backend.providerRuntimeSupport === undefined ? undefined
+      : message<ProviderRuntimeSupport>("joko.v1.ProviderRuntimeSupport", {
+        protocols: backend.providerRuntimeSupport.protocols.map(providerApi),
+        fields: backend.providerRuntimeSupport.fields.map((field) => providerConfigurationFields[field])
+      }),
     capabilities: message<CapabilityManifest>("joko.v1.CapabilityManifest", {
       schemaVersion: "joko.core.v1",
       capabilities: [...backend.capabilities.values()].map(toProtoCapability),
@@ -1024,7 +1032,7 @@ export function toProtoBlobRef(blob: BlobRef, createdAt?: number): ProtoBlobRef 
     fileName: blob.fileName ?? "",
     mediaType: blob.mimeType,
     byteSize: unsignedBigInt(blob.byteLength, "blob.byte_size"),
-    sha256Hex: blob.sha256.replace(/^sha256:/u, "").toLowerCase(),
+    sha256Hex: requireSha256(blob.sha256, "blob.sha256_hex"),
     createdAt: optionalTimestamp(createdAt),
     expiresAt: undefined,
     disposition: BlobDisposition.ATTACHMENT
@@ -1070,7 +1078,8 @@ export function toProtoInputContent(input: PromptInput): InputContent {
     }));
   }
   for (const mention of input.mentions) {
-    if (mention.kind === "workspace_file") {
+    if (mention.kind === "workspace_file" || mention.kind === "workspace_directory") {
+      const range = checkedWorkspaceMentionRange(mention.lineRange, mention.kind === "workspace_directory");
       parts.push(message<InputPart>("joko.v1.InputPart", {
         content: {
           case: "workspaceMention",
@@ -1078,7 +1087,9 @@ export function toProtoInputContent(input: PromptInput): InputContent {
             workspaceId: "",
             relativePath: mention.reference,
             displayText: mention.label,
-            revision: undefined
+            revision: undefined,
+            directory: mention.kind === "workspace_directory",
+            lineRange: range === undefined ? undefined : message<WorkspaceLineRange>("joko.v1.WorkspaceLineRange", range)
           })
         }
       }));
@@ -1137,13 +1148,17 @@ export function fromProtoInputContent(
           reference: part.content.value.resourceId
         });
         break;
-      case "workspaceMention":
+      case "workspaceMention": {
+        const lineRange = checkedWorkspaceMentionRange(part.content.value.lineRange, part.content.value.directory);
         mentions.push({
-          kind: "workspace_file",
+          ...(part.content.value.directory
+            ? { kind: "workspace_directory" as const }
+            : { kind: "workspace_file" as const, ...(lineRange === undefined ? {} : { lineRange }) }),
           label: part.content.value.displayText,
           reference: part.content.value.relativePath
         });
         break;
+      }
       case undefined:
         throw new ProtoMappingError("invalid_argument", "input.parts.content", "Input part content is required.");
     }
@@ -1208,6 +1223,18 @@ function fromProtoSessionDerivationOrigin(
           sourceEventId: requireText(origin.sourceEventId, "session.derivation_origin.source_event_id")
         })
   };
+}
+
+function checkedWorkspaceMentionRange(
+  range: { readonly startLine: number; readonly endLine: number } | undefined,
+  directory: boolean
+): { readonly startLine: number; readonly endLine: number } | undefined {
+  if (range === undefined) return undefined;
+  if (directory || !Number.isInteger(range.startLine) || !Number.isInteger(range.endLine)
+    || range.startLine < 1 || range.endLine < range.startLine || range.endLine > 0xffff_ffff) {
+    throw new ProtoMappingError("invalid_argument", "input.workspace_mention.line_range", "Line ranges require a file and ordered positive source line numbers.");
+  }
+  return { startLine: range.startLine, endLine: range.endLine };
 }
 
 function checkedInlineTextRanges(
@@ -1429,13 +1456,13 @@ function fromProtoReviewEvidence(
     throw new ProtoMappingError("invalid_argument", "review_run.evidence.captured_at", "Review evidence capture time is required.");
   }
   return {
-    sealSha256: requireSha256(value.sealSha256Hex, "review_run.evidence.seal_sha256_hex").slice(7),
+    sealSha256: requireSha256(value.sealSha256Hex, "review_run.evidence.seal_sha256_hex"),
     sourceRevision: {
       version: 1,
-      conversationSha256: requireSha256(source.conversationSha256Hex, "review_run.evidence.source_revision.conversation_sha256_hex").slice(7),
-      workspaceSha256: requireSha256(source.workspaceSha256Hex, "review_run.evidence.source_revision.workspace_sha256_hex").slice(7),
-      filesSha256: requireSha256(source.filesSha256Hex, "review_run.evidence.source_revision.files_sha256_hex").slice(7),
-      artifactsSha256: requireSha256(source.artifactsSha256Hex, "review_run.evidence.source_revision.artifacts_sha256_hex").slice(7)
+      conversationSha256: requireSha256(source.conversationSha256Hex, "review_run.evidence.source_revision.conversation_sha256_hex"),
+      workspaceSha256: requireSha256(source.workspaceSha256Hex, "review_run.evidence.source_revision.workspace_sha256_hex"),
+      filesSha256: requireSha256(source.filesSha256Hex, "review_run.evidence.source_revision.files_sha256_hex"),
+      artifactsSha256: requireSha256(source.artifactsSha256Hex, "review_run.evidence.source_revision.artifacts_sha256_hex")
     },
     targetKind,
     capturedAt
@@ -1494,7 +1521,8 @@ function toProtoMessageBlock(block: CoreMessageBlock): contract.MessageBlock {
           case: "artifact",
           value: message<contract.MessageArtifactBlock>("joko.v1.MessageArtifactBlock", {
             blob: toProtoBlobRef(block.blob),
-            label: block.label
+            label: block.label,
+            audioMetadata: toProtoAudioMetadata(block.audioMetadata)
           })
         }
       });
@@ -1552,7 +1580,8 @@ function fromProtoMessageBlock(block: contract.MessageBlock): CoreMessageBlock {
       return {
         kind: "artifact",
         blob: fromProtoBlobRef(artifact.blob),
-        label: artifact.label
+        label: artifact.label,
+        ...(artifact.audioMetadata === undefined ? {} : { audioMetadata: fromProtoAudioMetadata(artifact.audioMetadata) })
       };
     }
     case "toolCall":
@@ -1948,13 +1977,16 @@ export function fromProtoInteractionDecision(resolution: InteractionResolution):
 
 export function toProtoArtifact(record: ArtifactRecord): Artifact {
   const metadata = objectValue(record.metadata);
+  const audio = metadata?.["audio"];
+  if (audio !== undefined) assertAudioArtifactMetadata(audio);
   return message<Artifact>("joko.v1.Artifact", {
     artifactId: record.blob.id,
     sessionId: record.sessionId ?? "",
     runId: record.runId ?? "",
     kind: artifactKind(stringField(metadata, "kind"), record.blob.mimeType),
-    title: record.blob.fileName ?? stringField(metadata, "title") ?? record.blob.id,
-    description: stringField(metadata, "description") ?? "",
+    title: audio?.title || stringField(metadata, "title") || record.blob.fileName || record.blob.id,
+    description: audio?.description ?? stringField(metadata, "description") ?? "",
+    audioMetadata: toProtoAudioMetadata(audio),
     blob: {
       ...toProtoBlobRef(record.blob, record.createdAt),
       disposition: BlobDisposition.ARTIFACT
@@ -2685,7 +2717,7 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
       }));
     case "artifact": {
       const artifact = context.artifact === undefined
-        ? artifactFromBlob(payload.artifact, event, payload.purpose)
+        ? artifactFromBlob(payload.artifact, event, payload.purpose, payload.audioMetadata)
         : toProtoArtifact(context.artifact);
       return protoPayload("artifactProduced", message<ArtifactProducedEvent>("joko.v1.ArtifactProducedEvent", {
         artifact
@@ -3134,7 +3166,8 @@ function fromProtoEventPayload(
       return {
         type: "artifact",
         artifact: fromProtoBlobRef(artifact.blob),
-        purpose: artifact.description || artifact.title || "artifact"
+        purpose: artifact.description || artifact.title || "artifact",
+        ...(artifact.audioMetadata === undefined ? {} : { audioMetadata: fromProtoAudioMetadata(artifact.audioMetadata) })
       };
     }
     case "workspaceDiffProduced": {
@@ -3903,11 +3936,10 @@ function requireText(value: string, fieldPath: string): string {
 }
 
 function requireSha256(value: string, fieldPath: string): string {
-  const normalized = value.replace(/^sha256:/u, "").toLowerCase();
-  if (!/^[a-f0-9]{64}$/u.test(normalized)) {
+  if (!/^[a-f0-9]{64}$/u.test(value)) {
     throw new ProtoMappingError("invalid_argument", fieldPath, `${fieldPath} must be a 64-character SHA-256 digest.`);
   }
-  return `sha256:${normalized}`;
+  return value;
 }
 
 function objectValue(value: unknown): Readonly<Record<string, unknown>> {
@@ -3975,11 +4007,27 @@ function costMicros(value: number): bigint {
   return BigInt(Math.round(value * 1_000_000));
 }
 
+const providerConfigurationFields = {
+  request_path: ProviderConfigurationField.REQUEST_PATH,
+  models_endpoint: ProviderConfigurationField.MODELS_ENDPOINT,
+  headers: ProviderConfigurationField.HEADERS,
+  keyless: ProviderConfigurationField.KEYLESS,
+  auth_header: ProviderConfigurationField.AUTH_HEADER,
+  model_limits: ProviderConfigurationField.MODEL_LIMITS,
+  model_costs: ProviderConfigurationField.MODEL_COSTS,
+  model_input_modalities: ProviderConfigurationField.MODEL_INPUT_MODALITIES,
+  model_thinking_levels: ProviderConfigurationField.MODEL_THINKING_LEVELS,
+  model_sampling: ProviderConfigurationField.MODEL_SAMPLING,
+  model_compatibility: ProviderConfigurationField.MODEL_COMPATIBILITY,
+  model_fast_mode: ProviderConfigurationField.MODEL_FAST_MODE
+} satisfies Record<NonNullable<BackendDescriptor["providerRuntimeSupport"]>["fields"][number], ProviderConfigurationField>;
+
 function providerApi(api: ProviderModel["api"]): ProviderApiCompatibility {
   switch (api) {
     case "anthropic-messages": return ProviderApiCompatibility.ANTHROPIC_MESSAGES;
     case "openai-responses": return ProviderApiCompatibility.OPENAI_RESPONSES;
     case "openai-completions": return ProviderApiCompatibility.OPENAI_COMPLETIONS;
+    case "google-generative-ai": return ProviderApiCompatibility.GOOGLE_GENERATIVE_AI;
     default: return ProviderApiCompatibility.NATIVE;
   }
 }
@@ -4288,13 +4336,32 @@ function fromProtoMessageInputDelivery(value: ProtoMessageInputDelivery): CoreMe
   }
 }
 
+export function toProtoNativeNavigationTarget(value: import("@joko/core").NativeNavigationTarget): contract.NativeNavigationTarget {
+  return message<contract.NativeNavigationTarget>("joko.v1.NativeNavigationTarget", {
+    kind: value.kind === "session_start"
+      ? { case: "sessionStart", value: message("joko.v1.SessionStartTarget", {}) }
+      : { case: "nativeEntryId", value: requireText(value.entryId, "native_navigation_target.native_entry_id") }
+  });
+}
+
+export function fromProtoNativeNavigationTarget(value: contract.NativeNavigationTarget | undefined): import("@joko/core").NativeNavigationTarget {
+  if (value?.kind.case === "sessionStart") return { kind: "session_start" };
+  if (value?.kind.case === "nativeEntryId") {
+    const entryId = requireText(value.kind.value, "native_navigation_target.native_entry_id");
+    if (entryId.length > 4_096 || /[\u0000-\u001f\u007f]/u.test(entryId)) throw new Error("Native navigation entry ID is invalid.");
+    return { kind: "native_entry", entryId };
+  }
+  throw new Error("A native navigation target is required.");
+}
+
 function toProtoNativeMessageIdentity(
   value: CoreNativeMessageIdentity | undefined
 ): ProtoNativeMessageIdentity | undefined {
   if (value === undefined) return undefined;
   return message<ProtoNativeMessageIdentity>("joko.v1.NativeMessageIdentity", {
     entryId: requireText(value.entryId, "event.payload.native_identity.entry_id"),
-    parentEntryId: value.parentEntryId ?? ""
+    parentEntryId: value.parentEntryId ?? "",
+    ...(value.rewindBefore === undefined ? {} : { rewindBefore: toProtoNativeNavigationTarget(value.rewindBefore) })
   });
 }
 
@@ -4304,7 +4371,8 @@ function fromProtoNativeMessageIdentity(
   if (value === undefined) return undefined;
   return {
     entryId: requireText(value.entryId, "event.payload.native_identity.entry_id"),
-    ...(value.parentEntryId === "" ? {} : { parentEntryId: value.parentEntryId })
+    ...(value.parentEntryId === "" ? {} : { parentEntryId: value.parentEntryId }),
+    ...(value.rewindBefore === undefined ? {} : { rewindBefore: fromProtoNativeNavigationTarget(value.rewindBefore) })
   };
 }
 
@@ -5190,7 +5258,8 @@ function protoToolResultPart(part: CoreToolResultContentPart): ToolResultPart {
             artifactId: part.blob.id,
             blob: toProtoBlobRef(part.blob),
             kind: ArtifactKind.TOOL_RESULT,
-            title: part.label
+            title: part.label,
+            audioMetadata: toProtoAudioMetadata(part.audioMetadata)
           })
         }
       });
@@ -5222,7 +5291,8 @@ function coreToolResultParts(result: ToolResult | undefined): readonly CoreToolR
           parts.push({
             kind: "artifact",
             blob: fromProtoBlobRef(blob),
-            label: part.content.value.title || part.content.value.artifactId
+            label: part.content.value.title || part.content.value.artifactId,
+            ...(part.content.value.audioMetadata === undefined ? {} : { audioMetadata: fromProtoAudioMetadata(part.content.value.audioMetadata) })
           });
         }
         break;
@@ -5265,18 +5335,40 @@ function toolOutput(result: ToolResult | undefined): string {
   }).join("");
 }
 
-function artifactFromBlob(blob: BlobRef, event: PersistedEvent, purpose: string): Artifact {
+function artifactFromBlob(blob: BlobRef, event: PersistedEvent, purpose: string, audio?: AudioArtifactMetadata): Artifact {
   return message<Artifact>("joko.v1.Artifact", {
     artifactId: blob.id,
     sessionId: event.sessionId,
     runId: event.runId ?? "",
     kind: artifactKind(undefined, blob.mimeType),
-    title: blob.fileName ?? blob.id,
-    description: purpose,
+    title: audio?.title || blob.fileName || blob.id,
+    description: audio?.description ?? purpose,
+    audioMetadata: toProtoAudioMetadata(audio),
     blob: { ...toProtoBlobRef(blob, event.emittedAt), disposition: BlobDisposition.ARTIFACT },
     createdAt: toProtoTimestamp(event.emittedAt),
     expiresAt: undefined
   });
+}
+
+function toProtoAudioMetadata(audio: AudioArtifactMetadata | undefined): contract.AudioArtifactMetadata | undefined {
+  if (audio === undefined) return undefined;
+  assertAudioArtifactMetadata(audio);
+  return message<contract.AudioArtifactMetadata>("joko.v1.AudioArtifactMetadata", {
+    kind: audio.kind === "music" ? contract.AudioArtifactKind.MUSIC : audio.kind === "sound_effect" ? contract.AudioArtifactKind.SOUND_EFFECT : contract.AudioArtifactKind.GENERIC,
+    title: audio.title, description: audio.description, durationSeconds: audio.durationSeconds,
+    artwork: audio.artwork === undefined ? undefined : message<ImageRef>("joko.v1.ImageRef", { blob: toProtoBlobRef(audio.artwork.blob), widthPixels: audio.artwork.width, heightPixels: audio.artwork.height, altText: audio.artwork.alt })
+  });
+}
+
+function fromProtoAudioMetadata(audio: contract.AudioArtifactMetadata): AudioArtifactMetadata {
+  const value = {
+    kind: audio.kind === contract.AudioArtifactKind.GENERIC ? "generic" : audio.kind === contract.AudioArtifactKind.MUSIC ? "music" : audio.kind === contract.AudioArtifactKind.SOUND_EFFECT ? "sound_effect" : undefined,
+    title: audio.title, description: audio.description,
+    ...(audio.durationSeconds === undefined ? {} : { durationSeconds: audio.durationSeconds }),
+    ...(audio.artwork === undefined ? {} : { artwork: { blob: audio.artwork.blob === undefined ? undefined : fromProtoBlobRef(audio.artwork.blob), width: audio.artwork.widthPixels, height: audio.artwork.heightPixels, alt: audio.artwork.altText } })
+  };
+  assertAudioArtifactMetadata(value);
+  return value;
 }
 
 export function toProtoSubagentRun(

@@ -32,6 +32,9 @@ describe("WorkspaceFileBody", () => {
     expect(workspaceFileBodyKind("scene.gltf", textPreview("scene.gltf"))).toBe("model");
     expect(workspaceFileBodyKind("manual.bin", binaryPreview("manual.bin", "blob", "application/pdf"))).toBe("pdf");
     expect(workspaceFileBodyKind("demo.MOV", binaryPreview("demo.MOV", "blob", "video/quicktime"))).toBe("video");
+    expect(workspaceFileBodyKind("demo.M4A", binaryPreview("demo.M4A", "blob", "application/octet-stream"))).toBe("audio");
+    expect(workspaceFileBodyKind("sound.bin", binaryPreview("sound.bin", "blob", "audio/ogg; codecs=opus"))).toBe("audio");
+    expect(workspaceFileBodyKind("sound.mp3", textPreview("sound.mp3"))).toBe("text");
     expect(workspaceFileBodyKind("archive.zip", binaryPreview("archive.zip", "binary", "application/zip"))).toBe("binary");
   });
 

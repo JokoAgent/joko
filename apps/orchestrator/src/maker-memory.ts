@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { MEMORY_SAVE_REQUEST_PREFIXES } from "./i18n/orchestration-language.js";
 
 import type {
   MakerMemoryEntry,
@@ -29,7 +30,7 @@ Save only durable information worth recalling later:
 - project: durable decisions, constraints, or deadlines for this workspace
 - reference: pointers to external systems or documentation
 
-Do not save code structure, Git history, instructions already present in repository guidance, transient task progress, raw tool output, or credentials. Search before creating a related entry and update the existing entry instead of making a duplicate. A message beginning with "Save in memory:" or "记到 memory:" is an explicit request to evaluate and save the remainder.
+Do not save code structure, Git history, instructions already present in repository guidance, transient task progress, raw tool output, or credentials. Search before creating a related entry and update the existing entry instead of making a duplicate. A message beginning with ${MEMORY_SAVE_REQUEST_PREFIXES.map((prefix) => `"${prefix}"`).join(" or ")} is an explicit request to evaluate and save the remainder.
 
 Compression digests are private search-only history. They never appear in this automatic index and cannot be written through memory_write.`;
 

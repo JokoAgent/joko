@@ -83,6 +83,7 @@ describe("extension UI controller effects", () => {
       kind: "editorText",
       text: "visible editor text"
     }, local, (update) => { state = update(state); }, {
+      serverId: "server-a",
       isCurrent: () => true,
       isLatestEditorEffect: () => true
     });
@@ -121,12 +122,13 @@ describe("extension UI controller effects", () => {
       kind: "editorText",
       text: "replacement text"
     }, local, (update) => { state = update(state); }, {
+      serverId: "server-a",
       isCurrent: () => true,
       isLatestEditorEffect: () => true
     });
     await vi.waitFor(() => expect(state.extensionNotifications).toHaveLength(1));
 
-    expect(saveDraft).toHaveBeenCalledWith("session-a", {
+    expect(saveDraft).toHaveBeenCalledWith("server-a", "session-a", {
       ...draft,
       text: "replacement text"
     });
@@ -165,6 +167,7 @@ describe("extension UI controller effects", () => {
       kind: "editorText",
       text: "new draft"
     }, local, update, {
+      serverId: "server-a",
       isCurrent: () => generationCurrent,
       isLatestEditorEffect: () => latestEditorEffect
     });

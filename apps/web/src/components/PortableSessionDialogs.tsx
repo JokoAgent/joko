@@ -1,8 +1,9 @@
 import { Eye, EyeOff, LoaderCircle, ShieldAlert } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { JSX } from "react";
 
 import type {
+  ArtifactDownloadContext,
   PortableSessionExecutionSelection,
   PortableSessionActivationResultView,
   PortableSessionExportOutcomeView,
@@ -16,6 +17,7 @@ import { Button, IconButton, Modal, cx, CheckboxControl, SelectControl } from ".
 import "./PortableSessionDialogs.css";
 
 export type {
+  ArtifactDownloadContext,
   PortableSessionExecutionSelection,
   PortableSessionImportDraftView,
   PortableSessionImportPreviewView,
@@ -76,12 +78,14 @@ export function PortableSessionExportDialog({
   labels,
   onClose,
   onExport,
+  connectionOwner,
   onExported
 }: {
   readonly open: boolean;
   readonly labels: PortableSessionDialogLabels;
   readonly onClose: () => void;
-  readonly onExport: (input: { readonly password?: string; readonly excludeMedia: boolean }) => Promise<PortableSessionExportOutcome>;
+  readonly onExport: (input: { readonly password?: string; readonly excludeMedia: boolean }, context: ArtifactDownloadContext) => Promise<PortableSessionExportOutcome>;
+  readonly connectionOwner: unknown;
   readonly onExported: (fidelity: PortableSessionFidelity) => void;
 }): JSX.Element {
   const [encrypt, setEncrypt] = useState(false);
@@ -93,9 +97,12 @@ export function PortableSessionExportDialog({
   const [oversizeMediaMb, setOversizeMediaMb] = useState<number>();
   const [error, setError] = useState<string>();
   const passwordRef = useRef<HTMLInputElement>(null);
+  const scopeRef = useRef<object | undefined>(undefined);
+  const requestRef = useRef<AbortController | undefined>(undefined);
 
-  useEffect(() => {
-    if (!open) return;
+  useLayoutEffect(() => {
+    const scope = {};
+    scopeRef.current = open ? scope : undefined;
     setEncrypt(false);
     setPassword("");
     setConfirmation("");
@@ -104,7 +111,12 @@ export function PortableSessionExportDialog({
     setExcludeMedia(false);
     setOversizeMediaMb(undefined);
     setError(undefined);
-  }, [open]);
+    return () => {
+      if (scopeRef.current === scope) scopeRef.current = undefined;
+      requestRef.current?.abort();
+      requestRef.current = undefined;
+    };
+  }, [open, connectionOwner]);
 
   useEffect(() => {
     if (encrypt) passwordRef.current?.focus();
@@ -114,15 +126,23 @@ export function PortableSessionExportDialog({
   const tooShort = encrypt && password.length > 0 && password.length < 4;
   const canSubmit = !busy && (!encrypt || (password.length >= 4 && password === confirmation));
   const close = (): void => { if (!busy) onClose(); };
-  const submit = async (): Promise<void> => {
-    if (!canSubmit) return;
+  const submit = async (ownerDocument: Document): Promise<void> => {
+    const scope = scopeRef.current;
+    if (!canSubmit || scope === undefined || requestRef.current !== undefined) return;
+    const request = new AbortController();
+    requestRef.current = request;
+    const current = (): boolean => scopeRef.current === scope && requestRef.current === request && !request.signal.aborted;
+    const ownerWindow = ownerDocument.defaultView;
+    const retire = (): void => { request.abort(); if (requestRef.current === request) { requestRef.current = undefined; setBusy(false); } };
+    ownerWindow?.addEventListener("pagehide", retire, { once: true });
     setBusy(true);
     setError(undefined);
     try {
       const result = await onExport({
         ...(encrypt ? { password } : {}),
         excludeMedia
-      });
+      }, { ownerDocument, signal: request.signal });
+      if (!current()) return;
       if (result.status === "cancelled") return;
       if (result.status === "oversize") {
         if (result.mediaBytes > 0 && !excludeMedia) {
@@ -136,9 +156,10 @@ export function PortableSessionExportDialog({
       onExported(result.fidelity);
       onClose();
     } catch {
-      setError(labels.exportFailed);
+      if (current()) setError(labels.exportFailed);
     } finally {
-      setBusy(false);
+      ownerWindow?.removeEventListener("pagehide", retire);
+      if (current()) { requestRef.current = undefined; setBusy(false); }
     }
   };
 
@@ -188,7 +209,7 @@ export function PortableSessionExportDialog({
       {error !== undefined && <p className="portable-session-form__error" role="alert">{error}</p>}
       <div className="modal__actions">
         <Button disabled={busy} onClick={close}>{labels.cancel}</Button>
-        <Button tone="primary" disabled={!canSubmit} onClick={() => void submit()}>
+        <Button tone="primary" disabled={!canSubmit} onClick={(event) => void submit(event.currentTarget.ownerDocument)}>
           {busy && <LoaderCircle className="is-spinning" aria-hidden="true" />}
           {excludeMedia ? labels.exportWithoutMedia : labels.export}
         </Button>
@@ -253,6 +274,8 @@ export function PortableSessionImportDialog({
   const defaultTargetIdRef = useRef(defaultTargetId);
   const openRef = useRef(open);
   const passwordRef = useRef<HTMLInputElement>(null);
+  const scopeRef = useRef<object | undefined>(undefined);
+  const requestRef = useRef<AbortController | undefined>(undefined);
   const fileRef = useRef<HTMLInputElement>(null);
   cancelDraftRef.current = onCancelDraft;
   targetOptionsRef.current = targets;

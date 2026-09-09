@@ -9,11 +9,14 @@ import {
   InteractionService,
   OperationService,
   PiService,
+  PortableSessionService,
   QueueService,
   RunService,
   SchedulerService,
   SessionService,
+  SettingsService,
   TargetService,
+  TerminalService,
   ToolService,
   WorkspaceService as WorkspaceContractService
 } from "@joko/contracts";
@@ -25,6 +28,8 @@ export interface E2eClients {
   readonly backend: Client<typeof BackendService>;
   readonly target: Client<typeof TargetService>;
   readonly session: Client<typeof SessionService>;
+  readonly portableSession: Client<typeof PortableSessionService>;
+  readonly settings: Client<typeof SettingsService>;
   readonly run: Client<typeof RunService>;
   readonly queue: Client<typeof QueueService>;
   readonly scheduler: Client<typeof SchedulerService>;
@@ -34,6 +39,7 @@ export interface E2eClients {
   readonly tool: Client<typeof ToolService>;
   readonly browser: Client<typeof BrowserService>;
   readonly pi: Client<typeof PiService>;
+  readonly terminal: Client<typeof TerminalService>;
 }
 
 export interface PairedClient {
@@ -64,6 +70,8 @@ export function createE2eClients(baseUrl: string, authKey?: string, timeoutMs = 
     backend: createClient(BackendService, transport),
     target: createClient(TargetService, transport),
     session: createClient(SessionService, transport),
+    portableSession: createClient(PortableSessionService, transport),
+    settings: createClient(SettingsService, transport),
     run: createClient(RunService, transport),
     queue: createClient(QueueService, transport),
     scheduler: createClient(SchedulerService, transport),
@@ -72,6 +80,7 @@ export function createE2eClients(baseUrl: string, authKey?: string, timeoutMs = 
     artifact: createClient(ArtifactService, transport),
     tool: createClient(ToolService, transport),
     browser: createClient(BrowserService, transport),
-    pi: createClient(PiService, transport)
+    pi: createClient(PiService, transport),
+    terminal: createClient(TerminalService, transport)
   };
 }

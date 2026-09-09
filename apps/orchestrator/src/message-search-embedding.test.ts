@@ -35,11 +35,18 @@ describe("MessageSearchEmbeddingCoordinator", () => {
     const store = fixtureStore();
     const fetch = successfulFetch();
     let routeAvailable = false;
+    let foreignRouteAvailable = false;
+    const resolveOpenAiEmbeddingRoute = vi.fn((_modelId: string, selection?: { readonly backendId: string; readonly providerId: string }) => {
+      const original = embeddingProviders().resolveOpenAiEmbeddingRoute();
+      const candidates = [
+        ...(routeAvailable ? [original] : []),
+        ...(foreignRouteAvailable ? [{ ...original, backendId: "foreign-backend", generationId: "foreign-generation", endpoint: "https://foreign.example/embeddings" }] : [])
+      ].filter((route) => selection === undefined || route.backendId === selection.backendId && route.providerId === selection.providerId);
+      return candidates.length === 1 ? candidates[0] : undefined;
+    });
     const coordinator = new MessageSearchEmbeddingCoordinator({
       store,
-      providers: {
-        resolveOpenAiEmbeddingRoute: () => routeAvailable ? embeddingProviders().resolveOpenAiEmbeddingRoute() : undefined
-      },
+      providers: { resolveOpenAiEmbeddingRoute },
       fetch,
       setInterval: (() => ({ unref() {} })) as unknown as typeof globalThis.setInterval,
       clearInterval: (() => undefined) as unknown as typeof globalThis.clearInterval
@@ -55,7 +62,7 @@ describe("MessageSearchEmbeddingCoordinator", () => {
 
     routeAvailable = true;
     await coordinator.drain();
-    expect(coordinator.status()).toEqual(expect.objectContaining({ enabled: true, pendingCount: 0, doneCount: 0 }));
+    expect(coordinator.status()).toEqual(expect.objectContaining({ enabled: true, backendId: "embedding-backend", providerId: "embedding-provider", pendingCount: 0, doneCount: 0 }));
     appendMessage(store, "event-after-route", "session-a", 20, "eligible after the availability cutoff");
     await coordinator.drain();
     expect(coordinator.status()).toEqual(expect.objectContaining({ enabled: true, pendingCount: 0, doneCount: 1 }));
@@ -63,6 +70,7 @@ describe("MessageSearchEmbeddingCoordinator", () => {
 
     appendMessage(store, "event-accepted-before-loss", "session-a", 30, "accepted before capability loss");
     routeAvailable = false;
+    foreignRouteAvailable = true;
     coordinator.reconcileAvailability();
     expect(coordinator.configuredEnabled()).toBe(true);
     expect(coordinator.status()).toEqual(expect.objectContaining({ enabled: false, pendingCount: 1, doneCount: 1 }));
@@ -78,6 +86,8 @@ describe("MessageSearchEmbeddingCoordinator", () => {
     await coordinator.drain();
     expect(coordinator.status()).toEqual(expect.objectContaining({ enabled: true, pendingCount: 0, doneCount: 3 }));
     expect(fetch).toHaveBeenCalledTimes(3);
+    expect(resolveOpenAiEmbeddingRoute).toHaveBeenLastCalledWith("voyage/voyage-4", { backendId: "embedding-backend", providerId: "embedding-provider" });
+    expect(vi.mocked(fetch).mock.calls.every(([url]) => String(url).startsWith("https://embedding.example/"))).toBe(true);
     await coordinator.stop();
   });
 
@@ -223,6 +233,8 @@ describe("MessageSearchEmbeddingCoordinator", () => {
     await coordinator.drain();
 
     expect(coordinator.status()).toEqual(expect.objectContaining({ enabled: false, pendingCount: 0 }));
+    expect(coordinator.status().backendId).toBeUndefined();
+    expect(coordinator.status().providerId).toBeUndefined();
     expect(fetch).not.toHaveBeenCalled();
     await coordinator.stop();
   });
@@ -244,6 +256,7 @@ describe("MessageSearchEmbeddingCoordinator", () => {
 
   it("recovers a lease after an early restart and rejects the stale claimant", async () => {
     const store = fixtureStore();
+    store.bindMessageEmbeddingProvider("embedding-backend", "embedding-provider", EMBEDDING_GENERATION_ID);
     store.setMessageEmbeddingEnabled(true);
     appendMessage(store, "event-crashed", "session-a", 10, "recover after lease expiry");
     const [stale] = store.claimMessageEmbeddingJobs(1, 100);
@@ -313,6 +326,7 @@ describe("MessageSearchEmbeddingCoordinator", () => {
       store,
       providers: {
         resolveOpenAiEmbeddingRoute: () => ({
+          backendId: "embedding-backend",
           providerId: "embedding-provider",
           generationId: EMBEDDING_GENERATION_ID,
           modelId: "voyage/voyage-4",
@@ -349,6 +363,7 @@ function coordinatorFor(store: OperationalStore, fetch: typeof globalThis.fetch)
 function embeddingProviders() {
   return {
     resolveOpenAiEmbeddingRoute: () => ({
+      backendId: "embedding-backend",
       providerId: "embedding-provider",
       generationId: EMBEDDING_GENERATION_ID,
       modelId: "voyage/voyage-4",

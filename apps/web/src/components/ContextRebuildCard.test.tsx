@@ -26,8 +26,8 @@ afterEach(async () => {
 describe("ContextRebuildCard", () => {
   it("localizes the durable rebuild reason without gateway-authored display text", () => {
     expect(contextRebuildTimelineCopy(contextRebuildItem("contextOverflow"), english).label).toBe("Context reorganized, continuing");
-    expect(contextRebuildTimelineCopy(contextRebuildItem("promptTimeout"), chinese).label).toBe("上一轮没有响应，已整理后继续");
-    expect(contextRebuildTimelineCopy(contextRebuildItem("contextOverflow"), chinese).handoffTitle).toContain("原文为英文");
+    expect(contextRebuildTimelineCopy(contextRebuildItem("promptTimeout"), chinese).label).toBe(chinese("timeline.contextRebuildLabelTimeout"));
+    expect(contextRebuildTimelineCopy(contextRebuildItem("contextOverflow"), chinese).handoffTitle).toBe(chinese("timeline.contextRebuildHandoffTitleEnglishSource"));
   });
 
   it("renders a collapsed system separator and reveals only its handoff panel on demand", async () => {

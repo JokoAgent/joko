@@ -28,6 +28,23 @@ afterEach(async () => {
 });
 
 describe("MCP server editor", () => {
+  it("selects SSE explicitly and keeps its endpoint and header bindings when editing", async () => {
+    const onSave = vi.fn(async (_draft: McpServerDraft) => undefined);
+    const { container } = await mount({ onSave });
+    const label = [...container.querySelectorAll("label")].find((item) => item.querySelector("span")?.textContent === "Transport")!;
+    const select = required(label.querySelector<HTMLSelectElement>("select"));
+    await act(async () => { select.value = "sse"; select.dispatchEvent(new Event("change", { bubbles: true })); });
+    await changeInput(inputForLabel(container, "Endpoint"), "https://mcp.example.test/events");
+    expect(container.textContent).not.toContain("Arguments (JSON array)");
+    await act(async () => required(container.querySelector<HTMLButtonElement>('button[type="submit"]')).click());
+    expect(onSave).toHaveBeenCalledOnce();
+    expect(onSave.mock.calls[0]![0]).toMatchObject({
+      transport: "sse", endpoint: "https://mcp.example.test/events",
+      credentialBindings: [{ target: "header", name: "MCP_TOKEN" }, { target: "header", name: "MCP_TENANT" }]
+    });
+    expect(mcpServerDraft({ ...server(), transport: "sse", endpoint: "https://mcp.example.test/events" }).transport).toBe("sse");
+  });
+
   it("round-trips the saved ID, revision, arguments, environment, and ordered bindings", async () => {
     const drafts: McpServerDraft[] = [];
     const onSave = vi.fn(async (draft: McpServerDraft) => { drafts.push(draft); });
@@ -94,7 +111,7 @@ describe("MCP server editor", () => {
     expect(container.querySelector('[role="dialog"]')).not.toBeNull();
   });
 
-  it("fences a pending save outcome after explicit back navigation", async () => {
+  it.each(["back", "pagehide"] as const)("fences one pending save after %s", async (retirement) => {
     let resolveSave!: () => void;
     const pending = new Promise<void>((resolve) => { resolveSave = resolve; });
     const onSave = vi.fn(() => pending);
@@ -102,13 +119,49 @@ describe("MCP server editor", () => {
     const onSaved = vi.fn();
     const { container } = await mount({ onSave, onClose, onSaved });
 
-    await act(async () => required(container.querySelector<HTMLButtonElement>('button[type="submit"]')).click());
+    await act(async () => {
+      const form = required(container.querySelector("form"));
+      form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    });
+    expect(onSave).toHaveBeenCalledOnce();
     const back = container.querySelector<HTMLButtonElement>('.modal__header button[aria-label="Back"]');
-    await act(async () => required(back).click());
+    await act(async () => {
+      if (retirement === "back") required(back).click();
+      else window.dispatchEvent(new Event("pagehide"));
+    });
     await act(async () => resolveSave());
 
     expect(onClose).toHaveBeenCalledOnce();
     expect(onSaved).not.toHaveBeenCalled();
+  });
+
+  it("retires the editor on connection replacement without focusing its recycled trigger or closing a newer edit", async () => {
+    let finish!: () => void;
+    const save = new Promise<void>((resolve) => { finish = resolve; });
+    const oldSave = vi.fn(() => save);
+    const snapshot = emptySnapshot();
+    const configured = { ...snapshot, settings: { ...snapshot.settings, credentials, mcpServers: [server()] } };
+    const container = document.body.appendChild(document.createElement("div"));
+    const root = createRoot(container); roots.push(root);
+    const render = (saveMcpServer: AppController["saveMcpServer"]) => act(async () => root.render(<McpSettings
+      controller={{ saveMcpServer } as AppController} snapshot={configured} runAction={() => undefined} t={(key, values) => translate("en", key, values)}
+    />));
+    await render(oldSave);
+    const trigger = required(container.querySelector<HTMLButtonElement>('[aria-label="Edit Saved server"]'));
+    await act(async () => trigger.click());
+    const focus = vi.spyOn(trigger, "focus");
+    await act(async () => required(container.querySelector<HTMLButtonElement>('button[type="submit"]')).click());
+    const nextSave = vi.fn(async (_draft: McpServerDraft) => undefined);
+    await render(nextSave);
+    expect(container.querySelector('[role="dialog"]')).toBeNull();
+    expect(focus).not.toHaveBeenCalled();
+    await act(async () => trigger.click());
+    await changeInput(inputForLabel(container, "Display name"), "New connection draft");
+    await act(async () => finish());
+    expect(inputForLabel(container, "Display name").value).toBe("New connection draft");
+    expect(nextSave).not.toHaveBeenCalled();
+    focus.mockRestore();
   });
 
   it("closes an untouched edit without submitting any mutation", async () => {
@@ -141,6 +194,8 @@ async function mount(overrides: Partial<{
   const root = createRoot(container);
   roots.push(root);
   await act(async () => root.render(<McpServerEditor
+    returnFocus={document.body.appendChild(document.createElement("button"))}
+    isCurrent={() => true}
     server={server()}
     credentials={credentials}
     t={(key, values) => translate("en", key, values)}

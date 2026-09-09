@@ -59,13 +59,30 @@ export class SshConfigDocument {
     const scope = validateOwnerScope(options);
     const defaultUser = validateField(options.defaultUser, "defaultUser", 256);
     const hosts: RemoteSshConfigHost[] = [];
+    const seen = new Set<string>();
+    if (this.#parsed.lines.some(({ directive }) => directive !== undefined && ["include", "match"].includes(directive.name.toLowerCase()))) {
+      throw new RemoteSshError("CONFIG_INVALID", "Conditional and included SSH configuration cannot be imported. Configure the connection explicitly.", false);
+    }
     for (const block of this.#parsed.blocks) {
-      const directives = blockDirectives(this.#parsed, block);
       for (const alias of block.aliases) {
-        if (!isConcreteAlias(alias)) continue;
-        const hostname = firstDirective(directives, "hostname") ?? alias;
-        const user = firstDirective(directives, "user") ?? defaultUser;
-        const port = parseImportedPort(firstDirective(directives, "port"));
+        if (!isConcreteAlias(alias) || seen.has(alias.toLowerCase())) continue;
+        seen.add(alias.toLowerCase());
+        const directives = effectiveHostDirectives(this.#parsed, alias);
+        for (const name of ["proxyjump", "proxycommand", "identityfile", "certificatefile", "identityagent", "identitiesonly", "canonicalizehostname", "hostkeyalias"]) {
+          const candidates = name === "identityfile" || name === "certificatefile"
+            ? directives.filter((directive) => directive.name.toLowerCase() === name).map((directive) => importedDirective([directive], name))
+            : [importedDirective(directives, name)];
+          const inactive = name === "identitiesonly" || name === "canonicalizehostname" ? "no" : "none";
+          if (candidates.some((value) => value !== undefined && (name === "hostkeyalias" || value.toLowerCase() !== inactive))) {
+            throw new RemoteSshError("CONFIG_INVALID", "SSH routing or identity options require an explicitly configured connection.", false);
+          }
+        }
+        const hostname = importedDirective(directives, "hostname") ?? alias;
+        const user = importedDirective(directives, "user") ?? defaultUser;
+        if (hostname.includes("%") || user.includes("%")) {
+          throw new RemoteSshError("CONFIG_INVALID", "SSH token expansion requires an explicitly configured connection.", false);
+        }
+        const port = parseImportedPort(importedDirective(directives, "port"));
         hosts.push(Object.freeze({
           ...scope,
           id: alias,
@@ -344,6 +361,31 @@ function firstDirective(directives: readonly ParsedDirective[], name: string): s
   return directives.find((directive) => directive.name.toLowerCase() === name)?.value;
 }
 
+function effectiveHostDirectives(parsed: ParsedDocument, alias: string): readonly ParsedDirective[] {
+  const result: ParsedDirective[] = [];
+  let matches = true;
+  for (const { directive } of parsed.lines) {
+    if (directive === undefined) continue;
+    if (directive.name.toLowerCase() === "host") {
+      const patterns = tokenizeDirectiveValue(directive.value, "Host");
+      const match = (pattern: string): boolean => new RegExp(`^${pattern.split("").map((character) => character === "*" ? ".*" : character === "?" ? "." : character.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")).join("")}$`, "iu").test(alias);
+      matches = patterns.some((pattern) => !pattern.startsWith("!") && match(pattern))
+        && !patterns.some((pattern) => pattern.startsWith("!") && match(pattern.slice(1)));
+    } else if (matches) result.push(directive);
+  }
+  return result;
+}
+
+function importedDirective(directives: readonly ParsedDirective[], name: string): string | undefined {
+  const raw = firstDirective(directives, name);
+  if (raw === undefined) return undefined;
+  const values = tokenizeDirectiveValue(raw, name);
+  if (values.length !== 1 || values[0] === "") {
+    throw new RemoteSshError("CONFIG_INVALID", "An SSH connection option has an invalid value.", false);
+  }
+  return values[0];
+}
+
 function rewriteSingleHostBlock(
   parsed: ParsedDocument,
   block: HostBlock | undefined,
@@ -441,9 +483,12 @@ function formatPattern(value: string): string {
 }
 
 function parseImportedPort(value: string | undefined): number {
-  if (value === undefined || !/^\d+$/u.test(value)) return DEFAULT_SSH_PORT;
+  if (value === undefined) return DEFAULT_SSH_PORT;
   const port = Number(value);
-  return Number.isSafeInteger(port) && port >= 1 && port <= 65_535 ? port : DEFAULT_SSH_PORT;
+  if (!/^\d+$/u.test(value) || !Number.isSafeInteger(port) || port < 1 || port > 65_535) {
+    throw new RemoteSshError("CONFIG_INVALID", "The SSH port must be from 1 through 65535.", false);
+  }
+  return port;
 }
 
 function validateConfigHost(host: RemoteSshConfigHost): RemoteSshConfigHost {

@@ -1,3 +1,4 @@
+import { DEEP_LINK_IDENTITIES } from "./i18n/deep-link-corpus.js";
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
@@ -17,20 +18,20 @@ import {
 describe("Desktop public deep links", () => {
   it("round-trips task, machine, and message identities through the canonical task form", () => {
     const link = buildDesktopSessionDeepLink({
-      sessionId: "task / 一",
-      profileId: "machine / 一",
-      messageId: "message / 一",
-      messageEventId: "event / 一"
+      sessionId: DEEP_LINK_IDENTITIES.sessionId,
+      profileId: DEEP_LINK_IDENTITIES.profileId,
+      messageId: DEEP_LINK_IDENTITIES.messageId,
+      messageEventId: DEEP_LINK_IDENTITIES.messageEventId
     });
     expect(link).toBe(
       "joko://task/task%20%2F%20%E4%B8%80?event=event+%2F+%E4%B8%80&message=message+%2F+%E4%B8%80&profile=machine+%2F+%E4%B8%80"
     );
     expect(parseDesktopDeepLink(link)).toEqual({
       kind: "session",
-      sessionId: "task / 一",
-      profileId: "machine / 一",
-      messageId: "message / 一",
-      messageEventId: "event / 一"
+      sessionId: DEEP_LINK_IDENTITIES.sessionId,
+      profileId: DEEP_LINK_IDENTITIES.profileId,
+      messageId: DEEP_LINK_IDENTITIES.messageId,
+      messageEventId: DEEP_LINK_IDENTITIES.messageEventId
     });
   });
 

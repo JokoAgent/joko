@@ -5,12 +5,15 @@ import { isAbsolute, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { getDefaultEnvironment, StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
+import type { Transport, FetchLike } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { PiMcpBridgeOptions, PiMcpToolDescriptor } from "@joko/adapter-pi";
 import { validateMcpEndpoint } from "@joko/adapter-pi";
 import { redactSecrets, type BlobRef, type PolicySubjectKind } from "@joko/core";
 import { operationBodyHash, type OperationalStore } from "@joko/store";
 
 import type { CredentialManager } from "./credential-manager.js";
+import { McpAudioArtifacts } from "./mcp-audio-artifacts.js";
 import type {
   NativeAuthRecoveryPort,
   NativeAuthRecoverySignedRunnerEvidence,
@@ -82,7 +85,7 @@ export interface McpStdioServerInput extends McpServerBase {
 }
 
 export interface McpHttpServerInput extends McpServerBase {
-  readonly transport: "streamable_http";
+  readonly transport: "streamable_http" | "sse";
   readonly endpoint: string;
 }
 
@@ -117,7 +120,7 @@ export interface McpServerDescriptor {
       readonly workingDirectory: string;
       readonly environment: Readonly<Record<string, string>>;
     }
-    | { readonly case: "streamableHttp"; readonly endpoint: string };
+    | { readonly case: "streamableHttp" | "sse"; readonly endpoint: string };
   readonly version: bigint;
   readonly updatedAt: number;
   readonly error?: string;
@@ -156,6 +159,7 @@ export interface McpToolListPage {
 export interface McpClientConnection {
   listTools(cursor?: string, signal?: AbortSignal): Promise<McpToolListPage>;
   callTool(name: string, arguments_: Readonly<Record<string, unknown>>, signal?: AbortSignal): Promise<McpCallResult>;
+  readResource(uri: string, signal: AbortSignal): Promise<{ readonly contents: readonly unknown[] }>;
   close(): Promise<void>;
 }
 
@@ -400,6 +404,7 @@ export class McpRouter {
   readonly #store: OperationalStore;
   readonly #credentials: CredentialManager;
   readonly #resultArtifacts: McpResultArtifactStore | undefined;
+  readonly #audioArtifacts: McpAudioArtifacts | undefined;
   readonly #factory: McpClientFactory;
   readonly #scopeId: string;
   readonly #now: () => number;
@@ -439,6 +444,7 @@ export class McpRouter {
     this.#store = options.store;
     this.#credentials = options.credentials;
     this.#resultArtifacts = options.resultArtifacts;
+    this.#audioArtifacts = options.resultArtifacts === undefined ? undefined : new McpAudioArtifacts(options.store, options.resultArtifacts);
     this.#factory = options.clientFactory ?? new SdkMcpClientFactory();
     this.#scopeId = options.scopeId ?? "orchestrator";
     this.#now = options.now ?? Date.now;
@@ -865,13 +871,31 @@ export class McpRouter {
       let result: McpCallResult;
       let hostImages: readonly BridgeToolImageOutput[] = [];
       if (bridgeProvider === undefined) {
-        result = await this.callTool({
-            serverId: input.serverId,
-            toolName: input.toolName,
-            arguments: input.arguments ?? {},
-            expectedGeneration: serverGeneration,
-            ...(input.signal === undefined ? {} : { signal: input.signal })
-          });
+        const runtime = this.#requireRuntime(input.serverId, serverGeneration);
+        const targetRevision = this.#store.getTarget(session.targetId).revision;
+        const context = { sessionId: session.id, targetId: session.targetId, generation: input.generation, requestIdentity, requestBodyHash };
+        const guard = (): void => {
+          input.signal?.throwIfAborted();
+          const current = this.#store.getSession(context.sessionId).descriptor;
+          if (this.#findGrant(token) !== grant || this.#requireRuntime(input.serverId, serverGeneration) !== runtime
+            || current.targetId !== context.targetId || current.binding.generation !== context.generation
+            || current.archived || current.deletedAt !== undefined
+            || this.#store.findPendingSessionLifecycleCleanup(current.id) !== undefined
+            || this.#store.getTarget(context.targetId).revision !== targetRevision) throw new Error("MCP audio publication owner is no longer active.");
+        };
+        guard();
+        const replay = this.#audioArtifacts?.replay(context);
+        if (replay !== undefined) result = replay;
+        else {
+          const raw = await runtime.connection.callTool(input.toolName, input.arguments ?? {}, input.signal);
+          guard();
+          if (Buffer.byteLength(JSON.stringify(raw), "utf8") > this.#resultCapacityBytes) throw new McpResultResourceExhaustedError();
+          result = this.#audioArtifacts === undefined ? raw : await this.#audioArtifacts.publish(
+            raw, context, guard, (value) => this.#redactText(value), (value) => this.#normalizeResult(value, "MCP audio result").value,
+            { read: (uri, signal) => runtime.connection.readResource(uri, signal), ...(input.signal === undefined ? {} : { signal: input.signal }) }
+          );
+          guard();
+        }
       } else {
         const execution = await this.#callBridgeToolProvider(
             bridgeProvider,
@@ -1892,7 +1916,7 @@ export class McpRouter {
           workingDirectory: server.input.cwd ?? "",
           environment: { ...(server.input.environment ?? {}) }
         }
-        : { case: "streamableHttp", endpoint: server.input.endpoint },
+        : { case: server.input.transport === "sse" ? "sse" : "streamableHttp", endpoint: server.input.endpoint },
       version: BigInt(server.version),
       updatedAt: server.updatedAt,
       ...(state.error === undefined ? {} : { error: state.error }),
@@ -2014,10 +2038,15 @@ function sameBridgeToolPolicyDeclaration(
 }
 
 export class SdkMcpClientFactory implements McpClientFactory {
+  constructor(private readonly connectionTimeoutMs = 30_000) {
+    if (!Number.isSafeInteger(connectionTimeoutMs) || connectionTimeoutMs <= 0) throw new Error("MCP connection timeout must be positive.");
+  }
+
   async connect(input: McpClientFactoryInput): Promise<McpClientConnection> {
     const client = new Client({ name: "joko-orchestrator", version: "0.1.0" }, { capabilities: {} });
     client.onclose = input.onClose;
     client.onerror = input.onError;
+    let transport: Transport;
     if (input.config.transport === "stdio") {
       const env: Record<string, string> = {
         ...getDefaultEnvironment(),
@@ -2029,13 +2058,13 @@ export class SdkMcpClientFactory implements McpClientFactory {
         if (value === undefined) throw new Error("Stdio MCP credential binding is unresolved.");
         env[binding.name] = value;
       }
-      await client.connect(new StdioClientTransport({
+      transport = new StdioClientTransport({
         command: input.config.command,
         args: [...(input.config.args ?? [])],
         env,
         ...(input.config.cwd === undefined ? {} : { cwd: input.config.cwd }),
         stderr: "pipe"
-      }));
+      });
     } else {
       const headers = new Headers();
       for (const binding of input.config.credentialBindings) {
@@ -2044,9 +2073,34 @@ export class SdkMcpClientFactory implements McpClientFactory {
         if (value === undefined) throw new Error("HTTP MCP credential binding is unresolved.");
         headers.set(binding.name, value);
       }
-      await client.connect(new StreamableHTTPClientTransport(new URL(input.config.endpoint), {
-        requestInit: { headers, redirect: "error" }
-      }));
+      const endpoint = new URL(input.config.endpoint);
+      const nativeFetch = globalThis.fetch;
+      const fetch: FetchLike = async (url, init) => {
+        const target = new URL(url);
+        if (target.origin !== endpoint.origin || target.username !== "" || target.password !== "" || target.hash !== "") {
+          throw new Error("MCP request destination is outside its configured origin.");
+        }
+        return nativeFetch(url, { ...init, redirect: "error" });
+      };
+      const options = { requestInit: { headers, redirect: "error" as const }, fetch };
+      transport = input.config.transport === "sse"
+        ? new SSEClientTransport(endpoint, options)
+        : new StreamableHTTPClientTransport(endpoint, options);
+    }
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        client.connect(transport),
+        new Promise<never>((_resolve, reject) => {
+          timeout = setTimeout(() => reject(new Error("MCP connection timed out.")), this.connectionTimeoutMs);
+        })
+      ]);
+    } catch (error) {
+      await transport.close().catch(() => undefined);
+      await client.close().catch(() => undefined);
+      throw error;
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
     }
     return {
       async listTools(cursor, signal) {
@@ -2067,6 +2121,10 @@ export class SdkMcpClientFactory implements McpClientFactory {
           ...(result.structuredContent === undefined ? {} : { structuredContent: result.structuredContent }),
           isError: result.isError ?? false
         };
+      },
+      async readResource(uri, signal) {
+        if (client.getServerCapabilities()?.resources === undefined) throw new Error("MCP server does not support reading result resources.");
+        return client.readResource({ uri }, { signal });
       },
       close: () => client.close()
     };
@@ -2110,7 +2168,7 @@ function validateStoredServer(value: StoredMcpServer): StoredMcpServer {
   // validation still fails closed before the configuration is exposed.
   const input = value.input;
   if (!input || typeof input !== "object" || !Array.isArray(input.credentialBindings)) throw new Error("Stored MCP server input is malformed.");
-  if (!(input.transport === "stdio" || input.transport === "streamable_http")) throw new Error("Stored MCP transport is invalid.");
+  if (!(input.transport === "stdio" || input.transport === "streamable_http" || input.transport === "sse")) throw new Error("Stored MCP transport is invalid.");
   return { ...value, input: cloneServerInput(input) };
 }
 

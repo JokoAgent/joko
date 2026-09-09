@@ -111,6 +111,15 @@ type JokoDesktopUpdateRelaunchResult =
     readonly reason: "not-ready" | "busy" | "orchestrator-shutdown-failed" | "apply-failed";
   };
 
+interface JokoDesktopMainWindowCloseSettings {
+  readonly behavior: "tray" | "minimize" | "quit" | null;
+  readonly revision: number;
+}
+
+type JokoDesktopCopyFileResult =
+  | { readonly status: "copied" | "cancelled" | "unknown" | "unavailable" | "blocked" }
+  | { readonly status: "failed"; readonly reason: "capacity" | "storage" | "helper" };
+
 interface JokoDesktopAutoRelaunchSettings {
   readonly autoRelaunchOnIdle: boolean;
   readonly isCustomized: boolean;
@@ -192,6 +201,7 @@ type JokoDesktopNativeTaskStatusAction =
     };
 
 type JokoDesktopCapability =
+  | "files.copy"
   | "app.info"
   | "app.update"
   | "attention.badge"
@@ -210,7 +220,8 @@ type JokoDesktopCapability =
   | "selection.quote.contextMenu"
   | "session.windows"
   | "voice.globalDictation"
-  | "window.activationClick";
+  | "window.activationClick"
+  | "window.mainCloseBehavior";
 
 type JokoDesktopDeepLinkSettingsSection =
   | "general"
@@ -292,6 +303,11 @@ interface JokoDesktopApi {
   readonly layout: {
     reset(): Promise<void>;
     onReset(listener: () => void): () => void;
+  };
+  readonly mainWindowClose: {
+    get(): Promise<JokoDesktopMainWindowCloseSettings>;
+    set(change: { readonly behavior: JokoDesktopMainWindowCloseSettings["behavior"]; readonly expectedRevision: number }): Promise<JokoDesktopMainWindowCloseSettings>;
+    onChanged(listener: (settings: JokoDesktopMainWindowCloseSettings) => void): () => void;
   };
   readonly windowInteraction: {
     get(): Promise<{ readonly swallowActivationClick: boolean }>;
@@ -391,6 +407,8 @@ interface JokoDesktopApi {
     onNavigate(listener: (navigation: JokoDesktopDeepLinkNavigation) => void): () => void;
   };
   saveFile(file: JokoDesktopFile): Promise<boolean>;
+  copyFile(request: { readonly requestId: string; readonly file: JokoDesktopFile }): Promise<JokoDesktopCopyFileResult>;
+  cancelFileCopy(requestId: string): Promise<void>;
   readonly discovery: {
     scan(): Promise<readonly JokoDesktopDiscoveredNode[]>;
   };

@@ -244,14 +244,15 @@ class WorkspaceMarkdownImageWidget extends WidgetType {
       && JSON.stringify(other.target) === JSON.stringify(this.target);
   }
 
-  toDOM(): HTMLElement {
-    const root = document.createElement("div");
+  toDOM(view: EditorView): HTMLElement {
+    const ownerDocument = view.dom.ownerDocument;
+    const root = ownerDocument.createElement("div");
     root.className = "cm-md-image-widget";
     if (this.target.align === "center") root.classList.add("cm-md-image-center");
     root.setAttribute("contenteditable", "false");
     const lifecycle = { disposed: false, releases: [] as (() => void)[] };
     this.#roots.set(root, lifecycle);
-    for (const spec of this.target.images) root.appendChild(this.#item(spec, lifecycle));
+    for (const spec of this.target.images) root.appendChild(this.#item(spec, lifecycle, ownerDocument));
     return root;
   }
 
@@ -263,21 +264,21 @@ class WorkspaceMarkdownImageWidget extends WidgetType {
     this.#roots.delete(dom);
   }
 
-  #item(spec: WorkspaceMarkdownImageSpec, lifecycle: { disposed: boolean; releases: (() => void)[] }): HTMLElement {
-    const holder = document.createElement("div");
+  #item(spec: WorkspaceMarkdownImageSpec, lifecycle: { disposed: boolean; releases: (() => void)[] }, ownerDocument: Document): HTMLElement {
+    const holder = ownerDocument.createElement("div");
     holder.className = "cm-md-image-item";
-    holder.appendChild(this.#status(this.labels.loading, spec.src, true));
+    holder.appendChild(this.#status(ownerDocument, this.labels.loading, spec.src, true));
     void this.resolver(spec.src).then((resolved) => {
       if (lifecycle.disposed) {
         resolved?.release?.();
         return;
       }
       if (resolved === undefined) {
-        holder.replaceChildren(this.#status(this.labels.loadFailed, spec.src));
+        holder.replaceChildren(this.#status(ownerDocument, this.labels.loadFailed, spec.src));
         return;
       }
       if (resolved.release !== undefined) lifecycle.releases.push(resolved.release);
-      const image = document.createElement("img");
+      const image = ownerDocument.createElement("img");
       image.src = resolved.url;
       image.referrerPolicy = "no-referrer";
       image.alt = spec.alt;
@@ -287,22 +288,26 @@ class WorkspaceMarkdownImageWidget extends WidgetType {
       if (spec.width !== null) image.style.width = `${spec.width}px`;
       if (spec.height !== null) image.style.height = `${spec.height}px`;
       image.addEventListener("load", () => {
+        if (lifecycle.disposed) return;
         holder.classList.add("cm-md-image-clickable");
         holder.setAttribute("role", "button");
         holder.setAttribute("tabindex", "0");
         holder.setAttribute("aria-label", spec.alt || this.labels.open);
       });
       image.addEventListener("error", () => {
+        if (lifecycle.disposed) return;
         holder.classList.remove("cm-md-image-clickable");
         holder.removeAttribute("role");
         holder.removeAttribute("tabindex");
-        holder.replaceChildren(this.#status(this.labels.loadFailed, spec.src));
+        holder.replaceChildren(this.#status(ownerDocument, this.labels.loadFailed, spec.src));
       });
       const open = (event: Event): void => {
-        if (!holder.classList.contains("cm-md-image-clickable")) return;
+        const EventType = ownerDocument.defaultView?.CustomEvent;
+        if (lifecycle.disposed || !holder.isConnected || EventType === undefined || !holder.classList.contains("cm-md-image-clickable")) return;
         event.preventDefault();
         event.stopPropagation();
-        window.dispatchEvent(new CustomEvent<WorkspaceMarkdownImageOpenDetail>(WORKSPACE_MARKDOWN_IMAGE_OPEN_EVENT, {
+        holder.dispatchEvent(new EventType<WorkspaceMarkdownImageOpenDetail>(WORKSPACE_MARKDOWN_IMAGE_OPEN_EVENT, {
+          bubbles: true,
           detail: { ...resolved, returnFocus: holder }
         }));
       };
@@ -312,18 +317,18 @@ class WorkspaceMarkdownImageWidget extends WidgetType {
       });
       holder.replaceChildren(image);
     }).catch(() => {
-      if (!lifecycle.disposed) holder.replaceChildren(this.#status(this.labels.loadFailed, spec.src));
+      if (!lifecycle.disposed) holder.replaceChildren(this.#status(ownerDocument, this.labels.loadFailed, spec.src));
     });
     return holder;
   }
 
-  #status(label: string, source: string, loading = false): HTMLElement {
-    const card = document.createElement("div");
+  #status(ownerDocument: Document, label: string, source: string, loading = false): HTMLElement {
+    const card = ownerDocument.createElement("div");
     card.className = `cm-md-image-error${loading ? " cm-md-image-loading" : ""}`;
-    const title = document.createElement("div");
+    const title = ownerDocument.createElement("div");
     title.className = "cm-md-image-error-label";
     title.textContent = label;
-    const path = document.createElement("div");
+    const path = ownerDocument.createElement("div");
     path.className = "cm-md-image-error-path";
     path.textContent = source;
     card.append(title, path);

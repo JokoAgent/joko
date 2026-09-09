@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { SessionSdkOwner } from "./session-sdk-owner.js";
 import {
   DurableProcessOwner,
   type DurableProcessLease,
@@ -6,7 +7,7 @@ import {
 } from "@joko/runtime-governance";
 
 export const CLAUDE_AGENT_SDK_PACKAGE = "@anthropic-ai/claude-agent-sdk";
-export const CLAUDE_AGENT_SDK_VERSION = "0.3.239";
+export const CLAUDE_AGENT_SDK_VERSION = "0.3.259";
 
 export type ClaudeSdkPermissionMode =
   | "default"
@@ -117,6 +118,7 @@ export interface ClaudeSdkQuery extends AsyncIterable<unknown> {
   setModel(model?: string): Promise<void>;
   applyFlagSettings(settings: {
     readonly effortLevel?: "low" | "medium" | "high" | "xhigh" | "max" | null;
+    readonly fastMode?: boolean | null;
     readonly permissions?: {
       readonly additionalDirectories?: readonly string[];
     } | null;
@@ -188,6 +190,7 @@ export interface ClaudeSdkListSessionsOptions {
 
 export interface ClaudeSdkGetSessionMessagesOptions {
   readonly dir: string;
+  readonly signal?: AbortSignal;
   readonly limit: number;
   readonly offset: number;
   readonly includeSystemMessages: true;
@@ -224,15 +227,29 @@ export interface ClaudeSdkRuntime {
   readonly packageVersion: string;
   probe(input: ClaudeSdkProbeInput): Promise<ClaudeSdkProbe>;
   query(params: ClaudeSdkQueryParams): Promise<ClaudeSdkQuery>;
-  getSessionInfo(sessionId: string, options: { readonly dir: string }): Promise<ClaudeSdkSessionInfo | undefined>;
+  /** Confirm retirement of this exact Query before resuming its native Session. */
+  retireQuery(query: ClaudeSdkQuery, timeoutMs: number): Promise<void>;
+  getSessionInfo(sessionId: string, options: { readonly dir: string; readonly signal?: AbortSignal }): Promise<ClaudeSdkSessionInfo | undefined>;
   getSessionMessages(
     sessionId: string,
     options: ClaudeSdkGetSessionMessagesOptions
   ): Promise<readonly ClaudeSdkSessionMessage[]>;
   listSessions(options: ClaudeSdkListSessionsOptions): Promise<readonly ClaudeSdkSessionInfo[]>;
-  deleteSession(sessionId: string, options: { readonly dir: string }): Promise<void>;
+  deleteSession(sessionId: string, options: { readonly dir: string; readonly signal?: AbortSignal }): Promise<void>;
+  forkSession(sessionId: string, options: ClaudeSdkForkOptions): Promise<{ readonly sessionId: string }>;
+  ownsSessionFork(sessionId: string): boolean;
+  closeSessionOperations(): Promise<void>;
   /** Confirm hard retirement of every exact local CLI process still owned by this runtime. */
   retireOwnedProcesses?(timeoutMs: number): Promise<void>;
+}
+
+export interface ClaudeSdkForkOptions {
+  readonly dir: string;
+  /** Published SDK boundary, inclusive of this exact persisted message UUID. */
+  readonly upToMessageId?: string;
+  readonly signal: AbortSignal;
+  /** Synchronous Host receipt, called before this bounded operation settles. */
+  readonly recordSessionId: (sessionId: string) => void;
 }
 
 interface LoadedSdkModule {
@@ -244,32 +261,31 @@ interface LoadedSdkModule {
     readonly options?: NativeOptionsWithOAuth;
     readonly initializeTimeoutMs?: number;
   }) => Promise<NativeWarmQuery>;
-  readonly getSessionInfo: (
-    sessionId: string,
-    options: { readonly dir: string }
-  ) => Promise<ClaudeSdkSessionInfo | undefined>;
-  readonly getSessionMessages: (
-    sessionId: string,
-    options: ClaudeSdkGetSessionMessagesOptions
-  ) => Promise<ClaudeSdkSessionMessage[]>;
-  readonly listSessions: (options: ClaudeSdkListSessionsOptions) => Promise<readonly ClaudeSdkSessionInfo[]>;
-  readonly deleteSession: (sessionId: string, options: { readonly dir: string }) => Promise<void>;
 }
 
 export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
   readonly packageVersion = CLAUDE_AGENT_SDK_VERSION;
   readonly #processOwner: DurableProcessOwner | undefined;
   readonly #retirementTimeoutMs: number;
+  readonly #sessionOwner: SessionSdkOwner;
+  readonly #queryProcesses = new WeakMap<ClaudeSdkQuery, DurableProcessLease[]>();
   #module: Promise<LoadedSdkModule> | undefined;
 
   constructor(options: {
     readonly processOwner?: DurableProcessOwnerOptions;
     readonly retirementTimeoutMs?: number;
+    readonly environment?: Readonly<Record<string, string | undefined>>;
+    readonly sessionOperationTimeoutMs?: number;
   } = {}) {
     this.#processOwner = options.processOwner === undefined
       ? undefined
       : new DurableProcessOwner(options.processOwner);
     this.#retirementTimeoutMs = positiveTimeout(options.retirementTimeoutMs, 5_000);
+    this.#sessionOwner = new SessionSdkOwner({
+      environment: options.environment ?? process.env,
+      timeoutMs: positiveTimeout(options.sessionOperationTimeoutMs, 30_000),
+      cleanupTimeoutMs: this.#retirementTimeoutMs
+    });
   }
 
   async probe(input: ClaudeSdkProbeInput): Promise<ClaudeSdkProbe> {
@@ -348,6 +364,7 @@ export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
 
   async query(params: ClaudeSdkQueryParams): Promise<ClaudeSdkQuery> {
     await this.#processOwner?.prepare(this.#retirementTimeoutMs);
+    const leases: DurableProcessLease[] = [];
     const options: NativeOptionsWithOAuth = {
       abortController: params.options.abortController,
       additionalDirectories: [...params.options.additionalDirectories],
@@ -375,7 +392,7 @@ export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
       persistSession: params.options.persistSession,
       ...(this.#processOwner === undefined
         ? {}
-        : { spawnClaudeCodeProcess: (spawnOptions) => this.#spawnOwnedProcess(spawnOptions) }),
+        : { spawnClaudeCodeProcess: (spawnOptions) => this.#spawnOwnedProcess(spawnOptions, (lease) => leases.push(lease)) }),
       ...(params.options.resume === undefined ? {} : { resume: params.options.resume }),
       ...(params.options.sessionId === undefined ? {} : { sessionId: params.options.sessionId }),
       ...(params.options.settings === undefined ? {} : { settings: { ...params.options.settings } }),
@@ -388,36 +405,70 @@ export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
         ? [...params.options.tools]
         : { type: "preset", preset: "claude_code" }
     };
-    return (await this.#load()).query({
+    const query = (await this.#load()).query({
       prompt: params.prompt as AsyncIterable<NativeSdkUserMessage>,
       options
     }) as unknown as ClaudeSdkQuery;
+    this.#queryProcesses.set(query, leases);
+    return query;
+  }
+
+  async retireQuery(query: ClaudeSdkQuery, timeoutMs: number): Promise<void> {
+    const leases = this.#queryProcesses.get(query);
+    if (this.#processOwner === undefined || leases === undefined || leases.length === 0) {
+      throw new Error("The exact native Query process cannot be confirmed retired.");
+    }
+    const results = await Promise.allSettled(leases.map((lease) => this.#processOwner!.retireLease(lease, timeoutMs)));
+    const failed = results.find((result) => result.status === "rejected");
+    if (failed?.status === "rejected") throw failed.reason;
+    this.#queryProcesses.delete(query);
   }
 
   async getSessionInfo(
     sessionId: string,
-    options: { readonly dir: string }
+    options: { readonly dir: string; readonly signal?: AbortSignal }
   ): Promise<ClaudeSdkSessionInfo | undefined> {
-    return (await this.#load()).getSessionInfo(sessionId, options);
+    return await this.#sessionOwner.run({ kind: "getSessionInfo", sessionId, options: { dir: options.dir } }, { signal: options.signal }) as ClaudeSdkSessionInfo | undefined;
   }
 
   async getSessionMessages(
     sessionId: string,
     options: ClaudeSdkGetSessionMessagesOptions
   ): Promise<readonly ClaudeSdkSessionMessage[]> {
-    return (await this.#load()).getSessionMessages(sessionId, options);
+    const { signal, ...nativeOptions } = options;
+    return await this.#sessionOwner.run({ kind: "getSessionMessages", sessionId, options: nativeOptions }, { signal }) as readonly ClaudeSdkSessionMessage[];
   }
 
   async listSessions(options: ClaudeSdkListSessionsOptions): Promise<readonly ClaudeSdkSessionInfo[]> {
-    return (await this.#load()).listSessions(options);
+    return await this.#sessionOwner.run({ kind: "listSessions", options }) as readonly ClaudeSdkSessionInfo[];
   }
 
-  async deleteSession(sessionId: string, options: { readonly dir: string }): Promise<void> {
-    await (await this.#load()).deleteSession(sessionId, options);
+  async deleteSession(sessionId: string, options: { readonly dir: string; readonly signal?: AbortSignal }): Promise<void> {
+    if (this.#sessionOwner.ownsSession(sessionId)) throw new Error("Native Session copy is not confirmed retired.");
+    await this.#sessionOwner.run({ kind: "deleteSession", sessionId, options: { dir: options.dir } }, { signal: options.signal });
+  }
+
+  async forkSession(sessionId: string, options: ClaudeSdkForkOptions): Promise<{ readonly sessionId: string }> {
+    return await this.#sessionOwner.run({ kind: "forkSession", sessionId, options: {
+      dir: options.dir,
+      ...(options.upToMessageId === undefined ? {} : { upToMessageId: options.upToMessageId })
+    } }, {
+      signal: options.signal, recordSessionId: options.recordSessionId
+    }) as { readonly sessionId: string };
+  }
+
+  ownsSessionFork(sessionId: string): boolean {
+    return this.#sessionOwner.ownsSession(sessionId);
+  }
+
+  closeSessionOperations(): Promise<void> {
+    return this.#sessionOwner.close();
   }
 
   async retireOwnedProcesses(timeoutMs: number): Promise<void> {
-    await this.#processOwner?.retireAll(timeoutMs);
+    const results = await Promise.allSettled([this.#sessionOwner.retire(), this.#processOwner?.retireAll(timeoutMs)]);
+    const failed = results.find((result) => result.status === "rejected");
+    if (failed?.status === "rejected") throw failed.reason;
   }
 
   #load(): Promise<LoadedSdkModule> {
@@ -425,10 +476,10 @@ export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
     return this.#module;
   }
 
-  #spawnOwnedProcess(options: NativeSpawnOptions): NativeSpawnedProcess {
+  #spawnOwnedProcess(options: NativeSpawnOptions, recordLease?: (lease: DurableProcessLease) => void): NativeSpawnedProcess {
     const owner = this.#processOwner;
     if (owner === undefined) throw new Error("Claude CLI process ownership is not configured.");
-    return spawnOwnedClaudeCodeProcess(options, owner, this.#retirementTimeoutMs);
+    return spawnOwnedClaudeCodeProcess(options, owner, this.#retirementTimeoutMs, recordLease);
   }
 }
 
@@ -437,11 +488,7 @@ async function loadSdkModule(): Promise<LoadedSdkModule> {
   const value: unknown = await import(moduleName);
   if (!isRecord(value)
     || typeof value["query"] !== "function"
-    || typeof value["startup"] !== "function"
-    || typeof value["getSessionInfo"] !== "function"
-    || typeof value["getSessionMessages"] !== "function"
-    || typeof value["listSessions"] !== "function"
-    || typeof value["deleteSession"] !== "function") {
+    || typeof value["startup"] !== "function") {
     throw new Error("The installed Claude Agent SDK has an incompatible module surface.");
   }
   return value as unknown as LoadedSdkModule;
@@ -500,7 +547,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export function spawnOwnedClaudeCodeProcess(
   options: NativeSpawnOptions,
   owner: DurableProcessOwner,
-  retirementTimeoutMs: number
+  retirementTimeoutMs: number,
+  recordLease?: (lease: DurableProcessLease) => void
 ): NativeSpawnedProcess {
   const child = spawn(options.command, options.args, {
     cwd: options.cwd,
@@ -525,6 +573,7 @@ export function spawnOwnedClaudeCodeProcess(
   // logging so a verbose child cannot block and native diagnostics cannot
   // leak environment or credential fragments.
   child.stderr.resume();
+  recordLease?.(lease);
   return ownedSpawnedProcess(child, lease, owner, options.signal, retirementTimeoutMs);
 }
 

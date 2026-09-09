@@ -97,6 +97,7 @@ export class ComputerToolProviderError extends Error {
       | "unknown_tool"
       | "invalid_arguments"
       | "catalog_too_large"
+      | "driver_incompatible"
       | "stale_snapshot",
     readonly toolName?: string,
     readonly underlying?: unknown
@@ -117,6 +118,7 @@ interface SessionEntry {
   cursorMotion: "pending" | "applied" | "unavailable";
   cursorStyle: "pending" | "applied" | "unavailable";
   runtimeHeld: boolean;
+  driverTools?: readonly ComputerToolDescriptor[];
 }
 
 type ComputerRecoveryDecision<T> =
@@ -412,6 +414,7 @@ export class ComputerToolProvider {
     entry.connection = replacement;
     entry.transportEpoch += 1;
     entry.snapshots = new ComputerWindowSnapshotTracker(this.#idFactory);
+    entry.driverTools = undefined;
     entry.cursorMotion = "pending";
     entry.cursorStyle = "pending";
     try {
@@ -458,6 +461,7 @@ export class ComputerToolProvider {
 
     const stale = staleSnapshotResult(entry, name, arguments_);
     if (stale !== undefined) return stale;
+    if (name === "verify_state") invalidateWindowObservation(entry, name, arguments_);
 
     const chunks = name === "type_text" && typeof arguments_["text"] === "string"
       ? splitTextChunks(arguments_["text"])
@@ -468,13 +472,14 @@ export class ComputerToolProvider {
     let result: ComputerToolCallResult;
     try {
       result = await this.#withReconnect<ComputerToolCallResult>(entry, signal, async (connection, operationSignal) => {
+        entry.driverTools ??= await this.#readToolCatalog(connection, operationSignal);
         if (this.#decorateCursor) await initializeCursorDecoration(entry, connection, name, operationSignal);
         if (chunks === undefined || chunks.length === 1) {
-          const prepared = withDriverSession(entry, name, driverDispatchArguments(name, arguments_));
+          const prepared = prepareDriverArguments(entry, name, arguments_);
           const response = await callDriverTool(connection, name, prepared, operationSignal);
           const stale = staleToolResult(response);
           if (stale !== undefined) throw new StaleTransportError(stale);
-          if (chunks !== undefined && response.isError !== true) {
+          if (chunks !== undefined && !driverResultFailed(response)) {
             const characterCount = readInsertedCharacters(response) ?? Array.from(chunks[0] ?? "").length;
             return aggregateTypeTextResult(characterCount, 1);
           }
@@ -482,14 +487,14 @@ export class ComputerToolProvider {
         }
         while (nextChunk < chunks.length) {
           const chunk = chunks[nextChunk]!;
-          const prepared = withDriverSession(entry, name, {
-            ...driverDispatchArguments(name, arguments_),
+          const prepared = prepareDriverArguments(entry, name, {
+            ...arguments_,
             text: chunk
           });
           const response = await callDriverTool(connection, name, prepared, operationSignal);
           const stale = staleToolResult(response);
           if (stale !== undefined) throw new StaleTransportError(stale);
-          if (response.isError === true) return response;
+          if (driverResultFailed(response)) return response;
           inserted += readInsertedCharacters(response) ?? Array.from(chunk).length;
           nextChunk += 1;
         }
@@ -504,11 +509,21 @@ export class ComputerToolProvider {
         }
       });
     } catch (error) {
+      invalidateWindowObservation(entry, name, arguments_);
       const fallback = await this.#fallbackAfterFailure(name, arguments_, error, signal);
       if (fallback !== undefined) return fallback;
       throw error;
     }
 
+    if (driverResultFailed(result)) {
+      invalidateWindowObservation(entry, name, arguments_);
+      return { ...result, isError: true };
+    }
+    if (name === "verify_state") {
+      const payload = driverResultPayload(result);
+      const confirmed = payload?.["status"] === "satisfied" && payload["stable"] !== false;
+      return { ...result, isError: !confirmed, structuredContent: { ...payload, ok: confirmed } };
+    }
     if (name === "list_windows") {
       const payload = driverResultPayload(result);
       if (payload === undefined) return result;
@@ -519,11 +534,16 @@ export class ComputerToolProvider {
     if (name !== "get_window_state") return result;
     const processId = arguments_["pid"];
     const windowId = arguments_["window_id"];
-    if (typeof processId !== "number" || typeof windowId !== "number" || driverResultFailed(result)) return result;
-    const snapshotId = entry.snapshots.record(processId, windowId);
+    if (typeof processId !== "number" || typeof windowId !== "number") return result;
+    const payload = driverResultPayload(result);
+    if (payload?.["degraded"] === true || payload?.["frame_valid"] === false || payload?.["screenshot_error"] !== undefined) {
+      entry.snapshots.invalidate(processId, windowId);
+      return { ...result, isError: true };
+    }
     const driverSnapshotId = readDriverSnapshotId(result);
+    const snapshotId = entry.snapshots.record(processId, windowId, driverSnapshotId);
     if (driverSnapshotId !== undefined) entry.snapshots.registerAlias(snapshotId, driverSnapshotId);
-    return stampSnapshotId(result, snapshotId);
+    return stampSnapshotId(result, snapshotId, entry.snapshots);
   }
 
   async #fallbackAfterFailure(
@@ -595,7 +615,7 @@ export class ComputerToolProvider {
       const summaryBudget = Math.max(0, Math.min(2_048, 64 * 1024 - summaryCharacters));
       const summary = summarizeToolResult(result, summaryBudget);
       summaryCharacters += summary.length;
-      const ok = result.isError !== true;
+      const ok = !driverResultFailed(result);
       turns.push({ turn: action.turn, tool: action.tool, ok, result_summary: summary });
       if (ok) {
         succeeded += 1;
@@ -690,6 +710,7 @@ function publicPermissionState(
 
 const CURSOR_DECORATED_TOOLS = new Set<ComputerPublicToolName>([
   "get_window_state",
+  "verify_state",
   "click",
   "double_click",
   "right_click",
@@ -1256,7 +1277,7 @@ function driverDispatchArguments(
   delete prepared["snapshot_id"];
   if (
     name === "get_window_state"
-    && prepared["capture_mode"] !== "ax"
+    && prepared["include_screenshot"] !== false
     && typeof prepared["screenshot_out_file"] !== "string"
   ) {
     prepared["screenshot_out_file"] = defaultScreenshotOutputPath(prepared["window_id"]);
@@ -1269,6 +1290,45 @@ function driverDispatchArguments(
   return prepared;
 }
 
+function prepareDriverArguments(entry: SessionEntry, name: ComputerPublicToolName, input: Readonly<Record<string, unknown>>): Record<string, unknown> {
+  const schema = entry.driverTools?.find((tool) => tool.name === name)?.inputSchema;
+  if (schema === undefined || !isRecord(schema["properties"])) throw new ComputerToolProviderError("driver_incompatible", name);
+  const properties = schema["properties"];
+  const prepared = driverDispatchArguments(name, input);
+  // These are host-owned lifecycle identifiers, never caller-selected scopes.
+  delete prepared["session"];
+  delete prepared["cursor_id"];
+  const scoped = withDriverSession(entry, name, prepared);
+  for (const field of ["session", "cursor_id"]) if (Object.hasOwn(properties, field) && scoped[field] !== undefined) prepared[field] = scoped[field];
+  if (Object.hasOwn(properties, "session")) prepared["session"] = driverSessionId(entry);
+  if (name === "get_window_state") {
+    if (!Object.hasOwn(properties, "include_screenshot")) throw new ComputerToolProviderError("driver_incompatible", name);
+    prepared["include_screenshot"] ??= true;
+    if (Object.hasOwn(properties, "max_elements")) prepared["max_elements"] ??= 200;
+    if (Object.hasOwn(properties, "max_depth")) prepared["max_depth"] ??= 15;
+  }
+  const element = typeof input["element_token"] === "string" ? entry.snapshots.element(input["element_token"]) : undefined;
+  const id = typeof input["snapshot_id"] === "string" ? input["snapshot_id"] : element?.snapshotId;
+  const reference = id === undefined ? undefined : entry.snapshots.reference(id);
+  if (element !== undefined) prepared["element_token"] = element.token;
+  if (reference !== undefined) {
+    prepared["window_id"] ??= reference.windowId;
+    if (Object.hasOwn(properties, "snapshot_id") && reference.driverSnapshotId !== undefined) prepared["snapshot_id"] = reference.driverSnapshotId;
+  }
+  if (prepared["element_index"] !== undefined && Object.hasOwn(properties, "snapshot_id") && prepared["snapshot_id"] === undefined && prepared["element_token"] === undefined) {
+    throw new ComputerToolProviderError("driver_incompatible", name);
+  }
+  for (const [key, value] of Object.entries(prepared)) {
+    const property = properties[key];
+    if (schema["additionalProperties"] === false && property === undefined) throw new ComputerToolProviderError("driver_incompatible", name);
+    if (isRecord(property) && Array.isArray(property["enum"]) && !property["enum"].includes(value)) throw new ComputerToolProviderError("driver_incompatible", name);
+  }
+  for (const required of Array.isArray(schema["required"]) ? schema["required"] : []) {
+    if (typeof required !== "string" || prepared[required] === undefined) throw new ComputerToolProviderError("driver_incompatible", name);
+  }
+  return prepared;
+}
+
 function defaultScreenshotOutputPath(windowId: unknown): string {
   const directory = join(tmpdir(), "joko-computer-automation");
   mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -1276,14 +1336,32 @@ function defaultScreenshotOutputPath(windowId: unknown): string {
   return join(directory, `get_window_state-${target}-${Date.now()}-${randomUUID().slice(0, 8)}.png`);
 }
 
+function invalidateWindowObservation(
+  entry: SessionEntry,
+  name: ComputerPublicToolName,
+  arguments_: Readonly<Record<string, unknown>>
+): void {
+  if (name !== "get_window_state" && name !== "verify_state") return;
+  const processId = arguments_["pid"];
+  const windowId = arguments_["window_id"];
+  if (typeof processId === "number" && typeof windowId === "number") {
+    entry.snapshots.invalidate(processId, windowId);
+  }
+}
+
 function staleSnapshotResult(
   entry: SessionEntry,
   name: ComputerPublicToolName,
   arguments_: Readonly<Record<string, unknown>>
 ): ComputerToolCallResult | undefined {
-  if (!ELEMENT_ACTION_TOOLS.has(name) || typeof arguments_["element_index"] !== "number") return undefined;
-  const snapshotId = arguments_["snapshot_id"];
-  if (typeof snapshotId !== "string") return undefined;
+  if (!ELEMENT_ACTION_TOOLS.has(name) || (typeof arguments_["element_index"] !== "number" && typeof arguments_["element_token"] !== "string")) return undefined;
+  const token = arguments_["element_token"];
+  const element = typeof token === "string" ? entry.snapshots.element(token) : undefined;
+  const snapshotId = arguments_["snapshot_id"] ?? element?.snapshotId;
+  if (typeof snapshotId !== "string" || (typeof token === "string" && element === undefined)) return errorToolResult("STALE_SNAPSHOT", { reason: "unknown_snapshot" });
+  if (element !== undefined && (entry.snapshots.reference(snapshotId)?.snapshotId !== element.snapshotId || (arguments_["element_index"] !== undefined && arguments_["element_index"] !== element.index))) {
+    return errorToolResult("STALE_SNAPSHOT", { reason: "window_mismatch" });
+  }
   const processId = arguments_["pid"];
   const windowId = arguments_["window_id"];
   if (typeof processId !== "number") return undefined;
@@ -1359,13 +1437,15 @@ function aggregateTypeTextResult(
     ok: true,
     inserted,
     chars: inserted,
-    chunks
+    chunks,
+    outcome: { status: "unknown", next_step: "verify_state" }
   });
 }
 
 function driverResultFailed(result: ComputerToolCallResult): boolean {
   if (result.isError === true) return true;
-  return driverResultPayload(result)?.["ok"] === false;
+  const payload = driverResultPayload(result);
+  return payload?.["ok"] === false || payload?.["isError"] === true || payload?.["effect"] === "refused";
 }
 
 function readDriverSnapshotId(result: ComputerToolCallResult): string | undefined {
@@ -1382,9 +1462,25 @@ function readDriverSnapshotId(result: ComputerToolCallResult): string | undefine
   return undefined;
 }
 
-function stampSnapshotId(result: ComputerToolCallResult, snapshotId: string): ComputerToolCallResult {
+function stampSnapshotId(result: ComputerToolCallResult, snapshotId: string, snapshots: ComputerWindowSnapshotTracker): ComputerToolCallResult {
   const payload = driverResultPayload(result);
-  const stamped = { ...(payload ?? {}), snapshot_id: snapshotId };
+  const stamped: Record<string, unknown> = { ...(payload ?? {}), snapshot_id: snapshotId };
+  if (Array.isArray(payload?.["elements"])) {
+    const elements = payload["elements"] as unknown[];
+    const counts = new Map<string, number>();
+    for (const element of elements) if (isRecord(element) && typeof element["element_token"] === "string") {
+      const token = element["element_token"];
+      counts.set(token, (counts.get(token) ?? 0) + 1);
+    }
+    stamped["elements"] = elements.map((element) => {
+      if (!isRecord(element) || typeof element["element_token"] !== "string") return element;
+      const token = element["element_token"];
+      const accepted = counts.get(token) === 1 ? snapshots.registerElement(snapshotId, token, typeof element["element_index"] === "number" ? element["element_index"] : undefined) : undefined;
+      const output = { ...element };
+      delete output["element_token"];
+      return accepted === undefined ? output : { ...output, element_token: accepted };
+    });
+  }
   let replaced = false;
   const content = Array.isArray(result.content)
     ? result.content.map((item) => {
@@ -1393,7 +1489,7 @@ function stampSnapshotId(result: ComputerToolCallResult, snapshotId: string): Co
           const parsed: unknown = JSON.parse(item["text"]);
           if (!isRecord(parsed)) return item;
           replaced = true;
-          return { ...item, text: JSON.stringify({ ...parsed, snapshot_id: snapshotId }) };
+          return { ...item, text: JSON.stringify({ ...parsed, ...stamped }) };
         } catch {
           return item;
         }
@@ -1597,6 +1693,7 @@ function providerErrorMessage(code: ComputerToolProviderError["code"], toolName?
     ? "Computer automation tool name is invalid."
     : `Computer automation tool '${toolName}' is unavailable.`;
   if (code === "catalog_too_large") return "Computer automation tool catalog exceeded its bound.";
+  if (code === "driver_incompatible") return "The installed computer driver does not accept this operation's contract. No action was dispatched.";
   if (code === "stale_snapshot") return "Computer automation window snapshot is stale.";
   return "Computer automation tool arguments are invalid.";
 }

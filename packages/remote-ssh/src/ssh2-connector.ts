@@ -9,10 +9,15 @@ import ssh2, {
   type ClientErrorExtensions,
   type ConnectConfig,
   type FileEntryWithStats,
+  type IdentityCallback,
+  type ParsedKey,
+  type SignCallback,
+  type SigningRequestOptions,
   type SFTPWrapper,
   type Stats
 } from "ssh2";
 import { isRemoteSshError, RemoteSshError } from "./errors.js";
+import { openSsh2Terminal, type Ssh2TerminalTimeouts } from "./ssh2-terminal.js";
 import type {
   AgentAuthConnection,
   AgentAuthExecutionRequest,
@@ -30,12 +35,48 @@ import type {
   RemoteProcessStartRequest,
   RemoteProcessTransportPort,
   RemoteSshTransportCapabilities,
+  RemoteTerminalStartRequest,
+  RemoteTerminalTransportPort,
   ResolvedAgentAuthConnectorPort,
   ResolvedAgentAuthConnectorRequest
 } from "./types.js";
 import { AgentAuthConnectorFailure } from "./types.js";
 
-const { Client, utils } = ssh2;
+const { Client, utils, BaseAgent, createAgent } = ssh2;
+
+/** The selected public identity is the entire authority granted to this agent. */
+class SelectedKeyAgent extends BaseAgent {
+  readonly #agent: InstanceType<typeof BaseAgent>;
+  readonly #publicKey: Buffer;
+  constructor(endpoint: string, publicKey: Uint8Array, readonly failed: () => void) {
+    super();
+    this.#agent = createAgent(endpoint);
+    if (publicKey.byteLength === 0 || publicKey.byteLength > 64 * 1024) throw new RemoteSshError("NODE_KEY_CHANGED", "The selected node key changed.", false);
+    const parsed = utils.parseKey(Buffer.from(publicKey));
+    if (parsed instanceof Error || parsed.isPrivateKey()) throw new RemoteSshError("NODE_KEY_CHANGED", "The selected node key changed.", false);
+    this.#publicKey = parsed.getPublicSSH();
+  }
+  #matches(key: string | Buffer | ParsedKey): boolean {
+    const parsed = typeof key === "object" && "getPublicSSH" in key ? key : utils.parseKey(key);
+    return !(parsed instanceof Error) && parsed.getPublicSSH().equals(this.#publicKey);
+  }
+  getIdentities(callback: IdentityCallback): void {
+    this.#agent.getIdentities((error, keys) => {
+      const selected = error ? undefined : keys?.find((key) => !(typeof key === "object" && "pubKey" in key) && this.#matches(key));
+      if (!selected) { this.failed(); callback(new Error("Selected SSH identity is unavailable.")); return; }
+      callback(null, [selected]);
+    });
+  }
+  sign(key: string | Buffer | ParsedKey, data: Buffer, options: SigningRequestOptions | SignCallback, callback?: SignCallback): void {
+    const done = typeof options === "function" ? options : callback;
+    if (!done) return;
+    if (!this.#matches(key)) { this.failed(); done(new Error("Selected SSH identity is unavailable.")); return; }
+    this.#agent.sign(key, data, typeof options === "function" ? {} : options, (error, signature) => {
+      if (error) { this.failed(); done(new Error("Selected SSH identity is unavailable.")); return; }
+      done(null, signature);
+    });
+  }
+}
 
 const MAXIMUM_FILE_TRANSFER_BYTES = 64 * 1_024 * 1_024;
 const MAXIMUM_DIRECTORY_ENTRIES = 10_000;
@@ -48,6 +89,7 @@ const DEFAULT_KEEPALIVE_COUNT_MAX = 3;
 const SSH2_CAPABILITIES: RemoteSshTransportCapabilities = Object.freeze({
   commandExecution: true,
   processStreaming: true,
+  interactiveTerminal: true,
   fileTransfer: true,
   tcpForwarding: true
 });
@@ -58,6 +100,10 @@ export interface Ssh2ResolvedAgentAuthConnectorOptions {
   readonly readyTimeoutMs?: number;
   readonly keepaliveIntervalMs?: number;
   readonly keepaliveCountMax?: number;
+  readonly terminalOpenTimeoutMs?: number;
+  readonly terminalOperationTimeoutMs?: number;
+  readonly terminalStopTimeoutMs?: number;
+  readonly terminalDrainTimeoutMs?: number;
 }
 
 /**
@@ -70,9 +116,16 @@ export class Ssh2ResolvedAgentAuthConnector implements ResolvedAgentAuthConnecto
   readonly #readyTimeoutMs: number;
   readonly #keepaliveIntervalMs: number;
   readonly #keepaliveCountMax: number;
+  readonly #terminalTimeouts: Ssh2TerminalTimeouts;
 
   constructor(options: Ssh2ResolvedAgentAuthConnectorOptions = {}) {
     this.#systemAgentEndpoint = options.systemAgentEndpoint;
+    this.#terminalTimeouts = Object.freeze({
+      open: boundedInteger(options.terminalOpenTimeoutMs ?? 20_000, "terminal open timeout", 1, 120_000),
+      operation: boundedInteger(options.terminalOperationTimeoutMs ?? 5_000, "terminal operation timeout", 1, 30_000),
+      stop: boundedInteger(options.terminalStopTimeoutMs ?? 2_000, "terminal stop timeout", 1, 30_000),
+      drain: boundedInteger(options.terminalDrainTimeoutMs ?? 1_000, "terminal output drain timeout", 1, 2_000)
+    });
     this.#readyTimeoutMs = boundedInteger(
       options.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS,
       "ready timeout",
@@ -118,9 +171,12 @@ export class Ssh2ResolvedAgentAuthConnector implements ResolvedAgentAuthConnecto
         }
       }
 
-      const agentEndpoint = request.authentication.kind === "system_agent"
+      const agentEndpoint = request.authentication.kind !== "private_key"
         ? resolveSystemAgentEndpoint(request.authentication.endpoint, this.#systemAgentEndpoint)
         : undefined;
+      if (request.authentication.kind === "agent_key" && agentEndpoint === undefined) {
+        throw new RemoteSshError("NODE_KEY_UNAVAILABLE", "The selected node key is unavailable in the SSH agent.", false);
+      }
       if (request.authentication.kind === "system_agent" && agentEndpoint === undefined) {
         throw new AgentAuthConnectorFailure("AUTHENTICATION_FAILED");
       }
@@ -131,6 +187,11 @@ export class Ssh2ResolvedAgentAuthConnector implements ResolvedAgentAuthConnecto
         let hostVerificationAttempted = false;
         let authenticationReported = false;
         let verificationFailure: unknown;
+        let identityFailure: RemoteSshError | undefined;
+        const agent = request.authentication.kind === "agent_key"
+          ? new SelectedKeyAgent(agentEndpoint!, request.authentication.publicKey, () => {
+            identityFailure = new RemoteSshError("NODE_KEY_UNAVAILABLE", "The selected node key is unavailable in the SSH agent.", false);
+          }) : agentEndpoint;
 
         const cleanupBeforeReady = (): void => {
           request.signal.removeEventListener("abort", onAbort);
@@ -142,14 +203,17 @@ export class Ssh2ResolvedAgentAuthConnector implements ResolvedAgentAuthConnecto
           if (settled) return;
           settled = true;
           cleanupBeforeReady();
+          // Agent callbacks may report a second error after authentication has
+          // already failed. The closed client must not emit an unhandled event.
+          client.on("error", () => undefined);
           client.destroy();
           reject(safeConnectFailure(error));
         };
         const onAbort = (): void => fail(abortedError());
         const onError = (error: Error & ClientErrorExtensions): void => {
-          fail(verificationFailure ?? connectorFailure(error));
+          fail(verificationFailure ?? identityFailure ?? connectorFailure(error));
         };
-        const onClose = (): void => fail(verificationFailure ?? new AgentAuthConnectorFailure("CONNECTION_FAILED"));
+        const onClose = (): void => fail(verificationFailure ?? identityFailure ?? new AgentAuthConnectorFailure("CONNECTION_FAILED"));
         const onReady = (): void => {
           if (!hostVerificationAttempted || !authenticationReported) {
             fail(new RemoteSshError(
@@ -165,7 +229,7 @@ export class Ssh2ResolvedAgentAuthConnector implements ResolvedAgentAuthConnecto
           }
           settled = true;
           cleanupBeforeReady();
-          resolve(new Ssh2AgentAuthConnection(client));
+        resolve(new Ssh2AgentAuthConnection(client, this.#terminalTimeouts));
         };
 
         request.signal.addEventListener("abort", onAbort, { once: true });
@@ -184,7 +248,7 @@ export class Ssh2ResolvedAgentAuthConnector implements ResolvedAgentAuthConnecto
           authHandler: request.authentication.kind === "private_key" ? ["publickey"] : ["agent"],
           ...(privateKey === undefined ? {} : { privateKey }),
           ...(passphrase === undefined ? {} : { passphrase }),
-          ...(agentEndpoint === undefined ? {} : { agent: agentEndpoint }),
+          ...(agent === undefined ? {} : { agent }),
           hostVerifier: (key: Buffer, done: (accepted: boolean) => void): void => {
             hostVerificationAttempted = true;
             let algorithm: string;
@@ -244,6 +308,7 @@ export class Ssh2ResolvedAgentAuthConnector implements ResolvedAgentAuthConnecto
 class Ssh2AgentAuthConnection implements AgentAuthConnection {
   readonly capabilities = SSH2_CAPABILITIES;
   readonly processes: RemoteProcessTransportPort;
+  readonly terminals: RemoteTerminalTransportPort;
   readonly files: RemoteFileTransportPort;
   readonly forwarding: RemoteForwardingTransportPort;
   readonly #client: InstanceType<typeof Client>;
@@ -255,11 +320,16 @@ class Ssh2AgentAuthConnection implements AgentAuthConnection {
   #closed = false;
   #sftpPromise: Promise<SFTPWrapper> | undefined;
 
-  constructor(client: InstanceType<typeof Client>) {
+  constructor(client: InstanceType<typeof Client>, terminalTimeouts: Ssh2TerminalTimeouts) {
     this.#client = client;
     this.processes = Object.freeze({
       open: (request: RemoteProcessStartRequest) => this.openProcess(request)
     });
+    this.terminals = Object.freeze({ open: async (request: RemoteTerminalStartRequest) => {
+      this.assertOpen();
+      const command = processCommand({ executable: request.executable, args: request.args, cwd: request.cwd });
+      return openSsh2Terminal(client, command, request, terminalTimeouts);
+    } });
     this.files = new Ssh2RemoteFileTransport(
       (signal) => this.sftp(signal),
       () => this.invalidateSftp()

@@ -6,7 +6,7 @@ import type { GenEnum, GenFile, GenMessage } from "@bufbuild/protobuf/codegenv2"
 import { enumDesc, fileDesc, messageDesc } from "@bufbuild/protobuf/codegenv2";
 import type { Timestamp } from "@bufbuild/protobuf/wkt";
 import { file_google_protobuf_timestamp } from "@bufbuild/protobuf/wkt";
-import type { ArtifactKind, BlobRef, EntityVersion, ErrorInfo, ImageRef, RemoteWorkspaceBinding, TextRange } from "./common_pb.js";
+import type { ArtifactKind, AudioArtifactMetadata, BlobRef, EntityVersion, ErrorInfo, ImageRef, RemoteWorkspaceBinding, TextRange } from "./common_pb.js";
 import { file_joko_v1_common } from "./common_pb.js";
 import type { Message } from "@bufbuild/protobuf";
 
@@ -14,7 +14,80 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file joko/v1/workspace.proto.
  */
 export const file_joko_v1_workspace: GenFile = /*@__PURE__*/
-  fileDesc("Chdqb2tvL3YxL3dvcmtzcGFjZS5wcm90bxIHam9rby52MSK2AgoTV29ya3NwYWNlRGVzY3JpcHRvchIUCgx3b3Jrc3BhY2VfaWQYASABKAkSEQoJdGFyZ2V0X2lkGAIgASgJEhQKDGRpc3BsYXlfbmFtZRgDIAEoCRIkCgRraW5kGAQgASgOMhYuam9rby52MS5Xb3Jrc3BhY2VLaW5kEhsKE3NlcnZlcl9wYXRoX2Rpc3BsYXkYBSABKAkSDwoHdHJ1c3RlZBgGIAEoCBIoCgNnaXQYByABKAsyGy5qb2tvLnYxLkdpdFJlcG9zaXRvcnlTdGF0ZRInCgd2ZXJzaW9uGAggASgLMhYuam9rby52MS5FbnRpdHlWZXJzaW9uEjkKEHJlbW90ZV93b3Jrc3BhY2UYCSABKAsyHy5qb2tvLnYxLlJlbW90ZVdvcmtzcGFjZUJpbmRpbmcifwoMRmlsZVJldmlzaW9uEhIKCnNoYTI1Nl9oZXgYASABKAkSEQoJYnl0ZV9zaXplGAIgASgEEi8KC21vZGlmaWVkX2F0GAMgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBIXCg9vcGFxdWVfcmV2aXNpb24YBCABKAki5QEKDldvcmtzcGFjZUVudHJ5EhQKDHdvcmtzcGFjZV9pZBgBIAEoCRIVCg1yZWxhdGl2ZV9wYXRoGAIgASgJEhQKDGRpc3BsYXlfbmFtZRgDIAEoCRIfCgRraW5kGAQgASgOMhEuam9rby52MS5GaWxlS2luZBInCghyZXZpc2lvbhgFIAEoCzIVLmpva28udjEuRmlsZVJldmlzaW9uEhEKCWdlbmVyYXRlZBgGIAEoCBIPCgdpZ25vcmVkGAcgASgIEg4KBmhpZGRlbhgIIAEoCBISCgptZWRpYV90eXBlGAkgASgJIvEBCgtGaWxlUHJldmlldxImCgVlbnRyeRgBIAEoCzIXLmpva28udjEuV29ya3NwYWNlRW50cnkSKAoEdGV4dBgCIAEoCzIYLmpva28udjEuVGV4dEZpbGVQcmV2aWV3SAASIgoFaW1hZ2UYAyABKAsyES5qb2tvLnYxLkltYWdlUmVmSAASIAoEYmxvYhgEIAEoCzIQLmpva28udjEuQmxvYlJlZkgAEiwKBmJpbmFyeRgFIAEoCzIaLmpva28udjEuQmluYXJ5RmlsZVByZXZpZXdIABIRCgl0cnVuY2F0ZWQYBiABKAhCCQoHY29udGVudCJ0Cg9UZXh0RmlsZVByZXZpZXcSEQoJdXRmOF90ZXh0GAEgASgJEhMKC2xhbmd1YWdlX2lkGAIgASgJEhIKCnN0YXJ0X2J5dGUYAyABKAQSEAoIZW5kX2J5dGUYBCABKAQSEwoLdG90YWxfbGluZXMYBSABKA0iOAoRQmluYXJ5RmlsZVByZXZpZXcSEgoKbWVkaWFfdHlwZRgBIAEoCRIPCgdzdW1tYXJ5GAIgASgJIsUBChRXb3Jrc3BhY2VTZWFyY2hNYXRjaBIVCg1yZWxhdGl2ZV9wYXRoGAEgASgJEiEKBXJhbmdlGAIgASgLMhIuam9rby52MS5UZXh0UmFuZ2USFAoMbGluZV9wcmV2aWV3GAMgASgJEicKCHJldmlzaW9uGAQgASgLMhUuam9rby52MS5GaWxlUmV2aXNpb24SNAoKc3VibWF0Y2hlcxgFIAMoCzIgLmpva28udjEuV29ya3NwYWNlU2VhcmNoU3VibWF0Y2gilwIKE1dvcmtzcGFjZUZpbGVDaGFuZ2USFAoMd29ya3NwYWNlX2lkGAEgASgJEi4KBGtpbmQYAiABKA4yIC5qb2tvLnYxLldvcmtzcGFjZUZpbGVDaGFuZ2VLaW5kEhUKDXJlbGF0aXZlX3BhdGgYAyABKAkSHgoWcHJldmlvdXNfcmVsYXRpdmVfcGF0aBgEIAEoCRInCghyZXZpc2lvbhgFIAEoCzIVLmpva28udjEuRmlsZVJldmlzaW9uEhAKCHNlcXVlbmNlGAYgASgEEhcKD3N0cmVhbV9yZXZpc2lvbhgHIAEoCRIvCgtvYnNlcnZlZF9hdBgIIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXAi4wEKEkdpdFJlcG9zaXRvcnlTdGF0ZRISCgpyZXBvc2l0b3J5GAEgASgIEhMKC2JyYW5jaF9uYW1lGAIgASgJEhMKC2hlYWRfY29tbWl0GAMgASgJEhUKDWRldGFjaGVkX2hlYWQYBCABKAgSDQoFZGlydHkYBSABKAgSHQoVb3BlcmF0aW9uX2luX3Byb2dyZXNzGAYgASgIEicKB2NoYW5nZXMYByADKAsyFi5qb2tvLnYxLkdpdEZpbGVDaGFuZ2USIQoFZXJyb3IYCCABKAsyEi5qb2tvLnYxLkVycm9ySW5mbyK0AQoNR2l0RmlsZUNoYW5nZRIVCg1yZWxhdGl2ZV9wYXRoGAEgASgJEhkKEW9sZF9yZWxhdGl2ZV9wYXRoGAIgASgJEiwKDGluZGV4X3N0YXR1cxgDIAEoDjIWLmpva28udjEuR2l0RmlsZVN0YXR1cxIzChN3b3JraW5nX3RyZWVfc3RhdHVzGAQgASgOMhYuam9rby52MS5HaXRGaWxlU3RhdHVzEg4KBmJpbmFyeRgFIAEoCCJhCghEaWZmTGluZRIjCgRraW5kGAEgASgOMhUuam9rby52MS5EaWZmTGluZUtpbmQSEAoIb2xkX2xpbmUYAiABKA0SEAoIbmV3X2xpbmUYAyABKA0SDAoEdGV4dBgEIAEoCSKJAQoIRGlmZkh1bmsSEQoJb2xkX3N0YXJ0GAEgASgNEhEKCW9sZF9jb3VudBgCIAEoDRIRCgluZXdfc3RhcnQYAyABKA0SEQoJbmV3X2NvdW50GAQgASgNEg8KB2hlYWRpbmcYBSABKAkSIAoFbGluZXMYBiADKAsyES5qb2tvLnYxLkRpZmZMaW5lIuMBCghGaWxlRGlmZhIVCg1yZWxhdGl2ZV9wYXRoGAEgASgJEhkKEW9sZF9yZWxhdGl2ZV9wYXRoGAIgASgJEiYKBnN0YXR1cxgDIAEoDjIWLmpva28udjEuR2l0RmlsZVN0YXR1cxIOCgZiaW5hcnkYBCABKAgSIAoFaHVua3MYBSADKAsyES5qb2tvLnYxLkRpZmZIdW5rEiMKCWZ1bGxfZGlmZhgGIAEoCzIQLmpva28udjEuQmxvYlJlZhImCgZzb3VyY2UYByABKA4yFi5qb2tvLnYxLkdpdERpZmZTb3VyY2Ui7QQKDVdvcmtzcGFjZURpZmYSFAoMd29ya3NwYWNlX2lkGAEgASgJEiAKBWZpbGVzGAIgAygLMhEuam9rby52MS5GaWxlRGlmZhIRCgl0cnVuY2F0ZWQYAyABKAgSJwoNY29tcGxldGVfZGlmZhgEIAEoCzIQLmpva28udjEuQmxvYlJlZhIgChNyZXBvc2l0b3J5X3JldmlzaW9uGAUgASgJSACIAQESGgoNYmFzZV9yZXZpc2lvbhgGIAEoCUgBiAEBEhoKDWhlYWRfcmV2aXNpb24YByABKAlIAogBARIgChNtZXJnZV9iYXNlX3JldmlzaW9uGAggASgJSAOIAQESKwoGc291cmNlGAkgASgOMhYuam9rby52MS5HaXREaWZmU291cmNlSASIAQESHAoPc291cmNlX3JldmlzaW9uGAogASgJSAWIAQESHwoScmVxdWVzdGVkX2Jhc2VfcmVmGAsgASgJSAaIAQESHgoRcmVzb2x2ZWRfYmFzZV9yZWYYDCABKAlIB4gBARJAChNicmFuY2hfYmFzZV93YXJuaW5nGA0gASgLMiMuam9rby52MS5Xb3Jrc3BhY2VCcmFuY2hCYXNlV2FybmluZ0IWChRfcmVwb3NpdG9yeV9yZXZpc2lvbkIQCg5fYmFzZV9yZXZpc2lvbkIQCg5faGVhZF9yZXZpc2lvbkIWChRfbWVyZ2VfYmFzZV9yZXZpc2lvbkIJCgdfc291cmNlQhIKEF9zb3VyY2VfcmV2aXNpb25CFQoTX3JlcXVlc3RlZF9iYXNlX3JlZkIUChJfcmVzb2x2ZWRfYmFzZV9yZWYiigEKGldvcmtzcGFjZUJyYW5jaEJhc2VXYXJuaW5nEjUKBGNvZGUYASABKA4yJy5qb2tvLnYxLldvcmtzcGFjZUJyYW5jaEJhc2VXYXJuaW5nQ29kZRIaChJyZXF1ZXN0ZWRfYmFzZV9yZWYYAiABKAkSGQoRcmVzb2x2ZWRfYmFzZV9yZWYYAyABKAkinwIKEldvcmtzcGFjZUNoYW5nZVNldBIVCg1jaGFuZ2Vfc2V0X2lkGAEgASgJEhQKDHdvcmtzcGFjZV9pZBgCIAEoCRISCgpzZXNzaW9uX2lkGAMgASgJEg4KBnJ1bl9pZBgEIAEoCRIPCgd0dXJuX2lkGAUgASgJEhMKC2Jhc2VsaW5lX2lkGAYgASgJEiQKB2NoYW5nZXMYByADKAsyEy5qb2tvLnYxLkZpbGVDaGFuZ2USGQoRY29tcGxldGVfYmFzZWxpbmUYCCABKAgSIAoEZ2FwcxgJIAMoCzISLmpva28udjEuUmV3aW5kR2FwEi8KC2NhcHR1cmVkX2F0GAogASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcCLlAQoKRmlsZUNoYW5nZRIVCg1yZWxhdGl2ZV9wYXRoGAEgASgJEhkKEW9sZF9yZWxhdGl2ZV9wYXRoGAIgASgJEiUKBGtpbmQYAyABKA4yFy5qb2tvLnYxLkZpbGVDaGFuZ2VLaW5kEi4KD2JlZm9yZV9yZXZpc2lvbhgEIAEoCzIVLmpva28udjEuRmlsZVJldmlzaW9uEi0KDmFmdGVyX3JldmlzaW9uGAUgASgLMhUuam9rby52MS5GaWxlUmV2aXNpb24SHwoEZGlmZhgGIAEoCzIRLmpva28udjEuRmlsZURpZmYiXQoJUmV3aW5kR2FwEiQKBGtpbmQYASABKA4yFi5qb2tvLnYxLlJld2luZEdhcEtpbmQSFQoNcmVsYXRpdmVfcGF0aBgCIAEoCRITCgtleHBsYW5hdGlvbhgDIAEoCSL2AgoWV29ya3NwYWNlUmV3aW5kUHJldmlldxISCgpwcmV2aWV3X2lkGAEgASgJEhUKDWNoYW5nZV9zZXRfaWQYAiABKAkSFAoMd29ya3NwYWNlX2lkGAMgASgJEiUKBnNhZmV0eRgEIAEoDjIVLmpva28udjEuUmV3aW5kU2FmZXR5EiwKD2ludmVyc2VfY2hhbmdlcxgFIAMoCzITLmpva28udjEuRmlsZUNoYW5nZRIgCgRnYXBzGAYgAygLMhIuam9rby52MS5SZXdpbmRHYXASLQoJY29uZmxpY3RzGAcgAygLMhouam9rby52MS5Xb3Jrc3BhY2VDb25mbGljdBIkCgRkaWZmGAggASgLMhYuam9rby52MS5Xb3Jrc3BhY2VEaWZmEi4KCmV4cGlyZXNfYXQYCSABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEh8KF2RpYWxvZ3VlX29ubHlfYXZhaWxhYmxlGAogASgIIqEBChFXb3Jrc3BhY2VDb25mbGljdBIVCg1yZWxhdGl2ZV9wYXRoGAEgASgJEjAKEWV4cGVjdGVkX3JldmlzaW9uGAIgASgLMhUuam9rby52MS5GaWxlUmV2aXNpb24SLgoPYWN0dWFsX3JldmlzaW9uGAMgASgLMhUuam9rby52MS5GaWxlUmV2aXNpb24SEwoLZXhwbGFuYXRpb24YBCABKAkiyAEKDkV4dHJhRGlyZWN0b3J5EhoKEmV4dHJhX2RpcmVjdG9yeV9pZBgBIAEoCRIUCgx3b3Jrc3BhY2VfaWQYAiABKAkSGwoTc2VydmVyX3BhdGhfZGlzcGxheRgDIAEoCRItCgZhY2Nlc3MYBCABKA4yHS5qb2tvLnYxLkV4dHJhRGlyZWN0b3J5QWNjZXNzEg8KB3RydXN0ZWQYBSABKAgSJwoHdmVyc2lvbhgGIAEoCzIWLmpva28udjEuRW50aXR5VmVyc2lvbiKMAgoIQXJ0aWZhY3QSEwoLYXJ0aWZhY3RfaWQYASABKAkSEgoKc2Vzc2lvbl9pZBgCIAEoCRIOCgZydW5faWQYAyABKAkSIwoEa2luZBgEIAEoDjIVLmpva28udjEuQXJ0aWZhY3RLaW5kEg0KBXRpdGxlGAUgASgJEhMKC2Rlc2NyaXB0aW9uGAYgASgJEh4KBGJsb2IYByABKAsyEC5qb2tvLnYxLkJsb2JSZWYSLgoKY3JlYXRlZF9hdBgIIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASLgoKZXhwaXJlc19hdBgJIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXAi5gEKEkJsb2JUcmFuc2ZlclRpY2tldBIRCgl0aWNrZXRfaWQYASABKAkSDwoHYmxvYl9pZBgCIAEoCRItCglkaXJlY3Rpb24YAyABKA4yGi5qb2tvLnYxLlRyYW5zZmVyRGlyZWN0aW9uEhkKEXJlbGF0aXZlX2VuZHBvaW50GAQgASgJEi4KCmV4cGlyZXNfYXQYBSABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEhUKDW1heGltdW1fYnl0ZXMYBiABKAQSGwoTcmVxdWlyZWRfbWVkaWFfdHlwZRgHIAEoCSKMAQoRUGVuZGluZ0Jsb2JVcGxvYWQSEQoJdXBsb2FkX2lkGAEgASgJEisKBnRpY2tldBgCIAEoCzIbLmpva28udjEuQmxvYlRyYW5zZmVyVGlja2V0EhsKE2V4cGVjdGVkX3NoYTI1Nl9oZXgYAyABKAkSGgoSZXhwZWN0ZWRfYnl0ZV9zaXplGAQgASgEIj8KF1dvcmtzcGFjZVNlYXJjaFN1Ym1hdGNoEhIKCnN0YXJ0X2J5dGUYASABKAQSEAoIZW5kX2J5dGUYAiABKAQqdQoNV29ya3NwYWNlS2luZBIeChpXT1JLU1BBQ0VfS0lORF9VTlNQRUNJRklFRBAAEh8KG1dPUktTUEFDRV9LSU5EX1VTRVJfUFJPSkVDVBABEiMKH1dPUktTUEFDRV9LSU5EX01BTkFHRURfRElBTE9HVUUQAiqJAQoIRmlsZUtpbmQSGQoVRklMRV9LSU5EX1VOU1BFQ0lGSUVEEAASFQoRRklMRV9LSU5EX1JFR1VMQVIQARIXChNGSUxFX0tJTkRfRElSRUNUT1JZEAISGwoXRklMRV9LSU5EX1NZTUJPTElDX0xJTksQAxIVChFGSUxFX0tJTkRfU1BFQ0lBTBAEKrYCChdXb3Jrc3BhY2VGaWxlQ2hhbmdlS2luZBIqCiZXT1JLU1BBQ0VfRklMRV9DSEFOR0VfS0lORF9VTlNQRUNJRklFRBAAEiYKIldPUktTUEFDRV9GSUxFX0NIQU5HRV9LSU5EX0NSRUFURUQQARInCiNXT1JLU1BBQ0VfRklMRV9DSEFOR0VfS0lORF9NT0RJRklFRBACEiYKIldPUktTUEFDRV9GSUxFX0NIQU5HRV9LSU5EX0RFTEVURUQQAxImCiJXT1JLU1BBQ0VfRklMRV9DSEFOR0VfS0lORF9SRU5BTUVEEAQSJwojV09SS1NQQUNFX0ZJTEVfQ0hBTkdFX0tJTkRfT1ZFUkZMT1cQBRIlCiFXT1JLU1BBQ0VfRklMRV9DSEFOR0VfS0lORF9SRVNZTkMQBiq7AgoNR2l0RmlsZVN0YXR1cxIfChtHSVRfRklMRV9TVEFUVVNfVU5TUEVDSUZJRUQQABIeChpHSVRfRklMRV9TVEFUVVNfVU5NT0RJRklFRBABEhkKFUdJVF9GSUxFX1NUQVRVU19BRERFRBACEhwKGEdJVF9GSUxFX1NUQVRVU19NT0RJRklFRBADEhsKF0dJVF9GSUxFX1NUQVRVU19ERUxFVEVEEAQSGwoXR0lUX0ZJTEVfU1RBVFVTX1JFTkFNRUQQBRIaChZHSVRfRklMRV9TVEFUVVNfQ09QSUVEEAYSHQoZR0lUX0ZJTEVfU1RBVFVTX1VOVFJBQ0tFRBAHEhsKF0dJVF9GSUxFX1NUQVRVU19JR05PUkVEEAgSHgoaR0lUX0ZJTEVfU1RBVFVTX0NPTkZMSUNURUQQCSqfAQoMRGlmZkxpbmVLaW5kEh4KGkRJRkZfTElORV9LSU5EX1VOU1BFQ0lGSUVEEAASGgoWRElGRl9MSU5FX0tJTkRfQ09OVEVYVBABEhgKFERJRkZfTElORV9LSU5EX0FEREVEEAISGgoWRElGRl9MSU5FX0tJTkRfUkVNT1ZFRBADEh0KGURJRkZfTElORV9LSU5EX05PX05FV0xJTkUQBCrfAQoNR2l0RGlmZlNvdXJjZRIfChtHSVRfRElGRl9TT1VSQ0VfVU5TUEVDSUZJRUQQABIcChhHSVRfRElGRl9TT1VSQ0VfVU5TVEFHRUQQARIaChZHSVRfRElGRl9TT1VSQ0VfU1RBR0VEEAISGgoWR0lUX0RJRkZfU09VUkNFX0NPTU1JVBADEhoKFkdJVF9ESUZGX1NPVVJDRV9CUkFOQ0gQBBIdChlHSVRfRElGRl9TT1VSQ0VfTEFTVF9UVVJOEAUSHAoYR0lUX0RJRkZfU09VUkNFX1RVUk5fU0VUEAYqogEKE1dvcmtzcGFjZURpZmZBY3Rpb24SJQohV09SS1NQQUNFX0RJRkZfQUNUSU9OX1VOU1BFQ0lGSUVEEAASHwobV09SS1NQQUNFX0RJRkZfQUNUSU9OX1NUQUdFEAESIQodV09SS1NQQUNFX0RJRkZfQUNUSU9OX1VOU1RBR0UQAhIgChxXT1JLU1BBQ0VfRElGRl9BQ1RJT05fUkVWRVJUEAMqfAoTV29ya3NwYWNlRGlmZlRhcmdldBIlCiFXT1JLU1BBQ0VfRElGRl9UQVJHRVRfVU5TUEVDSUZJRUQQABIeChpXT1JLU1BBQ0VfRElGRl9UQVJHRVRfRklMRRABEh4KGldPUktTUEFDRV9ESUZGX1RBUkdFVF9IVU5LEAIqkwEKHldvcmtzcGFjZUJyYW5jaEJhc2VXYXJuaW5nQ29kZRIyCi5XT1JLU1BBQ0VfQlJBTkNIX0JBU0VfV0FSTklOR19DT0RFX1VOU1BFQ0lGSUVEEAASPQo5V09SS1NQQUNFX0JSQU5DSF9CQVNFX1dBUk5JTkdfQ09ERV9SRVFVRVNURURfQkFTRV9NSVNTSU5HEAEqqgEKDkZpbGVDaGFuZ2VLaW5kEiAKHEZJTEVfQ0hBTkdFX0tJTkRfVU5TUEVDSUZJRUQQABIcChhGSUxFX0NIQU5HRV9LSU5EX0NSRUFURUQQARIcChhGSUxFX0NIQU5HRV9LSU5EX1VQREFURUQQAhIcChhGSUxFX0NIQU5HRV9LSU5EX0RFTEVURUQQAxIcChhGSUxFX0NIQU5HRV9LSU5EX1JFTkFNRUQQBCrsAQoNUmV3aW5kR2FwS2luZBIfChtSRVdJTkRfR0FQX0tJTkRfVU5TUEVDSUZJRUQQABIkCiBSRVdJTkRfR0FQX0tJTkRfTUlTU0lOR19CQVNFTElORRABEiIKHlJFV0lORF9HQVBfS0lORF9DQVBUVVJFX0ZBSUxFRBACEiQKIFJFV0lORF9HQVBfS0lORF9VTlNVUFBPUlRFRF9GSUxFEAMSIwofUkVXSU5EX0dBUF9LSU5EX0VYVEVSTkFMX1dSSVRFUhAEEiUKIVJFV0lORF9HQVBfS0lORF9DT05DVVJSRU5UX0NIQU5HRRAFKokBCgxSZXdpbmRTYWZldHkSHQoZUkVXSU5EX1NBRkVUWV9VTlNQRUNJRklFRBAAEhYKElJFV0lORF9TQUZFVFlfU0FGRRABEicKI1JFV0lORF9TQUZFVFlfUkVRVUlSRVNfQ09ORklSTUFUSU9OEAISGQoVUkVXSU5EX1NBRkVUWV9CTE9DS0VEEAMqiwEKFEV4dHJhRGlyZWN0b3J5QWNjZXNzEiYKIkVYVFJBX0RJUkVDVE9SWV9BQ0NFU1NfVU5TUEVDSUZJRUQQABIkCiBFWFRSQV9ESVJFQ1RPUllfQUNDRVNTX1JFQURfT05MWRABEiUKIUVYVFJBX0RJUkVDVE9SWV9BQ0NFU1NfUkVBRF9XUklURRACKncKEVRyYW5zZmVyRGlyZWN0aW9uEiIKHlRSQU5TRkVSX0RJUkVDVElPTl9VTlNQRUNJRklFRBAAEh0KGVRSQU5TRkVSX0RJUkVDVElPTl9VUExPQUQQARIfChtUUkFOU0ZFUl9ESVJFQ1RJT05fRE9XTkxPQUQQAmIGcHJvdG8z", [file_google_protobuf_timestamp, file_joko_v1_common]);
+  fileDesc("Chdqb2tvL3YxL3dvcmtzcGFjZS5wcm90bxIHam9rby52MSJgChZXb3Jrc3BhY2VIdG1sUmVmZXJlbmNlEhQKDHdvcmtzcGFjZV9pZBgBIAEoCRIVCg1yZWxhdGl2ZV9wYXRoGAIgASgJEhkKEWV4cGVjdGVkX3JldmlzaW9uGAMgASgJImUKIFJlYWRXb3Jrc3BhY2VIdG1sU25hcHNob3RSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSLQoEZmlsZRgCIAEoCzIfLmpva28udjEuV29ya3NwYWNlSHRtbFJlZmVyZW5jZSJlCiFSZWFkV29ya3NwYWNlSHRtbFNuYXBzaG90UmVzcG9uc2USLQoEZmlsZRgBIAEoCzIfLmpva28udjEuV29ya3NwYWNlSHRtbFJlZmVyZW5jZRIRCgl1dGY4X2h0bWwYAiABKAkitgIKE1dvcmtzcGFjZURlc2NyaXB0b3ISFAoMd29ya3NwYWNlX2lkGAEgASgJEhEKCXRhcmdldF9pZBgCIAEoCRIUCgxkaXNwbGF5X25hbWUYAyABKAkSJAoEa2luZBgEIAEoDjIWLmpva28udjEuV29ya3NwYWNlS2luZBIbChNzZXJ2ZXJfcGF0aF9kaXNwbGF5GAUgASgJEg8KB3RydXN0ZWQYBiABKAgSKAoDZ2l0GAcgASgLMhsuam9rby52MS5HaXRSZXBvc2l0b3J5U3RhdGUSJwoHdmVyc2lvbhgIIAEoCzIWLmpva28udjEuRW50aXR5VmVyc2lvbhI5ChByZW1vdGVfd29ya3NwYWNlGAkgASgLMh8uam9rby52MS5SZW1vdGVXb3Jrc3BhY2VCaW5kaW5nIn8KDEZpbGVSZXZpc2lvbhISCgpzaGEyNTZfaGV4GAEgASgJEhEKCWJ5dGVfc2l6ZRgCIAEoBBIvCgttb2RpZmllZF9hdBgDIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASFwoPb3BhcXVlX3JldmlzaW9uGAQgASgJIuUBCg5Xb3Jrc3BhY2VFbnRyeRIUCgx3b3Jrc3BhY2VfaWQYASABKAkSFQoNcmVsYXRpdmVfcGF0aBgCIAEoCRIUCgxkaXNwbGF5X25hbWUYAyABKAkSHwoEa2luZBgEIAEoDjIRLmpva28udjEuRmlsZUtpbmQSJwoIcmV2aXNpb24YBSABKAsyFS5qb2tvLnYxLkZpbGVSZXZpc2lvbhIRCglnZW5lcmF0ZWQYBiABKAgSDwoHaWdub3JlZBgHIAEoCBIOCgZoaWRkZW4YCCABKAgSEgoKbWVkaWFfdHlwZRgJIAEoCSLxAQoLRmlsZVByZXZpZXcSJgoFZW50cnkYASABKAsyFy5qb2tvLnYxLldvcmtzcGFjZUVudHJ5EigKBHRleHQYAiABKAsyGC5qb2tvLnYxLlRleHRGaWxlUHJldmlld0gAEiIKBWltYWdlGAMgASgLMhEuam9rby52MS5JbWFnZVJlZkgAEiAKBGJsb2IYBCABKAsyEC5qb2tvLnYxLkJsb2JSZWZIABIsCgZiaW5hcnkYBSABKAsyGi5qb2tvLnYxLkJpbmFyeUZpbGVQcmV2aWV3SAASEQoJdHJ1bmNhdGVkGAYgASgIQgkKB2NvbnRlbnQidAoPVGV4dEZpbGVQcmV2aWV3EhEKCXV0ZjhfdGV4dBgBIAEoCRITCgtsYW5ndWFnZV9pZBgCIAEoCRISCgpzdGFydF9ieXRlGAMgASgEEhAKCGVuZF9ieXRlGAQgASgEEhMKC3RvdGFsX2xpbmVzGAUgASgNIjgKEUJpbmFyeUZpbGVQcmV2aWV3EhIKCm1lZGlhX3R5cGUYASABKAkSDwoHc3VtbWFyeRgCIAEoCSLFAQoUV29ya3NwYWNlU2VhcmNoTWF0Y2gSFQoNcmVsYXRpdmVfcGF0aBgBIAEoCRIhCgVyYW5nZRgCIAEoCzISLmpva28udjEuVGV4dFJhbmdlEhQKDGxpbmVfcHJldmlldxgDIAEoCRInCghyZXZpc2lvbhgEIAEoCzIVLmpva28udjEuRmlsZVJldmlzaW9uEjQKCnN1Ym1hdGNoZXMYBSADKAsyIC5qb2tvLnYxLldvcmtzcGFjZVNlYXJjaFN1Ym1hdGNoIpcCChNXb3Jrc3BhY2VGaWxlQ2hhbmdlEhQKDHdvcmtzcGFjZV9pZBgBIAEoCRIuCgRraW5kGAIgASgOMiAuam9rby52MS5Xb3Jrc3BhY2VGaWxlQ2hhbmdlS2luZBIVCg1yZWxhdGl2ZV9wYXRoGAMgASgJEh4KFnByZXZpb3VzX3JlbGF0aXZlX3BhdGgYBCABKAkSJwoIcmV2aXNpb24YBSABKAsyFS5qb2tvLnYxLkZpbGVSZXZpc2lvbhIQCghzZXF1ZW5jZRgGIAEoBBIXCg9zdHJlYW1fcmV2aXNpb24YByABKAkSLwoLb2JzZXJ2ZWRfYXQYCCABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wIuMBChJHaXRSZXBvc2l0b3J5U3RhdGUSEgoKcmVwb3NpdG9yeRgBIAEoCBITCgticmFuY2hfbmFtZRgCIAEoCRITCgtoZWFkX2NvbW1pdBgDIAEoCRIVCg1kZXRhY2hlZF9oZWFkGAQgASgIEg0KBWRpcnR5GAUgASgIEh0KFW9wZXJhdGlvbl9pbl9wcm9ncmVzcxgGIAEoCBInCgdjaGFuZ2VzGAcgAygLMhYuam9rby52MS5HaXRGaWxlQ2hhbmdlEiEKBWVycm9yGAggASgLMhIuam9rby52MS5FcnJvckluZm8itAEKDUdpdEZpbGVDaGFuZ2USFQoNcmVsYXRpdmVfcGF0aBgBIAEoCRIZChFvbGRfcmVsYXRpdmVfcGF0aBgCIAEoCRIsCgxpbmRleF9zdGF0dXMYAyABKA4yFi5qb2tvLnYxLkdpdEZpbGVTdGF0dXMSMwoTd29ya2luZ190cmVlX3N0YXR1cxgEIAEoDjIWLmpva28udjEuR2l0RmlsZVN0YXR1cxIOCgZiaW5hcnkYBSABKAgiYQoIRGlmZkxpbmUSIwoEa2luZBgBIAEoDjIVLmpva28udjEuRGlmZkxpbmVLaW5kEhAKCG9sZF9saW5lGAIgASgNEhAKCG5ld19saW5lGAMgASgNEgwKBHRleHQYBCABKAkiiQEKCERpZmZIdW5rEhEKCW9sZF9zdGFydBgBIAEoDRIRCglvbGRfY291bnQYAiABKA0SEQoJbmV3X3N0YXJ0GAMgASgNEhEKCW5ld19jb3VudBgEIAEoDRIPCgdoZWFkaW5nGAUgASgJEiAKBWxpbmVzGAYgAygLMhEuam9rby52MS5EaWZmTGluZSLjAQoIRmlsZURpZmYSFQoNcmVsYXRpdmVfcGF0aBgBIAEoCRIZChFvbGRfcmVsYXRpdmVfcGF0aBgCIAEoCRImCgZzdGF0dXMYAyABKA4yFi5qb2tvLnYxLkdpdEZpbGVTdGF0dXMSDgoGYmluYXJ5GAQgASgIEiAKBWh1bmtzGAUgAygLMhEuam9rby52MS5EaWZmSHVuaxIjCglmdWxsX2RpZmYYBiABKAsyEC5qb2tvLnYxLkJsb2JSZWYSJgoGc291cmNlGAcgASgOMhYuam9rby52MS5HaXREaWZmU291cmNlIu0ECg1Xb3Jrc3BhY2VEaWZmEhQKDHdvcmtzcGFjZV9pZBgBIAEoCRIgCgVmaWxlcxgCIAMoCzIRLmpva28udjEuRmlsZURpZmYSEQoJdHJ1bmNhdGVkGAMgASgIEicKDWNvbXBsZXRlX2RpZmYYBCABKAsyEC5qb2tvLnYxLkJsb2JSZWYSIAoTcmVwb3NpdG9yeV9yZXZpc2lvbhgFIAEoCUgAiAEBEhoKDWJhc2VfcmV2aXNpb24YBiABKAlIAYgBARIaCg1oZWFkX3JldmlzaW9uGAcgASgJSAKIAQESIAoTbWVyZ2VfYmFzZV9yZXZpc2lvbhgIIAEoCUgDiAEBEisKBnNvdXJjZRgJIAEoDjIWLmpva28udjEuR2l0RGlmZlNvdXJjZUgEiAEBEhwKD3NvdXJjZV9yZXZpc2lvbhgKIAEoCUgFiAEBEh8KEnJlcXVlc3RlZF9iYXNlX3JlZhgLIAEoCUgGiAEBEh4KEXJlc29sdmVkX2Jhc2VfcmVmGAwgASgJSAeIAQESQAoTYnJhbmNoX2Jhc2Vfd2FybmluZxgNIAEoCzIjLmpva28udjEuV29ya3NwYWNlQnJhbmNoQmFzZVdhcm5pbmdCFgoUX3JlcG9zaXRvcnlfcmV2aXNpb25CEAoOX2Jhc2VfcmV2aXNpb25CEAoOX2hlYWRfcmV2aXNpb25CFgoUX21lcmdlX2Jhc2VfcmV2aXNpb25CCQoHX3NvdXJjZUISChBfc291cmNlX3JldmlzaW9uQhUKE19yZXF1ZXN0ZWRfYmFzZV9yZWZCFAoSX3Jlc29sdmVkX2Jhc2VfcmVmIooBChpXb3Jrc3BhY2VCcmFuY2hCYXNlV2FybmluZxI1CgRjb2RlGAEgASgOMicuam9rby52MS5Xb3Jrc3BhY2VCcmFuY2hCYXNlV2FybmluZ0NvZGUSGgoScmVxdWVzdGVkX2Jhc2VfcmVmGAIgASgJEhkKEXJlc29sdmVkX2Jhc2VfcmVmGAMgASgJIp8CChJXb3Jrc3BhY2VDaGFuZ2VTZXQSFQoNY2hhbmdlX3NldF9pZBgBIAEoCRIUCgx3b3Jrc3BhY2VfaWQYAiABKAkSEgoKc2Vzc2lvbl9pZBgDIAEoCRIOCgZydW5faWQYBCABKAkSDwoHdHVybl9pZBgFIAEoCRITCgtiYXNlbGluZV9pZBgGIAEoCRIkCgdjaGFuZ2VzGAcgAygLMhMuam9rby52MS5GaWxlQ2hhbmdlEhkKEWNvbXBsZXRlX2Jhc2VsaW5lGAggASgIEiAKBGdhcHMYCSADKAsyEi5qb2tvLnYxLlJld2luZEdhcBIvCgtjYXB0dXJlZF9hdBgKIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXAi5QEKCkZpbGVDaGFuZ2USFQoNcmVsYXRpdmVfcGF0aBgBIAEoCRIZChFvbGRfcmVsYXRpdmVfcGF0aBgCIAEoCRIlCgRraW5kGAMgASgOMhcuam9rby52MS5GaWxlQ2hhbmdlS2luZBIuCg9iZWZvcmVfcmV2aXNpb24YBCABKAsyFS5qb2tvLnYxLkZpbGVSZXZpc2lvbhItCg5hZnRlcl9yZXZpc2lvbhgFIAEoCzIVLmpva28udjEuRmlsZVJldmlzaW9uEh8KBGRpZmYYBiABKAsyES5qb2tvLnYxLkZpbGVEaWZmIl0KCVJld2luZEdhcBIkCgRraW5kGAEgASgOMhYuam9rby52MS5SZXdpbmRHYXBLaW5kEhUKDXJlbGF0aXZlX3BhdGgYAiABKAkSEwoLZXhwbGFuYXRpb24YAyABKAki9gIKFldvcmtzcGFjZVJld2luZFByZXZpZXcSEgoKcHJldmlld19pZBgBIAEoCRIVCg1jaGFuZ2Vfc2V0X2lkGAIgASgJEhQKDHdvcmtzcGFjZV9pZBgDIAEoCRIlCgZzYWZldHkYBCABKA4yFS5qb2tvLnYxLlJld2luZFNhZmV0eRIsCg9pbnZlcnNlX2NoYW5nZXMYBSADKAsyEy5qb2tvLnYxLkZpbGVDaGFuZ2USIAoEZ2FwcxgGIAMoCzISLmpva28udjEuUmV3aW5kR2FwEi0KCWNvbmZsaWN0cxgHIAMoCzIaLmpva28udjEuV29ya3NwYWNlQ29uZmxpY3QSJAoEZGlmZhgIIAEoCzIWLmpva28udjEuV29ya3NwYWNlRGlmZhIuCgpleHBpcmVzX2F0GAkgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBIfChdkaWFsb2d1ZV9vbmx5X2F2YWlsYWJsZRgKIAEoCCKhAQoRV29ya3NwYWNlQ29uZmxpY3QSFQoNcmVsYXRpdmVfcGF0aBgBIAEoCRIwChFleHBlY3RlZF9yZXZpc2lvbhgCIAEoCzIVLmpva28udjEuRmlsZVJldmlzaW9uEi4KD2FjdHVhbF9yZXZpc2lvbhgDIAEoCzIVLmpva28udjEuRmlsZVJldmlzaW9uEhMKC2V4cGxhbmF0aW9uGAQgASgJIsgBCg5FeHRyYURpcmVjdG9yeRIaChJleHRyYV9kaXJlY3RvcnlfaWQYASABKAkSFAoMd29ya3NwYWNlX2lkGAIgASgJEhsKE3NlcnZlcl9wYXRoX2Rpc3BsYXkYAyABKAkSLQoGYWNjZXNzGAQgASgOMh0uam9rby52MS5FeHRyYURpcmVjdG9yeUFjY2VzcxIPCgd0cnVzdGVkGAUgASgIEicKB3ZlcnNpb24YBiABKAsyFi5qb2tvLnYxLkVudGl0eVZlcnNpb24ixAIKCEFydGlmYWN0EhMKC2FydGlmYWN0X2lkGAEgASgJEhIKCnNlc3Npb25faWQYAiABKAkSDgoGcnVuX2lkGAMgASgJEiMKBGtpbmQYBCABKA4yFS5qb2tvLnYxLkFydGlmYWN0S2luZBINCgV0aXRsZRgFIAEoCRITCgtkZXNjcmlwdGlvbhgGIAEoCRIeCgRibG9iGAcgASgLMhAuam9rby52MS5CbG9iUmVmEi4KCmNyZWF0ZWRfYXQYCCABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEi4KCmV4cGlyZXNfYXQYCSABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEjYKDmF1ZGlvX21ldGFkYXRhGAogASgLMh4uam9rby52MS5BdWRpb0FydGlmYWN0TWV0YWRhdGEi5gEKEkJsb2JUcmFuc2ZlclRpY2tldBIRCgl0aWNrZXRfaWQYASABKAkSDwoHYmxvYl9pZBgCIAEoCRItCglkaXJlY3Rpb24YAyABKA4yGi5qb2tvLnYxLlRyYW5zZmVyRGlyZWN0aW9uEhkKEXJlbGF0aXZlX2VuZHBvaW50GAQgASgJEi4KCmV4cGlyZXNfYXQYBSABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEhUKDW1heGltdW1fYnl0ZXMYBiABKAQSGwoTcmVxdWlyZWRfbWVkaWFfdHlwZRgHIAEoCSKMAQoRUGVuZGluZ0Jsb2JVcGxvYWQSEQoJdXBsb2FkX2lkGAEgASgJEisKBnRpY2tldBgCIAEoCzIbLmpva28udjEuQmxvYlRyYW5zZmVyVGlja2V0EhsKE2V4cGVjdGVkX3NoYTI1Nl9oZXgYAyABKAkSGgoSZXhwZWN0ZWRfYnl0ZV9zaXplGAQgASgEIj8KF1dvcmtzcGFjZVNlYXJjaFN1Ym1hdGNoEhIKCnN0YXJ0X2J5dGUYASABKAQSEAoIZW5kX2J5dGUYAiABKAQqdQoNV29ya3NwYWNlS2luZBIeChpXT1JLU1BBQ0VfS0lORF9VTlNQRUNJRklFRBAAEh8KG1dPUktTUEFDRV9LSU5EX1VTRVJfUFJPSkVDVBABEiMKH1dPUktTUEFDRV9LSU5EX01BTkFHRURfRElBTE9HVUUQAiqJAQoIRmlsZUtpbmQSGQoVRklMRV9LSU5EX1VOU1BFQ0lGSUVEEAASFQoRRklMRV9LSU5EX1JFR1VMQVIQARIXChNGSUxFX0tJTkRfRElSRUNUT1JZEAISGwoXRklMRV9LSU5EX1NZTUJPTElDX0xJTksQAxIVChFGSUxFX0tJTkRfU1BFQ0lBTBAEKrYCChdXb3Jrc3BhY2VGaWxlQ2hhbmdlS2luZBIqCiZXT1JLU1BBQ0VfRklMRV9DSEFOR0VfS0lORF9VTlNQRUNJRklFRBAAEiYKIldPUktTUEFDRV9GSUxFX0NIQU5HRV9LSU5EX0NSRUFURUQQARInCiNXT1JLU1BBQ0VfRklMRV9DSEFOR0VfS0lORF9NT0RJRklFRBACEiYKIldPUktTUEFDRV9GSUxFX0NIQU5HRV9LSU5EX0RFTEVURUQQAxImCiJXT1JLU1BBQ0VfRklMRV9DSEFOR0VfS0lORF9SRU5BTUVEEAQSJwojV09SS1NQQUNFX0ZJTEVfQ0hBTkdFX0tJTkRfT1ZFUkZMT1cQBRIlCiFXT1JLU1BBQ0VfRklMRV9DSEFOR0VfS0lORF9SRVNZTkMQBiq7AgoNR2l0RmlsZVN0YXR1cxIfChtHSVRfRklMRV9TVEFUVVNfVU5TUEVDSUZJRUQQABIeChpHSVRfRklMRV9TVEFUVVNfVU5NT0RJRklFRBABEhkKFUdJVF9GSUxFX1NUQVRVU19BRERFRBACEhwKGEdJVF9GSUxFX1NUQVRVU19NT0RJRklFRBADEhsKF0dJVF9GSUxFX1NUQVRVU19ERUxFVEVEEAQSGwoXR0lUX0ZJTEVfU1RBVFVTX1JFTkFNRUQQBRIaChZHSVRfRklMRV9TVEFUVVNfQ09QSUVEEAYSHQoZR0lUX0ZJTEVfU1RBVFVTX1VOVFJBQ0tFRBAHEhsKF0dJVF9GSUxFX1NUQVRVU19JR05PUkVEEAgSHgoaR0lUX0ZJTEVfU1RBVFVTX0NPTkZMSUNURUQQCSqfAQoMRGlmZkxpbmVLaW5kEh4KGkRJRkZfTElORV9LSU5EX1VOU1BFQ0lGSUVEEAASGgoWRElGRl9MSU5FX0tJTkRfQ09OVEVYVBABEhgKFERJRkZfTElORV9LSU5EX0FEREVEEAISGgoWRElGRl9MSU5FX0tJTkRfUkVNT1ZFRBADEh0KGURJRkZfTElORV9LSU5EX05PX05FV0xJTkUQBCrfAQoNR2l0RGlmZlNvdXJjZRIfChtHSVRfRElGRl9TT1VSQ0VfVU5TUEVDSUZJRUQQABIcChhHSVRfRElGRl9TT1VSQ0VfVU5TVEFHRUQQARIaChZHSVRfRElGRl9TT1VSQ0VfU1RBR0VEEAISGgoWR0lUX0RJRkZfU09VUkNFX0NPTU1JVBADEhoKFkdJVF9ESUZGX1NPVVJDRV9CUkFOQ0gQBBIdChlHSVRfRElGRl9TT1VSQ0VfTEFTVF9UVVJOEAUSHAoYR0lUX0RJRkZfU09VUkNFX1RVUk5fU0VUEAYqogEKE1dvcmtzcGFjZURpZmZBY3Rpb24SJQohV09SS1NQQUNFX0RJRkZfQUNUSU9OX1VOU1BFQ0lGSUVEEAASHwobV09SS1NQQUNFX0RJRkZfQUNUSU9OX1NUQUdFEAESIQodV09SS1NQQUNFX0RJRkZfQUNUSU9OX1VOU1RBR0UQAhIgChxXT1JLU1BBQ0VfRElGRl9BQ1RJT05fUkVWRVJUEAMqfAoTV29ya3NwYWNlRGlmZlRhcmdldBIlCiFXT1JLU1BBQ0VfRElGRl9UQVJHRVRfVU5TUEVDSUZJRUQQABIeChpXT1JLU1BBQ0VfRElGRl9UQVJHRVRfRklMRRABEh4KGldPUktTUEFDRV9ESUZGX1RBUkdFVF9IVU5LEAIqkwEKHldvcmtzcGFjZUJyYW5jaEJhc2VXYXJuaW5nQ29kZRIyCi5XT1JLU1BBQ0VfQlJBTkNIX0JBU0VfV0FSTklOR19DT0RFX1VOU1BFQ0lGSUVEEAASPQo5V09SS1NQQUNFX0JSQU5DSF9CQVNFX1dBUk5JTkdfQ09ERV9SRVFVRVNURURfQkFTRV9NSVNTSU5HEAEqqgEKDkZpbGVDaGFuZ2VLaW5kEiAKHEZJTEVfQ0hBTkdFX0tJTkRfVU5TUEVDSUZJRUQQABIcChhGSUxFX0NIQU5HRV9LSU5EX0NSRUFURUQQARIcChhGSUxFX0NIQU5HRV9LSU5EX1VQREFURUQQAhIcChhGSUxFX0NIQU5HRV9LSU5EX0RFTEVURUQQAxIcChhGSUxFX0NIQU5HRV9LSU5EX1JFTkFNRUQQBCrsAQoNUmV3aW5kR2FwS2luZBIfChtSRVdJTkRfR0FQX0tJTkRfVU5TUEVDSUZJRUQQABIkCiBSRVdJTkRfR0FQX0tJTkRfTUlTU0lOR19CQVNFTElORRABEiIKHlJFV0lORF9HQVBfS0lORF9DQVBUVVJFX0ZBSUxFRBACEiQKIFJFV0lORF9HQVBfS0lORF9VTlNVUFBPUlRFRF9GSUxFEAMSIwofUkVXSU5EX0dBUF9LSU5EX0VYVEVSTkFMX1dSSVRFUhAEEiUKIVJFV0lORF9HQVBfS0lORF9DT05DVVJSRU5UX0NIQU5HRRAFKokBCgxSZXdpbmRTYWZldHkSHQoZUkVXSU5EX1NBRkVUWV9VTlNQRUNJRklFRBAAEhYKElJFV0lORF9TQUZFVFlfU0FGRRABEicKI1JFV0lORF9TQUZFVFlfUkVRVUlSRVNfQ09ORklSTUFUSU9OEAISGQoVUkVXSU5EX1NBRkVUWV9CTE9DS0VEEAMqiwEKFEV4dHJhRGlyZWN0b3J5QWNjZXNzEiYKIkVYVFJBX0RJUkVDVE9SWV9BQ0NFU1NfVU5TUEVDSUZJRUQQABIkCiBFWFRSQV9ESVJFQ1RPUllfQUNDRVNTX1JFQURfT05MWRABEiUKIUVYVFJBX0RJUkVDVE9SWV9BQ0NFU1NfUkVBRF9XUklURRACKncKEVRyYW5zZmVyRGlyZWN0aW9uEiIKHlRSQU5TRkVSX0RJUkVDVElPTl9VTlNQRUNJRklFRBAAEh0KGVRSQU5TRkVSX0RJUkVDVElPTl9VUExPQUQQARIfChtUUkFOU0ZFUl9ESVJFQ1RJT05fRE9XTkxPQUQQAmIGcHJvdG8z", [file_google_protobuf_timestamp, file_joko_v1_common]);
+
+/**
+ * @generated from message joko.v1.WorkspaceHtmlReference
+ */
+export type WorkspaceHtmlReference = Message<"joko.v1.WorkspaceHtmlReference"> & {
+  /**
+   * @generated from field: string workspace_id = 1;
+   */
+  workspaceId: string;
+
+  /**
+   * @generated from field: string relative_path = 2;
+   */
+  relativePath: string;
+
+  /**
+   * @generated from field: string expected_revision = 3;
+   */
+  expectedRevision: string;
+};
+
+/**
+ * Describes the message joko.v1.WorkspaceHtmlReference.
+ * Use `create(WorkspaceHtmlReferenceSchema)` to create a new message.
+ */
+export const WorkspaceHtmlReferenceSchema: GenMessage<WorkspaceHtmlReference> = /*@__PURE__*/
+  messageDesc(file_joko_v1_workspace, 0);
+
+/**
+ * @generated from message joko.v1.ReadWorkspaceHtmlSnapshotRequest
+ */
+export type ReadWorkspaceHtmlSnapshotRequest = Message<"joko.v1.ReadWorkspaceHtmlSnapshotRequest"> & {
+  /**
+   * @generated from field: string session_id = 1;
+   */
+  sessionId: string;
+
+  /**
+   * @generated from field: joko.v1.WorkspaceHtmlReference file = 2;
+   */
+  file?: WorkspaceHtmlReference | undefined;
+};
+
+/**
+ * Describes the message joko.v1.ReadWorkspaceHtmlSnapshotRequest.
+ * Use `create(ReadWorkspaceHtmlSnapshotRequestSchema)` to create a new message.
+ */
+export const ReadWorkspaceHtmlSnapshotRequestSchema: GenMessage<ReadWorkspaceHtmlSnapshotRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_workspace, 1);
+
+/**
+ * Complete UTF-8 only. This response must not be persisted as a Browser URL.
+ *
+ * @generated from message joko.v1.ReadWorkspaceHtmlSnapshotResponse
+ */
+export type ReadWorkspaceHtmlSnapshotResponse = Message<"joko.v1.ReadWorkspaceHtmlSnapshotResponse"> & {
+  /**
+   * @generated from field: joko.v1.WorkspaceHtmlReference file = 1;
+   */
+  file?: WorkspaceHtmlReference | undefined;
+
+  /**
+   * @generated from field: string utf8_html = 2;
+   */
+  utf8Html: string;
+};
+
+/**
+ * Describes the message joko.v1.ReadWorkspaceHtmlSnapshotResponse.
+ * Use `create(ReadWorkspaceHtmlSnapshotResponseSchema)` to create a new message.
+ */
+export const ReadWorkspaceHtmlSnapshotResponseSchema: GenMessage<ReadWorkspaceHtmlSnapshotResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_workspace, 2);
 
 /**
  * @generated from message joko.v1.WorkspaceDescriptor
@@ -74,7 +147,7 @@ export type WorkspaceDescriptor = Message<"joko.v1.WorkspaceDescriptor"> & {
  * Use `create(WorkspaceDescriptorSchema)` to create a new message.
  */
 export const WorkspaceDescriptorSchema: GenMessage<WorkspaceDescriptor> = /*@__PURE__*/
-  messageDesc(file_joko_v1_workspace, 0);
+  messageDesc(file_joko_v1_workspace, 3);
 
 /**
  * @generated from message joko.v1.FileRevision
@@ -106,7 +179,7 @@ export type FileRevision = Message<"joko.v1.FileRevision"> & {
  * Use `create(FileRevisionSchema)` to create a new message.
  */
 export const FileRevisionSchema: GenMessage<FileRevision> = /*@__PURE__*/
-  messageDesc(file_joko_v1_workspace, 1);
+  messageDesc(file_joko_v1_workspace, 4);
 
 /**
  * @generated from message joko.v1.WorkspaceEntry
@@ -163,7 +236,7 @@ export type WorkspaceEntry = Message<"joko.v1.WorkspaceEntry"> & {
  * Use `create(WorkspaceEntrySchema)` to create a new message.
  */
 export const WorkspaceEntrySchema: GenMessage<WorkspaceEntry> = /*@__PURE__*/
-  messageDesc(file_joko_v1_workspace, 2);
+  messageDesc(file_joko_v1_workspace, 5);
 
 /**
  * @generated from message joko.v1.FilePreview
@@ -214,7 +287,7 @@ export type FilePreview = Message<"joko.v1.FilePreview"> & {
  * Use `create(FilePreviewSchema)` to create a new message.
  */
 export const FilePreviewSchema: GenMessage<FilePreview> = /*@__PURE__*/
-  messageDesc(file_joko_v1_workspace, 3);
+  messageDesc(file_joko_v1_workspace, 6);
 
 /**
  * @generated from message joko.v1.TextFilePreview
@@ -251,7 +324,7 @@ export type TextFilePreview = Message<"joko.v1.TextFilePreview"> & {
  * Use `create(TextFilePreviewSchema)` to create a new message.
  */
 export const TextFilePreviewSchema: GenMessage<TextFilePreview> = /*@__PURE__*/
-  messageDesc(file_joko_v1_workspace, 4);
+  messageDesc(file_joko_v1_workspace, 7);
 
 /**
  * @generated from message joko.v1.BinaryFilePreview
@@ -273,7 +346,7 @@ export type BinaryFilePreview = Message<"joko.v1.BinaryFilePreview"> & {
  * Use `create(BinaryFilePreviewSchema)` to create a new message.
  */
 export const BinaryFilePreviewSchema: GenMessage<BinaryFilePreview> = /*@__PURE__*/
-  messageDesc(file_joko_v1_workspace, 5);
+  messageDesc(file_joko_v1_workspace, 8);
 
 /**
  * @generated from message joko.v1.WorkspaceSearchMatch
@@ -310,7 +383,7 @@ export type WorkspaceSearchMatch = Message<"joko.v1.WorkspaceSearchMatch"> & {
  * Use `create(WorkspaceSearchMatchSchema)` to create a new message.
  */
 export const WorkspaceSearchMatchSchema: GenMessage<WorkspaceSearchMatch> = /*@__PURE__*/
-  messageDesc(file_joko_v1_workspace, 6);
+  messageDesc(file_joko_v1_workspace, 9);
 
 /**
  * @generated from message joko.v1.WorkspaceFileChange
@@ -372,7 +445,7 @@ export type WorkspaceFileChange = Message<"joko.v1.WorkspaceFileChange"> & {
  * Use `create(WorkspaceFileChangeSchema)` to create a new message.
  */
 export const WorkspaceFileChangeSchema: GenMessage<WorkspaceFileChange> = /*@__PURE__*/
-  messageDesc(file_joko_v1_workspace, 7);
+  messageDesc(file_joko_v1_workspace, 10);
 
 /**
  * @generated from message joko.v1.GitRepositoryState
@@ -424,7 +497,7 @@ export type GitRepositoryState = Message<"joko.v1.GitRepositoryState"> & {
  * Use `create(GitRepositoryStateSchema)` to create a new message.
  */
 export const GitRepositoryStateSchema: GenMessage<GitRepositoryState> = /*@__PURE__*/
-  messageDesc(file_joko_v1_workspace, 8);
+  messageDesc(file_joko_v1_workspace, 11);
 
 /**
  * @generated from message joko.v1.GitFileChange
@@ -461,7 +534,7 @@ export type GitFileChange = Message<"joko.v1.GitFileChange"> & {
  * Use `create(GitFileChangeSchema)` to create a new message.
  */
 export const GitFileChangeSchema: GenMessage<GitFileChange> = /*@__PURE__*/
-  messageDesc(file_joko_v1_workspace, 9);
+  messageDesc(file_joko_v1_workspace, 12);
 
 /**
  * @generated from message joko.v1.DiffLine
@@ -493,7 +566,7 @@ export type DiffLine = Message<"joko.v1.DiffLine"> & {
  * Use `create(DiffLineSchema)` to create a new message.
  */
 export const DiffLineSchema: GenMessage<DiffLine> = /*@__PURE__*/
-  messageDesc(file_joko_v1_workspace, 10);
+  messageDesc(file_joko_v1_workspace, 13);
 
 /**
  * @generated from message joko.v1.DiffHunk
@@ -535,7 +608,7 @@ export type DiffHunk = Message<"joko.v1.DiffHunk"> & {
  * Use `create(DiffHunkSchema)` to create a new message.
  */
 export const DiffHunkSchema: GenMessage<DiffHunk> = /*@__PURE__*/
-  messageDesc(file_joko_v1_workspace, 11);
+  messageDesc(file_joko_v1_workspace, 14);
 
 /**
  * @generated from message joko.v1.FileDiff
@@ -582,7 +655,7 @@ export type FileDiff = Message<"joko.v1.FileDiff"> & {
  * Use `create(FileDiffSchema)` to create a new message.
  */
 export const FileDiffSchema: GenMessage<FileDiff> = /*@__PURE__*/
-  messageDesc(file_joko_v1_workspace, 12);
+  messageDesc(file_joko_v1_workspace, 15);
 
 /**
  * @generated from message joko.v1.WorkspaceDiff
@@ -672,7 +745,7 @@ export type WorkspaceDiff = Message<"joko.v1.WorkspaceDiff"> & {
  * Use `create(WorkspaceDiffSchema)` to create a new message.
  */
 export const WorkspaceDiffSchema: GenMessage<WorkspaceDiff> = /*@__PURE__*/
-  messageDesc(file_joko_v1_workspace, 13);
+  messageDesc(file_joko_v1_workspace, 16);
 
 /**
  * @generated from message joko.v1.WorkspaceBranchBaseWarning
@@ -699,7 +772,7 @@ export type WorkspaceBranchBaseWarning = Message<"joko.v1.WorkspaceBranchBaseWar
  * Use `create(WorkspaceBranchBaseWarningSchema)` to create a new message.
  */
 export const WorkspaceBranchBaseWarningSchema: GenMessage<WorkspaceBranchBaseWarning> = /*@__PURE__*/
-  messageDesc(file_joko_v1_workspace, 14);
+  messageDesc(file_joko_v1_workspace, 17);
 
 /**
  * @generated from message joko.v1.WorkspaceChangeSet
@@ -761,7 +834,7 @@ export type WorkspaceChangeSet = Message<"joko.v1.WorkspaceChangeSet"> & {
  * Use `create(WorkspaceChangeSetSchema)` to create a new message.
  */
 export const WorkspaceChangeSetSchema: GenMessage<WorkspaceChangeSet> = /*@__PURE__*/
-  messageDesc(file_joko_v1_workspace, 15);
+  messageDesc(file_joko_v1_workspace, 18);
 
 /**
  * @generated from message joko.v1.FileChange
@@ -803,7 +876,7 @@ export type FileChange = Message<"joko.v1.FileChange"> & {
  * Use `create(FileChangeSchema)` to create a new message.
  */
 export const FileChangeSchema: GenMessage<FileChange> = /*@__PURE__*/
-  messageDesc(file_joko_v1_workspace, 16);
+  messageDesc(file_joko_v1_workspace, 19);
 
 /**
  * @generated from message joko.v1.RewindGap
@@ -830,7 +903,7 @@ export type RewindGap = Message<"joko.v1.RewindGap"> & {
  * Use `create(RewindGapSchema)` to create a new message.
  */
 export const RewindGapSchema: GenMessage<RewindGap> = /*@__PURE__*/
-  messageDesc(file_joko_v1_workspace, 17);
+  messageDesc(file_joko_v1_workspace, 20);
 
 /**
  * @generated from message joko.v1.WorkspaceRewindPreview
@@ -892,7 +965,7 @@ export type WorkspaceRewindPreview = Message<"joko.v1.WorkspaceRewindPreview"> &
  * Use `create(WorkspaceRewindPreviewSchema)` to create a new message.
  */
 export const WorkspaceRewindPreviewSchema: GenMessage<WorkspaceRewindPreview> = /*@__PURE__*/
-  messageDesc(file_joko_v1_workspace, 18);
+  messageDesc(file_joko_v1_workspace, 21);
 
 /**
  * @generated from message joko.v1.WorkspaceConflict
@@ -924,7 +997,7 @@ export type WorkspaceConflict = Message<"joko.v1.WorkspaceConflict"> & {
  * Use `create(WorkspaceConflictSchema)` to create a new message.
  */
 export const WorkspaceConflictSchema: GenMessage<WorkspaceConflict> = /*@__PURE__*/
-  messageDesc(file_joko_v1_workspace, 19);
+  messageDesc(file_joko_v1_workspace, 22);
 
 /**
  * @generated from message joko.v1.ExtraDirectory
@@ -966,7 +1039,7 @@ export type ExtraDirectory = Message<"joko.v1.ExtraDirectory"> & {
  * Use `create(ExtraDirectorySchema)` to create a new message.
  */
 export const ExtraDirectorySchema: GenMessage<ExtraDirectory> = /*@__PURE__*/
-  messageDesc(file_joko_v1_workspace, 20);
+  messageDesc(file_joko_v1_workspace, 23);
 
 /**
  * @generated from message joko.v1.Artifact
@@ -1016,6 +1089,11 @@ export type Artifact = Message<"joko.v1.Artifact"> & {
    * @generated from field: google.protobuf.Timestamp expires_at = 9;
    */
   expiresAt?: Timestamp | undefined;
+
+  /**
+   * @generated from field: joko.v1.AudioArtifactMetadata audio_metadata = 10;
+   */
+  audioMetadata?: AudioArtifactMetadata | undefined;
 };
 
 /**
@@ -1023,7 +1101,7 @@ export type Artifact = Message<"joko.v1.Artifact"> & {
  * Use `create(ArtifactSchema)` to create a new message.
  */
 export const ArtifactSchema: GenMessage<Artifact> = /*@__PURE__*/
-  messageDesc(file_joko_v1_workspace, 21);
+  messageDesc(file_joko_v1_workspace, 24);
 
 /**
  * An opaque, short-lived ticket consumed by the authenticated Blob API.
@@ -1072,7 +1150,7 @@ export type BlobTransferTicket = Message<"joko.v1.BlobTransferTicket"> & {
  * Use `create(BlobTransferTicketSchema)` to create a new message.
  */
 export const BlobTransferTicketSchema: GenMessage<BlobTransferTicket> = /*@__PURE__*/
-  messageDesc(file_joko_v1_workspace, 22);
+  messageDesc(file_joko_v1_workspace, 25);
 
 /**
  * @generated from message joko.v1.PendingBlobUpload
@@ -1104,7 +1182,7 @@ export type PendingBlobUpload = Message<"joko.v1.PendingBlobUpload"> & {
  * Use `create(PendingBlobUploadSchema)` to create a new message.
  */
 export const PendingBlobUploadSchema: GenMessage<PendingBlobUpload> = /*@__PURE__*/
-  messageDesc(file_joko_v1_workspace, 23);
+  messageDesc(file_joko_v1_workspace, 26);
 
 /**
  * One authoritative ripgrep submatch within line_preview. Offsets are UTF-8
@@ -1130,7 +1208,7 @@ export type WorkspaceSearchSubmatch = Message<"joko.v1.WorkspaceSearchSubmatch">
  * Use `create(WorkspaceSearchSubmatchSchema)` to create a new message.
  */
 export const WorkspaceSearchSubmatchSchema: GenMessage<WorkspaceSearchSubmatch> = /*@__PURE__*/
-  messageDesc(file_joko_v1_workspace, 24);
+  messageDesc(file_joko_v1_workspace, 27);
 
 /**
  * @generated from enum joko.v1.WorkspaceKind

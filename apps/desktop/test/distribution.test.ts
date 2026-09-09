@@ -81,6 +81,7 @@ describe("Desktop distribution", () => {
       "!dist/orchestrator-runtime/**",
       expect.stringContaining("map,ts,tsx,cts,mts,proto,tsbuildinfo,c,cc,cpp"),
       "!**/{test,tests,__tests__,coverage,fixtures,workspace}/**",
+      "!**/*.test.*",
       "!**/WORKSPACE",
       "!**/WORKSPACE/**",
       "!**/{.env,.env.*,*.db,*.db-shm,*.db-wal,*.log}"
@@ -107,7 +108,7 @@ describe("Desktop distribution", () => {
       expect.objectContaining({
         from: "dist/orchestrator-runtime",
         to: "orchestrator-runtime",
-        filter: expect.arrayContaining(["!node_modules/**", expect.stringContaining("map,ts,tsx,cts,mts,proto,tsbuildinfo,c,cc,cpp")])
+        filter: expect.arrayContaining(["!node_modules/**", "!**/*.test.*", expect.stringContaining("map,ts,tsx,cts,mts,proto,tsbuildinfo,c,cc,cpp")])
       }),
       expect.objectContaining({
         from: "dist/orchestrator-runtime/node_modules",
@@ -115,6 +116,7 @@ describe("Desktop distribution", () => {
         filter: expect.arrayContaining([
           expect.stringContaining("map,ts,tsx,cts,mts,proto,tsbuildinfo,c,cc,cpp"),
           "!**/{test,tests,__tests__,coverage,fixtures,workspace}/**",
+          "!**/*.test.*",
           "!**/WORKSPACE",
           "!**/WORKSPACE/**",
           "!**/{.env,.env.*,*.db,*.db-shm,*.db-wal,*.log}"

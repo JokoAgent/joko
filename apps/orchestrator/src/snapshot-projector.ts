@@ -816,7 +816,7 @@ export function activeNativeTimeline(
     const currentFingerprint = nativeBindingFingerprint(currentBinding.opaqueRef);
     return events.filter((event) => {
       const identity = nativeHistoryEventContext(event.payload)?.identity;
-      if (identity !== undefined) {
+      if (identity !== undefined || event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD] !== undefined) {
         return event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD] === currentFingerprint;
       }
       return event.generation === currentBinding.generation;
@@ -825,7 +825,9 @@ export function activeNativeTimeline(
   if (currentBinding !== undefined && marker.payload.opaqueRef !== currentBinding.opaqueRef) {
     return events.filter((event) =>
       nativeHistoryEventContext(event.payload)?.identity === undefined &&
-      event.generation === currentBinding.generation
+      (event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD] === undefined
+        ? event.generation === currentBinding.generation
+        : event.metadata.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD] === nativeBindingFingerprint(currentBinding.opaqueRef))
     );
   }
   const nativeReference = marker.payload.opaqueRef;
@@ -853,6 +855,9 @@ export function activeNativeTimeline(
       if (eventBindingFingerprint !== bindingFingerprint) return false;
       return leafId === undefined || active.has(entryId);
     }
+    const productFingerprint = event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD];
+    if (productFingerprint !== undefined && productFingerprint !== bindingFingerprint) return false;
+    if (currentBinding !== undefined && event.generation !== currentBinding.generation) return false;
     // Persistence-confirmed history replaces transient live stream records
     // that preceded the leaf marker; later in-flight records remain visible.
     if (

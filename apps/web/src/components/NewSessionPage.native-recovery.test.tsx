@@ -5,17 +5,44 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { AppController } from "../controller.js";
+import type { JSONContent } from "@tiptap/core";
+import { composerDocumentPlainText, emptyComposerDocument, plainTextToComposerDocument } from "../composer-quote-document.js";
+import type { VoiceMediaSessionUpdate } from "../voice-input-media.js";
+import { readVoiceInputPreferences } from "../voice-input-preferences.js";
 import {
   emptySnapshot,
   type AppSnapshot,
   type ComposerDraft,
   type NativeSessionCandidateView,
-  type NewSessionLocalDraft
+  type NewSessionLocalDraft,
+  type ModelView,
+  type ProviderRuntimeView,
+  type VoiceInputDictionaryAdviceView
 } from "../model.js";
 import type { DelayedNewSessionDraft } from "../new-session-flow.js";
 import { NewSessionPage } from "./NewSessionPage.js";
 
-let latestEditorProps: { readonly knownWorkspacePaths?: readonly string[] } | undefined;
+let latestEditorProps: { readonly knownWorkspacePaths?: readonly string[]; readonly document?: JSONContent; readonly onDocumentChange?: (document: JSONContent, isComposing: boolean) => void } | undefined;
+const voiceCaptures: Array<{
+  emit(update: VoiceMediaSessionUpdate): void;
+  readonly stop: ReturnType<typeof vi.fn>;
+  readonly cancel: ReturnType<typeof vi.fn>;
+  readonly dispose: ReturnType<typeof vi.fn>;
+}> = [];
+
+vi.mock("../voice-input-media.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../voice-input-media.js")>(),
+  supportsVoiceMediaCapture: () => true,
+  VoiceInputMediaSession: class {
+    currentState = "idle";
+    constructor(private readonly options: { onUpdate(update: VoiceMediaSessionUpdate): void }) { voiceCaptures.push(this); }
+    emit(update: VoiceMediaSessionUpdate): void { this.currentState = update.state; this.options.onUpdate(update); }
+    async start(): Promise<void> { this.emit({ state: "starting" }); }
+    stop = vi.fn(async () => this.emit({ state: "submitting" }));
+    cancel = vi.fn(async () => this.emit({ state: "cancelled" }));
+    dispose = vi.fn(async () => this.emit({ state: "cancelled" }));
+  }
+}));
 
 vi.mock("./ComposerRichTextEditor.js", () => ({
   ComposerRichTextEditor: forwardRef(function Editor(props: { readonly knownWorkspacePaths?: readonly string[] }, ref) {
@@ -41,17 +68,279 @@ beforeEach(() => {
   vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => window.setTimeout(() => callback(0), 0));
   vi.stubGlobal("cancelAnimationFrame", (id: number) => window.clearTimeout(id));
   latestEditorProps = undefined;
+  voiceCaptures.length = 0;
+  window.localStorage.clear();
 });
 
 afterEach(async () => {
   for (const root of roots.splice(0).reverse()) await act(async () => root.unmount());
   document.body.replaceChildren();
+  window.localStorage.clear();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+  vi.useRealTimers();
+  Reflect.deleteProperty(navigator, "mediaDevices");
   Reflect.deleteProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT");
 });
 
 describe("new-task native draft recovery", () => {
+  it.each(["before recovery", "after recovery"])("keeps a model removed from the catalog %s without choosing an available substitute", async (when) => {
+    vi.useFakeTimers();
+    const selectedModel: ModelView = {
+      backendId: "backend-1", providerId: "source-one", providerName: "Source one", modelId: "original-model", name: "Original model",
+      available: true, supportsImages: false, supportsFast: true, inputModalities: ["text"], outputModalities: ["text"],
+      efforts: ["low", "high"], contextWindow: 8192, maximumOutputTokens: 2048, inputCostMicrosPerMillion: 0, outputCostMicrosPerMillion: 0, currencyCode: "USD"
+    };
+    const base = snapshot();
+    const makeSnapshot = (missing: boolean): AppSnapshot => ({ ...base,
+      backends: base.backends.map((backend) => ({ ...backend, authenticationState: "authenticated", capabilities: new Map([...backend.capabilities,
+        ...["model.switch", "model.effort", "model.fast_mode"].map((name) => [name, { name, supported: true, options: [] }] as const)]) })),
+      models: [...(missing ? [] : [selectedModel]), { ...selectedModel, modelId: "substitute-model", name: "Available substitute" }]
+    });
+    const original = controller({ discover: async () => [] });
+    const api = { ...original, state: { ...original.state, snapshot: makeSnapshot(when === "before recovery") },
+      readNewSessionDraft: vi.fn(async () => ({ ...restoredDraft(), nativeStart: { kind: "fresh" }, providerId: selectedModel.providerId, modelId: selectedModel.modelId, effort: "high", fastMode: true })),
+      refreshProviderModels: vi.fn(async () => undefined)
+    } as unknown as AppController;
+    const onSubmit = vi.fn(async () => undefined);
+    const { container, rerender } = await renderPage(api, onSubmit);
+    if (when === "after recovery") await rerender({ ...api, state: { ...api.state, snapshot: makeSnapshot(true) } });
+    expect(sendButton(container).disabled).toBe(true);
+    expect(container.querySelector('.composer__source-notice')?.textContent).toContain("original-model · source-one");
+    expect(container.querySelector('.composer__source-notice')?.textContent).toContain("modelPicker.modelMissing");
+    await act(async () => { vi.advanceTimersByTime(500); });
+    expect(api.saveNewSessionDraft).toHaveBeenLastCalledWith(expect.objectContaining({ providerId: "source-one", modelId: "original-model", effort: "high", fastMode: true, text: "Continue this task" }));
+    vi.mocked(api.refreshProviderModels).mockRejectedValueOnce(new Error("Source cannot be reached"));
+    await act(async () => { buttonWithText(container, "modelPicker.checkSource").click(); buttonWithText(container, "modelPicker.checkSource").click(); });
+    expect(api.refreshProviderModels).toHaveBeenCalledExactlyOnceWith("backend-1", "source-one", false);
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("modelPicker.sourceCheckFailed");
+    await act(async () => buttonWithText(container, "modelPicker.checkSource").click());
+    expect(api.refreshProviderModels).toHaveBeenCalledTimes(2);
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    expect(onSubmit).not.toHaveBeenCalled();
+    await rerender({ ...api, state: { ...api.state, snapshot: makeSnapshot(false) } });
+    expect(sendButton(container).disabled).toBe(false);
+    expect(onSubmit).not.toHaveBeenCalled();
+    await act(async () => sendButton(container).click());
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ providerId: "source-one", modelId: "original-model", effort: "high", fastMode: true }),
+      expect.objectContaining({ text: "Continue this task" }), expect.anything());
+  });
+
+  it("recovers a native default without selecting another provider or automatically submitting the first input", async () => {
+    vi.useFakeTimers();
+    const base = snapshot();
+    const makeSnapshot = (authenticationState: "expired" | "authenticated"): AppSnapshot => ({ ...base,
+      backends: base.backends.map((backend) => ({ ...backend, authenticationState, capabilities: new Map([...backend.capabilities,
+        ["model.switch", { name: "model.switch", supported: true, options: [] }]]) }))
+    });
+    const original = controller({ discover: async () => [] });
+    const api = { ...original, state: { ...original.state, snapshot: makeSnapshot("expired") },
+      readNewSessionDraft: vi.fn(async () => ({ ...restoredDraft(), nativeStart: { kind: "fresh" } })),
+      refreshProviderModels: vi.fn(async () => undefined), refresh: vi.fn(async () => undefined)
+    } as unknown as AppController;
+    const onSubmit = vi.fn(async () => undefined);
+    const { container, rerender } = await renderPage(api, onSubmit);
+    expect(sendButton(container).disabled).toBe(true);
+    expect(container.querySelector('.composer__source-notice')?.textContent).toContain("settings.backendNativeDefault");
+    expect(container.querySelector('.composer__source-notice')?.textContent).toContain("providerAuth.expired");
+    await act(async () => buttonWithText(container, "modelPicker.checkSource").click());
+    expect(api.refresh).toHaveBeenCalledOnce();
+    expect(api.refreshProviderModels).not.toHaveBeenCalled();
+    expect(onSubmit).not.toHaveBeenCalled();
+    await rerender({ ...api, state: { ...api.state, snapshot: makeSnapshot("authenticated") } });
+    expect(sendButton(container).disabled).toBe(false);
+    expect(container.querySelector('.composer__source-notice')).toBeNull();
+    expect(onSubmit).not.toHaveBeenCalled();
+    await act(async () => sendButton(container).click());
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ providerId: "", modelId: "", fastMode: false }),
+      expect.objectContaining({ text: "Continue this task" }), expect.anything());
+  });
+
+  it("retains a disconnected draft model, authorizes its exact source and requires an explicit first send after recovery", async () => {
+    vi.useFakeTimers();
+    const selectedModel: ModelView = {
+      backendId: "backend-1", providerId: "source-one", providerName: "Source one", modelId: "model-one", name: "Model one",
+      available: false, supportsImages: false, supportsFast: true, inputModalities: ["text"], outputModalities: ["text"],
+      efforts: ["low", "high"], contextWindow: 8192, maximumOutputTokens: 2048, inputCostMicrosPerMillion: 0, outputCostMicrosPerMillion: 0, currencyCode: "USD"
+    };
+    const provider: ProviderRuntimeView = {
+      backendId: "backend-1", id: "source-one", name: "Source one", kind: "oauth", compatibility: "native",
+      authenticationState: "expired", endpoint: "", ownerManaged: false, supportsLogin: true, loginMethods: ["deviceCode"],
+      supportsLogout: true, supportsRefresh: true, credentialSurfaces: [], capabilities: new Set()
+    };
+    const base = snapshot();
+    const makeSnapshot = (ready: boolean): AppSnapshot => ({ ...base,
+      backends: base.backends.map((backend) => ({ ...backend, capabilities: new Map([...backend.capabilities,
+        ["model.switch", { name: "model.switch", supported: true, options: [] }],
+        ["model.effort", { name: "model.effort", supported: true, options: [] }],
+        ["model.fast_mode", { name: "model.fast_mode", supported: true, options: [] }]]) })),
+      models: [{ ...selectedModel, available: ready }], providers: [{ ...provider, authenticationState: ready ? "authenticated" : "expired" }]
+    });
+    const original = controller({ discover: async () => [] });
+    const api = { ...original, state: { ...original.state, snapshot: makeSnapshot(false) },
+      readNewSessionDraft: vi.fn(async () => ({ ...restoredDraft(), nativeStart: { kind: "fresh" }, providerId: provider.id, modelId: selectedModel.modelId, effort: "high", fastMode: true })),
+      beginProviderLogin: vi.fn(async () => ({ id: "login-one", providerId: provider.id, method: "deviceCode", state: "completed", updatedAt: 1 })),
+      refresh: vi.fn(async () => undefined)
+    } as unknown as AppController;
+    const onSubmit = vi.fn(async () => undefined);
+    const { container, rerender } = await renderPage(api, onSubmit);
+    expect(container.querySelector('.composer__source-notice')?.textContent).toContain("Model one · Source one");
+    expect(container.querySelector('.composer__source-notice')?.textContent).toContain("providerAuth.expired");
+    expect(sendButton(container).disabled).toBe(true);
+    await act(async () => { vi.advanceTimersByTime(500); });
+    expect(api.saveNewSessionDraft).toHaveBeenLastCalledWith(expect.objectContaining({ providerId: provider.id, modelId: selectedModel.modelId, effort: "high", fastMode: true, text: "Continue this task" }));
+    await act(async () => buttonWithText(container, "providerLogin.signIn").click());
+    await act(async () => buttonWithText(document.body, "providerLogin.start").click());
+    expect(api.beginProviderLogin).toHaveBeenCalledExactlyOnceWith("backend-1", provider.id, "deviceCode");
+    expect(api.refresh).toHaveBeenCalledOnce();
+    expect(onSubmit).not.toHaveBeenCalled();
+    await rerender({ ...api, state: { ...api.state, snapshot: makeSnapshot(true) } });
+    expect(container.querySelector('.composer__source-notice')).toBeNull();
+    expect(sendButton(container).disabled).toBe(false);
+    expect(composerDocumentPlainText(required(latestEditorProps?.document))).toBe("Continue this task");
+    await rerender({ ...api, state: { ...api.state, snapshot: makeSnapshot(false) } });
+    expect(document.body.querySelector('[role="dialog"]')).toBeNull();
+    expect(api.beginProviderLogin).toHaveBeenCalledTimes(1);
+    await rerender({ ...api, state: { ...api.state, snapshot: makeSnapshot(true) } });
+    await act(async () => sendButton(container).click());
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ providerId: provider.id, modelId: selectedModel.modelId, effort: "high", fastMode: true }),
+      expect.objectContaining({ text: "Continue this task" }), expect.anything());
+  });
+
+  it("waits for the held capture's final success before first submission and cancels its send intent on target change", async () => {
+    vi.useFakeTimers();
+    Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: { getUserMedia: vi.fn() } });
+    const api = Object.assign(controller({ discover: async () => [] }), {
+      getVoiceInputCapabilities: vi.fn(async () => ({ support: "supported" })),
+      readNewSessionDraft: vi.fn(async () => ({ ...restoredDraft(), nativeStart: { kind: "fresh" }, text: "Existing:", editorDocument: plainTextToComposerDocument("Existing:") }))
+    }) as unknown as AppController;
+    const onSubmit = vi.fn(async () => undefined);
+    const { container } = await renderPage(api, onSubmit);
+    const start = async () => { await act(async () => required(container.querySelector<HTMLButtonElement>('.voice-input-button button')).click()); return required(voiceCaptures.at(-1)); };
+    const first = await start();
+    await act(async () => { sendButton(container).click(); sendButton(container).click(); });
+    expect(first.stop).toHaveBeenCalledOnce(); expect(onSubmit).not.toHaveBeenCalled();
+    await act(async () => first.emit({ state: "submitting", session: { ...voiceResult("interim").session!, state: "refining", outcome: undefined } }));
+    expect(container.querySelector('.voice-input-overlay[data-state="refining"]')).not.toBeNull();
+    expect(onSubmit).not.toHaveBeenCalled();
+    await act(async () => first.emit(voiceResult("final")));
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ selection: { kind: "target", targetId: "target-1" } }), expect.objectContaining({ text: "Existing:final" }), expect.objectContaining({ ownerDocument: document, signal: expect.any(AbortSignal) }));
+    const second = await start();
+    await act(async () => sendButton(container).click());
+    await act(async () => { const select = required(container.querySelector<HTMLSelectElement>(".new-task-context__control--target select")); select.value = "target:target-2"; select.dispatchEvent(new Event("change", { bubbles: true })); });
+    await act(async () => second.emit(voiceResult("late")));
+    expect(onSubmit).toHaveBeenCalledOnce();
+    expect(composerDocumentPlainText(required(latestEditorProps?.document))).toBe("Existing:final");
+  });
+
+  it("learns first-prompt voice corrections while fencing cancelled capture, target changes and task creation", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("MediaRecorder", class {});
+    Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: { getUserMedia: vi.fn() } });
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+    const adviceResults: Array<ReturnType<typeof deferred<VoiceInputDictionaryAdviceView>>> = [];
+    const advice = vi.fn((_draft: unknown, _signal?: AbortSignal) => {
+      const result = deferred<VoiceInputDictionaryAdviceView>();
+      adviceResults.push(result);
+      return result.promise;
+    });
+    const api = Object.assign(controller({ discover: async () => [] }), {
+      getVoiceInputCapabilities: vi.fn(async () => ({ support: "supported" })),
+      adviseVoiceInputDictionaryEdit: advice,
+      readNewSessionDraft: vi.fn(async () => ({ ...restoredDraft(), nativeStart: { kind: "fresh" }, text: "", editorDocument: emptyComposerDocument() })),
+      createSession: vi.fn()
+    }) as unknown as AppController;
+    const { container, rerender } = await renderPage(api, onSubmit);
+    const edit = async (text: string, isComposing = false) => {
+      await act(async () => required(latestEditorProps?.onDocumentChange)(plainTextToComposerDocument(text), isComposing));
+    };
+    const startCapture = async () => {
+      await act(async () => required(container.querySelector<HTMLButtonElement>('button[aria-label="voice.start"]')).click());
+      return required(voiceCaptures.at(-1));
+    };
+    const dictionaryAdvice = (term: string): VoiceInputDictionaryAdviceView => ({ actions: [{ action: "addEntry", term, aliases: ["voice kit"], type: "productName", confidence: "high" }] });
+    await flush();
+    await act(async () => required(container.querySelector<HTMLButtonElement>('button[aria-label="voice.start"]')).click());
+    expect(container.querySelector('.voice-input-overlay[data-state="starting"]')).not.toBeNull();
+    expect(sendButton(container).disabled).toBe(false);
+    const first = required(voiceCaptures[0]);
+    await act(async () => first.emit({ state: "listening" }));
+    await act(async () => required(container.querySelector<HTMLButtonElement>('button[aria-label="voice.stop"]')).click());
+    expect(first.stop).toHaveBeenCalledOnce();
+    await act(async () => first.emit(voiceResult("voice kit", "raw voice kit")));
+    await flush();
+    await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+    expect(composerDocumentPlainText(required(latestEditorProps?.document))).toBe("voice kit");
+    expect(api.saveNewSessionDraft).toHaveBeenLastCalledWith(expect.objectContaining({ text: "voice kit" }));
+    expect(api.createSession).not.toHaveBeenCalled();
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(sendButton(container).disabled).toBe(false);
+    expect(advice).not.toHaveBeenCalled();
+    await edit("VoiceKit");
+    await edit("VoiceKit unfinished", true);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_200); });
+    expect(advice).not.toHaveBeenCalled();
+    await edit("VoiceKit");
+    await act(async () => { await vi.advanceTimersByTimeAsync(600); });
+    const refreshedAdvice = vi.fn(advice);
+    await rerender({ ...api, state: { ...api.state }, adviseVoiceInputDictionaryEdit: refreshedAdvice });
+    await act(async () => { await vi.advanceTimersByTimeAsync(600); });
+    expect(advice).toHaveBeenCalledOnce();
+    expect(refreshedAdvice).toHaveBeenCalledOnce();
+    expect(api.getVoiceInputCapabilities).toHaveBeenCalledOnce();
+    expect(advice.mock.calls[0]?.[0]).toEqual(expect.objectContaining({ beforeText: "voice kit", afterText: "VoiceKit", rawTranscriptText: "raw voice kit" }));
+    await act(async () => required(adviceResults[0]).resolve(dictionaryAdvice("VoiceKit")));
+    expect(readVoiceInputPreferences().dictionary.entries.map((entry) => entry.text)).toEqual(["VoiceKit"]);
+
+    const retired = await startCapture();
+    await act(async () => retired.emit(voiceResult("sound kit")));
+    await edit("VoiceKitSoundKit");
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_200); });
+    expect(advice).toHaveBeenCalledTimes(2);
+    const selection = required(container.querySelector<HTMLSelectElement>(".new-task-context__control--target select"));
+    await act(async () => {
+      selection.value = "target:target-2";
+      selection.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(retired.dispose).toHaveBeenCalledOnce();
+    expect(advice.mock.calls[1]?.[1]?.aborted).toBe(true);
+    await act(async () => required(adviceResults[1]).resolve(dictionaryAdvice("SoundKit")));
+    await act(async () => retired.emit(voiceResult("Must not replace the retained draft")));
+    expect(composerDocumentPlainText(required(latestEditorProps?.document))).toBe("VoiceKitSoundKit");
+    expect(readVoiceInputPreferences().dictionary.entries.map((entry) => entry.text)).toEqual(["VoiceKit"]);
+    expect(onSubmit).not.toHaveBeenCalled();
+
+    const moved = await startCapture();
+    await act(async () => {
+      selection.value = "target:target-1";
+      selection.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(moved.dispose).toHaveBeenCalledOnce();
+    await act(async () => moved.emit(voiceResult("Late result from a different target")));
+    expect(composerDocumentPlainText(required(latestEditorProps?.document))).toBe("VoiceKitSoundKit");
+
+    const cancelled = await startCapture();
+    await act(async () => required(container.querySelector<HTMLElement>('[data-testid="editor"]')).dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+    expect(cancelled.cancel).toHaveBeenCalledOnce();
+    await act(async () => cancelled.emit(voiceResult("Cancelled result")));
+    expect(composerDocumentPlainText(required(latestEditorProps?.document))).toBe("VoiceKitSoundKit");
+    await edit("VoiceKitSoundKit updated");
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_200); });
+    expect(advice).toHaveBeenCalledTimes(2);
+
+    const submitted = await startCapture();
+    await act(async () => submitted.emit(voiceResult("ship kit")));
+    await edit("VoiceKitSoundKit updatedShipKit");
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_200); });
+    expect(advice).toHaveBeenCalledTimes(3);
+    await act(async () => sendButton(container).click());
+    expect(onSubmit).toHaveBeenCalledOnce();
+    expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ selection: { kind: "target", targetId: "target-1" } }), expect.objectContaining({ text: "VoiceKitSoundKit updatedShipKit" }), expect.objectContaining({ ownerDocument: document, isCurrent: expect.any(Function) }));
+    expect(advice.mock.calls[2]?.[1]?.aborted).toBe(true);
+    await act(async () => required(adviceResults[2]).resolve(dictionaryAdvice("ShipKit")));
+    expect(readVoiceInputPreferences().dictionary.entries.map((entry) => entry.text)).toEqual(["VoiceKit"]);
+  });
+
   it("lets a project-scoped route override the saved draft location without discarding the draft", async () => {
     const discover = vi.fn(async () => [candidate()]);
     const { container } = await renderPage(controller({ discover }), vi.fn().mockResolvedValue(undefined), "target-2");
@@ -91,7 +380,8 @@ describe("new-task native draft recovery", () => {
     await act(async () => sendButton(container).click());
     expect(onSubmit).toHaveBeenCalledWith(
       expect.objectContaining({ nativeStart: { kind: "attach", reference: "native://restored" } }),
-      expect.objectContaining({ text: "Continue this task" })
+      expect.objectContaining({ text: "Continue this task" }),
+      expect.objectContaining({ ownerDocument: document, isCurrent: expect.any(Function) })
     );
   });
 
@@ -183,9 +473,9 @@ async function renderPage(
   document.body.appendChild(container);
   const root = createRoot(container);
   roots.push(root);
-  await act(async () => root.render(<NewSessionPage
-    controller={controllerValue}
-    snapshot={snapshot()}
+  const rerender = async (nextController: AppController) => act(async () => root.render(<NewSessionPage
+    controller={nextController}
+    snapshot={nextController.state.snapshot}
     initialTargetId={initialTargetId}
     initialDialogueBackendId={initialDialogueBackendId}
     navigationOpen
@@ -194,7 +484,8 @@ async function renderPage(
     onClose={vi.fn()}
     onSubmit={onSubmit}
   />));
-  return { container, root };
+  await rerender(controllerValue);
+  return { container, root, rerender };
 }
 
 function controller(options: {
@@ -204,6 +495,8 @@ function controller(options: {
 }): AppController {
   return {
     state: {
+      connectionState: "connected",
+      snapshot: snapshot(),
       preferences: {
         locale: "en",
         composerSendShortcut: "enter",
@@ -225,8 +518,10 @@ function controller(options: {
 }
 
 function snapshot(): AppSnapshot {
+  const initial = emptySnapshot();
   return {
-    ...emptySnapshot(),
+    ...initial,
+    settings: { ...initial.settings, voiceInput: { ...initial.settings.voiceInput, refinementEnabled: true } },
     backends: [{
       id: "backend-1",
       name: "Backend",
@@ -244,6 +539,7 @@ function snapshot(): AppSnapshot {
       backendId: "backend-1",
       name: "Project",
       workspaceId: "workspace-1",
+      revision: 1n,
       workspaceName: "Project",
       trusted: true,
       pinned: false,
@@ -253,6 +549,7 @@ function snapshot(): AppSnapshot {
       backendId: "backend-1",
       name: "Second project",
       workspaceId: "workspace-2",
+      revision: 1n,
       workspaceName: "Second project",
       trusted: true,
       pinned: false,
@@ -314,8 +611,17 @@ function candidate(overrides: Partial<NativeSessionCandidateView> = {}): NativeS
   };
 }
 
+function voiceResult(text: string, rawTranscriptText?: string): VoiceMediaSessionUpdate {
+  return { state: "done", session: {
+    id: "voice-draft", state: "done", outcome: "success", nextChunkSequence: 1n,
+    acceptedAudioBytes: 0, acceptedAudioDurationMs: 0, createdAt: 0, updatedAt: 0,
+    recoveryAttempts: 0, stallWarning: false,
+    result: { text, source: "stable", salvaged: false, ...(rawTranscriptText === undefined ? {} : { rawTranscriptText }) }
+  } };
+}
+
 function sendButton(container: ParentNode): HTMLButtonElement {
-  return required(container.querySelector<HTMLButtonElement>('button[aria-label="composer.send"]'));
+  return required(container.querySelector<HTMLButtonElement>('button.send-button'));
 }
 
 function buttonWithText(container: ParentNode, text: string): HTMLButtonElement {

@@ -8,6 +8,7 @@ const roots: Root[] = [];
 const labels = {
   close: "Close",
   copy: "Copy displayed payload",
+  copyTitle: "Copy title",
   copied: "Payload copied",
   copyFailed: "Could not copy payload",
   selectAll: "Select all",
@@ -34,6 +35,7 @@ function mount(onClose = vi.fn(), returnFocus?: HTMLElement): void {
   const root = createRoot(host);
   roots.push(root);
   act(() => root.render(<ToolPayloadLightbox
+    ownerKey="task"
     title="change_files"
     sections={[
       { id: "input", label: "Input", text: "diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n-old\n+new\ndiff --git a/b.ts b/b.ts\n--- a/b.ts\n+++ b/b.ts\n-before\n+after" },
@@ -69,6 +71,8 @@ describe("tool payload lightbox", () => {
     await act(async () => { document.querySelector<HTMLButtonElement>('button[aria-label="Copy displayed payload"]')?.click(); });
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith(text.value);
     expect(document.querySelector('[role="status"]')?.textContent).toContain("Payload copied");
+    await act(async () => document.querySelector<HTMLButtonElement>('button[aria-label="Copy title"]')!.click());
+    expect(navigator.clipboard.writeText).toHaveBeenLastCalledWith("change_files");
   });
 
   it("switches input/output and restores focus after the close transition", () => {
@@ -76,6 +80,15 @@ describe("tool payload lightbox", () => {
     const focus = vi.spyOn(trigger, "focus");
     const onClose = vi.fn();
     mount(onClose, trigger);
+    const select = document.querySelector<HTMLButtonElement>('[role="combobox"]')!;
+    act(() => { select.focus(); select.click(); });
+    act(() => select.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", isComposing: true, bubbles: true, cancelable: true })));
+    expect(select.getAttribute("aria-expanded")).toBe("true");
+    act(() => select.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })));
+    expect(select.getAttribute("aria-expanded")).toBe("false");
+    act(() => vi.advanceTimersByTime(200));
+    expect(onClose).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(select);
     const output = [...document.querySelectorAll<HTMLButtonElement>(".tool-payload-lightbox__tabs button")].find((button) => button.textContent === "Output")!;
     act(() => output.click());
     expect(document.querySelector<HTMLTextAreaElement>("textarea")?.value).toBe("completed");
@@ -85,5 +98,49 @@ describe("tool payload lightbox", () => {
     expect(onClose).toHaveBeenCalledTimes(1);
     act(() => roots[0]?.render(null));
     expect(focus).toHaveBeenCalled();
+  });
+
+  it("keeps payload copies and closing transitions within their source and triggering Document", async () => {
+    const frame = document.body.appendChild(document.createElement("iframe"));
+    const detached = frame.contentDocument!;
+    const trigger = document.body.appendChild(document.createElement("button"));
+    const nextTrigger = detached.body.appendChild(detached.createElement("button"));
+    const triggerFocus = vi.spyOn(trigger, "focus");
+    const nextFocus = vi.spyOn(nextTrigger, "focus");
+    const writes: { resolve: () => void }[] = [];
+    const writeText = vi.fn(() => new Promise<void>((resolve) => { writes.push({ resolve }); }));
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    const detachedWrite = vi.fn(async () => undefined);
+    Object.defineProperty(detached.defaultView!.navigator, "clipboard", { configurable: true, value: { writeText: detachedWrite } });
+    const root = createRoot(document.body.appendChild(document.createElement("div")));
+    roots.push(root);
+    const oldClose = vi.fn();
+    const newClose = vi.fn();
+    const render = (ownerKey: string, title: string, returnFocus: HTMLElement, onClose: () => void) => act(async () => root.render(<ToolPayloadLightbox ownerKey={ownerKey} title={title} sections={[{ id: "input", label: "Input", text: "input text" }, { id: "output", label: "Output", text: "output text" }]} initialSectionId="input" labels={labels} returnFocus={returnFocus} onClose={onClose} />));
+    await render("task", "first tool", trigger, oldClose);
+    await act(async () => document.querySelector<HTMLButtonElement>('button[aria-label="Copy displayed payload"]')!.click());
+    act(() => [...document.querySelectorAll<HTMLButtonElement>(".tool-payload-lightbox__tabs button")].find((node) => node.textContent === "Output")!.click());
+    await act(async () => writes[0]!.resolve());
+    expect(document.querySelector('[role="status"]')).toBeNull();
+    await act(async () => document.querySelector<HTMLButtonElement>('button[aria-label="Copy displayed payload"]')!.click());
+    expect(writeText).toHaveBeenLastCalledWith("output text");
+    act(() => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", isComposing: true })));
+    expect(oldClose).not.toHaveBeenCalled();
+    act(() => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" })));
+    await render("next task", "second tool", nextTrigger, newClose);
+    await act(async () => { writes[1]!.resolve(); vi.advanceTimersByTime(220); });
+    expect(oldClose).not.toHaveBeenCalled();
+    expect(newClose).not.toHaveBeenCalled();
+    expect(triggerFocus).not.toHaveBeenCalled();
+    expect(detached.querySelector('[role="status"]')).toBeNull();
+    expect(detached.activeElement).toBe(detached.querySelector("textarea"));
+    await act(async () => detached.querySelector<HTMLButtonElement>('button[aria-label="Copy title"]')!.click());
+    expect(detachedWrite).toHaveBeenCalledExactlyOnceWith("second tool");
+    act(() => detached.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" })));
+    act(() => vi.advanceTimersByTime(200));
+    expect(newClose).toHaveBeenCalledOnce();
+    expect(nextFocus).toHaveBeenCalledOnce();
+    await act(async () => root.render(null));
+    expect(nextFocus).toHaveBeenCalledOnce();
   });
 });

@@ -22,3 +22,5 @@ export {
   REMOTE_HOST_FAILURE_CODES
 } from "./types.js";
 export type * from "./types.js";
+export type * from "./usage-report.js";
+export { UsageReportQueryError, UsageReportCapacityError } from "./usage-report.js";

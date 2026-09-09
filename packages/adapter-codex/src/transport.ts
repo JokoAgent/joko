@@ -18,6 +18,8 @@ import {
 import { RpcRemoteFault, TransportFault } from "./errors.js";
 
 export interface RpcTransportHandlers {
+  /** Synchronous wire-arrival observation, before asynchronous notification delivery. */
+  readonly onNotificationObserved?: (notification: RpcNotification) => void;
   readonly onNotification: (notification: RpcNotification) => void | Promise<void>;
   readonly onRequest: (request: RpcServerRequest) => void | Promise<void>;
   readonly onExit: (fault: TransportFault) => void | Promise<void>;
@@ -26,6 +28,8 @@ export interface RpcTransportHandlers {
 export interface RpcRequestOptions {
   readonly timeoutMs?: number;
   readonly signal?: AbortSignal;
+  /** Synchronous owner check at the last boundary before writing this request. */
+  readonly beforeDispatch?: () => void;
   /** A write may have reached the app-server before a timeout or disconnect. */
   readonly mutation?: boolean;
 }
@@ -47,6 +51,8 @@ export interface StdioJsonRpcTransportOptions {
   readonly args?: readonly string[];
   readonly cwd?: string;
   readonly env?: NodeJS.ProcessEnv;
+  /** Private native-only credentials; the Adapter excludes these names from tools. */
+  readonly managedEnvironment?: Readonly<Record<string, string>>;
   readonly requestTimeoutMs?: number;
   readonly maxLineBytes?: number;
   readonly maxBufferedBytes?: number;
@@ -63,6 +69,7 @@ export interface StdioJsonRpcTransportOptions {
 interface PendingRequest {
   readonly method: string;
   readonly mutation: boolean;
+  dispatched: boolean;
   readonly resolve: (value: JsonValue) => void;
   readonly reject: (error: unknown) => void;
   readonly timer: NodeJS.Timeout;
@@ -153,9 +160,12 @@ export class StdioJsonRpcTransport implements RpcTransport {
     await this.#processOwner?.prepare(this.#options.shutdownTimeoutMs);
     const command = this.#options.command ?? "codex";
     const args = [...(this.#options.args ?? ["app-server", "--stdio"])];
-    const environment = this.#options.env ?? createChildRuntimeEnvironment({
-      allowedKeys: CODEX_RUNTIME_ENVIRONMENT_KEYS
-    }).environment;
+    const environment = {
+      ...(this.#options.env ?? createChildRuntimeEnvironment({
+        allowedKeys: CODEX_RUNTIME_ENVIRONMENT_KEYS
+      }).environment),
+      ...this.#options.managedEnvironment
+    };
     let child: ChildProcessWithoutNullStreams;
     try {
       child = spawn(command, args, {
@@ -218,11 +228,11 @@ export class StdioJsonRpcTransport implements RpcTransport {
         clearTimeout(pending.timer);
         pending.abortCleanup?.();
         this.#pending.delete(key);
-        this.#addTombstone(key);
+        if (pending.dispatched) this.#addTombstone(key);
         reject(new TransportFault(
           "closed",
           "The Codex request wait was cancelled.",
-          { stateMayHaveChanged: pending.mutation }
+          { stateMayHaveChanged: pending.mutation && pending.dispatched }
         ));
       };
       const timer = setTimeout(() => {
@@ -230,11 +240,11 @@ export class StdioJsonRpcTransport implements RpcTransport {
         if (pending === undefined) return;
         pending.abortCleanup?.();
         this.#pending.delete(key);
-        this.#addTombstone(key);
+        if (pending.dispatched) this.#addTombstone(key);
         reject(new TransportFault(
           "request_timeout",
           "The Codex app-server request timed out.",
-          { stateMayHaveChanged: pending.mutation }
+          { stateMayHaveChanged: pending.mutation && pending.dispatched }
         ));
       }, timeoutMs);
       timer.unref?.();
@@ -245,12 +255,37 @@ export class StdioJsonRpcTransport implements RpcTransport {
       this.#pending.set(key, {
         method,
         mutation: options.mutation ?? false,
+        dispatched: false,
         resolve,
         reject,
         timer,
         ...(abortCleanup === undefined ? {} : { abortCleanup })
       });
-      this.#enqueueWrite(child, envelope).catch((error: unknown) => {
+      this.#enqueueWrite(child, envelope, () => {
+        const pending = this.#pending.get(key);
+        if (pending === undefined) return false;
+        if (options.signal?.aborted) {
+          finishCancelled();
+          return false;
+        }
+        try {
+          options.beforeDispatch?.();
+        } catch (error) {
+          clearTimeout(pending.timer);
+          pending.abortCleanup?.();
+          this.#pending.delete(key);
+          reject(error);
+          return false;
+        }
+        // A synchronous guard may itself retire its owner or cancel this wait.
+        if (this.#pending.get(key) !== pending) return false;
+        if (options.signal?.aborted) {
+          finishCancelled();
+          return false;
+        }
+        pending.dispatched = true;
+        return true;
+      }).catch((error: unknown) => {
         const pending = this.#pending.get(key);
         if (pending === undefined) return;
         clearTimeout(pending.timer);
@@ -261,7 +296,7 @@ export class StdioJsonRpcTransport implements RpcTransport {
           : new TransportFault(
               "write_failed",
               "The Codex app-server request could not be written.",
-              { stateMayHaveChanged: pending.mutation }
+              { stateMayHaveChanged: pending.mutation && pending.dispatched }
             );
         if (fault.stateMayHaveChanged) this.#addTombstone(key);
         reject(fault);
@@ -376,7 +411,7 @@ export class StdioJsonRpcTransport implements RpcTransport {
     return this.#child;
   }
 
-  #enqueueWrite(child: ChildProcessWithoutNullStreams, envelope: JsonObject): Promise<void> {
+  #enqueueWrite(child: ChildProcessWithoutNullStreams, envelope: JsonObject, beforeWrite?: () => boolean): Promise<void> {
     let bytes: Buffer;
     try {
       bytes = Buffer.from(`${JSON.stringify(envelope)}\n`, "utf8");
@@ -388,6 +423,7 @@ export class StdioJsonRpcTransport implements RpcTransport {
     }
     const write = this.#writeTail.then(async () => {
       if (child !== this.#child || !this.running) throw new TransportFault("closed", "The Codex transport was closed before write.");
+      if (beforeWrite?.() === false) return;
       if (child.stdin.write(bytes)) return;
       await once(child.stdin, "drain");
     });
@@ -445,6 +481,12 @@ export class StdioJsonRpcTransport implements RpcTransport {
         if (!this.#dispatchServerRequest(request, byteLength)) return false;
       } else if (id === undefined) {
         const notification: RpcNotification = { method, params };
+        try {
+          this.#handlers?.onNotificationObserved?.(notification);
+        } catch {
+          this.#fail(new TransportFault("protocol_violation", "A Codex notification could not be observed safely."));
+          return false;
+        }
         if (!this.#dispatchInbound(
           () => this.#handlers?.onNotification(notification),
           "A Codex notification could not be routed safely.",
@@ -567,7 +609,7 @@ export class StdioJsonRpcTransport implements RpcTransport {
       clearTimeout(pending.timer);
       pending.abortCleanup?.();
       pending.reject(new TransportFault(fault.code, fault.message, {
-        stateMayHaveChanged: fault.stateMayHaveChanged || pending.mutation
+        stateMayHaveChanged: pending.dispatched && (fault.stateMayHaveChanged || pending.mutation)
       }));
     }
     this.#pending.clear();

@@ -4,7 +4,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { ArtifactView } from "../model.js";
+import type { ArtifactDownloadContext, ArtifactView } from "../model.js";
 import { TimelineTextAttachmentLightbox } from "./TimelineTextAttachmentLightbox.js";
 import {
   TIMELINE_TEXT_PREVIEW_LIMIT_BYTES,
@@ -89,7 +89,7 @@ describe("timeline text attachment lightbox", () => {
     await click(button(labels.copy));
     expect(writeText).toHaveBeenCalledWith(text);
     await click(button(labels.download));
-    expect(onDownload).toHaveBeenCalledWith("blob-1", "notes.md");
+    expect(onDownload).toHaveBeenCalledWith("blob-1", "notes.md", { ownerDocument: document, signal: expect.any(AbortSignal) });
 
     act(() => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
     expect(onClose).toHaveBeenCalledOnce();
@@ -120,14 +120,118 @@ describe("timeline text attachment lightbox", () => {
     await click(required(document.querySelector<HTMLButtonElement>(".text-attachment-lightbox__backdrop")));
     expect(onClose).toHaveBeenCalledOnce();
   });
+
+  it("cancels a pending download when the same text source moves to another Document", async () => {
+    const frame = document.body.appendChild(document.createElement("iframe"));
+    const detached = frame.contentDocument!;
+    const trigger = document.body.appendChild(document.createElement("button"));
+    const nextTrigger = detached.body.appendChild(detached.createElement("button"));
+    const large = { ...artifact, byteSize: TIMELINE_TEXT_PREVIEW_LIMIT_BYTES + 1 };
+    const loadUrl = vi.fn(async () => "blob:unused");
+    const attempts: { context: ArtifactDownloadContext; reject: (reason: unknown) => void }[] = [];
+    const onDownload = vi.fn((_blobId: string, _fileName: string, context: ArtifactDownloadContext) => new Promise<void>((_resolve, reject) => { attempts.push({ context, reject }); }));
+    const onClose = vi.fn();
+    const root = createRoot(document.body.appendChild(document.createElement("div")));
+    roots.push(root);
+    const render = (returnFocus: HTMLElement) => act(async () => root.render(<TimelineTextAttachmentLightbox ownerKey="task" artifact={large} labels={labels} returnFocus={returnFocus} loadUrl={loadUrl} onDownload={onDownload} onClose={onClose} />));
+    await render(trigger);
+    await click(button(labels.download));
+    expect(attempts[0]!.context.ownerDocument).toBe(document);
+    await render(nextTrigger);
+    expect(attempts[0]!.context.signal.aborted).toBe(true);
+    const currentDownload = detached.querySelector<HTMLButtonElement>('button[aria-label="Download"]')!;
+    await click(currentDownload);
+    expect(attempts[1]!.context.ownerDocument).toBe(detached);
+    await act(async () => attempts[0]!.reject(new Error("old download failed")));
+    expect(detached.querySelector('[role="alert"]')).toBeNull();
+    expect(currentDownload.getAttribute("aria-busy")).toBe("true");
+    await click(detached.querySelector<HTMLButtonElement>('button[aria-label="Close"]')!);
+    expect(attempts[1]!.context.signal.aborted).toBe(true);
+    expect(onClose).toHaveBeenCalledOnce();
+    await act(async () => attempts[1]!.reject(new Error("closed download failed")));
+    expect(detached.querySelector('[role="alert"]')).toBeNull();
+  });
+
+  it.each(["blob", "text"] as const)("rejects a retired %s read across a source ABA and copies only the current bounded text", async (stage) => {
+    let releaseOld!: () => void;
+    const firstBlob = { size: 7, text: async () => "retired" };
+    const lateBlob = stage === "blob"
+      ? new Promise<typeof firstBlob>((resolve) => { releaseOld = () => resolve(firstBlob); })
+      : Promise.resolve({ size: 7, text: () => new Promise<string>((resolve) => { releaseOld = () => resolve("retired"); }) });
+    const response = (text: string) => ({ ok: true, blob: async () => ({ size: text.length, text: async () => text }) });
+    const fetch = vi.fn()
+      .mockResolvedValueOnce({ ok: true, blob: () => lateBlob })
+      .mockResolvedValueOnce(response("second"))
+      .mockResolvedValueOnce(response("current first"));
+    vi.stubGlobal("fetch", fetch);
+    const root = createRoot(document.body.appendChild(document.createElement("div")));
+    roots.push(root);
+    const loadUrl = vi.fn(async (blobId: string) => `blob:${blobId}`);
+    const onClose = vi.fn();
+    const render = (current: ArtifactView) => act(async () => root.render(<TimelineTextAttachmentLightbox ownerKey="task" artifact={current} labels={labels} loadUrl={loadUrl} onDownload={vi.fn()} onClose={onClose} />));
+    await render(artifact);
+    await render({ ...artifact, blobId: "second" });
+    expect(document.querySelector("pre")?.textContent).toBe("second");
+    await render(artifact);
+    expect(document.querySelector("pre")?.textContent).toBe("current first");
+    await act(async () => releaseOld());
+    expect(document.querySelector("pre")?.textContent).toBe("current first");
+    await click(button(labels.copy));
+    expect(writeText).toHaveBeenLastCalledWith("current first");
+    expect((fetch.mock.calls[0]![1] as RequestInit).signal?.aborted).toBe(true);
+    act(() => window.dispatchEvent(new Event("pagehide")));
+    expect(document.querySelector("pre")?.textContent).toBe("current first");
+    await render({ ...artifact, byteSize: TIMELINE_TEXT_PREVIEW_LIMIT_BYTES + 1 });
+    expect(document.querySelector("pre")).toBeNull();
+    expect(document.body.textContent).toContain(labels.tooLarge);
+    expect(fetch).toHaveBeenCalledTimes(3);
+  });
+
+  it("retires an unresolved URL before changing windows and reports clipboard failure in the current dialog", async () => {
+    const frame = document.body.appendChild(document.createElement("iframe"));
+    const detached = frame.contentDocument!;
+    const trigger = document.body.appendChild(document.createElement("button"));
+    const nextTrigger = detached.body.appendChild(detached.createElement("button"));
+    const oldFocus = vi.spyOn(trigger, "focus");
+    const mainFetch = vi.fn();
+    vi.stubGlobal("fetch", mainFetch);
+    const detachedFetch = vi.fn(async () => ({ ok: true, blob: async () => ({ size: 7, text: async () => "current" }) }));
+    Object.defineProperty(detached.defaultView, "fetch", { configurable: true, value: detachedFetch });
+    Object.defineProperty(detached.defaultView!.navigator, "clipboard", { configurable: true, value: undefined });
+    let releaseUrl!: (url: string) => void;
+    const loadUrl = vi.fn().mockImplementationOnce(() => new Promise<string>((resolve) => { releaseUrl = resolve; })).mockResolvedValue("blob:current");
+    const root = createRoot(document.body.appendChild(document.createElement("div")));
+    roots.push(root);
+    const onClose = vi.fn();
+    const render = (returnFocus: HTMLElement) => act(async () => root.render(<TimelineTextAttachmentLightbox ownerKey="task" artifact={artifact} labels={labels} returnFocus={returnFocus} loadUrl={loadUrl} onDownload={vi.fn()} onClose={onClose} />));
+    await render(trigger);
+    expect(document.body.textContent).toContain(labels.loading);
+    act(() => window.dispatchEvent(new Event("pagehide")));
+    expect(document.querySelector('[role="alert"]')?.textContent).toBe(labels.unavailable);
+    expect(document.body.textContent).not.toContain(labels.loading);
+    await render(nextTrigger);
+    await act(async () => releaseUrl("blob:retired"));
+    expect(mainFetch).not.toHaveBeenCalled();
+    expect(detachedFetch).toHaveBeenCalledOnce();
+    expect(detached.querySelector("pre")?.textContent).toBe("current");
+    expect(oldFocus).not.toHaveBeenCalled();
+    await click(detached.querySelector<HTMLButtonElement>('button[aria-label="Copy content"]')!);
+    expect(detached.querySelector('[role="alert"]')?.textContent).toBe(labels.copyFailed);
+    act(() => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" })));
+    act(() => detached.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", isComposing: true })));
+    expect(onClose).not.toHaveBeenCalled();
+    act(() => detached.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" })));
+    expect(onClose).toHaveBeenCalledOnce();
+    expect(detached.activeElement).toBe(nextTrigger);
+  });
 });
 
-async function mount(props: Omit<Parameters<typeof TimelineTextAttachmentLightbox>[0], "labels">): Promise<void> {
+async function mount(props: Omit<Parameters<typeof TimelineTextAttachmentLightbox>[0], "labels" | "ownerKey">): Promise<void> {
   const host = document.createElement("div");
   document.body.append(host);
   const root = createRoot(host);
   roots.push(root);
-  await act(async () => root.render(<TimelineTextAttachmentLightbox {...props} labels={labels} />));
+  await act(async () => root.render(<TimelineTextAttachmentLightbox ownerKey="task" {...props} labels={labels} />));
 }
 
 async function flush(): Promise<void> {

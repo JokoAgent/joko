@@ -85,8 +85,10 @@ export interface UiPreferences extends AppearancePreferences {
   readonly messageNavRailEnabled: boolean;
   /** Owner-scoped custom instructions snapshotted into newly-created tasks. */
   readonly personalizationPrompts: PersonalizationPrompts;
-  /** Destination for ordinary HTTP(S) message links. */
-  readonly linkOpenPreference: LinkOpenPreference;
+  /** Destination for public and private-network HTTP(S) message links. */
+  readonly webLinkOpenPreference: LinkOpenPreference;
+  /** Destination for loopback HTTP(S) message links. */
+  readonly localLinkOpenPreference: LinkOpenPreference;
   /** Enables a word-level opacity reveal while assistant text streams. */
   readonly streamFadeEnabled: boolean;
   /** Enables local OS notifications for new durable task-attention edges. */
@@ -112,6 +114,11 @@ export type AutomaticConnectionTarget =
 export type ComposerSendShortcutPreference = "enter" | "modifier-enter";
 export type MessageSearchSortPreference = "relevance" | "activityDesc" | "activityAsc";
 export type LinkOpenPreference = "sidebar" | "external";
+export type LinkOpenKind = "web" | "local";
+export const LINK_OPEN_DEFAULTS: Readonly<Record<LinkOpenKind, LinkOpenPreference>> = {
+  web: "external",
+  local: "sidebar"
+};
 export type PersonalizationPrompts = Readonly<Record<string, string>>;
 
 export const PERSONALIZATION_PROMPT_MAX_LENGTH = 8_000;
@@ -129,7 +136,8 @@ export const DEFAULT_UI_PREFERENCES: UiPreferences = {
   messageSearchSort: "relevance",
   messageNavRailEnabled: true,
   personalizationPrompts: {},
-  linkOpenPreference: "sidebar",
+  webLinkOpenPreference: LINK_OPEN_DEFAULTS.web,
+  localLinkOpenPreference: LINK_OPEN_DEFAULTS.local,
   streamFadeEnabled: true,
   sessionNotificationsEnabled: true,
   newSessionWorktreeEnabled: false,
@@ -145,7 +153,8 @@ const UI_PREFERENCE_KEYS = [
   "codeSize",
   "composerSendShortcut",
   "inspectorOpen",
-  "linkOpenPreference",
+  "webLinkOpenPreference",
+  "localLinkOpenPreference",
   "locale",
   "machineSelection",
   "messageNavRailEnabled",
@@ -205,7 +214,8 @@ export function normalizeUiPreferences(value: unknown): UiPreferences {
     || (record["messageSearchSort"] !== "relevance" && record["messageSearchSort"] !== "activityDesc" && record["messageSearchSort"] !== "activityAsc")
     || typeof record["messageNavRailEnabled"] !== "boolean"
     || !samePersistedValue(personalizationPrompts, record["personalizationPrompts"])
-    || (record["linkOpenPreference"] !== "sidebar" && record["linkOpenPreference"] !== "external")
+    || (record["webLinkOpenPreference"] !== "sidebar" && record["webLinkOpenPreference"] !== "external")
+    || (record["localLinkOpenPreference"] !== "sidebar" && record["localLinkOpenPreference"] !== "external")
     || typeof record["streamFadeEnabled"] !== "boolean"
     || typeof record["sessionNotificationsEnabled"] !== "boolean"
     || typeof record["newSessionWorktreeEnabled"] !== "boolean"
@@ -228,7 +238,8 @@ export function normalizeUiPreferences(value: unknown): UiPreferences {
     messageSearchSort: record["messageSearchSort"],
     messageNavRailEnabled: record["messageNavRailEnabled"],
     personalizationPrompts,
-    linkOpenPreference: record["linkOpenPreference"],
+    webLinkOpenPreference: record["webLinkOpenPreference"],
+    localLinkOpenPreference: record["localLinkOpenPreference"],
     streamFadeEnabled: record["streamFadeEnabled"],
     sessionNotificationsEnabled: record["sessionNotificationsEnabled"],
     newSessionWorktreeEnabled: record["newSessionWorktreeEnabled"],
@@ -327,6 +338,31 @@ function normalizeConnectionProfile(value: unknown): ConnectionProfile | undefin
 function validConnectionIdentity(value: unknown, maximumLength: number): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= maximumLength &&
     value.trim() === value && !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
+export interface ComposerDraftSnapshot {
+  readonly revision: number;
+  readonly draft?: ComposerDraft;
+}
+
+interface ComposerDraftRecord {
+  readonly revision: number;
+  readonly draft: PersistedComposerDraft;
+}
+
+function currentDraftRecord(value: unknown): ComposerDraftRecord | undefined {
+  if (value === undefined) return undefined;
+  if (value === null || typeof value !== "object" || !("revision" in value) || !("draft" in value)
+    || !Number.isSafeInteger(value.revision) || (value.revision as number) < 1
+    || value.draft === null || typeof value.draft !== "object") throw new Error("The task draft record is invalid.");
+  return value as ComposerDraftRecord;
+}
+
+function sessionDraftKey(serverId: string, sessionId: string): string {
+  if (!validConnectionIdentity(serverId, 512) || !validConnectionIdentity(sessionId, 512)) {
+    throw new Error("A task draft requires a valid server and session identity.");
+  }
+  return JSON.stringify([serverId, sessionId]);
 }
 
 export class LocalState {
@@ -438,7 +474,16 @@ export class LocalState {
     await transactionDone(transaction);
   }
 
-  async saveDraft(sessionId: string, draft: ComposerDraft): Promise<void> {
+  async saveDraft(serverId: string, sessionId: string, draft: ComposerDraft): Promise<void> {
+    await this.writeDraft(serverId, sessionId, draft);
+  }
+
+  async saveDraftIfRevision(serverId: string, sessionId: string, draft: ComposerDraft, expectedRevision: number): Promise<number | undefined> {
+    if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) throw new Error("The task draft revision is invalid.");
+    return this.writeDraft(serverId, sessionId, draft, expectedRevision);
+  }
+
+  private async writeDraft(serverId: string, sessionId: string, draft: ComposerDraft, expectedRevision?: number): Promise<number | undefined> {
     const browserComments = normalizeLiveBrowserComments(draft.browserComments);
     const extraDirectoryIds = normalizeExtraDirectoryIds(draft.extraDirectoryIds);
     const persisted: PersistedComposerDraft = {
@@ -450,16 +495,44 @@ export class LocalState {
       attachments: draft.attachments.map(persistAttachment),
       browserComments: browserComments.map((item) => ({ ...item, screenshot: persistAttachment(item.screenshot) }))
     };
-    await this.put(DRAFT_STORE, sessionId, persisted);
+    const key = sessionDraftKey(serverId, sessionId);
+    const transaction = this.#database.transaction(DRAFT_STORE, "readwrite");
+    const objectStore = transaction.objectStore(DRAFT_STORE);
+    return new Promise((resolve, reject) => {
+      let writtenRevision: number | undefined;
+      transaction.oncomplete = () => resolve(writtenRevision);
+      transaction.onabort = () => reject(transaction.error ?? new Error("Task draft write aborted."));
+      transaction.onerror = () => reject(transaction.error ?? new Error("Task draft write failed."));
+      const request = objectStore.get(key);
+      request.onerror = () => reject(request.error ?? new Error("Task draft read failed."));
+      request.onsuccess = () => {
+        try {
+          const record = currentDraftRecord(request.result);
+          const revision = record?.revision ?? 0;
+          if (expectedRevision !== undefined && expectedRevision !== revision) return;
+          if (revision >= Number.MAX_SAFE_INTEGER) throw new Error("The task draft revision is exhausted.");
+          writtenRevision = revision + 1;
+          objectStore.put({ revision: writtenRevision, draft: persisted }, key);
+        } catch (error) {
+          reject(error);
+          transaction.abort();
+        }
+      };
+    });
   }
 
-  async readDraft(sessionId: string): Promise<ComposerDraft | undefined> {
-    const persisted = await this.get<PersistedComposerDraft>(DRAFT_STORE, sessionId);
-    if (persisted === undefined) return undefined;
+  async readDraft(serverId: string, sessionId: string): Promise<ComposerDraft | undefined> {
+    return (await this.readDraftSnapshot(serverId, sessionId)).draft;
+  }
+
+  async readDraftSnapshot(serverId: string, sessionId: string): Promise<ComposerDraftSnapshot> {
+    const record = currentDraftRecord(await this.get<unknown>(DRAFT_STORE, sessionDraftKey(serverId, sessionId)));
+    if (record === undefined) return { revision: 0 };
+    const persisted = record.draft;
     const attachments = restorePersistedAttachments(persisted.attachments);
     const browserComments = restorePersistedBrowserComments(persisted.browserComments);
     const extraDirectoryIds = normalizeExtraDirectoryIds(persisted.extraDirectoryIds);
-    return {
+    return { revision: record.revision, draft: {
       text: persisted.text,
       deliveryMode: persisted.deliveryMode,
       mentions: normalizeComposerMentions(persisted.mentions),
@@ -467,7 +540,7 @@ export class LocalState {
       attachments,
       browserComments,
       ...(extraDirectoryIds === undefined ? {} : { extraDirectoryIds })
-    };
+    } };
   }
 
   async saveNewSessionDraft(scope: string, draft: NewSessionLocalDraft): Promise<void> {
@@ -499,7 +572,8 @@ export class LocalState {
     // to follow future product defaults.
     const persisted: { -readonly [Key in keyof UiPreferences]?: UiPreferences[Key] } = { ...value };
     if (value.messageNavRailEnabled) delete persisted.messageNavRailEnabled;
-    if (value.linkOpenPreference === "sidebar") delete persisted.linkOpenPreference;
+    if (value.webLinkOpenPreference === LINK_OPEN_DEFAULTS.web) delete persisted.webLinkOpenPreference;
+    if (value.localLinkOpenPreference === LINK_OPEN_DEFAULTS.local) delete persisted.localLinkOpenPreference;
     if (value.streamFadeEnabled) delete persisted.streamFadeEnabled;
     if (value.sessionNotificationsEnabled) delete persisted.sessionNotificationsEnabled;
     if (!value.newSessionWorktreeEnabled) delete persisted.newSessionWorktreeEnabled;
@@ -699,6 +773,14 @@ export function normalizeComposerMentions(value: unknown): readonly ComposerMent
       continue;
     }
     if ((record["kind"] !== "workspace" && record["kind"] !== "resource") || typeof record["token"] !== "string") continue;
+    if (record["directory"] !== undefined && (record["kind"] !== "workspace" || typeof record["directory"] !== "boolean")) continue;
+    const lineRange = record["lineRange"];
+    if (lineRange !== undefined && (record["kind"] !== "workspace" || record["directory"] === true
+      || lineRange === null || typeof lineRange !== "object" || Array.isArray(lineRange)
+      || !("startLine" in lineRange) || !("endLine" in lineRange)
+      || typeof lineRange.startLine !== "number" || typeof lineRange.endLine !== "number"
+      || !Number.isInteger(lineRange.startLine) || !Number.isInteger(lineRange.endLine)
+      || lineRange.startLine < 1 || lineRange.endLine < lineRange.startLine || lineRange.endLine > 0xffff_ffff)) continue;
     if (seenIds.has(record["id"])) continue;
     result.push({
       id: record["id"],
@@ -706,6 +788,11 @@ export function normalizeComposerMentions(value: unknown): readonly ComposerMent
       reference: record["reference"],
       label: record["label"],
       token: record["token"],
+      ...(record["directory"] === undefined ? {} : { directory: record["directory"] as boolean }),
+      ...(lineRange === undefined ? {} : { lineRange: {
+        startLine: (lineRange as { startLine: number }).startLine,
+        endLine: (lineRange as { endLine: number }).endLine
+      } }),
       ...(validId(record["workspaceId"]) ? { workspaceId: record["workspaceId"] } : {})
     });
     seenIds.add(record["id"]);

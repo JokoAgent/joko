@@ -495,6 +495,7 @@ function snapshot(overrides: {
       backendId: "backend-local",
       name: "Project",
       workspaceId: "workspace-local",
+      revision: 1n,
       workspaceName: "Project",
       trusted: true,
       pinned: false,

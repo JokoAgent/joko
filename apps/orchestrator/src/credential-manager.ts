@@ -59,6 +59,11 @@ interface UploadTicket {
     readonly flowId: string;
     readonly promptId: string;
   };
+  sshKeyPassphrase?: {
+    readonly purpose: "generate" | "agent_add";
+    readonly keyId: string;
+    readonly expectedFingerprint: string;
+  };
   sealed?: EncryptedCredential;
   consumed: boolean;
 }
@@ -218,6 +223,39 @@ export class CredentialManager {
     ticket.sealed = this.#vault.seal(value, ticketReference(ticket.id));
   }
 
+  createSshKeyPassphraseTicket(input: {
+    readonly connectionId: string;
+    readonly purpose: "generate" | "agent_add";
+    readonly keyId: string;
+    readonly expectedFingerprint: string;
+  }): { readonly credentialUploadTicketId: string; readonly expiresAt: number; readonly maximumBytes: number } {
+    const ticket = this.createUploadTicket({ connectionId: input.connectionId, maximumBytes: Math.min(4096, this.#maximumSecretBytes) });
+    this.#tickets.get(ticket.credentialUploadTicketId)!.sshKeyPassphrase = {
+      purpose: input.purpose, keyId: input.keyId, expectedFingerprint: input.expectedFingerprint
+    };
+    return ticket;
+  }
+
+  consumeSshKeyPassphrase(input: {
+    readonly credentialUploadTicketId: string;
+    readonly connectionId: string;
+    readonly purpose: "generate" | "agent_add";
+    readonly keyId: string;
+    readonly expectedFingerprint: string;
+  }): string {
+    this.#assertInitialized();
+    const ticket = this.#requireTicket(input.credentialUploadTicketId);
+    const binding = ticket.sshKeyPassphrase;
+    if (binding === undefined || ticket.connectionId !== input.connectionId || binding.purpose !== input.purpose
+      || binding.keyId !== input.keyId || binding.expectedFingerprint !== input.expectedFingerprint || ticket.sealed === undefined) {
+      throw new Error("SSH passphrase ticket does not match the current action.");
+    }
+    const value = this.#vault.open(ticket.sealed, ticketReference(ticket.id));
+    ticket.consumed = true;
+    this.#tickets.delete(ticket.id);
+    return value;
+  }
+
   /** Strict UTF-8 variant for an application/octet-stream credential route. */
   uploadBytes(credentialUploadTicketId: string, value: Uint8Array, connectionId?: string): void {
     let decoded: string;
@@ -262,8 +300,8 @@ export class CredentialManager {
   }): Promise<CredentialDescriptor> {
     this.#assertInitialized();
     const ticket = this.#requireTicket(input.credentialUploadTicketId);
-    if (ticket.providerLoginInput !== undefined) {
-      throw new Error("Provider login input tickets cannot be committed as credentials.");
+    if (ticket.providerLoginInput !== undefined || ticket.sshKeyPassphrase !== undefined) {
+      throw new Error("Ephemeral input tickets cannot be committed as credentials.");
     }
     if (ticket.sealed === undefined) throw new Error("Credential upload ticket has no uploaded value.");
     if (ticket.kind !== undefined && ticket.kind !== input.kind) throw new Error("Credential upload ticket is bound to a different credential kind.");
@@ -345,6 +383,61 @@ export class CredentialManager {
     return descriptor(updated, this.#now());
   }
 
+  /** Claims a connection-bound ticket for a new, private service credential. */
+  async commitNewManagedUpload(input: {
+    readonly credentialUploadTicketId: string;
+    readonly displayName: string;
+    readonly kind: CredentialKind;
+    readonly connectionId: string;
+    /** The service journals this non-secret reservation before any credential I/O. */
+    readonly onReserved: (credentialReferenceId: string) => void;
+  }): Promise<CredentialDescriptor> {
+    this.#assertInitialized();
+    const ticket = this.#requireTicket(input.credentialUploadTicketId);
+    const displayName = nonBlank(input.displayName, "Credential display name");
+    const connectionId = nonBlank(input.connectionId, "Connection ID");
+    validateCredentialKind(input.kind);
+    if (ticket.providerLoginInput !== undefined || ticket.sshKeyPassphrase !== undefined
+      || ticket.credentialReferenceId !== undefined || ticket.providerId !== undefined
+      || ticket.kind !== input.kind || ticket.connectionId !== connectionId || ticket.sealed === undefined) {
+      throw new Error("Credential ticket does not authorize a new service credential.");
+    }
+    const reference = `cred_managed_${randomUUID()}`;
+    const bound: UploadTicket = { ...ticket, credentialReferenceId: reference };
+    this.reserveManagedSecret({ credentialReferenceId: reference, kind: input.kind });
+    this.#tickets.set(ticket.id, bound);
+    try {
+      input.onReserved(reference);
+      const committing = this.commitManagedUpload({ ...input, displayName, connectionId, credentialReferenceId: reference });
+      // commitManagedUpload has synchronously validated/captured this ticket.
+      // Remove the public capability before its persistence await can be interleaved.
+      this.#tickets.delete(ticket.id);
+      return await committing;
+    } catch (error) {
+      if (!bound.consumed && (this.#tickets.get(ticket.id) === bound || !this.#tickets.has(ticket.id))) this.#tickets.set(ticket.id, ticket);
+      if (!this.#records.has(reference)) this.#managedReferences.delete(reference);
+      throw error;
+    }
+  }
+
+  /** Releases only a retired reservation whose exact durable generation was removed. */
+  async retireManagedCredential(credentialReferenceId: string, expectedGeneration: string | undefined): Promise<boolean> {
+    this.#assertInitialized();
+    const reference = normalizeReference(credentialReferenceId);
+    if (!this.#managedReferences.has(reference)) throw new Error("Service credential is not reserved.");
+    return this.#mutate(async () => {
+      const current = this.#records.get(reference);
+      if ((current === undefined ? undefined : credentialGeneration(current)) !== expectedGeneration) return false;
+      if (current !== undefined) {
+        this.#records.delete(reference);
+        try { await this.#persist(); }
+        catch (error) { this.#records.set(reference, current); throw error; }
+      }
+      this.#managedReferences.delete(reference);
+      return true;
+    });
+  }
+
   /** Commits a ticket into an exact service-owned credential reservation. */
   async commitManagedUpload(input: {
     readonly credentialUploadTicketId: string;
@@ -356,8 +449,8 @@ export class CredentialManager {
   }): Promise<CredentialDescriptor> {
     this.#assertInitialized();
     const ticket = this.#requireTicket(input.credentialUploadTicketId);
-    if (ticket.providerLoginInput !== undefined) {
-      throw new Error("Provider login input tickets cannot be committed as credentials.");
+    if (ticket.providerLoginInput !== undefined || ticket.sshKeyPassphrase !== undefined) {
+      throw new Error("Ephemeral input tickets cannot be committed as credentials.");
     }
     if (ticket.sealed === undefined) throw new Error("Credential upload ticket has no uploaded value.");
     if (ticket.kind !== undefined && ticket.kind !== input.kind) throw new Error("Credential upload ticket is bound to a different credential kind.");
@@ -721,7 +814,11 @@ function nativeProviderLoginMethods(
 }
 
 export interface ManagedProviderEntry {
+  readonly backendId: string;
   readonly provider: PiManagedProvider;
+  readonly requestPath?: string;
+  readonly modelsEndpoint?: string;
+  readonly credentialOrigin: string;
   readonly displayName: string;
   readonly kind: ProviderKind;
   /** Environment variable name -> opaque credential reference. */
@@ -751,7 +848,17 @@ interface StoredProviderEntry extends Omit<ManagedProviderEntry, "version" | "pr
 interface StoredProviderCatalog {
   readonly format: 1;
   readonly generation: number;
-  readonly entries: readonly StoredProviderEntry[];
+  readonly configurations: readonly StoredProviderConfiguration[];
+}
+
+interface StoredProviderConfiguration {
+  readonly providerId: string;
+  readonly displayName: string;
+  readonly kind: ProviderKind;
+  readonly enabled: boolean;
+  readonly version: string;
+  readonly updatedAt: number;
+  readonly runtimes: readonly Omit<StoredProviderEntry, "displayName" | "kind" | "enabled" | "version" | "updatedAt">[];
 }
 
 interface StoredNativeProviderAuthEntry {
@@ -876,12 +983,33 @@ export class ProviderAuthUnsupportedError extends Error {
 export interface ProviderCatalogManagerOptions {
   readonly store: OperationalStore;
   readonly credentials: CredentialManager;
+  /** Explicit composition owner of the native Provider authentication registry. */
+  readonly nativeBackendId: string;
   readonly scopeId?: string;
   readonly now?: () => number;
   readonly loginHandlers?: Readonly<Record<string, (method: ProviderLoginFlow["method"]) => Promise<ProviderLoginFlow>>>;
   readonly nativeAuth?: ProviderNativeAuthSupervisor;
-  readonly providerEnabled?: (providerId: string) => boolean;
-  readonly modelEnabled?: (providerId: string, modelId: string) => boolean;
+  readonly providerEnabled?: (backendId: string, providerId: string) => boolean;
+  readonly modelEnabled?: (backendId: string, providerId: string, modelId: string) => boolean;
+}
+
+export interface ProviderConfigurationDescriptor {
+  readonly providerId: string;
+  readonly displayName: string;
+  readonly kind: ProviderKind;
+  readonly enabled: boolean;
+  readonly version: bigint;
+  readonly updatedAt: number;
+  readonly runtimes: readonly ProviderDescriptor[];
+}
+
+export interface ManagedProviderRuntimeInput {
+  readonly backendId: string;
+  readonly provider: PiManagedProvider;
+  readonly credentialBindings: Readonly<Record<string, string>>;
+  readonly credentialOrigin: string;
+  readonly requestPath?: string;
+  readonly modelsEndpoint?: string;
 }
 
 export interface PiProviderGenerationSnapshot {
@@ -898,6 +1026,7 @@ export interface PiProviderGenerationSnapshot {
 
 /** In-process only. This secret-bearing route must never cross Connect or Store. */
 export interface OpenAiEmbeddingRoute {
+  readonly backendId: string;
   readonly providerId: string;
   /**
    * Non-secret identity of the exact Provider configuration generation used
@@ -915,25 +1044,33 @@ export interface OpenAiEmbeddingRoute {
  * prediction. Plaintext authorization is resolved at the final Orchestrator
  * boundary and must never be persisted, projected, or logged. */
 export interface ProviderInferenceRoute {
+  readonly backendId: string;
   readonly providerId: string;
   readonly generationId: string;
   readonly modelId: string;
   readonly api: "anthropic-messages" | "openai-responses" | "openai-completions";
   readonly baseUrl: string;
+  readonly requestPath?: string;
   readonly authorization?: string;
   readonly headers: Readonly<Record<string, string>>;
   readonly supportsImages: boolean;
+}
+
+/** Service-only identity. Never project this credential generation into public state. */
+export interface ProviderInferenceIdentity {
+  readonly generationId: string;
 }
 
 /** Public provider catalog plus an in-memory credential join for Pi spawning. */
 export class ProviderCatalogManager {
   readonly #store: OperationalStore;
   readonly #credentials: CredentialManager;
+  readonly #nativeBackendId: string;
   readonly #scopeId: string;
   readonly #now: () => number;
   readonly #loginHandlers: Readonly<Record<string, (method: ProviderLoginFlow["method"]) => Promise<ProviderLoginFlow>>>;
-  readonly #providerEnabled: (providerId: string) => boolean;
-  readonly #modelEnabled: (providerId: string, modelId: string) => boolean;
+  readonly #providerEnabled: (backendId: string, providerId: string) => boolean;
+  readonly #modelEnabled: (backendId: string, providerId: string, modelId: string) => boolean;
   readonly #entries = new Map<string, ManagedProviderEntry>();
   readonly #nativeEntries = new Map<string, NativeProviderAuthEntry>();
   readonly #authentication = new Map<string, { readonly state: ProviderAuthenticationState; readonly error?: string }>();
@@ -945,6 +1082,7 @@ export class ProviderCatalogManager {
   constructor(options: ProviderCatalogManagerOptions) {
     this.#store = options.store;
     this.#credentials = options.credentials;
+    this.#nativeBackendId = nonBlank(options.nativeBackendId, "Native authentication Backend ID");
     this.#scopeId = options.scopeId ?? "orchestrator";
     this.#now = options.now ?? Date.now;
     this.#loginHandlers = options.loginHandlers ?? {};
@@ -1032,15 +1170,16 @@ export class ProviderCatalogManager {
     if (this.#initialized) return;
     const stored = this.#store.findSetting<StoredProviderCatalog>("service", this.#scopeId, "provider_catalog");
     if (stored !== undefined) {
-      if (stored.value.format !== 1 || !Array.isArray(stored.value.entries) || !Number.isSafeInteger(stored.value.generation)) {
+      if (stored.value.format !== 1 || !Array.isArray(stored.value.configurations) || !Number.isSafeInteger(stored.value.generation)) {
         throw new Error("Provider catalog setting has an unsupported format.");
       }
       this.#generation = stored.value.generation;
-      for (const item of stored.value.entries) {
+      for (const item of stored.value.configurations.flatMap(providerConfigurationFromStorage)) {
         const entry = providerFromStorage(item);
         validateProviderEntry(entry);
-        if (this.#entries.has(entry.provider.id)) throw new Error("Provider catalog contains duplicate provider IDs.");
-        this.#entries.set(entry.provider.id, entry);
+        const key = managedProviderKey(entry.backendId, entry.provider.id);
+        if (this.#entries.has(key)) throw new Error("Provider catalog contains duplicate runtime identities.");
+        this.#entries.set(key, entry);
       }
     }
     const storedNative = this.#store.findSetting<StoredNativeProviderAuthCatalog>("service", this.#scopeId, "native_provider_auth_catalog");
@@ -1062,25 +1201,91 @@ export class ProviderCatalogManager {
     return this.#generation;
   }
 
-  list(): readonly ProviderDescriptor[] {
+  get nativeAuthenticationBackendId(): string { return this.#nativeBackendId; }
+
+  hasManagedProvider(backendId: string, providerId: string): boolean {
     this.#assertInitialized();
-    const managed = [...this.#entries.values()].map((entry) => this.#descriptor(entry, this.#nativeEntries.get(entry.provider.id)));
+    return this.#entries.has(managedProviderKey(backendId, providerId));
+  }
+
+  listManaged(backendId: string): readonly ProviderDescriptor[] {
+    this.#assertInitialized();
+    return [...this.#entries.values()].filter((entry) => entry.backendId === backendId).map((entry) => this.#descriptor(entry, undefined));
+  }
+
+  list(backendId?: string): readonly ProviderDescriptor[] {
+    this.#assertInitialized();
+    const managed = [...this.#entries.values()]
+      .filter((entry) => backendId === undefined || entry.backendId === backendId)
+      .map((entry) => this.#descriptor(entry, entry.backendId === this.#nativeBackendId ? this.#nativeEntries.get(entry.provider.id) : undefined));
     const native = [...this.#nativeEntries.values()]
-      .filter((entry) => entry.runtimeProvider !== undefined && !this.#entries.has(entry.providerId))
+      .filter((entry) => (backendId === undefined || backendId === this.#nativeBackendId)
+        && entry.runtimeProvider !== undefined && !this.#entries.has(managedProviderKey(this.#nativeBackendId, entry.providerId)))
       .map((entry) => this.#nativeDescriptor(entry));
     return [...managed, ...native]
       .sort((left, right) => left.displayName.localeCompare(right.displayName, "en") || left.provider.id.localeCompare(right.provider.id, "en"))
       ;
   }
 
-  get(providerId: string): ProviderDescriptor {
+  get(backendId: string, providerId: string): ProviderDescriptor {
     this.#assertInitialized();
     const normalized = nonBlank(providerId, "Provider ID");
-    const managed = this.#entries.get(normalized);
-    const native = this.#nativeEntries.get(normalized);
+    const managed = this.#entries.get(managedProviderKey(backendId, normalized));
+    const native = backendId === this.#nativeBackendId ? this.#nativeEntries.get(normalized) : undefined;
     if (managed !== undefined) return this.#descriptor(managed, native);
     if (native?.runtimeProvider !== undefined) return this.#nativeDescriptor(native);
     throw new Error("Provider does not exist.");
+  }
+
+  listConfigurations(): readonly ProviderConfigurationDescriptor[] {
+    const grouped = new Map<string, ProviderDescriptor[]>();
+    for (const runtime of this.list()) {
+      const entries = grouped.get(runtime.provider.id) ?? [];
+      entries.push(runtime);
+      grouped.set(runtime.provider.id, entries);
+    }
+    return [...grouped].map(([providerId, runtimes]) => {
+      const metadata = [...runtimes].sort((a, b) => a.version > b.version ? -1 : a.version < b.version ? 1 : 0)[0]!;
+      return { providerId, displayName: metadata.displayName, kind: metadata.kind,
+        enabled: metadata.enabled, version: metadata.version, updatedAt: metadata.updatedAt, runtimes };
+    });
+  }
+
+  async upsertConfiguration(input: {
+    readonly providerId: string;
+    readonly displayName: string;
+    readonly kind: ProviderKind;
+    readonly enabled: boolean;
+    readonly expectedVersion: bigint;
+    readonly runtimes: readonly ManagedProviderRuntimeInput[];
+  }, options: { readonly stillActive?: () => boolean } = {}): Promise<void> {
+    this.#assertInitialized();
+    if (input.runtimes.length === 0 || new Set(input.runtimes.map((runtime) => runtime.backendId)).size !== input.runtimes.length) {
+      throw new Error("Provider configuration requires unique runtime identities.");
+    }
+    for (const runtime of input.runtimes) {
+      if (runtime.provider.id !== input.providerId) throw new Error("Provider runtime identity differs from its configuration.");
+      validateProviderEntry({ ...runtime, displayName: input.displayName, kind: input.kind, enabled: input.enabled,
+        version: 1n, updatedAt: this.#now(), supportsLogin: false, supportsLogout: false, supportsRefresh: false });
+    }
+    await this.#mutate(async () => {
+      if (options.stillActive?.() === false) throw new Error("Provider mutation owner changed.");
+      const existing = [...this.#entries].filter(([, entry]) => entry.provider.id === input.providerId);
+      const revision = existing.reduce((maximum, [, entry]) => entry.version > maximum ? entry.version : maximum, 0n);
+      if (revision !== input.expectedVersion) throw new Error("Provider configuration changed concurrently.");
+      const updatedAt = this.#now();
+      for (const [key] of existing) this.#entries.delete(key);
+      for (const runtime of input.runtimes) {
+        this.#entries.set(managedProviderKey(runtime.backendId, input.providerId), {
+          ...structuredClone(runtime), displayName: input.displayName, kind: input.kind, enabled: input.enabled,
+          version: revision === 0n ? BigInt(this.#generation) + 1n : revision + 1n, updatedAt, supportsLogin: false, supportsLogout: false, supportsRefresh: false
+        });
+      }
+      await this.#bumpAndPersist(() => {
+        for (const [key, entry] of this.#entries) if (entry.provider.id === input.providerId) this.#entries.delete(key);
+        for (const [key, entry] of existing) this.#entries.set(key, entry);
+      });
+    });
   }
 
   /**
@@ -1088,33 +1293,36 @@ export class ProviderCatalogManager {
    * `/embeddings` route. No endpoint is inferred from a Provider that did not
    * declare the model, and plaintext credentials remain inside Orchestrator.
    */
-  resolveOpenAiEmbeddingRoute(modelId: string, providerId?: string): OpenAiEmbeddingRoute | undefined {
+  resolveOpenAiEmbeddingRoute(modelId: string, selection?: Pick<OpenAiEmbeddingRoute, "backendId" | "providerId">): OpenAiEmbeddingRoute | undefined {
     this.#assertInitialized();
     const normalizedModelId = nonBlank(modelId, "Embedding model ID");
-    const normalizedProviderId = providerId === undefined ? undefined : nonBlank(providerId, "Embedding Provider ID");
+    const normalizedProviderId = selection === undefined ? undefined : nonBlank(selection.providerId, "Embedding Provider ID");
+    const normalizedBackendId = selection === undefined ? undefined : nonBlank(selection.backendId, "Embedding Backend ID");
     const candidates = [...this.#entries.values()]
       .filter((entry) => entry.enabled)
-      .filter((entry) => this.#providerEnabled(entry.provider.id))
-      .filter((entry) => this.#modelEnabled(entry.provider.id, normalizedModelId))
+      .filter((entry) => this.#providerEnabled(entry.backendId, entry.provider.id))
+      .filter((entry) => this.#modelEnabled(entry.backendId, entry.provider.id, normalizedModelId))
       .filter((entry) => entry.provider.baseUrl !== undefined)
       .filter((entry) => entry.provider.models.some((model) => model.id === normalizedModelId))
       .filter((entry) => normalizedProviderId === undefined || entry.provider.id === normalizedProviderId)
+      .filter((entry) => normalizedBackendId === undefined || entry.backendId === normalizedBackendId)
       .filter((entry) => safeEmbeddingBaseUrl(entry.provider.baseUrl!))
       .sort((left, right) => left.provider.id.localeCompare(right.provider.id, "en"));
-    // Selecting a Provider is a durable security choice, not dictionary-order
-    // routing. An unpinned generation is available only when exactly one
-    // eligible Provider exists; the coordinator then pins its ID in Store.
-    if (normalizedProviderId === undefined && candidates.length !== 1) return undefined;
+    // The first selection requires one complete route. Later selections retain
+    // both Backend and Provider; another runtime cannot take over its index.
+    const eligible: OpenAiEmbeddingRoute[] = [];
     for (const entry of candidates) {
       const baseUrl = entry.provider.baseUrl;
       if (baseUrl === undefined) continue;
       const apiKeyEnvironment = entry.provider.apiKeyEnv;
+      const generations = new Map<string, string>();
       let authorization: string | undefined;
       if (apiKeyEnvironment !== undefined) {
         const reference = entry.credentialBindings[apiKeyEnvironment];
         if (reference === undefined) continue;
         try {
           authorization = `Bearer ${this.#credentials.resolve(reference)}`;
+          generations.set(reference, this.#credentials.find(reference)!.generation);
         } catch {
           continue;
         }
@@ -1131,6 +1339,7 @@ export class ProviderCatalogManager {
         }
         try {
           headers[headerName] = this.#credentials.resolve(reference);
+          generations.set(reference, this.#credentials.find(reference)!.generation);
         } catch {
           complete = false;
           break;
@@ -1140,18 +1349,20 @@ export class ProviderCatalogManager {
       const endpointBase = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
       const endpoint = new URL("embeddings", endpointBase).toString();
       const generationId = createHash("sha256")
-        .update(`${entry.provider.id}\0${entry.version.toString(10)}\0${normalizedModelId}\0${endpoint}`)
+        .update(JSON.stringify([entry.backendId, entry.provider.id, entry.version.toString(10), normalizedModelId, endpoint,
+          [...generations].sort(([left], [right]) => left.localeCompare(right, "en"))]))
         .digest("hex");
-      return {
+      eligible.push({
+        backendId: entry.backendId,
         providerId: entry.provider.id,
         generationId,
         modelId: normalizedModelId,
         endpoint,
         ...(authorization === undefined ? {} : { authorization }),
         headers
-      };
+      });
     }
-    return undefined;
+    return eligible.length === 1 ? eligible[0] : undefined;
   }
 
   /** Resolve one exact, catalogued inference route. Unlike embedding routing,
@@ -1159,6 +1370,7 @@ export class ProviderCatalogManager {
    * Session selection. Native OAuth routes stay inside Pi and are therefore
    * intentionally unavailable to this independent Orchestrator one-shot channel. */
   hasInferenceModel(
+    backendId: string,
     providerId: string,
     modelId: string,
     options: { readonly requireImages?: boolean } = {}
@@ -1166,12 +1378,12 @@ export class ProviderCatalogManager {
     this.#assertInitialized();
     const normalizedProviderId = nonBlank(providerId, "Inference Provider ID");
     const normalizedModelId = nonBlank(modelId, "Inference model ID");
-    const entry = this.#entries.get(normalizedProviderId);
+    const entry = this.#entries.get(managedProviderKey(backendId, normalizedProviderId));
     if (
       entry === undefined
       || !entry.enabled
-      || !this.#providerEnabled(normalizedProviderId)
-      || !this.#modelEnabled(normalizedProviderId, normalizedModelId)
+      || !this.#providerEnabled(backendId, normalizedProviderId)
+      || !this.#modelEnabled(backendId, normalizedProviderId, normalizedModelId)
       || entry.provider.baseUrl === undefined
     ) return false;
     const model = entry.provider.models.find((candidate) => candidate.id === normalizedModelId);
@@ -1182,7 +1394,40 @@ export class ProviderCatalogManager {
     return safeEmbeddingBaseUrl(entry.provider.baseUrl);
   }
 
+  /** Describe readiness and all credential replacements without opening any secret. */
+  describeInferenceRoute(backendId: string, providerId: string, modelId: string): ProviderInferenceIdentity | undefined {
+    const normalizedProviderId = nonBlank(providerId, "Inference Provider ID");
+    const normalizedModelId = nonBlank(modelId, "Inference model ID");
+    if (!this.hasInferenceModel(backendId, normalizedProviderId, normalizedModelId)) return undefined;
+    const entry = this.#entries.get(managedProviderKey(backendId, normalizedProviderId))!;
+    const references = new Set<string>();
+    if (entry.provider.apiKeyEnv !== undefined) {
+      const reference = entry.credentialBindings[entry.provider.apiKeyEnv];
+      if (reference === undefined) return undefined;
+      references.add(reference);
+    } else if (entry.provider.keyless !== true && Object.keys(entry.provider.headers ?? {}).length === 0) {
+      return undefined;
+    }
+    for (const source of Object.values(entry.provider.headers ?? {})) {
+      const reference = entry.credentialBindings[source.env];
+      if (reference === undefined) return undefined;
+      references.add(reference);
+    }
+    const generations: string[] = [];
+    for (const reference of [...references].sort()) {
+      const credential = this.#credentials.find(reference);
+      if (credential?.configured !== true) return undefined;
+      generations.push(credential.generation);
+    }
+    return {
+      generationId: createHash("sha256").update(JSON.stringify([
+        backendId, entry.version.toString(), normalizedProviderId, normalizedModelId, generations
+      ])).digest("hex")
+    };
+  }
+
   resolveInferenceRoute(
+    backendId: string,
     providerId: string,
     modelId: string,
     options: { readonly requireImages?: boolean } = {}
@@ -1190,12 +1435,12 @@ export class ProviderCatalogManager {
     this.#assertInitialized();
     const normalizedProviderId = nonBlank(providerId, "Inference Provider ID");
     const normalizedModelId = nonBlank(modelId, "Inference model ID");
-    const entry = this.#entries.get(normalizedProviderId);
+    const entry = this.#entries.get(managedProviderKey(backendId, normalizedProviderId));
     if (
       entry === undefined
       || !entry.enabled
-      || !this.#providerEnabled(normalizedProviderId)
-      || !this.#modelEnabled(normalizedProviderId, normalizedModelId)
+      || !this.#providerEnabled(backendId, normalizedProviderId)
+      || !this.#modelEnabled(backendId, normalizedProviderId, normalizedModelId)
       || entry.provider.baseUrl === undefined
     ) return undefined;
     const model = entry.provider.models.find((candidate) => candidate.id === normalizedModelId);
@@ -1239,15 +1484,17 @@ export class ProviderCatalogManager {
         authorization = `Bearer ${secret}`;
       }
     }
-    const generationId = createHash("sha256")
-      .update(`${entry.provider.id}\0${entry.version.toString(10)}\0${normalizedModelId}\0${entry.provider.baseUrl}\0${api}`)
-      .digest("hex");
+    const identity = this.describeInferenceRoute(backendId, providerId, modelId);
+    if (identity === undefined) return undefined;
+    const generationId = identity.generationId;
     return {
+      backendId,
       providerId: normalizedProviderId,
       generationId,
       modelId: normalizedModelId,
       api,
       baseUrl: entry.provider.baseUrl,
+      ...(entry.requestPath === undefined ? {} : { requestPath: entry.requestPath }),
       ...(authorization === undefined ? {} : { authorization }),
       headers,
       supportsImages
@@ -1259,7 +1506,7 @@ export class ProviderCatalogManager {
     this.#assertInitialized();
     for (const entry of this.#entries.values()) {
       for (const model of entry.provider.models) {
-        if (this.resolveInferenceRoute(entry.provider.id, model.id, options) !== undefined) return true;
+        if (this.resolveInferenceRoute(entry.backendId, entry.provider.id, model.id, options) !== undefined) return true;
       }
     }
     return false;
@@ -1273,8 +1520,9 @@ export class ProviderCatalogManager {
     validateProviderEntry({ ...input, version: 1n, updatedAt: this.#now() });
     return this.#mutate(async () => {
       if (options.stillActive?.() === false) throw new Error("Provider mutation owner changed.");
-      const existing = this.#entries.get(input.provider.id);
-      if (input.expectedVersion !== undefined && existing?.version !== input.expectedVersion) {
+      const key = managedProviderKey(input.backendId, input.provider.id);
+      const existing = this.#entries.get(key);
+      if (input.expectedVersion !== undefined && (existing?.version ?? 0n) !== input.expectedVersion) {
         throw new Error("Provider catalog entry changed concurrently.");
       }
       const next: ManagedProviderEntry = {
@@ -1283,29 +1531,30 @@ export class ProviderCatalogManager {
         ...(existing?.nativeCredentialReferenceId === undefined
           ? {}
           : { nativeCredentialReferenceId: existing.nativeCredentialReferenceId }),
-        version: (existing?.version ?? 0n) + 1n,
+        version: existing === undefined ? BigInt(this.#generation) + 1n : existing.version + 1n,
         updatedAt: this.#now()
       };
-      this.#entries.set(next.provider.id, next);
+      this.#entries.set(key, next);
       await this.#bumpAndPersist(existing === undefined
-        ? () => this.#entries.delete(next.provider.id)
-        : () => this.#entries.set(existing.provider.id, existing));
+        ? () => this.#entries.delete(key)
+        : () => this.#entries.set(key, existing));
       return this.#descriptor(next);
     });
   }
 
-  canDiscoverProviderModels(providerId: string): boolean {
+  canDiscoverProviderModels(backendId: string, providerId: string): boolean {
     this.#assertInitialized();
-    const entry = this.#entries.get(nonBlank(providerId, "Provider ID"));
+    const entry = this.#entries.get(managedProviderKey(backendId, providerId));
     return entry?.provider.baseUrl !== undefined;
   }
 
   async discoverProviderModels(
+    backendId: string,
     providerId: string,
     fetchImpl: typeof fetch = fetch
   ): Promise<ProviderModelDiscoveryResult> {
     this.#assertInitialized();
-    const normalized = nonBlank(providerId, "Provider ID");
+    const normalized = managedProviderKey(backendId, providerId);
     const captured = this.#entries.get(normalized);
     if (captured === undefined || captured.provider.baseUrl === undefined) {
       throw new ProviderModelDiscoveryError("unsafe_endpoint");
@@ -1321,7 +1570,7 @@ export class ProviderCatalogManager {
       const additions = discovered.filter((model) => !known.has(model.id));
       if (additions.length === 0) {
         return {
-          providerId: normalized,
+          providerId,
           addedModelIds: [],
           modelCount: current.provider.models.length
         };
@@ -1348,7 +1597,7 @@ export class ProviderCatalogManager {
       this.#entries.set(normalized, next);
       await this.#bumpAndPersist(() => this.#entries.set(normalized, current));
       return {
-        providerId: normalized,
+        providerId,
         addedModelIds: additions.map((model) => model.id),
         modelCount: next.provider.models.length
       };
@@ -1359,54 +1608,14 @@ export class ProviderCatalogManager {
     this.#assertInitialized();
     return this.#mutate(async () => {
       if (options.stillActive?.() === false) throw new Error("Provider mutation owner changed.");
-      const existing = this.#entries.get(providerId);
-      if (existing === undefined) return false;
-      this.#entries.delete(providerId);
-      await this.#bumpAndPersist(() => this.#entries.set(providerId, existing));
+      const existing = [...this.#entries].filter(([, entry]) => entry.provider.id === providerId);
+      if (existing.length === 0) return false;
+      for (const [key] of existing) this.#entries.delete(key);
+      await this.#bumpAndPersist(() => { for (const [key, entry] of existing) this.#entries.set(key, entry); });
       return true;
     });
   }
 
-  async commitCredential(input: {
-    readonly providerId: string;
-    readonly environmentName?: string;
-    readonly credentialUploadTicketId: string;
-    readonly credentialReferenceId?: string;
-    readonly displayName: string;
-    readonly kind: CredentialKind;
-    readonly expiresAt?: number;
-    readonly connectionId?: string;
-  }): Promise<CredentialDescriptor> {
-    this.#assertInitialized();
-    const entry = this.#require(input.providerId);
-    const environmentName = input.environmentName ?? inferPrimaryCredentialEnvironment(entry.provider);
-    if (environmentName === undefined) throw new Error("Provider has no credential environment binding.");
-    assertEnvironmentName(environmentName);
-    const allowed = providerEnvironmentNames(entry.provider);
-    if (!allowed.has(environmentName)) throw new Error("Credential environment is not declared by the provider.");
-    const credential = await this.#credentials.commitUpload({
-      credentialUploadTicketId: input.credentialUploadTicketId,
-      ...(input.credentialReferenceId === undefined ? {} : { credentialReferenceId: input.credentialReferenceId }),
-      displayName: input.displayName,
-      kind: input.kind,
-      providerId: input.providerId,
-      ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
-      ...(input.connectionId === undefined ? {} : { connectionId: input.connectionId })
-    });
-    await this.#mutate(async () => {
-      const current = this.#require(input.providerId);
-      const updated: ManagedProviderEntry = {
-        ...current,
-        credentialBindings: { ...current.credentialBindings, [environmentName]: credential.credentialReferenceId },
-        version: current.version + 1n,
-        updatedAt: this.#now()
-      };
-      this.#entries.set(input.providerId, updated);
-      await this.#bumpAndPersist(() => this.#entries.set(input.providerId, current));
-    });
-    this.#authentication.delete(input.providerId);
-    return credential;
-  }
 
   /**
    * Supervisor-only write path for Pi's complete, type-tagged OAuth object.
@@ -1605,7 +1814,7 @@ export class ProviderCatalogManager {
   /** Accepts only pre-redacted, user-safe status text from the supervisor. */
   setNativeAuthenticationState(providerId: string, state: ProviderAuthenticationState, publicError?: string): void {
     this.#assertInitialized();
-    this.get(providerId);
+    this.get(this.#nativeBackendId, providerId);
     if (state === "authenticated") {
       this.#authentication.delete(providerId);
       return;
@@ -1619,7 +1828,7 @@ export class ProviderCatalogManager {
   /** Captures the exact disabled managed entry a login is allowed to activate. */
   captureAuthenticatedProviderActivation(providerId: string): bigint | undefined {
     this.#assertInitialized();
-    const current = this.#entries.get(nonBlank(providerId, "Provider ID"));
+    const current = this.#entries.get(managedProviderKey(this.#nativeBackendId, providerId));
     return current === undefined || current.enabled ? undefined : current.version;
   }
 
@@ -1633,7 +1842,8 @@ export class ProviderCatalogManager {
       if (reference === undefined || this.#credentials.find(reference) === undefined) {
         throw new Error("Native Provider credential was not persisted before activation.");
       }
-      const current = this.#entries.get(normalizedProviderId);
+      const key = managedProviderKey(this.#nativeBackendId, normalizedProviderId);
+      const current = this.#entries.get(key);
       if (current === undefined || current.enabled || expectedVersion === undefined) return false;
       if (current.version !== expectedVersion) {
         throw new Error("Provider configuration changed while authentication was pending.");
@@ -1644,15 +1854,37 @@ export class ProviderCatalogManager {
         version: current.version + 1n,
         updatedAt: this.#now()
       };
-      this.#entries.set(normalizedProviderId, updated);
-      await this.#bumpAndPersist(() => this.#entries.set(normalizedProviderId, current));
+      this.#entries.set(key, updated);
+      await this.#bumpAndPersist(() => this.#entries.set(key, current));
+      return true;
+    });
+  }
+
+  /** Remove only the runtime owned by the caller, retaining the other routes. */
+  async deleteRuntime(backendId: string, providerId: string, options: {
+    readonly expectedVersion: bigint; readonly stillActive?: () => boolean;
+  }): Promise<boolean> {
+    this.#assertInitialized();
+    return this.#mutate(async () => {
+      if (options.stillActive?.() === false) throw new Error("Provider mutation owner changed.");
+      const key = managedProviderKey(backendId, providerId);
+      const entry = this.#entries.get(key);
+      if (entry === undefined) return false;
+      if (entry.version !== options.expectedVersion) throw new Error("Provider configuration changed concurrently.");
+      const previous = [...this.#entries].filter(([, runtime]) => runtime.provider.id === providerId);
+      this.#entries.delete(key);
+      const updatedAt = this.#now();
+      for (const [runtimeKey, runtime] of previous) {
+        if (runtimeKey !== key) this.#entries.set(runtimeKey, { ...runtime, version: entry.version + 1n, updatedAt });
+      }
+      await this.#bumpAndPersist(() => { for (const [runtimeKey, runtime] of previous) this.#entries.set(runtimeKey, runtime); });
       return true;
     });
   }
 
   async beginLogin(providerId: string, method: ProviderLoginFlow["method"]): Promise<ProviderLoginFlow> {
     this.#assertInitialized();
-    const provider = this.get(providerId);
+    const provider = this.get(this.#nativeBackendId, providerId);
     if (!provider.supportsLogin) throw new Error("Provider does not support login.");
     const handler = this.#loginHandlers[providerId];
     const native = handler === undefined && this.#nativeAuth?.canHandle(providerId) === true ? this.#nativeAuth : undefined;
@@ -1671,7 +1903,7 @@ export class ProviderCatalogManager {
 
   async refreshCredential(providerId: string): Promise<CredentialDescriptor> {
     this.#assertInitialized();
-    const entry = this.get(providerId);
+    const entry = this.get(this.#nativeBackendId, providerId);
     if (!entry.supportsRefresh) throw new Error("Provider does not support credential refresh.");
     const native = this.#nativeAuth?.canHandle(providerId) === true ? this.#nativeAuth : undefined;
     if (native === undefined) throw new ProviderAuthUnsupportedError("Provider refresh is not implemented by the active Pi runtime.");
@@ -1703,7 +1935,7 @@ export class ProviderCatalogManager {
     readonly authenticated: boolean;
   } {
     const normalizedProviderId = nonBlank(providerId, "Provider ID");
-    const descriptor = this.get(normalizedProviderId);
+    const descriptor = this.get(this.#nativeBackendId, normalizedProviderId);
     const reference = this.#nativeEntries.get(normalizedProviderId)?.credentialReferenceId;
     const stored = reference === undefined ? undefined : this.readNativeCredential(normalizedProviderId);
     if (reference === undefined || stored === undefined || descriptor.authenticationState !== "authenticated") {
@@ -1734,7 +1966,7 @@ export class ProviderCatalogManager {
     const normalizedProviderId = nonBlank(providerId, "Provider ID");
     const native = this.#nativeEntries.get(normalizedProviderId);
     if (native?.accountUsageAvailable !== true || native.kind !== "subscription" || native.runtimeProvider === undefined) return undefined;
-    const descriptor = this.get(normalizedProviderId);
+    const descriptor = this.get(this.#nativeBackendId, normalizedProviderId);
     if (descriptor.authenticationState !== "authenticated") return undefined;
     const reference = native.credentialReferenceId;
     if (reference === undefined) return undefined;
@@ -1781,7 +2013,7 @@ export class ProviderCatalogManager {
 
   async logout(providerId: string): Promise<ProviderDescriptor> {
     this.#assertInitialized();
-    const entry = this.get(providerId);
+    const entry = this.get(this.#nativeBackendId, providerId);
     if (!entry.supportsLogout) throw new Error("Provider does not support logout.");
     const nativeReference = this.#nativeEntries.get(providerId)?.credentialReferenceId;
     if (nativeReference !== undefined && this.#nativeAuth?.canHandle(providerId) === true) {
@@ -1797,24 +2029,23 @@ export class ProviderCatalogManager {
     } else if (nativeReference !== undefined) {
       await this.deleteNativeCredential(providerId);
     }
-    const currentEntry = this.#entries.get(providerId);
+    const key = managedProviderKey(this.#nativeBackendId, providerId);
+    const currentEntry = this.#entries.get(key);
     if (currentEntry !== undefined && Object.keys(currentEntry.credentialBindings).length > 0) {
-      const references = [...new Set(Object.values(currentEntry.credentialBindings))];
       await this.#mutate(async () => {
-        const current = this.#require(providerId);
+        const current = this.#require(this.#nativeBackendId, providerId);
         const updated: ManagedProviderEntry = {
           ...current,
           credentialBindings: {},
           version: current.version + 1n,
           updatedAt: this.#now()
         };
-        this.#entries.set(providerId, updated);
-        await this.#bumpAndPersist(() => this.#entries.set(providerId, current));
+        this.#entries.set(key, updated);
+        await this.#bumpAndPersist(() => this.#entries.set(key, current));
       });
-      for (const reference of references) await this.#credentials.delete(reference);
     }
     this.#authentication.delete(providerId);
-    return this.get(providerId);
+    return this.get(this.#nativeBackendId, providerId);
   }
 
   async createPiGenerationSnapshot(input: {
@@ -1831,12 +2062,12 @@ export class ProviderCatalogManager {
       const generation = this.#generation;
       const entries = [...this.#entries.values()].flatMap((entry): ManagedProviderEntry[] => {
         if (
-          !entry.enabled
-          || !this.#providerEnabled(entry.provider.id)
+          entry.backendId !== this.#nativeBackendId || !entry.enabled
+          || !this.#providerEnabled(entry.backendId, entry.provider.id)
           || input.providerEnabled?.(entry.provider.id) === false
         ) return [];
         const models = entry.provider.models.filter((model) =>
-          this.#modelEnabled(entry.provider.id, model.id)
+          this.#modelEnabled(entry.backendId, entry.provider.id, model.id)
           && input.modelEnabled?.(entry.provider.id, model.id) !== false);
         return models.length === 0 ? [] : [{ ...entry, provider: { ...entry.provider, models } }];
       });
@@ -1877,7 +2108,7 @@ export class ProviderCatalogManager {
         const nativeAuthProviderIds = [...this.#nativeEntries.values()]
           .filter((entry) => entry.runtimeProvider !== undefined
             && entry.kind !== "local_keyless"
-            && this.#providerEnabled(entry.providerId)
+            && this.#providerEnabled(this.#nativeBackendId, entry.providerId)
             && input.providerEnabled?.(entry.providerId) !== false)
           .map((entry) => entry.providerId)
           .sort();
@@ -1887,7 +2118,7 @@ export class ProviderCatalogManager {
           providers: entries.map((entry) => entry.provider),
           nativeAuthProviderIds,
           nativeAuthenticatedProviderIds: nativeAuthProviderIds.filter((providerId) =>
-            this.get(providerId).authenticationState === "authenticated"
+            this.get(this.#nativeBackendId, providerId).authenticationState === "authenticated"
           ),
           environment,
           secretEnvironmentNames: Object.keys(environment).sort()
@@ -1898,7 +2129,7 @@ export class ProviderCatalogManager {
     });
   }
 
-  #descriptor(entry: ManagedProviderEntry, native = this.#nativeEntries.get(entry.provider.id)): ProviderDescriptor {
+  #descriptor(entry: ManagedProviderEntry, native = entry.backendId === this.#nativeBackendId ? this.#nativeEntries.get(entry.provider.id) : undefined): ProviderDescriptor {
     const nativeReference = native?.credentialReferenceId ?? entry.nativeCredentialReferenceId;
     const credentials = [...new Set([
       ...Object.values(entry.credentialBindings),
@@ -1907,7 +2138,7 @@ export class ProviderCatalogManager {
       .map((reference) => this.#credentials.find(reference));
     const existing = credentials.filter((value): value is CredentialDescriptor => value !== undefined);
     const expires = existing.map((item) => item.expiresAt).filter((value): value is number => value !== undefined);
-    const override = this.#authentication.get(entry.provider.id);
+    const override = entry.backendId === this.#nativeBackendId ? this.#authentication.get(entry.provider.id) : undefined;
     let authenticationState: ProviderAuthenticationState;
     if (override !== undefined) authenticationState = override.state;
     else if (entry.provider.keyless) authenticationState = "not_required";
@@ -1944,6 +2175,8 @@ export class ProviderCatalogManager {
   #nativeDescriptor(entry: NativeProviderAuthEntry): ProviderDescriptor {
     if (entry.runtimeProvider === undefined) throw new Error("Pi native Provider metadata is unavailable.");
     return this.#descriptor({
+      backendId: this.#nativeBackendId,
+      credentialOrigin: "",
       provider: entry.runtimeProvider,
       displayName: entry.displayName,
       kind: entry.kind,
@@ -1981,14 +2214,15 @@ export class ProviderCatalogManager {
     }
     return {
       baseUrl: entry.provider.baseUrl!,
+      ...(entry.modelsEndpoint === undefined ? {} : { modelsEndpoint: entry.modelsEndpoint }),
       ...(entry.provider.api === undefined ? {} : { api: entry.provider.api }),
       ...(apiKey === undefined ? {} : { apiKey }),
       ...(Object.keys(headers).length === 0 ? {} : { headers })
     };
   }
 
-  #require(providerId: string): ManagedProviderEntry {
-    const entry = this.#entries.get(nonBlank(providerId, "Provider ID"));
+  #require(backendId: string, providerId: string): ManagedProviderEntry {
+    const entry = this.#entries.get(managedProviderKey(backendId, providerId));
     if (entry === undefined) throw new Error("Provider does not exist.");
     return entry;
   }
@@ -1999,6 +2233,20 @@ export class ProviderCatalogManager {
     return entry;
   }
 
+  #synchronizeConfigurationMetadata(): void {
+    const metadata = new Map<string, ManagedProviderEntry>();
+    for (const entry of this.#entries.values()) {
+      const current = metadata.get(entry.provider.id);
+      if (current === undefined || entry.version > current.version) metadata.set(entry.provider.id, entry);
+    }
+    for (const [key, entry] of this.#entries) {
+      const current = metadata.get(entry.provider.id)!;
+      if (entry === current) continue;
+      this.#entries.set(key, { ...entry, displayName: current.displayName, kind: current.kind,
+        enabled: current.enabled, version: current.version, updatedAt: current.updatedAt });
+    }
+  }
+
   #assertCatalogGeneration(expected: number): void {
     if (!Number.isSafeInteger(expected) || expected < 0) throw new RangeError("Provider auth generation is invalid.");
     if (expected !== this.#generation) throw new ProviderAuthGenerationConflictError(expected, this.#generation);
@@ -2006,15 +2254,19 @@ export class ProviderCatalogManager {
 
   async #bumpAndPersist(rollback?: () => void): Promise<void> {
     const previousGeneration = this.#generation;
+    const previousEntries = new Map(this.#entries);
     this.#generation += 1;
     try {
+      this.#synchronizeConfigurationMetadata();
       this.#store.setSetting("service", this.#scopeId, "provider_catalog", {
         format: 1,
         generation: this.#generation,
-        entries: [...this.#entries.values()].map(providerForStorage)
+        configurations: providerConfigurationsForStorage([...this.#entries.values()])
       } satisfies StoredProviderCatalog);
     } catch (error) {
       this.#generation = previousGeneration;
+      this.#entries.clear();
+      for (const [key, entry] of previousEntries) this.#entries.set(key, entry);
       rollback?.();
       throw error;
     }
@@ -2028,7 +2280,7 @@ export class ProviderCatalogManager {
         store.setSetting("service", this.#scopeId, "provider_catalog", {
           format: 1,
           generation: this.#generation,
-          entries: [...this.#entries.values()].map(providerForStorage)
+          configurations: providerConfigurationsForStorage([...this.#entries.values()])
         } satisfies StoredProviderCatalog);
         store.setSetting("service", this.#scopeId, "native_provider_auth_catalog", {
           format: 1,
@@ -2129,6 +2381,44 @@ function providerForStorage(entry: ManagedProviderEntry): StoredProviderEntry {
       .map(([environmentName, credentialReferenceId]) => ({ environmentName, credentialReferenceId })),
     version: sourceVersion.toString(10)
   };
+}
+
+function managedProviderKey(backendId: string, providerId: string): string {
+  return JSON.stringify([nonBlank(backendId, "Backend ID"), nonBlank(providerId, "Provider ID")]);
+}
+
+function providerConfigurationsForStorage(entries: readonly ManagedProviderEntry[]): readonly StoredProviderConfiguration[] {
+  const grouped = new Map<string, ManagedProviderEntry[]>();
+  for (const entry of entries) {
+    const group = grouped.get(entry.provider.id) ?? [];
+    group.push(entry);
+    grouped.set(entry.provider.id, group);
+  }
+  return [...grouped].sort(([a], [b]) => a.localeCompare(b, "en")).map(([providerId, runtimes]) => {
+    const metadata = [...runtimes].sort((a, b) => a.version > b.version ? -1 : a.version < b.version ? 1 : 0)[0]!;
+    return {
+      providerId, displayName: metadata.displayName, kind: metadata.kind, enabled: metadata.enabled,
+      version: metadata.version.toString(), updatedAt: metadata.updatedAt,
+      runtimes: runtimes.sort((a, b) => a.backendId.localeCompare(b.backendId, "en")).map((runtime) => {
+        const { displayName: _name, kind: _kind, enabled: _enabled, version: _version, updatedAt: _updatedAt, ...stored } = providerForStorage(runtime);
+        return stored;
+      })
+    };
+  });
+}
+
+function providerConfigurationFromStorage(configuration: StoredProviderConfiguration): readonly StoredProviderEntry[] {
+  if (!isRecord(configuration) || !Array.isArray(configuration.runtimes) || configuration.runtimes.length === 0
+    || Object.keys(configuration).some((key) => !["providerId", "displayName", "kind", "enabled", "version", "updatedAt", "runtimes"].includes(key))) {
+    throw new Error("Provider runtime configuration is malformed.");
+  }
+  const { runtimes, providerId, ...metadata } = configuration;
+  return runtimes.map((runtime) => {
+    if (!isRecord(runtime) || !isRecord(runtime.provider) || runtime.provider.id !== providerId) {
+      throw new Error("Provider runtime identity does not match its configuration.");
+    }
+    return { ...runtime, ...metadata } as unknown as StoredProviderEntry;
+  });
 }
 
 function providerFromStorage(entry: StoredProviderEntry): ManagedProviderEntry {
@@ -2268,6 +2558,9 @@ function assertLeasedNativeCredentialAccount(current: NativePiCredential, next: 
 }
 
 function validateProviderEntry(entry: ManagedProviderEntry): void {
+  nonBlank(entry.backendId, "Provider Backend ID");
+  if (typeof entry.enabled !== "boolean" || typeof entry.version !== "bigint" || entry.version < 1n
+    || !Number.isSafeInteger(entry.updatedAt) || entry.updatedAt < 0) throw new Error("Provider configuration metadata is malformed.");
   if (!isRecord(entry.provider)) throw new Error("Provider configuration must be an object.");
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(entry.provider.id)) throw new Error("Provider ID is invalid.");
   nonBlank(entry.displayName, "Provider display name");
@@ -2275,7 +2568,32 @@ function validateProviderEntry(entry: ManagedProviderEntry): void {
     throw new Error("Provider kind is invalid.");
   }
   if (entry.provider.baseUrl !== undefined) validateEndpoint(entry.provider.baseUrl);
+  if (typeof entry.credentialOrigin !== "string") throw new Error("Provider credential origin is required.");
+  const origin = entry.provider.baseUrl === undefined ? undefined : new URL(entry.provider.baseUrl).origin;
+  if (Object.keys(entry.credentialBindings).length > 0 && (origin === undefined || entry.credentialOrigin !== origin)) {
+    throw new Error("Provider credentials are not authorized for the configured origin.");
+  }
+  if (entry.provider.keyless === true && Object.keys(entry.credentialBindings).length > 0) {
+    throw new Error("A keyless runtime cannot retain credentials.");
+  }
+  if (entry.requestPath !== undefined && (!/^\/(?!\/)[^?#\s]*$/u.test(entry.requestPath)
+    || origin === undefined || new URL(entry.requestPath, origin).origin !== origin)) {
+    throw new Error("Provider request path must be relative to its configured origin.");
+  }
+  if (entry.modelsEndpoint !== undefined) {
+    validateEndpoint(entry.modelsEndpoint);
+    if (origin === undefined || new URL(entry.modelsEndpoint).origin !== origin) throw new Error("Provider model catalog must use the configured origin.");
+  }
   const allowed = providerEnvironmentNames(entry.provider);
+  if (new Set([...allowed].map((name) => name.toUpperCase())).size !== allowed.size) {
+    throw new Error("Provider environment names must not differ only by case.");
+  }
+  for (const name of Object.keys(entry.provider.headers ?? {})) {
+    if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/u.test(name)
+      || ["host", "connection", "content-length", "transfer-encoding", "upgrade", "trailer", "te", "proxy-authorization"].includes(name.toLowerCase())) {
+      throw new Error("Provider header cannot replace HTTP transport authority.");
+    }
+  }
   for (const [name, reference] of Object.entries(entry.credentialBindings)) {
     assertEnvironmentName(name);
     if (!allowed.has(name)) throw new Error("Provider credential binding targets an undeclared environment name.");

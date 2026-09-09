@@ -7,6 +7,8 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import type { ArtifactView, TimelineItemView } from "../model.js";
 import { ArtifactBlock, MessageAttachment } from "./Timeline.js";
 import { TimelineArtifactMedia, timelineArtifactMediaKind } from "./TimelineArtifactMedia.js";
+import { WorkspaceFileBody } from "./WorkspaceFileBody.js";
+import type { AppController } from "../controller.js";
 import type { Translator } from "./types.js";
 
 const roots: Root[] = [];
@@ -18,6 +20,7 @@ beforeAll(() => {
 beforeEach(() => {
   vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => undefined);
   vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => undefined);
+  vi.spyOn(HTMLMediaElement.prototype, "play").mockImplementation(async function (this: HTMLMediaElement) { this.dispatchEvent(new Event("play")); });
 });
 
 afterEach(async () => {
@@ -65,20 +68,21 @@ describe("Timeline artifact media", () => {
     const root = createRoot(container);
     roots.push(root);
     await act(async () => root.render(<>
-      <MessageAttachment artifact={artifact("message-audio", "audio/mpeg")} t={t} onArtifactUrl={loadUrl} onArtifactDownload={download} />
+      <MessageAttachment artifact={{ ...artifact("message-audio", "audio/mpeg"), description: "Actual recorded sound" }} t={t} onArtifactUrl={loadUrl} onArtifactDownload={download} />
       <ArtifactBlock item={artifactItem(artifact("standalone-video", "video/mp4"))} icon={<span />} locale="en" t={t} onArtifactUrl={loadUrl} onArtifactDownload={download} />
     </>));
 
     expect(container.querySelector(".message-attachment--media audio")).not.toBeNull();
+    expect(container.querySelector(".audio-preview__description")?.textContent).toBe("Actual recorded sound");
     const video = required(container.querySelector<HTMLVideoElement>(".artifact-block__media video"));
-    expect(video.controls).toBe(true);
+    expect(video.controls).toBe(false);
     expect(video.playsInline).toBe(true);
     const downloadButtons = [...container.querySelectorAll<HTMLButtonElement>('button[aria-label^="timeline.downloadArtifact"]')];
     expect(downloadButtons).toHaveLength(2);
     await act(async () => downloadButtons[0]?.click());
     await act(async () => downloadButtons[1]?.click());
-    expect(download).toHaveBeenNthCalledWith(1, "blob-message-audio", "clip.mp3");
-    expect(download).toHaveBeenNthCalledWith(2, "blob-standalone-video", "clip.mp4");
+    expect(download).toHaveBeenNthCalledWith(1, "blob-message-audio", "clip.mp3", { ownerDocument: document, signal: expect.any(AbortSignal) });
+    expect(download).toHaveBeenNthCalledWith(2, "blob-standalone-video", "clip.mp4", { ownerDocument: document, signal: expect.any(AbortSignal) });
   });
 
   it("stops playback when the task owner changes and again on unmount", async () => {
@@ -88,17 +92,88 @@ describe("Timeline artifact media", () => {
       loadUrl={async () => "blob:video"}
       t={t}
     />);
-    expect(rendered.container.querySelector("video")).not.toBeNull();
+    await act(async () => rendered.container.querySelector<HTMLButtonElement>("button")!.click());
+    const player = required(document.querySelector<HTMLVideoElement>('[role="dialog"] video'));
 
     await rendered.rerender("session-two");
-    expect(HTMLMediaElement.prototype.pause).toHaveBeenCalledTimes(1);
-    expect(HTMLMediaElement.prototype.load).toHaveBeenCalledTimes(1);
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(player.hasAttribute("src")).toBe(false);
     await act(async () => { await Promise.resolve(); });
     expect(rendered.container.querySelector("video")).not.toBeNull();
     await act(async () => rendered.root.unmount());
     roots.splice(roots.indexOf(rendered.root), 1);
-    expect(HTMLMediaElement.prototype.pause).toHaveBeenCalledTimes(2);
-    expect(HTMLMediaElement.prototype.load).toHaveBeenCalledTimes(2);
+    expect(HTMLMediaElement.prototype.pause).toHaveBeenCalled();
+    expect(HTMLMediaElement.prototype.load).toHaveBeenCalled();
+  });
+
+  it("ignores a retired audio acquisition and exposes the current URL failure", async () => {
+    const first = deferred<string>();
+    const rendered = await render((ownerKey) => <TimelineArtifactMedia
+      artifact={artifact("same-audio", "audio/mpeg")}
+      playbackOwnerKey={ownerKey}
+      loadUrl={() => ownerKey === "session-one" ? first.promise : Promise.reject(new Error("private URL failure"))}
+      t={t}
+    />);
+    await rendered.rerender("session-two");
+    expect(rendered.container.querySelector('[role="alert"]')?.textContent).toBe("timeline.mediaUnavailable");
+    await act(async () => first.resolve("blob:retired-audio"));
+    expect(rendered.container.querySelector("audio")).toBeNull();
+    expect(rendered.container.querySelector('[role="alert"]')?.textContent).toBe("timeline.mediaUnavailable");
+  });
+
+  it("switches playback between timeline audio, video and workspace preview, and retires unmounted players", async () => {
+    const controller = {
+      state: { preferences: { locale: "en" } },
+      getArtifactUrl: vi.fn(async (blobId: string) => `blob:${blobId}`),
+      releaseArtifactUrl: vi.fn(),
+      downloadArtifact: vi.fn()
+    } as unknown as AppController;
+    const rendered = await render((ownerKey) => <>
+      <TimelineArtifactMedia artifact={artifact("audio", "audio/mpeg")} playbackOwnerKey="session-one" loadUrl={async () => "blob:audio"} t={t} />
+      <TimelineArtifactMedia artifact={artifact("video", "video/mp4")} playbackOwnerKey="session-one" loadUrl={async () => "blob:video"} t={t} />
+      <WorkspaceFileBody controller={controller} sessionId={ownerKey} workspaceId="workspace-one" path="preview.mp4" preview={{ kind: "blob", path: "preview.mp4", name: "preview.mp4", mediaType: "video/mp4", blobId: "workspace-video", byteSize: 12, truncated: false }} canWrite={false} />
+      <WorkspaceFileBody controller={controller} sessionId={ownerKey} workspaceId="workspace-one" path="recording.wav" preview={{ kind: "blob", path: "recording.wav", name: "recording.wav", mediaType: "audio/wav", blobId: "workspace-audio", byteSize: 44, truncated: false }} canWrite={false} />
+    </>);
+    const audio = required(rendered.container.querySelector("audio"));
+    const pauseAudio = vi.fn();
+    Object.defineProperty(audio, "pause", { value: pauseAudio });
+    await act(async () => audio.dispatchEvent(new Event("play")));
+    await act(async () => rendered.container.querySelector<HTMLButtonElement>(".timeline-artifact-media--video button")!.click());
+    const video = required(document.querySelector<HTMLVideoElement>('[role="dialog"] video'));
+    const pauseVideo = vi.fn();
+    Object.defineProperty(video, "pause", { value: pauseVideo });
+    expect(pauseAudio).toHaveBeenCalledTimes(1);
+    expect(pauseVideo).not.toHaveBeenCalled();
+    await act(async () => audio.dispatchEvent(new Event("play")));
+    expect(pauseVideo).toHaveBeenCalledTimes(1);
+    await act(async () => document.querySelector<HTMLButtonElement>('[role="dialog"] button')!.click());
+    await act(async () => rendered.container.querySelector<HTMLButtonElement>(".workspace-file-body .video-preview__open")!.click());
+    const workspaceVideo = required(document.querySelector<HTMLVideoElement>('[role="dialog"] video'));
+    const pauseWorkspace = vi.fn();
+    Object.defineProperty(workspaceVideo, "pause", { value: pauseWorkspace });
+    expect(pauseAudio).toHaveBeenCalledTimes(2);
+    await act(async () => audio.dispatchEvent(new Event("play")));
+    expect(pauseWorkspace).toHaveBeenCalledTimes(1);
+    const workspaceAudio = required(rendered.container.querySelector<HTMLAudioElement>('[data-file-kind="audio"] audio'));
+    const pauseWorkspaceAudio = vi.fn();
+    Object.defineProperty(workspaceAudio, "pause", { value: pauseWorkspaceAudio });
+    await act(async () => workspaceAudio.dispatchEvent(new Event("play")));
+    expect(pauseAudio).toHaveBeenCalledTimes(3);
+    await act(async () => audio.dispatchEvent(new Event("play")));
+    expect(pauseWorkspaceAudio).toHaveBeenCalledTimes(1);
+    await rendered.rerender("session-two");
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(workspaceVideo.hasAttribute("src")).toBe(false);
+    expect(controller.releaseArtifactUrl).toHaveBeenCalledWith("workspace-video");
+    expect(controller.releaseArtifactUrl).toHaveBeenCalledWith("workspace-audio");
+    expect(workspaceAudio.hasAttribute("src")).toBe(false);
+    expect(controller.getArtifactUrl).toHaveBeenCalledTimes(4);
+    await act(async () => rendered.root.unmount());
+    roots.splice(roots.indexOf(rendered.root), 1);
+    expect(pauseAudio.mock.calls.length).toBeGreaterThan(1);
+    const retiredPauseCount = pauseAudio.mock.calls.length;
+    await act(async () => workspaceVideo.dispatchEvent(new Event("play")));
+    expect(pauseAudio).toHaveBeenCalledTimes(retiredPauseCount);
   });
 });
 

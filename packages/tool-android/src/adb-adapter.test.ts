@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 
 import { describe, expect, it, vi } from "vitest";
+import { ANDROID_TEXT_CORPUS } from "./i18n/input.test-fixture.js";
 
 import {
   AdbCliAdapter,
@@ -57,7 +58,7 @@ describe("ADB parsers and validators", () => {
     expect(escapeAdbInputText("hello world@example.test")).toBe("hello%sworld@example.test");
     expect(() => escapeAdbInputText("already%sspace")).toThrow(/unsupported/iu);
     expect(() => escapeAdbInputText("quote'and&shell")).toThrow(/unsupported/iu);
-    expect(() => escapeAdbInputText("秘密")).toThrow(/unsupported/iu);
+    expect(() => escapeAdbInputText(ANDROID_TEXT_CORPUS.unsupportedInput)).toThrow(/unsupported/iu);
   });
 
   it("redacts password nodes and bounds the UI tree", () => {

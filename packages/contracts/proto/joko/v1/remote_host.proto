@@ -5,6 +5,99 @@ package joko.v1;
 import "google/protobuf/timestamp.proto";
 import "joko/v1/capability.proto";
 import "joko/v1/common.proto";
+import "joko/v1/operation.proto";
+
+// Keys belong to the authenticated service node, never a client-selected path.
+service SshKeyService {
+  rpc ListSshKeys(ListSshKeysRequest) returns (ListSshKeysResponse);
+  rpc BeginSshKeyPassphraseUpload(BeginSshKeyPassphraseUploadRequest) returns (BeginSshKeyPassphraseUploadResponse);
+  rpc GenerateSshKey(GenerateSshKeyRequest) returns (GenerateSshKeyResponse);
+  rpc AddSshKeyToAgent(AddSshKeyToAgentRequest) returns (AddSshKeyToAgentResponse);
+  rpc ReadSshPublicKey(ReadSshPublicKeyRequest) returns (ReadSshPublicKeyResponse);
+  rpc GetSshKeyInstallCommand(GetSshKeyInstallCommandRequest) returns (GetSshKeyInstallCommandResponse);
+}
+
+enum SshAgentState {
+  SSH_AGENT_STATE_UNSPECIFIED = 0;
+  SSH_AGENT_STATE_READY = 1;
+  SSH_AGENT_STATE_UNAVAILABLE = 2;
+  SSH_AGENT_STATE_FAILED = 3;
+}
+
+enum SshKeyPassphrasePurpose {
+  SSH_KEY_PASSPHRASE_PURPOSE_UNSPECIFIED = 0;
+  SSH_KEY_PASSPHRASE_PURPOSE_GENERATE = 1;
+  SSH_KEY_PASSPHRASE_PURPOSE_AGENT_ADD = 2;
+}
+
+enum SshInstallShell {
+  SSH_INSTALL_SHELL_UNSPECIFIED = 0;
+  SSH_INSTALL_SHELL_POSIX = 1;
+  SSH_INSTALL_SHELL_POWERSHELL = 2;
+}
+
+message SshKey {
+  string id = 1;
+  string name = 2;
+  string algorithm = 3;
+  string comment = 4;
+  string sha256_fingerprint = 5;
+  google.protobuf.Timestamp modified_at = 6;
+  bool in_agent = 7;
+}
+message ListSshKeysRequest {}
+message ListSshKeysResponse {
+  repeated SshKey keys = 1;
+  SshAgentState agent_state = 2;
+  bool generation_supported = 3;
+}
+message BeginSshKeyPassphraseUploadRequest {
+  SshKeyPassphrasePurpose purpose = 1;
+  string key_id = 2;
+  string expected_fingerprint = 3;
+}
+message BeginSshKeyPassphraseUploadResponse { CredentialUploadTicket ticket = 1; }
+message GenerateSshKeyRequest {
+  string name = 1;
+  string comment = 2;
+  optional string passphrase_upload_ticket_id = 3;
+}
+message GenerateSshKeyResponse { SshKey key = 1; }
+message AddSshKeyToAgentRequest {
+  string key_id = 1;
+  string expected_fingerprint = 2;
+  optional string passphrase_upload_ticket_id = 3;
+}
+message AddSshKeyToAgentResponse {}
+message ReadSshPublicKeyRequest {
+  string key_id = 1;
+  string expected_fingerprint = 2;
+}
+message ReadSshPublicKeyResponse { string public_key = 1; }
+message GetSshKeyInstallCommandRequest {
+  string key_id = 1;
+  string expected_fingerprint = 2;
+  oneof destination {
+    SshKeySavedHost saved_host = 3;
+    SshKeyDraftHost draft_host = 4;
+  }
+  SshInstallShell shell = 5;
+}
+message SshKeySavedHost {
+  string target_id = 1;
+  string host_id = 2;
+  Revision expected_revision = 3;
+}
+message SshKeyDraftHost {
+  string hostname = 1;
+  string user = 2;
+  uint32 port = 3;
+}
+message SshKeyReference {
+  string id = 1;
+  string expected_fingerprint = 2;
+}
+message GetSshKeyInstallCommandResponse { string command = 1; }
 
 // Authenticated, owner-bound Remote Host catalog and connection control.
 // The owner identity is derived from the service context and is intentionally
@@ -59,6 +152,8 @@ enum RemoteHostAuthenticationMode {
   REMOTE_HOST_AUTHENTICATION_MODE_SYSTEM_AGENT = 1;
   // Resolves credential_reference_id only inside the authenticated Orchestrator runtime.
   REMOTE_HOST_AUTHENTICATION_MODE_PRIVATE_KEY = 2;
+  // Only this fingerprint-checked node key may authenticate through the agent.
+  REMOTE_HOST_AUTHENTICATION_MODE_NODE_KEY = 3;
 }
 
 enum RemoteHostStatus {
@@ -88,6 +183,8 @@ enum RemoteHostFailureCode {
   REMOTE_HOST_FAILURE_CODE_HOST_KEY_STORE_MISSING = 12;
   REMOTE_HOST_FAILURE_CODE_HOST_KEY_STORE_UNREADABLE = 13;
   REMOTE_HOST_FAILURE_CODE_HOST_KEY_STORE_WRITE_FAILED = 14;
+  REMOTE_HOST_FAILURE_CODE_NODE_KEY_CHANGED = 15;
+  REMOTE_HOST_FAILURE_CODE_NODE_KEY_UNAVAILABLE = 16;
 }
 
 message RemoteHostFailure {
@@ -124,6 +221,7 @@ message RemoteHost {
   google.protobuf.Timestamp updated_at = 11;
   Revision revision = 12;
   RemoteHostAuthenticationMode authentication_mode = 13;
+  SshKeyReference node_key = 14;
 }
 
 message GetRemoteHostCapabilitiesRequest {
@@ -207,6 +305,7 @@ message CreateRemoteHostRequest {
   string user = 6;
   optional string credential_reference_id = 7;
   RemoteHostAuthenticationMode authentication_mode = 8;
+  SshKeyReference node_key = 9;
 }
 
 message CreateRemoteHostResponse {
@@ -224,6 +323,7 @@ message UpdateRemoteHostRequest {
   optional string credential_reference_id = 6;
   Revision expected_revision = 7;
   RemoteHostAuthenticationMode authentication_mode = 8;
+  SshKeyReference node_key = 9;
 }
 
 message UpdateRemoteHostResponse {

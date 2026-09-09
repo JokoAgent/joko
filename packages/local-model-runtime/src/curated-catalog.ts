@@ -1,4 +1,5 @@
 import type { CuratedLocalModel } from "./types.js";
+import { MODEL_SEARCH_TERMS } from "./i18n/model-search-terms.js";
 
 const GIB = 1024 ** 3;
 
@@ -19,7 +20,7 @@ const CATALOG: readonly CatalogEntry[] = [
     displayName: "Qwen3.8 27B",
     genericName: "qwen3.8:27b",
     appleName: "qwen3.8:27b-mlx",
-    aliases: ["qwen", "qwen3.8", "qwen3", "tongyi", "qwq", "通义", "通義", "千问", "千問"],
+    aliases: MODEL_SEARCH_TERMS.qwen,
     sizeBytes: 18 * GIB,
     minimumMemoryGb: 32
   },

@@ -27,6 +27,14 @@ describe("HistoryMaintenance", () => {
     createTask(fixture.store, "deleted-old", "deleted", OLD, visible("deleted private history"));
     createTask(fixture.store, "archived-recent", "archived", RECENT, visible("recent retained history"));
     addTerminalTurn(fixture.store, "active-old");
+    const retainedDerivation = reserveDerivedBinding(fixture.store, "active-old", "retained-derivation", {
+      opaqueRef: "native/unadopted.jsonl", nativeSessionId: "unadopted", generation: 1
+    });
+    fixture.store.appendEvent({
+      backendId: "runtime", targetId: "target-1", sessionId: "active-old",
+      operationId: retainedDerivation.operationId, generation: 0, emittedAt: OLD,
+      traceId: "derived-receipt-history", payload: { type: "session_changed" }
+    });
     fixture.store.putObjective({ sessionId: "active-old", text: "private objective", updatedAt: OLD });
     fixture.store.putArtifact({
       id: "artifact-retained",
@@ -97,6 +105,12 @@ describe("HistoryMaintenance", () => {
     expect(fixture.store.getArtifact("artifact-retained").runId).toBeUndefined();
     expect(fixture.store.findObjective("active-old")).toBeUndefined();
     expect(fixture.store.findOperation("operation-active-old")).toBeUndefined();
+    expect(fixture.store.getOperation(retainedDerivation.operationId).status).toBe("failed");
+    expect(fixture.store.findNativeSessionDerivation(retainedDerivation.operationId)?.state).toBe("recorded");
+    for (const [index, binding] of [replacement.source, replacement.replacement].entries()) {
+      expect(() => reserveDerivedBinding(fixture.store, "archived-recent", `reject-adopted-${index}`, binding))
+        .toThrow("An adopted native binding cannot belong to derivation cleanup.");
+    }
     expect(fixture.store.listQueueItems({ sessionId: "active-old" })).toEqual([]);
     expect(fixture.store.listRuns({ sessionId: "active-old", includeCleared: true })).toEqual([]);
     for (const sessionId of ["active-old", "archived-old", "deleted-old"]) {
@@ -152,6 +166,30 @@ describe("HistoryMaintenance", () => {
       scope: { sessionId: "archived-old" },
       query: "keep after change"
     }).matches).toHaveLength(1);
+  });
+
+  it("does not replace active history with a binding reserved for native derivation cleanup", async () => {
+    const fixture = createFixture();
+    createTask(fixture.store, "active-old", "active", OLD, visible("retain this source history"));
+    const source = fixture.store.getSession("active-old").descriptor.binding;
+    const receipt = reserveDerivedBinding(fixture.store, "active-old", "reserved-replacement", {
+      opaqueRef: "native/reserved.jsonl", nativeSessionId: "reserved", generation: 1
+    });
+    const maintenance = new HistoryMaintenance({
+      store: fixture.store,
+      activeSessions: {
+        prepare: async () => [{ sessionId: "active-old", source, replacement: receipt.binding }],
+        release: () => undefined
+      },
+      now: () => NOW,
+      workDatabase: async (input) => cleanHistoryMaintenanceCopy(input)
+    });
+    const scan = maintenance.scan({ retention: "7-days", includeActiveTasks: true });
+    await expect(maintenance.cleanup(scan.scanId, false)).rejects.toThrow("belongs to an unresolved derivation");
+    expect(fixture.store.getSession("active-old").descriptor.binding).toEqual(source);
+    expect(fixture.store.searchSessionMessages({ scope: { sessionId: "active-old" }, query: "retain this source history" }).matches)
+      .toHaveLength(1);
+    expect(fixture.store.findNativeSessionDerivation(receipt.operationId)?.state).toBe("recorded");
   });
 
   it("does not report a committed cleanup as failed when external cache reconciliation fails", async () => {
@@ -338,4 +376,21 @@ function addTerminalTurn(store: OperationalStore, sessionId: string): void {
   for (const state of ["backend_accepted", "completed"] as const) {
     store.updateQueueState({ queueItemId, state, attemptId, traceId: `test:${queueItemId}:${state}`, at: OLD + 1 });
   }
+}
+
+function reserveDerivedBinding(
+  store: OperationalStore, sourceSessionId: string, operationId: string, binding: SessionDescriptor["binding"]
+) {
+  const connection = store.createConnection({ id: `connection-${operationId}`, name: "Owner", authKeyDigest: operationId });
+  const claim = store.claimAuthorizedDeferredEffectOperation(connection.id, connection.authKeyDigest, {
+    id: operationId, kind: "clone_session", body: { sourceSessionId }
+  });
+  const source = store.getSession(sourceSessionId).descriptor;
+  const receipt = store.recordNativeSessionDerivation({
+    operationId, expectedBodyHash: claim.operation.bodyHash, sourceSessionId, sourceBinding: source.binding,
+    sessionId: `derived-${operationId}`, backendId: source.backendId, backendInstanceGeneration: 0,
+    targetId: source.targetId, effectiveWorkspaceRoot: "D:/workspace", binding
+  });
+  store.failEffectOperation(operationId, claim.operation.bodyHash, new Error("Derived product was not adopted."));
+  return receipt;
 }

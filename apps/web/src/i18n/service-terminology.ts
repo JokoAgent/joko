@@ -1,6 +1,6 @@
 const INTERNAL_SERVICE_TERM = /\bOrchestrator\b/giu;
 
-/** Converts the architecture-facing service name into the public Joko vocabulary. */
+/** Localizes architecture-facing service names for public UI messages. */
 export function presentJokoServiceTerminology(value: string): string {
   const publicServiceTerm = /\p{Script=Han}/u.test(value) ? "Joko 服务" : "Joko service";
   return value

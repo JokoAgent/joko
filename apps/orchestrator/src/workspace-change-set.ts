@@ -3,6 +3,7 @@ import { constants, type Dirent, type Stats } from "node:fs";
 import { lstat, mkdir, open, readdir, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import { isWithin } from "@joko/core/policy";
+import { isNativeNavigationTarget, type NativeNavigationAnchor } from "@joko/core";
 
 export interface SnapshotFile {
   readonly path: string;
@@ -21,7 +22,7 @@ export interface WorkspaceBaseline {
   readonly gaps: readonly string[];
   readonly capturedAt: number;
   /** Native conversation leaf active immediately before the captured Run. */
-  readonly dialogueEntryId?: string;
+  readonly dialogueAnchor?: NativeNavigationAnchor;
 }
 
 export interface WorkspaceChange {
@@ -42,8 +43,8 @@ export interface WorkspaceChangeSetRecord {
   readonly complete: boolean;
   readonly gaps: readonly string[];
   readonly capturedAt: number;
-  /** Native conversation leaf to restore without touching workspace files. */
-  readonly dialogueEntryId?: string;
+  /** Observed native navigation target and binding generation, independent of file restoration. */
+  readonly dialogueAnchor?: NativeNavigationAnchor;
 }
 
 export interface RewindPreviewRecord {
@@ -173,7 +174,9 @@ export class WorkspaceChangeSetService {
     await this.reconcileIncompleteJournals();
   }
 
-  async captureBaseline(workspaceId: string, workspaceRoot: string, dialogueEntryId?: string): Promise<WorkspaceBaseline> {
+  async captureBaseline(workspaceId: string, workspaceRoot: string, dialogueAnchor?: NativeNavigationAnchor): Promise<WorkspaceBaseline> {
+    if (dialogueAnchor !== undefined && (!isNativeNavigationTarget(dialogueAnchor.target)
+      || !Number.isSafeInteger(dialogueAnchor.generation) || dialogueAnchor.generation < 1)) throw new Error("Invalid dialogue navigation anchor.");
     return this.withLock(workspaceId, async () => {
       const root = await validateRoot(workspaceRoot);
       const snapshot = await this.scan(root);
@@ -185,7 +188,7 @@ export class WorkspaceChangeSetService {
         complete: snapshot.gaps.length === 0,
         gaps: snapshot.gaps,
         capturedAt: this.#now(),
-        ...(dialogueEntryId === undefined ? {} : { dialogueEntryId })
+        ...(dialogueAnchor === undefined ? {} : { dialogueAnchor })
       };
       await this.#options.repository.putBaseline(baseline);
       return baseline;
@@ -219,7 +222,7 @@ export class WorkspaceChangeSetService {
         complete: baseline.complete && gaps.length === 0,
         gaps,
         capturedAt: this.#now(),
-        ...(baseline.dialogueEntryId === undefined ? {} : { dialogueEntryId: baseline.dialogueEntryId })
+        ...(baseline.dialogueAnchor === undefined ? {} : { dialogueAnchor: baseline.dialogueAnchor })
       };
       await this.#options.repository.putChangeSet(changeSet);
       return changeSet;
@@ -369,7 +372,7 @@ export class WorkspaceChangeSetService {
     const preview = await this.#options.repository.getRewindPreview(previewId);
     if (preview === undefined || preview.expiresAt <= this.#now()) throw new Error("Workspace rewind preview is missing or expired.");
     const changeSet = await this.#options.repository.getChangeSet(preview.changeSetId);
-    if (changeSet?.dialogueEntryId === undefined) throw new Error("Dialogue-only rewind is unavailable for this change set.");
+    if (changeSet?.dialogueAnchor === undefined) throw new Error("Dialogue-only rewind is unavailable for this change set.");
     return this.withLock(changeSet.workspaceId, async () => {
       if (await this.loadJournal(previewId)) throw new Error("Workspace rewind already has a file apply journal.");
       if (!(await this.#options.repository.consumeRewindPreview(previewId, this.#now()))) {

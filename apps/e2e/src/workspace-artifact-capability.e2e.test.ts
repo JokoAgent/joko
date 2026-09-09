@@ -5,14 +5,16 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 
 import { create } from "@bufbuild/protobuf";
-import { ConnectError } from "@connectrpc/connect";
+import { Code, ConnectError } from "@connectrpc/connect";
 import {
   CapabilitySupport,
   GitDiffSource,
   OperationMutationSchema,
+  OpenBrowserPageMutationSchema,
   OperationState,
   QueueDeliveryMode,
   RestartBrowserMutationSchema,
+  RevokeDeviceMutationSchema,
   WorkspaceFileChangeKind
 } from "@joko/contracts";
 import {
@@ -21,11 +23,13 @@ import {
   PI_LIKE_PROFILE,
   type FakeAdapterProfile
 } from "@joko/testkit";
-import { afterEach, describe, expect, it } from "vitest";
+import { OperationalBrowserState, type OrchestratorApplication } from "@joko/orchestrator";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { OrchestratorE2eFixture, sha256, waitFor } from "./fixture.js";
 import {
   createSessionMutation,
+  archiveMutation,
   sendInputMutation,
   sessionIdFrom,
   submit
@@ -96,6 +100,90 @@ describe("workspace, artifact, and capability boundaries", () => {
       source: GitDiffSource.UNSTAGED
     });
     expect(diff.diff?.files.some((file) => file.relativePath === "README.md" && file.hunks.length > 0)).toBe(true);
+  });
+
+  it("transfers authenticated workspace HTML through durable Browser admission without retaining bytes or completing a retired owner's read", async () => {
+    const controlled = controlledHtmlBrowser();
+    fixture = await OrchestratorE2eFixture.start({ createAuxiliaryServices: async (store) => ({
+      browser: controlled.provider, browserState: new OperationalBrowserState(store)
+    }) });
+    const owner = await fixture.pair("HTML owner");
+    const manager = await fixture.pair("HTML manager");
+    const createTask = async (name: string) => sessionIdFrom(await submit(manager.clients.operation, manager.connectionId,
+      createSessionMutation({ backendId: PI_LIKE_PROFILE.id, targetId: fixture!.targetId(), displayName: name })));
+    const sessionId = await createTask("HTML task");
+    const otherSessionId = await createTask("Other task");
+    const file = { workspaceId: "workspace-main", relativePath: "index.html", expectedRevision: "" };
+    const read = { sessionId, file };
+    const initialHtml = "<!doctype html><title>Preview</title><button onclick=\"this.textContent='clicked'\">Private initial content</button>";
+    const currentHtml = initialHtml.replace("initial", "current");
+    await writeFile(join(fixture.workspaceDirectory, file.relativePath), initialHtml);
+    await expect(fixture.anonymous.workspace.readWorkspaceHtmlSnapshot(read)).rejects.toMatchObject({ code: Code.Unauthenticated });
+    const initial = await owner.clients.workspace.readWorkspaceHtmlSnapshot(read);
+    expect(initial.utf8Html).toBe(initialHtml);
+    const mutationFor = (reference: NonNullable<typeof initial.file>, requestedSession = sessionId) => {
+      const takeover = controlled.provider.currentHumanTakeover();
+      return create(OperationMutationSchema, { payload: { case: "openBrowserPage", value: create(OpenBrowserPageMutationSchema, {
+        browserProviderId: "browser", sessionId: requestedSession, expectedGeneration: BigInt(controlled.provider.generation),
+        currentPageId: takeover?.pageId ?? "", takeoverId: takeover?.takeoverId ?? "", workspaceHtml: reference
+      }) } });
+    };
+    await writeFile(join(fixture.workspaceDirectory, file.relativePath), currentHtml);
+    const staleId = randomUUID();
+    const stale = await submit(owner.clients.operation, owner.connectionId, mutationFor(initial.file!), staleId);
+    expect(stale.state).toBe(OperationState.FAILED);
+    expect(controlled.accepted).toEqual([]);
+    expect(fixture.application.store.getOperation(staleId).status).toBe("failed");
+
+    const current = await owner.clients.workspace.readWorkspaceHtmlSnapshot(read);
+    expect(current.file?.expectedRevision).not.toBe(initial.file?.expectedRevision);
+    const mutation = mutationFor(current.file!);
+    const operationId = randomUUID();
+    const opened = await submit(owner.clients.operation, owner.connectionId, mutation, operationId);
+    expect(opened.state).toBe(OperationState.SUCCEEDED);
+    expect(opened.result?.payload).toMatchObject({ case: "browserTakeover", value: { pageId: "page-1-1", connectionId: owner.connectionId } });
+    expect(controlled.accepted).toEqual([{ owner: owner.connectionId, html: currentHtml }]);
+    const durable = fixture.application.store.getOperation(operationId);
+    expect(durable.status).toBe("completed");
+    expect(durable.body).toMatchObject({ payload: { case: "openBrowserPage", value: { workspaceHtml: current.file, url: "" } } });
+    expect(JSON.stringify(durable.body)).not.toContain("Private");
+    const pages = (await manager.clients.browser.listBrowserProviders({})).providers[0]?.pages;
+    expect(pages).toEqual([expect.objectContaining({ pageId: "page-1-1", sessionId, url: expect.stringMatching(/^https:\/\/[a-z0-9-]+\.preview\.joko\.invalid\/index\.html$/u) })]);
+    await submit(owner.clients.operation, owner.connectionId, mutation, operationId);
+    expect(controlled.accepted).toHaveLength(1);
+    await expect(submit(owner.clients.operation, owner.connectionId, mutationFor(current.file!, otherSessionId))).rejects.toMatchObject({ code: Code.FailedPrecondition });
+    await submit(manager.clients.operation, manager.connectionId, archiveMutation(otherSessionId, true));
+    await expect(manager.clients.workspace.readWorkspaceHtmlSnapshot({ ...read, sessionId: otherSessionId })).rejects.toMatchObject({ code: Code.Aborted });
+
+    let readStarted = false;
+    let releaseRead!: () => void;
+    const released = new Promise<void>((resolve) => { releaseRead = resolve; });
+    const originalPreview = fixture.application.workspaces.preview.bind(fixture.application.workspaces);
+    const heldRead = vi.spyOn(fixture.application.workspaces, "preview").mockImplementationOnce(async (...args) => {
+      const snapshot = await originalPreview(...args);
+      readStarted = true;
+      await released;
+      return snapshot;
+    });
+    const lateId = randomUUID();
+    const late = submit(owner.clients.operation, owner.connectionId, mutationFor(current.file!), lateId).then(
+      (operation) => operation.state, (error: unknown) => error
+    );
+    try {
+      await waitFor(async () => readStarted, (value) => value, "HTML snapshot read");
+      expect(fixture.application.store.getOperation(lateId).status).toBe("started");
+      await submit(manager.clients.operation, manager.connectionId, create(OperationMutationSchema, {
+        payload: { case: "revokeDevice", value: create(RevokeDeviceMutationSchema, { deviceId: owner.deviceId, reason: "Retire HTML owner" }) }
+      }));
+    } finally { releaseRead(); }
+    const lateResult = await late;
+    heldRead.mockRestore();
+    expect(lateResult).toBe(OperationState.FAILED);
+    expect(fixture.application.store.getOperation(lateId).status).toBe("failed");
+    expect(controlled.accepted).toHaveLength(1);
+    expect(controlled.accepted.some((value) => value.owner === manager.connectionId)).toBe(false);
+    expect(JSON.stringify(fixture.application.store.getOperation(lateId).body)).not.toContain("Private");
+    await expect(owner.clients.workspace.readWorkspaceHtmlSnapshot(read)).rejects.toMatchObject({ code: Code.Unauthenticated });
   });
 
   it("enforces blob hash/size and one-time authenticated upload/download tickets", async () => {
@@ -226,7 +314,7 @@ describe("workspace, artifact, and capability boundaries", () => {
     const steer = await submit(
       paired.clients.operation,
       paired.connectionId,
-      sendInputMutation(threadSession, "must not be simulated", QueueDeliveryMode.STEER)
+      sendInputMutation(threadSession, BigInt(fixture!.application.store.getSession(threadSession).descriptor.binding.generation), "must not be simulated", QueueDeliveryMode.STEER)
     );
     expect(steer.state).toBe(OperationState.FAILED);
     expect(steer.error?.code).toBe("INPUT_CAPABILITY_UNAVAILABLE");
@@ -266,6 +354,42 @@ async function nextWithin<T>(iterator: AsyncIterator<T>, label: string, timeoutM
   } finally {
     if (timer !== undefined) clearTimeout(timer);
   }
+}
+
+/** HTTP composition uses a controlled Provider boundary; Chromium isolation belongs to tool-browser's tests. */
+function controlledHtmlBrowser() {
+  type Provider = NonNullable<OrchestratorApplication["browser"]>;
+  type Takeover = Awaited<ReturnType<Provider["openHumanPage"]>>;
+  const accepted: Array<{ readonly owner: string; readonly html: string }> = [];
+  const pages: Array<Awaited<ReturnType<Provider["listPages"]>>[number]> = [];
+  let generation = 0;
+  let running = false;
+  let takeover: Takeover | undefined;
+  const assertHumanTakeover = (expected: Takeover): Takeover => {
+    if (takeover === undefined || expected.takeoverId !== takeover.takeoverId || expected.owner !== takeover.owner || expected.generation !== generation) throw new Error("Browser owner fence changed.");
+    return takeover;
+  };
+  const provider = {
+    id: "browser", targetMode: "sidebar",
+    get generation() { return generation; }, get running() { return running; },
+    start: async () => { if (!running) { generation += 1; running = true; } },
+    stop: async () => { running = false; pages.length = 0; takeover = undefined; },
+    currentHumanTakeover: () => takeover,
+    currentAgentLease: () => undefined,
+    assertHumanTakeover,
+    endHumanTakeover: async (expected: Takeover) => { assertHumanTakeover(expected); takeover = undefined; },
+    listPages: async () => [...pages],
+    openHumanPage: async (...[request, ttlMs = 60_000, snapshot]: Parameters<Provider["openHumanPage"]>): Promise<Takeover> => {
+      if (!running || request.generation !== generation || request.providerId !== "browser" || snapshot === undefined) throw new Error("HTML Browser admission is invalid.");
+      snapshot.assertCurrent();
+      accepted.push({ owner: request.owner, html: snapshot.html });
+      const pageId = `page-${generation}-${accepted.length}`;
+      pages.push({ id: pageId, url: request.url, title: "HTML preview", state: "ready" });
+      takeover = { providerId: "browser", pageId, owner: request.owner, generation, takeoverId: `takeover-${accepted.length}`, startedAt: Date.now(), expiresAt: Date.now() + ttlMs };
+      return takeover;
+    }
+  } as unknown as Provider;
+  return { provider, accepted };
 }
 
 async function nextWorkspacePath<T extends {

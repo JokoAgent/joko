@@ -24,7 +24,7 @@ const WORKSPACE_ROOT = resolve("D:\\workspace");
 const TOOL_SCHEMA = { type: "object", properties: {}, additionalProperties: false } as const;
 
 describe("ComputerToolBridgeProvider", () => {
-  it("lists the complete frozen 24-tool catalog behind the two public wrappers", async () => {
+  it("lists the current provider catalog and observation workflow behind the two public wrappers", async () => {
     const provider = new FakeComputerProvider(COMPUTER_PUBLIC_TOOLS);
     const bridge = createBridge(provider);
     await bridge.prepare();
@@ -40,7 +40,6 @@ describe("ComputerToolBridgeProvider", () => {
     ));
     const tools = payload["tools"] as readonly Record<string, unknown>[];
     expect(tools.map((tool) => tool["name"])).toEqual(COMPUTER_TOOL_NAMES);
-    expect(tools).toHaveLength(24);
     expect(tools.filter((tool) => tool["readOnly"] === true).map((tool) => tool["name"])).toEqual([
       "status",
       "check_permissions",
@@ -48,19 +47,22 @@ describe("ComputerToolBridgeProvider", () => {
       "list_apps",
       "list_windows",
       "get_window_state",
+      "verify_state",
       "zoom",
       "get_screen_size",
       "get_cursor_position",
       "get_agent_cursor_state"
     ]);
     expect(tools.find((tool) => tool["name"] === "get_window_state")).toMatchObject({
-      description: expect.stringContaining("normally omit screenshot_out_file"),
       inputSchema: expect.objectContaining({
         $schema: "https://json-schema.org/draft/2020-12/schema",
         required: ["pid", "window_id"],
+        properties: expect.objectContaining({ include_screenshot: { type: "boolean" } }),
         additionalProperties: false
       })
     });
+    expect(payload["workflow"]).toContain('{"include_screenshot":true}');
+    expect(payload["workflow"]).toContain("Verification invalidates previous element references");
   });
 
   it("discovers the runtime catalog once and exposes the two-tool discovery workflow", async () => {

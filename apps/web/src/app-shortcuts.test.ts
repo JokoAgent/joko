@@ -28,14 +28,17 @@ const ctrlF: AppShortcutCombo = { code: "KeyF", meta: false, ctrl: true, alt: fa
 const ctrlG: AppShortcutCombo = { code: "KeyG", meta: false, ctrl: true, alt: false, shift: false };
 
 describe("application shortcut registry", () => {
-  it("registers every executable action and only excludes the documented server-local terminal action", () => {
-    expect(APP_SHORTCUT_IDS).toHaveLength(26);
+  it("registers every executable action including the interactive terminal", () => {
+    expect(APP_SHORTCUT_IDS).toHaveLength(27);
     expect(APP_SHORTCUT_DEFINITION_LIST.map((definition) => definition.id)).toEqual(APP_SHORTCUT_IDS);
-    expect(APP_SHORTCUT_DEFINITION_LIST.map((definition) => definition.id)).not.toContain("open-terminal");
+    expect(APP_SHORTCUT_DEFINITION_LIST.map((definition) => definition.id)).toContain("open-terminal");
     expect(SWITCH_SESSION_SHORTCUT_IDS).toHaveLength(9);
   });
 
   it("keeps platform defaults and exact physical-key matching", () => {
+    expect(effectiveAppShortcutCombos("open-terminal", {}, "darwin")).toEqual([
+      { code: "Backquote", meta: false, ctrl: true, alt: false, shift: false }
+    ]);
     expect(effectiveAppShortcutCombos("new-maker", {}, "win32")).toEqual([
       { code: "KeyN", meta: false, ctrl: true, alt: false, shift: false }
     ]);
@@ -138,6 +141,7 @@ describe("application shortcut registry", () => {
       "cycle-permission-mode",
       "right-tab-prev",
       "right-tab-next",
+      "open-terminal",
       "find-in-page",
       "search-in-project",
       "zoom-in",
@@ -154,6 +158,7 @@ describe("application shortcut registry", () => {
       "cycle-permission-mode",
       "right-tab-prev",
       "right-tab-next",
+      "open-terminal",
       "find-in-page",
       "search-in-project",
       "browser-focus-url",

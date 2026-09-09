@@ -41,6 +41,41 @@ export interface InlineWordSegment {
   readonly changed: boolean;
 }
 
+/** Index replacement pairs without deriving word spans for offscreen lines. */
+export function createReviewInlineDiff(hunk: WorkspaceDiffHunkView): {
+  readonly get: (lineIndex: number) => readonly InlineWordSegment[] | undefined;
+} {
+  const pairs = new Map<number, { readonly before: number; readonly after: number }>();
+  let index = 0;
+  while (index < hunk.lines.length) {
+    if (hunk.lines[index]!.kind !== "removed") { index += 1; continue; }
+    const beforeStart = index;
+    while (index < hunk.lines.length && hunk.lines[index]!.kind === "removed") index += 1;
+    const afterStart = index;
+    while (index < hunk.lines.length && hunk.lines[index]!.kind === "added") index += 1;
+    const count = Math.min(afterStart - beforeStart, index - afterStart);
+    for (let offset = 0; offset < count; offset += 1) {
+      const pair = { before: beforeStart + offset, after: afterStart + offset };
+      pairs.set(pair.before, pair);
+      pairs.set(pair.after, pair);
+    }
+  }
+  const cache = new Map<number, ReturnType<typeof inlineWordDiff>>();
+  return {
+    get(lineIndex) {
+      const pair = pairs.get(lineIndex);
+      if (pair === undefined) return undefined;
+      let spans = cache.get(pair.before);
+      if (spans === undefined) {
+        spans = inlineWordDiff(hunk.lines[pair.before]!.text, hunk.lines[pair.after]!.text);
+        if (cache.size >= 256) cache.delete(cache.keys().next().value!);
+        cache.set(pair.before, spans);
+      }
+      return lineIndex === pair.before ? spans.before : spans.after;
+    }
+  };
+}
+
 export function reviewFileKey(file: Pick<WorkspaceFileDiffView, "source" | "oldPath" | "path" | "evidenceId">): string {
   return file.evidenceId === undefined
     ? `${file.source}:${file.oldPath ?? ""}:${file.path}`
@@ -185,6 +220,16 @@ export function inlineWordDiff(before: string, after: string): {
   readonly before: readonly InlineWordSegment[];
   readonly after: readonly InlineWordSegment[];
 } {
+  if (before === after) {
+    const unchanged = before === "" ? [] : [{ text: before, changed: false }];
+    return { before: unchanged, after: unchanged };
+  }
+  if (before.length > 16_384 || after.length > 16_384) {
+    return {
+      before: before === "" ? [] : [{ text: before, changed: true }],
+      after: after === "" ? [] : [{ text: after, changed: true }]
+    };
+  }
   const left = tokenize(before);
   const right = tokenize(after);
   if (left.length === 0 && right.length === 0) return { before: [], after: [] };

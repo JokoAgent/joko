@@ -208,7 +208,7 @@ export function createRemoteHostConnectService(
       const credentialReferenceId = request.credentialReferenceId === undefined
         ? undefined
         : publicCredentialReference(request.credentialReferenceId);
-      assertPublicAuthentication(authenticationMode, credentialReferenceId);
+      assertPublicAuthentication(authenticationMode, credentialReferenceId, request.nodeKey);
       const host = requireRegistry(registry).create({
         targetId: publicIdentity(request.targetId, "target_id"),
         id: publicHostAlias(request.hostId),
@@ -217,6 +217,7 @@ export function createRemoteHostConnectService(
         user: publicUser(request.user),
         source: "manual",
         authenticationMode,
+        ...(request.nodeKey === undefined ? {} : { nodeKey: { id: request.nodeKey.id, expectedFingerprint: request.nodeKey.expectedFingerprint } }),
         ...(credentialReferenceId === undefined
           ? {}
           : { credentialReferenceId }),
@@ -231,7 +232,7 @@ export function createRemoteHostConnectService(
       const credentialReferenceId = request.credentialReferenceId === undefined
         ? undefined
         : publicCredentialReference(request.credentialReferenceId);
-      assertPublicAuthentication(authenticationMode, credentialReferenceId);
+      assertPublicAuthentication(authenticationMode, credentialReferenceId, request.nodeKey);
       const host = requireRegistry(registry).update({
         targetId: publicIdentity(request.targetId, "target_id"),
         id: publicHostAlias(request.hostId),
@@ -240,6 +241,7 @@ export function createRemoteHostConnectService(
         user: publicUser(request.user),
         authenticationMode,
         credentialReferenceId: credentialReferenceId ?? null,
+        nodeKey: request.nodeKey === undefined ? null : { id: request.nodeKey.id, expectedFingerprint: request.nodeKey.expectedFingerprint },
         expectedRevision: fromProtoRevision(request.expectedRevision, "expected_revision"),
         updatedAt: now()
       });
@@ -336,7 +338,8 @@ function toProtoRemoteHost(value: RemoteHostRecord): contract.RemoteHost {
       : contract.RemoteHostSource.SSH_CONFIG,
     authenticationMode: value.authenticationMode === "system_agent"
       ? contract.RemoteHostAuthenticationMode.SYSTEM_AGENT
-      : contract.RemoteHostAuthenticationMode.PRIVATE_KEY,
+      : value.authenticationMode === "node_key" ? contract.RemoteHostAuthenticationMode.NODE_KEY : contract.RemoteHostAuthenticationMode.PRIVATE_KEY,
+    ...(value.nodeKey === undefined ? {} : { nodeKey: create(contract.SshKeyReferenceSchema, value.nodeKey) }),
     ...(value.credentialReferenceId === undefined
       ? {}
       : { credentialReferenceId: value.credentialReferenceId }),
@@ -381,6 +384,8 @@ function toProtoFailureCode(value: StoredFailureCode): contract.RemoteHostFailur
   switch (value) {
     case "aborted": return contract.RemoteHostFailureCode.ABORTED;
     case "authentication_failed": return contract.RemoteHostFailureCode.AUTHENTICATION_FAILED;
+    case "node_key_changed": return contract.RemoteHostFailureCode.NODE_KEY_CHANGED;
+    case "node_key_unavailable": return contract.RemoteHostFailureCode.NODE_KEY_UNAVAILABLE;
     case "connection_failed": return contract.RemoteHostFailureCode.CONNECTION_FAILED;
     case "connection_timeout": return contract.RemoteHostFailureCode.CONNECTION_TIMEOUT;
     case "connector_protocol": return contract.RemoteHostFailureCode.CONNECTOR_PROTOCOL;
@@ -487,27 +492,25 @@ function publicCredentialReference(value: string): string {
 
 function publicAuthenticationMode(
   value: contract.RemoteHostAuthenticationMode
-): "system_agent" | "private_key" {
+): "system_agent" | "private_key" | "node_key" {
   if (value === contract.RemoteHostAuthenticationMode.SYSTEM_AGENT) return "system_agent";
   if (value === contract.RemoteHostAuthenticationMode.PRIVATE_KEY) return "private_key";
+  if (value === contract.RemoteHostAuthenticationMode.NODE_KEY) return "node_key";
   throw new ConnectError("Remote Host authentication_mode is required.", Code.InvalidArgument);
 }
 
 function assertPublicAuthentication(
-  mode: "system_agent" | "private_key",
-  credentialReferenceId: string | undefined
+  mode: "system_agent" | "private_key" | "node_key",
+  credentialReferenceId: string | undefined,
+  nodeKey: contract.SshKeyReference | undefined
 ): void {
-  if (mode === "system_agent" && credentialReferenceId !== undefined) {
-    throw new ConnectError(
-      "System-agent authentication cannot include credential_reference_id.",
-      Code.InvalidArgument
-    );
+  if ((mode === "private_key") !== (credentialReferenceId !== undefined) ||
+    (mode === "node_key") !== (nodeKey !== undefined)) {
+    throw new ConnectError("Remote Host authentication metadata is inconsistent.", Code.InvalidArgument);
   }
-  if (mode === "private_key" && credentialReferenceId === undefined) {
-    throw new ConnectError(
-      "Private-key authentication requires credential_reference_id.",
-      Code.InvalidArgument
-    );
+  if (nodeKey !== undefined && (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/u.test(nodeKey.id) ||
+    !/^SHA256:[A-Za-z0-9+/]{43}$/u.test(nodeKey.expectedFingerprint))) {
+    throw new ConnectError("Remote Host node_key identity is invalid.", Code.InvalidArgument);
   }
 }
 

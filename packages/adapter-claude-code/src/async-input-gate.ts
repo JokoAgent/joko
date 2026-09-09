@@ -33,11 +33,13 @@ interface PendingInput<T> {
   readonly value: T;
   readonly consumed: Deferred<void>;
   readonly onConsumed: () => void;
+  readonly release: () => void;
 }
 
 /**
  * A deliberately one-slot AsyncIterable. The Adapter does not make the next
- * product turn visible to the SDK until the previous turn has a Result.
+ * product turn visible to the SDK until the previous turn has a Result;
+ * same-turn input uses the same slot and can be withdrawn before consumption.
  */
 export class AsyncInputGate<T> implements AsyncIterable<T>, AsyncIterator<T> {
   #pending: PendingInput<T> | undefined;
@@ -45,8 +47,9 @@ export class AsyncInputGate<T> implements AsyncIterable<T>, AsyncIterator<T> {
   #closed = false;
   #closeReason: unknown = new Error("The native input stream is closed.");
 
-  offer(value: T, onConsumed: () => void = () => undefined): Promise<void> {
+  offer(value: T, onConsumed: () => void = () => undefined, signal?: AbortSignal): Promise<void> {
     if (this.#closed) return Promise.reject(this.#closeReason);
+    if (signal?.aborted === true) return Promise.reject(signal.reason);
     if (this.#pending !== undefined) {
       return Promise.reject(new Error("The native input gate already contains an unread turn."));
     }
@@ -58,7 +61,14 @@ export class AsyncInputGate<T> implements AsyncIterable<T>, AsyncIterator<T> {
       consumed.resolve(undefined);
       reader.resolve({ value, done: false });
     } else {
-      this.#pending = { value, consumed, onConsumed };
+      const cancel = () => {
+        if (this.#pending?.consumed !== consumed) return;
+        this.#pending.release();
+        this.#pending = undefined;
+        consumed.reject(signal?.reason);
+      };
+      this.#pending = { value, consumed, onConsumed, release: () => signal?.removeEventListener("abort", cancel) };
+      signal?.addEventListener("abort", cancel, { once: true });
     }
     return consumed.promise;
   }
@@ -67,6 +77,7 @@ export class AsyncInputGate<T> implements AsyncIterable<T>, AsyncIterator<T> {
     const pending = this.#pending;
     if (pending !== undefined) {
       this.#pending = undefined;
+      pending.release();
       pending.onConsumed();
       pending.consumed.resolve(undefined);
       return Promise.resolve({ value: pending.value, done: false });
@@ -90,6 +101,7 @@ export class AsyncInputGate<T> implements AsyncIterable<T>, AsyncIterator<T> {
     this.#closed = true;
     this.#closeReason = reason;
     this.#pending?.consumed.reject(reason);
+    this.#pending?.release();
     this.#pending = undefined;
     this.#reader?.resolve({ value: undefined, done: true });
     this.#reader = undefined;

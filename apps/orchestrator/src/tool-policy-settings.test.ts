@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import type { BridgeToolPolicyDeclaration } from "./mcp-router.js";
 import { ToolPolicySettingsRepository } from "./tool-policy-settings.js";
+import { MULTILINGUAL_FIXTURES } from "./i18n/multilingual-fixtures.js";
 
 const POLICY: BridgeToolPolicyDeclaration = {
   id: "joko-test-tools",
@@ -16,7 +17,7 @@ const POLICY: BridgeToolPolicyDeclaration = {
   description: "A testable ordinary Tool Provider.",
   productDefaultEnabled: true,
   localizations: {
-    "zh-CN": { displayName: "测试工具", description: "可测试的普通工具。" }
+    "zh-CN": MULTILINGUAL_FIXTURES.toolPolicy
   }
 };
 const cleanups: Array<() => void> = [];
@@ -33,10 +34,7 @@ describe("ToolPolicySettingsRepository", () => {
       expect(initial.targetSettings[0]?.targetId).toBe("target-a");
       expect(initial.targetSettings[0]?.effectiveEnabled).toBe(true);
       expect(initial.targetSettings[0]?.effectiveSource).toBe(ToolPolicyEffectiveSource.PRODUCT_DEFAULT);
-      expect(fixture.repository.snapshot("zh-CN")[0]).toMatchObject({
-        displayName: "测试工具",
-        description: "可测试的普通工具。"
-      });
+      expect(fixture.repository.snapshot("zh-CN")[0]).toMatchObject(MULTILINGUAL_FIXTURES.toolPolicy);
       expect(initial).not.toHaveProperty("userOverride");
       expect(initial.targetSettings[0]).not.toHaveProperty("projectOverride");
 

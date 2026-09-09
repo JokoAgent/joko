@@ -31,7 +31,7 @@ import { spawn } from "node:child_process";
 import { release as operatingSystemRelease } from "node:os";
 import { appendFileSync, writeFileSync } from "node:fs";
 import { readdir, stat, unlink } from "node:fs/promises";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   DESKTOP_CHANNELS,
@@ -47,6 +47,7 @@ import {
   type DesktopManagedOrchestratorConnection,
   type DesktopManagedOrchestratorRecoveryReason,
   type DesktopManagedOrchestratorStatus,
+  type DesktopMainWindowCloseSettings,
   type DesktopNativeTaskStatusAction,
   type DesktopNativeTaskStatusDisplay,
   type DesktopNativeTaskStatusSoundChoice,
@@ -117,6 +118,11 @@ import {
   createDesktopWindowInteractionSettingsStore,
   type DesktopWindowInteractionSettingsStore
 } from "./window-interaction-settings.js";
+import {
+  createDesktopMainWindowCloseSettingsStore,
+  parseMainWindowCloseSettingsChange,
+  type DesktopMainWindowCloseSettingsStore
+} from "./window-close-settings.js";
 import {
   createDesktopNativeTaskStatusSettingsStore,
   type DesktopNativeTaskStatusSettingsStore
@@ -199,6 +205,7 @@ import {
   readRegularFileSnapshot
 } from "./secure-files.js";
 import { installSelectionContextMenu, setSelectionContextMenuLocale } from "./selection-context-menu.js";
+import { NativeFileClipboard, type FileCopyScope } from "./native-file-clipboard.js";
 import { bundledElectronUpdater, createElectronUpdateDriver } from "./electron-update-driver.js";
 import {
   createDesktopUpdateAutoRelaunchPolicy,
@@ -218,12 +225,21 @@ import { resolveDesktopUpdateFeedUrl } from "./update-feed.js";
 import { fetchDesktopUpdateManifestVersion } from "./update-manifest.js";
 import { createDesktopUpdateService, type DesktopUpdateService } from "./update-service.js";
 import { runDesktopUpdateStartupCheck } from "./update-startup.js";
-import { popUpDesktopTrayMenu, resolveDesktopTrayMenuLabels, usesJavaScriptTrayMenuPopup } from "./tray-menu.js";
+import { popUpDesktopTrayMenu, usesJavaScriptTrayMenuPopup } from "./tray-menu.js";
+import { resolveDesktopTrayMenuLabels } from "./i18n/tray-menu.js";
+import {
+  desktopMainWindowCloseLabels,
+  desktopRuntimeResourceWindowTitle,
+  desktopWindowLoadFailureLabels
+} from "./i18n/window-lifecycle.js";
 import {
   canShowDesktopWindow,
+  applyDesktopMainWindowCloseBehavior,
+  createDesktopMainWindowCloseController,
   hideWindowToAvailableTray,
   onDesktopWindowClosed,
-  showWindowFromTray
+  showWindowFromTray,
+  type DesktopMainWindowCloseController
 } from "./window-lifecycle.js";
 import {
   loadDesktopWindowWithRecovery,
@@ -417,6 +433,8 @@ let desktopUpdateChannelSettings: DesktopUpdateChannelSettingsStore | undefined;
 let desktopKeepAwakeSettings: DesktopKeepAwakeSettingsStore | undefined;
 let desktopKeepAwakeController: DesktopKeepAwakeController | undefined;
 let desktopWindowInteractionSettings: DesktopWindowInteractionSettingsStore | undefined;
+let desktopMainWindowCloseSettings: DesktopMainWindowCloseSettingsStore | undefined;
+let mainWindowCloseController: DesktopMainWindowCloseController | undefined;
 let desktopNativeTaskStatusSettings: DesktopNativeTaskStatusSettingsStore | undefined;
 let desktopNativeTaskStatusLayoutSettings: DesktopNativeTaskStatusLayoutSettingsStore | undefined;
 let macNativeTaskStatusHost: MacNativeTaskStatusHost | undefined;
@@ -449,6 +467,8 @@ const MAXIMUM_ATTACHMENT_BYTES = 64 * 1024 * 1024;
 const MAXIMUM_ATTACHMENT_BATCH_BYTES = 256 * 1024 * 1024;
 const MAXIMUM_ATTACHMENT_FILES = 32;
 const MAXIMUM_NATIVE_FILE_BYTES = 256 * 1024 * 1024;
+let nativeFileClipboard: NativeFileClipboard | undefined;
+const nativeFileCopyScopes = new WeakMap<WebContents, FileCopyScope>();
 const TRAY_ICON_DATA_URL_PREFIX = "data:image/png;base64,";
 const MAXIMUM_TRAY_ICON_DATA_URL_LENGTH = 512 * 1024;
 const EXPECTED_TRAY_ICON_SIZE = 256;
@@ -515,6 +535,8 @@ if (!app.requestSingleInstanceLock()) {
     if (intent !== undefined) handleDesktopInboundOpenIntent(intent);
   });
   app.on("before-quit", (event) => {
+    nativeFileClipboard?.cancelPending();
+    mainWindowCloseController?.cancelPending();
     quitting = true;
     activeDiscoveryAbort?.abort();
     sessionDragPreviewCoordinator.dispose();
@@ -559,6 +581,7 @@ if (!app.requestSingleInstanceLock()) {
     });
   });
   app.on("will-quit", () => {
+    nativeFileClipboard?.dispose();
     globalVoiceShortcutRecovery.dispose();
     unregisterGlobalVoiceShortcut();
     stopGlobalVoiceShortcutCapture();
@@ -603,6 +626,10 @@ if (!app.requestSingleInstanceLock()) {
     initializeDesktopUpdateAutoSettings();
     initializeDesktopAttentionBadge();
     await initializeDesktopWindowInteractionSettings();
+    desktopMainWindowCloseSettings = createDesktopMainWindowCloseSettingsStore(
+      join(app.getPath("userData"), "main-window-close-settings.json"), process.platform
+    );
+    await desktopMainWindowCloseSettings.initialize();
     await initializeDesktopNativeTaskStatus();
     if (shouldRunDesktopUpdateStartup()) desktopUpdateStartupPhase = { kind: "checking" };
     await initializeDesktopKeepAwake();
@@ -867,23 +894,51 @@ function createWindow(): void {
       responseHeaders: mergeContentSecurityPolicyHeaders(details.responseHeaders)
     });
   });
+  const closeController = createDesktopMainWindowCloseController({
+    isCurrent: () => mainWindow === window && !window.isDestroyed() && canApplyMainWindowClose(),
+    read: () => requireDesktopMainWindowCloseSettings().initialize(),
+    currentSettings: () => requireDesktopMainWindowCloseSettings().get(),
+    prompt: async (signal) => {
+      const labels = desktopMainWindowCloseLabels(applicationMenuLocale);
+      const keepRunning = process.platform === "win32" ? "tray" : "minimize";
+      const result = await dialog.showMessageBox(window, {
+        type: "question", title: labels.title, message: labels.message, detail: labels.detail,
+        buttons: [labels.cancel, labels[keepRunning], labels.quit], defaultId: 0, cancelId: 0, noLink: true, signal
+      });
+      return result.response === 1 ? keepRunning : result.response === 2 ? "quit" : null;
+    },
+    save: async (behavior, expectedRevision, isCurrent) => {
+      const settings = await requireDesktopMainWindowCloseSettings().set({ behavior, expectedRevision }, isCurrent);
+      broadcastDesktopMainWindowCloseSettings(settings);
+      return settings;
+    },
+    apply: (behavior, isCurrent) => applyDesktopMainWindowCloseBehavior(window, behavior, {
+      isCurrent, quit: () => app.quit(), hideToTray: (current) => closeWindowToTray(window, current)
+    }),
+    onError: async (signal) => {
+      const labels = desktopMainWindowCloseLabels(applicationMenuLocale);
+      await dialog.showMessageBox(window, {
+        type: "error", title: labels.title, message: labels.failure, buttons: [labels.cancel], cancelId: 0, signal
+      });
+    }
+  });
+  mainWindowCloseController = closeController;
+  window.once("closed", () => {
+    closeController.cancelPending();
+    if (mainWindowCloseController === closeController) mainWindowCloseController = undefined;
+  });
   window.on("close", (event) => {
     // Electron's macOS autoUpdater emits before-quit only after it has started
     // closing windows. The post-stop native handoff flag is therefore also an
     // authoritative close boundary; dirty beforeunload may still cancel it,
     // in which case the driver's will-quit timeout recovers managed Orchestrator.
     if (quitting || desktopUpdateNativeInstallQuitHandoffPending) return;
-    // Development launches must release the single-instance lock and the
-    // managed service so the next rebuilt launch cannot reopen stale code.
-    if (!app.isPackaged) {
-      event.preventDefault();
-      app.quit();
-      return;
-    }
     event.preventDefault();
-    // Native close, Alt+F4, taskbar close, and the renderer X all mean the
-    // same thing: keep Desktop/Orchestrator alive and hide only the main window.
-    void closeWindowToTray(window);
+    // All main-window close entrances share the device preference. macOS
+    // retains its existing keep-running behavior without a platform override.
+    if (process.platform === "darwin") void closeWindowToTray(window,
+      () => mainWindow === window && !window.isDestroyed() && canApplyMainWindowClose());
+    else void closeController.request();
   });
   window.on("hide", () => {
     if (inspectorWindow !== undefined && !inspectorWindow.isDestroyed()) inspectorWindow.hide();
@@ -1128,23 +1183,14 @@ async function presentDesktopWindowLoadFailure(
   attempt: number,
   preferredOwner?: BrowserWindow
 ): Promise<DesktopWindowLoadFailureAction> {
-  const chinese = app.getLocale().toLowerCase().startsWith("zh");
+  const labels = desktopWindowLoadFailureLabels(app.getLocale(), kind, attempt);
   const main = kind === "main";
-  const runtime = kind === "runtime";
   const options: MessageBoxOptions = {
     type: "error",
-    title: chinese
-      ? main ? "Joko 无法启动" : runtime ? "Joko 无法打开运行时资源用量" : "Joko 无法打开任务窗口"
-      : main ? "Joko could not start" : runtime ? "Joko could not open runtime resource usage" : "Joko could not open the task window",
-    message: chinese
-      ? main ? "Joko 用户界面无法加载。" : runtime ? "运行时资源用量无法加载。" : "任务窗口无法加载。"
-      : main ? "The Joko user interface could not be loaded." : runtime ? "Runtime resource usage could not be loaded." : "The task window could not be loaded.",
-    detail: `${safeSmokeError(error)}${attempt > 1
-      ? chinese ? `\n\n第 ${attempt} 次加载失败。` : `\n\nLoad attempt ${attempt} failed.`
-      : ""}`,
-    buttons: chinese
-      ? ["重试", main ? "退出" : "关闭"]
-      : ["Retry", main ? "Quit" : "Close"],
+    title: labels.title,
+    message: labels.message,
+    detail: `${safeSmokeError(error)}${labels.attemptDetail}`,
+    buttons: labels.buttons,
     defaultId: 0,
     cancelId: 1,
     noLink: true
@@ -2009,9 +2055,7 @@ async function openRuntimeProcessMonitorWindow(owner: BrowserWindow): Promise<{ 
 }
 
 function runtimeProcessMonitorWindowTitle(): string {
-  return applicationMenuLocale.toLowerCase().startsWith("zh")
-    ? "Joko · 运行时资源用量"
-    : "Joko · Runtime resource usage";
+  return desktopRuntimeResourceWindowTitle(applicationMenuLocale);
 }
 
 function isRuntimeProcessMonitorNavigation(value: string): boolean {
@@ -2312,6 +2356,7 @@ function showMainWindow(): void {
     nativeInstallQuitHandoffPending: desktopUpdateNativeInstallQuitHandoffPending,
     completeExitQuitHandoffPending: desktopCompleteExitQuitHandoffPending
   })) return;
+  mainWindowCloseController?.cancelPending();
   if (mainWindow === undefined || mainWindow.isDestroyed()) createWindow();
   if (mainWindow !== undefined) showWindowFromTray(mainWindow);
 }
@@ -2394,10 +2439,10 @@ async function ensureTrayAvailable(): Promise<boolean> {
   return tray !== undefined && !tray.isDestroyed();
 }
 
-async function closeWindowToTray(window: BrowserWindow): Promise<void> {
-  const result = await hideWindowToAvailableTray(window, ensureTrayAvailable);
+async function closeWindowToTray(window: BrowserWindow, isCurrent: () => boolean = () => true): Promise<void> {
+  const result = await hideWindowToAvailableTray(window, ensureTrayAvailable, isCurrent);
   if (result === "unavailable") {
-    if (!window.isDestroyed()) {
+    if (!window.isDestroyed() && isCurrent()) {
       window.show();
       window.focus();
       void dialog.showMessageBox(window, {
@@ -3013,6 +3058,24 @@ function broadcastDesktopWindowInteractionSettings(settings: DesktopWindowIntera
   if (inspectorWindow !== undefined && !inspectorWindow.isDestroyed() &&
     !inspectorWindow.webContents.isDestroyed()) {
     inspectorWindow.webContents.send(DESKTOP_CHANNELS.windowInteractionChanged, settings);
+  }
+}
+
+function canApplyMainWindowClose(): boolean {
+  return canShowDesktopWindow({
+    quitting,
+    channelQuitHandoffPending: desktopUpdateChannelQuitHandoffPending,
+    nativeInstallQuitHandoffPending: desktopUpdateNativeInstallQuitHandoffPending,
+    completeExitQuitHandoffPending: desktopCompleteExitQuitHandoffPending
+  }) && desktopUpdateChannelRelaunch === undefined && desktopUpdateService?.isRelaunching() !== true;
+}
+
+function broadcastDesktopMainWindowCloseSettings(settings: DesktopMainWindowCloseSettings): void {
+  for (const window of applicationWindows()) {
+    if (!window.isDestroyed() && !window.webContents.isDestroyed()) {
+      try { window.webContents.send(DESKTOP_CHANNELS.mainWindowCloseSettingsChanged, settings); }
+      catch { /* Renderer availability does not change the committed device setting. */ }
+    }
   }
 }
 
@@ -3765,6 +3828,23 @@ function registerIpc(): void {
     await store.initialize();
     return store.get();
   });
+  ipcMain.handle(DESKTOP_CHANNELS.mainWindowCloseSettingsGet, async (event, ...parameters: unknown[]) => {
+    assertTrustedIpcSender(event);
+    if (parameters.length !== 0) throw new TypeError("Main-window close settings get does not accept parameters.");
+    const store = requireDesktopMainWindowCloseSettings();
+    await store.initialize();
+    return store.get();
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.mainWindowCloseSettingsSet, async (event, ...parameters: unknown[]) => {
+    assertTrustedIpcSender(event);
+    if (parameters.length !== 1) throw new TypeError("Main-window close settings set requires one request.");
+    const change = parseMainWindowCloseSettingsChange(parameters[0], process.platform);
+    const settings = await requireDesktopMainWindowCloseSettings().set(change,
+      () => !event.sender.isDestroyed() && canApplyMainWindowClose());
+    mainWindowCloseController?.cancelPending();
+    broadcastDesktopMainWindowCloseSettings(settings);
+    return settings;
+  });
   ipcMain.handle(DESKTOP_CHANNELS.windowInteractionSet, async (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);
     if (parameters.length !== 1 || typeof parameters[0] !== "boolean") {
@@ -3811,7 +3891,7 @@ function registerIpc(): void {
     const window = BrowserWindow.fromWebContents(event.sender);
     if (window === null || window.isDestroyed()) throw new Error("Desktop close request has no trusted window.");
     if (window === mainWindow) {
-      await closeWindowToTray(window);
+      window.close();
       return;
     }
     if (window === runtimeProcessMonitorWindow) {
@@ -4148,6 +4228,18 @@ function registerIpc(): void {
     await atomicWriteUserSelectedFile(selection.filePath, request.bytes, MAXIMUM_NATIVE_FILE_BYTES);
     return true;
   });
+  ipcMain.handle(DESKTOP_CHANNELS.copyFile, (event, ...parameters: unknown[]) => {
+    assertTrustedIpcSender(event);
+    if (parameters.length !== 1) throw new TypeError("Native file copy requires one request object.");
+    nativeFileClipboard ??= new NativeFileClipboard({ directory: join(app.getPath("userData"), "clipboard-files"), platform: process.platform });
+    return nativeFileClipboard.copy(parameters[0], fileCopyScope(event));
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.cancelFileCopy, (event, ...parameters: unknown[]) => {
+    assertTrustedIpcSender(event);
+    if (parameters.length !== 1 || typeof parameters[0] !== "string") throw new TypeError("Native file copy cancellation requires one identity.");
+    const scope = nativeFileCopyScopes.get(event.sender);
+    if (scope !== undefined) nativeFileClipboard?.cancel(parameters[0], scope.id);
+  });
   ipcMain.handle(DESKTOP_CHANNELS.discoveryScan, async (event) => {
     assertTrustedIpcSender(event);
     return runDiscoveryScan();
@@ -4345,6 +4437,11 @@ function requireDesktopWindowInteractionSettings(): DesktopWindowInteractionSett
     throw new Error("Desktop window-interaction settings are not initialized.");
   }
   return desktopWindowInteractionSettings;
+}
+
+function requireDesktopMainWindowCloseSettings(): DesktopMainWindowCloseSettingsStore {
+  if (desktopMainWindowCloseSettings === undefined) throw new Error("Main-window close settings are not initialized.");
+  return desktopMainWindowCloseSettings;
 }
 
 async function runDiscoveryScan(): Promise<readonly DesktopDiscoveredNode[]> {
@@ -4792,6 +4889,31 @@ function assertTrustedIpcSender(event: IpcMainInvokeEvent): void {
   }, navigationPolicy)) {
     throw new Error("Desktop IPC request did not originate from the trusted Joko application frame.");
   }
+}
+
+function fileCopyScope(event: IpcMainInvokeEvent): FileCopyScope {
+  const contents = event.sender;
+  const existing = nativeFileCopyScopes.get(contents);
+  if (existing !== undefined) return existing;
+  const frame = event.senderFrame;
+  let active = true;
+  const scope: FileCopyScope = {
+    id: randomUUID(),
+    isCurrent: () => active && !quitting && !contents.isDestroyed() && contents.mainFrame === frame && trustedApplicationWindowForContents(contents) !== undefined
+  };
+  const retire = (): void => {
+    if (!active) return;
+    active = false;
+    nativeFileClipboard?.retireScope(scope.id);
+    if (nativeFileCopyScopes.get(contents) === scope) nativeFileCopyScopes.delete(contents);
+    contents.removeListener("did-start-navigation", navigate);
+    contents.removeListener("destroyed", retire);
+  };
+  const navigate = (_event: unknown, _url: string, isInPlace: boolean, isMainFrame: boolean): void => { if (isMainFrame && !isInPlace) retire(); };
+  contents.on("did-start-navigation", navigate);
+  contents.once("destroyed", retire);
+  nativeFileCopyScopes.set(contents, scope);
+  return scope;
 }
 
 function trustedApplicationWindowForContents(contents: WebContents): BrowserWindow | undefined {

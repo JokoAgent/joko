@@ -15,7 +15,7 @@
     "test:real:paid-smoke": "vitest run src/real-provider.opt-in.test.ts"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "0.3.239",
+    "@anthropic-ai/claude-agent-sdk": "0.3.259",
     "@joko/core": "workspace:*",
     "@joko/runtime-governance": "workspace:*"
   },

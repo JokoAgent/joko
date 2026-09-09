@@ -1,11 +1,16 @@
-import type { BackgroundTaskActivityView, ConnectionProfile, SessionView } from "./model.js";
+import type { BackgroundTaskActivityView, ConnectionProfile, Locale, SessionView } from "./model.js";
 
 export const PROMPT_RECOMMENDATION_SETTLE_MS = 500;
 
-export function promptRecommendationOwnerKey(profile: ConnectionProfile | undefined): string | undefined {
+export function promptRecommendationOwnerKey(profile: ConnectionProfile | undefined, routing: {
+  readonly locale: Locale;
+  readonly revision: bigint;
+  readonly runtimeRevision: string;
+  readonly enabled: boolean;
+}): string | undefined {
   return profile === undefined
     ? undefined
-    : `${profile.serverId}\0${profile.id}`;
+    : JSON.stringify([profile.serverId, profile.id, routing.locale, routing.revision.toString(), routing.runtimeRevision, routing.enabled]);
 }
 
 export interface PromptRecommendationFence {
@@ -22,6 +27,7 @@ export interface PromptRecommendationStoreState extends PromptRecommendationFenc
 interface Entry extends PromptRecommendationStoreState {
   readonly requestId: number;
   readonly timer: ReturnType<typeof setTimeout> | undefined;
+  readonly abort: AbortController | undefined;
 }
 
 interface ObservedSession extends PromptRecommendationFence {
@@ -29,7 +35,7 @@ interface ObservedSession extends PromptRecommendationFence {
   readonly backgroundActive: boolean;
 }
 
-type PredictionRequest = (fence: PromptRecommendationFence) => Promise<string>;
+type PredictionRequest = (fence: PromptRecommendationFence, signal: AbortSignal) => Promise<string>;
 
 /**
  * Renderer-only prompt recommendation store. It observes
@@ -42,6 +48,7 @@ export class PromptRecommendationStore {
   readonly #entries = new Map<string, Entry>();
   readonly #listeners = new Set<() => void>();
   #active = false;
+  #ownerKey: string | undefined;
   #revision = 0;
   #nextRequestId = 0;
 
@@ -55,6 +62,12 @@ export class PromptRecommendationStore {
   };
 
   readonly getRevision = (): number => this.#revision;
+
+  setOwner(key: string | undefined): void {
+    if (key === this.#ownerKey) return;
+    this.reset();
+    this.#ownerKey = key;
+  }
 
   observe(
     sessions: readonly SessionView[],
@@ -109,15 +122,19 @@ export class PromptRecommendationStore {
   ): void {
     const entry = this.#entries.get(sessionId);
     if (!this.#active || entry?.phase !== "candidate" || !sameFence(entry, { sessionId, generation, updatedAt })) return;
-    const requesting: Entry = { ...entry, phase: "requesting" };
+    const abort = new AbortController();
+    const requesting: Entry = { ...entry, phase: "requesting", abort };
     this.#entries.set(sessionId, requesting);
     this.#emit();
-    void Promise.resolve().then(() => request({ sessionId, generation, updatedAt })).then((value) => {
+    void Promise.resolve().then(() => {
+      if (this.#entries.get(sessionId) !== requesting || !this.#active || !this.#fenceIsCurrent(requesting)) return undefined;
+      return request({ sessionId, generation, updatedAt }, abort.signal);
+    }).then((value) => {
       const current = this.#entries.get(sessionId);
       if (current !== requesting || !this.#active || !this.#fenceIsCurrent(requesting)) return;
-      const text = value.trim();
+      const text = value?.trim() ?? "";
       if (text.length === 0) this.#entries.delete(sessionId);
-      else this.#entries.set(sessionId, { ...requesting, phase: "ready", text });
+      else this.#entries.set(sessionId, { ...requesting, phase: "ready", text, abort: undefined });
       this.#emit();
     }).catch(() => {
       if (this.#entries.get(sessionId) !== requesting) return;
@@ -136,7 +153,7 @@ export class PromptRecommendationStore {
   inspect(sessionId: string): PromptRecommendationStoreState | undefined {
     const entry = this.#entries.get(sessionId);
     if (entry === undefined) return undefined;
-    const { timer: _timer, requestId: _requestId, ...state } = entry;
+    const { timer: _timer, requestId: _requestId, abort: _abort, ...state } = entry;
     return state;
   }
 
@@ -145,6 +162,7 @@ export class PromptRecommendationStore {
   }
 
   reset(): void {
+    this.#ownerKey = undefined;
     this.#active = false;
     this.#observed.clear();
     this.#clearEntries();
@@ -170,7 +188,8 @@ export class PromptRecommendationStore {
       updatedAt: session.updatedAt,
       phase: "settling",
       requestId,
-      timer
+      timer,
+      abort: undefined
     });
   }
 
@@ -183,13 +202,17 @@ export class PromptRecommendationStore {
     const entry = this.#entries.get(sessionId);
     if (entry === undefined) return;
     if (entry.timer !== undefined) clearTimeout(entry.timer);
+    entry.abort?.abort();
     this.#entries.delete(sessionId);
     if (emit) this.#emit();
   }
 
   #clearEntries(): void {
     if (this.#entries.size === 0) return;
-    for (const entry of this.#entries.values()) if (entry.timer !== undefined) clearTimeout(entry.timer);
+    for (const entry of this.#entries.values()) {
+      if (entry.timer !== undefined) clearTimeout(entry.timer);
+      entry.abort?.abort();
+    }
     this.#entries.clear();
     this.#emit();
   }

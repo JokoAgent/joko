@@ -70,7 +70,8 @@
   padding: 7px 9px 7px 16px;
   background: var(--surface-raised);
 }
-.tool-payload-lightbox__title { min-width: 0; display: flex; align-items: center; gap: 9px; color: var(--text); }
+.tool-payload-lightbox__title { min-width: 0; display: flex; align-items: center; gap: 9px; border: 0; border-radius: 4px; padding: 0; background: transparent; color: var(--text); text-align: start; }
+.tool-payload-lightbox__title:focus-visible { outline: 2px solid var(--accent-edge); outline-offset: 3px; }
 .tool-payload-lightbox__title > svg { width: 18px; height: 18px; flex: 0 0 auto; color: var(--blue); }
 .tool-payload-lightbox__title > span { min-width: 0; display: grid; gap: 1px; }
 .tool-payload-lightbox__title strong,

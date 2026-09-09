@@ -16,6 +16,9 @@ import {
 import { createHash, randomUUID } from "node:crypto";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
+export { auditTerminalRuntimeAssets, terminalElectronSmokeSource } from "./terminal-runtime-probe.js";
+export { auditClaudeSessionRuntimeAssets, claudeSessionElectronSmokeSource } from "./claude-session-runtime-probe.js";
+
 export const ORCHESTRATOR_RUNTIME_MAXIMUM_FILES = 100_000;
 export const ORCHESTRATOR_RUNTIME_MAXIMUM_BYTES = 2 * 1024 * 1024 * 1024;
 
@@ -48,6 +51,7 @@ export const ORCHESTRATOR_RUNTIME_PACKAGES = [
   { name: "@joko/tool-browser", workspacePath: "packages/tool-browser", candidatePath: "node_modules/@joko/tool-browser" },
   { name: "@joko/tool-computer", workspacePath: "packages/tool-computer", candidatePath: "node_modules/@joko/tool-computer" },
   { name: "@joko/tool-lsp", workspacePath: "packages/tool-lsp", candidatePath: "node_modules/@joko/tool-lsp" },
+  { name: "@joko/tool-terminal", workspacePath: "packages/tool-terminal", candidatePath: "node_modules/@joko/tool-terminal" },
   { name: "@joko/voice-input", workspacePath: "packages/voice-input", candidatePath: "node_modules/@joko/voice-input" },
   { name: "@joko/worktree", workspacePath: "packages/worktree", candidatePath: "node_modules/@joko/worktree" }
 ] as const;
@@ -77,6 +81,7 @@ export const ORCHESTRATOR_RUNTIME_CRITICAL_IMPORTS = [
   "@joko/tool-browser",
   "@joko/tool-computer",
   "@joko/tool-lsp",
+  "@joko/tool-terminal",
   "@joko/voice-input",
   "@joko/worktree",
   "@earendil-works/pi-coding-agent",
@@ -89,10 +94,14 @@ export const ORCHESTRATOR_RUNTIME_CRITICAL_IMPORTS = [
   "@modelcontextprotocol/sdk/client/index.js",
   "@modelcontextprotocol/sdk/client/stdio.js",
   "@modelcontextprotocol/sdk/client/streamableHttp.js",
+  "@xterm/addon-serialize",
+  "@xterm/headless",
   "croner",
   "extract-zip",
   "fastify",
+  "file-type",
   "minimatch",
+  "node-pty",
   "playwright-core",
   "sharp",
   "sqlite-vec",

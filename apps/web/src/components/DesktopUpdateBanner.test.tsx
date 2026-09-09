@@ -307,6 +307,60 @@ describe("DesktopUpdateBanner automatic busy deferral", () => {
     expect(probeRuntimeActivity).toHaveBeenCalledOnce();
   });
 
+  it("withdraws an automatically shown banner when activity resumes and restores it when idle", async () => {
+    vi.useFakeTimers();
+    let busy = false;
+    const probeRuntimeActivity = vi.fn(async () => busy);
+    const desktop = installDesktopUpdate({ status: "ready", version: "2.0.0" });
+    const { container } = await renderBanner(false, probeRuntimeActivity);
+    expect(container.querySelector(".desktop-update-banner--expanded")).not.toBeNull();
+
+    await act(async () => desktop.publish({ status: "ready", version: "2.0.0" }));
+    expect(probeRuntimeActivity).toHaveBeenCalledOnce();
+    busy = true;
+    await act(async () => vi.advanceTimersByTimeAsync(DESKTOP_UPDATE_BUSY_POLL_MS));
+    expect(container.querySelector(".desktop-update-banner--expanded")).toBeNull();
+    expect(container.querySelector(".desktop-update-restore")).not.toBeNull();
+    busy = false;
+    await act(async () => vi.advanceTimersByTimeAsync(DESKTOP_UPDATE_BUSY_POLL_MS));
+    expect(container.querySelector(".desktop-update-banner--expanded")).not.toBeNull();
+    expect(probeRuntimeActivity).toHaveBeenCalledTimes(3);
+  });
+
+  it.each([false, true])("probes a new version after a user pin and applies its busy=%s answer", async (busy) => {
+    const nextProbe = deferred<boolean>();
+    const probeRuntimeActivity = vi.fn()
+      .mockResolvedValueOnce(true)
+      .mockImplementation(() => nextProbe.promise);
+    const desktop = installDesktopUpdate({ status: "ready", version: "2.0.0" });
+    const { container } = await renderBanner(false, probeRuntimeActivity);
+    await act(async () => requireElement<HTMLButtonElement>(container, ".desktop-update-restore").click());
+    expect(container.querySelector(".desktop-update-banner--expanded")).not.toBeNull();
+
+    await act(async () => desktop.publish({ status: "ready", version: "2.1.0" }));
+    expect(container.querySelector(".desktop-update-banner--expanded")).toBeNull();
+    expect(probeRuntimeActivity).toHaveBeenCalledTimes(2);
+    await act(async () => nextProbe.resolve(busy));
+    expect(container.querySelector(".desktop-update-banner--expanded") !== null).toBe(!busy);
+  });
+
+  it("does not let an outstanding busy poll override an explicit user restore", async () => {
+    vi.useFakeTimers();
+    const poll = deferred<boolean>();
+    const probeRuntimeActivity = vi.fn()
+      .mockResolvedValueOnce(true)
+      .mockImplementation(() => poll.promise);
+    installDesktopUpdate({ status: "ready", version: "2.0.0" });
+    const { container } = await renderBanner(false, probeRuntimeActivity);
+    await act(async () => vi.advanceTimersByTimeAsync(DESKTOP_UPDATE_BUSY_POLL_MS));
+    expect(probeRuntimeActivity).toHaveBeenCalledTimes(2);
+    await act(async () => requireElement<HTMLButtonElement>(container, ".desktop-update-restore").click());
+    await act(async () => poll.resolve(true));
+    await act(async () => vi.advanceTimersByTimeAsync(DESKTOP_UPDATE_BUSY_POLL_MS * 2));
+    expect(container.querySelector(".desktop-update-banner--expanded")).not.toBeNull();
+    expect(probeRuntimeActivity).toHaveBeenCalledTimes(2);
+  });
+
   it("re-probes a newer pending update and can reveal it after an older busy deferral", async () => {
     const probeRuntimeActivity = vi.fn()
       .mockResolvedValueOnce(true)

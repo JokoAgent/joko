@@ -23,6 +23,59 @@ const capability: VoiceInputCapabilityView = {
 };
 
 describe("VoiceInputMediaSession", () => {
+  it("does not append a buffered recorder chunk after the capture has failed", async () => {
+    const api = voiceApi(); api.getVoiceInputCapabilities = vi.fn(async () => capability); api.startVoiceInput = vi.fn(async () => voiceSession());
+    const track = new FakeTrack();
+    const media = new VoiceInputMediaSession({ ownerWindow: window, api, mediaDevices: { getUserMedia: vi.fn(async () => fakeStream(track)) }, mediaRecorder: FakeMediaRecorder as unknown as typeof MediaRecorder, preferences: { playInteractionSound: false } });
+    await media.start();
+    let finish!: (buffer: ArrayBuffer) => void;
+    const arrayBuffer = vi.fn(async () => new Promise<ArrayBuffer>(resolve => { finish = resolve; }));
+    const event = new Event("dataavailable"); Object.assign(event, { data: { size: 3, arrayBuffer } });
+    FakeMediaRecorder.latest!.dispatchEvent(event);
+    await vi.waitFor(() => expect(arrayBuffer).toHaveBeenCalledOnce());
+    track.dispatchEvent(new Event("ended"));
+    expect(media.currentState).toBe("error");
+    finish(new Uint8Array([1, 2, 3]).buffer);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(api.appendVoiceAudio).not.toHaveBeenCalled();
+    expect(track.stop).toHaveBeenCalledOnce();
+  });
+
+  it("uses the initiating Window and discards late permission and stop responses after cancellation", async () => {
+    const iframe = document.body.appendChild(document.createElement("iframe"));
+    const ownerWindow = iframe.contentWindow! as Window & typeof globalThis;
+    const permissionTrack = new FakeTrack();
+    let grant!: (stream: MediaStream) => void;
+    const pendingPermission = new Promise<MediaStream>(resolve => { grant = resolve; });
+    const getUserMedia = vi.fn(async () => pendingPermission);
+    Object.defineProperty(ownerWindow.navigator, "mediaDevices", { configurable: true, value: { getUserMedia } });
+    Object.defineProperty(ownerWindow, "MediaRecorder", { configurable: true, value: FakeMediaRecorder });
+    const api = voiceApi();
+    api.getVoiceInputCapabilities = vi.fn(async () => capability);
+    api.startVoiceInput = vi.fn(async () => voiceSession());
+    const media = new VoiceInputMediaSession({ ownerWindow, api, preferences: { playInteractionSound: false } });
+    const starting = media.start();
+    await vi.waitFor(() => expect(getUserMedia).toHaveBeenCalledOnce());
+    await media.cancel(); grant(fakeStream(permissionTrack)); await starting;
+    expect(permissionTrack.stop).toHaveBeenCalledOnce(); expect(api.startVoiceInput).not.toHaveBeenCalled();
+    expect(media.currentState).toBe("cancelled");
+
+    const activeTrack = new FakeTrack();
+    getUserMedia.mockResolvedValue(fakeStream(activeTrack));
+    let finish!: (session: VoiceInputSessionView) => void;
+    api.stopVoiceInput = vi.fn(async () => new Promise<VoiceInputSessionView>(resolve => { finish = resolve; }));
+    const updates: string[] = [];
+    const active = new VoiceInputMediaSession({ ownerWindow, api, preferences: { playInteractionSound: false }, onUpdate: value => updates.push(value.state) });
+    await active.start(); const stopping = active.stop();
+    await vi.waitFor(() => expect(api.stopVoiceInput).toHaveBeenCalledOnce());
+    await active.cancel();
+    finish(voiceSession({ state: "done", outcome: "success", result: { text: "late", source: "stable", salvaged: false } }));
+    expect(await stopping).toBeUndefined();
+    expect(active.currentSession).toBeUndefined(); expect(updates.at(-1)).toBe("cancelled");
+    expect(activeTrack.stop).toHaveBeenCalledOnce();
+    iframe.remove();
+  });
+
   it("captures real recorder bytes in strict sequence, fences stop, and releases the device", async () => {
     const updates: string[] = [];
     const track = new FakeTrack();
@@ -47,6 +100,7 @@ describe("VoiceInputMediaSession", () => {
     }));
 
     const media = new VoiceInputMediaSession({
+      ownerWindow: window,
       api,
       preferences: {
         refinementInstructions: "Keep commands verbatim.",
@@ -86,6 +140,7 @@ describe("VoiceInputMediaSession", () => {
     api.getVoiceInputCapabilities = vi.fn(async () => capability);
     const errors: Array<VoiceMediaError | undefined> = [];
     const media = new VoiceInputMediaSession({
+      ownerWindow: window,
       api,
       mediaDevices: { getUserMedia: vi.fn(async () => { throw denied; }) },
       mediaRecorder: FakeMediaRecorder as unknown as typeof MediaRecorder,
@@ -105,6 +160,7 @@ describe("VoiceInputMediaSession", () => {
     api.getVoiceInputCapabilities = vi.fn(async () => capability);
     api.startVoiceInput = vi.fn(async () => voiceSession());
     const media = new VoiceInputMediaSession({
+      ownerWindow: window,
       api,
       prewarmedStream: stream,
       mediaDevices: { getUserMedia },
@@ -125,6 +181,7 @@ describe("VoiceInputMediaSession", () => {
     api.stopVoiceInput = vi.fn(async () => voiceSession({ state: "done", outcome: "noSpeech" }));
     const states: string[] = [];
     const media = new VoiceInputMediaSession({
+      ownerWindow: window,
       api,
       mediaDevices: { getUserMedia: vi.fn(async () => fakeStream(new FakeTrack())) },
       mediaRecorder: FakeMediaRecorder as unknown as typeof MediaRecorder,
@@ -146,6 +203,7 @@ describe("VoiceInputMediaSession", () => {
     api.stopVoiceInput = vi.fn(async () => voiceSession({ state: "done", outcome: "noSpeech" }));
     const states: string[] = [];
     const media = new VoiceInputMediaSession({
+      ownerWindow: window,
       api,
       mediaDevices: { getUserMedia: vi.fn(async () => fakeStream(new FakeTrack())) },
       mediaRecorder: FakeMediaRecorder as unknown as typeof MediaRecorder,
@@ -186,6 +244,7 @@ describe("VoiceInputMediaSession", () => {
     const capture = new FakePcmCapture();
     const track = new FakeTrack();
     const media = new VoiceInputMediaSession({
+      ownerWindow: window,
       api,
       mediaDevices: { getUserMedia: vi.fn(async () => fakeStream(track)) },
       pcmCaptureFactory: () => capture

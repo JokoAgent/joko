@@ -227,6 +227,7 @@ message RuntimeRecoveryChangedEvent {
 message NativeMessageIdentity {
   string entry_id = 1;
   string parent_entry_id = 2;
+  NativeNavigationTarget rewind_before = 3;
 }
 
 message SessionAttentionChangedEvent {
@@ -302,6 +303,7 @@ message MessageThinkingBlock {
 message MessageArtifactBlock {
   BlobRef blob = 1;
   string label = 2;
+  AudioArtifactMetadata audio_metadata = 3;
 }
 
 message MessageToolCallBlock {

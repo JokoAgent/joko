@@ -10,6 +10,7 @@ import type {
   McpToolDescriptor
 } from "./mcp-router.js";
 import type { RemoteHostRegistry } from "./remote-host-registry.js";
+import { REMOTE_HOST_POLICY_LOCALIZATIONS } from "./i18n/orchestration-language.js";
 
 export const REMOTE_HOST_TOOL_PROVIDER_ID = "joko-remote-host-tools";
 export const REMOTE_HOST_TOOL_POLICY: BridgeToolPolicyDeclaration = Object.freeze({
@@ -17,12 +18,7 @@ export const REMOTE_HOST_TOOL_POLICY: BridgeToolPolicyDeclaration = Object.freez
   displayName: "Remote Host",
   description: "Inspect and run approved commands on configured remote hosts.",
   productDefaultEnabled: true,
-  localizations: {
-    "zh-CN": {
-      displayName: "远程主机",
-      description: "检查已配置的远程主机，并运行经过批准的命令。"
-    }
-  }
+  localizations: REMOTE_HOST_POLICY_LOCALIZATIONS
 });
 
 const OUTPUT_CHARACTER_LIMIT = 32_000;

@@ -1734,7 +1734,8 @@ export function Sidebar(props: SidebarProps): JSX.Element {
               className={cx("sidebar__rail-aggregate", railPanel?.section === "projects" && "is-open")}
               data-sidebar-rail-trigger="projects"
               label={t("nav.projects")}
-              tip={railPanel?.section === "projects" ? "" : t("nav.projects")}
+              tip={t("nav.projects")}
+              tooltipOpen={railPanel?.section === "projects" ? false : undefined}
               aria-haspopup="menu"
               aria-expanded={railPanel?.section === "projects"}
               onPointerEnter={(event) => {
@@ -1748,7 +1749,8 @@ export function Sidebar(props: SidebarProps): JSX.Element {
               className={cx("sidebar__rail-aggregate", railPanel?.section === "dialogues" && "is-open")}
               data-sidebar-rail-trigger="dialogues"
               label={t("newTask.dialogues")}
-              tip={railPanel?.section === "dialogues" ? "" : t("newTask.dialogues")}
+              tip={t("newTask.dialogues")}
+              tooltipOpen={railPanel?.section === "dialogues" ? false : undefined}
               aria-haspopup="menu"
               aria-expanded={railPanel?.section === "dialogues"}
               onPointerEnter={(event) => {

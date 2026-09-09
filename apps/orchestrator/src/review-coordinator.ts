@@ -14,6 +14,7 @@ import { buildReviewEvidence, compareReviewFreshness, type BuildReviewEvidenceIn
 import { ReviewEvidenceCaptureError } from "./review-evidence-provider.js";
 import { buildReviewPrompt } from "./review-prompt.js";
 import { readStartReviewRequest, type StartReviewRequest } from "./review-types.js";
+import { reviewTitlePrefix } from "./i18n/orchestration-language.js";
 
 export interface ReviewEvidenceProvider {
   /** Captures fresh source truth. The coordinator never logs or persists this return value. */
@@ -557,7 +558,7 @@ function reviewRunIdForOperation(operationId: string): string {
 }
 
 export function reviewTitle(sourceTitle: string, locale: string): string {
-  const prefix = locale.toLowerCase().startsWith("zh") ? "审查 · " : "Review · ";
+  const prefix = reviewTitlePrefix(locale);
   const title = `${prefix}${sourceTitle.trim() || "Task"}`;
   const characters = [...title];
   return characters.length <= 120 ? title : characters.slice(0, 120).join("");

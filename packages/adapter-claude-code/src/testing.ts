@@ -4,6 +4,8 @@ export type {
   ClaudePermissionUpdate,
   ClaudeSdkAccountInfo,
   ClaudeSdkInitializationResult,
+  ClaudeSdkForkOptions,
+  ClaudeSdkGetSessionMessagesOptions,
   ClaudeSdkListSessionsOptions,
   ClaudeSdkModelInfo,
   ClaudeSdkProbe,
@@ -12,5 +14,7 @@ export type {
   ClaudeSdkQueryParams,
   ClaudeSdkRuntime,
   ClaudeSdkSessionInfo,
+  ClaudeSdkSessionMessage,
   ClaudeSdkUserMessage
 } from "./sdk-runtime.js";
+export { SessionSdkOwner, SessionSdkFailure } from "./session-sdk-owner.js";

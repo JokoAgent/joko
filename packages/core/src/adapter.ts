@@ -26,6 +26,9 @@ export interface AdapterContext {
   readonly backendInstanceGeneration?: number;
   readonly target: TargetDescriptor;
   readonly binding?: NativeSessionBinding;
+  /** Complete service-owned durable selection for restoring this Session's route.
+   * Native-default Sessions leave this absent; never infer a Provider from a model. */
+  readonly modelSelection?: { readonly providerId: string; readonly modelId: string };
   /** Stable host operation identity for idempotent Backend mutations. */
   readonly operationId?: string;
   /** Private immutable creation snapshot used only to restore native runtime launch state. */
@@ -110,6 +113,7 @@ export interface NativeSessionState {
 export interface NativeHistoryProjectedEvent {
   readonly nativeEntryId: string;
   readonly nativeParentEntryId?: string;
+  readonly nativeRewindBefore?: import("./types.js").NativeNavigationTarget;
   readonly projectionKind: string;
   readonly contentIndex: number;
   readonly emittedAt?: number;
@@ -120,6 +124,8 @@ export interface NativeHistoryProjectedEvent {
 export interface NativeHistoryProjection {
   readonly events: readonly NativeHistoryProjectedEvent[];
   readonly activeEntryId?: string;
+  /** Explicitly observed current navigation position; absence is unavailable. */
+  readonly activeNavigationTarget?: import("./types.js").NativeNavigationTarget;
   /** Complete active native parent chain, including entries with no public projection. */
   readonly activeLineage?: readonly {
     readonly entryId: string;
@@ -162,6 +168,31 @@ export interface NativeSessionForkResult {
   readonly binding: NativeSessionBinding;
   readonly editorText?: string;
 }
+
+/** Host-owned adoption and cleanup authority for one native derivation.
+ * Register a distinct native binding synchronously as soon as its identity is
+ * known, before subsequent validation or runtime cleanup can fail. A successful
+ * registration transfers that binding to the Host, even if the source was
+ * cancelled. Keep this authority separate from the source runtime context. */
+export interface NativeSessionDerivation {
+  readonly sessionId: SessionId;
+  readonly recordBinding: (binding: NativeSessionBinding) => void;
+}
+
+/** Host authority for a navigation that may replace this product Session's
+ * native context. Register the new binding before any subsequent await. */
+export interface NativeSessionNavigation {
+  readonly recordBinding: (binding: NativeSessionBinding) => void;
+}
+
+export type NativeSessionNavigationResult =
+  | { readonly kind: "in_place" }
+  | {
+      readonly kind: "replacement";
+      /** A distinct detached native context with a strictly newer generation. */
+      readonly binding: NativeSessionBinding;
+      readonly nativeHistory: NativeHistoryProjection;
+    };
 
 /** Opaque native persistence bytes suitable for a user-authorized portable package. */
 export interface PortableNativeSession {
@@ -378,13 +409,17 @@ export interface BackendAdapter {
   ): Promise<NativeSessionBinding>;
   getTree(context: AdapterContext): Promise<SessionTree>;
   navigateTree(
-    entryId: string,
+    target: import("./types.js").NativeNavigationTarget,
     summarize: boolean,
     context: AdapterContext,
-    customInstructions?: string
-  ): Promise<void>;
-  fork(entryId: string, context: AdapterContext): Promise<NativeSessionForkResult>;
-  clone(context: AdapterContext): Promise<NativeSessionBinding>;
+    customInstructions: string | undefined,
+    navigation: NativeSessionNavigation
+  ): Promise<NativeSessionNavigationResult>;
+  /** Preserve the source runtime and binding. Success returns a distinct,
+   * registered binding whose derived runtime is already detached. */
+  fork(entryId: string, context: AdapterContext, derivation: NativeSessionDerivation): Promise<NativeSessionForkResult>;
+  /** Same ownership contract as fork, for the complete durable history. */
+  clone(context: AdapterContext, derivation: NativeSessionDerivation): Promise<NativeSessionBinding>;
   /**
    * Replace the attached native context with a fresh same-Backend session.
    * Implementations must accept a fenced inactive or unhealthy source binding,

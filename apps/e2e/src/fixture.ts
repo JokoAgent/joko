@@ -22,6 +22,7 @@ import {
   WorkspaceService,
   createPublicServer,
   type OrchestratorApplication,
+  type BackendInstanceFactory,
   type OrchestratorConfig
 } from "@joko/orchestrator";
 import { OperationalStore } from "@joko/store";
@@ -38,7 +39,11 @@ export type { E2eClients, PairedClient } from "./connect-clients.js";
 export interface FixtureOptions {
   readonly rootDirectory?: string;
   readonly profiles?: readonly FakeAdapterProfile[];
+  readonly createAdapter?: (profile: FakeAdapterProfile) => InstrumentedFakeAdapter;
+  readonly backendFactories?: readonly BackendInstanceFactory[];
   readonly keepRoot?: boolean;
+  readonly terminals?: OrchestratorApplication["terminals"];
+  readonly createAuxiliaryServices?: (store: OperationalStore, dataDirectory: string, artifacts: ArtifactStore) => Promise<Pick<OrchestratorApplication, "auxiliaryText" | "subagentModels" | "sessionNavigation" | "providers" | "mcpRouter" | "sshKeys" | "credentials" | "remoteHosts" | "browser" | "browserState">>;
 }
 
 export class InstrumentedFakeAdapter extends FakeBackendAdapter {
@@ -176,17 +181,15 @@ export class OrchestratorE2eFixture {
     const adapters = new Map<string, InstrumentedFakeAdapter>();
     const store = new OperationalStore(databasePath);
     const backendInstances = new BackendInstanceRegistry(store);
-    await backendInstances.provision(profiles.map((profile) => ({
+    const factories: readonly BackendInstanceFactory[] = [...profiles.map((profile) => ({
       instanceId: profile.id,
       adapterKind: "fake",
       displayName: profile.displayName,
-      create: () => new InstrumentedFakeAdapter(profile)
-    })));
+      create: () => options.createAdapter?.(profile) ?? new InstrumentedFakeAdapter(profile)
+    })), ...(options.backendFactories ?? [])];
+    await backendInstances.provision(factories);
     for (const adapter of backendInstances.availableAdapters()) {
-      if (!(adapter instanceof InstrumentedFakeAdapter)) {
-        throw new Error("The E2E Backend registry provisioned an unexpected Adapter type.");
-      }
-      adapters.set(adapter.id, adapter);
+      if (adapter instanceof InstrumentedFakeAdapter) adapters.set(adapter.id, adapter);
     }
     const artifactRepository = new OperationalArtifactRepository(store);
     const artifacts = new ArtifactStore({
@@ -235,13 +238,13 @@ export class OrchestratorE2eFixture {
       externalRecords: workspaceChanges
     });
     const targets = new Map<string, string>();
-    for (const profile of profiles) {
-      const targetId = `target-${profile.id}`;
-      targets.set(profile.id, targetId);
+    for (const factory of factories) {
+      const targetId = `target-${factory.instanceId}`;
+      targets.set(factory.instanceId, targetId);
       await sessionHost.registerTarget({
         id: targetId,
-        backendId: profile.id,
-        displayName: `${profile.displayName} target`,
+        backendId: factory.instanceId,
+        displayName: `${factory.displayName} target`,
         workspaceRoot: workspaceDirectory,
         managed: true,
         trusted: true
@@ -297,7 +300,7 @@ export class OrchestratorE2eFixture {
             hooks.preparePrevious(candidateAdapter, candidateGeneration),
           activateCurrent: ({ adapter }) => {
             hooks.activateCurrent();
-            adapters.set(backendId, adapter as InstrumentedFakeAdapter);
+            if (adapter instanceof InstrumentedFakeAdapter) adapters.set(backendId, adapter);
           }
         })
       });
@@ -305,6 +308,7 @@ export class OrchestratorE2eFixture {
     const refreshBackendDescriptor = async (backendId: string): Promise<void> => {
       await backendInstances.refresh(backendId);
     };
+    const auxiliaryServices = await options.createAuxiliaryServices?.(store, dataDirectory, artifacts);
     const application: OrchestratorApplication = {
       config,
       store,
@@ -327,9 +331,18 @@ export class OrchestratorE2eFixture {
       restartBackend,
       refreshBackendDescriptor,
       browserActivity: [],
+      ...(options.terminals === undefined ? {} : { terminals: options.terminals }),
+      ...auxiliaryServices,
       async close() {
         scheduler.stop();
+        auxiliaryServices?.sessionNavigation?.dispose();
+        auxiliaryServices?.auxiliaryText?.dispose();
+        await auxiliaryServices?.mcpRouter?.dispose();
+        auxiliaryServices?.sshKeys?.close();
+        await auxiliaryServices?.remoteHosts?.close();
+        await auxiliaryServices?.browser?.stop();
         await lanDiscovery.stop();
+        await options.terminals?.dispose();
         await sessionHost.dispose();
         sessionWorktrees.dispose();
         store.close();

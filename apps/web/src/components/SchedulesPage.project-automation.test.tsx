@@ -202,6 +202,7 @@ const target: TargetView = {
   backendId: "backend",
   name: "Project",
   workspaceId: "workspace",
+  revision: 1n,
   workspaceName: "Project",
   trusted: true,
   pinned: false,

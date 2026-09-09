@@ -139,7 +139,8 @@ describe("RemoteHostService", () => {
         commandExecution: false,
         processStreaming: false,
         fileTransfer: false,
-        tcpForwarding: false
+        tcpForwarding: false,
+        interactiveTerminal: false
       },
       async connect(request) {
         if (request.authentication.kind !== "private_key") throw new Error("unexpected authentication mode");

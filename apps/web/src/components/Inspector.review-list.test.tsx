@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act } from "react";
+import { act, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { WorkspaceDiffView, WorkspaceFileDiffView } from "../model.js";
@@ -60,6 +60,36 @@ describe("Workspace Review file list", () => {
     };
     const { container } = await renderPreview([item], false);
     expect(container.querySelector('[data-virtualized-diff="true"]')).not.toBeNull();
+  });
+
+  it("defers collapsed diff content and restores it when expanded", async () => {
+    const item: WorkspaceFileDiffView = {
+      ...file("src/change.ts"),
+      hunks: [{
+        oldStart: 1, oldCount: 1, newStart: 1, newCount: 1, heading: "",
+        lines: [
+          { kind: "removed", oldLine: 1, newLine: 0, text: "return oldValue;" },
+          { kind: "added", oldLine: 0, newLine: 1, text: "return newValue;" }
+        ]
+      }]
+    };
+    function Preview() {
+      const [expanded, setExpanded] = useState(false);
+      return <WorkspaceDiffPreview diff={{ source: "unstaged", repositoryRevision: "revision-1", truncated: false, files: [item] }}
+        fallback={[]} t={(key) => key} expandedFileKeys={new Set(expanded ? [reviewFileKey(item)] : [])}
+        onFileExpandedChange={(_key, value) => setExpanded(value)} />;
+    }
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    roots.push(root);
+    await act(async () => root.render(<Preview />));
+    expect(container.querySelector(".review-hunks")).toBeNull();
+    expect(container.querySelector(".review-diff-stats")?.textContent).toBe("+1−1");
+    await act(async () => container.querySelector<HTMLElement>("summary")!.click());
+    expect([...container.querySelectorAll(".inline-word-change")].map((node) => node.textContent)).toEqual(["oldValue", "newValue"]);
+    await act(async () => container.querySelector<HTMLElement>("summary")!.click());
+    expect(container.querySelector(".review-hunks")).toBeNull();
   });
 
   it("filters and selects files from the keyboard jump control", async () => {

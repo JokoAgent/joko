@@ -14,6 +14,8 @@
     { "path": "./packages/adapter-pi" },
     { "path": "./packages/adapter-transcription-openai" },
     { "path": "./packages/adapter-transcription-realtime" },
+    { "path": "./packages/adapter-transcription-scribe" },
+    { "path": "./packages/adapter-transcription-sauc" },
     { "path": "./packages/tool-android" },
     { "path": "./packages/tool-browser" },
     { "path": "./packages/tool-computer" },

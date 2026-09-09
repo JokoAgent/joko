@@ -25,7 +25,7 @@ describe("lazy new-session dispatch", () => {
   it("creates only when invoked, reveals the durable task, then sends its first input", async () => {
     const order: string[] = [];
     const api = {
-      createSession: vi.fn(async () => { order.push("create"); return "session-1"; }),
+      createSession: vi.fn(async () => { order.push("create"); return { sessionId: "session-1", generation: 7n }; }),
       send: vi.fn(async () => { order.push("send"); })
     };
     const onCreated = vi.fn((sessionId: string) => {
@@ -36,13 +36,13 @@ describe("lazy new-session dispatch", () => {
     await expect(createSessionFromFirstInput(api, session, input, onCreated)).resolves.toBe("session-1");
 
     expect(order).toEqual(["create", "navigate:session-1", "send"]);
-    expect(api.send).toHaveBeenCalledWith("session-1", input);
+    expect(api.send).toHaveBeenCalledWith("session-1", input, { expectedGeneration: 7n });
   });
 
   it("still reveals the created task before a first-input failure escapes", async () => {
     const order: string[] = [];
     const api = {
-      createSession: vi.fn(async () => { order.push("create"); return "session-2"; }),
+      createSession: vi.fn(async () => { order.push("create"); return { sessionId: "session-2", generation: 8n }; }),
       send: vi.fn(async () => { order.push("send"); throw new Error("dispatch failed"); })
     };
 
@@ -62,6 +62,17 @@ describe("lazy new-session dispatch", () => {
     await expect(createSessionFromFirstInput(api, session, input, onCreated)).rejects.toThrow("create failed");
     expect(onCreated).not.toHaveBeenCalled();
     expect(api.send).not.toHaveBeenCalled();
+  });
+
+  it("preserves accepted first input even if revealing the created task fails", async () => {
+    const api = {
+      createSession: vi.fn(async () => ({ sessionId: "created", generation: 3n })),
+      send: vi.fn(async () => undefined)
+    };
+    await expect(createSessionFromFirstInput(api, session, input, () => {
+      throw new Error("Navigation failed");
+    })).rejects.toThrow("Navigation failed");
+    expect(api.send).toHaveBeenCalledExactlyOnceWith("created", input, { expectedGeneration: 3n });
   });
 
   it("creates and refreshes a durable managed-dialogue target before Session creation", async () => {

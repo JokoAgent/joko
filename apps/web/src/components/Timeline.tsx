@@ -1,6 +1,7 @@
 import { createContext, isValidElement, memo, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ComponentProps, CSSProperties, JSX, ReactNode } from "react";
 import { createPortal } from "react-dom";
+import { assertBrowserActionCurrent, type BrowserActionContext, type HttpLinkOpenOptions } from "../browser-action.js";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   AlertCircle,
@@ -25,8 +26,6 @@ import {
   Link2,
   ListChecks,
   MessageSquarePlus,
-  Globe2,
-  PanelRight,
   Pencil,
   RotateCcw,
   RefreshCw,
@@ -44,7 +43,10 @@ import rehypeKatex from "rehype-katex";
 import remarkCjkFriendly from "remark-cjk-friendly";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
+import { remarkChatUrlBoundaries } from "./remark-chat-url-boundaries.js";
 import "katex/dist/katex.min.css";
+import { ArtifactDownloadButton } from "./ArtifactDownloadButton.js";
+import type { OperationApi } from "../model.js";
 import type { MessageKey } from "../i18n.js";
 import type { ComposerSelectionQuoteDraft, ErrorRecoveryActionView, ErrorView, SessionView, SubagentRunDetailView, SubagentRunView, TimelineItemView } from "../model.js";
 import { sessionMessageDeepLink } from "../message-reference.js";
@@ -74,13 +76,16 @@ import { SubagentInlineCard } from "./SubagentInlineCard.js";
 import { deriveMessageNavEntries } from "./message-nav-rail.js";
 import { usePreviousUserMessageJump } from "./use-prev-message-jump.js";
 import { consumeMessageNavBackfillRound, resetMessageNavBackfillBudget, scheduleMessageNavBackfill, shouldBackfillMessageNav, type MessageNavBackfillBudget } from "./message-nav-backfill.js";
-import { TimelineCopyAsImageBlock, timelineMathToLatex, timelineTableToTsv } from "./TimelineCopyAsImageBlock.js";
+import { TimelineCopyAsImageBlock } from "./TimelineCopyAsImageBlock.js";
+import { timelineMathToLatex, timelineTableToTsv } from "./timeline-image-export.js";
 import { TimelineCodeBlock } from "./TimelineCodeBlock.js";
 import { TimelineMermaidBlock } from "./TimelineMermaidBlock.js";
 import { TimelineTextAttachmentLightbox } from "./TimelineTextAttachmentLightbox.js";
 import { timelineArtifactSupportsTextPreview } from "./timeline-text-attachment.js";
 import { TimelineArtifactMedia, timelineArtifactMediaKind } from "./TimelineArtifactMedia.js";
+import { TimelineArtifactModel, timelineArtifactModelKind } from "./TimelineArtifactModel.js";
 import { useTimelineArtifactUrlCache } from "./timeline-artifact-url-cache.js";
+import { AudioArtworkContext } from "./AudioArtwork.js";
 import { timelineErrorCopy } from "../timeline-error-copy.js";
 import {
   TIMELINE_HISTORY_NAVIGATION_KEYS,
@@ -93,8 +98,10 @@ import {
 import { ToolPayloadLightbox, ToolPayloadOpenButton } from "./ToolPayloadLightbox.js";
 import { WorkspaceImageLightbox } from "./WorkspaceImageLightbox.js";
 import type { ToolPayloadSection } from "./tool-payload.js";
-import { SentMessageReferenceText, TimelineMarkdownImage, TimelineMarkdownLink, type TimelineReferenceActions, type TimelineWorkspaceAsset } from "./TimelineReferenceContent.js";
+import { SentMessageReferenceText, TimelineLinkSourceContext, TimelineMarkdownImage, TimelineMarkdownLink, type TimelineReferenceActions, type TimelineWorkspaceAsset } from "./TimelineReferenceContent.js";
 import { normalizeTimelineMathDelimiters, remarkStrictTimelineInlineMath } from "./timeline-markdown-math.js";
+import { TimelineMarkdownDocument } from "./TimelineMarkdownDocument.js";
+import { TimelineFadeElement } from "./TimelineFadeElement.js";
 import {
   commitTimelineWordFadeCandidate,
   createTimelineWordFadeCandidate,
@@ -112,7 +119,8 @@ const TIMELINE_REMARK_PLUGINS: NonNullable<ComponentProps<typeof ReactMarkdown>[
   [remarkGfm, { singleTilde: false }],
   remarkCjkFriendly,
   remarkMath,
-  remarkStrictTimelineInlineMath
+  remarkStrictTimelineInlineMath,
+  remarkChatUrlBoundaries
 ];
 const TIMELINE_REHYPE_PLUGINS: NonNullable<ComponentProps<typeof ReactMarkdown>["rehypePlugins"]> = [
   [rehypeKatex, { strict: "ignore", errorColor: "inherit" }]
@@ -134,15 +142,18 @@ interface TimelineSubagentContextValue {
 const TimelineSubagentContext = createContext<TimelineSubagentContextValue>({ runs: new Map(), details: new Map() });
 
 interface TimelinePersonalizationContextValue {
+  readonly ownerKey: string;
   readonly streamFadeEnabled: boolean;
   readonly reducedMotion: boolean;
   readonly sessionId: string;
-  readonly onOpenHttpLink?: (url: string, options?: { readonly forceExternal?: boolean; readonly forceSidebar?: boolean }) => void;
+  readonly onOpenHttpLink?: (url: string, options?: HttpLinkOpenOptions) => void | Promise<void>;
+  readonly onOpenWorkspaceHtml?: (path: string, options?: HttpLinkOpenOptions) => void | Promise<void>;
   readonly onLoadWorkspaceAsset?: (path: string) => Promise<TimelineWorkspaceAsset>;
   readonly onWorkspaceImageToComposer?: (file: File) => void | Promise<void>;
 }
 
 const TimelinePersonalizationContext = createContext<TimelinePersonalizationContextValue>({
+  ownerKey: "",
   streamFadeEnabled: true,
   reducedMotion: false,
   sessionId: ""
@@ -157,7 +168,8 @@ export interface TimelineShareSelection {
   readonly selectedIds: ReadonlySet<string>;
 }
 
-export function Timeline({ sessionId, sessionName, items, sessionActive, derivationOrigin, sessionCreatedAt, onOpenDerivationOrigin, messageNavRailEnabled, streamFadeEnabled, onOpenHttpLink, onLoadWorkspaceAsset, onWorkspaceImageToComposer, subagentRuns, subagentRunDetails, onOpenSubagent, onStopSubagent, hasEarlier, historyLoading, historyError, onLoadEarlier, followLatestSignal = 0, focusRequest, bottomInset = 0, retryRunId, locale, t, onRetry, onRecovery, recoveryContext, onArtifactUrl, onArtifactUrlRelease, onArtifactDownload, onWorkspaceRewind, onOpenGeneratedFile, onOpenTurnReview, onReobserveReview, onAddMessageToComposer, onAddSelectionToComposer, onForkMessage, forkingMessageId, shareSelection, onStartShareSelection, onToggleShareMessage, editableMessageId, onMoveEditedMessageToComposer, onPreviewMessageRewind, onDeleteMessage, messageDeleteBlockedReason, messageActionResetSignal, onInlinePlanVisibilityChange }: {
+export function Timeline({ ownerKey, sessionId, sessionName, items, sessionActive, derivationOrigin, sessionCreatedAt, onOpenDerivationOrigin, messageNavRailEnabled, streamFadeEnabled, onOpenHttpLink, onOpenWorkspaceHtml, onLoadWorkspaceAsset, onWorkspaceImageToComposer, subagentRuns, subagentRunDetails, onOpenSubagent, onStopSubagent, hasEarlier, historyLoading, historyError, onLoadEarlier, followLatestSignal = 0, focusRequest, bottomInset = 0, retryRunId, locale, t, onRetry, onRecovery, recoveryContext, onArtifactUrl, onArtifactUrlRelease, onArtifactDownload, onWorkspaceRewind, onOpenGeneratedFile, onOpenTurnReview, onReobserveReview, onAddMessageToComposer, onAddSelectionToComposer, onForkMessage, forkingMessageId, shareSelection, onStartShareSelection, onToggleShareMessage, editableMessageId, onMoveEditedMessageToComposer, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason, messageActionResetSignal, onInlinePlanVisibilityChange }: {
+  readonly ownerKey: string;
   readonly sessionId: string;
   readonly sessionName: string;
   readonly items: readonly TimelineItemView[];
@@ -167,7 +179,8 @@ export function Timeline({ sessionId, sessionName, items, sessionActive, derivat
   readonly onOpenDerivationOrigin?: () => void;
   readonly messageNavRailEnabled: boolean;
   readonly streamFadeEnabled: boolean;
-  readonly onOpenHttpLink?: (url: string, options?: { readonly forceExternal?: boolean; readonly forceSidebar?: boolean }) => void;
+  readonly onOpenHttpLink?: (url: string, options?: HttpLinkOpenOptions) => void | Promise<void>;
+  readonly onOpenWorkspaceHtml?: (path: string, options?: HttpLinkOpenOptions) => void | Promise<void>;
   readonly onLoadWorkspaceAsset?: (path: string) => Promise<TimelineWorkspaceAsset>;
   readonly onWorkspaceImageToComposer?: (file: File) => void | Promise<void>;
   readonly subagentRuns?: ReadonlyMap<string, SubagentRunView>;
@@ -189,7 +202,7 @@ export function Timeline({ sessionId, sessionName, items, sessionActive, derivat
   readonly recoveryContext?: RecoveryActionContext;
   readonly onArtifactUrl: (blobId: string) => Promise<string>;
   readonly onArtifactUrlRelease: (blobId: string) => void;
-  readonly onArtifactDownload: (blobId: string, fileName: string) => void;
+  readonly onArtifactDownload: OperationApi["downloadArtifact"];
   readonly onWorkspaceRewind?: (workspaceId: string, changeSetId: string) => void;
   readonly onOpenGeneratedFile?: (workspaceId: string, relativePath: string) => void;
   readonly onOpenTurnReview?: (changeSetId: string, relativePath?: string) => void;
@@ -203,7 +216,7 @@ export function Timeline({ sessionId, sessionName, items, sessionActive, derivat
   readonly onToggleShareMessage?: (itemId: string, extendRange: boolean) => void;
   readonly editableMessageId?: string;
   readonly onMoveEditedMessageToComposer?: (item: TimelineItemView, text: string) => Promise<void>;
-  readonly onPreviewMessageRewind?: (item: TimelineItemView) => void;
+  readonly onPreviewMessageRewind?: (item: TimelineItemView) => void; readonly rewindToStartSupported?: boolean;
   readonly onDeleteMessage?: (item: TimelineItemView) => void;
   readonly messageDeleteBlockedReason?: string;
   readonly messageActionResetSignal?: number;
@@ -232,7 +245,8 @@ export function Timeline({ sessionId, sessionName, items, sessionActive, derivat
   const [messageNavRailCoversNavigation, setMessageNavRailCoversNavigation] = useState(false);
   useEffect(() => setEditingMessageId(undefined), [messageActionResetSignal, sessionId]);
   useEffect(() => { if (!messageNavRailEnabled) setMessageNavRailCoversNavigation(false); }, [messageNavRailEnabled]);
-  const loadArtifactUrl = useTimelineArtifactUrlCache(sessionId, onArtifactUrl, onArtifactUrlRelease);
+  const loadArtifactUrl = useTimelineArtifactUrlCache(ownerKey, onArtifactUrl, onArtifactUrlRelease);
+  const artworkGateway = useMemo(() => ({ acquire: onArtifactUrl, release: onArtifactUrlRelease }), [ownerKey, onArtifactUrl, onArtifactUrlRelease]);
   const openGalleryImage = useCallback((imageId: string, trigger: HTMLElement): void => {
     // Modal and lightbox surfaces are mutually exclusive. The lightbox owns the
     // same shortcut/scroll lock while open, so a hidden dialog cannot stack.
@@ -267,13 +281,15 @@ export function Timeline({ sessionId, sessionName, items, sessionActive, derivat
   const loadEarlierInFlightRef = useRef(false);
   const reducedMotion = usePrefersReducedMotion();
   const personalizationContext = useMemo<TimelinePersonalizationContextValue>(() => ({
+    ownerKey,
     streamFadeEnabled,
     reducedMotion,
     sessionId,
     ...(onOpenHttpLink === undefined ? {} : { onOpenHttpLink }),
+    ...(onOpenWorkspaceHtml === undefined ? {} : { onOpenWorkspaceHtml }),
     ...(onLoadWorkspaceAsset === undefined ? {} : { onLoadWorkspaceAsset }),
     ...(onWorkspaceImageToComposer === undefined ? {} : { onWorkspaceImageToComposer })
-  }), [onLoadWorkspaceAsset, onOpenHttpLink, onWorkspaceImageToComposer, reducedMotion, sessionId, streamFadeEnabled]);
+  }), [onLoadWorkspaceAsset, onOpenHttpLink, onOpenWorkspaceHtml, onWorkspaceImageToComposer, ownerKey, reducedMotion, sessionId, streamFadeEnabled]);
   const subagentContext = useMemo<TimelineSubagentContextValue>(() => ({
     runs: subagentRuns ?? new Map(),
     details: subagentRunDetails ?? new Map(),
@@ -687,6 +703,7 @@ export function Timeline({ sessionId, sessionName, items, sessionActive, derivat
 
   return (
     <TimelineSubagentContext.Provider value={subagentContext}>
+    <AudioArtworkContext.Provider value={artworkGateway}>
     <TimelineImageGalleryContext.Provider value={galleryContext}>
     <TimelinePersonalizationContext.Provider value={personalizationContext}>
     <div className="timeline-shell" style={{ "--timeline-bottom-inset": `${Math.max(0, bottomInset)}px` } as CSSProperties}>
@@ -747,7 +764,7 @@ export function Timeline({ sessionId, sessionName, items, sessionActive, derivat
               >
                 {renderItem.historyGapBefore !== undefined && <div className="timeline-history-gap" role="separator"><span>{t("timeline.historyGap")}</span></div>}
                 {renderItem.type === "item"
-                  ? <TimelineBlock sessionId={sessionId} sessionName={sessionName} item={renderItem.item} planAnimated={sessionActive} retryRunId={retryRunId} locale={locale} reducedMotion={reducedMotion} t={t} onRetry={onRetry} onRecovery={onRecovery} recoveryContext={recoveryContext} onArtifactUrl={loadArtifactUrl} onArtifactDownload={onArtifactDownload} onWorkspaceRewind={onWorkspaceRewind} onOpenGeneratedFile={onOpenGeneratedFile} onOpenTurnReview={onOpenTurnReview} onReobserveReview={onReobserveReview} onAddMessageToComposer={onAddMessageToComposer} onForkMessage={onForkMessage} forkingMessageId={forkingMessageId} shareSelection={shareSelection} onStartShareSelection={onStartShareSelection} onToggleShareMessage={onToggleShareMessage} editingMessageId={editingMessageId} editableMessageId={editableMessageId} onEditMessage={(item) => setEditingMessageId(item.id)} onCancelEditMessage={() => setEditingMessageId(undefined)} onMoveEditedMessageToComposer={onMoveEditedMessageToComposer === undefined ? undefined : async (item, text) => { await onMoveEditedMessageToComposer(item, text); setEditingMessageId(undefined); }} onPreviewMessageRewind={onPreviewMessageRewind} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} showMessageActions={renderItem.item.kind !== "assistant" || (assistantMessageActions.has(renderItem.item.id) && !blockedAssistantForks.has(renderItem.item.id))} />
+                  ? <TimelineBlock sessionId={sessionId} sessionName={sessionName} item={renderItem.item} planAnimated={sessionActive} retryRunId={retryRunId} locale={locale} reducedMotion={reducedMotion} t={t} onRetry={onRetry} onRecovery={onRecovery} recoveryContext={recoveryContext} onArtifactUrl={loadArtifactUrl} onArtifactDownload={onArtifactDownload} onWorkspaceRewind={onWorkspaceRewind} onOpenGeneratedFile={onOpenGeneratedFile} onOpenTurnReview={onOpenTurnReview} onReobserveReview={onReobserveReview} onAddMessageToComposer={onAddMessageToComposer} onForkMessage={onForkMessage} forkingMessageId={forkingMessageId} shareSelection={shareSelection} onStartShareSelection={onStartShareSelection} onToggleShareMessage={onToggleShareMessage} editingMessageId={editingMessageId} editableMessageId={editableMessageId} onEditMessage={(item) => setEditingMessageId(item.id)} onCancelEditMessage={() => setEditingMessageId(undefined)} onMoveEditedMessageToComposer={onMoveEditedMessageToComposer === undefined ? undefined : async (item, text) => { await onMoveEditedMessageToComposer(item, text); setEditingMessageId(undefined); }} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} showMessageActions={renderItem.item.kind !== "assistant" || (assistantMessageActions.has(renderItem.item.id) && !blockedAssistantForks.has(renderItem.item.id))} />
                   : renderItem.type === "work"
                     ? <WorkGroupBlock sessionId={sessionId} sessionName={sessionName} work={renderItem} retryRunId={retryRunId} locale={locale} reducedMotion={reducedMotion} t={t} onRetry={onRetry} onRecovery={onRecovery} recoveryContext={recoveryContext} onArtifactUrl={loadArtifactUrl} onArtifactDownload={onArtifactDownload} onWorkspaceRewind={onWorkspaceRewind} />
                     : <SessionDerivationMarker origin={renderItem.origin} onOpen={onOpenDerivationOrigin} t={t} />}
@@ -769,6 +786,7 @@ export function Timeline({ sessionId, sessionName, items, sessionActive, derivat
     {openGallery !== undefined && galleryImages.length > 0 && <TimelineImageLightbox key={openGallery.imageId} images={galleryImages} startImageId={openGallery.imageId} returnFocus={openGallery.trigger} t={t} loadUrl={loadArtifactUrl} onDownload={onArtifactDownload} {...(onWorkspaceImageToComposer === undefined ? {} : { onSendToChat: onWorkspaceImageToComposer })} onClose={() => setOpenGallery(undefined)} />}
     </TimelinePersonalizationContext.Provider>
     </TimelineImageGalleryContext.Provider>
+    </AudioArtworkContext.Provider>
     </TimelineSubagentContext.Provider>
   );
 }
@@ -790,7 +808,7 @@ export function SessionDerivationMarker({ origin, onOpen, t }: {
   );
 }
 
-function WorkGroupBlock({ sessionId, sessionName, work, retryRunId, locale, reducedMotion, t, onRetry, onRecovery, recoveryContext, onArtifactUrl, onArtifactDownload, onWorkspaceRewind }: { readonly sessionId: string; readonly sessionName: string; readonly work: TimelineWorkRenderItem; readonly retryRunId?: string; readonly locale: string; readonly reducedMotion: boolean; readonly t: Translator; readonly onRetry?: (error: ErrorView) => void; readonly onRecovery?: (error: ErrorView, action: ErrorRecoveryActionView) => void; readonly recoveryContext?: RecoveryActionContext; readonly onArtifactUrl: (blobId: string) => Promise<string>; readonly onArtifactDownload: (blobId: string, fileName: string) => void; readonly onWorkspaceRewind?: (workspaceId: string, changeSetId: string) => void }): JSX.Element {
+function WorkGroupBlock({ sessionId, sessionName, work, retryRunId, locale, reducedMotion, t, onRetry, onRecovery, recoveryContext, onArtifactUrl, onArtifactDownload, onWorkspaceRewind }: { readonly sessionId: string; readonly sessionName: string; readonly work: TimelineWorkRenderItem; readonly retryRunId?: string; readonly locale: string; readonly reducedMotion: boolean; readonly t: Translator; readonly onRetry?: (error: ErrorView) => void; readonly onRecovery?: (error: ErrorView, action: ErrorRecoveryActionView) => void; readonly recoveryContext?: RecoveryActionContext; readonly onArtifactUrl: (blobId: string) => Promise<string>; readonly onArtifactDownload: OperationApi["downloadArtifact"]; readonly onWorkspaceRewind?: (workspaceId: string, changeSetId: string) => void }): JSX.Element {
   const expansionKey = `${sessionId}\u0000${work.key}`;
   const [expanded, setExpanded] = useState(() => workGroupExpansion.get(expansionKey) ?? false);
   const visibleChildren = expanded ? work.children : work.visibleChildren;
@@ -822,11 +840,11 @@ function WorkGroupBlock({ sessionId, sessionName, work, retryRunId, locale, redu
   );
 }
 
-function TimelineBlock({ sessionId, sessionName, item, planAnimated = false, retryRunId, locale, reducedMotion, t, onRetry, onRecovery, recoveryContext, onArtifactUrl, onArtifactDownload, onWorkspaceRewind, onOpenGeneratedFile, onOpenTurnReview, onReobserveReview, onAddMessageToComposer, onForkMessage, forkingMessageId, shareSelection, onStartShareSelection, onToggleShareMessage, editingMessageId, editableMessageId, onEditMessage, onCancelEditMessage, onMoveEditedMessageToComposer, onPreviewMessageRewind, onDeleteMessage, messageDeleteBlockedReason, showMessageActions = true }: { readonly sessionId: string; readonly sessionName: string; readonly item: TimelineItemView; readonly planAnimated?: boolean; readonly retryRunId?: string; readonly locale: string; readonly reducedMotion: boolean; readonly t: Translator; readonly onRetry?: (error: ErrorView) => void; readonly onRecovery?: (error: ErrorView, action: ErrorRecoveryActionView) => void; readonly recoveryContext?: RecoveryActionContext; readonly onArtifactUrl: (blobId: string) => Promise<string>; readonly onArtifactDownload: (blobId: string, fileName: string) => void; readonly onWorkspaceRewind?: (workspaceId: string, changeSetId: string) => void; readonly onOpenGeneratedFile?: (workspaceId: string, relativePath: string) => void; readonly onOpenTurnReview?: (changeSetId: string, relativePath?: string) => void; readonly onReobserveReview?: (reviewRunId: string) => Promise<void>; readonly onAddMessageToComposer?: (item: TimelineItemView) => void; readonly onForkMessage?: (item: TimelineItemView) => void; readonly forkingMessageId?: string; readonly shareSelection?: TimelineShareSelection; readonly onStartShareSelection?: (item: TimelineItemView) => void; readonly onToggleShareMessage?: (itemId: string, extendRange: boolean) => void; readonly editingMessageId?: string; readonly editableMessageId?: string; readonly onEditMessage?: (item: TimelineItemView) => void; readonly onCancelEditMessage?: () => void; readonly onMoveEditedMessageToComposer?: (item: TimelineItemView, text: string) => Promise<void>; readonly onPreviewMessageRewind?: (item: TimelineItemView) => void; readonly onDeleteMessage?: (item: TimelineItemView) => void; readonly messageDeleteBlockedReason?: string; readonly showMessageActions?: boolean }): JSX.Element {
+function TimelineBlock({ sessionId, sessionName, item, planAnimated = false, retryRunId, locale, reducedMotion, t, onRetry, onRecovery, recoveryContext, onArtifactUrl, onArtifactDownload, onWorkspaceRewind, onOpenGeneratedFile, onOpenTurnReview, onReobserveReview, onAddMessageToComposer, onForkMessage, forkingMessageId, shareSelection, onStartShareSelection, onToggleShareMessage, editingMessageId, editableMessageId, onEditMessage, onCancelEditMessage, onMoveEditedMessageToComposer, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason, showMessageActions = true }: { readonly sessionId: string; readonly sessionName: string; readonly item: TimelineItemView; readonly planAnimated?: boolean; readonly retryRunId?: string; readonly locale: string; readonly reducedMotion: boolean; readonly t: Translator; readonly onRetry?: (error: ErrorView) => void; readonly onRecovery?: (error: ErrorView, action: ErrorRecoveryActionView) => void; readonly recoveryContext?: RecoveryActionContext; readonly onArtifactUrl: (blobId: string) => Promise<string>; readonly onArtifactDownload: OperationApi["downloadArtifact"]; readonly onWorkspaceRewind?: (workspaceId: string, changeSetId: string) => void; readonly onOpenGeneratedFile?: (workspaceId: string, relativePath: string) => void; readonly onOpenTurnReview?: (changeSetId: string, relativePath?: string) => void; readonly onReobserveReview?: (reviewRunId: string) => Promise<void>; readonly onAddMessageToComposer?: (item: TimelineItemView) => void; readonly onForkMessage?: (item: TimelineItemView) => void; readonly forkingMessageId?: string; readonly shareSelection?: TimelineShareSelection; readonly onStartShareSelection?: (item: TimelineItemView) => void; readonly onToggleShareMessage?: (itemId: string, extendRange: boolean) => void; readonly editingMessageId?: string; readonly editableMessageId?: string; readonly onEditMessage?: (item: TimelineItemView) => void; readonly onCancelEditMessage?: () => void; readonly onMoveEditedMessageToComposer?: (item: TimelineItemView, text: string) => Promise<void>; readonly onPreviewMessageRewind?: (item: TimelineItemView) => void; readonly rewindToStartSupported?: boolean; readonly onDeleteMessage?: (item: TimelineItemView) => void; readonly messageDeleteBlockedReason?: string; readonly showMessageActions?: boolean }): JSX.Element {
   if (item.inlinePlan !== undefined) return <InlinePlanCard plan={item.inlinePlan} animated={planAnimated} t={t} />;
   switch (item.kind) {
-    case "user": return <MessageBlock sessionId={sessionId} sessionName={sessionName} item={item} role="user" locale={locale} reducedMotion={reducedMotion} t={t} onArtifactUrl={onArtifactUrl} onArtifactDownload={onArtifactDownload} onAddMessageToComposer={onAddMessageToComposer} onForkMessage={onForkMessage} forking={forkingMessageId === item.id} shareSelection={shareSelection} onStartShareSelection={onStartShareSelection} onToggleShareMessage={onToggleShareMessage} editing={editingMessageId === item.id} editable={editableMessageId === item.id} onEdit={onEditMessage} onCancelEdit={onCancelEditMessage} onMoveEditedMessageToComposer={onMoveEditedMessageToComposer} onPreviewMessageRewind={onPreviewMessageRewind} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} showActions={showMessageActions} />;
-    case "assistant": return <MessageBlock sessionId={sessionId} sessionName={sessionName} item={item} role="assistant" locale={locale} reducedMotion={reducedMotion} t={t} onArtifactUrl={onArtifactUrl} onArtifactDownload={onArtifactDownload} onAddMessageToComposer={onAddMessageToComposer} onForkMessage={onForkMessage} forking={forkingMessageId === item.id} shareSelection={shareSelection} onStartShareSelection={onStartShareSelection} onToggleShareMessage={onToggleShareMessage} editing={false} editable={false} onPreviewMessageRewind={onPreviewMessageRewind} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} showActions={showMessageActions} />;
+    case "user": return <MessageBlock sessionId={sessionId} sessionName={sessionName} item={item} role="user" locale={locale} reducedMotion={reducedMotion} t={t} onArtifactUrl={onArtifactUrl} onArtifactDownload={onArtifactDownload} onAddMessageToComposer={onAddMessageToComposer} onForkMessage={onForkMessage} forking={forkingMessageId === item.id} shareSelection={shareSelection} onStartShareSelection={onStartShareSelection} onToggleShareMessage={onToggleShareMessage} editing={editingMessageId === item.id} editable={editableMessageId === item.id} onEdit={onEditMessage} onCancelEdit={onCancelEditMessage} onMoveEditedMessageToComposer={onMoveEditedMessageToComposer} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} showActions={showMessageActions} />;
+    case "assistant": return <MessageBlock sessionId={sessionId} sessionName={sessionName} item={item} role="assistant" locale={locale} reducedMotion={reducedMotion} t={t} onArtifactUrl={onArtifactUrl} onArtifactDownload={onArtifactDownload} onAddMessageToComposer={onAddMessageToComposer} onForkMessage={onForkMessage} forking={forkingMessageId === item.id} shareSelection={shareSelection} onStartShareSelection={onStartShareSelection} onToggleShareMessage={onToggleShareMessage} editing={false} editable={false} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} showActions={showMessageActions} />;
     case "thinking": return <ThinkingBlock item={item} locale={locale} t={t} />;
     case "tool": return <ToolBlock item={item} locale={locale} t={t} onArtifactUrl={onArtifactUrl} onArtifactDownload={onArtifactDownload} />;
     case "toolResult": return <ToolBlock item={item} locale={locale} t={t} onArtifactUrl={onArtifactUrl} onArtifactDownload={onArtifactDownload} />;
@@ -972,14 +990,17 @@ export function AutomationOriginBadge({ automationOrigin, t }: {
   ><Timer aria-hidden="true" /><span>{label}</span></button>;
 }
 
-function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotion, t, onArtifactUrl, onArtifactDownload, onAddMessageToComposer, onForkMessage, forking, shareSelection, onStartShareSelection, onToggleShareMessage, editing, editable, onEdit, onCancelEdit, onMoveEditedMessageToComposer, onPreviewMessageRewind, onDeleteMessage, messageDeleteBlockedReason, showActions }: { readonly sessionId: string; readonly sessionName: string; readonly item: TimelineItemView; readonly role: "user" | "assistant"; readonly locale: string; readonly reducedMotion: boolean; readonly t: Translator; readonly onArtifactUrl: (blobId: string) => Promise<string>; readonly onArtifactDownload: (blobId: string, fileName: string) => void; readonly onAddMessageToComposer?: (item: TimelineItemView) => void; readonly onForkMessage?: (item: TimelineItemView) => void; readonly forking: boolean; readonly shareSelection?: TimelineShareSelection; readonly onStartShareSelection?: (item: TimelineItemView) => void; readonly onToggleShareMessage?: (itemId: string, extendRange: boolean) => void; readonly editing: boolean; readonly editable: boolean; readonly onEdit?: (item: TimelineItemView) => void; readonly onCancelEdit?: () => void; readonly onMoveEditedMessageToComposer?: (item: TimelineItemView, text: string) => Promise<void>; readonly onPreviewMessageRewind?: (item: TimelineItemView) => void; readonly onDeleteMessage?: (item: TimelineItemView) => void; readonly messageDeleteBlockedReason?: string; readonly showActions: boolean }): JSX.Element {
+function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotion, t, onArtifactUrl, onArtifactDownload, onAddMessageToComposer, onForkMessage, forking, shareSelection, onStartShareSelection, onToggleShareMessage, editing, editable, onEdit, onCancelEdit, onMoveEditedMessageToComposer, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason, showActions }: { readonly sessionId: string; readonly sessionName: string; readonly item: TimelineItemView; readonly role: "user" | "assistant"; readonly locale: string; readonly reducedMotion: boolean; readonly t: Translator; readonly onArtifactUrl: (blobId: string) => Promise<string>; readonly onArtifactDownload: OperationApi["downloadArtifact"]; readonly onAddMessageToComposer?: (item: TimelineItemView) => void; readonly onForkMessage?: (item: TimelineItemView) => void; readonly forking: boolean; readonly shareSelection?: TimelineShareSelection; readonly onStartShareSelection?: (item: TimelineItemView) => void; readonly onToggleShareMessage?: (itemId: string, extendRange: boolean) => void; readonly editing: boolean; readonly editable: boolean; readonly onEdit?: (item: TimelineItemView) => void; readonly onCancelEdit?: () => void; readonly onMoveEditedMessageToComposer?: (item: TimelineItemView, text: string) => Promise<void>; readonly onPreviewMessageRewind?: (item: TimelineItemView) => void; readonly rewindToStartSupported?: boolean; readonly onDeleteMessage?: (item: TimelineItemView) => void; readonly messageDeleteBlockedReason?: string; readonly showActions: boolean }): JSX.Element {
   const personalization = useContext(TimelinePersonalizationContext);
   const referenceActions = useMemo<TimelineReferenceActions>(() => ({
+    ownerKey: personalization.ownerKey,
     sessionId,
+    t,
     ...(personalization.onOpenHttpLink === undefined ? {} : { onOpenHttpLink: personalization.onOpenHttpLink }),
+    ...(personalization.onOpenWorkspaceHtml === undefined ? {} : { onOpenWorkspaceHtml: personalization.onOpenWorkspaceHtml }),
     ...(personalization.onLoadWorkspaceAsset === undefined ? {} : { onLoadWorkspaceAsset: personalization.onLoadWorkspaceAsset }),
     ...(personalization.onWorkspaceImageToComposer === undefined ? {} : { onWorkspaceImageToComposer: personalization.onWorkspaceImageToComposer })
-  }), [personalization.onLoadWorkspaceAsset, personalization.onOpenHttpLink, personalization.onWorkspaceImageToComposer, sessionId]);
+  }), [personalization.ownerKey, personalization.onLoadWorkspaceAsset, personalization.onOpenHttpLink, personalization.onOpenWorkspaceHtml, personalization.onWorkspaceImageToComposer, sessionId, t]);
   const text = item.text ?? "";
   const quotedUserMessage = role === "user"
     ? parseSelectionQuoteMessage(text, item.quotesEncoded === true)
@@ -1008,7 +1029,7 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
     pastedTextSegmentIndex += 1;
     return projected === undefined
       ? <SentMessageReferenceText text={segment.text} actions={referenceActions} key={`${item.id}:text:${index}`} />
-      : <SentPastedTextInline segment={projected} t={t} key={`${item.id}:text:${index}`} />;
+      : <SentPastedTextInline ownerKey={JSON.stringify([personalization.ownerKey, sessionId, item.id, item.sourceEventId, index])} segment={projected} t={t} key={`${item.id}:text:${index}`} />;
   });
   if (role === "user") {
     if (editing && onCancelEdit !== undefined && onMoveEditedMessageToComposer !== undefined) {
@@ -1027,7 +1048,7 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
               </CollapsibleUserMessageContent>
             </div>
           )}
-          {!selectionActive && showActions && <MessageActions sessionId={sessionId} sessionName={sessionName} item={item} text={actionText} align="right" locale={locale} t={t} onAddMessageToComposer={onAddMessageToComposer} onFork={onForkMessage} forking={forking} onStartShareSelection={onStartShareSelection} editable={editable} onEdit={onEdit} onPreviewMessageRewind={onPreviewMessageRewind} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} />}
+          {!selectionActive && showActions && <MessageActions ownerKey={personalization.ownerKey} sessionId={sessionId} sessionName={sessionName} item={item} text={actionText} align="right" locale={locale} t={t} onAddMessageToComposer={onAddMessageToComposer} onFork={onForkMessage} forking={forking} onStartShareSelection={onStartShareSelection} editable={editable} onEdit={onEdit} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} />}
         </div>
       </article>
     );
@@ -1035,7 +1056,7 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
   const assistantContent = <>
     <div className="markdown message-assistant__body"><StreamingMarkdown text={text} streaming={item.streaming === true} streamFadeKey={`${sessionId}:${item.id}`} t={t} />{item.streaming && <span className={cx("streaming-cursor", reducedMotion && "streaming-cursor--reduced-motion")} aria-label={t("timeline.streaming")} />}</div>
     {attachments}
-    {!selectionActive && !item.streaming && showActions && <MessageActions sessionId={sessionId} sessionName={sessionName} item={item} text={text} align="left" locale={locale} t={t} onAddMessageToComposer={onAddMessageToComposer} onFork={onForkMessage} forking={forking} onStartShareSelection={onStartShareSelection} editable={false} onPreviewMessageRewind={onPreviewMessageRewind} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} />}
+    {!selectionActive && !item.streaming && showActions && <MessageActions ownerKey={personalization.ownerKey} sessionId={sessionId} sessionName={sessionName} item={item} text={text} align="left" locale={locale} t={t} onAddMessageToComposer={onAddMessageToComposer} onFork={onForkMessage} forking={forking} onStartShareSelection={onStartShareSelection} editable={false} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} />}
   </>;
   return (
     <article className={cx("message-assistant", selectionActive && "is-share-selecting")} data-message-client-id={item.id} data-selection-quote-message-id={item.id} data-selection-quote-source-event-id={item.sourceEventId} data-selection-quote-role="assistant" aria-label={roleLabel}>
@@ -1049,51 +1070,137 @@ function MessageSelectionControl({ item, selected, roleLabel, t, onToggle }: { r
   return <button type="button" className={cx("message-share-choice", selected && "is-selected")} role="checkbox" aria-checked={selected} aria-label={t("timeline.shareSelectionToggle", { role: roleLabel })} onClick={(event) => onToggle(item.id, event.shiftKey)}><span aria-hidden="true">{selected && <Check />}</span></button>;
 }
 
-function MessageActions({ sessionId, sessionName, item, text, align, locale, t, onAddMessageToComposer, onFork, forking, onStartShareSelection, editable, onEdit, onPreviewMessageRewind, onDeleteMessage, messageDeleteBlockedReason }: { readonly sessionId: string; readonly sessionName: string; readonly item: TimelineItemView; readonly text: string; readonly align: "left" | "right"; readonly locale: string; readonly t: Translator; readonly onAddMessageToComposer?: (item: TimelineItemView) => void; readonly onFork?: (item: TimelineItemView) => void; readonly forking: boolean; readonly onStartShareSelection?: (item: TimelineItemView) => void; readonly editable: boolean; readonly onEdit?: (item: TimelineItemView) => void; readonly onPreviewMessageRewind?: (item: TimelineItemView) => void; readonly onDeleteMessage?: (item: TimelineItemView) => void; readonly messageDeleteBlockedReason?: string }): JSX.Element {
+export function MessageActions({ ownerKey, sessionId, sessionName, item, text, align, locale, t, onAddMessageToComposer, onFork, forking, onStartShareSelection, editable, onEdit, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason }: { readonly ownerKey: string; readonly sessionId: string; readonly sessionName: string; readonly item: TimelineItemView; readonly text: string; readonly align: "left" | "right"; readonly locale: string; readonly t: Translator; readonly onAddMessageToComposer?: (item: TimelineItemView) => void; readonly onFork?: (item: TimelineItemView) => void; readonly forking: boolean; readonly onStartShareSelection?: (item: TimelineItemView) => void; readonly editable: boolean; readonly onEdit?: (item: TimelineItemView) => void; readonly onPreviewMessageRewind?: (item: TimelineItemView) => void; readonly rewindToStartSupported?: boolean; readonly onDeleteMessage?: (item: TimelineItemView) => void; readonly messageDeleteBlockedReason?: string }): JSX.Element {
   const deepLink = sessionMessageDeepLink(sessionId, item.id, item.sourceEventId, window.location.href);
+  const actionsRef = useRef<HTMLDivElement>(null);
+  const ownerRef = useRef<{ readonly key: string; readonly document: Document; readonly release: () => void } | undefined>(undefined);
+  const shareRequestRef = useRef<AbortController | undefined>(undefined);
+  const copyRequestRef = useRef<object | undefined>(undefined);
+  const feedbackIntentRef = useRef<object | undefined>(undefined);
+  const translatorRef = useRef(t);
+  translatorRef.current = t;
   const forkable = onFork !== undefined && resolveMessageForkTarget(item) !== undefined;
   const [sharing, setSharing] = useState(false);
-  const [shareFeedback, setShareFeedback] = useState<{ readonly kind: "success" | "error"; readonly text: string }>();
-  const shareFeedbackTimerRef = useRef<number | undefined>(undefined);
-  useEffect(() => () => { if (shareFeedbackTimerRef.current !== undefined) window.clearTimeout(shareFeedbackTimerRef.current); }, []);
-  const reportShareFeedback = (kind: "success" | "error", value: string): void => {
-    if (shareFeedbackTimerRef.current !== undefined) window.clearTimeout(shareFeedbackTimerRef.current);
-    setShareFeedback({ kind, text: value });
-    shareFeedbackTimerRef.current = window.setTimeout(() => setShareFeedback(undefined), kind === "error" ? 5_000 : 2_400);
+  const [copying, setCopying] = useState<"text" | "link">();
+  const [shareFeedback, setShareFeedback] = useState<{ readonly kind: "success" | "error"; readonly text: string; readonly copy?: "text" | "link" }>();
+  const shareFeedbackTimerRef = useRef<{ readonly window: Window; readonly id: number } | undefined>(undefined);
+  const clearFeedbackTimer = (): void => {
+    const timer = shareFeedbackTimerRef.current;
+    if (timer !== undefined) timer.window.clearTimeout(timer.id);
+    shareFeedbackTimerRef.current = undefined;
+  };
+  const shareContent = {
+    sessionName,
+    role: align === "right" ? "user" as const : "assistant" as const,
+    roleLabel: align === "right" ? t("timeline.you") : t("timeline.agent"),
+    text,
+    attachmentNames: item.attachments?.map((attachment) => attachment.fileName || attachment.title),
+    attachmentsLabel: t("timeline.attachments"),
+    createdAtLabel: formatDateTime(item.createdAt, locale)
+  };
+  const actionOwnerKey = JSON.stringify([ownerKey, sessionId, item.id, item.sourceEventId, item.createdAt, shareContent]);
+  const retireActions = (): void => {
+    shareRequestRef.current?.abort();
+    shareRequestRef.current = undefined;
+    copyRequestRef.current = undefined;
+    feedbackIntentRef.current = undefined;
+    clearFeedbackTimer();
+    setCopying(undefined);
+    setSharing(false);
+    setShareFeedback(undefined);
+  };
+  useLayoutEffect(() => {
+    const document = actionsRef.current?.ownerDocument;
+    if (document === undefined) return;
+    const previous = ownerRef.current;
+    if (previous?.key === actionOwnerKey && previous.document === document) return;
+    previous?.release();
+    retireActions();
+    const ownerWindow = document.defaultView;
+    const onPageHide = (): void => { if (ownerRef.current === owner) retireActions(); };
+    const owner = { key: actionOwnerKey, document, release: () => ownerWindow?.removeEventListener("pagehide", onPageHide) };
+    ownerRef.current = owner;
+    ownerWindow?.addEventListener("pagehide", onPageHide);
+  });
+  useLayoutEffect(() => () => {
+    ownerRef.current?.release();
+    ownerRef.current = undefined;
+    retireActions();
+  }, []);
+  const reportShareFeedback = (intent: object, kind: "success" | "error", value: string, copy?: "text" | "link"): void => {
+    if (feedbackIntentRef.current !== intent) return;
+    clearFeedbackTimer();
+    setShareFeedback({ kind, text: value, ...(copy === undefined ? {} : { copy }) });
+    const ownerWindow = actionsRef.current?.ownerDocument.defaultView;
+    if (ownerWindow !== undefined && ownerWindow !== null) shareFeedbackTimerRef.current = {
+      window: ownerWindow,
+      id: ownerWindow.setTimeout(() => { shareFeedbackTimerRef.current = undefined; setShareFeedback(undefined); }, kind === "error" ? 5_000 : 2_400)
+    };
+  };
+  const copyMessage = async (kind: "text" | "link", trigger: HTMLElement): Promise<void> => {
+    const owner = ownerRef.current;
+    if (owner === undefined || copyRequestRef.current !== undefined) return;
+    const request = {};
+    copyRequestRef.current = request;
+    feedbackIntentRef.current = request;
+    setCopying(kind);
+    clearFeedbackTimer();
+    setShareFeedback(undefined);
+    const current = (): boolean => ownerRef.current === owner && copyRequestRef.current === request && actionsRef.current?.isConnected === true;
+    try {
+      const ownerWindow = trigger.ownerDocument.defaultView;
+      if (ownerWindow?.navigator.clipboard?.writeText === undefined) throw new Error("Clipboard unavailable.");
+      const value = kind === "text" ? text : deepLink;
+      await ownerWindow.navigator.clipboard.writeText(value);
+      if (current()) reportShareFeedback(request, "success", translatorRef.current(kind === "text" ? "timeline.blockCopied" : "timeline.linkCopied"), kind);
+    } catch {
+      if (current()) reportShareFeedback(request, "error", translatorRef.current(kind === "text" ? "timeline.blockCopyFailed" : "timeline.linkCopyFailed"));
+    } finally {
+      if (current()) { copyRequestRef.current = undefined; setCopying(undefined); }
+    }
   };
   const shareable = text.trim().length > 0 || (item.attachments?.length ?? 0) > 0;
-  const shareMessage = async (): Promise<void> => {
-    if (!shareable || sharing) return;
+  const shareMessage = async (trigger: HTMLElement): Promise<void> => {
+    if (!shareable || shareRequestRef.current !== undefined) return;
+    const owner = ownerRef.current;
+    if (owner === undefined || owner.document !== trigger.ownerDocument) return;
+    const request = new AbortController();
+    const action: BrowserActionContext = { ownerDocument: trigger.ownerDocument, signal: request.signal };
+    shareRequestRef.current = request;
+    const current = (): boolean => ownerRef.current === owner && shareRequestRef.current === request && !request.signal.aborted
+      && actionsRef.current?.isConnected === true && actionsRef.current.ownerDocument === action.ownerDocument
+      && action.ownerDocument.defaultView?.document === action.ownerDocument && !action.ownerDocument.defaultView.closed;
+    const intent = {};
+    feedbackIntentRef.current = intent;
+    clearFeedbackTimer();
     setSharing(true);
     setShareFeedback(undefined);
     try {
-      const blob = await buildShareMessageImagePng({
-        sessionName,
-        role: align === "right" ? "user" : "assistant",
-        roleLabel: align === "right" ? t("timeline.you") : t("timeline.agent"),
-        text,
-        attachmentNames: item.attachments?.map((attachment) => attachment.fileName || attachment.title),
-        attachmentsLabel: t("timeline.attachments"),
-        createdAtLabel: formatDateTime(item.createdAt, locale)
-      });
-      const delivery = await deliverShareMessageImage(blob, shareMessageImageFilename(sessionName, item.createdAt), sessionName);
-      if (delivery === "shared") reportShareFeedback("success", t("timeline.shareShared"));
-      if (delivery === "downloaded") reportShareFeedback("success", t("timeline.shareDownloaded"));
+      assertBrowserActionCurrent(action);
+      const blob = await buildShareMessageImagePng(shareContent, action);
+      if (!current()) return;
+      assertBrowserActionCurrent(action);
+      const delivery = await deliverShareMessageImage(blob, shareMessageImageFilename(sessionName, item.createdAt), sessionName, action);
+      if (!current()) return;
+      if (delivery === "shared") reportShareFeedback(intent, "success", t("timeline.shareShared"));
+      if (delivery === "dispatched") reportShareFeedback(intent, "success", t("timeline.shareDownloaded"));
     } catch (error) {
-      reportShareFeedback("error", error instanceof ShareMessageImageTooLargeError
+      if (!current()) return;
+      reportShareFeedback(intent, "error", error instanceof ShareMessageImageTooLargeError
         ? t("timeline.shareTooLarge")
         : error instanceof ShareMessageImageEmptyError
           ? t("timeline.shareEmpty")
           : t("timeline.shareFailed"));
     } finally {
-      setSharing(false);
+      if (shareRequestRef.current === request) { shareRequestRef.current = undefined; setSharing(false); }
     }
   };
   const time = <time key="time" dateTime={new Date(item.createdAt).toISOString()}>{formatDateTime(item.createdAt, locale)}</time>;
   const usage = align === "left" ? <MessageUsageMeta key="usage" usage={item.usage} t={t} /> : null;
-  const copy = <CopyButton key="copy" text={text} label={t("timeline.copy")} />;
+  const copied = shareFeedback?.kind === "success" && shareFeedback.copy === "text";
+  const copy = <IconButton key="copy" className="copy-button" disabled={copying !== undefined} aria-busy={copying === "text"} label={copied ? t("timeline.blockCopied") : t("timeline.copy")} onClick={(event) => { void copyMessage("text", event.currentTarget); }}>{copying === "text" ? <Spinner label={t("common.loading")} /> : copied ? <Check aria-hidden="true" /> : <Clipboard aria-hidden="true" />}</IconButton>;
   const share = shareable
-    ? <IconButton key="share" className="copy-button" disabled={sharing} disabledReason={sharing ? t("timeline.shareGenerating") : undefined} label={sharing ? t("timeline.shareGenerating") : t("timeline.shareAsImage")} onClick={() => { void shareMessage(); }}>{sharing ? <Spinner label={t("timeline.shareGenerating")} /> : <Share aria-hidden="true" />}</IconButton>
+    ? <IconButton key="share" className="copy-button" disabled={sharing} disabledReason={sharing ? t("timeline.shareGenerating") : undefined} label={sharing ? t("timeline.shareGenerating") : t("timeline.shareAsImage")} onClick={(event) => { void shareMessage(event.currentTarget); }}>{sharing ? <Spinner label={t("timeline.shareGenerating")} /> : <Share aria-hidden="true" />}</IconButton>
     : null;
   const fork = forkable
     ? <IconButton key="fork" className="copy-button" disabled={forking} disabledReason={forking ? t("timeline.forkFromHere") : undefined} label={t("timeline.forkFromHere")} onClick={() => onFork?.(item)}>{forking ? <Spinner label={t("timeline.forkFromHere")} /> : <GitFork aria-hidden="true" />}</IconButton>
@@ -1101,13 +1208,13 @@ function MessageActions({ sessionId, sessionName, item, text, align, locale, t, 
   const edit = editable && onEdit !== undefined
     ? <IconButton key="edit" className="copy-button" label={t("timeline.editMessage")} onClick={() => onEdit(item)}><Pencil aria-hidden="true" /></IconButton>
     : null;
-  const more = <MessageMoreMenu key="more" item={item} deepLink={deepLink} align={align} t={t} onAddMessageToComposer={onAddMessageToComposer} onStartShareSelection={onStartShareSelection} onPreviewMessageRewind={onPreviewMessageRewind} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} />;
-  return <div className={cx("message-actions", `message-actions--${align}`, shareFeedback !== undefined && "has-feedback")}>{align === "left" ? <>{copy}{share}{fork}{more}{time}{usage}</> : <>{time}{copy}{share}{edit}{fork}{more}</>}{shareFeedback !== undefined && <span className={cx("message-share-feedback", shareFeedback.kind === "error" && "is-error")} role={shareFeedback.kind === "error" ? "alert" : "status"}>{shareFeedback.text}</span>}</div>;
+  const more = <MessageMoreMenu key="more" item={item} copying={copying !== undefined} onCopyLink={(trigger) => { void copyMessage("link", trigger); }} align={align} t={t} onAddMessageToComposer={onAddMessageToComposer} onStartShareSelection={onStartShareSelection} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} />;
+  return <div ref={actionsRef} className={cx("message-actions", `message-actions--${align}`, shareFeedback !== undefined && "has-feedback")}>{align === "left" ? <>{copy}{share}{fork}{more}{time}{usage}</> : <>{time}{copy}{share}{edit}{fork}{more}</>}{shareFeedback !== undefined && <span className={cx("message-share-feedback", shareFeedback.kind === "error" && "is-error")} role={shareFeedback.kind === "error" ? "alert" : "status"}>{shareFeedback.text}</span>}</div>;
 }
 
-function MessageMoreMenu({ item, deepLink, align, t, onAddMessageToComposer, onStartShareSelection, onPreviewMessageRewind, onDeleteMessage, messageDeleteBlockedReason }: { readonly item: TimelineItemView; readonly deepLink: string; readonly align: "left" | "right"; readonly t: Translator; readonly onAddMessageToComposer?: (item: TimelineItemView) => void; readonly onStartShareSelection?: (item: TimelineItemView) => void; readonly onPreviewMessageRewind?: (item: TimelineItemView) => void; readonly onDeleteMessage?: (item: TimelineItemView) => void; readonly messageDeleteBlockedReason?: string }): JSX.Element {
+function MessageMoreMenu({ item, copying, onCopyLink, align, t, onAddMessageToComposer, onStartShareSelection, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason }: { readonly item: TimelineItemView; readonly copying: boolean; readonly onCopyLink: (trigger: HTMLElement) => void; readonly align: "left" | "right"; readonly t: Translator; readonly onAddMessageToComposer?: (item: TimelineItemView) => void; readonly onStartShareSelection?: (item: TimelineItemView) => void; readonly onPreviewMessageRewind?: (item: TimelineItemView) => void; readonly rewindToStartSupported?: boolean; readonly onDeleteMessage?: (item: TimelineItemView) => void; readonly messageDeleteBlockedReason?: string }): JSX.Element {
   const detailsRef = useRef<HTMLDetailsElement>(null);
-  const rewindable = onPreviewMessageRewind !== undefined && messageDialogueRewindTarget(item) !== undefined;
+  const rewindable = onPreviewMessageRewind !== undefined && messageDialogueRewindTarget(item, rewindToStartSupported) !== undefined;
   const deletable = onDeleteMessage !== undefined && resolveMessageDeleteTarget(item) !== undefined;
   const close = (): void => { detailsRef.current?.removeAttribute("open"); };
   return (
@@ -1126,7 +1233,7 @@ function MessageMoreMenu({ item, deepLink, align, t, onAddMessageToComposer, onS
       <div className={cx("message-action-menu__popover", align === "right" && "message-action-menu__popover--right")} role="menu">
         {onAddMessageToComposer !== undefined && <button type="button" role="menuitem" onClick={() => { onAddMessageToComposer(item); close(); }}><MessageSquarePlus aria-hidden="true" />{t("timeline.addToChat")}</button>}
         {onStartShareSelection !== undefined && <button type="button" role="menuitem" onClick={() => { onStartShareSelection(item); close(); }}><Images aria-hidden="true" />{t("timeline.shareSelectionEntry")}</button>}
-        <button type="button" role="menuitem" onClick={() => { void navigator.clipboard.writeText(deepLink); close(); }}><Link2 aria-hidden="true" />{t("timeline.copyLink")}</button>
+        <button type="button" role="menuitem" disabled={copying} onClick={(event) => { onCopyLink(event.currentTarget); close(); detailsRef.current?.querySelector<HTMLElement>("summary")?.focus(); }}><Link2 aria-hidden="true" />{t("timeline.copyLink")}</button>
         {rewindable && <button type="button" role="menuitem" onClick={() => { onPreviewMessageRewind(item); close(); }}><RotateCcw aria-hidden="true" />{t("timeline.rewindMessage")}</button>}
         {deletable && <><span className="message-action-menu__separator" role="separator" />{messageDeleteBlockedReason === undefined
           ? <button type="button" role="menuitem" className="danger-text" aria-label={t("timeline.deleteMessage")} onClick={() => { onDeleteMessage?.(item); close(); }}><Trash2 aria-hidden="true" />{t("timeline.deleteMessage")}</button>
@@ -1136,15 +1243,18 @@ function MessageMoreMenu({ item, deepLink, align, t, onAddMessageToComposer, onS
   );
 }
 
-export function MessageAttachment({ artifact, galleryId, t, onArtifactUrl, onArtifactDownload }: { readonly artifact: NonNullable<TimelineItemView["attachments"]>[number]; readonly galleryId?: string; readonly t: Translator; readonly onArtifactUrl: (blobId: string) => Promise<string>; readonly onArtifactDownload: (blobId: string, fileName: string) => void }): JSX.Element {
+export function MessageAttachment({ artifact, galleryId, t, onArtifactUrl, onArtifactDownload }: { readonly artifact: NonNullable<TimelineItemView["attachments"]>[number]; readonly galleryId?: string; readonly t: Translator; readonly onArtifactUrl: (blobId: string) => Promise<string>; readonly onArtifactDownload: OperationApi["downloadArtifact"] }): JSX.Element {
   const gallery = useContext(TimelineImageGalleryContext);
-  const { sessionId } = useContext(TimelinePersonalizationContext);
+  const { ownerKey } = useContext(TimelinePersonalizationContext);
   const [textPreviewTrigger, setTextPreviewTrigger] = useState<HTMLElement>();
   const mediaKind = timelineArtifactMediaKind(artifact.mediaType);
-  const [image, markImageFailed] = useArtifactImageUrl(artifact.blobId, mediaKind === undefined && artifact.kind === "image", onArtifactUrl);
+  const modelKind = timelineArtifactModelKind(artifact);
+  const [image, markImageFailed] = useArtifactImageUrl(artifact.blobId, modelKind === undefined && mediaKind === undefined && artifact.kind === "image", onArtifactUrl);
   const textPreviewSupported = timelineArtifactSupportsTextPreview(artifact);
-  const imagePreview = mediaKind !== undefined
-    ? <TimelineArtifactMedia artifact={artifact} playbackOwnerKey={sessionId} loadUrl={onArtifactUrl} t={t} className="message-attachment__media" />
+  const imagePreview = modelKind !== undefined
+    ? <TimelineArtifactModel artifact={artifact} ownerKey={ownerKey} loadUrl={onArtifactUrl} onDownload={onArtifactDownload} t={t} className="message-attachment__preview message-attachment__preview--text" />
+    : mediaKind !== undefined
+    ? <TimelineArtifactMedia artifact={artifact} playbackOwnerKey={ownerKey} loadUrl={onArtifactUrl} t={t} className="message-attachment__media" />
     : artifact.kind !== "image"
     ? textPreviewSupported
       ? <IconButton className="message-attachment__preview message-attachment__preview--text" label={`${t("workspace.preview")}: ${artifact.fileName}`} tip={t("workspace.preview")} onClick={(event) => setTextPreviewTrigger(event.currentTarget)}><FileText aria-hidden="true" /></IconButton>
@@ -1153,8 +1263,9 @@ export function MessageAttachment({ artifact, galleryId, t, onArtifactUrl, onArt
       ? <button className="message-attachment__preview" type="button" data-gallery-image-id={galleryId} aria-label={t("timeline.openImage", { name: artifact.title })} onClick={(event) => gallery.open(galleryId, event.currentTarget)}><img src={image.url} alt={artifact.title} loading="lazy" onError={markImageFailed} /></button>
       : <span className={cx("message-attachment__icon", image.status === "error" && "image-preview--failed")} aria-hidden="true">{image.status === "error" ? <ImageOff /> : <ImageIcon />}</span>;
   return <>
-    <article className={cx("message-attachment", mediaKind !== undefined && "message-attachment--media")}>{imagePreview}<span className="message-attachment__copy"><strong>{artifact.title}</strong><small>{artifact.fileName} · {formatBytes(artifact.byteSize)}</small>{mediaKind === undefined && image.status === "error" && <small className="image-preview__failure-label">{t("timeline.imageUnavailable")}</small>}</span><IconButton label={t("timeline.downloadArtifact", { name: artifact.fileName })} onClick={() => onArtifactDownload(artifact.blobId, artifact.fileName)}><Download aria-hidden="true" /></IconButton></article>
+    <article className={cx("message-attachment", mediaKind !== undefined && "message-attachment--media")}>{imagePreview}<span className="message-attachment__copy"><strong>{artifact.title}</strong><small>{artifact.fileName} · {formatBytes(artifact.byteSize)}</small>{mediaKind === undefined && image.status === "error" && <small className="image-preview__failure-label">{t("timeline.imageUnavailable")}</small>}</span><ArtifactDownloadButton iconOnly ownerKey={JSON.stringify([ownerKey, artifact.blobId, artifact.fileName])} connectionOwner={onArtifactUrl} label={t("timeline.downloadArtifact", { name: artifact.fileName })} errorLabel={t("workspace.downloadUnavailable")} action={(context) => onArtifactDownload(artifact.blobId, artifact.fileName, context)} /></article>
     {textPreviewTrigger !== undefined && <TimelineTextAttachmentLightbox
+      ownerKey={JSON.stringify([ownerKey, artifact.id])}
       artifact={artifact}
       labels={{
         preview: t("workspace.preview"),
@@ -1202,7 +1313,7 @@ function ThinkingBlock({ item, locale, t }: { readonly item: TimelineItemView; r
   return (
     <details className="thinking-block" open={item.streaming || !item.collapsed}>
       <summary><Brain aria-hidden="true" /><strong>{item.title ?? t("timeline.thinking")}</strong>{item.streaming && <span className="thinking-pulse" />}<time>{formatDateTime(item.createdAt, locale)}</time><ChevronDown className="details-chevron" aria-hidden="true" /></summary>
-      <div className="thinking-block__content"><StreamingMarkdown text={item.text ?? ""} streaming={item.streaming === true} t={t} /></div>
+      <div className="thinking-block__content markdown"><StreamingMarkdown text={item.text ?? ""} streaming={item.streaming === true} t={t} /></div>
     </details>
   );
 }
@@ -1240,86 +1351,26 @@ const ParsedMarkdown = memo(function ParsedMarkdown({ text, t, wordFade, onWordF
 }): JSX.Element {
   const personalization = useContext(TimelinePersonalizationContext);
   const referenceActions = useMemo<TimelineReferenceActions>(() => ({
+    ownerKey: personalization.ownerKey,
     sessionId: personalization.sessionId,
+    t,
     ...(personalization.onOpenHttpLink === undefined ? {} : { onOpenHttpLink: personalization.onOpenHttpLink }),
+    ...(personalization.onOpenWorkspaceHtml === undefined ? {} : { onOpenWorkspaceHtml: personalization.onOpenWorkspaceHtml }),
     ...(personalization.onLoadWorkspaceAsset === undefined ? {} : { onLoadWorkspaceAsset: personalization.onLoadWorkspaceAsset }),
     ...(personalization.onWorkspaceImageToComposer === undefined ? {} : { onWorkspaceImageToComposer: personalization.onWorkspaceImageToComposer })
-  }), [personalization.onLoadWorkspaceAsset, personalization.onOpenHttpLink, personalization.onWorkspaceImageToComposer, personalization.sessionId]);
-  const [linkMenu, setLinkMenu] = useState<{ readonly url: string; readonly x: number; readonly y: number }>();
-  const [linkFeedback, setLinkFeedback] = useState<string>();
-  const linkMenuRef = useRef<HTMLDivElement>(null);
-  const linkFeedbackTimerRef = useRef<number | undefined>(undefined);
-  const openLinkMenu = useCallback((url: string, x: number, y: number): void => {
-    setLinkMenu({
-      url,
-      x: Math.max(8, Math.min(x, window.innerWidth - 224)),
-      y: Math.max(8, Math.min(y, window.innerHeight - 132))
-    });
-  }, []);
-  useEffect(() => {
-    if (linkMenu === undefined) return;
-    linkMenuRef.current?.querySelector<HTMLButtonElement>('button[role="menuitem"]')?.focus();
-    const close = (event: PointerEvent): void => {
-      if (!linkMenuRef.current?.contains(event.target as Node)) setLinkMenu(undefined);
-    };
-    const key = (event: KeyboardEvent): void => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        setLinkMenu(undefined);
-      }
-    };
-    const dismiss = (): void => setLinkMenu(undefined);
-    document.addEventListener("pointerdown", close, true);
-    document.addEventListener("keydown", key, true);
-    window.addEventListener("resize", dismiss);
-    window.addEventListener("scroll", dismiss, true);
-    return () => {
-      document.removeEventListener("pointerdown", close, true);
-      document.removeEventListener("keydown", key, true);
-      window.removeEventListener("resize", dismiss);
-      window.removeEventListener("scroll", dismiss, true);
-    };
-  }, [linkMenu]);
-  useEffect(() => () => {
-    if (linkFeedbackTimerRef.current !== undefined) window.clearTimeout(linkFeedbackTimerRef.current);
-  }, []);
-  const reportLinkFeedback = (message: string): void => {
-    if (linkFeedbackTimerRef.current !== undefined) window.clearTimeout(linkFeedbackTimerRef.current);
-    setLinkFeedback(message);
-    linkFeedbackTimerRef.current = window.setTimeout(() => setLinkFeedback(undefined), 1_400);
-  };
+  }), [personalization.ownerKey, personalization.onLoadWorkspaceAsset, personalization.onOpenHttpLink, personalization.onOpenWorkspaceHtml, personalization.onWorkspaceImageToComposer, personalization.sessionId, t]);
   const components = useMemo(
-    () => safeMarkdownComponents(t, referenceActions, onWordFadeSettled, openLinkMenu),
-    [onWordFadeSettled, openLinkMenu, referenceActions, t]
+    () => safeMarkdownComponents(t, referenceActions, onWordFadeSettled),
+    [onWordFadeSettled, referenceActions, t]
   );
   const normalized = useMemo(() => normalizeTimelineMathDelimiters(text), [text]);
   const rehypePlugins = useMemo(() => wordFade === undefined
     ? TIMELINE_REHYPE_PLUGINS
     : [...TIMELINE_REHYPE_PLUGINS, [rehypeTimelineStreamFade, wordFade]] as NonNullable<ComponentProps<typeof ReactMarkdown>["rehypePlugins"]>, [wordFade]);
-  return <>
-    <ReactMarkdown remarkPlugins={TIMELINE_REMARK_PLUGINS} rehypePlugins={rehypePlugins} components={components} skipHtml>{normalized}</ReactMarkdown>
-    {linkMenu !== undefined && createPortal(<div
-      ref={linkMenuRef}
-      className="timeline-link-menu"
-      role="menu"
-      aria-label={t("timeline.linkOpenMenu")}
-      style={{ left: linkMenu.x, top: linkMenu.y }}
-      onContextMenu={(event) => event.preventDefault()}
-    >
-      <button type="button" role="menuitem" onClick={() => { referenceActions.onOpenHttpLink?.(linkMenu.url, { forceSidebar: true }); setLinkMenu(undefined); }}><PanelRight aria-hidden="true" />{t("timeline.openInSidebarBrowser")}</button>
-      <button type="button" role="menuitem" onClick={() => { referenceActions.onOpenHttpLink?.(linkMenu.url, { forceExternal: true }); setLinkMenu(undefined); }}><Globe2 aria-hidden="true" />{t("timeline.openInDefaultBrowser")}</button>
-      <span role="separator" />
-      <button type="button" role="menuitem" onClick={() => {
-        const url = linkMenu.url;
-        setLinkMenu(undefined);
-        void navigator.clipboard.writeText(url).then(
-          () => reportLinkFeedback(t("timeline.linkCopied")),
-          () => reportLinkFeedback(t("timeline.linkCopyFailed"))
-        );
-      }}><Link2 aria-hidden="true" />{t("timeline.copyUrl")}</button>
-    </div>, document.body)}
-    {linkFeedback !== undefined && createPortal(<div className="timeline-link-feedback" role="status" aria-live="polite">{linkFeedback}</div>, document.body)}
-  </>;
+  return <TimelineLinkSourceContext.Provider value={text}>
+    <TimelineMarkdownDocument remarkPlugins={TIMELINE_REMARK_PLUGINS} rehypePlugins={rehypePlugins} components={components} skipHtml>{normalized}</TimelineMarkdownDocument>
+
+  </TimelineLinkSourceContext.Provider>;
 });
 
 function useStreamingMarkdownText(value: string, streaming: boolean, intervalMs = 100): string {
@@ -1372,7 +1423,8 @@ function usePrefersReducedMotion(): boolean {
   return reduced;
 }
 
-function ToolBlock({ item, locale, t, onArtifactUrl, onArtifactDownload }: { readonly item: TimelineItemView; readonly locale: string; readonly t: Translator; readonly onArtifactUrl: (blobId: string) => Promise<string>; readonly onArtifactDownload: (blobId: string, fileName: string) => void }): JSX.Element {
+function ToolBlock({ item, locale, t, onArtifactUrl, onArtifactDownload }: { readonly item: TimelineItemView; readonly locale: string; readonly t: Translator; readonly onArtifactUrl: (blobId: string) => Promise<string>; readonly onArtifactDownload: OperationApi["downloadArtifact"] }): JSX.Element {
+  const { ownerKey } = useContext(TimelinePersonalizationContext);
   const [payloadPreview, setPayloadPreview] = useState<{ readonly sectionId: ToolPayloadSection["id"]; readonly trigger: HTMLButtonElement }>();
   const tool = item.tool;
   if (tool === undefined) return <NoticeBlock item={item} icon={<Wrench />} title={item.title ?? t("timeline.tool")} locale={locale} />;
@@ -1395,35 +1447,38 @@ function ToolBlock({ item, locale, t, onArtifactUrl, onArtifactDownload }: { rea
         {tool.output !== undefined && <section><div className="tool-block__payload-heading"><h4>{t("common.output")}</h4><ToolPayloadOpenButton label={`${t("timeline.toolPayloadOpen")} · ${t("common.output")}`} onClick={(trigger) => setPayloadPreview({ sectionId: "output", trigger })} /></div><WindowedText text={tool.output} label={`${tool.name} ${t("common.output")}`} /></section>}
         {(item.attachments?.length ?? 0) > 0 && <div className="message-attachments" aria-label={t("timeline.attachments")}>{item.attachments?.map((attachment, index) => <MessageAttachment artifact={attachment} galleryId={timelineMessageAttachmentGalleryId(item.id, attachment.id, index)} t={t} onArtifactUrl={onArtifactUrl} onArtifactDownload={onArtifactDownload} key={`${attachment.id}:${index}`} />)}</div>}
       </div>
-      {payloadPreview !== undefined && <ToolPayloadLightbox title={tool.name} sections={payloadSections} initialSectionId={payloadPreview.sectionId} returnFocus={payloadPreview.trigger} labels={{ close: t("common.close"), copy: t("timeline.toolPayloadCopy"), copied: t("timeline.toolPayloadCopied"), copyFailed: t("timeline.toolPayloadCopyFailed"), selectAll: t("timeline.toolPayloadSelectAll"), allFiles: t("timeline.toolPayloadAllFiles"), chooseFile: t("timeline.toolPayloadChooseFile") }} onClose={() => setPayloadPreview(undefined)} />}
+      {payloadPreview !== undefined && <ToolPayloadLightbox ownerKey={JSON.stringify([ownerKey, item.id, item.sourceEventId])} title={tool.name} sections={payloadSections} initialSectionId={payloadPreview.sectionId} returnFocus={payloadPreview.trigger} labels={{ close: t("common.close"), copy: t("timeline.toolPayloadCopy"), copyTitle: t("timeline.toolPayloadCopyTitle"), copied: t("timeline.toolPayloadCopied"), copyFailed: t("timeline.toolPayloadCopyFailed"), selectAll: t("timeline.toolPayloadSelectAll"), allFiles: t("timeline.toolPayloadAllFiles"), chooseFile: t("timeline.toolPayloadChooseFile") }} onClose={() => setPayloadPreview(undefined)} />}
     </details>
   );
 }
 
-export function ArtifactBlock({ item, icon, locale, t, onArtifactUrl, onArtifactDownload }: { readonly item: TimelineItemView; readonly icon: JSX.Element; readonly locale: string; readonly t: Translator; readonly onArtifactUrl: (blobId: string) => Promise<string>; readonly onArtifactDownload: (blobId: string, fileName: string) => void }): JSX.Element {
+export function ArtifactBlock({ item, icon, locale, t, onArtifactUrl, onArtifactDownload }: { readonly item: TimelineItemView; readonly icon: JSX.Element; readonly locale: string; readonly t: Translator; readonly onArtifactUrl: (blobId: string) => Promise<string>; readonly onArtifactDownload: OperationApi["downloadArtifact"] }): JSX.Element {
   const artifact = item.artifact;
   const gallery = useContext(TimelineImageGalleryContext);
-  const { sessionId } = useContext(TimelinePersonalizationContext);
+  const { ownerKey } = useContext(TimelinePersonalizationContext);
   const mediaKind = artifact === undefined ? undefined : timelineArtifactMediaKind(artifact.mediaType);
-  const [image, markImageFailed] = useArtifactImageUrl(artifact?.blobId ?? "", mediaKind === undefined && item.kind === "image" && artifact !== undefined, onArtifactUrl);
+  const modelKind = artifact === undefined ? undefined : timelineArtifactModelKind(artifact);
+  const [image, markImageFailed] = useArtifactImageUrl(artifact?.blobId ?? "", modelKind === undefined && mediaKind === undefined && item.kind === "image" && artifact !== undefined, onArtifactUrl);
   const galleryId = artifact === undefined ? undefined : timelineArtifactGalleryId(item.id, artifact.id);
   return (
     <article className="artifact-block">
-      {mediaKind !== undefined && artifact !== undefined && <TimelineArtifactMedia artifact={artifact} playbackOwnerKey={sessionId} loadUrl={onArtifactUrl} t={t} className="artifact-block__media" />}
-      {mediaKind === undefined && item.kind === "image" && artifact !== undefined && (image.status === "ready" && gallery !== undefined && galleryId !== undefined
+      {modelKind === undefined && mediaKind !== undefined && artifact !== undefined && <TimelineArtifactMedia artifact={artifact} playbackOwnerKey={ownerKey} loadUrl={onArtifactUrl} t={t} className="artifact-block__media" />}
+      {modelKind === undefined && mediaKind === undefined && item.kind === "image" && artifact !== undefined && (image.status === "ready" && gallery !== undefined && galleryId !== undefined
         ? <button className="artifact-block__image" type="button" data-gallery-image-id={galleryId} aria-label={t("timeline.openImage", { name: artifact.title })} onClick={(event) => gallery.open(galleryId, event.currentTarget)}><img src={image.url} alt={artifact.title ?? item.title ?? t("timeline.image")} loading="lazy" onError={markImageFailed} /></button>
         : <div className={cx("artifact-block__image-placeholder", image.status === "error" && "image-preview--failed")} role={image.status === "error" ? "status" : undefined}>{image.status === "error" ? <><ImageOff aria-hidden="true" /><span>{t("timeline.imageUnavailable")}</span></> : <Spinner label={t("common.loading")} />}</div>)}
       <div className="artifact-block__row">
         <span className="artifact-block__icon" aria-hidden="true">{icon}</span>
         <div><strong>{artifact?.title ?? item.title ?? t("timeline.artifact")}</strong><span>{artifact === undefined ? item.text : `${artifact.fileName} · ${formatBytes(artifact.byteSize)}`}</span></div>
         <time>{formatDateTime(item.createdAt, locale)}</time>
-        {artifact !== undefined && <IconButton label={t("timeline.downloadArtifact", { name: artifact.fileName })} onClick={() => onArtifactDownload(artifact.blobId, artifact.fileName)}><Download aria-hidden="true" /></IconButton>}
+        {modelKind !== undefined && artifact !== undefined && <TimelineArtifactModel artifact={artifact} ownerKey={ownerKey} loadUrl={onArtifactUrl} onDownload={onArtifactDownload} t={t} />}
+        {artifact !== undefined && <ArtifactDownloadButton iconOnly ownerKey={JSON.stringify([ownerKey, artifact.blobId, artifact.fileName])} connectionOwner={onArtifactUrl} label={t("timeline.downloadArtifact", { name: artifact.fileName })} errorLabel={t("workspace.downloadUnavailable")} action={(context) => onArtifactDownload(artifact.blobId, artifact.fileName, context)} />}
       </div>
     </article>
   );
 }
 
-function TimelineImageLightbox({ images, startImageId, returnFocus, t, loadUrl, onDownload, onSendToChat, onClose }: { readonly images: readonly TimelineGalleryImage[]; readonly startImageId: string; readonly returnFocus: HTMLElement; readonly t: Translator; readonly loadUrl: (blobId: string) => Promise<string>; readonly onDownload: (blobId: string, fileName: string) => void; readonly onSendToChat?: (file: File) => void | Promise<void>; readonly onClose: () => void }): JSX.Element {
+function TimelineImageLightbox({ images, startImageId, returnFocus, t, loadUrl, onDownload, onSendToChat, onClose }: { readonly images: readonly TimelineGalleryImage[]; readonly startImageId: string; readonly returnFocus: HTMLElement; readonly t: Translator; readonly loadUrl: (blobId: string) => Promise<string>; readonly onDownload: OperationApi["downloadArtifact"]; readonly onSendToChat?: (file: File) => void | Promise<void>; readonly onClose: () => void }): JSX.Element {
+  const { ownerKey } = useContext(TimelinePersonalizationContext);
   const startIndex = Math.max(0, images.findIndex((image) => image.id === startImageId));
   const [index, setIndex] = useState(startIndex);
   const current = images[index] ?? images[0];
@@ -1433,6 +1488,7 @@ function TimelineImageLightbox({ images, startImageId, returnFocus, t, loadUrl, 
 
   if (current === undefined) return <></>;
   return <WorkspaceImageLightbox
+    ownerKey={JSON.stringify([ownerKey, current.id, current.blobId])}
     src={image.status === "ready" ? image.url : ""}
     status={image.status}
     name={current.fileName}
@@ -1461,13 +1517,13 @@ function TimelineImageLightbox({ images, startImageId, returnFocus, t, loadUrl, 
     showZoomControls
     returnFocus={returnFocus}
     onClose={onClose}
-    onDownload={() => onDownload(current.blobId, current.fileName)}
+    onDownload={(context) => onDownload(current.blobId, current.fileName, context)}
     onImageError={markImageFailed}
     {...(onSendToChat === undefined ? {} : { onSendToChat })}
   />;
 }
 
-function DiffBlock({ item, locale, t, onArtifactDownload, onWorkspaceRewind, onOpenGeneratedFile, onOpenTurnReview }: { readonly item: TimelineItemView; readonly locale: string; readonly t: Translator; readonly onArtifactDownload: (blobId: string, fileName: string) => void; readonly onWorkspaceRewind?: (workspaceId: string, changeSetId: string) => void; readonly onOpenGeneratedFile?: (workspaceId: string, relativePath: string) => void; readonly onOpenTurnReview?: (changeSetId: string, relativePath?: string) => void }): JSX.Element {
+function DiffBlock({ item, locale, t, onArtifactDownload, onWorkspaceRewind, onOpenGeneratedFile, onOpenTurnReview }: { readonly item: TimelineItemView; readonly locale: string; readonly t: Translator; readonly onArtifactDownload: OperationApi["downloadArtifact"]; readonly onWorkspaceRewind?: (workspaceId: string, changeSetId: string) => void; readonly onOpenGeneratedFile?: (workspaceId: string, relativePath: string) => void; readonly onOpenTurnReview?: (changeSetId: string, relativePath?: string) => void }): JSX.Element {
   const diff = item.workspaceDiff;
   const changeSetId = diff?.changeSetId;
   const canOpenExactReview = changeSetId !== undefined && onOpenTurnReview !== undefined;
@@ -1478,8 +1534,8 @@ function DiffBlock({ item, locale, t, onArtifactDownload, onWorkspaceRewind, onO
       <summary><FileDiff aria-hidden="true" /><strong>{item.title ?? t("timeline.workspaceChanges")}</strong>{diff !== undefined && <Pill tone={diff.truncated ? "warning" : "neutral"}>{diff.files.length}</Pill>}<time>{formatDateTime(item.createdAt, locale)}</time><ChevronDown className="details-chevron" aria-hidden="true" /></summary>
       {diff === undefined ? <pre className="diff-content">{item.text ?? t("timeline.noTextDiff")}</pre> : <div className="timeline-workspace-diff">
         {canOpenExactReview && <div className="timeline-workspace-diff__actions"><Button tone="secondary" onClick={() => onOpenTurnReview(changeSetId)}><FileDiff aria-hidden="true" />{t("timeline.reviewChanges")}</Button></div>}
-        {diff.files.map((file) => <section className="timeline-diff-file" key={`${file.oldPath ?? ""}:${file.path}`}><header>{canOpenExactReview ? <button className="timeline-diff-file__review" type="button" title={file.path} onClick={() => onOpenTurnReview(changeSetId, file.path)}><strong>{file.oldPath === undefined ? file.path : `${file.oldPath} → ${file.path}`}</strong></button> : <strong>{file.oldPath === undefined ? file.path : `${file.oldPath} → ${file.path}`}</strong>}{file.status !== undefined && <Pill tone={file.status === "conflicted" ? "danger" : "neutral"}>{file.status}</Pill>}{file.fullDiffBlobId !== undefined && <IconButton label={t("timeline.downloadArtifact", { name: `${file.path}.diff` })} onClick={() => onArtifactDownload(file.fullDiffBlobId as string, `${file.path}.diff`)}><Download aria-hidden="true" /></IconButton>}</header>{file.binary ? <p className="muted">{t("timeline.binaryDiff")}</p> : file.hunks.length === 0 ? <pre>{file.text || t("timeline.noTextDiff")}</pre> : file.hunks.map((hunk, index) => <div className="timeline-diff-hunk" key={`${hunk.oldStart}:${hunk.newStart}:${index}`}><code className="timeline-diff-hunk__heading">@@ -{hunk.oldStart},{hunk.oldCount} +{hunk.newStart},{hunk.newCount} @@ {hunk.heading}</code><pre>{hunk.lines.map((line, lineIndex) => <span className={`diff-line diff-line--${line.kind}`} key={`${line.oldLine}:${line.newLine}:${lineIndex}`}><span>{line.oldLine || ""}</span><span>{line.newLine || ""}</span><code>{line.kind === "added" ? "+" : line.kind === "removed" ? "-" : line.kind === "noNewline" ? "\\" : " "}{line.text}</code></span>)}</pre></div>)}</section>)}
-        {diff.truncated && <p className="inline-warning"><AlertCircle aria-hidden="true" />{t("timeline.diffTruncated")}{diff.completeDiffBlobId !== undefined && <Button tone="ghost" onClick={() => onArtifactDownload(diff.completeDiffBlobId as string, "workspace.diff")}>{t("common.download")}</Button>}</p>}
+        {diff.files.map((file) => <section className="timeline-diff-file" key={`${file.oldPath ?? ""}:${file.path}`}><header>{canOpenExactReview ? <button className="timeline-diff-file__review" type="button" title={file.path} onClick={() => onOpenTurnReview(changeSetId, file.path)}><strong>{file.oldPath === undefined ? file.path : `${file.oldPath} → ${file.path}`}</strong></button> : <strong>{file.oldPath === undefined ? file.path : `${file.oldPath} → ${file.path}`}</strong>}{file.status !== undefined && <Pill tone={file.status === "conflicted" ? "danger" : "neutral"}>{file.status}</Pill>}{file.fullDiffBlobId !== undefined && <ArtifactDownloadButton iconOnly ownerKey={JSON.stringify([file.fullDiffBlobId, file.path])} connectionOwner={onArtifactDownload} label={t("timeline.downloadArtifact", { name: `${file.path}.diff` })} errorLabel={t("workspace.downloadUnavailable")} action={(context) => onArtifactDownload(file.fullDiffBlobId as string, `${file.path}.diff`, context)} />}</header>{file.binary ? <p className="muted">{t("timeline.binaryDiff")}</p> : file.hunks.length === 0 ? <pre>{file.text || t("timeline.noTextDiff")}</pre> : file.hunks.map((hunk, index) => <div className="timeline-diff-hunk" key={`${hunk.oldStart}:${hunk.newStart}:${index}`}><code className="timeline-diff-hunk__heading">@@ -{hunk.oldStart},{hunk.oldCount} +{hunk.newStart},{hunk.newCount} @@ {hunk.heading}</code><pre>{hunk.lines.map((line, lineIndex) => <span className={`diff-line diff-line--${line.kind}`} key={`${line.oldLine}:${line.newLine}:${lineIndex}`}><span>{line.oldLine || ""}</span><span>{line.newLine || ""}</span><code>{line.kind === "added" ? "+" : line.kind === "removed" ? "-" : line.kind === "noNewline" ? "\\" : " "}{line.text}</code></span>)}</pre></div>)}</section>)}
+        {diff.truncated && <p className="inline-warning"><AlertCircle aria-hidden="true" />{t("timeline.diffTruncated")}{diff.completeDiffBlobId !== undefined && <ArtifactDownloadButton tone="ghost" ownerKey={diff.completeDiffBlobId} connectionOwner={onArtifactDownload} label={t("common.download")} errorLabel={t("workspace.downloadUnavailable")} action={(context) => onArtifactDownload(diff.completeDiffBlobId as string, "workspace.diff", context)} />}</p>}
         {diff.gaps.length > 0 && <ul className="timeline-diff-gaps">{diff.gaps.map((gap) => <li key={gap}>{gap}</li>)}</ul>}
         {diff.changeSetId !== undefined && diff.workspaceId.length > 0 && onWorkspaceRewind !== undefined && <Button onClick={() => onWorkspaceRewind(diff.workspaceId, diff.changeSetId as string)}><RotateCcw aria-hidden="true" />{t("timeline.previewRewind")}</Button>}
       </div>}
@@ -1722,11 +1778,6 @@ function StatusBlock({ item, locale }: { readonly item: TimelineItemView; readon
   return <div className="status-block" role="status"><CircleDotDashed className={item.streaming ? "spin-slow" : ""} aria-hidden="true" /><span>{item.title ?? item.text ?? "…"}</span><time>{formatDateTime(item.createdAt, locale)}</time></div>;
 }
 
-function CopyButton({ text, label }: { readonly text: string; readonly label: string }): JSX.Element {
-  const [copied, setCopied] = useState(false);
-  return <IconButton className="copy-button" label={label} onClick={() => { void navigator.clipboard.writeText(text).then(() => { setCopied(true); window.setTimeout(() => setCopied(false), 1400); }); }}>{copied ? <Check aria-hidden="true" /> : <Clipboard aria-hidden="true" />}</IconButton>;
-}
-
 export { sessionMessageDeepLink };
 
 function ToolIcon({ name }: { readonly name: string }): JSX.Element {
@@ -1811,8 +1862,7 @@ function rememberWorkGroupExpansion(key: string, expanded: boolean): void {
 function safeMarkdownComponents(
   t: Translator,
   referenceActions: TimelineReferenceActions,
-  onWordFadeSettled?: (event: { readonly animationName: string; readonly currentTarget: { readonly dataset: DOMStringMap } }) => void,
-  onOpenHttpLinkMenu?: (url: string, x: number, y: number) => void
+  onWordFadeSettled?: (event: { readonly animationName: string; readonly currentTarget: { readonly dataset: DOMStringMap } }) => void
 ): Components {
   return {
     pre: ({ children, node: _node, ...props }) => {
@@ -1820,17 +1870,21 @@ function safeMarkdownComponents(
       if (isValidElement(first)) {
         const className = (first.props as { readonly className?: string }).className;
         if (className?.split(/\s+/u).includes("language-mermaid") === true) {
-          return <TimelineMermaidBlock source={timelineMarkdownNodeText((first.props as { readonly children?: ReactNode }).children).replace(/\n$/u, "")} t={t} />;
+          return <TimelineMermaidBlock ownerKey={JSON.stringify([referenceActions.ownerKey, referenceActions.sessionId])} source={timelineMarkdownNodeText((first.props as { readonly children?: ReactNode }).children).replace(/\n$/u, "")} onSendToChat={referenceActions.onWorkspaceImageToComposer} t={t} />;
         }
-        return <TimelineCodeBlock source={timelineMarkdownNodeText((first.props as { readonly children?: ReactNode }).children)} codeClassName={className} t={t} />;
+        return <TimelineCodeBlock ownerKey={JSON.stringify([referenceActions.ownerKey, referenceActions.sessionId])} source={timelineMarkdownNodeText((first.props as { readonly children?: ReactNode }).children)} codeClassName={className} t={t} />;
       }
       return <pre {...props}>{children}</pre>;
     },
-    table: ({ children, node: _node, ...props }) => <TimelineCopyAsImageBlock className="timeline-copy-block--table" contentClassName="timeline-copy-block__scroll" extractPlainText={timelineTableToTsv} t={t}>
+    table: ({ children, node, ...props }) => <TimelineCopyAsImageBlock ownerKey={JSON.stringify([referenceActions.ownerKey, referenceActions.sessionId])} sourceKey={JSON.stringify(node)} imageName="table.png" onSendToChat={referenceActions.onWorkspaceImageToComposer} className="timeline-copy-block--table" contentClassName="timeline-copy-block__scroll" extractPlainText={timelineTableToTsv} t={t}>
       <table {...props}>{children}</table>
     </TimelineCopyAsImageBlock>,
-    span: ({ children, className, node: _node, ...props }) => {
+    span: ({ children, className, node, ...props }) => {
       const wordFadeKey = (props as Record<string, unknown>)["data-wf-key"];
+      const startedAt = Number((props as Record<string, unknown>)["data-wf-started-at"]);
+      if (typeof wordFadeKey === "string" && Number.isFinite(startedAt)) {
+        return <TimelineFadeElement as="span" {...props} startedAt={startedAt} className={className} onAnimationEnd={onWordFadeSettled}>{children}</TimelineFadeElement>;
+      }
       const content = <span
         className={className}
         {...props}
@@ -1839,13 +1893,17 @@ function safeMarkdownComponents(
           : undefined}
       >{children}</span>;
       return className?.split(/\s+/u).includes("katex-display") === true
-        ? <TimelineCopyAsImageBlock className="timeline-copy-block--math" extractPlainText={timelineMathToLatex} t={t}>{content}</TimelineCopyAsImageBlock>
+        ? <TimelineCopyAsImageBlock ownerKey={JSON.stringify([referenceActions.ownerKey, referenceActions.sessionId])} sourceKey={JSON.stringify(node)} imageName="formula.png" onSendToChat={referenceActions.onWorkspaceImageToComposer} className="timeline-copy-block--math" extractPlainText={timelineMathToLatex} t={t}>{content}</TimelineCopyAsImageBlock>
         : content;
     },
-    a: ({ children, href, node: _node, ...props }) => {
-      return <TimelineMarkdownLink href={href} actions={referenceActions} onOpenHttpLinkMenu={onOpenHttpLinkMenu} anchorProps={props}>{children}</TimelineMarkdownLink>;
+    li: ({ node: _node, ...props }) => {
+      const startedAt = Number((props as Record<string, unknown>)["data-wf-started-at"]);
+      return Number.isFinite(startedAt) ? <TimelineFadeElement as="li" {...props} startedAt={startedAt} /> : <li {...props} />;
     },
-    img: ({ src, alt }) => <TimelineMarkdownImage src={src} alt={alt} actions={referenceActions} t={t} onOpenHttpLinkMenu={onOpenHttpLinkMenu} />
+    a: ({ children, href, node: _node, ...props }) => {
+      return <TimelineMarkdownLink href={href} actions={referenceActions} anchorProps={props}>{children}</TimelineMarkdownLink>;
+    },
+    img: ({ src, alt }) => <TimelineMarkdownImage src={src} alt={alt} actions={referenceActions} t={t} />
   };
 }
 

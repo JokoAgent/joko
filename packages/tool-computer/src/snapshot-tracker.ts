@@ -10,6 +10,8 @@ interface SnapshotMeta {
   readonly windowKey: string;
   readonly processId: number;
   readonly windowId: number;
+  readonly driverSnapshotId?: string;
+  readonly elements: Map<string, { readonly token: string; readonly index?: number }>;
 }
 
 const MAXIMUM_WINDOWS = 256;
@@ -26,7 +28,7 @@ export class ComputerWindowSnapshotTracker {
     this.#idFactory = idFactory;
   }
 
-  record(processId: number, windowId: number): string {
+  record(processId: number, windowId: number, driverSnapshotId?: string): string {
     const windowKey = `${processId}\0${windowId}`;
     if (!this.#latestByWindow.has(windowKey) && this.#latestByWindow.size >= MAXIMUM_WINDOWS) {
       const oldest = this.#latestByWindow.keys().next().value as string | undefined;
@@ -44,8 +46,30 @@ export class ComputerWindowSnapshotTracker {
     const suffix = this.#idFactory().replace(/[^a-z0-9_-]/giu, "").slice(0, 20) || "snapshot";
     const id = `ws-${this.#sequence.toString(36)}-${suffix}`;
     this.#latestByWindow.set(windowKey, id);
-    this.#metadataById.set(id, { windowKey, processId, windowId });
+    this.#metadataById.set(id, { windowKey, processId, windowId, driverSnapshotId, elements: new Map() });
     return id;
+  }
+
+  registerElement(snapshotId: string, token: string, index?: number): string | undefined {
+    const metadata = this.#metadataById.get(snapshotId);
+    if (metadata === undefined || metadata.elements.size >= 2_000) return undefined;
+    const key = `${snapshotId}:${metadata.elements.size}`;
+    metadata.elements.set(key, { token, index });
+    return key;
+  }
+
+  reference(snapshotId: string): { readonly snapshotId: string; readonly windowId: number; readonly driverSnapshotId?: string } | undefined {
+    const id = this.#aliases.get(snapshotId) ?? snapshotId;
+    const meta = this.#metadataById.get(id);
+    return meta === undefined ? undefined : { snapshotId: id, windowId: meta.windowId, driverSnapshotId: meta.driverSnapshotId };
+  }
+
+  element(token: string): { readonly snapshotId: string; readonly token: string; readonly index?: number } | undefined {
+    for (const [snapshotId, metadata] of this.#metadataById) {
+      const element = metadata.elements.get(token);
+      if (element !== undefined) return { snapshotId, ...element };
+    }
+    return undefined;
   }
 
   registerAlias(snapshotId: string, alias: string): void {
@@ -56,6 +80,12 @@ export class ComputerWindowSnapshotTracker {
       if (oldest !== undefined) this.#aliases.delete(oldest);
     }
     this.#aliases.set(alias, snapshotId);
+  }
+
+  invalidate(processId: number, windowId: number): void {
+    // Retain old identities so a driver alias cannot later rebind to a fresh
+    // observation and accidentally authorize an action from the failed view.
+    this.#latestByWindow.delete(`${processId}\0${windowId}`);
   }
 
   validate(

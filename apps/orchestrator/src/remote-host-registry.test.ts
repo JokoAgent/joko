@@ -8,8 +8,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   AgentAuthConnectorFailure,
   RemoteSshError,
+  SshKeyError,
   sshHostKeyFingerprint,
   type AgentAuthConnection,
+  type RemoteFileTransportPort,
   type RemoteSshConfigHost,
   type SshConfigFilePort
 } from "@joko/remote-ssh";
@@ -26,6 +28,7 @@ import {
 import {
   RemoteHostRegistry,
   type RemoteHostCredentialResolverPort,
+  type RemoteHostNodeKeyResolverPort,
   type RemoteHostCreate,
   type RemoteHostRegistryChange,
   type ResolvedAgentAuthConnectorPort,
@@ -231,6 +234,75 @@ describe("RemoteHostRegistry owner-private catalog", () => {
 });
 
 describe("RemoteHostRegistry credential and lifecycle boundary", () => {
+  it("invalidates a captured file-read authority on disconnect, reconnect and Host revision change without reconnecting during checks", async () => {
+    const fixture = createFixture();
+    const unavailable = async (): Promise<never> => { throw new Error("No file I/O in authority test."); };
+    const files: RemoteFileTransportPort = { realpath: unavailable, stat: unavailable, list: unavailable, read: unavailable, write: unavailable, mkdir: unavailable, rename: unavailable, remove: unavailable };
+    const capabilities = { commandExecution: false, processStreaming: false, fileTransfer: true, tcpForwarding: false, interactiveTerminal: false };
+    const connect = vi.fn(async (request: ResolvedAgentAuthConnectorRequest) => {
+      await request.verifyHostKey({ algorithm: "ssh-ed25519", key: Uint8Array.of(1, 2, 3) });
+      request.onAuthenticating();
+      return { capabilities, files, close: async () => undefined };
+    });
+    const registry = fixture.registry({ connector: { capabilities, connect } });
+    const host = registry.create(hostCreate());
+    const first = await registry.captureTransportAuthority(host.targetId, host.id);
+    expect(first.lease.files).toBe(files);
+    expect(() => first.assertCurrent()).not.toThrow();
+    const disconnected = await registry.disconnect(host.targetId, host.id, registry.get(host.targetId, host.id).revision);
+    expect(() => first.assertCurrent()).toThrow();
+    expect(connect).toHaveBeenCalledOnce();
+    const ready = await registry.connect(host.targetId, host.id, disconnected.revision);
+    expect(ready.ok).toBe(true);
+    expect(() => first.assertCurrent()).toThrow();
+    expect(connect).toHaveBeenCalledTimes(2);
+    const second = await registry.captureTransportAuthority(host.targetId, host.id);
+    expect(() => second.assertCurrent()).not.toThrow();
+    expect(second.leaseGeneration).not.toBe(first.leaseGeneration);
+    const current = registry.get(host.targetId, host.id);
+    fixture.store.updateRemoteHostStatus({ ownerId: current.ownerId, targetId: current.targetId, id: current.id, expectedRevision: current.revision, state: "ready", changedAt: current.status.changedAt + 1 });
+    expect(() => second.assertCurrent()).toThrow();
+    expect(connect).toHaveBeenCalledTimes(2);
+  });
+
+  it("resolves the exact selected public identity only after revision admission and never dispatches a changed or canceled node key", async () => {
+    const fixture = createFixture();
+    const resolve = vi.fn(() => CREDENTIAL_VALUE);
+    const readPublic = vi.fn(async (_id: string, _fingerprint: string, _signal: AbortSignal) => "public identity");
+    const connect = vi.fn(async (request: ResolvedAgentAuthConnectorRequest) => {
+      expect(request.authentication).toEqual({ kind: "agent_key", publicKey: Buffer.from("public identity") });
+      expect(request).not.toHaveProperty("nodeKey");
+      expect(request).not.toHaveProperty("credentialRef");
+      await request.verifyHostKey({ algorithm: "ssh-ed25519", key: Uint8Array.of(1, 2, 3) });
+      request.onAuthenticating();
+      return { close: async () => undefined };
+    });
+    const registry = fixture.registry({ credentials: { resolve }, nodeKeys: { readPublic }, connector: {
+      capabilities: { commandExecution: false, processStreaming: false, fileTransfer: false, tcpForwarding: false, interactiveTerminal: false }, connect
+    } });
+    const nodeKey = { id: "id_work", expectedFingerprint: `SHA256:${"b".repeat(43)}` };
+    const host = registry.create(hostCreate({ authenticationMode: "node_key", nodeKey }));
+    await expect(registry.connect(host.targetId, host.id, host.revision + 1n)).rejects.toBeInstanceOf(RevisionConflictError);
+    expect(readPublic).not.toHaveBeenCalled();
+    const ready = await registry.connect(host.targetId, host.id, host.revision);
+    expect(ready.ok).toBe(true);
+    expect(readPublic).toHaveBeenCalledWith(nodeKey.id, nodeKey.expectedFingerprint, expect.any(AbortSignal));
+    const disconnected = await registry.disconnect(host.targetId, host.id, ready.host.revision);
+    readPublic.mockRejectedValueOnce(new SshKeyError("key_changed"));
+    const changed = await registry.connect(host.targetId, host.id, disconnected.revision);
+    expect(changed.failure).toEqual({ code: "node_key_changed", retryable: false });
+    expect(connect).toHaveBeenCalledOnce();
+    let release!: (value: string) => void;
+    readPublic.mockImplementationOnce(() => new Promise<string>(resolve => { release = resolve; }));
+    const abort = new AbortController();
+    const pending = registry.connect(host.targetId, host.id, changed.host.revision, abort.signal);
+    await vi.waitFor(() => expect(readPublic).toHaveBeenCalledTimes(3));
+    abort.abort(); release("public identity");
+    expect((await pending).failure?.code).toBe("aborted");
+    expect(connect).toHaveBeenCalledOnce();
+    expect(resolve).not.toHaveBeenCalled();
+  });
+
   it("resolves credentials only for a CAS-valid connection and zeroes the bytes when connect settles", async () => {
     const fixture = createFixture();
     const resolve = vi.fn((_referenceId: string) => CREDENTIAL_VALUE);
@@ -446,7 +518,8 @@ describe("RemoteHostRegistry unavailable boundaries", () => {
         commandExecution: false,
         processStreaming: false,
         fileTransfer: false,
-        tcpForwarding: false
+        tcpForwarding: false,
+        interactiveTerminal: false
       },
       async connect(request) {
         calls += 1;
@@ -502,7 +575,8 @@ describe("RemoteHostRegistry unavailable boundaries", () => {
       commandExecution: false,
       processStreaming: false,
       fileTransfer: false,
-      tcpForwarding: false
+      tcpForwarding: false,
+      interactiveTerminal: false
     });
     const unavailable = await unavailableRegistry.connect(
       unavailableHost.targetId,
@@ -600,7 +674,8 @@ function recordingConnector(
       commandExecution: false,
       processStreaming: false,
       fileTransfer: false,
-      tcpForwarding: false
+      tcpForwarding: false,
+      interactiveTerminal: false
     },
     credentialViews,
     safeCalls,
@@ -691,6 +766,7 @@ interface Fixture {
   registry(options?: {
     readonly ownerId?: string;
     readonly credentials?: RemoteHostCredentialResolverPort;
+    readonly nodeKeys?: RemoteHostNodeKeyResolverPort;
     readonly connector?: ResolvedAgentAuthConnectorPort;
     readonly sshConfig?: SshConfigFilePort;
     readonly defaultSshUser?: string;
@@ -743,6 +819,7 @@ function createFixture(): Fixture {
         ownerId: options.ownerId ?? "owner-a",
         now: options.now ?? now,
         ...(options.credentials === undefined ? {} : { credentials: options.credentials }),
+        ...(options.nodeKeys === undefined ? {} : { nodeKeys: options.nodeKeys }),
         ...(options.connector === undefined ? {} : { connector: options.connector }),
         ...(options.sshConfig === undefined ? {} : { sshConfig: options.sshConfig }),
         ...(options.defaultSshUser === undefined ? {} : { defaultSshUser: options.defaultSshUser })

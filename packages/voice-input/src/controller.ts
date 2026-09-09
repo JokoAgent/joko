@@ -85,7 +85,7 @@ export class VoiceInputController {
   private generation = 0;
   private locale: string | undefined;
   private latestPartial = "";
-  private latestStable = "";
+  private latestStable: string | undefined;
   private latestTranscript = "";
   private latestTranscriptSource: VoiceInputDraftSource = "partial";
   private speechActivitySeen = false;
@@ -144,7 +144,7 @@ export class VoiceInputController {
     this.runId = this.createId();
     this.locale = locale;
     this.latestPartial = "";
-    this.latestStable = "";
+    this.latestStable = undefined;
     this.latestTranscript = "";
     this.latestTranscriptSource = "partial";
     this.speechActivitySeen = false;
@@ -254,8 +254,9 @@ export class VoiceInputController {
     }
 
     const stable = await this.waitForStable(this.stableWaitMs);
-    const text = normalizeTranscript(stable || this.latestStable || this.latestPartial);
-    const source: VoiceInputDraftSource = stable || this.latestStable ? "stable" : "partial";
+    const confirmed = stable ?? this.latestStable;
+    const text = normalizeTranscript(confirmed ?? this.latestPartial);
+    const source: VoiceInputDraftSource = confirmed !== undefined ? "stable" : "partial";
 
     try {
       await this.closeProviderOnce();
@@ -563,7 +564,6 @@ export class VoiceInputController {
 
   private publishDraft(value: string, source: VoiceInputDraftSource): void {
     const text = normalizeTranscript(value);
-    if (text === "") return;
     const segment: SpeechSegment = {
       id: `draft-${this.runId}`,
       source: "mic",
@@ -579,7 +579,7 @@ export class VoiceInputController {
   }
 
   private waitForStable(timeoutMs: number): Promise<string | undefined> {
-    if (normalizeTranscript(this.latestStable) !== "") return Promise.resolve(this.latestStable);
+    if (this.latestStable !== undefined) return Promise.resolve(this.latestStable);
     return new Promise((resolve) => {
       let waiter: StableWaiter;
       const finish = (text: string | undefined): void => {

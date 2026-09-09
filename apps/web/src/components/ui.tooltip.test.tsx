@@ -1,10 +1,11 @@
 // @vitest-environment jsdom
 
-import { act, createRef } from "react";
+import { act, createRef, StrictMode } from "react";
+import { createPortal } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { IconButton, TOOLTIP_DELAY_MS, TipSummary, resolveTooltipPlacement } from "./ui.js";
+import { IconButton, TOOLTIP_DELAY_MS, Tip, TipSummary, TooltipProvider, resolveTooltipPlacement } from "./ui.js";
 
 const roots: Root[] = [];
 
@@ -16,6 +17,7 @@ beforeEach(() => {
 afterEach(async () => {
   for (const root of roots.splice(0).reverse()) await act(async () => root.unmount());
   document.body.replaceChildren();
+  vi.restoreAllMocks();
   vi.useRealTimers();
   Reflect.deleteProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT");
 });
@@ -26,15 +28,20 @@ describe("shared visible tooltips", () => {
     const button = required(document.querySelector<HTMLButtonElement>('button[aria-label="Archive"]'));
     expect(button.hasAttribute("title")).toBe(false);
 
-    await act(async () => {
-      button.focus();
-      vi.advanceTimersByTime(TOOLTIP_DELAY_MS - 1);
-    });
+    await act(async () => button.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true })));
+    await act(async () => button.focus());
     expect(document.querySelector('[role="tooltip"]')).toBeNull();
-    await act(async () => { vi.advanceTimersByTime(1); });
+    await act(async () => document.dispatchEvent(new MouseEvent("pointerup", { bubbles: true })));
+    await act(async () => button.blur());
+    await hover(button, true);
+    await act(async () => { vi.advanceTimersByTime(TOOLTIP_DELAY_MS - 1); });
+    expect(document.querySelector('[role="tooltip"]')).toBeNull();
+    await act(async () => button.focus());
     const tooltip = required(document.querySelector<HTMLElement>('[role="tooltip"]'));
     expect(tooltip.textContent).toBe("Archive");
     expect(button.getAttribute("aria-describedby")).toBe(tooltip.id);
+    await act(async () => button.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", isComposing: true, bubbles: true })));
+    expect(document.querySelector('[role="tooltip"]')).toBe(tooltip);
 
     await act(async () => button.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
     expect(document.querySelector('[role="tooltip"]')).toBeNull();
@@ -73,6 +80,148 @@ describe("shared visible tooltips", () => {
     expect(document.querySelector('[role="tooltip"]')?.textContent).toBe("More actions");
   });
 
+  it("shares the short hover window only within an explicit group and closes on activation", async () => {
+    const activated = vi.fn();
+    await render(<TooltipProvider><IconButton label="First" /><IconButton label="Second" onClick={activated} /></TooltipProvider>);
+    const first = required(document.querySelector<HTMLButtonElement>('[aria-label="First"]'));
+    const second = required(document.querySelector<HTMLButtonElement>('[aria-label="Second"]'));
+    await hover(first, true);
+    await act(async () => { vi.advanceTimersByTime(499); });
+    expect(document.querySelector('[role="tooltip"]')).toBeNull();
+    await act(async () => { vi.advanceTimersByTime(1); });
+    expect(document.querySelector('[role="tooltip"]')?.textContent).toBe("First");
+    await hover(first, false);
+    await hover(second, true);
+    expect(document.querySelector('[role="tooltip"]')?.textContent).toBe("Second");
+    await act(async () => second.click());
+    expect(activated).toHaveBeenCalledOnce();
+    expect(document.querySelector('[role="tooltip"]')).toBeNull();
+    await render(<IconButton label="Independent" />);
+    const independent = required(document.querySelector<HTMLButtonElement>('[aria-label="Independent"]'));
+    await hover(independent, true);
+    expect(document.querySelector('[role="tooltip"]')).toBeNull();
+    await hover(independent, false);
+    await act(async () => { vi.advanceTimersByTime(201); });
+    await hover(first, true);
+    expect(document.querySelector('[role="tooltip"]')).toBeNull();
+    await act(async () => { vi.advanceTimersByTime(500); });
+    expect(document.querySelector('[role="tooltip"]')?.textContent).toBe("First");
+    await hover(first, false);
+    await hover(second, true, "touch");
+    await act(async () => { vi.advanceTimersByTime(500); });
+    expect(document.querySelector('[role="tooltip"]')).toBeNull();
+  });
+
+  it("handles controlled visibility and retires old content and anchor delays", async () => {
+    const scheduled: (() => void)[] = [];
+    const setTimeout = window.setTimeout.bind(window);
+    vi.spyOn(window, "setTimeout").mockImplementation((handler, timeout, ...args) => {
+      if (timeout === 500 && typeof handler === "function") scheduled.push(handler as () => void);
+      return Reflect.apply(setTimeout, window, [handler, timeout, ...args]);
+    });
+    const root = await render(<StrictMode><IconButton label="Start" /></StrictMode>);
+    const update = (label: string, tooltipOpen?: boolean, disabled = false) => act(async () => root.render(<StrictMode><IconButton label={label} tooltipOpen={tooltipOpen} disabled={disabled} disabledReason={disabled ? label : undefined} /></StrictMode>));
+    let anchor = required(document.querySelector<HTMLButtonElement>("button"));
+    await hover(anchor, true);
+    await act(async () => { vi.advanceTimersByTime(400); });
+    const retired = required(scheduled.at(-1));
+    await update("Start", false);
+    await update("Start", undefined);
+    await act(async () => retired());
+    expect(document.querySelector('[role="tooltip"]')).toBeNull();
+    await act(async () => { vi.advanceTimersByTime(499); });
+    expect(document.querySelector('[role="tooltip"]')).toBeNull();
+    await act(async () => { vi.advanceTimersByTime(1); });
+    expect(document.querySelector('[role="tooltip"]')?.textContent).toBe("Start");
+    await update("Finishing", true);
+    expect(document.querySelector('[role="tooltip"]')?.textContent).toBe("Finishing");
+    await update("Finishing", false);
+    await hover(anchor, true);
+    await act(async () => { vi.advanceTimersByTime(600); });
+    expect(document.querySelector('[role="tooltip"]')).toBeNull();
+    await update("Finishing", undefined);
+    expect(document.querySelector('[role="tooltip"]')).toBeNull();
+    await act(async () => { vi.advanceTimersByTime(500); });
+    expect(document.querySelector('[role="tooltip"]')?.textContent).toBe("Finishing");
+    await hover(anchor, false);
+    await update("Start");
+    await hover(anchor, true);
+    await act(async () => { vi.advanceTimersByTime(400); });
+    await update("Other source");
+    await update("Start");
+    await act(async () => { vi.advanceTimersByTime(500); });
+    expect(document.querySelector('[role="tooltip"]')).toBeNull();
+    await update("Start", undefined, true);
+    const wrapper = required(document.querySelector<HTMLElement>(".tip-anchor--disabled"));
+    await act(async () => { wrapper.focus(); vi.advanceTimersByTime(400); });
+    await update("Start");
+    anchor = required(document.querySelector<HTMLButtonElement>("button"));
+    await act(async () => { vi.advanceTimersByTime(500); });
+    expect(document.querySelector('[role="tooltip"]')).toBeNull();
+    await act(async () => { anchor.focus(); vi.advanceTimersByTime(500); });
+    expect(document.querySelector('[role="tooltip"]')?.textContent).toBe("Start");
+    await act(async () => window.dispatchEvent(new Event("pagehide")));
+    expect(document.querySelector('[role="tooltip"]')).toBeNull();
+    await act(async () => window.dispatchEvent(new Event("pageshow")));
+    await hover(anchor, true);
+    await act(async () => { vi.advanceTimersByTime(500); });
+    expect(document.querySelector('[role="tooltip"]')?.textContent).toBe("Start");
+    await update("Finishing", true);
+    await act(async () => window.dispatchEvent(new Event("pagehide")));
+    expect(document.querySelector('[role="tooltip"]')).toBeNull();
+    await update("Finishing", false);
+    await update("Finishing", true);
+    expect(document.querySelector('[role="tooltip"]')?.textContent).toBe("Finishing");
+  });
+
+  it("positions and observes foreign-document bubbles without sharing its timing or late callbacks with another document", async () => {
+    const frame = document.body.appendChild(document.createElement("iframe"));
+    const child = required(frame.contentDocument);
+    const ownerWindow = required(child.defaultView);
+    const viewport = Object.assign(new ownerWindow.EventTarget(), { offsetLeft: 30, offsetTop: 40, width: 180, height: 120 });
+    Object.defineProperty(ownerWindow, "visualViewport", { configurable: true, value: viewport });
+    const observed: Element[] = [];
+    const disconnect = vi.fn();
+    let resized: (() => void) | undefined;
+    Object.defineProperty(ownerWindow, "ResizeObserver", { configurable: true, value: class {
+      constructor(callback: () => void) { resized = callback; }
+      observe(element: Element) { observed.push(element); }
+      disconnect = disconnect;
+    } });
+    ownerWindow.requestAnimationFrame = (callback) => ownerWindow.setTimeout(() => callback(0), 16);
+    ownerWindow.cancelAnimationFrame = (id) => ownerWindow.clearTimeout(id);
+    const root = await render(<TooltipProvider><IconButton label="Main" />{createPortal(<Tip text="Owned hint" focusable mono preformatted><span>Child</span></Tip>, child.body)}</TooltipProvider>);
+    const main = required(document.querySelector<HTMLButtonElement>('[aria-label="Main"]'));
+    const anchor = required(child.querySelector<HTMLElement>(".tip-anchor"));
+    anchor.getBoundingClientRect = () => ({ ...rect(50, 55, 20, 20), x: 50, y: 55, toJSON: () => ({}) });
+    await hover(main, true);
+    await act(async () => { vi.advanceTimersByTime(500); });
+    await hover(main, false);
+    await hover(anchor, true);
+    expect(child.querySelector('[role="tooltip"]')).toBeNull();
+    await act(async () => { vi.advanceTimersByTime(500); });
+    const bubble = required(child.querySelector<HTMLElement>('[role="tooltip"]'));
+    expect(document.querySelector('[role="tooltip"]')).toBeNull();
+    expect(observed.includes(anchor)).toBe(true);
+    expect(observed.includes(bubble)).toBe(true);
+    expect(bubble.classList.contains("shared-tooltip--mono")).toBe(true);
+    expect(bubble.classList.contains("shared-tooltip--preformatted")).toBe(true);
+    bubble.getBoundingClientRect = () => ({ ...rect(0, 0, 100, 40), x: 0, y: 0, toJSON: () => ({}) });
+    await act(async () => { resized?.(); vi.advanceTimersByTime(16); });
+    expect(bubble.classList.contains("shared-tooltip--bottom")).toBe(true);
+    expect(Number.parseFloat(bubble.style.left)).toBeGreaterThanOrEqual(88);
+    viewport.width = 110;
+    await act(async () => { viewport.dispatchEvent(new ownerWindow.Event("resize")); vi.advanceTimersByTime(16); });
+    expect(bubble.style.maxWidth).toBe("86px");
+    await act(async () => root.render(<TooltipProvider><Tip text="Owned hint" focusable><span>Main now</span></Tip></TooltipProvider>));
+    expect(bubble.isConnected).toBe(false);
+    expect(child.querySelector('[role="tooltip"]')).toBeNull();
+    expect(document.querySelector('[role="tooltip"]')).toBeNull();
+    await act(async () => { resized?.(); vi.advanceTimersByTime(500); });
+    expect(document.querySelector('[role="tooltip"]')).toBeNull();
+    expect(disconnect).toHaveBeenCalled();
+  });
+
   it("flips and clamps portal bubbles at every viewport edge", () => {
     const bubble = { width: 100, height: 40 };
     const cases = [
@@ -93,12 +242,20 @@ describe("shared visible tooltips", () => {
   });
 });
 
-async function render(element: React.ReactNode): Promise<void> {
+async function render(element: React.ReactNode): Promise<Root> {
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
   roots.push(root);
   await act(async () => root.render(element));
+  return root;
+}
+
+async function hover(element: HTMLElement, enter: boolean, pointerType = "mouse"): Promise<void> {
+  const ownerWindow = required(element.ownerDocument.defaultView);
+  const event = new ownerWindow.MouseEvent(enter ? "pointerover" : "pointerout", { bubbles: true, relatedTarget: enter ? null : element.ownerDocument.body });
+  Object.defineProperty(event, "pointerType", { value: pointerType });
+  await act(async () => element.dispatchEvent(event));
 }
 
 function required<T>(value: T | null | undefined): T {

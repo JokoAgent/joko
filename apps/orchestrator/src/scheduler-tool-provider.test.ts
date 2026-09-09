@@ -330,7 +330,10 @@ describe("SchedulerToolBridgeProvider", () => {
   });
 
   it("persists and patches notification, expiration, and managed hook extensions", async () => {
-    const { store, provider } = fixture();
+    const script = ["let body = '';", "process.stdin.setEncoding('utf8');",
+      "for await (const chunk of process.stdin) body += chunk;", "JSON.parse(body);", "process.exit(0);"].join("\n");
+    const generate = vi.fn(async () => script);
+    const { store, provider } = fixture({}, new ScheduleHookScriptInstaller({ generate }));
     const created = resultData(await call(provider, "schedule_create", {
       name: "Quiet watcher",
       prompt: "check for changes",
@@ -347,19 +350,17 @@ describe("SchedulerToolBridgeProvider", () => {
 
     const installed = resultData(await call(provider, "schedule_set_pre_run_hook", {
       scheduleId: created["id"],
-      script: [
-        "let body = '';",
-        "process.stdin.setEncoding('utf8');",
-        "for await (const chunk of process.stdin) body += chunk;",
-        "JSON.parse(body);",
-        "process.exit(0);"
-      ].join("\n"),
+      description: "Install a bounded local gate",
       timeoutMs: 5_000
     })) as Record<string, unknown>;
     expect(installed).toMatchObject({
       attached: true,
       test: { status: "passed", decision: "run", exitCode: 0 }
     });
+    expect(generate).toHaveBeenCalledWith(expect.objectContaining({
+      backendId: "backend-a", providerId: "provider-a", modelId: "model-a",
+      workspaceRoot: store.getTarget("target-a").descriptor.workspaceRoot
+    }), undefined);
     expect(existsSync(String(installed["filePath"]))).toBe(true);
     const attached = resultData(await call(provider, "schedule_get", { id: created["id"] })) as Record<string, unknown>;
     expect(attached).toMatchObject({
@@ -528,7 +529,7 @@ describe("SchedulerToolBridgeProvider", () => {
   });
 });
 
-function fixture(coordinatorOverrides: Partial<SchedulerToolCoordinator> = {}) {
+function fixture(coordinatorOverrides: Partial<SchedulerToolCoordinator> = {}, hookScripts = new ScheduleHookScriptInstaller()) {
   const store = new OperationalStore(":memory:");
   openStores.push(store);
   const workspaceBase = mkdtempSync(join(tmpdir(), "joko-scheduler-tools-"));
@@ -602,7 +603,7 @@ function fixture(coordinatorOverrides: Partial<SchedulerToolCoordinator> = {}) {
     provider: new SchedulerToolBridgeProvider({
       store,
       coordinator: () => coordinator,
-      hookScripts: new ScheduleHookScriptInstaller(),
+      hookScripts,
       runNotifications,
       now: () => NOW
     })

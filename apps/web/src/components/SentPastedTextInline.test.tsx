@@ -26,7 +26,7 @@ describe("sent pasted-text inline chip", () => {
     const host = document.body.appendChild(document.createElement("div"));
     const root = createRoot(host);
     roots.push(root);
-    act(() => root.render(<SentPastedTextInline t={t} segment={{
+    act(() => root.render(<SentPastedTextInline ownerKey="task" t={t} segment={{
       text: "before\nfirst\nsecond\nafter",
       projectedText: "before\nPasted text (2 lines)\nafter",
       tokens: [
@@ -40,5 +40,19 @@ describe("sent pasted-text inline chip", () => {
     expect(document.querySelector("[role=dialog]")).not.toBeNull();
     expect(document.querySelector("pre")?.textContent).toBe("first\nsecond");
     expect(document.querySelector("[role=dialog]")?.getAttribute("aria-label")).toBeNull();
+  });
+
+  it("retires the open payload when its message owner changes and does not revive it on return", async () => {
+    const root = createRoot(document.body.appendChild(document.createElement("div")));
+    roots.push(root);
+    const segment = { text: "full text", projectedText: "Pasted text", tokens: [{ kind: "pasted" as const, text: "full text", display: "Pasted text" }] };
+    const render = (ownerKey: string) => act(async () => root.render(<SentPastedTextInline ownerKey={ownerKey} segment={segment} t={t} />));
+    await render("first");
+    act(() => document.querySelector<HTMLButtonElement>(".message-user__pasted-text-chip")!.click());
+    expect(document.querySelector("pre")?.textContent).toBe("full text");
+    await render("second");
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    await render("first");
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
   });
 });

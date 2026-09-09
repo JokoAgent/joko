@@ -20,8 +20,9 @@ afterEach(async () => {
 
 describe("BackgroundTasksPanel cancellation", () => {
   it("shows a real Stop action only for active tasks when the capability is advertised", async () => {
-    const pending = Promise.withResolvers<void>();
-    const onCancel = vi.fn(() => pending.promise);
+    let resolvePending!: () => void;
+    const pending = new Promise<void>((resolve) => { resolvePending = resolve; });
+    const onCancel = vi.fn(() => pending);
     const onRefresh = vi.fn();
     const container = await renderPanel({ canCancel: true, onCancel, onRefresh });
 
@@ -34,7 +35,7 @@ describe("BackgroundTasksPanel cancellation", () => {
     expect(stop?.disabled).toBe(true);
     expect(stop?.textContent).toContain("Stopping");
 
-    await act(async () => pending.resolve());
+    await act(async () => resolvePending());
     expect(onRefresh).toHaveBeenCalledOnce();
   });
 

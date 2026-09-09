@@ -291,6 +291,8 @@ test("durable and cross-process field numbers remain stable", () => {
     [contract.SettingsSnapshotSchema, "agent_resource", 25],
     [contract.SettingsSnapshotSchema, "collaboration", 26],
     [contract.SettingsSnapshotSchema, "git_safety", 27],
+    [contract.SettingsSnapshotSchema, "auxiliary_text", 30],
+    [contract.OperationMutationSchema, "update_auxiliary_text_settings", 179],
     [contract.OperationMutationSchema, "update_personalization_settings", 144],
     [contract.OperationMutationSchema, "update_language_tool_settings", 161],
     [contract.OperationMutationSchema, "update_agent_resource_settings", 163],
@@ -301,6 +303,28 @@ test("durable and cross-process field numbers remain stable", () => {
   for (const [schema, name, number] of expected) {
     assert.equal(field(schema, name).number, number, `${schema.typeName}.${name}`);
   }
+});
+
+test("auxiliary routing preserves ordered exact routes and independent revisions", () => {
+  const models = [
+    { backendId: "backend-a", providerId: "provider", modelId: "model" },
+    { backendId: "backend-b", providerId: "provider", modelId: "model" }
+  ];
+  const value = roundTrip(contract.AuxiliaryTextSettingsSchema, {
+    models, automaticModels: [models[1]],
+    options: [{ route: models[0], available: false, unavailableReason: "Credentials are unavailable." }],
+    revision: { value: 9007199254740993n }, runtimeRevision: "service-incarnation:7"
+  });
+  assert.deepEqual(value.models.map(({ backendId, providerId, modelId }) => ({ backendId, providerId, modelId })), models);
+  assert.equal(value.revision.value, 9007199254740993n);
+  assert.equal(value.runtimeRevision, "service-incarnation:7");
+  assert.equal(value.options[0].available, false);
+  const reset = roundTrip(contract.OperationMutationSchema, {
+    payload: { case: "updateAuxiliaryTextSettings", value: { models: [], expectedRevision: { value: 8n } } }
+  });
+  assert.equal(reset.payload.case, "updateAuxiliaryTextSettings");
+  assert.deepEqual(reset.payload.value.models, []);
+  assert.equal(reset.payload.value.expectedRevision.value, 8n);
 });
 
 test("public enum wire numbers remain stable", () => {

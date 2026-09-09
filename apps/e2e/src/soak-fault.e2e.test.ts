@@ -46,7 +46,7 @@ describe("configurable queue soak and dispatch fault matrix", () => {
         const queued = await submit(
           paired.clients.operation,
           paired.connectionId,
-          sendInputMutation(sessionId, `cycle ${cycle + 1} ${fault}`)
+          sendInputMutation(sessionId, BigInt(fixture!.application.store.getSession(sessionId).descriptor.binding.generation), `cycle ${cycle + 1} ${fault}`)
         );
         const runId = queueRunIdFrom(queued);
         if (fault === "clean") {

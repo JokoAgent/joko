@@ -43,11 +43,9 @@ describe("SSH config document", () => {
       "Host one two *.internal !blocked",
       "  HostName shared.example",
       "  PORT 2201",
-      "  ProxyJump jump.example",
-      "Host ?ingle * !never",
+      "Host ?ingle !never",
       "  User ignored",
       "Host fallback",
-      "  Port invalid",
       ""
     ].join("\n"));
     expect(document.concreteHosts({ ...scope, defaultUser: "local-user" })).toEqual([
@@ -76,6 +74,29 @@ describe("SSH config document", () => {
         source: "ssh_config"
       }
     ]);
+  });
+
+  it("resolves global and wildcard first values, negation, quoted values, and duplicate aliases", () => {
+    const document = parseSshConfig('User global\nHost *.internal !private.internal\n  Port 2222\nHost build.internal\n  HostName "build.example"\n  User overridden\nHost private.internal\n  Port 2200\nHost build.internal\n  Port 23\n');
+    expect(document.concreteHosts({ ...scope, defaultUser: "local" }).map(({ id, hostname, user, port }) => ({ id, hostname, user, port }))).toEqual([
+      { id: "build.internal", hostname: "build.example", user: "global", port: 2222 },
+      { id: "private.internal", hostname: "private.internal", user: "global", port: 2200 }
+    ]);
+  });
+
+  it.each([
+    "ProxyJump bastion", "ProxyCommand ssh -W %h:%p bastion", "IdentityFile ~/.ssh/private",
+    "IdentitiesOnly yes", "IdentityAgent another-agent", "CanonicalizeHostname yes", "HostKeyAlias different-host",
+    "Port invalid", "HostName %h.example", "Include other.conf", "Match all",
+    "ProxyCommand no", "IdentityFile none\n IdentityFile ~/.ssh/required", "HostKeyAlias none"
+  ])("rejects unsupported routing or invalid connection semantics: %s", (directive) => {
+    const document = parseSshConfig(`Host alpha\n  ${directive}\n`);
+    expect(() => document.concreteHosts({ ...scope, defaultUser: "local" })).toThrowError(expect.objectContaining({ code: "CONFIG_INVALID", retryable: false }));
+  });
+
+  it("does not let an unrelated host's proxy block a directly connectable alias", () => {
+    const document = parseSshConfig("Host *.private\n ProxyJump bastion\nHost public\n HostName example.test\n");
+    expect(document.concreteHosts({ ...scope, defaultUser: "local" })).toEqual([expect.objectContaining({ id: "public", hostname: "example.test" })]);
   });
 
   it("rejects malformed Host patterns instead of partially importing them", () => {

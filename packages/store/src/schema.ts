@@ -79,6 +79,7 @@ CREATE TABLE backends (
         error_json TEXT,
         capabilities_json TEXT NOT NULL,
         providers_json TEXT NOT NULL,
+        provider_runtime_support_json TEXT,
         models_json TEXT NOT NULL,
         tools_json TEXT NOT NULL,
         diagnostics_json TEXT NOT NULL,
@@ -383,9 +384,13 @@ CREATE TABLE message_embedding_state (
         cutoff_cursor INTEGER NOT NULL CHECK (cutoff_cursor >= 0),
         model_id TEXT NOT NULL,
         dimensions INTEGER NOT NULL CHECK (dimensions > 0),
+        backend_id TEXT,
         provider_id TEXT,
         cutoff_initialized INTEGER NOT NULL CHECK (cutoff_initialized IN (0, 1)),
-        provider_generation_id TEXT
+        provider_generation_id TEXT,
+        CHECK ((backend_id IS NULL AND provider_id IS NULL AND provider_generation_id IS NULL)
+          OR (length(backend_id) > 0 AND length(provider_id) > 0 AND length(provider_generation_id) > 0
+            AND backend_id IS NOT NULL AND provider_id IS NOT NULL AND provider_generation_id IS NOT NULL))
       ) STRICT;
 
 CREATE TABLE message_event_tombstones (
@@ -769,6 +774,16 @@ CREATE TABLE remote_hosts (
             AND credential_reference_id NOT GLOB '*[^A-Za-z0-9._:/@-]*'
           )
         ),
+        node_key_id TEXT CHECK (node_key_id IS NULL OR (
+          length(node_key_id) BETWEEN 1 AND 100
+          AND substr(node_key_id, 1, 1) GLOB '[A-Za-z0-9]'
+          AND node_key_id NOT GLOB '*[^A-Za-z0-9._-]*'
+        )),
+        node_key_fingerprint TEXT CHECK (node_key_fingerprint IS NULL OR (
+          length(node_key_fingerprint) = 50
+          AND substr(node_key_fingerprint, 1, 7) = 'SHA256:'
+          AND substr(node_key_fingerprint, 8) NOT GLOB '*[^A-Za-z0-9+/]*'
+        )),
         trust_algorithm TEXT CHECK (
           trust_algorithm IS NULL OR (
             length(trust_algorithm) BETWEEN 1 AND 128
@@ -790,13 +805,14 @@ CREATE TABLE remote_hosts (
           'connector_protocol', 'connector_unavailable', 'host_key_changed',
           'host_key_conflict', 'host_key_invalid', 'host_key_missing',
           'host_key_store_corrupt', 'host_key_store_missing',
-          'host_key_store_unreadable', 'host_key_store_write_failed'
+          'host_key_store_unreadable', 'host_key_store_write_failed',
+          'node_key_changed', 'node_key_unavailable'
         )),
         failure_retryable INTEGER CHECK (failure_retryable IS NULL OR failure_retryable IN (0, 1)),
         created_at INTEGER NOT NULL CHECK (created_at >= 0),
         updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
         revision INTEGER NOT NULL CHECK (revision >= 1), authentication_mode TEXT NOT NULL
-        CHECK (authentication_mode IN ('system_agent', 'private_key')),
+        CHECK (authentication_mode IN ('system_agent', 'private_key', 'node_key')),
         PRIMARY KEY(owner_id, target_id, host_id),
         CHECK (
           (trust_algorithm IS NULL AND trust_fingerprint IS NULL AND trust_pinned_at IS NULL)
@@ -1358,10 +1374,70 @@ CREATE TABLE session_lifecycle_cleanups (
 CREATE UNIQUE INDEX session_lifecycle_cleanups_pending_session_idx
         ON session_lifecycle_cleanups(session_id) WHERE state = 'pending';
 
+CREATE TABLE native_session_derivations (
+        operation_id TEXT PRIMARY KEY REFERENCES operations(id) ON DELETE RESTRICT,
+        body_hash TEXT NOT NULL,
+        source_session_id TEXT NOT NULL REFERENCES product_sessions(id) ON DELETE RESTRICT,
+        derived_session_id TEXT NOT NULL UNIQUE,
+        backend_id TEXT NOT NULL REFERENCES backends(id) ON DELETE RESTRICT,
+        backend_instance_generation INTEGER NOT NULL CHECK (backend_instance_generation >= 0),
+        target_id TEXT NOT NULL REFERENCES targets(id) ON DELETE RESTRICT,
+        source_native_opaque_ref TEXT NOT NULL,
+        source_native_session_id TEXT,
+        source_generation INTEGER NOT NULL CHECK (source_generation >= 0),
+        effective_workspace_root TEXT NOT NULL CHECK (
+          length(effective_workspace_root) BETWEEN 1 AND 32768
+          AND instr(effective_workspace_root, char(0)) = 0
+        ),
+        remote_host_id TEXT,
+        remote_workspace_root TEXT,
+        native_opaque_ref TEXT NOT NULL COLLATE NOCASE,
+        native_session_id TEXT,
+        generation INTEGER NOT NULL CHECK (generation >= 0),
+        state TEXT NOT NULL CHECK (state IN (
+          'recorded', 'adopted', 'cleanup_claimed', 'cleaned', 'cleanup_unknown'
+        )),
+        cleanup_token TEXT,
+        cleanup_started_at INTEGER CHECK (cleanup_started_at IS NULL OR cleanup_started_at >= 0),
+        adopted_at INTEGER CHECK (adopted_at IS NULL OR adopted_at >= 0),
+        cleaned_at INTEGER CHECK (cleaned_at IS NULL OR cleaned_at >= 0),
+        failure_code TEXT,
+        created_at INTEGER NOT NULL CHECK (created_at >= 0),
+        updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        UNIQUE(backend_id, native_opaque_ref),
+        CHECK ((remote_host_id IS NULL) = (remote_workspace_root IS NULL)),
+      CHECK (source_session_id <> derived_session_id OR generation = source_generation + 1),
+        CHECK (source_native_opaque_ref <> native_opaque_ref COLLATE NOCASE),
+        CHECK (state <> 'cleanup_claimed' OR (cleanup_token IS NOT NULL AND cleanup_started_at IS NOT NULL)),
+        CHECK ((state = 'adopted') = (adopted_at IS NOT NULL)),
+        CHECK ((state = 'cleaned') = (cleaned_at IS NOT NULL))
+      ) STRICT;
+
+CREATE TABLE native_binding_adoptions (
+        backend_id TEXT NOT NULL REFERENCES backends(id) ON DELETE RESTRICT,
+        native_opaque_ref TEXT NOT NULL COLLATE NOCASE,
+        session_id TEXT NOT NULL REFERENCES product_sessions(id) ON DELETE RESTRICT,
+        native_session_id TEXT,
+        first_generation INTEGER NOT NULL CHECK (first_generation >= 0),
+        adopted_at INTEGER NOT NULL CHECK (adopted_at >= 0),
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        PRIMARY KEY(backend_id, native_opaque_ref, session_id)
+      ) STRICT;
+
 CREATE INDEX artifacts_session_idx
         ON artifacts(session_id, created_at DESC) WHERE deleted_at IS NULL;
 
 CREATE INDEX artifacts_storage_key_idx ON artifacts(storage_key);
+
+CREATE TABLE artifact_relations (
+  parent_id TEXT NOT NULL REFERENCES artifacts(id),
+  child_id TEXT NOT NULL REFERENCES artifacts(id),
+  role TEXT NOT NULL CHECK(role = 'audio_artwork'),
+  PRIMARY KEY(parent_id, role),
+  CHECK(parent_id <> child_id)
+) STRICT;
+CREATE INDEX artifact_relations_child_idx ON artifact_relations(child_id);
 
 CREATE INDEX attempts_run_idx ON attempts(run_id, ordinal);
 
@@ -1632,18 +1708,20 @@ CREATE TRIGGER local_runtime_provider_bindings_owner_update
 CREATE TRIGGER remote_hosts_auth_insert
       BEFORE INSERT ON remote_hosts
       WHEN NOT (
-        (NEW.authentication_mode = 'system_agent' AND NEW.credential_reference_id IS NULL)
-        OR (NEW.authentication_mode = 'private_key' AND NEW.credential_reference_id IS NOT NULL)
+        (NEW.authentication_mode = 'system_agent' AND NEW.credential_reference_id IS NULL AND NEW.node_key_id IS NULL AND NEW.node_key_fingerprint IS NULL)
+        OR (NEW.authentication_mode = 'private_key' AND NEW.credential_reference_id IS NOT NULL AND NEW.node_key_id IS NULL AND NEW.node_key_fingerprint IS NULL)
+        OR (NEW.authentication_mode = 'node_key' AND NEW.credential_reference_id IS NULL AND NEW.node_key_id IS NOT NULL AND NEW.node_key_fingerprint IS NOT NULL)
       )
       BEGIN
         SELECT RAISE(ABORT, 'remote host authentication metadata is inconsistent');
       END;
 
 CREATE TRIGGER remote_hosts_auth_update
-      BEFORE UPDATE OF authentication_mode, credential_reference_id ON remote_hosts
+      BEFORE UPDATE OF authentication_mode, credential_reference_id, node_key_id, node_key_fingerprint ON remote_hosts
       WHEN NOT (
-        (NEW.authentication_mode = 'system_agent' AND NEW.credential_reference_id IS NULL)
-        OR (NEW.authentication_mode = 'private_key' AND NEW.credential_reference_id IS NOT NULL)
+        (NEW.authentication_mode = 'system_agent' AND NEW.credential_reference_id IS NULL AND NEW.node_key_id IS NULL AND NEW.node_key_fingerprint IS NULL)
+        OR (NEW.authentication_mode = 'private_key' AND NEW.credential_reference_id IS NOT NULL AND NEW.node_key_id IS NULL AND NEW.node_key_fingerprint IS NULL)
+        OR (NEW.authentication_mode = 'node_key' AND NEW.credential_reference_id IS NULL AND NEW.node_key_id IS NOT NULL AND NEW.node_key_fingerprint IS NOT NULL)
       )
       BEGIN
         SELECT RAISE(ABORT, 'remote host authentication metadata is inconsistent');
@@ -1731,7 +1809,7 @@ CREATE TRIGGER targets_remote_binding_update
       END;
 
 INSERT INTO store_meta(singleton, revision) VALUES (1, 0);
-INSERT INTO message_embedding_state(singleton, enabled, cutoff_cursor, model_id, dimensions, provider_id, cutoff_initialized, provider_generation_id) VALUES (1, 0, 0, 'voyage/voyage-4', 1024, NULL, 0, NULL);
+INSERT INTO message_embedding_state(singleton, enabled, cutoff_cursor, model_id, dimensions, backend_id, provider_id, cutoff_initialized, provider_generation_id) VALUES (1, 0, 0, 'voyage/voyage-4', 1024, NULL, NULL, 0, NULL);
 `;
 
 /** Exact first-release schema identity, including its marker table. */

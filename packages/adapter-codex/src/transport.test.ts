@@ -4,10 +4,126 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { StdioJsonRpcTransport } from "./transport.js";
+import { AppServerHost } from "./host.js";
 
 const fixture = fileURLToPath(new URL("./fixtures/fake-app-server.mjs", import.meta.url));
 
 describe("StdioJsonRpcTransport", () => {
+  it.each(["cancel", "timeout", "stale"] as const)("does not write a queued mutation after %s while the prior write is blocked", async (boundary) => {
+    const transport = new StdioJsonRpcTransport({ command: process.execPath, args: [fixture], requestTimeoutMs: 2_000 });
+    const cancellation = new AbortController();
+    let current = true;
+    try {
+      await transport.start({ onNotification: () => undefined, onRequest: () => undefined, onExit: () => undefined });
+      await transport.request("pause-input", {});
+      const padding = transport.notify("backpressure-padding", { value: "x".repeat(8 * 1024 * 1024) });
+      let paddingWritten = false;
+      void padding.then(() => { paddingWritten = true; });
+      const pending = transport.request(boundary === "stale" ? "thread/fork" : "turn/steer", {}, {
+        mutation: true,
+        signal: cancellation.signal,
+        timeoutMs: boundary === "timeout" ? 20 : 2_000,
+        beforeDispatch: () => {
+          if (!current) throw new Error("The captured history changed.");
+        }
+      }).catch((error: unknown) => error);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(paddingWritten).toBe(false);
+      if (boundary === "cancel") cancellation.abort();
+      if (boundary === "stale") current = false;
+      const failure = await pending;
+      if (boundary === "stale") expect(failure).toMatchObject({ message: "The captured history changed." });
+      else expect(failure).toMatchObject({ code: boundary === "cancel" ? "closed" : "request_timeout", stateMayHaveChanged: false });
+      await padding;
+      const received = await transport.request("received-methods", {});
+      expect(received).not.toContain("thread/fork");
+      expect(received).not.toContain("turn/steer");
+    } finally {
+      await transport.close();
+    }
+  });
+
+  it("observes the exact thread history revision before a response while notification delivery is blocked", async () => {
+    const host = new AppServerHost({ transport: { command: process.execPath, args: [fixture], requestTimeoutMs: 1_500 } });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const delivered: string[] = [];
+    const handlers = {
+      onNotification: async (method: string) => {
+        if (method === "fixture/held") await held;
+        delivered.push(method);
+      },
+      onRequest: async () => undefined,
+      onDisconnect: () => undefined
+    };
+    try {
+      const generation = await host.ensureStarted();
+      const subscription = await host.subscribe("history-thread", generation, handlers);
+      const initial = host.historyRevision("history-thread", generation);
+      expect(initial).toBeTypeOf("bigint");
+      expect(host.hasPendingThreadNotifications("history-thread", generation)).toBe(false);
+      await host.request("notifications-before-response", { notifications: [
+        { method: "fixture/held", params: { threadId: "history-thread" } },
+        { method: "thread/tokenUsage/updated", params: { threadId: "history-thread" } },
+        { method: "thread/reverted", params: { threadId: "foreign-thread" } }
+      ] });
+      expect(delivered).toEqual([]);
+      expect(host.hasPendingThreadNotifications("history-thread", generation)).toBe(true);
+      expect(host.historyRevision("history-thread", generation)).toBe(initial);
+      expect(host.historyRevision("foreign-thread", generation)).toBeUndefined();
+      expect(host.historyRevision("history-thread", generation + 1)).toBeUndefined();
+      for (const method of ["thread/reverted", "turn/completed", "item/agentMessage/delta"]) {
+        const before = host.historyRevision("history-thread", generation);
+        await host.request("notifications-before-response", { notifications: [{ method, params: { threadId: "history-thread" } }] });
+        expect(host.historyRevision("history-thread", generation)).not.toBe(before);
+        expect(delivered).toEqual([]);
+      }
+      const cancellation = new AbortController();
+      const cancelledWait = host.waitForThreadNotifications("history-thread", generation, cancellation.signal).catch((error: unknown) => error);
+      cancellation.abort();
+      expect(await cancelledWait).toMatchObject({ code: "closed" });
+      const retiredWait = host.waitForThreadNotifications("history-thread", generation, new AbortController().signal).catch((error: unknown) => error);
+      await subscription.release({ unsubscribe: false });
+      expect(await retiredWait).toMatchObject({ code: "process_exited" });
+      expect(host.historyRevision("history-thread", generation)).toBeUndefined();
+      await host.subscribe("history-thread", generation, handlers);
+      expect(host.historyRevision("history-thread", generation)).not.toBe(initial);
+      release();
+    } finally {
+      release();
+      await host.shutdown();
+    }
+  });
+
+  it("keeps descendant arrival pending through ownership registration and asynchronous delivery", async () => {
+    const host = new AppServerHost({ transport: { command: process.execPath, args: [fixture], requestTimeoutMs: 1_500 } });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    try {
+      const generation = await host.ensureStarted();
+      await host.subscribe("pending-root", generation, {
+        onNotification: () => undefined, onRequest: async () => undefined, onDisconnect: () => undefined,
+        onDescendantThreadStarted: () => undefined,
+        onDescendantNotification: async () => held
+      });
+      await host.request("notifications-before-response", { notifications: [{ method: "thread/started", params: { thread: { id: "pending-child", parentThreadId: "pending-root" } } }] });
+      expect(host.hasPendingThreadNotifications("pending-root", generation)).toBe(true);
+      await host.registerDescendantThread("pending-child", "pending-root", generation);
+      expect(host.hasPendingThreadNotifications("pending-root", generation)).toBe(false);
+      await host.request("notifications-before-response", { notifications: [{ method: "turn/started", params: { threadId: "pending-child", turn: { id: "child-turn" } } }] });
+      expect(host.hasPendingThreadNotifications("pending-root", generation)).toBe(true);
+      let settled = false;
+      const pendingDrain = host.waitForThreadNotifications("pending-root", generation, new AbortController().signal).then(() => { settled = true; });
+      await Promise.resolve();
+      expect(settled).toBe(false);
+      release();
+      await pendingDrain;
+      expect(host.hasPendingThreadNotifications("pending-root", generation)).toBe(false);
+    } finally {
+      release(); await host.shutdown();
+    }
+  });
+
   it("limits the default child environment and preserves an explicitly supplied environment", async () => {
     const unrelatedName = "JOKO_CODEX_UNRELATED_TEST_VALUE";
     const originalUnrelated = process.env[unrelatedName];

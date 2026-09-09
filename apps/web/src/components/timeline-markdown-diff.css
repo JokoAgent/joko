@@ -1,0 +1,28 @@
+.markdown .timeline-code-block > .timeline-code-block__diff {
+  padding-inline: 0;
+  white-space: pre;
+  overflow-wrap: normal;
+}
+.markdown .timeline-code-block > .timeline-code-block__diff:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.markdown .timeline-code-block__diff > code {
+  display: block;
+  min-width: 100%;
+  width: max-content;
+}
+.timeline-markdown-diff { display: block; }
+.timeline-markdown-diff__row {
+  display: grid;
+  grid-template-columns: var(--timeline-diff-number-width) 2ch minmax(0, 1fr);
+  min-height: 1.55em;
+  line-height: 1.55;
+}
+.timeline-markdown-diff__number,
+.timeline-markdown-diff__sign { user-select: none; }
+.timeline-markdown-diff__number { padding-inline: 4px; color: var(--text-faint); text-align: right; }
+.timeline-markdown-diff__sign { text-align: center; }
+.timeline-markdown-diff__text { padding-right: 12px; white-space: pre; }
+.timeline-markdown-diff__row--added { background: var(--green-soft); color: var(--green); }
+.timeline-markdown-diff__row--removed { background: var(--red-soft); color: var(--red); }

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, JSX } from "react";
 import { CirclePlus, Trash2 } from "lucide-react";
 
@@ -13,6 +13,8 @@ import type { Translator } from "./types.js";
 import { Button, ErrorBanner, IconButton, Modal, ModalBackButton, CheckboxControl, SelectControl } from "./ui.js";
 
 export interface McpServerEditorProps {
+  readonly returnFocus: HTMLElement;
+  readonly isCurrent: () => boolean;
   readonly server?: McpServerView;
   readonly credentials: readonly CredentialView[];
   readonly t: Translator;
@@ -21,25 +23,39 @@ export interface McpServerEditorProps {
   readonly onSaved: () => void;
 }
 
-export function McpServerEditor({ server, credentials, t, onClose, onSave, onSaved }: McpServerEditorProps): JSX.Element {
+export function McpServerEditor({ server, credentials, t, onClose, onSave, onSaved, returnFocus, isCurrent }: McpServerEditorProps): JSX.Element {
   const [draft, setDraft] = useState<McpServerDraft>(() => mcpServerDraft(server));
   const [argumentsText, setArgumentsText] = useState(() => formatMcpArguments(draft.arguments));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string>();
   const requestEpochRef = useRef(0);
+  const pendingRef = useRef(false);
+  const formRef = useRef<HTMLFormElement>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
   const editing = server !== undefined;
   const argumentsResult = useMemo(() => parseMcpArguments(argumentsText), [argumentsText]);
   const valid = mcpServerDraftIsValid(draft, argumentsResult);
 
-  useEffect(() => () => { requestEpochRef.current += 1; }, []);
+  useLayoutEffect(() => {
+    const win = formRef.current?.ownerDocument.defaultView;
+    const retire = (): void => { requestEpochRef.current += 1; onCloseRef.current(); };
+    win?.addEventListener("pagehide", retire);
+    return () => { requestEpochRef.current += 1; win?.removeEventListener("pagehide", retire); };
+  }, []);
 
   const close = (): void => {
     requestEpochRef.current += 1;
+    restoreFocus();
     onClose();
+  };
+  const restoreFocus = (): void => {
+    if (isCurrent() && returnFocus.isConnected && returnFocus.ownerDocument === formRef.current?.ownerDocument) returnFocus.focus({ preventScroll: true });
   };
   const submit = (event: FormEvent): void => {
     event.preventDefault();
-    if (!valid || (draft.transport === "stdio" && !argumentsResult.ok) || saving) return;
+    if (!isCurrent() || !valid || (draft.transport === "stdio" && !argumentsResult.ok) || pendingRef.current) return;
+    pendingRef.current = true;
     const epoch = ++requestEpochRef.current;
     setSaving(true);
     setError(undefined);
@@ -47,11 +63,11 @@ export function McpServerEditor({ server, credentials, t, onClose, onSave, onSav
       ...draft,
       arguments: argumentsResult.ok ? argumentsResult.value : draft.arguments
     }).then(() => {
-      if (requestEpochRef.current === epoch) onSaved();
+      if (requestEpochRef.current === epoch && isCurrent()) { restoreFocus(); onSaved(); }
     }).catch((cause: unknown) => {
-      if (requestEpochRef.current === epoch) setError(messageOf(cause, t("settings.mcpSaveFailed")));
+      if (requestEpochRef.current === epoch && isCurrent()) setError(messageOf(cause, t("settings.mcpSaveFailed")));
     }).finally(() => {
-      if (requestEpochRef.current === epoch) setSaving(false);
+      if (requestEpochRef.current === epoch) { pendingRef.current = false; setSaving(false); }
     });
   };
   const setTransport = (transport: McpServerDraft["transport"]): void => {
@@ -73,8 +89,9 @@ export function McpServerEditor({ server, credentials, t, onClose, onSave, onSav
     onClose={close}
     headerLeading={<ModalBackButton label={t("common.back")} onClick={close} />}
     dismissOnBackdrop={!saving}
+    restoreFocus={false}
   >
-    <form className="settings-form" aria-busy={saving} onSubmit={submit}>
+    <form ref={formRef} className="settings-form" aria-busy={saving} onSubmit={submit}>
       {error !== undefined && <ErrorBanner message={error} onClose={() => setError(undefined)} />}
       <div className="settings-form__grid">
         <label className="field"><span>{t("settings.serverId")}</span><input
@@ -93,8 +110,8 @@ export function McpServerEditor({ server, credentials, t, onClose, onSave, onSav
           disabled={saving}
           value={draft.transport}
           onChange={(event) => setTransport(event.target.value as McpServerDraft["transport"])}
-        ><option value="https">HTTPS Streamable HTTP</option><option value="stdio">Stdio</option></SelectControl></label>
-        {draft.transport === "https" ? <label className="field"><span>{t("settings.endpoint")}</span><input
+        ><option value="https">HTTPS Streamable HTTP</option><option value="sse">HTTP SSE</option><option value="stdio">Stdio</option></SelectControl></label>
+        {draft.transport !== "stdio" ? <label className="field"><span>{t("settings.endpoint")}</span><input
           type="url"
           required
           disabled={saving}
@@ -236,7 +253,7 @@ export function mcpServerDraft(server?: McpServerView): McpServerDraft {
     id: server?.id ?? "",
     revision: server?.revision ?? 0n,
     name: server?.name ?? "",
-    transport: server?.transport === "stdio" ? "stdio" : "https",
+    transport: server?.transport === "stdio" ? "stdio" : server?.transport === "sse" ? "sse" : "https",
     endpoint: server?.endpoint ?? "",
     command: server?.command ?? "",
     arguments: [...(server?.arguments ?? [])],
@@ -272,7 +289,7 @@ export function formatMcpArguments(arguments_: readonly string[]): string {
 
 export function mcpServerDraftIsValid(draft: McpServerDraft, argumentsResult: McpArgumentsResult): boolean {
   if (draft.name.trim().length === 0 || (draft.transport === "stdio" && !argumentsResult.ok)) return false;
-  if (draft.transport === "https" ? draft.endpoint.trim().length === 0 : draft.command.trim().length === 0) return false;
+  if (draft.transport === "stdio" ? draft.command.trim().length === 0 : draft.endpoint.trim().length === 0) return false;
   const bindingTargets = new Set<string>();
   for (const binding of draft.credentialBindings) {
     if (binding.credentialId.trim().length === 0 || binding.name.trim().length === 0) return false;

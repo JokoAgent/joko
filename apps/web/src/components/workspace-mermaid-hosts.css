@@ -11,6 +11,7 @@
   overflow: hidden;
   padding: 0;
 }
+.workspace-mermaid-source-modal__content { display: flex; flex-direction: column; min-height: 0; flex: 1; }
 .workspace-mermaid-source-modal__field {
   min-height: 0;
   flex: 1;
@@ -73,6 +74,7 @@
   justify-content: center;
   cursor: grab;
   user-select: none;
+  touch-action: none;
 }
 .workspace-mermaid-lightbox__stage.is-dragging { cursor: grabbing; }
 .workspace-mermaid-lightbox__card {

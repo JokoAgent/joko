@@ -7,6 +7,7 @@ import type {
 } from "@joko/core";
 import {
   NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD,
+  isNativeNavigationTarget,
   nativeHistoryEventContext,
   withNativeHistoryEventContext
 } from "@joko/core";
@@ -43,6 +44,9 @@ export function projectNativeHistory(
     const nativeParentEntryId = event.nativeParentEntryId === undefined
       ? undefined
       : boundedIdentity(event.nativeParentEntryId, "parent entry", 4_096);
+    if (event.nativeRewindBefore !== undefined && !isNativeNavigationTarget(event.nativeRewindBefore)) {
+      throw new Error("Native history projection contains an invalid rewind target.");
+    }
     const projectionKind = boundedIdentity(event.projectionKind, "projection kind", 256);
     if (!Number.isSafeInteger(event.contentIndex) || event.contentIndex < 0) {
       throw new Error("Native history projection contains an invalid content index.");
@@ -59,7 +63,8 @@ export function projectNativeHistory(
     const payload = withNativeHistoryEventContext(event.payload, {
       identity: {
         entryId: nativeEntryId,
-        ...(nativeParentEntryId === undefined ? {} : { parentEntryId: nativeParentEntryId })
+        ...(nativeParentEntryId === undefined ? {} : { parentEntryId: nativeParentEntryId }),
+        ...(event.nativeRewindBefore === undefined ? {} : { rewindBefore: event.nativeRewindBefore })
       }
     });
     return {

@@ -21,7 +21,7 @@ const cleanups: Array<() => void> = [];
 afterEach(() => { for (const cleanup of cleanups.splice(0).reverse()) cleanup(); });
 
 describe("Backend model access", () => {
-  it("persists Provider and model disables independently and removes empty state", () => {
+  it("persists Provider and model disables independently and retains the restored access revision", () => {
     const store = createStore();
     writeBackendModelAccess(store, "backend-a", create(BackendModelAccessUpdateSchema, {
       providerId: "provider-a",
@@ -48,12 +48,16 @@ describe("Backend model access", () => {
     expect(providerRoutingEnabled(store, "backend-a", "provider-a")).toBe(true);
     expect(modelRoutingEnabled(store, "backend-a", "provider-b", "model-b")).toBe(false);
 
+    const restrictedRevision = store.findSetting("service", "orchestrator", backendModelAccessSettingKey("backend-a"))!.revision;
     writeBackendModelAccess(store, "backend-a", create(BackendModelAccessUpdateSchema, {
       providerId: "provider-b",
       modelId: "model-b",
       enabled: true
     }));
-    expect(store.findSetting("service", "orchestrator", backendModelAccessSettingKey("backend-a"))).toBeUndefined();
+    const restored = store.findSetting("service", "orchestrator", backendModelAccessSettingKey("backend-a"))!;
+    expect(restored.value).toMatchObject({ disabledProviderIds: [], disabledModels: [] });
+    expect(restored.revision).toBeGreaterThan(restrictedRevision);
+    expect(modelRoutingEnabled(store, "backend-a", "provider-b", "model-b")).toBe(true);
   });
 
   it("keeps Backend namespaces isolated", () => {

@@ -536,6 +536,7 @@ export class SchedulerToolBridgeProvider implements BridgeToolProvider {
       ? {}
       : schedule.executionSnapshot;
     const installed = await this.#hookScripts.install({
+      backendId: caller.backendId,
       workspaceRoot: target.workspaceRoot,
       ...(schedule === undefined ? {} : { scheduleId: schedule.id }),
       scheduleName: schedule?.name ?? optionalText(input["scheduleName"], "scheduleName", 256),

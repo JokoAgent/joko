@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { deferredShareValue, pngBlob, shareImageTestPalette, shareImageTestSurface } from "./share-image.test-support.js";
 import {
   MAXIMUM_SHARE_IMAGE_EDGE_PIXELS,
   MAXIMUM_SHARE_IMAGE_PIXELS,
@@ -15,7 +16,6 @@ import {
   wrapShareMessageText
 } from "./share-message-image.js";
 
-afterEach(() => vi.unstubAllGlobals());
 
 describe("share-message PNG layout", () => {
   it("wraps paragraphs and unbroken tokens without exceeding the measured width", () => {
@@ -52,78 +52,82 @@ describe("share-message PNG layout", () => {
   });
 });
 
-describe("share-message PNG integrity", () => {
+describe("share-message PNG integrity and delivery", () => {
   it("accepts only a real PNG signature", async () => {
-    await expect(assertPngBlob(new Blob([new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 1])], { type: "image/png" }))).resolves.toBeUndefined();
-    await expect(assertPngBlob(new Blob(["not png"], { type: "image/png" }))).rejects.toBeInstanceOf(ShareMessageImageEncodingError);
-    await expect(assertPngBlob(new Blob([new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10])], { type: "image/jpeg" }))).rejects.toBeInstanceOf(ShareMessageImageEncodingError);
+    const { action } = shareImageTestSurface();
+    await expect(assertPngBlob(pngBlob(), action)).resolves.toBeUndefined();
+    await expect(assertPngBlob(new Blob(["not png"], { type: "image/png" }), action)).rejects.toBeInstanceOf(ShareMessageImageEncodingError);
+    await expect(assertPngBlob(new Blob([await pngBlob().arrayBuffer()], { type: "image/jpeg" }), action)).rejects.toBeInstanceOf(ShareMessageImageEncodingError);
   });
 
-  it("requests browser canvas PNG encoding and rejects no intermediate format", async () => {
-    const encoded = new Blob([new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 1])], { type: "image/png" });
-    const encodingTypes: string[] = [];
-    const context = new Proxy({
-      measureText: (value: string) => ({ width: value.length * 8 })
-    } as unknown as CanvasRenderingContext2D, {
-      get(target, property) {
-        if (property in target) return Reflect.get(target, property);
-        return vi.fn();
-      },
-      set(target, property, value) {
-        return Reflect.set(target, property, value);
-      }
-    });
-    const canvas = {
-      width: 0,
-      height: 0,
-      getContext: () => context,
-      toBlob: (callback: BlobCallback, type?: string) => { encodingTypes.push(type ?? ""); callback(encoded); }
-    } as unknown as HTMLCanvasElement;
-    vi.stubGlobal("document", { createElement: () => canvas });
+  it("encodes using the initiating document and releases its canvas, including retired encoding", async () => {
+    const surface = shareImageTestSurface();
+    const content = { sessionName: "Task", role: "assistant" as const, roleLabel: "Agent", text: "Completed the review.", attachmentsLabel: "Attachments" };
+    await expect(buildShareMessageImagePng(content, surface.action, shareImageTestPalette)).resolves.toMatchObject({ type: "image/png" });
+    expect(surface.canvas.toBlob).toHaveBeenCalledWith(expect.any(Function), "image/png");
+    expect([surface.canvas.width, surface.canvas.height]).toEqual([0, 0]);
 
-    const result = await buildShareMessageImagePng({
-      sessionName: "Task",
-      role: "assistant",
-      roleLabel: "Agent",
-      text: "Completed the review.",
-      attachmentsLabel: "Attachments"
-    }, {
-      background: "white",
-      surface: "white",
-      text: "black",
-      secondaryText: "gray",
-      line: "gray",
-      accent: "orange",
-      accentInk: "black",
-      fontFamily: "sans-serif"
-    });
-
-    expect(encodingTypes).toEqual(["image/png"]);
-    expect(result).toBe(encoded);
-    expect(canvas.width).toBeGreaterThan(0);
-    expect(canvas.height).toBeGreaterThan(0);
+    let finish!: BlobCallback;
+    surface.canvas.toBlob.mockImplementationOnce((callback) => { finish = callback; });
+    const pending = buildShareMessageImagePng(content, surface.action, shareImageTestPalette);
+    const rejected = expect(pending).rejects.toThrow();
+    surface.abort.abort();
+    await rejected;
+    expect([surface.canvas.width, surface.canvas.height]).toEqual([0, 0]);
+    finish(pngBlob());
   });
 
-  it("delivers a validated PNG through a real browser download fallback", async () => {
-    const blob = new Blob([new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 1])], { type: "image/png" });
-    const click = vi.fn();
-    const remove = vi.fn();
-    const appendChild = vi.fn();
-    const revokeObjectURL = vi.fn();
-    vi.stubGlobal("File", undefined);
-    vi.stubGlobal("navigator", {});
-    vi.stubGlobal("document", {
-      createElement: () => ({ href: "", download: "", rel: "", hidden: false, click, remove }),
-      body: { appendChild }
-    });
-    vi.stubGlobal("URL", { createObjectURL: () => "blob:joko-share", revokeObjectURL });
-    vi.stubGlobal("window", { setTimeout: (callback: () => void) => { callback(); return 1; } });
+  it.each(["aborted", "navigated"] as const)("does not dispatch after PNG validation becomes %s", async (reason) => {
+    const surface = shareImageTestSurface();
+    const bytes = deferredShareValue<ArrayBuffer>();
+    const blob = pngBlob();
+    vi.spyOn(blob, "slice").mockReturnValue({ arrayBuffer: () => bytes.promise } as Blob);
+    const pending = deliverShareMessageImage(blob, "task.png", "Task", surface.action);
+    const rejected = expect(pending).rejects.toThrow();
+    if (reason === "aborted") surface.abort.abort();
+    else surface.window.document = { createElement: vi.fn() };
+    bytes.resolve(await pngBlob().arrayBuffer());
+    await rejected;
+    expect(surface.share).not.toHaveBeenCalled();
+    expect(surface.click).not.toHaveBeenCalled();
+  });
 
-    await expect(deliverShareMessageImage(blob, "joko-task.png", "Task")).resolves.toBe("downloaded");
-    expect(appendChild).toHaveBeenCalledOnce();
-    expect(click).toHaveBeenCalledOnce();
-    expect(remove).toHaveBeenCalledOnce();
-    expect(revokeObjectURL).toHaveBeenCalledWith("blob:joko-share");
+  it("uses the initiating share capability and downloads only when preflight declines", async () => {
+    const surface = shareImageTestSurface();
+    await expect(deliverShareMessageImage(pngBlob(), "task.png", "Task", surface.action)).resolves.toBe("shared");
+    expect(surface.share).toHaveBeenCalledOnce();
+    expect(surface.click).not.toHaveBeenCalled();
+    surface.window.navigator.canShare.mockReturnValue(false);
+    await expect(deliverShareMessageImage(pngBlob(), "task.png", "Task", surface.action)).resolves.toBe("dispatched");
+    expect(surface.share).toHaveBeenCalledOnce();
+    expect(surface.click).toHaveBeenCalledOnce();
+    surface.window.dispatchEvent(new Event("pagehide"));
+    expect(surface.window.URL.revokeObjectURL).toHaveBeenCalledExactlyOnceWith("blob:share-image");
+  });
+
+  it("preserves native cancellation, unknown failure and an already issued success without a second download", async () => {
+    const surface = shareImageTestSurface();
+    surface.share.mockRejectedValueOnce(new DOMException("cancelled", "AbortError"));
+    await expect(deliverShareMessageImage(pngBlob(), "task.png", "Task", surface.action)).resolves.toBe("cancelled");
+    surface.share.mockRejectedValueOnce(new Error("Native result unavailable"));
+    await expect(deliverShareMessageImage(pngBlob(), "task.png", "Task", surface.action)).rejects.toThrow("Native result unavailable");
+    const completion = deferredShareValue<void>();
+    surface.share.mockImplementationOnce(() => { surface.abort.abort(); return completion.promise; });
+    const issued = deliverShareMessageImage(pngBlob(), "task.png", "Task", surface.action);
+    await vi.waitFor(() => expect(surface.share).toHaveBeenCalledTimes(3));
+    completion.resolve();
+    await expect(issued).resolves.toBe("shared");
+    expect(surface.click).not.toHaveBeenCalled();
+  });
+
+  it.each(["missing", "throws", "inactive"] as const)("chooses browser delivery when file-share preflight is %s", async (capability) => {
+    const surface = shareImageTestSurface();
+    if (capability === "missing") Reflect.deleteProperty(surface.window.navigator, "canShare");
+    else if (capability === "throws") surface.window.navigator.canShare.mockImplementation(() => { throw new Error("unsupported"); });
+    else surface.window.navigator.userActivation.isActive = false;
+    await expect(deliverShareMessageImage(pngBlob(), "task.png", "Task", surface.action)).resolves.toBe("dispatched");
+    expect(surface.share).not.toHaveBeenCalled();
+    expect(surface.click).toHaveBeenCalledOnce();
   });
 
   it("creates a bounded filesystem-safe Joko filename", () => {

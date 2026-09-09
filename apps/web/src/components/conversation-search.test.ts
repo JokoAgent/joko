@@ -354,6 +354,7 @@ function target(id: string, name: string): TargetView {
     backendId: "backend",
     name,
     workspaceId: `workspace-${id}`,
+    revision: 1n,
     workspaceName: name,
     trusted: true,
     pinned: false,

@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
 import { extname } from "node:path";
 
-import type { BlobRef, PortableNativeSession } from "@joko/core";
-import type { PersistedEvent } from "@joko/store";
+import type { AudioArtifactMetadata, BlobRef, PortableNativeSession } from "@joko/core";
+import { operationBodyHash, type OperationalStore, type PersistedEvent } from "@joko/store";
+import { decodeAudioArtwork, inspectAudioArtifact } from "./audio-artifact-media.js";
 
 import {
   createPortableSessionManifest,
@@ -54,6 +55,7 @@ export interface PreparedPortableSessionImport {
 export interface MaterializedPortableSessionImport {
   readonly manifest: PortableSessionManifest;
   readonly projection: PortableSessionProjection;
+  readonly blobs: readonly BlobRef[];
   readonly events: ReturnType<typeof portableProjectionEventPayloads>;
   readonly nativeSession?: PreparedPortableSessionImport["nativeSession"];
   readonly collaboration?: PortableCollaborationProjection;
@@ -136,6 +138,13 @@ export async function buildPortableSessionExport(
   }
 
   const projection = omitUnavailablePortableProjectionBlobs(initialProjection, availableIds);
+  const retained = collectPortableProjectionBlobRefs(projection);
+  for (let index = mediaMapItems.length - 1; index >= 0; index -= 1) {
+    if (retained.has(mediaMapItems[index]!.sourceId)) continue;
+    mediaBytes -= mediaEntries[index]!.bytes.byteLength;
+    mediaEntries.splice(index, 1);
+    mediaMapItems.splice(index, 1);
+  }
   const projectionBytes = encodePortableSessionProjection(projection);
   const missingMediaCount = requestedBlobs.size - availableIds.size;
   const workers = [...(input.workers ?? [])];
@@ -232,6 +241,7 @@ export function preparePortableSessionImport(
     throw new Error("Portable Session package has no valid product message projection.");
   }
   const projection = decodePortableSessionProjection(projectionEntry.bytes);
+  audioMetadataByBlob(projection);
   const requested = collectPortableProjectionBlobRefs(projection);
   const mediaMapEntry = byPath.get("projection/media-map.json");
   const mediaMap = mediaMapEntry === undefined
@@ -282,6 +292,22 @@ export async function materializePortableSessionImport(
     readonly sha256: string;
   }) => Promise<BlobRef>
 ): Promise<MaterializedPortableSessionImport> {
+  // Validate every typed media claim before creating any receiving identities.
+  const media = new Map(prepared.media.map((item) => [item.sourceId, item]));
+  const artworkInfo = new Map<string, Awaited<ReturnType<typeof decodeAudioArtwork>>>();
+  for (const [id, audio] of audioMetadataByBlob(prepared.projection)) {
+    const item = media.get(id);
+    if (item === undefined) throw new Error("Portable audio Artifact is missing its media.");
+    await inspectAudioArtifact(item.bytes, item.blob.mimeType);
+    if (audio.artwork === undefined) continue;
+    const cover = media.get(audio.artwork.blob.id);
+    if (cover === undefined) throw new Error("Portable audio artwork is missing its media.");
+    const info = artworkInfo.get(cover.sourceId) ?? await decodeAudioArtwork(cover.bytes, cover.blob.mimeType);
+    artworkInfo.set(cover.sourceId, info);
+    if (info.width !== audio.artwork.width || info.height !== audio.artwork.height) {
+      throw new Error("Portable audio artwork dimensions do not match its media.");
+    }
+  }
   const replacements = new Map<string, BlobRef>();
   for (const item of prepared.media) {
     const stored = await storeBlob({
@@ -300,10 +326,34 @@ export async function materializePortableSessionImport(
   return {
     manifest: prepared.manifest,
     projection,
+    blobs: [...replacements.values()],
     events: portableProjectionEventPayloads(projection),
     ...(prepared.nativeSession === undefined ? {} : { nativeSession: prepared.nativeSession }),
     ...(prepared.collaboration === undefined ? {} : { collaboration: prepared.collaboration })
   };
+}
+
+/** Called only inside the receiving Session's adoption transaction. */
+export function adoptPortableSessionArtifacts(store: OperationalStore, materialized: MaterializedPortableSessionImport, sessionId: string): void {
+  const audio = audioMetadataByBlob(materialized.projection);
+  for (const blob of materialized.blobs) if (!audio.has(blob.id)) store.adoptSessionArtifact({ blob, sessionId });
+  for (const blob of materialized.blobs) {
+    const metadata = audio.get(blob.id);
+    if (metadata !== undefined) store.adoptSessionArtifact({ blob, sessionId, audioMetadata: metadata });
+  }
+}
+
+function audioMetadataByBlob(projection: PortableSessionProjection): ReadonlyMap<string, AudioArtifactMetadata> {
+  const values = new Map<string, AudioArtifactMetadata>();
+  const add = (blob: BlobRef, audio: AudioArtifactMetadata | undefined): void => {
+    if (audio === undefined) return;
+    const previous = values.get(blob.id);
+    if (previous !== undefined && operationBodyHash(previous) !== operationBodyHash(audio)) throw new Error("Portable audio Artifact has conflicting metadata.");
+    values.set(blob.id, audio);
+  };
+  for (const message of projection.messages) for (const block of message.blocks) if (block.kind === "artifact") add(block.blob, block.audioMetadata);
+  for (const { payload } of projection.artifacts) if (payload.type === "artifact") add(payload.artifact, payload.audioMetadata);
+  return values;
 }
 
 function parseMediaMap(entry: PortableSessionPackage["entries"][number]): PortableMediaMap {

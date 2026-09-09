@@ -79,7 +79,8 @@ describe("PersonalizationSettings persistence", () => {
         activeProfile: { id: "profile-one", serverId: "orchestrator-one", name: "Orchestrator", origin: "https://orchestrator.invalid" },
         preferences: {
           locale: "en",
-          linkOpenPreference: "external",
+          webLinkOpenPreference: "sidebar",
+          localLinkOpenPreference: "external",
           streamFadeEnabled: false,
           messageNavRailEnabled: false
         },
@@ -112,7 +113,8 @@ describe("PersonalizationSettings persistence", () => {
     await restore(container.querySelector('[aria-labelledby="personalization-prompt-heading"]'));
     await restore(container.querySelector('[aria-labelledby="vision-bridge-title"]'));
     await restore(container.querySelector('[aria-labelledby="personalization-compaction-heading"]'));
-    await restore(container.querySelector('[aria-labelledby="personalization-links-heading"]'));
+    await restore(required(container.querySelector('[aria-label="Select external web link destination"]')).closest(".personalization-link-row"));
+    await restore(required(container.querySelector('[aria-label="Select local web link destination"]')).closest(".personalization-link-row"));
     await restore(container.querySelector('[aria-labelledby="personalization-stream-heading"]'));
     await restore(container.querySelector(".prompt-recommendation"));
     await restore(required(container.querySelector<HTMLInputElement>('[aria-label="Toggle chat semantic indexing"]')).closest(".personalization-tip-row"));
@@ -121,7 +123,7 @@ describe("PersonalizationSettings persistence", () => {
     expect(resetPersonalizationPrompt).toHaveBeenCalledOnce();
     expect(updateVisionBridgeSettings).toHaveBeenCalledWith({ resetAll: true });
     expect(updatePiSettings).toHaveBeenCalledWith("pi", { resetAutoCompactionThresholdPercent: true });
-    expect(resetLinkOpenPreference).toHaveBeenCalledOnce();
+    expect(resetLinkOpenPreference.mock.calls).toEqual([["web"], ["local"]]);
     expect(resetStreamFadeEnabled).toHaveBeenCalledOnce();
     expect(resetPromptRecommendationSettings).toHaveBeenCalledOnce();
     expect(resetMessageSearchSettings).toHaveBeenCalledOnce();
@@ -131,7 +133,8 @@ describe("PersonalizationSettings persistence", () => {
       "personalization-prompt:reset",
       "vision-bridge-reset",
       "pi-auto-compact-threshold:reset",
-      "link-open:reset",
+      "link-open:web:reset",
+      "link-open:local:reset",
       "stream-fade:reset",
       "prompt-recommendation:reset",
       "message-search-semantic-index:reset",
@@ -139,16 +142,19 @@ describe("PersonalizationSettings persistence", () => {
     ]);
   });
 
-  it("rolls an optimistic local preference back when persistence fails", async () => {
+  it("keeps link rows independent while saving and rolls only a failed row back", async () => {
     const snapshot = emptySnapshot();
+    let rejectSave: (error: Error) => void = () => undefined;
+    const save = vi.fn(() => new Promise<void>((_resolve, reject) => { rejectSave = reject; }));
     const controller = {
       getPersonalizationPrompt: () => "",
-      setLinkOpenPreference: vi.fn(async () => { throw new Error("write failed"); }),
+      setLinkOpenPreference: save,
       state: {
         activeProfile: { id: "profile-one", serverId: "orchestrator-one", name: "Orchestrator", origin: "https://orchestrator.invalid" },
         preferences: {
           locale: "en",
-          linkOpenPreference: "sidebar",
+          webLinkOpenPreference: "external",
+          localLinkOpenPreference: "sidebar",
           streamFadeEnabled: true,
           messageNavRailEnabled: true
         },
@@ -167,15 +173,29 @@ describe("PersonalizationSettings persistence", () => {
       t={(key, values) => translate("en", key, values)}
     />));
 
-    const external = required(container.querySelector<HTMLButtonElement>('[role="radio"]:last-child'));
+    const web = required(container.querySelector('[aria-label="Select external web link destination"]'));
+    const local = required(container.querySelector('[aria-label="Select local web link destination"]'));
+    const external = required(local.querySelector<HTMLButtonElement>('[role="radio"]:last-child'));
     await act(async () => {
       external.click();
       await Promise.resolve();
     });
 
-    const sidebar = required(container.querySelector<HTMLButtonElement>('[role="radio"]:first-child'));
+    expect(save).toHaveBeenCalledWith("local", "external");
+    expect(external.disabled).toBe(true);
+    expect(local.closest(".personalization-link-row")?.getAttribute("aria-busy")).toBe("true");
+    expect(required(web.querySelector<HTMLButtonElement>('[role="radio"]')).disabled).toBe(false);
+    expect(required(web.querySelector('[role="radio"]:last-child')).getAttribute("aria-checked")).toBe("true");
+    await act(async () => {
+      rejectSave(new Error("write failed"));
+      await Promise.resolve();
+    });
+    const sidebar = required(local.querySelector<HTMLButtonElement>('[role="radio"]:first-child'));
     expect(sidebar.getAttribute("aria-checked")).toBe("true");
     expect(external.getAttribute("aria-checked")).toBe("false");
+    expect(external.disabled).toBe(false);
+    expect(local.closest(".personalization-link-row")?.getAttribute("aria-busy")).toBe("false");
+    expect(required(web.querySelector('[role="radio"]:last-child')).getAttribute("aria-checked")).toBe("true");
   });
 });
 

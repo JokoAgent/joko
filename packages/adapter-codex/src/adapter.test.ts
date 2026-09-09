@@ -1,4 +1,5 @@
 import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -9,12 +10,17 @@ import type {
   InteractionDecision,
   InteractionPayload,
   NativeSessionBinding,
+  ManagedProviderRuntimePort,
+  ManagedProviderRouteBinding,
+  ProviderModel,
   TargetDescriptor
 } from "@joko/core";
 import { CAPABILITIES } from "@joko/core";
-import { afterEach, describe, expect, it } from "vitest";
-import { CodexBackendAdapter, type CodexAdapterOptions } from "./adapter.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { CodexBackendAdapter, CODEX_MANAGED_PROVIDER_SUPPORT, type CodexAdapterOptions } from "./adapter.js";
 import { AppServerHost } from "./host.js";
+import { TransportFault } from "./errors.js";
+import type { JsonObject } from "./protocol.js";
 import { FakeCodexAppServer } from "./testing.js";
 
 const cleanups: (() => Promise<void>)[] = [];
@@ -24,6 +30,72 @@ afterEach(async () => {
 });
 
 describe("CodexBackendAdapter", () => {
+  it("keeps managed routes on the original thread, authorizes only the active operation, and adopts revisions before new input", async () => {
+    let revision = "1";
+    let enabled = true;
+    const model: ProviderModel = { providerId: "custom", modelId: "custom-model", displayName: "Custom", api: "openai-responses", contextWindow: 0, maxOutputTokens: 0, supportsImages: false, supportsFastMode: false, thinkingLevels: [], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+    const released = vi.fn();
+    const retired = vi.fn();
+    const operations: Parameters<ManagedProviderRouteBinding["activate"]>[0][] = [];
+    const port: ManagedProviderRuntimePort = {
+      support: CODEX_MANAGED_PROVIDER_SUPPORT, environment: { JOKO_PROVIDER_PROXY_TOKEN: "private-fixture-token" }, secretEnvironmentNames: ["JOKO_PROVIDER_PROXY_TOKEN"],
+      dispose: retired, hasProvider: (id) => id === "custom", listModels: () => enabled ? [model] : [], listProviders: () => [], getThinkingLevelMap: () => ({}),
+      prepare: vi.fn(async (owner: Parameters<ManagedProviderRuntimePort["prepare"]>[0]): Promise<ManagedProviderRouteBinding> => {
+        expect(owner).toMatchObject({ backendId: "codex-test", backendInstanceGeneration: 7, targetId: "target-codex", sessionId: "session-codex", sessionGeneration: 1, providerId: "custom", modelId: "custom-model" });
+        if (!enabled) throw new Error("route disabled");
+        const captured = revision;
+        let disposed = false;
+        return {
+          providerId: "custom", model, protocol: "openai-responses", revision: captured, baseUrl: `http://127.0.0.1:1234/managed/route-${captured}`, apiKeyEnvironment: "JOKO_PROVIDER_PROXY_TOKEN", thinkingLevelMap: {},
+          assertCurrent: () => { if (disposed || captured !== revision || !enabled) throw new Error("route changed"); },
+          activate: async (operation) => { operation.assertCurrent(); operations.push(operation); return { release: released }; },
+          dispose: () => { disposed = true; }
+        };
+      })
+    };
+    const setup = await createSetup(7, { managedProviders: port });
+    const binding = await setup.adapter.createSession({ ...sessionInput(setup.target), providerId: model.providerId, modelId: model.modelId }, context(setup.target, [], { backendInstanceGeneration: 7 }));
+    const nativeStart = setup.fake.transport!.requests.find((request) => request.method === "thread/start")!;
+    expect(nativeStart.params).toMatchObject({ modelProvider: "custom", config: { model_providers: { custom: { env_key: "JOKO_PROVIDER_PROXY_TOKEN", wire_api: "responses", request_max_retries: 0 } }, "shell_environment_policy.exclude": ["JOKO_PROVIDER_PROXY_TOKEN"] } });
+    expect(JSON.stringify(nativeStart)).not.toContain("private-fixture-token");
+    const operationContext = (id: string) => context(setup.target, [], { binding, backendInstanceGeneration: 7, operationId: id });
+    await setup.adapter.send(prompt("first"), operationContext("one"));
+    expect(operations).toHaveLength(1);
+    revision = "2";
+    expect(() => operations[0]!.assertCurrent()).not.toThrow();
+    await setup.adapter.send({ ...prompt("steer"), disposition: "steer" }, operationContext("steer"));
+    expect(operations).toHaveLength(1);
+    await setup.fake.completeTurn(binding.nativeSessionId!, "done");
+    expect(released).toHaveBeenCalledTimes(1);
+    expect(() => operations[0]!.assertCurrent()).toThrow();
+    await setup.adapter.send(prompt("second"), operationContext("two"));
+    const requests = setup.fake.transport!.requests;
+    const resumeIndex = requests.findIndex((request) => request.method === "thread/resume");
+    expect(requests.slice(0, resumeIndex).at(-1)?.method).toBe("thread/unsubscribe");
+    expect(requests[resumeIndex]?.params).toMatchObject({ threadId: binding.nativeSessionId, modelProvider: "custom", model: "custom-model", config: { model_providers: { custom: { base_url: "http://127.0.0.1:1234/managed/route-2" } } } });
+    expect(requests.filter((request) => request.method === "thread/start")).toHaveLength(1);
+    expect(requests.filter((request) => request.method === "turn/start")).toHaveLength(2);
+    await setup.fake.completeTurn(binding.nativeSessionId!, "done again");
+    enabled = false;
+    await expect(setup.adapter.send(prompt("retained input"), operationContext("three"))).rejects.toThrow();
+    expect(requests.filter((request) => request.method === "turn/start")).toHaveLength(2);
+    await setup.adapter.dispose();
+    expect(retired).toHaveBeenCalledOnce();
+  });
+
+  it("rejects unsupported directory and source range mentions before native dispatch", async () => {
+    const setup = await createSetup();
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), context(setup.target, [], { backendInstanceGeneration: 7 }));
+    for (const mention of [
+      { kind: "workspace_directory", label: "source", reference: "src" },
+      { kind: "workspace_file", label: "lines", reference: "src/main.ts", lineRange: { startLine: 1, endLine: 2 } }
+    ] as const) {
+      await expect(setup.adapter.send({ ...prompt(""), mentions: [mention] }, context(setup.target, [], { binding, backendInstanceGeneration: 7, operationId: "unsupported-mention" })))
+        .rejects.toMatchObject({ publicError: { code: "CODEX_MENTION_KIND_UNSUPPORTED", stateMayHaveChanged: false } });
+    }
+    expect(setup.fake.transport?.requests.filter((request) => request.method === "turn/start")).toEqual([]);
+  });
+
   it("probes stable account/models, drains pre-subscription events, and translates a complete turn", async () => {
     const setup = await createSetup();
     setup.fake.emitNameBeforeStartResponse = true;
@@ -32,7 +104,7 @@ describe("CodexBackendAdapter", () => {
       id: "codex-test",
       adapterKind: "codex",
       instanceGeneration: 7,
-      version: "0.151.0-alpha.7.2",
+      version: "0.153.4",
       health: "healthy",
       authenticationState: "authenticated"
     });
@@ -124,6 +196,26 @@ describe("CodexBackendAdapter", () => {
     expect(setup.fake.transport?.requests.filter((request) => request.method === "turn/start")).toHaveLength(1);
     expect(setup.fake.threads.get(binding.nativeSessionId!)?.turns).toHaveLength(1);
     expect(setup.fake.transport?.requests.some((request) => request.method === "thread/read")).toBe(true);
+  });
+
+  it("keeps an accepted send unknown when its complete history lookup becomes stale without resending input", async () => {
+    const setup = await createSetup();
+    const events: EventPayload[] = [];
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), context(setup.target, events, { backendInstanceGeneration: 7 }));
+    setup.fake.timeoutNextTurnStart = true;
+    const transport = setup.fake.transport!;
+    const request = transport.request.bind(transport);
+    vi.spyOn(transport, "request").mockImplementation(async (method, params, options) => {
+      const result = await request(method, params, options);
+      if (method === "thread/turns/list") await transport.emitNotification("thread/reverted", { threadId: binding.nativeSessionId! });
+      return result;
+    });
+    await expect(setup.adapter.send(prompt("Keep the unconfirmed input"), context(setup.target, events, {
+      binding, backendInstanceGeneration: 7, operationId: "unconfirmed-paginated-send"
+    }))).rejects.toMatchObject({ publicError: { code: "CODEX_DISPATCH_UNKNOWN", stateMayHaveChanged: true, retryable: false } });
+    expect(transport.requests.filter((value) => value.method === "turn/start")).toHaveLength(1);
+    expect(transport.requests.filter((value) => value.method === "turn/steer")).toHaveLength(0);
+    expect(setup.fake.threads.get(binding.nativeSessionId!)!.turns).toHaveLength(1);
   });
 
   it("reconciles a malformed accepted turn/start response through the durable client id", async () => {
@@ -238,6 +330,7 @@ describe("CodexBackendAdapter", () => {
     const threadId = "unowned-thread";
     setup.fake.threads.set(threadId, {
       id: threadId,
+      historyMode: "paginated",
       cwd: setup.target.workspaceRoot,
       name: null,
       turns: [],
@@ -254,6 +347,7 @@ describe("CodexBackendAdapter", () => {
     const threadId = "unowned-restricted-thread";
     setup.fake.threads.set(threadId, {
       id: threadId,
+      historyMode: "paginated",
       cwd: setup.target.workspaceRoot,
       name: null,
       turns: [],
@@ -687,6 +781,7 @@ describe("CodexBackendAdapter", () => {
 
     setup.fake.threads.set("foreign-thread", {
       id: "foreign-thread",
+      historyMode: "paginated",
       cwd: otherWorkspace,
       name: "Foreign",
       turns: [],
@@ -806,6 +901,7 @@ describe("CodexBackendAdapter", () => {
       backendInstanceGeneration: 7,
       operationId: "fork-source-message"
     });
+    setup.fake.threads.get(binding.nativeSessionId!)!.turns.push(...Array.from({ length: 100 }, (_, index) => historyTurn(index)));
     await setup.adapter.send({
       text: "create a fork point",
       images: [],
@@ -815,7 +911,12 @@ describe("CodexBackendAdapter", () => {
     }, sourceContext);
     await setup.fake.completeTurn(binding.nativeSessionId!);
 
-    const derived = await setup.adapter.fork("fork-source-message", sourceContext);
+    const recordBinding = vi.fn((derived: NativeSessionBinding) => {
+      expect(derived.nativeSessionId).not.toBe(binding.nativeSessionId);
+      expect(setup.fake.transport?.requests.some((request) => request.method === "thread/unsubscribe")).toBe(false);
+    });
+    const derived = await setup.adapter.fork("fork-source-message", sourceContext, { sessionId: "derived-session", recordBinding });
+    expect(recordBinding).toHaveBeenCalledExactlyOnceWith(derived.binding);
     const forkRequest = setup.fake.transport?.requests.find((request) => request.method === "thread/fork");
     expect(forkRequest?.params).toMatchObject({ threadId: binding.nativeSessionId, lastTurnId: "turn-1" });
     await expect(setup.adapter.detachSession(derived.binding, {
@@ -830,6 +931,549 @@ describe("CodexBackendAdapter", () => {
       mentions: [],
       disposition: "prompt"
     }, { ...sourceContext, operationId: "source-after-fork" })).resolves.toBeUndefined();
+    await setup.fake.completeTurn(binding.nativeSessionId!);
+    expect(events.at(-1)).toEqual({ type: "done", outcome: "completed" });
+    const cleanupContext = { ...sourceContext, sessionId: "derived-session", binding: derived.binding };
+    expect(setup.adapter.supportsDetachedSessionDeletion(cleanupContext)).toBe(true);
+    const nativeStarts = setup.fake.transport!.requests.filter((entry) => entry.method === "thread/start" || entry.method === "thread/resume");
+    await setup.adapter.deleteSession(derived.binding, cleanupContext);
+    expect(setup.fake.threads.has(derived.binding.nativeSessionId!)).toBe(false);
+    expect(setup.fake.threads.has(binding.nativeSessionId!)).toBe(true);
+    expect(setup.fake.transport!.requests.filter((entry) => entry.method === "thread/start" || entry.method === "thread/resume")).toEqual(nativeStarts);
+  });
+
+  it("rewinds paginated history to an exact retained turn and treats the retained tail as a no-op", async () => {
+    const setup = await createRewindSetup();
+    expect(setup.transport.requests.find((entry) => entry.method === "thread/start")?.params).toMatchObject({ historyMode: "paginated" });
+    expect((await setup.adapter.describe()).capabilities.get("session.rewind")?.supported).toBe(true);
+    const retained = structuredClone(setup.thread.turns.slice(0, 1));
+    await setup.adapter.navigateTree({ kind: "native_entry", entryId: "history-item-0" }, false, setup.bound, undefined, navigationAuthority);
+    expect(setup.transport.requests.filter((entry) => entry.method === "thread/revert").map((entry) => entry.params))
+      .toEqual([{ threadId: setup.binding.nativeSessionId, beforeTurnId: "history-turn-1" }]);
+    expect(setup.thread.turns).toEqual(retained);
+    const projection = await setup.adapter.getNativeHistoryProjection(setup.bound);
+    expect(projection.activeEntryId).toBe("history-item-0");
+    await setup.adapter.navigateTree({ kind: "native_entry", entryId: "history-turn-0" }, false, setup.bound, undefined, navigationAuthority);
+    expect(setup.transport.requests.filter((entry) => entry.method === "thread/revert")).toHaveLength(1);
+    await setup.adapter.send(prompt("Continue the confirmed prefix"), { ...setup.bound, operationId: "after-confirmed-rewind" });
+  });
+
+  it("clears the first turn with an explicit start target, preserves its binding, and resumes the empty prefix", async () => {
+    const setup = await createRewindSetup();
+    expect((await setup.adapter.describe()).capabilities.get("session.rewind_to_start")?.supported).toBe(true);
+    await setup.adapter.navigateTree({ kind: "session_start" }, false, setup.bound, undefined, navigationAuthority);
+    expect(setup.transport.requests.filter((entry) => entry.method === "thread/revert").map((entry) => entry.params))
+      .toEqual([{ threadId: setup.binding.nativeSessionId, beforeTurnId: "history-turn-0" }]);
+    expect(setup.thread.turns).toEqual([]);
+    expect(await setup.adapter.getNativeHistoryProjection(setup.bound)).toMatchObject({ activeNavigationTarget: { kind: "session_start" }, activeLineage: [] });
+    await setup.adapter.navigateTree({ kind: "session_start" }, false, setup.bound, undefined, navigationAuthority);
+    expect(setup.transport.requests.filter((entry) => entry.method === "thread/revert")).toHaveLength(1);
+    await setup.adapter.closeSession(setup.binding, setup.bound);
+    await setup.adapter.resumeSession(setup.binding, setup.bound);
+    expect((await setup.adapter.getNativeHistoryProjection(setup.bound)).activeNavigationTarget).toEqual({ kind: "session_start" });
+    await setup.adapter.send(prompt("Continue the empty prefix"), { ...setup.bound, operationId: "after-start-rewind" });
+    expect(setup.thread.turns).toHaveLength(1);
+  });
+
+  it.each(["middle-item", "missing", "empty", "mode", "busy", "background", "summary", "instructions"] as const)("rejects an inexact or unavailable %s rewind without native mutation", async (boundary) => {
+    const setup = await createRewindSetup();
+    let entryId = "history-item-0";
+    if (boundary === "middle-item") (setup.thread.turns[0]!["items"] as JsonObject[]).push({ id: "later-item", type: "agentMessage", text: "Later output" });
+    if (boundary === "missing") entryId = "missing-item";
+    if (boundary === "empty") entryId = "";
+    if (boundary === "mode") setup.thread.historyMode = "legacy";
+    if (boundary === "busy") setup.thread.status = { type: "active", activeFlags: [] };
+    if (boundary === "background") (setup.thread.turns[1]!["items"] as JsonObject[]).push({
+      id: "active-spawn", type: "collabAgentToolCall", tool: "spawnAgent", status: "completed", receiverThreadIds: ["active-child"], agentsStates: { "active-child": { status: "running", message: null } }
+    });
+    await expect(setup.adapter.navigateTree({ kind: "native_entry", entryId: entryId }, boundary === "summary", setup.bound, boundary === "instructions" ? "Summary instruction" : undefined, navigationAuthority))
+      .rejects.toMatchObject({ publicError: { stateMayHaveChanged: false } });
+    expect(setup.transport.requests.some((entry) => entry.method === "thread/revert")).toBe(false);
+    expect(setup.thread.turns).toHaveLength(3);
+  });
+
+  it.each(["lost-ack-confirmed", "lost-ack-unchanged", "hydrate-failed", "invalid-reply", "cancelled-after-write"] as const)("keeps the exact rewind outcome across %s without replay", async (boundary) => {
+    const setup = await createRewindSetup();
+    const cancellation = new AbortController();
+    const request = setup.transport.request.bind(setup.transport);
+    let reverted = false;
+    const intercepted = vi.spyOn(setup.transport, "request").mockImplementation(async (method, params, options) => {
+      if (method === "thread/revert" && boundary === "lost-ack-unchanged") throw new TransportFault("request_timeout", "Fixture outcome is unknown.", { stateMayHaveChanged: true });
+      if (method === "thread/read" && reverted && boundary === "hydrate-failed") throw new TransportFault("request_timeout", "Fixture hydration failed.");
+      const result = await request(method, params, options);
+      if (method !== "thread/revert") return result;
+      reverted = true;
+      if (boundary === "lost-ack-confirmed") throw new TransportFault("request_timeout", "Fixture acknowledgement lost.", { stateMayHaveChanged: true });
+      if (boundary === "invalid-reply") return { thread: { id: "foreign-thread", turns: [], historyMode: "paginated" } };
+      if (boundary === "cancelled-after-write") cancellation.abort();
+      return result;
+    });
+    const result = setup.adapter.navigateTree({ kind: "native_entry", entryId: "history-item-0" }, false, { ...setup.bound, signal: cancellation.signal }, undefined, navigationAuthority);
+    if (boundary === "lost-ack-confirmed") await expect(result).resolves.toEqual({ kind: "in_place" });
+    else await expect(result).rejects.toMatchObject({ publicError: { code: "CODEX_REWIND_UNKNOWN", stateMayHaveChanged: true, retryable: false } });
+    expect(intercepted.mock.calls.filter(([method]) => method === "thread/revert")).toHaveLength(1);
+    intercepted.mockRestore();
+    if (boundary !== "lost-ack-confirmed") {
+      await setup.adapter.getNativeHistoryProjection(setup.bound);
+      await expect(setup.adapter.send(prompt("Do not guess the outcome"), { ...setup.bound, operationId: "after-unknown-rewind" }))
+        .rejects.toMatchObject({ publicError: { code: "CODEX_REWIND_UNKNOWN" } });
+      await expect(setup.adapter.navigateTree({ kind: "native_entry", entryId: "history-item-0" }, false, setup.bound, undefined, navigationAuthority))
+        .rejects.toMatchObject({ publicError: { code: "CODEX_REWIND_UNKNOWN" } });
+    }
+  });
+
+  it.each([false, true])("bounds read-only rewind confirmation after continuing native arrivals: %s", async (continuing) => {
+    const setup = await createRewindSetup();
+    const request = setup.transport.request.bind(setup.transport);
+    let reverted = false;
+    let confirmationReads = 0;
+    const intercepted = vi.spyOn(setup.transport, "request").mockImplementation(async (method, params, options) => {
+      const result = await request(method, params, options);
+      if (method === "thread/revert") reverted = true;
+      if (method === "thread/read" && reverted) {
+        confirmationReads++;
+        if (continuing || confirmationReads === 1) {
+          await setup.transport.emitNotification("thread/reverted", { threadId: setup.binding.nativeSessionId! });
+        }
+      }
+      return result;
+    });
+    const pending = setup.adapter.navigateTree({ kind: "native_entry", entryId: "history-item-0" }, false, setup.bound, undefined, navigationAuthority);
+    if (continuing) {
+      await expect(pending).rejects.toMatchObject({ publicError: { code: "CODEX_REWIND_UNKNOWN", stateMayHaveChanged: true } });
+      expect(confirmationReads).toBe(2);
+    } else {
+      await expect(pending).resolves.toEqual({ kind: "in_place" });
+      expect(confirmationReads).toBe(3);
+    }
+    expect(intercepted.mock.calls.filter(([method]) => method === "thread/revert")).toHaveLength(1);
+  });
+
+  it("fences new input and controls while rewind preparation is pending and retires its source before write", async () => {
+    const setup = await createRewindSetup();
+    const request = setup.transport.request.bind(setup.transport);
+    let release!: () => void;
+    let entered!: () => void;
+    const waiting = new Promise<void>((resolve) => { entered = resolve; });
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const intercepted = vi.spyOn(setup.transport, "request").mockImplementationOnce(async (method, params, options) => {
+      entered(); await held; return request(method, params, options);
+    });
+    const pending = setup.adapter.navigateTree({ kind: "native_entry", entryId: "history-item-0" }, false, setup.bound, undefined, navigationAuthority).catch((error: unknown) => error);
+    await waiting;
+    for (const mutation of [
+      () => setup.adapter.send(prompt("Pending input"), { ...setup.bound, operationId: "during-rewind" }),
+      () => setup.adapter.setFastMode(false, setup.bound),
+      () => setup.adapter.compact(undefined, setup.bound),
+      () => setup.adapter.clone(setup.bound, { sessionId: "derived", recordBinding: () => undefined })
+    ]) await expect(mutation()).rejects.toMatchObject({ publicError: { code: "CODEX_REWIND_BUSY", stateMayHaveChanged: false } });
+    await setup.adapter.closeSession(setup.binding, setup.bound);
+    release();
+    expect(await pending).toMatchObject({ publicError: { stateMayHaveChanged: false } });
+    expect(intercepted.mock.calls.some(([method]) => method === "thread/revert")).toBe(false);
+  });
+
+  it.each(["reverted", "cancel", "close"] as const)("rechecks a prepared rewind across %s at the final host dispatch boundary", async (boundary) => {
+    const setup = await createRewindSetup();
+    const cancellation = new AbortController();
+    const request = setup.host.request.bind(setup.host);
+    const ensureStarted = setup.host.ensureStarted.bind(setup.host);
+    vi.spyOn(setup.host, "request").mockImplementation((method, params, options) => {
+      if (method === "thread/revert") vi.spyOn(setup.host, "ensureStarted").mockImplementationOnce(async () => {
+        if (boundary === "reverted") await setup.transport.emitNotification("thread/reverted", { threadId: setup.binding.nativeSessionId! });
+        if (boundary === "cancel") cancellation.abort();
+        if (boundary === "close") await setup.adapter.closeSession(setup.binding, setup.bound);
+        return ensureStarted();
+      });
+      return request(method, params, options);
+    });
+    await expect(setup.adapter.navigateTree({ kind: "native_entry", entryId: "history-item-0" }, false, { ...setup.bound, signal: cancellation.signal }, undefined, navigationAuthority))
+      .rejects.toMatchObject({ publicError: { stateMayHaveChanged: false } });
+    expect(setup.transport.requests.some((entry) => entry.method === "thread/revert")).toBe(false);
+    expect(setup.thread.turns).toHaveLength(3);
+  });
+
+  it("requires explicit confirmation of paginated mode on new native threads", async () => {
+    const setup = await createSetup();
+    setup.fake.threadStartResponseOverrides = { thread: { id: "thread-1", cwd: setup.target.workspaceRoot, turns: [], historyMode: "legacy" } };
+    await expect(setup.adapter.createSession(sessionInput(setup.target), context(setup.target, [], { backendInstanceGeneration: 7 })))
+      .rejects.toMatchObject({ publicError: { code: "CODEX_HISTORY_MODE_UNCONFIRMED", stateMayHaveChanged: true } });
+    expect(setup.fake.transport!.requests.filter((entry) => entry.method === "thread/start")).toHaveLength(1);
+  });
+
+  it("refuses rewind when earlier input is still preparing before its native request", async () => {
+    let entered!: () => void;
+    let release!: (value: { data: Uint8Array; mimeType: string }) => void;
+    const preparing = new Promise<void>((resolve) => { entered = resolve; });
+    const data = new Uint8Array([1, 2, 3]);
+    const setup = await createRewindSetup({ readBlob: async () => { entered(); return new Promise((resolve) => { release = resolve; }); } });
+    const cancellation = new AbortController();
+    const pending = setup.adapter.send({ ...prompt("Prepared input"), images: [{ blob: { id: "held-image", byteLength: data.byteLength, sha256: createHash("sha256").update(data).digest("hex"), mimeType: "image/png" } }] }, { ...setup.bound, operationId: "prepared-before-rewind", signal: cancellation.signal }).catch((error: unknown) => error);
+    await preparing;
+    await expect(setup.adapter.navigateTree({ kind: "native_entry", entryId: "history-item-0" }, false, setup.bound, undefined, navigationAuthority)).rejects.toMatchObject({ publicError: { code: "CODEX_REWIND_BUSY" } });
+    cancellation.abort(); release({ data, mimeType: "image/png" }); await pending;
+    expect(setup.transport.requests.some((entry) => entry.method === "thread/revert")).toBe(false);
+  });
+
+  it.each([
+    { wait: "host", boundary: "reverted" },
+    { wait: "host", boundary: "cancel" },
+    { wait: "host", boundary: "close" },
+    { wait: "transport", boundary: "reverted" },
+    { wait: "transport", boundary: "cancel" },
+    { wait: "transport", boundary: "close" }
+  ] as const)("does not dispatch a selected fork after $boundary during the $wait wait", async ({ wait, boundary }) => {
+    const setup = await createSetup();
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), context(setup.target, [], { backendInstanceGeneration: 7 }));
+    const base = context(setup.target, [], { binding, backendInstanceGeneration: 7, operationId: "selected-fork-boundary" });
+    await setup.adapter.send(prompt("Completed fork point"), base);
+    await setup.fake.completeTurn(binding.nativeSessionId!);
+    const cancellation = new AbortController();
+    const transport = setup.fake.transport!;
+    const invalidate = async () => {
+      if (boundary === "reverted") await transport.emitNotification("thread/reverted", { threadId: binding.nativeSessionId! });
+      if (boundary === "cancel") cancellation.abort();
+      if (boundary === "close") await setup.adapter.closeSession(binding, base);
+    };
+    if (wait === "host") {
+      const request = setup.host.request.bind(setup.host);
+      const ensureStarted = setup.host.ensureStarted.bind(setup.host);
+      vi.spyOn(setup.host, "request").mockImplementation((method, params, options) => {
+        if (method === "thread/fork") {
+          vi.spyOn(setup.host, "ensureStarted").mockImplementationOnce(async () => {
+            await invalidate();
+            return ensureStarted();
+          });
+        }
+        return request(method, params, options);
+      });
+    } else {
+      const request = transport.request.bind(transport);
+      vi.spyOn(transport, "request").mockImplementation(async (method, params, options) => {
+        if (method === "thread/fork") await invalidate();
+        return request(method, params, options);
+      });
+    }
+    const recordBinding = vi.fn();
+    await expect(setup.adapter.fork("selected-fork-boundary", { ...base, signal: cancellation.signal }, {
+      sessionId: "derived-session", recordBinding
+    })).rejects.toMatchObject({ publicError: { stateMayHaveChanged: false } });
+    expect(recordBinding).not.toHaveBeenCalled();
+    expect(transport.requests.some((request) => request.method === "thread/fork")).toBe(false);
+    expect(setup.fake.threads.size).toBe(1);
+  });
+
+  it.each([
+    { response: "source", code: "CODEX_SESSION_FORK_IDENTITY_MISMATCH" },
+    { response: "foreign-target", code: "CODEX_SESSION_FORK_TARGET_MISMATCH" },
+    { response: "missing-target", code: "CODEX_SESSION_FORK_TARGET_MISMATCH" },
+    { response: "malformed", code: "CODEX_SESSION_FORK_INVALID_RESPONSE" },
+    { response: "malformed-history", code: "CODEX_SESSION_FORK_INVALID_RESPONSE" }
+  ])("rejects a $response fork reply without detaching the source thread", async ({ response, code }) => {
+    const setup = await createSetup();
+    const events: EventPayload[] = [];
+    const binding = await setup.adapter.createSession(
+      sessionInput(setup.target),
+      context(setup.target, events, { backendInstanceGeneration: 7 })
+    );
+    const bound = context(setup.target, events, { binding, backendInstanceGeneration: 7 });
+    const transport = setup.fake.transport!;
+    const request = transport.request.bind(transport);
+    const foreignRoot = await realpath(tmpdir());
+    const interceptor = vi.spyOn(transport, "request").mockImplementation(async (method, params, options) => {
+      const result = await request(method, params, options);
+      if (method !== "thread/fork") return result;
+      if (response === "malformed") return { thread: { id: null } };
+      const envelope = result as JsonObject;
+      const thread = { ...(envelope["thread"] as JsonObject) };
+      if (response === "source") thread["id"] = binding.nativeSessionId!;
+      if (response === "foreign-target") thread["cwd"] = foreignRoot;
+      if (response === "missing-target") delete thread["cwd"];
+      if (response === "malformed-history") thread["turns"] = "invalid";
+      return { ...envelope, thread };
+    });
+
+    const recordBinding = vi.fn();
+    const failure: unknown = await setup.adapter.clone(bound, { sessionId: "derived-session", recordBinding }).catch((error: unknown) => error);
+    expect(failure).toMatchObject({ publicError: { code, stateMayHaveChanged: true, retryable: false } });
+    expect(JSON.stringify(failure)).not.toContain(foreignRoot);
+    expect(JSON.stringify(failure)).not.toContain(binding.nativeSessionId);
+    const knownDerived = response !== "source" && response !== "malformed";
+    expect(recordBinding).toHaveBeenCalledTimes(knownDerived ? 1 : 0);
+    const released = transport.requests.filter((entry) => entry.method === "thread/unsubscribe");
+    expect(released).toHaveLength(knownDerived ? 1 : 0);
+    expect(released.some((entry) => (entry.params as JsonObject)["threadId"] === binding.nativeSessionId)).toBe(false);
+    expect(transport.requests.some((entry) => entry.method === "thread/delete")).toBe(false);
+    interceptor.mockRestore();
+
+    await expect(setup.adapter.send(prompt("source remains attached"), {
+      ...bound,
+      operationId: "source-after-invalid-fork"
+    })).resolves.toBeUndefined();
+    await setup.fake.completeTurn(binding.nativeSessionId!);
+    expect(events.at(-1)).toEqual({ type: "done", outcome: "completed" });
+  });
+
+  it.each(["source-closed", "receipt-rejected", "detach-rejected"] as const)("retains the exact clone receipt across %s and never releases the source by derived identity", async (boundary) => {
+    const setup = await createSetup();
+    const events: EventPayload[] = [];
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), context(setup.target, events, { backendInstanceGeneration: 7 }));
+    const bound = context(setup.target, events, { binding, backendInstanceGeneration: 7 });
+    const transport = setup.fake.transport!;
+    const request = transport.request.bind(transport);
+    let nativeDerivedId: string | undefined;
+    vi.spyOn(transport, "request").mockImplementation(async (method, params, options) => {
+      if (method === "thread/unsubscribe" && (params as JsonObject)["threadId"] === nativeDerivedId && boundary === "detach-rejected") {
+        throw new TransportFault("request_timeout", "Unsubscribe response unavailable", { stateMayHaveChanged: true });
+      }
+      const response = await request(method, params, options);
+      if (method === "thread/fork") {
+        nativeDerivedId = ((response as JsonObject)["thread"] as JsonObject)["id"] as string;
+        if (boundary === "source-closed") await setup.adapter.closeSession(binding, bound);
+      }
+      return response;
+    });
+    const recordBinding = vi.fn((derived: NativeSessionBinding) => {
+      expect(derived.nativeSessionId).toBe(nativeDerivedId);
+      if (boundary === "receipt-rejected") throw new Error("Receipt storage unavailable");
+    });
+    const failure = await setup.adapter.clone(bound, { sessionId: "derived-session", recordBinding }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(Error);
+    expect(recordBinding).toHaveBeenCalledTimes(1);
+    if (boundary === "source-closed") expect(failure).toMatchObject({ publicError: { code: "CODEX_RUNTIME_GENERATION_STALE", stateMayHaveChanged: true } });
+    if (boundary === "detach-rejected") expect(failure).toMatchObject({ publicError: { code: "CODEX_SESSION_FORK_DETACH_FAILED", stateMayHaveChanged: true } });
+    if (boundary !== "source-closed") {
+      expect(transport.requests.some((entry) => entry.method === "thread/unsubscribe" && (entry.params as JsonObject)["threadId"] === binding.nativeSessionId)).toBe(false);
+      await setup.adapter.send(prompt("source still owns its event sink"), { ...bound, operationId: "after-clone-failure" });
+      await setup.fake.completeTurn(binding.nativeSessionId!);
+      expect(events.at(-1)).toEqual({ type: "done", outcome: "completed" });
+    }
+  });
+
+  it("rejects detached deletion through another owner or profile before issuing native deletion", async () => {
+    const setup = await createSetup();
+    const events: EventPayload[] = [];
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), context(setup.target, events, { backendInstanceGeneration: 7 }));
+    const bound = context(setup.target, events, { binding, backendInstanceGeneration: 7 });
+    await expect(setup.adapter.deleteSession(binding, { ...bound, sessionId: "another-product-session" }))
+      .rejects.toMatchObject({ publicError: { code: "CODEX_SESSION_ACTIVE", stateMayHaveChanged: false } });
+    const profileDirectory = await mkdtemp(join(tmpdir(), "joko-codex-delete-profile-"));
+    cleanups.push(() => rm(profileDirectory, { recursive: true, force: true }));
+    const otherProfile = await createSetup(7, { profileDirectory });
+    await expect(otherProfile.adapter.deleteSession(binding, context(otherProfile.target, [], { binding, backendInstanceGeneration: 7 })))
+      .rejects.toMatchObject({ publicError: { code: "CODEX_NATIVE_REFERENCE_INVALID", stateMayHaveChanged: false } });
+    expect(setup.fake.transport!.requests.some((entry) => entry.method === "thread/delete")).toBe(false);
+    expect(otherProfile.fake.transport?.requests.some((entry) => entry.method === "thread/delete") ?? false).toBe(false);
+  });
+
+  it("keeps the steer target selected at entry when native turns change before the first continuation", async () => {
+    const setup = await createSetup();
+    const events: EventPayload[] = [];
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), context(setup.target, events, { backendInstanceGeneration: 7 }));
+    const base = context(setup.target, events, { binding, backendInstanceGeneration: 7, operationId: "entry-first-turn" });
+    await setup.adapter.send(prompt("First turn"), base);
+    const transport = setup.fake.transport!;
+    const thread = setup.fake.threads.get(binding.nativeSessionId!)!;
+    const firstTurn = thread.turns.at(-1)!;
+    const pending = setup.adapter.send({ ...prompt("Steer the first turn"), disposition: "steer" }, {
+      ...base,
+      operationId: "entry-steer-first-turn"
+    }).catch((error: unknown) => error);
+
+    firstTurn["status"] = "completed";
+    thread.status = { type: "idle" };
+    const completed = transport.emitNotification("turn/completed", { threadId: thread.id, turn: firstTurn });
+    const started = transport.request("turn/start", {
+      threadId: thread.id,
+      input: [],
+      clientUserMessageId: "native-second-turn"
+    });
+    await Promise.all([completed, started]);
+
+    expect(await pending).toMatchObject({ publicError: { code: "CODEX_ACTIVE_TURN_REQUIRED", stateMayHaveChanged: false } });
+    expect(transport.requests.filter((request) => request.method === "turn/steer")).toEqual([]);
+    expect(thread.turns.at(-1)?.["id"]).toBe("turn-2");
+    expect(thread.turns.flatMap((turn) => turn["items"] as JsonObject[])
+      .some((item) => item["clientId"] === "entry-steer-first-turn")).toBe(false);
+  });
+
+  it.each(["closed", "disconnected"] as const)("does not restore a %s runtime to select a steer target", async (boundary) => {
+    const setup = await createSetup();
+    const events: EventPayload[] = [];
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), context(setup.target, events, { backendInstanceGeneration: 7 }));
+    const base = context(setup.target, events, { binding, backendInstanceGeneration: 7, operationId: "bound-steer-start" });
+    await setup.adapter.send(prompt("First turn"), base);
+    if (boundary === "closed") await setup.adapter.closeSession(binding, base);
+    else await setup.fake.transport!.exit();
+    const resume = vi.spyOn(setup.adapter, "resumeSession");
+
+    await expect(setup.adapter.send({ ...prompt("Keep the selected turn"), disposition: "steer" }, {
+      ...base,
+      operationId: "retired-runtime-steer"
+    })).rejects.toMatchObject({ publicError: { stateMayHaveChanged: false } });
+
+    expect(resume).not.toHaveBeenCalled();
+    expect(setup.fake.transport?.requests.filter((request) => request.method === "turn/steer")).toEqual([]);
+  });
+
+  it.each(["next_turn", "cancel", "close", "generation"] as const)("does not dispatch a prepared steer across %s", async (boundary) => {
+    const data = Buffer.from("bounded image fixture");
+    let releaseImage!: (value: { readonly data: Uint8Array; readonly mimeType: string }) => void;
+    let imageRequested!: () => void;
+    const requested = new Promise<void>((resolve) => { imageRequested = resolve; });
+    const image = new Promise<{ readonly data: Uint8Array; readonly mimeType: string }>((resolve) => { releaseImage = resolve; });
+    const setup = await createSetup(7, { readBlob: async () => { imageRequested(); return image; } });
+    const events: EventPayload[] = [];
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), context(setup.target, events, { backendInstanceGeneration: 7 }));
+    const base = context(setup.target, events, { binding, backendInstanceGeneration: 7, operationId: "first-turn" });
+    await setup.adapter.send(prompt("First turn"), base);
+    const cancellation = new AbortController();
+    const pending = setup.adapter.send({
+      ...prompt("Steer the first turn"),
+      disposition: "steer",
+      images: [{ blob: { id: "steer-image", byteLength: data.byteLength, sha256: createHash("sha256").update(data).digest("hex"), mimeType: "image/png" } }]
+    }, { ...base, operationId: "steer-first-turn", signal: cancellation.signal }).catch((error: unknown) => error);
+    await requested;
+    if (boundary === "next_turn") {
+      await setup.fake.completeTurn(binding.nativeSessionId!);
+      await setup.adapter.send(prompt("Second turn"), { ...base, operationId: "second-turn" });
+    } else if (boundary === "cancel") {
+      cancellation.abort();
+    } else {
+      await setup.adapter.closeSession(binding, base);
+      if (boundary === "generation") {
+        await setup.adapter.resumeSession(binding, { ...base, generation: 2, binding: { ...binding, generation: 2 } });
+      }
+    }
+    if (boundary !== "next_turn") expect(await pending).toMatchObject({ publicError: { stateMayHaveChanged: false } });
+    releaseImage({ data, mimeType: "image/png" });
+    expect(await pending).toMatchObject({ publicError: { stateMayHaveChanged: false } });
+    expect(setup.fake.transport?.requests.filter((request) => request.method === "turn/steer")).toEqual([]);
+    expect(setup.fake.threads.get(binding.nativeSessionId!)?.turns.flatMap((turn) => turn["items"] as JsonObject[])
+      .some((item) => item["clientId"] === "steer-first-turn")).toBe(false);
+  });
+
+  it("steers only the active native turn and forwards cancellation to the RPC wait", async () => {
+    const setup = await createSetup();
+    const events: EventPayload[] = [];
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), context(setup.target, events, { backendInstanceGeneration: 7 }));
+    const base = context(setup.target, events, { binding, backendInstanceGeneration: 7, operationId: "steer-owner-start" });
+    await setup.adapter.send(prompt("First turn"), base);
+    const cancellation = new AbortController();
+    await setup.adapter.send({ ...prompt("Same turn"), disposition: "steer" }, { ...base, operationId: "steer-owner-message", signal: cancellation.signal });
+    const requests = setup.fake.transport!.requests.filter((request) => request.method === "turn/steer");
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.params).toMatchObject({ threadId: binding.nativeSessionId, expectedTurnId: "turn-1", clientUserMessageId: "steer-owner-message" });
+    expect(requests[0]?.options.signal?.aborted).toBe(false);
+    cancellation.abort();
+    expect(requests[0]?.options.signal?.aborted).toBe(true);
+    expect(setup.fake.threads.get(binding.nativeSessionId!)?.turns).toHaveLength(1);
+    await expect(setup.fake.transport!.request("turn/steer", { threadId: binding.nativeSessionId!, expectedTurnId: "another-turn", input: [] }))
+      .rejects.toMatchObject({ rpcCode: -32602 });
+    await setup.fake.completeTurn(binding.nativeSessionId!);
+    await expect(setup.fake.transport!.request("turn/steer", { threadId: binding.nativeSessionId!, expectedTurnId: "turn-1", input: [] }))
+      .rejects.toMatchObject({ rpcCode: -32602 });
+  });
+
+  it("cancels steer admission when the runtime closes during the host readiness wait", async () => {
+    const setup = await createSetup();
+    const events: EventPayload[] = [];
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), context(setup.target, events, { backendInstanceGeneration: 7 }));
+    const base = context(setup.target, events, { binding, backendInstanceGeneration: 7, operationId: "before-admission-close" });
+    await setup.adapter.send(prompt("First turn"), base);
+    const ensureStarted = setup.host.ensureStarted.bind(setup.host);
+    vi.spyOn(setup.host, "ensureStarted").mockImplementationOnce(async () => {
+      await setup.adapter.closeSession(binding, base);
+      return ensureStarted();
+    });
+    await expect(setup.adapter.send({ ...prompt("Stop before dispatch"), disposition: "steer" }, { ...base, operationId: "closed-at-admission" }))
+      .rejects.toMatchObject({ publicError: { stateMayHaveChanged: false } });
+    expect(setup.fake.transport?.requests.filter((request) => request.method === "turn/steer")).toEqual([]);
+  });
+
+  it("keeps an in-flight cancelled steer unknown and does not send it again after a late response", async () => {
+    const setup = await createSetup();
+    const events: EventPayload[] = [];
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), context(setup.target, events, { backendInstanceGeneration: 7 }));
+    const base = context(setup.target, events, { binding, backendInstanceGeneration: 7, operationId: "inflight-steer-start" });
+    await setup.adapter.send(prompt("First turn"), base);
+    const transport = setup.fake.transport!;
+    const request = transport.request.bind(transport);
+    let entered!: () => void;
+    const admitted = new Promise<void>((resolve) => { entered = resolve; });
+    let lateAck!: (value: JsonObject) => void;
+    const intercepted = vi.spyOn(transport, "request").mockImplementation((method, params, options) => {
+      if (method !== "turn/steer") return request(method, params, options);
+      return new Promise((resolve, reject) => {
+        lateAck = resolve;
+        options!.signal!.addEventListener("abort", () => reject(new TransportFault("closed", "Scripted delivery is uncertain.", { stateMayHaveChanged: true })), { once: true });
+        entered();
+      });
+    });
+    const cancellation = new AbortController();
+    const pending = setup.adapter.send({ ...prompt("Unconfirmed input"), disposition: "steer" }, { ...base, operationId: "inflight-steer", signal: cancellation.signal });
+    await admitted;
+    cancellation.abort();
+    await expect(pending).rejects.toMatchObject({ publicError: { code: "CODEX_DISPATCH_UNKNOWN", stateMayHaveChanged: true } });
+    lateAck({ turnId: "turn-1" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(intercepted.mock.calls.filter(([method]) => method === "turn/steer")).toHaveLength(1);
+    expect(transport.requests.filter((value) => value.method === "turn/start")).toHaveLength(1);
+  });
+
+  it("reconciles a lost steer ACK only in its original turn without replacing a later active turn", async () => {
+    const setup = await createSetup();
+    const events: EventPayload[] = [];
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), context(setup.target, events, { backendInstanceGeneration: 7 }));
+    const base = context(setup.target, events, { binding, backendInstanceGeneration: 7, operationId: "lost-steer-start" });
+    await setup.adapter.send(prompt("First turn"), base);
+    const transport = setup.fake.transport!;
+    const request = transport.request.bind(transport);
+    let loseResponse = true;
+    vi.spyOn(transport, "request").mockImplementation(async (method, params, options) => {
+      const response = await request(method, params, options);
+      if (method === "turn/steer" && loseResponse) {
+        loseResponse = false;
+        await setup.fake.completeTurn(binding.nativeSessionId!);
+        setup.fake.threads.get(binding.nativeSessionId!)!.turns.push(...Array.from({ length: 100 }, (_, index) => historyTurn(index)));
+        await setup.adapter.send(prompt("Second turn"), { ...base, operationId: "lost-steer-second-turn" });
+        throw new TransportFault("request_timeout", "Scripted acknowledgement was lost.", { stateMayHaveChanged: true });
+      }
+      return response;
+    });
+    await setup.adapter.send({ ...prompt("Accepted in first turn"), disposition: "steer" }, { ...base, operationId: "lost-steer-first-turn" });
+    await expect(setup.adapter.inspectSession(binding, base)).resolves.toMatchObject({ streaming: true });
+    expect(transport.requests.filter((value) => value.method === "turn/steer")).toHaveLength(1);
+    expect(transport.requests.filter((value) => value.method === "thread/turns/list" && (value.params as JsonObject)["sortDirection"] === "asc")).toHaveLength(2);
+    await setup.adapter.send({ ...prompt("Explicit new steer"), disposition: "steer" }, { ...base, operationId: "explicit-second-steer" });
+    expect(transport.requests.filter((value) => value.method === "turn/steer").at(-1)?.params).toMatchObject({ expectedTurnId: "turn-2" });
+  });
+
+  it("does not clear a newer active turn when an older accepted start is confirmed by complete history", async () => {
+    const setup = await createSetup();
+    const events: EventPayload[] = [];
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), context(setup.target, events, { backendInstanceGeneration: 7 }));
+    const base = context(setup.target, events, { binding, backendInstanceGeneration: 7, operationId: "lost-start-first" });
+    const transport = setup.fake.transport!;
+    const request = transport.request.bind(transport);
+    let first = true;
+    vi.spyOn(transport, "request").mockImplementation(async (method, params, options) => {
+      const result = await request(method, params, options);
+      if (method === "turn/start" && first) {
+        first = false;
+        await setup.fake.completeTurn(binding.nativeSessionId!);
+        await setup.adapter.send(prompt("New active turn"), { ...base, operationId: "new-active-second" });
+        throw new TransportFault("request_timeout", "The earlier start acknowledgement was lost.", { stateMayHaveChanged: true });
+      }
+      return result;
+    });
+    await setup.adapter.send(prompt("Earlier completed turn"), base);
+    await expect(setup.adapter.inspectSession(binding, base)).resolves.toMatchObject({ streaming: true });
+    await setup.adapter.send({ ...prompt("Steer the current turn"), disposition: "steer" }, { ...base, operationId: "new-current-steer" });
+    expect(transport.requests.filter((value) => value.method === "turn/start")).toHaveLength(2);
+    expect(transport.requests.filter((value) => value.method === "turn/steer")).toEqual([
+      expect.objectContaining({ params: expect.objectContaining({ expectedTurnId: "turn-2" }) })
+    ]);
   });
 
   it("holds manual compaction until the native compaction item is durably emitted", async () => {
@@ -946,7 +1590,7 @@ describe("CodexBackendAdapter", () => {
       ]
     });
     expect(setup.fake.transport?.requests.findLast((request) => request.method === "thread/read")?.params)
-      .toMatchObject({ threadId: binding.nativeSessionId, includeTurns: true });
+      .toMatchObject({ threadId: binding.nativeSessionId, includeTurns: false });
 
     setup.fake.nextThreadReadOverride = {
       id: binding.nativeSessionId!,
@@ -964,6 +1608,151 @@ describe("CodexBackendAdapter", () => {
     await expect(setup.adapter.getNativeHistoryProjection(bound))
       .rejects.toMatchObject({ publicError: { code: "CODEX_NATIVE_HISTORY_UNAVAILABLE" } });
   });
+
+  it("hydrates every full history page in order and ignores unrelated or usage-only wire notifications", async () => {
+    const setup = await createSetup();
+    const events: EventPayload[] = [];
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), context(setup.target, events, { backendInstanceGeneration: 7 }));
+    setup.fake.threads.get(binding.nativeSessionId!)!.turns.push(...Array.from({ length: 201 }, (_, index) => historyTurn(index)));
+    const bound = context(setup.target, events, { binding, backendInstanceGeneration: 7 });
+    const transport = setup.fake.transport!;
+    const request = transport.request.bind(transport);
+    vi.spyOn(transport, "request").mockImplementation(async (method, params, options) => {
+      const value = await request(method, params, options);
+      if (method === "thread/turns/list" && (params as JsonObject)["sortDirection"] === "asc") {
+        await transport.emitNotification("thread/reverted", { threadId: "another-thread" });
+        await transport.emitNotification("thread/tokenUsage/updated", {
+          threadId: binding.nativeSessionId!, turnId: "history-turn-200",
+          tokenUsage: { total: { totalTokens: 1, inputTokens: 1, outputTokens: 0, cachedInputTokens: 0 }, last: { totalTokens: 1, inputTokens: 1, outputTokens: 0, cachedInputTokens: 0 } }
+        });
+      }
+      return value;
+    });
+    const projection = await setup.adapter.getNativeHistoryProjection(bound);
+    expect(projection.activeEntryId).toBe("history-item-200");
+    expect(projection.activeLineage?.map((entry) => entry.entryId)).toEqual(Array.from({ length: 201 }, (_, index) => `history-item-${index}`));
+    const pages = transport.requests.filter((value) => value.method === "thread/turns/list");
+    expect(pages.map((value) => value.params)).toEqual([
+      { threadId: binding.nativeSessionId, sortDirection: "asc", itemsView: "full", limit: 100 },
+      { threadId: binding.nativeSessionId, sortDirection: "asc", itemsView: "full", limit: 100, cursor: "turn-page-100" },
+      { threadId: binding.nativeSessionId, sortDirection: "asc", itemsView: "full", limit: 100, cursor: "turn-page-200" },
+      { threadId: binding.nativeSessionId, sortDirection: "desc", itemsView: "full", limit: 1 }
+    ]);
+    expect(pages.every((value) => value.options.signal !== undefined && value.options.timeoutMs! <= 30_000)).toBe(true);
+    expect(transport.requests.filter((value) => value.method === "thread/read").every((value) => (value.params as JsonObject)["includeTurns"] === false)).toBe(true);
+  });
+
+  it.each(["cursor-loop", "duplicate-turn", "duplicate-item", "pages", "turns", "items", "aggregate-bytes"] as const)(
+    "rejects incomplete full history at the %s boundary without returning a truncated projection", async (boundary) => {
+      const setup = await createSetup(7, {
+        ...(boundary === "pages" ? { maximumHistoryPages: 1 } : {}),
+        ...(boundary === "turns" ? { maximumHistoryTurns: 100 } : {}),
+        ...(boundary === "items" ? { maximumHistoryItems: 100 } : {}),
+        ...(boundary === "aggregate-bytes" ? { maximumHistoryBytes: 1_200 } : {})
+      });
+      const events: EventPayload[] = [];
+      const binding = await setup.adapter.createSession(sessionInput(setup.target), context(setup.target, events, { backendInstanceGeneration: 7 }));
+      const thread = setup.fake.threads.get(binding.nativeSessionId!)!;
+      thread.turns.push(...Array.from({ length: boundary === "aggregate-bytes" ? 1 : 101 }, (_, index) => historyTurn(index, boundary === "aggregate-bytes" ? "x".repeat(400) : "answer")));
+      const transport = setup.fake.transport!;
+      const request = transport.request.bind(transport);
+      let fullPages = 0;
+      const responseBytes: number[] = [];
+      const intercepted = vi.spyOn(transport, "request").mockImplementation(async (method, params, options) => {
+        let result = await request(method, params, options);
+        if (method === "thread/turns/list" && (params as JsonObject)["sortDirection"] === "asc") {
+          fullPages += 1;
+          if (boundary === "cursor-loop") result = { data: [historyTurn(fullPages)], nextCursor: "turn-page-1", backwardsCursor: null };
+          if (fullPages === 2 && boundary === "duplicate-turn") result = { data: [historyTurn(0)], nextCursor: null };
+          if (fullPages === 2 && boundary === "duplicate-item") result = { data: [{ ...historyTurn(100), items: (historyTurn(0))["items"]! }], nextCursor: null };
+        }
+        responseBytes.push(Buffer.byteLength(JSON.stringify(result)));
+        return result;
+      });
+      await expect(setup.adapter.getNativeHistoryProjection(context(setup.target, events, { binding, backendInstanceGeneration: 7 })))
+        .rejects.toMatchObject({ publicError: { code: ["cursor-loop", "duplicate-turn", "duplicate-item"].includes(boundary) ? "CODEX_NATIVE_HISTORY_UNAVAILABLE" : "CODEX_NATIVE_HISTORY_SIZE_LIMIT" } });
+      expect(fullPages).toBe(boundary === "pages" || boundary === "aggregate-bytes" ? 1 : 2);
+      if (boundary === "aggregate-bytes") {
+        expect(responseBytes.every((bytes) => bytes < 1_200)).toBe(true);
+        expect(responseBytes.reduce((sum, bytes) => sum + bytes, 0)).toBeGreaterThan(1_200);
+      }
+      expect(intercepted.mock.calls.some(([method]) => method === "turn/start" || method === "turn/steer")).toBe(false);
+    }
+  );
+
+  it("does not activate a detached runtime for an already cancelled history read", async () => {
+    const setup = await createSetup();
+    const events: EventPayload[] = [];
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), context(setup.target, events, { backendInstanceGeneration: 7 }));
+    const bound = context(setup.target, events, { binding, backendInstanceGeneration: 7 });
+    await setup.adapter.closeSession(binding, bound);
+    const before = setup.fake.transport!.requests.length;
+    const cancellation = new AbortController();
+    cancellation.abort();
+    await expect(setup.adapter.getNativeHistoryProjection({ ...bound, signal: cancellation.signal }))
+      .rejects.toMatchObject({ publicError: { code: "CODEX_NATIVE_HISTORY_CANCELLED" } });
+    expect(setup.fake.transport!.requests).toHaveLength(before);
+  });
+
+  it.each(["cancel", "close", "replace", "disconnect", "timeout"] as const)(
+    "settles a paginated read on %s even when its transport ignores cancellation and returns late", async (boundary) => {
+      const setup = await createSetup(7, { historyReadTimeoutMs: boundary === "timeout" ? 60 : 1_000 });
+      const events: EventPayload[] = [];
+      const binding = await setup.adapter.createSession(sessionInput(setup.target), context(setup.target, events, { backendInstanceGeneration: 7 }));
+      setup.fake.threads.get(binding.nativeSessionId!)!.turns.push(...Array.from({ length: 101 }, (_, index) => historyTurn(index)));
+      const cancellation = new AbortController();
+      const bound = { ...context(setup.target, events, { binding, backendInstanceGeneration: 7 }), signal: cancellation.signal };
+      const transport = setup.fake.transport!;
+      const request = transport.request.bind(transport);
+      let entered!: () => void;
+      let release!: () => void;
+      const admitted = new Promise<void>((resolve) => { entered = resolve; });
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      let hold = true;
+      const intercepted = vi.spyOn(transport, "request").mockImplementation(async (method, params, options) => {
+        const result = await request(method, params, options);
+        if (hold && method === "thread/turns/list" && (params as JsonObject)["cursor"] !== undefined) {
+          hold = false;
+          entered();
+          await held;
+        }
+        return result;
+      });
+      const pending = setup.adapter.getNativeHistoryProjection(bound).catch((error: unknown) => error);
+      await admitted;
+      if (boundary === "cancel") cancellation.abort();
+      if (boundary === "close" || boundary === "replace") await setup.adapter.closeSession(binding, bound);
+      if (boundary === "replace") await setup.adapter.resumeSession(binding, bound);
+      if (boundary === "disconnect") await transport.exit();
+      expect(await pending).toMatchObject({ publicError: { code: boundary === "timeout" ? "CODEX_NATIVE_HISTORY_TIMEOUT" : "CODEX_NATIVE_HISTORY_CANCELLED" } });
+      const calls = intercepted.mock.calls.length;
+      release();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(intercepted.mock.calls).toHaveLength(calls);
+    }
+  );
+
+  it.each(["thread/reverted", "turn/completed", "item/agentMessage/delta", "silent-tail-change", "silent-prefix-change"] as const)(
+    "rejects history changed during hydration by %s", async (boundary) => {
+      const setup = await createSetup();
+      const events: EventPayload[] = [];
+      const binding = await setup.adapter.createSession(sessionInput(setup.target), context(setup.target, events, { backendInstanceGeneration: 7 }));
+      setup.fake.threads.get(binding.nativeSessionId!)!.turns.push(historyTurn(0));
+      const transport = setup.fake.transport!;
+      const request = transport.request.bind(transport);
+      vi.spyOn(transport, "request").mockImplementation(async (method, params, options) => {
+        const result = await request(method, params, options);
+        if (method === "thread/turns/list" && (params as JsonObject)["sortDirection"] === "asc") {
+          if (boundary === "silent-tail-change") setup.fake.threads.get(binding.nativeSessionId!)!.turns[0] = historyTurn(0, "updated between pages");
+          else if (boundary === "silent-prefix-change") setup.fake.threads.get(binding.nativeSessionId!)!.turns.unshift(historyTurn(1));
+          else await transport.emitNotification(boundary, { threadId: binding.nativeSessionId!, turnId: "history-turn-0", turn: historyTurn(0), itemId: "history-item-0", delta: "changed" });
+        }
+        return result;
+      });
+      await expect(setup.adapter.getNativeHistoryProjection(context(setup.target, events, { binding, backendInstanceGeneration: 7 })))
+        .rejects.toMatchObject({ publicError: { code: "CODEX_NATIVE_HISTORY_STALE" } });
+    }
+  );
 
   it("publishes only Adapter-safe Host-composed capabilities", async () => {
     const setup = await createSetup(7, {
@@ -1179,6 +1968,8 @@ describe("CodexBackendAdapter", () => {
     expect(interactionRequests).toBe(0);
     await expect(setup.adapter.setName("review", boundReview))
       .rejects.toMatchObject({ publicError: { code: "CODEX_REVIEW_OPERATION_DENIED" } });
+    await expect(setup.adapter.navigateTree({ kind: "native_entry", entryId: "review-entry" }, false, boundReview, undefined, navigationAuthority))
+      .rejects.toMatchObject({ publicError: { code: "CODEX_REVIEW_OPERATION_DENIED", stateMayHaveChanged: false } });
     await expect(setup.adapter.deleteSession(binding, boundReview))
       .rejects.toMatchObject({ publicError: { code: "CODEX_REVIEW_OPERATION_DENIED" } });
     await expect(setup.adapter.abort(boundReview)).resolves.toBeUndefined();
@@ -1419,11 +2210,39 @@ describe("CodexBackendAdapter", () => {
     expect(serialized).not.toContain(grandchildThreadId);
     expect(serialized).not.toContain("spawn-call-sensitive-id");
     expect(serialized).not.toContain("nested-spawn-sensitive-id");
+
+    const rootThread = setup.fake.threads.get(rootThreadId)!;
+    const rootItems = rootThread.turns[0]!["items"] as JsonObject[];
+    rootItems.push({ ...spawnItem, status: "completed" });
+    await setup.fake.completeTurn(rootThreadId);
+    const retainedEntryId = (rootThread.turns[0]!["items"] as JsonObject[]).at(-1)!["id"] as string;
+    await setup.adapter.send(prompt("A later root turn"), { ...active, operationId: "later-root-turn" });
+    await setup.fake.completeTurn(rootThreadId);
+    await setup.adapter.navigateTree({ kind: "native_entry", entryId: retainedEntryId }, false, active, undefined, navigationAuthority);
+    const afterRewind = events.length;
+    await transport.emitNotification("turn/started", {
+      threadId: grandchildThreadId,
+      turn: { id: "grandchild-resumed", status: "inProgress", items: [], error: null }
+    });
+    expect(events.slice(afterRewind)).toContainEqual(expect.objectContaining({
+      type: "subagent_run", run: expect.objectContaining({ id: nestedRun.id, state: "running" })
+    }));
+    await expect(setup.adapter.navigateTree({ kind: "native_entry", entryId: retainedEntryId }, false, active, undefined, navigationAuthority)).rejects.toMatchObject({
+      publicError: { code: "CODEX_REWIND_BUSY", stateMayHaveChanged: false }
+    });
   });
 
-  it("fails Review closed for an old runtime, unknown MCP inventory, or inherited instructions", async () => {
+  it.each([
+    "codex/0.151.0-alpha.7.2",
+    "codex/0.153.3",
+    "codex/0.153.4-alpha.1",
+    "codex/0.153.4+unverified",
+    "codex/0.153.5",
+    "codex/0.154.0",
+    "unknown"
+  ])("fails audited capabilities closed for runtime %s", async (userAgent) => {
     const old = await createSetup();
-    old.fake.userAgent = "codex/0.150.9";
+    old.fake.userAgent = userAgent;
     const oldDescriptor = await old.adapter.describe();
     expect(oldDescriptor.capabilities.get("review.isolated")).toMatchObject({
       supported: false,
@@ -1431,6 +2250,7 @@ describe("CodexBackendAdapter", () => {
     });
     expect(oldDescriptor.capabilities.get("plan_mode")).toMatchObject({ supported: false, reason: "upstream_missing" });
     expect(oldDescriptor.capabilities.get("background.tasks")).toMatchObject({ supported: false, reason: "upstream_missing" });
+    expect(oldDescriptor.capabilities.get("subagents.list")).toMatchObject({ supported: false, reason: "upstream_missing" });
     await expect(old.adapter.createSession({
       ...sessionInput(old.target),
       runtimePolicy: "review_read_only"
@@ -1438,16 +2258,10 @@ describe("CodexBackendAdapter", () => {
       ...context(old.target, [], { backendInstanceGeneration: 7 }),
       runtimePolicy: "review_read_only"
     })).rejects.toMatchObject({ publicError: { code: "CODEX_REVIEW_RUNTIME_UNSUPPORTED" } });
+    expect(old.fake.transport?.requests.some((request) => request.method === "thread/start")).toBe(false);
+  });
 
-    const unaudited = await createSetup();
-    unaudited.fake.userAgent = "codex/0.152.0";
-    const unauditedDescriptor = await unaudited.adapter.describe();
-    expect(unauditedDescriptor.capabilities.get("review.isolated")).toMatchObject({
-      supported: false,
-      reason: "upstream_missing"
-    });
-    expect(unauditedDescriptor.capabilities.get("subagents.list")).toMatchObject({ supported: false, reason: "upstream_missing" });
-
+  it("fails Review closed for unknown MCP inventory or inherited instructions", async () => {
     const unknown = await createSetup();
     unknown.fake.reviewMcpStatuses.push({
       name: "unclassified_runtime_server",
@@ -1770,6 +2584,19 @@ async function createSetup(
   return { adapter, fake, host, target };
 }
 
+async function createRewindSetup(adapterOptions: Omit<CodexAdapterOptions, "id" | "instanceGeneration" | "host"> = {}) {
+  const setup = await createSetup(7, adapterOptions);
+  const binding = await setup.adapter.createSession(sessionInput(setup.target), context(setup.target, [], { backendInstanceGeneration: 7 }));
+  const bound = context(setup.target, [], { binding, backendInstanceGeneration: 7 });
+  const thread = setup.fake.threads.get(binding.nativeSessionId!)!;
+  thread.turns.push(historyTurn(0), historyTurn(1), historyTurn(2));
+  return { ...setup, binding, bound, thread, transport: setup.fake.transport! };
+}
+
+function historyTurn(index: number, text = "answer"): JsonObject {
+  return { id: `history-turn-${index}`, status: "completed", items: [{ type: "agentMessage", id: `history-item-${index}`, text }], error: null };
+}
+
 function sessionInput(target: TargetDescriptor): CreateNativeSessionInput {
   return {
     target,
@@ -1815,3 +2642,5 @@ function context(
     storeArtifact: async () => ({ id: "artifact", sha256: "0".repeat(64), byteLength: 0, mimeType: "application/octet-stream" })
   };
 }
+
+const navigationAuthority = { recordBinding: (): never => { throw new Error("Unexpected native context replacement."); } };

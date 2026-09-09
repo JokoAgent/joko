@@ -192,6 +192,8 @@ message OperationMutation {
     ReobserveReviewMutation reobserve_review = 176;
     CommitProviderCredentialSurfaceMutation commit_provider_credential_surface = 177;
     ClearProviderCredentialSurfaceMutation clear_provider_credential_surface = 178;
+    UpdateAuxiliaryTextSettingsMutation update_auxiliary_text_settings = 179;
+    UpdateSubagentModelSettingsMutation update_subagent_model_settings = 180;
   }
 }
 
@@ -393,7 +395,7 @@ message CloneSessionMutation {
 
 message NavigateSessionBranchMutation {
   string session_id = 1;
-  string native_entry_id = 2;
+  NativeNavigationTarget target = 2;
   bool summarize = 3;
   string custom_instructions = 4;
 }
@@ -447,6 +449,8 @@ message MoveSessionProjectMutation {
 }
 
 message SendInputMutation {
+  // Requires a positive exact SESSION expected_generation precondition captured before input preparation.
+  // Admission and queue insertion commit together; replay keeps that accepted result after activation.
   string session_id = 1;
   InputContent input = 2;
   QueueDeliveryMode delivery_mode = 3;
@@ -817,7 +821,6 @@ message CommitCredentialMutation {
   string display_name = 3;
   CredentialKind kind = 4;
   string provider_id = 5;
-  string environment_name = 6;
 }
 
 message DeleteCredentialMutation {
@@ -928,6 +931,18 @@ message UpdateVisionBridgeSettingsMutation {
 
 message UpdatePromptRecommendationSettingsMutation {
   PromptRecommendationSettingsPatch patch = 1;
+}
+
+message UpdateAuxiliaryTextSettingsMutation {
+  repeated ModelRouteRef models = 1;
+  Revision expected_revision = 2;
+}
+
+message UpdateSubagentModelSettingsMutation {
+  string backend_id = 1;
+  // Omitted restores the native default.
+  optional ModelKey model = 2;
+  Revision expected_revision = 3;
 }
 
 // Backend-neutral user shell surface.
@@ -1050,6 +1065,9 @@ message OpenBrowserPageMutation {
   string takeover_id = 6;
   // Optional durable lost-page descriptor replaced by this new page.
   string recovery_page_id = 7;
+  // Opens a bounded isolated workspace snapshot. Mutually exclusive with URL
+  // and recovery_page_id; HTML bytes never enter the durable mutation.
+  WorkspaceHtmlReference workspace_html = 8;
 }
 
 // Transfers one exact owned human capability to another live page.

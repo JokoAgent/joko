@@ -1,9 +1,9 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { deferredShareValue, pngBlob, shareImageTestPalette, shareImageTestSurface } from "./share-image.test-support.js";
 import { MAXIMUM_SHARE_IMAGE_EDGE_PIXELS, MAXIMUM_SHARE_IMAGE_PIXELS, MAXIMUM_SHARE_MESSAGE_CHARACTERS, ShareMessageImageTooLargeError } from "./share-message-image.js";
-import { buildShareSelectionImagePng, layoutShareSelectionImage, shareSelectionImageMessages } from "./share-selection-image.js";
+import { buildShareSelectionImagePng, copyShareSelectionImagePng, downloadShareSelectionImagePng, layoutShareSelectionImage, shareSelectionImageMessages } from "./share-selection-image.js";
 import type { TimelineItemView } from "../model.js";
 
-afterEach(() => vi.unstubAllGlobals());
 
 describe("multi-message share PNG", () => {
   it("preserves selected timeline order and marks skipped messages honestly", () => {
@@ -48,19 +48,42 @@ describe("multi-message share PNG", () => {
     }, () => 1)).toThrow(ShareMessageImageTooLargeError);
   });
 
-  it("encodes the combined export directly as a real PNG", async () => {
-    const encoded = new Blob([new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 1])], { type: "image/png" });
-    const encodingTypes: string[] = [];
-    const context = new Proxy({ measureText: (value: string) => ({ width: value.length * 8 }) } as unknown as CanvasRenderingContext2D, {
-      get(target, property) { return property in target ? Reflect.get(target, property) : vi.fn(); },
-      set(target, property, value) { return Reflect.set(target, property, value); }
-    });
-    const canvas = { width: 0, height: 0, getContext: () => context, toBlob: (callback: BlobCallback, type?: string) => { encodingTypes.push(type ?? ""); callback(encoded); } } as unknown as HTMLCanvasElement;
-    vi.stubGlobal("document", { createElement: () => canvas });
-    await expect(buildShareSelectionImagePng({ sessionName: "Task", messages: [{ id: "one", role: "assistant", roleLabel: "Agent", text: "Done", attachmentNames: [], attachmentsLabel: "Attachments", gapBefore: false }] }, {
-      background: "white", surface: "white", text: "black", secondaryText: "gray", line: "gray", accent: "orange", accentInk: "black", fontFamily: "sans-serif"
-    })).resolves.toBe(encoded);
-    expect(encodingTypes).toEqual(["image/png"]);
+  it("encodes in the initiating document and releases the canvas", async () => {
+    const surface = shareImageTestSurface();
+    await expect(buildShareSelectionImagePng({ sessionName: "Task", messages: [{ id: "one", role: "assistant", roleLabel: "Agent", text: "Done", attachmentNames: [], attachmentsLabel: "Attachments", gapBefore: false }] }, surface.action, shareImageTestPalette)).resolves.toMatchObject({ type: "image/png" });
+    expect(surface.canvas.toBlob).toHaveBeenCalledWith(expect.any(Function), "image/png");
+    expect([surface.canvas.width, surface.canvas.height]).toEqual([0, 0]);
+  });
+
+  it("writes PNG through the initiating clipboard and reports missing image capability", async () => {
+    const surface = shareImageTestSurface();
+    const blob = pngBlob();
+    await copyShareSelectionImagePng(blob, surface.action);
+    expect(surface.write).toHaveBeenCalledExactlyOnceWith([expect.objectContaining({ items: { "image/png": blob } })]);
+    Reflect.deleteProperty(surface.window, "ClipboardItem");
+    await expect(copyShareSelectionImagePng(blob, surface.action)).rejects.toThrow();
+    expect(surface.write).toHaveBeenCalledOnce();
+  });
+
+  it.each(["copy", "download"] as const)("does not dispatch %s after retirement during validation", async (kind) => {
+    const surface = shareImageTestSurface();
+    const bytes = deferredShareValue<ArrayBuffer>();
+    const blob = pngBlob();
+    vi.spyOn(blob, "slice").mockReturnValue({ arrayBuffer: () => bytes.promise } as Blob);
+    const pending = kind === "copy" ? copyShareSelectionImagePng(blob, surface.action) : downloadShareSelectionImagePng(blob, "Task", 0, surface.action);
+    const rejected = expect(pending).rejects.toThrow();
+    surface.abort.abort();
+    bytes.resolve(await pngBlob().arrayBuffer());
+    await rejected;
+    expect(surface.write).not.toHaveBeenCalled();
+    expect(surface.click).not.toHaveBeenCalled();
+  });
+
+  it("keeps the result of an already dispatched clipboard write", async () => {
+    const surface = shareImageTestSurface();
+    surface.write.mockImplementationOnce(async () => { surface.abort.abort(); });
+    await expect(copyShareSelectionImagePng(pngBlob(), surface.action)).resolves.toBeUndefined();
+    expect(surface.write).toHaveBeenCalledOnce();
   });
 });
 

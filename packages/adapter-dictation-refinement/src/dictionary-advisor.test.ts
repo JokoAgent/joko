@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  DictationDictionaryResponseError,
   ManagedDictationDictionaryAdvisor,
   getDictationDictionaryAdviceSkipReason
 } from "./dictionary-advisor.js";
@@ -70,9 +71,9 @@ describe("managed dictation dictionary advisor", () => {
     })).toBe("large_rewrite");
   });
 
-  it("fails closed on invalid model output", async () => {
-    const advisor = new ManagedDictationDictionaryAdvisor({ request: async () => "not json" });
+  it.each(["not json", "null", "[]", '{}', '{"actions":null}'])("rejects malformed response %s without echoing model output", async (output) => {
+    const advisor = new ManagedDictationDictionaryAdvisor({ request: async () => output });
     await expect(advisor.advise({ beforeText: "voice kit", afterText: "VoiceKit" }, new AbortController().signal))
-      .resolves.toEqual({ actions: [] });
+      .rejects.toEqual(new DictationDictionaryResponseError());
   });
 });

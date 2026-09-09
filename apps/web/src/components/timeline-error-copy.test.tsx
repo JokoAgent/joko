@@ -23,12 +23,12 @@ describe("classified timeline failure UX", () => {
     roots.push(root);
     await act(async () => root.render(<ErrorBlock item={errorItem("UPSTREAM_OVERLOAD", "redacted upstream detail")} locale="zh-CN" t={(key, values) => translate("zh-CN", key, values)} />));
 
-    expect(container.querySelector(".timeline-error__message")?.textContent).toContain("没有可用容量");
-    expect(container.querySelector(".timeline-error__recovery")?.textContent).toContain("另一个可用模型");
-    expect(container.querySelector(".timeline-error header strong")?.textContent).toBe("模型服务繁忙");
+    expect(container.querySelector(".timeline-error__message")?.textContent).toContain(translate("zh-CN", "timeline.errorCapacityMessage"));
+    expect(container.querySelector(".timeline-error__recovery")?.textContent).toContain(translate("zh-CN", "timeline.errorCapacityRecovery"));
+    expect(container.querySelector(".timeline-error header strong")?.textContent).toBe(translate("zh-CN", "timeline.errorCapacityTitle"));
     const details = container.querySelector<HTMLDetailsElement>(".timeline-error__raw");
     expect(details?.open).toBe(false);
-    expect(details?.querySelector("summary")?.textContent).toBe("显示原始错误");
+    expect(details?.querySelector("summary")?.textContent).toBe(translate("zh-CN", "timeline.showRawError"));
     expect(details?.querySelector("code")?.textContent).toBe("UPSTREAM_OVERLOAD");
     expect(details?.querySelector("pre")?.textContent).toBe("redacted upstream detail");
 
@@ -36,7 +36,7 @@ describe("classified timeline failure UX", () => {
       details!.open = true;
       details!.dispatchEvent(new Event("toggle", { bubbles: false }));
     });
-    expect(details?.querySelector("summary")?.textContent).toBe("隐藏原始错误");
+    expect(details?.querySelector("summary")?.textContent).toBe(translate("zh-CN", "timeline.hideRawError"));
   });
 
   it("keeps unknown code and message out of the visible summary and inside technical detail", async () => {

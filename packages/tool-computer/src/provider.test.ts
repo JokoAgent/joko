@@ -1,8 +1,9 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { describe, expect, it, vi } from "vitest";
+import { COMPUTER_TEXT_CORPUS } from "./i18n/input.test-fixture.js";
 
 import {
   ComputerToolProvider as PublicComputerToolProvider,
@@ -14,6 +15,7 @@ import {
   type ComputerToolCallResult
 } from "./provider.js";
 import { COMPUTER_TOOL_NAMES } from "./catalog.js";
+const driverContract = JSON.parse(readFileSync(new URL("./fixtures/driver-contract-0.23.2-win32.json", import.meta.url), "utf8")) as ComputerMcpToolPage;
 import { ComputerRuntime } from "./runtime.js";
 
 class ComputerToolProvider extends PublicComputerToolProvider {
@@ -437,7 +439,7 @@ describe("isStaleComputerTransportError", () => {
 });
 
 describe("public computer automation surface", () => {
-  it("publishes the complete stable 24-tool catalog independently of private driver tools", async () => {
+  it("publishes the stable catalog independently of private driver tools", async () => {
     const connection = new FakeConnection({
       listTools: async () => ({ tools: [{ name: "private_driver_tool", inputSchema: {} }] })
     });
@@ -450,7 +452,7 @@ describe("public computer automation surface", () => {
     const tools = await provider.listTools(fence);
 
     expect(tools.map((tool) => tool.name)).toEqual(COMPUTER_TOOL_NAMES);
-    expect(tools).toHaveLength(24);
+    expect(tools).toHaveLength(25);
     expect(connection.listRequests).toHaveLength(0);
   });
 
@@ -646,7 +648,7 @@ describe("public computer automation surface", () => {
     const first = await provider.callTool(fence, "get_window_state", {
       pid: 10,
       window_id: 2,
-      capture_mode: "vision",
+      include_screenshot: true,
       session: "untrusted"
     });
     const firstSnapshot = first.structuredContent?.["snapshot_id"];
@@ -656,7 +658,7 @@ describe("public computer automation surface", () => {
       arguments: {
         pid: 10,
         window_id: 2,
-        capture_mode: "vision",
+        include_screenshot: true,
         session: "session-a-computer-fence-1-1"
       }
     });
@@ -671,6 +673,7 @@ describe("public computer automation surface", () => {
       pid: 10,
       window_id: 2,
       element_index: 0,
+      snapshot_id: "driver-1",
       session: "session-a-computer-fence-1-1"
     });
 
@@ -689,6 +692,71 @@ describe("public computer automation surface", () => {
     expect(connection.callRequests).toHaveLength(callsBeforeStaleAction);
   });
 
+  it.each([
+    { name: "MCP error", result: { isError: true } },
+    { name: "structured failure", result: { structuredContent: { ok: false } } },
+    { name: "JSON failure", result: { content: [{ type: "text", text: '{"ok":false}' }] } },
+    { name: "thrown observation failure", result: undefined }
+  ])("invalidates only the failed window and its aliases after $name, until re-observed", async ({ result }) => {
+    let failObservation = false;
+    let observation = 0;
+    const connection = new FakeConnection({
+      callTool: async (name, args) => {
+        if (name !== "get_window_state") return { structuredContent: { ok: true } };
+        if (failObservation && args["window_id"] === 2) {
+          if (result === undefined) throw new Error("Window observation failed.");
+          return result;
+        }
+        observation += 1;
+        return { structuredContent: { ok: true, snapshot_id: `driver-${observation}` } };
+      }
+    });
+    const otherConnection = new FakeConnection({
+      callTool: async () => ({ structuredContent: { ok: true, snapshot_id: "s00000001" } })
+    });
+    const provider = new UndecoratedComputerToolProvider({
+      connectionFactory: connectionHarness([connection, otherConnection]).factory,
+      idFactory: () => "snapshot"
+    });
+    const fence = await provider.openSession("session-a");
+    const otherFence = await provider.openSession("session-b");
+    const target = { pid: 10, window_id: 2 };
+    const first = await provider.callTool(fence, "get_window_state", target);
+    const otherWindow = await provider.callTool(fence, "get_window_state", { pid: 10, window_id: 3 });
+    const otherSession = await provider.callTool(otherFence, "get_window_state", target);
+    const firstId = first.structuredContent?.["snapshot_id"];
+
+    failObservation = true;
+    if (result === undefined) {
+      await expect(provider.callTool(fence, "get_window_state", target)).rejects.toMatchObject({ code: "transport_failed" });
+    } else {
+      await expect(provider.callTool(fence, "get_window_state", target)).resolves.toEqual({ ...result, isError: true });
+    }
+    const callsAfterFailure = connection.callRequests.length;
+    for (const snapshotId of [firstId, "driver-1"]) {
+      await expect(provider.callTool(fence, "click", { ...target, element_index: 0, snapshot_id: snapshotId }))
+        .resolves.toMatchObject({ isError: true, structuredContent: { errorCode: "STALE_SNAPSHOT" } });
+    }
+    expect(connection.callRequests).toHaveLength(callsAfterFailure);
+    await expect(provider.callTool(fence, "click", {
+      pid: 10, window_id: 3, element_index: 0, snapshot_id: otherWindow.structuredContent?.["snapshot_id"]
+    })).resolves.toMatchObject({ structuredContent: { ok: true } });
+    await expect(provider.callTool(otherFence, "click", {
+      ...target, element_index: 0, snapshot_id: otherSession.structuredContent?.["snapshot_id"]
+    })).resolves.toMatchObject({ structuredContent: { ok: true } });
+
+    failObservation = false;
+    const recovered = await provider.callTool(fence, "get_window_state", target);
+    await expect(provider.callTool(fence, "click", {
+      ...target, element_index: 0, snapshot_id: recovered.structuredContent?.["snapshot_id"]
+    })).resolves.toMatchObject({ structuredContent: { ok: true } });
+    const callsAfterRecovery = connection.callRequests.length;
+    await expect(provider.callTool(fence, "click", { ...target, element_index: 0, snapshot_id: "driver-1" }))
+      .resolves.toMatchObject({ isError: true, structuredContent: { errorCode: "STALE_SNAPSHOT" } });
+    expect(connection.callRequests).toHaveLength(callsAfterRecovery);
+    await provider.closeAll();
+  });
+
   it("owns the default screenshot path while preserving explicit and accessibility-only reads", async () => {
     const connection = new FakeConnection({
       callTool: async () => ({ structuredContent: { ok: true } })
@@ -702,17 +770,17 @@ describe("public computer automation surface", () => {
     await provider.callTool(fence, "get_window_state", {
       pid: 7,
       window_id: 2,
-      capture_mode: "vision"
+      include_screenshot: true
     });
     await provider.callTool(fence, "get_window_state", {
       pid: 7,
       window_id: 2,
-      capture_mode: "ax"
+      include_screenshot: false
     });
     await provider.callTool(fence, "get_window_state", {
       pid: 7,
       window_id: 2,
-      capture_mode: "som",
+      include_screenshot: true,
       screenshot_out_file: "D:\\workspace\\explicit.png"
     });
 
@@ -744,14 +812,14 @@ describe("public computer automation surface", () => {
 
     const result = await provider.callTool(fence, "type_text", {
       pid: 7,
-      text: "界".repeat(450)
+      text: COMPUTER_TEXT_CORPUS.multibyteCharacter.repeat(450)
     });
 
     expect(Array.from(first.callRequests[0]?.arguments["text"] as string)).toHaveLength(400);
     expect(Array.from(first.callRequests[1]?.arguments["text"] as string)).toHaveLength(50);
     expect(Array.from(second.callRequests[0]?.arguments["text"] as string)).toHaveLength(50);
     expect(result.structuredContent).toMatchObject({ ok: true, inserted: 450, chars: 450, chunks: 2 });
-    expect(JSON.stringify(result)).not.toContain("界");
+    expect(JSON.stringify(result)).not.toContain(COMPUTER_TEXT_CORPUS.multibyteCharacter);
   });
 
   it("rejects unknown fields before driver dispatch", async () => {
@@ -787,6 +855,9 @@ describe("public computer automation surface", () => {
         arguments: {}
       });
       const connection = new FakeConnection({
+        listTools: async () => ({ tools: driverContract.tools.map((tool) => tool.name === "click" ? {
+          ...tool, inputSchema: { ...tool.inputSchema, properties: { ...(tool.inputSchema["properties"] as object), debug_image_out: { type: "string" } } }
+        } : tool) }),
         callTool: async () => ({ structuredContent: { ok: true } })
       });
       const provider = new UndecoratedComputerToolProvider({
@@ -906,7 +977,7 @@ describe("public computer automation surface", () => {
       workspace_root: "D:/workspace/project"
     });
 
-    expect(connection.callRequests[0]?.arguments).toEqual({ session: "session-computer-fence-1-1" });
+    expect(connection.callRequests[0]?.arguments).toEqual({});
     expect(result.structuredContent?.["windows"]).toEqual([
       expect.objectContaining({ pid: 7, process_name: "Editor" })
     ]);
@@ -956,7 +1027,7 @@ class FakeConnection implements ComputerMcpConnection {
 
   async listTools(cursor: string | undefined, signal?: AbortSignal): Promise<ComputerMcpToolPage> {
     this.listRequests.push({ cursor, signal });
-    return await this.#options.listTools?.(cursor, signal) ?? { tools: [] };
+    return await this.#options.listTools?.(cursor, signal) ?? driverContract;
   }
 
   async callTool(

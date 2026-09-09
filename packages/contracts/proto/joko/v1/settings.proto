@@ -60,6 +60,8 @@ enum VoiceInputTranscriptionProtocol {
   VOICE_INPUT_TRANSCRIPTION_PROTOCOL_OPENAI_COMPATIBLE_BATCH = 1;
   VOICE_INPUT_TRANSCRIPTION_PROTOCOL_OPENAI_COMPATIBLE_REALTIME = 2;
   VOICE_INPUT_TRANSCRIPTION_PROTOCOL_QWEN_COMPATIBLE_REALTIME = 3;
+  VOICE_INPUT_TRANSCRIPTION_PROTOCOL_ELEVENLABS_SCRIBE_REALTIME = 4;
+  VOICE_INPUT_TRANSCRIPTION_PROTOCOL_VOLCENGINE_SAUC = 5;
 }
 
 // Service-node configuration only. The credential value is deliberately not
@@ -73,16 +75,17 @@ message VoiceInputServiceSettings {
   bool credential_configured = 6;
   EntityVersion version = 7;
   bool refinement_enabled = 8;
-  string refiner_provider_id = 9;
-  string refiner_model_id = 10;
-  string refiner_fallback_provider_id = 11;
-  string refiner_fallback_model_id = 12;
+  ModelRouteRef refiner_model = 9;
+  ModelRouteRef refiner_fallback_model = 10;
   bool fallback_enabled = 13;
   VoiceInputTranscriptionProtocol fallback_protocol = 14;
   string fallback_endpoint = 15;
   string fallback_model = 16;
   bool fallback_keyless = 17;
   bool fallback_credential_configured = 18;
+  // SAUC resource identities are independent from transcription model IDs.
+  string resource_id = 19;
+  string fallback_resource_id = 20;
 }
 
 message VoiceInputServiceSettingsPatch {
@@ -97,10 +100,9 @@ message VoiceInputServiceSettingsPatch {
   optional bool clear_credential = 7;
   Revision expected_revision = 8;
   optional bool refinement_enabled = 9;
-  optional string refiner_provider_id = 10;
-  optional string refiner_model_id = 11;
-  optional string refiner_fallback_provider_id = 12;
-  optional string refiner_fallback_model_id = 13;
+  // Absent preserves the selection; a present empty key explicitly clears it.
+  ModelRouteRef refiner_model = 10;
+  ModelRouteRef refiner_fallback_model = 11;
   optional bool fallback_enabled = 14;
   optional VoiceInputTranscriptionProtocol fallback_protocol = 15;
   optional string fallback_endpoint = 16;
@@ -108,23 +110,38 @@ message VoiceInputServiceSettingsPatch {
   optional bool fallback_keyless = 18;
   optional string fallback_credential_upload_ticket_id = 19;
   optional bool clear_fallback_credential = 20;
+  optional string resource_id = 21;
+  optional string fallback_resource_id = 22;
 }
 
 message ProviderConfiguration {
   string provider_id = 1;
   string display_name = 2;
   ProviderKind kind = 3;
-  ProviderApiCompatibility api_compatibility = 4;
+  bool enabled = 4;
+  EntityVersion version = 5;
+  // Exactly one configuration per Backend identity; there is no implicit runtime.
+  repeated ProviderRuntimeConfiguration runtimes = 6;
+}
+
+message ProviderRuntimeConfiguration {
+  string backend_id = 1;
+  ProviderApiCompatibility api_compatibility = 2;
   // Canonical endpoint without URL user-info, tokens, or secret query values.
-  string endpoint = 5;
-  string credential_reference_id = 6;
-  bool enabled = 7;
-  EntityVersion version = 8;
-  string api_key_environment = 9;
-  bool keyless = 10;
-  bool auth_header = 11;
-  repeated ProviderHeaderConfiguration headers = 12;
-  repeated ProviderModelConfiguration models = 13;
+  string endpoint = 3;
+  string credential_reference_id = 4;
+  string api_key_environment = 5;
+  bool keyless = 6;
+  bool auth_header = 7;
+  repeated ProviderHeaderConfiguration headers = 8;
+  repeated ProviderModelConfiguration models = 9;
+  // Optional origin-relative API path. The runtime must advertise support.
+  optional string request_path = 10;
+  // Optional same-origin model catalog URL.
+  optional string models_endpoint = 11;
+  // Explicit credential authority; must match endpoint origin when any key is bound.
+  // Changing endpoint origin never updates this field implicitly.
+  string credential_origin = 12;
 }
 
 message ProviderHeaderConfiguration {
@@ -670,6 +687,34 @@ message ModelRouteRefList {
   repeated ModelRouteRef values = 1;
 }
 
+message AuxiliaryTextRouteOption {
+  ModelRouteRef route = 1;
+  bool available = 2;
+  string unavailable_reason = 3;
+}
+
+message AuxiliaryTextSettings {
+  // Empty selects the automatic chain; otherwise one to three exact routes.
+  repeated ModelRouteRef models = 1;
+  repeated ModelRouteRef automatic_models = 2;
+  repeated AuxiliaryTextRouteOption options = 3;
+  bool available = 4;
+  string unavailable_reason = 5;
+  // Durable revision of this setting, independent of unrelated events.
+  Revision revision = 6;
+  // Opaque service incarnation and availability revision, without secrets.
+  string runtime_revision = 7;
+}
+
+message SubagentModelSettings {
+  string backend_id = 1;
+  // Selection source is retained for display; execution keeps the parent source.
+  optional ModelKey model = 2;
+  bool available = 3;
+  string unavailable_reason = 4;
+  Revision revision = 5;
+}
+
 message VisionBridgeSettings {
   bool enabled = 1;
   repeated ModelRouteRef target_models = 2;
@@ -799,6 +844,8 @@ message SettingsSnapshot {
   GitSafetySettings git_safety = 27;
   repeated ToolPolicySettings tool_policies = 28;
   VoiceInputServiceSettings voice_input = 29;
+  AuxiliaryTextSettings auxiliary_text = 30;
+  repeated SubagentModelSettings subagent_models = 31;
 }
 
 message AppearanceSettingsPatch {

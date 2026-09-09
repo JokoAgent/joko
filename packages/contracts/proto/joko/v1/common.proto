@@ -2,6 +2,15 @@ syntax = "proto3";
 
 package joko.v1;
 
+message NativeNavigationTarget {
+  oneof kind {
+    string native_entry_id = 1;
+    SessionStartTarget session_start = 2;
+  }
+}
+
+message SessionStartTarget {}
+
 // Capability-neutral execution/filesystem location. Host credentials and
 // presented keys are intentionally not representable.
 message RemoteWorkspaceBinding {
@@ -146,6 +155,23 @@ message ArtifactRef {
   BlobRef blob = 2;
   ArtifactKind kind = 3;
   string title = 4;
+  AudioArtifactMetadata audio_metadata = 5;
+}
+
+enum AudioArtifactKind {
+  AUDIO_ARTIFACT_KIND_UNSPECIFIED = 0;
+  AUDIO_ARTIFACT_KIND_GENERIC = 1;
+  AUDIO_ARTIFACT_KIND_MUSIC = 2;
+  AUDIO_ARTIFACT_KIND_SOUND_EFFECT = 3;
+}
+
+// Metadata belongs to this Artifact, never to content-addressed bytes globally.
+message AudioArtifactMetadata {
+  AudioArtifactKind kind = 1;
+  string title = 2;
+  string description = 3;
+  optional double duration_seconds = 4;
+  ImageRef artwork = 5;
 }
 
 enum ArtifactKind {

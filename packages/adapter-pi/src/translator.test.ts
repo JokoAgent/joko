@@ -29,11 +29,47 @@ describe("PiEventTranslator", () => {
     } as unknown as PiRpcEvent);
 
     expect(events.filter((event) => event.type === "text_delta")).toEqual([
-      { type: "text_delta", blockId: "assistant-1-0", delta: "wire delta", contentIndex: 0 }
+      { type: "text_delta", blockId: expect.any(String), delta: "wire delta", contentIndex: 0 }
     ]);
     // Streaming usage is cumulative billed-call data, not the authoritative
     // live context window. SessionHost syncs get_session_stats instead.
     expect(events.filter((event) => event.type === "usage")).toEqual([]);
+  });
+
+  it("keeps streamed message identities distinct after runtime recreation in the same Session", async () => {
+    const events: EventPayload[] = [];
+    const workspace = await mkdtemp(join(tmpdir(), "joko-pi-stream-identity-workspace-"));
+    const artifacts = await mkdtemp(join(tmpdir(), "joko-pi-stream-identity-artifacts-"));
+    const sessionContext = context(workspace, events, []);
+    for (let runtime = 0; runtime < 2; runtime += 1) {
+      const translator = new PiEventTranslator({
+        context: sessionContext,
+        artifactDirectory: artifacts,
+        wasAbortRequested: () => false
+      });
+      for (let message = 0; message < 2; message += 1) {
+        await translator.translate({ type: "message_start", message: { role: "assistant", content: [] } } as unknown as PiRpcEvent);
+        for (const [type, contentIndex] of [["text_delta", 0], ["thinking_delta", 1]] as const) {
+          for (const delta of ["first", "second"]) {
+            await translator.translate({
+              type: "message_update",
+              assistantMessageEvent: { type, contentIndex, delta }
+            } as unknown as PiRpcEvent);
+          }
+        }
+      }
+    }
+
+    const deltas = events.filter((event) => event.type === "text_delta" || event.type === "thinking_delta");
+    expect(deltas).toHaveLength(16);
+    const byBlock = new Map<string, string[]>();
+    for (const event of deltas) {
+      const values = byBlock.get(event.blockId) ?? [];
+      values.push(event.delta);
+      byBlock.set(event.blockId, values);
+    }
+    expect(byBlock.size).toBe(8);
+    expect([...byBlock.values()]).toEqual(Array.from({ length: 8 }, () => ["first", "second"]));
   });
 
   it("drops empty text/thinking deltas and preserves provider-redacted thinking at message completion", async () => {

@@ -1,0 +1,8 @@
+.interactive-terminal { display: flex; flex-direction: column; min-height: 180px; height: 100%; min-width: 0; background: var(--surface); }
+.interactive-terminal > header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px; padding: 8px 12px; border-bottom: 1px solid var(--line); font-size: var(--text-12); }
+.interactive-terminal > header > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.interactive-terminal__screen { flex: 1; min-height: 120px; min-width: 0; overflow: hidden; padding: 8px; font-family: var(--font-mono); font-size: var(--app-code-font-size); }
+.interactive-terminal__screen .xterm { height: 100%; }
+.interactive-terminal__status { flex-shrink: 0; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 12px; border-top: 1px solid var(--line); font-size: var(--text-12); }
+.interactive-terminal__status p { margin: 0; overflow-wrap: anywhere; }
+@media (max-width: 600px) { .interactive-terminal__screen { padding: 4px; } .interactive-terminal > header { padding: 6px 8px; } }

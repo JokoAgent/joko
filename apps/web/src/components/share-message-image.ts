@@ -1,3 +1,6 @@
+import { downloadArtifactBlob } from "../artifact-download.js";
+import { assertBrowserActionCurrent, type BrowserActionContext } from "../browser-action.js";
+
 export const MAXIMUM_SHARE_MESSAGE_CHARACTERS = 12_000;
 export const MAXIMUM_SHARE_IMAGE_EDGE_PIXELS = 8_192;
 export const MAXIMUM_SHARE_IMAGE_PIXELS = 16_777_216;
@@ -46,7 +49,7 @@ export interface ShareMessageImageLayout {
   readonly cardHeight: number;
 }
 
-export type ShareMessageImageDelivery = "shared" | "downloaded" | "cancelled";
+export type ShareMessageImageDelivery = "shared" | "dispatched" | "cancelled";
 
 export class ShareMessageImageEmptyError extends Error {
   constructor() {
@@ -162,125 +165,129 @@ export function layoutShareMessageImage(
 
 export async function buildShareMessageImagePng(
   content: ShareMessageImageContent,
-  palette = readShareMessageImagePalette()
+  action: BrowserActionContext,
+  palette = readShareMessageImagePalette(action)
 ): Promise<Blob> {
-  const canvas = document.createElement("canvas");
-  const context = canvas.getContext("2d");
-  if (context === null) throw new ShareMessageImageEncodingError();
-  context.font = `400 17px ${palette.fontFamily}`;
-  const layout = layoutShareMessageImage(content, (value) => context.measureText(value).width);
-  canvas.width = layout.width * layout.scale;
-  canvas.height = layout.height * layout.scale;
-  context.scale(layout.scale, layout.scale);
-  context.textBaseline = "top";
+  assertBrowserActionCurrent(action);
+  const canvas = action.ownerDocument.createElement("canvas");
+  try {
+    const context = canvas.getContext("2d");
+    if (context === null) throw new ShareMessageImageEncodingError();
+    context.font = `400 17px ${palette.fontFamily}`;
+    const layout = layoutShareMessageImage(content, (value) => context.measureText(value).width);
+    canvas.width = layout.width * layout.scale;
+    canvas.height = layout.height * layout.scale;
+    context.scale(layout.scale, layout.scale);
+    context.textBaseline = "top";
 
-  context.fillStyle = palette.background;
-  context.fillRect(0, 0, layout.width, layout.height);
-  context.fillStyle = palette.accent;
-  roundedRect(context, SHARE_IMAGE_HORIZONTAL_PADDING, 43, 34, 7, 3.5);
-  context.fill();
-  context.fillStyle = palette.text;
-  context.font = `650 25px ${palette.fontFamily}`;
-  context.fillText(layout.title, SHARE_IMAGE_HORIZONTAL_PADDING, 65, layout.width - SHARE_IMAGE_HORIZONTAL_PADDING * 2);
-  context.fillStyle = palette.secondaryText;
-  context.font = `400 13px ${palette.fontFamily}`;
-  context.fillText("Joko", SHARE_IMAGE_HORIZONTAL_PADDING, 101);
-
-  const cardLeft = SHARE_IMAGE_HORIZONTAL_PADDING;
-  const cardWidth = layout.width - SHARE_IMAGE_HORIZONTAL_PADDING * 2;
-  roundedRect(context, cardLeft, layout.cardTop, cardWidth, layout.cardHeight, 18);
-  context.fillStyle = palette.surface;
-  context.fill();
-  context.strokeStyle = palette.line;
-  context.lineWidth = 1;
-  context.stroke();
-
-  const roleLabel = layout.roleLabel || (content.role === "user" ? "You" : "Agent");
-  context.font = `600 13px ${palette.fontFamily}`;
-  const pillWidth = Math.min(220, Math.max(62, context.measureText(roleLabel).width + 24));
-  roundedRect(context, cardLeft + SHARE_IMAGE_CARD_PADDING, layout.cardTop + SHARE_IMAGE_CARD_PADDING, pillWidth, 28, 14);
-  context.fillStyle = palette.accent;
-  context.fill();
-  context.fillStyle = palette.accentInk;
-  context.fillText(roleLabel, cardLeft + SHARE_IMAGE_CARD_PADDING + 12, layout.cardTop + SHARE_IMAGE_CARD_PADDING + 6, pillWidth - 24);
-  if (layout.createdAtLabel !== undefined) {
+    context.fillStyle = palette.background;
+    context.fillRect(0, 0, layout.width, layout.height);
+    context.fillStyle = palette.accent;
+    roundedRect(context, SHARE_IMAGE_HORIZONTAL_PADDING, 43, 34, 7, 3.5);
+    context.fill();
+    context.fillStyle = palette.text;
+    context.font = `650 25px ${palette.fontFamily}`;
+    context.fillText(layout.title, SHARE_IMAGE_HORIZONTAL_PADDING, 65, layout.width - SHARE_IMAGE_HORIZONTAL_PADDING * 2);
     context.fillStyle = palette.secondaryText;
-    context.font = `400 12px ${palette.fontFamily}`;
-    const timeWidth = context.measureText(layout.createdAtLabel).width;
-    context.fillText(layout.createdAtLabel, cardLeft + cardWidth - SHARE_IMAGE_CARD_PADDING - timeWidth, layout.cardTop + SHARE_IMAGE_CARD_PADDING + 7);
+    context.font = `400 13px ${palette.fontFamily}`;
+    context.fillText("Joko", SHARE_IMAGE_HORIZONTAL_PADDING, 101);
+
+    const cardLeft = SHARE_IMAGE_HORIZONTAL_PADDING;
+    const cardWidth = layout.width - SHARE_IMAGE_HORIZONTAL_PADDING * 2;
+    roundedRect(context, cardLeft, layout.cardTop, cardWidth, layout.cardHeight, 18);
+    context.fillStyle = palette.surface;
+    context.fill();
+    context.strokeStyle = palette.line;
+    context.lineWidth = 1;
+    context.stroke();
+
+    const roleLabel = layout.roleLabel || (content.role === "user" ? "You" : "Agent");
+    context.font = `600 13px ${palette.fontFamily}`;
+    const pillWidth = Math.min(220, Math.max(62, context.measureText(roleLabel).width + 24));
+    roundedRect(context, cardLeft + SHARE_IMAGE_CARD_PADDING, layout.cardTop + SHARE_IMAGE_CARD_PADDING, pillWidth, 28, 14);
+    context.fillStyle = palette.accent;
+    context.fill();
+    context.fillStyle = palette.accentInk;
+    context.fillText(roleLabel, cardLeft + SHARE_IMAGE_CARD_PADDING + 12, layout.cardTop + SHARE_IMAGE_CARD_PADDING + 6, pillWidth - 24);
+    if (layout.createdAtLabel !== undefined) {
+      context.fillStyle = palette.secondaryText;
+      context.font = `400 12px ${palette.fontFamily}`;
+      const timeWidth = context.measureText(layout.createdAtLabel).width;
+      context.fillText(layout.createdAtLabel, cardLeft + cardWidth - SHARE_IMAGE_CARD_PADDING - timeWidth, layout.cardTop + SHARE_IMAGE_CARD_PADDING + 7);
+    }
+
+    context.fillStyle = palette.text;
+    context.font = `400 17px ${palette.fontFamily}`;
+    let lineTop = layout.cardTop + SHARE_IMAGE_CARD_PADDING + 46;
+    for (const line of layout.lines) {
+      context.fillText(line, cardLeft + SHARE_IMAGE_CARD_PADDING, lineTop, cardWidth - SHARE_IMAGE_CARD_PADDING * 2);
+      lineTop += SHARE_IMAGE_BODY_LINE_HEIGHT;
+    }
+
+    const footerTop = layout.cardTop + layout.cardHeight + 44;
+    context.strokeStyle = palette.line;
+    context.beginPath();
+    context.moveTo(SHARE_IMAGE_HORIZONTAL_PADDING, footerTop);
+    context.lineTo(layout.width - SHARE_IMAGE_HORIZONTAL_PADDING, footerTop);
+    context.stroke();
+    context.fillStyle = palette.accent;
+    context.font = `700 18px ${palette.fontFamily}`;
+    context.fillText("Joko", SHARE_IMAGE_HORIZONTAL_PADDING, footerTop + 18);
+
+    const blob = await canvasPngBlob(canvas, action.signal);
+    assertBrowserActionCurrent(action);
+    await assertPngBlob(blob, action);
+    assertBrowserActionCurrent(action);
+    return blob;
+  } finally {
+    canvas.width = 0;
+    canvas.height = 0;
   }
-
-  context.fillStyle = palette.text;
-  context.font = `400 17px ${palette.fontFamily}`;
-  let lineTop = layout.cardTop + SHARE_IMAGE_CARD_PADDING + 46;
-  for (const line of layout.lines) {
-    context.fillText(line, cardLeft + SHARE_IMAGE_CARD_PADDING, lineTop, cardWidth - SHARE_IMAGE_CARD_PADDING * 2);
-    lineTop += SHARE_IMAGE_BODY_LINE_HEIGHT;
-  }
-
-  const footerTop = layout.cardTop + layout.cardHeight + 44;
-  context.strokeStyle = palette.line;
-  context.beginPath();
-  context.moveTo(SHARE_IMAGE_HORIZONTAL_PADDING, footerTop);
-  context.lineTo(layout.width - SHARE_IMAGE_HORIZONTAL_PADDING, footerTop);
-  context.stroke();
-  context.fillStyle = palette.accent;
-  context.font = `700 18px ${palette.fontFamily}`;
-  context.fillText("Joko", SHARE_IMAGE_HORIZONTAL_PADDING, footerTop + 18);
-
-  const blob = await canvasPngBlob(canvas);
-  await assertPngBlob(blob);
-  return blob;
 }
 
-export async function assertPngBlob(blob: Blob): Promise<void> {
+export async function assertPngBlob(blob: Blob, action: BrowserActionContext): Promise<void> {
+  assertBrowserActionCurrent(action);
   if (blob.type !== "image/png" || blob.size < PNG_SIGNATURE.length) throw new ShareMessageImageEncodingError();
   const bytes = new Uint8Array(await blob.slice(0, PNG_SIGNATURE.length).arrayBuffer());
+  assertBrowserActionCurrent(action);
   if (!PNG_SIGNATURE.every((byte, index) => bytes[index] === byte)) throw new ShareMessageImageEncodingError();
 }
 
 export async function deliverShareMessageImage(
   blob: Blob,
   filename: string,
-  title: string
+  title: string,
+  action: BrowserActionContext
 ): Promise<ShareMessageImageDelivery> {
-  await assertPngBlob(blob);
+  await assertPngBlob(blob, action);
+  assertBrowserActionCurrent(action);
+  const ownerWindow = action.ownerDocument.defaultView!;
+  const navigator = ownerWindow.navigator;
   const safeTitle = boundedDisplayText(redactShareMessageText(singleLine(title)), SHARE_IMAGE_MAX_TITLE_CHARACTERS) || "Joko";
-  const file = typeof File === "undefined" ? undefined : new File([blob], filename, { type: "image/png" });
+  const file = typeof ownerWindow.File === "undefined" ? undefined : new ownerWindow.File([blob], filename, { type: "image/png" });
   if (file !== undefined && typeof navigator.share === "function" && (navigator.userActivation?.isActive ?? true)) {
     let canShare = false;
     try {
-      canShare = typeof navigator.canShare !== "function" || navigator.canShare({ files: [file] });
+      canShare = typeof navigator.canShare === "function" && navigator.canShare({ files: [file] });
     } catch {
       canShare = false;
     }
     if (canShare) {
+      assertBrowserActionCurrent(action);
       try {
+        // Once issued, preserve the OS result. Retirement only suppresses stale UI feedback.
         await navigator.share({ files: [file], title: safeTitle });
         return "shared";
       } catch (error) {
         if (error !== null && typeof error === "object" && "name" in error && error.name === "AbortError") return "cancelled";
-        // Some Chromium/WebView builds advertise file sharing but reject it
-        // after asynchronous PNG encoding. The local download remains a real,
-        // user-visible fallback; only failure of both paths reaches the UI.
+        throw error;
       }
     }
   }
 
-  const url = URL.createObjectURL(blob);
-  try {
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = filename;
-    anchor.rel = "noopener";
-    anchor.hidden = true;
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-  } finally {
-    window.setTimeout(() => URL.revokeObjectURL(url), 0);
-  }
-  return "downloaded";
+  assertBrowserActionCurrent(action);
+  downloadArtifactBlob(blob, filename, action);
+  return "dispatched";
 }
 
 export function shareMessageImageFilename(sessionName: string, createdAt: number): string {
@@ -301,8 +308,9 @@ function safeIsoTimestamp(value: number): string {
   }
 }
 
-function readShareMessageImagePalette(): ShareMessageImagePalette {
-  const styles = getComputedStyle(document.documentElement);
+function readShareMessageImagePalette(action: BrowserActionContext): ShareMessageImagePalette {
+  assertBrowserActionCurrent(action);
+  const styles = action.ownerDocument.defaultView!.getComputedStyle(action.ownerDocument.documentElement);
   const required = (name: string): string => {
     const value = styles.getPropertyValue(name).trim();
     if (value.length === 0) throw new ShareMessageImageEncodingError();
@@ -320,13 +328,21 @@ function readShareMessageImagePalette(): ShareMessageImagePalette {
   };
 }
 
-function canvasPngBlob(canvas: HTMLCanvasElement): Promise<Blob> {
-  return new Promise((resolve, reject) => {
-    canvas.toBlob((blob) => {
-      if (blob === null) reject(new ShareMessageImageEncodingError());
-      else resolve(blob);
-    }, "image/png");
-  });
+export async function canvasPngBlob(canvas: HTMLCanvasElement, signal: AbortSignal): Promise<Blob> {
+  signal.throwIfAborted();
+  let onAbort!: () => void;
+  try {
+    return await new Promise<Blob>((resolve, reject) => {
+      onAbort = () => reject(signal.reason);
+      signal.addEventListener("abort", onAbort, { once: true });
+      canvas.toBlob((blob) => {
+        if (blob === null) reject(new ShareMessageImageEncodingError());
+        else resolve(blob);
+      }, "image/png");
+    });
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
 }
 
 function normalizeMultiline(value: string): string {

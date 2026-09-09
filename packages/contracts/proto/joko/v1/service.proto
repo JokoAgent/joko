@@ -57,6 +57,7 @@ service BackendService {
   rpc GetProvider(GetProviderRequest) returns (GetProviderResponse);
   rpc GetProviderUsage(GetProviderUsageRequest) returns (GetProviderUsageResponse);
   rpc GetUsageHistory(GetUsageHistoryRequest) returns (GetUsageHistoryResponse);
+  rpc GetUsageReport(GetUsageReportRequest) returns (GetUsageReportResponse);
   rpc GetModelPriceOverride(GetModelPriceOverrideRequest) returns (GetModelPriceOverrideResponse);
   rpc SetModelPriceOverride(SetModelPriceOverrideRequest) returns (SetModelPriceOverrideResponse);
   rpc ResetModelPriceOverride(ResetModelPriceOverrideRequest) returns (ResetModelPriceOverrideResponse);
@@ -128,6 +129,7 @@ service WorkspaceService {
   // Lazy filename index (`rg --files --hidden`, 30k cap).
   rpc ListWorkspaceFiles(ListWorkspaceFilesRequest) returns (ListWorkspaceFilesResponse);
   rpc ReadWorkspaceFile(ReadWorkspaceFileRequest) returns (ReadWorkspaceFileResponse);
+  rpc ReadWorkspaceHtmlSnapshot(ReadWorkspaceHtmlSnapshotRequest) returns (ReadWorkspaceHtmlSnapshotResponse);
   rpc WriteWorkspaceTextFile(WriteWorkspaceTextFileRequest) returns (WriteWorkspaceTextFileResponse);
   rpc SearchWorkspace(SearchWorkspaceRequest) returns (SearchWorkspaceResponse);
   // Fixed-string project search. Match records arrive while
@@ -623,6 +625,24 @@ message GetUsageHistoryRequest {
 
 message GetUsageHistoryResponse {
   UsageHistory history = 1;
+}
+
+message GetUsageReportRequest {
+  // Empty bounds include the entire retained ledger. Dates are UTC YYYY-MM-DD.
+  string from_day = 1;
+  string through_day = 2;
+  optional string backend_id = 3;
+  optional string provider_id = 4;
+  optional string model_id = 5;
+  optional string session_id = 6;
+  UsageReportGroup group = 7;
+  PageRequest page = 8;
+}
+
+message GetUsageReportResponse {
+  repeated UsageReportEntry entries = 1;
+  UsageHistorySummary summary = 2;
+  PageInfo page = 3;
 }
 
 message GetModelPriceOverrideRequest {

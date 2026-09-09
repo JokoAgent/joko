@@ -55,6 +55,8 @@ function usageSnapshot(value: unknown): UsageSnapshot | undefined {
   ) return undefined;
   const contextTokens = optionalNonnegative(value["contextTokens"]);
   const contextWindow = optionalNonnegative(value["contextWindow"]);
+  const pricing = isRecord(value["pricingContext"]) ? value["pricingContext"] : undefined;
+  const requestInputTokens = nonnegativeInteger(pricing?.["inputTokens"]);
   return {
     inputTokens,
     outputTokens,
@@ -63,6 +65,10 @@ function usageSnapshot(value: unknown): UsageSnapshot | undefined {
     totalTokens,
     ...(contextTokens === undefined ? {} : { contextTokens }),
     ...(contextWindow === undefined ? {} : { contextWindow }),
+    ...(requestInputTokens === undefined ? {} : { pricingContext: {
+      inputTokens: requestInputTokens,
+      ...(typeof pricing?.["fastMode"] === "boolean" ? { fastMode: pricing["fastMode"] } : {})
+    } }),
     cost
   };
 }

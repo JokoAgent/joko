@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, type JSX } from "react";
+import { useEffect, useId, useRef, useState, type JSX } from "react";
 import { X } from "lucide-react";
 import type {
   ComposerMentionCatalogItem,
@@ -16,6 +16,8 @@ export function ComposerInlineMentionPanel({
   labels,
   onActiveIndexChange,
   onSelect,
+  onReference,
+  referenceOptions,
   onClose,
   onRetry,
   embedded = false
@@ -34,6 +36,15 @@ export function ComposerInlineMentionPanel({
   };
   readonly onActiveIndexChange: (index: number) => void;
   readonly onSelect: (item: ComposerMentionCatalogItem) => void;
+  readonly onReference?: (item: ComposerMentionCatalogItem) => void;
+  readonly referenceOptions?: {
+    readonly directory: boolean;
+    readonly lineRange: boolean;
+    readonly directoryLabel: string;
+    readonly startLineLabel: string;
+    readonly endLineLabel: string;
+    readonly lineRangeLabel: string;
+  };
   readonly onClose: () => void;
   readonly onRetry?: () => void;
   readonly embedded?: boolean;
@@ -43,6 +54,13 @@ export function ComposerInlineMentionPanel({
   const selectedIndex = results.items.length === 0 ? 0 : Math.min(Math.max(activeIndex, 0), results.items.length - 1);
   const activeItem = results.items[selectedIndex];
   const activeOptionId = activeItem === undefined ? undefined : `${listId}-option-${selectedIndex}`;
+  const [sourceLines, setSourceLines] = useState({ itemId: "", start: "", end: "" });
+  const start = sourceLines.itemId === activeItem?.id ? sourceLines.start : "";
+  const end = sourceLines.itemId === activeItem?.id ? sourceLines.end : "";
+  const startLine = Number(start);
+  const endLine = Number(end);
+  const validLines = start !== "" && end !== "" && Number.isInteger(startLine) && Number.isInteger(endLine)
+    && startLine > 0 && endLine >= startLine && endLine <= 0xffff_ffff;
 
   useEffect(() => {
     if (activeOptionId === undefined) return;
@@ -116,6 +134,28 @@ export function ComposerInlineMentionPanel({
           </button>
         ))}
       </div>
+      {activeItem?.disabled !== true && activeItem?.mention !== undefined && referenceOptions !== undefined && onReference !== undefined && (
+        activeItem.kind === "directory" && referenceOptions.directory
+          ? <button className="composer-palette__reference" type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => onReference(activeItem)}>{referenceOptions.directoryLabel}</button>
+          : activeItem.kind === "file" && referenceOptions.lineRange
+            ? <form className="composer-palette__reference" onSubmit={(event) => {
+                event.preventDefault();
+                if (!validLines || activeItem.mention === undefined) return;
+                const label = `${activeItem.mention.label}:${startLine}–${endLine}`;
+                onReference({ ...activeItem, mention: {
+                  ...activeItem.mention,
+                  id: `${activeItem.mention.id}:lines:${startLine}:${endLine}`,
+                  label,
+                  token: `${activeItem.mention.token}:${startLine}–${endLine}`,
+                  lineRange: { startLine, endLine }
+                } });
+              }}>
+                <label>{referenceOptions.startLineLabel}<input type="number" min={1} max={0xffff_ffff} step={1} value={start} onChange={(event) => setSourceLines({ itemId: activeItem.id, start: event.target.value, end })} /></label>
+                <label>{referenceOptions.endLineLabel}<input type="number" min={1} max={0xffff_ffff} step={1} value={end} onChange={(event) => setSourceLines({ itemId: activeItem.id, start, end: event.target.value })} /></label>
+                <button type="submit" disabled={!validLines}>{referenceOptions.lineRangeLabel}</button>
+              </form>
+            : null
+      )}
       {results.items.length === 0 && state.kind === "loading" && <p role="status">{labels.loading}</p>}
       {results.items.length === 0 && state.kind === "error" && (
         <p role="alert">{state.message}{onRetry === undefined ? null : <button type="button" onClick={onRetry}>{labels.retry}</button>}</p>

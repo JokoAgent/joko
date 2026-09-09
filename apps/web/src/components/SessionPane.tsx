@@ -1,3 +1,4 @@
+import { useArtifactDownload } from "./use-artifact-download.js";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { JSX } from "react";
 import {
@@ -16,7 +17,7 @@ import {
 import type { AppController, AppRoute } from "../controller.js";
 import { modelPreferenceOwnerId } from "../model-picker-preferences.js";
 import { isRoutableConversationModel } from "../model-capabilities.js";
-import type { AttachmentDraft, BackendView, ComposerSelectionQuoteDraft, ErrorView, ExtensionStatusView, ExtensionWidgetView, ExtraDirectoryView, InteractionView, ModelView, PermissionMode, QueueControlView, QueueItemView, ResourceView, RuntimeCommandView, SessionView, SubagentRunDetailView, SubagentRunView, TargetView, TimelineItemView, UsageTokensView, WorkspaceRewindPreviewView, WorkspaceView } from "../model.js";
+import type { AttachmentDraft, NativeNavigationTargetView, BackendView, ComposerSelectionQuoteDraft, ErrorView, ExtensionStatusView, ExtensionWidgetView, ExtraDirectoryView, InteractionView, ModelView, PermissionMode, QueueControlView, QueueItemView, ResourceView, RuntimeCommandView, SessionView, SubagentRunDetailView, SubagentRunView, TargetView, TimelineItemView, UsageTokensView, WorkspaceRewindPreviewView, WorkspaceView } from "../model.js";
 import { composerDocumentFromEditedEncodedMessage, composerDocumentFromMessage, composerDocumentPlainText, plainTextToComposerDocument } from "../composer-quote-document.js";
 import type { RunAction, Translator } from "./types.js";
 import { Button, IconButton, Modal, Pill, StatusDot, cx, CheckboxControl } from "./ui.js";
@@ -34,6 +35,7 @@ import { PermissionSelector } from "./PermissionSelector.js";
 import { PinnedPlanPanel } from "./PinnedPlanPanel.js";
 import { RetryStatusIndicator } from "./RetryStatusIndicator.js";
 import { SessionRunningStatusBar } from "./SessionRunningStatusBar.js";
+import { SessionScheduleNotice } from "./SessionScheduleNotice.js";
 import { activeBackgroundTaskIds } from "./running-status.js";
 import { collectTimelineSubagentRuns, timelineSubagentDetailResponseIsCurrent } from "./subagent-inline-card.js";
 import { RecoveryActionSingleFlight, executableRecoveryActions, nextPermissionMode, recoverySettingsHash, waitForRecoveryDelay, type ExecutableRecoveryAction, type RecoveryActionContext } from "./coding-ui-behavior.js";
@@ -45,10 +47,11 @@ import { hidesFromTimelineHistory, resolveActiveRetry, resolveRetryEscapeIntent,
 import { projectRuntimeRecoveryTimeline } from "../runtime-recovery.js";
 import { createMessageComposerMention, messageForkBlocked, resolveMessageDeleteTarget, resolveMessageForkTarget, type MessageForkTarget } from "./message-actions.js";
 import { restoreMessageAttachmentDrafts, sameMessageAttachments } from "./message-attachment-roundtrip.js";
-import { canEditVisibleUserMessage, changeSetForMessageRound, lastVisibleUserMessage, messageDialogueRewindTarget, messageRoundRunId } from "./message-rewind-behavior.js";
+import { canEditVisibleUserMessage, changeSetForMessageRound, lastVisibleUserMessage, sameNativeNavigationTarget, messageDialogueRewindTarget, messageRoundRunId } from "./message-rewind-behavior.js";
 import { reconcileShareSelection, shareableTimelineMessages, toggleShareMessageSelection } from "./share-selection-behavior.js";
 import { ShareSelectionBar } from "./ShareSelectionBar.js";
 import { Timeline, type InlinePlanVisibility } from "./Timeline.js";
+import { NativeFileCopyContext } from "./NativeFileCopyMenu.js";
 import { useAppShortcut } from "../use-app-shortcut.js";
 import { randomUuid } from "../web-crypto.js";
 import { portableSessionExportSupported } from "../portable-session-ui.js";
@@ -88,7 +91,11 @@ interface ActiveShareSelection {
 interface ActiveMessageRewind extends MessageRewindPreviewState {
   readonly sessionId: string;
   readonly itemId: string;
-  readonly targetEntryId: string;
+  readonly target: NativeNavigationTargetView;
+  readonly generation: bigint;
+  readonly navigate: AppController["navigateSessionBranch"];
+  readonly executeWorkspaceRewind: AppController["executeWorkspaceRewind"];
+  readonly isCurrent: () => boolean;
 }
 
 interface ActiveMessageDelete {
@@ -155,8 +162,15 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   readonly onSplitSession?: (side: "right" | "bottom") => void;
   readonly onOpenSessionWindow?: () => void;
 }): JSX.Element {
+  const exportDownload = useArtifactDownload(session.id, controller.exportSession);
+  const timelineResourceOwnerKey = useMemo(() => randomUuid(), [controller.getArtifactUrl, controller.releaseArtifactUrl, controller.state.activeProfile?.serverId, controller.state.activeProfile?.id, session.id, workspace?.id]);
+  const timelineResourceOwnerRef = useRef<string | undefined>(undefined);
+  useLayoutEffect(() => {
+    timelineResourceOwnerRef.current = timelineResourceOwnerKey;
+    return () => { timelineResourceOwnerRef.current = undefined; };
+  }, [timelineResourceOwnerKey]);
   const [permissionToConfirm, setPermissionToConfirm] = useState<PermissionMode>();
-  const [rewindPreview, setRewindPreview] = useState<WorkspaceRewindPreviewView>();
+  const [rewindPreview, setRewindPreview] = useState<WorkspaceRewindPreviewView & { readonly workspaceId: string; readonly execute: AppController["executeWorkspaceRewind"]; readonly isCurrent: () => boolean }>();
   const [dialogueOnlyRewind, setDialogueOnlyRewind] = useState(false);
   const [followLatestSignal, setFollowLatestSignal] = useState(0);
   const [composerFocusRequest, setComposerFocusRequest] = useState(0);
@@ -209,6 +223,28 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   const compactGuardRef = useRef(new SessionScopedRequestGuard());
   const messageDeleteGuardRef = useRef(new SessionScopedRequestGuard());
   const paneRef = useRef<HTMLElement>(null);
+  const rewindEpochRef = useRef(0);
+  const rewindDocumentRef = useRef<{ document: Document; remove: () => void } | undefined>(undefined);
+  useLayoutEffect(() => {
+    const document = paneRef.current?.ownerDocument;
+    if (document === rewindDocumentRef.current?.document) return;
+    rewindDocumentRef.current?.remove();
+    rewindEpochRef.current += 1;
+    setComposerDraftReplacement(undefined);
+    setMessageRewind(undefined);
+    setRewindPreview(undefined);
+    if (document === undefined) { rewindDocumentRef.current = undefined; return; }
+    const retire = () => { rewindEpochRef.current += 1; setComposerDraftReplacement(undefined); setMessageRewind(undefined); setRewindPreview(undefined); };
+    document.defaultView?.addEventListener("pagehide", retire);
+    rewindDocumentRef.current = { document, remove: () => document.defaultView?.removeEventListener("pagehide", retire) };
+  });
+  useLayoutEffect(() => {
+    rewindEpochRef.current += 1;
+    setComposerDraftReplacement(undefined);
+    setMessageRewind(undefined);
+    setRewindPreview(undefined);
+  }, [session.id, session.generation, controller.navigateSessionBranch, controller.state.navigationRevision]);
+  useLayoutEffect(() => () => { rewindEpochRef.current += 1; rewindDocumentRef.current?.remove(); }, []);
   const bottomOverlayRef = useRef<HTMLDivElement>(null);
   const composerMessageMentionInsertionIdRef = useRef(0);
   const composerSelectionQuoteInsertionIdRef = useRef(0);
@@ -216,6 +252,8 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   const appliedExternalSelectionQuoteInsertionRef = useRef<string | undefined>(undefined);
   const appliedExternalAttachmentInsertionRef = useRef<string | undefined>(undefined);
   const composerDraftReplacementIdRef = useRef(0);
+  const composerLocalDraftEpochRef = useRef(0);
+  const noteComposerDraftMutation = useCallback(() => { composerLocalDraftEpochRef.current += 1; setComposerDraftReplacement(undefined); }, []);
   const shareSelectionBeforeAllRef = useRef<ReadonlySet<string> | undefined>(undefined);
   const messageRewindRequestIdRef = useRef(0);
   const compactConfirmationRef = useRef(compactConfirmation);
@@ -267,17 +305,46 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   const canOpenWorkspaceReferences = workspace !== undefined && backend?.capabilities.get("workspace.files")?.supported === true;
   const loadTimelineWorkspaceAsset = useCallback(async (path: string) => {
     if (!canOpenWorkspaceReferences || workspace === undefined) throw new Error("Workspace file previews are unavailable.");
-    const preview = await controllerRef.current.readWorkspaceFile(workspace.id, path);
-    if (preview.blobId === undefined || (preview.kind !== "image" && preview.mediaType?.startsWith("image/") !== true)) {
+    const read = controller.readWorkspaceFile;
+    const acquire = controller.getArtifactUrl;
+    const releaseArtifact = controller.releaseArtifactUrl;
+    const isCurrent = (): boolean => timelineResourceOwnerRef.current === timelineResourceOwnerKey;
+    if (!isCurrent()) throw new Error("The workspace preview owner changed.");
+    const preview = await read(workspace.id, path);
+    if (!isCurrent()) throw new Error("The workspace preview owner changed.");
+    if (preview.path !== path || preview.truncated) throw new Error("The workspace image preview is incomplete or changed.");
+    const mediaType = preview.mediaType?.split(";", 1)[0]?.trim().toLowerCase();
+    let url: string;
+    let dispose: () => void;
+    if (preview.kind === "text" && /\.svg$/iu.test(preview.path) && mediaType === "image/svg+xml" && preview.text !== undefined) {
+      const objectUrls = URL;
+      url = objectUrls.createObjectURL(new Blob([preview.text], { type: "image/svg+xml" }));
+      dispose = () => objectUrls.revokeObjectURL(url);
+    } else if (preview.blobId !== undefined && preview.blobId !== "" && (preview.kind === "image" || mediaType?.startsWith("image/") === true)) {
+      const blobId = preview.blobId;
+      url = await acquire(blobId);
+      dispose = () => releaseArtifact(blobId);
+    } else {
       throw new Error("The workspace target is not an image.");
+    }
+    let released = false;
+    const release = (): void => {
+      if (released) return;
+      released = true;
+      dispose();
+    };
+    if (!isCurrent()) {
+      release();
+      throw new Error("The workspace preview owner changed.");
     }
     return {
       path: preview.path,
       name: preview.name,
-      url: await controllerRef.current.getArtifactUrl(preview.blobId),
+      url,
+      release,
       ...(preview.mediaType === undefined ? {} : { mediaType: preview.mediaType })
     };
-  }, [canOpenWorkspaceReferences, workspace?.id]);
+  }, [canOpenWorkspaceReferences, workspace?.id, timelineResourceOwnerKey, controller.readWorkspaceFile, controller.getArtifactUrl, controller.releaseArtifactUrl]);
   const addTimelineWorkspaceImage = useCallback((file: File): void => {
     setComposerAttachmentInsertion({ id: ++composerAttachmentInsertionIdRef.current, sessionId: session.id, file });
   }, [session.id]);
@@ -451,7 +518,8 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   const currentMessageFork = messageFork?.sessionId === session.id ? messageFork : undefined;
   const currentMessageDelete = messageDelete?.sessionId === session.id ? messageDelete : undefined;
   const latestVisibleUserMessage = lastVisibleUserMessage(visibleTimeline);
-  const editableMessageId = messageRewindSupported && canEditVisibleUserMessage(latestVisibleUserMessage) ? latestVisibleUserMessage.id : undefined;
+  const rewindToStartSupported = backend?.capabilities.get("session.rewind_to_start")?.supported === true;
+  const editableMessageId = messageRewindSupported && canEditVisibleUserMessage(latestVisibleUserMessage, rewindToStartSupported) ? latestVisibleUserMessage.id : undefined;
   const errorTailActions = errorTailProjection?.bannerVisible === true && errorTailProjection.item.error !== undefined
     ? executableRecoveryActions(errorTailProjection.item.error, recoveryContext)
     : [];
@@ -1054,8 +1122,27 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
 
   const moveEditedMessageToComposer = async (item: TimelineItemView, text: string): Promise<void> => {
     const sourceSessionId = session.id;
-    const targetEntryId = messageDialogueRewindTarget(item);
-    if (targetEntryId === undefined) throw new Error(t("timeline.rewindUnavailable"));
+    const navigationTarget = messageDialogueRewindTarget(item, rewindToStartSupported);
+    if (navigationTarget === undefined) throw new Error(t("timeline.rewindUnavailable"));
+    const sourceController = {
+      navigateSessionBranch: controllerRef.current.navigateSessionBranch,
+      readDraftSnapshot: controllerRef.current.readDraftSnapshot,
+      saveDraftIfRevision: controllerRef.current.saveDraftIfRevision,
+      getArtifactUrl: controllerRef.current.getArtifactUrl,
+      releaseArtifactUrl: controllerRef.current.releaseArtifactUrl
+    };
+    const sourceGeneration = session.generation;
+    const sourceDraftEpoch = composerLocalDraftEpochRef.current;
+    const sourceEpoch = rewindEpochRef.current;
+    const sourceDocument = paneRef.current?.ownerDocument;
+    const sourceNavigationRevision = controllerRef.current.state.navigationRevision;
+    const sourceStillOwned = () => rewindEpochRef.current === sourceEpoch
+      && composerLocalDraftEpochRef.current === sourceDraftEpoch
+      && paneRef.current?.isConnected === true && paneRef.current.ownerDocument === sourceDocument
+      && controllerRef.current.state.navigationRevision === sourceNavigationRevision
+      && controllerRef.current.navigateSessionBranch === sourceController.navigateSessionBranch
+      && controllerRef.current.readDraftSnapshot === sourceController.readDraftSnapshot
+      && controllerRef.current.saveDraftIfRevision === sourceController.saveDraftIfRevision;
     const currentBoundary = () => {
       const state = controllerRef.current.state;
       const snapshot = state.snapshot;
@@ -1065,13 +1152,17 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
       const activeUser = lastVisibleUserMessage(activeTimeline.filter((candidate) => !hidesFromTimelineHistory(candidate)));
       const queuedWork = snapshot.queue.some((candidate) => candidate.sessionId === sourceSessionId && !["completed", "cancelled", "failed"].includes(candidate.state));
       if (
-        !sessionRouteIsCurrent(state.route, sourceSessionId)
+        !sourceStillOwned()
+        || !sessionRouteIsCurrent(state.route, sourceSessionId)
         || activeSession?.state !== "idle"
+        || activeSession.generation !== sourceGeneration
+        || controllerRef.current.navigateSessionBranch !== sourceController.navigateSessionBranch
+
         || queuedWork
         || activeBackend?.capabilities.get("session.rewind")?.supported !== true
         || activeUser?.id !== item.id
-        || !canEditVisibleUserMessage(activeUser)
-        || messageDialogueRewindTarget(activeUser) !== targetEntryId
+        || !canEditVisibleUserMessage(activeUser, activeBackend.capabilities.get("session.rewind_to_start")?.supported === true)
+        || !sameNativeNavigationTarget(messageDialogueRewindTarget(activeUser, activeBackend.capabilities.get("session.rewind_to_start")?.supported === true), navigationTarget)
       ) return undefined;
       return { snapshot, session: activeSession, backend: activeBackend, user: activeUser };
     };
@@ -1107,9 +1198,16 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
         initialBoundary.user.attachments ?? [],
         attachmentPolicy,
         async (artifact) => {
-          const response = await fetch(await controllerRef.current.getArtifactUrl(artifact.blobId));
-          if (!response.ok) throw new Error("Artifact bytes are unavailable.");
-          return response.blob();
+          if (currentBoundary() === undefined) throw new Error(t("timeline.editStale"));
+          const url = await sourceController.getArtifactUrl(artifact.blobId);
+          try {
+            if (currentBoundary() === undefined) throw new Error(t("timeline.editStale"));
+            const response = await fetch(url);
+            if (!response.ok) throw new Error("Artifact bytes are unavailable.");
+            return await response.blob();
+          } finally {
+            sourceController.releaseArtifactUrl(artifact.blobId);
+          }
         },
         randomUuid
       );
@@ -1121,7 +1219,9 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
     if (boundaryAfterLoad === undefined || !sameMessageAttachments(boundaryAfterLoad.user.attachments, item.attachments)) {
       throw new Error(t("timeline.editStale"));
     }
-    const previousDraft = await controllerRef.current.readDraft(sourceSessionId);
+    const previous = await sourceController.readDraftSnapshot(sourceSessionId);
+    const previousDraft = previous.draft;
+    if (currentBoundary() === undefined) throw new Error(t("timeline.editStale"));
     const replacement = {
       id: ++composerDraftReplacementIdRef.current,
       sessionId: sourceSessionId,
@@ -1138,34 +1238,55 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
       ...(previousDraft?.extraDirectoryIds === undefined ? {} : { extraDirectoryIds: previousDraft.extraDirectoryIds })
     };
     const rollbackDraft = previousDraft ?? { text: "", attachments: [], mentions: [], deliveryMode: "prompt" as const };
-    await controllerRef.current.saveDraft(sourceSessionId, replacementDraft);
+    const replacementRevision = await sourceController.saveDraftIfRevision(sourceSessionId, replacementDraft, previous.revision);
+    if (replacementRevision === undefined) throw new Error(t("timeline.editStale"));
     const boundaryBeforeRewind = currentBoundary();
     if (boundaryBeforeRewind === undefined || !sameMessageAttachments(boundaryBeforeRewind.user.attachments, item.attachments)) {
-      await restoreEditedMessageDraft(controllerRef.current, sourceSessionId, rollbackDraft, t);
+      await restoreEditedMessageDraft(sourceController, sourceSessionId, rollbackDraft, replacementRevision, t);
       throw new Error(t("timeline.editStale"));
     }
     try {
-      await controllerRef.current.navigateSessionBranch(sourceSessionId, targetEntryId);
+      await sourceController.navigateSessionBranch(sourceSessionId, navigationTarget, { expectedGeneration: sourceGeneration });
+      if (!sourceStillOwned()
+        || controllerRef.current.navigateSessionBranch !== sourceController.navigateSessionBranch
+        || !sessionRouteIsCurrent(controllerRef.current.state.route, sourceSessionId)
+        || controllerRef.current.state.snapshot.sessions.find((candidate) => candidate.id === sourceSessionId)?.generation !== sourceGeneration) return;
     } catch (error) {
-      await restoreEditedMessageDraft(controllerRef.current, sourceSessionId, rollbackDraft, t);
+      await restoreEditedMessageDraft(sourceController, sourceSessionId, rollbackDraft, replacementRevision, t);
       throw error;
     }
+    const currentDraft = await sourceController.readDraftSnapshot(sourceSessionId);
+    if (!sourceStillOwned() || currentDraft.revision !== replacementRevision) return;
     setComposerDraftReplacement(replacement);
   };
 
   const previewMessageRewind = (item: TimelineItemView): void => {
-    const targetEntryId = messageDialogueRewindTarget(item);
-    if (!messageRewindSupported || targetEntryId === undefined) return;
+    const navigationTarget = messageDialogueRewindTarget(item, rewindToStartSupported);
+    if (!messageRewindSupported || navigationTarget === undefined) return;
     const requestId = ++messageRewindRequestIdRef.current;
     const runId = messageRoundRunId(visibleTimeline, item.id);
     const filesSupported = workspace !== undefined && backend?.capabilities.get("workspace.rewind")?.supported === true && runId !== undefined;
-    setMessageRewind({ sessionId: session.id, itemId: item.id, targetEntryId, loadingFiles: filesSupported });
+    const sourceController = controllerRef.current;
+    const generation = session.generation;
+    const sourceEpoch = rewindEpochRef.current;
+    const sourceDocument = paneRef.current?.ownerDocument;
+    const navigationRevision = controllerRef.current.state.navigationRevision;
+    const isCurrent = () => rewindEpochRef.current === sourceEpoch
+      && paneRef.current?.isConnected === true && paneRef.current.ownerDocument === sourceDocument
+      && controllerRef.current.state.navigationRevision === navigationRevision
+      && sessionRouteIsCurrent(controllerRef.current.state.route, session.id)
+      && messageRewindRequestIdRef.current === requestId
+      && activeSessionIdRef.current === session.id
+      && controllerRef.current.navigateSessionBranch === sourceController.navigateSessionBranch
+      && controllerRef.current.state.snapshot.sessions.find((candidate) => candidate.id === session.id)?.generation === generation;
+    setMessageRewind({ sessionId: session.id, itemId: item.id, target: navigationTarget, generation, navigate: sourceController.navigateSessionBranch, executeWorkspaceRewind: sourceController.executeWorkspaceRewind, isCurrent, loadingFiles: filesSupported });
     if (!filesSupported || workspace === undefined || runId === undefined) return;
     const sourceSessionId = session.id;
     const workspaceId = workspace.id;
     void (async () => {
       try {
-        const changeSets = await controllerRef.current.listWorkspaceChangeSets(workspaceId, sourceSessionId);
+        const changeSets = await sourceController.listWorkspaceChangeSets(workspaceId, sourceSessionId);
+        if (!isCurrent()) return;
         const changeSet = changeSetForMessageRound(changeSets, runId);
         if (changeSet === undefined) {
           if (messageRewindRequestIdRef.current === requestId && activeSessionIdRef.current === sourceSessionId) {
@@ -1173,11 +1294,11 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
           }
           return;
         }
-        const preview = await controllerRef.current.previewWorkspaceRewind(workspaceId, changeSet.id);
-        if (messageRewindRequestIdRef.current !== requestId || activeSessionIdRef.current !== sourceSessionId) return;
+        const preview = await sourceController.previewWorkspaceRewind(workspaceId, changeSet.id);
+        if (!isCurrent()) return;
         setMessageRewind((current) => current?.sessionId === sourceSessionId && current.itemId === item.id ? { ...current, loadingFiles: false, preview } : current);
       } catch {
-        if (messageRewindRequestIdRef.current !== requestId || activeSessionIdRef.current !== sourceSessionId) return;
+        if (!isCurrent()) return;
         setMessageRewind((current) => current?.sessionId === sourceSessionId && current.itemId === item.id ? { ...current, loadingFiles: false, filePreviewError: t("timeline.rewindFilesUnavailable") } : current);
       }
     })();
@@ -1190,20 +1311,27 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
 
   const rewindDialogueOnly = async (): Promise<void> => {
     const rewind = messageRewind;
-    if (rewind === undefined || rewind.sessionId !== session.id) throw new Error(t("timeline.rewindUnavailable"));
+    if (rewind === undefined || !rewind.isCurrent() || rewind.sessionId !== session.id) throw new Error(t("timeline.rewindUnavailable"));
     const latest = controllerRef.current.state.snapshot;
     const latestSession = latest.sessions.find((candidate) => candidate.id === rewind.sessionId);
     const latestBackend = latestSession === undefined ? undefined : latest.backends.find((candidate) => candidate.id === latestSession.backendId);
     const latestQueuedWork = latest.queue.some((candidate) => candidate.sessionId === rewind.sessionId && !["completed", "cancelled", "failed"].includes(candidate.state));
     if (latestSession?.state !== "idle" || latestQueuedWork || latestBackend?.capabilities.get("session.rewind")?.supported !== true) throw new Error(t("timeline.rewindStale"));
-    await controllerRef.current.navigateSessionBranch(rewind.sessionId, rewind.targetEntryId);
+    const currentItem = (latest.timelineBySession.get(rewind.sessionId) ?? []).find((item) => item.id === rewind.itemId);
+    if (latestSession.generation !== rewind.generation || controllerRef.current.navigateSessionBranch !== rewind.navigate
+      || currentItem === undefined || !sameNativeNavigationTarget(messageDialogueRewindTarget(currentItem, latestBackend.capabilities.get("session.rewind_to_start")?.supported === true), rewind.target)) {
+      throw new Error(t("timeline.rewindStale"));
+    }
+    await rewind.navigate(rewind.sessionId, rewind.target, { expectedGeneration: rewind.generation });
   };
 
   const rewindFilesOnly = async (): Promise<void> => {
     const rewind = messageRewind;
     const preview = rewind?.preview;
-    if (rewind === undefined || preview === undefined || workspace === undefined || rewind.sessionId !== session.id || preview.safety === "blocked") throw new Error(t("timeline.rewindFilesUnavailable"));
-    await controllerRef.current.executeWorkspaceRewind(workspace.id, preview.id, preview.changeSetId, false);
+    if (rewind === undefined || !rewind.isCurrent() || preview === undefined || workspace === undefined || rewind.sessionId !== session.id || preview.safety === "blocked") throw new Error(t("timeline.rewindFilesUnavailable"));
+    if (controllerRef.current.executeWorkspaceRewind !== rewind.executeWorkspaceRewind
+      || controllerRef.current.state.snapshot.sessions.find((candidate) => candidate.id === rewind.sessionId)?.generation !== rewind.generation) throw new Error(t("timeline.rewindStale"));
+    await rewind.executeWorkspaceRewind(workspace.id, preview.id, preview.changeSetId, false);
   };
 
   const composerControls = (
@@ -1323,7 +1451,8 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
             onMoveSessionProject={onMoveSessionProject}
             onCopyTaskLink={onCopyTaskLink}
             onExportPortableSession={canExportPortable ? onExportPortableSession : undefined}
-            onExportHtml={canExport ? () => runAction(`export:${session.id}`, () => controller.exportSession(session.id)) : undefined}
+            exportHtmlPending={exportDownload.pending}
+            onExportHtml={canExport ? (ownerDocument) => exportDownload.run(ownerDocument, (context) => controller.exportSession(session.id, context)) : undefined}
             onClone={canClone ? () => runAction(`clone:${session.id}`, async () => {
               const sourceMessage = latestDerivationSourceMessage(
                 controller.state.snapshot.timelineBySession.get(session.id) ?? visibleTimeline
@@ -1350,8 +1479,11 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
 
       <ExtensionStatuses statuses={extensionStatuses} />
 
+      {exportDownload.failed && <p className="danger-text" role="alert">{t("portable.exportFailed")}</p>}
+      <NativeFileCopyContext.Provider value={controller.state.ready && controller.state.connectionState === "connected" ? controller.copyArtifactFile : undefined}>
       <Timeline
-        key={session.id}
+        key={timelineResourceOwnerKey}
+        ownerKey={`${timelineResourceOwnerKey}:${session.generation}:${controller.state.connectionState}`}
         sessionId={session.id}
         sessionName={session.name}
         items={visibleTimeline}
@@ -1366,7 +1498,8 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
         })}
         messageNavRailEnabled={controller.state.preferences.messageNavRailEnabled}
         streamFadeEnabled={controller.state.preferences.streamFadeEnabled}
-        onOpenHttpLink={(url, options) => runAction("open-message-link", () => controller.openHttpLink(url, { ...options, sessionId: session.id }))}
+        onOpenHttpLink={(url, options) => controller.openHttpLink(url, { ...options, sessionId: session.id })}
+        onOpenWorkspaceHtml={workspace === undefined ? undefined : (path, options) => controller.openWorkspaceHtml(session.id, workspace.id, path, options)}
         onLoadWorkspaceAsset={canOpenWorkspaceReferences ? loadTimelineWorkspaceAsset : undefined}
         onWorkspaceImageToComposer={canAddWorkspaceImage ? addTimelineWorkspaceImage : undefined}
         subagentRuns={subagentRuns}
@@ -1384,9 +1517,9 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
         retryRunId={session.retryRunId}
         locale={controller.state.preferences.locale}
         t={t}
-        onArtifactUrl={(blobId) => controller.getArtifactUrl(blobId)}
-        onArtifactUrlRelease={(blobId) => controller.releaseArtifactUrl(blobId)}
-        onArtifactDownload={(blobId, fileName) => runAction(`download:${blobId}`, () => controller.downloadArtifact(blobId, fileName))}
+        onArtifactUrl={controller.getArtifactUrl}
+        onArtifactUrlRelease={controller.releaseArtifactUrl}
+        onArtifactDownload={controller.downloadArtifact}
         onOpenGeneratedFile={!canOpenGeneratedFiles(backend, workspace) ? undefined : (workspaceId, relativePath) => {
           if (workspace?.id !== workspaceId) return;
           controller.navigate({ kind: "files", sessionId: session.id, file: relativePath });
@@ -1402,14 +1535,28 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
         onToggleShareMessage={currentShareSelection === undefined ? undefined : toggleShareMessage}
         editableMessageId={editableMessageId}
         onMoveEditedMessageToComposer={moveEditedMessageToComposer}
-        onPreviewMessageRewind={messageRewindSupported ? previewMessageRewind : undefined}
+        onPreviewMessageRewind={messageRewindSupported ? previewMessageRewind : undefined} rewindToStartSupported={rewindToStartSupported}
         onDeleteMessage={messageDeleteSupported ? openMessageDelete : undefined}
         messageDeleteBlockedReason={messageDeleteSupported ? messageDeleteBlockedReason : undefined}
         messageActionResetSignal={messageActionResetSignal}
         onWorkspaceRewind={reviewReadOnly || !canRewindFromTimeline(backend, workspace) ? undefined : (workspaceId, changeSetId) => runAction(`preview-rewind:${changeSetId}`, async () => {
           if (workspace?.id !== workspaceId) throw new Error("This workspace change no longer belongs to the active task.");
+          const requestId = ++messageRewindRequestIdRef.current;
+          const epoch = rewindEpochRef.current;
+          const document = paneRef.current?.ownerDocument;
+          const navigationRevision = controller.state.navigationRevision;
+          const generation = session.generation;
+          const preview = controller.previewWorkspaceRewind;
+          const execute = controller.executeWorkspaceRewind;
+          const isCurrent = () => messageRewindRequestIdRef.current === requestId && rewindEpochRef.current === epoch
+            && paneRef.current?.isConnected === true && paneRef.current.ownerDocument === document
+            && controllerRef.current.state.navigationRevision === navigationRevision
+            && sessionRouteIsCurrent(controllerRef.current.state.route, session.id)
+            && controllerRef.current.previewWorkspaceRewind === preview && controllerRef.current.executeWorkspaceRewind === execute
+            && controllerRef.current.state.snapshot.sessions.find((candidate) => candidate.id === session.id)?.generation === generation;
           setDialogueOnlyRewind(false);
-          setRewindPreview(await controller.previewWorkspaceRewind(workspaceId, changeSetId));
+          const result = await preview(workspaceId, changeSetId);
+          if (isCurrent()) setRewindPreview({ ...result, workspaceId, execute, isCurrent });
         })}
         onRetry={reviewReadOnly || session.retryRunId === undefined ? undefined : (error) => { if (error.runId === session.retryRunId) runAction(`retry:${error.runId}`, () => controller.retry(error.runId as string)); }}
         recoveryContext={recoveryContext}
@@ -1445,7 +1592,15 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
           }
         }}
       />
+      </NativeFileCopyContext.Provider>
       <div ref={bottomOverlayRef} className="session-bottom-overlay">
+      {!reviewReadOnly && <SessionScheduleNotice
+        ownerId={controller.state.activeProfile?.serverId ?? controller.state.activeProfile?.id ?? "local"}
+        sessionId={session.id}
+        schedules={controller.state.snapshot.schedules}
+        markRead={controller.markScheduleRunRead}
+        t={t}
+      />}
       <ExtensionWidgets widgets={extensionWidgets.filter((widget) => widget.placement === "aboveEditor")} label={t("a11y.extensionWidgets")} />
       <PinnedPlanPanel key={session.id} sessionId={session.id} items={recoveryPresentationTimeline} running={running} visible={interaction === undefined} inlinePlanVisibility={inlinePlanVisibility} t={t} />
       {errorTailProjection?.bannerVisible === true && <ErrorTailBanner
@@ -1475,8 +1630,8 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
       >
         <InteractionDialog key={interaction === undefined ? "interaction:none" : `${interaction.sessionId}:${interaction.id}`} controller={controller} interaction={interaction} remaining={remainingInteractions} inline t={t} runAction={runAction} />
       </InteractionPromptHost>
-      {currentShareSelection !== undefined && <ShareSelectionBar sessionName={session.name} messages={shareableMessages} selectedIds={currentShareSelection.selectedIds} locale={controller.state.preferences.locale} t={t} onToggleAll={toggleAllShareMessages} onCancel={closeShareSelection} />}
-      {interaction === undefined && <div hidden={currentShareSelection !== undefined}><Composer controller={controller} session={session} backend={backend} sessionUsage={effectiveSessionUsage} readOnly={reviewReadOnly} autoFocus={composerAutoFocus && presentation === "standard" && currentShareSelection === undefined} focusRequest={composerFocusRequest} queue={queue} queueControl={queueControl} workspace={workspace} extraDirectories={extraDirectories} resources={resources} commands={canListRuntimeCommands ? liveCommands : []} messageHistory={messageHistory} controls={composerControls} runningStatus={<SessionRunningStatusBar session={session} items={recoveryPresentationTimeline} backgroundTaskIds={backgroundTaskIds} canStopBackgroundTasks={canStopBackgroundTasks} backgroundStopping={backgroundStopping} backgroundStopError={backgroundStopError} suppressed={reviewReadOnly} t={t} onStopBackgroundTasks={stopAllBackgroundTasks} />} messageMentionInsertion={composerMessageMentionInsertion} selectionQuoteInsertion={composerSelectionQuoteInsertion} attachmentInsertion={composerAttachmentInsertion} draftReplacement={composerDraftReplacement} t={t} runAction={runAction} onLocalSend={(sourceSessionId) => { if (activeSessionIdRef.current === sourceSessionId) setFollowLatestSignal((current) => current + 1); }} onStop={canStop ? stopRun : undefined} stopInFlight={stopInFlight} onCompact={canCompact && !running && activeCompaction === undefined && !compactInFlight && (session.context?.usedTokens ?? 0) > 0 ? requestCompact : undefined} /></div>}
+      {currentShareSelection !== undefined && <ShareSelectionBar ownerKey={`${timelineResourceOwnerKey}:${session.generation}`} sessionName={session.name} messages={shareableMessages} selectedIds={currentShareSelection.selectedIds} locale={controller.state.preferences.locale} t={t} onToggleAll={toggleAllShareMessages} onCancel={closeShareSelection} />}
+      {interaction === undefined && <div hidden={currentShareSelection !== undefined}><Composer controller={controller} session={session} backend={backend} sessionUsage={effectiveSessionUsage} readOnly={reviewReadOnly} autoFocus={composerAutoFocus && presentation === "standard" && currentShareSelection === undefined} focusRequest={composerFocusRequest} queue={queue} queueControl={queueControl} workspace={workspace} extraDirectories={extraDirectories} resources={resources} commands={canListRuntimeCommands ? liveCommands : []} messageHistory={messageHistory} controls={composerControls} runningStatus={<SessionRunningStatusBar session={session} items={recoveryPresentationTimeline} backgroundTaskIds={backgroundTaskIds} canStopBackgroundTasks={canStopBackgroundTasks} backgroundStopping={backgroundStopping} backgroundStopError={backgroundStopError} suppressed={reviewReadOnly} t={t} onStopBackgroundTasks={stopAllBackgroundTasks} />} messageMentionInsertion={composerMessageMentionInsertion} selectionQuoteInsertion={composerSelectionQuoteInsertion} attachmentInsertion={composerAttachmentInsertion} draftReplacement={composerDraftReplacement} onDraftMutation={noteComposerDraftMutation} t={t} runAction={runAction} onLocalSend={(sourceSessionId) => { if (activeSessionIdRef.current === sourceSessionId) setFollowLatestSignal((current) => current + 1); }} onStop={canStop ? stopRun : undefined} stopInFlight={stopInFlight} onCompact={canCompact && !running && activeCompaction === undefined && !compactInFlight && (session.context?.usedTokens ?? 0) > 0 ? requestCompact : undefined} /></div>}
       <ExtensionWidgets widgets={extensionWidgets.filter((widget) => widget.placement === "belowEditor")} label={t("a11y.extensionWidgets")} />
       </div>
 
@@ -1535,20 +1690,21 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
         onFilesOnly={rewindFilesOnly}
       />
       <Modal open={rewindPreview !== undefined} title={t("workspace.previewTitle")} description={t("workspace.previewDescription")} size="large" onClose={() => setRewindPreview(undefined)}>
-        {rewindPreview !== undefined && <div className="rewind-preview timeline-rewind-preview"><Pill tone={rewindPreview.safety === "blocked" ? "danger" : rewindPreview.safety === "requiresConfirmation" ? "warning" : "success"}>{rewindPreview.safety}</Pill><p>{t("workspace.restoreCount", { count: rewindPreview.inversePaths.length })}</p>{rewindPreview.conflicts.length > 0 && <section><strong>{t("workspace.conflicts")}</strong><ul>{rewindPreview.conflicts.map((value) => <li key={value}>{value}</li>)}</ul></section>}{rewindPreview.gaps.length > 0 && <section><strong>{t("workspace.captureGaps")}</strong><ul>{rewindPreview.gaps.map((value) => <li key={value}>{value}</li>)}</ul></section>}{rewindPreview.dialogueOnlyAvailable && <label className="rewind-dialogue-only"><CheckboxControl checked={dialogueOnlyRewind} onChange={(event) => setDialogueOnlyRewind(event.target.checked)} /><span>{t("workspace.dialogueOnly")}</span></label>}<div className="modal__actions"><Button onClick={() => setRewindPreview(undefined)}>{t("common.cancel")}</Button><Button tone={dialogueOnlyRewind ? "secondary" : "danger"} disabled={rewindPreview.safety === "blocked" && !dialogueOnlyRewind} onClick={() => { const preview = rewindPreview; setRewindPreview(undefined); runAction(`rewind:${preview.changeSetId}`, () => controller.executeWorkspaceRewind(workspace?.id ?? "", preview.id, preview.changeSetId, dialogueOnlyRewind)); }}>{dialogueOnlyRewind ? t("workspace.rewindDialogue") : t("workspace.restoreFiles")}</Button></div></div>}
+        {rewindPreview !== undefined && <div className="rewind-preview timeline-rewind-preview"><Pill tone={rewindPreview.safety === "blocked" ? "danger" : rewindPreview.safety === "requiresConfirmation" ? "warning" : "success"}>{rewindPreview.safety}</Pill><p>{t("workspace.restoreCount", { count: rewindPreview.inversePaths.length })}</p>{rewindPreview.conflicts.length > 0 && <section><strong>{t("workspace.conflicts")}</strong><ul>{rewindPreview.conflicts.map((value) => <li key={value}>{value}</li>)}</ul></section>}{rewindPreview.gaps.length > 0 && <section><strong>{t("workspace.captureGaps")}</strong><ul>{rewindPreview.gaps.map((value) => <li key={value}>{value}</li>)}</ul></section>}{rewindPreview.dialogueOnlyAvailable && <label className="rewind-dialogue-only"><CheckboxControl checked={dialogueOnlyRewind} onChange={(event) => setDialogueOnlyRewind(event.target.checked)} /><span>{t("workspace.dialogueOnly")}</span></label>}<div className="modal__actions"><Button onClick={() => setRewindPreview(undefined)}>{t("common.cancel")}</Button><Button tone={dialogueOnlyRewind ? "secondary" : "danger"} disabled={rewindPreview.safety === "blocked" && !dialogueOnlyRewind} onClick={() => { const preview = rewindPreview; setRewindPreview(undefined); runAction(`rewind:${preview.changeSetId}`, async () => { if (!preview.isCurrent()) throw new Error(t("timeline.rewindStale")); await preview.execute(preview.workspaceId, preview.id, preview.changeSetId, dialogueOnlyRewind); }); }}>{dialogueOnlyRewind ? t("workspace.rewindDialogue") : t("workspace.restoreFiles")}</Button></div></div>}
       </Modal>
     </main>
   );
 }
 
 async function restoreEditedMessageDraft(
-  controller: AppController,
+  controller: Pick<AppController, "saveDraftIfRevision">,
   sessionId: string,
   draft: Parameters<AppController["saveDraft"]>[1],
+  expectedRevision: number,
   t: Translator
 ): Promise<void> {
   try {
-    await controller.saveDraft(sessionId, draft);
+    await controller.saveDraftIfRevision(sessionId, draft, expectedRevision);
   } catch (cause) {
     throw new Error(t("timeline.editDraftRestoreFailed"), { cause });
   }

@@ -10,13 +10,406 @@ import type { CapabilitySupport } from "./capability_pb.js";
 import { file_joko_v1_capability } from "./capability_pb.js";
 import type { PageInfo, PageRequest, Revision } from "./common_pb.js";
 import { file_joko_v1_common } from "./common_pb.js";
+import type { CredentialUploadTicket } from "./operation_pb.js";
+import { file_joko_v1_operation } from "./operation_pb.js";
 import type { Message } from "@bufbuild/protobuf";
 
 /**
  * Describes the file joko/v1/remote_host.proto.
  */
 export const file_joko_v1_remote_host: GenFile = /*@__PURE__*/
-  fileDesc("Chlqb2tvL3YxL3JlbW90ZV9ob3N0LnByb3RvEgdqb2tvLnYxIowBCh5SZW1vdGVIb3N0Q2FwYWJpbGl0eURlc2NyaXB0b3ISLwoEa2luZBgBIAEoDjIhLmpva28udjEuUmVtb3RlSG9zdENhcGFiaWxpdHlLaW5kEgwKBG5hbWUYAiABKAkSKwoHc3VwcG9ydBgDIAEoDjIaLmpva28udjEuQ2FwYWJpbGl0eVN1cHBvcnQiVAoRUmVtb3RlSG9zdEZhaWx1cmUSLAoEY29kZRgBIAEoDjIeLmpva28udjEuUmVtb3RlSG9zdEZhaWx1cmVDb2RlEhEKCXJldHJ5YWJsZRgCIAEoCCJyChJSZW1vdGVIb3N0VHJ1c3RQaW4SEQoJYWxnb3JpdGhtGAEgASgJEhoKEnNoYTI1Nl9maW5nZXJwcmludBgCIAEoCRItCglwaW5uZWRfYXQYAyABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wIqEBChhSZW1vdGVIb3N0U3RhdHVzU25hcHNob3QSKAoFc3RhdGUYASABKA4yGS5qb2tvLnYxLlJlbW90ZUhvc3RTdGF0dXMSLgoKY2hhbmdlZF9hdBgCIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASKwoHZmFpbHVyZRgDIAEoCzIaLmpva28udjEuUmVtb3RlSG9zdEZhaWx1cmUi8wMKClJlbW90ZUhvc3QSEQoJdGFyZ2V0X2lkGAEgASgJEg8KB2hvc3RfaWQYAiABKAkSEAoIaG9zdG5hbWUYAyABKAkSDAoEcG9ydBgEIAEoDRIMCgR1c2VyGAUgASgJEikKBnNvdXJjZRgGIAEoDjIZLmpva28udjEuUmVtb3RlSG9zdFNvdXJjZRIkChdjcmVkZW50aWFsX3JlZmVyZW5jZV9pZBgHIAEoCUgAiAEBEioKBXRydXN0GAggASgLMhsuam9rby52MS5SZW1vdGVIb3N0VHJ1c3RQaW4SMQoGc3RhdHVzGAkgASgLMiEuam9rby52MS5SZW1vdGVIb3N0U3RhdHVzU25hcHNob3QSLgoKY3JlYXRlZF9hdBgKIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASLgoKdXBkYXRlZF9hdBgLIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASIwoIcmV2aXNpb24YDCABKAsyES5qb2tvLnYxLlJldmlzaW9uEkIKE2F1dGhlbnRpY2F0aW9uX21vZGUYDSABKA4yJS5qb2tvLnYxLlJlbW90ZUhvc3RBdXRoZW50aWNhdGlvbk1vZGVCGgoYX2NyZWRlbnRpYWxfcmVmZXJlbmNlX2lkIjUKIEdldFJlbW90ZUhvc3RDYXBhYmlsaXRpZXNSZXF1ZXN0EhEKCXRhcmdldF9pZBgBIAEoCSKTAQohR2V0UmVtb3RlSG9zdENhcGFiaWxpdGllc1Jlc3BvbnNlEj0KDGNhcGFiaWxpdGllcxgBIAMoCzInLmpva28udjEuUmVtb3RlSG9zdENhcGFiaWxpdHlEZXNjcmlwdG9yEi8KC29ic2VydmVkX2F0GAIgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcCJPChZMaXN0UmVtb3RlSG9zdHNSZXF1ZXN0EhEKCXRhcmdldF9pZBgBIAEoCRIiCgRwYWdlGAIgASgLMhQuam9rby52MS5QYWdlUmVxdWVzdCJeChdMaXN0UmVtb3RlSG9zdHNSZXNwb25zZRIiCgVob3N0cxgBIAMoCzITLmpva28udjEuUmVtb3RlSG9zdBIfCgRwYWdlGAIgASgLMhEuam9rby52MS5QYWdlSW5mbyI6ChRHZXRSZW1vdGVIb3N0UmVxdWVzdBIRCgl0YXJnZXRfaWQYASABKAkSDwoHaG9zdF9pZBgCIAEoCSI6ChVHZXRSZW1vdGVIb3N0UmVzcG9uc2USIQoEaG9zdBgBIAEoCzITLmpva28udjEuUmVtb3RlSG9zdCIsChdXYXRjaFJlbW90ZUhvc3RzUmVxdWVzdBIRCgl0YXJnZXRfaWQYASABKAkicAoZUmVtb3RlSG9zdENhdGFsb2dTbmFwc2hvdBIiCgVob3N0cxgBIAMoCzITLmpva28udjEuUmVtb3RlSG9zdBIvCgtvYnNlcnZlZF9hdBgCIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXAikwEKEFJlbW90ZUhvc3RDaGFuZ2USKwoEa2luZBgBIAEoDjIdLmpva28udjEuUmVtb3RlSG9zdENoYW5nZUtpbmQSIQoEaG9zdBgCIAEoCzITLmpva28udjEuUmVtb3RlSG9zdBIvCgtvYnNlcnZlZF9hdBgDIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXAimwEKGFdhdGNoUmVtb3RlSG9zdHNSZXNwb25zZRI2CghzbmFwc2hvdBgBIAEoCzIiLmpva28udjEuUmVtb3RlSG9zdENhdGFsb2dTbmFwc2hvdEgAEisKBmNoYW5nZRgCIAEoCzIZLmpva28udjEuUmVtb3RlSG9zdENoYW5nZUgAEhAKCHNlcXVlbmNlGAMgASgEQggKBnVwZGF0ZSJICh9SZWZyZXNoUmVtb3RlSG9zdENhdGFsb2dSZXF1ZXN0EhEKCXRhcmdldF9pZBgBIAEoCRISCgpyZXF1ZXN0X2lkGAIgASgJIngKIFJlZnJlc2hSZW1vdGVIb3N0Q2F0YWxvZ1Jlc3BvbnNlEiIKBWhvc3RzGAEgAygLMhMuam9rby52MS5SZW1vdGVIb3N0EjAKDHJlZnJlc2hlZF9hdBgCIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXAihQIKF0NyZWF0ZVJlbW90ZUhvc3RSZXF1ZXN0EhIKCnJlcXVlc3RfaWQYASABKAkSEQoJdGFyZ2V0X2lkGAIgASgJEg8KB2hvc3RfaWQYAyABKAkSEAoIaG9zdG5hbWUYBCABKAkSDAoEcG9ydBgFIAEoDRIMCgR1c2VyGAYgASgJEiQKF2NyZWRlbnRpYWxfcmVmZXJlbmNlX2lkGAcgASgJSACIAQESQgoTYXV0aGVudGljYXRpb25fbW9kZRgIIAEoDjIlLmpva28udjEuUmVtb3RlSG9zdEF1dGhlbnRpY2F0aW9uTW9kZUIaChhfY3JlZGVudGlhbF9yZWZlcmVuY2VfaWQiPQoYQ3JlYXRlUmVtb3RlSG9zdFJlc3BvbnNlEiEKBGhvc3QYASABKAsyEy5qb2tvLnYxLlJlbW90ZUhvc3QinwIKF1VwZGF0ZVJlbW90ZUhvc3RSZXF1ZXN0EhEKCXRhcmdldF9pZBgBIAEoCRIPCgdob3N0X2lkGAIgASgJEhAKCGhvc3RuYW1lGAMgASgJEgwKBHBvcnQYBCABKA0SDAoEdXNlchgFIAEoCRIkChdjcmVkZW50aWFsX3JlZmVyZW5jZV9pZBgGIAEoCUgAiAEBEiwKEWV4cGVjdGVkX3JldmlzaW9uGAcgASgLMhEuam9rby52MS5SZXZpc2lvbhJCChNhdXRoZW50aWNhdGlvbl9tb2RlGAggASgOMiUuam9rby52MS5SZW1vdGVIb3N0QXV0aGVudGljYXRpb25Nb2RlQhoKGF9jcmVkZW50aWFsX3JlZmVyZW5jZV9pZCI9ChhVcGRhdGVSZW1vdGVIb3N0UmVzcG9uc2USIQoEaG9zdBgBIAEoCzITLmpva28udjEuUmVtb3RlSG9zdCJrChdEZWxldGVSZW1vdGVIb3N0UmVxdWVzdBIRCgl0YXJnZXRfaWQYASABKAkSDwoHaG9zdF9pZBgCIAEoCRIsChFleHBlY3RlZF9yZXZpc2lvbhgDIAEoCzIRLmpva28udjEuUmV2aXNpb24iPQoYRGVsZXRlUmVtb3RlSG9zdFJlc3BvbnNlEiEKBGhvc3QYASABKAsyEy5qb2tvLnYxLlJlbW90ZUhvc3QibAoYQ29ubmVjdFJlbW90ZUhvc3RSZXF1ZXN0EhEKCXRhcmdldF9pZBgBIAEoCRIPCgdob3N0X2lkGAIgASgJEiwKEWV4cGVjdGVkX3JldmlzaW9uGAMgASgLMhEuam9rby52MS5SZXZpc2lvbiI+ChlDb25uZWN0UmVtb3RlSG9zdFJlc3BvbnNlEiEKBGhvc3QYASABKAsyEy5qb2tvLnYxLlJlbW90ZUhvc3QibwobRGlzY29ubmVjdFJlbW90ZUhvc3RSZXF1ZXN0EhEKCXRhcmdldF9pZBgBIAEoCRIPCgdob3N0X2lkGAIgASgJEiwKEWV4cGVjdGVkX3JldmlzaW9uGAMgASgLMhEuam9rby52MS5SZXZpc2lvbiJBChxEaXNjb25uZWN0UmVtb3RlSG9zdFJlc3BvbnNlEiEKBGhvc3QYASABKAsyEy5qb2tvLnYxLlJlbW90ZUhvc3QicwofVGVzdFJlbW90ZUhvc3RDb25uZWN0aW9uUmVxdWVzdBIRCgl0YXJnZXRfaWQYASABKAkSDwoHaG9zdF9pZBgCIAEoCRIsChFleHBlY3RlZF9yZXZpc2lvbhgDIAEoCzIRLmpva28udjEuUmV2aXNpb24irQEKHlJlbW90ZUhvc3RDb25uZWN0aW9uVGVzdFJlc3VsdBI5CgdvdXRjb21lGAEgASgOMiguam9rby52MS5SZW1vdGVIb3N0Q29ubmVjdGlvblRlc3RPdXRjb21lEiEKBGhvc3QYAiABKAsyEy5qb2tvLnYxLlJlbW90ZUhvc3QSLQoJdGVzdGVkX2F0GAMgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcCJbCiBUZXN0UmVtb3RlSG9zdENvbm5lY3Rpb25SZXNwb25zZRI3CgZyZXN1bHQYASABKAsyJy5qb2tvLnYxLlJlbW90ZUhvc3RDb25uZWN0aW9uVGVzdFJlc3VsdCJvChtDbGVhclJlbW90ZUhvc3RUcnVzdFJlcXVlc3QSEQoJdGFyZ2V0X2lkGAEgASgJEg8KB2hvc3RfaWQYAiABKAkSLAoRZXhwZWN0ZWRfcmV2aXNpb24YAyABKAsyES5qb2tvLnYxLlJldmlzaW9uIkEKHENsZWFyUmVtb3RlSG9zdFRydXN0UmVzcG9uc2USIQoEaG9zdBgBIAEoCzITLmpva28udjEuUmVtb3RlSG9zdCrzAwoYUmVtb3RlSG9zdENhcGFiaWxpdHlLaW5kEisKJ1JFTU9URV9IT1NUX0NBUEFCSUxJVFlfS0lORF9VTlNQRUNJRklFRBAAEicKI1JFTU9URV9IT1NUX0NBUEFCSUxJVFlfS0lORF9DQVRBTE9HEAESKgomUkVNT1RFX0hPU1RfQ0FQQUJJTElUWV9LSU5EX01BTkFHRU1FTlQQAhIyCi5SRU1PVEVfSE9TVF9DQVBBQklMSVRZX0tJTkRfQ09OTkVDVElPTl9DT05UUk9MEAMSLworUkVNT1RFX0hPU1RfQ0FQQUJJTElUWV9LSU5EX0NPTk5FQ1RJT05fVEVTVBAEEisKJ1JFTU9URV9IT1NUX0NBUEFCSUxJVFlfS0lORF9UUlVTVF9SRVNFVBAFEjEKLVJFTU9URV9IT1NUX0NBUEFCSUxJVFlfS0lORF9DT01NQU5EX0VYRUNVVElPThAGEjEKLVJFTU9URV9IT1NUX0NBUEFCSUxJVFlfS0lORF9QUk9DRVNTX1NUUkVBTUlORxAHEi0KKVJFTU9URV9IT1NUX0NBUEFCSUxJVFlfS0lORF9GSUxFX1RSQU5TRkVSEAgSLgoqUkVNT1RFX0hPU1RfQ0FQQUJJTElUWV9LSU5EX1RDUF9GT1JXQVJESU5HEAkqeAoQUmVtb3RlSG9zdFNvdXJjZRIiCh5SRU1PVEVfSE9TVF9TT1VSQ0VfVU5TUEVDSUZJRUQQABIdChlSRU1PVEVfSE9TVF9TT1VSQ0VfTUFOVUFMEAESIQodUkVNT1RFX0hPU1RfU09VUkNFX1NTSF9DT05GSUcQAiqyAQocUmVtb3RlSG9zdEF1dGhlbnRpY2F0aW9uTW9kZRIvCitSRU1PVEVfSE9TVF9BVVRIRU5USUNBVElPTl9NT0RFX1VOU1BFQ0lGSUVEEAASMAosUkVNT1RFX0hPU1RfQVVUSEVOVElDQVRJT05fTU9ERV9TWVNURU1fQUdFTlQQARIvCitSRU1PVEVfSE9TVF9BVVRIRU5USUNBVElPTl9NT0RFX1BSSVZBVEVfS0VZEAIq4gEKEFJlbW90ZUhvc3RTdGF0dXMSIgoeUkVNT1RFX0hPU1RfU1RBVFVTX1VOU1BFQ0lGSUVEEAASIwofUkVNT1RFX0hPU1RfU1RBVFVTX0RJU0NPTk5FQ1RFRBABEiEKHVJFTU9URV9IT1NUX1NUQVRVU19DT05ORUNUSU5HEAISJQohUkVNT1RFX0hPU1RfU1RBVFVTX0FVVEhFTlRJQ0FUSU5HEAMSHAoYUkVNT1RFX0hPU1RfU1RBVFVTX1JFQURZEAQSHQoZUkVNT1RFX0hPU1RfU1RBVFVTX0ZBSUxFRBAFKvoFChVSZW1vdGVIb3N0RmFpbHVyZUNvZGUSKAokUkVNT1RFX0hPU1RfRkFJTFVSRV9DT0RFX1VOU1BFQ0lGSUVEEAASJAogUkVNT1RFX0hPU1RfRkFJTFVSRV9DT0RFX0FCT1JURUQQARIyCi5SRU1PVEVfSE9TVF9GQUlMVVJFX0NPREVfQVVUSEVOVElDQVRJT05fRkFJTEVEEAISLgoqUkVNT1RFX0hPU1RfRkFJTFVSRV9DT0RFX0NPTk5FQ1RJT05fRkFJTEVEEAMSLworUkVNT1RFX0hPU1RfRkFJTFVSRV9DT0RFX0NPTk5FQ1RJT05fVElNRU9VVBAEEi8KK1JFTU9URV9IT1NUX0ZBSUxVUkVfQ09ERV9DT05ORUNUT1JfUFJPVE9DT0wQBRIyCi5SRU1PVEVfSE9TVF9GQUlMVVJFX0NPREVfQ09OTkVDVE9SX1VOQVZBSUxBQkxFEAYSLQopUkVNT1RFX0hPU1RfRkFJTFVSRV9DT0RFX0hPU1RfS0VZX0NIQU5HRUQQBxIuCipSRU1PVEVfSE9TVF9GQUlMVVJFX0NPREVfSE9TVF9LRVlfQ09ORkxJQ1QQCBItCilSRU1PVEVfSE9TVF9GQUlMVVJFX0NPREVfSE9TVF9LRVlfSU5WQUxJRBAJEi0KKVJFTU9URV9IT1NUX0ZBSUxVUkVfQ09ERV9IT1NUX0tFWV9NSVNTSU5HEAoSMwovUkVNT1RFX0hPU1RfRkFJTFVSRV9DT0RFX0hPU1RfS0VZX1NUT1JFX0NPUlJVUFQQCxIzCi9SRU1PVEVfSE9TVF9GQUlMVVJFX0NPREVfSE9TVF9LRVlfU1RPUkVfTUlTU0lORxAMEjYKMlJFTU9URV9IT1NUX0ZBSUxVUkVfQ09ERV9IT1NUX0tFWV9TVE9SRV9VTlJFQURBQkxFEA0SOAo0UkVNT1RFX0hPU1RfRkFJTFVSRV9DT0RFX0hPU1RfS0VZX1NUT1JFX1dSSVRFX0ZBSUxFRBAOKooBChRSZW1vdGVIb3N0Q2hhbmdlS2luZBInCiNSRU1PVEVfSE9TVF9DSEFOR0VfS0lORF9VTlNQRUNJRklFRBAAEiQKIFJFTU9URV9IT1NUX0NIQU5HRV9LSU5EX1VQU0VSVEVEEAESIwofUkVNT1RFX0hPU1RfQ0hBTkdFX0tJTkRfREVMRVRFRBACKrkBCh9SZW1vdGVIb3N0Q29ubmVjdGlvblRlc3RPdXRjb21lEjMKL1JFTU9URV9IT1NUX0NPTk5FQ1RJT05fVEVTVF9PVVRDT01FX1VOU1BFQ0lGSUVEEAASMQotUkVNT1RFX0hPU1RfQ09OTkVDVElPTl9URVNUX09VVENPTUVfU1VDQ0VFREVEEAESLgoqUkVNT1RFX0hPU1RfQ09OTkVDVElPTl9URVNUX09VVENPTUVfRkFJTEVEEAIymwkKEVJlbW90ZUhvc3RTZXJ2aWNlEnIKGUdldFJlbW90ZUhvc3RDYXBhYmlsaXRpZXMSKS5qb2tvLnYxLkdldFJlbW90ZUhvc3RDYXBhYmlsaXRpZXNSZXF1ZXN0Giouam9rby52MS5HZXRSZW1vdGVIb3N0Q2FwYWJpbGl0aWVzUmVzcG9uc2USVAoPTGlzdFJlbW90ZUhvc3RzEh8uam9rby52MS5MaXN0UmVtb3RlSG9zdHNSZXF1ZXN0GiAuam9rby52MS5MaXN0UmVtb3RlSG9zdHNSZXNwb25zZRJOCg1HZXRSZW1vdGVIb3N0Eh0uam9rby52MS5HZXRSZW1vdGVIb3N0UmVxdWVzdBoeLmpva28udjEuR2V0UmVtb3RlSG9zdFJlc3BvbnNlElkKEFdhdGNoUmVtb3RlSG9zdHMSIC5qb2tvLnYxLldhdGNoUmVtb3RlSG9zdHNSZXF1ZXN0GiEuam9rby52MS5XYXRjaFJlbW90ZUhvc3RzUmVzcG9uc2UwARJvChhSZWZyZXNoUmVtb3RlSG9zdENhdGFsb2cSKC5qb2tvLnYxLlJlZnJlc2hSZW1vdGVIb3N0Q2F0YWxvZ1JlcXVlc3QaKS5qb2tvLnYxLlJlZnJlc2hSZW1vdGVIb3N0Q2F0YWxvZ1Jlc3BvbnNlElcKEENyZWF0ZVJlbW90ZUhvc3QSIC5qb2tvLnYxLkNyZWF0ZVJlbW90ZUhvc3RSZXF1ZXN0GiEuam9rby52MS5DcmVhdGVSZW1vdGVIb3N0UmVzcG9uc2USVwoQVXBkYXRlUmVtb3RlSG9zdBIgLmpva28udjEuVXBkYXRlUmVtb3RlSG9zdFJlcXVlc3QaIS5qb2tvLnYxLlVwZGF0ZVJlbW90ZUhvc3RSZXNwb25zZRJXChBEZWxldGVSZW1vdGVIb3N0EiAuam9rby52MS5EZWxldGVSZW1vdGVIb3N0UmVxdWVzdBohLmpva28udjEuRGVsZXRlUmVtb3RlSG9zdFJlc3BvbnNlEloKEUNvbm5lY3RSZW1vdGVIb3N0EiEuam9rby52MS5Db25uZWN0UmVtb3RlSG9zdFJlcXVlc3QaIi5qb2tvLnYxLkNvbm5lY3RSZW1vdGVIb3N0UmVzcG9uc2USYwoURGlzY29ubmVjdFJlbW90ZUhvc3QSJC5qb2tvLnYxLkRpc2Nvbm5lY3RSZW1vdGVIb3N0UmVxdWVzdBolLmpva28udjEuRGlzY29ubmVjdFJlbW90ZUhvc3RSZXNwb25zZRJvChhUZXN0UmVtb3RlSG9zdENvbm5lY3Rpb24SKC5qb2tvLnYxLlRlc3RSZW1vdGVIb3N0Q29ubmVjdGlvblJlcXVlc3QaKS5qb2tvLnYxLlRlc3RSZW1vdGVIb3N0Q29ubmVjdGlvblJlc3BvbnNlEmMKFENsZWFyUmVtb3RlSG9zdFRydXN0EiQuam9rby52MS5DbGVhclJlbW90ZUhvc3RUcnVzdFJlcXVlc3QaJS5qb2tvLnYxLkNsZWFyUmVtb3RlSG9zdFRydXN0UmVzcG9uc2ViBnByb3RvMw", [file_google_protobuf_timestamp, file_joko_v1_capability, file_joko_v1_common]);
+  fileDesc("Chlqb2tvL3YxL3JlbW90ZV9ob3N0LnByb3RvEgdqb2tvLnYxIqUBCgZTc2hLZXkSCgoCaWQYASABKAkSDAoEbmFtZRgCIAEoCRIRCglhbGdvcml0aG0YAyABKAkSDwoHY29tbWVudBgEIAEoCRIaChJzaGEyNTZfZmluZ2VycHJpbnQYBSABKAkSLwoLbW9kaWZpZWRfYXQYBiABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEhAKCGluX2FnZW50GAcgASgIIhQKEkxpc3RTc2hLZXlzUmVxdWVzdCJ/ChNMaXN0U3NoS2V5c1Jlc3BvbnNlEh0KBGtleXMYASADKAsyDy5qb2tvLnYxLlNzaEtleRIrCgthZ2VudF9zdGF0ZRgCIAEoDjIWLmpva28udjEuU3NoQWdlbnRTdGF0ZRIcChRnZW5lcmF0aW9uX3N1cHBvcnRlZBgDIAEoCCKFAQoiQmVnaW5Tc2hLZXlQYXNzcGhyYXNlVXBsb2FkUmVxdWVzdBIxCgdwdXJwb3NlGAEgASgOMiAuam9rby52MS5Tc2hLZXlQYXNzcGhyYXNlUHVycG9zZRIOCgZrZXlfaWQYAiABKAkSHAoUZXhwZWN0ZWRfZmluZ2VycHJpbnQYAyABKAkiVgojQmVnaW5Tc2hLZXlQYXNzcGhyYXNlVXBsb2FkUmVzcG9uc2USLwoGdGlja2V0GAEgASgLMh8uam9rby52MS5DcmVkZW50aWFsVXBsb2FkVGlja2V0IoABChVHZW5lcmF0ZVNzaEtleVJlcXVlc3QSDAoEbmFtZRgBIAEoCRIPCgdjb21tZW50GAIgASgJEigKG3Bhc3NwaHJhc2VfdXBsb2FkX3RpY2tldF9pZBgDIAEoCUgAiAEBQh4KHF9wYXNzcGhyYXNlX3VwbG9hZF90aWNrZXRfaWQiNgoWR2VuZXJhdGVTc2hLZXlSZXNwb25zZRIcCgNrZXkYASABKAsyDy5qb2tvLnYxLlNzaEtleSKRAQoXQWRkU3NoS2V5VG9BZ2VudFJlcXVlc3QSDgoGa2V5X2lkGAEgASgJEhwKFGV4cGVjdGVkX2ZpbmdlcnByaW50GAIgASgJEigKG3Bhc3NwaHJhc2VfdXBsb2FkX3RpY2tldF9pZBgDIAEoCUgAiAEBQh4KHF9wYXNzcGhyYXNlX3VwbG9hZF90aWNrZXRfaWQiGgoYQWRkU3NoS2V5VG9BZ2VudFJlc3BvbnNlIkcKF1JlYWRTc2hQdWJsaWNLZXlSZXF1ZXN0Eg4KBmtleV9pZBgBIAEoCRIcChRleHBlY3RlZF9maW5nZXJwcmludBgCIAEoCSIuChhSZWFkU3NoUHVibGljS2V5UmVzcG9uc2USEgoKcHVibGljX2tleRgBIAEoCSLmAQoeR2V0U3NoS2V5SW5zdGFsbENvbW1hbmRSZXF1ZXN0Eg4KBmtleV9pZBgBIAEoCRIcChRleHBlY3RlZF9maW5nZXJwcmludBgCIAEoCRIuCgpzYXZlZF9ob3N0GAMgASgLMhguam9rby52MS5Tc2hLZXlTYXZlZEhvc3RIABIuCgpkcmFmdF9ob3N0GAQgASgLMhguam9rby52MS5Tc2hLZXlEcmFmdEhvc3RIABInCgVzaGVsbBgFIAEoDjIYLmpva28udjEuU3NoSW5zdGFsbFNoZWxsQg0KC2Rlc3RpbmF0aW9uImMKD1NzaEtleVNhdmVkSG9zdBIRCgl0YXJnZXRfaWQYASABKAkSDwoHaG9zdF9pZBgCIAEoCRIsChFleHBlY3RlZF9yZXZpc2lvbhgDIAEoCzIRLmpva28udjEuUmV2aXNpb24iPwoPU3NoS2V5RHJhZnRIb3N0EhAKCGhvc3RuYW1lGAEgASgJEgwKBHVzZXIYAiABKAkSDAoEcG9ydBgDIAEoDSI7Cg9Tc2hLZXlSZWZlcmVuY2USCgoCaWQYASABKAkSHAoUZXhwZWN0ZWRfZmluZ2VycHJpbnQYAiABKAkiMgofR2V0U3NoS2V5SW5zdGFsbENvbW1hbmRSZXNwb25zZRIPCgdjb21tYW5kGAEgASgJIowBCh5SZW1vdGVIb3N0Q2FwYWJpbGl0eURlc2NyaXB0b3ISLwoEa2luZBgBIAEoDjIhLmpva28udjEuUmVtb3RlSG9zdENhcGFiaWxpdHlLaW5kEgwKBG5hbWUYAiABKAkSKwoHc3VwcG9ydBgDIAEoDjIaLmpva28udjEuQ2FwYWJpbGl0eVN1cHBvcnQiVAoRUmVtb3RlSG9zdEZhaWx1cmUSLAoEY29kZRgBIAEoDjIeLmpva28udjEuUmVtb3RlSG9zdEZhaWx1cmVDb2RlEhEKCXJldHJ5YWJsZRgCIAEoCCJyChJSZW1vdGVIb3N0VHJ1c3RQaW4SEQoJYWxnb3JpdGhtGAEgASgJEhoKEnNoYTI1Nl9maW5nZXJwcmludBgCIAEoCRItCglwaW5uZWRfYXQYAyABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wIqEBChhSZW1vdGVIb3N0U3RhdHVzU25hcHNob3QSKAoFc3RhdGUYASABKA4yGS5qb2tvLnYxLlJlbW90ZUhvc3RTdGF0dXMSLgoKY2hhbmdlZF9hdBgCIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASKwoHZmFpbHVyZRgDIAEoCzIaLmpva28udjEuUmVtb3RlSG9zdEZhaWx1cmUinwQKClJlbW90ZUhvc3QSEQoJdGFyZ2V0X2lkGAEgASgJEg8KB2hvc3RfaWQYAiABKAkSEAoIaG9zdG5hbWUYAyABKAkSDAoEcG9ydBgEIAEoDRIMCgR1c2VyGAUgASgJEikKBnNvdXJjZRgGIAEoDjIZLmpva28udjEuUmVtb3RlSG9zdFNvdXJjZRIkChdjcmVkZW50aWFsX3JlZmVyZW5jZV9pZBgHIAEoCUgAiAEBEioKBXRydXN0GAggASgLMhsuam9rby52MS5SZW1vdGVIb3N0VHJ1c3RQaW4SMQoGc3RhdHVzGAkgASgLMiEuam9rby52MS5SZW1vdGVIb3N0U3RhdHVzU25hcHNob3QSLgoKY3JlYXRlZF9hdBgKIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASLgoKdXBkYXRlZF9hdBgLIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASIwoIcmV2aXNpb24YDCABKAsyES5qb2tvLnYxLlJldmlzaW9uEkIKE2F1dGhlbnRpY2F0aW9uX21vZGUYDSABKA4yJS5qb2tvLnYxLlJlbW90ZUhvc3RBdXRoZW50aWNhdGlvbk1vZGUSKgoIbm9kZV9rZXkYDiABKAsyGC5qb2tvLnYxLlNzaEtleVJlZmVyZW5jZUIaChhfY3JlZGVudGlhbF9yZWZlcmVuY2VfaWQiNQogR2V0UmVtb3RlSG9zdENhcGFiaWxpdGllc1JlcXVlc3QSEQoJdGFyZ2V0X2lkGAEgASgJIpMBCiFHZXRSZW1vdGVIb3N0Q2FwYWJpbGl0aWVzUmVzcG9uc2USPQoMY2FwYWJpbGl0aWVzGAEgAygLMicuam9rby52MS5SZW1vdGVIb3N0Q2FwYWJpbGl0eURlc2NyaXB0b3ISLwoLb2JzZXJ2ZWRfYXQYAiABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wIk8KFkxpc3RSZW1vdGVIb3N0c1JlcXVlc3QSEQoJdGFyZ2V0X2lkGAEgASgJEiIKBHBhZ2UYAiABKAsyFC5qb2tvLnYxLlBhZ2VSZXF1ZXN0Il4KF0xpc3RSZW1vdGVIb3N0c1Jlc3BvbnNlEiIKBWhvc3RzGAEgAygLMhMuam9rby52MS5SZW1vdGVIb3N0Eh8KBHBhZ2UYAiABKAsyES5qb2tvLnYxLlBhZ2VJbmZvIjoKFEdldFJlbW90ZUhvc3RSZXF1ZXN0EhEKCXRhcmdldF9pZBgBIAEoCRIPCgdob3N0X2lkGAIgASgJIjoKFUdldFJlbW90ZUhvc3RSZXNwb25zZRIhCgRob3N0GAEgASgLMhMuam9rby52MS5SZW1vdGVIb3N0IiwKF1dhdGNoUmVtb3RlSG9zdHNSZXF1ZXN0EhEKCXRhcmdldF9pZBgBIAEoCSJwChlSZW1vdGVIb3N0Q2F0YWxvZ1NuYXBzaG90EiIKBWhvc3RzGAEgAygLMhMuam9rby52MS5SZW1vdGVIb3N0Ei8KC29ic2VydmVkX2F0GAIgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcCKTAQoQUmVtb3RlSG9zdENoYW5nZRIrCgRraW5kGAEgASgOMh0uam9rby52MS5SZW1vdGVIb3N0Q2hhbmdlS2luZBIhCgRob3N0GAIgASgLMhMuam9rby52MS5SZW1vdGVIb3N0Ei8KC29ic2VydmVkX2F0GAMgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcCKbAQoYV2F0Y2hSZW1vdGVIb3N0c1Jlc3BvbnNlEjYKCHNuYXBzaG90GAEgASgLMiIuam9rby52MS5SZW1vdGVIb3N0Q2F0YWxvZ1NuYXBzaG90SAASKwoGY2hhbmdlGAIgASgLMhkuam9rby52MS5SZW1vdGVIb3N0Q2hhbmdlSAASEAoIc2VxdWVuY2UYAyABKARCCAoGdXBkYXRlIkgKH1JlZnJlc2hSZW1vdGVIb3N0Q2F0YWxvZ1JlcXVlc3QSEQoJdGFyZ2V0X2lkGAEgASgJEhIKCnJlcXVlc3RfaWQYAiABKAkieAogUmVmcmVzaFJlbW90ZUhvc3RDYXRhbG9nUmVzcG9uc2USIgoFaG9zdHMYASADKAsyEy5qb2tvLnYxLlJlbW90ZUhvc3QSMAoMcmVmcmVzaGVkX2F0GAIgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcCKxAgoXQ3JlYXRlUmVtb3RlSG9zdFJlcXVlc3QSEgoKcmVxdWVzdF9pZBgBIAEoCRIRCgl0YXJnZXRfaWQYAiABKAkSDwoHaG9zdF9pZBgDIAEoCRIQCghob3N0bmFtZRgEIAEoCRIMCgRwb3J0GAUgASgNEgwKBHVzZXIYBiABKAkSJAoXY3JlZGVudGlhbF9yZWZlcmVuY2VfaWQYByABKAlIAIgBARJCChNhdXRoZW50aWNhdGlvbl9tb2RlGAggASgOMiUuam9rby52MS5SZW1vdGVIb3N0QXV0aGVudGljYXRpb25Nb2RlEioKCG5vZGVfa2V5GAkgASgLMhguam9rby52MS5Tc2hLZXlSZWZlcmVuY2VCGgoYX2NyZWRlbnRpYWxfcmVmZXJlbmNlX2lkIj0KGENyZWF0ZVJlbW90ZUhvc3RSZXNwb25zZRIhCgRob3N0GAEgASgLMhMuam9rby52MS5SZW1vdGVIb3N0IssCChdVcGRhdGVSZW1vdGVIb3N0UmVxdWVzdBIRCgl0YXJnZXRfaWQYASABKAkSDwoHaG9zdF9pZBgCIAEoCRIQCghob3N0bmFtZRgDIAEoCRIMCgRwb3J0GAQgASgNEgwKBHVzZXIYBSABKAkSJAoXY3JlZGVudGlhbF9yZWZlcmVuY2VfaWQYBiABKAlIAIgBARIsChFleHBlY3RlZF9yZXZpc2lvbhgHIAEoCzIRLmpva28udjEuUmV2aXNpb24SQgoTYXV0aGVudGljYXRpb25fbW9kZRgIIAEoDjIlLmpva28udjEuUmVtb3RlSG9zdEF1dGhlbnRpY2F0aW9uTW9kZRIqCghub2RlX2tleRgJIAEoCzIYLmpva28udjEuU3NoS2V5UmVmZXJlbmNlQhoKGF9jcmVkZW50aWFsX3JlZmVyZW5jZV9pZCI9ChhVcGRhdGVSZW1vdGVIb3N0UmVzcG9uc2USIQoEaG9zdBgBIAEoCzITLmpva28udjEuUmVtb3RlSG9zdCJrChdEZWxldGVSZW1vdGVIb3N0UmVxdWVzdBIRCgl0YXJnZXRfaWQYASABKAkSDwoHaG9zdF9pZBgCIAEoCRIsChFleHBlY3RlZF9yZXZpc2lvbhgDIAEoCzIRLmpva28udjEuUmV2aXNpb24iPQoYRGVsZXRlUmVtb3RlSG9zdFJlc3BvbnNlEiEKBGhvc3QYASABKAsyEy5qb2tvLnYxLlJlbW90ZUhvc3QibAoYQ29ubmVjdFJlbW90ZUhvc3RSZXF1ZXN0EhEKCXRhcmdldF9pZBgBIAEoCRIPCgdob3N0X2lkGAIgASgJEiwKEWV4cGVjdGVkX3JldmlzaW9uGAMgASgLMhEuam9rby52MS5SZXZpc2lvbiI+ChlDb25uZWN0UmVtb3RlSG9zdFJlc3BvbnNlEiEKBGhvc3QYASABKAsyEy5qb2tvLnYxLlJlbW90ZUhvc3QibwobRGlzY29ubmVjdFJlbW90ZUhvc3RSZXF1ZXN0EhEKCXRhcmdldF9pZBgBIAEoCRIPCgdob3N0X2lkGAIgASgJEiwKEWV4cGVjdGVkX3JldmlzaW9uGAMgASgLMhEuam9rby52MS5SZXZpc2lvbiJBChxEaXNjb25uZWN0UmVtb3RlSG9zdFJlc3BvbnNlEiEKBGhvc3QYASABKAsyEy5qb2tvLnYxLlJlbW90ZUhvc3QicwofVGVzdFJlbW90ZUhvc3RDb25uZWN0aW9uUmVxdWVzdBIRCgl0YXJnZXRfaWQYASABKAkSDwoHaG9zdF9pZBgCIAEoCRIsChFleHBlY3RlZF9yZXZpc2lvbhgDIAEoCzIRLmpva28udjEuUmV2aXNpb24irQEKHlJlbW90ZUhvc3RDb25uZWN0aW9uVGVzdFJlc3VsdBI5CgdvdXRjb21lGAEgASgOMiguam9rby52MS5SZW1vdGVIb3N0Q29ubmVjdGlvblRlc3RPdXRjb21lEiEKBGhvc3QYAiABKAsyEy5qb2tvLnYxLlJlbW90ZUhvc3QSLQoJdGVzdGVkX2F0GAMgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcCJbCiBUZXN0UmVtb3RlSG9zdENvbm5lY3Rpb25SZXNwb25zZRI3CgZyZXN1bHQYASABKAsyJy5qb2tvLnYxLlJlbW90ZUhvc3RDb25uZWN0aW9uVGVzdFJlc3VsdCJvChtDbGVhclJlbW90ZUhvc3RUcnVzdFJlcXVlc3QSEQoJdGFyZ2V0X2lkGAEgASgJEg8KB2hvc3RfaWQYAiABKAkSLAoRZXhwZWN0ZWRfcmV2aXNpb24YAyABKAsyES5qb2tvLnYxLlJldmlzaW9uIkEKHENsZWFyUmVtb3RlSG9zdFRydXN0UmVzcG9uc2USIQoEaG9zdBgBIAEoCzITLmpva28udjEuUmVtb3RlSG9zdCqIAQoNU3NoQWdlbnRTdGF0ZRIfChtTU0hfQUdFTlRfU1RBVEVfVU5TUEVDSUZJRUQQABIZChVTU0hfQUdFTlRfU1RBVEVfUkVBRFkQARIfChtTU0hfQUdFTlRfU1RBVEVfVU5BVkFJTEFCTEUQAhIaChZTU0hfQUdFTlRfU1RBVEVfRkFJTEVEEAMqmAEKF1NzaEtleVBhc3NwaHJhc2VQdXJwb3NlEioKJlNTSF9LRVlfUEFTU1BIUkFTRV9QVVJQT1NFX1VOU1BFQ0lGSUVEEAASJwojU1NIX0tFWV9QQVNTUEhSQVNFX1BVUlBPU0VfR0VORVJBVEUQARIoCiRTU0hfS0VZX1BBU1NQSFJBU0VfUFVSUE9TRV9BR0VOVF9BREQQAipzCg9Tc2hJbnN0YWxsU2hlbGwSIQodU1NIX0lOU1RBTExfU0hFTExfVU5TUEVDSUZJRUQQABIbChdTU0hfSU5TVEFMTF9TSEVMTF9QT1NJWBABEiAKHFNTSF9JTlNUQUxMX1NIRUxMX1BPV0VSU0hFTEwQAirzAwoYUmVtb3RlSG9zdENhcGFiaWxpdHlLaW5kEisKJ1JFTU9URV9IT1NUX0NBUEFCSUxJVFlfS0lORF9VTlNQRUNJRklFRBAAEicKI1JFTU9URV9IT1NUX0NBUEFCSUxJVFlfS0lORF9DQVRBTE9HEAESKgomUkVNT1RFX0hPU1RfQ0FQQUJJTElUWV9LSU5EX01BTkFHRU1FTlQQAhIyCi5SRU1PVEVfSE9TVF9DQVBBQklMSVRZX0tJTkRfQ09OTkVDVElPTl9DT05UUk9MEAMSLworUkVNT1RFX0hPU1RfQ0FQQUJJTElUWV9LSU5EX0NPTk5FQ1RJT05fVEVTVBAEEisKJ1JFTU9URV9IT1NUX0NBUEFCSUxJVFlfS0lORF9UUlVTVF9SRVNFVBAFEjEKLVJFTU9URV9IT1NUX0NBUEFCSUxJVFlfS0lORF9DT01NQU5EX0VYRUNVVElPThAGEjEKLVJFTU9URV9IT1NUX0NBUEFCSUxJVFlfS0lORF9QUk9DRVNTX1NUUkVBTUlORxAHEi0KKVJFTU9URV9IT1NUX0NBUEFCSUxJVFlfS0lORF9GSUxFX1RSQU5TRkVSEAgSLgoqUkVNT1RFX0hPU1RfQ0FQQUJJTElUWV9LSU5EX1RDUF9GT1JXQVJESU5HEAkqeAoQUmVtb3RlSG9zdFNvdXJjZRIiCh5SRU1PVEVfSE9TVF9TT1VSQ0VfVU5TUEVDSUZJRUQQABIdChlSRU1PVEVfSE9TVF9TT1VSQ0VfTUFOVUFMEAESIQodUkVNT1RFX0hPU1RfU09VUkNFX1NTSF9DT05GSUcQAirgAQocUmVtb3RlSG9zdEF1dGhlbnRpY2F0aW9uTW9kZRIvCitSRU1PVEVfSE9TVF9BVVRIRU5USUNBVElPTl9NT0RFX1VOU1BFQ0lGSUVEEAASMAosUkVNT1RFX0hPU1RfQVVUSEVOVElDQVRJT05fTU9ERV9TWVNURU1fQUdFTlQQARIvCitSRU1PVEVfSE9TVF9BVVRIRU5USUNBVElPTl9NT0RFX1BSSVZBVEVfS0VZEAISLAooUkVNT1RFX0hPU1RfQVVUSEVOVElDQVRJT05fTU9ERV9OT0RFX0tFWRADKuIBChBSZW1vdGVIb3N0U3RhdHVzEiIKHlJFTU9URV9IT1NUX1NUQVRVU19VTlNQRUNJRklFRBAAEiMKH1JFTU9URV9IT1NUX1NUQVRVU19ESVNDT05ORUNURUQQARIhCh1SRU1PVEVfSE9TVF9TVEFUVVNfQ09OTkVDVElORxACEiUKIVJFTU9URV9IT1NUX1NUQVRVU19BVVRIRU5USUNBVElORxADEhwKGFJFTU9URV9IT1NUX1NUQVRVU19SRUFEWRAEEh0KGVJFTU9URV9IT1NUX1NUQVRVU19GQUlMRUQQBSrcBgoVUmVtb3RlSG9zdEZhaWx1cmVDb2RlEigKJFJFTU9URV9IT1NUX0ZBSUxVUkVfQ09ERV9VTlNQRUNJRklFRBAAEiQKIFJFTU9URV9IT1NUX0ZBSUxVUkVfQ09ERV9BQk9SVEVEEAESMgouUkVNT1RFX0hPU1RfRkFJTFVSRV9DT0RFX0FVVEhFTlRJQ0FUSU9OX0ZBSUxFRBACEi4KKlJFTU9URV9IT1NUX0ZBSUxVUkVfQ09ERV9DT05ORUNUSU9OX0ZBSUxFRBADEi8KK1JFTU9URV9IT1NUX0ZBSUxVUkVfQ09ERV9DT05ORUNUSU9OX1RJTUVPVVQQBBIvCitSRU1PVEVfSE9TVF9GQUlMVVJFX0NPREVfQ09OTkVDVE9SX1BST1RPQ09MEAUSMgouUkVNT1RFX0hPU1RfRkFJTFVSRV9DT0RFX0NPTk5FQ1RPUl9VTkFWQUlMQUJMRRAGEi0KKVJFTU9URV9IT1NUX0ZBSUxVUkVfQ09ERV9IT1NUX0tFWV9DSEFOR0VEEAcSLgoqUkVNT1RFX0hPU1RfRkFJTFVSRV9DT0RFX0hPU1RfS0VZX0NPTkZMSUNUEAgSLQopUkVNT1RFX0hPU1RfRkFJTFVSRV9DT0RFX0hPU1RfS0VZX0lOVkFMSUQQCRItCilSRU1PVEVfSE9TVF9GQUlMVVJFX0NPREVfSE9TVF9LRVlfTUlTU0lORxAKEjMKL1JFTU9URV9IT1NUX0ZBSUxVUkVfQ09ERV9IT1NUX0tFWV9TVE9SRV9DT1JSVVBUEAsSMwovUkVNT1RFX0hPU1RfRkFJTFVSRV9DT0RFX0hPU1RfS0VZX1NUT1JFX01JU1NJTkcQDBI2CjJSRU1PVEVfSE9TVF9GQUlMVVJFX0NPREVfSE9TVF9LRVlfU1RPUkVfVU5SRUFEQUJMRRANEjgKNFJFTU9URV9IT1NUX0ZBSUxVUkVfQ09ERV9IT1NUX0tFWV9TVE9SRV9XUklURV9GQUlMRUQQDhItCilSRU1PVEVfSE9TVF9GQUlMVVJFX0NPREVfTk9ERV9LRVlfQ0hBTkdFRBAPEjEKLVJFTU9URV9IT1NUX0ZBSUxVUkVfQ09ERV9OT0RFX0tFWV9VTkFWQUlMQUJMRRAQKooBChRSZW1vdGVIb3N0Q2hhbmdlS2luZBInCiNSRU1PVEVfSE9TVF9DSEFOR0VfS0lORF9VTlNQRUNJRklFRBAAEiQKIFJFTU9URV9IT1NUX0NIQU5HRV9LSU5EX1VQU0VSVEVEEAESIwofUkVNT1RFX0hPU1RfQ0hBTkdFX0tJTkRfREVMRVRFRBACKrkBCh9SZW1vdGVIb3N0Q29ubmVjdGlvblRlc3RPdXRjb21lEjMKL1JFTU9URV9IT1NUX0NPTk5FQ1RJT05fVEVTVF9PVVRDT01FX1VOU1BFQ0lGSUVEEAASMQotUkVNT1RFX0hPU1RfQ09OTkVDVElPTl9URVNUX09VVENPTUVfU1VDQ0VFREVEEAESLgoqUkVNT1RFX0hPU1RfQ09OTkVDVElPTl9URVNUX09VVENPTUVfRkFJTEVEEAIyxgQKDVNzaEtleVNlcnZpY2USSAoLTGlzdFNzaEtleXMSGy5qb2tvLnYxLkxpc3RTc2hLZXlzUmVxdWVzdBocLmpva28udjEuTGlzdFNzaEtleXNSZXNwb25zZRJ4ChtCZWdpblNzaEtleVBhc3NwaHJhc2VVcGxvYWQSKy5qb2tvLnYxLkJlZ2luU3NoS2V5UGFzc3BocmFzZVVwbG9hZFJlcXVlc3QaLC5qb2tvLnYxLkJlZ2luU3NoS2V5UGFzc3BocmFzZVVwbG9hZFJlc3BvbnNlElEKDkdlbmVyYXRlU3NoS2V5Eh4uam9rby52MS5HZW5lcmF0ZVNzaEtleVJlcXVlc3QaHy5qb2tvLnYxLkdlbmVyYXRlU3NoS2V5UmVzcG9uc2USVwoQQWRkU3NoS2V5VG9BZ2VudBIgLmpva28udjEuQWRkU3NoS2V5VG9BZ2VudFJlcXVlc3QaIS5qb2tvLnYxLkFkZFNzaEtleVRvQWdlbnRSZXNwb25zZRJXChBSZWFkU3NoUHVibGljS2V5EiAuam9rby52MS5SZWFkU3NoUHVibGljS2V5UmVxdWVzdBohLmpva28udjEuUmVhZFNzaFB1YmxpY0tleVJlc3BvbnNlEmwKF0dldFNzaEtleUluc3RhbGxDb21tYW5kEicuam9rby52MS5HZXRTc2hLZXlJbnN0YWxsQ29tbWFuZFJlcXVlc3QaKC5qb2tvLnYxLkdldFNzaEtleUluc3RhbGxDb21tYW5kUmVzcG9uc2UymwkKEVJlbW90ZUhvc3RTZXJ2aWNlEnIKGUdldFJlbW90ZUhvc3RDYXBhYmlsaXRpZXMSKS5qb2tvLnYxLkdldFJlbW90ZUhvc3RDYXBhYmlsaXRpZXNSZXF1ZXN0Giouam9rby52MS5HZXRSZW1vdGVIb3N0Q2FwYWJpbGl0aWVzUmVzcG9uc2USVAoPTGlzdFJlbW90ZUhvc3RzEh8uam9rby52MS5MaXN0UmVtb3RlSG9zdHNSZXF1ZXN0GiAuam9rby52MS5MaXN0UmVtb3RlSG9zdHNSZXNwb25zZRJOCg1HZXRSZW1vdGVIb3N0Eh0uam9rby52MS5HZXRSZW1vdGVIb3N0UmVxdWVzdBoeLmpva28udjEuR2V0UmVtb3RlSG9zdFJlc3BvbnNlElkKEFdhdGNoUmVtb3RlSG9zdHMSIC5qb2tvLnYxLldhdGNoUmVtb3RlSG9zdHNSZXF1ZXN0GiEuam9rby52MS5XYXRjaFJlbW90ZUhvc3RzUmVzcG9uc2UwARJvChhSZWZyZXNoUmVtb3RlSG9zdENhdGFsb2cSKC5qb2tvLnYxLlJlZnJlc2hSZW1vdGVIb3N0Q2F0YWxvZ1JlcXVlc3QaKS5qb2tvLnYxLlJlZnJlc2hSZW1vdGVIb3N0Q2F0YWxvZ1Jlc3BvbnNlElcKEENyZWF0ZVJlbW90ZUhvc3QSIC5qb2tvLnYxLkNyZWF0ZVJlbW90ZUhvc3RSZXF1ZXN0GiEuam9rby52MS5DcmVhdGVSZW1vdGVIb3N0UmVzcG9uc2USVwoQVXBkYXRlUmVtb3RlSG9zdBIgLmpva28udjEuVXBkYXRlUmVtb3RlSG9zdFJlcXVlc3QaIS5qb2tvLnYxLlVwZGF0ZVJlbW90ZUhvc3RSZXNwb25zZRJXChBEZWxldGVSZW1vdGVIb3N0EiAuam9rby52MS5EZWxldGVSZW1vdGVIb3N0UmVxdWVzdBohLmpva28udjEuRGVsZXRlUmVtb3RlSG9zdFJlc3BvbnNlEloKEUNvbm5lY3RSZW1vdGVIb3N0EiEuam9rby52MS5Db25uZWN0UmVtb3RlSG9zdFJlcXVlc3QaIi5qb2tvLnYxLkNvbm5lY3RSZW1vdGVIb3N0UmVzcG9uc2USYwoURGlzY29ubmVjdFJlbW90ZUhvc3QSJC5qb2tvLnYxLkRpc2Nvbm5lY3RSZW1vdGVIb3N0UmVxdWVzdBolLmpva28udjEuRGlzY29ubmVjdFJlbW90ZUhvc3RSZXNwb25zZRJvChhUZXN0UmVtb3RlSG9zdENvbm5lY3Rpb24SKC5qb2tvLnYxLlRlc3RSZW1vdGVIb3N0Q29ubmVjdGlvblJlcXVlc3QaKS5qb2tvLnYxLlRlc3RSZW1vdGVIb3N0Q29ubmVjdGlvblJlc3BvbnNlEmMKFENsZWFyUmVtb3RlSG9zdFRydXN0EiQuam9rby52MS5DbGVhclJlbW90ZUhvc3RUcnVzdFJlcXVlc3QaJS5qb2tvLnYxLkNsZWFyUmVtb3RlSG9zdFRydXN0UmVzcG9uc2ViBnByb3RvMw", [file_google_protobuf_timestamp, file_joko_v1_capability, file_joko_v1_common, file_joko_v1_operation]);
+
+/**
+ * @generated from message joko.v1.SshKey
+ */
+export type SshKey = Message<"joko.v1.SshKey"> & {
+  /**
+   * @generated from field: string id = 1;
+   */
+  id: string;
+
+  /**
+   * @generated from field: string name = 2;
+   */
+  name: string;
+
+  /**
+   * @generated from field: string algorithm = 3;
+   */
+  algorithm: string;
+
+  /**
+   * @generated from field: string comment = 4;
+   */
+  comment: string;
+
+  /**
+   * @generated from field: string sha256_fingerprint = 5;
+   */
+  sha256Fingerprint: string;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp modified_at = 6;
+   */
+  modifiedAt?: Timestamp | undefined;
+
+  /**
+   * @generated from field: bool in_agent = 7;
+   */
+  inAgent: boolean;
+};
+
+/**
+ * Describes the message joko.v1.SshKey.
+ * Use `create(SshKeySchema)` to create a new message.
+ */
+export const SshKeySchema: GenMessage<SshKey> = /*@__PURE__*/
+  messageDesc(file_joko_v1_remote_host, 0);
+
+/**
+ * @generated from message joko.v1.ListSshKeysRequest
+ */
+export type ListSshKeysRequest = Message<"joko.v1.ListSshKeysRequest"> & {
+};
+
+/**
+ * Describes the message joko.v1.ListSshKeysRequest.
+ * Use `create(ListSshKeysRequestSchema)` to create a new message.
+ */
+export const ListSshKeysRequestSchema: GenMessage<ListSshKeysRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_remote_host, 1);
+
+/**
+ * @generated from message joko.v1.ListSshKeysResponse
+ */
+export type ListSshKeysResponse = Message<"joko.v1.ListSshKeysResponse"> & {
+  /**
+   * @generated from field: repeated joko.v1.SshKey keys = 1;
+   */
+  keys: SshKey[];
+
+  /**
+   * @generated from field: joko.v1.SshAgentState agent_state = 2;
+   */
+  agentState: SshAgentState;
+
+  /**
+   * @generated from field: bool generation_supported = 3;
+   */
+  generationSupported: boolean;
+};
+
+/**
+ * Describes the message joko.v1.ListSshKeysResponse.
+ * Use `create(ListSshKeysResponseSchema)` to create a new message.
+ */
+export const ListSshKeysResponseSchema: GenMessage<ListSshKeysResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_remote_host, 2);
+
+/**
+ * @generated from message joko.v1.BeginSshKeyPassphraseUploadRequest
+ */
+export type BeginSshKeyPassphraseUploadRequest = Message<"joko.v1.BeginSshKeyPassphraseUploadRequest"> & {
+  /**
+   * @generated from field: joko.v1.SshKeyPassphrasePurpose purpose = 1;
+   */
+  purpose: SshKeyPassphrasePurpose;
+
+  /**
+   * @generated from field: string key_id = 2;
+   */
+  keyId: string;
+
+  /**
+   * @generated from field: string expected_fingerprint = 3;
+   */
+  expectedFingerprint: string;
+};
+
+/**
+ * Describes the message joko.v1.BeginSshKeyPassphraseUploadRequest.
+ * Use `create(BeginSshKeyPassphraseUploadRequestSchema)` to create a new message.
+ */
+export const BeginSshKeyPassphraseUploadRequestSchema: GenMessage<BeginSshKeyPassphraseUploadRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_remote_host, 3);
+
+/**
+ * @generated from message joko.v1.BeginSshKeyPassphraseUploadResponse
+ */
+export type BeginSshKeyPassphraseUploadResponse = Message<"joko.v1.BeginSshKeyPassphraseUploadResponse"> & {
+  /**
+   * @generated from field: joko.v1.CredentialUploadTicket ticket = 1;
+   */
+  ticket?: CredentialUploadTicket | undefined;
+};
+
+/**
+ * Describes the message joko.v1.BeginSshKeyPassphraseUploadResponse.
+ * Use `create(BeginSshKeyPassphraseUploadResponseSchema)` to create a new message.
+ */
+export const BeginSshKeyPassphraseUploadResponseSchema: GenMessage<BeginSshKeyPassphraseUploadResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_remote_host, 4);
+
+/**
+ * @generated from message joko.v1.GenerateSshKeyRequest
+ */
+export type GenerateSshKeyRequest = Message<"joko.v1.GenerateSshKeyRequest"> & {
+  /**
+   * @generated from field: string name = 1;
+   */
+  name: string;
+
+  /**
+   * @generated from field: string comment = 2;
+   */
+  comment: string;
+
+  /**
+   * @generated from field: optional string passphrase_upload_ticket_id = 3;
+   */
+  passphraseUploadTicketId?: string | undefined;
+};
+
+/**
+ * Describes the message joko.v1.GenerateSshKeyRequest.
+ * Use `create(GenerateSshKeyRequestSchema)` to create a new message.
+ */
+export const GenerateSshKeyRequestSchema: GenMessage<GenerateSshKeyRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_remote_host, 5);
+
+/**
+ * @generated from message joko.v1.GenerateSshKeyResponse
+ */
+export type GenerateSshKeyResponse = Message<"joko.v1.GenerateSshKeyResponse"> & {
+  /**
+   * @generated from field: joko.v1.SshKey key = 1;
+   */
+  key?: SshKey | undefined;
+};
+
+/**
+ * Describes the message joko.v1.GenerateSshKeyResponse.
+ * Use `create(GenerateSshKeyResponseSchema)` to create a new message.
+ */
+export const GenerateSshKeyResponseSchema: GenMessage<GenerateSshKeyResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_remote_host, 6);
+
+/**
+ * @generated from message joko.v1.AddSshKeyToAgentRequest
+ */
+export type AddSshKeyToAgentRequest = Message<"joko.v1.AddSshKeyToAgentRequest"> & {
+  /**
+   * @generated from field: string key_id = 1;
+   */
+  keyId: string;
+
+  /**
+   * @generated from field: string expected_fingerprint = 2;
+   */
+  expectedFingerprint: string;
+
+  /**
+   * @generated from field: optional string passphrase_upload_ticket_id = 3;
+   */
+  passphraseUploadTicketId?: string | undefined;
+};
+
+/**
+ * Describes the message joko.v1.AddSshKeyToAgentRequest.
+ * Use `create(AddSshKeyToAgentRequestSchema)` to create a new message.
+ */
+export const AddSshKeyToAgentRequestSchema: GenMessage<AddSshKeyToAgentRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_remote_host, 7);
+
+/**
+ * @generated from message joko.v1.AddSshKeyToAgentResponse
+ */
+export type AddSshKeyToAgentResponse = Message<"joko.v1.AddSshKeyToAgentResponse"> & {
+};
+
+/**
+ * Describes the message joko.v1.AddSshKeyToAgentResponse.
+ * Use `create(AddSshKeyToAgentResponseSchema)` to create a new message.
+ */
+export const AddSshKeyToAgentResponseSchema: GenMessage<AddSshKeyToAgentResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_remote_host, 8);
+
+/**
+ * @generated from message joko.v1.ReadSshPublicKeyRequest
+ */
+export type ReadSshPublicKeyRequest = Message<"joko.v1.ReadSshPublicKeyRequest"> & {
+  /**
+   * @generated from field: string key_id = 1;
+   */
+  keyId: string;
+
+  /**
+   * @generated from field: string expected_fingerprint = 2;
+   */
+  expectedFingerprint: string;
+};
+
+/**
+ * Describes the message joko.v1.ReadSshPublicKeyRequest.
+ * Use `create(ReadSshPublicKeyRequestSchema)` to create a new message.
+ */
+export const ReadSshPublicKeyRequestSchema: GenMessage<ReadSshPublicKeyRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_remote_host, 9);
+
+/**
+ * @generated from message joko.v1.ReadSshPublicKeyResponse
+ */
+export type ReadSshPublicKeyResponse = Message<"joko.v1.ReadSshPublicKeyResponse"> & {
+  /**
+   * @generated from field: string public_key = 1;
+   */
+  publicKey: string;
+};
+
+/**
+ * Describes the message joko.v1.ReadSshPublicKeyResponse.
+ * Use `create(ReadSshPublicKeyResponseSchema)` to create a new message.
+ */
+export const ReadSshPublicKeyResponseSchema: GenMessage<ReadSshPublicKeyResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_remote_host, 10);
+
+/**
+ * @generated from message joko.v1.GetSshKeyInstallCommandRequest
+ */
+export type GetSshKeyInstallCommandRequest = Message<"joko.v1.GetSshKeyInstallCommandRequest"> & {
+  /**
+   * @generated from field: string key_id = 1;
+   */
+  keyId: string;
+
+  /**
+   * @generated from field: string expected_fingerprint = 2;
+   */
+  expectedFingerprint: string;
+
+  /**
+   * @generated from oneof joko.v1.GetSshKeyInstallCommandRequest.destination
+   */
+  destination: {
+    /**
+     * @generated from field: joko.v1.SshKeySavedHost saved_host = 3;
+     */
+    value: SshKeySavedHost;
+    case: "savedHost";
+  } | {
+    /**
+     * @generated from field: joko.v1.SshKeyDraftHost draft_host = 4;
+     */
+    value: SshKeyDraftHost;
+    case: "draftHost";
+  } | { case: undefined; value?: undefined };
+
+  /**
+   * @generated from field: joko.v1.SshInstallShell shell = 5;
+   */
+  shell: SshInstallShell;
+};
+
+/**
+ * Describes the message joko.v1.GetSshKeyInstallCommandRequest.
+ * Use `create(GetSshKeyInstallCommandRequestSchema)` to create a new message.
+ */
+export const GetSshKeyInstallCommandRequestSchema: GenMessage<GetSshKeyInstallCommandRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_remote_host, 11);
+
+/**
+ * @generated from message joko.v1.SshKeySavedHost
+ */
+export type SshKeySavedHost = Message<"joko.v1.SshKeySavedHost"> & {
+  /**
+   * @generated from field: string target_id = 1;
+   */
+  targetId: string;
+
+  /**
+   * @generated from field: string host_id = 2;
+   */
+  hostId: string;
+
+  /**
+   * @generated from field: joko.v1.Revision expected_revision = 3;
+   */
+  expectedRevision?: Revision | undefined;
+};
+
+/**
+ * Describes the message joko.v1.SshKeySavedHost.
+ * Use `create(SshKeySavedHostSchema)` to create a new message.
+ */
+export const SshKeySavedHostSchema: GenMessage<SshKeySavedHost> = /*@__PURE__*/
+  messageDesc(file_joko_v1_remote_host, 12);
+
+/**
+ * @generated from message joko.v1.SshKeyDraftHost
+ */
+export type SshKeyDraftHost = Message<"joko.v1.SshKeyDraftHost"> & {
+  /**
+   * @generated from field: string hostname = 1;
+   */
+  hostname: string;
+
+  /**
+   * @generated from field: string user = 2;
+   */
+  user: string;
+
+  /**
+   * @generated from field: uint32 port = 3;
+   */
+  port: number;
+};
+
+/**
+ * Describes the message joko.v1.SshKeyDraftHost.
+ * Use `create(SshKeyDraftHostSchema)` to create a new message.
+ */
+export const SshKeyDraftHostSchema: GenMessage<SshKeyDraftHost> = /*@__PURE__*/
+  messageDesc(file_joko_v1_remote_host, 13);
+
+/**
+ * @generated from message joko.v1.SshKeyReference
+ */
+export type SshKeyReference = Message<"joko.v1.SshKeyReference"> & {
+  /**
+   * @generated from field: string id = 1;
+   */
+  id: string;
+
+  /**
+   * @generated from field: string expected_fingerprint = 2;
+   */
+  expectedFingerprint: string;
+};
+
+/**
+ * Describes the message joko.v1.SshKeyReference.
+ * Use `create(SshKeyReferenceSchema)` to create a new message.
+ */
+export const SshKeyReferenceSchema: GenMessage<SshKeyReference> = /*@__PURE__*/
+  messageDesc(file_joko_v1_remote_host, 14);
+
+/**
+ * @generated from message joko.v1.GetSshKeyInstallCommandResponse
+ */
+export type GetSshKeyInstallCommandResponse = Message<"joko.v1.GetSshKeyInstallCommandResponse"> & {
+  /**
+   * @generated from field: string command = 1;
+   */
+  command: string;
+};
+
+/**
+ * Describes the message joko.v1.GetSshKeyInstallCommandResponse.
+ * Use `create(GetSshKeyInstallCommandResponseSchema)` to create a new message.
+ */
+export const GetSshKeyInstallCommandResponseSchema: GenMessage<GetSshKeyInstallCommandResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_remote_host, 15);
 
 /**
  * @generated from message joko.v1.RemoteHostCapabilityDescriptor
@@ -43,7 +436,7 @@ export type RemoteHostCapabilityDescriptor = Message<"joko.v1.RemoteHostCapabili
  * Use `create(RemoteHostCapabilityDescriptorSchema)` to create a new message.
  */
 export const RemoteHostCapabilityDescriptorSchema: GenMessage<RemoteHostCapabilityDescriptor> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_host, 0);
+  messageDesc(file_joko_v1_remote_host, 16);
 
 /**
  * @generated from message joko.v1.RemoteHostFailure
@@ -65,7 +458,7 @@ export type RemoteHostFailure = Message<"joko.v1.RemoteHostFailure"> & {
  * Use `create(RemoteHostFailureSchema)` to create a new message.
  */
 export const RemoteHostFailureSchema: GenMessage<RemoteHostFailure> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_host, 1);
+  messageDesc(file_joko_v1_remote_host, 17);
 
 /**
  * @generated from message joko.v1.RemoteHostTrustPin
@@ -94,7 +487,7 @@ export type RemoteHostTrustPin = Message<"joko.v1.RemoteHostTrustPin"> & {
  * Use `create(RemoteHostTrustPinSchema)` to create a new message.
  */
 export const RemoteHostTrustPinSchema: GenMessage<RemoteHostTrustPin> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_host, 2);
+  messageDesc(file_joko_v1_remote_host, 18);
 
 /**
  * @generated from message joko.v1.RemoteHostStatusSnapshot
@@ -123,7 +516,7 @@ export type RemoteHostStatusSnapshot = Message<"joko.v1.RemoteHostStatusSnapshot
  * Use `create(RemoteHostStatusSnapshotSchema)` to create a new message.
  */
 export const RemoteHostStatusSnapshotSchema: GenMessage<RemoteHostStatusSnapshot> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_host, 3);
+  messageDesc(file_joko_v1_remote_host, 19);
 
 /**
  * @generated from message joko.v1.RemoteHost
@@ -195,6 +588,11 @@ export type RemoteHost = Message<"joko.v1.RemoteHost"> & {
    * @generated from field: joko.v1.RemoteHostAuthenticationMode authentication_mode = 13;
    */
   authenticationMode: RemoteHostAuthenticationMode;
+
+  /**
+   * @generated from field: joko.v1.SshKeyReference node_key = 14;
+   */
+  nodeKey?: SshKeyReference | undefined;
 };
 
 /**
@@ -202,7 +600,7 @@ export type RemoteHost = Message<"joko.v1.RemoteHost"> & {
  * Use `create(RemoteHostSchema)` to create a new message.
  */
 export const RemoteHostSchema: GenMessage<RemoteHost> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_host, 4);
+  messageDesc(file_joko_v1_remote_host, 20);
 
 /**
  * @generated from message joko.v1.GetRemoteHostCapabilitiesRequest
@@ -219,7 +617,7 @@ export type GetRemoteHostCapabilitiesRequest = Message<"joko.v1.GetRemoteHostCap
  * Use `create(GetRemoteHostCapabilitiesRequestSchema)` to create a new message.
  */
 export const GetRemoteHostCapabilitiesRequestSchema: GenMessage<GetRemoteHostCapabilitiesRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_host, 5);
+  messageDesc(file_joko_v1_remote_host, 21);
 
 /**
  * @generated from message joko.v1.GetRemoteHostCapabilitiesResponse
@@ -241,7 +639,7 @@ export type GetRemoteHostCapabilitiesResponse = Message<"joko.v1.GetRemoteHostCa
  * Use `create(GetRemoteHostCapabilitiesResponseSchema)` to create a new message.
  */
 export const GetRemoteHostCapabilitiesResponseSchema: GenMessage<GetRemoteHostCapabilitiesResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_host, 6);
+  messageDesc(file_joko_v1_remote_host, 22);
 
 /**
  * @generated from message joko.v1.ListRemoteHostsRequest
@@ -263,7 +661,7 @@ export type ListRemoteHostsRequest = Message<"joko.v1.ListRemoteHostsRequest"> &
  * Use `create(ListRemoteHostsRequestSchema)` to create a new message.
  */
 export const ListRemoteHostsRequestSchema: GenMessage<ListRemoteHostsRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_host, 7);
+  messageDesc(file_joko_v1_remote_host, 23);
 
 /**
  * @generated from message joko.v1.ListRemoteHostsResponse
@@ -285,7 +683,7 @@ export type ListRemoteHostsResponse = Message<"joko.v1.ListRemoteHostsResponse">
  * Use `create(ListRemoteHostsResponseSchema)` to create a new message.
  */
 export const ListRemoteHostsResponseSchema: GenMessage<ListRemoteHostsResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_host, 8);
+  messageDesc(file_joko_v1_remote_host, 24);
 
 /**
  * @generated from message joko.v1.GetRemoteHostRequest
@@ -307,7 +705,7 @@ export type GetRemoteHostRequest = Message<"joko.v1.GetRemoteHostRequest"> & {
  * Use `create(GetRemoteHostRequestSchema)` to create a new message.
  */
 export const GetRemoteHostRequestSchema: GenMessage<GetRemoteHostRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_host, 9);
+  messageDesc(file_joko_v1_remote_host, 25);
 
 /**
  * @generated from message joko.v1.GetRemoteHostResponse
@@ -324,7 +722,7 @@ export type GetRemoteHostResponse = Message<"joko.v1.GetRemoteHostResponse"> & {
  * Use `create(GetRemoteHostResponseSchema)` to create a new message.
  */
 export const GetRemoteHostResponseSchema: GenMessage<GetRemoteHostResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_host, 10);
+  messageDesc(file_joko_v1_remote_host, 26);
 
 /**
  * @generated from message joko.v1.WatchRemoteHostsRequest
@@ -341,7 +739,7 @@ export type WatchRemoteHostsRequest = Message<"joko.v1.WatchRemoteHostsRequest">
  * Use `create(WatchRemoteHostsRequestSchema)` to create a new message.
  */
 export const WatchRemoteHostsRequestSchema: GenMessage<WatchRemoteHostsRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_host, 11);
+  messageDesc(file_joko_v1_remote_host, 27);
 
 /**
  * @generated from message joko.v1.RemoteHostCatalogSnapshot
@@ -363,7 +761,7 @@ export type RemoteHostCatalogSnapshot = Message<"joko.v1.RemoteHostCatalogSnapsh
  * Use `create(RemoteHostCatalogSnapshotSchema)` to create a new message.
  */
 export const RemoteHostCatalogSnapshotSchema: GenMessage<RemoteHostCatalogSnapshot> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_host, 12);
+  messageDesc(file_joko_v1_remote_host, 28);
 
 /**
  * @generated from message joko.v1.RemoteHostChange
@@ -392,7 +790,7 @@ export type RemoteHostChange = Message<"joko.v1.RemoteHostChange"> & {
  * Use `create(RemoteHostChangeSchema)` to create a new message.
  */
 export const RemoteHostChangeSchema: GenMessage<RemoteHostChange> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_host, 13);
+  messageDesc(file_joko_v1_remote_host, 29);
 
 /**
  * @generated from message joko.v1.WatchRemoteHostsResponse
@@ -429,7 +827,7 @@ export type WatchRemoteHostsResponse = Message<"joko.v1.WatchRemoteHostsResponse
  * Use `create(WatchRemoteHostsResponseSchema)` to create a new message.
  */
 export const WatchRemoteHostsResponseSchema: GenMessage<WatchRemoteHostsResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_host, 14);
+  messageDesc(file_joko_v1_remote_host, 30);
 
 /**
  * Re-reads the service-owned catalog source. No client-selected path crosses
@@ -454,7 +852,7 @@ export type RefreshRemoteHostCatalogRequest = Message<"joko.v1.RefreshRemoteHost
  * Use `create(RefreshRemoteHostCatalogRequestSchema)` to create a new message.
  */
 export const RefreshRemoteHostCatalogRequestSchema: GenMessage<RefreshRemoteHostCatalogRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_host, 15);
+  messageDesc(file_joko_v1_remote_host, 31);
 
 /**
  * @generated from message joko.v1.RefreshRemoteHostCatalogResponse
@@ -476,7 +874,7 @@ export type RefreshRemoteHostCatalogResponse = Message<"joko.v1.RefreshRemoteHos
  * Use `create(RefreshRemoteHostCatalogResponseSchema)` to create a new message.
  */
 export const RefreshRemoteHostCatalogResponseSchema: GenMessage<RefreshRemoteHostCatalogResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_host, 16);
+  messageDesc(file_joko_v1_remote_host, 32);
 
 /**
  * @generated from message joko.v1.CreateRemoteHostRequest
@@ -521,6 +919,11 @@ export type CreateRemoteHostRequest = Message<"joko.v1.CreateRemoteHostRequest">
    * @generated from field: joko.v1.RemoteHostAuthenticationMode authentication_mode = 8;
    */
   authenticationMode: RemoteHostAuthenticationMode;
+
+  /**
+   * @generated from field: joko.v1.SshKeyReference node_key = 9;
+   */
+  nodeKey?: SshKeyReference | undefined;
 };
 
 /**
@@ -528,7 +931,7 @@ export type CreateRemoteHostRequest = Message<"joko.v1.CreateRemoteHostRequest">
  * Use `create(CreateRemoteHostRequestSchema)` to create a new message.
  */
 export const CreateRemoteHostRequestSchema: GenMessage<CreateRemoteHostRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_host, 17);
+  messageDesc(file_joko_v1_remote_host, 33);
 
 /**
  * @generated from message joko.v1.CreateRemoteHostResponse
@@ -545,7 +948,7 @@ export type CreateRemoteHostResponse = Message<"joko.v1.CreateRemoteHostResponse
  * Use `create(CreateRemoteHostResponseSchema)` to create a new message.
  */
 export const CreateRemoteHostResponseSchema: GenMessage<CreateRemoteHostResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_host, 18);
+  messageDesc(file_joko_v1_remote_host, 34);
 
 /**
  * Full routing replacement. An absent credential reference explicitly clears
@@ -593,6 +996,11 @@ export type UpdateRemoteHostRequest = Message<"joko.v1.UpdateRemoteHostRequest">
    * @generated from field: joko.v1.RemoteHostAuthenticationMode authentication_mode = 8;
    */
   authenticationMode: RemoteHostAuthenticationMode;
+
+  /**
+   * @generated from field: joko.v1.SshKeyReference node_key = 9;
+   */
+  nodeKey?: SshKeyReference | undefined;
 };
 
 /**
@@ -600,7 +1008,7 @@ export type UpdateRemoteHostRequest = Message<"joko.v1.UpdateRemoteHostRequest">
  * Use `create(UpdateRemoteHostRequestSchema)` to create a new message.
  */
 export const UpdateRemoteHostRequestSchema: GenMessage<UpdateRemoteHostRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_host, 19);
+  messageDesc(file_joko_v1_remote_host, 35);
 
 /**
  * @generated from message joko.v1.UpdateRemoteHostResponse
@@ -617,7 +1025,7 @@ export type UpdateRemoteHostResponse = Message<"joko.v1.UpdateRemoteHostResponse
  * Use `create(UpdateRemoteHostResponseSchema)` to create a new message.
  */
 export const UpdateRemoteHostResponseSchema: GenMessage<UpdateRemoteHostResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_host, 20);
+  messageDesc(file_joko_v1_remote_host, 36);
 
 /**
  * @generated from message joko.v1.DeleteRemoteHostRequest
@@ -644,7 +1052,7 @@ export type DeleteRemoteHostRequest = Message<"joko.v1.DeleteRemoteHostRequest">
  * Use `create(DeleteRemoteHostRequestSchema)` to create a new message.
  */
 export const DeleteRemoteHostRequestSchema: GenMessage<DeleteRemoteHostRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_host, 21);
+  messageDesc(file_joko_v1_remote_host, 37);
 
 /**
  * @generated from message joko.v1.DeleteRemoteHostResponse
@@ -661,7 +1069,7 @@ export type DeleteRemoteHostResponse = Message<"joko.v1.DeleteRemoteHostResponse
  * Use `create(DeleteRemoteHostResponseSchema)` to create a new message.
  */
 export const DeleteRemoteHostResponseSchema: GenMessage<DeleteRemoteHostResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_host, 22);
+  messageDesc(file_joko_v1_remote_host, 38);
 
 /**
  * @generated from message joko.v1.ConnectRemoteHostRequest
@@ -688,7 +1096,7 @@ export type ConnectRemoteHostRequest = Message<"joko.v1.ConnectRemoteHostRequest
  * Use `create(ConnectRemoteHostRequestSchema)` to create a new message.
  */
 export const ConnectRemoteHostRequestSchema: GenMessage<ConnectRemoteHostRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_host, 23);
+  messageDesc(file_joko_v1_remote_host, 39);
 
 /**
  * @generated from message joko.v1.ConnectRemoteHostResponse
@@ -705,7 +1113,7 @@ export type ConnectRemoteHostResponse = Message<"joko.v1.ConnectRemoteHostRespon
  * Use `create(ConnectRemoteHostResponseSchema)` to create a new message.
  */
 export const ConnectRemoteHostResponseSchema: GenMessage<ConnectRemoteHostResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_host, 24);
+  messageDesc(file_joko_v1_remote_host, 40);
 
 /**
  * @generated from message joko.v1.DisconnectRemoteHostRequest
@@ -732,7 +1140,7 @@ export type DisconnectRemoteHostRequest = Message<"joko.v1.DisconnectRemoteHostR
  * Use `create(DisconnectRemoteHostRequestSchema)` to create a new message.
  */
 export const DisconnectRemoteHostRequestSchema: GenMessage<DisconnectRemoteHostRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_host, 25);
+  messageDesc(file_joko_v1_remote_host, 41);
 
 /**
  * @generated from message joko.v1.DisconnectRemoteHostResponse
@@ -749,7 +1157,7 @@ export type DisconnectRemoteHostResponse = Message<"joko.v1.DisconnectRemoteHost
  * Use `create(DisconnectRemoteHostResponseSchema)` to create a new message.
  */
 export const DisconnectRemoteHostResponseSchema: GenMessage<DisconnectRemoteHostResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_host, 26);
+  messageDesc(file_joko_v1_remote_host, 42);
 
 /**
  * @generated from message joko.v1.TestRemoteHostConnectionRequest
@@ -776,7 +1184,7 @@ export type TestRemoteHostConnectionRequest = Message<"joko.v1.TestRemoteHostCon
  * Use `create(TestRemoteHostConnectionRequestSchema)` to create a new message.
  */
 export const TestRemoteHostConnectionRequestSchema: GenMessage<TestRemoteHostConnectionRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_host, 27);
+  messageDesc(file_joko_v1_remote_host, 43);
 
 /**
  * @generated from message joko.v1.RemoteHostConnectionTestResult
@@ -803,7 +1211,7 @@ export type RemoteHostConnectionTestResult = Message<"joko.v1.RemoteHostConnecti
  * Use `create(RemoteHostConnectionTestResultSchema)` to create a new message.
  */
 export const RemoteHostConnectionTestResultSchema: GenMessage<RemoteHostConnectionTestResult> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_host, 28);
+  messageDesc(file_joko_v1_remote_host, 44);
 
 /**
  * @generated from message joko.v1.TestRemoteHostConnectionResponse
@@ -820,7 +1228,7 @@ export type TestRemoteHostConnectionResponse = Message<"joko.v1.TestRemoteHostCo
  * Use `create(TestRemoteHostConnectionResponseSchema)` to create a new message.
  */
 export const TestRemoteHostConnectionResponseSchema: GenMessage<TestRemoteHostConnectionResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_host, 29);
+  messageDesc(file_joko_v1_remote_host, 45);
 
 /**
  * @generated from message joko.v1.ClearRemoteHostTrustRequest
@@ -847,7 +1255,7 @@ export type ClearRemoteHostTrustRequest = Message<"joko.v1.ClearRemoteHostTrustR
  * Use `create(ClearRemoteHostTrustRequestSchema)` to create a new message.
  */
 export const ClearRemoteHostTrustRequestSchema: GenMessage<ClearRemoteHostTrustRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_host, 30);
+  messageDesc(file_joko_v1_remote_host, 46);
 
 /**
  * @generated from message joko.v1.ClearRemoteHostTrustResponse
@@ -864,7 +1272,90 @@ export type ClearRemoteHostTrustResponse = Message<"joko.v1.ClearRemoteHostTrust
  * Use `create(ClearRemoteHostTrustResponseSchema)` to create a new message.
  */
 export const ClearRemoteHostTrustResponseSchema: GenMessage<ClearRemoteHostTrustResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_remote_host, 31);
+  messageDesc(file_joko_v1_remote_host, 47);
+
+/**
+ * @generated from enum joko.v1.SshAgentState
+ */
+export enum SshAgentState {
+  /**
+   * @generated from enum value: SSH_AGENT_STATE_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: SSH_AGENT_STATE_READY = 1;
+   */
+  READY = 1,
+
+  /**
+   * @generated from enum value: SSH_AGENT_STATE_UNAVAILABLE = 2;
+   */
+  UNAVAILABLE = 2,
+
+  /**
+   * @generated from enum value: SSH_AGENT_STATE_FAILED = 3;
+   */
+  FAILED = 3,
+}
+
+/**
+ * Describes the enum joko.v1.SshAgentState.
+ */
+export const SshAgentStateSchema: GenEnum<SshAgentState> = /*@__PURE__*/
+  enumDesc(file_joko_v1_remote_host, 0);
+
+/**
+ * @generated from enum joko.v1.SshKeyPassphrasePurpose
+ */
+export enum SshKeyPassphrasePurpose {
+  /**
+   * @generated from enum value: SSH_KEY_PASSPHRASE_PURPOSE_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: SSH_KEY_PASSPHRASE_PURPOSE_GENERATE = 1;
+   */
+  GENERATE = 1,
+
+  /**
+   * @generated from enum value: SSH_KEY_PASSPHRASE_PURPOSE_AGENT_ADD = 2;
+   */
+  AGENT_ADD = 2,
+}
+
+/**
+ * Describes the enum joko.v1.SshKeyPassphrasePurpose.
+ */
+export const SshKeyPassphrasePurposeSchema: GenEnum<SshKeyPassphrasePurpose> = /*@__PURE__*/
+  enumDesc(file_joko_v1_remote_host, 1);
+
+/**
+ * @generated from enum joko.v1.SshInstallShell
+ */
+export enum SshInstallShell {
+  /**
+   * @generated from enum value: SSH_INSTALL_SHELL_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: SSH_INSTALL_SHELL_POSIX = 1;
+   */
+  POSIX = 1,
+
+  /**
+   * @generated from enum value: SSH_INSTALL_SHELL_POWERSHELL = 2;
+   */
+  POWERSHELL = 2,
+}
+
+/**
+ * Describes the enum joko.v1.SshInstallShell.
+ */
+export const SshInstallShellSchema: GenEnum<SshInstallShell> = /*@__PURE__*/
+  enumDesc(file_joko_v1_remote_host, 2);
 
 /**
  * Catalog and management remain usable when a connector is unavailable. This
@@ -928,7 +1419,7 @@ export enum RemoteHostCapabilityKind {
  * Describes the enum joko.v1.RemoteHostCapabilityKind.
  */
 export const RemoteHostCapabilityKindSchema: GenEnum<RemoteHostCapabilityKind> = /*@__PURE__*/
-  enumDesc(file_joko_v1_remote_host, 0);
+  enumDesc(file_joko_v1_remote_host, 3);
 
 /**
  * @generated from enum joko.v1.RemoteHostSource
@@ -954,7 +1445,7 @@ export enum RemoteHostSource {
  * Describes the enum joko.v1.RemoteHostSource.
  */
 export const RemoteHostSourceSchema: GenEnum<RemoteHostSource> = /*@__PURE__*/
-  enumDesc(file_joko_v1_remote_host, 1);
+  enumDesc(file_joko_v1_remote_host, 4);
 
 /**
  * @generated from enum joko.v1.RemoteHostAuthenticationMode
@@ -978,13 +1469,20 @@ export enum RemoteHostAuthenticationMode {
    * @generated from enum value: REMOTE_HOST_AUTHENTICATION_MODE_PRIVATE_KEY = 2;
    */
   PRIVATE_KEY = 2,
+
+  /**
+   * Only this fingerprint-checked node key may authenticate through the agent.
+   *
+   * @generated from enum value: REMOTE_HOST_AUTHENTICATION_MODE_NODE_KEY = 3;
+   */
+  NODE_KEY = 3,
 }
 
 /**
  * Describes the enum joko.v1.RemoteHostAuthenticationMode.
  */
 export const RemoteHostAuthenticationModeSchema: GenEnum<RemoteHostAuthenticationMode> = /*@__PURE__*/
-  enumDesc(file_joko_v1_remote_host, 2);
+  enumDesc(file_joko_v1_remote_host, 5);
 
 /**
  * @generated from enum joko.v1.RemoteHostStatus
@@ -1025,7 +1523,7 @@ export enum RemoteHostStatus {
  * Describes the enum joko.v1.RemoteHostStatus.
  */
 export const RemoteHostStatusSchema: GenEnum<RemoteHostStatus> = /*@__PURE__*/
-  enumDesc(file_joko_v1_remote_host, 3);
+  enumDesc(file_joko_v1_remote_host, 6);
 
 /**
  * Closed, content-free failure taxonomy. Retryability is derived by the
@@ -1108,13 +1606,23 @@ export enum RemoteHostFailureCode {
    * @generated from enum value: REMOTE_HOST_FAILURE_CODE_HOST_KEY_STORE_WRITE_FAILED = 14;
    */
   HOST_KEY_STORE_WRITE_FAILED = 14,
+
+  /**
+   * @generated from enum value: REMOTE_HOST_FAILURE_CODE_NODE_KEY_CHANGED = 15;
+   */
+  NODE_KEY_CHANGED = 15,
+
+  /**
+   * @generated from enum value: REMOTE_HOST_FAILURE_CODE_NODE_KEY_UNAVAILABLE = 16;
+   */
+  NODE_KEY_UNAVAILABLE = 16,
 }
 
 /**
  * Describes the enum joko.v1.RemoteHostFailureCode.
  */
 export const RemoteHostFailureCodeSchema: GenEnum<RemoteHostFailureCode> = /*@__PURE__*/
-  enumDesc(file_joko_v1_remote_host, 4);
+  enumDesc(file_joko_v1_remote_host, 7);
 
 /**
  * @generated from enum joko.v1.RemoteHostChangeKind
@@ -1140,7 +1648,7 @@ export enum RemoteHostChangeKind {
  * Describes the enum joko.v1.RemoteHostChangeKind.
  */
 export const RemoteHostChangeKindSchema: GenEnum<RemoteHostChangeKind> = /*@__PURE__*/
-  enumDesc(file_joko_v1_remote_host, 5);
+  enumDesc(file_joko_v1_remote_host, 8);
 
 /**
  * @generated from enum joko.v1.RemoteHostConnectionTestOutcome
@@ -1166,7 +1674,64 @@ export enum RemoteHostConnectionTestOutcome {
  * Describes the enum joko.v1.RemoteHostConnectionTestOutcome.
  */
 export const RemoteHostConnectionTestOutcomeSchema: GenEnum<RemoteHostConnectionTestOutcome> = /*@__PURE__*/
-  enumDesc(file_joko_v1_remote_host, 6);
+  enumDesc(file_joko_v1_remote_host, 9);
+
+/**
+ * Keys belong to the authenticated service node, never a client-selected path.
+ *
+ * @generated from service joko.v1.SshKeyService
+ */
+export const SshKeyService: GenService<{
+  /**
+   * @generated from rpc joko.v1.SshKeyService.ListSshKeys
+   */
+  listSshKeys: {
+    methodKind: "unary";
+    input: typeof ListSshKeysRequestSchema;
+    output: typeof ListSshKeysResponseSchema;
+  },
+  /**
+   * @generated from rpc joko.v1.SshKeyService.BeginSshKeyPassphraseUpload
+   */
+  beginSshKeyPassphraseUpload: {
+    methodKind: "unary";
+    input: typeof BeginSshKeyPassphraseUploadRequestSchema;
+    output: typeof BeginSshKeyPassphraseUploadResponseSchema;
+  },
+  /**
+   * @generated from rpc joko.v1.SshKeyService.GenerateSshKey
+   */
+  generateSshKey: {
+    methodKind: "unary";
+    input: typeof GenerateSshKeyRequestSchema;
+    output: typeof GenerateSshKeyResponseSchema;
+  },
+  /**
+   * @generated from rpc joko.v1.SshKeyService.AddSshKeyToAgent
+   */
+  addSshKeyToAgent: {
+    methodKind: "unary";
+    input: typeof AddSshKeyToAgentRequestSchema;
+    output: typeof AddSshKeyToAgentResponseSchema;
+  },
+  /**
+   * @generated from rpc joko.v1.SshKeyService.ReadSshPublicKey
+   */
+  readSshPublicKey: {
+    methodKind: "unary";
+    input: typeof ReadSshPublicKeyRequestSchema;
+    output: typeof ReadSshPublicKeyResponseSchema;
+  },
+  /**
+   * @generated from rpc joko.v1.SshKeyService.GetSshKeyInstallCommand
+   */
+  getSshKeyInstallCommand: {
+    methodKind: "unary";
+    input: typeof GetSshKeyInstallCommandRequestSchema;
+    output: typeof GetSshKeyInstallCommandResponseSchema;
+  },
+}> = /*@__PURE__*/
+  serviceDesc(file_joko_v1_remote_host, 0);
 
 /**
  * Authenticated, owner-bound Remote Host catalog and connection control.
@@ -1276,5 +1841,5 @@ export const RemoteHostService: GenService<{
     output: typeof ClearRemoteHostTrustResponseSchema;
   },
 }> = /*@__PURE__*/
-  serviceDesc(file_joko_v1_remote_host, 0);
+  serviceDesc(file_joko_v1_remote_host, 1);
 

@@ -110,6 +110,7 @@ const target: TargetView = {
   backendId: "backend-one",
   name: "Project",
   workspaceId: "workspace-one",
+  revision: 1n,
   workspaceName: "Project",
   trusted: true,
   pinned: false,

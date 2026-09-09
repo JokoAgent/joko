@@ -21,7 +21,7 @@ interface RunCaptureReference {
   readonly baselineId: string;
   readonly changeSetId: string;
   readonly workspaceId: string;
-  readonly dialogueEntryId?: string;
+  readonly dialogueAnchor?: import("@joko/core").NativeNavigationAnchor;
 }
 
 export class DurableWorkspaceRunCapture implements WorkspaceRunCapture {
@@ -42,7 +42,7 @@ export class DurableWorkspaceRunCapture implements WorkspaceRunCapture {
     this.#gitSafety = gitSafety;
   }
 
-  async captureBeforeRun(input: { readonly sessionId: string; readonly runId: string; readonly target: TargetDescriptor; readonly nativeLeafId?: string }): Promise<void> {
+  async captureBeforeRun(input: { readonly sessionId: string; readonly runId: string; readonly target: TargetDescriptor; readonly navigationAnchor?: import("@joko/core").NativeNavigationAnchor }): Promise<void> {
     if (input.target.remoteWorkspace === undefined) {
       await this.#gitSafety?.onTurnStart({
         sessionId: input.sessionId,
@@ -52,12 +52,12 @@ export class DurableWorkspaceRunCapture implements WorkspaceRunCapture {
     }
     if (this.reference(input.sessionId, input.runId) !== undefined) return;
     const workspaceId = workspaceIdFor(this.#store, input.target, input.sessionId);
-    const baseline = await this.#changes.captureBaseline(workspaceId, input.target.workspaceRoot, input.nativeLeafId);
+    const baseline = await this.#changes.captureBaseline(workspaceId, input.target.workspaceRoot, input.navigationAnchor);
     this.#store.setSetting("session", input.sessionId, referenceKey(input.runId), {
       baselineId: baseline.id,
       changeSetId: stableChangeSetId(input.runId),
       workspaceId,
-      ...(input.nativeLeafId === undefined ? {} : { dialogueEntryId: input.nativeLeafId })
+      ...(input.navigationAnchor === undefined ? {} : { dialogueAnchor: input.navigationAnchor })
     } satisfies RunCaptureReference);
   }
 

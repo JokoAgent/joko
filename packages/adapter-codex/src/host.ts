@@ -40,6 +40,9 @@ export interface AppServerHostOptions {
 interface Subscriber {
   readonly generation: number;
   readonly handlers: HostSubscriptionHandlers;
+  historyRevision: bigint;
+  pendingNotifications: number;
+  notificationDrain?: () => void;
 }
 
 interface BufferedNotification {
@@ -76,6 +79,8 @@ export class AppServerHost {
   #bufferedEntries = 0;
   #bufferedBytes = 0;
   #closing = false;
+  #nextHistoryRevision = 0n;
+  readonly #notificationOwners = new WeakMap<RpcNotification, Subscriber>();
 
   constructor(options: AppServerHostOptions = {}) {
     this.#options = {
@@ -110,6 +115,60 @@ export class AppServerHost {
     return this.#transport?.running === true && generation === this.#generation;
   }
 
+  /** Exists only for this exact live root subscription; release removes its authority. */
+  historyRevision(threadId: string, hostGeneration: number): bigint | undefined {
+    const subscriber = this.#subscribers.get(threadId);
+    return this.isActiveGeneration(hostGeneration) && subscriber?.generation === hostGeneration
+      ? subscriber.historyRevision
+      : undefined;
+  }
+
+  /** Pending delivery can contain activity that the Adapter has not observed yet. */
+  hasPendingThreadNotifications(threadId: string, hostGeneration: number): boolean {
+    const subscriber = this.#subscribers.get(threadId);
+    return !this.isActiveGeneration(hostGeneration) || subscriber?.generation !== hostGeneration
+      || subscriber.pendingNotifications !== 0;
+  }
+
+  async waitForThreadNotifications(threadId: string, hostGeneration: number, signal: AbortSignal): Promise<void> {
+    const subscriber = this.#subscribers.get(threadId);
+    if (subscriber === undefined || subscriber.generation !== hostGeneration || !this.isActiveGeneration(hostGeneration)) {
+      throw new TransportFault("process_exited", "The Codex notification owner is no longer active.");
+    }
+    if (subscriber.notificationDrain !== undefined) {
+      throw new TransportFault("protocol_violation", "The Codex notification owner already has a pending history confirmation.");
+    }
+    await new Promise<void>((resolve, reject) => {
+      const check = () => {
+        const error = signal.aborted
+          ? new TransportFault("closed", "The Codex notification wait was cancelled.")
+          : this.#subscribers.get(threadId) !== subscriber || !this.isActiveGeneration(hostGeneration)
+            ? new TransportFault("process_exited", "The Codex notification owner changed while waiting.")
+            : undefined;
+        if (error === undefined && subscriber.pendingNotifications !== 0) return;
+        signal.removeEventListener("abort", check);
+        if (subscriber.notificationDrain === check) subscriber.notificationDrain = undefined;
+        if (error === undefined) resolve();
+        else reject(error);
+      };
+      subscriber.notificationDrain = check;
+      signal.addEventListener("abort", check, { once: true });
+      check();
+    });
+  }
+
+  retainDescendantThreads(rootThreadId: string, hostGeneration: number, retained: ReadonlySet<string>): void {
+    if (!this.isActiveGeneration(hostGeneration) || this.#subscribers.get(rootThreadId)?.generation !== hostGeneration) {
+      throw new TransportFault("process_exited", "The Codex descendant owner changed before history synchronization.");
+    }
+    for (const [threadId, lineage] of this.#descendants) {
+      if (lineage.rootThreadId !== rootThreadId || lineage.generation !== hostGeneration || retained.has(threadId)) continue;
+      this.#descendants.delete(threadId);
+      this.#rememberDetachedThread(threadId);
+      this.#discardBuffered(threadId);
+    }
+  }
+
   async ensureStarted(): Promise<number> {
     if (this.#closing) throw new TransportFault("closed", "The Codex app-server host is closed.");
     if (this.#transport?.running === true && this.#initializeResult !== undefined) return this.#generation;
@@ -124,14 +183,18 @@ export class AppServerHost {
   }
 
   async request(method: string, params: JsonValue | undefined, options: RpcRequestOptions = {}): Promise<HostRequestResult> {
+    if (options.signal?.aborted) throw new TransportFault("closed", "The Codex request was cancelled before host readiness.");
     const generation = await this.ensureStarted();
     const transport = this.#transport;
-    if (transport === undefined || !transport.running || generation !== this.#generation) {
-      throw new TransportFault("process_exited", "The Codex app-server generation changed before request dispatch.", {
-        stateMayHaveChanged: options.mutation
-      });
-    }
-    const value = await transport.request(method, params, options);
+    const beforeDispatch = () => {
+      if (options.signal?.aborted) throw new TransportFault("closed", "The Codex request was cancelled before dispatch.");
+      if (transport === undefined || transport !== this.#transport || !transport.running || generation !== this.#generation) {
+        throw new TransportFault("process_exited", "The Codex app-server generation changed before request dispatch.");
+      }
+      options.beforeDispatch?.();
+    };
+    beforeDispatch();
+    const value = await transport!.request(method, params, { ...options, beforeDispatch });
     if (generation !== this.#generation) {
       throw new TransportFault("process_exited", "The Codex app-server generation changed before the response was accepted.", {
         stateMayHaveChanged: options.mutation
@@ -165,7 +228,7 @@ export class AppServerHost {
       throw new TransportFault("protocol_violation", "A Codex descendant thread already belongs to an active root subscription.");
     }
     this.#detachedThreads.delete(threadId);
-    const subscriber: Subscriber = { generation: expectedHostGeneration, handlers };
+    const subscriber: Subscriber = { generation: expectedHostGeneration, handlers, historyRevision: ++this.#nextHistoryRevision, pendingNotifications: 0 };
     this.#subscribers.set(threadId, subscriber);
     const waiting = this.#takeBuffered(threadId);
     try {
@@ -176,7 +239,8 @@ export class AppServerHost {
         if (item.expiresAt <= Date.now()) {
           throw new TransportFault("buffer_overflow", "A pre-subscription Codex notification expired before it could be applied.");
         }
-        await handlers.onNotification(item.notification.method, item.notification.params);
+        try { await handlers.onNotification(item.notification.method, item.notification.params); }
+        finally { this.#finishNotification(item.notification); }
       }
     } catch (error) {
       if (this.#subscribers.get(threadId) === subscriber) this.#subscribers.delete(threadId);
@@ -190,6 +254,7 @@ export class AppServerHost {
         if (released) return;
         released = true;
         if (this.#subscribers.get(threadId) === subscriber) this.#subscribers.delete(threadId);
+        subscriber.notificationDrain?.();
         const ownedThreadIds = [threadId, ...this.#removeDescendantsForRoot(threadId, expectedHostGeneration)];
         for (const ownedThreadId of ownedThreadIds) {
           this.#rememberDetachedThread(ownedThreadId);
@@ -228,7 +293,14 @@ export class AppServerHost {
     this.#rememberDetachedThread(threadId);
     this.#discardBuffered(threadId);
     if (!this.isActiveGeneration(expectedHostGeneration)) return;
-    await this.request("thread/unsubscribe", { threadId }, { timeoutMs: 5_000 }).catch(() => undefined);
+    const response = await this.request("thread/unsubscribe", { threadId }, { timeoutMs: 5_000 });
+    const value = response.value;
+    if (value === null || typeof value !== "object" || Array.isArray(value)
+      || !["notLoaded", "notSubscribed", "unsubscribed"].includes(String(value["status"]))) {
+      throw new TransportFault("protocol_violation", "Codex did not confirm the derived thread subscription was released.", {
+        stateMayHaveChanged: true
+      });
+    }
   }
 
   async shutdown(): Promise<void> {
@@ -244,6 +316,7 @@ export class AppServerHost {
     this.#closing = true;
     const subscribers = [...this.#subscribers.values()];
     this.#subscribers.clear();
+    for (const subscriber of subscribers) subscriber.notificationDrain?.();
     this.#descendants.clear();
     this.#detachedThreads.clear();
     this.#clearBuffer();
@@ -267,6 +340,7 @@ export class AppServerHost {
     this.#initializeResult = undefined;
     try {
       await transport.start({
+        onNotificationObserved: (notification) => this.#observeNotification(transport, generation, notification),
         onNotification: (notification) => this.#routeNotification(transport, generation, notification),
         onRequest: (request) => this.#routeRequest(transport, generation, request),
         onExit: (fault) => this.#handleExit(transport, generation, fault)
@@ -298,33 +372,65 @@ export class AppServerHost {
     }
   }
 
+  #observeNotification(transport: RpcTransport, generation: number, notification: RpcNotification): void {
+    if (transport !== this.#transport || generation !== this.#generation || !transport.running) return;
+    const threadId = threadIdFromParams(notification.params);
+    if (!validThreadIdentity(threadId)) return;
+    const subscriber = this.#subscribers.get(threadId);
+    if (subscriber?.generation === generation && changesNativeHistory(notification.method)) subscriber.historyRevision = ++this.#nextHistoryRevision;
+    const lineage = this.#descendants.get(threadId);
+    const started = notification.method === "thread/started" ? descendantStartMetadata(notification.params) : undefined;
+    const parent = started === undefined ? undefined : this.#subscribers.get(started.parentThreadId)
+      ?? this.#subscribers.get(this.#descendants.get(started.parentThreadId)?.rootThreadId ?? "");
+    const owner = subscriber ?? (lineage === undefined ? parent : this.#subscribers.get(lineage.rootThreadId));
+    if (owner?.generation === generation) {
+      owner.pendingNotifications++;
+      this.#notificationOwners.set(notification, owner);
+    }
+  }
+
   async #routeNotification(
     transport: RpcTransport,
     generation: number,
     notification: RpcNotification
   ): Promise<void> {
-    if (transport !== this.#transport || generation !== this.#generation) return;
+    let delivered = true;
+    try { delivered = await this.#deliverNotification(transport, generation, notification); }
+    finally { if (delivered) this.#finishNotification(notification); }
+  }
+
+  async #deliverNotification(transport: RpcTransport, generation: number, notification: RpcNotification): Promise<boolean> {
+    if (transport !== this.#transport || generation !== this.#generation) return true;
     if (notification.method === "thread/started") {
       const routed = await this.#routeDescendantStarted(generation, notification.params);
-      if (routed) return;
+      if (routed) return true;
     }
     const threadId = threadIdFromParams(notification.params);
-    if (threadId === undefined) return;
+    if (threadId === undefined) return true;
     const subscriber = this.#subscribers.get(threadId);
     if (subscriber !== undefined && subscriber.generation === generation) {
       await subscriber.handlers.onNotification(notification.method, notification.params);
-      return;
+      return true;
     }
     const lineage = this.#descendants.get(threadId);
     if (lineage !== undefined && lineage.generation === generation) {
       const root = this.#subscribers.get(lineage.rootThreadId);
       if (root !== undefined && root.generation === generation) {
         await root.handlers.onDescendantNotification?.(threadId, notification.method, notification.params);
-        return;
+        return true;
       }
     }
-    if (this.#detachedThreads.has(threadId)) return;
+    if (this.#detachedThreads.has(threadId)) return true;
     this.#bufferNotification(threadId, notification);
+    return false;
+  }
+
+  #finishNotification(notification: RpcNotification): void {
+    const owner = this.#notificationOwners.get(notification);
+    if (owner === undefined) return;
+    this.#notificationOwners.delete(notification);
+    owner.pendingNotifications--;
+    if (owner.pendingNotifications === 0) owner.notificationDrain?.();
   }
 
   async #routeRequest(
@@ -365,6 +471,7 @@ export class AppServerHost {
     for (const [threadId, subscriber] of this.#subscribers) {
       if (subscriber.generation === generation) this.#subscribers.delete(threadId);
     }
+    for (const subscriber of subscribers) subscriber.notificationDrain?.();
     await Promise.allSettled(subscribers.map((subscriber) => subscriber.handlers.onDisconnect(fault)));
   }
 
@@ -410,7 +517,7 @@ export class AppServerHost {
   }
 
   #discardBuffered(threadId: string): void {
-    this.#takeBuffered(threadId);
+    for (const item of this.#takeBuffered(threadId)) this.#finishNotification(item.notification);
   }
 
   #rememberDetachedThread(threadId: string): void {
@@ -424,6 +531,7 @@ export class AppServerHost {
   }
 
   #clearBuffer(): void {
+    for (const items of this.#buffered.values()) for (const item of items) this.#finishNotification(item.notification);
     this.#buffered.clear();
     this.#bufferedEntries = 0;
     this.#bufferedBytes = 0;
@@ -501,15 +609,13 @@ export class AppServerHost {
       if (item.expiresAt <= Date.now()) {
         throw new TransportFault("buffer_overflow", "A pre-lineage Codex notification expired before it could be applied.");
       }
-      if (item.notification.method === "thread/started") {
-        await this.#routeDescendantStarted(subscriber.generation, item.notification.params);
-      } else {
-        await subscriber.handlers.onDescendantNotification?.(
-          childThreadId,
-          item.notification.method,
-          item.notification.params
-        );
-      }
+      try {
+        if (item.notification.method === "thread/started") {
+          await this.#routeDescendantStarted(subscriber.generation, item.notification.params);
+        } else {
+          await subscriber.handlers.onDescendantNotification?.(childThreadId, item.notification.method, item.notification.params);
+        }
+      } finally { this.#finishNotification(item.notification); }
     }
   }
 
@@ -529,6 +635,13 @@ function threadIdFromParams(params: JsonValue): string | undefined {
   if (typeof params["threadId"] === "string" && params["threadId"].length > 0) return params["threadId"];
   if (isJsonObject(params["thread"]) && typeof params["thread"]["id"] === "string") return params["thread"]["id"];
   return undefined;
+}
+
+function changesNativeHistory(method: string): boolean {
+  return method.startsWith("turn/") || method.startsWith("item/")
+    || method === "thread/started" || method === "thread/reverted" || method === "thread/compacted"
+    || method === "thread/deleted" || method === "thread/closed" || method === "thread/status/changed"
+    || method === "thread/name/updated";
 }
 
 function descendantStartMetadata(params: JsonValue): {

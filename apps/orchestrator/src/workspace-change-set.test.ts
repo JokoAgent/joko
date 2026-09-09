@@ -105,15 +105,15 @@ describe("WorkspaceChangeSetService", () => {
     const repository = new MemoryRepository();
     const service = new WorkspaceChangeSetService({ snapshotDirectory: snapshots, repository });
     await service.initialize();
-    const baseline = await service.captureBaseline("workspace", root, "native-leaf-before-run");
+    const baseline = await service.captureBaseline("workspace", root, { target: { kind: "native_entry", entryId: "native-leaf-before-run" }, generation: 1 });
     await writeFile(join(root, "value.txt"), "after");
     const changeSet = await service.captureChangeSet(baseline.id, "session", "run");
-    expect(changeSet.dialogueEntryId).toBe("native-leaf-before-run");
+    expect(changeSet.dialogueAnchor).toEqual({ target: { kind: "native_entry", entryId: "native-leaf-before-run" }, generation: 1 });
     const preview = await service.previewRewind(changeSet.id);
 
     await expect(service.consumeDialogueOnlyRewind(preview.id)).resolves.toMatchObject({
       id: changeSet.id,
-      dialogueEntryId: "native-leaf-before-run"
+      dialogueAnchor: { target: { kind: "native_entry", entryId: "native-leaf-before-run" }, generation: 1 }
     });
     await expect(service.consumeDialogueOnlyRewind(preview.id)).rejects.toThrow(/already consumed/);
     expect(await readFile(join(root, "value.txt"), "utf8")).toBe("after");

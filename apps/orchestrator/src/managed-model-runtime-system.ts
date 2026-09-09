@@ -52,6 +52,7 @@ export async function createManagedModelRuntimeSystem(
   const launcher = new OllamaRuntimeLauncher({ client, dataRoot });
   const providerCoordinator = new LocalModelProviderCoordinator({
     providers: options.providers,
+    backendId: options.providers.nativeAuthenticationBackendId,
     currentOwner: () => activeOwner,
     bindings: new StoreLocalModelProviderBindings(options.store)
   });

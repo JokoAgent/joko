@@ -6,6 +6,8 @@ import {
   CompactSessionOutcome,
   EventCursorSchema,
   InteractionState,
+  NativeNavigationTargetSchema,
+  OperationMutationSchema,
   OperationState,
   OwnerSnapshotScopeSchema,
   PermissionMode,
@@ -16,7 +18,7 @@ import {
   nativeSessionTreeRoots
 } from "@joko/contracts";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
 import {
@@ -52,8 +54,67 @@ describe("session host, durable events, and reconnect semantics", () => {
   let fixture: OrchestratorE2eFixture | undefined;
 
   afterEach(async () => {
-    await fixture?.close();
+    await fixture?.close({ removeRoot: true });
     fixture = undefined;
+  });
+
+  it("fences input at atomic admission and replays accepted input after runtime activation", async () => {
+    fixture = await OrchestratorE2eFixture.start();
+    const paired = await fixture.pair();
+    const { store } = fixture.application;
+    const adapter = fixture.adapter();
+    const created = await submit(paired.clients.operation, paired.connectionId,
+      createSessionMutation({ backendId: adapter.id, targetId: fixture.targetId() }));
+    const sessionId = sessionIdFrom(created);
+    if (created.result?.payload.case !== "session") throw new Error("The create result has no task binding.");
+    const sourceGeneration = created.result.payload.value.nativeBinding!.runtimeGeneration;
+    const source = sendInputMutation(sessionId, sourceGeneration, "prepared before reset");
+    await submit(paired.clients.operation, paired.connectionId, create(OperationMutationSchema, {
+      preconditions: source.preconditions,
+      payload: { case: "resetSession", value: { sessionId } }
+    }));
+    const currentGeneration = BigInt(store.getSession(sessionId).descriptor.binding.generation);
+    expect(currentGeneration).toBeGreaterThan(sourceGeneration);
+    await expect(submit(paired.clients.operation, paired.connectionId, source)).rejects.toMatchObject({ code: Code.Aborted });
+    for (const preconditions of [[], [{ entity: source.preconditions[0]!.entity, expectedGeneration: 0n }],
+      [{ entity: { ...source.preconditions[0]!.entity!, id: "another-task" }, expectedGeneration: currentGeneration }]]) {
+      await expect(submit(paired.clients.operation, paired.connectionId, create(OperationMutationSchema, {
+        preconditions, payload: source.payload
+      }))).rejects.toMatchObject({ code: Code.InvalidArgument });
+    }
+    expect(store.listRuns({ sessionId })).toEqual([]);
+    expect(store.listQueueItems({ sessionId })).toEqual([]);
+    expect(adapter.sendCalls).toEqual([]);
+
+    const operationId = randomUUID();
+    const input = sendInputMutation(sessionId, currentGeneration, "accepted before activation");
+    // Pinning advances revision only; an unrelated edit cannot invalidate this input.
+    await submit(paired.clients.operation, paired.connectionId, pinMutation(sessionId, true));
+    const nativeSend = adapter.send.bind(adapter);
+    let observedCommitted = false;
+    vi.spyOn(adapter, "send").mockImplementation(async (prompt, context) => {
+      expect(store.getOperation(operationId)).toMatchObject({ status: "completed", completionMode: "transactional" });
+      const queue = store.listQueueItems({ sessionId });
+      expect(queue).toHaveLength(1);
+      expect(queue[0]?.operationId).toBe(operationId);
+      const attemptId = queue[0]?.attemptId;
+      if (attemptId === undefined) throw new Error("The admitted queue item has no attempt.");
+      expect(store.getAttempt(attemptId).descriptor.generation).toBe(context.generation);
+      observedCommitted = true;
+      await nativeSend(prompt, context);
+    });
+    const accepted = await submit(paired.clients.operation, paired.connectionId, input, operationId);
+    expect(accepted.state).toBe(OperationState.SUCCEEDED);
+    const runId = queueRunIdFrom(accepted);
+    await waitFor(() => paired.clients.run.getRun({ runId }), (value) => value.run?.state === RunState.SUCCEEDED, "admitted input to complete");
+    expect(observedCommitted).toBe(true);
+    expect(BigInt(store.getSession(sessionId).descriptor.binding.generation)).toBeGreaterThan(currentGeneration);
+    const replay = await submit(paired.clients.operation, paired.connectionId, input, operationId);
+    expect(replay.state).toBe(OperationState.SUCCEEDED);
+    expect(queueRunIdFrom(replay)).toBe(runId);
+    expect(store.listRuns({ sessionId })).toHaveLength(1);
+    expect(store.listQueueItems({ sessionId })).toHaveLength(1);
+    expect(adapter.sendCalls).toHaveLength(1);
   });
 
   it("projects owner/session snapshots and resumes a scoped durable event stream", async () => {
@@ -85,7 +146,7 @@ describe("session host, durable events, and reconnect semantics", () => {
       scope: sessionScope,
       afterCursor: before.snapshot!.resumeCursor
     });
-    await submit(paired.clients.operation, paired.connectionId, sendInputMutation(sessionId, "streamed turn"));
+    await submit(paired.clients.operation, paired.connectionId, sendInputMutation(sessionId, BigInt(fixture!.application.store.getSession(sessionId).descriptor.binding.generation), "streamed turn"));
     const first = await streamed;
     expect(first.identity?.sessionId).toBe(sessionId);
     expect(first.cursor?.sequence).toBeGreaterThan(before.snapshot!.resumeCursor!.sequence);
@@ -94,7 +155,7 @@ describe("session host, durable events, and reconnect semantics", () => {
     await submit(
       paired.clients.operation,
       paired.connectionId,
-      sendInputMutation(sessionId, "native follow-up", QueueDeliveryMode.FOLLOW_UP)
+      sendInputMutation(sessionId, BigInt(fixture!.application.store.getSession(sessionId).descriptor.binding.generation), "native follow-up", QueueDeliveryMode.FOLLOW_UP)
     );
     const second = await resumed;
     expect(second.cursor!.sequence).toBeGreaterThan(first.cursor!.sequence);
@@ -117,6 +178,44 @@ describe("session host, durable events, and reconnect semantics", () => {
     await expect(malformedIterator.next()).rejects.toBeInstanceOf(ConnectError);
   });
 
+  it("replays an adopted native clone after restart and keeps both task bindings independently usable", async () => {
+    fixture = await OrchestratorE2eFixture.start();
+    const paired = await fixture.pair();
+    const sourceId = sessionIdFrom(await submit(
+      paired.clients.operation, paired.connectionId,
+      createSessionMutation({ backendId: fixture.adapter().id, targetId: fixture.targetId(), displayName: "Source" })
+    ));
+    const sourceBinding = fixture.application.store.getSession(sourceId).descriptor.binding;
+    const operationId = randomUUID();
+    const clone = cloneMutation(sourceId);
+    const derivedId = sessionIdFrom(await submit(paired.clients.operation, paired.connectionId, clone, operationId));
+    const derivedBinding = fixture.application.store.getSession(derivedId).descriptor.binding;
+    expect(derivedBinding.opaqueRef).not.toBe(sourceBinding.opaqueRef);
+    const nativeOperation = fixture.application.store.listOperations({ sessionId: derivedId })
+      .find((operation) => operation.kind === "clone_session");
+    if (nativeOperation === undefined) throw new Error("The completed clone has no native operation.");
+    expect(fixture.application.store.findNativeSessionDerivation(nativeOperation.id)).toMatchObject({
+      state: "adopted", sessionId: derivedId, binding: derivedBinding
+    });
+    const rootDirectory = fixture.rootDirectory;
+    await fixture.close({ removeRoot: false });
+    fixture = await OrchestratorE2eFixture.start({ rootDirectory });
+    const clients = fixture.clients(paired.authKey);
+    const cloneNative = vi.spyOn(fixture.adapter(), "clone");
+    const deleteNative = vi.spyOn(fixture.adapter(), "deleteSession");
+    expect(sessionIdFrom(await submit(clients.operation, paired.connectionId, clone, operationId))).toBe(derivedId);
+    expect(cloneNative).not.toHaveBeenCalled();
+    expect(deleteNative).not.toHaveBeenCalled();
+    expect(fixture.application.store.findNativeSessionDerivation(nativeOperation.id)?.state).toBe("adopted");
+    for (const sessionId of [sourceId, derivedId]) {
+      const runId = queueRunIdFrom(await submit(clients.operation, paired.connectionId, sendInputMutation(sessionId, BigInt(fixture!.application.store.getSession(sessionId).descriptor.binding.generation), `Continue ${sessionId}`)));
+      await waitFor(() => clients.run.getRun({ runId }), (value) => value.run?.state === RunState.SUCCEEDED, "independent task to settle");
+    }
+    expect(fixture.application.store.getSession(sourceId).descriptor.binding.opaqueRef).toBe(sourceBinding.opaqueRef);
+    expect(fixture.application.store.getSession(derivedId).descriptor.binding.opaqueRef).toBe(derivedBinding.opaqueRef);
+    expect(fixture.application.store.getSession(derivedId).descriptor.derivationOrigin?.sourceSessionId).toBe(sourceId);
+  });
+
   it("executes prompt, steer, follow-up, abort/retry, tree, derive, compact, export, and interactions through operations", async () => {
     fixture = await OrchestratorE2eFixture.start({ profiles: [{ ...PI_LIKE_PROFILE, streamDelayMs: 300 }] });
     const paired = await fixture.pair();
@@ -132,7 +231,7 @@ describe("session host, durable events, and reconnect semantics", () => {
     await submit(paired.clients.operation, paired.connectionId, renameMutation(sessionId, "Renamed task"));
     await submit(paired.clients.operation, paired.connectionId, pinMutation(sessionId, true));
 
-    const prompt = await submit(paired.clients.operation, paired.connectionId, sendInputMutation(sessionId, "primary"));
+    const prompt = await submit(paired.clients.operation, paired.connectionId, sendInputMutation(sessionId, BigInt(fixture!.application.store.getSession(sessionId).descriptor.binding.generation), "primary"));
     await waitFor(
       async () => adapter.sendCalls.length,
       (value) => value === 1,
@@ -149,12 +248,12 @@ describe("session host, durable events, and reconnect semantics", () => {
     const correction = queueItemFrom(await submit(
       paired.clients.operation,
       paired.connectionId,
-      sendInputMutation(sessionId, "correction", QueueDeliveryMode.FOLLOW_UP)
+      sendInputMutation(sessionId, BigInt(fixture!.application.store.getSession(sessionId).descriptor.binding.generation), "correction", QueueDeliveryMode.FOLLOW_UP)
     ));
     const afterwards = queueItemFrom(await submit(
       paired.clients.operation,
       paired.connectionId,
-      sendInputMutation(sessionId, "afterwards", QueueDeliveryMode.FOLLOW_UP)
+      sendInputMutation(sessionId, BigInt(fixture!.application.store.getSession(sessionId).descriptor.binding.generation), "afterwards", QueueDeliveryMode.FOLLOW_UP)
     ));
 
     const pausedControl = (await paired.clients.queue.getQueueControl({ sessionId })).queueControl;
@@ -217,7 +316,7 @@ describe("session host, durable events, and reconnect semantics", () => {
     expect(adapter.sendCalls.slice(0, 3).map((item) => item.disposition)).toEqual(["prompt", "steer", "follow_up"]);
     expect(adapter.sendCalls.slice(0, 3).map((item) => item.text)).toEqual(["primary", "corrected", "afterwards"]);
 
-    const abortable = await submit(paired.clients.operation, paired.connectionId, sendInputMutation(sessionId, "abort me"));
+    const abortable = await submit(paired.clients.operation, paired.connectionId, sendInputMutation(sessionId, BigInt(fixture!.application.store.getSession(sessionId).descriptor.binding.generation), "abort me"));
     const abortedRunId = queueRunIdFrom(abortable);
     await waitFor(
       async () => adapter.sendCalls.length,
@@ -238,7 +337,15 @@ describe("session host, durable events, and reconnect semantics", () => {
     const tree = await paired.clients.session.getNativeSessionTree({ sessionId });
     expect(tree.tree?.activeEntryId).toBe("root");
     expect(nativeSessionTreeRoots(tree.tree!)[0]?.entryId).toBe("root");
-    await submit(paired.clients.operation, paired.connectionId, navigateMutation(sessionId, "root"));
+    const navigationSource = await paired.clients.session.getSession({ sessionId });
+    const navigationGeneration = navigationSource.session?.version?.generation;
+    if (navigationGeneration === undefined) throw new Error("The navigation source has no generation.");
+    const navigation = await submit(paired.clients.operation, paired.connectionId, navigateMutation(
+      sessionId,
+      create(NativeNavigationTargetSchema, { kind: { case: "nativeEntryId", value: "root" } }),
+      navigationGeneration
+    ));
+    expect(navigation.state).toBe(OperationState.SUCCEEDED);
     const forkSourceMessage = fixture.application.store.findVisibleSessionMessageOrigin({ sessionId });
     expect(forkSourceMessage).toBeDefined();
     if (forkSourceMessage === undefined) throw new Error("No visible durable message was available for the fork boundary.");
@@ -338,7 +445,7 @@ describe("session host, durable events, and reconnect semantics", () => {
     const interactionOperation = await submit(
       paired.clients.operation,
       paired.connectionId,
-      sendInputMutation(sessionId, "[permission]")
+      sendInputMutation(sessionId, BigInt(fixture!.application.store.getSession(sessionId).descriptor.binding.generation), "[permission]")
     );
     const interactionRunId = queueRunIdFrom(interactionOperation);
     const pending = await waitFor(
@@ -384,7 +491,7 @@ describe("session host, durable events, and reconnect semantics", () => {
     const abort = new AbortController();
     const iterator = paired.clients.event.streamEvents({ scope, afterCursor: snapshot.snapshot!.resumeCursor }, { signal: abort.signal })[Symbol.asyncIterator]();
     const pendingEvent = iterator.next();
-    const runOperation = await submit(paired.clients.operation, paired.connectionId, sendInputMutation(sessionId, "continue without UI"));
+    const runOperation = await submit(paired.clients.operation, paired.connectionId, sendInputMutation(sessionId, BigInt(fixture!.application.store.getSession(sessionId).descriptor.binding.generation), "continue without UI"));
     await pendingEvent;
     abort.abort();
     await iterator.return?.();

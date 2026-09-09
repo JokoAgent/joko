@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { JSX } from "react";
 import { AlertTriangle, Copy, ExternalLink, LoaderCircle, ShieldCheck } from "lucide-react";
 import type { AppController } from "../controller.js";
@@ -9,23 +9,53 @@ import { Button, Modal, SelectControl } from "./ui.js";
 
 const TERMINAL_STATES = new Set<ProviderLoginFlowView["state"]>(["completed", "cancelled", "timedOut", "outcomeUnknown", "failed"]);
 
-export function ProviderLoginDialog({ controller, backendId, provider, loginMethods, t, onClose, onCompleted, onBack, onUseApiKey }: {
+interface ProviderLoginDialogProps {
   readonly controller: AppController;
   readonly backendId?: string;
-  readonly provider?: ProviderConfigurationView;
+  readonly provider?: Pick<ProviderConfigurationView, "id" | "name" | "kind">;
   readonly loginMethods?: readonly ProviderLoginMethodView[];
   readonly t: Translator;
   readonly onClose: () => void;
   readonly onCompleted?: (target: { readonly backendId: string; readonly providerId: string }) => void;
   readonly onBack?: () => void;
   readonly onUseApiKey?: () => void;
-}): JSX.Element {
+}
+
+export function ProviderLoginDialog(props: ProviderLoginDialogProps): JSX.Element {
+  const { controller, backendId, provider, loginMethods } = props;
+  const key = JSON.stringify([controller.state.activeProfile?.id, controller.state.activeProfile?.serverId,
+    String(controller.state.snapshot.generation), controller.state.connectionState, backendId, provider?.id, provider?.kind, loginMethods]);
+  const source = useRef({ begin: controller.beginProviderLogin, key, revision: 0 });
+  if (source.current.begin !== controller.beginProviderLogin || source.current.key !== key) {
+    source.current = { begin: controller.beginProviderLogin, key, revision: source.current.revision + 1 };
+  }
+  return <ProviderLoginDialogOwner key={source.current.revision} {...props} />;
+}
+
+function ProviderLoginDialogOwner({ controller, backendId, provider, loginMethods, t, onClose, onCompleted, onBack, onUseApiKey }: ProviderLoginDialogProps): JSX.Element {
   const [method, setMethod] = useState<ProviderLoginMethodView>("oauthBrowser");
   const [flow, setFlow] = useState<ProviderLoginFlowView>();
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
   const [completionAttempt, setCompletionAttempt] = useState(0);
+  const owner = useMemo(() => ({ active: true }), []);
+  const ownerRef = useRef(owner);
+  ownerRef.current = owner;
+  const requestInFlight = useRef(false);
+  const activeFlowRef = useRef<{ flow: ProviderLoginFlowView; controller: AppController } | undefined>(undefined);
+  const current = (source: typeof owner): boolean => source.active && ownerRef.current === source;
+  useLayoutEffect(() => {
+    owner.active = true;
+    return () => {
+      owner.active = false;
+      const active = activeFlowRef.current;
+      activeFlowRef.current = undefined;
+      if (active !== undefined && !TERMINAL_STATES.has(active.flow.state)) {
+        void Promise.resolve().then(() => active.controller.cancelProviderLogin(active.flow.id)).catch(() => undefined);
+      }
+    };
+  }, [owner]);
   const controllerRef = useRef(controller);
   controllerRef.current = controller;
   const onCloseRef = useRef(onClose);
@@ -33,6 +63,7 @@ export function ProviderLoginDialog({ controller, backendId, provider, loginMeth
   const onCompletedRef = useRef(onCompleted);
   onCompletedRef.current = onCompleted;
   const open = provider !== undefined;
+  const connected = controller.state.connectionState === "connected";
   const verificationUri = safeExternalUrl(flow?.verificationUri);
   const terminal = flow !== undefined && TERMINAL_STATES.has(flow.state);
   const methods = useMemo<readonly ProviderLoginMethodView[]>(
@@ -55,7 +86,8 @@ export function ProviderLoginDialog({ controller, backendId, provider, loginMeth
     setInput("");
     setError(undefined);
     setCompletionAttempt(0);
-  }, [backendId, loginMethods, open, provider?.id, provider?.kind]);
+    setBusy(false);
+  }, [owner, open]);
 
   useEffect(() => {
     setInput("");
@@ -66,13 +98,14 @@ export function ProviderLoginDialog({ controller, backendId, provider, loginMeth
     let active = true;
     let inFlight = false;
     const poll = (): void => {
-      if (inFlight) return;
+      if (inFlight || !current(owner)) return;
       inFlight = true;
       void controllerRef.current.getProviderLoginFlow(flow.id).then((next) => {
-        if (!active) return;
+        if (!active || !current(owner)) return;
+        activeFlowRef.current = { flow: next, controller: controllerRef.current };
         setFlow(next);
       }).catch((cause: unknown) => {
-        if (active) setError(errorMessage(cause));
+        if (active && current(owner)) setError(errorMessage(cause));
       }).finally(() => { inFlight = false; });
     };
     const timer = window.setInterval(poll, 1_250);
@@ -80,78 +113,95 @@ export function ProviderLoginDialog({ controller, backendId, provider, loginMeth
       active = false;
       window.clearInterval(timer);
     };
-  }, [busy, flow?.id, flow?.state, terminal]);
+  }, [busy, flow?.id, flow?.state, owner, terminal]);
 
   useEffect(() => {
-    if (!open || flow?.state !== "completed" || backendId === undefined || provider === undefined) return;
+    if (!open || !current(owner) || flow?.state !== "completed" || backendId === undefined || provider === undefined) return;
     let active = true;
     setBusy(true);
     setError(undefined);
     void controllerRef.current.refresh().then(() => {
-      if (!active) return;
+      if (!active || !current(owner)) return;
       setBusy(false);
       const completed = onCompletedRef.current;
       if (completed === undefined) onCloseRef.current();
       else completed({ backendId, providerId: provider.id });
     }).catch((cause: unknown) => {
-      if (!active) return;
+      if (!active || !current(owner)) return;
       setBusy(false);
       setError(errorMessage(cause));
     });
     return () => { active = false; };
-  }, [backendId, completionAttempt, flow?.id, flow?.state, open, provider?.id]);
+  }, [backendId, completionAttempt, flow?.id, flow?.state, open, owner, provider?.id]);
 
   const begin = async (): Promise<void> => {
-    if (backendId === undefined || provider === undefined) return;
+    if (!connected || backendId === undefined || provider === undefined || requestInFlight.current || !current(owner)) return;
+    requestInFlight.current = true;
+    const sourceController = controller;
     setBusy(true);
     setError(undefined);
     try {
-      const next = await controller.beginProviderLogin(backendId, provider.id, method);
+      const next = await sourceController.beginProviderLogin(backendId, provider.id, method);
+      if (!current(owner)) {
+        if (!TERMINAL_STATES.has(next.state)) void Promise.resolve().then(() => sourceController.cancelProviderLogin(next.id)).catch(() => undefined);
+        return;
+      }
+      activeFlowRef.current = { flow: next, controller: sourceController };
       setFlow(next);
       const externalUrl = safeExternalUrl(next.verificationUri);
       if (externalUrl !== undefined) {
-        await controller.openHttpLink(externalUrl, { forceExternal: true });
+        await sourceController.openHttpLink(externalUrl, { forceExternal: true });
       }
     } catch (cause) {
-      setError(errorMessage(cause));
+      if (current(owner)) setError(errorMessage(cause));
     } finally {
-      setBusy(false);
+      if (current(owner)) { requestInFlight.current = false; setBusy(false); }
     }
   };
 
   const submit = async (): Promise<void> => {
-    if (flow?.pendingPrompt === undefined || input.length === 0) return;
+    if (!connected || flow?.pendingPrompt === undefined || input.length === 0 || requestInFlight.current || !current(owner)) return;
+    requestInFlight.current = true;
     setBusy(true);
     setError(undefined);
     try {
       const next = await controller.submitProviderLoginInput(flow, input);
+      if (!current(owner)) return;
+      activeFlowRef.current = { flow: next, controller };
       setInput("");
       setFlow(next);
     } catch (cause) {
-      setInput("");
-      setError(errorMessage(cause));
+      if (current(owner)) {
+        setInput("");
+        setError(errorMessage(cause));
+      }
     } finally {
-      setBusy(false);
+      if (current(owner)) { requestInFlight.current = false; setBusy(false); }
     }
   };
 
   const cancel = async (closeAfter = false): Promise<void> => {
+    if (!current(owner)) return;
+    if (closeAfter) owner.active = false;
     setInput("");
     setError(undefined);
     if (flow !== undefined && !TERMINAL_STATES.has(flow.state)) {
       setBusy(true);
+      activeFlowRef.current = undefined;
       try {
-        setFlow(await controller.cancelProviderLogin(flow.id));
+        const next = await controller.cancelProviderLogin(flow.id);
+        if (current(owner)) setFlow(next);
       } catch (cause) {
-        if (!closeAfter) setError(errorMessage(cause));
+        if (!closeAfter && current(owner)) setError(errorMessage(cause));
       } finally {
-        setBusy(false);
+        if (current(owner)) setBusy(false);
       }
     }
-    if (closeAfter) onClose();
+    if (closeAfter && ownerRef.current === owner) onClose();
   };
 
   const back = async (): Promise<void> => {
+    if (!current(owner)) return;
     if (onBack === undefined) {
       await cancel(true);
       return;
@@ -160,16 +210,19 @@ export function ProviderLoginDialog({ controller, backendId, provider, loginMeth
     setError(undefined);
     if (flow !== undefined && !TERMINAL_STATES.has(flow.state)) {
       setBusy(true);
+      activeFlowRef.current = undefined;
       try {
-        setFlow(await controller.cancelProviderLogin(flow.id));
+        const next = await controller.cancelProviderLogin(flow.id);
+        if (!current(owner)) return;
+        setFlow(next);
       } catch (cause) {
-        setError(errorMessage(cause));
+        if (current(owner)) setError(errorMessage(cause));
         return;
       } finally {
-        setBusy(false);
+        if (current(owner)) setBusy(false);
       }
     }
-    onBack();
+    if (current(owner)) { owner.active = false; onBack(); }
   };
 
   const retry = (): void => {
@@ -195,7 +248,7 @@ export function ProviderLoginDialog({ controller, backendId, provider, loginMeth
       {methods.length > 1 && <label className="field"><span>{t("providerLogin.method")}</span><SelectControl value={method} onChange={(event) => setMethod(event.target.value as ProviderLoginMethodView)}>{methods.map((candidate) => <option value={candidate} key={candidate}>{methodLabel(candidate, t)}</option>)}</SelectControl></label>}
       <p className="provider-login__assurance"><ShieldCheck aria-hidden="true" />{t("providerLogin.noPersistence")}</p>
       {error !== undefined && <p className="provider-login__error" role="alert"><AlertTriangle aria-hidden="true" />{error}</p>}
-      <ProviderFlowFooter>{onUseApiKey !== undefined && <Button disabled={busy} onClick={onUseApiKey}>{t("providerLogin.useApiKey")}</Button>}<Button tone="primary" disabled={busy || methods.length === 0} onClick={() => void begin()}>{busy && <LoaderCircle className="spin" aria-hidden="true" />}{t("providerLogin.start")}</Button></ProviderFlowFooter>
+      <ProviderFlowFooter>{onUseApiKey !== undefined && <Button disabled={busy} onClick={onUseApiKey}>{t("providerLogin.useApiKey")}</Button>}<Button tone="primary" disabled={!connected || busy || methods.length === 0} onClick={() => void begin()}>{busy && <LoaderCircle className="spin" aria-hidden="true" />}{t("providerLogin.start")}</Button></ProviderFlowFooter>
     </div> : <div className="provider-login" aria-live="polite">
       {onBack !== undefined && <p className="provider-login__description">{t("providerLogin.security")}</p>}
       {(!terminal || flow.state === "completed") && <p className="provider-login__description">{stateLabel(flow.state, t)}</p>}

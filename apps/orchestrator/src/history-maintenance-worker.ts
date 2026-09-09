@@ -310,6 +310,7 @@ export function cleanHistoryMaintenanceCopy(
             AND NOT EXISTS (SELECT 1 FROM message_event_tombstones WHERE message_event_tombstones.deletion_operation_id = operations.id)
             AND NOT EXISTS (SELECT 1 FROM session_context_rebuilds WHERE session_context_rebuilds.latest_deletion_operation_id = operations.id)
             AND NOT EXISTS (SELECT 1 FROM session_objectives WHERE session_objectives.pending_operation_id = operations.id)
+            AND NOT EXISTS (SELECT 1 FROM native_session_derivations WHERE native_session_derivations.operation_id = operations.id)
             AND NOT EXISTS (SELECT 1 FROM session_reset_boundaries WHERE session_reset_boundaries.reset_operation_id = operations.id);
       `);
 
@@ -326,9 +327,27 @@ export function cleanHistoryMaintenanceCopy(
                updated_at = MAX(updated_at, ?), revision = ?
          WHERE id = ? AND id IN (SELECT session_id FROM history_targets WHERE status = 'active')
       `);
+      const reservedBinding = database.prepare(`
+        SELECT receipt.operation_id
+        FROM native_session_derivations AS receipt JOIN product_sessions AS session
+          ON session.backend_id = receipt.backend_id
+        WHERE session.id = ? AND receipt.native_opaque_ref = ? COLLATE NOCASE
+          AND receipt.state IN ('recorded', 'cleanup_claimed', 'cleanup_unknown')
+      `);
+      const retainAdoption = database.prepare(`
+        INSERT OR IGNORE INTO native_binding_adoptions(
+          backend_id, native_opaque_ref, session_id, native_session_id,
+          first_generation, adopted_at, revision
+        ) SELECT backend_id, native_opaque_ref, id, native_session_id, generation, ?, ?
+          FROM product_sessions WHERE id = ?
+      `);
       for (const sessionId of activeSessionIds) {
         const replacement = replacementBySession.get(sessionId);
         if (replacement === undefined) throw new Error("Active task history cleanup lacks a fresh native binding.");
+        if (reservedBinding.get(sessionId, replacement.replacement.opaqueRef) !== undefined) {
+          throw new Error("The replacement native binding belongs to an unresolved derivation.");
+        }
+        retainAdoption.run(input.prunedAt, newRevision, sessionId);
         updateActive.run(
           replacement.replacement.opaqueRef,
           nativeBindingFingerprint(replacement.replacement.opaqueRef),
@@ -338,6 +357,7 @@ export function cleanHistoryMaintenanceCopy(
           newRevision,
           sessionId
         );
+        retainAdoption.run(input.prunedAt, newRevision, sessionId);
       }
       database.exec("COMMIT");
       reportProgress("compacting", 60);

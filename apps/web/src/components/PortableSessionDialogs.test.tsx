@@ -3,6 +3,9 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { emptySnapshot, type ArtifactDownloadContext, type PortableSessionExportOutcomeView, type SessionView } from "../model.js";
+import { translate } from "../i18n.js";
+import { PortableSessionDialogHost } from "./PortableSessionDialogHost.js";
 
 import {
   PortableSessionExportDialog,
@@ -69,6 +72,83 @@ afterEach(async () => {
 });
 
 describe("PortableSessionExportDialog", () => {
+  it("keeps import and export host siblings distinct while closed and when their ids stringify equally", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const controller = {
+        cancelPortableSessionImport: vi.fn(), commitPortableSessionImport: vi.fn(),
+        exportPortableSession: vi.fn(), inspectPortableSessionImport: vi.fn(),
+        retryPortableSessionActivation: vi.fn(), unlockPortableSessionImport: vi.fn()
+      };
+      const host = document.body.appendChild(document.createElement("div"));
+      const root = createRoot(host);
+      roots.push(root);
+      const element = (open: boolean) => <PortableSessionDialogHost
+        controller={controller}
+        snapshot={emptySnapshot()}
+        locale="en"
+        t={(key, values) => translate("en", key, values)}
+        exportSession={open ? { id: "7", name: "Exported task" } as SessionView : undefined}
+        importRequest={open ? { id: 7 } : undefined}
+        worktreeSupportedTargetIds={new Set()}
+        onCloseExport={vi.fn()} onCloseImport={vi.fn()} onExported={vi.fn()} onOpenTask={vi.fn()}
+      />;
+      await act(async () => root.render(element(false)));
+      expect(host.querySelectorAll(".portable-session-dialog")).toHaveLength(0);
+      await act(async () => root.render(element(true)));
+      expect(host.querySelectorAll(".portable-session-dialog--export")).toHaveLength(1);
+      expect(host.querySelectorAll(".portable-session-dialog--import")).toHaveLength(1);
+      await act(async () => root.render(element(false)));
+      expect(host.querySelectorAll(".portable-session-dialog")).toHaveLength(0);
+      expect(error).not.toHaveBeenCalled();
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it("retires a pending export across connection ABA and closing, and keeps cancellation in the current dialog", async () => {
+    const attempts: { readonly context: ArtifactDownloadContext; readonly result: ReturnType<typeof deferred<PortableSessionExportOutcomeView>> }[] = [];
+    const onExport = vi.fn((_options, context: ArtifactDownloadContext) => {
+      const result = deferred<PortableSessionExportOutcomeView>();
+      attempts.push({ context, result });
+      return result.promise;
+    });
+    const onExported = vi.fn();
+    const onClose = vi.fn();
+    const firstConnection = {};
+    let connection = firstConnection;
+    let open = true;
+    const host = document.body.appendChild(document.createElement("div"));
+    const root = createRoot(host);
+    roots.push(root);
+    const renderCurrent = () => act(async () => root.render(<PortableSessionExportDialog open={open} labels={labels} connectionOwner={connection} onClose={onClose} onExport={onExport} onExported={onExported} />));
+    await renderCurrent();
+    await act(async () => { buttonWithText(host, "Export").click(); buttonWithText(host, "Export").click(); });
+    expect(onExport).toHaveBeenCalledTimes(1);
+    expect(attempts[0]!.context.ownerDocument).toBe(document);
+    await renderCurrent();
+    expect(attempts[0]!.context.signal.aborted).toBe(false);
+    connection = {};
+    await renderCurrent();
+    connection = firstConnection;
+    await renderCurrent();
+    expect(attempts[0]!.context.signal.aborted).toBe(true);
+    await act(async () => buttonWithText(host, "Export").click());
+    await act(async () => attempts[0]!.result.resolve({ status: "exported", fidelity: "full" }));
+    expect(onClose).not.toHaveBeenCalled();
+    expect(onExported).not.toHaveBeenCalled();
+    expect(buttonWithText(host, "Export").disabled).toBe(true);
+    await act(async () => attempts[1]!.result.resolve({ status: "cancelled" }));
+    expect(buttonWithText(host, "Export").disabled).toBe(false);
+    expect(onClose).not.toHaveBeenCalled();
+    await act(async () => buttonWithText(host, "Export").click());
+    open = false;
+    await renderCurrent();
+    expect(attempts[2]!.context.signal.aborted).toBe(true);
+    await act(async () => attempts[2]!.result.resolve({ status: "exported", fidelity: "full" }));
+    expect(onExported).not.toHaveBeenCalled();
+  });
+
   it("validates encryption and retries an oversized export without media", async () => {
     const onExport = vi.fn()
       .mockResolvedValueOnce({ status: "oversize", mediaBytes: 12 * 1024 * 1024, limitBytes: 10 * 1024 * 1024 })
@@ -80,6 +160,7 @@ describe("PortableSessionExportDialog", () => {
       labels={labels}
       onClose={onClose}
       onExport={onExport}
+      connectionOwner={onExport}
       onExported={onExported}
     />);
 
@@ -93,10 +174,10 @@ describe("PortableSessionExportDialog", () => {
     await change(required(inputs[1]), "secret");
     await act(async () => buttonWithText(container, "Export").click());
 
-    expect(onExport).toHaveBeenNthCalledWith(1, { password: "secret", excludeMedia: false });
+    expect(onExport).toHaveBeenNthCalledWith(1, { password: "secret", excludeMedia: false }, { ownerDocument: document, signal: expect.any(AbortSignal) });
     expect(container.textContent).toContain("12 MB of media cannot fit.");
     await act(async () => buttonWithText(container, "Export without media").click());
-    expect(onExport).toHaveBeenNthCalledWith(2, { password: "secret", excludeMedia: true });
+    expect(onExport).toHaveBeenNthCalledWith(2, { password: "secret", excludeMedia: true }, { ownerDocument: document, signal: expect.any(AbortSignal) });
     expect(onExported).toHaveBeenCalledWith("partial");
     expect(onClose).toHaveBeenCalledOnce();
   });

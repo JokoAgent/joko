@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ArtifactDownloadButton } from "./ArtifactDownloadButton.js";
+import { UsageHistorySection } from "./UsageHistorySection.js";
 import type { CSSProperties, JSX, KeyboardEvent as ReactKeyboardEvent, ReactNode } from "react";
 import { capabilityNames } from "@joko/contracts";
 import {
@@ -40,6 +42,7 @@ import {
   X
 } from "lucide-react";
 import type { AppController } from "../controller.js";
+import { LINK_OPEN_DEFAULTS, type LinkOpenKind, type LinkOpenPreference } from "../local-state.js";
 import { currentAppShortcutPlatform } from "../app-shortcuts.js";
 import { composerVoiceShortcutsConflict } from "../composer-voice-shortcut-conflict.js";
 import { isConversationModel } from "../model-capabilities.js";
@@ -50,19 +53,25 @@ import type { RunAction, Translator } from "./types.js";
 import { Button, ErrorBanner, IconButton, Modal, ModalBackButton, Pill, SegmentedControl, Spinner, StatusDot, Tip, cx, formatRelativeTime, CheckboxControl, SelectControl, SwitchControl } from "./ui.js";
 import { ProviderLoginDialog } from "./ProviderLoginDialog.js";
 import { ProviderMark } from "./ProviderMark.js";
+import { ProviderEditor } from "./ProviderEditor.js";
 import { ProviderFlowBackButton, ProviderFlowFooter, ProviderWizardProgress } from "./ProviderFlow.js";
 import { AppShortcutsSettings } from "./AppShortcutsSettings.js";
 import { DesktopAutoRelaunchSetting } from "./DesktopAutoRelaunchSetting.js";
+import { DesktopMainWindowCloseSetting } from "./DesktopMainWindowCloseSetting.js";
 import { DesktopBetaChannelSetting } from "./DesktopBetaChannelSetting.js";
 import { PersonalizationMemorySettings } from "./PersonalizationMemorySettings.js";
 import { PromptRecommendationCell } from "./PromptRecommendationCell.js";
 import { SilentEncryptedRetryCell } from "./SilentEncryptedRetryCell.js";
 import { SessionRuntimeFallbackCell } from "./SessionRuntimeFallbackCell.js";
 import { VisionBridgeSection } from "./VisionBridgeSection.js";
+import { AuxiliaryTextModelSection } from "./AuxiliaryTextModelSection.js";
+import { SubagentModelSection } from "./SubagentModelSection.js";
 import { AutomationSettings } from "./AutomationSettings.js";
 import { VoiceInputSettings } from "./VoiceInputSettings.js";
+import { TerminalShellSettings } from "./TerminalShellSettings.js";
 import { RuntimeProcessMonitor } from "./RuntimeProcessMonitor.js";
 import { RemoteHostsSettings } from "./RemoteHostsSettings.js";
+import { SshKeySettings } from "./SshKeySettings.js";
 import { ModelPicker } from "./ModelPicker.js";
 import { ModelPriceOverrideDialog, type ModelPriceVariant } from "./ModelPriceOverrideDialog.js";
 import { PiPackagesSection } from "./PiPackagesSection.js";
@@ -77,7 +86,7 @@ import { DeviceControlSettings } from "./DeviceControlSettings.js";
 import { NativeTaskStatusSettings } from "./NativeTaskStatusSettings.js";
 import { McpServerEditor } from "./McpServerEditor.js";
 import { ProviderOrderList } from "./ProviderOrderList.js";
-import { sha256Hex } from "../web-crypto.js";
+import { randomUuid, sha256Hex } from "../web-crypto.js";
 import { moveTablistSelection } from "./tablist-navigation.js";
 import { resolveNewSessionExecutionOptions } from "./new-session-options.js";
 import { advertisedPermissionModes, planModeSupported } from "./backend-control-capabilities.js";
@@ -276,7 +285,7 @@ export function SettingsPage({ controller, snapshot, activeTargetId, locale, t, 
             {section === "shortcuts" && <AppShortcutsSettings controller={controller} overrides={controller.state.preferences.appShortcutOverrides} t={t} />}
             {section === "voice" && <VoiceInputSettings controller={controller} t={t} />}
             {section === "taskStatus" && <><SettingsHeading title={t("settings.nativeTaskStatus.title")} body={t("settings.nativeTaskStatus.body")} /><NativeTaskStatusSettings t={t} showHeading={false} /></>}
-            {section === "connections" && <><SettingsHeading title={t("settings.connections")} body={t("settings.connectionsBody")} /><SettingsPageSection id="connections"><ConnectionSettings controller={controller} snapshot={snapshot} locale={locale} t={t} runAction={runAction} showHeading={false} /></SettingsPageSection><SettingsPageSection id="remoteHosts"><RemoteHostsSettings controller={controller} snapshot={snapshot} activeTargetId={activeTargetId} runAction={runAction} t={t} /></SettingsPageSection></>}
+            {section === "connections" && <><SettingsHeading title={t("settings.connections")} body={t("settings.connectionsBody")} /><SettingsPageSection id="connections"><ConnectionSettings controller={controller} snapshot={snapshot} locale={locale} t={t} runAction={runAction} showHeading={false} /></SettingsPageSection><SettingsPageSection id="remoteHosts"><RemoteHostsSettings controller={controller} snapshot={snapshot} activeTargetId={activeTargetId} runAction={runAction} t={t} /></SettingsPageSection><SshKeySettings controller={controller} t={t} /></>}
             {section === "providers" && <SettingsPageSection id="providers"><ProviderSettings controller={controller} snapshot={snapshot} runAction={runAction} onSuccess={showSuccess} initialView={subsection === "credentials" ? "credentials" : undefined} t={t} /></SettingsPageSection>}
             {section === "tools" && <><SettingsHeading title={t("settings.toolPolicies.nav")} body={t("settings.toolsBody")} /><SettingsPageSection id="tools"><SettingsSectionHeading title={t("settings.toolPolicies.title")} body={t("settings.toolPolicies.body")} /><ToolPolicySettings controller={controller} snapshot={snapshot} activeTargetId={activeTargetId} runAction={runAction} showHeading={false} t={t} /></SettingsPageSection><SettingsPageSection id="mcp"><McpSettings controller={controller} snapshot={snapshot} runAction={runAction} t={t} /></SettingsPageSection></>}
             {section === "automation" && <AutomationSettings controller={controller} snapshot={snapshot} activeTargetId={activeTargetId} runAction={runAction} onSuccess={showSuccess} t={t} />}
@@ -515,7 +524,7 @@ export function AppearanceSettings({ controller, locale, theme, onSuccess, onOpe
         {themeSave.error !== undefined && <ErrorBanner message={themeSave.error} dismissLabel={t("common.dismiss")} onClose={themeSave.dismissError} />}
         <div className="setting-row">
           <div><strong>{t("settings.locale")}</strong><span>{t("settings.localeBody")}</span>{localeSave.pending && <span role="status">{t("common.working")}</span>}</div>
-          <SelectControl value={locale} disabled={localeSave.pending} aria-busy={localeSave.pending} onChange={(event) => saveLocale(event.target.value as Locale)} aria-label={t("settings.locale")}><option value="en">English</option><option value="zh-CN">简体中文</option><option value="en-XA">Pseudo · en-XA</option></SelectControl>
+          <SelectControl value={locale} disabled={localeSave.pending} aria-busy={localeSave.pending} onChange={(event) => saveLocale(event.target.value as Locale)} aria-label={t("settings.locale")}><option value="en">{t("language.en")}</option><option value="zh-CN">{t("language.zh-CN")}</option><option value="en-XA">{t("language.en-XA")}</option></SelectControl>
         </div>
         {localeSave.error !== undefined && <ErrorBanner message={localeSave.error} dismissLabel={t("common.dismiss")} onClose={localeSave.dismissError} />}
         <button type="button" className="setting-row settings-row-link" onClick={onOpenPi}>
@@ -740,6 +749,7 @@ export function GeneralSettings({ controller, snapshot, runAction, onSuccess, sh
             onChange={(event) => void changeKeepAwake(event.target.checked)}
           />
       </div>
+      <DesktopMainWindowCloseSetting t={t} />
       {activationClickAvailable && <div className="setting-row">
         <div>
           <strong><MousePointerClick aria-hidden="true" />{t("settings.activationClick")}</strong>
@@ -1137,7 +1147,7 @@ export function TaskImportSettings({ controller, snapshot, onImportPortable, run
               const defaults = activeSnapshot.settings.backendSettings.find((candidate) => candidate.backendId === backend?.id);
               const execution = resolveNewSessionExecutionOptions(backend, activeSnapshot.models, "");
               const desiredPermission = defaults?.permissionMode ?? activeSnapshot.settings.policy.defaultMode;
-              const sessionId = await controllerRef.current.createSession({
+              const { sessionId } = await controllerRef.current.createSession({
                 targetId: runtimeTarget.targetId,
                 name: candidate.title?.trim() || candidate.id,
                 nativeStart: { kind: "attach", reference: candidate.reference },
@@ -2002,8 +2012,6 @@ export function PersonalizationSettings({ controller, snapshot, runAction, onSuc
   const [promptPending, setPromptPending] = useState(false);
   const [enabled, setEnabled] = useState(settings.semanticIndexEnabled);
   const [pending, setPending] = useState(false);
-  const [linkPreference, setLinkPreference] = useState(controller.state.preferences.linkOpenPreference);
-  const [linkPending, setLinkPending] = useState(false);
   const [streamFadeEnabled, setStreamFadeEnabled] = useState(controller.state.preferences.streamFadeEnabled);
   const [streamFadePending, setStreamFadePending] = useState(false);
   const [messageNavRailEnabled, setMessageNavRailEnabled] = useState(controller.state.preferences.messageNavRailEnabled);
@@ -2015,7 +2023,6 @@ export function PersonalizationSettings({ controller, snapshot, runAction, onSuc
   const thresholdTimer = useRef<number | undefined>(undefined);
   useEffect(() => setPromptDraft(savedPrompt), [savedPrompt]);
   useEffect(() => setEnabled(settings.semanticIndexEnabled), [settings.semanticIndexEnabled]);
-  useEffect(() => setLinkPreference(controller.state.preferences.linkOpenPreference), [controller.state.preferences.linkOpenPreference]);
   useEffect(() => setStreamFadeEnabled(controller.state.preferences.streamFadeEnabled), [controller.state.preferences.streamFadeEnabled]);
   useEffect(() => setMessageNavRailEnabled(controller.state.preferences.messageNavRailEnabled), [controller.state.preferences.messageNavRailEnabled]);
   useEffect(() => setThreshold(authoritativeThreshold), [authoritativeThreshold]);
@@ -2113,23 +2120,6 @@ export function PersonalizationSettings({ controller, snapshot, runAction, onSuc
       }
     });
   };
-  const updateLinkPreference = (next: "sidebar" | "external", reset = false): void => {
-    if (linkPending) return;
-    const previous = linkPreference;
-    setLinkPreference(next);
-    setLinkPending(true);
-    runAction(reset ? "link-open:reset" : `link-open:${next}`, async () => {
-      try {
-        if (reset) await controller.resetLinkOpenPreference();
-        else await controller.setLinkOpenPreference(next);
-      } catch (error) {
-        setLinkPreference(previous);
-        throw error;
-      } finally {
-        setLinkPending(false);
-      }
-    });
-  };
   const updateStreamFade = (next: boolean, reset = false): void => {
     if (streamFadePending) return;
     const previous = streamFadeEnabled;
@@ -2168,6 +2158,7 @@ export function PersonalizationSettings({ controller, snapshot, runAction, onSuc
   const promptCanSave = promptDraft !== savedPrompt && !promptOverLimit && !promptPending;
   return (
     <div className="personalization-settings">
+      <TerminalShellSettings controller={controller} t={t} />
       <section className="personalization-section" aria-labelledby="personalization-prompt-heading">
         <div className="personalization-section__heading personalization-section__heading--actions"><h2 id="personalization-prompt-heading">{t("settings.personalization")}</h2><DefaultOverrideControls customized={savedPrompt.length > 0} disabled={promptPending} t={t} onReset={resetPrompt} /></div>
         <div className="personalization-card personalization-prompt-card">
@@ -2195,6 +2186,9 @@ export function PersonalizationSettings({ controller, snapshot, runAction, onSuc
       <PersonalizationMemorySettings controller={controller} snapshot={snapshot} runAction={runAction} onSuccess={onSuccess} t={t} />
 
       <VisionBridgeSection controller={controller} snapshot={snapshot} runAction={runAction} t={t} />
+
+      <AuxiliaryTextModelSection controller={controller} snapshot={snapshot} t={t} />
+      <SubagentModelSection controller={controller} snapshot={snapshot} t={t} />
 
       {piSettings !== undefined && <section className="personalization-section" aria-labelledby="personalization-compaction-heading">
         <div className="personalization-section__heading">
@@ -2238,15 +2232,9 @@ export function PersonalizationSettings({ controller, snapshot, runAction, onSuc
           <p>{t("settings.linkOpen.description")}</p>
         </div>
         <div className="personalization-card personalization-link-card">
-          <div className="personalization-card__title-row">
-            <strong>{t("settings.linkOpen.label")}</strong>
-            <DefaultOverrideControls customized={linkPreference !== "sidebar"} disabled={linkPending} t={t} onReset={() => updateLinkPreference("sidebar", true)} />
-          </div>
+          <LinkOpenSettingRow kind="web" controller={controller} runAction={runAction} t={t} />
+          <LinkOpenSettingRow kind="local" controller={controller} runAction={runAction} t={t} />
           <p>{t("settings.linkOpen.cardDescription")}</p>
-          <div className="personalization-segmented" role="radiogroup" aria-label={t("settings.linkOpen.aria")}>
-            <button type="button" role="radio" aria-checked={linkPreference === "sidebar"} className={linkPreference === "sidebar" ? "is-active" : ""} disabled={linkPending} onClick={() => updateLinkPreference("sidebar")}>{t("settings.linkOpen.sidebar")}</button>
-            <button type="button" role="radio" aria-checked={linkPreference === "external"} className={linkPreference === "external" ? "is-active" : ""} disabled={linkPending} onClick={() => updateLinkPreference("external")}>{t("settings.linkOpen.external")}</button>
-          </div>
         </div>
       </section>
 
@@ -2303,6 +2291,45 @@ export function PersonalizationSettings({ controller, snapshot, runAction, onSuc
   );
 }
 
+function LinkOpenSettingRow({ kind, controller, runAction, t }: {
+  readonly kind: LinkOpenKind;
+  readonly controller: AppController;
+  readonly runAction: RunAction;
+  readonly t: Translator;
+}): JSX.Element {
+  const saved = kind === "web" ? controller.state.preferences.webLinkOpenPreference : controller.state.preferences.localLinkOpenPreference;
+  const [preference, setPreference] = useState(saved);
+  const [pending, setPending] = useState(false);
+  useEffect(() => setPreference(saved), [saved]);
+  const update = (next: LinkOpenPreference, reset = false): void => {
+    if (pending) return;
+    const previous = preference;
+    setPreference(next);
+    setPending(true);
+    runAction(`link-open:${kind}:${reset ? "reset" : next}`, async () => {
+      try {
+        if (reset) await controller.resetLinkOpenPreference(kind);
+        else await controller.setLinkOpenPreference(kind, next);
+      } catch (error) {
+        setPreference(previous);
+        throw error;
+      } finally {
+        setPending(false);
+      }
+    });
+  };
+  return <div className="personalization-link-row" aria-busy={pending}>
+    <div className="personalization-card__title-row">
+      <strong>{t(`settings.linkOpen.${kind}.label`)}</strong>
+      <DefaultOverrideControls customized={preference !== LINK_OPEN_DEFAULTS[kind]} disabled={pending} t={t} onReset={() => update(LINK_OPEN_DEFAULTS[kind], true)} />
+    </div>
+    <p>{t(`settings.linkOpen.${kind}.description`)}</p>
+    <div className="personalization-segmented" role="radiogroup" aria-label={t(`settings.linkOpen.${kind}.aria`)}>
+      {(["sidebar", "external"] as const).map((destination) => <button key={destination} type="button" role="radio" aria-checked={preference === destination} className={preference === destination ? "is-active" : ""} disabled={pending} onClick={() => update(destination)}>{t(`settings.linkOpen.${destination}`)}</button>)}
+    </div>
+  </div>;
+}
+
 function DefaultOverrideControls({ customized, disabled, t, onReset }: {
   readonly customized: boolean;
   readonly disabled?: boolean;
@@ -2319,7 +2346,8 @@ function personalizationSuccessMessage(action: string, t: Translator): string | 
   if (action === "personalization-prompt:reset"
     || action === "vision-bridge-target-reset"
     || action === "pi-auto-compact-threshold:reset"
-    || action === "link-open:reset"
+    || action === "link-open:web:reset"
+    || action === "link-open:local:reset"
     || action === "stream-fade:reset"
     || action === "message-nav-rail:reset"
     || action === "prompt-recommendation:reset"
@@ -2572,6 +2600,7 @@ export function ProviderSettings({ controller, snapshot, runAction, onSuccess, i
     : providerApiKeyAlternative(snapshot, availableProviders, loginTarget);
   const selectedProvider = selectedProviderEntry?.provider;
   const effectiveSelectedItem = selectedItem === "credentials"
+      || selectedItem === "usage"
       || selectedProviderEntry !== undefined
       || (selectedProviderId !== undefined && selectedProviderId === pendingProviderSelection)
     ? selectedItem
@@ -2690,7 +2719,7 @@ export function ProviderSettings({ controller, snapshot, runAction, onSuccess, i
       ? relatedProviderRuntimes
       : selectedProviderEntry.runtime === undefined ? [] : [selectedProviderEntry.runtime];
     if (enabled && providerConfigurationEditable(selectedProviderEntry.provider) && !selectedProviderEntry.provider.enabled) {
-      await controller.saveProvider({ ...providerDraft(selectedProviderEntry.provider), enabled: true });
+      await controller.saveProvider({ ...selectedProviderEntry.provider, enabled: true });
     }
     if (runtimes.length > 0) {
       await Promise.all(runtimes.map((runtime) => controller.updateBackendSettings(runtime.backendId, {
@@ -2699,7 +2728,7 @@ export function ProviderSettings({ controller, snapshot, runAction, onSuccess, i
       return;
     }
     if (providerConfigurationEditable(selectedProviderEntry.provider)) {
-      await controller.saveProvider({ ...providerDraft(selectedProviderEntry.provider), enabled });
+      await controller.saveProvider({ ...selectedProviderEntry.provider, enabled });
     }
   };
   const priceVariants = useMemo<readonly ModelPriceVariant[]>(() => {
@@ -2713,7 +2742,7 @@ export function ProviderSettings({ controller, snapshot, runAction, onSuccess, i
       label: backendNames.get(candidate.backendId) ?? candidate.backendId
     }));
   }, [priceModel, selectedProviderEntry?.id, snapshot.backends, snapshot.models, snapshot.providers]);
-  const authState = providerRuntime?.authenticationState ?? (selectedProvider?.keyless ? "notRequired" : "unknown");
+  const authState = providerRuntime?.authenticationState ?? (selectedProvider !== undefined && selectedProvider.runtimes.length > 0 && selectedProvider.runtimes.every((runtime) => runtime.keyless) ? "notRequired" : "unknown");
   return <div className="provider-settings-page">
     <SettingsHeading title={t("settings.providers")} body={t("settings.providersBody")} />
     <section className={cx("provider-workbench", mobileDetailOpen && "provider-workbench--mobile-detail")}>
@@ -2733,7 +2762,7 @@ export function ProviderSettings({ controller, snapshot, runAction, onSuccess, i
             renderItem={(entry) => {
               const provider = entry.provider;
               const runtime = entry.runtime;
-              const state = runtime?.authenticationState ?? (provider.keyless ? "notRequired" : "unknown");
+              const state = runtime?.authenticationState ?? (provider.runtimes.length > 0 && provider.runtimes.every((item) => item.keyless) ? "notRequired" : "unknown");
               const enabled = providerSettingsEntryEnabled(snapshot, entry);
               return <button type="button" className={cx("provider-master-row", selectedProviderEntry?.id === entry.id && "is-active", !enabled && "is-disabled")} aria-current={selectedProviderEntry?.id === entry.id ? "true" : undefined} onClick={() => selectProviderItem(`provider:${entry.id}`)}>
                 <span className="provider-master-row__icon" aria-hidden="true"><ProviderMark providerId={provider.id} name={provider.name} /></span>
@@ -2758,6 +2787,7 @@ export function ProviderSettings({ controller, snapshot, runAction, onSuccess, i
             <p className="provider-master__group-label">{t("settings.credentials")}</p>
             <button type="button" className={cx("provider-master-row", selectedItem === "credentials" && "is-active")} aria-current={selectedItem === "credentials" ? "true" : undefined} onClick={() => selectProviderItem("credentials")}><span className="provider-master-row__icon"><KeyRound aria-hidden="true" /></span><span><strong>{t("settings.credentials")}</strong><small>{t("settings.credentialCount", { count: snapshot.settings.credentials.length })}</small></span><ChevronRight aria-hidden="true" /></button>
           </>}
+          <button type="button" className={cx("provider-master-row", selectedItem === "usage" && "is-active")} aria-current={selectedItem === "usage" ? "true" : undefined} onClick={() => selectProviderItem("usage")}><span className="provider-master-row__icon"><Database aria-hidden="true" /></span><span><strong>{t("usage.title")}</strong></span><ChevronRight aria-hidden="true" /></button>
           {orderedProviders.length === 0 && detectedProviders.length === 0 && <p className="provider-master__empty">{t("settings.noProviders")}</p>}
         </div>
         {orderedProviders.length > 0 && pickerOwnerId === undefined && <p className="provider-master__warning" role="status">{t("settings.providerOrderUnavailable")}</p>}
@@ -2765,7 +2795,7 @@ export function ProviderSettings({ controller, snapshot, runAction, onSuccess, i
       </aside>
       <div className="provider-detail">
         <button type="button" className="provider-detail__mobile-back" onClick={closeMobileProviderDetail}><ArrowLeft aria-hidden="true" />{t("settings.providersBack")}</button>
-        {selectedItem === "credentials" ? <CredentialVaultPanel controller={controller} snapshot={snapshot} runAction={runAction} onAdd={() => setCredentialEditorOpen(true)} t={t} /> : selectedProvider !== undefined ? <>
+        {selectedItem === "usage" ? <UsageHistorySection controller={controller} t={t} /> : selectedItem === "credentials" ? <CredentialVaultPanel controller={controller} snapshot={snapshot} runAction={runAction} onAdd={() => setCredentialEditorOpen(true)} t={t} /> : selectedProvider !== undefined ? <>
           <header className={cx("provider-detail__header", selectedImageCredentialSurfaces.length > 0 && "has-detail")}>
             <div className="provider-detail__top-row">
               <div className="provider-detail__identity"><span className="provider-detail__icon" aria-hidden="true"><ProviderMark providerId={selectedProvider.id} name={selectedProvider.name} /></span><span><span className="provider-detail__title"><strong>{selectedProvider.name}</strong><Pill className="provider-detail__model-count">{providerModelCountLabel(logicalProviderModelCount, t)}</Pill>{providerRuntime?.kind === "subscription" && <Pill className="provider-detail__tag">{t("settings.providerSubscription", { product: providerRuntime.accessProduct ?? selectedProvider.name })}</Pill>}{!selectedProviderEnabled && <Pill className="provider-detail__tag">{t("settings.providerDisabled")}</Pill>}{providerConfigurationEditable(selectedProvider) && <Pill className="provider-detail__tag">{t("settings.customEndpoint")}</Pill>}</span><small>{providerDetailSubtitle(selectedProviderEntry!, t)}</small></span></div>
@@ -2824,7 +2854,7 @@ export function ProviderSettings({ controller, snapshot, runAction, onSuccess, i
       </div>
     </section>
     <ProviderAddWizard open={addWizardOpen} providers={availableProviders} runtimes={availableModelRuntimes} t={t} onClose={() => setAddWizardOpen(false)} onChoose={(entry) => { setAddWizardOpen(false); selectProviderItem(`provider:${entry.id}`); setLoginFromAddWizard(true); setLoginTarget(entry); }} onChooseRuntime={(runtimeId) => { setAddWizardOpen(false); setRuntimeOnboardingId(runtimeId); }} onCustom={() => { setAddWizardOpen(false); setEditor("new"); }} />
-    <ProviderEditor open={editor !== undefined} provider={editor === "new" ? undefined : editor} initialKind="customEndpoint" credentials={snapshot.settings.credentials} providerIds={providers.map((item) => item.id)} runtimeNames={snapshot.backends.filter((backend) => backend.capabilities.get(capabilityNames.modelList)?.supported === true).map((backend) => backend.name)} t={t} onClose={() => setEditor(undefined)} onBack={editor === "new" ? () => { setEditor(undefined); setAddWizardOpen(true); } : undefined} onSave={(submission) => { setEditor(undefined); runAction(`save-provider:${submission.provider.id}`, async () => { if (submission.credential !== undefined) await controller.saveCredential(submission.credential); await controller.saveProvider(submission.provider); }); }} />
+    <ProviderEditor open={editor !== undefined} provider={editor === "new" ? undefined : editor} credentials={snapshot.settings.credentials} providerIds={providers.map((item) => item.id)} backends={snapshot.backends} saveCredential={controller.saveCredential} saveProvider={controller.saveProvider} t={t} onClose={() => setEditor(undefined)} onBack={editor === "new" ? () => { setEditor(undefined); setAddWizardOpen(true); } : undefined} onSaved={() => setEditor(undefined)} />
     <Modal
       open={runtimeOnboardingId !== undefined}
       title={t("settings.providerWizard.titleWith", { name: snapshot.managedModelRuntimes?.find((runtime) => runtime.id === runtimeOnboardingId)?.name ?? t("settings.localModelRuntime") })}
@@ -3002,7 +3032,7 @@ function deduplicateConfiguredProviderEntries(entries: readonly ProviderSettings
     const key = entry.runtime === undefined
       ? entry.id
       : entry.runtime.ownerManaged
-        ? `managed\u0000${entry.provider.compatibility}\u0000${entry.runtime.id}`
+        ? `managed\u0000${entry.runtime.id}`
         : `native\u0000${entry.runtime.backendId}\u0000${entry.runtime.id}`;
     if (seen.has(key)) return false;
     seen.add(key);
@@ -3012,8 +3042,8 @@ function deduplicateConfiguredProviderEntries(entries: readonly ProviderSettings
 
 function providerRuntimesRelated(left: ProviderRuntimeView, right: ProviderRuntimeView): boolean {
   if (left.ownerManaged !== right.ownerManaged) return false;
-  if (left.compatibility !== right.compatibility || left.id !== right.id) return false;
-  return left.ownerManaged || left.backendId === right.backendId;
+  if (left.id !== right.id) return false;
+  return left.ownerManaged || left.backendId === right.backendId && left.compatibility === right.compatibility;
 }
 
 function providerApiKeyAlternative(
@@ -3026,7 +3056,7 @@ function providerApiKeyAlternative(
     && entry.runtime?.ownerManaged === true
     && entry.runtime.loginMethods.includes("apiKey")
     && entry.provider.id === target.provider.id
-    && entry.provider.compatibility === target.provider.compatibility
+    && entry.runtime.compatibility === target.runtime?.compatibility
     && providerSettingsModelRoutes(snapshot, entry).some(isConversationModel));
   return candidates.length === 1 ? candidates[0] : undefined;
 }
@@ -3080,7 +3110,7 @@ function providerSettingsModelCount(
   snapshot: AppSnapshot,
   entry: ProviderSettingsEntry
 ): number {
-  if (entry.runtime === undefined) return entry.provider.models.length;
+  if (entry.runtime === undefined) return new Set(entry.provider.runtimes.flatMap((runtime) => runtime.models.map((model) => model.modelId))).size;
   return new Set(uniqueModelsByRoute([
     ...providerSettingsModelRoutes(snapshot, entry),
     ...providerCredentialSurfaceModels(snapshot, entry.runtime)
@@ -3106,16 +3136,10 @@ function nativeProviderConfiguration(runtime: ProviderRuntimeView, models: reado
     id: runtime.id,
     name: runtime.name,
     kind: runtime.kind,
-    compatibility: runtime.compatibility,
-    endpoint: runtime.endpoint,
-    credentialId: "",
     enabled: true,
-    keyless: runtime.authenticationState === "notRequired",
-    authHeader: false,
-    environmentName: "",
-    modelCount: models.filter((model) => model.backendId === runtime.backendId && model.providerId === runtime.id).length,
-    headers: [],
-    models: []
+    revision: 0n,
+    runtimes: [{ backendId: runtime.backendId, compatibility: runtime.compatibility, endpoint: runtime.endpoint, credentialId: "", credentialOrigin: "",
+      keyless: runtime.authenticationState === "notRequired", authHeader: false, environmentName: "", headers: [], models: [] }]
   };
 }
 
@@ -3169,7 +3193,7 @@ function providerDetailSubtitle(entry: ProviderSettingsEntry, t: Translator): st
     return t("settings.providerSubtitle.oauth", { runtime: runtimeName });
   }
   if (runtime?.kind === "localKeyless") return t("settings.providerSubtitle.local");
-  return runtime?.endpoint || entry.provider.endpoint || entry.provider.compatibility;
+  return runtime?.endpoint || [...new Set(entry.provider.runtimes.map((item) => item.endpoint || item.compatibility))].join(" · ");
 }
 
 function ProviderDetailMenu({ providerName, runtime, locale, onRefresh, onEdit, onDelete, enabled, onSetEnabled, t }: {
@@ -3609,214 +3633,6 @@ function ProviderAccountUsageDetails({
   </div>;
 }
 
-type ProviderEditorAuthentication = "apiKey" | "oauth" | "none";
-
-interface ProviderEditorSubmission {
-  readonly provider: ProviderDraft;
-  readonly credential?: CredentialDraft;
-}
-
-function ProviderEditor({ open, provider, initialKind = "customEndpoint", credentials, providerIds, runtimeNames, t, onClose, onBack, onSave }: {
-  readonly open: boolean;
-  readonly provider?: ProviderConfigurationView;
-  readonly initialKind?: ProviderDraft["kind"];
-  readonly credentials: AppSnapshot["settings"]["credentials"];
-  readonly providerIds: readonly string[];
-  readonly runtimeNames: readonly string[];
-  readonly t: Translator;
-  readonly onClose: () => void;
-  readonly onBack?: () => void;
-  readonly onSave: (submission: ProviderEditorSubmission) => void;
-}): JSX.Element {
-  const [draft, setDraft] = useState<ProviderDraft>(() => providerDraft(provider, initialKind));
-  const [authentication, setAuthentication] = useState<ProviderEditorAuthentication>(() => providerEditorAuthentication(provider));
-  const [secret, setSecret] = useState("");
-  const [template, setTemplate] = useState<"manual" | ProviderDraft["compatibility"]>("manual");
-  const [idManuallyEdited, setIdManuallyEdited] = useState(provider !== undefined);
-  useEffect(() => {
-    setDraft(providerDraft(provider, initialKind));
-    setAuthentication(providerEditorAuthentication(provider));
-    setSecret("");
-    setTemplate("manual");
-    setIdManuallyEdited(provider !== undefined);
-  }, [initialKind, open, provider?.id]);
-  const existingCredential = draft.credentialId.trim().length > 0;
-  const valid = providerDraftValid(draft) && (authentication !== "apiKey" || secret.length > 0 || existingCredential);
-  const updateModel = (index: number, patch: Partial<ProviderModelConfigurationView>): void => setDraft((current) => ({ ...current, models: current.models.map((model, position) => position === index ? { ...model, ...patch } : model) }));
-  const chooseAuthentication = (next: Exclude<ProviderEditorAuthentication, "oauth">): void => {
-    setAuthentication(next);
-    setDraft((current) => next === "none"
-      ? { ...current, kind: "customEndpoint", keyless: true, authHeader: false, credentialId: "", environmentName: "" }
-      : { ...current, kind: "customEndpoint", keyless: false, authHeader: current.compatibility !== "anthropic" });
-  };
-  const chooseProtocol = (compatibility: ProviderDraft["compatibility"]): void => {
-    setTemplate(compatibility);
-    setDraft((current) => ({ ...current, compatibility, authHeader: authentication === "apiKey" && compatibility !== "anthropic" }));
-  };
-  const submit = (): void => {
-    if (!valid) return;
-    const id = draft.id.trim();
-    const credentialId = authentication === "apiKey"
-      ? draft.credentialId.trim() || providerCredentialId(id)
-      : authentication === "oauth" ? draft.credentialId.trim() : "";
-    const environmentName = authentication === "apiKey"
-      ? draft.environmentName.trim() || providerCredentialEnvironment(id)
-      : authentication === "oauth" ? draft.environmentName.trim() : "";
-    const normalizedProvider: ProviderDraft = {
-      ...draft,
-      id,
-      name: draft.name.trim(),
-      kind: authentication === "oauth" ? draft.kind : "customEndpoint",
-      credentialId,
-      environmentName,
-      keyless: authentication === "oauth" ? draft.keyless : authentication === "none",
-      authHeader: authentication === "oauth" ? draft.authHeader : authentication === "apiKey" && draft.compatibility !== "anthropic"
-    };
-    onSave({
-      provider: normalizedProvider,
-      ...(authentication === "apiKey" && secret.length > 0 ? { credential: {
-        id: credentialId,
-        name: `${normalizedProvider.name} API key`,
-        kind: "apiKey",
-        providerId: id,
-        environmentName,
-        secret
-      } satisfies CredentialDraft } : {})
-    });
-  };
-  const protocolOptions: readonly ProviderDraft["compatibility"][] = ["openaiResponses", "openaiChat", "anthropic"];
-  return <Modal open={open} title={provider === undefined ? t("settings.customProvider.addTitle") : t("settings.editProvider", { name: provider.name })} size="large" className="provider-editor-modal" onClose={onClose} headerLeading={<ProviderFlowBackButton onBack={onBack ?? onClose} t={t} />}>
-    <form className="settings-form provider-editor provider-editor--guided" onSubmit={(event) => { event.preventDefault(); submit(); }}>
-      <div className="provider-editor__intro"><p>{t("settings.customProvider.description")}</p></div>
-      <label className="field provider-editor__template"><span>{t("settings.customProvider.template")}</span><SelectControl value={template} onChange={(event) => { const value = event.target.value as typeof template; setTemplate(value); if (value !== "manual") chooseProtocol(value); }}><option value="manual">{t("settings.customProvider.templateManual")}</option><option value="openaiResponses">OpenAI Responses</option><option value="openaiChat">OpenAI Chat Completions</option><option value="anthropic">Anthropic Messages</option></SelectControl></label>
-      <label className="field"><span>{t("settings.displayName")}</span><input required value={draft.name} onChange={(event) => { const name = event.target.value; setDraft((current) => ({ ...current, name, ...(provider === undefined && !idManuallyEdited ? { id: uniqueProviderId(name, providerIds) } : {}) })); }} placeholder={t("settings.customProvider.namePlaceholder")} /></label>
-
-      <section className="provider-editor__block" aria-labelledby="provider-editor-authentication"><div className="provider-editor__section-label" id="provider-editor-authentication">{t("settings.customProvider.authentication")}</div><div className="provider-editor__segments" role="group" aria-label={t("settings.customProvider.authentication")}><button type="button" className={cx(authentication === "apiKey" && "is-active")} aria-pressed={authentication === "apiKey"} onClick={() => chooseAuthentication("apiKey")}>{t("settings.apiKey")}</button><Tip className="provider-editor__segment-tip" focusable text={t("settings.customProvider.oauthUnavailable")}><button type="button" className={cx(authentication === "oauth" && "is-active")} aria-pressed={authentication === "oauth"} disabled>OAuth</button></Tip><button type="button" className={cx(authentication === "none" && "is-active")} aria-pressed={authentication === "none"} onClick={() => chooseAuthentication("none")}>{t("settings.customProvider.noAuthentication")}</button></div></section>
-
-      <section className="provider-editor__block" aria-labelledby="provider-editor-runtime"><div className="provider-editor__section-label" id="provider-editor-runtime">{t("settings.customProvider.runtime")}</div><div className="provider-editor__runtime-list">{runtimeNames.length > 0 ? [...new Set(runtimeNames)].map((name) => <span key={name}>{name}</span>) : <span>{t("settings.customProvider.runtimeUnavailable")}</span>}</div><p className="provider-editor__help">{t("settings.customProvider.runtimeBody")}</p></section>
-
-      <section className="provider-editor__connection"><div className="provider-editor__section-label">{t("settings.customProvider.connection")}</div><div className="provider-editor__protocol"><span>{t("settings.customProvider.protocol")}</span><div className="provider-editor__segments" role="group" aria-label={t("settings.customProvider.protocol")}>{protocolOptions.map((compatibility) => <button type="button" key={compatibility} className={cx(draft.compatibility === compatibility && "is-active")} aria-pressed={draft.compatibility === compatibility} onClick={() => chooseProtocol(compatibility)}>{providerCompatibilityLabel(compatibility)}</button>)}</div></div><label className="field"><span>{t("settings.customProvider.baseUrl")}</span><input required type="url" value={draft.endpoint} onChange={(event) => setDraft((current) => ({ ...current, endpoint: event.target.value }))} placeholder="https://api.example.com/v1" /><small>{t("settings.endpointSafety")}</small></label>{authentication === "apiKey" && <label className="field"><span>{t("settings.customProvider.apiKeyValue")}</span><input required={!existingCredential} type="password" autoComplete="new-password" value={secret} onChange={(event) => setSecret(event.target.value)} placeholder={existingCredential ? t("settings.customProvider.apiKeyKeep") : t("settings.customProvider.apiKeyPlaceholder")} /><small>{t("settings.customProvider.secretBody")}</small></label>}{authentication === "none" && <p className="provider-editor__help">{t("settings.customProvider.noAuthenticationBody")}</p>}</section>
-
-      <section className="provider-editor__models"><div className="provider-editor__models-heading"><span><strong>{t("settings.modelsRequired")}</strong><small>{t("settings.customProvider.modelsBody")}</small></span><Button onClick={() => setDraft((current) => ({ ...current, models: [...current.models, emptyProviderModel()] }))}><CirclePlus aria-hidden="true" />{t("settings.addModel")}</Button></div><div className="provider-editor__model-list">{draft.models.map((model, index) => <article className="provider-model-card" key={`model:${index}`}><div className="provider-model-card__heading"><span className="provider-catalog-icon" aria-hidden="true">{providerMonogram(model.name || model.modelId || "M")}</span><span><strong>{model.name || model.modelId || t("settings.newModel")}</strong><small>{model.modelId || t("settings.customProvider.modelRequired")}</small></span>{draft.models.length > 1 && <IconButton className="danger-text" label={t("settings.removeModel")} onClick={() => setDraft((current) => ({ ...current, models: current.models.filter((_, position) => position !== index) }))}><Trash2 aria-hidden="true" /></IconButton>}</div><div className="settings-form__grid"><label className="field"><span>{t("settings.modelId")}</span><input required value={model.modelId} onChange={(event) => updateModel(index, { modelId: event.target.value })} placeholder="model-id" /></label><label className="field"><span>{t("settings.displayName")}</span><input required value={model.name} onChange={(event) => updateModel(index, { name: event.target.value })} /></label><label className="field"><span>{t("settings.contextWindow")}</span><input required min={1} type="number" value={model.contextWindowTokens} onChange={(event) => updateModel(index, { contextWindowTokens: numericInput(event.target.value) })} /></label><label className="field"><span>{t("settings.maximumOutput")}</span><input required min={1} type="number" value={model.maximumOutputTokens} onChange={(event) => updateModel(index, { maximumOutputTokens: numericInput(event.target.value) })} /></label></div><details className="provider-model-card__advanced"><summary>{t("settings.customProvider.advancedModelOptions")}</summary><label className="field"><span>{t("settings.apiOverride")}</span><SelectControl value={model.compatibility ?? ""} onChange={(event) => updateModel(index, { compatibility: event.target.value === "" ? undefined : event.target.value as ProviderDraft["compatibility"] })}><option value="">{t("settings.inheritProvider")}</option>{providerCompatibilityOptions()}</SelectControl></label><fieldset className="provider-modalities"><legend>{t("settings.inputModalities")}</legend>{(["text", "image", "file", "audio"] as const).map((modality) => <label key={modality}><CheckboxControl checked={model.inputModalities.includes(modality)} onChange={(event) => updateModel(index, { inputModalities: toggleModality(model.inputModalities, modality, event.target.checked) })} />{modality}</label>)}</fieldset><div className="settings-form__toggles"><label><CheckboxControl checked={model.reasoning} onChange={(event) => updateModel(index, { reasoning: event.target.checked })} />{t("settings.reasoning")}</label><label><CheckboxControl checked={model.supportsFastMode} onChange={(event) => updateModel(index, { supportsFastMode: event.target.checked })} />{t("settings.fastSupported")}</label></div><label className="field"><span>{t("settings.effortMappings")}</span><input value={model.thinkingLevels.map((level) => level.nativeLevel === undefined ? level.effortId : `${level.effortId}:${level.nativeLevel}`).join(", ")} onChange={(event) => updateModel(index, { thinkingLevels: thinkingLevels(event.target.value) })} placeholder="low, medium, high:xhigh" /></label><div className="provider-cost-grid">{(["inputCostMicrosPerMillion", "outputCostMicrosPerMillion", "cacheReadCostMicrosPerMillion", "cacheWriteCostMicrosPerMillion"] as const).map((field) => <label className="field" key={field}><span>{t(`settings.${field}`)}</span><input type="number" min={0} value={model[field]} onChange={(event) => updateModel(index, { [field]: numericInput(event.target.value) })} /></label>)}</div></details></article>)}</div></section>
-
-      <details className="provider-editor__advanced"><summary>{t("settings.customProvider.advancedProvider")}</summary><div className="provider-editor__advanced-body"><div className="settings-form__grid"><label className="field"><span>{t("settings.providerId")}</span><input required disabled={provider !== undefined} value={draft.id} onChange={(event) => { setIdManuallyEdited(true); setDraft((current) => ({ ...current, id: event.target.value })); }} placeholder="my-provider" /></label>{authentication === "apiKey" && <><label className="field"><span>{t("settings.customProvider.savedCredential")}</span><SelectControl value={draft.credentialId} onChange={(event) => setDraft((current) => ({ ...current, credentialId: event.target.value }))}><option value="">{t("settings.customProvider.newCredential")}</option>{credentials.map((credential) => <option value={credential.id} key={credential.id}>{credential.name}</option>)}</SelectControl></label><label className="field"><span>{t("settings.environmentName")}</span><input value={draft.environmentName} onChange={(event) => setDraft((current) => ({ ...current, environmentName: event.target.value }))} placeholder={providerCredentialEnvironment(draft.id || "provider")} /></label></>}</div><div className="provider-editor__switches"><label><span>{t("common.enabled")}</span><button type="button" role="switch" className="model-visibility-toggle" aria-checked={draft.enabled} onClick={() => setDraft((current) => ({ ...current, enabled: !current.enabled }))}><span /></button></label>{authentication === "apiKey" && <label><span>{t("settings.authorizationHeader")}</span><button type="button" role="switch" className="model-visibility-toggle" aria-checked={draft.authHeader} onClick={() => setDraft((current) => ({ ...current, authHeader: !current.authHeader }))}><span /></button></label>}</div><fieldset className="provider-editor__section"><legend>{t("settings.headerBindings")}</legend>{draft.headers.map((header, index) => <div className="provider-binding-row" key={`header:${index}`}><label className="field"><span>{t("settings.headerName")}</span><input value={header.headerName} onChange={(event) => setDraft((current) => ({ ...current, headers: current.headers.map((item, position) => position === index ? { ...item, headerName: event.target.value } : item) }))} placeholder="X-API-Key" /></label><label className="field"><span>{t("settings.credentialReference")}</span><SelectControl value={header.credentialId} onChange={(event) => setDraft((current) => ({ ...current, headers: current.headers.map((item, position) => position === index ? { ...item, credentialId: event.target.value } : item) }))}><option value="">{t("common.none")}</option>{credentials.map((credential) => <option value={credential.id} key={credential.id}>{credential.name}</option>)}</SelectControl></label><label className="field"><span>{t("settings.environmentName")}</span><input value={header.environmentName} onChange={(event) => setDraft((current) => ({ ...current, headers: current.headers.map((item, position) => position === index ? { ...item, environmentName: event.target.value } : item) }))} placeholder="PROVIDER_HEADER" /></label><IconButton label={t("common.remove")} onClick={() => setDraft((current) => ({ ...current, headers: current.headers.filter((_, position) => position !== index) }))}><Trash2 aria-hidden="true" /></IconButton></div>)}<Button onClick={() => setDraft((current) => ({ ...current, headers: [...current.headers, { headerName: "", environmentName: "", credentialId: "" }] }))}><CirclePlus aria-hidden="true" />{t("settings.addHeader")}</Button></fieldset><AdvancedProviderModels models={draft.models} t={t} onChange={updateModel} /></div></details>
-      <ProviderFlowFooter className="provider-editor__actions"><Button type="submit" tone="primary" disabled={!valid}>{t("common.save")}</Button></ProviderFlowFooter>
-    </form>
-  </Modal>;
-}
-
-const PROVIDER_COMPATIBILITY_BOOLEAN_FIELDS = [
-  "supportsDeveloperRole",
-  "supportsReasoningEffort",
-  "supportsUsageInStreaming",
-  "supportsFinishReason",
-  "requiresReasoningContentOnAssistantMessages",
-  "supportsStore",
-  "supportsStrictMode",
-  "supportsOpenaiGrammarTools",
-  "supportsEagerToolInputStreaming",
-  "supportsLongCacheRetention",
-  "supportsCacheControlOnTools",
-  "supportsStrictTools"
-] as const;
-
-function AdvancedProviderModels({ models, t, onChange }: { readonly models: readonly ProviderModelConfigurationView[]; readonly t: Translator; readonly onChange: (index: number, patch: Partial<ProviderModelConfigurationView>) => void }): JSX.Element {
-  return <fieldset className="provider-editor__section"><legend>{t("settings.advancedModel")}</legend>{models.map((model, index) => <details className="provider-model-advanced" key={`advanced:${model.modelId}:${index}`}><summary>{model.name || model.modelId || t("settings.newModel")}</summary><fieldset><legend>{t("settings.sampling")}</legend><div className="provider-cost-grid">{(["temperature", "topP", "topK", "minP", "repetitionPenalty", "frequencyPenalty", "presencePenalty", "seed"] as const).map((field) => <label className="field" key={field}><span>{t(`settings.sampling.${field}`)}</span><input type="number" step={field === "topK" || field === "seed" ? 1 : "any"} value={model.sampling?.[field] ?? ""} onChange={(event) => onChange(index, { sampling: { ...(model.sampling ?? {}), [field]: optionalNumber(event.target.value) } })} /></label>)}</div></fieldset><fieldset><legend>{t("settings.compatibilityFlags")}</legend><div className="provider-compatibility-grid">{PROVIDER_COMPATIBILITY_BOOLEAN_FIELDS.map((field) => <label className="field" key={field}><span>{t(`settings.compatibility.${field}`)}</span><SelectControl value={optionalBooleanValue(model.compatibilityOptions?.[field])} onChange={(event) => onChange(index, { compatibilityOptions: { ...(model.compatibilityOptions ?? {}), [field]: parseOptionalBoolean(event.target.value) } })}><option value="">{t("settings.unspecified")}</option><option value="true">{t("common.on")}</option><option value="false">{t("common.off")}</option></SelectControl></label>)}</div><div className="settings-form__grid"><label className="field"><span>{t("settings.thinkingFormat")}</span><input value={model.compatibilityOptions?.thinkingFormat ?? ""} onChange={(event) => onChange(index, { compatibilityOptions: { ...(model.compatibilityOptions ?? {}), thinkingFormat: event.target.value || undefined } })} /></label><label className="field"><span>{t("settings.cacheControlFormat")}</span><input value={model.compatibilityOptions?.cacheControlFormat ?? ""} onChange={(event) => onChange(index, { compatibilityOptions: { ...(model.compatibilityOptions ?? {}), cacheControlFormat: event.target.value || undefined } })} /></label></div></fieldset></details>)}</fieldset>;
-}
-
-function optionalNumber(value: string): number | undefined {
-  if (value.trim().length === 0) return undefined;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : undefined;
-}
-
-function optionalBooleanValue(value: boolean | undefined): string {
-  return value === undefined ? "" : String(value);
-}
-
-function parseOptionalBoolean(value: string): boolean | undefined {
-  return value === "" ? undefined : value === "true";
-}
-
-function providerDraft(provider?: ProviderConfigurationView, initialKind: ProviderDraft["kind"] = "customEndpoint"): ProviderDraft {
-  return { id: provider?.id ?? "", name: provider?.name ?? "", kind: provider?.kind ?? initialKind, compatibility: provider?.compatibility ?? "openaiResponses", endpoint: provider?.endpoint ?? "", credentialId: provider?.credentialId ?? "", enabled: provider?.enabled ?? true, keyless: provider?.keyless ?? initialKind === "localKeyless", authHeader: provider?.authHeader ?? true, environmentName: provider?.environmentName ?? "", headers: provider?.headers ?? [], models: provider?.models.length ? provider.models : [emptyProviderModel()] };
-}
-
-function providerEditorAuthentication(provider?: ProviderConfigurationView): ProviderEditorAuthentication {
-  if (provider?.kind === "oauth" || provider?.kind === "subscription") return "oauth";
-  if (provider?.keyless === true || provider?.kind === "localKeyless") return "none";
-  return "apiKey";
-}
-
-function uniqueProviderId(name: string, providerIds: readonly string[]): string {
-  const normalized = name.normalize("NFKD")
-    .toLocaleLowerCase()
-    .replace(/[\u0300-\u036f]/gu, "")
-    .replace(/[^a-z0-9._-]+/gu, "-")
-    .replace(/^[^a-z0-9]+|[-._]+$/gu, "")
-    .slice(0, 96);
-  const base = normalized || "custom-provider";
-  const occupied = new Set(providerIds);
-  if (!occupied.has(base)) return base;
-  for (let suffix = 2; suffix < 10_000; suffix += 1) {
-    const candidate = `${base.slice(0, 120 - String(suffix).length)}-${suffix}`;
-    if (!occupied.has(candidate)) return candidate;
-  }
-  return `${base.slice(0, 111)}-${Date.now().toString(36)}`;
-}
-
-function providerCredentialId(providerId: string): string {
-  return `credential-${providerId}`.slice(0, 128);
-}
-
-function providerCredentialEnvironment(providerId: string): string {
-  const suffix = providerId.toLocaleUpperCase().replace(/[^A-Z0-9]+/gu, "_").replace(/^_+|_+$/gu, "") || "PROVIDER";
-  return `JOKO_PROVIDER_${suffix.slice(0, 96)}_API_KEY`;
-}
-
-function providerCompatibilityLabel(compatibility: ProviderDraft["compatibility"]): string {
-  switch (compatibility) {
-    case "openaiResponses": return "OpenAI Responses";
-    case "openaiChat": return "OpenAI Chat Completions";
-    case "anthropic": return "Anthropic Messages";
-    case "google": return "Google Generative AI";
-    case "openaiCompletions": return "OpenAI Completions";
-    case "native": return "Native";
-  }
-}
-
-function emptyProviderModel(): ProviderModelConfigurationView {
-  return { modelId: "", name: "", reasoning: false, inputModalities: ["text"], contextWindowTokens: 128_000, maximumOutputTokens: 8_192, inputCostMicrosPerMillion: 0, outputCostMicrosPerMillion: 0, cacheReadCostMicrosPerMillion: 0, cacheWriteCostMicrosPerMillion: 0, thinkingLevels: [], supportsFastMode: false };
-}
-
-function providerDraftValid(draft: ProviderDraft): boolean {
-  return draft.id.trim().length > 0 && draft.name.trim().length > 0
-    && (draft.endpoint.trim().length > 0 || draft.kind === "managed" || draft.kind === "localKeyless")
-    && draft.models.length > 0
-    && draft.models.every((model) => model.modelId.trim().length > 0 && model.name.trim().length > 0 && model.inputModalities.length > 0 && model.contextWindowTokens > 0 && model.maximumOutputTokens > 0)
-    && new Set(draft.models.map((model) => model.modelId.trim())).size === draft.models.length
-    && draft.headers.every((header) => header.headerName.trim().length > 0 && (header.credentialId.length > 0 || header.environmentName.trim().length > 0));
-}
-
-function providerCompatibilityOptions(): JSX.Element {
-  return <><option value="openaiResponses">OpenAI Responses</option><option value="openaiChat">OpenAI Chat Completions</option><option value="anthropic">Anthropic Messages</option><option value="google">Google Generative AI</option><option value="native">Native</option><option value="openaiCompletions">OpenAI Completions</option></>;
-}
-
-function numericInput(value: string): number {
-  const parsed = Number(value);
-  return Number.isSafeInteger(parsed) ? parsed : 0;
-}
-
-function toggleModality(current: readonly ModelInputModalityView[], modality: ModelInputModalityView, checked: boolean): readonly ModelInputModalityView[] {
-  return checked ? [...new Set([...current, modality])] : current.filter((candidate) => candidate !== modality);
-}
-
-function thinkingLevels(value: string): ProviderModelConfigurationView["thinkingLevels"] {
-  return value.split(",").map((part) => part.trim()).filter(Boolean).map((part) => {
-    const [effortId = "", nativeLevel] = part.split(":", 2).map((value) => value.trim());
-    return { effortId, ...(nativeLevel ? { nativeLevel } : {}) };
-  });
-}
 
 function providerStatusTone(state: AppSnapshot["providers"][number]["authenticationState"], enabled: boolean): string {
   if (!enabled) return "muted";
@@ -3836,11 +3652,11 @@ function CredentialEditor({ open, initialProviderId = "", providers, t, onClose,
   const [draft, setDraft] = useState<CredentialDraft>(() => credentialDraft(initialProviderId));
   useEffect(() => { if (open) setDraft(credentialDraft(initialProviderId)); }, [initialProviderId, open]);
   const valid = draft.id.trim().length > 0 && draft.name.trim().length > 0 && draft.secret.length > 0;
-  return <Modal open={open} title={t("settings.addCredential")} description={t("settings.credentialBody")} size="medium" className="provider-flow-modal credential-editor-modal" onClose={onClose} headerLeading={<ProviderFlowBackButton onBack={onClose} t={t} />}><form className="settings-form credential-editor-form" onSubmit={(event) => { event.preventDefault(); if (valid) onSave(draft); }}><div className="settings-form__grid"><label className="field"><span>{t("settings.referenceId")}</span><input required value={draft.id} onChange={(event) => setDraft((current) => ({ ...current, id: event.target.value }))} placeholder="cred_my_provider" /></label><label className="field"><span>{t("settings.displayName")}</span><input required value={draft.name} onChange={(event) => setDraft((current) => ({ ...current, name: event.target.value }))} /></label><label className="field"><span>{t("settings.kind")}</span><SelectControl value={draft.kind} onChange={(event) => setDraft((current) => ({ ...current, kind: event.target.value as CredentialDraft["kind"] }))}><option value="apiKey">{t("settings.apiKey")}</option><option value="headerSecret">{t("settings.headerSecret")}</option><option value="oauth">{t("settings.oauthToken")}</option><option value="subscription">{t("providerLogin.subscriptionMethod")}</option><option value="localKeyless">{t("settings.localKeyless")}</option></SelectControl></label><label className="field"><span>{t("settings.provider")}</span><SelectControl value={draft.providerId} onChange={(event) => setDraft((current) => ({ ...current, providerId: event.target.value }))}><option value="">{t("settings.unbound")}</option>{providers.filter(providerConfigurationEditable).map((provider) => <option value={provider.id} key={provider.id}>{provider.name}</option>)}</SelectControl></label><label className="field"><span>{t("settings.environmentName")}</span><input value={draft.environmentName} onChange={(event) => setDraft((current) => ({ ...current, environmentName: event.target.value }))} placeholder="OPENAI_API_KEY" /></label><label className="field"><span>{t("settings.secretValue")}</span><input required type="password" autoComplete="off" value={draft.secret} onChange={(event) => setDraft((current) => ({ ...current, secret: event.target.value }))} /></label></div><ProviderFlowFooter className="credential-editor-form__footer"><Button type="submit" tone="primary" disabled={!valid}>{t("common.save")}</Button></ProviderFlowFooter></form></Modal>;
+  return <Modal open={open} title={t("settings.addCredential")} description={t("settings.credentialBody")} size="medium" className="provider-flow-modal credential-editor-modal" onClose={onClose} headerLeading={<ProviderFlowBackButton onBack={onClose} t={t} />}><form className="settings-form credential-editor-form" onSubmit={(event) => { event.preventDefault(); if (valid) onSave(draft); }}><div className="settings-form__grid"><label className="field"><span>{t("settings.referenceId")}</span><input required value={draft.id} onChange={(event) => setDraft((current) => ({ ...current, id: event.target.value }))} placeholder="cred_my_provider" /></label><label className="field"><span>{t("settings.displayName")}</span><input required value={draft.name} onChange={(event) => setDraft((current) => ({ ...current, name: event.target.value }))} /></label><label className="field"><span>{t("settings.kind")}</span><SelectControl value={draft.kind} onChange={(event) => setDraft((current) => ({ ...current, kind: event.target.value as CredentialDraft["kind"] }))}><option value="apiKey">{t("settings.apiKey")}</option><option value="headerSecret">{t("settings.headerSecret")}</option><option value="oauth">{t("settings.oauthToken")}</option><option value="subscription">{t("providerLogin.subscriptionMethod")}</option><option value="localKeyless">{t("settings.localKeyless")}</option></SelectControl></label><label className="field"><span>{t("settings.provider")}</span><SelectControl value={draft.providerId} onChange={(event) => setDraft((current) => ({ ...current, providerId: event.target.value }))}><option value="">{t("settings.unbound")}</option>{providers.filter(providerConfigurationEditable).map((provider) => <option value={provider.id} key={provider.id}>{provider.name}</option>)}</SelectControl></label><label className="field"><span>{t("settings.secretValue")}</span><input required type="password" autoComplete="off" value={draft.secret} onChange={(event) => setDraft((current) => ({ ...current, secret: event.target.value }))} /></label></div><ProviderFlowFooter className="credential-editor-form__footer"><Button type="submit" tone="primary" disabled={!valid}>{t("common.save")}</Button></ProviderFlowFooter></form></Modal>;
 }
 
 function credentialDraft(providerId = ""): CredentialDraft {
-  return { id: "", name: "", kind: "apiKey", providerId, environmentName: "", secret: "" };
+  return { id: "", name: "", kind: "apiKey", providerId, secret: "" };
 }
 
 function PolicySettings({ controller, snapshot, runAction, showHeading = true, t }: { readonly controller: AppController; readonly snapshot: AppSnapshot; readonly runAction: RunAction; readonly showHeading?: boolean; readonly t: Translator }): JSX.Element {
@@ -3858,24 +3674,31 @@ function PolicyCard({ title, body, count, tone, t }: { readonly title: string; r
 }
 
 export function McpSettings({ controller, snapshot, runAction, showHeading = true, t }: { readonly controller: AppController; readonly snapshot: AppSnapshot; readonly runAction: RunAction; readonly showHeading?: boolean; readonly t: Translator }): JSX.Element {
-  const [editor, setEditor] = useState<"create" | McpServerView | null>(null);
+  const [editor, setEditor] = useState<{ readonly id: number; readonly save: AppController["saveMcpServer"]; readonly returnFocus: HTMLElement; readonly server?: McpServerView } | null>(null);
+  const editorSequence = useRef(0);
+  const currentSave = useRef(controller.saveMcpServer);
+  currentSave.current = controller.saveMcpServer;
+  const openEditor = (returnFocus: HTMLElement, server?: McpServerView): void => setEditor({ id: ++editorSequence.current, save: controller.saveMcpServer, returnFocus, ...(server === undefined ? {} : { server }) });
   return <>
-    {showHeading && <SettingsSectionHeading title={t("settings.mcp")} body={t("settings.mcpBody")} actions={<Button tone="primary" onClick={() => setEditor("create")}>{t("settings.addMcp")}</Button>} />}
+    {showHeading && <SettingsSectionHeading title={t("settings.mcp")} body={t("settings.mcpBody")} actions={<Button tone="primary" onClick={(event) => openEditor(event.currentTarget)}>{t("settings.addMcp")}</Button>} />}
     <section className="settings-card settings-list">
       {snapshot.settings.mcpServers.map((server) => <article key={server.id}>
         <div><StatusDot state={server.state} label={server.state} /><span><strong>{server.name}</strong><small>{server.transport} · {server.endpoint || server.command || t("settings.managedLoopback")} · {t("settings.toolsGeneration", { tools: server.toolCount, generation: server.generation.toString() })}</small></span></div>
-        <div><Pill tone={server.state === "connected" ? "success" : server.state === "error" ? "danger" : "warning"}>{server.state}</Pill><Button disabled={!server.enabled} onClick={() => runAction(`restart-mcp:${server.id}`, () => controller.restartMcpServer(server.id))}>{t("common.restart")}</Button>{server.transport !== "loopback" && <><IconButton label={t("settings.editMcp", { name: server.name })} onClick={() => setEditor(server)}><Pencil aria-hidden="true" /></IconButton><IconButton label={`${t("common.delete")} ${server.name}`} onClick={() => runAction(`delete-mcp:${server.id}`, () => controller.deleteMcpServer(server.id))}><Trash2 aria-hidden="true" /></IconButton></>}</div>
+        <div><Pill tone={server.state === "connected" ? "success" : server.state === "error" ? "danger" : "warning"}>{server.state}</Pill><Button disabled={!server.enabled} onClick={() => runAction(`restart-mcp:${server.id}`, () => controller.restartMcpServer(server.id))}>{t("common.restart")}</Button>{server.transport !== "loopback" && <><IconButton label={t("settings.editMcp", { name: server.name })} onClick={(event) => openEditor(event.currentTarget, server)}><Pencil aria-hidden="true" /></IconButton><IconButton label={`${t("common.delete")} ${server.name}`} onClick={() => runAction(`delete-mcp:${server.id}`, () => controller.deleteMcpServer(server.id))}><Trash2 aria-hidden="true" /></IconButton></>}</div>
       </article>)}
       {snapshot.settings.mcpServers.length === 0 && <p className="muted">{t("settings.noMcp")}</p>}
     </section>
     <section className="security-callout"><Shield aria-hidden="true" /><div><h3>{t("settings.credentialReferences")}</h3><p>{t("settings.credentialReferencesBody")}</p></div></section>
-    {editor !== null && <McpServerEditor
-      server={editor === "create" ? undefined : editor}
+    {editor !== null && editor.save === controller.saveMcpServer && <McpServerEditor
+      key={editor.id}
+      returnFocus={editor.returnFocus}
+      isCurrent={() => currentSave.current === editor.save}
+      server={editor.server}
       credentials={snapshot.settings.credentials}
       t={t}
-      onClose={() => setEditor(null)}
-      onSave={(draft) => controller.saveMcpServer(draft)}
-      onSaved={() => setEditor(null)}
+      onClose={() => setEditor((current) => current === editor ? null : current)}
+      onSave={editor.save}
+      onSaved={() => setEditor((current) => current === editor ? null : current)}
     />}
   </>;
 }
@@ -3884,7 +3707,7 @@ export function providerConfigurationEditable(provider: ProviderConfigurationVie
   // Orchestrator deliberately projects built-in Pi Providers without managed models;
   // their API semantics remain owned by Pi and authentication is the only
   // configurable surface. Managed/BYOM entries always carry at least one model.
-  return provider.models.length > 0;
+  return provider.runtimes.some((runtime) => runtime.models.length > 0);
 }
 
 export function LanguageToolSettings({ controller, snapshot, runAction, onSuccess, t }: {
@@ -3962,7 +3785,7 @@ function emptyResourceDraft(backendId: string): ResourceDraft {
 function DiagnosticSettings({ controller, snapshot, runAction, showHeading = true, t }: { readonly controller: AppController; readonly snapshot: AppSnapshot; readonly runAction: RunAction; readonly showHeading?: boolean; readonly t: Translator }): JSX.Element {
   const settings = snapshot.settings.diagnostics;
   return <>
-    {showHeading && <SettingsSectionHeading title={t("settings.diagnostics")} body={t("settings.diagnosticsHint")} actions={<Button tone="primary" onClick={() => runAction("diagnostics-bundle", async () => { const artifact = await controller.createDiagnosticsBundle(); await controller.downloadArtifact(artifact.blobId, artifact.fileName); })}>{t("settings.createBundle")}</Button>} />}
+    {showHeading && <SettingsSectionHeading title={t("settings.diagnostics")} body={t("settings.diagnosticsHint")} actions={<ArtifactDownloadButton tone="primary" ownerKey="diagnostics" connectionOwner={controller.downloadArtifact} label={t("settings.createBundle")} errorLabel={t("workspace.downloadUnavailable")} action={async (context) => { const artifact = await controller.createDiagnosticsBundle(); context.signal.throwIfAborted(); return controller.downloadArtifact(artifact.blobId, artifact.fileName, context); }}>{t("settings.createBundle")}</ArtifactDownloadButton>} />}
     <section className="settings-card">
       <div className="setting-row"><div><strong>{t("settings.diagnosticLevel")}</strong><span>{t("settings.diagnosticLevelBody")}</span></div><SelectControl value={settings.level} onChange={(event) => runAction("diagnostics-level", () => controller.updateDiagnostics({ level: event.target.value as typeof settings.level }))}><option value="errors">{t("settings.errorsOnly")}</option><option value="standard">{t("settings.standard")}</option><option value="verbose">{t("settings.verbose")}</option></SelectControl></div>
       <div className="setting-row"><div><strong>{t("settings.retention")}</strong><span>{t("settings.retentionBody")}</span></div><input type="number" min={0} value={settings.retentionSeconds} onChange={(event) => runAction("diagnostics-retention", () => controller.updateDiagnostics({ retentionSeconds: Number(event.target.value) }))} /></div>

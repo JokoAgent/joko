@@ -1,3 +1,5 @@
+import { downloadArtifactBlob } from "../artifact-download.js";
+import type { ArtifactDownloadContext } from "../model.js";
 import { File, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type JSX } from "react";
 
@@ -11,7 +13,8 @@ import { WorkspaceImageLightbox } from "./WorkspaceImageLightbox.js";
 
 type AttachmentPreviewKind = "image" | "text";
 
-export function ComposerAttachmentTray({ attachments, removeDisabled = false, t, onRemove }: {
+export function ComposerAttachmentTray({ ownerKey, attachments, removeDisabled = false, t, onRemove }: {
+  readonly ownerKey: string;
   readonly attachments: readonly AttachmentDraft[];
   readonly removeDisabled?: boolean;
   readonly t: Translator;
@@ -19,7 +22,8 @@ export function ComposerAttachmentTray({ attachments, removeDisabled = false, t,
 }): JSX.Element {
   return <div className="attachment-list" aria-label={t("composer.attachments")}>
     {attachments.map((attachment) => <ComposerAttachmentItem
-      key={attachment.id}
+      key={JSON.stringify([ownerKey, attachment.id])}
+      ownerKey={ownerKey}
       attachment={attachment}
       removeDisabled={removeDisabled}
       t={t}
@@ -28,7 +32,8 @@ export function ComposerAttachmentTray({ attachments, removeDisabled = false, t,
   </div>;
 }
 
-function ComposerAttachmentItem({ attachment, removeDisabled, t, onRemove }: {
+function ComposerAttachmentItem({ ownerKey, attachment, removeDisabled, t, onRemove }: {
+  readonly ownerKey: string;
   readonly attachment: AttachmentDraft;
   readonly removeDisabled: boolean;
   readonly t: Translator;
@@ -66,15 +71,7 @@ function ComposerAttachmentItem({ attachment, removeDisabled, t, onRemove }: {
     return textObjectUrlRef.current;
   }, [attachment.file]);
 
-  const download = useCallback((): void => {
-    const url = attachment.previewUrl ?? textObjectUrlRef.current ?? URL.createObjectURL(attachment.file);
-    if (attachment.previewUrl === undefined && textObjectUrlRef.current === undefined) textObjectUrlRef.current = url;
-    const anchor = (triggerRef.current?.ownerDocument ?? document).createElement("a");
-    anchor.href = url;
-    anchor.download = attachment.file.name || "attachment";
-    anchor.rel = "noopener";
-    anchor.click();
-  }, [attachment]);
+  const download = useCallback((context: ArtifactDownloadContext) => downloadArtifactBlob(attachment.file, attachment.file.name || "attachment", context), [attachment.file]);
 
   const contents = <>
     {attachment.previewUrl !== undefined
@@ -127,6 +124,7 @@ function ComposerAttachmentItem({ attachment, removeDisabled, t, onRemove }: {
       src={attachment.previewUrl}
     />}
     {imageOpen && attachment.previewUrl !== undefined && <WorkspaceImageLightbox
+      ownerKey={JSON.stringify([ownerKey, attachment.id])}
       src={attachment.previewUrl}
       name={attachment.file.name}
       mediaType={attachment.file.type}
@@ -155,6 +153,7 @@ function ComposerAttachmentItem({ attachment, removeDisabled, t, onRemove }: {
       onDownload={download}
     />}
     {textPreviewTrigger !== undefined && <TimelineTextAttachmentLightbox
+      ownerKey={JSON.stringify([ownerKey, attachment.id])}
       artifact={textArtifact}
       labels={{
         preview: t("workspace.preview"),
@@ -169,7 +168,7 @@ function ComposerAttachmentItem({ attachment, removeDisabled, t, onRemove }: {
       }}
       returnFocus={textPreviewTrigger}
       loadUrl={loadTextUrl}
-      onDownload={download}
+      onDownload={(_blobId, _name, context) => download(context)}
       onClose={() => setTextPreviewTrigger(undefined)}
     />}
   </div>;

@@ -110,7 +110,7 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     const enqueued = await submit(
       paired.clients.operation,
       paired.connectionId,
-      sendInputMutation(sessionId, prompt)
+      sendInputMutation(sessionId, BigInt(fixture!.application.store.getSession(sessionId).descriptor.binding.generation), prompt)
     );
     expect(enqueued.state).toBe(OperationState.SUCCEEDED);
     const runId = queueRunIdFrom(enqueued);
@@ -257,7 +257,7 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     const firstRun = await submit(
       paired.clients.operation,
       paired.connectionId,
-      sendInputMutation(sessionId, firstPrompt)
+      sendInputMutation(sessionId, BigInt(fixture!.application.store.getSession(sessionId).descriptor.binding.generation), firstPrompt)
     );
     await waitForRealSystem(
       () => paired.clients.run.getRun({ runId: queueRunIdFrom(firstRun) }),
@@ -293,7 +293,7 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     const secondRun = await submit(
       paired.clients.operation,
       paired.connectionId,
-      sendInputMutation(sessionId, secondPrompt)
+      sendInputMutation(sessionId, BigInt(fixture!.application.store.getSession(sessionId).descriptor.binding.generation), secondPrompt)
     );
     await waitForRealSystem(
       () => paired.clients.run.getRun({ runId: queueRunIdFrom(secondRun) }),
@@ -367,7 +367,7 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
       const queued = await submit(
         paired.clients.operation,
         paired.connectionId,
-        sendInputMutation(sessionId, prompt)
+        sendInputMutation(sessionId, BigInt(fixture!.application.store.getSession(sessionId).descriptor.binding.generation), prompt)
       );
       const runId = queueRunIdFrom(queued);
       await waitForRealSystem(
@@ -480,7 +480,7 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
       const queued = await submit(
         paired.clients.operation,
         paired.connectionId,
-        sendInputMutation(sessionId, prompt)
+        sendInputMutation(sessionId, BigInt(fixture!.application.store.getSession(sessionId).descriptor.binding.generation), prompt)
       );
       const runId = queueRunIdFrom(queued);
       await waitForRealSystem(
@@ -551,7 +551,7 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
       const queued = await submit(
         paired.clients.operation,
         paired.connectionId,
-        sendInputMutation(sessionId, prompt)
+        sendInputMutation(sessionId, BigInt(fixture!.application.store.getSession(sessionId).descriptor.binding.generation), prompt)
       );
       const runId = queueRunIdFrom(queued);
       await waitForRealSystem(

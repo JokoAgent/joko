@@ -205,13 +205,20 @@ export const REMOTE_HOST_FAILURE_CODES = [
   "host_key_store_corrupt",
   "host_key_store_missing",
   "host_key_store_unreadable",
-  "host_key_store_write_failed"
+  "host_key_store_write_failed",
+  "node_key_changed",
+  "node_key_unavailable"
 ] as const;
 
 export type RemoteHostFailureCode = (typeof REMOTE_HOST_FAILURE_CODES)[number];
 export type RemoteHostSource = "manual" | "ssh_config";
 export type RemoteHostStatus = "disconnected" | "connecting" | "authenticating" | "ready" | "failed";
-export type RemoteHostAuthenticationMode = "system_agent" | "private_key";
+export type RemoteHostAuthenticationMode = "system_agent" | "private_key" | "node_key";
+
+export interface RemoteHostNodeKey {
+  readonly id: string;
+  readonly expectedFingerprint: string;
+}
 
 export interface RemoteHostScope {
   readonly ownerId: string;
@@ -242,6 +249,7 @@ export interface RemoteHostRecord extends RemoteHostScope {
   readonly authenticationMode: RemoteHostAuthenticationMode;
   /** Opaque identifier only; credential material belongs in the credential channel. */
   readonly credentialReferenceId?: string;
+  readonly nodeKey?: RemoteHostNodeKey;
   readonly trust?: RemoteHostTrustPin;
   readonly status: RemoteHostStatusSnapshot;
   readonly createdAt: UnixMillis;
@@ -258,6 +266,7 @@ export interface CreateRemoteHostInput extends RemoteHostScope {
   /** Defaults to private_key when a reference is supplied, otherwise system_agent. */
   readonly authenticationMode?: RemoteHostAuthenticationMode;
   readonly credentialReferenceId?: string;
+  readonly nodeKey?: RemoteHostNodeKey;
   readonly createdAt?: UnixMillis;
 }
 
@@ -271,6 +280,8 @@ export interface UpdateRemoteHostInput extends RemoteHostScope {
   readonly authenticationMode?: RemoteHostAuthenticationMode;
   /** Null explicitly clears the reference; undefined keeps it unchanged. */
   readonly credentialReferenceId?: string | null;
+  /** Null explicitly clears the node identity; undefined keeps it unchanged. */
+  readonly nodeKey?: RemoteHostNodeKey | null;
   readonly updatedAt?: UnixMillis;
 }
 
@@ -756,6 +767,7 @@ export interface MessageEmbeddingJob {
 export interface MessageEmbeddingStatus {
   readonly enabled: boolean;
   readonly vectorAvailable: boolean;
+  readonly backendId?: string;
   readonly providerId?: string;
   readonly providerGenerationId?: string;
   readonly modelId: string;
@@ -887,6 +899,41 @@ export interface SessionLifecycleCleanupRecord {
   readonly worktreeCompleted: boolean;
   readonly gitSafetyCompleted: boolean;
   readonly failure?: string;
+  readonly createdAt: UnixMillis;
+  readonly updatedAt: UnixMillis;
+  readonly revision: bigint;
+}
+
+export interface RecordNativeSessionDerivationInput {
+  readonly operationId: string;
+  readonly expectedBodyHash: string;
+  readonly sourceSessionId: string;
+  readonly sourceBinding: SessionDescriptor["binding"];
+  /** Stable new product Session identity, distinct from the source runtime key. */
+  readonly sessionId: string;
+  readonly backendId: string;
+  readonly backendInstanceGeneration: number;
+  readonly targetId: string;
+  readonly effectiveWorkspaceRoot: string;
+  readonly remoteWorkspace?: SessionDescriptor["remoteWorkspace"];
+  readonly binding: SessionDescriptor["binding"];
+}
+
+export type NativeSessionDerivationState =
+  | "recorded"
+  | "adopted"
+  | "cleanup_claimed"
+  | "cleaned"
+  | "cleanup_unknown";
+
+/** Private receipt for an exact native effect; never a transcript or credential store. */
+export interface NativeSessionDerivationRecord extends RecordNativeSessionDerivationInput {
+  readonly state: NativeSessionDerivationState;
+  readonly cleanupToken?: string;
+  readonly cleanupStartedAt?: UnixMillis;
+  readonly adoptedAt?: UnixMillis;
+  readonly cleanedAt?: UnixMillis;
+  readonly failureCode?: string;
   readonly createdAt: UnixMillis;
   readonly updatedAt: UnixMillis;
   readonly revision: bigint;

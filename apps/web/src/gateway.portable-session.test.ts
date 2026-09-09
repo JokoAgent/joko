@@ -75,17 +75,22 @@ describe("portable task package gateway", () => {
     await expect(gateway.exportPortableSession("session-1", {
       password: "transient",
       excludeMedia: false
-    })).resolves.toEqual({ status: "exported", fidelity: "full" });
+    }, { ownerDocument: { defaultView: window } as Document, signal: new AbortController().signal })).resolves.toEqual({ status: "exported", fidelity: "full" });
     expect(saveFile).toHaveBeenCalledWith({
       name: "portable-task.jshare",
       mediaType: "application/vnd.joko.session",
       bytes: new Uint8Array([1, 2, 3])
     });
 
+    saveFile.mockResolvedValueOnce(false);
+    await expect(gateway.exportPortableSession("session-1", { password: "transient", excludeMedia: false }, {
+      ownerDocument: { defaultView: window } as Document, signal: new AbortController().signal
+    })).resolves.toEqual({ status: "cancelled" });
+
     oversize = true;
     await expect(gateway.exportPortableSession("session-1", {
       excludeMedia: false
-    })).resolves.toEqual({
+    }, { ownerDocument: { defaultView: window } as Document, signal: new AbortController().signal })).resolves.toEqual({
       status: "oversize",
       mediaBytes: 7_340_032,
       limitBytes: 10_485_760

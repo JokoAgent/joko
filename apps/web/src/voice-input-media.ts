@@ -54,6 +54,8 @@ export interface VoiceMediaPreferences {
 
 export interface VoiceMediaSessionOptions {
   readonly api: OperationApi;
+  readonly ownerWindow: Window & typeof globalThis;
+  readonly subscribeMicrophoneRelease?: (listener: () => void) => () => void;
   readonly preferences?: VoiceMediaPreferences;
   readonly onUpdate?: (update: VoiceMediaSessionUpdate) => void;
   readonly mediaDevices?: Pick<MediaDevices, "getUserMedia">;
@@ -81,6 +83,8 @@ const VOICE_MEDIA_ERROR_MESSAGES: Readonly<Record<VoiceMediaErrorCode, string>> 
  * values exist only in this instance and are never written to browser storage.
  */
 export class VoiceInputMediaSession {
+  private readonly ownerWindow: Window & typeof globalThis;
+  private readonly subscribeMicrophoneRelease: VoiceMediaSessionOptions["subscribeMicrophoneRelease"];
   private readonly api: OperationApi;
   private readonly preferences: VoiceMediaPreferences;
   private readonly onUpdate: (update: VoiceMediaSessionUpdate) => void;
@@ -112,12 +116,14 @@ export class VoiceInputMediaSession {
 
   constructor(options: VoiceMediaSessionOptions) {
     this.api = options.api;
+    this.ownerWindow = options.ownerWindow;
+    this.subscribeMicrophoneRelease = options.subscribeMicrophoneRelease;
     this.preferences = options.preferences ?? {};
     this.onUpdate = options.onUpdate ?? (() => undefined);
-    const mediaDevices = options.mediaDevices ?? globalThis.navigator?.mediaDevices;
-    const MediaRecorderClass = options.mediaRecorder ?? globalThis.MediaRecorder;
+    const mediaDevices = options.mediaDevices ?? options.ownerWindow.navigator.mediaDevices;
+    const MediaRecorderClass = options.mediaRecorder ?? options.ownerWindow.MediaRecorder;
     const pcmCaptureFactory = options.pcmCaptureFactory
-      ?? (hasVoicePcmCapture() ? () => new WebAudioVoicePcmCapture() : undefined);
+      ?? (typeof options.ownerWindow.AudioContext === "function" ? () => new WebAudioVoicePcmCapture(options.ownerWindow.AudioContext) : undefined);
     if (mediaDevices === undefined || MediaRecorderClass === undefined && pcmCaptureFactory === undefined) {
       throw new VoiceMediaError("unsupported");
     }
@@ -125,9 +131,9 @@ export class VoiceInputMediaSession {
     this.MediaRecorderClass = MediaRecorderClass;
     this.pcmCaptureFactory = pcmCaptureFactory;
     this.stream = options.prewarmedStream;
-    this.now = options.now ?? Date.now;
-    this.setTimer = options.setTimer ?? ((callback, delayMs) => window.setTimeout(callback, delayMs));
-    this.clearTimer = options.clearTimer ?? ((handle) => window.clearTimeout(handle));
+    this.now = options.now ?? options.ownerWindow.Date.now;
+    this.setTimer = options.setTimer ?? ((callback, delayMs) => options.ownerWindow.setTimeout(callback, delayMs));
+    this.clearTimer = options.clearTimer ?? ((handle) => options.ownerWindow.clearTimeout(handle));
   }
 
   get currentState(): VoiceMediaState {
@@ -188,7 +194,7 @@ export class VoiceInputMediaSession {
       );
       if (!this.isCurrent(generation) || startAbort.signal.aborted) {
         if (recorder !== undefined) stopMediaRecorder(recorder);
-        stopMediaStream(stream);
+        if (this.stream === stream) { stopMediaStream(stream); this.stream = undefined; }
         await this.api.cancelVoiceInput(session.id).catch(() => undefined);
         throw new VoiceMediaError("cancelled");
       }
@@ -201,16 +207,20 @@ export class VoiceInputMediaSession {
         const capture = this.pcmCaptureFactory!();
         this.pcmCapture = capture;
         await capture.start(stream, this.handlePcmChunk);
+        if (!this.isCurrent(generation) || startAbort.signal.aborted) {
+          if (this.pcmCapture === capture) { this.pcmCapture = undefined; await capture.stop(); }
+          throw new VoiceMediaError("cancelled");
+        }
       } else {
         recorder!.addEventListener("dataavailable", this.handleDataAvailable);
         recorder!.addEventListener("error", this.handleRecorderError);
         recorder!.start(chunkDuration);
       }
-      this.releaseSubscription = window.jokoDesktop?.microphone?.onRelease(() => {
+      this.releaseSubscription = this.subscribeMicrophoneRelease?.(() => {
         void this.fail(new VoiceMediaError("captureFailed"));
       });
       this.setState("listening", session);
-      if (this.preferences.playInteractionSound !== false) playVoiceInputCue("start");
+      if (this.preferences.playInteractionSound !== false) playVoiceInputCue("start", () => new this.ownerWindow.AudioContext());
       if (this.stopRequested) {
         this.stopRequested = false;
         await this.stop();
@@ -233,7 +243,7 @@ export class VoiceInputMediaSession {
     }
     if (this.state !== "listening" || this.session === undefined) return this.session;
     const generation = this.generation;
-    if (this.preferences.playInteractionSound !== false) playVoiceInputCue("stop");
+    if (this.preferences.playInteractionSound !== false) playVoiceInputCue("stop", () => new this.ownerWindow.AudioContext());
     this.setState("submitting", this.session);
     this.pollAbort?.abort();
     this.clearPoll();
@@ -242,6 +252,7 @@ export class VoiceInputMediaSession {
       await this.appendChain;
       if (!this.isCurrent(generation) || this.session === undefined) return this.session;
       const result = await this.api.stopVoiceInput(this.session.id, this.chunkSequence);
+      if (!this.isCurrent(generation)) return undefined;
       this.acceptSession(result);
       this.stopCaptureResources();
       if (isVoiceSessionTerminal(result)) {
@@ -300,6 +311,7 @@ export class VoiceInputMediaSession {
       const capability = this.capability;
       if (capability === undefined) throw new VoiceMediaError("unsupported");
       const audio = typeof source === "function" ? await source() : Uint8Array.from(source);
+      if (!this.isCurrent(generation) || this.session === undefined) return;
       if (audio.byteLength === 0) return;
       const nextBytes = this.acceptedBytes + audio.byteLength;
       const nextDuration = this.acceptedDurationMs + durationMs;

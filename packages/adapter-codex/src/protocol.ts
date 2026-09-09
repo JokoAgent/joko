@@ -14,6 +14,7 @@ export interface RpcServerRequest extends RpcNotification {
 
 export interface NativeThread {
   readonly id: string;
+  readonly historyMode?: "paginated" | "legacy";
   readonly sessionId?: string;
   readonly preview?: string;
   readonly name?: string | null;
@@ -33,6 +34,8 @@ export interface NativeTurn {
   readonly id: string;
   readonly status: "completed" | "interrupted" | "failed" | "inProgress";
   readonly items: readonly NativeThreadItem[];
+  /** The published protocol defaults an omitted marker to full. */
+  readonly itemsView?: "full" | "summary" | "notLoaded";
   readonly error?: JsonObject | null;
   readonly durationMs?: number | null;
 }
@@ -143,39 +146,17 @@ export function parseThreadResult(value: JsonValue): NativeThread {
   return parseThread(objectValue(value, "thread result")["thread"]);
 }
 
-export function parseBoundedThreadResult(
-  value: JsonValue,
-  bounds: NativeThreadHistoryBounds
-): NativeThread {
-  assertHistoryBound(bounds.maximumTurns);
-  assertHistoryBound(bounds.maximumItems);
-  const counter = { items: 0 };
-  return parseThreadWithBounds(
-    objectValue(value, "thread result")["thread"],
-    bounds,
-    counter
-  );
-}
-
 export function parseThread(value: JsonValue | unknown): NativeThread {
-  return parseThreadWithBounds(value);
-}
-
-function parseThreadWithBounds(
-  value: JsonValue | unknown,
-  bounds?: NativeThreadHistoryBounds,
-  counter?: { items: number }
-): NativeThread {
   const record = objectValue(value, "thread");
   const rawTurns = record["turns"] === undefined
     ? []
     : arrayValue(record["turns"], "thread turns");
-  if (bounds !== undefined && rawTurns.length > bounds.maximumTurns) {
-    throw new ProtocolShapeError("thread turns exceed the native history bound");
-  }
-  const turns = rawTurns.map((turn) => parseTurnWithBounds(turn, bounds, counter));
+  const turns = rawTurns.map(parseTurn);
+  const historyMode = record["historyMode"] === undefined ? "legacy" : record["historyMode"];
+  if (historyMode !== "paginated" && historyMode !== "legacy") throw new ProtocolShapeError("invalid native thread history mode");
   return {
     id: stringValue(record["id"], "thread id"),
+    historyMode,
     ...(optionalString(record["sessionId"]) === undefined ? {} : { sessionId: optionalString(record["sessionId"]) }),
     ...(typeof record["preview"] === "string" ? { preview: record["preview"] } : {}),
     ...(record["name"] === null ? { name: null } : optionalString(record["name"]) === undefined ? {} : { name: optionalString(record["name"]) }),
@@ -224,10 +205,15 @@ function parseTurnWithBounds(
     }
   }
   const items = rawItems.map(parseThreadItem);
+  const itemsView = record["itemsView"];
+  if (itemsView !== undefined && itemsView !== "full" && itemsView !== "summary" && itemsView !== "notLoaded") {
+    throw new ProtocolShapeError("turn item completeness is unsupported");
+  }
   return {
     id: stringValue(record["id"], "turn id"),
     status,
     items,
+    ...(itemsView === undefined ? {} : { itemsView }),
     ...(record["error"] === null ? { error: null } : isJsonObject(record["error"]) ? { error: record["error"] } : {}),
     ...(numberValue(record["durationMs"]) === undefined ? {} : { durationMs: numberValue(record["durationMs"]) })
   };
@@ -298,6 +284,37 @@ export function parseThreadList(
 export function parseTurnList(value: JsonValue): readonly NativeTurn[] {
   const record = objectValue(value, "turn list result");
   return arrayValue(record["data"], "turn list data").map(parseTurn);
+}
+
+/** The only complete-history page shape; summary/notLoaded items are never hydrated. */
+export function parseFullTurnPage(value: JsonValue, bounds: NativeThreadHistoryBounds): {
+  readonly turns: readonly NativeTurn[];
+  readonly nextCursor?: string;
+  readonly backwardsCursor?: string;
+} {
+  assertHistoryBound(bounds.maximumTurns);
+  assertHistoryBound(bounds.maximumItems);
+  const record = objectValue(value, "full turn page");
+  const counter = { items: 0 };
+  const turns = boundedArrayValue(record["data"], "full turn page data", bounds.maximumTurns).map((value) => {
+    const turn = objectValue(value, "full turn");
+    if (!Array.isArray(turn["items"]) || (turn["itemsView"] !== undefined && turn["itemsView"] !== "full")) {
+      throw new ProtocolShapeError("native history requires complete turn items");
+    }
+    const parsed = parseTurnWithBounds(turn, bounds, counter);
+    for (const identity of [parsed.id, ...parsed.items.map((item) => item.id)]) {
+      if (identity.length > 512 || /[\u0000-\u001f\u007f]/u.test(identity)) {
+        throw new ProtocolShapeError("native history contains an invalid identity");
+      }
+    }
+    return parsed;
+  });
+  const nextCursor = paginationCursor(record["nextCursor"], "full turn page nextCursor");
+  const backwardsCursor = paginationCursor(record["backwardsCursor"], "full turn page backwardsCursor");
+  if (turns.length === 0 && (nextCursor !== undefined || backwardsCursor !== undefined)) {
+    throw new ProtocolShapeError("an empty native history page cannot carry a continuation anchor");
+  }
+  return { turns, ...(nextCursor === undefined ? {} : { nextCursor }), ...(backwardsCursor === undefined ? {} : { backwardsCursor }) };
 }
 
 export function parseTurnStart(value: JsonValue): NativeTurn {

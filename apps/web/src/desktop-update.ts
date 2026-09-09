@@ -16,6 +16,7 @@ export interface DesktopUpdateDismissSnapshot {
   readonly reason?: DesktopUpdateDismissReason;
   readonly updateKey?: string;
   readonly decisionKey?: string;
+  readonly pinnedKey?: string;
 }
 
 let dismissSnapshot: DesktopUpdateDismissSnapshot = Object.freeze({ dismissed: false });
@@ -48,9 +49,11 @@ export function dismissDesktopUpdateBanner(status: JokoDesktopUpdateStatus): voi
 
 export function restoreDesktopUpdateBanner(): void {
   if (!dismissSnapshot.dismissed) return;
+  const updateKey = dismissSnapshot.decisionKey ?? dismissSnapshot.updateKey;
   dismissSnapshot = Object.freeze({
     dismissed: false,
-    decisionKey: dismissSnapshot.decisionKey ?? dismissSnapshot.updateKey
+    decisionKey: updateKey,
+    pinnedKey: updateKey
   });
   emitDismissChange();
 }
@@ -63,7 +66,7 @@ export function restoreDesktopUpdateBanner(): void {
  */
 export function deferDesktopUpdateBannerBecauseBusy(status: JokoDesktopUpdateStatus): boolean {
   const updateKey = desktopUpdateDismissKey(status);
-  if (updateKey === undefined || dismissSnapshot.reason === "user") return false;
+  if (updateKey === undefined || dismissSnapshot.reason === "user" || desktopUpdateBannerPinnedFor(status)) return false;
   if (
     dismissSnapshot.dismissed
     && dismissSnapshot.reason === "busy"
@@ -83,7 +86,7 @@ export function deferDesktopUpdateBannerBecauseBusy(status: JokoDesktopUpdateSta
 /** Records that the automatic busy gate allowed this exact update to appear. */
 export function markDesktopUpdateBannerAutoShown(status: JokoDesktopUpdateStatus): boolean {
   const updateKey = desktopUpdateDismissKey(status);
-  if (updateKey === undefined || dismissSnapshot.reason === "user") return false;
+  if (updateKey === undefined || dismissSnapshot.reason === "user" || desktopUpdateBannerPinnedFor(status)) return false;
   if (
     !dismissSnapshot.dismissed
     && dismissSnapshot.reason === undefined
@@ -103,10 +106,11 @@ export function prepareDesktopUpdateBannerStatus(
   status: JokoDesktopUpdateStatus
 ): DesktopUpdateDismissSnapshot {
   const updateKey = desktopUpdateDismissKey(status);
+  const previousKey = dismissSnapshot.updateKey ?? dismissSnapshot.decisionKey;
   if (
     updateKey === undefined
-    || !dismissSnapshot.dismissed
-    || dismissSnapshot.updateKey === updateKey
+    || previousKey === undefined
+    || previousKey === updateKey
   ) return dismissSnapshot;
 
   dismissSnapshot = dismissSnapshot.reason === "busy"
@@ -123,6 +127,11 @@ export function currentDesktopUpdateBannerDismiss(): DesktopUpdateDismissSnapsho
 export function desktopUpdateBannerDecidedFor(status: JokoDesktopUpdateStatus): boolean {
   const updateKey = desktopUpdateDismissKey(status);
   return updateKey !== undefined && dismissSnapshot.decisionKey === updateKey;
+}
+
+export function desktopUpdateBannerPinnedFor(status: JokoDesktopUpdateStatus): boolean {
+  const updateKey = desktopUpdateDismissKey(status);
+  return updateKey !== undefined && dismissSnapshot.pinnedKey === updateKey;
 }
 
 export function isNewDesktopUpdateAfterDismiss(status: JokoDesktopUpdateStatus): boolean {

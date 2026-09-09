@@ -6,18 +6,27 @@ import {
   CAPABILITIES,
   CapabilityDrivenBackendAdapter,
   HOST_COMPOSED_CAPABILITIES,
+  JokoError,
   type AdapterContext,
   type BackendDescriptor,
   type Capability,
   type CreateNativeSessionInput,
   type HostComposedCapability,
   type KnownCapability,
+  type ManagedProviderRuntimePort,
+  type ManagedProviderRouteBinding,
+  type ManagedProviderOperationLease,
+  type ProviderRuntimeSupport,
   type NativeSessionBinding,
+  type NativeSessionDerivation,
   type NativeSessionCandidate,
   type NativeSessionCatalogEntry,
   type NativeSessionCatalogResult,
   type NativeSessionForkResult,
+  type NativeSessionNavigation,
+  type NativeSessionNavigationResult,
   type NativeHistoryProjection,
+  type NativeNavigationTarget,
   type NativeSessionState,
   type PermissionMode,
   type PromptInput,
@@ -31,7 +40,7 @@ import {
   objectValue,
   optionalString,
   parseAccountRateLimits,
-  parseBoundedThreadResult,
+  parseFullTurnPage,
   parseModels,
   parseThreadList,
   parseThreadResult,
@@ -44,7 +53,8 @@ import {
   type JsonValue,
   type NativeAccountUsageSnapshot,
   type NativeModel,
-  type NativeThread
+  type NativeThread,
+  type NativeTurn
 } from "./protocol.js";
 import { projectCodexNativeHistory } from "./native-history.js";
 import {
@@ -71,6 +81,7 @@ import {
 } from "./translator.js";
 
 export interface CodexAdapterOptions extends CodexInputResolvers {
+  readonly managedProviders?: ManagedProviderRuntimePort;
   readonly id?: string;
   readonly instanceGeneration: number;
   readonly providerId?: string;
@@ -84,6 +95,8 @@ export interface CodexAdapterOptions extends CodexInputResolvers {
   readonly maximumHistoryItems?: number;
   readonly maximumHistoryBytes?: number;
   readonly maximumHistoryEvents?: number;
+  readonly maximumHistoryPages?: number;
+  readonly historyReadTimeoutMs?: number;
   readonly now?: () => number;
   /** Product Host capabilities that do not require Adapter runtime integration. */
   readonly hostCapabilities?: readonly HostComposedCapability[];
@@ -93,6 +106,11 @@ export interface CodexAdapterOptions extends CodexInputResolvers {
   /** Exact profile roots used by the read-only local task catalog. */
   readonly catalogProfileDirectories?: readonly string[];
 }
+
+export const CODEX_MANAGED_PROVIDER_SUPPORT: ProviderRuntimeSupport = Object.freeze<ProviderRuntimeSupport>({
+  protocols: ["openai-responses"],
+  fields: ["request_path", "models_endpoint", "headers", "keyless", "model_costs", "model_input_modalities", "model_fast_mode"]
+});
 
 export interface CodexAccountSnapshot {
   readonly authenticated: boolean;
@@ -129,6 +147,9 @@ export interface CodexNativeAccountOperations {
 }
 
 interface SessionRuntime {
+  managedRoute: ManagedProviderRouteBinding | undefined;
+  managedOperation: { readonly id: string; lease?: ManagedProviderOperationLease } | undefined;
+  routeUnknown: boolean;
   readonly sessionId: string;
   readonly threadId: string;
   readonly targetId: string;
@@ -136,6 +157,7 @@ interface SessionRuntime {
   readonly binding: NativeSessionBinding;
   readonly sessionGeneration: number;
   readonly backendInstanceGeneration: number;
+  readonly dispatchLifetime: AbortController;
   context: AdapterContext;
   hostGeneration: number;
   subscription?: HostSubscription;
@@ -157,6 +179,7 @@ interface SessionRuntime {
   closed: boolean;
   disconnectTerminalEmitted: boolean;
   compaction?: CompactionWaiter;
+  rewindUnknown: boolean;
 }
 
 interface PendingServerRequest {
@@ -175,8 +198,7 @@ interface CompactionWaiter {
 
 const NATIVE_REFERENCE_PREFIX = "codex-thread:";
 const NATIVE_REFERENCE_VERSION = 1;
-const ISOLATED_REVIEW_APP_SERVER_VERSION = [0, 151, 0] as const;
-const NATIVE_COLLABORATION_APP_SERVER_VERSION = [0, 151, 0] as const;
+const AUDITED_APP_SERVER_VERSION = "0.153.4";
 const REVIEW_PERMISSION_PROFILE = "joko-review-readonly";
 const REVIEW_MAXIMUM_INVENTORY_ITEMS = 4_096;
 const REVIEW_MAXIMUM_INVENTORY_PAGES = 100;
@@ -302,6 +324,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   readonly #maximumHistoryItems: number;
   readonly #maximumHistoryBytes: number;
   readonly #maximumHistoryEvents: number;
+  readonly #maximumHistoryPages: number;
+  readonly #historyReadTimeoutMs: number;
   readonly #now: () => number;
   readonly #hostCapabilities: ReadonlySet<HostComposedCapability>;
   readonly #compactionTimeoutMs: number;
@@ -312,7 +336,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   readonly #catalogEntrySources = new WeakMap<NativeSessionCatalogEntry, CodexCatalogSource>();
   #catalogMaterializationTail: Promise<void> = Promise.resolve();
   readonly #sessions = new Map<string, SessionRuntime>();
+  readonly #sessionMutations = new Map<string, { count: number; rewinding: boolean }>();
   #models: readonly ProviderModel[] = [];
+  readonly #managedProviders: ManagedProviderRuntimePort | undefined;
   #account: CodexAccountSnapshot | undefined;
   #disposed = false;
   #disposeFlight: Promise<void> | undefined;
@@ -323,7 +349,14 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     this.id = options.id ?? "codex";
     this.#instanceGeneration = options.instanceGeneration;
     this.#providerId = options.providerId ?? "openai";
-    this.#host = options.host ?? new AppServerHost(options.appServer);
+    this.#managedProviders = options.managedProviders;
+    this.#host = options.host ?? new AppServerHost({
+      ...options.appServer,
+      transport: {
+        ...options.appServer?.transport,
+        ...(options.managedProviders === undefined ? {} : { managedEnvironment: options.managedProviders.environment })
+      }
+    });
     this.#ownsHost = options.host === undefined;
     this.#resolvers = {
       ...(options.readBlob === undefined ? {} : { readBlob: options.readBlob }),
@@ -341,6 +374,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     this.#maximumHistoryItems = options.maximumHistoryItems ?? 100_000;
     this.#maximumHistoryBytes = options.maximumHistoryBytes ?? 32 * 1024 * 1024;
     this.#maximumHistoryEvents = options.maximumHistoryEvents ?? 250_000;
+    this.#maximumHistoryPages = options.maximumHistoryPages ?? 100;
+    this.#historyReadTimeoutMs = options.historyReadTimeoutMs ?? 30_000;
     this.#now = options.now ?? Date.now;
     this.#hostCapabilities = validatedHostCapabilities(options.hostCapabilities);
     this.#compactionTimeoutMs = options.compactionTimeoutMs ?? 120_000;
@@ -365,6 +400,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       || !Number.isSafeInteger(this.#maximumHistoryItems) || this.#maximumHistoryItems < 1
       || !Number.isSafeInteger(this.#maximumHistoryBytes) || this.#maximumHistoryBytes < 1
       || !Number.isSafeInteger(this.#maximumHistoryEvents) || this.#maximumHistoryEvents < 1
+      || !Number.isSafeInteger(this.#maximumHistoryPages) || this.#maximumHistoryPages < 1
+      || !Number.isSafeInteger(this.#historyReadTimeoutMs) || this.#historyReadTimeoutMs < 1
       || !Number.isSafeInteger(this.#compactionTimeoutMs) || this.#compactionTimeoutMs < 1) {
       throw new TypeError("Codex bounds and timeouts must be positive integers.");
     }
@@ -421,6 +458,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     } else {
       this.#models = [];
     }
+    this.#models = this.#withManagedModels(this.#models);
     const authenticationState = this.#account?.authenticationState ?? "error";
     return this.#descriptor({
       version: versionFromUserAgent(this.#host.initializeResult?.userAgent),
@@ -470,6 +508,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   }
 
   async createSession(input: CreateNativeSessionInput, context: AdapterContext): Promise<NativeSessionBinding> {
+    return this.#withNativeMutation(context, () => this.#createSession(input, context));
+  }
+
+  async #createSession(input: CreateNativeSessionInput, context: AdapterContext): Promise<NativeSessionBinding> {
     this.#assertOpen();
     const runtimePolicy = reviewRuntimePolicy(input, context);
     await this.validateTarget(input.target);
@@ -523,6 +565,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           method: "thread/start",
           params: {
             cwd,
+            historyMode: "paginated",
             ...(input.modelId === undefined ? {} : { model: input.modelId }),
             ...(input.providerId === undefined ? {} : { modelProvider: input.providerId }),
             ...(reviewThreadProfile === undefined
@@ -535,11 +578,21 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             ...(runtimePolicy === "review_read_only" ? {} : permissionParams(input.permissionMode))
           }
         };
+    const managedRoute = await this.#prepareManagedRoute(input.providerId, input.modelId, context).catch(async (error) => {
+      if (reviewWorkingDirectory !== undefined) await removeReviewWorkingDirectory(reviewWorkingDirectory);
+      throw error;
+    });
+    const nativeConfiguration = this.#nativeRouteConfiguration(managedRoute);
+    if (nativeConfiguration !== undefined) {
+      const previousConfig = (request.params as JsonObject)["config"];
+      Object.assign(request.params, { config: { ...(isJsonObject(previousConfig) ? previousConfig : {}), ...nativeConfiguration } });
+    }
     let response;
     try {
       response = await this.#host.request(request.method, request.params, { mutation: true });
     } catch (error) {
       if (reviewWorkingDirectory !== undefined) await removeReviewWorkingDirectory(reviewWorkingDirectory);
+      managedRoute?.dispose();
       throw this.#requestFailure(error, "provision", "CODEX_SESSION_CREATE_FAILED", true);
     }
     let thread: NativeThread;
@@ -548,7 +601,17 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     let runtime: SessionRuntime;
     try {
       thread = parseThreadResult(response.value);
+      if (request.method === "thread/start" && thread.historyMode !== "paginated") {
+        throw adapterError({
+          code: "CODEX_HISTORY_MODE_UNCONFIRMED",
+          message: "Codex did not confirm the requested paginated history mode.",
+          phase: "provision",
+          stateMayHaveChanged: true,
+          recovery: "Inspect native Session discovery before explicitly creating another Session."
+        });
+      }
       record = objectValue(response.value, "session response");
+      this.#assertManagedRouteResponse(record, managedRoute);
       if (runtimePolicy === "review_read_only") {
         if (reviewWorkingDirectory === undefined) throw invalidReviewProfile();
         assertReviewThreadStarted(record, thread, cwd, reviewWorkingDirectory);
@@ -560,16 +623,19 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         context,
         hostGeneration: response.hostGeneration,
         permissionMode: input.permissionMode,
+        managedRoute,
         providerId: optionalString(record["modelProvider"]) ?? input.providerId,
         modelId: optionalString(record["model"]) ?? input.modelId,
         effort: input.effort ?? optionalString(record["reasoningEffort"]) ?? optionalString(record["effort"]),
         fastMode: Object.hasOwn(record, "serviceTier")
           ? isFastServiceTier(record["serviceTier"])
           : input.fastMode,
+        observedFastMode: observedFastServiceTier(record),
         name: input.name ?? thread.name ?? undefined,
         ...(reviewWorkingDirectory === undefined ? {} : { reviewWorkingDirectory })
       });
     } catch (error) {
+      managedRoute?.dispose();
       if (reviewWorkingDirectory !== undefined) await removeReviewWorkingDirectory(reviewWorkingDirectory);
       throw error;
     }
@@ -581,6 +647,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   }
 
   async resumeSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState> {
+    return this.#withNativeMutation(context, () => this.#resumeSession(binding, context));
+  }
+
+  async #resumeSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState> {
     this.#assertOpen();
     assertStandardReviewContext(context, "resume native Session history");
     this.#assertContextTarget(context, context.target);
@@ -599,11 +669,20 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       current.context = context;
       return stateFromRuntime(current);
     }
+    const managedRoute = await this.#prepareManagedRoute(context.modelSelection?.providerId, context.modelSelection?.modelId, context);
+    if (managedRoute !== undefined) {
+      if (inspection.thread.status?.["type"] === "active") { managedRoute.dispose(); throw managedRouteUnavailable(true); }
+      try { await this.#host.releaseUnboundThread(threadId, inspection.hostGeneration); }
+      catch { managedRoute.dispose(); throw managedRouteUnavailable(true); }
+    }
     const response = await this.#resumeNativeThread(
       threadId,
       inspection.workspaceRoot,
-      inspection.hostGeneration
+      inspection.hostGeneration,
+      context.modelSelection,
+      managedRoute
     ).catch((error) => {
+      managedRoute?.dispose();
       throw this.#nativeThreadResumeFailure(error);
     });
     let thread = parseThreadResult(response.value);
@@ -633,10 +712,12 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       context,
       hostGeneration: response.hostGeneration,
       permissionMode: permissionModeFromResponse(record),
+      managedRoute,
       providerId: optionalString(record["modelProvider"]),
       modelId: optionalString(record["model"]),
       effort: optionalString(record["reasoningEffort"]) ?? optionalString(record["effort"]),
       fastMode: isFastServiceTier(record["serviceTier"]),
+      observedFastMode: observedFastServiceTier(record),
       name: thread.name ?? undefined
     });
     return stateFromRuntime(runtime);
@@ -821,9 +902,11 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
 
   async getNativeHistoryProjection(context: AdapterContext): Promise<NativeHistoryProjection> {
     this.#assertOpen();
+    if (context.signal.aborted) throw nativeHistoryReadFailure("CANCELLED");
     assertStandardReviewContext(context, "read persisted native history");
     this.#assertContextTarget(context, context.target);
     await this.validateTarget(context.target);
+    if (context.signal.aborted) throw nativeHistoryReadFailure("CANCELLED");
     const binding = context.binding;
     if (binding === undefined) {
       throw adapterError({
@@ -834,36 +917,75 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       });
     }
     const currentBinding = this.#resumeBindingForContext(binding, context);
-    const threadId = threadIdFromBinding(currentBinding);
     const runtime = await this.#requireRuntime(context);
     this.#assertStandardRuntime(runtime, "read native history");
     this.#assertHistoryRuntimeFence(runtime, context, currentBinding, runtime.hostGeneration);
     try {
-      const response = await this.#host.request("thread/read", { threadId, includeTurns: true });
-      this.#assertHistoryRuntimeFence(runtime, context, currentBinding, response.hostGeneration);
-      if (serializedByteLength(response.value) > this.#maximumHistoryBytes) {
-        throw adapterError({
-          code: "CODEX_NATIVE_HISTORY_SIZE_LIMIT",
-          message: "The Codex native history exceeds the configured safe read limit.",
-          phase: "probe",
-          recovery: "Reduce the native thread history before importing or synchronizing it."
-        });
-      }
-      const thread = parseBoundedThreadResult(response.value, {
-        maximumTurns: this.#maximumHistoryTurns,
-        maximumItems: this.#maximumHistoryItems
-      });
-      await assertNativeThreadTarget(thread, threadId, runtime.targetWorkspaceRoot, "probe");
-      this.#assertHistoryRuntimeFence(runtime, context, currentBinding, response.hostGeneration);
-      return projectCodexNativeHistory(thread, { maximumEvents: this.#maximumHistoryEvents });
+      const history = await this.#readCompleteHistory(runtime, context);
+      history.assertCurrent();
+      const projection = projectCodexNativeHistory(history.thread, { maximumEvents: this.#maximumHistoryEvents });
+      history.assertCurrent();
+      return projection;
     } catch (error) {
       throw this.#requestFailure(error, "probe", "CODEX_NATIVE_HISTORY_UNAVAILABLE", false);
     }
   }
 
   async send(input: PromptInput, context: AdapterContext): Promise<void> {
+    return this.#withNativeMutation(context, () => this.#send(input, context));
+  }
+
+  async #send(input: PromptInput, context: AdapterContext): Promise<void> {
     this.#assertOpen();
-    const runtime = await this.#requireRuntime(context);
+    assertDispatchNotCancelled(context.signal);
+    this.#assertBackendContext(context);
+    // Steering owns the currently attached turn before any asynchronous preparation.
+    let runtime = input.disposition === "steer"
+      ? this.#sessions.get(context.sessionId)
+      : await this.#requireRuntime(context);
+    if (runtime === undefined) {
+      throw adapterError({
+        code: "CODEX_ACTIVE_TURN_REQUIRED",
+        message: "The Codex turn selected for steering is no longer attached.",
+        phase: "dispatch",
+        recovery: "Keep the input and explicitly send it as a new prompt after refreshing the task."
+      });
+    }
+    if (input.disposition !== "steer" && runtime.managedRoute !== undefined) {
+      try { runtime.managedRoute.assertCurrent(); }
+      catch {
+        runtime = await this.#switchNativeRoute(runtime, runtime.managedRoute.providerId, runtime.managedRoute.model.modelId, context);
+      }
+    }
+    if (runtime.routeUnknown) throw managedRouteUnavailable(true);
+    const hostGeneration = runtime.hostGeneration;
+    const dispatchSignal = AbortSignal.any([context.signal, runtime.dispatchLifetime.signal]);
+    const expectedTurnId = input.disposition === "steer" ? runtime.state.activeTurnId : undefined;
+    const assertDispatchReady = () => {
+      assertDispatchNotCancelled(dispatchSignal);
+      if (!this.#matchesCoreFence(runtime, context)
+        || runtime.hostGeneration !== hostGeneration
+        || !this.#host.isActiveGeneration(hostGeneration)) {
+        throw adapterError({
+          code: "CODEX_RUNTIME_GENERATION_STALE",
+          message: "The Codex runtime changed before input dispatch.",
+          phase: "dispatch",
+          recovery: "Refresh the Session and Backend instance before sending the input."
+        });
+      }
+      if (input.disposition === "steer" && (expectedTurnId === undefined
+        || runtime.state.activeTurnId !== expectedTurnId
+        || runtime.state.terminalTurnIds.has(expectedTurnId))) {
+        throw adapterError({
+          code: "CODEX_ACTIVE_TURN_REQUIRED",
+          message: "The Codex turn selected for steering is no longer active.",
+          phase: "dispatch",
+          recovery: "Keep the input and explicitly send it as a new prompt after refreshing the task."
+        });
+      }
+    };
+    assertDispatchReady();
+    runtime.context = context;
     if (runtime.runtimePolicy === "review_read_only" && (
       input.disposition !== "prompt"
       || input.files.length !== 0
@@ -877,7 +999,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         recovery: "Retry through the durable Joko Queue so the native client message can be reconciled."
       });
     }
-    const nativeInput = await translatePromptInput(input, context, this.#resolvers);
+    const nativeInput = await waitForDispatchPreparation(translatePromptInput(input, context, this.#resolvers), dispatchSignal);
+    assertDispatchReady();
     const clientUserMessageId = context.operationId;
     const collaborationMode = runtime.runtimePolicy === "standard"
       && supportsNativeCollaboration(this.#host.initializeResult?.userAgent)
@@ -886,29 +1009,22 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     let acceptedResponseShapePending = false;
     try {
       if (input.disposition === "steer") {
-        const turnId = runtime.state.activeTurnId;
-        if (turnId === undefined) {
-          throw adapterError({
-            code: "CODEX_ACTIVE_TURN_REQUIRED",
-            message: "The Codex thread has no active turn to steer.",
-            phase: "dispatch",
-            recovery: "Send the input as a new prompt after the current durable state is refreshed."
-          });
-        }
         const response = await this.#host.request("turn/steer", {
           threadId: runtime.threadId,
           clientUserMessageId,
           input: [...nativeInput],
-          expectedTurnId: turnId
-        }, { mutation: true });
+          expectedTurnId: expectedTurnId!
+        }, { mutation: true, signal: dispatchSignal, beforeDispatch: assertDispatchReady });
         this.#assertRuntimeFence(runtime, context, response.hostGeneration);
         acceptedResponseShapePending = true;
-        if (parseTurnSteer(response.value) !== turnId) {
+        if (parseTurnSteer(response.value) !== expectedTurnId) {
           throw new ProtocolShapeError("turn steer result does not match the active turn");
         }
         acceptedResponseShapePending = false;
         return;
       }
+      await this.#activateManagedOperation(runtime, context);
+      assertDispatchReady();
       const response = await this.#host.request("turn/start", {
         threadId: runtime.threadId,
         clientUserMessageId,
@@ -925,7 +1041,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
               serviceTierForTurn: "default"
             }
           : runtime.fastMode ? { serviceTier: "fast" } : {})
-      }, { mutation: true });
+      }, { mutation: true, signal: dispatchSignal, beforeDispatch: assertDispatchReady });
       this.#assertRuntimeFence(runtime, context, response.hostGeneration);
       acceptedResponseShapePending = true;
       const startedTurn = parseTurnStart(response.value);
@@ -943,11 +1059,12 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     } catch (error) {
       if (isAmbiguousDispatchFailure(error)
         || (acceptedResponseShapePending && error instanceof ProtocolShapeError)) {
-        const reconciled = await this.#reconcileClientMessage(runtime, context, clientUserMessageId);
+        const reconciled = await this.#reconcileClientMessage(runtime, context, clientUserMessageId, expectedTurnId);
         if (reconciled) {
           if (collaborationMode?.mode === "default") runtime.defaultCollaborationMarkerPending = false;
           return;
         }
+        if (input.disposition !== "steer") this.#releaseManagedOperation(runtime);
         throw adapterError({
           code: "CODEX_DISPATCH_UNKNOWN",
           message: "Codex may have accepted the input, but the durable outcome could not be proven.",
@@ -957,6 +1074,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           recovery: "Refresh the native thread and resolve the unknown dispatch before explicitly retrying."
         });
       }
+      if (input.disposition !== "steer") this.#releaseManagedOperation(runtime);
       if (error instanceof Error && "publicError" in error) throw error;
       throw this.#requestFailure(error, "dispatch", "CODEX_TURN_START_FAILED", false);
     }
@@ -964,6 +1082,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
 
   async abort(context: AdapterContext): Promise<void> {
     const runtime = await this.#requireRuntime(context);
+    this.#releaseManagedOperation(runtime);
     const turnId = runtime.state.activeTurnId;
     if (turnId === undefined) return;
     try {
@@ -991,6 +1110,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         recovery: "Refresh the Session binding before closing it."
       });
     }
+    runtime.dispatchLifetime.abort();
     await this.#emitNativeTaskPayloads(
       runtime,
       runtime.nativeTasks.terminateActive("stopped"),
@@ -1017,6 +1137,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const runtime = this.#sessions.get(context.sessionId);
     if (runtime === undefined || threadIdFromBinding(binding) !== runtime.threadId) return;
     this.#assertRuntimeFence(runtime, context, runtime.hostGeneration, false);
+    runtime.dispatchLifetime.abort();
     await this.#emitNativeTaskPayloads(
       runtime,
       runtime.nativeTasks.terminateActive("stopped"),
@@ -1040,17 +1161,45 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
 
   override async deleteSession(binding: NativeSessionBinding, context: AdapterContext): Promise<void> {
     assertStandardReviewContext(context, "delete native Session state");
+    this.#assertOpen();
     this.#assertBackendContext(context);
     const threadId = threadIdFromBinding(binding);
+    const profileKey = await this.#activeProfileKey;
+    this.#assertOpen();
+    this.#assertBackendContext(context);
+    if (parseNativeReference(binding.opaqueRef).profileKey !== profileKey) throw invalidNativeReference();
+    if (context.target.backendId !== this.id
+      || binding.generation !== context.generation
+      || context.binding?.opaqueRef !== binding.opaqueRef
+      || context.binding.generation !== binding.generation) {
+      throw adapterError({
+        code: "CODEX_SESSION_BINDING_MISMATCH",
+        message: "The Codex delete request does not match its owning Session binding.",
+        phase: "shutdown",
+        recovery: "Refresh the durable Session binding before deleting native state."
+      });
+    }
+    if ([...this.#sessions.values()].some((runtime) => runtime.threadId === threadId && runtime.sessionId !== context.sessionId)) {
+      throw adapterError({
+        code: "CODEX_SESSION_ACTIVE",
+        message: "Another product Session is still using the native Codex thread.",
+        phase: "shutdown",
+        recovery: "Detach the owning Session before deleting native state."
+      });
+    }
     await this.closeSession(binding, context);
     try {
-      await this.#host.request("thread/delete", { threadId }, { mutation: true });
+      await this.#host.request("thread/delete", { threadId }, { mutation: true, signal: context.signal });
     } catch (error) {
       throw this.#requestFailure(error, "shutdown", "CODEX_SESSION_DELETE_FAILED", true);
     }
   }
 
   override async setName(name: string, context: AdapterContext): Promise<void> {
+    return this.#withNativeMutation(context, () => this.#setName(name, context));
+  }
+
+  async #setName(name: string, context: AdapterContext): Promise<void> {
     if (name.trim().length === 0) {
       throw adapterError({
         code: "CODEX_SESSION_NAME_INVALID",
@@ -1068,6 +1217,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   }
 
   override async compact(customInstructions: string | undefined, context: AdapterContext): Promise<"compacted" | "noop"> {
+    return this.#withNativeMutation(context, () => this.#compact(customInstructions, context));
+  }
+
+  async #compact(customInstructions: string | undefined, context: AdapterContext): Promise<"compacted" | "noop"> {
     if (customInstructions !== undefined && customInstructions.trim().length > 0) {
       return this.unsupported("context.compact.custom_instructions");
     }
@@ -1086,7 +1239,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     void completion.catch(() => undefined);
     let response;
     try {
-      response = await this.#host.request("thread/compact/start", { threadId: runtime.threadId }, { mutation: true });
+      await this.#activateManagedOperation(runtime, context);
+      response = await this.#host.request("thread/compact/start", { threadId: runtime.threadId }, { mutation: true, signal: context.signal });
       this.#assertRuntimeFence(runtime, context, response.hostGeneration);
       await completion;
       this.#assertRuntimeFence(runtime, context, response.hostGeneration);
@@ -1098,24 +1252,139 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     return "compacted";
   }
 
-  override async fork(entryId: string, context: AdapterContext): Promise<NativeSessionForkResult> {
+  override async fork(entryId: string, context: AdapterContext, derivation: NativeSessionDerivation): Promise<NativeSessionForkResult> {
+    return this.#withNativeMutation(context, () => this.#fork(entryId, context, derivation));
+  }
+
+  async #fork(entryId: string, context: AdapterContext, derivation: NativeSessionDerivation): Promise<NativeSessionForkResult> {
     const runtime = await this.#requireRuntime(context);
     this.#assertStandardRuntime(runtime, "fork the native thread");
     return {
-      binding: await this.#forkThread(runtime, context, entryId)
+      binding: await this.#forkThread(runtime, context, derivation, entryId)
     };
   }
 
-  override async clone(context: AdapterContext): Promise<NativeSessionBinding> {
+  override async clone(context: AdapterContext, derivation: NativeSessionDerivation): Promise<NativeSessionBinding> {
+    return this.#withNativeMutation(context, () => this.#clone(context, derivation));
+  }
+
+  async #clone(context: AdapterContext, derivation: NativeSessionDerivation): Promise<NativeSessionBinding> {
     const runtime = await this.#requireRuntime(context);
     this.#assertStandardRuntime(runtime, "clone the native thread");
-    return this.#forkThread(runtime, context);
+    return this.#forkThread(runtime, context, derivation);
+  }
+
+  override async navigateTree(target: NativeNavigationTarget, summarize: boolean, context: AdapterContext, customInstructions: string | undefined, _navigation: NativeSessionNavigation): Promise<NativeSessionNavigationResult> {
+    this.#assertOpen();
+    this.#assertBackendContext(context);
+    assertDispatchNotCancelled(context.signal);
+    if (summarize || customInstructions !== undefined) return this.unsupported("session.tree.summary");
+    const runtime = this.#sessions.get(context.sessionId);
+    if (runtime === undefined || !this.#matchesCoreFence(runtime, context)) throw nativeHistoryReadFailure("STALE");
+    this.#assertStandardRuntime(runtime, "rewind native history");
+    if (runtime.rewindUnknown) throw rewindUnknown();
+    const existing = this.#sessionMutations.get(context.sessionId);
+    if (existing !== undefined) throw rewindBusy();
+    const admission = { count: 0, rewinding: true };
+    this.#sessionMutations.set(context.sessionId, admission);
+    const hostGeneration = runtime.hostGeneration;
+    const signal = AbortSignal.any([context.signal, runtime.dispatchLifetime.signal]);
+    const assertIdle = () => {
+      assertDispatchNotCancelled(signal);
+      if (!this.#matchesCoreFence(runtime, context) || runtime.hostGeneration !== hostGeneration
+        || !this.#host.isActiveGeneration(hostGeneration)) throw nativeHistoryReadFailure("STALE");
+      if (runtime.state.activeTurnId !== undefined || runtime.compaction !== undefined
+        || runtime.pendingServerRequests.size !== 0 || runtime.nativeTasks.hasActiveTasks()
+        || this.#host.hasPendingThreadNotifications(runtime.threadId, hostGeneration)) throw rewindBusy();
+    };
+    try {
+      assertIdle();
+      const history = await this.#readCompleteHistory(runtime, context);
+      assertIdle();
+      assertRewindableHistory(history.thread);
+      for (const lineage of runtime.nativeTasks.mergeHistory(history.thread)) {
+        await this.#host.registerDescendantThread(lineage.childThreadId, lineage.parentThreadId, hostGeneration);
+        history.assertCurrent();
+      }
+      assertIdle();
+      const index = target.kind === "session_start" ? -1
+        : history.thread.turns.findIndex((turn) => turn.id === target.entryId || turn.items.some((item) => item.id === target.entryId));
+      if (target.kind === "native_entry") {
+        if (index < 0) throw rewindBoundaryUnavailable();
+        const selected = history.thread.turns[index]!;
+        if (selected.id !== target.entryId && selected.items.at(-1)?.id !== target.entryId) throw rewindBoundaryUnavailable();
+      }
+      const excluded = history.thread.turns[index + 1];
+      const beforeDispatch = () => { assertIdle(); history.assertCurrent(); };
+      beforeDispatch();
+      if (excluded === undefined) return { kind: "in_place" };
+      const expectedPrefix = history.thread.turns.slice(0, index + 1).map(fullTurnSignature);
+      let response;
+      try {
+        response = await this.#host.request("thread/revert", { threadId: runtime.threadId, beforeTurnId: excluded.id }, {
+          mutation: true, signal, beforeDispatch
+        });
+      } catch (error) {
+        if (!isAmbiguousDispatchFailure(error)) {
+          throw this.#requestFailure(error, "dispatch", "CODEX_REWIND_REJECTED", false);
+        }
+      }
+      try {
+        const confirmationSignal = AbortSignal.any([signal, AbortSignal.timeout(this.#historyReadTimeoutMs)]);
+        const confirmationContext = { ...context, signal: confirmationSignal };
+        if (response !== undefined) {
+          const rawThread = objectValue(objectValue(response.value, "revert result")["thread"], "revert metadata");
+          if (!Array.isArray(rawThread["turns"]) || rawThread["turns"].length !== 0) throw new ProtocolShapeError("revert result must contain metadata only");
+          const thread = parseThreadResult(response.value);
+          if (thread.id !== runtime.threadId || thread.historyMode !== "paginated") throw new ProtocolShapeError("revert thread identity changed");
+          this.#assertRuntimeFence(runtime, context, response.hostGeneration);
+          await waitForHistoryRead(assertNativeThreadTarget(thread, runtime.threadId, runtime.targetWorkspaceRoot, "probe"),
+            confirmationSignal, rewindUnknown);
+        }
+        // A lost acknowledgement is never resent. Only the exact retained
+        // prefix, read from the same live owner, can confirm the desired state.
+        const confirm = async () => {
+          await this.#host.waitForThreadNotifications(runtime.threadId, hostGeneration, confirmationSignal);
+          assertIdle();
+          return this.#readCompleteHistory(runtime, confirmationContext);
+        };
+        let retained;
+        try { retained = await confirm(); }
+        catch (error) {
+          if (!(error instanceof JokoError) || error.publicError.code !== "CODEX_NATIVE_HISTORY_STALE") throw error;
+          // The native acknowledgement can precede its own reverted/status
+          // notification. Retry only the read, within the same total deadline.
+          retained = await confirm();
+        }
+        assertIdle();
+        assertRewindableHistory(retained.thread);
+        if (JSON.stringify(retained.thread.turns.map(fullTurnSignature)) !== JSON.stringify(expectedPrefix)) throw new ProtocolShapeError("revert retained prefix differs");
+        retained.assertCurrent();
+        const retainedDescendants = runtime.nativeTasks.replaceHistory(retained.thread);
+        this.#host.retainDescendantThreads(runtime.threadId, hostGeneration, new Set(retainedDescendants.map((lineage) => lineage.childThreadId)));
+        runtime.state.activeTurnId = undefined;
+        runtime.state.usage = undefined;
+        runtime.state.itemNames.clear();
+        runtime.state.terminalTurnIds.clear();
+        for (const turn of retained.thread.turns) runtime.state.terminalTurnIds.add(turn.id);
+      } catch {
+        runtime.rewindUnknown = true;
+        throw rewindUnknown();
+      }
+    } finally {
+      if (this.#sessionMutations.get(context.sessionId) === admission) this.#sessionMutations.delete(context.sessionId);
+    }
+    return { kind: "in_place" };
   }
 
   override async setModel(providerId: string, modelId: string, context: AdapterContext): Promise<ProviderModel> {
-    const runtime = await this.#requireRuntime(context);
+    return this.#withNativeMutation(context, () => this.#setModel(providerId, modelId, context));
+  }
+
+  async #setModel(providerId: string, modelId: string, context: AdapterContext): Promise<ProviderModel> {
+    let runtime = await this.#requireRuntime(context);
     this.#assertStandardRuntime(runtime, "change the model");
-    const models = this.#models.length === 0 ? await this.listModels() : this.#models;
+    const models = this.#withManagedModels(this.#models.length === 0 ? await this.listModels() : this.#models);
     const model = models.find((candidate) => candidate.providerId === providerId && candidate.modelId === modelId);
     if (model === undefined) {
       throw adapterError({
@@ -1124,6 +1393,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         phase: "dispatch",
         recovery: "Refresh the model catalog and choose an available model."
       });
+    }
+    if (runtime.providerId !== providerId || runtime.managedRoute !== undefined || this.#managedProviders?.hasProvider(providerId)) {
+      runtime = await this.#switchNativeRoute(runtime, providerId, modelId, context);
     }
     const nextEffort = runtime.effort !== undefined && model.thinkingLevels.includes(runtime.effort)
       ? runtime.effort
@@ -1146,6 +1418,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   }
 
   override async setEffort(level: string, context: AdapterContext): Promise<void> {
+    return this.#withNativeMutation(context, () => this.#setEffort(level, context));
+  }
+
+  async #setEffort(level: string, context: AdapterContext): Promise<void> {
     const runtime = await this.#requireRuntime(context);
     this.#assertStandardRuntime(runtime, "change reasoning effort");
     const model = await this.#requireRuntimeModel(runtime);
@@ -1173,6 +1449,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   }
 
   override async setFastMode(enabled: boolean, context: AdapterContext): Promise<void> {
+    return this.#withNativeMutation(context, () => this.#setFastMode(enabled, context));
+  }
+
+  async #setFastMode(enabled: boolean, context: AdapterContext): Promise<void> {
     const runtime = await this.#requireRuntime(context);
     this.#assertStandardRuntime(runtime, "change Fast Mode");
     if (enabled) {
@@ -1197,6 +1477,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   }
 
   override async setPermissionMode(mode: PermissionMode, context: AdapterContext): Promise<void> {
+    return this.#withNativeMutation(context, () => this.#setPermissionMode(mode, context));
+  }
+
+  async #setPermissionMode(mode: PermissionMode, context: AdapterContext): Promise<void> {
     if (mode === "bypassPermissions" && !context.target.trusted) {
       throw adapterError({
         code: "CODEX_FULL_ACCESS_REQUIRES_TRUST",
@@ -1216,7 +1500,17 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     runtime.permissionMode = mode;
   }
 
+  supportsDetachedSessionDeletion(context: AdapterContext): boolean {
+    return context.runtimePolicy !== "review_read_only"
+      && context.target.backendId === this.id
+      && context.backendInstanceGeneration === this.#instanceGeneration;
+  }
+
   override async setPlanMode(enabled: boolean, context: AdapterContext): Promise<void> {
+    return this.#withNativeMutation(context, () => this.#setPlanMode(enabled, context));
+  }
+
+  async #setPlanMode(enabled: boolean, context: AdapterContext): Promise<void> {
     if (!supportsNativeCollaboration(this.#host.initializeResult?.userAgent)) {
       return this.unsupported("plan_mode");
     }
@@ -1226,6 +1520,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const effort = runtime.effort !== undefined && model.thinkingLevels.includes(runtime.effort)
       ? runtime.effort
       : undefined;
+    runtime.state.observedFastMode = undefined;
     const response = await this.#host.request("thread/settings/update", {
       threadId: runtime.threadId,
       collaborationMode: collaborationModeValue(enabled, model.modelId, effort, null)
@@ -1332,8 +1627,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     this.#assertOpen();
     const account = this.#account ?? await this.readAccount();
     if (!codexAccountModelsAvailable(account.authenticationState)) {
-      this.#models = [];
-      return [];
+      this.#models = this.#withManagedModels([]);
+      return this.#models;
     }
     const models: ProviderModel[] = [];
     const nativeIds = new Set<string>();
@@ -1359,14 +1654,14 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           nativeIds.add(identity);
           models.push(modelFromNative(native, this.#providerId));
           if (models.length >= this.#maximumModels) {
-            this.#models = models;
-            return models;
+            this.#models = this.#withManagedModels(models);
+            return this.#models;
           }
         }
         cursor = nextPaginationCursor(page.nextCursor, seenCursors, "CODEX_MODEL_PAGINATION_INVALID", "model discovery");
       } while (cursor !== undefined);
-      this.#models = models;
-      return models;
+      this.#models = this.#withManagedModels(models);
+      return this.#models;
     } catch (error) {
       this.#models = [];
       throw this.#requestFailure(error, "probe", "CODEX_MODEL_DISCOVERY_FAILED", false);
@@ -1377,6 +1672,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     if (this.#disposeFlight !== undefined) return this.#disposeFlight;
     if (this.#disposed) return Promise.resolve();
     this.#disposed = true;
+    this.#managedProviders?.dispose();
     const flight = this.#disposeRuntimes();
     this.#disposeFlight = flight;
     return flight;
@@ -1385,6 +1681,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   forceDispose(): Promise<void> {
     if (this.#forceDisposeFlight !== undefined) return this.#forceDisposeFlight;
     this.#disposed = true;
+    this.#managedProviders?.dispose();
     const flight = this.#forceDisposeRuntimes();
     this.#forceDisposeFlight = flight;
     return flight;
@@ -1392,6 +1689,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
 
   async #disposeRuntimes(): Promise<void> {
     const runtimes = [...this.#sessions.values()];
+    for (const runtime of runtimes) runtime.dispatchLifetime.abort();
     await Promise.allSettled(runtimes.map((runtime) => this.#emitNativeTaskPayloads(
       runtime,
       runtime.nativeTasks.terminateActive("stopped"),
@@ -1418,6 +1716,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
 
   async #forceDisposeRuntimes(): Promise<void> {
     const runtimes = [...this.#sessions.values()];
+    for (const runtime of runtimes) runtime.dispatchLifetime.abort();
     await Promise.allSettled(runtimes.map((runtime) => this.#emitNativeTaskPayloads(
       runtime,
       runtime.nativeTasks.terminateActive("stopped"),
@@ -1445,12 +1744,16 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   async #resumeNativeThread(
     threadId: string,
     workspaceRoot: string,
-    expectedHostGeneration: number
+    expectedHostGeneration: number,
+    selection?: { readonly providerId: string; readonly modelId: string },
+    managedRoute?: ManagedProviderRouteBinding
   ) {
     const response = await this.#host.request("thread/resume", {
       threadId,
       cwd: workspaceRoot,
-      excludeTurns: true
+      excludeTurns: true,
+      ...(selection === undefined ? {} : { modelProvider: selection.providerId, model: selection.modelId }),
+      ...(this.#nativeRouteConfiguration(managedRoute) === undefined ? {} : { config: this.#nativeRouteConfiguration(managedRoute)! })
     }, { mutation: false });
     if (response.hostGeneration !== expectedHostGeneration) {
       throw adapterError({
@@ -1463,6 +1766,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     }
     const thread = parseThreadResult(response.value);
     await assertNativeThreadTarget(thread, threadId, workspaceRoot, "provision");
+    this.#assertManagedRouteResponse(objectValue(response.value, "resume response"), managedRoute);
     return response;
   }
 
@@ -1510,6 +1814,132 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       });
     }
     return resumed;
+  }
+
+  #withManagedModels(models: readonly ProviderModel[]): readonly ProviderModel[] {
+    const managed = this.#managedProviders?.listModels() ?? [];
+    if (managed.some((model) => model.providerId === this.#providerId)) throw managedRouteUnavailable();
+    return [...models.filter((model) => model.providerId === this.#providerId), ...managed];
+  }
+
+  async #prepareManagedRoute(providerId: string | undefined, modelId: string | undefined, context: AdapterContext): Promise<ManagedProviderRouteBinding | undefined> {
+    if (providerId === undefined) return undefined;
+    if (!this.#managedProviders?.hasProvider(providerId)) {
+      if (providerId !== this.#providerId) throw managedRouteUnavailable();
+      return undefined;
+    }
+    if (providerId === this.#providerId || modelId === undefined) throw managedRouteUnavailable();
+    const route = await this.#managedProviders.prepare({
+      backendId: this.id,
+      backendInstanceGeneration: this.#instanceGeneration,
+      targetId: context.target.id,
+      sessionId: context.sessionId,
+      sessionGeneration: context.generation,
+      providerId,
+      modelId
+    });
+    try {
+      this.#assertBackendContext(context);
+      assertDispatchNotCancelled(context.signal);
+      if (route.providerId !== providerId || route.model.providerId !== providerId || route.model.modelId !== modelId || route.protocol !== "openai-responses") throw managedRouteUnavailable();
+      route.assertCurrent();
+      return route;
+    } catch (error) {
+      route.dispose();
+      throw error;
+    }
+  }
+
+  #nativeRouteConfiguration(route?: ManagedProviderRouteBinding): JsonObject | undefined {
+    if (this.#managedProviders === undefined) return undefined;
+    return {
+      "shell_environment_policy.exclude": [...this.#managedProviders.secretEnvironmentNames],
+      ...(route === undefined ? {} : {
+        model_providers: { [route.providerId]: {
+          name: route.providerId,
+          base_url: route.baseUrl,
+          wire_api: "responses",
+          env_key: route.apiKeyEnvironment,
+          requires_openai_auth: false,
+          supports_websockets: false,
+          request_max_retries: 0,
+          stream_max_retries: 0
+        } }
+      })
+    };
+  }
+
+  #assertManagedRouteResponse(record: JsonObject, route?: ManagedProviderRouteBinding): void {
+    if (route !== undefined && (record["modelProvider"] !== route.providerId || record["model"] !== route.model.modelId)) {
+      throw managedRouteUnavailable(true);
+    }
+  }
+
+  async #activateManagedOperation(runtime: SessionRuntime, context: AdapterContext): Promise<void> {
+    if (runtime.routeUnknown) throw managedRouteUnavailable(true);
+    const route = runtime.managedRoute;
+    if (route === undefined) {
+      if (runtime.providerId !== undefined && this.#managedProviders?.hasProvider(runtime.providerId)) throw managedRouteUnavailable();
+      return;
+    }
+    if (runtime.managedOperation !== undefined || context.operationId === undefined) throw managedRouteUnavailable();
+    route.assertCurrent();
+    const operation: NonNullable<SessionRuntime["managedOperation"]> = { id: context.operationId };
+    runtime.managedOperation = operation;
+    const signal = AbortSignal.any([context.signal, runtime.dispatchLifetime.signal]);
+    const assertCurrent = () => {
+      assertDispatchNotCancelled(signal);
+      if (runtime.managedOperation !== operation || !this.#isRuntimeCurrent(runtime, runtime.hostGeneration)) throw managedRouteUnavailable();
+    };
+    try {
+      const lease = await route.activate({ operationId: operation.id, signal, assertCurrent });
+      try { assertCurrent(); } catch (error) { lease.release(); throw error; }
+      operation.lease = lease;
+    } catch (error) {
+      if (runtime.managedOperation === operation) runtime.managedOperation = undefined;
+      throw error;
+    }
+  }
+
+  #releaseManagedOperation(runtime: SessionRuntime): void {
+    const operation = runtime.managedOperation;
+    runtime.managedOperation = undefined;
+    operation?.lease?.release();
+  }
+
+  async #switchNativeRoute(runtime: SessionRuntime, providerId: string, modelId: string, context: AdapterContext): Promise<SessionRuntime> {
+    if (runtime.state.activeTurnId !== undefined || runtime.compaction !== undefined || runtime.nativeTasks.hasActiveTasks()) throw managedRouteUnavailable();
+    const route = await this.#prepareManagedRoute(providerId, modelId, context);
+    const generation = runtime.hostGeneration;
+    const assertCurrent = () => {
+      assertDispatchNotCancelled(context.signal);
+      this.#assertRuntimeFence(runtime, context, generation);
+    };
+    try {
+      assertCurrent();
+      // Native resume on an already loaded thread ignores changed Provider config.
+      await this.#releaseRuntimeSubscription(runtime, false);
+      assertCurrent();
+      await this.#host.releaseUnboundThread(runtime.threadId, generation);
+      assertCurrent();
+      const response = await this.#resumeNativeThread(runtime.threadId, runtime.targetWorkspaceRoot, generation, { providerId, modelId }, route);
+      assertCurrent();
+      const record = objectValue(response.value, "route resume response");
+      if (record["modelProvider"] !== providerId || record["model"] !== modelId) throw managedRouteUnavailable(true);
+      const next = await this.#installRuntime({
+        thread: parseThreadResult(response.value), binding: runtime.binding, context, hostGeneration: generation,
+        permissionMode: runtime.permissionMode, providerId, modelId, managedRoute: route,
+        effort: runtime.effort, fastMode: runtime.fastMode, name: runtime.name
+      });
+      next.planMode = runtime.planMode;
+      next.collaborationTouched = runtime.collaborationTouched;
+      next.defaultCollaborationMarkerPending = runtime.defaultCollaborationMarkerPending;
+      return next;
+    } catch (error) {
+      route?.dispose();
+      runtime.routeUnknown = true;
+      throw managedRouteUnavailable(true);
+    }
   }
 
   async #validateModelSelection(
@@ -1704,6 +2134,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   }
 
   async #installRuntime(input: {
+    readonly managedRoute?: ManagedProviderRouteBinding | undefined;
     readonly thread: NativeThread;
     readonly binding: NativeSessionBinding;
     readonly context: AdapterContext;
@@ -1713,6 +2144,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     readonly modelId?: string;
     readonly effort?: string;
     readonly fastMode?: boolean;
+    readonly observedFastMode?: boolean;
     readonly name?: string;
     readonly reviewWorkingDirectory?: string;
   }): Promise<SessionRuntime> {
@@ -1725,6 +2157,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     );
     const previous = this.#sessions.get(input.context.sessionId);
     if (previous !== undefined) {
+      previous.dispatchLifetime.abort();
       await this.#emitNativeTaskPayloads(
         previous,
         previous.nativeTasks.terminateActive("stopped"),
@@ -1762,6 +2195,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       ? []
       : nativeTasks.seed(input.thread);
     const runtime: SessionRuntime = {
+      managedRoute: input.managedRoute,
+      managedOperation: undefined,
+      routeUnknown: false,
       sessionId: input.context.sessionId,
       threadId: input.thread.id,
       targetId: input.context.target.id,
@@ -1769,6 +2205,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       binding: input.binding,
       sessionGeneration: input.context.generation,
       backendInstanceGeneration: backendGeneration(input.context),
+      dispatchLifetime: new AbortController(),
       context: input.context,
       hostGeneration: input.hostGeneration,
       state,
@@ -1786,9 +2223,11 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       runtimePolicy: input.context.runtimePolicy === "review_read_only" ? "review_read_only" : "standard",
       ...(input.reviewWorkingDirectory === undefined ? {} : { reviewWorkingDirectory: input.reviewWorkingDirectory }),
       closed: false,
+      rewindUnknown: false,
       disconnectTerminalEmitted: false
     };
     this.#sessions.set(input.context.sessionId, runtime);
+    runtime.state.observedFastMode = input.observedFastMode;
     try {
       const subscriptionFlight = this.#host.subscribe(input.thread.id, input.hostGeneration, {
         onNotification: async (method, params) => {
@@ -1798,6 +2237,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             return;
           }
           if (!this.#acceptTurnNotification(runtime, method, params)) return;
+          if (method === "turn/completed") this.#releaseManagedOperation(runtime);
           const events = this.#translator.translate(method, params, runtime.state);
           for (const event of events) {
             if (!this.#isRuntimeCurrent(runtime, input.hostGeneration)) return;
@@ -1928,6 +2368,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         },
         onDisconnect: async (fault) => {
           if (!this.#matchesCallbackFence(runtime, input.hostGeneration) || runtime.disconnectTerminalEmitted) return;
+          runtime.dispatchLifetime.abort();
+          runtime.managedRoute?.dispose();
           runtime.disconnectTerminalEmitted = true;
           this.#cancelPendingServerRequests(runtime);
           runtime.state.activeTurnId = undefined;
@@ -1999,6 +2441,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       }
       return runtime;
     } catch (error) {
+      runtime.dispatchLifetime.abort();
       runtime.closed = true;
       if (this.#sessions.get(input.context.sessionId) === runtime) this.#sessions.delete(input.context.sessionId);
       this.#cancelPendingServerRequests(runtime);
@@ -2102,6 +2545,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   }
 
   async #releaseRuntimeSubscription(runtime: SessionRuntime, unsubscribe: boolean): Promise<void> {
+    this.#releaseManagedOperation(runtime);
+    runtime.managedRoute?.dispose();
     try {
       const flight = runtime.subscriptionFlight;
       const subscription = runtime.subscription ?? (flight === undefined ? undefined : await flight.catch(() => undefined));
@@ -2116,22 +2561,22 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     }
   }
 
-  async #reconcileClientMessage(runtime: SessionRuntime, context: AdapterContext, clientId: string): Promise<boolean> {
+  async #reconcileClientMessage(runtime: SessionRuntime, context: AdapterContext, clientId: string, expectedTurnId?: string): Promise<boolean> {
     try {
-      const response = await this.#host.request("thread/read", { threadId: runtime.threadId, includeTurns: true });
-      this.#assertRuntimeFence(runtime, context, response.hostGeneration);
-      const thread = parseThreadResult(response.value);
-      const targetWorkspaceRoot = await realpath(context.target.workspaceRoot);
-      await assertNativeThreadTarget(
-        thread,
-        runtime.threadId,
-        runtime.reviewWorkingDirectory ?? targetWorkspaceRoot,
-        "probe"
-      );
-      for (const turn of thread.turns) {
+      const history = await this.#readCompleteHistory(runtime, context);
+      history.assertCurrent();
+      for (const turn of history.thread.turns) {
+        if (expectedTurnId !== undefined && turn.id !== expectedTurnId) continue;
         for (const item of turn.items) {
           if (item.type === "userMessage" && item["clientId"] === clientId) {
-            runtime.state.activeTurnId = turn.status === "inProgress" ? turn.id : undefined;
+            history.assertCurrent();
+            if (expectedTurnId === undefined
+              && (runtime.state.activeTurnId === undefined || runtime.state.activeTurnId === turn.id)) {
+              const tail = history.thread.turns.at(-1);
+              runtime.state.activeTurnId = tail?.status === "inProgress" && !runtime.state.terminalTurnIds.has(tail.id)
+                ? tail.id
+                : undefined;
+            }
             return true;
           }
         }
@@ -2167,34 +2612,92 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   #settleCompaction(runtime: SessionRuntime, error?: unknown): void {
     const waiter = runtime.compaction;
     if (waiter === undefined) return;
+    this.#releaseManagedOperation(runtime);
     runtime.compaction = undefined;
     clearTimeout(waiter.timer);
     if (error === undefined) waiter.resolve();
     else waiter.reject(error);
   }
 
-  async #forkThread(runtime: SessionRuntime, context: AdapterContext, nativeBoundaryId?: string): Promise<NativeSessionBinding> {
-    const lastTurnId = nativeBoundaryId === undefined
+  async #forkThread(runtime: SessionRuntime, context: AdapterContext, derivation: NativeSessionDerivation, nativeBoundaryId?: string): Promise<NativeSessionBinding> {
+    const hostGeneration = runtime.hostGeneration;
+    const dispatchSignal = AbortSignal.any([context.signal, runtime.dispatchLifetime.signal]);
+    const boundary = nativeBoundaryId === undefined
       ? undefined
       : await this.#resolveForkTurnId(runtime, context, nativeBoundaryId);
+    const profileKey = await this.#activeProfileKey;
+    const assertForkDispatch = () => {
+      assertDispatchNotCancelled(dispatchSignal);
+      if (!this.#matchesCoreFence(runtime, context)
+        || runtime.hostGeneration !== hostGeneration
+        || !this.#host.isActiveGeneration(hostGeneration)) {
+        throw adapterError({
+          code: "CODEX_RUNTIME_GENERATION_STALE",
+          message: "The Codex runtime changed before the derived Session could be dispatched.",
+          phase: "dispatch",
+          recovery: "Refresh the source Session before explicitly deriving a new Session."
+        });
+      }
+      boundary?.assertCurrent();
+    };
+    assertForkDispatch();
     let response;
     try {
       response = await this.#host.request("thread/fork", {
         threadId: runtime.threadId,
-        ...(lastTurnId === undefined ? {} : { lastTurnId }),
+        ...(boundary === undefined ? {} : { lastTurnId: boundary.turnId }),
         cwd: context.target.workspaceRoot,
         excludeTurns: true
-      }, { mutation: true });
+      }, { mutation: true, signal: dispatchSignal, beforeDispatch: assertForkDispatch });
     } catch (error) {
-      throw this.#requestFailure(error, "dispatch", "CODEX_SESSION_FORK_FAILED", true);
+      throw this.#requestFailure(error, "dispatch", "CODEX_SESSION_FORK_FAILED",
+        error instanceof TransportFault ? error.stateMayHaveChanged : true);
     }
-    this.#assertRuntimeFence(runtime, context, response.hostGeneration);
-    const thread = parseThreadResult(response.value);
-    await this.#host.releaseUnboundThread(thread.id, response.hostGeneration);
-    return bindingForThread(thread.id, context.generation, await this.#activeProfileKey);
+    let threadId: string;
+    try {
+      threadId = stringValue(objectValue(objectValue(response.value, "fork result")["thread"], "fork thread")["id"], "fork thread id");
+      if (!isValidNativeThreadId(threadId)) throw new ProtocolShapeError("Invalid fork thread identity");
+    } catch (error) {
+      throw this.#requestFailure(error, "dispatch", "CODEX_SESSION_FORK_INVALID_RESPONSE", true);
+    }
+    if (threadId === runtime.threadId || [...this.#sessions.values()].some((session) => session.threadId === threadId)) {
+      throw adapterError({
+        code: "CODEX_SESSION_FORK_IDENTITY_MISMATCH",
+        message: "Codex did not return a distinct native thread for the fork.",
+        phase: "dispatch",
+        stateMayHaveChanged: true,
+        recovery: "Refresh native Session discovery before explicitly retrying the fork."
+      });
+    }
+    const binding = bindingForThread(threadId, context.generation, profileKey);
+    try {
+      derivation.recordBinding(binding);
+      this.#assertRuntimeFence(runtime, context, response.hostGeneration);
+      let thread: NativeThread;
+      try {
+        thread = parseThreadResult(response.value);
+      } catch (error) {
+        throw this.#requestFailure(error, "dispatch", "CODEX_SESSION_FORK_INVALID_RESPONSE", true);
+      }
+      if (!(await nativeThreadMatchesWorkspace(thread, runtime.targetWorkspaceRoot))) {
+        throw adapterError({
+          code: "CODEX_SESSION_FORK_TARGET_MISMATCH",
+          message: "The derived Codex native thread does not match the source Target workspace.",
+          phase: "dispatch",
+          stateMayHaveChanged: true,
+          recovery: "Inspect native Session discovery for the selected Target before explicitly retrying the fork."
+        });
+      }
+      this.#assertRuntimeFence(runtime, context, response.hostGeneration);
+      return binding;
+    } finally {
+      await this.#host.releaseUnboundThread(threadId, response.hostGeneration).catch((error) => {
+        throw this.#requestFailure(error, "shutdown", "CODEX_SESSION_FORK_DETACH_FAILED", true);
+      });
+    }
   }
 
-  async #resolveForkTurnId(runtime: SessionRuntime, context: AdapterContext, nativeBoundaryId: string): Promise<string> {
+  async #resolveForkTurnId(runtime: SessionRuntime, context: AdapterContext, nativeBoundaryId: string): Promise<{ readonly turnId: string; readonly assertCurrent: () => void }> {
     if (nativeBoundaryId.length === 0 || nativeBoundaryId.length > 512 || /[\u0000-\u001f]/.test(nativeBoundaryId)) {
       throw adapterError({
         code: "CODEX_FORK_BOUNDARY_INVALID",
@@ -2203,15 +2706,14 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         recovery: "Choose a durable message from the current native thread."
       });
     }
-    let response;
+    let history;
     try {
-      response = await this.#host.request("thread/read", { threadId: runtime.threadId, includeTurns: true });
+      history = await this.#readCompleteHistory(runtime, context);
     } catch (error) {
       throw this.#requestFailure(error, "probe", "CODEX_FORK_BOUNDARY_UNAVAILABLE", false);
     }
-    this.#assertRuntimeFence(runtime, context, response.hostGeneration);
-    const thread = parseThreadResult(response.value);
-    const turn = thread.turns.find((candidate) => candidate.id === nativeBoundaryId || candidate.items.some((item) =>
+    history.assertCurrent();
+    const turn = history.thread.turns.find((candidate) => candidate.id === nativeBoundaryId || candidate.items.some((item) =>
       item.id === nativeBoundaryId || (item.type === "userMessage" && item["clientId"] === nativeBoundaryId)
     ));
     if (turn === undefined) {
@@ -2232,7 +2734,107 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         recovery: "Wait for the turn to finish or interrupt it before forking."
       });
     }
-    return turn.id;
+    return { turnId: turn.id, assertCurrent: history.assertCurrent };
+  }
+
+  async #readCompleteHistory(runtime: SessionRuntime, context: AdapterContext): Promise<{
+    readonly thread: NativeThread;
+    readonly assertCurrent: () => void;
+  }> {
+    const binding = runtime.binding;
+    const hostGeneration = runtime.hostGeneration;
+    const threadId = runtime.threadId;
+    const historyRevision = this.#host.historyRevision(threadId, hostGeneration);
+    const deadline = performance.now() + this.#historyReadTimeoutMs;
+    const timedOut = new AbortController();
+    const signal = AbortSignal.any([context.signal, runtime.dispatchLifetime.signal, timedOut.signal]);
+    const timer = setTimeout(() => timedOut.abort(), this.#historyReadTimeoutMs);
+    timer.unref?.();
+    const assertCurrent = (): void => {
+      if (timedOut.signal.aborted || performance.now() >= deadline) throw nativeHistoryReadFailure("TIMEOUT");
+      if (signal.aborted) throw nativeHistoryReadFailure("CANCELLED");
+      this.#assertHistoryRuntimeFence(runtime, context, binding, hostGeneration);
+      if (historyRevision === undefined || this.#host.historyRevision(threadId, hostGeneration) !== historyRevision) {
+        throw nativeHistoryReadFailure("STALE");
+      }
+    };
+    let bytes = 0;
+    const request = async (method: string, params: JsonObject): Promise<JsonValue> => {
+      assertCurrent();
+      const result = await waitForHistoryRead(this.#host.request(method, params, {
+        signal, timeoutMs: Math.max(1, Math.ceil(deadline - performance.now())), beforeDispatch: assertCurrent
+      }), signal, () => nativeHistoryReadFailure(timedOut.signal.aborted ? "TIMEOUT" : "CANCELLED"));
+      assertCurrent();
+      if (result.hostGeneration !== hostGeneration) throw nativeHistoryReadFailure("STALE");
+      bytes += serializedByteLength(result.value);
+      if (bytes > this.#maximumHistoryBytes) throw nativeHistoryReadFailure("SIZE_LIMIT");
+      return result.value;
+    };
+    const readMetadata = async (): Promise<NativeThread> => {
+      const value = await request("thread/read", { threadId, includeTurns: false });
+      const raw = objectValue(objectValue(value, "thread metadata result")["thread"], "thread metadata");
+      if (!Array.isArray(raw["turns"]) || raw["turns"].length !== 0) {
+        throw new ProtocolShapeError("thread metadata must not contain history turns");
+      }
+      const thread = parseThreadResult(value);
+      await waitForHistoryRead(assertNativeThreadTarget(
+        thread, threadId, runtime.reviewWorkingDirectory ?? runtime.targetWorkspaceRoot, "probe"
+      ), signal, () => nativeHistoryReadFailure(timedOut.signal.aborted ? "TIMEOUT" : "CANCELLED"));
+      assertCurrent();
+      return thread;
+    };
+    try {
+      assertCurrent();
+      const metadata = await readMetadata();
+      const turns: NativeTurn[] = [];
+      const turnIds = new Set<string>();
+      const itemIds = new Set<string>();
+      const cursors = new Set<string>();
+      let cursor: string | undefined;
+      let pages = 0;
+      let items = 0;
+      do {
+        if (++pages > this.#maximumHistoryPages) throw nativeHistoryReadFailure("SIZE_LIMIT");
+        const page = parseFullTurnPage(await request("thread/turns/list", {
+          threadId, sortDirection: "asc", itemsView: "full", limit: 100,
+          ...(cursor === undefined ? {} : { cursor })
+        }), { maximumTurns: 100, maximumItems: this.#maximumHistoryItems });
+        assertCurrent();
+        if (turns.length + page.turns.length > this.#maximumHistoryTurns) throw nativeHistoryReadFailure("SIZE_LIMIT");
+        for (const turn of page.turns) {
+          if (turnIds.has(turn.id) || itemIds.has(turn.id)) throw new ProtocolShapeError("native history contains duplicate identities");
+          turnIds.add(turn.id);
+          items += turn.items.length;
+          if (items > this.#maximumHistoryItems) throw nativeHistoryReadFailure("SIZE_LIMIT");
+          for (const item of turn.items) {
+            if (itemIds.has(item.id) || turnIds.has(item.id)) throw new ProtocolShapeError("native history contains duplicate identities");
+            itemIds.add(item.id);
+          }
+          turns.push(turn);
+        }
+        cursor = page.nextCursor;
+        if (cursor !== undefined) {
+          if (page.turns.length === 0 || cursors.has(cursor)) throw new ProtocolShapeError("native history pagination did not advance");
+          cursors.add(cursor);
+        }
+      } while (cursor !== undefined);
+
+      // Public pages have no atomic snapshot token. Re-read the newest full turn
+      // and metadata as optimistic evidence, in addition to the wire-arrival fence.
+      const tail = parseFullTurnPage(await request("thread/turns/list", {
+        threadId, sortDirection: "desc", itemsView: "full", limit: 1
+      }), { maximumTurns: 1, maximumItems: this.#maximumHistoryItems });
+      const latestMetadata = await readMetadata();
+      assertCurrent();
+      if (JSON.stringify(metadata) !== JSON.stringify(latestMetadata)
+        || (turns.length > 1) !== (tail.nextCursor !== undefined)
+        || fullTurnSignature(turns.at(-1)) !== fullTurnSignature(tail.turns[0])) {
+        throw nativeHistoryReadFailure("STALE");
+      }
+      return { thread: { ...latestMetadata, turns }, assertCurrent };
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   #descriptor(input: {
@@ -2274,8 +2876,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           executionApi: "openai-images",
           models: [{ modelId: "gpt-image-2", displayName: "GPT Image 2" }]
         }]
-      }],
-      models: this.#models,
+      }, ...(this.#managedProviders?.listProviders().filter((provider) => provider.providerId !== this.#providerId) ?? [])],
+      models: this.#withManagedModels(this.#models),
+      ...(this.#managedProviders === undefined ? {} : { providerRuntimeSupport: CODEX_MANAGED_PROVIDER_SUPPORT }),
       tools: [],
       diagnostics: input.diagnostics
     };
@@ -2290,6 +2893,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       "session.detach",
       "session.fork",
       "session.clone",
+      "session.rewind",
+      "session.rewind_to_start",
       "turn.stream",
       "turn.abort",
       "turn.steer",
@@ -2308,6 +2913,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       "interaction.permission",
       "interaction.question"
     ]);
+    if (this.#managedProviders !== undefined) supported.add("provider.managed_catalog");
     if (this.#models.some((model) => model.thinkingLevels.length > 0)) supported.add("model.effort");
     if (this.#models.some((model) => model.supportsFastMode)) supported.add("model.fast_mode");
     if (this.#account?.supportsLogin === true) supported.add("provider.login");
@@ -2580,6 +3186,23 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     }
   }
 
+  async #withNativeMutation<T>(context: AdapterContext, action: () => Promise<T>): Promise<T> {
+    this.#assertOpen();
+    this.#assertBackendContext(context);
+    assertDispatchNotCancelled(context.signal);
+    if (this.#sessions.get(context.sessionId)?.rewindUnknown) throw rewindUnknown();
+    const admission = this.#sessionMutations.get(context.sessionId) ?? { count: 0, rewinding: false };
+    if (admission.rewinding) throw rewindBusy();
+    admission.count++;
+    this.#sessionMutations.set(context.sessionId, admission);
+    try {
+      return await action();
+    } finally {
+      admission.count--;
+      if (admission.count === 0 && this.#sessionMutations.get(context.sessionId) === admission) this.#sessionMutations.delete(context.sessionId);
+    }
+  }
+
   #assertOpen(): void {
     if (this.#disposed) {
       throw adapterError({
@@ -2590,6 +3213,15 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       });
     }
   }
+}
+
+function managedRouteUnavailable(stateMayHaveChanged = false): JokoError {
+  return adapterError({
+    code: stateMayHaveChanged ? "CODEX_PROVIDER_ROUTE_UNKNOWN" : "CODEX_PROVIDER_ROUTE_UNAVAILABLE",
+    message: stateMayHaveChanged ? "The native Provider route could not be confirmed." : "The selected Provider route is not available for this operation.",
+    phase: "dispatch", retryable: false, stateMayHaveChanged,
+    recovery: "Keep the input, refresh the task, and explicitly select an available model before sending again."
+  });
 }
 
 export function createCodexAdapter(options: CodexAdapterOptions): CodexBackendAdapter {
@@ -2662,21 +3294,16 @@ function reviewInventoryInvalid() {
 }
 
 function supportsIsolatedReview(userAgent: string | undefined): boolean {
-  return matchesExactAppServerVersion(userAgent, ISOLATED_REVIEW_APP_SERVER_VERSION);
+  return matchesExactAppServerVersion(userAgent);
 }
 
 function supportsNativeCollaboration(userAgent: string | undefined): boolean {
-  return matchesExactAppServerVersion(userAgent, NATIVE_COLLABORATION_APP_SERVER_VERSION);
+  return matchesExactAppServerVersion(userAgent);
 }
 
-function matchesExactAppServerVersion(
-  userAgent: string | undefined,
-  expected: readonly [number, number, number]
-): boolean {
-  const match = /\b(\d+)\.(\d+)\.(\d+)/u.exec(userAgent ?? "");
-  if (match === null) return false;
-  const observed = [Number(match[1]), Number(match[2]), Number(match[3])] as const;
-  return expected.every((part, index) => observed[index] === part);
+function matchesExactAppServerVersion(userAgent: string | undefined): boolean {
+  const version = /^[^/\s]+\/([^\s]+)(?:\s|$)/u.exec(userAgent ?? "")?.[1];
+  return version === AUDITED_APP_SERVER_VERSION;
 }
 
 interface ReviewSkillInventory {
@@ -2798,6 +3425,26 @@ function assertReviewThreadStarted(
     || (rawThread["forkedFromId"] !== undefined && rawThread["forkedFromId"] !== null)) {
     throw invalidReviewProfile();
   }
+
+}
+
+function rewindBusy() {
+  return adapterError({ code: "CODEX_REWIND_BUSY", message: "Native history cannot be rewound while this Session has pending work.", phase: "dispatch", recovery: "Wait for input, controls, compaction and background tasks to settle before rewinding." });
+}
+
+function rewindBoundaryUnavailable() {
+  return adapterError({ code: "CODEX_REWIND_BOUNDARY_UNAVAILABLE", message: "The selected entry is not the end of a retained native turn.", phase: "dispatch", recovery: "Choose the final entry of a completed turn. An interior entry cannot be rewound precisely." });
+}
+
+function rewindUnknown() {
+  return adapterError({ code: "CODEX_REWIND_UNKNOWN", message: "The native dialogue may have changed, but its retained history could not be confirmed.", phase: "dispatch", stateMayHaveChanged: true, retryable: false, recovery: "Inspect native history and explicitly close and reattach this Session before further changes. Do not repeat the rewind automatically." });
+}
+
+function assertRewindableHistory(thread: NativeThread): void {
+  if (thread.historyMode !== "paginated") {
+    throw adapterError({ code: "CODEX_REWIND_MODE_UNAVAILABLE", message: "This native Session does not use the paginated history contract required for rewind.", phase: "dispatch", recovery: "Use a newly created paginated Session. Existing native history is not converted." });
+  }
+  if (thread.status?.["type"] !== "idle" || thread.turns.some((turn) => turn.status === "inProgress")) throw rewindBusy();
 }
 
 function reviewDynamicToolSpecs(): JsonValue[] {
@@ -3537,7 +4184,10 @@ function reconcileRuntimeSettings(runtime: SessionRuntime, method: string, param
   if (Object.hasOwn(settings, "effort")) {
     runtime.effort = typeof settings["effort"] === "string" ? settings["effort"] : undefined;
   }
-  if (Object.hasOwn(settings, "serviceTier")) runtime.fastMode = isFastServiceTier(settings["serviceTier"]);
+  if (Object.hasOwn(settings, "serviceTier")) {
+    runtime.fastMode = isFastServiceTier(settings["serviceTier"]);
+    runtime.state.observedFastMode = observedFastServiceTier(settings);
+  }
   const collaboration = isJsonObject(settings["collaborationMode"])
     ? settings["collaborationMode"]
     : undefined;
@@ -3621,9 +4271,11 @@ function modelFromNative(model: NativeModel, providerId: string): ProviderModel 
       pricing: {
         source: "providerReference" as const,
         currencyCode: "USD",
-        updatedAt: CODEX_MODEL_ESTIMATES_UPDATED_AT,
+        updatedAt: estimate.updatedAt ?? CODEX_MODEL_ESTIMATES_UPDATED_AT,
         cacheReadAvailable: estimate.price.cacheRead !== undefined,
-        cacheWriteAvailable: estimate.price.cacheWrite !== undefined
+        cacheWriteAvailable: estimate.price.cacheWrite !== undefined,
+        ...(estimate.fastModeMultiplier === undefined ? {} : { fastModeMultiplier: estimate.fastModeMultiplier }),
+        ...(estimate.longContext === undefined ? {} : { longContext: estimate.longContext })
       }
     })
   };
@@ -3631,6 +4283,73 @@ function modelFromNative(model: NativeModel, providerId: string): ProviderModel 
 
 function isFastServiceTier(value: JsonValue | undefined): boolean {
   return value === "fast" || value === "priority";
+}
+
+function cancelledDispatch() {
+  return adapterError({
+    code: "CODEX_DISPATCH_CANCELLED",
+    message: "The Codex input was cancelled before dispatch.",
+    phase: "dispatch",
+    recovery: "Keep the input and explicitly send it when ready."
+  });
+}
+
+function assertDispatchNotCancelled(signal: AbortSignal): void {
+  if (signal.aborted) throw cancelledDispatch();
+}
+
+function waitForDispatchPreparation<T>(pending: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(cancelledDispatch());
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) {
+      signal.removeEventListener("abort", onAbort);
+      onAbort();
+    }
+    pending.then(
+      (result) => { signal.removeEventListener("abort", onAbort); resolve(result); },
+      (error: unknown) => { signal.removeEventListener("abort", onAbort); reject(error); }
+    );
+  });
+}
+
+function nativeHistoryReadFailure(reason: "TIMEOUT" | "CANCELLED" | "STALE" | "SIZE_LIMIT") {
+  return adapterError({
+    code: `CODEX_NATIVE_HISTORY_${reason}`,
+    message: reason === "STALE"
+      ? "The Codex native history changed while its complete history was being read."
+      : reason === "SIZE_LIMIT"
+        ? "The Codex native history exceeds the configured safe read limit."
+        : reason === "TIMEOUT"
+          ? "The complete Codex native history read exceeded its deadline."
+          : "The Codex native history read was cancelled.",
+    phase: "probe",
+    recovery: "Refresh the current native Session before explicitly reading its history again."
+  });
+}
+
+function fullTurnSignature(turn: NativeTurn | undefined): string | undefined {
+  return turn === undefined ? undefined : JSON.stringify({ ...turn, itemsView: "full" });
+}
+
+function waitForHistoryRead<T>(pending: Promise<T>, signal: AbortSignal, cancelled: () => Error): Promise<T> {
+  return new Promise<T>((resolveWait, reject) => {
+    const onAbort = (): void => reject(cancelled());
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) {
+      signal.removeEventListener("abort", onAbort);
+      onAbort();
+    }
+    pending.then(
+      (result) => { signal.removeEventListener("abort", onAbort); resolveWait(result); },
+      (error: unknown) => { signal.removeEventListener("abort", onAbort); reject(error); }
+    );
+  });
+}
+
+function observedFastServiceTier(record: JsonObject): boolean | undefined {
+  const tier = record["serviceTier"];
+  return isFastServiceTier(tier) ? true : tier === null || tier === "default" ? false : undefined;
 }
 
 function versionFromUserAgent(userAgent: string | undefined): string {

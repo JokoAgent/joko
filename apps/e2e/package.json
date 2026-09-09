@@ -11,12 +11,16 @@
     "@bufbuild/protobuf": "2.14.0",
     "@connectrpc/connect": "2.1.2",
     "@connectrpc/connect-node": "2.1.2",
+    "@joko/adapter-claude-code": "workspace:*",
     "@joko/adapter-pi": "workspace:*",
     "@joko/contracts": "workspace:*",
     "@joko/core": "workspace:*",
     "@joko/orchestrator": "workspace:*",
+    "@joko/remote-ssh": "workspace:*",
     "@joko/store": "workspace:*",
-    "@joko/testkit": "workspace:*"
+    "@joko/testkit": "workspace:*",
+    "@joko/tool-terminal": "workspace:*",
+    "@modelcontextprotocol/sdk": "1.29.0"
   },
   "devDependencies": {
     "@types/node": "24.12.4",

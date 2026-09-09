@@ -2019,27 +2019,34 @@ describe("OperationalStore", () => {
     )).toThrow(OperationPreviouslyFailedError);
   });
 
-  it("preserves an already-sanitized public effect error instead of flattening its recovery contract", () => {
+  it.each(["effect", "transaction"] as const)("preserves a sanitized public %s error and its recovery contract", (mode) => {
     const store = createStore();
     const connection = store.createConnection({
       id: "connection-public-effect-failure",
       name: "Public effect client",
       authKeyDigest: "public-effect-failure-digest"
     });
-    const claim = store.claimAuthorizedDeferredEffectOperation(
-      connection.id,
-      connection.authKeyDigest,
-      { id: "operation-public-effect-failure", kind: "compact", body: { sessionId: "session-1" } }
-    );
-
-    const failed = store.failEffectOperation(claim.operation.id, claim.operation.bodyHash, new JokoError({
+    const input = { id: "operation-public-failure", kind: "compact", body: { sessionId: "session-1" } };
+    const error = new JokoError({
       code: "COMPACTION_IN_PROGRESS",
       message: "Session is compacting sk-abcdefghijklmnop",
       phase: "compaction",
       retryable: true,
       stateMayHaveChanged: false,
       recovery: "Wait, then retry with token=sk-abcdefghijklmnop."
-    }));
+    });
+    if (mode === "effect") {
+      const claim = store.claimAuthorizedDeferredEffectOperation(connection.id, connection.authKeyDigest, input);
+      store.failEffectOperation(claim.operation.id, claim.operation.bodyHash, error);
+    } else {
+      expect(() => store.runAuthorizedOperation(connection.id, connection.authKeyDigest, input, transaction => {
+        transaction.setSetting("service", "global", "failed-admission", true);
+        throw error;
+      })).toThrow(error);
+      expect(store.findSetting("service", "global", "failed-admission")).toBeUndefined();
+      expect(() => store.runAuthorizedOperation(connection.id, connection.authKeyDigest, input, () => true)).toThrow(OperationPreviouslyFailedError);
+    }
+    const failed = store.getOperation(input.id);
 
     expect(failed).toMatchObject({
       status: "failed",
@@ -3835,6 +3842,42 @@ describe("OperationalStore", () => {
     )).toThrow(RevisionConflictError);
   });
 
+  it("adopts audio and artwork atomically, preserving shared cover retention and immutable metadata", () => {
+    const fixture = createFixture();
+    let { store } = fixture;
+    const stage = (id: string, mimeType: string) => store.putArtifact({ id, sha256: "a".repeat(64), byteLength: 12, mimeType, fileName: "track", storageKey: "storage", metadata: { expiresAt: 9_000_000_000_000 } }).blob;
+    const cover = stage("cover", "image/png");
+    const first = stage("first", "audio/wav");
+    const second = stage("second", "audio/wav");
+    const metadata = { kind: "music" as const, title: "Morning", description: "Strings", artwork: { blob: cover, width: 2, height: 2, alt: "Cover" } };
+    expect(() => store.transaction(() => {
+      store.adoptSessionArtifact({ blob: cover, sessionId: "session-1" });
+      store.adoptSessionArtifact({ blob: first, sessionId: "session-1", audioMetadata: metadata });
+      throw new Error("rollback");
+    })).toThrow("rollback");
+    expect(store.getArtifact(cover.id).sessionId).toBeUndefined();
+    expect(store.getArtifact(first.id).metadata).toEqual({ expiresAt: 9_000_000_000_000 });
+    store.transaction(() => {
+      store.adoptSessionArtifact({ blob: cover, sessionId: "session-1" });
+      store.adoptSessionArtifact({ blob: first, sessionId: "session-1", audioMetadata: metadata });
+      store.adoptSessionArtifact({ blob: second, sessionId: "session-1", audioMetadata: { ...metadata, title: "Evening" } });
+    });
+    expect(store.getArtifact(first.id).revision).toBe(store.getArtifact(cover.id).revision);
+    const filePath = store.filePath;
+    store.close();
+    store = new OperationalStore(filePath);
+    fixture.replaceStore(store);
+    expect(store.getArtifact(first.id).metadata).toEqual({ audio: metadata });
+    expect(store.getArtifact(second.id).metadata).toEqual({ audio: { ...metadata, title: "Evening" } });
+    expect(() => store.transaction(() => store.adoptSessionArtifact({ blob: first, sessionId: "session-1", audioMetadata: { ...metadata, title: "Overwrite" } }))).toThrow(/different ownership or metadata/u);
+    expect(() => store.deleteArtifact(cover.id)).toThrow(/audio artwork/u);
+    expect(store.expireArtifacts(9_000_000_000_001)).toEqual([]);
+    store.deleteArtifact(first.id);
+    expect(() => store.deleteArtifact(cover.id)).toThrow(/audio artwork/u);
+    store.deleteArtifact(second.id);
+    expect(store.deleteArtifact(cover.id).deletedAt).toBeDefined();
+  });
+
   it("allows independent artifact records to share one content-addressed storage key", () => {
     const store = createStore();
     const storageKey = "sha256/aa/" + "a".repeat(64);
@@ -3883,6 +3926,10 @@ describe("OperationalStore", () => {
         recovery: "Wait for the refresh to finish."
       },
       capabilities: new Map(),
+      providerRuntimeSupport: {
+        protocols: ["openai-responses", "openai-completions"],
+        fields: ["request_path", "headers", "model_limits"]
+      },
       providers: [{
         providerId: "provider-one",
         displayName: "Provider One",
@@ -3931,6 +3978,10 @@ describe("OperationalStore", () => {
       instanceGeneration: 7,
       installationState: "update_available",
       authenticationState: "refreshing",
+      providerRuntimeSupport: {
+        protocols: ["openai-responses", "openai-completions"],
+        fields: ["request_path", "headers", "model_limits"]
+      },
       providers: [expect.objectContaining({
         providerId: "provider-one",
         loginMethods: ["api_key", "oauth_browser"]
@@ -3958,6 +4009,26 @@ describe("OperationalStore", () => {
       ...backend.descriptor,
       adapterKind: " tool-runtime"
     })).toThrow(/non-empty normalized string/u);
+    const filePath = store.filePath;
+    store.close();
+    const reopened = new OperationalStore(filePath);
+    cleanups.push(() => reopened.close());
+    expect(reopened.getBackend("tool-backend").descriptor.providerRuntimeSupport).toEqual(backend.descriptor.providerRuntimeSupport);
+    expect(reopened.listBackends()[0]?.descriptor.providerRuntimeSupport).toEqual(backend.descriptor.providerRuntimeSupport);
+    const current = { ...backend.descriptor, providerRuntimeSupport: { protocols: ["openai-responses"] as const, fields: [] } };
+    expect(reopened.refreshBackendInstanceDescriptor(current, 7)).toMatchObject({
+      status: "published", backend: { descriptor: { providerRuntimeSupport: current.providerRuntimeSupport } }
+    });
+    expect(reopened.refreshBackendInstanceDescriptor({ ...backend.descriptor, instanceGeneration: 6 }, 6)).toMatchObject({
+      status: "stale", current: { descriptor: { providerRuntimeSupport: current.providerRuntimeSupport } }
+    });
+    const { providerRuntimeSupport: _removed, ...withoutManagedSupport } = current;
+    reopened.refreshBackendInstanceDescriptor(withoutManagedSupport, 7);
+    expect(reopened.getBackend("tool-backend").descriptor.providerRuntimeSupport).toBeUndefined();
+    reopened.close();
+    const reopenedWithoutSupport = new OperationalStore(filePath);
+    cleanups.push(() => reopenedWithoutSupport.close());
+    expect(reopenedWithoutSupport.getBackend("tool-backend").descriptor.providerRuntimeSupport).toBeUndefined();
   });
 
   it("reserves non-reusable per-Backend generations and publishes only the latest expected-current winner", () => {

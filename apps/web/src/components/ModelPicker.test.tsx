@@ -109,19 +109,25 @@ describe("ModelPicker", () => {
     expect(document.body.querySelectorAll(".model-picker__row.is-favorite")).toHaveLength(0);
   });
 
-  it("keeps a removed current route visible as a disconnected source", async () => {
+  it("keeps a removed current route visible while offering source recovery in an empty catalog", async () => {
     const selection: ModelPickerSelection = {
       backendId: "backend-removed",
       providerId: "provider-removed",
       modelId: "model-removed",
       fastMode: false
     };
-    await renderPicker(vi.fn(), "owner-one", undefined, false, undefined, [], selection);
+    const onConnectSource = vi.fn();
+    await renderPicker(vi.fn(), "owner-one", undefined, false, undefined, [], selection, onConnectSource);
 
     const trigger = required(document.body.querySelector<HTMLButtonElement>(".model-picker-trigger"));
     expect(trigger.textContent).toContain("model-removed");
     expect(trigger.textContent).toContain("provider-removed");
     expect(trigger.textContent).toContain("Source disconnected");
+    expect(trigger.getAttribute("aria-label")).toContain("model-removed");
+    await openPicker();
+    const recovery = required([...document.body.querySelectorAll<HTMLButtonElement>('.model-picker__empty button')][0]);
+    await act(async () => recovery.click());
+    expect(onConnectSource).toHaveBeenCalledOnce();
   });
 
   it("omits models disabled for routing even when their picker visibility is on", async () => {
@@ -325,7 +331,8 @@ async function renderPicker(
   allowDefault = false,
   onOpen?: () => void | Promise<void>,
   pickerModels: readonly ModelView[] = models,
-  value?: ModelPickerSelection
+  value?: ModelPickerSelection,
+  onConnectSource?: () => void
 ): Promise<void> {
   const container = document.createElement("div");
   document.body.append(container);
@@ -338,6 +345,7 @@ async function renderPicker(
     t={(key, values) => translate("en", key, values)}
     onSelect={onSelect}
     onOpen={onOpen}
+    onConnectSource={onConnectSource}
     allowDefault={allowDefault}
     seedDefault={seedDefault}
   />));

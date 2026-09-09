@@ -38,7 +38,8 @@ export interface SessionHeaderActionsMenuProps {
   readonly onMoveSessionProject?: (placement: SessionProjectNavigationPlacement) => void;
   readonly onCopyTaskLink?: () => void;
   readonly onExportPortableSession?: () => void;
-  readonly onExportHtml?: () => void;
+  readonly onExportHtml?: (ownerDocument: Document) => void;
+  readonly exportHtmlPending?: boolean;
   readonly onClone?: () => void;
   readonly onSplitSession?: (side: "right" | "bottom") => void;
   readonly onOpenSessionWindow?: () => void;
@@ -58,6 +59,7 @@ export function SessionHeaderActionsMenu({
   onCopyTaskLink,
   onExportPortableSession,
   onExportHtml,
+  exportHtmlPending,
   onClone,
   onSplitSession,
   onOpenSessionWindow,
@@ -239,7 +241,7 @@ export function SessionHeaderActionsMenu({
           <FileOutput aria-hidden="true" />
           {t("session.exportPortable")}
         </button>}
-        {onExportHtml !== undefined && <button type="button" role="menuitem" onClick={() => run(onExportHtml)}>
+        {onExportHtml !== undefined && <button type="button" role="menuitem" disabled={exportHtmlPending} aria-busy={exportHtmlPending} onClick={(event) => { const ownerDocument = event.currentTarget.ownerDocument; run(() => onExportHtml(ownerDocument)); }}>
           <Download aria-hidden="true" />
           {t("session.export")}
         </button>}

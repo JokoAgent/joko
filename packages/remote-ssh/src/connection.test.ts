@@ -10,6 +10,7 @@ import type {
   AgentAuthConnectorPort,
   RemoteSshHostInput,
   RemoteSshLogger,
+  RemoteTerminalHandle,
   SshHostKeyVerifierPort
 } from "./types.js";
 import {
@@ -69,6 +70,53 @@ describe("remote SSH connection test lifecycle", () => {
     const [left, right] = await Promise.all([first, second]);
     expect(left).toEqual(right);
     expect(connector.connect).toHaveBeenCalledOnce();
+    await controller.disconnect(scope);
+  });
+
+  it("fences terminal dispatch by authenticated connection generation and cleans late handles", async () => {
+    const kill = vi.fn(async () => undefined);
+    const terminal: RemoteTerminalHandle = {
+      onData: () => ({ dispose() {} }), onExit: () => ({ dispose() {} }),
+      write: async () => undefined, resize: async () => undefined, kill,
+      pause() {}, resume() {}
+    };
+    let release: ((handle: RemoteTerminalHandle) => void) | undefined;
+    const open = vi.fn(() => new Promise<RemoteTerminalHandle>((resolve) => { release = resolve; }));
+    const connector: AgentAuthConnectorPort = {
+      connect: vi.fn(async (request) => {
+        request.onAuthenticating();
+        await request.verifyHostKey({ algorithm: "ssh-ed25519", key: Uint8Array.of(1) });
+        return { close: async () => undefined, capabilities: {
+          commandExecution: false, processStreaming: false, interactiveTerminal: true, fileTransfer: false, tcpForwarding: false
+        }, terminals: { open } };
+      })
+    };
+    const controller = controllerWith(connector);
+    await controller.test(scope);
+    const lease = controller.transports(scope);
+    expect(lease.capabilities.interactiveTerminal).toBe(true);
+    expect(() => controller.transports({ ...scope, ownerId: "other" })).toThrow(expect.objectContaining({ code: "OWNER_SCOPE_MISMATCH" }));
+    const request = { executable: "/bin/sh", args: [], cwd: "/workspace", cols: 80, rows: 24 };
+    const opening = lease.terminals!.open(request);
+    await controller.disconnect(scope);
+    await controller.test(scope);
+    release!(terminal);
+    await expect(opening).rejects.toMatchObject({ code: "TERMINAL_UNKNOWN", details: { stateMayHaveChanged: true } });
+    expect(kill).toHaveBeenCalledOnce();
+    await expect(lease.terminals!.open(request)).rejects.toMatchObject({ code: "TERMINAL_UNAVAILABLE" });
+    expect(open).toHaveBeenCalledOnce();
+    const abort = new AbortController();
+    const cancelled = controller.transports(scope).terminals!.open({ ...request, signal: abort.signal });
+    release!(terminal);
+    abort.abort();
+    await expect(cancelled).rejects.toMatchObject({ code: "TERMINAL_UNKNOWN" });
+    expect(kill).toHaveBeenCalledTimes(2);
+    await expect(controller.transports(scope).terminals!.open({ ...request, signal: abort.signal }))
+      .rejects.toMatchObject({ code: "ABORTED" });
+    const current = controller.transports(scope).terminals!.open(request);
+    release!(terminal);
+    await expect(current).resolves.toBe(terminal);
+    expect(open).toHaveBeenCalledTimes(3);
     await controller.disconnect(scope);
   });
 

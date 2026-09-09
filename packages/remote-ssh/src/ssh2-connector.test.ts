@@ -10,9 +10,11 @@ import ssh2, {
   type ServerChannel,
   type SFTPWrapper
 } from "ssh2";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { RemoteSshError } from "./errors.js";
-import { Ssh2ResolvedAgentAuthConnector } from "./ssh2-connector.js";
+import { SSH_UNICODE_CORPUS } from "./i18n/unicode.test-fixture.js";
+import { Ssh2ResolvedAgentAuthConnector, type Ssh2ResolvedAgentAuthConnectorOptions } from "./ssh2-connector.js";
+import type { RemoteTerminalExit, RemoteTerminalHandle } from "./types.js";
 
 const { Server, utils } = ssh2;
 
@@ -24,6 +26,12 @@ const allowedUserKey = parsedPrivateKey(userPrivateKey);
 interface TestSshServer {
   readonly port: number;
   readonly commands: string[];
+  readonly terminalChannels: ServerChannel[];
+  readonly terminalRequests: { term: string; cols: number; rows: number }[];
+  readonly terminalSizes: { cols: number; rows: number }[];
+  readonly terminalSignals: string[];
+  readonly terminalEnvironmentRequests: string[];
+  readonly pendingTerminals: (() => void)[];
   openForwarded(remotePort: number): Promise<ServerChannel>;
   close(): Promise<void>;
 }
@@ -61,6 +69,7 @@ describe("Ssh2ResolvedAgentAuthConnector", () => {
     expect(connection.capabilities).toEqual({
       commandExecution: true,
       processStreaming: true,
+      interactiveTerminal: true,
       fileTransfer: true,
       tcpForwarding: true
     });
@@ -127,14 +136,18 @@ describe("Ssh2ResolvedAgentAuthConnector", () => {
     const endpoint = process.platform === "win32"
       ? `\\\\.\\pipe\\joko-ssh-agent-${randomUUID()}`
       : join(tmpdir(), `joko-ssh-agent-${randomUUID()}.sock`);
+    const otherKey = parsedPrivateKey(otherPrivateKey);
+    const offered = [otherKey, allowedUserKey];
+    const signed: Buffer[] = [];
     const agent = createTcpServer((socket) => {
       const protocol = new ssh2.AgentProtocol(false);
-      protocol.on("identities", (request) => protocol.getIdentitiesReply(request, [allowedUserKey]));
+      protocol.on("identities", (request) => protocol.getIdentitiesReply(request, offered));
       protocol.on("sign", (request, publicKey, data, options) => {
         if (!publicKey.getPublicSSH().equals(allowedUserKey.getPublicSSH())) {
           protocol.failureReply(request);
           return;
         }
+        signed.push(publicKey.getPublicSSH());
         protocol.signReply(request, allowedUserKey.sign(data, options.hash));
       });
       socket.pipe(protocol).pipe(socket);
@@ -162,6 +175,17 @@ describe("Ssh2ResolvedAgentAuthConnector", () => {
       signal: new AbortController().signal
     })).stdout).toBe("abcdefghijklmnop");
     await connection.close();
+    signed.length = 0;
+    const selectedRequest = { hostname: "127.0.0.1", port: server.port, user: "maker", signal: new AbortController().signal, verifyHostKey: async () => undefined, onAuthenticating: () => undefined };
+    const selected = await connector.connect({ ...selectedRequest, authentication: { kind: "agent_key", publicKey: allowedUserKey.getPublicSSH() } });
+    await selected.close();
+    expect(signed).toEqual([allowedUserKey.getPublicSSH()]);
+    // The selected rejected key must not fall through to the allowed identity.
+    await expect(connector.connect({ ...selectedRequest, authentication: { kind: "agent_key", publicKey: otherKey.getPublicSSH() } })).rejects.toMatchObject({ code: "AUTHENTICATION_FAILED", retryable: false });
+    expect(signed).toHaveLength(1);
+    offered.splice(1, 1);
+    await expect(connector.connect({ ...selectedRequest, authentication: { kind: "agent_key", publicKey: allowedUserKey.getPublicSSH() } })).rejects.toMatchObject({ code: "NODE_KEY_UNAVAILABLE", retryable: false });
+    expect(signed).toHaveLength(1);
   });
 
   it("preserves a fail-closed host-key verifier error", async () => {
@@ -291,8 +315,201 @@ describe("Ssh2ResolvedAgentAuthConnector", () => {
   });
 });
 
-async function connect(port: number) {
-  const connector = new Ssh2ResolvedAgentAuthConnector({ readyTimeoutMs: 2_000 });
+describe("SSH interactive terminal transport", () => {
+  const request = { executable: "/bin/sh", args: ["-l"], cwd: "/workspace", cols: 80, rows: 24 };
+
+  it("requests a quoted PTY without environment forwarding and preserves streaming UTF-8, input, resize, and confirmed exit", async () => {
+    const server = await startSshServer();
+    const connection = await connect(server.port);
+    const abort = new AbortController();
+    const terminal = await connection.terminals!.open({ ...request, executable: "/shell with space", args: ["one'arg", "$(unsafe)"], cwd: "/space ' dir", signal: abort.signal });
+    abort.abort(); // A completed creation request never owns the live PTY.
+    expect(server.terminalRequests).toEqual([{ term: "xterm-256color", cols: 80, rows: 24 }]);
+    expect(server.commands).toEqual(["cd -- '/space '\"'\"' dir' && exec '/shell with space' 'one'\"'\"'arg' '$(unsafe)'"]);
+    const channel = server.terminalChannels[0]!;
+    let output = "";
+    terminal.onData((data) => { output += data; });
+    const text = Buffer.from(SSH_UNICODE_CORPUS.text);
+    channel.write(text.subarray(0, 3));
+    await vi.waitFor(() => expect(output).toBe("A"));
+    channel.write(text.subarray(3, 6));
+    channel.write(text.subarray(6));
+    await vi.waitFor(() => expect(output).toBe(SSH_UNICODE_CORPUS.text));
+    terminal.pause();
+    channel.write(" paused");
+    await terminal.resize(120, 40);
+    await vi.waitFor(() => expect(server.terminalSizes).toEqual([{ cols: 120, rows: 40 }]));
+    expect(output).toBe(SSH_UNICODE_CORPUS.text);
+    terminal.resume();
+    await vi.waitFor(() => expect(output).toBe(SSH_UNICODE_CORPUS.paused));
+    const input = once(channel, "data");
+    await terminal.write("typed\r");
+    expect(String((await input)[0])).toBe("typed\r");
+    await expect(terminal.write("x".repeat(256 * 1_024 + 1))).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+    await expect(terminal.resize(0, 24)).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+    expect(server.terminalEnvironmentRequests).toEqual([]);
+    const exit = terminalExit(terminal);
+    terminal.pause();
+    channel.write(" final");
+    channel.exit(7);
+    channel.end();
+    terminal.resume();
+    expect(await exit).toEqual({ exitCode: 7, processExitConfirmed: true });
+    expect(output).toBe(SSH_UNICODE_CORPUS.finished);
+    await expect(terminal.kill()).resolves.toBeUndefined();
+    await connection.close();
+  });
+
+  it.each(["channel", "connection"] as const)("does not invent success after %s loss", async (loss) => {
+    const server = await startSshServer();
+    const connection = await connect(server.port);
+    const terminal = await connection.terminals!.open(request);
+    const exit = terminalExit(terminal);
+    if (loss === "channel") server.terminalChannels[0]!.close();
+    else await connection.close();
+    expect(await exit).toEqual({ exitCode: 1, failureCode: "TERMINAL_UNKNOWN", processExitConfirmed: false });
+    await expect(terminal.kill()).rejects.toMatchObject({ code: "TERMINAL_UNKNOWN", details: { stateMayHaveChanged: true } });
+    await connection.close();
+  });
+
+  it("delivers output sent after exit-status before publishing the final exit", async () => {
+    const server = await startSshServer();
+    const connection = await connect(server.port);
+    const terminal = await connection.terminals!.open(request);
+    const events: string[] = [];
+    terminal.onData((data) => events.push(data));
+    const exit = terminalExit(terminal).then((result) => { events.push("exit"); return result; });
+    const channel = server.terminalChannels[0]!;
+    channel.write("head");
+    channel.exit(0);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(events.join("")).toBe("head");
+    channel.write("tail");
+    channel.end();
+    expect(await exit).toEqual({ exitCode: 0, processExitConfirmed: true });
+    expect(events.join("")).toBe("headtailexit");
+    await connection.close();
+  });
+
+  it("honors consumer pause until the full 96 KiB tail is delivered before final exit", async () => {
+    const server = await startSshServer();
+    const connection = await connect(server.port);
+    const terminal = await connection.terminals!.open(request);
+    let output = "";
+    let pausedBytes = 0;
+    let exited = false;
+    terminal.onData((data) => {
+      expect(exited).toBe(false);
+      output += data;
+      if (pausedBytes === 0) { pausedBytes = output.length; terminal.pause(); }
+    });
+    const exit = terminalExit(terminal).then((result) => { exited = true; return result; });
+    const channel = server.terminalChannels[0]!;
+    channel.write("x".repeat(96 * 1_024));
+    channel.exit(0);
+    channel.end();
+    await vi.waitFor(() => expect(pausedBytes).toBeGreaterThan(0));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(output.length).toBe(pausedBytes);
+    expect(exited).toBe(false);
+    terminal.resume();
+    expect(await exit).toEqual({ exitCode: 0, processExitConfirmed: true });
+    expect(output).toBe("x".repeat(96 * 1_024));
+    await connection.close();
+  });
+
+  it.each(["peer output remains open", "consumer remains paused"] as const)("reports confirmed process exit with failed output after the bounded drain deadline: %s", async (reason) => {
+    const server = await startSshServer();
+    const connection = await connect(server.port, { terminalDrainTimeoutMs: 150 });
+    const terminal = await connection.terminals!.open(request);
+    let output = "";
+    terminal.onData((data) => { output += data; });
+    const exit = terminalExit(terminal);
+    const channel = server.terminalChannels[0]!;
+    if (reason === "consumer remains paused") {
+      terminal.pause();
+      channel.write("undelivered");
+    }
+    channel.exit(0);
+    if (reason === "consumer remains paused") channel.end();
+    expect(await exit).toEqual({ exitCode: 0, failureCode: "TERMINAL_FAILED", processExitConfirmed: true });
+    terminal.resume();
+    expect(output).toBe("");
+    await expect(terminal.kill()).resolves.toBeUndefined();
+    await connection.close();
+  });
+
+  it.each([true, false])("waits for explicit stop confirmation (peer confirms: %s)", async (confirmed) => {
+    const server = await startSshServer({ confirmTerminalStop: confirmed });
+    const connection = await connect(server.port, { terminalStopTimeoutMs: 500 });
+    const terminal = await connection.terminals!.open(request);
+    const exit = terminalExit(terminal);
+    if (confirmed) {
+      await expect(terminal.kill()).resolves.toBeUndefined();
+      expect(await exit).toMatchObject({ processExitConfirmed: true, signal: 15 });
+    } else {
+      await expect(terminal.kill()).rejects.toMatchObject({ code: "TERMINAL_UNKNOWN", retryable: false });
+      expect(await exit).toMatchObject({ processExitConfirmed: false });
+    }
+    expect(server.terminalSignals).toContain("TERM");
+    await connection.close();
+  });
+
+  it.each(["abort", "timeout"] as const)("bounds %s during creation and stops a late acquired PTY", async (outcome) => {
+    const server = await startSshServer({ deferTerminal: true });
+    const connection = await connect(server.port, { terminalOpenTimeoutMs: 400, terminalStopTimeoutMs: 500 });
+    const aborted = new AbortController();
+    aborted.abort();
+    await expect(connection.terminals!.open({ ...request, signal: aborted.signal })).rejects.toMatchObject({ code: "ABORTED" });
+    expect(server.commands).toHaveLength(0);
+    const abort = new AbortController();
+    const opening = connection.terminals!.open({ ...request, signal: abort.signal });
+    const rejected = expect(opening).rejects.toMatchObject({ code: "TERMINAL_UNKNOWN", details: { stateMayHaveChanged: true } });
+    await vi.waitFor(() => expect(server.pendingTerminals).toHaveLength(1));
+    if (outcome === "abort") abort.abort();
+    await rejected;
+    server.pendingTerminals[0]!();
+    await vi.waitFor(() => expect(server.terminalSignals).toContain("TERM"));
+    await connection.close();
+  });
+
+  it("bounds output received before subscription and rejects unsafe start values before dispatch", async () => {
+    const server = await startSshServer();
+    const connection = await connect(server.port);
+    for (const invalid of [{ ...request, cols: 0 }, { ...request, args: ["bad\0arg"] }]) {
+      await expect(connection.terminals!.open(invalid)).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+    }
+    expect(server.commands).toHaveLength(0);
+    const terminal = await connection.terminals!.open(request);
+    const exit = terminalExit(terminal);
+    server.terminalChannels[0]!.write(Buffer.alloc(1_024 * 1_024 + 1, 65));
+    expect(await exit).toMatchObject({ failureCode: "TERMINAL_UNKNOWN", processExitConfirmed: false });
+    await connection.close();
+  });
+
+  it("bounds input waiting for the peer's SSH receive window", async () => {
+    const server = await startSshServer({ confirmTerminalStop: false });
+    const connection = await connect(server.port, { terminalOperationTimeoutMs: 200 });
+    const terminal = await connection.terminals!.open(request);
+    server.terminalChannels[0]!.pause();
+    const exit = terminalExit(terminal);
+    let failure: unknown;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      try { await terminal.write("x".repeat(256 * 1_024)); }
+      catch (error) { failure = error; break; }
+    }
+    expect(failure).toMatchObject({ code: "TERMINAL_UNKNOWN", details: { stateMayHaveChanged: true } });
+    expect(await exit).toMatchObject({ processExitConfirmed: false });
+    await connection.close();
+  });
+});
+
+function terminalExit(terminal: RemoteTerminalHandle): Promise<RemoteTerminalExit> {
+  return new Promise((resolve) => { terminal.onExit(resolve); });
+}
+
+async function connect(port: number, options: Ssh2ResolvedAgentAuthConnectorOptions = {}) {
+  const connector = new Ssh2ResolvedAgentAuthConnector({ readyTimeoutMs: 2_000, ...options });
   return connector.connect({
     hostname: "127.0.0.1",
     port,
@@ -304,8 +521,14 @@ async function connect(port: number) {
   });
 }
 
-async function startSshServer(): Promise<TestSshServer> {
+async function startSshServer(options: { deferTerminal?: boolean; confirmTerminalStop?: boolean } = {}): Promise<TestSshServer> {
   const commands: string[] = [];
+  const terminalChannels: ServerChannel[] = [];
+  const terminalRequests: { term: string; cols: number; rows: number }[] = [];
+  const terminalSizes: { cols: number; rows: number }[] = [];
+  const terminalSignals: string[] = [];
+  const terminalEnvironmentRequests: string[] = [];
+  const pendingTerminals: (() => void)[] = [];
   const clients = new Set<Connection>();
   let readyClient: Connection | undefined;
   let nextForwardedPort = 40_000;
@@ -340,8 +563,41 @@ async function startSshServer(): Promise<TestSshServer> {
       });
       client.on("session", (accept) => {
         const session = accept();
+        let terminal = false;
+        let terminalChannel: ServerChannel | undefined;
+        session.on("env", (acceptEnv, _reject, info) => {
+          terminalEnvironmentRequests.push(info.key);
+          acceptEnv?.();
+        });
+        session.on("pty", (acceptPty, _reject, info) => {
+          terminal = true;
+          terminalRequests.push({ term: (info as typeof info & { term: string }).term, cols: info.cols, rows: info.rows });
+          acceptPty?.();
+        });
+        session.on("window-change", (acceptWindow, _reject, info) => {
+          terminalSizes.push({ cols: info.cols, rows: info.rows });
+          acceptWindow?.();
+        });
+        session.on("signal", (acceptSignal, _reject, info) => {
+          terminalSignals.push(info.name);
+          acceptSignal?.();
+          if (options.confirmTerminalStop !== false && terminalChannel !== undefined) {
+            terminalChannel.exit(info.name);
+            terminalChannel.end();
+          }
+        });
         session.on("exec", (acceptExec, _reject, info) => {
           commands.push(info.command);
+          if (terminal) {
+            const open = (): void => {
+              terminalChannel = acceptExec();
+              terminalChannel.on("error", () => undefined);
+              terminalChannels.push(terminalChannel);
+            };
+            if (options.deferTerminal) pendingTerminals.push(open);
+            else open();
+            return;
+          }
           const stream = acceptExec();
           if (info.command.endsWith("never-complete")) return;
           if (info.command.endsWith("bounded-output")) {
@@ -379,6 +635,12 @@ async function startSshServer(): Promise<TestSshServer> {
   const result: TestSshServer = {
     port: (server.address() as AddressInfo).port,
     commands,
+    terminalChannels,
+    terminalRequests,
+    terminalSizes,
+    terminalSignals,
+    terminalEnvironmentRequests,
+    pendingTerminals,
     openForwarded: async (remotePort) => new Promise<ServerChannel>((resolve, reject) => {
       if (readyClient === undefined) {
         reject(new Error("SSH test client is not ready."));

@@ -27,9 +27,9 @@ describe("per-turn extra-directory gateway selection", () => {
     const gateway = createOrchestratorGateway({ id: "connection-extra", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example" , serverId: "server-test" }, "secret", {}, () => transport);
     await gateway.connect();
 
-    await gateway.send("session-1", { text: "default directories", attachments: [], mentions: [], deliveryMode: "prompt" });
-    await gateway.send("session-1", { text: "none", attachments: [], mentions: [], deliveryMode: "prompt", extraDirectoryIds: [] });
-    await gateway.send("session-1", { text: "selected", attachments: [], mentions: [], deliveryMode: "prompt", extraDirectoryIds: ["extra-1", "extra-1", "extra-2"] });
+    await gateway.send("session-1", { text: "default directories", attachments: [], mentions: [], deliveryMode: "prompt" }, { expectedGeneration: 1n });
+    await gateway.send("session-1", { text: "none", attachments: [], mentions: [], deliveryMode: "prompt", extraDirectoryIds: [] }, { expectedGeneration: 1n });
+    await gateway.send("session-1", { text: "selected", attachments: [], mentions: [], deliveryMode: "prompt", extraDirectoryIds: ["extra-1", "extra-1", "extra-2"] }, { expectedGeneration: 1n });
 
     expect(payloads[0]?.value.overrides).toBeUndefined();
     expect(payloads[1]?.value.overrides?.extraDirectoryIds).toEqual([]);

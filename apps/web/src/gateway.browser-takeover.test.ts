@@ -16,13 +16,14 @@ import {
   OperationState,
   SnapshotSchema,
   SubmitOperationResponseSchema,
-  UpdateBrowserCommentDesignResponseSchema
+  UpdateBrowserCommentDesignResponseSchema,
+  ReadWorkspaceHtmlSnapshotResponseSchema
 } from "@joko/contracts";
 import { describe, expect, it, vi } from "vitest";
 import { createOrchestratorGateway } from "./gateway.js";
 
 describe("remote browser takeover gateway", () => {
-  it("opens a session-scoped fresh page and returns its exact takeover page", async () => {
+  it("opens a session-scoped fresh HTTP or revision-fenced HTML page without persisting source bytes", async () => {
     const submitted: any[] = [];
     const snapshot = create(SnapshotSchema, {
       browsers: [{ browserProviderId: "browser-1", state: BrowserProviderState.READY, generation: 7n }]
@@ -30,6 +31,10 @@ describe("remote browser takeover gateway", () => {
     const transport = {
       unary: vi.fn(async (method: any, _signal: unknown, _timeout: unknown, _headers: unknown, input: any) => {
         if (method.localName === "getSnapshot") return response(method, create(GetSnapshotResponseSchema, { snapshot }));
+        if (method.localName === "readWorkspaceHtmlSnapshot") {
+          expect(input).toMatchObject({ sessionId: "session-1", file: { workspaceId: "workspace", relativePath: "index.html", expectedRevision: "" } });
+          return response(method, create(ReadWorkspaceHtmlSnapshotResponseSchema, { file: { workspaceId: "workspace", relativePath: "index.html", expectedRevision: "content-revision" }, utf8Html: "<p>Private source</p>" }));
+        }
         submitted.push(input.mutation.payload);
         return response(method, create(SubmitOperationResponseSchema, {
           operation: {
@@ -76,6 +81,11 @@ describe("remote browser takeover gateway", () => {
     await expect(gateway.openBrowserPage("browser-1", "session-1", "https://example.test/callback?access_token=secret"))
       .rejects.toThrow("Credential-shaped");
     expect(submitted).toHaveLength(1);
+    const html = await gateway.readWorkspaceHtmlSnapshot("session-1", "workspace", "index.html", new AbortController().signal);
+    await expect(gateway.openBrowserPage("browser-1", "session-1", "https://example.test/", "", html.file)).rejects.toThrow("without a URL");
+    await expect(gateway.openBrowserPage("browser-1", "session-1", "", "", html.file)).resolves.toBe("page-new");
+    expect(submitted[1]).toMatchObject({ case: "openBrowserPage", value: { url: "", workspaceHtml: html.file } });
+    expect(JSON.stringify(submitted[1], (_key, value) => typeof value === "bigint" ? value.toString() : value)).not.toContain("Private source");
     gateway.disconnect();
   });
 

@@ -23,6 +23,7 @@ import type {
   RemoteSshTransportLease
 } from "@joko/remote-ssh";
 import { afterEach, describe, expect, it } from "vitest";
+import { MULTILINGUAL_FIXTURES } from "./i18n/multilingual-fixtures.js";
 
 import type { RemoteHostRegistry } from "./remote-host-registry.js";
 import { REMOTE_PI_BROKER_SOURCE_SHA256 } from "./remote-pi-broker-source.js";
@@ -76,7 +77,8 @@ describe("RemotePiProcessFactory", () => {
         commandExecution: true,
         processStreaming: true,
         fileTransfer: true,
-        tcpForwarding: true
+        tcpForwarding: true,
+        interactiveTerminal: false
       },
       files,
       processes: {
@@ -347,7 +349,8 @@ describe("RemotePiProcessFactory", () => {
             commandExecution: true,
             processStreaming: false,
             fileTransfer: false,
-            tcpForwarding: false
+            tcpForwarding: false,
+            interactiveTerminal: false
           }
         }
       })
@@ -387,7 +390,8 @@ describe("RemotePiProcessFactory", () => {
         commandExecution: true,
         processStreaming: true,
         fileTransfer: true,
-        tcpForwarding: false
+        tcpForwarding: false,
+        interactiveTerminal: false
       },
       files,
       processes: { open: async () => bridge }
@@ -457,7 +461,8 @@ describe("RemotePiProcessFactory", () => {
         commandExecution: true,
         processStreaming: true,
         fileTransfer: true,
-        tcpForwarding: true
+        tcpForwarding: true,
+        interactiveTerminal: false
       },
       files,
       processes: {
@@ -503,8 +508,8 @@ describe("RemotePiProcessFactory", () => {
     const output: string[] = [];
     mapped.stdout.on("data", (chunk: Buffer | string) => output.push(String(chunk)));
     bridges[0]!.stdout.write(testFrame(2, 1, Buffer.from('{"phase":"before"}\n')));
-    const splitLine = Buffer.from('{"phase":"半line"}\n', "utf8");
-    const splitAt = splitLine.indexOf(Buffer.from("半", "utf8")) + 1;
+    const splitLine = Buffer.from(`${JSON.stringify({ phase: MULTILINGUAL_FIXTURES.splitPhase })}\n`, "utf8");
+    const splitAt = splitLine.indexOf(Buffer.from(MULTILINGUAL_FIXTURES.splitCharacter, "utf8")) + 1;
     bridges[0]!.stdout.write(testFrame(2, 2, splitLine.subarray(0, splitAt)));
     mapped.stdin.write('{"type":"uncertain"}\n');
     await waitUntil(() => bridges[0]!.input.some((entry, index) => index > 0 && decodeTestFrame(entry).type === 1));
@@ -548,7 +553,7 @@ describe("RemotePiProcessFactory", () => {
     await new Promise((resolveWait) => setImmediate(resolveWait));
     expect(exits).toBe(1);
     expect(output.join("").match(/"phase":"before"/gu)).toHaveLength(1);
-    expect(output.join("")).toContain('"phase":"半line"');
+    expect(output.join("")).toContain(JSON.stringify({ phase: MULTILINGUAL_FIXTURES.splitPhase }));
     expect(requests).toHaveLength(2);
     expect(forwardCloseCount).toBe(2);
   });
@@ -599,7 +604,8 @@ describe("RemotePiProcessFactory", () => {
         commandExecution: true,
         processStreaming: true,
         fileTransfer: true,
-        tcpForwarding: false
+        tcpForwarding: false,
+        interactiveTerminal: false
       },
       files,
       processes: {
@@ -772,7 +778,8 @@ describe("RemotePiProcessFactory", () => {
         commandExecution: true,
         processStreaming: true,
         fileTransfer: true,
-        tcpForwarding: false
+        tcpForwarding: false,
+        interactiveTerminal: false
       },
       files,
       processes: {
@@ -879,7 +886,8 @@ describe("RemotePiProcessFactory", () => {
         commandExecution: true,
         processStreaming: true,
         fileTransfer: true,
-        tcpForwarding: false
+        tcpForwarding: false,
+        interactiveTerminal: false
       },
       files,
       processes: {
@@ -960,7 +968,8 @@ describe("RemotePiProcessFactory", () => {
         commandExecution: true,
         processStreaming: true,
         fileTransfer: true,
-        tcpForwarding: false
+        tcpForwarding: false,
+        interactiveTerminal: false
       },
       files,
       processes: {
@@ -1040,7 +1049,8 @@ describe("RemotePiProcessFactory", () => {
               commandExecution: true,
               processStreaming: true,
               fileTransfer: true,
-              tcpForwarding: false
+              tcpForwarding: false,
+              interactiveTerminal: false
             },
             files,
             processes: {

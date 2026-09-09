@@ -283,6 +283,7 @@ async function renderSidebar(
       backendId: "backend",
       name: "Project A",
       workspaceId: "workspace-a",
+      revision: 1n,
       workspaceName: "Project A",
       trusted: true,
       pinned: false,

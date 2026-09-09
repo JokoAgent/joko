@@ -25,7 +25,7 @@ const running = Object.freeze({
   phase: "running",
   activityLines: Object.freeze([
     Object.freeze({ id: "running-user", kind: "user", text: "Check visual consistency" }),
-    Object.freeze({ id: "running-assistant", kind: "assistant", text: "Aligning semantic tokens and icons" }),
+    Object.freeze({ id: "running-assistant", kind: "assistant", text: "Updating theme tokens and icons" }),
     Object.freeze({ id: "running-tool", kind: "tool", text: "Running focused verification" })
   ]),
   updatedAt: 12
@@ -85,7 +85,7 @@ const cards = Object.freeze([
     mode: "expanded", policy: "manual", current: failed,
     sessions: Object.freeze([failed, completed, running]), counts: counts(3, 1, 0, 1, 1)
   }, "en", "dark"),
-  card("运行中紧凑态 · Dark", 420, 46, {
+  card("Running compact view · Dark", 420, 46, {
     mode: "compact", policy: "peek", current: running,
     sessions: Object.freeze([running]), counts: counts(1, 1)
   }, "zh-CN", "dark")

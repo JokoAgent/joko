@@ -141,7 +141,7 @@ describe("Sidebar organizer display controls", () => {
         revision: 1n,
         server: { name: "Orchestrator", version: "test", health: "healthy" },
         backends: [{ id: "backend", name: "Backend", version: "1", health: "healthy", capabilities: new Map() }],
-        targets: [{ id: "target", backendId: "backend", name: "Project", workspaceId: "workspace", workspaceName: "Project", trusted: true, pinned: false, archived: false }],
+        targets: [{ id: "target", backendId: "backend", name: "Project", workspaceId: "workspace", revision: 1n, workspaceName: "Project", trusted: true, pinned: false, archived: false }],
         sessions: [tracked]
       }
     });
@@ -169,7 +169,7 @@ describe("Sidebar organizer display controls", () => {
         revision: 1n,
         server: { name: "Orchestrator", version: "test", health: "healthy" },
         backends: [{ id: "backend", name: "Local Backend", version: "1", health: "healthy", capabilities: new Map() }],
-        targets: [{ id: "target", backendId: "backend", name: "Project", workspaceId: "workspace", workspaceName: "Project", trusted: true, pinned: false, archived: false }],
+        targets: [{ id: "target", backendId: "backend", name: "Project", workspaceId: "workspace", revision: 1n, workspaceName: "Project", trusted: true, pinned: false, archived: false }],
         sessions: [session(), running],
         workspaces: [{ id: "workspace", targetId: "target", name: "Project", kind: "userProject", serverPath: "D:\\joko", trusted: true, dirty: false, entries: [] }]
       }
@@ -222,7 +222,7 @@ describe("Sidebar organizer display controls", () => {
         revision: 1n,
         server: { name: "Orchestrator", version: "test", health: "healthy" },
         backends: [{ id: "backend", name: "Backend", version: "1", health: "healthy", capabilities: new Map() }],
-        targets: [{ id: "target", backendId: "backend", name: "Project", workspaceId: "workspace", workspaceName: "Project", trusted: true, pinned: false, archived: false }],
+        targets: [{ id: "target", backendId: "backend", name: "Project", workspaceId: "workspace", revision: 1n, workspaceName: "Project", trusted: true, pinned: false, archived: false }],
         sessions: [retrying]
       }
     });
@@ -248,7 +248,7 @@ describe("Sidebar organizer display controls", () => {
         revision: 1n,
         server: { name: "Orchestrator", version: "test", health: "healthy" },
         backends: [{ id: "backend", name: "Backend", version: "1", health: "healthy", capabilities: new Map() }],
-        targets: [{ id: "target", backendId: "backend", name: "Project", workspaceId: "workspace", workspaceName: "Project", trusted: true, pinned: false, archived: false }],
+        targets: [{ id: "target", backendId: "backend", name: "Project", workspaceId: "workspace", revision: 1n, workspaceName: "Project", trusted: true, pinned: false, archived: false }],
         sessions: [pinnedSession]
       }
     });
@@ -299,8 +299,8 @@ describe("Sidebar organizer display controls", () => {
 
   it("promotes pinned projects as mixed pinned entries without duplicating individually pinned tasks", async () => {
     const onPinTarget = vi.fn();
-    const pinnedTarget = { id: "pinned-target", backendId: "backend", name: "Pinned project", workspaceId: "workspace-pinned", workspaceName: "Pinned project", trusted: true, pinned: true, archived: false };
-    const mainTarget = { id: "main-target", backendId: "backend", name: "Main project", workspaceId: "workspace-main", workspaceName: "Main project", trusted: true, pinned: false, archived: false };
+    const pinnedTarget = { id: "pinned-target", backendId: "backend", name: "Pinned project", workspaceId: "workspace-pinned", revision: 1n, workspaceName: "Pinned project", trusted: true, pinned: true, archived: false };
+    const mainTarget = { id: "main-target", backendId: "backend", name: "Main project", workspaceId: "workspace-main", revision: 1n, workspaceName: "Main project", trusted: true, pinned: false, archived: false };
     const individuallyPinned = { ...session(), id: "pinned-task", name: "Pinned task", projectId: pinnedTarget.id, targetId: pinnedTarget.id, pinned: true, updatedAt: 30 };
     const projectTask = { ...session(), id: "project-task", name: "Project task", projectId: pinnedTarget.id, targetId: pinnedTarget.id, updatedAt: 20 };
     const mainTask = { ...session(), id: "main-task", name: "Main task", projectId: mainTarget.id, targetId: mainTarget.id, updatedAt: 10 };
@@ -339,10 +339,11 @@ describe("Sidebar organizer display controls", () => {
   });
 
   it("uses pinned task tiles and keyboard-reachable project and dialogue rail panels", async () => {
+    vi.useFakeTimers();
     const onPinTarget = vi.fn();
     const onNewDialogue = vi.fn();
-    const pinnedTarget = { id: "pinned-target", backendId: "backend", name: "Pinned project", workspaceId: "workspace-pinned", workspaceName: "Pinned project", trusted: true, pinned: true, archived: false } as const;
-    const mainTarget = { id: "main-target", backendId: "backend", name: "Main project", workspaceId: "workspace-main", workspaceName: "Main project", trusted: true, pinned: false, archived: false } as const;
+    const pinnedTarget = { id: "pinned-target", backendId: "backend", name: "Pinned project", workspaceId: "workspace-pinned", revision: 1n, workspaceName: "Pinned project", trusted: true, pinned: true, archived: false } as const;
+    const mainTarget = { id: "main-target", backendId: "backend", name: "Main project", workspaceId: "workspace-main", revision: 1n, workspaceName: "Main project", trusted: true, pinned: false, archived: false } as const;
     const pinnedTask = { ...session(), id: "pinned-task", name: "Pinned task", projectId: pinnedTarget.id, targetId: pinnedTarget.id, pinned: true, updatedAt: 30 };
     const mainTask = { ...session(), id: "main-task", name: "Main task", projectId: mainTarget.id, targetId: mainTarget.id, updatedAt: 20 };
     const { projectId: _projectId, ...dialogueTask } = { ...session(), id: "dialogue-task", name: "Dialogue task", targetId: mainTarget.id, updatedAt: 10 };
@@ -367,7 +368,10 @@ describe("Sidebar organizer display controls", () => {
 
     const projectsTrigger = required(rail.querySelector<HTMLButtonElement>("[data-sidebar-rail-trigger='projects']"));
     mockRect(projectsTrigger, 70, 120, 36, 36);
+    await act(async () => { projectsTrigger.focus(); vi.advanceTimersByTime(400); });
     await act(async () => projectsTrigger.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: 0 })));
+    await act(async () => { vi.advanceTimersByTime(500); });
+    expect(projectsTrigger.hasAttribute("aria-describedby")).toBe(false);
     let projectPanel = required(document.body.querySelector<HTMLElement>(".sidebar-rail-panel[data-sidebar-rail-panel-level='1']"));
     expect(projectPanel.textContent).toContain("Pinned project");
     expect(projectPanel.textContent).toContain("Main project");
@@ -402,7 +406,7 @@ describe("Sidebar organizer display controls", () => {
   });
 
   it("executes the complete local project action surface with confirmation and inline rename", async () => {
-    const target = { id: "target", backendId: "backend", name: "Project", workspaceId: "workspace", workspaceName: "Project", trusted: true, pinned: false, archived: false } as const;
+    const target = { id: "target", backendId: "backend", name: "Project", workspaceId: "workspace", revision: 1n, workspaceName: "Project", trusted: true, pinned: false, archived: false } as const;
     const idle = { ...session(), id: "idle-task", name: "Idle task" };
     const running = { ...session(), id: "running-task", name: "Running task", state: "running" as const, activeRunId: "run" };
     const onNewTaskInTarget = vi.fn();
@@ -528,7 +532,7 @@ describe("Sidebar organizer display controls", () => {
         revision: 1n,
         server: { name: "Orchestrator", version: "test", health: "healthy" },
         backends: [{ id: "backend", name: "Backend", version: "1", health: "healthy", capabilities: new Map() }],
-        targets: [{ id: "target", backendId: "backend", name: "Project", workspaceId: "workspace", workspaceName: "Project", trusted: true, pinned: false, archived: false }],
+        targets: [{ id: "target", backendId: "backend", name: "Project", workspaceId: "workspace", revision: 1n, workspaceName: "Project", trusted: true, pinned: false, archived: false }],
         sessions: [{ ...session(), pinned: true }]
       }
     });
@@ -559,7 +563,7 @@ describe("Sidebar organizer display controls", () => {
           { id: "backend", name: "Backend", version: "1", health: "healthy", capabilities: new Map() },
           { id: "other", name: "Other", version: "1", health: "healthy", capabilities: new Map() }
         ],
-        targets: [{ id: "target", backendId: "backend", name: "Project", workspaceId: "workspace", workspaceName: "Project", trusted: true, pinned: false, archived: false }],
+        targets: [{ id: "target", backendId: "backend", name: "Project", workspaceId: "workspace", revision: 1n, workspaceName: "Project", trusted: true, pinned: false, archived: false }],
         sessions
       }
     });
@@ -573,7 +577,7 @@ describe("Sidebar organizer display controls", () => {
         revision: 1n,
         server: { name: "Orchestrator", version: "test", health: "healthy" },
         backends: [{ id: "backend", name: "Backend", version: "1", health: "healthy", capabilities: new Map() }],
-        targets: [{ id: "target", backendId: "backend", name: "Project", workspaceId: "workspace", workspaceName: "Project", trusted: true, pinned: false, archived: false }],
+        targets: [{ id: "target", backendId: "backend", name: "Project", workspaceId: "workspace", revision: 1n, workspaceName: "Project", trusted: true, pinned: false, archived: false }],
         sessions: [
           { ...session(), id: "archived-pinned", pinned: true, archived: true },
           { ...session(), id: "archived-main", pinned: false, archived: true }
@@ -650,6 +654,7 @@ describe("Sidebar organizer display controls", () => {
       backendId: "backend",
       name: "Project A",
       workspaceId: "workspace-a",
+      revision: 1n,
       workspaceName: "Project A",
       trusted: true,
       pinned: false,
@@ -722,7 +727,7 @@ describe("Sidebar organizer display controls", () => {
         revision: 1n,
         server: { name: "Orchestrator", version: "test", health: "healthy" },
         backends: [{ id: "backend", name: "Backend", version: "1", health: "healthy", capabilities: new Map() }],
-        targets: [{ id: "target", backendId: "backend", name: "Project", workspaceId: "workspace", workspaceName: "Project", trusted: true, pinned: false, archived: false }],
+        targets: [{ id: "target", backendId: "backend", name: "Project", workspaceId: "workspace", revision: 1n, workspaceName: "Project", trusted: true, pinned: false, archived: false }],
         sessions
       },
       onNavigate,
@@ -845,7 +850,7 @@ describe("Sidebar organizer display controls", () => {
       revision: 1n,
       server: { name: "Orchestrator", version: "test", health: "healthy" as const },
       backends: [{ id: "backend", name: "Backend", version: "1", health: "healthy" as const, capabilities: new Map() }],
-      targets: [{ id: "target", backendId: "backend", name: "Project", workspaceId: "workspace", workspaceName: "Project", trusted: true, pinned: false, archived: false }],
+      targets: [{ id: "target", backendId: "backend", name: "Project", workspaceId: "workspace", revision: 1n, workspaceName: "Project", trusted: true, pinned: false, archived: false }],
       sessions: [...projectSessions, ...dialogueSessions]
     };
     const rendered = await renderSidebar(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, vi.fn(), { snapshot });
@@ -898,7 +903,7 @@ describe("Sidebar organizer display controls", () => {
         revision: 1n,
         server: { name: "Orchestrator", version: "test", health: "healthy" },
         backends: [{ id: "backend", name: "Backend", version: "1", health: "healthy", capabilities: new Map() }],
-        targets: [{ id: "target", backendId: "backend", name: "Project", workspaceId: "workspace", workspaceName: "Project", trusted: true, pinned: false, archived: false }],
+        targets: [{ id: "target", backendId: "backend", name: "Project", workspaceId: "workspace", revision: 1n, workspaceName: "Project", trusted: true, pinned: false, archived: false }],
         sessions: runs,
         schedules: [daily]
       },
@@ -1119,6 +1124,7 @@ async function renderSidebar(
       backendId: "backend",
       name: "Project",
       workspaceId: "workspace",
+      revision: 1n,
       workspaceName: "Project",
       trusted: true,
       pinned: false,
@@ -1354,7 +1360,7 @@ function scheduleSnapshot(sessions: readonly SessionView[]): SidebarProps["snaps
     revision: 1n,
     server: { name: "Orchestrator", version: "test", health: "healthy" },
     backends: [{ id: "backend", name: "Backend", version: "1", health: "healthy", capabilities: new Map() }],
-    targets: [{ id: "target", backendId: "backend", name: "Project", workspaceId: "workspace", workspaceName: "Project", trusted: true, pinned: false, archived: false }],
+    targets: [{ id: "target", backendId: "backend", name: "Project", workspaceId: "workspace", revision: 1n, workspaceName: "Project", trusted: true, pinned: false, archived: false }],
     sessions,
     schedules: [schedule("daily", [])]
   };

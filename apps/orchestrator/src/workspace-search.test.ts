@@ -15,6 +15,7 @@ import {
   streamWorkspaceTextSearch
 } from "./workspace-search.js";
 import { WorkspaceService } from "./workspace-service.js";
+import { MULTILINGUAL_FIXTURES } from "./i18n/multilingual-fixtures.js";
 
 const execFileAsync = promisify(execFile);
 const roots: string[] = [];
@@ -129,7 +130,7 @@ describe("workspace ripgrep contracts", () => {
 describe("WorkspaceService search/index projection", () => {
   it("adds canonical ranges and per-file content revisions to streamed matches", async () => {
     const root = await projectRoot("joko-search-service-");
-    await writeFile(join(root, "README.md"), "prefix [literal tail\n前🐾后🐾\n", "utf8");
+    await writeFile(join(root, "README.md"), `prefix [literal tail\n${MULTILINGUAL_FIXTURES.searchLine}\n`, "utf8");
     const service = new WorkspaceService();
     await service.register({ id: "project", root, displayName: "Project", trusted: true });
 
@@ -161,7 +162,7 @@ describe("WorkspaceService search/index projection", () => {
         line: 2,
         column: 2,
         endColumn: 4,
-        preview: "前🐾后🐾",
+        preview: MULTILINGUAL_FIXTURES.searchLine,
         submatches: [
           { startByte: 3, endByte: 7 },
           { startByte: 10, endByte: 14 }

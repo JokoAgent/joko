@@ -32,6 +32,7 @@ describe("Session export gateway", () => {
       click: clicked
     };
     vi.stubGlobal("document", {
+      defaultView: { URL, setTimeout, clearTimeout, addEventListener: vi.fn(), removeEventListener: vi.fn(), closed: false },
       createElement: vi.fn((tag: string) => {
         expect(tag).toBe("a");
         return link;
@@ -65,7 +66,7 @@ describe("Session export gateway", () => {
     );
     await gateway.connect();
 
-    await gateway.exportSession("session-1");
+    await gateway.exportSession("session-1", { ownerDocument: typeof document === "undefined" ? {} as Document : document, signal: new AbortController().signal });
 
     expect(calls).toEqual(["submit", "watch", "ticket", "fetch", "object-url", "click"]);
     expect(link).toMatchObject({
@@ -94,7 +95,7 @@ describe("Session export gateway", () => {
       );
       await gateway.connect();
 
-      await expect(gateway.exportSession("session-1")).rejects.toThrow(
+      await expect(gateway.exportSession("session-1", { ownerDocument: typeof document === "undefined" ? {} as Document : document, signal: new AbortController().signal })).rejects.toThrow(
         "completed Session export without an Artifact"
       );
       expect(fetchDownload).not.toHaveBeenCalled();
@@ -102,11 +103,34 @@ describe("Session export gateway", () => {
       gateway.disconnect();
     }
   );
+
+  it("does not download an export whose caller closes while the accepted operation is generating it", async () => {
+    const calls: string[] = [];
+    let finish!: () => void;
+    const pendingResult = new Promise<void>((resolve) => { finish = resolve; });
+    const fetchDownload = vi.fn();
+    vi.stubGlobal("fetch", fetchDownload);
+    const gateway = createOrchestratorGateway(
+      { id: "connection-export", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" },
+      "secret", {}, () => exportTransport(calls, "artifact", () => pendingResult)
+    );
+    await gateway.connect();
+    const request = new AbortController();
+    const pending = gateway.exportSession("session-1", { ownerDocument: {} as Document, signal: request.signal });
+    const failed = expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    await vi.waitFor(() => expect(calls).toContain("watch"));
+    request.abort();
+    finish();
+    await failed;
+    expect(calls).toEqual(["submit", "watch"]);
+    expect(fetchDownload).not.toHaveBeenCalled();
+    gateway.disconnect();
+  });
 });
 
 type ExportResultKind = "artifact" | "acknowledgement" | "missing";
 
-function exportTransport(calls: string[], resultKind: ExportResultKind): Transport {
+function exportTransport(calls: string[], resultKind: ExportResultKind, beforeTerminal?: () => Promise<void>): Transport {
   return {
     unary: vi.fn(async (method: any, _signal: unknown, _timeout: unknown, _headers: unknown, input: any) => {
       if (method.localName === "getSnapshot") {
@@ -150,7 +174,7 @@ function exportTransport(calls: string[], resultKind: ExportResultKind): Transpo
     stream: vi.fn(async (method: any, _signal: unknown, _timeout: unknown, _headers: unknown, input: any) => {
       if (method.localName === "watchOperation") {
         calls.push("watch");
-        return response(method, terminalExport(input.operationId, resultKind), true);
+        return response(method, terminalExport(input.operationId, resultKind, beforeTerminal), true);
       }
       return response(method, idleStream(), true);
     })
@@ -183,7 +207,8 @@ function terminalResult(kind: ExportResultKind) {
   };
 }
 
-async function* terminalExport(operationId: string, kind: ExportResultKind) {
+async function* terminalExport(operationId: string, kind: ExportResultKind, beforeTerminal?: () => Promise<void>) {
+  await beforeTerminal?.();
   yield create(WatchOperationResponseSchema, {
     operation: {
       operationId,

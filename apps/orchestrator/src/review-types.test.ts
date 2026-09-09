@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { MULTILINGUAL_FIXTURES } from "./i18n/multilingual-fixtures.js";
 
 import {
   MAX_REVIEW_ATTACHMENTS,
@@ -21,11 +22,11 @@ describe("review request types", () => {
   it("strictly normalizes a bounded BlobRef-only request", () => {
     expect(readStartReviewRequest({
       sourceSessionId: "  session-one  ",
-      focus: "  第一行\r\n第二行  ",
+      focus: "  First line\r\nSecond line  ",
       attachments: [{ kind: "file", displayName: "  résumé.txt ", blob }]
     })).toEqual({
       sourceSessionId: "session-one",
-      focus: "第一行\n第二行",
+      focus: "First line\nSecond line",
       attachments: [{
         kind: "file",
         displayName: "résumé.txt",
@@ -37,7 +38,7 @@ describe("review request types", () => {
   it("rejects focus and attachment count above the public limits", () => {
     expect(() => readStartReviewRequest({
       sourceSessionId: "session-one",
-      focus: "界".repeat(MAX_REVIEW_FOCUS_CHARACTERS + 1),
+      focus: MULTILINGUAL_FIXTURES.limitCharacter.repeat(MAX_REVIEW_FOCUS_CHARACTERS + 1),
       attachments: []
     })).toThrow(/4000/u);
     expect(() => readStartReviewRequest({

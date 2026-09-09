@@ -107,6 +107,66 @@ describe("Session visual harness", () => {
     expect(container.querySelector("h1")?.textContent).toBe("New task");
     expect(container.textContent).not.toContain("Cannot read properties of undefined");
   }, 10_000);
+
+  it("saves and cancels queue edits from the keyboard without consuming composition or steering an edited row", async ({ onTestFinished }) => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    await renderHarness(container);
+    const actions: string[] = [];
+    const observer = new MutationObserver((records) => {
+      for (const record of records) if (record.oldValue !== null) actions.push(record.oldValue);
+    });
+    observer.observe(document.documentElement, { attributes: true, attributeOldValue: true, attributeFilter: ["data-harness-last-action"] });
+    onTestFinished(() => observer.disconnect());
+    const beginEdit = async () => {
+      await act(async () => required(container.querySelector<HTMLButtonElement>('[aria-label="Edit queued input"]')).click());
+      return required(container.querySelector<HTMLTextAreaElement>('[aria-label="Queued input text"]'));
+    };
+    const textarea = await beginEdit();
+    expect(document.activeElement).toBe(textarea);
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set?.call(textarea, "Updated queued follow-up");
+      textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    for (const options of [{ shiftKey: true }, { isComposing: true }, { repeat: true }, { keyCode: 229 }]) {
+      await act(async () => textarea.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, ...options })));
+      expect(container.querySelector(".queue-strip__editor")).not.toBeNull();
+      expect(document.documentElement.dataset.harnessLastAction).toBe("queue-edit-lock:visual-queue:true");
+    }
+    await act(async () => textarea.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", ctrlKey: true, bubbles: true })));
+    expect(container.querySelector(".queue-strip__editor")).toBeNull();
+    expect(document.documentElement.dataset.harnessLastAction).toBe("queue-edit-lock:visual-queue:false");
+    expect(actions).toContain("queue-edit:visual-queue");
+    expect(actions).not.toContain("queue-steer:visual-queue");
+    expect(container.querySelector(".queue-strip__text")?.textContent).toBe("Updated queued follow-up");
+    expect(document.activeElement).toBe(container.querySelector('[aria-label="Edit queued input"]'));
+    actions.length = 0;
+    const cancelTextarea = await beginEdit();
+    await act(async () => cancelTextarea.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+    expect(container.querySelector(".queue-strip__editor")).toBeNull();
+    expect(document.documentElement.dataset.harnessLastAction).toBe("queue-edit-lock:visual-queue:false");
+    expect(actions).not.toContain("queue-edit:visual-queue");
+    expect(document.activeElement).toBe(container.querySelector('[aria-label="Edit queued input"]'));
+    await beginEdit();
+    const save = required(container.querySelector<HTMLButtonElement>('.queue-strip__editor button[type="submit"]'));
+    save.focus();
+    await act(async () => save.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+    expect(container.querySelector(".queue-strip__editor")).toBeNull();
+    expect(document.activeElement).toBe(container.querySelector('[aria-label="Edit queued input"]'));
+    const savingTextarea = await beginEdit();
+    const queueControl = required(container.querySelector<HTMLButtonElement>(".queue-strip__title button"));
+    await act(async () => {
+      savingTextarea.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+      queueControl.focus();
+    });
+    expect(container.querySelector(".queue-strip__editor")).toBeNull();
+    expect(document.activeElement).toBe(queueControl);
+    const row = required(container.querySelector<HTMLElement>('.queue-strip__items article[tabindex="0"]'));
+    expect(row.getAttribute("aria-keyshortcuts")).toBe("Meta+Enter Control+Enter");
+    await act(async () => row.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", metaKey: true, bubbles: true })));
+    expect(document.documentElement.dataset.harnessLastAction).toBe("queue-edit-lock:visual-queue:false");
+    expect(actions).toContain("queue-steer:visual-queue");
+  }, 10_000);
 });
 
 function required<T>(value: T | null | undefined): T {

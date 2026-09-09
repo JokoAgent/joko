@@ -4,7 +4,6 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MessageUsageMeta } from "./MessageUsageMeta.js";
-import { TOOLTIP_DELAY_MS } from "./ui.js";
 import type { Translator } from "./types.js";
 
 const roots: Root[] = [];
@@ -25,7 +24,7 @@ afterEach(async () => {
 });
 
 describe("message usage meta", () => {
-  it("matches the delayed hover/focus detail interaction and token fallback", () => {
+  it("shows keyboard focus detail immediately and retains the token fallback", () => {
     const host = document.body.appendChild(document.createElement("div"));
     const root = createRoot(host);
     roots.push(root);
@@ -41,9 +40,6 @@ describe("message usage meta", () => {
     const meta = host.querySelector<HTMLElement>(".message-usage-meta")!;
     expect(meta.textContent).toBe("1.0k tokens");
     act(() => meta.focus());
-    act(() => vi.advanceTimersByTime(TOOLTIP_DELAY_MS - 1));
-    expect(document.body.querySelector("[role=tooltip]")).toBeNull();
-    act(() => vi.advanceTimersByTime(1));
     expect(document.body.querySelector("[role=tooltip]")?.textContent).toContain("timeline.usageTokenLine");
     expect(meta.getAttribute("aria-describedby")).not.toBeNull();
     act(() => meta.blur());

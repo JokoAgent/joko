@@ -16,6 +16,7 @@ export const APP_SHORTCUT_IDS = [
   "close-tab-or-window",
   "right-tab-prev",
   "right-tab-next",
+  "open-terminal",
   "open-settings",
   "find-in-page",
   "search-in-project",
@@ -109,6 +110,7 @@ const CORE_SHORTCUT_DEFINITIONS: readonly AppShortcutDefinition[] = [
   definition("right-tab-next", "app", (platform) => platform === "darwin"
     ? [combo("BracketRight", { meta: true, shift: true }), combo("Tab", { ctrl: true })]
     : [combo("PageDown", { ctrl: true }), combo("Tab", { ctrl: true })]),
+  definition("open-terminal", "app", () => [combo("Backquote", { ctrl: true })]),
   definition("open-settings", "app", () => [combo("Comma", { meta: true })], {
     hiddenInSettings: true,
     menuBacked: true,

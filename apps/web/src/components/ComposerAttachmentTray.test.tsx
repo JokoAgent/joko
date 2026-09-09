@@ -88,5 +88,5 @@ function mount(attachments: readonly AttachmentDraft[], onRemove = vi.fn()): voi
   const host = document.body.appendChild(document.createElement("div"));
   const root = createRoot(host);
   roots.push(root);
-  act(() => root.render(<ComposerAttachmentTray attachments={attachments} t={t} onRemove={onRemove} />));
+  act(() => root.render(<ComposerAttachmentTray ownerKey="draft" attachments={attachments} t={t} onRemove={onRemove} />));
 }

@@ -1,20 +1,23 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { SessionView } from "./model.js";
-import { PROMPT_RECOMMENDATION_SETTLE_MS, PromptRecommendationStore, promptRecommendationOwnerKey } from "./prompt-recommendation-store.js";
+import { PROMPT_RECOMMENDATION_SETTLE_MS, PromptRecommendationStore, promptRecommendationOwnerKey, type PromptRecommendationFence } from "./prompt-recommendation-store.js";
 
 afterEach(() => vi.useRealTimers());
 
 describe("PromptRecommendationStore", () => {
-  it("keys ownership by both server/origin and profile identity", () => {
+  it("keys ownership by connection, locale, routing revisions, and the recommendation switch", () => {
     const common = { deviceId: "device-a", name: "Local", origin: "http://127.0.0.1:4318", serverId: "server-a" } as const;
-    expect(promptRecommendationOwnerKey({ ...common, id: "profile-a" }))
-      .toBe("server-a\0profile-a");
-    expect(promptRecommendationOwnerKey({ ...common, id: "profile-b" }))
-      .toBe("server-a\0profile-b");
-    expect(promptRecommendationOwnerKey({ id: "profile-a", deviceId: "device-test", name: "Local", origin: "http://localhost:4318" , serverId: "server-test" }))
-      .toBe("server-test\0profile-a");
-    expect(promptRecommendationOwnerKey(undefined)).toBeUndefined();
+    const profile = { ...common, id: "profile-a" };
+    const routing = { locale: "en", revision: 1n, runtimeRevision: "runtime-one", enabled: true } as const;
+    const original = promptRecommendationOwnerKey(profile, routing);
+    expect(promptRecommendationOwnerKey({ ...profile }, { ...routing })).toBe(original);
+    expect(promptRecommendationOwnerKey({ ...profile, id: "profile-b" }, routing)).not.toBe(original);
+    expect(promptRecommendationOwnerKey({ ...profile, serverId: "server-b" }, routing)).not.toBe(original);
+    for (const next of [{ ...routing, locale: "zh-CN" as const }, { ...routing, revision: 2n }, { ...routing, runtimeRevision: "runtime-two" }, { ...routing, enabled: false }]) {
+      expect(promptRecommendationOwnerKey(profile, next)).not.toBe(original);
+    }
+    expect(promptRecommendationOwnerKey(undefined, routing)).toBeUndefined();
   });
 
   it("captures a background Session completion, waits 500ms, and predicts only when that Session is revisited", async () => {
@@ -137,8 +140,14 @@ describe("PromptRecommendationStore", () => {
     await vi.advanceTimersByTimeAsync(1);
     expect(store.inspect("session-a")?.phase).toBe("candidate");
 
+    let signal: AbortSignal | undefined;
+    store.request("session-a", 0n, 2, (_fence, nextSignal) => { signal = nextSignal; return new Promise(() => undefined); });
+    await Promise.resolve();
+    expect(signal?.aborted).toBe(false);
+
     store.observe([session("session-a", "idle", 2)], { enabled: false, available: true });
     expect(store.inspect("session-a")).toBeUndefined();
+    expect(signal?.aborted).toBe(true);
   });
 
   it("does not carry a colliding Session id across connection-owner reset", async () => {
@@ -153,6 +162,43 @@ describe("PromptRecommendationStore", () => {
     store.observe([session("same-id", "idle", 2)], enabled);
     await vi.advanceTimersByTimeAsync(1);
     expect(store.inspect("same-id")).toBeUndefined();
+  });
+
+  it("retires queued, pending, and ready predictions across owner ABA without charging idle sessions again", async () => {
+    vi.useFakeTimers();
+    const store = new PromptRecommendationStore(1);
+    for (const phase of ["queued", "pending", "ready"] as const) {
+      store.setOwner("owner-a");
+      store.observe([session("same-id", "running", 1)], enabled);
+      store.observe([session("same-id", "idle", 2)], enabled);
+      await vi.advanceTimersByTimeAsync(1);
+      const result = deferred<string>();
+      const request = vi.fn((_fence: PromptRecommendationFence, _signal: AbortSignal) => result.promise);
+      store.request("same-id", 0n, 2, request);
+      if (phase !== "queued") await Promise.resolve();
+      if (phase === "ready") {
+        result.resolve("Old ready text");
+        await vi.waitFor(() => expect(store.recommendation("same-id", 0n, 2)).toBe("Old ready text"));
+      }
+      store.setOwner("owner-b");
+      if (phase === "pending") expect(request.mock.calls[0]?.[1].aborted).toBe(true);
+      store.observe([session("same-id", "idle", 2)], enabled);
+      store.setOwner("owner-a");
+      store.observe([session("same-id", "idle", 2)], enabled);
+      result.resolve("Late old text");
+      await vi.advanceTimersByTimeAsync(2);
+      store.request("same-id", 0n, 2, request);
+      await Promise.resolve();
+      expect(request).toHaveBeenCalledTimes(phase === "queued" ? 0 : 1);
+      expect(store.inspect("same-id")).toBeUndefined();
+      store.setOwner("owner-a");
+      store.observe([session("same-id", "running", 3)], enabled);
+      store.observe([session("same-id", "idle", 4)], enabled);
+      await vi.advanceTimersByTimeAsync(1);
+      store.request("same-id", 0n, 4, async () => "New natural completion");
+      await vi.waitFor(() => expect(store.recommendation("same-id", 0n, 4)).toBe("New natural completion"));
+      store.reset();
+    }
   });
 });
 

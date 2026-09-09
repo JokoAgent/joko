@@ -3,6 +3,16 @@ import type { TimelineItemView, WorkspaceChangeSetView } from "../model.js";
 import { canEditVisibleUserMessage, changeSetForMessageRound, lastVisibleUserMessage, messageDialogueRewindTarget, messageRoundRunId } from "./message-rewind-behavior.js";
 
 describe("message rewind boundaries", () => {
+  it("requires explicit first-turn authority and the start capability, independently of parent and pagination", () => {
+    const root = { ...message("first", "user"), nativeRewindBefore: { kind: "session_start" as const } };
+    expect(messageDialogueRewindTarget(root)).toBeUndefined();
+    expect(canEditVisibleUserMessage(root)).toBe(false);
+    expect(messageDialogueRewindTarget(root, true)).toEqual({ kind: "session_start" });
+    expect(canEditVisibleUserMessage(root, true)).toBe(true);
+    expect(messageDialogueRewindTarget(message("unknown", "user"), true)).toBeUndefined();
+    expect(messageDialogueRewindTarget({ ...message("partial", "user"), nativeParentEntryId: "parent" }, true)).toBeUndefined();
+  });
+
   const items: readonly TimelineItemView[] = [
     message("user-1", "user", "parent-1"),
     { ...message("assistant-1", "assistant"), runId: "run-1" },
@@ -15,7 +25,7 @@ describe("message rewind boundaries", () => {
     const last = lastVisibleUserMessage(items);
     expect(last?.id).toBe("user-2");
     expect(canEditVisibleUserMessage(last)).toBe(true);
-    expect(messageDialogueRewindTarget(last!)).toBe("parent-2");
+    expect(messageDialogueRewindTarget(last!)).toEqual({ kind: "native_entry", entryId: "parent-2" });
     expect(canEditVisibleUserMessage({ ...last!, attachments: [{ id: "a", blobId: "b", title: "x", kind: "file", fileName: "x", mediaType: "text/plain", byteSize: 1 }] })).toBe(true);
     expect(canEditVisibleUserMessage({ ...last!, text: "", attachments: [{ id: "a", blobId: "b", title: "x", kind: "file", fileName: "x", mediaType: "text/plain", byteSize: 1 }] })).toBe(false);
   });
@@ -29,7 +39,7 @@ describe("message rewind boundaries", () => {
 });
 
 function message(id: string, kind: TimelineItemView["kind"], nativeParentEntryId?: string): TimelineItemView {
-  return { id, kind, sequence: BigInt(id.length), createdAt: id.length, text: id, ...(nativeParentEntryId === undefined ? {} : { nativeParentEntryId }) };
+  return { id, kind, sequence: BigInt(id.length), createdAt: id.length, text: id, ...(nativeParentEntryId === undefined ? {} : { nativeParentEntryId, nativeRewindBefore: { kind: "native_entry", entryId: nativeParentEntryId } }) };
 }
 
 function changeSet(id: string, runId: string, capturedAt: number): WorkspaceChangeSetView {

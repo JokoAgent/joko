@@ -9,13 +9,14 @@ import { translate } from "../i18n.js";
 import { modelPreferenceKey, providerPreferenceKey, readModelPickerOwnerPreferences, resetModelPickerPreferencesForTests } from "../model-picker-preferences.js";
 import {
   emptySnapshot,
+  type BackendView,
   type ManagedModelRuntimeView,
   type ModelView,
   type ProviderConfigurationView,
   type ProviderModelConfigurationView,
-  type ProviderRuntimeView
+  type ProviderRuntimeView,
+  type ProviderRuntimeConfigurationView
 } from "../model.js";
-import { ProviderLoginDialog } from "./ProviderLoginDialog.js";
 import { ProviderSettings, providerSettingsEntries } from "./SettingsPage.js";
 
 const roots: Root[] = [];
@@ -37,7 +38,7 @@ afterEach(async () => {
 describe("ProviderSettings model visibility", () => {
   it("keeps authenticated backend-native Provider entries separate when Provider IDs overlap", () => {
     const base = emptySnapshot();
-    const configuration = provider("shared", "Shared account", { enabled: false, keyless: false });
+    const configuration = provider("shared", "Shared account", { enabled: false, runtimes: [runtimeConfiguration({ keyless: false })] });
     const catalog = providerSettingsEntries({
       ...base,
       providers: [
@@ -55,7 +56,7 @@ describe("ProviderSettings model visibility", () => {
 
   it("projects one configured Provider entry across related managed runtimes", () => {
     const base = emptySnapshot();
-    const configuration = provider("shared", "Shared account", { models: [configuredModel("model", "Model")] });
+    const configuration = provider("shared", "Shared account", { runtimes: ["backend-a", "backend-b"].map((backendId) => runtimeConfiguration({ backendId, models: [configuredModel("model", "Model")] })) });
     const catalog = providerSettingsEntries({
       ...base,
       providers: [
@@ -71,7 +72,7 @@ describe("ProviderSettings model visibility", () => {
 
   it("does not offer an installed signed-out backend-native Provider without an in-app login method", () => {
     const base = emptySnapshot();
-    const configuration = provider("external-account", "External account", { enabled: false, keyless: false });
+    const configuration = provider("external-account", "External account", { enabled: false, runtimes: [runtimeConfiguration({ keyless: false })] });
     const catalog = providerSettingsEntries({
       ...base,
       backends: [{
@@ -102,7 +103,7 @@ describe("ProviderSettings model visibility", () => {
     const configuration = provider("managed-template", "Managed template", {
       kind: "subscription",
       enabled: false,
-      keyless: false
+      runtimes: [runtimeConfiguration({ keyless: false })]
     });
     const catalog = providerSettingsEntries({
       ...base,
@@ -135,8 +136,7 @@ describe("ProviderSettings model visibility", () => {
     const configuration = provider("managed-template", "Managed template", {
       kind: "subscription",
       enabled: false,
-      keyless: false,
-      models: [configuredModel("catalog-model", "Catalog model")]
+      runtimes: [runtimeConfiguration({ keyless: false, models: [configuredModel("catalog-model", "Catalog model")] })]
     });
     const catalog = providerSettingsEntries({
       ...base,
@@ -157,9 +157,9 @@ describe("ProviderSettings model visibility", () => {
   it("separates owner-managed and backend-native entries with the same Provider ID while retaining each complete management catalog", async () => {
     const base = emptySnapshot();
     const managedConfiguration = provider("shared", "Managed account", {
-      models: [configuredModel("catalog-entry", "Catalog entry")]
+      runtimes: [runtimeConfiguration({ backendId: "backend-managed", models: [configuredModel("catalog-entry", "Catalog entry")] })]
     });
-    const nativeConfiguration = provider("shared", "Native account", { enabled: false, keyless: false });
+    const nativeConfiguration = provider("shared", "Native account", { enabled: false, runtimes: [runtimeConfiguration({ keyless: false })] });
     const snapshot = {
       ...base,
       backends: [
@@ -201,68 +201,18 @@ describe("ProviderSettings model visibility", () => {
     expect(nativeRow.querySelector("small")?.textContent).toBe("3 models");
   });
 
-  it("refreshes the snapshot when native browser login polling completes", async () => {
-    vi.useFakeTimers();
-    try {
-      const pending = {
-        id: "flow-one",
-        providerId: "native-provider",
-        method: "oauthBrowser" as const,
-        state: "pending" as const,
-        verificationUri: "https://accounts.example.test/authorize",
-        updatedAt: 1
-      };
-      const refresh = vi.fn(async () => undefined);
-      const openHttpLink = vi.fn(async () => undefined);
-      const controller = {
-        beginProviderLogin: vi.fn(async () => pending),
-        getProviderLoginFlow: vi.fn(async () => ({ ...pending, state: "completed" as const, updatedAt: 2 })),
-        openHttpLink,
-        refresh,
-        state: {
-          preferences: { locale: "en" },
-          snapshot: emptySnapshot()
-        }
-      } as unknown as AppController;
-      const container = document.createElement("div");
-      document.body.append(container);
-      const root = createRoot(container);
-      roots.push(root);
-      await act(async () => root.render(<ProviderLoginDialog
-        controller={controller}
-        backendId="backend-native"
-        provider={provider("native-provider", "Native Provider", { kind: "oauth" })}
-        loginMethods={["oauthBrowser"]}
-        t={(key, values) => translate("en", key, values)}
-        onClose={() => undefined}
-      />));
-
-      const start = [...document.body.querySelectorAll<HTMLButtonElement>("button")]
-        .find((button) => button.textContent === "Start sign-in");
-      if (start === undefined) throw new Error("Expected login start button.");
-      await act(async () => start.click());
-      await act(async () => vi.advanceTimersByTimeAsync(1_250));
-
-      expect(openHttpLink).toHaveBeenCalledWith(pending.verificationUri, { forceExternal: true });
-      expect(controller.getProviderLoginFlow).toHaveBeenCalledWith("flow-one");
-      expect(refresh).toHaveBeenCalledOnce();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
   it("keeps unconfigured login templates out of the rail and offers only supported templates in the add wizard", async () => {
     const base = emptySnapshot();
     const configured = provider("configured", "Configured");
     const signInTemplate = provider("sign-in-template", "Sign-in Template", {
       kind: "subscription",
       enabled: false,
-      keyless: false
+      runtimes: [runtimeConfiguration({ keyless: false })]
     });
     const unsupportedTemplate = provider("unsupported-template", "Unsupported Template", {
       kind: "apiKey",
       enabled: false,
-      keyless: false
+      runtimes: [runtimeConfiguration({ keyless: false })]
     });
     const snapshot = {
       ...base,
@@ -397,7 +347,10 @@ describe("ProviderSettings model visibility", () => {
   });
 
   it("returns from custom provider setup through the title-bar Back action", async () => {
-    const snapshot = emptySnapshot();
+    const snapshot = { ...emptySnapshot(), backends: [
+      managedBackend(),
+      { id: "native", name: "Native runtime", version: "1", health: "healthy" as const, capabilities: new Map([["model.list", { name: "model.list", supported: true, options: [] }]]) }
+    ] };
     const container = document.createElement("div");
     document.body.append(container);
     const root = createRoot(container);
@@ -413,6 +366,7 @@ describe("ProviderSettings model visibility", () => {
     await act(async () => required(document.body.querySelector<HTMLButtonElement>(".provider-add-wizard__custom")).click());
 
     expect(document.body.querySelector(".provider-editor__actions .provider-flow-header-back")).toBeNull();
+    expect([...document.body.querySelectorAll('[role="tab"]')].map((tab) => tab.textContent)).toEqual(["Managed runtime"]);
     const back = required(document.body.querySelector<HTMLButtonElement>(".provider-editor-modal .modal__header .provider-flow-header-back"));
     await act(async () => back.click());
 
@@ -420,11 +374,20 @@ describe("ProviderSettings model visibility", () => {
     expect(document.body.querySelector(".provider-add-wizard")).not.toBeNull();
   });
 
-  it("saves a custom endpoint through the managed credential channel before saving the provider", async () => {
-    const snapshot = emptySnapshot();
+  it.each(["success", "credential failure", "provider failure", "connection change"] as const)("keeps custom provider saves bound to their connection and preserves the draft after %s", async (scenario) => {
+    const snapshot = { ...emptySnapshot(), backends: [managedBackend()] };
     const calls: string[] = [];
-    const saveCredential = vi.fn(async (_draft: unknown) => { calls.push("credential"); });
-    const saveProvider = vi.fn(async (_draft: unknown) => { calls.push("provider"); });
+    let finishUpload!: () => void;
+    const upload = new Promise<void>((resolve) => { finishUpload = resolve; });
+    let failed = false;
+    const saveCredential = vi.fn(async (_draft: unknown, _signal?: AbortSignal) => {
+      calls.push("credential"); await upload;
+      if (scenario === "credential failure" && !failed) { failed = true; throw new Error("Upload failed"); }
+    });
+    const saveProvider = vi.fn(async (_draft: unknown, _signal?: AbortSignal) => {
+      calls.push("provider");
+      if (scenario === "provider failure" && !failed) { failed = true; throw new Error("Provider failed"); }
+    });
     const controller = {
       refreshProviderModels: vi.fn(async () => undefined),
       saveCredential,
@@ -457,21 +420,57 @@ describe("ProviderSettings model visibility", () => {
     const save = required(container.querySelector<HTMLButtonElement>('.provider-editor__actions button[type="submit"]'));
     expect(save.disabled).toBe(false);
     await act(async () => { save.click(); await Promise.resolve(); await Promise.resolve(); });
+    expect(container.querySelector(".provider-editor")).not.toBeNull();
+    expect(container.querySelector(".provider-editor")?.getAttribute("aria-busy")).toBe("true");
+    await act(async () => save.click());
+    expect(saveCredential).toHaveBeenCalledOnce();
+    expect(saveProvider).not.toHaveBeenCalled();
+    if (scenario === "connection change") {
+      const foreignSave = vi.fn(async () => undefined);
+      const foreignCredential = vi.fn(async () => undefined);
+      await act(async () => root.render(<ProviderSettings
+        controller={{ ...controller, saveProvider: foreignSave, saveCredential: foreignCredential }} snapshot={snapshot}
+        runAction={() => undefined} t={(key, values) => translate("en", key, values)}
+      />));
+      expect(container.querySelector<HTMLInputElement>('input[type="password"]')?.value).toBe("");
+      expect(container.textContent).toContain("The connection changed");
+      await act(async () => finishUpload());
+      expect(saveProvider).not.toHaveBeenCalled();
+      expect(foreignSave).not.toHaveBeenCalled();
+      expect(foreignCredential).not.toHaveBeenCalled();
+      expect(container.querySelector<HTMLInputElement>('input[type="url"]')?.value).toBe("https://models.example.invalid/v1");
+      expect(container.querySelector(".provider-editor")).not.toBeNull();
+      return;
+    }
+    await act(async () => finishUpload());
+    if (scenario !== "success") {
+      expect(container.querySelector(".provider-editor")?.getAttribute("aria-busy")).toBe("false");
+      expect(container.querySelector<HTMLInputElement>('input[type="url"]')?.value).toBe("https://models.example.invalid/v1");
+      expect(container.querySelector<HTMLInputElement>('input[type="password"]')?.value).toBe(scenario === "credential failure" ? "test-secret" : "");
+      expect(container.textContent).toContain(scenario === "credential failure" ? "Could not confirm the save" : "The credential was saved");
+      await act(async () => save.click());
+      expect(saveCredential).toHaveBeenCalledTimes(scenario === "credential failure" ? 2 : 1);
+    }
 
-    expect(calls).toEqual(["credential", "provider"]);
+    expect(calls).toEqual(scenario === "success" ? ["credential", "provider"]
+      : scenario === "credential failure" ? ["credential", "credential", "provider"] : ["credential", "provider", "provider"]);
     expect(saveCredential).toHaveBeenCalledWith(expect.objectContaining({
-      id: "credential-example-provider",
-      providerId: "example-provider",
-      environmentName: "JOKO_PROVIDER_EXAMPLE_PROVIDER_API_KEY",
+      id: expect.stringMatching(/^credential-example-provider-/u),
+      providerId: "",
       secret: "test-secret"
-    }));
+    }), expect.any(AbortSignal));
     expect(saveProvider).toHaveBeenCalledWith(expect.objectContaining({
       id: "example-provider",
-      credentialId: "credential-example-provider",
-      environmentName: "JOKO_PROVIDER_EXAMPLE_PROVIDER_API_KEY",
-      endpoint: "https://models.example.invalid/v1"
-    }));
+      revision: 0n,
+      runtimes: [expect.objectContaining({ backendId: "catalog",
+        credentialId: (saveCredential.mock.calls.at(-1)?.[0] as { id: string }).id,
+        environmentName: "JOKO_PROVIDER_EXAMPLE_PROVIDER_API_KEY", endpoint: "https://models.example.invalid/v1",
+        credentialOrigin: "https://models.example.invalid", models: [expect.objectContaining({ modelId: "example-model", name: "Example model" })]
+      })]
+    }), expect.any(AbortSignal));
     expect(saveProvider.mock.calls[0]?.[0]).not.toHaveProperty("secret");
+    expect(JSON.stringify(saveProvider.mock.calls[0]?.[0], (_key, value) => typeof value === "bigint" ? value.toString() : value)).not.toContain("test-secret");
+    expect(container.querySelector(".provider-editor")).toBeNull();
   });
 
   it("returns to provider selection when the chosen sign-in provider is wrong", async () => {
@@ -479,7 +478,7 @@ describe("ProviderSettings model visibility", () => {
     const signInTemplate = provider("sign-in-template", "Sign-in Template", {
       kind: "subscription",
       enabled: false,
-      keyless: false
+      runtimes: [runtimeConfiguration({ keyless: false })]
     });
     const snapshot = {
       ...base,
@@ -516,7 +515,7 @@ describe("ProviderSettings model visibility", () => {
     const signInTemplate = provider("sign-in-template", "Sign-in Template", {
       kind: "subscription",
       enabled: false,
-      keyless: false
+      runtimes: [runtimeConfiguration({ keyless: false })]
     });
     const snapshot = {
       ...base,
@@ -550,7 +549,7 @@ describe("ProviderSettings model visibility", () => {
   it("confirms before deleting an editable persisted provider through the controller", async () => {
     const base = emptySnapshot();
     const removable = provider("removable", "Removable provider", {
-      models: [configuredModel("removable-model", "Removable model")]
+      runtimes: [runtimeConfiguration({ models: [configuredModel("removable-model", "Removable model")] })]
     });
     const snapshot = { ...base, settings: { ...base.settings, providers: [removable] } };
     const deleteProvider = vi.fn(async (_providerId: string) => undefined);
@@ -584,37 +583,37 @@ describe("ProviderSettings model visibility", () => {
     const base = emptySnapshot();
     const disabledPersisted = provider("disabled", "Disabled persisted", {
       enabled: false,
-      models: [configuredModel("persisted-model", "Persisted model")]
+      runtimes: [runtimeConfiguration({ models: [configuredModel("persisted-model", "Persisted model")] })]
     });
     const pending = provider("pending", "Pending provider", {
       kind: "oauth",
       enabled: false,
-      keyless: false
+      runtimes: [runtimeConfiguration({ keyless: false })]
     });
     const refreshing = provider("refreshing", "Refreshing provider", {
       kind: "subscription",
       enabled: false,
-      keyless: false
+      runtimes: [runtimeConfiguration({ keyless: false })]
     });
     const dormant = provider("dormant", "Dormant template", {
       kind: "subscription",
       enabled: false,
-      keyless: false
+      runtimes: [runtimeConfiguration({ keyless: false })]
     });
     const authenticated = provider("authenticated", "Authenticated provider", {
       kind: "subscription",
       enabled: false,
-      keyless: false
+      runtimes: [runtimeConfiguration({ keyless: false })]
     });
     const expired = provider("expired", "Expired provider", {
       kind: "oauth",
       enabled: false,
-      keyless: false
+      runtimes: [runtimeConfiguration({ keyless: false })]
     });
     const failed = provider("failed", "Failed provider", {
       kind: "apiKey",
       enabled: false,
-      keyless: false
+      runtimes: [runtimeConfiguration({ keyless: false })]
     });
     const snapshot = {
       ...base,
@@ -655,7 +654,7 @@ describe("ProviderSettings model visibility", () => {
     const nativeProvider = provider("native-account", "Native account", {
       kind: "subscription",
       enabled: false,
-      keyless: false
+      runtimes: [runtimeConfiguration({ keyless: false })]
     });
     const authenticatedSnapshot = {
       ...base,
@@ -711,7 +710,7 @@ describe("ProviderSettings model visibility", () => {
 
   it("derives the provider model count from the live model catalog instead of stale configuration metadata", async () => {
     const base = emptySnapshot();
-    const configured = provider("provider", "Provider", { modelCount: 27 });
+    const configured = provider("provider", "Provider", { runtimes: [runtimeConfiguration({ models: Array.from({ length: 27 }, (_, index) => configuredModel(`declared-${index}`, `Declared ${index}`)) })] });
     const snapshot = {
       ...base,
       providers: [providerRuntime(configured)],
@@ -877,16 +876,9 @@ describe("ProviderSettings model visibility", () => {
       id: "provider",
       name: "Provider",
       kind: "customEndpoint" as const,
-      compatibility: "openaiChat" as const,
-      endpoint: "https://provider.invalid/v1",
-      credentialId: "credential",
       enabled: true,
-      keyless: false,
-      authHeader: true,
-      environmentName: "",
-      modelCount: 1,
-      headers: [],
-      models: []
+      revision: 1n,
+      runtimes: [runtimeConfiguration({ credentialId: "credential", keyless: false, authHeader: true, credentialOrigin: "https://provider.invalid" })]
     };
     const snapshot = {
       ...base,
@@ -895,9 +887,9 @@ describe("ProviderSettings model visibility", () => {
         id: provider.id,
         name: provider.name,
         kind: provider.kind,
-        compatibility: provider.compatibility,
+        compatibility: "openaiChat" as const,
         authenticationState: "authenticated" as const,
-        endpoint: provider.endpoint,
+        endpoint: "https://provider.invalid/v1",
         ownerManaged: true,
         supportsLogin: false,
         loginMethods: [],
@@ -939,8 +931,9 @@ describe("ProviderSettings model visibility", () => {
 
   it("disables a Provider across related runtimes and supports per-runtime model visibility", async () => {
     const base = emptySnapshot();
-    const configuration = provider("shared-provider", "Shared Provider", { keyless: false });
-    const secondConfiguration = provider("shared-provider", "Shared Provider", { keyless: false });
+    const configuration = provider("shared-provider", "Shared Provider", {
+      runtimes: ["backend-a", "backend-b"].map((backendId) => runtimeConfiguration({ backendId, keyless: false }))
+    });
     const snapshot = {
       ...base,
       backends: [
@@ -949,7 +942,7 @@ describe("ProviderSettings model visibility", () => {
       ],
       providers: [
         providerRuntime(configuration, { backendId: "backend-a", ownerManaged: true, authenticationState: "authenticated", routingEnabled: true }),
-        providerRuntime(secondConfiguration, { backendId: "backend-b", ownerManaged: true, authenticationState: "authenticated", routingEnabled: true })
+        providerRuntime(configuration, { backendId: "backend-b", ownerManaged: true, authenticationState: "authenticated", routingEnabled: true })
       ],
       models: [
         { ...catalogModel("shared-provider", "shared-model", "Shared model"), backendId: "backend-a" },
@@ -1018,7 +1011,9 @@ describe("ProviderSettings model visibility", () => {
 
   it("keeps every related runtime column when a model route is unavailable", async () => {
     const base = emptySnapshot();
-    const configuration = provider("shared-provider", "Shared Provider", { keyless: false });
+    const configuration = provider("shared-provider", "Shared Provider", {
+      runtimes: ["backend-a", "backend-b"].map((backendId) => runtimeConfiguration({ backendId, keyless: false }))
+    });
     const snapshot = {
       ...base,
       backends: [
@@ -1062,7 +1057,7 @@ describe("ProviderSettings model visibility", () => {
 
   it("shows a disabled Provider state and restores it without exposing its model list", async () => {
     const base = emptySnapshot();
-    const configuration = provider("provider", "Provider", { keyless: false });
+    const configuration = provider("provider", "Provider", { runtimes: [runtimeConfiguration({ keyless: false })] });
     const snapshot = {
       ...base,
       backends: [{ id: "backend-provider-catalog", name: "Runtime", version: "1", health: "healthy" as const, capabilities: new Map() }],
@@ -1109,7 +1104,7 @@ describe("ProviderSettings model visibility", () => {
 
   it("keeps the recovery action for a disabled model that is no longer in the catalog", async () => {
     const base = emptySnapshot();
-    const configuration = provider("provider", "Provider", { keyless: false });
+    const configuration = provider("provider", "Provider", { runtimes: [runtimeConfiguration({ keyless: false })] });
     const snapshot = {
       ...base,
       backends: [{ id: "backend-provider-catalog", name: "Runtime", version: "1", health: "healthy" as const, capabilities: new Map() }],
@@ -1161,8 +1156,9 @@ describe("ProviderSettings model visibility", () => {
 
   it("moves a logical model to disabled when any runtime route is disabled", async () => {
     const base = emptySnapshot();
-    const first = provider("shared-provider", "Shared Provider", { keyless: false });
-    const second = provider("shared-provider", "Shared Provider", { keyless: false });
+    const configuration = provider("shared-provider", "Shared Provider", {
+      runtimes: ["backend-a", "backend-b"].map((backendId) => runtimeConfiguration({ backendId, keyless: false }))
+    });
     const snapshot = {
       ...base,
       backends: [
@@ -1170,14 +1166,14 @@ describe("ProviderSettings model visibility", () => {
         { id: "backend-b", name: "Runtime B", version: "1", health: "healthy" as const, capabilities: new Map() }
       ],
       providers: [
-        providerRuntime(first, { backendId: "backend-a", ownerManaged: true, authenticationState: "authenticated" }),
-        providerRuntime(second, { backendId: "backend-b", ownerManaged: true, authenticationState: "authenticated" })
+        providerRuntime(configuration, { backendId: "backend-a", ownerManaged: true, authenticationState: "authenticated" }),
+        providerRuntime(configuration, { backendId: "backend-b", ownerManaged: true, authenticationState: "authenticated" })
       ],
       models: [
         { ...catalogModel("shared-provider", "shared-model", "Shared model"), backendId: "backend-a", routingEnabled: true },
         { ...catalogModel("shared-provider", "shared-model", "Shared model"), backendId: "backend-b", routingEnabled: false }
       ],
-      settings: { ...base.settings, providers: [first] }
+      settings: { ...base.settings, providers: [configuration] }
     };
     const updateBackendSettings = vi.fn(async () => undefined);
     const controller = {
@@ -1209,7 +1205,7 @@ describe("ProviderSettings model visibility", () => {
 
   it("separates capability-only and disabled models from picker visibility", async () => {
     const base = emptySnapshot();
-    const configuration = provider("provider", "Provider", { keyless: false });
+    const configuration = provider("provider", "Provider", { runtimes: [runtimeConfiguration({ keyless: false })] });
     const snapshot = {
       ...base,
       backends: [{ id: "backend-provider-catalog", name: "Runtime", version: "1", health: "healthy" as const, capabilities: new Map() }],
@@ -1266,7 +1262,7 @@ describe("ProviderSettings model visibility", () => {
         id: configured.id,
         name: configured.name,
         kind: "subscription" as const,
-        compatibility: configured.compatibility,
+        compatibility: "openaiChat" as const,
         authenticationState: "authenticated" as const,
         endpoint: "",
         ownerManaged: true,
@@ -1418,17 +1414,26 @@ function provider(id: string, name: string, overrides: Partial<ProviderConfigura
     id,
     name,
     kind: "customEndpoint" as const,
-    compatibility: "openaiChat" as const,
-    endpoint: `https://${id}.invalid/v1`,
-    credentialId: "",
     enabled: true,
-    keyless: true,
-    authHeader: true,
-    environmentName: "",
-    modelCount: 0,
-    headers: [],
-    models: [],
+    revision: 1n,
+    runtimes: [runtimeConfiguration()],
     ...overrides
+  };
+}
+
+function runtimeConfiguration(overrides: Partial<ProviderRuntimeConfigurationView> = {}): ProviderRuntimeConfigurationView {
+  return {
+    backendId: "backend-provider-catalog", compatibility: "openaiChat", endpoint: "https://provider.invalid/v1",
+    credentialId: "", keyless: true, authHeader: false, environmentName: "", credentialOrigin: "", headers: [], models: [],
+    ...overrides
+  };
+}
+
+function managedBackend(): BackendView {
+  return {
+    id: "catalog", name: "Managed runtime", version: "1", health: "healthy",
+    capabilities: new Map([["provider.managed_catalog", { name: "provider.managed_catalog", supported: true, options: [] }]]),
+    providerRuntimeSupport: { protocols: ["openaiChat"], fields: ["headers", "authHeader", "keyless", "modelLimits", "modelCosts", "modelInputModalities", "modelThinkingLevels"] }
   };
 }
 
@@ -1441,9 +1446,9 @@ function providerRuntime(
     id: configuration.id,
     name: configuration.name,
     kind: configuration.kind,
-    compatibility: configuration.compatibility,
+    compatibility: "openaiChat",
     authenticationState: "unknown",
-    endpoint: configuration.endpoint,
+    endpoint: "https://provider.invalid/v1",
     ownerManaged: true,
     supportsLogin: false,
     supportsLogout: false,

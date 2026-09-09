@@ -63,16 +63,18 @@ export function PortableSessionDialogHost({
     : targets[0]?.id;
   return <>
     <PortableSessionExportDialog
+      key={JSON.stringify(["export", exportSession?.id])}
+      connectionOwner={controller.exportPortableSession}
       open={exportSession !== undefined}
       labels={labels}
       onClose={onCloseExport}
-      onExport={(options) => exportSession === undefined
+      onExport={(options, context) => exportSession === undefined
         ? Promise.resolve({ status: "cancelled" })
-        : controller.exportPortableSession(exportSession.id, options)}
+        : controller.exportPortableSession(exportSession.id, options, context)}
       onExported={onExported}
     />
     <PortableSessionImportDialog
-      key={importRequest?.id ?? "closed"}
+      key={JSON.stringify(["import", importRequest?.id])}
       open={importRequest !== undefined}
       initialFile={importRequest?.file}
       labels={labels}
