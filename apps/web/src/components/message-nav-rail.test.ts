@@ -20,10 +20,10 @@ describe("message navigation rail model", () => {
   it("derives real user turns, attachment fallbacks, and the first assistant excerpt", () => {
     const attachment = { id: "a", blobId: "b", title: "capture", kind: "image" as const, fileName: "capture.png", mediaType: "image/png", byteSize: 4 };
     expect(deriveMessageNavEntries([
-      item("u1", "user", "> quoted\n\nFix the parser"),
+      { ...item("u1", "user", "> quoted\n\nFix the parser"), inputDelivery: "prompt" },
       item("a2", "assistant", "## Done\n**Parser** is fixed."),
       item("a3", "assistant", "ignored"),
-      item("u4", "user", "", [attachment])
+      { ...item("u4", "user", "", [attachment]), inputDelivery: "prompt" }
     ])).toEqual([
       { id: "u1", preview: "Fix the parser", answerExcerpt: "Done Parser is fixed." },
       { id: "u4", preview: "capture.png" }
@@ -41,20 +41,21 @@ describe("message navigation rail model", () => {
       inputDelivery: "scheduler" as const,
       automationOrigin: { kind: "scheduler", scheduleId: "schedule-1" } as const
     };
-    expect(deriveMessageNavEntries([automated, item("u2", "user", "manual check")])).toEqual([
+    expect(deriveMessageNavEntries([automated, { ...item("u2", "user", "manual check"), inputDelivery: "prompt" }])).toEqual([
       { id: "u1", preview: "nightly check", isAutomation: true },
       { id: "u2", preview: "manual check" }
     ]);
   });
 
-  it("keeps prompt, scheduler, and untyped imported turns while excluding typed steer and follow-up input", () => {
+  it("keeps only explicit prompt and scheduler boundaries", () => {
     expect(deriveMessageNavEntries([
       { ...item("u1", "user", "initial"), inputDelivery: "prompt" },
       { ...item("u2", "user", "redirect"), inputDelivery: "steer" },
       { ...item("u3", "user", "continue"), inputDelivery: "followUp" },
       { ...item("u4", "user", "scheduled"), inputDelivery: "scheduler" },
-      item("u5", "user", "untyped import")
-    ]).map((entry) => entry.id)).toEqual(["u1", "u4", "u5"]);
+      item("u5", "user", "untyped import"),
+      { ...item("u6", "user", "future delivery"), inputDelivery: "future" as never }
+    ]).map((entry) => entry.id)).toEqual(["u1", "u4"]);
   });
 
   it("compresses then truncates ticks and chooses the last turn above the reading line", () => {

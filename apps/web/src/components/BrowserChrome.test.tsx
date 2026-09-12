@@ -99,7 +99,7 @@ describe("BrowserChrome", () => {
     expect(onNavigate).toHaveBeenCalledWith("https://www.openai.com");
   });
 
-  it("supports reference menu keyboard navigation and restores trigger focus on Escape", async () => {
+  it("supports tools-menu keyboard navigation and restores trigger focus on Escape", async () => {
     const { container, onOverlayOpenChange } = await renderChrome();
     const trigger = required(container.querySelector<HTMLButtonElement>('[aria-label="browser.moreTools"]'));
     expect(trigger.hasAttribute("title")).toBe(false);

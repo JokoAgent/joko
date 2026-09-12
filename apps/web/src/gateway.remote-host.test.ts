@@ -7,7 +7,6 @@ import {
   EntityKind,
   InteractionKind,
   InteractionState,
-  QuestionAnswerHandling,
   GetRemoteHostCapabilitiesResponseSchema,
   GetSnapshotResponseSchema,
   ListRemoteHostsResponseSchema,
@@ -245,10 +244,9 @@ describe("Remote Host gateway", () => {
     gateway.disconnect();
   });
 
-  it.each(["provider", "voice", "interaction"] as const)("fences the %s continuation after its credential upload has returned", async (consumer) => {
+  it.each(["provider", "voice"] as const)("fences the %s continuation after its credential upload has returned", async (consumer) => {
     const submissions: unknown[] = [];
     let tickets = 0;
-    let snapshot: AppSnapshot | undefined;
     const transport = remoteTransport((method, input) => {
       if (method === "beginCredentialUpload") {
         tickets += 1;
@@ -259,15 +257,10 @@ describe("Remote Host gateway", () => {
       if (method !== "submitOperation") throw new Error(`Unexpected method: ${method}`);
       submissions.push(input);
       return create(SubmitOperationResponseSchema, { operation: { operationId: input.operationId, state: OperationState.SUCCEEDED } });
-    }, { interactions: [{
-      interactionId: "question", sessionId: "task", kind: InteractionKind.QUESTION, state: InteractionState.PENDING,
-      request: { case: "question", value: { title: "Test credential", fields: [{
-        fieldId: "key", required: true, input: { case: "text", value: { answerHandling: QuestionAnswerHandling.CREDENTIAL_CHANNEL } }
-      }] } }
-    }] });
+    });
     const gateway = createOrchestratorGateway(
       { id: "credential-consumer", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" },
-      "auth-key", { onSnapshot: (value) => { snapshot = value; } }, () => transport
+      "auth-key", {}, () => transport
     );
     await gateway.connect();
     vi.stubGlobal("fetch", vi.fn(async () => {
@@ -277,9 +270,7 @@ describe("Remote Host gateway", () => {
     }));
     const action = consumer === "provider"
       ? gateway.saveProviderCredentialSurface("backend", "provider", "apiKey", "test-only-secret")
-      : consumer === "interaction"
-        ? gateway.resolveInteraction(snapshot!.interactions[0]!, { kind: "question", answers: { key: "test-only-secret" } })
-        : gateway.updateVoiceInputServiceSettings({
+      : gateway.updateVoiceInputServiceSettings({
           enabled: true, protocol: "openAiCompatibleBatch", endpoint: "https://voice.example/transcribe", model: "model", resourceId: "", keyless: false,
           secret: "test-only-secret", fallbackSecret: "test-only-fallback", fallbackEnabled: true,
           fallbackProtocol: "openAiCompatibleBatch", fallbackEndpoint: "https://voice.example/fallback", fallbackModel: "fallback", fallbackResourceId: "", fallbackKeyless: false,
@@ -288,6 +279,46 @@ describe("Remote Host gateway", () => {
     await expect(action).rejects.toMatchObject({ name: "AbortError" });
     expect(tickets).toBe(1);
     expect(submissions).toEqual([]);
+    gateway.disconnect();
+  });
+
+  it("submits an ordinary text question without opening or uploading through a credential channel", async () => {
+    const methods: string[] = [];
+    const submissions: any[] = [];
+    let snapshot: AppSnapshot | undefined;
+    const transport = remoteTransport((method, input) => {
+      methods.push(method);
+      if (method !== "submitOperation") throw new Error(`Unexpected method: ${method}`);
+      submissions.push(input);
+      return create(SubmitOperationResponseSchema, {
+        operation: { operationId: input.operationId, state: OperationState.SUCCEEDED }
+      });
+    }, { interactions: [{
+      interactionId: "question", sessionId: "task", kind: InteractionKind.QUESTION, state: InteractionState.PENDING,
+      generation: 4n,
+      request: { case: "question", value: { title: "Release notes", fields: [{
+        fieldId: "notes", label: "Notes", required: true, input: { case: "text", value: { multiline: true } }
+      }] } }
+    }] });
+    const fetch = vi.fn();
+    vi.stubGlobal("fetch", fetch);
+    const gateway = createOrchestratorGateway(
+      { id: "question-answer", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" },
+      "auth-key", { onSnapshot: (value) => { snapshot = value; } }, () => transport
+    );
+    await gateway.connect();
+    await gateway.resolveInteraction(snapshot!.interactions[0]!, {
+      kind: "question",
+      answers: { notes: { kind: "text", value: "Ready" } }
+    });
+
+    expect(fetch).not.toHaveBeenCalled();
+    expect(methods).not.toContain("beginCredentialUpload");
+    expect(methods.filter((method) => method === "submitOperation")).toHaveLength(1);
+    expect(submissions[0]?.mutation?.payload?.value?.resolution?.decision).toMatchObject({
+      case: "question",
+      value: { answers: [{ fieldId: "notes", value: { case: "text", value: "Ready" } }] }
+    });
     gateway.disconnect();
   });
 

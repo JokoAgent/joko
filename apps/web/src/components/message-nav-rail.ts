@@ -34,9 +34,9 @@ export function deriveMessageNavEntries(items: readonly TimelineItemView[]): rea
   const entries: Array<{ id: string; preview: string; isAutomation?: boolean; attachmentsOnly?: number; answerExcerpt?: string }> = [];
   for (const item of items) {
     if (item.kind === "user") {
-      // An accepted steer/follow-up belongs to the running turn. Untyped
-      // imported rows remain navigable because their delivery cannot be proven.
-      if (item.inputDelivery === "steer" || item.inputDelivery === "followUp") continue;
+      // Only service-authored prompt boundaries are navigable. Missing or
+      // unknown delivery semantics cannot prove a standalone user turn.
+      if (item.inputDelivery !== "prompt" && item.inputDelivery !== "scheduler") continue;
       const preview = promptPreviewLine(visibleSelectionQuoteMessageText(item.text ?? "", item.quotesEncoded === true));
       const attachmentNames = (item.attachments ?? []).map((attachment) => attachment.fileName.trim()).filter(Boolean);
       const isAutomation = item.automationOrigin !== undefined;

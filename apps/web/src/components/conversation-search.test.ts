@@ -55,6 +55,16 @@ describe("conversation search projection", () => {
     )).toEqual([]);
   });
 
+  it("filters and labels navigation projects independently of the execution target", () => {
+    const moved = session("moved", "Needle moved", "alpha", 40, { projectId: "beta" });
+    const dialogue = session("dialogue", "Needle dialogue", "beta", 30, { projectId: undefined });
+    const results = projectConversationSearchResults([moved, dialogue], targets, [
+      hit("dialogue", "dialogue-hit", "needle", 9, 30)
+    ], "needle", { kind: "owner" }, "relevance", 24, { projectIds: ["beta"] });
+    expect(results.map((result) => [result.session.id, result.target?.name])).toEqual([["moved", "Beta"]]);
+    expect(projectConversationSearchResults([dialogue], targets, [], "needle", { kind: "owner" }, "relevance")[0]?.target).toBeUndefined();
+  });
+
   it("opens the best message from a parent result row and the task only for title-only results", () => {
     const withHit = projectConversationSearchResults(
       sessions,
@@ -196,14 +206,14 @@ describe("conversation search projection", () => {
     ).map((result) => result.session.id)).toEqual(["boundary", "recent"]);
   });
 
-  it("supports multi-target selection and intersects it with the existing scope", () => {
+  it("supports multiple navigation projects and intersects them with the execution scope", () => {
     const candidates = [
       session("alpha-task", "Needle", "alpha", 100),
       session("beta-task", "Needle", "beta", 200),
       session("gamma-task", "Needle", "gamma", 300)
     ];
     const allTargets = [...targets, target("gamma", "Gamma")];
-    const filters = { targetIds: ["alpha", "beta"] } as const;
+    const filters = { projectIds: ["alpha", "beta"] } as const;
 
     expect(projectConversationSearchResults(
       candidates,
@@ -263,7 +273,7 @@ describe("conversation search projection", () => {
         status: "archived",
         backendId: "backend-b",
         lastActivity: "3d",
-        targetIds: ["beta"]
+        projectIds: ["beta"]
       },
       nowMs
     ).map((result) => result.session.id)).toEqual(["match"]);
@@ -289,7 +299,7 @@ describe("conversation search projection", () => {
       { kind: "owner" },
       "activityDesc",
       24,
-      { targetIds: ["beta"] },
+      { projectIds: ["beta"] },
       2_000
     ).map((result) => result.session.id)).toEqual(["included-one", "included-two"]);
   });
@@ -315,7 +325,7 @@ describe("conversation search projection", () => {
       { kind: "owner" },
       "activityDesc",
       24,
-      { status: "all", backendId: "all", lastActivity: "all", targetIds: "all" },
+      { status: "all", backendId: "all", lastActivity: "all", projectIds: "all" },
       1_000
     );
 
@@ -373,6 +383,7 @@ function session(
     id,
     backendId: "backend",
     targetId,
+    projectId: targetId,
     name,
     state: "idle",
     permissionMode: "ask",

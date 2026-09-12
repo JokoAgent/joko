@@ -1,4 +1,5 @@
-import { constants } from "node:fs";
+import { createHash } from "node:crypto";
+import { constants, createReadStream } from "node:fs";
 import { copyFile, lstat, mkdir, readFile, readdir, realpath, stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { RuntimeResource } from "@joko/core";
@@ -59,6 +60,103 @@ export interface ManagedRuntimeResourceSnapshot {
   readonly resources: readonly RuntimeResource[];
   readonly fileCount: number;
   readonly byteLength: number;
+}
+
+/** Recompute the host-approved revision from a private runtime copy. */
+export async function assertRuntimeResourceRevision(
+  path: string,
+  expectedRevision: string,
+  maxFiles = 10_000,
+  maxBytes = 256 * 1024 * 1024
+): Promise<void> {
+  const canonical = await canonicalApprovedResource(path, "loaded runtime resource");
+  if (!Number.isSafeInteger(maxFiles) || maxFiles < 1 || !Number.isSafeInteger(maxBytes) || maxBytes < 1) {
+    throw piError("PI_RESOURCE_INVALID_LIMIT", "Runtime resource verification limits must be positive safe integers", "resource");
+  }
+  const hash = createHash("sha256");
+  const budget: CopyBudget = { files: 0, bytes: 0, maxFiles, maxBytes };
+  const info = await lstat(canonical);
+  if (info.isFile()) await hashRuntimeResourceFile(canonical, canonical, "", hash, budget);
+  else await hashRuntimeResourceDirectory(canonical, canonical, "", hash, budget);
+  const actual = `sha256:${hash.digest("hex")}`;
+  if (actual !== expectedRevision) {
+    throw piError(
+      "PI_RESOURCE_REVISION_STALE",
+      "The loaded runtime resource no longer matches its approved content revision",
+      "dispatch",
+      { recovery: "Restart the task after re-approving the current resource content." }
+    );
+  }
+}
+
+async function hashRuntimeResourceDirectory(
+  root: string,
+  directory: string,
+  relativePath: string,
+  hash: ReturnType<typeof createHash>,
+  budget: CopyBudget
+): Promise<void> {
+  const before = await lstat(directory);
+  if (!before.isDirectory() || before.isSymbolicLink()) {
+    throw piError("PI_RESOURCE_RUNTIME_UNSAFE", "Loaded runtime resource contains an unsafe directory", "dispatch");
+  }
+  const canonical = await realpath(directory);
+  assertContained(root, canonical, "loaded runtime resource");
+  hash.update(`D\0${relativePath}\0`);
+  const entries = await readdir(canonical, { withFileTypes: true });
+  entries.sort((left, right) => left.name.localeCompare(right.name, "en"));
+  for (const entry of entries) {
+    if (entry.name === "." || entry.name === ".." || entry.name.includes("\0")) {
+      throw piError("PI_RESOURCE_INVALID_NAME", "Loaded runtime resource contains an invalid path component", "dispatch");
+    }
+    const child = join(canonical, entry.name);
+    const childRelative = relativePath === "" ? entry.name : `${relativePath}/${entry.name}`;
+    const info = await lstat(child);
+    if (entry.isSymbolicLink() || info.isSymbolicLink()) {
+      throw piError("PI_RESOURCE_RUNTIME_UNSAFE", "Loaded runtime resource contains a symlink or junction", "dispatch");
+    }
+    if (entry.isDirectory() && info.isDirectory()) {
+      await hashRuntimeResourceDirectory(root, child, childRelative, hash, budget);
+    } else if (entry.isFile() && info.isFile()) {
+      await hashRuntimeResourceFile(root, child, childRelative, hash, budget);
+    } else {
+      throw piError("PI_RESOURCE_RUNTIME_UNSAFE", "Loaded runtime resource contains a special file", "dispatch");
+    }
+  }
+  const after = await lstat(canonical);
+  if (!after.isDirectory() || after.isSymbolicLink() || !sameIdentity(before, after) || before.mtimeMs !== after.mtimeMs) {
+    throw piError("PI_RESOURCE_RUNTIME_CHANGED", "Loaded runtime resource changed during verification", "dispatch", {
+      retryable: true,
+      recovery: "Retry after the task runtime resource snapshot is stable."
+    });
+  }
+}
+
+async function hashRuntimeResourceFile(
+  root: string,
+  path: string,
+  relativePath: string,
+  hash: ReturnType<typeof createHash>,
+  budget: CopyBudget
+): Promise<void> {
+  const before = await lstat(path);
+  if (!before.isFile() || before.isSymbolicLink()) {
+    throw piError("PI_RESOURCE_RUNTIME_UNSAFE", "Loaded runtime resource contains an unsafe file", "dispatch");
+  }
+  const canonical = await realpath(path);
+  assertContained(root, canonical, "loaded runtime resource");
+  budget.files += 1;
+  budget.bytes += before.size;
+  assertBudget(budget);
+  hash.update(`F\0${relativePath}\0${before.size}\0`);
+  for await (const chunk of createReadStream(canonical)) hash.update(chunk as Buffer);
+  const after = await stat(canonical);
+  if (!after.isFile() || !sameIdentity(before, after) || before.size !== after.size || before.mtimeMs !== after.mtimeMs) {
+    throw piError("PI_RESOURCE_RUNTIME_CHANGED", "Loaded runtime resource changed during verification", "dispatch", {
+      retryable: true,
+      recovery: "Retry after the task runtime resource snapshot is stable."
+    });
+  }
 }
 
 interface CopyBudget {

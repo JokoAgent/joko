@@ -43,7 +43,7 @@ export interface FixtureOptions {
   readonly backendFactories?: readonly BackendInstanceFactory[];
   readonly keepRoot?: boolean;
   readonly terminals?: OrchestratorApplication["terminals"];
-  readonly createAuxiliaryServices?: (store: OperationalStore, dataDirectory: string, artifacts: ArtifactStore) => Promise<Pick<OrchestratorApplication, "auxiliaryText" | "subagentModels" | "sessionNavigation" | "providers" | "mcpRouter" | "sshKeys" | "credentials" | "remoteHosts" | "browser" | "browserState">>;
+  readonly createAuxiliaryServices?: (store: OperationalStore, dataDirectory: string, artifacts: ArtifactStore) => Promise<Pick<OrchestratorApplication, "auxiliaryText" | "subagentModels" | "sessionNavigation" | "providers" | "mcpRouter" | "sshKeys" | "credentials" | "remoteHosts" | "browser" | "browserSettings" | "browserState">>;
 }
 
 export class InstrumentedFakeAdapter extends FakeBackendAdapter {

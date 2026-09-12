@@ -10,6 +10,7 @@ export * from "./portable-session-projection.js";
 export * from "./portable-session-transfer.js";
 export * from "./artifact-repository.js";
 export * from "./artifact-store.js";
+export * from "./artifact-mention-resolver.js";
 export * from "./blob-transfers.js";
 export * from "./browser-transfers.js";
 export * from "./browser-settings.js";

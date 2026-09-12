@@ -21,7 +21,7 @@ function item(markerNumber: number, kind: "element" | "region" = "element"): Bro
     target: kind === "element"
       ? { kind, point: { x: 320, y: 180 }, viewport }
       : { kind, point: { x: 640, y: 360 }, viewport, region: { x: 240, y: 120, width: 400, height: 240 } },
-    comment: "Align this card with the grid.",
+    comment: "Place this card on the grid.",
     screenshot: { id: `screen-${markerNumber}`, kind: "image", file: new File(["png"], `browser-comment-${markerNumber}.png`, { type: "image/png" }) }
   };
 }
@@ -33,7 +33,8 @@ describe("structured Browser page comments", () => {
   });
 
   it("serializes untrusted page evidence after the user's body", () => {
-    const text = formatBrowserCommentsForSend([item(2, "region")], "Please update this layout.");
+    const { text, bodyStart } = formatBrowserCommentsForSend([item(2, "region")], "Please update this layout.");
+    expect(bodyStart).toBe(0);
     expect(text.startsWith("Please update this layout.\n\n" + BROWSER_COMMENTS_SECTION_HEADER)).toBe(true);
     expect(text).toContain("## Comment 2");
     expect(text).toContain("Selected region: 400x240 at (240, 120) in 1280x720 viewport");

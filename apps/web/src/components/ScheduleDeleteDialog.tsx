@@ -3,6 +3,8 @@ import { Archive, LoaderCircle, MessageSquare, Trash2 } from "lucide-react";
 
 import type { ScheduleView } from "../model.js";
 import type { GeneratedSessionDisposition } from "../schedule-deletion.js";
+import type { WorktreeRemovalPreflightSummary } from "../worktree-removal-preflight.js";
+import { WorktreeRemovalWarnings } from "./SessionDialogs.js";
 import type { Translator } from "./types.js";
 import { Button, Modal, cx } from "./ui.js";
 
@@ -12,11 +14,12 @@ const DISPOSITION_OPTIONS = [
   { value: "delete", Icon: Trash2, title: "scheduler.deleteOptionDelete", description: "scheduler.deleteOptionDeleteBody" }
 ] as const;
 
-export function ScheduleDeleteDialog({ schedule, disposition, generatedCount, inflightCount, previewError, operationError, pending, t, onDispositionChange, onRetryPreview, onClose, onConfirm }: {
+export function ScheduleDeleteDialog({ schedule, disposition, generatedCount, inflightCount, worktreeRemoval, previewError, operationError, pending, t, onDispositionChange, onRetryPreview, onClose, onConfirm }: {
   readonly schedule?: ScheduleView;
   readonly disposition: GeneratedSessionDisposition;
   readonly generatedCount?: number;
   readonly inflightCount?: number;
+  readonly worktreeRemoval?: WorktreeRemovalPreflightSummary;
   readonly previewError?: string;
   readonly operationError?: string;
   readonly pending: boolean;
@@ -59,6 +62,11 @@ export function ScheduleDeleteDialog({ schedule, disposition, generatedCount, in
           </button>;
         })}
       </div>
+      {disposition !== "keep" && <WorktreeRemovalWarnings
+        disposition={disposition === "archive" ? "archive" : "delete"}
+        preflight={worktreeRemoval}
+        t={t}
+      />}
       {operationError !== undefined && <p className="danger-text" role="alert">{operationError}</p>}
       <div className="modal__actions">
         <Button disabled={pending} onClick={onClose}>{t("common.cancel")}</Button>

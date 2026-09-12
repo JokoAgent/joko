@@ -361,9 +361,14 @@ export function promoteTrailingPlainListParagraph(view: EditorView): boolean {
   const itemType = view.state.schema.nodes["listItem"];
   const listType = view.state.schema.nodes[trailing.marker.kind === "ordered" ? "orderedList" : "bulletList"];
   if (paragraphType === undefined || itemType === undefined || listType === undefined) return false;
-  const body = trailing.paragraph.content.cut(trailing.marker.prefixLength);
-  const list = listType.create(trailing.marker.attrs, itemType.create(null, paragraphType.create(trailing.paragraph.attrs, body)));
-  const transaction = view.state.tr.replaceWith(trailing.position, trailing.position + trailing.paragraph.nodeSize, list);
+  // Delete only the typed marker and wrap the existing paragraph. Keeping the
+  // paragraph in the replace-around gap preserves positions owned by its text.
+  const transaction = view.state.tr.delete(trailing.position + 1, trailing.position + 1 + trailing.marker.prefixLength);
+  const paragraphStart = transaction.doc.resolve(trailing.position + 1);
+  const paragraphEnd = transaction.doc.resolve(trailing.position + trailing.paragraph.nodeSize - trailing.marker.prefixLength - 1);
+  const range = paragraphStart.blockRange(paragraphEnd);
+  if (range === null) return false;
+  transaction.wrap(range, [{ type: listType, attrs: trailing.marker.attrs }, { type: itemType }]);
   transaction.setSelection(TextSelection.atEnd(transaction.doc));
   view.dispatch(transaction.scrollIntoView());
   return true;

@@ -17,7 +17,7 @@ import {
 import type { AppController, AppRoute } from "../controller.js";
 import { modelPreferenceOwnerId } from "../model-picker-preferences.js";
 import { isRoutableConversationModel } from "../model-capabilities.js";
-import type { AttachmentDraft, NativeNavigationTargetView, BackendView, ComposerSelectionQuoteDraft, ErrorView, ExtensionStatusView, ExtensionWidgetView, ExtraDirectoryView, InteractionView, ModelView, PermissionMode, QueueControlView, QueueItemView, ResourceView, RuntimeCommandView, SessionView, SubagentRunDetailView, SubagentRunView, TargetView, TimelineItemView, UsageTokensView, WorkspaceRewindPreviewView, WorkspaceView } from "../model.js";
+import type { ArtifactView, AttachmentDraft, NativeNavigationTargetView, BackendView, ComposerSelectionQuoteDraft, ErrorView, ExtensionStatusView, ExtensionWidgetView, ExtraDirectoryView, InteractionView, ModelView, PermissionMode, QueueControlView, QueueItemView, ResourceView, RuntimeCommandView, SessionResourceView, SessionView, SubagentRunDetailView, SubagentRunView, TargetView, TimelineItemView, UsageTokensView, WorkspaceRewindPreviewView, WorkspaceView } from "../model.js";
 import { composerDocumentFromEditedEncodedMessage, composerDocumentFromMessage, composerDocumentPlainText, plainTextToComposerDocument } from "../composer-quote-document.js";
 import type { RunAction, Translator } from "./types.js";
 import { Button, IconButton, Modal, Pill, StatusDot, cx, CheckboxControl } from "./ui.js";
@@ -53,6 +53,8 @@ import { ShareSelectionBar } from "./ShareSelectionBar.js";
 import { Timeline, type InlinePlanVisibility } from "./Timeline.js";
 import { NativeFileCopyContext } from "./NativeFileCopyMenu.js";
 import { useAppShortcut } from "../use-app-shortcut.js";
+import { useGamepadActions } from "../gamepad-actions.js";
+import { modelSourceAccess } from "../model-source-access.js";
 import { randomUuid } from "../web-crypto.js";
 import { portableSessionExportSupported } from "../portable-session-ui.js";
 import type { SessionProjectNavigationPlacement } from "../session-project-navigation.js";
@@ -115,7 +117,7 @@ interface ActiveMessageFork {
 
 export type SessionPanePresentation = "standard" | "filesRail";
 
-export function SessionPane({ controller, session, target, backend, reviewReadOnly = false, presentation = "standard", composerAutoFocus = true, models, timeline, timelineHasEarlier, timelineHistoryLoading, timelineHistoryError, onLoadEarlierTimeline, timelineFocusRequest, extensionWidgets, extensionStatuses, queue, queueControl, workspace, extraDirectories, resources, commandRefreshSignal, interaction, remainingInteractions, navigationOpen, inspectorOpen, inspectorAvailable = true, selectionQuoteInsertion, attachmentInsertion, t, runAction, onOpenNavigation, onOpenInspector, onOpenSubagent, onOpenTurnReview, onRename, onPin, onArchive, onDelete, onMoveSessionProject, movingSessionProject = false, onCopyTaskLink, onExportPortableSession, onSplitSession, onOpenSessionWindow }: {
+export function SessionPane({ controller, session, target, backend, reviewReadOnly = false, presentation = "standard", composerAutoFocus = true, models, timeline, timelineHasEarlier, timelineHistoryLoading, timelineHistoryError, onLoadEarlierTimeline, timelineFocusRequest, extensionWidgets, extensionStatuses, queue, queueControl, workspace, extraDirectories, resources, commandRefreshSignal, interaction, remainingInteractions, navigationOpen, inspectorOpen, inspectorAvailable = true, selectionQuoteInsertion, attachmentInsertion, t, runAction, onOpenNavigation, onOpenInspector, onOpenSubagent, onOpenTurnReview, onRename, onPin, onArchive, onPrefetchRemoval, onDelete, onMoveSessionProject, movingSessionProject = false, onCopyTaskLink, onExportPortableSession, onSplitSession, onOpenSessionWindow }: {
   readonly controller: AppController;
   readonly session: SessionView;
   readonly target?: TargetView;
@@ -153,7 +155,8 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   readonly onOpenTurnReview?: (changeSetId: string, selectedPath?: string) => void;
   readonly onRename: () => void;
   readonly onPin?: () => void;
-  readonly onArchive?: () => void;
+  readonly onArchive: () => void;
+  readonly onPrefetchRemoval?: () => void;
   readonly onDelete: () => void;
   readonly onMoveSessionProject?: (placement: SessionProjectNavigationPlacement) => void;
   readonly movingSessionProject?: boolean;
@@ -175,6 +178,14 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   const [followLatestSignal, setFollowLatestSignal] = useState(0);
   const [composerFocusRequest, setComposerFocusRequest] = useState(0);
   const [liveCommands, setLiveCommands] = useState<readonly RuntimeCommandView[]>([]);
+  const [liveResourceCatalog, setLiveResourceCatalog] = useState<{
+    readonly owner: object;
+    readonly resources: readonly SessionResourceView[];
+  }>();
+  const [liveArtifactCatalog, setLiveArtifactCatalog] = useState<{
+    readonly owner: object;
+    readonly artifacts: readonly ArtifactView[];
+  }>();
   const [errorTailRevision, setErrorTailRevision] = useState(0);
   const [bottomInset, setBottomInset] = useState(0);
   const [composerMessageMentionInsertion, setComposerMessageMentionInsertion] = useState<{ readonly id: number; readonly sessionId: string; readonly mention: NonNullable<ReturnType<typeof createMessageComposerMention>> }>();
@@ -218,6 +229,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   activeSessionIdRef.current = session.id;
   const timelineSubagentEpochRef = useRef(0);
   const stoppingRunIdsRef = useRef(new Set<string>());
+  const gamepadSettingFlightsRef = useRef(new Set<string>());
   const recoveryFlightsRef = useRef(new RecoveryActionSingleFlight());
   const recoveryWaitAbortsRef = useRef(new Map<string, AbortController>());
   const compactGuardRef = useRef(new SessionScopedRequestGuard());
@@ -291,14 +303,18 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   const canAcknowledgeSessionAttention = backend?.capabilities.get("session.attention")?.supported === true;
   const displayBranch = codeHostDisplayBranch(workspace, session.codeHostPullRequests);
   const canExport = !reviewReadOnly && backend?.capabilities.get("session.export")?.supported === true;
-  const canClone = !reviewReadOnly && backend?.capabilities.get("session.clone")?.supported === true;
+  const canDeriveWorkspace = session.worktree === undefined
+    || backend?.capabilities.get("workspace.derive")?.supported === true;
+  const canClone = !reviewReadOnly && canDeriveWorkspace
+    && backend?.capabilities.get("session.clone")?.supported === true;
   const canExportPortable = onExportPortableSession !== undefined
     && portableSessionExportSupported(session, controller.state.snapshot);
   const sessionProjectTargets = controller.state.snapshot.targets.filter(
     (candidate) => !candidate.archived && candidate.remoteWorkspace === undefined
   );
   const canAddMessageReference = !reviewReadOnly && backend?.capabilities.get("input.text")?.supported === true;
-  const canForkMessage = !reviewReadOnly && backend?.capabilities.get("session.fork")?.supported === true;
+  const canForkMessage = !reviewReadOnly && canDeriveWorkspace
+    && backend?.capabilities.get("session.fork")?.supported === true;
   const visionBridgeRouted = controller.state.snapshot.settings.visionBridge.enabled && session.model !== undefined
     && controller.state.snapshot.settings.visionBridge.targetModels.some((candidate) => candidate.backendId === session.backendId && candidate.providerId === session.model?.providerId && candidate.modelId === session.model.modelId);
   const canAddWorkspaceImage = !reviewReadOnly && resolveComposerAttachmentPolicy(backend, session.model?.supportsImages === true || visionBridgeRouted).images;
@@ -359,6 +375,15 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   const allowedPermissions = advertisedPermissionModes(backend);
   const canSetPermission = !reviewReadOnly && permissionChangeSupported(backend);
   const canListRuntimeCommands = !reviewReadOnly && backend?.capabilities.get("runtime.commands")?.supported === true;
+  const canListSessionResources = !reviewReadOnly
+    && controller.state.connectionState === "connected"
+    && backend?.capabilities.get("runtime.resources")?.supported === true
+    && backend.capabilities.get("input.mention")?.supported === true
+    && backend.capabilities.get("input.mention")?.options.includes("resource") === true;
+  const canListSessionArtifacts = !reviewReadOnly
+    && controller.state.connectionState === "connected"
+    && backend?.capabilities.get("input.mention")?.supported === true
+    && backend.capabilities.get("input.mention")?.options.includes("artifact") === true;
   const canSetPlanMode = !reviewReadOnly && planModeSupported(backend);
   const canContactOwner = controller.state.activeProfile !== undefined && controller.state.snapshot.revision > 0n;
   const canListSubagents = backend?.capabilities.get("subagents.list")?.supported === true
@@ -564,6 +589,48 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
     () => commandRefreshSignal.filter((command) => command.sessionId === session.id),
     [commandRefreshSignal, session.id]
   );
+  const resourceRefreshKey = useMemo(() => resources
+    .filter((resource) => resource.backendId === session.backendId
+      && (resource.targetId === undefined || resource.targetId === session.targetId))
+    .map((resource) => [resource.id, resource.discoveredRevision, resource.state, resource.enabled ? "1" : "0"].join("\u0000"))
+    .sort()
+    .join("\u0001"), [resources, session.backendId, session.targetId]);
+  const resourceCatalogOwner = useMemo(() => ({}), [
+    canListSessionResources,
+    controller.state.activeProfile?.id,
+    controller.state.activeProfile?.serverId,
+    controller.state.connectionState,
+    resourceRefreshKey,
+    session.backendId,
+    session.generation,
+    session.id,
+    session.targetId
+  ]);
+  const liveResources = liveResourceCatalog?.owner === resourceCatalogOwner
+    ? liveResourceCatalog.resources
+    : [];
+  const artifactRefreshKey = useMemo(() => timeline.flatMap((item) => item.kind === "artifact" && item.artifact !== undefined
+    ? [[item.artifact.id, item.artifact.blobId, item.sequence.toString()].join("\u0000")]
+    : []).sort().join("\u0001"), [timeline]);
+  const artifactCatalogOwner = useMemo(() => ({}), [
+    artifactRefreshKey,
+    backend?.instanceGeneration,
+    canListSessionArtifacts,
+    controller.state.activeProfile?.id,
+    controller.state.activeProfile?.serverId,
+    controller.state.connectionState,
+    session.backendId,
+    session.generation,
+    session.id,
+    session.targetId
+  ]);
+  const liveArtifacts = liveArtifactCatalog?.owner === artifactCatalogOwner
+    ? liveArtifactCatalog.artifacts
+    : [];
+  const historicalSessionMentionCandidates = useMemo(
+    () => controller.state.snapshot.sessions.filter((candidate) => candidate.id !== session.id && candidate.state !== "closed"),
+    [controller.state.snapshot.sessions, session.id]
+  );
 
   useEffect(() => {
     let current = true;
@@ -576,6 +643,49 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
     });
     return () => { current = false; };
   }, [canListRuntimeCommands, durableCommands, session.id]);
+
+  useEffect(() => {
+    const request = new AbortController();
+    let current = true;
+    if (!canListSessionResources) return () => {
+      current = false;
+      request.abort();
+    };
+    void controllerRef.current.listSessionResources(session.id, request.signal).then((catalog) => {
+      if (!current) return;
+      setLiveResourceCatalog({
+        owner: resourceCatalogOwner,
+        resources: catalog.every((resource) => resource.sessionId === session.id
+          && BigInt(resource.runtimeGeneration) === session.generation)
+          ? catalog
+          : []
+      });
+    }).catch(() => {
+      if (current && !request.signal.aborted) setLiveResourceCatalog({ owner: resourceCatalogOwner, resources: [] });
+    });
+    return () => {
+      current = false;
+      request.abort();
+    };
+  }, [canListSessionResources, resourceCatalogOwner, session.generation, session.id]);
+
+  useEffect(() => {
+    const request = new AbortController();
+    let current = true;
+    if (!canListSessionArtifacts) return () => {
+      current = false;
+      request.abort();
+    };
+    void controllerRef.current.listSessionArtifacts(session.id, request.signal).then((catalog) => {
+      if (current) setLiveArtifactCatalog({ owner: artifactCatalogOwner, artifacts: catalog });
+    }).catch(() => {
+      if (current && !request.signal.aborted) setLiveArtifactCatalog({ owner: artifactCatalogOwner, artifacts: [] });
+    });
+    return () => {
+      current = false;
+      request.abort();
+    };
+  }, [artifactCatalogOwner, canListSessionArtifacts, session.id]);
 
   useEffect(() => {
     setComposerMessageMentionInsertion(undefined);
@@ -1041,6 +1151,8 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
     if (!routeCurrent) return;
     if (
       latestBackend?.capabilities.get("session.fork")?.supported !== true
+      || (latestSession?.worktree !== undefined
+        && latestBackend.capabilities.get("workspace.derive")?.supported !== true)
       || latestItem === undefined
       || latestItem.sourceEventId === undefined
       || latestTarget?.entryId !== pending.target.entryId
@@ -1334,6 +1446,52 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
     await rewind.executeWorkspaceRewind(workspace.id, preview.id, preview.changeSetId, false);
   };
 
+  const gamepadSettingAction = (kind: "plan" | "model", action: () => Promise<void>): void => {
+    const key = `${timelineResourceOwnerKey}:${session.generation}:${kind}`;
+    if (gamepadSettingFlightsRef.current.has(key)) return;
+    gamepadSettingFlightsRef.current.add(key);
+    runAction(`gamepad-${kind}:${session.id}`, async () => {
+      try { await action(); } finally { gamepadSettingFlightsRef.current.delete(key); }
+    });
+  };
+  const changeGamepadModelSetting = (change: "fast" | "increase" | "decrease"): void => {
+    const model = session.model;
+    if (model === undefined || !modelSourceAccess(backend, model, model, controller.state.snapshot.providers).available) return;
+    if (change === "fast") {
+      if (!canSetFast || !model.supportsFast) return;
+      gamepadSettingAction("model", () => controller.setModel(session.id, model.providerId, model.modelId, session.effort, !session.fastMode));
+      return;
+    }
+    if (!canSetEffort || model.efforts.length === 0) return;
+    const previous = model.efforts.indexOf(session.effort ?? "");
+    const index = previous < 0 ? change === "increase" ? 0 : model.efforts.length - 1
+      : Math.max(0, Math.min(model.efforts.length - 1, previous + (change === "increase" ? 1 : -1)));
+    const effort = model.efforts[index];
+    if (effort === undefined || effort === session.effort) return;
+    gamepadSettingAction("model", () => controller.setModel(session.id, model.providerId, model.modelId, effort, session.fastMode));
+  };
+  const gamepadConnected = controller.state.ready && controller.state.connectionState === "connected";
+  useGamepadActions(paneRef, `${timelineResourceOwnerKey}:${session.generation}`, "session", {
+    "scroll-bottom": () => setFollowLatestSignal((current) => current + 1),
+    ...(gamepadConnected ? {
+      stop: stopRun,
+      ...(reviewReadOnly ? {} : {
+        "toggle-plan": () => { if (canSetPlanMode) gamepadSettingAction("plan", () => controller.setPlanMode(session.id, !session.planMode)); },
+        "toggle-fast": () => changeGamepadModelSetting("fast"),
+        "effort-increase": () => changeGamepadModelSetting("increase"),
+        "effort-decrease": () => changeGamepadModelSetting("decrease"),
+        "toggle-pin": onPin ?? (() => runAction(`pin:${session.id}`, () => controller.pinSession(session.id, !session.pinned))),
+        ...(onArchive === undefined ? {} : { "archive-task": onArchive }),
+        "fork-task": () => {
+          if (!canForkMessage) return;
+          const source = [...visibleTimeline].reverse().find((item) => resolveMessageForkTarget(item) !== undefined);
+          if (source !== undefined) forkFromMessage(source);
+        }
+      }),
+      ...(onCopyTaskLink === undefined ? {} : { "copy-task-link": onCopyTaskLink })
+    } : {})
+  });
+
   const composerControls = (
     <div className="composer__controls" aria-label={t("session.controls")}>
       {canSetPermission && <PermissionSelector
@@ -1446,7 +1604,8 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
             t={t}
             onRename={onRename}
             onPin={onPin ?? (() => runAction(`pin:${session.id}`, () => controller.pinSession(session.id, !session.pinned)))}
-            onArchive={onArchive ?? (() => runAction(`archive:${session.id}`, () => controller.archiveSession(session.id, !session.archived)))}
+            onArchive={onArchive}
+            onPrefetchRemoval={onPrefetchRemoval}
             onDelete={onDelete}
             onMoveSessionProject={onMoveSessionProject}
             onCopyTaskLink={onCopyTaskLink}
@@ -1486,6 +1645,8 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
         ownerKey={`${timelineResourceOwnerKey}:${session.generation}:${controller.state.connectionState}`}
         sessionId={session.id}
         sessionName={session.name}
+        workspaceId={canOpenWorkspaceReferences && controller.state.connectionState === "connected" ? workspace?.id : undefined}
+        onReadArtifact={controller.state.connectionState === "connected" ? controller.readSessionArtifact : undefined}
         items={visibleTimeline}
         sessionActive={running}
         derivationOrigin={derivationOrigin}
@@ -1631,7 +1792,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
         <InteractionDialog key={interaction === undefined ? "interaction:none" : `${interaction.sessionId}:${interaction.id}`} controller={controller} interaction={interaction} remaining={remainingInteractions} inline t={t} runAction={runAction} />
       </InteractionPromptHost>
       {currentShareSelection !== undefined && <ShareSelectionBar ownerKey={`${timelineResourceOwnerKey}:${session.generation}`} sessionName={session.name} messages={shareableMessages} selectedIds={currentShareSelection.selectedIds} locale={controller.state.preferences.locale} t={t} onToggleAll={toggleAllShareMessages} onCancel={closeShareSelection} />}
-      {interaction === undefined && <div hidden={currentShareSelection !== undefined}><Composer controller={controller} session={session} backend={backend} sessionUsage={effectiveSessionUsage} readOnly={reviewReadOnly} autoFocus={composerAutoFocus && presentation === "standard" && currentShareSelection === undefined} focusRequest={composerFocusRequest} queue={queue} queueControl={queueControl} workspace={workspace} extraDirectories={extraDirectories} resources={resources} commands={canListRuntimeCommands ? liveCommands : []} messageHistory={messageHistory} controls={composerControls} runningStatus={<SessionRunningStatusBar session={session} items={recoveryPresentationTimeline} backgroundTaskIds={backgroundTaskIds} canStopBackgroundTasks={canStopBackgroundTasks} backgroundStopping={backgroundStopping} backgroundStopError={backgroundStopError} suppressed={reviewReadOnly} t={t} onStopBackgroundTasks={stopAllBackgroundTasks} />} messageMentionInsertion={composerMessageMentionInsertion} selectionQuoteInsertion={composerSelectionQuoteInsertion} attachmentInsertion={composerAttachmentInsertion} draftReplacement={composerDraftReplacement} onDraftMutation={noteComposerDraftMutation} t={t} runAction={runAction} onLocalSend={(sourceSessionId) => { if (activeSessionIdRef.current === sourceSessionId) setFollowLatestSignal((current) => current + 1); }} onStop={canStop ? stopRun : undefined} stopInFlight={stopInFlight} onCompact={canCompact && !running && activeCompaction === undefined && !compactInFlight && (session.context?.usedTokens ?? 0) > 0 ? requestCompact : undefined} /></div>}
+{interaction === undefined && <div hidden={currentShareSelection !== undefined}><Composer artifacts={canListSessionArtifacts ? liveArtifacts : []} sessions={historicalSessionMentionCandidates} controller={controller} session={session} backend={backend} sessionUsage={effectiveSessionUsage} readOnly={reviewReadOnly} autoFocus={composerAutoFocus && presentation === "standard" && currentShareSelection === undefined} focusRequest={composerFocusRequest} queue={queue} queueControl={queueControl} workspace={workspace} extraDirectories={extraDirectories} resources={canListSessionResources ? liveResources : []} commands={canListRuntimeCommands ? liveCommands : []} messageHistory={messageHistory} controls={composerControls} runningStatus={<SessionRunningStatusBar session={session} items={recoveryPresentationTimeline} backgroundTaskIds={backgroundTaskIds} canStopBackgroundTasks={canStopBackgroundTasks} backgroundStopping={backgroundStopping} backgroundStopError={backgroundStopError} suppressed={reviewReadOnly} t={t} onStopBackgroundTasks={stopAllBackgroundTasks} />} messageMentionInsertion={composerMessageMentionInsertion} selectionQuoteInsertion={composerSelectionQuoteInsertion} attachmentInsertion={composerAttachmentInsertion} draftReplacement={composerDraftReplacement} onDraftMutation={noteComposerDraftMutation} t={t} runAction={runAction} onLocalSend={(sourceSessionId) => { if (activeSessionIdRef.current === sourceSessionId) setFollowLatestSignal((current) => current + 1); }} onStop={canStop ? stopRun : undefined} stopInFlight={stopInFlight} onCompact={canCompact && !running && activeCompaction === undefined && !compactInFlight && (session.context?.usedTokens ?? 0) > 0 ? requestCompact : undefined} /></div>}
       <ExtensionWidgets widgets={extensionWidgets.filter((widget) => widget.placement === "belowEditor")} label={t("a11y.extensionWidgets")} />
       </div>
 

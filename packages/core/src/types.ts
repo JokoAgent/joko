@@ -81,6 +81,7 @@ export const CAPABILITIES = [
   "workspace.files",
   "workspace.files.watch",
   "workspace.files.write",
+  "workspace.derive",
   "workspace.diff",
   "workspace.generated_files",
   "workspace.diff.sources",
@@ -212,9 +213,44 @@ interface MentionInputBase {
 }
 
 export type MentionInput = MentionInputBase & (
-  | { readonly kind: "workspace_file"; readonly lineRange?: WorkspaceLineRange }
-  | { readonly kind: "workspace_directory" | "resource" | "artifact"; readonly lineRange?: never }
+  | { readonly kind: "workspace_file"; readonly workspaceId?: string; readonly lineRange?: WorkspaceLineRange }
+  | { readonly kind: "workspace_directory"; readonly workspaceId?: string; readonly lineRange?: never }
+  | {
+      readonly kind: "resource";
+      /** Immutable content identity observed in the exact live runtime. */
+      readonly discoveredRevision: string;
+      /** Canonical positive decimal entity revision captured by that runtime. */
+      readonly resourceVersion: string;
+      /** Product/native runtime generation that owns the loaded snapshot. */
+      readonly runtimeGeneration: number;
+      readonly lineRange?: never;
+    }
+  | { readonly kind: "artifact"; readonly lineRange?: never }
+  | { readonly kind: "session"; readonly lineRange?: never }
 );
+
+/** Host-authored durable fence for one Session mention in a queued prompt.
+ * The public input carries only the source Session identity; referenced
+ * message bodies are reconstructed from Store immediately before dispatch. */
+export interface SessionReferenceSnapshot {
+  readonly mentionIndex: number;
+  readonly sessionId: string;
+  /** Decimal global Event cursor captured inside Queue admission. */
+  readonly throughCursor: string;
+  readonly sourceGeneration: number;
+  readonly historyBindingFingerprint: string;
+  /** Decimal Event cursor of the active history marker at admission. */
+  readonly historyMarkerCursor?: string;
+  readonly historyLeafId?: string;
+}
+
+/** An exact UTF-16 occurrence of one typed mention in PromptInput.text. */
+export interface InputMentionRange {
+  readonly start: number;
+  readonly end: number;
+  /** Index in PromptInput.mentions, independent of files, images, and text parts. */
+  readonly mentionIndex: number;
+}
 
 /** UTF-16 offsets identifying an inline source span with a compact display label. */
 export interface InlineTextRange {
@@ -251,6 +287,35 @@ export function validInlineTextRanges(
   return true;
 }
 
+/** Validate identity ranges as received; never infer a target from visible text. */
+export function validInputMentionRanges(
+  text: string,
+  mentions: readonly MentionInput[],
+  ranges: readonly InputMentionRange[],
+  pastedTextRanges: readonly InlineTextRange[] = []
+): boolean {
+  if (!validInlineTextRanges(text, pastedTextRanges)) return false;
+  let previousEnd = 0;
+  let pasteIndex = 0;
+  for (const range of ranges) {
+    if (!Number.isSafeInteger(range.start)
+      || !Number.isSafeInteger(range.end)
+      || range.start < previousEnd
+      || range.start < 0
+      || range.end <= range.start
+      || range.end > text.length
+      || !isUtf16Boundary(text, range.start)
+      || !isUtf16Boundary(text, range.end)
+      || !Number.isSafeInteger(range.mentionIndex)
+      || range.mentionIndex < 0
+      || range.mentionIndex >= mentions.length) return false;
+    while (pasteIndex < pastedTextRanges.length && pastedTextRanges[pasteIndex]!.end <= range.start) pasteIndex += 1;
+    if (pastedTextRanges[pasteIndex] !== undefined && pastedTextRanges[pasteIndex]!.start < range.end) return false;
+    previousEnd = range.end;
+  }
+  return true;
+}
+
 function isUtf16Boundary(text: string, offset: number): boolean {
   if (offset <= 0 || offset >= text.length) return true;
   const before = text.charCodeAt(offset - 1);
@@ -263,11 +328,16 @@ export interface PromptInput {
   readonly images: readonly ImageInput[];
   readonly files: readonly FileInput[];
   readonly mentions: readonly MentionInput[];
+  /** Queue-only authority for typed Session mentions. Public mappers never
+   * accept or emit this field, and dispatch removes it before Adapter input. */
+  readonly sessionReferenceSnapshots?: readonly SessionReferenceSnapshot[];
   readonly disposition: InputDisposition;
   /** True only when the product encoded inline quote atoms into text. */
   readonly quotesEncoded?: boolean;
   /** Durable UTF-16 spans for compact sent-paste rendering. */
   readonly pastedTextRanges?: readonly InlineTextRange[];
+  /** Exact inline occurrences; mentions without inline text may omit these ranges. */
+  readonly mentionRanges?: readonly InputMentionRange[];
   /**
    * Service-owned continuation identity. Public SendInput contracts never
    * accept this field; it exists so an internally replayed prompt can retain

@@ -12,7 +12,6 @@ export interface ErrorTailResolution {
 
 const CONTINUATION_QUEUE_STATES = new Set<QueueItemView["state"]>([
   "accepted",
-  "queued",
   "dispatching",
   "acceptedByBackend",
   "dispatchUnknown"

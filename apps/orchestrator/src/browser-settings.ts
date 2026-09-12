@@ -354,7 +354,7 @@ function validateTakeoverTimeout(value: BrowserSettingsPatch["takeoverTimeout"])
   try { return validateTakeoverTimeoutMilliseconds(fromProtoDuration(value, "patch.takeover_timeout")); }
   catch (error) {
     if (error instanceof BrowserSettingsValidationError) throw error;
-    throw new BrowserSettingsValidationError("patch.takeover_timeout", "Browser takeover timeout must be millisecond-aligned and between 1 second and 24 hours.");
+    throw new BrowserSettingsValidationError("patch.takeover_timeout", "Browser takeover timeout must use whole milliseconds and be between 1 second and 24 hours.");
   }
 }
 

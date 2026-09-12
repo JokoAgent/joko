@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { composerDocumentPlainText, plainTextToComposerDocument } from "../composer-quote-document.js";
-import { insertNewSessionPaletteDocument } from "./new-session-composer-document.js";
+import { insertNewSessionPaletteDocument, replaceNewSessionCommandDocument } from "./new-session-composer-document.js";
 
 describe("new-session structured composer insertion", () => {
   it("appends commands without flattening an existing list", () => {
@@ -49,5 +49,18 @@ describe("new-session structured composer insertion", () => {
     });
     expect(inserted.text).toBe("/status");
     expect(inserted.document).toEqual(plainTextToComposerDocument("/status "));
+  });
+
+  it("replaces a complete slash run inside a rich document when the caret moved into its middle", () => {
+    const original = plainTextToComposerDocument("- inspect\n- use /review later");
+    const inserted = replaceNewSessionCommandDocument(original, { from: 16, to: 23, query: "rev" }, {
+      id: "command:status",
+      label: "/status",
+      value: "/status",
+      meta: "Status"
+    });
+    expect(inserted?.text).toBe("- inspect\n- use /status later");
+    expect(inserted?.caret).toBe(23);
+    expect(inserted?.document.content?.[0]?.type).toBe("bulletList");
   });
 });

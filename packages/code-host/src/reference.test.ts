@@ -9,7 +9,7 @@ describe("code-host pull request references", () => {
   it("extracts and de-duplicates pull and merge request URLs without retaining surrounding text", () => {
     expect(extractCodeHostPullRequestReferences([
       "Review https://code.example/acme/widgets/pull/42, then https://code.example/acme/widgets/pull/42.",
-      "Mirror: https://forge.example/team/service/-/merge_requests/7"
+      "Merge request: https://forge.example/team/service/-/merge_requests/7"
     ])).toEqual([
       {
         key: "code.example/acme/widgets#42",

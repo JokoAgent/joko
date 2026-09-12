@@ -26,8 +26,8 @@ describe("structured message references", () => {
 
   it("retains token mentions only while present and retains detachable message chips", () => {
     expect(activeComposerMentions("keep @one", [
-      { id: "one", kind: "resource", reference: "one", label: "One", token: "@one" },
-      { id: "two", kind: "resource", reference: "two", label: "Two", token: "@two" },
+      { id: "one", kind: "resource", reference: "one", label: "One", token: "@one", discoveredRevision: "revision-one", resourceVersion: "1", runtimeGeneration: 2 },
+      { id: "two", kind: "resource", reference: "two", label: "Two", token: "@two", discoveredRevision: "revision-two", resourceVersion: "2", runtimeGeneration: 2 },
       messageMention
     ]).map((mention) => mention.id)).toEqual(["one", messageMention.id]);
   });

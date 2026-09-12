@@ -125,12 +125,38 @@ describe("MessageNavRail mounted behavior", () => {
 
     unmountRail(mounted);
   });
+
+  it("reports coverage only while every eligible tick is visible", () => {
+    const truncatedCoverage = vi.fn();
+    const truncated = mountRail({
+      height: 94,
+      entries: Array.from({ length: 20 }, (_, index) => ({ id: `u${index + 1}`, preview: `prompt ${index + 1}` })),
+      tops: Array.from({ length: 20 }, (_, index) => index * 20),
+      onCoverageChange: truncatedCoverage
+    });
+    flushMeasure();
+    expect(truncated.host.querySelector(".message-nav-rail__hidden")).not.toBeNull();
+    expect(truncatedCoverage).toHaveBeenLastCalledWith(false);
+    unmountRail(truncated);
+
+    const completeCoverage = vi.fn();
+    const complete = mountRail({
+      tops: [0, 100, 200, 300, 400],
+      onCoverageChange: completeCoverage
+    });
+    flushMeasure();
+    expect(complete.host.querySelector(".message-nav-rail__hidden")).toBeNull();
+    expect(tickButtons(complete.host)).toHaveLength(complete.entries.length);
+    expect(completeCoverage).toHaveBeenLastCalledWith(true);
+    unmountRail(complete);
+  });
 });
 
 function mountRail({
   entries = Array.from({ length: 5 }, (_, index) => ({ id: `u${index + 1}`, preview: `prompt ${index + 1}` })),
   height = 700,
   mountedIndexes,
+  onCoverageChange,
   onJump = vi.fn(),
   onWheelIntent,
   tops
@@ -138,6 +164,7 @@ function mountRail({
   readonly entries?: readonly MessageNavEntry[];
   readonly height?: number;
   readonly mountedIndexes?: readonly number[];
+  readonly onCoverageChange?: (covered: boolean) => void;
   readonly onJump?: (id: string) => void;
   readonly onWheelIntent?: (deltaY: number) => void;
   readonly tops: readonly number[];
@@ -165,6 +192,7 @@ function mountRail({
     bottomOffset={0}
     resetKey="session-1"
     estimateEntryTop={(id) => tops[entries.findIndex((entry) => entry.id === id)] ?? null}
+    onCoverageChange={onCoverageChange}
     onWheelIntent={onWheelIntent}
     onJump={onJump}
     t={t}

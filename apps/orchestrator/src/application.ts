@@ -62,6 +62,7 @@ import {
 import { ProxyAgent, fetch as proxyFetch, type Dispatcher } from "undici";
 
 import { OperationalArtifactRepository } from "./artifact-repository.js";
+import { createArtifactMentionResolver } from "./artifact-mention-resolver.js";
 import { ArtifactMaintenance } from "./artifact-maintenance.js";
 import { AndroidAutomationSettingsController } from "./android-automation-settings.js";
 import {
@@ -850,6 +851,17 @@ export async function createOrchestratorApplication(
         oauthFetch: claudeCodeOAuthFetch,
         readBlob: (blob) => artifacts.readBlob(blob),
         resolveFile: (blob) => artifacts.resolveBlobPath(blob),
+        resolveArtifactMention: createArtifactMentionResolver({
+          store, artifacts,
+          resolveTarget: (session) => sessionWorktrees.effectiveTarget(session),
+          assertBackendCurrent: (context) => {
+            const current = backendInstances.get(instanceId);
+            if (context.target.backendId !== instanceId || context.backendInstanceGeneration !== generation
+              || current.state !== "available" || current.generation !== generation) {
+              throw new Error("The Artifact input Backend instance is no longer current.");
+            }
+          }
+        }),
         probeCwd: config.workspace.root,
         processOwner: {
           rootDirectory: join(config.dataDirectory, "backend-runtime", instanceId),
@@ -1344,7 +1356,38 @@ export async function createOrchestratorApplication(
   };
 
   try {
-    await workspaces.register(config.workspace);
+    const backendTargets: readonly {
+      readonly backendId: string;
+      readonly targetId: string;
+      readonly displayName: string;
+    }[] = [
+      { backendId: piBackendId, targetId: config.workspace.id, displayName: config.workspace.displayName },
+      { backendId: codexBackendId, targetId: `${config.workspace.id}:codex`, displayName: `${config.workspace.displayName} · Codex` },
+      { backendId: claudeCodeBackendId, targetId: `${config.workspace.id}:claude-code`, displayName: `${config.workspace.displayName} · Claude Code` }
+    ];
+    const storedTargets = new Map(store.listTargets().map((target) => [target.descriptor.id, target]));
+    // Validate configured identities before restoring workspaces or activating stored Sessions.
+    for (const registration of backendTargets) {
+      const storedTarget = storedTargets.get(registration.targetId);
+      if (storedTarget === undefined) continue;
+      const metadata = isRecord(storedTarget.metadata) ? storedTarget.metadata : {};
+      if (storedTarget.descriptor.backendId !== registration.backendId
+        || resolve(storedTarget.descriptor.workspaceRoot) !== resolve(config.workspace.root)
+        || metadata["workspaceId"] !== config.workspace.id) {
+        throw new Error("The configured workspace does not match its persisted Target. Choose a distinct workspace identity for a different root or Backend.");
+      }
+    }
+    const configuredTarget = storedTargets.get(config.workspace.id);
+    const configuredBinding = configuredTarget?.descriptor.remoteWorkspace;
+    await workspaces.register(configuredTarget === undefined ? config.workspace : {
+      id: config.workspace.id,
+      root: configuredBinding?.workspaceRoot ?? configuredTarget.descriptor.workspaceRoot,
+      displayName: configuredTarget.descriptor.displayName,
+      trusted: configuredTarget.descriptor.trusted,
+      ...(configuredBinding === undefined ? {} : {
+        remote: { targetId: configuredTarget.descriptor.id, hostId: configuredBinding.hostId, workspaceRoot: configuredBinding.workspaceRoot }
+      })
+    });
     for (const storedTarget of store.listTargets()) {
       const metadata = isRecord(storedTarget.metadata) ? storedTarget.metadata : {};
       const workspaceId = typeof metadata["workspaceId"] === "string" ? metadata["workspaceId"] : undefined;
@@ -1378,23 +1421,6 @@ export async function createOrchestratorApplication(
     await reviewCoordinator.reconcileStartup();
     await sessionWorktrees.initialize();
     await sessionHost.initialize();
-    const backendTargets: readonly {
-      readonly backendId: string;
-      readonly targetId: string;
-      readonly displayName: string;
-    }[] = [
-      { backendId: piBackendId, targetId: config.workspace.id, displayName: config.workspace.displayName },
-      {
-        backendId: codexBackendId,
-        targetId: `${config.workspace.id}:codex`,
-        displayName: `${config.workspace.displayName} · Codex`
-      },
-      {
-        backendId: claudeCodeBackendId,
-        targetId: `${config.workspace.id}:claude-code`,
-        displayName: `${config.workspace.displayName} · Claude Code`
-      }
-    ];
     for (const registration of backendTargets) {
       if (backendInstances.adapter(registration.backendId) === undefined) continue;
       const target: TargetDescriptor = {
@@ -1408,7 +1434,14 @@ export async function createOrchestratorApplication(
         managed: false,
         trusted: config.workspace.trusted
       };
-      await sessionHost.registerTarget(target, { workspaceId: config.workspace.id });
+      const storedTarget = storedTargets.get(registration.targetId);
+      if (storedTarget !== undefined) {
+        const metadata = isRecord(storedTarget.metadata) ? storedTarget.metadata : {};
+        if (metadata["deletedAt"] !== undefined) continue;
+        await sessionHost.registerTarget(storedTarget.descriptor, storedTarget.metadata);
+      } else {
+        await sessionHost.registerTarget(target, { workspaceId: config.workspace.id });
+      }
     }
 
     const computerRuntimeAdapter = computerAutomationRuntime(computerRuntime);

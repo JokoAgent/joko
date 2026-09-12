@@ -6,6 +6,7 @@ import type {
   ScheduleView,
   SessionView
 } from "./model.js";
+import type { WorktreeRemovalPreflightSummary } from "./worktree-removal-preflight.js";
 
 export type GeneratedSessionDisposition = ScheduleGeneratedSessionDispositionView;
 
@@ -20,7 +21,12 @@ export type ScheduleDeletionResult = ScheduleDeletionResultView;
 export interface ScheduleDeletionPreview {
   readonly generatedSessionIds: readonly string[];
   readonly inflightCount: number;
+  readonly worktreeRemoval: WorktreeRemovalPreflightSummary;
 }
+
+export type SessionRemovalPreparer = (
+  sessions: readonly SessionView[]
+) => Promise<WorktreeRemovalPreflightSummary | undefined>;
 
 /** Preview only Sessions carrying the authoritative automation origin. A history
  * primary may be a pre-existing task selected by a script and is never ownership proof. */
@@ -41,15 +47,24 @@ export async function collectScheduleGeneratedSessionIds(
 export async function prepareScheduleDeletion(
   access: Pick<ScheduleDeletionAccess, "listScheduleRunHistory" | "getSchedulerRuntime">,
   schedule: ScheduleView,
-  knownSessions?: readonly SessionView[]
+  knownSessions: readonly SessionView[],
+  prepareSessionRemoval: SessionRemovalPreparer
 ): Promise<ScheduleDeletionPreview> {
   const [generatedSessionIds, runtime] = await Promise.all([
     collectScheduleGeneratedSessionIds(access, schedule, knownSessions),
     access.getSchedulerRuntime()
   ]);
+  const generated = new Set(generatedSessionIds);
+  const worktreeRemoval = await prepareSessionRemoval(
+    knownSessions.filter((session) => generated.has(session.id))
+  );
+  if (worktreeRemoval === undefined) {
+    throw new Error("The Schedule deletion preview is no longer current.");
+  }
   return {
     generatedSessionIds,
-    inflightCount: runtime.runs.filter((run) => run.scheduleId === schedule.id).length
+    inflightCount: runtime.runs.filter((run) => run.scheduleId === schedule.id).length,
+    worktreeRemoval
   };
 }
 

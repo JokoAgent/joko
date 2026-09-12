@@ -83,6 +83,7 @@ import {
 import { AuthenticatedImage, Button, IconButton, Modal, Pill, Spinner, StatusDot, cx, formatRelativeTime, CheckboxControl, SelectControl } from "./ui.js";
 import { currentAppShortcutPlatform } from "../app-shortcuts.js";
 import { useAppShortcut } from "../use-app-shortcut.js";
+import { GAMEPAD_PANEL_EVENT } from "../gamepad-client.js";
 import { isSessionApplicationWindow } from "../session-window-navigation.js";
 import { CLIENT_LAYOUT_RESET_EVENT } from "../client-layout-reset.js";
 import { installCurrentWindowActivationClickGuard } from "../window-activation-click.js";
@@ -728,6 +729,13 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
   };
 
   const shortcutOverrides = controller.state.preferences.appShortcutOverrides;
+  useEffect(() => {
+    const cycle = (event: Event): void => {
+      if (event instanceof CustomEvent && (event.detail === -1 || event.detail === 1)) cycleTabsFromShortcut(event.detail);
+    };
+    window.addEventListener(GAMEPAD_PANEL_EVENT, cycle);
+    return () => window.removeEventListener(GAMEPAD_PANEL_EVENT, cycle);
+  });
   const openTerminalFromShortcut = (): boolean => {
     if ((!canTerminal && !bucket.tabs.some((tab) => tab.kind === "terminal")) || document.body.classList.contains("modal-open")) return false;
     openTerminal(true);
@@ -1114,7 +1122,8 @@ export function BranchesPanel({ controller, backend, session, t, runAction }: { 
   const controllerRef = useRef(controller);
   controllerRef.current = controller;
   const busy = session.state === "running" || session.state === "waiting" || session.state === "retrying";
-  const canFork = backend?.capabilities.get("session.fork")?.supported === true;
+  const canFork = backend?.capabilities.get("session.fork")?.supported === true
+    && (session.worktree === undefined || backend.capabilities.get("workspace.derive")?.supported === true);
   const load = useCallback(async (): Promise<void> => {
     setLoading(true);
     setError(undefined);

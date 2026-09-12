@@ -1,7 +1,7 @@
 import type {
   ComposerMentionDraft,
-  ResourceView,
   RuntimeCommandView,
+  SessionView,
   WorkspaceEntryView
 } from "../model.js";
 import { activeComposerMentions } from "../message-reference.js";
@@ -13,6 +13,15 @@ export interface ComposerPaletteItem {
   readonly value: string;
   readonly meta: string;
   readonly mention?: ComposerMentionDraft;
+}
+
+export interface ComposerCommandActivation {
+  /** UTF-16 offset of the slash that owns this command run. */
+  readonly from: number;
+  /** UTF-16 offset after the complete non-whitespace command run. */
+  readonly to: number;
+  /** The live query between the slash and the caret. */
+  readonly query: string;
 }
 
 export interface ComposerCommandItemOptions {
@@ -39,8 +48,8 @@ export type ComposerBuiltInCommand =
 export function composerMentionItems(
   entries: readonly WorkspaceEntryView[],
   workspaceId: string | undefined,
-  resources: readonly ResourceView[],
-  indexedPaths: readonly string[] = []
+  indexedPaths: readonly string[] = [],
+  sessions: readonly SessionView[] = []
 ): readonly ComposerPaletteItem[] {
   return uniquePaletteItems([
     ...flattenWorkspaceEntries(entries, workspaceId),
@@ -62,33 +71,28 @@ export function composerMentionItems(
         }
       };
     }),
-    ...resources.map((resource) => {
-      const token = `@${resource.name}`;
-      return {
-        id: `resource:${resource.id}`,
-        label: resource.name,
-        value: token,
-        meta: resource.kind,
+    ...sessions.flatMap((session): readonly ComposerPaletteItem[] => {
+      if (session.id.trim() === "" || session.name.trim() === "" || session.state === "closed") return [];
+      return [{
+        id: `session:${session.id}`,
+        label: session.name,
+        value: serializeComposerMentionPath(session.name),
+        meta: session.summary ?? "",
         mention: {
-          id: `resource:${resource.id}`,
-          kind: "resource" as const,
-          reference: resource.id,
-          label: resource.name,
-          token
+          id: `session:${session.id}`,
+          kind: "session",
+          reference: session.id,
+          label: session.name,
+          token: serializeComposerMentionPath(session.name)
         }
-      };
+      }];
     })
   ]);
 }
 
-/**
- * Runtime get_commands remains authoritative. A loaded skill/prompt resource
- * is also useful on the delayed-create route, where no Session exists yet to
- * request a session-scoped command catalog.
- */
+/** Runtime get_commands is the sole native command authority. */
 export function composerCommandItems(
   commands: readonly RuntimeCommandView[],
-  resources: readonly ResourceView[] = [],
   options: ComposerCommandItemOptions = {}
 ): readonly ComposerPaletteItem[] {
   const items: ComposerPaletteItem[] = [
@@ -116,18 +120,69 @@ export function composerCommandItems(
       value: slashName(command.name),
       meta: command.description || command.source
     })));
-  const representedResources = new Set(commands.flatMap((command) => command.resourceId === undefined ? [] : [command.resourceId]));
-  for (const resource of resources) {
-    if (
-      !resource.enabled
-      || resource.state !== "loaded"
-      || (resource.kind !== "skill" && resource.kind !== "prompt")
-      || representedResources.has(resource.id)
-    ) continue;
-    const value = slashName(resource.name.replace(/\s+/gu, "-"));
-    items.push({ id: `resource-command:${resource.id}`, label: value, value, meta: resource.kind });
-  }
   return uniquePaletteItems(items);
+}
+
+/**
+ * Detect a typed slash command at the caret without borrowing authority from
+ * an incomplete or unrelated token. The returned end covers the whole run so
+ * choosing a command after moving the caret into `/command` cannot leave a
+ * stale suffix behind.
+ */
+export function detectComposerCommandActivation(
+  text: string,
+  caret: number,
+  options: { readonly isComposing: boolean; readonly bashMode: boolean }
+): ComposerCommandActivation | undefined {
+  if (options.isComposing || options.bashMode || !Number.isInteger(caret) || caret < 0 || caret > text.length) {
+    return undefined;
+  }
+  let from = caret;
+  while (from > 0 && !/\s/u.test(text[from - 1] ?? "")) from -= 1;
+  const prefix = text.slice(from, caret);
+  if (!prefix.startsWith("/") || prefix.slice(1).includes("/")) return undefined;
+
+  let to = caret;
+  while (to < text.length && !/\s/u.test(text[to] ?? "")) to += 1;
+  return { from, to, query: prefix.slice(1) };
+}
+
+export function filterComposerPaletteItems(
+  items: readonly ComposerPaletteItem[],
+  query: string,
+  limit = 20
+): readonly ComposerPaletteItem[] {
+  const normalized = query.toLocaleLowerCase();
+  return items
+    .filter((item) => `${item.label} ${item.meta}`.toLocaleLowerCase().includes(normalized))
+    .slice(0, Math.max(0, limit));
+}
+
+export function replaceComposerCommandRun(
+  text: string,
+  activation: ComposerCommandActivation,
+  value: string
+): { readonly text: string; readonly caret: number; readonly replacement: string } | undefined {
+  if (
+    activation.from < 0
+    || activation.to < activation.from
+    || activation.to > text.length
+    || text[activation.from] !== "/"
+  ) return undefined;
+  const run = text.slice(activation.from, activation.to);
+  if (
+    !/^\/\S*$/u.test(run)
+    || !run.slice(1).startsWith(activation.query)
+    || activation.from > 0 && !/\s/u.test(text[activation.from - 1] ?? "")
+    || activation.to < text.length && !/\s/u.test(text[activation.to] ?? "")
+  ) return undefined;
+  const separator = activation.to < text.length && /\s/u.test(text[activation.to] ?? "") ? "" : " ";
+  const replacement = `${value}${separator}`;
+  return {
+    text: `${text.slice(0, activation.from)}${replacement}${text.slice(activation.to)}`,
+    caret: activation.from + replacement.length,
+    replacement
+  };
 }
 
 /**
@@ -206,7 +261,7 @@ function slashName(value: string): string {
 function uniquePaletteItems(items: readonly ComposerPaletteItem[]): readonly ComposerPaletteItem[] {
   const seen = new Set<string>();
   return items.filter((item) => {
-    const key = item.value.toLocaleLowerCase();
+    const key = item.id.startsWith("session:") ? item.id : item.value.toLocaleLowerCase();
     if (seen.has(key)) return false;
     seen.add(key);
     return true;

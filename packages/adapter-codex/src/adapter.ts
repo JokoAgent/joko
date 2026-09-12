@@ -2620,6 +2620,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   }
 
   async #forkThread(runtime: SessionRuntime, context: AdapterContext, derivation: NativeSessionDerivation, nativeBoundaryId?: string): Promise<NativeSessionBinding> {
+    assertCodexDerivationTarget(context.target, derivation.target);
+    await this.validateTarget(derivation.target);
     const hostGeneration = runtime.hostGeneration;
     const dispatchSignal = AbortSignal.any([context.signal, runtime.dispatchLifetime.signal]);
     const boundary = nativeBoundaryId === undefined
@@ -2646,7 +2648,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       response = await this.#host.request("thread/fork", {
         threadId: runtime.threadId,
         ...(boundary === undefined ? {} : { lastTurnId: boundary.turnId }),
-        cwd: context.target.workspaceRoot,
+        cwd: derivation.target.workspaceRoot,
         excludeTurns: true
       }, { mutation: true, signal: dispatchSignal, beforeDispatch: assertForkDispatch });
     } catch (error) {
@@ -2679,10 +2681,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       } catch (error) {
         throw this.#requestFailure(error, "dispatch", "CODEX_SESSION_FORK_INVALID_RESPONSE", true);
       }
-      if (!(await nativeThreadMatchesWorkspace(thread, runtime.targetWorkspaceRoot))) {
+      if (!(await nativeThreadMatchesWorkspace(thread, derivation.target.workspaceRoot))) {
         throw adapterError({
           code: "CODEX_SESSION_FORK_TARGET_MISMATCH",
-          message: "The derived Codex native thread does not match the source Target workspace.",
+          message: "The derived Codex native thread does not match the derived Target workspace.",
           phase: "dispatch",
           stateMayHaveChanged: true,
           recovery: "Inspect native Session discovery for the selected Target before explicitly retrying the fork."
@@ -2893,6 +2895,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       "session.detach",
       "session.fork",
       "session.clone",
+      "workspace.derive",
       "session.rewind",
       "session.rewind_to_start",
       "turn.stream",
@@ -2951,6 +2954,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             ? { reason: "not_implemented" as const }
             : {}),
         ...(key === "permission.modes" ? { options: ["ask", "auto", "bypassPermissions"] } : {}),
+        ...(key === "input.mention" && available ? { options: ["workspace_file"] } : {}),
         ...(key === "provider.login" && this.#account?.supportsLogin === true
           ? { options: [...this.#account.loginMethods] }
           : {})
@@ -4071,6 +4075,23 @@ function threadIdFromBinding(binding: NativeSessionBinding): string {
 
 function isValidNativeThreadId(value: string): boolean {
   return value.length > 0 && value.length <= 512 && !/[\u0000-\u001f]/.test(value);
+}
+
+function assertCodexDerivationTarget(source: TargetDescriptor, derived: TargetDescriptor): void {
+  if (source.id !== derived.id
+    || source.backendId !== derived.backendId
+    || source.managed !== derived.managed
+    || source.trusted !== derived.trusted
+    || source.remoteWorkspace?.hostId !== derived.remoteWorkspace?.hostId
+    || source.remoteWorkspace?.workspaceRoot !== derived.remoteWorkspace?.workspaceRoot) {
+    throw adapterError({
+      code: "CODEX_SESSION_DERIVATION_TARGET_MISMATCH",
+      message: "The derived workspace does not preserve the source Target identity.",
+      phase: "provision",
+      stateMayHaveChanged: false,
+      recovery: "Retry through the owning Session and its derived workspace lease."
+    });
+  }
 }
 
 async function assertNativeThreadTarget(

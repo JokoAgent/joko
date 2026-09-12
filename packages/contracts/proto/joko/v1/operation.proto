@@ -280,7 +280,6 @@ message ArchiveTargetMutation {
 message DeleteTargetMutation {
   string target_id = 1;
   bool delete_managed_workspace = 2;
-  bool delete_product_sessions = 3;
 }
 
 message CreateSessionMutation {
@@ -488,6 +487,15 @@ message EditQueueItemMutation {
   InputContent input = 2;
   optional QueueDeliveryMode delivery_mode = 3;
   string lock_token = 4;
+  // Ordered UTF-16 splices based on the durable text and then each preceding
+  // splice. The service replays them to derive surviving range authority.
+  repeated QueueTextEditSplice text_splices = 5;
+}
+
+message QueueTextEditSplice {
+  uint32 start = 1;
+  uint32 end = 2;
+  string replacement_text = 3;
 }
 
 message ReorderQueueItemMutation {
@@ -1068,6 +1076,10 @@ message OpenBrowserPageMutation {
   // Opens a bounded isolated workspace snapshot. Mutually exclusive with URL
   // and recovery_page_id; HTML bytes never enter the durable mutation.
   WorkspaceHtmlReference workspace_html = 8;
+  // Exact configured presentation target requested by the initiating surface.
+  // UNSPECIFIED is invalid; the Orchestrator never switches or falls back to
+  // another Browser target while admitting this effect.
+  BrowserAutomationTarget presentation_target = 9;
 }
 
 // Transfers one exact owned human capability to another live page.

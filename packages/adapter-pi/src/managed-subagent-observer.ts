@@ -28,7 +28,7 @@ const TERMINAL_STATES = new Set(["completed", "failed", "aborted"]);
 const MAX_JSON_BYTES = 512 * 1024;
 const MAX_RESULT_BYTES = 256 * 1024;
 // The runner accepts up to 50 MiB and may still append one final bounded
-// truncation marker. Keep the reader aligned with that durable format.
+// truncation marker. The reader accepts that complete durable envelope.
 const MAX_TRANSCRIPT_BYTES = 50 * 1024 * 1024 + 4_096;
 const MAX_TRANSCRIPT_CONTENT_BYTES = 256 * 1024;
 const MAX_TOOL_INPUT_BYTES = 64 * 1024;

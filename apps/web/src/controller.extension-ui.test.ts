@@ -105,7 +105,7 @@ describe("extension UI controller effects", () => {
     const draft: ComposerDraft = {
       text: "old text",
       attachments: [attachment],
-      mentions: [{ id: "mention-one", kind: "resource", reference: "resource-one", label: "Resource", token: "@Resource" }],
+      mentions: [{ id: "mention-one", kind: "resource", reference: "resource-one", label: "Resource", token: "@Resource", discoveredRevision: "revision-one", resourceVersion: "5", runtimeGeneration: 2 }],
       deliveryMode: "followUp",
       extraDirectoryIds: ["extra-one"]
     };
@@ -130,6 +130,7 @@ describe("extension UI controller effects", () => {
 
     expect(saveDraft).toHaveBeenCalledWith("server-a", "session-a", {
       ...draft,
+      mentions: [],
       text: "replacement text"
     });
     expect(state.extensionNotifications[0]).toMatchObject({

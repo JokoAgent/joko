@@ -51,7 +51,7 @@ import {
 import { AsyncInputGate, deferred, type Deferred } from "./async-input-gate.js";
 import { claudeCodeError } from "./errors.js";
 import { SessionSdkFailure } from "./session-sdk-owner.js";
-import { prepareClaudePrompt, type ClaudeInputResolvers } from "./prompt-input.js";
+import { prepareClaudePrompt, type ClaudeInputResolvers, type PreparedClaudePrompt } from "./prompt-input.js";
 import {
   PartialMessageBuffer,
   ProjectionLimitError,
@@ -536,7 +536,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     this.#resolveSubagentModel = options.resolveSubagentModel;
     this.#inputResolvers = {
       ...(options.readBlob === undefined ? {} : { readBlob: options.readBlob }),
-      ...(options.resolveFile === undefined ? {} : { resolveFile: options.resolveFile })
+      ...(options.resolveFile === undefined ? {} : { resolveFile: options.resolveFile }),
+      ...(options.resolveArtifactMention === undefined ? {} : { resolveArtifactMention: options.resolveArtifactMention })
     };
     this.#now = options.now ?? Date.now;
     this.#projection = new SafeProjection([
@@ -1200,11 +1201,11 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     const preparation = new AbortController();
     const preparationSignal = AbortSignal.any([context.signal, preparation.signal]);
     runtime.inputPreparation = preparation;
-    let content: ClaudeSdkUserMessage["message"]["content"];
+    let prepared: PreparedClaudePrompt;
     let providerLease: ManagedProviderOperationLease | undefined;
     try {
       preparationSignal.throwIfAborted();
-      content = await waitFor(
+      prepared = await waitFor(
         prepareClaudePrompt(input, context, this.#inputResolvers, preparationSignal),
         this.#admissionTimeoutMs,
         preparationSignal,
@@ -1238,13 +1239,13 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       }
     } catch (error) {
       providerLease?.release();
+      preparation.abort();
       throw error;
     } finally {
       if (runtime.inputPreparation === preparation) runtime.inputPreparation = undefined;
-      preparation.abort();
     }
-    try { this.#requireIdleRuntime(context); }
-    catch (error) { providerLease?.release(); throw error; }
+    try { this.#requireIdleRuntime(context); prepared.assertCurrent(); }
+    catch (error) { providerLease?.release(); preparation.abort(); throw error; }
     const turn: ActiveTurn = {
       ...(providerLease === undefined ? {} : { providerLease }),
       context,
@@ -1278,10 +1279,13 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       parentGenerationReliable: true,
       parentStreamUsage: emptyUsage()
     };
+    // An unread input can lose its resource authority before admission starts.
+    // Runtime retirement must also settle the not-yet-awaited admission safely.
+    void turn.admission.promise.catch(() => undefined);
     runtime.activeTurn = turn;
     const nativeInput: ClaudeSdkUserMessage = {
       type: "user",
-      message: { role: "user", content },
+      message: { role: "user", content: prepared.content },
       parent_tool_use_id: null,
       origin: { kind: "human" },
       uuid: turn.userMessageUuid
@@ -1290,6 +1294,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       await waitFor(
         runtime.gate.offer(nativeInput, () => {
           turn.inputConsumed = true;
+        }, preparationSignal, () => {
+          prepared.assertCurrent();
+          this.#assertCurrent(runtime, context, context.binding);
+          if (!this.#isTurnCurrent(runtime, turn) || turn.stopping || turn.terminalClaimed) {
+            throw dispatchError("The native input authority ended before consumption.", false);
+          }
         }),
         this.#admissionTimeoutMs,
         context.signal,
@@ -1312,6 +1322,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
           : "The native prompt was not dispatched.",
         turn.inputConsumed
       );
+    } finally {
+      preparation.abort();
     }
   }
 
@@ -1351,7 +1363,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     runtime.inputPreparation = cancellation;
     try {
       signal.throwIfAborted();
-      const content = await waitFor(
+      const prepared = await waitFor(
         prepareClaudePrompt(input, context, this.#inputResolvers, signal), this.#admissionTimeoutMs, signal,
         () => claudeCodeError("INPUT_PREPARATION_TIMEOUT", "Same-turn input could not be prepared in time.", "input")
       );
@@ -1361,8 +1373,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         throw steerNotActive();
       }
       await waitFor(runtime.gate.offer({
-        type: "user", message: { role: "user", content }, parent_tool_use_id: null, origin: { kind: "human" }, uuid
-      }, () => { steer.consumed = true; }, signal), this.#admissionTimeoutMs, signal,
+        type: "user", message: { role: "user", content: prepared.content }, parent_tool_use_id: null, origin: { kind: "human" }, uuid
+      }, () => { steer.consumed = true; }, signal, () => {
+        prepared.assertCurrent();
+        this.#assertCurrent(runtime, context, context.binding);
+        if (!this.#isTurnCurrent(runtime, turn) || turn.stopping || turn.terminalClaimed || turn.awaitingNativeContinuation) throw steerNotActive();
+      }), this.#admissionTimeoutMs, signal,
       () => dispatchError("The native input stream did not consume the same-turn input in time.", false));
       await waitFor(steer.admission.promise, this.#admissionTimeoutMs, signal,
         () => dispatchError("Native same-turn input admission could not be confirmed.", true));
@@ -1486,12 +1502,17 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     return { kind: "replacement", binding: result.binding, nativeHistory: result.nativeHistory };
   }
 
-  async #deriveSession(context: AdapterContext, derivation: NativeSessionNavigation, entryId?: string, replacement = false): Promise<{
+  async #deriveSession(context: AdapterContext, derivation: NativeSessionDerivation | NativeSessionNavigation, entryId?: string, replacement = false): Promise<{
     readonly binding: NativeSessionBinding; readonly nativeHistory?: NativeHistoryProjection;
   }> {
     this.#assertUsable();
     const runtime = this.#requireIdleRuntime(context);
     const phase = replacement ? "session_navigation" : entryId === undefined ? "session_clone" : "session_fork";
+    const derivedTarget = "target" in derivation ? derivation.target : context.target;
+    if ("target" in derivation) {
+      assertClaudeDerivationTarget(context.target, derivedTarget);
+      await this.validateTarget(derivedTarget);
+    }
     this.#assertStandardRuntime(runtime, "derive native history");
     if (context.signal.aborted) throw claudeCodeError(entryId === undefined ? "NATIVE_SESSION_CLONE_CANCELLED" : "NATIVE_SESSION_FORK_CANCELLED", "The native Session copy was cancelled.", phase);
     if (runtime.nativeTasks.hasActiveTasks() || this.#runtime.ownsSessionFork(runtime.nativeSessionId)) {
@@ -1536,7 +1557,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       if (runtime.nativeTasks.hasActiveTasks()) throw claudeCodeError("SESSION_BUSY", "Native history still has an active writer.", phase);
       dispatched = true;
       const result = await this.#runtime.forkSession(runtime.nativeSessionId, {
-        dir: runtime.target.workspaceRoot,
+        dir: derivedTarget.workspaceRoot,
         ...(boundaryId === undefined ? {} : { upToMessageId: boundaryId }),
         signal,
         recordSessionId: (sessionId) => {
@@ -1553,14 +1574,14 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       signal.throwIfAborted();
       this.#assertCurrent(runtime, context, context.binding);
       if (registered === undefined || registered.nativeSessionId !== result.sessionId.toLowerCase()) throw new Error("Native Session copy lacks its receipt.");
-      const derivedInfo = await waitFor(this.#sessionInfo(result.sessionId, runtime.target, signal), this.#initializationTimeoutMs, signal,
+      const derivedInfo = await waitFor(this.#sessionInfo(result.sessionId, derivedTarget, signal), this.#initializationTimeoutMs, signal,
         () => new SessionSdkFailure("TIMEOUT", true));
       signal.throwIfAborted();
       this.#assertCurrent(runtime, context, context.binding);
       if (derivedInfo === undefined) throw continuityGap();
-      assertSessionInfo(derivedInfo, result.sessionId, runtime.target.workspaceRoot);
+      assertSessionInfo(derivedInfo, result.sessionId, derivedTarget.workspaceRoot);
       if (sourceHistory !== undefined && prefix !== undefined) {
-        const derivedHistory = await this.#readForkHistory(result.sessionId, runtime.target, signal);
+        const derivedHistory = await this.#readForkHistory(result.sessionId, derivedTarget, signal);
         const derivedMessages = derivedHistory.entries.filter((entry) => entry.type !== "system");
         const sourceIds = new Set(sourceHistory.map((entry) => entry.uuid));
         if (derivedHistory.entries.some((entry) => entry.child || sourceIds.has(entry.uuid))
@@ -2843,8 +2864,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
           description: header,
           required: true,
           kind: "text",
-          multiline: false,
-          sensitive: false
+          multiline: false
         });
       } else if (multi) {
         fields.push({
@@ -2855,7 +2875,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
           kind: "multiple",
           choices,
           defaultChoiceIds: [],
-          minimumSelections: 1
+          minimumSelections: 1,
+          allowOther: true
         });
       } else {
         fields.push({
@@ -2864,7 +2885,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
           description: header,
           required: true,
           kind: "single",
-          choices
+          choices,
+          allowOther: true
         });
       }
     }
@@ -2884,11 +2906,20 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       const original = originals[index];
       if (original === undefined) continue;
       const value = decision.answers[`q${index}`];
-      const selectedValues = Array.isArray(value) ? value : value === undefined ? [] : [value];
-      const labels = selectedValues.map((selected) => {
-        const text = String(selected);
-        return original.choices.get(text) ?? text;
-      });
+      const labels = value === undefined
+        ? []
+        : value.kind === "text"
+          ? [value.value]
+          : value.kind === "boolean"
+            ? [String(value.value)]
+            : value.kind === "single"
+              ? value.selection.kind === "choice"
+                ? [original.choices.get(value.selection.choiceId) ?? value.selection.choiceId]
+                : [value.selection.text]
+              : [
+                  ...value.choiceIds.map((choiceId) => original.choices.get(choiceId) ?? choiceId),
+                  ...(value.otherText === undefined ? [] : [value.otherText])
+                ];
       answers[original.question] = original.multi ? labels.join(", ") : (labels[0] ?? "");
     }
     return { behavior: "allow", updatedInput: { ...input, answers } };
@@ -3831,6 +3862,7 @@ function capabilityManifest(
     "session.resume",
     "session.clone",
     "session.fork",
+    "workspace.derive",
     "session.rewind",
     "session.detach",
     "session.discovery",
@@ -3882,7 +3914,7 @@ function capabilityManifest(
       : key === "workspace.extra_dirs"
         ? ["read_write"]
         : key === "input.mention"
-          ? ["workspace_file", "workspace_directory", "workspace_line_range"]
+          ? ["workspace_file", "workspace_directory", "workspace_line_range", ...(inputResolvers.resolveArtifactMention === undefined ? [] : ["artifact"])]
         : undefined;
     return [key, {
       key,
@@ -4232,6 +4264,22 @@ function assertSameTarget(left: TargetDescriptor, right: TargetDescriptor): void
     throw claudeCodeError("TARGET_CONTEXT_MISMATCH", "The creation input and Adapter context identify different Targets.", "target", {
       recovery: "Refresh the Target and retry Session creation."
     });
+  }
+}
+
+function assertClaudeDerivationTarget(source: TargetDescriptor, derived: TargetDescriptor): void {
+  if (source.id !== derived.id
+    || source.backendId !== derived.backendId
+    || source.managed !== derived.managed
+    || source.trusted !== derived.trusted
+    || source.remoteWorkspace?.hostId !== derived.remoteWorkspace?.hostId
+    || source.remoteWorkspace?.workspaceRoot !== derived.remoteWorkspace?.workspaceRoot) {
+    throw claudeCodeError(
+      "SESSION_DERIVATION_TARGET_MISMATCH",
+      "The derived workspace does not preserve the source Target identity.",
+      "target",
+      { recovery: "Retry through the owning Session and its derived workspace lease." }
+    );
   }
 }
 

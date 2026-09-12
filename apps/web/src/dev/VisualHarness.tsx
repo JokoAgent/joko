@@ -15,6 +15,7 @@ import {
 } from "../local-state.js";
 import { withAppShortcutOverride } from "../app-shortcuts.js";
 import type { NavigationLayout } from "../navigation-layout.js";
+import { SIDEBAR_DIALOGUE_FILTER_ID, withSidebarDisplayPreferences, withSidebarOwnerLayout } from "../sidebar-layout.js";
 import { emptySnapshot } from "../model.js";
 import { workspaceFilesHash } from "../workspace-files-navigation.js";
 import type {
@@ -68,6 +69,10 @@ const VISUAL_SUBAGENT_SESSION_ID = "session-1";
 const VISUAL_SUBAGENT_ROOT_ID = "visual-subagent-orchestrator";
 const VISUAL_SUBAGENT_LIST_PAGE_SIZE = 2;
 const VISUAL_SUBAGENT_TRANSCRIPT_PAGE_SIZE = 3;
+const VISUAL_ARTIFACT_OUTPUTS = [
+  { id: "visual-artifact-one", description: "Original report", text: "First report.\n" },
+  { id: "visual-artifact-two", description: "Revised report", text: "Second report.\n" }
+] as const;
 
 /**
  * Credential-free, memory-only visual QA surface. `main.tsx` imports this
@@ -75,7 +80,7 @@ const VISUAL_SUBAGENT_TRANSCRIPT_PAGE_SIZE = 3;
  */
 export function VisualHarness(): JSX.Element {
   const scenario = useMemo(() => harnessParameters(), []);
-  const files = useMemo(() => new VisualWorkspaceFiles(), []);
+  const files = useMemo(() => new VisualWorkspaceFiles(scenario.artifact), []);
   const artifactActions = useMemo(() => ({
     getArtifactUrl: async (blobId: string): Promise<string> => files.acquireArtifactUrl(blobId),
     releaseArtifactUrl: (blobId: string): void => files.releaseArtifactUrl(blobId)
@@ -233,6 +238,14 @@ export function VisualHarness(): JSX.Element {
       saveCredential: scenario.scenario === "providers" ? providerActions.saveCredential : remoteHosts.saveCredential,
       saveProvider: providerActions.saveProvider,
       updateTarget: remoteHosts.updateTarget,
+      archiveTarget: async (targetId: string, archived: boolean): Promise<void> => {
+        if (!state.snapshot.targets.some((target) => target.id === targetId)) throw new Error("The visual project does not exist.");
+        updateSnapshot((snapshot) => ({ ...snapshot, revision: snapshot.revision + 1n,
+          targets: snapshot.targets.map((target) => target.id === targetId
+            ? { ...target, archived, revision: target.revision + 1n } : target)
+        }));
+        record(`project-archive:${targetId}:${String(archived)}`);
+      },
       getTerminalCapabilities: terminals.getTerminalCapabilities,
       getUsageReport: usageHistory.getUsageReport,
       listTerminals: terminals.listTerminals,
@@ -418,6 +431,18 @@ export function VisualHarness(): JSX.Element {
       },
       setMessageSearchSort: async (messageSearchSort: ControllerState["preferences"]["messageSearchSort"]): Promise<void> => {
         setState((current) => ({ ...current, preferences: { ...current.preferences, messageSearchSort } }));
+      },
+      setSidebarDisplayPreferences: async (patch): Promise<void> => {
+        setState((current) => ({ ...current, preferences: { ...current.preferences,
+          sidebarDisplayPreferences: withSidebarDisplayPreferences(current.preferences.sidebarDisplayPreferences, patch)
+        } }));
+      },
+      setSidebarOwnerLayout: async (patch): Promise<void> => {
+        const ownerId = state.activeProfile?.serverId;
+        if (ownerId === undefined) throw new Error("The visual Orchestrator owner is unavailable.");
+        setState((current) => ({ ...current, preferences: { ...current.preferences,
+          sidebarOwnerLayouts: withSidebarOwnerLayout(current.preferences.sidebarOwnerLayouts, ownerId, patch)
+        } }));
       },
       setMessageNavRailEnabled: async (messageNavRailEnabled: boolean): Promise<void> => {
         record(`message-nav-rail:${messageNavRailEnabled ? "on" : "off"}`);
@@ -751,7 +776,8 @@ export function VisualHarness(): JSX.Element {
         if (state.snapshot.sessions.find(session => session.id === sessionId)?.generation !== admission.expectedGeneration) {
           throw new Error("The source task generation has changed.");
         }
-        record(`send:${sessionId}:${draft.deliveryMode}`);
+        record(`send:${sessionId}:${draft.deliveryMode}${scenario.artifact
+          ? `:artifacts:${JSON.stringify(draft.mentions.filter((mention) => mention.kind === "artifact").map((mention) => mention.reference))}` : ""}`);
         updateSnapshot((snapshot) => {
           const current = snapshot.timelineBySession.get(sessionId) ?? [];
           const timelineBySession = new Map(snapshot.timelineBySession);
@@ -1274,8 +1300,19 @@ export function VisualHarness(): JSX.Element {
       },
       renameSession: async (sessionId: string, name: string): Promise<void> => updateSession(sessionId, (session) => ({ ...session, name })),
       pinSession: async (sessionId: string, pinned: boolean): Promise<void> => updateSession(sessionId, (session) => ({ ...session, pinned })),
-      archiveSession: async (sessionId: string, archived: boolean): Promise<void> => updateSession(sessionId, (session) => ({ ...session, archived })),
-      deleteSession: async (sessionId: string): Promise<void> => updateSnapshot((snapshot) => ({ ...snapshot, sessions: snapshot.sessions.filter((session) => session.id !== sessionId) })),
+      archiveSession: async (sessionId: string, archived: boolean): Promise<void> => {
+        record(`archive:${sessionId}:${String(archived)}`);
+        updateSession(sessionId, (session) => ({ ...session, archived }));
+      },
+      getSessionWorktreeRemovalPreview: async (sessionId: string) => {
+        record(`worktree-removal-preview:${sessionId}:${scenario.worktreeRemoval}`);
+        if (scenario.worktreeRemoval === "unknown") throw new Error("The visual workspace state is unavailable.");
+        return { hasWorktree: true, dirty: scenario.worktreeRemoval === "dirty" };
+      },
+      deleteSession: async (sessionId: string): Promise<void> => {
+        record(`delete:${sessionId}`);
+        updateSnapshot((snapshot) => ({ ...snapshot, sessions: snapshot.sessions.filter((session) => session.id !== sessionId) }));
+      },
       abort: async (runId: string): Promise<void> => {
         record(`abort:${runId}`);
         updateSnapshot((snapshot) => ({ ...snapshot, sessions: snapshot.sessions.map((session) => session.activeRunId === runId ? { ...session, state: "idle" as const, activeRunId: undefined } : session) }));
@@ -1284,12 +1321,12 @@ export function VisualHarness(): JSX.Element {
       cancelQueueItem: async (queueItemId: string): Promise<void> => { record(`queue-cancel:${queueItemId}`); },
       setQueueItemEditLock: async (queueItemId: string, _lockToken: string, locked: boolean): Promise<void> => { record(`queue-edit-lock:${queueItemId}:${String(locked)}`); },
       setQueueInteractionLock: async (sessionId: string, _lockToken: string, locked: boolean): Promise<void> => { record(`queue-interaction-lock:${sessionId}:${String(locked)}`); },
-      editQueueItem: async (queueItemId, text, mode): Promise<void> => {
+      editQueueItem: async (queueItemId, edit, mode): Promise<void> => {
         record(`queue-edit:${queueItemId}`);
         updateSnapshot((snapshot) => ({
           ...snapshot,
           queue: snapshot.queue.map((item) => item.id === queueItemId
-            ? { ...item, text, mode, revision: item.revision + 1n }
+            ? { ...item, text: edit.text, quotesEncoded: false, pastedTextRanges: edit.pastedTextRanges, mentionRanges: edit.mentionRanges, mode, revision: item.revision + 1n }
             : item)
         }));
       },
@@ -1380,6 +1417,38 @@ export function VisualHarness(): JSX.Element {
       },
       getArtifactUrl: artifactActions.getArtifactUrl,
       releaseArtifactUrl: artifactActions.releaseArtifactUrl,
+      listSessionArtifacts: async (sessionId: string, signal?: AbortSignal): Promise<readonly ArtifactView[]> => {
+        signal?.throwIfAborted();
+        if (!scenario.artifact || sessionId !== "session-1") return [];
+        return VISUAL_ARTIFACT_OUTPUTS.map((output) => ({
+          id: output.id,
+          blobId: output.id,
+          kind: "file",
+          title: "report.txt",
+          fileName: "report.txt",
+          description: output.description,
+          mediaType: "text/plain",
+          byteSize: utf8Length(output.text)
+        }));
+      },
+      readSessionArtifact: async (sessionId: string, artifactId: string, signal: AbortSignal): Promise<ArtifactView> => {
+        signal.throwIfAborted();
+        const output = sessionId === "session-1"
+          ? VISUAL_ARTIFACT_OUTPUTS.find((candidate) => candidate.id === artifactId)
+          : undefined;
+        if (output === undefined) throw new Error("The visual Artifact reference is unavailable.");
+        record(`artifact-reference-read:${sessionId}:${artifactId}`);
+        return {
+          id: output.id,
+          blobId: output.id,
+          kind: "file",
+          title: "report.txt",
+          fileName: "report.txt",
+          description: output.description,
+          mediaType: "text/plain",
+          byteSize: utf8Length(output.text)
+        };
+      },
       downloadArtifact: async (blobId, name, context) => { context.signal.throwIfAborted(); record(`artifact-download:${blobId}:${name}`); return "dispatched"; },
       listSubagentRuns: async (
         sessionId: string,
@@ -2004,10 +2073,14 @@ interface VisualFileRecord {
  */
 class VisualWorkspaceFiles {
   readonly #entries = new Map<string, VisualFileRecord>();
+  readonly #standaloneArtifacts = new Map<string, { readonly bytes: Uint8Array; readonly mediaType: string }>();
   readonly #artifactUrls = new Map<string, { readonly url: string; refs: number }>();
   #sequence = 1;
 
-  constructor() {
+  constructor(includeMentionArtifacts = false) {
+    if (includeMentionArtifacts) for (const output of VISUAL_ARTIFACT_OUTPUTS) {
+      this.#standaloneArtifacts.set(output.id, { bytes: new TextEncoder().encode(output.text), mediaType: "text/plain" });
+    }
     this.#seedFile("README.md", "# Sample workspace\n\nThis project demonstrates the Files route with a tree, document, and task rail visible together.\n", "text/markdown");
     this.#seedDirectory("guides");
     this.#seedFile("guides/STYLE_GUIDE.md", "# Style guide\n\nUse restrained surfaces, compact geometry, and one clear accent.\n", "text/markdown");
@@ -2129,7 +2202,7 @@ class VisualWorkspaceFiles {
       retained.refs += 1;
       return retained.url;
     }
-    const record = [...this.#entries.values()].find((candidate) => candidate.blobId === blobId);
+    const record = this.#standaloneArtifacts.get(blobId) ?? [...this.#entries.values()].find((candidate) => candidate.blobId === blobId);
     if (record?.bytes === undefined) throw new Error("The visual artifact does not exist.");
     const copy = new Uint8Array(record.bytes.byteLength);
     copy.set(record.bytes);
@@ -2500,6 +2573,8 @@ interface HarnessParameters {
   readonly theme: Theme;
   readonly richCopy: boolean;
   readonly markdown: boolean;
+  readonly project: boolean;
+  readonly artifact: boolean;
   readonly running: boolean;
   readonly queue: boolean;
   readonly queueLock: "none" | "edit" | "interaction";
@@ -2508,6 +2583,7 @@ interface HarnessParameters {
   readonly composerSendShortcut: ComposerSendShortcutPreference;
   readonly computerUpdate: "none" | "available" | "downloading" | "installing";
   readonly computerPlatform: "win32" | "darwin";
+  readonly worktreeRemoval: "clean" | "dirty" | "unknown";
 }
 
 function harnessParameters(): HarnessParameters {
@@ -2539,6 +2615,8 @@ function harnessParameters(): HarnessParameters {
     usageState: query.get("usageState") === "empty" ? "empty" : query.get("usageState") === "error" ? "error" : "ready",
     richCopy: query.get("richCopy") === "1",
     markdown: query.get("markdown") === "1",
+    project: query.get("project") === "1",
+    artifact: query.get("artifact") === "1",
     running: query.get("running") === "1",
     queue: query.get("queue") === "1",
     queueLock: query.get("queueLock") === "edit"
@@ -2554,7 +2632,10 @@ function harnessParameters(): HarnessParameters {
     computerUpdate: updateValue === "available" || updateValue === "downloading" || updateValue === "installing"
       ? updateValue
       : "none",
-    computerPlatform: query.get("platform") === "darwin" ? "darwin" : "win32"
+    computerPlatform: query.get("platform") === "darwin" ? "darwin" : "win32",
+    worktreeRemoval: query.get("worktree") === "dirty"
+      ? "dirty"
+      : query.get("worktree") === "unknown" ? "unknown" : "clean"
   };
 }
 
@@ -2631,6 +2712,9 @@ function initialControllerState(parameters: HarnessParameters, files: VisualWork
       navigationOpen: true,
       navigationMode: "expanded",
       navigationWidth: 260,
+      ...(parameters.project ? { sidebarOwnerLayouts: withSidebarOwnerLayout({}, activeProfile.serverId, {
+        projectFilter: ["visual-target", SIDEBAR_DIALOGUE_FILTER_ID]
+      }) } : {}),
       composerSendShortcut: parameters.composerSendShortcut,
       messageSearchSort: "relevance"
     },
@@ -2699,6 +2783,10 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
     ["workspace.files", capability("workspace.files")],
     ["workspace.files.write", capability("workspace.files.write")]
   ]);
+  if (parameters.artifact) {
+    capabilities.set("input.text", capability("input.text"));
+    capabilities.set("input.mention", capability("input.mention", ["artifact"]));
+  }
   const providerConfiguration: AppSnapshot["settings"]["providers"][number] = {
     id: "api",
     name: "api",
@@ -2815,6 +2903,7 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
     id: `session-${index + 1}`,
     backendId: "visual-backend",
     targetId: "visual-target",
+    ...(parameters.project && index < 3 ? { projectId: "visual-target" } : {}),
     name: parameters.scenario === "files"
       ? filesSessionNames[index] ?? `Deterministic task ${index + 1}`
       : index === 0 ? "End-to-end visual verification" : `Deterministic task ${index + 1}`,
@@ -2839,7 +2928,16 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
   }));
   const timelineBySession = new Map(base.timelineBySession);
   timelineBySession.set("session-1", [
-    { id: "message-1", sequence: 1n, kind: "user", createdAt: FIXED_NOW - 4_000, text: "Inspect the coding interface across runtime, interaction, and recovery surfaces.", ...(parameters.scenario === "files" ? { attachments: [visualAudioArtifact()] } : {}) },
+    { id: "message-1", sequence: 1n, kind: "user", createdAt: FIXED_NOW - 4_000,
+      text: parameters.artifact
+        ? "Plain @report.txt; open @report.txt."
+        : "Inspect the coding interface across runtime, interaction, and recovery surfaces.",
+      ...(parameters.artifact ? {
+        userInputAccepted: true as const,
+        inputMentions: [{ kind: "artifact" as const, artifactId: "visual-artifact-two", displayText: "@report.txt" }],
+        mentionRanges: [{ start: 24, end: 35, mentionIndex: 0 }]
+      } : {}),
+      ...(parameters.scenario === "files" ? { attachments: [visualAudioArtifact()] } : {}) },
     { id: "message-2", sequence: 2n, kind: "assistant", createdAt: FIXED_NOW - 2_000, text: parameters.richCopy ? [
       "### Copy and annotate",
       "",
@@ -2973,6 +3071,14 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
         revision: 2n
       }
     }] : [])
+  ]);
+  if (parameters.artifact) timelineBySession.set("session-1", [
+    ...(timelineBySession.get("session-1") ?? []),
+    ...VISUAL_ARTIFACT_OUTPUTS.map((output, index) => ({
+      id: `output-${output.id}`, sequence: BigInt(90 + index), kind: "artifact" as const, createdAt: FIXED_NOW - 1_000 + index,
+      artifact: { id: output.id, blobId: output.id, kind: "file" as const, title: "report.txt", fileName: "report.txt",
+        description: output.description, mediaType: "text/plain", byteSize: utf8Length(output.text) }
+    }))
   ]);
   const interactions = parameters.scenario === "session"
     || parameters.scenario === "background"
@@ -3260,7 +3366,7 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
       transfers: [],
       revision: 0n
     }] : [],
-    targets: [{ id: "visual-target", backendId: "visual-backend", name: "Joko workspace", workspaceId: "visual-workspace", revision: 1n, workspaceName: "Joko workspace", trusted: true, pinned: true, archived: false }],
+    targets: [{ id: "visual-target", backendId: "visual-backend", name: "Joko workspace", workspaceId: "visual-workspace", revision: 1n, workspaceName: "Joko workspace", trusted: true, pinned: !parameters.project, archived: false }],
     sessions,
     schedules: parameters.scenario === "scheduler" ? visualSchedulerSchedules() : [],
     timelineBySession,
@@ -3287,7 +3393,7 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
       { id: "ui-audit", sessionId: "session-1", state: "completed" },
       { id: "provider-check", sessionId: "session-1", state: "failed" }
     ] : [],
-    queue: parameters.queue ? [{ id: "visual-queue", sessionId: "session-1", revision: 1n, generation: 1n, source: parameters.queueSource, mode: "followUp", text: "Queued visual follow-up", state: "queued", editLocked: parameters.queueLock === "edit", ordinal: 1, createdAt: FIXED_NOW }] : [],
+    queue: parameters.queue ? [{ id: "visual-queue", sessionId: "session-1", revision: 1n, generation: 1n, source: parameters.queueSource, mode: "followUp", text: "Queued visual follow-up", state: "accepted", editLocked: parameters.queueLock === "edit", ordinal: 1, createdAt: FIXED_NOW }] : [],
     queueControls: parameters.queue ? [{ sessionId: "session-1", revision: 1n, generation: 1n, state: "active", interactionLocked: parameters.queueLock === "interaction", queuedItemCount: 1 }] : [],
     interactions,
     devices: parameters.scenario === "connections"
@@ -3607,13 +3713,13 @@ function questionInteraction(long: boolean): InteractionView {
       kind: "single",
       options: longOptions,
       multiline: false,
-      sensitive: false,
-      minimumSelections: 0
+      minimumSelections: 0,
+      allowOther: true
     }] : [
-      { id: "summary", label: "Audit summary", description: "Required before continuing.", required: true, kind: "text", options: [], placeholder: "Type a deterministic answer", multiline: true, sensitive: false, minimumSelections: 0 },
-      { id: "density", label: "Navigation density", required: true, kind: "single", options: [{ id: "compact", label: "Compact", description: "Use 32px rows." }, { id: "comfortable", label: "Comfortable" }], multiline: false, sensitive: false, minimumSelections: 0 },
-      { id: "evidence", label: "Evidence to retain", required: true, kind: "multiple", options: [{ id: "geometry", label: "Geometry" }, { id: "keyboard", label: "Keyboard" }, { id: "motion", label: "Motion" }], multiline: false, sensitive: false, minimumSelections: 1, maximumSelections: 2 },
-      { id: "approved", label: "Approve the result?", required: true, kind: "boolean", options: [], multiline: false, sensitive: false, minimumSelections: 0 }
+      { id: "summary", label: "Audit summary", description: "Required before continuing.", required: true, kind: "text", options: [], placeholder: "Type a deterministic answer", multiline: true, minimumSelections: 0, allowOther: false },
+      { id: "density", label: "Navigation density", required: true, kind: "single", options: [{ id: "compact", label: "Compact", description: "Use 32px rows." }, { id: "comfortable", label: "Comfortable" }], multiline: false, minimumSelections: 0, allowOther: true },
+      { id: "evidence", label: "Evidence to retain", required: true, kind: "multiple", options: [{ id: "geometry", label: "Geometry" }, { id: "keyboard", label: "Keyboard" }, { id: "motion", label: "Motion" }], multiline: false, minimumSelections: 1, maximumSelections: 2, allowOther: true },
+      { id: "approved", label: "Approve the result?", required: true, kind: "boolean", options: [], multiline: false, minimumSelections: 0, allowOther: false }
     ],
     planSteps: [],
     createdAt: FIXED_NOW

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { BlobRef, PromptInput } from "@joko/core";
 import type { PersistedEvent } from "@joko/store";
 import {
   MAXIMUM_PORTABLE_SESSION_MESSAGES,
@@ -18,6 +19,22 @@ const sourceBlob = {
   byteLength: 3,
   mimeType: "image/png",
   fileName: "image.png"
+} as const;
+
+const sourceFile = {
+  id: "source-file",
+  sha256: "b".repeat(64),
+  byteLength: 5,
+  mimeType: "text/plain",
+  fileName: "notes.txt"
+} as const;
+
+const sourceArtifact = {
+  id: "source-artifact",
+  sha256: "c".repeat(64),
+  byteLength: 8,
+  mimeType: "application/pdf",
+  fileName: "report.pdf"
 } as const;
 
 function event(overrides: Partial<PersistedEvent> = {}): PersistedEvent {
@@ -44,6 +61,61 @@ function event(overrides: Partial<PersistedEvent> = {}): PersistedEvent {
   };
 }
 
+function acceptedInput(): PromptInput {
+  const text = "A😀pasteZ @workspace @resource @artifact @artifact @orphan";
+  const occurrence = (value: string, from = 0) => {
+    const start = text.indexOf(value, from);
+    return { start, end: start + value.length };
+  };
+  const workspace = occurrence("@workspace");
+  const resource = occurrence("@resource");
+  const firstArtifact = occurrence("@artifact");
+  const secondArtifact = occurrence("@artifact", firstArtifact.end);
+  const orphan = occurrence("@orphan");
+  return {
+    text,
+    images: [{ blob: sourceBlob, alt: "Input preview" }],
+    files: [{ blob: sourceFile, workspacePath: "notes.txt" }],
+    mentions: [
+      {
+        kind: "workspace_file",
+        workspaceId: "source-workspace",
+        label: "workspace",
+        reference: "src/main.ts",
+        lineRange: { startLine: 2, endLine: 5 }
+      },
+      { kind: "resource", label: "resource", reference: "resource-one", discoveredRevision: "revision-one", resourceVersion: "7", runtimeGeneration: 3 },
+      { kind: "artifact", label: "artifact", reference: sourceArtifact.id },
+      { kind: "artifact", label: "orphan", reference: "unrepresented-artifact" }
+    ],
+    disposition: "steer",
+    quotesEncoded: true,
+    pastedTextRanges: [{ start: 3, end: 8, display: "Pasted text (1 line)" }],
+    mentionRanges: [
+      { ...workspace, mentionIndex: 0 },
+      { ...resource, mentionIndex: 1 },
+      { ...firstArtifact, mentionIndex: 2 },
+      { ...secondArtifact, mentionIndex: 2 },
+      { ...orphan, mentionIndex: 3 }
+    ]
+  };
+}
+
+function acceptedEvent(): PersistedEvent {
+  return event({
+    payload: {
+      type: "message_complete",
+      role: "user",
+      blocks: [
+        { kind: "text", text: "native expanded input" },
+        { kind: "artifact", blob: sourceArtifact, label: "Report" }
+      ],
+      acceptedInput: acceptedInput(),
+      inputDelivery: "steer"
+    }
+  });
+}
+
 describe("portable Session message projection", () => {
   it("retains source order across simultaneous messages, Artifacts and missing-media markers", () => {
     const artifact = event({ payload: { type: "artifact", artifact: sourceBlob, purpose: "preview" } });
@@ -58,6 +130,30 @@ describe("portable Session message projection", () => {
         messages: [{ ...restored.messages[0], sourceOrder }]
       })))).toThrowError(PortableSessionProjectionError);
     }
+  });
+
+  it("keeps visible text while stripping historical-task authority from a portable projection", () => {
+    const text = "Use @Earlier";
+    const projected = projectPortableSessionMessages([event({
+      payload: {
+        type: "message_complete",
+        role: "user",
+        blocks: [{ kind: "text", text }],
+        acceptedInput: {
+          text, images: [], files: [], disposition: "prompt",
+          mentions: [{ kind: "session", label: "Earlier", reference: "source-task" }],
+          mentionRanges: [{ start: 4, end: 12, mentionIndex: 0 }],
+          sessionReferenceSnapshots: [{
+            mentionIndex: 0, sessionId: "source-task", throughCursor: "7", sourceGeneration: 1,
+            historyBindingFingerprint: `sha256:${"a".repeat(64)}`
+          }]
+        }
+      }
+    })]);
+    expect(projected.messages[0]?.acceptedInput).toEqual({
+      text, images: [], files: [], disposition: "prompt", mentions: [], mentionRanges: []
+    });
+    expect(() => encodePortableSessionProjection(projected)).not.toThrow();
   });
 
   it("accepts exactly the format message limit and rejects the 100001st message", { timeout: 20_000 }, () => {
@@ -80,30 +176,52 @@ describe("portable Session message projection", () => {
     }]);
   });
 
-  it("round-trips ordered pasted-text UTF-16 ranges and rejects unsafe metadata", () => {
-    const source = event({
-      payload: {
-        type: "message_complete",
-        role: "user",
-        blocks: [{ kind: "text", text: "A😀pasteZ" }],
-        pastedTextRanges: [{ start: 3, end: 8, display: "Pasted text (1 line)" }]
-      }
-    });
+  it("round-trips the complete accepted input and rejects legacy top-level rendering metadata", () => {
+    const source = acceptedEvent();
     const projection = projectPortableSessionMessages([source]);
     expect(decodePortableSessionProjection(encodePortableSessionProjection(projection))).toEqual(projection);
     expect(portableProjectionEventPayloads(projection)[0]?.payload).toEqual(source.payload);
 
-    expect(() => decodePortableSessionProjection(Buffer.from(JSON.stringify({
+    for (const legacy of [
+      { quotesEncoded: true },
+      { pastedTextRanges: [{ start: 3, end: 8, display: "legacy" }] }
+    ]) {
+      expect(() => decodePortableSessionProjection(Buffer.from(JSON.stringify({
+        ...projection,
+        messages: [{ ...projection.messages[0], ...legacy }]
+      })))).toThrowError(PortableSessionProjectionError);
+    }
+  });
+
+  it("strictly validates every accepted-input part, workspace identity and UTF-16 range", () => {
+    const projection = projectPortableSessionMessages([acceptedEvent()]);
+    const input = projection.messages[0]!.acceptedInput!;
+    const rejects = (candidate: unknown) => expect(() => decodePortableSessionProjection(Buffer.from(JSON.stringify({
       ...projection,
-      messages: [{ ...projection.messages[0], pastedTextRanges: [{ start: 1, end: 2, display: "split" }] }]
+      messages: [{ ...projection.messages[0], acceptedInput: candidate }]
     })))).toThrowError(PortableSessionProjectionError);
-    expect(() => decodePortableSessionProjection(Buffer.from(JSON.stringify({
-      ...projection,
-      messages: [{ ...projection.messages[0], pastedTextRanges: [
-        { start: 3, end: 8, display: "later" },
-        { start: 0, end: 1, display: "earlier" }
-      ] }]
-    })))).toThrowError(PortableSessionProjectionError);
+
+    const { files: _files, ...missingRequiredPart } = input;
+    rejects(missingRequiredPart);
+    rejects({ ...input, unexpected: true });
+    rejects({ ...input, images: [{ ...input.images[0], unexpected: true }] });
+    rejects({ ...input, files: [{ ...input.files[0], workspacePath: 42 }] });
+    rejects({ ...input, mentions: [{ kind: "workspace_file", label: "source", reference: "src/main.ts" }] });
+    rejects({ ...input, mentions: [{ kind: "resource", label: "resource", reference: "resource-one" }] });
+    rejects({ ...input, mentions: [{
+      kind: "workspace_directory", workspaceId: "source-workspace", label: "source", reference: "src",
+      lineRange: { startLine: 1, endLine: 2 }
+    }] });
+    rejects({ ...input, mentions: [{
+      kind: "workspace_file", workspaceId: "source-workspace", label: "source", reference: "src/main.ts",
+      lineRange: { startLine: 0, endLine: 2 }
+    }] });
+    rejects({ ...input, mentionRanges: [{ start: 1, end: 2, mentionIndex: 0 }] });
+    rejects({ ...input, mentionRanges: [{ start: 10, end: 20, mentionIndex: 99 }] });
+    rejects({ ...input, pastedTextRanges: [
+      { start: 3, end: 8, display: "later" },
+      { start: 0, end: 1, display: "earlier" }
+    ] });
   });
 
   it("preserves per-message usage and rejects malformed accounting", () => {
@@ -151,25 +269,105 @@ describe("portable Session message projection", () => {
     expect(decodePortableSessionProjection(encodePortableSessionProjection(unreliable))).toEqual(unreliable);
   });
 
-  it("collects and rebinds media without accepting an identity mismatch", () => {
-    const projection = projectPortableSessionMessages([event()]);
-    expect([...collectPortableProjectionBlobRefs(projection)]).toEqual([[sourceBlob.id, sourceBlob]]);
+  it("collects and rebinds accepted attachments while retiring source-only authority", () => {
+    const projection = projectPortableSessionMessages([acceptedEvent()]);
+    expect([...collectPortableProjectionBlobRefs(projection)]).toEqual([
+      [sourceBlob.id, sourceBlob],
+      [sourceFile.id, sourceFile],
+      [sourceArtifact.id, sourceArtifact]
+    ]);
     const receivedBlob = { ...sourceBlob, id: "received-blob" };
-    const rebound = rebindPortableProjectionBlobs(projection, new Map([[sourceBlob.id, receivedBlob]]));
-    expect(rebound.messages[0]?.blocks[1]).toEqual({ kind: "image", blob: receivedBlob, alt: "preview" });
-    expect(() => rebindPortableProjectionBlobs(projection, new Map([
-      [sourceBlob.id, { ...receivedBlob, sha256: "b".repeat(64) }]
+    const receivedFile = { ...sourceFile, id: "received-file" };
+    const receivedArtifact = { ...sourceArtifact, id: "received-artifact" };
+    const rebound = rebindPortableProjectionBlobs(projection, new Map<string, BlobRef>([
+      [sourceBlob.id, receivedBlob],
+      [sourceFile.id, receivedFile],
+      [sourceArtifact.id, receivedArtifact],
+      ["unrepresented-artifact", { ...receivedArtifact, id: "must-not-be-guessed" }]
+    ]));
+    expect(rebound.messages[0]?.blocks[1]).toEqual({ kind: "artifact", blob: receivedArtifact, label: "Report" });
+    expect(rebound.messages[0]?.acceptedInput).toMatchObject({
+      text: acceptedInput().text,
+      images: [{ blob: receivedBlob, alt: "Input preview" }],
+      files: [{ blob: receivedFile }],
+      mentions: [{ kind: "artifact", label: "artifact", reference: receivedArtifact.id }]
+    });
+    expect(rebound.messages[0]?.acceptedInput?.files[0]).not.toHaveProperty("workspacePath");
+    expect(rebound.messages[0]?.acceptedInput?.mentionRanges).toEqual([
+      { start: acceptedInput().text.indexOf("@artifact"), end: acceptedInput().text.indexOf("@artifact") + 9, mentionIndex: 0 },
+      {
+        start: acceptedInput().text.indexOf("@artifact", acceptedInput().text.indexOf("@artifact") + 9),
+        end: acceptedInput().text.indexOf("@artifact", acceptedInput().text.indexOf("@artifact") + 9) + 9,
+        mentionIndex: 0
+      }
+    ]);
+    expect(() => rebindPortableProjectionBlobs(projection, new Map<string, BlobRef>([
+      [sourceBlob.id, { ...receivedBlob, sha256: "d".repeat(64) }],
+      [sourceFile.id, receivedFile],
+      [sourceArtifact.id, receivedArtifact]
     ]))).toThrowError(PortableSessionProjectionError);
   });
 
-  it("keeps messages when media is excluded or unavailable", () => {
-    const projection = projectPortableSessionMessages([event()]);
-    const filtered = omitUnavailablePortableProjectionBlobs(projection, new Set());
+  it("rejects service-owned continuation identity in decoded portable input", () => {
+    const projection = projectPortableSessionMessages([acceptedEvent()]);
+    const message = projection.messages[0]!;
+    expect(() => decodePortableSessionProjection(Buffer.from(JSON.stringify({
+      ...projection,
+      messages: [{
+        ...message,
+        acceptedInput: {
+          ...message.acceptedInput,
+          automaticContinuation: {
+            recoveryId: "recovery",
+            sourceRunId: "run",
+            attempt: 1,
+            maximumAttempts: 1,
+            sessionTotal: 1
+          }
+        }
+      }]
+    })))).toThrowError(PortableSessionProjectionError);
+  });
+
+  it("keeps messages and text while omitting unavailable attachments and unproven Artifact mentions", () => {
+    const projection = projectPortableSessionMessages([acceptedEvent()]);
+    const filtered = omitUnavailablePortableProjectionBlobs(projection, new Set([
+      sourceFile.id,
+      sourceArtifact.id,
+      "unrepresented-artifact"
+    ]));
     expect(filtered.messages[0]?.blocks).toEqual([
-      { kind: "text", text: "hello" },
-      { kind: "text", text: "[Unavailable attachment: preview]" }
+      { kind: "text", text: "native expanded input" },
+      { kind: "artifact", blob: sourceArtifact, label: "Report" }
     ]);
-    expect(collectPortableProjectionBlobRefs(filtered).size).toBe(0);
+    expect(filtered.messages[0]?.acceptedInput).toMatchObject({
+      text: acceptedInput().text,
+      images: [],
+      files: [{ blob: sourceFile, workspacePath: "notes.txt" }],
+      mentions: [
+        { kind: "workspace_file", workspaceId: "source-workspace", label: "workspace", reference: "src/main.ts" },
+        { kind: "resource", label: "resource", reference: "resource-one", discoveredRevision: "revision-one", resourceVersion: "7", runtimeGeneration: 3 },
+        { kind: "artifact", label: "artifact", reference: sourceArtifact.id }
+      ]
+    });
+    expect(filtered.messages[0]?.acceptedInput?.mentionRanges?.map((range) => range.mentionIndex)).toEqual([0, 1, 2, 2]);
+    expect([...collectPortableProjectionBlobRefs(filtered).keys()]).toEqual([sourceFile.id, sourceArtifact.id]);
+
+    const withoutMedia = omitUnavailablePortableProjectionBlobs(projection, new Set());
+    expect(withoutMedia.messages[0]?.blocks).toEqual([
+      { kind: "text", text: "native expanded input" },
+      { kind: "text", text: "[Unavailable attachment: Report]" }
+    ]);
+    expect(withoutMedia.messages[0]?.acceptedInput).toMatchObject({
+      text: acceptedInput().text,
+      images: [],
+      files: [],
+      mentions: [
+        { kind: "workspace_file", workspaceId: "source-workspace", label: "workspace", reference: "src/main.ts" },
+        { kind: "resource", label: "resource", reference: "resource-one", discoveredRevision: "revision-one", resourceVersion: "7", runtimeGeneration: 3 }
+      ]
+    });
+    expect(collectPortableProjectionBlobRefs(withoutMedia).size).toBe(0);
   });
 
   it("rejects unsafe extensions, malformed Blobs, invalid delivery metadata, and invalid UTF-8", () => {

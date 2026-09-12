@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import type { JSX } from "react";
-import { LoaderCircle, Sparkles, Trash2 } from "lucide-react";
+import { Archive, LoaderCircle, Sparkles, Trash2 } from "lucide-react";
 import type { SessionTitleSuggestionView, SessionView } from "../model.js";
+import type { WorktreeRemovalPreflightSummary } from "../worktree-removal-preflight.js";
 import type { Translator } from "./types.js";
 import { Button, IconButton, Modal, CheckboxControl } from "./ui.js";
 
@@ -113,14 +114,34 @@ export function RenameSessionDialog({ session, t, onClose, onRename, onSuggest }
   </Modal>;
 }
 
-export function DeleteSessionDialog({ session, t, onClose, onDelete }: { readonly session?: SessionView; readonly t: Translator; readonly onClose: () => void; readonly onDelete: (deleteNative: boolean) => void }): JSX.Element {
-  const [deleteNative, setDeleteNative] = useState(false);
-  useEffect(() => { if (session !== undefined) setDeleteNative(false); }, [session?.id]);
-  return <Modal open={session !== undefined} title={t("session.delete")} description={session?.name} closeLabel={t("common.close")} size="small" onClose={onClose}><div className="delete-dialog"><div className="delete-dialog__warning"><Trash2 aria-hidden="true" /><p>{t("session.deleteWarning")}</p></div><label className="check-row"><CheckboxControl checked={deleteNative} onChange={(event) => setDeleteNative(event.target.checked)} /><span><strong>{t("session.deleteNative")}</strong><small>{t("session.deleteNativeBody")}</small></span></label><div className="modal__actions"><Button onClick={onClose}>{t("common.cancel")}</Button><Button tone="danger" onClick={() => onDelete(deleteNative)}><Trash2 aria-hidden="true" />{t("common.delete")}</Button></div></div></Modal>;
+export function ArchiveSessionDialog({ sessions, preflight, t, onClose, onArchive }: {
+  readonly sessions: readonly SessionView[];
+  readonly preflight?: WorktreeRemovalPreflightSummary;
+  readonly t: Translator;
+  readonly onClose: () => void;
+  readonly onArchive: () => void;
+}): JSX.Element {
+  return <Modal open={sessions.length > 0} title={t("session.archive")} description={sessions.length === 1 ? sessions[0]?.name : undefined} closeLabel={t("common.close")} size="small" onClose={onClose}>
+    <div className="delete-dialog">
+      <div className="delete-dialog__warning"><Archive aria-hidden="true" /><div>
+        <p>{t("session.archiveWarning")}</p>
+        <WorktreeRemovalWarnings disposition="archive" preflight={preflight} t={t} />
+      </div></div>
+      {sessions.length > 1 && <ul className="delete-dialog__sessions">{sessions.map((session) => <li key={session.id}>{session.name}</li>)}</ul>}
+      <div className="modal__actions"><Button onClick={onClose}>{t("common.cancel")}</Button><Button tone="primary" onClick={onArchive}><Archive aria-hidden="true" />{t("session.archive")}</Button></div>
+    </div>
+  </Modal>;
 }
 
-export function BulkDeleteSessionDialog({ sessions, t, onClose, onDelete }: {
+export function DeleteSessionDialog({ session, preflight, t, onClose, onDelete }: { readonly session?: SessionView; readonly preflight?: WorktreeRemovalPreflightSummary; readonly t: Translator; readonly onClose: () => void; readonly onDelete: (deleteNative: boolean) => void }): JSX.Element {
+  const [deleteNative, setDeleteNative] = useState(false);
+  useEffect(() => { if (session !== undefined) setDeleteNative(false); }, [session?.id]);
+  return <Modal open={session !== undefined} title={t("session.delete")} description={session?.name} closeLabel={t("common.close")} size="small" onClose={onClose}><div className="delete-dialog"><div className="delete-dialog__warning"><Trash2 aria-hidden="true" /><div><p>{t("session.deleteWarning")}</p><WorktreeRemovalWarnings disposition="delete" preflight={preflight} t={t} /></div></div><label className="check-row"><CheckboxControl checked={deleteNative} onChange={(event) => setDeleteNative(event.target.checked)} /><span><strong>{t("session.deleteNative")}</strong><small>{t("session.deleteNativeBody")}</small></span></label><div className="modal__actions"><Button onClick={onClose}>{t("common.cancel")}</Button><Button tone="danger" onClick={() => onDelete(deleteNative)}><Trash2 aria-hidden="true" />{t("common.delete")}</Button></div></div></Modal>;
+}
+
+export function BulkDeleteSessionDialog({ sessions, preflight, t, onClose, onDelete }: {
   readonly sessions: readonly SessionView[];
+  readonly preflight?: WorktreeRemovalPreflightSummary;
   readonly t: Translator;
   readonly onClose: () => void;
   readonly onDelete: (deleteNative: boolean) => void;
@@ -130,10 +151,28 @@ export function BulkDeleteSessionDialog({ sessions, t, onClose, onDelete }: {
   useEffect(() => { if (sessions.length > 0) setDeleteNative(false); }, [sessionKey]);
   return <Modal open={sessions.length > 0} title={t("session.delete")} closeLabel={t("common.close")} size="small" onClose={onClose}>
     <div className="delete-dialog">
-      <div className="delete-dialog__warning"><Trash2 aria-hidden="true" /><p>{t("session.deleteWarning")}</p></div>
+      <div className="delete-dialog__warning"><Trash2 aria-hidden="true" /><div><p>{t("session.deleteWarning")}</p><WorktreeRemovalWarnings disposition="delete" preflight={preflight} t={t} /></div></div>
       <ul className="delete-dialog__sessions">{sessions.map((session) => <li key={session.id}>{session.name}</li>)}</ul>
       <label className="check-row"><CheckboxControl checked={deleteNative} onChange={(event) => setDeleteNative(event.target.checked)} /><span><strong>{t("session.deleteNative")}</strong><small>{t("session.deleteNativeBody")}</small></span></label>
       <div className="modal__actions"><Button onClick={onClose}>{t("common.cancel")}</Button><Button tone="danger" onClick={() => onDelete(deleteNative)}><Trash2 aria-hidden="true" />{t("common.delete")}</Button></div>
     </div>
   </Modal>;
+}
+
+export function WorktreeRemovalWarnings({ disposition, preflight, t }: {
+  readonly disposition: "archive" | "delete";
+  readonly preflight?: WorktreeRemovalPreflightSummary;
+  readonly t: Translator;
+}): JSX.Element | null {
+  if (preflight === undefined || preflight.dirty === 0 && preflight.unknown === 0) return null;
+  return <>
+    {preflight.dirty > 0 && <p className="delete-dialog__worktree-warning" role="alert">{t(
+      disposition === "archive" ? "session.archiveDirtyWorktreeWarning" : "session.deleteDirtyWorktreeWarning",
+      { count: preflight.dirty }
+    )}</p>}
+    {preflight.unknown > 0 && <p className="delete-dialog__worktree-warning" role="alert">{t(
+      "session.worktreePreflightUnknown",
+      { count: preflight.unknown }
+    )}</p>}
+  </>;
 }

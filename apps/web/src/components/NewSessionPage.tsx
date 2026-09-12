@@ -26,15 +26,19 @@ import {
   plainTextToComposerDocument
 } from "../composer-quote-document.js";
 import { modelPreferenceOwnerId } from "../model-picker-preferences.js";
+import { remapComposerInlineMentionReplacement } from "../composer-mention-ranges.js";
+import { composerMentionsAllowed, resolveComposerMentionPolicy } from "../composer-mention-policy.js";
 import type {
   AppSnapshot,
   AttachmentDraft,
   ComposerDraft,
+  ComposerInlineMentionRange,
   ComposerMentionDraft,
   NativeSessionCandidateView,
   NewSessionDraftSelection,
   NewSessionLocalDraft,
   PermissionMode,
+  SessionView,
   TargetWorktreeProbeView,
   WorktreeEligibilityView,
   WorktreeSourceView,
@@ -52,11 +56,13 @@ import {
 import {
   composerCommandItems,
   composerMentionItems,
-  mentionsStillPresent,
+  detectComposerCommandActivation,
+  filterComposerPaletteItems,
+  type ComposerCommandActivation,
   type ComposerPaletteItem
 } from "./composer-palette.js";
 import { countComposerPasteLines } from "./composer-paste-pipeline.js";
-import { insertNewSessionPaletteDocument } from "./new-session-composer-document.js";
+import { insertNewSessionPaletteDocument, replaceNewSessionCommandDocument } from "./new-session-composer-document.js";
 import {
   defaultNewSessionSelection,
   dialogueBackends,
@@ -72,22 +78,40 @@ import { modelSourceAccess, type ModelSourceSelection } from "../model-source-ac
 import { PermissionSelector, permissionLabel } from "./PermissionSelector.js";
 import { ComposerAddMenu } from "./ComposerAddMenu.js";
 import { ComposerAttachmentTray } from "./ComposerAttachmentTray.js";
+import { ComposerInlineMentionPanel } from "./composer-inline-mention-panel.js";
 import { HomeUsageDashboard } from "./HomeUsageDashboard.js";
 import { ComposerPastedTextDialog, type ComposerPastedTextDialogTarget } from "./ComposerPastedTextDialog.js";
 import { ComposerRichTextEditor, type ComposerRichTextEditorHandle } from "./ComposerRichTextEditor.js";
 import { VoiceInputOverlay } from "./VoiceInputOverlay.js";
 import { useDraftVoiceInput } from "./use-draft-voice-input.js";
+import { useGamepadVoiceInput } from "../gamepad-client.js";
 import { useHeldVoiceInput } from "./use-held-voice-input.js";
 import { VoiceInputButton } from "./VoiceInputButton.js";
 import { applyVoiceDraftResult, createVoiceDraftFence } from "./voice-draft-fence.js";
 import { createVoiceInsertedEditTracker } from "./voice-inserted-edit.js";
 import { useVoiceDictionaryLearning } from "./use-voice-dictionary-learning.js";
-import { composerSelectionTextRange, setComposerCaretTextOffset } from "./composer-inline-mention.js";
+import {
+  composerCaretTextOffset,
+  composerDirectoryQueryToken,
+  composerMentionCatalog,
+  composerMentionsFromRanges,
+  composerSelectionTextRange,
+  detectComposerInlineMention,
+  firstEnabledComposerMentionIndex,
+  replaceComposerDocumentTextRange,
+  resolveComposerInlineMentionKey,
+  resolveComposerMentionResults,
+  restoreComposerInlineMentionRanges,
+  setComposerCaretTextOffset,
+  type ComposerInlineMentionActivation,
+  type ComposerMentionCatalogItem,
+  type ComposerMentionProviderState
+} from "./composer-inline-mention.js";
 import { isComposerBlankPointerTarget } from "./composer-blank-focus.js";
 import { resolveComposerRouteReferenceFromRuntime } from "./composer-route-reference-runtime.js";
 import { hasComposerInternalDrop, resolveComposerInternalDrop } from "./composer-internal-drop.js";
 import type { Translator } from "./types.js";
-import { IconButton, Pill, cx, formatBytes, formatRelativeTime, CheckboxControl, RadioControl, SelectControl } from "./ui.js";
+import { Button, IconButton, Modal, Pill, cx, formatBytes, formatRelativeTime, CheckboxControl, RadioControl, SelectControl } from "./ui.js";
 
 interface NewSessionPageProps {
   readonly controller: AppController;
@@ -107,6 +131,15 @@ interface NewTaskWorkspaceMentionIndex {
   readonly paths: readonly string[];
   readonly truncated: boolean;
   readonly error?: string;
+}
+
+interface FullAccessConfirmation {
+  readonly scope: object;
+  readonly ownerDocument: Document;
+}
+
+interface NewTaskInlineMentionActivation extends ComposerInlineMentionActivation {
+  readonly source: "typed" | "button";
 }
 
 const QUICK_STARTS = [
@@ -141,6 +174,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const [effort, setEffort] = useState("");
   const [fastMode, setFastMode] = useState(false);
   const [permissionMode, setPermissionMode] = useState<PermissionMode>("ask");
+  const [fullAccessConfirmation, setFullAccessConfirmation] = useState<FullAccessConfirmation>();
   const [planMode, setPlanMode] = useState(false);
   const [worktreeEnabled, setWorktreeEnabled] = useState(() => controller.state.preferences.newSessionWorktreeEnabled);
   const [worktreeSourceRef, setWorktreeSourceRef] = useState<string>();
@@ -152,6 +186,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const [text, setText] = useState("");
   const [editorDocument, setEditorDocument] = useState<JSONContent>(emptyComposerDocument);
   const [mentions, setMentions] = useState<readonly ComposerMentionDraft[]>([]);
+  const [inlineMentionRanges, setInlineMentionRanges] = useState<readonly ComposerInlineMentionRange[]>([]);
   const [attachments, setAttachments] = useState<readonly AttachmentDraft[]>([]);
   const [extraDirectoryIds, setExtraDirectoryIds] = useState<readonly string[]>([]);
   const [attachmentError, setAttachmentError] = useState<string>();
@@ -159,6 +194,10 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const [dragging, setDragging] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [palette, setPalette] = useState<"add" | "mention" | "commands">();
+  const [inlineMentionActivation, setInlineMentionActivation] = useState<NewTaskInlineMentionActivation>();
+  const [inlineMentionActiveIndex, setInlineMentionActiveIndex] = useState(0);
+  const [commandActivation, setCommandActivation] = useState<ComposerCommandActivation>();
+  const [commandActiveIndex, setCommandActiveIndex] = useState(0);
   const [workspaceMentionIndex, setWorkspaceMentionIndex] = useState<NewTaskWorkspaceMentionIndex>();
   const [workspaceMentionReload, setWorkspaceMentionReload] = useState(0);
   const [pastedTextTarget, setPastedTextTarget] = useState<ComposerPastedTextDialogTarget>();
@@ -174,20 +213,48 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const fileInputRef = useRef<HTMLInputElement>(null);
   const editorDocumentRef = useRef(editorDocument);
   const textRef = useRef(text);
+  const mentionsRef = useRef(mentions);
+  const inlineMentionRangesRef = useRef(inlineMentionRanges);
   const attachmentsRef = useRef(attachments);
   const submissionRef = useRef<object | undefined>(undefined);
   const submissionAbortRef = useRef<AbortController | undefined>(undefined);
   const submissionOriginRef = useRef<NewSessionSubmissionOwner | undefined>(undefined);
+  const fullAccessConfirmationRef = useRef<FullAccessConfirmation | undefined>(undefined);
   const mountedRef = useRef(true);
   const controllerRef = useRef(controller);
   const draftSaveChainRef = useRef<Promise<void>>(Promise.resolve());
   const restoredExecutionRef = useRef<NewSessionLocalDraft | undefined>(undefined);
   const typedPaletteTriggerRef = useRef<"/" | "@" | undefined>(undefined);
+  const inlineMentionActivationRef = useRef<NewTaskInlineMentionActivation | undefined>(undefined);
+  const suppressedInlineMentionFromRef = useRef<number | undefined>(undefined);
+  const commandActivationRef = useRef<ComposerCommandActivation | undefined>(undefined);
+  const commandComposingRef = useRef(false);
+  const suppressedCommandFromRef = useRef<number | undefined>(undefined);
   const worktreeProbeSequenceRef = useRef(0);
   controllerRef.current = controller;
   editorDocumentRef.current = editorDocument;
   textRef.current = text;
+  mentionsRef.current = mentions;
+  inlineMentionRangesRef.current = inlineMentionRanges;
   attachmentsRef.current = attachments;
+  commandActivationRef.current = commandActivation;
+
+  const replaceInlineMentionActivation = (next: NewTaskInlineMentionActivation | undefined): void => {
+    inlineMentionActivationRef.current = next;
+    setInlineMentionActivation(next);
+  };
+
+  const replaceMentions = (nextMentions: readonly ComposerMentionDraft[], nextRanges: readonly ComposerInlineMentionRange[]): void => {
+    mentionsRef.current = nextMentions;
+    inlineMentionRangesRef.current = nextRanges;
+    setMentions(nextMentions);
+    setInlineMentionRanges(nextRanges);
+  };
+
+  const replaceCommandActivation = (next: ComposerCommandActivation | undefined): void => {
+    commandActivationRef.current = next;
+    setCommandActivation(next);
+  };
 
   const selectionKey = selection === undefined ? "" : newSessionSelectionValue(selection);
   const selected = selection?.kind === "target" ? activeTargets.find((target) => target.id === selection.targetId) : undefined;
@@ -195,6 +262,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     ? eligibleDialogueBackends.find((candidate) => candidate.id === selection.backendId)
     : snapshot.backends.find((candidate) => candidate.id === selected?.backendId);
   const workspace = selected === undefined ? undefined : snapshot.workspaces.find((candidate) => candidate.id === selected.workspaceId);
+  const workspaceIdRef = useRef(workspace?.id); workspaceIdRef.current = workspace?.id;
   const discoveryAvailability = nativeSessionDiscoveryAvailability(selected === undefined ? undefined : backend?.capabilities);
   const canDiscover = discoveryAvailability.visible;
   const canAttach = discoveryAvailability.attachEnabled;
@@ -227,23 +295,61 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     () => resolveComposerAttachmentPolicy(backend, selectedModel?.supportsImages),
     [backend, selectedModel?.supportsImages]
   );
-  const relevantResources = snapshot.resources.filter((resource) =>
-    resource.backendId === backend?.id
-    && resource.enabled
-    && resource.state === "loaded"
-    && (resource.targetId === undefined || resource.targetId === selected?.id));
-  const canMention = backend?.capabilities.get("input.mention")?.supported === true;
-  const matchingWorkspaceMentionIndex = workspaceMentionIndex?.workspaceId === workspace?.id
+  const mentionCapability = backend?.capabilities.get("input.mention");
+  const mentionPolicy = useMemo(() => resolveComposerMentionPolicy(mentionCapability), [mentionCapability]);
+  const mentionPolicyRef = useRef(mentionPolicy); mentionPolicyRef.current = mentionPolicy;
+  // A new task has no live runtime resource or Artifact inventory, but it can quote an existing task.
+  const canMention = mentionPolicy.files || mentionPolicy.directories || mentionPolicy.sessions;
+  const workspaceMentionNavigation = mentionPolicy.files || mentionPolicy.directories;
+  const matchingWorkspaceMentionIndex = mentionPolicy.files && workspaceMentionIndex?.workspaceId === workspace?.id
     ? workspaceMentionIndex
     : undefined;
   const mentionItems = canMention
     ? composerMentionItems(
-        workspace?.entries ?? [],
+        mentionPolicy.files ? workspace?.entries ?? [] : [],
         workspace?.id,
-        relevantResources,
-        matchingWorkspaceMentionIndex?.paths ?? []
+        matchingWorkspaceMentionIndex?.paths ?? [],
+        mentionPolicy.sessions ? snapshot.sessions.filter((session): session is SessionView => session.state !== "closed") : []
       )
     : [];
+  const inlineMentionCatalogItems = useMemo(
+    () => composerMentionCatalog(
+      workspaceMentionNavigation ? workspace?.entries ?? [] : [],
+      workspace?.id,
+      [],
+      matchingWorkspaceMentionIndex?.paths ?? [],
+      [],
+      mentionPolicy.sessions ? snapshot.sessions : []
+    ).filter((item) => item.kind === "directory"
+      || item.kind === "file" && mentionPolicy.files
+      || item.kind === "session" && mentionPolicy.sessions),
+    [matchingWorkspaceMentionIndex?.paths, mentionPolicy.files, mentionPolicy.sessions, snapshot.sessions, workspace?.entries, workspace?.id, workspaceMentionNavigation]
+  );
+  const inlineMentionProviderState = useMemo<ComposerMentionProviderState>(
+    () => matchingWorkspaceMentionIndex?.status === "loading"
+      ? { kind: "loading", items: inlineMentionCatalogItems, truncated: matchingWorkspaceMentionIndex.truncated }
+      : matchingWorkspaceMentionIndex?.status === "error"
+        ? {
+            kind: "error",
+            message: matchingWorkspaceMentionIndex.error ?? t("composer.mentionLoadFailed"),
+            items: inlineMentionCatalogItems,
+            truncated: matchingWorkspaceMentionIndex.truncated
+          }
+        : { kind: "ready", items: inlineMentionCatalogItems, truncated: matchingWorkspaceMentionIndex?.truncated ?? false },
+    [inlineMentionCatalogItems, matchingWorkspaceMentionIndex, t]
+  );
+  const inlineMentionResults = useMemo(
+    () => resolveComposerMentionResults(inlineMentionProviderState, inlineMentionActivation?.query ?? ""),
+    [inlineMentionActivation?.query, inlineMentionProviderState]
+  );
+  const mentionItemCount = mentionPolicy.directories
+    ? inlineMentionCatalogItems.filter((item) => item.disabled !== true).length
+    : mentionItems.length;
+  useEffect(() => {
+    const current = inlineMentionResults.items[inlineMentionActiveIndex];
+    if (current !== undefined && current.disabled !== true) return;
+    setInlineMentionActiveIndex(firstEnabledComposerMentionIndex(inlineMentionResults.items));
+  }, [inlineMentionActiveIndex, inlineMentionResults.items]);
   const knownWorkspacePaths = useMemo(() => workspace === undefined
     ? []
     : [...new Set([
@@ -252,9 +358,9 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       ])], [matchingWorkspaceMentionIndex?.paths, workspace]);
   const globalCommands = snapshot.commands.filter((command) => command.sessionId === undefined);
   const commandItems = composerCommandItems(
-    backend?.capabilities.get("runtime.commands")?.supported === true ? globalCommands : [],
-    backend?.capabilities.get("runtime.resources")?.supported === true ? relevantResources : []
+    backend?.capabilities.get("runtime.commands")?.supported === true ? globalCommands : []
   );
+  const commandCatalogKey = commandItems.map((item) => `${item.id}\u0000${item.value}\u0000${item.meta}`).join("\u0001");
   const selectableExtraDirectories = snapshot.extraDirectories.filter((directory) => directory.workspaceId === workspace?.id && directory.trusted);
   const canSelectExtraDirectories = workspace !== undefined && backend?.capabilities.get("workspace.extra_dirs")?.supported === true;
   const canUseAddMenu = attachmentPolicy.images || attachmentPolicy.files || canMention || commandItems.length > 0
@@ -267,6 +373,84 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const effectiveWorktreeEnabled = worktreeRequested && worktreeEligible;
 
   const profileScope = `${controller.state.activeProfile?.serverId ?? ""}\u0000${controller.state.activeProfile?.id ?? ""}`;
+  const inlineMentionPaletteScope = useMemo(() => ({}), [
+    profileScope,
+    selectionKey,
+    backend?.id,
+    backend?.instanceGeneration,
+    workspace?.id,
+    workspace?.revision,
+    voiceRoot?.ownerDocument
+  ]);
+  useLayoutEffect(() => {
+    const retire = (): void => {
+      inlineMentionActivationRef.current = undefined;
+      suppressedInlineMentionFromRef.current = undefined;
+      setInlineMentionActivation(undefined);
+      setPalette((current) => current === "mention" ? undefined : current);
+    };
+    retire();
+    const ownerWindow = voiceRoot?.ownerDocument.defaultView;
+    ownerWindow?.addEventListener("pagehide", retire);
+    return () => {
+      ownerWindow?.removeEventListener("pagehide", retire);
+      inlineMentionActivationRef.current = undefined;
+      suppressedInlineMentionFromRef.current = undefined;
+    };
+  }, [inlineMentionPaletteScope, voiceRoot?.ownerDocument.defaultView]);
+  const commandPaletteScope = useMemo(() => ({}), [
+    profileScope,
+    selectionKey,
+    backend?.id,
+    backend?.instanceGeneration,
+    commandCatalogKey,
+    voiceRoot?.ownerDocument
+  ]);
+  useLayoutEffect(() => {
+    const retire = (): void => {
+      commandActivationRef.current = undefined;
+      commandComposingRef.current = false;
+      suppressedCommandFromRef.current = undefined;
+      setCommandActivation(undefined);
+      setPalette((current) => current === "commands" ? undefined : current);
+    };
+    retire();
+    const ownerWindow = voiceRoot?.ownerDocument.defaultView;
+    ownerWindow?.addEventListener("pagehide", retire);
+    return () => {
+      ownerWindow?.removeEventListener("pagehide", retire);
+      commandActivationRef.current = undefined;
+      commandComposingRef.current = false;
+      suppressedCommandFromRef.current = undefined;
+    };
+  }, [commandPaletteScope, voiceRoot?.ownerDocument.defaultView]);
+  const permissionModesKey = execution.permissionModes.join("\u0000");
+  const fullAccessConfirmationScope = useMemo(() => ({}), [
+    profileScope,
+    selectionKey,
+    backend?.id,
+    backend?.instanceGeneration,
+    permissionModesKey,
+    voiceRoot?.ownerDocument
+  ]);
+  const fullAccessConfirmationScopeRef = useRef(fullAccessConfirmationScope);
+  fullAccessConfirmationScopeRef.current = fullAccessConfirmationScope;
+  const retireFullAccessConfirmation = useCallback((candidate?: FullAccessConfirmation): void => {
+    const current = fullAccessConfirmationRef.current;
+    if (candidate !== undefined && current !== candidate) return;
+    fullAccessConfirmationRef.current = undefined;
+    setFullAccessConfirmation((pending) => candidate === undefined || pending === candidate ? undefined : pending);
+  }, []);
+  useLayoutEffect(() => {
+    retireFullAccessConfirmation();
+    const ownerWindow = voiceRoot?.ownerDocument.defaultView;
+    const retire = (): void => retireFullAccessConfirmation();
+    ownerWindow?.addEventListener("pagehide", retire);
+    return () => {
+      ownerWindow?.removeEventListener("pagehide", retire);
+      fullAccessConfirmationRef.current = undefined;
+    };
+  }, [fullAccessConfirmationScope, retireFullAccessConfirmation, voiceRoot?.ownerDocument.defaultView]);
   const voiceOwnerKey = `${profileScope}\u0000${selectionKey}\u0000${startKind}`;
   const voiceDictionaryLearning = useVoiceDictionaryLearning({
     controller,
@@ -286,6 +470,8 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     },
     capture: () => {
       voiceDictionaryLearning.clear();
+      commandActivationRef.current = undefined;
+      setCommandActivation(undefined);
       setPalette(undefined);
       const sourceDocument = editorDocumentRef.current;
       const editor = composerRootRef.current?.querySelector<HTMLElement>(".composer-rich-editor__content") ?? null;
@@ -294,11 +480,12 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
         if (editorDocumentRef.current !== sourceDocument) return undefined;
         const applied = applyVoiceDraftResult({ fence, sessionId: voiceOwnerKey, revision: 0, document: sourceDocument, text: textRef.current, transcript });
         if (!applied.applied) return undefined;
+        const nextRanges = remapComposerInlineMentionReplacement(inlineMentionRangesRef.current, fence.from, fence.to, applied.caret - fence.from);
+        replaceMentions(composerMentionsFromRanges(mentionsRef.current, nextRanges), nextRanges);
         editorDocumentRef.current = applied.document;
         textRef.current = applied.text;
         setEditorDocument(applied.document);
         setText(applied.text);
-        setMentions((current) => mentionsStillPresent(applied.text, current));
         voiceDictionaryLearning.track(createVoiceInsertedEditTracker({
           fence,
           insertedText: transcript,
@@ -319,7 +506,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   }, []);
 
   useEffect(() => {
-    if (!canMention || workspace === undefined) {
+    if (!mentionPolicy.files || workspace === undefined) {
       setWorkspaceMentionIndex(undefined);
       return;
     }
@@ -350,7 +537,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       }));
     });
     return () => requestController.abort();
-  }, [canMention, t, workspace?.id, workspace?.revision, workspaceMentionReload]);
+  }, [mentionPolicy.files, t, workspace?.id, workspace?.revision, workspaceMentionReload]);
 
   useEffect(() => {
     let cancelled = false;
@@ -365,13 +552,14 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       const restored = { ...draft, selection: restoredSelection };
       const restoredDocument = normalizeComposerDocument(restored.editorDocument, restored.text);
       const restoredText = composerDocumentPlainText(restoredDocument);
+      const restoredRanges = restoreComposerInlineMentionRanges(restoredText, restored.mentions, restored.inlineMentionRanges);
       restoredExecutionRef.current = restored;
       setSelection(restoredSelection);
       editorDocumentRef.current = restoredDocument;
       setEditorDocument(restoredDocument);
       textRef.current = restoredText;
       setText(restoredText);
-      setMentions(mentionsStillPresent(restoredText, restored.mentions));
+      replaceMentions(restored.mentions, restoredRanges);
       setAttachments((current) => {
         revokeAttachments(current);
         return restored.attachments.map(withAttachmentPreview);
@@ -461,8 +649,14 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     setStartKind("fresh");
     setNativeReference("");
     setNativeSelectionWarning(undefined);
-    setMentions([]);
+    replaceMentions([], []);
     setExtraDirectoryIds([]);
+    inlineMentionActivationRef.current = undefined;
+    setInlineMentionActivation(undefined);
+    suppressedInlineMentionFromRef.current = undefined;
+    commandActivationRef.current = undefined;
+    setCommandActivation(undefined);
+    suppressedCommandFromRef.current = undefined;
     setPalette(undefined);
     typedPaletteTriggerRef.current = undefined;
   }, [backend?.id, hydrationRevision, selectionKey]);
@@ -565,7 +759,8 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       },
       text,
       editorDocument,
-      mentions: mentionsStillPresent(text, mentions),
+      mentions: composerMentionsFromRanges(mentions, inlineMentionRanges),
+      inlineMentionRanges,
       attachments,
       ...(canSelectExtraDirectories ? { extraDirectoryIds } : {})
     };
@@ -575,9 +770,14 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       void enqueueNewSessionDraftSave(draftSaveChainRef, sourceControllerRef, draft).then(() => { if (!cancelled) setDraftError(undefined); }).catch((error: unknown) => { if (!cancelled) setDraftError(messageOf(error)); });
     }, 420);
     return () => { cancelled = true; window.clearTimeout(timer); };
-  }, [controller.saveNewSessionDraft, attachments, canSelectExtraDirectories, editorDocument, effort, execution.effortSupported, execution.fastModeSupported, execution.permissionModes, execution.planModeSupported, extraDirectoryIds, fastMode, hydrated, mentions, modelKey, nativeReference, permissionMode, planMode, refreshWorktreeRemote, selected?.id, selectedModel?.efforts, selectedModel?.supportsFast, selectionKey, startKind, submitting, text, worktreeEnabled, worktreeSourceRef]);
+  }, [controller.saveNewSessionDraft, attachments, canSelectExtraDirectories, editorDocument, effort, execution.effortSupported, execution.fastModeSupported, execution.permissionModes, execution.planModeSupported, extraDirectoryIds, fastMode, hydrated, mentions, inlineMentionRanges, modelKey, nativeReference, permissionMode, planMode, refreshWorktreeRemote, selected?.id, selectedModel?.efforts, selectedModel?.supportsFast, selectionKey, startKind, submitting, text, worktreeEnabled, worktreeSourceRef]);
 
   const attachmentsAllowed = attachments.every((attachment) => attachment.kind === "image" ? attachmentPolicy.images : attachmentPolicy.files);
+  const mentionsAllowed = newTaskMentionsAllowed(
+    composerMentionsFromRanges(mentions, inlineMentionRanges),
+    mentionPolicy,
+    workspace?.id
+  );
   const hasInput = !composerDocumentIsEmpty(editorDocument) || attachments.length > 0;
   const validContext = selection !== undefined && backend !== undefined
     && (startKind === "fresh" || (selected !== undefined && nativeSelectionReady));
@@ -585,13 +785,13 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const worktreeDecisionReady = !worktreeRequested || (
     !worktreeLoading && worktreeError === undefined && worktreeProbe?.targetId === selected?.id
   );
-  const canFinishVoiceSend = hydrated && controller.state.connectionState === "connected" && validContext && modelRouteReady && attachmentsAllowed && worktreeDecisionReady && !submitting;
+  const canFinishVoiceSend = hydrated && controller.state.connectionState === "connected" && validContext && modelRouteReady && attachmentsAllowed && mentionsAllowed && worktreeDecisionReady && fullAccessConfirmation === undefined && !submitting;
   const canSend = canFinishVoiceSend && hasInput && !voice.active;
   const submissionScope = useMemo(() => ({}), [profileScope, selectionKey, startKind, nativeReference, modelKey, selectedModel?.providerId, selectedModel?.modelId, effort, fastMode, permissionMode, planMode, effectiveWorktreeEnabled, worktreeSourceRef, refreshWorktreeRemote, snapshot.generation, controller.getArtifactUrl, voiceRoot]);
   const submissionEpochRef = useRef<object | undefined>(undefined);
   const submissionScopeRef = useRef(submissionScope); submissionScopeRef.current = submissionScope;
   const submissionValidityRef = useRef(false);
-  submissionValidityRef.current = hydrated && validContext && modelRouteReady && attachmentsAllowed && worktreeDecisionReady && controller.state.connectionState === "connected";
+  submissionValidityRef.current = hydrated && validContext && modelRouteReady && attachmentsAllowed && mentionsAllowed && worktreeDecisionReady && fullAccessConfirmationRef.current === undefined && controller.state.connectionState === "connected";
   useLayoutEffect(() => {
     const ownerWindow = voiceRoot?.ownerDocument.defaultView;
     const activate = (): void => { submissionEpochRef.current = {}; };
@@ -615,6 +815,11 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     }).finally(() => { if (voiceSendFlight.current === flight) voiceSendFlight.current = undefined; });
   };
   useLayoutEffect(() => () => { voiceSendFlight.current = undefined; }, [submissionScope]);
+  useGamepadVoiceInput(voiceRoot, voice.scope, {
+    enabled: voice.supported && hydrated && !submitting,
+    isActive: voice.isActive, getCaptureIdentity: voice.getCaptureIdentity,
+    start: voice.start, finish: voice.finish, cancel: voice.cancel
+  });
   const heldVoice = useHeldVoiceInput({
     scope: voice.scope, root: voiceRoot, sendTarget: voiceSendTarget, canSend: canFinishVoiceSend,
     enabled: voice.supported && hydrated && !submitting, phase: voice.phase,
@@ -629,43 +834,348 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
 
   const closePalette = (restoreFocus = false): void => {
     typedPaletteTriggerRef.current = undefined;
+    replaceInlineMentionActivation(undefined);
+    replaceCommandActivation(undefined);
     setPalette(undefined);
     if (restoreFocus) requestAnimationFrame(() => richEditorRef.current?.focus());
   };
 
-  const updateDocument = (nextDocument: JSONContent, isComposing = false): void => {
+  const closeInlineMention = (restoreFocus = false, suppress = false): void => {
+    const active = inlineMentionActivationRef.current;
+    if (suppress && active?.source === "typed") suppressedInlineMentionFromRef.current = active.from;
+    closePalette(restoreFocus);
+  };
+
+  useEffect(() => {
+    if (!canMention && palette === "mention") {
+      typedPaletteTriggerRef.current = undefined;
+      replaceInlineMentionActivation(undefined);
+      setPalette(undefined);
+      return;
+    }
+    if (!mentionPolicy.directories && inlineMentionActivationRef.current !== undefined) {
+      typedPaletteTriggerRef.current = undefined;
+      replaceInlineMentionActivation(undefined);
+      if (palette === "mention") setPalette(undefined);
+    }
+  }, [canMention, mentionPolicy.directories, palette]);
+
+  const updateDocument = (nextDocument: JSONContent, isComposing = false, mapRanges?: (ranges: readonly ComposerInlineMentionRange[]) => readonly ComposerInlineMentionRange[]): void => {
     const normalizedDocument = normalizeComposerDocument(nextDocument);
     const nextText = composerDocumentPlainText(normalizedDocument);
+    // An update without its originating transaction has no occurrence authority.
+    const nextRanges = mapRanges?.(inlineMentionRangesRef.current) ?? [];
+    replaceMentions(composerMentionsFromRanges(mentionsRef.current, nextRanges), nextRanges);
     voiceDictionaryLearning.observe(nextText, isComposing);
     editorDocumentRef.current = normalizedDocument;
     setEditorDocument(normalizedDocument);
     textRef.current = nextText;
     setText(nextText);
-    setMentions((current) => mentionsStillPresent(nextText, current));
+    commandComposingRef.current = isComposing;
+    const editor = composerRootRef.current?.querySelector<HTMLElement>(".composer-rich-editor__content") ?? null;
+    const caret = composerCaretTextOffset(editor, editor?.ownerDocument.getSelection() ?? null) ?? nextText.length;
+    const command = commandItems.length === 0
+      ? undefined
+      : detectComposerCommandActivation(nextText, caret, { isComposing, bashMode: false });
+    if (command !== undefined) {
+      typedPaletteTriggerRef.current = undefined;
+      replaceInlineMentionActivation(undefined);
+      suppressedInlineMentionFromRef.current = undefined;
+      if (suppressedCommandFromRef.current === command.from) {
+        replaceCommandActivation(undefined);
+        if (palette === "commands") setPalette(undefined);
+        return;
+      }
+      replaceCommandActivation(command);
+      setCommandActiveIndex(0);
+      setPalette("commands");
+      return;
+    }
+    suppressedCommandFromRef.current = undefined;
+    replaceCommandActivation(undefined);
+    const mentionTrigger = mentionPolicy.directories && !isComposing
+      ? detectComposerInlineMention(nextText, caret, nextRanges)
+      : null;
+    if (mentionTrigger !== null) {
+      typedPaletteTriggerRef.current = "@";
+      if (suppressedInlineMentionFromRef.current === mentionTrigger.from) {
+        replaceInlineMentionActivation(undefined);
+        if (palette === "mention") setPalette(undefined);
+        return;
+      }
+      replaceInlineMentionActivation({ ...mentionTrigger, source: "typed" });
+      setInlineMentionActiveIndex(0);
+      setPalette("mention");
+      return;
+    }
+    suppressedInlineMentionFromRef.current = undefined;
+    replaceInlineMentionActivation(undefined);
     const typedPalette = resolveTypedComposerPalette(nextText, isComposing, false);
-    if ((typedPalette === "mention" && !canMention) || (typedPalette === "commands" && commandItems.length === 0)) {
+    if (typedPalette === "mention" && !canMention) {
       closePalette();
       return;
     }
-    if (typedPalette !== null) {
-      typedPaletteTriggerRef.current = nextText as "/" | "@";
-      setPalette(typedPalette);
+    if (typedPalette === "mention") {
+      typedPaletteTriggerRef.current = "@";
+      setPalette("mention");
       return;
     }
     closePalette();
   };
 
-  const insertPaletteItem = (item: ComposerPaletteItem): void => {
+  useEffect(() => {
+    const editor = composerRootRef.current?.querySelector<HTMLElement>(".composer-rich-editor__content") ?? null;
+    const ownerDocument = editor?.ownerDocument;
+    const ownerWindow = ownerDocument?.defaultView;
+    if (editor === null || ownerDocument === undefined || ownerWindow === null || ownerWindow === undefined) return;
+    const trackSelection = (): void => {
+      const caret = composerCaretTextOffset(editor, ownerWindow.getSelection());
+      if (caret === undefined || submitting) return;
+      if (mentionPolicy.directories) {
+        const activeMention = inlineMentionActivationRef.current;
+        if (activeMention?.source === "button") return;
+        const detectedMention = commandComposingRef.current
+          ? null
+          : detectComposerInlineMention(textRef.current, caret, inlineMentionRangesRef.current);
+        if (detectedMention !== null) {
+          replaceCommandActivation(undefined);
+          suppressedCommandFromRef.current = undefined;
+          if (suppressedInlineMentionFromRef.current === detectedMention.from) return;
+          if (activeMention?.from === detectedMention.from
+            && activeMention.to === detectedMention.to
+            && activeMention.query === detectedMention.query
+            && activeMention.quoted === detectedMention.quoted) return;
+          typedPaletteTriggerRef.current = "@";
+          replaceInlineMentionActivation({ ...detectedMention, source: "typed" });
+          setInlineMentionActiveIndex(0);
+          setPalette("mention");
+          return;
+        }
+        suppressedInlineMentionFromRef.current = undefined;
+        if (activeMention?.source === "typed") {
+          replaceInlineMentionActivation(undefined);
+          if (palette === "mention") setPalette(undefined);
+        }
+      }
+      const command = commandItems.length === 0
+        ? undefined
+        : detectComposerCommandActivation(textRef.current, caret, {
+            isComposing: commandComposingRef.current,
+            bashMode: false
+          });
+      if (command === undefined) {
+        suppressedCommandFromRef.current = undefined;
+        if (commandActivationRef.current !== undefined) {
+          replaceCommandActivation(undefined);
+          if (palette === "commands") setPalette(undefined);
+        }
+        return;
+      }
+      if (suppressedCommandFromRef.current === command.from) return;
+      const previous = commandActivationRef.current;
+      if (previous?.from === command.from && previous.to === command.to && previous.query === command.query) return;
+      typedPaletteTriggerRef.current = undefined;
+      replaceCommandActivation(command);
+      setCommandActiveIndex(0);
+      setPalette("commands");
+    };
+    ownerDocument.addEventListener("selectionchange", trackSelection);
+    return () => ownerDocument.removeEventListener("selectionchange", trackSelection);
+  }, [commandItems.length, mentionPolicy.directories, palette, submitting]);
+
+  const focusComposerAt = (offset: number): void => {
+    requestAnimationFrame(() => {
+      richEditorRef.current?.focus();
+      const editor = composerRootRef.current?.querySelector<HTMLElement>(".composer-rich-editor__content") ?? null;
+      setComposerCaretTextOffset(editor, editor?.ownerDocument.getSelection() ?? null, offset);
+    });
+  };
+
+  const openInlineMentionPalette = (): void => {
+    if (submitting || !mentionPolicy.directories) return;
+    const editor = composerRootRef.current?.querySelector<HTMLElement>(".composer-rich-editor__content") ?? null;
+    const selectedOffset = composerCaretTextOffset(editor, editor?.ownerDocument.getSelection() ?? null);
+    const from = Math.min(Math.max(selectedOffset ?? textRef.current.length, 0), textRef.current.length);
+    typedPaletteTriggerRef.current = undefined;
+    suppressedInlineMentionFromRef.current = undefined;
+    suppressedCommandFromRef.current = undefined;
+    replaceCommandActivation(undefined);
+    replaceInlineMentionActivation({ from, to: from, query: "", quoted: false, source: "button" });
+    setInlineMentionActiveIndex(0);
+    setPalette("mention");
+  };
+
+  const selectInlineMention = (item: ComposerMentionCatalogItem, reference = false): void => {
+    if (submitting || !mentionPolicy.directories) return;
+    const activation = inlineMentionActivationRef.current;
+    const selectedItem = inlineMentionCatalogItems.find((candidate) => candidate.id === item.id);
+    if (activation === undefined || selectedItem === undefined || selectedItem.disabled === true) return;
+    const directoryToken = selectedItem.kind === "directory" && !reference
+      ? composerDirectoryQueryToken(selectedItem.path)
+      : undefined;
+    const mention = selectedItem.mention;
+    if (directoryToken === undefined) {
+      if (mention === undefined || !newTaskMentionsAllowed([mention], mentionPolicy, workspace?.id)) return;
+      if (mention.kind === "workspace"
+        && (mention.workspaceId !== workspace?.id || (selectedItem.kind === "directory") !== (mention.directory === true))) return;
+    }
+    const existingSeparator = /\s/u.test(textRef.current[activation.to] ?? "");
+    const replacement = directoryToken ?? `${mention!.token}${existingSeparator ? "" : " "}`;
+    const nextDocument = replaceComposerDocumentTextRange(
+      editorDocumentRef.current,
+      activation.from,
+      activation.to,
+      replacement
+    );
+    if (nextDocument === undefined) return;
     voiceDictionaryLearning.clear();
+    const nextText = composerDocumentPlainText(nextDocument);
+    const mappedRanges = remapComposerInlineMentionReplacement(
+      inlineMentionRangesRef.current,
+      activation.from,
+      activation.to,
+      replacement.length
+    );
+    editorDocumentRef.current = nextDocument;
+    setEditorDocument(nextDocument);
+    textRef.current = nextText;
+    setText(nextText);
+    if (directoryToken !== undefined) {
+      replaceMentions(composerMentionsFromRanges(mentionsRef.current, mappedRanges), mappedRanges);
+      const caret = activation.from + directoryToken.length;
+      const detected = detectComposerInlineMention(nextText, caret, mappedRanges);
+      if (detected === null) {
+        closePalette();
+      } else {
+        replaceInlineMentionActivation({ ...detected, source: activation.source });
+        setInlineMentionActiveIndex(0);
+        setPalette("mention");
+      }
+      focusComposerAt(caret);
+      return;
+    }
+    const nextRanges = [...mappedRanges, {
+      mentionId: mention!.id,
+      from: activation.from,
+      to: activation.from + mention!.token.length
+    }].sort((left, right) => left.from - right.from || left.to - right.to);
+    replaceMentions([
+      ...composerMentionsFromRanges(mentionsRef.current, mappedRanges).filter((candidate) => candidate.id !== mention!.id),
+      mention!
+    ], nextRanges);
+    const caret = activation.from + mention!.token.length + (existingSeparator ? 1 : 0);
+    closePalette();
+    focusComposerAt(Math.min(caret, nextText.length));
+  };
+
+  const insertPaletteItem = (item: ComposerPaletteItem): void => {
+    if (submitting || item.mention !== undefined && !newTaskMentionsAllowed([item.mention], mentionPolicy, workspace?.id)) return;
+    voiceDictionaryLearning.clear();
+    const activeCommand = commandActivationRef.current;
+    if (palette === "commands" && activeCommand !== undefined) {
+      const next = replaceNewSessionCommandDocument(editorDocumentRef.current, activeCommand, item);
+      if (next === undefined) return;
+      const replacementLength = next.caret - activeCommand.from;
+      const nextRanges = remapComposerInlineMentionReplacement(
+        inlineMentionRangesRef.current,
+        activeCommand.from,
+        activeCommand.to,
+        replacementLength
+      );
+      replaceMentions(composerMentionsFromRanges(mentionsRef.current, nextRanges), nextRanges);
+      editorDocumentRef.current = next.document;
+      setEditorDocument(next.document);
+      textRef.current = next.text;
+      setText(next.text);
+      closePalette();
+      requestAnimationFrame(() => {
+        richEditorRef.current?.focus();
+        const editor = composerRootRef.current?.querySelector<HTMLElement>(".composer-rich-editor__content") ?? null;
+        setComposerCaretTextOffset(editor, editor?.ownerDocument.getSelection() ?? null, Math.min(next.caret, next.text.length));
+      });
+      return;
+    }
     const typedTrigger = typedPaletteTriggerRef.current;
+    const previousText = textRef.current;
     const next = insertNewSessionPaletteDocument(editorDocumentRef.current, typedTrigger, item);
+    const previousRanges = typedTrigger !== undefined && previousText === typedTrigger ? [] : inlineMentionRangesRef.current;
+    const retainedMentions = composerMentionsFromRanges(mentionsRef.current, previousRanges);
+    if (item.mention !== undefined && item.mention.kind !== "message") {
+      const mention = item.mention;
+      const from = next.text.length - mention.token.length;
+      const nextRanges = [...previousRanges, { mentionId: mention.id, from, to: next.text.length }];
+      replaceMentions([...retainedMentions.filter((candidate) => candidate.id !== mention.id), mention], nextRanges);
+    } else {
+      replaceMentions(retainedMentions, previousRanges);
+    }
     editorDocumentRef.current = next.document;
     setEditorDocument(next.document);
     textRef.current = next.text;
     setText(next.text);
-    if (item.mention !== undefined) setMentions((current) => [...current.filter((candidate) => candidate.id !== item.mention?.id), item.mention!]);
     closePalette(true);
   };
+
+  const visibleCommandItems = filterComposerPaletteItems(commandItems, commandActivation?.query ?? "");
+  const selectedCommandIndex = visibleCommandItems.length === 0
+    ? 0
+    : Math.min(commandActiveIndex, visibleCommandItems.length - 1);
+  useEffect(() => {
+    if (visibleCommandItems.length === 0) {
+      if (commandActiveIndex !== 0) setCommandActiveIndex(0);
+    } else if (commandActiveIndex >= visibleCommandItems.length) {
+      setCommandActiveIndex(visibleCommandItems.length - 1);
+    }
+  }, [commandActiveIndex, visibleCommandItems.length]);
+
+  const captureInlineMentionKey = (event: KeyboardEvent): boolean => {
+    if (palette !== "mention" || inlineMentionActivationRef.current === undefined || event.isComposing) return false;
+    if (event.altKey || event.ctrlKey || event.metaKey || (event.key === "Tab" && event.shiftKey)) return false;
+    const intent = resolveComposerInlineMentionKey(event.key, inlineMentionActiveIndex, inlineMentionResults.items);
+    if (intent === null) return false;
+    event.preventDefault();
+    if (intent.kind === "close") {
+      closeInlineMention(true, true);
+      return true;
+    }
+    if (intent.kind === "move") {
+      setInlineMentionActiveIndex(intent.index);
+      return true;
+    }
+    const selectedItem = inlineMentionResults.items[intent.index];
+    if (selectedItem !== undefined && selectedItem.disabled !== true) selectInlineMention(selectedItem);
+    return true;
+  };
+
+  const captureTypedCommandKey = (event: KeyboardEvent): boolean => {
+    const active = commandActivationRef.current;
+    if (palette !== "commands" || active === undefined || event.isComposing) return false;
+    if (event.altKey || event.ctrlKey || event.metaKey || (event.key === "Tab" && event.shiftKey)) return false;
+    if (visibleCommandItems.length === 0 && (event.key === "Enter" || event.key === "Tab")) {
+      event.preventDefault();
+      return true;
+    }
+    const intent = resolveComposerPaletteKey(event.key, selectedCommandIndex, visibleCommandItems.length);
+    if (intent === null) return false;
+    event.preventDefault();
+    if (intent.kind === "close") {
+      suppressedCommandFromRef.current = active.from;
+      closePalette(true);
+      return true;
+    }
+    if (intent.kind === "move") {
+      setCommandActiveIndex(intent.index);
+      return true;
+    }
+    const selectedItem = visibleCommandItems[intent.index];
+    if (selectedItem !== undefined) insertPaletteItem(selectedItem);
+    return true;
+  };
+
+  useEffect(() => {
+    if (commandItems.length > 0 || commandActivationRef.current === undefined) return;
+    replaceCommandActivation(undefined);
+    if (palette === "commands") setPalette(undefined);
+  }, [commandItems.length, palette]);
 
   const addFiles = (files: FileList | readonly File[]): void => {
     if (submitting) return;
@@ -713,11 +1223,15 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const submit = async (activeDocument: JSONContent = editorDocumentRef.current): Promise<void> => {
     const sourceEditorDocument = normalizeComposerDocument(activeDocument, textRef.current);
     const sourceText = composerDocumentPlainText(sourceEditorDocument);
+    const sourceRanges = restoreComposerInlineMentionRanges(sourceText, mentionsRef.current, inlineMentionRangesRef.current);
+    const sourceMentions = composerMentionsFromRanges(mentionsRef.current, sourceRanges);
     const activeCanSend = validContext
       && modelRouteReady
       && (!composerDocumentIsEmpty(sourceEditorDocument) || attachments.length > 0)
       && attachmentsAllowed
+      && newTaskMentionsAllowed(sourceMentions, mentionPolicy, workspace?.id)
       && worktreeDecisionReady
+      && fullAccessConfirmationRef.current === undefined
       && !submitting && !voice.isActive();
     if (!activeCanSend || selection === undefined || submissionRef.current) return;
     voiceDictionaryLearning.clear();
@@ -736,6 +1250,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       isCurrent: () => submissionScopeRef.current === sourceScope && submissionEpochRef.current === sourceEpoch && submissionRef.current === attempt
         && !request.signal.aborted && submissionValidityRef.current && voiceRoot?.isConnected === true && voiceRoot.ownerDocument === ownerDocument && !ownerWindow.closed
         && editorDocumentRef.current === sourceDraft && attachmentsRef.current === sourceAttachments
+        && newTaskMentionsAllowed(sourceMentions, mentionPolicyRef.current, workspaceIdRef.current)
     };
     submissionOriginRef.current = owner;
     setSubmitting(true);
@@ -764,10 +1279,11 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
         planMode: execution.planModeSupported && planMode,
         ...(worktree === undefined ? {} : { worktree })
       }, {
-        text: sourceText.trim(),
+        text: sourceText,
         editorDocument: sourceEditorDocument,
         attachments,
-        mentions: mentionsStillPresent(sourceText, mentions),
+        mentions: sourceMentions,
+        inlineMentionRanges: sourceRanges,
         deliveryMode: "prompt",
         ...(canSelectExtraDirectories ? { extraDirectoryIds } : {})
       }, owner);
@@ -785,6 +1301,8 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   submitRef.current = submit;
 
   const handleEditorKeyDown = (event: KeyboardEvent, activeDocument: JSONContent): boolean => {
+    if (captureInlineMentionKey(event)) return true;
+    if (captureTypedCommandKey(event)) return true;
     const intent = resolveComposerEnterIntent({
       key: event.key,
       shiftKey: event.shiftKey,
@@ -810,7 +1328,46 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     event.stopPropagation();
   };
 
-  const paletteInAddMenu = palette !== undefined && typedPaletteTriggerRef.current === undefined;
+  const selectPermissionMode = (mode: PermissionMode): void => {
+    if (submitting || !execution.permissionModes.includes(mode)) return;
+    if (mode !== "bypassPermissions" || permissionMode === "bypassPermissions") {
+      retireFullAccessConfirmation();
+      setPermissionMode(mode);
+      return;
+    }
+    const ownerDocument = voiceRoot?.ownerDocument;
+    const ownerWindow = ownerDocument?.defaultView;
+    if (!hydrated || ownerDocument === undefined || ownerWindow === null || ownerWindow === undefined || ownerWindow.closed) return;
+    const confirmation: FullAccessConfirmation = { scope: fullAccessConfirmationScope, ownerDocument };
+    fullAccessConfirmationRef.current = confirmation;
+    setFullAccessConfirmation(confirmation);
+  };
+
+  const confirmFullAccess = (confirmation: FullAccessConfirmation): void => {
+    const ownerDocument = voiceRoot?.ownerDocument;
+    const ownerWindow = ownerDocument?.defaultView;
+    const current = fullAccessConfirmationRef.current;
+    if (current !== confirmation
+      || confirmation.scope !== fullAccessConfirmationScopeRef.current
+      || confirmation.ownerDocument !== ownerDocument
+      || ownerWindow === null
+      || ownerWindow === undefined
+      || ownerWindow.closed
+      || submitting
+      || !execution.permissionModes.includes("bypassPermissions")) {
+      retireFullAccessConfirmation(confirmation);
+      return;
+    }
+    retireFullAccessConfirmation(confirmation);
+    setPermissionMode("bypassPermissions");
+  };
+
+  const paletteInAddMenu = palette !== undefined
+    && typedPaletteTriggerRef.current === undefined
+    && commandActivation === undefined;
+  const activeFullAccessConfirmation = fullAccessConfirmation?.scope === fullAccessConfirmationScope
+    ? fullAccessConfirmation
+    : undefined;
 
   return <main className="new-task-page">
     <header className="new-task-page__header">
@@ -962,6 +1519,8 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
                     onOpenChange={(next) => {
                       if (next) {
                         typedPaletteTriggerRef.current = undefined;
+                        suppressedCommandFromRef.current = undefined;
+                        replaceCommandActivation(undefined);
                         setPalette("add");
                       } else if (paletteInAddMenu) {
                         closePalette(false);
@@ -975,16 +1534,47 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
                     count={extraDirectoryIds.length}
                   >
                     {palette === "add" && <><div className="composer-add-menu__actions" role="menu">
-                      {(attachmentPolicy.images || attachmentPolicy.files) && <button className="composer-add-menu__action" type="button" role="menuitem" onClick={() => { setPalette(undefined); fileInputRef.current?.click(); }}><Paperclip aria-hidden="true" /><span><strong>{t("composer.attach")}</strong><small>{t("composer.attachments")}</small></span></button>}
-                      {canMention && <button className="composer-add-menu__action" type="button" role="menuitem" onClick={() => { typedPaletteTriggerRef.current = undefined; setPalette("mention"); }}><AtSign aria-hidden="true" /><span><strong>{t("composer.mention")}</strong><small>{mentionItems.length}</small></span></button>}
-                      {commandItems.length > 0 && <button className="composer-add-menu__action" type="button" role="menuitem" onClick={() => { typedPaletteTriggerRef.current = undefined; setPalette("commands"); }}><Sparkles aria-hidden="true" /><span><strong>{t("composer.commands")}</strong><small>{commandItems.length}</small></span></button>}
+                      {(attachmentPolicy.images || attachmentPolicy.files) && <button className="composer-add-menu__action" type="button" role="menuitem" onClick={() => { closePalette(); fileInputRef.current?.click(); }}><Paperclip aria-hidden="true" /><span><strong>{t("composer.attach")}</strong><small>{t("composer.attachments")}</small></span></button>}
+                      {canMention && <button className="composer-add-menu__action" type="button" role="menuitem" onClick={() => {
+                        if (mentionPolicy.directories) {
+                          openInlineMentionPalette();
+                          return;
+                        }
+                        typedPaletteTriggerRef.current = undefined;
+                        suppressedCommandFromRef.current = undefined;
+                        replaceCommandActivation(undefined);
+                        setPalette("mention");
+                      }}><AtSign aria-hidden="true" /><span><strong>{t("composer.mention")}</strong><small>{t("composer.mentionCount", { count: mentionItemCount })}</small></span></button>}
+                      {commandItems.length > 0 && <button className="composer-add-menu__action" type="button" role="menuitem" onClick={() => { typedPaletteTriggerRef.current = undefined; suppressedCommandFromRef.current = undefined; replaceCommandActivation(undefined); setPalette("commands"); }}><Sparkles aria-hidden="true" /><span><strong>{t("composer.commands")}</strong><small>{commandItems.length}</small></span></button>}
                     </div>
                     {canSelectExtraDirectories && selectableExtraDirectories.length > 0 && <fieldset className="composer-add-menu__directories">
                       <legend>{t("composer.extraDirectories")}</legend>
                       {selectableExtraDirectories.map((directory) => <label key={directory.id}><CheckboxControl disabled={submitting} checked={extraDirectoryIds.includes(directory.id)} onChange={(event) => setExtraDirectoryIds((current) => event.target.checked ? [...new Set([...current, directory.id])] : current.filter((id) => id !== directory.id))} /><span><strong>{directory.serverPath}</strong><small>{directory.access === "readWrite" ? t("projects.readWrite") : t("projects.readOnly")}</small></span></label>)}
                       <button className="composer-add-menu__directory-reset" type="button" disabled={submitting || extraDirectoryIds.length === 0} onClick={() => setExtraDirectoryIds([])}>{t("common.none")}</button>
                     </fieldset>}</>}
-                    {palette === "mention" && paletteInAddMenu && <NewTaskPalette
+                    {palette === "mention" && mentionPolicy.directories && inlineMentionActivation !== undefined && paletteInAddMenu && <ComposerInlineMentionPanel
+                      embedded
+                      title={t("composer.mention")}
+                      query={inlineMentionActivation.query}
+                      state={inlineMentionProviderState}
+                      results={inlineMentionResults}
+                      activeIndex={inlineMentionActiveIndex}
+                      labels={{ close: t("common.close"), loading: t("common.loading"), empty: t("composer.noMentions"), more: t("common.more"), retry: t("common.retry") }}
+                      onActiveIndexChange={setInlineMentionActiveIndex}
+                      onSelect={selectInlineMention}
+                      onReference={(item) => selectInlineMention(item, true)}
+                      referenceOptions={{
+                        directory: true,
+                        lineRange: mentionPolicy.lineRanges,
+                        directoryLabel: t("composer.referenceDirectory"),
+                        startLineLabel: t("composer.referenceStartLine"),
+                        endLineLabel: t("composer.referenceEndLine"),
+                        lineRangeLabel: t("composer.referenceLines")
+                      }}
+                      onClose={() => closeInlineMention(true, true)}
+                      onRetry={() => setWorkspaceMentionReload((current) => current + 1)}
+                    />}
+                    {palette === "mention" && !mentionPolicy.directories && paletteInAddMenu && <NewTaskPalette
                       embedded
                       title={t("composer.mention")}
                       items={mentionItems}
@@ -999,7 +1589,28 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
                     />}
                     {palette === "commands" && paletteInAddMenu && <NewTaskPalette embedded title={t("composer.commands")} items={commandItems} empty={t("composer.noCommands")} t={t} onSelect={insertPaletteItem} onClose={() => closePalette(true)} />}
                   </ComposerAddMenu>
-                  {palette === "mention" && !paletteInAddMenu && <NewTaskPalette
+                  {palette === "mention" && mentionPolicy.directories && inlineMentionActivation !== undefined && !paletteInAddMenu && <ComposerInlineMentionPanel
+                    title={t("composer.mention")}
+                    query={inlineMentionActivation.query}
+                    state={inlineMentionProviderState}
+                    results={inlineMentionResults}
+                    activeIndex={inlineMentionActiveIndex}
+                    labels={{ close: t("common.close"), loading: t("common.loading"), empty: t("composer.noMentions"), more: t("common.more"), retry: t("common.retry") }}
+                    onActiveIndexChange={setInlineMentionActiveIndex}
+                    onSelect={selectInlineMention}
+                    onReference={(item) => selectInlineMention(item, true)}
+                    referenceOptions={{
+                      directory: true,
+                      lineRange: mentionPolicy.lineRanges,
+                      directoryLabel: t("composer.referenceDirectory"),
+                      startLineLabel: t("composer.referenceStartLine"),
+                      endLineLabel: t("composer.referenceEndLine"),
+                      lineRangeLabel: t("composer.referenceLines")
+                    }}
+                    onClose={() => closeInlineMention(true, true)}
+                    onRetry={() => setWorkspaceMentionReload((current) => current + 1)}
+                  />}
+                  {palette === "mention" && !mentionPolicy.directories && !paletteInAddMenu && <NewTaskPalette
                   title={t("composer.mention")}
                   items={mentionItems}
                   empty={t("composer.noMentions")}
@@ -1011,7 +1622,21 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
                   onClose={() => closePalette(true)}
                   onRetry={() => setWorkspaceMentionReload((current) => current + 1)}
                 />}
-                  {palette === "commands" && !paletteInAddMenu && <NewTaskPalette title={t("composer.commands")} items={commandItems} empty={t("composer.noCommands")} t={t} onSelect={insertPaletteItem} onClose={() => closePalette(true)} />}
+                  {palette === "commands" && !paletteInAddMenu && <NewTaskPalette
+                    title={t("composer.commands")}
+                    items={commandItems}
+                    empty={t("composer.noCommands")}
+                    typedQuery={commandActivation?.query}
+                    controlledActiveIndex={selectedCommandIndex}
+                    onControlledActiveIndexChange={setCommandActiveIndex}
+                    t={t}
+                    onSelect={insertPaletteItem}
+                    onClose={() => {
+                      const active = commandActivationRef.current;
+                      if (active !== undefined) suppressedCommandFromRef.current = active.from;
+                      closePalette(true);
+                    }}
+                  />}
                 </div>}
               </div>
               <div className="new-task-composer__controls">
@@ -1054,7 +1679,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
                     setFastMode(execution.fastModeSupported && nextModel.supportsFast && selection.fastMode);
                   }}
                 />}
-                {execution.permissionSelectable ? <PermissionSelector value={permissionMode} modes={execution.permissionModes} disabled={submitting} disabledReason={submitting ? t("common.working") : undefined} onChange={setPermissionMode} t={t} /> : <Pill tone="neutral"><Shield aria-hidden="true" />{permissionLabel(execution.permissionModes[0] ?? "ask", t)}</Pill>}
+                {execution.permissionSelectable ? <PermissionSelector value={permissionMode} modes={execution.permissionModes} disabled={submitting} disabledReason={submitting ? t("common.working") : undefined} onChange={selectPermissionMode} t={t} /> : <Pill tone="neutral"><Shield aria-hidden="true" />{permissionLabel(execution.permissionModes[0] ?? "ask", t)}</Pill>}
                 {execution.planModeSupported && <button className={cx("new-task-composer__toggle", planMode && "is-active")} type="button" disabled={submitting} aria-pressed={planMode} onClick={() => setPlanMode((value) => !value)}><Sparkles aria-hidden="true" />{t("controls.plan")}</button>}
               </div>
               <IconButton buttonRef={bindVoiceSend} className={cx("send-button", heldVoice.sendTargetActive && "is-voice-target")} tooltipOpen={heldVoice.sendTargetActive ? true : undefined} label={voice.active ? t(heldVoice.sendTargetActive ? "voice.releaseToSend" : "voice.finishAndSend") : t("composer.send")} disabled={voice.active ? !canFinishVoiceSend : !canSend} disabledReason={!canSend ? submitting ? t("common.working") : !hasInput ? t("composer.placeholder") : t("composer.inputUnavailable") : undefined} onClick={() => { if (voice.isActive()) finishVoiceAndSend(); else void submit(); }}><Send aria-hidden="true" /></IconButton>
@@ -1074,7 +1699,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
               setEditorDocument(nextDocument);
               textRef.current = nextText;
               setText(nextText);
-              setMentions([]);
+              replaceMentions([], []);
               closePalette();
               requestAnimationFrame(() => richEditorRef.current?.focus());
             }}><span><Icon aria-hidden="true" /></span><strong>{t(label)}</strong></button>)}
@@ -1083,6 +1708,30 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
         <HomeUsageDashboard controller={controller} ownerId={pickerOwnerId} locale={controller.state.preferences.locale} t={t} />
       </section>
     </div>
+    <Modal
+      open={activeFullAccessConfirmation !== undefined}
+      ownerDocument={activeFullAccessConfirmation?.ownerDocument}
+      title={t("permission.full")}
+      description={t("permission.fullHelp")}
+      dialogRole="alertdialog"
+      size="small"
+      onClose={() => {
+        if (activeFullAccessConfirmation !== undefined) retireFullAccessConfirmation(activeFullAccessConfirmation);
+      }}
+    >
+      <div className="risk-confirmation">
+        <div className="risk-confirmation__icon"><Shield aria-hidden="true" /></div>
+        <p>{t("permission.fullHelp")}</p>
+        <div className="modal__actions">
+          <Button onClick={() => {
+            if (activeFullAccessConfirmation !== undefined) retireFullAccessConfirmation(activeFullAccessConfirmation);
+          }}>{t("common.cancel")}</Button>
+          <Button tone="danger" onClick={() => {
+            if (activeFullAccessConfirmation !== undefined) confirmFullAccess(activeFullAccessConfirmation);
+          }}>{t("common.enable")} {t("permission.full")}</Button>
+        </div>
+      </div>
+    </Modal>
     <ComposerPastedTextDialog
       target={pastedTextTarget}
       title={t("composer.pastedTextEditTitle")}
@@ -1109,46 +1758,65 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   </main>;
 }
 
-function NewTaskPalette({ title, items, empty, loading = false, error, truncated = false, t, onSelect, onClose, onRetry, embedded = false }: {
+function newTaskMentionsAllowed(
+  mentions: readonly ComposerMentionDraft[],
+  policy: ReturnType<typeof resolveComposerMentionPolicy>,
+  workspaceId: string | undefined
+): boolean {
+  return composerMentionsAllowed(mentions, policy, []) && mentions.every((mention) =>
+    mention.kind !== "workspace" || workspaceId !== undefined && mention.workspaceId === workspaceId);
+}
+
+function NewTaskPalette({ title, items, empty, loading = false, error, truncated = false, typedQuery, controlledActiveIndex, onControlledActiveIndexChange, t, onSelect, onClose, onRetry, embedded = false }: {
   readonly title: string;
   readonly items: readonly ComposerPaletteItem[];
   readonly empty: string;
   readonly loading?: boolean;
   readonly error?: string;
   readonly truncated?: boolean;
+  readonly typedQuery?: string;
+  readonly controlledActiveIndex?: number;
+  readonly onControlledActiveIndexChange?: (index: number) => void;
   readonly t: Translator;
   readonly onSelect: (item: ComposerPaletteItem) => void;
   readonly onClose: () => void;
   readonly onRetry?: () => void;
   readonly embedded?: boolean;
 }): JSX.Element {
-  const [query, setQuery] = useState("");
-  const [activeIndex, setActiveIndex] = useState(0);
+  const [localQuery, setLocalQuery] = useState("");
+  const [localActiveIndex, setLocalActiveIndex] = useState(0);
+  const query = typedQuery ?? localQuery;
+  const activeIndex = controlledActiveIndex ?? localActiveIndex;
+  const rootRef = useRef<HTMLDivElement>(null);
+  const updateActiveIndex = (index: number): void => {
+    if (controlledActiveIndex === undefined) setLocalActiveIndex(index);
+    else onControlledActiveIndexChange?.(index);
+  };
   const listId = useId();
-  const visible = items.filter((item) => `${item.label} ${item.meta}`.toLowerCase().includes(query.toLowerCase())).slice(0, 20);
+  const visible = filterComposerPaletteItems(items, query);
   const selectedIndex = visible.length > 0 ? Math.min(activeIndex, visible.length - 1) : 0;
   const activeOptionId = visible.length > 0 ? `${listId}-option-${selectedIndex}` : undefined;
   useEffect(() => {
-    if (visible.length === 0 && activeIndex !== 0) setActiveIndex(0);
-    else if (activeIndex >= visible.length && visible.length > 0) setActiveIndex(visible.length - 1);
+    if (visible.length === 0 && activeIndex !== 0) updateActiveIndex(0);
+    else if (activeIndex >= visible.length && visible.length > 0) updateActiveIndex(visible.length - 1);
   }, [activeIndex, visible.length]);
-  useEffect(() => { if (activeOptionId !== undefined) document.getElementById(activeOptionId)?.scrollIntoView?.({ block: "nearest" }); }, [activeOptionId]);
-  return <div className={cx("composer-palette", embedded && "composer-palette--embedded")} role={embedded ? "group" : "dialog"} aria-label={title}>
+  useEffect(() => { if (activeOptionId !== undefined) rootRef.current?.ownerDocument.getElementById(activeOptionId)?.scrollIntoView?.({ block: "nearest" }); }, [activeOptionId]);
+  return <div ref={rootRef} className={cx("composer-palette", embedded && "composer-palette--embedded")} role={embedded ? "group" : "dialog"} aria-label={title}>
     {!embedded && <header><strong>{title}</strong><IconButton label={t("common.close")} onClick={onClose}><X aria-hidden="true" /></IconButton></header>}
-    <input autoFocus type="search" role="combobox" aria-autocomplete="list" aria-controls={listId} aria-expanded="true" aria-activedescendant={activeOptionId} value={query} onChange={(event) => { setQuery(event.target.value); setActiveIndex(0); }} onKeyDown={(event) => {
+    {typedQuery === undefined && <input autoFocus type="search" role="combobox" aria-autocomplete="list" aria-controls={listId} aria-expanded="true" aria-activedescendant={activeOptionId} value={query} onChange={(event) => { setLocalQuery(event.target.value); updateActiveIndex(0); }} onKeyDown={(event) => {
       if (event.nativeEvent.isComposing || event.altKey || event.ctrlKey || event.metaKey || (event.key === "Tab" && event.shiftKey)) return;
       const intent = resolveComposerPaletteKey(event.key, selectedIndex, visible.length);
       if (intent === null) return;
       event.preventDefault();
       if (intent.kind === "close") onClose();
-      else if (intent.kind === "move") setActiveIndex(intent.index);
+      else if (intent.kind === "move") updateActiveIndex(intent.index);
       else {
         const selectedItem = visible[intent.index];
         if (selectedItem !== undefined) onSelect(selectedItem);
       }
-    }} placeholder={t("common.filter")} aria-label={`${t("common.filter")} ${title}`} />
+    }} placeholder={t("common.filter")} aria-label={`${t("common.filter")} ${title}`} />}
     <div id={listId} className="composer-palette__list" role="listbox">
-      {visible.map((item, index) => <button id={`${listId}-option-${index}`} type="button" role="option" aria-selected={index === selectedIndex} tabIndex={-1} key={item.id} onMouseMove={() => setActiveIndex(index)} onClick={() => onSelect(item)}><span>{item.label}</span><small>{item.meta}</small></button>)}
+      {visible.map((item, index) => <button id={`${listId}-option-${index}`} type="button" role="option" aria-selected={index === selectedIndex} tabIndex={-1} key={item.id} onMouseMove={() => updateActiveIndex(index)} onClick={() => onSelect(item)}><span>{item.label}</span><small>{item.meta}</small></button>)}
       {visible.length === 0 && !loading && error === undefined && <p>{empty}</p>}
     </div>
     {loading && <p role="status">{t("common.loading")}</p>}

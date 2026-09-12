@@ -10,6 +10,7 @@ import type {
   EventId,
   EventPayload,
   InputDisposition,
+  InteractionDecision,
   InteractionId,
   InteractionPayload,
   OperationId,
@@ -790,7 +791,7 @@ export interface InteractionRecord {
   readonly kind: InteractionPayload["kind"];
   readonly status: "open" | "resolved" | "dismissed";
   readonly payload: InteractionPayload;
-  readonly decision?: unknown;
+  readonly decision?: InteractionDecision;
   readonly dismissalReason?: string;
   readonly createdAt: UnixMillis;
   readonly resolvedAt?: UnixMillis;
@@ -1062,6 +1063,7 @@ export interface StartupRecoveryResult {
   readonly affectedRunIds: readonly RunId[];
   readonly recoveredEffectOperationIds: readonly OperationId[];
   readonly recoveredReviewRuns: readonly ReviewRunRecord[];
+  readonly dismissedInteractionIds: readonly InteractionId[];
   readonly revision: bigint;
   readonly events: readonly PersistedEvent[];
 }

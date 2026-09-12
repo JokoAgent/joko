@@ -92,6 +92,7 @@ export interface WorkspaceFilesRouteProps {
   readonly chatPane: ReactNode;
   readonly t: Translator;
   readonly onError: (message: string) => void;
+  readonly onArchiveSession: (session: SessionView, onArchived?: () => void) => void;
   readonly onSelectionQuote?: (sessionId: string, quote: ComposerFileSelectionQuoteDraft) => void;
   readonly onImageToChat?: (sessionId: string, file: File) => void | Promise<void>;
   readonly navigation: WorkspaceFilesNavigationShell;
@@ -117,12 +118,6 @@ export type WorkspaceFilesNavigationShell = Pick<SidebarFrameProps,
 interface LeavePromptState {
   readonly input: WorkspaceLeavePromptInput;
   readonly resolve: (choice: WorkspaceLeaveChoice) => void;
-}
-
-interface ArchivePromptState {
-  readonly sessionId: string;
-  readonly neighborId?: string;
-  readonly title: string;
 }
 
 interface RailDragState {
@@ -156,6 +151,7 @@ export function WorkspaceFilesRoute({
   chatPane,
   t,
   onError,
+  onArchiveSession,
   onSelectionQuote,
   onImageToChat,
   navigation
@@ -171,9 +167,6 @@ export function WorkspaceFilesRoute({
   navigationRef.current = navigation;
   const leavePromptRef = useRef<LeavePromptState | undefined>(undefined);
   const [leavePrompt, setLeavePrompt] = useState<LeavePromptState | undefined>(undefined);
-  const [archivePrompt, setArchivePrompt] = useState<ArchivePromptState>();
-  const [archiveBusy, setArchiveBusy] = useState(false);
-  const archiveBusyRef = useRef(false);
   const [previewState, setPreviewState] = useState<FilePreviewState>({ loading: false });
   const [previewRefreshSequence, setPreviewRefreshSequence] = useState(0);
   const [compactLayout, setCompactLayout] = useState(() => browserMatches(WORKSPACE_FILES_COMPACT_MEDIA_QUERY));
@@ -728,45 +721,11 @@ export function WorkspaceFilesRoute({
       onError(t("workspace.archiveRunningBlocked"));
       return;
     }
-    setArchivePrompt({ sessionId, ...(neighborId === undefined ? {} : { neighborId }), title: closing.name.trim() || t("session.unnamed") });
-  }, [onError, t, workdirSessions]);
-
-  const confirmArchive = useCallback(async (): Promise<void> => {
-    const pending = archivePrompt;
-    if (pending === undefined || archiveBusyRef.current) return;
-    archiveBusyRef.current = true;
-    setArchiveBusy(true);
-    try {
-      if (pending.sessionId === session.id) {
-        const matches = (identity: { readonly sessionId: string }): boolean => identity.sessionId === pending.sessionId;
-        // Avoid stacking two focus-trapping Modals while the dirty document
-        // registry asks its save/discard/cancel question.
-        if (workspaceDocumentController.shouldPreventUnload(matches)) setArchivePrompt(undefined);
-        const allowed = await requestWorkspaceDocumentLeave({
-          reason: "switch-session",
-          matches
-        });
-        if (!allowed) return;
-      }
-      const latest = controllerRef.current.state.snapshot.sessions.find((candidate) => candidate.id === pending.sessionId);
-      if (latest !== undefined && (latest.state === "running" || latest.state === "waiting" || latest.state === "retrying")) {
-        setArchivePrompt(undefined);
-        onError(t("workspace.archiveRunningBlocked"));
-        return;
-      }
-      await controllerRef.current.archiveSession(pending.sessionId, true);
-      setArchivePrompt(undefined);
-      if (pending.sessionId === session.id) {
-        if (pending.neighborId === undefined) controllerRef.current.navigate({ kind: "session" });
-        else activateSession(pending.neighborId);
-      }
-    } catch (error) {
-      onError(messageOf(error, t("workspace.archiveFailed")));
-    } finally {
-      archiveBusyRef.current = false;
-      setArchiveBusy(false);
-    }
-  }, [activateSession, archivePrompt, onError, session.id, t]);
+    onArchiveSession(closing, closing.id === session.id ? () => {
+      if (neighborId === undefined) controllerRef.current.navigate({ kind: "session" });
+      else activateSession(neighborId);
+    } : undefined);
+  }, [activateSession, onArchiveSession, onError, session.id, t, workdirSessions]);
 
   const createSession = useCallback(async (optionId: string): Promise<void> => {
     if (optionId !== backend.id) return;
@@ -999,19 +958,6 @@ export function WorkspaceFilesRoute({
       </div>
     </Modal>
 
-    <Modal
-      open={archivePrompt !== undefined}
-      title={t("workspace.archiveSessionTitle")}
-      description={archivePrompt === undefined ? undefined : t("workspace.archiveSessionDescription", { name: archivePrompt.title })}
-      closeLabel={t("common.close")}
-      size="small"
-      onClose={() => { if (!archiveBusy) setArchivePrompt(undefined); }}
-    >
-      <div className="modal__actions">
-        <Button disabled={archiveBusy} onClick={() => setArchivePrompt(undefined)}>{t("common.cancel")}</Button>
-        <Button tone="primary" disabled={archiveBusy} onClick={() => { void confirmArchive(); }}>{archiveBusy ? <Spinner label={t("common.working")} /> : null}{t("session.archive")}</Button>
-      </div>
-    </Modal>
   </>;
 }
 

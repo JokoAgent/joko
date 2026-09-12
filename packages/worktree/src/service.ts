@@ -34,11 +34,14 @@ import {
   type WorktreeAcquisition,
   type WorktreeCallOptions,
   type WorktreeCwdDetection,
+  type WorktreeDeriveRequest,
   type WorktreeInitialization,
   type WorktreeInitializeOptions,
   type WorktreeLease,
   type WorktreeRelease,
   type WorktreeReleaseOptions,
+  type WorktreeRemovalPreview,
+  type WorktreeRemovalPreviewRequest,
   type WorktreeResult,
   type WorktreeServiceSnapshot,
   type WorktreeSourceResolution,
@@ -224,6 +227,182 @@ export class EphemeralWorktreeService {
 
       const created = await this.#createEntry(detection, accepted.sessionId, source, control);
       return Object.freeze({ lease: leaseFromEntry(created), existing: false });
+    });
+  }
+
+  derive(
+    request: WorktreeDeriveRequest,
+    options?: WorktreeCallOptions
+  ): Promise<WorktreeResult<WorktreeAcquisition>> {
+    return this.#serialize(options, true, async (control) => {
+      const accepted = validateDeriveRequest(request);
+      const store = this.#requireStore();
+      if (store.entries().some((entry) => entry.sessionId === accepted.sessionId)) {
+        throw new WorktreeServiceError(
+          "SESSION_CONFLICT",
+          "The derived Session already owns a worktree lease.",
+          { sessionId: accepted.sessionId }
+        );
+      }
+      const source = store.entries().find((entry) => entry.sessionId === accepted.sourceSessionId);
+      if (source === undefined || source.id !== accepted.sourceLeaseId || source.status !== "active") {
+        throw new WorktreeServiceError(
+          "SESSION_CONFLICT",
+          "The source Session no longer owns the active worktree lease.",
+          { sourceSessionId: accepted.sourceSessionId }
+        );
+      }
+      await this.#validateManagedPath(source, true);
+      if (await attachedWorktreeBranch(source.path, control) !== source.branch) {
+        throw new WorktreeServiceError("SESSION_CONFLICT", "The source worktree branch changed before derivation.");
+      }
+      const sourceDetection = await probeWorktreeCwd(source.path, control);
+      const repositoryDetection = await probeWorktreeCwd(source.repositoryRoot, control);
+      if (!sourceDetection.isLinkedWorktree
+        || !samePath(sourceDetection.cwd, source.path)
+        || !samePath(sourceDetection.repositoryRoot, source.path)
+        || repositoryDetection.isLinkedWorktree
+        || !samePath(repositoryDetection.repositoryRoot, source.repositoryRoot)
+        || !samePath(sourceDetection.gitCommonDirectory, repositoryDetection.gitCommonDirectory)) {
+        throw new WorktreeServiceError("SESSION_CONFLICT", "The source worktree identity changed before derivation.");
+      }
+
+      const sourceHead = await worktreeHeadCommit(source.path, control);
+      if (sourceHead === undefined) {
+        throw new WorktreeServiceError("SESSION_CONFLICT", "The source worktree has no stable HEAD commit.");
+      }
+      const snapshotSha = await this.#createDirtySnapshotObject(source, control);
+      if (!(await this.#sourceSnapshotStillCurrent(source, sourceHead, snapshotSha, control))) {
+        throw new WorktreeServiceError("SESSION_CONFLICT", "The source worktree changed while it was being captured.");
+      }
+
+      let created: ManagedWorktreeEntry | undefined;
+      try {
+        created = await this.#createEntry(repositoryDetection, accepted.sessionId, {
+          ref: sourceHead,
+          commit: sourceHead,
+          refreshed: false,
+          strategy: "explicit",
+          reason: "derived_session_snapshot"
+        }, control);
+        if (snapshotSha !== undefined) {
+          await runGit(["stash", "apply", "--index", snapshotSha], created.path, control);
+          if (!(await this.#snapshotMatchesWorktree(created, snapshotSha, control))) {
+            throw new WorktreeServiceError(
+              "SESSION_CONFLICT",
+              "The derived worktree did not reproduce the captured source state."
+            );
+          }
+        } else if (!(await isWorktreeCompletelyClean(created.path, control))) {
+          throw new WorktreeServiceError("SESSION_CONFLICT", "The clean derived worktree changed during creation.");
+        }
+        if (await worktreeHeadCommit(created.path, control) !== sourceHead
+          || !(await this.#sourceSnapshotStillCurrent(source, sourceHead, snapshotSha, control))) {
+          throw new WorktreeServiceError("SESSION_CONFLICT", "The source worktree changed before derivation completed.");
+        }
+        return Object.freeze({ lease: leaseFromEntry(created), existing: false });
+      } catch (error) {
+        if (created !== undefined) {
+          try {
+            await this.#destroyEntry(created, control);
+          } catch {
+            if (isTerminalError(error)) throw error;
+            throw new WorktreeServiceError(
+              "CLEANUP_FAILED",
+              "A failed derived worktree could not be destroyed safely."
+            );
+          }
+        }
+        throw error;
+      }
+    });
+  }
+
+  previewRemoval(
+    request: WorktreeRemovalPreviewRequest,
+    options?: WorktreeCallOptions
+  ): Promise<WorktreeResult<WorktreeRemovalPreview>> {
+    return this.#serialize(options, true, async (control) => {
+      const accepted = validateRemovalPreviewRequest(request);
+      const entry = this.#requireStore().entries().find(
+        (candidate) => candidate.sessionId === accepted.sessionId && candidate.id === accepted.leaseId
+      );
+      if (entry === undefined) {
+        throw new WorktreeServiceError(
+          "SESSION_CONFLICT",
+          "The Session no longer owns the requested worktree lease.",
+          { sessionId: accepted.sessionId }
+        );
+      }
+      await this.#validateManagedRecord(entry);
+      await validateOrdinaryDirectory(
+        entry.repositoryRoot,
+        "REPOSITORY_UNSAFE",
+        "The managed repository is unavailable during removal preview."
+      );
+      if (entry.status === "active") {
+        if (entry.archiveSnapshot !== undefined || entry.pendingOwnerRefTransition !== undefined
+          || entry.checkoutCleanup !== undefined || entry.deletionTransfer !== undefined) {
+          throw new WorktreeServiceError(
+            "STATE_CORRUPT",
+            "An active Session worktree conflicts with durable removal state."
+          );
+        }
+        await this.#validateManagedPath(entry, true);
+        if (await attachedWorktreeBranch(entry.path, control) !== entry.branch) {
+          throw new WorktreeServiceError(
+            "SESSION_CONFLICT",
+            "The Session worktree branch changed before removal preview."
+          );
+        }
+        return Object.freeze({
+          state: "active" as const,
+          dirty: !(await isWorktreeCompletelyClean(entry.path, control))
+        });
+      }
+      if (entry.status === "preserved" && entry.archiveSnapshot !== undefined) {
+        if (await pathExists(entry.path)) {
+          throw new WorktreeServiceError(
+            "SESSION_CONFLICT",
+            "The preserved Session worktree unexpectedly still has a checkout."
+          );
+        }
+        await this.#assertRecordedBranchTip(entry, control);
+        if (entry.pendingOwnerRefTransition !== undefined || entry.checkoutCleanup !== undefined
+          || entry.deletionTransfer !== undefined) {
+          throw new WorktreeServiceError(
+            "SESSION_CONFLICT",
+            "The preserved Session worktree is changing recovery ownership."
+          );
+        }
+        const ownerSha = await this.#snapshotSha(entry, control);
+        if (entry.archiveSnapshot.kind === "clean" && ownerSha !== undefined) {
+          throw new WorktreeServiceError(
+            "SESSION_CONFLICT",
+            "A clean Session archive conflicts with a Git recovery object."
+          );
+        }
+        if (entry.archiveSnapshot.kind === "dirty" && ownerSha === undefined) {
+          throw new WorktreeServiceError(
+            "STATE_CORRUPT",
+            "The dirty Session archive is missing its authoritative owner reference."
+          );
+        }
+        if (entry.archiveSnapshot.kind === "dirty" && ownerSha !== entry.archiveSnapshot.sha) {
+          throw new WorktreeServiceError(
+            "SESSION_CONFLICT",
+            "The dirty Session archive owner reference moved away from its durable object identity."
+          );
+        }
+        return Object.freeze({
+          state: "preserved" as const,
+          dirty: entry.archiveSnapshot.kind === "dirty"
+        });
+      }
+      throw new WorktreeServiceError(
+        "SESSION_CONFLICT",
+        "The Session worktree is changing ownership."
+      );
     });
   }
 
@@ -657,6 +836,18 @@ export class EphemeralWorktreeService {
       throw new WorktreeServiceError("STATE_CORRUPT", "The Session worktree snapshot was not durably recorded.");
     }
     return snapshotSha;
+  }
+
+  async #sourceSnapshotStillCurrent(
+    entry: ManagedWorktreeEntry,
+    expectedHead: string,
+    snapshotSha: string | undefined,
+    control: WorktreeOperationControl
+  ): Promise<boolean> {
+    if (await worktreeHeadCommit(entry.path, control) !== expectedHead) return false;
+    return snapshotSha === undefined
+      ? isWorktreeCompletelyClean(entry.path, control)
+      : this.#snapshotMatchesWorktree(entry, snapshotSha, control);
   }
 
   async #createDirtySnapshotObject(
@@ -1431,6 +1622,34 @@ function validateAcquireRequest(value: unknown): WorktreeAcquireRequest {
     ...(value["sourceRef"] === undefined ? {} : { sourceRef: value["sourceRef"] }),
     ...(value["refreshRemote"] === undefined ? {} : { refreshRemote: value["refreshRemote"] })
   };
+}
+
+function validateDeriveRequest(value: unknown): WorktreeDeriveRequest {
+  if (!isRecord(value) || hasUnsupportedKeys(value, ["sessionId", "sourceSessionId", "sourceLeaseId"])) {
+    throw invalidArgument("request", "The worktree derivation request is invalid.");
+  }
+  const sessionId = validateSessionId(value["sessionId"]);
+  const sourceSessionId = validateSessionId(value["sourceSessionId"]);
+  const sourceLeaseId = value["sourceLeaseId"];
+  if (sessionId === sourceSessionId) {
+    throw invalidArgument("sessionId", "A derived worktree requires a distinct Session owner.");
+  }
+  if (typeof sourceLeaseId !== "string" || !ENTRY_ID_PATTERN.test(sourceLeaseId)) {
+    throw invalidArgument("sourceLeaseId", "The source worktree lease id is invalid.");
+  }
+  return { sessionId, sourceSessionId, sourceLeaseId };
+}
+
+function validateRemovalPreviewRequest(value: unknown): WorktreeRemovalPreviewRequest {
+  if (!isRecord(value) || hasUnsupportedKeys(value, ["sessionId", "leaseId"])) {
+    throw invalidArgument("request", "The worktree removal-preview request is invalid.");
+  }
+  const sessionId = validateSessionId(value["sessionId"]);
+  const leaseId = value["leaseId"];
+  if (typeof leaseId !== "string" || !ENTRY_ID_PATTERN.test(leaseId)) {
+    throw invalidArgument("leaseId", "The worktree lease id is invalid.");
+  }
+  return { sessionId, leaseId };
 }
 
 function validateSessionId(value: unknown): string {

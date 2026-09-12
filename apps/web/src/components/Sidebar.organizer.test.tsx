@@ -2,11 +2,11 @@
 
 import { act, createRef } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, onTestFinished, vi } from "vitest";
 
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
 import { emptySnapshot, type ScheduleView, type SessionView } from "../model.js";
-import { DEFAULT_SIDEBAR_OWNER_LAYOUT, type SidebarDisplayPreferences } from "../sidebar-layout.js";
+import { DEFAULT_SIDEBAR_OWNER_LAYOUT, SIDEBAR_DIALOGUE_FILTER_ID, type SidebarDisplayPreferences } from "../sidebar-layout.js";
 import { Sidebar, type SidebarProps } from "./Sidebar.js";
 import { SIDEBAR_HOVER_CARD_CLOSE_DELAY_MS, SIDEBAR_HOVER_CARD_OPEN_DELAY_MS } from "./SidebarHoverCard.js";
 import type { Translator } from "./types.js";
@@ -27,6 +27,22 @@ afterEach(async () => {
 });
 
 describe("Sidebar organizer display controls", () => {
+  it("offers created-time sorting through the organizer", async () => {
+    const onPreferencesChange = vi.fn();
+    const rendered = await renderSidebar(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, onPreferencesChange);
+
+    let menu = await openOrganizer(rendered.container);
+    const created = buttonWithText(menu, "nav.sortCreated");
+    expect(created.getAttribute("role")).toBe("menuitemradio");
+    expect(created.getAttribute("aria-checked")).toBe("false");
+    await act(async () => created.click());
+    expect(onPreferencesChange).toHaveBeenLastCalledWith({ sortBy: "created" });
+
+    await rendered.rerender({ ...DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, sortBy: "created" });
+    menu = await openOrganizer(rendered.container);
+    expect(buttonWithText(menu, "nav.sortCreated").getAttribute("aria-checked")).toBe("true");
+  });
+
   it("hands a completed task drag to the Desktop outside-window fence", async () => {
     installDragPreviewTokens();
     const beginDragPreview = vi.fn().mockResolvedValue(true);
@@ -405,6 +421,56 @@ describe("Sidebar organizer display controls", () => {
     expect(onNewDialogue).toHaveBeenCalledWith("backend");
   });
 
+  it.each(["expanded", "rail"] as const)("keeps hidden-project tasks reachable as dialogues in %s navigation and restores their original group", async (mode) => {
+    const target = { id: "target", backendId: "backend", name: "Hidden project", workspaceId: "workspace", revision: 1n, workspaceName: "Hidden project", trusted: true, pinned: false, archived: true } as const;
+    const task = session();
+    const onArchive = vi.fn();
+    const snapshot = {
+      ...emptySnapshot(), revision: 1n,
+      server: { name: "Orchestrator", version: "test", health: "healthy" as const },
+      backends: [{ id: "backend", name: "Backend", version: "1", health: "healthy" as const, capabilities: new Map() }],
+      targets: [target], sessions: [task, { ...task, id: "pinned-task", pinned: true }]
+    };
+    const rendered = await renderSidebar(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, vi.fn(), {
+      mode, snapshot, onArchive,
+      sidebarOwnerLayouts: { owner: { ...DEFAULT_SIDEBAR_OWNER_LAYOUT, projectFilter: [SIDEBAR_DIALOGUE_FILTER_ID] } }
+    });
+    let dialogue: HTMLElement;
+    if (mode === "rail") {
+      const rail = required(rendered.container.querySelector<HTMLElement>(".sidebar__rail-view"));
+      const trigger = required(rail.querySelector<HTMLButtonElement>("[data-sidebar-rail-trigger='dialogues']"));
+      mockRect(trigger, 70, 162, 36, 36);
+      await act(async () => trigger.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: 0 })));
+      dialogue = required(document.body.querySelector<HTMLElement>(".sidebar-rail-panel[data-sidebar-rail-panel-level='1']"));
+      expect(rail.querySelector(".sidebar__rail-pinned-tile[data-session-id='pinned-task']")).not.toBeNull();
+    } else {
+      dialogue = required(rendered.container.querySelector<HTMLElement>(".sidebar-main-view .project-group--dialogue"));
+      expect(rendered.container.querySelector(".sidebar-main-view .project-group:not(.project-group--dialogue)")).toBeNull();
+    }
+    const row = required(dialogue.querySelector<HTMLElement>("[data-session-id='session']"));
+    await act(async () => row.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 170, clientY: 190 })));
+    const menu = required(document.body.querySelector<HTMLElement>(".session-menu-popover"));
+    await act(async () => buttonWithText(menu, "session.archive").click());
+    expect(onArchive).toHaveBeenCalledExactlyOnceWith(task);
+    expect(onArchive.mock.calls[0]?.[0]).toBe(task);
+    expect(task.projectId).toBe("target");
+    if (mode === "rail") await act(async () => window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+
+    await rendered.rerenderOwnerLayouts({ owner: { ...DEFAULT_SIDEBAR_OWNER_LAYOUT, projectFilter: [target.id] } });
+    await rendered.rerenderSnapshot({ ...snapshot, targets: [{ ...target, archived: false }] });
+    if (mode === "rail") {
+      const trigger = required(rendered.container.querySelector<HTMLButtonElement>("[data-sidebar-rail-trigger='projects']"));
+      mockRect(trigger, 70, 120, 36, 36);
+      await act(async () => trigger.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: 0 })));
+      expect(document.body.querySelector(".sidebar-rail-panel")?.textContent).toContain("Hidden project");
+    } else {
+      const group = required(rendered.container.querySelector<HTMLElement>(".sidebar-main-view .project-group:not(.project-group--dialogue)"));
+      expect(group.textContent).toContain("Hidden project");
+      expect(group.querySelector("[data-session-id='session']")).not.toBeNull();
+      expect(rendered.container.querySelector(".sidebar-main-view .project-group--dialogue")).toBeNull();
+    }
+  });
+
   it("executes the complete local project action surface with confirmation and inline rename", async () => {
     const target = { id: "target", backendId: "backend", name: "Project", workspaceId: "workspace", revision: 1n, workspaceName: "Project", trusted: true, pinned: false, archived: false } as const;
     const idle = { ...session(), id: "idle-task", name: "Idle task" };
@@ -461,13 +527,12 @@ describe("Sidebar organizer display controls", () => {
 
     menu = await openMenu();
     await act(async () => buttonWithText(menu, "projects.archiveAll").click());
-    let dialog = required(document.body.querySelector<HTMLElement>("[role='alertdialog']"));
-    await act(async () => buttonWithText(dialog, "projects.archiveAll").click());
     expect(onSetTargetSessionsArchived).toHaveBeenCalledWith(target, [idle], true);
+    expect(document.body.querySelector("[role='alertdialog']")).toBeNull();
 
     menu = await openMenu();
     await act(async () => buttonWithText(menu, "projects.removeFromSidebar").click());
-    dialog = required(document.body.querySelector<HTMLElement>("[role='alertdialog']"));
+    const dialog = required(document.body.querySelector<HTMLElement>("[role='alertdialog']"));
     await act(async () => buttonWithText(dialog, "common.remove").click());
     expect(onRemoveTarget).toHaveBeenCalledWith(target);
 
@@ -475,6 +540,38 @@ describe("Sidebar organizer display controls", () => {
     await act(async () => buttonWithText(menu, "projects.search").click());
     await act(async () => { await new Promise((resolve) => window.requestAnimationFrame(() => resolve(undefined))); });
     expect(document.activeElement).toBe(rendered.container.querySelector(".sidebar-search input"));
+  });
+
+  it.each(["member", "dialogue", "search", "user-focus", "owner-change"] as const)("continues project-removal focus only for the original scope: %s", async (outcome) => {
+    const rects = vi.spyOn(HTMLElement.prototype, "getClientRects").mockImplementation(function (this: HTMLElement) {
+      return (this.matches(".sidebar-main-view .session-row__main, .sidebar-main-view .project-group--dialogue .project-group__header, .sidebar-search input")
+        ? [new DOMRect(0, 0, 20, 20)] : []) as unknown as DOMRectList;
+    });
+    onTestFinished(() => rects.mockRestore());
+    const target = { id: "target", backendId: "backend", name: "Project", workspaceId: "workspace", revision: 1n, workspaceName: "Project", trusted: true, pinned: false, archived: false };
+    const snapshot = { ...emptySnapshot(), targets: [target], sessions: [session()] };
+    const onRemoveTarget = vi.fn();
+    const view = await renderSidebar(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, vi.fn(), { snapshot, onRemoveTarget,
+      sidebarOwnerLayouts: { owner: { ...DEFAULT_SIDEBAR_OWNER_LAYOUT, collapsedDialogue: outcome === "dialogue" } }
+    });
+    const more = required(view.container.querySelector<HTMLButtonElement>(".project-group [aria-label='common.more']"));
+    await act(async () => { more.focus(); more.click(); });
+    await act(async () => buttonWithText(required(document.body.querySelector<HTMLElement>(".sidebar-project-actions-menu")), "projects.removeFromSidebar").click());
+    const confirm = buttonWithText(required(document.body.querySelector<HTMLElement>("[role='alertdialog']")), "common.remove");
+    await act(async () => { confirm.focus(); confirm.click(); });
+    expect(onRemoveTarget).toHaveBeenCalledExactlyOnceWith(target);
+    expect(document.activeElement).toBe(more);
+    if (outcome === "user-focus") {
+      const other = document.createElement("button"); document.body.append(other);
+      other.focus(); other.blur();
+    }
+    if (outcome === "owner-change") await view.rerenderOwnerId("other-owner");
+    await view.rerenderSnapshot({ ...snapshot, targets: [{ ...target, archived: true }], sessions: outcome === "search" ? [] : snapshot.sessions });
+    await act(async () => { await new Promise((resolve) => window.requestAnimationFrame(resolve)); });
+    if (outcome === "member") expect(document.activeElement).toBe(view.container.querySelector(".sidebar-main-view [data-session-id='session']"));
+    else if (outcome === "dialogue") expect(document.activeElement).toBe(view.container.querySelector(".sidebar-main-view .project-group--dialogue .project-group__header"));
+    else if (outcome === "search") expect(document.activeElement).toBe(view.container.querySelector(".sidebar-search input"));
+    else expect(document.activeElement).toBe(document.body);
   });
 
   it("uses click-open filter and task-information submenus while keeping filter edits open", async () => {
@@ -711,7 +808,7 @@ describe("Sidebar organizer display controls", () => {
     expect(onMoveSessionProject).toHaveBeenLastCalledWith(moved, { kind: "dialogue" });
   });
 
-  it("opens the task menu at the row context point and supports synchronous selection, inline rename, bulk actions, and inline archive confirmation", async () => {
+  it("opens the task menu at the row context point and supports synchronous selection, inline rename, bulk actions, and quick archive", async () => {
     const onNavigate = vi.fn();
     const onRename = vi.fn();
     const onArchive = vi.fn();
@@ -805,9 +902,6 @@ describe("Sidebar organizer display controls", () => {
     const quickArchive = rendered.container.querySelector<HTMLElement>("[data-session-id='session-a']")?.closest(".session-row")?.querySelector<HTMLButtonElement>(".session-row__quick-archive");
     if (quickArchive === null || quickArchive === undefined) throw new Error("Quick archive action was not rendered.");
     await act(async () => quickArchive.click());
-    const confirm = rendered.container.querySelector<HTMLElement>("[data-session-id='session-a']")?.closest(".session-row")?.querySelector<HTMLButtonElement>(".session-row__archive-confirm");
-    if (confirm === null || confirm === undefined) throw new Error("Inline archive confirmation was not rendered.");
-    await act(async () => confirm.click());
     expect(onArchive).toHaveBeenCalledWith(sessions[0]);
   });
 
@@ -885,7 +979,7 @@ describe("Sidebar organizer display controls", () => {
     expect(buttonWithText(flat.container, "nav.showAllTasks")).toBeDefined();
   });
 
-  it("groups fresh schedule runs and exposes the reference schedule controls", async () => {
+  it("groups fresh schedule runs and exposes their schedule controls", async () => {
     const operations: string[] = [];
     const onNavigate = vi.fn();
     const onRunSchedule = vi.fn(async () => undefined);
@@ -911,7 +1005,7 @@ describe("Sidebar organizer display controls", () => {
       onRunSchedule,
       onToggleSchedule,
       onDeleteSchedule,
-      onPreviewScheduleDeletion: async () => ({ generatedSessionIds: runs.map((run) => run.id), inflightCount: 0 }),
+      onPreviewScheduleDeletion: async () => ({ generatedSessionIds: runs.map((run) => run.id), inflightCount: 0, worktreeRemoval: { clean: runs.length, dirty: 0, unknown: 0 } }),
       onSidebarOwnerLayoutChange: onOwnerLayoutChange
     });
 
@@ -978,7 +1072,7 @@ describe("Sidebar organizer display controls", () => {
     const rendered = await renderSidebar(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, vi.fn(), {
       snapshot: scheduleSnapshot(runs),
       onDeleteSchedule: vi.fn(async () => { throw new Error("schedule delete failed"); }),
-      onPreviewScheduleDeletion: async () => ({ generatedSessionIds: runs.map((run) => run.id), inflightCount: 0 })
+      onPreviewScheduleDeletion: async () => ({ generatedSessionIds: runs.map((run) => run.id), inflightCount: 0, worktreeRemoval: { clean: runs.length, dirty: 0, unknown: 0 } })
     });
     const group = required(rendered.container.querySelector<HTMLElement>("[data-schedule-group-id='daily']"));
     const menu = required(group.querySelector<HTMLDetailsElement>(".schedule-session-group__menu"));
@@ -1108,13 +1202,15 @@ async function renderSidebar(
   readonly rerender: (next: SidebarDisplayPreferences) => Promise<void>;
   readonly rerenderOwnerLayouts: (next: SidebarProps["sidebarOwnerLayouts"]) => Promise<void>;
   readonly rerenderActiveSessionId: (next: string | undefined) => Promise<void>;
+  readonly rerenderSnapshot: (next: SidebarProps["snapshot"]) => Promise<void>;
+  readonly rerenderOwnerId: (next: string) => Promise<void>;
 }> {
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
   roots.push(root);
   const noop = vi.fn();
-  const snapshot = options.snapshot ?? {
+  let snapshot = options.snapshot ?? {
     ...emptySnapshot(),
     revision: 1n,
     server: { name: "Orchestrator", version: "test", health: "healthy" as const },
@@ -1135,6 +1231,7 @@ async function renderSidebar(
   let currentPreferences = preferences;
   let currentOwnerLayouts = options.sidebarOwnerLayouts ?? DEFAULT_UI_PREFERENCES.sidebarOwnerLayouts;
   let currentActiveSessionId = options.activeSessionId;
+  let currentOwnerId = "owner";
   const render = async (next: SidebarDisplayPreferences, ownerLayouts: SidebarProps["sidebarOwnerLayouts"], nextActiveSessionId: string | undefined): Promise<void> => {
     currentPreferences = next;
     currentOwnerLayouts = ownerLayouts;
@@ -1145,7 +1242,7 @@ async function renderSidebar(
       route={{ kind: "session" }}
       locale="en"
       messageSearchSort="relevance"
-      sidebarOwnerId="owner"
+      sidebarOwnerId={currentOwnerId}
       sidebarDisplayPreferences={next}
       sidebarOwnerLayouts={ownerLayouts}
       open
@@ -1197,7 +1294,9 @@ async function renderSidebar(
     container,
     rerender: (next) => render(next, currentOwnerLayouts, currentActiveSessionId),
     rerenderOwnerLayouts: (next) => render(currentPreferences, next, currentActiveSessionId),
-    rerenderActiveSessionId: (next) => render(currentPreferences, currentOwnerLayouts, next)
+    rerenderActiveSessionId: (next) => render(currentPreferences, currentOwnerLayouts, next),
+    rerenderSnapshot: (next) => { snapshot = next; return render(currentPreferences, currentOwnerLayouts, currentActiveSessionId); },
+    rerenderOwnerId: (next) => { currentOwnerId = next; return render(currentPreferences, currentOwnerLayouts, currentActiveSessionId); }
   };
 }
 

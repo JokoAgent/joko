@@ -78,6 +78,7 @@ service SessionService {
   rpc GetNativeSessionTree(GetNativeSessionTreeRequest) returns (GetNativeSessionTreeResponse);
   rpc GetSessionStatistics(GetSessionStatisticsRequest) returns (GetSessionStatisticsResponse);
   rpc ListRuntimeCommands(ListRuntimeCommandsRequest) returns (ListRuntimeCommandsResponse);
+  rpc ListSessionResources(ListSessionResourcesRequest) returns (ListSessionResourcesResponse);
   rpc ListBackgroundTasks(ListBackgroundTasksRequest) returns (ListBackgroundTasksResponse);
   rpc ListSessionTimeline(ListSessionTimelineRequest) returns (ListSessionTimelineResponse);
   rpc SearchSessionMessages(SearchSessionMessagesRequest) returns (SearchSessionMessagesResponse);
@@ -222,6 +223,7 @@ service BrowserService {
 service WorktreeService {
   rpc ProbeTargetWorktree(ProbeTargetWorktreeRequest) returns (ProbeTargetWorktreeResponse);
   rpc ListTargetWorktreeSources(ListTargetWorktreeSourcesRequest) returns (ListTargetWorktreeSourcesResponse);
+  rpc GetSessionWorktreeRemovalPreview(GetSessionWorktreeRemovalPreviewRequest) returns (GetSessionWorktreeRemovalPreviewResponse);
 }
 
 service SubagentService {
@@ -1022,6 +1024,16 @@ message ListTargetWorktreeSourcesResponse {
   PageInfo page = 2;
 }
 
+message GetSessionWorktreeRemovalPreviewRequest {
+  string session_id = 1;
+}
+
+message GetSessionWorktreeRemovalPreviewResponse {
+  string session_id = 1;
+  bool has_worktree = 2;
+  bool dirty = 3;
+}
+
 message ListWorkspacesRequest {
   string target_id = 1;
   PageRequest page = 2;
@@ -1264,6 +1276,7 @@ message ListArtifactsRequest {
 message ListArtifactsResponse {
   repeated Artifact artifacts = 1;
   PageInfo page = 2;
+  Revision revision = 3;
 }
 
 message GetArtifactRequest {
@@ -1828,4 +1841,12 @@ message ListRuntimeCommandsRequest {
 
 message ListRuntimeCommandsResponse {
   repeated RuntimeCommand commands = 1;
+}
+
+message ListSessionResourcesRequest {
+  string session_id = 1;
+}
+
+message ListSessionResourcesResponse {
+  repeated SessionResource resources = 1;
 }

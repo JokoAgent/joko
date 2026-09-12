@@ -118,9 +118,9 @@ class Ssh2TerminalHandle implements RemoteTerminalHandle {
     channel.stderr.on("error", this.onFailure);
     channel.once("end", () => { this.#stdoutEnded = true; this.maybeFinish(); });
     channel.stderr.once("end", () => { this.#stderrEnded = true; this.maybeFinish(); });
-    channel.once("close", () => { this.#channelClosed = true; this.maybeFinish(); });
+    channel.once("close", () => { this.#channelClosed = true; this.maybeFinish(); if (this.#exit !== undefined) this.closeChannel(); });
     channel.once("exit", (code: number | null, signal?: string) => {
-      if (this.#exit !== undefined) return;
+      if (this.#exit?.processExitConfirmed === true) return;
       if (Number.isInteger(code) && code !== null && code >= 0) {
         this.#remoteExit = { exitCode: code, processExitConfirmed: true };
       } else if (typeof signal === "string" && signal.length > 0 && signal.length <= 64) {
@@ -133,12 +133,16 @@ class Ssh2TerminalHandle implements RemoteTerminalHandle {
       // SSH exit-status/exit-signal confirms the process, not EOF. The peer may
       // still send output, and only the consumer may release its backpressure.
       if (this.#remoteExit !== undefined) {
+        if (this.#exit !== undefined) {
+          this.finish({ ...this.#exit, ...this.#remoteExit });
+          return;
+        }
         this.#drainTimer = setTimeout(this.onFailure, timeouts.drain);
         this.maybeFinish();
       }
     });
-    client.once("close", this.onFailure);
-    client.once("error", this.onFailure);
+    client.once("close", this.onTransportFailure);
+    client.once("error", this.onTransportFailure);
   }
 
   onData(listener: (data: string) => void): { dispose(): void } {
@@ -150,7 +154,7 @@ class Ssh2TerminalHandle implements RemoteTerminalHandle {
   onExit(listener: (event: RemoteTerminalExit) => void): { dispose(): void } {
     this.#exitListeners.add(listener);
     const exit = this.#exit;
-    if (exit !== undefined) queueMicrotask(() => { if (this.#exitListeners.has(listener)) listener(exit); });
+    if (exit !== undefined) queueMicrotask(() => { if (this.#exit === exit && this.#exitListeners.has(listener)) listener(exit); });
     return { dispose: () => { this.#exitListeners.delete(listener); } };
   }
 
@@ -238,6 +242,7 @@ class Ssh2TerminalHandle implements RemoteTerminalHandle {
       ? { exitCode: 1, failureCode: "TERMINAL_UNKNOWN", processExitConfirmed: false }
       : { ...this.#remoteExit, failureCode: "TERMINAL_FAILED" });
   };
+  private readonly onTransportFailure = (): void => { this.onFailure(); this.closeChannel(); };
 
   private receive(chunk: Buffer, decoder: StringDecoder): void {
     if (this.#exit !== undefined) return;
@@ -291,13 +296,11 @@ class Ssh2TerminalHandle implements RemoteTerminalHandle {
   }
 
   private finish(exit: RemoteTerminalExit): void {
-    if (this.#exit !== undefined) return;
+    if (this.#exit !== undefined && (this.#exit.processExitConfirmed === true || exit.processExitConfirmed !== true)) return;
     this.#exit = Object.freeze(exit);
     clearTimeout(this.#drainTimer);
     this.#output.length = 0;
     this.#outputBytes = 0;
-    this.#client.removeListener("close", this.onFailure);
-    this.#client.removeListener("error", this.onFailure);
     this.#channel.removeListener("data", this.onStdout);
     this.#channel.stderr.removeListener("data", this.onStderr);
     for (const fail of this.#pendingOperations) fail();
@@ -305,6 +308,19 @@ class Ssh2TerminalHandle implements RemoteTerminalHandle {
     if (this.#remoteExit === undefined) {
       try { this.#channel.signal("KILL"); } catch { /* The connection may already be gone. */ }
     }
+    if (exit.processExitConfirmed !== true && !this.#channelClosed) {
+      // Keep this exact channel available for a late exit-status. Its screen is
+      // already incomplete; discard later output without retaining buffered data.
+      this.#channel.resume();
+      this.#channel.stderr.resume();
+      return;
+    }
+    this.closeChannel();
+  }
+
+  private closeChannel(): void {
+    this.#client.removeListener("close", this.onTransportFailure);
+    this.#client.removeListener("error", this.onTransportFailure);
     try { this.#channel.close(); } catch { /* Cleanup cannot confirm remote exit. */ }
     this.#channel.destroy();
   }

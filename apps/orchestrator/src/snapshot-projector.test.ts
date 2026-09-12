@@ -815,7 +815,8 @@ function createFixture(): { readonly store: OperationalStore } {
         choices: [
           { id: "yes", label: "yes" },
           { id: "no", label: "no" }
-        ]
+        ],
+        allowOther: false
       }]
     }
   });

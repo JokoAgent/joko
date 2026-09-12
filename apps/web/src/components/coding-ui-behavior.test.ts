@@ -52,38 +52,47 @@ describe("fuzzy sidebar search", () => {
 });
 
 const textField = field({ id: "text", kind: "text", required: true });
-const singleField = field({ id: "single", kind: "single", required: true, options: [{ id: "one", label: "One" }] });
-const multipleField = field({ id: "multiple", kind: "multiple", required: true, options: [{ id: "one", label: "One" }, { id: "two", label: "Two" }, { id: "three", label: "Three" }], minimumSelections: 2, maximumSelections: 2 });
+const singleField = field({ id: "single", kind: "single", required: true, allowOther: true, options: [{ id: "one", label: "One" }] });
+const multipleField = field({ id: "multiple", kind: "multiple", required: true, allowOther: true, options: [{ id: "one", label: "One" }, { id: "two", label: "Two" }, { id: "three", label: "Three" }], minimumSelections: 2, maximumSelections: 2 });
 const booleanField = field({ id: "boolean", kind: "boolean", required: true });
+const textAnswer = (value: string) => ({ kind: "text", value } as const);
+const choiceAnswer = (choiceId: string) => ({ kind: "single", selection: { kind: "choice", choiceId } } as const);
+const otherAnswer = (text: string) => ({ kind: "single", selection: { kind: "other", text } } as const);
+const multipleAnswer = (choiceIds: readonly string[], otherText?: string) => ({
+  kind: "multiple",
+  choiceIds,
+  ...(otherText === undefined ? {} : { otherText })
+} as const);
+const booleanAnswer = (value: boolean) => ({ kind: "boolean", value } as const);
 
 describe("typed question wizard", () => {
   it("validates text, single, multiple min/max, and boolean answers", () => {
-    expect(validQuestionAnswer(textField, "  ")).toBe(false);
-    expect(validQuestionAnswer(textField, "answer")).toBe(true);
-    expect(validQuestionAnswer(singleField, " ")).toBe(false);
-    expect(validQuestionAnswer(singleField, "custom answer")).toBe(true);
-    expect(validQuestionAnswer(singleField, "one")).toBe(true);
-    expect(validQuestionAnswer(multipleField, ["one"])).toBe(false);
-    expect(validQuestionAnswer(multipleField, ["one", "two"])).toBe(true);
-    expect(validQuestionAnswer(multipleField, ["one", "two", "three"])).toBe(false);
+    expect(validQuestionAnswer(textField, textAnswer("  "))).toBe(false);
+    expect(validQuestionAnswer(textField, textAnswer("answer"))).toBe(true);
+    expect(validQuestionAnswer(singleField, otherAnswer(" "))).toBe(false);
+    expect(validQuestionAnswer(singleField, otherAnswer("custom answer"))).toBe(true);
+    expect(validQuestionAnswer(singleField, choiceAnswer("one"))).toBe(true);
+    expect(validQuestionAnswer(multipleField, multipleAnswer(["one"]))).toBe(false);
+    expect(validQuestionAnswer(multipleField, multipleAnswer(["one", "two"]))).toBe(true);
+    expect(validQuestionAnswer(multipleField, multipleAnswer(["one", "two", "three"]))).toBe(false);
     expect(validQuestionAnswer(booleanField, undefined)).toBe(false);
-    expect(validQuestionAnswer(booleanField, false)).toBe(true);
+    expect(validQuestionAnswer(booleanField, booleanAnswer(false))).toBe(true);
   });
 
   it("keeps empty optional answers behind the explicit Skip action", () => {
     const optionalText = field({ id: "optional-text", kind: "text", required: false });
-    const optionalMultiple = field({ id: "optional-multiple", kind: "multiple", required: false });
+    const optionalMultiple = field({ id: "optional-multiple", kind: "multiple", required: false, allowOther: true });
     expect(validQuestionAnswer(optionalText, undefined)).toBe(true);
     expect(hasQuestionAnswer(optionalText, undefined)).toBe(false);
-    expect(hasQuestionAnswer(optionalText, "   ")).toBe(false);
-    expect(hasQuestionAnswer(optionalText, "answer")).toBe(true);
-    expect(hasQuestionAnswer(optionalMultiple, [])).toBe(false);
-    expect(hasQuestionAnswer(optionalMultiple, ["custom answer"])).toBe(true);
+    expect(hasQuestionAnswer(optionalText, textAnswer("   "))).toBe(false);
+    expect(hasQuestionAnswer(optionalText, textAnswer("answer"))).toBe(true);
+    expect(hasQuestionAnswer(optionalMultiple, multipleAnswer([]))).toBe(false);
+    expect(hasQuestionAnswer(optionalMultiple, multipleAnswer([], "custom answer"))).toBe(true);
   });
 
   it("hydrates defaults and clamps restored steps", () => {
     const fields = [field({ id: "default", kind: "text", defaultValue: "saved" }), booleanField];
-    expect(initialQuestionAnswers(fields)).toEqual({ default: "saved" });
+    expect(initialQuestionAnswers(fields)).toEqual({ default: textAnswer("saved") });
     expect(clampQuestionStep(99, fields.length)).toBe(1);
     expect(clampQuestionStep(-2, fields.length)).toBe(0);
     expect(clampQuestionStep(4, 0)).toBe(0);
@@ -91,10 +100,10 @@ describe("typed question wizard", () => {
 
   it("keeps drafts isolated by both session and interaction", () => {
     const store = new QuestionWizardDraftStore();
-    store.write("session-a", "question-1", { answers: { single: "Custom A" }, otherText: { single: "Custom A in progress" }, currentIndex: 2, minimized: true });
-    store.write("session-b", "question-1", { answers: { single: "Custom B" }, otherText: { single: "Custom B in progress" }, currentIndex: 0, minimized: false });
-    expect(store.read("session-a", "question-1")).toEqual({ answers: { single: "Custom A" }, otherText: { single: "Custom A in progress" }, currentIndex: 2, minimized: true });
-    expect(store.read("session-b", "question-1")?.answers).toEqual({ single: "Custom B" });
+    store.write("session-a", "question-1", { answers: { single: otherAnswer("Custom A") }, otherText: { single: "Custom A in progress" }, currentIndex: 2, minimized: true });
+    store.write("session-b", "question-1", { answers: { single: otherAnswer("Custom B") }, otherText: { single: "Custom B in progress" }, currentIndex: 0, minimized: false });
+    expect(store.read("session-a", "question-1")).toEqual({ answers: { single: otherAnswer("Custom A") }, otherText: { single: "Custom A in progress" }, currentIndex: 2, minimized: true });
+    expect(store.read("session-b", "question-1")?.answers).toEqual({ single: otherAnswer("Custom B") });
     expect(store.read("session-b", "question-1")?.otherText).toEqual({ single: "Custom B in progress" });
     expect(store.read("session-a", "question-2")).toBeUndefined();
     store.delete("session-a", "question-1");
@@ -103,28 +112,30 @@ describe("typed question wizard", () => {
   });
 
   it("keeps raw Other text typed for single and multiple answers without inventing an option id", () => {
-    expect(replaceQuestionOtherAnswer(singleField, "one", "  handmade  ")).toBe("handmade");
-    expect(questionOtherAnswer(singleField, "handmade")).toBe("handmade");
-    expect(questionOtherAnswer(singleField, "one")).toBe("");
+    expect(replaceQuestionOtherAnswer(singleField, choiceAnswer("one"), "  handmade  ")).toEqual(otherAnswer("handmade"));
+    expect(questionOtherAnswer(singleField, otherAnswer("handmade"))).toBe("handmade");
+    expect(questionOtherAnswer(singleField, choiceAnswer("one"))).toBe("");
 
-    const withOther = replaceQuestionOtherAnswer(multipleField, ["one"], "handmade");
-    expect(withOther).toEqual(["one", "handmade"]);
+    const withOther = replaceQuestionOtherAnswer(multipleField, multipleAnswer(["one"]), "handmade");
+    expect(withOther).toEqual(multipleAnswer(["one"], "handmade"));
     expect(questionOtherAnswer(multipleField, withOther)).toBe("handmade");
     expect(validQuestionAnswer(multipleField, withOther)).toBe(true);
-    expect(toggleQuestionOptionAnswer(multipleField, withOther, "one")).toEqual(["handmade"]);
-    expect(replaceQuestionOtherAnswer(multipleField, withOther, "")).toEqual(["one"]);
+    expect(toggleQuestionOptionAnswer(multipleField, withOther, "one")).toEqual(multipleAnswer([], "handmade"));
+    expect(replaceQuestionOtherAnswer(multipleField, withOther, "")).toEqual(multipleAnswer(["one"]));
   });
 
   it("maps 1–N and Other while fencing repeats, IME composition, and editable targets", () => {
     const key = { key: "1", repeat: false, isComposing: false, metaKey: false, ctrlKey: false, altKey: false, shiftKey: false, editableTarget: false };
-    expect(resolveQuestionWizardKey(key, { kind: "single", optionCount: 2, required: true, currentValid: false })).toEqual({ kind: "choice", index: 0 });
-    expect(resolveQuestionWizardKey({ ...key, key: "3" }, { kind: "single", optionCount: 2, required: true, currentValid: false })).toEqual({ kind: "other" });
-    expect(resolveQuestionWizardKey({ ...key, key: "2" }, { kind: "multiple", optionCount: 2, required: true, currentValid: false })).toEqual({ kind: "choice", index: 1 });
-    expect(resolveQuestionWizardKey({ ...key, repeat: true }, { kind: "single", optionCount: 2, required: true, currentValid: false })).toBeNull();
-    expect(resolveQuestionWizardKey({ ...key, isComposing: true }, { kind: "single", optionCount: 2, required: true, currentValid: false })).toBeNull();
-    expect(resolveQuestionWizardKey({ ...key, editableTarget: true }, { kind: "single", optionCount: 2, required: true, currentValid: false })).toBeNull();
-    expect(resolveQuestionWizardKey({ ...key, key: "Escape" }, { kind: "single", optionCount: 2, required: false, currentValid: true })).toEqual({ kind: "skip" });
-    expect(resolveQuestionWizardKey({ ...key, key: "Escape" }, { kind: "single", optionCount: 2, required: true, currentValid: true })).toEqual({ kind: "minimize" });
+    const context = { kind: "single" as const, optionCount: 2, allowOther: true, required: true, currentValid: false };
+    expect(resolveQuestionWizardKey(key, context)).toEqual({ kind: "choice", index: 0 });
+    expect(resolveQuestionWizardKey({ ...key, key: "3" }, context)).toEqual({ kind: "other" });
+    expect(resolveQuestionWizardKey({ ...key, key: "3" }, { ...context, allowOther: false })).toBeNull();
+    expect(resolveQuestionWizardKey({ ...key, key: "2" }, { ...context, kind: "multiple" })).toEqual({ kind: "choice", index: 1 });
+    expect(resolveQuestionWizardKey({ ...key, repeat: true }, context)).toBeNull();
+    expect(resolveQuestionWizardKey({ ...key, isComposing: true }, context)).toBeNull();
+    expect(resolveQuestionWizardKey({ ...key, editableTarget: true }, context)).toBeNull();
+    expect(resolveQuestionWizardKey({ ...key, key: "Escape" }, { ...context, required: false, currentValid: true })).toEqual({ kind: "skip" });
+    expect(resolveQuestionWizardKey({ ...key, key: "Escape" }, { ...context, currentValid: true })).toEqual({ kind: "minimize" });
   });
 });
 
@@ -203,8 +214,8 @@ function field(overrides: Partial<QuestionFieldView> & Pick<QuestionFieldView, "
     kind: overrides.kind,
     options: overrides.options ?? [],
     multiline: overrides.multiline ?? false,
-    sensitive: overrides.sensitive ?? false,
     minimumSelections: overrides.minimumSelections ?? 0,
+    allowOther: overrides.allowOther ?? false,
     ...(overrides.description === undefined ? {} : { description: overrides.description }),
     ...(overrides.placeholder === undefined ? {} : { placeholder: overrides.placeholder }),
     ...(overrides.defaultValue === undefined ? {} : { defaultValue: overrides.defaultValue }),

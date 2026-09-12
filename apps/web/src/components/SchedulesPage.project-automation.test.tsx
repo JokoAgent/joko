@@ -148,6 +148,7 @@ async function renderSchedules(configure?: (controller: ReturnType<typeof contro
     t={t}
     runAction={runAction}
     onOpenNavigation={vi.fn()}
+    prepareSessionRemoval={async (sessions) => ({ clean: sessions.length, dirty: 0, unknown: 0 })}
   />));
   const row = (id: string): HTMLElement => required(container.querySelector<HTMLElement>(`#schedule-row-${id}`));
   const openMenu = async (id: string): Promise<HTMLElement> => {

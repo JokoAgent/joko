@@ -68,7 +68,11 @@ export function MessageNavRail({ entries, scrollRef, contentRef, bottomOffset, r
   const suppressClickRef = useRef(false);
   const entriesRef = useRef(entries);
   entriesRef.current = entries;
-  const covered = entries.length >= MESSAGE_NAV_MIN_ENTRIES && layout.hasRoom && layout.availableHeight >= MESSAGE_NAV_MIN_HEIGHT_PX;
+  const plan = planMessageNavTicks(entries.length, layout.availableHeight);
+  const covered = entries.length >= MESSAGE_NAV_MIN_ENTRIES
+    && layout.hasRoom
+    && layout.availableHeight >= MESSAGE_NAV_MIN_HEIGHT_PX
+    && plan.hiddenCount === 0;
 
   useEffect(() => {
     onCoverageChange?.(covered);
@@ -324,7 +328,6 @@ export function MessageNavRail({ entries, scrollRef, contentRef, bottomOffset, r
   }, [dropPending, onWheelIntent, scrollRef]);
 
   if (entries.length < MESSAGE_NAV_MIN_ENTRIES || !layout.hasRoom || layout.availableHeight < MESSAGE_NAV_MIN_HEIGHT_PX) return null;
-  const plan = planMessageNavTicks(entries.length, layout.availableHeight);
   const visible = entries.slice(plan.startIndex);
   const displayActiveId = pendingId ?? activeId;
   let rangeStartIndex = -1;

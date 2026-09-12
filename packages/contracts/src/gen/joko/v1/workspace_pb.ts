@@ -134,7 +134,7 @@ export type WorkspaceDescriptor = Message<"joko.v1.WorkspaceDescriptor"> & {
   version?: EntityVersion | undefined;
 
   /**
-   * Mirrors the owning Target location so file clients can gate local-only
+   * Records the owning Target location so file clients can gate local-only
    * affordances without interpreting Backend identity.
    *
    * @generated from field: joko.v1.RemoteWorkspaceBinding remote_workspace = 9;

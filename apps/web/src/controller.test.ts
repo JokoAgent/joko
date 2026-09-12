@@ -321,11 +321,12 @@ describe("typed editor effects", () => {
     const draft = {
       text: "stale",
       attachments: [],
-      mentions: [{ id: "mention-1", kind: "resource" as const, reference: "resource-1", label: "Resource", token: "@Resource" }],
+      mentions: [{ id: "mention-1", kind: "resource" as const, reference: "resource-1", label: "Resource", token: "@Resource", discoveredRevision: "revision-1", resourceVersion: "2", runtimeGeneration: 3 }],
       deliveryMode: "followUp" as const
     };
     expect(composerDraftWithEditorText("selected Pi user text", draft)).toEqual({
       ...draft,
+      mentions: [],
       text: "selected Pi user text"
     });
     expect(composerDraftWithEditorText("selected Pi user text", undefined)).toEqual({

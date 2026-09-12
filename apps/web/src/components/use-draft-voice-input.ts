@@ -193,7 +193,11 @@ export function useDraftVoiceInput<T>(options: DraftVoiceInputOptions<T>) {
     const capture = captureRef.current;
     return capture !== undefined && current(capture) && ["starting", "listening", "submitting"].includes(capture.media.currentState);
   }, [current]);
-  return { supported, active, isActive, update, draftError, start, finish, cancel, useTranscript, preferences, startedAt, ownerDocument, ownerWindow, scope,
+  const getCaptureIdentity = useCallback((): object | undefined => {
+    const capture = captureRef.current;
+    return capture !== undefined && current(capture) ? capture : undefined;
+  }, [current]);
+  return { supported, active, isActive, getCaptureIdentity, update, draftError, start, finish, cancel, useTranscript, preferences, startedAt, ownerDocument, ownerWindow, scope,
     phase: update?.session?.state === "refining" ? "refining" as const : update?.state,
     error: update === undefined ? undefined : draftVoiceError(update, options.t) };
 }

@@ -9,7 +9,7 @@ import type { TimelineWorkspaceAsset } from "./TimelineReferenceContent.js";
 import { SessionPane } from "./SessionPane.js";
 import type { AppController, ControllerState } from "../controller.js";
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
-import { emptySnapshot, type SessionView, type TimelineItemView, type WorkspaceFilePreviewView } from "../model.js";
+import { emptySnapshot, type ArtifactView, type SessionView, type TimelineItemView, type WorkspaceFilePreviewView } from "../model.js";
 import type { Translator } from "./types.js";
 import { WorkspaceHtmlExternalUnavailableError } from "../browser-action.js";
 
@@ -44,7 +44,7 @@ afterEach(async () => {
 describe("timeline reference content", () => {
   it("opens HTML through workspace authority and retains per-click destination overrides", async () => {
     const open = vi.fn();
-    const mounted = mount(<SentMessageReferenceText text="@preview.html" actions={{ ownerKey: "profile", sessionId: "task", t, onOpenWorkspaceHtml: open }} />);
+    const mounted = mount(<SentMessageReferenceText text="[Preview](preview.html)" actions={{ ownerKey: "profile", sessionId: "task", t, onOpenWorkspaceHtml: open }} />);
     const link = mounted.host.querySelector<HTMLAnchorElement>("a")!;
     await act(async () => link.click());
     expect(open).toHaveBeenLastCalledWith("preview.html", { forceExternal: false, action: { ownerDocument: document, signal: expect.any(AbortSignal) } });
@@ -55,21 +55,35 @@ describe("timeline reference content", () => {
     expect(open).toHaveBeenLastCalledWith("preview.html", { forceSidebar: true, action: { ownerDocument: document, signal: expect.any(AbortSignal) } });
     open.mockRejectedValueOnce(new WorkspaceHtmlExternalUnavailableError());
     act(() => link.dispatchEvent(new KeyboardEvent("keydown", { key: "ContextMenu", bubbles: true, cancelable: true })));
-    await act(async () => [...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find((button) => button.textContent === "timeline.openInDefaultBrowser")!.click());
+    await act(async () => [...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find((button) => button.textContent === "timeline.openInManagedBrowser")!.click());
     expect(document.querySelector('[role="status"]')?.textContent).toBe("timeline.htmlExternalUnavailable");
   });
-  it("restores sent task and file atoms as navigable chips", () => {
+  it("keeps single-message links distinct from typed task and file atoms", () => {
+    const text = "Open [Message](#/tasks/task-2?message=m-1), @Prior task and @src/main.ts";
+    const taskStart = text.indexOf("@Prior task");
+    const fileStart = text.indexOf("@src/main.ts");
     const mounted = mount(<SentMessageReferenceText
-      text="Open [Task](#/tasks/task-2?message=m-1) and @src/main.ts"
-      actions={{ ownerKey: "profile", sessionId: "task-1", t }}
+      text={text}
+      inputMentions={[
+        { kind: "session", sessionId: "task-3", displayText: "Prior task" },
+        { kind: "workspace", workspaceId: "w", relativePath: "src/main.ts", displayText: "main.ts", directory: false }
+      ]}
+      mentionRanges={[
+        { start: taskStart, end: taskStart + "@Prior task".length, mentionIndex: 0 },
+        { start: fileStart, end: fileStart + "@src/main.ts".length, mentionIndex: 1 }
+      ]}
+      actions={{ ownerKey: "profile", sessionId: "task-1", workspaceId: "w", t }}
     />);
     const links = [...mounted.host.querySelectorAll<HTMLAnchorElement>("a")];
     expect(links.map((link) => link.getAttribute("href"))).toEqual([
       "#/tasks/task-2?message=m-1",
+      "#/tasks/task-3",
       "#/files/task-1?file=src%2Fmain.ts"
     ]);
-    act(() => links[0]?.dispatchEvent(new MouseEvent("click", { bubbles: true, button: 0 })));
-    expect(window.location.hash).toBe("#/tasks/task-2?message=m-1");
+    expect(links[1]?.textContent).toBe("@Prior task");
+    expect(links[2]?.textContent).toBe("@src/main.ts");
+    act(() => links[1]?.dispatchEvent(new MouseEvent("click", { bubbles: true, button: 0 })));
+    expect(window.location.hash).toBe("#/tasks/task-3");
   });
 
   it("keeps external sent URLs on the governed browser action", async () => {
@@ -77,6 +91,9 @@ describe("timeline reference content", () => {
     const mounted = mount(<SentMessageReferenceText text="https://example.test/docs" actions={{ ownerKey: "profile", sessionId: "task-1", t, onOpenHttpLink: open }} />);
     await act(async () => mounted.host.querySelector("a")?.dispatchEvent(new MouseEvent("click", { bubbles: true, button: 0 })));
     expect(open).toHaveBeenCalledWith("https://example.test/docs", { forceExternal: false, action: { ownerDocument: document, signal: expect.any(AbortSignal) } });
+    act(() => mounted.host.querySelector("a")?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true })));
+    expect([...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].map((button) => button.textContent)).toContain("timeline.openInDefaultBrowser");
+    expect([...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].map((button) => button.textContent)).not.toContain("timeline.openInManagedBrowser");
   });
 
   it("loads a local markdown image through the authenticated workspace asset path and opens the full viewer", async () => {
@@ -97,10 +114,45 @@ describe("timeline reference content", () => {
     expect(document.querySelector(".workspace-image-lightbox")).not.toBeNull();
   });
 
+  it("reads the exact Artifact and retires pending or open previews when the source owner changes", async () => {
+    const artifact: ArtifactView = { id: "artifact-two", blobId: "content-two", kind: "file", title: "report.txt", fileName: "report.txt", mediaType: "text/plain", byteSize: 3 };
+    let resolve!: (value: typeof artifact) => void;
+    const read = vi.fn((_sessionId: string, _artifactId: string, _signal: AbortSignal) => new Promise<typeof artifact>((done) => { resolve = done; }));
+    const preview = vi.fn((value: typeof artifact) => <span role="dialog">{value.blobId}</span>);
+    const node = (ownerKey: string) => <SentMessageReferenceText text="@report.txt @report.txt @report.txt"
+      inputMentions={[
+        { kind: "workspace", workspaceId: "w", relativePath: "report.txt", displayText: "report.txt", directory: false },
+        { kind: "artifact", artifactId: artifact.id, displayText: "report.txt" }
+      ]} mentionRanges={[{ start: 0, end: 11, mentionIndex: 1 }, { start: 12, end: 23, mentionIndex: 0 }]}
+      actions={{ ownerKey, sessionId: "task", workspaceId: "w", t, onReadArtifact: read, renderArtifactPreview: preview }} />;
+    const mounted = mount(node("first"));
+    expect(mounted.host.querySelectorAll("a")).toHaveLength(1);
+    expect(mounted.host.querySelector("a")?.getAttribute("href")).toBe("#/files/task?file=report.txt");
+    expect(mounted.host.textContent).toBe("@report.txt @report.txt @report.txt");
+    const button = () => mounted.host.querySelector<HTMLButtonElement>("button")!;
+    await act(async () => { button().click(); button().click(); });
+    expect(read).toHaveBeenCalledExactlyOnceWith("task", artifact.id, expect.any(AbortSignal));
+    expect(preview).not.toHaveBeenCalled();
+    const oldSignal = read.mock.calls[0]![2];
+    act(() => mounted.root.render(node("second")));
+    expect(oldSignal.aborted).toBe(true);
+    await act(async () => resolve(artifact));
+    expect(mounted.host.querySelector('[role="dialog"]')).toBeNull();
+    await act(async () => button().click());
+    await act(async () => resolve(artifact));
+    expect(mounted.host.querySelector('[role="dialog"]')?.textContent).toBe("content-two");
+    act(() => mounted.root.render(node("third")));
+    expect(mounted.host.querySelector('[role="dialog"]')).toBeNull();
+    read.mockRejectedValueOnce(new Error("Unavailable"));
+    await act(async () => button().click());
+    expect(button().textContent).toContain("timeline.referenceUnavailable");
+    expect(window.location.hash).toBe("");
+  });
+
   it("copies a file's relative location with line and column from a keyboard menu", async () => {
     const writeText = vi.fn(async () => undefined);
     Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
-    const mounted = mount(<SentMessageReferenceText text="@src/main.ts:18:4" actions={{ ownerKey: "profile", sessionId: "task-1", t }} />);
+    const mounted = mount(<SentMessageReferenceText text="[Source](src/main.ts:18:4)" actions={{ ownerKey: "profile", sessionId: "task-1", t }} />);
     const link = mounted.host.querySelector<HTMLAnchorElement>("a")!;
     link.focus();
     act(() => link.dispatchEvent(new KeyboardEvent("keydown", { key: "F10", shiftKey: true, bubbles: true, cancelable: true })));
@@ -325,7 +377,7 @@ async function mountAssetPane(initial: AppController, initialPath: string, stric
       timelineHasEarlier={false} timelineHistoryLoading={false} onLoadEarlierTimeline={async () => undefined}
       extensionWidgets={[]} extensionStatuses={[]} queue={[]} extraDirectories={[]} resources={[]} commandRefreshSignal={[]}
       remainingInteractions={0} navigationOpen inspectorOpen t={t} runAction={(_key, action) => { void action(); }}
-      onOpenNavigation={() => undefined} onOpenInspector={() => undefined} onRename={() => undefined} onDelete={() => undefined}
+      onOpenNavigation={() => undefined} onOpenInspector={() => undefined} onRename={() => undefined} onArchive={() => undefined} onDelete={() => undefined}
     />;
     mounted.root.render(strict ? <StrictMode>{pane}</StrictMode> : pane);
   });

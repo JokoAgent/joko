@@ -115,7 +115,7 @@ describe("application shortcut registry", () => {
     )).toBeNull();
   });
 
-  it("keeps platform availability and the settings surface aligned with executable definitions", () => {
+  it("derives platform availability and the settings surface from executable definitions", () => {
     expect(APP_SHORTCUT_DEFINITION_LIST.find((definition) => definition.id === "new-maker")?.menuBacked).toBe(true);
     expect(APP_SHORTCUT_DEFINITION_LIST.find((definition) => definition.id === "open-settings")?.menuBacked).toBe(true);
     expect(APP_SHORTCUT_DEFINITION_LIST.find((definition) => definition.id === "toggle-sidebar")?.menuBacked).toBeUndefined();

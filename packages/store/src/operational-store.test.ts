@@ -1064,7 +1064,8 @@ describe("OperationalStore", () => {
           label: "Choose",
           required: true,
           kind: "single",
-          choices: [{ id: "yes", label: "Yes" }]
+          choices: [{ id: "yes", label: "Yes" }],
+          allowOther: false
         }]
       }
     });
@@ -1089,7 +1090,7 @@ describe("OperationalStore", () => {
     store.resolveInteraction(
       "interaction-attention",
       route.binding.generation,
-      { option: "yes" },
+      yesQuestionDecision(),
       "interaction:resolve-attention"
     );
     const cleared = store.getSessionAttention(route.id);
@@ -1123,7 +1124,8 @@ describe("OperationalStore", () => {
           label: "Choose",
           required: true,
           kind: "single",
-          choices: [{ id: "yes", label: "Yes" }]
+          choices: [{ id: "yes", label: "Yes" }],
+          allowOther: false
         }]
       }
     });
@@ -1141,7 +1143,7 @@ describe("OperationalStore", () => {
     store.resolveInteraction(
       `interaction-${outcome}`,
       route.binding.generation,
-      { option: "yes" },
+      yesQuestionDecision(),
       `interaction:${outcome}:resolve`
     );
     const settled = store.getSessionAttention(route.id);
@@ -1261,7 +1263,7 @@ describe("OperationalStore", () => {
     store.resolveInteraction(
       "interaction-a-second",
       route.binding.generation,
-      { option: "yes" },
+      yesQuestionDecision(),
       "awaiting:second-resolve"
     );
     const rebased = store.getSessionAttention(route.id);
@@ -1302,7 +1304,7 @@ describe("OperationalStore", () => {
     store.resolveInteraction(
       "interaction-edge-b",
       route.binding.generation,
-      { option: "yes" },
+      yesQuestionDecision(),
       "awaiting-edge:b-resolve"
     );
     const rebasedRead = store.getSessionAttention(route.id);
@@ -1316,7 +1318,7 @@ describe("OperationalStore", () => {
     store.resolveInteraction(
       "interaction-edge-a",
       route.binding.generation,
-      { option: "yes" },
+      yesQuestionDecision(),
       "awaiting-edge:a-resolve"
     );
     expect(store.getSessionAttention(route.id)).toMatchObject({ kind: "awaiting", unread: false });
@@ -1359,7 +1361,7 @@ describe("OperationalStore", () => {
     store.resolveInteraction(
       "interaction-resolved-before-error-ack",
       route.binding.generation,
-      { option: "yes" },
+      yesQuestionDecision(),
       "error:resolved-interaction:resolve"
     );
     const current = store.getSessionAttention(route.id);
@@ -1795,6 +1797,20 @@ describe("OperationalStore", () => {
       PRAGMA user_version = 1;
     `);
     unsupported.close();
+
+    expect(() => new OperationalStore(filePath)).toThrow(/schema is unsupported/u);
+  });
+
+  it("rejects a same-version stale durable-shape baseline before opening stored rows", () => {
+    const directory = mkdtempSync(path.join(tmpdir(), "joko-store-stale-durable-shape-"));
+    const filePath = path.join(directory, "operational.sqlite");
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const current = new OperationalStore(filePath);
+    current.close();
+
+    const stale = new DatabaseSync(filePath);
+    stale.prepare("UPDATE schema_version SET baseline_id = ? WHERE singleton = 1").run("0".repeat(64));
+    stale.close();
 
     expect(() => new OperationalStore(filePath)).toThrow(/schema is unsupported/u);
   });
@@ -2295,6 +2311,107 @@ describe("OperationalStore", () => {
     });
     expect(recovery.events.map((event) => event.payload.type)).toEqual(["queue_update", "run_state"]);
     expect(reopened.recoverStartup("recover-again").recoveredQueueItemIds).toEqual([]);
+  });
+
+  it("dismisses an open interaction after restart instead of accepting a response without a Backend waiter", () => {
+    const fixture = createFixture();
+    const session = fixture.store.getSession("session-1");
+    fixture.store.updateSession("session-1", { planMode: true }, session.revision);
+    fixture.store.openInteraction({
+      sessionId: "session-1",
+      generation: 0,
+      payload: {
+        id: "interaction-restart-question",
+        kind: "question",
+        title: "Continue?",
+        prompt: "Choose before continuing.",
+        fields: [{
+          id: "continue",
+          kind: "boolean",
+          label: "Continue",
+          required: true,
+          defaultValue: false
+        }]
+      },
+      traceId: "interaction:before-restart:question",
+      createdAt: 10
+    });
+    fixture.store.openInteraction({
+      sessionId: "session-1",
+      generation: 0,
+      payload: {
+        id: "interaction-restart-plan",
+        kind: "plan_review",
+        title: "Review plan",
+        markdown: "Do the work.",
+        choices: ["execute", "stay"]
+      },
+      traceId: "interaction:before-restart:plan",
+      createdAt: 11
+    });
+    expect(fixture.store.findSessionAttention("session-1")).toMatchObject({ kind: "awaiting", unread: true });
+
+    const filePath = fixture.store.filePath;
+    fixture.store.close();
+    const reopened = new OperationalStore(filePath);
+    fixture.replaceStore(reopened);
+
+    const recovery = reopened.recoverStartup("recover-interaction");
+    expect(recovery.dismissedInteractionIds).toEqual([
+      "interaction-restart-question",
+      "interaction-restart-plan"
+    ]);
+    for (const interactionId of recovery.dismissedInteractionIds) {
+      expect(reopened.getInteraction(interactionId)).toMatchObject({
+        status: "dismissed",
+        dismissalReason: "The Orchestrator restarted while this interaction was awaiting a response."
+      });
+    }
+    expect(reopened.listInteractions({ status: "open" })).toEqual([]);
+    expect(reopened.inspectDurableRuntimeActivity().interaction).toBe(false);
+    expect(reopened.findSessionAttention("session-1")).toMatchObject({ kind: "awaiting", unread: false });
+    expect(reopened.getSession("session-1").descriptor.planMode).toBe(true);
+    expect(recovery.events.filter((event) => event.payload.type === "interaction_dismissed")
+      .map((event) => event.payload.type === "interaction_dismissed" ? event.payload.interactionId : undefined))
+      .toEqual(["interaction-restart-question", "interaction-restart-plan"]);
+    const recoveredRevision = recovery.revision;
+    const replay = reopened.recoverStartup("recover-interaction-again");
+    expect(replay).toMatchObject({ dismissedInteractionIds: [], events: [], revision: recoveredRevision });
+    expect(reopened.listEvents({ sessionId: "session-1" }).filter((event) =>
+      event.payload.type === "interaction_dismissed"
+    ).map((event) => event.payload.type === "interaction_dismissed" ? event.payload.interactionId : undefined))
+      .toEqual(["interaction-restart-question", "interaction-restart-plan"]);
+  });
+
+  it("rolls back startup recovery when an open interaction violates its Session generation", () => {
+    const fixture = createFixture();
+    fixture.store.openInteraction({
+      sessionId: "session-1",
+      generation: 0,
+      payload: {
+        id: "interaction-stale-generation",
+        kind: "permission",
+        risk: "high",
+        title: "Run command?",
+        toolName: "tool",
+        summary: "This request belongs to the retired runtime.",
+        choices: ["allow_once", "deny_once"]
+      },
+      traceId: "interaction:stale-generation"
+    });
+    const session = fixture.store.getSession("session-1");
+    fixture.store.updateSession("session-1", {
+      binding: { ...session.descriptor.binding, generation: 1 }
+    }, session.revision);
+    const beforeRecovery = fixture.store.health().revision;
+
+    expect(() => fixture.store.recoverStartup("recover-stale-interaction"))
+      .toThrow(StaleGenerationError);
+    expect(fixture.store.health().revision).toBe(beforeRecovery);
+    expect(fixture.store.getInteraction("interaction-stale-generation").status).toBe("open");
+    expect(fixture.store.listEvents({ sessionId: "session-1" }).filter((event) =>
+      event.payload.type === "interaction_dismissed"
+    )).toEqual([]);
   });
 
   it("recovers when the process stops immediately after the atomic Backend instance claim", () => {
@@ -2833,8 +2950,12 @@ describe("OperationalStore", () => {
           type: "message_complete",
           role: "user",
           blocks: [{ kind: "text", text: "> <!-- joko-selection-quote -->\n> selected" }],
-          quotesEncoded: true,
-          pastedTextRanges: [{ start: 34, end: 42, display: "Pasted text (1 line)" }]
+          acceptedInput: {
+            ...fixture.prompt,
+            text: "> <!-- joko-selection-quote -->\n> selected",
+            quotesEncoded: true,
+            pastedTextRanges: [{ start: 34, end: 42, display: "Pasted text (1 line)" }]
+          }
         }
       });
       return { accepted: true };
@@ -2847,8 +2968,10 @@ describe("OperationalStore", () => {
       .toMatchObject({
         type: "message_complete",
         role: "user",
-        quotesEncoded: true,
-        pastedTextRanges: [{ start: 34, end: 42, display: "Pasted text (1 line)" }]
+        acceptedInput: {
+          quotesEncoded: true,
+          pastedTextRanges: [{ start: 34, end: 42, display: "Pasted text (1 line)" }]
+        }
       });
   });
 
@@ -3192,6 +3315,101 @@ describe("OperationalStore", () => {
     )).toThrow(OperationPreviouslyFailedError);
   });
 
+  it("fails closed on old Interaction JSON and round-trips the exact typed current decision", () => {
+    const fixture = createFixture();
+    const beforeOldRequest = fixture.store.health().revision;
+    expect(() => fixture.store.openInteraction({
+      sessionId: "session-1",
+      generation: 0,
+      traceId: "interaction-old-request",
+      payload: {
+        id: "interaction-old-request",
+        kind: "question",
+        title: "Choose",
+        prompt: "Continue?",
+        fields: [{
+          id: "answer",
+          label: "Choose",
+          required: true,
+          kind: "single",
+          choices: [{ id: "yes", label: "Yes" }]
+        }]
+      } as never
+    })).toThrow(/current-v1 durable shape/u);
+    expect(fixture.store.health().revision).toBe(beforeOldRequest);
+    expect(fixture.store.countInteractions()).toBe(0);
+
+    const payload = {
+      id: "interaction-current-question",
+      kind: "question" as const,
+      title: "Choose",
+      prompt: "Continue?",
+      fields: [{
+        id: "answer",
+        label: "Choose",
+        required: true,
+        kind: "single" as const,
+        choices: [{ id: "yes", label: "Yes" }],
+        allowOther: true
+      }]
+    };
+    expect(fixture.store.openInteraction({
+      sessionId: "session-1",
+      generation: 0,
+      traceId: "interaction-current-open",
+      payload
+    }).payload).toEqual(payload);
+
+    const beforeOldDecision = fixture.store.health().revision;
+    expect(() => fixture.store.resolveInteraction(
+      payload.id,
+      0,
+      "yes" as never,
+      "interaction-old-decision"
+    )).toThrow(/current-v1 durable/u);
+    expect(fixture.store.health().revision).toBe(beforeOldDecision);
+    expect(fixture.store.getInteraction(payload.id).status).toBe("open");
+
+    const decision = {
+      kind: "question" as const,
+      answers: {
+        answer: {
+          kind: "single" as const,
+          selection: { kind: "other" as const, text: "yes" }
+        }
+      }
+    };
+    expect(fixture.store.resolveInteraction(
+      payload.id,
+      0,
+      decision,
+      "interaction-current-decision"
+    )).toMatchObject({ status: "resolved", payload, decision });
+
+    const filePath = fixture.store.filePath;
+    fixture.store.close();
+    const database = new DatabaseSync(filePath);
+    database.prepare("UPDATE interactions SET decision_json = ? WHERE id = ?")
+      .run(JSON.stringify("yes"), payload.id);
+    const openingRow = database.prepare(`
+      SELECT id, payload_json FROM events
+      WHERE json_extract(payload_json, '$.payload.type') = 'interaction_opened'
+        AND json_extract(payload_json, '$.payload.interaction.id') = ?
+    `).get(payload.id) as { readonly id: string; readonly payload_json: string };
+    const oldOpeningEvent = JSON.parse(openingRow.payload_json) as {
+      payload: { interaction: { fields: Array<Record<string, unknown>> } };
+    };
+    delete oldOpeningEvent.payload.interaction.fields[0]?.["allowOther"];
+    database.prepare("UPDATE events SET payload_json = ? WHERE id = ?")
+      .run(JSON.stringify(oldOpeningEvent), openingRow.id);
+    database.close();
+
+    const reopened = new OperationalStore(filePath);
+    fixture.replaceStore(reopened);
+    expect(() => reopened.getInteraction(payload.id)).toThrow(/current-v1 durable/u);
+    expect(() => reopened.listEvents({ sessionId: "session-1" })).toThrow(/current-v1 durable shape/u);
+  });
+
   it("persists interactions, schedules, leases, artifacts, settings, and diagnostics", () => {
     const { store, prompt } = createFixture();
     const now = Date.now();
@@ -3213,12 +3431,13 @@ describe("OperationalStore", () => {
           choices: [
             { id: "yes", label: "yes" },
             { id: "no", label: "no" }
-          ]
+          ],
+          allowOther: false
         }]
       }
     });
     expect(store.resolveInteraction(
-      "interaction-1", 0, { option: "yes" }, "interaction-resolve"
+      "interaction-1", 0, yesQuestionDecision(), "interaction-resolve"
     ).status).toBe("resolved");
 
     const schedule = store.upsertSchedule({
@@ -3904,6 +4123,45 @@ describe("OperationalStore", () => {
     store.deleteArtifact("artifact-shared-one", 20);
     expect(store.listArtifacts().filter((artifact) => artifact.storageKey === storageKey).map((artifact) => artifact.blob.id))
       .toEqual(["artifact-shared-two"]);
+  });
+
+  it("reuses only live plain outputs with the same Session and complete storage identity", () => {
+    const { store } = createFixture();
+    store.createSession({
+      ...store.getSession("session-1").descriptor,
+      id: "session-other",
+      binding: { opaqueRef: "native/other.jsonl", generation: 0 }
+    });
+    const identity = {
+      sha256: "a".repeat(64), byteLength: 12, storageKey: "sha256/aa/" + "a".repeat(64),
+      mimeType: "audio/wav", fileName: "output.wav"
+    };
+    const stage = (id: string, details: { storageKey?: string; mimeType?: string; fileName?: string } = {}) =>
+      store.putArtifact({ ...identity, ...details, id, metadata: { expiresAt: 9_000_000_000_000 } }).blob;
+    const own = (id: string, sessionId: string, details: { storageKey?: string; mimeType?: string; fileName?: string } = {}) => {
+      const blob = stage(id, details);
+      return store.transaction(() => store.adoptSessionArtifact({ blob, sessionId }));
+    };
+    const find = () => store.findSessionArtifactByStorage("session-1", identity.storageKey, identity.mimeType, identity.fileName);
+
+    store.putArtifact({ ...identity, id: "unowned-permanent" });
+    stage("unadopted-staging");
+    const other = own("other-session-output", "session-other");
+    const audio = stage("audio-with-metadata");
+    store.transaction(() => store.adoptSessionArtifact({
+      blob: audio, sessionId: "session-1", audioMetadata: { kind: "music", title: "Morning", description: "Strings" }
+    }));
+    own("other-storage", "session-1", { storageKey: "sha256/bb/" + "b".repeat(64) });
+    own("other-mime", "session-1", { mimeType: "application/octet-stream" });
+    own("other-name", "session-1", { fileName: "other.wav" });
+    expect(find()).toBeUndefined();
+    expect(store.findSessionArtifactByStorage("session-other", identity.storageKey, identity.mimeType, identity.fileName)).toEqual(other);
+
+    const committed = own("plain-session-output", "session-1");
+    expect(find()).toEqual(committed);
+    expect(store.findSessionArtifactByStorage("session-1", identity.storageKey, identity.mimeType, undefined)).toBeUndefined();
+    store.deleteArtifact(committed.blob.id);
+    expect(find()).toBeUndefined();
   });
 
   it("round-trips Backend Provider and tool catalogs without losing typed metadata", () => {
@@ -4656,7 +4914,17 @@ function questionInteraction(id: string) {
       label: "Choose",
       kind: "single" as const,
       required: true,
-      choices: [{ id: "yes", label: "Yes" }]
+      choices: [{ id: "yes", label: "Yes" }],
+      allowOther: false
     }]
+  };
+}
+
+function yesQuestionDecision() {
+  return {
+    kind: "question" as const,
+    answers: {
+      answer: { kind: "single" as const, selection: { kind: "choice" as const, choiceId: "yes" } }
+    }
   };
 }

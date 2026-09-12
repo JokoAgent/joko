@@ -52,6 +52,17 @@ export function createWorktreeConnectService(
         })),
         page: page.info
       });
+    }),
+
+    getSessionWorktreeRemovalPreview: async (request, context) => worktreeRpc(async () => {
+      authenticate(context);
+      const sessionId = publicSessionId(request.sessionId);
+      const preview = await requireCoordinator(coordinator).previewRemoval(sessionId, { signal: context.signal });
+      return create(contract.GetSessionWorktreeRemovalPreviewResponseSchema, {
+        sessionId,
+        hasWorktree: preview.hasWorktree,
+        dirty: preview.dirty
+      });
     })
   } satisfies ServiceImpl<typeof contract.WorktreeService>;
 }
@@ -66,6 +77,14 @@ function publicTargetId(value: string): string {
     value === "" || value !== value.trim() || value.length > 256 ||
     /[\p{Cc}\u2028\u2029]/u.test(value)
   ) throw new ConnectError("target_id is invalid.", Code.InvalidArgument);
+  return value;
+}
+
+function publicSessionId(value: string): string {
+  if (
+    value === "" || value !== value.trim() || value.length > 256 ||
+    /[\p{Cc}\u2028\u2029]/u.test(value)
+  ) throw new ConnectError("session_id is invalid.", Code.InvalidArgument);
   return value;
 }
 
@@ -123,7 +142,7 @@ async function worktreeRpc<T>(callback: () => Promise<T>): Promise<T> {
     return await callback();
   } catch (error) {
     if (error instanceof ConnectError) throw error;
-    if (error instanceof NotFoundError) throw new ConnectError("Target was not found.", Code.NotFound);
+    if (error instanceof NotFoundError) throw new ConnectError("The requested object was not found.", Code.NotFound);
     if (error instanceof StoreClosedError) throw new ConnectError("Worktree storage is unavailable.", Code.Unavailable);
     if (error instanceof SessionWorktreeCoordinatorError) {
       if (error.code === "ABORTED") throw new ConnectError("The Worktree request was cancelled.", Code.Canceled);

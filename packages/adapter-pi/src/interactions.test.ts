@@ -42,18 +42,18 @@ describe("Pi typed interactions", () => {
         { id: "q1", label: "Branch", description: "Choose a branch", required: true, kind: "single", choices: [
           { id: "q1-option-1", label: "main" },
           { id: "q1-option-2", label: "release", description: "stable" }
-        ] },
+        ], allowOther: true },
         { id: "q2", label: "Checks", required: true, kind: "multiple", choices: [
           { id: "q2-option-1", label: "unit" },
           { id: "q2-option-2", label: "e2e" }
-        ] },
+        ], allowOther: true },
         { id: "q3", label: "Notes", required: true, kind: "text", multiline: true }
       ]
     };
     const answers = {
-      q1: "q1-option-1",
-      q2: ["q2-option-1", "q2-option-2"],
-      q3: "Keep compatibility"
+      q1: { kind: "single", selection: { kind: "choice", choiceId: "q1-option-1" } },
+      q2: { kind: "multiple", choiceIds: ["q2-option-1", "q2-option-2"] },
+      q3: { kind: "text", value: "Keep compatibility" }
     } as const;
     const notify = vi.fn(async () => undefined);
     let opened: InteractionPayload | undefined;
@@ -76,7 +76,7 @@ describe("Pi typed interactions", () => {
       fields: [
         { id: "q1", kind: "single" },
         { id: "q2", kind: "multiple", minimumSelections: 1, maximumSelections: 3 },
-        { id: "q3", kind: "text", sensitive: false }
+        { id: "q3", kind: "text" }
       ]
     });
     expect(notify).toHaveBeenCalledWith({
@@ -91,12 +91,15 @@ describe("Pi typed interactions", () => {
       title: "Pi has questions",
       prompt: "Answer or skip",
       fields: [
-        { id: "q1", label: "Branch", required: false, kind: "single", choices: [{ id: "main", label: "main" }] },
-        { id: "q2", label: "Checks", required: false, kind: "multiple", choices: [{ id: "unit", label: "unit" }] },
+        { id: "q1", label: "Branch", required: false, kind: "single", choices: [{ id: "main", label: "main" }], allowOther: true },
+        { id: "q2", label: "Checks", required: false, kind: "multiple", choices: [{ id: "unit", label: "unit" }], allowOther: true },
         { id: "q3", label: "Notes", required: false, kind: "text", multiline: true }
       ]
     };
-    const answers = { q1: "a custom branch", q2: ["unit", "a custom check"] } as const;
+    const answers = {
+      q1: { kind: "single", selection: { kind: "other", text: "a custom branch" } },
+      q2: { kind: "multiple", choiceIds: ["unit"], otherText: "a custom check" }
+    } as const;
     const notify = vi.fn(async () => undefined);
     let opened: InteractionPayload | undefined;
     const context = adapterContext(async (interaction) => {

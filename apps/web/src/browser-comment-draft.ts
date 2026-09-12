@@ -16,11 +16,11 @@ export function nextBrowserCommentMarker(items: readonly BrowserCommentDraftItem
   return (items ?? []).reduce((maximum, item) => Math.max(maximum, item.markerNumber), 0) + 1;
 }
 
-export function formatBrowserCommentsForSend(items: readonly BrowserCommentDraftItem[], body: string): string {
-  if (items.length === 0) return body;
+export function formatBrowserCommentsForSend(items: readonly BrowserCommentDraftItem[], body: string): { readonly text: string; readonly bodyStart: number } {
+  if (items.length === 0) return { text: body, bodyStart: 0 };
   const blocks = items.map((item) => buildBrowserCommentBlock(item)).join("\n\n");
   const section = `${BROWSER_COMMENTS_SECTION_HEADER}\n\n${blocks}`;
-  return body.length === 0 ? section : `${body}\n\n${section}`;
+  return { text: body.length === 0 ? section : `${body}\n\n${section}`, bodyStart: 0 };
 }
 
 export function buildBrowserCommentBlock(item: Pick<BrowserCommentDraftItem, "markerNumber" | "pageUrl" | "target" | "comment" | "styleChanges">): string {

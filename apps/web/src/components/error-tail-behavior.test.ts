@@ -47,10 +47,10 @@ describe("durable error-tail projection", () => {
 
   it("suppresses duplicate activation while a queue continuation is pending", () => {
     const error = item("error-1", 2n, "error", 200);
-    expect(hasErrorTailQueueContinuation([queueItem("queued", 201)], "session-a")).toBe(true);
+    expect(hasErrorTailQueueContinuation([queueItem("accepted", 201)], "session-a")).toBe(true);
     expect(hasErrorTailQueueContinuation([queueItem("failed", 201)], "session-a")).toBe(false);
     // A follow-up may have been queued before the failing run settled; it still owns continuation.
-    expect(hasErrorTailQueueContinuation([queueItem("queued", 199)], "session-a")).toBe(true);
+    expect(hasErrorTailQueueContinuation([queueItem("accepted", 199)], "session-a")).toBe(true);
     expect(resolveErrorTail("session-a", [error], [queueItem("dispatchUnknown", 205)], false, "none")).toMatchObject({
       bannerVisible: false,
       hideFromTimeline: true,

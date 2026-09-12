@@ -117,6 +117,55 @@ describe("Inspector production trees", () => {
     expect(navigateSessionBranch).toHaveBeenCalledWith("session-one", { kind: "native_entry", entryId: "child" }, { expectedGeneration: 1n, summarize: false });
   });
 
+  it("shows isolated-workspace branch forks only when the backend can derive the workspace", async () => {
+    const treeView: NativeSessionTreeView = {
+      nativeSessionId: "native-one",
+      roots: [{ id: "root", kind: "message", role: "user", text: "Root question", active: false, children: [] }]
+    };
+    const controller = {
+      getSessionTree: vi.fn(async () => treeView),
+      navigateSessionBranch: vi.fn(async () => undefined),
+      forkSession: vi.fn(async () => "forked"),
+      navigate: vi.fn()
+    } as unknown as AppController;
+    const isolatedSession: SessionView = {
+      ...session(),
+      worktree: {
+        leaseId: "0123456789abcdef01234567",
+        workspaceId: "workspace-one",
+        workingPath: "D:/worktrees/session-one",
+        repositoryRoot: "D:/workspace",
+        branch: "joko/session-one",
+        sourceRef: "main",
+        sourceCommit: "0123456789abcdef0123456789abcdef01234567",
+        sourceStrategy: "explicit",
+        sourceRefreshed: false,
+        state: "active",
+        acquiredAt: 1,
+        updatedAt: 1
+      }
+    };
+    const unavailable = await render(<BranchesPanel
+      controller={controller}
+      backend={backend()}
+      session={isolatedSession}
+      t={t}
+      runAction={(_key, action) => { void action(); }}
+    />);
+    const available = await render(<BranchesPanel
+      controller={controller}
+      backend={backend(true)}
+      session={isolatedSession}
+      t={t}
+      runAction={(_key, action) => { void action(); }}
+    />);
+    await settle();
+
+    expect(unavailable.querySelector("[data-inspector-tree-secondary-action]")).toBeNull();
+    expect(available.querySelector<HTMLButtonElement>("[data-inspector-tree-secondary-action]")?.textContent).toBe("session.fork");
+    expect(controller.forkSession).not.toHaveBeenCalled();
+  });
+
   it("moves through Review hierarchy and collapses its parent with standard tree keys", async () => {
     const files = [diff("src/App.tsx"), diff("src/lib/data.ts"), diff("README.md")];
     const onSelect = vi.fn();
@@ -191,8 +240,17 @@ function session(): SessionView {
   return { id: "session-one", backendId: "backend-one", targetId: "target-one", name: "Task", state: "idle", pinned: false, archived: false, generation: 1n, fastMode: false, permissionMode: "ask", planMode: false, updatedAt: 1 };
 }
 
-function backend(): BackendView {
-  return { id: "backend-one", name: "Backend", version: "1", health: "healthy", capabilities: new Map([["session.fork", { name: "session.fork", supported: true, options: [] }]]) };
+function backend(deriveWorkspace = false): BackendView {
+  return {
+    id: "backend-one",
+    name: "Backend",
+    version: "1",
+    health: "healthy",
+    capabilities: new Map([
+      ["session.fork", { name: "session.fork", supported: true, options: [] }],
+      ...(deriveWorkspace ? [["workspace.derive", { name: "workspace.derive", supported: true, options: [] }] as const] : [])
+    ])
+  };
 }
 
 function required<T>(value: T | null | undefined): T {

@@ -10,7 +10,7 @@ export interface HttpLinkOpenOptions {
 }
 
 export class WorkspaceHtmlExternalUnavailableError extends Error {
-  constructor() { super("HTML previews require the isolated sidebar Browser."); }
+  constructor() { super("HTML previews require the dedicated managed Browser."); }
 }
 
 /** Check immediately before dispatching an effect in the initiating window. */

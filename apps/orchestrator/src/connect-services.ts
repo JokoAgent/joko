@@ -19,7 +19,7 @@ import {
   DEFAULT_COLLABORATION_SETTINGS,
   type ManagedProcessPriority
 } from "@joko/runtime-governance";
-import { JokoError, redactSecrets, type BackendAdapter, type BackendDescriptor, type BackendToolDescriptor, type BlobRef, type DynamicInputFieldType, type InteractionDecision, type NativeSessionCandidate as CoreNativeSessionCandidate, type NativeSessionCatalogEntry as CoreNativeSessionCatalogEntry, type PermissionMode as CorePermissionMode, type PiNativeStateMetadata, type PromptInput, type ProviderModel, type RuntimeCommand, type RuntimeResource, type RuntimeToolCatalog, type SessionTree, type SessionTreeNode, type TurnExecutionOverrides } from "@joko/core";
+import { JokoError, redactSecrets, type BackendAdapter, type BackendDescriptor, type BackendToolDescriptor, type BlobRef, type DynamicInputFieldType, type NativeSessionCandidate as CoreNativeSessionCandidate, type NativeSessionCatalogEntry as CoreNativeSessionCatalogEntry, type PermissionMode as CorePermissionMode, type PiNativeStateMetadata, type PromptInput, type ProviderModel, type RuntimeCommand, type RuntimeResource, type RuntimeToolCatalog, type SessionTree, type SessionTreeNode, type TurnExecutionOverrides } from "@joko/core";
 import {
   AsyncTransactionError,
   AuthorizationError,
@@ -74,6 +74,7 @@ import {
   type BrowserCommentTarget as NativeBrowserCommentTarget,
   type BrowserPageState as NativeBrowserPage,
   type BrowserProvider,
+  type BrowserTargetMode,
   type BrowserTakeoverFence,
   type BrowserTakeoverInput
 } from "@joko/tool-browser";
@@ -152,7 +153,6 @@ import {
   fromProtoDuration,
   fromProtoBlobRef,
   fromProtoInputContent,
-  fromProtoInteractionDecision,
   fromProtoRevision,
   fromProtoNativeNavigationTarget,
   fromProtoRemoteWorkspace,
@@ -194,7 +194,13 @@ import { ProtoMappingError } from "./proto-mapper.js";
 import { TIMED_EXTENSION_INTERACTION_EXPIRED_REASON } from "./interaction-expiry.js";
 import { BROWSER_TOOLS } from "./browser-tool-bridge.js";
 import type { OperationalBrowserState, RecoverableBrowserPageRecord } from "./operational-browser-state.js";
-import type { SessionHost, SessionRuntimeActivityKind } from "./session-host.js";
+import {
+  InteractionDecisionValidationError,
+  type InteractionDecisionSubmission,
+  type InteractionQuestionAnswerSubmission,
+  type SessionHost,
+  type SessionRuntimeActivityKind
+} from "./session-host.js";
 import type { ScheduleCoordinator } from "./schedule-coordinator.js";
 import {
   defaultScheduleExtensionSnapshot,
@@ -575,6 +581,9 @@ function toConnectError(error: unknown): ConnectError {
   if (error instanceof PairingError) return new ConnectError("Pairing failed.", Code.PermissionDenied);
   if (error instanceof SensitiveDataError || error instanceof ProtoMappingError || error instanceof RangeError) {
     return new ConnectError(error.message, Code.InvalidArgument);
+  }
+  if (error instanceof InteractionDecisionValidationError) {
+    return new ConnectError(redactSecrets(error.publicError.message), Code.InvalidArgument);
   }
   if (error instanceof BrowserSettingsValidationError) return new ConnectError(error.message, Code.InvalidArgument);
   if (error instanceof BrowserSettingsEffectError) return new ConnectError(error.message, Code.FailedPrecondition);
@@ -1845,6 +1854,21 @@ export function createConnectServices(application: OrchestratorApplication): Con
       const commands = await dependencies.sessionHost.getCommands(request.sessionId);
       return { commands: commands.map((command) => toProtoRuntimeCommand(command, request.sessionId)) };
     },
+    listSessionResources: async (request, context) => {
+      authenticate(context);
+      const sessionId = request.sessionId.trim();
+      if (sessionId === "") throw invalidArgument("session_id is required");
+      const resources = await dependencies.sessionHost.getResources(sessionId);
+      // Activation may advance the binding generation, so read it after the
+      // live runtime catalog has been acquired.
+      const session = dependencies.store.getSession(sessionId).descriptor;
+      return {
+        resources: resources.flatMap((resource) => {
+          const mapped = toProtoSessionResource(resource, sessionId, session.binding.generation);
+          return mapped === undefined ? [] : [mapped];
+        })
+      };
+    },
     listBackgroundTasks: (request, context) => {
       authenticate(context);
       const sessionId = request.sessionId.trim();
@@ -2708,19 +2732,66 @@ export function createConnectServices(application: OrchestratorApplication): Con
   const artifact = {
     listArtifacts: (request, context) => {
       authenticate(context);
-      const window = storePageWindow(request.page);
       const kind = coreArtifactListKind(request.kind);
-      if (kind?.unsupported === true) return { artifacts: [], page: storePage([], 0, window).page };
+      const queryKey = artifactPageQueryKey(
+        request.sessionId,
+        request.runId,
+        kind?.unsupported === true ? `unsupported:${request.kind ?? ""}` : kind?.kind ?? ""
+      );
+      const cursor = decodeArtifactPageToken(request.page?.pageToken ?? "");
+      if (cursor !== undefined && cursor.queryKey !== queryKey) {
+        throw invalidArgument("page_token does not match the Artifact query");
+      }
+      const limit = Math.min(Math.max(request.page?.pageSize || DEFAULT_PAGE_SIZE, 1), MAX_PAGE_SIZE);
+      const offset = cursor?.offset ?? 0;
+      const beforeRevision = dependencies.store.health().revision;
+      if (cursor !== undefined && cursor.revision !== beforeRevision) {
+        throw new ConnectError(
+          "Artifacts changed while the catalog was being paged; restart from the first page.",
+          Code.Aborted
+        );
+      }
+      if (kind?.unsupported === true) {
+        if (offset !== 0) throw new ConnectError("Artifact page token is outside the current result set.", Code.FailedPrecondition);
+        return {
+          artifacts: [],
+          page: create(contract.PageInfoSchema, { nextPageToken: "", totalSize: 0n }),
+          revision: create(contract.RevisionSchema, { value: beforeRevision, etag: "" })
+        };
+      }
       const query = {
         ...(request.sessionId === "" ? {} : { sessionId: request.sessionId }),
         ...(request.runId === "" ? {} : { runId: request.runId }),
         ...(kind?.kind === undefined ? {} : { kind: kind.kind }),
-        limit: window.limit,
-        offset: window.offset
+        limit,
+        offset
       };
       const values = dependencies.store.listArtifacts(query).map(toProtoArtifact);
-      const result = storePage(values, dependencies.store.countArtifacts(query), window);
-      return { artifacts: result.values, page: result.page };
+      const totalSize = dependencies.store.countArtifacts(query);
+      const afterRevision = dependencies.store.health().revision;
+      if (afterRevision !== beforeRevision) {
+        throw new ConnectError(
+          "Artifacts changed while the catalog page was being read; restart from the first page.",
+          Code.Aborted
+        );
+      }
+      if (offset > totalSize || values.length > limit || offset + values.length > totalSize) {
+        throw new ConnectError("Artifact page token is outside the current result set.", Code.FailedPrecondition);
+      }
+      const nextOffset = offset + values.length;
+      if (nextOffset < totalSize && values.length === 0) {
+        throw new ConnectError("Artifact catalog did not make pagination progress.", Code.Internal);
+      }
+      return {
+        artifacts: values,
+        page: create(contract.PageInfoSchema, {
+          nextPageToken: nextOffset < totalSize
+            ? encodeArtifactPageToken({ queryKey, revision: beforeRevision, offset: nextOffset })
+            : "",
+          totalSize: BigInt(totalSize)
+        }),
+        revision: create(contract.RevisionSchema, { value: beforeRevision, etag: "" })
+      };
     },
     getArtifact: (request, context) => {
       authenticate(context);
@@ -4593,7 +4664,8 @@ function coreQueueListStates(value: contract.QueueItemState | undefined): readon
     case contract.QueueItemState.COMPLETED: return ["completed"];
     case contract.QueueItemState.CANCELLED: return ["cancelled"];
     case contract.QueueItemState.FAILED: return ["failed"];
-    default: return [];
+    case contract.QueueItemState.UNSPECIFIED: throw invalidArgument("queue state is required");
+    default: throw invalidArgument("queue state is invalid");
   }
 }
 
@@ -4646,6 +4718,57 @@ function coreArtifactListKind(value: contract.ArtifactKind | undefined): Artifac
     case contract.ArtifactKind.DIAGNOSTICS: return { kind: "diagnostics" };
     case contract.ArtifactKind.DIFF: return { kind: "diff" };
     default: return { unsupported: true };
+  }
+}
+
+interface ArtifactPageCursor {
+  readonly queryKey: string;
+  readonly revision: bigint;
+  readonly offset: number;
+}
+
+function artifactPageQueryKey(sessionId: string, runId: string, kind: string): string {
+  return createHash("sha256")
+    .update("joko.artifact-page-query.v1\0")
+    .update(JSON.stringify([sessionId, runId, kind]))
+    .digest("hex");
+}
+
+function encodeArtifactPageToken(cursor: ArtifactPageCursor): string {
+  return Buffer.from(JSON.stringify({
+    version: 1,
+    queryKey: cursor.queryKey,
+    revision: cursor.revision.toString(10),
+    offset: cursor.offset
+  }), "utf8").toString("base64url");
+}
+
+function decodeArtifactPageToken(token: string): ArtifactPageCursor | undefined {
+  if (token === "") return undefined;
+  if (token.length > 1_024 || !/^[A-Za-z0-9_-]+$/u.test(token)) throw invalidArgument("page_token is malformed");
+  try {
+    const decoded = Buffer.from(token, "base64url").toString("utf8");
+    if (Buffer.from(decoded, "utf8").toString("base64url") !== token) throw new Error("non-canonical");
+    const value = asRecord(JSON.parse(decoded) as unknown);
+    const queryKey = value["queryKey"];
+    const revision = value["revision"];
+    const offset = value["offset"];
+    if (
+      value["version"] !== 1
+      || typeof queryKey !== "string"
+      || !/^[a-f0-9]{64}$/u.test(queryKey)
+      || typeof revision !== "string"
+      || !/^(?:0|[1-9][0-9]{0,19})$/u.test(revision)
+      || typeof offset !== "number"
+      || !Number.isSafeInteger(offset)
+      || offset < 0
+    ) throw new Error("shape");
+    const parsedRevision = BigInt(revision);
+    if (parsedRevision > 18_446_744_073_709_551_615n) throw new Error("revision-range");
+    return { queryKey, revision: parsedRevision, offset };
+  } catch (error) {
+    if (error instanceof ConnectError) throw error;
+    throw invalidArgument("page_token is malformed");
   }
 }
 
@@ -8760,22 +8883,24 @@ function settingsSnapshot(dependencies: ConnectServiceDependencies): contract.Se
           browserProviderId: BROWSER_PROVIDER_ID,
           profileDisplayName: "Joko",
           takeoverTimeout: toProtoDuration(15 * 60_000),
-          allowUploads: true,
-          allowDownloads: true,
-          automationTarget: contract.BrowserAutomationTarget.EXTERNAL,
-          support: contract.CapabilitySupport.SUPPORTED,
-          supportReason: "",
+          allowUploads: false,
+          allowDownloads: false,
+          automationTarget: dependencies.browserProvider.targetMode === "sidebar"
+            ? contract.BrowserAutomationTarget.SIDEBAR
+            : contract.BrowserAutomationTarget.EXTERNAL,
+          support: contract.CapabilitySupport.TEMPORARILY_UNAVAILABLE,
+          supportReason: "Browser settings are unavailable on this Orchestrator node.",
           detectedBrowser: "",
           targetSettings: dependencies.store.listTargets().map((target) => create(contract.BrowserTargetSettingsSchema, {
             targetId: target.descriptor.id,
-            enabled: true,
+            enabled: false,
             version: toProtoEntityVersion(target.revision, 0, target.updatedAt)
           })),
           backendHealth: create(contract.BrowserBackendHealthSchema, {
-            active: dependencies.browserProvider.running,
-            status: dependencies.browserProvider.running ? contract.BrowserBackendStatus.READY : contract.BrowserBackendStatus.DISCONNECTED,
-            canRecover: true,
-            reason: contract.BrowserBackendFailureReason.UNSPECIFIED
+            active: false,
+            status: contract.BrowserBackendStatus.UNAVAILABLE,
+            canRecover: false,
+            reason: contract.BrowserBackendFailureReason.STATUS_FAILED
           }),
           version: toProtoEntityVersion(health.revision, dependencies.browserProvider.generation, Date.now())
         })],
@@ -10231,6 +10356,39 @@ function requireBrowserState(state: OperationalBrowserState | undefined): Operat
   return state;
 }
 
+function browserPresentationTarget(value: contract.BrowserAutomationTarget): BrowserTargetMode {
+  switch (value) {
+    case contract.BrowserAutomationTarget.SIDEBAR: return "sidebar";
+    case contract.BrowserAutomationTarget.EXTERNAL: return "external";
+    case contract.BrowserAutomationTarget.UNSPECIFIED:
+      throw invalidArgument("open_browser_page.presentation_target is required");
+    default:
+      throw invalidArgument("open_browser_page.presentation_target is invalid");
+  }
+}
+
+function requireBrowserPresentationTarget(
+  provider: BrowserProvider,
+  settings: BrowserSettingsController | undefined,
+  expected: BrowserTargetMode
+): void {
+  if (settings?.automationTarget() !== expected || provider.targetMode !== expected) {
+    throw new ConnectError("The requested Browser presentation target is unavailable.", Code.Unavailable);
+  }
+}
+
+function requireEnabledBrowserPresentationTarget(
+  provider: BrowserProvider,
+  settings: BrowserSettingsController | undefined,
+  expected: BrowserTargetMode,
+  targetId: string
+): void {
+  requireBrowserPresentationTarget(provider, settings, expected);
+  if (settings?.enabled(targetId) !== true) {
+    throw new ConnectError("Browser Provider is disabled for this project.", Code.FailedPrecondition);
+  }
+}
+
 function requireActiveBrowserSessionAuthority(
   state: OperationalBrowserState | undefined,
   authority: { readonly sessionId: string; readonly targetId: string; readonly bindingGeneration: number }
@@ -10291,8 +10449,11 @@ function requireSameBrowserPageOwner(
   ) throw new BrowserTakeoverConflictError("Browser page authority is unavailable or fenced.");
 }
 
-function recoverableBrowserUrl(value: string): string | undefined {
-  try { return validateTakeoverNavigationUrl(value); } catch { return undefined; }
+function durableBrowserPageProjection(page: NativeBrowserPage): { readonly url: string; readonly title: string } | undefined {
+  try {
+    const url = validateTakeoverNavigationUrl(page.url);
+    return { url, title: isWorkspaceHtmlPreviewUrl(url) ? "HTML preview" : page.title };
+  } catch { return undefined; }
 }
 
 function mapBrowserTakeoverNavigationCommand(
@@ -10810,29 +10971,44 @@ async function releaseRevokedBrowserTakeover(
 ): Promise<void> {
   const provider = dependencies.browserProvider;
   if (provider === undefined) return;
+  let cleanupFailed = false;
+  try {
+    const htmlCleanup = await provider.closeHtmlPagesOwnedBy(connectionId);
+    for (const page of htmlCleanup.retiredPages) {
+      try {
+        dependencies.browserState?.closeHumanPage(provider.id, page.pageId, page.generation);
+      } catch { cleanupFailed = true; }
+    }
+    if (!htmlCleanup.complete) cleanupFailed = true;
+  } catch { cleanupFailed = true; }
   let fence: BrowserTakeoverFence | undefined;
   try {
     const current = provider.currentHumanTakeover();
-    if (current === undefined || current.owner !== connectionId) return;
-    fence = {
-      providerId: current.providerId,
-      pageId: current.pageId,
-      generation: current.generation,
-      owner: current.owner,
-      takeoverId: current.takeoverId
-    };
-    await provider.endHumanTakeover(fence);
+    if (current !== undefined && current.owner === connectionId) {
+      fence = {
+        providerId: current.providerId,
+        pageId: current.pageId,
+        generation: current.generation,
+        owner: current.owner,
+        takeoverId: current.takeoverId
+      };
+      await provider.endHumanTakeover(fence);
+    }
   } catch {
     // A concurrent end/recovery/new generation is a successful fence outcome:
     // it proves the revoked owner's exact capability is no longer current.
-    if (fence !== undefined) {
+    if (fence === undefined) {
+      cleanupFailed = true;
+    } else {
       try {
         const current = provider.currentHumanTakeover();
-        if (current === undefined || !sameTakeoverFence(current, fence)) return;
+        if (current !== undefined && sameTakeoverFence(current, fence)) cleanupFailed = true;
       } catch {
-        // A failed state probe still needs the same redacted diagnostic below.
+        cleanupFailed = true;
       }
     }
+  }
+  if (cleanupFailed) {
     try {
       dependencies.store.appendDiagnostic({
         severity: "warning",
@@ -11207,8 +11383,8 @@ async function dispatchMutation(
         includeArchived: true,
         includeDeleted: true
       }).filter((item) => item.descriptor.deletedAt === undefined);
-      if (sessions.length > 0 && !payload.value.deleteProductSessions) {
-        throw new ConnectError("Target still owns product sessions; set delete_product_sessions to tombstone them.", Code.FailedPrecondition);
+      if (sessions.length > 0) {
+        throw new ConnectError("Delete the Target's product sessions before deleting the Target.", Code.FailedPrecondition);
       }
       if (payload.value.deleteManagedWorkspace && !existing.descriptor.managed) {
         throw new ConnectError("Only a service-created managed workspace can be moved to managed trash.", Code.FailedPrecondition);
@@ -11241,36 +11417,20 @@ async function dispatchMutation(
         kind: payload.case,
         body: mutation,
         precondition: assertDeletionPrecondition,
-        ...(payload.value.deleteManagedWorkspace || sessions.some((session) => session.descriptor.worktree !== undefined) ? {
+        ...(payload.value.deleteManagedWorkspace ? {
           effect: async () => {
-            // Stop native runtimes before moving their cwd on platforms that
-            // hold directory handles. Closing a UI is never used as a proxy.
-            for (const session of sessions) {
-              if (payload.value.deleteManagedWorkspace || session.descriptor.worktree !== undefined) {
-                await host.close(session.descriptor.id);
-              }
-              if (session.descriptor.worktree !== undefined) {
-                if (dependencies.sessionWorktrees === undefined) throw new ConnectError("Isolated workspace cleanup is unavailable.", Code.FailedPrecondition);
-                await dependencies.sessionWorktrees.release(session.descriptor.id);
-              }
-            }
-            if (payload.value.deleteManagedWorkspace) {
-              const trashed = await moveManagedWorkspaceToTrash({
-                managedRoot: resolve(dependencies.managedWorkspaceRoot!),
-                workspaceRoot: existing.descriptor.workspaceRoot,
-                targetId: existing.descriptor.id,
-                operationId
-              });
-              trashedPath = trashed.trashedPath;
-              dependencies.workspaceService.unregister(workspaceId);
-            }
+            const trashed = await moveManagedWorkspaceToTrash({
+              managedRoot: resolve(dependencies.managedWorkspaceRoot!),
+              workspaceRoot: existing.descriptor.workspaceRoot,
+              targetId: existing.descriptor.id,
+              operationId
+            });
+            trashedPath = trashed.trashedPath;
+            dependencies.workspaceService.unregister(workspaceId);
           }
         } : {}),
         commit: (store) => {
           assertDeletionPrecondition(store);
-          for (const item of sessions) {
-            store.updateSession(item.descriptor.id, { archived: true, deletedAt }, item.revision, deletedAt);
-          }
           store.upsertTarget(existing.descriptor, {
             ...metadata,
             state: "archived",
@@ -12380,35 +12540,51 @@ async function dispatchMutation(
           "Only user-created queued input can be edited."
         );
       }
-      const disposition = payload.value.deliveryMode === undefined
-        ? current.disposition
+      const requestedDisposition = payload.value.deliveryMode === undefined
+        ? undefined
         : deliveryMode(payload.value.deliveryMode);
-      const prompt = fromProtoInputContent(payload.value.input, disposition);
+      const publicPrompt = fromProtoInputContent(
+        payload.value.input,
+        requestedDisposition ?? current.disposition
+      );
       const execution = await host.mutate({
         operationId,
         connection,
         kind: payload.case,
         body: mutation,
-        precondition: () => dependencies.sessionHost.assertInputCapabilities(current.sessionId, prompt),
         commit: (store) => {
+          const durableCurrent = store.getQueueItem(payload.value.queueItemId);
+          const durableRun = store.getRun(durableCurrent.runId).descriptor;
+          if (durableRun.source !== "user" || durableRun.parentRunId !== undefined) {
+            throw new StoreError("Only user-created queued input can be edited.");
+          }
+          const prompt = dependencies.sessionHost.canonicalQueueItemEdit(durableCurrent, {
+            ...publicPrompt,
+            disposition: requestedDisposition ?? durableCurrent.disposition
+          }, payload.value.textSplices.map((splice) => ({
+            start: splice.start,
+            end: splice.end,
+            replacementText: splice.replacementText
+          })));
+          dependencies.sessionHost.assertInputCapabilities(durableCurrent.sessionId, prompt);
           const updated = store.editQueueItem({
-            queueItemId: current.id,
+            queueItemId: durableCurrent.id,
             body: prompt,
             connectionId: connection.id,
             lockToken: payload.value.lockToken,
             traceId: `operation:${operationId}`
           });
-            if (disposition === "steer") {
-              store.reorderQueueItem({
-                queueItemId: current.id,
-                placement: { edge: "first" },
-                connectionId: connection.id,
-                editLockToken: payload.value.lockToken,
-                expectedRevision: updated.revision,
-                traceId: `operation:${operationId}:steer`
-              });
+          if (prompt.disposition === "steer") {
+            store.reorderQueueItem({
+              queueItemId: durableCurrent.id,
+              placement: { edge: "first" },
+              connectionId: connection.id,
+              editLockToken: payload.value.lockToken,
+              expectedRevision: updated.revision,
+              traceId: `operation:${operationId}:steer`
+            });
           }
-          return { accepted: true, resultCase: "queueItem", entityId: current.id } satisfies OperationOutcome;
+          return { accepted: true, resultCase: "queueItem", entityId: durableCurrent.id } satisfies OperationOutcome;
         }
       });
       return presented(execution);
@@ -12907,7 +13083,7 @@ async function dispatchMutation(
     }
     case "resolveInteraction": {
       if (payload.value.resolution === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Interaction resolution is required.");
-      const mapped = fromProtoInteractionDecision(payload.value.resolution);
+      const mapped = interactionDecisionSubmission(payload.value.resolution);
       const execution = await host.mutate({
         operationId,
         connection,
@@ -12915,9 +13091,14 @@ async function dispatchMutation(
         body: mutation,
         commit: () => {
           if (mapped.kind === "dismissal") host.dismissInteraction(payload.value.interactionId, Number(payload.value.interactionGeneration), mapped.reason, `operation:${operationId}`, operationId);
-          else host.resolveInteraction(payload.value.interactionId, Number(payload.value.interactionGeneration), coreInteractionDecision(mapped.value), `operation:${operationId}`, operationId);
+          else host.resolveInteraction(payload.value.interactionId, Number(payload.value.interactionGeneration), mapped.value, `operation:${operationId}`, operationId);
           return { accepted: true, resultCase: "interaction", entityId: payload.value.interactionId } satisfies OperationOutcome;
         }
+      }).catch((error: unknown) => {
+        if (error instanceof InteractionDecisionValidationError) {
+          throw invalidArgument(redactSecrets(error.publicError.message));
+        }
+        throw error;
       });
       return presented(execution);
     }
@@ -15272,6 +15453,9 @@ async function dispatchMutation(
       if (payload.value.browserProviderId !== dependencies.browserProvider.id) {
         throw new ConnectError("Browser Provider not found.", Code.NotFound);
       }
+      const presentationTarget = browserPresentationTarget(payload.value.presentationTarget);
+      const provider = dependencies.browserProvider;
+      requireBrowserPresentationTarget(provider, dependencies.browserSettings, presentationTarget);
       requireOpaqueTakeoverId(payload.value.sessionId, "Session ID");
       let browserSession;
       try {
@@ -15286,9 +15470,7 @@ async function dispatchMutation(
       ) {
         throw new ConnectError("Browser pages can only be opened for an active task.", Code.FailedPrecondition);
       }
-      if (dependencies.browserSettings?.enabled(browserSession.descriptor.targetId) === false) {
-        throw new ConnectError("Browser Provider is disabled for this project.", Code.FailedPrecondition);
-      }
+      requireEnabledBrowserPresentationTarget(provider, dependencies.browserSettings, presentationTarget, browserSession.descriptor.targetId);
       const requestedPageOwner = {
         sessionId: browserSession.descriptor.id,
         targetId: browserSession.descriptor.targetId,
@@ -15307,7 +15489,12 @@ async function dispatchMutation(
       if (htmlSource !== undefined && (payload.value.url !== "" || payload.value.recoveryPageId !== "" || htmlSource.expectedRevision === "")) {
         throw invalidArgument("HTML page opens require an exact file revision and cannot include a URL or recovery page.");
       }
-      const requestedUrl = htmlSource === undefined ? validateTakeoverNavigationUrl(payload.value.url) : workspaceHtmlPreviewUrl(randomUUID(), htmlSource.relativePath);
+      let requestedUrl: string;
+      if (htmlSource === undefined) requestedUrl = validateTakeoverNavigationUrl(payload.value.url);
+      else {
+        try { requestedUrl = workspaceHtmlPreviewUrl(randomUUID(), htmlSource.relativePath); }
+        catch { throw invalidArgument("Workspace HTML path cannot fit the bounded Browser preview URL."); }
+      }
       if (htmlSource === undefined && isWorkspaceHtmlPreviewUrl(requestedUrl)) {
         throw new ConnectError("This HTML snapshot cannot be recovered by URL. Open the source file again.", Code.FailedPrecondition);
       }
@@ -15333,7 +15520,6 @@ async function dispatchMutation(
         throw invalidArgument("Browser page recovery URL does not match its durable descriptor.");
       }
       const targetUrl = recovery?.url ?? requestedUrl;
-      const provider = dependencies.browserProvider;
       const observed = provider.currentHumanTakeover();
       let sourceFence: ReturnType<BrowserProvider["currentHumanTakeover"]> = undefined;
       if (observed === undefined) {
@@ -15357,12 +15543,16 @@ async function dispatchMutation(
       }
       let takeover: ReturnType<BrowserProvider["currentHumanTakeover"]>;
       let openedPage: NativeBrowserPage | undefined;
-      const execution = await host.mutate({
+      let openedPageCommitted = false;
+      let releaseOpenedReadOwner: (() => void) | undefined;
+      try {
+        const execution = await host.mutate({
         operationId,
         connection,
         kind: payload.case,
         body: mutation,
         precondition: () => {
+          requireEnabledBrowserPresentationTarget(provider, dependencies.browserSettings, presentationTarget, requestedPageOwner.targetId);
           requireActiveBrowserSessionAuthority(dependencies.browserState, requestedPageOwner);
           if (takeover !== undefined) {
             provider.assertHumanTakeover(takeover);
@@ -15390,12 +15580,16 @@ async function dispatchMutation(
           if (recovery !== undefined && provider.running && (await provider.listPages()).some((page) => page.id === recovery.pageId)) {
             throw new ConnectError("The Browser page is still live and does not need recovery.", Code.FailedPrecondition);
           }
+          requireEnabledBrowserPresentationTarget(provider, dependencies.browserSettings, presentationTarget, requestedPageOwner.targetId);
           await provider.start();
+          requireEnabledBrowserPresentationTarget(provider, dependencies.browserSettings, presentationTarget, requestedPageOwner.targetId);
           const assertHtmlOwner = (): void => {
             dependencies.connections.fence(connection);
             requireActiveBrowserSessionAuthority(dependencies.browserState, requestedPageOwner);
+            requireEnabledBrowserPresentationTarget(provider, dependencies.browserSettings, presentationTarget, requestedPageOwner.targetId);
           };
           const htmlOwner = htmlSource === undefined ? undefined : captureHtmlConnectionRead(dependencies.connections, connection);
+          releaseOpenedReadOwner = htmlOwner?.dispose;
           let pageOwnsRead = false;
           try {
             const htmlSnapshot = htmlSource === undefined ? undefined : await readWorkspaceHtmlSnapshot({
@@ -15403,6 +15597,7 @@ async function dispatchMutation(
               source: htmlSource, assertConnection: assertHtmlOwner, signal: htmlOwner!.signal
             });
             htmlSnapshot?.assertCurrent();
+            requireEnabledBrowserPresentationTarget(provider, dependencies.browserSettings, presentationTarget, requestedPageOwner.targetId);
             const requestedGeneration = provider.generation;
             takeover = await provider.openHumanPage({
               providerId: provider.id,
@@ -15411,10 +15606,12 @@ async function dispatchMutation(
               url: targetUrl
             }, dependencies.browserSettings?.takeoverTimeout(), htmlSnapshot === undefined ? undefined : { ...htmlSnapshot, dispose: htmlOwner!.dispose });
             pageOwnsRead = true;
+            requireEnabledBrowserPresentationTarget(provider, dependencies.browserSettings, presentationTarget, requestedPageOwner.targetId);
             openedPage = (await provider.listPages()).find((page) => page.id === takeover?.pageId);
           } finally { if (!pageOwnsRead) htmlOwner?.dispose(); }
         },
         commit: () => {
+          requireEnabledBrowserPresentationTarget(provider, dependencies.browserSettings, presentationTarget, requestedPageOwner.targetId);
           if (takeover === undefined || openedPage === undefined) throw new Error("Browser page open completed without a live page takeover.");
           requireBrowserState(dependencies.browserState).recordHumanPage({
             browserProviderId: provider.id,
@@ -15424,13 +15621,41 @@ async function dispatchMutation(
             targetId: browserSession.descriptor.targetId,
             bindingGeneration: browserSession.descriptor.binding.generation,
             url: targetUrl,
-            title: openedPage.title,
+            title: htmlSource === undefined ? openedPage.title : "HTML preview",
             updatedAt: (dependencies.now ?? Date.now)()
           }, { active: true, ...(recovery === undefined ? {} : { replacesPageId: recovery.pageId }) });
+          openedPageCommitted = true;
+          releaseOpenedReadOwner = undefined;
           return { accepted: true, resultCase: "browserTakeover", entityId: takeover.takeoverId } satisfies OperationOutcome;
         }
-      });
-      return presented(execution);
+        });
+        return presented(execution);
+      } catch (error) {
+        if (takeover !== undefined && !openedPageCommitted) {
+          try {
+            await provider.compensateHumanPageOpen(takeover, sourceFence === undefined ? undefined : {
+              pageId: sourceFence.pageId,
+              assertCurrent: () => {
+                dependencies.connections.fence(connection);
+                requireActiveBrowserSessionAuthority(dependencies.browserState, requestedPageOwner);
+                requireEnabledBrowserPresentationTarget(provider, dependencies.browserSettings, presentationTarget, requestedPageOwner.targetId);
+                requireActiveBrowserPageAuthority(
+                  dependencies.browserState,
+                  provider.id,
+                  sourceFence.pageId,
+                  sourceFence.generation,
+                  requestedPageOwner
+                );
+              }
+            }, dependencies.browserSettings?.takeoverTimeout());
+          } catch (compensationError) {
+            releaseOpenedReadOwner?.();
+            throw new AggregateError([error, compensationError], "Browser page-open failed and its uncommitted page could not be compensated.");
+          }
+        }
+        releaseOpenedReadOwner?.();
+        throw error;
+      }
     }
     case "focusBrowserPage": {
       if (dependencies.browserProvider === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Browser Provider is not configured.");
@@ -15488,8 +15713,8 @@ async function dispatchMutation(
             takeover.generation,
             targetOwner
           );
-          const recoveryUrl = recoverableBrowserUrl(focusedPage.url);
-          if (recoveryUrl !== undefined) {
+          const projection = durableBrowserPageProjection(focusedPage);
+          if (projection !== undefined) {
             requireBrowserState(dependencies.browserState).recordHumanPage({
               browserProviderId: provider.id,
               pageId: focusedPage.id,
@@ -15497,8 +15722,8 @@ async function dispatchMutation(
               sessionId: targetOwner.sessionId,
               targetId: targetOwner.targetId,
               bindingGeneration: targetOwner.bindingGeneration,
-              url: recoveryUrl,
-              title: focusedPage.title,
+              url: projection.url,
+              title: projection.title,
               updatedAt: (dependencies.now ?? Date.now)()
             }, { active: true });
           }
@@ -15577,8 +15802,8 @@ async function dispatchMutation(
         commit: () => {
           requireBrowserState(dependencies.browserState).closeHumanPage(provider.id, payload.value.pageId, current.generation, takeover?.pageId);
           if (takeover !== undefined && activePage !== undefined && replacementOwner !== undefined) {
-            const recoveryUrl = recoverableBrowserUrl(activePage.url);
-            if (recoveryUrl !== undefined) {
+            const projection = durableBrowserPageProjection(activePage);
+            if (projection !== undefined) {
               requireBrowserState(dependencies.browserState).recordHumanPage({
                 browserProviderId: provider.id,
                 pageId: activePage.id,
@@ -15586,8 +15811,8 @@ async function dispatchMutation(
                 sessionId: replacementOwner.sessionId,
                 targetId: replacementOwner.targetId,
                 bindingGeneration: replacementOwner.bindingGeneration,
-                url: recoveryUrl,
-                title: activePage.title,
+                url: projection.url,
+                title: projection.title,
                 updatedAt: (dependencies.now ?? Date.now)()
               }, { active: true });
             }
@@ -15674,8 +15899,8 @@ async function dispatchMutation(
           );
         },
         commit: () => {
-          const recoveryUrl = updatedPage === undefined ? undefined : recoverableBrowserUrl(updatedPage.url);
-          if (recoveryUrl !== undefined && updatedPage !== undefined) {
+          const projection = updatedPage === undefined ? undefined : durableBrowserPageProjection(updatedPage);
+          if (projection !== undefined) {
             requireBrowserState(dependencies.browserState).recordHumanPage({
               browserProviderId: current.providerId,
               pageId: current.pageId,
@@ -15683,8 +15908,8 @@ async function dispatchMutation(
               sessionId: pageOwner.sessionId,
               targetId: pageOwner.targetId,
               bindingGeneration: pageOwner.bindingGeneration,
-              url: recoveryUrl,
-              title: updatedPage.title,
+              url: projection.url,
+              title: projection.title,
               updatedAt: (dependencies.now ?? Date.now)()
             }, { active: true });
           }
@@ -16503,9 +16728,13 @@ function protoPermission(value: string | undefined): contract.PermissionMode {
 }
 
 function deliveryMode(value: contract.QueueDeliveryMode): PromptInput["disposition"] {
-  if (value === contract.QueueDeliveryMode.STEER) return "steer";
-  if (value === contract.QueueDeliveryMode.FOLLOW_UP) return "follow_up";
-  return "prompt";
+  switch (value) {
+    case contract.QueueDeliveryMode.PROMPT: return "prompt";
+    case contract.QueueDeliveryMode.STEER: return "steer";
+    case contract.QueueDeliveryMode.FOLLOW_UP: return "follow_up";
+    case contract.QueueDeliveryMode.UNSPECIFIED: throw invalidArgument("delivery_mode is required");
+    default: throw invalidArgument("delivery_mode is invalid");
+  }
 }
 
 function protoDeliveryMode(value: PromptInput["disposition"]): contract.QueueDeliveryMode {
@@ -16514,32 +16743,106 @@ function protoDeliveryMode(value: PromptInput["disposition"]): contract.QueueDel
   return contract.QueueDeliveryMode.PROMPT;
 }
 
-function coreInteractionDecision(value: unknown): InteractionDecision {
-  if (typeof value === "boolean") return { kind: "confirmed", confirmed: value };
-  if (typeof value === "string") return { kind: "selected", value };
-  if (value !== null && typeof value === "object" && !Array.isArray(value)) {
-    const record = value as Record<string, unknown>;
-    if (record["cancelled"] === true) return { kind: "cancelled" };
-    const planDecision = record["decision"];
-    if (planDecision === "execute" || planDecision === "stay" || planDecision === "refine") {
+function interactionDecisionSubmission(resolution: contract.InteractionResolution):
+  | { readonly kind: "decision"; readonly value: InteractionDecisionSubmission }
+  | { readonly kind: "dismissal"; readonly reason: string } {
+  switch (resolution.decision.case) {
+    case "permission":
       return {
-        kind: "plan_review",
-        decision: planDecision,
-        feedback: typeof record["feedback"] === "string" ? record["feedback"] : ""
+        kind: "decision",
+        value: {
+          kind: "permission",
+          decision: submittedPermissionDecision(resolution.decision.value.decision)
+        }
       };
-    }
-    const answers: Record<string, string | boolean | readonly string[]> = {};
-    for (const [fieldId, answer] of Object.entries(record)) {
-      if (typeof answer === "string" || typeof answer === "boolean" ||
-        (Array.isArray(answer) && answer.every((entry) => typeof entry === "string"))) {
-        answers[fieldId] = answer as string | boolean | readonly string[];
-      } else {
-        throw new ConnectError("Question response contains an invalid answer.", Code.InvalidArgument);
-      }
-    }
-    return { kind: "question", answers };
+    case "question":
+      return {
+        kind: "decision",
+        value: {
+          kind: "question",
+          answers: resolution.decision.value.answers.map((answer) => ({
+            fieldId: answer.fieldId,
+            value: submittedQuestionAnswer(answer)
+          }))
+        }
+      };
+    case "planReview":
+      return {
+        kind: "decision",
+        value: {
+          kind: "plan_review",
+          decision: submittedPlanReviewDecision(resolution.decision.value.decision),
+          feedback: resolution.decision.value.feedback
+        }
+      };
+    case "extensionUi":
+      return {
+        kind: "decision",
+        value: {
+          kind: "extension",
+          result: submittedExtensionResult(resolution.decision.value)
+        }
+      };
+    case "dismissal":
+      return { kind: "dismissal", reason: resolution.decision.value.reason };
+    case undefined:
+      throw invalidArgument("Interaction decision is required.");
   }
-  return { kind: "selected", value: safeJson(value) };
+}
+
+function submittedPermissionDecision(value: contract.PermissionDecisionKind): string {
+  switch (value) {
+    case contract.PermissionDecisionKind.ALLOW_ONCE: return "allow_once";
+    case contract.PermissionDecisionKind.ALLOW_FOR_TURN: return "allow_for_turn";
+    case contract.PermissionDecisionKind.ALLOW_FOR_SESSION: return "allow_for_session";
+    case contract.PermissionDecisionKind.DENY_ONCE: return "deny_once";
+    case contract.PermissionDecisionKind.DENY_FOR_SESSION: return "deny_for_session";
+    case contract.PermissionDecisionKind.ABORT_RUN: return "abort_run";
+    case contract.PermissionDecisionKind.UNSPECIFIED: return "unspecified";
+    default: return "invalid";
+  }
+}
+
+function submittedPlanReviewDecision(value: contract.PlanReviewDecisionKind): string {
+  switch (value) {
+    case contract.PlanReviewDecisionKind.EXECUTE: return "execute";
+    case contract.PlanReviewDecisionKind.STAY_IN_PLAN_MODE: return "stay";
+    case contract.PlanReviewDecisionKind.REFINE: return "refine";
+    case contract.PlanReviewDecisionKind.UNSPECIFIED: return "unspecified";
+    default: return "invalid";
+  }
+}
+
+function submittedQuestionAnswer(answer: contract.QuestionAnswer): InteractionQuestionAnswerSubmission {
+  switch (answer.value.case) {
+    case "text": return { kind: "text", value: answer.value.value };
+    case "singleChoice": {
+      const selection = answer.value.value.selection;
+      if (selection.case === "choiceId") return { kind: "choice", value: selection.value };
+      if (selection.case === "otherText") return { kind: "other", value: selection.value };
+      throw invalidArgument("Single-choice question answer selection is required.");
+    }
+    case "multipleChoice": return {
+      kind: "choices",
+      values: [...answer.value.value.choiceIds],
+      ...(answer.value.value.otherText === undefined ? {} : { otherText: answer.value.value.otherText })
+    };
+    case "boolean": return { kind: "boolean", value: answer.value.value };
+    case undefined: throw invalidArgument("Question answer value is required.");
+    default: throw invalidArgument("Question answer value is invalid.");
+  }
+}
+
+function submittedExtensionResult(
+  resolution: contract.ExtensionUiResolution
+): Extract<InteractionDecisionSubmission, { readonly kind: "extension" }>["result"] {
+  switch (resolution.result.case) {
+    case "value": return { kind: "value", value: resolution.result.value };
+    case "confirmed": return { kind: "confirmed", value: resolution.result.value };
+    case "cancelled": return { kind: "cancelled", value: resolution.result.value };
+    case undefined: return { kind: "missing" };
+    default: return { kind: "invalid" };
+  }
 }
 
 function captureHtmlConnectionRead(connections: ConnectionManager, connection: ConnectionRecord): { readonly signal: AbortSignal; readonly dispose: () => void } {
@@ -16549,6 +16852,38 @@ function captureHtmlConnectionRead(connections: ConnectionManager, connection: C
   const dispose = (): void => { if (disposed) return; disposed = true; unsubscribe(); abort.abort(); };
   try { connections.fence(connection); } catch (error) { dispose(); throw error; }
   return { signal: abort.signal, dispose };
+}
+
+function toProtoSessionResource(
+  item: RuntimeResource,
+  sessionId: string,
+  runtimeGeneration: number
+): contract.SessionResource | undefined {
+  if (
+    item.state !== "loaded"
+    || item.runtimePath === undefined
+    || !validSessionResourceIdentityText(item.id)
+    || !validSessionResourceIdentityText(item.revision)
+    || item.resourceVersion === undefined
+    || item.resourceVersion < 1n
+    || item.resourceVersion > 18_446_744_073_709_551_615n
+    || item.runtimeGeneration !== runtimeGeneration
+  ) return undefined;
+  return create(contract.SessionResourceSchema, {
+    sessionId,
+    resourceId: item.id,
+    kind: protoResourceKind(item.kind),
+    name: item.name,
+    version: item.version ?? "",
+    discoveredRevision: item.revision,
+    resourceVersion: item.resourceVersion,
+    runtimeGeneration: BigInt(runtimeGeneration)
+  });
+}
+
+function validSessionResourceIdentityText(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 4_096
+    && value === value.trim() && !/[\u0000-\u001f\u007f\u2028\u2029]/u.test(value);
 }
 
 function stableConnection(connection: ConnectionRecord): ConnectionRecord {

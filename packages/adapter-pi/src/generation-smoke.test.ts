@@ -171,6 +171,7 @@ describe("real Pi managed generation smoke", () => {
       const forkReceipt: NativeSessionBinding[] = [];
       const forkResult = await adapter.fork(branchMessage.entryId, first, {
         sessionId: "real-pi-workflow-fork",
+        target: first.target,
         recordBinding: (binding) => { forkReceipt.push(binding); }
       });
       expect(forkReceipt).toEqual([forkResult.binding]);
@@ -189,6 +190,7 @@ describe("real Pi managed generation smoke", () => {
       const cloneReceipt: NativeSessionBinding[] = [];
       const cloneBinding = await adapter.clone(forkContext, {
         sessionId: "real-pi-workflow-clone",
+        target: forkContext.target,
         recordBinding: (binding) => { cloneReceipt.push(binding); }
       });
       expect(cloneReceipt).toEqual([cloneBinding]);

@@ -34,6 +34,7 @@ export interface SessionHeaderActionsMenuProps {
   readonly onRename: () => void;
   readonly onPin: () => void;
   readonly onArchive: () => void;
+  readonly onPrefetchRemoval?: () => void;
   readonly onDelete: () => void;
   readonly onMoveSessionProject?: (placement: SessionProjectNavigationPlacement) => void;
   readonly onCopyTaskLink?: () => void;
@@ -54,6 +55,7 @@ export function SessionHeaderActionsMenu({
   onRename,
   onPin,
   onArchive,
+  onPrefetchRemoval,
   onDelete,
   onMoveSessionProject,
   onCopyTaskLink,
@@ -150,6 +152,7 @@ export function SessionHeaderActionsMenu({
     className="header-menu session-header-menu"
     onToggle={(event) => {
       setMenuOpen(event.currentTarget.open);
+      if (event.currentTarget.open) onPrefetchRemoval?.();
       if (!event.currentTarget.open) setProjectMenuOpen(false);
     }}
   >

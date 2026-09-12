@@ -114,7 +114,7 @@ describe("PersonalizationSettings persistence", () => {
     await restore(container.querySelector('[aria-labelledby="vision-bridge-title"]'));
     await restore(container.querySelector('[aria-labelledby="personalization-compaction-heading"]'));
     await restore(required(container.querySelector('[aria-label="Select external web link destination"]')).closest(".personalization-link-row"));
-    await restore(required(container.querySelector('[aria-label="Select local web link destination"]')).closest(".personalization-link-row"));
+    await restore(required(container.querySelector('[aria-label="Select local and Workspace HTML destination"]')).closest(".personalization-link-row"));
     await restore(container.querySelector('[aria-labelledby="personalization-stream-heading"]'));
     await restore(container.querySelector(".prompt-recommendation"));
     await restore(required(container.querySelector<HTMLInputElement>('[aria-label="Toggle chat semantic indexing"]')).closest(".personalization-tip-row"));
@@ -174,7 +174,10 @@ describe("PersonalizationSettings persistence", () => {
     />));
 
     const web = required(container.querySelector('[aria-label="Select external web link destination"]'));
-    const local = required(container.querySelector('[aria-label="Select local web link destination"]'));
+    const local = required(container.querySelector('[aria-label="Select local and Workspace HTML destination"]'));
+    expect([...web.querySelectorAll('[role="radio"]')].map((item) => item.textContent)).toEqual(["Sidebar Browser", "System browser"]);
+    expect([...local.querySelectorAll('[role="radio"]')].map((item) => item.textContent)).toEqual(["Sidebar Browser", "External Browser"]);
+    expect(local.closest(".personalization-link-row")?.textContent).toContain("a dedicated managed Browser for Workspace HTML");
     const external = required(local.querySelector<HTMLButtonElement>('[role="radio"]:last-child'));
     await act(async () => {
       external.click();

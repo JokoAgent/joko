@@ -116,6 +116,27 @@ describe("ManagedModelRuntimeController", () => {
     expect((await controller.snapshot()).revision).toBe(1n);
   });
 
+  it("does not let an earlier slow snapshot replace a newer committed projection", async () => {
+    const manager = new FakeRuntimeManager();
+    const staleModels = deferred<typeof manager.installed>();
+    const list = vi.spyOn(manager, "list")
+      .mockImplementationOnce(() => staleModels.promise)
+      .mockImplementation(async () => manager.installed);
+    const controller = new ManagedModelRuntimeController({ manager, owner, now: () => 100 });
+
+    const staleRequest = controller.snapshot();
+    await vi.waitFor(() => expect(list).toHaveBeenCalledTimes(1));
+    const currentSnapshot = await controller.snapshot();
+    expect(currentSnapshot.installedModels).toEqual(manager.installed);
+    expect(currentSnapshot.revision).toBe(1n);
+
+    staleModels.resolve([]);
+    const lateSnapshot = await staleRequest;
+    expect(lateSnapshot).toBe(currentSnapshot);
+    expect(lateSnapshot.installedModels).toEqual(manager.installed);
+    expect((await controller.snapshot()).revision).toBe(1n);
+  });
+
   it("starts pulls without tying them to the request and exposes pause, resume and cancel", async () => {
     const manager = new FakeRuntimeManager();
     const controller = new ManagedModelRuntimeController({ manager, owner });

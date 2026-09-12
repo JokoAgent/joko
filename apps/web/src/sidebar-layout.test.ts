@@ -100,6 +100,11 @@ describe("owner-scoped sidebar layout", () => {
     });
   });
 
+  it("accepts only the current created-time sort preference", () => {
+    expect(normalizeSidebarDisplayPreferences({ sortBy: "created" }).sortBy).toBe("created");
+    expect(normalizeSidebarDisplayPreferences({ sortBy: "creation" }).sortBy).toBe("recency");
+  });
+
   it("defaults display density safely and keeps explicit empty or user-ordered session information", () => {
     expect(normalizeSidebarDisplayPreferences({ mainViewMode: "tiles", pinnedViewMode: "tiles" })).toMatchObject({
       mainViewMode: "list",
@@ -163,6 +168,20 @@ describe("filtered manual sidebar ordering", () => {
 });
 
 describe("sidebar task sorting", () => {
+  it("orders by creation time without letting later activity move a task", () => {
+    const olderCreated = { ...session("older-created", "idle", 900), createdAt: 10 };
+    const newerB = { ...session("newer-b", "idle", 20), createdAt: 30 };
+    const newerA = { ...session("newer-a", "idle", 10), createdAt: 30 };
+
+    expect(sortSidebarSessions([olderCreated, newerB, newerA], "created").map((item) => item.id))
+      .toEqual(["newer-a", "newer-b", "older-created"]);
+    expect(sortSidebarSessions([
+      { ...olderCreated, updatedAt: 10_000 },
+      newerB,
+      newerA
+    ], "created").map((item) => item.id)).toEqual(["newer-a", "newer-b", "older-created"]);
+  });
+
   it("uses typed unread awaiting/error, unread done, running, then rest without state guesses", () => {
     const sessions = [
       session("idle-new", "idle", 40),
@@ -191,13 +210,15 @@ describe("sidebar task sorting", () => {
   it("orders project rows by activity/priority until custom order takes authority", () => {
     const targets = [target("a"), target("b"), target("c")];
     const sessions = [
-      { ...session("a-new", "idle", 50), targetId: "a", projectId: "a" },
-      { ...session("b-waiting", "waiting", 10), targetId: "b", projectId: "b", attention: attention("awaiting", true, 30n) },
-      { ...session("c-running", "running", 40), targetId: "c", projectId: "c" }
+      { ...session("a-new", "idle", 50), targetId: "a", projectId: "a", createdAt: 10 },
+      { ...session("b-waiting", "waiting", 10), targetId: "b", projectId: "b", createdAt: 30, attention: attention("awaiting", true, 30n) },
+      { ...session("c-running", "running", 40), targetId: "c", projectId: "c", createdAt: 20 }
     ];
 
     expect(sortSidebarTargets(targets, sessions, "recency", "activity", []).map((item) => item.id)).toEqual(["a", "c", "b"]);
+    expect(sortSidebarTargets(targets, sessions, "created", "activity", []).map((item) => item.id)).toEqual(["b", "c", "a"]);
     expect(sortSidebarTargets(targets, sessions, "priority", "activity", []).map((item) => item.id)).toEqual(["b", "c", "a"]);
+    expect(sortSidebarTargets(targets, sessions, "created", "custom", ["c", "a", "b"]).map((item) => item.id)).toEqual(["c", "a", "b"]);
     expect(sortSidebarTargets(targets, sessions, "priority", "custom", ["c", "a", "b"]).map((item) => item.id)).toEqual(["c", "a", "b"]);
   });
 

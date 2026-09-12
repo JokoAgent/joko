@@ -1,7 +1,7 @@
 import type { SessionView, TargetView, TimelineHistoryCursorView } from "./model.js";
 
 export type SidebarGroupBy = "project" | "flat";
-export type SidebarTaskSort = "recency" | "priority";
+export type SidebarTaskSort = "recency" | "created" | "priority";
 export type SidebarProjectOrder = "activity" | "custom";
 export type SidebarStatus = "active" | "archived" | "all";
 export type SidebarLastActivity = "all" | "1d" | "3d" | "7d" | "30d";
@@ -275,7 +275,9 @@ export function normalizeSidebarDisplayPreferences(value: unknown): SidebarDispl
     groupBy: record["groupBy"] === "flat" ? "flat" : "project",
     groupDialogue: record["groupDialogue"] !== false,
     groupDevice: record["groupDevice"] !== false,
-    sortBy: record["sortBy"] === "priority" ? "priority" : "recency",
+    sortBy: record["sortBy"] === "created" || record["sortBy"] === "priority"
+      ? record["sortBy"]
+      : "recency",
     projectOrder: record["projectOrder"] === "custom" ? "custom" : "activity",
     mainViewMode: record["mainViewMode"] === "text" ? "text" : "list",
     pinnedViewMode: record["pinnedViewMode"] === "list" || record["pinnedViewMode"] === "card"
@@ -333,7 +335,8 @@ export function sidebarContentFilterCount(layout: Pick<
 export function filterSidebarSessions(
   sessions: readonly SessionView[],
   layout: Pick<SidebarLayout, "backendId" | "lastActivity" | "projectFilter">,
-  nowMs: number
+  nowMs: number,
+  hiddenProjectIds: ReadonlySet<string> = new Set()
 ): readonly SessionView[] {
   if (!Number.isFinite(nowMs)) throw new Error("Sidebar filter clock must be finite.");
   const projectIds = layout.projectFilter === "all" ? undefined : new Set(layout.projectFilter);
@@ -342,10 +345,16 @@ export function filterSidebarSessions(
     if (layout.backendId !== "all" && session.backendId !== layout.backendId) return false;
     if (cutoff !== undefined && session.updatedAt < cutoff) return false;
     if (projectIds === undefined) return true;
-    return session.projectId === undefined
+    const projectId = sidebarNavigationProjectId(session, hiddenProjectIds);
+    return projectId === undefined
       ? projectIds.has(SIDEBAR_DIALOGUE_FILTER_ID)
-      : projectIds.has(session.projectId);
+      : projectIds.has(projectId);
   });
+}
+
+/** Hiding a project changes its navigation group, never the Session's persisted membership. */
+export function sidebarNavigationProjectId(session: Pick<SessionView, "projectId">, hiddenProjectIds: ReadonlySet<string>): string | undefined {
+  return session.projectId !== undefined && hiddenProjectIds.has(session.projectId) ? undefined : session.projectId;
 }
 
 export function sidebarLastActivityCutoff(
@@ -471,6 +480,10 @@ export function sortSidebarSessions(
   priorityContext: SidebarPriorityContext = {}
 ): readonly SessionView[] {
   return [...sessions].sort((left, right) => {
+    if (sortBy === "created") {
+      return (right.createdAt ?? 0) - (left.createdAt ?? 0)
+        || left.id.localeCompare(right.id);
+    }
     if (sortBy === "priority") {
       const priority = sidebarSessionPriority(left, priorityContext) - sidebarSessionPriority(right, priorityContext);
       if (priority !== 0) return priority;
@@ -508,7 +521,11 @@ export function sortSidebarTargets(
       activity: owned.reduce(
         (latest, session) => Math.max(
           latest,
-          sortBy === "priority" ? sidebarPriorityRecencyMs(session, priorityContext) : session.updatedAt
+          sortBy === "priority"
+            ? sidebarPriorityRecencyMs(session, priorityContext)
+            : sortBy === "created"
+              ? session.createdAt ?? 0
+              : session.updatedAt
         ),
         0
       )

@@ -1,13 +1,17 @@
 import type { JSONContent } from "@tiptap/core";
 import { normalizeComposerDocument } from "../composer-quote-document.js";
+import { normalizeComposerInlineMentionRanges } from "../composer-mention-ranges.js";
 import {
   COMPOSER_PASTED_TEXT_NODE_TYPE,
   COMPOSER_ROUTE_REFERENCE_NODE_TYPE
 } from "./composer-paste-pipeline.js";
 import type {
+  ArtifactView,
   ComposerMentionDraft,
+  ComposerInlineMentionRange,
   ComposerTokenMentionDraft,
-  ResourceView,
+  SessionResourceView,
+  SessionView,
   WorkspaceEntryView
 } from "../model.js";
 
@@ -20,15 +24,11 @@ export interface ComposerInlineMentionActivation {
   readonly quoted: boolean;
 }
 
-export interface ComposerInlineMentionRange {
-  readonly mentionId: string;
-  readonly from: number;
-  readonly to: number;
-}
+export type { ComposerInlineMentionRange } from "../model.js";
 
 export interface ComposerMentionCatalogItem {
   readonly id: string;
-  readonly kind: "file" | "directory" | "resource";
+  readonly kind: "file" | "directory" | "resource" | "artifact" | "session";
   readonly name: string;
   readonly path: string;
   readonly meta: string;
@@ -53,16 +53,27 @@ export type ComposerInlineMentionKeyIntent =
   | { readonly kind: "close" }
   | null;
 
-/** Detect the complete inline query run that owns the caret. */
-export function detectComposerInlineMention(text: string, caret: number): ComposerInlineMentionActivation | null {
+/** Confirmed ranges belong to this exact document after its latest edit. */
+export function detectComposerInlineMention(
+  text: string,
+  caret: number,
+  confirmedRanges: readonly ComposerInlineMentionRange[]
+): ComposerInlineMentionActivation | null {
   if (!Number.isInteger(caret) || caret < 0 || caret > text.length) return null;
+  if (confirmedRanges.some((range) => {
+    if (!Number.isSafeInteger(range.from) || !Number.isSafeInteger(range.to) || range.from < 0
+      || range.to <= range.from || range.to > text.length || caret < range.from || caret > range.to
+      || text[range.from] !== "@") return false;
+    const queryStart = Math.min(text.length, range.from + (text[range.from + 1] === '"' ? 2 : 1));
+    return parseMentionRun(text, range.from, queryStart)?.to === range.to;
+  })) return null;
   let candidate = text.lastIndexOf("@", Math.max(0, caret - 1));
   while (candidate >= 0) {
     if (candidate === 0 || /\s/u.test(text[candidate - 1] ?? "")) {
       const parsed = parseMentionRun(text, candidate, caret);
       if (parsed !== null) return parsed;
     }
-    candidate = text.lastIndexOf("@", candidate - 1);
+    candidate = candidate === 0 ? -1 : text.lastIndexOf("@", candidate - 1);
   }
   return null;
 }
@@ -86,27 +97,59 @@ export function composerDirectoryQueryToken(path: string): string {
 export function composerMentionCatalog(
   entries: readonly WorkspaceEntryView[],
   workspaceId: string | undefined,
-  resources: readonly ResourceView[],
-  indexedPaths: readonly string[] = []
+  resources: readonly SessionResourceView[],
+  indexedPaths: readonly string[] = [],
+  artifacts: readonly ArtifactView[] = [],
+  sessions: readonly SessionView[] = []
 ): readonly ComposerMentionCatalogItem[] {
   const result = flattenWorkspaceCatalog(entries, workspaceId);
   result.push(...workspaceFileIndexCatalog(indexedPaths, workspaceId));
   for (const resource of resources) {
     const token = serializeComposerMentionPath(resource.name);
-    const disabled = !resource.enabled || resource.state !== "loaded";
+    const identity = `resource:${resource.id}:${resource.resourceVersion}:${resource.runtimeGeneration}`;
     result.push({
-      id: `resource:${resource.id}`,
+      id: identity,
       kind: "resource",
       name: resource.name,
       path: resource.name,
       meta: resource.kind,
-      ...(disabled ? { disabled: true, disabledReason: resource.state } : {}),
       mention: {
-        id: `resource:${resource.id}`,
+        id: identity,
         kind: "resource",
         reference: resource.id,
         label: resource.name,
-        token
+        token,
+        discoveredRevision: resource.discoveredRevision,
+        resourceVersion: resource.resourceVersion,
+        runtimeGeneration: resource.runtimeGeneration
+      }
+    });
+  }
+  for (const artifact of artifacts) {
+    if (artifact.id.length === 0) continue;
+    const name = artifact.title || artifact.fileName;
+    if (name.trim() === "") continue;
+    result.push({
+      id: `artifact:${artifact.id}`, kind: "artifact", name, path: name,
+      meta: [artifact.description, artifact.fileName === name ? undefined : artifact.fileName, artifact.mediaType].filter(Boolean).join(" · "),
+      mention: { id: `artifact:${artifact.id}`, kind: "artifact", reference: artifact.id, label: name, token: serializeComposerMentionPath(name) }
+    });
+  }
+  for (const session of sessions) {
+    if (session.id.trim() === "" || session.name.trim() === "" || session.state === "closed") continue;
+    const identity = `session:${session.id}`;
+    result.push({
+      id: identity,
+      kind: "session",
+      name: session.name,
+      path: session.name,
+      meta: session.summary ?? "",
+      mention: {
+        id: identity,
+        kind: "session",
+        reference: session.id,
+        label: session.name,
+        token: serializeComposerMentionPath(session.name)
       }
     });
   }
@@ -263,35 +306,15 @@ export function remapComposerInlineMentionRanges(
   });
 }
 
-/** Rebuild range metadata from persisted structured mentions. */
+/** Restore exact persisted occurrences without inferring identity from display text. */
 export function restoreComposerInlineMentionRanges(
   text: string,
-  mentions: readonly ComposerMentionDraft[]
+  mentions: readonly ComposerMentionDraft[],
+  ranges: unknown
 ): readonly ComposerInlineMentionRange[] {
-  const result: ComposerInlineMentionRange[] = [];
-  const byToken = new Map<string, ComposerTokenMentionDraft[]>();
-  for (const mention of mentions) {
-    if (mention.kind === "message" || mention.token === "") continue;
-    byToken.set(mention.token, [...(byToken.get(mention.token) ?? []), mention]);
-  }
-  for (const [token, tokenMentions] of byToken) {
-    const occurrences: number[] = [];
-    for (let offset = 0; offset <= text.length - token.length;) {
-      const from = text.indexOf(token, offset);
-      if (from < 0) break;
-      if (from === 0 || /\s/u.test(text[from - 1] ?? "")) occurrences.push(from);
-      offset = from + Math.max(1, token.length);
-    }
-    if (tokenMentions.length === 1) {
-      for (const from of occurrences) result.push({ mentionId: tokenMentions[0]!.id, from, to: from + token.length });
-    } else {
-      tokenMentions.forEach((mention, index) => {
-        const from = occurrences[index];
-        if (from !== undefined) result.push({ mentionId: mention.id, from, to: from + token.length });
-      });
-    }
-  }
-  return result.sort((left, right) => left.from - right.from || left.to - right.to);
+  const normalized = normalizeComposerInlineMentionRanges(ranges, text, mentions);
+  if (normalized === undefined) throw new Error("The draft has invalid mention locations.");
+  return normalized;
 }
 
 export function composerMentionsFromRanges(
@@ -427,10 +450,12 @@ export function setComposerCaretTextOffset(root: HTMLElement | null, selection: 
   const complete = composerDomText(root);
   const leading = complete.length - complete.trimStart().length;
   const target = Math.min(offset, complete.trim().length);
-  const walker = root.ownerDocument.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const ownerWindow = root.ownerDocument.defaultView;
+  if (ownerWindow === null) return false;
+  const walker = root.ownerDocument.createTreeWalker(root, ownerWindow.NodeFilter.SHOW_TEXT);
   let selected: { readonly node: Text; readonly offset: number } | undefined;
   for (let node = walker.nextNode(); node !== null; node = walker.nextNode()) {
-    if (!(node instanceof Text) || node.parentElement?.closest("[data-composer-quote]") !== null) continue;
+    if (!(node instanceof ownerWindow.Text) || node.parentElement?.closest("[data-composer-quote]") !== null) continue;
     for (let local = 0; local <= node.data.length; local += 1) {
       let before: string;
       try {
@@ -552,7 +577,9 @@ function scopedQueryLeaf(query: string): string {
 function uniqueCatalog(items: readonly ComposerMentionCatalogItem[]): ComposerMentionCatalogItem[] {
   const seen = new Set<string>();
   return items.filter((item) => {
-    const key = `${item.kind}:${normalizedPath(item.path).toLocaleLowerCase()}`;
+    const key = item.kind === "artifact" || item.kind === "session"
+      ? item.id
+      : `${item.kind}:${normalizedPath(item.path).toLocaleLowerCase()}`;
     if (seen.has(key)) return false;
     seen.add(key);
     return true;

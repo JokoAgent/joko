@@ -72,6 +72,26 @@ export interface WorktreeAcquireRequest {
   readonly refreshRemote?: boolean;
 }
 
+/** Create a distinct lease from the exact current state of another managed
+ * Session checkout. The service resolves the source only from its durable
+ * owner record; callers cannot supply an arbitrary filesystem path. */
+export interface WorktreeDeriveRequest {
+  readonly sessionId: string;
+  readonly sourceSessionId: string;
+  readonly sourceLeaseId: string;
+}
+
+/** Inspect only the checkout owned by an exact durable Session lease. */
+export interface WorktreeRemovalPreviewRequest {
+  readonly sessionId: string;
+  readonly leaseId: string;
+}
+
+export interface WorktreeRemovalPreview {
+  readonly state: "active" | "preserved";
+  readonly dirty: boolean;
+}
+
 export interface WorktreeAcquisition {
   readonly lease: WorktreeLease;
   readonly existing: boolean;

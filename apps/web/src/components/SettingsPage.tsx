@@ -56,6 +56,7 @@ import { ProviderMark } from "./ProviderMark.js";
 import { ProviderEditor } from "./ProviderEditor.js";
 import { ProviderFlowBackButton, ProviderFlowFooter, ProviderWizardProgress } from "./ProviderFlow.js";
 import { AppShortcutsSettings } from "./AppShortcutsSettings.js";
+import { GamepadSettings } from "./GamepadSettings.js";
 import { DesktopAutoRelaunchSetting } from "./DesktopAutoRelaunchSetting.js";
 import { DesktopMainWindowCloseSetting } from "./DesktopMainWindowCloseSetting.js";
 import { DesktopBetaChannelSetting } from "./DesktopBetaChannelSetting.js";
@@ -282,7 +283,7 @@ export function SettingsPage({ controller, snapshot, activeTargetId, locale, t, 
                 <SettingsPageSection id="policy"><SettingsSectionHeading title={t("settings.policy")} body={t("settings.policyBody")} /><PolicySettings controller={controller} snapshot={snapshot} runAction={runAction} showHeading={false} t={t} /></SettingsPageSection>
               </>)}
             {section === "personalization" && <PersonalizationSettings controller={controller} snapshot={snapshot} runAction={personalizationRunAction} onSuccess={showSuccess} t={t} />}
-            {section === "shortcuts" && <AppShortcutsSettings controller={controller} overrides={controller.state.preferences.appShortcutOverrides} t={t} />}
+            {section === "shortcuts" && <><AppShortcutsSettings controller={controller} overrides={controller.state.preferences.appShortcutOverrides} t={t} /><GamepadSettings t={t} /></>}
             {section === "voice" && <VoiceInputSettings controller={controller} t={t} />}
             {section === "taskStatus" && <><SettingsHeading title={t("settings.nativeTaskStatus.title")} body={t("settings.nativeTaskStatus.body")} /><NativeTaskStatusSettings t={t} showHeading={false} /></>}
             {section === "connections" && <><SettingsHeading title={t("settings.connections")} body={t("settings.connectionsBody")} /><SettingsPageSection id="connections"><ConnectionSettings controller={controller} snapshot={snapshot} locale={locale} t={t} runAction={runAction} showHeading={false} /></SettingsPageSection><SettingsPageSection id="remoteHosts"><RemoteHostsSettings controller={controller} snapshot={snapshot} activeTargetId={activeTargetId} runAction={runAction} t={t} /></SettingsPageSection><SshKeySettings controller={controller} t={t} /></>}
@@ -2325,7 +2326,7 @@ function LinkOpenSettingRow({ kind, controller, runAction, t }: {
     </div>
     <p>{t(`settings.linkOpen.${kind}.description`)}</p>
     <div className="personalization-segmented" role="radiogroup" aria-label={t(`settings.linkOpen.${kind}.aria`)}>
-      {(["sidebar", "external"] as const).map((destination) => <button key={destination} type="button" role="radio" aria-checked={preference === destination} className={preference === destination ? "is-active" : ""} disabled={pending} onClick={() => update(destination)}>{t(`settings.linkOpen.${destination}`)}</button>)}
+      {(["sidebar", "external"] as const).map((destination) => <button key={destination} type="button" role="radio" aria-checked={preference === destination} className={preference === destination ? "is-active" : ""} disabled={pending} onClick={() => update(destination)}>{t(`settings.linkOpen.${kind}.${destination}`)}</button>)}
     </div>
   </div>;
 }
@@ -2764,7 +2765,7 @@ export function ProviderSettings({ controller, snapshot, runAction, onSuccess, i
               const runtime = entry.runtime;
               const state = runtime?.authenticationState ?? (provider.runtimes.length > 0 && provider.runtimes.every((item) => item.keyless) ? "notRequired" : "unknown");
               const enabled = providerSettingsEntryEnabled(snapshot, entry);
-              return <button type="button" className={cx("provider-master-row", selectedProviderEntry?.id === entry.id && "is-active", !enabled && "is-disabled")} aria-current={selectedProviderEntry?.id === entry.id ? "true" : undefined} onClick={() => selectProviderItem(`provider:${entry.id}`)}>
+              return <button type="button" className={cx("provider-master-row", selectedProviderEntry?.id === entry.id && "is-active", !enabled && "is-disabled")} aria-current={selectedProviderEntry?.id === entry.id ? "true" : undefined} onClick={() => selectProviderItem(`provider:${entry.id}`)} onDoubleClick={providerConfigurationEditable(provider) ? () => setEditor(provider) : undefined}>
                 <span className="provider-master-row__icon" aria-hidden="true"><ProviderMark providerId={provider.id} name={provider.name} /></span>
                 <span className="provider-master-row__copy"><strong>{provider.name}</strong><small>{enabled ? providerModelCountLabel(providerSettingsModelCount(snapshot, entry), t) : t("settings.providerDisabled")}</small></span>
                 <span className={cx("provider-master-row__state", providerStatusTone(state, enabled) === "healthy" && "is-ready")} aria-label={t(`providerAuth.${state}`)} />

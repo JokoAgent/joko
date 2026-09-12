@@ -2,7 +2,11 @@ import { createHash } from "node:crypto";
 
 import { redactSecrets, type BlobRef } from "@joko/core";
 import type { OperationalStore, SettingRecord } from "@joko/store";
-import { validateTakeoverNavigationUrl, type BrowserActivity } from "@joko/tool-browser";
+import {
+  isWorkspaceHtmlPreviewUrl,
+  validateTakeoverNavigationUrl,
+  type BrowserActivity
+} from "@joko/tool-browser";
 
 import type {
   BrowserTransferRepository,
@@ -197,9 +201,33 @@ export class OperationalBrowserState implements BrowserTransferRepository {
 
   recoverablePages(browserProviderId: string, livePageIds: ReadonlySet<string>): readonly RecoverableBrowserPageRecord[] {
     if (!safeOpaqueId(browserProviderId)) return [];
+    const retiredHtmlPages = this.#pageCatalog.openEntries.filter((item) =>
+      item.browserProviderId === browserProviderId
+      && !livePageIds.has(item.pageId)
+      && isWorkspaceHtmlPreviewUrl(item.url)
+    );
+    if (retiredHtmlPages.length > 0) {
+      const retiredPageIds = new Set(retiredHtmlPages.map((item) => item.pageId));
+      const openEntries = this.#pageCatalog.openEntries.filter((item) =>
+        item.browserProviderId !== browserProviderId || !retiredPageIds.has(item.pageId)
+      );
+      let lastGenerations = this.#pageCatalog.lastGenerations;
+      for (const retired of retiredHtmlPages) {
+        lastGenerations = advanceGeneration(lastGenerations, browserProviderId, retired.generation);
+      }
+      this.#pageCatalog = {
+        version: 1,
+        openEntries,
+        activePages: retainActivePages(this.#pageCatalog.activePages, openEntries),
+        lastGenerations
+      };
+      this.persistPageCatalog();
+    }
     const active = this.activePageId(browserProviderId);
     return this.#pageCatalog.openEntries
-      .filter((item) => item.browserProviderId === browserProviderId && !livePageIds.has(item.pageId))
+      .filter((item) => item.browserProviderId === browserProviderId
+        && !livePageIds.has(item.pageId)
+        && !isWorkspaceHtmlPreviewUrl(item.url))
       .sort((left, right) => {
         if (left.pageId === active && right.pageId !== active) return -1;
         if (right.pageId === active && left.pageId !== active) return 1;

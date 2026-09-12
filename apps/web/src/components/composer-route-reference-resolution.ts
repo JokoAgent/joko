@@ -34,7 +34,7 @@ export interface SeededComposerRouteReference {
   readonly pending?: PendingComposerRouteReferenceResolution;
 }
 
-/** Build the immediate chip without waiting for storage or a remote task mirror. */
+/** Build the immediate chip without waiting for storage or a remote task lookup. */
 export function seedComposerRouteReference(
   segment: Extract<ComposerPasteSegment, { readonly kind: "session" | "project" }>
 ): SeededComposerRouteReference {

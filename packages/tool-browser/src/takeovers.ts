@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 
+export const MAXIMUM_TAKEOVER_NAVIGATION_URL_LENGTH = 8_192;
+
 export interface BrowserTakeoverRequest {
   readonly providerId: string;
   readonly pageId: string;
@@ -179,7 +181,7 @@ function validateKeyModifiers(modifiers: readonly BrowserTakeoverKeyModifier[]):
 
 /** Normalizes the deliberately narrow URL surface accepted from the durable human-control channel. */
 export function validateTakeoverNavigationUrl(value: string): string {
-  if (value.length === 0 || value.length > 8_192 || value.includes("\u0000")) {
+  if (value.length === 0 || value.length > MAXIMUM_TAKEOVER_NAVIGATION_URL_LENGTH || value.includes("\u0000")) {
     throw new BrowserTakeoverInputError("Browser takeover navigation URL is invalid.");
   }
   if (value === "about:blank") return value;
@@ -253,6 +255,30 @@ export class BrowserTakeoverRegistry {
     const current = this.assert(fence);
     this.#takeover = undefined;
     return current;
+  }
+
+  /** Rolls an exact failed replacement back to the still-live prior capability. */
+  restore(fence: BrowserTakeoverFence, previous: BrowserTakeover): BrowserTakeover | undefined {
+    const current = this.assert(fence);
+    validateTakeoverFence(previous);
+    if (
+      previous.providerId !== current.providerId
+      || previous.generation !== current.generation
+      || previous.owner !== current.owner
+      || previous.pageId === current.pageId
+      || previous.takeoverId === current.takeoverId
+      || !Number.isSafeInteger(previous.startedAt)
+      || !Number.isSafeInteger(previous.expiresAt)
+      || previous.expiresAt <= previous.startedAt
+    ) {
+      throw new BrowserTakeoverConflictError("The previous Browser takeover is invalid.");
+    }
+    if (previous.expiresAt <= this.#now()) {
+      this.#takeover = undefined;
+      return undefined;
+    }
+    this.#takeover = { ...previous };
+    return this.#takeover;
   }
 
   /** Invalidates any takeover created before a new runtime generation. */

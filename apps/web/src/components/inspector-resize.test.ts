@@ -66,7 +66,7 @@ describe("right-sidebar sizing", () => {
     expect(inspectorRatioForWidth(1_000, 420)).toBe(0.42);
   });
 
-  it("mirrors pointer and keyboard resizing when the panel moves left", () => {
+  it("supports pointer and keyboard resizing when the panel moves left", () => {
     expect(inspectorPointerWidth(1_000, 620, "right")).toBe(380);
     expect(inspectorPointerWidth(100, 480, "left")).toBe(380);
     expect(inspectorResizeDeltaForKey("right", "ArrowLeft")).toBe(16);

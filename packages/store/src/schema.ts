@@ -5,6 +5,14 @@ import { ActiveWriterError } from "./errors.js";
 
 export const SCHEMA_VERSION = 1;
 
+// SQLite stores several current-v1 domain values as canonical JSON. Those
+// shapes are as much a part of the non-migrating first-release baseline as the
+// DDL: changing one must reject an existing development database for rebuild.
+const DURABLE_JSON_SHAPE_BASELINE = [
+  "interaction-question-request:single/multiple.allowOther=required",
+  "interaction-question-decision:text|single(choice|other)|multiple(choiceIds+optionalOtherText)|boolean"
+].join("\n");
+
 const SCHEMA_MARKER_SCHEMA = `
 CREATE TABLE schema_version (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -1812,9 +1820,11 @@ INSERT INTO store_meta(singleton, revision) VALUES (1, 0);
 INSERT INTO message_embedding_state(singleton, enabled, cutoff_cursor, model_id, dimensions, backend_id, provider_id, cutoff_initialized, provider_generation_id) VALUES (1, 0, 0, 'voyage/voyage-4', 1024, NULL, NULL, 0, NULL);
 `;
 
-/** Exact first-release schema identity, including its marker table. */
+/** Exact first-release database identity, including DDL and durable JSON shapes. */
 export const SCHEMA_BASELINE_ID = createHash("sha256")
-  .update(`schema-version:${SCHEMA_VERSION}\n${SCHEMA_MARKER_SCHEMA}\n${BASELINE_SCHEMA}`)
+  .update(
+    `schema-version:${SCHEMA_VERSION}\n${DURABLE_JSON_SHAPE_BASELINE}\n${SCHEMA_MARKER_SCHEMA}\n${BASELINE_SCHEMA}`
+  )
   .digest("hex");
 
 let expectedSchemaCatalogId: string | undefined;

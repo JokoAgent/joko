@@ -1,4 +1,5 @@
 import type { Page } from "playwright-core";
+import { MAXIMUM_TAKEOVER_NAVIGATION_URL_LENGTH } from "./takeovers.js";
 
 export const HTML_PREVIEW_MAXIMUM_BYTES = 2 * 1024 * 1024;
 export const HTML_PREVIEW_TOTAL_BYTES = 16 * 1024 * 1024;
@@ -17,10 +18,13 @@ export interface BrowserHtmlSnapshot {
 
 export function workspaceHtmlPreviewUrl(id: string, path = "index.html"): string {
   if (!/^[a-z0-9-]{1,80}$/u.test(id) || !validPath(path)) throw new Error("Invalid HTML preview identity.");
-  return `https://${id}.preview.joko.invalid/${path.split("/").map(encodeURIComponent).join("/")}`;
+  const url = `https://${id}.preview.joko.invalid/${path.split("/").map(encodeURIComponent).join("/")}`;
+  if (url.length > MAXIMUM_TAKEOVER_NAVIGATION_URL_LENGTH) throw new RangeError("HTML preview URL exceeds its safe bound.");
+  return url;
 }
 
 export function isWorkspaceHtmlPreviewUrl(url: string): boolean {
+  if (url.length > MAXIMUM_TAKEOVER_NAVIGATION_URL_LENGTH) return false;
   try {
     const value = new URL(url);
     return value.protocol === "https:" && /^[a-z0-9-]{1,80}\.preview\.joko\.invalid$/u.test(value.hostname)

@@ -44,10 +44,20 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
   const writerRef = useRef({ id: randomUuid(), sequence: 0n, generation: 0n, blocked: false, chain: Promise.resolve() });
   const scope = `${controller.state.activeProfile?.serverId ?? ""}\u0000${controller.state.activeProfile?.id ?? ""}\u0000${sessionId}\u0000${terminalId}`;
   const connected = controller.state.connectionState === "connected";
+  const policyDisabled = capabilities.support === "disabledByPolicy";
   const scopeRef = useRef<string | undefined>(scope);
   scopeRef.current = scope;
   const focusAfterConnectRef = useRef<{ readonly scope: string; readonly element: Element | null } | undefined>(undefined);
   useLayoutEffect(() => { if (!active) appearanceRef.current?.cancelFocus(); }, [active]);
+  useLayoutEffect(() => {
+    if (policyDisabled) {
+      appearanceRef.current?.cancelFocus();
+      if (terminalRef.current !== undefined) terminalRef.current.options.disableStdin = true;
+    } else if (connectionRef.current === "ready") {
+      fitRef.current();
+      void appearanceRef.current?.synchronize(false).catch(() => undefined);
+    }
+  }, [policyDisabled]);
 
   useLayoutEffect(() => {
     const slot = slotRef.current;
@@ -87,7 +97,7 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
     });
     const input = terminal.onData((data) => {
       const current = descriptorRef.current;
-      if (current === undefined || current.status !== "running" || connectionRef.current !== "ready" || !latest.current.active || latest.current.controller.state.connectionState !== "connected") return;
+      if (current === undefined || current.status !== "running" || connectionRef.current !== "ready" || !latest.current.active || latest.current.capabilities.support === "disabledByPolicy" || latest.current.controller.state.connectionState !== "connected") return;
       if (writerRef.current.generation !== current.generation) writerRef.current = { id: randomUuid(), sequence: 0n, generation: current.generation, blocked: false, chain: Promise.resolve() };
       const writer = writerRef.current;
       if (writer.blocked) return;
@@ -105,7 +115,7 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
             return;
           }
           if (appearance.signal.aborted || appearanceRef.current !== appearance || writerRef.current !== writer) return;
-          if (admission.signal.aborted) {
+          if (admission.signal.aborted || latest.current.capabilities.support === "disabledByPolicy") {
             if (sent) { writer.blocked = true; terminal.options.disableStdin = true; setError(latest.current.t("terminal.inputUncertain")); }
             return;
           }
@@ -135,12 +145,12 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
         const rows = Math.max(1, Math.min(terminal.rows, latest.current.capabilities.maximumRows));
         if (columns !== terminal.cols || rows !== terminal.rows) terminal.resize(columns, rows);
         const current = descriptorRef.current;
-        if (current === undefined || current.status !== "running" || latest.current.controller.state.connectionState !== "connected") return;
+        if (current === undefined || current.status !== "running" || latest.current.capabilities.support === "disabledByPolicy" || latest.current.controller.state.connectionState !== "connected") return;
         const nextDimensions = `${current.generation}:${columns}:${rows}`;
         if (dimensionsRef.current === nextDimensions) return;
         dimensionsRef.current = nextDimensions;
         resizeChain = resizeChain.then(async () => {
-          if (!alive || latest.current.controller.state.connectionState !== "connected") return;
+          if (!alive || latest.current.capabilities.support === "disabledByPolicy" || latest.current.controller.state.connectionState !== "connected") { dimensionsRef.current = ""; return; }
           await api.resizeTerminal(sessionId, terminalId, current.generation, columns, rows);
         }).catch(() => { dimensionsRef.current = ""; });
       });
@@ -156,7 +166,7 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
       });
       parsingRef.current = parsed.catch(() => undefined);
       void parsed.then(() => appearanceRef.current?.synchronize(false)).catch((failure: unknown) => {
-        if (!alive) return;
+        if (!alive || failure instanceof DOMException && failure.name === "AbortError") return;
         terminal.options.disableStdin = true;
         setError(failure instanceof Error ? failure.message : latest.current.t("terminal.disconnected"));
       });
@@ -272,6 +282,7 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
           if (current() && registered) terminal.options.disableStdin = true;
           const task = appearanceChain.then(async () => {
             if (!current() || !registered || claimSignal.aborted) throw new DOMException("Terminal view retired.", "AbortError");
+            if (latest.current.capabilities.support === "disabledByPolicy") throw new DOMException("Terminal view is read-only.", "AbortError");
             if (descriptorRef.current?.status !== "running") {
               if (claim) throw new DOMException("Terminal view retired.", "AbortError");
               return;
@@ -306,7 +317,7 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
             setError(failure instanceof Error ? failure.message : latest.current.t("terminal.disconnected"));
           }).finally(() => {
             appearancePending -= 1;
-            if (current() && registered && !appearanceFailed && appearancePending === 0 && descriptorRef.current?.status === "running" && !writerRef.current.blocked) terminal.options.disableStdin = false;
+            if (current() && registered && !appearanceFailed && appearancePending === 0 && descriptorRef.current?.status === "running" && !writerRef.current.blocked && latest.current.capabilities.support !== "disabledByPolicy") terminal.options.disableStdin = false;
           });
           return task;
         };
@@ -338,17 +349,17 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
           if (update.terminal !== undefined) accept(update.terminal);
           if (!registered) {
             registered = true;
-            try { await synchronize(focused()); }
+            try { if (latest.current.capabilities.support !== "disabledByPolicy") await synchronize(focused()); }
             catch (failure) {
               if (!current() || !(failure instanceof DOMException && failure.name === "AbortError")) throw failure;
-              await synchronize(false);
+              if (latest.current.capabilities.support !== "disabledByPolicy") await synchronize(false);
             }
             if (!current()) return;
           }
           failures = 0;
           setConnection("ready");
           connectionRef.current = "ready";
-          terminal.options.disableStdin = descriptorRef.current?.status !== "running" || writerRef.current.blocked || appearanceFailed || appearancePending > 0;
+          terminal.options.disableStdin = descriptorRef.current?.status !== "running" || writerRef.current.blocked || appearanceFailed || appearancePending > 0 || latest.current.capabilities.support === "disabledByPolicy";
           if (!writerRef.current.blocked && !appearanceFailed) setError(undefined);
           fitRef.current();
           restoreRequestedFocus();
@@ -395,7 +406,7 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
   };
   const restart = async (): Promise<void> => {
     const current = descriptorRef.current;
-    if (current === undefined || !current.exitConfirmed || current.status === "running" || current.status === "closed" || restarting || !connected) return;
+    if (current === undefined || !current.exitConfirmed || current.status === "running" || current.status === "closed" || restarting || !connected || latest.current.capabilities.support === "disabledByPolicy") return;
     const previous = restartAttemptRef.current;
     const attempt = previous?.scope === scope && previous.generation === current.generation
       ? previous
@@ -416,10 +427,11 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
   return <section className="interactive-terminal" aria-label={t("terminal.title")}>
     <header><span title={descriptor?.cwd}>{descriptor?.shellLabel ?? t("terminal.title")}</span><Pill tone={descriptor?.status === "running" ? "accent" : "neutral"}>{descriptor?.status === "running" ? t("terminal.running") : descriptor?.status === "closed" ? t("terminal.closed") : descriptor?.status === "failed" ? t(descriptor.failureCode === "TERMINAL_UNKNOWN" && !descriptor.exitConfirmed ? "terminal.stateUnknown" : "terminal.failed") : descriptor?.status === "exited" ? descriptor.exitSignal !== undefined && descriptor.exitSignal !== 0 ? t("terminal.signalled", { signal: descriptor.exitSignal }) : t("terminal.exited", { code: descriptor.exitCode ?? t("terminal.exitUnknown") }) : t("terminal.connecting")}</Pill></header>
     <div ref={slotRef} className="interactive-terminal__screen" aria-label={t("terminal.screen")} />
-    {(connection !== "ready" || error !== undefined || descriptor?.status !== "running") && <div className="interactive-terminal__status" role="status">
+    {(connection !== "ready" || error !== undefined || descriptor?.status !== "running" || policyDisabled) && <div className="interactive-terminal__status" role="status">
+      {policyDisabled && <p>{capabilities.reason ?? t("terminal.unavailable")}</p>}
       {error !== undefined ? <p>{error}</p> : connection !== "ready" ? <p>{t(connected ? connection === "connecting" ? "terminal.connecting" : "terminal.reconnecting" : "terminal.disconnected")}</p> : null}
       {descriptor !== undefined && descriptor.status !== "running" && descriptor.status !== "closed" && !descriptor.exitConfirmed && <p>{t(descriptor.failureCode === "TERMINAL_UNKNOWN" ? "terminal.transportUnconfirmed" : "terminal.exitUnconfirmed")}</p>}
-      {descriptor !== undefined && descriptor.status !== "running" && descriptor.status !== "closed" && descriptor.exitConfirmed && <Button disabled={restarting || !connected} onClick={() => void restart()}><RotateCw aria-hidden="true" />{t("terminal.restart")}</Button>}
+      {descriptor !== undefined && descriptor.status !== "running" && descriptor.status !== "closed" && descriptor.exitConfirmed && <Button disabled={restarting || !connected || policyDisabled} onClick={() => void restart()}><RotateCw aria-hidden="true" />{t("terminal.restart")}</Button>}
       {(error !== undefined || descriptor !== undefined && descriptor.status !== "running" && descriptor.status !== "closed" && !descriptor.exitConfirmed) && <Button disabled={restarting || !connected} onClick={reconnect}>{t("terminal.reconnect")}</Button>}
     </div>}
   </section>;

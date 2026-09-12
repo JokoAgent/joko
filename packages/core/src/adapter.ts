@@ -58,12 +58,27 @@ export interface AdapterEventMetadata {
   readonly pi?: PiEventMetadata;
 }
 
+export type InteractionQuestionAnswer =
+  | { readonly kind: "text"; readonly value: string }
+  | {
+      readonly kind: "single";
+      readonly selection:
+        | { readonly kind: "choice"; readonly choiceId: string }
+        | { readonly kind: "other"; readonly text: string };
+    }
+  | {
+      readonly kind: "multiple";
+      readonly choiceIds: readonly string[];
+      readonly otherText?: string;
+    }
+  | { readonly kind: "boolean"; readonly value: boolean };
+
 export type InteractionDecision =
   | { readonly kind: "selected"; readonly value: string }
   | { readonly kind: "confirmed"; readonly confirmed: boolean }
   | {
       readonly kind: "question";
-      readonly answers: Readonly<Record<string, string | boolean | readonly string[]>>;
+      readonly answers: Readonly<Record<string, InteractionQuestionAnswer>>;
     }
   | { readonly kind: "plan_review"; readonly decision: PlanReviewDecision; readonly feedback: string }
   | { readonly kind: "cancelled" };
@@ -176,6 +191,9 @@ export interface NativeSessionForkResult {
  * cancelled. Keep this authority separate from the source runtime context. */
 export interface NativeSessionDerivation {
   readonly sessionId: SessionId;
+  /** Exact workspace authority for the detached native child. It may differ
+   * from the source context only when the Backend advertises workspace.derive. */
+  readonly target: TargetDescriptor;
   readonly recordBinding: (binding: NativeSessionBinding) => void;
 }
 

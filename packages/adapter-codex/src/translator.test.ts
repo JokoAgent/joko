@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { InteractionQuestionAnswer } from "@joko/core";
 import type { JsonValue } from "./protocol.js";
 import { CodexEventTranslator, createTranslatorState, interactionFromServerRequest } from "./translator.js";
 
@@ -178,13 +179,44 @@ describe("Codex interaction translation", () => {
     });
     expect(interaction?.toResponse({
       kind: "question",
-      answers: { name: "Joko", mode: ["safe"] }
+      answers: {
+        name: { kind: "text", value: "Joko" },
+        mode: { kind: "single", selection: { kind: "choice", choiceId: "safe" } }
+      }
     })).toEqual({
       answers: {
         name: { answers: ["Joko"] },
         mode: { answers: ["safe"] }
       }
     });
+  });
+
+  it("keeps explicit Other text distinct when it equals a generated choice ID", () => {
+    const interaction = interactionFromServerRequest(41, "item/tool/requestUserInput", {
+      threadId: "thread-one",
+      turnId: "turn-one",
+      itemId: "question-other-collision",
+      questions: [{
+        id: "mode",
+        question: "Mode?",
+        isOther: true,
+        options: [{ label: "Safe route", description: "Use safe mode" }]
+      }]
+    }, "D:\\workspace");
+    expect(interaction?.payload.kind).toBe("question");
+    const field = interaction?.payload.kind === "question" ? interaction.payload.fields[0] : undefined;
+    expect(field).toMatchObject({ kind: "single", allowOther: true });
+    const choiceId = field?.kind === "single" ? field.choices[0]?.id : undefined;
+    expect(choiceId).toBeTruthy();
+
+    expect(interaction?.toResponse({
+      kind: "question",
+      answers: { mode: { kind: "single", selection: { kind: "choice", choiceId: choiceId! } } }
+    })).toEqual({ answers: { mode: { answers: ["Safe route"] } } });
+    expect(interaction?.toResponse({
+      kind: "question",
+      answers: { mode: { kind: "single", selection: { kind: "other", text: choiceId! } } }
+    })).toEqual({ answers: { mode: { answers: [choiceId] } } });
   });
 
   it("rejects oversized question schemas and bounds projected answers", () => {
@@ -226,11 +258,11 @@ describe("Codex interaction translation", () => {
     const response = interaction?.toResponse({
       kind: "question",
       answers: {
-        name: `password=very-private ${oversized}`,
-        mode: ["fast"],
-        third: oversized,
-        ignored: "not-returned",
-        unknown: "not-returned"
+        name: { kind: "text", value: `password=very-private ${oversized}` },
+        mode: { kind: "single", selection: { kind: "choice", choiceId: "fast" } },
+        third: { kind: "text", value: oversized },
+        ignored: { kind: "text", value: "not-returned" },
+        unknown: { kind: "text", value: "not-returned" }
       }
     });
     expect(response).toMatchObject({
@@ -272,7 +304,9 @@ describe("Codex interaction translation", () => {
     }, "D:\\workspace");
     const response = interaction?.toResponse({
       kind: "question",
-      answers: Object.assign(Object.create(null) as Record<string, string>, { __proto__: "safe" })
+      answers: Object.assign(Object.create(null) as Record<string, InteractionQuestionAnswer>, {
+        __proto__: { kind: "text", value: "safe" }
+      })
     }) as { answers: Record<string, { answers: string[] }> };
     expect(Object.getPrototypeOf(response.answers)).toBeNull();
     expect(Object.prototype.hasOwnProperty.call(response.answers, "__proto__")).toBe(true);

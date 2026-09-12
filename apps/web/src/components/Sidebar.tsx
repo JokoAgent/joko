@@ -80,6 +80,7 @@ import {
   sidebarGroupIndicatorState,
   sidebarContentFilterCount,
   sidebarLastActivityCutoff,
+  sidebarNavigationProjectId,
   sidebarOwnerLayoutFor,
   sidebarSessionIndicatorState,
   sortSidebarSessions,
@@ -97,6 +98,7 @@ import {
   SIDEBAR_DIALOGUE_FILTER_ID
 } from "../sidebar-layout.js";
 import { workspaceSelectedFileStore } from "../workspace-selected-file.js";
+import { PinnedCardMasonry } from "./PinnedCardMasonry.js";
 import { type FuzzyTextMatch, type SidebarFuzzyMatch } from "./coding-ui-behavior.js";
 import {
   ALL_CONVERSATION_SEARCH_FILTERS,
@@ -239,7 +241,7 @@ interface SidebarProjectActions {
   readonly onPinTarget: (target: TargetView) => void;
   readonly onSearchTarget: (target: TargetView) => void;
   readonly onCopyTargetLink?: (target: TargetView) => void;
-  readonly onRemoveTarget?: (target: TargetView) => void;
+  readonly onRemoveTarget?: (target: TargetView, confirm: HTMLElement, returnFocus: HTMLElement | null) => void;
   readonly onSetTargetSessionsArchived?: (target: TargetView, sessions: readonly SessionView[], archived: boolean) => void;
 }
 const SIDEBAR_SESSION_INFO_OPTIONS = [
@@ -276,6 +278,7 @@ export interface SidebarProps {
   readonly onSetTargetSessionsArchived?: (target: TargetView, sessions: readonly SessionView[], archived: boolean) => void;
   readonly onCopyTargetLink?: (target: TargetView) => void;
   readonly onArchive: (session: SessionView) => void;
+  readonly onPrefetchRemoval?: (session: SessionView) => void;
   readonly onDelete: (session: SessionView) => void;
   readonly onRunSchedule?: (schedule: ScheduleView) => Promise<void>;
   readonly onToggleSchedule?: (schedule: ScheduleView) => Promise<void>;
@@ -337,6 +340,8 @@ interface DeleteScheduleRequest {
 
 export function Sidebar(props: SidebarProps): JSX.Element {
   const { snapshot, route, activeSessionId, t } = props;
+  const visibleTargets = useMemo(() => snapshot.targets.filter((target) => !target.archived), [snapshot.targets]);
+  const hiddenProjectIds = useMemo(() => new Set(snapshot.targets.filter((target) => target.archived).map((target) => target.id)), [snapshot.targets]);
   const navigateAndClose = (nextRoute: AppRoute): void => {
     props.onNavigate(nextRoute);
     props.onClose();
@@ -362,6 +367,8 @@ export function Sidebar(props: SidebarProps): JSX.Element {
   const [messageSearchBackendId, setMessageSearchBackendId] = useState<string | "all">("all");
   const [messageSearchLastActivity, setMessageSearchLastActivity] = useState<ConversationSearchLastActivityFilter>("all");
   const [messageSearchTargetIds, setMessageSearchTargetIds] = useState<readonly string[] | "all">("all");
+  const [messageSearchOwnerId, setMessageSearchOwnerId] = useState(props.sidebarOwnerId);
+  const [lockedSearchTargetId, setLockedSearchTargetId] = useState<string>();
   const [activeSearchOption, setActiveSearchOption] = useState(-1);
   const [expandedSearchSessions, setExpandedSearchSessions] = useState<ReadonlySet<string>>(() => new Set());
   const messageSearchGenerationRef = useRef(0);
@@ -376,13 +383,21 @@ export function Sidebar(props: SidebarProps): JSX.Element {
   } | undefined>(undefined);
   const searchFilterRef = useRef<HTMLDetailsElement>(null);
   const sessionListRef = useRef<HTMLElement>(null);
+  const projectRemovalFocusRef = useRef<{
+    readonly targetId: string;
+    readonly ownerId: string;
+    readonly profileId: string | undefined;
+    readonly generation: AppSnapshot["generation"];
+    readonly mode: NavigationMode;
+    readonly complete: () => void;
+    readonly cancel: () => void;
+  } | undefined>(undefined);
   const [listSettingsContextMenuRequest, setListSettingsContextMenuRequest] = useState<SidebarListContextMenuRequest>();
   const [selectedSessionIds, setSelectedSessionIds] = useState<ReadonlySet<string>>(() => new Set());
   const [deleteSchedule, setDeleteSchedule] = useState<DeleteScheduleRequest>();
   const [deleteScheduleDisposition, setDeleteScheduleDisposition] = useState<GeneratedSessionDisposition>("keep");
   const [deleteSchedulePending, setDeleteSchedulePending] = useState(false);
-  const [deleteScheduleGeneratedCount, setDeleteScheduleGeneratedCount] = useState<number>();
-  const [deleteScheduleInflightCount, setDeleteScheduleInflightCount] = useState<number>();
+  const [deleteSchedulePreview, setDeleteSchedulePreview] = useState<ScheduleDeletionPreview>();
   const [deleteSchedulePreviewError, setDeleteSchedulePreviewError] = useState<string>();
   const [deleteScheduleOperationError, setDeleteScheduleOperationError] = useState<string>();
   const deleteSchedulePreviewGenerationRef = useRef(0);
@@ -403,18 +418,36 @@ export function Sidebar(props: SidebarProps): JSX.Element {
   const targetNamesById = useMemo(() => new Map(snapshot.targets.map((target) => [target.id, target.name])), [snapshot.targets]);
   const backendNamesById = useMemo(() => new Map(snapshot.backends.map((backend) => [backend.id, backend.name])), [snapshot.backends]);
   const workspacePathsByTargetId = useMemo(() => new Map(snapshot.workspaces.map((workspace) => [workspace.targetId, workspace.serverPath])), [snapshot.workspaces]);
-  const projectNameFor = useCallback((session: SessionView): string => session.projectId === undefined
+  const projectNameFor = useCallback((session: SessionView): string => sidebarNavigationProjectId(session, hiddenProjectIds) === undefined
     ? t("nav.dialogue")
-    : targetNamesById.get(session.projectId) ?? t("session.noProjectsAvailable"), [t, targetNamesById]);
+    : targetNamesById.get(session.projectId!) ?? t("session.noProjectsAvailable"), [hiddenProjectIds, t, targetNamesById]);
   const environmentNameFor = useCallback((session: SessionView): string => backendNamesById.get(session.backendId) ?? session.backendId, [backendNamesById]);
   const workspacePathFor = useCallback((target: TargetView): string => target.remoteWorkspace?.workspaceRoot
     ?? workspacePathsByTargetId.get(target.id)
     ?? target.workspaceName, [workspacePathsByTargetId]);
-  const normalizedQuery = query.trim().toLocaleLowerCase();
   const currentSearchProfileId = props.machineControl?.activeProfile.id ?? "local";
   const currentMachineIncluded = props.machineControl === undefined
     || props.machineControl.selection === "all"
     || props.machineControl.selection.includes(props.machineControl.activeProfile.id);
+  useLayoutEffect(() => {
+    const request = projectRemovalFocusRef.current;
+    if (request === undefined) return;
+    if (!props.open || !currentMachineIncluded || request.ownerId !== props.sidebarOwnerId
+      || request.profileId !== props.machineControl?.activeProfile.id || request.generation !== snapshot.generation
+      || request.mode !== props.mode) request.cancel();
+    else if (hiddenProjectIds.has(request.targetId)) request.complete();
+  }, [currentMachineIncluded, hiddenProjectIds, props.machineControl?.activeProfile.id, props.mode, props.open, props.sidebarOwnerId, snapshot.generation]);
+  useLayoutEffect(() => () => projectRemovalFocusRef.current?.cancel(), []);
+  const lockedSearchTarget = lockedSearchTargetId === undefined ? undefined : snapshot.targets.find((target) =>
+    target.id === lockedSearchTargetId && !target.archived);
+  const searchContextAvailable = messageSearchOwnerId === props.sidebarOwnerId
+    && (lockedSearchTargetId === undefined || (lockedSearchTarget !== undefined && currentMachineIncluded));
+  const normalizedQuery = searchContextAvailable ? query.trim().toLocaleLowerCase() : "";
+  // Navigation membership can change independently of the execution target.
+  // A stable membership key avoids restarting searches for unrelated task updates.
+  const messageSearchSessionScopeKey = messageSearchTargetIds === "all" ? undefined : JSON.stringify(snapshot.sessions
+    .filter((session) => session.projectId !== undefined && messageSearchTargetIds.includes(session.projectId))
+    .map((session) => session.id).sort());
   const sessions = useMemo(() => currentMachineIncluded
     ? sessionsForSidebarStatus(snapshot.sessions, sidebarLayout.status)
     : [], [currentMachineIncluded, sidebarLayout.status, snapshot.sessions]);
@@ -536,7 +569,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
   });
   const localSearchCandidates = useMemo(() => normalizedQuery === "" ? [] : projectConversationSearchResults(
     currentMachineIncluded ? snapshot.sessions : [],
-    snapshot.targets,
+    visibleTargets,
     messageMatches,
     query.trim(),
     { kind: "owner" },
@@ -547,10 +580,10 @@ export function Sidebar(props: SidebarProps): JSX.Element {
       status: messageSearchStatus,
       backendId: messageSearchBackendId,
       lastActivity: messageSearchLastActivity,
-      targetIds: messageSearchTargetIds
+      projectIds: messageSearchTargetIds
     }
-  ), [currentMachineIncluded, messageMatches, messageSearchBackendId, messageSearchLastActivity, messageSearchStatus, messageSearchTargetIds, normalizedQuery, props.messageSearchSort, query, snapshot.sessions, snapshot.targets]);
-  const remoteSearchCandidates = useMemo(() => projectRemoteMachineSearchResults(
+  ), [currentMachineIncluded, messageMatches, messageSearchBackendId, messageSearchLastActivity, messageSearchStatus, messageSearchTargetIds, normalizedQuery, props.messageSearchSort, query, snapshot.sessions, visibleTargets]);
+  const remoteSearchCandidates = useMemo(() => messageSearchTargetIds !== "all" ? [] : projectRemoteMachineSearchResults(
     remoteMachineCaches,
     props.machineControl?.presenceByProfile ?? {},
     query.trim(),
@@ -629,7 +662,8 @@ export function Sidebar(props: SidebarProps): JSX.Element {
   const recent = sortSidebarSessions(filterSidebarSessions(
     sessions.filter((session) => !session.pinned && (session.projectId === undefined || !pinnedProjectIds.has(session.projectId))),
     sidebarLayout,
-    Date.now()
+    Date.now(),
+    hiddenProjectIds
   ), sidebarLayout.sortBy, priorityContext);
   const railPinnedEntries = pinnedEntries.filter((entry): entry is SidebarPinnedSessionEntry => entry.kind !== "project");
   const activeContentFilterCount = sidebarContentFilterCount(sidebarLayout);
@@ -655,7 +689,8 @@ export function Sidebar(props: SidebarProps): JSX.Element {
   const railLocalPanelSessions = sortSidebarSessions(filterSidebarSessions(
     sessions.filter((session) => !session.pinned),
     sidebarLayout,
-    Date.now()
+    Date.now(),
+    hiddenProjectIds
   ), sidebarLayout.sortBy, priorityContext);
   const railLocalProjectEntries = orderedTargets.flatMap<SidebarRailProjectEntry>((target) => {
     if (target.archived) return [];
@@ -691,18 +726,18 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     });
   }, [railRemotePanelEntries]);
   const railProjectEntries = [...railLocalProjectEntries, ...railRemoteProjectEntries];
-  const railDialogueSessions = railLocalPanelSessions.filter((session) => session.projectId === undefined);
+  const railDialogueSessions = railLocalPanelSessions.filter((session) => sidebarNavigationProjectId(session, hiddenProjectIds) === undefined);
   const railRemoteDialogueEntries = railRemotePanelEntries
     .filter(({ session }) => session.targetName === undefined)
     .sort((left, right) => right.session.lastActivityAt - left.session.lastActivityAt
       || left.cache.profileId.localeCompare(right.cache.profileId)
       || left.session.id.localeCompare(right.session.id));
   const visibleProjectGroupIds = orderedTargets
-    .filter((target) => recent.some((session) => session.projectId === target.id))
+    .filter((target) => !target.archived && recent.some((session) => session.projectId === target.id))
     .map((target) => target.id);
   const visibleDialogueGrouped = sidebarLayout.groupBy === "project"
     && sidebarLayout.groupDialogue
-    && recent.some((session) => session.projectId === undefined);
+    && recent.some((session) => sidebarNavigationProjectId(session, hiddenProjectIds) === undefined);
   const visibleScheduleGroupKeys = groupSidebarScheduleSessions(recent, snapshot.schedules)
     .flatMap((entry) => entry.kind === "scheduleGroup" ? [entry.group.key] : []);
   const expandedScheduleGroupKeys = readExpandedScheduleGroups(props.sidebarOwnerId);
@@ -781,14 +816,14 @@ export function Sidebar(props: SidebarProps): JSX.Element {
 
   useEffect(() => {
     if (sidebarLayout.projectFilter === "all") return;
-    const activeProjectIds = new Set(snapshot.targets.map((target) => target.id));
-    if (snapshot.sessions.some((session) => session.projectId === undefined)) {
+    const activeProjectIds = new Set(visibleTargets.map((target) => target.id));
+    if (snapshot.sessions.some((session) => sidebarNavigationProjectId(session, hiddenProjectIds) === undefined)) {
       activeProjectIds.add(SIDEBAR_DIALOGUE_FILTER_ID);
     }
     const next = sidebarLayout.projectFilter.filter((projectId) => activeProjectIds.has(projectId));
     if (next.length === sidebarLayout.projectFilter.length) return;
     props.onSidebarOwnerLayoutChange({ projectFilter: next.length === 0 ? "all" : next });
-  }, [sidebarLayout.projectFilter, snapshot.sessions, snapshot.targets]);
+  }, [hiddenProjectIds, sidebarLayout.projectFilter, snapshot.sessions, visibleTargets]);
 
   useEffect(() => {
     if (sidebarLayout.backendId === "all"
@@ -817,7 +852,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     setMessageSearchLoading(true);
     const abort = new AbortController();
     const searchFilters: SessionMessageSearchFiltersView = {
-      ...(messageSearchTargetIds === "all" ? {} : { targetIds: messageSearchTargetIds }),
+      ...(messageSearchSessionScopeKey === undefined ? {} : { sessionIds: JSON.parse(messageSearchSessionScopeKey) as string[] }),
       ...(messageSearchBackendId === "all" ? {} : { backendIds: [messageSearchBackendId] }),
       ...(messageSearchStatus === "all" ? {} : { sessionStatus: messageSearchStatus }),
       ...(messageSearchLastActivity === "all"
@@ -876,7 +911,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
       abort.abort(new DOMException("Superseded search", "AbortError"));
       if (messageSearchGenerationRef.current === generation) messageSearchGenerationRef.current += 1;
     };
-  }, [currentMachineIncluded, messageSearchBackendId, messageSearchLastActivity, messageSearchStatus, messageSearchTargetIds, normalizedQuery, query, t]);
+  }, [currentMachineIncluded, messageSearchBackendId, messageSearchLastActivity, messageSearchStatus, messageSearchSessionScopeKey, normalizedQuery, query, t]);
 
   useEffect(() => {
     const generation = ++remoteMessageSearchGenerationRef.current;
@@ -885,7 +920,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     remoteKeywordMatchesRef.current = undefined;
     setRemoteMessageSearchError(undefined);
     const searchRemoteMessages = searchRemoteMessagesRef.current;
-    if (normalizedQuery === "" || searchRemoteMessages === undefined) {
+    if (normalizedQuery === "" || searchRemoteMessages === undefined || messageSearchTargetIds !== "all") {
       setRemoteMessageMatches([]);
       setRemoteMessageSearchLoading(false);
       return;
@@ -894,7 +929,6 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     setRemoteMessageSearchLoading(true);
     const abort = new AbortController();
     const searchFilters: SessionMessageSearchFiltersView = {
-      ...(messageSearchTargetIds === "all" ? {} : { targetIds: messageSearchTargetIds }),
       ...(messageSearchBackendId === "all" ? {} : { backendIds: [messageSearchBackendId] }),
       ...(messageSearchStatus === "all" ? {} : { sessionStatus: messageSearchStatus }),
       ...(messageSearchLastActivity === "all"
@@ -1015,11 +1049,11 @@ export function Sidebar(props: SidebarProps): JSX.Element {
       setMessageSearchBackendId("all");
     }
     if (messageSearchTargetIds !== "all") {
-      const available = new Set(snapshot.targets.map((target) => target.id));
+      const available = new Set(visibleTargets.map((target) => target.id));
       const next = messageSearchTargetIds.filter((targetId) => available.has(targetId));
       if (next.length !== messageSearchTargetIds.length) setMessageSearchTargetIds(next.length === 0 ? "all" : next);
     }
-  }, [messageSearchBackendId, messageSearchTargetIds, snapshot.backends, snapshot.targets]);
+  }, [messageSearchBackendId, messageSearchTargetIds, snapshot.backends, visibleTargets]);
 
   useLayoutEffect(() => {
     const visible = new Set(visibleSidebarSessionIds(sessionListRef.current));
@@ -1086,10 +1120,30 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     setMessageSearchStatus("all");
     setMessageSearchBackendId("all");
     setMessageSearchLastActivity("all");
+    setMessageSearchTargetIds(lockedSearchTargetId === undefined ? "all" : [lockedSearchTargetId]);
+  };
+
+  const releaseSearchProject = (): void => {
+    if (lockedSearchTargetId === undefined) return;
+    setLockedSearchTargetId(undefined);
     setMessageSearchTargetIds("all");
   };
 
+  useLayoutEffect(() => {
+    if (searchContextAvailable) return;
+    clearSearch();
+    setLockedSearchTargetId(undefined);
+    setMessageSearchTargetIds("all");
+    if (messageSearchOwnerId !== props.sidebarOwnerId) {
+      setMessageSearchOwnerId(props.sidebarOwnerId);
+      setMessageSearchStatus("all");
+      setMessageSearchBackendId("all");
+      setMessageSearchLastActivity("all");
+    }
+  }, [messageSearchOwnerId, props.sidebarOwnerId, searchContextAvailable]);
+
   const toggleMessageSearchTarget = (targetId: string): void => {
+    if (lockedSearchTargetId !== undefined) return;
     setMessageSearchTargetIds((current) => {
       if (current === "all") return [targetId];
       if (!current.includes(targetId)) return [...current, targetId];
@@ -1165,7 +1219,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
       return;
     }
     const visibleProjectIds = orderedTargets
-      .filter((target) => recent.some((session) => session.projectId === target.id))
+      .filter((target) => !target.archived && recent.some((session) => session.projectId === target.id))
       .map((target) => target.id);
     props.onSidebarDisplayPreferencesChange({ projectOrder });
     props.onSidebarOwnerLayoutChange({
@@ -1177,8 +1231,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
 
   const loadDeleteSchedulePreview = (schedule: ScheduleView): void => {
     const generation = ++deleteSchedulePreviewGenerationRef.current;
-    setDeleteScheduleGeneratedCount(undefined);
-    setDeleteScheduleInflightCount(undefined);
+    setDeleteSchedulePreview(undefined);
     setDeleteSchedulePreviewError(undefined);
     if (props.onPreviewScheduleDeletion === undefined) {
       setDeleteSchedulePreviewError(t("scheduler.deletePreviewFailed"));
@@ -1186,8 +1239,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     }
     void props.onPreviewScheduleDeletion(schedule).then((preview) => {
       if (deleteSchedulePreviewGenerationRef.current !== generation) return;
-      setDeleteScheduleGeneratedCount(preview.generatedSessionIds.length);
-      setDeleteScheduleInflightCount(preview.inflightCount);
+      setDeleteSchedulePreview(preview);
     }).catch((error: unknown) => {
       if (deleteSchedulePreviewGenerationRef.current !== generation) return;
       setDeleteSchedulePreviewError(error instanceof Error ? error.message : t("scheduler.deletePreviewFailed"));
@@ -1206,11 +1258,18 @@ export function Sidebar(props: SidebarProps): JSX.Element {
   };
   const confirmDeleteSchedule = async (): Promise<void> => {
     const request = deleteSchedule;
-    if (request === undefined || deleteSchedulePending || props.onDeleteSchedule === undefined) return;
-    if (deleteScheduleGeneratedCount === undefined || deleteSchedulePreviewError !== undefined) return;
+    if (request === undefined || deleteSchedulePending || props.onDeleteSchedule === undefined || props.onPreviewScheduleDeletion === undefined) return;
+    if (deleteSchedulePreview === undefined || deleteSchedulePreviewError !== undefined) return;
     setDeleteSchedulePending(true);
     setDeleteScheduleOperationError(undefined);
     try {
+      if (deleteScheduleDisposition !== "keep") {
+        const refreshed = await props.onPreviewScheduleDeletion(request.schedule);
+        if (!sameScheduleDeletionPreview(deleteSchedulePreview, refreshed)) {
+          setDeleteSchedulePreview(refreshed);
+          return;
+        }
+      }
       await props.onDeleteSchedule(request.schedule, deleteScheduleDisposition);
       deleteSchedulePreviewGenerationRef.current += 1;
       setDeleteSchedule(undefined);
@@ -1358,12 +1417,65 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     onPinTarget: props.onPinTarget,
     onSearchTarget: (target) => {
       closeRailPanels();
+      clearSearch();
+      setLockedSearchTargetId(target.id);
       setMessageSearchTargetIds([target.id]);
       props.onExpand();
       window.requestAnimationFrame(() => props.searchInputRef.current?.focus({ preventScroll: true }));
     },
     onCopyTargetLink: props.onCopyTargetLink,
-    onRemoveTarget: props.onRemoveTarget,
+    onRemoveTarget: props.onRemoveTarget === undefined ? undefined : (target, confirm, returnFocus) => {
+      projectRemovalFocusRef.current?.cancel();
+      const ownerDocument = confirm.ownerDocument;
+      const ownerWindow = ownerDocument.defaultView;
+      const dialog = confirm.closest("[role='alertdialog']");
+      const members = new Set(snapshot.sessions.filter((session) => session.projectId === target.id).map((session) => session.id));
+      if (ownerWindow !== null) {
+        let frame: number | undefined;
+        const ownsFocus = (): boolean => ownerDocument.activeElement === null || ownerDocument.activeElement === ownerDocument.body
+          || ownerDocument.activeElement === returnFocus || dialog?.contains(ownerDocument.activeElement) === true;
+        const visible = (element: HTMLElement): boolean => element.isConnected && element.getClientRects().length > 0
+          && element.closest("[hidden], [aria-hidden='true'], [inert]") === null && !element.matches(":disabled");
+        const request = {
+          targetId: target.id, ownerId: props.sidebarOwnerId, profileId: props.machineControl?.activeProfile.id,
+          generation: snapshot.generation, mode: props.mode,
+          cancel: (): void => {
+            if (frame !== undefined) ownerWindow.cancelAnimationFrame(frame);
+            ownerDocument.removeEventListener("focusin", onFocus, true);
+            ownerDocument.removeEventListener("pointerdown", onPointer, true);
+            ownerWindow.removeEventListener("blur", request.cancel);
+            ownerWindow.removeEventListener("pagehide", request.cancel);
+            if (projectRemovalFocusRef.current === request) projectRemovalFocusRef.current = undefined;
+          },
+          complete: (): void => {
+            if (frame !== undefined) return;
+            frame = ownerWindow.requestAnimationFrame(() => {
+              const shouldRestore = ownsFocus() && ownerDocument.visibilityState !== "hidden";
+              request.cancel();
+              if (!shouldRestore) return;
+              const sidebar = sessionListRef.current?.closest(".sidebar");
+              if (sidebar === null || sidebar === undefined) return;
+              const roots = [sidebar, ...ownerDocument.querySelectorAll(".sidebar-rail-panel")];
+              const member = roots.flatMap((root) => [...root.querySelectorAll<HTMLElement>("[data-session-id]:not([data-machine-profile])")])
+                .find((element) => members.has(element.dataset.sessionId ?? "") && element.tabIndex >= 0 && visible(element));
+              const dialogue = [...sidebar.querySelectorAll<HTMLElement>(".project-group--dialogue .project-group__header, [data-sidebar-rail-trigger='dialogues']")].find(visible);
+              const search = sidebar.querySelector<HTMLElement>(".sidebar-search input");
+              (member ?? dialogue ?? (search !== null && visible(search) ? search : undefined))?.focus({ preventScroll: true });
+            });
+          }
+        };
+        const onFocus = (): void => { if (!ownsFocus()) request.cancel(); };
+        const onPointer = (event: globalThis.PointerEvent): void => {
+          if (!(event.target instanceof Node) || dialog?.contains(event.target) !== true) request.cancel();
+        };
+        projectRemovalFocusRef.current = request;
+        ownerDocument.addEventListener("focusin", onFocus, true);
+        ownerDocument.addEventListener("pointerdown", onPointer, true);
+        ownerWindow.addEventListener("blur", request.cancel);
+        ownerWindow.addEventListener("pagehide", request.cancel);
+      }
+      props.onRemoveTarget?.(target);
+    },
     onSetTargetSessionsArchived: props.onSetTargetSessionsArchived
   };
 
@@ -1414,6 +1526,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     onHome={() => navigateAndClose({ kind: "session" })}
     onNewTask={createTaskAndClose}
     onSearch={() => {
+      releaseSearchProject();
       props.onExpand();
       requestAnimationFrame(() => props.searchInputRef.current?.focus());
     }}
@@ -1437,6 +1550,13 @@ export function Sidebar(props: SidebarProps): JSX.Element {
         <div className="sidebar__primary">
         <div className="sidebar-search">
           <Search aria-hidden="true" />
+          {lockedSearchTarget !== undefined && <span className="conversation-search__project-lock">
+            <span title={lockedSearchTarget.name}>{lockedSearchTarget.name}</span>
+            <IconButton label={t("nav.searchProjectUnlock", { name: lockedSearchTarget.name })} onClick={() => {
+              releaseSearchProject();
+              props.searchInputRef.current?.focus();
+            }}><X aria-hidden="true" /></IconButton>
+          </span>}
           <label className="sr-only" htmlFor="conversation-search-input">{t("nav.searchTasks")}</label>
           <input
             id="conversation-search-input"
@@ -1450,7 +1570,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
             value={query}
             onChange={(event) => setQuery(event.target.value)}
             onKeyDown={handleSearchKeyDown}
-            placeholder={t("nav.searchTasks")}
+            placeholder={lockedSearchTarget === undefined ? t("nav.searchTasks") : t("nav.searchProjectPlaceholder", { name: lockedSearchTarget.name })}
           />
           {query !== "" && <IconButton className="conversation-search__clear" label={t("nav.clearSearch")} onClick={() => { clearSearch(); props.searchInputRef.current?.focus(); }}><X aria-hidden="true" /></IconButton>}
           <details ref={searchFilterRef} className="conversation-search-filter" onKeyDown={(event) => {
@@ -1485,20 +1605,20 @@ export function Sidebar(props: SidebarProps): JSX.Element {
                   <option value="all">{t("nav.searchStatusAll")}</option>
                 </SelectControl>
               </label>
-              <fieldset className="conversation-search-filter__projects">
+              <fieldset className="conversation-search-filter__projects" disabled={lockedSearchTargetId !== undefined}>
                 <legend>{t("nav.searchProjects")}</legend>
                 <div className="conversation-search-filter__project-list">
                   <label>
                     <CheckboxControl checked={messageSearchTargetIds === "all"} onChange={() => setMessageSearchTargetIds("all")} />
                     <span>{t("nav.searchProjectsAll")}</span>
                   </label>
-                  {snapshot.targets.map((target) => <label key={target.id}>
+                  {visibleTargets.map((target) => <label key={target.id}>
                     <CheckboxControl
                       checked={messageSearchTargetIds !== "all" && messageSearchTargetIds.includes(target.id)}
                       onChange={() => toggleMessageSearchTarget(target.id)}
                     />
                     <span title={target.name}>{target.name}</span>
-                    <small>{snapshot.sessions.filter((session) => session.targetId === target.id).length}</small>
+                    <small>{snapshot.sessions.filter((session) => session.projectId === target.id).length}</small>
                   </label>)}
                 </div>
               </fieldset>
@@ -1537,7 +1657,8 @@ export function Sidebar(props: SidebarProps): JSX.Element {
         </div>}
         {!searchPopupOpen && <SidebarListSettings
           layout={sidebarLayout}
-          targets={snapshot.targets}
+          targets={visibleTargets}
+          hiddenProjectIds={hiddenProjectIds}
           backends={snapshot.backends}
           sessions={snapshot.sessions}
           activeContentFilterCount={activeContentFilterCount}
@@ -1936,8 +2057,9 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     <ScheduleDeleteDialog
       schedule={deleteSchedule?.schedule}
       disposition={deleteScheduleDisposition}
-      generatedCount={deleteScheduleGeneratedCount}
-      inflightCount={deleteScheduleInflightCount}
+      generatedCount={deleteSchedulePreview?.generatedSessionIds.length}
+      inflightCount={deleteSchedulePreview?.inflightCount}
+      worktreeRemoval={deleteSchedulePreview?.worktreeRemoval}
       previewError={deleteSchedulePreviewError}
       operationError={deleteScheduleOperationError}
       pending={deleteSchedulePending}
@@ -2422,6 +2544,7 @@ function sessionCallbacks(
     onRename: props.onRename,
     onPin: props.onPin,
     onArchive: props.onArchive,
+    onPrefetchRemoval: props.onPrefetchRemoval ?? (() => undefined),
     onDelete: props.onDelete,
     onCopyTaskLink: props.onCopyTaskLink ?? (() => undefined),
     onExportPortableSession: props.onExportPortableSession,
@@ -2442,6 +2565,7 @@ interface SessionSectionCallbacks {
   readonly onRename: (session: SessionView, name: string) => void;
   readonly onPin: (session: SessionView) => void;
   readonly onArchive: (session: SessionView) => void;
+  readonly onPrefetchRemoval: (session: SessionView) => void;
   readonly onDelete: (session: SessionView) => void;
   readonly onCopyTaskLink: (session: SessionView) => void;
   readonly onExportPortableSession?: (session: SessionView) => void;
@@ -2490,9 +2614,10 @@ interface SidebarSettingsNestedMenu<TKind extends string> {
   readonly y: number;
 }
 
-function SidebarListSettings({ layout, targets, backends, sessions, activeContentFilterCount, deviceGroupingAvailable, foldAction, contextMenuRequest, t, onContextMenuRequestHandled, onStatusChange, onGroupByChange, onGroupDialogueChange, onGroupDeviceChange, onSortByChange, onProjectOrderChange, onMainViewModeChange, onProjectFilterToggle, onProjectFilterReset, onBackendChange, onLastActivityChange, onResetContentFilters, onToggleAllGroups, onSessionInfoFieldToggle }: {
+function SidebarListSettings({ layout, targets, hiddenProjectIds, backends, sessions, activeContentFilterCount, deviceGroupingAvailable, foldAction, contextMenuRequest, t, onContextMenuRequestHandled, onStatusChange, onGroupByChange, onGroupDialogueChange, onGroupDeviceChange, onSortByChange, onProjectOrderChange, onMainViewModeChange, onProjectFilterToggle, onProjectFilterReset, onBackendChange, onLastActivityChange, onResetContentFilters, onToggleAllGroups, onSessionInfoFieldToggle }: {
   readonly layout: SidebarLayout;
   readonly targets: readonly TargetView[];
+  readonly hiddenProjectIds: ReadonlySet<string>;
   readonly backends: AppSnapshot["backends"];
   readonly sessions: readonly SessionView[];
   readonly activeContentFilterCount: number;
@@ -2706,7 +2831,11 @@ function SidebarListSettings({ layout, targets, backends, sessions, activeConten
   ].filter((value): value is string => value !== undefined).join(", ") || t("nav.groupNone");
   const organizerAria = t("nav.organizeSidebarAria", {
     grouping: groupingSummary,
-    sort: t(layout.sortBy === "priority" ? "nav.sortPriority" : "nav.sortRecent"),
+    sort: t(layout.sortBy === "priority"
+      ? "nav.sortPriority"
+      : layout.sortBy === "created"
+        ? "nav.sortCreated"
+        : "nav.sortRecent"),
     filters: filterSummary,
     display: t(layout.mainViewMode === "text" ? "nav.viewText" : "nav.viewList"),
     info: taskInfoSummary
@@ -2764,6 +2893,9 @@ function SidebarListSettings({ layout, targets, backends, sessions, activeConten
         <strong>{t("nav.taskSort")}</strong>
         <button type="button" role="menuitemradio" aria-checked={layout.sortBy === "recency"} onClick={() => selectAndClose(() => onSortByChange("recency"))}>
           <span>{t("nav.sortRecent")}</span>{layout.sortBy === "recency" && <Check aria-hidden="true" />}
+        </button>
+        <button type="button" role="menuitemradio" aria-checked={layout.sortBy === "created"} onClick={() => selectAndClose(() => onSortByChange("created"))}>
+          <span>{t("nav.sortCreated")}</span>{layout.sortBy === "created" && <Check aria-hidden="true" />}
         </button>
         <button type="button" role="menuitemradio" aria-checked={layout.sortBy === "priority"} title={t("nav.sortPriorityHint")} onClick={() => selectAndClose(() => onSortByChange("priority"))}>
           <span>{t("nav.sortPriority")}</span>{layout.sortBy === "priority" && <Check aria-hidden="true" />}
@@ -2877,7 +3009,7 @@ function SidebarListSettings({ layout, targets, backends, sessions, activeConten
           <button type="button" role="menuitemcheckbox" aria-checked={layout.projectFilter === "all"} onClick={onProjectFilterReset}><span>{t("nav.searchProjectsAll")}</span>{layout.projectFilter === "all" && <Check aria-hidden="true" />}</button>
           <hr />
           <button type="button" role="menuitemcheckbox" aria-checked={layout.projectFilter === "all" || layout.projectFilter.includes(SIDEBAR_DIALOGUE_FILTER_ID)} onClick={() => onProjectFilterToggle(SIDEBAR_DIALOGUE_FILTER_ID)}>
-            <span>{t("nav.dialogue")}</span><small>{sessions.filter((session) => session.projectId === undefined).length}</small>{(layout.projectFilter === "all" || layout.projectFilter.includes(SIDEBAR_DIALOGUE_FILTER_ID)) && <Check aria-hidden="true" />}
+            <span>{t("nav.dialogue")}</span><small>{sessions.filter((session) => sidebarNavigationProjectId(session, hiddenProjectIds) === undefined).length}</small>{(layout.projectFilter === "all" || layout.projectFilter.includes(SIDEBAR_DIALOGUE_FILTER_ID)) && <Check aria-hidden="true" />}
           </button>
           {targets.map((target) => <button type="button" role="menuitemcheckbox" aria-checked={layout.projectFilter === "all" || layout.projectFilter.includes(target.id)} key={target.id} onClick={() => onProjectFilterToggle(target.id)}>
             <span>{target.name}</span><small>{sessions.filter((session) => session.projectId === target.id).length}</small>{(layout.projectFilter === "all" || layout.projectFilter.includes(target.id)) && <Check aria-hidden="true" />}
@@ -2942,7 +3074,7 @@ function PinnedSessionSection({
   readonly browsableTargetIds: ReadonlySet<string>;
   readonly reducedMotion: boolean;
 } & SessionSectionCallbacks & SessionPriorityProps & SessionDisplayProps & ScheduleGroupPresentationProps): JSX.Element {
-  const targetNames = new Map(targets.map((target) => [target.id, target.name]));
+  const targetNames = new Map(targets.filter((target) => !target.archived).map((target) => [target.id, target.name]));
   const [collapsed, setCollapsed] = useState(false);
   const [viewMenu, setViewMenu] = useState<{ readonly x: number; readonly y: number }>();
   const viewTriggerRef = useRef<HTMLButtonElement>(null);
@@ -2990,7 +3122,7 @@ function PinnedSessionSection({
         session={session}
         active={session.id === activeSessionId}
         locale={locale}
-        targetName={session.projectId === undefined ? t("nav.dialogue") : targetNames.get(session.projectId)}
+        targetName={(session.projectId === undefined ? undefined : targetNames.get(session.projectId)) ?? t("nav.dialogue")}
         t={t}
         priorityContext={priorityContext}
         {...callbacks}
@@ -3064,17 +3196,28 @@ function PinnedSessionSection({
         </IconButton>
       </span>
     </h2>
-    {!collapsed && <SortableList
-        items={entries}
-        getId={(entry) => entry.id}
-        onReorder={onReorder}
-        renderItem={renderEntry}
-        reducedMotion={reducedMotion}
-        filter=".session-menu, [data-no-drag]"
-        className="session-section__sortable-sessions"
-        role="list"
-        ariaLabel={title}
-      />}
+    {!collapsed && (viewMode === "card"
+      ? <PinnedCardMasonry
+          items={entries}
+          getId={(entry) => entry.id}
+          onReorder={onReorder}
+          renderItem={renderEntry}
+          reducedMotion={reducedMotion}
+          isFullWidth={(entry) => entry.kind === "project"}
+          filter="input, textarea, select, a, .session-menu, [data-no-drag]"
+          ariaLabel={title}
+        />
+      : <SortableList
+          items={entries}
+          getId={(entry) => entry.id}
+          onReorder={onReorder}
+          renderItem={renderEntry}
+          reducedMotion={reducedMotion}
+          filter="input, textarea, select, a, .session-menu, [data-no-drag]"
+          className="session-section__sortable-sessions"
+          role="list"
+          ariaLabel={title}
+        />)}
     {viewMenu !== undefined && viewTriggerRef.current !== null && createPortal(<div
       ref={viewMenuRef}
       className="sidebar-list-settings__menu sidebar-list-settings__menu--compact"
@@ -3263,14 +3406,14 @@ function FlatSessionSection({ title, sessions, targets, activeSessionId, locale,
   readonly locale: string;
   readonly t: Translator;
 } & SessionSectionCallbacks & SessionPriorityProps & SessionDisplayProps & ScheduleGroupPresentationProps): JSX.Element {
-  const targetNames = new Map(targets.map((target) => [target.id, target.name]));
+  const targetNames = new Map(targets.filter((target) => !target.archived).map((target) => [target.id, target.name]));
   return <section className="session-section session-section--flat" aria-label={title}>
     <h2>{title}</h2>
     <CollapsibleSessionRows
       sessions={sessions}
       activeSessionId={activeSessionId}
       locale={locale}
-      targetNameFor={(session) => session.projectId === undefined ? t("nav.dialogue") : targetNames.get(session.projectId)}
+      targetNameFor={(session) => (session.projectId === undefined ? undefined : targetNames.get(session.projectId)) ?? t("nav.dialogue")}
       t={t}
       priorityContext={priorityContext}
       {...callbacks}
@@ -3596,7 +3739,7 @@ function ProjectGroupHeading({ target, sessions, displayedSessionCount, collapse
   const [editing, setEditing] = useState(false);
   const [editValue, setEditValue] = useState(target.name);
   const [menu, setMenu] = useState<{ readonly x: number; readonly y: number }>();
-  const [confirmation, setConfirmation] = useState<"archive" | "unarchive" | "remove">();
+  const [removeConfirmation, setRemoveConfirmation] = useState(false);
   const allArchived = sessions.length > 0 && sessions.every((session) => session.archived);
   const archiveCandidates = allArchived
     ? sessions.filter((session) => session.archived)
@@ -3811,27 +3954,24 @@ function ProjectGroupHeading({ target, sessions, displayedSessionCount, collapse
       {browsableSession !== undefined && <button type="button" role="menuitem" onClick={() => runMenuAction(() => onBrowseFiles(browsableSession))}><span>{t("workspace.browseFiles", { name: target.name })}</span></button>}
       {actions.onCopyTargetLink !== undefined && <button type="button" role="menuitem" onClick={() => runMenuAction(() => actions.onCopyTargetLink?.(target))}><span>{t("projects.copyLink")}</span></button>}
       <hr />
-      {actions.onRemoveTarget !== undefined && <button type="button" role="menuitem" onClick={() => runMenuAction(() => setConfirmation("remove"))}><span>{t("projects.removeFromSidebar")}</span></button>}
-      <button type="button" role="menuitem" disabled={!canSetArchived} onClick={() => runMenuAction(() => setConfirmation(allArchived ? "unarchive" : "archive"))}><span>{t(allArchived ? "projects.unarchiveAll" : "projects.archiveAll")}</span></button>
+      {actions.onRemoveTarget !== undefined && <button type="button" role="menuitem" onClick={() => runMenuAction(() => setRemoveConfirmation(true))}><span>{t("projects.removeFromSidebar")}</span></button>}
+      <button type="button" role="menuitem" disabled={!canSetArchived} onClick={() => runMenuAction(() => actions.onSetTargetSessionsArchived?.(target, archiveCandidates, !allArchived))}><span>{t(allArchived ? "projects.unarchiveAll" : "projects.archiveAll")}</span></button>
     </div>, document.body)}
     <Modal
-      open={confirmation !== undefined}
-      title={confirmation === "remove"
-        ? t("projects.removeTitle", { name: target.name })
-        : t(confirmation === "unarchive" ? "projects.unarchiveAllTitle" : "projects.archiveAllTitle", { name: target.name })}
-      description={confirmation === "remove" ? t("projects.removeBody") : t("projects.archiveAllBody")}
+      open={removeConfirmation}
+      title={t("projects.removeTitle", { name: target.name })}
+      description={t("projects.removeBody")}
       size="small"
       dialogRole="alertdialog"
-      onClose={() => setConfirmation(undefined)}
+      restoreFocusFallback={() => moreRef.current}
+      onClose={() => setRemoveConfirmation(false)}
     >
       <div className="modal__actions">
-        <Button onClick={() => setConfirmation(undefined)}>{t("common.cancel")}</Button>
-        <Button tone={confirmation === "unarchive" ? "primary" : "danger"} onClick={() => {
-          const action = confirmation;
-          setConfirmation(undefined);
-          if (action === "remove") actions.onRemoveTarget?.(target);
-          else if (action !== undefined) actions.onSetTargetSessionsArchived?.(target, archiveCandidates, action === "archive");
-        }}>{t(confirmation === "remove" ? "common.remove" : confirmation === "unarchive" ? "projects.unarchiveAll" : "projects.archiveAll")}</Button>
+        <Button onClick={() => setRemoveConfirmation(false)}>{t("common.cancel")}</Button>
+        <Button tone="danger" onClick={(event) => {
+          setRemoveConfirmation(false);
+          actions.onRemoveTarget?.(target, event.currentTarget, moreRef.current);
+        }}>{t("common.remove")}</Button>
       </div>
     </Modal>
   </>;
@@ -3901,8 +4041,9 @@ function SessionSection({ title, sessions, targets, activeSessionId, locale, col
   readonly projectActions: SidebarProjectActions;
   readonly workspacePathFor: (target: TargetView) => string;
 } & SessionSectionCallbacks & SessionPriorityProps & SessionDisplayProps & ScheduleGroupPresentationProps): JSX.Element {
-  const groups = targets.map((target) => ({ target, sessions: sessions.filter((session) => session.projectId === target.id) })).filter((group) => group.sessions.length > 0);
-  const dialogue = sessions.filter((session) => session.projectId === undefined);
+  const hiddenProjectIds = new Set(targets.filter((target) => target.archived).map((target) => target.id));
+  const groups = targets.filter((target) => !target.archived).map((target) => ({ target, sessions: sessions.filter((session) => session.projectId === target.id) })).filter((group) => group.sessions.length > 0);
+  const dialogue = sessions.filter((session) => sidebarNavigationProjectId(session, hiddenProjectIds) === undefined);
   const renderGroup = ({ target, sessions: targetSessions }: (typeof groups)[number]): JSX.Element => {
     const allTargetSessions = projectActions.allSessions.filter((session) => session.projectId === target.id);
     const collapsed = collapsedTargets.has(target.id);
@@ -4002,7 +4143,7 @@ function SessionSection({ title, sessions, targets, activeSessionId, locale, col
   );
 }
 
-function SessionRow({ session, active, locale, targetName, match, t, priorityContext, sessionInfoFields, sessionProfileId, projectNameFor, environmentNameFor, onSelect, onRename, onPin, onArchive, onDelete, onCopyTaskLink, onExportPortableSession, canExportPortableSession, onSplitSession, onOpenSessionWindow, projectMenuTargets, movingSessionProjectIds, onMoveSessionProject, selectedSessionIds }: { readonly session: SessionView; readonly active: boolean; readonly locale: string; readonly targetName?: string; readonly match?: SidebarFuzzyMatch; readonly t: Translator } & SessionSectionCallbacks & SessionPriorityProps & SessionDisplayProps): JSX.Element {
+function SessionRow({ session, active, locale, targetName, match, t, priorityContext, sessionInfoFields, sessionProfileId, projectNameFor, environmentNameFor, onSelect, onRename, onPin, onArchive, onPrefetchRemoval, onDelete, onCopyTaskLink, onExportPortableSession, canExportPortableSession, onSplitSession, onOpenSessionWindow, projectMenuTargets, movingSessionProjectIds, onMoveSessionProject, selectedSessionIds }: { readonly session: SessionView; readonly active: boolean; readonly locale: string; readonly targetName?: string; readonly match?: SidebarFuzzyMatch; readonly t: Translator } & SessionSectionCallbacks & SessionPriorityProps & SessionDisplayProps): JSX.Element {
   const indicator = sidebarSessionIndicatorState(session, priorityContext);
   const stateLabel = indicator === undefined
     ? sessionStateLabel(session.state, t)
@@ -4019,7 +4160,6 @@ function SessionRow({ session, active, locale, targetName, match, t, priorityCon
   const restoreRowFocusRef = useRef(false);
   const contextRequestSequenceRef = useRef(0);
   const [contextMenuRequest, setContextMenuRequest] = useState<SessionMenuContextRequest>();
-  const [archivePending, setArchivePending] = useState(false);
   const [editing, setEditing] = useState(false);
   const [editValue, setEditValue] = useState(session.name);
   useEffect(() => {
@@ -4040,19 +4180,6 @@ function SessionRow({ session, active, locale, targetName, match, t, priorityCon
     mainButtonRef.current?.focus({ preventScroll: true });
   }, [editing]);
   useEffect(() => () => cancelSessionWindowDragPreviewForSession(session.id), [session.id]);
-  useEffect(() => {
-    if (!archivePending) return;
-    const timer = window.setTimeout(() => setArchivePending(false), 4_000);
-    const dismiss = (event: globalThis.PointerEvent): void => {
-      const target = event.target;
-      if (!(target instanceof Element) || target.closest("[data-session-archive-confirm]")?.getAttribute("data-session-archive-confirm") !== session.id) setArchivePending(false);
-    };
-    document.addEventListener("pointerdown", dismiss, true);
-    return () => {
-      window.clearTimeout(timer);
-      document.removeEventListener("pointerdown", dismiss, true);
-    };
-  }, [archivePending, session.id]);
   const activate = (event: ReactMouseEvent<HTMLButtonElement>): void => {
     if (editing || event.detail > 1) return;
     const modifiers = { metaKey: event.metaKey, ctrlKey: event.ctrlKey, shiftKey: event.shiftKey };
@@ -4062,7 +4189,6 @@ function SessionRow({ session, active, locale, targetName, match, t, priorityCon
     if (editing) return;
     renameCommittedRef.current = false;
     restoreRowFocusRef.current = false;
-    setArchivePending(false);
     setContextMenuRequest(undefined);
     setEditValue(session.name);
     setEditing(true);
@@ -4228,6 +4354,7 @@ function SessionRow({ session, active, locale, targetName, match, t, priorityCon
         onStartRename={beginRename}
         onPin={onPin}
         onArchive={onArchive}
+        onPrefetchRemoval={onPrefetchRemoval}
         onDelete={onDelete}
         onCopyTaskLink={onCopyTaskLink}
         onExportPortableSession={canExportPortableSession(session) ? onExportPortableSession : undefined}
@@ -4239,17 +4366,13 @@ function SessionRow({ session, active, locale, targetName, match, t, priorityCon
         contextMenuRequest={contextMenuRequest}
         onContextMenuRequestHandled={() => setContextMenuRequest(undefined)}
       />
-      {archivePending ? <button
-        type="button"
-        className="session-row__archive-confirm"
-        data-session-archive-confirm={session.id}
-        aria-label={t("session.archive")}
-        onClick={() => { setArchivePending(false); onArchive(session); }}
-      >{t("common.confirm")}</button> : <IconButton
+      <IconButton
         className="session-row__quick-archive"
         label={session.archived ? t("session.unarchive") : t("session.archive")}
-        onClick={() => session.archived ? onArchive(session) : setArchivePending(true)}
-      >{session.archived ? <Undo2 aria-hidden="true" /> : <Archive aria-hidden="true" />}</IconButton>}
+        onPointerEnter={() => onPrefetchRemoval(session)}
+        onFocus={() => onPrefetchRemoval(session)}
+        onClick={() => onArchive(session)}
+      >{session.archived ? <Undo2 aria-hidden="true" /> : <Archive aria-hidden="true" />}</IconButton>
       </div>}
     </li>
   );
@@ -4261,12 +4384,13 @@ interface SessionMenuContextRequest {
   readonly sequence: number;
 }
 
-function SessionActionsMenu({ session, t, onStartRename, onPin, onArchive, onDelete, onCopyTaskLink, onExportPortableSession, onSplitSession, onOpenSessionWindow, projectMenuTargets, moving, onMoveSessionProject, contextMenuRequest, onContextMenuRequestHandled }: {
+function SessionActionsMenu({ session, t, onStartRename, onPin, onArchive, onPrefetchRemoval, onDelete, onCopyTaskLink, onExportPortableSession, onSplitSession, onOpenSessionWindow, projectMenuTargets, moving, onMoveSessionProject, contextMenuRequest, onContextMenuRequestHandled }: {
   readonly session: SessionView;
   readonly t: Translator;
   readonly onStartRename: () => void;
   readonly onPin: (session: SessionView) => void;
   readonly onArchive: (session: SessionView) => void;
+  readonly onPrefetchRemoval: (session: SessionView) => void;
   readonly onDelete: (session: SessionView) => void;
   readonly onCopyTaskLink: (session: SessionView) => void;
   readonly onExportPortableSession?: (session: SessionView) => void;
@@ -4300,6 +4424,7 @@ function SessionActionsMenu({ session, t, onStartRename, onPin, onArchive, onDel
     const trigger = triggerRef.current;
     const ownerWindow = trigger?.ownerDocument.defaultView;
     if (trigger === null || trigger === undefined || ownerWindow === null || ownerWindow === undefined) return;
+    onPrefetchRemoval(session);
     focusTargetRef.current = focusTarget;
     pointAnchorRef.current = undefined;
     setProjectMenuPosition(undefined);
@@ -4329,6 +4454,7 @@ function SessionActionsMenu({ session, t, onStartRename, onPin, onArchive, onDel
 
   useEffect(() => {
     if (contextMenuRequest === undefined) return;
+    onPrefetchRemoval(session);
     const ownerWindow = triggerRef.current?.ownerDocument.defaultView;
     if (ownerWindow === null || ownerWindow === undefined) return;
     focusTargetRef.current = "first";
@@ -4791,14 +4917,40 @@ function sidebarRightStatusLabel(status: SidebarRightStatus, t: Translator): str
 
 export function visibleSidebarSessionIds(root: HTMLElement | null): readonly string[] {
   if (root === null) return [];
+  const rows = [...root.querySelectorAll<HTMLElement>(".session-row [data-session-id]")];
+  const cardGroups = new Map<HTMLElement, Array<{ readonly row: HTMLElement; readonly domIndex: number; readonly order: number }>>();
+  rows.forEach((row, domIndex) => {
+    const group = row.closest<HTMLElement>("[data-sidebar-card-order='row-major']");
+    const card = row.closest<HTMLElement>("[data-sidebar-row-order]");
+    if (group === null || card === null || !group.contains(card)) return;
+    const order = Number.parseInt(card.dataset.sidebarRowOrder ?? "", 10);
+    if (!Number.isInteger(order) || order < 0) return;
+    const entries = cardGroups.get(group) ?? [];
+    entries.push({ row, domIndex, order });
+    cardGroups.set(group, entries);
+  });
   const seen = new Set<string>();
+  const emittedGroups = new Set<HTMLElement>();
   const result: string[] = [];
-  for (const row of root.querySelectorAll<HTMLElement>(".session-row [data-session-id]")) {
+  const append = (row: HTMLElement): void => {
     const sessionId = row.dataset.sessionId;
-    if (sessionId === undefined || sessionId === "" || seen.has(sessionId)) continue;
-    if (row.closest("[aria-hidden='true'], [inert]") !== null) continue;
+    if (sessionId === undefined || sessionId === "" || seen.has(sessionId)) return;
+    if (row.closest("[aria-hidden='true'], [inert]") !== null) return;
     seen.add(sessionId);
     result.push(sessionId);
+  };
+  for (const row of rows) {
+    const group = row.closest<HTMLElement>("[data-sidebar-card-order='row-major']");
+    const groupedRows = group === null ? undefined : cardGroups.get(group);
+    if (group === null || groupedRows === undefined) {
+      append(row);
+      continue;
+    }
+    if (emittedGroups.has(group)) continue;
+    emittedGroups.add(group);
+    groupedRows
+      .sort((left, right) => left.order - right.order || left.domIndex - right.domIndex)
+      .forEach(({ row: groupedRow }) => append(groupedRow));
   }
   return result;
 }
@@ -4807,6 +4959,15 @@ function sameStringSet(left: ReadonlySet<string>, right: ReadonlySet<string>): b
   if (left.size !== right.size) return false;
   for (const value of left) if (!right.has(value)) return false;
   return true;
+}
+
+function sameScheduleDeletionPreview(left: ScheduleDeletionPreview, right: ScheduleDeletionPreview): boolean {
+  return left.inflightCount === right.inflightCount
+    && left.generatedSessionIds.length === right.generatedSessionIds.length
+    && left.generatedSessionIds.every((sessionId, index) => sessionId === right.generatedSessionIds[index])
+    && left.worktreeRemoval.clean === right.worktreeRemoval.clean
+    && left.worktreeRemoval.dirty === right.worktreeRemoval.dirty
+    && left.worktreeRemoval.unknown === right.worktreeRemoval.unknown;
 }
 
 function SidebarRightStatusIndicator({ status, active, t, className }: {

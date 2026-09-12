@@ -291,6 +291,7 @@ function mountPane(
     onOpenNavigation={() => undefined}
     onOpenInspector={() => undefined}
     onRename={() => undefined}
+    onArchive={() => undefined}
     onDelete={() => undefined}
   />));
   return container;

@@ -64,7 +64,7 @@ export function ComposerInlineMentionPanel({
 
   useEffect(() => {
     if (activeOptionId === undefined) return;
-    document.getElementById(activeOptionId)?.scrollIntoView?.({ block: "nearest" });
+    listRef.current?.ownerDocument.getElementById(activeOptionId)?.scrollIntoView?.({ block: "nearest" });
   }, [activeOptionId]);
   useEffect(() => {
     if (embedded) listRef.current?.focus({ preventScroll: true });
@@ -139,8 +139,8 @@ export function ComposerInlineMentionPanel({
           ? <button className="composer-palette__reference" type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => onReference(activeItem)}>{referenceOptions.directoryLabel}</button>
           : activeItem.kind === "file" && referenceOptions.lineRange
             ? <form className="composer-palette__reference" onSubmit={(event) => {
-                event.preventDefault();
-                if (!validLines || activeItem.mention === undefined) return;
+              event.preventDefault();
+                if (!validLines || activeItem.mention?.kind !== "workspace") return;
                 const label = `${activeItem.mention.label}:${startLine}–${endLine}`;
                 onReference({ ...activeItem, mention: {
                   ...activeItem.mention,

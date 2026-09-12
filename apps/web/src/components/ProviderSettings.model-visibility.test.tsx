@@ -248,6 +248,39 @@ describe("ProviderSettings model visibility", () => {
       .some((button) => button.textContent === "Cancel")).toBe(false);
   });
 
+  it("opens the existing editor from an editable provider row double-click only", async () => {
+    const base = emptySnapshot();
+    const fixed = provider("fixed", "Fixed provider", { runtimes: [runtimeConfiguration()] });
+    const editable = provider("editable", "Editable provider", {
+      runtimes: [runtimeConfiguration({ models: [configuredModel("editable-model", "Editable model")] })]
+    });
+    const snapshot = {
+      ...base,
+      settings: { ...base.settings, providers: [fixed, editable] }
+    };
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    roots.push(root);
+    await act(async () => root.render(<ProviderSettings
+      controller={controllerFor(snapshot)}
+      snapshot={snapshot}
+      runAction={() => undefined}
+      t={(key, values) => translate("en", key, values)}
+    />));
+
+    const rows = [...container.querySelectorAll<HTMLButtonElement>(".provider-master-row")];
+    const fixedRow = required(rows.find((row) => row.textContent?.includes("Fixed provider")));
+    const editableRow = required(rows.find((row) => row.textContent?.includes("Editable provider")));
+
+    await act(async () => fixedRow.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, detail: 2 })));
+    expect(document.body.querySelector(".provider-editor")).toBeNull();
+
+    await act(async () => editableRow.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, detail: 2 })));
+    expect(document.body.querySelector(".provider-editor")).not.toBeNull();
+    expect(document.body.querySelector<HTMLInputElement>('.provider-editor input[required]')?.value).toBe("Editable provider");
+  });
+
   it("keeps an absent local runtime out of the configured rail and offers it only from the add flow", async () => {
     const base = emptySnapshot();
     const absentRuntime: ManagedModelRuntimeView = {

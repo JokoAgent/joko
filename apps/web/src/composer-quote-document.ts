@@ -1,5 +1,5 @@
 import type { JSONContent } from "@tiptap/core";
-import type { ComposerSelectionQuoteDraft } from "./model.js";
+import type { ComposerInlineMentionRange, ComposerSelectionQuoteDraft } from "./model.js";
 import { normalizedListAttrs, promoteComposerMarkdownLists } from "./composer-list-document.js";
 import {
   COMPOSER_LONG_PASTE_ATTRIBUTE_LIMIT,
@@ -24,6 +24,8 @@ export interface SerializedComposerDocument {
   readonly text: string;
   readonly quotesEncoded: boolean;
   readonly pastedTextRanges?: readonly ComposerPastedTextRange[];
+  /** Occurrences projected into the final serialized text, preserving their identity. */
+  readonly mentionRanges?: readonly { readonly mentionId: string; readonly start: number; readonly end: number }[];
 }
 
 export interface ComposerPastedTextRange {
@@ -208,8 +210,13 @@ export function quoteSegmentsToComposerDocument(
   return normalizeComposerDocument({ type: "doc", content });
 }
 
-export function serializeComposerDocument(document: unknown): SerializedComposerDocument {
+export function serializeComposerDocument(document: unknown, mentionRanges: readonly ComposerInlineMentionRange[] = []): SerializedComposerDocument {
   const blocks = composerDocumentBlocks(normalizeComposerDocument(document));
+  const plain = blocks.filter((block) => block.kind === "text").map((block) => block.text).join("\n");
+  const plainLeadingTrim = plain.length - plain.trimStart().length;
+  const plainLength = plain.trim().length;
+  const textProjections: { readonly from: number; readonly to: number; readonly wireStart: number }[] = [];
+  let plainCursor = 0;
   let serialized = "";
   const pastedTextRanges: ComposerPastedTextRange[] = [];
   let previousKind: SerializedBlock["kind"] | undefined;
@@ -223,6 +230,8 @@ export function serializeComposerDocument(document: unknown): SerializedComposer
       && previous?.kind === "quote"
       && next?.kind === "quote";
     if (pureLineBreakIsland) {
+      textProjections.push({ from: plainCursor, to: plainCursor + block.text.length, wireStart: serialized.length + 2 });
+      plainCursor += block.text.length + 1;
       serialized += `\n\n${block.text}`;
       suppressNextSeparator = true;
       previousKind = block.kind;
@@ -233,6 +242,10 @@ export function serializeComposerDocument(document: unknown): SerializedComposer
       : previousKind === "quote" || block.kind === "quote" ? "\n\n" : "\n";
     serialized += separator;
     const blockStart = serialized.length;
+    if (block.kind === "text") {
+      textProjections.push({ from: plainCursor, to: plainCursor + block.text.length, wireStart: blockStart });
+      plainCursor += block.text.length + 1;
+    }
     serialized += block.text;
     for (const range of block.pastedTextRanges ?? []) {
       pastedTextRanges.push({
@@ -251,10 +264,28 @@ export function serializeComposerDocument(document: unknown): SerializedComposer
     const end = Math.min(text.length, range.end - leadingTrim);
     return start < end ? [{ start, end, display: range.display }] : [];
   });
+  let projectionIndex = 0;
+  let previousEnd = 0;
+  const projectedMentions = mentionRanges.map((range) => {
+    const from = range.from + plainLeadingTrim;
+    const to = range.to + plainLeadingTrim;
+    if (!Number.isSafeInteger(range.from) || !Number.isSafeInteger(range.to) || range.from < previousEnd || range.to <= range.from || range.to > plainLength) {
+      throw new Error("The composer mention occurrence is outside its canonical text.");
+    }
+    while (projectionIndex < textProjections.length && textProjections[projectionIndex]!.to <= from) projectionIndex += 1;
+    const projection = textProjections[projectionIndex];
+    if (projection === undefined || from < projection.from || to > projection.to) throw new Error("The composer mention occurrence crosses a structured text boundary.");
+    const start = projection.wireStart + from - projection.from - leadingTrim;
+    const end = start + range.to - range.from;
+    if (start < 0 || end > text.length) throw new Error("The serialized composer mention occurrence is outside its text.");
+    previousEnd = range.to;
+    return { mentionId: range.mentionId, start, end };
+  });
   return {
     text,
     quotesEncoded: blocks.some((block) => block.kind === "quote"),
-    ...(projectedRanges.length === 0 ? {} : { pastedTextRanges: projectedRanges })
+    ...(projectedRanges.length === 0 ? {} : { pastedTextRanges: projectedRanges }),
+    ...(projectedMentions.length === 0 ? {} : { mentionRanges: projectedMentions })
   };
 }
 

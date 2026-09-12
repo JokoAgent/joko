@@ -216,7 +216,10 @@ test("proto3 optional scalars preserve absent values separately from explicit ze
     [contract.SessionContextStateSchema, "compacting", "compacting", false],
     [contract.MoveSessionProjectMutationSchema, "projectId", "project_id", ""],
     [contract.NativeSessionCatalogEntrySchema, "workingDirectory", "working_directory", ""],
-    [contract.NativeSessionCatalogEntrySchema, "existingSessionId", "existing_session_id", ""]
+    [contract.NativeSessionCatalogEntrySchema, "existingSessionId", "existing_session_id", ""],
+    [contract.QuestionSingleChoiceInputSchema, "allowOther", "allow_other", false],
+    [contract.QuestionMultipleChoiceInputSchema, "allowOther", "allow_other", false],
+    [contract.QuestionMultipleChoiceAnswerSchema, "otherText", "other_text", ""]
   ];
   for (const [schema, property, wireName, explicitZero] of cases) {
     assert.equal(field(schema, wireName).proto.proto3Optional, true);
@@ -241,7 +244,8 @@ test("typed unions retain their exact branch membership", () => {
     [contract.InteractionResolutionSchema, "decision", [
       "permission", "question", "plan_review", "extension_ui", "dismissal"
     ]],
-    [contract.QuestionAnswerSchema, "value", ["text", "choice_id", "choice_ids", "boolean", "sensitive"]],
+    [contract.QuestionAnswerSchema, "value", ["text", "boolean", "single_choice", "multiple_choice"]],
+    [contract.QuestionSingleChoiceAnswerSchema, "selection", ["choice_id", "other_text"]],
     [contract.ExtensionUiResolutionSchema, "result", ["value", "confirmed", "cancelled"]],
     [contract.WatchRemoteHostsResponseSchema, "update", ["snapshot", "change"]],
     [contract.BrowserTakeoverActionMutationSchema, "action", [
@@ -263,16 +267,33 @@ test("typed unions retain their exact branch membership", () => {
   }
 });
 
+test("retired question-answer tags cannot decode as current typed selections", () => {
+  const oldSingleChoice = fromBinary(
+    contract.QuestionAnswerSchema,
+    Uint8Array.from([0x5a, 0x04, 0x66, 0x61, 0x73, 0x74])
+  );
+  const oldMultipleChoice = fromBinary(
+    contract.QuestionAnswerSchema,
+    Uint8Array.from([0x62, 0x05, 0x0a, 0x03, 0x77, 0x65, 0x62])
+  );
+  assert.equal(oldSingleChoice.value.case, undefined);
+  assert.equal(oldMultipleChoice.value.case, undefined);
+});
+
 test("durable and cross-process field numbers remain stable", () => {
   const expected = [
     [contract.InputContentSchema, "quotes_encoded", 2],
     [contract.InputContentSchema, "pasted_text_ranges", 3],
-    [contract.MessageStartedEventSchema, "quotes_encoded", 5],
+    [contract.InputContentSchema, "mention_ranges", 4],
     [contract.MessageStartedEventSchema, "automation_origin", 6],
+    [contract.MessageStartedEventSchema, "user_input_accepted", 11],
+    [contract.EditQueueItemMutationSchema, "text_splices", 5],
     [contract.MessageCompletedEventSchema, "usage", 4],
     [contract.MessageCompletedEventSchema, "generation_duration_ms", 6],
     [contract.MessageCompletedEventSchema, "generation_reliable", 7],
     [contract.MessageCompletedEventSchema, "blocks", 9],
+    [contract.QuestionAnswerSchema, "single_choice", 15],
+    [contract.QuestionAnswerSchema, "multiple_choice", 16],
     [contract.NativeSessionCatalogEntrySchema, "native_session_id", 1],
     [contract.NativeSessionCatalogEntrySchema, "native_reference", 2],
     [contract.NativeSessionCatalogEntrySchema, "working_directory", 4],
@@ -327,6 +348,23 @@ test("auxiliary routing preserves ordered exact routes and independent revisions
   assert.equal(reset.payload.value.expectedRevision.value, 8n);
 });
 
+test("Browser page-open mutations carry one exact presentation target", () => {
+  const target = field(contract.OpenBrowserPageMutationSchema, "presentation_target");
+  assert.equal(target.number, 9);
+  assert.equal(target.enum?.typeName, "joko.v1.BrowserAutomationTarget");
+  const omitted = roundTrip(contract.OpenBrowserPageMutationSchema, {
+    browserProviderId: "browser",
+    sessionId: "session"
+  });
+  assert.equal(omitted.presentationTarget, contract.BrowserAutomationTarget.UNSPECIFIED);
+  const external = roundTrip(contract.OpenBrowserPageMutationSchema, {
+    browserProviderId: "browser",
+    sessionId: "session",
+    presentationTarget: contract.BrowserAutomationTarget.EXTERNAL
+  });
+  assert.equal(external.presentationTarget, contract.BrowserAutomationTarget.EXTERNAL);
+});
+
 test("public enum wire numbers remain stable", () => {
   const cases = [
     [contract.CapabilitySupport, {
@@ -334,6 +372,10 @@ test("public enum wire numbers remain stable", () => {
       DISABLED_BY_POLICY: 5, TEMPORARILY_UNAVAILABLE: 6
     }],
     [contract.QueueDeliveryMode, { PROMPT: 1, STEER: 2, FOLLOW_UP: 3 }],
+    [contract.QueueItemState, {
+      ACCEPTED: 1, DISPATCHING: 2, BACKEND_ACCEPTED: 3, DISPATCH_UNKNOWN: 4,
+      COMPLETED: 5, CANCELLED: 6, FAILED: 7
+    }],
     [contract.PermissionMode, { ASK: 1, AUTO: 2, BYPASS_PERMISSIONS: 3 }],
     [contract.SessionAttentionAcknowledgementIntent, { VIEWED: 1, EXPLICIT: 2 }],
     [contract.ReviewFreshnessState, { CURRENT: 1, STALE: 2, UNAVAILABLE: 3 }],

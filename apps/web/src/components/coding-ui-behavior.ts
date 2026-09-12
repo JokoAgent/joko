@@ -101,7 +101,7 @@ export interface QuestionWizardKeyInput {
 
 export function resolveQuestionWizardKey(
   input: QuestionWizardKeyInput,
-  context: { readonly kind: QuestionFieldView["kind"]; readonly optionCount: number; readonly required: boolean; readonly currentValid: boolean }
+  context: { readonly kind: QuestionFieldView["kind"]; readonly optionCount: number; readonly allowOther: boolean; readonly required: boolean; readonly currentValid: boolean }
 ): QuestionWizardKeyIntent {
   if (input.repeat || input.isComposing || input.metaKey || input.ctrlKey || input.altKey || input.shiftKey) return null;
   if (input.editableTarget) return null;
@@ -109,7 +109,7 @@ export function resolveQuestionWizardKey(
   if ((context.kind === "single" || context.kind === "multiple") && /^[1-9]$/.test(input.key)) {
     const index = Number(input.key) - 1;
     if (index < context.optionCount) return { kind: "choice", index };
-    if (index === context.optionCount) return { kind: "other" };
+    if (context.allowOther && index === context.optionCount) return { kind: "other" };
   }
   if (input.key === "Enter" && context.currentValid) return { kind: "advance" };
   return null;
@@ -144,19 +144,29 @@ function questionDraftKey(sessionId: string, interactionId: string): string {
 }
 
 export function initialQuestionAnswers(fields: readonly QuestionFieldView[]): QuestionAnswerMap {
-  return Object.fromEntries(fields.flatMap((field) => field.defaultValue === undefined ? [] : [[field.id, field.defaultValue]]));
+  return Object.fromEntries(fields.flatMap((field) => {
+    const answer = defaultQuestionAnswer(field);
+    return answer === undefined ? [] : [[field.id, answer]];
+  }));
 }
 
 export function validQuestionAnswer(field: QuestionFieldView, answer: QuestionAnswerDraft | undefined): boolean {
   if (answer === undefined) return !field.required;
-  if (field.kind === "text") return typeof answer === "string" && (!field.required || answer.trim().length > 0);
-  if (field.kind === "boolean") return typeof answer === "boolean";
-  if (field.kind === "single") return typeof answer === "string" && (!field.required || answer.trim().length > 0);
-  if (!Array.isArray(answer) || answer.some((value) => typeof value !== "string" || value.trim().length === 0) || new Set(answer).size !== answer.length) return false;
+  if (field.kind === "text") return answer.kind === "text" && (!field.required || answer.value.trim().length > 0);
+  if (field.kind === "boolean") return answer.kind === "boolean";
+  if (field.kind === "single") {
+    if (answer.kind !== "single") return false;
+    const selection = answer.selection;
+    if (selection.kind === "choice") return field.options.some((option) => option.id === selection.choiceId);
+    return field.allowOther && selection.text.trim().length > 0;
+  }
+  if (answer.kind !== "multiple" || new Set(answer.choiceIds).size !== answer.choiceIds.length) return false;
   const optionIds = new Set(field.options.map((option) => option.id));
-  if (answer.filter((value) => !optionIds.has(value)).length > 1) return false;
+  if (answer.choiceIds.some((value) => !optionIds.has(value))) return false;
+  if (answer.otherText !== undefined && (!field.allowOther || answer.otherText.trim().length === 0)) return false;
   const minimum = Math.max(field.required ? 1 : 0, field.minimumSelections);
-  return answer.length >= minimum && (field.maximumSelections === undefined || answer.length <= field.maximumSelections);
+  const count = answer.choiceIds.length + (answer.otherText === undefined ? 0 : 1);
+  return count >= minimum && (field.maximumSelections === undefined || count <= field.maximumSelections);
 }
 
 /**
@@ -169,30 +179,55 @@ export function hasQuestionAnswer(field: QuestionFieldView, answer: QuestionAnsw
 }
 
 export function questionOtherAnswer(field: QuestionFieldView, answer: QuestionAnswerDraft | undefined): string {
-  const optionIds = new Set(field.options.map((option) => option.id));
-  if (field.kind === "single") return typeof answer === "string" && !optionIds.has(answer) ? answer : "";
-  if (field.kind !== "multiple" || !Array.isArray(answer)) return "";
-  return answer.find((value) => !optionIds.has(value)) ?? "";
+  if (!field.allowOther) return "";
+  if (field.kind === "single") return answer?.kind === "single" && answer.selection.kind === "other" ? answer.selection.text : "";
+  if (field.kind !== "multiple" || answer?.kind !== "multiple") return "";
+  return answer.otherText ?? "";
 }
 
 export function replaceQuestionOtherAnswer(field: QuestionFieldView, answer: QuestionAnswerDraft | undefined, rawText: string): QuestionAnswerDraft {
+  if (!field.allowOther) return answer ?? emptyQuestionAnswer(field);
   const text = rawText.trim();
-  if (field.kind === "single") return text;
-  if (field.kind !== "multiple") return answer ?? "";
-  const optionIds = new Set(field.options.map((option) => option.id));
-  const selected = (Array.isArray(answer) ? answer : []).filter((value) => optionIds.has(value));
-  if (text === "" || (field.maximumSelections !== undefined && selected.length >= field.maximumSelections)) return selected;
-  return [...selected, text];
+  if (field.kind === "single") return { kind: "single", selection: { kind: "other", text } };
+  if (field.kind !== "multiple") return answer ?? emptyQuestionAnswer(field);
+  const choiceIds = answer?.kind === "multiple" ? answer.choiceIds : [];
+  if (text === "" || (field.maximumSelections !== undefined && choiceIds.length >= field.maximumSelections)) {
+    return { kind: "multiple", choiceIds };
+  }
+  return { kind: "multiple", choiceIds, otherText: text };
 }
 
 export function toggleQuestionOptionAnswer(field: QuestionFieldView, answer: QuestionAnswerDraft | undefined, optionId: string): QuestionAnswerDraft {
-  if (field.kind === "single") return optionId;
-  if (field.kind !== "multiple") return answer ?? "";
-  const selected = Array.isArray(answer) ? [...answer] : [];
+  if (field.kind === "single") return { kind: "single", selection: { kind: "choice", choiceId: optionId } };
+  if (field.kind !== "multiple") return answer ?? emptyQuestionAnswer(field);
+  const selected = answer?.kind === "multiple" ? [...answer.choiceIds] : [];
+  const otherText = answer?.kind === "multiple" ? answer.otherText : undefined;
   const index = selected.indexOf(optionId);
-  if (index >= 0) return selected.filter((value) => value !== optionId);
-  if (field.maximumSelections !== undefined && selected.length >= field.maximumSelections) return selected;
-  return [...selected, optionId];
+  if (index >= 0) return { kind: "multiple", choiceIds: selected.filter((value) => value !== optionId), ...(otherText === undefined ? {} : { otherText }) };
+  const count = selected.length + (otherText === undefined ? 0 : 1);
+  if (field.maximumSelections !== undefined && count >= field.maximumSelections) {
+    return { kind: "multiple", choiceIds: selected, ...(otherText === undefined ? {} : { otherText }) };
+  }
+  return { kind: "multiple", choiceIds: [...selected, optionId], ...(otherText === undefined ? {} : { otherText }) };
+}
+
+function defaultQuestionAnswer(field: QuestionFieldView): QuestionAnswerDraft | undefined {
+  const value = field.defaultValue;
+  if (value === undefined) return undefined;
+  if (field.kind === "text" && typeof value === "string") return { kind: "text", value };
+  if (field.kind === "boolean" && typeof value === "boolean") return { kind: "boolean", value };
+  if (field.kind === "single" && typeof value === "string") {
+    return { kind: "single", selection: { kind: "choice", choiceId: value } };
+  }
+  if (field.kind === "multiple" && Array.isArray(value)) return { kind: "multiple", choiceIds: [...value] };
+  return undefined;
+}
+
+function emptyQuestionAnswer(field: QuestionFieldView): QuestionAnswerDraft {
+  if (field.kind === "text") return { kind: "text", value: "" };
+  if (field.kind === "boolean") return { kind: "boolean", value: false };
+  if (field.kind === "multiple") return { kind: "multiple", choiceIds: [] };
+  return { kind: "single", selection: { kind: "other", text: "" } };
 }
 
 export function clampQuestionStep(step: number, fieldCount: number): number {

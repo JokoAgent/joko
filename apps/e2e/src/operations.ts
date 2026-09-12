@@ -191,6 +191,8 @@ export function editQueuedInputMutation(
   lockToken: string
 ): OperationMutation {
   if (item.version?.revision === undefined) throw new Error("Queue item has no entity version.");
+  const currentText = item.input?.parts.flatMap((part) =>
+    part.content.case === "text" ? [part.content.value] : []).join("") ?? "";
   return create(OperationMutationSchema, {
     preconditions: [{
       entity: { kind: EntityKind.QUEUE_ITEM, id: item.queueItemId },
@@ -203,7 +205,8 @@ export function editQueuedInputMutation(
         queueItemId: item.queueItemId,
         input: textInput(text),
         deliveryMode,
-        lockToken
+        lockToken,
+        textSplices: [{ start: 0, end: currentText.length, replacementText: text }]
       })
     }
   });

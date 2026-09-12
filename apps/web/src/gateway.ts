@@ -87,6 +87,10 @@ import {
   WorkspaceFileChangeKind,
   workspaceEntryAbsentRevision,
   InteractionKind,
+  InlineTextRangeSchema,
+  InputContentSchema,
+  InputMentionRangeSchema,
+  InputPartSchema,
   AutomationPermissionState,
   InteractionResolutionSchema,
   InteractionState,
@@ -139,13 +143,13 @@ import {
   ProviderLoginPromptKind,
   PlanStepState,
   PlanReviewDecisionKind,
-  QuestionAnswerHandling,
   QuestionAnswerSchema,
   QueueDeliveryMode,
   QueueDispatchState,
   QueueEdge,
   QueueItemState,
   QueueSourceKind,
+  QueueTextEditSpliceSchema,
   ResourceAcquisitionSourceSchema,
   ResourceCompatibility,
   ResourceCompatibilityIssue,
@@ -259,6 +263,7 @@ import {
   type FilePreview,
   type FileDiff,
   type Interaction,
+  type InputContent,
   type PermissionSubject,
   type ManagedResource,
   type ManagedModelRuntime,
@@ -305,6 +310,7 @@ import {
   type VoiceInputSession as ProtoVoiceInputSession,
   type SettingsSnapshot,
   type RuntimeCommand,
+  type SessionResource,
   type RuntimeToolCatalog,
   type TaskHistoryCleanupResult,
   type TaskHistoryMaintenanceProgress,
@@ -364,6 +370,7 @@ import type {
   ExtensionWidgetView,
   InteractionView,
   InteractionResolutionDraft,
+  QuestionAnswerDraft,
   ModelPriceOverrideView,
   ModelPriceQuoteView,
   ModelView,
@@ -383,12 +390,14 @@ import type {
   ProviderRuntimeView,
   ProviderLoginFlowView,
   ProviderLoginMethodView,
+  QueueItemTextEditView,
   QueueItemView,
   QueueControlView,
   ReviewRunView,
   ResourceView,
   ResourceDraft,
   RuntimeCommandView,
+  SessionResourceView,
   RuntimeProcessUsageSnapshotView,
   RuntimeProcessUsageView,
   RuntimeToolCatalogView,
@@ -411,6 +420,7 @@ import type {
   SessionMessageSearchScopeView,
   SessionStatisticsView,
   SessionView,
+  SessionWorktreeRemovalPreviewView,
   SessionWorktreeView,
   SubagentControlActionView,
   SubagentRunDetailView,
@@ -482,8 +492,10 @@ import type {
   WorktreeSourceView,
   WorkspaceView
 } from "./model.js";
-import { activeComposerMentions, messageMentionWireText } from "./message-reference.js";
-import { normalizeComposerDocument, serializeComposerDocument } from "./composer-quote-document.js";
+import { messageMentionWireText } from "./message-reference.js";
+import { composerDocumentPlainText, normalizeComposerDocument, serializeComposerDocument } from "./composer-quote-document.js";
+import { normalizeComposerInlineMentionRanges } from "./composer-mention-ranges.js";
+import { equalQueueItemTextEdit, queueItemEditProjection } from "./queue-item-edit.js";
 import { formatBrowserCommentsForSend, normalizeBrowserCommentTarget } from "./browser-comment-draft.js";
 import { normalizeResourceDraft } from "./resource-draft.js";
 import { isInsecureLanOrigin, isLoopbackHostname, normalizeOrchestratorOrigin } from "./connection-origin.js";
@@ -546,12 +558,14 @@ export interface PairingOutcome {
   readonly authKey: string;
 }
 
-export interface OrchestratorGateway extends OperationApi {
+export interface OrchestratorGateway extends Omit<OperationApi, "openBrowserPage" | "recoverBrowserPage"> {
   connect(): Promise<void>;
   disconnect(): void;
   pair(origin: string, humanCode: string, deviceName: string): Promise<PairingOutcome>;
   /** Authoritative owner-runtime shutdown fence, sampled only on demand. */
   probeRuntimeActivity(): Promise<boolean>;
+  openBrowserPage(browserId: string, sessionId: string, url: string, presentationTarget: BrowserSettingsView["automationTarget"], recoveryPageId?: string, workspaceHtml?: { readonly workspaceId: string; readonly relativePath: string; readonly expectedRevision: string }): Promise<string>;
+  recoverBrowserPage(browserId: string, sessionId: string, pageId: string, url: string, presentationTarget: BrowserSettingsView["automationTarget"]): Promise<string>;
 }
 
 export interface VisionBridgeUiEffect {
@@ -741,6 +755,88 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       this.#abort === undefined ? undefined : { signal: this.#abort.signal }
     );
     await this.refresh();
+  }
+
+  async readSessionArtifact(sessionId: string, artifactId: string, signal: AbortSignal): Promise<ArtifactView> {
+    if (!sessionId || !artifactId) throw new GatewayError("An Artifact reference requires its original task and object identity.");
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ArtifactService, scope.transport).getArtifact({ artifactId }, { signal: scope.signal }).catch((error: unknown) => {
+      scope.signal.throwIfAborted();
+      if (ConnectError.from(error).code === Code.NotFound) throw new GatewayError("The referenced Artifact is unavailable in its original task.");
+      throw error;
+    });
+    scope.signal.throwIfAborted();
+    const artifact = response.artifact;
+    if (artifact === undefined || artifact.artifactId !== artifactId || artifact.sessionId !== sessionId || !artifact.blob?.blobId
+      || artifact.expiresAt !== undefined && timestampMs(artifact.expiresAt) <= Date.now()) {
+      throw new GatewayError("The referenced Artifact is unavailable in its original task.");
+    }
+    return mapArtifact(artifact);
+  }
+
+  async listSessionArtifacts(sessionId: string, signal?: AbortSignal): Promise<readonly ArtifactView[]> {
+    if (!validResourceIdentityText(sessionId)) throw new GatewayError("An Artifact catalog requires its exact task identity.");
+    const scope = this.captureActionScope(signal);
+    const client = createClient(ArtifactService, scope.transport);
+
+    artifactCatalogAttempts:
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const artifacts: ArtifactView[] = [];
+      const artifactIds = new Set<string>();
+      const consumedTokens = new Set<string>();
+      let pageToken = "";
+      let revision: bigint | undefined;
+      let totalSize: number | undefined;
+      let received = 0;
+      try {
+        for (let pageIndex = 0; pageIndex < MAX_COMPLETE_MESSAGE_SEARCH_PAGES; pageIndex += 1) {
+          scope.signal.throwIfAborted();
+          if (pageToken !== "") {
+            if (consumedTokens.has(pageToken)) throw new GatewayError("Orchestrator returned a cyclic Artifact catalog page token.");
+            consumedTokens.add(pageToken);
+          }
+          const response = await client.listArtifacts(
+            { sessionId, page: { pageSize: 500, pageToken } },
+            { signal: scope.signal }
+          );
+          scope.signal.throwIfAborted();
+          const pageRevision = response.revision?.value;
+          if (pageRevision === undefined) throw new GatewayError("Orchestrator returned an Artifact catalog without its durable revision.");
+          if (revision === undefined) revision = pageRevision;
+          else if (revision !== pageRevision) {
+            if (attempt === 0) continue artifactCatalogAttempts;
+            throw new GatewayError("Artifact catalog changed repeatedly while it was being loaded.");
+          }
+          const page = response.page;
+          const pageTotal = page === undefined ? undefined : exactSafeUnsignedNumber(page.totalSize);
+          if (pageTotal === undefined) throw new GatewayError("Orchestrator returned an invalid Artifact catalog size.");
+          if (totalSize === undefined) totalSize = pageTotal;
+          else if (totalSize !== pageTotal) throw new GatewayError("Orchestrator returned inconsistent Artifact catalog sizes.");
+          if (response.artifacts.length > 500 || received + response.artifacts.length > pageTotal) {
+            throw new GatewayError("Orchestrator returned an invalid Artifact catalog page.");
+          }
+          for (const artifact of response.artifacts) {
+            const mapped = mapSessionArtifactCatalogItem(artifact, sessionId, artifactIds);
+            if (mapped !== undefined) artifacts.push(mapped);
+          }
+          received += response.artifacts.length;
+          const nextPageToken = page?.nextPageToken ?? "";
+          if (nextPageToken === "") {
+            if (received !== pageTotal) throw new GatewayError("Orchestrator returned an incomplete Artifact catalog.");
+            return artifacts;
+          }
+          if (received >= pageTotal || nextPageToken === pageToken || consumedTokens.has(nextPageToken)) {
+            throw new GatewayError("Orchestrator returned an invalid Artifact catalog pagination boundary.");
+          }
+          pageToken = nextPageToken;
+        }
+      } catch (error) {
+        if (attempt === 0 && isRevisionDriftError(error)) continue;
+        throw error;
+      }
+      throw new GatewayError("Artifact catalog exceeded the safe pagination limit.");
+    }
+    throw new GatewayError("Artifact catalog changed repeatedly while it was being loaded.");
   }
 
   async getArtifactStorageStats(protectedSha256: readonly string[] = []): Promise<ArtifactStorageMaintenanceView> {
@@ -1063,8 +1159,22 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       throw new GatewayError("Page annotations contain an invalid screenshot set.");
     }
     const parts: Array<Record<string, unknown>> = [];
-    const serialized = serializeComposerDocument(normalizeComposerDocument(draft.editorDocument, draft.text));
-    const text = formatBrowserCommentsForSend(browserComments, serialized.text);
+    const document = normalizeComposerDocument(draft.editorDocument, draft.text);
+    const mentions = [...draft.mentions];
+    if (mentions.some((mention) => mention.kind === "workspace" && !mention.workspaceId)) throw new GatewayError("A workspace mention requires its original workspace identity.");
+    const occurrences = normalizeComposerInlineMentionRanges(draft.inlineMentionRanges, composerDocumentPlainText(document), mentions);
+    if (occurrences === undefined) throw new GatewayError("The task input has invalid mention occurrences.");
+    const serialized = serializeComposerDocument(document, occurrences);
+    const { text, bodyStart } = formatBrowserCommentsForSend(browserComments, serialized.text);
+    const typedMentions = mentions.filter((mention) => mention.kind !== "message");
+    const mentionIndices = new Map(typedMentions.map((mention, index) => [mention.id, index]));
+    const mentionRanges = (serialized.mentionRanges ?? []).map((range) => ({
+      start: bodyStart + range.start, end: bodyStart + range.end, mentionIndex: mentionIndices.get(range.mentionId)!
+    }));
+    if (mentionRanges.some((range) => !utf16Boundary(text, range.start) || !utf16Boundary(text, range.end)
+      || serialized.pastedTextRanges?.some((pasted) => range.start < bodyStart + pasted.end && bodyStart + pasted.start < range.end))) {
+      throw new GatewayError("The task input mention occurrence overlaps a structured text atom.");
+    }
     if (text.length > 0) parts.push({ content: { case: "text", value: text } });
     for (const attachment of draft.attachments) {
       const blob = await this.uploadAttachment(attachment.file, scope);
@@ -1073,7 +1183,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         ? { content: { case: "image", value: { blob, altText: attachment.file.name } } }
         : { content: { case: "file", value: blob } });
     }
-    for (const mention of activeComposerMentions(draft.text, draft.mentions)) {
+    for (const mention of mentions) {
       if (mention.kind === "message") {
         parts.push({ content: { case: "text", value: messageMentionWireText(mention, window.location.href) } });
       } else if (mention.kind === "workspace") {
@@ -1082,8 +1192,31 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           directory: mention.directory === true,
           ...(mention.lineRange === undefined ? {} : { lineRange: mention.lineRange })
         } } });
+      } else if (mention.kind === "artifact") {
+        parts.push({ content: { case: "artifactMention", value: { artifactId: mention.reference, displayText: mention.label } } });
+      } else if (mention.kind === "session") {
+        if (!validSessionMentionId(mention.reference)) {
+          throw new GatewayError("A task mention requires its exact task identity.");
+        }
+        parts.push({ content: { case: "sessionMention", value: { sessionId: mention.reference, displayText: mention.label } } });
       } else {
-        parts.push({ content: { case: "resourceMention", value: { resourceId: mention.reference, displayText: mention.label } } });
+        if (!validResourceIdentityText(mention.reference)
+          || !validResourceIdentityText(mention.discoveredRevision)
+          || !validResourceVersionText(mention.resourceVersion)
+          || !Number.isSafeInteger(mention.runtimeGeneration) || mention.runtimeGeneration < 1) {
+          throw new GatewayError("A resource mention requires an exact runtime identity.");
+        }
+        const resourceVersion = BigInt(mention.resourceVersion);
+        if (resourceVersion > 18_446_744_073_709_551_615n) {
+          throw new GatewayError("A resource mention version exceeds the supported range.");
+        }
+        parts.push({ content: { case: "resourceMention", value: {
+          resourceId: mention.reference,
+          displayText: mention.label,
+          discoveredRevision: mention.discoveredRevision,
+          resourceVersion,
+          runtimeGeneration: BigInt(mention.runtimeGeneration)
+        } } });
       }
     }
     for (const item of browserComments) {
@@ -1100,10 +1233,11 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           parts,
           quotesEncoded: serialized.quotesEncoded,
           pastedTextRanges: serialized.pastedTextRanges?.map((range) => ({
-            start: range.start,
-            end: range.end,
+            start: bodyStart + range.start,
+            end: bodyStart + range.end,
             display: range.display
-          })) ?? []
+          })) ?? [],
+          mentionRanges
         },
         deliveryMode: deliveryMode(draft.deliveryMode),
         ...(draft.extraDirectoryIds === undefined
@@ -1351,8 +1485,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     await this.submit({ case: "archiveTarget", value: { targetId, archived } }, true);
   }
 
-  async deleteTarget(targetId: string, deleteManagedWorkspace: boolean, deleteProductSessions: boolean): Promise<void> {
-    await this.submit({ case: "deleteTarget", value: { targetId, deleteManagedWorkspace, deleteProductSessions } }, true);
+  async deleteTarget(targetId: string, deleteManagedWorkspace: boolean): Promise<void> {
+    await this.submit({ case: "deleteTarget", value: { targetId, deleteManagedWorkspace } }, true);
   }
 
   async setWorkspaceTrust(workspaceId: string, trusted: boolean): Promise<void> {
@@ -1562,6 +1696,23 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       pageToken = nextPageToken;
     }
     throw new GatewayError("Worktree source discovery exceeded the safe pagination limit.");
+  }
+
+  async getSessionWorktreeRemovalPreview(
+    sessionId: string,
+    signal?: AbortSignal
+  ): Promise<SessionWorktreeRemovalPreviewView> {
+    const scope = this.captureActionScope(signal);
+    const client = createClient(WorktreeService, scope.transport);
+    const response = await client.getSessionWorktreeRemovalPreview(
+      { sessionId },
+      { signal: scope.signal }
+    );
+    scope.signal.throwIfAborted();
+    if (response.sessionId !== sessionId || (!response.hasWorktree && response.dirty)) {
+      throw new GatewayError("Orchestrator returned an invalid Worktree removal preview.");
+    }
+    return { hasWorktree: response.hasWorktree, dirty: response.dirty };
   }
 
   async exportSession(sessionId: string, context: ArtifactDownloadContext): Promise<ArtifactDownloadOutcome> {
@@ -1858,7 +2009,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const scope = this.captureActionScope();
     const raw = this.#rawSnapshot?.interactions.find((candidate) => candidate.interactionId === interaction.id);
     if (raw === undefined) throw new GatewayError("This interaction is no longer pending.");
-    const decision = await interactionDecision(raw, resolution, (secret) => this.uploadCredential(secret, CredentialKind.UNSPECIFIED, "", scope));
+    const decision = await interactionDecision(raw, resolution);
     scope.signal.throwIfAborted();
     await this.submit({
       case: "resolveInteraction",
@@ -2055,19 +2206,25 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     );
   }
 
-  async editQueueItem(queueItemId: string, text: string, mode: ComposerDraft["deliveryMode"], lockToken: string): Promise<void> {
+  async editQueueItem(queueItemId: string, edit: QueueItemTextEditView, mode: ComposerDraft["deliveryMode"], lockToken: string): Promise<void> {
     const existing = this.#rawSnapshot?.queueItems.find((item) => item.queueItemId === queueItemId);
     if (existing === undefined) throw new GatewayError("This queued input is no longer available.");
-    const retained = (existing.input?.parts ?? []).filter((part) => part.content.case !== "text");
-    const normalized = text.trim();
-    if (normalized.length === 0 && retained.length === 0) throw new GatewayError("Queued input cannot be empty.");
+    const originalInput = requiredQueueInput(existing);
+    const original = mapQueueItem(existing);
+    const editorSource = queueItemEditProjection(original);
+    const sameEdit = equalQueueItemTextEdit(edit, editorSource);
+    if (sameEdit && mode === original.mode) return;
+    const input = sameEdit
+      ? originalInput
+      : editedQueueInput(originalInput, edit);
     await this.submit({
       case: "editQueueItem",
       value: {
         queueItemId,
-        input: { parts: [...(normalized.length === 0 ? [] : [{ content: { case: "text" as const, value: normalized } }]), ...retained] },
+        input,
         deliveryMode: deliveryMode(mode),
-        lockToken
+        lockToken,
+        textSplices: sameEdit ? [] : edit.textSplices.map((splice) => create(QueueTextEditSpliceSchema, splice))
       }
     }, true, [queueItemPrecondition(existing)]);
   }
@@ -2088,8 +2245,18 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     );
   }
 
-  async steerQueueItemNow(queueItemId: string, text: string, lockToken: string): Promise<void> {
-    await this.editQueueItem(queueItemId, text, "steer", lockToken);
+  async steerQueueItemNow(queueItemId: string, lockToken: string): Promise<void> {
+    const existing = this.#rawSnapshot?.queueItems.find((item) => item.queueItemId === queueItemId);
+    if (existing === undefined) throw new GatewayError("This queued input is no longer available.");
+    await this.submit({
+      case: "editQueueItem",
+      value: {
+        queueItemId,
+        input: requiredQueueInput(existing),
+        deliveryMode: QueueDeliveryMode.STEER,
+        lockToken
+      }
+    }, true, [queueItemPrecondition(existing)]);
   }
 
   async pauseQueue(sessionId: string, reason = "Paused by user"): Promise<void> {
@@ -2116,7 +2283,17 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     await this.submit({ case: "restartBrowser", value: { browserProviderId: browserId } });
   }
 
-  async openBrowserPage(browserId: string, sessionId: string, url: string, recoveryPageId = "", workspaceHtml?: { readonly workspaceId: string; readonly relativePath: string; readonly expectedRevision: string }): Promise<string> {
+  async openBrowserPage(
+    browserId: string,
+    sessionId: string,
+    url: string,
+    presentationTarget: BrowserSettingsView["automationTarget"],
+    recoveryPageId = "",
+    workspaceHtml?: { readonly workspaceId: string; readonly relativePath: string; readonly expectedRevision: string }
+  ): Promise<string> {
+    if (presentationTarget !== "sidebar" && presentationTarget !== "external") {
+      throw new GatewayError("A Browser presentation target is required.");
+    }
     if (workspaceHtml !== undefined && (url !== "" || recoveryPageId !== "" || workspaceHtml.expectedRevision === "")) {
       throw new GatewayError("HTML page opens require an exact file revision without a URL or recovery page.");
     }
@@ -2139,6 +2316,9 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         sessionId,
         url: workspaceHtml === undefined ? durableBrowserTakeoverUrl(url) : "",
         expectedGeneration: browser.generation,
+        presentationTarget: presentationTarget === "sidebar"
+          ? BrowserAutomationTarget.SIDEBAR
+          : BrowserAutomationTarget.EXTERNAL,
         currentPageId: takeover?.pageId ?? "",
         takeoverId: takeover?.takeoverId ?? "",
         recoveryPageId,
@@ -2152,9 +2332,15 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return payload.value.pageId;
   }
 
-  async recoverBrowserPage(browserId: string, sessionId: string, pageId: string, url: string): Promise<string> {
+  async recoverBrowserPage(
+    browserId: string,
+    sessionId: string,
+    pageId: string,
+    url: string,
+    presentationTarget: BrowserSettingsView["automationTarget"]
+  ): Promise<string> {
     if (pageId.trim().length === 0) throw new GatewayError("A recoverable Browser page ID is required.");
-    return this.openBrowserPage(browserId, sessionId, url, pageId);
+    return this.openBrowserPage(browserId, sessionId, url, presentationTarget, pageId);
   }
 
   async focusBrowserPage(browserId: string, pageId: string): Promise<string> {
@@ -2418,6 +2604,16 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const client = createClient(SessionService, this.requireTransport());
     const response = await client.listRuntimeCommands({ sessionId }, this.#abort === undefined ? undefined : { signal: this.#abort.signal });
     return response.commands.map(mapRuntimeCommand);
+  }
+
+  async listSessionResources(sessionId: string, signal?: AbortSignal): Promise<readonly SessionResourceView[]> {
+    const client = createClient(SessionService, this.requireTransport());
+    const requestSignal = combinedAbortSignal(signal, this.#abort?.signal);
+    const response = await client.listSessionResources(
+      { sessionId },
+      requestSignal === undefined ? undefined : { signal: requestSignal }
+    );
+    return response.resources.map((resource) => mapSessionResource(resource, sessionId));
   }
 
   async listRuntimeProcesses(backendId: string, signal?: AbortSignal): Promise<RuntimeProcessUsageSnapshotView> {
@@ -2754,7 +2950,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         } catch (error) {
           throwIfAborted(signal);
           if (this.#transport !== transport) throw abortedGatewayRequest();
-          if (!isMessageSearchRevisionDriftError(error)) throw error;
+          if (!isRevisionDriftError(error)) throw error;
           if (attempt === 0) continue searchAttempts;
           throw new GatewayError(
             "Message-search results changed while pages were loading after retrying from the first page.",
@@ -3762,7 +3958,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     scope.signal.throwIfAborted();
     const response = await createClient(SshKeyService, scope.transport).beginSshKeyPassphraseUpload({ purpose, ...key }, { signal: scope.signal });
     scope.signal.throwIfAborted();
-    return this.uploadSensitiveTicket(secret, response.ticket, scope);
+    return this.uploadCredentialTicket(secret, response.ticket, scope);
   }
 
   async listRemoteHosts(targetId: string, signal?: AbortSignal): Promise<readonly RemoteHostView[]> {
@@ -4007,9 +4203,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           ...(patch.allowUploads === undefined ? {} : { allowUploads: patch.allowUploads }),
           ...(patch.allowDownloads === undefined ? {} : { allowDownloads: patch.allowDownloads }),
           ...(patch.automationTarget === undefined ? {} : {
-            automationTarget: patch.automationTarget === "sidebar"
-              ? BrowserAutomationTarget.SIDEBAR
-              : BrowserAutomationTarget.EXTERNAL
+            automationTarget: protoBrowserAutomationTarget(patch.automationTarget)
           })
         }
       }
@@ -4802,18 +4996,18 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       })
     }, { signal: scope.signal });
     scope.signal.throwIfAborted();
-    return this.uploadSensitiveTicket(secret, response.ticket, scope);
+    return this.uploadCredentialTicket(secret, response.ticket, scope);
   }
 
-  private async uploadSensitiveTicket(secret: string, ticket: CredentialUploadTicket | undefined, scope: GatewayActionScope): Promise<string> {
+  private async uploadCredentialTicket(secret: string, ticket: CredentialUploadTicket | undefined, scope: GatewayActionScope): Promise<string> {
     scope.signal.throwIfAborted();
     if (ticket === undefined || ticket.ticketId.length === 0 || ticket.relativeEndpoint.length === 0) {
-      throw new GatewayError("Orchestrator has no credential channel available for this sensitive answer.");
+      throw new GatewayError("Orchestrator has no credential channel available for this credential input.");
     }
     const bytes = new TextEncoder().encode(secret);
     try {
       if (ticket.maximumBytes > 0n && BigInt(bytes.byteLength) > ticket.maximumBytes) {
-        throw new GatewayError("The sensitive answer exceeds the credential channel limit.");
+        throw new GatewayError("The credential input exceeds the credential channel limit.");
       }
       scope.signal.throwIfAborted();
       const upload = await fetch(this.authorizedEndpoint(ticket.relativeEndpoint), {
@@ -4826,7 +5020,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         signal: scope.signal
       });
       scope.signal.throwIfAborted();
-      if (!upload.ok) throw new GatewayError(`Sensitive answer upload failed (${upload.status}).`);
+      if (!upload.ok) throw new GatewayError(`Credential input upload failed (${upload.status}).`);
       return ticket.ticketId;
     } finally {
       bytes.fill(0);
@@ -5592,9 +5786,15 @@ function projectTimelineEvent(
       const existing = items.find((item) => item.id === kind.value.messageId);
       const userInput = kind.value.role === 1 ? kind.value.userInput : undefined;
       const userText = kind.value.role === 1 ? messageInputText(userInput) : undefined;
+      const userInputAccepted = kind.value.role === 1 && kind.value.userInputAccepted === true;
+      const inputMentions = messageInputMentions(userInput);
+      if (!userInputAccepted && (inputMentions.length > 0 || userInput?.mentionRanges.length || userInput?.pastedTextRanges.length || userInput?.quotesEncoded)) {
+        throw new GatewayError("Orchestrator returned structured user input without an accepted receipt.");
+      }
       const pastedTextRanges = userText === undefined
         ? []
         : messageInputPastedTextRanges(userInput, userText);
+      const mentionRanges = messageInputMentionRanges(userInput, userText ?? "", inputMentions.length, pastedTextRanges);
       const rawAutomationOrigin = kind.value.automationOrigin;
       const automationOrigin = rawAutomationOrigin !== undefined && rawAutomationOrigin.scheduleId.trim().length > 0
         ? {
@@ -5616,7 +5816,10 @@ function projectTimelineEvent(
         createdAt: existing?.createdAt ?? createdAt,
         text: kind.value.role === 1 ? userText : existing?.text ?? "",
         ...(kind.value.role === 1 ? { attachments: inputAttachments(userInput) } : {}),
-        ...(kind.value.role === 1 && kind.value.quotesEncoded === true ? { quotesEncoded: true } : {}),
+        ...(userInputAccepted ? { userInputAccepted: true } : {}),
+        ...(userInputAccepted && inputMentions.length > 0 ? { inputMentions } : {}),
+        ...(userInputAccepted && mentionRanges.length > 0 ? { mentionRanges } : {}),
+        ...(userInputAccepted && userInput?.quotesEncoded === true ? { quotesEncoded: true } : {}),
         ...(kind.value.role === 1 && pastedTextRanges.length > 0 ? { pastedTextRanges } : {}),
         ...(kind.value.role === 1 && automationOrigin !== undefined ? { automationOrigin } : {}),
         ...(kind.value.role === 1 && inputDelivery !== undefined ? { inputDelivery } : {}),
@@ -5700,7 +5903,7 @@ function projectTimelineEvent(
             streaming: false,
             sourceEventId: event.eventId,
             ...timelineNativeMessageIdentity(event, item),
-            ...(kind.value.blocks.length === 0 ? {} : { text: finalText, attachments })
+            ...(item.userInputAccepted === true || kind.value.blocks.length === 0 ? {} : { text: finalText, attachments })
           };
           found = true;
         }
@@ -7950,6 +8153,11 @@ function mapProviderAccountUsageWindow(
 
 function mapQueueItem(item: QueueItem): QueueItemView {
   const version = queueItemVersion(item);
+  const text = messageInputText(item.input);
+  const inputMentions = messageInputMentions(item.input);
+  const pastedTextRanges = messageInputPastedTextRanges(item.input, text);
+  const mentionRanges = messageInputMentionRanges(item.input, text, inputMentions.length, pastedTextRanges);
+  const attachments = messageInputAttachments(item.input);
   return {
     id: item.queueItemId,
     sessionId: item.sessionId,
@@ -7957,7 +8165,12 @@ function mapQueueItem(item: QueueItem): QueueItemView {
     generation: version.generation,
     source: queueSource(item.sourceKind),
     mode: uiDeliveryMode(item.deliveryMode),
-    text: inputText(item.input),
+    text,
+    ...(item.input?.quotesEncoded === true ? { quotesEncoded: true } : {}),
+    ...(pastedTextRanges.length === 0 ? {} : { pastedTextRanges }),
+    ...(inputMentions.length === 0 ? {} : { inputMentions }),
+    ...(mentionRanges.length === 0 ? {} : { mentionRanges }),
+    ...(attachments.length === 0 ? {} : { attachments }),
     state: queueState(item.state),
     editLocked: item.editLocked,
     ordinal: numberValue(item.ordinal),
@@ -8043,6 +8256,7 @@ export function mapInteraction(interaction: Interaction): InteractionView {
     };
   }
   if (request.case === "question") {
+    validateQuestionRequestDeclaration(request.value.fields);
     return {
       ...base,
       kind: "question",
@@ -8121,10 +8335,20 @@ function mapTimelineInteraction(interaction: Interaction): NonNullable<TimelineI
 function timelineQuestionAnswer(field: QuestionField, answer: QuestionAnswer | undefined): NonNullable<NonNullable<TimelineItemView["interaction"]>["questions"][number]["answer"]> | undefined {
   switch (answer?.value.case) {
     case "text": return { kind: "text", values: answer.value.value.trim() === "" ? [] : [answer.value.value] };
-    case "choiceId": return { kind: "text", values: [questionChoiceLabel(field, answer.value.value)] };
-    case "choiceIds": return { kind: "text", values: answer.value.value.values.map((value) => questionChoiceLabel(field, value)) };
+    case "singleChoice": {
+      const selection = answer.value.value.selection;
+      if (selection.case === "choiceId") return { kind: "text", values: [questionChoiceLabel(field, selection.value)] };
+      if (selection.case === "otherText") return { kind: "text", values: [selection.value] };
+      return undefined;
+    }
+    case "multipleChoice": return {
+      kind: "text",
+      values: [
+        ...answer.value.value.choiceIds.map((value) => questionChoiceLabel(field, value)),
+        ...(answer.value.value.otherText === undefined ? [] : [answer.value.value.otherText])
+      ]
+    };
     case "boolean": return { kind: "boolean", value: answer.value.value };
-    case "sensitive": return { kind: "sensitive" };
     default: return undefined;
   }
 }
@@ -8246,30 +8470,40 @@ function mapQuestionField(field: QuestionField): InteractionView["fields"][numbe
     required: field.required,
     options: [],
     multiline: false,
-    sensitive: false,
-    minimumSelections: 0
+    minimumSelections: 0,
+    allowOther: false
   };
-  if (input.case === "singleChoice") return {
-    ...base,
-    kind: "single",
-    options: input.value.choices.map(mapQuestionChoice),
-    ...(input.value.defaultChoiceId.length > 0 ? { defaultValue: input.value.defaultChoiceId } : {})
-  };
-  if (input.case === "multipleChoice") return {
-    ...base,
-    kind: "multiple",
-    options: input.value.choices.map(mapQuestionChoice),
-    defaultValue: [...input.value.defaultChoiceIds],
-    minimumSelections: input.value.minimumSelections,
-    ...(input.value.maximumSelections > 0 ? { maximumSelections: input.value.maximumSelections } : {})
-  };
+  if (input.case === "singleChoice") {
+    if (input.value.allowOther === undefined) throw new GatewayError("Question choice fields require explicit free-text authority.");
+    return {
+      ...base,
+      kind: "single",
+      options: input.value.choices.map(mapQuestionChoice),
+      allowOther: input.value.allowOther,
+      ...(input.value.defaultChoiceId.length > 0 ? { defaultValue: input.value.defaultChoiceId } : {})
+    };
+  }
+  if (input.case === "multipleChoice") {
+    if (input.value.allowOther === undefined) throw new GatewayError("Question choice fields require explicit free-text authority.");
+    return {
+      ...base,
+      kind: "multiple",
+      options: input.value.choices.map(mapQuestionChoice),
+      defaultValue: [...input.value.defaultChoiceIds],
+      minimumSelections: input.value.minimumSelections,
+      allowOther: input.value.allowOther,
+      ...(input.value.maximumSelections > 0 ? { maximumSelections: input.value.maximumSelections } : {})
+    };
+  }
   if (input.case === "boolean") return { ...base, kind: "boolean", defaultValue: input.value.defaultValue };
-  return {
+  if (input.case === "text") return {
     ...base,
     kind: "text",
-    ...(input.case === "text" && input.value.placeholder.length > 0 ? { placeholder: input.value.placeholder } : {}),
-    ...(input.case === "text" ? { defaultValue: input.value.defaultValue, multiline: input.value.multiline, sensitive: input.value.answerHandling === QuestionAnswerHandling.CREDENTIAL_CHANNEL } : {})
+    ...(input.value.placeholder.length > 0 ? { placeholder: input.value.placeholder } : {}),
+    defaultValue: input.value.defaultValue,
+    multiline: input.value.multiline
   };
+  throw new GatewayError("This question has a field without a current input type.");
 }
 
 function mapQuestionChoice(choice: QuestionChoice): InteractionView["options"][number] {
@@ -9358,7 +9592,7 @@ function mapSettings(settings: SettingsSnapshot | undefined): SettingsView {
       takeoverTimeoutSeconds: durationSeconds(browser.takeoverTimeout),
       allowUploads: browser.allowUploads,
       allowDownloads: browser.allowDownloads,
-      automationTarget: browser.automationTarget === BrowserAutomationTarget.SIDEBAR ? "sidebar" : "external",
+      automationTarget: browserAutomationTarget(browser.automationTarget),
       support: automationCapabilitySupport(browser.support),
       supportReason: browser.supportReason,
       detectedBrowser: browser.detectedBrowser
@@ -10130,7 +10364,7 @@ function abortedGatewayRequest(): DOMException {
   return new DOMException("The Orchestrator connection changed while the request was running.", "AbortError");
 }
 
-function isMessageSearchRevisionDriftError(error: unknown): boolean {
+function isRevisionDriftError(error: unknown): boolean {
   let candidate: unknown = error;
   const seen = new Set<unknown>();
   while (candidate instanceof Error && !seen.has(candidate)) {
@@ -10350,17 +10584,61 @@ function mapToolItem(
 }
 
 function mapArtifact(artifact: Artifact): ArtifactView {
+  const blob = artifact.blob;
+  if (blob === undefined || blob.blobId === "") throw new GatewayError("Orchestrator returned an Artifact without its Blob identity.");
   return {
     id: artifact.artifactId,
-    blobId: artifact.blob?.blobId ?? artifact.artifactId,
+    blobId: blob.blobId,
     title: artifact.title,
     ...(artifact.audioMetadata === undefined ? {} : { audioMetadata: mapAudioMetadata(artifact.audioMetadata) }),
     ...(artifact.description === "" ? {} : { description: artifact.description }),
     kind: artifactKind(artifact.kind),
-    fileName: artifact.blob?.fileName ?? "artifact",
-    mediaType: artifact.blob?.mediaType ?? "application/octet-stream",
-    byteSize: numberValue(artifact.blob?.byteSize)
+    fileName: blob.fileName || "artifact",
+    mediaType: blob.mediaType || "application/octet-stream",
+    byteSize: numberValue(blob.byteSize)
   };
+}
+
+function mapSessionArtifactCatalogItem(
+  artifact: Artifact,
+  expectedSessionId: string,
+  seenArtifactIds: Set<string>
+): ArtifactView | undefined {
+  const blob = artifact.blob;
+  const byteSize = blob === undefined ? undefined : exactSafeUnsignedNumber(blob.byteSize);
+  const createdAt = artifact.createdAt === undefined ? undefined : timestampMs(artifact.createdAt);
+  const expiresAt = artifact.expiresAt === undefined ? undefined : timestampMs(artifact.expiresAt);
+  if (
+    !validResourceIdentityText(artifact.artifactId)
+    || artifact.sessionId !== expectedSessionId
+    || seenArtifactIds.has(artifact.artifactId)
+    || blob === undefined
+    || !validResourceIdentityText(blob.blobId)
+    || !/^[a-f0-9]{64}$/u.test(blob.sha256Hex)
+    || byteSize === undefined
+    || blob.mediaType.trim() === ""
+    || createdAt === undefined
+    || !Number.isSafeInteger(createdAt)
+    || createdAt < 0
+    || expiresAt !== undefined && (!Number.isSafeInteger(expiresAt) || expiresAt < 0)
+    || !artifactCatalogKind(artifact.kind)
+  ) throw new GatewayError("Orchestrator returned an invalid Artifact catalog identity.");
+  seenArtifactIds.add(artifact.artifactId);
+  if (expiresAt !== undefined && expiresAt <= Date.now()) return undefined;
+  const mapped = mapArtifact(artifact);
+  if ((mapped.title || mapped.fileName).trim() === "") {
+    throw new GatewayError("Orchestrator returned an Artifact catalog item without a display name.");
+  }
+  return mapped;
+}
+
+function artifactCatalogKind(value: ArtifactKind): boolean {
+  return value === ArtifactKind.FILE
+    || value === ArtifactKind.IMAGE
+    || value === ArtifactKind.EXPORT
+    || value === ArtifactKind.TOOL_RESULT
+    || value === ArtifactKind.DIAGNOSTICS
+    || value === ArtifactKind.DIFF;
 }
 
 function mapAudioMetadata(audio: AudioArtifactMetadata): NonNullable<ArtifactView["audioMetadata"]> {
@@ -10411,56 +10689,261 @@ function recoveryActionKind(kind: RecoveryActionKind): ErrorView["recovery"][num
 
 async function interactionDecision(
   raw: Interaction,
-  resolution: InteractionResolutionDraft,
-  uploadSensitive: (secret: string) => Promise<string>
+  resolution: InteractionResolutionDraft
 ): Promise<NonNullable<MessageInitShape<typeof InteractionResolutionSchema>["decision"]>> {
   if (raw.request.case === "permission") {
     if (resolution.kind !== "permission") throw new GatewayError("This permission response is no longer valid.");
-    const parsed = Number(resolution.decisionId);
-    return { case: "permission", value: { decision: Number.isFinite(parsed) ? parsed : PermissionDecisionKind.DENY_ONCE } };
+    const decision = advertisedInteractionDecision(
+      resolution.decisionId,
+      CURRENT_PERMISSION_DECISIONS,
+      raw.request.value.allowedDecisions,
+      "permission"
+    );
+    return { case: "permission", value: { decision } };
   }
   if (raw.request.case === "planReview") {
     if (resolution.kind !== "plan") throw new GatewayError("This plan response is no longer valid.");
-    const parsed = Number(resolution.decisionId);
-    return { case: "planReview", value: { decision: Number.isFinite(parsed) ? parsed : PlanReviewDecisionKind.STAY_IN_PLAN_MODE, feedback: resolution.feedback } };
+    if (typeof resolution.feedback !== "string") throw new GatewayError("Plan review feedback must be text.");
+    const decision = advertisedInteractionDecision(
+      resolution.decisionId,
+      CURRENT_PLAN_REVIEW_DECISIONS,
+      raw.request.value.allowedDecisions,
+      "plan review"
+    );
+    return { case: "planReview", value: { decision, feedback: resolution.feedback } };
   }
   if (raw.request.case === "extensionUi") {
     if (resolution.kind !== "extension") throw new GatewayError("This extension response is no longer valid.");
-    return { case: "extensionUi", value: { result: typeof resolution.value === "boolean" ? { case: "confirmed", value: resolution.value } : { case: "value", value: resolution.value } } };
+    const request = raw.request.value.request;
+    if (request.case === "confirm") {
+      if (typeof resolution.value !== "boolean") throw new GatewayError("This extension confirmation requires a yes or no response.");
+      return { case: "extensionUi", value: { result: { case: "confirmed", value: resolution.value } } };
+    }
+    if (request.case === "select") {
+      if (typeof resolution.value !== "string" || !request.value.options.includes(resolution.value)) {
+        throw new GatewayError("This extension selection is not one of the currently advertised options.");
+      }
+      return { case: "extensionUi", value: { result: { case: "value", value: resolution.value } } };
+    }
+    if (request.case === "input" || request.case === "editor") {
+      if (typeof resolution.value !== "string") throw new GatewayError("This extension input requires text.");
+      return { case: "extensionUi", value: { result: { case: "value", value: resolution.value } } };
+    }
+    throw new GatewayError("This extension request has no current response type.");
   }
   if (raw.request.case === "question") {
     if (resolution.kind !== "question") throw new GatewayError("These question answers are no longer valid.");
-    const answers: Array<MessageInitShape<typeof QuestionAnswerSchema>> = [];
-    for (const field of raw.request.value.fields) {
-      const answer = resolution.answers[field.fieldId];
-      if (answer === undefined) {
-        if (field.required) throw new GatewayError(`${field.label || field.fieldId} is required.`);
-        continue;
-      }
-      let value: NonNullable<MessageInitShape<typeof QuestionAnswerSchema>["value"]>;
-      if (field.input.case === "boolean") {
-        if (typeof answer !== "boolean") throw new GatewayError(`${field.label || field.fieldId} requires a yes or no answer.`);
-        value = { case: "boolean", value: answer };
-      } else if (field.input.case === "singleChoice") {
-        if (typeof answer !== "string") throw new GatewayError(`${field.label || field.fieldId} requires one choice.`);
-        value = { case: "choiceId", value: answer };
-      } else if (field.input.case === "multipleChoice") {
-        if (!Array.isArray(answer)) throw new GatewayError(`${field.label || field.fieldId} requires a list of choices.`);
-        value = { case: "choiceIds", value: { values: [...answer] } };
-      } else {
-        if (typeof answer !== "string") throw new GatewayError(`${field.label || field.fieldId} requires text.`);
-        if (field.input.case === "text" && field.input.value.answerHandling === QuestionAnswerHandling.CREDENTIAL_CHANNEL) {
-          if (answer.length === 0 && !field.required) continue;
-          value = { case: "sensitive", value: { credentialUploadTicketId: await uploadSensitive(answer) } };
-        } else {
-          value = { case: "text", value: answer };
-        }
-      }
-      answers.push({ fieldId: field.fieldId, value });
-    }
-    return { case: "question", value: { answers } };
+    return { case: "question", value: { answers: exactQuestionAnswers(raw.request.value.fields, resolution.answers) } };
   }
-  return { case: "dismissal", value: { reason: "Unsupported interaction" } };
+  throw new GatewayError("This interaction has no current response type.");
+}
+
+const CURRENT_PERMISSION_DECISIONS: ReadonlySet<number> = new Set([
+  PermissionDecisionKind.ALLOW_ONCE,
+  PermissionDecisionKind.ALLOW_FOR_TURN,
+  PermissionDecisionKind.ALLOW_FOR_SESSION,
+  PermissionDecisionKind.DENY_ONCE,
+  PermissionDecisionKind.DENY_FOR_SESSION,
+  PermissionDecisionKind.ABORT_RUN
+]);
+
+const CURRENT_PLAN_REVIEW_DECISIONS: ReadonlySet<number> = new Set([
+  PlanReviewDecisionKind.EXECUTE,
+  PlanReviewDecisionKind.STAY_IN_PLAN_MODE,
+  PlanReviewDecisionKind.REFINE
+]);
+
+function advertisedInteractionDecision(
+  decisionId: string,
+  current: ReadonlySet<number>,
+  advertised: readonly number[],
+  label: string
+): number {
+  if (typeof decisionId !== "string" || !/^[1-9][0-9]*$/u.test(decisionId)) {
+    throw new GatewayError(`This ${label} response is not a current decision.`);
+  }
+  const decision = Number(decisionId);
+  if (!Number.isSafeInteger(decision) || String(decision) !== decisionId
+    || !current.has(decision) || !advertised.includes(decision)) {
+    throw new GatewayError(`This ${label} response is not one of the currently advertised decisions.`);
+  }
+  return decision;
+}
+
+function exactQuestionAnswers(
+  rawFields: readonly QuestionField[],
+  draft: Readonly<Record<string, QuestionAnswerDraft>>
+): Array<MessageInitShape<typeof QuestionAnswerSchema>> {
+  if (!questionAnswerRecord(draft)) throw new GatewayError("Question answers must be a typed field map.");
+  validateQuestionRequestDeclaration(rawFields);
+  const fields = new Map<string, QuestionField>();
+  for (const field of rawFields) {
+    fields.set(field.fieldId, field);
+  }
+
+  const submitted = new Map<string, unknown>();
+  for (const property of Reflect.ownKeys(draft)) {
+    if (typeof property !== "string") throw new GatewayError("Question answers contain an undeclared field.");
+    const field = fields.get(property);
+    if (field === undefined) throw new GatewayError("Question answers contain an undeclared field.");
+    submitted.set(property, draft[property]);
+  }
+
+  const answers: Array<MessageInitShape<typeof QuestionAnswerSchema>> = [];
+  for (const field of rawFields) {
+    const answer = submitted.get(field.fieldId);
+    if (answer === undefined) {
+      if (field.required) throw new GatewayError(`${field.label || field.fieldId} is required.`);
+      continue;
+    }
+    answers.push({ fieldId: field.fieldId, value: exactQuestionAnswer(field, answer) });
+  }
+  return answers;
+}
+
+function questionAnswerRecord(value: unknown): value is Readonly<Record<string, QuestionAnswerDraft>> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function validateQuestionRequestDeclaration(rawFields: readonly QuestionField[]): void {
+  if (rawFields.length === 0) throw new GatewayError("This question has no current fields.");
+  const fieldIds = new Set<string>();
+  for (const field of rawFields) {
+    if (typeof field.fieldId !== "string" || field.fieldId.trim() === "" || fieldIds.has(field.fieldId)) {
+      throw new GatewayError("This question has an invalid field declaration.");
+    }
+    fieldIds.add(field.fieldId);
+    validateQuestionFieldDeclaration(field);
+  }
+}
+
+function validateQuestionFieldDeclaration(field: QuestionField): void {
+  const input = field.input;
+  if (input.case === "text" || input.case === "boolean") return;
+  if (input.case === "singleChoice") {
+    const choices = declaredQuestionChoiceIds(input.value.choices);
+    if (typeof input.value.allowOther !== "boolean") {
+      throw new GatewayError("Question choice fields require explicit free-text authority.");
+    }
+    if (input.value.defaultChoiceId !== "" && !choices.has(input.value.defaultChoiceId)) {
+      throw new GatewayError("This question has an invalid default choice.");
+    }
+    return;
+  }
+  if (input.case === "multipleChoice") {
+    const choices = declaredQuestionChoiceIds(input.value.choices);
+    const defaults = input.value.defaultChoiceIds;
+    const minimum = Math.max(field.required ? 1 : 0, input.value.minimumSelections);
+    const maximum = input.value.maximumSelections === 0 ? undefined : input.value.maximumSelections;
+    if (typeof input.value.allowOther !== "boolean") {
+      throw new GatewayError("Question choice fields require explicit free-text authority.");
+    }
+    const capacity = choices.size + (input.value.allowOther ? 1 : 0);
+    if (!Number.isSafeInteger(input.value.minimumSelections) || input.value.minimumSelections < 0
+      || minimum > capacity
+      || maximum !== undefined && (!Number.isSafeInteger(maximum) || maximum < minimum || maximum > capacity)
+      || new Set(defaults).size !== defaults.length
+      || defaults.some((choiceId) => !choices.has(choiceId))
+      || maximum !== undefined && defaults.length > maximum) {
+      throw new GatewayError("This question has invalid multiple-choice bounds or defaults.");
+    }
+    return;
+  }
+  throw new GatewayError("This question has a field without a current input type.");
+}
+
+function exactQuestionAnswer(
+  field: QuestionField,
+  answer: unknown
+): NonNullable<MessageInitShape<typeof QuestionAnswerSchema>["value"]> {
+  const label = field.label || field.fieldId;
+  if (typeof answer !== "object" || answer === null || Array.isArray(answer)) {
+    throw new GatewayError(`${label} requires a current typed answer.`);
+  }
+  const typed = answer as Readonly<Record<string, unknown>>;
+  if (field.input.case === "text") {
+    if (!exactQuestionDraftKeys(typed, ["kind", "value"])
+      || typed["kind"] !== "text" || typeof typed["value"] !== "string") {
+      throw new GatewayError(`${label} requires text.`);
+    }
+    if (field.required && typed["value"].trim() === "") throw new GatewayError(`${label} is required.`);
+    return { case: "text", value: typed["value"] };
+  }
+  if (field.input.case === "boolean") {
+    if (!exactQuestionDraftKeys(typed, ["kind", "value"])
+      || typed["kind"] !== "boolean" || typeof typed["value"] !== "boolean") {
+      throw new GatewayError(`${label} requires a yes or no answer.`);
+    }
+    return { case: "boolean", value: typed["value"] };
+  }
+  if (field.input.case === "singleChoice") {
+    if (!exactQuestionDraftKeys(typed, ["kind", "selection"]) || typed["kind"] !== "single"
+      || typeof typed["selection"] !== "object" || typed["selection"] === null || Array.isArray(typed["selection"])) {
+      throw new GatewayError(`${label} requires one currently advertised choice.`);
+    }
+    const selection = typed["selection"] as Readonly<Record<string, unknown>>;
+    const choices = declaredQuestionChoiceIds(field.input.value.choices);
+    if (exactQuestionDraftKeys(selection, ["kind", "choiceId"])
+      && selection["kind"] === "choice" && typeof selection["choiceId"] === "string"
+      && choices.has(selection["choiceId"])) {
+      return { case: "singleChoice", value: { selection: { case: "choiceId", value: selection["choiceId"] } } };
+    }
+    if (!exactQuestionDraftKeys(selection, ["kind", "text"])
+      || selection["kind"] !== "other" || typeof selection["text"] !== "string"
+      || !field.input.value.allowOther || selection["text"].trim() === "") {
+      throw new GatewayError(`${label} requires one currently advertised choice or allowed free-text response.`);
+    }
+    return { case: "singleChoice", value: { selection: { case: "otherText", value: selection["text"] } } };
+  }
+  if (field.input.case === "multipleChoice") {
+    if (!exactQuestionDraftKeys(typed, ["kind", "choiceIds"], ["otherText"])
+      || typed["kind"] !== "multiple" || !Array.isArray(typed["choiceIds"])
+      || typed["choiceIds"].some((value) => typeof value !== "string")
+      || (typed["otherText"] !== undefined && typeof typed["otherText"] !== "string")) {
+      throw new GatewayError(`${label} requires a list of choices.`);
+    }
+    const choiceIds = typed["choiceIds"] as readonly string[];
+    const otherText = typed["otherText"] as string | undefined;
+    const choices = declaredQuestionChoiceIds(field.input.value.choices);
+    const minimum = Math.max(field.required ? 1 : 0, field.input.value.minimumSelections);
+    const maximum = field.input.value.maximumSelections === 0 ? undefined : field.input.value.maximumSelections;
+    const count = choiceIds.length + (otherText === undefined ? 0 : 1);
+    if (new Set(choiceIds).size !== choiceIds.length || choiceIds.some((value) => !choices.has(value))
+      || (otherText !== undefined && (!field.input.value.allowOther || otherText.trim() === ""))
+      || count < minimum || maximum !== undefined && count > maximum) {
+      throw new GatewayError(`${label} does not satisfy its advertised choices and selection bounds.`);
+    }
+    return {
+      case: "multipleChoice",
+      value: {
+        choiceIds: [...choiceIds],
+        ...(otherText === undefined ? {} : { otherText })
+      }
+    };
+  }
+  throw new GatewayError(`${label} has no current answer type.`);
+}
+
+function exactQuestionDraftKeys(
+  value: Readonly<Record<string, unknown>>,
+  required: readonly string[],
+  optional: readonly string[] = []
+): boolean {
+  const keys = Reflect.ownKeys(value);
+  return required.every((key) => Object.prototype.hasOwnProperty.call(value, key))
+    && keys.every((key) => typeof key === "string" && (required.includes(key) || optional.includes(key)));
+}
+
+function declaredQuestionChoiceIds(choices: readonly QuestionChoice[]): ReadonlySet<string> {
+  const ids = new Set<string>();
+  for (const choice of choices) {
+    if (typeof choice.choiceId !== "string" || choice.choiceId.trim() === "" || ids.has(choice.choiceId)) {
+      throw new GatewayError("This question has an invalid choice declaration.");
+    }
+    ids.add(choice.choiceId);
+  }
+  if (ids.size === 0) throw new GatewayError("This question has no selectable choices.");
+  return ids;
 }
 
 function normalizeError(error: unknown): GatewayError {
@@ -10563,18 +11046,134 @@ function inputText(input: any): string {
     if (content?.case === "image") return `![${content.value.altText || content.value.blob?.fileName || "image"}]`;
     if (content?.case === "workspaceMention") return `@${content.value.displayText || content.value.relativePath}`;
     if (content?.case === "resourceMention") return `/${content.value.displayText}`;
+    if (content?.case === "artifactMention") return `@${content.value.displayText}`;
+    if (content?.case === "sessionMention") return `@${content.value.displayText}`;
     return "";
   }).filter(Boolean).join("\n");
 }
 
 function messageInputText(input: any): string {
-  return (input?.parts ?? []).map((part: any) => {
+  return (input?.parts ?? []).filter((part: any) => part.content?.case === "text").map((part: any) => String(part.content.value)).join("");
+}
+
+function requiredQueueInput(item: QueueItem): InputContent {
+  const input = item.input;
+  if (input === undefined || input.parts.length === 0 || input.parts.some((part) => part.content.case === undefined)) {
+    throw new GatewayError("Orchestrator returned a queued input without its canonical content.");
+  }
+  return input;
+}
+
+function editedQueueInput(original: InputContent, edit: QueueItemTextEditView): InputContent {
+  const originalMentionParts = original.parts.filter((part) => typedInputMention(part.content.case));
+  const pastedTextRanges = messageInputPastedTextRanges({ pastedTextRanges: edit.pastedTextRanges }, edit.text);
+  const mentionRanges = messageInputMentionRanges(
+    { mentionRanges: edit.mentionRanges },
+    edit.text,
+    originalMentionParts.length,
+    pastedTextRanges
+  );
+  const originallyInline = new Set(original.mentionRanges.map((range) => range.mentionIndex));
+  if (mentionRanges.some((range) => !originallyInline.has(range.mentionIndex))) {
+    throw new GatewayError("A queued-input edit cannot create new reference authority from display text.");
+  }
+  const stillInline = new Set(mentionRanges.map((range) => range.mentionIndex));
+  const retainedParts: InputContent["parts"] = [];
+  const retainedMentionIndices = new Map<number, number>();
+  let originalMentionIndex = 0;
+  for (const part of original.parts) {
+    if (part.content.case === "text") continue;
+    if (!typedInputMention(part.content.case)) {
+      retainedParts.push(part);
+      continue;
+    }
+    if (!originallyInline.has(originalMentionIndex) || stillInline.has(originalMentionIndex)) {
+      retainedMentionIndices.set(originalMentionIndex, retainedMentionIndices.size);
+      retainedParts.push(part);
+    }
+    originalMentionIndex += 1;
+  }
+  const parts: InputContent["parts"] = [
+    ...(edit.text.length === 0 ? [] : [create(InputPartSchema, { content: { case: "text", value: edit.text } })]),
+    ...retainedParts
+  ];
+  if (parts.length === 0 || edit.text.trim().length === 0 && retainedParts.length === 0) {
+    throw new GatewayError("Queued input cannot be empty.");
+  }
+  return create(InputContentSchema, {
+    parts,
+    quotesEncoded: false,
+    pastedTextRanges: pastedTextRanges.map((range) => create(InlineTextRangeSchema, range)),
+    mentionRanges: mentionRanges.map((range) => create(InputMentionRangeSchema, {
+      start: range.start,
+      end: range.end,
+      mentionIndex: retainedMentionIndices.get(range.mentionIndex)!
+    }))
+  });
+}
+
+function typedInputMention(value: string | undefined): boolean {
+  return value === "workspaceMention" || value === "resourceMention" || value === "artifactMention" || value === "sessionMention";
+}
+
+function messageInputMentions(input: any): NonNullable<TimelineItemView["inputMentions"]> {
+  return (input?.parts ?? []).flatMap((part: any): NonNullable<TimelineItemView["inputMentions"]>[number][] => {
     const content = part.content;
-    if (content?.case === "text") return String(content.value);
-    if (content?.case === "workspaceMention") return `@${content.value.displayText || content.value.relativePath}`;
-    if (content?.case === "resourceMention") return `/${content.value.displayText}`;
-    return "";
-  }).filter(Boolean).join("\n");
+    const value = content?.value;
+    if (content?.case === "workspaceMention") {
+      if (!value.workspaceId || !value.relativePath) throw new GatewayError("Orchestrator returned a workspace mention without its identity.");
+      return [{ kind: "workspace", workspaceId: value.workspaceId, relativePath: value.relativePath, displayText: value.displayText, directory: value.directory,
+        ...(value.lineRange === undefined ? {} : { lineRange: { startLine: value.lineRange.startLine, endLine: value.lineRange.endLine } }) }];
+    }
+    if (content?.case === "resourceMention") {
+      const runtimeGeneration = exactSafeUnsignedNumber(value.runtimeGeneration);
+      if (!value.resourceId || !value.discoveredRevision || value.resourceVersion < 1n || runtimeGeneration === undefined || runtimeGeneration < 1) {
+        throw new GatewayError("Orchestrator returned a resource mention without its exact runtime identity.");
+      }
+      return [{
+        kind: "resource",
+        resourceId: value.resourceId,
+        displayText: value.displayText,
+        discoveredRevision: value.discoveredRevision,
+        resourceVersion: value.resourceVersion.toString(10),
+        runtimeGeneration
+      }];
+    }
+    if (content?.case === "artifactMention") {
+      if (!value.artifactId) throw new GatewayError("Orchestrator returned an Artifact mention without its identity.");
+      return [{ kind: "artifact", artifactId: value.artifactId, displayText: value.displayText }];
+    }
+    if (content?.case === "sessionMention") {
+      if (!validSessionMentionId(value.sessionId)) throw new GatewayError("Orchestrator returned a task mention without its identity.");
+      return [{ kind: "session", sessionId: value.sessionId, displayText: value.displayText }];
+    }
+    return [];
+  });
+}
+
+function messageInputAttachments(input: any): NonNullable<QueueItemView["attachments"]> {
+  return (input?.parts ?? []).flatMap((part: any): NonNullable<QueueItemView["attachments"]>[number][] => {
+    const content = part.content;
+    if (content?.case === "image") {
+      return [{ kind: "image", label: content.value.altText || content.value.blob?.fileName || "" }];
+    }
+    if (content?.case === "file") return [{ kind: "file", label: content.value.fileName || "" }];
+    return [];
+  });
+}
+
+function messageInputMentionRanges(input: any, text: string, mentionCount: number, pastedRanges: NonNullable<TimelineItemView["pastedTextRanges"]>): NonNullable<TimelineItemView["mentionRanges"]> {
+  const ranges = input?.mentionRanges ?? [];
+  if (!Array.isArray(ranges)) throw new GatewayError("Orchestrator returned invalid mention occurrence metadata.");
+  let previousEnd = 0;
+  return ranges.map((range) => {
+    const { start, end, mentionIndex } = range;
+    if (![start, end, mentionIndex].every(Number.isSafeInteger) || start < previousEnd || start < 0 || end <= start || end > text.length
+      || mentionIndex < 0 || mentionIndex >= mentionCount || !utf16Boundary(text, start) || !utf16Boundary(text, end)
+      || pastedRanges.some((pasted) => start < pasted.end && pasted.start < end)) throw new GatewayError("Orchestrator returned invalid mention occurrence metadata.");
+    previousEnd = end;
+    return { start, end, mentionIndex };
+  });
 }
 
 function messageInputPastedTextRanges(
@@ -11232,18 +11831,25 @@ function durationFromMs(value: number): { readonly seconds: bigint; readonly nan
 }
 
 function uiDeliveryMode(value: QueueDeliveryMode): QueueItemView["mode"] {
-  return value === QueueDeliveryMode.STEER ? "steer" : value === QueueDeliveryMode.FOLLOW_UP ? "followUp" : "prompt";
+  switch (value) {
+    case QueueDeliveryMode.PROMPT: return "prompt";
+    case QueueDeliveryMode.STEER: return "steer";
+    case QueueDeliveryMode.FOLLOW_UP: return "followUp";
+    default: throw new GatewayError("Orchestrator returned an unknown Queue delivery mode.");
+  }
 }
 
 function queueState(value: QueueItemState): QueueItemView["state"] {
-  if (value === QueueItemState.QUEUED) return "queued";
-  if (value === QueueItemState.DISPATCHING) return "dispatching";
-  if (value === QueueItemState.BACKEND_ACCEPTED || value === QueueItemState.RUNNING) return "acceptedByBackend";
-  if (value === QueueItemState.DISPATCH_UNKNOWN) return "dispatchUnknown";
-  if (value === QueueItemState.COMPLETED) return "completed";
-  if (value === QueueItemState.CANCELLED || value === QueueItemState.ABORTED) return "cancelled";
-  if (value === QueueItemState.FAILED) return "failed";
-  return "accepted";
+  switch (value) {
+    case QueueItemState.ACCEPTED: return "accepted";
+    case QueueItemState.DISPATCHING: return "dispatching";
+    case QueueItemState.BACKEND_ACCEPTED: return "acceptedByBackend";
+    case QueueItemState.DISPATCH_UNKNOWN: return "dispatchUnknown";
+    case QueueItemState.COMPLETED: return "completed";
+    case QueueItemState.CANCELLED: return "cancelled";
+    case QueueItemState.FAILED: return "failed";
+    default: throw new GatewayError("Orchestrator returned an unknown Queue item state.");
+  }
 }
 
 function permissionRisk(value: PermissionRisk): NonNullable<InteractionView["risk"]> {
@@ -11629,6 +12235,70 @@ function resourceKind(value: ResourceKind): ResourceView["kind"] {
   if (value === ResourceKind.PROMPT_TEMPLATE) return "prompt";
   if (value === ResourceKind.THEME) return "theme";
   return "package";
+}
+
+function browserAutomationTarget(value: BrowserAutomationTarget): BrowserSettingsView["automationTarget"] {
+  switch (value) {
+    case BrowserAutomationTarget.SIDEBAR: return "sidebar";
+    case BrowserAutomationTarget.EXTERNAL: return "external";
+    case BrowserAutomationTarget.UNSPECIFIED:
+    default: throw new Error("Orchestrator returned an invalid Browser automation target.");
+  }
+}
+
+function protoBrowserAutomationTarget(value: BrowserSettingsView["automationTarget"]): BrowserAutomationTarget {
+  switch (value) {
+    case "sidebar": return BrowserAutomationTarget.SIDEBAR;
+    case "external": return BrowserAutomationTarget.EXTERNAL;
+    default: throw new GatewayError("Browser automation target must be sidebar or external.");
+  }
+}
+
+function mapSessionResource(resource: SessionResource, expectedSessionId: string): SessionResourceView {
+  const runtimeGeneration = exactSafeUnsignedNumber(resource.runtimeGeneration);
+  const kind = sessionResourceKind(resource.kind);
+  if (
+    resource.sessionId !== expectedSessionId
+    || kind === undefined
+    || !validResourceIdentityText(resource.resourceId)
+    || resource.name.trim() === ""
+    || !validResourceIdentityText(resource.discoveredRevision)
+    || resource.resourceVersion < 1n
+    || runtimeGeneration === undefined
+    || runtimeGeneration < 1
+  ) throw new GatewayError("Orchestrator returned an invalid task resource identity.");
+  return {
+    sessionId: resource.sessionId,
+    id: resource.resourceId,
+    name: resource.name,
+    ...(resource.version === "" ? {} : { version: resource.version }),
+    kind,
+    discoveredRevision: resource.discoveredRevision,
+    resourceVersion: resource.resourceVersion.toString(10),
+    runtimeGeneration
+  };
+}
+
+function validResourceIdentityText(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 4_096
+    && value === value.trim() && !/[\u0000-\u001f\u007f\u2028\u2029]/u.test(value);
+}
+
+function validSessionMentionId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 1_024
+    && value === value.trim() && !/[\u0000-\u001f\u007f\u2028\u2029]/u.test(value);
+}
+
+function validResourceVersionText(value: unknown): value is string {
+  return typeof value === "string" && value.length <= 20 && /^[1-9][0-9]*$/u.test(value);
+}
+
+function sessionResourceKind(value: ResourceKind): SessionResourceView["kind"] | undefined {
+  if (value === ResourceKind.EXTENSION) return "extension";
+  if (value === ResourceKind.SKILL) return "skill";
+  if (value === ResourceKind.PROMPT_TEMPLATE) return "prompt";
+  if (value === ResourceKind.PACKAGE) return "package";
+  return undefined;
 }
 
 function protoResourceKind(value: ResourceView["kind"]): ResourceKind {

@@ -5,6 +5,7 @@ import {
   AuthenticationState,
   BackendHealth,
   BackgroundTaskState,
+  BrowserAutomationTarget,
   BrowserProviderState,
   BrowserTakeoverState,
   CapabilitySupport,
@@ -31,7 +32,6 @@ import {
   ProviderApiCompatibility,
   ProviderKind,
   ProviderLoginMethod,
-  QuestionAnswerHandling,
   QueueDeliveryMode,
   QueueDispatchState,
   QueueItemState,
@@ -756,7 +756,7 @@ describe("incremental event projection", () => {
     expect(projected.snapshot.commands.map((command) => command.id)).toEqual(["retained-command"]);
   });
 
-  it("coalesces an answered question into a stable Q/A item without exposing sensitive references", () => {
+  it("coalesces ordinary answered questions into a stable Q/A item", () => {
     let raw = create(SnapshotSchema, { generation: 2n, resumeCursor: { generation: 2n, sequence: 0n } });
     let snapshot = mapSnapshot(raw);
     const apply = (sequence: bigint, state: InteractionState, resolution?: any): void => {
@@ -774,8 +774,16 @@ describe("incremental event projection", () => {
             title: "Choose release mode",
             prompt: "Two details",
             fields: [
-              { fieldId: "mode", label: "Mode", input: { case: "singleChoice", value: { choices: [{ choiceId: "fast", label: "Fast" }] } } },
-              { fieldId: "token", label: "Token", input: { case: "text", value: { answerHandling: QuestionAnswerHandling.CREDENTIAL_CHANNEL } } }
+              { fieldId: "mode", label: "Mode", input: { case: "singleChoice", value: {
+                choices: [{ choiceId: "fast", label: "Fast" }], allowOther: false
+              } } },
+              { fieldId: "targets", label: "Targets", input: { case: "multipleChoice", value: {
+                choices: [{ choiceId: "web", label: "Web" }, { choiceId: "desktop", label: "Desktop" }],
+                minimumSelections: 1,
+                maximumSelections: 2,
+                allowOther: true
+              } } },
+              { fieldId: "notes", label: "Notes", input: { case: "text", value: {} } }
             ]
           } },
           ...(resolution === undefined ? {} : { resolution })
@@ -788,8 +796,13 @@ describe("incremental event projection", () => {
 
     apply(1n, InteractionState.PENDING);
     apply(2n, InteractionState.RESOLVED, { decision: { case: "question", value: { answers: [
-      { fieldId: "mode", value: { case: "choiceId", value: "fast" } },
-      { fieldId: "token", value: { case: "sensitive", value: { credentialUploadTicketId: "secret-ticket" } } }
+      { fieldId: "mode", value: { case: "singleChoice", value: {
+        selection: { case: "choiceId", value: "fast" }
+      } } },
+      { fieldId: "targets", value: { case: "multipleChoice", value: {
+        choiceIds: ["web"], otherText: "desktop"
+      } } },
+      { fieldId: "notes", value: { case: "text", value: "Ready" } }
     ] } } });
 
     const timeline = snapshot.timelineBySession.get("session-1") ?? [];
@@ -798,14 +811,14 @@ describe("incremental event projection", () => {
       id: "interaction:question-1",
       sequence: 1n,
       interaction: {
-        state: "resolved",
-        questions: [
-          { question: "Mode", answer: { kind: "text", values: ["Fast"] } },
-          { question: "Token", answer: { kind: "sensitive" } }
+          state: "resolved",
+          questions: [
+            { question: "Mode", answer: { kind: "text", values: ["Fast"] } },
+            { question: "Targets", answer: { kind: "text", values: ["Web", "desktop"] } },
+            { question: "Notes", answer: { kind: "text", values: ["Ready"] } }
         ]
       }
     });
-    expect(JSON.stringify(timeline.map((item) => item.interaction))).not.toContain("secret-ticket");
   });
 
   it("clears stale context usage when Pi reports that the post-compaction window is unknown", () => {
@@ -1750,7 +1763,61 @@ describe("incremental event projection", () => {
     ] });
   });
 
-  it("projects only the durable quotesEncoded event gate onto user timeline rows", () => {
+  it("keeps accepted mention identities and repeated occurrences independent of labels and native echo", () => {
+    const raw = create(SnapshotSchema, { generation: 1n, resumeCursor: { generation: 1n, sequence: 0n } });
+    const input = { parts: [
+      { content: { case: "text" as const, value: "@same @same @same" } },
+      { content: { case: "workspaceMention" as const, value: { workspaceId: "workspace", relativePath: "src/main.ts", displayText: "same", lineRange: { startLine: 2, endLine: 3 } } } },
+      { content: { case: "image" as const, value: { blob: { blobId: "image", fileName: "image.png", mediaType: "image/png" } } } },
+      { content: { case: "resourceMention" as const, value: {
+        resourceId: "resource", displayText: "same", discoveredRevision: "revision-one", resourceVersion: 7n, runtimeGeneration: 3n
+      } } },
+      { content: { case: "artifactMention" as const, value: { artifactId: "artifact", displayText: "same" } } },
+      { content: { case: "sessionMention" as const, value: { sessionId: "earlier", displayText: "same" } } }
+    ], mentionRanges: [{ start: 0, end: 5, mentionIndex: 2 }, { start: 6, end: 11, mentionIndex: 0 }, { start: 12, end: 17, mentionIndex: 2 }] };
+    const started = create(EventSchema, { eventId: "receipt", cursor: { generation: 1n, sequence: 1n }, identity: { sessionId: "s" }, payload: { kind: { case: "messageStarted", value: {
+      messageId: "m", role: MessageRole.USER, userInputAccepted: true, userInput: input
+    } } } });
+    const accepted = projectSnapshotEvent(raw, mapSnapshot(raw), started);
+    const row = accepted.snapshot.timelineBySession.get("s")?.[0];
+    expect(row).toMatchObject({ text: "@same @same @same", userInputAccepted: true, mentionRanges: input.mentionRanges, inputMentions: [
+      { kind: "workspace", workspaceId: "workspace", relativePath: "src/main.ts", displayText: "same", directory: false, lineRange: { startLine: 2, endLine: 3 } },
+      { kind: "resource", resourceId: "resource", displayText: "same", discoveredRevision: "revision-one", resourceVersion: "7", runtimeGeneration: 3 },
+      { kind: "artifact", artifactId: "artifact", displayText: "same" },
+      { kind: "session", sessionId: "earlier", displayText: "same" }
+    ] });
+    const completed = create(EventSchema, { eventId: "echo", cursor: { generation: 1n, sequence: 2n }, identity: { sessionId: "s" }, payload: { kind: { case: "messageCompleted", value: {
+      messageId: "m", role: MessageRole.USER, blocks: [{ content: { case: "text", value: "Native enriched prompt" } }]
+    } } } });
+    expect(projectSnapshotEvent(accepted.rawSnapshot, accepted.snapshot, completed).snapshot.timelineBySession.get("s")?.[0]).toMatchObject({
+      text: row?.text, inputMentions: row?.inputMentions, mentionRanges: row?.mentionRanges, attachments: row?.attachments
+    });
+    const unowned = create(EventSchema, { eventId: "unowned", identity: { sessionId: "s" }, cursor: { generation: 1n, sequence: 1n }, payload: { kind: { case: "messageStarted", value: { messageId: "m", role: MessageRole.USER, userInput: input } } } });
+    expect(() => projectSnapshotEvent(raw, mapSnapshot(raw), unowned)).toThrow("without an accepted receipt");
+    const invalid = create(EventSchema, { eventId: "invalid", identity: { sessionId: "s" }, cursor: { generation: 1n, sequence: 1n }, payload: { kind: { case: "messageStarted", value: { messageId: "m", role: MessageRole.USER, userInputAccepted: true, userInput: { ...input, mentionRanges: [{ start: 0, end: 5, mentionIndex: 4 }] } } } } });
+    expect(() => projectSnapshotEvent(raw, mapSnapshot(raw), invalid)).toThrow("invalid mention occurrence metadata");
+    const oldResourceShape = create(EventSchema, { eventId: "old-resource", identity: { sessionId: "s" }, cursor: { generation: 1n, sequence: 1n }, payload: { kind: { case: "messageStarted", value: {
+      messageId: "m", role: MessageRole.USER, userInputAccepted: true, userInput: { ...input, parts: input.parts.map((part) => part.content.case === "resourceMention"
+        ? { content: { case: "resourceMention" as const, value: { resourceId: "resource", displayText: "same" } } }
+        : part) }
+    } } } });
+    expect(() => projectSnapshotEvent(raw, mapSnapshot(raw), oldResourceShape)).toThrow("exact runtime identity");
+
+    const splitText = create(EventSchema, { eventId: "split", identity: { sessionId: "split" }, cursor: { generation: 1n, sequence: 1n }, payload: { kind: { case: "messageStarted", value: {
+      messageId: "split", role: MessageRole.USER, userInputAccepted: true, userInput: { parts: [
+        { content: { case: "text", value: "@sa" } },
+        { content: { case: "text", value: "me" } },
+        { content: { case: "artifactMention", value: { artifactId: "artifact-split", displayText: "same" } } }
+      ], mentionRanges: [{ start: 0, end: 5, mentionIndex: 0 }] }
+    } } } });
+    expect(projectSnapshotEvent(raw, mapSnapshot(raw), splitText).snapshot.timelineBySession.get("split")?.[0]).toMatchObject({
+      text: "@same",
+      mentionRanges: [{ start: 0, end: 5, mentionIndex: 0 }],
+      inputMentions: [{ kind: "artifact", artifactId: "artifact-split" }]
+    });
+  });
+
+  it("projects quote and paste metadata only from canonical accepted user input", () => {
     const raw = create(SnapshotSchema, { generation: 1n, resumeCursor: { generation: 1n, sequence: 0n } });
     const markedText = "> <!-- joko-selection-quote -->\n> selected\n\nreply";
     const encoded = create(EventSchema, {
@@ -1765,7 +1832,7 @@ describe("incremental event projection", () => {
           quotesEncoded: true,
           pastedTextRanges: [{ start: 44, end: 49, display: "Pasted text (1 line)" }]
         },
-        quotesEncoded: true
+        userInputAccepted: true
       } } }
     });
     const encodedProjection = projectSnapshotEvent(raw, mapSnapshot(raw), encoded).snapshot;
@@ -1797,6 +1864,7 @@ describe("incremental event projection", () => {
       payload: { kind: { case: "messageStarted", value: {
         messageId: "malformed-user-message",
         role: MessageRole.USER,
+        userInputAccepted: true,
         userInput: {
           parts: [{ content: { case: "text", value: "short" } }],
           pastedTextRanges: [{ start: 0, end: 8, display: "outside" }]
@@ -1989,6 +2057,23 @@ describe("incremental event projection", () => {
 });
 
 describe("provider and model projection", () => {
+  it("accepts only exact Browser automation targets from settings snapshots", () => {
+    const snapshotFor = (automationTarget: BrowserAutomationTarget) => create(SnapshotSchema, {
+      settings: {
+        auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" },
+        agentResource: {},
+        collaboration: {},
+        gitSafety: {},
+        browsers: [{ browserProviderId: "browser", automationTarget }]
+      }
+    });
+
+    expect(mapSnapshot(snapshotFor(BrowserAutomationTarget.SIDEBAR)).settings.browsers[0]?.automationTarget).toBe("sidebar");
+    expect(mapSnapshot(snapshotFor(BrowserAutomationTarget.EXTERNAL)).settings.browsers[0]?.automationTarget).toBe("external");
+    expect(() => mapSnapshot(snapshotFor(BrowserAutomationTarget.UNSPECIFIED))).toThrow(/invalid Browser automation target/u);
+    expect(() => mapSnapshot(snapshotFor(99 as BrowserAutomationTarget))).toThrow(/invalid Browser automation target/u);
+  });
+
   it("preserves provider auth/rate state and complete BYOM model configuration", () => {
     const snapshot = mapSnapshot(create(SnapshotSchema, {
       providers: [{ backendId: "backend-custom", providerId: "custom", displayName: "Custom", kind: ProviderKind.CUSTOM_ENDPOINT, apiCompatibility: ProviderApiCompatibility.OPENAI_RESPONSES, authenticationState: AuthenticationState.AUTHENTICATED, endpointDisplay: "https://example.test/v1", supportsLogin: true, loginMethods: [ProviderLoginMethod.API_KEY], supportsLogout: true, supportsRefresh: true, capabilities: { schemaVersion: "joko.provider.v1", capabilities: [{ name: "provider.account_usage", support: CapabilitySupport.SUPPORTED }] }, accountUsage: { providerId: "custom", primaryWindow: { usedPercent: 42, windowMinutes: 300, resetAt: { seconds: 1_800_003_600n } }, secondaryWindow: { usedPercent: 75, windowMinutes: 10_080 }, limitReached: false, planType: "pro", credits: { hasCredits: true, unlimited: false, balance: "4.50", observedAt: { seconds: 1_800_000_000n } }, observedAt: { seconds: 1_800_000_000n } }, rateLimit: { limited: false, requestLimit: 100n, requestsRemaining: 77n, tokenLimit: 1_000n, tokensRemaining: 800n }, usage: { providerId: "custom", usage: { inputTokens: 12n, outputTokens: 8n, costMicros: 25_000n, currencyCode: "USD" }, estimated: true } }],

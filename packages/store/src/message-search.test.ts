@@ -121,7 +121,8 @@ describe("OperationalStore visible message search", () => {
           label: "Select the release region",
           description: "Do not expose sk-abcdefghijklmnop",
           required: true,
-          choices: [{ id: "east", label: "East" }]
+          choices: [{ id: "east", label: "East" }],
+          allowOther: false
         }]
       }
     });
@@ -1318,7 +1319,6 @@ describe("OperationalStore visible message search", () => {
           description: "Enter the deployment lane",
           required: true,
           multiline: false,
-          sensitive: false
         }]
       }
     });

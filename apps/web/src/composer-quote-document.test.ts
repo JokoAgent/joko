@@ -18,6 +18,28 @@ import {
 const source = { sessionId: "session-one", messageId: "user-one", sourceEventId: "event-one", role: "user" as const };
 
 describe("composer quote documents", () => {
+  it("projects exact repeated mention occurrences through trim, quote encoding, paste atoms, and list markers", () => {
+    const quoteText = "> <!-- joko-selection-quote -->\n> @same";
+    const document = { type: "doc", content: [
+      { type: "paragraph", content: [
+        { type: "text", text: "  @same" },
+        { type: "composerQuote", attrs: { id: "quote", kind: "message", text: "@same", sessionId: "s", messageId: "m", role: "assistant" } },
+        { type: "text", text: "@same" }
+      ] },
+      { type: "paragraph", content: [{ type: "composerPastedText", attrs: { text: "@same", display: "Pasted" } }] },
+      { type: "orderedList", attrs: { start: 9 }, content: [{ type: "listItem", content: [{ type: "paragraph", content: [{ type: "text", text: "@same  " }] }] }] }
+    ] };
+    expect(composerDocumentPlainText(document)).toBe("@same\n@same\n@same\n9. @same");
+    const second = 5 + 2 + quoteText.length + 2;
+    const last = second + 5 + 1 + 5 + 1 + 3;
+    expect(serializeComposerDocument(document, [
+      { mentionId: "b", from: 0, to: 5 }, { mentionId: "a", from: 6, to: 11 }, { mentionId: "b", from: 21, to: 26 }
+    ])).toEqual({ text: `@same\n\n${quoteText}\n\n@same\n@same\n9. @same`, quotesEncoded: true,
+      pastedTextRanges: [{ start: second + 6, end: second + 11, display: "Pasted" }],
+      mentionRanges: [{ mentionId: "b", start: 0, end: 5 }, { mentionId: "a", start: second, end: second + 5 }, { mentionId: "b", start: last, end: last + 5 }]
+    });
+  });
+
   it("joins a rejected send snapshot before newer input without flattening either document", () => {
     const sent = appendQuoteToComposerDocument(plainTextToComposerDocument("first"), {
       id: "quote-one", kind: "message", text: "evidence", sessionId: "session-one", messageId: "assistant-one", role: "assistant"

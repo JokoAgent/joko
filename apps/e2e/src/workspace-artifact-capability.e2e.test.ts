@@ -8,6 +8,8 @@ import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
 import {
   CapabilitySupport,
+  BrowserAutomationTarget,
+  BrowserSettingsSchema,
   GitDiffSource,
   OperationMutationSchema,
   OpenBrowserPageMutationSchema,
@@ -105,7 +107,7 @@ describe("workspace, artifact, and capability boundaries", () => {
   it("transfers authenticated workspace HTML through durable Browser admission without retaining bytes or completing a retired owner's read", async () => {
     const controlled = controlledHtmlBrowser();
     fixture = await OrchestratorE2eFixture.start({ createAuxiliaryServices: async (store) => ({
-      browser: controlled.provider, browserState: new OperationalBrowserState(store)
+      browser: controlled.provider, browserSettings: controlled.settings, browserState: new OperationalBrowserState(store)
     }) });
     const owner = await fixture.pair("HTML owner");
     const manager = await fixture.pair("HTML manager");
@@ -125,6 +127,7 @@ describe("workspace, artifact, and capability boundaries", () => {
       const takeover = controlled.provider.currentHumanTakeover();
       return create(OperationMutationSchema, { payload: { case: "openBrowserPage", value: create(OpenBrowserPageMutationSchema, {
         browserProviderId: "browser", sessionId: requestedSession, expectedGeneration: BigInt(controlled.provider.generation),
+        presentationTarget: BrowserAutomationTarget.SIDEBAR,
         currentPageId: takeover?.pageId ?? "", takeoverId: takeover?.takeoverId ?? "", workspaceHtml: reference
       }) } });
     };
@@ -389,7 +392,20 @@ function controlledHtmlBrowser() {
       return takeover;
     }
   } as unknown as Provider;
-  return { provider, accepted };
+  const settings = {
+    enabled: () => true,
+    automationTarget: () => "sidebar" as const,
+    takeoverTimeout: () => 60_000,
+    profileDisplayName: () => "Joko",
+    setBackendHealth: () => undefined,
+    snapshot: () => create(BrowserSettingsSchema, {
+      browserProviderId: "browser",
+      profileDisplayName: "Joko",
+      automationTarget: BrowserAutomationTarget.SIDEBAR,
+      support: CapabilitySupport.SUPPORTED
+    })
+  } as unknown as NonNullable<OrchestratorApplication["browserSettings"]>;
+  return { provider, settings, accepted };
 }
 
 async function nextWorkspacePath<T extends {

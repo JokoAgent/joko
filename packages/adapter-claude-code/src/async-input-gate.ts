@@ -33,6 +33,7 @@ interface PendingInput<T> {
   readonly value: T;
   readonly consumed: Deferred<void>;
   readonly onConsumed: () => void;
+  readonly beforeConsumed: () => void;
   readonly release: () => void;
 }
 
@@ -47,7 +48,7 @@ export class AsyncInputGate<T> implements AsyncIterable<T>, AsyncIterator<T> {
   #closed = false;
   #closeReason: unknown = new Error("The native input stream is closed.");
 
-  offer(value: T, onConsumed: () => void = () => undefined, signal?: AbortSignal): Promise<void> {
+  offer(value: T, onConsumed: () => void = () => undefined, signal?: AbortSignal, beforeConsumed: () => void = () => undefined): Promise<void> {
     if (this.#closed) return Promise.reject(this.#closeReason);
     if (signal?.aborted === true) return Promise.reject(signal.reason);
     if (this.#pending !== undefined) {
@@ -56,6 +57,13 @@ export class AsyncInputGate<T> implements AsyncIterable<T>, AsyncIterator<T> {
     const consumed = deferred<void>();
     const reader = this.#reader;
     if (reader !== undefined) {
+      try { beforeConsumed(); }
+      catch (error) {
+        consumed.reject(error);
+        // The SDK still owns its outstanding read. A rejected offer must not
+        // end that iterator or leave a second reader behind.
+        return consumed.promise;
+      }
       this.#reader = undefined;
       onConsumed();
       consumed.resolve(undefined);
@@ -67,7 +75,7 @@ export class AsyncInputGate<T> implements AsyncIterable<T>, AsyncIterator<T> {
         this.#pending = undefined;
         consumed.reject(signal?.reason);
       };
-      this.#pending = { value, consumed, onConsumed, release: () => signal?.removeEventListener("abort", cancel) };
+      this.#pending = { value, consumed, onConsumed, beforeConsumed, release: () => signal?.removeEventListener("abort", cancel) };
       signal?.addEventListener("abort", cancel, { once: true });
     }
     return consumed.promise;
@@ -78,6 +86,13 @@ export class AsyncInputGate<T> implements AsyncIterable<T>, AsyncIterator<T> {
     if (pending !== undefined) {
       this.#pending = undefined;
       pending.release();
+      try { pending.beforeConsumed(); }
+      catch (error) {
+        pending.consumed.reject(error);
+        // Keep this same SDK read waiting for the next authorized offer;
+        // close() also settles it if its Adapter retires the runtime.
+        return this.next();
+      }
       pending.onConsumed();
       pending.consumed.resolve(undefined);
       return Promise.resolve({ value: pending.value, done: false });

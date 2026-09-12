@@ -6,7 +6,7 @@ import Paragraph from "@tiptap/extension-paragraph";
 import Text from "@tiptap/extension-text";
 import { EditorContent, useEditor } from "@tiptap/react";
 import { Fragment, Slice } from "@tiptap/pm/model";
-import { TextSelection } from "@tiptap/pm/state";
+import { TextSelection, type Transaction } from "@tiptap/pm/state";
 import { forwardRef, useEffect, useImperativeHandle, useRef, type JSX } from "react";
 import { composerDocumentIsEmpty, normalizeComposerDocument } from "../composer-quote-document.js";
 import { composerDocumentContainsList } from "../composer-list-document.js";
@@ -48,6 +48,7 @@ import {
 } from "./composer-list-nodes.js";
 import { plainTextToComposerDocument } from "../composer-quote-document.js";
 import { ComposerCjkPunctuationDecoration } from "./composer-cjk-punctuation.js";
+import { createComposerMentionTransactionMapper, type ComposerMentionRangeMapper } from "../composer-mention-transaction.js";
 
 export interface ComposerRichTextEditorHandle {
   readonly focus: (position?: "start" | "end") => void;
@@ -61,7 +62,7 @@ export const ComposerRichTextEditor = forwardRef<ComposerRichTextEditorHandle, {
   readonly editable: boolean;
   readonly disabled: boolean;
   readonly placeholder: string;
-  readonly onDocumentChange: (document: JSONContent, isComposing: boolean) => void;
+  readonly onDocumentChange: (document: JSONContent, isComposing: boolean, rangeMapper: ComposerMentionRangeMapper) => void;
   readonly onKeyDown: (event: KeyboardEvent, document: JSONContent) => boolean;
   readonly onClipboardFiles: (files: readonly File[]) => void;
   readonly pastedTextLabel: (lines: number) => string;
@@ -71,6 +72,7 @@ export const ComposerRichTextEditor = forwardRef<ComposerRichTextEditorHandle, {
   readonly resolveRouteReference?: ComposerRouteReferenceResolver;
 }>(function ComposerRichTextEditor({ document, editable, disabled, placeholder, onDocumentChange, onKeyDown, onClipboardFiles, pastedTextLabel, onPastedTextOpen, workingDirectory, knownWorkspacePaths = [], resolveRouteReference }, forwardedRef): JSX.Element {
   const pasteRuntimeRef = useRef({ editable, disabled, onClipboardFiles, pastedTextLabel, workingDirectory, knownWorkspacePaths, resolveRouteReference });
+  const pendingMentionTransactionsRef = useRef<readonly Transaction[]>([]);
   pasteRuntimeRef.current = { editable, disabled, onClipboardFiles, pastedTextLabel, workingDirectory, knownWorkspacePaths, resolveRouteReference };
   const editor = useEditor({
     immediatelyRender: false,
@@ -168,11 +170,17 @@ export const ComposerRichTextEditor = forwardRef<ComposerRichTextEditorHandle, {
       }
     },
     onCreate: ({ editor: activeEditor }) => setEditorEmptyAttribute(activeEditor.view.dom, activeEditor.getJSON()),
-    onUpdate: ({ editor: activeEditor }) => {
+    onTransaction: ({ editor: activeEditor, transaction, appendedTransactions }) => {
+      if (transaction.getMeta("preventUpdate") || ![transaction, ...appendedTransactions].some((entry) => entry.docChanged)) return;
+      // List promotion dispatches another update synchronously. Its mapping
+      // starts after this transaction, while the parent still owns the old ranges.
+      pendingMentionTransactionsRef.current = [...pendingMentionTransactionsRef.current, transaction, ...appendedTransactions];
       if (!activeEditor.view.composing && promoteTrailingPlainListParagraph(activeEditor.view)) return;
       const next = normalizeComposerDocument(activeEditor.getJSON());
+      const rangeMapper = createComposerMentionTransactionMapper(pendingMentionTransactionsRef.current);
+      pendingMentionTransactionsRef.current = [];
       setEditorEmptyAttribute(activeEditor.view.dom, next);
-      onDocumentChange(next, activeEditor.view.composing);
+      onDocumentChange(next, activeEditor.view.composing, rangeMapper);
     }
   });
 
@@ -221,6 +229,7 @@ export const ComposerRichTextEditor = forwardRef<ComposerRichTextEditorHandle, {
     // schema defaults (for example sourceEventId: null). Comparing raw JSON
     // would setContent after every keystroke and move the caret around atoms.
     if (JSON.stringify(normalizeComposerDocument(editor.getJSON())) === JSON.stringify(normalized)) return;
+    pendingMentionTransactionsRef.current = [];
     editor.commands.setContent(normalized, { emitUpdate: false });
     setEditorEmptyAttribute(editor.view.dom, normalized);
   }, [document, editor]);

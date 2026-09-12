@@ -406,6 +406,21 @@ describe("Orchestrator application composition", () => {
       managed: true,
       trusted: false
     }, { workspaceId: "workspace-restored" });
+    const defaultTarget = application.store.getTarget(config.workspace.id);
+    application.store.upsertTarget({ ...defaultTarget.descriptor, displayName: "Personal project", trusted: false }, {
+      ...defaultTarget.metadata as Record<string, unknown>, pinned: true
+    });
+    const archiveResponse = await server.inject({
+      method: "POST", url: "/joko.v1.OperationService/SubmitOperation",
+      headers: { authorization: `Bearer ${paired.authKey}`, "content-type": "application/json", "connect-protocol-version": "1" },
+      payload: {
+        operationId: "hide-configured-project", connectionId: paired.connection.id,
+        mutation: { archiveTarget: { targetId: config.workspace.id, archived: true } }
+      }
+    });
+    expect(archiveResponse.statusCode, archiveResponse.body).toBe(200);
+    const archivedMetadata = application.store.getTarget(config.workspace.id).metadata;
+    expect(archivedMetadata).toMatchObject({ state: "archived", pinned: true });
     await server.close();
     await internalServer.close();
     await lanServer.close();
@@ -423,8 +438,36 @@ describe("Orchestrator application composition", () => {
       { id: "claude-code", generation: 2 }
     ]));
     expect(reopened.workspaces.listRegistrations()).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: "workspace-restored", root: restoredWorkspaceRoot })
+      expect.objectContaining({ id: "workspace-restored", root: restoredWorkspaceRoot }),
+      expect.objectContaining({ id: config.workspace.id, displayName: "Personal project", trusted: false })
     ]));
+    expect(reopened.store.getTarget(config.workspace.id)).toMatchObject({
+      descriptor: { displayName: "Personal project", trusted: false, workspaceRoot: workspace },
+      metadata: archivedMetadata
+    });
+    const reopenedServer = await createPublicServer(reopened);
+    reopenedServer.log.level = "silent";
+    cleanups.push(() => reopenedServer.close());
+    const restoreResponse = await reopenedServer.inject({
+      method: "POST", url: "/joko.v1.OperationService/SubmitOperation",
+      headers: { authorization: `Bearer ${paired.authKey}`, "content-type": "application/json", "connect-protocol-version": "1" },
+      payload: {
+        operationId: "restore-configured-project", connectionId: paired.connection.id,
+        mutation: { archiveTarget: { targetId: config.workspace.id, archived: false } }
+      }
+    });
+    expect(restoreResponse.statusCode, restoreResponse.body).toBe(200);
+    expect(reopened.store.getTarget(config.workspace.id)).toMatchObject({
+      descriptor: { displayName: "Personal project", trusted: false },
+      metadata: { state: "active", pinned: true }
+    });
+    expect(reopened.store.listTargets()).toHaveLength(4);
+    await reopenedServer.close();
+    await reopened.close();
+    const differentRoot = join(root, "different-workspace");
+    await mkdir(differentRoot, { recursive: true });
+    await expect(createOrchestratorApplication({ ...config, workspace: { ...config.workspace, root: differentRoot } }))
+      .rejects.toThrow("does not match its persisted Target");
   }, 20_000);
 
   it("replaces an idle Pi runtime after native auth write-back without stale generation or fence", async () => {

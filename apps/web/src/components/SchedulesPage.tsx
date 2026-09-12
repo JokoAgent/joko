@@ -24,7 +24,7 @@ import {
   buildUsageLimitScheduleDraft,
   consumeUsageLimitScheduleIntent
 } from "../usage-limit-recovery.js";
-import { deleteScheduleWithGeneratedSessions, prepareScheduleDeletion, type GeneratedSessionDisposition, type ScheduleDeletionPreview } from "../schedule-deletion.js";
+import { deleteScheduleWithGeneratedSessions, prepareScheduleDeletion, type GeneratedSessionDisposition, type ScheduleDeletionPreview, type SessionRemovalPreparer } from "../schedule-deletion.js";
 import { ScheduleDeleteDialog } from "./ScheduleDeleteDialog.js";
 import { ScheduleRunHistoryCard } from "./ScheduleRunHistoryCard.js";
 import { groupScheduleHistoryRuns } from "./schedule-history-grouping.js";
@@ -41,7 +41,7 @@ interface ProjectAutomationNotice {
   readonly tone: "success" | "warning";
 }
 
-export function SchedulesPage({ controller, schedules, sessions, targets, models, backends, extraDirectories, focusScheduleId, locale, t, runAction, onOpenNavigation }: {
+export function SchedulesPage({ controller, schedules, sessions, targets, models, backends, extraDirectories, focusScheduleId, locale, t, runAction, onOpenNavigation, prepareSessionRemoval }: {
   readonly controller: AppController;
   readonly schedules: readonly ScheduleView[];
   readonly sessions: readonly SessionView[];
@@ -54,6 +54,7 @@ export function SchedulesPage({ controller, schedules, sessions, targets, models
   readonly t: Translator;
   readonly runAction: RunAction;
   readonly onOpenNavigation: () => void;
+  readonly prepareSessionRemoval: SessionRemovalPreparer;
 }): JSX.Element {
   const [deleteSchedule, setDeleteSchedule] = useState<ScheduleView>();
   const [deleteScheduleDisposition, setDeleteScheduleDisposition] = useState<GeneratedSessionDisposition>("keep");
@@ -195,14 +196,14 @@ export function SchedulesPage({ controller, schedules, sessions, targets, models
     const requestId = ++deleteSchedulePreviewRequestRef.current;
     setDeleteSchedulePreview(undefined);
     setDeleteSchedulePreviewError(undefined);
-    void prepareScheduleDeletion(controller, schedule, sessions).then((preview) => {
+    void prepareScheduleDeletion(controller, schedule, sessions, prepareSessionRemoval).then((preview) => {
       if (deleteSchedulePreviewRequestRef.current === requestId) setDeleteSchedulePreview(preview);
     }).catch((error: unknown) => {
       if (deleteSchedulePreviewRequestRef.current === requestId) {
         setDeleteSchedulePreviewError(error instanceof Error ? error.message : t("scheduler.deletePreviewFailed"));
       }
     });
-  }, [controller, sessions, t]);
+  }, [controller, prepareSessionRemoval, sessions, t]);
   const requestScheduleDeletion = useCallback((schedule: ScheduleView): void => {
     setDeleteScheduleDisposition("keep");
     setDeleteScheduleOperationError(undefined);
@@ -220,6 +221,13 @@ export function SchedulesPage({ controller, schedules, sessions, targets, models
     setDeleteSchedulePending(true);
     setDeleteScheduleOperationError(undefined);
     try {
+      if (deleteScheduleDisposition !== "keep") {
+        const refreshed = await prepareScheduleDeletion(controller, schedule, sessions, prepareSessionRemoval);
+        if (!sameScheduleDeletionPreview(deleteSchedulePreview, refreshed)) {
+          setDeleteSchedulePreview(refreshed);
+          return;
+        }
+      }
       const result = await deleteScheduleWithGeneratedSessions(controller, schedule, deleteScheduleDisposition, sessions);
       deleteSchedulePreviewRequestRef.current += 1;
       setDeleteSchedule(undefined);
@@ -237,7 +245,7 @@ export function SchedulesPage({ controller, schedules, sessions, targets, models
     } finally {
       setDeleteSchedulePending(false);
     }
-  }, [controller, deleteSchedule, deleteScheduleDisposition, deleteSchedulePending, deleteSchedulePreview, sessions, showProjectNotice, t]);
+  }, [controller, deleteSchedule, deleteScheduleDisposition, deleteSchedulePending, deleteSchedulePreview, prepareSessionRemoval, sessions, showProjectNotice, t]);
   const markAllScheduleHistoryRead = useCallback((): void => {
     runAction("schedule-history-mark-all-read", async () => {
       const attentionFailures: string[] = [];
@@ -406,7 +414,7 @@ export function SchedulesPage({ controller, schedules, sessions, targets, models
           if (projectOwned) showProjectNotice(t("scheduler.projectUpdated"));
         });
       }} />
-      <ScheduleDeleteDialog schedule={deleteSchedule} disposition={deleteScheduleDisposition} generatedCount={deleteSchedulePreview?.generatedSessionIds.length} inflightCount={deleteSchedulePreview?.inflightCount} previewError={deleteSchedulePreviewError} operationError={deleteScheduleOperationError} pending={deleteSchedulePending} t={t} onDispositionChange={setDeleteScheduleDisposition} onRetryPreview={() => { if (deleteSchedule !== undefined) loadScheduleDeletionPreview(deleteSchedule); }} onClose={closeScheduleDeletion} onConfirm={() => void confirmScheduleDeletion()} />
+      <ScheduleDeleteDialog schedule={deleteSchedule} disposition={deleteScheduleDisposition} generatedCount={deleteSchedulePreview?.generatedSessionIds.length} inflightCount={deleteSchedulePreview?.inflightCount} worktreeRemoval={deleteSchedulePreview?.worktreeRemoval} previewError={deleteSchedulePreviewError} operationError={deleteScheduleOperationError} pending={deleteSchedulePending} t={t} onDispositionChange={setDeleteScheduleDisposition} onRetryPreview={() => { if (deleteSchedule !== undefined) loadScheduleDeletionPreview(deleteSchedule); }} onClose={closeScheduleDeletion} onConfirm={() => void confirmScheduleDeletion()} />
       <Modal
         open={removeProjectSchedule !== undefined}
         title={t("scheduler.projectRemoveTitle")}
@@ -1194,6 +1202,15 @@ function formatScheduleDateTime(value: number, locale: string, timezone: string)
   } catch {
     return formatDateTime(value, locale);
   }
+}
+
+function sameScheduleDeletionPreview(left: ScheduleDeletionPreview, right: ScheduleDeletionPreview): boolean {
+  return left.inflightCount === right.inflightCount
+    && left.generatedSessionIds.length === right.generatedSessionIds.length
+    && left.generatedSessionIds.every((sessionId, index) => sessionId === right.generatedSessionIds[index])
+    && left.worktreeRemoval.clean === right.worktreeRemoval.clean
+    && left.worktreeRemoval.dirty === right.worktreeRemoval.dirty
+    && left.worktreeRemoval.unknown === right.worktreeRemoval.unknown;
 }
 
 function runScheduleAction(runAction: RunAction, key: string, action: () => Promise<void>): Promise<void> {

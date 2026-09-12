@@ -31,6 +31,7 @@ import { parseWorkspaceFilesHash, workspaceFilesHash } from "./workspace-files-n
 import { requestWorkspaceDocumentLeave, workspaceRouteLeaveRequest } from "./workspace-document-lifecycle.js";
 import type {
   AppSnapshot,
+  BrowserSettingsView,
   BrowserView,
   ComposerDraft,
   ConnectionProfile,
@@ -247,6 +248,7 @@ export function useAppController(): AppController {
   const discoveryAbortRef = useRef<AbortController | undefined>(undefined);
   const startupAutoConnectRef = useRef<ConnectionProfile | undefined>(undefined);
   const startupManagedLocalAutoPendingRef = useRef(false);
+  const explicitDisconnectRef = useRef(false);
   const managedRetryRef = useRef(false);
   const machineRefreshGenerationRef = useRef(0);
   const machineRefreshPromiseRef = useRef<Promise<void> | undefined>(undefined);
@@ -335,6 +337,7 @@ export function useAppController(): AppController {
       if (!cancelled) setState((current) => ({ ...current, ready: true, error: messageOf(error) }));
     });
     const commitRoute = (route: AppRoute): void => {
+      explicitDisconnectRef.current = false;
       routeRef.current = route;
       setState((current) => ({
         ...current,
@@ -347,6 +350,10 @@ export function useAppController(): AppController {
       const next = routeFromLocation();
       if (navigationBypassHashRef.current === requestedHash) {
         navigationBypassHashRef.current = undefined;
+        if (explicitDisconnectRef.current) {
+          window.history.replaceState(window.history.state, "", appRouteHash(routeRef.current));
+          return;
+        }
         commitRoute(next);
         return;
       }
@@ -468,6 +475,7 @@ export function useAppController(): AppController {
   }, [updatePreferences]);
 
   const beginGatewayTransition = useCallback((): number => {
+    explicitDisconnectRef.current = false;
     const generation = ++gatewayGenerationRef.current;
     const previous = gatewayRef.current;
     gatewayRef.current = undefined;
@@ -893,8 +901,12 @@ export function useAppController(): AppController {
   }, [beginGatewayTransition, bindGateway, commitAutomaticConnectionChoice, state.profiles]);
 
   const disconnect = useCallback(async (): Promise<void> => {
+    explicitDisconnectRef.current = true;
+    startupAutoConnectRef.current = undefined;
     startupManagedLocalAutoPendingRef.current = false;
     automaticPreferenceIntentRef.current += 1;
+    machineSwitchIntentRef.current += 1;
+    navigationRequestRef.current += 1;
     gatewayGenerationRef.current += 1;
     const previous = gatewayRef.current;
     gatewayRef.current = undefined;
@@ -968,6 +980,7 @@ export function useAppController(): AppController {
       : route;
     const hash = appRouteHash(effectiveRoute);
     const commit = (): void => {
+      explicitDisconnectRef.current = false;
       routeRef.current = effectiveRoute;
       if (window.location.hash === hash) setState((current) => ({
         ...current,
@@ -1347,6 +1360,7 @@ export function useAppController(): AppController {
   useEffect(() => {
     const route = state.route;
     if (!state.ready || route.kind !== "session" || route.profileId === undefined || route.sessionId === undefined) return;
+    if (explicitDisconnectRef.current) return;
     if (activeProfileRef.current?.id === route.profileId && connectionStateRef.current === "connecting") return;
     if (activeProfileRef.current?.id === route.profileId
       && connectionStateRef.current === "connected"
@@ -1440,6 +1454,19 @@ export function useAppController(): AppController {
   }, []);
 
   const artifactGateway = gatewayRef.current;
+  const queueApi = useMemo(() => {
+    const original = () => { if (artifactGateway === undefined) throw new Error("Connect to Joko before changing queued input."); return artifactGateway; };
+    return {
+      cancelQueueItem: (...args: Parameters<AppController["cancelQueueItem"]>) => original().cancelQueueItem(...args),
+      setQueueItemEditLock: (...args: Parameters<AppController["setQueueItemEditLock"]>) => original().setQueueItemEditLock(...args),
+      setQueueInteractionLock: (...args: Parameters<AppController["setQueueInteractionLock"]>) => original().setQueueInteractionLock(...args),
+      editQueueItem: (...args: Parameters<AppController["editQueueItem"]>) => original().editQueueItem(...args),
+      reorderQueueItem: (...args: Parameters<AppController["reorderQueueItem"]>) => original().reorderQueueItem(...args),
+      steerQueueItemNow: (...args: Parameters<AppController["steerQueueItemNow"]>) => original().steerQueueItemNow(...args),
+      pauseQueue: (...args: Parameters<AppController["pauseQueue"]>) => original().pauseQueue(...args),
+      resumeQueue: (...args: Parameters<AppController["resumeQueue"]>) => original().resumeQueue(...args)
+    };
+  }, [artifactGateway]);
   const linkGatewayGeneration = gatewayGenerationRef.current;
   useEffect(() => {
     for (const [pageId, preview] of htmlPreviewsRef.current) {
@@ -1496,22 +1523,32 @@ export function useAppController(): AppController {
       if (typeof destination !== "string") {
         assertCurrent();
         if (artifactGateway === undefined || options?.sessionId === undefined) throw new Error("An active connected task is required to preview HTML.");
+        const session = snapshotRef.current.sessions.find((value) => value.id === options.sessionId);
+        if (session === undefined || session.archived) throw new Error("An active connected task is required to preview HTML.");
         const preference = options.forceExternal === true ? "external" : options.forceSidebar === true ? "sidebar" : preferencesRef.current.localLinkOpenPreference;
-        if (preference === "external") throw new WorkspaceHtmlExternalUnavailableError();
-        const browser = snapshotRef.current.browsers.find((candidate) => candidate.state === "ready");
-        if (preference === "sidebar" && browser === undefined) throw new Error("The sidebar Browser is unavailable.");
+        const configuredBrowserIds = new Set(snapshotRef.current.settings.browsers
+          .filter((settings) => settings.automationTarget === preference
+            && settings.support === "supported"
+            && settings.targetSettings.some((target) => target.targetId === session.targetId && target.enabled))
+          .map((settings) => settings.browserProviderId));
+        const browser = snapshotRef.current.browsers.find((candidate) =>
+          configuredBrowserIds.has(candidate.id)
+          && (candidate.state === "ready" || (preference === "external" && candidate.state === "stopped")));
+        if (browser === undefined) {
+          if (preference === "external") throw new WorkspaceHtmlExternalUnavailableError();
+          throw new Error("The sidebar Browser is unavailable.");
+        }
         const snapshot = await artifactGateway.readWorkspaceHtmlSnapshot(options.sessionId, destination.workspaceId, destination.path, action.signal);
         assertCurrent();
-        const pageId = await artifactGateway.openBrowserPage(browser!.id, options.sessionId, "", "", snapshot.file);
-        await showBrowser(browser!.id, pageId, options.sessionId);
-        const session = snapshotRef.current.sessions.find((value) => value.id === options.sessionId);
-        if (session !== undefined) {
-          const reload = new WorkspaceHtmlAutoReload(snapshot.file.workspaceId, snapshot.file.relativePath);
-          reload.observe(session, [], true);
-          htmlPreviewsRef.current.set(pageId, { gateway: artifactGateway, gatewayGeneration: linkGatewayGeneration,
-            browserId: browser!.id, browserGeneration: browser!.generation, sessionId: session.id, targetId: session.targetId,
-            sessionGeneration: session.generation, ownerDocument, ownerHash: ownerWindow?.location.hash, reload });
-        }
+        const pageId = await artifactGateway.openBrowserPage(browser.id, options.sessionId, "", preference, "", snapshot.file);
+        assertCurrent();
+        if (preference === "external") return;
+        await showBrowser(browser.id, pageId, options.sessionId);
+        const reload = new WorkspaceHtmlAutoReload(snapshot.file.workspaceId, snapshot.file.relativePath);
+        reload.observe(session, [], true);
+        htmlPreviewsRef.current.set(pageId, { gateway: artifactGateway, gatewayGeneration: linkGatewayGeneration,
+          browserId: browser.id, browserGeneration: browser.generation, sessionId: session.id, targetId: session.targetId,
+          sessionGeneration: session.generation, ownerDocument, ownerHash: ownerWindow?.location.hash, reload });
         return;
       }
       const url = destination;
@@ -1521,7 +1558,7 @@ export function useAppController(): AppController {
         openPage: (browserId, sessionId, targetUrl) => {
           assertCurrent();
           if (artifactGateway === undefined) throw new Error("Connect to Joko before opening a Browser page.");
-          return artifactGateway.openBrowserPage(browserId, sessionId, targetUrl);
+          return artifactGateway.openBrowserPage(browserId, sessionId, targetUrl, "sidebar");
         },
         showBrowser,
         openExternal: (targetUrl) => openExternalHttpUrl(targetUrl, ownerDocument)
@@ -1616,6 +1653,8 @@ export function useAppController(): AppController {
     };
     return {
       refresh: async () => original().refresh(),
+      listSessionArtifacts: async (...args: Parameters<OperationApi["listSessionArtifacts"]>) => original().listSessionArtifacts(...args),
+      readSessionArtifact: async (...args: Parameters<OperationApi["readSessionArtifact"]>) => original().readSessionArtifact(...args),
       send: async (...args: Parameters<OperationApi["send"]>) => original().send(...args),
       createTarget: async (...args: Parameters<OperationApi["createTarget"]>) => original().createTarget(...args),
       createSession: async (draft: NewSessionDraft) => original().createSession(sessionDraftWithPersonalization(
@@ -1877,6 +1916,7 @@ export function useAppController(): AppController {
     suggestSessionTitle: (sessionId, signal) => gateway().suggestSessionTitle(sessionId, signal),
     pinSession: (sessionId, pinned) => gateway().pinSession(sessionId, pinned),
     archiveSession: (sessionId, archived) => gateway().archiveSession(sessionId, archived),
+    getSessionWorktreeRemovalPreview: (sessionId, signal) => gateway().getSessionWorktreeRemovalPreview(sessionId, signal),
     moveSessionProject: (sessionId, projectId, catalogImport) => gateway().moveSessionProject(sessionId, projectId, catalogImport),
     acknowledgeSessionAttention: (sessionId, throughCursor) => gateway().acknowledgeSessionAttention(sessionId, throughCursor),
     acknowledgeSessionError: (sessionId, throughCursor) => gateway().acknowledgeSessionError(sessionId, throughCursor),
@@ -1886,7 +1926,7 @@ export function useAppController(): AppController {
     discoverNativeSessions: (targetId) => gateway().discoverNativeSessions(targetId),
     scanNativeSessionCatalog: (backendId, options) => gateway().scanNativeSessionCatalog(backendId, options),
     archiveTarget: (targetId, archived) => gateway().archiveTarget(targetId, archived),
-    deleteTarget: (targetId, deleteManagedWorkspace, deleteProductSessions) => gateway().deleteTarget(targetId, deleteManagedWorkspace, deleteProductSessions),
+    deleteTarget: (targetId, deleteManagedWorkspace) => gateway().deleteTarget(targetId, deleteManagedWorkspace),
     setWorkspaceTrust: (workspaceId, trusted) => gateway().setWorkspaceTrust(workspaceId, trusted),
     addExtraDirectory: (workspaceId, serverPath, access) => gateway().addExtraDirectory(workspaceId, serverPath, access),
     removeExtraDirectory: (extraDirectoryId) => gateway().removeExtraDirectory(extraDirectoryId),
@@ -1925,17 +1965,23 @@ export function useAppController(): AppController {
     saveSchedule: (scheduleId, draft) => gateway().saveSchedule(scheduleId, draft),
     listScheduleRunHistory: (scheduleId, pageToken, pageSize) => gateway().listScheduleRunHistory(scheduleId, pageToken, pageSize),
     getSchedulerRuntime: (signal) => gateway().getSchedulerRuntime(signal),
-    cancelQueueItem: (queueItemId) => gateway().cancelQueueItem(queueItemId),
-    setQueueItemEditLock: (queueItemId, lockToken, locked) => gateway().setQueueItemEditLock(queueItemId, lockToken, locked),
-    setQueueInteractionLock: (sessionId, lockToken, locked) => gateway().setQueueInteractionLock(sessionId, lockToken, locked),
-    editQueueItem: (queueItemId, text, mode, lockToken) => gateway().editQueueItem(queueItemId, text, mode, lockToken),
-    reorderQueueItem: (queueItemId, placement, anchorQueueItemId, interactionLockToken) => gateway().reorderQueueItem(queueItemId, placement, anchorQueueItemId, interactionLockToken),
-    steerQueueItemNow: (queueItemId, text, lockToken) => gateway().steerQueueItemNow(queueItemId, text, lockToken),
-    pauseQueue: (sessionId, reason) => gateway().pauseQueue(sessionId, reason),
-    resumeQueue: (sessionId) => gateway().resumeQueue(sessionId),
+    ...queueApi,
     restartBrowser: (browserId) => gateway().restartBrowser(browserId),
-    openBrowserPage: (...args) => gateway().openBrowserPage(...args),
-    recoverBrowserPage: (browserId, sessionId, pageId, url) => gateway().recoverBrowserPage(browserId, sessionId, pageId, url),
+    openBrowserPage: (browserId, sessionId, url, recoveryPageId, workspaceHtml) => gateway().openBrowserPage(
+      browserId,
+      sessionId,
+      url,
+      browserPresentationTarget(snapshotRef.current, browserId),
+      recoveryPageId,
+      workspaceHtml
+    ),
+    recoverBrowserPage: (browserId, sessionId, pageId, url) => gateway().recoverBrowserPage(
+      browserId,
+      sessionId,
+      pageId,
+      url,
+      browserPresentationTarget(snapshotRef.current, browserId)
+    ),
     focusBrowserPage: (browserId, pageId) => gateway().focusBrowserPage(browserId, pageId),
     closeBrowserPage: (browserId, pageId) => gateway().closeBrowserPage(browserId, pageId),
     beginBrowserTakeover: (browserId, pageId) => gateway().beginBrowserTakeover(browserId, pageId),
@@ -1952,6 +1998,7 @@ export function useAppController(): AppController {
     setResourceEnabled: (resourceId, enabled) => gateway().setResourceEnabled(resourceId, enabled),
     removeResource: (resourceId) => gateway().removeResource(resourceId),
     listCommands: (sessionId) => gateway().listCommands(sessionId),
+    listSessionResources: (sessionId, signal) => gateway().listSessionResources(sessionId, signal),
     listRuntimeProcesses: (backendId, signal) => gateway().listRuntimeProcesses(backendId, signal),
     getUsageHistory: (days, backendId, providerId, signal) => gateway().getUsageHistory(days, backendId, providerId, signal),
     getUsageReport: usageApi.getUsageReport,
@@ -2220,6 +2267,12 @@ export interface OpenHttpLinkDependencies {
   readonly openPage: (browserId: string, sessionId: string, url: string) => Promise<string>;
   readonly showBrowser: (browserId: string, pageId: string, sessionId: string) => Promise<void> | void;
   readonly openExternal: (url: string) => Promise<void>;
+}
+
+function browserPresentationTarget(snapshot: AppSnapshot, browserId: string): BrowserSettingsView["automationTarget"] {
+  const settings = snapshot.settings.browsers.find((candidate) => candidate.browserProviderId === browserId);
+  if (settings === undefined) throw new Error("The Browser presentation target is unavailable.");
+  return settings.automationTarget;
 }
 
 export function resolveLinkOpenPreference(
@@ -2667,7 +2720,7 @@ export function composerDraftWithEditorText(text: string, draft: ComposerDraft |
     text,
     attachments: draft?.attachments ?? [],
     ...(draft?.browserComments === undefined ? {} : { browserComments: draft.browserComments }),
-    mentions: draft?.mentions ?? [],
+    mentions: draft?.mentions.filter((mention) => mention.kind === "message") ?? [],
     ...(editorDocument === undefined ? {} : { editorDocument }),
     deliveryMode: draft?.deliveryMode ?? "prompt",
     ...(draft?.extraDirectoryIds === undefined ? {} : { extraDirectoryIds: draft.extraDirectoryIds })

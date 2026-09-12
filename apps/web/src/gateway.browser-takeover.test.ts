@@ -2,6 +2,7 @@ import { create } from "@bufbuild/protobuf";
 import type { Transport } from "@connectrpc/connect";
 import {
   BrowserProviderState,
+  BrowserAutomationTarget,
   BrowserCommentDesignAction,
   BrowserCommentInspectionIntent,
   BrowserCommentTargetKind,
@@ -23,6 +24,45 @@ import { describe, expect, it, vi } from "vitest";
 import { createOrchestratorGateway } from "./gateway.js";
 
 describe("remote browser takeover gateway", () => {
+  it("maps Browser settings targets exactly and rejects unknown runtime values before RPC", async () => {
+    const submitted: any[] = [];
+    const snapshot = create(SnapshotSchema, {});
+    const transport = {
+      unary: vi.fn(async (method: any, _signal: unknown, _timeout: unknown, _headers: unknown, input: any) => {
+        if (method.localName === "getSnapshot") return response(method, create(GetSnapshotResponseSchema, { snapshot }));
+        submitted.push(input.mutation.payload);
+        return response(method, create(SubmitOperationResponseSchema, {
+          operation: {
+            operationId: input.operationId,
+            state: OperationState.SUCCEEDED,
+            result: { payload: { case: "acknowledgement", value: { accepted: true } } }
+          }
+        }));
+      }),
+      stream: vi.fn(async (method: any) => response(method, idleStream(), true))
+    } as unknown as Transport;
+    const gateway = createOrchestratorGateway(
+      { id: "connection-1", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" },
+      "secret",
+      {},
+      () => transport
+    );
+    await gateway.connect();
+
+    await expect(gateway.updateBrowserSettings("browser-1", {
+      automationTarget: "automatic" as "sidebar"
+    })).rejects.toThrow("must be sidebar or external");
+    expect(submitted).toEqual([]);
+
+    await gateway.updateBrowserSettings("browser-1", { automationTarget: "sidebar" });
+    await gateway.updateBrowserSettings("browser-1", { automationTarget: "external" });
+    expect(submitted).toMatchObject([
+      { case: "updateBrowserSettings", value: { patch: { automationTarget: BrowserAutomationTarget.SIDEBAR } } },
+      { case: "updateBrowserSettings", value: { patch: { automationTarget: BrowserAutomationTarget.EXTERNAL } } }
+    ]);
+    gateway.disconnect();
+  });
+
   it("opens a session-scoped fresh HTTP or revision-fenced HTML page without persisting source bytes", async () => {
     const submitted: any[] = [];
     const snapshot = create(SnapshotSchema, {
@@ -65,26 +105,32 @@ describe("remote browser takeover gateway", () => {
     );
     await gateway.connect();
 
-    await expect(gateway.openBrowserPage("browser-1", "session-1", "https://example.test/docs")).resolves.toBe("page-new");
+    await expect(gateway.openBrowserPage("browser-1", "session-1", "https://example.test/docs", "automatic" as "sidebar"))
+      .rejects.toThrow("presentation target is required");
+    expect(submitted).toHaveLength(0);
+    await expect(gateway.openBrowserPage("browser-1", "session-1", "https://example.test/docs", "sidebar")).resolves.toBe("page-new");
     expect(submitted).toMatchObject([{
       case: "openBrowserPage",
       value: {
         browserProviderId: "browser-1",
         sessionId: "session-1",
         url: "https://example.test/docs",
+        presentationTarget: BrowserAutomationTarget.SIDEBAR,
         expectedGeneration: 7n,
         currentPageId: "",
         takeoverId: "",
         recoveryPageId: ""
       }
     }]);
-    await expect(gateway.openBrowserPage("browser-1", "session-1", "https://example.test/callback?access_token=secret"))
+    await expect(gateway.openBrowserPage("browser-1", "session-1", "https://example.test/callback?access_token=secret", "sidebar"))
       .rejects.toThrow("Credential-shaped");
     expect(submitted).toHaveLength(1);
     const html = await gateway.readWorkspaceHtmlSnapshot("session-1", "workspace", "index.html", new AbortController().signal);
-    await expect(gateway.openBrowserPage("browser-1", "session-1", "https://example.test/", "", html.file)).rejects.toThrow("without a URL");
-    await expect(gateway.openBrowserPage("browser-1", "session-1", "", "", html.file)).resolves.toBe("page-new");
-    expect(submitted[1]).toMatchObject({ case: "openBrowserPage", value: { url: "", workspaceHtml: html.file } });
+    await expect(gateway.openBrowserPage("browser-1", "session-1", "https://example.test/", "external", "", html.file)).rejects.toThrow("without a URL");
+    await expect(gateway.openBrowserPage("browser-1", "session-1", "", "external", "", html.file)).resolves.toBe("page-new");
+    expect(submitted[1]).toMatchObject({ case: "openBrowserPage", value: {
+      url: "", presentationTarget: BrowserAutomationTarget.EXTERNAL, workspaceHtml: html.file
+    } });
     expect(JSON.stringify(submitted[1], (_key, value) => typeof value === "bigint" ? value.toString() : value)).not.toContain("Private source");
     gateway.disconnect();
   });
@@ -144,7 +190,7 @@ describe("remote browser takeover gateway", () => {
 
     await expect(gateway.focusBrowserPage("browser-1", "page-2")).resolves.toBe("page-2");
     await expect(gateway.closeBrowserPage("browser-1", "page-1")).resolves.toBe("page-2");
-    await expect(gateway.recoverBrowserPage("browser-1", "session-1", "page-lost", "https://lost.test/"))
+    await expect(gateway.recoverBrowserPage("browser-1", "session-1", "page-lost", "https://lost.test/", "sidebar"))
       .resolves.toBe("page-new");
 
     expect(submitted).toMatchObject([
@@ -156,6 +202,7 @@ describe("remote browser takeover gateway", () => {
       } },
       { case: "openBrowserPage", value: {
         browserProviderId: "browser-1", sessionId: "session-1", url: "https://lost.test/", expectedGeneration: 7n,
+        presentationTarget: BrowserAutomationTarget.SIDEBAR,
         currentPageId: "page-1", takeoverId: "takeover-1", recoveryPageId: "page-lost"
       } }
     ]);

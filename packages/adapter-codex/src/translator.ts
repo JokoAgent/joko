@@ -75,10 +75,10 @@ export async function translatePromptInput(
   context: AdapterContext,
   resolvers: CodexInputResolvers
 ): Promise<readonly NativeUserInput[]> {
-  if (input.mentions.some((mention) => mention.kind === "workspace_directory" || mention.lineRange !== undefined)) {
+  if (input.mentions.some((mention) => mention.kind !== "workspace_file" || mention.lineRange !== undefined)) {
     throw adapterError({
       code: "CODEX_MENTION_KIND_UNSUPPORTED",
-      message: "Directory and source line range mentions are unavailable for this native input.",
+      message: "This native input supports only regular workspace file mentions.",
       phase: "dispatch",
       recovery: "Choose a regular workspace file mention."
     });
@@ -106,6 +106,7 @@ export async function translatePromptInput(
       recovery: "Reduce the number of attachments and mentions before retrying."
     });
   }
+  const textParts = input.text.length > 0 ? [input.text] : [];
   if (Buffer.byteLength(input.text, "utf8") > maximumPromptTextBytes) {
     throw adapterError({
       code: "CODEX_PROMPT_TOO_LARGE",
@@ -114,7 +115,6 @@ export async function translatePromptInput(
       recovery: "Shorten the prompt or attach bounded workspace files instead."
     });
   }
-  if (input.text.length > 0) result.push({ type: "text", text: input.text, text_elements: [] });
   const maximumBlobBytes = positiveBound(
     resolvers.maximumBlobBytes,
     DEFAULT_MAXIMUM_BLOB_BYTES,
@@ -197,28 +197,27 @@ export async function translatePromptInput(
     const path = file.workspacePath === undefined
       ? await resolveManagedFile(file.blob, context, resolvers)
       : await resolveWorkspacePath(context.target.workspaceRoot, file.workspacePath);
-    result.push({
-      type: "mention",
+    textParts.push(`Attached file: ${JSON.stringify({
       name: file.blob.fileName ?? basename(path),
       path
-    });
+    })}`);
   }
   for (const mention of input.mentions) {
-    let path: string;
-    if (mention.kind === "workspace_file") {
-      path = await resolveWorkspacePath(context.target.workspaceRoot, mention.reference);
-    } else if (isSafeMentionReference(mention.reference)) {
-      path = mention.reference;
-    } else {
-      throw adapterError({
-        code: "CODEX_MENTION_REFERENCE_UNSUPPORTED",
-        message: "A mention does not resolve to a supported local or capability URI.",
-        phase: "dispatch",
-        recovery: "Select a workspace file, app, or plugin mention exposed by the current Target."
-      });
-    }
-    result.push({ type: "mention", name: mention.label, path });
+    const path = await resolveWorkspacePath(context.target.workspaceRoot, mention.reference);
+    textParts.push(`Workspace file reference: ${JSON.stringify({ name: mention.label, path })}`);
   }
+  const combinedText = textParts.join("\n\n");
+  if (Buffer.byteLength(combinedText, "utf8") > maximumPromptTextBytes) {
+    throw adapterError({
+      code: "CODEX_PROMPT_TOO_LARGE",
+      message: "The Codex prompt text exceeds the configured input limit.",
+      phase: "dispatch",
+      recovery: "Shorten the prompt or attach bounded workspace files instead."
+    });
+  }
+  // Native mentions select tools such as apps, plugins, and skills. Ordinary
+  // file identities must remain model-visible text instead of using that form.
+  if (combinedText.length > 0) result.unshift({ type: "text", text: combinedText, text_elements: [] });
   if (result.length === 0) {
     throw adapterError({
       code: "CODEX_PROMPT_EMPTY",
@@ -690,12 +689,12 @@ function projectInteractionQuestions(values: readonly JsonValue[]): readonly Pro
     projected.push(choices.length === 0
       ? {
           nativeId,
-          field: { ...base, kind: "text", multiline: false, sensitive: false },
+          field: { ...base, kind: "text", multiline: false },
           allowsOther: false
         }
       : {
           nativeId,
-          field: { ...base, kind: "single", choices },
+          field: { ...base, kind: "single", choices, allowOther: value["isOther"] === true },
           optionByChoiceId,
           allowsOther: value["isOther"] === true
         });
@@ -721,15 +720,19 @@ function durableInteractionId(
 
 function normalizeInteractionAnswer(
   question: ProjectedInteractionQuestion,
-  value: string | boolean | readonly string[] | undefined
+  value: Extract<InteractionDecision, { readonly kind: "question" }>["answers"][string] | undefined
 ): string | undefined {
-  const raw = Array.isArray(value) ? value[0] : value;
-  if (raw === undefined) return undefined;
-  const answer = typeof raw === "boolean" ? String(raw) : raw;
-  if (question.optionByChoiceId === undefined) return boundedAnswer(answer);
-  const nativeOption = question.optionByChoiceId.get(answer);
-  if (nativeOption !== undefined) return nativeOption;
-  return question.allowsOther ? boundedAnswer(answer) : undefined;
+  if (value === undefined) return undefined;
+  if (question.optionByChoiceId === undefined) {
+    if (value.kind === "text") return boundedAnswer(value.value);
+    if (value.kind === "boolean") return boundedAnswer(String(value.value));
+    return undefined;
+  }
+  if (value.kind !== "single") return undefined;
+  if (value.selection.kind === "choice") {
+    return question.optionByChoiceId.get(value.selection.choiceId);
+  }
+  return question.allowsOther ? boundedAnswer(value.selection.text) : undefined;
 }
 
 function boundedAnswer(value: string): string | undefined {
@@ -906,11 +909,6 @@ async function validateRegularFile(path: string): Promise<string> {
     });
   }
   return canonical;
-}
-
-function isSafeMentionReference(value: string): boolean {
-  if (value.length === 0 || value.length > 4_096 || /[?#]/.test(value)) return false;
-  return /^(?:app|plugin):\/\/[A-Za-z0-9._@/-]+$/.test(value);
 }
 
 export function safeText(value: string, limit: number): string {

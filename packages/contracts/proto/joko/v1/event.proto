@@ -185,9 +185,6 @@ message MessageStartedEvent {
   string turn_id = 2;
   MessageRole role = 3;
   InputContent user_input = 4;
-  // Persisted end-to-end from the accepted SendInput. Only true permits quote
-  // marker parsing/stripping in a client projection.
-  bool quotes_encoded = 5;
   MessageAutomationOrigin automation_origin = 6;
   // UNSPECIFIED is reserved for untyped imported native history whose original
   // accepted-input delivery cannot be proven.
@@ -197,6 +194,9 @@ message MessageStartedEvent {
   // prompt with the matching RuntimeRecoveryChangedEvent activity row.
   bool automatic_continuation = 9;
   string runtime_recovery_id = 10;
+  // Only the Host may mark user_input as the canonical accepted Queue input.
+  // False denotes native history without typed mention, quote, or paste authority.
+  bool user_input_accepted = 11;
 }
 
 enum RuntimeRecoveryState {

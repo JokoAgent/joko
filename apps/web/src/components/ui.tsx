@@ -918,15 +918,18 @@ export function Modal({ open, title, description, children, onClose, closeLabel,
       ? null
       : dialog?.querySelector<HTMLElement>(".modal__actions .button:not(.button--danger):not([disabled])");
     const headerBack = dialog?.querySelector<HTMLElement>(".modal__header-leading button:not([disabled])");
-    const focusable = preferred !== undefined && preferred !== null && dialog?.contains(preferred) === true
+    const eligible = (element: HTMLElement): boolean => !element.matches(":disabled") && element.tabIndex !== -1;
+    const firstFocusable = (root: HTMLElement | null | undefined): HTMLElement | undefined =>
+      [...(root?.querySelectorAll<HTMLElement>(FOCUSABLE) ?? [])].find(eligible);
+    const focusable = preferred !== undefined && preferred !== null && dialog?.contains(preferred) === true && eligible(preferred)
       ? preferred
       : destructiveCancel !== null
         ? destructiveCancel
         : headerBack !== null
           ? headerBack
-          : active !== null && dialog?.contains(active) === true && active.matches(FOCUSABLE)
+          : active !== null && dialog?.contains(active) === true && active.matches(FOCUSABLE) && eligible(active)
             ? active
-            : body?.querySelector<HTMLElement>(FOCUSABLE) ?? dialog?.querySelector<HTMLElement>(FOCUSABLE);
+            : firstFocusable(body) ?? firstFocusable(dialog);
     (focusable ?? dialog)?.focus();
     const handleKey = (event: KeyboardEvent): void => {
       if (pageHidden || event.defaultPrevented || event.isComposing || !modalOwnsKeyboardEvent(event, dialog) || selectControlOwnsEscape(event, ownerDocument)) return;
@@ -937,7 +940,7 @@ export function Modal({ open, title, description, children, onClose, closeLabel,
         return;
       }
       if (event.key !== "Tab" || dialog === null) return;
-      const elements = [...dialog.querySelectorAll<HTMLElement>(FOCUSABLE)].filter((element) => !element.hasAttribute("disabled") && element.tabIndex !== -1);
+      const elements = [...dialog.querySelectorAll<HTMLElement>(FOCUSABLE)].filter(eligible);
       if (elements.length === 0) {
         event.preventDefault();
         dialog.focus();

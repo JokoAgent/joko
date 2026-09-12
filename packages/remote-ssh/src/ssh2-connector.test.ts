@@ -473,6 +473,31 @@ describe("SSH interactive terminal transport", () => {
     await connection.close();
   });
 
+  it("accepts a late exit confirmation from the same channel after an unconfirmed stop", async () => {
+    const server = await startSshServer({ confirmTerminalStop: false });
+    const connection = await connect(server.port, { terminalStopTimeoutMs: 150 });
+    const terminal = await connection.terminals!.open(request);
+    const exits: RemoteTerminalExit[] = [];
+    const output: string[] = [];
+    terminal.onExit((exit) => exits.push(exit));
+    terminal.onData((data) => output.push(data));
+    await expect(terminal.kill()).rejects.toMatchObject({ code: "TERMINAL_UNKNOWN" });
+    expect(exits).toEqual([{ exitCode: 1, failureCode: "TERMINAL_UNKNOWN", processExitConfirmed: false }]);
+    await expect(terminal.write("do not replay")).rejects.toMatchObject({ code: "TERMINAL_UNAVAILABLE" });
+    const channel = server.terminalChannels[0]!;
+    channel.write("discarded after failure");
+    channel.exit(7);
+    channel.end();
+    await vi.waitFor(() => expect(exits).toEqual([
+      { exitCode: 1, failureCode: "TERMINAL_UNKNOWN", processExitConfirmed: false },
+      { exitCode: 7, failureCode: "TERMINAL_UNKNOWN", processExitConfirmed: true }
+    ]));
+    expect(output).toEqual([]);
+    await expect(terminal.kill()).resolves.toBeUndefined();
+    expect((await connection.execute!({ command: "bounded-output", timeoutMs: 1_000, maxOutputBytes: 128, signal: new AbortController().signal })).stdout).toBe("abcdefghijklmnop");
+    await connection.close();
+  });
+
   it("bounds output received before subscription and rejects unsafe start values before dispatch", async () => {
     const server = await startSshServer();
     const connection = await connect(server.port);

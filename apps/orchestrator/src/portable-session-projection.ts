@@ -1,4 +1,4 @@
-import { assertAudioArtifactMetadata, validInlineTextRanges, type AudioArtifactMetadata, type BlobRef, type EventPayload, type InlineTextRange, type MessageBlock } from "@joko/core";
+import { assertAudioArtifactMetadata, validInlineTextRanges, validInputMentionRanges, type AudioArtifactMetadata, type BlobRef, type EventPayload, type InlineTextRange, type InputMentionRange, type MentionInput, type MessageBlock, type PromptInput } from "@joko/core";
 import type { PersistedEvent } from "@joko/store";
 
 const PROJECTION_FORMAT = 1;
@@ -13,8 +13,7 @@ export interface PortableProjectedMessage {
   readonly emittedAt: number;
   readonly role: "user" | "assistant";
   readonly blocks: readonly MessageBlock[];
-  readonly quotesEncoded?: boolean;
-  readonly pastedTextRanges?: readonly InlineTextRange[];
+  readonly acceptedInput?: PromptInput;
   readonly usage?: Extract<EventPayload, { readonly type: "message_complete" }>["usage"];
   readonly generationDurationMs?: Extract<EventPayload, { readonly type: "message_complete" }>["generationDurationMs"];
   readonly generationReliable?: Extract<EventPayload, { readonly type: "message_complete" }>["generationReliable"];
@@ -53,14 +52,19 @@ export function projectPortableSessionMessages(
   for (const [sourceOrder, event] of events.entries()) {
     if (event.payload.type === "artifact") artifacts.push({ sourceOrder, emittedAt: event.emittedAt, payload: event.payload });
     if (event.payload.type === "status" && event.payload.key === "artifact_unavailable") artifacts.push({ sourceOrder, emittedAt: event.emittedAt, payload: { type: "status", key: "artifact_unavailable", text: event.payload.text ?? "" } });
-    if (event.payload.type !== "message_complete" || event.payload.automaticContinuation !== undefined) continue;
+    if (event.payload.type !== "message_complete" || event.payload.automaticContinuation !== undefined
+      || event.payload.acceptedInput?.automaticContinuation !== undefined) continue;
     messages.push({
       sourceOrder,
       emittedAt: event.emittedAt,
       role: event.payload.role,
       blocks: event.payload.blocks,
-      ...(event.payload.quotesEncoded === undefined ? {} : { quotesEncoded: event.payload.quotesEncoded }),
-      ...(event.payload.pastedTextRanges === undefined ? {} : { pastedTextRanges: event.payload.pastedTextRanges }),
+      ...(event.payload.acceptedInput === undefined ? {} : {
+        acceptedInput: projectAcceptedInputMentions(
+          event.payload.acceptedInput,
+          (mention) => mention.kind === "session" ? undefined : mention
+        )
+      }),
       ...(event.payload.usage === undefined ? {} : { usage: event.payload.usage }),
       ...(event.payload.generationDurationMs === undefined
         ? {}
@@ -107,6 +111,8 @@ export function collectPortableProjectionBlobRefs(
     refs.set(blob.id, blob);
   };
   for (const message of projection.messages) {
+    for (const image of message.acceptedInput?.images ?? []) collect(image.blob);
+    for (const file of message.acceptedInput?.files ?? []) collect(file.blob);
     for (const block of message.blocks) {
       if (block.kind !== "image" && block.kind !== "artifact") continue;
       collect(block.blob);
@@ -126,6 +132,7 @@ export function rebindPortableProjectionBlobs(
   replacements: ReadonlyMap<string, BlobRef>
 ): PortableSessionProjection {
   validatePortableSessionProjection(projection);
+  const sourceRefs = collectPortableProjectionBlobRefs(projection);
   const replace = (blob: BlobRef): BlobRef => {
     const replacement = replacements.get(blob.id);
     if (replacement === undefined || replacement.sha256 !== blob.sha256 || replacement.byteLength !== blob.byteLength || replacement.mimeType !== blob.mimeType) throw invalid("Portable Session media is missing or mismatched.");
@@ -134,6 +141,9 @@ export function rebindPortableProjectionBlobs(
   const audio = (value: AudioArtifactMetadata | undefined): AudioArtifactMetadata | undefined => value?.artwork === undefined ? value : { ...value, artwork: { ...value.artwork, blob: replace(value.artwork.blob) } };
   const messages = projection.messages.map((message): PortableProjectedMessage => ({
     ...message,
+    ...(message.acceptedInput === undefined ? {} : {
+      acceptedInput: rebindAcceptedInput(message.acceptedInput, sourceRefs, replacements, replace)
+    }),
     blocks: message.blocks.map((block): MessageBlock => {
       if (block.kind !== "image" && block.kind !== "artifact") return block;
       const replacement = replace(block.blob);
@@ -155,6 +165,7 @@ export function omitUnavailablePortableProjectionBlobs(
   availableSourceIds: ReadonlySet<string>
 ): PortableSessionProjection {
   validatePortableSessionProjection(projection);
+  const sourceRefs = collectPortableProjectionBlobRefs(projection);
   const audio = (value: AudioArtifactMetadata): AudioArtifactMetadata => {
     if (value.artwork === undefined || availableSourceIds.has(value.artwork.blob.id)) return value;
     const { artwork: _artwork, ...retained } = value;
@@ -162,6 +173,9 @@ export function omitUnavailablePortableProjectionBlobs(
   };
   const messages = projection.messages.map((message): PortableProjectedMessage => ({
     ...message,
+    ...(message.acceptedInput === undefined ? {} : {
+      acceptedInput: omitAcceptedInputBlobs(message.acceptedInput, sourceRefs, availableSourceIds)
+    }),
     blocks: message.blocks.map((block): MessageBlock => {
       if (block.kind !== "image" && block.kind !== "artifact") return block;
       if (availableSourceIds.has(block.blob.id)) return block.kind === "artifact" && block.audioMetadata !== undefined ? { ...block, audioMetadata: audio(block.audioMetadata) } : block;
@@ -191,8 +205,7 @@ export function portableProjectionEventPayloads(
       type: "message_complete",
       role: message.role,
       blocks: message.blocks,
-      ...(message.quotesEncoded === undefined ? {} : { quotesEncoded: message.quotesEncoded }),
-      ...(message.pastedTextRanges === undefined ? {} : { pastedTextRanges: message.pastedTextRanges }),
+      ...(message.acceptedInput === undefined ? {} : { acceptedInput: message.acceptedInput }),
       ...(message.usage === undefined ? {} : { usage: message.usage }),
       ...(message.generationDurationMs === undefined
         ? {}
@@ -248,10 +261,10 @@ function validateMessage(value: unknown): asserts value is PortableProjectedMess
   }
   if (value["blocks"].length > MAX_BLOCKS_PER_MESSAGE) throw invalid("Portable Session message contains too many blocks.");
   for (const block of value["blocks"]) validateBlock(block);
-  if (value["quotesEncoded"] !== undefined && typeof value["quotesEncoded"] !== "boolean") {
-    throw invalid("Portable Session quote metadata is invalid.");
+  if (value["acceptedInput"] !== undefined) {
+    if (value["role"] !== "user") throw invalid("Portable Session accepted input requires a user message.");
+    validateAcceptedInput(value["acceptedInput"]);
   }
-  validatePastedTextRanges(value["pastedTextRanges"], value["blocks"]);
   if (value["usage"] !== undefined) validateMessageUsage(value["usage"]);
   validateMessageGenerationTiming(value);
   if (value["inputDelivery"] !== undefined
@@ -264,8 +277,7 @@ function validateMessage(value: unknown): asserts value is PortableProjectedMess
     "emittedAt",
     "role",
     "blocks",
-    "quotesEncoded",
-    "pastedTextRanges",
+    "acceptedInput",
     "usage",
     "generationDurationMs",
     "generationReliable",
@@ -322,7 +334,204 @@ function validateMessageUsage(value: unknown): void {
   ], "message usage");
 }
 
-function validatePastedTextRanges(value: unknown, blocks: readonly MessageBlock[]): void {
+function validateAcceptedInput(value: unknown): asserts value is PromptInput {
+  if (!isRecord(value)
+    || typeof value["text"] !== "string"
+    || !Array.isArray(value["images"])
+    || !Array.isArray(value["files"])
+    || !Array.isArray(value["mentions"])
+    || (value["disposition"] !== "prompt" && value["disposition"] !== "steer" && value["disposition"] !== "follow_up")) {
+    throw invalid("Portable Session accepted input is invalid.");
+  }
+  boundedString(value["text"], "accepted input text");
+  if (value["images"].length + value["files"].length + value["mentions"].length > MAX_BLOCKS_PER_MESSAGE) {
+    throw invalid("Portable Session accepted input contains too many parts.");
+  }
+  for (const image of value["images"]) validateImageInput(image);
+  for (const file of value["files"]) validateFileInput(file);
+  for (const mention of value["mentions"]) validateMentionInput(mention);
+  if (value["quotesEncoded"] !== undefined && typeof value["quotesEncoded"] !== "boolean") {
+    throw invalid("Portable Session quote metadata is invalid.");
+  }
+  validatePastedTextRanges(value["pastedTextRanges"], value["text"]);
+  validateMentionRanges(
+    value["mentionRanges"],
+    value["text"],
+    value["mentions"] as readonly MentionInput[],
+    value["pastedTextRanges"] as readonly InlineTextRange[] | undefined
+  );
+  assertExactKeys(value, [
+    "text",
+    "images",
+    "files",
+    "mentions",
+    "disposition",
+    "quotesEncoded",
+    "pastedTextRanges",
+    "mentionRanges"
+  ], "accepted input");
+}
+
+function validateImageInput(value: unknown): void {
+  if (!isRecord(value)) throw invalid("Portable Session image input is invalid.");
+  validateBlob(value["blob"]);
+  if (value["alt"] !== undefined) boundedString(value["alt"], "image input alternative text");
+  assertExactKeys(value, ["blob", "alt"], "image input");
+}
+
+function validateFileInput(value: unknown): void {
+  if (!isRecord(value)) throw invalid("Portable Session file input is invalid.");
+  validateBlob(value["blob"]);
+  if (value["workspacePath"] !== undefined) boundedString(value["workspacePath"], "file input workspace path");
+  assertExactKeys(value, ["blob", "workspacePath"], "file input");
+}
+
+function validateMentionInput(value: unknown): asserts value is MentionInput {
+  if (!isRecord(value)
+    || (value["kind"] !== "workspace_file" && value["kind"] !== "workspace_directory"
+      && value["kind"] !== "resource" && value["kind"] !== "artifact")) {
+    throw invalid("Portable Session mention input is invalid.");
+  }
+  boundedString(value["label"], "mention label", 4_096);
+  boundedString(value["reference"], "mention reference", 4_096);
+  if (value["kind"] === "workspace_file" || value["kind"] === "workspace_directory") {
+    boundedNonEmptyString(value["workspaceId"], "mention workspace ID", 4_096);
+  }
+  if (value["kind"] === "workspace_file") {
+    if (value["lineRange"] !== undefined) validateWorkspaceLineRange(value["lineRange"]);
+    assertExactKeys(value, ["kind", "label", "reference", "workspaceId", "lineRange"], "workspace file mention");
+    return;
+  }
+  if (value["kind"] === "workspace_directory") {
+    assertExactKeys(value, ["kind", "label", "reference", "workspaceId"], "workspace directory mention");
+    return;
+  }
+  if (value["kind"] === "resource") {
+    boundedNonEmptyString(value["discoveredRevision"], "resource mention discovered revision", 4_096);
+    if (value["reference"] !== value["reference"].trim()
+      || value["discoveredRevision"] !== value["discoveredRevision"].trim()
+      || /[\u0000-\u001f\u007f\u2028\u2029]/u.test(value["reference"])
+      || /[\u0000-\u001f\u007f\u2028\u2029]/u.test(value["discoveredRevision"])) {
+      throw invalid("Portable Session resource mention identity is invalid.");
+    }
+    if (typeof value["resourceVersion"] !== "string"
+      || value["resourceVersion"].length > 20
+      || !/^[1-9][0-9]*$/u.test(value["resourceVersion"])
+      || BigInt(value["resourceVersion"]) > 18_446_744_073_709_551_615n) {
+      throw invalid("Portable Session resource mention entity revision is invalid.");
+    }
+    if (!Number.isSafeInteger(value["runtimeGeneration"]) || Number(value["runtimeGeneration"]) < 1) {
+      throw invalid("Portable Session resource mention runtime generation is invalid.");
+    }
+    assertExactKeys(
+      value,
+      ["kind", "label", "reference", "discoveredRevision", "resourceVersion", "runtimeGeneration"],
+      "resource mention"
+    );
+    return;
+  }
+  assertExactKeys(value, ["kind", "label", "reference"], "artifact mention");
+}
+
+function validateWorkspaceLineRange(value: unknown): void {
+  if (!isRecord(value)
+    || !Number.isSafeInteger(value["startLine"])
+    || !Number.isSafeInteger(value["endLine"])
+    || Number(value["startLine"]) <= 0
+    || Number(value["endLine"]) < Number(value["startLine"])) {
+    throw invalid("Portable Session workspace mention line range is invalid.");
+  }
+  assertExactKeys(value, ["startLine", "endLine"], "workspace mention line range");
+}
+
+function validateMentionRanges(
+  value: unknown,
+  text: string,
+  mentions: readonly MentionInput[],
+  pastedTextRanges: readonly InlineTextRange[] | undefined
+): void {
+  if (value === undefined) return;
+  if (!Array.isArray(value)) throw invalid("Portable Session mention range metadata is invalid.");
+  const ranges: InputMentionRange[] = [];
+  for (const rawRange of value) {
+    if (!isRecord(rawRange)
+      || !Number.isSafeInteger(rawRange["start"])
+      || !Number.isSafeInteger(rawRange["end"])
+      || !Number.isSafeInteger(rawRange["mentionIndex"])) {
+      throw invalid("Portable Session mention range is invalid.");
+    }
+    assertExactKeys(rawRange, ["start", "end", "mentionIndex"], "mention range");
+    ranges.push({
+      start: Number(rawRange["start"]),
+      end: Number(rawRange["end"]),
+      mentionIndex: Number(rawRange["mentionIndex"])
+    });
+  }
+  if (!validInputMentionRanges(text, mentions, ranges, pastedTextRanges ?? [])) {
+    throw invalid("Portable Session mention ranges do not match the accepted input.");
+  }
+}
+
+function rebindAcceptedInput(
+  input: PromptInput,
+  sourceRefs: ReadonlyMap<string, BlobRef>,
+  replacements: ReadonlyMap<string, BlobRef>,
+  replace: (blob: BlobRef) => BlobRef
+): PromptInput {
+  return projectAcceptedInputMentions({
+    ...input,
+    images: input.images.map((image) => ({ ...image, blob: replace(image.blob) })),
+    files: input.files.map((file) => ({ blob: replace(file.blob) }))
+  }, (mention) => {
+    if (mention.kind !== "artifact") return undefined;
+    const source = sourceRefs.get(mention.reference);
+    const replacement = replacements.get(mention.reference);
+    if (source === undefined || replacement === undefined || !sameBlobContent(source, replacement)) return undefined;
+    return { ...mention, reference: replacement.id };
+  });
+}
+
+function omitAcceptedInputBlobs(
+  input: PromptInput,
+  sourceRefs: ReadonlyMap<string, BlobRef>,
+  availableSourceIds: ReadonlySet<string>
+): PromptInput {
+  return projectAcceptedInputMentions({
+    ...input,
+    images: input.images.filter((image) => availableSourceIds.has(image.blob.id)),
+    files: input.files.filter((file) => availableSourceIds.has(file.blob.id))
+  }, (mention) => mention.kind === "session"
+    ? undefined
+    : mention.kind !== "artifact" || sourceRefs.has(mention.reference) && availableSourceIds.has(mention.reference)
+      ? mention
+      : undefined);
+}
+
+function projectAcceptedInputMentions(
+  input: PromptInput,
+  project: (mention: MentionInput) => MentionInput | undefined
+): PromptInput {
+  const mentions: MentionInput[] = [];
+  const replacementIndexes = new Map<number, number>();
+  for (const [index, mention] of input.mentions.entries()) {
+    const projected = project(mention);
+    if (projected === undefined) continue;
+    replacementIndexes.set(index, mentions.length);
+    mentions.push(projected);
+  }
+  const mentionRanges = input.mentionRanges?.flatMap((range): InputMentionRange[] => {
+    const mentionIndex = replacementIndexes.get(range.mentionIndex);
+    return mentionIndex === undefined ? [] : [{ ...range, mentionIndex }];
+  });
+  const { sessionReferenceSnapshots: _sessionReferenceSnapshots, ...portableInput } = input;
+  return {
+    ...portableInput,
+    mentions,
+    ...(mentionRanges === undefined ? {} : { mentionRanges })
+  };
+}
+
+function validatePastedTextRanges(value: unknown, text: string): void {
   if (value === undefined) return;
   if (!Array.isArray(value)) throw invalid("Portable Session pasted-text metadata is invalid.");
   const ranges: InlineTextRange[] = [];
@@ -340,7 +549,6 @@ function validatePastedTextRanges(value: unknown, blocks: readonly MessageBlock[
       display: rawRange["display"]
     });
   }
-  const text = blocks.flatMap((block) => block.kind === "text" ? [block.text] : []).join("");
   if (!validInlineTextRanges(text, ranges)) {
     throw invalid("Portable Session pasted-text ranges do not match the message text.");
   }
@@ -420,6 +628,11 @@ function boundedString(value: unknown, label: string, maximumBytes = MAX_STRING_
   }
 }
 
+function boundedNonEmptyString(value: unknown, label: string, maximumBytes = MAX_STRING_BYTES): asserts value is string {
+  boundedString(value, label, maximumBytes);
+  if (value.trim().length === 0) throw invalid(`Portable Session ${label} is invalid.`);
+}
+
 function assertExactKeys(value: Readonly<Record<string, unknown>>, allowed: readonly string[], label: string): void {
   const names = new Set(allowed);
   if (Object.keys(value).some((key) => !names.has(key))) throw invalid(`Portable Session ${label} has unsupported fields.`);
@@ -428,6 +641,10 @@ function assertExactKeys(value: Readonly<Record<string, unknown>>, allowed: read
 function sameBlob(left: BlobRef, right: BlobRef): boolean {
   return left.id === right.id && left.sha256 === right.sha256 && left.byteLength === right.byteLength
     && left.mimeType === right.mimeType && left.fileName === right.fileName;
+}
+
+function sameBlobContent(left: BlobRef, right: BlobRef): boolean {
+  return left.sha256 === right.sha256 && left.byteLength === right.byteLength && left.mimeType === right.mimeType;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

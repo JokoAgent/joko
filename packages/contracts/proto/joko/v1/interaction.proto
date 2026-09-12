@@ -208,15 +208,6 @@ message QuestionTextInput {
   string placeholder = 1;
   string default_value = 2;
   bool multiline = 3;
-  QuestionAnswerHandling answer_handling = 4;
-}
-
-enum QuestionAnswerHandling {
-  QUESTION_ANSWER_HANDLING_UNSPECIFIED = 0;
-  QUESTION_ANSWER_HANDLING_NORMAL = 1;
-  // The answer is uploaded through the credential channel and the durable
-  // interaction carries only SensitiveAnswerRef.
-  QUESTION_ANSWER_HANDLING_CREDENTIAL_CHANNEL = 2;
 }
 
 message QuestionChoice {
@@ -228,6 +219,7 @@ message QuestionChoice {
 message QuestionSingleChoiceInput {
   repeated QuestionChoice choices = 1;
   string default_choice_id = 2;
+  optional bool allow_other = 3;
 }
 
 message QuestionMultipleChoiceInput {
@@ -235,6 +227,7 @@ message QuestionMultipleChoiceInput {
   repeated string default_choice_ids = 2;
   uint32 minimum_selections = 3;
   uint32 maximum_selections = 4;
+  optional bool allow_other = 5;
 }
 
 message QuestionBooleanInput {
@@ -324,21 +317,26 @@ message QuestionResolution {
 
 message QuestionAnswer {
   string field_id = 1;
+  reserved 11, 12, 14;
+  reserved "choice_id", "choice_ids", "sensitive";
   oneof value {
     string text = 10;
-    string choice_id = 11;
-    StringList choice_ids = 12;
     bool boolean = 13;
-    SensitiveAnswerRef sensitive = 14;
+    QuestionSingleChoiceAnswer single_choice = 15;
+    QuestionMultipleChoiceAnswer multiple_choice = 16;
   }
 }
 
-message SensitiveAnswerRef {
-  string credential_upload_ticket_id = 1;
+message QuestionSingleChoiceAnswer {
+  oneof selection {
+    string choice_id = 1;
+    string other_text = 2;
+  }
 }
 
-message StringList {
-  repeated string values = 1;
+message QuestionMultipleChoiceAnswer {
+  repeated string choice_ids = 1;
+  optional string other_text = 2;
 }
 
 message PlanReviewResolution {

@@ -71,7 +71,8 @@ import {
   encodePortableSessionProjection
 } from "./portable-session-projection.js";
 import { ScheduleCoordinator } from "./schedule-coordinator.js";
-import { SessionHost, type WorkspaceRunCapture } from "./session-host.js";
+import { SessionHost, type InteractionDecisionSubmission, type WorkspaceRunCapture } from "./session-host.js";
+import type { SessionWorktreeCoordinator } from "./session-worktree-coordinator.js";
 import { activeNativeTimeline } from "./snapshot-projector.js";
 import { NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD } from "./native-history.js";
 import {
@@ -199,8 +200,8 @@ afterEach(async () => {
 });
 
 describe("SessionHost", () => {
-  it.each([undefined, ["workspace_file"], ["workspace_directory", "workspace_line_range"]])(
-    "gates structured workspace references on explicit native mention options: %j", async (options) => {
+  it.each([undefined, [], ["workspace_file"], ["workspace_line_range"], ["resource"], ["artifact"], ["workspace_directory", "workspace_file", "workspace_line_range", "resource", "artifact"]])(
+    "gates every reference kind on explicit native mention options: %j", async (options) => {
       const adapter = new FakeBackendAdapter({
         ...PI_LIKE_PROFILE,
         capabilities: [
@@ -214,18 +215,520 @@ describe("SessionHost", () => {
         targetId: "target-one", title: "Workspace references", fastMode: false,
         permissionMode: "ask", planMode: false
       });
-      for (const mention of [
+      vi.spyOn(adapter, "getResources").mockImplementation(async (context) => [{
+        id: "resource-1",
+        kind: "skill",
+        name: "Skill",
+        source: "managed",
+        state: "loaded",
+        revision: "revision-1",
+        resourceVersion: 2n,
+        runtimePath: join(fixture.directory, "resource-1"),
+        runtimeGeneration: context.generation
+      }]);
+      await fixture.host.getResources(created.value.sessionId);
+      const runtimeGeneration = fixture.store.getSession(created.value.sessionId).descriptor.binding.generation;
+      const mentions: PromptInput["mentions"] = [
+        { kind: "workspace_file", label: "source", reference: "src/main.ts" },
         { kind: "workspace_directory", label: "sources", reference: "src" },
-        { kind: "workspace_file", label: "lines", reference: "src/main.ts", lineRange: { startLine: 1, endLine: 2 } }
-      ] as const) {
+        { kind: "workspace_file", label: "lines", reference: "src/main.ts", lineRange: { startLine: 1, endLine: 2 } },
+        { kind: "resource", label: "Skill", reference: "resource-1", discoveredRevision: "revision-1", resourceVersion: "2", runtimeGeneration },
+        { kind: "artifact", label: "Report", reference: "artifact-1" }
+      ];
+      for (const mention of mentions) {
         const check = () => fixture.host.assertInputCapabilities(created.value.sessionId, {
           text: "", images: [], files: [], mentions: [mention], disposition: "prompt"
         });
-        if (options?.includes("workspace_directory")) expect(check).not.toThrow();
+        const allowed = options?.includes(mention.kind) === true
+          && (!("lineRange" in mention) || options.includes("workspace_line_range"));
+        if (allowed) expect(check).not.toThrow();
         else expect(check).toThrow("does not support");
       }
     }
   );
+
+  it("hydrates a typed historical task only at dispatch and removes its authority before Adapter input", async () => {
+    const adapter = new SessionReferenceCaptureFakeAdapter();
+    const fixture = await createFixture(adapter);
+    const create = async (operationId: string, title: string): Promise<string> => (await fixture.host.createSession({
+      operationId, connection: fixture.connection, targetId: "target-one", title,
+      fastMode: false, permissionMode: "ask", planMode: false
+    })).value.sessionId;
+    const sourceSessionId = await create("create-session-reference-source", "Earlier task");
+    const destinationSessionId = await create("create-session-reference-destination", "Current task");
+    const source = fixture.store.getSession(sourceSessionId).descriptor;
+    const appendSourceMessage = (id: string, role: "user" | "assistant", text: string, accepted = false): void => {
+      fixture.store.appendEvent({
+        id, backendId: source.backendId, targetId: source.targetId, sessionId: sourceSessionId,
+        generation: source.binding.generation, traceId: `test:${id}`,
+        payload: {
+          type: "message_complete", role, blocks: [{ kind: "text", text }],
+          ...(accepted ? { acceptedInput: { text, images: [], files: [], mentions: [], disposition: "prompt" as const } } : {})
+        }
+      });
+    };
+    appendSourceMessage("session-reference-user", "user", "Investigate sk-abcdefghijklmnop", true);
+    appendSourceMessage("session-reference-assistant", "assistant", "The bounded answer");
+    fixture.store.setQueuePaused({ sessionId: destinationSessionId, paused: true, traceId: "test:session-reference:pause" });
+    const queued = fixture.host.enqueueInput({
+      operationId: "send-session-reference",
+      connection: fixture.connection,
+      sessionId: destinationSessionId,
+      prompt: {
+        text: "Compare @Earlier and @Report",
+        images: [], files: [], disposition: "prompt",
+        mentions: [
+          { kind: "session", label: "Earlier", reference: sourceSessionId },
+          { kind: "artifact", label: "Report", reference: "artifact-one" }
+        ],
+        mentionRanges: [
+          { start: 8, end: 16, mentionIndex: 0 },
+          { start: 21, end: 28, mentionIndex: 1 }
+        ]
+      }
+    });
+    const durableBody = fixture.store.getQueueItem(queued.value.queueItemId).body;
+    expect(durableBody.sessionReferenceSnapshots).toEqual([
+      expect.objectContaining({ mentionIndex: 0, sessionId: sourceSessionId })
+    ]);
+    expect(JSON.stringify(durableBody)).not.toContain("Investigate");
+    expect(JSON.stringify(durableBody)).not.toContain("bounded answer");
+
+    appendSourceMessage("session-reference-late", "assistant", "Late expansion must stay out");
+    const durableItem = fixture.store.getQueueItem(queued.value.queueItemId);
+    const { sessionReferenceSnapshots: _privateSnapshots, ...publicBody } = durableItem.body;
+    const editedBody = fixture.host.canonicalQueueItemEdit(durableItem, {
+      ...publicBody,
+      text: `Please ${publicBody.text}`,
+      mentionRanges: publicBody.mentionRanges?.map((range) => ({
+        ...range,
+        start: range.start + 7,
+        end: range.end + 7
+      }))
+    }, [{ start: 0, end: 0, replacementText: "Please " }]);
+    expect(editedBody.sessionReferenceSnapshots).toEqual(durableBody.sessionReferenceSnapshots);
+    fixture.store.editQueueItem({
+      queueItemId: durableItem.id,
+      body: editedBody,
+      traceId: "test:session-reference:edit"
+    });
+    fixture.store.setQueuePaused({ sessionId: destinationSessionId, paused: false, traceId: "test:session-reference:resume" });
+    fixture.host.requestQueueDrain(destinationSessionId);
+    await eventually(() => adapter.inputs.length === 1);
+
+    const dispatched = adapter.inputs[0]!;
+    expect(dispatched.sessionReferenceSnapshots).toBeUndefined();
+    expect(dispatched.mentions).toEqual([{ kind: "artifact", label: "Report", reference: "artifact-one" }]);
+    expect(dispatched.mentionRanges).toEqual([{ start: 28, end: 35, mentionIndex: 0 }]);
+    expect(dispatched.text).toContain("Please Compare @Earlier and @Report");
+    expect(dispatched.text).toContain("[JOKO_TASK_REFERENCE_DATA_V1]");
+    expect(dispatched.text).toContain("Investigate [REDACTED]");
+    expect(dispatched.text).toContain("The bounded answer");
+    expect(dispatched.text).not.toContain("Late expansion must stay out");
+    expect(Buffer.byteLength(dispatched.text.slice(dispatched.text.indexOf("[JOKO_TASK_REFERENCE_DATA_V1]")), "utf8"))
+      .toBeLessThanOrEqual(32 * 1_024);
+  });
+
+  it("replays Queue text edits and retains only the exact surviving historical-task fences", async () => {
+    const fixture = await createFixture(new SessionReferenceCaptureFakeAdapter());
+    const create = async (operationId: string): Promise<string> => (await fixture.host.createSession({
+      operationId,
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Same label",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const firstSourceId = await create("create-queue-edit-reference-first");
+    const secondSourceId = await create("create-queue-edit-reference-second");
+    const destinationId = await create("create-queue-edit-reference-destination");
+    for (const [sessionId, eventId] of [
+      [firstSourceId, "queue-edit-reference-first-message"],
+      [secondSourceId, "queue-edit-reference-second-message"]
+    ] as const) {
+      const source = fixture.store.getSession(sessionId).descriptor;
+      fixture.store.appendEvent({
+        id: eventId,
+        backendId: source.backendId,
+        targetId: source.targetId,
+        sessionId,
+        generation: source.binding.generation,
+        traceId: `test:${eventId}`,
+        payload: { type: "message_complete", role: "user", blocks: [{ kind: "text", text: eventId }] }
+      });
+    }
+    fixture.store.setQueuePaused({ sessionId: destinationId, paused: true, traceId: "test:queue-edit-reference:pause" });
+    const queued = fixture.host.enqueueInput({
+      operationId: "send-queue-edit-references",
+      connection: fixture.connection,
+      sessionId: destinationId,
+      prompt: {
+        text: "@Same @Same",
+        images: [],
+        files: [],
+        disposition: "prompt",
+        mentions: [
+          { kind: "session", label: "Same", reference: firstSourceId },
+          { kind: "artifact", label: "Detached", reference: "artifact-detached" },
+          { kind: "session", label: "Same", reference: secondSourceId }
+        ],
+        mentionRanges: [
+          { start: 0, end: 5, mentionIndex: 0 },
+          { start: 6, end: 11, mentionIndex: 2 }
+        ]
+      }
+    });
+    const current = fixture.store.getQueueItem(queued.value.queueItemId);
+    const secondFence = current.body.sessionReferenceSnapshots?.find((snapshot) => snapshot.mentionIndex === 2);
+    expect(secondFence).toBeDefined();
+
+    const reconciled = fixture.host.canonicalQueueItemEdit(current, {
+      text: "@Same",
+      images: [],
+      files: [],
+      disposition: "prompt",
+      mentions: [
+        { kind: "artifact", label: "Detached", reference: "artifact-detached" },
+        { kind: "session", label: "Same", reference: secondSourceId }
+      ],
+      mentionRanges: [{ start: 0, end: 5, mentionIndex: 1 }]
+    }, [{ start: 0, end: 6, replacementText: "" }]);
+    expect(reconciled.sessionReferenceSnapshots).toEqual([{ ...secondFence!, mentionIndex: 1 }]);
+
+    const publicCurrent = {
+      text: current.body.text,
+      images: current.body.images,
+      files: current.body.files,
+      disposition: current.body.disposition,
+      mentions: current.body.mentions,
+      mentionRanges: current.body.mentionRanges
+    } satisfies PromptInput;
+
+    const steered = fixture.host.canonicalQueueItemEdit(current, {
+      ...publicCurrent,
+      disposition: "steer"
+    }, []);
+    expect(steered).toEqual({ ...current.body, disposition: "steer" });
+    expect(() => fixture.host.canonicalQueueItemEdit(current, {
+      ...publicCurrent,
+      text: `!${publicCurrent.text}`,
+      mentionRanges: publicCurrent.mentionRanges?.map((range) => ({
+        ...range,
+        start: range.start + 1,
+        end: range.end + 1
+      }))
+    }, [])).toThrow(expect.objectContaining({
+      publicError: expect.objectContaining({ code: "INPUT_QUEUE_EDIT_RECEIPT_INVALID" })
+    }));
+
+    const replacedFirstDisplay = fixture.host.canonicalQueueItemEdit(current, {
+      ...publicCurrent,
+      mentions: [current.body.mentions[1]!, current.body.mentions[2]!],
+      mentionRanges: [{ start: 6, end: 11, mentionIndex: 1 }]
+    }, [{ start: 0, end: 5, replacementText: "@Same" }]);
+    expect(replacedFirstDisplay.sessionReferenceSnapshots).toEqual([{ ...secondFence!, mentionIndex: 1 }]);
+
+    expect(() => fixture.host.canonicalQueueItemEdit(current, publicCurrent, [
+      { start: 0, end: 5, replacementText: "@Same" }
+    ])).toThrow(expect.objectContaining({
+      publicError: expect.objectContaining({ code: "INPUT_QUEUE_EDIT_REFERENCE_INVALID" })
+    }));
+    expect(() => fixture.host.canonicalQueueItemEdit(current, {
+      ...publicCurrent,
+      mentions: [current.body.mentions[2]!, current.body.mentions[1]!, current.body.mentions[0]!],
+      mentionRanges: [
+        { start: 0, end: 5, mentionIndex: 2 },
+        { start: 6, end: 11, mentionIndex: 0 }
+      ]
+    }, [
+      { start: 11, end: 11, replacementText: "!" },
+      { start: 11, end: 12, replacementText: "" }
+    ])).toThrow(expect.objectContaining({
+      publicError: expect.objectContaining({ code: "INPUT_QUEUE_EDIT_REFERENCE_INVALID" })
+    }));
+    expect(() => fixture.host.canonicalQueueItemEdit(current, {
+      ...publicCurrent,
+      quotesEncoded: true
+    }, [{ start: 11, end: 11, replacementText: "!" }])).toThrow(expect.objectContaining({
+      publicError: expect.objectContaining({ code: "INPUT_QUEUE_EDIT_QUOTE_INVALID" })
+    }));
+    expect(() => fixture.host.canonicalQueueItemEdit(current, {
+      ...publicCurrent,
+      text: `${publicCurrent.text}!`
+    }, [{ start: 99, end: 99, replacementText: "!" }])).toThrow(expect.objectContaining({
+      publicError: expect.objectContaining({ code: "INPUT_QUEUE_EDIT_RECEIPT_INVALID" })
+    }));
+  });
+
+  it("fails a queued historical task reference before dispatch after source rebinding", async () => {
+    const adapter = new SessionReferenceCaptureFakeAdapter();
+    const fixture = await createFixture(adapter);
+    const sourceSessionId = (await fixture.host.createSession({
+      operationId: "create-revoked-reference-source", connection: fixture.connection,
+      targetId: "target-one", title: "Reference source", fastMode: false,
+      permissionMode: "ask", planMode: false
+    })).value.sessionId;
+    const destinationSessionId = (await fixture.host.createSession({
+      operationId: "create-revoked-reference-destination", connection: fixture.connection,
+      targetId: "target-one", title: "Reference destination", fastMode: false,
+      permissionMode: "ask", planMode: false
+    })).value.sessionId;
+    const source = fixture.store.getSession(sourceSessionId);
+    fixture.store.appendEvent({
+      id: "revoked-reference-message", backendId: source.descriptor.backendId,
+      targetId: source.descriptor.targetId, sessionId: sourceSessionId,
+      generation: source.descriptor.binding.generation, traceId: "test:revoked-reference:message",
+      payload: { type: "message_complete", role: "user", blocks: [{ kind: "text", text: "Source context" }] }
+    });
+    fixture.store.setQueuePaused({ sessionId: destinationSessionId, paused: true, traceId: "test:revoked-reference:pause" });
+    const queued = fixture.host.enqueueInput({
+      operationId: "send-revoked-reference", connection: fixture.connection, sessionId: destinationSessionId,
+      prompt: { text: "Use @Source", images: [], files: [], disposition: "prompt",
+        mentions: [{ kind: "session", label: "Source", reference: sourceSessionId }],
+        mentionRanges: [{ start: 4, end: 11, mentionIndex: 0 }] }
+    });
+    fixture.store.updateSession(sourceSessionId, {
+      binding: { opaqueRef: `${source.descriptor.binding.opaqueRef}/rebound`, generation: source.descriptor.binding.generation + 1 }
+    }, source.revision);
+    fixture.store.setQueuePaused({ sessionId: destinationSessionId, paused: false, traceId: "test:revoked-reference:resume" });
+    fixture.host.requestQueueDrain(destinationSessionId);
+    await eventually(() => fixture.store.getQueueItem(queued.value.queueItemId).state === "failed");
+    expect(adapter.inputs).toEqual([]);
+  });
+
+  it("admits only an exact resource identity from this task's current live catalog", async () => {
+    const adapter = new FakeBackendAdapter({
+      ...PI_LIKE_PROFILE,
+      capabilities: [
+        ...PI_LIKE_PROFILE.capabilities.filter((capability) => capability.key !== "input.mention"),
+        { key: "input.mention", supported: true, options: ["resource"] }
+      ]
+    });
+    const fixture = await createFixture(adapter);
+    vi.spyOn(adapter, "getResources").mockImplementation(async (context) => [{
+      id: "resource-exact",
+      kind: "prompt",
+      name: "Exact prompt",
+      source: "managed",
+      state: "loaded",
+      revision: "sha256:exact",
+      resourceVersion: 11n,
+      runtimePath: join(fixture.directory, "runtime", "prompt.md"),
+      runtimeGeneration: context.generation
+    }]);
+    const create = (operationId: string) => fixture.host.createSession({
+      operationId,
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: operationId,
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    });
+    const first = (await create("create-resource-owner-one")).value.sessionId;
+    const second = (await create("create-resource-owner-two")).value.sessionId;
+    const generation = fixture.store.getSession(first).descriptor.binding.generation;
+    const mention = {
+      kind: "resource" as const,
+      label: "Exact prompt",
+      reference: "resource-exact",
+      discoveredRevision: "sha256:exact",
+      resourceVersion: "11",
+      runtimeGeneration: generation
+    };
+    const check = (sessionId: string, candidate = mention) => fixture.host.assertInputCapabilities(sessionId, {
+      text: "",
+      images: [],
+      files: [],
+      mentions: [candidate],
+      disposition: "prompt"
+    });
+
+    expect(() => check(first)).toThrow(/catalog/u);
+    await fixture.host.getResources(first);
+    expect(() => check(first)).not.toThrow();
+    expect(() => check(first, { ...mention, discoveredRevision: "sha256:other" })).toThrow(/exact version/u);
+    expect(() => check(first, { ...mention, resourceVersion: "12" })).toThrow(/exact version/u);
+    expect(() => check(first, { ...mention, runtimeGeneration: generation + 1 })).toThrow(/earlier runtime/u);
+    expect(() => check(second)).toThrow(/catalog/u);
+  });
+
+  it("re-observes the live resource catalog after queue claim and before Backend dispatch", async () => {
+    const adapter = new FakeBackendAdapter({
+      ...PI_LIKE_PROFILE,
+      capabilities: [
+        ...PI_LIKE_PROFILE.capabilities.filter((capability) => capability.key !== "input.mention"),
+        { key: "input.mention", supported: true, options: ["resource"] }
+      ]
+    });
+    const send = vi.spyOn(adapter, "send");
+    const fixture = await createFixture(adapter);
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-resource-dispatch-refresh",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Resource dispatch refresh",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    let revision = "sha256:accepted";
+    const getResources = vi.spyOn(adapter, "getResources").mockImplementation(async (context) => [{
+      id: "resource-live",
+      kind: "prompt",
+      name: "Live prompt",
+      source: "managed",
+      state: "loaded",
+      revision,
+      resourceVersion: revision === "sha256:accepted" ? 3n : 4n,
+      runtimePath: join(fixture.directory, "runtime", "live-prompt.md"),
+      runtimeGeneration: context.generation
+    }]);
+    await fixture.host.getResources(sessionId);
+    const runtimeGeneration = fixture.store.getSession(sessionId).descriptor.binding.generation;
+    fixture.store.setQueuePaused({ sessionId, paused: true, traceId: "test:resource:pause" });
+    const queued = fixture.host.enqueueInput({
+      operationId: "send-resource-dispatch-refresh",
+      connection: fixture.connection,
+      sessionId,
+      prompt: {
+        text: "",
+        images: [],
+        files: [],
+        mentions: [{
+          kind: "resource",
+          label: "Live prompt",
+          reference: "resource-live",
+          discoveredRevision: "sha256:accepted",
+          resourceVersion: "3",
+          runtimeGeneration
+        }],
+        disposition: "prompt"
+      }
+    });
+    revision = "sha256:replaced";
+    fixture.store.setQueuePaused({ sessionId, paused: false, traceId: "test:resource:resume" });
+    fixture.host.requestQueueDrain(sessionId);
+
+    await eventually(() => fixture.store.getQueueItem(queued.value.queueItemId).state === "failed");
+    expect(getResources).toHaveBeenCalledTimes(2);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("fails an accepted reference before Backend dispatch when its exact capability is removed", async () => {
+    const adapter = new FakeBackendAdapter({
+      ...PI_LIKE_PROFILE,
+      capabilities: [...PI_LIKE_PROFILE.capabilities, { key: "input.mention", supported: true, options: ["artifact"] }]
+    });
+    const send = vi.spyOn(adapter, "send");
+    const fixture = await createFixture(adapter);
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-reference-capability-loss", connection: fixture.connection,
+      targetId: "target-one", title: "Reference capability", fastMode: false,
+      permissionMode: "ask", planMode: false
+    })).value.sessionId;
+    fixture.store.setQueuePaused({ sessionId, paused: true, traceId: "test:reference:pause" });
+    const queued = fixture.host.enqueueInput({
+      operationId: "send-reference-capability-loss", connection: fixture.connection, sessionId,
+      prompt: { text: "", images: [], files: [], mentions: [{ kind: "artifact", label: "Report", reference: "artifact-1" }], disposition: "prompt" }
+    });
+    expect(fixture.store.getQueueItem(queued.value.queueItemId).state).toBe("accepted");
+    const backend = fixture.store.getBackend(fixture.store.getSession(sessionId).descriptor.backendId).descriptor;
+    fixture.store.upsertBackend({
+      ...backend,
+      capabilities: new Map(backend.capabilities).set("input.mention", { key: "input.mention", supported: true, options: ["workspace_file"] })
+    });
+    fixture.store.setQueuePaused({ sessionId, paused: false, traceId: "test:reference:resume" });
+    fixture.host.requestQueueDrain(sessionId);
+    await eventually(() => fixture.store.getQueueItem(queued.value.queueItemId).state === "failed");
+    expect(fixture.store.getRun(queued.value.runId).descriptor.state).toBe("failed");
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("writes the current workspace identity into internal Queue prompts and rejects stale workspace authority", async () => {
+    const adapter = new FakeBackendAdapter({
+      ...PI_LIKE_PROFILE,
+      capabilities: [
+        ...PI_LIKE_PROFILE.capabilities,
+        { key: "input.mention", supported: true, options: ["workspace_file"] }
+      ]
+    });
+    const send = vi.spyOn(adapter, "send");
+    const fixture = await createFixture(adapter);
+    const registeredTarget = fixture.store.getTarget("target-one");
+    fixture.store.upsertTarget(registeredTarget.descriptor, {
+      ...(registeredTarget.metadata as Record<string, unknown>),
+      workspaceId: "workspace-current"
+    });
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-workspace-identity",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Workspace identity",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    fixture.store.setQueuePaused({ sessionId, paused: true, traceId: "test:workspace-identity:pause" });
+    const implicitPrompt: PromptInput = {
+      text: "inspect source",
+      images: [],
+      files: [],
+      mentions: [{ kind: "workspace_file", label: "source", reference: "src/main.ts" }],
+      disposition: "prompt"
+    };
+    const user = fixture.host.enqueueInput({
+      operationId: "send-implicit-user-workspace",
+      connection: fixture.connection,
+      sessionId,
+      prompt: implicitPrompt
+    });
+    const service = fixture.host.enqueueServiceInput({
+      operationId: "send-implicit-service-workspace",
+      sessionId,
+      source: "system",
+      prompt: implicitPrompt
+    });
+    for (const queueItemId of [user.value.queueItemId, service.value.queueItemId]) {
+      expect(fixture.store.getQueueItem(queueItemId).body.mentions).toEqual([{
+        kind: "workspace_file",
+        label: "source",
+        reference: "src/main.ts",
+        workspaceId: "workspace-current"
+      }]);
+    }
+    expect(fixture.store.getOperation("send-implicit-service-workspace").body).toMatchObject({
+      prompt: { mentions: [{ workspaceId: "workspace-current" }] }
+    });
+
+    expect(() => fixture.host.enqueueServiceInput({
+      operationId: "send-wrong-service-workspace",
+      sessionId,
+      source: "system",
+      prompt: {
+        ...implicitPrompt,
+        mentions: [{
+          kind: "workspace_file",
+          label: "source",
+          reference: "src/main.ts",
+          workspaceId: "workspace-other"
+        }]
+      }
+    })).toThrow("does not belong to the task's current workspace");
+    expect(fixture.store.findOperation("send-wrong-service-workspace")).toBeUndefined();
+
+    const changedTarget = fixture.store.getTarget("target-one");
+    fixture.store.upsertTarget(changedTarget.descriptor, {
+      ...(changedTarget.metadata as Record<string, unknown>),
+      workspaceId: "workspace-replaced"
+    });
+    fixture.store.setQueuePaused({ sessionId, paused: false, traceId: "test:workspace-identity:resume" });
+    fixture.host.requestQueueDrain(sessionId);
+    await eventually(() => [user.value.queueItemId, service.value.queueItemId].every((queueItemId) =>
+      fixture.store.getQueueItem(queueItemId).state === "failed"));
+    expect(send).not.toHaveBeenCalled();
+  });
 
   it("rejects new task admission before native effects when its Backend is disabled", async () => {
     const adapter = new FakeBackendAdapter(PI_LIKE_PROFILE);
@@ -482,17 +985,17 @@ describe("SessionHost", () => {
       toolName: "fixture",
       summary: "Must remain owned by the admitted Attempt",
       risk: "low",
-      choices: ["allow", "deny"]
+      choices: ["allow_once", "deny_once"]
     });
     await eventually(() => fixture.store.listInteractions({ sessionId, status: "open" }).length === 1);
     const interaction = fixture.store.listInteractions({ sessionId, status: "open" })[0]!;
     fixture.host.resolveInteraction(
       interaction.id,
       interaction.generation,
-      { kind: "confirmed", confirmed: false },
+      { kind: "permission", decision: "deny_once" },
       "resolve-admitted-instance"
     );
-    await expect(decision).resolves.toEqual({ kind: "confirmed", confirmed: false });
+    await expect(decision).resolves.toEqual({ kind: "selected", value: "deny_once" });
 
     expect(fixture.store.listEvents({ sessionId }).some((event) =>
       event.payload.type === "status" && event.payload.key === "fixture.admitted"
@@ -1190,11 +1693,14 @@ describe("SessionHost", () => {
     }
     expect(fixture.store.listEvents({ sessionId: reviewerSessionId })).toHaveLength(eventsBeforeDeniedPayloads);
 
+    const reviewPrompt: PromptInput = {
+      text: "review prompt", images: [], files: [], mentions: [], disposition: "prompt"
+    };
     const dispatch = await fixture.host.enqueueInitialPrompt({
       operationId: "review-initial:review-host-run",
       reviewRunId: created.run.id,
       reviewerSessionId,
-      prompt: { text: "review prompt", images: [], files: [], mentions: [], disposition: "prompt" }
+      prompt: reviewPrompt
     });
     await expect(dispatch.accepted).resolves.toBeUndefined();
     await expect(dispatch.outcome).resolves.toEqual({
@@ -1210,7 +1716,12 @@ describe("SessionHost", () => {
       .filter((event) => event.payload.type === "message_complete")
       .map((event) => event.payload);
     expect(messages).toEqual([
-      { type: "message_complete", role: "user", blocks: [{ kind: "text", text: "review prompt" }] },
+      {
+        type: "message_complete",
+        role: "user",
+        blocks: [{ kind: "text", text: "review prompt" }],
+        acceptedInput: reviewPrompt
+      },
       {
         type: "message_complete",
         role: "assistant",
@@ -1777,6 +2288,7 @@ describe("SessionHost", () => {
 
     const artifact = await fixture.host.exportSession(sessionId);
     expect(artifact).toEqual(fixture.store.getArtifact(artifact.id).blob);
+    expect(fixture.store.getArtifact(artifact.id)).toMatchObject({ sessionId, metadata: {} });
 
     exportSession.mockResolvedValue({ ...artifact, sha256: "f".repeat(64) });
     await expect(fixture.host.exportSession(sessionId)).rejects.toThrow(
@@ -1785,6 +2297,75 @@ describe("SessionHost", () => {
 
     exportSession.mockResolvedValue({ ...artifact, id: "missing-export-artifact" });
     await expect(fixture.host.exportSession(sessionId)).rejects.toThrow("Artifact does not exist or has expired.");
+  });
+
+  it.each(["trust revoked", "trust restored", "worktree preserved"] as const)("releases staged Backend output when %s during ingestion retires its original workspace", async (change) => {
+    let fixture!: Awaited<ReturnType<typeof createFixture>>;
+    const worktrees = {
+      acquire: async ({ target, sessionId }: Parameters<SessionWorktreeCoordinator["acquire"]>[0]) => {
+        const path = join(target.workspaceRoot, "isolated");
+        mkdirSync(path);
+        return { leaseId: "owned-lease", workspaceId: `workspace-${sessionId}`, path, repositoryRoot: target.workspaceRoot,
+          branch: "task-branch", sourceRef: "main", sourceCommit: "a".repeat(40), sourceStrategy: "explicit" as const,
+          sourceRefreshed: false, state: "active" as const, acquiredAt: 1, updatedAt: 1 };
+      },
+      effectiveTarget: (session: Parameters<SessionWorktreeCoordinator["effectiveTarget"]>[0]) => ({
+        ...fixture.store.getTarget(session.descriptor.targetId).descriptor,
+        workspaceRoot: session.descriptor.worktree!.path
+      })
+    } as unknown as SessionWorktreeCoordinator;
+    fixture = await createFixture(new FakeBackendAdapter(PI_LIKE_PROFILE), { worktrees });
+    const createSession = fixture.adapter.createSession.bind(fixture.adapter);
+    let originalContext!: AdapterContext;
+    vi.spyOn(fixture.adapter, "createSession").mockImplementation((input, context) => {
+      originalContext = context;
+      return createSession(input, context);
+    });
+    const sessionId = (await fixture.host.createSession({ operationId: `create-output-${change}`, connection: fixture.connection,
+      targetId: "target-one", title: "Owned output", fastMode: false, permissionMode: "ask", planMode: false,
+      worktree: { refreshRemote: false }
+    })).value.sessionId;
+    const path = join(originalContext.target.workspaceRoot, "report.txt");
+    writeFileSync(path, "original output");
+    // The provisional callback must retain the exact worktree acquired before
+    // its Session record existed, then adopt successfully after creation.
+    const first = await originalContext.storeArtifact(path, { mimeType: "text/plain" });
+    expect(fixture.store.getArtifact(first.id).sessionId).toBe(sessionId);
+    writeFileSync(path, "later output");
+    const gate = new AsyncGate();
+    const ingestPath = fixture.artifacts.ingestPath.bind(fixture.artifacts);
+    let stagedId!: string;
+    vi.spyOn(fixture.artifacts, "ingestPath").mockImplementationOnce(async (source, options) => {
+      const staged = await ingestPath(source, options);
+      stagedId = staged.id;
+      gate.enter();
+      await gate.wait;
+      return staged;
+    });
+    const storing = originalContext.storeArtifact(path, { mimeType: "text/plain" });
+    const rejected = expect(storing).rejects.toThrow("Artifact workspace authority changed");
+    await gate.entered;
+    await fixture.host.mutate({ operationId: `change-output-owner-${change}`, connection: fixture.connection,
+      kind: "workspace_authority", body: { change }, commit: (store) => {
+        if (change === "worktree preserved") store.updateSessionWorktreeState(sessionId, "preserved");
+        else {
+          const target = store.getTarget("target-one");
+          store.upsertTarget({ ...target.descriptor, trusted: false }, target.metadata);
+        }
+        return { accepted: true };
+      }
+    });
+    if (change === "trust restored") {
+      const target = fixture.store.getTarget("target-one");
+      fixture.store.upsertTarget({ ...target.descriptor, trusted: true }, target.metadata);
+    }
+    gate.release();
+    await rejected;
+    expect(fixture.store.getArtifact(stagedId).sessionId).toBeUndefined();
+    expect(fixture.store.getArtifact(stagedId).metadata).toEqual({ expiresAt: 0 });
+    expect(fixture.store.listArtifacts({ sessionId }).map((artifact) => artifact.blob.id)).toEqual([first.id]);
+    expect(fixture.store.listEvents({ sessionId, limit: 100 }).filter((event) => event.payload.type === "artifact"))
+      .toHaveLength(1);
   });
 
   it("exports a password-protected portable task with native and product history", async () => {
@@ -2059,11 +2640,19 @@ describe("SessionHost", () => {
     expect(adapter.importedNativeText).toEqual(["{\"type\":\"session\",\"id\":\"portable-native\"}\n"]);
     expect(fixture.store.listEvents({ sessionId: imported.value.sessionId })
       .filter((event) => event.payload.type === "message_complete")
-      .map((event) => event.payload)).toEqual([{
-        type: "message_complete",
-        role: "assistant",
-        blocks: [{ kind: "text", text: "restored history" }]
-      }]);
+      .map((event) => event.payload)).toEqual([
+        {
+          type: "message_complete",
+          role: "assistant",
+          blocks: [{ kind: "text", text: "restored history" }]
+        },
+        {
+          type: "message_complete",
+          role: "assistant",
+          blocks: [{ kind: "text", text: "restored history" }],
+          nativeHistory: { identity: { entryId: "portable-native-message" } }
+        }
+      ]);
     expect(JSON.stringify(fixture.store.getOperation(request.operationId).body)).not.toContain(request.password);
 
     await expect(fixture.host.importPortableSession(request)).resolves.toMatchObject({
@@ -2265,7 +2854,7 @@ describe("SessionHost", () => {
     policy.host.resolveInteraction(
       permission.id,
       permission.generation,
-      { kind: "selected", value: "allow_once" },
+      { kind: "permission", decision: "allow_once" },
       "allow-user-shell"
     );
     await policyAdapter.waitForStart();
@@ -2289,7 +2878,7 @@ describe("SessionHost", () => {
     policy.host.resolveInteraction(
       ambiguous.id,
       ambiguous.generation,
-      { kind: "selected", value: "deny_once" },
+      { kind: "permission", decision: "deny_once" },
       "deny-user-shell"
     );
     await denial;
@@ -2906,39 +3495,44 @@ describe("SessionHost", () => {
       permissionMode: "ask",
       planMode: false
     })).value.sessionId;
+    const quotedPrompt: PromptInput = {
+      text: "> <!-- joko-selection-quote -->\n> selected\n\nreply",
+      images: [],
+      files: [],
+      mentions: [],
+      disposition: "prompt",
+      quotesEncoded: true,
+      pastedTextRanges: [{ start: 44, end: 49, display: "Pasted text (1 line)" }]
+    };
     const quoted = fixture.host.enqueueInput({
       operationId: "send-quote-gate",
       connection: fixture.connection,
       sessionId,
-      prompt: {
-        text: "> <!-- joko-selection-quote -->\n> selected\n\nreply",
-        images: [],
-        files: [],
-        mentions: [],
-        disposition: "prompt",
-        quotesEncoded: true,
-        pastedTextRanges: [{ start: 44, end: 49, display: "Pasted text (1 line)" }]
-      }
+      prompt: quotedPrompt
     });
     await eventually(() => fixture.store.getRun(quoted.value.runId).descriptor.state === "completed");
     await eventually(() => fixture.store.listEvents({ sessionId }).filter((event) => event.pi?.entryId === "quote-entry-1").length === 2);
-    expect(fixture.store.listEvents({ sessionId }).filter((event) => event.pi?.entryId === "quote-entry-1").map((event) => event.payload))
-      .toEqual([
-        expect.objectContaining({
-          type: "message_complete",
-          role: "user",
-          quotesEncoded: true,
-          pastedTextRanges: [{ start: 44, end: 49, display: "Pasted text (1 line)" }],
-          inputDelivery: "prompt"
-        }),
-        expect.objectContaining({
-          type: "message_complete",
-          role: "user",
-          quotesEncoded: true,
-          pastedTextRanges: [{ start: 44, end: 49, display: "Pasted text (1 line)" }],
-          inputDelivery: "prompt"
-        })
-      ]);
+    const quotedPayloads = fixture.store.listEvents({ sessionId })
+      .filter((event) => event.pi?.entryId === "quote-entry-1")
+      .map((event) => event.payload);
+    expect(quotedPayloads).toEqual([
+      expect.objectContaining({
+        type: "message_complete",
+        role: "user",
+        acceptedInput: quotedPrompt,
+        inputDelivery: "prompt"
+      }),
+      expect.objectContaining({
+        type: "message_complete",
+        role: "user",
+        acceptedInput: quotedPrompt,
+        inputDelivery: "prompt"
+      })
+    ]);
+    for (const payload of quotedPayloads) {
+      expect(payload).not.toHaveProperty("quotesEncoded");
+      expect(payload).not.toHaveProperty("pastedTextRanges");
+    }
     const generationBeforeResume = fixture.store.getSession(sessionId).descriptor.binding.generation;
     await fixture.host.detach(sessionId);
     await expect(fixture.host.resume(sessionId)).resolves.toBeDefined();
@@ -2948,8 +3542,7 @@ describe("SessionHost", () => {
       .map((event) => event.payload)).toEqual([
         expect.objectContaining({
           type: "message_complete",
-          quotesEncoded: true,
-          pastedTextRanges: [{ start: 44, end: 49, display: "Pasted text (1 line)" }],
+          acceptedInput: quotedPrompt,
           inputDelivery: "prompt"
         })
       ]);
@@ -2969,20 +3562,22 @@ describe("SessionHost", () => {
     await eventually(() => fixture.store.getRun(typedMarker.value.runId).descriptor.state === "completed");
     await eventually(() => fixture.store.listEvents({ sessionId }).filter((event) => event.pi?.entryId === "quote-entry-2").length === 2);
     expect(fixture.store.listEvents({ sessionId }).filter((event) => event.pi?.entryId === "quote-entry-2")
-      .every((event) => event.payload.type === "message_complete" && event.payload.quotesEncoded !== true)).toBe(true);
+      .every((event) => event.payload.type === "message_complete"
+        && event.payload.acceptedInput?.quotesEncoded !== true)).toBe(true);
 
+    const repeatedPrompt: PromptInput = {
+      text: "> <!-- joko-selection-quote -->\n> selected\n\nreply",
+      images: [],
+      files: [],
+      mentions: [],
+      disposition: "prompt",
+      pastedTextRanges: [{ start: 0, end: 1, display: "Pasted prefix" }]
+    };
     const repeated = fixture.host.enqueueInput({
       operationId: "send-repeated-quote-text",
       connection: fixture.connection,
       sessionId,
-      prompt: {
-        text: "> <!-- joko-selection-quote -->\n> selected\n\nreply",
-        images: [],
-        files: [],
-        mentions: [],
-        disposition: "prompt",
-        pastedTextRanges: [{ start: 0, end: 1, display: "Pasted prefix" }]
-      }
+      prompt: repeatedPrompt
     });
     await eventually(() => fixture.store.getRun(repeated.value.runId).descriptor.state === "completed");
     await eventually(() => fixture.store.listEvents({ sessionId }).some((event) => (
@@ -2993,7 +3588,7 @@ describe("SessionHost", () => {
     ))?.payload).toMatchObject({
       type: "message_complete",
       role: "user",
-      pastedTextRanges: [{ start: 0, end: 1, display: "Pasted prefix" }],
+      acceptedInput: repeatedPrompt,
       inputDelivery: "prompt"
     });
 
@@ -3012,6 +3607,118 @@ describe("SessionHost", () => {
     })).toThrow("ordered, non-overlapping UTF-16 spans");
     expect(fixture.store.getOperation("send-invalid-paste-range").status).toBe("failed");
     expect(fixture.store.listQueueItems({ sessionId }).some(item => item.operationId === "send-invalid-paste-range")).toBe(false);
+
+    expect(() => fixture.host.enqueueInput({
+      operationId: "send-overlapping-mention-paste-ranges",
+      connection: fixture.connection,
+      sessionId,
+      prompt: {
+        text: "@report pasted",
+        images: [],
+        files: [],
+        mentions: [{ kind: "artifact", label: "report", reference: "artifact-one" }],
+        disposition: "prompt",
+        mentionRanges: [{ start: 0, end: 7, mentionIndex: 0 }],
+        pastedTextRanges: [{ start: 0, end: 7, display: "Pasted reference" }]
+      }
+    })).toThrow("Mention ranges must identify ordered, non-overlapping UTF-16 spans");
+    expect(fixture.store.getOperation("send-overlapping-mention-paste-ranges").status).toBe("failed");
+    expect(fixture.store.listQueueItems({ sessionId }).some((item) =>
+      item.operationId === "send-overlapping-mention-paste-ranges")).toBe(false);
+  });
+
+  it("keeps equal native text bound to each exact accepted Artifact identity", async () => {
+    const adapter = new QuoteGateFakeAdapter();
+    const fixture = await createFixture(adapter);
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-equal-artifact-inputs",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Equal Artifact input",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const prompt = (reference: string): PromptInput => ({
+      text: "@report inspect",
+      images: [],
+      files: [],
+      mentions: [{ kind: "artifact", label: "report", reference }],
+      mentionRanges: [{ start: 0, end: 7, mentionIndex: 0 }],
+      disposition: "prompt"
+    });
+
+    const firstPrompt = prompt("artifact-one");
+    const first = fixture.host.enqueueInput({
+      operationId: "send-equal-artifact-one",
+      connection: fixture.connection,
+      sessionId,
+      prompt: firstPrompt
+    });
+    await eventually(() => fixture.store.getRun(first.value.runId).descriptor.state === "completed");
+    const secondPrompt = prompt("artifact-two");
+    const second = fixture.host.enqueueInput({
+      operationId: "send-equal-artifact-two",
+      connection: fixture.connection,
+      sessionId,
+      prompt: secondPrompt
+    });
+    await eventually(() => fixture.store.getRun(second.value.runId).descriptor.state === "completed");
+    await eventually(() => fixture.store.listEvents({ sessionId }).filter((event) =>
+      event.id.startsWith("native-event-")
+      && event.payload.type === "message_complete"
+      && event.payload.role === "user"
+      && event.payload.acceptedInput !== undefined
+    ).length === 2);
+
+    const projected = new Map(fixture.store.listEvents({ sessionId })
+      .filter((event) => event.id.startsWith("native-event-")
+        && event.payload.type === "message_complete" && event.payload.role === "user")
+      .map((event) => {
+        if (event.payload.type !== "message_complete") throw new Error("Expected a projected message.");
+        return [event.payload.nativeHistory?.identity?.entryId, event.payload.acceptedInput] as const;
+      }));
+    expect(projected.get("quote-entry-1")).toEqual(firstPrompt);
+    expect(projected.get("quote-entry-2")).toEqual(secondPrompt);
+  });
+
+  it("retains an accepted live receipt without native identity but does not grant it to refreshed history", async () => {
+    const adapter = new QuoteGateFakeAdapter({ liveNativeIdentity: false });
+    const fixture = await createFixture(adapter);
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-unidentified-live-input",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Unidentified live input",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const prompt: PromptInput = {
+      text: "same native body",
+      images: [],
+      files: [],
+      mentions: [{ kind: "artifact", label: "report", reference: "artifact-private" }],
+      disposition: "prompt"
+    };
+    const execution = fixture.host.enqueueInput({
+      operationId: "send-unidentified-live-input",
+      connection: fixture.connection,
+      sessionId,
+      prompt
+    });
+    await eventually(() => fixture.store.getRun(execution.value.runId).descriptor.state === "completed");
+    await eventually(() => fixture.store.listEvents({ sessionId }).some((event) =>
+      event.id.startsWith("native-event-") && event.pi?.entryId === "quote-entry-1"));
+
+    const userEvents = fixture.store.listEvents({ sessionId }).filter((event) =>
+      event.payload.type === "message_complete" && event.payload.role === "user");
+    const live = userEvents.find((event) => event.runId === execution.value.runId);
+    const refreshed = userEvents.find((event) => event.id.startsWith("native-event-"));
+    expect(live?.payload).toMatchObject({ acceptedInput: prompt, inputDelivery: "prompt" });
+    expect(live?.payload).not.toHaveProperty("nativeHistory.identity.entryId");
+    expect(fixture.store.findEvent(live!.id)?.payload).toEqual(live?.payload);
+    expect(refreshed?.payload).not.toHaveProperty("acceptedInput");
   });
 
   it("buffers a synchronous terminal until Backend acceptance commits, then settles Queue and Run", async () => {
@@ -4535,7 +5242,7 @@ describe("SessionHost", () => {
       fixture.host.resolveInteraction(
         "run-silence-question",
         fixture.store.getSession(sessionId).descriptor.binding.generation,
-        { kind: "question", answers: {} },
+        { kind: "question", answers: [] },
         "test:run-silence-question"
       );
 
@@ -7138,7 +7845,10 @@ describe("SessionHost", () => {
     }
   );
 
-  it.each(["active", "preserved"] as const)("rejects a %s isolated checkout before any native derivation", async (state) => {
+  it.each([
+    { state: "active" as const, code: "SESSION_DERIVATION_WORKTREE_UNSUPPORTED" },
+    { state: "preserved" as const, code: "SESSION_DERIVATION_WORKTREE_UNAVAILABLE" }
+  ])("rejects an isolated checkout without active workspace derivation authority ($state)", async ({ state, code }) => {
     const adapter = new GatedFakeAdapter();
     const fixture = await createFixture(adapter);
     const baseId = (await fixture.host.createSession({
@@ -7159,7 +7869,7 @@ describe("SessionHost", () => {
     await expect(fixture.host.deriveSession({
       operationId: `worktree-derive-${state}`, connection: fixture.connection,
       sourceSessionId: source.descriptor.id, title: "Derived", kind: "clone"
-    })).rejects.toMatchObject({ publicError: { code: "SESSION_DERIVATION_WORKTREE_UNAVAILABLE", stateMayHaveChanged: false } });
+    })).rejects.toMatchObject({ publicError: { code, stateMayHaveChanged: false } });
     expect(cloneNative).not.toHaveBeenCalled();
     expect(adapter.forkCalls).toBe(0);
     expect(fixture.store.getSession(source.descriptor.id).descriptor.worktree).toEqual(source.descriptor.worktree);
@@ -7869,6 +8579,15 @@ describe("SessionHost", () => {
     })).value.sessionId;
     const session = fixture.store.getSession(sessionId).descriptor;
     const nativeEntryId = "native-history-tail";
+    const acceptedInput: PromptInput = {
+      text: "tail input",
+      images: [],
+      files: [],
+      mentions: [],
+      disposition: "prompt",
+      quotesEncoded: true,
+      pastedTextRanges: [{ start: 0, end: 4, display: "Pasted text (1 line)" }]
+    };
     const accepted = fixture.store.appendEvent({
       id: "accepted-native-history-tail",
       backendId: session.backendId,
@@ -7880,8 +8599,7 @@ describe("SessionHost", () => {
         type: "message_complete",
         role: "user",
         blocks: [{ kind: "text", text: "tail input" }],
-        quotesEncoded: true,
-        pastedTextRanges: [{ start: 0, end: 4, display: "Pasted text (1 line)" }],
+        acceptedInput,
         nativeHistory: { identity: { entryId: nativeEntryId } }
       },
       pi: quoteGateMetadata(nativeEntryId).pi,
@@ -7931,12 +8649,9 @@ describe("SessionHost", () => {
       && event.payload.type === "message_complete"
     );
     expect(projection?.payload).toMatchObject({
-      quotesEncoded: true,
-      pastedTextRanges: [{ start: 0, end: 4, display: "Pasted text (1 line)" }]
+      acceptedInput
     });
     expect(queries.map((query) => query.afterCursor)).toEqual([
-      undefined,
-      100_000n,
       undefined,
       100_000n
     ]);
@@ -8167,7 +8882,7 @@ describe("SessionHost", () => {
     fixture.host.resolveInteraction(
       interaction.id,
       interaction.generation,
-      { kind: "confirmed", confirmed: true },
+      { kind: "extension", result: { kind: "confirmed", value: true } },
       "resolve-single-owner"
     );
     await eventually(() => fixture.store.getRun(execution.value.runId).descriptor.state === "completed");
@@ -8183,6 +8898,418 @@ describe("SessionHost", () => {
     expect(fixture.store.listEvents({ sessionId }).filter((event) =>
       event.payload.type === "interaction_dismissed" && event.payload.interactionId === interaction.id
     )).toHaveLength(0);
+  });
+
+  it("rejects an invalid Adapter question declaration before it becomes durable", async () => {
+    const declarations = [
+      {
+        label: "no fields",
+        payload: {
+          id: "invalid-question-no-fields",
+          kind: "question",
+          title: "Invalid question",
+          prompt: "This request has no answer fields.",
+          fields: []
+        }
+      },
+      {
+        label: "old sensitive text shape",
+        payload: {
+          id: "invalid-question-old-text",
+          kind: "question",
+          title: "Invalid question",
+          prompt: "This request uses a removed field.",
+          fields: [{
+            id: "answer",
+            kind: "text",
+            label: "Answer",
+            required: true,
+            multiline: false,
+            sensitive: true
+          }]
+        }
+      },
+      {
+        label: "unknown field kind",
+        payload: {
+          id: "invalid-question-field-kind",
+          kind: "question",
+          title: "Invalid question",
+          prompt: "This request has no current field kind.",
+          fields: [{ id: "answer", kind: "choice", label: "Answer", required: true }]
+        }
+      }
+    ] as const;
+
+    for (const declaration of declarations) {
+      const adapter = new InteractionFakeAdapter(declaration.payload as never);
+      const fixture = await createFixture(adapter);
+      const sessionId = (await fixture.host.createSession({
+        operationId: `create-${declaration.payload.id}`,
+        connection: fixture.connection,
+        targetId: "target-one",
+        title: "Invalid question declaration",
+        fastMode: false,
+        permissionMode: "ask",
+        planMode: false
+      })).value.sessionId;
+      const execution = fixture.host.enqueueInput({
+        operationId: `send-${declaration.payload.id}`,
+        connection: fixture.connection,
+        sessionId,
+        prompt: { text: "ask", images: [], files: [], mentions: [], disposition: "prompt" }
+      });
+
+      await eventually(() => fixture.store.getRun(execution.value.runId).descriptor.state === "failed");
+      expect(fixture.store.getRun(execution.value.runId).descriptor.error?.code, declaration.label)
+        .toBe("INTERACTION_DECISION_INVALID");
+      expect(fixture.store.listInteractions({ sessionId }), declaration.label).toHaveLength(0);
+      expect(fixture.store.listEvents({ sessionId }).filter((event) =>
+        event.payload.type === "interaction_opened" && event.payload.interaction.id === declaration.payload.id
+      ), declaration.label).toHaveLength(0);
+    }
+  });
+
+  it("dismisses a durable Interaction during startup when its Backend waiter cannot survive restart", async () => {
+    const fixture = await createFixture();
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-startup-interaction-recovery",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Startup interaction recovery",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: true
+    })).value.sessionId;
+    const generation = fixture.store.getSession(sessionId).descriptor.binding.generation;
+    fixture.store.openInteraction({
+      sessionId,
+      generation,
+      payload: {
+        id: "startup-orphaned-interaction",
+        kind: "plan_review",
+        title: "Review plan",
+        markdown: "This waiter belongs to the stopped Host.",
+        choices: ["execute", "stay"]
+      },
+      traceId: "test:startup-orphaned-interaction"
+    });
+    await fixture.host.dispose();
+
+    const restarted = new SessionHost(
+      fixture.store,
+      fixture.artifacts,
+      [new FakeBackendAdapter(PI_LIKE_PROFILE)]
+    );
+    cleanups.push(() => restarted.dispose());
+    await restarted.initialize();
+
+    expect(fixture.store.getInteraction("startup-orphaned-interaction")).toMatchObject({
+      status: "dismissed",
+      dismissalReason: "The Orchestrator restarted while this interaction was awaiting a response."
+    });
+    expect(restarted.inspectRuntimeActivity()).not.toContain("interaction");
+    expect(fixture.store.getSession(sessionId).descriptor.planMode).toBe(true);
+    expect(() => restarted.resolveInteraction(
+      "startup-orphaned-interaction",
+      generation,
+      { kind: "plan_review", decision: "execute" },
+      "test:late-startup-interaction-response"
+    )).toThrow(InvalidStateTransitionError);
+    expect(fixture.store.listEvents({ sessionId }).filter((event) =>
+      event.payload.type === "interaction_dismissed"
+        && event.payload.interactionId === "startup-orphaned-interaction"
+    )).toHaveLength(1);
+  });
+
+  it("rejects mismatched and unadvertised permission decisions before every interaction side effect", async () => {
+    const adapter = new InteractionFakeAdapter({
+      id: "permission-decision-authority",
+      kind: "permission",
+      title: "Run command?",
+      toolName: "bash",
+      summary: "write output",
+      risk: "high",
+      choices: ["deny_once"]
+    });
+    const fixture = await createFixture(adapter);
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-permission-decision-authority",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Permission decision authority",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: true
+    })).value.sessionId;
+    const execution = fixture.host.enqueueInput({
+      operationId: "send-permission-decision-authority",
+      connection: fixture.connection,
+      sessionId,
+      prompt: { text: "ask", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    await eventually(() => fixture.store.listInteractions({ sessionId, status: "open" }).length === 1);
+    const target = fixture.store.getInteraction("permission-decision-authority");
+    fixture.store.openInteraction({
+      sessionId,
+      runId: execution.value.runId,
+      generation: target.generation,
+      payload: {
+        id: "permission-decision-sibling",
+         kind: "question",
+         title: "Sibling prompt",
+         prompt: "Remain open",
+         fields: [{
+           id: "keep-open",
+           kind: "boolean",
+           label: "Keep open",
+           required: false,
+           defaultValue: false
+         }]
+      },
+      traceId: "test:permission-decision-sibling"
+    });
+
+    for (const submission of [
+      { kind: "plan_review", decision: "execute", feedback: "" },
+      { kind: "permission", decision: "allow_once" }
+    ] satisfies readonly InteractionDecisionSubmission[]) {
+      expect(() => fixture.host.resolveInteraction(
+        target.id,
+        target.generation,
+        submission,
+        `test:invalid:${submission.kind}`
+      )).toThrow(expect.objectContaining({
+        publicError: expect.objectContaining({ code: "INTERACTION_DECISION_INVALID", stateMayHaveChanged: false })
+      }));
+      expect(fixture.store.getInteraction(target.id).status).toBe("open");
+      expect(fixture.store.getInteraction("permission-decision-sibling").status).toBe("open");
+      expect(fixture.store.getSession(sessionId).descriptor.planMode).toBe(true);
+      expect(adapter.decision).toBeUndefined();
+      expect(fixture.store.listEvents({ sessionId }).filter((event) =>
+        (event.payload.type === "interaction_resolved" || event.payload.type === "interaction_dismissed")
+        && (event.payload.interactionId === target.id || event.payload.interactionId === "permission-decision-sibling")
+      )).toHaveLength(0);
+    }
+
+    fixture.host.resolveInteraction(
+      target.id,
+      target.generation,
+      { kind: "permission", decision: "deny_once" },
+      "test:valid-denial"
+    );
+    await eventually(() => adapter.decision !== undefined);
+    expect(adapter.decision).toEqual({ kind: "selected", value: "deny_once" });
+    expect(fixture.store.getInteraction("permission-decision-sibling").status).toBe("open");
+    expect(fixture.store.getSession(sessionId).descriptor.planMode).toBe(true);
+  });
+
+  it("validates every question answer against the exact durable field declaration", async () => {
+    const fixture = await createFixture();
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-question-decision-authority",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Question decision authority",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const generation = fixture.store.getSession(sessionId).descriptor.binding.generation;
+    const interactionId = "question-decision-authority";
+    fixture.store.openInteraction({
+      sessionId,
+      generation,
+      payload: {
+        id: interactionId,
+        kind: "question",
+        title: "Exact answers",
+        prompt: "Answer the declared fields",
+        fields: [
+          { id: "name", label: "Name", required: true, kind: "text", multiline: false },
+          { id: "branch", label: "Branch", required: true, kind: "single", choices: [
+            { id: "main", label: "main" },
+            { id: "release", label: "release" }
+          ], allowOther: true },
+          { id: "checks", label: "Checks", required: false, kind: "multiple", choices: [
+            { id: "unit", label: "unit" },
+            { id: "e2e", label: "e2e" }
+          ], defaultChoiceIds: [], minimumSelections: 1, maximumSelections: 2, allowOther: true },
+          { id: "strict", label: "Strict", required: false, kind: "single", choices: [
+            { id: "only", label: "only" }
+          ], allowOther: false },
+          { id: "publish", label: "Publish", required: true, kind: "boolean", defaultValue: false }
+        ]
+      },
+      traceId: "test:question-decision-authority"
+    });
+    const validRequired = [
+      { fieldId: "name", value: { kind: "text", value: "Joko" } },
+      { fieldId: "branch", value: { kind: "choice", value: "main" } },
+      { fieldId: "publish", value: { kind: "boolean", value: false } }
+    ] as const;
+    const invalid = [
+      { label: "wrong decision oneof", submission: { kind: "permission", decision: "deny_once" } },
+      { label: "missing required field", submission: { kind: "question", answers: validRequired.slice(0, 2) } },
+      { label: "extra field", submission: { kind: "question", answers: [
+        ...validRequired,
+        { fieldId: "undeclared", value: { kind: "text", value: "extra" } }
+      ] } },
+      { label: "wrong answer oneof", submission: { kind: "question", answers: [
+        { fieldId: "name", value: { kind: "choice", value: "main" } },
+        ...validRequired.slice(1)
+      ] } },
+      { label: "undeclared choice", submission: { kind: "question", answers: [
+        validRequired[0],
+        { fieldId: "branch", value: { kind: "choice", value: "develop" } },
+        validRequired[2]
+      ] } },
+      { label: "duplicate field", submission: { kind: "question", answers: [
+        ...validRequired,
+        validRequired[2]
+      ] } },
+      { label: "duplicate multiple choice", submission: { kind: "question", answers: [
+        ...validRequired,
+        { fieldId: "checks", value: { kind: "choices", values: ["unit", "unit"] } }
+      ] } },
+      { label: "unadvertised other", submission: { kind: "question", answers: [
+        ...validRequired,
+        { fieldId: "strict", value: { kind: "other", value: "custom" } }
+      ] } },
+      { label: "empty multiple other", submission: { kind: "question", answers: [
+        ...validRequired,
+        { fieldId: "checks", value: { kind: "choices", values: ["unit"], otherText: " " } }
+      ] } }
+    ] satisfies readonly { readonly label: string; readonly submission: InteractionDecisionSubmission }[];
+
+    for (const scenario of invalid) {
+      expect(() => fixture.host.resolveInteraction(
+        interactionId,
+        generation,
+        scenario.submission,
+        `test:question-invalid:${scenario.label}`
+      ), scenario.label).toThrow(expect.objectContaining({
+        publicError: expect.objectContaining({ code: "INTERACTION_DECISION_INVALID", stateMayHaveChanged: false })
+      }));
+      expect(fixture.store.getInteraction(interactionId).status, scenario.label).toBe("open");
+      expect(fixture.store.listEvents({ sessionId }).filter((event) =>
+        event.payload.type === "interaction_resolved" && event.payload.interactionId === interactionId
+      ), scenario.label).toHaveLength(0);
+    }
+
+    fixture.host.resolveInteraction(
+      interactionId,
+      generation,
+      { kind: "question", answers: [
+        validRequired[0],
+        { fieldId: "branch", value: { kind: "other", value: "trunk" } },
+        { fieldId: "checks", value: { kind: "choices", values: ["unit"], otherText: "lint" } },
+        validRequired[2]
+      ] },
+      "test:question-valid"
+    );
+    expect(fixture.store.getInteraction(interactionId)).toMatchObject({
+      status: "resolved",
+      decision: { kind: "question", answers: {
+        name: { kind: "text", value: "Joko" },
+        branch: { kind: "single", selection: { kind: "other", text: "trunk" } },
+        checks: { kind: "multiple", choiceIds: ["unit"], otherText: "lint" },
+        publish: { kind: "boolean", value: false }
+      } }
+    });
+
+    expect(() => fixture.store.openInteraction({
+      sessionId,
+      generation,
+      payload: {
+        id: "question-invalid-optional-schema",
+        kind: "question",
+        title: "Invalid optional field",
+        prompt: "This declaration cannot be answered",
+        fields: [{
+          id: "optional",
+          label: "Optional",
+          required: false,
+          kind: "multiple",
+          choices: [],
+          defaultChoiceIds: [],
+          minimumSelections: 1,
+          allowOther: false
+        }]
+      },
+      traceId: "test:question-invalid-optional-schema"
+    })).toThrow(StoreError);
+  });
+
+  it("accepts only advertised plan-review decisions and keeps invalid responses side-effect free", async () => {
+    const fixture = await createFixture();
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-plan-decision-authority",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Plan decision authority",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: true
+    })).value.sessionId;
+    const generation = fixture.store.getSession(sessionId).descriptor.binding.generation;
+    fixture.store.openInteraction({
+      sessionId,
+      generation,
+      payload: {
+        id: "plan-decision-authority",
+        kind: "plan_review",
+        title: "Review plan",
+        markdown: "1. Inspect\n2. Refine",
+        choices: ["refine"]
+      },
+      traceId: "test:plan-decision-authority"
+    });
+    fixture.store.openInteraction({
+      sessionId,
+      generation,
+      payload: {
+        id: "plan-decision-sibling",
+        kind: "permission",
+        title: "Sibling permission",
+        toolName: "tool",
+        summary: "Remain open",
+        risk: "low",
+        choices: ["deny_once"]
+      },
+      traceId: "test:plan-decision-sibling"
+    });
+
+    for (const submission of [
+      { kind: "plan_review", decision: "execute" },
+      { kind: "plan_review", decision: "execute_plan" },
+      { kind: "permission", decision: "deny_once" }
+    ] satisfies readonly InteractionDecisionSubmission[]) {
+      expect(() => fixture.host.resolveInteraction(
+        "plan-decision-authority",
+        generation,
+        submission,
+        "test:plan-decision-invalid"
+      )).toThrow(expect.objectContaining({
+        publicError: expect.objectContaining({ code: "INTERACTION_DECISION_INVALID" })
+      }));
+      expect(fixture.store.getInteraction("plan-decision-authority").status).toBe("open");
+      expect(fixture.store.getInteraction("plan-decision-sibling").status).toBe("open");
+      expect(fixture.store.getSession(sessionId).descriptor.planMode).toBe(true);
+    }
+
+    fixture.host.resolveInteraction(
+      "plan-decision-authority",
+      generation,
+      { kind: "plan_review", decision: "refine" },
+      "test:plan-decision-valid"
+    );
+    expect(fixture.store.getInteraction("plan-decision-authority")).toMatchObject({
+      status: "resolved",
+      decision: { kind: "plan_review", decision: "refine", feedback: "" }
+    });
+    expect(fixture.store.getInteraction("plan-decision-sibling").status).toBe("open");
+    expect(fixture.store.getSession(sessionId).descriptor.planMode).toBe(true);
   });
 
   it("durably dismisses an Interaction when its Backend cancels the native request", async () => {
@@ -8259,7 +9386,7 @@ describe("SessionHost", () => {
     expect(() => fixture.host.resolveInteraction(
       interaction.id,
       interaction.generation,
-      { kind: "confirmed", confirmed: true },
+      { kind: "extension", result: { kind: "confirmed", value: true } },
       "late-timed-answer"
     )).toThrow(InvalidStateTransitionError);
     expect(fixture.store.listEvents({ sessionId }).filter((event) =>
@@ -8306,7 +9433,7 @@ describe("SessionHost", () => {
     expect(() => fixture.host.resolveInteraction(
       interaction.id,
       interaction.generation,
-      { kind: "confirmed", confirmed: true },
+      { kind: "permission", decision: "allow_once" },
       "late-approval"
     )).toThrow(InvalidStateTransitionError);
     expect(adapter.decision).toEqual({ kind: "cancelled" });
@@ -8657,10 +9784,16 @@ describe("SessionHost", () => {
       generation,
       payload: {
         id: "delete-question",
-        kind: "question",
-        title: "Question",
-        prompt: "remove this question too",
-        fields: []
+         kind: "question",
+         title: "Question",
+         prompt: "remove this question too",
+         fields: [{
+           id: "optional-note",
+           kind: "text",
+           label: "Optional note",
+           required: false,
+           multiline: false
+         }]
       },
       traceId: "test:delete-question",
       createdAt: 23
@@ -8668,7 +9801,7 @@ describe("SessionHost", () => {
     fixture.store.resolveInteraction(
       "delete-question",
       generation,
-      { answers: {} },
+      { kind: "question", answers: {} },
       "test:delete-question:resolved",
       undefined,
       24
@@ -9248,7 +10381,11 @@ describe("SessionHost", () => {
     expect(after.descriptor.binding.nativeSessionId).not.toBe(before.descriptor.binding.nativeSessionId);
     expect(after.descriptor.binding.generation).toBeGreaterThan(before.descriptor.binding.generation);
     expect(adapter.resetCalls).toBe(1);
-    expect(fixture.store.listEvents({ sessionId }).map((event) => event.payload.type)).toEqual(["session_reset"]);
+    expect(fixture.store.listEvents({ sessionId }).map(({ payload, generation }) => ({ payload, generation }))).toEqual([
+      { payload: { type: "session_changed" }, generation: after.descriptor.binding.generation },
+      { payload: { type: "session_reset" }, generation: after.descriptor.binding.generation }
+    ]);
+    expect(fixture.store.listEvents({ sessionId }).at(-1)?.operationId).toBe("clear-session-context");
     expect(fixture.store.listEvents({ sessionId, includeTombstoned: true }).map((event) => event.id))
       .toEqual(expect.arrayContaining(["reset-old-user", "reset-old-assistant"]));
   });
@@ -9268,7 +10405,8 @@ describe("SessionHost", () => {
     appendSessionEvent(fixture.store, sessionId, "reset-retry-old", 10, {
       type: "message_complete", role: "user", blocks: [{ kind: "text", text: "must remain on failure" }]
     });
-    const originalOpaqueRef = fixture.store.getSession(sessionId).descriptor.binding.opaqueRef;
+    const originalBinding = fixture.store.getSession(sessionId).descriptor.binding;
+    const originalEvents = fixture.store.listEvents({ sessionId });
     adapter.failReset = true;
 
     await expect(fixture.host.resetSession({
@@ -9278,8 +10416,8 @@ describe("SessionHost", () => {
       body: { sessionId },
       result: (session) => session.descriptor.id
     })).rejects.toBeInstanceOf(OperationPreviouslyFailedError);
-    expect(fixture.store.getSession(sessionId).descriptor.binding.opaqueRef).toBe(originalOpaqueRef);
-    expect(fixture.store.listEvents({ sessionId }).some((event) => event.id === "reset-retry-old")).toBe(true);
+    expect(fixture.store.getSession(sessionId).descriptor.binding).toEqual(originalBinding);
+    expect(fixture.store.listEvents({ sessionId })).toEqual(originalEvents);
     expect(fixture.store.getOperation("clear-session-failed").error).toMatchObject({
       code: "SESSION_RESET_EFFECT_FAILED",
       retryable: true
@@ -9293,7 +10431,14 @@ describe("SessionHost", () => {
       body: { sessionId },
       result: (session) => session.descriptor.id
     })).resolves.toMatchObject({ value: sessionId });
-    expect(fixture.store.listEvents({ sessionId }).map((event) => event.payload.type)).toEqual(["session_reset"]);
+    const resetBinding = fixture.store.getSession(sessionId).descriptor.binding;
+    expect(resetBinding.opaqueRef).not.toBe(originalBinding.opaqueRef);
+    expect(resetBinding.generation).toBeGreaterThan(originalBinding.generation);
+    expect(fixture.store.listEvents({ sessionId }).map(({ payload, generation }) => ({ payload, generation }))).toEqual([
+      { payload: { type: "session_changed" }, generation: resetBinding.generation },
+      { payload: { type: "session_reset" }, generation: resetBinding.generation }
+    ]);
+    expect(fixture.store.listEvents({ sessionId }).at(-1)?.operationId).toBe("clear-session-retry-success");
   });
 
   it("rejects durable background work and fences prompt admission for the full reset effect", async () => {
@@ -9718,6 +10863,7 @@ async function createFixture(
   adapter: FakeBackendAdapter = new FakeBackendAdapter(PI_LIKE_PROFILE),
   hostOptions: {
     readonly workspaceCapture?: WorkspaceRunCapture;
+    readonly worktrees?: SessionWorktreeCoordinator;
     readonly monotonicNow?: () => number;
     readonly freezeToolPolicies?: (sessionId: string, targetId: string) => void;
     readonly runSilenceTimeoutMs?: number;
@@ -10307,6 +11453,26 @@ class TieredUsageFakeAdapter extends FakeBackendAdapter {
   }
 }
 
+class SessionReferenceCaptureFakeAdapter extends FakeBackendAdapter {
+  readonly inputs: PromptInput[] = [];
+
+  constructor() {
+    super({
+      ...PI_LIKE_PROFILE,
+      id: "session-reference-capture",
+      capabilities: [
+        ...PI_LIKE_PROFILE.capabilities,
+        { key: "input.mention", supported: true, options: ["artifact"] }
+      ]
+    });
+  }
+
+  override async send(input: PromptInput, context: AdapterContext): Promise<void> {
+    this.inputs.push(input);
+    await super.send(input, context);
+  }
+}
+
 class TokenPricedScheduleUsageFakeAdapter extends FakeBackendAdapter {
   constructor(id = "token-priced-schedule-usage-fake") {
     super({
@@ -10556,9 +11722,17 @@ class ImmediateTerminalFakeAdapter extends FakeBackendAdapter {
 
 class QuoteGateFakeAdapter extends FakeBackendAdapter {
   readonly #messages: Array<{ readonly id: string; readonly text: string }> = [];
+  readonly #liveNativeIdentity: boolean;
 
-  constructor() {
-    super(PI_LIKE_PROFILE);
+  constructor(options: { readonly liveNativeIdentity?: boolean } = {}) {
+    super({
+      ...PI_LIKE_PROFILE,
+      capabilities: [
+        ...PI_LIKE_PROFILE.capabilities,
+        { key: "input.mention", supported: true, options: ["artifact"] }
+      ]
+    });
+    this.#liveNativeIdentity = options.liveNativeIdentity ?? true;
   }
 
   override async send(input: PromptInput, context: AdapterContext): Promise<void> {
@@ -10567,7 +11741,8 @@ class QuoteGateFakeAdapter extends FakeBackendAdapter {
     await context.emit({
       type: "message_complete",
       role: "user",
-      blocks: [{ kind: "text", text: input.text }]
+      blocks: [{ kind: "text", text: input.text }],
+      ...(this.#liveNativeIdentity ? { nativeHistory: { identity: { entryId: id } } } : {})
     }, quoteGateMetadata(id));
     await context.emit({ type: "done", outcome: "completed" });
   }
@@ -10944,7 +12119,7 @@ class RunSilenceFakeAdapter extends FakeBackendAdapter {
       kind: "question",
       title: "Continue?",
       prompt: "Waiting for an explicit decision.",
-      fields: []
+      fields: [{ id: "note", label: "Note", required: false, kind: "text", multiline: false }]
     });
   }
 

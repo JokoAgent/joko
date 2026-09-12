@@ -7,9 +7,11 @@ import { assertBrowserActionCurrent, WorkspaceHtmlExternalUnavailableError, type
 import { writeClipboardText } from "../clipboard-action.js";
 import { useClipboardAction } from "./use-clipboard-action.js";
 import { TimelineLinkMenu } from "./TimelineLinkMenu.js";
+import type { ArtifactView, OperationApi, TimelineInputMentionRangeView, TimelineInputMentionView } from "../model.js";
 import type { Translator } from "./types.js";
 import { WorkspaceImageLightbox } from "./WorkspaceImageLightbox.js";
-import { parseSentMessageReferences, resolveTimelineReference, type TimelineReferenceTarget } from "./timeline-references.js";
+import { parseSentMessageReferences, resolveSentSessionMention, resolveSentWorkspaceMention, resolveTimelineReference, sentInputMentionSegments, type TimelineReferenceTarget } from "./timeline-references.js";
+import "./timeline-references.css";
 
 export const TimelineLinkSourceContext = createContext("");
 
@@ -26,25 +28,120 @@ export interface TimelineReferenceActions {
   readonly sessionId: string;
   readonly t: Translator;
   readonly sourceKey?: string;
+  readonly workspaceId?: string;
+  readonly onReadArtifact?: OperationApi["readSessionArtifact"];
+  readonly renderArtifactPreview?: (artifact: ArtifactView, trigger: HTMLElement, onClose: () => void) => ReactNode;
   readonly onOpenHttpLink?: (url: string, options?: HttpLinkOpenOptions) => void | Promise<void>;
   readonly onOpenWorkspaceHtml?: (path: string, options?: HttpLinkOpenOptions) => void | Promise<void>;
   readonly onLoadWorkspaceAsset?: (path: string) => Promise<TimelineWorkspaceAsset>;
   readonly onWorkspaceImageToComposer?: (file: File) => void | Promise<void>;
 }
 
-export function SentMessageReferenceText({ text, actions }: {
+export function SentMessageReferenceText({ text, inputMentions = [], mentionRanges = [], actions }: {
   readonly text: string;
+  readonly inputMentions?: readonly TimelineInputMentionView[];
+  readonly mentionRanges?: readonly TimelineInputMentionRangeView[];
   readonly actions: TimelineReferenceActions;
 }): JSX.Element {
-  const segments = useMemo(() => parseSentMessageReferences(text, actions.sessionId), [actions.sessionId, text]);
-  return <span className="message-user__text">{segments.map((segment, index) => segment.kind === "text"
-    ? <span key={`text:${index}`}>{segment.text}</span>
-    : <TimelineReferenceLink
-        target={segment.target}
+  const segments = useMemo(() => sentInputMentionSegments(text, inputMentions, mentionRanges), [text, inputMentions, mentionRanges]);
+  return <span className="message-user__text">{segments.map((segment, index) => segment.kind === "mention"
+    ? <SentInputMention key={`mention:${index}`} mention={segment.mention} actions={{ ...actions, sourceKey: actions.sourceKey ?? text }}>{segment.text}</SentInputMention>
+    : parseSentMessageReferences(segment.text, actions.sessionId).map((reference, referenceIndex) => reference.kind === "text"
+      ? <span key={`text:${index}:${referenceIndex}`}>{reference.text}</span>
+      : <TimelineReferenceLink
+        target={reference.target}
         actions={{ ...actions, sourceKey: text }}
-        mention={segment.mention}
-        key={`reference:${index}`}
-      >{segment.text}</TimelineReferenceLink>)}</span>;
+        mention={reference.mention}
+        key={`reference:${index}:${referenceIndex}`}
+      >{reference.text}</TimelineReferenceLink>))}</span>;
+}
+
+export function SentMessageReferenceChips({ mentions, actions }: {
+  readonly mentions: readonly TimelineInputMentionView[];
+  readonly actions: TimelineReferenceActions;
+}): JSX.Element | null {
+  return mentions.length === 0 ? null : <span className="message-input-references" role="group" aria-label={actions.t("timeline.inputReferences")}>
+    {mentions.map((mention, index) => <SentInputMention mention={mention} actions={actions} key={index}>
+      {mention.displayText || actions.t("timeline.inputReferences")}
+    </SentInputMention>)}
+  </span>;
+}
+
+function SentInputMention({ mention, actions, children }: {
+  readonly mention: TimelineInputMentionView;
+  readonly actions: TimelineReferenceActions;
+  readonly children: ReactNode;
+}): JSX.Element {
+  if (mention.kind === "artifact") return <TimelineArtifactMention mention={mention} actions={actions}>{children}</TimelineArtifactMention>;
+  const target = mention.kind === "workspace"
+    ? resolveSentWorkspaceMention(mention, actions.sessionId, actions.workspaceId)
+    : mention.kind === "session"
+      ? resolveSentSessionMention(mention, actions.sessionId)
+      : undefined;
+  if (target !== undefined) return <TimelineReferenceLink target={target} actions={actions} mention>{children}</TimelineReferenceLink>;
+  return <span className="timeline-reference-chip is-mention is-unavailable" aria-disabled="true" title={actions.t("timeline.referenceUnavailable")}>
+    {mention.kind === "session"
+      ? <MessageSquare aria-hidden="true" />
+      : mention.kind === "workspace" && mention.directory
+        ? <Folder aria-hidden="true" />
+        : <FileText aria-hidden="true" />}
+    <span>{children}</span><small>{actions.t("timeline.referenceUnavailable")}</small>
+  </span>;
+}
+
+function TimelineArtifactMention({ mention, actions, children }: {
+  readonly mention: Extract<TimelineInputMentionView, { readonly kind: "artifact" }>;
+  readonly actions: TimelineReferenceActions;
+  readonly children: ReactNode;
+}): JSX.Element {
+  const [trigger, setTrigger] = useState<HTMLButtonElement | null>(null);
+  const [epoch, setEpoch] = useState(0);
+  const ownerDocument = trigger?.ownerDocument;
+  const sourceOwner = useMemo(() => ({}), [actions.ownerKey, actions.sessionId, actions.sourceKey, actions.onReadArtifact, mention.artifactId, ownerDocument, epoch]);
+  const scopeRef = useRef<AbortController | undefined>(undefined);
+  const requestRef = useRef<AbortController | undefined>(undefined);
+  const [state, setState] = useState<{ readonly owner: object; readonly status: "loading" | "error" | "ready"; readonly artifact?: ArtifactView }>();
+  const current = state?.owner === sourceOwner ? state : undefined;
+  const available = actions.onReadArtifact !== undefined && actions.renderArtifactPreview !== undefined;
+  useLayoutEffect(() => {
+    const scope = new AbortController(); scopeRef.current = scope;
+    const retire = (): void => { scope.abort(); requestRef.current?.abort(); requestRef.current = undefined; setState(undefined); };
+    const restore = (): void => { if (scope.signal.aborted) setEpoch((value) => value + 1); };
+    ownerDocument?.defaultView?.addEventListener("pagehide", retire);
+    ownerDocument?.defaultView?.addEventListener("pageshow", restore);
+    return () => {
+      retire();
+      if (scopeRef.current === scope) scopeRef.current = undefined;
+      ownerDocument?.defaultView?.removeEventListener("pagehide", retire);
+      ownerDocument?.defaultView?.removeEventListener("pageshow", restore);
+    };
+  }, [sourceOwner, ownerDocument]);
+  const open = (): void => {
+    const scope = scopeRef.current;
+    const read = actions.onReadArtifact;
+    if (!available || read === undefined || scope === undefined || scope.signal.aborted || requestRef.current !== undefined || !trigger?.isConnected) return;
+    const request = new AbortController(); requestRef.current = request;
+    const signal = AbortSignal.any([scope.signal, request.signal]);
+    const isCurrent = (): boolean => !signal.aborted && scopeRef.current === scope && requestRef.current === request;
+    setState({ owner: sourceOwner, status: "loading" });
+    void read(actions.sessionId, mention.artifactId, signal).then((artifact) => {
+      if (!isCurrent()) return;
+      if (artifact.id !== mention.artifactId || artifact.blobId === "") throw new Error("The referenced Artifact is unavailable.");
+      setState({ owner: sourceOwner, status: "ready", artifact });
+    }).catch(() => { if (isCurrent()) setState({ owner: sourceOwner, status: "error" }); })
+      .finally(() => { if (isCurrent()) requestRef.current = undefined; });
+  };
+  return <>
+    <button ref={setTrigger} type="button" className="timeline-reference-chip is-mention" disabled={!available}
+      aria-busy={current?.status === "loading"} aria-disabled={!available || current?.status === "loading"}
+      title={mention.displayText} onClick={open}>
+      <FileText aria-hidden="true" /><span>{children}</span>
+      {current?.status === "loading" && <small role="status">{actions.t("common.loading")}</small>}
+      {(!available || current?.status === "error") && <small role="status">{actions.t("timeline.referenceUnavailable")}</small>}
+    </button>
+    {current?.status === "ready" && current.artifact !== undefined && trigger !== null
+      && actions.renderArtifactPreview?.(current.artifact, trigger, () => setState(undefined))}
+  </>;
 }
 
 export function TimelineMarkdownLink({ href, children, actions, anchorProps }: {
@@ -190,7 +287,7 @@ function TimelineReferenceLink({ target, actions, mention = false, anchorProps, 
       label={actions.t(external ? "timeline.linkOpenMenu" : "workspace.fileActions")} onClose={close}>
       {(external || html) && <>
         <button type="button" role="menuitem" disabled={opening || copy.pending || !canOpen} onClick={() => openLink({ forceSidebar: true })}><PanelRight aria-hidden="true" />{actions.t("timeline.openInSidebarBrowser")}</button>
-        <button type="button" role="menuitem" disabled={opening || copy.pending || !canOpen} onClick={() => openLink({ forceExternal: true })}><Globe2 aria-hidden="true" />{actions.t("timeline.openInDefaultBrowser")}</button>
+        <button type="button" role="menuitem" disabled={opening || copy.pending || !canOpen} onClick={() => openLink({ forceExternal: true })}><Globe2 aria-hidden="true" />{actions.t(html ? "timeline.openInManagedBrowser" : "timeline.openInDefaultBrowser")}</button>
         <span role="separator" />
       </>}
       <button type="button" role="menuitem" disabled={opening || copy.pending} onClick={() => {

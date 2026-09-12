@@ -19,7 +19,7 @@ const READY_DEVICE: AndroidConnectedDevice = {
 };
 
 describe("AndroidToolProvider", () => {
-  it("publishes exactly the eight reference tools and no host-management operations", () => {
+  it("publishes exactly eight device-automation tools and no host-management operations", () => {
     const provider = providerWith();
 
     expect(ANDROID_TOOL_NAMES).toEqual([

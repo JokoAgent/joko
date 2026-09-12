@@ -629,6 +629,10 @@ export interface TimelineItemView {
   readonly quotesEncoded?: boolean;
   /** Ordered UTF-16 spans used to render compact sent-paste atoms. */
   readonly pastedTextRanges?: readonly TimelineInlineTextRangeView[];
+  /** Service-authored receipt of the exact accepted user input. */
+  readonly userInputAccepted?: true;
+  readonly inputMentions?: readonly TimelineInputMentionView[];
+  readonly mentionRanges?: readonly TimelineInputMentionRangeView[];
   /** Authoritative accounting for this completed assistant segment. */
   readonly usage?: TimelineMessageUsageView;
   /** Durable host-authored identity for a scheduler-injected user prompt. */
@@ -662,6 +666,19 @@ export interface TimelineInlineTextRangeView {
   readonly start: number;
   readonly end: number;
   readonly display: string;
+}
+
+export type TimelineInputMentionView =
+  | { readonly kind: "workspace"; readonly workspaceId: string; readonly relativePath: string; readonly displayText: string; readonly directory: boolean; readonly lineRange?: { readonly startLine: number; readonly endLine: number } }
+  | { readonly kind: "resource"; readonly resourceId: string; readonly displayText: string; readonly discoveredRevision: string; readonly resourceVersion: string; readonly runtimeGeneration: number }
+  | { readonly kind: "artifact"; readonly artifactId: string; readonly displayText: string }
+  | { readonly kind: "session"; readonly sessionId: string; readonly displayText: string };
+
+export interface TimelineInputMentionRangeView {
+  readonly start: number;
+  readonly end: number;
+  /** Index into inputMentions, independent of text and attachment parts. */
+  readonly mentionIndex: number;
 }
 
 export interface TimelineMessageUsageView {
@@ -756,8 +773,7 @@ export interface TimelineQuestionAnswerView {
   readonly question: string;
   readonly answer?:
     | { readonly kind: "text"; readonly values: readonly string[] }
-    | { readonly kind: "boolean"; readonly value: boolean }
-    | { readonly kind: "sensitive" };
+    | { readonly kind: "boolean"; readonly value: boolean };
 }
 
 export interface SessionMessageSearchMatchView {
@@ -914,11 +930,42 @@ export interface QueueItemView {
   readonly generation: bigint;
   readonly source: "user" | "schedule" | "backend" | "retry";
   readonly mode: DeliveryMode;
+  /** Canonical concatenation of the accepted InputContent text parts. */
   readonly text: string;
-  readonly state: "accepted" | "queued" | "dispatching" | "acceptedByBackend" | "dispatchUnknown" | "completed" | "cancelled" | "failed";
+  /** Durable product truth for Joko-owned selected-text quote atoms. */
+  readonly quotesEncoded?: boolean;
+  /** Ordered UTF-16 spans for compact pasted-text atoms. */
+  readonly pastedTextRanges?: readonly TimelineInlineTextRangeView[];
+  /** Exact typed references carried by the queued input. */
+  readonly inputMentions?: readonly TimelineInputMentionView[];
+  /** Ordered UTF-16 occurrences into text, indexed against inputMentions. */
+  readonly mentionRanges?: readonly TimelineInputMentionRangeView[];
+  /** Non-text attachments retained by the queue item. */
+  readonly attachments?: readonly QueueInputAttachmentView[];
+  readonly state: "accepted" | "dispatching" | "acceptedByBackend" | "dispatchUnknown" | "completed" | "cancelled" | "failed";
   readonly editLocked: boolean;
   readonly ordinal: number;
   readonly createdAt: number;
+}
+
+export interface QueueInputAttachmentView {
+  readonly kind: "image" | "file";
+  readonly label: string;
+}
+
+/** Text-editor result whose ranges were mapped through the actual edit transaction. */
+export interface QueueItemTextEditView {
+  readonly text: string;
+  readonly mentionRanges: readonly TimelineInputMentionRangeView[];
+  readonly pastedTextRanges: readonly TimelineInlineTextRangeView[];
+  /** Ordered UTF-16 edits from the durable Queue text to this projection. */
+  readonly textSplices: readonly QueueTextEditSpliceView[];
+}
+
+export interface QueueTextEditSpliceView {
+  readonly start: number;
+  readonly end: number;
+  readonly replacementText: string;
 }
 
 export interface QueueControlView {
@@ -1010,9 +1057,9 @@ export interface QuestionFieldView {
   readonly placeholder?: string;
   readonly defaultValue?: string | boolean | readonly string[];
   readonly multiline: boolean;
-  readonly sensitive: boolean;
   readonly minimumSelections: number;
   readonly maximumSelections?: number;
+  readonly allowOther: boolean;
 }
 
 export interface PlanStepView {
@@ -1022,7 +1069,16 @@ export interface PlanStepView {
   readonly state: "pending" | "inProgress" | "completed" | "skipped";
 }
 
-export type QuestionAnswerDraft = string | boolean | readonly string[];
+export type QuestionAnswerDraft =
+  | { readonly kind: "text"; readonly value: string }
+  | {
+      readonly kind: "single";
+      readonly selection:
+        | { readonly kind: "choice"; readonly choiceId: string }
+        | { readonly kind: "other"; readonly text: string };
+    }
+  | { readonly kind: "multiple"; readonly choiceIds: readonly string[]; readonly otherText?: string }
+  | { readonly kind: "boolean"; readonly value: boolean };
 
 export type InteractionResolutionDraft =
   | { readonly kind: "permission"; readonly decisionId: string }
@@ -1924,6 +1980,18 @@ export interface ResourceView {
   readonly extensionContentFingerprint?: string;
   readonly postMutationNotice: boolean;
   readonly error?: string;
+}
+
+/** Exact loaded resource identity owned by one live task runtime. */
+export interface SessionResourceView {
+  readonly sessionId: string;
+  readonly id: string;
+  readonly name: string;
+  readonly version?: string;
+  readonly kind: Exclude<ResourceKindView, "theme">;
+  readonly discoveredRevision: string;
+  readonly resourceVersion: string;
+  readonly runtimeGeneration: number;
 }
 
 export type ResourceAcquisitionDraft =
@@ -2979,6 +3047,11 @@ export interface TargetWorktreeProbeView {
   readonly canRefreshRemote: boolean;
 }
 
+export interface SessionWorktreeRemovalPreviewView {
+  readonly hasWorktree: boolean;
+  readonly dirty: boolean;
+}
+
 export interface WorktreeSourceView {
   readonly ref: string;
   readonly commit: string;
@@ -3013,20 +3086,47 @@ export interface NewSessionLocalDraft {
   /** Ordered rich-text source of truth for the delayed first message. */
   readonly editorDocument: JSONContent;
   readonly mentions: readonly ComposerMentionDraft[];
+  readonly inlineMentionRanges?: readonly ComposerInlineMentionRange[];
   readonly attachments: readonly AttachmentDraft[];
   readonly extraDirectoryIds?: readonly string[];
 }
 
-export interface ComposerTokenMentionDraft {
+interface ComposerTokenMentionBaseDraft {
   readonly id: string;
-  readonly kind: "workspace" | "resource";
   readonly reference: string;
   readonly label: string;
   readonly token: string;
-  readonly workspaceId?: string;
-  readonly directory?: boolean;
-  readonly lineRange?: { readonly startLine: number; readonly endLine: number };
 }
+
+export type ComposerTokenMentionDraft = ComposerTokenMentionBaseDraft & (
+  | {
+      readonly kind: "workspace";
+      readonly workspaceId?: string;
+      readonly directory?: boolean;
+      readonly lineRange?: { readonly startLine: number; readonly endLine: number };
+    }
+  | {
+      readonly kind: "resource";
+      readonly discoveredRevision: string;
+      readonly resourceVersion: string;
+      readonly runtimeGeneration: number;
+      readonly workspaceId?: never;
+      readonly directory?: never;
+      readonly lineRange?: never;
+    }
+  | {
+      readonly kind: "artifact";
+      readonly workspaceId?: never;
+      readonly directory?: never;
+      readonly lineRange?: never;
+    }
+  | {
+      readonly kind: "session";
+      readonly workspaceId?: never;
+      readonly directory?: never;
+      readonly lineRange?: never;
+    }
+);
 
 /**
  * A message reference stays structured in the local draft. It deliberately
@@ -3044,6 +3144,13 @@ export interface ComposerMessageMentionDraft {
 }
 
 export type ComposerMentionDraft = ComposerTokenMentionDraft | ComposerMessageMentionDraft;
+
+/** Exact occurrences in the rich document's plain-text projection. */
+export interface ComposerInlineMentionRange {
+  readonly mentionId: string;
+  readonly from: number;
+  readonly to: number;
+}
 
 interface ComposerSelectionQuoteBaseDraft {
   readonly id: string;
@@ -3079,6 +3186,7 @@ export interface ComposerDraft {
   readonly attachments: readonly AttachmentDraft[];
   readonly browserComments?: readonly BrowserCommentDraftItem[];
   readonly mentions: readonly ComposerMentionDraft[];
+  readonly inlineMentionRanges?: readonly ComposerInlineMentionRange[];
   readonly deliveryMode: DeliveryMode;
   /** Explicit per-turn directory selection. Undefined follows Session defaults; [] grants none. */
   readonly extraDirectoryIds?: readonly string[];
@@ -3351,6 +3459,8 @@ export interface OperationApi {
   refresh(): Promise<void>;
   refreshProviderAccountUsage(backendId: string, providerId: string): Promise<void>;
   getArtifactStorageStats(protectedSha256?: readonly string[]): Promise<ArtifactStorageMaintenanceView>;
+  listSessionArtifacts(sessionId: string, signal?: AbortSignal): Promise<readonly ArtifactView[]>;
+  readSessionArtifact(sessionId: string, artifactId: string, signal: AbortSignal): Promise<ArtifactView>;
   scanArtifactStorage(protectedSha256?: readonly string[]): Promise<ArtifactStorageScanView>;
   reconcileArtifactStorage(protectedSha256?: readonly string[]): Promise<ArtifactStorageReconcileView>;
   cleanupArtifactStorage(scanToken: string, protectedSha256?: readonly string[]): Promise<ArtifactStorageCleanupView>;
@@ -3385,6 +3495,7 @@ export interface OperationApi {
   suggestSessionTitle(sessionId: string, signal?: AbortSignal): Promise<SessionTitleSuggestionView>;
   pinSession(sessionId: string, pinned: boolean): Promise<void>;
   archiveSession(sessionId: string, archived: boolean): Promise<void>;
+  getSessionWorktreeRemovalPreview(sessionId: string, signal?: AbortSignal): Promise<SessionWorktreeRemovalPreviewView>;
   moveSessionProject(
     sessionId: string,
     projectId?: string,
@@ -3410,7 +3521,7 @@ export interface OperationApi {
       | { readonly kind: "serviceNode" };
   }, expectedRevision: bigint): Promise<void>;
   archiveTarget(targetId: string, archived: boolean): Promise<void>;
-  deleteTarget(targetId: string, deleteManagedWorkspace: boolean, deleteProductSessions: boolean): Promise<void>;
+  deleteTarget(targetId: string, deleteManagedWorkspace: boolean): Promise<void>;
   setWorkspaceTrust(workspaceId: string, trusted: boolean): Promise<void>;
   addExtraDirectory(workspaceId: string, serverPath: string, access: ExtraDirectoryView["access"]): Promise<void>;
   removeExtraDirectory(extraDirectoryId: string): Promise<void>;
@@ -3477,9 +3588,9 @@ export interface OperationApi {
   cancelQueueItem(queueItemId: string): Promise<void>;
   setQueueItemEditLock(queueItemId: string, lockToken: string, locked: boolean): Promise<void>;
   setQueueInteractionLock(sessionId: string, lockToken: string, locked: boolean): Promise<void>;
-  editQueueItem(queueItemId: string, text: string, mode: DeliveryMode, lockToken: string): Promise<void>;
+  editQueueItem(queueItemId: string, edit: QueueItemTextEditView, mode: DeliveryMode, lockToken: string): Promise<void>;
   reorderQueueItem(queueItemId: string, placement: "first" | "last" | "before" | "after", anchorQueueItemId?: string, interactionLockToken?: string): Promise<void>;
-  steerQueueItemNow(queueItemId: string, text: string, lockToken: string): Promise<void>;
+  steerQueueItemNow(queueItemId: string, lockToken: string): Promise<void>;
   pauseQueue(sessionId: string, reason?: string): Promise<void>;
   resumeQueue(sessionId: string): Promise<void>;
   restartBrowser(browserId: string): Promise<void>;
@@ -3501,6 +3612,7 @@ export interface OperationApi {
   setResourceEnabled(resourceId: string, enabled: boolean): Promise<void>;
   removeResource(resourceId: string): Promise<void>;
   listCommands(sessionId: string): Promise<readonly RuntimeCommandView[]>;
+  listSessionResources(sessionId: string, signal?: AbortSignal): Promise<readonly SessionResourceView[]>;
   listRuntimeProcesses(backendId: string, signal?: AbortSignal): Promise<RuntimeProcessUsageSnapshotView>;
   getUsageHistory(days?: number, backendId?: string, providerId?: string, signal?: AbortSignal): Promise<UsageHistoryView>;
   getUsageReport(query: UsageReportQueryView, signal: AbortSignal): Promise<UsageReportView>;

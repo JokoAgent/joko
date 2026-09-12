@@ -22,15 +22,15 @@ export interface ConversationSearchFilters {
   /** A single dynamically discovered backend, or every backend. */
   readonly backendId?: string | "all";
   readonly lastActivity?: ConversationSearchLastActivityFilter;
-  /** Dynamically discovered target ids. An empty selection matches nothing. */
-  readonly targetIds?: readonly string[] | "all";
+  /** Navigation project ids. An empty selection matches nothing. */
+  readonly projectIds?: readonly string[] | "all";
 }
 
 export const ALL_CONVERSATION_SEARCH_FILTERS = {
   status: "all",
   backendId: "all",
   lastActivity: "all",
-  targetIds: "all"
+  projectIds: "all"
 } as const satisfies ConversationSearchFilters;
 
 const DAY_MS = 24 * 60 * 60 * 1_000;
@@ -104,7 +104,7 @@ export function projectConversationSearchResults(
   }
 
   const results = matchingSessions.flatMap((session): ConversationSearchResult[] => {
-    const target = targetById.get(session.targetId);
+    const target = session.projectId === undefined ? undefined : targetById.get(session.projectId);
     // Search the visible task title only. Project names remain
     // metadata and an explicit filter; matching them here would return every
     // task in a project for a project-name query.
@@ -206,7 +206,7 @@ interface NormalizedConversationSearchFilters {
   readonly status: ConversationSearchStatusFilter;
   readonly backendId?: string;
   readonly activityCutoff?: number;
-  readonly targetIds?: ReadonlySet<string>;
+  readonly projectIds?: ReadonlySet<string>;
 }
 
 function normalizeConversationSearchFilters(
@@ -222,9 +222,9 @@ function normalizeConversationSearchFilters(
     ...(lastActivity === "all"
       ? {}
       : { activityCutoff: nowMs - LAST_ACTIVITY_DAY_COUNTS[lastActivity] * DAY_MS }),
-    ...(filters.targetIds === undefined || filters.targetIds === "all"
+    ...(filters.projectIds === undefined || filters.projectIds === "all"
       ? {}
-      : { targetIds: new Set(filters.targetIds) })
+      : { projectIds: new Set(filters.projectIds) })
   };
 }
 
@@ -236,7 +236,7 @@ function sessionMatchesConversationSearchFilters(
   if (filters.status === "archived" && !session.archived) return false;
   if (filters.backendId !== undefined && session.backendId !== filters.backendId) return false;
   if (filters.activityCutoff !== undefined && session.updatedAt < filters.activityCutoff) return false;
-  if (filters.targetIds !== undefined && !filters.targetIds.has(session.targetId)) return false;
+  if (filters.projectIds !== undefined && (session.projectId === undefined || !filters.projectIds.has(session.projectId))) return false;
   return true;
 }
 

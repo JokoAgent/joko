@@ -7,22 +7,27 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
 import type { JSONContent } from "@tiptap/core";
 import { composerDocumentPlainText, emptyComposerDocument, plainTextToComposerDocument } from "../composer-quote-document.js";
+import { remapComposerInlineMentionReplacement } from "../composer-mention-ranges.js";
 import type { VoiceMediaSessionUpdate } from "../voice-input-media.js";
 import { readVoiceInputPreferences } from "../voice-input-preferences.js";
 import {
   emptySnapshot,
   type AppSnapshot,
   type ComposerDraft,
+  type ComposerInlineMentionRange,
+  type ComposerMentionDraft,
   type NativeSessionCandidateView,
   type NewSessionLocalDraft,
   type ModelView,
   type ProviderRuntimeView,
+  type SessionView,
   type VoiceInputDictionaryAdviceView
 } from "../model.js";
 import type { DelayedNewSessionDraft } from "../new-session-flow.js";
 import { NewSessionPage } from "./NewSessionPage.js";
 
-let latestEditorProps: { readonly knownWorkspacePaths?: readonly string[]; readonly document?: JSONContent; readonly onDocumentChange?: (document: JSONContent, isComposing: boolean) => void } | undefined;
+let latestEditorProps: { readonly knownWorkspacePaths?: readonly string[]; readonly document?: JSONContent; readonly onDocumentChange?: (document: JSONContent, isComposing: boolean, mapRanges?: (ranges: readonly ComposerInlineMentionRange[]) => readonly ComposerInlineMentionRange[]) => void } | undefined;
+let renderVoiceSelection = false;
 const voiceCaptures: Array<{
   emit(update: VoiceMediaSessionUpdate): void;
   readonly stop: ReturnType<typeof vi.fn>;
@@ -45,7 +50,7 @@ vi.mock("../voice-input-media.js", async (importOriginal) => ({
 }));
 
 vi.mock("./ComposerRichTextEditor.js", () => ({
-  ComposerRichTextEditor: forwardRef(function Editor(props: { readonly knownWorkspacePaths?: readonly string[] }, ref) {
+  ComposerRichTextEditor: forwardRef(function Editor(props: { readonly knownWorkspacePaths?: readonly string[]; readonly document: JSONContent }, ref) {
     latestEditorProps = props;
     useImperativeHandle(ref, () => ({
       focus: vi.fn(),
@@ -54,7 +59,7 @@ vi.mock("./ComposerRichTextEditor.js", () => ({
       insertText: vi.fn(),
       editPastedText: vi.fn()
     }));
-    return <div data-testid="editor" />;
+    return <div data-testid="editor" className={renderVoiceSelection ? "composer-rich-editor__content" : undefined}>{renderVoiceSelection ? composerDocumentPlainText(props.document) : null}</div>;
   })
 }));
 vi.mock("./ModelPicker.js", () => ({ ModelPicker: () => <div data-testid="model-picker" /> }));
@@ -68,6 +73,7 @@ beforeEach(() => {
   vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => window.setTimeout(() => callback(0), 0));
   vi.stubGlobal("cancelAnimationFrame", (id: number) => window.clearTimeout(id));
   latestEditorProps = undefined;
+  renderVoiceSelection = false;
   voiceCaptures.length = 0;
   window.localStorage.clear();
 });
@@ -84,6 +90,175 @@ afterEach(async () => {
 });
 
 describe("new-task native draft recovery", () => {
+  it("blocks a retained workspace mention when its type disappears during pending draft persistence", async () => {
+    vi.useFakeTimers();
+    let release!: () => void;
+    const save = vi.fn(() => new Promise<void>((resolve) => { release = resolve; }));
+    const mention: ComposerMentionDraft = { id: "file", kind: "workspace", reference: "notes.txt", label: "Notes", token: "@notes.txt", workspaceId: "workspace-1" };
+    const draft: NewSessionLocalDraft = { ...restoredDraft(), nativeStart: { kind: "fresh" }, text: "@notes.txt", editorDocument: plainTextToComposerDocument("@notes.txt"), mentions: [mention], inlineMentionRanges: [{ mentionId: "file", from: 0, to: 10 }] };
+    const api = Object.assign(controller({ discover: async () => [], saveDraft: save }), { readNewSessionDraft: vi.fn(async () => draft) });
+    const withOptions = (options: readonly string[]): AppController => ({ ...api, state: { ...api.state, snapshot: { ...api.state.snapshot,
+      backends: api.state.snapshot.backends.map((backend) => ({ ...backend, capabilities: new Map([...backend.capabilities, ["input.mention", { name: "input.mention", supported: true, options }]]) }))
+    } } });
+    const onSubmit = vi.fn(async () => undefined);
+    const { container, rerender } = await renderPage(withOptions(["workspace_file"]), onSubmit);
+    await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+    expect(save).toHaveBeenCalledOnce();
+    await act(async () => sendButton(container).click());
+    await rerender(withOptions(["artifact"]));
+    await act(async () => { release(); await Promise.resolve(); });
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(sendButton(container).disabled).toBe(true);
+    expect(composerDocumentPlainText(latestEditorProps?.document)).toBe("@notes.txt");
+    await rerender(withOptions(["workspace_file"]));
+    expect(sendButton(container).disabled).toBe(false);
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("offers no workspace or resource candidates in a new-task Artifact-only profile", async () => {
+    const base = controller({ discover: async () => [] });
+    const api = { ...base, state: { ...base.state, snapshot: { ...base.state.snapshot, backends: base.state.snapshot.backends.map((backend) => ({ ...backend,
+      capabilities: new Map([...backend.capabilities, ["input.mention", { name: "input.mention", supported: true, options: ["artifact"] }]])
+    })) } } };
+    const { container } = await renderPage(api, vi.fn(async () => undefined));
+    expect(api.listWorkspaceFiles).not.toHaveBeenCalled();
+    const add = container.querySelector<HTMLButtonElement>('button[aria-label="common.add"]');
+    expect(add).toBeNull();
+    await act(async () => required(latestEditorProps?.onDocumentChange)(plainTextToComposerDocument("@"), false, (ranges) => ranges));
+    expect(document.body.querySelector('[role="option"]')).toBeNull();
+  });
+
+  it("submits the exact historical task selected from equal-title candidates", async () => {
+    const base = controller({ discover: async () => [] });
+    const api = Object.assign({
+      ...base,
+      state: { ...base.state, snapshot: {
+        ...base.state.snapshot,
+        sessions: [
+          historicalSession({ id: "history-one", name: "Prior task", summary: "First conversation" }),
+          historicalSession({ id: "history-two", name: "Prior task", summary: "Second conversation" }),
+          historicalSession({ id: "history-closed", name: "Prior task", summary: "Closed conversation", state: "closed" })
+        ],
+        backends: base.state.snapshot.backends.map((backend) => ({
+          ...backend,
+          capabilities: new Map([...backend.capabilities, ["input.mention", {
+            name: "input.mention", supported: true, options: ["session"]
+          }]])
+        }))
+      } }
+    }, {
+      readNewSessionDraft: vi.fn(async () => ({
+        ...restoredDraft(),
+        nativeStart: { kind: "fresh" },
+        text: "",
+        editorDocument: emptyComposerDocument
+      }))
+    }) as unknown as AppController;
+    const onSubmit = vi.fn(async () => undefined);
+    const { container } = await renderPage(api, onSubmit);
+
+    await openMentionMenu(container);
+    await act(async () => setInput(required(document.body.querySelector<HTMLInputElement>('input[role="combobox"]')), "Prior task"));
+    const options = [...document.body.querySelectorAll<HTMLButtonElement>('[role="option"]')];
+    expect(options.map((option) => option.textContent)).toEqual([
+      "Prior taskFirst conversation",
+      "Prior taskSecond conversation"
+    ]);
+    await act(async () => required(options.find((option) => option.textContent?.includes("Second conversation") === true)).click());
+    await act(async () => sendButton(container).click());
+
+    const token = '@"Prior task"';
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith(expect.anything(), expect.objectContaining({
+      text: token,
+      mentions: [{
+        id: "session:history-two",
+        kind: "session",
+        reference: "history-two",
+        label: "Prior task",
+        token
+      }],
+      inlineMentionRanges: [{ mentionId: "session:history-two", from: 0, to: token.length }]
+    }), expect.anything());
+    expect(api.listWorkspaceFiles).not.toHaveBeenCalled();
+  });
+
+  it("keeps repeated equal-name references at their persisted positions and sends only the occurrence left by the editor transaction", async () => {
+    vi.useFakeTimers();
+    const draft = repeatedMentionDraft();
+    const api = Object.assign(controller({ discover: async () => [] }), { readNewSessionDraft: vi.fn(async () => draft) });
+    const onSubmit = vi.fn(async () => undefined);
+    const { container } = await renderPage(api, onSubmit);
+    await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+    expect(api.saveNewSessionDraft).toHaveBeenLastCalledWith(expect.objectContaining({
+      mentions: draft.mentions, inlineMentionRanges: draft.inlineMentionRanges
+    }));
+    await act(async () => required(latestEditorProps?.onDocumentChange)(plainTextToComposerDocument("@same"), false,
+      (ranges) => remapComposerInlineMentionReplacement(ranges, 0, 12, 0)));
+    await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+    const retained = [draft.mentions[1]!];
+    const ranges = [{ mentionId: "workspace:first", from: 0, to: 5 }];
+    expect(api.saveNewSessionDraft).toHaveBeenLastCalledWith(expect.objectContaining({ text: "@same", mentions: retained, inlineMentionRanges: ranges }));
+    await act(async () => sendButton(container).click());
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith(expect.anything(), expect.objectContaining({
+      text: "@same", mentions: retained, inlineMentionRanges: ranges
+    }), expect.anything());
+    onSubmit.mockClear();
+    await act(async () => required(latestEditorProps?.onDocumentChange)(plainTextToComposerDocument("@same"), false));
+    await act(async () => sendButton(container).click());
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith(expect.anything(), expect.objectContaining({
+      text: "@same", mentions: [], inlineMentionRanges: []
+    }), expect.anything());
+  });
+
+  it("persists exact palette append locations and clears them when a quick start or unowned text replaces the draft", async () => {
+    vi.useFakeTimers();
+    const draft = repeatedMentionDraft();
+    const api = Object.assign(controller({ discover: async () => [], listWorkspaceFiles: async () => ({ paths: ["src/guide.md"], truncated: false, revision: "files" }) }), {
+      readNewSessionDraft: vi.fn(async () => draft)
+    });
+    const onSubmit = vi.fn(async () => undefined);
+    const { container } = await renderPage(api, onSubmit);
+    await openMentionMenu(container);
+    await act(async () => setInput(required(document.body.querySelector<HTMLInputElement>('input[role="combobox"]')), "guide"));
+    await act(async () => required(document.body.querySelector<HTMLButtonElement>('[role="option"]')).click());
+    await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+    expect(api.saveNewSessionDraft).toHaveBeenLastCalledWith(expect.objectContaining({
+      text: "@same @same @same @src/guide.md",
+      inlineMentionRanges: [...draft.inlineMentionRanges!, { mentionId: "workspace:workspace-1:src/guide.md", from: 18, to: 31 }]
+    }));
+    await act(async () => buttonWithText(container, "newTask.quickExplore").click());
+    await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+    expect(api.saveNewSessionDraft).toHaveBeenLastCalledWith(expect.objectContaining({ mentions: [], inlineMentionRanges: [] }));
+    await act(async () => required(latestEditorProps?.onDocumentChange)(plainTextToComposerDocument("@same"), false));
+    await act(async () => sendButton(container).click());
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith(expect.anything(), expect.objectContaining({ text: "@same", mentions: [], inlineMentionRanges: [] }), expect.anything());
+  });
+
+  it("retires the selected mention when voice replaces it with the same spelling and preserves other occurrences for first send", async () => {
+    vi.useFakeTimers();
+    renderVoiceSelection = true;
+    Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: { getUserMedia: vi.fn() } });
+    const draft = repeatedMentionDraft();
+    const api = Object.assign(controller({ discover: async () => [] }), {
+      getVoiceInputCapabilities: vi.fn(async () => ({ support: "supported" })),
+      readNewSessionDraft: vi.fn(async () => draft)
+    });
+    const onSubmit = vi.fn(async () => undefined);
+    const { container } = await renderPage(api, onSubmit);
+    const textNode = required(container.querySelector('[data-testid="editor"]')?.firstChild);
+    const selection = document.createRange(); selection.setStart(textNode, 0); selection.setEnd(textNode, 5);
+    window.getSelection()?.removeAllRanges(); window.getSelection()?.addRange(selection);
+    await act(async () => required(container.querySelector<HTMLButtonElement>('.voice-input-button button')).click());
+    const capture = required(voiceCaptures.at(-1));
+    await act(async () => sendButton(container).click());
+    expect(capture.stop).toHaveBeenCalledOnce();
+    await act(async () => capture.emit(voiceResult("@same")));
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith(expect.anything(), expect.objectContaining({
+      text: "@same @same @same", mentions: draft.mentions,
+      inlineMentionRanges: draft.inlineMentionRanges!.slice(1)
+    }), expect.anything());
+  });
+
   it.each(["before recovery", "after recovery"])("keeps a model removed from the catalog %s without choosing an available substitute", async (when) => {
     vi.useFakeTimers();
     const selectedModel: ModelView = {
@@ -529,7 +704,7 @@ function snapshot(): AppSnapshot {
       health: "healthy",
       capabilities: new Map([
         ["input.text", { name: "input.text", supported: true, options: [] }],
-        ["input.mention", { name: "input.mention", supported: true, options: [] }],
+        ["input.mention", { name: "input.mention", supported: true, options: ["workspace_file", "resource"] }],
         ["session.discovery", { name: "session.discovery", supported: true, options: [] }],
         ["session.resume", { name: "session.resume", supported: true, options: [] }]
       ])
@@ -594,7 +769,41 @@ function restoredDraft(): NewSessionLocalDraft {
       content: [{ type: "paragraph", content: [{ type: "text", text: "Continue this task" }] }]
     },
     mentions: [],
+    inlineMentionRanges: [],
     attachments: []
+  };
+}
+
+function repeatedMentionDraft(): NewSessionLocalDraft {
+  const mentions: readonly ComposerMentionDraft[] = [
+    { id: "workspace:second", kind: "workspace", reference: "second.ts", label: "same", token: "@same", workspaceId: "workspace-1" },
+    { id: "workspace:first", kind: "workspace", reference: "first.ts", label: "same", token: "@same", workspaceId: "workspace-1" }
+  ];
+  return { ...restoredDraft(), nativeStart: { kind: "fresh" }, text: "@same @same @same",
+    editorDocument: plainTextToComposerDocument("@same @same @same"), mentions,
+    inlineMentionRanges: [
+      { mentionId: "workspace:first", from: 0, to: 5 },
+      { mentionId: "workspace:second", from: 6, to: 11 },
+      { mentionId: "workspace:first", from: 12, to: 17 }
+    ]
+  };
+}
+
+function historicalSession(overrides: Partial<SessionView> = {}): SessionView {
+  return {
+    id: "history-one",
+    backendId: "backend-1",
+    targetId: "target-1",
+    name: "Prior task",
+    state: "idle",
+    pinned: false,
+    archived: false,
+    generation: 1n,
+    fastMode: false,
+    permissionMode: "ask",
+    planMode: false,
+    updatedAt: 1,
+    ...overrides
   };
 }
 

@@ -148,13 +148,13 @@ describe("composer Stop semantics", () => {
   });
 
   it("pauses only for future or dispatch-uncertain items, not the active backend-accepted run", () => {
-    for (const state of ["accepted", "queued", "dispatching", "dispatchUnknown"] as const) {
+    for (const state of ["accepted", "dispatching", "dispatchUnknown"] as const) {
       expect(hasPendingComposerQueueItems([queueItem(state)], "session-a")).toBe(true);
     }
     for (const state of ["acceptedByBackend", "completed", "cancelled", "failed"] as const) {
       expect(hasPendingComposerQueueItems([queueItem(state)], "session-a")).toBe(false);
     }
-    expect(hasPendingComposerQueueItems([queueItem("queued", "session-b")], "session-a")).toBe(false);
+    expect(hasPendingComposerQueueItems([queueItem("accepted", "session-b")], "session-a")).toBe(false);
   });
 
   it("durably pauses a pending queue before aborting the active run", async () => {

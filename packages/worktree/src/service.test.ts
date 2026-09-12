@@ -62,8 +62,69 @@ describe("EphemeralWorktreeService", () => {
     const again = unwrap(await service.acquire({ sessionId: "session-a", cwd: fixture.repositoryRoot }));
     expect(again.existing).toBe(true);
     expect(again.lease.path).toBe(first.lease.path);
+    expect(unwrap(await service.previewRemoval({ sessionId: "session-a", leaseId: first.lease.id })))
+      .toEqual({ state: "active", dirty: false });
+    expectFailure(await service.previewRemoval({
+      sessionId: "session-a",
+      leaseId: "0".repeat(24)
+    }), "SESSION_CONFLICT");
+    await writeFile(join(first.lease.path, "preview-only.txt"), "uncommitted\n", "utf8");
+    expect(unwrap(await service.previewRemoval({ sessionId: "session-a", leaseId: first.lease.id })))
+      .toEqual({ state: "active", dirty: true });
     expect(service.snapshot()).toMatchObject({ initialized: true, residualCount: 0 });
     expect(service.snapshot().active).toHaveLength(1);
+  });
+
+  test("derives a distinct lease from one stable HEAD, index, tracked tree, and untracked tree", { timeout: 20_000 }, async () => {
+    const fixture = await createRepositoryFixture();
+    const service = new EphemeralWorktreeService({ storageRoot: fixture.storageRoot });
+    unwrap(await service.initialize());
+    const source = unwrap(await service.acquire({ sessionId: "source-session", cwd: fixture.repositoryRoot }));
+
+    await writeFile(join(source.lease.path, "committed.txt"), "branch commit\n", "utf8");
+    await writeFile(join(source.lease.path, "deleted.txt"), "delete after commit\n", "utf8");
+    await git(source.lease.path, ["add", "committed.txt", "deleted.txt"]);
+    await git(source.lease.path, ["commit", "-m", "advance source task"]);
+    const sourceHead = (await git(source.lease.path, ["rev-parse", "HEAD"])).trim();
+    await writeFile(join(source.lease.path, "src", "index.ts"), "export const value = 2;\n", "utf8");
+    await git(source.lease.path, ["add", "src/index.ts"]);
+    await writeFile(join(source.lease.path, "tracked.txt"), "unstaged source change\n", "utf8");
+    await unlink(join(source.lease.path, "deleted.txt"));
+    await writeFile(join(source.lease.path, "untracked.txt"), "untracked source file\n", "utf8");
+
+    expectFailure(await service.derive({
+      sessionId: "wrong-lease-child",
+      sourceSessionId: "source-session",
+      sourceLeaseId: "0".repeat(24)
+    }), "SESSION_CONFLICT");
+    const derived = unwrap(await service.derive({
+      sessionId: "derived-session",
+      sourceSessionId: "source-session",
+      sourceLeaseId: source.lease.id
+    }));
+
+    expect(derived).toMatchObject({ existing: false });
+    expect(derived.lease.id).not.toBe(source.lease.id);
+    expect(derived.lease.path).not.toBe(source.lease.path);
+    expect(derived.lease.branch).not.toBe(source.lease.branch);
+    expect(derived.lease.source).toMatchObject({
+      ref: sourceHead,
+      commit: sourceHead,
+      strategy: "explicit",
+      refreshed: false,
+      reason: "derived_session_snapshot"
+    });
+    expect((await git(derived.lease.path, ["rev-parse", "HEAD"])).trim()).toBe(sourceHead);
+    expect(await git(derived.lease.path, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]))
+      .toBe(await git(source.lease.path, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]));
+    expect(await git(derived.lease.path, ["diff", "--cached", "--binary"]))
+      .toBe(await git(source.lease.path, ["diff", "--cached", "--binary"]));
+    expect(await git(derived.lease.path, ["diff", "--binary"]))
+      .toBe(await git(source.lease.path, ["diff", "--binary"]));
+    expect((await readFile(join(derived.lease.path, "untracked.txt"), "utf8")).replaceAll("\r\n", "\n"))
+      .toBe("untracked source file\n");
+    expect(service.snapshot().active.map((lease) => lease.sessionId).sort())
+      .toEqual(["derived-session", "source-session"]);
   });
 
   test("retains every valid worktree source after the thousandth local branch", { timeout: 15_000 }, async () => {
@@ -208,12 +269,21 @@ describe("EphemeralWorktreeService", () => {
     await writeFile(join(acquired.lease.path, "new-file.txt"), "untracked content\n", "utf8");
     await git(acquired.lease.path, ["add", "tracked.txt"]);
 
+    expect(unwrap(await service.previewRemoval({
+      sessionId: "restorable-owner",
+      leaseId: acquired.lease.id
+    }))).toEqual({ state: "active", dirty: true });
+
     expect(unwrap(await service.release("restorable-owner", { retainForRestore: true }))).toMatchObject({
       status: "preserved",
       reason: "restorable",
       pathRemoved: true,
       branchPreserved: true
     });
+    expect(unwrap(await service.previewRemoval({
+      sessionId: "restorable-owner",
+      leaseId: acquired.lease.id
+    }))).toEqual({ state: "preserved", dirty: true });
     await expect(lstat(acquired.lease.path)).rejects.toMatchObject({ code: "ENOENT" });
     expect(await gitBranchExists(fixture.repositoryRoot, acquired.lease.branch)).toBe(true);
     const cleanupStash = await git(fixture.repositoryRoot, ["stash", "list", "--format=%H%x09%gs"]);
@@ -251,6 +321,10 @@ describe("EphemeralWorktreeService", () => {
       "update-ref", "-d", `refs/joko/worktree-snapshots/${ownerKey("missing-required-ref")}`, snapshotSha
     ]);
 
+    expectFailure(await service.previewRemoval({
+      sessionId: "missing-required-ref",
+      leaseId: acquired.lease.id
+    }), "STATE_CORRUPT");
     expectFailure(
       await service.acquire({ sessionId: "missing-required-ref", cwd: fixture.repositoryRoot }),
       "STATE_CORRUPT"
@@ -271,8 +345,24 @@ describe("EphemeralWorktreeService", () => {
       reason: "restorable",
       pathRemoved: true
     });
+    expect(unwrap(await service.previewRemoval({
+      sessionId: "clean-owner",
+      leaseId: acquired.lease.id
+    }))).toEqual({ state: "preserved", dirty: false });
     expect((await persistedEntries(fixture.storageRoot))[0]?.["archiveSnapshot"]).toMatchObject({ kind: "clean" });
     expect(await snapshotRefSha(fixture.repositoryRoot, "clean-owner")).toBe("");
+
+    const branchHead = (await git(fixture.repositoryRoot, ["rev-parse", acquired.lease.branch])).trim();
+    await git(fixture.repositoryRoot, [
+      "update-ref", `refs/joko/worktree-snapshots/${ownerKey("clean-owner")}`, branchHead
+    ]);
+    expectFailure(await service.previewRemoval({
+      sessionId: "clean-owner",
+      leaseId: acquired.lease.id
+    }), "SESSION_CONFLICT");
+    await git(fixture.repositoryRoot, [
+      "update-ref", "-d", `refs/joko/worktree-snapshots/${ownerKey("clean-owner")}`, branchHead
+    ]);
 
     const restored = unwrap(await service.acquire({ sessionId: "clean-owner", cwd: fixture.repositoryRoot }));
     expect((await readFile(join(restored.lease.path, "tracked.txt"), "utf8")).replaceAll("\r\n", "\n"))

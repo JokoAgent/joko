@@ -48,9 +48,9 @@ import "katex/dist/katex.min.css";
 import { ArtifactDownloadButton } from "./ArtifactDownloadButton.js";
 import type { OperationApi } from "../model.js";
 import type { MessageKey } from "../i18n.js";
-import type { ComposerSelectionQuoteDraft, ErrorRecoveryActionView, ErrorView, SessionView, SubagentRunDetailView, SubagentRunView, TimelineItemView } from "../model.js";
+import type { ArtifactView, ComposerSelectionQuoteDraft, ErrorRecoveryActionView, ErrorView, SessionView, SubagentRunDetailView, SubagentRunView, TimelineItemView } from "../model.js";
 import { sessionMessageDeepLink } from "../message-reference.js";
-import { parseSelectionQuoteMessage, visibleSelectionQuoteMessageText } from "../selection-quote.js";
+import { parseSelectionQuoteMessage, selectionQuoteTextSourceSegments, visibleSelectionQuoteMessageText } from "../selection-quote.js";
 import { executableRecoveryActions, type RecoveryActionContext } from "./coding-ui-behavior.js";
 import { InlinePlanCard } from "./InlinePlanCard.js";
 import { GeneratedFilesCard } from "./GeneratedFilesCard.js";
@@ -66,7 +66,7 @@ import { collectTimelineGalleryImages, moveTimelineGalleryIndex, timelineArtifac
 import { findTimelineRenderItemIndex, insertTimelineDerivationOrigin, projectTimelineRenderItems, timelineRenderChildIndex, type TimelineRenderItem, type TimelineWorkRenderItem } from "./timeline-render-items.js";
 import { TimelineViewportStore, countUnreadTimelineItems, maximumTimelineSequence, repairStreamingMarkdown, resolveTimelineFollowingOnScroll, resolveTimelineResizeScrollTop, shouldLoadEarlierTimeline, streamingMarkdownRenderValue, streamingMarkdownThrottleDelay, timelineJumpBehavior, type TimelineViewportState } from "./timeline-behavior.js";
 import type { Translator } from "./types.js";
-import { Button, IconButton, Pill, Spinner, Tip, TipSummary, cx, formatBytes, formatDateTime } from "./ui.js";
+import { Button, IconButton, Modal, Pill, Spinner, Tip, TipSummary, cx, formatBytes, formatDateTime } from "./ui.js";
 import { UserMessageEditBox } from "./UserMessageEditBox.js";
 import { AUTOMATION_USER_MESSAGE_VISUAL_LINE_THRESHOLD, mayExceedUserMessageLineThreshold, useUserMessageAutoCollapse } from "./user-message-collapse.js";
 import { MessageNavRail } from "./MessageNavRail.js";
@@ -87,6 +87,7 @@ import { TimelineArtifactModel, timelineArtifactModelKind } from "./TimelineArti
 import { useTimelineArtifactUrlCache } from "./timeline-artifact-url-cache.js";
 import { AudioArtworkContext } from "./AudioArtwork.js";
 import { timelineErrorCopy } from "../timeline-error-copy.js";
+import { GAMEPAD_SCROLL_EVENT } from "../gamepad-client.js";
 import {
   TIMELINE_HISTORY_NAVIGATION_KEYS,
   TIMELINE_TOUCH_UP_INTENT_THRESHOLD_PX,
@@ -98,7 +99,8 @@ import {
 import { ToolPayloadLightbox, ToolPayloadOpenButton } from "./ToolPayloadLightbox.js";
 import { WorkspaceImageLightbox } from "./WorkspaceImageLightbox.js";
 import type { ToolPayloadSection } from "./tool-payload.js";
-import { SentMessageReferenceText, TimelineLinkSourceContext, TimelineMarkdownImage, TimelineMarkdownLink, type TimelineReferenceActions, type TimelineWorkspaceAsset } from "./TimelineReferenceContent.js";
+import { SentMessageReferenceChips, SentMessageReferenceText, TimelineLinkSourceContext, TimelineMarkdownImage, TimelineMarkdownLink, type TimelineReferenceActions, type TimelineWorkspaceAsset } from "./TimelineReferenceContent.js";
+import { validSentInputMentionRanges } from "./timeline-references.js";
 import { normalizeTimelineMathDelimiters, remarkStrictTimelineInlineMath } from "./timeline-markdown-math.js";
 import { TimelineMarkdownDocument } from "./TimelineMarkdownDocument.js";
 import { TimelineFadeElement } from "./TimelineFadeElement.js";
@@ -146,6 +148,8 @@ interface TimelinePersonalizationContextValue {
   readonly streamFadeEnabled: boolean;
   readonly reducedMotion: boolean;
   readonly sessionId: string;
+  readonly workspaceId?: string;
+  readonly onReadArtifact?: OperationApi["readSessionArtifact"];
   readonly onOpenHttpLink?: (url: string, options?: HttpLinkOpenOptions) => void | Promise<void>;
   readonly onOpenWorkspaceHtml?: (path: string, options?: HttpLinkOpenOptions) => void | Promise<void>;
   readonly onLoadWorkspaceAsset?: (path: string) => Promise<TimelineWorkspaceAsset>;
@@ -168,10 +172,12 @@ export interface TimelineShareSelection {
   readonly selectedIds: ReadonlySet<string>;
 }
 
-export function Timeline({ ownerKey, sessionId, sessionName, items, sessionActive, derivationOrigin, sessionCreatedAt, onOpenDerivationOrigin, messageNavRailEnabled, streamFadeEnabled, onOpenHttpLink, onOpenWorkspaceHtml, onLoadWorkspaceAsset, onWorkspaceImageToComposer, subagentRuns, subagentRunDetails, onOpenSubagent, onStopSubagent, hasEarlier, historyLoading, historyError, onLoadEarlier, followLatestSignal = 0, focusRequest, bottomInset = 0, retryRunId, locale, t, onRetry, onRecovery, recoveryContext, onArtifactUrl, onArtifactUrlRelease, onArtifactDownload, onWorkspaceRewind, onOpenGeneratedFile, onOpenTurnReview, onReobserveReview, onAddMessageToComposer, onAddSelectionToComposer, onForkMessage, forkingMessageId, shareSelection, onStartShareSelection, onToggleShareMessage, editableMessageId, onMoveEditedMessageToComposer, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason, messageActionResetSignal, onInlinePlanVisibilityChange }: {
+export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onReadArtifact, items, sessionActive, derivationOrigin, sessionCreatedAt, onOpenDerivationOrigin, messageNavRailEnabled, streamFadeEnabled, onOpenHttpLink, onOpenWorkspaceHtml, onLoadWorkspaceAsset, onWorkspaceImageToComposer, subagentRuns, subagentRunDetails, onOpenSubagent, onStopSubagent, hasEarlier, historyLoading, historyError, onLoadEarlier, followLatestSignal = 0, focusRequest, bottomInset = 0, retryRunId, locale, t, onRetry, onRecovery, recoveryContext, onArtifactUrl, onArtifactUrlRelease, onArtifactDownload, onWorkspaceRewind, onOpenGeneratedFile, onOpenTurnReview, onReobserveReview, onAddMessageToComposer, onAddSelectionToComposer, onForkMessage, forkingMessageId, shareSelection, onStartShareSelection, onToggleShareMessage, editableMessageId, onMoveEditedMessageToComposer, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason, messageActionResetSignal, onInlinePlanVisibilityChange }: {
   readonly ownerKey: string;
   readonly sessionId: string;
   readonly sessionName: string;
+  readonly workspaceId?: string;
+  readonly onReadArtifact?: OperationApi["readSessionArtifact"];
   readonly items: readonly TimelineItemView[];
   readonly sessionActive: boolean;
   readonly derivationOrigin?: NonNullable<SessionView["derivationOrigin"]>;
@@ -285,11 +291,13 @@ export function Timeline({ ownerKey, sessionId, sessionName, items, sessionActiv
     streamFadeEnabled,
     reducedMotion,
     sessionId,
+    workspaceId,
+    onReadArtifact,
     ...(onOpenHttpLink === undefined ? {} : { onOpenHttpLink }),
     ...(onOpenWorkspaceHtml === undefined ? {} : { onOpenWorkspaceHtml }),
     ...(onLoadWorkspaceAsset === undefined ? {} : { onLoadWorkspaceAsset }),
     ...(onWorkspaceImageToComposer === undefined ? {} : { onWorkspaceImageToComposer })
-  }), [onLoadWorkspaceAsset, onOpenHttpLink, onOpenWorkspaceHtml, onWorkspaceImageToComposer, ownerKey, reducedMotion, sessionId, streamFadeEnabled]);
+  }), [onLoadWorkspaceAsset, onOpenHttpLink, onOpenWorkspaceHtml, onWorkspaceImageToComposer, onReadArtifact, workspaceId, ownerKey, reducedMotion, sessionId, streamFadeEnabled]);
   const subagentContext = useMemo<TimelineSubagentContextValue>(() => ({
     runs: subagentRuns ?? new Map(),
     details: subagentRunDetails ?? new Map(),
@@ -681,6 +689,22 @@ export function Timeline({ ownerKey, sessionId, sessionName, items, sessionActiv
     if (historyError === undefined && shouldLoadEarlierTimeline({ scrollTop: node.scrollTop, hasEarlier, loading: historyLoading })) requestEarlier();
   };
 
+  useEffect(() => {
+    const node = scrollRef.current;
+    if (node === null) return;
+    const scroll = (event: Event): void => {
+      if (!(event instanceof CustomEvent)) return;
+      const value = event.detail as { x?: unknown; y?: unknown } | undefined;
+      if (typeof value?.x !== "number" || typeof value.y !== "number" || !Number.isFinite(value.x) || !Number.isFinite(value.y)) return;
+      const x = Math.max(-240, Math.min(240, value.x));
+      const y = Math.max(-240, Math.min(240, value.y));
+      handleTimelineWheelIntent(y, x, node);
+      node.scrollBy({ left: x, top: y, behavior: "instant" });
+    };
+    node.addEventListener(GAMEPAD_SCROLL_EVENT, scroll);
+    return () => node.removeEventListener(GAMEPAD_SCROLL_EVENT, scroll);
+  });
+
   if (items.length === 0) {
     return (
       <div className="timeline-shell" style={{ "--timeline-bottom-inset": `${Math.max(0, bottomInset)}px` } as CSSProperties}>
@@ -996,12 +1020,22 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
     ownerKey: personalization.ownerKey,
     sessionId,
     t,
+    sourceKey: JSON.stringify([item.id, item.sourceEventId, item.text, item.inputMentions, item.mentionRanges]),
+    workspaceId: personalization.workspaceId,
+    onReadArtifact: personalization.onReadArtifact,
+    renderArtifactPreview: (artifact, trigger, onClose) => <TimelineArtifactReferencePreview
+      artifact={artifact} trigger={trigger} ownerKey={personalization.ownerKey} t={t}
+      onArtifactUrl={onArtifactUrl} onArtifactDownload={onArtifactDownload} onClose={onClose} />,
     ...(personalization.onOpenHttpLink === undefined ? {} : { onOpenHttpLink: personalization.onOpenHttpLink }),
     ...(personalization.onOpenWorkspaceHtml === undefined ? {} : { onOpenWorkspaceHtml: personalization.onOpenWorkspaceHtml }),
     ...(personalization.onLoadWorkspaceAsset === undefined ? {} : { onLoadWorkspaceAsset: personalization.onLoadWorkspaceAsset }),
     ...(personalization.onWorkspaceImageToComposer === undefined ? {} : { onWorkspaceImageToComposer: personalization.onWorkspaceImageToComposer })
-  }), [personalization.ownerKey, personalization.onLoadWorkspaceAsset, personalization.onOpenHttpLink, personalization.onOpenWorkspaceHtml, personalization.onWorkspaceImageToComposer, sessionId, t]);
+  }), [item.id, item.sourceEventId, item.text, item.inputMentions, item.mentionRanges, onArtifactUrl, onArtifactDownload, personalization.ownerKey, personalization.workspaceId, personalization.onReadArtifact, personalization.onLoadWorkspaceAsset, personalization.onOpenHttpLink, personalization.onOpenWorkspaceHtml, personalization.onWorkspaceImageToComposer, sessionId, t]);
   const text = item.text ?? "";
+  const inputMentions = item.userInputAccepted === true ? item.inputMentions ?? [] : [];
+  const inputRanges = validSentInputMentionRanges(text, inputMentions, item.userInputAccepted === true ? item.mentionRanges ?? [] : []);
+  const sourceSegments = selectionQuoteTextSourceSegments(text, item.quotesEncoded === true);
+  const renderedMentions = new Set<number>();
   const quotedUserMessage = role === "user"
     ? parseSelectionQuoteMessage(text, item.quotesEncoded === true)
     : { segments: [{ kind: "text" as const, text }], quotes: [], body: text };
@@ -1025,11 +1059,24 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
   let pastedTextSegmentIndex = 0;
   const userMessageSegments = quotedUserMessage.segments.map((segment, index) => {
     if (segment.kind === "quote") return <SelectionQuoteChip quote={segment.quote} key={`${item.id}:quote:${index}`} />;
+    const source = sourceSegments[pastedTextSegmentIndex];
     const projected = pastedTextSegments[pastedTextSegmentIndex];
     pastedTextSegmentIndex += 1;
+    const rangesForText = (value: string, offset: number) => {
+      const start = source === undefined || text.slice(source.sourceStart, source.sourceEnd) !== segment.text ? undefined : source.sourceStart + offset;
+      return start === undefined || inputRanges === undefined ? [] : inputRanges.filter((range) => range.start >= start && range.end <= start + value.length)
+        .map((range) => ({ ...range, start: range.start - start, end: range.end - start }));
+    };
+    let tokenStart = 0;
+    for (const token of projected?.tokens ?? [{ kind: "text", text: segment.text }]) {
+      if (token.kind === "text") for (const range of rangesForText(token.text, tokenStart)) renderedMentions.add(range.mentionIndex);
+      tokenStart += token.text.length;
+    }
+    const renderText = (value: string, offset: number): ReactNode => <SentMessageReferenceText text={value}
+      inputMentions={inputMentions} mentionRanges={rangesForText(value, offset)} actions={referenceActions} />;
     return projected === undefined
-      ? <SentMessageReferenceText text={segment.text} actions={referenceActions} key={`${item.id}:text:${index}`} />
-      : <SentPastedTextInline ownerKey={JSON.stringify([personalization.ownerKey, sessionId, item.id, item.sourceEventId, index])} segment={projected} t={t} key={`${item.id}:text:${index}`} />;
+      ? <span key={`${item.id}:text:${index}`}>{renderText(segment.text, 0)}</span>
+      : <SentPastedTextInline ownerKey={JSON.stringify([personalization.ownerKey, sessionId, item.id, item.sourceEventId, index])} segment={projected} t={t} renderText={renderText} key={`${item.id}:text:${index}`} />;
   });
   if (role === "user") {
     if (editing && onCancelEdit !== undefined && onMoveEditedMessageToComposer !== undefined) {
@@ -1048,6 +1095,7 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
               </CollapsibleUserMessageContent>
             </div>
           )}
+          <SentMessageReferenceChips mentions={inputRanges === undefined ? [] : inputMentions.filter((_mention, index) => !renderedMentions.has(index))} actions={referenceActions} />
           {!selectionActive && showActions && <MessageActions ownerKey={personalization.ownerKey} sessionId={sessionId} sessionName={sessionName} item={item} text={actionText} align="right" locale={locale} t={t} onAddMessageToComposer={onAddMessageToComposer} onFork={onForkMessage} forking={forking} onStartShareSelection={onStartShareSelection} editable={editable} onEdit={onEdit} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} />}
         </div>
       </article>
@@ -1284,6 +1332,32 @@ export function MessageAttachment({ artifact, galleryId, t, onArtifactUrl, onArt
       onClose={() => setTextPreviewTrigger(undefined)}
     />}
   </>;
+}
+
+function TimelineArtifactReferencePreview({ artifact, trigger, ownerKey, t, onArtifactUrl, onArtifactDownload, onClose }: {
+  readonly artifact: ArtifactView;
+  readonly trigger: HTMLElement;
+  readonly ownerKey: string;
+  readonly t: Translator;
+  readonly onArtifactUrl: (blobId: string) => Promise<string>;
+  readonly onArtifactDownload: OperationApi["downloadArtifact"];
+  readonly onClose: () => void;
+}): JSX.Element {
+  if (timelineArtifactSupportsTextPreview(artifact)) return <TimelineTextAttachmentLightbox
+    ownerKey={JSON.stringify([ownerKey, artifact.id])} artifact={artifact} returnFocus={trigger}
+    loadUrl={onArtifactUrl} onDownload={onArtifactDownload} onClose={onClose}
+    labels={{ preview: t("workspace.preview"), loading: t("workspace.loadingPreview"), unavailable: t("workspace.filePreviewUnavailable"),
+      tooLarge: t("workspace.previewTruncated"), copy: t("timeline.copy"), copied: t("timeline.blockCopied"),
+      copyFailed: t("timeline.blockCopyFailed"), download: t("workspace.downloadFile"), close: t("common.close") }}
+  />;
+  if (artifact.kind === "image") return <TimelineImageLightbox
+    images={[{ id: artifact.id, blobId: artifact.blobId, title: artifact.title, fileName: artifact.fileName, byteSize: artifact.byteSize }]}
+    startImageId={artifact.id} returnFocus={trigger} t={t} loadUrl={onArtifactUrl} onDownload={onArtifactDownload} onClose={onClose}
+  />;
+  return <Modal open title={artifact.title || artifact.fileName} description={artifact.description} showClose closeLabel={t("common.close")}
+    ownerDocument={trigger.ownerDocument} restoreFocusFallback={() => trigger} onClose={onClose}>
+    <MessageAttachment artifact={artifact} t={t} onArtifactUrl={onArtifactUrl} onArtifactDownload={onArtifactDownload} />
+  </Modal>;
 }
 
 type ArtifactImageLoadState =
@@ -1746,9 +1820,7 @@ function InteractionAnswerBlock({ item, t }: { readonly item: TimelineItemView; 
         return (
           <section key={question.id} className={cx(index > 0 && "interaction-answer__pair--divided")}>
             {question.question !== "" && <div className="interaction-answer__line"><span aria-hidden="true">Q</span><p>{question.question}</p></div>}
-            <div className="interaction-answer__line interaction-answer__line--answer"><span aria-hidden="true"><Check /></span><div>{question.answer?.kind === "sensitive"
-              ? <em>{t("timeline.secureAnswer")}</em>
-              : values.length === 0
+            <div className="interaction-answer__line interaction-answer__line--answer"><span aria-hidden="true"><Check /></span><div>{values.length === 0
                 ? <em>{t("timeline.skippedAnswer")}</em>
                 : values.map((value, valueIndex) => <p key={valueIndex}>{value}</p>)}</div></div>
           </section>

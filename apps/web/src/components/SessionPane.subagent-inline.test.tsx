@@ -131,6 +131,7 @@ function mountPane(controller: AppController, sourceSession: SessionView, timeli
       onOpenNavigation={() => undefined}
       onOpenInspector={() => undefined}
       onRename={() => undefined}
+      onArchive={() => undefined}
       onDelete={() => undefined}
     />
   ));

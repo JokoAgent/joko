@@ -35,7 +35,7 @@ afterEach(async () => {
 });
 
 describe("Browser visual harness", () => {
-  it("mounts the real Browser workbench with the reference chrome and remote takeover state", async () => {
+  it("mounts the real Browser workbench with navigation controls and remote takeover state", async () => {
     const container = await renderHarness();
 
     expect(document.documentElement.dataset.visualHarness).toBe("browser");

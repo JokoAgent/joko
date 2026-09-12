@@ -7,13 +7,9 @@ import {
   CircleCheck,
   CircleStop,
   Clock3,
-  GripVertical,
   Image as ImageIcon,
   MessageSquarePlus,
   Paperclip,
-  Pause,
-  Pencil,
-  Play,
   Send,
   Sparkles,
   Terminal,
@@ -23,8 +19,9 @@ import {
 import type { AppController } from "../controller.js";
 import type { ComposerSendShortcutPreference } from "../local-state.js";
 import { modelSourceAccess } from "../model-source-access.js";
+import { remapComposerInlineMentionReplacement } from "../composer-mention-ranges.js";
 import { ModelSourceNotice } from "./ModelSourceNotice.js";
-import type { AttachmentDraft, BackendView, BrowserCommentDraftItem, ComposerDraft, ComposerMentionDraft, ComposerMessageMentionDraft, ComposerSelectionQuoteDraft, DeliveryMode, ExtraDirectoryView, QueueControlView, QueueItemView, ResourceView, RuntimeCommandView, SessionView, UsageTokensView, WorkspaceView } from "../model.js";
+import type { ArtifactView, AttachmentDraft, BackendView, BrowserCommentDraftItem, ComposerDraft, ComposerMentionDraft, ComposerMessageMentionDraft, ComposerSelectionQuoteDraft, DeliveryMode, ExtraDirectoryView, QueueControlView, QueueItemView, RuntimeCommandView, SessionResourceView, SessionView, UsageTokensView, WorkspaceView } from "../model.js";
 import { browserCommentPreviewTag, removeBrowserCommentAndRepairChains } from "../browser-comment-draft.js";
 import { appendQuoteToComposerDocument, appendTextToComposerDocument, composerDocumentIsEmpty, composerDocumentKeepingQuotes, composerDocumentPlainText, composerDocumentQuotes, emptyComposerDocument, joinComposerDocuments, normalizeComposerDocument, plainTextToComposerDocument } from "../composer-quote-document.js";
 import { advertisedQueueDeliveryModes } from "./backend-control-capabilities.js";
@@ -32,12 +29,14 @@ import { upsertComposerMention } from "../message-reference.js";
 import { normalizeSelectionQuoteDrafts } from "../selection-quote.js";
 import { randomUuid } from "../web-crypto.js";
 import { promptRecommendationStore } from "../prompt-recommendation-store.js";
-import { ComposerOperationGuard, composerQueueWindow, currentComposerPlatform, getComposerSendShortcutLabel, resolveComposerAttachmentPolicy, resolveComposerEnterIntent, resolveComposerEscapeIntent, resolveComposerHistoryKey, resolveComposerPaletteKey, resolveQueueReorderShortcut, resolveTypedComposerPalette, resolveUserShellDraft, type ComposerSubmissionKind } from "./composer-behavior.js";
-import { composerBuiltInCommand, composerCommandItems, insertComposerPaletteValue, type ComposerPaletteItem } from "./composer-palette.js";
+import { ComposerOperationGuard, currentComposerPlatform, getComposerSendShortcutLabel, resolveComposerAttachmentPolicy, resolveComposerEnterIntent, resolveComposerEscapeIntent, resolveComposerHistoryKey, resolveComposerPaletteKey, resolveUserShellDraft, type ComposerSubmissionKind } from "./composer-behavior.js";
+import { QueueStrip, deliveryLabel } from "./QueueStrip.js";
+import { composerBuiltInCommand, composerCommandItems, detectComposerCommandActivation, filterComposerPaletteItems, insertComposerPaletteValue, replaceComposerCommandRun, type ComposerCommandActivation, type ComposerPaletteItem } from "./composer-palette.js";
 import { ComposerInlineMentionPanel } from "./composer-inline-mention-panel.js";
 import { ComposerAddMenu } from "./ComposerAddMenu.js";
 import { ComposerAttachmentTray } from "./ComposerAttachmentTray.js";
 import { composerCaretTextOffset, composerDirectoryQueryToken, composerMentionCatalog, composerMentionsFromRanges, composerSelectionTextRange, detectComposerInlineMention, firstEnabledComposerMentionIndex, remapComposerInlineMentionRanges, replaceComposerDocumentTextRange, resolveComposerInlineMentionKey, resolveComposerMentionResults, restoreComposerInlineMentionRanges, setComposerCaretTextOffset, type ComposerInlineMentionActivation, type ComposerInlineMentionRange, type ComposerMentionCatalogItem, type ComposerMentionProviderState } from "./composer-inline-mention.js";
+import { composerMentionsAllowed, resolveComposerMentionPolicy } from "../composer-mention-policy.js";
 import { ContextCapacityRing } from "./ContextCapacityRing.js";
 import { SessionUsageChip } from "./SessionUsageChip.js";
 import { ComposerRichTextEditor, type ComposerRichTextEditorHandle } from "./ComposerRichTextEditor.js";
@@ -52,6 +51,8 @@ import type { RunAction, Translator } from "./types.js";
 import { Button, IconButton, Modal, Pill, SegmentedControl, cx, CheckboxControl, SelectControl, formatBytes } from "./ui.js";
 import { useDraftVoiceInput } from "./use-draft-voice-input.js";
 import { useHeldVoiceInput } from "./use-held-voice-input.js";
+import { useGamepadVoiceInput } from "../gamepad-client.js";
+import { useGamepadActions } from "../gamepad-actions.js";
 import { VoiceInputButton } from "./VoiceInputButton.js";
 import { VoiceInputOverlay } from "./VoiceInputOverlay.js";
 import { applyVoiceDraftResult, createVoiceDraftFence } from "./voice-draft-fence.js";
@@ -71,7 +72,7 @@ interface ComposerWorkspaceMentionIndex {
   readonly error?: string;
 }
 
-export function Composer({ controller, session, backend, sessionUsage, readOnly = false, autoFocus = true, focusRequest = 0, queue, queueControl, workspace, extraDirectories, resources, commands, messageHistory, controls, runningStatus, messageMentionInsertion, selectionQuoteInsertion, attachmentInsertion, draftReplacement, t, runAction, onLocalSend, onDraftMutation, onStop, stopInFlight = false, onCompact }: {
+export function Composer({ controller, session, backend, sessionUsage, readOnly = false, autoFocus = true, focusRequest = 0, queue, queueControl, workspace, extraDirectories, resources, artifacts, sessions, commands, messageHistory, controls, runningStatus, messageMentionInsertion, selectionQuoteInsertion, attachmentInsertion, draftReplacement, t, runAction, onLocalSend, onDraftMutation, onStop, stopInFlight = false, onCompact }: {
   readonly controller: AppController;
   readonly session: SessionView;
   readonly backend?: BackendView;
@@ -85,7 +86,9 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   readonly queueControl?: QueueControlView;
   readonly workspace?: WorkspaceView;
   readonly extraDirectories: readonly ExtraDirectoryView[];
-  readonly resources: readonly ResourceView[];
+  readonly resources: readonly SessionResourceView[];
+  readonly artifacts?: readonly ArtifactView[];
+  readonly sessions?: readonly SessionView[];
   readonly commands: readonly RuntimeCommandView[];
   readonly messageHistory: readonly ComposerHistoryEntry[];
   readonly controls?: ReactNode;
@@ -117,6 +120,8 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   const [saved, setSaved] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [palette, setPalette] = useState<"add" | "mention" | "commands">();
+  const [commandActivation, setCommandActivation] = useState<ComposerCommandActivation>();
+  const [commandActiveIndex, setCommandActiveIndex] = useState(0);
   const [workspaceMentionIndex, setWorkspaceMentionIndex] = useState<ComposerWorkspaceMentionIndex>();
   const [workspaceMentionReload, setWorkspaceMentionReload] = useState(0);
   const [queueExpandedSessionId, setQueueExpandedSessionId] = useState<string>();
@@ -153,7 +158,6 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     onDraftMutation?.();
   };
   const draftSaveChainRef = useRef<Promise<void>>(Promise.resolve());
-  const typedPaletteTriggerRef = useRef<"/" | "@" | undefined>(undefined);
   const textRef = useRef(text);
   textRef.current = text;
   const editorDocumentRef = useRef(editorDocument);
@@ -164,7 +168,11 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   inlineMentionRangesRef.current = inlineMentionRanges;
   const inlineMentionActivationRef = useRef(inlineMentionActivation);
   inlineMentionActivationRef.current = inlineMentionActivation;
+  const commandActivationRef = useRef(commandActivation);
+  commandActivationRef.current = commandActivation;
+  const composerIsComposingRef = useRef(false);
   const suppressedInlineMentionFromRef = useRef<number | undefined>(undefined);
+  const suppressedCommandFromRef = useRef<number | undefined>(undefined);
   const lastComposerCaretRef = useRef<number | undefined>(undefined);
   const historyDraftRef = useRef<{ readonly text: string; readonly mentions: readonly ComposerMentionDraft[]; readonly inlineMentionRanges: readonly ComposerInlineMentionRange[]; readonly editorDocument: JSONContent } | undefined>(undefined);
   const hydratedHistoryDraftRef = useRef<string | undefined>(undefined);
@@ -179,9 +187,13 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   );
   const editorTextUpdate = controller.state.editorTextUpdate;
   const selectionQuotes = useMemo(() => composerDocumentQuotes(editorDocument), [editorDocument]);
+  const mentionCapability = backend?.capabilities.get("input.mention");
+  const mentionPolicy = useMemo(() => resolveComposerMentionPolicy(mentionCapability), [mentionCapability]);
+  const workspaceMentionsAvailable = mentionPolicy.files || mentionPolicy.directories;
+  const canMention = workspaceMentionsAvailable || mentionPolicy.resources || mentionPolicy.artifacts || mentionPolicy.sessions;
 
   useEffect(() => {
-    if (workspace === undefined) {
+    if (!workspaceMentionsAvailable || workspace === undefined) {
       setWorkspaceMentionIndex(undefined);
       return;
     }
@@ -212,7 +224,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       }));
     });
     return () => requestController.abort();
-  }, [t, workspace?.id, workspace?.revision, workspaceMentionReload]);
+  }, [t, workspace?.id, workspace?.revision, workspaceMentionReload, workspaceMentionsAvailable]);
 
   const modelRouteUnavailable = !modelSourceAccess(backend, session.model, session.model, controller.state.snapshot.providers).available;
   const supportedModes = useMemo(
@@ -236,7 +248,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     sessionResetSupported,
     reviewSupported
   } as const;
-  const availableCommandItems = composerCommandItems(commands, [], commandOptions);
+  const availableCommandItems = composerCommandItems(commands, commandOptions);
   const extraDirectoriesSupported = backend?.capabilities.get("workspace.extra_dirs")?.supported === true && workspace !== undefined;
   const selectableExtraDirectories = extraDirectories.filter((directory) => directory.workspaceId === workspace?.id && directory.trusted);
   const shellDraft = resolveUserShellDraft(text, bashMode, bashExcluded);
@@ -256,9 +268,10 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   };
 
   const closePalette = (restoreFocus = false): void => {
-    typedPaletteTriggerRef.current = undefined;
     inlineMentionActivationRef.current = undefined;
     setInlineMentionActivation(undefined);
+    commandActivationRef.current = undefined;
+    setCommandActivation(undefined);
     setPalette(undefined);
     if (restoreFocus) requestAnimationFrame(() => richEditorRef.current?.focus());
   };
@@ -273,6 +286,60 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     if (suppressTyped && activation?.source === "typed") suppressedInlineMentionFromRef.current = activation.from;
     closePalette(restoreFocus);
   };
+
+  const closeTypedCommand = (restoreFocus: boolean, suppressTyped: boolean): void => {
+    const activation = commandActivationRef.current;
+    if (suppressTyped && activation !== undefined) suppressedCommandFromRef.current = activation.from;
+    closePalette(restoreFocus);
+  };
+
+  const retireTypedInlineMention = (): void => {
+    if (inlineMentionActivationRef.current?.source !== "typed") return;
+    inlineMentionActivationRef.current = undefined;
+    setInlineMentionActivation(undefined);
+    setPalette((current) => current === "mention" ? undefined : current);
+  };
+
+  const retireTypedCommand = (): void => {
+    const wasTyped = commandActivationRef.current !== undefined;
+    commandActivationRef.current = undefined;
+    setCommandActivation(undefined);
+    if (wasTyped) setPalette((current) => current === "commands" ? undefined : current);
+  };
+
+  const activateTypedCommand = (nextText: string, caret: number, isComposing: boolean, isBash: boolean): boolean => {
+    const activation = detectComposerCommandActivation(nextText, caret, { isComposing, bashMode: isBash });
+    if (activation === undefined) {
+      suppressedCommandFromRef.current = undefined;
+      retireTypedCommand();
+      return false;
+    }
+    if (suppressedCommandFromRef.current === activation.from) {
+      retireTypedCommand();
+      return false;
+    }
+    suppressedCommandFromRef.current = undefined;
+    const previous = commandActivationRef.current;
+    if (
+      previous?.from !== activation.from
+      || previous.to !== activation.to
+      || previous.query !== activation.query
+    ) {
+      commandActivationRef.current = activation;
+      setCommandActivation(activation);
+      setCommandActiveIndex(0);
+    }
+    setPalette("commands");
+    return true;
+  };
+
+  useEffect(() => {
+    if (!canMention && palette === "mention") {
+      inlineMentionActivationRef.current = undefined;
+      setInlineMentionActivation(undefined);
+      setPalette(undefined);
+    }
+  }, [canMention, palette]);
 
   const voiceDictionaryOwnerKey = JSON.stringify([controller.state.activeProfile?.serverId, controller.state.activeProfile?.id, session.id, String(session.generation)]);
   const voiceDictionaryLearning = useVoiceDictionaryLearning({
@@ -301,7 +368,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
           document: editorDocumentRef.current, text: textRef.current, transcript });
         if (!applied.applied) return undefined;
         markDraftEdited(session.id); editorRevisionRef.current += 1;
-        const ranges = remapComposerInlineMentionRanges(textRef.current, applied.text, inlineMentionRangesRef.current);
+        const ranges = remapComposerInlineMentionReplacement(inlineMentionRangesRef.current, fence.from, fence.to, applied.caret - fence.from);
         editorDocumentRef.current = applied.document; textRef.current = applied.text;
         setEditorDocument(applied.document); setText(applied.text); replaceInlineMentionRanges(ranges);
         const nextMentions = composerMentionsFromRanges(mentionsRef.current, ranges);
@@ -322,6 +389,10 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   const stopVoiceInput = (): void => { void voice.finish(); };
   const retryVoiceInput = (): void => { voice.start(); };
   const useRetainedVoiceTranscript = voice.useTranscript;
+  useGamepadVoiceInput(voiceRoot, voice.scope, {
+    enabled: voice.supported && !readOnly && submissionKind === undefined && !effectiveBashMode && hydratedSession === session.id,
+    isActive: voice.isActive, getCaptureIdentity: voice.getCaptureIdentity, start: voice.start, finish: voice.finish, cancel: voice.cancel
+  });
   const sendRouteKey = JSON.stringify([session.backendId, session.targetId, session.model?.providerId, session.model?.modelId]);
   const sendOwner = useMemo(() => ({}), [voiceDictionaryOwnerKey, controller.getArtifactUrl, controller.state.snapshot.generation, sendRouteKey]);
   const sendEpochRef = useRef<object | undefined>(undefined);
@@ -333,12 +404,13 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     ownerWindow?.addEventListener("pagehide", retire); ownerWindow?.addEventListener("pageshow", activate);
     return () => { retire(); ownerWindow?.removeEventListener("pagehide", retire); ownerWindow?.removeEventListener("pageshow", activate); };
   }, [voiceDictionaryOwnerKey, controller.getArtifactUrl, voiceRoot]);
-  const sendStateRef = useRef({ owner: sendOwner, readOnly, connected: controller.state.connectionState === "connected", supportedModes, attachmentPolicy, route: sendRouteKey });
-  sendStateRef.current = { owner: sendOwner, readOnly, connected: controller.state.connectionState === "connected", supportedModes, attachmentPolicy, route: sendRouteKey };
+  const sendStateRef = useRef({ owner: sendOwner, readOnly, connected: controller.state.connectionState === "connected", supportedModes, attachmentPolicy, mentionPolicy, resources, route: sendRouteKey });
+  sendStateRef.current = { owner: sendOwner, readOnly, connected: controller.state.connectionState === "connected", supportedModes, attachmentPolicy, mentionPolicy, resources, route: sendRouteKey };
   const voiceSendFlight = useRef<object | undefined>(undefined);
   const sendDraftRef = useRef<(mode?: DeliveryMode, completedDocument?: JSONContent) => void>(() => undefined);
   const canFinishVoiceSend = !readOnly && controller.state.connectionState === "connected" && submissionKind === undefined && !effectiveBashMode && !modelRouteUnavailable && supportedModes.includes(deliveryMode)
-    && attachmentsAllowed([...attachments, ...browserComments.map(item => item.screenshot)], attachmentPolicy);
+    && attachmentsAllowed([...attachments, ...browserComments.map(item => item.screenshot)], attachmentPolicy)
+    && composerMentionsAllowed(composerMentionsFromRanges(mentions, inlineMentionRanges), mentionPolicy, resources);
   const finishVoiceAndSend = (event?: KeyboardEvent): void => {
     if (!canFinishVoiceSend || voiceSendFlight.current !== undefined) return;
     const intent = event === undefined ? null : resolveComposerEnterIntent({ key: event.key, shiftKey: event.shiftKey, ctrlKey: event.ctrlKey, metaKey: event.metaKey, altKey: event.altKey, isComposing: event.isComposing, repeat: event.repeat }, sendShortcut, { platform: composerPlatform, turnRunning });
@@ -386,8 +458,12 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     setPalette(undefined);
     inlineMentionActivationRef.current = undefined;
     setInlineMentionActivation(undefined);
+    commandActivationRef.current = undefined;
+    setCommandActivation(undefined);
+    setCommandActiveIndex(0);
+    composerIsComposingRef.current = false;
     suppressedInlineMentionFromRef.current = undefined;
-    typedPaletteTriggerRef.current = undefined;
+    suppressedCommandFromRef.current = undefined;
     setHistoryIndex(-1);
     historyDraftRef.current = undefined;
     hydratedHistoryDraftRef.current = undefined;
@@ -403,7 +479,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
         textRef.current = restoredText;
         setText(restoredText);
         setMentions(restoredMentions);
-        replaceInlineMentionRanges(restoreComposerInlineMentionRanges(restoredText, restoredMentions));
+        replaceInlineMentionRanges(restoreComposerInlineMentionRanges(restoredText, restoredMentions, draft?.inlineMentionRanges));
         setExtraDirectoryIds(draft?.extraDirectoryIds === undefined
           ? undefined
           : draft.extraDirectoryIds.filter((id) => selectableExtraDirectories.some((directory) => directory.id === id)));
@@ -476,7 +552,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     closePalette();
     const replaced = appendTextToComposerDocument(composerDocumentKeepingQuotes(editorDocument), editorTextUpdate.text);
     const nextText = composerDocumentPlainText(replaced);
-    const nextRanges = remapComposerInlineMentionRanges(textRef.current, nextText, inlineMentionRangesRef.current);
+    const nextRanges: readonly ComposerInlineMentionRange[] = [];
     setEditorDocument(replaced);
     textRef.current = nextText;
     setText(nextText);
@@ -568,6 +644,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       editorDocument,
       deliveryMode,
       mentions,
+      inlineMentionRanges,
       attachments,
       browserComments,
       ...(extraDirectoriesSupported && extraDirectoryIds !== undefined ? { extraDirectoryIds } : {})
@@ -587,20 +664,21 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       });
     }, 420);
     return () => { cancelled = true; window.clearTimeout(timer); };
-  }, [controller.saveDraft, attachments, browserComments, deliveryMode, editorDocument, extraDirectoriesSupported, extraDirectoryIds, hydratedSession, mentions, readOnly, session.id, submissionKind, text]);
+  }, [controller.saveDraft, attachments, browserComments, deliveryMode, editorDocument, extraDirectoriesSupported, extraDirectoryIds, hydratedSession, mentions, inlineMentionRanges, readOnly, session.id, submissionKind, text]);
 
   useEffect(() => () => {
     revokeAttachments(attachmentsRef.current);
     revokeBrowserCommentPreviews(browserCommentsRef.current);
   }, []);
 
-  const updateDocument = (nextDocument: JSONContent, isComposing: boolean): void => {
+  const updateDocument = (nextDocument: JSONContent, isComposing: boolean, mapRanges?: (ranges: readonly ComposerInlineMentionRange[]) => readonly ComposerInlineMentionRange[]): void => {
+    composerIsComposingRef.current = isComposing;
     markDraftEdited(session.id);
     editorRevisionRef.current += 1;
     resetHistoryNavigation();
     const next = composerDocumentPlainText(nextDocument);
     observeVoiceDictionaryEdit(next, isComposing);
-    const nextRanges = remapComposerInlineMentionRanges(textRef.current, next, inlineMentionRangesRef.current);
+    const nextRanges = mapRanges?.(inlineMentionRangesRef.current) ?? [];
     setEditorDocument(nextDocument);
     textRef.current = next;
     setText(next);
@@ -609,60 +687,71 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     const root = composerStackRef.current?.querySelector<HTMLElement>(".composer-rich-editor__content") ?? null;
     const caret = composerCaretTextOffset(root, typeof window === "undefined" ? null : window.getSelection()) ?? next.length;
     lastComposerCaretRef.current = caret;
-    const mentionTrigger = !isComposing && !bashMode ? detectComposerInlineMention(next, caret) : null;
+    const mentionTrigger = canMention && !isComposing && !bashMode ? detectComposerInlineMention(next, caret, nextRanges) : null;
     if (mentionTrigger !== null) {
+      retireTypedCommand();
       if (suppressedInlineMentionFromRef.current !== mentionTrigger.from) {
         const activation = { ...mentionTrigger, source: "typed" as const };
         inlineMentionActivationRef.current = activation;
         setInlineMentionActivation(activation);
-        typedPaletteTriggerRef.current = undefined;
         setInlineMentionActiveIndex(0);
         setPalette("mention");
       }
       return;
     }
     if (suppressedInlineMentionFromRef.current !== undefined) suppressedInlineMentionFromRef.current = undefined;
-    const typedPalette = resolveTypedComposerPalette(next, isComposing, bashMode);
-    if (typedPalette === "commands") {
-      typedPaletteTriggerRef.current = "/";
-      setPalette(typedPalette);
-      return;
-    }
-    closePalette();
+    retireTypedInlineMention();
+    activateTypedCommand(
+      next,
+      caret,
+      isComposing,
+      resolveUserShellDraft(next, bashMode, bashExcluded) !== null
+    );
   };
 
   useEffect(() => {
+    const ownerDocument = composerStackRef.current?.ownerDocument;
+    const ownerWindow = ownerDocument?.defaultView;
+    if (ownerDocument === undefined || ownerWindow === null || ownerWindow === undefined) return;
     const trackComposerSelection = (): void => {
       const root = composerStackRef.current?.querySelector<HTMLElement>(".composer-rich-editor__content") ?? null;
-      const selection = typeof window === "undefined" ? null : window.getSelection();
+      const selection = ownerWindow.getSelection();
       const caret = composerCaretTextOffset(root, selection);
       if (caret === undefined) return;
       lastComposerCaretRef.current = caret;
-      if (composerLocked || effectiveBashMode) return;
-      const detected = detectComposerInlineMention(textRef.current, caret);
-      if (detected === null) {
-        suppressedInlineMentionFromRef.current = undefined;
-        if (inlineMentionActivationRef.current?.source === "typed") closePalette();
+      if (composerLocked || effectiveBashMode || composerIsComposingRef.current) {
+        retireTypedInlineMention();
+        retireTypedCommand();
         return;
       }
-      if (suppressedInlineMentionFromRef.current === detected.from) return;
-      const previous = inlineMentionActivationRef.current;
-      if (
-        previous?.source === "typed"
-        && previous.from === detected.from
-        && previous.to === detected.to
-        && previous.query === detected.query
-        && previous.quoted === detected.quoted
-      ) return;
-      const activation = { ...detected, source: "typed" as const };
-      inlineMentionActivationRef.current = activation;
-      setInlineMentionActivation(activation);
-      setInlineMentionActiveIndex(0);
-      setPalette("mention");
+      const detectedMention = canMention
+        ? detectComposerInlineMention(textRef.current, caret, inlineMentionRangesRef.current)
+        : null;
+      if (detectedMention !== null) {
+        retireTypedCommand();
+        if (suppressedInlineMentionFromRef.current === detectedMention.from) return;
+        const previous = inlineMentionActivationRef.current;
+        if (
+          previous?.source === "typed"
+          && previous.from === detectedMention.from
+          && previous.to === detectedMention.to
+          && previous.query === detectedMention.query
+          && previous.quoted === detectedMention.quoted
+        ) return;
+        const activation = { ...detectedMention, source: "typed" as const };
+        inlineMentionActivationRef.current = activation;
+        setInlineMentionActivation(activation);
+        setInlineMentionActiveIndex(0);
+        setPalette("mention");
+        return;
+      }
+      suppressedInlineMentionFromRef.current = undefined;
+      retireTypedInlineMention();
+      activateTypedCommand(textRef.current, caret, false, false);
     };
-    document.addEventListener("selectionchange", trackComposerSelection);
-    return () => document.removeEventListener("selectionchange", trackComposerSelection);
-  }, [composerLocked, effectiveBashMode]);
+    ownerDocument.addEventListener("selectionchange", trackComposerSelection);
+    return () => ownerDocument.removeEventListener("selectionchange", trackComposerSelection);
+  }, [composerLocked, effectiveBashMode, canMention, voiceRoot?.ownerDocument]);
 
   const handleHistoryNavigation = (event: KeyboardEvent, activeDocument: JSONContent): boolean => {
     if (composerLocked || palette !== undefined || event.isComposing || event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return false;
@@ -1028,7 +1117,9 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     const sourceEpoch = sendEpochRef.current;
     const sourceDeliveryMode = modeOverride ?? deliveryMode;
     const draftMedia = [...attachments, ...browserComments.map((item) => item.screenshot)];
-    if (modelRouteUnavailable || !(browserComments.length > 0 || canSend(draftText, attachments, mentions, composerDocumentQuotes(draftDocument), supportedModes, sourceDeliveryMode)) || !attachmentsAllowed(draftMedia, attachmentPolicy)) return;
+    const sourceMentions = composerMentionsFromRanges(mentionsRef.current, inlineMentionRangesRef.current);
+    const sourceMentionRanges = [...inlineMentionRangesRef.current];
+    if (modelRouteUnavailable || !(browserComments.length > 0 || canSend(draftText, attachments, mentions, composerDocumentQuotes(draftDocument), supportedModes, sourceDeliveryMode)) || !attachmentsAllowed(draftMedia, attachmentPolicy) || !composerMentionsAllowed(sourceMentions, mentionPolicy, resources)) return;
     const sourceSessionId = session.id;
     const owner = operationGuardRef.current.capture(sourceSessionId);
     if (!operationGuardRef.current.beginSubmission(sourceSessionId, "send")) return;
@@ -1041,7 +1132,6 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     const sourceEditorDocument = draftDocument;
     const sourceAttachments = [...attachments];
     const sourceBrowserComments = [...browserComments];
-    const sourceMentions = composerMentionsFromRanges(mentions, inlineMentionRanges);
     const sourceExtraDirectoryIds = extraDirectoriesSupported ? extraDirectoryIds : undefined;
     const clearedDocument = emptyComposerDocument();
     const clearedOwner = operationGuardRef.current.capture(sourceSessionId);
@@ -1082,13 +1172,22 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
             editorDocument: editorDocumentRef.current,
             deliveryMode,
             mentions: mentionsRef.current,
+            inlineMentionRanges: inlineMentionRangesRef.current,
             attachments: attachmentsRef.current,
             browserComments: browserCommentsRef.current
           } satisfies ComposerDraft
         : await sourceController.readDraft(sourceSessionId) ?? clearedDraft;
-      const restoredDocument = joinComposerDocuments(sourceEditorDocument, current.editorDocument);
+      const currentDocument = normalizeComposerDocument(current.editorDocument, current.text);
+      const currentText = composerDocumentPlainText(currentDocument);
+      const restoredDocument = joinComposerDocuments(sourceEditorDocument, currentDocument);
       const restoredText = composerDocumentPlainText(restoredDocument);
       const restoredMentions = mergeDraftItemsById(sourceMentions, current.mentions);
+      const currentRanges = restoreComposerInlineMentionRanges(currentText, current.mentions, current.inlineMentionRanges);
+      const currentOffset = restoredText.length - currentText.length;
+      const restoredRanges = restoreComposerInlineMentionRanges(restoredText, restoredMentions, [
+        ...sourceMentionRanges,
+        ...currentRanges.map((range) => ({ ...range, from: range.from + currentOffset, to: range.to + currentOffset }))
+      ]);
       const restoredAttachments = mergeDraftItemsById(sourceAttachments, current.attachments);
       const restoredBrowserComments = mergeDraftItemsById(sourceBrowserComments, current.browserComments ?? []);
       const restoredDraft = {
@@ -1096,6 +1195,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
         editorDocument: restoredDocument,
         deliveryMode: current.deliveryMode,
         mentions: restoredMentions,
+        inlineMentionRanges: restoredRanges,
         attachments: restoredAttachments,
         browserComments: restoredBrowserComments,
         ...((current.extraDirectoryIds ?? sourceExtraDirectoryIds) === undefined
@@ -1113,7 +1213,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
         setEditorDocument(restoredDocument);
         setText(restoredText);
         setMentions(restoredMentions);
-        replaceInlineMentionRanges(restoreComposerInlineMentionRanges(restoredText, restoredMentions));
+        replaceInlineMentionRanges(restoredRanges);
         setExtraDirectoryIds(current.extraDirectoryIds ?? sourceExtraDirectoryIds);
         setAttachments(restoredAttachments);
         setBrowserComments(restoredBrowserComments);
@@ -1126,13 +1226,14 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       try {
         await clearSave;
         const current = sendStateRef.current;
-        if (sourceEpoch === undefined || sendEpochRef.current !== sourceEpoch || current.owner !== sourceSendOwner || current.readOnly || !current.connected || current.route !== sourceRoute || !current.supportedModes.includes(sourceDeliveryMode) || !attachmentsAllowed(draftMedia, current.attachmentPolicy)) throw new Error(t("composer.inputUnavailable"));
+        if (sourceEpoch === undefined || sendEpochRef.current !== sourceEpoch || current.owner !== sourceSendOwner || current.readOnly || !current.connected || current.route !== sourceRoute || !current.supportedModes.includes(sourceDeliveryMode) || !attachmentsAllowed(draftMedia, current.attachmentPolicy) || !composerMentionsAllowed(sourceMentions, current.mentionPolicy, current.resources)) throw new Error(t("composer.inputUnavailable"));
         await sourceSend(sourceSessionId, {
           text: sourceText,
           editorDocument: sourceEditorDocument,
           attachments: sourceAttachments,
           browserComments: sourceBrowserComments,
           mentions: sourceMentions,
+          inlineMentionRanges: sourceMentionRanges,
           deliveryMode: sourceDeliveryMode,
           ...(sourceExtraDirectoryIds === undefined ? {} : { extraDirectoryIds: sourceExtraDirectoryIds })
         }, { expectedGeneration: sourceGeneration });
@@ -1151,33 +1252,73 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   sendDraftRef.current = sendDraft;
 
   const insert = (item: ComposerPaletteItem): void => {
-    if (composerLocked) return;
+    if (composerLocked || item.mention !== undefined && !composerMentionsAllowed([item.mention], mentionPolicy, resources)) return;
+    const typedActivation = commandActivationRef.current;
+    if (typedActivation !== undefined) {
+      const replacement = replaceComposerCommandRun(textRef.current, typedActivation, item.value);
+      if (replacement === undefined) return;
+      const nextDocument = replaceComposerDocumentTextRange(
+        editorDocumentRef.current,
+        typedActivation.from,
+        typedActivation.to,
+        replacement.replacement
+      );
+      const normalizedReplacementText = composerDocumentPlainText(plainTextToComposerDocument(replacement.text));
+      if (nextDocument === undefined || composerDocumentPlainText(nextDocument) !== normalizedReplacementText) return;
+      markDraftEdited(session.id);
+      resetHistoryNavigation();
+      const nextRanges = remapComposerInlineMentionReplacement(
+        inlineMentionRangesRef.current,
+        typedActivation.from,
+        typedActivation.to,
+        replacement.replacement.length
+      );
+      editorDocumentRef.current = nextDocument;
+      setEditorDocument(nextDocument);
+      textRef.current = normalizedReplacementText;
+      setText(normalizedReplacementText);
+      replaceInlineMentionRanges(nextRanges);
+      const nextMentions = composerMentionsFromRanges(mentionsRef.current, nextRanges);
+      mentionsRef.current = nextMentions;
+      setMentions(nextMentions);
+      const caret = Math.min(replacement.caret, normalizedReplacementText.length);
+      lastComposerCaretRef.current = caret;
+      closePalette();
+      if (replacement.caret > normalizedReplacementText.length) {
+        requestAnimationFrame(() => richEditorRef.current?.focus("end"));
+      } else {
+        focusComposerAt(caret);
+      }
+      return;
+    }
     markDraftEdited(session.id);
     resetHistoryNavigation();
-    const typedTrigger = typedPaletteTriggerRef.current;
-    const nextText = insertComposerPaletteValue(text, typedTrigger, item);
-    const nextDocument = typedTrigger !== undefined && text === typedTrigger
-      ? plainTextToComposerDocument(nextText)
-      : appendTextToComposerDocument(editorDocument, nextText.slice(text.length));
+    const nextText = insertComposerPaletteValue(textRef.current, undefined, item);
+    const nextDocument = appendTextToComposerDocument(editorDocumentRef.current, nextText.slice(textRef.current.length));
     const normalizedNextText = composerDocumentPlainText(nextDocument);
     const nextRanges = remapComposerInlineMentionRanges(textRef.current, normalizedNextText, inlineMentionRangesRef.current);
+    editorDocumentRef.current = nextDocument;
     setEditorDocument(nextDocument);
     textRef.current = normalizedNextText;
     setText(normalizedNextText);
     replaceInlineMentionRanges(nextRanges);
     setMentions((current) => composerMentionsFromRanges(current, nextRanges));
     const mention = item.mention;
-    if (mention !== undefined) setMentions((current) => [...current.filter((candidate) => candidate.id !== mention.id), mention]);
+    if (mention !== undefined && mention.kind !== "message" && normalizedNextText.endsWith(mention.token)) {
+      replaceInlineMentionRanges([...nextRanges, { mentionId: mention.id, from: normalizedNextText.length - mention.token.length, to: normalizedNextText.length }]);
+      setMentions((current) => [...current.filter((candidate) => candidate.id !== mention.id), mention]);
+    }
     closePalette();
     requestAnimationFrame(() => richEditorRef.current?.focus());
   };
 
   const selectInlineMention = (item: ComposerMentionCatalogItem, reference = false): void => {
-    if (composerLocked || item.disabled === true) return;
+    if (composerLocked || item.disabled === true || !canMention) return;
     const activation = inlineMentionActivationRef.current;
     if (activation === undefined) return;
     const directoryToken = item.kind === "directory" && !reference ? composerDirectoryQueryToken(item.path) : undefined;
     const mention = item.mention;
+    if (directoryToken !== undefined ? !workspaceMentionsAvailable : mention !== undefined && !composerMentionsAllowed([mention], mentionPolicy, resources)) return;
     if (directoryToken === undefined && mention === undefined) return;
     const existingSeparator = /\s/u.test(textRef.current[activation.to] ?? "");
     const replacement = directoryToken ?? `${mention!.token}${existingSeparator ? "" : " "}`;
@@ -1185,9 +1326,8 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     if (nextDocument === undefined) return;
     markDraftEdited(session.id);
     resetHistoryNavigation();
-    const previousText = textRef.current;
     const nextText = composerDocumentPlainText(nextDocument);
-    const mappedRanges = remapComposerInlineMentionRanges(previousText, nextText, inlineMentionRangesRef.current);
+    const mappedRanges = remapComposerInlineMentionReplacement(inlineMentionRangesRef.current, activation.from, activation.to, replacement.length);
     setEditorDocument(nextDocument);
     textRef.current = nextText;
     setText(nextText);
@@ -1196,7 +1336,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       setMentions((current) => composerMentionsFromRanges(current, mappedRanges));
       const caret = activation.from + directoryToken.length;
       lastComposerCaretRef.current = caret;
-      const detected = detectComposerInlineMention(nextText, caret);
+      const detected = detectComposerInlineMention(nextText, caret, mappedRanges);
       if (detected === null) {
         closePalette();
       } else {
@@ -1234,7 +1374,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   };
 
   const openInlineMentionPalette = (): void => {
-    if (composerLocked) return;
+    if (composerLocked || !canMention) return;
     if (palette === "mention") {
       closeInlineMention(true, false);
       return;
@@ -1243,11 +1383,20 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     const selectedOffset = composerCaretTextOffset(root, typeof window === "undefined" ? null : window.getSelection());
     const from = Math.min(Math.max(selectedOffset ?? lastComposerCaretRef.current ?? text.length, 0), text.length);
     const activation = { from, to: from, query: "", quoted: false, source: "button" as const };
-    typedPaletteTriggerRef.current = undefined;
+    retireTypedCommand();
     inlineMentionActivationRef.current = activation;
     setInlineMentionActivation(activation);
     setInlineMentionActiveIndex(0);
     setPalette("mention");
+  };
+
+  const openCommandMenu = (): void => {
+    commandActivationRef.current = undefined;
+    setCommandActivation(undefined);
+    suppressedCommandFromRef.current = undefined;
+    inlineMentionActivationRef.current = undefined;
+    setInlineMentionActivation(undefined);
+    setPalette("commands");
   };
 
   const changeDeliveryMode = (mode: DeliveryMode): void => {
@@ -1261,13 +1410,12 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   const queueExpanded = queueExpandedSessionId === session.id;
   const draftMedia = [...attachments, ...browserComments.map((item) => item.screenshot)];
   const shortcutLabel = getComposerSendShortcutLabel(sendShortcut, composerPlatform);
-  const matchingWorkspaceMentionIndex = workspaceMentionIndex?.workspaceId === workspace?.id
+  const matchingWorkspaceMentionIndex = workspaceMentionsAvailable && workspaceMentionIndex?.workspaceId === workspace?.id
     ? workspaceMentionIndex
     : undefined;
-  const mentionCapability = backend?.capabilities.get("input.mention");
   const mentionReferenceOptions = {
-    directory: mentionCapability?.supported === true && mentionCapability.options?.includes("workspace_directory") === true,
-    lineRange: mentionCapability?.supported === true && mentionCapability.options?.includes("workspace_line_range") === true,
+    directory: mentionPolicy.directories,
+    lineRange: mentionPolicy.lineRanges,
     directoryLabel: t("composer.referenceDirectory"),
     startLineLabel: t("composer.referenceStartLine"),
     endLineLabel: t("composer.referenceEndLine"),
@@ -1275,12 +1423,14 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   };
   const mentionCatalogItems = useMemo(
     () => composerMentionCatalog(
-      workspace?.entries ?? [],
+      workspaceMentionsAvailable ? workspace?.entries ?? [] : [],
       workspace?.id,
-      resources,
-      matchingWorkspaceMentionIndex?.paths ?? []
-    ),
-    [matchingWorkspaceMentionIndex?.paths, resources, workspace?.entries, workspace?.id]
+      mentionPolicy.resources ? resources : [],
+      matchingWorkspaceMentionIndex?.paths ?? [],
+      mentionPolicy.artifacts ? artifacts ?? [] : [],
+      mentionPolicy.sessions ? sessions ?? [] : []
+    ).filter((item) => item.kind !== "file" || mentionPolicy.files),
+    [matchingWorkspaceMentionIndex?.paths, resources, artifacts, sessions, mentionPolicy, workspaceMentionsAvailable, workspace?.entries, workspace?.id]
   );
   const knownWorkspacePaths = useMemo(() => workspace === undefined
     ? []
@@ -1320,6 +1470,21 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     setInlineMentionActiveIndex(firstEnabledComposerMentionIndex(mentionResults.items));
   }, [inlineMentionActiveIndex, mentionResults.items]);
 
+  const typedCommandItems = commandActivation === undefined
+    ? []
+    : filterComposerPaletteItems(availableCommandItems, commandActivation.query);
+  const selectedCommandIndex = typedCommandItems.length > 0
+    ? Math.min(commandActiveIndex, typedCommandItems.length - 1)
+    : 0;
+
+  useEffect(() => {
+    if (typedCommandItems.length === 0) {
+      if (commandActiveIndex !== 0) setCommandActiveIndex(0);
+      return;
+    }
+    if (commandActiveIndex >= typedCommandItems.length) setCommandActiveIndex(typedCommandItems.length - 1);
+  }, [commandActiveIndex, typedCommandItems.length]);
+
   const captureInlineMentionKey = (event: KeyboardEvent): boolean => {
     if (palette !== "mention" || inlineMentionActivationRef.current === undefined || event.isComposing) return false;
     if (event.altKey || event.ctrlKey || event.metaKey || (event.key === "Tab" && event.shiftKey)) return false;
@@ -1336,6 +1501,27 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     }
     const selected = mentionResults.items[intent.index];
     if (selected !== undefined && selected.disabled !== true) selectInlineMention(selected);
+    return true;
+  };
+
+  const captureTypedCommandKey = (event: KeyboardEvent): boolean => {
+    if (palette !== "commands" || commandActivationRef.current === undefined || event.isComposing) return false;
+    if (event.altKey || event.ctrlKey || event.metaKey || (event.key === "Tab" && event.shiftKey)) return false;
+    if (typedCommandItems.length === 0 && (event.key === "Enter" || event.key === "Tab")) {
+      event.preventDefault();
+      return true;
+    }
+    const intent = resolveComposerPaletteKey(event.key, selectedCommandIndex, typedCommandItems.length);
+    if (intent === null) return false;
+    event.preventDefault();
+    if (intent.kind === "close") {
+      closeTypedCommand(true, true);
+    } else if (intent.kind === "move") {
+      setCommandActiveIndex(intent.index);
+    } else {
+      const selected = typedCommandItems[intent.index];
+      if (selected !== undefined) insert(selected);
+    }
     return true;
   };
   const promptRecommendationSetting = controller.state.snapshot.settings.promptRecommendation;
@@ -1363,7 +1549,8 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   const draftCanSend = !modelRouteUnavailable && (recommendationVisible !== undefined
     || browserComments.length > 0
     || canSend(text, attachments, mentions, selectionQuotes, supportedModes, deliveryMode))
-    && attachmentsAllowed(draftMedia, attachmentPolicy);
+    && attachmentsAllowed(draftMedia, attachmentPolicy)
+    && composerMentionsAllowed(composerMentionsFromRanges(mentions, inlineMentionRanges), mentionPolicy, resources);
   const mainSlotIsStop = canStop && !voiceActive && (!draftCanSend || submissionKind === "send");
   const showSecondaryStop = canStop && draftCanSend && submissionKind !== "send";
 
@@ -1400,8 +1587,26 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   }, [queueExpanded]);
 
   const paletteInAddMenu = palette === "add"
-    || (palette === "commands" && typedPaletteTriggerRef.current === undefined)
+    || (palette === "commands" && commandActivation === undefined)
     || (palette === "mention" && inlineMentionActivation?.source === "button");
+
+  useGamepadActions(voiceRoot, sendOwner, "composer", {
+    submit: () => {
+      if (readOnly || controller.state.connectionState !== "connected" || effectiveBashMode) return;
+      if (voiceActive) { if (canFinishVoiceSend) finishVoiceAndSend(); }
+      else if (!composerLocked && draftCanSend) sendDraft();
+    },
+    "add-attachments": () => {
+      if (!composerLocked && !effectiveBashMode && controller.state.connectionState === "connected" && (attachmentPolicy.images || attachmentPolicy.files)) {
+        closePalette(); fileInputRef.current?.click();
+      }
+    },
+    "open-commands": () => {
+      if (!composerLocked && !effectiveBashMode && controller.state.connectionState === "connected") {
+        openCommandMenu();
+      }
+    }
+  });
 
   return (
     <div className="composer-region">
@@ -1415,6 +1620,12 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
             event.preventDefault();
             event.stopPropagation();
             cancelVoiceInput();
+            return;
+          }
+          if (!event.nativeEvent.isComposing && event.key === "Escape" && palette === "commands" && commandActivationRef.current !== undefined) {
+            event.preventDefault();
+            event.stopPropagation();
+            closeTypedCommand(true, true);
             return;
           }
           if (event.key === "Escape" && palette === "mention" && inlineMentionActivationRef.current !== undefined) {
@@ -1557,6 +1768,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
             placeholder={effectiveBashMode ? t("composer.shellPlaceholder") : supportedModes.length === 0 ? t("composer.inputUnavailable") : t("composer.placeholder")}
             onDocumentChange={updateDocument}
             onKeyDown={(event, activeDocument) => {
+              if (captureTypedCommandKey(event)) return true;
               if (captureInlineMentionKey(event)) return true;
               if (
                 recommendationVisible !== undefined &&
@@ -1613,7 +1825,9 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
                 open={paletteInAddMenu}
                 onOpenChange={(next) => {
                   if (next) {
-                    typedPaletteTriggerRef.current = undefined;
+                    commandActivationRef.current = undefined;
+                    setCommandActivation(undefined);
+                    suppressedCommandFromRef.current = undefined;
                     setPalette("add");
                   } else if (paletteInAddMenu) {
                     closePalette(false);
@@ -1627,9 +1841,9 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
                 count={extraDirectoryIds?.length}
               >
                 {palette === "add" && <><div className="composer-add-menu__actions" role="menu">
-                  {(attachmentPolicy.images || attachmentPolicy.files) && <button className="composer-add-menu__action" type="button" role="menuitem" onClick={() => { setPalette(undefined); fileInputRef.current?.click(); }}><Paperclip aria-hidden="true" /><span><strong>{t("composer.attach")}</strong><small>{t("composer.attachments")}</small></span></button>}
-                  <button className="composer-add-menu__action" type="button" role="menuitem" onClick={openInlineMentionPalette}><AtSign aria-hidden="true" /><span><strong>{t("composer.mention")}</strong><small>{t("composer.noMentions")}</small></span></button>
-                  <button className="composer-add-menu__action" type="button" role="menuitem" onClick={() => { typedPaletteTriggerRef.current = undefined; setPalette("commands"); }}><Sparkles aria-hidden="true" /><span><strong>{t("composer.commands")}</strong><small>{availableCommandItems.length}</small></span></button>
+                  {(attachmentPolicy.images || attachmentPolicy.files) && <button className="composer-add-menu__action" type="button" role="menuitem" onClick={() => { closePalette(); fileInputRef.current?.click(); }}><Paperclip aria-hidden="true" /><span><strong>{t("composer.attach")}</strong><small>{t("composer.attachments")}</small></span></button>}
+                  {canMention && <button className="composer-add-menu__action" type="button" role="menuitem" onClick={openInlineMentionPalette}><AtSign aria-hidden="true" /><span><strong>{t("composer.mention")}</strong><small>{t("composer.mentionCount", { count: mentionCatalogItems.filter((item) => item.disabled !== true).length })}</small></span></button>}
+                  <button className="composer-add-menu__action" type="button" role="menuitem" onClick={openCommandMenu}><Sparkles aria-hidden="true" /><span><strong>{t("composer.commands")}</strong><small>{availableCommandItems.length}</small></span></button>
                 </div>
                 {extraDirectoriesSupported && selectableExtraDirectories.length > 0 && <fieldset className="composer-add-menu__directories">
                   <legend>{t("composer.extraDirectories")}</legend>
@@ -1674,10 +1888,19 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
                 onClose={() => closeInlineMention(true, true)}
                 onRetry={() => setWorkspaceMentionReload((current) => current + 1)}
               />}
-              {palette === "commands" && !paletteInAddMenu && <ComposerPalette title={t("composer.commands")} items={availableCommandItems} empty={t("composer.noCommands")} t={t} onSelect={insert} onClose={() => closePalette(true)} />}
+              {palette === "commands" && commandActivation !== undefined && !paletteInAddMenu && <ComposerTypedCommandPalette
+                title={t("composer.commands")}
+                items={typedCommandItems}
+                empty={t("composer.noCommands")}
+                activeIndex={selectedCommandIndex}
+                t={t}
+                onActiveIndexChange={setCommandActiveIndex}
+                onSelect={insert}
+                onClose={() => closeTypedCommand(true, true)}
+              />}
             </div>}
             {!effectiveBashMode && voice.supported && <VoiceInputButton phase={voice.phase} held={heldVoice.held} sendTargetActive={heldVoice.sendTargetActive} startedAt={voice.startedAt} ownerWindow={voice.ownerWindow} enabled={!readOnly && submissionKind === undefined && hydratedSession === session.id} buttonProps={heldVoice.buttonProps} t={t} />}
-            {bashCapable && <IconButton label={effectiveBashMode ? t("composer.shellExit") : t("composer.shellEnter")} disabled={composerLocked} aria-pressed={effectiveBashMode} onClick={() => { setBashMode((current) => !current); requestAnimationFrame(() => richEditorRef.current?.focus()); }}><Terminal aria-hidden="true" /></IconButton>}
+            {bashCapable && <IconButton label={effectiveBashMode ? t("composer.shellExit") : t("composer.shellEnter")} disabled={composerLocked} aria-pressed={effectiveBashMode} onClick={() => { closePalette(); setBashMode((current) => !current); requestAnimationFrame(() => richEditorRef.current?.focus()); }}><Terminal aria-hidden="true" /></IconButton>}
             {effectiveBashMode && <label className="composer__bash-option"><CheckboxControl checked={shellDraft?.excludeFromContext ?? bashExcluded} disabled={composerLocked || shellDraft?.prefix === "exclude"} onChange={(event) => setBashExcluded(event.target.checked)} />{t("composer.shellExclude")}</label>}
             {saved && <span className="draft-saved" role="status"><CircleCheck aria-hidden="true" />{t("composer.saved")}</span>}
           </div>
@@ -1702,7 +1925,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
               label={voiceActive ? t(heldVoice.sendTargetActive ? "voice.releaseToSend" : "voice.finishAndSend") : effectiveBashMode ? t("composer.shellEnter") : deliveryLabel(deliveryMode, t)}
               tip={voiceActive ? t(heldVoice.sendTargetActive ? "voice.releaseToSend" : "voice.finishAndSend") : effectiveBashMode ? `${t("composer.shellEnter")} (${shortcutLabel})` : `${deliveryLabel(deliveryMode, t)} (${shortcutLabel})`}
               disabled={voiceActive ? !canFinishVoiceSend : composerLocked || (effectiveBashMode ? !bashPermitted || (shellDraft?.command.length ?? 0) === 0 || attachments.length > 0 : !draftCanSend)}
-              disabledReason={composerLocked
+              disabledReason={composerLocked || !composerMentionsAllowed(composerMentionsFromRanges(mentions, inlineMentionRanges), mentionPolicy, resources)
                 ? t("composer.inputUnavailable")
                 : effectiveBashMode && !bashPermitted
                   ? t("composer.shellUnavailable")
@@ -1784,318 +2007,45 @@ function isCodedReviewDispatchFailure(error: unknown): boolean {
     && error.code.length > 0;
 }
 
-function QueueStrip({ sessionId, items, control, supportedDispositions, controller, runAction, t, expanded, onExpandedChange }: { readonly sessionId: string; readonly items: readonly QueueItemView[]; readonly control?: QueueControlView; readonly supportedDispositions: readonly DeliveryMode[]; readonly controller: AppController; readonly runAction: RunAction; readonly t: Translator; readonly expanded: boolean; readonly onExpandedChange: (expanded: boolean) => void }): JSX.Element {
-  const [editingId, setEditingId] = useState<string>();
-  const [editingText, setEditingText] = useState("");
-  const [draggingQueueItemId, setDraggingQueueItemId] = useState<string>();
-  const [dragTargetQueueItemId, setDragTargetQueueItemId] = useState<string>();
-  const [pendingItemIds, setPendingItemIds] = useState<ReadonlySet<string>>(() => new Set());
-  const [queueControlPending, setQueueControlPending] = useState(false);
-  const queueRootRef = useRef<HTMLDivElement>(null);
-  const restoreEditorFocusRef = useRef<{ readonly row: HTMLElement; readonly queueItemId: string } | undefined>(undefined);
-  const pendingItemIdsRef = useRef(new Set<string>());
-  const queueControlPendingRef = useRef(false);
-  const controllerRef = useRef(controller);
-  controllerRef.current = controller;
-  const editLockRef = useRef<{ readonly queueItemId: string; readonly token: string } | undefined>(undefined);
-  const dragLockRef = useRef<{
-    readonly token: string;
-    readonly promise: Promise<void>;
-    acquired: boolean;
-    dropInProgress: boolean;
-    released: boolean;
-  } | undefined>(undefined);
-  const queueItemsId = useId();
-  const ordered = [...items].sort((left, right) => left.ordinal - right.ordinal || left.createdAt - right.createdAt);
-  const queueWindow = composerQueueWindow(ordered, expanded);
-  const unknown = ordered.some((item) => item.state === "dispatchUnknown");
-  const paused = control?.state === "paused";
-  const interactionLocked = control?.interactionLocked === true && dragLockRef.current === undefined;
-  useLayoutEffect(() => {
-    const target = restoreEditorFocusRef.current;
-    if (editingId !== undefined || target === undefined || pendingItemIds.has(target.queueItemId)) return;
-    restoreEditorFocusRef.current = undefined;
-    if (!target.row.isConnected) return;
-    const active = target.row.ownerDocument.activeElement;
-    if (active !== target.row.ownerDocument.body && active !== null && !target.row.contains(active)) return;
-    const editButton = target.row.querySelector<HTMLButtonElement>("[data-queue-edit]:not(:disabled)");
-    (editButton ?? target.row).focus();
-  }, [editingId, pendingItemIds]);
+function ComposerTypedCommandPalette({ title, items, empty, activeIndex, t, onActiveIndexChange, onSelect, onClose }: {
+  readonly title: string;
+  readonly items: readonly ComposerPaletteItem[];
+  readonly empty: string;
+  readonly activeIndex: number;
+  readonly t: Translator;
+  readonly onActiveIndexChange: (index: number) => void;
+  readonly onSelect: (item: ComposerPaletteItem) => void;
+  readonly onClose: () => void;
+}): JSX.Element {
+  const listId = useId();
+  const rootRef = useRef<HTMLDivElement>(null);
+  const activeOptionId = items.length > 0 ? `${listId}-option-${activeIndex}` : undefined;
+
   useEffect(() => {
-    if (!queueWindow.collapsible && expanded) onExpandedChange(false);
-  }, [expanded, onExpandedChange, queueWindow.collapsible]);
-  const trackItemAction = (queueItemId: string, key: string, action: () => Promise<void>): Promise<void> | undefined => {
-    if (pendingItemIdsRef.current.has(queueItemId)) return undefined;
-    pendingItemIdsRef.current.add(queueItemId);
-    setPendingItemIds(new Set(pendingItemIdsRef.current));
-    const promise = action().finally(() => {
-      pendingItemIdsRef.current.delete(queueItemId);
-      setPendingItemIds(new Set(pendingItemIdsRef.current));
-    });
-    runAction(key, () => promise);
-    return promise;
-  };
-  const releaseEditLock = (lock: { readonly queueItemId: string; readonly token: string }): Promise<void> => {
-    if (editLockRef.current?.token === lock.token) editLockRef.current = undefined;
-    const promise = controller.setQueueItemEditLock(lock.queueItemId, lock.token, false);
-    runAction(`queue-edit-unlock:${lock.queueItemId}`, () => promise);
-    return promise;
-  };
-  const closeEditor = (): void => {
-    const lock = editLockRef.current;
-    rememberEditorFocus();
-    setEditingId(undefined);
-    if (lock !== undefined) void releaseEditLock(lock).catch(() => undefined);
-  };
-  const rememberEditorFocus = (): void => {
-    const active = queueRootRef.current?.ownerDocument.activeElement;
-    const editor = active?.closest(".queue-strip__editor");
-    const row = editor?.closest("article");
-    restoreEditorFocusRef.current = editingId !== undefined && row instanceof HTMLElement && queueRootRef.current?.contains(row)
-      ? { row, queueItemId: editingId }
-      : undefined;
-  };
-  const beginEdit = (item: QueueItemView): void => {
-    if (editLockRef.current?.queueItemId === item.id) return;
-    const token = randomUuid();
-    const promise = trackItemAction(
-      item.id,
-      `queue-edit-lock:${item.id}`,
-      async () => {
-        const previous = editLockRef.current;
-        if (previous !== undefined) {
-          setEditingId(undefined);
-          await releaseEditLock(previous);
-        }
-        await controller.setQueueItemEditLock(item.id, token, true);
-      }
-    );
-    if (promise === undefined) return;
-    void promise.then(() => {
-      editLockRef.current = { queueItemId: item.id, token };
-      setEditingId(item.id);
-      setEditingText(item.text);
-    }).catch(() => undefined);
-  };
-  const runWithEditLock = (
-    item: QueueItemView,
-    key: string,
-    action: (lockToken: string) => Promise<void>
-  ): void => {
-    const token = randomUuid();
-    const promise = trackItemAction(item.id, key, async () => {
-      await controller.setQueueItemEditLock(item.id, token, true);
-      try {
-        await action(token);
-      } finally {
-        await controller.setQueueItemEditLock(item.id, token, false);
-      }
-    });
-    void promise?.catch(() => undefined);
-  };
-  const beginInteractionLock = (): NonNullable<typeof dragLockRef.current> => {
-    const token = randomUuid();
-    const promise = controller.setQueueInteractionLock(sessionId, token, true);
-    const lock = { token, promise, acquired: false, dropInProgress: false, released: false };
-    dragLockRef.current = lock;
-    runAction(`queue-interaction-lock:${sessionId}`, () => promise);
-    void promise.then(() => { lock.acquired = true; }).catch(() => undefined);
-    return lock;
-  };
-  const releaseInteractionLock = async (lock: NonNullable<typeof dragLockRef.current>): Promise<void> => {
-    if (lock.released) return;
-    lock.released = true;
-    if (dragLockRef.current === lock) dragLockRef.current = undefined;
-    await lock.promise.catch(() => undefined);
-    if (!lock.acquired) return;
-    const promise = controller.setQueueInteractionLock(sessionId, lock.token, false);
-    runAction(`queue-interaction-unlock:${sessionId}`, () => promise);
-    await promise;
-  };
-  const reorderWithInteractionLock = (
-    queueItemId: string,
-    placement: "first" | "last" | "before" | "after",
-    anchorQueueItemId?: string,
-    existingLock?: NonNullable<typeof dragLockRef.current>
-  ): void => {
-    const lock = existingLock ?? beginInteractionLock();
-    lock.dropInProgress = true;
-    void (async () => {
-      try {
-        await lock.promise;
-        const reorder = trackItemAction(
-          queueItemId,
-          `queue-reorder:${queueItemId}`,
-          () => controller.reorderQueueItem(queueItemId, placement, anchorQueueItemId, lock.token)
-        );
-        if (reorder !== undefined) await reorder;
-      } finally {
-        await releaseInteractionLock(lock);
-      }
-    })().catch(() => undefined);
-  };
-  useEffect(() => {
-    const lock = editLockRef.current;
-    if (lock === undefined || editingId !== lock.queueItemId) return;
-    const item = ordered.find((candidate) => candidate.id === lock.queueItemId);
-    if (item === undefined || item.source !== "user" || (item.state !== "accepted" && item.state !== "queued")) {
-      closeEditor();
-      return;
-    }
-    const timer = window.setInterval(() => {
-      const promise = controller.setQueueItemEditLock(lock.queueItemId, lock.token, true);
-      runAction(`queue-edit-renew:${lock.queueItemId}`, () => promise);
-      void promise.catch(() => {
-        if (editLockRef.current?.token === lock.token) {
-          editLockRef.current = undefined;
-          setEditingId(undefined);
-        }
-      });
-    }, 30_000);
-    return () => window.clearInterval(timer);
-  }, [controller, editingId, items, runAction]);
-  useEffect(() => () => {
-    const editLock = editLockRef.current;
-    if (editLock !== undefined) void controllerRef.current.setQueueItemEditLock(editLock.queueItemId, editLock.token, false).catch(() => undefined);
-    const dragLock = dragLockRef.current;
-    if (dragLock !== undefined && !dragLock.released) {
-      dragLock.released = true;
-      void dragLock.promise.then(() => controllerRef.current.setQueueInteractionLock(sessionId, dragLock.token, false)).catch(() => undefined);
-    }
-  }, [sessionId]);
-  const steerSupported = supportedDispositions.includes("steer");
-  const deliveryUnavailable = supportedDispositions.length === 0;
+    if (activeOptionId === undefined) return;
+    rootRef.current?.ownerDocument.getElementById(activeOptionId)?.scrollIntoView?.({ block: "nearest" });
+  }, [activeOptionId]);
+
   return (
-    <div ref={queueRootRef} className={cx("queue-strip", unknown && "queue-strip--warning", paused && "queue-strip--paused")} aria-label={t("context.queue")}>
-      <div className="queue-strip__title">{unknown ? <AlertTriangle aria-hidden="true" /> : paused ? <Pause aria-hidden="true" /> : <Clock3 aria-hidden="true" />}<strong>{t("composer.queueCount", { count: ordered.length })}</strong>{paused && <Pill tone="warning">{t("queue.paused")}</Pill>}{interactionLocked && <Pill tone="warning">{t("queue.interactionLocked")}</Pill>}<IconButton label={paused ? t("queue.resume") : t("queue.pause")} disabled={queueControlPending} onClick={() => {
-        if (queueControlPendingRef.current) return;
-        queueControlPendingRef.current = true;
-        setQueueControlPending(true);
-        runAction(paused ? `resume-queue:${sessionId}` : `pause-queue:${sessionId}`, async () => {
-          try {
-            await (paused ? controller.resumeQueue(sessionId) : controller.pauseQueue(sessionId));
-          } finally {
-            queueControlPendingRef.current = false;
-            setQueueControlPending(false);
-          }
-        });
-      }}>{paused ? <Play aria-hidden="true" /> : <Pause aria-hidden="true" />}</IconButton></div>
-      <div id={queueItemsId} className={cx("queue-strip__items", expanded && "is-expanded")}>{queueWindow.items.map((item) => {
-        const index = ordered.findIndex((candidate) => candidate.id === item.id);
-        const mutable = item.state === "accepted" || item.state === "queued";
-        const userEditable = mutable && item.source === "user";
-        const pending = pendingItemIds.has(item.id);
-        const editLocked = item.editLocked && editLockRef.current?.queueItemId !== item.id;
-        const lockReason = interactionLocked
-          ? t("queue.interactionLockedReason")
-          : editLocked
-            ? t("queue.editLockedReason")
-            : undefined;
-        const blocked = pending || lockReason !== undefined;
-        const itemDeliveryUnavailable = !supportedDispositions.includes(item.mode);
-        const reorder = (placement: "first" | "last" | "before" | "after", anchorQueueItemId?: string): void => {
-          if (!blocked) reorderWithInteractionLock(item.id, placement, anchorQueueItemId);
-        };
-        return (
-          <article
-            key={item.id}
-            className={cx(editingId === item.id && "is-editing", draggingQueueItemId === item.id && "is-dragging", dragTargetQueueItemId === item.id && "is-drag-target")}
-            tabIndex={userEditable && steerSupported && editingId !== item.id && !blocked ? 0 : -1}
-            aria-keyshortcuts={userEditable && steerSupported ? "Meta+Enter Control+Enter" : undefined}
-            onKeyDown={(event) => {
-              if (event.key !== "Enter" || !(event.metaKey || event.ctrlKey) || event.shiftKey || event.altKey
-                || event.repeat || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229
-                || !userEditable || !steerSupported || blocked || editingId === item.id) return;
-              event.preventDefault();
-              event.stopPropagation();
-              runWithEditLock(item, `steer-now:${item.id}`, (lockToken) => controller.steerQueueItemNow(item.id, item.text, lockToken));
-            }}
-            onDragOver={(event) => {
-              if (draggingQueueItemId === undefined || draggingQueueItemId === item.id || !mutable || pending) return;
-              event.preventDefault();
-              event.dataTransfer.dropEffect = "move";
-              setDragTargetQueueItemId(item.id);
-            }}
-            onDragLeave={(event) => {
-              if (event.relatedTarget instanceof Node && event.currentTarget.contains(event.relatedTarget)) return;
-              setDragTargetQueueItemId((current) => current === item.id ? undefined : current);
-            }}
-            onDrop={(event) => {
-              event.preventDefault();
-              const sourceId = draggingQueueItemId ?? event.dataTransfer.getData("text/x-joko-queue-item");
-              const lock = dragLockRef.current;
-              setDraggingQueueItemId(undefined);
-              setDragTargetQueueItemId(undefined);
-              if (sourceId === "" || sourceId === item.id || !mutable || pending || lock === undefined) {
-                if (lock !== undefined) void releaseInteractionLock(lock).catch(() => undefined);
-                return;
-              }
-              const source = ordered.find((candidate) => candidate.id === sourceId);
-              if (source === undefined || !(source.state === "accepted" || source.state === "queued") || source.editLocked || pendingItemIdsRef.current.has(source.id)) {
-                void releaseInteractionLock(lock).catch(() => undefined);
-                return;
-              }
-              const rect = event.currentTarget.getBoundingClientRect();
-              const placement = event.clientY >= rect.top + rect.height / 2 ? "after" : "before";
-              reorderWithInteractionLock(source.id, placement, item.id, lock);
-            }}
-          >
-            <div className="queue-strip__row">
-              {mutable && <IconButton
-                className="queue-strip__drag-handle"
-                draggable={editingId !== item.id && !blocked}
-                disabled={editingId === item.id || blocked}
-                disabledReason={lockReason}
-                label={`${t("queue.moveUp")} / ${t("queue.moveDown")}`}
-                aria-keyshortcuts="ArrowUp ArrowDown Home End"
-                onDragStart={(event) => {
-                  if (editingId === item.id || blocked) { event.preventDefault(); return; }
-                  event.dataTransfer.effectAllowed = "move";
-                  event.dataTransfer.setData("text/x-joko-queue-item", item.id);
-                  setDraggingQueueItemId(item.id);
-                  beginInteractionLock();
-                }}
-                onDragEnd={() => { const lock = dragLockRef.current; setDraggingQueueItemId(undefined); setDragTargetQueueItemId(undefined); if (lock !== undefined && !lock.dropInProgress) void releaseInteractionLock(lock).catch(() => undefined); }}
-                onKeyDown={(event) => {
-                  if (event.repeat || event.nativeEvent.isComposing || editingId === item.id || blocked) return;
-                  const intent = resolveQueueReorderShortcut(event.key, index, ordered.length);
-                  if (intent === null) return;
-                  event.preventDefault();
-                  event.stopPropagation();
-                  if ("anchorIndex" in intent) reorder(intent.placement, ordered[intent.anchorIndex]?.id);
-                  else reorder(intent.placement);
-                }}
-              ><GripVertical aria-hidden="true" /></IconButton>}
-              <Pill tone={item.state === "dispatchUnknown" ? "warning" : item.mode === "steer" ? "accent" : "neutral"}>{deliveryLabel(item.mode, t)}</Pill>
-              {item.source !== "user" && <Pill tone="neutral">{queueSourceLabel(item.source, t)}</Pill>}
-              {editLocked && <Pill tone="warning">{t("queue.editLocked")}</Pill>}
-              <span className="queue-strip__text">{item.text}</span>
-              {mutable && editingId !== item.id && <div className="queue-strip__actions">{userEditable && <IconButton data-queue-edit label={t("queue.edit")} disabled={blocked || itemDeliveryUnavailable} disabledReason={lockReason ?? (itemDeliveryUnavailable ? t("queue.deliveryUnavailable") : undefined)} onClick={() => beginEdit(item)}><Pencil aria-hidden="true" /></IconButton>}{userEditable && steerSupported && <IconButton label={t("queue.steerNow")} disabled={blocked} disabledReason={lockReason} onClick={() => runWithEditLock(item, `steer-now:${item.id}`, (lockToken) => controller.steerQueueItemNow(item.id, item.text, lockToken))}><Zap aria-hidden="true" /></IconButton>}<IconButton label={t("queue.cancel")} disabled={blocked} disabledReason={lockReason} onClick={() => { const promise = trackItemAction(item.id, `cancel-queue:${item.id}`, () => controller.cancelQueueItem(item.id)); void promise?.catch(() => undefined); }}><X aria-hidden="true" /></IconButton></div>}
-            </div>
-            {editingId === item.id && <form className="queue-strip__editor" onSubmit={(event) => { event.preventDefault(); if (itemDeliveryUnavailable || pending || interactionLocked || editingText.trim().length === 0) return; const lock = editLockRef.current; if (lock?.queueItemId !== item.id) return; rememberEditorFocus(); const promise = trackItemAction(item.id, `edit-queue:${item.id}`, async () => { await controller.editQueueItem(item.id, editingText, item.mode, lock.token); setEditingId(undefined); await releaseEditLock(lock); }); void promise?.catch(() => undefined); }} onKeyDown={(event) => {
-              if (event.key === "Escape" && !event.repeat && !event.nativeEvent.isComposing && event.nativeEvent.keyCode !== 229 && !pending && !interactionLocked) {
-                event.preventDefault();
-                event.stopPropagation();
-                closeEditor();
-              }
-            }}><textarea rows={2} autoFocus value={editingText} disabled={pending || interactionLocked} onChange={(event) => setEditingText(event.target.value)} aria-label={t("queue.editText")} onKeyDown={(event) => {
-              if (event.repeat || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229 || pending || interactionLocked) return;
-              if (event.key === "Enter" && !event.shiftKey) {
-                event.preventDefault();
-                event.stopPropagation();
-                event.currentTarget.form?.requestSubmit();
-              }
-            }} /><Button disabled={pending} onClick={closeEditor}>{t("common.cancel")}</Button><Button type="submit" tone="primary" disabled={pending || interactionLocked || editingText.trim().length === 0 || itemDeliveryUnavailable}>{t("common.save")}</Button></form>}
-          </article>
-        );
-      })}</div>
-      {queueWindow.collapsible && <button className="queue-strip__toggle" type="button" aria-controls={queueItemsId} aria-expanded={expanded} onClick={() => onExpandedChange(!expanded)}>{expanded ? t("queue.showLess") : t("queue.showMore", { count: queueWindow.hiddenCount })}</button>}
-      {unknown && <p>{t("error.dispatchUnknown")}</p>}
-      {paused && control?.pauseReason !== undefined && <p>{control.pauseReason}</p>}
-      {deliveryUnavailable && <p role="status">{t("queue.deliveryUnavailable")}</p>}
+    <div ref={rootRef} className="composer-palette" role="dialog" aria-label={title} data-composer-typed-command-palette="true">
+      <header><strong>{title}</strong><IconButton label={t("common.close")} onClick={onClose}><X aria-hidden="true" /></IconButton></header>
+      <div id={listId} className="composer-palette__list" role="listbox" aria-label={title} aria-activedescendant={activeOptionId}>
+        {items.map((item, index) => <button
+          id={`${listId}-option-${index}`}
+          type="button"
+          role="option"
+          aria-selected={index === activeIndex}
+          tabIndex={-1}
+          key={item.id}
+          onMouseMove={() => onActiveIndexChange(index)}
+          onClick={() => onSelect(item)}
+        ><span>{item.label}</span><small>{item.meta}</small></button>)}
+        {items.length === 0 && <p>{empty}</p>}
+      </div>
     </div>
   );
 }
+
 
 function ComposerPalette({ title, items, empty, t, onSelect, onClose, embedded = false }: { readonly title: string; readonly items: readonly ComposerPaletteItem[]; readonly empty: string; readonly t: Translator; readonly onSelect: (item: ComposerPaletteItem) => void; readonly onClose: () => void; readonly embedded?: boolean }): JSX.Element {
   const [query, setQuery] = useState("");
@@ -2162,19 +2112,6 @@ function deliveryModesFor(session: SessionView, backend?: BackendView): readonly
     return advertised.includes("prompt") ? ["prompt"] : [];
   }
   return advertised.filter((mode) => mode !== "prompt");
-}
-
-function deliveryLabel(mode: DeliveryMode, t: Translator): string {
-  if (mode === "steer") return t("composer.steer");
-  if (mode === "followUp") return t("composer.followUp");
-  return t("composer.send");
-}
-
-function queueSourceLabel(source: QueueItemView["source"], t: Translator): string {
-  if (source === "schedule") return t("queue.sourceAutomation");
-  if (source === "retry") return t("queue.sourceRetry");
-  if (source === "backend") return t("queue.sourceSystem");
-  return t("queue.sourceUser");
 }
 
 function canSend(text: string, attachments: readonly AttachmentDraft[], mentions: readonly ComposerMentionDraft[], selectionQuotes: readonly ComposerSelectionQuoteDraft[], supportedModes: readonly DeliveryMode[], mode: DeliveryMode): boolean {

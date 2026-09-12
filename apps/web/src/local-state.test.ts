@@ -102,6 +102,7 @@ describe("owner-scoped delayed-create drafts", () => {
       text: "Review @src/main.ts",
       editorDocument: plainTextToComposerDocument("Review @src/main.ts"),
       mentions: [{ id: "file-1", kind: "workspace", reference: "src/main.ts", label: "main.ts", token: "@src/main.ts", workspaceId: "workspace-1" }],
+      inlineMentionRanges: [{ mentionId: "file-1", from: 7, to: 19 }],
       attachments: [
         { id: "attachment-1", kind: "image", file: image, previewUrl: "blob:must-not-survive" },
         { secret: "must not survive" }
@@ -121,12 +122,13 @@ describe("owner-scoped delayed-create drafts", () => {
       text: "Review @src/main.ts",
       editorDocument: plainTextToComposerDocument("Review @src/main.ts"),
       mentions: [{ id: "file-1", kind: "workspace", reference: "src/main.ts", label: "main.ts", token: "@src/main.ts", workspaceId: "workspace-1" }],
+      inlineMentionRanges: [{ mentionId: "file-1", from: 7, to: 19 }],
       attachments: [{ id: "attachment-1", kind: "image", file: image }],
       extraDirectoryIds: ["extra-approved-id"]
     });
   });
 
-  it("fails closed on invalid target identity and strips malformed mentions", () => {
+  it("fails closed on invalid target identity and malformed durable mentions", () => {
     expect(normalizeNewSessionLocalDraft({ selection: { kind: "target", targetId: "" }, text: "", nativeStart: { kind: "fresh" } })).toBeUndefined();
     expect(normalizeNewSessionLocalDraft({
       selection: { kind: "dialogue", backendId: "backend-1" },
@@ -134,15 +136,16 @@ describe("owner-scoped delayed-create drafts", () => {
       editorDocument: plainTextToComposerDocument("hello"),
       nativeStart: { kind: "fresh" },
       permissionMode: "backend-specific",
-      mentions: [{ id: "bad", kind: "artifact", reference: "x", label: "x", token: "@x" }]
-    })).toMatchObject({ permissionMode: "ask", mentions: [], attachments: [] });
+      mentions: [{ id: "bad", kind: "artifact", reference: "x", label: "x", token: "@x", workspaceId: "invalid-artifact-scope" }]
+    })).toBeUndefined();
   });
 
   it("requires and normalizes the structured first-message document", () => {
     const common = {
       selection: { kind: "target", targetId: "target-1" },
       nativeStart: { kind: "fresh" },
-      text: "- inspect\n- verify"
+      text: "- inspect\n- verify",
+      mentions: []
     };
     const structured = {
       type: "doc",
@@ -167,6 +170,7 @@ describe("owner-scoped delayed-create drafts", () => {
       text: "inspect",
       editorDocument: plainTextToComposerDocument("inspect"),
       nativeStart: { kind: "fresh" },
+      mentions: [],
       worktree: { enabled: true, sourceRef: "refs/remotes/origin/main", refreshRemote: true, serverPath: "must-not-survive" }
     })?.worktree).toEqual({ enabled: true, sourceRef: "refs/remotes/origin/main", refreshRemote: true });
 
@@ -175,6 +179,7 @@ describe("owner-scoped delayed-create drafts", () => {
       text: "inspect",
       editorDocument: plainTextToComposerDocument("inspect"),
       nativeStart: { kind: "fresh" },
+      mentions: [],
       worktree: { enabled: true, sourceRef: "refs/heads/main\nmalformed", refreshRemote: true }
     })).toBeUndefined();
   });
@@ -195,13 +200,32 @@ describe("structured composer message references", () => {
   });
 
   it("restores bounded message identities while preserving existing mention kinds", () => {
+    const resource = { id: "resource:one", kind: "resource", reference: "one", label: "One", token: "@One", discoveredRevision: "revision-one", resourceVersion: "7", runtimeGeneration: 3 };
     expect(normalizeComposerMentions([
-      { id: "resource:one", kind: "resource", reference: "one", label: "One", token: "@One" },
+      resource,
       { id: "message:s1:e1", kind: "message", reference: "m1", label: " Task ", sessionId: "s1", role: "assistant", sourceEventId: "e1" }
     ])).toEqual([
-      { id: "resource:one", kind: "resource", reference: "one", label: "One", token: "@One" },
+      resource,
       { id: "message:s1:e1", kind: "message", reference: "m1", label: "Task", sessionId: "s1", role: "assistant", sourceEventId: "e1" }
     ]);
+  });
+
+  it("rejects an old resource mention shape at the durable new-task draft boundary", () => {
+    const current = normalizeNewSessionLocalDraft({
+      selection: { kind: "target", targetId: "target-1" },
+      nativeStart: { kind: "fresh" },
+      providerId: "",
+      modelId: "",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false,
+      text: "@One",
+      editorDocument: plainTextToComposerDocument("@One"),
+      mentions: [{ id: "resource:one", kind: "resource", reference: "one", label: "One", token: "@One" }],
+      inlineMentionRanges: [{ mentionId: "resource:one", from: 0, to: 4 }],
+      attachments: []
+    });
+    expect(current).toBeUndefined();
   });
 
   it("drops malformed message references from untrusted IndexedDB data", () => {

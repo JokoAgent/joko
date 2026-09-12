@@ -10,6 +10,7 @@ import {
   evaluateOrderedPolicyRules,
   NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD,
   redactSecrets,
+  validInputMentionRanges,
   type ApprovedDirectory,
   type AdapterContext,
   type AdapterEventMetadata,
@@ -124,6 +125,7 @@ import {
   type PiNativeHistoryEntry
 } from "./native-history.js";
 import {
+  assertRuntimeResourceRevision,
   snapshotApprovedProjectResources,
   snapshotManagedRuntimeResources,
   type PiManagedRuntimeResourceSnapshot,
@@ -165,6 +167,7 @@ const PI_LONG_RUNNING_RPC_TIMEOUT_MS = 10 * 60_000;
 /** Pi's native Bash timeout is capped at thirty minutes. Keep RPC ownership
  * for the same bounded interval and refresh it only on native Bash progress. */
 const PI_USER_SHELL_RPC_TIMEOUT_MS = 30 * 60_000;
+const MAXIMUM_REFERENCED_RESOURCE_TEXT_BYTES = 256 * 1024;
 const BUNDLED_PI_CLI = join(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "cli.js");
 const EXTERNAL_SESSION_REFERENCE_PREFIX = "pi-external-session:";
 const DEFAULT_APPEND_SYSTEM_PROMPT =
@@ -1098,9 +1101,11 @@ export class PiBackendAdapter implements BackendAdapter {
     onVisionStart: () => void,
     persistFence?: (preparation: DurableNativeDispatchPreparation) => Promise<void>
   ): Promise<void> {
-    if (input.mentions.some((mention) => mention.kind === "workspace_directory" || mention.lineRange !== undefined)) {
-      throw piError("PI_MENTION_KIND_UNSUPPORTED", "Directory and source line range mentions are unavailable for this native input", "dispatch", {
-        recovery: "Choose a regular workspace file mention."
+    if (input.mentions.some((mention) =>
+      (mention.kind !== "workspace_file" && mention.kind !== "resource")
+      || mention.kind === "workspace_file" && mention.lineRange !== undefined)) {
+      throw piError("PI_MENTION_KIND_UNSUPPORTED", "This native input supports regular workspace files and loaded task resources", "dispatch", {
+        recovery: "Choose a regular workspace file or a resource from this task's current loaded catalog."
       });
     }
     const runtime = this.#runtime(context);
@@ -2329,6 +2334,7 @@ export class PiBackendAdapter implements BackendAdapter {
 
   async fork(entryId: string, context: AdapterContext, derivation: NativeSessionDerivation): Promise<NativeSessionForkResult> {
     this.#assertReviewOperationAllowed(context, "fork native history");
+    assertPiDerivationTarget(context, derivation);
     if (!entryId) throw piError("PI_FORK_ENTRY_REQUIRED", "Native fork entry id is required", "dispatch");
     const runtime = this.#runtime(context);
     return this.#runExclusiveSessionMutation(runtime, context, async () => {
@@ -2492,6 +2498,7 @@ export class PiBackendAdapter implements BackendAdapter {
 
   async clone(context: AdapterContext, derivation: NativeSessionDerivation): Promise<NativeSessionBinding> {
     this.#assertReviewOperationAllowed(context, "clone native history");
+    assertPiDerivationTarget(context, derivation);
     const runtime = this.#runtime(context);
     return this.#runExclusiveSessionMutation(runtime, context, async () => {
       const sourceBinding = runtime.binding;
@@ -5179,7 +5186,9 @@ export class PiBackendAdapter implements BackendAdapter {
 
   async #composePrompt(input: PromptInput, context: AdapterContext, options: PiAdapterOptions): Promise<string> {
     const sections: string[] = [];
-    if (input.text.trim()) sections.push(input.text);
+    const resourceBlocks = await this.#resolveResourceMentionBlocks(input, context, options);
+    const projected = projectResourceMentionText(input, resourceBlocks);
+    if (projected.text.trim()) sections.push(projected.text);
     const attachments: string[] = [];
     for (const file of input.files) {
       let path: string;
@@ -5208,11 +5217,80 @@ export class PiBackendAdapter implements BackendAdapter {
       attachments.push(`- file: ${path}`);
     }
     for (const mention of input.mentions) {
+      if (mention.kind === "resource") continue;
       attachments.push(`- ${mention.kind}: ${mention.label} -> ${mention.reference}`);
     }
     if (attachments.length > 0) sections.push(`[Joko resolved resources]\n${attachments.join("\n")}`);
+    sections.push(...projected.supplemental);
     if (sections.length === 0 && input.images.length === 0) throw piError("PI_PROMPT_EMPTY", "Pi prompt has no text, image, file, or mention content", "dispatch");
     return sections.join("\n\n");
+  }
+
+  async #resolveResourceMentionBlocks(
+    input: PromptInput,
+    context: AdapterContext,
+    options: PiAdapterOptions
+  ): Promise<ReadonlyMap<number, string>> {
+    const requested = input.mentions.flatMap((mention, index) => mention.kind === "resource" ? [{ mention, index }] : []);
+    if (requested.length === 0) return new Map();
+    const runtime = this.#runtime(context);
+    const commandCatalog = await this.#readCommandCatalog(runtime, context);
+    const tools = await this.getRuntimeTools(context).then((catalog) => catalog.tools).catch(() => []);
+    const blocks = new Map<number, string>();
+    const resolved = new Map<string, string>();
+    for (const { mention, index } of requested) {
+      const cacheKey = `${mention.reference}\0${mention.discoveredRevision}\0${mention.resourceVersion}\0${mention.runtimeGeneration}`;
+      let block = resolved.get(cacheKey);
+      if (block === undefined) {
+        if (
+          mention.reference.length === 0 || mention.reference.length > 4_096
+          || mention.discoveredRevision.length === 0 || mention.discoveredRevision.length > 4_096
+          || mention.resourceVersion.length > 20
+          || !/^[1-9][0-9]*$/u.test(mention.resourceVersion)
+          || BigInt(mention.resourceVersion) > 18_446_744_073_709_551_615n
+          || !Number.isSafeInteger(mention.runtimeGeneration)
+          || mention.runtimeGeneration !== runtime.transport.generation
+        ) {
+          throw piError("PI_RESOURCE_MENTION_IDENTITY_INVALID", "Resource mention identity is incomplete or invalid", "dispatch", {
+            recovery: "Select the resource again from this task's current loaded catalog."
+          });
+        }
+        const matches = runtime.resources.filter((resource) => resource.id === mention.reference);
+        const resource = matches.length === 1 ? matches[0] : undefined;
+        if (
+          resource === undefined
+          || resource.revision !== mention.discoveredRevision
+          || resource.resourceVersion?.toString(10) !== mention.resourceVersion
+          || resource.runtimePath === undefined
+          || !isAbsolute(resource.runtimePath)
+          || !samePathOrContained(join(runtime.runtimeDirectory, "resources"), resource.runtimePath)
+          || !isRuntimeResourceProvenLoaded(resource, commandCatalog.commands, tools)
+        ) {
+          throw piError("PI_RESOURCE_MENTION_STALE", "The referenced resource is not the exact version loaded by this task runtime", "dispatch", {
+            recovery: "Refresh the task resource catalog and select the loaded resource again."
+          });
+        }
+        await assertRuntimeResourceRevision(
+          resource.runtimePath,
+          mention.discoveredRevision,
+          options.managedResourceMaxFiles,
+          options.managedResourceMaxBytes
+        );
+        block = await resolvedRuntimeResourceBlock(resource, commandCatalog.commands, tools);
+        // Bracket semantic extraction with the same content proof. A loaded
+        // extension runs in-process and must not be able to rewrite its copy
+        // between verification and prompt construction without detection.
+        await assertRuntimeResourceRevision(
+          resource.runtimePath,
+          mention.discoveredRevision,
+          options.managedResourceMaxFiles,
+          options.managedResourceMaxBytes
+        );
+        resolved.set(cacheKey, block);
+      }
+      blocks.set(index, block);
+    }
+    return blocks;
   }
 
   #baseEnvironment(): NodeJS.ProcessEnv {
@@ -5322,6 +5400,7 @@ export class PiBackendAdapter implements BackendAdapter {
           return [key, {
             key,
             supported: true,
+            ...(key === "input.mention" ? { options: ["workspace_file", "resource"] } : {}),
             ...(key === "permission.modes" ? { options: ["ask", "auto", "bypassPermissions"] } : {})
           }];
         }
@@ -6603,6 +6682,156 @@ export function isRuntimeResourceProvenLoaded(
   return tools.some((tool) =>
     isAbsolute(tool.sourceInfo.path) && samePathOrContained(resource.runtimePath!, tool.sourceInfo.path)
   );
+}
+
+function assertPiDerivationTarget(context: AdapterContext, derivation: NativeSessionDerivation): void {
+  const source = context.target;
+  const target = derivation.target;
+  const sameWorkspace = source.remoteWorkspace === undefined
+    ? target.remoteWorkspace === undefined && samePath(source.workspaceRoot, target.workspaceRoot)
+    : target.remoteWorkspace?.hostId === source.remoteWorkspace.hostId
+      && target.remoteWorkspace.workspaceRoot === source.remoteWorkspace.workspaceRoot
+      && target.workspaceRoot === source.workspaceRoot;
+  if (target.id === source.id
+    && target.backendId === source.backendId
+    && target.managed === source.managed
+    && target.trusted === source.trusted
+    && sameWorkspace) return;
+  throw piError(
+    "PI_DERIVED_WORKSPACE_UNSUPPORTED",
+    "Pi cannot copy native history into a different workspace without rewriting its transcript workspace",
+    "session",
+    {
+      recovery: "Use the source workspace or a Backend that advertises workspace.derive."
+    }
+  );
+}
+
+function projectResourceMentionText(
+  input: PromptInput,
+  blocks: ReadonlyMap<number, string>
+): { readonly text: string; readonly supplemental: readonly string[] } {
+  if (blocks.size === 0) return { text: input.text, supplemental: [] };
+  const ranges = input.mentionRanges ?? [];
+  if (!validInputMentionRanges(input.text, input.mentions, ranges, input.pastedTextRanges ?? [])) {
+    throw piError("PI_MENTION_RANGE_INVALID", "Resource mention ranges do not match the accepted input", "dispatch", {
+      recovery: "Restore the exact task draft and select the resource again."
+    });
+  }
+  const selected = ranges.filter((range) => blocks.has(range.mentionIndex));
+  const represented = new Set<number>();
+  const text: string[] = [];
+  let cursor = 0;
+  for (const range of selected) {
+    text.push(input.text.slice(cursor, range.start));
+    text.push(`\n\n${blocks.get(range.mentionIndex)!}\n\n`);
+    represented.add(range.mentionIndex);
+    cursor = range.end;
+  }
+  text.push(input.text.slice(cursor));
+  return {
+    text: text.join(""),
+    supplemental: [...blocks.entries()]
+      .filter(([index]) => !represented.has(index))
+      .map(([, block]) => block)
+  };
+}
+
+async function resolvedRuntimeResourceBlock(
+  resource: RuntimeResource,
+  commands: readonly RuntimeCommand[],
+  tools: readonly PiRuntimeToolDescriptor[]
+): Promise<string> {
+  const header = [
+    "[Joko loaded resource]",
+    `Name: ${JSON.stringify(resource.name)}`,
+    `Kind: ${resource.kind}`,
+    `Resource ID: ${JSON.stringify(resource.id)}`,
+    `Content revision: ${JSON.stringify(resource.revision)}`,
+    `Entity revision: ${resource.resourceVersion?.toString(10) ?? ""}`
+  ];
+  let semantic: string[];
+  if (resource.kind === "prompt" || resource.kind === "skill") {
+    const root = resource.runtimePath!;
+    const info = await lstat(root).catch((error) => {
+      throw piError("PI_RESOURCE_CONTENT_UNAVAILABLE", "Loaded resource content is unavailable", "dispatch", { cause: error });
+    });
+    const contentPath = resource.kind === "prompt"
+      ? root
+      : info.isDirectory() && !info.isSymbolicLink() ? join(root, "SKILL.md") : root;
+    const content = await readBoundedRuntimeResourceText(contentPath, root);
+    semantic = ["Content:", content, "[End content]"];
+  } else if (resource.kind === "extension") {
+    const matchingCommands = commands.filter((command) =>
+      command.loaded && command.path !== undefined && isAbsolute(command.path)
+      && samePathOrContained(resource.runtimePath!, command.path)
+    );
+    const matchingTools = tools.filter((tool) =>
+      isAbsolute(tool.sourceInfo.path) && samePathOrContained(resource.runtimePath!, tool.sourceInfo.path)
+    );
+    semantic = [
+      "Runtime commands:",
+      ...(matchingCommands.length === 0
+        ? ["(none)"]
+        : matchingCommands.map((command) => `- /${command.name}: ${command.description}`)),
+      "Runtime tools:",
+      ...(matchingTools.length === 0
+        ? ["(none)"]
+        : matchingTools.map((tool) => {
+            const guidance = tool.promptGuidelines.length === 0 ? "" : ` Guidance: ${tool.promptGuidelines.join(" ")}`;
+            return `- ${tool.name}: ${tool.description}${guidance}`;
+          }))
+    ];
+  } else {
+    throw piError("PI_RESOURCE_MENTION_KIND_UNSUPPORTED", "Loaded packages cannot be referenced as one semantic resource", "dispatch", {
+      recovery: "Select an individually loaded prompt, skill, or extension."
+    });
+  }
+  const block = [...header, ...semantic, "[/Joko loaded resource]"].join("\n");
+  if (Buffer.byteLength(block, "utf8") > MAXIMUM_REFERENCED_RESOURCE_TEXT_BYTES) {
+    throw piError("PI_RESOURCE_CONTENT_TOO_LARGE", "Referenced resource content exceeds the native input limit", "dispatch", {
+      recovery: "Reduce the resource instructions and approve a new revision."
+    });
+  }
+  return block;
+}
+
+async function readBoundedRuntimeResourceText(path: string, root: string): Promise<string> {
+  if (!isAbsolute(path) || !samePathOrContained(root, path)) {
+    throw piError("PI_RESOURCE_CONTENT_PATH_INVALID", "Loaded resource content path escaped its immutable snapshot", "dispatch");
+  }
+  const before = await lstat(path).catch((error) => {
+    throw piError("PI_RESOURCE_CONTENT_UNAVAILABLE", "Loaded resource content is unavailable", "dispatch", { cause: error });
+  });
+  if (!before.isFile() || before.isSymbolicLink() || before.size > MAXIMUM_REFERENCED_RESOURCE_TEXT_BYTES) {
+    throw piError("PI_RESOURCE_CONTENT_UNSAFE", "Loaded resource content must be a bounded regular file", "dispatch", {
+      recovery: "Approve a regular UTF-8 prompt or skill document within the input limit."
+    });
+  }
+  const canonical = await realpath(path);
+  if (!samePathOrContained(root, canonical) || !samePathOrContained(canonical, path)) {
+    throw piError("PI_RESOURCE_CONTENT_PATH_INVALID", "Loaded resource content uses a path alias", "dispatch");
+  }
+  const bytes = await readFile(canonical);
+  const after = await stat(canonical);
+  if (
+    !after.isFile() || before.dev !== after.dev
+    || before.ino !== 0 && after.ino !== 0 && before.ino !== after.ino
+    || before.size !== after.size || before.mtimeMs !== after.mtimeMs
+  ) {
+    throw piError("PI_RESOURCE_RUNTIME_CHANGED", "Loaded resource content changed while it was read", "dispatch", {
+      retryable: true,
+      recovery: "Retry after the task runtime resource snapshot is stable."
+    });
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch (error) {
+    throw piError("PI_RESOURCE_CONTENT_ENCODING_INVALID", "Loaded resource content is not valid UTF-8", "dispatch", {
+      cause: error,
+      recovery: "Approve a UTF-8 prompt or skill document."
+    });
+  }
 }
 
 function cloneRuntimeToolCatalog(catalog: PiRuntimeToolCatalog): PiRuntimeToolCatalog {

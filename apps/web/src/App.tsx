@@ -21,7 +21,7 @@ import {
   navigationVisualWidth,
   type NavigationMode
 } from "./navigation-layout.js";
-import { BulkDeleteSessionDialog, DeleteSessionDialog, RenameSessionDialog } from "./components/SessionDialogs.js";
+import { ArchiveSessionDialog, BulkDeleteSessionDialog, DeleteSessionDialog, RenameSessionDialog } from "./components/SessionDialogs.js";
 import { NewSessionPage } from "./components/NewSessionPage.js";
 import { DesktopWindowControls } from "./components/DesktopWindowControls.js";
 import { DesktopPageSearchBar } from "./components/DesktopPageSearchBar.js";
@@ -47,6 +47,7 @@ import {
   type DesktopApplicationMenuPreferenceView
 } from "./desktop-application-menu.js";
 import { useAppShortcut } from "./use-app-shortcut.js";
+import { useGamepadInput } from "./gamepad-client.js";
 import { isStartupUpdateInteractionBlocked } from "./startup-update-interaction.js";
 import { promptRecommendationOwnerKey, promptRecommendationStore } from "./prompt-recommendation-store.js";
 import { visionBridgeToastStore } from "./vision-bridge-toast-store.js";
@@ -94,6 +95,11 @@ import {
 } from "./session-project-navigation.js";
 import { isRuntimeProcessMonitorWindow } from "./runtime-process-monitor-window.js";
 import { createProviderModelRefreshLifecycle } from "./provider-model-refresh-lifecycle.js";
+import {
+  prefetchWorktreeRemovalPreflight,
+  summarizeWorktreeRemovalPreflights,
+  type WorktreeRemovalPreflightSummary
+} from "./worktree-removal-preflight.js";
 
 const SessionPane = lazy(async () => ({ default: (await import("./components/SessionPane.js")).SessionPane }));
 const Inspector = lazy(async () => ({ default: (await import("./components/Inspector.js")).Inspector }));
@@ -120,6 +126,12 @@ interface NavigationDragState {
   readonly startWidth: number;
   readonly visualWidth: number;
   readonly mode: Exclude<NavigationMode, "hidden">;
+}
+
+interface SessionRemovalDialogRequest {
+  readonly sessions: readonly SessionView[];
+  readonly preflight: WorktreeRemovalPreflightSummary;
+  readonly onArchived?: () => void;
 }
 
 interface DesktopApplicationMenuActionTarget {
@@ -166,8 +178,8 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const sessionApplicationWindow = typeof window !== "undefined" && isSessionApplicationWindow(window.location);
   const t = useCallback((key: Parameters<typeof translate>[1], values?: Parameters<typeof translate>[2]) => translate(state.preferences.locale, key, values), [state.preferences.locale]);
   const [renameSession, setRenameSession] = useState<SessionView>();
-  const [deleteSession, setDeleteSession] = useState<SessionView>();
-  const [bulkDeleteSessions, setBulkDeleteSessions] = useState<readonly SessionView[]>([]);
+  const [archiveRemoval, setArchiveRemoval] = useState<SessionRemovalDialogRequest>();
+  const [deleteRemoval, setDeleteRemoval] = useState<SessionRemovalDialogRequest>();
   const [actionError, setActionError] = useState<string>();
   const [applicationMenuNotice, setApplicationMenuNotice] = useState<(DesktopUpdateCheckNotice & { readonly id: number })>();
   const [busyAction, setBusyAction] = useState<string>();
@@ -264,9 +276,18 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const loadingMessageDeepLinkRef = useRef<string | undefined>(undefined);
   const currentMessageDeepLinkRef = useRef<string | undefined>(undefined);
   const portableImportRequestIdRef = useRef(0);
+  const removalRequestGenerationRef = useRef(0);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const controllerRef = useRef(controller);
   controllerRef.current = controller;
+  const removalOwnerId = !state.ready || state.connectionState !== "connected" || state.activeProfile === undefined
+    ? undefined
+    : JSON.stringify([state.activeProfile.serverId, state.activeProfile.id]);
+  useEffect(() => {
+    removalRequestGenerationRef.current += 1;
+    setArchiveRemoval(undefined);
+    setDeleteRemoval(undefined);
+  }, [removalOwnerId]);
   const providerModelRefreshLifecycleRef = useRef<ReturnType<typeof createProviderModelRefreshLifecycle> | undefined>(undefined);
   providerModelRefreshLifecycleRef.current ??= createProviderModelRefreshLifecycle({
     refresh: async () => {
@@ -993,6 +1014,26 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     navigateFromShortcut({ kind: "newSession" });
     return true;
   });
+  useGamepadInput(`${state.activeProfile?.id ?? ""}:${state.connectionState}:${appRouteHash(state.route)}:${focusedSplitSessionId ?? activeSession?.id ?? ""}:${activeSession?.generation ?? ""}`, (action) => {
+    if (!state.ready || document.body.classList.contains("modal-open")) return;
+    if (action === "new-task") { navigateFromShortcut({ kind: "newSession" }); return; }
+    if (action === "open-settings") { navigateFromShortcut({ kind: "settings" }); return; }
+    if (action === "toggle-sidebar") { setWindowNavigationOpen(!effectiveNavigationOpen); return; }
+    if (action === "toggle-inspector") {
+      if (state.route.kind === "session" && activeSession !== undefined && activeReviewerRun === undefined) runAction("gamepad-inspector", () => controller.setInspectorOpen(!inspectorOpen));
+      return;
+    }
+    if (state.connectionState !== "connected") return;
+    if (action !== "previous-task" && action !== "next-task") return;
+    const visible = [...document.querySelectorAll<HTMLElement>(".sidebar [data-session-id], .workspace-session-tabs-bar [data-session-id]")]
+      .filter((element) => element.getClientRects().length > 0 && element.closest("[aria-hidden='true'], [inert]") === null);
+    const ids = [...new Set(visible.map((element) => element.dataset.sessionId).filter((id): id is string => id !== undefined))];
+    if (ids.length === 0) return;
+    const selected = state.route.kind === "session" || state.route.kind === "files" ? state.route.sessionId : undefined;
+    const index = selected === undefined ? -1 : ids.indexOf(selected);
+    const sessionId = ids[index === -1 ? 0 : (index + (action === "previous-task" ? -1 : 1) + ids.length) % ids.length];
+    if (sessionId !== undefined && sessionId !== selected) navigateFromShortcut({ kind: "session", sessionId });
+  });
   useAppShortcut("toggle-sidebar", shortcutOverrides, (event) => {
     if (shortcutBlocked(event)) return false;
     const editable = event.target instanceof Element ? event.target.closest<HTMLElement>("[contenteditable='true']") : null;
@@ -1231,18 +1272,9 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       }}
       onRename={() => setRenameSession(activeSession)}
       onPin={() => runAction(`pin:${activeSession.id}`, () => controller.pinSession(activeSession.id, !activeSession.pinned))}
-      onArchive={() => runAction(`archive:${activeSession.id}`, async () => {
-        const archive = !activeSession.archived;
-        if (archive && !(await requestWorkspaceDocumentLeave({ reason: "switch-session", matches: (identity) => identity.sessionId === activeSession.id }))) return;
-        await controller.archiveSession(activeSession.id, archive);
-        if (!archive) return;
-        if (sessionSplitPanes(sessionSplitLayout.root).some((pane) => pane.sessionId === activeSession.id)) {
-          closeSessionSplitPane(activeSession.id);
-        } else {
-          controller.navigate({ kind: "session" });
-        }
-      })}
-      onDelete={() => setDeleteSession(activeSession)}
+      onArchive={() => requestArchiveSession(activeSession)}
+      onPrefetchRemoval={() => prefetchRemoval(activeSession)}
+      onDelete={() => requestDeleteSessions([activeSession])}
       onMoveSessionProject={(placement) => moveTaskToProject(activeSession, placement)}
       movingSessionProject={movingSessionProjectIds.has(activeSession.id)}
       onCopyTaskLink={() => copyTaskLink(activeSession)}
@@ -1286,14 +1318,110 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     setFocusedSplitSessionId(replacement);
     if (replacement !== undefined) controller.navigate({ kind: "session", sessionId: replacement });
   };
-  const removeSessionsFromNavigation = (sessions: readonly SessionView[]): void => {
+  const removeSessionsFromNavigation = (
+    sessions: readonly SessionView[],
+    navigateAfterRemoval = true
+  ): void => {
     const removed = new Set(sessions.map((session) => session.id));
     let nextLayout = sessionSplitLayout;
     for (const sessionId of removed) nextLayout = removeSessionSplit(nextLayout, sessionId);
     if (nextLayout !== sessionSplitLayout) commitSessionSplitLayout(nextLayout);
-    if (activeSession === undefined || !removed.has(activeSession.id)) return;
+    if (!navigateAfterRemoval || activeSession === undefined || !removed.has(activeSession.id)) return;
     const replacement = sessionSplitPanes(nextLayout.root)[0]?.sessionId;
     controller.navigate(replacement === undefined ? { kind: "session" } : { kind: "session", sessionId: replacement });
+  };
+  const prepareWorktreeRemoval = async (
+    sessions: readonly SessionView[]
+  ): Promise<WorktreeRemovalPreflightSummary | undefined> => {
+    const ownerId = removalOwnerId;
+    if (ownerId === undefined) return undefined;
+    const requestGeneration = ++removalRequestGenerationRef.current;
+    const preflight = await summarizeWorktreeRemovalPreflights(
+      ownerId,
+      sessions.map((session) => session.id),
+      (sessionId) => controllerRef.current.getSessionWorktreeRemovalPreview(sessionId)
+    );
+    const currentState = controllerRef.current.state;
+    const currentOwnerId = !currentState.ready || currentState.connectionState !== "connected" || currentState.activeProfile === undefined
+      ? undefined
+      : JSON.stringify([currentState.activeProfile.serverId, currentState.activeProfile.id]);
+    if (removalRequestGenerationRef.current !== requestGeneration || currentOwnerId !== ownerId) return undefined;
+    return preflight;
+  };
+  const prefetchRemoval = (session: SessionView): void => {
+    const ownerId = removalOwnerId;
+    if (ownerId === undefined || session.archived) return;
+    prefetchWorktreeRemovalPreflight(
+      ownerId,
+      session.id,
+      (sessionId) => controllerRef.current.getSessionWorktreeRemovalPreview(sessionId)
+    );
+  };
+  const archiveSessionsNow = async (
+    sessions: readonly SessionView[],
+    onArchived?: () => void
+  ): Promise<void> => {
+    for (const session of sessions) await controller.archiveSession(session.id, true);
+    removeSessionsFromNavigation(sessions, onArchived === undefined);
+    onArchived?.();
+  };
+  const requestArchiveSessions = (
+    sessions: readonly SessionView[],
+    onArchived?: () => void
+  ): void => {
+    const batch = uniqueSessions(sessions).filter((session) => !session.archived);
+    if (batch.length === 0) return;
+    runAction(`archive-preflight:${batch.map((session) => session.id).join(",")}`, async () => {
+      const removed = new Set(batch.map((session) => session.id));
+      if (state.route.kind === "files" && activeSession !== undefined && removed.has(activeSession.id)) {
+        const allowed = await requestWorkspaceDocumentLeave({
+          reason: "switch-session",
+          matches: (identity) => removed.has(identity.sessionId)
+        });
+        if (!allowed) return;
+      }
+      const preflight = await prepareWorktreeRemoval(batch);
+      if (preflight === undefined) return;
+      if (preflight.dirty > 0 || preflight.unknown > 0) {
+        setArchiveRemoval({
+          sessions: batch,
+          preflight,
+          ...(onArchived === undefined ? {} : { onArchived })
+        });
+        return;
+      }
+      await archiveSessionsNow(batch, onArchived);
+    });
+  };
+  const requestArchiveSession = (session: SessionView, onArchived?: () => void): void => {
+    if (!session.archived) {
+      requestArchiveSessions([session], onArchived);
+      return;
+    }
+    runAction(`unarchive:${session.id}`, () => controller.archiveSession(session.id, false));
+  };
+  const requestDeleteSessions = (sessions: readonly SessionView[]): void => {
+    const batch = uniqueSessions(sessions);
+    if (batch.length === 0) return;
+    runAction(`delete-preflight:${batch.map((session) => session.id).join(",")}`, async () => {
+      const preflight = await prepareWorktreeRemoval(batch);
+      if (preflight !== undefined) setDeleteRemoval({ sessions: batch, preflight });
+    });
+  };
+  const deleteSessionsNow = async (
+    sessions: readonly SessionView[],
+    deleteNative: boolean
+  ): Promise<void> => {
+    const removed = new Set(sessions.map((session) => session.id));
+    if (state.route.kind === "files" && activeSession !== undefined && removed.has(activeSession.id)) {
+      const allowed = await requestWorkspaceDocumentLeave({
+        reason: "switch-session",
+        matches: (identity) => removed.has(identity.sessionId)
+      });
+      if (!allowed) return;
+    }
+    for (const session of sessions) await controller.deleteSession(session.id, deleteNative);
+    removeSessionsFromNavigation(sessions);
   };
   const copyTaskLink = (session: SessionView): void => {
     let link: string;
@@ -1410,12 +1538,9 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       onOpenNavigation={() => setWindowNavigationOpen(true)}
       onRename={setRenameSession}
       onPin={(session) => runAction(`pin:${session.id}`, () => controller.pinSession(session.id, !session.pinned))}
-      onArchive={(session) => runAction(`archive:${session.id}`, async () => {
-        const archive = !session.archived;
-        await controller.archiveSession(session.id, archive);
-        if (archive) closeSessionSplitPane(session.id);
-      })}
-      onDelete={setDeleteSession}
+      onArchive={requestArchiveSession}
+      onPrefetchRemoval={prefetchRemoval}
+      onDelete={(session) => requestDeleteSessions([session])}
       onMoveSessionProject={moveTaskToProject}
       movingSessionProject={movingSessionProjectIds.has(sessionId)}
       onCopyTaskLink={copyTaskLink}
@@ -1512,28 +1637,21 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         onPinTarget={(target) => runAction(`project-pin:${target.id}`, () => controller.updateTarget(target.id, { pinned: !target.pinned }, target.revision))}
         onRenameTarget={(target, name) => runAction(`project-rename:${target.id}`, () => controller.updateTarget(target.id, { name }, target.revision))}
         onRemoveTarget={(target) => runAction(`project-archive:${target.id}`, () => controller.archiveTarget(target.id, true))}
-        onSetTargetSessionsArchived={(target, sessions, archived) => runAction(`project-${archived ? "archive" : "unarchive"}-all:${target.id}`, async () => {
-          for (const session of sessions) await controller.archiveSession(session.id, archived);
-          if (archived) removeSessionsFromNavigation(sessions);
-        })}
-        onCopyTargetLink={copyTargetLink}
-        onArchive={(session) => runAction(`archive:${session.id}`, async () => {
-          const archive = !session.archived;
-          await controller.archiveSession(session.id, archive);
-          if (archive && sessionSplitPanes(sessionSplitLayout.root).some((pane) => pane.sessionId === session.id)) {
-            closeSessionSplitPane(session.id);
+        onSetTargetSessionsArchived={(target, sessions, archived) => {
+          if (archived) {
+            requestArchiveSessions(sessions);
+            return;
           }
-        })}
-        onDelete={setDeleteSession}
-        onBulkArchive={(sessions) => {
-          const batch = sessions.filter((session) => !session.archived);
-          if (batch.length === 0) return;
-          runAction(`bulk-archive:${batch.map((session) => session.id).join(",")}`, async () => {
-            for (const session of batch) await controller.archiveSession(session.id, true);
-            removeSessionsFromNavigation(batch);
+          runAction(`project-unarchive-all:${target.id}`, async () => {
+            for (const session of sessions) await controller.archiveSession(session.id, false);
           });
         }}
-        onBulkDelete={setBulkDeleteSessions}
+        onCopyTargetLink={copyTargetLink}
+        onArchive={requestArchiveSession}
+        onPrefetchRemoval={prefetchRemoval}
+        onDelete={(session) => requestDeleteSessions([session])}
+        onBulkArchive={requestArchiveSessions}
+        onBulkDelete={requestDeleteSessions}
         onCopyTaskLink={copyTaskLink}
         onExportPortableSession={setPortableExportSession}
         onSplitSession={(session, side) => {
@@ -1550,7 +1668,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         onSidebarOwnerLayoutChange={(patch) => { void controller.setSidebarOwnerLayout(patch); }}
         onRunSchedule={(schedule) => runSidebarScheduleAction(() => controller.runSchedule(schedule.id))}
         onToggleSchedule={(schedule) => runSidebarScheduleAction(() => controller.setScheduleEnabled(schedule.id, !schedule.enabled))}
-        onPreviewScheduleDeletion={(schedule) => prepareScheduleDeletion(controller, schedule, state.snapshot.sessions)}
+        onPreviewScheduleDeletion={(schedule) => prepareScheduleDeletion(controller, schedule, state.snapshot.sessions, prepareWorktreeRemoval)}
         onDeleteSchedule={(schedule, disposition) => runSidebarScheduleAction(async () => {
           const result = await deleteScheduleWithGeneratedSessions(
             controller,
@@ -1613,6 +1731,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
             chatPane={renderActiveSessionPane(true)}
             t={t}
             onError={setActionError}
+            onArchiveSession={requestArchiveSession}
             onSelectionQuote={insertFileSelectionQuote}
             onImageToChat={activeImageAttachments ? insertFileAttachment : undefined}
             navigation={{
@@ -1670,8 +1789,8 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
             onDropSession={addSessionToSplit}
           />)}
           {state.route.kind === "files" && <main className="empty-session-page"><EmptyState icon={<AlertTriangle />} title={t("workspace.filesLoadFailed")} body={t("workspace.noWorkspace")} action={<Button onClick={() => { const sessionId = activeSession?.id; controller.navigate(sessionId === undefined ? { kind: "session" } : { kind: "session", sessionId }); }}>{t("workspace.filesBack")}</Button>} /></main>}
-          {state.route.kind === "schedules" && <SchedulesPage controller={controller} schedules={state.snapshot.schedules} sessions={state.snapshot.sessions} targets={state.snapshot.targets} models={state.snapshot.models} backends={state.snapshot.backends} extraDirectories={state.snapshot.extraDirectories} focusScheduleId={state.route.scheduleId} locale={state.preferences.locale} t={t} runAction={runAction} onOpenNavigation={() => setWindowNavigationOpen(true)} />}
-          {state.route.kind === "projects" && <ProjectsPage controller={controller} snapshot={state.snapshot} focusProjectId={state.route.projectId} t={t} runAction={runAction} onOpenNavigation={() => setWindowNavigationOpen(true)} />}
+          {state.route.kind === "schedules" && <SchedulesPage controller={controller} schedules={state.snapshot.schedules} sessions={state.snapshot.sessions} targets={state.snapshot.targets} models={state.snapshot.models} backends={state.snapshot.backends} extraDirectories={state.snapshot.extraDirectories} focusScheduleId={state.route.scheduleId} locale={state.preferences.locale} t={t} runAction={runAction} onOpenNavigation={() => setWindowNavigationOpen(true)} prepareSessionRemoval={prepareWorktreeRemoval} />}
+          {state.route.kind === "projects" && <ProjectsPage controller={controller} snapshot={state.snapshot} focusProjectId={state.route.projectId} t={t} runAction={runAction} onOpenNavigation={() => setWindowNavigationOpen(true)} prepareSessionRemoval={prepareWorktreeRemoval} />}
           {state.route.kind === "tools" && <ToolsPage controller={controller} snapshot={state.snapshot} locale={state.preferences.locale} t={t} runAction={runAction} onOpenNavigation={() => setWindowNavigationOpen(true)} />}
           {state.route.kind === "settings" && <SettingsPage controller={controller} snapshot={state.snapshot} activeTargetId={settingsTargetIdRef.current} locale={state.preferences.locale} t={t} runAction={runAction} onImportPortableSession={portableImportTargets.length === 0 ? undefined : () => { void choosePortableSessionImport(); }} />}
           </>}
@@ -1697,31 +1816,72 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
           if (session !== undefined) runAction(`rename:${session.id}`, () => controller.renameSession(session.id, name));
         }}
       />
-      <DeleteSessionDialog session={deleteSession} t={t} onClose={() => setDeleteSession(undefined)} onDelete={(deleteNative) => { const session = deleteSession; setDeleteSession(undefined); if (session !== undefined) runAction(`delete:${session.id}`, async () => {
-        if (state.route.kind === "files" && activeSession?.id === session.id) {
-          const allowed = await requestWorkspaceDocumentLeave({ reason: "switch-session", matches: (identity) => identity.sessionId === session.id });
-          if (!allowed) return;
-        }
-        await controller.deleteSession(session.id, deleteNative);
-        const splitContainsSession = sessionSplitPanes(sessionSplitLayout.root)
-          .some((pane) => pane.sessionId === session.id);
-        if (splitContainsSession) closeSessionSplitPane(session.id);
-        else if (activeSession?.id === session.id) controller.navigate({ kind: "session" });
-      }); }} />
-      <BulkDeleteSessionDialog sessions={bulkDeleteSessions} t={t} onClose={() => setBulkDeleteSessions([])} onDelete={(deleteNative) => {
-        const batch = bulkDeleteSessions;
-        setBulkDeleteSessions([]);
-        if (batch.length === 0) return;
-        runAction(`bulk-delete:${batch.map((session) => session.id).join(",")}`, async () => {
-          const removed = new Set(batch.map((session) => session.id));
-          if (state.route.kind === "files" && activeSession !== undefined && removed.has(activeSession.id)) {
-            const allowed = await requestWorkspaceDocumentLeave({ reason: "switch-session", matches: (identity) => removed.has(identity.sessionId) });
-            if (!allowed) return;
-          }
-          for (const session of batch) await controller.deleteSession(session.id, deleteNative);
-          removeSessionsFromNavigation(batch);
-        });
-      }} />
+      <ArchiveSessionDialog
+        sessions={archiveRemoval?.sessions ?? []}
+        preflight={archiveRemoval?.preflight}
+        t={t}
+        onClose={() => {
+          removalRequestGenerationRef.current += 1;
+          setArchiveRemoval(undefined);
+        }}
+        onArchive={() => {
+          const request = archiveRemoval;
+          removalRequestGenerationRef.current += 1;
+          setArchiveRemoval(undefined);
+          if (request !== undefined) runAction(
+            `archive:${request.sessions.map((session) => session.id).join(",")}`,
+            () => archiveSessionsNow(request.sessions, request.onArchived)
+          );
+        }}
+      />
+      <DeleteSessionDialog
+        session={deleteRemoval?.sessions.length === 1 ? deleteRemoval.sessions[0] : undefined}
+        preflight={deleteRemoval?.preflight}
+        t={t}
+        onClose={() => {
+          removalRequestGenerationRef.current += 1;
+          setDeleteRemoval(undefined);
+        }}
+        onDelete={(deleteNative) => {
+          const request = deleteRemoval;
+          if (request === undefined) return;
+          runAction(`delete-confirm:${request.sessions.map((session) => session.id).join(",")}`, async () => {
+            const refreshed = await prepareWorktreeRemoval(request.sessions);
+            if (refreshed === undefined) return;
+            if (!sameWorktreeRemovalSummary(request.preflight, refreshed)) {
+              setDeleteRemoval({ sessions: request.sessions, preflight: refreshed });
+              return;
+            }
+            removalRequestGenerationRef.current += 1;
+            setDeleteRemoval(undefined);
+            await deleteSessionsNow(request.sessions, deleteNative);
+          });
+        }}
+      />
+      <BulkDeleteSessionDialog
+        sessions={deleteRemoval !== undefined && deleteRemoval.sessions.length > 1 ? deleteRemoval.sessions : []}
+        preflight={deleteRemoval?.preflight}
+        t={t}
+        onClose={() => {
+          removalRequestGenerationRef.current += 1;
+          setDeleteRemoval(undefined);
+        }}
+        onDelete={(deleteNative) => {
+          const request = deleteRemoval;
+          if (request === undefined) return;
+          runAction(`bulk-delete-confirm:${request.sessions.map((session) => session.id).join(",")}`, async () => {
+            const refreshed = await prepareWorktreeRemoval(request.sessions);
+            if (refreshed === undefined) return;
+            if (!sameWorktreeRemovalSummary(request.preflight, refreshed)) {
+              setDeleteRemoval({ sessions: request.sessions, preflight: refreshed });
+              return;
+            }
+            removalRequestGenerationRef.current += 1;
+            setDeleteRemoval(undefined);
+            await deleteSessionsNow(request.sessions, deleteNative);
+          });
+        }}
+      />
       <PortableSessionDialogHost
         controller={controller}
         snapshot={state.snapshot}
@@ -1747,7 +1907,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   );
 }
 
-function SplitSessionPaneHost({ controller, sessionId, navigationOpen, t, runAction, onOpenNavigation, onRename, onPin, onArchive, onDelete, onMoveSessionProject, movingSessionProject, onCopyTaskLink, onExportPortableSession, onSplitSession, onOpenSessionWindow, onOpenTurnReview }: {
+function SplitSessionPaneHost({ controller, sessionId, navigationOpen, t, runAction, onOpenNavigation, onRename, onPin, onArchive, onPrefetchRemoval, onDelete, onMoveSessionProject, movingSessionProject, onCopyTaskLink, onExportPortableSession, onSplitSession, onOpenSessionWindow, onOpenTurnReview }: {
   readonly controller: AppController;
   readonly sessionId: string;
   readonly navigationOpen: boolean;
@@ -1757,6 +1917,7 @@ function SplitSessionPaneHost({ controller, sessionId, navigationOpen, t, runAct
   readonly onRename: (session: SessionView) => void;
   readonly onPin: (session: SessionView) => void;
   readonly onArchive: (session: SessionView) => void;
+  readonly onPrefetchRemoval: (session: SessionView) => void;
   readonly onDelete: (session: SessionView) => void;
   readonly onMoveSessionProject: (session: SessionView, placement: SessionProjectNavigationPlacement) => void;
   readonly movingSessionProject: boolean;
@@ -1852,6 +2013,7 @@ function SplitSessionPaneHost({ controller, sessionId, navigationOpen, t, runAct
     onRename={() => onRename(session)}
     onPin={() => onPin(session)}
     onArchive={() => onArchive(session)}
+    onPrefetchRemoval={() => onPrefetchRemoval(session)}
     onDelete={() => onDelete(session)}
     onMoveSessionProject={(placement) => onMoveSessionProject(session, placement)}
     movingSessionProject={movingSessionProject}
@@ -1882,6 +2044,22 @@ function UnavailableScreen({ controller, t, error }: { readonly controller: Retu
 
 function EmptySessionPage({ navigationOpen, t, onOpenNavigation, onNewTask }: { readonly navigationOpen: boolean; readonly t: (key: Parameters<typeof translate>[1]) => string; readonly onOpenNavigation: () => void; readonly onNewTask: () => void }): JSX.Element {
   return <main className="empty-session-page"><header>{!navigationOpen && <IconButton label={t("a11y.openNavigation")} onClick={onOpenNavigation}><Menu aria-hidden="true" /></IconButton>}</header><EmptyState icon={<Sparkles />} title={t("session.emptyTitle")} body={t("session.emptyBody")} action={<Button tone="primary" onClick={onNewTask}><CirclePlus aria-hidden="true" />{t("nav.newTask")}</Button>} /></main>;
+}
+
+function uniqueSessions(sessions: readonly SessionView[]): readonly SessionView[] {
+  const seen = new Set<string>();
+  return sessions.filter((session) => {
+    if (seen.has(session.id)) return false;
+    seen.add(session.id);
+    return true;
+  });
+}
+
+function sameWorktreeRemovalSummary(
+  left: WorktreeRemovalPreflightSummary,
+  right: WorktreeRemovalPreflightSummary
+): boolean {
+  return left.clean === right.clean && left.dirty === right.dirty && left.unknown === right.unknown;
 }
 
 function messageOf(error: unknown, fallback: string): string {

@@ -28,7 +28,7 @@ afterEach(async () => {
 });
 
 describe("RuntimeProcessMonitor", () => {
-  it("keeps formatting and sort defaults aligned with the compact process table", () => {
+  it("uses the compact process table's formatting and sort defaults", () => {
     expect(formatRuntimeProcessCpu(2.25)).toBe("2.3%");
     expect(formatRuntimeProcessCpu(12.6)).toBe("13%");
     expect(formatRuntimeProcessMemory(1536)).toBe("2 MB");

@@ -560,6 +560,7 @@ describe("PiBackendAdapter", () => {
       await expect(adapter.navigateTree({ kind: "session_start" }, false, makeContext(target, []), undefined, navigationAuthority)).rejects.toMatchObject({ publicError: { code: "PI_REWIND_START_UNAVAILABLE" } });
       for (const mention of [
         { kind: "workspace_directory", label: "source", reference: "src" },
+        { kind: "artifact", label: "Export", reference: "artifact-one" },
         { kind: "workspace_file", label: "lines", reference: "src/main.ts", lineRange: { startLine: 1, endLine: 2 } }
       ] as const) {
         await expect(adapter.send({ text: "", images: [], files: [], mentions: [mention], disposition: "prompt" }, makeContext(target, [])))
@@ -1756,6 +1757,7 @@ describe("PiBackendAdapter", () => {
       options: ["ask", "auto", "bypassPermissions"]
     });
     expect(descriptor.capabilities.get("background.tasks")).toMatchObject({ supported: true });
+    expect(descriptor.capabilities.get("input.mention")).toMatchObject({ supported: true, options: ["workspace_file", "resource"] });
     expect(descriptor.capabilities.get("background.tasks.cancel")).toMatchObject({ supported: true });
     for (const capability of [
       "subagents.list",
@@ -1768,6 +1770,7 @@ describe("PiBackendAdapter", () => {
     ]) expect(descriptor.capabilities.get(capability)).toMatchObject({ supported: true });
     expect(descriptor.capabilities.get("session.discovery")).toMatchObject({ supported: true });
     expect(descriptor.capabilities.get("session.portable_transfer")).toMatchObject({ supported: true });
+    expect(descriptor.capabilities.get("workspace.derive")).toMatchObject({ supported: false });
     expect(descriptor.capabilities.get("runtime.user_shell")).toMatchObject({ supported: true });
     expect(descriptor.models).toEqual([expect.objectContaining({ supportsFastMode: false })]);
     const target: TargetDescriptor = {
@@ -1980,7 +1983,20 @@ describe("PiBackendAdapter", () => {
     expect(importedHeader).not.toHaveProperty("parentSession");
     await adapter.deleteNativeSession(importedBinding.opaqueRef);
 
-    const clonedBinding = await adapter.clone(boundContext, { sessionId: "derived-session", recordBinding: vi.fn() });
+    const processCountBeforeRejectedClone = processes.length;
+    await expect(adapter.clone(boundContext, {
+      sessionId: "derived-workspace-session",
+      target: { ...boundContext.target, workspaceRoot: join(boundContext.target.workspaceRoot, "derived-workspace") },
+      recordBinding: vi.fn()
+    })).rejects.toMatchObject({
+      publicError: {
+        code: "PI_DERIVED_WORKSPACE_UNSUPPORTED",
+        stateMayHaveChanged: false
+      }
+    });
+    expect(processes).toHaveLength(processCountBeforeRejectedClone);
+
+    const clonedBinding = await adapter.clone(boundContext, { sessionId: "derived-session", target: boundContext.target, recordBinding: vi.fn() });
     expect(clonedBinding.nativeSessionId).toBe("clone-native");
     expect(clonedBinding.opaqueRef).not.toBe(binding.opaqueRef);
     expect(processes[0]?.commands.some((command) => command.type === "clone" || command.type === "abort")).toBe(false);
@@ -2215,6 +2231,136 @@ describe("PiBackendAdapter", () => {
       expect(events.some((event) => event.type === "extension_status" && event.key === PI_RUNTIME_TOOL_CATALOG_STATUS_KEY)).toBe(false);
     } finally {
       await adapter.dispose();
+    }
+  });
+
+  it("resolves an exact loaded prompt mention from its immutable runtime copy and rejects stale authority", { timeout: 20_000 }, async () => {
+    const agentHome = await mkdtemp(join(tmpdir(), "joko-pi-resource-mention-home-"));
+    const workspace = await mkdtemp(join(tmpdir(), "joko-pi-resource-mention-workspace-"));
+    const resources = await mkdtemp(join(tmpdir(), "joko-pi-resource-mention-source-"));
+    const sourcePath = join(resources, "release.md");
+    const sourceBytes = Buffer.from("Follow the exact release procedure.\n", "utf8");
+    await writeFile(sourcePath, sourceBytes);
+    const revisionHash = createHash("sha256");
+    revisionHash.update(`F\0\0${sourceBytes.byteLength}\0`);
+    revisionHash.update(sourceBytes);
+    const revision = `sha256:${revisionHash.digest("hex")}`;
+    let process!: ScriptedPiProcess;
+    const adapter = createPiAdapter({
+      agentHome,
+      sessionRoot: agentHome,
+      versionProbe: async () => "pi 99.99.99-resource-mention-test",
+      providers: [{
+        id: "local",
+        baseUrl: "http://127.0.0.1:11434/v1",
+        api: "openai-completions",
+        keyless: true,
+        models: [{ id: "test-model", contextWindow: 32_768, maxTokens: 4_096 }]
+      }],
+      managedResources: {
+        extensions: [],
+        skills: [],
+        prompts: [sourcePath],
+        packages: [],
+        resources: [{
+          id: "release-prompt",
+          kind: "prompt",
+          name: "Release",
+          source: "local:release",
+          state: "approved",
+          revision,
+          resourceVersion: 7n,
+          runtimePath: sourcePath
+        }]
+      },
+      processFactory: (spec) => {
+        const runtimePrompt = valuesForArgument(spec.args, "--prompt-template")[0]!;
+        process = new ScriptedPiProcess(spec, {
+          commands: [{
+            name: "release",
+            description: "Use the release procedure",
+            source: "prompt",
+            sourceInfo: { path: runtimePrompt, scope: "temporary" }
+          }]
+        });
+        return process as unknown as PiProcessHandle;
+      }
+    });
+    const target: TargetDescriptor = {
+      id: "resource-mention-target",
+      backendId: "pi",
+      displayName: "Resource mention",
+      workspaceRoot: workspace,
+      managed: true,
+      trusted: false
+    };
+    const context = makeContext(target, []);
+    try {
+      const binding = await adapter.createSession({
+        target,
+        providerId: "local",
+        modelId: "test-model",
+        fastMode: false,
+        permissionMode: "ask"
+      }, context);
+      const bound = { ...context, binding };
+      const loaded = (await adapter.getResources(bound))[0]!;
+      expect(loaded).toMatchObject({
+        id: "release-prompt",
+        state: "loaded",
+        revision,
+        resourceVersion: 7n,
+        runtimeGeneration: 1
+      });
+      const mention = {
+        kind: "resource" as const,
+        label: "Release",
+        reference: "release-prompt",
+        discoveredRevision: revision,
+        resourceVersion: "7",
+        runtimeGeneration: 1
+      };
+      await adapter.send({
+        text: "Use @release now",
+        images: [],
+        files: [],
+        mentions: [mention],
+        mentionRanges: [{ start: 4, end: 12, mentionIndex: 0 }],
+        disposition: "prompt"
+      }, bound);
+      const dispatched = process.commands.findLast((command) => command.type === "prompt");
+      expect(dispatched?.message).toContain("Follow the exact release procedure.");
+      expect(dispatched?.message).toContain("Resource ID: \"release-prompt\"");
+      expect(dispatched?.message).not.toContain("@release");
+
+      const dispatches = process.commands.filter((command) => command.type === "prompt").length;
+      await expect(adapter.send({
+        text: "@release",
+        images: [], files: [],
+        mentions: [{ ...mention, resourceVersion: "8" }],
+        mentionRanges: [{ start: 0, end: 8, mentionIndex: 0 }],
+        disposition: "prompt"
+      }, bound)).rejects.toMatchObject({ publicError: { code: "PI_RESOURCE_MENTION_STALE" } });
+      await expect(adapter.send({
+        text: "@release",
+        images: [], files: [],
+        mentions: [{ ...mention, runtimeGeneration: 2 }],
+        mentionRanges: [{ start: 0, end: 8, mentionIndex: 0 }],
+        disposition: "prompt"
+      }, bound)).rejects.toMatchObject({ publicError: { code: "PI_RESOURCE_MENTION_IDENTITY_INVALID" } });
+
+      await writeFile(loaded.runtimePath!, "Changed after activation.\n");
+      await expect(adapter.send({
+        text: "@release",
+        images: [], files: [],
+        mentions: [mention],
+        mentionRanges: [{ start: 0, end: 8, mentionIndex: 0 }],
+        disposition: "prompt"
+      }, bound)).rejects.toMatchObject({ publicError: { code: "PI_RESOURCE_REVISION_STALE" } });
+      expect(process.commands.filter((command) => command.type === "prompt")).toHaveLength(dispatches);
+    } finally {
+      await adapter.dispose().catch(() => undefined);
+      await Promise.all([agentHome, workspace, resources].map((path) => rm(path, { recursive: true, force: true })));
     }
   });
 
@@ -2538,7 +2684,7 @@ describe("PiBackendAdapter", () => {
       const abortIndex = scripted.commands.findIndex((command) => command.type === "abort");
       expect(clearIndex).toBeGreaterThanOrEqual(0);
       expect(abortIndex).toBe(clearIndex + 1);
-      await expect(adapter.clone(bound, { sessionId: "derived-session", recordBinding: vi.fn() })).resolves.toMatchObject({ opaqueRef: expect.stringContaining("clone-native") });
+      await expect(adapter.clone(bound, { sessionId: "derived-session", target: bound.target, recordBinding: vi.fn() })).resolves.toMatchObject({ opaqueRef: expect.stringContaining("clone-native") });
     } finally {
       await adapter.dispose();
     }
@@ -2720,7 +2866,7 @@ describe("PiBackendAdapter", () => {
         planMode: true
       });
 
-      const deriving = adapter.fork("entry-1", bound, { sessionId: "derived-session", recordBinding: vi.fn() });
+      const deriving = adapter.fork("entry-1", bound, { sessionId: "derived-session", target: bound.target, recordBinding: vi.fn() });
       await vi.waitFor(() => {
         expect(processes[1]?.commands.some((command) => command.type === "fork")).toBe(true);
       });
@@ -4028,7 +4174,7 @@ describe("PiBackendAdapter", () => {
         fastMode: false,
         permissionMode: "ask"
       }, context);
-      const result = await adapter.fork("entry-1", { ...context, binding }, { sessionId: "derived-session", recordBinding: vi.fn() });
+      const result = await adapter.fork("entry-1", { ...context, binding }, { sessionId: "derived-session", target: context.target, recordBinding: vi.fn() });
       expect(result.binding.nativeSessionId).toBe("fork-native");
       expect(result.editorText).toBe(`restore me [REDACTED] ${"x".repeat(70_000)}`);
       expect(result.editorText).toContain("restore me [REDACTED]");
@@ -4103,7 +4249,7 @@ describe("PiBackendAdapter", () => {
         expect(readFileSync(derived.opaqueRef, "utf8")).toContain("fork-native");
         expect(processes[1]?.signalCode).toBeNull();
       });
-      const pendingFork = adapter.fork("stable-user", bound, { sessionId: "derived-session", recordBinding });
+      const pendingFork = adapter.fork("stable-user", bound, { sessionId: "derived-session", target: bound.target, recordBinding });
       await vi.waitFor(() => {
         expect(processes[1]?.commands.some((command) => command.type === "fork")).toBe(true);
       });
@@ -4192,7 +4338,7 @@ describe("PiBackendAdapter", () => {
         expect(readFileSync(derived.opaqueRef, "utf8")).toContain("clone-native");
         expect(processes[1]?.signalCode).toBeNull();
       });
-      const pendingClone = adapter.clone(bound, { sessionId: "derived-session", recordBinding });
+      const pendingClone = adapter.clone(bound, { sessionId: "derived-session", target: bound.target, recordBinding });
       await vi.waitFor(() => {
         expect(processes[1]?.commands.some((command) => command.type === "clone")).toBe(true);
       });
@@ -4262,7 +4408,7 @@ describe("PiBackendAdapter", () => {
         expect(processes[1]?.signalCode).toBeNull();
         throw new Error("Receipt registration unavailable");
       });
-      const derivation = { sessionId: "derived-session", recordBinding };
+      const derivation = { sessionId: "derived-session", target: bound.target, recordBinding };
       await expect(operation === "fork" ? adapter.fork("entry-1", bound, derivation) : adapter.clone(bound, derivation))
         .rejects.toMatchObject({ publicError: { stateMayHaveChanged: true } });
       expect(recordBinding).toHaveBeenCalledTimes(1);
@@ -4332,7 +4478,7 @@ describe("PiBackendAdapter", () => {
       const bound = { ...context, binding };
 
       const recordBinding = vi.fn();
-      await expect(adapter.clone(bound, { sessionId: "derived-session", recordBinding })).rejects.toMatchObject({
+      await expect(adapter.clone(bound, { sessionId: "derived-session", target: bound.target, recordBinding })).rejects.toMatchObject({
         publicError: { code: "PI_SESSION_CLONE_ENTRY_FENCE_CHANGED", stateMayHaveChanged: false }
       });
       expect(recordBinding).not.toHaveBeenCalled();
@@ -4393,7 +4539,7 @@ describe("PiBackendAdapter", () => {
       const bound = { ...context, binding };
       const cancellation = new AbortController();
       const recordBinding = vi.fn();
-      const pendingClone = adapter.clone({ ...bound, signal: cancellation.signal }, { sessionId: "derived-session", recordBinding });
+      const pendingClone = adapter.clone({ ...bound, signal: cancellation.signal }, { sessionId: "derived-session", target: bound.target, recordBinding });
       await vi.waitFor(() => {
         expect(processes[1]?.commands.some((command) => command.type === "clone")).toBe(true);
       });
@@ -4462,7 +4608,7 @@ describe("PiBackendAdapter", () => {
       }, context);
       const bound = { ...context, binding };
 
-      await expect(adapter.fork("entry-1", bound, { sessionId: "derived-session", recordBinding: vi.fn() })).rejects.toMatchObject({
+      await expect(adapter.fork("entry-1", bound, { sessionId: "derived-session", target: bound.target, recordBinding: vi.fn() })).rejects.toMatchObject({
         publicError: { code: "PI_RPC_REJECTED", stateMayHaveChanged: true }
       });
       expect(processes).toHaveLength(2);

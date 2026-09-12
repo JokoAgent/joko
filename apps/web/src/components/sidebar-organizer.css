@@ -1,3 +1,34 @@
+.conversation-search__project-lock {
+  display: flex;
+  align-items: center;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 44%;
+  gap: 2px;
+  padding-left: 6px;
+  border-radius: 999px;
+  background: var(--surface-hover);
+  color: var(--text-soft);
+  font-size: var(--text-11);
+}
+
+.conversation-search__project-lock > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conversation-search__project-lock .icon-button {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 20px;
+}
+
+.conversation-search__project-lock .icon-button svg {
+  width: 12px;
+  height: 12px;
+}
+
 .sidebar-hover-card {
   width: min(380px, calc(100vw - 16px));
   position: fixed;
@@ -734,18 +765,66 @@
   gap: 6px;
 }
 
-.sidebar-view--card.session-section--pinned .session-section__sortable-sessions {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(108px, 1fr));
+.pinned-card-masonry,
+.pinned-card-masonry__layout {
+  width: 100%;
+  min-width: 0;
+}
+
+.pinned-card-masonry__layout.is-animated {
+  animation: pinned-card-layout-enter 140ms ease-out both;
+}
+
+.pinned-card-masonry__flow {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+}
+
+.pinned-card-masonry__columns {
+  display: flex;
+  width: 100%;
   align-items: stretch;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+}
+
+.pinned-card-masonry__wide-lane {
+  width: 100%;
+  min-width: 0;
+  min-height: 1px;
+}
+
+.pinned-card-masonry__column,
+.pinned-card-masonry__single {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 0;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.pinned-card-masonry__column { min-height: 1px; }
+
+@keyframes pinned-card-layout-enter {
+  from { opacity: 0; }
+  to { opacity: 1; }
 }
 
 .sidebar-view--card.session-section--pinned .pinned-project-entry {
-  grid-column: 1 / -1;
   border: 1px solid var(--line);
   border-radius: 12px;
   padding: 4px;
   background: var(--surface-raised);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pinned-card-masonry__layout.is-animated { animation: none; }
 }
 
 .sidebar-view--card .session-row {

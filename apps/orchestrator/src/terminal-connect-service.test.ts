@@ -186,6 +186,39 @@ describe("TerminalService authority and volatile transport", () => {
     expect(f.ptys[0]!.kill).not.toHaveBeenCalled();
   });
 
+  it("fences queued resizing after a policy change while retaining observation and close", async () => {
+    const f = await fixture();
+    const created = await f.service.createTerminal(create(contract.CreateTerminalRequestSchema, { initialPalette: palette, sessionId: "task", requestId: "queued-resize" }), f.context);
+    const reference = { sessionId: "task", terminalId: created.terminal!.id, generation: created.terminal!.generation };
+    const request = create(contract.ResizeTerminalRequestSchema, { ...reference, columns: 92, rows: 28 });
+    let finishResize!: () => void;
+    f.ptys[0]!.resize.mockImplementationOnce(() => new Promise<void>((resolve) => { finishResize = resolve; }));
+    const first = f.service.resizeTerminal(request, f.context);
+    await vi.waitFor(() => expect(f.ptys[0]!.resize).toHaveBeenCalledOnce());
+    const second = f.service.resizeTerminal(create(contract.ResizeTerminalRequestSchema, { ...request, columns: 100 }), f.context);
+    const outcomes = Promise.allSettled([first, second]);
+    vi.spyOn(f.store, "findSessionRuntimePolicy").mockReturnValue({ sessionId: "task", reviewRunId: "review",
+      policy: "review_read_only", sourceLeaseFencingToken: 1n, revision: 1n, createdAt: 1, updatedAt: 1 });
+    finishResize();
+    expect(await outcomes).toMatchObject([
+      { status: "rejected", reason: { code: Code.PermissionDenied } },
+      { status: "rejected", reason: { code: Code.PermissionDenied } }
+    ]);
+    expect(f.ptys[0]!.resize).toHaveBeenCalledTimes(1);
+    expect((await f.service.getTerminal(create(contract.GetTerminalRequestSchema, reference), f.context)).terminal).toMatchObject({ columns: 92, rows: 28 });
+    const appearance = { viewId: "read-only-view", viewRevision: 1n, palette };
+    const stream = f.service.watchTerminal(create(contract.WatchTerminalRequestSchema, { ...reference, appearance }), f.context)[Symbol.asyncIterator]();
+    expect((await stream.next()).value).toMatchObject({ kind: contract.TerminalUpdateKind.RESET, terminal: { columns: 92, rows: 28 } });
+    const observedOutput = stream.next();
+    f.ptys[0]!.output("screen remains observable");
+    expect((await observedOutput).value).toMatchObject({ kind: contract.TerminalUpdateKind.OUTPUT, data: "screen remains observable" });
+    await expect(f.service.updateTerminalAppearance(create(contract.UpdateTerminalAppearanceRequestSchema, { ...reference, appearance }), f.context)).rejects.toMatchObject({ code: Code.PermissionDenied });
+    await expect(f.service.writeTerminal(create(contract.WriteTerminalRequestSchema, { ...reference, writerId: "read-only", inputSequence: 1n, data: "do not execute" }), f.context)).rejects.toMatchObject({ code: Code.PermissionDenied });
+    await stream.return?.();
+    await f.service.closeTerminal(create(contract.CloseTerminalRequestSchema, reference), f.context);
+    expect(f.ptys[0]!.kill).toHaveBeenCalledOnce();
+  });
+
   it("resolves the isolated task directory and rejects unconfigured remote, archived and closing tasks before spawn", async () => {
     const f = await fixture();
     const isolated = join(f.root, "isolated");

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import ts from "typescript";
 
 import {
   DEFAULT_MANAGED_BASH_TIMEOUT_SECONDS,
@@ -66,7 +67,40 @@ describe("managed Pi bridge boundaries", () => {
     });
     expect(Buffer.byteLength(wireRecord, "utf8") + 1).toBeLessThan(DEFAULT_PI_JSONL_RECORD_BYTES);
   });
+
+  it("parses only the current typed question response and preserves explicit Other branches", () => {
+    const parse = managedQuestionResponseParser();
+    const response = JSON.stringify({ answers: {
+      q1: { kind: "single", selection: { kind: "other", text: "q1-option-1" } },
+      q2: { kind: "multiple", choiceIds: ["q2-option-1"], otherText: "q2-option-2" },
+      q3: { kind: "boolean", value: false }
+    } });
+    expect(parse(response)).toEqual({
+      q1: { kind: "single", selection: { kind: "other", text: "q1-option-1" } },
+      q2: { kind: "multiple", choiceIds: ["q2-option-1"], otherText: "q2-option-2" },
+      q3: { kind: "boolean", value: false }
+    });
+    expect(parse(JSON.stringify({ answers: { q1: "q1-option-1" } }))).toBeUndefined();
+    expect(parse(JSON.stringify({ answers: {}, legacy: true }))).toBeUndefined();
+  });
 });
+
+function managedQuestionResponseParser(): (
+  value: string | undefined
+) => Readonly<Record<string, unknown>> | undefined {
+  const start = MANAGED_BRIDGE_SOURCE.indexOf("type QuestionResponseAnswer =");
+  const end = MANAGED_BRIDGE_SOURCE.indexOf("\n\nfunction freezeToolInput", start);
+  if (start < 0 || end < 0) throw new Error("Managed question response parser source is unavailable");
+  const output = ts.transpileModule(MANAGED_BRIDGE_SOURCE.slice(start, end), {
+    compilerOptions: { module: ts.ModuleKind.None, target: ts.ScriptTarget.ES2022 },
+    reportDiagnostics: true
+  });
+  const syntaxErrors = output.diagnostics?.filter((diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error) ?? [];
+  if (syntaxErrors.length > 0) throw new Error("Managed question response parser is invalid TypeScript");
+  return Function(`${output.outputText}\nreturn questionResponse;`)() as (
+    value: string | undefined
+  ) => Readonly<Record<string, unknown>> | undefined;
+}
 
 function managedEnvironmentSanitizer(
   secretEnvironmentNames: readonly string[]

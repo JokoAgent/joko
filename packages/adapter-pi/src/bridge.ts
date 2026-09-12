@@ -166,16 +166,49 @@ function planReviewResponse(value: string | undefined): PlanReviewResponse | und
   }
 }
 
-function questionResponse(value: string | undefined): Record<string, string | boolean | string[]> | undefined {
+type QuestionResponseAnswer =
+  | { kind: "text"; value: string }
+  | { kind: "single"; selection: { kind: "choice"; choiceId: string } | { kind: "other"; text: string } }
+  | { kind: "multiple"; choiceIds: string[]; otherText?: string }
+  | { kind: "boolean"; value: boolean };
+
+function questionResponse(value: string | undefined): Record<string, QuestionResponseAnswer> | undefined {
   if (!value) return undefined;
   try {
-    const parsed = JSON.parse(value) as { answers?: unknown };
-    if (!parsed || !parsed.answers || typeof parsed.answers !== "object" || Array.isArray(parsed.answers)) return undefined;
-    const answers: Record<string, string | boolean | string[]> = {};
-    for (const [key, answer] of Object.entries(parsed.answers as Record<string, unknown>)) {
-      if (typeof answer === "string" || typeof answer === "boolean") answers[key] = answer;
-      else if (Array.isArray(answer) && answer.every((item) => typeof item === "string")) answers[key] = answer as string[];
-      else return undefined;
+    const parsed = JSON.parse(value) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const envelope = parsed as Record<string, unknown>;
+    if (Object.keys(envelope).length !== 1 || !Object.prototype.hasOwnProperty.call(envelope, "answers")
+      || !envelope.answers || typeof envelope.answers !== "object" || Array.isArray(envelope.answers)) return undefined;
+    const answers: Record<string, QuestionResponseAnswer> = {};
+    for (const [key, answer] of Object.entries(envelope.answers as Record<string, unknown>)) {
+      if (!key.trim()) return undefined;
+      if (!answer || typeof answer !== "object" || Array.isArray(answer)) return undefined;
+      const record = answer as Record<string, unknown>;
+      const keys = Object.keys(record);
+      if (record.kind === "text" && keys.length === 2 && keys.includes("kind") && keys.includes("value") && typeof record.value === "string") {
+        answers[key] = { kind: "text", value: record.value };
+      } else if (record.kind === "boolean" && keys.length === 2 && keys.includes("kind") && keys.includes("value") && typeof record.value === "boolean") {
+        answers[key] = { kind: "boolean", value: record.value };
+      } else if (record.kind === "single" && keys.length === 2 && keys.includes("kind") && keys.includes("selection")
+        && record.selection && typeof record.selection === "object" && !Array.isArray(record.selection)) {
+        const selection = record.selection as Record<string, unknown>;
+        const selectionKeys = Object.keys(selection);
+        if (selection.kind === "choice" && selectionKeys.length === 2 && selectionKeys.includes("kind") && selectionKeys.includes("choiceId") && typeof selection.choiceId === "string") {
+          answers[key] = { kind: "single", selection: { kind: "choice", choiceId: selection.choiceId } };
+        } else if (selection.kind === "other" && selectionKeys.length === 2 && selectionKeys.includes("kind") && selectionKeys.includes("text") && typeof selection.text === "string") {
+          answers[key] = { kind: "single", selection: { kind: "other", text: selection.text } };
+        } else return undefined;
+      } else if (record.kind === "multiple" && keys.every((candidate) => ["kind", "choiceIds", "otherText"].includes(candidate))
+        && keys.includes("kind") && keys.includes("choiceIds") && Array.isArray(record.choiceIds)
+        && record.choiceIds.every((item) => typeof item === "string")
+        && (record.otherText === undefined || typeof record.otherText === "string")) {
+        answers[key] = {
+          kind: "multiple",
+          choiceIds: [...record.choiceIds] as string[],
+          ...(record.otherText === undefined ? {} : { otherText: record.otherText })
+        };
+      } else return undefined;
     }
     return answers;
   } catch {
@@ -512,7 +545,7 @@ export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void>
           label: option.label,
           description: option.description,
         }));
-        return { ...base, kind: question.multiSelect ? "multiple" : "single", choices };
+        return { ...base, kind: question.multiSelect ? "multiple" : "single", choices, allowOther: true };
       });
       const descriptor = {
         title: params.questions.length === 1 ? "Pi needs your input" : "Pi has " + String(params.questions.length) + " questions",
@@ -543,18 +576,18 @@ export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void>
         const key = Object.prototype.hasOwnProperty.call(readable, keyBase) ? keyBase + " #" + String(questionIndex + 1) : keyBase;
         const answer = answers[fieldId];
         const options = Array.isArray(question.options) ? question.options : [];
-        if (typeof answer === "string" && options.length > 0) {
-          const match = /^q\d+-option-(\d+)$/.exec(answer);
-          const optionIndex = match ? Number(match[1]) - 1 : -1;
-          readable[key] = options[optionIndex]?.label ?? answer;
-        } else if (Array.isArray(answer) && options.length > 0) {
-          readable[key] = answer.map((choice) => {
-            const match = /^q\d+-option-(\d+)$/.exec(choice);
-            const optionIndex = match ? Number(match[1]) - 1 : -1;
-            return options[optionIndex]?.label ?? choice;
-          });
-        } else if (answer !== undefined) {
-          readable[key] = answer;
+        const optionLabels = new Map(options.map((option, optionIndex) => [fieldId + "-option-" + String(optionIndex + 1), option.label]));
+        if (answer?.kind === "text") readable[key] = answer.value;
+        else if (answer?.kind === "boolean") readable[key] = answer.value;
+        else if (answer?.kind === "single") {
+          readable[key] = answer.selection.kind === "choice"
+            ? optionLabels.get(answer.selection.choiceId) ?? answer.selection.choiceId
+            : answer.selection.text;
+        } else if (answer?.kind === "multiple") {
+          readable[key] = [
+            ...answer.choiceIds.map((choiceId) => optionLabels.get(choiceId) ?? choiceId),
+            ...(answer.otherText === undefined ? [] : [answer.otherText])
+          ];
         }
       });
       return {

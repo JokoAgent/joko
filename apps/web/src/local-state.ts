@@ -8,7 +8,8 @@ import {
   type NavigationMode
 } from "./navigation-layout.js";
 import { persistentWebSecretEncryptionAvailable } from "./web-crypto.js";
-import { normalizeComposerDocument } from "./composer-quote-document.js";
+import { composerDocumentPlainText, normalizeComposerDocument } from "./composer-quote-document.js";
+import { normalizeComposerInlineMentionRanges } from "./composer-mention-ranges.js";
 import { normalizeAppShortcutOverrides, type AppShortcutOverrides } from "./app-shortcuts.js";
 import {
   DEFAULT_APPEARANCE_PREFERENCES,
@@ -486,11 +487,17 @@ export class LocalState {
   private async writeDraft(serverId: string, sessionId: string, draft: ComposerDraft, expectedRevision?: number): Promise<number | undefined> {
     const browserComments = normalizeLiveBrowserComments(draft.browserComments);
     const extraDirectoryIds = normalizeExtraDirectoryIds(draft.extraDirectoryIds);
+    const mentions = normalizeDraftMentions(draft.mentions);
+    if (mentions === undefined) throw new Error("The task draft mention identities are invalid.");
+    const editorDocument = normalizeComposerDocument(draft.editorDocument, draft.text);
+    const inlineMentionRanges = normalizeComposerInlineMentionRanges(draft.inlineMentionRanges, composerDocumentPlainText(editorDocument), mentions);
+    if (inlineMentionRanges === undefined) throw new Error("The task draft mention occurrences are invalid.");
     const persisted: PersistedComposerDraft = {
       text: draft.text,
       deliveryMode: draft.deliveryMode,
-      mentions: normalizeComposerMentions(draft.mentions),
-      ...(draft.editorDocument === undefined ? {} : { editorDocument: normalizeComposerDocument(draft.editorDocument, draft.text) }),
+      mentions,
+      ...(inlineMentionRanges.length === 0 ? {} : { inlineMentionRanges }),
+      ...(draft.editorDocument === undefined ? {} : { editorDocument }),
       ...(extraDirectoryIds === undefined ? {} : { extraDirectoryIds }),
       attachments: draft.attachments.map(persistAttachment),
       browserComments: browserComments.map((item) => ({ ...item, screenshot: persistAttachment(item.screenshot) }))
@@ -532,11 +539,17 @@ export class LocalState {
     const attachments = restorePersistedAttachments(persisted.attachments);
     const browserComments = restorePersistedBrowserComments(persisted.browserComments);
     const extraDirectoryIds = normalizeExtraDirectoryIds(persisted.extraDirectoryIds);
+    const mentions = normalizeDraftMentions(persisted.mentions);
+    if (mentions === undefined) throw new Error("The task draft mention identities are invalid.");
+    const editorDocument = normalizeComposerDocument(persisted.editorDocument, persisted.text);
+    const inlineMentionRanges = normalizeComposerInlineMentionRanges(persisted.inlineMentionRanges, composerDocumentPlainText(editorDocument), mentions);
+    if (inlineMentionRanges === undefined) throw new Error("The task draft mention occurrences are invalid.");
     return { revision: record.revision, draft: {
       text: persisted.text,
       deliveryMode: persisted.deliveryMode,
-      mentions: normalizeComposerMentions(persisted.mentions),
-      ...(persisted.editorDocument === undefined ? {} : { editorDocument: normalizeComposerDocument(persisted.editorDocument, persisted.text) }),
+      mentions,
+      ...(inlineMentionRanges.length === 0 ? {} : { inlineMentionRanges }),
+      ...(persisted.editorDocument === undefined ? {} : { editorDocument }),
       attachments,
       browserComments,
       ...(extraDirectoryIds === undefined ? {} : { extraDirectoryIds })
@@ -690,7 +703,10 @@ export function normalizeNewSessionLocalDraft(value: unknown): NewSessionLocalDr
     : undefined;
   if (nativeStart === undefined) return undefined;
   const permissionMode = normalizePermissionMode(record["permissionMode"]);
-  const mentions = normalizeComposerMentions(record["mentions"]);
+  const mentions = normalizeDraftMentions(record["mentions"]);
+  if (mentions === undefined) return undefined;
+  const inlineMentionRanges = normalizeComposerInlineMentionRanges(record["inlineMentionRanges"], composerDocumentPlainText(editorDocument), mentions);
+  if (inlineMentionRanges === undefined) return undefined;
   const attachments = normalizeLiveAttachments(record["attachments"]);
   const extraDirectoryIds = normalizeExtraDirectoryIds(record["extraDirectoryIds"]);
   const rawWorktree = record["worktree"];
@@ -709,6 +725,7 @@ export function normalizeNewSessionLocalDraft(value: unknown): NewSessionLocalDr
     text: record["text"],
     editorDocument,
     mentions,
+    ...(inlineMentionRanges.length === 0 ? {} : { inlineMentionRanges }),
     attachments,
     ...(extraDirectoryIds === undefined ? {} : { extraDirectoryIds })
   };
@@ -737,6 +754,21 @@ function normalizeNativeStart(value: Record<string, unknown>): NewSessionLocalDr
   return value["kind"] === "attach" && validId(value["reference"])
     ? { kind: "attach", reference: value["reference"] }
     : undefined;
+}
+
+function normalizeDraftMentions(value: unknown): readonly ComposerMentionDraft[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const mentions = normalizeComposerMentions(value);
+  // Durable drafts use one current shape. Silently dropping an unknown or
+  // incomplete mention would change the user's input authority.
+  if (mentions.length !== value.length) return undefined;
+  const identities = new Set<string>();
+  for (const candidate of value) {
+    if (candidate === null || typeof candidate !== "object" || !validId(candidate.id)) return undefined;
+    if (identities.has(candidate.id)) return undefined;
+    identities.add(candidate.id);
+  }
+  return mentions;
 }
 
 function normalizePermissionMode(value: unknown): PermissionMode {
@@ -772,7 +804,58 @@ export function normalizeComposerMentions(value: unknown): readonly ComposerMent
       seenIds.add(record["id"]);
       continue;
     }
-    if ((record["kind"] !== "workspace" && record["kind"] !== "resource") || typeof record["token"] !== "string") continue;
+    if ((record["kind"] !== "workspace" && record["kind"] !== "resource" && record["kind"] !== "artifact" && record["kind"] !== "session")
+      || typeof record["token"] !== "string") continue;
+    if (record["kind"] === "artifact" && (record["workspaceId"] !== undefined || !validMessageIdentity(record["reference"]))) continue;
+    if (record["kind"] === "session" && (
+      record["workspaceId"] !== undefined || record["directory"] !== undefined || record["lineRange"] !== undefined
+      || !validSessionMentionIdentity(record["reference"])
+    )) continue;
+    if (record["kind"] === "resource") {
+      if (
+        record["workspaceId"] !== undefined || record["directory"] !== undefined || record["lineRange"] !== undefined
+        || !validResourceRevision(record["discoveredRevision"])
+        || !validResourceVersion(record["resourceVersion"])
+        || !Number.isSafeInteger(record["runtimeGeneration"]) || Number(record["runtimeGeneration"]) < 1
+      ) continue;
+      if (seenIds.has(record["id"])) continue;
+      result.push({
+        id: record["id"],
+        kind: "resource",
+        reference: record["reference"],
+        label: record["label"],
+        token: record["token"],
+        discoveredRevision: record["discoveredRevision"],
+        resourceVersion: record["resourceVersion"],
+        runtimeGeneration: Number(record["runtimeGeneration"])
+      });
+      seenIds.add(record["id"]);
+      continue;
+    }
+    if (record["kind"] === "artifact") {
+      if (record["directory"] !== undefined || record["lineRange"] !== undefined || seenIds.has(record["id"])) continue;
+      result.push({
+        id: record["id"],
+        kind: "artifact",
+        reference: record["reference"],
+        label: record["label"],
+        token: record["token"]
+      });
+      seenIds.add(record["id"]);
+      continue;
+    }
+    if (record["kind"] === "session") {
+      if (seenIds.has(record["id"])) continue;
+      result.push({
+        id: record["id"],
+        kind: "session",
+        reference: record["reference"],
+        label: record["label"],
+        token: record["token"]
+      });
+      seenIds.add(record["id"]);
+      continue;
+    }
     if (record["directory"] !== undefined && (record["kind"] !== "workspace" || typeof record["directory"] !== "boolean")) continue;
     const lineRange = record["lineRange"];
     if (lineRange !== undefined && (record["kind"] !== "workspace" || record["directory"] === true
@@ -784,7 +867,7 @@ export function normalizeComposerMentions(value: unknown): readonly ComposerMent
     if (seenIds.has(record["id"])) continue;
     result.push({
       id: record["id"],
-      kind: record["kind"],
+      kind: "workspace",
       reference: record["reference"],
       label: record["label"],
       token: record["token"],
@@ -802,6 +885,21 @@ export function normalizeComposerMentions(value: unknown): readonly ComposerMent
 
 function validMessageIdentity(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= 1_024 && !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
+function validSessionMentionIdentity(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 1_024
+    && value === value.trim() && !/[\u0000-\u001f\u007f\u2028\u2029]/u.test(value);
+}
+
+function validResourceRevision(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 4_096
+    && value === value.trim() && !/[\u0000-\u001f\u007f\u2028\u2029]/u.test(value);
+}
+
+function validResourceVersion(value: unknown): value is string {
+  if (typeof value !== "string" || value.length > 20 || !/^[1-9][0-9]*$/u.test(value)) return false;
+  return BigInt(value) <= 18_446_744_073_709_551_615n;
 }
 
 function validId(value: unknown): value is string {

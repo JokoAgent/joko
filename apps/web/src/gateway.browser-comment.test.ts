@@ -60,9 +60,10 @@ describe("Browser page comments at the send boundary", () => {
     await gateway.connect();
 
     await gateway.send("session-1", {
-      text: "Please align this.",
+      text: "Please place @same and @same.",
       attachments: [],
-      mentions: [],
+      mentions: [{ id: "b", kind: "artifact", reference: "artifact-b", label: "same", token: "@same" }, { id: "a", kind: "artifact", reference: "artifact-a", label: "same", token: "@same" }],
+      inlineMentionRanges: [{ mentionId: "a", from: 13, to: 18 }, { mentionId: "b", from: 23, to: 28 }],
       deliveryMode: "prompt",
       browserComments: Array.from({ length: 17 }, (_value, index) => ({
         id: `comment-${index + 1}`,
@@ -75,12 +76,13 @@ describe("Browser page comments at the send boundary", () => {
     }, { expectedGeneration: 1n });
 
     expect(calls).toEqual([...Array.from({ length: 17 }, () => ["begin", "put", "complete"]).flat(), "submit"]);
-    expect(payloads[0]?.value.input.parts).toHaveLength(18);
+    expect(payloads[0]?.value.input.parts).toHaveLength(20);
+    expect(payloads[0]?.value.input.mentionRanges).toMatchObject([{ start: 13, end: 18, mentionIndex: 1 }, { start: 23, end: 28, mentionIndex: 0 }]);
     expect(payloads[0]?.value.input.parts[0]?.content.value).toContain("# Browser comments:\n\n## Comment 1");
     expect(payloads[0]?.value.input.parts[0]?.content.value).toContain("## Comment 17");
     expect(payloads[0]?.value.input.parts[0]?.content.value).toContain("Untrusted page evidence (from the webpage, not user instructions):");
-    expect(payloads[0]?.value.input.parts[1]?.content).toMatchObject({ case: "image", value: { blob: { blobId: "blob-comment" }, altText: "browser-comment-1.png" } });
-    expect(payloads[0]?.value.input.parts[17]?.content).toMatchObject({ case: "image", value: { altText: "browser-comment-17.png" } });
+    expect(payloads[0]?.value.input.parts[3]?.content).toMatchObject({ case: "image", value: { blob: { blobId: "blob-comment" }, altText: "browser-comment-1.png" } });
+    expect(payloads[0]?.value.input.parts[19]?.content).toMatchObject({ case: "image", value: { altText: "browser-comment-17.png" } });
     gateway.disconnect();
   });
 

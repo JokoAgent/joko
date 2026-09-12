@@ -116,6 +116,7 @@ import {
   type InputContent,
   type InputPart,
   type InlineTextRange as ProtoInlineTextRange,
+  type InputMentionRange as ProtoInputMentionRange,
   type Interaction as ProtoInteraction,
   type InteractionResolution,
   type InteractionChangedEvent,
@@ -144,13 +145,14 @@ import {
   type ProviderDescriptor,
   type ProviderRuntimeSupport,
   type QuestionAnswer,
-  QuestionAnswerHandling,
   type QuestionBooleanInput,
   type QuestionChoice,
   type QuestionField,
+  type QuestionMultipleChoiceAnswer,
   type QuestionMultipleChoiceInput,
   type QuestionRequest,
   type QuestionResolution,
+  type QuestionSingleChoiceAnswer,
   type QuestionSingleChoiceInput,
   type QuestionTextInput,
   type QueueItem as ProtoQueueItem,
@@ -173,6 +175,7 @@ import {
   type RunDoneEvent,
   type Run as ProtoRun,
   type Schedule as ProtoSchedule,
+  type SessionMention,
   type ScheduleExecutionSnapshot,
   type ScheduleRecurrence,
   type ScheduleRunHistory,
@@ -180,7 +183,6 @@ import {
   type Session as ProtoSession,
   type SessionWorktree as ProtoSessionWorktree,
   type StatusStreamEvent,
-  type StringList,
   type Target as ProtoTarget,
   type ToolCall,
   type ToolCallCompletedEvent,
@@ -224,8 +226,10 @@ import type {
   Capability,
   EventPayload,
   InlineTextRange as CoreInlineTextRange,
+  InputMentionRange as CoreInputMentionRange,
   InputDisposition,
   InteractionPayload,
+  InteractionQuestionAnswer,
   InteractionQuestionField,
   MessageBlock as CoreMessageBlock,
   MessageInputDelivery as CoreMessageInputDelivery,
@@ -256,7 +260,7 @@ import type {
   ToolResultContentPart as CoreToolResultContentPart,
   UsageSnapshot
 } from "@joko/core";
-import { validInlineTextRanges } from "@joko/core";
+import { validInlineTextRanges, validInputMentionRanges } from "@joko/core";
 import type { ExtraDirectoryRecord } from "./extra-directory-manager.js";
 import { TIMED_EXTENSION_INTERACTION_EXPIRED_REASON } from "./interaction-expiry.js";
 import {
@@ -1055,6 +1059,7 @@ export function toProtoInputContent(input: PromptInput): InputContent {
     input.pastedTextRanges ?? [],
     "input.pasted_text_ranges"
   );
+  const mentionRanges = checkedInputMentionRanges(input.text, input.mentions, input.mentionRanges ?? [], pastedTextRanges);
   const parts: InputPart[] = [];
   if (input.text !== "" || (input.images.length === 0 && input.files.length === 0 && input.mentions.length === 0)) {
     parts.push(message<InputPart>("joko.v1.InputPart", { content: { case: "text", value: input.text } }));
@@ -1084,7 +1089,7 @@ export function toProtoInputContent(input: PromptInput): InputContent {
         content: {
           case: "workspaceMention",
           value: message<WorkspaceMention>("joko.v1.WorkspaceMention", {
-            workspaceId: "",
+            workspaceId: requireText(mention.workspaceId ?? "", "input.workspace_mention.workspace_id"),
             relativePath: mention.reference,
             displayText: mention.label,
             revision: undefined,
@@ -1093,13 +1098,37 @@ export function toProtoInputContent(input: PromptInput): InputContent {
           })
         }
       }));
+    } else if (mention.kind === "artifact") {
+      parts.push(message<InputPart>("joko.v1.InputPart", {
+        content: {
+          case: "artifactMention",
+          value: message<contract.ArtifactMention>("joko.v1.ArtifactMention", {
+            artifactId: mention.reference,
+            displayText: mention.label
+          })
+        }
+      }));
+    } else if (mention.kind === "session") {
+      parts.push(message<InputPart>("joko.v1.InputPart", {
+        content: {
+          case: "sessionMention",
+          value: message<SessionMention>("joko.v1.SessionMention", {
+            sessionId: checkedSessionMentionId(mention.reference, "input.session_mention.session_id"),
+            displayText: mention.label
+          })
+        }
+      }));
     } else {
+      const identity = checkedResourceMentionIdentity(mention);
       parts.push(message<InputPart>("joko.v1.InputPart", {
         content: {
           case: "resourceMention",
           value: message<ResourceMention>("joko.v1.ResourceMention", {
-            resourceId: mention.reference,
-            displayText: mention.label
+            resourceId: identity.resourceId,
+            displayText: mention.label,
+            discoveredRevision: identity.discoveredRevision,
+            resourceVersion: identity.resourceVersion,
+            runtimeGeneration: BigInt(identity.runtimeGeneration)
           })
         }
       }));
@@ -1112,6 +1141,11 @@ export function toProtoInputContent(input: PromptInput): InputContent {
       start: range.start,
       end: range.end,
       display: range.display
+    })),
+    mentionRanges: mentionRanges.map((range) => message<ProtoInputMentionRange>("joko.v1.InputMentionRange", {
+      start: range.start,
+      end: range.end,
+      mentionIndex: range.mentionIndex
     }))
   });
 }
@@ -1141,24 +1175,44 @@ export function fromProtoInputContent(
       case "file":
         files.push({ blob: fromProtoBlobRef(part.content.value) });
         break;
-      case "resourceMention":
+      case "resourceMention": {
+        const identity = checkedProtoResourceMentionIdentity(part.content.value);
         mentions.push({
           kind: "resource",
           label: part.content.value.displayText,
-          reference: part.content.value.resourceId
+          reference: identity.resourceId,
+          discoveredRevision: identity.discoveredRevision,
+          resourceVersion: identity.resourceVersion,
+          runtimeGeneration: identity.runtimeGeneration
         });
         break;
+      }
       case "workspaceMention": {
         const lineRange = checkedWorkspaceMentionRange(part.content.value.lineRange, part.content.value.directory);
         mentions.push({
           ...(part.content.value.directory
             ? { kind: "workspace_directory" as const }
             : { kind: "workspace_file" as const, ...(lineRange === undefined ? {} : { lineRange }) }),
+          workspaceId: requireText(part.content.value.workspaceId, "input.workspace_mention.workspace_id"),
           label: part.content.value.displayText,
           reference: part.content.value.relativePath
         });
         break;
       }
+      case "artifactMention":
+        if (part.content.value.artifactId.length === 0 || part.content.value.artifactId.length > 1_024
+          || /[\u0000-\u001f\u007f]/u.test(part.content.value.artifactId)) {
+          throw new ProtoMappingError("invalid_argument", "input.parts.artifact_mention.artifact_id", "A bounded Artifact identity is required.");
+        }
+        mentions.push({ kind: "artifact", label: part.content.value.displayText, reference: part.content.value.artifactId });
+        break;
+      case "sessionMention":
+        mentions.push({
+          kind: "session",
+          label: part.content.value.displayText,
+          reference: checkedSessionMentionId(part.content.value.sessionId, "input.parts.session_mention.session_id")
+        });
+        break;
       case undefined:
         throw new ProtoMappingError("invalid_argument", "input.parts.content", "Input part content is required.");
     }
@@ -1173,6 +1227,11 @@ export function fromProtoInputContent(
     })),
     "input.pasted_text_ranges"
   );
+  const mentionRanges = checkedInputMentionRanges(joinedText, mentions, (content?.mentionRanges ?? []).map((range) => ({
+    start: range.start,
+    end: range.end,
+    mentionIndex: range.mentionIndex
+  })), pastedTextRanges);
   return {
     text: joinedText,
     images,
@@ -1180,7 +1239,8 @@ export function fromProtoInputContent(
     mentions,
     disposition,
     ...(content?.quotesEncoded === true ? { quotesEncoded: true } : {}),
-    ...(pastedTextRanges.length === 0 ? {} : { pastedTextRanges })
+    ...(pastedTextRanges.length === 0 ? {} : { pastedTextRanges }),
+    ...(mentionRanges.length === 0 ? {} : { mentionRanges })
   };
 }
 
@@ -1247,6 +1307,22 @@ function checkedInlineTextRanges(
       "invalid_argument",
       path,
       "Inline text ranges must be ordered, non-overlapping UTF-16 spans within the input text."
+    );
+  }
+  return ranges;
+}
+
+function checkedInputMentionRanges(
+  text: string,
+  mentions: PromptInput["mentions"],
+  ranges: readonly CoreInputMentionRange[],
+  pastedTextRanges: readonly CoreInlineTextRange[]
+): readonly CoreInputMentionRange[] {
+  if (!validInputMentionRanges(text, mentions, ranges, pastedTextRanges)) {
+    throw new ProtoMappingError(
+      "invalid_argument",
+      "input.mention_ranges",
+      "Mention ranges must identify typed mentions in ordered, non-overlapping UTF-16 spans outside pasted text."
     );
   }
   return ranges;
@@ -1470,9 +1546,7 @@ function fromProtoReviewEvidence(
 }
 
 function promptInputFromMessageBlocks(
-  blocks: readonly import("@joko/core").MessageBlock[],
-  quotesEncoded: boolean,
-  pastedTextRanges: readonly CoreInlineTextRange[] = []
+  blocks: readonly import("@joko/core").MessageBlock[]
 ): PromptInput {
   return {
     text: blocks.flatMap((block) => block.kind === "text" ? [block.text] : []).join(""),
@@ -1481,9 +1555,7 @@ function promptInputFromMessageBlocks(
       : []),
     files: blocks.flatMap((block) => block.kind === "artifact" ? [{ blob: block.blob }] : []),
     mentions: [],
-    disposition: "prompt",
-    ...(quotesEncoded ? { quotesEncoded: true } : {}),
-    ...(pastedTextRanges.length === 0 ? {} : { pastedTextRanges })
+    disposition: "prompt"
   };
 }
 
@@ -1978,7 +2050,11 @@ export function fromProtoInteractionDecision(resolution: InteractionResolution):
 export function toProtoArtifact(record: ArtifactRecord): Artifact {
   const metadata = objectValue(record.metadata);
   const audio = metadata?.["audio"];
+  const expiresAt = metadata?.["expiresAt"];
   if (audio !== undefined) assertAudioArtifactMetadata(audio);
+  if (expiresAt !== undefined && (typeof expiresAt !== "number" || !Number.isSafeInteger(expiresAt) || expiresAt < 0)) {
+    throw new ProtoMappingError("out_of_range", "artifact.expires_at", "Artifact expiration must be non-negative safe integer milliseconds.");
+  }
   return message<Artifact>("joko.v1.Artifact", {
     artifactId: record.blob.id,
     sessionId: record.sessionId ?? "",
@@ -1992,7 +2068,7 @@ export function toProtoArtifact(record: ArtifactRecord): Artifact {
       disposition: BlobDisposition.ARTIFACT
     },
     createdAt: toProtoTimestamp(record.createdAt),
-    expiresAt: undefined
+    expiresAt: expiresAt === undefined ? undefined : toProtoTimestamp(expiresAt)
   });
 }
 
@@ -2626,6 +2702,9 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
         hidden: false
       }));
     case "message_complete":
+      if (payload.acceptedInput !== undefined && payload.role !== "user") {
+        throw new ProtoMappingError("invalid_argument", "event.payload.accepted_input", "Only user messages may carry accepted input.");
+      }
       if (payload.role === "user") {
         if (payload.generationDurationMs !== undefined || payload.generationReliable !== undefined) {
           throw new ProtoMappingError(
@@ -2638,13 +2717,9 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
           messageId: payload.nativeHistory?.identity?.entryId ?? event.id,
           turnId: event.runId ?? "",
           role: MessageRole.USER,
-          userInput: toProtoInputContent(promptInputFromMessageBlocks(
-            payload.blocks,
-            payload.quotesEncoded === true,
-            payload.pastedTextRanges
-          )),
-          quotesEncoded: payload.quotesEncoded === true,
-          inputDelivery: toProtoMessageInputDelivery(payload.inputDelivery),
+          userInput: toProtoInputContent(payload.acceptedInput ?? promptInputFromMessageBlocks(payload.blocks)),
+          userInputAccepted: payload.acceptedInput !== undefined,
+          inputDelivery: toProtoMessageInputDelivery(payload.inputDelivery ?? payload.acceptedInput?.disposition),
           automationOrigin: payload.automationOrigin === undefined
             ? undefined
             : message<ProtoMessageAutomationOrigin>("joko.v1.MessageAutomationOrigin", {
@@ -3022,9 +3097,18 @@ function fromProtoEventPayload(
         contentIndex: payload.kind.value.contentIndex
       };
     case "messageStarted": {
-      const input = fromProtoInputContent(payload.kind.value.userInput, "prompt");
       const origin = payload.kind.value.automationOrigin;
       const inputDelivery = fromProtoMessageInputDelivery(payload.kind.value.inputDelivery);
+      const input = fromProtoInputContent(payload.kind.value.userInput,
+        inputDelivery === "steer" || inputDelivery === "follow_up" ? inputDelivery : "prompt");
+      if (payload.kind.value.userInputAccepted) {
+        if (payload.kind.value.role !== MessageRole.USER || payload.kind.value.userInput === undefined) {
+          throw new ProtoMappingError("invalid_argument", "event.payload.user_input_accepted", "Accepted input requires a user message and its canonical input.");
+        }
+      } else if (input.mentions.length > 0 || (input.mentionRanges?.length ?? 0) > 0
+        || input.quotesEncoded === true || (input.pastedTextRanges?.length ?? 0) > 0) {
+        throw new ProtoMappingError("invalid_argument", "event.payload.user_input_accepted", "Native history cannot claim typed mention, quote, or paste authority.");
+      }
       return {
         type: "message_complete",
         role: payload.kind.value.role === MessageRole.ASSISTANT ? "assistant" : "user",
@@ -3033,8 +3117,7 @@ function fromProtoEventPayload(
           ...input.images.map((image) => ({ kind: "image" as const, blob: image.blob, ...(image.alt === undefined ? {} : { alt: image.alt }) })),
           ...input.files.map((file) => ({ kind: "artifact" as const, blob: file.blob, label: file.blob.fileName ?? "file" }))
         ],
-        ...(payload.kind.value.quotesEncoded === true || input.quotesEncoded === true ? { quotesEncoded: true } : {}),
-        ...(input.pastedTextRanges === undefined ? {} : { pastedTextRanges: input.pastedTextRanges }),
+        ...(payload.kind.value.userInputAccepted ? { acceptedInput: input } : {}),
         ...(inputDelivery === undefined ? {} : { inputDelivery }),
         ...(payload.kind.value.automaticContinuation && payload.kind.value.runtimeRecoveryId.trim().length > 0 ? {
           automaticContinuation: {
@@ -3909,7 +3992,7 @@ function validateNanoseconds(value: number, fieldPath: string): void {
     throw new ProtoMappingError(
       "out_of_range",
       fieldPath,
-      `${fieldPath} nanoseconds must be millisecond-aligned and between 0 and 999999999.`
+      `${fieldPath} nanoseconds must be divisible by 1000000 and between 0 and 999999999.`
     );
   }
 }
@@ -4342,6 +4425,92 @@ export function toProtoNativeNavigationTarget(value: import("@joko/core").Native
       ? { case: "sessionStart", value: message("joko.v1.SessionStartTarget", {}) }
       : { case: "nativeEntryId", value: requireText(value.entryId, "native_navigation_target.native_entry_id") }
   });
+}
+
+const MAXIMUM_RESOURCE_IDENTITY_TEXT = 4_096;
+const MAXIMUM_UINT64 = (1n << 64n) - 1n;
+
+function checkedSessionMentionId(value: string, fieldPath: string): string {
+  if (value.length === 0 || value.length > 1_024 || value !== value.trim()
+    || /[\u0000-\u001f\u007f\u2028\u2029]/u.test(value)) {
+    throw new ProtoMappingError("invalid_argument", fieldPath, "A bounded Session identity is required.");
+  }
+  return value;
+}
+
+function checkedResourceIdentityText(value: string, fieldPath: string): string {
+  if (value.length === 0 || value.length > MAXIMUM_RESOURCE_IDENTITY_TEXT
+    || value !== value.trim() || /[\u0000-\u001f\u007f\u2028\u2029]/u.test(value)) {
+    throw new ProtoMappingError("invalid_argument", fieldPath, `${fieldPath} is invalid.`);
+  }
+  return value;
+}
+
+function checkedResourceMentionIdentity(
+  mention: Extract<PromptInput["mentions"][number], { readonly kind: "resource" }>
+): { readonly resourceId: string; readonly discoveredRevision: string; readonly resourceVersion: bigint; readonly runtimeGeneration: number } {
+  const resourceId = checkedResourceIdentityText(mention.reference, "input.resource_mention.resource_id");
+  const discoveredRevision = checkedResourceIdentityText(
+    mention.discoveredRevision,
+    "input.resource_mention.discovered_revision"
+  );
+  if (mention.resourceVersion.length > 20 || !/^[1-9][0-9]*$/u.test(mention.resourceVersion)) {
+    throw new ProtoMappingError(
+      "invalid_argument",
+      "input.resource_mention.resource_version",
+      "input.resource_mention.resource_version must be a canonical positive decimal integer."
+    );
+  }
+  const resourceVersion = BigInt(mention.resourceVersion);
+  if (resourceVersion > MAXIMUM_UINT64) {
+    throw new ProtoMappingError(
+      "out_of_range",
+      "input.resource_mention.resource_version",
+      "input.resource_mention.resource_version exceeds uint64."
+    );
+  }
+  if (!Number.isSafeInteger(mention.runtimeGeneration) || mention.runtimeGeneration < 1) {
+    throw new ProtoMappingError(
+      "out_of_range",
+      "input.resource_mention.runtime_generation",
+      "input.resource_mention.runtime_generation must be a positive safe integer."
+    );
+  }
+  return { resourceId, discoveredRevision, resourceVersion, runtimeGeneration: mention.runtimeGeneration };
+}
+
+function checkedProtoResourceMentionIdentity(value: ResourceMention): {
+  readonly resourceId: string;
+  readonly discoveredRevision: string;
+  readonly resourceVersion: string;
+  readonly runtimeGeneration: number;
+} {
+  const resourceId = checkedResourceIdentityText(value.resourceId, "input.resource_mention.resource_id");
+  const discoveredRevision = checkedResourceIdentityText(
+    value.discoveredRevision,
+    "input.resource_mention.discovered_revision"
+  );
+  if (value.resourceVersion < 1n) {
+    throw new ProtoMappingError(
+      "invalid_argument",
+      "input.resource_mention.resource_version",
+      "input.resource_mention.resource_version is required."
+    );
+  }
+  const runtimeGeneration = safeNumber(value.runtimeGeneration, "input.resource_mention.runtime_generation");
+  if (runtimeGeneration < 1) {
+    throw new ProtoMappingError(
+      "invalid_argument",
+      "input.resource_mention.runtime_generation",
+      "input.resource_mention.runtime_generation is required."
+    );
+  }
+  return {
+    resourceId,
+    discoveredRevision,
+    resourceVersion: value.resourceVersion.toString(10),
+    runtimeGeneration
+  };
 }
 
 export function fromProtoNativeNavigationTarget(value: contract.NativeNavigationTarget | undefined): import("@joko/core").NativeNavigationTarget {
@@ -4918,30 +5087,35 @@ function toProtoQuestionField(field: InteractionQuestionField): QuestionField {
         value: message<QuestionTextInput>("joko.v1.QuestionTextInput", {
           placeholder: field.placeholder ?? "",
           defaultValue: field.defaultValue ?? "",
-          multiline: field.multiline,
-          answerHandling: field.sensitive
-            ? QuestionAnswerHandling.CREDENTIAL_CHANNEL
-            : QuestionAnswerHandling.NORMAL
+          multiline: field.multiline
         })
       };
       break;
     case "single":
+      if (typeof field.allowOther !== "boolean") {
+        throw new ProtoMappingError("invalid_argument", "interaction.question.field.allow_other", "Question choice fields require explicit allow_other authority.");
+      }
       input = {
         case: "singleChoice",
         value: message<QuestionSingleChoiceInput>("joko.v1.QuestionSingleChoiceInput", {
           choices,
-          defaultChoiceId: field.defaultChoiceId ?? ""
+          defaultChoiceId: field.defaultChoiceId ?? "",
+          allowOther: field.allowOther
         })
       };
       break;
     case "multiple":
+      if (typeof field.allowOther !== "boolean") {
+        throw new ProtoMappingError("invalid_argument", "interaction.question.field.allow_other", "Question choice fields require explicit allow_other authority.");
+      }
       input = {
         case: "multipleChoice",
         value: message<QuestionMultipleChoiceInput>("joko.v1.QuestionMultipleChoiceInput", {
           choices,
           defaultChoiceIds: [...field.defaultChoiceIds],
           minimumSelections: field.minimumSelections,
-          maximumSelections: field.maximumSelections ?? 0
+          maximumSelections: field.maximumSelections ?? 0,
+          allowOther: field.allowOther
         })
       };
       break;
@@ -4980,23 +5154,30 @@ function fromProtoQuestionField(field: QuestionField): InteractionQuestionField 
         kind: "text",
         ...(field.input.value.placeholder === "" ? {} : { placeholder: field.input.value.placeholder }),
         ...(field.input.value.defaultValue === "" ? {} : { defaultValue: field.input.value.defaultValue }),
-        multiline: field.input.value.multiline,
-        sensitive: field.input.value.answerHandling === QuestionAnswerHandling.CREDENTIAL_CHANNEL
+        multiline: field.input.value.multiline
       };
     case "singleChoice":
+      if (field.input.value.allowOther === undefined) {
+        throw new ProtoMappingError("invalid_argument", "interaction.question.field.allow_other", "Question choice fields require explicit allow_other authority.");
+      }
       return {
         ...base,
         kind: "single",
         choices: choices(field.input.value.choices),
+        allowOther: field.input.value.allowOther,
         ...(field.input.value.defaultChoiceId === "" ? {} : { defaultChoiceId: field.input.value.defaultChoiceId })
       };
     case "multipleChoice":
+      if (field.input.value.allowOther === undefined) {
+        throw new ProtoMappingError("invalid_argument", "interaction.question.field.allow_other", "Question choice fields require explicit allow_other authority.");
+      }
       return {
         ...base,
         kind: "multiple",
         choices: choices(field.input.value.choices),
         defaultChoiceIds: [...field.input.value.defaultChoiceIds],
         minimumSelections: field.input.value.minimumSelections,
+        allowOther: field.input.value.allowOther,
         ...(field.input.value.maximumSelections === 0 ? {} : { maximumSelections: field.input.value.maximumSelections })
       };
     case "boolean":
@@ -5031,29 +5212,90 @@ function decisionAnswers(value: unknown): QuestionAnswer[] {
 }
 
 function questionAnswer(value: unknown, fieldId: string): QuestionAnswer["value"] {
-  if (typeof value === "boolean") return { case: "boolean", value };
-  if (Array.isArray(value) && value.every((entry) => typeof entry === "string")) {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw invalidQuestionDecisionAnswer(fieldId);
+  }
+  const answer = value as Readonly<Record<string, unknown>>;
+  if (answer["kind"] === "text" && exactObjectKeys(answer, ["kind", "value"]) && typeof answer["value"] === "string") {
+    return { case: "text", value: answer["value"] };
+  }
+  if (answer["kind"] === "boolean" && exactObjectKeys(answer, ["kind", "value"]) && typeof answer["value"] === "boolean") {
+    return { case: "boolean", value: answer["value"] };
+  }
+  if (answer["kind"] === "single" && exactObjectKeys(answer, ["kind", "selection"])) {
+    const selection = answer["selection"];
+    if (typeof selection !== "object" || selection === null || Array.isArray(selection)) {
+      throw invalidQuestionDecisionAnswer(fieldId);
+    }
+    const selected = selection as Readonly<Record<string, unknown>>;
+    let mapped: QuestionSingleChoiceAnswer["selection"];
+    if (selected["kind"] === "choice" && exactObjectKeys(selected, ["kind", "choiceId"])
+      && typeof selected["choiceId"] === "string") {
+      mapped = { case: "choiceId", value: selected["choiceId"] };
+    } else if (selected["kind"] === "other" && exactObjectKeys(selected, ["kind", "text"])
+      && typeof selected["text"] === "string") {
+      mapped = { case: "otherText", value: selected["text"] };
+    } else {
+      throw invalidQuestionDecisionAnswer(fieldId);
+    }
     return {
-      case: "choiceIds",
-      value: message<StringList>("joko.v1.StringList", { values: value })
+      case: "singleChoice",
+      value: message<QuestionSingleChoiceAnswer>("joko.v1.QuestionSingleChoiceAnswer", { selection: mapped })
     };
   }
-  if (typeof value === "string") return { case: "text", value };
-  throw new ProtoMappingError(
+  if (answer["kind"] === "multiple" && exactObjectKeys(answer, ["kind", "choiceIds"], ["otherText"])
+    && Array.isArray(answer["choiceIds"])
+    && answer["choiceIds"].every((entry) => typeof entry === "string")
+    && (answer["otherText"] === undefined || typeof answer["otherText"] === "string")) {
+    return {
+      case: "multipleChoice",
+      value: message<QuestionMultipleChoiceAnswer>("joko.v1.QuestionMultipleChoiceAnswer", {
+        choiceIds: [...answer["choiceIds"] as readonly string[]],
+        ...(answer["otherText"] === undefined ? {} : { otherText: answer["otherText"] as string })
+      })
+    };
+  }
+  throw invalidQuestionDecisionAnswer(fieldId);
+}
+
+function invalidQuestionDecisionAnswer(fieldId: string): ProtoMappingError {
+  return new ProtoMappingError(
     "invalid_argument",
     `interaction.decision.answers.${fieldId}`,
-    "Question interaction answers must be strings, booleans, or string lists."
+    "Question interaction answers must use the current typed answer shape."
   );
 }
 
-function questionAnswerValue(answer: QuestionAnswer): unknown {
+function exactObjectKeys(
+  value: Readonly<Record<string, unknown>>,
+  required: readonly string[],
+  optional: readonly string[] = []
+): boolean {
+  const keys = Object.keys(value);
+  return required.every((key) => Object.prototype.hasOwnProperty.call(value, key))
+    && keys.every((key) => required.includes(key) || optional.includes(key));
+}
+
+function questionAnswerValue(answer: QuestionAnswer): InteractionQuestionAnswer {
   switch (answer.value.case) {
-    case "text":
-    case "choiceId": return answer.value.value;
-    case "choiceIds": return [...answer.value.value.values];
-    case "boolean": return answer.value.value;
-    case "sensitive": return { credentialUploadTicketId: answer.value.value.credentialUploadTicketId };
-    case undefined: return undefined;
+    case "text": return { kind: "text", value: answer.value.value };
+    case "singleChoice": {
+      const selection = answer.value.value.selection;
+      if (selection.case === "choiceId") {
+        return { kind: "single", selection: { kind: "choice", choiceId: selection.value } };
+      }
+      if (selection.case === "otherText") {
+        return { kind: "single", selection: { kind: "other", text: selection.value } };
+      }
+      throw invalidQuestionDecisionAnswer(answer.fieldId);
+    }
+    case "multipleChoice": return {
+      kind: "multiple",
+      choiceIds: [...answer.value.value.choiceIds],
+      ...(answer.value.value.otherText === undefined ? {} : { otherText: answer.value.value.otherText })
+    };
+    case "boolean": return { kind: "boolean", value: answer.value.value };
+    case undefined: throw invalidQuestionDecisionAnswer(answer.fieldId);
   }
 }
 

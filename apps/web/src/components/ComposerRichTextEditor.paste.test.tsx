@@ -1,9 +1,11 @@
 // @vitest-environment jsdom
-import type { JSONContent } from "@tiptap/core";
+import type { Editor, JSONContent } from "@tiptap/core";
+import { TextSelection } from "@tiptap/pm/state";
 import { act, createRef, type RefObject } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ComposerRichTextEditor, type ComposerRichTextEditorHandle } from "./ComposerRichTextEditor.js";
+import type { ComposerInlineMentionRange } from "../model.js";
 
 const roots: Root[] = [];
 
@@ -66,6 +68,30 @@ function paste(editor: HTMLElement, text: string, options: { readonly html?: str
 }
 
 describe("rich composer paste integration", () => {
+  it("keeps an existing occurrence through nested automatic list promotion and observes identical text replacement", async () => {
+    let ranges: readonly ComposerInlineMentionRange[] = [{ mentionId: "artifact", from: 0, to: 7 }];
+    const changes: JSONContent[] = [];
+    const mounted = await mount({
+      document: { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: "@Export" }] }] },
+      onDocumentChange: (document, _composing, mapRanges) => {
+        ranges = mapRanges(ranges);
+        changes.push(document);
+      }
+    });
+    const editor = (mounted.editor as HTMLElement & { editor: Editor }).editor;
+    act(() => {
+      const transaction = editor.state.tr.insertText("- ", 1);
+      transaction.setSelection(TextSelection.atEnd(transaction.doc));
+      editor.view.dispatch(transaction);
+    });
+    expect(changes).toHaveLength(1);
+    expect(changes[0]?.content?.[0]?.type).toBe("bulletList");
+    expect(ranges).toEqual([{ mentionId: "artifact", from: 2, to: 9 }]);
+    act(() => editor.view.dispatch(editor.state.tr.insertText("@Export", 3, 10)));
+    expect(changes).toHaveLength(2);
+    expect(ranges).toEqual([]);
+  });
+
   it("gives clipboard files priority over a long text payload", async () => {
     const mounted = await mount();
     const file = new File(["image"], "capture.png", { type: "image/png" });

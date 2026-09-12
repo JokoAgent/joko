@@ -2,7 +2,8 @@
 
 import { describe, expect, it } from "vitest";
 import type { JSONContent } from "@tiptap/core";
-import type { ComposerMentionDraft, ResourceView, WorkspaceEntryView } from "../model.js";
+import type { ComposerMentionDraft, SessionResourceView, SessionView, WorkspaceEntryView } from "../model.js";
+import { remapComposerInlineMentionReplacement } from "../composer-mention-ranges.js";
 import {
   COMPOSER_MENTION_RESULT_LIMIT,
   composerCaretTextOffset,
@@ -26,26 +27,51 @@ import {
 
 describe("inline composer mention syntax", () => {
   it("opens only at a token boundary and tracks the complete run around the caret", () => {
-    expect(detectComposerInlineMention("mail@example.com", 16)).toBeNull();
-    expect(detectComposerInlineMention("prefix(@src", 11)).toBeNull();
-    expect(detectComposerInlineMention("check @src/main.ts later", 10)).toEqual({
+    expect(detectComposerInlineMention("mail@example.com", 16, [])).toBeNull();
+    expect(detectComposerInlineMention("prefix(@src", 11, [])).toBeNull();
+    expect(detectComposerInlineMention("check @src/main.ts later", 10, [])).toEqual({
       from: 6,
       to: 18,
       query: "src",
       quoted: false
     });
-    expect(detectComposerInlineMention("@root", 5)).toEqual({ from: 0, to: 5, query: "root", quoted: false });
-    expect(detectComposerInlineMention("line\n@next", 10)).toEqual({ from: 5, to: 10, query: "next", quoted: false });
+    expect(detectComposerInlineMention("@root", 5, [])).toEqual({ from: 0, to: 5, query: "root", quoted: false });
+    expect(detectComposerInlineMention("line\n@next", 10, [])).toEqual({ from: 5, to: 10, query: "next", quoted: false });
+    expect(detectComposerInlineMention("@root later", 11, [])).toBeNull();
   });
 
   it("keeps an unclosed quoted path active across spaces", () => {
-    expect(detectComposerInlineMention('open @"My Documents/fi', 22)).toEqual({
+    expect(detectComposerInlineMention('open @"My Documents/fi', 22, [])).toEqual({
       from: 5,
       to: 22,
       query: "My Documents/fi",
       quoted: true
     });
-    expect(detectComposerInlineMention('open @"My Documents/file.md"', 29)).toBeNull();
+    const closed = 'open @"My Documents/file.md"';
+    expect(detectComposerInlineMention(closed, closed.length, [])).toBeNull();
+  });
+
+  it("does not reopen complete confirmed occurrences when the caret moves or a preceding occurrence is removed", () => {
+    for (const token of ["@report.txt", '@"Original report.txt"', '@"report @ final.txt"']) {
+      const first = { mentionId: "original", from: 0, to: token.length };
+      const second = { mentionId: "revised", from: token.length + 1, to: token.length * 2 + 1 };
+      const text = `${token} ${token} `;
+      for (let caret = 0; caret <= text.length; caret += 1) {
+        expect(detectComposerInlineMention(text, caret, [first, second])).toBeNull();
+      }
+      const retained = remapComposerInlineMentionReplacement([first, second], 0, token.length + 1, 0);
+      expect(retained).toEqual([{ mentionId: "revised", from: 0, to: token.length }]);
+      expect(detectComposerInlineMention(`${token} `, 0, retained)).toBeNull();
+    }
+  });
+
+  it("queries an edited occurrence or a new occurrence without borrowing another token's confirmation", () => {
+    const ranges = [{ mentionId: "original", from: 0, to: 11 }];
+    const edited = remapComposerInlineMentionReplacement(ranges, 7, 11, 0);
+    expect(detectComposerInlineMention("@report", 7, edited)).toEqual({ from: 0, to: 7, query: "report", quoted: false });
+    expect(detectComposerInlineMention("@report.txtx", 12, ranges)).toEqual({ from: 0, to: 12, query: "report.txtx", quoted: false });
+    expect(detectComposerInlineMention("@report.txt @report", 19, ranges)).toEqual({ from: 12, to: 19, query: "report", quoted: false });
+    expect(detectComposerInlineMention("@report.txt", 11, [{ ...ranges[0]!, to: 7 }])).toEqual({ from: 0, to: 11, query: "report.txt", quoted: false });
   });
 
   it("quotes whitespace and quotes while preserving Windows backslashes", () => {
@@ -58,6 +84,24 @@ describe("inline composer mention syntax", () => {
 });
 
 describe("composer mention catalog and ranking", () => {
+  it("keeps canonical artifacts with equal names distinct by opaque identity", () => {
+    const artifacts = ["first", "second"].map((id) => ({
+      id, blobId: `bytes-${id}`, title: "Report", kind: "file" as const, fileName: "report.txt", mediaType: "text/plain", byteSize: 4
+    }));
+    const items = composerMentionCatalog([], undefined, [], [], [...artifacts, artifacts[0]!]);
+    expect(items.map((item) => item.mention?.reference)).toEqual(["first", "second"]);
+    expect(items.every((item) => item.kind === "artifact" && item.mention?.kind === "artifact")).toBe(true);
+    expect(items[1]?.mention?.token).toBe("@Report");
+  });
+
+  it("keeps historical tasks with equal titles distinct and excludes closed tasks", () => {
+    const sessions = [session("first", "Investigation"), session("second", "Investigation"), session("closed", "Closed", "closed")];
+    const items = composerMentionCatalog([], undefined, [], [], [], sessions);
+    expect(items.map((item) => item.mention)).toEqual([
+      expect.objectContaining({ id: "session:first", kind: "session", reference: "first", token: "@Investigation" }),
+      expect.objectContaining({ id: "session:second", kind: "session", reference: "second", token: "@Investigation" })
+    ]);
+  });
   const entries: readonly WorkspaceEntryView[] = [{
     path: "src",
     name: "src",
@@ -179,6 +223,13 @@ describe("composer mention catalog and ranking", () => {
   });
 });
 
+function session(id: string, name: string, state: SessionView["state"] = "idle"): SessionView {
+  return {
+    id, name, state, backendId: "backend", targetId: "target", pinned: false, archived: false,
+    generation: 1n, fastMode: false, permissionMode: "ask", planMode: false, updatedAt: 1
+  };
+}
+
 describe("structured composer mention ranges", () => {
   const mentions: readonly ComposerMentionDraft[] = [{
     id: "workspace:w:src/main.ts",
@@ -196,15 +247,17 @@ describe("structured composer mention ranges", () => {
     role: "assistant"
   }];
 
-  it("restores once, then uses ranges rather than raw token search as the active source", () => {
-    const ranges = restoreComposerInlineMentionRanges("open @src/main.ts", mentions);
+  it("restores exact persisted occurrences and refuses to infer them from matching text", () => {
+    const ranges = restoreComposerInlineMentionRanges("open @src/main.ts", mentions, [{ mentionId: "workspace:w:src/main.ts", from: 5, to: 17 }]);
     expect(ranges).toEqual([{ mentionId: "workspace:w:src/main.ts", from: 5, to: 17 }]);
     expect(composerMentionsFromRanges(mentions, ranges)).toEqual(mentions);
     expect(composerMentionsFromRanges(mentions, [])).toEqual([mentions[1]]);
-    expect(restoreComposerInlineMentionRanges("@src/main.ts and @src/main.ts", mentions)).toEqual([
+    const repeated = [
       { mentionId: "workspace:w:src/main.ts", from: 0, to: 12 },
       { mentionId: "workspace:w:src/main.ts", from: 17, to: 29 }
-    ]);
+    ];
+    expect(restoreComposerInlineMentionRanges("@src/main.ts and @src/main.ts", mentions, repeated)).toEqual(repeated);
+    expect(() => restoreComposerInlineMentionRanges("@src/main.ts", mentions, undefined)).toThrow("invalid mention locations");
   });
 
   it("shifts an untouched range and drops a range edited at either edge", () => {
@@ -261,29 +314,33 @@ describe("structured composer mention ranges", () => {
     expect(setComposerCaretTextOffset(root, selection, "open ".length)).toBe(true);
     expect(composerCaretTextOffset(root, selection)).toBe("open ".length);
   });
+
+  it("restores a caret with the editor document's realm instead of the primary window", () => {
+    const frame = document.createElement("iframe");
+    document.body.append(frame);
+    const ownerDocument = frame.contentDocument!;
+    const ownerWindow = frame.contentWindow!;
+    const root = ownerDocument.createElement("div");
+    root.innerHTML = "<p>detached editor</p>";
+    ownerDocument.body.append(root);
+    const selection = ownerWindow.getSelection();
+    expect(setComposerCaretTextOffset(root, selection, 8)).toBe(true);
+    expect(composerCaretTextOffset(root, selection)).toBe(8);
+  });
 });
 
 function item(name: string, path: string): ComposerMentionCatalogItem {
   return { id: path, kind: "file", name, path, meta: path };
 }
 
-function resource(id: string, name: string): ResourceView {
+function resource(id: string, name: string): SessionResourceView {
   return {
+    sessionId: "session-1",
     id,
-    backendId: "backend-1",
     name,
     kind: "prompt",
-    scope: "managed",
-    state: "loaded",
-    enabled: true,
-    source: "test",
-    discoveredRevision: "1",
-    compatibilityDetails: [],
-    runtimeRequirements: [],
-    warnings: [],
-    disabledLifecycleScripts: [],
-    canToggle: true,
-    requiresExtensionApproval: false,
-    postMutationNotice: false
+    discoveredRevision: "revision-1",
+    resourceVersion: "3",
+    runtimeGeneration: 2
   };
 }

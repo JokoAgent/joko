@@ -7,12 +7,14 @@ import { ComposerInlineMentionPanel } from "./composer-inline-mention-panel.js";
 import type { ComposerMentionCatalogItem } from "./composer-inline-mention.js";
 
 const mounted: Array<{ container: HTMLDivElement; root: ReturnType<typeof createRoot> }> = [];
+const frames: HTMLIFrameElement[] = [];
 
 afterEach(() => {
   for (const item of mounted.splice(0)) {
     act(() => item.root.unmount());
     item.container.remove();
   }
+  for (const frame of frames.splice(0)) frame.remove();
 });
 
 describe("inline mention panel", () => {
@@ -100,11 +102,24 @@ describe("inline mention panel", () => {
     const empty = renderPanel({ state: { kind: "ready", items: [], truncated: false }, results: { items: [], truncated: false } });
     expect(empty.textContent).toContain("No matches");
   });
+
+  it("resolves the active option through the panel owner document", () => {
+    const frame = document.createElement("iframe");
+    document.body.append(frame);
+    frames.push(frame);
+    const ownerDocument = frame.contentDocument!;
+    const lookup = vi.spyOn(ownerDocument, "getElementById");
+    renderPanel({}, ownerDocument);
+    expect(lookup).toHaveBeenCalledWith(expect.stringContaining("option-0"));
+  });
 });
 
-function renderPanel(overrides: Partial<Parameters<typeof ComposerInlineMentionPanel>[0]>): HTMLDivElement {
-  const container = document.createElement("div");
-  document.body.append(container);
+function renderPanel(
+  overrides: Partial<Parameters<typeof ComposerInlineMentionPanel>[0]>,
+  ownerDocument: Document = document
+): HTMLDivElement {
+  const container = ownerDocument.createElement("div");
+  ownerDocument.body.append(container);
   const root = createRoot(container);
   mounted.push({ container, root });
   act(() => root.render(<ComposerInlineMentionPanel

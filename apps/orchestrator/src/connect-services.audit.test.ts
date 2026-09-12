@@ -123,6 +123,26 @@ async function invoke(handler: unknown, request: unknown, handlerContext: unknow
   return await result;
 }
 
+function providerConfiguration(provider: {
+  readonly backendId: string;
+  readonly provider: { readonly id: string };
+  readonly displayName: string;
+  readonly kind: string;
+  readonly enabled: boolean;
+  readonly version: bigint;
+  readonly updatedAt: number;
+}) {
+  return {
+    providerId: provider.provider.id,
+    displayName: provider.displayName,
+    kind: provider.kind,
+    enabled: provider.enabled,
+    version: provider.version,
+    updatedAt: provider.updatedAt,
+    runtimes: [provider]
+  };
+}
+
 describe("Connect security and protocol audit", () => {
   it("authenticates every RPC except the explicit credential-free bootstrap calls", async () => {
     const registrations: Array<{
@@ -265,6 +285,8 @@ describe("Connect security and protocol audit", () => {
 
   it("routes a managed Provider catalog through a fake non-specialized Backend capability", async () => {
     const list = vi.fn(() => [{
+      backendId: "backend-provider-capability",
+      credentialOrigin: "",
       provider: { id: "provider-capability", api: "anthropic-messages", models: [] },
       displayName: "Capability Provider",
       kind: "api_key",
@@ -282,6 +304,7 @@ describe("Connect security and protocol audit", () => {
         getBackend: (backendId: string) => ({
           descriptor: {
             id: backendId,
+            models: [],
             capabilities: new Map([["provider.managed_catalog", {
               key: "provider.managed_catalog",
               supported: true
@@ -349,6 +372,8 @@ describe("Connect security and protocol audit", () => {
 
   it("projects capability-owned account quota separately from token usage", async () => {
     const descriptor = {
+      backendId: "backend-provider-capability",
+      credentialOrigin: "",
       provider: { id: "subscription-capability", models: [] },
       displayName: "Subscription capability",
       kind: "subscription",
@@ -376,6 +401,7 @@ describe("Connect security and protocol audit", () => {
         getBackend: (backendId: string) => ({
           descriptor: {
             id: backendId,
+            models: [],
             capabilities: new Map([["provider.managed_catalog", {
               key: "provider.managed_catalog",
               supported: true
@@ -438,6 +464,8 @@ describe("Connect security and protocol audit", () => {
       diagnostics: []
     });
     const descriptor = {
+      backendId: "managed-provider-backend",
+      credentialOrigin: "",
       provider: { id: "subscription-snapshot", models: [] },
       displayName: "Subscription snapshot",
       kind: "subscription",
@@ -455,7 +483,7 @@ describe("Connect security and protocol audit", () => {
     const peek = vi.fn(() => undefined);
     const services = createConnectServices(stubApplication({
       store,
-      providers: { list: () => [descriptor] },
+      providers: { list: () => [descriptor], listConfigurations: () => [providerConfiguration(descriptor)] },
       providerAccountUsage: { get, peek },
       connections: { authenticate: () => ({ id: "connection-account-snapshot", authKeyDigest: "digest", state: "active" }) }
     }));
@@ -495,6 +523,8 @@ describe("Connect security and protocol audit", () => {
       disabledModels: [{ providerId: "managed-provider", modelId: "disabled-model" }]
     });
     const provider = {
+      backendId: "managed-model-backend",
+      credentialOrigin: "",
       provider: {
         id: "managed-provider",
         api: "openai-responses",
@@ -513,7 +543,7 @@ describe("Connect security and protocol audit", () => {
     };
     const services = createConnectServices(stubApplication({
       store,
-      providers: { list: () => [provider] },
+      providers: { list: () => [provider], listConfigurations: () => [providerConfiguration(provider)] },
       connections: { authenticate: () => ({ id: "connection-owner-model-catalog", authKeyDigest: "digest", state: "active" }) }
     }));
 
@@ -888,6 +918,78 @@ describe("Connect security and protocol audit", () => {
       source: contract.RuntimeCommandSource.PROMPT,
       loaded: false
     });
+  });
+
+  it("returns only exact loaded resources from the generation produced by first activation", async () => {
+    let generation = 1;
+    const getResources = vi.fn(async () => {
+      generation = 2;
+      return [{
+        id: "prompt-one",
+        kind: "prompt" as const,
+        name: "Release notes",
+        version: "1.2.3",
+        source: "managed",
+        state: "loaded" as const,
+        revision: "sha256:revision-one",
+        resourceVersion: 7n,
+        runtimePath: "C:\\runtime\\resources\\prompt.md",
+        runtimeGeneration: 2
+      }, {
+        id: "approved-only",
+        kind: "skill" as const,
+        name: "Not loaded",
+        source: "managed",
+        state: "approved" as const,
+        revision: "sha256:revision-two",
+        resourceVersion: 8n,
+        runtimePath: "C:\\runtime\\resources\\skill",
+        runtimeGeneration: 2
+      }, {
+        id: " invalid-id",
+        kind: "prompt" as const,
+        name: "Invalid identity",
+        source: "managed",
+        state: "loaded" as const,
+        revision: "sha256:revision-three",
+        resourceVersion: 9n,
+        runtimePath: "C:\\runtime\\resources\\invalid.md",
+        runtimeGeneration: 2
+      }, {
+        id: "overflow-version",
+        kind: "prompt" as const,
+        name: "Invalid version",
+        source: "managed",
+        state: "loaded" as const,
+        revision: "sha256:revision-four",
+        resourceVersion: 18_446_744_073_709_551_616n,
+        runtimePath: "C:\\runtime\\resources\\overflow.md",
+        runtimeGeneration: 2
+      }];
+    });
+    const services = createConnectServices(stubApplication({
+      connections: { authenticate: () => ({ id: "connection-session-resources", authKeyDigest: "digest", state: "active" }) },
+      store: {
+        getSession: () => ({ descriptor: { binding: { generation } } })
+      },
+      sessionHost: { getResources }
+    }));
+
+    const response = await invoke(services.session.listSessionResources, {
+      sessionId: "session-resources"
+    }, context()) as { resources: readonly contract.SessionResource[] };
+
+    expect(getResources).toHaveBeenCalledExactlyOnceWith("session-resources");
+    expect(response.resources).toEqual([expect.objectContaining({
+      sessionId: "session-resources",
+      resourceId: "prompt-one",
+      kind: contract.ResourceKind.PROMPT_TEMPLATE,
+      name: "Release notes",
+      version: "1.2.3",
+      discoveredRevision: "sha256:revision-one",
+      resourceVersion: 7n,
+      runtimeGeneration: 2n
+    })]);
   });
 
   it("maps authenticated owner-wide visible message search without Backend branching", async () => {
@@ -1976,6 +2078,8 @@ describe("Connect security and protocol audit", () => {
       diagnostics: []
     });
     const provider = {
+      backendId: "pi",
+      credentialOrigin: "",
       provider: {
         id: "provider-signed-out",
         api: "openai-responses",
@@ -2031,7 +2135,7 @@ describe("Connect security and protocol audit", () => {
     const services = createConnectServices(stubApplication({
       store,
       connections: { authenticate: () => ({ id: "connection-owner", authKeyDigest: "digest", state: "active" }) },
-      providers: { list: () => [provider] },
+      providers: { list: () => [provider], listConfigurations: () => [providerConfiguration(provider)] },
       credentials: { list: () => [] },
       mcpRouter: { list: () => [] },
       piResources: {
@@ -2554,10 +2658,10 @@ describe("Connect security and protocol audit", () => {
       {
         name: "delete_target.delete_managed_workspace",
         first: mutation({ case: "deleteTarget", value: create(contract.DeleteTargetMutationSchema, {
-          targetId: "target", deleteManagedWorkspace: false, deleteProductSessions: false
+          targetId: "target", deleteManagedWorkspace: false
         }) }),
         second: mutation({ case: "deleteTarget", value: create(contract.DeleteTargetMutationSchema, {
-          targetId: "target", deleteManagedWorkspace: true, deleteProductSessions: false
+          targetId: "target", deleteManagedWorkspace: true
         }) })
       }
     ];
@@ -2615,6 +2719,46 @@ describe("Connect security and protocol audit", () => {
     expect(register).not.toHaveBeenCalled();
   });
 
+  it("requires every product task to finish its own lifecycle deletion before deleting a Target", async () => {
+    const existing = {
+      descriptor: {
+        id: "target-with-task",
+        backendId: "pi",
+        displayName: "Target with task",
+        workspaceRoot: "D:\\workspace",
+        managed: false,
+        trusted: false
+      },
+      metadata: {},
+      revision: 1n,
+      updatedAt: 1
+    };
+    const mutate = vi.fn();
+    const services = createConnectServices(stubApplication({
+      store: {
+        findOperation: () => undefined,
+        getTarget: () => existing,
+        listSessions: () => [{ descriptor: { id: "task", targetId: existing.descriptor.id }, revision: 1n }]
+      },
+      sessionHost: { mutate },
+      connections: { authenticate: () => ({ id: "connection", authKeyDigest: "digest", state: "active" }) }
+    }));
+    const mutation = create(contract.OperationMutationSchema, {
+      preconditions: [],
+      payload: { case: "deleteTarget", value: create(contract.DeleteTargetMutationSchema, {
+        targetId: existing.descriptor.id,
+        deleteManagedWorkspace: false
+      }) }
+    });
+
+    await expect(invoke(services.operation.submitOperation, {
+      operationId: "operation-delete-nonempty-target",
+      connectionId: "connection",
+      mutation
+    }, context())).rejects.toMatchObject({ code: Code.FailedPrecondition });
+    expect(mutate).not.toHaveBeenCalled();
+  });
+
   it("moves only a managed Target workspace into recoverable trash before tombstoning it", async () => {
     const dataDirectory = mkdtempSync(join(tmpdir(), "joko-target-delete-audit-"));
     cleanups.push(() => rmSync(dataDirectory, { recursive: true, force: true }));
@@ -2646,8 +2790,7 @@ describe("Connect security and protocol audit", () => {
       preconditions: [],
       payload: { case: "deleteTarget", value: create(contract.DeleteTargetMutationSchema, {
         targetId: existing.descriptor.id,
-        deleteManagedWorkspace: true,
-        deleteProductSessions: true
+        deleteManagedWorkspace: true
       }) }
     });
     const outcome = { accepted: true, resultCase: "target", entityId: existing.descriptor.id };
@@ -2815,8 +2958,10 @@ describe("Connect security and protocol audit", () => {
     expect(beginHumanTakeover).toHaveBeenCalledOnce();
   });
 
-  it.each(["http", "html"] as const)("claims a cold %s Browser page before reading or opening and freezes the started generation", async (sourceKind) => {
+  it.each(["http", "html", "html-long-path"] as const)("claims a cold %s Browser page before reading or opening and freezes the started generation", async (sourceKind) => {
     const order: string[] = [];
+    const html = sourceKind !== "http";
+    const sourcePath = sourceKind === "html-long-path" ? `${"nested/".repeat(160)}index.html` : "index.html";
     const request = new AbortController();
     let revoke = (): void => undefined;
     const unsubscribe = vi.fn();
@@ -2836,6 +2981,7 @@ describe("Connect security and protocol audit", () => {
       order.push("start");
       generation = 1;
     });
+    const recordHumanPage = vi.fn();
     const openHumanPage = vi.fn(async (binding: {
       readonly providerId: string;
       readonly generation: number;
@@ -2886,8 +3032,9 @@ describe("Connect security and protocol audit", () => {
       payload: { case: "openBrowserPage", value: create(contract.OpenBrowserPageMutationSchema, {
         browserProviderId: "browser",
         sessionId: "session-browser-open",
-        url: sourceKind === "http" ? "https://example.test/open" : "",
-        ...(sourceKind === "html" ? { workspaceHtml: { workspaceId: "workspace-html", relativePath: "index.html", expectedRevision: `workspace-html:${createHash("sha256").update(JSON.stringify(["workspace-authority", "index.html", "revision-html"])).digest("hex")}` } } : {})
+        url: html ? "" : "https://example.test/open",
+        presentationTarget: contract.BrowserAutomationTarget.SIDEBAR,
+        ...(html ? { workspaceHtml: { workspaceId: "workspace-html", relativePath: sourcePath, expectedRevision: `workspace-html:${createHash("sha256").update(JSON.stringify(["workspace-authority", sourcePath, "revision-html"])).digest("hex")}` } } : {})
       }) }
     });
     const assertHumanTakeover = vi.fn((expected: typeof takeover) => {
@@ -2911,24 +3058,26 @@ describe("Connect security and protocol audit", () => {
         expect(order).toEqual(["claim", "start"]);
         order.push("read");
         expect(JSON.stringify(mutation, (_key, value) => typeof value === "bigint" ? value.toString() : value)).not.toContain("Private HTML bytes");
-        return { entry: { path: "index.html", revision: "revision-html" }, mediaType: "text/html", text: "<p>Private HTML bytes</p>", truncated: false };
+        return { entry: { path: sourcePath, revision: "revision-html" }, mediaType: "text/html", text: "<title>Private HTML title</title><p>Private HTML bytes</p>", truncated: false };
       }) }; } },
       browser: {
         id: "browser",
+        targetMode: "sidebar",
         get generation() { return generation; },
         start,
         openHumanPage,
-        listPages: async () => [{ id: "page-opened", title: "Opened", url: "https://example.test/open", state: "ready" as const }],
+        listPages: async () => [{ id: "page-opened", title: html ? "Private HTML title" : "Opened", url: "https://example.test/open", state: "ready" as const }],
         assertHumanTakeover,
         currentHumanTakeover: () => takeover
       },
       browserSettings: {
         enabled: () => true,
+        automationTarget: () => "sidebar",
         takeoverTimeout: () => 42_000
       },
       browserState: {
         findRecoverablePage: () => undefined,
-        recordHumanPage: vi.fn()
+        recordHumanPage
       },
       connections: {
         authenticate: () => ({ id: "connection", authKeyDigest: "digest", state: "active" }), fence: () => undefined,
@@ -2942,16 +3091,20 @@ describe("Connect security and protocol audit", () => {
       mutation
     }, context(request.signal));
 
-    expect(order).toEqual(sourceKind === "html" ? ["claim", "start", "read", "open", "commit"] : ["claim", "start", "open", "commit"]);
+    expect(order).toEqual(html ? ["claim", "start", "read", "open", "commit"] : ["claim", "start", "open", "commit"]);
     expect(openHumanPage).toHaveBeenCalledWith({
       providerId: "browser",
       generation: 1,
       owner: "connection",
-      url: sourceKind === "html" ? expect.stringMatching(/^https:\/\/[a-z0-9-]+\.preview\.joko\.invalid\/index\.html$/u) : "https://example.test/open"
-    }, 42_000, sourceKind === "html" ? expect.objectContaining({ html: "<p>Private HTML bytes</p>", assertCurrent: expect.any(Function) }) : undefined);
+      url: html ? expect.stringMatching(/^https:\/\/[a-z0-9-]+\.preview\.joko\.invalid\/.*index\.html$/u) : "https://example.test/open"
+    }, 42_000, html ? expect.objectContaining({ html: "<title>Private HTML title</title><p>Private HTML bytes</p>", assertCurrent: expect.any(Function) }) : undefined);
     expect(assertHumanTakeover).toHaveBeenCalledOnce();
+    expect(recordHumanPage).toHaveBeenCalledWith(expect.objectContaining({
+      title: html ? "HTML preview" : "Opened"
+    }), { active: true });
+    if (html) expect(JSON.stringify(recordHumanPage.mock.calls)).not.toContain("Private HTML title");
     expect(unsubscribe).not.toHaveBeenCalled();
-    if (sourceKind === "html") {
+    if (html) {
       request.abort();
       expect(readSignal?.aborted).toBe(false);
       revoke();
@@ -2960,6 +3113,499 @@ describe("Connect security and protocol audit", () => {
       pageSnapshot!.dispose!();
       expect(unsubscribe).toHaveBeenCalledOnce();
     }
+  });
+
+  it.each([
+    { name: "missing", target: contract.BrowserAutomationTarget.UNSPECIFIED, settingsTarget: "external", providerTarget: "external", code: Code.InvalidArgument },
+    { name: "unknown", target: 99 as contract.BrowserAutomationTarget, settingsTarget: "external", providerTarget: "external", code: Code.InvalidArgument },
+    { name: "settings mismatch", target: contract.BrowserAutomationTarget.EXTERNAL, settingsTarget: "sidebar", providerTarget: "external", code: Code.Unavailable },
+    { name: "Provider mismatch", target: contract.BrowserAutomationTarget.EXTERNAL, settingsTarget: "external", providerTarget: "sidebar", code: Code.Unavailable }
+  ] as const)("rejects a $name Browser presentation target before task or Provider side effects", async ({ target, settingsTarget, providerTarget, code }) => {
+    const getSession = vi.fn();
+    const mutate = vi.fn();
+    const start = vi.fn();
+    const openHumanPage = vi.fn();
+    const mutation = create(contract.OperationMutationSchema, {
+      payload: { case: "openBrowserPage", value: create(contract.OpenBrowserPageMutationSchema, {
+        browserProviderId: "browser",
+        sessionId: "session-browser-target",
+        url: "https://example.test/open",
+        presentationTarget: target
+      }) }
+    });
+    const services = createConnectServices(stubApplication({
+      store: { findOperation: () => undefined, getSession },
+      sessionHost: { mutate },
+      browser: {
+        id: "browser",
+        targetMode: providerTarget,
+        generation: 0,
+        currentHumanTakeover: () => undefined,
+        start,
+        openHumanPage
+      },
+      browserSettings: { automationTarget: () => settingsTarget },
+      connections: { authenticate: () => ({ id: "connection", authKeyDigest: "digest", state: "active" }) }
+    }));
+
+    await expect(invoke(services.operation.submitOperation, {
+      operationId: `operation-browser-target-${target}-${settingsTarget}-${providerTarget}`,
+      connectionId: "connection",
+      mutation
+    }, context())).rejects.toMatchObject({ code });
+
+    expect(getSession).not.toHaveBeenCalled();
+    expect(mutate).not.toHaveBeenCalled();
+    expect(start).not.toHaveBeenCalled();
+    expect(openHumanPage).not.toHaveBeenCalled();
+  });
+
+  it("rejects a percent-expanded Workspace HTML path before a durable claim, read, or Browser effect", async () => {
+    const mutate = vi.fn();
+    const capturePreviewAuthority = vi.fn();
+    const start = vi.fn();
+    const currentHumanTakeover = vi.fn();
+    const path = `${"🦊".repeat(1_000)}.html`;
+    const mutation = create(contract.OperationMutationSchema, {
+      payload: { case: "openBrowserPage", value: create(contract.OpenBrowserPageMutationSchema, {
+        browserProviderId: "browser",
+        sessionId: "session-browser-encoded-path",
+        presentationTarget: contract.BrowserAutomationTarget.EXTERNAL,
+        workspaceHtml: { workspaceId: "workspace-html", relativePath: path, expectedRevision: "workspace-html:exact" }
+      }) }
+    });
+    const services = createConnectServices(stubApplication({
+      store: {
+        findOperation: () => undefined,
+        findPendingSessionLifecycleCleanup: () => undefined,
+        getSession: () => ({ descriptor: { id: "session-browser-encoded-path", targetId: "target-browser", binding: { generation: 0 }, archived: false } })
+      },
+      sessionHost: { mutate },
+      workspaces: { capturePreviewAuthority },
+      browser: { id: "browser", targetMode: "external", generation: 0, currentHumanTakeover, start },
+      browserSettings: { enabled: () => true, automationTarget: () => "external" },
+      browserState: { findRecoverablePage: () => undefined },
+      connections: { authenticate: () => ({ id: "connection", authKeyDigest: "digest", state: "active" }) }
+    }));
+
+    await expect(invoke(services.operation.submitOperation, {
+      operationId: "operation-browser-encoded-path",
+      connectionId: "connection",
+      mutation
+    }, context())).rejects.toMatchObject({ code: Code.InvalidArgument });
+
+    expect(mutate).not.toHaveBeenCalled();
+    expect(capturePreviewAuthority).not.toHaveBeenCalled();
+    expect(currentHumanTakeover).not.toHaveBeenCalled();
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it.each(["sidebar", "external"] as const)("projects a missing Browser settings controller as disabled on the exact %s Provider target", async (targetMode) => {
+    const directory = mkdtempSync(join(tmpdir(), "joko-browser-settings-unavailable-"));
+    const store = new OperationalStore(join(directory, "orchestrator.db"));
+    cleanups.push(() => {
+      store.close();
+      rmSync(directory, { recursive: true, force: true });
+    });
+    const services = createConnectServices(stubApplication({
+      store,
+      browser: { id: "browser", targetMode, running: true, generation: 7 },
+      connections: { authenticate: () => ({ id: "connection", authKeyDigest: "digest", state: "active" }) }
+    }));
+
+    const response = await invoke(services.settings.getSettings, {}, context()) as { settings?: contract.SettingsSnapshot };
+    expect(response.settings?.browsers[0]).toMatchObject({
+      automationTarget: targetMode === "sidebar" ? contract.BrowserAutomationTarget.SIDEBAR : contract.BrowserAutomationTarget.EXTERNAL,
+      support: contract.CapabilitySupport.TEMPORARILY_UNAVAILABLE,
+      allowUploads: false,
+      allowDownloads: false,
+      targetSettings: [],
+      backendHealth: {
+        active: false,
+        status: contract.BrowserBackendStatus.UNAVAILABLE,
+        canRecover: false,
+        reason: contract.BrowserBackendFailureReason.STATUS_FAILED
+      }
+    });
+  });
+
+  it.each([
+    { change: "target switch", phase: "claim", code: Code.Unavailable },
+    { change: "target switch", phase: "start", code: Code.Unavailable },
+    { change: "target switch", phase: "read", code: Code.Unavailable },
+    { change: "target switch", phase: "open", code: Code.Unavailable },
+    { change: "target switch", phase: "commit", code: Code.Unavailable },
+    { change: "project disable", phase: "claim", code: Code.FailedPrecondition },
+    { change: "project disable", phase: "start", code: Code.FailedPrecondition },
+    { change: "project disable", phase: "read", code: Code.FailedPrecondition },
+    { change: "project disable", phase: "open", code: Code.FailedPrecondition },
+    { change: "project disable", phase: "commit", code: Code.FailedPrecondition }
+  ] as const)("fences a same-generation $change at the $phase boundary", async ({ change, phase, code }) => {
+    let settingsTarget: "sidebar" | "external" = "external";
+    let providerTarget: "sidebar" | "external" = "external";
+    let enabled = true;
+    let generation = 0;
+    let pageSnapshot: Parameters<import("@joko/tool-browser").BrowserProvider["openHumanPage"]>[2];
+    let takeover: {
+      readonly providerId: string;
+      readonly pageId: string;
+      readonly generation: number;
+      readonly owner: string;
+      readonly takeoverId: string;
+      readonly startedAt: number;
+      readonly expiresAt: number;
+    } | undefined;
+    const invalidate = (): void => {
+      if (change === "target switch") { settingsTarget = "sidebar"; providerTarget = "sidebar"; }
+      else enabled = false;
+    };
+    const start = vi.fn(async () => { generation = 1; if (phase === "start") invalidate(); });
+    const preview = vi.fn(async () => {
+      if (phase === "read") invalidate();
+      return { entry: { path: "index.html", revision: "revision-html" }, mediaType: "text/html", text: "<p>Exact snapshot</p>", truncated: false };
+    });
+    const openHumanPage = vi.fn(async (binding: {
+      readonly providerId: string;
+      readonly generation: number;
+      readonly owner: string;
+      readonly url: string;
+    }, _ttl?: number, snapshot?: Parameters<import("@joko/tool-browser").BrowserProvider["openHumanPage"]>[2]) => {
+      pageSnapshot = snapshot;
+      snapshot?.assertCurrent();
+      if (phase === "open") invalidate();
+      takeover = {
+        providerId: binding.providerId,
+        pageId: "page-opened",
+        generation: binding.generation,
+        owner: binding.owner,
+        takeoverId: "takeover-opened",
+        startedAt: 1,
+        expiresAt: 2
+      };
+      return takeover;
+    });
+    const compensateHumanPageOpen = vi.fn(async (opened: NonNullable<typeof takeover>, previous?: { readonly pageId: string; readonly assertCurrent: () => void }) => {
+      expect(opened).toBe(takeover);
+      expect(previous).toBeUndefined();
+      pageSnapshot?.dispose?.();
+      takeover = undefined;
+      return undefined;
+    });
+    const unsubscribeReadOwner = vi.fn();
+    const listPages = vi.fn(async () => [{ id: "page-opened", title: "Opened", url: "https://example.test/open", state: "ready" as const }]);
+    const recordHumanPage = vi.fn();
+    const mutate = vi.fn(async (input: { precondition?: () => void; effect?: () => Promise<void>; commit: () => unknown }) => {
+      if (phase === "claim") invalidate();
+      input.precondition?.();
+      await input.effect?.();
+      input.precondition?.();
+      if (phase === "commit") {
+        invalidate();
+        input.commit();
+      }
+      throw new Error("The invalidated Browser target must not reach commit.");
+    });
+    const mutation = create(contract.OperationMutationSchema, {
+      payload: { case: "openBrowserPage", value: create(contract.OpenBrowserPageMutationSchema, {
+        browserProviderId: "browser",
+        sessionId: "session-browser-target-race",
+        presentationTarget: contract.BrowserAutomationTarget.EXTERNAL,
+        workspaceHtml: {
+          workspaceId: "workspace-html",
+          relativePath: "index.html",
+          expectedRevision: `workspace-html:${createHash("sha256").update(JSON.stringify(["workspace-authority", "index.html", "revision-html"])).digest("hex")}`
+        }
+      }) }
+    });
+    const services = createConnectServices(stubApplication({
+      store: {
+        findOperation: () => undefined,
+        findPendingSessionLifecycleCleanup: () => undefined,
+        getTarget: () => ({ descriptor: { id: "target-browser" }, metadata: { workspaceId: "workspace-html" }, revision: 1n }),
+        getSession: () => ({ descriptor: { id: "session-browser-target-race", targetId: "target-browser", binding: { generation: 0 }, archived: false } })
+      },
+      sessionHost: { mutate },
+      workspaces: { capturePreviewAuthority: async () => ({ identity: "workspace-authority", assertCurrent: () => undefined, preview }) },
+      browser: {
+        id: "browser",
+        get targetMode() { return providerTarget; },
+        get generation() { return generation; },
+        get running() { return generation > 0; },
+        currentHumanTakeover: () => takeover,
+        start,
+        openHumanPage,
+        compensateHumanPageOpen,
+        listPages,
+        assertHumanTakeover: () => undefined
+      },
+      browserSettings: {
+        enabled: () => enabled,
+        automationTarget: () => settingsTarget,
+        takeoverTimeout: () => 42_000
+      },
+      browserState: { findRecoverablePage: () => undefined, recordHumanPage },
+      connections: {
+        authenticate: () => ({ id: "connection", authKeyDigest: "digest", state: "active" }),
+        fence: () => undefined,
+        onRevoked: () => unsubscribeReadOwner
+      }
+    }));
+
+    await expect(invoke(services.operation.submitOperation, {
+      operationId: `operation-browser-target-race-${phase}`,
+      connectionId: "connection",
+      mutation
+    }, context())).rejects.toMatchObject({ code });
+
+    expect(start).toHaveBeenCalledTimes(phase === "claim" ? 0 : 1);
+    expect(preview).toHaveBeenCalledTimes(phase === "read" || phase === "open" || phase === "commit" ? 1 : 0);
+    expect(openHumanPage).toHaveBeenCalledTimes(phase === "open" || phase === "commit" ? 1 : 0);
+    expect(listPages).toHaveBeenCalledTimes(phase === "commit" ? 1 : 0);
+    expect(recordHumanPage).not.toHaveBeenCalled();
+    expect(compensateHumanPageOpen).toHaveBeenCalledTimes(phase === "open" || phase === "commit" ? 1 : 0);
+    expect(unsubscribeReadOwner).toHaveBeenCalledTimes(phase === "read" || phase === "open" || phase === "commit" ? 1 : 0);
+    expect(takeover).toBeUndefined();
+  });
+
+  it.each(["connection", "session", "target switch", "project disable"] as const)(
+    "compensates an uncommitted HTML page without restoring its source after %s authority retires",
+    async (retirement) => {
+      const connection = { id: "connection", authKeyDigest: "digest", state: "active" as const };
+      const sourceOwner = {
+        browserProviderId: "browser",
+        pageId: "page-source",
+        generation: 1,
+        sessionId: "session-browser-owner-race",
+        targetId: "target-browser",
+        bindingGeneration: 3,
+        url: "https://example.test/source",
+        title: "Source",
+        state: "open" as const,
+        updatedAt: 1
+      };
+      let connectionActive = true;
+      let sessionActive = true;
+      let settingsTarget: "sidebar" | "external" = "external";
+      let providerTarget: "sidebar" | "external" = "external";
+      let enabled = true;
+      let pageSnapshot: Parameters<import("@joko/tool-browser").BrowserProvider["openHumanPage"]>[2];
+      let takeover: {
+        readonly providerId: string;
+        readonly pageId: string;
+        readonly generation: number;
+        readonly owner: string;
+        readonly takeoverId: string;
+        readonly startedAt: number;
+        readonly expiresAt: number;
+      } | undefined = {
+        providerId: "browser",
+        pageId: sourceOwner.pageId,
+        generation: 1,
+        owner: connection.id,
+        takeoverId: "takeover-source",
+        startedAt: 1,
+        expiresAt: 60_000
+      };
+      const retire = (): void => {
+        switch (retirement) {
+          case "connection": connectionActive = false; break;
+          case "session": sessionActive = false; break;
+          case "target switch": settingsTarget = "sidebar"; providerTarget = "sidebar"; break;
+          case "project disable": enabled = false; break;
+        }
+      };
+      const unsubscribeReadOwner = vi.fn();
+      const recordHumanPage = vi.fn();
+      const openHumanPage = vi.fn(async (binding: {
+        readonly providerId: string;
+        readonly generation: number;
+        readonly owner: string;
+      }, _ttl?: number, snapshot?: Parameters<import("@joko/tool-browser").BrowserProvider["openHumanPage"]>[2]) => {
+        pageSnapshot = snapshot;
+        takeover = {
+          providerId: binding.providerId,
+          pageId: "page-opened",
+          generation: binding.generation,
+          owner: binding.owner,
+          takeoverId: "takeover-opened",
+          startedAt: 2,
+          expiresAt: 60_001
+        };
+        return takeover;
+      });
+      const compensateHumanPageOpen = vi.fn(async (
+        opened: NonNullable<typeof takeover>,
+        previous?: { readonly pageId: string; readonly assertCurrent: () => void }
+      ) => {
+        expect(opened).toBe(takeover);
+        expect(previous?.pageId).toBe(sourceOwner.pageId);
+        expect(() => previous?.assertCurrent()).toThrow();
+        pageSnapshot?.dispose?.();
+        takeover = undefined;
+        return undefined;
+      });
+      const connections = {
+        authenticate: () => connection,
+        fence: () => {
+          if (!connectionActive) throw new ConnectionAuthenticationError("AUTH_REVOKED", "revoked");
+          return connection;
+        },
+        onRevoked: () => unsubscribeReadOwner
+      };
+      const mutation = create(contract.OperationMutationSchema, {
+        payload: { case: "openBrowserPage", value: create(contract.OpenBrowserPageMutationSchema, {
+          browserProviderId: "browser",
+          sessionId: sourceOwner.sessionId,
+          expectedGeneration: 1n,
+          currentPageId: sourceOwner.pageId,
+          takeoverId: "takeover-source",
+          presentationTarget: contract.BrowserAutomationTarget.EXTERNAL,
+          workspaceHtml: {
+            workspaceId: "workspace-html",
+            relativePath: "index.html",
+            expectedRevision: `workspace-html:${createHash("sha256").update(JSON.stringify(["workspace-authority", "index.html", "revision-html"])).digest("hex")}`
+          }
+        }) }
+      });
+      const mutate = vi.fn(async (input: {
+        precondition?: () => void;
+        effect?: () => Promise<void>;
+      }) => {
+        input.precondition?.();
+        await input.effect?.();
+        retire();
+        if (retirement === "connection") connections.fence();
+        input.precondition?.();
+        throw new Error("Retired authority reached the Browser page-open commit.");
+      });
+      const services = createConnectServices(stubApplication({
+        store: {
+          findOperation: () => undefined,
+          findPendingSessionLifecycleCleanup: () => undefined,
+          getTarget: () => ({ descriptor: { id: sourceOwner.targetId }, metadata: { workspaceId: "workspace-html" }, revision: 1n }),
+          getSession: () => ({ descriptor: {
+            id: sourceOwner.sessionId,
+            targetId: sourceOwner.targetId,
+            binding: { generation: sourceOwner.bindingGeneration },
+            archived: false
+          } })
+        },
+        sessionHost: { mutate },
+        workspaces: { capturePreviewAuthority: async () => ({
+          identity: "workspace-authority",
+          assertCurrent: () => undefined,
+          preview: async () => ({
+            entry: { path: "index.html", revision: "revision-html" },
+            mediaType: "text/html",
+            text: "<title>Private</title>",
+            truncated: false
+          })
+        }) },
+        browser: {
+          id: "browser",
+          get targetMode() { return providerTarget; },
+          generation: 1,
+          running: true,
+          currentHumanTakeover: () => takeover,
+          assertHumanTakeover: (expected: NonNullable<typeof takeover>) => {
+            if (takeover?.takeoverId !== expected.takeoverId || takeover.pageId !== expected.pageId) {
+              throw new Error("stale takeover");
+            }
+            return takeover;
+          },
+          start: async () => undefined,
+          openHumanPage,
+          compensateHumanPageOpen,
+          listPages: async () => [{
+            id: "page-opened",
+            title: "Private",
+            url: "https://workspace.preview.joko.invalid/index.html",
+            state: "ready" as const
+          }]
+        },
+        browserSettings: {
+          enabled: () => enabled,
+          automationTarget: () => settingsTarget,
+          takeoverTimeout: () => 42_000
+        },
+        browserState: {
+          findRecoverablePage: (_providerId: string, pageId: string) => pageId === sourceOwner.pageId ? sourceOwner : undefined,
+          assertSessionAuthority: () => {
+            if (!sessionActive) throw new Error("retired session");
+          },
+          assertPageAuthority: () => {
+            if (!sessionActive) throw new Error("retired page owner");
+            return sourceOwner;
+          },
+          recordHumanPage
+        },
+        connections
+      }));
+
+      await expect(invoke(services.operation.submitOperation, {
+        operationId: `operation-browser-owner-retirement-${retirement}`,
+        connectionId: connection.id,
+        mutation
+      }, context())).rejects.toThrow();
+
+      expect(openHumanPage).toHaveBeenCalledOnce();
+      expect(compensateHumanPageOpen).toHaveBeenCalledOnce();
+      expect(recordHumanPage).not.toHaveBeenCalled();
+      expect(unsubscribeReadOwner).toHaveBeenCalledOnce();
+      expect(takeover).toBeUndefined();
+    }
+  );
+
+  it("replays a completed targeted Browser open without repeating settings, Workspace, or Provider effects", async () => {
+    const mutation = create(contract.OperationMutationSchema, {
+      payload: { case: "openBrowserPage", value: create(contract.OpenBrowserPageMutationSchema, {
+        browserProviderId: "browser",
+        sessionId: "session-browser-replay",
+        presentationTarget: contract.BrowserAutomationTarget.EXTERNAL,
+        workspaceHtml: { workspaceId: "workspace", relativePath: "index.html", expectedRevision: "workspace-html:recorded" }
+      }) }
+    });
+    const record = {
+      id: "operation-browser-target-replay",
+      connectionId: "connection",
+      kind: "openBrowserPage",
+      body: mutation,
+      bodyHash: operationBodyHash(mutation),
+      completionMode: "external_effect",
+      status: "completed",
+      response: { accepted: true, resultCase: "browserTakeover", entityId: "takeover-recorded" },
+      createdAt: 1,
+      updatedAt: 2,
+      revision: 1n
+    } as const;
+    const getSession = vi.fn();
+    const preview = vi.fn();
+    const start = vi.fn();
+    const openHumanPage = vi.fn();
+    const automationTarget = vi.fn();
+    const services = createConnectServices(stubApplication({
+      store: { findOperation: () => record, getSession },
+      workspaces: { capturePreviewAuthority: preview },
+      browser: { id: "browser", targetMode: "sidebar", generation: 99, start, openHumanPage },
+      browserSettings: { automationTarget },
+      connections: { authenticate: () => ({ id: "connection", authKeyDigest: "digest", state: "active" }) }
+    }));
+
+    const response = await invoke(services.operation.submitOperation, {
+      operationId: record.id,
+      connectionId: "connection",
+      mutation
+    }, context());
+
+    expect(response).toMatchObject({ operation: {
+      state: contract.OperationState.SUCCEEDED,
+      result: { payload: { case: "acknowledgement" } }
+    } });
+    expect(getSession).not.toHaveBeenCalled();
+    expect(preview).not.toHaveBeenCalled();
+    expect(start).not.toHaveBeenCalled();
+    expect(openHumanPage).not.toHaveBeenCalled();
+    expect(automationTarget).not.toHaveBeenCalled();
   });
 
   it.each(["request", "connection"] as const)("cancels an in-flight HTML snapshot read with its original %s and releases the subscription", async (cause) => {
@@ -3001,6 +3647,58 @@ describe("Connect security and protocol audit", () => {
     expect(unsubscribe).toHaveBeenCalledOnce();
   });
 
+  it("rejects URL-only Workspace HTML recovery before observing or mutating the Provider", async () => {
+    const currentHumanTakeover = vi.fn();
+    const start = vi.fn();
+    const openHumanPage = vi.fn();
+    const mutate = vi.fn();
+    const findRecoverablePage = vi.fn();
+    const mutation = create(contract.OperationMutationSchema, {
+      payload: { case: "openBrowserPage", value: create(contract.OpenBrowserPageMutationSchema, {
+        browserProviderId: "browser",
+        sessionId: "session-browser-html-recovery",
+        url: "https://retired-source.preview.joko.invalid/private.html",
+        presentationTarget: contract.BrowserAutomationTarget.EXTERNAL
+      }) }
+    });
+    const services = createConnectServices(stubApplication({
+      store: {
+        findOperation: () => undefined,
+        findPendingSessionLifecycleCleanup: () => undefined,
+        getSession: () => ({ descriptor: {
+          id: "session-browser-html-recovery",
+          targetId: "target-browser",
+          binding: { generation: 1 },
+          archived: false
+        } })
+      },
+      sessionHost: { mutate },
+      browser: {
+        id: "browser",
+        targetMode: "external",
+        generation: 7,
+        currentHumanTakeover,
+        start,
+        openHumanPage
+      },
+      browserSettings: { enabled: () => true, automationTarget: () => "external" },
+      browserState: { findRecoverablePage },
+      connections: { authenticate: () => ({ id: "connection", authKeyDigest: "digest", state: "active" }) }
+    }));
+
+    await expect(invoke(services.operation.submitOperation, {
+      operationId: "operation-browser-html-url-recovery",
+      connectionId: "connection",
+      mutation
+    }, context())).rejects.toMatchObject({ code: Code.FailedPrecondition });
+
+    expect(findRecoverablePage).not.toHaveBeenCalled();
+    expect(currentHumanTakeover).not.toHaveBeenCalled();
+    expect(mutate).not.toHaveBeenCalled();
+    expect(start).not.toHaveBeenCalled();
+    expect(openHumanPage).not.toHaveBeenCalled();
+  });
+
   it("rejects cross-task Browser page recovery before observing or mutating the provider", async () => {
     const currentHumanTakeover = vi.fn(() => undefined);
     const start = vi.fn(async () => undefined);
@@ -3015,7 +3713,8 @@ describe("Connect security and protocol audit", () => {
         browserProviderId: "browser",
         sessionId: "session-browser-b",
         recoveryPageId: "page-browser-a",
-        url: "https://example.test/recover"
+        url: "https://example.test/recover",
+        presentationTarget: contract.BrowserAutomationTarget.SIDEBAR
       }) }
     });
     const services = createConnectServices(stubApplication({
@@ -3033,6 +3732,7 @@ describe("Connect security and protocol audit", () => {
       sessionHost: { mutate },
       browser: {
         id: "browser",
+        targetMode: "sidebar",
         generation: 0,
         running: false,
         currentHumanTakeover,
@@ -3055,7 +3755,7 @@ describe("Connect security and protocol audit", () => {
         }),
         recordHumanPage
       },
-      browserSettings: { enabled: () => true },
+      browserSettings: { enabled: () => true, automationTarget: () => "sidebar" },
       connections: { authenticate: () => ({ id: "connection", authKeyDigest: "digest", state: "active" }) }
     }));
 
@@ -3095,7 +3795,8 @@ describe("Connect security and protocol audit", () => {
         payload: { case: "openBrowserPage", value: create(contract.OpenBrowserPageMutationSchema, {
           browserProviderId: "browser",
           sessionId: `session-browser-${blocked.name}`,
-          url: "https://example.test/open"
+          url: "https://example.test/open",
+          presentationTarget: contract.BrowserAutomationTarget.SIDEBAR
         }) }
       });
       const services = createConnectServices(stubApplication({
@@ -3105,8 +3806,8 @@ describe("Connect security and protocol audit", () => {
           getSession: () => ({ descriptor: blocked.descriptor })
         },
         sessionHost: { mutate },
-        browser: { id: "browser", generation: 0, currentHumanTakeover },
-        browserSettings: { enabled: () => true },
+        browser: { id: "browser", targetMode: "sidebar", generation: 0, currentHumanTakeover },
+        browserSettings: { enabled: () => true, automationTarget: () => "sidebar" },
         connections: { authenticate: () => ({ id: "connection", authKeyDigest: "digest", state: "active" }) }
       }));
 
@@ -3128,7 +3829,11 @@ describe("Connect security and protocol audit", () => {
     }
   });
 
-  it("focuses and closes Browser pages only through the complete owned takeover fence", async () => {
+  it("focuses and closes Workspace HTML pages without persisting their private document titles", async () => {
+    const previewUrls = {
+      "page-7-1": "https://workspace-one.preview.joko.invalid/private-one.html",
+      "page-7-2": "https://workspace-two.preview.joko.invalid/private-two.html"
+    } as const;
     let current: {
       readonly providerId: string;
       readonly pageId: string;
@@ -3193,7 +3898,10 @@ describe("Connect security and protocol audit", () => {
       },
       focusHumanPage,
       closeHumanPage,
-      listPages: async () => [{ id: "page-7-1", title: "One", url: "https://one.test/", state: "ready" as const }, { id: "page-7-2", title: "Two", url: "https://two.test/", state: "ready" as const }]
+      listPages: async () => [
+        { id: "page-7-1", title: "Private title one", url: previewUrls["page-7-1"], state: "ready" as const },
+        { id: "page-7-2", title: "Private title two", url: previewUrls["page-7-2"], state: "ready" as const }
+      ]
     };
     const services = createConnectServices(stubApplication({
       store: { findOperation: () => undefined },
@@ -3207,8 +3915,8 @@ describe("Connect security and protocol audit", () => {
           targetId: "target-1",
           bindingGeneration: 1,
           generation: 7,
-          url: pageId === "page-7-1" ? "https://one.test/" : "https://two.test/",
-          title: pageId,
+          url: previewUrls[pageId as keyof typeof previewUrls],
+          title: "HTML preview",
           state: "open" as const,
           updatedAt: 10
         }),
@@ -3229,7 +3937,12 @@ describe("Connect security and protocol audit", () => {
     }) } });
     await invoke(services.operation.submitOperation, { operationId: "focus-page", connectionId: "connection", mutation: focus }, context());
     expect(focusHumanPage).toHaveBeenCalledWith(expect.objectContaining({ takeoverId: "takeover-1" }), "page-7-2", 42_000);
-    expect(recordHumanPage).toHaveBeenCalledWith(expect.objectContaining({ pageId: "page-7-2", sessionId: "session-1" }), { active: true });
+    expect(recordHumanPage).toHaveBeenCalledWith(expect.objectContaining({
+      pageId: "page-7-2",
+      sessionId: "session-1",
+      url: previewUrls["page-7-2"],
+      title: "HTML preview"
+    }), { active: true });
 
     const close = create(contract.OperationMutationSchema, { payload: { case: "closeBrowserPage", value: create(contract.CloseBrowserPageMutationSchema, {
       browserProviderId: "browser",
@@ -3241,7 +3954,13 @@ describe("Connect security and protocol audit", () => {
     await invoke(services.operation.submitOperation, { operationId: "close-page", connectionId: "connection", mutation: close }, context());
     expect(closeHumanPage).toHaveBeenCalledWith(expect.objectContaining({ takeoverId: "takeover-2" }), "page-7-2", 42_000);
     expect(recordClosedPage).toHaveBeenCalledWith("browser", "page-7-2", 7, "page-7-1");
-    expect(recordHumanPage).toHaveBeenLastCalledWith(expect.objectContaining({ pageId: "page-7-1", sessionId: "session-1" }), { active: true });
+    expect(recordHumanPage).toHaveBeenLastCalledWith(expect.objectContaining({
+      pageId: "page-7-1",
+      sessionId: "session-1",
+      url: previewUrls["page-7-1"],
+      title: "HTML preview"
+    }), { active: true });
+    expect(JSON.stringify(recordHumanPage.mock.calls)).not.toContain("Private title");
   });
 
   it("rejects a cross-Session Browser focus before dispatch", async () => {

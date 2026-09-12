@@ -915,13 +915,16 @@ describe("ClaudeCodeAdapter", () => {
     const image = imageAttachment();
     const readBlob = vi.fn(async () => ({ data: image.data, mimeType: "image/png" }));
     const resolveFile = vi.fn(async () => attachmentPath);
+    const artifactBlob = { id: "mentioned-artifact", sha256: createHash("sha256").update("attachment").digest("hex"), byteLength: 10, mimeType: "text/plain" };
+    const assertArtifactCurrent = vi.fn();
+    const resolveArtifactMention = vi.fn(async () => ({ blob: artifactBlob, path: attachmentPath, assertCurrent: assertArtifactCurrent }));
     const runtime = new FakeSdkRuntime({ initialFrameOverrides: { cwd: workspaceTarget.workspaceRoot } });
-    const adapter = adapterFor(runtime, { readBlob, resolveFile });
+    const adapter = adapterFor(runtime, { readBlob, resolveFile, resolveArtifactMention });
     try {
       const descriptor = await adapter.describe();
       expect(descriptor.capabilities.get("input.image")?.supported).toBe(true);
       expect(descriptor.capabilities.get("input.file")?.supported).toBe(true);
-      expect(descriptor.capabilities.get("input.mention")).toMatchObject({ supported: true, options: ["workspace_file", "workspace_directory", "workspace_line_range"] });
+      expect(descriptor.capabilities.get("input.mention")).toMatchObject({ supported: true, options: ["workspace_file", "workspace_directory", "workspace_line_range", "artifact"] });
       const binding = await adapter.createSession(createInput({ target: workspaceTarget }), contextFor(undefined, { target: workspaceTarget }).context);
       const active = contextFor(binding, { target: workspaceTarget, operationId: "mixed-input" });
       await adapter.send({
@@ -931,7 +934,8 @@ describe("ClaudeCodeAdapter", () => {
         mentions: [
           { kind: "workspace_file", label: "mentioned", reference: "mentioned.txt" },
           { kind: "workspace_directory", label: "sources", reference: "source files" },
-          { kind: "workspace_file", label: "selected lines", reference: "mentioned.txt", lineRange: { startLine: 1, endLine: 1 } }
+          { kind: "workspace_file", label: "selected lines", reference: "mentioned.txt", lineRange: { startLine: 1, endLine: 1 } },
+          { kind: "artifact", label: "prior output", reference: artifactBlob.id }
         ]
       }, active.context);
       expect(runtime.queries[0]!.receivedInputs[0]!.message.content).toEqual([
@@ -941,15 +945,108 @@ describe("ClaudeCodeAdapter", () => {
           `Attached file: ${JSON.stringify({ name: "attached.txt", path: attachmentPath })}`,
           `Workspace file reference: ${JSON.stringify({ name: "mentioned", path: mentionedPath })}`,
           `Workspace directory reference: ${JSON.stringify({ name: "sources", path: directoryPath })}`,
-          `Workspace file reference: ${JSON.stringify({ name: "selected lines", path: mentionedPath, lineRange: { startLine: 1, endLine: 1 } })}`
+          `Workspace file reference: ${JSON.stringify({ name: "selected lines", path: mentionedPath, lineRange: { startLine: 1, endLine: 1 } })}`,
+          `Artifact reference: ${JSON.stringify({ name: "prior output", path: attachmentPath })}`
         ].join("\n\n") }
       ]);
       expect(resolveFile).toHaveBeenCalledWith(expect.objectContaining({ fileName: "attached.txt" }), active.context);
       expect(readBlob).toHaveBeenCalledOnce();
+      expect(resolveArtifactMention).toHaveBeenCalledWith(artifactBlob.id, active.context, expect.any(AbortSignal));
+      expect(assertArtifactCurrent).toHaveBeenCalled();
     } finally {
       await adapter.dispose();
       await rm(workspace, { recursive: true, force: true });
     }
+  });
+
+  test("refuses mismatched or retired Artifact authority before native admission", async () => {
+    const workspace = await mkdtemp(join(tmpdir(), "joko-claude-artifact-"));
+    const path = join(workspace, "report.txt");
+    await writeFile(path, "report");
+    const blob = { id: "report", sha256: createHash("sha256").update("report").digest("hex"), byteLength: 6, mimeType: "text/plain" };
+    let mode: "mismatch" | "retired" | "valid" = "mismatch";
+    const runtime = new FakeSdkRuntime();
+    const adapter = adapterFor(runtime, { resolveArtifactMention: async () => ({
+      blob: mode === "mismatch" ? { ...blob, id: "different" } : blob, path,
+      assertCurrent: () => { if (mode === "retired") throw new Error("Private authority details"); }
+    }) });
+    try {
+      const binding = await adapter.createSession(createInput(), contextFor().context);
+      const prompt = { ...textPrompt(""), mentions: [{ kind: "artifact" as const, label: "report", reference: blob.id }] };
+      await expect(adapter.send(prompt, contextFor(binding, { operationId: "mismatch" }).context))
+        .rejects.toMatchObject({ publicError: { code: "ARTIFACT_REFERENCE_INVALID", stateMayHaveChanged: false } });
+      mode = "retired";
+      await expect(adapter.send(prompt, contextFor(binding, { operationId: "retired" }).context))
+        .rejects.toMatchObject({ publicError: { code: "ARTIFACT_UNAVAILABLE", stateMayHaveChanged: false } });
+      expect(runtime.queries[0]!.receivedInputs).toEqual([]);
+      mode = "valid";
+      await adapter.send(prompt, contextFor(binding, { operationId: "valid" }).context);
+      expect(runtime.queries[0]!.receivedInputs[0]!.message.content).toContain("Artifact reference:");
+    } finally { await adapter.dispose(); await rm(workspace, { recursive: true, force: true }); }
+  });
+
+  test.each(["managed admission", "unread prompt", "unread steer"] as const)("withdraws an Artifact that is deleted while waiting for %s", async (waiting) => {
+    const workspace = await mkdtemp(join(tmpdir(), "joko-claude-artifact-authority-"));
+    const path = join(workspace, "report.txt");
+    await writeFile(path, "report");
+    const blob = { id: "report", sha256: createHash("sha256").update("report").digest("hex"), byteLength: 6, mimeType: "text/plain" };
+    let deleted = false;
+    const assertArtifactCurrent = vi.fn();
+    const resolveArtifactMention: NonNullable<ClaudeCodeAdapterOptions["resolveArtifactMention"]> = async (_id, _context, signal) => ({
+      blob, path, assertCurrent: () => {
+        signal.throwIfAborted();
+        assertArtifactCurrent();
+        if (deleted) throw new Error("The canonical record was deleted.");
+      }
+    });
+    const managed = managedProviderFixture();
+    let finishActivation: (() => void) | undefined;
+    const release = vi.fn();
+    const port: ManagedProviderRuntimePort = { ...managed.port, prepare: async (owner) => ({
+      ...await managed.port.prepare(owner), activate: async () => {
+        await new Promise<void>((resolvePromise) => { finishActivation = resolvePromise; });
+        return { release };
+      }
+    }) };
+    const runtime = new FakeSdkRuntime({ pauseAfterFirstInput: waiting !== "managed admission", initialFrameOverrides: {
+      ...(waiting === "managed admission" ? { model: "configured-model" } : {})
+    } });
+    const adapter = adapterFor(runtime, { resolveArtifactMention, ...(waiting === "managed admission" ? { managedProviders: port } : {}) });
+    try {
+      const selection = waiting === "managed admission" ? { providerId: "configured-provider", modelId: "configured-model" } : {};
+      const binding = await adapter.createSession(createInput(selection), contextFor().context);
+      const query = runtime.queries[0]!;
+      const parent = contextFor(binding, { operationId: "first" });
+      if (waiting !== "managed admission") {
+        await adapter.send(textPrompt("Start"), parent.context);
+        if (waiting === "unread prompt") {
+          query.push(resultMessage(binding.nativeSessionId!, { result: "Done", totalCostUsd: 0 }));
+          await eventually(() => parent.events.some((event) => event.type === "done"));
+        }
+      }
+      const context = { ...contextFor(binding, { operationId: "artifact-input" }).context,
+        ...(waiting === "managed admission" ? { modelSelection: { providerId: "configured-provider", modelId: "configured-model" } } : {}) };
+      const sending = adapter.send({ ...textPrompt(""), ...(waiting === "unread steer" ? { disposition: "steer" as const } : {}),
+        mentions: [{ kind: "artifact", label: "report", reference: blob.id }] }, context);
+      const rejected = expect(sending).rejects.toMatchObject({ publicError: { code: "ARTIFACT_UNAVAILABLE", stateMayHaveChanged: false } });
+      if (waiting === "managed admission") await vi.waitFor(() => expect(finishActivation).toBeTypeOf("function"));
+      else await vi.waitFor(() => expect(assertArtifactCurrent).toHaveBeenCalled());
+      deleted = true;
+      if (waiting === "managed admission") finishActivation!();
+      else query.resumeInputs();
+      await rejected;
+      expect(query.receivedInputs.map((entry) => entry.message.content)).toEqual(waiting === "managed admission" ? [] : ["Start"]);
+      if (waiting === "managed admission") expect(release).toHaveBeenCalledOnce();
+      if (waiting === "unread steer") {
+        expect(query.closeCalls).toBe(0);
+        query.push(resultMessage(binding.nativeSessionId!, { result: "Done", totalCostUsd: 0 }));
+        await eventually(() => parent.events.some((event) => event.type === "done"));
+        deleted = false;
+        await adapter.send({ ...textPrompt(""), mentions: [{ kind: "artifact", label: "report", reference: blob.id }] },
+          contextFor(binding, { operationId: "current-artifact" }).context);
+        expect(query.receivedInputs).toHaveLength(2);
+      }
+    } finally { await adapter.dispose(); await rm(workspace, { recursive: true, force: true }); }
   });
 
   test.each([
@@ -990,7 +1087,14 @@ describe("ClaudeCodeAdapter", () => {
         ...textPrompt(""), mentions: [{ kind: "workspace_file", label: "outside", reference: "../outside.txt" }]
       }, active.context)).rejects.toMatchObject({ publicError: { code: "WORKSPACE_PATH_DENIED" } });
       await expect(adapter.send({
-        ...textPrompt(""), mentions: [{ kind: "resource", label: "unknown", reference: "resource://unknown" }]
+        ...textPrompt(""), mentions: [{
+          kind: "resource",
+          label: "unknown",
+          reference: "resource://unknown",
+          discoveredRevision: "sha256:unknown",
+          resourceVersion: "1",
+          runtimeGeneration: 1
+        }]
       }, active.context)).rejects.toMatchObject({ publicError: { code: "MENTION_KIND_UNSUPPORTED" } });
       expect(runtime.queries[0]!.receivedInputs).toEqual([]);
     } finally {
@@ -1278,7 +1382,7 @@ describe("ClaudeCodeAdapter", () => {
       () => adapter.setPlanMode(true, boundReview),
       () => adapter.setExtraDirectories([{ id: "extra", path: process.cwd(), access: "read_write" }], boundReview),
       () => adapter.getNativeHistoryProjection(boundReview),
-      () => adapter.clone(boundReview, { sessionId: "derived-review", recordBinding: vi.fn() }),
+      () => adapter.clone(boundReview, { sessionId: "derived-review", target: boundReview.target, recordBinding: vi.fn() }),
       () => adapter.deleteSession(binding, boundReview)
     ];
     for (const operation of deniedControls) {
@@ -2494,17 +2598,37 @@ describe("ClaudeCodeAdapter", () => {
       expect(derived.nativeSessionId).not.toBe(binding.nativeSessionId);
       expect(runtime.queries[0]!.closeCalls).toBe(0);
     });
-    const derived = await adapter.clone(source.context, { sessionId: "derived-product", recordBinding });
+    const derivedTarget = {
+      ...source.context.target,
+      workspaceRoot: await mkdtemp(join(tmpdir(), "joko-claude-derived-workspace-"))
+    };
+    expect((await adapter.describe()).capabilities.get("workspace.derive")).toMatchObject({ supported: true });
+    await expect(adapter.clone(source.context, {
+      sessionId: "mismatched-target-product",
+      target: { ...derivedTarget, managed: !derivedTarget.managed },
+      recordBinding: vi.fn()
+    })).rejects.toMatchObject({
+      publicError: {
+        code: "SESSION_DERIVATION_TARGET_MISMATCH",
+        stateMayHaveChanged: false
+      }
+    });
+    expect(runtime.forks).toHaveLength(0);
+    const derived = await adapter.clone(source.context, { sessionId: "derived-product", target: derivedTarget, recordBinding });
     expect(recordBinding).toHaveBeenCalledExactlyOnceWith(derived);
     expect(runtime.forks).toHaveLength(1);
     expect(runtime.forks[0]!.sourceId).toBe(binding.nativeSessionId);
-    expect(runtime.forks[0]!.options.dir).toBe(target.workspaceRoot);
+    expect(runtime.forks[0]!.options.dir).toBe(derivedTarget.workspaceRoot);
+    expect(runtime.infoOptions.at(-1)).toMatchObject({
+      sessionId: derived.nativeSessionId,
+      options: { dir: derivedTarget.workspaceRoot }
+    });
     expect(runtime.forks[0]!.options).not.toHaveProperty("upToMessageId");
     expect(runtime.queries).toHaveLength(1);
     await adapter.send(textPrompt("continue source"), source.context);
     runtime.queries[0]!.push(resultMessage(binding.nativeSessionId!, { result: "source output", totalCostUsd: 0 }));
     await eventually(() => source.events.some((event) => event.type === "done"));
-    const derivedContext = { ...contextFor(derived).context, sessionId: "derived-product" };
+    const derivedContext = { ...contextFor(derived).context, sessionId: "derived-product", target: derivedTarget };
     await adapter.resumeSession(derived, derivedContext);
     expect(runtime.queries[1]!.params.options.resume).toBe(derived.nativeSessionId);
     const projection = await adapter.getNativeHistoryProjection(derivedContext);
@@ -2525,14 +2649,24 @@ describe("ClaudeCodeAdapter", () => {
     runtime.messages.set(binding.nativeSessionId!, messages);
     const source = contextFor(binding, { operationId: "source-after-fork" });
     const recordBinding = vi.fn();
-    const fork = await adapter.fork(messages[selectedIndex]!.uuid.toLowerCase(), source.context, { sessionId: "forked-product", recordBinding });
+    const derivedTarget = {
+      ...source.context.target,
+      workspaceRoot: await mkdtemp(join(tmpdir(), "joko-claude-fork-workspace-"))
+    };
+    const fork = await adapter.fork(messages[selectedIndex]!.uuid.toLowerCase(), source.context, {
+      sessionId: "forked-product",
+      target: derivedTarget,
+      recordBinding
+    });
     expect(fork).not.toHaveProperty("editorText");
     expect(recordBinding).toHaveBeenCalledExactlyOnceWith(fork.binding);
     expect(runtime.forks[0]!.options.upToMessageId).toBe(messages[selectedIndex]!.uuid);
+    expect(runtime.forks[0]!.options.dir).toBe(derivedTarget.workspaceRoot);
+    expect(runtime.messageOptions.at(-1)?.options.dir).toBe(derivedTarget.workspaceRoot);
     expect(runtime.queries).toHaveLength(1);
     expect(runtime.queries[0]!.closeCalls).toBe(0);
     expect(runtime.messages.get(binding.nativeSessionId!)).toEqual(messages);
-    const forkContext = { ...contextFor(fork.binding).context, sessionId: "forked-product" };
+    const forkContext = { ...contextFor(fork.binding).context, sessionId: "forked-product", target: derivedTarget };
     await adapter.resumeSession(fork.binding, forkContext);
     const projected = await adapter.getNativeHistoryProjection(forkContext);
     expect(projected.activeLineage).toHaveLength(selectedIndex + 1);
@@ -2607,7 +2741,7 @@ describe("ClaudeCodeAdapter", () => {
     if (boundary === "over-limit") messages.push(...Array.from({ length: 10_000 }, () => ({ ...messages[0]!, uuid: randomUUID() })));
     runtime.messages.set(binding.nativeSessionId!, messages);
     const recordBinding = vi.fn();
-    await expect(adapter.fork(entryId, contextFor(binding).context, { sessionId: "derived", recordBinding })).rejects.toMatchObject({ publicError: { stateMayHaveChanged: false } });
+    await expect(adapter.fork(entryId, contextFor(binding).context, { sessionId: "derived", target, recordBinding })).rejects.toMatchObject({ publicError: { stateMayHaveChanged: false } });
     expect(runtime.forks).toHaveLength(0);
     expect(recordBinding).not.toHaveBeenCalled();
     await adapter.dispose();
@@ -2624,7 +2758,7 @@ describe("ClaudeCodeAdapter", () => {
     const ready = new Promise<void>((resolveReady) => { release = resolveReady; });
     const read = vi.spyOn(runtime, "getSessionMessages").mockImplementation(async () => { await ready; return messages; });
     const recordBinding = vi.fn();
-    const forking = adapter.fork(messages[1]!.uuid, context, { sessionId: "derived", recordBinding }).catch((error: unknown) => error);
+    const forking = adapter.fork(messages[1]!.uuid, context, { sessionId: "derived", target: context.target, recordBinding }).catch((error: unknown) => error);
     await eventually(() => read.mock.calls.length === 1);
     await expect(adapter.send(textPrompt("locked"), context)).rejects.toMatchObject({ publicError: { code: "SESSION_BUSY" } });
     if (boundary === "source-change") runtime.sessions.set(binding.nativeSessionId!, { ...sessionInfo(binding.nativeSessionId!), lastModified: 42 });
@@ -2655,7 +2789,7 @@ describe("ClaudeCodeAdapter", () => {
       return derived;
     });
     const recordBinding = vi.fn();
-    await expect(adapter.fork(messages[1]!.uuid, contextFor(binding).context, { sessionId: "derived", recordBinding })).rejects.toMatchObject({ publicError: { code: "NATIVE_SESSION_FORK_UNKNOWN", stateMayHaveChanged: true } });
+    await expect(adapter.fork(messages[1]!.uuid, contextFor(binding).context, { sessionId: "derived", target, recordBinding })).rejects.toMatchObject({ publicError: { code: "NATIVE_SESSION_FORK_UNKNOWN", stateMayHaveChanged: true } });
     expect(recordBinding).toHaveBeenCalledTimes(1);
     expect(runtime.forks).toHaveLength(1);
     expect(runtime.deleted).toEqual([]);
@@ -2671,7 +2805,7 @@ describe("ClaudeCodeAdapter", () => {
     runtime.messages.set(binding.nativeSessionId!, messages);
     runtime.forkHandler = async () => { throw new SessionSdkFailure("TIMEOUT", true); };
     const recordBinding = vi.fn();
-    await expect(adapter.fork(messages[1]!.uuid, contextFor(binding).context, { sessionId: "derived", recordBinding })).rejects.toMatchObject({ publicError: { code: "NATIVE_SESSION_FORK_UNKNOWN", stateMayHaveChanged: true } });
+    await expect(adapter.fork(messages[1]!.uuid, contextFor(binding).context, { sessionId: "derived", target, recordBinding })).rejects.toMatchObject({ publicError: { code: "NATIVE_SESSION_FORK_UNKNOWN", stateMayHaveChanged: true } });
     expect(runtime.forks).toHaveLength(1);
     expect(recordBinding).not.toHaveBeenCalled();
     expect(runtime.deleted).toEqual([]);
@@ -2685,7 +2819,7 @@ describe("ClaudeCodeAdapter", () => {
     if (state === "missing") runtime.sessions.delete(binding.nativeSessionId!);
     else runtime.sessions.set(binding.nativeSessionId!, { ...sessionInfo(binding.nativeSessionId!), cwd: resolve(target.workspaceRoot, "..") });
     const recordBinding = vi.fn();
-    await expect(adapter.clone(contextFor(binding).context, { sessionId: "derived", recordBinding })).rejects.toMatchObject({ publicError: { stateMayHaveChanged: false } });
+    await expect(adapter.clone(contextFor(binding).context, { sessionId: "derived", target, recordBinding })).rejects.toMatchObject({ publicError: { stateMayHaveChanged: false } });
     expect(runtime.forks).toHaveLength(0);
     expect(recordBinding).not.toHaveBeenCalled();
     await adapter.dispose();
@@ -2705,10 +2839,10 @@ describe("ClaudeCodeAdapter", () => {
       return { sessionId: derivedId };
     };
     const recordBinding = vi.fn();
-    const copying = adapter.clone(bound, { sessionId: "derived", recordBinding });
+    const copying = adapter.clone(bound, { sessionId: "derived", target: bound.target, recordBinding });
     await expect(adapter.send(textPrompt("too early"), { ...bound, operationId: "copy-busy" })).rejects.toMatchObject({ publicError: { code: "SESSION_BUSY" } });
     await expect(adapter.setFastMode(true, bound)).rejects.toMatchObject({ publicError: { code: "SESSION_BUSY" } });
-    await expect(adapter.clone(bound, { sessionId: "another-copy", recordBinding: vi.fn() })).rejects.toMatchObject({ publicError: { code: "SESSION_BUSY" } });
+    await expect(adapter.clone(bound, { sessionId: "another-copy", target: bound.target, recordBinding: vi.fn() })).rejects.toMatchObject({ publicError: { code: "SESSION_BUSY" } });
     release();
     await expect(copying).rejects.toMatchObject({ publicError: { code: "NATIVE_SESSION_CLONE_UNKNOWN", stateMayHaveChanged: true } });
     expect(recordBinding).toHaveBeenCalledTimes(1);
@@ -2732,7 +2866,7 @@ describe("ClaudeCodeAdapter", () => {
       }, { once: true });
     });
     const recordBinding = vi.fn();
-    const copying = adapter.clone(bound, { sessionId: "derived", recordBinding }).catch((error: unknown) => error);
+    const copying = adapter.clone(bound, { sessionId: "derived", target: bound.target, recordBinding }).catch((error: unknown) => error);
     await eventually(() => runtime.forks.length === 1);
     if (boundary === "cancel") cancellation.abort();
     else if (boundary === "close") await adapter.closeSession(binding, bound);
@@ -2750,7 +2884,7 @@ describe("ClaudeCodeAdapter", () => {
     const binding = await adapter.createSession(createInput(), contextFor().context);
     const bound = contextFor(binding).context;
     const recordBinding = vi.fn(() => { throw new Error("Binding already adopted"); });
-    await expect(adapter.clone(bound, { sessionId: "derived", recordBinding })).rejects.toMatchObject({ publicError: { code: "NATIVE_SESSION_CLONE_UNKNOWN", stateMayHaveChanged: true } });
+    await expect(adapter.clone(bound, { sessionId: "derived", target: bound.target, recordBinding })).rejects.toMatchObject({ publicError: { code: "NATIVE_SESSION_CLONE_UNKNOWN", stateMayHaveChanged: true } });
     expect(recordBinding).toHaveBeenCalledTimes(1);
     expect(runtime.deleted).toEqual([]);
     runtime.pendingForkIds.add(binding.nativeSessionId!);
@@ -2772,7 +2906,8 @@ describe("ClaudeCodeAdapter", () => {
     query.push(resultMessage(binding.nativeSessionId!, { result: "foreground done", totalCostUsd: 0 }));
     await eventually(() => active.events.some((event) => event.type === "done"));
     expect(active.events.some((event) => event.type === "background_task" && event.state === "running")).toBe(true);
-    await expect(adapter.clone(contextFor(binding).context, { sessionId: "derived", recordBinding: vi.fn() })).rejects.toMatchObject({ publicError: { code: "SESSION_BUSY" } });
+    const sourceContext = contextFor(binding).context;
+    await expect(adapter.clone(sourceContext, { sessionId: "derived", target: sourceContext.target, recordBinding: vi.fn() })).rejects.toMatchObject({ publicError: { code: "SESSION_BUSY" } });
     expect(runtime.forks).toHaveLength(0);
     await adapter.dispose();
   });
@@ -2792,7 +2927,10 @@ describe("ClaudeCodeAdapter", () => {
             : { kind: "selected", value: "allow_for_session" };
         }
         if (interaction.kind === "question") {
-          return { kind: "question", answers: { q0: "q0o1" } };
+          return { kind: "question", answers: {
+            q0: { kind: "single", selection: { kind: "choice", choiceId: "q0o1" } },
+            q1: { kind: "single", selection: { kind: "other", text: "q1o0" } }
+          } };
         }
         return { kind: "plan_review", decision: "execute", feedback: "" };
       }
@@ -2820,19 +2958,27 @@ describe("ClaudeCodeAdapter", () => {
     expect(denied).toEqual({ behavior: "deny", message: "The user denied this tool request." });
 
     const question = await query.params.options.canUseTool("AskUserQuestion", {
-      questions: [{
-        question: "Choose a route",
-        header: "Route",
-        options: [
-          { label: "Safe", description: "Use the safe route." },
-          { label: "Fast", description: "Use the fast route." }
-        ],
-        multiSelect: false
-      }]
+      questions: [
+        {
+          question: "Choose a route",
+          header: "Route",
+          options: [
+            { label: "Safe", description: "Use the safe route." },
+            { label: "Fast", description: "Use the fast route." }
+          ],
+          multiSelect: false
+        },
+        {
+          question: "Name another route",
+          header: "Other route",
+          options: [{ label: "Slow", description: "Use the slow route." }],
+          multiSelect: false
+        }
+      ]
     }, permissionOptions("question-one", "tool-question"));
     expect(question).toMatchObject({
       behavior: "allow",
-      updatedInput: { answers: { "Choose a route": "Fast" } }
+      updatedInput: { answers: { "Choose a route": "Fast", "Name another route": "q1o0" } }
     });
 
     const plan = await query.params.options.canUseTool(
@@ -2986,6 +3132,10 @@ class FakeSdkRuntime implements ClaudeSdkRuntime {
     readonly sessionId: string;
     readonly options: ClaudeSdkGetSessionMessagesOptions;
   }[] = [];
+  readonly infoOptions: {
+    readonly sessionId: string;
+    readonly options: { readonly dir: string; readonly signal?: AbortSignal };
+  }[] = [];
   readonly probeInputs: ClaudeSdkProbeInput[] = [];
   readonly options: FakeRuntimeOptions;
   probeInitialization: ClaudeSdkInitializationResult | undefined = initialization();
@@ -3035,7 +3185,8 @@ class FakeSdkRuntime implements ClaudeSdkRuntime {
     return Promise.resolve(query);
   }
 
-  getSessionInfo(sessionId: string): Promise<ClaudeSdkSessionInfo | undefined> {
+  getSessionInfo(sessionId: string, options: { readonly dir: string; readonly signal?: AbortSignal }): Promise<ClaudeSdkSessionInfo | undefined> {
+    this.infoOptions.push({ sessionId, options });
     return Promise.resolve(this.sessions.get(sessionId));
   }
 

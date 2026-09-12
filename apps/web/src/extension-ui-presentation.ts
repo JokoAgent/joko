@@ -6,7 +6,7 @@ export interface OrderedExtensionState {
 /**
  * Extension widgets are insertion ordered upstream. The public service owns a
  * durable update timestamp for each identity, so chronological update order is
- * the stable browser equivalent across events and reconnect snapshots.
+ * the browser's stable order across events and reconnect snapshots.
  */
 export function compareExtensionStateOrder(
   left: OrderedExtensionState,
@@ -16,7 +16,7 @@ export function compareExtensionStateOrder(
   return timestampOrder === 0 ? left.key.localeCompare(right.key) : timestampOrder;
 }
 
-/** Keep untrusted footer status on one readable line, matching native UI. */
+/** Collapse untrusted footer status into one readable line. */
 export function sanitizeExtensionStatusText(text: string): string {
   return text
     .replace(/[\u0000-\u001f\u007f]+/g, " ")

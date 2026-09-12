@@ -23,6 +23,7 @@ import {
   BrowserTakeoverConflictError,
   BrowserTakeoverRateLimitError,
   BrowserTakeoverRegistry,
+  sameTakeoverFence,
   validateTakeoverInput,
   validateTakeoverFence,
   validateTakeoverNavigationUrl,
@@ -188,12 +189,12 @@ export interface BrowserProviderOptions {
   readonly executablePath: string;
   /**
    * Distinct persistent profiles keep sidebar and external Browser authority
-   * isolated. The target defaults to `external` when targetMode is omitted.
+   * isolated.
    */
   readonly profileDirectories: BrowserTargetProfileDirectories;
   /** Product-owned name written only into the managed external Chrome profile. */
   readonly profileDisplayName?: string | (() => string);
-  readonly targetMode?: BrowserTargetMode;
+  readonly targetMode: BrowserTargetMode;
   readonly downloadDirectory: string;
   readonly uploadRoots: readonly string[];
   /** Live host policy checked when a page file input action is attempted. */
@@ -411,6 +412,11 @@ export interface BrowserHumanPageRequest {
   readonly url: string;
 }
 
+export interface BrowserHtmlPageCleanup {
+  readonly retiredPages: readonly { readonly pageId: string; readonly generation: number }[];
+  readonly complete: boolean;
+}
+
 export type BrowserAction =
   | { readonly type: "navigate"; readonly url: string }
   | { readonly type: "click"; readonly selector: string; readonly button?: "left" | "middle" | "right"; readonly doubleClick?: boolean; readonly modifiers?: readonly BrowserKeyModifier[] }
@@ -439,6 +445,12 @@ export class BrowserProvider {
   readonly #takeovers: BrowserTakeoverRegistry;
   #context: BrowserContext | undefined;
   readonly #htmlContexts = new Set<BrowserContext>();
+  readonly #htmlPageOwners = new Map<Page, {
+    readonly context: BrowserContext;
+    readonly owner: string;
+    readonly generation: number;
+    readonly pageId: string;
+  }>();
   readonly #profileDirectories: BrowserTargetProfileDirectories;
   readonly #maximumScreenshotBytes: number;
   readonly #maximumPdfBytes: number;
@@ -672,6 +684,7 @@ export class BrowserProvider {
     this.#context = undefined;
     for (const htmlContext of this.#htmlContexts) void htmlContext.close().catch(() => undefined);
     this.#htmlContexts.clear();
+    this.#htmlPageOwners.clear();
     if (!this.#generationAbort.signal.aborted) {
       this.#generationAbort.abort(new BrowserLeaseConflictError("Browser generation was interrupted."));
     }
@@ -804,7 +817,17 @@ export class BrowserProvider {
             isolated.once("close", () => { this.#htmlContexts.delete(isolated); disposeSnapshot(); });
             page = await isolated.newPage();
             this.bindPage(page);
-            page.once("close", () => { void isolated.close().catch(() => undefined); });
+            const htmlPage = page;
+            this.#htmlPageOwners.set(htmlPage, {
+              context: isolated,
+              owner: requested.owner,
+              generation: requested.generation,
+              pageId: this.idFor(htmlPage)
+            });
+            page.once("close", () => {
+              this.#htmlPageOwners.delete(htmlPage);
+              void isolated.close().catch(() => undefined);
+            });
           }
           this.#pageStates.set(page, "loading");
           if (htmlSnapshot !== undefined) await installHtmlSnapshot(page, requested.url, { ...htmlSnapshot, dispose: disposeSnapshot });
@@ -815,8 +838,20 @@ export class BrowserProvider {
           if (previous !== undefined) {
             await this.resetHumanCommentDesigns(this.requirePageNow(previous.pageId));
             assertOpeningCurrent();
-            this.#takeovers.end(previous);
-            this.#takeoverRateWindow = undefined;
+          }
+          await page.bringToFront();
+          assertOpeningCurrent();
+          if (previous !== undefined) this.assertHumanTakeover(previous);
+          if (previous !== undefined) this.#takeovers.end(previous);
+          this.#takeoverRateWindow = undefined;
+          takeover = this.#takeovers.begin({
+            providerId: this.id,
+            pageId,
+            generation: this.#generation,
+            owner: requested.owner
+          }, ttlMs);
+          this.assertHumanTakeover(takeover);
+          if (previous !== undefined) {
             await this.emit({
               at: Date.now(),
               type: "takeover",
@@ -824,15 +859,6 @@ export class BrowserProvider {
               detail: `Human takeover ${previous.takeoverId} ended.`
             });
           }
-          takeover = this.#takeovers.begin({
-            providerId: this.id,
-            pageId,
-            generation: this.#generation,
-            owner: requested.owner
-          }, ttlMs);
-          await page.bringToFront();
-          assertOpeningCurrent();
-          this.assertHumanTakeover(takeover);
           await this.emit({
             at: Date.now(),
             type: "takeover",
@@ -843,7 +869,12 @@ export class BrowserProvider {
         } catch (error) {
           if (takeover !== undefined) {
             try {
-              this.#takeovers.end(takeover);
+              if (previous !== undefined && !this.requirePageNow(previous.pageId).isClosed()) {
+                this.#takeovers.restore(takeover, previous);
+                await this.requirePageNow(previous.pageId).bringToFront().catch(() => undefined);
+              } else {
+                this.#takeovers.end(takeover);
+              }
             } catch {
               // Closing the new page may already have fenced the failed takeover.
             }
@@ -857,6 +888,130 @@ export class BrowserProvider {
         this.#takeoverRequestPending = false;
       });
     } catch (error) { disposeSnapshot(); throw error; }
+  }
+
+  /**
+   * Compensates a page-open that failed after the Provider transferred human
+   * control but before its owner durably committed the new page. Only the
+   * exact opened takeover may close the opened page; an exact previous page is
+   * restored when it is still live, otherwise human control is released.
+   */
+  compensateHumanPageOpen(
+    fence: BrowserTakeoverFence,
+    previous?: { readonly pageId: string; readonly assertCurrent: () => void },
+    ttlMs = 15 * 60 * 1_000
+  ): Promise<BrowserTakeover | undefined> {
+    const expected = copyTakeoverFence(fence);
+    const restoration = previous === undefined ? undefined : {
+      pageId: validatePublicPageId(previous.pageId),
+      assertCurrent: previous.assertCurrent
+    };
+    validateTakeoverFence(expected);
+    validateTakeoverTtl(ttlMs);
+    if (restoration !== undefined && typeof restoration.assertCurrent !== "function") {
+      throw new BrowserTakeoverConflictError("Browser page-open compensation requires an exact restoration authority.");
+    }
+    if (restoration?.pageId === expected.pageId) {
+      throw new BrowserTakeoverConflictError("Browser page-open compensation requires a distinct previous page.");
+    }
+    if (this.#takeoverRequestPending) {
+      return Promise.reject(new BrowserTakeoverConflictError("A Browser takeover transition is already pending."));
+    }
+    this.#takeoverRequestPending = true;
+    const result = this.queueLifecycle(async () => {
+      if (expected.providerId !== this.id || expected.generation !== this.#generation) {
+        throw new BrowserTakeoverConflictError("Browser takeover is missing, expired, or fenced.");
+      }
+      const observed = this.currentHumanTakeover();
+      if (observed?.pageId === expected.pageId && !sameTakeoverFence(observed, expected)) {
+        throw new BrowserTakeoverConflictError("The uncommitted Browser page has a different active takeover.");
+      }
+      let ownsOpenedTakeover = observed !== undefined && sameTakeoverFence(observed, expected);
+      const opened = this.requirePageNow(expected.pageId);
+      await this.resetHumanCommentDesigns(opened);
+      let restorePage: Page | undefined;
+      if (ownsOpenedTakeover && restoration !== undefined) {
+        try {
+          restoration.assertCurrent();
+          restorePage = this.allPages().find((candidate) => this.idFor(candidate) === restoration.pageId && !candidate.isClosed());
+          if (restorePage !== undefined) {
+            await restorePage.bringToFront();
+            this.assertHumanTakeover(expected);
+            restoration.assertCurrent();
+          }
+        } catch { restorePage = undefined; }
+      }
+      const current = this.currentHumanTakeover();
+      if (current?.pageId === expected.pageId && !sameTakeoverFence(current, expected)) {
+        throw new BrowserTakeoverConflictError("The uncommitted Browser page has a different active takeover.");
+      }
+      ownsOpenedTakeover = current !== undefined && sameTakeoverFence(current, expected);
+      if (!ownsOpenedTakeover) restorePage = undefined;
+      if (ownsOpenedTakeover && restorePage !== undefined) {
+        try { restoration!.assertCurrent(); }
+        catch { restorePage = undefined; }
+      }
+      if (ownsOpenedTakeover) {
+        this.#takeovers.end(expected);
+        this.#takeoverRateWindow = undefined;
+      }
+      const restored = !ownsOpenedTakeover || restorePage === undefined ? undefined : this.#takeovers.begin({
+        providerId: this.id,
+        pageId: this.idFor(restorePage),
+        generation: this.#generation,
+        owner: expected.owner
+      }, ttlMs);
+      await opened.close();
+      if (ownsOpenedTakeover) {
+        await this.emit({
+          at: Date.now(),
+          type: "takeover",
+          pageId: expected.pageId,
+          detail: `Human takeover ${expected.takeoverId} ended.`
+        });
+      }
+      if (restored !== undefined) {
+        await this.emit({
+          at: Date.now(),
+          type: "takeover",
+          pageId: restored.pageId,
+          detail: `Human takeover ${restored.takeoverId} started.`
+        });
+      }
+      await this.emit({ at: Date.now(), type: "page", pageId: expected.pageId, detail: "Page-open compensation closed the uncommitted page." });
+      return restored;
+    });
+    return result.finally(() => {
+      this.#takeoverRequestPending = false;
+    });
+  }
+
+  /** Closes every live isolated HTML page whose private read owner is this Connection. */
+  closeHtmlPagesOwnedBy(owner: string): Promise<BrowserHtmlPageCleanup> {
+    const expectedOwner = validateBoundedString(owner, "Browser HTML page owner", MAXIMUM_PUBLIC_ID_LENGTH);
+    return this.queueLifecycle(async () => {
+      const candidates = [...this.#htmlPageOwners.entries()].filter(([, binding]) => binding.owner === expectedOwner);
+      const retiredPages: { pageId: string; generation: number }[] = [];
+      let complete = true;
+      for (const [page, binding] of candidates) {
+        const current = this.currentHumanTakeover();
+        if (current !== undefined && current.pageId === binding.pageId && current.generation === binding.generation) {
+          try {
+            this.#takeovers.end(current);
+            this.#takeoverRateWindow = undefined;
+          } catch { complete = false; }
+        }
+        try { await binding.context.close(); }
+        catch { complete = false; }
+        if (page.isClosed()) {
+          this.#htmlPageOwners.delete(page);
+          retiredPages.push({ pageId: binding.pageId, generation: binding.generation });
+        } else {
+          complete = false;
+        }
+      }
+      return { retiredPages, complete };
+    });
   }
 
   /**
@@ -3411,7 +3566,7 @@ function resolveBrowserLaunchTargets(options: BrowserProviderOptions): ResolvedB
   }
   return {
     profileDirectories: { sidebar, external },
-    targetMode: validateBrowserTargetMode(options.targetMode ?? "external")
+    targetMode: validateBrowserTargetMode(options.targetMode)
   };
 }
 

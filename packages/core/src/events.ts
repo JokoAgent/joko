@@ -4,8 +4,8 @@ import type {
   BlobRef,
   EventId,
   InteractionId,
-  InlineTextRange,
   OperationId,
+  PromptInput,
   PublicError,
   QueueItemId,
   RunId,
@@ -47,10 +47,8 @@ export type EventPayload =
       readonly type: "message_complete";
       readonly role: "user" | "assistant";
       readonly blocks: readonly MessageBlock[];
-      /** Durable product truth copied from the accepted user input. */
-      readonly quotesEncoded?: boolean;
-      /** Durable UTF-16 spans copied from the accepted user input. */
-      readonly pastedTextRanges?: readonly InlineTextRange[];
+      /** Host-owned accepted Queue input for canonical user presentation, independent of the native echo. */
+      readonly acceptedInput?: PromptInput;
       /** Per-message provider accounting when authoritatively reported. */
       readonly usage?: UsageSnapshot;
       /** Generation-only time for this assistant message, never turn wall-clock time. */
@@ -412,15 +410,20 @@ export type InteractionQuestionField = {
       readonly placeholder?: string;
       readonly defaultValue?: string;
       readonly multiline: boolean;
-      readonly sensitive: boolean;
     }
-  | { readonly kind: "single"; readonly choices: readonly InteractionQuestionChoice[]; readonly defaultChoiceId?: string }
+  | {
+      readonly kind: "single";
+      readonly choices: readonly InteractionQuestionChoice[];
+      readonly defaultChoiceId?: string;
+      readonly allowOther: boolean;
+    }
   | {
       readonly kind: "multiple";
       readonly choices: readonly InteractionQuestionChoice[];
       readonly defaultChoiceIds: readonly string[];
       readonly minimumSelections: number;
       readonly maximumSelections?: number;
+      readonly allowOther: boolean;
     }
   | { readonly kind: "boolean"; readonly defaultValue: boolean }
 );

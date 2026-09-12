@@ -2,6 +2,7 @@ import { create } from "@bufbuild/protobuf";
 import type { Transport } from "@connectrpc/connect";
 import {
   GetSnapshotResponseSchema,
+  GetSessionWorktreeRemovalPreviewResponseSchema,
   ListTargetWorktreeSourcesResponseSchema,
   OperationState,
   ProbeTargetWorktreeResponseSchema,
@@ -14,6 +15,47 @@ import { describe, expect, it, vi } from "vitest";
 import { createOrchestratorGateway } from "./gateway.js";
 
 describe("isolated-workspace gateway", () => {
+  it("maps an exact Session removal preview and rejects contradictory identities", async () => {
+    let preview = create(GetSessionWorktreeRemovalPreviewResponseSchema, {
+      sessionId: "session-1",
+      hasWorktree: true,
+      dirty: true
+    });
+    const requests: unknown[] = [];
+    const transport = transportWithSnapshot(async (method, input) => {
+      if (method.localName !== "getSessionWorktreeRemovalPreview") {
+        throw new Error(`Unexpected method: ${method.localName}`);
+      }
+      requests.push(input);
+      return response(method, preview);
+    });
+    const gateway = createOrchestratorGateway(profile("worktree-removal"), "secret", {}, () => transport);
+    await gateway.connect();
+
+    await expect(gateway.getSessionWorktreeRemovalPreview("session-1")).resolves.toEqual({
+      hasWorktree: true,
+      dirty: true
+    });
+    expect(requests).toEqual([{ sessionId: "session-1" }]);
+
+    preview = create(GetSessionWorktreeRemovalPreviewResponseSchema, {
+      sessionId: "different-session",
+      hasWorktree: true,
+      dirty: false
+    });
+    await expect(gateway.getSessionWorktreeRemovalPreview("session-1"))
+      .rejects.toThrow("invalid Worktree removal preview");
+
+    preview = create(GetSessionWorktreeRemovalPreviewResponseSchema, {
+      sessionId: "session-1",
+      hasWorktree: false,
+      dirty: true
+    });
+    await expect(gateway.getSessionWorktreeRemovalPreview("session-1"))
+      .rejects.toThrow("invalid Worktree removal preview");
+    gateway.disconnect();
+  });
+
   it("probes and completely pages only the exact selected Target", async () => {
     const requests: Array<{ readonly method: string; readonly input: unknown }> = [];
     const transport = transportWithSnapshot(async (method, input) => {

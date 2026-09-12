@@ -192,7 +192,7 @@ export function createTerminalConnectService(dependencies: TerminalServiceDepend
       let release: (() => void) | undefined;
       try {
         const connection = dependencies.authenticate(context);
-        const initial = reference(request, true);
+        const initial = reference(request);
         const appearance = viewAppearance(request.appearance);
         const key = JSON.stringify([connection.id, initial.sessionId, initial.id, initial.generation, appearance.viewId]);
         if (views.has(key)) throw new ConnectError("The terminal view is already watching.", Code.AlreadyExists);
@@ -206,7 +206,7 @@ export function createTerminalConnectService(dependencies: TerminalServiceDepend
         release = () => { context.signal.removeEventListener("abort", remove); remove(); };
         unsubscribe = dependencies.onRevoked(connection.id, remove);
         const current = (): void => {
-          fence(context, initial, true);
+          fence(context, initial);
           if (signal.aborted || views.get(key) !== view || dependencies.authenticate(context).id !== connection.id) throw new ConnectError("Terminal view retired.", Code.Canceled);
         };
         current();
@@ -287,7 +287,7 @@ export function createTerminalConnectService(dependencies: TerminalServiceDepend
       const unsubscribe = dependencies.onRevoked(connection.id, () => revoked.abort());
       try {
         fence(context, initial, true);
-        const terminal = await provider().resize({ ...initial, cols: request.columns, rows: request.rows }, AbortSignal.any([context.signal, revoked.signal]));
+        const terminal = await provider().resize({ ...initial, cols: request.columns, rows: request.rows }, AbortSignal.any([context.signal, revoked.signal]), () => fence(context, initial, true));
         fence(context, initial, true);
         return create(contract.ResizeTerminalResponseSchema, { terminal: toTerminal(terminal) });
       } finally { unsubscribe(); }

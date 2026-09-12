@@ -18,6 +18,7 @@ import type {
   BackendDescriptor,
   Capability,
   EventPayload,
+  InteractionDecision,
   PromptInput,
   PublicError,
   QueueState,
@@ -26,6 +27,7 @@ import type {
   NativeSessionBinding,
   SessionAttentionKind,
   SessionDescriptor,
+  SessionReferenceSnapshot,
   SessionWorktreeBinding,
   SubagentRunDetail,
   SubagentRunState,
@@ -58,6 +60,11 @@ import {
   StoreClosedError,
   StoreError
 } from "./errors.js";
+import {
+  parseCurrentInteractionDecision,
+  parseCurrentInteractionEventPayload,
+  parseCurrentInteractionPayload
+} from "./interaction-shape.js";
 import { configureDatabase, initializeDatabase, SCHEMA_VERSION } from "./schema.js";
 import { readUsageReport, type UsageReportQuery, type UsageReportPage } from "./usage-report.js";
 import {
@@ -5091,7 +5098,7 @@ export class OperationalStore {
         }
       }
       if (input.operationId !== undefined) this.getOperation(input.operationId);
-      const payload = redactSubagentEventPayload(input.payload);
+      const payload = parseCurrentInteractionEventPayload(redactSubagentEventPayload(input.payload));
       this.validateSubagentEventInput({ ...input, payload });
       const counter = this.database.prepare(`
         UPDATE session_event_counters
@@ -7958,16 +7965,20 @@ export class OperationalStore {
     const pendingReviews = this.database.prepare(`
       SELECT id FROM review_runs WHERE state = 'running' ORDER BY created_at, id
     `).all() as Row[];
+    const pendingInteractions = this.database.prepare(`
+      SELECT id FROM interactions WHERE status = 'open' ORDER BY created_at, id
+    `).all() as Row[];
     const pendingDerivationCleanup = this.database.prepare(
       "SELECT operation_id FROM native_session_derivations WHERE state = 'cleanup_claimed' LIMIT 1"
     ).get() as Row | undefined;
     if (pending.length === 0 && pendingRuns.length === 0 && pendingEffects.length === 0 && pendingReviews.length === 0
-      && pendingDerivationCleanup === undefined) {
+      && pendingInteractions.length === 0 && pendingDerivationCleanup === undefined) {
       return {
         recoveredQueueItemIds: [],
         affectedRunIds: [],
         recoveredEffectOperationIds: [],
         recoveredReviewRuns: [],
+        dismissedInteractionIds: [],
         revision: this.readRevision(),
         events: []
       };
@@ -7982,6 +7993,7 @@ export class OperationalStore {
       const runIds = new Set<string>();
       const effectOperationIds: string[] = [];
       const recoveredReviewRuns: ReviewRunRecord[] = [];
+      const dismissedInteractionIds: string[] = [];
       const error = dispatchUnknownError();
       const at = this.now();
       this.database.prepare(`
@@ -8077,11 +8089,28 @@ export class OperationalStore {
         `).run(at, asSqlInteger(this.requireActiveRevision()), reviewRunId);
         recoveredReviewRuns.push(recoveredRun);
       }
+      const interactionRows = this.database.prepare(`
+        SELECT id FROM interactions WHERE status = 'open' ORDER BY created_at, id
+      `).all() as Row[];
+      for (const row of interactionRows) {
+        const interactionId = stringValue(row["id"]);
+        const interaction = this.getInteraction(interactionId);
+        this.dismissInteraction(
+          interactionId,
+          interaction.generation,
+          "The Orchestrator restarted while this interaction was awaiting a response.",
+          traceId,
+          undefined,
+          at
+        );
+        dismissedInteractionIds.push(interactionId);
+      }
       return {
         recoveredQueueItemIds: queueIds,
         affectedRunIds: [...runIds],
         recoveredEffectOperationIds: effectOperationIds,
         recoveredReviewRuns,
+        dismissedInteractionIds,
         revision: this.requireActiveRevision(),
         events: [...this.currentFrame().events]
       };
@@ -8107,6 +8136,155 @@ export class OperationalStore {
         ...(control.pausedByConnectionId === undefined ? {} : { connectionId: control.pausedByConnectionId })
       }
     });
+  }
+
+  /** Capture only the durable visibility fence for a historical task
+   * reference. Referenced message bodies never enter the destination Queue. */
+  captureSessionReferenceSnapshot(sessionId: string, mentionIndex: number): SessionReferenceSnapshot {
+    this.assertOpen();
+    const normalizedSessionId = nonBlank(sessionId, "Session reference source Session ID");
+    if (!Number.isSafeInteger(mentionIndex) || mentionIndex < 0) {
+      throw new StoreError("Session reference mention index is invalid.");
+    }
+    const source = this.getSession(normalizedSessionId);
+    if (source.descriptor.deletedAt !== undefined) {
+      throw new StoreError("The referenced Session was deleted.");
+    }
+    const throughCursor = this.latestEventCursor();
+    const historyBindingFingerprint = nativeBindingFingerprint(source.descriptor.binding.opaqueRef);
+    const marker = this.database.prepare(`
+      SELECT marker.event_cursor, marker.binding_fingerprint, marker.leaf_id
+      FROM native_history_current_markers AS marker
+      JOIN events AS marker_event ON marker_event.global_cursor = marker.event_cursor
+      LEFT JOIN message_event_tombstones AS tombstone ON tombstone.event_id = marker_event.id
+      WHERE marker.session_id = ?
+        AND marker.event_cursor <= ?
+        AND marker.binding_fingerprint = ?
+        AND tombstone.event_id IS NULL
+      LIMIT 1
+    `).get(
+      normalizedSessionId,
+      asSqlInteger(throughCursor),
+      historyBindingFingerprint
+    ) as Row | undefined;
+    return {
+      mentionIndex,
+      sessionId: normalizedSessionId,
+      throughCursor: throughCursor.toString(10),
+      sourceGeneration: source.descriptor.binding.generation,
+      historyBindingFingerprint,
+      ...(marker === undefined ? {} : {
+        historyMarkerCursor: toBigInt(marker["event_cursor"]).toString(10),
+        ...(marker["leaf_id"] === null ? {} : { historyLeafId: String(marker["leaf_id"]) })
+      })
+    };
+  }
+
+  /** Resolve the latest visible user/assistant messages at an admission fence.
+   * Current tombstones and binding ownership still apply, so deletion or reset
+   * can revoke content after a destination input was queued. */
+  listSessionReferenceMessageEvents(
+    snapshot: SessionReferenceSnapshot,
+    limit = 20
+  ): PersistedEvent[] {
+    this.assertOpen();
+    const sessionId = nonBlank(snapshot.sessionId, "Session reference source Session ID");
+    const normalizedLimit = normalizeLimit(limit, 20);
+    if (normalizedLimit > 20) throw new StoreError("A Session reference cannot read more than 20 messages.");
+    const throughCursor = sessionReferenceCursor(snapshot.throughCursor, "high-water cursor");
+    const markerCursor = snapshot.historyMarkerCursor === undefined
+      ? undefined
+      : sessionReferenceCursor(snapshot.historyMarkerCursor, "history marker cursor");
+    if (markerCursor !== undefined && markerCursor > throughCursor) {
+      throw new StoreError("Session reference history marker is ahead of its high-water cursor.");
+    }
+    if (!Number.isSafeInteger(snapshot.sourceGeneration) || snapshot.sourceGeneration < 0) {
+      throw new StoreError("Session reference source generation is invalid.");
+    }
+    if (!nativeBindingFingerprintIsValid(snapshot.historyBindingFingerprint)) {
+      throw new StoreError("Session reference history binding is invalid.");
+    }
+    const leafId = snapshot.historyLeafId === undefined
+      ? undefined
+      : nativeHistoryIdentityText(snapshot.historyLeafId, "Session reference history leaf ID");
+    if (leafId !== undefined && markerCursor === undefined) {
+      throw new StoreError("Session reference history leaf is missing its marker.");
+    }
+    const source = this.getSession(sessionId);
+    if (source.descriptor.deletedAt !== undefined
+      || nativeBindingFingerprint(source.descriptor.binding.opaqueRef) !== snapshot.historyBindingFingerprint) {
+      throw new StoreError("The referenced Session history authority changed.");
+    }
+    if (throughCursor > this.latestEventCursor()) {
+      throw new StoreError("Session reference high-water cursor is ahead of durable history.");
+    }
+    const bindingPath = `$.${NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD}`;
+    const replacesPath = `$.${NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD}`;
+    const rows = this.database.prepare(`
+      WITH RECURSIVE snapshot_active_entries(entry_id) AS (
+        SELECT ? WHERE ? IS NOT NULL
+        UNION
+        SELECT canonical.parent_entry_id
+        FROM snapshot_active_entries AS active
+        JOIN native_history_canonical_identities AS canonical
+          ON canonical.session_id = ?
+          AND canonical.binding_fingerprint = ?
+          AND canonical.entry_id = active.entry_id
+        WHERE canonical.parent_entry_id IS NOT NULL
+      )
+      SELECT event.*
+      FROM events AS event
+      LEFT JOIN message_event_tombstones AS tombstone ON tombstone.event_id = event.id
+      LEFT JOIN native_history_event_identities AS identity ON identity.event_cursor = event.global_cursor
+      WHERE event.session_id = ?
+        AND event.global_cursor <= ?
+        AND tombstone.event_id IS NULL
+        AND json_extract(event.payload_json, '$.payload.type') = 'message_complete'
+        AND json_extract(event.payload_json, '$.payload.role') IN ('user', 'assistant')
+        AND json_extract(event.payload_json, '$.payload.automaticContinuation') IS NULL
+        AND (
+          (
+            identity.entry_id IS NOT NULL
+            AND identity.binding_fingerprint = ?
+            AND (? IS NULL OR EXISTS (
+              SELECT 1 FROM snapshot_active_entries AS active
+              WHERE active.entry_id = identity.entry_id
+            ))
+          )
+          OR (
+            identity.entry_id IS NULL
+            AND (
+              json_extract(event.metadata_json, '${bindingPath}') = ?
+              OR (
+                json_extract(event.metadata_json, '${bindingPath}') IS NULL
+                AND event.generation = ?
+              )
+            )
+            AND NOT (
+              ? IS NOT NULL
+              AND event.global_cursor <= ?
+              AND COALESCE(json_extract(event.metadata_json, '${replacesPath}'), 0) = 1
+            )
+          )
+        )
+      ORDER BY event.global_cursor DESC
+      LIMIT ?
+    `).all(
+      leafId ?? null,
+      leafId ?? null,
+      sessionId,
+      snapshot.historyBindingFingerprint,
+      sessionId,
+      asSqlInteger(throughCursor),
+      snapshot.historyBindingFingerprint,
+      leafId ?? null,
+      snapshot.historyBindingFingerprint,
+      snapshot.sourceGeneration,
+      markerCursor === undefined ? null : asSqlInteger(markerCursor),
+      markerCursor === undefined ? null : asSqlInteger(markerCursor),
+      normalizedLimit
+    ) as Row[];
+    return rows.reverse().map(eventFromRow);
   }
 
   private appendQueueEvent(
@@ -8328,6 +8506,7 @@ export class OperationalStore {
   }
 
   openInteraction(input: OpenInteractionInput): InteractionRecord {
+    const payload = parseCurrentInteractionPayload(input.payload);
     return this.write(() => {
       const session = this.getSession(input.sessionId);
       if (input.generation !== session.descriptor.binding.generation) {
@@ -8358,14 +8537,14 @@ export class OperationalStore {
           status, payload_json, created_at, revision
         ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)
       `).run(
-        input.payload.id,
+        payload.id,
         input.sessionId,
         input.runId ?? null,
         input.attemptId ?? null,
         input.operationId ?? null,
         input.generation,
-        input.payload.kind,
-        serializeJson(input.payload),
+        payload.kind,
+        serializeJson(payload),
         createdAt,
         asSqlInteger(this.requireActiveRevision())
       );
@@ -8378,7 +8557,7 @@ export class OperationalStore {
         ...(input.operationId === undefined ? {} : { operationId: input.operationId }),
         generation: input.generation,
         traceId: input.traceId,
-        payload: { type: "interaction_opened", interaction: input.payload }
+        payload: { type: "interaction_opened", interaction: payload }
       });
       const attention = this.findSessionAttention(session.descriptor.id);
       if (hadOpenInteraction && attention?.kind === "awaiting") {
@@ -8402,7 +8581,7 @@ export class OperationalStore {
           at: sourceEvent.emittedAt
         });
       }
-      return this.getInteraction(input.payload.id);
+      return this.getInteraction(payload.id);
     });
   }
 
@@ -8478,7 +8657,7 @@ export class OperationalStore {
   resolveInteraction(
     id: string,
     generation: number,
-    decision: unknown,
+    decision: InteractionDecision,
     traceId: string,
     operationId?: string,
     resolvedAt = this.now()
@@ -8515,7 +8694,7 @@ export class OperationalStore {
     outcome:
       | {
         readonly status: "resolved";
-        readonly decision: unknown;
+        readonly decision: InteractionDecision;
         readonly traceId: string;
         readonly operationId?: string;
         readonly resolvedAt: number;
@@ -8539,13 +8718,16 @@ export class OperationalStore {
       }
       if (current.status !== "open") return current;
       if (outcome.operationId !== undefined) this.getOperation(outcome.operationId);
+      const decision = outcome.status === "resolved"
+        ? parseCurrentInteractionDecision(current.payload, outcome.decision)
+        : undefined;
       const result = this.database.prepare(`
         UPDATE interactions SET
           status = ?, decision_json = ?, dismissal_reason = ?, resolved_at = ?, revision = ?
         WHERE id = ? AND status = 'open' AND generation = ?
       `).run(
         outcome.status,
-        outcome.status === "resolved" ? serializeJson(outcome.decision) : null,
+        decision === undefined ? null : serializeJson(decision),
         outcome.status === "dismissed" ? outcome.reason : null,
         outcome.resolvedAt,
         asSqlInteger(this.requireActiveRevision()),
@@ -8568,7 +8750,7 @@ export class OperationalStore {
           ? {
             type: "interaction_resolved",
             interactionId: id,
-            decision: decisionText(outcome.decision)
+            decision: decisionText(decision as InteractionDecision)
           }
           : {
             type: "interaction_dismissed",
@@ -10470,6 +10652,18 @@ export class OperationalStore {
     const artifact = this.findArtifact(id, includeDeleted);
     if (artifact === undefined) throw new NotFoundError("Artifact", id);
     return artifact;
+  }
+
+  /** Reuse a plain committed output only within its original product Session. */
+  findSessionArtifactByStorage(sessionId: string, storageKey: string, mimeType: string, fileName: string | undefined): ArtifactRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(`
+      SELECT * FROM artifacts
+      WHERE session_id = ? AND storage_key = ? AND mime_type = ? AND file_name IS ?
+        AND deleted_at IS NULL AND metadata_json = '{}'
+      ORDER BY created_at, id LIMIT 1
+    `).get(nonBlank(sessionId, "Artifact Session ID"), nonBlank(storageKey, "Artifact storage key"), mimeType, fileName ?? null) as Row | undefined;
+    return row === undefined ? undefined : artifactFromRow(row);
   }
 
   /** Adopt a freshly materialized, expiring Blob into one durable Session. */
@@ -13604,9 +13798,10 @@ function cursorBigInt(value: unknown): bigint {
 
 function eventFromRow(row: Row): PersistedEvent {
   const stored = parseJson<{
-    readonly payload: EventPayload;
+    readonly payload: unknown;
     readonly pi?: NonNullable<AppendEventInput["pi"]> | null;
   }>(stringValue(row["payload_json"]));
+  const payload = parseCurrentInteractionEventPayload(stored.payload);
   return {
     id: stringValue(row["id"]),
     globalCursor: toBigInt(row["global_cursor"]),
@@ -13621,7 +13816,7 @@ function eventFromRow(row: Row): PersistedEvent {
     ...optionalString("operationId", row["operation_id"]),
     generation: numberValue(row["generation"]),
     traceId: stringValue(row["trace_id"]),
-    payload: stored.payload,
+    payload,
     ...(stored.pi === undefined || stored.pi === null ? {} : { pi: stored.pi }),
     ...(row["namespace"] === null || row["namespace"] === undefined
       ? {}
@@ -13639,17 +13834,33 @@ function eventFromRow(row: Row): PersistedEvent {
 }
 
 function interactionFromRow(row: Row): InteractionRecord {
+  const id = stringValue(row["id"]);
+  const kind = stringValue(row["kind"]);
+  const status = enumValue(row["status"], ["open", "resolved", "dismissed"] as const);
+  const payload = parseCurrentInteractionPayload(parseJson<unknown>(stringValue(row["payload_json"])));
+  if (payload.id !== id || payload.kind !== kind) {
+    throw new StoreError("Stored Interaction identity does not match its current-v1 payload.");
+  }
+  const rawDecision = row["decision_json"] === null || row["decision_json"] === undefined
+    ? undefined
+    : parseJson<unknown>(stringValue(row["decision_json"]));
+  if ((status === "resolved") !== (rawDecision !== undefined)) {
+    throw new StoreError("Stored Interaction resolution does not match its current-v1 status.");
+  }
+  const decision = rawDecision === undefined
+    ? undefined
+    : parseCurrentInteractionDecision(payload, rawDecision);
   return {
-    id: stringValue(row["id"]),
+    id,
     sessionId: stringValue(row["session_id"]),
     ...optionalString("runId", row["run_id"]),
     ...optionalString("attemptId", row["attempt_id"]),
     ...optionalString("operationId", row["operation_id"]),
     generation: numberValue(row["generation"]),
-    kind: stringValue(row["kind"]) as InteractionRecord["kind"],
-    status: enumValue(row["status"], ["open", "resolved", "dismissed"] as const),
-    payload: parseJson<InteractionRecord["payload"]>(stringValue(row["payload_json"])),
-    ...optionalJson("decision", row["decision_json"]),
+    kind: kind as InteractionRecord["kind"],
+    status,
+    payload,
+    ...(decision === undefined ? {} : { decision }),
     ...optionalString("dismissalReason", row["dismissal_reason"]),
     createdAt: numberValue(row["created_at"]),
     ...optionalNumber("resolvedAt", row["resolved_at"]),
@@ -14065,8 +14276,7 @@ function dispatchUnknownError(): PublicError {
   };
 }
 
-function decisionText(value: unknown): string {
-  if (typeof value === "string") return value;
+function decisionText(value: InteractionDecision): string {
   return serializeJson(value);
 }
 
@@ -14437,6 +14647,17 @@ function assertRemoteHostAuthentication(
     (mode === "node_key") !== (nodeKey !== undefined)) {
     throw new StoreError("Remote Host authentication metadata is inconsistent.");
   }
+}
+
+function sessionReferenceCursor(value: unknown, label: string): bigint {
+  if (typeof value !== "string" || !/^(?:0|[1-9][0-9]{0,18})$/u.test(value)) {
+    throw new StoreError(`Session reference ${label} is invalid.`);
+  }
+  const cursor = BigInt(value);
+  if (cursor > 9_223_372_036_854_775_807n) {
+    throw new StoreError(`Session reference ${label} exceeds durable history.`);
+  }
+  return cursor;
 }
 
 function remoteHostNodeKey(value: NonNullable<RemoteHostRecord["nodeKey"]>): NonNullable<RemoteHostRecord["nodeKey"]> {

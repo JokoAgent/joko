@@ -184,7 +184,6 @@ export function resolveComposerAttachmentPolicy(
 export function hasPendingComposerQueueItems(items: readonly QueueItemView[], sessionId: string): boolean {
   return items.some((item) => item.sessionId === sessionId && (
     item.state === "accepted"
-    || item.state === "queued"
     || item.state === "dispatching"
     || item.state === "dispatchUnknown"
   ));

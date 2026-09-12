@@ -21,7 +21,7 @@ import { ProviderAuthUnsupportedError } from "./credential-manager.js";
 import { nativeStateObservation, SESSION_NATIVE_STATE_OBSERVATION_SETTING_KEY } from "./native-state-observation.js";
 import { toProtoEventCursor, toProtoTimestamp } from "./proto-mapper.js";
 import { SESSION_RUNTIME_STATE_SETTING_KEY } from "./session-runtime-state.js";
-import type { SessionHost } from "./session-host.js";
+import { InteractionDecisionValidationError, type SessionHost } from "./session-host.js";
 
 const connection = {
   id: "connection-features",
@@ -115,6 +115,242 @@ async function completedNavigation(...args: Parameters<SessionHost["navigateTree
 }
 
 describe("Connect typed feature boundaries", () => {
+  it("preserves an exact Interaction oneof and maps Host validation failures to invalid-argument", async () => {
+    const resolveInteraction = vi.fn(() => {
+      throw new InteractionDecisionValidationError("Plan review response does not match the open permission request.");
+    });
+    const store = { findOperation: vi.fn(() => undefined) };
+    const services = createConnectServices(stubApplication({
+      store,
+      sessionHost: immediateHost(store, { resolveInteraction })
+    }));
+    const mutation = create(contract.OperationMutationSchema, {
+      payload: {
+        case: "resolveInteraction",
+        value: {
+          interactionId: "interaction-permission",
+          interactionGeneration: 3n,
+          resolution: {
+            decision: {
+              case: "planReview",
+              value: { decision: contract.PlanReviewDecisionKind.EXECUTE, feedback: "ship" }
+            }
+          }
+        }
+      }
+    });
+
+    await expect(invoke(services.operation.submitOperation, {
+      operationId: "resolve-interaction-wrong-oneof",
+      connectionId: connection.id,
+      mutation
+    })).rejects.toMatchObject({ code: Code.InvalidArgument });
+    expect(resolveInteraction).toHaveBeenCalledWith(
+      "interaction-permission",
+      3,
+      { kind: "plan_review", decision: "execute", feedback: "ship" },
+      "operation:resolve-interaction-wrong-oneof",
+      "resolve-interaction-wrong-oneof"
+    );
+  });
+
+  it.each([
+    ["missing", undefined],
+    ["unknown", { case: "futureAnswer", value: "opaque" }]
+  ] as const)("rejects a %s question answer oneof before entering a durable Host mutation", async (_label, value) => {
+    const mutate = vi.fn();
+    const resolveInteraction = vi.fn();
+    const services = createConnectServices(stubApplication({
+      store: { findOperation: vi.fn(() => undefined) },
+      sessionHost: { mutate, resolveInteraction }
+    }));
+    const mutation = create(contract.OperationMutationSchema, {
+      payload: {
+        case: "resolveInteraction",
+        value: {
+          interactionId: "interaction-question",
+          interactionGeneration: 1n,
+          resolution: {
+            decision: {
+              case: "question",
+              value: {
+                answers: [{
+                  fieldId: "answer",
+                  ...(value === undefined ? {} : { value: value as any })
+                }]
+              }
+            }
+          }
+        }
+      }
+    });
+
+    await expect(invoke(services.operation.submitOperation, {
+      operationId: `resolve-interaction-${_label}`,
+      connectionId: connection.id,
+      mutation
+    })).rejects.toMatchObject({ code: Code.InvalidArgument });
+    expect(mutate).not.toHaveBeenCalled();
+    expect(resolveInteraction).not.toHaveBeenCalled();
+  });
+
+  it("preserves every typed question-answer branch and optional Other presence", async () => {
+    const resolveInteraction = vi.fn();
+    const store = { findOperation: vi.fn(() => undefined) };
+    const services = createConnectServices(stubApplication({
+      store,
+      sessionHost: immediateHost(store, { resolveInteraction })
+    }));
+    const mutation = create(contract.OperationMutationSchema, {
+      payload: {
+        case: "resolveInteraction",
+        value: {
+          interactionId: "interaction-question",
+          interactionGeneration: 7n,
+          resolution: { decision: { case: "question", value: { answers: [
+            { fieldId: "notes", value: { case: "text", value: "Ready" } },
+            { fieldId: "release", value: { case: "singleChoice", value: {
+              selection: { case: "choiceId", value: "stable" }
+            } } },
+            { fieldId: "custom", value: { case: "singleChoice", value: {
+              selection: { case: "otherText", value: "stable" }
+            } } },
+            { fieldId: "targets", value: { case: "multipleChoice", value: {
+              choiceIds: ["web"]
+            } } },
+            { fieldId: "targets-with-other", value: { case: "multipleChoice", value: {
+              choiceIds: ["web"], otherText: "desktop"
+            } } },
+            { fieldId: "explicit-empty-other", value: { case: "multipleChoice", value: {
+              choiceIds: ["web"], otherText: ""
+            } } },
+            { fieldId: "publish", value: { case: "boolean", value: false } }
+          ] } } }
+        }
+      }
+    });
+
+    await invoke(services.operation.submitOperation, {
+      operationId: "resolve-interaction-typed-question",
+      connectionId: connection.id,
+      mutation
+    });
+    expect(resolveInteraction).toHaveBeenCalledWith(
+      "interaction-question",
+      7,
+      { kind: "question", answers: [
+        { fieldId: "notes", value: { kind: "text", value: "Ready" } },
+        { fieldId: "release", value: { kind: "choice", value: "stable" } },
+        { fieldId: "custom", value: { kind: "other", value: "stable" } },
+        { fieldId: "targets", value: { kind: "choices", values: ["web"] } },
+        { fieldId: "targets-with-other", value: { kind: "choices", values: ["web"], otherText: "desktop" } },
+        { fieldId: "explicit-empty-other", value: { kind: "choices", values: ["web"], otherText: "" } },
+        { fieldId: "publish", value: { kind: "boolean", value: false } }
+      ] },
+      "operation:resolve-interaction-typed-question",
+      "resolve-interaction-typed-question"
+    );
+  });
+
+  it.each([
+    ["unspecified", contract.QueueItemState.UNSPECIFIED],
+    ["unknown", 99 as contract.QueueItemState]
+  ])("rejects an explicitly %s Queue state before reading durable Queue data", async (_label, state) => {
+    const listQueueItems = vi.fn(() => []);
+    const countQueueItems = vi.fn(() => 0);
+    const services = createConnectServices(stubApplication({
+      store: { listQueueItems, countQueueItems }
+    }));
+
+    await expect(invoke(services.queue.listQueueItems, {
+      sessionId: "",
+      targetId: "",
+      state
+    })).rejects.toMatchObject({ code: Code.InvalidArgument });
+    expect(listQueueItems).not.toHaveBeenCalled();
+    expect(countQueueItems).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["unspecified", contract.QueueDeliveryMode.UNSPECIFIED],
+    ["unknown", 99 as contract.QueueDeliveryMode]
+  ])("rejects an explicitly %s send-input delivery mode before entering the Host", async (_label, deliveryMode) => {
+    const mutate = vi.fn();
+    const services = createConnectServices(stubApplication({
+      store: { findOperation: vi.fn(() => undefined) },
+      sessionHost: { mutate }
+    }));
+    const mutation = create(contract.OperationMutationSchema, {
+      preconditions: [{
+        entity: { kind: contract.EntityKind.SESSION, id: "session-invalid-delivery" },
+        expectedGeneration: 1n
+      }],
+      payload: {
+        case: "sendInput",
+        value: create(contract.SendInputMutationSchema, {
+          sessionId: "session-invalid-delivery",
+          input: create(contract.InputContentSchema, {
+            parts: [{ content: { case: "text", value: "Queued text" } }]
+          }),
+          deliveryMode
+        })
+      }
+    });
+
+    await expect(invoke(services.operation.submitOperation, {
+      operationId: `send-invalid-delivery-${deliveryMode}`,
+      connectionId: connection.id,
+      mutation
+    })).rejects.toMatchObject({ code: Code.InvalidArgument });
+    expect(mutate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["unspecified", contract.QueueDeliveryMode.UNSPECIFIED],
+    ["unknown", 99 as contract.QueueDeliveryMode]
+  ])("rejects an explicitly %s Queue-edit delivery mode before entering the Host", async (_label, deliveryMode) => {
+    const mutate = vi.fn();
+    const queueItem = {
+      id: "queue-invalid-delivery",
+      sessionId: "session-invalid-delivery",
+      runId: "run-invalid-delivery",
+      revision: 1n,
+      body: { text: "Queued text", images: [], files: [], mentions: [], disposition: "prompt" as const }
+    };
+    const services = createConnectServices(stubApplication({
+      store: {
+        findOperation: vi.fn(() => undefined),
+        getQueueItem: vi.fn(() => queueItem),
+        getRun: vi.fn(() => ({ descriptor: { source: "user" as const } }))
+      },
+      sessionHost: { mutate }
+    }));
+    const mutation = create(contract.OperationMutationSchema, {
+      preconditions: [{
+        entity: { kind: contract.EntityKind.QUEUE_ITEM, id: queueItem.id },
+        expectedRevision: { value: queueItem.revision }
+      }],
+      payload: {
+        case: "editQueueItem",
+        value: create(contract.EditQueueItemMutationSchema, {
+          queueItemId: queueItem.id,
+          input: create(contract.InputContentSchema, {
+            parts: [{ content: { case: "text", value: "Queued text" } }]
+          }),
+          deliveryMode,
+          lockToken: "queue-lock"
+        })
+      }
+    });
+
+    await expect(invoke(services.operation.submitOperation, {
+      operationId: `edit-invalid-delivery-${deliveryMode}`,
+      connectionId: connection.id,
+      mutation
+    })).rejects.toMatchObject({ code: Code.InvalidArgument });
+    expect(mutate).not.toHaveBeenCalled();
+  });
+
   it("queries every durable public list at an opaque offset beyond ten thousand with an exact total", async () => {
     const pageToken = Buffer.from("joko-page:10000", "utf8").toString("base64url");
     const page = { pageSize: 2, pageToken };
@@ -239,21 +475,6 @@ describe("Connect typed feature boundaries", () => {
       createdAt: 2,
       revision: 1n
     };
-    const artifact = {
-      blob: {
-        id: "artifact-page",
-        sha256: "a".repeat(64),
-        byteLength: 4,
-        mimeType: "text/plain",
-        fileName: "page.txt"
-      },
-      storageKey: "artifact-page",
-      sessionId: session.descriptor.id,
-      runId: run.descriptor.id,
-      metadata: { kind: "file" },
-      createdAt: 2,
-      revision: 1n
-    };
     const store = {
       listOperations: vi.fn(() => [operation]),
       countOperations: vi.fn(() => 10_001),
@@ -274,13 +495,11 @@ describe("Connect typed feature boundaries", () => {
       countScheduleRuns: vi.fn(() => 10_001),
       findRun: vi.fn(() => run),
       listInteractions: vi.fn(() => [interaction]),
-      countInteractions: vi.fn(() => 10_001),
-      listArtifacts: vi.fn(() => [artifact]),
-      countArtifacts: vi.fn(() => 10_001)
+      countInteractions: vi.fn(() => 10_001)
     };
     const services = createConnectServices(stubApplication({ store }));
 
-    const [operations, runs, queue, reviews, scheduleHistory, interactions, artifacts] = await Promise.all([
+    const [operations, runs, queue, reviews, scheduleHistory, interactions] = await Promise.all([
       invoke<contract.ListOperationsResponse>(services.operation.listOperations, {
         sessionId: session.descriptor.id,
         targetId: session.descriptor.targetId,
@@ -305,15 +524,10 @@ describe("Connect typed feature boundaries", () => {
         sessionId: session.descriptor.id,
         runId: run.descriptor.id,
         page
-      }),
-      invoke<contract.ListArtifactsResponse>(services.artifact.listArtifacts, {
-        sessionId: session.descriptor.id,
-        runId: run.descriptor.id,
-        page
       })
     ]);
 
-    for (const response of [operations, runs, queue, reviews, scheduleHistory, interactions, artifacts]) {
+    for (const response of [operations, runs, queue, reviews, scheduleHistory, interactions]) {
       expect(response.page).toMatchObject({ totalSize: 10_001n, nextPageToken: "" });
     }
     expect(queue.queueItems[0]?.ordinal).toBe(10_000n);
@@ -327,7 +541,60 @@ describe("Connect typed feature boundaries", () => {
     expect(store.listReviewRuns).toHaveBeenCalledWith(expect.objectContaining({ offset: 10_000, limit: 2 }));
     expect(store.listScheduleRuns).toHaveBeenCalledWith(schedule.id, 2, 10_000);
     expect(store.listInteractions).toHaveBeenCalledWith(expect.objectContaining({ offset: 10_000, limit: 2 }));
-    expect(store.listArtifacts).toHaveBeenCalledWith(expect.objectContaining({ offset: 10_000, limit: 2 }));
+  });
+
+  it("binds Artifact pagination to its exact query and durable revision", async () => {
+    let revision = 7n;
+    const artifacts = ["artifact-one", "artifact-two"].map((id, index) => ({
+      blob: {
+        id,
+        sha256: String(index + 1).repeat(64),
+        byteLength: 4,
+        mimeType: "text/plain",
+        fileName: `${id}.txt`
+      },
+      storageKey: id,
+      sessionId: "session-artifacts",
+      metadata: { kind: "file", title: id },
+      createdAt: 2 - index,
+      revision
+    }));
+    const listArtifacts = vi.fn((options: { readonly offset?: number; readonly limit?: number }) =>
+      artifacts.slice(options.offset ?? 0, (options.offset ?? 0) + (options.limit ?? 500)));
+    const store = {
+      health: vi.fn(() => ({ revision })),
+      listArtifacts,
+      countArtifacts: vi.fn(() => artifacts.length)
+    };
+    const services = createConnectServices(stubApplication({ store }));
+
+    const first = await invoke<contract.ListArtifactsResponse>(services.artifact.listArtifacts, {
+      sessionId: "session-artifacts",
+      page: { pageSize: 1 }
+    });
+    expect(first.revision?.value).toBe(7n);
+    expect(first.artifacts.map((artifact) => artifact.artifactId)).toEqual(["artifact-one"]);
+    expect(first.page).toMatchObject({ totalSize: 2n });
+    expect(first.page?.nextPageToken).not.toBe("");
+
+    const second = await invoke<contract.ListArtifactsResponse>(services.artifact.listArtifacts, {
+      sessionId: "session-artifacts",
+      page: { pageSize: 1, pageToken: first.page?.nextPageToken }
+    });
+    expect(second.artifacts.map((artifact) => artifact.artifactId)).toEqual(["artifact-two"]);
+    expect(second.page?.nextPageToken).toBe("");
+    expect(listArtifacts).toHaveBeenLastCalledWith(expect.objectContaining({ sessionId: "session-artifacts", offset: 1, limit: 1 }));
+
+    await expect(invoke(services.artifact.listArtifacts, {
+      sessionId: "another-session",
+      page: { pageSize: 1, pageToken: first.page?.nextPageToken }
+    })).rejects.toMatchObject({ code: Code.InvalidArgument });
+
+    revision = 8n;
+    await expect(invoke(services.artifact.listArtifacts, {
+      sessionId: "session-artifacts",
+      page: { pageSize: 1, pageToken: first.page?.nextPageToken }
+    })).rejects.toMatchObject({ code: Code.Aborted });
   });
 
   it("moves only Session navigation placement through a durable operation", async () => {

@@ -10,6 +10,12 @@ export interface ClaudeInputResolvers {
   readonly readBlob?: (blob: BlobRef) => Promise<{ readonly data: Uint8Array; readonly mimeType?: string }>;
   /** Resolves an immutable Artifact to its host-owned regular file. */
   readonly resolveFile?: (blob: BlobRef, context: AdapterContext) => Promise<string>;
+  /** Resolves only a committed Artifact in the original task's authority. */
+  readonly resolveArtifactMention?: (artifactId: string, context: AdapterContext, signal: AbortSignal) => Promise<{
+    readonly blob: BlobRef;
+    readonly path: string;
+    readonly assertCurrent: () => void;
+  }>;
 }
 
 const MAXIMUM_IMAGE_BYTES = 5 * 1024 * 1024;
@@ -18,16 +24,23 @@ const MAXIMUM_FILE_BYTES = 256 * 1024 * 1024;
 const MAXIMUM_TEXT_BYTES = 1024 * 1024;
 const MAXIMUM_INPUT_ITEMS = 100;
 
+export interface PreparedClaudePrompt {
+  readonly content: ClaudeSdkUserMessage["message"]["content"];
+  /** Retains the original resource authority until the SDK consumes this input. */
+  readonly assertCurrent: () => void;
+}
+
 export async function prepareClaudePrompt(
   input: PromptInput,
   context: AdapterContext,
   resolvers: ClaudeInputResolvers,
   signal: AbortSignal
-): Promise<ClaudeSdkUserMessage["message"]["content"]> {
+): Promise<PreparedClaudePrompt> {
   const itemCount = input.images.length + input.files.length + input.mentions.length + (input.text.length > 0 ? 1 : 0);
   if (itemCount > MAXIMUM_INPUT_ITEMS) throw inputError("INPUT_ITEM_LIMIT", "The prompt contains too many attachments and mentions.");
   const blocks: Readonly<Record<string, unknown>>[] = [];
   const text = input.text.length > 0 ? [input.text] : [];
+  const mentionAuthorities: Array<() => void> = [];
   let totalImageBytes = 0;
   for (const { blob } of input.images) {
     if (!Number.isSafeInteger(blob.byteLength) || blob.byteLength < 1 || !/^[a-f0-9]{64}$/iu.test(blob.sha256)) {
@@ -77,6 +90,33 @@ export async function prepareClaudePrompt(
   }
   for (const mention of input.mentions) {
     signal.throwIfAborted();
+    if (mention.kind === "artifact") {
+      if (resolvers.resolveArtifactMention === undefined) {
+        throw inputError("MENTION_KIND_UNSUPPORTED", "Artifact mentions require a service-owned authority resolver.");
+      }
+      if (mention.reference.length === 0 || mention.reference.length > 1_024
+        || /[\u0000-\u001f\u007f]/u.test(mention.reference) || mention.lineRange !== undefined) {
+        throw inputError("ARTIFACT_REFERENCE_INVALID", "An Artifact mention requires a bounded canonical identity.");
+      }
+      const resolved = await resolvers.resolveArtifactMention(mention.reference, context, signal).catch(() => {
+        signal.throwIfAborted();
+        throw inputError("ARTIFACT_UNAVAILABLE", "The referenced Artifact is unavailable in this task.");
+      });
+      signal.throwIfAborted();
+      const blob = resolved.blob;
+      if (blob.id !== mention.reference || !Number.isSafeInteger(blob.byteLength) || blob.byteLength < 0
+        || blob.byteLength > MAXIMUM_FILE_BYTES || !/^[a-f0-9]{64}$/iu.test(blob.sha256)) {
+        throw inputError("ARTIFACT_REFERENCE_INVALID", "The resolved Artifact does not match its canonical identity or size limit.");
+      }
+      const path = await regularFile(resolved.path);
+      await verifyFileContent(path, blob, signal);
+      mentionAuthorities.push(() => {
+        try { resolved.assertCurrent(); }
+        catch { throw inputError("ARTIFACT_UNAVAILABLE", "The referenced Artifact changed while input was prepared."); }
+      });
+      text.push(`Artifact reference: ${JSON.stringify({ name: mention.label, path })}`);
+      continue;
+    }
     if (mention.kind !== "workspace_file" && mention.kind !== "workspace_directory") {
       throw inputError("MENTION_KIND_UNSUPPORTED", "This native input supports workspace file and directory mentions.");
     }
@@ -102,9 +142,15 @@ export async function prepareClaudePrompt(
   if (Buffer.byteLength(combined, "utf8") > MAXIMUM_TEXT_BYTES) {
     throw inputError("PROMPT_TOO_LARGE", "The prompt and attachment descriptions exceed the native text limit.");
   }
-  if (blocks.length === 0) return combined;
+  const assertCurrent = (): void => {
+    signal.throwIfAborted();
+    context.signal.throwIfAborted();
+    for (const assertMentionCurrent of mentionAuthorities) assertMentionCurrent();
+  };
+  assertCurrent();
+  if (blocks.length === 0) return { content: combined, assertCurrent };
   if (combined.length > 0) blocks.push({ type: "text", text: combined });
-  return blocks;
+  return { content: blocks, assertCurrent };
 }
 
 async function workspaceFile(workspaceRoot: string, value: string): Promise<string> {

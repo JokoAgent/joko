@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { chromium } from "playwright-core";
 import { BrowserProvider } from "./provider.js";
-import { HTML_PREVIEW_CSP, installHtmlSnapshot, validateHtmlSnapshot, workspaceHtmlPreviewUrl } from "./html-preview.js";
+import { HTML_PREVIEW_CSP, installHtmlSnapshot, isWorkspaceHtmlPreviewUrl, validateHtmlSnapshot, workspaceHtmlPreviewUrl } from "./html-preview.js";
 
 describe("isolated HTML snapshots", () => {
   it("rejects missing, oversized and misaddressed snapshots before page creation", () => {
@@ -13,6 +13,13 @@ describe("isolated HTML snapshots", () => {
     expect(() => validateHtmlSnapshot("https://other.preview.joko.invalid/asset.html")).toThrow(/expired/u);
     expect(() => validateHtmlSnapshot("https://example.test/", { html: "<p>hello</p>", assertCurrent: () => undefined })).toThrow(/isolated/u);
     expect(() => validateHtmlSnapshot(url, { html: "é".repeat(1_048_577), assertCurrent: () => undefined })).toThrow(/bounded/u);
+  });
+
+  it("rejects a percent-encoded Workspace path that cannot fit the governed navigation URL", () => {
+    const path = `${"🦊".repeat(1_000)}.html`;
+    expect(path.length).toBeLessThan(4_096);
+    expect(() => workspaceHtmlPreviewUrl("encoded-path", path)).toThrow(/URL exceeds/u);
+    expect(isWorkspaceHtmlPreviewUrl(`https://encoded-path.preview.joko.invalid/${encodeURIComponent(path)}`)).toBe(false);
   });
 
   it.skipIf(process.env.JOKO_BROWSER_EXECUTABLE === undefined)("runs inline interactions in an opaque document while blocking unsupported resources, popups, forms and downloads", async () => {
@@ -56,10 +63,10 @@ describe("isolated HTML snapshots", () => {
     } finally { await browser.close(); }
   }, 20_000);
 
-  it.skipIf(process.env.JOKO_BROWSER_EXECUTABLE === undefined)("opens a governed page and refuses URL-only recovery after the runtime retires its source", async () => {
+  it.skipIf(process.env.JOKO_BROWSER_EXECUTABLE === undefined)("opens an external headed governed page and refuses URL-only recovery after the runtime retires its source", async () => {
     const root = await mkdtemp(join(tmpdir(), "joko-html-browser-"));
     const provider = new BrowserProvider({ providerId: "browser", executablePath: process.env.JOKO_BROWSER_EXECUTABLE!,
-      profileDirectories: { sidebar: join(root, "sidebar"), external: join(root, "external") }, targetMode: "sidebar", downloadDirectory: join(root, "downloads"), uploadRoots: [] });
+      profileDirectories: { sidebar: join(root, "sidebar"), external: join(root, "external") }, targetMode: "external", downloadDirectory: join(root, "downloads"), uploadRoots: [] });
     const url = workspaceHtmlPreviewUrl("runtime-owned");
     const dispose = vi.fn();
     try {

@@ -5,6 +5,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
 import { composerDocumentPlainText } from "../composer-quote-document.js";
+import { dispatchGamepadOwnedAction } from "../gamepad-actions.js";
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
 import { emptySnapshot, type BackendView, type ModelView, type ProviderRuntimeView, type SessionView } from "../model.js";
 import { Composer } from "./Composer.js";
@@ -36,6 +37,32 @@ afterEach(async () => {
 });
 
 describe("Composer model authorization", () => {
+  it("routes gamepad commands through the live composer, preserves attachment policy, and sends a draft only once", async () => {
+    const view = await mount();
+    view.host.className = "new-task-page";
+    const file = view.host.querySelector<HTMLInputElement>("input[type='file']")!;
+    const pick = vi.spyOn(file, "click").mockImplementation(() => undefined);
+    await act(async () => { dispatchGamepadOwnedAction(document, "add-attachments"); });
+    expect(pick).not.toHaveBeenCalled();
+    const attachmentsBackend = { ...backend, capabilities: new Map([...backend.capabilities, ["input.file", { name: "input.file", supported: true, options: [] }]]) };
+    await view.render([provider], session, attachmentsBackend);
+    await act(async () => { dispatchGamepadOwnedAction(document, "add-attachments"); });
+    expect(pick).toHaveBeenCalledOnce();
+    await view.render([provider], session, attachmentsBackend, true);
+    await act(async () => { dispatchGamepadOwnedAction(document, "submit"); dispatchGamepadOwnedAction(document, "add-attachments"); });
+    expect(view.api.send).not.toHaveBeenCalled(); expect(pick).toHaveBeenCalledOnce();
+    await view.render([provider]);
+    await act(async () => {
+      dispatchGamepadOwnedAction(document, "submit"); dispatchGamepadOwnedAction(document, "submit");
+      await Promise.all(view.actions);
+    });
+    expect(view.api.send).toHaveBeenCalledOnce();
+    expect(view.api.send).toHaveBeenCalledWith(session.id, expect.objectContaining({ text: "Keep this draft" }), { expectedGeneration: session.generation });
+    expect(view.draft()).toBe("");
+    await act(async () => { dispatchGamepadOwnedAction(document, "open-commands"); });
+    expect(document.body.textContent).toContain("/help");
+  });
+
   it("gates the native default with its Backend authentication while leaving unrelated provider states out of the decision", async () => {
     const view = await mount();
     const nativeSession = { ...session, model: undefined };
@@ -117,8 +144,9 @@ async function mount() {
   const host = document.body.appendChild(document.createElement("div"));
   const root = createRoot(host); roots.push(root);
   const actions: Promise<unknown>[] = []; const stop = vi.fn();
-  const render = async (providers: readonly ProviderRuntimeView[], currentSession = session, currentBackend = backend) => act(async () => root.render(<Composer
+  const render = async (providers: readonly ProviderRuntimeView[], currentSession = session, currentBackend = backend, readOnly = false) => act(async () => root.render(<Composer
     controller={{ ...api, state: { ...api.state, snapshot: { ...api.state.snapshot, providers } } }} session={currentSession} backend={currentBackend}
+    readOnly={readOnly}
     autoFocus={false} queue={[]} extraDirectories={[]} resources={[]} commands={[]} messageHistory={[]}
     t={(key) => key} runAction={(_key, action) => { actions.push(action().catch(() => undefined)); }} onLocalSend={() => undefined} onStop={stop} />));
   await render([provider]);

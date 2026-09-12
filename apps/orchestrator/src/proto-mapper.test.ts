@@ -2,9 +2,9 @@ import { describe, expect, it } from "vitest";
 
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { ProviderApiCompatibility, ProviderConfigurationField } from "@joko/contracts";
-import { AuthenticationState, BackgroundTaskState, CompactionState, ContextRebuildReason, EventSchema, InlineTextRangeSchema, InputContentSchema, InstallationState, InteractionState, MessageInputDelivery, ModelPriceSource, QueueSourceKind, ReviewFreshnessState, RetryState, RunState, ScheduleExecutionMode, ScheduleFireSource, ScheduleRunPhase, ScheduleSessionMode, ToolCallOutputMode } from "@joko/contracts";
+import { AuthenticationState, BackgroundTaskState, CompactionState, ContextRebuildReason, EventSchema, InlineTextRangeSchema, InputContentSchema, InputMentionRangeSchema, InstallationState, InteractionState, MessageInputDelivery, ModelPriceSource, QueueSourceKind, ReviewFreshnessState, RetryState, RunState, ScheduleExecutionMode, ScheduleFireSource, ScheduleRunPhase, ScheduleSessionMode, ToolCallOutputMode } from "@joko/contracts";
 import type { EventPayload, PiEventMetadata, ProviderModel, SubagentRunDetail, SubagentTranscriptEntry } from "@joko/core";
-import { OperationConflictError, type InteractionRecord, type PersistedEvent, type QueueItemRecord, type ScheduleRecord, type ScheduleRunRecord, type StoredAttempt, type StoredBackend, type StoredRun, type StoredSession } from "@joko/store";
+import { OperationConflictError, type ArtifactRecord, type InteractionRecord, type PersistedEvent, type QueueItemRecord, type ScheduleRecord, type ScheduleRunRecord, type StoredAttempt, type StoredBackend, type StoredRun, type StoredSession } from "@joko/store";
 
 import {
   ProtoMappingError,
@@ -23,6 +23,7 @@ import {
   toProtoEvent,
   toProtoBackend,
   toProtoAttempt,
+  toProtoArtifact,
   toProtoEventCursor,
   toProtoInputContent,
   toProtoInteraction,
@@ -37,6 +38,27 @@ import {
 } from "./proto-mapper.js";
 
 describe("proto mapper", () => {
+  it("projects Artifact expiration exactly and rejects malformed stored expiry", () => {
+    const artifact: ArtifactRecord = {
+      blob: {
+        id: "artifact-expiring",
+        sha256: "a".repeat(64),
+        byteLength: 4,
+        mimeType: "text/plain",
+        fileName: "report.txt"
+      },
+      storageKey: "artifacts/a",
+      sessionId: "session-artifact",
+      metadata: { kind: "file", expiresAt: 12_345 },
+      createdAt: 10_000,
+      revision: 1n
+    };
+
+    expect(fromProtoTimestamp(toProtoArtifact(artifact).expiresAt)).toBe(12_345);
+    expect(() => toProtoArtifact({ ...artifact, metadata: { expiresAt: Number.NaN } }))
+      .toThrow(/Artifact expiration/u);
+  });
+
   it("projects public Backend identity without exposing private Adapter kind", () => {
     const stored: StoredBackend = {
       descriptor: {
@@ -715,17 +737,41 @@ describe("proto mapper", () => {
         }
       }],
       mentions: [
-        { kind: "workspace_file" as const, label: "README", reference: "README.md" },
-        { kind: "workspace_file" as const, label: "selected lines", reference: "README.md", lineRange: { startLine: 2, endLine: 5 } },
-        { kind: "workspace_directory" as const, label: "sources", reference: "src" },
-        { kind: "resource" as const, label: "Docs", reference: "resource-1" }
+        { kind: "workspace_file" as const, workspaceId: "workspace-1", label: "README", reference: "README.md" },
+        { kind: "workspace_file" as const, workspaceId: "workspace-1", label: "selected lines", reference: "README.md", lineRange: { startLine: 2, endLine: 5 } },
+        { kind: "workspace_directory" as const, workspaceId: "workspace-1", label: "sources", reference: "src" },
+        { kind: "resource" as const, label: "Docs", reference: "resource-1", discoveredRevision: "revision-1", resourceVersion: "9", runtimeGeneration: 4 },
+        { kind: "artifact" as const, label: "Report", reference: "artifact-1" },
+        { kind: "session" as const, label: "Earlier task", reference: "task/earlier" }
       ],
       disposition: "steer" as const,
       quotesEncoded: true,
       pastedTextRanges: [{ start: 0, end: 7, display: "Pasted text (1 line)" }]
     };
 
-    expect(fromProtoInputContent(toProtoInputContent(input), "steer")).toEqual(input);
+    const wire = toProtoInputContent(input);
+    expect(wire.parts.at(-1)?.content).toMatchObject({
+      case: "sessionMention", value: { sessionId: "task/earlier", displayText: "Earlier task" }
+    });
+    expect(wire.parts.find((part) => part.content.case === "resourceMention")?.content.value).toMatchObject({
+      resourceId: "resource-1",
+      discoveredRevision: "revision-1",
+      resourceVersion: 9n,
+      runtimeGeneration: 4n
+    });
+    expect(fromProtoInputContent(wire, "steer")).toEqual(input);
+  });
+
+  it("rejects malformed task mention identity at the wire boundary", () => {
+    expect(() => fromProtoInputContent(create(InputContentSchema, {
+      parts: [{ content: { case: "sessionMention", value: { sessionId: " task", displayText: "Earlier" } } }]
+    }))).toThrow(ProtoMappingError);
+  });
+
+  it("rejects the former ID-only resource mention wire shape", () => {
+    expect(() => fromProtoInputContent(create(InputContentSchema, {
+      parts: [{ content: { case: "resourceMention", value: { resourceId: "resource-1", displayText: "Docs" } } }]
+    }))).toThrow(ProtoMappingError);
   });
 
   it.each([
@@ -734,7 +780,7 @@ describe("proto mapper", () => {
     { directory: false, lineRange: { startLine: 3, endLine: 2 } }
   ])("rejects invalid workspace mention ranges at the wire boundary: %j", (metadata) => {
     expect(() => fromProtoInputContent(create(InputContentSchema, {
-      parts: [{ content: { case: "workspaceMention", value: { relativePath: "src/main.ts", ...metadata } } }]
+      parts: [{ content: { case: "workspaceMention", value: { workspaceId: "workspace-1", relativePath: "src/main.ts", ...metadata } } }]
     }))).toThrow("Line ranges require a file");
   });
 
@@ -772,8 +818,12 @@ describe("proto mapper", () => {
       type: "message_complete",
       role: "user",
       blocks: [{ kind: "text", text: "> <!-- joko-selection-quote -->\n> selected\n\nreply" }],
-      quotesEncoded: true,
-      pastedTextRanges: [{ start: 44, end: 49, display: "Pasted text (1 line)" }],
+      acceptedInput: {
+        text: "> <!-- joko-selection-quote -->\n> selected\n\nreply",
+        images: [], files: [], mentions: [], disposition: "prompt",
+        quotesEncoded: true,
+        pastedTextRanges: [{ start: 44, end: 49, display: "Pasted text (1 line)" }]
+      },
       automationOrigin: { kind: "scheduler", scheduleId: "schedule-1", scheduleName: "Nightly", runId: "run-1" },
       inputDelivery: "scheduler",
       nativeHistory: { identity: { entryId: "entry-user", rewindBefore: { kind: "session_start" } } }
@@ -797,7 +847,7 @@ describe("proto mapper", () => {
     expect(proto.payload?.kind).toMatchObject({
       case: "messageStarted",
       value: {
-        quotesEncoded: true,
+        userInputAccepted: true,
         userInput: { quotesEncoded: true },
         inputDelivery: MessageInputDelivery.SCHEDULER,
         automationOrigin: { scheduleId: "schedule-1", scheduleName: "Nightly", runId: "run-1" },
@@ -805,6 +855,86 @@ describe("proto mapper", () => {
       }
     });
     expect(fromProtoEvent(proto).payload).toEqual(payload);
+  });
+
+  it("preserves repeated inline identities through binary input independently of attachment parts", () => {
+    const input = {
+      text: "😀 @report.txt @report.txt @report.txt paste",
+      images: [],
+      files: [{ blob: { id: "attachment", sha256: "a".repeat(64), byteLength: 1, mimeType: "text/plain", fileName: "report.txt" } }],
+      mentions: [
+        { kind: "artifact" as const, label: "report.txt", reference: "artifact-one" },
+        { kind: "workspace_file" as const, workspaceId: "workspace-other", label: "report.txt", reference: "report.txt" },
+        { kind: "resource" as const, label: "non-inline", reference: "resource-one", discoveredRevision: "revision-one", resourceVersion: "5", runtimeGeneration: 4 }
+      ],
+      mentionRanges: [
+        { start: 3, end: 14, mentionIndex: 0 },
+        { start: 15, end: 26, mentionIndex: 1 },
+        { start: 27, end: 38, mentionIndex: 0 }
+      ],
+      pastedTextRanges: [{ start: 39, end: 44, display: "paste" }],
+      disposition: "follow_up" as const
+    };
+    const wire = toProtoInputContent(input);
+    const decoded = fromBinary(InputContentSchema, toBinary(InputContentSchema, wire));
+    expect(decoded.parts.map((part) => part.content.case)).toEqual(["text", "file", "artifactMention", "workspaceMention", "resourceMention"]);
+    expect(fromProtoInputContent(decoded, "follow_up")).toEqual(input);
+    expect(() => fromProtoInputContent(create(InputContentSchema, {
+      ...wire,
+      mentionRanges: [create(InputMentionRangeSchema, { start: 3, end: 14, mentionIndex: 3 })]
+    }))).toThrow(/Mention ranges/u);
+    expect(() => toProtoInputContent({ ...input, mentionRanges: [{ start: 38, end: 41, mentionIndex: 0 }] })).toThrow(/Mention ranges/u);
+    expect(() => fromProtoInputContent(create(InputContentSchema, {
+      ...wire,
+      mentionRanges: [create(InputMentionRangeSchema, { start: 1, end: 14, mentionIndex: 0 })]
+    }))).toThrow(/Mention ranges/u);
+    expect(() => fromProtoInputContent(create(InputContentSchema, {
+      parts: [{ content: { case: "workspaceMention", value: { relativePath: "report.txt" } } }]
+    }))).toThrow(/workspace_id/u);
+    expect(() => toProtoInputContent({ ...input, mentions: [{ kind: "workspace_file", label: "report.txt", reference: "report.txt" }], mentionRanges: [] })).toThrow(/workspace_id/u);
+  });
+
+  it("projects accepted input separately from native echo and rejects authority without a receipt", () => {
+    const acceptedInput = {
+      text: "@report.txt",
+      images: [], files: [],
+      mentions: [{ kind: "artifact" as const, label: "report.txt", reference: "artifact-exact" }],
+      mentionRanges: [{ start: 0, end: 11, mentionIndex: 0 }],
+      disposition: "steer" as const
+    };
+    const payload: EventPayload = {
+      type: "message_complete", role: "user",
+      blocks: [{ kind: "text", text: "native expanded input" }],
+      acceptedInput,
+      inputDelivery: "steer",
+      nativeHistory: { identity: { entryId: "native-user-entry", rewindBefore: { kind: "session_start" } } }
+    };
+    const event: PersistedEvent = {
+      id: "event-user-reference", sequence: 1n, globalCursor: 1n, revision: 1n, emittedAt: 1_000,
+      backendId: "backend-1", targetId: "target-1", sessionId: "session-1", runId: "run-1", generation: 1,
+      traceId: "trace-user-reference", payload
+    };
+    const wire = fromBinary(EventSchema, toBinary(EventSchema, toProtoEvent(event)));
+    expect(wire.payload?.kind).toMatchObject({ case: "messageStarted", value: {
+      userInputAccepted: true,
+      userInput: { parts: [
+        { content: { case: "text", value: "@report.txt" } },
+        { content: { case: "artifactMention", value: { artifactId: "artifact-exact" } } }
+      ], mentionRanges: acceptedInput.mentionRanges },
+      nativeIdentity: { entryId: "native-user-entry" }
+    } });
+    expect(fromProtoEvent(wire).payload).toMatchObject({ acceptedInput, nativeHistory: payload.nativeHistory });
+    expect(payload.blocks).toEqual([{ kind: "text", text: "native expanded input" }]);
+    if (wire.payload?.kind.case !== "messageStarted") throw new Error("Expected a user message.");
+    wire.payload.kind.value.userInputAccepted = false;
+    expect(() => fromProtoEvent(wire)).toThrow(/cannot claim/u);
+    wire.payload.kind.value.userInput = create(InputContentSchema, {
+      parts: [{ content: { case: "text", value: "@report.txt" } }]
+    });
+    expect(fromProtoEvent(wire).payload).not.toHaveProperty("acceptedInput");
+    wire.payload.kind.value.userInput.quotesEncoded = true;
+    expect(() => fromProtoEvent(wire)).toThrow(/cannot claim/u);
+    expect(() => toProtoEvent({ ...event, payload: { ...payload, role: "assistant" } })).toThrow(/Only user messages/u);
   });
 
   it("round-trips service-owned continuation identity and its recovery lifecycle", () => {
@@ -1801,15 +1931,19 @@ describe("proto mapper", () => {
           { id: "branch", label: "Branch", required: true, kind: "single", choices: [
             { id: "main", label: "main" },
             { id: "release", label: "release", description: "stable" }
-          ] },
+          ], allowOther: true },
           { id: "checks", label: "Checks", required: true, kind: "multiple", choices: [
             { id: "unit", label: "unit" },
             { id: "e2e", label: "e2e" }
-          ], defaultChoiceIds: [], minimumSelections: 1, maximumSelections: 2 },
-          { id: "notes", label: "Notes", required: false, kind: "text", multiline: true, sensitive: false }
+          ], defaultChoiceIds: [], minimumSelections: 1, maximumSelections: 3, allowOther: true },
+          { id: "notes", label: "Notes", required: false, kind: "text", multiline: true }
         ]
       },
-      decision: { kind: "question", answers: { branch: "main", checks: ["unit", "e2e"], notes: "keep API" } },
+      decision: { kind: "question", answers: {
+        branch: { kind: "single", selection: { kind: "choice", choiceId: "main" } },
+        checks: { kind: "multiple", choiceIds: ["unit", "e2e"], otherText: "lint" },
+        notes: { kind: "text", value: "keep API" }
+      } },
       createdAt: 1_000,
       resolvedAt: 2_000,
       revision: 10n
@@ -1818,7 +1952,11 @@ describe("proto mapper", () => {
     expect(fromProtoInteraction(protoQuestion, "trace-question").payload).toEqual(question.payload);
     expect(fromProtoInteractionDecision(protoQuestion.resolution!)).toEqual({
       kind: "decision",
-      value: { branch: "main", checks: ["unit", "e2e"], notes: "keep API" }
+      value: {
+        branch: { kind: "single", selection: { kind: "choice", choiceId: "main" } },
+        checks: { kind: "multiple", choiceIds: ["unit", "e2e"], otherText: "lint" },
+        notes: { kind: "text", value: "keep API" }
+      }
     });
 
     for (const decision of ["execute", "stay", "refine"] as const) {

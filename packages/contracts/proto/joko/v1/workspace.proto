@@ -37,7 +37,7 @@ message WorkspaceDescriptor {
   bool trusted = 6;
   GitRepositoryState git = 7;
   EntityVersion version = 8;
-  // Mirrors the owning Target location so file clients can gate local-only
+  // Records the owning Target location so file clients can gate local-only
   // affordances without interpreting Backend identity.
   RemoteWorkspaceBinding remote_workspace = 9;
 }

@@ -4,6 +4,7 @@ import type { SessionWorktreeBinding, TargetDescriptor } from "@joko/core";
 import type { OperationalStore, StoredSession } from "@joko/store";
 import {
   EphemeralWorktreeService,
+  type WorktreeCallOptions,
   type WorktreeErrorCode,
   type WorktreeSourceOption
 } from "@joko/worktree";
@@ -36,6 +37,16 @@ export interface AcquireSessionWorktreeInput {
   readonly target: TargetDescriptor;
   readonly sourceRef?: string;
   readonly refreshRemote?: boolean;
+}
+
+export interface DeriveSessionWorktreeInput {
+  readonly sessionId: string;
+  readonly sourceSessionId: string;
+}
+
+export interface SessionWorktreeRemovalPreview {
+  readonly hasWorktree: boolean;
+  readonly dirty: boolean;
 }
 
 export class SessionWorktreeCoordinatorError extends Error {
@@ -73,6 +84,9 @@ export class SessionWorktreeCoordinator {
     const scheduledOwnerSessionIds = this.#store.listSettings("service")
       .filter((setting) => setting.key === SCHEDULED_WORKTREE_OWNER_SETTING_KEY)
       .map((setting) => setting.scopeId);
+    const pendingDerivationSessionIds = this.#store.listUnadoptedNativeSessionDerivations()
+      .filter((record) => record.state === "recorded")
+      .map((record) => record.sessionId);
     const liveSessionIds = sessions
       .filter((session) => !session.descriptor.archived)
       .map((session) => session.descriptor.id);
@@ -83,7 +97,8 @@ export class SessionWorktreeCoordinator {
     const initialized = await this.#service.initialize({
       retainSessionIds: [...new Set([
         ...liveSessionIds,
-        ...scheduledOwnerSessionIds.filter((sessionId) => !archivedSessionIdSet.has(sessionId))
+        ...scheduledOwnerSessionIds.filter((sessionId) => !archivedSessionIdSet.has(sessionId)),
+        ...pendingDerivationSessionIds
       ])],
       preserveSessionIds: archivedSessionIds
     });
@@ -153,22 +168,7 @@ export class SessionWorktreeCoordinator {
       refreshRemote: input.refreshRemote === true
     });
     if (!result.ok) throw new SessionWorktreeCoordinatorError(result.error.code);
-    const now = Date.now();
-    const binding: SessionWorktreeBinding = {
-      leaseId: result.value.lease.id,
-      workspaceId: workspaceIdFor(input.sessionId),
-      path: result.value.lease.path,
-      repositoryRoot: result.value.lease.repositoryRoot,
-      branch: result.value.lease.branch,
-      sourceRef: result.value.lease.source.ref,
-      sourceCommit: result.value.lease.source.commit,
-      sourceStrategy: result.value.lease.source.strategy,
-      sourceRefreshed: result.value.lease.source.refreshed,
-      ...(result.value.lease.source.remote === undefined ? {} : { sourceRemote: result.value.lease.source.remote }),
-      state: "active",
-      acquiredAt: result.value.lease.acquiredAt,
-      updatedAt: now
-    };
+    const binding = worktreeBindingFor(input.sessionId, result.value.lease);
     try {
       await this.#workspaces.register({
         id: binding.workspaceId,
@@ -183,12 +183,68 @@ export class SessionWorktreeCoordinator {
     return binding;
   }
 
+  async derive(input: DeriveSessionWorktreeInput): Promise<SessionWorktreeBinding> {
+    this.#requireInitialized();
+    const source = this.#store.getSession(input.sourceSessionId);
+    const sourceBinding = source.descriptor.worktree;
+    if (sourceBinding === undefined || sourceBinding.state !== "active") {
+      throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+    }
+    const activeLease = this.#service.snapshot().active.find((lease) => lease.sessionId === input.sourceSessionId);
+    if (activeLease === undefined || !sameLease(activeLease, sourceBinding)) {
+      throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+    }
+    const result = await this.#service.derive({
+      sessionId: input.sessionId,
+      sourceSessionId: input.sourceSessionId,
+      sourceLeaseId: sourceBinding.leaseId
+    });
+    if (!result.ok) throw new SessionWorktreeCoordinatorError(result.error.code);
+    const binding = worktreeBindingFor(input.sessionId, result.value.lease);
+    const target = this.#store.getTarget(source.descriptor.targetId).descriptor;
+    try {
+      await this.#workspaces.register({
+        id: binding.workspaceId,
+        root: binding.path,
+        displayName: `${target.displayName} · ${binding.branch}`,
+        trusted: target.trusted
+      });
+    } catch (error) {
+      await this.#service.release(input.sessionId).catch(() => undefined);
+      throw error;
+    }
+    return binding;
+  }
+
   effectiveTarget(session: StoredSession): TargetDescriptor {
     const target = this.#store.getTarget(session.descriptor.targetId).descriptor;
     const worktree = session.descriptor.worktree;
     if (worktree === undefined) return target;
     if (worktree.state !== "active") throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
     return { ...target, workspaceRoot: worktree.path };
+  }
+
+  activeWorkspacePath(sessionId: string, expectedPath: string): string | undefined {
+    if (!this.#initialized) return undefined;
+    const lease = this.#service.snapshot().active.find((candidate) => candidate.sessionId === sessionId);
+    if (lease === undefined || resolve(lease.path) !== resolve(expectedPath)) return undefined;
+    return lease.path;
+  }
+
+  async previewRemoval(
+    sessionId: string,
+    options?: WorktreeCallOptions
+  ): Promise<SessionWorktreeRemovalPreview> {
+    this.#requireInitialized();
+    const session = this.#store.getSession(sessionId);
+    const binding = session.descriptor.worktree;
+    if (binding === undefined) return Object.freeze({ hasWorktree: false, dirty: false });
+    const result = await this.#service.previewRemoval({ sessionId, leaseId: binding.leaseId }, options);
+    if (!result.ok) throw new SessionWorktreeCoordinatorError(result.error.code);
+    if (result.value.state !== binding.state) {
+      throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+    }
+    return Object.freeze({ hasWorktree: true, dirty: result.value.dirty });
   }
 
   async release(sessionId: string): Promise<void> {
@@ -268,12 +324,49 @@ export class SessionWorktreeCoordinator {
   }
 
   #requireInitialized(): void {
-    if (!this.#initialized) throw new Error("The isolated workspace coordinator is not initialized.");
+    if (!this.#initialized) throw new SessionWorktreeCoordinatorError("NOT_INITIALIZED");
   }
 }
 
 function workspaceIdFor(sessionId: string): string {
   return `worktree-${sessionId}`;
+}
+
+function worktreeBindingFor(
+  sessionId: string,
+  lease: ReturnType<EphemeralWorktreeService["snapshot"]>["active"][number]
+): SessionWorktreeBinding {
+  const now = Date.now();
+  return {
+    leaseId: lease.id,
+    workspaceId: workspaceIdFor(sessionId),
+    path: lease.path,
+    repositoryRoot: lease.repositoryRoot,
+    branch: lease.branch,
+    sourceRef: lease.source.ref,
+    sourceCommit: lease.source.commit,
+    sourceStrategy: lease.source.strategy,
+    sourceRefreshed: lease.source.refreshed,
+    ...(lease.source.remote === undefined ? {} : { sourceRemote: lease.source.remote }),
+    state: "active",
+    acquiredAt: lease.acquiredAt,
+    updatedAt: now
+  };
+}
+
+function sameLease(
+  lease: ReturnType<EphemeralWorktreeService["snapshot"]>["active"][number],
+  binding: SessionWorktreeBinding
+): boolean {
+  return lease.id === binding.leaseId
+    && resolve(lease.path) === resolve(binding.path)
+    && resolve(lease.repositoryRoot) === resolve(binding.repositoryRoot)
+    && lease.branch === binding.branch
+    && lease.source.ref === binding.sourceRef
+    && lease.source.commit === binding.sourceCommit
+    && lease.source.strategy === binding.sourceStrategy
+    && lease.source.refreshed === binding.sourceRefreshed
+    && lease.source.remote === binding.sourceRemote;
 }
 
 function probeEligibility(code: WorktreeErrorCode): TargetWorktreeEligibility {

@@ -39,6 +39,86 @@ afterEach(async () => {
 });
 
 describe("Sidebar progressive conversation search", () => {
+  it("locks project search to current navigation members, preserves the lock on reset, and releases it explicitly", async () => {
+    vi.useFakeTimers();
+    const onSearchMessages = vi.fn<SidebarProps["onSearchMessages"]>(async () => [
+      { ...hit("needle moved in", "moved-in-hit"), sessionId: "moved-in" },
+      hit("needle moved out", "moved-out-hit")
+    ]);
+    const onSearchRemoteMessages = vi.fn<NonNullable<SidebarProps["onSearchRemoteMessages"]>>(async () => []);
+    const rendered = await renderSidebar(onSearchMessages, { onSearchRemoteMessages, machineControl: remoteMachineControl() });
+    const originalSession = rendered.snapshot.sessions[0]!;
+    const originalTarget = rendered.snapshot.targets[0]!;
+    const scopedSnapshot = {
+      ...rendered.snapshot,
+      targets: [originalTarget, { ...originalTarget, id: "target-b", name: "Project B" }],
+      sessions: [
+        { ...originalSession, projectId: "target-b" },
+        { ...originalSession, id: "moved-in", targetId: "target-b", name: "Moved task" }
+      ]
+    };
+    await rendered.rerender({ snapshot: scopedSnapshot });
+    await lockProjectSearch(rendered.container, "Project A");
+    expect(rendered.container.querySelector(".conversation-search__project-lock")?.textContent).toContain("Project A");
+    const projects = rendered.container.querySelector<HTMLFieldSetElement>(".conversation-search-filter__projects");
+    expect(projects?.disabled).toBe(true);
+    await changeSelect(rendered.container, "archived");
+    await act(async () => rendered.container.querySelector<HTMLButtonElement>(".conversation-search-filter__header button")?.click());
+    await enterQuery(rendered.container, "needle");
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(onSearchMessages.mock.calls[0]?.[2]).toEqual({ sessionIds: ["moved-in"] });
+    expect(onSearchRemoteMessages).not.toHaveBeenCalled();
+    expect(rendered.container.textContent).toContain("needle moved in");
+    expect(rendered.container.textContent).not.toContain("needle moved out");
+    const firstSignal = onSearchMessages.mock.calls[0]?.[3];
+
+    await rendered.rerender({ snapshot: { ...scopedSnapshot, sessions: scopedSnapshot.sessions.map((session) => ({ ...session, updatedAt: 2 })) } });
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(onSearchMessages).toHaveBeenCalledTimes(1);
+    await rendered.rerender({ snapshot: { ...scopedSnapshot, sessions: scopedSnapshot.sessions.map((session) => ({ ...session, projectId: "target-b" })) } });
+    expect(firstSignal?.aborted).toBe(true);
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(onSearchMessages.mock.calls[1]?.[2]).toEqual({ sessionIds: [] });
+    expect(rendered.container.textContent).not.toContain("needle moved in");
+
+    const input = rendered.container.querySelector<HTMLInputElement>("#conversation-search-input")!;
+    await act(async () => input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+    expect(input.value).toBe("");
+    expect(projects?.disabled).toBe(true);
+    await act(async () => rendered.container.querySelector<HTMLButtonElement>("[aria-label='nav.searchProjectUnlock']")?.click());
+    expect(rendered.container.querySelector(".conversation-search__project-lock")).toBeNull();
+    expect(projects?.disabled).toBe(false);
+    expect(document.activeElement).toBe(input);
+    await enterQuery(rendered.container, "global");
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(onSearchMessages.mock.calls.at(-1)?.[2]).toEqual({});
+    expect(onSearchRemoteMessages).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["owner", "removed", "archived", "machine"] as const)("clears the project lock and pending query when its %s context changes", async (change) => {
+    vi.useFakeTimers();
+    const pending = deferred<readonly SessionMessageSearchMatchView[]>();
+    const onSearchMessages = vi.fn<SidebarProps["onSearchMessages"]>(() => pending.promise);
+    const onSearchRemoteMessages = vi.fn<NonNullable<SidebarProps["onSearchRemoteMessages"]>>(async () => []);
+    const control = remoteMachineControl();
+    const rendered = await renderSidebar(onSearchMessages, { machineControl: control, onSearchRemoteMessages });
+    await lockProjectSearch(rendered.container, "Project A");
+    await enterQuery(rendered.container, "needle");
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    const signal = onSearchMessages.mock.calls[0]?.[3];
+    await rendered.rerender(change === "owner" ? { sidebarOwnerId: "other-owner" }
+      : change === "machine" ? { machineControl: { ...control, selection: ["remote-east"] } }
+        : { snapshot: { ...rendered.snapshot, targets: change === "removed" ? [] : rendered.snapshot.targets.map((target) => ({ ...target, archived: true })) } });
+    expect(signal?.aborted).toBe(true);
+    expect(rendered.container.querySelector<HTMLInputElement>("#conversation-search-input")?.value).toBe("");
+    expect(rendered.container.querySelector(".conversation-search__project-lock")).toBeNull();
+    await act(async () => pending.resolve([hit("stale needle result", "stale")]));
+    await act(async () => vi.advanceTimersByTimeAsync(900));
+    expect(rendered.container.textContent).not.toContain("stale needle result");
+    expect(onSearchMessages).toHaveBeenCalledTimes(1);
+    expect(onSearchRemoteMessages).not.toHaveBeenCalled();
+  });
+
   it("shows keyword at 250ms and atomically upgrades to hybrid at 900ms", async () => {
     vi.useFakeTimers();
     const keyword = deferred<readonly SessionMessageSearchMatchView[]>();
@@ -119,7 +199,7 @@ describe("Sidebar progressive conversation search", () => {
     await act(async () => vi.advanceTimersByTimeAsync(900));
     expect(calls).toHaveLength(2);
     expect(calls[0]?.filters).toEqual({
-      targetIds: ["target-a"],
+      sessionIds: ["session-a"],
       backendIds: ["backend"],
       sessionStatus: "archived",
       sessionActivityFrom: Date.parse("2026-08-17T12:00:00.000Z")
@@ -261,8 +341,12 @@ describe("Sidebar progressive conversation search", () => {
 
 async function renderSidebar(
   onSearchMessages: SidebarProps["onSearchMessages"],
-  overrides: Partial<Pick<SidebarProps, "machineControl" | "onSearchRemoteMessages">> = {}
-): Promise<{ readonly container: HTMLDivElement }> {
+  overrides: Partial<SidebarProps> = {}
+): Promise<{
+  readonly container: HTMLDivElement;
+  readonly snapshot: SidebarProps["snapshot"];
+  readonly rerender: (next: Partial<SidebarProps>) => Promise<void>;
+}> {
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
@@ -293,6 +377,7 @@ async function renderSidebar(
       id: "session-a",
       backendId: "backend",
       targetId: "target-a",
+      projectId: "target-a",
       name: "Release task",
       state: "idle" as const,
       permissionMode: "ask" as const,
@@ -305,7 +390,9 @@ async function renderSidebar(
     }]
   };
   const noop = vi.fn();
-  await act(async () => root.render(<Sidebar
+  const t = ((key: string) => key) as Translator;
+  let currentOverrides = overrides;
+  const render = async (): Promise<void> => act(async () => root.render(<Sidebar
     snapshot={snapshot}
     route={{ kind: "session" }}
     locale="en"
@@ -317,7 +404,7 @@ async function renderSidebar(
     mode="expanded"
     width={320}
     searchInputRef={createRef<HTMLInputElement>()}
-    t={((key: string) => key) as Translator}
+    t={t}
     probeRuntimeActivity={async () => false}
     onNavigate={noop}
     onNewTask={noop}
@@ -327,7 +414,6 @@ async function renderSidebar(
     onArchive={noop}
     onDelete={noop}
     onSearchMessages={onSearchMessages}
-    {...overrides}
     onMessageSearchSortChange={noop}
     onSidebarDisplayPreferencesChange={noop}
     onSidebarOwnerLayoutChange={noop}
@@ -343,8 +429,13 @@ async function renderSidebar(
     onResizeKeyDown={noop}
     onResetWidth={noop}
     onDisconnect={noop}
+    {...currentOverrides}
   />));
-  return { container };
+  await render();
+  return { container, snapshot, rerender: async (next) => {
+    currentOverrides = { ...currentOverrides, ...next };
+    await render();
+  } };
 }
 
 async function enterQuery(container: HTMLElement, value: string): Promise<void> {
@@ -356,6 +447,18 @@ async function enterQuery(container: HTMLElement, value: string): Promise<void> 
     setter.call(input, value);
     input.dispatchEvent(new Event("input", { bubbles: true }));
   });
+}
+
+async function lockProjectSearch(container: HTMLElement, projectName: string): Promise<void> {
+  const project = [...container.querySelectorAll<HTMLElement>(".sidebar-main-view .project-group")]
+    .find((candidate) => candidate.querySelector(".project-group__header")?.textContent?.includes(projectName) === true);
+  const trigger = project?.querySelector<HTMLButtonElement>("[aria-label='common.more']");
+  if (trigger == null) throw new Error(`Project menu ${projectName} was not rendered.`);
+  await act(async () => trigger.click());
+  const search = [...document.body.querySelectorAll<HTMLButtonElement>(".sidebar-project-actions-menu button")]
+    .find((button) => button.textContent === "projects.search");
+  if (search === undefined) throw new Error("Project search action was not rendered.");
+  await act(async () => search.click());
 }
 
 async function changeSelect(container: HTMLElement, value: string): Promise<void> {

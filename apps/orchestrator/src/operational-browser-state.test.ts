@@ -1,5 +1,6 @@
 import * as contract from "@joko/contracts";
 import { OperationalStore } from "@joko/store";
+import { workspaceHtmlPreviewUrl } from "@joko/tool-browser";
 import { describe, expect, it } from "vitest";
 
 import { OperationalBrowserState } from "./operational-browser-state.js";
@@ -182,6 +183,40 @@ describe("OperationalBrowserState", () => {
       updatedAt: 10
     }, { active: true })).toThrow(/invalid/u);
     expect(JSON.stringify(store.listSettings())).not.toContain("secret");
+    store.close();
+  });
+
+  it("tombstones a missing Workspace HTML page instead of accumulating restart recovery state", () => {
+    const store = new OperationalStore(":memory:");
+    const previewUrl = workspaceHtmlPreviewUrl("workspace-runtime", "reports/private.html");
+    const state = new OperationalBrowserState(store);
+    state.recordHumanPage({
+      browserProviderId: "browser",
+      pageId: "page-html",
+      generation: 7,
+      sessionId: "session-1",
+      targetId: "target-1",
+      bindingGeneration: 1,
+      url: previewUrl,
+      title: "HTML preview",
+      updatedAt: 10
+    }, { active: true });
+
+    const restarted = new OperationalBrowserState(store);
+    expect(restarted.findRecoverablePage("browser", "page-html")).toMatchObject({
+      url: previewUrl,
+      title: "HTML preview"
+    });
+    expect(restarted.recoverablePages("browser", new Set())).toEqual([]);
+    expect(restarted.findRecoverablePage("browser", "page-html")).toBeUndefined();
+    expect(restarted.activePageId("browser")).toBeUndefined();
+    expect(store.findSetting<{
+      readonly openEntries: readonly unknown[];
+      readonly lastGenerations: readonly { readonly browserProviderId: string; readonly generation: number }[];
+    }>("service", "orchestrator", "browser_pages.v1")?.value).toMatchObject({
+      openEntries: [],
+      lastGenerations: [{ browserProviderId: "browser", generation: 7 }]
+    });
     store.close();
   });
 

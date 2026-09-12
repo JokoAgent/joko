@@ -1,12 +1,13 @@
 // @vitest-environment jsdom
 
 import { act } from "react";
+import type { JSX } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { translate } from "../i18n.js";
 import type { SessionTitleSuggestionView, SessionView } from "../model.js";
-import { RenameSessionDialog } from "./SessionDialogs.js";
+import { ArchiveSessionDialog, DeleteSessionDialog, RenameSessionDialog } from "./SessionDialogs.js";
 
 const roots: Root[] = [];
 
@@ -66,6 +67,48 @@ describe("RenameSessionDialog", () => {
   });
 });
 
+describe("Session removal dialogs", () => {
+  it("shows aggregated dirty and unknown workspace state before archiving a batch", async () => {
+    const onArchive = vi.fn();
+    await mount(<ArchiveSessionDialog
+      sessions={[session(), { ...session(), id: "session-b", name: "Second task" }]}
+      preflight={{ clean: 0, dirty: 1, unknown: 1 }}
+      t={(key, values) => translate("en", key, values)}
+      onClose={vi.fn()}
+      onArchive={onArchive}
+    />);
+
+    const alerts = [...document.querySelectorAll<HTMLElement>('[role="alert"]')].map((alert) => alert.textContent);
+    expect(alerts).toEqual([
+      "Workspaces with uncommitted changes: 1. Their exact state will be preserved for restoration.",
+      "Workspace states that could not be verified: 1. Review them before continuing."
+    ]);
+    expect([...document.querySelectorAll(".delete-dialog__sessions li")].map((item) => item.textContent))
+      .toEqual(["Existing title", "Second task"]);
+    await act(async () => buttonNamed("Archive task").click());
+    expect(onArchive).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the native deletion choice while warning about a dirty workspace", async () => {
+    const onDelete = vi.fn();
+    await mount(<DeleteSessionDialog
+      session={session()}
+      preflight={{ clean: 0, dirty: 1, unknown: 0 }}
+      t={(key, values) => translate("en", key, values)}
+      onClose={vi.fn()}
+      onDelete={onDelete}
+    />);
+
+    expect(document.querySelector('[role="alert"]')?.textContent)
+      .toContain("recovery snapshots will be transferred to the repository stash");
+    const checkbox = document.querySelector<HTMLInputElement>('.delete-dialog input[type="checkbox"]');
+    if (checkbox === null) throw new Error("missing native deletion checkbox");
+    await act(async () => checkbox.click());
+    await act(async () => buttonNamed("Delete").click());
+    expect(onDelete).toHaveBeenCalledExactlyOnceWith(true);
+  });
+});
+
 async function renderDialog(overrides: {
   readonly onClose?: () => void;
   readonly onRename?: (name: string) => void;
@@ -82,6 +125,14 @@ async function renderDialog(overrides: {
     onRename={overrides.onRename ?? vi.fn()}
     onSuggest={overrides.onSuggest}
   />));
+}
+
+async function mount(element: JSX.Element): Promise<void> {
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  roots.push(root);
+  await act(async () => root.render(element));
 }
 
 function session(): SessionView {
@@ -111,6 +162,13 @@ function cancelButton(): HTMLButtonElement {
   const button = [...document.querySelectorAll<HTMLButtonElement>("button")]
     .find((candidate) => candidate.textContent === "Cancel");
   if (button === undefined) throw new Error("missing cancel button");
+  return button;
+}
+
+function buttonNamed(name: string): HTMLButtonElement {
+  const button = [...document.querySelectorAll<HTMLButtonElement>("button")]
+    .find((candidate) => candidate.textContent?.trim() === name);
+  if (button === undefined) throw new Error(`missing button: ${name}`);
   return button;
 }
 

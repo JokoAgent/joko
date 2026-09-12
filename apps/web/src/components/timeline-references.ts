@@ -2,6 +2,7 @@ import { parseComposerRouteReference } from "./composer-paste-pipeline.js";
 import { canonicalWorkspaceRelativePath } from "./workspace-tree-state.js";
 import { workspaceFilesHash } from "../workspace-files-navigation.js";
 import { scanChatUrls } from "../chat-url-boundary.js";
+import type { TimelineInputMentionRangeView, TimelineInputMentionView } from "../model.js";
 
 export type TimelineReferenceTarget =
   | { readonly kind: "external"; readonly href: string }
@@ -13,7 +14,7 @@ export type SentMessageReferenceSegment =
   | { readonly kind: "text"; readonly text: string }
   | { readonly kind: "reference"; readonly text: string; readonly target: TimelineReferenceTarget; readonly mention: boolean };
 
-const SENT_REFERENCE_PATTERN = /\[([^\]\n]{1,240})\]\(([^)\s]{1,2048})\)|(?:joko:\/\/app[^\s"'<>]*?#\/(?:tasks|projects)\/[^\s"'<>]+|#\/(?:tasks|projects)\/[^\s"'<>]+|https?:\/\/)|@"((?:\\.|[^"\n]){1,1024})"|@([^\s"'<>]+)/giu;
+const SENT_REFERENCE_PATTERN = /\[([^\]\n]{1,240})\]\(([^)\s]{1,2048})\)|(?:joko:\/\/app[^\s"'<>]*?#\/(?:tasks|projects)\/[^\s"'<>]+|#\/(?:tasks|projects)\/[^\s"'<>]+|https?:\/\/)/giu;
 const TRAILING_REFERENCE_PUNCTUATION = /[.,;:!?]+$/u;
 
 export function resolveTimelineReference(rawValue: string, sessionId: string): TimelineReferenceTarget | undefined {
@@ -57,43 +58,111 @@ export function parseSentMessageReferences(text: string, sessionId: string): rea
   let match: RegExpExecArray | null;
   while ((match = SENT_REFERENCE_PATTERN.exec(text)) !== null) {
     const markdownHref = match[2];
-    const quotedMention = match[3];
-    const bareMention = match[4];
-    const mention = quotedMention !== undefined || bareMention !== undefined;
     let consumedText = match[0];
-    let rawTarget = markdownHref ?? quotedMention?.replace(/\\"/gu, '"') ?? bareMention ?? match[0];
+    let rawTarget = markdownHref ?? match[0];
     if (markdownHref !== undefined) {
       const destination = authoredDestination(text, match.index + match[0].indexOf("](") + 2);
       if (destination === undefined) continue;
       rawTarget = destination.value;
       consumedText = text.slice(match.index, destination.end);
       SENT_REFERENCE_PATTERN.lastIndex = destination.end;
-    } else if (!mention && /^https?:\/\//iu.test(rawTarget)) {
+    } else if (/^https?:\/\//iu.test(rawTarget)) {
       const url = bareUrls.get(match.index);
       if (url === undefined) continue;
       rawTarget = url.url;
       consumedText = rawTarget;
       SENT_REFERENCE_PATTERN.lastIndex = url.end;
-    } else if (markdownHref === undefined && quotedMention === undefined) {
+    } else if (markdownHref === undefined) {
       const trimmed = trimReferencePunctuation(rawTarget);
       consumedText = consumedText.slice(0, consumedText.length - (rawTarget.length - trimmed.length));
       rawTarget = trimmed;
       SENT_REFERENCE_PATTERN.lastIndex = match.index + consumedText.length;
     }
-    if (mention && !looksLikeWorkspaceMention(rawTarget)) continue;
     const target = resolveTimelineReference(rawTarget, sessionId);
-    if (target === undefined || (mention && target.kind !== "workspace")) continue;
+    if (target === undefined) continue;
     if (match.index > cursor) result.push({ kind: "text", text: text.slice(cursor, match.index) });
     result.push({
       kind: "reference",
       text: markdownHref === undefined ? consumedText : match[1] ?? markdownHref,
       target,
-      mention
+      mention: false
     });
     cursor = match.index + consumedText.length;
   }
   if (cursor < text.length) result.push({ kind: "text", text: text.slice(cursor) });
   return result.length === 0 ? [{ kind: "text", text }] : result;
+}
+
+/** A receipt supplies positions explicitly; spelling never establishes identity. */
+export function validSentInputMentionRanges(
+  text: string,
+  mentions: readonly TimelineInputMentionView[],
+  ranges: readonly TimelineInputMentionRangeView[]
+): readonly TimelineInputMentionRangeView[] | undefined {
+  let end = 0;
+  for (const range of ranges) {
+    if (![range.start, range.end, range.mentionIndex].every(Number.isSafeInteger)
+      || range.start < end || range.end <= range.start || range.end > text.length
+      || range.mentionIndex < 0 || range.mentionIndex >= mentions.length
+      || splitsSurrogate(text, range.start) || splitsSurrogate(text, range.end)) return undefined;
+    end = range.end;
+  }
+  return ranges;
+}
+
+export type SentInputMentionSegment =
+  | { readonly kind: "text"; readonly text: string }
+  | { readonly kind: "mention"; readonly text: string; readonly mention: TimelineInputMentionView; readonly mentionIndex: number };
+
+export function sentInputMentionSegments(
+  text: string,
+  mentions: readonly TimelineInputMentionView[],
+  ranges: readonly TimelineInputMentionRangeView[]
+): readonly SentInputMentionSegment[] {
+  const result: SentInputMentionSegment[] = [];
+  let cursor = 0;
+  const validRanges = validSentInputMentionRanges(text, mentions, ranges);
+  if (validRanges === undefined) return [{ kind: "text", text }];
+  for (const range of validRanges) {
+    if (range.start > cursor) result.push({ kind: "text", text: text.slice(cursor, range.start) });
+    result.push({ kind: "mention", text: text.slice(range.start, range.end), mention: mentions[range.mentionIndex]!, mentionIndex: range.mentionIndex });
+    cursor = range.end;
+  }
+  if (cursor < text.length) result.push({ kind: "text", text: text.slice(cursor) });
+  return result;
+}
+
+export function resolveSentWorkspaceMention(
+  mention: Extract<TimelineInputMentionView, { readonly kind: "workspace" }>,
+  sessionId: string,
+  workspaceId: string | undefined
+): TimelineReferenceTarget | undefined {
+  if (workspaceId === undefined || mention.workspaceId !== workspaceId) return undefined;
+  try {
+    const path = canonicalWorkspaceRelativePath(mention.relativePath);
+    if (path !== mention.relativePath) return undefined;
+    const lineRange = mention.lineRange;
+    if (lineRange !== undefined && (mention.directory || !Number.isSafeInteger(lineRange.startLine)
+      || !Number.isSafeInteger(lineRange.endLine) || lineRange.startLine < 1 || lineRange.endLine < lineRange.startLine)) return undefined;
+    const line = lineRange?.startLine;
+    return { kind: "workspace", path, directory: mention.directory,
+      href: workspaceFilesHash({ sessionId, file: path, ...(line === undefined ? {} : { line }) }),
+      ...(line === undefined ? {} : { line }) };
+  } catch { return undefined; }
+}
+
+export function resolveSentSessionMention(
+  mention: Extract<TimelineInputMentionView, { readonly kind: "session" }>,
+  currentSessionId: string
+): TimelineReferenceTarget | undefined {
+  const sessionId = mention.sessionId;
+  if (sessionId === currentSessionId || sessionId.length === 0 || sessionId.length > 1_024
+    || sessionId !== sessionId.trim() || /[\u0000-\u001f\u007f\u2028\u2029]/u.test(sessionId)) return undefined;
+  return { kind: "session", href: `#/tasks/${encodeURIComponent(sessionId)}`, sessionId };
+}
+
+function splitsSurrogate(text: string, offset: number): boolean {
+  return offset > 0 && offset < text.length && /[\uD800-\uDBFF]/u.test(text[offset - 1]!) && /[\uDC00-\uDFFF]/u.test(text[offset]!);
 }
 
 function authoredDestination(text: string, start: number): { readonly value: string; readonly end: number } | undefined {
@@ -151,11 +220,6 @@ function normalizeWorkspaceReference(value: string): { readonly path: string; re
   } catch {
     return undefined;
   }
-}
-
-function looksLikeWorkspaceMention(value: string): boolean {
-  const normalized = value.replace(/\\"/gu, '"');
-  return normalized.includes("/") || /\.[A-Za-z\d_-]{1,16}(?::\d+(?::\d+)?)?$/u.test(normalized);
 }
 
 function trimReferencePunctuation(value: string): string {

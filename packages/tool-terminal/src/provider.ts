@@ -308,12 +308,13 @@ export class TerminalProvider {
     }
   }
 
-  async resize(input: TerminalReference & { readonly cols: number; readonly rows: number }, signal?: AbortSignal): Promise<TerminalDescriptor> {
+  async resize(input: TerminalReference & { readonly cols: number; readonly rows: number }, signal?: AbortSignal, beforeCommit?: () => void): Promise<TerminalDescriptor> {
     const record = this.#requireRunning(input);
     const cols = integer(input.cols, 2, TERMINAL_LIMITS.maximumColumns, "Columns");
     const rows = integer(input.rows, 1, TERMINAL_LIMITS.maximumRows, "Rows");
     return this.#enqueue(record, async () => {
       signal?.throwIfAborted();
+      beforeCommit?.();
       this.#requireRunning(input);
       if (cols === record.descriptor.cols && rows === record.descriptor.rows) return { ...record.descriptor };
       try { await record.pty.resize(cols, rows); record.screen.resize(cols, rows); }
@@ -677,7 +678,7 @@ export class TerminalProvider {
         yield frame;
         continue;
       }
-      if (record.descriptor.status !== "running") return;
+      if (record.descriptor.status !== "running" && record.processExitConfirmed) return;
       await waitForOutput(record, signal);
     }
     } finally { signal.removeEventListener("abort", release); release(); record.streams -= 1; }

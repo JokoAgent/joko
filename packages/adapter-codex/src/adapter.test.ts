@@ -83,11 +83,20 @@ describe("CodexBackendAdapter", () => {
     expect(retired).toHaveBeenCalledOnce();
   });
 
-  it("rejects unsupported directory and source range mentions before native dispatch", async () => {
+  it("rejects every unsupported mention kind before native dispatch", async () => {
     const setup = await createSetup();
     const binding = await setup.adapter.createSession(sessionInput(setup.target), context(setup.target, [], { backendInstanceGeneration: 7 }));
     for (const mention of [
       { kind: "workspace_directory", label: "source", reference: "src" },
+      {
+        kind: "resource",
+        label: "Skill",
+        reference: "resource-one",
+        discoveredRevision: "sha256:resource-one",
+        resourceVersion: "1",
+        runtimeGeneration: 1
+      },
+      { kind: "artifact", label: "Export", reference: "artifact-one" },
       { kind: "workspace_file", label: "lines", reference: "src/main.ts", lineRange: { startLine: 1, endLine: 2 } }
     ] as const) {
       await expect(setup.adapter.send({ ...prompt(""), mentions: [mention] }, context(setup.target, [], { binding, backendInstanceGeneration: 7, operationId: "unsupported-mention" })))
@@ -110,6 +119,7 @@ describe("CodexBackendAdapter", () => {
     });
     expect(descriptor.models).toHaveLength(1);
     expect(descriptor.capabilities.size).toBe(CAPABILITIES.length);
+    expect(descriptor.capabilities.get("input.mention")).toMatchObject({ supported: true, options: ["workspace_file"] });
     expect(descriptor.capabilities.get("session.catalog")?.supported).toBe(true);
     expect(descriptor.capabilities.get("turn.steer")?.supported).toBe(true);
     expect(descriptor.capabilities.get("model.effort")?.supported).toBe(true);
@@ -152,15 +162,24 @@ describe("CodexBackendAdapter", () => {
       text: "work on this",
       images: [],
       files: [{
-        blob: { id: "blob-file", sha256: "0".repeat(64), byteLength: 5, mimeType: "text/plain", fileName: "notes.txt" },
+        blob: { id: "blob-file", sha256: "0".repeat(64), byteLength: 5, mimeType: "text/plain", fileName: "notes\"\n.txt" },
         workspacePath: "notes.txt"
       }],
-      mentions: [{ kind: "resource", label: "Demo App", reference: "app://demo-app" }],
+      mentions: [{ kind: "workspace_file", label: "Notes\"\nreference", reference: "notes.txt" }],
       disposition: "prompt"
     }, sendContext);
     const turnStart = setup.fake.transport?.requests.find((request) => request.method === "turn/start");
     expect(turnStart?.params).toMatchObject({ clientUserMessageId: "operation-one" });
-    expect(JSON.stringify(turnStart?.params)).toContain('"type":"mention"');
+    expect((turnStart?.params as JsonObject | undefined)?.["input"]).toEqual([{
+      type: "text",
+      text: [
+        "work on this",
+        `Attached file: ${JSON.stringify({ name: "notes\"\n.txt", path: attachmentPath })}`,
+        `Workspace file reference: ${JSON.stringify({ name: "Notes\"\nreference", path: attachmentPath })}`
+      ].join("\n\n"),
+      text_elements: []
+    }]);
+    expect(JSON.stringify((turnStart?.params as JsonObject | undefined)?.["input"])).not.toContain('"type":"mention"');
 
     await setup.fake.completeTurn(binding.nativeSessionId!, "hello from fake");
     expect(events).toContainEqual(expect.objectContaining({ type: "text_delta", delta: "hello from fake" }));
@@ -407,7 +426,7 @@ describe("CodexBackendAdapter", () => {
       operationId: "secret-question-turn",
       requestInteraction: async () => {
         interactionCount += 1;
-        return { kind: "question", answers: { secret: "must-not-be-persisted" } };
+        return { kind: "question", answers: { secret: { kind: "text", value: "must-not-be-persisted" } } };
       }
     });
     await setup.adapter.send({
@@ -514,7 +533,7 @@ describe("CodexBackendAdapter", () => {
     expect((await withImages.describe()).capabilities.get("input.image")?.supported).toBe(true);
   });
 
-  it("rejects oversized prompt input before native mutation dispatch", async () => {
+  it("rejects oversized user or generated prompt text before native mutation dispatch", async () => {
     const setup = await createSetup(7, { maximumPromptTextBytes: 8 });
     const events: EventPayload[] = [];
     const binding = await setup.adapter.createSession(
@@ -532,6 +551,22 @@ describe("CodexBackendAdapter", () => {
       binding,
       backendInstanceGeneration: 7,
       operationId: "oversized-prompt"
+    }))).rejects.toMatchObject({ publicError: { code: "CODEX_PROMPT_TOO_LARGE", stateMayHaveChanged: false } });
+    const attachmentPath = join(setup.target.workspaceRoot, "bounded.txt");
+    await writeFile(attachmentPath, "bounded", "utf8");
+    await expect(setup.adapter.send({
+      text: "",
+      images: [],
+      files: [{
+        blob: { id: "bounded-file", sha256: "0".repeat(64), byteLength: 7, mimeType: "text/plain" },
+        workspacePath: "bounded.txt"
+      }],
+      mentions: [],
+      disposition: "prompt"
+    }, context(setup.target, events, {
+      binding,
+      backendInstanceGeneration: 7,
+      operationId: "oversized-generated-prompt"
     }))).rejects.toMatchObject({ publicError: { code: "CODEX_PROMPT_TOO_LARGE", stateMayHaveChanged: false } });
     expect(setup.fake.transport?.requests.filter((request) => request.method === "turn/start")).toHaveLength(before);
   });
@@ -915,12 +950,38 @@ describe("CodexBackendAdapter", () => {
       expect(derived.nativeSessionId).not.toBe(binding.nativeSessionId);
       expect(setup.fake.transport?.requests.some((request) => request.method === "thread/unsubscribe")).toBe(false);
     });
-    const derived = await setup.adapter.fork("fork-source-message", sourceContext, { sessionId: "derived-session", recordBinding });
+    const derivedWorkspace = join(setup.target.workspaceRoot, "derived-workspace");
+    await mkdir(derivedWorkspace);
+    const derivedTarget = { ...sourceContext.target, workspaceRoot: derivedWorkspace };
+    expect((await setup.adapter.describe()).capabilities.get("workspace.derive")).toMatchObject({ supported: true });
+    const forkRequestsBeforeMismatch = setup.fake.transport?.requests.filter((request) => request.method === "thread/fork").length;
+    await expect(setup.adapter.clone(sourceContext, {
+      sessionId: "mismatched-target-session",
+      target: { ...derivedTarget, trusted: !derivedTarget.trusted },
+      recordBinding: vi.fn()
+    })).rejects.toMatchObject({
+      publicError: {
+        code: "CODEX_SESSION_DERIVATION_TARGET_MISMATCH",
+        stateMayHaveChanged: false
+      }
+    });
+    expect(setup.fake.transport?.requests.filter((request) => request.method === "thread/fork"))
+      .toHaveLength(forkRequestsBeforeMismatch ?? 0);
+    const derived = await setup.adapter.fork("fork-source-message", sourceContext, {
+      sessionId: "derived-session",
+      target: derivedTarget,
+      recordBinding
+    });
     expect(recordBinding).toHaveBeenCalledExactlyOnceWith(derived.binding);
     const forkRequest = setup.fake.transport?.requests.find((request) => request.method === "thread/fork");
-    expect(forkRequest?.params).toMatchObject({ threadId: binding.nativeSessionId, lastTurnId: "turn-1" });
+    expect(forkRequest?.params).toMatchObject({
+      threadId: binding.nativeSessionId,
+      lastTurnId: "turn-1",
+      cwd: derivedWorkspace
+    });
     await expect(setup.adapter.detachSession(derived.binding, {
       ...sourceContext,
+      target: derivedTarget,
       binding: derived.binding
     })).resolves.toBeUndefined();
 
@@ -1065,7 +1126,7 @@ describe("CodexBackendAdapter", () => {
       () => setup.adapter.send(prompt("Pending input"), { ...setup.bound, operationId: "during-rewind" }),
       () => setup.adapter.setFastMode(false, setup.bound),
       () => setup.adapter.compact(undefined, setup.bound),
-      () => setup.adapter.clone(setup.bound, { sessionId: "derived", recordBinding: () => undefined })
+      () => setup.adapter.clone(setup.bound, { sessionId: "derived", target: setup.bound.target, recordBinding: () => undefined })
     ]) await expect(mutation()).rejects.toMatchObject({ publicError: { code: "CODEX_REWIND_BUSY", stateMayHaveChanged: false } });
     await setup.adapter.closeSession(setup.binding, setup.bound);
     release();
@@ -1156,7 +1217,7 @@ describe("CodexBackendAdapter", () => {
     }
     const recordBinding = vi.fn();
     await expect(setup.adapter.fork("selected-fork-boundary", { ...base, signal: cancellation.signal }, {
-      sessionId: "derived-session", recordBinding
+      sessionId: "derived-session", target: base.target, recordBinding
     })).rejects.toMatchObject({ publicError: { stateMayHaveChanged: false } });
     expect(recordBinding).not.toHaveBeenCalled();
     expect(transport.requests.some((request) => request.method === "thread/fork")).toBe(false);
@@ -1194,7 +1255,7 @@ describe("CodexBackendAdapter", () => {
     });
 
     const recordBinding = vi.fn();
-    const failure: unknown = await setup.adapter.clone(bound, { sessionId: "derived-session", recordBinding }).catch((error: unknown) => error);
+    const failure: unknown = await setup.adapter.clone(bound, { sessionId: "derived-session", target: bound.target, recordBinding }).catch((error: unknown) => error);
     expect(failure).toMatchObject({ publicError: { code, stateMayHaveChanged: true, retryable: false } });
     expect(JSON.stringify(failure)).not.toContain(foreignRoot);
     expect(JSON.stringify(failure)).not.toContain(binding.nativeSessionId);
@@ -1237,7 +1298,7 @@ describe("CodexBackendAdapter", () => {
       expect(derived.nativeSessionId).toBe(nativeDerivedId);
       if (boundary === "receipt-rejected") throw new Error("Receipt storage unavailable");
     });
-    const failure = await setup.adapter.clone(bound, { sessionId: "derived-session", recordBinding }).catch((error: unknown) => error);
+    const failure = await setup.adapter.clone(bound, { sessionId: "derived-session", target: bound.target, recordBinding }).catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(Error);
     expect(recordBinding).toHaveBeenCalledTimes(1);
     if (boundary === "source-closed") expect(failure).toMatchObject({ publicError: { code: "CODEX_RUNTIME_GENERATION_STALE", stateMayHaveChanged: true } });

@@ -1,17 +1,20 @@
 import { describe, expect, it } from "vitest";
-import type { ResourceView, RuntimeCommandView, WorkspaceEntryView } from "../model.js";
+import type { RuntimeCommandView, SessionView, WorkspaceEntryView } from "../model.js";
 import {
   composerBuiltInCommand,
   composerCommandItems,
   composerMentionItems,
+  detectComposerCommandActivation,
+  filterComposerPaletteItems,
   insertComposerPaletteValue,
-  mentionsStillPresent
+  mentionsStillPresent,
+  replaceComposerCommandRun
 } from "./composer-palette.js";
 
 describe("shared composer palettes", () => {
   it("exposes and strictly parses the application help, task jump, and generic shell commands", () => {
     const options = { helpSupported: true, jumpSessionSupported: true, userShellSupported: true };
-    expect(composerCommandItems([], [], options).map((item) => item.value)).toEqual([
+    expect(composerCommandItems([], options).map((item) => item.value)).toEqual([
       "/help",
       "/jump-session",
       "/cmd"
@@ -31,7 +34,7 @@ describe("shared composer palettes", () => {
     expect(composerBuiltInCommand("/help", {})).toBeUndefined();
   });
 
-  it("projects workspace and resource mentions into the same structured wire shape", () => {
+  it("projects only workspace references before a task has a live runtime catalog", () => {
     const entries: readonly WorkspaceEntryView[] = [{
       path: "src",
       name: "src",
@@ -39,7 +42,7 @@ describe("shared composer palettes", () => {
       generated: false,
       children: [{ path: "src/main.ts", name: "main.ts", kind: "file", generated: false }]
     }];
-    const items = composerMentionItems(entries, "workspace-1", [resource({ id: "skill-1", name: "review", kind: "skill" })]);
+    const items = composerMentionItems(entries, "workspace-1");
 
     expect(items[0]?.mention).toEqual({
       id: "workspace:workspace-1:src/main.ts",
@@ -49,10 +52,23 @@ describe("shared composer palettes", () => {
       token: "@src/main.ts",
       workspaceId: "workspace-1"
     });
-    expect(items[1]?.mention).toMatchObject({ kind: "resource", reference: "skill-1", token: "@review" });
+    expect(items).toHaveLength(1);
   });
 
-  it("uses loaded runtime commands and supplements delayed-create with loaded skills/templates", () => {
+  it("adds exact historical task identities to a new task palette", () => {
+    const base = {
+      name: "Previous task", state: "idle" as const, backendId: "backend", targetId: "target",
+      pinned: false, archived: false, generation: 1n, fastMode: false, permissionMode: "ask" as const,
+      planMode: false, updatedAt: 1
+    };
+    const sessions: readonly SessionView[] = [{ ...base, id: "first" }, { ...base, id: "second" }];
+    expect(composerMentionItems([], undefined, [], sessions).map((item) => item.mention)).toEqual([
+      expect.objectContaining({ id: "session:first", kind: "session", reference: "first" }),
+      expect.objectContaining({ id: "session:second", kind: "session", reference: "second" })
+    ]);
+  });
+
+  it("uses only commands observed from the live runtime", () => {
     const commands: readonly RuntimeCommandView[] = [{
       id: "command-1",
       name: "review",
@@ -61,18 +77,40 @@ describe("shared composer palettes", () => {
       resourceId: "skill-1",
       loaded: true
     }];
-    const items = composerCommandItems(commands, [
-      resource({ id: "skill-1", name: "review", kind: "skill" }),
-      resource({ id: "prompt-1", name: "release notes", kind: "prompt" }),
-      resource({ id: "disabled", name: "hidden", kind: "skill", enabled: false })
-    ]);
+    const items = composerCommandItems(commands);
 
-    expect(items.map((item) => item.value)).toEqual(["/review", "/release-notes"]);
+    expect(items.map((item) => item.value)).toEqual(["/review"]);
+  });
+
+  it("tracks a slash query at a token boundary and owns the complete run around the caret", () => {
+    expect(detectComposerCommandActivation("inspect /rev", 12, { isComposing: false, bashMode: false }))
+      .toEqual({ from: 8, to: 12, query: "rev" });
+    expect(detectComposerCommandActivation("/review later", 4, { isComposing: false, bashMode: false }))
+      .toEqual({ from: 0, to: 7, query: "rev" });
+    expect(detectComposerCommandActivation("line\n/re", 8, { isComposing: false, bashMode: false }))
+      .toEqual({ from: 5, to: 8, query: "re" });
+    expect(detectComposerCommandActivation("path/to", 7, { isComposing: false, bashMode: false })).toBeUndefined();
+    expect(detectComposerCommandActivation("//review", 8, { isComposing: false, bashMode: false })).toBeUndefined();
+    expect(detectComposerCommandActivation("/rev", 4, { isComposing: true, bashMode: false })).toBeUndefined();
+    expect(detectComposerCommandActivation("/rev", 4, { isComposing: false, bashMode: true })).toBeUndefined();
+  });
+
+  it("filters with the live query and replaces the whole slash run without duplicating whitespace", () => {
+    const items = composerCommandItems([], { helpSupported: true, reviewSupported: true });
+    expect(filterComposerPaletteItems(items, "rev").map((item) => item.value)).toEqual(["/review"]);
+    expect(replaceComposerCommandRun("ask /review later", { from: 4, to: 11, query: "rev" }, "/help"))
+      .toEqual({ text: "ask /help later", caret: 9, replacement: "/help" });
+    expect(replaceComposerCommandRun("ask /review", { from: 4, to: 11, query: "rev" }, "/help"))
+      .toEqual({ text: "ask /help ", caret: 10, replacement: "/help " });
+    expect(replaceComposerCommandRun("ask /review later", { from: 4, to: 8, query: "rev" }, "/help"))
+      .toBeUndefined();
+    expect(replaceComposerCommandRun("ask /review later", { from: 4, to: 11, query: "other" }, "/help"))
+      .toBeUndefined();
   });
 
   it("adds and intercepts /clear only when session.reset is supported", () => {
-    expect(composerCommandItems([], [], { sessionResetSupported: false })).toEqual([]);
-    expect(composerCommandItems([], [], { sessionResetSupported: true })).toEqual([
+    expect(composerCommandItems([], { sessionResetSupported: false })).toEqual([]);
+    expect(composerCommandItems([], { sessionResetSupported: true })).toEqual([
       expect.objectContaining({ id: "builtin:clear", value: "/clear" })
     ]);
     expect(composerBuiltInCommand(" /clear ", { sessionResetSupported: true })).toEqual({ kind: "sessionReset" });
@@ -81,7 +119,7 @@ describe("shared composer palettes", () => {
   });
 
   it("adds and strictly intercepts the capability-driven isolated /review command", () => {
-    expect(composerCommandItems([], [], { reviewSupported: true })).toEqual([
+    expect(composerCommandItems([], { reviewSupported: true })).toEqual([
       expect.objectContaining({ id: "builtin:review", value: "/review" })
     ]);
     expect(composerBuiltInCommand("/review", { reviewSupported: true })).toEqual({ kind: "review", focus: "" });
@@ -100,8 +138,8 @@ describe("shared composer palettes", () => {
     expect(insertComposerPaletteValue("@", "@", item)).toBe("@src/a.ts ");
     expect(insertComposerPaletteValue("Inspect", undefined, item)).toBe("Inspect @src/a.ts ");
     expect(mentionsStillPresent("keep @one", [
-      { id: "one", kind: "resource", reference: "one", label: "One", token: "@one" },
-      { id: "two", kind: "resource", reference: "two", label: "Two", token: "@two" }
+      { id: "one", kind: "resource", reference: "one", label: "One", token: "@one", discoveredRevision: "revision-one", resourceVersion: "1", runtimeGeneration: 2 },
+      { id: "two", kind: "resource", reference: "two", label: "Two", token: "@two", discoveredRevision: "revision-two", resourceVersion: "2", runtimeGeneration: 2 }
     ]).map((mention) => mention.id)).toEqual(["one"]);
   });
 
@@ -117,25 +155,3 @@ describe("shared composer palettes", () => {
     }])).toHaveLength(1);
   });
 });
-
-function resource(overrides: Partial<ResourceView> & Pick<ResourceView, "id" | "name" | "kind">): ResourceView {
-  return {
-    id: overrides.id,
-    backendId: overrides.backendId ?? "backend-1",
-    name: overrides.name,
-    kind: overrides.kind,
-    scope: overrides.scope ?? "managed",
-    state: overrides.state ?? "loaded",
-    enabled: overrides.enabled ?? true,
-    source: overrides.source ?? "test",
-    discoveredRevision: overrides.discoveredRevision ?? "1",
-    compatibilityDetails: overrides.compatibilityDetails ?? [],
-    runtimeRequirements: overrides.runtimeRequirements ?? [],
-    warnings: overrides.warnings ?? [],
-    disabledLifecycleScripts: overrides.disabledLifecycleScripts ?? [],
-    canToggle: overrides.canToggle ?? true,
-    requiresExtensionApproval: overrides.requiresExtensionApproval ?? false,
-    postMutationNotice: overrides.postMutationNotice ?? false,
-    ...(overrides.targetId === undefined ? {} : { targetId: overrides.targetId })
-  };
-}

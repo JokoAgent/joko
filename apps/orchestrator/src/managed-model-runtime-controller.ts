@@ -94,6 +94,9 @@ export class ManagedModelRuntimeController {
   private lastError: RuntimePublicErrorCode | undefined;
   private revision = 0n;
   private lastProjection = "";
+  private snapshotOrdinal = 0;
+  private committedSnapshotOrdinal = 0;
+  private committedSnapshot: ManagedModelRuntimeSnapshot | undefined;
   private closed = false;
 
   constructor(private readonly options: ManagedModelRuntimeControllerOptions) {
@@ -106,6 +109,7 @@ export class ManagedModelRuntimeController {
 
   async snapshot(): Promise<ManagedModelRuntimeSnapshot> {
     this.assertOpen();
+    const ordinal = ++this.snapshotOrdinal;
     const freeDiskBytes = await this.readFreeDiskBytes();
     let status = await this.manager.status(this.owner);
     const [installedModels, paused] = await Promise.all([
@@ -148,11 +152,14 @@ export class ManagedModelRuntimeController {
       transfers: [...(installProgress === undefined ? [] : [installProgress]), ...pulls],
       lastError: this.lastError
     });
+    if (ordinal < this.committedSnapshotOrdinal && this.committedSnapshot !== undefined) {
+      return this.committedSnapshot;
+    }
     if (projection !== this.lastProjection) {
       this.lastProjection = projection;
       this.revision += 1n;
     }
-    return {
+    const snapshot: ManagedModelRuntimeSnapshot = {
       runtimeId: this.runtimeId,
       displayName: this.displayName,
       state: status.state,
@@ -169,6 +176,9 @@ export class ManagedModelRuntimeController {
       revision: this.revision,
       updatedAt: this.now()
     };
+    this.committedSnapshotOrdinal = ordinal;
+    this.committedSnapshot = snapshot;
+    return snapshot;
   }
 
   preflight(catalogId: string): Promise<RuntimePreflight> {

@@ -87,6 +87,7 @@ async function renderSchedules(schedules: readonly ScheduleView[]): Promise<HTML
     t={t}
     runAction={(_key, action) => { void action(); }}
     onOpenNavigation={vi.fn()}
+    prepareSessionRemoval={async (sessions) => ({ clean: sessions.length, dirty: 0, unknown: 0 })}
   />));
   return container;
 }

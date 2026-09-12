@@ -8,6 +8,7 @@ import * as contract from "@joko/contracts";
 import {
   BrowserTakeoverConflictError,
   sameTakeoverFence,
+  type BrowserHtmlPageCleanup,
   type BrowserTakeover,
   type BrowserTakeoverFence
 } from "@joko/tool-browser";
@@ -17,6 +18,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { OrchestratorApplication } from "./application.js";
 import { createConnectServices } from "./connect-services.js";
 import { ConnectionManager } from "./connection-manager.js";
+import { OperationalBrowserState } from "./operational-browser-state.js";
 
 const cleanups: Array<() => void> = [];
 
@@ -47,6 +49,7 @@ function fixture() {
     pairedAt: 1
   });
   const manager = new ConnectionManager(store);
+  const browserState = new OperationalBrowserState(store);
   const revoke = vi.fn((connectionId: string) => manager.revoke(connectionId));
   const logout = vi.fn((connectionId: string, authenticatedConnectionId: string) =>
     manager.logout(connectionId, authenticatedConnectionId));
@@ -64,11 +67,16 @@ function fixture() {
     }
     current = undefined;
   });
+  const closeHtmlPagesOwnedBy = vi.fn(async (_owner: string): Promise<BrowserHtmlPageCleanup> => ({
+    retiredPages: [],
+    complete: true
+  }));
   const browser = {
     id: "browser",
     generation: 7,
     currentHumanTakeover: () => current,
-    endHumanTakeover
+    endHumanTakeover,
+    closeHtmlPagesOwnedBy
   };
   const sessionHost = {
     mutate: async (input: MutationInput) => store.runAuthorizedOperation(
@@ -91,6 +99,7 @@ function fixture() {
     scheduler: {},
     adapters: [],
     browser,
+    browserState,
     browserActivity: [],
     close: async () => undefined
   } as unknown as OrchestratorApplication;
@@ -98,6 +107,8 @@ function fixture() {
     actor,
     browser,
     connections,
+    browserState,
+    closeHtmlPagesOwnedBy,
     endHumanTakeover,
     services: createConnectServices(application),
     setCurrent: (takeover: BrowserTakeover | undefined) => { current = takeover; },
@@ -166,6 +177,45 @@ async function submit(
 }
 
 describe("Connect Browser takeover revocation cleanup", () => {
+  it("retires every committed HTML page owned by a revoked Connection, including a non-current page", async () => {
+    const value = fixture();
+    const revoked = addConnection(value.store, "connection-html-owner", "device-html-owner");
+    const pages = [
+      { pageId: "page-html-non-current", generation: 7 },
+      { pageId: "page-html-current", generation: 7 }
+    ] as const;
+    for (const [index, page] of pages.entries()) {
+      value.browserState.recordHumanPage({
+        browserProviderId: "browser",
+        ...page,
+        sessionId: "session-html",
+        targetId: "target-html",
+        bindingGeneration: 1,
+        url: `https://workspace-${index}.preview.joko.invalid/private-${index}.html`,
+        title: "HTML preview",
+        updatedAt: index + 1
+      }, { active: index === 1 });
+    }
+    const active = { ...takeover(revoked.id), pageId: pages[1].pageId };
+    value.setCurrent(active);
+    value.closeHtmlPagesOwnedBy.mockResolvedValueOnce({ retiredPages: pages, complete: true });
+
+    await submit(value.services, "operation-logout-html-owner", logoutMutation(revoked.id));
+    await vi.waitFor(() => expect(value.closeHtmlPagesOwnedBy).toHaveBeenCalledExactlyOnceWith(revoked.id));
+
+    expect(value.browserState.findRecoverablePage("browser", pages[0].pageId)).toBeUndefined();
+    expect(value.browserState.findRecoverablePage("browser", pages[1].pageId)).toBeUndefined();
+    expect(value.browserState.activePageId("browser")).toBeUndefined();
+    expect(value.endHumanTakeover).toHaveBeenCalledExactlyOnceWith({
+      providerId: active.providerId,
+      pageId: active.pageId,
+      generation: active.generation,
+      owner: active.owner,
+      takeoverId: active.takeoverId
+    });
+    expect(value.current()).toBeUndefined();
+  });
+
   it("ends the exact logoutConnection owner's takeover once and does not repeat cleanup on mutation replay", async () => {
     const value = fixture();
     const revoked = addConnection(value.store, "connection-browser-owner", "device-browser-owner");

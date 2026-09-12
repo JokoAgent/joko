@@ -288,8 +288,7 @@ function questionInteraction(id: string, encoded: string, redactValues: readonly
         ...base,
         kind: "text",
         ...(boundedText(candidate.placeholder, 512) === "" ? {} : { placeholder: redact(boundedText(candidate.placeholder, 512), redactValues) }),
-        multiline: candidate.multiline !== false,
-        sensitive: false
+        multiline: candidate.multiline !== false
       });
       continue;
     }
@@ -297,7 +296,9 @@ function questionInteraction(id: string, encoded: string, redactValues: readonly
       fields.push({ ...base, kind: "boolean", defaultValue: candidate.defaultValue === true });
       continue;
     }
-    if ((kind === "single" || kind === "multiple") && Array.isArray(candidate.choices) && candidate.choices.length > 0 && candidate.choices.length <= 16) {
+    if ((kind === "single" || kind === "multiple")
+      && typeof candidate.allowOther === "boolean"
+      && Array.isArray(candidate.choices) && candidate.choices.length > 0 && candidate.choices.length <= 16) {
       const choices = candidate.choices.map((choice) => {
         if (!isRecord(choice)) return undefined;
         const choiceId = boundedText(choice.id, 128);
@@ -314,7 +315,7 @@ function questionInteraction(id: string, encoded: string, redactValues: readonly
       const typedChoices = choices as Array<{ readonly id: string; readonly label: string; readonly description?: string }>;
       if (new Set(typedChoices.map((choice) => choice.id)).size !== typedChoices.length) return undefined;
       if (kind === "single") {
-        fields.push({ ...base, kind: "single", choices: typedChoices });
+        fields.push({ ...base, kind: "single", choices: typedChoices, allowOther: candidate.allowOther });
       } else {
         fields.push({
           ...base,
@@ -322,9 +323,8 @@ function questionInteraction(id: string, encoded: string, redactValues: readonly
           choices: typedChoices,
           defaultChoiceIds: [],
           minimumSelections: base.required ? 1 : 0,
-          // One additional slot is reserved for the free-form "Other"
-          // answer, which is carried as the sole non-choice string.
-          maximumSelections: typedChoices.length + 1
+          maximumSelections: typedChoices.length + (candidate.allowOther ? 1 : 0),
+          allowOther: candidate.allowOther
         });
       }
       continue;
@@ -342,9 +342,9 @@ function questionInteraction(id: string, encoded: string, redactValues: readonly
 
 function validatedQuestionAnswers(
   interaction: Extract<InteractionPayload, { readonly kind: "question" }>,
-  answers: Readonly<Record<string, string | boolean | readonly string[]>>
-): Record<string, string | boolean | readonly string[]> | undefined {
-  const result: Record<string, string | boolean | readonly string[]> = {};
+  answers: Extract<InteractionDecision, { readonly kind: "question" }>["answers"]
+): Record<string, Extract<InteractionDecision, { readonly kind: "question" }>["answers"][string]> | undefined {
+  const result: Record<string, Extract<InteractionDecision, { readonly kind: "question" }>["answers"][string]> = {};
   for (const field of interaction.fields) {
     const answer = answers[field.id];
     if (answer === undefined) {
@@ -352,25 +352,37 @@ function validatedQuestionAnswers(
       continue;
     }
     if (field.kind === "text") {
-      if (typeof answer !== "string" || (field.required && answer.trim() === "")) return undefined;
-      result[field.id] = answer;
+      if (answer.kind !== "text" || (field.required && answer.value.trim() === "")) return undefined;
+      result[field.id] = { kind: "text", value: answer.value };
       continue;
     }
     if (field.kind === "boolean") {
-      if (typeof answer !== "boolean") return undefined;
-      result[field.id] = answer;
+      if (answer.kind !== "boolean") return undefined;
+      result[field.id] = { kind: "boolean", value: answer.value };
       continue;
     }
     const allowed = new Set(field.choices.map((choice) => choice.id));
     if (field.kind === "single") {
-      if (typeof answer !== "string" || answer.trim() === "") return undefined;
-      result[field.id] = answer;
+      if (answer.kind !== "single") return undefined;
+      if (answer.selection.kind === "choice") {
+        if (!allowed.has(answer.selection.choiceId)) return undefined;
+        result[field.id] = { kind: "single", selection: { kind: "choice", choiceId: answer.selection.choiceId } };
+      } else {
+        if (!field.allowOther || answer.selection.text.trim() === "") return undefined;
+        result[field.id] = { kind: "single", selection: { kind: "other", text: answer.selection.text } };
+      }
       continue;
     }
-    if (!Array.isArray(answer) || answer.some((choice) => typeof choice !== "string" || choice.trim() === "") || new Set(answer).size !== answer.length) return undefined;
-    if (answer.filter((choice) => !allowed.has(choice)).length > 1) return undefined;
-    if (answer.length < field.minimumSelections || (field.maximumSelections !== undefined && answer.length > field.maximumSelections)) return undefined;
-    result[field.id] = [...answer];
+    if (answer.kind !== "multiple" || new Set(answer.choiceIds).size !== answer.choiceIds.length
+      || answer.choiceIds.some((choice) => !allowed.has(choice))
+      || (answer.otherText !== undefined && (!field.allowOther || answer.otherText.trim() === ""))) return undefined;
+    const values = [...answer.choiceIds, ...(answer.otherText === undefined ? [] : [answer.otherText])];
+    if (values.length < field.minimumSelections || (field.maximumSelections !== undefined && values.length > field.maximumSelections)) return undefined;
+    result[field.id] = {
+      kind: "multiple",
+      choiceIds: [...answer.choiceIds],
+      ...(answer.otherText === undefined ? {} : { otherText: answer.otherText })
+    };
   }
   return result;
 }
