@@ -257,7 +257,7 @@ describe("Personalization visual harness", () => {
     expect(container.querySelector("[role=dialog]")).toBeNull();
   });
 
-  it("opens Pi as a General nested page without adding browser history", async () => {
+  it("opens runtime and resources as a General nested page without adding browser history", async () => {
     window.history.replaceState(null, "", "/__visual-harness__?scenario=personalization&theme=light#/settings/general");
     const initialHistoryLength = window.history.length;
     const container = document.createElement("div");
@@ -268,7 +268,7 @@ describe("Personalization visual harness", () => {
     expect(container.querySelector("#settings-subsection-appearance")).not.toBeNull();
     expect(container.querySelector("#settings-subsection-policy")).not.toBeNull();
     const piEntry = required(container.querySelector<HTMLButtonElement>(".settings-row-link"));
-    expect(piEntry.textContent).toContain("Pi resources");
+    expect(piEntry.textContent).toContain("Runtime & resources");
 
     await act(async () => piEntry.click());
     await flushFrame();

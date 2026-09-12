@@ -5401,6 +5401,7 @@ export class PiBackendAdapter implements BackendAdapter {
             key,
             supported: true,
             ...(key === "input.mention" ? { options: ["workspace_file", "resource"] } : {}),
+            ...(key === "runtime.resources" ? { options: ["extension", "skill", "prompt", "package"] } : {}),
             ...(key === "permission.modes" ? { options: ["ask", "auto", "bypassPermissions"] } : {})
           }];
         }
@@ -6080,7 +6081,9 @@ function piTreeEntryPreview(
   if (entry.type === "message") {
     const message = isRecord(entry.message) ? entry.message : undefined;
     const role = typeof message?.role === "string" ? message.role : "custom";
-    const content = piTreeContentText(message?.content);
+    const content = role === "user" && containsManagedResourceExpansion(message?.content)
+      ? ""
+      : piTreeContentText(message?.content);
     if (role === "user" || role === "assistant") {
       preview = content;
       if (preview === "" && role === "assistant") {
@@ -6139,6 +6142,10 @@ function piTreeContentText(content: unknown): string {
       isRecord(part) && part.type === "text" && typeof part.text === "string")
     .map((part) => part.text)
     .join("");
+}
+
+function containsManagedResourceExpansion(content: unknown): boolean {
+  return /(?:^|\n)\[Joko loaded resource\]\n/u.test(piTreeContentText(content));
 }
 
 function containsEntry(nodes: readonly SessionTreeNode[], entryId: string): boolean {
@@ -6745,10 +6752,7 @@ async function resolvedRuntimeResourceBlock(
   const header = [
     "[Joko loaded resource]",
     `Name: ${JSON.stringify(resource.name)}`,
-    `Kind: ${resource.kind}`,
-    `Resource ID: ${JSON.stringify(resource.id)}`,
-    `Content revision: ${JSON.stringify(resource.revision)}`,
-    `Entity revision: ${resource.resourceVersion?.toString(10) ?? ""}`
+    `Kind: ${resource.kind}`
   ];
   let semantic: string[];
   if (resource.kind === "prompt" || resource.kind === "skill") {

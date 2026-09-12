@@ -26,6 +26,7 @@ import { useLiveBrowserTakeover, withLiveBrowserTakeover } from "../browser-take
 import { browserPageKey } from "../browser-page-key.js";
 import type { AppSnapshot, BrowserActivityView, BrowserCommentDraftItem, BrowserCommentInspectionInputView, BrowserCommentPlacementView, BrowserCommentStyleChangeView, BrowserCommentTargetView, BrowserPageView, BrowserSettingsView, BrowserTakeoverActionView, BrowserTakeoverKeyModifierView, BrowserTakeoverKeyView, BrowserTransferView, BrowserView, McpServerView, ResourceView, SessionView, TimelineItemView } from "../model.js";
 import { nextBrowserCommentMarker, sanitizeBrowserCommentPageUrl } from "../browser-comment-draft.js";
+import { resourceKindsForBackend } from "../resource-capabilities.js";
 import { randomUuid } from "../web-crypto.js";
 import { useAppShortcut } from "../use-app-shortcut.js";
 import { BrowserChrome, type BrowserChromeHandle } from "./BrowserChrome.js";
@@ -77,7 +78,7 @@ export function ToolsPage({ controller, snapshot, locale, t, runAction, onOpenNa
       </div>
       <div id="tools-tabpanel" className="route-page__content" role="tabpanel" aria-labelledby={`tools-tab-${tab}`}>
         {tab === "browser" && <BrowserTools controller={controller} browsers={snapshot.browsers} browserSettings={snapshot.settings.browsers} sessions={browserSessions} commentSessions={browserCommentSessions} locale={locale} t={t} runAction={runAction} />}
-        {tab === "resources" && <ResourcesTools controller={controller} resources={snapshot.resources} t={t} runAction={runAction} onRemove={setRemoveResource} />}
+        {tab === "resources" && <ResourcesTools controller={controller} backends={snapshot.backends} resources={snapshot.resources} t={t} runAction={runAction} onRemove={setRemoveResource} />}
         {tab === "mcp" && <McpTools controller={controller} backends={mcpBackends} servers={snapshot.settings.mcpServers} t={t} runAction={runAction} />}
         {tab === "activity" && <ActivityTools activity={activity} locale={locale} t={t} />}
       </div>
@@ -790,15 +791,25 @@ function BrowserLedger({ controller, browser, page, locale, t, runAction }: { re
   </section>;
 }
 
-function ResourcesTools({ controller, resources, t, runAction, onRemove }: { readonly controller: AppController; readonly resources: readonly ResourceView[]; readonly t: Translator; readonly runAction: RunAction; readonly onRemove: (resource: ResourceView) => void }): JSX.Element {
+function ResourcesTools({ controller, backends, resources, t, runAction, onRemove }: { readonly controller: AppController; readonly backends: AppSnapshot["backends"]; readonly resources: readonly ResourceView[]; readonly t: Translator; readonly runAction: RunAction; readonly onRemove: (resource: ResourceView) => void }): JSX.Element {
   if (resources.length === 0) return <EmptyState icon={<Braces />} title={t("tools.noResources")} body={t("tools.noResourcesBody")} />;
-  return <div className="resource-grid">{resources.map((resource) => <article className={cx("resource-card", resource.state === "error" && "resource-card--error")} key={resource.id}><header><span className="resource-card__icon">{resource.kind === "package" ? <PackageCheck /> : <Braces />}</span><div><h2>{resource.name}</h2><p>{resource.kind} · {resource.scope}</p></div><Pill tone={resource.state === "loaded" ? "success" : resource.state === "error" ? "danger" : resource.state === "awaitingApproval" || resource.requiresExtensionApproval ? "warning" : "neutral"}>{resource.state}</Pill></header><dl><div><dt>{t("common.source")}</dt><dd>{resource.source}</dd></div><div><dt>{t("common.runtime")}</dt><dd>{resource.state === "loaded" ? t("tools.reportedRuntime") : t("tools.notLoaded")}</dd></div></dl>{resource.error !== undefined && <p className="resource-card__error"><AlertTriangle aria-hidden="true" />{resource.error}</p>}<footer>{(["discovered", "awaitingApproval"].includes(resource.state) || resource.requiresExtensionApproval) && <Button tone="primary" onClick={() => runAction(`approve-resource:${resource.id}`, () => controller.approveResource(resource.id))}><ShieldCheck aria-hidden="true" />{t("resource.approve")}</Button>}{resource.state === "approved" && resource.scope !== "project" && <Button onClick={() => runAction(`install-resource:${resource.id}`, async () => { await controller.installResource(resource.id); })}>{t("common.install")}</Button>}{resource.state === "updateAvailable" && <Button onClick={() => runAction(`update-resource:${resource.id}`, async () => { await controller.updateResource(resource.id); })}>{t("common.update")}</Button>}{resourceCanToggle(resource) && <Button onClick={() => runAction(`toggle-resource:${resource.id}`, () => controller.setResourceEnabled(resource.id, !resource.enabled))}>{resource.enabled ? t("common.disable") : t("common.enable")}</Button>}<Button tone="ghost" className="danger-text" onClick={() => onRemove(resource)}><Trash2 aria-hidden="true" />{t("common.remove")}</Button></footer></article>)}</div>;
+  return <div className="resource-grid">{resources.map((resource) => {
+    const capabilityAllowsResource = resourceKindsForBackend(
+      backends.find((backend) => backend.id === resource.backendId)
+    ).includes(resource.kind);
+    const approvalNeeded = ["discovered", "awaitingApproval"].includes(resource.state) || resource.requiresExtensionApproval;
+    return <article className={cx("resource-card", resource.state === "error" && "resource-card--error")} key={resource.id}><header><span className="resource-card__icon">{resource.kind === "package" ? <PackageCheck /> : <Braces />}</span><div><h2>{resource.name}</h2><p>{resource.kind} · {resource.scope}</p></div><Pill tone={resource.state === "loaded" ? "success" : resource.state === "error" ? "danger" : resource.state === "awaitingApproval" || resource.state === "updateAvailable" || resource.requiresExtensionApproval ? "warning" : "neutral"}>{resource.state}</Pill></header><dl><div><dt>{t("common.source")}</dt><dd>{resource.source}</dd></div><div><dt>{t("common.runtime")}</dt><dd>{resource.state === "loaded" ? t("tools.reportedRuntime") : t("tools.notLoaded")}</dd></div></dl>{resource.error !== undefined && <p className="resource-card__error"><AlertTriangle aria-hidden="true" />{resource.error}</p>}<footer>{approvalNeeded && capabilityAllowsResource && <Button tone="primary" onClick={() => runAction(`approve-resource:${resource.id}`, () => controller.approveResource(resource.id, resource.discoveredRevision))}><ShieldCheck aria-hidden="true" />{t("resource.approve")}</Button>}{resource.state === "approved" && resource.scope !== "project" && capabilityAllowsResource && <Button onClick={() => runAction(`install-resource:${resource.id}`, async () => { await controller.installResource(resource.id); })}>{t("common.install")}</Button>}{resourceCanUpdate(resource) && capabilityAllowsResource && <Button onClick={() => runAction(`update-resource:${resource.id}`, async () => { await controller.updateResource(resource.id); })}>{t("common.update")}</Button>}{resourceCanToggle(resource) && (resource.enabled || capabilityAllowsResource) && <Button onClick={() => runAction(`toggle-resource:${resource.id}`, () => controller.setResourceEnabled(resource.id, !resource.enabled))}>{resource.enabled ? t("common.disable") : t("common.enable")}</Button>}<Button tone="ghost" className="danger-text" onClick={() => onRemove(resource)}><Trash2 aria-hidden="true" />{t("common.remove")}</Button></footer></article>;
+  })}</div>;
 }
 
 function resourceCanToggle(resource: ResourceView): boolean {
   if (!resource.canToggle || resource.requiresExtensionApproval) return false;
   if (resource.scope === "project") return ["approved", "disabled", "loaded"].includes(resource.state);
-  return ["installed", "disabled", "loaded"].includes(resource.state);
+  return ["installed", "disabled", "loaded", "updateAvailable"].includes(resource.state);
+}
+
+function resourceCanUpdate(resource: ResourceView): boolean {
+  return ["installed", "loaded", "disabled", "updateAvailable"].includes(resource.state);
 }
 
 function McpTools({ controller, backends, servers, t, runAction }: { readonly controller: AppController; readonly backends: AppSnapshot["backends"]; readonly servers: readonly McpServerView[]; readonly t: Translator; readonly runAction: RunAction }): JSX.Element {

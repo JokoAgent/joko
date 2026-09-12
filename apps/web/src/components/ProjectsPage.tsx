@@ -5,6 +5,7 @@ import type { AppController } from "../controller.js";
 import type { AppSnapshot, ExtraDirectoryView, SessionView, TargetDraft, TargetView, WorkspaceView } from "../model.js";
 import type { WorktreeRemovalPreflightSummary } from "../worktree-removal-preflight.js";
 import { sidebarOwnerLayoutFor } from "../sidebar-layout.js";
+import { backendSupportsResourceDiscovery } from "../resource-capabilities.js";
 import type { RunAction, Translator } from "./types.js";
 import { Button, IconButton, Modal, Pill, StatusDot, cx, CheckboxControl, SelectControl } from "./ui.js";
 import { WorktreeRemovalWarnings } from "./SessionDialogs.js";
@@ -144,7 +145,7 @@ export function ProjectsPage({ controller, snapshot, focusProjectId, t, runActio
       const directories = snapshot.extraDirectories.filter((directory) => directory.workspaceId === workspace?.id);
       const taskCount = snapshot.sessions.filter((session) => session.projectId === target.id).length;
       const resourceCount = snapshot.resources.filter((resource) => resource.targetId === target.id).length;
-      const resourceDiscoverySupported = backend?.capabilities.get("runtime.resources")?.supported === true;
+      const resourceDiscoverySupported = backendSupportsResourceDiscovery(backend);
       return <article ref={(node) => { if (node === null) projectRefs.current.delete(target.id); else projectRefs.current.set(target.id, node); }} tabIndex={-1} className={cx("project-card", target.archived && "is-archived", focusProjectId === target.id && "is-focused")} key={target.id}>
         <header><span className="project-card__icon"><FolderKanban aria-hidden="true" /></span><div><h2>{target.name}</h2><p>{workspace?.serverPath || workspace?.name || target.workspaceName}</p></div><StatusDot state={target.error === undefined ? backend?.health ?? "unavailable" : "error"} label={target.error ?? backend?.health ?? "unavailable"} /></header>
         <dl><div><dt>{t("controls.backend")}</dt><dd>{backend?.name ?? target.backendId}</dd></div><div><dt>{t("projects.workspaceType")}</dt><dd>{workspace?.kind === "managedDialogue" ? t("projects.managed") : t("projects.userProject")}</dd></div><div><dt>{t("projects.tasks")}</dt><dd>{taskCount}</dd></div></dl>

@@ -249,6 +249,11 @@ describe("Orchestrator application composition", () => {
     });
     const claudeCapabilities = application.store.getBackend("claude-code").descriptor.capabilities;
     expect(claudeCapabilities.get("workspace.extra_dirs")?.supported).toBe(true);
+    expect(claudeCapabilities.get("runtime.resources")).toMatchObject({
+      supported: true,
+      options: ["skill", "prompt"]
+    });
+    expect(claudeCapabilities.get("input.mention")?.options).toContain("resource");
     expect(claudeCapabilities.get("session.ai_rename")?.supported).toBe(true);
     expect(claudeCapabilities.get("tool.browser")?.supported).toBe(false);
     expect(claudeCapabilities.get("tool.computer")?.supported).toBe(false);

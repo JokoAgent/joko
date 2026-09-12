@@ -13,21 +13,25 @@ import {
 
 import type { AppController } from "../controller.js";
 import type {
+  BackendView,
   ResourceCompatibilityIssueView,
   ResourceCompatibilityView,
   ResourcePackageWarningView,
   ResourceView
 } from "../model.js";
+import { resourceKindsForBackend } from "../resource-capabilities.js";
 import type { RunAction, Translator } from "./types.js";
 import { Button, IconButton, Modal, ModalBackButton, Pill, cx } from "./ui.js";
 
 export function PiPackagesSection({
   controller,
+  backends,
   resources,
   runAction,
   t
 }: {
   readonly controller: AppController;
+  readonly backends: readonly BackendView[];
   readonly resources: readonly ResourceView[];
   readonly runAction: RunAction;
   readonly t: Translator;
@@ -57,6 +61,9 @@ export function PiPackagesSection({
         const expanded = expandedIds.has(resource.id);
         const compatibility = packageCompatibility(resource);
         const approvalNeeded = resource.requiresExtensionApproval || ["discovered", "awaitingApproval"].includes(resource.state);
+        const capabilityAllowsResource = resourceKindsForBackend(
+          backends.find((backend) => backend.id === resource.backendId)
+        ).includes(resource.kind);
         return <article className={cx("package-row", resource.state === "error" && "package-row--error")} key={resource.id}>
           <div className="package-row__summary">
             <IconButton
@@ -80,10 +87,10 @@ export function PiPackagesSection({
               <Pill tone={resourceStateTone(resource)}>{resourceStateLabel(resource, t)}</Pill>
             </span>
             <span className="package-row__actions">
-              {approvalNeeded && <Button tone="primary" onClick={() => runAction(`approve-resource:${resource.id}`, () => controller.approveResource(resource.id))}>{t("resource.approve")}</Button>}
-              {resource.state === "approved" && resource.scope !== "project" && <Button onClick={() => runPackageMutation(`install-resource:${resource.id}`, () => controller.installResource(resource.id))}>{t("common.install")}</Button>}
-              {resourceCanUpdate(resource) && <Button onClick={() => runPackageMutation(`update-resource:${resource.id}`, () => controller.updateResource(resource.id))}>{t("common.update")}</Button>}
-              {resourceCanToggle(resource) && <Button onClick={() => runAction(`toggle-resource:${resource.id}`, () => controller.setResourceEnabled(resource.id, !resource.enabled))}>{resource.enabled ? t("common.disable") : t("common.enable")}</Button>}
+              {approvalNeeded && capabilityAllowsResource && <Button tone="primary" onClick={() => runAction(`approve-resource:${resource.id}`, () => controller.approveResource(resource.id, resource.discoveredRevision))}>{t("resource.approve")}</Button>}
+              {resource.state === "approved" && resource.scope !== "project" && capabilityAllowsResource && <Button onClick={() => runPackageMutation(`install-resource:${resource.id}`, () => controller.installResource(resource.id))}>{t("common.install")}</Button>}
+              {resourceCanUpdate(resource) && capabilityAllowsResource && <Button onClick={() => runPackageMutation(`update-resource:${resource.id}`, () => controller.updateResource(resource.id))}>{t("common.update")}</Button>}
+              {resourceCanToggle(resource) && (resource.enabled || capabilityAllowsResource) && <Button onClick={() => runAction(`toggle-resource:${resource.id}`, () => controller.setResourceEnabled(resource.id, !resource.enabled))}>{resource.enabled ? t("common.disable") : t("common.enable")}</Button>}
               {resource.state !== "removed" && <IconButton label={`${t("common.remove")} ${resource.name}`} onClick={() => runAction(`remove-resource:${resource.id}`, () => controller.removeResource(resource.id))}><Trash2 aria-hidden="true" /></IconButton>}
             </span>
           </div>
@@ -104,7 +111,9 @@ export function PiPackagesSection({
       {notice !== undefined && <>
         <div className="package-notice__body"><PackageDetails resource={notice} t={t} /></div>
         <div className="modal__actions">
-          {notice.requiresExtensionApproval && <Button tone="primary" onClick={() => runAction(`approve-resource:${notice.id}`, async () => {
+          {notice.requiresExtensionApproval && resourceKindsForBackend(
+            backends.find((backend) => backend.id === notice.backendId)
+          ).includes(notice.kind) && <Button tone="primary" onClick={() => runAction(`approve-resource:${notice.id}`, async () => {
             await controller.approveResource(notice.id, notice.discoveredRevision);
             setNotice(undefined);
           })}>{t("resource.approveCurrentContent")}</Button>}
@@ -160,7 +169,7 @@ export function packageCompatibility(resource: ResourceView): ResourceCompatibil
 export function resourceCanToggle(resource: ResourceView): boolean {
   if (!resource.canToggle || resource.requiresExtensionApproval) return false;
   if (resource.scope === "project") return ["approved", "disabled", "loaded"].includes(resource.state);
-  return ["installed", "disabled", "loaded"].includes(resource.state);
+  return ["installed", "disabled", "loaded", "updateAvailable"].includes(resource.state);
 }
 
 export function resourceCanUpdate(resource: ResourceView): boolean {

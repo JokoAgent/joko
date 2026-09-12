@@ -4,6 +4,34 @@ import { describe, expect, it } from "vitest";
 import { projectPiNativeHistory, type PiNativeSessionHistory } from "./native-history.js";
 
 describe("Pi native history projection", () => {
+  it("withholds a managed-resource expansion from projected user history", () => {
+    const privateBody = "private-resource-body-7f6c";
+    const projected = projectPiNativeHistory("native-resource-session", {
+      entries: [{
+        id: "resource-user",
+        type: "message",
+        data: {
+          message: {
+            role: "user",
+            content: [{
+              type: "text",
+              text: `[Joko loaded resource]\nName: \"Release\"\nKind: prompt\nContent:\n${privateBody}\n[End content]\n[/Joko loaded resource]`
+            }]
+          }
+        }
+      }],
+      leafId: "resource-user"
+    });
+
+    expect(projected.events).toHaveLength(1);
+    expect(projected.events[0]?.payload).toEqual({
+      type: "message_complete",
+      role: "user",
+      blocks: []
+    });
+    expect(JSON.stringify(projected)).not.toContain(privateBody);
+  });
+
   it("projects cleaned message and tool-result image content without raw Pi persistence objects", () => {
     const image: BlobRef = {
       id: "image-artifact",

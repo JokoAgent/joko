@@ -44,6 +44,7 @@ import {
   type PromptInput,
   type ProviderModel,
   type PublicError,
+  type RuntimeResource,
   type SubagentControlInput,
   type TargetDescriptor,
   type UsageSnapshot
@@ -52,6 +53,12 @@ import { AsyncInputGate, deferred, type Deferred } from "./async-input-gate.js";
 import { claudeCodeError } from "./errors.js";
 import { SessionSdkFailure } from "./session-sdk-owner.js";
 import { prepareClaudePrompt, type ClaudeInputResolvers, type PreparedClaudePrompt } from "./prompt-input.js";
+import {
+  loadedClaudeTextResources,
+  snapshotClaudeTextResources,
+  type ClaudeRuntimeTextResource,
+  type ClaudeTextResourceResolver
+} from "./resources.js";
 import {
   PartialMessageBuffer,
   ProjectionLimitError,
@@ -326,6 +333,8 @@ export interface ClaudeCodeAdapterOptions extends ClaudeInputResolvers {
   readonly hostCapabilities?: readonly HostComposedCapability[];
   /** Reads the committed default for new native runtimes on this Provider. */
   readonly resolveSubagentModel?: (providerId: string) => string | undefined;
+  /** Resolves approved text resources for one exact product Session runtime. */
+  readonly resolveTextResources?: ClaudeTextResourceResolver;
 }
 
 interface ActiveTurn {
@@ -411,6 +420,7 @@ interface NativeRuntime {
   readonly nativeTasks: ClaudeNativeTaskProjection;
   readonly runtimePolicy: "standard" | "review_read_only";
   readonly subagentModel: string | undefined;
+  readonly textResources: readonly ClaudeRuntimeTextResource[] | undefined;
   readonly capabilities: Set<string>;
   readonly pendingPermissions: Map<string, PendingPermission>;
   readonly resolvedPermissions: Map<string, PermissionCacheEntry>;
@@ -459,6 +469,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
   readonly #maximumCatalogSessions: number;
   readonly #hostCapabilities: ReadonlySet<HostComposedCapability>;
   readonly #inputResolvers: ClaudeInputResolvers;
+  readonly #resolveTextResources: ClaudeTextResourceResolver | undefined;
   readonly #resolveSubagentModel: ClaudeCodeAdapterOptions["resolveSubagentModel"];
   readonly #projection: SafeProjection;
   readonly #now: () => number;
@@ -534,6 +545,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     );
     this.#hostCapabilities = validatedHostCapabilities(options.hostCapabilities);
     this.#resolveSubagentModel = options.resolveSubagentModel;
+    this.#resolveTextResources = options.resolveTextResources;
     this.#inputResolvers = {
       ...(options.readBlob === undefined ? {} : { readBlob: options.readBlob }),
       ...(options.resolveFile === undefined ? {} : { resolveFile: options.resolveFile }),
@@ -681,7 +693,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         this.#hostCapabilities,
         supportsLogin,
         supportsLogout,
-        this.#inputResolvers
+        this.#inputResolvers,
+        this.#resolveTextResources !== undefined
       ),
       ...(this.#managedProviders === undefined ? {} : { providerRuntimeSupport: managedProviderSupport(this.#managedProviders.support) }),
       providers: [{
@@ -1127,6 +1140,10 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     await this.detachSession(binding, context);
   }
 
+  nativeUserEntryIdForOperation(operationId: string): string {
+    return operationUuid(operationId);
+  }
+
   override async deleteSession(binding: NativeSessionBinding, context: AdapterContext): Promise<void> {
     assertStandardReviewContext(context, "delete native Session state");
     await this.validateTarget(context.target);
@@ -1176,6 +1193,13 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       && context.backendInstanceGeneration === this.#instanceGeneration;
   }
 
+  override getResources(context: AdapterContext): Promise<readonly RuntimeResource[]> {
+    if (this.#resolveTextResources === undefined) return this.unsupported("runtime.resources");
+    const runtime = this.#requireRuntime(context);
+    if (runtime.runtimePolicy === "review_read_only") return Promise.resolve([]);
+    return Promise.resolve(loadedClaudeTextResources(runtime.textResources ?? []));
+  }
+
   override async send(input: PromptInput, context: AdapterContext): Promise<void> {
     validatePrompt(input);
     if (input.disposition === "steer") return this.#steer(input, context);
@@ -1206,7 +1230,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     try {
       preparationSignal.throwIfAborted();
       prepared = await waitFor(
-        prepareClaudePrompt(input, context, this.#inputResolvers, preparationSignal),
+        prepareClaudePrompt(input, context, this.#inputResolvers, preparationSignal, runtime.textResources),
         this.#admissionTimeoutMs,
         preparationSignal,
         () => claudeCodeError("INPUT_PREPARATION_TIMEOUT", "Native input attachments could not be prepared in time.", "input", {
@@ -1364,7 +1388,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     try {
       signal.throwIfAborted();
       const prepared = await waitFor(
-        prepareClaudePrompt(input, context, this.#inputResolvers, signal), this.#admissionTimeoutMs, signal,
+        prepareClaudePrompt(input, context, this.#inputResolvers, signal, runtime.textResources), this.#admissionTimeoutMs, signal,
         () => claudeCodeError("INPUT_PREPARATION_TIMEOUT", "Same-turn input could not be prepared in time.", "input")
       );
       signal.throwIfAborted();
@@ -1511,7 +1535,6 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     const derivedTarget = "target" in derivation ? derivation.target : context.target;
     if ("target" in derivation) {
       assertClaudeDerivationTarget(context.target, derivedTarget);
-      await this.validateTarget(derivedTarget);
     }
     this.#assertStandardRuntime(runtime, "derive native history");
     if (context.signal.aborted) throw claudeCodeError(entryId === undefined ? "NATIVE_SESSION_CLONE_CANCELLED" : "NATIVE_SESSION_FORK_CANCELLED", "The native Session copy was cancelled.", phase);
@@ -1527,6 +1550,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     let registered: NativeSessionBinding | undefined;
     let nativeHistory: NativeHistoryProjection | undefined;
     try {
+      if ("target" in derivation) await this.validateTarget(derivedTarget);
       await this.validateTarget(runtime.target);
       signal.throwIfAborted();
       this.#assertCurrent(runtime, context, context.binding);
@@ -1957,13 +1981,49 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     }
     const gate = new AsyncInputGate<ClaudeSdkUserMessage>();
     const abortController = new AbortController();
+    let textResources: readonly ClaudeRuntimeTextResource[] | undefined;
+    try {
+      if (this.#resolveTextResources !== undefined) {
+        if (launch.runtimePolicy === "review_read_only") {
+          textResources = Object.freeze([]);
+        } else {
+          const resourceSignal = AbortSignal.any([context.signal, abortController.signal]);
+          const seeds = await waitFor(
+            Promise.resolve().then(() => this.#resolveTextResources!(context, resourceSignal)),
+            this.#initializationTimeoutMs,
+            resourceSignal,
+            () => claudeCodeError(
+              "RESOURCE_CATALOG_TIMEOUT",
+              "Approved text resources could not be prepared in time.",
+              "session_start",
+              { retryable: true, recovery: "Restore the managed resource authority and retry this native Session." }
+            )
+          );
+          resourceSignal.throwIfAborted();
+          this.#assertUsable();
+          this.#assertBackendInstance(context);
+          this.#assertBindingContext(binding, context);
+          textResources = snapshotClaudeTextResources(seeds, context.generation, abortController.signal);
+        }
+      }
+    } catch (error) {
+      abortController.abort();
+      managedRoute?.dispose();
+      if (error instanceof JokoError) throw error;
+      throw claudeCodeError(
+        "RESOURCE_CATALOG_UNAVAILABLE",
+        "Approved text resources could not be prepared for this native Session.",
+        "session_start",
+        { retryable: true, recovery: "Restore the managed resource authority and retry this native Session." }
+      );
+    }
     let runtime: NativeRuntime | undefined;
     const startedQuery = await this.#createQuery(gate, abortController, nativeSessionId, context, launch, managedRoute, (...args) => {
       if (runtime === undefined) {
         return Promise.resolve({ behavior: "deny", message: "The native Session is not ready." });
       }
       return this.#canUseTool(runtime, ...args);
-    }).catch((error: unknown) => { managedRoute?.dispose(); throw error; });
+    }).catch((error: unknown) => { abortController.abort(); managedRoute?.dispose(); throw error; });
     const query = startedQuery.query;
     try {
       runtime = {
@@ -1986,6 +2046,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         }),
         runtimePolicy: launch.runtimePolicy,
         subagentModel: startedQuery.subagentModel,
+        textResources,
         capabilities: new Set(),
         pendingPermissions: new Map(),
         resolvedPermissions: new Map(),
@@ -3801,6 +3862,17 @@ function projectHistoryEntry(
   }
 
   const nativeMessage = record(entry.message)!;
+  if (containsManagedResourceExpansion(nativeMessage["content"])) {
+    // The SDK persists the exact expanded native input. Keep the entry identity
+    // so Host can bind it to the durable Queue operation, but never project the
+    // private managed-resource copy when that durable owner is unavailable
+    // (for example, a foreign attach or a derived native Session).
+    return [{
+      kind: "message_user",
+      contentIndex: 0,
+      payload: { type: "message_complete", role: "user", blocks: [] }
+    }];
+  }
   const user = projection.user(envelope);
   const blocks = projectedUserBlocks(nativeMessage["content"], projection);
   const projected: HistoryEntryProjection[] = user.toolResults.map((result, index) => ({
@@ -3856,7 +3928,8 @@ function capabilityManifest(
   hostCapabilities: ReadonlySet<HostComposedCapability>,
   supportsLogin: boolean,
   supportsLogout: boolean,
-  inputResolvers: ClaudeInputResolvers
+  inputResolvers: ClaudeInputResolvers,
+  textResourcesSupported: boolean
 ): ReadonlyMap<string, Capability> {
   const supported = new Set<string>([
     "session.resume",
@@ -3886,6 +3959,7 @@ function capabilityManifest(
   ]);
   if (inputResolvers.readBlob !== undefined) supported.add("input.image");
   if (inputResolvers.resolveFile !== undefined) supported.add("input.file");
+  if (textResourcesSupported) supported.add("runtime.resources");
   if (isolatedReviewSupported) supported.add("review.isolated");
   if (nativeTasksSupported) {
     for (const capability of [
@@ -3914,7 +3988,15 @@ function capabilityManifest(
       : key === "workspace.extra_dirs"
         ? ["read_write"]
         : key === "input.mention"
-          ? ["workspace_file", "workspace_directory", "workspace_line_range", ...(inputResolvers.resolveArtifactMention === undefined ? [] : ["artifact"])]
+          ? [
+              "workspace_file",
+              "workspace_directory",
+              "workspace_line_range",
+              ...(inputResolvers.resolveArtifactMention === undefined ? [] : ["artifact"]),
+              ...(textResourcesSupported ? ["resource"] : [])
+            ]
+          : key === "runtime.resources" && textResourcesSupported
+            ? ["skill", "prompt"]
         : undefined;
     return [key, {
       key,
@@ -4033,6 +4115,17 @@ function invalidForkBoundary(): JokoError {
   return claudeCodeError("NATIVE_SESSION_FORK_BOUNDARY_INVALID", "The fork boundary is not a persisted top-level message in this native Session.", "session_fork", {
     stateMayHaveChanged: false,
     recovery: "Refresh native history and select a persisted user or assistant message."
+  });
+}
+
+function containsManagedResourceExpansion(content: unknown): boolean {
+  const hasFrame = (value: unknown): boolean => typeof value === "string"
+    && /(?:^|\n)\[Joko approved (?:skill|prompt) resource\]\n/u.test(value);
+  if (hasFrame(content)) return true;
+  if (!Array.isArray(content)) return false;
+  return content.some((rawBlock) => {
+    const block = record(rawBlock);
+    return block?.["type"] === "text" && hasFrame(block["text"]);
   });
 }
 

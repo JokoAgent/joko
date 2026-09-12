@@ -2554,13 +2554,11 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return blobId;
   }
 
-  async approveResource(resourceId: string, discoveredRevision?: string): Promise<void> {
-    const resource = this.#rawSnapshot?.resources.find((candidate) => candidate.resourceId === resourceId);
-    const revision = discoveredRevision ?? resource?.discoveredRevision;
-    if (revision === undefined || revision.length === 0) throw new GatewayError("The resource must be discovered before it can be approved.");
+  async approveResource(resourceId: string, discoveredRevision: string): Promise<void> {
+    if (discoveredRevision.length === 0) throw new GatewayError("The resource must be discovered before it can be approved.");
     await this.submit({
       case: "approveResource",
-      value: { resourceId, discoveredRevision: revision }
+      value: { resourceId, discoveredRevision }
     }, true);
   }
 
@@ -2570,7 +2568,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
 
   async addResource(draft: ResourceDraft): Promise<void> {
     const normalized = normalizeResourceDraft(draft);
-    if (normalized === undefined) throw new GatewayError("The Pi resource source is invalid.");
+    if (normalized === undefined) throw new GatewayError("The managed resource source is invalid.");
     const acquisition = create(ResourceAcquisitionSourceSchema, {
       source: normalized.source.kind === "local"
         ? { case: "local", value: { serverPath: normalized.source.serverPath } }

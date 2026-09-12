@@ -6,7 +6,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import type { AppController } from "../controller.js";
 import { translate } from "../i18n.js";
-import type { ResourceView } from "../model.js";
+import type { BackendView, ResourceView } from "../model.js";
 import { PiPackagesSection, packageCompatibility, resourceCanToggle, resourceCanUpdate } from "./PiPackagesSection.js";
 
 const roots: Root[] = [];
@@ -80,6 +80,69 @@ describe("PiPackagesSection", () => {
       ]
     })).toBe("unsupported");
   });
+
+  it("binds list approval to the rendered discovery revision", async () => {
+    const approveResource = vi.fn(async () => undefined);
+    const controller = { approveResource } as unknown as AppController;
+    let pending: Promise<void> | undefined;
+    const approval = {
+      ...extension,
+      state: "awaitingApproval" as const,
+      discoveredRevision: "sha256:rendered-content"
+    };
+    const container = await renderPackages(controller, [approval], (_key, action) => {
+      pending = action();
+    });
+
+    await act(async () => buttonWithText(container, "Approve resource").click());
+    await act(async () => { await required(pending); });
+
+    expect(approveResource).toHaveBeenCalledWith(approval.id, approval.discoveredRevision);
+  });
+
+  it("removes expanding lifecycle actions after exact-kind capability loss while retaining disable and remove", async () => {
+    const approveResource = vi.fn(async () => undefined);
+    const installResource = vi.fn(async () => extension);
+    const updateResource = vi.fn(async () => extension);
+    const setResourceEnabled = vi.fn(async () => undefined);
+    const removeResource = vi.fn(async () => undefined);
+    const controller = {
+      approveResource,
+      installResource,
+      updateResource,
+      setResourceEnabled,
+      removeResource
+    } as unknown as AppController;
+    const resources: readonly ResourceView[] = [
+      { ...extension, id: "resource-approval", state: "awaitingApproval", requiresExtensionApproval: true },
+      { ...extension, id: "resource-install", state: "approved" },
+      extension,
+      { ...extension, id: "resource-enable", state: "disabled" },
+      { ...extension, id: "resource-disable", state: "updateAvailable", enabled: true }
+    ];
+    let pending: Promise<void> | undefined;
+    const container = await renderPackages(controller, resources, (_key, action) => {
+      pending = action();
+    }, [resourceBackend("runtime-capability", ["skill"])]);
+
+    expect(buttonTexts(container)).not.toContain("Approve");
+    expect(buttonTexts(container)).not.toContain("Install");
+    expect(buttonTexts(container)).not.toContain("Update");
+    expect(buttonTexts(container)).not.toContain("Enable");
+    expect(buttonTexts(container)).toContain("Disable");
+    expect(container.querySelectorAll<HTMLButtonElement>('[aria-label^="Remove "]')).toHaveLength(resources.length);
+
+    await act(async () => buttonWithText(container, "Disable").click());
+    await act(async () => { await required(pending); });
+    expect(setResourceEnabled).toHaveBeenCalledWith("resource-disable", false);
+
+    await act(async () => required(container.querySelector<HTMLButtonElement>('[aria-label="Remove Review helper"]')).click());
+    await act(async () => { await required(pending); });
+    expect(removeResource).toHaveBeenCalledWith("resource-approval");
+    expect(approveResource).not.toHaveBeenCalled();
+    expect(installResource).not.toHaveBeenCalled();
+    expect(updateResource).not.toHaveBeenCalled();
+  });
 });
 
 const extension: ResourceView = {
@@ -146,7 +209,8 @@ const theme: ResourceView = {
 async function renderPackages(
   controller: AppController,
   resources: readonly ResourceView[],
-  runAction: (key: string, action: () => Promise<void>) => void
+  runAction: (key: string, action: () => Promise<void>) => void,
+  backends: readonly BackendView[] = [resourceBackend("runtime-capability", ["extension", "skill", "prompt", "theme", "package"])]
 ): Promise<HTMLDivElement> {
   const container = document.createElement("div");
   document.body.append(container);
@@ -154,11 +218,26 @@ async function renderPackages(
   roots.push(root);
   await act(async () => root.render(<PiPackagesSection
     controller={controller}
+    backends={backends}
     resources={resources}
     runAction={runAction}
     t={(key, values) => translate("en", key, values)}
   />));
   return container;
+}
+
+function resourceBackend(id: string, kinds: readonly string[]): BackendView {
+  return {
+    id,
+    name: id,
+    version: "1",
+    health: "healthy",
+    capabilities: new Map([["runtime.resources", {
+      name: "runtime.resources",
+      supported: true,
+      options: kinds
+    }]])
+  };
 }
 
 function buttonWithText(container: HTMLElement, text: string): HTMLButtonElement {

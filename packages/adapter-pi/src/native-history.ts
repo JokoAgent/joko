@@ -514,7 +514,9 @@ function projectMessageEntry(entry: PiNativeHistoryEntry): PiNativeEntryProjecti
       payload: {
         type: "message_complete",
         role,
-        blocks: messageBlocks(message["content"], entry.id),
+        blocks: role === "user" && containsManagedResourceExpansion(message["content"])
+          ? []
+          : messageBlocks(message["content"], entry.id),
         ...(usage === undefined ? {} : { usage, ...generationTiming })
       }
     };
@@ -553,6 +555,17 @@ function projectMessageEntry(entry: PiNativeHistoryEntry): PiNativeEntryProjecti
       text: "Native message entry with an unsupported role preserved"
     }
   };
+}
+
+function containsManagedResourceExpansion(content: unknown): boolean {
+  const hasFrame = (value: unknown): boolean => typeof value === "string"
+    && /(?:^|\n)\[Joko loaded resource\]\n/u.test(value);
+  if (hasFrame(content)) return true;
+  if (!Array.isArray(content)) return false;
+  return content.some((rawBlock) => {
+    const block = record(rawBlock);
+    return block?.["type"] === "text" && hasFrame(block["text"]);
+  });
 }
 
 function messageBlocks(content: unknown, entryId: string): readonly MessageBlock[] {

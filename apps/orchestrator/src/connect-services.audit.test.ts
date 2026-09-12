@@ -933,7 +933,6 @@ describe("Connect security and protocol audit", () => {
         state: "loaded" as const,
         revision: "sha256:revision-one",
         resourceVersion: 7n,
-        runtimePath: "C:\\runtime\\resources\\prompt.md",
         runtimeGeneration: 2
       }, {
         id: "approved-only",

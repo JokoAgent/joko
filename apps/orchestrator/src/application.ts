@@ -862,6 +862,11 @@ export async function createOrchestratorApplication(
         oauthFetch: claudeCodeOAuthFetch,
         readBlob: (blob) => artifacts.readBlob(blob),
         resolveFile: (blob) => artifacts.resolveBlobPath(blob),
+        resolveTextResources: (context, signal) => piResources.runtimeTextSnapshot(
+          instanceId,
+          context.target.id,
+          signal
+        ),
         resolveArtifactMention: createArtifactMentionResolver({
           store, artifacts,
           resolveTarget: (session) => sessionWorktrees.effectiveTarget(session),

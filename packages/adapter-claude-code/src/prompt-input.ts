@@ -3,6 +3,10 @@ import { lstat, open, realpath } from "node:fs/promises";
 import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 import { JokoError, type AdapterContext, type ArtifactMentionResolver, type BlobRef, type PromptInput } from "@joko/core";
 import { claudeCodeError } from "./errors.js";
+import {
+  resolveClaudeResourceMention,
+  type ClaudeRuntimeTextResource
+} from "./resources.js";
 import type { ClaudeSdkUserMessage } from "./sdk-runtime.js";
 
 export interface ClaudeInputResolvers {
@@ -30,7 +34,8 @@ export async function prepareClaudePrompt(
   input: PromptInput,
   context: AdapterContext,
   resolvers: ClaudeInputResolvers,
-  signal: AbortSignal
+  signal: AbortSignal,
+  resources?: readonly ClaudeRuntimeTextResource[]
 ): Promise<PreparedClaudePrompt> {
   const itemCount = input.images.length + input.files.length + input.mentions.length + (input.text.length > 0 ? 1 : 0);
   if (itemCount > MAXIMUM_INPUT_ITEMS) throw inputError("INPUT_ITEM_LIMIT", "The prompt contains too many attachments and mentions.");
@@ -86,6 +91,12 @@ export async function prepareClaudePrompt(
   }
   for (const mention of input.mentions) {
     signal.throwIfAborted();
+    if (mention.kind === "resource") {
+      const resolved = resolveClaudeResourceMention(mention, resources);
+      mentionAuthorities.push(resolved.assertCurrent);
+      text.push(resolved.text);
+      continue;
+    }
     if (mention.kind === "artifact") {
       if (resolvers.resolveArtifactMention === undefined) {
         throw inputError("MENTION_KIND_UNSUPPORTED", "Artifact mentions require a service-owned authority resolver.");

@@ -9,6 +9,10 @@ export {
   CLAUDE_AGENT_SDK_VERSION
 } from "./sdk-runtime.js";
 export {
+  type ClaudeTextResourceResolver,
+  type ClaudeTextResourceSeed
+} from "./resources.js";
+export {
   ClaudeCodeOAuthAccount,
   type ClaudeCodeAccountSnapshot,
   type ClaudeCodeCredentialPort,

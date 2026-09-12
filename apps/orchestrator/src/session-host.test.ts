@@ -516,7 +516,6 @@ describe("SessionHost", () => {
       state: "loaded",
       revision: "sha256:exact",
       resourceVersion: 11n,
-      runtimePath: join(fixture.directory, "runtime", "prompt.md"),
       runtimeGeneration: context.generation
     }]);
     const create = (operationId: string) => fixture.host.createSession({
@@ -554,6 +553,73 @@ describe("SessionHost", () => {
     expect(() => check(first, { ...mention, resourceVersion: "12" })).toThrow(/exact version/u);
     expect(() => check(first, { ...mention, runtimeGeneration: generation + 1 })).toThrow(/earlier runtime/u);
     expect(() => check(second)).toThrow(/catalog/u);
+  });
+
+  it("keeps an old active runtime resource catalog revoked after a managed snapshot refresh", async () => {
+    const adapter = new FakeBackendAdapter({
+      ...PI_LIKE_PROFILE,
+      capabilities: [
+        ...PI_LIKE_PROFILE.capabilities.filter((capability) => capability.key !== "input.mention"),
+        { key: "input.mention", supported: true, options: ["resource"] }
+      ]
+    });
+    const send = vi.spyOn(adapter, "send");
+    const readResources = vi.spyOn(adapter, "getResources").mockImplementation(async (context) => [{
+      id: "resource-revoked",
+      kind: "prompt",
+      name: "Revoked prompt",
+      source: "managed",
+      state: "loaded",
+      revision: "sha256:revoked",
+      resourceVersion: 6n,
+      runtimePath: join(tmpdir(), "resource-revoked.md"),
+      runtimeGeneration: context.generation
+    }]);
+    const fixture = await createFixture(adapter);
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-resource-revocation",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Resource revocation",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    await fixture.host.getResources(sessionId);
+    const runtimeGeneration = fixture.store.getSession(sessionId).descriptor.binding.generation;
+    const prompt: PromptInput = {
+      text: "",
+      images: [],
+      files: [],
+      mentions: [{
+        kind: "resource",
+        label: "Revoked prompt",
+        reference: "resource-revoked",
+        discoveredRevision: "sha256:revoked",
+        resourceVersion: "6",
+        runtimeGeneration
+      }],
+      disposition: "prompt"
+    };
+    fixture.store.setQueuePaused({ sessionId, paused: true, traceId: "test:resource-revocation:pause" });
+    const queued = fixture.host.enqueueInput({
+      operationId: "send-resource-revocation",
+      connection: fixture.connection,
+      sessionId,
+      prompt
+    });
+
+    const fence = fixture.host.fenceBackendResourceCatalogs(adapter.id);
+    expect(() => fixture.host.assertInputCapabilities(sessionId, prompt)).toThrow(/catalog/u);
+    await expect(fixture.host.getResources(sessionId)).rejects.toThrow(/no longer current/u);
+    fixture.host.completeBackendResourceCatalogRefresh(adapter.id, fence, true);
+    await expect(fixture.host.getResources(sessionId)).rejects.toThrow(/no longer current/u);
+
+    fixture.store.setQueuePaused({ sessionId, paused: false, traceId: "test:resource-revocation:resume" });
+    fixture.host.requestQueueDrain(sessionId);
+    await eventually(() => fixture.store.getQueueItem(queued.value.queueItemId).state === "failed");
+    expect(readResources).toHaveBeenCalledTimes(1);
+    expect(send).not.toHaveBeenCalled();
   });
 
   it("re-observes the live resource catalog after queue claim and before Backend dispatch", async () => {
@@ -3682,6 +3748,51 @@ describe("SessionHost", () => {
       }));
     expect(projected.get("quote-entry-1")).toEqual(firstPrompt);
     expect(projected.get("quote-entry-2")).toEqual(secondPrompt);
+  });
+
+  it("persists canonical Queue blocks instead of a Backend-expanded user echo", async () => {
+    const privateBody = "private-runtime-resource-body-7f6c";
+    const adapter = new QuoteGateFakeAdapter({
+      nativeText: `[Joko loaded resource]\nName: \"Release\"\nKind: prompt\nContent:\n${privateBody}\n[End content]\n[/Joko loaded resource]`
+    });
+    const fixture = await createFixture(adapter);
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-canonical-user-echo",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Canonical user echo",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const prompt: PromptInput = {
+      text: "Apply @Release",
+      images: [],
+      files: [],
+      mentions: [],
+      disposition: "prompt"
+    };
+
+    const execution = fixture.host.enqueueInput({
+      operationId: "send-canonical-user-echo",
+      connection: fixture.connection,
+      sessionId,
+      prompt
+    });
+    await eventually(() => fixture.store.getRun(execution.value.runId).descriptor.state === "completed");
+    await eventually(() => fixture.store.listEvents({ sessionId }).some((event) =>
+      event.id.startsWith("native-event-")
+      && event.payload.type === "message_complete"
+      && event.payload.role === "user"));
+
+    const userEvents = fixture.store.listEvents({ sessionId }).filter((event) =>
+      event.payload.type === "message_complete" && event.payload.role === "user");
+    expect(userEvents.length).toBeGreaterThanOrEqual(2);
+    for (const event of userEvents) {
+      if (event.payload.type !== "message_complete") throw new Error("Expected a user message.");
+      expect(event.payload.blocks).toEqual([{ kind: "text", text: prompt.text }]);
+      expect(event.payload.acceptedInput).toEqual(prompt);
+    }
   });
 
   it("retains an accepted live receipt without native identity but does not grant it to refreshed history", async () => {
@@ -11946,8 +12057,9 @@ class ImmediateTerminalFakeAdapter extends FakeBackendAdapter {
 class QuoteGateFakeAdapter extends FakeBackendAdapter {
   readonly #messages: Array<{ readonly id: string; readonly text: string }> = [];
   readonly #liveNativeIdentity: boolean;
+  readonly #nativeText: string | undefined;
 
-  constructor(options: { readonly liveNativeIdentity?: boolean } = {}) {
+  constructor(options: { readonly liveNativeIdentity?: boolean; readonly nativeText?: string } = {}) {
     super({
       ...PI_LIKE_PROFILE,
       capabilities: [
@@ -11956,15 +12068,17 @@ class QuoteGateFakeAdapter extends FakeBackendAdapter {
       ]
     });
     this.#liveNativeIdentity = options.liveNativeIdentity ?? true;
+    this.#nativeText = options.nativeText;
   }
 
   override async send(input: PromptInput, context: AdapterContext): Promise<void> {
     const id = `quote-entry-${this.#messages.length + 1}`;
-    this.#messages.push({ id, text: input.text });
+    const nativeText = this.#nativeText ?? input.text;
+    this.#messages.push({ id, text: nativeText });
     await context.emit({
       type: "message_complete",
       role: "user",
-      blocks: [{ kind: "text", text: input.text }],
+      blocks: [{ kind: "text", text: nativeText }],
       ...(this.#liveNativeIdentity ? { nativeHistory: { identity: { entryId: id } } } : {})
     }, quoteGateMetadata(id));
     await context.emit({ type: "done", outcome: "completed" });

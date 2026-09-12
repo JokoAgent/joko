@@ -959,6 +959,169 @@ describe("ClaudeCodeAdapter", () => {
     }
   });
 
+  test("advertises exact loaded text resources and injects only approved content into the selected native input", async () => {
+    let current = true;
+    const assertCurrent = vi.fn(() => {
+      if (!current) throw new Error("Private managed-resource location changed.");
+    });
+    const seed = textResourceSeed({ assertCurrent });
+    const resolveTextResources: NonNullable<ClaudeCodeAdapterOptions["resolveTextResources"]> = vi.fn(
+      async (_context, signal) => {
+        signal.throwIfAborted();
+        return [seed];
+      }
+    );
+    const runtime = new FakeSdkRuntime();
+    const adapter = adapterFor(runtime, { resolveTextResources });
+    try {
+      const descriptor = await adapter.describe();
+      expect(descriptor.capabilities.get("runtime.resources")).toMatchObject({
+        supported: true,
+        options: ["skill", "prompt"]
+      });
+      expect(descriptor.capabilities.get("input.mention")?.options).toContain("resource");
+
+      const creation = contextFor();
+      const binding = await adapter.createSession(createInput(), creation.context);
+      expect(resolveTextResources).toHaveBeenCalledWith(creation.context, expect.any(AbortSignal));
+      const active = contextFor(binding, { operationId: "resource-input" });
+      await expect(adapter.getResources(active.context)).resolves.toEqual([{
+        id: seed.id,
+        kind: seed.kind,
+        name: seed.name,
+        source: "managed",
+        state: "loaded",
+        revision: seed.revision,
+        resourceVersion: seed.resourceVersion,
+        runtimeGeneration: active.context.generation,
+        version: seed.version
+      }]);
+      await adapter.send({
+        ...textPrompt("Use the selected instructions."),
+        mentions: [resourceMention(seed, active.context.generation)]
+      }, active.context);
+      const nativeContent = runtime.queries[0]!.receivedInputs[0]!.message.content;
+      expect(nativeContent).toContain("Use the selected instructions.");
+      expect(nativeContent).toContain(seed.content);
+      expect(nativeContent).toContain(JSON.stringify(seed.name));
+      expect(nativeContent).not.toContain(seed.id);
+      expect(nativeContent).not.toContain(seed.revision);
+      expect(nativeContent).not.toContain("managed-resources");
+      expect(assertCurrent.mock.calls.length).toBeGreaterThanOrEqual(5);
+
+      const nativeUser = runtime.queries[0]!.receivedInputs[0]!;
+      expect(adapter.nativeUserEntryIdForOperation(active.context.operationId!)).toBe(nativeUser.uuid);
+      const foreignUserId = randomUUID();
+      runtime.messages.set(binding.nativeSessionId!, [
+        {
+          ...nativeUser,
+          session_id: binding.nativeSessionId!,
+          parent_agent_id: null
+        },
+        historyMessage("user", foreignUserId, binding.nativeSessionId!, {
+          role: "user",
+          content: "An ordinary foreign native prompt remains visible."
+        })
+      ]);
+      const history = await adapter.getNativeHistoryProjection(active.context);
+      expect(history.events).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          nativeEntryId: nativeUser.uuid,
+          payload: { type: "message_complete", role: "user", blocks: [] }
+        }),
+        expect.objectContaining({
+          nativeEntryId: foreignUserId,
+          payload: {
+            type: "message_complete",
+            role: "user",
+            blocks: [{ kind: "text", text: "An ordinary foreign native prompt remains visible." }]
+          }
+        })
+      ]));
+      expect(JSON.stringify(history)).not.toContain(seed.content);
+
+      current = false;
+      await expect(adapter.getResources(active.context)).resolves.toEqual([]);
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
+  test.each([
+    ["revision", { discoveredRevision: "sha256:replacement" }],
+    ["entity version", { resourceVersion: "8" }],
+    ["runtime generation", { runtimeGeneration: 2 }]
+  ] as const)("rejects a resource mention with a stale %s before native admission", async (_label, replacement) => {
+    const seed = textResourceSeed();
+    const runtime = new FakeSdkRuntime();
+    const adapter = adapterFor(runtime, { resolveTextResources: async () => [seed] });
+    try {
+      const binding = await adapter.createSession(createInput(), contextFor().context);
+      const active = contextFor(binding, { operationId: `stale-resource-${_label}` });
+      await expect(adapter.send({
+        ...textPrompt(""),
+        mentions: [{ ...resourceMention(seed, active.context.generation), ...replacement }]
+      }, active.context)).rejects.toMatchObject({
+        publicError: { code: "RESOURCE_MENTION_STALE", stateMayHaveChanged: false }
+      });
+      expect(runtime.queries[0]!.receivedInputs).toEqual([]);
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
+  test("withdraws a text resource whose authority expires before the native input gate consumes it", async () => {
+    let current = true;
+    const assertCurrent = vi.fn(() => {
+      if (!current) throw new Error("The approved record was replaced.");
+    });
+    const seed = textResourceSeed({ assertCurrent });
+    const runtime = new FakeSdkRuntime({ pauseAfterFirstInput: true });
+    const adapter = adapterFor(runtime, { resolveTextResources: async () => [seed] });
+    try {
+      const binding = await adapter.createSession(createInput(), contextFor().context);
+      const query = runtime.queries[0]!;
+      const first = contextFor(binding, { operationId: "resource-gate-first" });
+      await adapter.send(textPrompt("Start"), first.context);
+      query.push(resultMessage(binding.nativeSessionId!, { result: "Done", totalCostUsd: 0 }));
+      await eventually(() => first.events.some((event) => event.type === "done"));
+
+      const sending = adapter.send({
+        ...textPrompt(""),
+        mentions: [resourceMention(seed, 1)]
+      }, contextFor(binding, { operationId: "resource-gate-second" }).context);
+      const rejected = expect(sending).rejects.toMatchObject({
+        publicError: { code: "RESOURCE_MENTION_STALE", stateMayHaveChanged: false }
+      });
+      await vi.waitFor(() => expect(assertCurrent.mock.calls.length).toBeGreaterThanOrEqual(4));
+      current = false;
+      query.resumeInputs();
+      await rejected;
+      expect(query.receivedInputs.map((input) => input.message.content)).toEqual(["Start"]);
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
+  test("keeps approved text resources out of isolated review runtimes", async () => {
+    const resolveTextResources: NonNullable<ClaudeCodeAdapterOptions["resolveTextResources"]> = vi.fn(async () => [textResourceSeed()]);
+    const runtime = new FakeSdkRuntime();
+    const adapter = adapterFor(runtime, { resolveTextResources });
+    try {
+      await adapter.describe();
+      const creation = contextFor(undefined, { runtimePolicy: "review_read_only" });
+      const binding = await adapter.createSession(createInput({
+        runtimePolicy: "review_read_only",
+        permissionMode: "ask"
+      }), creation.context);
+      const review = contextFor(binding, { runtimePolicy: "review_read_only" }).context;
+      await expect(adapter.getResources(review)).resolves.toEqual([]);
+      expect(resolveTextResources).not.toHaveBeenCalled();
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
   test("refuses mismatched or retired Artifact authority before native admission", async () => {
     const workspace = await mkdtemp(join(tmpdir(), "joko-claude-artifact-"));
     const path = join(workspace, "report.txt");
@@ -3434,6 +3597,31 @@ function contextFor(
 
 function textPrompt(text: string) {
   return { text, images: [], files: [], mentions: [], disposition: "prompt" as const };
+}
+
+function textResourceSeed(overrides: Partial<NonNullable<Awaited<ReturnType<NonNullable<ClaudeCodeAdapterOptions["resolveTextResources"]>>>[number]>> = {}) {
+  return {
+    id: "approved-skill-one",
+    kind: "skill" as const,
+    name: "Approved workflow",
+    revision: "sha256:approved-resource-revision",
+    resourceVersion: 7n,
+    version: "1.0.0",
+    content: "Follow the approved workflow without reading ambient settings.",
+    assertCurrent: vi.fn(),
+    ...overrides
+  };
+}
+
+function resourceMention(seed: ReturnType<typeof textResourceSeed>, runtimeGeneration: number) {
+  return {
+    kind: "resource" as const,
+    label: seed.name,
+    reference: seed.id,
+    discoveredRevision: seed.revision,
+    resourceVersion: seed.resourceVersion.toString(10),
+    runtimeGeneration
+  };
 }
 
 function initialization(): ClaudeSdkInitializationResult {

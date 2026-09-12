@@ -11,7 +11,7 @@ import { describe, expect, it, vi } from "vitest";
 import { createOrchestratorGateway } from "./gateway.js";
 import type { ResourceDraft } from "./model.js";
 
-describe("Pi resource acquisition gateway", () => {
+describe("managed resource acquisition gateway", () => {
   it("encodes local, npm, and Git drafts as typed acquisition oneofs", async () => {
     const submitted: any[] = [];
     const transport = operationTransport(submitted);
@@ -25,7 +25,7 @@ describe("Pi resource acquisition gateway", () => {
 
     const drafts: readonly ResourceDraft[] = [
       {
-        backendId: "pi",
+        backendId: "backend",
         kind: "skill",
         scope: "managed",
         source: { kind: "local", serverPath: "D:\\pi-resources\\skill" },
@@ -33,7 +33,7 @@ describe("Pi resource acquisition gateway", () => {
         version: ""
       },
       {
-        backendId: "pi",
+        backendId: "backend",
         kind: "package",
         scope: "global",
         source: { kind: "npm", packageName: "@joko/example", versionSpec: "^1.2.0" },
@@ -41,7 +41,7 @@ describe("Pi resource acquisition gateway", () => {
         version: "1.2.0"
       },
       {
-        backendId: "pi",
+        backendId: "backend",
         kind: "package",
         scope: "user",
         source: { kind: "git", repositoryUrl: "https://example.test/org/repo.git", ref: "main", subdirectory: "packages/agent" },
@@ -53,7 +53,7 @@ describe("Pi resource acquisition gateway", () => {
 
     expect(submitted.map((payload) => payload.case)).toEqual(["addResource", "addResource", "addResource"]);
     expect(submitted[0]?.value).toMatchObject({
-      backendId: "pi",
+      backendId: "backend",
       acquisition: { source: { case: "local", value: { serverPath: "D:\\pi-resources\\skill" } } }
     });
     expect(submitted[1]?.value).toMatchObject({
@@ -79,7 +79,7 @@ describe("Pi resource acquisition gateway", () => {
     await gateway.connect();
 
     await expect(gateway.addResource({
-      backendId: "pi",
+      backendId: "backend",
       kind: "skill",
       scope: "managed",
       source: { kind: "npm", packageName: "example", versionSpec: "" },
@@ -87,6 +87,28 @@ describe("Pi resource acquisition gateway", () => {
       version: ""
     })).rejects.toThrow("source is invalid");
     expect(submitted).toEqual([]);
+    gateway.disconnect();
+  });
+
+  it("submits the exact resource revision selected by the caller", async () => {
+    const submitted: any[] = [];
+    const gateway = createOrchestratorGateway(
+      { id: "connection-1", deviceId: "device-test", name: "Desktop", origin: "https://orchestrator.example", serverId: "server-test" },
+      "secret",
+      {},
+      () => operationTransport(submitted)
+    );
+    await gateway.connect();
+
+    await gateway.approveResource("resource-one", "sha256:selected-revision");
+
+    expect(submitted).toMatchObject([{
+      case: "approveResource",
+      value: {
+        resourceId: "resource-one",
+        discoveredRevision: "sha256:selected-revision"
+      }
+    }]);
     gateway.disconnect();
   });
 });

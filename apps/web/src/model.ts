@@ -3606,7 +3606,7 @@ export interface OperationApi {
   listBrowserActivity(browserId: string, pageId: string): Promise<readonly BrowserActivityView[]>;
   listBrowserTransfers(browserId: string, pageId: string): Promise<readonly BrowserTransferView[]>;
   uploadBrowserFile(browserId: string, pageId: string, file: File, inputHint?: string): Promise<void>;
-  approveResource(resourceId: string, discoveredRevision?: string): Promise<void>;
+  approveResource(resourceId: string, discoveredRevision: string): Promise<void>;
   discoverProjectResources(targetId: string): Promise<void>;
   addResource(draft: ResourceDraft): Promise<void>;
   setResourceEnabled(resourceId: string, enabled: boolean): Promise<void>;

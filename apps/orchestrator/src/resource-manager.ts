@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants, createReadStream } from "node:fs";
-import { copyFile, lstat, mkdir, readdir, realpath, rename, rm, stat } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { copyFile, lstat, mkdir, open, readdir, realpath, rename, rm, stat } from "node:fs/promises";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import type { ProjectSkillCandidate } from "@joko/adapter-pi";
 import { redactSecrets, type RuntimeResource } from "@joko/core";
@@ -79,6 +79,20 @@ interface StoredResource extends Omit<PiResourceDescriptor, "versionNumber"> {
   readonly workspaceRoot?: string;
   readonly installedPath?: string;
   readonly extensionApprovedRevision?: string;
+  /**
+   * A discovered replacement is acquisition intent, not authority over the
+   * currently installed generation. Keeping it separate lets an update fail
+   * without revoking or reinterpreting the last committed bytes.
+   */
+  readonly pendingUpdate?: StoredResourceUpdateIntent;
+}
+
+interface StoredResourceUpdateIntent {
+  readonly source: PiPackageSource;
+  readonly canonicalPath?: string;
+  readonly discoveredRevision: string;
+  readonly name: string;
+  readonly version?: string;
 }
 
 interface StoredResourceCatalog {
@@ -112,6 +126,8 @@ export interface DiscoverPiResourceInput {
 export interface DiscoverProjectResourcesInput {
   readonly backendId: string;
   readonly targetId: string;
+  /** Exact resource kinds advertised by the selected Backend. */
+  readonly kinds: readonly PiResourceKind[];
 }
 
 export interface DiscoverPiPackageInput {
@@ -132,6 +148,35 @@ export interface UpdatePiResourceInput {
   readonly approvedByConnectionId: string;
 }
 
+const preparedPiResourceMutationBrand = Symbol("PreparedPiResourceMutation");
+
+/**
+ * Filesystem work and compatibility inspection captured without changing the
+ * durable catalog. The mutation plan is intentionally opaque; `value` is only
+ * the descriptor that will be current if the plan is adopted.
+ */
+export interface PreparedPiResourceMutation<T> {
+  readonly value: T;
+  /** True only when adoption revokes bytes already eligible for a live runtime. */
+  readonly revokesRuntimeAuthority: boolean;
+  readonly [preparedPiResourceMutationBrand]: true;
+}
+
+interface PreparedCatalogEntry {
+  readonly id: string;
+  readonly expected: StoredResource | undefined;
+  readonly next: StoredResource;
+}
+
+interface PreparedCatalogMutation<T> {
+  readonly entries: readonly PreparedCatalogEntry[];
+  readonly value: T;
+  readonly assertCurrent?: () => void;
+  readonly rollbackFilesystem?: () => Promise<void>;
+  readonly cleanupAfterCommit?: () => Promise<void>;
+  completed: boolean;
+}
+
 export interface PiRuntimeResourceSnapshot {
   readonly extensions: readonly string[];
   readonly skills: readonly string[];
@@ -140,6 +185,24 @@ export interface PiRuntimeResourceSnapshot {
   readonly packages: readonly string[];
   readonly resources: readonly RuntimeResource[];
 }
+
+/** Immutable, path-free text authority captured for one Backend Target runtime. */
+export interface RuntimeTextResourceSeed {
+  readonly id: string;
+  readonly kind: "skill" | "prompt";
+  readonly name: string;
+  readonly revision: string;
+  readonly resourceVersion: bigint;
+  readonly version?: string;
+  readonly content: string;
+  /** Fences delayed native consumption against catalog mutation or Target revocation. */
+  readonly assertCurrent: () => void;
+}
+
+const MAXIMUM_RUNTIME_TEXT_RESOURCE_BYTES = 256 * 1024;
+const RESOURCE_GENERATIONS_DIRECTORY = ".generations";
+const RESOURCE_GENERATION_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const MISSING_INSTALLED_RESOURCE_ERROR = "Installed resource payload is missing.";
 
 export interface PiResourceLoadObservation {
   readonly discoveredRevision: string;
@@ -162,6 +225,7 @@ export class PiResourceManager {
   readonly #maximumBytes: number;
   readonly #acquisition: PiPackageAcquisition;
   readonly #records = new Map<string, StoredResource>();
+  readonly #preparedMutations = new WeakMap<object, PreparedCatalogMutation<unknown>>();
   #initialized = false;
   #tail: Promise<void> = Promise.resolve();
 
@@ -184,8 +248,8 @@ export class PiResourceManager {
     if (this.#initialized) return;
     await mkdir(this.#managedRoot, { recursive: true, mode: 0o700 });
     await assertCanonicalDirectory(this.#managedRoot, "Managed resource root");
-    await Promise.all(["extensions", "skills", "prompts", "themes", "packages", ".staging", ".trash"].map((name) => mkdir(join(this.#managedRoot, name), { recursive: true, mode: 0o700 })));
-    for (const name of ["extensions", "skills", "prompts", "themes", "packages", ".staging", ".trash"]) {
+    await Promise.all(["extensions", "skills", "prompts", "themes", "packages", ".staging"].map((name) => mkdir(join(this.#managedRoot, name), { recursive: true, mode: 0o700 })));
+    for (const name of ["extensions", "skills", "prompts", "themes", "packages", ".staging"]) {
       await assertContainedRegularDirectory(this.#managedRoot, join(this.#managedRoot, name), `Managed resource ${name} directory`);
     }
     const setting = this.#store.findSetting<StoredResourceCatalog>("service", this.#scopeId, "pi_resource_catalog");
@@ -197,6 +261,7 @@ export class PiResourceManager {
         this.#records.set(record.id, record);
       }
     }
+    const recoveryChanged = await this.#recoverOrphanedFilesystemState();
     let compatibilityChanged = false;
     for (const [id, record] of this.#records) {
       const refreshed = await this.#refreshCompatibility(record);
@@ -205,7 +270,7 @@ export class PiResourceManager {
         compatibilityChanged = true;
       }
     }
-    if (compatibilityChanged) this.#persist();
+    if (recoveryChanged || compatibilityChanged) this.#persist();
     this.#initialized = true;
   }
 
@@ -217,12 +282,12 @@ export class PiResourceManager {
   } = {}): readonly PiResourceDescriptor[] {
     this.#assertInitialized();
     return [...this.#records.values()]
+      .map(publicResource)
       .filter((item) => filter.backendId === undefined || item.backendId === filter.backendId)
       .filter((item) => filter.targetId === undefined || item.targetId === filter.targetId)
       .filter((item) => filter.kind === undefined || item.kind === filter.kind)
       .filter((item) => filter.state === undefined || item.state === filter.state)
-      .sort((left, right) => left.name.localeCompare(right.name, "en") || left.id.localeCompare(right.id, "en"))
-      .map(publicResource);
+      .sort((left, right) => left.name.localeCompare(right.name, "en") || left.id.localeCompare(right.id, "en"));
   }
 
   get(resourceId: string): PiResourceDescriptor {
@@ -230,7 +295,51 @@ export class PiResourceManager {
     return publicResource(this.#require(resourceId));
   }
 
-  async discover(input: DiscoverPiResourceInput): Promise<PiResourceDescriptor> {
+  /**
+   * Serialize completion of an inspected mutation. The supplied finalize
+   * callback is synchronous so an operation owner can call it from the same
+   * OperationalStore transaction that records operation completion. If that
+   * transaction (or its completion wrapper) fails, the in-memory catalog is
+   * restored to the exact pre-adoption records.
+   */
+  async completePreparedMutation<T, TResult>(
+    prepared: PreparedPiResourceMutation<T>,
+    completion: (finalize: (store: OperationalStore) => void) => TResult
+  ): Promise<TResult> {
+    this.#assertInitialized();
+    return this.#mutate(async () => {
+      const internal = this.#preparedMutations.get(prepared as object) as PreparedCatalogMutation<T> | undefined;
+      if (internal === undefined) throw new Error("Prepared resource mutation does not belong to this manager.");
+      if (internal.completed) throw new Error("Prepared resource mutation has already completed.");
+      let adopted = false;
+      const finalize = (store: OperationalStore): void => {
+        if (store !== this.#store) throw new Error("Prepared resource mutation must use its owning OperationalStore.");
+        if (adopted) throw new Error("Prepared resource mutation can only be adopted once.");
+        this.#adoptPreparedMutation(internal, store);
+        adopted = true;
+      };
+      try {
+        const result = completion(finalize);
+        if (isPromiseLike(result)) {
+          void Promise.resolve(result).catch(() => undefined);
+          throw new Error("Prepared resource mutation completion must be synchronous.");
+        }
+        if (!adopted) throw new Error("Prepared resource mutation completion did not adopt the catalog change.");
+        internal.completed = true;
+        await internal.cleanupAfterCommit?.().catch(() => undefined);
+        return result;
+      } catch (error) {
+        if (adopted) this.#restorePreparedMutation(internal);
+        if (internal.rollbackFilesystem !== undefined) {
+          internal.completed = true;
+          await internal.rollbackFilesystem().catch(() => undefined);
+        }
+        throw error;
+      }
+    });
+  }
+
+  async prepareDiscover(input: DiscoverPiResourceInput): Promise<PreparedPiResourceMutation<PiResourceDescriptor>> {
     this.#assertInitialized();
     validateKind(input.kind);
     validateScope(input.scope);
@@ -253,72 +362,23 @@ export class PiResourceManager {
     }
     const id = input.id ?? `resource_${randomUUID()}`;
     validateResourceId(id);
-    const now = this.#now();
-    return this.#mutate(async () => {
-      const previous = this.#records.get(id);
-      if (previous !== undefined && (
-        previous.backendId !== input.backendId ||
-        previous.targetId !== input.targetId ||
-        previous.kind !== input.kind ||
-        previous.scope !== input.scope ||
-        previous.canonicalPath === undefined || !samePath(previous.canonicalPath, inspection.canonicalPath)
-      )) throw new Error("Pi resource ID is already bound to a different source.");
-      if (
-        previous !== undefined &&
-        previous.state !== "removed" &&
-        previous.backendId === input.backendId &&
-        previous.targetId === input.targetId &&
-        previous.kind === input.kind &&
-        previous.scope === input.scope &&
-        previous.canonicalPath !== undefined && samePath(previous.canonicalPath, inspection.canonicalPath) &&
-        previous.discoveredRevision === inspection.revision
-      ) return publicResource(previous);
-      const changedInstalledResource = previous?.scope !== "project" && previous?.installedPath !== undefined;
-      const {
-        approvedAt: _approvedAt,
-        approvedByConnectionId: _approvedBy,
-        extensionApprovedRevision: _extensionApprovedRevision,
-        error: _error,
-        ...previousBase
-      } = previous ?? {} as StoredResource;
-      const record: StoredResource = {
-        ...previousBase,
-        id,
-        backendId: nonBlank(input.backendId, "Backend ID"),
-        ...(input.targetId === undefined ? {} : { targetId: nonBlank(input.targetId, "Target ID") }),
-        kind: input.kind,
-        scope: input.scope,
-        name: nonBlank(input.name ?? basename(inspection.canonicalPath), "Resource name"),
-        ...(input.version === undefined ? {} : { version: nonBlank(input.version, "Resource version") }),
-        sourceKind: source.kind,
-        sourceIdentity: input.kind === "package" ? piPackageSourceIdentity(source) : `${input.kind}:${pathIdentity(inspection.canonicalPath)}`,
-        sourceDisplay: basename(inspection.canonicalPath),
-        canonicalPathFingerprint: pathFingerprint(inspection.canonicalPath),
-        symbolicLinkDetected: false,
-        specialFileDetected: false,
-        discoveredRevision: inspection.revision,
-        ...compatibilityFields(compatibility, compatibility.extensionContentFingerprint !== undefined),
-        state: changedInstalledResource ? "update_available" : "awaiting_approval",
-        enabled: false,
-        versionNumber: ((previous === undefined ? 0n : BigInt(previous.versionNumber)) + 1n).toString(10),
-        updatedAt: now,
-        source,
-        canonicalPath: inspection.canonicalPath,
-        ...(workspaceRoot === undefined ? {} : { workspaceRoot })
-      };
-      this.#records.set(id, record);
-      this.#persistWithRollback(id, previous);
-      return publicResource(record);
-    });
+    const plan = this.#planLocalDiscovery(input, id, source, inspection, compatibility, workspaceRoot);
+    return this.#prepareMutation([plan.entry], plan.value, workspaceRoot === undefined
+      ? undefined
+      : () => { void this.#assertTrustedProjectTarget(input.backendId, input.targetId, workspaceRoot); });
+  }
+
+  async discover(input: DiscoverPiResourceInput): Promise<PiResourceDescriptor> {
+    return this.#completePreparedStandalone(await this.prepareDiscover(input));
   }
 
   /** Register a typed package intent without touching network or executing package code. */
-  async discoverPackage(input: DiscoverPiPackageInput): Promise<PiResourceDescriptor> {
+  async prepareDiscoverPackage(input: DiscoverPiPackageInput): Promise<PreparedPiResourceMutation<PiResourceDescriptor>> {
     this.#assertInitialized();
     validateScope(input.scope);
     const source = normalizePiPackageSource(input.source);
     if (source.kind === "local") {
-      return this.discover({
+      return this.prepareDiscover({
         ...(input.id === undefined ? {} : { id: input.id }),
         backendId: input.backendId,
         ...(input.targetId === undefined ? {} : { targetId: input.targetId }),
@@ -340,244 +400,373 @@ export class PiResourceManager {
     const sourceIdentity = piPackageSourceIdentity(source);
     const approvalRevision = piPackageSourceApprovalRevision(source);
     const now = this.#now();
-    return this.#mutate(async () => {
-      const previous = this.#records.get(id);
-      if (previous !== undefined && (
-        previous.backendId !== input.backendId || previous.targetId !== input.targetId ||
-        previous.kind !== "package" || previous.scope !== input.scope ||
-        previous.sourceIdentity !== sourceIdentity
-      )) throw new Error("Pi resource ID is already bound to a different package identity.");
-      if (
-        previous !== undefined && previous.state !== "removed" &&
-        previous.sourceIdentity === sourceIdentity &&
-        piPackageSourceApprovalRevision(previous.source) === approvalRevision
-      ) return publicResource(previous);
-      const {
-        approvedAt: _approvedAt,
-        approvedByConnectionId: _approvedBy,
-        canonicalPath: _canonicalPath,
-        error: _error,
-        extensionApprovedRevision: _extensionApprovedRevision,
-        workspaceRoot: _workspaceRoot,
-        ...previousBase
-      } = previous ?? {} as StoredResource;
-      const record: StoredResource = {
-        ...previousBase,
-        id,
-        backendId: nonBlank(input.backendId, "Backend ID"),
-        ...(input.targetId === undefined ? {} : { targetId: nonBlank(input.targetId, "Target ID") }),
-        kind: "package",
-        scope: input.scope,
-        name: nonBlank(input.name ?? piPackageSourceDisplay(source), "Resource name"),
-        ...(input.version === undefined ? {} : { version: nonBlank(input.version, "Resource version") }),
-        sourceKind: source.kind,
-        sourceIdentity,
-        sourceDisplay: piPackageSourceDisplay(source),
-        canonicalPathFingerprint: `sha256:${createHash("sha256").update(sourceIdentity).digest("hex")}`,
-        symbolicLinkDetected: false,
-        specialFileDetected: false,
-        discoveredRevision: approvalRevision,
-        ...emptyCompatibilityFields(),
-        state: previous?.installedPath === undefined ? "awaiting_approval" : "update_available",
-        enabled: false,
-        versionNumber: ((previous === undefined ? 0n : BigInt(previous.versionNumber)) + 1n).toString(10),
-        updatedAt: now,
+    const previous = this.#records.get(id);
+    if (previous !== undefined && (
+      previous.backendId !== input.backendId || previous.targetId !== input.targetId ||
+      previous.kind !== "package" || previous.scope !== input.scope ||
+      previous.sourceIdentity !== sourceIdentity
+    )) throw new Error("Pi resource ID is already bound to a different package identity.");
+    const requestedName = nonBlank(input.name ?? previous?.name ?? piPackageSourceDisplay(source), "Resource name");
+    const requestedVersion = input.version === undefined
+      ? previous?.version
+      : nonBlank(input.version, "Resource version");
+    if (previous?.installedPath !== undefined && previous.state !== "removed") {
+      const matchesActive = piPackageSourceApprovalRevision(previous.source) === approvalRevision
+        && previous.name === requestedName
+        && previous.version === requestedVersion;
+      const pendingUpdate: StoredResourceUpdateIntent = {
         source,
-        ...(workspaceRoot === undefined ? {} : { workspaceRoot })
+        discoveredRevision: approvalRevision,
+        name: requestedName,
+        ...(requestedVersion === undefined ? {} : { version: requestedVersion })
       };
-      this.#records.set(id, record);
-      this.#persistWithRollback(id, previous);
-      return publicResource(record);
-    });
+      const matchesPending = previous.pendingUpdate !== undefined
+        && storedUpdateIntentIdentity(previous.pendingUpdate) === storedUpdateIntentIdentity(pendingUpdate);
+      if ((matchesActive && previous.pendingUpdate === undefined) || matchesPending) {
+        return this.#prepareMutation(
+          [{ id, expected: previous, next: previous }],
+          publicResource(previous),
+          workspaceRoot === undefined
+            ? undefined
+            : () => { void this.#assertTrustedProjectTarget(input.backendId, input.targetId, workspaceRoot); }
+        );
+      }
+      const { pendingUpdate: _pendingUpdate, ...active } = previous;
+      const updated: StoredResource = {
+        ...active,
+        ...(matchesActive ? {} : { pendingUpdate }),
+        updatedAt: now
+      };
+      return this.#prepareMutation(
+        [{ id, expected: previous, next: updated }],
+        publicResource(updated),
+        workspaceRoot === undefined
+          ? undefined
+          : () => { void this.#assertTrustedProjectTarget(input.backendId, input.targetId, workspaceRoot); }
+      );
+    }
+    if (
+      previous !== undefined && previous.state !== "removed" &&
+      previous.sourceIdentity === sourceIdentity &&
+      piPackageSourceApprovalRevision(previous.source) === approvalRevision
+    ) {
+      return this.#prepareMutation(
+        [{ id, expected: previous, next: previous }],
+        publicResource(previous),
+        workspaceRoot === undefined
+          ? undefined
+          : () => { void this.#assertTrustedProjectTarget(input.backendId, input.targetId, workspaceRoot); }
+      );
+    }
+    const {
+      approvedAt: _approvedAt,
+      approvedByConnectionId: _approvedBy,
+      canonicalPath: _canonicalPath,
+      error: _error,
+      extensionApprovedRevision: _extensionApprovedRevision,
+      workspaceRoot: _workspaceRoot,
+      ...previousBase
+    } = previous ?? {} as StoredResource;
+    const record: StoredResource = {
+      ...previousBase,
+      id,
+      backendId: nonBlank(input.backendId, "Backend ID"),
+      ...(input.targetId === undefined ? {} : { targetId: nonBlank(input.targetId, "Target ID") }),
+      kind: "package",
+      scope: input.scope,
+      name: requestedName,
+      ...(requestedVersion === undefined ? {} : { version: requestedVersion }),
+      sourceKind: source.kind,
+      sourceIdentity,
+      sourceDisplay: piPackageSourceDisplay(source),
+      canonicalPathFingerprint: `sha256:${createHash("sha256").update(sourceIdentity).digest("hex")}`,
+      symbolicLinkDetected: false,
+      specialFileDetected: false,
+      discoveredRevision: approvalRevision,
+      ...emptyCompatibilityFields(),
+      state: "awaiting_approval",
+      enabled: false,
+      versionNumber: ((previous === undefined ? 0n : BigInt(previous.versionNumber)) + 1n).toString(10),
+      updatedAt: now,
+      source,
+      ...(workspaceRoot === undefined ? {} : { workspaceRoot })
+    };
+    return this.#prepareMutation(
+      [{ id, expected: previous, next: record }],
+      publicResource(record),
+      workspaceRoot === undefined
+        ? undefined
+        : () => { void this.#assertTrustedProjectTarget(input.backendId, input.targetId, workspaceRoot); }
+    );
   }
 
-  /**
-   * Discover conventional project-local Pi resources only after an owner has
-   * trusted the durable Target and explicitly requested a scan. Discovery is
-   * inert: no returned path is installed, enabled, or reported as loaded.
-   */
-  async discoverProjectResources(input: DiscoverProjectResourcesInput): Promise<readonly PiResourceDescriptor[]> {
+  /** Register a typed package intent without touching network or executing package code. */
+  async discoverPackage(input: DiscoverPiPackageInput): Promise<PiResourceDescriptor> {
+    return this.#completePreparedStandalone(await this.prepareDiscoverPackage(input));
+  }
+
+  /** Discover adapter-native project resources after explicit Target trust. */
+  async prepareDiscoverProjectResources(
+    input: DiscoverProjectResourcesInput
+  ): Promise<PreparedPiResourceMutation<readonly PiResourceDescriptor[]>> {
     this.#assertInitialized();
     const backendId = nonBlank(input.backendId, "Backend ID");
     const targetId = nonBlank(input.targetId, "Target ID");
-    const target = this.#store.getTarget(targetId).descriptor;
-    if (target.backendId !== backendId) throw new Error("Target does not belong to the requested Backend.");
-    if (!target.trusted) throw new Error("Project resources can only be discovered after the Target is trusted.");
-    const workspaceRoot = await canonicalDirectory(target.workspaceRoot, "Project resource workspace");
-    const candidates = await discoverCanonicalProjectCandidates(workspaceRoot, this.#maximumFiles);
+    const kinds = projectResourceKindSet(input.kinds);
+    const target = this.#store.getTarget(targetId);
+    assertTargetNotDeleted(target.metadata);
+    if (target.descriptor.backendId !== backendId) throw new Error("Target does not belong to the requested Backend.");
+    if (!target.descriptor.trusted) throw new Error("Project resources can only be discovered after the Target is trusted.");
+    const workspaceRoot = await canonicalDirectory(target.descriptor.workspaceRoot, "Project resource workspace");
+    const adapterKind = this.#store.getBackend(backendId).descriptor.adapterKind;
+    const candidates = await discoverCanonicalProjectCandidates(workspaceRoot, this.#maximumFiles, kinds, adapterKind);
 
-    // Inspect every candidate before committing any catalog mutation. An
-    // unsafe symlink/special file therefore fails the whole scan closed.
-    await Promise.all(candidates.map((candidate) => inspectResource(candidate.sourcePath, this.#maximumFiles, this.#maximumBytes)));
-    const discovered: PiResourceDescriptor[] = [];
-    for (const candidate of candidates) {
-      discovered.push(await this.discover({
+    // Inspect and classify every candidate before creating the batch. An
+    // unsafe or incompatible candidate therefore prevents every catalog write.
+    const runtimeVersion = this.#runtimeVersion(backendId);
+    const inspected = await Promise.all(candidates.map(async (candidate) => {
+      const inspection = await inspectResource(candidate.sourcePath, this.#maximumFiles, this.#maximumBytes);
+      const compatibility = await inspectPiResourceCompatibility(candidate.kind, inspection.canonicalPath, {
+        ...(runtimeVersion === undefined ? {} : { currentRuntimeVersion: runtimeVersion }),
+        contentFingerprint: inspection.revision
+      });
+      return { candidate, inspection, compatibility };
+    }));
+    // Filesystem traversal yields. Revalidate durable ownership, trust and the
+    // exact workspace root before deriving a catalog plan from those bytes.
+    this.#assertTrustedProjectTarget(backendId, targetId, workspaceRoot);
+    const plans = inspected.map(({ candidate, inspection, compatibility }) => {
+      const source = { kind: "local", path: candidate.sourcePath } as const;
+      const resourceInput: DiscoverPiResourceInput = {
         id: stableDiscoveredResourceId(backendId, targetId, candidate.kind, candidate.sourcePath),
         backendId,
         targetId,
         kind: candidate.kind,
         scope: "project",
         name: candidate.name,
-        source: { kind: "local", path: candidate.sourcePath },
+        source,
         workspaceRoot
-      }));
+      };
+      return this.#planLocalDiscovery(
+        resourceInput,
+        resourceInput.id!,
+        source,
+        inspection,
+        compatibility,
+        workspaceRoot
+      );
+    });
+    return this.#prepareMutation(
+      plans.map((plan) => plan.entry),
+      Object.freeze(plans.map((plan) => plan.value)),
+      () => { void this.#assertTrustedProjectTarget(backendId, targetId, workspaceRoot); }
+    );
+  }
+
+  async discoverProjectResources(input: DiscoverProjectResourcesInput): Promise<readonly PiResourceDescriptor[]> {
+    return this.#completePreparedStandalone(await this.prepareDiscoverProjectResources(input));
+  }
+
+  async prepareApprove(
+    resourceId: string,
+    discoveredRevision: string,
+    approvedByConnectionId: string
+  ): Promise<PreparedPiResourceMutation<PiResourceDescriptor>> {
+    this.#assertInitialized();
+    const current = this.#require(resourceId);
+    if (current.state === "removed") throw new Error("Removed resource cannot be approved.");
+    this.#assertStoredProjectTargetTrusted(current);
+    if (current.discoveredRevision !== discoveredRevision) throw new Error("Resource discovery revision is stale.");
+    const installedExtensionApproval = current.installedPath !== undefined
+      && current.requiresExtensionApproval
+      && current.extensionContentFingerprint === discoveredRevision;
+    if (installedExtensionApproval) {
+      await this.#assertInstalledSafe(current);
+    } else if (current.source.kind === "local") {
+      if (current.canonicalPath === undefined) throw new Error("Local resource is missing its canonical source path.");
+      const inspection = await inspectResource(current.canonicalPath, this.#maximumFiles, this.#maximumBytes);
+      if (current.workspaceRoot !== undefined) assertWithin(current.workspaceRoot, inspection.canonicalPath, "Project resource");
+      if (inspection.revision !== discoveredRevision || !samePath(inspection.canonicalPath, current.canonicalPath)) {
+        throw new Error("Resource changed after discovery and must be discovered again.");
+      }
+    } else if (current.kind !== "package" || piPackageSourceApprovalRevision(current.source) !== discoveredRevision) {
+      throw new Error("Package acquisition source changed after discovery and must be discovered again.");
     }
-    return discovered;
+    const approvesExtensionContent = current.extensionContentFingerprint === discoveredRevision;
+    const nextRequiresExtensionApproval = current.requiresExtensionApproval && !approvesExtensionContent;
+    const updated: StoredResource = {
+      ...current,
+      state: current.installedPath === undefined ? "approved" : "installed",
+      enabled: false,
+      requiresExtensionApproval: nextRequiresExtensionApproval,
+      postMutationNotice: shouldShowPiPackageNotice(inspectionFromRecord(current), nextRequiresExtensionApproval),
+      ...(approvesExtensionContent ? { extensionApprovedRevision: discoveredRevision } : {}),
+      approvedAt: this.#now(),
+      approvedByConnectionId: nonBlank(approvedByConnectionId, "Approving connection ID"),
+      versionNumber: (BigInt(current.versionNumber) + 1n).toString(10),
+      updatedAt: this.#now()
+    };
+    return this.#prepareMutation(
+      [{ id: resourceId, expected: current, next: updated }],
+      publicResource(updated),
+      current.scope === "project" ? () => this.#assertStoredProjectTargetTrusted(current) : undefined
+    );
   }
 
   async approve(resourceId: string, discoveredRevision: string, approvedByConnectionId: string): Promise<PiResourceDescriptor> {
+    return this.#completePreparedStandalone(await this.prepareApprove(resourceId, discoveredRevision, approvedByConnectionId));
+  }
+
+  async prepareInstall(resourceId: string): Promise<PreparedPiResourceMutation<PiResourceDescriptor>> {
     this.#assertInitialized();
-    return this.#mutate(async () => {
-      const current = this.#require(resourceId);
-      if (current.state === "removed") throw new Error("Removed resource cannot be approved.");
-      this.#assertStoredProjectTargetTrusted(current);
-      if (current.discoveredRevision !== discoveredRevision) throw new Error("Resource discovery revision is stale.");
-      const installedExtensionApproval = current.installedPath !== undefined
-        && current.requiresExtensionApproval
-        && current.extensionContentFingerprint === discoveredRevision;
-      if (installedExtensionApproval) {
-        await this.#assertInstalledSafe(current);
-      } else if (current.source.kind === "local") {
-        if (current.canonicalPath === undefined) throw new Error("Local resource is missing its canonical source path.");
-        const inspection = await inspectResource(current.canonicalPath, this.#maximumFiles, this.#maximumBytes);
-        if (current.workspaceRoot !== undefined) assertWithin(current.workspaceRoot, inspection.canonicalPath, "Project resource");
-        if (inspection.revision !== discoveredRevision || !samePath(inspection.canonicalPath, current.canonicalPath)) {
-          throw new Error("Resource changed after discovery and must be discovered again.");
-        }
-      } else if (current.kind !== "package" || piPackageSourceApprovalRevision(current.source) !== discoveredRevision) {
-        throw new Error("Package acquisition source changed after discovery and must be discovered again.");
-      }
-      const approvesExtensionContent = current.extensionContentFingerprint === discoveredRevision;
-      const nextRequiresExtensionApproval = current.requiresExtensionApproval && !approvesExtensionContent;
-      const updated: StoredResource = {
-        ...current,
-        state: current.installedPath === undefined ? "approved" : "installed",
-        enabled: false,
-        requiresExtensionApproval: nextRequiresExtensionApproval,
-        postMutationNotice: shouldShowPiPackageNotice(inspectionFromRecord(current), nextRequiresExtensionApproval),
-        ...(approvesExtensionContent ? { extensionApprovedRevision: discoveredRevision } : {}),
-        approvedAt: this.#now(),
-        approvedByConnectionId: nonBlank(approvedByConnectionId, "Approving connection ID"),
-        versionNumber: (BigInt(current.versionNumber) + 1n).toString(10),
-        updatedAt: this.#now()
-      };
-      this.#records.set(resourceId, updated);
-      this.#persistWithRollback(resourceId, current);
-      return publicResource(updated);
-    });
+    const current = this.#require(resourceId);
+    return this.#prepareInstalledMutation(current, current);
   }
 
   async install(resourceId: string): Promise<PiResourceDescriptor> {
+    return this.#completePreparedStandalone(await this.prepareInstall(resourceId));
+  }
+
+  async prepareUpdate(
+    resourceId: string,
+    input: UpdatePiResourceInput
+  ): Promise<PreparedPiResourceMutation<PiResourceDescriptor>> {
     this.#assertInitialized();
-    return this.#mutate(() => this.#installLocked(resourceId));
+    const current = this.#require(resourceId);
+    if (!(current.state === "installed" || current.state === "loaded" || current.state === "disabled" || current.state === "update_available")) {
+      throw new Error("Only an installed resource can be updated.");
+    }
+    this.#assertStoredProjectTargetTrusted(current);
+    if (input.source !== undefined && input.requestedVersion !== undefined) throw new Error("Typed resource acquisition and requested_version cannot both be set.");
+    if (input.source !== undefined && input.source.kind !== "local" && current.kind !== "package") {
+      throw new Error("Non-package resources require a local acquisition source.");
+    }
+    const pendingUpdate = input.source === undefined && input.requestedVersion === undefined
+      ? current.pendingUpdate
+      : undefined;
+    const requestedSource = input.source !== undefined
+      ? normalizePiPackageSource(input.source)
+      : input.requestedVersion !== undefined
+        ? piPackageSourceWithVersion(current.source, input.requestedVersion)
+        : pendingUpdate?.source ?? current.source;
+    let inspection: ResourceInspection | undefined;
+    if (requestedSource.kind === "local") {
+      inspection = await inspectResource(requestedSource.path, this.#maximumFiles, this.#maximumBytes);
+      if (current.workspaceRoot !== undefined) assertWithin(current.workspaceRoot, inspection.canonicalPath, "Project resource");
+    }
+    const requestedIdentity = current.kind === "package"
+      ? piPackageSourceIdentity(requestedSource)
+      : `${current.kind}:${pathIdentity(inspection!.canonicalPath)}`;
+    if (requestedIdentity !== current.sourceIdentity) {
+      throw new Error("Resource update cannot change resource identity; add it as a new resource.");
+    }
+    const requestedRevision = inspection?.revision ?? piPackageSourceApprovalRevision(requestedSource);
+    if (pendingUpdate !== undefined && requestedRevision !== pendingUpdate.discoveredRevision) {
+      throw new Error("Resource changed after update discovery and must be discovered again.");
+    }
+    const compatibility = inspection === undefined
+      ? undefined
+      : await inspectPiResourceCompatibility(current.kind, inspection.canonicalPath, {
+          ...(this.#runtimeVersion(current.backendId) === undefined
+            ? {}
+            : { currentRuntimeVersion: this.#runtimeVersion(current.backendId)! }),
+          contentFingerprint: inspection.revision
+        });
+    const {
+      canonicalPath: _canonicalPath,
+      extensionApprovedRevision: _extensionApprovedRevision,
+      pendingUpdate: _pendingUpdate,
+      error: _error,
+      ...currentBase
+    } = current;
+    const sourceDisplay = piPackageSourceDisplay(requestedSource);
+    const approved: StoredResource = {
+      ...currentBase,
+      name: pendingUpdate?.name ?? current.name,
+      source: requestedSource,
+      sourceKind: requestedSource.kind,
+      sourceDisplay,
+      canonicalPathFingerprint: inspection === undefined
+        ? `sha256:${createHash("sha256").update(current.sourceIdentity).digest("hex")}`
+        : pathFingerprint(inspection.canonicalPath),
+      discoveredRevision: requestedRevision,
+      ...(compatibility === undefined
+        ? emptyCompatibilityFields()
+        : compatibilityFields(compatibility, false)),
+      ...(compatibility?.extensionContentFingerprint === undefined
+        ? {}
+        : { extensionApprovedRevision: compatibility.extensionContentFingerprint }),
+      ...(requestedSource.kind === "local" ? { canonicalPath: inspection!.canonicalPath } : {}),
+      ...(pendingUpdate?.version === undefined ? {} : { version: pendingUpdate.version }),
+      ...(input.requestedVersion === undefined ? {} : { version: nonBlank(input.requestedVersion, "Requested resource version") }),
+      state: "approved",
+      enabled: false,
+      approvedAt: this.#now(),
+      approvedByConnectionId: nonBlank(input.approvedByConnectionId, "Approving connection ID"),
+      versionNumber: (BigInt(current.versionNumber) + 1n).toString(10),
+      updatedAt: this.#now()
+    };
+    if (isDirectProjectResource(approved)) {
+      return this.#prepareMutation(
+        [{ id: resourceId, expected: current, next: approved }],
+        publicResource(approved),
+        () => this.#assertStoredProjectTargetTrusted(current)
+      );
+    }
+    return this.#prepareInstalledMutation(current, approved);
   }
 
   async update(resourceId: string, input: UpdatePiResourceInput): Promise<PiResourceDescriptor> {
+    return this.#completePreparedStandalone(await this.prepareUpdate(resourceId, input));
+  }
+
+  async prepareSetEnabled(resourceId: string, enabled: boolean): Promise<PreparedPiResourceMutation<PiResourceDescriptor>> {
     this.#assertInitialized();
-    return this.#mutate(async () => {
-      const current = this.#require(resourceId);
-      if (!(current.state === "installed" || current.state === "loaded" || current.state === "disabled" || current.state === "update_available")) {
-        throw new Error("Only an installed resource can be updated.");
-      }
+    const current = this.#require(resourceId);
+    // A redundant disable is an exact no-op. In particular, it must not turn
+    // an unapproved or removed project resource into the otherwise valid
+    // `disabled` state and thereby create an approval bypass on re-enable.
+    if (!enabled && !current.enabled) {
+      return this.#prepareMutation(
+        [{ id: resourceId, expected: current, next: current }],
+        publicResource(current)
+      );
+    }
+    if (enabled) {
       this.#assertStoredProjectTargetTrusted(current);
-      if (input.source !== undefined && input.requestedVersion !== undefined) throw new Error("Typed resource acquisition and requested_version cannot both be set.");
-      if (input.source !== undefined && input.source.kind !== "local" && current.kind !== "package") {
-        throw new Error("Non-package resources require a local acquisition source.");
+      if (!current.canToggle) throw new Error("Resource has no headless-compatible runtime content to enable.");
+      if (
+        current.requiresExtensionApproval ||
+        current.extensionContentFingerprint !== undefined && current.extensionApprovedRevision !== current.extensionContentFingerprint
+      ) {
+        throw new Error("Extension content must be approved at its current fingerprint before it can be enabled.");
       }
-      const requestedSource = input.source !== undefined
-        ? normalizePiPackageSource(input.source)
-        : piPackageSourceWithVersion(current.source, input.requestedVersion);
-      let inspection: ResourceInspection | undefined;
-      if (requestedSource.kind === "local") {
-        inspection = await inspectResource(requestedSource.path, this.#maximumFiles, this.#maximumBytes);
-        if (current.workspaceRoot !== undefined) assertWithin(current.workspaceRoot, inspection.canonicalPath, "Project resource");
+      if (isDirectProjectResource(current)) {
+        if (!(current.state === "approved" || current.state === "disabled" || current.state === "loaded")) throw new Error("Project resource is not approved.");
+        await this.#assertSourceUnchanged(current);
+      } else {
+        if (current.installedPath === undefined || !(current.state === "installed" || current.state === "disabled" || current.state === "loaded")) {
+          throw new Error("Managed resource is not installed.");
+        }
+        await this.#assertInstalledSafe(current);
       }
-      const requestedIdentity = current.kind === "package"
-        ? piPackageSourceIdentity(requestedSource)
-        : `${current.kind}:${pathIdentity(inspection!.canonicalPath)}`;
-      if (requestedIdentity !== current.sourceIdentity) {
-        throw new Error("Resource update cannot change package identity; add it as a new resource.");
-      }
-      const compatibility = inspection === undefined
-        ? undefined
-        : await inspectPiResourceCompatibility(current.kind, inspection.canonicalPath, {
-            ...(this.#runtimeVersion(current.backendId) === undefined
-              ? {}
-              : { currentRuntimeVersion: this.#runtimeVersion(current.backendId)! }),
-            contentFingerprint: inspection.revision
-          });
-      const {
-        canonicalPath: _canonicalPath,
-        extensionApprovedRevision: _extensionApprovedRevision,
-        error: _error,
-        ...currentBase
-      } = current;
-      const sourceDisplay = piPackageSourceDisplay(requestedSource);
-      const approved: StoredResource = {
-        ...currentBase,
-        source: requestedSource,
-        sourceKind: requestedSource.kind,
-        sourceDisplay,
-        canonicalPathFingerprint: inspection === undefined
-          ? `sha256:${createHash("sha256").update(current.sourceIdentity).digest("hex")}`
-          : pathFingerprint(inspection.canonicalPath),
-        discoveredRevision: inspection?.revision ?? piPackageSourceApprovalRevision(requestedSource),
-        ...(compatibility === undefined
-          ? emptyCompatibilityFields()
-          : compatibilityFields(compatibility, false)),
-        ...(compatibility?.extensionContentFingerprint === undefined
-          ? {}
-          : { extensionApprovedRevision: compatibility.extensionContentFingerprint }),
-        ...(requestedSource.kind === "local" ? { canonicalPath: inspection!.canonicalPath } : {}),
-        ...(input.requestedVersion === undefined ? {} : { version: nonBlank(input.requestedVersion, "Requested resource version") }),
-        state: "approved",
-        enabled: false,
-        approvedAt: this.#now(),
-        approvedByConnectionId: nonBlank(input.approvedByConnectionId, "Approving connection ID"),
-        versionNumber: (BigInt(current.versionNumber) + 1n).toString(10),
-        updatedAt: this.#now()
-      };
-      this.#records.set(resourceId, approved);
-      this.#persistWithRollback(resourceId, current);
-      if (isDirectProjectResource(approved)) return publicResource(approved);
-      return this.#installLocked(resourceId);
-    });
+    }
+    const updated: StoredResource = {
+      ...current,
+      enabled,
+      state: enabled ? (current.state === "loaded" ? "loaded" : isDirectProjectResource(current) ? "approved" : "installed") : "disabled",
+      versionNumber: (BigInt(current.versionNumber) + 1n).toString(10),
+      updatedAt: this.#now()
+    };
+    return this.#prepareMutation(
+      [{ id: resourceId, expected: current, next: updated }],
+      publicResource(updated),
+      enabled && current.scope === "project" ? () => this.#assertStoredProjectTargetTrusted(current) : undefined
+    );
   }
 
   async setEnabled(resourceId: string, enabled: boolean): Promise<PiResourceDescriptor> {
-    this.#assertInitialized();
-    return this.#mutate(async () => {
-      const current = this.#require(resourceId);
-      if (enabled) {
-        this.#assertStoredProjectTargetTrusted(current);
-        if (!current.canToggle) throw new Error("Resource has no headless-compatible runtime content to enable.");
-        if (
-          current.requiresExtensionApproval ||
-          current.extensionContentFingerprint !== undefined && current.extensionApprovedRevision !== current.extensionContentFingerprint
-        ) {
-          throw new Error("Extension content must be approved at its current fingerprint before it can be enabled.");
-        }
-        if (isDirectProjectResource(current)) {
-          if (!(current.state === "approved" || current.state === "disabled" || current.state === "loaded")) throw new Error("Project resource is not approved.");
-          await this.#assertSourceUnchanged(current);
-        } else {
-          if (current.installedPath === undefined || !(current.state === "installed" || current.state === "disabled" || current.state === "loaded")) {
-            throw new Error("Managed resource is not installed.");
-          }
-          await this.#assertInstalledSafe(current);
-        }
-      }
-      const updated: StoredResource = {
-        ...current,
-        enabled,
-        state: enabled ? (current.state === "loaded" ? "loaded" : isDirectProjectResource(current) ? "approved" : "installed") : "disabled",
-        versionNumber: (BigInt(current.versionNumber) + 1n).toString(10),
-        updatedAt: this.#now()
-      };
-      this.#records.set(resourceId, updated);
-      this.#persistWithRollback(resourceId, current);
-      return publicResource(updated);
-    });
+    return this.#completePreparedStandalone(await this.prepareSetEnabled(resourceId, enabled));
   }
 
   /** Only an adapter/runtime observation of this exact content revision may promote installed to loaded. */
@@ -638,32 +827,42 @@ export class PiResourceManager {
     });
   }
 
-  async remove(resourceId: string): Promise<PiResourceDescriptor> {
+  async prepareRemove(resourceId: string): Promise<PreparedPiResourceMutation<PiResourceDescriptor>> {
     this.#assertInitialized();
-    return this.#mutate(async () => {
-      const current = this.#require(resourceId);
-      if (current.installedPath !== undefined) {
-        assertExpectedInstalledLocation(this.#managedRoot, current);
-        await assertContainedPath(this.#managedRoot, current.installedPath, "Installed resource");
-        const container = installedContainer(current.installedPath);
-        await assertContainedPath(this.#managedRoot, container, "Installed resource container");
-        const trash = join(this.#managedRoot, ".trash", `${safeId(current.id)}-${randomUUID()}`);
-        if (await exists(container)) {
-          await rename(container, trash);
-          await rm(trash, { recursive: true, force: true });
-        }
+    const current = this.#require(resourceId);
+    if (current.state === "removed" && current.installedPath === undefined && current.pendingUpdate === undefined) {
+      return this.#prepareMutation(
+        [{ id: resourceId, expected: current, next: current }],
+        publicResource(current)
+      );
+    }
+    if (current.installedPath !== undefined) {
+      assertExpectedInstalledLocation(this.#managedRoot, current);
+      await assertContainedPathIfPresent(this.#managedRoot, current.installedPath, "Installed resource");
+    }
+    const { pendingUpdate: _pendingUpdate, ...withoutPendingUpdate } = omitInstalledPath(current);
+    const updated: StoredResource = {
+      ...withoutPendingUpdate,
+      state: "removed",
+      enabled: false,
+      versionNumber: (BigInt(current.versionNumber) + 1n).toString(10),
+      updatedAt: this.#now()
+    };
+    return this.#prepareMutation(
+      [{ id: resourceId, expected: current, next: updated }],
+      publicResource(updated),
+      undefined,
+      {
+        rollback: async () => undefined,
+        ...(current.installedPath === undefined
+          ? {}
+          : { cleanupAfterCommit: () => this.#removeResourceOwner(current) })
       }
-      const updated: StoredResource = {
-        ...omitInstalledPath(current),
-        state: "removed",
-        enabled: false,
-        versionNumber: (BigInt(current.versionNumber) + 1n).toString(10),
-        updatedAt: this.#now()
-      };
-      this.#records.set(resourceId, updated);
-      this.#persistWithRollback(resourceId, current);
-      return publicResource(updated);
-    });
+    );
+  }
+
+  async remove(resourceId: string): Promise<PiResourceDescriptor> {
+    return this.#completePreparedStandalone(await this.prepareRemove(resourceId));
   }
 
   /** Callback passed directly to PiAdapterOptions.approveProjectSkill. */
@@ -674,6 +873,7 @@ export class PiResourceManager {
     for (const record of this.#records.values()) {
       try { this.#assertStoredProjectTargetTrusted(record); } catch { continue; }
       if (
+        this.#backendSupportsResourceKind(record.backendId, record.kind) &&
         record.kind === "skill" &&
         record.scope === "project" &&
         record.source.kind === "local" &&
@@ -698,6 +898,117 @@ export class PiResourceManager {
     return this.#runtimeSnapshot(backendId, targetId, true);
   }
 
+  /**
+   * Capture approved prompt/skill text for one exact Backend Target without
+   * exposing its service-owned source path. The read shares the mutation tail,
+   * so every returned seed belongs to one coherent catalog incarnation.
+   */
+  async runtimeTextSnapshot(
+    backendId: string,
+    targetId: string,
+    signal: AbortSignal
+  ): Promise<readonly RuntimeTextResourceSeed[]> {
+    this.#assertInitialized();
+    const expectedBackendId = nonBlank(backendId, "Backend ID");
+    const expectedTargetId = nonBlank(targetId, "Target ID");
+    signal.throwIfAborted();
+    const snapshot = this.#mutate(async () => {
+      signal.throwIfAborted();
+      this.#assertTargetOwner(expectedBackendId, expectedTargetId);
+      const records = [...this.#records.values()]
+        .filter((record) => record.backendId === expectedBackendId)
+        .filter((record) => record.targetId === undefined || record.targetId === expectedTargetId)
+        .filter((record): record is StoredResource & { readonly kind: "skill" | "prompt" } =>
+          record.kind === "skill" || record.kind === "prompt")
+        .filter((record) => this.#backendSupportsResourceKind(record.backendId, record.kind))
+        .filter((record) => record.enabled && runtimeTextState(record.state))
+        .sort((left, right) => left.name.localeCompare(right.name, "en") || left.id.localeCompare(right.id, "en"));
+      const seeds: RuntimeTextResourceSeed[] = [];
+      let totalTextBytes = 0;
+      for (const record of records) {
+        signal.throwIfAborted();
+        this.#assertStoredProjectTargetTrusted(record);
+        const root = await this.#runtimeTextRoot(record, signal);
+        const before = await inspectResource(root, this.#maximumFiles, this.#maximumBytes, signal);
+        assertApprovedRuntimeTextInspection(record, root, before);
+        const content = await readRuntimeTextContent(
+          root,
+          record.kind,
+          Math.min(this.#maximumBytes, MAXIMUM_RUNTIME_TEXT_RESOURCE_BYTES),
+          signal
+        );
+        totalTextBytes += Buffer.byteLength(content, "utf8");
+        if (totalTextBytes > this.#maximumBytes) {
+          throw new Error("Runtime text resource snapshot exceeds the configured byte limit.");
+        }
+        const after = await inspectResource(root, this.#maximumFiles, this.#maximumBytes, signal);
+        assertApprovedRuntimeTextInspection(record, root, after);
+        if (before.revision !== after.revision || !samePath(before.canonicalPath, after.canonicalPath)) {
+          throw new Error("Runtime text resource changed while its content was read.");
+        }
+        const authority = {
+          id: record.id,
+          backendId: record.backendId,
+          targetId: record.targetId,
+          scope: record.scope,
+          kind: record.kind,
+          state: record.state,
+          revision: record.discoveredRevision,
+          versionNumber: record.versionNumber,
+          version: record.version,
+          sourceIdentity: record.sourceIdentity,
+          approvedAt: record.approvedAt,
+          approvedByConnectionId: record.approvedByConnectionId
+        } as const;
+        const assertCurrent = (): void => {
+          this.#assertTargetOwner(expectedBackendId, expectedTargetId);
+          const current = this.#records.get(authority.id);
+          // A live runtime observation advances only the durable presentation
+          // state from approved/installed to loaded. Accept that single exact
+          // transition; every disable, re-enable, update, or replacement
+          // advances the entity again and therefore revokes this seed.
+          const sameRuntimeIncarnation = current !== undefined && (
+            (current.state === authority.state && current.versionNumber === authority.versionNumber)
+            || (
+              current.state === "loaded"
+              && (authority.state === "approved" || authority.state === "installed")
+              && BigInt(current.versionNumber) === BigInt(authority.versionNumber) + 1n
+            )
+          );
+          if (
+            current === undefined || !current.enabled
+            || !this.#backendSupportsResourceKind(current.backendId, current.kind)
+            || current.backendId !== authority.backendId
+            || current.targetId !== authority.targetId
+            || current.scope !== authority.scope
+            || current.kind !== authority.kind
+            || !sameRuntimeIncarnation
+            || current.discoveredRevision !== authority.revision
+            || current.version !== authority.version
+            || current.sourceIdentity !== authority.sourceIdentity
+            || current.approvedAt !== authority.approvedAt
+            || current.approvedByConnectionId !== authority.approvedByConnectionId
+          ) throw new Error("Runtime text resource authority is no longer current.");
+          this.#assertStoredProjectTargetTrusted(current);
+        };
+        assertCurrent();
+        seeds.push(Object.freeze({
+          id: authority.id,
+          kind: authority.kind,
+          name: record.name,
+          revision: authority.revision,
+          resourceVersion: BigInt(authority.versionNumber),
+          ...(authority.version === undefined ? {} : { version: authority.version }),
+          content,
+          assertCurrent
+        }));
+      }
+      signal.throwIfAborted();
+      return Object.freeze(seeds);
+    });
+    return waitForCaller(snapshot, signal);
+  }
+
   async #runtimeSnapshot(backendId: string, targetId: string | undefined, targetOnly: boolean): Promise<PiRuntimeResourceSnapshot> {
     this.#assertInitialized();
     const paths: Record<PiResourceKind, string[]> = { extension: [], skill: [], prompt: [], theme: [], package: [] };
@@ -705,6 +1016,7 @@ export class PiResourceManager {
     for (const record of this.#records.values()) {
       if (record.backendId !== backendId || !record.enabled || record.state === "removed" || record.state === "error") continue;
       if (record.kind === "theme") continue;
+      if (!this.#backendSupportsResourceKind(record.backendId, record.kind)) continue;
       if (targetOnly ? record.targetId !== targetId : record.targetId !== undefined && targetId !== record.targetId) continue;
       let path: string;
       if (isDirectProjectResource(record)) {
@@ -743,54 +1055,172 @@ export class PiResourceManager {
     };
   }
 
-  async #installLocked(resourceId: string): Promise<PiResourceDescriptor> {
-    const current = this.#require(resourceId);
-    if (isDirectProjectResource(current)) throw new Error("Project-local resources are snapshotted by the Pi adapter and are not installed globally.");
-    if (current.state !== "approved") throw new Error("Resource must be approved before installation.");
-    if (current.approvedAt === undefined || current.approvedByConnectionId === undefined) {
+  async #recoverOrphanedFilesystemState(): Promise<boolean> {
+    await this.#clearWorkingDirectory(join(this.#managedRoot, ".staging"));
+    let changed = false;
+    for (const [id, stored] of this.#records) {
+      let record = stored;
+      if (record.installedPath !== undefined) {
+        assertExpectedInstalledLocation(this.#managedRoot, record);
+        if (!await assertContainedPathIfPresent(this.#managedRoot, record.installedPath, "Stored installed resource")) {
+          record = this.#fenceMissingInstalledPayload(record);
+          if (record !== stored) {
+            this.#records.set(id, record);
+            changed = true;
+          }
+        }
+      }
+      await this.#recoverResourceOwner(record);
+    }
+    return changed;
+  }
+
+  #fenceMissingInstalledPayload(record: StoredResource): StoredResource {
+    if (record.state === "error" && !record.enabled && record.error === MISSING_INSTALLED_RESOURCE_ERROR) return record;
+    return {
+      ...record,
+      state: "error",
+      enabled: false,
+      error: MISSING_INSTALLED_RESOURCE_ERROR,
+      versionNumber: (BigInt(record.versionNumber) + 1n).toString(10),
+      updatedAt: this.#now()
+    };
+  }
+
+  async #clearWorkingDirectory(directory: string): Promise<void> {
+    await assertContainedRegularDirectory(this.#managedRoot, directory, "Managed resource working directory");
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      validateEntryName(entry.name);
+      await removeOwnedPath(this.#managedRoot, join(directory, entry.name), "Managed resource working entry");
+    }
+  }
+
+  async #recoverResourceOwner(record: StoredResource): Promise<void> {
+    const owner = resourceOwnerPath(this.#managedRoot, record);
+    const ownerInfo = await optionalLstat(owner);
+    if (ownerInfo === undefined) return;
+    if (!ownerInfo.isDirectory() || ownerInfo.isSymbolicLink()) {
+      throw new Error("Managed resource owner must be a regular directory.");
+    }
+    await assertContainedRegularDirectory(this.#managedRoot, owner, "Managed resource owner directory");
+    const referencedGeneration = record.installedPath === undefined
+      ? undefined
+      : installedGenerationContainer(this.#managedRoot, record);
+    for (const entry of await readdir(owner, { withFileTypes: true })) {
+      validateEntryName(entry.name);
+      const path = join(owner, entry.name);
+      if (entry.name === RESOURCE_GENERATIONS_DIRECTORY) {
+        if (!entry.isDirectory() || entry.isSymbolicLink()) {
+          throw new Error("Managed resource generations must be a regular directory.");
+        }
+        await assertContainedRegularDirectory(this.#managedRoot, path, "Managed resource generations directory");
+        for (const generationEntry of await readdir(path, { withFileTypes: true })) {
+          validateEntryName(generationEntry.name);
+          if (!RESOURCE_GENERATION_PATTERN.test(generationEntry.name) || !generationEntry.isDirectory() || generationEntry.isSymbolicLink()) {
+            throw new Error("Managed resource generation entry is malformed.");
+          }
+          const generationPath = join(path, generationEntry.name);
+          if (referencedGeneration === undefined || !samePath(generationPath, referencedGeneration)) {
+            await removeOwnedPath(this.#managedRoot, generationPath, "Orphaned resource generation");
+          }
+        }
+      } else {
+        throw new Error("Managed resource owner contains an unsupported current-v1 entry.");
+      }
+    }
+    await this.#pruneResourceOwner(record);
+  }
+
+  async #removeCandidateGeneration(record: StoredResource, candidateContainer: string): Promise<void> {
+    const generations = join(resourceOwnerPath(this.#managedRoot, record), RESOURCE_GENERATIONS_DIRECTORY);
+    if (
+      !samePath(dirname(candidateContainer), generations)
+      || !RESOURCE_GENERATION_PATTERN.test(basename(candidateContainer))
+    ) throw new Error("Prepared resource candidate does not match its managed ownership boundary.");
+    await removeOwnedPath(this.#managedRoot, candidateContainer, "Prepared resource candidate");
+    await this.#pruneResourceOwner(record);
+  }
+
+  async #removeInstalledIncarnation(record: StoredResource): Promise<void> {
+    assertExpectedInstalledLocation(this.#managedRoot, record);
+    const generation = installedGenerationContainer(this.#managedRoot, record);
+    await removeOwnedPath(
+      this.#managedRoot,
+      generation,
+      "Retired installed resource"
+    );
+    await this.#pruneResourceOwner(record);
+  }
+
+  async #removeResourceOwner(record: StoredResource): Promise<void> {
+    const owner = resourceOwnerPath(this.#managedRoot, record);
+    await removeOwnedPath(this.#managedRoot, owner, "Removed resource owner");
+  }
+
+  async #pruneResourceOwner(record: StoredResource): Promise<void> {
+    const owner = resourceOwnerPath(this.#managedRoot, record);
+    const generations = join(owner, RESOURCE_GENERATIONS_DIRECTORY);
+    if (await directoryIsEmpty(generations)) {
+      await removeOwnedPath(this.#managedRoot, generations, "Empty resource generations directory");
+    }
+    if (await directoryIsEmpty(owner)) {
+      await removeOwnedPath(this.#managedRoot, owner, "Empty resource owner directory");
+    }
+  }
+
+  async #prepareInstalledMutation(
+    expected: StoredResource,
+    approved: StoredResource
+  ): Promise<PreparedPiResourceMutation<PiResourceDescriptor>> {
+    if (isDirectProjectResource(approved)) throw new Error("Project-local resources are snapshotted by the Pi adapter and are not installed globally.");
+    if (approved.state !== "approved") throw new Error("Resource must be approved before installation.");
+    if (approved.approvedAt === undefined || approved.approvedByConnectionId === undefined) {
       throw new Error("Resource installation requires an explicit owner approval.");
     }
-    this.#assertStoredProjectTargetTrusted(current);
-    if (current.source.kind === "local") await this.#assertSourceUnchanged(current);
-    else if (current.kind !== "package" || current.discoveredRevision !== piPackageSourceApprovalRevision(current.source)) {
+    this.#assertStoredProjectTargetTrusted(approved);
+    if (approved.source.kind === "local") await this.#assertSourceUnchanged(approved);
+    else if (approved.kind !== "package" || approved.discoveredRevision !== piPackageSourceApprovalRevision(approved.source)) {
       throw new Error("Package acquisition approval is stale.");
     }
-    const group = join(this.#managedRoot, groupFor(current.kind));
-    const containerName = safeId(current.id);
-    const finalContainer = join(group, containerName);
-    const stage = join(this.#managedRoot, ".staging", `${containerName}-${randomUUID()}`);
-    const backup = join(this.#managedRoot, ".trash", `${containerName}-${randomUUID()}`);
+    if (expected.installedPath !== undefined) {
+      assertExpectedInstalledLocation(this.#managedRoot, expected);
+      await assertContainedPath(this.#managedRoot, expected.installedPath, "Existing installed resource");
+    }
+    const owner = resourceOwnerPath(this.#managedRoot, approved);
+    await mkdir(owner, { recursive: true, mode: 0o700 });
+    await assertContainedRegularDirectory(this.#managedRoot, owner, "Managed resource owner directory");
+    const generations = join(owner, RESOURCE_GENERATIONS_DIRECTORY);
+    await mkdir(generations, { recursive: true, mode: 0o700 });
+    await assertContainedRegularDirectory(this.#managedRoot, generations, "Managed resource generations directory");
+    const generation = randomUUID();
+    const candidateContainer = join(generations, generation);
+    const stage = join(this.#managedRoot, ".staging", `resource-${generation}`);
     await mkdir(stage, { recursive: false, mode: 0o700 });
     const acquisitionRoot = join(stage, ".acquisition");
     let acquiredVersion: string | undefined;
-    let sourceRoot: string;
-    let sourceInspection: ResourceInspection;
+    let candidatePublished = false;
     try {
-      if (current.source.kind === "local") {
-        if (current.canonicalPath === undefined) throw new Error("Local resource is missing its canonical source path.");
-        sourceRoot = current.canonicalPath;
+      let sourceRoot: string;
+      let sourceInspection: ResourceInspection;
+      if (approved.source.kind === "local") {
+        if (approved.canonicalPath === undefined) throw new Error("Local resource is missing its canonical source path.");
+        sourceRoot = approved.canonicalPath;
         sourceInspection = await inspectResource(sourceRoot, this.#maximumFiles, this.#maximumBytes);
       } else {
         const acquired = await this.#acquisition.acquire({
-          source: current.source,
+          source: approved.source,
           destinationRoot: acquisitionRoot,
-          action: current.installedPath === undefined ? "install" : "update"
+          action: expected.installedPath === undefined ? "install" : "update"
         });
         sourceRoot = normalizedAbsolute(acquired.rootPath, "Acquired package root");
         assertWithin(acquisitionRoot, sourceRoot, "Acquired package root");
         sourceInspection = await inspectResource(sourceRoot, this.#maximumFiles, this.#maximumBytes);
         acquiredVersion = acquired.version === undefined ? undefined : boundedVersion(acquired.version);
       }
-    } catch (error) {
-      await rm(stage, { recursive: true, force: true }).catch(() => undefined);
-      throw error;
-    }
-    const sourceInfo = await lstat(sourceRoot);
-    if (current.kind === "package" && !sourceInfo.isDirectory()) throw new Error("Package acquisition must produce a regular directory.");
-    const payloadName = safePayloadName(current.source.kind === "local" ? basename(sourceRoot) : current.name);
-    const stagedPayload = join(stage, payloadName);
-    let backedUp = false;
-    try {
+      const sourceInfo = await lstat(sourceRoot);
+      if (approved.kind === "package" && !sourceInfo.isDirectory()) throw new Error("Package acquisition must produce a regular directory.");
+      const payloadName = safePayloadName(approved.source.kind === "local" ? basename(sourceRoot) : approved.name);
+      const stagedPayload = join(stage, payloadName);
       if (sourceInfo.isDirectory()) {
         await mkdir(stagedPayload, { recursive: false, mode: 0o700 });
         await copyTreeFailClosed(sourceRoot, sourceRoot, stagedPayload, { files: 0, bytes: 0, maxFiles: this.#maximumFiles, maxBytes: this.#maximumBytes });
@@ -801,50 +1231,62 @@ export class PiResourceManager {
       }
       const stagedInspection = await inspectResource(stagedPayload, this.#maximumFiles, this.#maximumBytes);
       if (stagedInspection.revision !== sourceInspection.revision) throw new Error("Resource changed during staged installation.");
-      if (current.source.kind === "local") await this.#assertSourceUnchanged(current);
+      if (approved.source.kind === "local") await this.#assertSourceUnchanged(approved);
       else await rm(acquisitionRoot, { recursive: true, force: true });
-      if (await exists(finalContainer)) {
-        await assertContainedPath(this.#managedRoot, finalContainer, "Existing managed resource");
-        await rename(finalContainer, backup);
-        backedUp = true;
-      }
-      await rename(stage, finalContainer);
-      if (backedUp) await rm(backup, { recursive: true, force: true });
+      await rename(stage, candidateContainer);
+      candidatePublished = true;
+      const installedPath = join(candidateContainer, payloadName);
+      await assertContainedPath(this.#managedRoot, installedPath, "Installed resource candidate");
+      const installedInspection = await inspectResource(installedPath, this.#maximumFiles, this.#maximumBytes);
+      const installedRuntimeVersion = this.#runtimeVersion(approved.backendId);
+      const compatibility = await inspectPiResourceCompatibility(approved.kind, installedPath, {
+        ...(installedRuntimeVersion === undefined ? {} : { currentRuntimeVersion: installedRuntimeVersion }),
+        contentFingerprint: installedInspection.revision
+      });
+      const extensionApprovedRevision = compatibility.extensionContentFingerprint !== undefined
+        && approved.extensionApprovedRevision === compatibility.extensionContentFingerprint
+        ? approved.extensionApprovedRevision
+        : undefined;
+      const requiresExtensionApproval = compatibility.extensionContentFingerprint !== undefined
+        && extensionApprovedRevision === undefined;
+      const { extensionApprovedRevision: _previousExtensionApproval, ...approvedBase } = approved;
+      const preservesEnabledState = expected.installedPath !== undefined
+        && expected.enabled
+        && compatibility.canToggle
+        && !requiresExtensionApproval;
+      const preservesExplicitDisable = expected.installedPath !== undefined && expected.state === "disabled";
+      const updated: StoredResource = {
+        ...approvedBase,
+        installedPath,
+        discoveredRevision: installedInspection.revision,
+        ...compatibilityFields(compatibility, requiresExtensionApproval),
+        ...(extensionApprovedRevision === undefined ? {} : { extensionApprovedRevision }),
+        ...(acquiredVersion === undefined ? {} : { version: acquiredVersion }),
+        state: preservesExplicitDisable ? "disabled" : "installed",
+        enabled: preservesEnabledState,
+        versionNumber: (BigInt(approved.versionNumber) + 1n).toString(10),
+        updatedAt: this.#now()
+      };
+      assertExpectedInstalledLocation(this.#managedRoot, updated);
+      return this.#prepareMutation(
+        [{ id: approved.id, expected, next: updated }],
+        publicResource(updated),
+        approved.scope === "project" ? () => this.#assertStoredProjectTargetTrusted(approved) : undefined,
+        {
+          rollback: async () => {
+            await this.#removeCandidateGeneration(approved, candidateContainer);
+          },
+          ...(expected.installedPath === undefined
+            ? {}
+            : { cleanupAfterCommit: () => this.#removeInstalledIncarnation(expected) })
+        }
+      );
     } catch (error) {
       await rm(stage, { recursive: true, force: true }).catch(() => undefined);
-      if (backedUp && !(await exists(finalContainer))) await rename(backup, finalContainer).catch(() => undefined);
+      if (candidatePublished) await this.#removeCandidateGeneration(approved, candidateContainer).catch(() => undefined);
+      else await this.#pruneResourceOwner(approved).catch(() => undefined);
       throw error;
     }
-    const installedPath = join(finalContainer, payloadName);
-    await assertContainedPath(this.#managedRoot, installedPath, "Installed resource payload");
-    const installedInspection = await inspectResource(installedPath, this.#maximumFiles, this.#maximumBytes);
-    const installedRuntimeVersion = this.#runtimeVersion(current.backendId);
-    const compatibility = await inspectPiResourceCompatibility(current.kind, installedPath, {
-      ...(installedRuntimeVersion === undefined ? {} : { currentRuntimeVersion: installedRuntimeVersion }),
-      contentFingerprint: installedInspection.revision
-    });
-    const extensionApprovedRevision = compatibility.extensionContentFingerprint !== undefined
-      && current.extensionApprovedRevision === compatibility.extensionContentFingerprint
-      ? current.extensionApprovedRevision
-      : undefined;
-    const requiresExtensionApproval = compatibility.extensionContentFingerprint !== undefined
-      && extensionApprovedRevision === undefined;
-    const { extensionApprovedRevision: _previousExtensionApproval, ...currentBase } = current;
-    const updated: StoredResource = {
-      ...currentBase,
-      installedPath,
-      discoveredRevision: installedInspection.revision,
-      ...compatibilityFields(compatibility, requiresExtensionApproval),
-      ...(extensionApprovedRevision === undefined ? {} : { extensionApprovedRevision }),
-      ...(acquiredVersion === undefined ? {} : { version: acquiredVersion }),
-      state: "installed",
-      enabled: false,
-      versionNumber: (BigInt(current.versionNumber) + 1n).toString(10),
-      updatedAt: this.#now()
-    };
-    this.#records.set(resourceId, updated);
-    this.#persistWithRollback(resourceId, current);
-    return publicResource(updated);
   }
 
   async #assertSourceUnchanged(record: StoredResource): Promise<void> {
@@ -865,6 +1307,193 @@ export class PiResourceManager {
     if (inspection.revision !== record.discoveredRevision) throw new Error("Installed resource content changed and is fenced.");
   }
 
+  async #runtimeTextRoot(record: StoredResource, signal: AbortSignal): Promise<string> {
+    signal.throwIfAborted();
+    if (isDirectProjectResource(record)) {
+      const workspaceRoot = this.#assertTrustedProjectTarget(record.backendId, record.targetId, record.workspaceRoot);
+      assertWithin(workspaceRoot, record.canonicalPath, "Runtime text project resource");
+      return record.canonicalPath;
+    }
+    if (record.installedPath === undefined) {
+      throw new Error("Enabled runtime text resource has no installed payload.");
+    }
+    assertExpectedInstalledLocation(this.#managedRoot, record);
+    await assertContainedPath(this.#managedRoot, record.installedPath, "Runtime text installed resource");
+    signal.throwIfAborted();
+    return record.installedPath;
+  }
+
+  #planLocalDiscovery(
+    input: DiscoverPiResourceInput,
+    id: string,
+    source: Extract<PiPackageSource, { readonly kind: "local" }>,
+    inspection: ResourceInspection,
+    compatibility: PiPackageInspection,
+    workspaceRoot: string | undefined
+  ): { readonly entry: PreparedCatalogEntry; readonly value: PiResourceDescriptor } {
+    const previous = this.#records.get(id);
+    if (previous !== undefined && (
+      previous.backendId !== input.backendId ||
+      previous.targetId !== input.targetId ||
+      previous.kind !== input.kind ||
+      previous.scope !== input.scope ||
+      previous.canonicalPath === undefined || !samePath(previous.canonicalPath, inspection.canonicalPath)
+    )) throw new Error("Pi resource ID is already bound to a different source.");
+    const changedInstalledResource = previous?.scope !== "project" && previous?.installedPath !== undefined;
+    const requestedName = nonBlank(input.name ?? previous?.name ?? basename(inspection.canonicalPath), "Resource name");
+    const requestedVersion = input.version === undefined
+      ? previous?.version
+      : nonBlank(input.version, "Resource version");
+    if (changedInstalledResource && previous.state !== "removed") {
+      const matchesActive = previous.discoveredRevision === inspection.revision
+        && previous.name === requestedName
+        && previous.version === requestedVersion;
+      const pendingUpdate: StoredResourceUpdateIntent = {
+        source,
+        canonicalPath: inspection.canonicalPath,
+        discoveredRevision: inspection.revision,
+        name: requestedName,
+        ...(requestedVersion === undefined ? {} : { version: requestedVersion })
+      };
+      const matchesPending = previous.pendingUpdate !== undefined
+        && storedUpdateIntentIdentity(previous.pendingUpdate) === storedUpdateIntentIdentity(pendingUpdate);
+      if ((matchesActive && previous.pendingUpdate === undefined) || matchesPending) {
+        return { entry: { id, expected: previous, next: previous }, value: publicResource(previous) };
+      }
+      const { pendingUpdate: _pendingUpdate, ...active } = previous;
+      const updated: StoredResource = {
+        ...active,
+        ...(matchesActive ? {} : { pendingUpdate }),
+        updatedAt: this.#now()
+      };
+      return { entry: { id, expected: previous, next: updated }, value: publicResource(updated) };
+    }
+    if (
+      previous !== undefined &&
+      previous.state !== "removed" &&
+      previous.backendId === input.backendId &&
+      previous.targetId === input.targetId &&
+      previous.kind === input.kind &&
+      previous.scope === input.scope &&
+      previous.canonicalPath !== undefined && samePath(previous.canonicalPath, inspection.canonicalPath) &&
+      previous.discoveredRevision === inspection.revision
+    ) {
+      return { entry: { id, expected: previous, next: previous }, value: publicResource(previous) };
+    }
+    const {
+      approvedAt: _approvedAt,
+      approvedByConnectionId: _approvedBy,
+      extensionApprovedRevision: _extensionApprovedRevision,
+      pendingUpdate: _pendingUpdate,
+      error: _error,
+      ...previousBase
+    } = previous ?? {} as StoredResource;
+    const record: StoredResource = {
+      ...previousBase,
+      id,
+      backendId: nonBlank(input.backendId, "Backend ID"),
+      ...(input.targetId === undefined ? {} : { targetId: nonBlank(input.targetId, "Target ID") }),
+      kind: input.kind,
+      scope: input.scope,
+      name: requestedName,
+      ...(requestedVersion === undefined ? {} : { version: requestedVersion }),
+      sourceKind: source.kind,
+      sourceIdentity: input.kind === "package" ? piPackageSourceIdentity(source) : `${input.kind}:${pathIdentity(inspection.canonicalPath)}`,
+      sourceDisplay: basename(inspection.canonicalPath),
+      canonicalPathFingerprint: pathFingerprint(inspection.canonicalPath),
+      symbolicLinkDetected: false,
+      specialFileDetected: false,
+      discoveredRevision: inspection.revision,
+      ...compatibilityFields(compatibility, compatibility.extensionContentFingerprint !== undefined),
+      state: "awaiting_approval",
+      enabled: false,
+      versionNumber: ((previous === undefined ? 0n : BigInt(previous.versionNumber)) + 1n).toString(10),
+      updatedAt: this.#now(),
+      source,
+      canonicalPath: inspection.canonicalPath,
+      ...(workspaceRoot === undefined ? {} : { workspaceRoot })
+    };
+    return { entry: { id, expected: previous, next: record }, value: publicResource(record) };
+  }
+
+  #prepareMutation<T>(
+    entries: readonly PreparedCatalogEntry[],
+    value: T,
+    assertCurrent?: () => void,
+    filesystem?: {
+      readonly rollback: () => Promise<void>;
+      readonly cleanupAfterCommit?: () => Promise<void>;
+    }
+  ): PreparedPiResourceMutation<T> {
+    const ids = new Set<string>();
+    for (const entry of entries) {
+      if (ids.has(entry.id)) throw new Error("Prepared resource mutation contains duplicate IDs.");
+      ids.add(entry.id);
+    }
+    const prepared = Object.freeze({
+      value,
+      revokesRuntimeAuthority: entries.some(({ expected, next }) =>
+        expected !== undefined
+        && expected.scope === "project"
+        && expected.enabled
+        && runtimeTextState(expected.state)
+        && (
+          !next.enabled
+          || !runtimeTextState(next.state)
+          || next.backendId !== expected.backendId
+          || next.targetId !== expected.targetId
+          || next.kind !== expected.kind
+          || next.scope !== expected.scope
+          || next.discoveredRevision !== expected.discoveredRevision
+          || next.versionNumber !== expected.versionNumber
+          || next.sourceIdentity !== expected.sourceIdentity
+          || next.canonicalPath !== expected.canonicalPath
+        )),
+      [preparedPiResourceMutationBrand]: true as const
+    });
+    this.#preparedMutations.set(prepared, {
+      entries: [...entries],
+      value,
+      ...(assertCurrent === undefined ? {} : { assertCurrent }),
+      ...(filesystem === undefined ? {} : { rollbackFilesystem: filesystem.rollback }),
+      ...(filesystem?.cleanupAfterCommit === undefined ? {} : { cleanupAfterCommit: filesystem.cleanupAfterCommit }),
+      completed: false
+    });
+    return prepared;
+  }
+
+  #adoptPreparedMutation<T>(prepared: PreparedCatalogMutation<T>, store: OperationalStore): void {
+    prepared.assertCurrent?.();
+    for (const entry of prepared.entries) {
+      if (this.#records.get(entry.id) !== entry.expected) {
+        throw new Error(`Prepared resource mutation is stale for ${entry.id}.`);
+      }
+    }
+    const changed = prepared.entries.filter((entry) => entry.next !== entry.expected);
+    for (const entry of changed) this.#records.set(entry.id, entry.next);
+    try {
+      if (changed.length > 0) this.#persist(store);
+    } catch (error) {
+      this.#restorePreparedMutation(prepared);
+      throw error;
+    }
+  }
+
+  #restorePreparedMutation(prepared: PreparedCatalogMutation<unknown>): void {
+    for (const entry of prepared.entries) {
+      if (entry.next === entry.expected) continue;
+      if (entry.expected === undefined) this.#records.delete(entry.id);
+      else this.#records.set(entry.id, entry.expected);
+    }
+  }
+
+  async #completePreparedStandalone<T>(prepared: PreparedPiResourceMutation<T>): Promise<T> {
+    return this.completePreparedMutation(prepared, (finalize) => this.#store.transaction((store) => {
+      finalize(store);
+      return prepared.value;
+    }));
+  }
+
   #require(resourceId: string): StoredResource {
     const record = this.#records.get(nonBlank(resourceId, "Resource ID"));
     if (record === undefined) throw new Error("Pi resource does not exist.");
@@ -877,14 +1506,21 @@ export class PiResourceManager {
     this.#assertTrustedProjectTarget(record.backendId, record.targetId, record.workspaceRoot);
   }
 
+  #assertTargetOwner(backendId: string, targetId: string): void {
+    const target = this.#store.getTarget(targetId);
+    assertTargetNotDeleted(target.metadata);
+    if (target.descriptor.backendId !== backendId) throw new Error("Target does not belong to the requested Backend.");
+  }
+
   #assertTrustedProjectTarget(backendId: string, targetId: string | undefined, workspaceRoot?: string): string {
     if (targetId === undefined) throw new Error("Project resources require a Target.");
-    const target = this.#store.getTarget(targetId).descriptor;
-    const targetWorkspaceRoot = normalizedAbsolute(target.workspaceRoot, "Target workspace root");
-    if (target.backendId !== backendId || (workspaceRoot !== undefined && !samePath(targetWorkspaceRoot, workspaceRoot))) {
+    const target = this.#store.getTarget(targetId);
+    assertTargetNotDeleted(target.metadata);
+    const targetWorkspaceRoot = normalizedAbsolute(target.descriptor.workspaceRoot, "Target workspace root");
+    if (target.descriptor.backendId !== backendId || (workspaceRoot !== undefined && !samePath(targetWorkspaceRoot, workspaceRoot))) {
       throw new Error("Project resource does not match its durable Target boundary.");
     }
-    if (!target.trusted) throw new Error("Project resource is fenced because its Target is not trusted.");
+    if (!target.descriptor.trusted) throw new Error("Project resource is fenced because its Target is not trusted.");
     return targetWorkspaceRoot;
   }
 
@@ -896,8 +1532,8 @@ export class PiResourceManager {
     }
   }
 
-  #persist(): void {
-    this.#store.setSetting("service", this.#scopeId, "pi_resource_catalog", {
+  #persist(store: OperationalStore = this.#store): void {
+    store.setSetting("service", this.#scopeId, "pi_resource_catalog", {
       format: 1,
       records: [...this.#records.values()].sort((left, right) => left.id.localeCompare(right.id, "en"))
     } satisfies StoredResourceCatalog);
@@ -919,6 +1555,15 @@ export class PiResourceManager {
       return version === "" ? undefined : version;
     } catch {
       return undefined;
+    }
+  }
+
+  #backendSupportsResourceKind(backendId: string, kind: PiResourceKind): boolean {
+    try {
+      const capability = this.#store.getBackend(backendId).descriptor.capabilities.get("runtime.resources");
+      return capability?.supported === true && capability.options?.includes(kind) === true;
+    } catch {
+      return false;
     }
   }
 
@@ -958,58 +1603,198 @@ interface ResourceInspection {
 
 interface CopyBudget { files: number; bytes: number; readonly maxFiles: number; readonly maxBytes: number }
 
-async function inspectResource(sourcePath: string, maximumFiles: number, maximumBytes: number): Promise<ResourceInspection> {
+async function inspectResource(
+  sourcePath: string,
+  maximumFiles: number,
+  maximumBytes: number,
+  signal?: AbortSignal
+): Promise<ResourceInspection> {
+  signal?.throwIfAborted();
   const source = normalizedAbsolute(sourcePath, "Resource source path");
   const rootInfo = await lstat(source);
+  signal?.throwIfAborted();
   if (rootInfo.isSymbolicLink()) throw new Error("Resource symlinks and junctions are not allowed.");
   if (!rootInfo.isDirectory() && !rootInfo.isFile()) throw new Error("Resource source must be a regular file or directory.");
   const canonicalPath = await realpath(source);
+  signal?.throwIfAborted();
   if (!samePath(source, canonicalPath)) throw new Error("Resource source contains a path alias or junction.");
   const hash = createHash("sha256");
   const budget = { files: 0, bytes: 0, maxFiles: maximumFiles, maxBytes: maximumBytes };
-  if (rootInfo.isFile()) await inspectFile(canonicalPath, canonicalPath, "", hash, budget);
-  else await inspectDirectory(canonicalPath, canonicalPath, "", hash, budget);
+  if (rootInfo.isFile()) await inspectFile(canonicalPath, canonicalPath, "", hash, budget, signal);
+  else await inspectDirectory(canonicalPath, canonicalPath, "", hash, budget, signal);
+  signal?.throwIfAborted();
   return { canonicalPath, revision: `sha256:${hash.digest("hex")}`, files: budget.files, bytes: budget.bytes };
 }
 
-async function inspectDirectory(root: string, directory: string, relativePath: string, hash: ReturnType<typeof createHash>, budget: CopyBudget): Promise<void> {
+async function inspectDirectory(
+  root: string,
+  directory: string,
+  relativePath: string,
+  hash: ReturnType<typeof createHash>,
+  budget: CopyBudget,
+  signal?: AbortSignal
+): Promise<void> {
+  signal?.throwIfAborted();
   const before = await lstat(directory);
   if (!before.isDirectory() || before.isSymbolicLink()) throw new Error("Resource tree contains a symlink, junction, or non-directory entry.");
   const canonical = await realpath(directory);
+  signal?.throwIfAborted();
   assertWithin(root, canonical, "Resource directory");
   hash.update(`D\0${relativePath}\0`);
   const entries = await readdir(directory, { withFileTypes: true });
   entries.sort((left, right) => left.name.localeCompare(right.name, "en"));
   for (const entry of entries) {
+    signal?.throwIfAborted();
     validateEntryName(entry.name);
     const path = join(directory, entry.name);
     const childRelative = relativePath === "" ? entry.name : `${relativePath}/${entry.name}`;
     const info = await lstat(path);
     if (entry.isSymbolicLink() || info.isSymbolicLink()) throw new Error("Resource tree contains a symlink or junction.");
-    if (entry.isDirectory() && info.isDirectory()) await inspectDirectory(root, path, childRelative, hash, budget);
-    else if (entry.isFile() && info.isFile()) await inspectFile(root, path, childRelative, hash, budget);
+    if (entry.isDirectory() && info.isDirectory()) await inspectDirectory(root, path, childRelative, hash, budget, signal);
+    else if (entry.isFile() && info.isFile()) await inspectFile(root, path, childRelative, hash, budget, signal);
     else throw new Error("Resource tree contains a special file or changed during inspection.");
   }
+
   const after = await lstat(directory);
+  signal?.throwIfAborted();
   if (!after.isDirectory() || after.isSymbolicLink() || !sameIdentity(before, after) || before.mtimeMs !== after.mtimeMs) {
     throw new Error("Resource directory changed during inspection.");
   }
 }
 
-async function inspectFile(root: string, path: string, relativePath: string, hash: ReturnType<typeof createHash>, budget: CopyBudget): Promise<void> {
+async function inspectFile(
+  root: string,
+  path: string,
+  relativePath: string,
+  hash: ReturnType<typeof createHash>,
+  budget: CopyBudget,
+  signal?: AbortSignal
+): Promise<void> {
+  signal?.throwIfAborted();
   const before = await lstat(path);
   if (!before.isFile() || before.isSymbolicLink()) throw new Error("Resource tree contains a special file or symlink.");
   const canonical = await realpath(path);
+  signal?.throwIfAborted();
   assertWithin(root, canonical, "Resource file");
   budget.files += 1;
   budget.bytes += before.size;
   if (budget.files > budget.maxFiles || budget.bytes > budget.maxBytes) throw new Error("Resource exceeds configured file or byte limits.");
   hash.update(`F\0${relativePath}\0${before.size}\0`);
-  for await (const chunk of createReadStream(path)) hash.update(chunk as Buffer);
+  for await (const chunk of createReadStream(path, signal === undefined ? undefined : { signal })) {
+    signal?.throwIfAborted();
+    hash.update(chunk as Buffer);
+  }
   const after = await stat(path);
+  signal?.throwIfAborted();
   if (!after.isFile() || !sameIdentity(before, after) || before.size !== after.size || before.mtimeMs !== after.mtimeMs) {
     throw new Error("Resource file changed during inspection.");
   }
+}
+
+function runtimeTextState(state: PiResourceState): state is "approved" | "installed" | "loaded" {
+  return state === "approved" || state === "installed" || state === "loaded";
+}
+
+function assertApprovedRuntimeTextInspection(
+  record: StoredResource,
+  root: string,
+  inspection: ResourceInspection
+): void {
+  if (!samePath(root, inspection.canonicalPath) || inspection.revision !== record.discoveredRevision) {
+    throw new Error("Runtime text resource content changed after approval.");
+  }
+}
+
+async function readRuntimeTextContent(
+  root: string,
+  kind: "skill" | "prompt",
+  maximumBytes: number,
+  signal: AbortSignal
+): Promise<string> {
+  signal.throwIfAborted();
+  const rootInfo = await lstat(root);
+  if (rootInfo.isSymbolicLink() || (!rootInfo.isFile() && !rootInfo.isDirectory())) {
+    throw new Error("Runtime text resource root must be a regular file or directory.");
+  }
+  const canonicalRoot = await realpath(root);
+  if (!samePath(root, canonicalRoot)) throw new Error("Runtime text resource root contains a path alias or junction.");
+  let contentPath: string;
+  if (kind === "prompt") {
+    if (!rootInfo.isFile()) throw new Error("Runtime prompt content must be a bounded regular UTF-8 file.");
+    contentPath = canonicalRoot;
+  } else {
+    contentPath = rootInfo.isFile() ? canonicalRoot : join(canonicalRoot, "SKILL.md");
+  }
+  return readBoundedRuntimeTextFile(canonicalRoot, contentPath, maximumBytes, signal);
+}
+
+async function readBoundedRuntimeTextFile(
+  root: string,
+  path: string,
+  maximumBytes: number,
+  signal: AbortSignal
+): Promise<string> {
+  signal.throwIfAborted();
+  if (!isAbsolute(path)) throw new Error("Runtime text content path must be absolute.");
+  assertWithin(root, path, "Runtime text content");
+  const before = await lstat(path);
+  if (
+    !before.isFile() || before.isSymbolicLink()
+    || !Number.isSafeInteger(before.size) || before.size < 0 || before.size > maximumBytes
+  ) throw new Error("Runtime text content must be a bounded regular UTF-8 file.");
+  const canonical = await realpath(path);
+  if (!samePath(path, canonical)) throw new Error("Runtime text content contains a path alias or junction.");
+  assertWithin(root, canonical, "Runtime text content");
+  signal.throwIfAborted();
+  const handle = await open(canonical, "r");
+  let bytes: Buffer;
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile() || !sameIdentity(before, opened) || opened.size !== before.size || opened.mtimeMs !== before.mtimeMs) {
+      throw new Error("Runtime text content changed before it was read.");
+    }
+    bytes = Buffer.alloc(before.size);
+    let offset = 0;
+    while (offset < bytes.byteLength) {
+      signal.throwIfAborted();
+      const length = Math.min(64 * 1024, bytes.byteLength - offset);
+      const result = await handle.read(bytes, offset, length, offset);
+      if (result.bytesRead === 0) break;
+      offset += result.bytesRead;
+    }
+    signal.throwIfAborted();
+    if (offset !== bytes.byteLength) throw new Error("Runtime text content changed while it was read.");
+    const after = await handle.stat();
+    if (!after.isFile() || !sameIdentity(opened, after) || opened.size !== after.size || opened.mtimeMs !== after.mtimeMs) {
+      throw new Error("Runtime text content changed while it was read.");
+    }
+  } finally {
+    await handle.close();
+  }
+  signal.throwIfAborted();
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new Error("Runtime text content must contain valid UTF-8.");
+  }
+}
+
+async function waitForCaller<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  signal.throwIfAborted();
+  return new Promise<T>((resolvePromise, rejectPromise) => {
+    const aborted = (): void => rejectPromise(signal.reason ?? new DOMException("The operation was aborted.", "AbortError"));
+    signal.addEventListener("abort", aborted, { once: true });
+    void promise.then(
+      (value) => {
+        signal.removeEventListener("abort", aborted);
+        resolvePromise(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", aborted);
+        rejectPromise(error);
+      }
+    );
+  });
 }
 
 async function copyTreeFailClosed(root: string, source: string, destination: string, budget: CopyBudget): Promise<void> {
@@ -1063,7 +1848,9 @@ function publicResource(record: StoredResource): PiResourceDescriptor {
     requiresExtensionApproval: record.requiresExtensionApproval,
     ...(record.extensionContentFingerprint === undefined ? {} : { extensionContentFingerprint: record.extensionContentFingerprint }),
     postMutationNotice: record.postMutationNotice,
-    state: record.state,
+    state: record.pendingUpdate !== undefined && record.state !== "error" && record.state !== "removed"
+      ? "update_available"
+      : record.state,
     enabled: record.enabled,
     ...(record.approvedAt === undefined ? {} : { approvedAt: record.approvedAt }),
     ...(record.approvedByConnectionId === undefined ? {} : { approvedByConnectionId: record.approvedByConnectionId }),
@@ -1071,6 +1858,16 @@ function publicResource(record: StoredResource): PiResourceDescriptor {
     updatedAt: record.updatedAt,
     ...(record.error === undefined ? {} : { error: record.error })
   };
+}
+
+function storedUpdateIntentIdentity(intent: StoredResourceUpdateIntent): string {
+  return JSON.stringify({
+    source: intent.source,
+    canonicalPath: intent.canonicalPath,
+    discoveredRevision: intent.discoveredRevision,
+    name: intent.name,
+    version: intent.version
+  });
 }
 
 type StoredCompatibilityFields = Pick<
@@ -1302,6 +2099,44 @@ function validateStoredResource(value: StoredResource): StoredResource {
     throw new Error("Stored Pi resource flags are malformed.");
   }
   const storedCompatibility = validateStoredCompatibility(stored);
+  let pendingUpdate: StoredResourceUpdateIntent | undefined;
+  if (stored.pendingUpdate !== undefined) {
+    if (!stored.pendingUpdate || typeof stored.pendingUpdate !== "object") {
+      throw new Error("Stored resource update intent is malformed.");
+    }
+    const pendingSource = normalizePiPackageSource(stored.pendingUpdate.source);
+    if (JSON.stringify(pendingSource) !== JSON.stringify(stored.pendingUpdate.source)) {
+      throw new Error("Stored resource update source is not canonical.");
+    }
+    if (stored.kind !== "package" && pendingSource.kind !== "local") {
+      throw new Error("Only package update intents may use npm or git acquisition.");
+    }
+    let pendingCanonicalPath: string | undefined;
+    if (pendingSource.kind === "local") {
+      pendingCanonicalPath = normalizedAbsolute(stored.pendingUpdate.canonicalPath!, "Stored update canonical resource path");
+      if (!samePath(pendingCanonicalPath, pendingSource.path)) {
+        throw new Error("Stored resource update path is not canonical.");
+      }
+    } else if (stored.pendingUpdate.canonicalPath !== undefined) {
+      throw new Error("Stored remote resource update contains a local canonical path.");
+    }
+    const pendingSourceIdentity = stored.kind === "package"
+      ? piPackageSourceIdentity(pendingSource)
+      : `${stored.kind}:${pathIdentity(pendingCanonicalPath!)}`;
+    if (pendingSourceIdentity !== sourceIdentity) {
+      throw new Error("Stored resource update intent changes resource identity.");
+    }
+    if (!/^sha256:[a-f0-9]{64}$/u.test(stored.pendingUpdate.discoveredRevision)) {
+      throw new Error("Stored resource update fingerprint is malformed.");
+    }
+    pendingUpdate = {
+      source: pendingSource,
+      ...(pendingCanonicalPath === undefined ? {} : { canonicalPath: pendingCanonicalPath }),
+      discoveredRevision: stored.pendingUpdate.discoveredRevision,
+      name: nonBlank(stored.pendingUpdate.name, "Stored resource update name"),
+      ...(stored.pendingUpdate.version === undefined ? {} : { version: boundedVersion(stored.pendingUpdate.version) })
+    };
+  }
   const extensionApprovedRevision = stored.extensionApprovedRevision;
   if (extensionApprovedRevision !== undefined && !/^sha256:[a-f0-9]{64}$/u.test(extensionApprovedRevision)) {
     throw new Error("Stored extension approval fingerprint is malformed.");
@@ -1314,6 +2149,7 @@ function validateStoredResource(value: StoredResource): StoredResource {
     canonicalPathFingerprint: _canonicalPathFingerprint,
     canonicalPath: _canonicalPath,
     extensionApprovedRevision: _extensionApprovedRevision,
+    pendingUpdate: _pendingUpdate,
     error: _error,
     ...base
   } = stored;
@@ -1326,6 +2162,7 @@ function validateStoredResource(value: StoredResource): StoredResource {
     canonicalPathFingerprint,
     ...storedCompatibility,
     ...(extensionApprovedRevision === undefined ? {} : { extensionApprovedRevision }),
+    ...(pendingUpdate === undefined ? {} : { pendingUpdate }),
     ...(canonicalPath === undefined ? {} : { canonicalPath }),
     ...(stored.version === undefined ? {} : { version: boundedVersion(stored.version) }),
     ...(stored.error === undefined ? {} : { error: redactSecrets(stored.error).slice(0, 2_048) })
@@ -1347,14 +2184,30 @@ function groupFor(kind: PiResourceKind): string {
   }
 }
 
-function installedContainer(path: string): string {
-  return dirname(path);
+function resourceOwnerPath(managedRoot: string, record: Pick<StoredResource, "id" | "kind">): string {
+  return join(managedRoot, groupFor(record.kind), safeId(record.id));
+}
+
+function installedPayloadName(record: StoredResource): string {
+  return safePayloadName(record.source.kind === "local" ? basename(record.canonicalPath!) : record.name);
+}
+
+function installedGenerationContainer(managedRoot: string, record: StoredResource): string {
+  if (record.installedPath === undefined) throw new Error("Resource has no installed payload.");
+  const owner = resourceOwnerPath(managedRoot, record);
+  const container = dirname(record.installedPath);
+  const generations = join(owner, RESOURCE_GENERATIONS_DIRECTORY);
+  if (
+    !samePath(dirname(container), generations)
+    || !RESOURCE_GENERATION_PATTERN.test(basename(container))
+  ) throw new Error("Installed resource path does not match its managed generation boundary.");
+  return container;
 }
 
 function assertExpectedInstalledLocation(managedRoot: string, record: StoredResource): void {
   if (record.installedPath === undefined) throw new Error("Resource has no installed payload.");
-  const expectedContainer = join(managedRoot, groupFor(record.kind), safeId(record.id));
-  if (!samePath(dirname(record.installedPath), expectedContainer)) {
+  void installedGenerationContainer(managedRoot, record);
+  if (basename(record.installedPath) !== installedPayloadName(record)) {
     throw new Error("Installed resource path does not match its managed ownership boundary.");
   }
 }
@@ -1367,7 +2220,7 @@ function safeId(id: string): string {
 
 function safePayloadName(name: string): string {
   const value = name.replace(/[<>:"/\\|?*\u0000-\u001f]/gu, "_").trim();
-  return value === "" || value === "." || value === ".." ? "resource" : value;
+  return value === "" || value === "." || value === ".." || value === RESOURCE_GENERATIONS_DIRECTORY ? "resource" : value;
 }
 
 function validateResourceId(id: string): void {
@@ -1376,6 +2229,18 @@ function validateResourceId(id: string): void {
 
 function validateKind(kind: PiResourceKind): void {
   if (!(["extension", "skill", "prompt", "theme", "package"] as const).includes(kind)) throw new Error("Pi resource kind is invalid.");
+}
+
+function projectResourceKindSet(kinds: readonly PiResourceKind[]): ReadonlySet<PiResourceKind> {
+  if (!Array.isArray(kinds) || kinds.length === 0) {
+    throw new Error("Project resource discovery requires at least one Backend-advertised resource kind.");
+  }
+  const result = new Set<PiResourceKind>();
+  for (const kind of kinds) {
+    validateKind(kind);
+    result.add(kind);
+  }
+  return result;
 }
 
 function validateScope(scope: PiResourceScope): void {
@@ -1419,6 +2284,17 @@ async function assertContainedPath(root: string, path: string, label: string): P
   if (info.isSymbolicLink()) throw new Error(`${label} is a symlink or junction.`);
   const canonical = await realpath(path);
   assertWithin(canonicalRoot, canonical, label);
+}
+
+async function assertContainedPathIfPresent(root: string, path: string, label: string): Promise<boolean> {
+  if (await optionalLstat(path) === undefined) return false;
+  try {
+    await assertContainedPath(root, path, label);
+    return true;
+  } catch (error) {
+    if (await optionalLstat(path) === undefined) return false;
+    throw error;
+  }
 }
 
 function assertWithin(root: string, candidate: string, label: string): void {
@@ -1469,11 +2345,27 @@ function nonBlank(value: string, label: string): string {
   return normalized;
 }
 
-async function exists(path: string): Promise<boolean> {
-  try { await lstat(path); return true; } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") return false;
-    throw error;
+async function removeOwnedPath(root: string, path: string, label: string): Promise<void> {
+  normalizedAbsolute(root, `${label} root`);
+  normalizedAbsolute(path, label);
+  assertWithin(root, path, label);
+  const info = await optionalLstat(path);
+  if (info === undefined) return;
+  if (info.isSymbolicLink()) {
+    await rm(path, { force: true });
+    return;
   }
+  const canonicalRoot = await realpath(root);
+  const canonical = await realpath(path);
+  assertWithin(canonicalRoot, canonical, label);
+  await rm(path, { recursive: info.isDirectory(), force: true });
+}
+
+async function directoryIsEmpty(path: string): Promise<boolean> {
+  const info = await optionalLstat(path);
+  if (info === undefined) return false;
+  if (!info.isDirectory() || info.isSymbolicLink()) return false;
+  return (await readdir(path)).length === 0;
 }
 
 interface ProjectResourceCandidate {
@@ -1482,25 +2374,58 @@ interface ProjectResourceCandidate {
   readonly name: string;
 }
 
-async function discoverCanonicalProjectCandidates(workspaceRoot: string, maximumCandidates: number): Promise<readonly ProjectResourceCandidate[]> {
+async function discoverCanonicalProjectCandidates(
+  workspaceRoot: string,
+  maximumCandidates: number,
+  kinds: ReadonlySet<PiResourceKind>,
+  adapterKind: string
+): Promise<readonly ProjectResourceCandidate[]> {
   const candidates: ProjectResourceCandidate[] = [];
-  const push = (kind: PiResourceKind, sourcePath: string): void => {
+  const push = (kind: PiResourceKind, sourcePath: string, name = basename(sourcePath)): void => {
     if (candidates.length >= maximumCandidates) throw new Error("Project resource discovery exceeds the configured candidate limit.");
-    candidates.push({ kind, sourcePath, name: basename(sourcePath) });
+    candidates.push({ kind, sourcePath, name });
   };
+
+  if (adapterKind === "claude-agent-sdk-stdio") {
+    const claudeRoot = join(workspaceRoot, ".claude");
+    await assertOptionalSafeDirectory(workspaceRoot, claudeRoot, "Claude project resource root");
+    if (kinds.has("skill")) {
+      for (const sourcePath of await discoverClaudeSkillEntries(workspaceRoot, join(claudeRoot, "skills"))) {
+        push("skill", sourcePath);
+      }
+    }
+    if (kinds.has("prompt")) {
+      for (const sourcePath of await discoverClaudePromptEntries(workspaceRoot, join(claudeRoot, "commands"))) {
+        push("prompt", sourcePath, basename(sourcePath, extname(sourcePath)));
+      }
+    }
+    return candidates.sort((left, right) => left.kind.localeCompare(right.kind, "en") || left.sourcePath.localeCompare(right.sourcePath, "en"));
+  }
+  if (adapterKind !== "pi") throw new Error(`Backend adapter does not define project resource discovery: ${adapterKind}`);
 
   const piRoot = join(workspaceRoot, ".pi");
   const agentsRoot = join(workspaceRoot, ".agents");
-  for (const root of [piRoot, agentsRoot]) await assertOptionalSafeDirectory(workspaceRoot, root, "Project resource root");
+  await assertOptionalSafeDirectory(workspaceRoot, piRoot, "Project resource root");
 
-  for (const sourcePath of await discoverExtensionEntries(workspaceRoot, join(piRoot, "extensions"))) push("extension", sourcePath);
-  for (const sourcePath of await discoverSkillEntries(workspaceRoot, join(piRoot, "skills"))) push("skill", sourcePath);
-  for (const sourcePath of await discoverSkillEntries(workspaceRoot, join(agentsRoot, "skills"))) push("skill", sourcePath);
-  for (const sourcePath of await discoverPromptEntries(workspaceRoot, join(piRoot, "prompts"))) push("prompt", sourcePath);
-  for (const sourcePath of await discoverThemeEntries(workspaceRoot, join(piRoot, "themes"))) push("theme", sourcePath);
-  for (const sourcePath of await discoverDirectPackageEntries(workspaceRoot, join(piRoot, "packages"))) push("package", sourcePath);
-  for (const sourcePath of await discoverNpmPackageEntries(workspaceRoot, join(piRoot, "npm", "node_modules"))) push("package", sourcePath);
-  for (const sourcePath of await discoverGitPackageEntries(workspaceRoot, join(piRoot, "git"), maximumCandidates - candidates.length)) push("package", sourcePath);
+  if (kinds.has("extension")) {
+    for (const sourcePath of await discoverExtensionEntries(workspaceRoot, join(piRoot, "extensions"))) push("extension", sourcePath);
+  }
+  if (kinds.has("skill")) {
+    await assertOptionalSafeDirectory(workspaceRoot, agentsRoot, "Project resource root");
+    for (const sourcePath of await discoverSkillEntries(workspaceRoot, join(piRoot, "skills"))) push("skill", sourcePath);
+    for (const sourcePath of await discoverSkillEntries(workspaceRoot, join(agentsRoot, "skills"))) push("skill", sourcePath);
+  }
+  if (kinds.has("prompt")) {
+    for (const sourcePath of await discoverPromptEntries(workspaceRoot, join(piRoot, "prompts"))) push("prompt", sourcePath);
+  }
+  if (kinds.has("theme")) {
+    for (const sourcePath of await discoverThemeEntries(workspaceRoot, join(piRoot, "themes"))) push("theme", sourcePath);
+  }
+  if (kinds.has("package")) {
+    for (const sourcePath of await discoverDirectPackageEntries(workspaceRoot, join(piRoot, "packages"))) push("package", sourcePath);
+    for (const sourcePath of await discoverNpmPackageEntries(workspaceRoot, join(piRoot, "npm", "node_modules"))) push("package", sourcePath);
+    for (const sourcePath of await discoverGitPackageEntries(workspaceRoot, join(piRoot, "git"), maximumCandidates - candidates.length)) push("package", sourcePath);
+  }
 
   return candidates
     .sort((left, right) => left.kind.localeCompare(right.kind, "en") || left.sourcePath.localeCompare(right.sourcePath, "en"));
@@ -1538,6 +2463,24 @@ async function discoverSkillEntries(workspaceRoot: string, root: string): Promis
     if (await hasRegularContainedFile(workspaceRoot, join(entry.canonicalPath, "SKILL.md"), "Project skill manifest")) candidates.push(entry.canonicalPath);
   }
   return candidates;
+}
+
+async function discoverClaudeSkillEntries(workspaceRoot: string, root: string): Promise<readonly string[]> {
+  const entries = await safeOptionalDirectoryEntries(workspaceRoot, root, "Claude project skill directory", true);
+  const candidates: string[] = [];
+  for (const entry of entries) {
+    if (!entry.info.isDirectory()) continue;
+    if (await hasRegularContainedFile(workspaceRoot, join(entry.canonicalPath, "SKILL.md"), "Claude project skill manifest")) {
+      candidates.push(entry.canonicalPath);
+    }
+  }
+  return candidates;
+}
+
+async function discoverClaudePromptEntries(workspaceRoot: string, root: string): Promise<readonly string[]> {
+  return (await safeOptionalDirectoryEntries(workspaceRoot, root, "Claude project command directory", true))
+    .filter((entry) => entry.info.isFile() && entry.name.toLowerCase().endsWith(".md"))
+    .map((entry) => entry.canonicalPath);
 }
 
 async function discoverPromptEntries(workspaceRoot: string, root: string): Promise<readonly string[]> {
@@ -1600,7 +2543,12 @@ interface SafeDirectoryEntry {
   readonly info: Awaited<ReturnType<typeof lstat>>;
 }
 
-async function safeOptionalDirectoryEntries(workspaceRoot: string, root: string, label: string): Promise<readonly SafeDirectoryEntry[]> {
+async function safeOptionalDirectoryEntries(
+  workspaceRoot: string,
+  root: string,
+  label: string,
+  skipHidden = false
+): Promise<readonly SafeDirectoryEntry[]> {
   const info = await optionalLstat(root);
   if (info === undefined) return [];
   if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`${label} must be a regular directory.`);
@@ -1611,6 +2559,7 @@ async function safeOptionalDirectoryEntries(workspaceRoot: string, root: string,
   const result: SafeDirectoryEntry[] = [];
   for (const entry of entries) {
     validateEntryName(entry.name);
+    if (skipHidden && entry.name.startsWith(".")) continue;
     const path = join(canonicalRoot, entry.name);
     const child = await lstat(path);
     if (entry.isSymbolicLink() || child.isSymbolicLink() || (!child.isDirectory() && !child.isFile())) {
@@ -1648,4 +2597,17 @@ async function optionalLstat(path: string): Promise<Awaited<ReturnType<typeof ls
 function stableDiscoveredResourceId(backendId: string, targetId: string, kind: PiResourceKind, canonicalPath: string): string {
   const identity = process.platform === "win32" ? canonicalPath.toLowerCase() : canonicalPath;
   return `resource_project_${createHash("sha256").update(`${backendId}\0${targetId}\0${kind}\0${identity}`).digest("hex").slice(0, 32)}`;
+}
+
+function assertTargetNotDeleted(metadata: unknown): void {
+  if (
+    typeof metadata === "object" && metadata !== null && !Array.isArray(metadata)
+    && (metadata as Record<string, unknown>)["deletedAt"] !== undefined
+  ) throw new Error("Project resource is fenced because its Target is deleted.");
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+  return (
+    (typeof value === "object" && value !== null) || typeof value === "function"
+  ) && typeof (value as { readonly then?: unknown }).then === "function";
 }

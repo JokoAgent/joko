@@ -230,7 +230,8 @@ import type {
   PiResourceDescriptor as NativePiResourceDescriptor,
   PiResourceKind as NativePiResourceKind,
   PiResourceManager,
-  PiResourceState as NativePiResourceState
+  PiResourceState as NativePiResourceState,
+  PreparedPiResourceMutation
 } from "./resource-manager.js";
 import {
   normalizePiPackageSource,
@@ -733,7 +734,7 @@ interface HostMutationInput<T> {
   readonly effect?: () => Promise<void>;
   readonly sessionLifecycleFenceId?: string;
   readonly complete?: (
-    commit: () => OperationExecution<T>
+    commit: (finalize?: (store: OperationalStore) => void) => OperationExecution<T>
   ) => Promise<OperationExecution<T>>;
   readonly preserveClaimOnEffectFailure?: (error: unknown) => boolean;
 }
@@ -789,6 +790,12 @@ type ExtendedSessionHost = SessionHost & {
     filter: { readonly backendId: string },
     effect: (sessionId: string, adapter: import("@joko/core").BackendAdapter, context: import("@joko/core").AdapterContext) => Promise<void>
   ): Promise<readonly string[]>;
+  fenceBackendResourceCatalogs(backendId: string): symbol;
+  completeBackendResourceCatalogRefresh(
+    backendId: string,
+    token: symbol,
+    activeRuntimesRetainPreviousSnapshot: boolean
+  ): void;
 };
 
 const DEFAULT_PAGE_SIZE = 100;
@@ -15266,28 +15273,53 @@ async function dispatchMutation(
       });
     }
     case "discoverProjectResources": {
-      if (dependencies.piResources === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The Pi Resource Manager is not configured.");
-      const target = dependencies.store.getTarget(payload.value.targetId).descriptor;
-      if (!target.trusted) throw new ConnectError("Project resources can only be discovered after the Target is trusted.", Code.FailedPrecondition);
+      if (dependencies.piResources === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The managed resource authority is not configured.");
+      let authority: ProjectResourceAdmission | undefined;
+      let prepared: PreparedPiResourceMutation<readonly NativePiResourceDescriptor[]> | undefined;
+      let resourceCatalogFence: symbol | undefined;
+      const assertDiscoveryAdmission = (store: OperationalStore) => {
+        const observed = projectResourceAdmission(dependencies, payload.value.targetId, store);
+        if (authority === undefined) authority = observed;
+        else assertSameProjectResourceAdmission(authority, observed);
+        return authority;
+      };
       return ackOperation(dependencies, operationId, connection, mutation, payload.case, async () => {
-        await dependencies.piResources!.discoverProjectResources({ backendId: target.backendId, targetId: target.id });
-      });
+        const admitted = assertDiscoveryAdmission(dependencies.store);
+        prepared = await dependencies.piResources!.prepareDiscoverProjectResources({
+          backendId: admitted.backendId,
+          targetId: admitted.targetId,
+          kinds: admitted.kinds
+        });
+      }, (store) => { void assertDiscoveryAdmission(store); }, (commit) =>
+        dependencies.piResources!.completePreparedMutation(
+          requiredPreparedResourceMutation(prepared),
+          (finalize) => {
+            const execution = commit(finalize);
+            if (prepared!.revokesRuntimeAuthority) {
+              resourceCatalogFence = dependencies.sessionHost.fenceBackendResourceCatalogs(authority!.backendId);
+            }
+            return execution;
+          }
+        ), async (execution) => {
+          if (!execution.replayed && resourceCatalogFence !== undefined) {
+            await reconcileCommittedResourceRuntime(
+              dependencies,
+              authority!.backendId,
+              payload.value.targetId,
+              resourceCatalogFence
+            );
+          }
+        });
     }
     case "addResource": {
-      if (dependencies.piResources === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The Pi Resource Manager is not configured.");
+      if (dependencies.piResources === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The managed resource authority is not configured.");
       const backendId = payload.value.backendId.trim();
       if (backendId === "") throw invalidArgument("backend_id is required");
-      dependencies.store.getBackend(backendId);
       const scope = nativeResourceScope(payload.value.scope);
       let targetId: string | undefined;
-      let workspaceRoot: string | undefined;
       if (scope === "project") {
         if (payload.value.targetId.trim() === "") throw invalidArgument("target_id is required for a project resource");
-        const target = dependencies.store.getTarget(payload.value.targetId).descriptor;
-        if (target.backendId !== backendId) throw new ConnectError("Target does not belong to the requested Backend.", Code.FailedPrecondition);
-        if (!target.trusted) throw new ConnectError("Project resources can only be added after the Target is trusted.", Code.FailedPrecondition);
-        targetId = target.id;
-        workspaceRoot = target.workspaceRoot;
+        targetId = payload.value.targetId;
       } else if (payload.value.targetId !== "") {
         throw invalidArgument("target_id is only valid for a project resource");
       }
@@ -15306,7 +15338,17 @@ async function dispatchMutation(
       const resourceId = `resource_owner_${createHash("sha256")
         .update(`${backendId}\0${targetId ?? ""}\0${scope}\0${kind}\0${resourceSourceIdentity}`)
         .digest("hex").slice(0, 32)}`;
+      let authority: AddResourceAdmission | undefined;
+      let prepared: PreparedPiResourceMutation<NativePiResourceDescriptor> | undefined;
+      let resourceCatalogFence: symbol | undefined;
+      const assertAddAdmission = (store: OperationalStore): { readonly workspaceRoot?: string } => {
+        const observed = addResourceAdmission(dependencies, backendId, targetId, kind, store);
+        if (authority === undefined) authority = observed;
+        else assertSameAddResourceAdmission(authority, observed);
+        return authority.workspaceRoot === undefined ? {} : { workspaceRoot: authority.workspaceRoot };
+      };
       return ackOperation(dependencies, operationId, connection, mutation, payload.case, async () => {
+        const { workspaceRoot } = assertAddAdmission(dependencies.store);
         const common = {
           id: resourceId,
           backendId,
@@ -15316,61 +15358,114 @@ async function dispatchMutation(
           ...(payload.value.version.trim() === "" ? {} : { version: payload.value.version })
         };
         if (kind === "package") {
-          await dependencies.piResources!.discoverPackage({
+          prepared = await dependencies.piResources!.prepareDiscoverPackage({
             ...common,
             source: acquisition,
             ...(workspaceRoot === undefined || acquisition.kind !== "local" ? {} : { workspaceRoot })
           });
         } else {
           if (acquisition.kind !== "local") throw new Error("Non-package resource acquisition was not local.");
-          await dependencies.piResources!.discover({
+          prepared = await dependencies.piResources!.prepareDiscover({
             ...common,
             kind,
             source: acquisition,
             ...(workspaceRoot === undefined ? {} : { workspaceRoot })
           });
         }
-      });
+      }, (store) => { void assertAddAdmission(store); }, (commit) =>
+        dependencies.piResources!.completePreparedMutation(
+          requiredPreparedResourceMutation(prepared),
+          (finalize) => {
+            const execution = commit(finalize);
+            if (prepared!.revokesRuntimeAuthority) {
+              resourceCatalogFence = dependencies.sessionHost.fenceBackendResourceCatalogs(backendId);
+            }
+            return execution;
+          }
+        ), async (execution) => {
+          if (!execution.replayed && resourceCatalogFence !== undefined) {
+            await reconcileCommittedResourceRuntime(dependencies, backendId, resourceId, resourceCatalogFence);
+          }
+        });
     }
     case "approveResource": {
-      if (dependencies.piResources === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The Pi Resource Manager is not configured.");
-      return resourceEffectOperation(dependencies, operationId, connection, mutation, payload.case, payload.value.resourceId, async () => {
-        await dependencies.piResources!.approve(payload.value.resourceId, payload.value.discoveredRevision, connection.id);
-      });
+      if (dependencies.piResources === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The managed resource authority is not configured.");
+      return preparedResourceEffectOperation(
+        dependencies,
+        operationId,
+        connection,
+        mutation,
+        payload.case,
+        payload.value.resourceId,
+        true,
+        () => dependencies.piResources!.prepareApprove(
+          payload.value.resourceId,
+          payload.value.discoveredRevision,
+          connection.id
+        )
+      );
     }
     case "installResource": {
-      if (dependencies.piResources === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The Pi Resource Manager is not configured.");
-      return resourceEffectOperation(dependencies, operationId, connection, mutation, payload.case, payload.value.resourceId, async () => {
-        await dependencies.piResources!.install(payload.value.resourceId);
-      });
+      if (dependencies.piResources === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The managed resource authority is not configured.");
+      return preparedResourceEffectOperation(
+        dependencies,
+        operationId,
+        connection,
+        mutation,
+        payload.case,
+        payload.value.resourceId,
+        true,
+        () => dependencies.piResources!.prepareInstall(payload.value.resourceId)
+      );
     }
     case "updateResource": {
-      if (dependencies.piResources === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The Pi Resource Manager is not configured.");
+      if (dependencies.piResources === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The managed resource authority is not configured.");
       if (payload.value.acquisition !== undefined && payload.value.requestedVersion !== "") {
         throw invalidArgument("acquisition and requested_version cannot both be set");
       }
       const acquisition = payload.value.acquisition === undefined
         ? undefined
         : nativeResourceAcquisition(payload.value.acquisition);
-      return resourceEffectOperation(dependencies, operationId, connection, mutation, payload.case, payload.value.resourceId, async () => {
-        await dependencies.piResources!.update(payload.value.resourceId, {
+      return preparedResourceEffectOperation(
+        dependencies,
+        operationId,
+        connection,
+        mutation,
+        payload.case,
+        payload.value.resourceId,
+        true,
+        () => dependencies.piResources!.prepareUpdate(payload.value.resourceId, {
           ...(payload.value.requestedVersion === "" ? {} : { requestedVersion: payload.value.requestedVersion }),
           ...(acquisition === undefined ? {} : { source: acquisition }),
           approvedByConnectionId: connection.id
-        });
-      });
+        })
+      );
     }
     case "setResourceEnabled": {
-      if (dependencies.piResources === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The Pi Resource Manager is not configured.");
-      return resourceEffectOperation(dependencies, operationId, connection, mutation, payload.case, payload.value.resourceId, async () => {
-        await dependencies.piResources!.setEnabled(payload.value.resourceId, payload.value.enabled);
-      });
+      if (dependencies.piResources === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The managed resource authority is not configured.");
+      return preparedResourceEffectOperation(
+        dependencies,
+        operationId,
+        connection,
+        mutation,
+        payload.case,
+        payload.value.resourceId,
+        payload.value.enabled,
+        () => dependencies.piResources!.prepareSetEnabled(payload.value.resourceId, payload.value.enabled)
+      );
     }
     case "removeResource": {
-      if (dependencies.piResources === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The Pi Resource Manager is not configured.");
-      return resourceEffectOperation(dependencies, operationId, connection, mutation, payload.case, payload.value.resourceId, async () => {
-        await dependencies.piResources!.remove(payload.value.resourceId);
-      });
+      if (dependencies.piResources === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The managed resource authority is not configured.");
+      return preparedResourceEffectOperation(
+        dependencies,
+        operationId,
+        connection,
+        mutation,
+        payload.case,
+        payload.value.resourceId,
+        false,
+        () => dependencies.piResources!.prepareRemove(payload.value.resourceId)
+      );
     }
     case "abortToolCall": {
       const projected = listProjectedToolCalls(dependencies.store).find((item) => item.value.toolCallId === payload.value.toolCallId);
@@ -16057,7 +16152,8 @@ async function effectOperation(
   mutation: contract.OperationMutation,
   kind: string,
   outcome: OperationOutcome,
-  effect: () => Promise<void>
+  effect: () => Promise<void>,
+  precondition?: (store: OperationalStore) => void
 ): Promise<PresentedOperation> {
   return presented(await dependencies.sessionHost.mutate({
     operationId,
@@ -16065,27 +16161,270 @@ async function effectOperation(
     kind,
     body: mutation,
     commit: () => outcome,
+    ...(precondition === undefined ? {} : { precondition }),
     effect: () => effect()
   }));
 }
 
-async function resourceEffectOperation(
+async function preparedResourceEffectOperation(
   dependencies: ConnectServiceDependencies,
   operationId: string,
   connection: ConnectionRecord,
   mutation: contract.OperationMutation,
   kind: string,
   resourceId: string,
-  effect: () => Promise<void>
+  requireCapability: boolean,
+  prepare: () => Promise<PreparedPiResourceMutation<NativePiResourceDescriptor>>
 ): Promise<PresentedOperation> {
-  return effectOperation(dependencies, operationId, connection, mutation, kind, {
-    accepted: true,
-    resultCase: "resource",
-    entityId: resourceId
-  }, async () => {
-    await effect();
-    await dependencies.refreshPiGeneration?.();
+  let admittedBackendId: string | undefined;
+  let admittedCapability: BackendResourceAdmission | undefined;
+  let prepared: PreparedPiResourceMutation<NativePiResourceDescriptor> | undefined;
+  let resourceCatalogFence: symbol | undefined;
+  const assertResourceAuthority = (store: OperationalStore): NativePiResourceDescriptor => {
+    if (dependencies.piResources === undefined) throw new Error("The managed resource authority is unavailable.");
+    const resource = dependencies.piResources.get(resourceId);
+    if (admittedBackendId === undefined) admittedBackendId = resource.backendId;
+    else if (resource.backendId !== admittedBackendId) {
+      throw new ConnectError("Managed resource authority changed while the operation was in progress.", Code.Aborted);
+    }
+    if (requireCapability) {
+      const observed = backendResourceAdmission(dependencies, resource.backendId, store);
+      if (!observed.kinds.includes(resource.kind)) {
+        throw new ConnectError(
+          `The selected Backend does not support managed ${resource.kind} resources.`,
+          Code.FailedPrecondition
+        );
+      }
+      if (admittedCapability === undefined) admittedCapability = observed;
+      else if (
+        admittedCapability.backendId !== observed.backendId
+        || admittedCapability.instanceGeneration !== observed.instanceGeneration
+        || !sameResourceKinds(admittedCapability.kinds, observed.kinds)
+      ) {
+        throw new ConnectError(
+          "Managed resource Backend authority changed while the operation was in progress.",
+          Code.Aborted
+        );
+      }
+    }
+    return resource;
+  };
+  const execution = await dependencies.sessionHost.mutate<OperationOutcome>({
+    operationId,
+    connection,
+    kind,
+    body: mutation,
+    commit: () => ({ accepted: true, resultCase: "resource", entityId: resourceId }),
+    precondition: (store) => { void assertResourceAuthority(store); },
+    effect: async () => {
+      void assertResourceAuthority(dependencies.store);
+      prepared = await prepare();
+    },
+    complete: (commit) => dependencies.piResources!.completePreparedMutation(
+      requiredPreparedResourceMutation(prepared),
+      (finalize) => {
+        const execution = commit(finalize);
+        resourceCatalogFence = dependencies.sessionHost.fenceBackendResourceCatalogs(admittedBackendId!);
+        return execution;
+      }
+    )
   });
+  if (!execution.replayed) {
+    if (admittedBackendId === undefined) throw new StoreError("Managed resource operation completed without Backend authority.");
+    if (resourceCatalogFence === undefined) throw new StoreError("Managed resource operation completed without a runtime catalog fence.");
+    await reconcileCommittedResourceRuntime(dependencies, admittedBackendId, resourceId, resourceCatalogFence);
+  }
+  return presented(execution);
+}
+
+interface BackendResourceAdmission {
+  readonly backendId: string;
+  readonly instanceGeneration: number;
+  readonly kinds: readonly NativePiResourceKind[];
+}
+
+interface ProjectResourceAdmission extends BackendResourceAdmission {
+  readonly targetId: string;
+  readonly workspaceRoot: string;
+}
+
+interface AddResourceAdmission extends BackendResourceAdmission {
+  readonly targetId?: string;
+  readonly workspaceRoot?: string;
+}
+
+function requiredPreparedResourceMutation<T>(
+  prepared: PreparedPiResourceMutation<T> | undefined
+): PreparedPiResourceMutation<T> {
+  if (prepared === undefined) throw new StoreError("Managed resource preparation did not produce a catalog mutation.");
+  return prepared;
+}
+
+function projectResourceAdmission(
+  dependencies: ConnectServiceDependencies,
+  targetId: string,
+  store: OperationalStore
+): ProjectResourceAdmission {
+  const target = store.getTarget(targetId);
+  assertTargetAcceptsResourceExpansion(target);
+  const descriptor = target.descriptor;
+  if (!descriptor.trusted) {
+    throw new ConnectError("Project resources can only be discovered after the Target is trusted.", Code.FailedPrecondition);
+  }
+  return {
+    ...backendResourceAdmission(dependencies, descriptor.backendId, store),
+    targetId: descriptor.id,
+    workspaceRoot: descriptor.workspaceRoot
+  };
+}
+
+function addResourceAdmission(
+  dependencies: ConnectServiceDependencies,
+  backendId: string,
+  targetId: string | undefined,
+  kind: NativePiResourceKind,
+  store: OperationalStore
+): AddResourceAdmission {
+  const admission = backendResourceAdmission(dependencies, backendId, store);
+  if (!admission.kinds.includes(kind)) {
+    throw new ConnectError(
+      `The selected Backend does not support managed ${kind} resources.`,
+      Code.FailedPrecondition
+    );
+  }
+  if (targetId === undefined) return admission;
+  const target = store.getTarget(targetId);
+  assertTargetAcceptsResourceExpansion(target);
+  if (target.descriptor.backendId !== backendId) {
+    throw new ConnectError("Target does not belong to the requested Backend.", Code.FailedPrecondition);
+  }
+  if (!target.descriptor.trusted) {
+    throw new ConnectError("Project resources can only be added after the Target is trusted.", Code.FailedPrecondition);
+  }
+  return {
+    ...admission,
+    targetId: target.descriptor.id,
+    workspaceRoot: target.descriptor.workspaceRoot
+  };
+}
+
+function assertTargetAcceptsResourceExpansion(target: StoredTarget): void {
+  if (asRecord(target.metadata)["deletedAt"] !== undefined) {
+    throw new ConnectError("Deleted Targets cannot acquire managed resources.", Code.FailedPrecondition);
+  }
+}
+
+function assertSameProjectResourceAdmission(
+  expected: ProjectResourceAdmission,
+  current: ProjectResourceAdmission
+): void {
+  if (
+    expected.targetId !== current.targetId
+    || expected.backendId !== current.backendId
+    || expected.instanceGeneration !== current.instanceGeneration
+    || expected.workspaceRoot !== current.workspaceRoot
+    || !sameResourceKinds(expected.kinds, current.kinds)
+  ) {
+    throw new ConnectError("Project resource authority changed while discovery was in progress.", Code.Aborted);
+  }
+}
+
+function assertSameAddResourceAdmission(expected: AddResourceAdmission, current: AddResourceAdmission): void {
+  if (
+    expected.backendId !== current.backendId
+    || expected.instanceGeneration !== current.instanceGeneration
+    || expected.targetId !== current.targetId
+    || expected.workspaceRoot !== current.workspaceRoot
+    || !sameResourceKinds(expected.kinds, current.kinds)
+  ) {
+    throw new ConnectError("Managed resource authority changed while the resource was being prepared.", Code.Aborted);
+  }
+}
+
+function sameResourceKinds(
+  left: readonly NativePiResourceKind[],
+  right: readonly NativePiResourceKind[]
+): boolean {
+  return left.length === right.length && left.every((kind) => right.includes(kind));
+}
+
+function backendResourceAdmission(
+  dependencies: ConnectServiceDependencies,
+  backendId: string,
+  store: OperationalStore = dependencies.store
+): BackendResourceAdmission {
+  const descriptor = store.getBackend(backendId).descriptor;
+  const capability = descriptor.capabilities.get("runtime.resources");
+  if (capability?.supported !== true) {
+    throw new ConnectError(
+      "The selected Backend does not support managed resources.",
+      Code.FailedPrecondition
+    );
+  }
+  const kinds = [...new Set((capability.options ?? []).filter(isNativeResourceKindOption))];
+  if (kinds.length === 0) {
+    throw new ConnectError(
+      "The selected Backend does not advertise any supported managed resource kinds.",
+      Code.FailedPrecondition
+    );
+  }
+  return { backendId, instanceGeneration: descriptor.instanceGeneration, kinds };
+}
+
+function isNativeResourceKindOption(value: string): value is NativePiResourceKind {
+  return value === "extension" || value === "skill" || value === "prompt" || value === "theme" || value === "package";
+}
+
+async function refreshResourceBackendGeneration(
+  dependencies: ConnectServiceDependencies,
+  backendId: string
+): Promise<boolean> {
+  const adapterKind = dependencies.store.getBackend(backendId).descriptor.adapterKind;
+  if (dependencies.piBackendIds?.has(backendId) === true || adapterKind === "pi") {
+    if (dependencies.refreshPiGeneration === undefined) {
+      throw new ConnectError("The managed resource runtime cannot be refreshed.", Code.Unavailable);
+    }
+    await dependencies.refreshPiGeneration();
+    return true;
+  }
+  if (dependencies.restartBackend === undefined) {
+    throw new ConnectError("The managed resource runtime cannot be restarted.", Code.Unavailable);
+  }
+  await dependencies.restartBackend(backendId);
+  return false;
+}
+
+async function reconcileCommittedResourceRuntime(
+  dependencies: ConnectServiceDependencies,
+  backendId: string,
+  resourceId: string,
+  resourceCatalogFence: symbol
+): Promise<void> {
+  try {
+    const activeRuntimesRetainPreviousSnapshot = await refreshResourceBackendGeneration(dependencies, backendId);
+    dependencies.sessionHost.completeBackendResourceCatalogRefresh(
+      backendId,
+      resourceCatalogFence,
+      activeRuntimesRetainPreviousSnapshot
+    );
+  } catch {
+    // The desired catalog and the Operation outcome were committed together.
+    // A runtime refresh is a derived reconciliation step: reporting the
+    // already-committed Operation as failed would make replay contradict the
+    // first response and could repeat a Backend lifecycle effect.
+    try {
+      dependencies.store.appendDiagnostic({
+        severity: "warning",
+        component: "resource-runtime",
+        code: "RESOURCE_RUNTIME_REFRESH_FAILED",
+        message: "A managed resource change was saved, but its Backend runtime has not refreshed yet.",
+        details: { backendId, resourceId }
+      });
+    } catch {
+      // Store shutdown must not turn a durably completed Operation into an
+      // in-memory-only failure response.
+    }
+  }
 }
 
 async function ackOperation(
@@ -16094,7 +16433,14 @@ async function ackOperation(
   connection: ConnectionRecord,
   mutation: contract.OperationMutation,
   kind: string,
-  effect?: () => Promise<void>
+  effect?: () => Promise<void>,
+  precondition?: (store: OperationalStore) => void,
+  complete?: (
+    commit: (finalize?: (store: OperationalStore) => void) => OperationExecution<{ readonly accepted: true; readonly resultCase: "acknowledgement" }>
+  ) => Promise<OperationExecution<{ readonly accepted: true; readonly resultCase: "acknowledgement" }>>,
+  afterCompletion?: (
+    execution: OperationExecution<{ readonly accepted: true; readonly resultCase: "acknowledgement" }>
+  ) => Promise<void>
 ): Promise<PresentedOperation> {
   const execution = await dependencies.sessionHost.mutate({
     operationId,
@@ -16102,8 +16448,11 @@ async function ackOperation(
     kind,
     body: mutation,
     commit: () => ({ accepted: true, resultCase: "acknowledgement" } satisfies OperationOutcome),
-    ...(effect === undefined ? {} : { effect: () => effect() })
+    ...(precondition === undefined ? {} : { precondition }),
+    ...(effect === undefined ? {} : { effect: () => effect() }),
+    ...(complete === undefined ? {} : { complete })
   });
+  await afterCompletion?.(execution);
   return presented(execution);
 }
 
@@ -16861,7 +17210,6 @@ function toProtoSessionResource(
 ): contract.SessionResource | undefined {
   if (
     item.state !== "loaded"
-    || item.runtimePath === undefined
     || !validSessionResourceIdentityText(item.id)
     || !validSessionResourceIdentityText(item.revision)
     || item.resourceVersion === undefined

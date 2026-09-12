@@ -41,26 +41,26 @@ describe("translate", () => {
       "session.startMode",
       "projects.deleteSessionsBody",
       "scheduler.inputPlaceholder",
-      "settings.processUsage.empty"
-    ] as const;
-    for (const locale of ["en", "zh-CN"] as const) {
-      for (const key of sharedKeys) expect(translate(locale, key)).not.toContain("Pi");
-    }
-
-    const piOwnedKeys = [
+      "settings.processUsage.empty",
       "tools.resources",
       "settings.pi",
       "tools.subtitle",
       "tools.removeBody",
       "tools.noResources",
       "tools.noDiscoveredResources",
+      "settings.addResource",
+      "settings.resourceBackendUnavailable"
+    ] as const;
+    for (const locale of ["en", "zh-CN"] as const) {
+      for (const key of sharedKeys) expect(translate(locale, key)).not.toContain("Pi");
+    }
+
+    const piOwnedKeys = [
       "settings.compaction.description",
       "settings.piBody",
       "settings.piDefaults",
       "settings.autoCompactionBody",
       "settings.autoRetryBody",
-      "settings.addResource",
-      "settings.resourceBackendUnavailable",
       "resource.noCompatibleContents"
     ] as const;
     for (const locale of ["en", "zh-CN"] as const) {
@@ -70,10 +70,10 @@ describe("translate", () => {
     expect(translate("zh-CN", "permission.fullHelp"))
       .toBe("这不是 OS 沙箱。所选后端可使用服务账户读取凭证或修改已授权的额外目录。");
     expect(translate("zh-CN", "settings.resourceBackendUnavailable"))
-      .toBe("当前没有 Backend 支持受管 Pi 资源，因此暂时不能添加资源。");
+      .toBe("当前没有 Backend 声明受支持的受管资源类型，因此暂时不能添加资源。");
     expect(translate("zh-CN", "settings.toolPolicies.empty"))
       .toBe("此 Joko 节点没有可配置的内置工具供应商。");
-    expect(translate("en", "settings.pi")).toBe("Pi resources");
+    expect(translate("en", "settings.pi")).toBe("Runtime & resources");
   });
 
   it("keeps the architecture-facing service name out of every localized UI message", () => {

@@ -1758,6 +1758,10 @@ describe("PiBackendAdapter", () => {
     });
     expect(descriptor.capabilities.get("background.tasks")).toMatchObject({ supported: true });
     expect(descriptor.capabilities.get("input.mention")).toMatchObject({ supported: true, options: ["workspace_file", "resource"] });
+    expect(descriptor.capabilities.get("runtime.resources")).toMatchObject({
+      supported: true,
+      options: ["extension", "skill", "prompt", "package"]
+    });
     expect(descriptor.capabilities.get("background.tasks.cancel")).toMatchObject({ supported: true });
     for (const capability of [
       "subagents.list",
@@ -2330,7 +2334,9 @@ describe("PiBackendAdapter", () => {
       }, bound);
       const dispatched = process.commands.findLast((command) => command.type === "prompt");
       expect(dispatched?.message).toContain("Follow the exact release procedure.");
-      expect(dispatched?.message).toContain("Resource ID: \"release-prompt\"");
+      expect(dispatched?.message).not.toContain("Resource ID:");
+      expect(dispatched?.message).not.toContain("release-prompt");
+      expect(dispatched?.message).not.toContain(revision);
       expect(dispatched?.message).not.toContain("@release");
 
       const dispatches = process.commands.filter((command) => command.type === "prompt").length;
@@ -3046,6 +3052,27 @@ describe("PiBackendAdapter", () => {
     }
     expect(projected).toBe(depth);
     expect(roots[0]?.entryId).toBe("entry-0");
+  });
+
+  it("withholds managed-resource expansion text from native tree previews", () => {
+    const privateBody = "private-tree-resource-body-7f6c";
+    const roots = projectPiTreeNodes([{
+      entry: {
+        id: "resource-user",
+        type: "message",
+        message: {
+          role: "user",
+          content: [{
+            type: "text",
+            text: `[Joko loaded resource]\nName: \"Release\"\nKind: prompt\nContent:\n${privateBody}\n[End content]\n[/Joko loaded resource]`
+          }]
+        }
+      },
+      children: []
+    }], []);
+
+    expect(roots).toMatchObject([{ entryId: "resource-user", role: "user", label: undefined }]);
+    expect(JSON.stringify(roots)).not.toContain(privateBody);
   });
 
   it("routes expanded and duplicate queued inputs by accepted queue order instead of message text", async () => {

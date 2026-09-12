@@ -178,6 +178,8 @@ interface ActiveSession {
   readonly sessionId: string;
   /** Exact Backend process instance that owns this native runtime handle. */
   readonly backendInstanceGeneration: number;
+  /** Resource authority observed before this native runtime began activation. */
+  readonly resourceCatalogEpoch: bigint;
   lastActivityAt: number;
 }
 
@@ -677,6 +679,8 @@ export class SessionHost {
   readonly #active = new Map<string, ActiveSession>();
   /** Ephemeral authority populated only by the formal task-scoped live read. */
   readonly #activeResourceCatalogs = new Map<string, ActiveResourceCatalog>();
+  readonly #backendResourceCatalogEpochs = new Map<string, bigint>();
+  readonly #backendResourceCatalogFences = new Map<string, Map<symbol, bigint>>();
   readonly #activating = new Map<string, Promise<ActiveSession>>();
   readonly #nativeSessionCatalogFlights = new Map<string, NativeSessionCatalogFlight>();
   readonly #nativeSessionCatalogCache = new Map<string, NativeSessionCatalogCacheEntry>();
@@ -1811,6 +1815,7 @@ export class SessionHost {
       return { reviewerSessionId };
     }
     const backendInstanceGeneration = this.requireAdapterGeneration(target.descriptor.backendId, adapter);
+    const resourceCatalogEpoch = this.backendResourceCatalogEpoch(target.descriptor.backendId);
     const releaseBackendAdmission = this.beginBackendAdmissionEffect(target.descriptor.backendId);
     const now = Date.now();
     const context = this.provisionalContext(
@@ -1856,7 +1861,7 @@ export class SessionHost {
       this.assertCurrentAdapterGeneration(target.descriptor.backendId, adapter, backendInstanceGeneration);
       this.setActiveSession(
         reviewerSessionId,
-        this.activeSession(adapter, reviewerSessionId, backendInstanceGeneration)
+        this.activeSession(adapter, reviewerSessionId, backendInstanceGeneration, resourceCatalogEpoch)
       );
       return { reviewerSessionId };
     } catch (error) {
@@ -2285,7 +2290,7 @@ export class SessionHost {
     readonly sessionLifecycleFenceId?: string;
     /** Wrap the final synchronous Store completion in a serialized external commit protocol. */
     readonly complete?: (
-      commit: () => OperationExecution<T>
+      commit: (finalize?: (store: OperationalStore) => void) => OperationExecution<T>
     ) => Promise<OperationExecution<T>>;
     /**
      * A durable product-specific recovery record may make an effect safe to
@@ -2330,7 +2335,7 @@ export class SessionHost {
         installedLifecycleFence = true;
       }
       await input.effect();
-      const commit = (): OperationExecution<T> =>
+      const commit = (finalize?: (store: OperationalStore) => void): OperationExecution<T> =>
         this.#store.completeAuthorizedDeferredEffectOperation<T>(
           input.connection.id,
           input.connection.authKeyDigest,
@@ -2338,6 +2343,7 @@ export class SessionHost {
           claim.operation.bodyHash,
           (store) => {
             input.precondition?.(store);
+            finalize?.(store);
             return input.commit(store);
           }
         );
@@ -3238,6 +3244,42 @@ export class SessionHost {
       }
     }
     return applied;
+  }
+
+  /**
+   * Revoke every live resource catalog in the same synchronous call stack that
+   * publishes a managed-resource catalog change. The returned token keeps new
+   * live reads fenced until the corresponding Backend snapshot is available.
+   */
+  fenceBackendResourceCatalogs(backendId: string): symbol {
+    const epoch = this.nextBackendResourceCatalogEpoch(backendId);
+    const token = Symbol(`resource-catalog:${backendId}:${epoch}`);
+    const fences = this.#backendResourceCatalogFences.get(backendId) ?? new Map<symbol, bigint>();
+    fences.set(token, epoch);
+    this.#backendResourceCatalogFences.set(backendId, fences);
+    this.clearBackendResourceCatalogs(backendId);
+    return token;
+  }
+
+  /**
+   * Release this and every older change covered by the successfully published
+   * snapshot. Pi keeps already-running runtimes on their prior immutable
+   * snapshot, so those exact runtime owners remain revoked after publication.
+   */
+  completeBackendResourceCatalogRefresh(
+    backendId: string,
+    token: symbol,
+    activeRuntimesRetainPreviousSnapshot: boolean
+  ): void {
+    const fences = this.#backendResourceCatalogFences.get(backendId);
+    const completedEpoch = fences?.get(token);
+    if (fences === undefined || completedEpoch === undefined) return;
+    for (const [candidate, epoch] of fences) {
+      if (epoch <= completedEpoch) fences.delete(candidate);
+    }
+    if (fences.size === 0) this.#backendResourceCatalogFences.delete(backendId);
+    if (activeRuntimesRetainPreviousSnapshot) this.nextBackendResourceCatalogEpoch(backendId);
+    this.clearBackendResourceCatalogs(backendId);
   }
 
   /** Revoke every pending owner decision, then hot-fence the current ordered
@@ -4619,6 +4661,7 @@ export class SessionHost {
     const catalog = this.#activeResourceCatalogs.get(sessionId);
     if (
       active === undefined || catalog === undefined || catalog.active !== active
+      || !this.activeResourceCatalogIsCurrent(active)
       || catalog.productGeneration !== stored.descriptor.binding.generation
       || catalog.backendInstanceGeneration !== active.backendInstanceGeneration
       || mention.runtimeGeneration !== catalog.productGeneration
@@ -4636,7 +4679,6 @@ export class SessionHost {
       || resource.revision !== mention.discoveredRevision
       || resource.resourceVersion?.toString(10) !== mention.resourceVersion
       || resource.runtimeGeneration !== mention.runtimeGeneration
-      || resource.runtimePath === undefined
     ) {
       throw inputCapabilityError(
         "INPUT_RESOURCE_CATALOG_STALE",
@@ -5568,7 +5610,7 @@ export class SessionHost {
             const replaced = store.updateSession(sessionId, { binding: navigation.binding }, current.revision, Date.now(), {
               derivationOperationId: authority.operationId
             });
-            this.appendNativeHistory(store, replaced.descriptor, navigation.nativeHistory, authority.operationId);
+            this.appendNativeHistory(store, replaced.descriptor, lease!.active.adapter, navigation.nativeHistory, authority.operationId);
           }
           return { accepted: true, resultCase: "acknowledgement" } as const;
         },
@@ -5649,11 +5691,24 @@ export class SessionHost {
     const active = await this.activate(sessionId);
     const lease = this.beginActiveBackendSideEffect(sessionId, active);
     try {
+      if (!this.activeResourceCatalogIsCurrent(active)) {
+        this.#activeResourceCatalogs.delete(sessionId);
+        throw inputCapabilityError(
+          "INPUT_RESOURCE_CATALOG_STALE",
+          "The task resource catalog belongs to a managed snapshot that is no longer current."
+        );
+      }
       const resources = await active.adapter.getResources(lease.context);
       this.assertActiveBackendSideEffectLease(lease);
       await this.refreshRuntimeCommands(sessionId, active)
         .catch((error: unknown) => this.recordFailure("runtime_commands_resource_sync", error));
       this.assertActiveBackendSideEffectLease(lease);
+      if (!this.activeResourceCatalogIsCurrent(active)) {
+        throw inputCapabilityError(
+          "INPUT_RESOURCE_CATALOG_STALE",
+          "The task resource catalog changed while its live snapshot was being read."
+        );
+      }
       const copied = resources.map((resource) => ({ ...resource }));
       this.#activeResourceCatalogs.set(sessionId, {
         active,
@@ -5765,6 +5820,10 @@ export class SessionHost {
       const stored = this.#store.getSession(sessionId);
       if (filter.backendId !== undefined && stored.descriptor.backendId !== filter.backendId) continue;
       if (filter.targetId !== undefined && stored.descriptor.targetId !== filter.targetId) continue;
+      if (!this.activeResourceCatalogIsCurrent(active)) {
+        this.#activeResourceCatalogs.delete(sessionId);
+        continue;
+      }
       let lease: ActiveBackendSideEffectLease;
       try {
         lease = this.beginActiveBackendSideEffect(sessionId, active);
@@ -5775,9 +5834,11 @@ export class SessionHost {
         const resources = await active.adapter.getResources(lease.context).catch(() => undefined);
         if (resources === undefined) continue;
         this.assertActiveBackendSideEffectLease(lease);
+        if (!this.activeResourceCatalogIsCurrent(active)) continue;
         await this.refreshRuntimeCommands(sessionId, active)
           .catch((error: unknown) => this.recordFailure("runtime_commands_resource_observation", error));
         this.assertActiveBackendSideEffectLease(lease);
+        if (!this.activeResourceCatalogIsCurrent(active)) continue;
         for (const resource of resources) observations.push({
           backendId: lease.stored.descriptor.backendId,
           targetId: lease.stored.descriptor.targetId,
@@ -7290,6 +7351,8 @@ export class SessionHost {
     this.#inflightEmissions.clear();
     this.#active.clear();
     this.#activeResourceCatalogs.clear();
+    this.#backendResourceCatalogEpochs.clear();
+    this.#backendResourceCatalogFences.clear();
     this.#activating.clear();
     this.#draining.clear();
     this.#creationLocks.clear();
@@ -7390,6 +7453,7 @@ export class SessionHost {
     let replaced: StoredSession | undefined;
     let adapterForCleanup: BackendAdapter | undefined;
     let backendInstanceGeneration: number | undefined;
+    let resourceCatalogEpoch: bigint | undefined;
     let releaseBackendAdmission: (() => void) | undefined;
     try {
       const target = this.#store.getTarget(input.targetId);
@@ -7430,6 +7494,7 @@ export class SessionHost {
       const adapter = this.requireAdapter(target.descriptor.backendId);
       adapterForCleanup = adapter;
       backendInstanceGeneration = this.requireAdapterGeneration(target.descriptor.backendId, adapter);
+      resourceCatalogEpoch = this.backendResourceCatalogEpoch(target.descriptor.backendId);
       releaseBackendAdmission = this.beginBackendAdmissionEffect(target.descriptor.backendId);
       this.validateFastSelection(
         target.descriptor.backendId,
@@ -7699,7 +7764,7 @@ export class SessionHost {
       if (createdLiveRuntime) {
         this.setActiveSession(
           sessionId,
-          this.activeSession(adapter, sessionId, backendInstanceGeneration)
+          this.activeSession(adapter, sessionId, backendInstanceGeneration, resourceCatalogEpoch)
         );
       } else {
         await this.tryPortableSessionActivation(sessionId);
@@ -7781,6 +7846,7 @@ export class SessionHost {
       const target = this.#store.getTarget(input.targetId);
       const adapter = this.requireAdapter(target.descriptor.backendId);
       const backendInstanceGeneration = this.requireAdapterGeneration(target.descriptor.backendId, adapter);
+      const resourceCatalogEpoch = this.backendResourceCatalogEpoch(target.descriptor.backendId);
       const routedInput = this.resolveNewSessionRoute(target.descriptor.backendId, input);
       if (input.catalogImport === undefined) {
         this.assertBackendCreationReady(target.descriptor.backendId, routedInput);
@@ -8085,7 +8151,7 @@ export class SessionHost {
                 && nativeStart.parentNativeReference === undefined
             });
             if (nativeHistory !== undefined) {
-              this.appendNativeHistory(store, descriptor, nativeHistory, input.operationId);
+              this.appendNativeHistory(store, descriptor, adapter, nativeHistory, input.operationId);
             }
             if (authorized && input.initialPlacement === "dialogue") {
               const created = store.getSession(sessionId);
@@ -8113,7 +8179,7 @@ export class SessionHost {
         if (catalogBinding === undefined) {
           this.setActiveSession(
             sessionId,
-            this.activeSession(adapter, sessionId, backendInstanceGeneration)
+            this.activeSession(adapter, sessionId, backendInstanceGeneration, resourceCatalogEpoch)
           );
           const active = this.#active.get(sessionId)!;
           await this.refreshRuntimeCommands(sessionId, active)
@@ -8514,6 +8580,7 @@ export class SessionHost {
     }
     const adapter = this.requireAdapter(stored.descriptor.backendId);
     const backendInstanceGeneration = this.requireAdapterGeneration(stored.descriptor.backendId, adapter);
+    const resourceCatalogEpoch = this.backendResourceCatalogEpoch(stored.descriptor.backendId);
     const previousBinding = stored.descriptor.binding;
     const nextBinding = { ...previousBinding, generation: previousBinding.generation + 1 };
     stored = this.#store.updateSession(sessionId, { binding: nextBinding }, stored.revision);
@@ -8584,7 +8651,7 @@ export class SessionHost {
         adapter,
         backendInstanceGeneration
       );
-      const result = this.activeSession(adapter, sessionId, backendInstanceGeneration);
+      const result = this.activeSession(adapter, sessionId, backendInstanceGeneration, resourceCatalogEpoch);
       this.setActiveSession(sessionId, result);
       this.persistRuntimeUsage(sessionId, stored.descriptor.binding.generation, state.usage, false, state.providerId, state.modelId);
       await this.refreshNativeStateBestEffort(sessionId, result, "native_state_activation_sync", allowance);
@@ -10795,6 +10862,7 @@ export class SessionHost {
         this.appendNativeHistory(
           store,
           current.descriptor,
+          active.adapter,
           history,
           recovered?.baseline.operationId,
           recovered === undefined ? undefined : {
@@ -10886,6 +10954,7 @@ export class SessionHost {
   private appendNativeHistory(
     store: OperationalStore,
     session: SessionDescriptor,
+    adapter: BackendAdapter,
     history: NativeHistoryProjection,
     operationId?: string,
     recoveryOwnership?: {
@@ -10900,7 +10969,24 @@ export class SessionHost {
       readonly automaticContinuation: Extract<EventPayload, { readonly type: "message_complete" }>["automaticContinuation"];
     };
     const acceptedUserMetadata = new Map<string, AcceptedUserMetadata>();
+    const acceptedQueueInputs = new Map<string, QueueItemRecord>();
+    const nativeIdentityAdapter = adapter as BackendAdapter & {
+      readonly nativeUserEntryIdForOperation?: (operationId: string) => string;
+    };
     const bindingFingerprint = nativeBindingFingerprint(session.binding.opaqueRef);
+    if (nativeIdentityAdapter.nativeUserEntryIdForOperation !== undefined) {
+      for (const item of listAllQueueItems(store, { sessionId: session.id })) {
+        const entryId = nativeIdentityAdapter.nativeUserEntryIdForOperation(item.operationId);
+        if (entryId.trim() === "" || entryId.length > 4_096 || entryId.includes("\0")) {
+          throw new StoreError("Backend returned an invalid native user-entry identity for a durable Operation.");
+        }
+        const existing = acceptedQueueInputs.get(entryId);
+        if (existing !== undefined && existing.id !== item.id) {
+          throw new StoreError("Backend mapped multiple durable Queue items to the same native user-entry identity.");
+        }
+        acceptedQueueInputs.set(entryId, item);
+      }
+    }
     visitVisibleSessionEvents(store, session.id, (event) => {
       if (
         event.payload.type === "message_complete"
@@ -10926,34 +11012,63 @@ export class SessionHost {
     const projections = projectNativeHistory(session.id, session.binding.opaqueRef, history);
     for (const projection of projections) {
       const projectionEntryId = nativeHistoryEventContext(projection.payload)?.identity?.entryId;
+      const acceptedQueueItem = projection.payload.type === "message_complete"
+        && projection.payload.role === "user"
+        && projectionEntryId !== undefined
+        ? acceptedQueueInputs.get(projectionEntryId)
+        : undefined;
       const recoveredProjection = recoveryOwnership !== undefined && projectionEntryId !== undefined &&
         recoveryOwnership.nativeEntryIds.has(projectionEntryId);
       const acceptedMetadata = projection.payload.type === "message_complete"
         && projection.payload.role === "user"
         && nativeHistoryEventContext(projection.payload)?.identity?.entryId !== undefined
-        ? acceptedUserMetadata.get(nativeHistoryEventContext(projection.payload)!.identity!.entryId)
+          ? acceptedUserMetadata.get(nativeHistoryEventContext(projection.payload)!.identity!.entryId)
+          : undefined;
+      const recoveredQueueItem = recoveredProjection && recoveryOwnership !== undefined
+        ? store.findQueueItemByRunId(session.id, recoveryOwnership.runId)
         : undefined;
-      const payload = acceptedMetadata === undefined
+      let canonicalQueuePayload: EventPayload | undefined;
+      if (
+        (acceptedQueueItem !== undefined || recoveredQueueItem !== undefined)
+        && projection.payload.type === "message_complete"
+        && projection.payload.role === "user"
+      ) {
+        const queueItem = acceptedQueueItem ?? recoveredQueueItem!;
+        canonicalQueuePayload = this.withAcceptedInputMetadata({
+          ...projection.payload,
+          blocks: promptInputMessageBlocks(queueItem.body)
+        }, session.id, queueItem.runId);
+      }
+      const payload = canonicalQueuePayload ?? (acceptedMetadata === undefined
         ? projection.payload
         : {
             ...projection.payload,
-            ...(acceptedMetadata.acceptedInput === undefined ? {} : { acceptedInput: acceptedMetadata.acceptedInput }),
+            ...(acceptedMetadata.acceptedInput === undefined
+              ? {}
+              : {
+                  blocks: promptInputMessageBlocks(acceptedMetadata.acceptedInput),
+                  acceptedInput: acceptedMetadata.acceptedInput
+                }),
             ...(acceptedMetadata.automationOrigin === undefined ? {} : { automationOrigin: acceptedMetadata.automationOrigin }),
             ...(acceptedMetadata.inputDelivery === undefined ? {} : { inputDelivery: acceptedMetadata.inputDelivery }),
             ...(acceptedMetadata.automaticContinuation === undefined
               ? {}
               : { automaticContinuation: acceptedMetadata.automaticContinuation })
-          };
+          });
       store.appendEventIfAbsent({
         id: projection.id,
         ...(projection.emittedAt === undefined ? {} : { emittedAt: projection.emittedAt }),
         backendId: session.backendId,
         targetId: session.targetId,
         sessionId: session.id,
-        ...(operationId === undefined || (recoveryOwnership !== undefined && !recoveredProjection)
-          ? {}
-          : { operationId }),
-        ...(recoveredProjection ? { runId: recoveryOwnership.runId } : {}),
+        ...(acceptedQueueItem !== undefined
+          ? { operationId: acceptedQueueItem.operationId, runId: acceptedQueueItem.runId }
+          : {
+              ...(operationId === undefined || (recoveryOwnership !== undefined && !recoveredProjection)
+                ? {}
+                : { operationId }),
+              ...(recoveredProjection ? { runId: recoveryOwnership.runId } : {})
+            }),
         generation: session.binding.generation,
         traceId: `native-history:${projection.id}`,
         payload,
@@ -11044,6 +11159,7 @@ export class SessionHost {
     };
     return {
       ...nativePayload,
+      blocks: promptInputMessageBlocks(queued.body),
       acceptedInput: queued.body,
       ...(automationOrigin === undefined ? {} : { automationOrigin }),
       ...(queued.body.automaticContinuation === undefined
@@ -11089,7 +11205,8 @@ export class SessionHost {
   private activeSession(
     adapter: BackendAdapter,
     sessionId: string,
-    backendInstanceGeneration: number
+    backendInstanceGeneration: number,
+    resourceCatalogEpoch: bigint
   ): ActiveSession {
     const session = this.#store.getSession(sessionId);
     if (session.descriptor.backendId !== adapter.id) {
@@ -11099,8 +11216,30 @@ export class SessionHost {
       adapter,
       sessionId,
       backendInstanceGeneration,
+      resourceCatalogEpoch,
       lastActivityAt: this.#monotonicNow()
     };
+  }
+
+  private backendResourceCatalogEpoch(backendId: string): bigint {
+    return this.#backendResourceCatalogEpochs.get(backendId) ?? 0n;
+  }
+
+  private nextBackendResourceCatalogEpoch(backendId: string): bigint {
+    const next = this.backendResourceCatalogEpoch(backendId) + 1n;
+    this.#backendResourceCatalogEpochs.set(backendId, next);
+    return next;
+  }
+
+  private clearBackendResourceCatalogs(backendId: string): void {
+    for (const [sessionId, catalog] of this.#activeResourceCatalogs) {
+      if (catalog.active.adapter.id === backendId) this.#activeResourceCatalogs.delete(sessionId);
+    }
+  }
+
+  private activeResourceCatalogIsCurrent(active: ActiveSession): boolean {
+    return active.resourceCatalogEpoch === this.backendResourceCatalogEpoch(active.adapter.id)
+      && (this.#backendResourceCatalogFences.get(active.adapter.id)?.size ?? 0) === 0;
   }
 
   private setActiveSession(sessionId: string, active: ActiveSession): void {
@@ -11467,6 +11606,26 @@ export class SessionHost {
   #assertOpen(): void {
     if (this.#disposed) throw new Error("Session Host is closed.");
   }
+}
+
+function promptInputMessageBlocks(input: PromptInput): readonly MessageBlock[] {
+  const blocks: MessageBlock[] = [];
+  if (input.text.length > 0) blocks.push({ kind: "text", text: input.text });
+  for (const image of input.images) {
+    blocks.push({
+      kind: "image",
+      blob: image.blob,
+      ...(image.alt === undefined ? {} : { alt: image.alt })
+    });
+  }
+  for (const file of input.files) {
+    blocks.push({
+      kind: "artifact",
+      blob: file.blob,
+      label: file.workspacePath ?? file.blob.fileName ?? "file"
+    });
+  }
+  return blocks;
 }
 
 function planMessageDeletion(

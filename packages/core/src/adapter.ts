@@ -281,7 +281,8 @@ export interface RuntimeResource {
   readonly revision?: string;
   /** Exact managed-resource entity revision captured at runtime assembly. */
   readonly resourceVersion?: bigint;
-  /** Runtime-private copied path used only to correlate authoritative Pi RPC observations. */
+  /** Optional runtime-private copied path used when a Backend proves loading
+   * through a filesystem-backed runtime. In-memory runtime snapshots omit it. */
   readonly runtimePath?: string;
   /** Product runtime generation that made the observation. Required for loaded promotion. */
   readonly runtimeGeneration?: number;
@@ -508,6 +509,13 @@ export interface BackendAdapter {
   abortUserShell?(context: AdapterContext): Promise<void>;
   /** Read and project native append-only history at a persistence-confirmed sync point. */
   getNativeHistoryProjection?(context: AdapterContext): Promise<NativeHistoryProjection>;
+  /**
+   * Derive the stable opaque native user-entry identity assigned to one durable
+   * product Operation. Hosts may use this only to bind that Session's retained
+   * Queue input to an exact native-history entry; it must be deterministic
+   * across Adapter instances and service restarts.
+   */
+  nativeUserEntryIdForOperation?(operationId: string): string;
   /** Fence and settle adapter-owned background transitions before a replacement generation is published. */
   quiesceForReplacement?(): Promise<void>;
   /**
