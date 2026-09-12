@@ -58,6 +58,7 @@ describe("Connect service composition", () => {
       contract.ToolService,
       contract.BrowserService,
       contract.RemoteHostService,
+      contract.SshKeyService,
       contract.VoiceInputService,
       contract.TerminalService,
       contract.PiService

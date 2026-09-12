@@ -51,6 +51,20 @@ export interface AdapterContext {
   readonly storeArtifact: (sourcePath: string, options?: { fileName?: string; mimeType?: string }) => Promise<BlobRef>;
 }
 
+/** Service-owned authority for turning one opaque canonical Artifact identity
+ * into an immutable local file without exposing storage paths to clients. */
+export type ArtifactMentionResolver = (
+  artifactId: string,
+  context: AdapterContext,
+  signal: AbortSignal
+) => Promise<{
+  readonly blob: BlobRef;
+  readonly path: string;
+  /** Revalidate the original task, binding, Backend and Artifact record at the
+   * last synchronous boundary before native dispatch. */
+  readonly assertCurrent: () => void;
+}>;
+
 export interface AdapterEventMetadata {
   readonly namespace: string;
   readonly fields: Readonly<Record<string, string | number | boolean>>;

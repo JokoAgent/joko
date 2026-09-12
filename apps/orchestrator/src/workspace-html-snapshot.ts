@@ -67,10 +67,24 @@ export async function readWorkspaceHtmlSnapshot(input: {
       guard(); signal.throwIfAborted();
       return next;
     },
+    readDocument: async (path, signal) => {
+      const currentSignal = input.signal === undefined ? signal : AbortSignal.any([input.signal, signal]);
+      guard(); currentSignal.throwIfAborted();
+      if (!validHtmlPath(path)) {
+        throw new WorkspaceFilePreviewError("Invalid HTML document path.", "invalid");
+      }
+      const document = await reader.preview(path, WORKSPACE_TEXT_FILE_MAXIMUM_BYTES, WORKSPACE_TEXT_FILE_MAXIMUM_BYTES, currentSignal);
+      guard(); currentSignal.throwIfAborted();
+      if (document.text === undefined || document.truncated || document.mediaType !== "text/html"
+        || Buffer.byteLength(document.text, "utf8") > WORKSPACE_TEXT_FILE_MAXIMUM_BYTES) {
+        throw new WorkspaceFilePreviewError("HTML previews require a complete UTF-8 file of at most 2 MiB.", "unsupported");
+      }
+      return { html: document.text, mediaType: "text/html" as const };
+    },
     readResource: async (path, signal) => {
       const currentSignal = input.signal === undefined ? signal : AbortSignal.any([input.signal, signal]);
       guard(); currentSignal.throwIfAborted();
-      if (!path || path.startsWith("/") || path.includes("\\") || path.includes(":") || path.split("/").some((part) => !part || part === "." || part === "..")) {
+      if (!validWorkspaceReadPath(path)) {
         throw new WorkspaceFilePreviewError("Invalid HTML resource path.", "invalid");
       }
       const extension = path.slice(path.lastIndexOf(".")).toLowerCase();
@@ -92,11 +106,27 @@ export interface WorkspaceHtmlSnapshot {
   readonly html: string;
   readonly assertCurrent: () => void;
   readonly reload: (signal: AbortSignal) => Promise<WorkspaceHtmlSnapshot>;
+  readonly readDocument: (path: string, signal: AbortSignal) => Promise<{ readonly html: string; readonly mediaType: "text/html" }>;
   readonly readResource: (path: string, signal: AbortSignal) => Promise<{ readonly body: Buffer; readonly mediaType: string }>;
+}
+
+function validWorkspaceReadPath(path: string): boolean {
+  return path.length > 0 && path.length <= 4_096 && !path.startsWith("/") && !/[\\:\x00-\x1f]/u.test(path)
+    && path.split("/").every((part) => part !== "" && part !== "." && part !== "..");
+}
+
+function validHtmlPath(path: string): boolean {
+  return validWorkspaceReadPath(path) && /\.html?$/iu.test(path);
 }
 
 const HTML_RESOURCE_MEDIA = new Map([
   [".css", "text/css"], [".js", "text/javascript"], [".mjs", "text/javascript"],
+  [".json", "application/json"], [".wasm", "application/wasm"],
+  [".woff", "font/woff"], [".woff2", "font/woff2"], [".ttf", "font/ttf"], [".otf", "font/otf"],
   [".png", "image/png"], [".jpg", "image/jpeg"], [".jpeg", "image/jpeg"], [".gif", "image/gif"],
-  [".webp", "image/webp"], [".bmp", "image/bmp"], [".ico", "image/x-icon"], [".svg", "image/svg+xml"]
+  [".webp", "image/webp"], [".bmp", "image/bmp"], [".ico", "image/x-icon"], [".svg", "image/svg+xml"],
+  [".mp3", "audio/mpeg"], [".wav", "audio/wav"], [".ogg", "audio/ogg"], [".oga", "audio/ogg"],
+  [".m4a", "audio/mp4"], [".aac", "audio/aac"], [".flac", "audio/flac"], [".opus", "audio/ogg"],
+  [".mp4", "video/mp4"], [".m4v", "video/x-m4v"], [".mov", "video/quicktime"],
+  [".webm", "video/webm"], [".avi", "video/x-msvideo"], [".mkv", "video/x-matroska"]
 ]);

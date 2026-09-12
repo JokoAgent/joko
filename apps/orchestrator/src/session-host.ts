@@ -56,6 +56,7 @@ import {
 } from "@joko/store";
 import type {
   ConnectionRecord,
+  InteractionRecord,
   NativeSessionDerivationRecord,
   OperationExecution,
   OperationalStore,
@@ -6653,7 +6654,14 @@ export class SessionHost {
         recovery: "Refresh the task before responding to another interaction."
       });
     }
-    this.#store.resolveInteraction(id, generation, decision, traceId, operationId);
+    let continuation: EnqueueResult | undefined;
+    this.#store.transaction((store) => {
+      store.resolveInteraction(id, generation, decision, traceId, operationId);
+      if (decision.kind === "plan_review" && decision.decision === "execute") {
+        store.updateSession(interaction.sessionId, { planMode: false });
+      }
+      continuation = this.commitPostTurnPlanReviewContinuation(store, interaction, decision);
+    });
     if (pending?.generation === generation) {
       this.#pendingInteractions.delete(id);
       clearPendingInteractionExpiry(pending);
@@ -6661,12 +6669,107 @@ export class SessionHost {
     }
     this.refreshRunSilenceWatchdog(interaction.sessionId);
     if (decision.kind === "plan_review" && decision.decision === "execute") {
-      this.#store.updateSession(interaction.sessionId, { planMode: false });
       this.#dismissPendingInteractions(
         new Set([interaction.sessionId]),
         "Plan mode ended after the approved plan was scheduled for execution."
       );
     }
+    if (continuation !== undefined) {
+      queueMicrotask(() => void this.drain(continuation!.sessionId));
+    }
+  }
+
+  /**
+   * A plan review opened after its source Run settled cannot resume an
+   * in-flight native callback. Admit its execute/refine consequence as a new
+   * deterministic child Run in the same transaction that resolves the
+   * Interaction, so a restart can never retain the decision without its
+   * corresponding Queue item. */
+  private commitPostTurnPlanReviewContinuation(
+    store: OperationalStore,
+    interaction: InteractionRecord,
+    decision: InteractionDecision
+  ): EnqueueResult | undefined {
+    if (interaction.payload.kind !== "plan_review" || decision.kind !== "plan_review"
+      || interaction.runId === undefined || decision.decision === "stay") return undefined;
+    const sourceRun = store.getRun(interaction.runId).descriptor;
+    if (sourceRun.sessionId !== interaction.sessionId || sourceRun.state !== "completed") return undefined;
+    const feedback = decision.feedback.trim();
+    const text = decision.decision === "execute"
+      ? "Implement the plan."
+      : feedback;
+    if (text.length === 0) return undefined;
+    const prompt: PromptInput = {
+      text,
+      images: [],
+      files: [],
+      mentions: [],
+      disposition: "prompt"
+    };
+    const acceptedPrompt = this.canonicalQueuedPrompt(interaction.sessionId, prompt);
+    assertPromptInlineTextRanges(acceptedPrompt);
+    this.assertInputCapabilities(interaction.sessionId, acceptedPrompt);
+    const session = store.getSession(interaction.sessionId).descriptor;
+    if (session.deletedAt !== undefined || session.archived) {
+      throw new StoreError("The plan-review task is archived or deleted.");
+    }
+    this.assertBackendAdmissionOpen(session.backendId);
+    this.assertSessionNotPendingScheduleDeletion(interaction.sessionId);
+    this.assertMessageDeletionAdmission(interaction.sessionId);
+    const continuationOperationId = stableId(
+      "plan-continuation",
+      `${interaction.id}:${interaction.generation}:${decision.decision}`
+    );
+    const runId = stableId("run", continuationOperationId);
+    const existingChild = store.findRunByParentId(sourceRun.id);
+    if (existingChild !== undefined && existingChild.descriptor.id !== runId) {
+      throw new StoreError("The reviewed plan already has a different durable continuation.");
+    }
+    const attemptId = stableId("attempt", continuationOperationId);
+    const queueItemId = stableId("queue", continuationOperationId);
+    const now = Date.now();
+    const execution = store.runOperation(
+      {
+        id: continuationOperationId,
+        kind: "plan_review_continuation",
+        body: {
+          sessionId: interaction.sessionId,
+          interactionId: interaction.id,
+          sourceRunId: sourceRun.id,
+          decision: decision.decision,
+          prompt: acceptedPrompt
+        }
+      },
+      (owner) => {
+        owner.createRun({
+          id: runId,
+          sessionId: interaction.sessionId,
+          source: "system",
+          state: "queued",
+          parentRunId: sourceRun.id,
+          createdAt: now
+        });
+        owner.createAttempt({
+          id: attemptId,
+          runId,
+          ordinal: 1,
+          generation: owner.getSession(interaction.sessionId).descriptor.binding.generation,
+          startedAt: now
+        });
+        owner.enqueueQueueItem({
+          id: queueItemId,
+          sessionId: interaction.sessionId,
+          runId,
+          attemptId,
+          operationId: continuationOperationId,
+          disposition: acceptedPrompt.disposition,
+          body: acceptedPrompt,
+          createdAt: now
+        });
+        return { sessionId: interaction.sessionId, runId, attemptId, queueItemId };
+      }
+    );
+    return execution.value;
   }
 
   dismissInteraction(id: string, generation: number, reason: string, traceId: string, operationId?: string): void {

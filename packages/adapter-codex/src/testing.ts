@@ -120,6 +120,7 @@ export class FakeCodexAppServer {
   readonly threads = new Map<string, FakeThread>();
   timeoutNextTurnStart = false;
   completeTurnBeforeStartResponse = false;
+  completePlanTurnBeforeStartResponse: string | undefined;
   emitNameBeforeStartResponse = false;
   malformedNextTurnStartResponse = false;
   dropNextTurnClientId = false;
@@ -176,6 +177,22 @@ export class FakeCodexAppServer {
         modelContextWindow: 128_000
       }
     });
+    turn["status"] = "completed";
+    turn["items"] = [...((turn["items"] as JsonValue[]) ?? []), item];
+    thread.status = { type: "idle" };
+    await transport.emitNotification("turn/completed", { threadId, turn });
+  }
+
+  async completePlanTurn(threadId: string, text: string): Promise<void> {
+    const transport = this.#requireTransport();
+    const thread = this.#thread(threadId);
+    const turn = thread.turns.at(-1);
+    if (turn === undefined) throw new Error("No fake turn is active.");
+    const turnId = String(turn["id"]);
+    const item = { type: "plan", id: `plan-${turnId}`, text };
+    await transport.emitNotification("item/started", { threadId, turnId, item, startedAtMs: Date.now() });
+    await transport.emitNotification("item/plan/delta", { threadId, turnId, itemId: item.id, delta: text });
+    await transport.emitNotification("item/completed", { threadId, turnId, item, completedAtMs: Date.now() });
     turn["status"] = "completed";
     turn["items"] = [...((turn["items"] as JsonValue[]) ?? []), item];
     thread.status = { type: "idle" };
@@ -407,6 +424,22 @@ export class FakeCodexAppServer {
         thread.status = { type: "active", activeFlags: [] };
         thread.updatedAt = Math.trunc(Date.now() / 1_000);
         await transport.emitNotification("turn/started", { threadId: thread.id, turn });
+        if (this.completePlanTurnBeforeStartResponse !== undefined) {
+          const text = this.completePlanTurnBeforeStartResponse;
+          this.completePlanTurnBeforeStartResponse = undefined;
+          const turnId = String(turn["id"]);
+          const item = { type: "plan", id: `plan-${turnId}`, text };
+          await transport.emitNotification("item/completed", {
+            threadId: thread.id,
+            turnId,
+            item,
+            completedAtMs: Date.now()
+          });
+          turn["status"] = "completed";
+          turn["items"] = [...((turn["items"] as JsonValue[]) ?? []), item];
+          thread.status = { type: "idle" };
+          await transport.emitNotification("turn/completed", { threadId: thread.id, turn });
+        }
         if (this.completeTurnBeforeStartResponse) {
           this.completeTurnBeforeStartResponse = false;
           turn["status"] = "completed";

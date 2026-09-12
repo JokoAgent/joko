@@ -191,7 +191,7 @@ describe("Connect Browser takeover revocation cleanup", () => {
         sessionId: "session-html",
         targetId: "target-html",
         bindingGeneration: 1,
-        url: `https://workspace-${index}.preview.joko.invalid/private-${index}.html`,
+        url: `http://workspace-${index}.preview.joko.localhost/private-${index}.html`,
         title: "HTML preview",
         updatedAt: index + 1
       }, { active: index === 1 });

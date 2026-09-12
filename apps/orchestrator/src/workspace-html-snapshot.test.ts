@@ -1,4 +1,4 @@
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { OperationalStore } from "@joko/store";
@@ -29,10 +29,29 @@ describe("workspace HTML snapshot authority", () => {
       await expect(readWorkspaceHtmlSnapshot({ ...input, source: { ...input.source, expectedRevision: (await workspaces.preview("workspace", "index.html")).entry.revision } })).rejects.toMatchObject({ kind: "stale" });
       const navigation = new AbortController();
       const readSignal = navigation.signal;
+      await mkdir(join(root, "pages"));
+      await writeFile(join(root, "pages", "details.html"), "<!doctype html><p>Details</p>");
+      await writeFile(join(root, "pages", "not-html.txt"), "not html");
+      expect(await snapshot.readDocument("pages/details.html", readSignal)).toEqual({ html: "<!doctype html><p>Details</p>", mediaType: "text/html" });
+      await expect(snapshot.readDocument("pages/not-html.txt", readSignal)).rejects.toMatchObject({ kind: "invalid" });
+      await expect(snapshot.readDocument("../outside.html", readSignal)).rejects.toMatchObject({ kind: "invalid" });
       await writeFile(join(root, "style.css"), "p { color: red }");
       expect(await snapshot.readResource("style.css", readSignal)).toEqual({ body: Buffer.from("p { color: red }"), mediaType: "text/css" });
       await writeFile(join(root, "private.json"), '{"value":"private"}');
-      await expect(snapshot.readResource("private.json", readSignal)).rejects.toMatchObject({ kind: "unsupported" });
+      expect(await snapshot.readResource("private.json", readSignal)).toEqual({ body: Buffer.from('{"value":"private"}'), mediaType: "application/json" });
+      const binaryResources = [
+        ["module.wasm", "application/wasm"],
+        ["font.woff2", "font/woff2"],
+        ["sound.mp3", "audio/mpeg"],
+        ["movie.mp4", "video/mp4"]
+      ] as const;
+      for (const [name, mediaType] of binaryResources) {
+        const body = Buffer.from([0, 1, 2, 3]);
+        await writeFile(join(root, name), body);
+        expect(await snapshot.readResource(name, readSignal)).toEqual({ body, mediaType });
+      }
+      await writeFile(join(root, "private.bin"), Buffer.from([0, 1, 2, 3]));
+      await expect(snapshot.readResource("private.bin", readSignal)).rejects.toMatchObject({ kind: "unsupported" });
       await expect(snapshot.readResource("../outside.css", readSignal)).rejects.toMatchObject({ kind: "invalid" });
       await writeFile(join(root, "large.png"), Buffer.alloc(2 * 1024 * 1024 + 1));
       await expect(snapshot.readResource("large.png", readSignal)).rejects.toMatchObject({ kind: "unsupported" });
@@ -51,6 +70,7 @@ describe("workspace HTML snapshot authority", () => {
       await expect(readWorkspaceHtmlSnapshot(input)).rejects.toThrow();
       owner.retire();
       expect(snapshot.assertCurrent).toThrow(/owner changed/u);
+      await expect(snapshot.readDocument("pages/details.html", readSignal)).rejects.toMatchObject({ kind: "stale" });
       await expect(snapshot.readResource("style.css", readSignal)).rejects.toMatchObject({ kind: "stale" });
     } finally { await rm(root, { recursive: true, force: true }); }
   });
@@ -89,7 +109,7 @@ describe("workspace HTML snapshot authority", () => {
     await expect(retired).rejects.toMatchObject({ kind: "stale" });
   });
 
-  it.each(["resource", "reload"] as const)("propagates original connection cancellation to an in-flight %s read", async (kind) => {
+  it.each(["document", "resource", "reload"] as const)("propagates original connection cancellation to an in-flight %s read", async (kind) => {
     const owner = authority();
     const original = new AbortController();
     const navigation = new AbortController();
@@ -103,7 +123,8 @@ describe("workspace HTML snapshot authority", () => {
     const snapshot = await readWorkspaceHtmlSnapshot({ store: owner.store, workspaces: {} as WorkspaceService,
       authority: { identity: "workspace", assertCurrent: () => undefined, preview }, signal: original.signal,
       sessionId: "session", source: { workspaceId: "workspace", relativePath: "index.html", expectedRevision: "" }, assertConnection: () => undefined });
-    const pending = kind === "resource" ? snapshot.readResource("script.js", navigation.signal) : snapshot.reload(navigation.signal);
+    const pending = kind === "document" ? snapshot.readDocument("next.html", navigation.signal)
+      : kind === "resource" ? snapshot.readResource("script.js", navigation.signal) : snapshot.reload(navigation.signal);
     expect(readSignal?.aborted).toBe(false);
     original.abort();
     expect(readSignal?.aborted).toBe(true);

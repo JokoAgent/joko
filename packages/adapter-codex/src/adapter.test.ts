@@ -9,6 +9,7 @@ import type {
   EventPayload,
   InteractionDecision,
   InteractionPayload,
+  MentionInput,
   NativeSessionBinding,
   ManagedProviderRuntimePort,
   ManagedProviderRouteBinding,
@@ -105,6 +106,115 @@ describe("CodexBackendAdapter", () => {
     expect(setup.fake.transport?.requests.filter((request) => request.method === "turn/start")).toEqual([]);
   });
 
+  it("resolves a canonical Artifact through its service authority and rechecks it at native dispatch", async () => {
+    const bytes = Buffer.from("canonical artifact", "utf8");
+    let artifactPath = "";
+    let current = true;
+    const assertCurrent = vi.fn(() => { if (!current) throw new Error("retired authority"); });
+    const resolveArtifactMention = vi.fn(async () => ({
+      blob: {
+        id: "artifact-one",
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+        byteLength: bytes.byteLength,
+        mimeType: "text/plain",
+        fileName: "report.txt"
+      },
+      path: artifactPath,
+      assertCurrent
+    }));
+    const setup = await createSetup(7, { resolveArtifactMention });
+    artifactPath = join(setup.target.workspaceRoot, "canonical-artifact.txt");
+    await writeFile(artifactPath, bytes);
+    const descriptor = await setup.adapter.describe();
+    expect(descriptor.capabilities.get("input.mention")).toMatchObject({
+      supported: true,
+      options: ["workspace_file", "artifact"]
+    });
+    const binding = await setup.adapter.createSession(
+      sessionInput(setup.target),
+      context(setup.target, [], { backendInstanceGeneration: 7 })
+    );
+    const owner = context(setup.target, [], {
+      binding,
+      backendInstanceGeneration: 7,
+      operationId: "canonical-artifact"
+    });
+    await expect(setup.adapter.send({
+      ...prompt("Inspect lines"),
+      mentions: [{
+        kind: "artifact",
+        label: "Report",
+        reference: "artifact-one",
+        lineRange: { startLine: 1, endLine: 2 }
+      } as unknown as MentionInput]
+    }, { ...owner, operationId: "artifact-line-range" })).rejects.toMatchObject({
+      publicError: { code: "CODEX_ARTIFACT_REFERENCE_INVALID", stateMayHaveChanged: false }
+    });
+    expect(resolveArtifactMention).not.toHaveBeenCalled();
+    await setup.adapter.send({
+      ...prompt("Inspect"),
+      mentions: [{ kind: "artifact", label: "Report", reference: "artifact-one" }]
+    }, owner);
+    expect(resolveArtifactMention).toHaveBeenCalledWith("artifact-one", owner, owner.signal);
+    expect(assertCurrent.mock.calls.length).toBeGreaterThanOrEqual(3);
+    expect(setup.fake.transport?.requests.find((request) => request.method === "turn/start")?.params).toMatchObject({
+      input: [{
+        type: "text",
+        text: `Inspect\n\nArtifact reference: ${JSON.stringify({ name: "Report", path: artifactPath })}`,
+        text_elements: []
+      }]
+    });
+    await setup.fake.completeTurn(binding.nativeSessionId!, "done");
+
+    const transport = setup.fake.transport!;
+    const request = transport.request.bind(transport);
+    transport.request = async (...args: Parameters<typeof transport.request>) => {
+      if (args[0] === "turn/start") current = false;
+      return request(...args);
+    };
+    await expect(setup.adapter.send({
+      ...prompt("Again"),
+      mentions: [{ kind: "artifact", label: "Report", reference: "artifact-one" }]
+    }, { ...owner, operationId: "retired-artifact" })).rejects.toMatchObject({
+      publicError: { code: "CODEX_ARTIFACT_UNAVAILABLE", stateMayHaveChanged: false }
+    });
+    expect(setup.fake.transport?.requests.filter((request) => request.method === "turn/start")).toHaveLength(1);
+  });
+
+  it("rejects an Artifact whose service-owned file no longer matches its immutable digest", async () => {
+    const expected = Buffer.from("expected", "utf8");
+    let artifactPath = "";
+    const setup = await createSetup(7, {
+      resolveArtifactMention: async () => ({
+        blob: {
+          id: "artifact-tampered",
+          sha256: createHash("sha256").update(expected).digest("hex"),
+          byteLength: expected.byteLength,
+          mimeType: "text/plain"
+        },
+        path: artifactPath,
+        assertCurrent: () => undefined
+      })
+    });
+    artifactPath = join(setup.target.workspaceRoot, "tampered-artifact.txt");
+    await writeFile(artifactPath, "tampered", "utf8");
+    const binding = await setup.adapter.createSession(
+      sessionInput(setup.target),
+      context(setup.target, [], { backendInstanceGeneration: 7 })
+    );
+    await expect(setup.adapter.send({
+      ...prompt("Inspect"),
+      mentions: [{ kind: "artifact", label: "Report", reference: "artifact-tampered" }]
+    }, context(setup.target, [], {
+      binding,
+      backendInstanceGeneration: 7,
+      operationId: "tampered-artifact"
+    }))).rejects.toMatchObject({
+      publicError: { code: "CODEX_FILE_INTEGRITY_FAILED", stateMayHaveChanged: false }
+    });
+    expect(setup.fake.transport?.requests.filter((request) => request.method === "turn/start")).toEqual([]);
+  });
+
   it("probes stable account/models, drains pre-subscription events, and translates a complete turn", async () => {
     const setup = await createSetup();
     setup.fake.emitNameBeforeStartResponse = true;
@@ -162,7 +272,7 @@ describe("CodexBackendAdapter", () => {
       text: "work on this",
       images: [],
       files: [{
-        blob: { id: "blob-file", sha256: "0".repeat(64), byteLength: 5, mimeType: "text/plain", fileName: "notes\"\n.txt" },
+        blob: { id: "blob-file", sha256: createHash("sha256").update("notes").digest("hex"), byteLength: 5, mimeType: "text/plain", fileName: "notes\"\n.txt" },
         workspacePath: "notes.txt"
       }],
       mentions: [{ kind: "workspace_file", label: "Notes\"\nreference", reference: "notes.txt" }],
@@ -558,7 +668,7 @@ describe("CodexBackendAdapter", () => {
       text: "",
       images: [],
       files: [{
-        blob: { id: "bounded-file", sha256: "0".repeat(64), byteLength: 7, mimeType: "text/plain" },
+        blob: { id: "bounded-file", sha256: createHash("sha256").update("bounded").digest("hex"), byteLength: 7, mimeType: "text/plain" },
         workspacePath: "bounded.txt"
       }],
       mentions: [],
@@ -2036,6 +2146,119 @@ describe("CodexBackendAdapter", () => {
     await expect(setup.adapter.abort(boundReview)).resolves.toBeUndefined();
     await expect(setup.adapter.closeSession(binding, boundReview)).resolves.toBeUndefined();
     expect(await stat(String(reviewCwd)).catch(() => undefined)).toBeUndefined();
+  });
+
+  it("opens a completed native plan through the shared review Interaction and resets execution to default", async () => {
+    const setup = await createSetup();
+    const descriptor = await setup.adapter.describe();
+    expect(descriptor.capabilities.get("interaction.plan_review")).toMatchObject({ supported: true });
+    const events: EventPayload[] = [];
+    const requests: InteractionPayload[] = [];
+    let resolveDecision!: (decision: InteractionDecision) => void;
+    const decision = new Promise<InteractionDecision>((resolve) => { resolveDecision = resolve; });
+    const binding = await setup.adapter.createSession(
+      sessionInput(setup.target),
+      context(setup.target, events, { backendInstanceGeneration: 7 })
+    );
+    const active = context(setup.target, events, {
+      binding,
+      backendInstanceGeneration: 7,
+      operationId: "plan-review-source",
+      requestInteraction: async (request) => {
+        requests.push(request);
+        expect(events.at(-1)).toMatchObject({ type: "done", outcome: "completed" });
+        return decision;
+      }
+    });
+
+    await setup.adapter.setPlanMode(true, { ...active, operationId: "plan-review-enable" });
+    await setup.adapter.send(prompt("make a plan"), active);
+    await setup.fake.completePlanTurn(binding.nativeSessionId!, "1. Inspect\n2. Implement");
+    await vi.waitFor(() => expect(requests).toHaveLength(1));
+    expect(requests[0]).toEqual(expect.objectContaining({
+      kind: "plan_review",
+      title: "Review plan",
+      markdown: "1. Inspect\n2. Implement",
+      choices: ["execute", "stay", "refine"]
+    }));
+    expect(events.some((event) => event.type === "text_delta")).toBe(false);
+
+    resolveDecision({ kind: "plan_review", decision: "execute", feedback: "" });
+    await vi.waitFor(async () => {
+      await expect(setup.adapter.inspectSession(binding, { ...active, operationId: "inspect-plan-review" }))
+        .resolves.toMatchObject({ planMode: false });
+    });
+    await setup.adapter.send(prompt("Implement the plan."), {
+      ...active,
+      operationId: "plan-review-continuation"
+    });
+    expect(setup.fake.transport?.requests.filter((request) => request.method === "turn/start").at(-1)?.params)
+      .toMatchObject({
+        collaborationMode: {
+          mode: "default",
+          settings: { developer_instructions: null }
+        }
+      });
+    await setup.fake.completeTurn(binding.nativeSessionId!);
+  });
+
+  it("does not open plan review for a native plan item from a non-plan turn", async () => {
+    const setup = await createSetup();
+    await setup.adapter.describe();
+    const events: EventPayload[] = [];
+    const requestInteraction = vi.fn<AdapterContext["requestInteraction"]>(async () => ({ kind: "cancelled" }));
+    const binding = await setup.adapter.createSession(
+      sessionInput(setup.target),
+      context(setup.target, events, { backendInstanceGeneration: 7 })
+    );
+    await setup.adapter.send(prompt("normal work"), context(setup.target, events, {
+      binding,
+      backendInstanceGeneration: 7,
+      operationId: "normal-plan-item",
+      requestInteraction
+    }));
+    await setup.fake.completePlanTurn(binding.nativeSessionId!, "native plan-like output");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(requestInteraction).not.toHaveBeenCalled();
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "text_delta",
+      delta: "native plan-like output"
+    }));
+  });
+
+  it("keeps the originating Run context when a native plan completes before turn/start responds", async () => {
+    const setup = await createSetup();
+    await setup.adapter.describe();
+    const events: EventPayload[] = [];
+    const requestInteraction = vi.fn<AdapterContext["requestInteraction"]>(async () => ({
+      kind: "plan_review",
+      decision: "stay",
+      feedback: ""
+    }));
+    const binding = await setup.adapter.createSession(
+      sessionInput(setup.target),
+      context(setup.target, events, { backendInstanceGeneration: 7 })
+    );
+    const active = context(setup.target, events, {
+      binding,
+      backendInstanceGeneration: 7,
+      operationId: "early-plan-owner",
+      requestInteraction
+    });
+    await setup.adapter.setPlanMode(true, { ...active, operationId: "early-plan-enable" });
+    setup.fake.completePlanTurnBeforeStartResponse = "1. Capture the early plan";
+
+    await setup.adapter.send(prompt("plan early"), active);
+    await vi.waitFor(() => expect(requestInteraction).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: "plan_review",
+        markdown: "1. Capture the early plan"
+      }),
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    ));
+    expect(events.filter((event) => event.type === "done")).toEqual([
+      { type: "done", outcome: "completed" }
+    ]);
   });
 
   it("applies exact sticky Plan collaboration settings and explicitly resets later turns", async () => {

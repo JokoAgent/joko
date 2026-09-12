@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { lstat, open, realpath } from "node:fs/promises";
 import { basename, isAbsolute, relative, resolve, sep } from "node:path";
-import { JokoError, type AdapterContext, type BlobRef, type PromptInput } from "@joko/core";
+import { JokoError, type AdapterContext, type ArtifactMentionResolver, type BlobRef, type PromptInput } from "@joko/core";
 import { claudeCodeError } from "./errors.js";
 import type { ClaudeSdkUserMessage } from "./sdk-runtime.js";
 
@@ -11,11 +11,7 @@ export interface ClaudeInputResolvers {
   /** Resolves an immutable Artifact to its host-owned regular file. */
   readonly resolveFile?: (blob: BlobRef, context: AdapterContext) => Promise<string>;
   /** Resolves only a committed Artifact in the original task's authority. */
-  readonly resolveArtifactMention?: (artifactId: string, context: AdapterContext, signal: AbortSignal) => Promise<{
-    readonly blob: BlobRef;
-    readonly path: string;
-    readonly assertCurrent: () => void;
-  }>;
+  readonly resolveArtifactMention?: ArtifactMentionResolver;
 }
 
 const MAXIMUM_IMAGE_BYTES = 5 * 1024 * 1024;

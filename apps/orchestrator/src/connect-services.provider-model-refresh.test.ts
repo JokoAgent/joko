@@ -31,7 +31,13 @@ describe("Provider model refresh operation", () => {
     const services = createConnectServices(stubApplication({
       store,
       sessionHost: immediateHost(store),
-      providers: {},
+      providers: {
+        nativeAuthenticationBackendId: "managed-backend",
+        list: () => [{
+          backendId: "managed-backend",
+          provider: { id: "provider-one" }
+        }]
+      },
       providerAuth: { refreshModelCatalogs },
       messageSearch: { reconcileAvailability }
     }));

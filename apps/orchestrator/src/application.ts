@@ -835,6 +835,17 @@ export async function createOrchestratorApplication(
         readBlob: (blob) => artifacts.readBlob(blob),
         resolveFile: (blob) => artifacts.resolveBlobPath(blob),
         maximumBlobBytes: artifacts.maximumBlobBytes,
+        resolveArtifactMention: createArtifactMentionResolver({
+          store, artifacts,
+          resolveTarget: (session) => sessionWorktrees.effectiveTarget(session),
+          assertBackendCurrent: (context) => {
+            const current = backendInstances.get(instanceId);
+            if (context.target.backendId !== instanceId || context.backendInstanceGeneration !== generation
+              || current.state !== "available" || current.generation !== generation) {
+              throw new Error("The Artifact input Backend instance is no longer current.");
+            }
+          }
+        }),
         hostCapabilities: HOST_COMPOSED_CAPABILITIES
       })
     },

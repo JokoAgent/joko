@@ -109,7 +109,10 @@ export interface WorkspaceFilePreview {
   readonly mediaType: string;
   readonly text?: string;
   /**
-   * Complete, revision-fenced bytes for a bounded local raster image or PDF.
+   * Complete, revision-fenced bytes for a bounded binary preview. Ordinary
+   * callers still receive bytes only for the media types owned by preview UI;
+   * an authority caller may opt into another complete binary with its explicit
+   * maximumFileBytes bound.
    * Absolute workspace paths never cross this service boundary.
    */
   readonly bytes?: Buffer;
@@ -648,8 +651,16 @@ export class WorkspaceService {
     }
     const mediaType = inferMediaType(resolved.path);
     const mediaLimit = workspaceMediaPreviewLimit(resolved.path);
-    if (mediaLimit !== undefined) {
-      const maximumMediaBytes = Math.min(mediaLimit, WORKSPACE_MEDIA_PREVIEW_TOTAL_MAXIMUM_BYTES);
+    const completeBinaryLimit = maximumFileBytes !== undefined && !isTextMediaType(mediaType)
+      ? maximumFileBytes
+      : undefined;
+    const binaryReadLimit = mediaLimit === undefined
+      ? completeBinaryLimit
+      : completeBinaryLimit === undefined
+        ? mediaLimit
+        : Math.min(mediaLimit, completeBinaryLimit);
+    if (binaryReadLimit !== undefined) {
+      const maximumMediaBytes = Math.min(binaryReadLimit, WORKSPACE_MEDIA_PREVIEW_TOTAL_MAXIMUM_BYTES);
       if (resolved.info.size > maximumMediaBytes) {
         return {
           entry: workspaceFileEntry(resolved.path, resolved.info, metadataFileRevision(resolved.info)),
@@ -754,6 +765,8 @@ export class WorkspaceService {
           signal?.throwIfAborted();
           await this.#afterWorkspaceArtifactRead?.({ workspaceId: workspace.id, path: resolved.path });
           signal?.throwIfAborted();
+          const beforeVerification = await handle.stat();
+          const verifiedSnapshot = await digestFileHandle(handle, snapshot.byteLength, signal);
           const after = await handle.stat();
           let current: WorkspaceResolvedPreviewFile;
           try {
@@ -763,8 +776,11 @@ export class WorkspaceService {
           }
           if (
             snapshot.byteLength !== before.size
+            || verifiedSnapshot.byteLength !== snapshot.byteLength
+            || verifiedSnapshot.sha256 !== snapshot.sha256
             || current.absolute !== resolved.absolute
-            || !sameFileState(before, after)
+            || !sameFileState(before, beforeVerification)
+            || !sameFileState(beforeVerification, after)
             || !sameFileState(after, current.info)
           ) {
             throw new WorkspaceFilePreviewError("Workspace file changed while it was being downloaded.", "stale");
@@ -3593,6 +3609,30 @@ async function readFileHandlePrefix(handle: FileHandle, maximumBytes: number): P
   return buffer.subarray(0, offset);
 }
 
+async function digestFileHandle(
+  handle: FileHandle,
+  maximumBytes: number,
+  signal?: AbortSignal
+): Promise<{ readonly sha256: string; readonly byteLength: number }> {
+  const hash = createHash("sha256");
+  const buffer = Buffer.allocUnsafe(64 * 1024);
+  let position = 0;
+  while (position < maximumBytes) {
+    signal?.throwIfAborted();
+    const result = await handle.read(
+      buffer,
+      0,
+      Math.min(buffer.byteLength, maximumBytes - position),
+      position
+    );
+    if (result.bytesRead === 0) break;
+    hash.update(buffer.subarray(0, result.bytesRead));
+    position += result.bytesRead;
+  }
+  signal?.throwIfAborted();
+  return { sha256: hash.digest("hex"), byteLength: position };
+}
+
 function encodeWorkspaceText(value: string): Buffer {
   if (value.includes("\0") || hasUnpairedSurrogate(value)) {
     throw new WorkspaceTextFileWriteError("Workspace save requires valid UTF-8 text without NUL bytes.", "unsupported");
@@ -4134,6 +4174,11 @@ const WORKSPACE_RASTER_MEDIA_BY_EXTENSION: ReadonlyMap<string, string> = new Map
 ]);
 
 const WORKSPACE_BINARY_MEDIA_BY_EXTENSION: ReadonlyMap<string, string> = new Map([
+  [".wasm", "application/wasm"],
+  [".woff", "font/woff"],
+  [".woff2", "font/woff2"],
+  [".ttf", "font/ttf"],
+  [".otf", "font/otf"],
   [".mp3", "audio/mpeg"],
   [".wav", "audio/wav"],
   [".ogg", "audio/ogg"],

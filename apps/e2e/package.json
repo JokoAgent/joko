@@ -23,7 +23,9 @@
     "@modelcontextprotocol/sdk": "1.29.0"
   },
   "devDependencies": {
+    "@joko/tool-browser": "workspace:*",
     "@types/node": "24.12.4",
+    "playwright-core": "1.60.0",
     "typescript": "5.9.3",
     "vitest": "4.1.9"
   }

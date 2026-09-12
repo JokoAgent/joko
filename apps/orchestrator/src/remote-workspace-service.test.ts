@@ -158,7 +158,11 @@ describe("RemoteWorkspaceService", () => {
     const files = new MemoryRemoteFiles();
     await files.mkdir("/workspace", { recursive: true });
     await files.write({ path: "/workspace/page.html", content: Buffer.from("<p>First</p>"), mode: 0o644 });
+    await files.write({ path: "/workspace/details.html", content: Buffer.from("<p>Details</p>"), mode: 0o644 });
     await files.write({ path: "/workspace/script.js", content: Buffer.from("globalThis.value = 1"), mode: 0o644 });
+    for (const name of ["module.wasm", "font.woff2", "sound.mp3", "movie.mp4", "pixel.bmp"] as const) {
+      await files.write({ path: `/workspace/${name}`, content: Buffer.from([0, 1, 2, 3]), mode: 0o644 });
+    }
     let generation = 1;
     const lease = { capabilities: { fileTransfer: true, processStreaming: true }, files, processes: {} };
     const capture = vi.fn(async (_targetId: string, _hostId: string, _signal?: AbortSignal) => {
@@ -180,7 +184,12 @@ describe("RemoteWorkspaceService", () => {
     await writeRemoteHtml("Second");
     const reloaded = await snapshot.reload(signal);
     expect(reloaded.html).toBe("<p>Second</p>");
+    expect(await reloaded.readDocument("details.html", signal)).toEqual({ html: "<p>Details</p>", mediaType: "text/html" });
     expect((await reloaded.readResource("script.js", signal)).mediaType).toBe("text/javascript");
+    for (const [name, mediaType] of [["module.wasm", "application/wasm"], ["font.woff2", "font/woff2"],
+      ["sound.mp3", "audio/mpeg"], ["movie.mp4", "video/mp4"], ["pixel.bmp", "image/bmp"]] as const) {
+      expect(await reloaded.readResource(name, signal)).toEqual({ body: Buffer.from([0, 1, 2, 3]), mediaType });
+    }
     expect(capture).toHaveBeenCalledOnce();
     let finish!: () => void;
     let started!: () => void;

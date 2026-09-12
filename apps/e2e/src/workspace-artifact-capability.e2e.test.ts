@@ -151,7 +151,7 @@ describe("workspace, artifact, and capability boundaries", () => {
     expect(durable.body).toMatchObject({ payload: { case: "openBrowserPage", value: { workspaceHtml: current.file, url: "" } } });
     expect(JSON.stringify(durable.body)).not.toContain("Private");
     const pages = (await manager.clients.browser.listBrowserProviders({})).providers[0]?.pages;
-    expect(pages).toEqual([expect.objectContaining({ pageId: "page-1-1", sessionId, url: expect.stringMatching(/^https:\/\/[a-z0-9-]+\.preview\.joko\.invalid\/index\.html$/u) })]);
+    expect(pages).toEqual([expect.objectContaining({ pageId: "page-1-1", sessionId, url: expect.stringMatching(/^http:\/\/[a-z0-9-]+\.preview\.joko\.localhost\/index\.html$/u) })]);
     await submit(owner.clients.operation, owner.connectionId, mutation, operationId);
     expect(controlled.accepted).toHaveLength(1);
     await expect(submit(owner.clients.operation, owner.connectionId, mutationFor(current.file!, otherSessionId))).rejects.toMatchObject({ code: Code.FailedPrecondition });

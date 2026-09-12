@@ -856,8 +856,9 @@ export function activeNativeTimeline(
       return leafId === undefined || active.has(entryId);
     }
     const productFingerprint = event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD];
-    if (productFingerprint !== undefined && productFingerprint !== bindingFingerprint) return false;
-    if (currentBinding !== undefined && event.generation !== currentBinding.generation) return false;
+    if (productFingerprint !== undefined) {
+      if (productFingerprint !== bindingFingerprint) return false;
+    } else if (currentBinding !== undefined && event.generation !== currentBinding.generation) return false;
     // Persistence-confirmed history replaces transient live stream records
     // that preceded the leaf marker; later in-flight records remain visible.
     if (

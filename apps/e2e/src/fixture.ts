@@ -38,6 +38,7 @@ export type { E2eClients, PairedClient } from "./connect-clients.js";
 
 export interface FixtureOptions {
   readonly rootDirectory?: string;
+  readonly webDirectory?: string;
   readonly profiles?: readonly FakeAdapterProfile[];
   readonly createAdapter?: (profile: FakeAdapterProfile) => InstrumentedFakeAdapter;
   readonly backendFactories?: readonly BackendInstanceFactory[];
@@ -273,7 +274,7 @@ export class OrchestratorE2eFixture {
         trusted: true
       },
       artifactDirectory,
-      webDirectory: join(rootDirectory, "web-not-built"),
+      webDirectory: options.webDirectory ?? join(rootDirectory, "web-not-built"),
       corsOrigins: []
     };
     const connections = new RecordingConnectionManager(store);

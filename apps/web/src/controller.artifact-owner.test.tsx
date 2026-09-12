@@ -450,7 +450,7 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
 
   let htmlState: AppSnapshot = { ...externalState, sessions: [htmlSession], settings: { ...externalState.settings, browsers: [browserSettings("sidebar")] }, browsers: [{ id: "browser", name: "Browser", state: "ready", generation: 1n,
     takeover: { id: "takeover", pageId: "opened-page", connectionId: "connection", state: "active", generation: 1n },
-    pages: [{ id: "opened-page", sessionId: "shared-session", title: "HTML", url: "https://preview.preview.joko.invalid/index.html", state: "ready", canGoBack: false, canGoForward: false, recoverable: false, lastKnownGeneration: 1n }] }] };
+    pages: [{ id: "opened-page", sessionId: "shared-session", title: "HTML", url: "http://preview.preview.joko.localhost/index.html", state: "ready", canGoBack: false, canGoForward: false, recoverable: false, lastKnownGeneration: 1n }] }] };
   await act(async () => publishSnapshot.get(second.id)!(htmlState));
   await act(async () => current.openWorkspaceHtml("shared-session", "workspace", "index.html", { forceSidebar: true }));
   expect(browserCalls.get(second.id)).toHaveBeenLastCalledWith("browser", "shared-session", "", "sidebar", "", { workspaceId: "workspace", relativePath: "index.html", expectedRevision: "html-revision:index.html" });
@@ -459,8 +459,8 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   expect(current.state.browserInspectorFocusRequest).toMatchObject({ sessionId: "shared-session", pageId: "opened-page" });
   const previewSurface = document.createElement("div"); document.body.append(previewSurface);
   const releasePreview = registerWorkspaceHtmlPreviewSurface("browser", "opened-page", previewSurface);
-  const publishHtml = async (runId?: string, changed = false) => {
-    const items = changed ? [{ runId: "html-run", workspaceDiff: { changeSetId: "change", workspaceId: "workspace", files: [{ path: "index.html", status: "modified" }] } }] as unknown as TimelineItemView[] : [];
+  const publishHtml = async (runId?: string, changed = false, path = "index.html", evidenceRunId = "html-run") => {
+    const items = changed ? [{ runId: evidenceRunId, workspaceDiff: { changeSetId: `change:${evidenceRunId}`, workspaceId: "workspace", files: [{ path, status: "modified" }] } }] as unknown as TimelineItemView[] : [];
     htmlState = { ...htmlState, sessions: [{ ...htmlSession, ...(runId === undefined ? {} : { activeRunId: runId }) }], timelineBySession: new Map([[htmlSession.id, items]]) };
     await act(async () => publishSnapshot.get(second.id)!(htmlState));
   };
@@ -470,9 +470,18 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   expect(reloadCalls.get(second.id)).toHaveBeenCalledExactlyOnceWith("browser", "opened-page", { kind: "navigationCommand", command: "reload" });
   await publishHtml(undefined, true);
   expect(reloadCalls.get(second.id)).toHaveBeenCalledOnce();
+  htmlState = { ...htmlState, browsers: htmlState.browsers.map((browser) => ({ ...browser,
+    pages: browser.pages.map((page) => page.id === "opened-page" ? { ...page, url: "http://preview.preview.joko.localhost/pages/details.html?view=current" } : page) })) };
+  await act(async () => publishSnapshot.get(second.id)!(htmlState));
+  await publishHtml("details-run"); await publishHtml();
+  await publishHtml(undefined, true, "index.html", "details-run");
+  expect(reloadCalls.get(second.id)).toHaveBeenCalledOnce();
+  await publishHtml("details-current"); await publishHtml();
+  await publishHtml(undefined, true, "pages/details.html", "details-current");
+  expect(reloadCalls.get(second.id)).toHaveBeenCalledTimes(2);
   previewSurface.hidden = true;
   await publishHtml("html-run"); await publishHtml(undefined, true);
-  expect(reloadCalls.get(second.id)).toHaveBeenCalledOnce();
+  expect(reloadCalls.get(second.id)).toHaveBeenCalledTimes(2);
   previewSurface.hidden = false;
   await publishHtml("html-run");
   await act(async () => {

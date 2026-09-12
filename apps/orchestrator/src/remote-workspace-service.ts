@@ -926,6 +926,11 @@ function inferRemoteMediaType(value: string): string {
   if ([".md", ".markdown", ".mdx"].includes(extension)) return "text/markdown";
   if ([".html", ".htm"].includes(extension)) return "text/html";
   if ([".json", ".jsonc"].includes(extension)) return "application/json";
+  if (extension === ".wasm") return "application/wasm";
+  if (extension === ".woff") return "font/woff";
+  if (extension === ".woff2") return "font/woff2";
+  if (extension === ".ttf") return "font/ttf";
+  if (extension === ".otf") return "font/otf";
   if (extension === ".svg") return "image/svg+xml";
   if (extension === ".glb") return "model/gltf-binary";
   if (extension === ".gltf") return "model/gltf+json";
@@ -934,8 +939,21 @@ function inferRemoteMediaType(value: string): string {
   if ([".jpg", ".jpeg"].includes(extension)) return "image/jpeg";
   if (extension === ".gif") return "image/gif";
   if (extension === ".webp") return "image/webp";
+  if (extension === ".bmp") return "image/bmp";
+  if (extension === ".ico") return "image/x-icon";
   if (extension === ".pdf") return "application/pdf";
-  if ([".mp3", ".wav", ".ogg", ".mp4", ".webm"].includes(extension)) return extension === ".mp4" || extension === ".webm" ? `video/${extension.slice(1)}` : `audio/${extension.slice(1)}`;
+  if (extension === ".mp3") return "audio/mpeg";
+  if (extension === ".wav") return "audio/wav";
+  if ([".ogg", ".oga", ".opus"].includes(extension)) return "audio/ogg";
+  if (extension === ".m4a") return "audio/mp4";
+  if (extension === ".aac") return "audio/aac";
+  if (extension === ".flac") return "audio/flac";
+  if (extension === ".mp4") return "video/mp4";
+  if (extension === ".m4v") return "video/x-m4v";
+  if (extension === ".mov") return "video/quicktime";
+  if (extension === ".webm") return "video/webm";
+  if (extension === ".avi") return "video/x-msvideo";
+  if (extension === ".mkv") return "video/x-matroska";
   if (/\.(?:txt|log|csv|tsv|js|mjs|cjs|jsx|ts|tsx|py|rb|go|rs|java|kt|swift|c|h|cpp|hpp|cs|proto|php|sh|bash|zsh|ps1|yaml|yml|toml|ini|html|vue|svelte|css|scss|sql|graphql|diff|patch)$/iu.test(value)) return "text/plain";
   return "application/octet-stream";
 }

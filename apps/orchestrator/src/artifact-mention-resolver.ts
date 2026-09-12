@@ -1,4 +1,4 @@
-import type { AdapterContext, BlobRef, TargetDescriptor } from "@joko/core";
+import type { AdapterContext, ArtifactMentionResolver, TargetDescriptor } from "@joko/core";
 import { operationBodyHash, type OperationalStore, type StoredSession } from "@joko/store";
 import type { ArtifactStore } from "./artifact-store.js";
 
@@ -9,9 +9,7 @@ export function createArtifactMentionResolver(options: {
   readonly resolveTarget: (session: StoredSession) => TargetDescriptor;
   readonly assertBackendCurrent: (context: AdapterContext) => void;
   readonly now?: () => number;
-}): (artifactId: string, context: AdapterContext, signal: AbortSignal) => Promise<{
-  readonly blob: BlobRef; readonly path: string; readonly assertCurrent: () => void;
-}> {
+}): ArtifactMentionResolver {
   const now = options.now ?? Date.now;
   return async (artifactId, context, signal) => {
     if (artifactId.length === 0 || artifactId.length > 1_024 || /[\u0000-\u001f\u007f]/u.test(artifactId)) throw unavailable();

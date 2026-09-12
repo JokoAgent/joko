@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
-import { lstat, realpath } from "node:fs/promises";
+import { lstat, open, realpath } from "node:fs/promises";
 import { basename, isAbsolute, relative, resolve } from "node:path";
 import {
+  JokoError,
   redactSecrets,
   type AdapterContext,
+  type ArtifactMentionResolver,
   type BlobRef,
   type EventPayload,
   type InteractionDecision,
@@ -38,14 +40,17 @@ export interface ResolvedBlob {
 export interface CodexInputResolvers {
   readonly readBlob?: (blob: BlobRef) => Promise<ResolvedBlob>;
   readonly resolveFile?: (blob: BlobRef, context: AdapterContext) => Promise<string>;
+  readonly resolveArtifactMention?: ArtifactMentionResolver;
   readonly maximumBlobBytes?: number;
   readonly maximumAggregateBlobBytes?: number;
+  readonly maximumFileBytes?: number;
   readonly maximumPromptTextBytes?: number;
   readonly maximumInputItems?: number;
 }
 
 const DEFAULT_MAXIMUM_BLOB_BYTES = 10 * 1024 * 1024;
 const DEFAULT_MAXIMUM_AGGREGATE_BLOB_BYTES = 20 * 1024 * 1024;
+const DEFAULT_MAXIMUM_FILE_BYTES = 256 * 1024 * 1024;
 const DEFAULT_MAXIMUM_PROMPT_TEXT_BYTES = 4 * 1024 * 1024;
 const DEFAULT_MAXIMUM_INPUT_ITEMS = 256;
 const MAXIMUM_INTERACTION_QUESTIONS = 3;
@@ -70,18 +75,32 @@ export function createTranslatorState(): TranslatorState {
   };
 }
 
+export interface PreparedCodexPrompt {
+  readonly input: readonly NativeUserInput[];
+  readonly assertCurrent: () => void;
+}
+
 export async function translatePromptInput(
   input: PromptInput,
   context: AdapterContext,
   resolvers: CodexInputResolvers
-): Promise<readonly NativeUserInput[]> {
-  if (input.mentions.some((mention) => mention.kind !== "workspace_file" || mention.lineRange !== undefined)) {
-    throw adapterError({
-      code: "CODEX_MENTION_KIND_UNSUPPORTED",
-      message: "This native input supports only regular workspace file mentions.",
-      phase: "dispatch",
-      recovery: "Choose a regular workspace file mention."
-    });
+): Promise<PreparedCodexPrompt> {
+  for (const mention of input.mentions) {
+    if (mention.kind === "workspace_file" && mention.lineRange === undefined) continue;
+    if (mention.kind === "artifact") {
+      if (resolvers.resolveArtifactMention === undefined) throw unsupportedMention();
+      if (mention.reference.length === 0 || mention.reference.length > 1_024
+        || /[\u0000-\u001f\u007f]/u.test(mention.reference) || mention.lineRange !== undefined) {
+        throw adapterError({
+          code: "CODEX_ARTIFACT_REFERENCE_INVALID",
+          message: "An Artifact mention requires a bounded canonical identity.",
+          phase: "dispatch",
+          recovery: "Choose the Artifact again from this task's current catalog."
+        });
+      }
+      continue;
+    }
+    throw unsupportedMention();
   }
   const result: NativeUserInput[] = [];
   const maximumPromptTextBytes = positiveBound(
@@ -126,6 +145,11 @@ export async function translatePromptInput(
     "aggregate image blob"
   );
   let aggregateBlobBytes = 0;
+  const maximumFileBytes = Math.min(
+    positiveBound(resolvers.maximumFileBytes, DEFAULT_MAXIMUM_FILE_BYTES, "file blob"),
+    positiveBound(context.artifactCapacityBytes, DEFAULT_MAXIMUM_FILE_BYTES, "Artifact capacity")
+  );
+  const mentionAuthorities: Array<() => void> = [];
   for (const image of input.images) {
     if (!Number.isSafeInteger(image.blob.byteLength) || image.blob.byteLength < 0) {
       throw adapterError({
@@ -194,17 +218,58 @@ export async function translatePromptInput(
     });
   }
   for (const file of input.files) {
+    validateFileBlob(file.blob, maximumFileBytes, "CODEX_FILE_REFERENCE_INVALID");
     const path = file.workspacePath === undefined
       ? await resolveManagedFile(file.blob, context, resolvers)
       : await resolveWorkspacePath(context.target.workspaceRoot, file.workspacePath);
+    await verifyFileContent(path, file.blob, context.signal);
     textParts.push(`Attached file: ${JSON.stringify({
       name: file.blob.fileName ?? basename(path),
       path
     })}`);
   }
   for (const mention of input.mentions) {
-    const path = await resolveWorkspacePath(context.target.workspaceRoot, mention.reference);
-    textParts.push(`Workspace file reference: ${JSON.stringify({ name: mention.label, path })}`);
+    if (mention.kind === "workspace_file") {
+      const path = await resolveWorkspacePath(context.target.workspaceRoot, mention.reference);
+      textParts.push(`Workspace file reference: ${JSON.stringify({ name: mention.label, path })}`);
+      continue;
+    }
+    const resolved = await resolvers.resolveArtifactMention!(mention.reference, context, context.signal).catch(() => {
+      context.signal.throwIfAborted();
+      throw adapterError({
+        code: "CODEX_ARTIFACT_UNAVAILABLE",
+        message: "The referenced Artifact is unavailable in this task.",
+        phase: "dispatch",
+        retryable: true,
+        recovery: "Refresh this task's Artifact catalog and explicitly retry."
+      });
+    });
+    if (resolved.blob.id !== mention.reference) {
+      throw adapterError({
+        code: "CODEX_ARTIFACT_REFERENCE_INVALID",
+        message: "The resolved Artifact does not match its canonical identity.",
+        phase: "dispatch",
+        recovery: "Choose the Artifact again from this task's current catalog."
+      });
+    }
+    validateFileBlob(resolved.blob, maximumFileBytes, "CODEX_ARTIFACT_REFERENCE_INVALID");
+    const path = await validateRegularFile(resolved.path);
+    await verifyFileContent(path, resolved.blob, context.signal);
+    const assertArtifactCurrent = (): void => {
+      try { resolved.assertCurrent(); }
+      catch {
+        context.signal.throwIfAborted();
+        throw adapterError({
+          code: "CODEX_ARTIFACT_UNAVAILABLE",
+          message: "The referenced Artifact changed while input was prepared.",
+          phase: "dispatch",
+          recovery: "Refresh this task's Artifact catalog and explicitly retry."
+        });
+      }
+    };
+    assertArtifactCurrent();
+    mentionAuthorities.push(assertArtifactCurrent);
+    textParts.push(`Artifact reference: ${JSON.stringify({ name: mention.label, path })}`);
   }
   const combinedText = textParts.join("\n\n");
   if (Buffer.byteLength(combinedText, "utf8") > maximumPromptTextBytes) {
@@ -226,7 +291,21 @@ export async function translatePromptInput(
       recovery: "Add text or a supported attachment."
     });
   }
-  return result;
+  const assertCurrent = (): void => {
+    context.signal.throwIfAborted();
+    for (const assertMentionCurrent of mentionAuthorities) assertMentionCurrent();
+  };
+  assertCurrent();
+  return { input: result, assertCurrent };
+}
+
+function unsupportedMention(): Error {
+  return adapterError({
+    code: "CODEX_MENTION_KIND_UNSUPPORTED",
+    message: "This native input supports regular workspace files and service-authorized Artifacts.",
+    phase: "dispatch",
+    recovery: "Choose a regular workspace file or an Artifact advertised by this Backend."
+  });
 }
 
 export class CodexEventTranslator {
@@ -873,6 +952,14 @@ async function resolveWorkspacePath(workspaceRoot: string, value: string): Promi
 }
 
 async function validateRegularFile(path: string): Promise<string> {
+  if (!isAbsolute(path)) {
+    throw adapterError({
+      code: "CODEX_FILE_UNSAFE",
+      message: "A local attachment path must be absolute.",
+      phase: "dispatch",
+      recovery: "Choose a regular local file exposed by the current task."
+    });
+  }
   const original = await lstat(path).catch(() => {
     throw adapterError({
       code: "CODEX_FILE_UNAVAILABLE",
@@ -900,7 +987,8 @@ async function validateRegularFile(path: string): Promise<string> {
     });
   });
   const info = await lstat(canonical).catch(() => undefined);
-  if (info?.isFile() !== true || info.isSymbolicLink()) {
+  if (info?.isFile() !== true || info.isSymbolicLink()
+    || info.dev !== original.dev || info.ino !== original.ino) {
     throw adapterError({
       code: "CODEX_FILE_UNSAFE",
       message: "A local attachment is not a regular file.",
@@ -909,6 +997,69 @@ async function validateRegularFile(path: string): Promise<string> {
     });
   }
   return canonical;
+}
+
+function validateFileBlob(blob: BlobRef, maximumBytes: number, code: string): void {
+  if (blob.id.length === 0 || blob.id.length > 1_024
+    || !Number.isSafeInteger(blob.byteLength) || blob.byteLength < 0 || blob.byteLength > maximumBytes
+    || !/^[a-f0-9]{64}$/iu.test(blob.sha256)) {
+    throw adapterError({
+      code,
+      message: "A file has an invalid or oversized immutable Artifact reference.",
+      phase: "dispatch",
+      recovery: "Choose a bounded canonical Artifact and retry."
+    });
+  }
+}
+
+async function verifyFileContent(path: string, blob: BlobRef, signal: AbortSignal): Promise<void> {
+  const handle = await open(path, "r").catch(() => {
+    throw adapterError({
+      code: "CODEX_FILE_UNAVAILABLE",
+      message: "A referenced file could not be opened for verification.",
+      phase: "dispatch",
+      retryable: true,
+      recovery: "Restore the immutable Artifact and retry."
+    });
+  });
+  try {
+    const before = await handle.stat();
+    if (!before.isFile() || before.size !== blob.byteLength) throw fileIntegrityError();
+    const hash = createHash("sha256");
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    let total = 0;
+    for (;;) {
+      signal.throwIfAborted();
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+      if (bytesRead === 0) break;
+      total += bytesRead;
+      if (total > blob.byteLength) throw fileIntegrityError();
+      hash.update(buffer.subarray(0, bytesRead));
+    }
+    const after = await handle.stat();
+    const current = await lstat(path);
+    if (total !== blob.byteLength || hash.digest("hex") !== blob.sha256.toLowerCase()
+      || current.isSymbolicLink() || !current.isFile()
+      || ![after, current].every((info) => info.dev === before.dev && info.ino === before.ino
+        && info.size === before.size && info.mtimeMs === before.mtimeMs && info.ctimeMs === before.ctimeMs)) {
+      throw fileIntegrityError();
+    }
+  } catch (error) {
+    signal.throwIfAborted();
+    if (error instanceof JokoError) throw error;
+    throw fileIntegrityError();
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+function fileIntegrityError(): Error {
+  return adapterError({
+    code: "CODEX_FILE_INTEGRITY_FAILED",
+    message: "A referenced file no longer matches its immutable Artifact reference.",
+    phase: "dispatch",
+    recovery: "Restore the original canonical Artifact and retry."
+  });
 }
 
 export function safeText(value: string, limit: number): string {

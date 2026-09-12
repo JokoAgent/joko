@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { Dirent, Stats } from "node:fs";
 import { mkdtemp, readFile, readdir, realpath, rm, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
@@ -174,6 +175,15 @@ interface SessionRuntime {
   planMode: boolean;
   collaborationTouched: boolean;
   defaultCollaborationMarkerPending: boolean;
+  pendingTurnStart?: { readonly planMode: boolean; readonly context: AdapterContext };
+  readonly planTurnIds: Set<string>;
+  readonly planTextByTurn: Map<string, string>;
+  readonly planContextByTurn: Map<string, AdapterContext>;
+  planReview?: {
+    readonly interactionId: string;
+    readonly turnId: string;
+    readonly abort: AbortController;
+  };
   readonly runtimePolicy: "standard" | "review_read_only";
   readonly reviewWorkingDirectory?: string;
   closed: boolean;
@@ -208,6 +218,7 @@ const REVIEW_MAXIMUM_WALK_ENTRIES = 5_000;
 const REVIEW_MAXIMUM_GREP_FILES = 2_000;
 const REVIEW_MAXIMUM_GREP_BYTES = 16 * 1024 * 1024;
 const REVIEW_MAXIMUM_RESULTS = 500;
+const MAXIMUM_PLAN_REVIEW_BYTES = 1024 * 1024;
 const REVIEW_DYNAMIC_TOOL_NAMES = new Set(["joko_read", "joko_grep", "joko_find", "joko_ls"]);
 const REVIEW_DISABLED_FEATURES = [
   "apps",
@@ -361,8 +372,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     this.#resolvers = {
       ...(options.readBlob === undefined ? {} : { readBlob: options.readBlob }),
       ...(options.resolveFile === undefined ? {} : { resolveFile: options.resolveFile }),
+      ...(options.resolveArtifactMention === undefined ? {} : { resolveArtifactMention: options.resolveArtifactMention }),
       ...(options.maximumBlobBytes === undefined ? {} : { maximumBlobBytes: options.maximumBlobBytes }),
       ...(options.maximumAggregateBlobBytes === undefined ? {} : { maximumAggregateBlobBytes: options.maximumAggregateBlobBytes }),
+      ...(options.maximumFileBytes === undefined ? {} : { maximumFileBytes: options.maximumFileBytes }),
       ...(options.maximumPromptTextBytes === undefined ? {} : { maximumPromptTextBytes: options.maximumPromptTextBytes }),
       ...(options.maximumInputItems === undefined ? {} : { maximumInputItems: options.maximumInputItems })
     };
@@ -1000,21 +1013,31 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       });
     }
     const nativeInput = await waitForDispatchPreparation(translatePromptInput(input, context, this.#resolvers), dispatchSignal);
-    assertDispatchReady();
+    const assertNativeDispatchReady = (): void => {
+      assertDispatchReady();
+      nativeInput.assertCurrent();
+    };
+    assertNativeDispatchReady();
     const clientUserMessageId = context.operationId;
     const collaborationMode = runtime.runtimePolicy === "standard"
       && supportsNativeCollaboration(this.#host.initializeResult?.userAgent)
       ? collaborationModeForTurn(runtime)
       : undefined;
+    if (input.disposition !== "steer") {
+      runtime.pendingTurnStart = {
+        planMode: collaborationMode?.mode === "plan",
+        context
+      };
+    }
     let acceptedResponseShapePending = false;
     try {
       if (input.disposition === "steer") {
         const response = await this.#host.request("turn/steer", {
           threadId: runtime.threadId,
           clientUserMessageId,
-          input: [...nativeInput],
+          input: [...nativeInput.input],
           expectedTurnId: expectedTurnId!
-        }, { mutation: true, signal: dispatchSignal, beforeDispatch: assertDispatchReady });
+        }, { mutation: true, signal: dispatchSignal, beforeDispatch: assertNativeDispatchReady });
         this.#assertRuntimeFence(runtime, context, response.hostGeneration);
         acceptedResponseShapePending = true;
         if (parseTurnSteer(response.value) !== expectedTurnId) {
@@ -1024,11 +1047,11 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         return;
       }
       await this.#activateManagedOperation(runtime, context);
-      assertDispatchReady();
+      assertNativeDispatchReady();
       const response = await this.#host.request("turn/start", {
         threadId: runtime.threadId,
         clientUserMessageId,
-        input: [...nativeInput],
+        input: [...nativeInput.input],
         cwd: runtime.reviewWorkingDirectory ?? context.target.workspaceRoot,
         ...(runtime.modelId === undefined ? {} : { model: runtime.modelId }),
         ...(runtime.effort === undefined ? {} : { effort: runtime.effort }),
@@ -1041,7 +1064,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
               serviceTierForTurn: "default"
             }
           : runtime.fastMode ? { serviceTier: "fast" } : {})
-      }, { mutation: true, signal: dispatchSignal, beforeDispatch: assertDispatchReady });
+      }, { mutation: true, signal: dispatchSignal, beforeDispatch: assertNativeDispatchReady });
       this.#assertRuntimeFence(runtime, context, response.hostGeneration);
       acceptedResponseShapePending = true;
       const startedTurn = parseTurnStart(response.value);
@@ -1054,6 +1077,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       } else if (!runtime.state.terminalTurnIds.has(startedTurn.id)) {
         throw new ProtocolShapeError("turn start result conflicts with the active turn");
       }
+      bindPlanTurnIntent(runtime, startedTurn.id, collaborationMode?.mode === "plan", context);
       if (collaborationMode?.mode === "default") runtime.defaultCollaborationMarkerPending = false;
       acceptedResponseShapePending = false;
     } catch (error) {
@@ -1061,6 +1085,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         || (acceptedResponseShapePending && error instanceof ProtocolShapeError)) {
         const reconciled = await this.#reconcileClientMessage(runtime, context, clientUserMessageId, expectedTurnId);
         if (reconciled) {
+          if (input.disposition !== "steer" && runtime.state.activeTurnId !== undefined) {
+            bindPlanTurnIntent(runtime, runtime.state.activeTurnId, collaborationMode?.mode === "plan", context);
+          }
           if (collaborationMode?.mode === "default") runtime.defaultCollaborationMarkerPending = false;
           return;
         }
@@ -1077,6 +1104,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       if (input.disposition !== "steer") this.#releaseManagedOperation(runtime);
       if (error instanceof Error && "publicError" in error) throw error;
       throw this.#requestFailure(error, "dispatch", "CODEX_TURN_START_FAILED", false);
+    } finally {
+      if (input.disposition !== "steer") runtime.pendingTurnStart = undefined;
     }
   }
 
@@ -2220,6 +2249,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       planMode: false,
       collaborationTouched: false,
       defaultCollaborationMarkerPending: false,
+      planTurnIds: new Set(),
+      planTextByTurn: new Map(),
+      planContextByTurn: new Map(),
       runtimePolicy: input.context.runtimePolicy === "review_read_only" ? "review_read_only" : "standard",
       ...(input.reviewWorkingDirectory === undefined ? {} : { reviewWorkingDirectory: input.reviewWorkingDirectory }),
       closed: false,
@@ -2238,7 +2270,13 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           }
           if (!this.#acceptTurnNotification(runtime, method, params)) return;
           if (method === "turn/completed") this.#releaseManagedOperation(runtime);
-          const events = this.#translator.translate(method, params, runtime.state);
+          const completedPlan = runtime.runtimePolicy === "standard"
+            ? observePlanReviewNotification(runtime, method, params)
+            : undefined;
+          const planTurnId = method === "item/plan/delta" ? turnIdFromParams(params) : undefined;
+          const events = planTurnId !== undefined && runtime.planTurnIds.has(planTurnId)
+            ? []
+            : this.#translator.translate(method, params, runtime.state);
           for (const event of events) {
             if (!this.#isRuntimeCurrent(runtime, input.hostGeneration)) return;
             await runtime.context.emit(event, {
@@ -2266,6 +2304,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
               stateMayHaveChanged: true,
               recovery: "Inspect the native thread before retrying compaction."
             }));
+          }
+          if (completedPlan !== undefined && events.some((event) =>
+            event.type === "done" && event.outcome === "completed")) {
+            this.#schedulePlanReview(runtime, completedPlan, completedPlan.context, input.hostGeneration);
           }
         },
         onDescendantThreadStarted: async (params) => {
@@ -2451,6 +2493,69 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     }
   }
 
+  #schedulePlanReview(
+    runtime: SessionRuntime,
+    plan: { readonly turnId: string; readonly markdown: string },
+    context: AdapterContext,
+    hostGeneration: number
+  ): void {
+    runtime.planReview?.abort.abort();
+    const interactionId = `codex-plan-review-${createHash("sha256")
+      .update(runtime.sessionId).update("\0")
+      .update(String(runtime.sessionGeneration)).update("\0")
+      .update(plan.turnId)
+      .digest("hex")}`;
+    const pending = {
+      interactionId,
+      turnId: plan.turnId,
+      abort: new AbortController()
+    };
+    runtime.planReview = pending;
+    const timer = setTimeout(() => {
+      void this.#runPlanReview(runtime, pending, plan.markdown, context, hostGeneration);
+    }, 0);
+    timer.unref?.();
+  }
+
+  async #runPlanReview(
+    runtime: SessionRuntime,
+    pending: NonNullable<SessionRuntime["planReview"]>,
+    markdown: string,
+    context: AdapterContext,
+    hostGeneration: number
+  ): Promise<void> {
+    try {
+      if (runtime.planReview !== pending || !this.#isRuntimeCurrent(runtime, hostGeneration)) return;
+      const decision = await context.requestInteraction({
+        id: pending.interactionId,
+        kind: "plan_review",
+        title: "Review plan",
+        markdown,
+        choices: ["execute", "stay", "refine"]
+      }, { signal: pending.abort.signal });
+      if (runtime.planReview !== pending || !this.#isRuntimeCurrent(runtime, hostGeneration)) return;
+      if (decision.kind === "plan_review" && decision.decision === "execute") {
+        // Host commits the resolved Interaction, plan-mode state change, and
+        // durable continuation Queue item before releasing this waiter. Update
+        // the native runtime state so queued implementation work sends
+        // the explicit sticky reset marker instead of another plan turn.
+        runtime.planMode = false;
+        runtime.collaborationTouched = true;
+        runtime.defaultCollaborationMarkerPending = true;
+      }
+    } catch {
+      if (!pending.abort.signal.aborted && this.#isRuntimeCurrent(runtime, hostGeneration)) {
+        await context.emit({
+          type: "status",
+          key: "plan_review_unavailable",
+          text: "The completed Codex plan could not be opened for review."
+        }, { namespace: "codex.plan_review", fields: { turnId: pending.turnId } }).catch(() => undefined);
+      }
+    } finally {
+      if (runtime.planReview === pending) runtime.planReview = undefined;
+    }
+  }
+
   async #applyNativeTaskEffects(
     runtime: SessionRuntime,
     effects: CodexNativeTaskEffects,
@@ -2547,6 +2652,11 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   async #releaseRuntimeSubscription(runtime: SessionRuntime, unsubscribe: boolean): Promise<void> {
     this.#releaseManagedOperation(runtime);
     runtime.managedRoute?.dispose();
+    runtime.planReview?.abort.abort();
+    runtime.planReview = undefined;
+    runtime.planTurnIds.clear();
+    runtime.planTextByTurn.clear();
+    runtime.planContextByTurn.clear();
     try {
       const flight = runtime.subscriptionFlight;
       const subscription = runtime.subscription ?? (flight === undefined ? undefined : await flight.catch(() => undefined));
@@ -2927,6 +3037,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const nativeCollaborationSupported = supportsNativeCollaboration(this.#host.initializeResult?.userAgent);
     if (nativeCollaborationSupported) {
       supported.add("plan_mode");
+      supported.add("interaction.plan_review");
       supported.add("background.tasks");
       supported.add("subagents.list");
       supported.add("subagents.detail");
@@ -2944,6 +3055,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           : key === "review.isolated" && !isolatedReviewSupported
             ? { reason: "upstream_missing" as const }
           : (key === "plan_mode"
+              || key === "interaction.plan_review"
               || key === "background.tasks"
               || key === "subagents.list"
               || key === "subagents.detail"
@@ -2954,7 +3066,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             ? { reason: "not_implemented" as const }
             : {}),
         ...(key === "permission.modes" ? { options: ["ask", "auto", "bypassPermissions"] } : {}),
-        ...(key === "input.mention" && available ? { options: ["workspace_file"] } : {}),
+        ...(key === "input.mention" && available
+          ? { options: ["workspace_file", ...(this.#resolvers.resolveArtifactMention === undefined ? [] : ["artifact"])] }
+          : {}),
         ...(key === "provider.login" && this.#account?.supportsLogin === true
           ? { options: [...this.#account.loginMethods] }
           : {})
@@ -4162,6 +4276,79 @@ function threadIdFromParams(params: JsonValue): string | undefined {
   if (!isJsonObject(thread)) return undefined;
   const nested = thread["id"];
   return typeof nested === "string" && isValidNativeThreadId(nested) ? nested : undefined;
+}
+
+function bindPlanTurnIntent(
+  runtime: SessionRuntime,
+  turnId: string,
+  planMode: boolean,
+  context?: AdapterContext
+): void {
+  if (planMode) {
+    runtime.planTurnIds.add(turnId);
+    if (context !== undefined) runtime.planContextByTurn.set(turnId, context);
+  }
+  else {
+    runtime.planTurnIds.delete(turnId);
+    runtime.planTextByTurn.delete(turnId);
+    runtime.planContextByTurn.delete(turnId);
+  }
+}
+
+function observePlanReviewNotification(
+  runtime: SessionRuntime,
+  method: string,
+  params: JsonValue
+): { readonly turnId: string; readonly markdown: string; readonly context: AdapterContext } | undefined {
+  const turnId = turnIdFromParams(params);
+  if (turnId === undefined) return undefined;
+  if (method === "turn/started") {
+    if (runtime.pendingTurnStart !== undefined) {
+      bindPlanTurnIntent(
+        runtime,
+        turnId,
+        runtime.pendingTurnStart.planMode,
+        runtime.pendingTurnStart.context
+      );
+    }
+    return undefined;
+  }
+  const record = isJsonObject(params) ? params : undefined;
+  if (method === "item/completed") {
+    const item = isJsonObject(record?.["item"]) ? record["item"] : undefined;
+    if (item?.["type"] !== "plan" || typeof item["text"] !== "string") return undefined;
+    if (!runtime.planTurnIds.has(turnId)) {
+      if (runtime.pendingTurnStart?.planMode !== true) return undefined;
+      bindPlanTurnIntent(runtime, turnId, true, runtime.pendingTurnStart.context);
+    }
+    const markdown = boundedPlanReviewText(item["text"]);
+    if (markdown !== undefined) runtime.planTextByTurn.set(turnId, markdown);
+    return undefined;
+  }
+  if (method !== "turn/completed") return undefined;
+  const planTurn = runtime.planTurnIds.delete(turnId);
+  let markdown = runtime.planTextByTurn.get(turnId);
+  const context = runtime.planContextByTurn.get(turnId);
+  runtime.planTextByTurn.delete(turnId);
+  runtime.planContextByTurn.delete(turnId);
+  if (!planTurn || context === undefined) return undefined;
+  const turn = isJsonObject(record?.["turn"]) ? record["turn"] : undefined;
+  if (turn?.["status"] !== "completed") return undefined;
+  if (markdown === undefined && Array.isArray(turn["items"])) {
+    for (const item of turn["items"]) {
+      if (isJsonObject(item) && item["type"] === "plan" && typeof item["text"] === "string") {
+        markdown = boundedPlanReviewText(item["text"]);
+      }
+    }
+  }
+  const trimmed = markdown?.trim();
+  return trimmed === undefined || trimmed.length === 0
+    ? undefined
+    : { turnId, markdown: trimmed, context };
+}
+
+function boundedPlanReviewText(value: string): string | undefined {
+  return Buffer.byteLength(value, "utf8") <= MAXIMUM_PLAN_REVIEW_BYTES ? value : undefined;
 }
 
 function collaborationModeForTurn(runtime: SessionRuntime): JsonObject | undefined {

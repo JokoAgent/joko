@@ -21,7 +21,19 @@ export function isWorkspaceHtmlPreviewVisible(document: Document, browserId: str
 /** Observe one active preview's main Run and its independently delivered file-change evidence. */
 export class WorkspaceHtmlAutoReload {
   #runId: string | undefined;
-  constructor(readonly workspaceId: string, readonly path: string) {}
+  #path: string;
+  #previewOrigin: string | undefined;
+
+  constructor(readonly workspaceId: string, path: string) { this.#path = path; }
+
+  /** Follow only the live page URL from the same bounded Joko preview origin. */
+  observePageUrl(url: string): boolean {
+    const parsed = workspaceHtmlPath(url);
+    if (parsed === undefined || (this.#previewOrigin !== undefined && parsed.origin !== this.#previewOrigin)) return false;
+    this.#previewOrigin ??= parsed.origin;
+    this.#path = parsed.path;
+    return true;
+  }
 
   observe(session: SessionView, items: readonly TimelineItemView[], active: boolean): boolean {
     if (!active) { this.#runId = undefined; return false; }
@@ -31,6 +43,19 @@ export class WorkspaceHtmlAutoReload {
       && item.workspaceDiff.workspaceId === this.workspaceId);
     if (evidence === undefined) return false;
     this.#runId = undefined;
-    return evidence.workspaceDiff!.files.some((file) => file.path === this.path && file.status !== "deleted");
+    return evidence.workspaceDiff!.files.some((file) => file.path === this.#path && file.status !== "deleted");
   }
+}
+
+function workspaceHtmlPath(url: string): { readonly origin: string; readonly path: string } | undefined {
+  if (url.length === 0 || url.length > 8_192) return undefined;
+  try {
+    const value = new URL(url);
+    const path = decodeURIComponent(value.pathname.slice(1));
+    if (value.protocol !== "http:" || value.port !== "" || value.username !== "" || value.password !== ""
+      || !/^[a-z0-9-]{1,80}\.preview\.joko\.localhost$/u.test(value.hostname)
+      || path.length === 0 || path.length > 4_096 || !/\.html?$/iu.test(path) || /[\\:\x00-\x1f]/u.test(path)
+      || path.split("/").some((part) => part === "" || part === "." || part === "..")) return undefined;
+    return { origin: value.origin, path };
+  } catch { return undefined; }
 }

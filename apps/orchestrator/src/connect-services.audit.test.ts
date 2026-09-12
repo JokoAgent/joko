@@ -3096,7 +3096,7 @@ describe("Connect security and protocol audit", () => {
       providerId: "browser",
       generation: 1,
       owner: "connection",
-      url: html ? expect.stringMatching(/^https:\/\/[a-z0-9-]+\.preview\.joko\.invalid\/.*index\.html$/u) : "https://example.test/open"
+      url: html ? expect.stringMatching(/^http:\/\/[a-z0-9-]+\.preview\.joko\.localhost\/.*index\.html$/u) : "https://example.test/open"
     }, 42_000, html ? expect.objectContaining({ html: "<title>Private HTML title</title><p>Private HTML bytes</p>", assertCurrent: expect.any(Function) }) : undefined);
     expect(assertHumanTakeover).toHaveBeenCalledOnce();
     expect(recordHumanPage).toHaveBeenCalledWith(expect.objectContaining({
@@ -3519,7 +3519,7 @@ describe("Connect security and protocol audit", () => {
           listPages: async () => [{
             id: "page-opened",
             title: "Private",
-            url: "https://workspace.preview.joko.invalid/index.html",
+            url: "http://workspace.preview.joko.localhost/index.html",
             state: "ready" as const
           }]
         },
@@ -3657,7 +3657,7 @@ describe("Connect security and protocol audit", () => {
       payload: { case: "openBrowserPage", value: create(contract.OpenBrowserPageMutationSchema, {
         browserProviderId: "browser",
         sessionId: "session-browser-html-recovery",
-        url: "https://retired-source.preview.joko.invalid/private.html",
+        url: "http://retired-source.preview.joko.localhost/private.html",
         presentationTarget: contract.BrowserAutomationTarget.EXTERNAL
       }) }
     });
@@ -3831,8 +3831,8 @@ describe("Connect security and protocol audit", () => {
 
   it("focuses and closes Workspace HTML pages without persisting their private document titles", async () => {
     const previewUrls = {
-      "page-7-1": "https://workspace-one.preview.joko.invalid/private-one.html",
-      "page-7-2": "https://workspace-two.preview.joko.invalid/private-two.html"
+      "page-7-1": "http://workspace-one.preview.joko.localhost/private-one.html",
+      "page-7-2": "http://workspace-two.preview.joko.localhost/private-two.html"
     } as const;
     let current: {
       readonly providerId: string;

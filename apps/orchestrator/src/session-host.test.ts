@@ -8,6 +8,8 @@ import { PassThrough, Writable } from "node:stream";
 
 import { create } from "@bufbuild/protobuf";
 import { createPiAdapter, type PiProcessHandle, type PiProcessSpec } from "@joko/adapter-pi";
+import { AppServerHost as CodexAppServerHost, CodexBackendAdapter } from "@joko/adapter-codex";
+import { FakeCodexAppServer } from "@joko/adapter-codex/testing";
 import * as contract from "@joko/contracts";
 import {
   JokoError,
@@ -9312,6 +9314,227 @@ describe("SessionHost", () => {
     expect(fixture.store.getSession(sessionId).descriptor.planMode).toBe(true);
   });
 
+  it.each([
+    { decision: "execute" as const, feedback: "", expectedPrompt: "Implement the plan.", expectedPlanMode: false },
+    { decision: "refine" as const, feedback: "Narrow the second step", expectedPrompt: "Narrow the second step", expectedPlanMode: true }
+  ])("atomically queues a post-turn plan $decision as a durable child Run", async ({
+    decision, feedback, expectedPrompt, expectedPlanMode
+  }) => {
+    const adapter = new PostTurnPlanReviewFakeAdapter();
+    const fixture = await createFixture(adapter);
+    const sessionId = (await fixture.host.createSession({
+      operationId: `create-post-turn-plan-${decision}`,
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Post-turn plan review",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: true
+    })).value.sessionId;
+    const source = fixture.host.enqueueInput({
+      operationId: `send-post-turn-plan-${decision}`,
+      connection: fixture.connection,
+      sessionId,
+      prompt: { text: "Make a plan", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    await eventually(() => fixture.store.listInteractions({ sessionId, status: "open" }).length === 1);
+    expect(fixture.store.getRun(source.value.runId).descriptor.state).toBe("completed");
+    const interaction = fixture.store.listInteractions({ sessionId, status: "open" })[0]!;
+
+    fixture.host.resolveInteraction(
+      interaction.id,
+      interaction.generation,
+      { kind: "plan_review", decision, feedback },
+      `test:post-turn-plan-${decision}`
+    );
+
+    const continuation = fixture.store.findRunByParentId(source.value.runId);
+    expect(continuation?.descriptor).toMatchObject({
+      sessionId,
+      source: "system",
+      state: "queued",
+      parentRunId: source.value.runId
+    });
+    const queued = continuation === undefined
+      ? undefined
+      : fixture.store.findQueueItemByRunId(sessionId, continuation.descriptor.id);
+    expect(queued?.body).toEqual({
+      text: expectedPrompt,
+      images: [],
+      files: [],
+      mentions: [],
+      disposition: "prompt"
+    });
+    expect(queued === undefined ? undefined : fixture.store.getOperation(queued.operationId)).toMatchObject({
+      status: "completed",
+      kind: "plan_review_continuation"
+    });
+    expect(fixture.store.getSession(sessionId).descriptor.planMode).toBe(expectedPlanMode);
+    await eventually(() => adapter.inputs.length === 2);
+    expect(adapter.inputs.map((input) => input.text)).toEqual(["Make a plan", expectedPrompt]);
+    await eventually(() => continuation !== undefined
+      && fixture.store.getRun(continuation.descriptor.id).descriptor.state === "completed");
+  });
+
+  it("runs the mounted Codex plan-review execute path through a durable Queue before native dispatch", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "joko-codex-plan-host-"));
+    const store = new OperationalStore(join(directory, "store.db"));
+    const repository = new OperationalArtifactRepository(store);
+    const artifacts = new ArtifactStore({
+      rootDirectory: join(directory, "artifacts"),
+      repository,
+      ingestRoots: [directory]
+    });
+    await artifacts.initialize();
+    const fake = new FakeCodexAppServer();
+    const nativeHost = new CodexAppServerHost({ transportFactory: () => fake.createTransport() });
+    const adapter = new CodexBackendAdapter({
+      id: "codex-plan-mounted",
+      instanceGeneration: 7,
+      host: nativeHost,
+      profileDirectory: directory
+    });
+    const descriptor = await adapter.describe();
+    const host = new SessionHost(store, artifacts, [adapter], { backendDescriptors: [descriptor] });
+    cleanups.push(async () => {
+      await host.dispose().catch(() => undefined);
+      await adapter.dispose().catch(() => undefined);
+      await nativeHost.shutdown().catch(() => undefined);
+      store.close();
+      rmSync(directory, { recursive: true, force: true });
+    });
+    await host.initialize();
+    await host.registerTarget({
+      id: "codex-plan-target",
+      backendId: adapter.id,
+      displayName: "Codex plan target",
+      workspaceRoot: directory,
+      managed: true,
+      trusted: true
+    });
+    const connection = store.createConnection({
+      id: "codex-plan-connection",
+      name: "Codex plan device",
+      authKeyDigest: "digest"
+    });
+    const sessionId = (await host.createSession({
+      operationId: "create-mounted-codex-plan",
+      connection,
+      targetId: "codex-plan-target",
+      title: "Mounted Codex plan",
+      providerId: "openai",
+      modelId: "gpt-test",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: true
+    })).value.sessionId;
+    const source = host.enqueueInput({
+      operationId: "send-mounted-codex-plan",
+      connection,
+      sessionId,
+      prompt: { text: "Plan the change", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    await eventually(() => fake.transport?.requests.filter((request) => request.method === "turn/start").length === 1);
+    const binding = store.getSession(sessionId).descriptor.binding;
+    await completeFakeCodexPlanTurn(fake, binding.nativeSessionId!, "1. Inspect\n2. Implement");
+    await eventually(() => store.listInteractions({ sessionId, status: "open" }).length === 1);
+    const interaction = store.listInteractions({ sessionId, status: "open" })[0]!;
+    expect(interaction).toMatchObject({
+      runId: source.value.runId,
+      payload: {
+        kind: "plan_review",
+        markdown: "1. Inspect\n2. Implement",
+        choices: ["execute", "stay", "refine"]
+      }
+    });
+
+    host.resolveInteraction(
+      interaction.id,
+      interaction.generation,
+      { kind: "plan_review", decision: "execute", feedback: "" },
+      "test:mounted-codex-plan-execute"
+    );
+    const child = store.findRunByParentId(source.value.runId);
+    expect(child?.descriptor).toMatchObject({ source: "system", state: "queued" });
+    await eventually(() => fake.transport?.requests.filter((request) => request.method === "turn/start").length === 2);
+    expect(fake.transport?.requests.filter((request) => request.method === "turn/start").at(-1)?.params)
+      .toMatchObject({
+        clientUserMessageId: store.findQueueItemByRunId(sessionId, child!.descriptor.id)?.operationId,
+        input: [{ type: "text", text: "Implement the plan.", text_elements: [] }],
+        collaborationMode: {
+          mode: "default",
+          settings: { developer_instructions: null }
+        }
+      });
+    await fake.completeTurn(binding.nativeSessionId!, "Implemented");
+    await eventually(() => store.getRun(child!.descriptor.id).descriptor.state === "completed");
+  });
+
+  it("leaves a post-turn plan idle when the user chooses to stay", async () => {
+    const adapter = new PostTurnPlanReviewFakeAdapter();
+    const fixture = await createFixture(adapter);
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-post-turn-plan-stay",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Stay on plan",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: true
+    })).value.sessionId;
+    const source = fixture.host.enqueueInput({
+      operationId: "send-post-turn-plan-stay",
+      connection: fixture.connection,
+      sessionId,
+      prompt: { text: "Make a plan", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    await eventually(() => fixture.store.listInteractions({ sessionId, status: "open" }).length === 1);
+    const interaction = fixture.store.listInteractions({ sessionId, status: "open" })[0]!;
+    fixture.host.resolveInteraction(
+      interaction.id,
+      interaction.generation,
+      { kind: "plan_review", decision: "stay", feedback: "" },
+      "test:post-turn-plan-stay"
+    );
+    await nextTurn();
+    expect(fixture.store.findRunByParentId(source.value.runId)).toBeUndefined();
+    expect(fixture.store.getSession(sessionId).descriptor.planMode).toBe(true);
+    expect(adapter.inputs.map((input) => input.text)).toEqual(["Make a plan"]);
+  });
+
+  it("rolls back a post-turn plan decision when its continuation cannot be admitted", async () => {
+    const adapter = new PostTurnPlanReviewFakeAdapter();
+    const fixture = await createFixture(adapter);
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-post-turn-plan-admission-failure",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Plan admission failure",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: true
+    })).value.sessionId;
+    const source = fixture.host.enqueueInput({
+      operationId: "send-post-turn-plan-admission-failure",
+      connection: fixture.connection,
+      sessionId,
+      prompt: { text: "Make a plan", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    await eventually(() => fixture.store.listInteractions({ sessionId, status: "open" }).length === 1);
+    const interaction = fixture.store.listInteractions({ sessionId, status: "open" })[0]!;
+    fixture.store.updateSession(sessionId, { archived: true });
+
+    expect(() => fixture.host.resolveInteraction(
+      interaction.id,
+      interaction.generation,
+      { kind: "plan_review", decision: "execute", feedback: "" },
+      "test:post-turn-plan-admission-failure"
+    )).toThrow();
+    expect(fixture.store.getInteraction(interaction.id).status).toBe("open");
+    expect(fixture.store.getSession(sessionId).descriptor.planMode).toBe(true);
+    expect(fixture.store.findRunByParentId(source.value.runId)).toBeUndefined();
+  });
+
   it("durably dismisses an Interaction when its Backend cancels the native request", async () => {
     const adapter = new AdapterCancellationInteractionFake();
     const fixture = await createFixture(adapter);
@@ -12057,6 +12280,35 @@ class InteractionFakeAdapter extends FakeBackendAdapter {
   }
 }
 
+class PostTurnPlanReviewFakeAdapter extends FakeBackendAdapter {
+  readonly inputs: PromptInput[] = [];
+  decision: InteractionDecision | undefined;
+
+  constructor() {
+    super(MUTABLE_RUNTIME_POLICY_PROFILE);
+  }
+
+  override async send(input: PromptInput, context: AdapterContext): Promise<void> {
+    this.inputs.push(input);
+    if (this.inputs.length === 1) {
+      queueMicrotask(() => {
+        void (async () => {
+          await context.emit({ type: "done", outcome: "completed" });
+          this.decision = await context.requestInteraction({
+            id: "post-turn-plan-review",
+            kind: "plan_review",
+            title: "Review plan",
+            markdown: "1. Inspect\n2. Implement",
+            choices: ["execute", "stay", "refine"]
+          });
+        })();
+      });
+      return;
+    }
+    queueMicrotask(() => void context.emit({ type: "done", outcome: "completed" }));
+  }
+}
+
 class AdapterCancellationInteractionFake extends FakeBackendAdapter {
   decision: InteractionDecision | undefined;
   readonly #interactionAbort = new AbortController();
@@ -12913,6 +13165,28 @@ async function eventually(predicate: () => boolean, timeoutMs = 2_000): Promise<
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error("Condition did not become true in time.");
+}
+
+async function completeFakeCodexPlanTurn(
+  fake: FakeCodexAppServer,
+  threadId: string,
+  text: string
+): Promise<void> {
+  const transport = fake.transport;
+  const thread = fake.threads.get(threadId);
+  const turn = thread?.turns.at(-1);
+  if (transport === undefined || thread === undefined || turn === undefined) {
+    throw new Error("No mounted fake Codex plan turn is active.");
+  }
+  const turnId = String(turn["id"]);
+  const item = { type: "plan", id: `plan-${turnId}`, text };
+  await transport.emitNotification("item/started", { threadId, turnId, item, startedAtMs: Date.now() });
+  await transport.emitNotification("item/plan/delta", { threadId, turnId, itemId: item.id, delta: text });
+  await transport.emitNotification("item/completed", { threadId, turnId, item, completedAtMs: Date.now() });
+  turn["status"] = "completed";
+  turn["items"] = [...((turn["items"] as unknown[]) ?? []), item] as never;
+  thread.status = { type: "idle" };
+  await transport.emitNotification("turn/completed", { threadId, turn });
 }
 
 async function nextTurn(): Promise<void> {

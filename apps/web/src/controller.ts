@@ -1472,16 +1472,17 @@ export function useAppController(): AppController {
     for (const [pageId, preview] of htmlPreviewsRef.current) {
       const browser = state.snapshot.browsers.find((value) => value.id === preview.browserId);
       const session = state.snapshot.sessions.find((value) => value.id === preview.sessionId);
+      const page = browser?.pages.find((value) => value.id === pageId && value.state !== "closed");
       const ownerWindow = preview.ownerDocument.defaultView;
       if (preview.gateway !== gatewayRef.current || preview.gatewayGeneration !== gatewayGenerationRef.current
         || state.connectionState !== "connected" || browser?.generation !== preview.browserGeneration
-        || !browser.pages.some((page) => page.id === pageId && page.state !== "closed") || session === undefined
+        || page === undefined || session === undefined
         || session.targetId !== preview.targetId || session.generation !== preview.sessionGeneration || session.archived
         || ownerWindow === null || ownerWindow.closed) {
         htmlPreviewsRef.current.delete(pageId); continue;
       }
       const active = browser.state === "ready" && browser.takeover?.state === "active" && browser.takeover.pageId === pageId
-        && browser.pages.some((page) => page.id === pageId && page.state === "ready")
+        && page.state === "ready" && preview.reload.observePageUrl(page.url)
         && ownerWindow.location.hash === preview.ownerHash && state.preferences.inspectorOpen
         && isWorkspaceHtmlPreviewVisible(preview.ownerDocument, browser.id, pageId);
       if (preview.reload.observe(session, state.snapshot.timelineBySession.get(session.id) ?? [], active)) {
