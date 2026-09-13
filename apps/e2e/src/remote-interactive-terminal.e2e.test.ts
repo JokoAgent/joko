@@ -64,8 +64,21 @@ it("composes remote terminals over authenticated HTTP and completes service shut
     expect(openTerminal).toHaveBeenCalledWith(expect.objectContaining({ executable: "/bin/sh", cwd: "/srv/project", cols: 90, rows: 30 }));
     expect(openTerminal.mock.calls[0]?.[0]).not.toHaveProperty("env");
     const reference = { sessionId, terminalId: created.terminal!.id, generation: created.terminal!.generation };
-    await clients.terminal.writeTerminal({ ...reference, writerId: "view", inputSequence: 1n, data: "remote typed text" });
+    const view = { viewId: "remote-view", viewRevision: 1n, palette };
+    const watchAbort = new AbortController();
+    const watch = clients.terminal.watchTerminal({ ...reference, appearance: view }, { signal: watchAbort.signal })[Symbol.asyncIterator]();
+    const registered = (await watch.next()).value!;
+    const focused = await clients.terminal.updateTerminalAppearance({
+      ...reference,
+      appearance: { ...view, viewRevision: 2n },
+      claimFocus: true,
+      expectedAppearanceRevision: registered.appearanceRevision
+    });
+    expect(focused).toMatchObject({ accepted: true, ownsDefaults: true, acceptedViewRevision: 2n });
+    await clients.terminal.writeTerminal({ ...reference, writerId: view.viewId, inputSequence: 1n, data: "remote typed text" });
     await waitFor(async () => (await clients.terminal.getTerminal(reference)).serialized, (screen) => screen.includes("remote typed text"), "remote terminal screen");
+    watchAbort.abort();
+    await watch.return?.();
     channels[0]!.finish();
     await waitFor(async () => (await clients.terminal.getTerminal(reference)).terminal, (terminal) => terminal?.exitConfirmed === true, "remote exit confirmation");
     const restarted = await clients.terminal.restartTerminal({ ...reference, requestId: "restart" });

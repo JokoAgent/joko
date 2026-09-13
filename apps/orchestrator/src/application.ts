@@ -53,6 +53,9 @@ import { AndroidAutomationRuntimeFactory } from "@joko/tool-android";
 import { BrowserProvider, type BrowserActivity } from "@joko/tool-browser";
 import { TerminalProvider } from "@joko/tool-terminal";
 import { RemoteTerminalRuntimeResolver } from "./remote-terminal-runtime.js";
+import { RemoteCodexRuntimeResolver } from "./remote-codex-read-runtime.js";
+import { RemoteCodexMcpBridgeManager } from "./remote-codex-mcp-bridge.js";
+import { RemoteClaudeRuntimeResolver } from "./remote-claude-runtime.js";
 import {
   ComputerRuntime,
   ComputerToolProvider,
@@ -136,6 +139,11 @@ import { PiProviderAuthSupervisor } from "./pi-provider-auth-supervisor.js";
 import { ProviderAccountUsageProvider } from "./provider-account-usage.js";
 import { PiResourceManager } from "./resource-manager.js";
 import { RemoteHostRegistry } from "./remote-host-registry.js";
+import {
+  RemoteBackendRuntimeSetupManager,
+  createRemoteClaudeRuntimeSetupProvider,
+  createRemoteCodexRuntimeSetupProvider
+} from "./remote-backend-runtime-setup.js";
 import { RemotePiProcessFactory } from "./remote-pi-process.js";
 import { RemoteWorkspaceService } from "./remote-workspace-service.js";
 import { RemoteHostToolBridgeProvider } from "./remote-host-tool-provider.js";
@@ -284,6 +292,7 @@ export interface OrchestratorApplication {
   readonly scheduler: ScheduleCoordinator;
   readonly reviewCoordinator?: ReviewCoordinator;
   readonly remoteHosts?: RemoteHostRegistry;
+  readonly remoteBackendRuntimeSetup?: RemoteBackendRuntimeSetupManager;
   readonly sshKeys?: SshKeyManager;
   readonly terminals?: TerminalProvider;
   readonly voiceInput?: VoiceInputCoordinator;
@@ -580,7 +589,11 @@ export async function createOrchestratorApplication(
     targetResolver: {
       resolveSnapshot: (targetId) => {
         const target = store.getTarget(targetId).descriptor;
-        return { workspaceRoot: target.workspaceRoot, trusted: target.trusted };
+        return {
+          workspaceRoot: target.workspaceRoot,
+          trusted: target.trusted,
+          remote: target.remoteWorkspace !== undefined
+        };
       },
       resolveAuthenticated: (context) => resolveAuthenticatedLspTarget(store, context)
     }
@@ -596,10 +609,13 @@ export async function createOrchestratorApplication(
   const unregisterVisionBridgeTools = mcpRouter.registerBridgeToolProvider(
     new VisionBridgeToolProvider({
       vision: visionBridge,
-      allowedRoots: (context) => [
-        store.getTarget(context.targetId).descriptor.workspaceRoot,
-        config.artifactDirectory
-      ]
+      allowedRoots: (context) => {
+        const target = store.getTarget(context.targetId).descriptor;
+        return [
+          ...(target.remoteWorkspace === undefined ? [target.workspaceRoot] : []),
+          config.artifactDirectory
+        ];
+      }
     })
   );
   const scheduleHookScripts = new ScheduleHookScriptInstaller({
@@ -776,6 +792,14 @@ export async function createOrchestratorApplication(
   };
   const codexBackendId = "codex";
   const claudeCodeBackendId = "claude-code";
+  const remoteBackendRuntimeSetup = new RemoteBackendRuntimeSetupManager({
+    store,
+    registry: remoteHosts,
+    providers: [
+      createRemoteCodexRuntimeSetupProvider(codexBackendId),
+      createRemoteClaudeRuntimeSetupProvider(claudeCodeBackendId)
+    ]
+  });
   const claudeCodeCredentialPort = createClaudeCodeCredentialPort(
     credentials,
     "cred_backend_claude_code_subscription",
@@ -819,6 +843,15 @@ export async function createOrchestratorApplication(
       create: ({ instanceId, generation }) => createCodexAdapter({
         id: instanceId,
         instanceGeneration: generation,
+        remoteRuntimes: new RemoteCodexRuntimeResolver({
+          store,
+          registry: remoteHosts,
+          mcpBridge: new RemoteCodexMcpBridgeManager({
+            router: mcpRouter,
+            includeToolPolicy: (sessionId, targetId, policyId) =>
+              toolPolicies.enabledForSession(sessionId, targetId, policyId)
+          })
+        }),
         managedProviders: managedRuntime(instanceId, generation, CODEX_MANAGED_PROVIDER_SUPPORT),
         appServer: {
           transport: {
@@ -856,6 +889,10 @@ export async function createOrchestratorApplication(
       create: ({ instanceId, generation }) => createClaudeCodeAdapter({
         id: instanceId,
         instanceGeneration: generation,
+        remoteRuntimes: new RemoteClaudeRuntimeResolver({
+          store,
+          registry: remoteHosts
+        }),
         managedProviders: managedRuntime(instanceId, generation, CLAUDE_MANAGED_PROVIDER_SUPPORT),
         credentialPort: claudeCodeCredentialPort,
         resolveSubagentModel: (providerId) => subagentModels.resolve(instanceId, providerId),
@@ -996,7 +1033,8 @@ export async function createOrchestratorApplication(
     onSessionRuntimeClosed: (sessionId) => {
       androidRuntimeForSessionCleanup?.closeSession(sessionId);
       void computerBridgeForSessionCleanup?.closeSession(sessionId).catch(() => undefined);
-    }
+    },
+    closeSessionTerminals: (sessionId) => terminals.closeSession(sessionId)
   });
   let backendLifecycleTail: Promise<void> = Promise.resolve();
   const runBackendLifecycle = <T>(action: () => Promise<T>): Promise<T> => {
@@ -1683,6 +1721,7 @@ export async function createOrchestratorApplication(
     await terminals.dispose().catch(() => undefined);
     await voiceInput.close().catch(() => undefined);
     sshKeys.close();
+    await remoteBackendRuntimeSetup.close().catch(() => undefined);
     await remoteHosts.close().catch(() => undefined);
     runtimeActivity.close();
     store.close();
@@ -1711,6 +1750,7 @@ export async function createOrchestratorApplication(
     scheduler,
     reviewCoordinator,
     remoteHosts,
+    remoteBackendRuntimeSetup,
     sshKeys,
     terminals,
     voiceInput,
@@ -1810,6 +1850,7 @@ export async function createOrchestratorApplication(
         await attempt(() => mcpRouter.dispose());
         await attempt(() => voiceInput.close());
         sshKeys.close();
+        await attempt(() => remoteBackendRuntimeSetup.close());
         await attempt(() => remoteHosts.close());
         await attempt(() => workspaces.close());
         await attempt(() => runtimeActivity.close());

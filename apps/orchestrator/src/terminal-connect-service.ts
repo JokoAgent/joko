@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { create } from "@bufbuild/protobuf";
 import { timestampFromDate } from "@bufbuild/protobuf/wkt";
 import { Code, ConnectError, type HandlerContext, type ServiceImpl } from "@connectrpc/connect";
@@ -12,6 +12,7 @@ interface TerminalServiceDependencies {
   readonly effectiveTarget?: (session: StoredSession) => { readonly workspaceRoot: string };
   readonly authenticate: (context: HandlerContext) => { readonly id: string };
   readonly onRevoked: (connectionId: string, callback: () => void) => () => void;
+  readonly isSessionMutationBlocked?: (sessionId: string) => boolean;
   readonly registerCleanup?: (callback: () => void) => unknown;
 }
 
@@ -20,6 +21,21 @@ interface MutationMemo {
   readonly result: Promise<TerminalDescriptor>;
 }
 
+interface TerminalWriterMemo {
+  next: bigint;
+  uncertain: boolean;
+  tail: Promise<void>;
+  readonly acknowledgements: Map<bigint, string>;
+}
+
+interface TerminalViewMemo {
+  readonly token: string;
+  readonly abort: AbortController;
+  readonly writer: TerminalWriterMemo;
+}
+
+const MAXIMUM_RETAINED_INPUT_ACKNOWLEDGEMENTS = 256;
+
 class ConfirmedTerminalStartFailure extends Error {
   constructor(readonly original: unknown) { super("The terminal start did not leave an active process."); }
 }
@@ -27,10 +43,9 @@ class ConfirmedTerminalStartFailure extends Error {
 /** This boundary deliberately uses no Operation, Event, setting or log for terminal bytes. */
 export function createTerminalConnectService(dependencies: TerminalServiceDependencies): ServiceImpl<typeof contract.TerminalService> {
   const mutations = new Map<string, MutationMemo>();
-  const writers = new Map<string, { next: bigint; uncertain: boolean; tail: Promise<void> }>();
-  const views = new Map<string, { readonly token: string; readonly abort: AbortController }>();
+  const views = new Map<string, TerminalViewMemo>();
   let pendingInputBytes = 0;
-  dependencies.registerCleanup?.(() => { for (const view of views.values()) view.abort.abort(); views.clear(); mutations.clear(); writers.clear(); });
+  dependencies.registerCleanup?.(() => { for (const view of views.values()) view.abort.abort(); views.clear(); mutations.clear(); });
 
   const provider = (): TerminalProvider => {
     if (dependencies.terminals === undefined) throw new ConnectError("Interactive terminals are unavailable.", Code.Unimplemented);
@@ -40,8 +55,12 @@ export function createTerminalConnectService(dependencies: TerminalServiceDepend
     identity(sessionId, "session_id");
     const session = dependencies.store.getSession(sessionId);
     if (session.descriptor.archived || session.descriptor.deletedAt !== undefined
-      || dependencies.store.findPendingSessionLifecycleCleanup(sessionId) !== undefined) {
+      || dependencies.store.findPendingSessionLifecycleCleanup(sessionId) !== undefined
+      || dependencies.store.findPendingScheduleDeletionCleanupForSession(sessionId) !== undefined) {
       throw new ConnectError("This task is closing or no longer active.", Code.FailedPrecondition);
+    }
+    if (mutate && dependencies.isSessionMutationBlocked?.(sessionId) === true) {
+      throw new ConnectError("This task is being replaced and cannot accept terminal changes.", Code.FailedPrecondition);
     }
     if (mutate && dependencies.store.findSessionRuntimePolicy(sessionId)?.policy === "review_read_only") {
       throw new ConnectError("This task only permits review reads.", Code.PermissionDenied);
@@ -140,7 +159,11 @@ export function createTerminalConnectService(dependencies: TerminalServiceDepend
       if (request.sessionId !== "") {
         const session = dependencies.store.getSession(identity(request.sessionId, "session_id"));
         const reason = dependencies.store.findSessionRuntimePolicy(request.sessionId)?.policy === "review_read_only" ? "This task only permits review reads."
-          : session.descriptor.archived || session.descriptor.deletedAt !== undefined || dependencies.store.findPendingSessionLifecycleCleanup(request.sessionId) !== undefined ? "This task is closing or no longer active." : "";
+          : dependencies.isSessionMutationBlocked?.(request.sessionId) === true ? "This task is being replaced and cannot accept terminal changes."
+          : session.descriptor.archived || session.descriptor.deletedAt !== undefined
+            || dependencies.store.findPendingSessionLifecycleCleanup(request.sessionId) !== undefined
+            || dependencies.store.findPendingScheduleDeletionCleanupForSession(request.sessionId) !== undefined
+            ? "This task is closing or no longer active." : "";
         if (reason !== "") return create(contract.GetTerminalCapabilitiesResponseSchema, { ...limits, support: contract.CapabilitySupport.DISABLED_BY_POLICY, reason });
         initial = scope(request.sessionId);
       }
@@ -174,7 +197,7 @@ export function createTerminalConnectService(dependencies: TerminalServiceDepend
       const initial = scope(request.sessionId, true);
       const initialPalette = copyTerminalPalette(request.initialPalette!);
       const terminal = await mutation(JSON.stringify([request.sessionId, "create", request.requestId]), [initial, request.shellId, request.columns, request.rows, initialPalette],
-        () => start(context, initial, (signal, beforeSpawn) => provider().create({ ...initial, initialPalette, id: randomUUID(),
+        () => start(context, initial, (signal, beforeSpawn) => provider().create({ ...initial, initialPalette, id: randomUUID(), fallbackToDefaultShell: true,
           ...(request.shellId === "" ? {} : { shellId: request.shellId }),
           ...(request.columns === 0 ? {} : { cols: request.columns }), ...(request.rows === 0 ? {} : { rows: request.rows }) }, signal, beforeSpawn)));
       fence(context, initial, true);
@@ -197,7 +220,11 @@ export function createTerminalConnectService(dependencies: TerminalServiceDepend
         const key = JSON.stringify([connection.id, initial.sessionId, initial.id, initial.generation, appearance.viewId]);
         if (views.has(key)) throw new ConnectError("The terminal view is already watching.", Code.AlreadyExists);
         if (views.size >= TERMINAL_LIMITS.maximumTerminals * TERMINAL_LIMITS.maximumStreamsPerTerminal) throw new ConnectError("Terminal view capacity reached.", Code.ResourceExhausted);
-        const view = { token: randomUUID(), abort: new AbortController() };
+        const view: TerminalViewMemo = {
+          token: randomUUID(),
+          abort: new AbortController(),
+          writer: { next: 1n, uncertain: false, tail: Promise.resolve(), acknowledgements: new Map() }
+        };
         views.set(key, view);
         release = () => { view.abort.abort(); if (views.get(key) === view) views.delete(key); };
         const signal = AbortSignal.any([context.signal, view.abort.signal]);
@@ -252,29 +279,44 @@ export function createTerminalConnectService(dependencies: TerminalServiceDepend
         throw new ConnectError("Terminal input exceeds the advertised limits.", Code.InvalidArgument);
       }
       const key = JSON.stringify([connection.id, initial.sessionId, initial.id, initial.generation, request.writerId]);
-      let writer = writers.get(key);
-      if (writer === undefined) {
-        if (writers.size >= 4096) throw new ConnectError("Terminal writer capacity reached.", Code.ResourceExhausted);
-        writer = { next: 1n, uncertain: false, tail: Promise.resolve() };
-        writers.set(key, writer);
-      }
+      const view = views.get(key);
+      if (view === undefined) throw new ConnectError("This terminal view is no longer watching.", Code.FailedPrecondition);
+      const writer = view.writer;
       if (pendingInputBytes + bytes > 1024 * 1024) throw new ConnectError("Terminal input is arriving faster than it can be delivered.", Code.ResourceExhausted);
       pendingInputBytes += bytes;
       const currentWriter = writer;
       const revoked = new AbortController();
       const unsubscribe = dependencies.onRevoked(connection.id, () => revoked.abort());
+      const signal = AbortSignal.any([context.signal, revoked.signal, view.abort.signal]);
+      const current = (): void => {
+        fence(context, initial, true);
+        if (signal.aborted || views.get(key) !== view || dependencies.authenticate(context).id !== connection.id) {
+          throw new ConnectError("Terminal view retired.", Code.Canceled);
+        }
+      };
+      const digest = createHash("sha256").update(request.data, "utf8").digest("hex");
       const result = currentWriter.tail.then(async () => {
         if (currentWriter.uncertain) throw new ConnectError("Terminal input outcome is unknown. Reconnect before sending new input.", Code.FailedPrecondition);
         if (request.inputSequence > currentWriter.next) throw new ConnectError("Terminal input arrived out of order.", Code.FailedPrecondition);
-        fence(context, initial, true);
+        current();
         const terminal = provider().list(initial).find((item) => item.id === initial.id);
-        if (terminal?.generation !== initial.generation) throw new ConnectError("The terminal generation is no longer current.", Code.FailedPrecondition);
-        if (request.inputSequence === currentWriter.next) {
-          try { await provider().input({ ...initial, data: request.data }, AbortSignal.any([context.signal, revoked.signal])); }
-          catch (error) { if (error instanceof TerminalError && error.stateMayHaveChanged) currentWriter.uncertain = true; throw error; }
-          currentWriter.next += 1n;
+        if (terminal?.generation !== initial.generation) {
+          throw new ConnectError("The terminal generation is no longer current.", Code.FailedPrecondition);
         }
-        fence(context, initial, true);
+        if (request.inputSequence < currentWriter.next) {
+          const acknowledged = currentWriter.acknowledgements.get(request.inputSequence);
+          if (acknowledged === undefined) throw new ConnectError("The terminal input acknowledgement is no longer retained.", Code.FailedPrecondition);
+          if (acknowledged !== digest) throw new ConnectError("input_sequence already identifies different terminal input.", Code.AlreadyExists);
+          return create(contract.WriteTerminalResponseSchema, { nextInputSequence: currentWriter.next });
+        }
+        try { await provider().input({ ...initial, viewId: view.token, data: request.data }, signal, current); }
+        catch (error) { if (error instanceof TerminalError && error.stateMayHaveChanged) currentWriter.uncertain = true; throw error; }
+        currentWriter.acknowledgements.set(request.inputSequence, digest);
+        while (currentWriter.acknowledgements.size > MAXIMUM_RETAINED_INPUT_ACKNOWLEDGEMENTS) {
+          currentWriter.acknowledgements.delete(currentWriter.acknowledgements.keys().next().value!);
+        }
+        currentWriter.next += 1n;
+        current();
         return create(contract.WriteTerminalResponseSchema, { nextInputSequence: currentWriter.next });
       });
       currentWriter.tail = result.then(() => undefined, () => undefined);
@@ -283,12 +325,23 @@ export function createTerminalConnectService(dependencies: TerminalServiceDepend
     resizeTerminal: async (request, context) => rpc(async () => {
       const connection = dependencies.authenticate(context);
       const initial = reference(request, true);
+      identity(request.viewId, "view_id");
+      const key = JSON.stringify([connection.id, initial.sessionId, initial.id, initial.generation, request.viewId]);
+      const view = views.get(key);
+      if (view === undefined) throw new ConnectError("This terminal view is no longer watching.", Code.FailedPrecondition);
       const revoked = new AbortController();
       const unsubscribe = dependencies.onRevoked(connection.id, () => revoked.abort());
+      const signal = AbortSignal.any([context.signal, revoked.signal, view.abort.signal]);
+      const current = (): void => {
+        fence(context, initial, true);
+        if (signal.aborted || views.get(key) !== view || dependencies.authenticate(context).id !== connection.id) {
+          throw new ConnectError("Terminal view retired.", Code.Canceled);
+        }
+      };
       try {
-        fence(context, initial, true);
-        const terminal = await provider().resize({ ...initial, cols: request.columns, rows: request.rows }, AbortSignal.any([context.signal, revoked.signal]), () => fence(context, initial, true));
-        fence(context, initial, true);
+        current();
+        const terminal = await provider().resize({ ...initial, viewId: view.token, cols: request.columns, rows: request.rows }, signal, current);
+        current();
         return create(contract.ResizeTerminalResponseSchema, { terminal: toTerminal(terminal) });
       } finally { unsubscribe(); }
     }),

@@ -6,7 +6,27 @@ export {
 } from "./adapter.js";
 export {
   CLAUDE_AGENT_SDK_PACKAGE,
-  CLAUDE_AGENT_SDK_VERSION
+  CLAUDE_AGENT_SDK_VERSION,
+  type ClaudeRemoteRuntimePort,
+  type ClaudeTargetRuntime,
+  type ClaudeSdkRuntime,
+  type ClaudeSdkQuery,
+  type ClaudeSdkQueryOptions,
+  type ClaudeSdkQueryParams,
+  type ClaudeSdkProbe,
+  type ClaudeSdkProbeInput,
+  type ClaudeSdkSessionInfo,
+  type ClaudeSdkSessionMessage,
+  type ClaudeSdkListSessionsOptions,
+  type ClaudeSdkGetSessionMessagesOptions,
+  type ClaudeSdkForkOptions,
+  type ClaudeSdkInitializationResult,
+  type ClaudeSdkModelInfo,
+  type ClaudeSdkAccountInfo,
+  type ClaudeSdkPermissionMode,
+  type ClaudePermissionResult,
+  type ClaudeCanUseToolOptions,
+  type ClaudeSdkUserMessage
 } from "./sdk-runtime.js";
 export {
   type ClaudeTextResourceResolver,
@@ -21,3 +41,4 @@ export {
   type ClaudeCodeOAuthAccountOptions,
   type ClaudeCodeRuntimeAuthorization
 } from "./oauth-account.js";
+export { loadClaudeRemoteManagerSource } from "./remote-manager-source.js";

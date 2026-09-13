@@ -12,6 +12,11 @@ import {
   ListRemoteHostsResponseSchema,
   OperationState,
   RemoteHostAuthenticationMode,
+  InstallRemoteBackendRuntimeResponseSchema,
+  ProbeRemoteBackendRuntimeResponseSchema,
+  UninstallRemoteBackendRuntimeResponseSchema,
+  RemoteBackendRuntimeInstallPhase,
+  RemoteBackendRuntimeState,
   RemoteHostCapabilityKind,
   RemoteHostFailureCode,
   RemoteHostSource,
@@ -49,7 +54,8 @@ describe("Remote Host gateway", () => {
             RemoteHostCapabilityKind.CONNECTION_TEST,
             RemoteHostCapabilityKind.PROCESS_STREAMING,
             RemoteHostCapabilityKind.FILE_TRANSFER,
-            RemoteHostCapabilityKind.TCP_FORWARDING
+            RemoteHostCapabilityKind.TCP_FORWARDING,
+            RemoteHostCapabilityKind.BACKEND_RUNTIME_SETUP
           ].map((kind) => ({ kind, name: `capability-${kind}`, support: CapabilitySupport.SUPPORTED }))
         });
       }
@@ -92,7 +98,8 @@ describe("Remote Host gateway", () => {
       fileTransfer: true,
       tcpForwarding: true,
       connectionControl: false,
-      commandExecution: false
+      commandExecution: false,
+      backendRuntimeSetup: true
     });
     await expect(gateway.listRemoteHosts("target-one")).resolves.toEqual([{
       targetId: "target-one",
@@ -158,6 +165,100 @@ describe("Remote Host gateway", () => {
     expect(requests.find((request) => request.method === "submitOperation")?.input.mutation.preconditions).toMatchObject([{
       entity: { kind: EntityKind.TARGET, id: "target-one" }, expectedRevision: { value: 7n }
     }]);
+    gateway.disconnect();
+  });
+
+  it("maps exact runtime setup revisions and ordered installation progress without exposing Backend selection", async () => {
+    const requests: Array<{ readonly method: string; readonly input: any }> = [];
+    const transport = remoteTransport((method, input) => {
+      requests.push({ method, input });
+      if (method === "probeRemoteBackendRuntime") return create(ProbeRemoteBackendRuntimeResponseSchema, { runtime: runtime() });
+      if (method === "uninstallRemoteBackendRuntime") return create(UninstallRemoteBackendRuntimeResponseSchema, {
+        runtime: runtime({ state: RemoteBackendRuntimeState.NOT_INSTALLED, installedVersion: "0.153.4", canInstall: true, canReinstall: false, canUninstall: false })
+      });
+      throw new Error(`Unexpected method: ${method}`);
+    });
+    vi.mocked(transport.stream).mockImplementation(async (method: any, _signal: unknown, _timeout: unknown, _headers: unknown, input: AsyncIterable<any>) => {
+      if (method.localName !== "installRemoteBackendRuntime") return response(method, idleStream(), true);
+      const iterator = input[Symbol.asyncIterator]();
+      const first = await iterator.next();
+      const request = first.value;
+      requests.push({ method: method.localName, input: request });
+      return response(method, (async function* () {
+        yield create(InstallRemoteBackendRuntimeResponseSchema, {
+          requestId: request.requestId, sequence: 1n, phase: RemoteBackendRuntimeInstallPhase.DOWNLOADING,
+          runtime: runtime({ state: RemoteBackendRuntimeState.INSTALLING, canInstall: false, canReinstall: false, canUninstall: false }),
+          observedAt: { seconds: 20n }
+        });
+        yield create(InstallRemoteBackendRuntimeResponseSchema, {
+          requestId: request.requestId, sequence: 2n, phase: RemoteBackendRuntimeInstallPhase.COMPLETE,
+          runtime: runtime(), observedAt: { seconds: 21n }
+        });
+      })(), true);
+    });
+    const gateway = createOrchestratorGateway(
+      { id: "runtime", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" },
+      "auth-key", {}, () => transport
+    );
+    await gateway.connect();
+
+    await expect(gateway.probeRemoteBackendRuntime("target-one", "build-box", 7n, 4n)).resolves.toMatchObject({
+      displayName: "Codex", expectedVersion: "0.153.4", installedVersion: "0.153.4", state: "ready",
+      targetRevision: 7n, hostRevision: 4n
+    });
+    const progress = [];
+    for await (const event of gateway.installRemoteBackendRuntime("target-one", "build-box", 7n, 4n, true)) progress.push(event);
+    expect(progress.map((event) => event.phase)).toEqual(["downloading", "complete"]);
+    await expect(gateway.uninstallRemoteBackendRuntime("target-one", "build-box", 7n, 4n)).resolves.toMatchObject({ state: "notInstalled" });
+    const runtimeRequests = requests.filter(({ method }) => method.includes("RemoteBackendRuntime"));
+    expect(runtimeRequests.map(({ method }) => method)).toEqual([
+      "probeRemoteBackendRuntime", "installRemoteBackendRuntime", "uninstallRemoteBackendRuntime"
+    ]);
+    for (const { input } of runtimeRequests) {
+      expect(input).toMatchObject({
+        targetId: "target-one", hostId: "build-box",
+        expectedTargetRevision: { value: 7n }, expectedHostRevision: { value: 4n }
+      });
+      expect(input).not.toHaveProperty("backendId");
+    }
+    gateway.disconnect();
+  });
+
+  it("rejects drifted runtime authority and non-contiguous install progress", async () => {
+    const transport = remoteTransport((method) => {
+      if (method === "probeRemoteBackendRuntime") {
+        return create(ProbeRemoteBackendRuntimeResponseSchema, {
+          runtime: runtime({ targetRevision: { value: 8n } })
+        });
+      }
+      throw new Error(`Unexpected method: ${method}`);
+    });
+    vi.mocked(transport.stream).mockImplementation(async (method: any, _signal: unknown, _timeout: unknown, _headers: unknown, input: AsyncIterable<any>) => {
+      if (method.localName !== "installRemoteBackendRuntime") return response(method, idleStream(), true);
+      const request = (await input[Symbol.asyncIterator]().next()).value;
+      return response(method, (async function* () {
+        yield create(InstallRemoteBackendRuntimeResponseSchema, {
+          requestId: request.requestId,
+          sequence: 2n,
+          phase: RemoteBackendRuntimeInstallPhase.DOWNLOADING,
+          runtime: runtime({ state: RemoteBackendRuntimeState.INSTALLING, canInstall: false, canReinstall: false, canUninstall: false }),
+          observedAt: { seconds: 20n }
+        });
+      })(), true);
+    });
+    const gateway = createOrchestratorGateway(
+      { id: "runtime-invalid", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" },
+      "auth-key", {}, () => transport
+    );
+    await gateway.connect();
+
+    await expect(gateway.probeRemoteBackendRuntime("target-one", "build-box", 7n, 4n))
+      .rejects.toThrow("incomplete remote Backend runtime");
+    await expect((async () => {
+      for await (const _event of gateway.installRemoteBackendRuntime("target-one", "build-box", 7n, 4n, false)) {
+        // Consume the stream so continuity validation runs.
+      }
+    })()).rejects.toThrow("invalid remote Backend runtime progress");
     gateway.disconnect();
   });
 
@@ -441,6 +542,24 @@ function host(patch: Record<string, unknown> = {}): any {
       failure: { code: RemoteHostFailureCode.HOST_KEY_CHANGED, retryable: false }
     },
     revision: { value: 4n },
+    ...patch
+  };
+}
+
+function runtime(patch: Record<string, unknown> = {}): any {
+  return {
+    targetId: "target-one",
+    hostId: "build-box",
+    displayName: "Codex",
+    expectedVersion: "0.153.4",
+    installedVersion: "0.153.4",
+    state: RemoteBackendRuntimeState.READY,
+    canInstall: false,
+    canReinstall: true,
+    canUninstall: true,
+    observedAt: { seconds: 12n, nanos: 0 },
+    targetRevision: { value: 7n },
+    hostRevision: { value: 4n },
     ...patch
   };
 }

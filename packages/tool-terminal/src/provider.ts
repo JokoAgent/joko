@@ -104,6 +104,7 @@ interface TerminalRecord {
   readonly frames: { frame: TerminalFrame; bytes: number }[];
   readonly views: Map<string, TerminalViewLease>;
   defaultViewId: string | undefined;
+  controlViewId: string | undefined;
   appearanceRevision: number;
   viewOrder: number;
   descriptor: TerminalDescriptor;
@@ -193,7 +194,7 @@ export class TerminalProvider {
     }
     const requestedShell = input.shellId === undefined || input.shellId === "" ? "auto" : input.shellId;
     identity(requestedShell, "Shell identity");
-    const key = JSON.stringify([input.sessionId, input.targetId, input.remoteHostId ?? null, paths.resolve(input.workspaceRoot), paths.resolve(input.workspaceRoot, cwd), requestedShell, cols, rows, initialPalette]);
+    const key = JSON.stringify([input.sessionId, input.targetId, input.remoteHostId ?? null, paths.resolve(input.workspaceRoot), paths.resolve(input.workspaceRoot, cwd), requestedShell, input.fallbackToDefaultShell === true, cols, rows, initialPalette]);
     const existing = this.#records.get(input.id);
     if (existing !== undefined) {
       this.#assertScope(existing, input);
@@ -216,7 +217,7 @@ export class TerminalProvider {
     const combined = signal === undefined ? abort.signal : AbortSignal.any([signal, abort.signal]);
     const scope: TerminalScope = { sessionId: input.sessionId, targetId: input.targetId, workspaceRoot: paths.resolve(input.workspaceRoot),
       ...(input.remoteHostId === undefined ? {} : { remoteHostId: input.remoteHostId }) };
-    const result = this.#create(scope, input.id, key, cwd, requestedShell, cols, rows, initialPalette, combined, beforeSpawn);
+    const result = this.#create(scope, input.id, key, cwd, requestedShell, input.fallbackToDefaultShell === true, cols, rows, initialPalette, combined, beforeSpawn);
     this.#creating.set(input.id, { key, scope, abort, result });
     this.#activity();
     try { return { ...await result }; }
@@ -277,6 +278,7 @@ export class TerminalProvider {
       view.palette = appearance.palette;
       if (input.claimFocus) {
         view.focused = ++record.viewOrder;
+        record.controlViewId = view.id;
         this.#useViewDefaults(record, view, true);
       } else if (record.defaultViewId === view.id) this.#useViewDefaults(record, view);
       return result(true);
@@ -295,20 +297,26 @@ export class TerminalProvider {
     return [...record.views.values()].filter((view) => view.live).sort((left, right) => right.focused - left.focused || left.attached - right.attached)[0];
   }
 
-  async input(input: TerminalReference & { readonly data: string }, signal?: AbortSignal): Promise<void> {
+  async input(input: TerminalReference & { readonly data: string; readonly viewId?: string }, signal?: AbortSignal, beforeCommit?: () => void): Promise<void> {
     signal?.throwIfAborted();
     const record = this.#requireRunning(input);
     if (typeof input.data !== "string" || input.data.length === 0 || Buffer.byteLength(input.data) > TERMINAL_LIMITS.maximumInputBytes) {
       throw new TerminalError("INPUT_LIMIT", "Terminal input must be nonempty and fit within the advertised byte limit.");
     }
-    try { await record.pty.write(input.data); this.#activity(); }
-    catch (error) {
-      if (error instanceof TerminalError) throw error;
-      throw new TerminalError("INPUT_UNKNOWN", "The terminal input outcome could not be confirmed.", true);
-    }
+    return this.#enqueue(record, async () => {
+      signal?.throwIfAborted();
+      beforeCommit?.();
+      this.#requireRunning(input);
+      this.#assertControlView(record, input.viewId);
+      try { await record.pty.write(input.data); this.#activity(); }
+      catch (error) {
+        if (error instanceof TerminalError) throw error;
+        throw new TerminalError("INPUT_UNKNOWN", "The terminal input outcome could not be confirmed.", true);
+      }
+    });
   }
 
-  async resize(input: TerminalReference & { readonly cols: number; readonly rows: number }, signal?: AbortSignal, beforeCommit?: () => void): Promise<TerminalDescriptor> {
+  async resize(input: TerminalReference & { readonly cols: number; readonly rows: number; readonly viewId?: string }, signal?: AbortSignal, beforeCommit?: () => void): Promise<TerminalDescriptor> {
     const record = this.#requireRunning(input);
     const cols = integer(input.cols, 2, TERMINAL_LIMITS.maximumColumns, "Columns");
     const rows = integer(input.rows, 1, TERMINAL_LIMITS.maximumRows, "Rows");
@@ -316,6 +324,7 @@ export class TerminalProvider {
       signal?.throwIfAborted();
       beforeCommit?.();
       this.#requireRunning(input);
+      this.#assertControlView(record, input.viewId);
       if (cols === record.descriptor.cols && rows === record.descriptor.rows) return { ...record.descriptor };
       try { await record.pty.resize(cols, rows); record.screen.resize(cols, rows); }
       catch { throw new TerminalError("RESIZE_UNKNOWN", "The terminal resize outcome could not be confirmed.", true); }
@@ -432,10 +441,10 @@ export class TerminalProvider {
     if (outcomes.some((outcome) => outcome.status === "rejected") || pendingOutcomes.some(unknownCleanup) || this.#uncertainScopes.size > 0) throw new TerminalError("CLEANUP_UNKNOWN", "Some terminal processes could not be stopped during shutdown.", true);
   }
 
-  async #create(scope: TerminalScope, id: string, key: string, cwd: string, shellId: string, cols: number, rows: number, initialPalette: TerminalPalette, signal: AbortSignal, beforeSpawn?: () => void): Promise<TerminalDescriptor> {
+  async #create(scope: TerminalScope, id: string, key: string, cwd: string, shellId: string, fallbackToDefaultShell: boolean, cols: number, rows: number, initialPalette: TerminalPalette, signal: AbortSignal, beforeSpawn?: () => void): Promise<TerminalDescriptor> {
     signal.throwIfAborted();
     const runtime = await this.#runtime(scope, signal);
-    const shell = await this.#selectShell(runtime, shellId, signal);
+    const shell = await this.#selectShell(runtime, shellId, signal, fallbackToDefaultShell);
     const directory = await abortable(runtime.canonicalDirectory(scope.workspaceRoot, cwd), signal);
     signal.throwIfAborted();
     this.#assertOpen();
@@ -470,7 +479,7 @@ export class TerminalProvider {
     const record: TerminalRecord = {
       scope: { ...scope }, createKey, shell: { ...shell, args: [...shell.args] }, pty, screen, serializer, colors,
       framer: new TerminalOutputFramer(), lifetime: new AbortController(), subscriptions: [], wake: new Set(), frames: [],
-      views: new Map(), defaultViewId: undefined, appearanceRevision: 1, viewOrder: 0,
+      views: new Map(), defaultViewId: undefined, controlViewId: undefined, appearanceRevision: 1, viewOrder: 0,
       descriptor: { id, sessionId: scope.sessionId, targetId: scope.targetId, generation: ++this.#generation, status: "running", exitConfirmed: false, shellId: shell.id, shellLabel: shell.label, cwd, cols, rows,
         ...(pty.pid === undefined ? {} : { pid: pty.pid }), createdAt: timestamp, updatedAt: timestamp },
       queue: Promise.resolve(), sequence: 0, retainedBytes: 0, pendingBytes: 0, bytesSinceCapacityCheck: 0,
@@ -505,11 +514,15 @@ export class TerminalProvider {
     return runtime;
   }
 
-  async #selectShell(runtime: TerminalRuntime, shellId: string, signal: AbortSignal): Promise<TerminalShell> {
+  async #selectShell(runtime: TerminalRuntime, shellId: string, signal: AbortSignal, fallbackToDefault = false): Promise<TerminalShell> {
     const shells = await abortable(runtime.discoverShells(), signal);
     const candidates = shells.filter((shell) => shellId === "auto" ? shell.isDefault : shell.id === shellId);
-    if (candidates.length !== 1) throw new TerminalError("SHELL_UNAVAILABLE", "The selected shell is not uniquely available on the terminal host.");
-    return { ...candidates[0]!, args: [...candidates[0]!.args] };
+    const defaults = fallbackToDefault && shellId !== "auto" && candidates.length === 0
+      ? shells.filter((shell) => shell.isDefault)
+      : [];
+    const selected = candidates.length === 1 ? candidates[0] : defaults.length === 1 ? defaults[0] : undefined;
+    if (selected === undefined) throw new TerminalError("SHELL_UNAVAILABLE", "The selected shell is not uniquely available on the terminal host.");
+    return { ...selected, args: [...selected.args] };
   }
 
   async #discardUnpublished(record: TerminalRecord): Promise<void> {
@@ -628,6 +641,15 @@ export class TerminalProvider {
     catch { this.#fail(record, "PROTOCOL_RESPONSE_FAILED"); }
   }
 
+  #assertControlView(record: TerminalRecord, viewId: string | undefined): void {
+    if (viewId === undefined) return;
+    identity(viewId, "Terminal view identity");
+    const view = record.views.get(viewId);
+    if (view === undefined || !view.live || record.controlViewId !== viewId) {
+      throw new TerminalError("VIEW_CONTROL_REQUIRED", "The terminal view does not own interactive control.");
+    }
+  }
+
   async *#stream(input: TerminalStreamInput, signal: AbortSignal, beforeCommit?: () => void): AsyncGenerator<TerminalFrame> {
     const record = this.#require(input);
     if (record.streams >= TERMINAL_LIMITS.maximumStreamsPerTerminal) throw new TerminalError("STREAM_LIMIT", "Too many clients are watching this terminal.");
@@ -644,6 +666,7 @@ export class TerminalProvider {
       if (record.views.get(view.id) !== view) return;
       record.views.delete(view.id);
       void this.#enqueue(record, () => {
+        if (record.controlViewId === view.id) record.controlViewId = undefined;
         if (record.defaultViewId === view.id) this.#useViewDefaults(record, this.#remainingView(record));
       }).catch(() => undefined);
     };

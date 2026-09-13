@@ -46,6 +46,25 @@ export interface RpcTransport {
   close(): Promise<void>;
 }
 
+export interface JsonRpcRecordChannelHandlers {
+  /** Bytes from the native peer. Complete records are not required. */
+  readonly onData: (chunk: Buffer | string) => void;
+  readonly onExit: (fault: TransportFault) => void | Promise<void>;
+}
+
+/**
+ * Process-boundary channel for the shared bounded JSON-RPC engine.
+ * `write` receives exactly one UTF-8 JSONL record, including its final newline.
+ */
+export interface JsonRpcRecordChannel {
+  readonly running: boolean;
+  start(handlers: JsonRpcRecordChannelHandlers): Promise<void>;
+  write(record: Buffer): Promise<void>;
+  /** Hard stop for an already-fenced channel generation. */
+  forceClose?(): Promise<void>;
+  close(): Promise<void>;
+}
+
 export interface StdioJsonRpcTransportOptions {
   readonly command?: string;
   readonly args?: readonly string[];
@@ -64,6 +83,8 @@ export interface StdioJsonRpcTransportOptions {
   readonly shutdownTimeoutMs?: number;
   /** Adapter-private crash recovery authority for the exact local child. */
   readonly processOwner?: DurableProcessOwnerOptions;
+  /** Alternate process boundary; JSON-RPC parsing, limits, and receipts stay here. */
+  readonly channelFactory?: () => JsonRpcRecordChannel;
 }
 
 interface PendingRequest {
@@ -100,6 +121,8 @@ export class StdioJsonRpcTransport implements RpcTransport {
   >> & StdioJsonRpcTransportOptions;
   readonly #processOwner: DurableProcessOwner | undefined;
   #child: ChildProcessWithoutNullStreams | undefined;
+  #channel: JsonRpcRecordChannel | undefined;
+  #closingChannel: JsonRpcRecordChannel | undefined;
   #handlers: RpcTransportHandlers | undefined;
   #buffer = Buffer.alloc(0);
   #nextRequestId = 1;
@@ -131,6 +154,16 @@ export class StdioJsonRpcTransport implements RpcTransport {
     this.#processOwner = options.processOwner === undefined
       ? undefined
       : new DurableProcessOwner(options.processOwner);
+    if (options.channelFactory !== undefined && (
+      options.command !== undefined
+      || options.args !== undefined
+      || options.cwd !== undefined
+      || options.env !== undefined
+      || options.managedEnvironment !== undefined
+      || options.processOwner !== undefined
+    )) {
+      throw new TypeError("A Codex record channel cannot be combined with local process options.");
+    }
     if (!positiveInteger(this.#options.requestTimeoutMs)
       || !positiveInteger(this.#options.maxLineBytes)
       || !positiveInteger(this.#options.maxBufferedBytes)
@@ -149,14 +182,44 @@ export class StdioJsonRpcTransport implements RpcTransport {
   }
 
   get running(): boolean {
-    return this.#child !== undefined && !this.#fatal && !this.#closing;
+    return (this.#child !== undefined || this.#channel?.running === true) && !this.#fatal && !this.#closing;
   }
 
   async start(handlers: RpcTransportHandlers): Promise<void> {
-    if (this.#child !== undefined || this.#handlers !== undefined) {
+    if (this.#child !== undefined || this.#channel !== undefined || this.#handlers !== undefined) {
       throw new TransportFault("closed", "The Codex transport cannot be started twice.");
     }
     this.#handlers = handlers;
+    if (this.#options.channelFactory !== undefined) {
+      let channel: JsonRpcRecordChannel;
+      try {
+        channel = this.#options.channelFactory();
+      } catch {
+        throw new TransportFault("spawn_failed", "The Codex record channel could not be created.");
+      }
+      this.#channel = channel;
+      try {
+        await channel.start({
+          onData: (chunk) => this.#acceptChunk(chunk),
+          onExit: (fault) => {
+            if (this.#closing) return;
+            this.#fail(fault);
+          }
+        });
+      } catch (error) {
+        if (this.#channel === channel) this.#channel = undefined;
+        await channel.forceClose?.().catch(() => undefined);
+        await channel.close().catch(() => undefined);
+        if (error instanceof TransportFault) throw error;
+        throw new TransportFault("spawn_failed", "The Codex record channel could not be started.");
+      }
+      if (!channel.running || this.#channel !== channel) {
+        if (this.#channel === channel) this.#channel = undefined;
+        await (channel.forceClose?.() ?? channel.close()).catch(() => undefined);
+        throw new TransportFault("spawn_failed", "The Codex record channel did not become ready.");
+      }
+      return;
+    }
     await this.#processOwner?.prepare(this.#options.shutdownTimeoutMs);
     const command = this.#options.command ?? "codex";
     const args = [...(this.#options.args ?? ["app-server", "--stdio"])];
@@ -206,7 +269,7 @@ export class StdioJsonRpcTransport implements RpcTransport {
   }
 
   request(method: string, params: JsonValue | undefined, options: RpcRequestOptions = {}): Promise<JsonValue> {
-    const child = this.#requireChild();
+    const writer = this.#requireWriter();
     if (options.signal?.aborted === true) {
       return Promise.reject(new TransportFault("closed", "The Codex request was cancelled before dispatch."));
     }
@@ -261,7 +324,7 @@ export class StdioJsonRpcTransport implements RpcTransport {
         timer,
         ...(abortCleanup === undefined ? {} : { abortCleanup })
       });
-      this.#enqueueWrite(child, envelope, () => {
+      this.#enqueueWrite(writer, envelope, () => {
         const pending = this.#pending.get(key);
         if (pending === undefined) return false;
         if (options.signal?.aborted) {
@@ -305,24 +368,30 @@ export class StdioJsonRpcTransport implements RpcTransport {
   }
 
   notify(method: string, params?: JsonValue): Promise<void> {
-    return this.#enqueueWrite(this.#requireChild(), {
+    return this.#enqueueWrite(this.#requireWriter(), {
       method,
       ...(params === undefined ? {} : { params })
     });
   }
 
   respond(id: RpcId, result: JsonValue): Promise<void> {
-    return this.#enqueueWrite(this.#requireChild(), { id, result });
+    return this.#enqueueWrite(this.#requireWriter(), { id, result });
   }
 
   respondError(id: RpcId, code: number, message: string): Promise<void> {
-    return this.#enqueueWrite(this.#requireChild(), {
+    return this.#enqueueWrite(this.#requireWriter(), {
       id,
       error: { code, message }
     });
   }
 
   async close(): Promise<void> {
+    const channel = this.#beginChannelClose(false);
+    if (channel !== undefined) {
+      await channel.close();
+      if (this.#closingChannel === channel) this.#closingChannel = undefined;
+      return;
+    }
     const child = this.#beginClose(false);
     if (child === undefined) return;
     child.stdin.end();
@@ -350,6 +419,13 @@ export class StdioJsonRpcTransport implements RpcTransport {
   }
 
   async forceClose(): Promise<void> {
+    const channel = this.#beginChannelClose(true);
+    if (channel !== undefined) {
+      if (channel.forceClose !== undefined) await channel.forceClose();
+      else await channel.close();
+      if (this.#closingChannel === channel) this.#closingChannel = undefined;
+      return;
+    }
     const child = this.#beginClose(true);
     if (child === undefined) return;
     if (child.exitCode !== null || child.signalCode !== null) {
@@ -369,6 +445,18 @@ export class StdioJsonRpcTransport implements RpcTransport {
     this.#rejectPending(new TransportFault("closed", "The Codex transport was closed."));
     this.#buffer = Buffer.alloc(0);
     return child;
+  }
+
+  #beginChannelClose(force: boolean): JsonRpcRecordChannel | undefined {
+    if (this.#closing) return force ? this.#closingChannel : undefined;
+    if (this.#channel === undefined) return undefined;
+    this.#closing = true;
+    const channel = this.#channel;
+    this.#channel = undefined;
+    this.#closingChannel = channel;
+    this.#rejectPending(new TransportFault("closed", "The Codex transport was closed."));
+    this.#buffer = Buffer.alloc(0);
+    return channel;
   }
 
   async #hardStopChild(child: ChildProcessWithoutNullStreams): Promise<void> {
@@ -404,14 +492,15 @@ export class StdioJsonRpcTransport implements RpcTransport {
     if (this.#processLease === lease) this.#processLease = undefined;
   }
 
-  #requireChild(): ChildProcessWithoutNullStreams {
-    if (!this.running || this.#child === undefined) {
+  #requireWriter(): ChildProcessWithoutNullStreams | JsonRpcRecordChannel {
+    const writer = this.#channel ?? this.#child;
+    if (!this.running || writer === undefined) {
       throw new TransportFault("not_started", "The Codex app-server transport is not running.");
     }
-    return this.#child;
+    return writer;
   }
 
-  #enqueueWrite(child: ChildProcessWithoutNullStreams, envelope: JsonObject, beforeWrite?: () => boolean): Promise<void> {
+  #enqueueWrite(writer: ChildProcessWithoutNullStreams | JsonRpcRecordChannel, envelope: JsonObject, beforeWrite?: () => boolean): Promise<void> {
     let bytes: Buffer;
     try {
       bytes = Buffer.from(`${JSON.stringify(envelope)}\n`, "utf8");
@@ -422,10 +511,16 @@ export class StdioJsonRpcTransport implements RpcTransport {
       return Promise.reject(new TransportFault("buffer_overflow", "A Codex JSON-RPC request exceeded the configured byte limit."));
     }
     const write = this.#writeTail.then(async () => {
-      if (child !== this.#child || !this.running) throw new TransportFault("closed", "The Codex transport was closed before write.");
+      if ((writer !== this.#child && writer !== this.#channel) || !this.running) {
+        throw new TransportFault("closed", "The Codex transport was closed before write.");
+      }
       if (beforeWrite?.() === false) return;
-      if (child.stdin.write(bytes)) return;
-      await once(child.stdin, "drain");
+      if (!("stdin" in writer)) {
+        await writer.write(bytes);
+        return;
+      }
+      if (writer.stdin.write(bytes)) return;
+      await once(writer.stdin, "drain");
     });
     this.#writeTail = write.catch(() => undefined);
     return write;
@@ -619,9 +714,14 @@ export class StdioJsonRpcTransport implements RpcTransport {
     if (this.#fatal || this.#closing) return;
     this.#fatal = true;
     const child = this.#child;
+    const channel = this.#channel;
     this.#child = undefined;
+    this.#channel = undefined;
     this.#rejectPending(fault);
     if (child !== undefined && child.exitCode === null && child.signalCode === null) child.kill();
+    if (channel !== undefined) {
+      void (channel.forceClose?.() ?? channel.close()).catch(() => undefined);
+    }
     if (this.#exitDelivered) return;
     this.#exitDelivered = true;
     void Promise.resolve(this.#handlers?.onExit(fault)).catch(() => undefined);

@@ -50,6 +50,24 @@ describe("TerminalProvider", () => {
     } finally { await fixture.provider.dispose(); }
   });
 
+  test("falls back to the runtime default when a saved creation shell disappears", async () => {
+    const fixture = remoteSetup();
+    try {
+      const created = await fixture.provider.create({
+        ...fixture.scope,
+        id: "stale-shell-preference",
+        shellId: "removed-shell",
+        fallbackToDefaultShell: true
+      });
+      expect(created).toMatchObject({ shellId: remoteShell.id, shellLabel: remoteShell.label });
+      expect(fixture.runtime.spawn).toHaveBeenCalledExactlyOnceWith(
+        remoteShell,
+        { cwd: fixture.scope.workspaceRoot, cols: 80, rows: 24 },
+        expect.any(AbortSignal)
+      );
+    } finally { await fixture.provider.dispose(); }
+  });
+
   test("re-resolves a remote runtime after confirmed exit and keeps the checkpoint without replaying input", async () => {
     const fixture = remoteSetup();
     try {

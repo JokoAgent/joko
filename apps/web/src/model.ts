@@ -347,6 +347,35 @@ export interface RemoteHostCapabilitiesView {
   readonly processStreaming: boolean;
   readonly fileTransfer: boolean;
   readonly tcpForwarding: boolean;
+  readonly backendRuntimeSetup: boolean;
+}
+
+export type RemoteBackendRuntimeStateView = "probing" | "notInstalled" | "installing" | "ready" | "failed" | "outcomeUnknown";
+export type RemoteBackendRuntimeInstallPhaseView = "probing" | "downloading" | "installing" | "validating" | "complete" | "failed" | "outcomeUnknown";
+export type RemoteBackendRuntimeFailureCodeView = "aborted" | "authorityChanged" | "hostNotReady" | "notSupported" | "probeFailed" | "installFailed" | "uninstallFailed" | "busy";
+
+export interface RemoteBackendRuntimeView {
+  readonly targetId: string;
+  readonly hostId: string;
+  readonly displayName: string;
+  readonly expectedVersion: string;
+  readonly installedVersion?: string;
+  readonly state: RemoteBackendRuntimeStateView;
+  readonly canInstall: boolean;
+  readonly canReinstall: boolean;
+  readonly canUninstall: boolean;
+  readonly failure?: { readonly code: RemoteBackendRuntimeFailureCodeView; readonly retryable: boolean };
+  readonly observedAt: number;
+  readonly targetRevision: bigint;
+  readonly hostRevision: bigint;
+}
+
+export interface RemoteBackendRuntimeInstallEventView {
+  readonly requestId: string;
+  readonly sequence: bigint;
+  readonly phase: RemoteBackendRuntimeInstallPhaseView;
+  readonly runtime: RemoteBackendRuntimeView;
+  readonly observedAt: number;
 }
 
 /** Content-free resource usage for one Adapter-owned service-node runtime. */
@@ -3460,7 +3489,7 @@ export interface OperationApi {
   watchTerminal(sessionId: string, terminalId: string, generation: bigint, appearance: TerminalAppearanceView, onUpdate: (update: TerminalUpdateView) => void | Promise<void>, afterSequence?: bigint, signal?: AbortSignal): Promise<void>;
   updateTerminalAppearance(sessionId: string, terminalId: string, generation: bigint, appearance: TerminalAppearanceView, claimFocus: boolean, expectedAppearanceRevision: bigint, signal?: AbortSignal): Promise<TerminalAppearanceResultView>;
   writeTerminal(sessionId: string, terminalId: string, generation: bigint, writerId: string, inputSequence: bigint, data: string, signal?: AbortSignal): Promise<void>;
-  resizeTerminal(sessionId: string, terminalId: string, generation: bigint, columns: number, rows: number, signal?: AbortSignal): Promise<void>;
+  resizeTerminal(sessionId: string, terminalId: string, generation: bigint, viewId: string, columns: number, rows: number, signal?: AbortSignal): Promise<void>;
   restartTerminal(sessionId: string, terminalId: string, generation: bigint, requestId: string, signal?: AbortSignal): Promise<TerminalView>;
   closeTerminal(sessionId: string, terminalId: string, generation: bigint, signal?: AbortSignal): Promise<void>;
   refresh(): Promise<void>;
@@ -3708,6 +3737,9 @@ export interface OperationApi {
   disconnectRemoteHost(targetId: string, hostId: string, expectedRevision: bigint): Promise<RemoteHostView>;
   testRemoteHostConnection(targetId: string, hostId: string, expectedRevision: bigint): Promise<RemoteHostView>;
   clearRemoteHostTrust(targetId: string, hostId: string, expectedRevision: bigint): Promise<RemoteHostView>;
+  probeRemoteBackendRuntime(targetId: string, hostId: string, expectedTargetRevision: bigint, expectedHostRevision: bigint, signal?: AbortSignal): Promise<RemoteBackendRuntimeView>;
+  installRemoteBackendRuntime(targetId: string, hostId: string, expectedTargetRevision: bigint, expectedHostRevision: bigint, reinstall: boolean, signal?: AbortSignal): AsyncIterable<RemoteBackendRuntimeInstallEventView>;
+  uninstallRemoteBackendRuntime(targetId: string, hostId: string, expectedTargetRevision: bigint, expectedHostRevision: bigint): Promise<RemoteBackendRuntimeView>;
   saveMcpServer(draft: McpServerDraft): Promise<void>;
   deleteMcpServer(serverId: string): Promise<void>;
   restartMcpServer(serverId: string): Promise<void>;

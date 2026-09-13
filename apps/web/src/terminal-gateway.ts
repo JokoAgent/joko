@@ -47,10 +47,10 @@ export function createTerminalGateway(transport: Transport, ownerSignal?: AbortS
     },
     async writeTerminal(sessionId, terminalId, generation, writerId, inputSequence, data, signal) {
       const response = await client.writeTerminal({ sessionId, terminalId, generation, writerId, inputSequence, data }, options(signal));
-      if (response.nextInputSequence !== inputSequence + 1n) throw new Error("Terminal input acknowledgement is inconsistent.");
+      if (response.nextInputSequence <= inputSequence) throw new Error("Terminal input acknowledgement is inconsistent.");
     },
-    async resizeTerminal(sessionId, terminalId, generation, columns, rows, signal) {
-      const response = await client.resizeTerminal({ sessionId, terminalId, generation, columns, rows }, options(signal));
+    async resizeTerminal(sessionId, terminalId, generation, viewId, columns, rows, signal) {
+      const response = await client.resizeTerminal({ sessionId, terminalId, generation, viewId, columns, rows }, options(signal));
       terminalView(response.terminal, sessionId, terminalId);
     },
     async restartTerminal(sessionId, terminalId, generation, requestId, signal) {

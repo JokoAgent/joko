@@ -17,6 +17,8 @@ export interface TerminalCreateInput extends TerminalScope {
   /** A relative directory beneath the registered canonical workspace. */
   readonly cwd?: string;
   readonly shellId?: string;
+  /** Creation-only preference recovery; restart always requires the original shell. */
+  readonly fallbackToDefaultShell?: boolean;
   readonly cols?: number;
   readonly rows?: number;
 }
