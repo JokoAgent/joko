@@ -1,0 +1,7 @@
+version: v1
+plugins:
+  - plugin: es
+    out: packages/contracts/src/gen
+    opt:
+      - target=ts
+      - import_extension=js

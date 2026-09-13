@@ -1,0 +1,43 @@
+{
+  "name": "@joko/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/main.js",
+  "files": [
+    "dist/**",
+    "package.json"
+  ],
+  "scripts": {
+    "build": "pnpm build:native-voice-shortcut && tsc -p tsconfig.json && node --check dist/main.js && node --check dist/preload.cjs && node --check dist/voice-overlay-preload.cjs && node scripts/stage-web.mjs",
+    "build:native-voice-shortcut": "node scripts/build-native-voice-shortcut.mjs",
+    "build:runtime-stager": "tsc -b tsconfig.json --force",
+    "stage:orchestrator-runtime": "node scripts/stage-orchestrator-runtime.mjs",
+    "package:dir": "electron-builder --config electron-builder.json --dir --publish never",
+    "package:artifacts": "electron-builder --config electron-builder.json --publish never",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "test": "vitest run",
+    "test:electron-host": "node scripts/smoke-packaged.mjs",
+    "test:packaged-artifact": "node scripts/smoke-packaged.mjs --unpacked",
+    "preview:task-status": "node scripts/preview-native-task-status.mjs",
+    "dev": "pnpm --dir ../.. prepare:desktop:dev && electron ."
+  },
+  "dependencies": {
+    "@connectrpc/connect": "2.1.2",
+    "@connectrpc/connect-node": "2.1.2",
+    "@joko/contracts": "workspace:*",
+    "electron-updater": "6.8.9",
+    "electron-window-state": "5.0.3",
+    "loudness": "0.4.2",
+    "yaml": "2.9.0"
+  },
+  "devDependencies": {
+    "@joko/web": "workspace:*",
+    "@types/node": "24.12.4",
+    "electron": "39.2.7",
+    "electron-builder": "26.15.3",
+    "tsx": "4.22.1",
+    "typescript": "5.9.3",
+    "vitest": "4.1.9"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "jsx": "react-jsx",
+    "allowImportingTsExtensions": false,
+    "noEmit": true,
+    "types": ["vite/client"]
+  },
+  "references": [{ "path": "../../packages/contracts" }],
+  "include": ["src/**/*.ts", "src/**/*.tsx", "model-viewer-assets.ts", "pdfjs-assets.ts", "vite.config.ts"]
+}

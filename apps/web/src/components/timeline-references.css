@@ -1,0 +1,36 @@
+.message-input-references {
+  width: 100%;
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+  max-width: 100%;
+}
+
+.message-input-references > .timeline-reference-chip {
+  min-width: 0;
+}
+
+.timeline-reference-chip > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.timeline-reference-chip > small {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-soft);
+  font-family: var(--app-font-ui, var(--app-font-ui-default));
+  font-weight: 400;
+  text-overflow: ellipsis;
+}
+
+.timeline-reference-chip.is-unavailable,
+.timeline-reference-chip:disabled {
+  color: var(--text-soft);
+  border-color: var(--line);
+  background: var(--surface);
+  cursor: default;
+}

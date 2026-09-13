@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+
+enum CodeHostPullRequestState {
+  CODE_HOST_PULL_REQUEST_STATE_UNSPECIFIED = 0;
+  CODE_HOST_PULL_REQUEST_STATE_OPEN = 1;
+  CODE_HOST_PULL_REQUEST_STATE_CLOSED = 2;
+  CODE_HOST_PULL_REQUEST_STATE_MERGED = 3;
+}
+
+// Credential-free identity extracted from bounded, user-visible task context.
+message CodeHostPullRequestReference {
+  string reference_key = 1;
+  string host = 2;
+  string repository_owner = 3;
+  string repository_name = 4;
+  uint64 number = 5;
+  string web_url = 6;
+}
+
+// Last successful provider observation. Cache failures and negative-cache
+// metadata remain service-private and cannot overwrite these fields.
+message CodeHostPullRequestProjection {
+  CodeHostPullRequestReference reference = 1;
+  CodeHostPullRequestState state = 2;
+  bool draft = 3;
+  google.protobuf.Timestamp observed_at = 4;
+  bool observed = 5;
+  string title = 6;
+  string head_branch = 7;
+  optional uint32 unresolved_review_thread_count = 8;
+}
