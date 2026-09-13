@@ -167,6 +167,9 @@ import {
   ReviewRunState,
   ReviewTargetKind,
   RemoteHostAuthenticationMode,
+  RemoteBackendRuntimeFailureCode,
+  RemoteBackendRuntimeInstallPhase,
+  RemoteBackendRuntimeState,
   RemoteHostCapabilityKind,
   RemoteHostChangeKind,
   RemoteHostFailureCode,
@@ -291,6 +294,7 @@ import {
   type ScheduleRunHistory,
   type ReviewRun as ProtoReviewRun,
   type RemoteHost as ProtoRemoteHost,
+  type RemoteBackendRuntime as ProtoRemoteBackendRuntime,
   type SessionMessageSearchMatch,
   type Session,
   type SessionStatistics as ProtoSessionStatistics,
@@ -404,6 +408,9 @@ import type {
   RuntimeToolCatalogView,
   RuntimeToolFieldTypeView,
   RemoteConnectionView,
+  RemoteBackendRuntimeFailureCodeView,
+  RemoteBackendRuntimeInstallEventView,
+  RemoteBackendRuntimeView,
   RemoteHostCapabilitiesView,
   RemoteHostDraft,
   RemoteHostView,
@@ -3986,7 +3993,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       commandExecution: supported.has(RemoteHostCapabilityKind.COMMAND_EXECUTION),
       processStreaming: supported.has(RemoteHostCapabilityKind.PROCESS_STREAMING),
       fileTransfer: supported.has(RemoteHostCapabilityKind.FILE_TRANSFER),
-      tcpForwarding: supported.has(RemoteHostCapabilityKind.TCP_FORWARDING)
+      tcpForwarding: supported.has(RemoteHostCapabilityKind.TCP_FORWARDING),
+      backendRuntimeSetup: supported.has(RemoteHostCapabilityKind.BACKEND_RUNTIME_SETUP)
     };
   }
 
@@ -4196,6 +4204,102 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       remoteHostRpcOptions(this.#abort?.signal)
     );
     return requireRemoteHost(response.host);
+  }
+
+  async probeRemoteBackendRuntime(
+    targetId: string,
+    hostId: string,
+    expectedTargetRevision: bigint,
+    expectedHostRevision: bigint,
+    signal?: AbortSignal
+  ): Promise<RemoteBackendRuntimeView> {
+    const response = await createClient(RemoteHostService, this.requireTransport()).probeRemoteBackendRuntime({
+      targetId,
+      hostId,
+      expectedTargetRevision: { value: expectedTargetRevision },
+      expectedHostRevision: { value: expectedHostRevision }
+    }, remoteHostRpcOptions(this.#abort?.signal, signal));
+    return requireRemoteBackendRuntime(
+      response.runtime,
+      targetId,
+      hostId,
+      expectedTargetRevision,
+      expectedHostRevision
+    );
+  }
+
+  async *installRemoteBackendRuntime(
+    targetId: string,
+    hostId: string,
+    expectedTargetRevision: bigint,
+    expectedHostRevision: bigint,
+    reinstall: boolean,
+    signal?: AbortSignal
+  ): AsyncGenerator<RemoteBackendRuntimeInstallEventView> {
+    const requestId = randomUuid();
+    const stream = createClient(RemoteHostService, this.requireTransport()).installRemoteBackendRuntime({
+      requestId,
+      targetId,
+      hostId,
+      expectedTargetRevision: { value: expectedTargetRevision },
+      expectedHostRevision: { value: expectedHostRevision },
+      reinstall
+    }, remoteHostRpcOptions(this.#abort?.signal, signal));
+    let sequence = 0n;
+    let terminal = false;
+    for await (const response of stream) {
+      if (terminal || response.requestId !== requestId || response.sequence !== sequence + 1n || response.runtime === undefined || response.observedAt === undefined) {
+        throw new GatewayError("Orchestrator returned invalid remote Backend runtime progress.");
+      }
+      sequence = response.sequence;
+      const phase = remoteBackendRuntimeInstallPhase(response.phase);
+      const runtime = requireRemoteBackendRuntime(
+        response.runtime,
+        targetId,
+        hostId,
+        expectedTargetRevision,
+        expectedHostRevision
+      );
+      if ((phase === "probing" && runtime.state !== "probing")
+        || ((phase === "downloading" || phase === "installing" || phase === "validating") && runtime.state !== "installing")
+        || (phase === "complete" && runtime.state !== "ready")
+        || (phase === "outcomeUnknown" && runtime.state !== "outcomeUnknown")) {
+        throw new GatewayError("Orchestrator returned inconsistent remote Backend runtime progress.");
+      }
+      terminal = phase === "complete" || phase === "failed" || phase === "outcomeUnknown";
+      yield {
+        requestId,
+        sequence,
+        phase,
+        runtime,
+        observedAt: timestampMs(response.observedAt)
+      };
+    }
+    if (!terminal && signal?.aborted !== true && this.#abort?.signal.aborted !== true) {
+      throw new GatewayError("Remote Backend runtime installation ended without a terminal result.");
+    }
+  }
+
+  async uninstallRemoteBackendRuntime(
+    targetId: string,
+    hostId: string,
+    expectedTargetRevision: bigint,
+    expectedHostRevision: bigint
+  ): Promise<RemoteBackendRuntimeView> {
+    const response = await createClient(RemoteHostService, this.requireTransport()).uninstallRemoteBackendRuntime({
+      requestId: randomUuid(),
+      targetId,
+      hostId,
+      expectedTargetRevision: { value: expectedTargetRevision },
+      expectedHostRevision: { value: expectedHostRevision }
+    }, remoteHostRpcOptions(this.#abort?.signal));
+    return requireRemoteBackendRuntime(
+      response.runtime,
+      targetId,
+      hostId,
+      expectedTargetRevision,
+      expectedHostRevision
+    );
   }
 
   async saveMcpServer(draft: McpServerDraft): Promise<void> {
@@ -10276,6 +10380,87 @@ function protoRemoteHostAuthentication(value: RemoteHostDraft["authentication"])
 function mapSshKey(key: SshKey): SshKeyView {
   return { id: key.id, name: key.name, algorithm: key.algorithm, comment: key.comment, sha256Fingerprint: key.sha256Fingerprint,
     modifiedAt: timestampMs(key.modifiedAt), inAgent: key.inAgent };
+}
+
+function requireRemoteBackendRuntime(
+  runtime: ProtoRemoteBackendRuntime | undefined,
+  expectedTargetId: string,
+  expectedHostId: string,
+  expectedTargetRevision: bigint,
+  expectedHostRevision: bigint
+): RemoteBackendRuntimeView {
+  if (runtime === undefined || runtime.observedAt === undefined || runtime.targetRevision === undefined || runtime.hostRevision === undefined
+    || runtime.targetId !== expectedTargetId || runtime.hostId !== expectedHostId || runtime.displayName.trim() === ""
+    || runtime.expectedVersion.trim() === "" || runtime.targetRevision.value !== expectedTargetRevision
+    || runtime.hostRevision.value !== expectedHostRevision) {
+    throw new GatewayError("Orchestrator returned an incomplete remote Backend runtime.");
+  }
+  const state = remoteBackendRuntimeState(runtime.state);
+  const failure = runtime.failure === undefined ? undefined : {
+    code: remoteBackendRuntimeFailureCode(runtime.failure.code),
+    retryable: runtime.failure.retryable
+  };
+  if ((state === "failed" || state === "outcomeUnknown") && failure === undefined) {
+    throw new GatewayError("Orchestrator returned an inconsistent remote Backend runtime failure.");
+  }
+  if ((state === "ready") !== (runtime.canReinstall && runtime.canUninstall)
+    || ((state === "probing" || state === "installing") && (runtime.canInstall || runtime.canReinstall || runtime.canUninstall))) {
+    throw new GatewayError("Orchestrator returned inconsistent remote Backend runtime actions.");
+  }
+  return {
+    targetId: runtime.targetId,
+    hostId: runtime.hostId,
+    displayName: runtime.displayName,
+    expectedVersion: runtime.expectedVersion,
+    ...(runtime.installedVersion === undefined ? {} : { installedVersion: runtime.installedVersion }),
+    state,
+    canInstall: runtime.canInstall,
+    canReinstall: runtime.canReinstall,
+    canUninstall: runtime.canUninstall,
+    ...(failure === undefined ? {} : { failure }),
+    observedAt: timestampMs(runtime.observedAt),
+    targetRevision: runtime.targetRevision.value,
+    hostRevision: runtime.hostRevision.value
+  };
+}
+
+function remoteBackendRuntimeState(value: RemoteBackendRuntimeState): RemoteBackendRuntimeView["state"] {
+  switch (value) {
+    case RemoteBackendRuntimeState.PROBING: return "probing";
+    case RemoteBackendRuntimeState.NOT_INSTALLED: return "notInstalled";
+    case RemoteBackendRuntimeState.INSTALLING: return "installing";
+    case RemoteBackendRuntimeState.READY: return "ready";
+    case RemoteBackendRuntimeState.FAILED: return "failed";
+    case RemoteBackendRuntimeState.OUTCOME_UNKNOWN: return "outcomeUnknown";
+    default: throw new GatewayError("Orchestrator returned an unknown remote Backend runtime state.");
+  }
+}
+
+function remoteBackendRuntimeInstallPhase(value: RemoteBackendRuntimeInstallPhase): RemoteBackendRuntimeInstallEventView["phase"] {
+  switch (value) {
+    case RemoteBackendRuntimeInstallPhase.PROBING: return "probing";
+    case RemoteBackendRuntimeInstallPhase.DOWNLOADING: return "downloading";
+    case RemoteBackendRuntimeInstallPhase.INSTALLING: return "installing";
+    case RemoteBackendRuntimeInstallPhase.VALIDATING: return "validating";
+    case RemoteBackendRuntimeInstallPhase.COMPLETE: return "complete";
+    case RemoteBackendRuntimeInstallPhase.FAILED: return "failed";
+    case RemoteBackendRuntimeInstallPhase.OUTCOME_UNKNOWN: return "outcomeUnknown";
+    default: throw new GatewayError("Orchestrator returned an unknown remote Backend runtime phase.");
+  }
+}
+
+function remoteBackendRuntimeFailureCode(value: RemoteBackendRuntimeFailureCode): RemoteBackendRuntimeFailureCodeView {
+  switch (value) {
+    case RemoteBackendRuntimeFailureCode.ABORTED: return "aborted";
+    case RemoteBackendRuntimeFailureCode.AUTHORITY_CHANGED: return "authorityChanged";
+    case RemoteBackendRuntimeFailureCode.HOST_NOT_READY: return "hostNotReady";
+    case RemoteBackendRuntimeFailureCode.NOT_SUPPORTED: return "notSupported";
+    case RemoteBackendRuntimeFailureCode.PROBE_FAILED: return "probeFailed";
+    case RemoteBackendRuntimeFailureCode.INSTALL_FAILED: return "installFailed";
+    case RemoteBackendRuntimeFailureCode.UNINSTALL_FAILED: return "uninstallFailed";
+    case RemoteBackendRuntimeFailureCode.BUSY: return "busy";
+    default: throw new GatewayError("Orchestrator returned an unknown remote Backend runtime failure code.");
+  }
 }
 
 function compareRemoteHosts(left: RemoteHostView, right: RemoteHostView): number {

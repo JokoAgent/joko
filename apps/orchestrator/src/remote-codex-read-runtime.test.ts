@@ -33,7 +33,7 @@ describe("RemoteCodexRuntimeResolver", () => {
     expect(fixture.processes.requests[0]).toMatchObject({
       executable: "/bin/sh",
       cwd: "/srv/project",
-      args: ["-lc", expect.stringContaining("packages/standalone/current/codex")]
+      args: ["-c", expect.stringContaining(".joko-runtime-ready-v1")]
     });
 
     const generation = await runtime.host.ensureStarted();
@@ -249,6 +249,7 @@ class FakeRemoteProcesses implements RemoteProcessTransportPort {
           "/home/test/.joko/runtime/v1/codex-home",
           "/home/test/.joko/runtime/v1/codex-home/packages/standalone/current/codex",
           this.#probeVersion,
+          this.#probeVersion === "codex-cli 0.153.4" ? "ready" : "not_installed",
           ""
         ].join("\0"), "utf8"));
         processHandle.finish(0);

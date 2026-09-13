@@ -1,10 +1,12 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { JSX } from "react";
-import { Fingerprint, Link2, Pencil, Plug, PlugZap, RefreshCw, Server, ShieldX, Trash2 } from "lucide-react";
+import { Download, Fingerprint, Link2, Package, Pencil, Plug, PlugZap, RefreshCw, Server, ShieldX, Trash2 } from "lucide-react";
 
 import type { AppController } from "../controller.js";
 import type {
   AppSnapshot,
+  RemoteBackendRuntimeInstallEventView,
+  RemoteBackendRuntimeView,
   RemoteHostCapabilitiesView,
   RemoteHostDraft,
   RemoteHostView
@@ -24,10 +26,11 @@ const NO_CAPABILITIES: RemoteHostCapabilitiesView = {
   commandExecution: false,
   processStreaming: false,
   fileTransfer: false,
-  tcpForwarding: false
+  tcpForwarding: false,
+  backendRuntimeSetup: false
 };
 
-type RemoteHostApi = KeyApi & Pick<AppController, "getRemoteHostCapabilities" | "watchRemoteHosts" | "refreshRemoteHostCatalog" | "createRemoteHost" | "updateRemoteHost" | "deleteRemoteHost" | "connectRemoteHost" | "disconnectRemoteHost" | "testRemoteHostConnection" | "clearRemoteHostTrust" | "saveCredential" | "updateTarget">;
+type RemoteHostApi = KeyApi & Pick<AppController, "getRemoteHostCapabilities" | "watchRemoteHosts" | "refreshRemoteHostCatalog" | "createRemoteHost" | "updateRemoteHost" | "deleteRemoteHost" | "connectRemoteHost" | "disconnectRemoteHost" | "testRemoteHostConnection" | "clearRemoteHostTrust" | "probeRemoteBackendRuntime" | "installRemoteBackendRuntime" | "uninstallRemoteBackendRuntime" | "saveCredential" | "updateTarget">;
 interface CatalogScope {
   readonly id: string;
   readonly abort: AbortController;
@@ -86,9 +89,12 @@ export function RemoteHostsSettings({ controller, snapshot, activeTargetId, show
     disconnectRemoteHost: controller.disconnectRemoteHost,
     testRemoteHostConnection: controller.testRemoteHostConnection,
     clearRemoteHostTrust: controller.clearRemoteHostTrust,
+    probeRemoteBackendRuntime: controller.probeRemoteBackendRuntime,
+    installRemoteBackendRuntime: controller.installRemoteBackendRuntime,
+    uninstallRemoteBackendRuntime: controller.uninstallRemoteBackendRuntime,
     saveCredential: controller.saveCredential,
     updateTarget: controller.updateTarget
-  }), [controller.listSshKeys, controller.generateSshKey, controller.addSshKeyToAgent, controller.readSshPublicKey, controller.getSshKeyInstallCommand, controller.getRemoteHostCapabilities, controller.watchRemoteHosts, controller.refreshRemoteHostCatalog, controller.createRemoteHost, controller.updateRemoteHost, controller.deleteRemoteHost, controller.connectRemoteHost, controller.disconnectRemoteHost, controller.testRemoteHostConnection, controller.clearRemoteHostTrust, controller.saveCredential, controller.updateTarget]);
+  }), [controller.listSshKeys, controller.generateSshKey, controller.addSshKeyToAgent, controller.readSshPublicKey, controller.getSshKeyInstallCommand, controller.getRemoteHostCapabilities, controller.watchRemoteHosts, controller.refreshRemoteHostCatalog, controller.createRemoteHost, controller.updateRemoteHost, controller.deleteRemoteHost, controller.connectRemoteHost, controller.disconnectRemoteHost, controller.testRemoteHostConnection, controller.clearRemoteHostTrust, controller.probeRemoteBackendRuntime, controller.installRemoteBackendRuntime, controller.uninstallRemoteBackendRuntime, controller.saveCredential, controller.updateTarget]);
   const scope = useMemo<CatalogScope>(() => ({ id: randomUuid(), abort: new AbortController(), pending: new Set() }), [api, targetId, occurrence, controller.state.connectionState, controller.state.route, controller.state.navigationRevision]);
   const emptyCatalog = (): CatalogState => ({ scope, hosts: [], capabilities: NO_CAPABILITIES, capabilitiesReady: false, streamReady: false, loading: targetId !== "" && controller.state.connectionState === "connected" });
   const [catalog, setCatalog] = useState<CatalogState>(emptyCatalog);
@@ -255,6 +261,15 @@ export function RemoteHostsSettings({ controller, snapshot, activeTargetId, show
             onClick={() => perform(host.id, () => api.deleteRemoteHost(targetId, host.id, host.revision))}
           ><Trash2 aria-hidden="true" /></IconButton>}
         </div>
+        {target !== undefined && capabilities.backendRuntimeSetup && <RemoteBackendRuntimeSetup
+          key={`${scope.id}:${target.revision}:${host.id}:${host.revision}`}
+          api={api}
+          scope={scope}
+          target={target}
+          host={host}
+          ready={ready}
+          t={t}
+        />}
       </article>)}
       {!loading && hosts.length === 0 && <p className="muted">{t("settings.remoteHosts.empty")}</p>}
     </section>
@@ -281,6 +296,161 @@ interface BindingDraft {
   readonly workspaceRoot: string;
   readonly dirty: boolean;
   readonly submitted?: { readonly kind: "serviceNode" } | { readonly kind: "remote"; readonly hostId: string; readonly workspaceRoot: string };
+}
+
+function RemoteBackendRuntimeSetup({ api, scope, target, host, ready, t }: {
+  readonly api: RemoteHostApi;
+  readonly scope: CatalogScope;
+  readonly target: AppSnapshot["targets"][number];
+  readonly host: RemoteHostView;
+  readonly ready: boolean;
+  readonly t: Translator;
+}): JSX.Element {
+  const eligible = ready && host.status.state === "ready" && host.trust !== undefined && target.trusted;
+  const mounted = useRef(true);
+  const actionToken = useRef(0);
+  const [runtime, setRuntime] = useState<RemoteBackendRuntimeView>();
+  const [phase, setPhase] = useState<RemoteBackendRuntimeInstallEventView["phase"]>();
+  const [probing, setProbing] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string>();
+  const [clientOutcomeUnknown, setClientOutcomeUnknown] = useState(false);
+  const [probeRequest, setProbeRequest] = useState(0);
+  const [uninstallFocus, setUninstallFocus] = useState<HTMLElement>();
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      actionToken.current += 1;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!eligible || busy) return;
+    const controller = new AbortController();
+    const abort = (): void => controller.abort();
+    scope.abort.signal.addEventListener("abort", abort, { once: true });
+    let timer: number | undefined;
+    setProbing(true);
+    setRuntime((current) => current?.targetRevision === target.revision && current.hostRevision === host.revision
+      ? current
+      : undefined);
+    void api.probeRemoteBackendRuntime(target.id, host.id, target.revision, host.revision, controller.signal).then((next) => {
+      if (!mounted.current || controller.signal.aborted) return;
+      setRuntime(next);
+      setClientOutcomeUnknown(false);
+      setError(undefined);
+      setPhase(undefined);
+      if (next.state === "installing" || next.state === "probing") {
+        timer = window.setTimeout(() => setProbeRequest((value) => value + 1), 1_500);
+      }
+    }).catch(() => {
+      if (mounted.current && !controller.signal.aborted) {
+        setError((current) => current ?? t("settings.remoteHosts.runtime.probeFailed"));
+      }
+    }).finally(() => {
+      if (mounted.current && !controller.signal.aborted) setProbing(false);
+    });
+    return () => {
+      controller.abort();
+      scope.abort.signal.removeEventListener("abort", abort);
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [api, scope, target.id, target.revision, host.id, host.revision, eligible, busy, probeRequest, t]);
+
+  const install = (reinstall: boolean): void => {
+    if (!eligible || busy) return;
+    const token = ++actionToken.current;
+    const controller = new AbortController();
+    const abort = (): void => controller.abort();
+    scope.abort.signal.addEventListener("abort", abort, { once: true });
+    setBusy(true);
+    setError(undefined);
+    setClientOutcomeUnknown(false);
+    setPhase("probing");
+    void (async () => {
+      try {
+        for await (const event of api.installRemoteBackendRuntime(target.id, host.id, target.revision, host.revision, reinstall, controller.signal)) {
+          if (!mounted.current || controller.signal.aborted || actionToken.current !== token) return;
+          setRuntime(event.runtime);
+          setClientOutcomeUnknown(false);
+          setPhase(event.phase);
+        }
+      } catch {
+        if (mounted.current && !controller.signal.aborted && actionToken.current === token) {
+          setRuntime(undefined);
+          setPhase(undefined);
+          setClientOutcomeUnknown(true);
+          setError(t("settings.remoteHosts.runtime.installFailed"));
+        }
+      } finally {
+        scope.abort.signal.removeEventListener("abort", abort);
+        if (mounted.current && !controller.signal.aborted && actionToken.current === token) {
+          setBusy(false);
+          setProbeRequest((value) => value + 1);
+        }
+      }
+    })();
+  };
+
+  const uninstall = (): void => {
+    if (!eligible || busy || runtime?.canUninstall !== true) return;
+    const token = ++actionToken.current;
+    setUninstallFocus(undefined);
+    setBusy(true);
+    setError(undefined);
+    setClientOutcomeUnknown(false);
+    void api.uninstallRemoteBackendRuntime(target.id, host.id, target.revision, host.revision).then((next) => {
+      if (!mounted.current || scope.abort.signal.aborted || actionToken.current !== token) return;
+      setRuntime(next);
+      setClientOutcomeUnknown(false);
+      setPhase(undefined);
+    }).catch(() => {
+      if (mounted.current && !scope.abort.signal.aborted && actionToken.current === token) {
+        setRuntime(undefined);
+        setPhase(undefined);
+        setClientOutcomeUnknown(true);
+        setError(t("settings.remoteHosts.runtime.uninstallFailed"));
+      }
+    }).finally(() => {
+      if (mounted.current && !scope.abort.signal.aborted && actionToken.current === token) setBusy(false);
+    });
+  };
+
+  const state = clientOutcomeUnknown ? "outcomeUnknown" : probing && runtime === undefined ? "probing" : runtime?.state;
+  const statusTone = state === "ready" ? "success" : state === "failed" || state === "outcomeUnknown" ? "danger" : state === "probing" || state === "installing" ? "warning" : "neutral";
+  return <div className="remote-runtime-setup" aria-busy={probing || busy}>
+    <div className="remote-runtime-setup__identity">
+      <Package aria-hidden="true" />
+      <span>
+        <strong>{runtime?.displayName ?? t("settings.remoteHosts.runtime.title")}</strong>
+        <small>{runtime === undefined ? t("settings.remoteHosts.runtime.checking") : t("settings.remoteHosts.runtime.version", { version: runtime.expectedVersion })}</small>
+        {runtime?.installedVersion !== undefined && <small>{t("settings.remoteHosts.runtime.installedVersion", { version: runtime.installedVersion })}</small>}
+        {!eligible && <small>{t("settings.remoteHosts.runtime.hostNotReady")}</small>}
+        {runtime?.failure !== undefined && <small className="remote-host-failure">{t("settings.remoteHosts.runtime.failure", {
+          reason: t(`settings.remoteHosts.runtime.failure.${runtime.failure.code}`)
+        })}</small>}
+        {error !== undefined && <small className="remote-host-failure" role="status">{error}</small>}
+        {phase !== undefined && phase !== "complete" && phase !== "failed" && phase !== "outcomeUnknown" && <small role="status">{t(`settings.remoteHosts.runtime.phase.${phase}`)}</small>}
+      </span>
+    </div>
+    <div className="remote-runtime-setup__actions">
+      {state !== undefined && <Pill tone={statusTone}>{t(`settings.remoteHosts.runtime.state.${state}`)}</Pill>}
+      <Button disabled={!eligible || busy || probing} onClick={() => setProbeRequest((value) => value + 1)}><RefreshCw aria-hidden="true" />{t("settings.remoteHosts.runtime.refresh")}</Button>
+      {runtime?.canInstall === true && <Button tone="primary" disabled={!eligible || busy} onClick={() => install(false)}><Download aria-hidden="true" />{t("settings.remoteHosts.runtime.install")}</Button>}
+      {runtime?.canReinstall === true && <Button disabled={!eligible || busy} onClick={() => install(true)}><RefreshCw aria-hidden="true" />{t("settings.remoteHosts.runtime.reinstall")}</Button>}
+      {runtime?.canUninstall === true && <Button tone="danger" disabled={!eligible || busy} onClick={(event) => setUninstallFocus(event.currentTarget)}><Trash2 aria-hidden="true" />{t("settings.remoteHosts.runtime.uninstall")}</Button>}
+    </div>
+    {uninstallFocus !== undefined && <Modal
+      open
+      ownerDocument={uninstallFocus.ownerDocument}
+      title={t("settings.remoteHosts.runtime.uninstallTitle", { name: runtime?.displayName ?? t("settings.remoteHosts.runtime.title") })}
+      description={t("settings.remoteHosts.runtime.uninstallBody")}
+      size="small"
+      onClose={() => setUninstallFocus(undefined)}
+    ><div className="modal__actions"><Button onClick={() => setUninstallFocus(undefined)}>{t("common.cancel")}</Button><Button tone="danger" onClick={uninstall}>{t("settings.remoteHosts.runtime.uninstall")}</Button></div></Modal>}
+  </div>;
 }
 
 function RemoteWorkspaceBinding({ api, target, hosts, capabilities, ready, busy, perform, drafts, t }: {

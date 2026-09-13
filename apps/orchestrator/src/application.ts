@@ -138,6 +138,10 @@ import { PiProviderAuthSupervisor } from "./pi-provider-auth-supervisor.js";
 import { ProviderAccountUsageProvider } from "./provider-account-usage.js";
 import { PiResourceManager } from "./resource-manager.js";
 import { RemoteHostRegistry } from "./remote-host-registry.js";
+import {
+  RemoteBackendRuntimeSetupManager,
+  createRemoteCodexRuntimeSetupProvider
+} from "./remote-backend-runtime-setup.js";
 import { RemotePiProcessFactory } from "./remote-pi-process.js";
 import { RemoteWorkspaceService } from "./remote-workspace-service.js";
 import { RemoteHostToolBridgeProvider } from "./remote-host-tool-provider.js";
@@ -286,6 +290,7 @@ export interface OrchestratorApplication {
   readonly scheduler: ScheduleCoordinator;
   readonly reviewCoordinator?: ReviewCoordinator;
   readonly remoteHosts?: RemoteHostRegistry;
+  readonly remoteBackendRuntimeSetup?: RemoteBackendRuntimeSetupManager;
   readonly sshKeys?: SshKeyManager;
   readonly terminals?: TerminalProvider;
   readonly voiceInput?: VoiceInputCoordinator;
@@ -785,6 +790,11 @@ export async function createOrchestratorApplication(
   };
   const codexBackendId = "codex";
   const claudeCodeBackendId = "claude-code";
+  const remoteBackendRuntimeSetup = new RemoteBackendRuntimeSetupManager({
+    store,
+    registry: remoteHosts,
+    providers: [createRemoteCodexRuntimeSetupProvider(codexBackendId)]
+  });
   const claudeCodeCredentialPort = createClaudeCodeCredentialPort(
     credentials,
     "cred_backend_claude_code_subscription",
@@ -1701,6 +1711,7 @@ export async function createOrchestratorApplication(
     await terminals.dispose().catch(() => undefined);
     await voiceInput.close().catch(() => undefined);
     sshKeys.close();
+    await remoteBackendRuntimeSetup.close().catch(() => undefined);
     await remoteHosts.close().catch(() => undefined);
     runtimeActivity.close();
     store.close();
@@ -1729,6 +1740,7 @@ export async function createOrchestratorApplication(
     scheduler,
     reviewCoordinator,
     remoteHosts,
+    remoteBackendRuntimeSetup,
     sshKeys,
     terminals,
     voiceInput,
@@ -1828,6 +1840,7 @@ export async function createOrchestratorApplication(
         await attempt(() => mcpRouter.dispose());
         await attempt(() => voiceInput.close());
         sshKeys.close();
+        await attempt(() => remoteBackendRuntimeSetup.close());
         await attempt(() => remoteHosts.close());
         await attempt(() => workspaces.close());
         await attempt(() => runtimeActivity.close());

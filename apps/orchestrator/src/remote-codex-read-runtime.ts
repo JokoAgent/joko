@@ -18,13 +18,10 @@ import type {
   RemoteSshTransportLease
 } from "@joko/remote-ssh";
 import type { OperationalStore, RemoteHostRecord, StoredTarget } from "@joko/store";
+import { probeRemoteCodexInstallation } from "./remote-codex-installation.js";
 import type { RemoteHostRegistry } from "./remote-host-registry.js";
 import type { RemoteCodexMcpBridgeManager } from "./remote-codex-mcp-bridge.js";
 
-const EXPECTED_CODEX_VERSION = "0.153.4";
-const EXPECTED_CODEX_VERSION_OUTPUT = `codex-cli ${EXPECTED_CODEX_VERSION}`;
-const REMOTE_CODEX_PROFILE_SUFFIX = ".joko/runtime/v1/codex-home";
-const REMOTE_CODEX_BINARY_SUFFIX = `${REMOTE_CODEX_PROFILE_SUFFIX}/packages/standalone/current/codex`;
 const PROBE_TIMEOUT_MS = 10_000;
 const DAEMON_BOOTSTRAP_TIMEOUT_MS = 30_000;
 const HANDSHAKE_TIMEOUT_MS = 15_000;
@@ -34,16 +31,6 @@ const MAXIMUM_HANDSHAKE_BYTES = 64 * 1_024;
 const MAXIMUM_MESSAGE_BYTES = 16 * 1_024 * 1_024;
 const MAXIMUM_FRAME_BUFFER_BYTES = 20 * 1_024 * 1_024;
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-
-const RUNTIME_PROBE_SCRIPT = `set -eu
-workspace=$(pwd -P)
-home=\${HOME-}
-case "$home" in /*) ;; *) exit 20 ;; esac
-profile="$home/${REMOTE_CODEX_PROFILE_SUFFIX}"
-binary="$home/${REMOTE_CODEX_BINARY_SUFFIX}"
-[ -x "$binary" ] || exit 21
-version=$("$binary" --version 2>/dev/null) || exit 22
-printf '%s\\0%s\\0%s\\0%s\\0' "$workspace" "$profile" "$binary" "$version"`;
 
 type ProcessAuthority = Awaited<ReturnType<RemoteHostRegistry["captureProcessAuthority"]>>;
 
@@ -133,8 +120,9 @@ export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
     const authority = await this.#registry.captureProcessAuthority(target.id, binding.hostId, signal);
     const processes = requireProcesses(authority.lease);
     authority.assertCurrent();
-    const installation = await probeRemoteCodex(processes, binding.workspaceRoot, authority.assertCurrent, signal);
+    const installation = await probeRemoteCodexInstallation(processes, binding.workspaceRoot, authority.assertCurrent, signal);
     authority.assertCurrent();
+    if (installation.state !== "ready") throw remoteRuntimeFault("The fixed remote Codex runtime is unavailable.");
     if (signal?.aborted) throw remoteRuntimeFault("The remote Codex runtime lookup was cancelled.");
     const executionDomain = executionDomainFor(authority.host, installation.profileRoot);
     const profileKey = createHash("sha256").update(executionDomain, "utf8").digest("hex");
@@ -222,44 +210,6 @@ export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
   #assertOpen(): void {
     if (this.#closed) throw remoteRuntimeFault("The remote Codex runtime resolver is closed.");
   }
-}
-
-interface RemoteCodexInstallation {
-  readonly workspaceRoot: string;
-  readonly profileRoot: string;
-  readonly executable: string;
-}
-
-async function probeRemoteCodex(
-  processes: RemoteProcessTransportPort,
-  workspaceRoot: string,
-  assertCurrent: () => void,
-  signal?: AbortSignal
-): Promise<RemoteCodexInstallation> {
-  if (!normalizedAbsoluteRemotePath(workspaceRoot)) throw remoteRuntimeFault("The remote Codex workspace path is invalid.");
-  assertCurrent();
-  const result = await runRemoteCommand(processes, {
-    executable: "/bin/sh",
-    args: ["-lc", RUNTIME_PROBE_SCRIPT],
-    cwd: workspaceRoot,
-    timeoutMs: PROBE_TIMEOUT_MS,
-    signal
-  });
-  assertCurrent();
-  if (result.exitCode !== 0) throw remoteRuntimeFault("The fixed remote Codex runtime is unavailable.");
-  const fields = nulFields(result.stdout, 4);
-  const canonicalWorkspace = fields[0]!;
-  const profileRoot = fields[1]!;
-  const executable = fields[2]!;
-  const version = fields[3]!;
-  if (!normalizedAbsoluteRemotePath(canonicalWorkspace)
-    || !normalizedAbsoluteRemotePath(profileRoot)
-    || !normalizedAbsoluteRemotePath(executable)
-    || executable !== remotePath.join(profileRoot, "packages", "standalone", "current", "codex")
-    || version !== EXPECTED_CODEX_VERSION_OUTPUT) {
-    throw remoteRuntimeFault("The fixed remote Codex runtime did not match its audited installation contract.");
-  }
-  return Object.freeze({ workspaceRoot: canonicalWorkspace, profileRoot, executable });
 }
 
 interface RemoteCommandInput {
@@ -825,20 +775,6 @@ function normalizedAbsoluteRemotePath(value: string): boolean {
     && !/[\u0000-\u001f\u007f\\]/u.test(value)
     && remotePath.isAbsolute(value)
     && remotePath.normalize(value) === value;
-}
-
-function nulFields(value: Buffer, count: number): string[] {
-  const fields: string[] = [];
-  let offset = 0;
-  for (let index = 0; index < value.byteLength; index += 1) {
-    if (value[index] !== 0) continue;
-    fields.push(decodeUtf8(value.subarray(offset, index)));
-    offset = index + 1;
-  }
-  if (fields.length !== count || offset !== value.byteLength) {
-    throw remoteRuntimeFault("The remote Codex runtime probe returned invalid metadata.");
-  }
-  return fields;
 }
 
 function executionDomainFor(host: RemoteHostRecord, profileRoot: string): string {

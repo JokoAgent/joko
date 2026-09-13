@@ -292,6 +292,7 @@ import type { ManagedModelRuntimeController } from "./managed-model-runtime-cont
 import { PortableSessionPackageError } from "./portable-session-package.js";
 import { PortableSessionExportTooLargeError } from "./portable-session-transfer.js";
 import type { RemoteHostRegistry } from "./remote-host-registry.js";
+import type { RemoteBackendRuntimeSetupManager } from "./remote-backend-runtime-setup.js";
 import { createVoiceInputConnectService } from "./voice-input-connect-service.js";
 import type { VoiceInputCoordinator } from "./voice-input-coordinator.js";
 import {
@@ -376,6 +377,7 @@ interface ConnectServiceDependencies {
   readonly sessionNavigation?: SessionNavigationCoordinator;
   readonly reviewCoordinator?: ReviewCoordinator;
   readonly remoteHosts?: RemoteHostRegistry;
+  readonly remoteBackendRuntimeSetup?: RemoteBackendRuntimeSetupManager;
   readonly sshKeys?: OrchestratorApplication["sshKeys"];
   readonly terminals?: TerminalProvider;
   readonly voiceInput?: VoiceInputCoordinator;
@@ -905,6 +907,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
     ...(application.sessionNavigation === undefined ? {} : { sessionNavigation: application.sessionNavigation }),
     ...(application.reviewCoordinator === undefined ? {} : { reviewCoordinator: application.reviewCoordinator }),
     ...(application.remoteHosts === undefined ? {} : { remoteHosts: application.remoteHosts }),
+    ...(application.remoteBackendRuntimeSetup === undefined ? {} : { remoteBackendRuntimeSetup: application.remoteBackendRuntimeSetup }),
     ...(application.sshKeys === undefined ? {} : { sshKeys: application.sshKeys }),
     ...(application.terminals === undefined ? {} : { terminals: application.terminals }),
     ...(application.voiceInput === undefined ? {} : { voiceInput: application.voiceInput }),
@@ -986,7 +989,8 @@ export function createConnectServices(application: OrchestratorApplication): Con
     dependencies.remoteHosts,
     (context) => ({ connectionId: authenticate(context).id }),
     (connectionId, listener) => dependencies.connections.onRevoked(connectionId, listener),
-    now
+    now,
+    dependencies.remoteBackendRuntimeSetup
   );
   const voiceInput = createVoiceInputConnectService(dependencies.voiceInput, dependencies.voiceInputSettings, (context) => ({
     connectionId: authenticate(context).id

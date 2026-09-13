@@ -5,7 +5,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Code, ConnectError } from "@connectrpc/connect";
 
 import type { AppController } from "../controller.js";
-import { emptySnapshot, type AppSnapshot, type CredentialDraft, type RemoteHostDraft, type RemoteHostView, type SshKeyView } from "../model.js";
+import {
+  emptySnapshot,
+  type AppSnapshot,
+  type CredentialDraft,
+  type RemoteBackendRuntimeInstallEventView,
+  type RemoteBackendRuntimeView,
+  type RemoteHostDraft,
+  type RemoteHostView,
+  type SshKeyView
+} from "../model.js";
 import { translate } from "../i18n.js";
 import { RemoteHostsSettings, saveRemoteHostDraft } from "./RemoteHostsSettings.js";
 
@@ -225,6 +234,72 @@ function host(): RemoteHostView {
   };
 }
 
+it("probes and manages the fixed remote Backend runtime with exact Target and Host authority", async () => {
+  const fixture = await mountSettings({ runtimeSetup: true });
+  const probe = vi.mocked(fixture.controller.probeRemoteBackendRuntime);
+  probe
+    .mockResolvedValueOnce(runtime("notInstalled"))
+    .mockResolvedValueOnce(runtime("ready"))
+    .mockResolvedValue(runtime("notInstalled"));
+  const readyHost: RemoteHostView = {
+    ...host(),
+    trust: { algorithm: "ssh-ed25519", sha256Fingerprint: "SHA256:test", pinnedAt: 1 },
+    status: { state: "ready", changedAt: 2 }
+  };
+
+  await fixture.publish([readyHost]);
+  expect(probe).toHaveBeenCalledWith("target-one", "build-box", 1n, 1n, expect.any(AbortSignal));
+  expect(document.body.textContent).toContain("Required version 0.153.4");
+  expect(document.body.textContent).toContain("Not installed");
+
+  await act(async () => button("Install").click());
+  expect(fixture.controller.installRemoteBackendRuntime).toHaveBeenCalledWith(
+    "target-one",
+    "build-box",
+    1n,
+    1n,
+    false,
+    expect.any(AbortSignal)
+  );
+  expect(document.body.textContent).toContain("Ready");
+  expect(button("Reinstall").disabled).toBe(false);
+
+  await act(async () => button("Uninstall").click());
+  const dialog = document.querySelector<HTMLElement>('[role="dialog"]')!;
+  expect(dialog.textContent).toContain("Uninstall Codex?");
+  const confirm = [...dialog.querySelectorAll<HTMLButtonElement>("button")]
+    .find((candidate) => candidate.textContent === "Uninstall")!;
+  await act(async () => confirm.click());
+  expect(fixture.controller.uninstallRemoteBackendRuntime).toHaveBeenCalledWith(
+    "target-one",
+    "build-box",
+    1n,
+    1n
+  );
+  expect(document.body.textContent).toContain("Not installed");
+});
+
+it("requires a successful probe before offering another install after an unconfirmed stream", async () => {
+  const fixture = await mountSettings({ runtimeSetup: true });
+  vi.mocked(fixture.controller.probeRemoteBackendRuntime)
+    .mockResolvedValueOnce(runtime("notInstalled"))
+    .mockRejectedValue(new Error("probe unavailable"));
+  vi.mocked(fixture.controller.installRemoteBackendRuntime).mockImplementation(async function* () {
+    throw new Error("stream ended without a terminal result");
+  });
+  await fixture.publish([{
+    ...host(),
+    trust: { algorithm: "ssh-ed25519", sha256Fingerprint: "SHA256:test", pinnedAt: 1 },
+    status: { state: "ready", changedAt: 2 }
+  }]);
+
+  await act(async () => button("Install").click());
+  expect(document.body.textContent).toContain("Check required");
+  expect(document.body.textContent).toContain("Runtime installation was interrupted");
+  expect([...document.querySelectorAll("button")].some((candidate) => candidate.textContent === "Install")).toBe(false);
+  expect(button("Check").disabled).toBe(false);
+});
+
 it("keeps the exact node key in a Host draft, fences draft recipes, and retries saving without copying private credentials", async () => {
   const fixture = await mountSettings();
   await fixture.publish([host()]);
@@ -290,7 +365,11 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-async function mountSettings(options: { readonly strict?: boolean; readonly saveCredential?: AppController["saveCredential"] } = {}) {
+async function mountSettings(options: {
+  readonly strict?: boolean;
+  readonly saveCredential?: AppController["saveCredential"];
+  readonly runtimeSetup?: boolean;
+} = {}) {
   const container = document.body.appendChild(document.createElement("div"));
   const root = createRoot(container); roots.push(root);
   let deliver!: (hosts: readonly RemoteHostView[]) => void;
@@ -314,13 +393,19 @@ async function mountSettings(options: { readonly strict?: boolean; readonly save
     getSshKeyInstallCommand: vi.fn(async () => "current recipe"),
     state: { connectionState: "connected", route: { kind: "settings" }, navigationRevision: 1 },
     watchRemoteHosts,
-    getRemoteHostCapabilities: vi.fn(async () => ({ catalog: true, management: true, connectionControl: true, connectionTest: true, trustReset: true, commandExecution: true, processStreaming: true, fileTransfer: true, tcpForwarding: true })),
+    getRemoteHostCapabilities: vi.fn(async () => ({ catalog: true, management: true, connectionControl: true, connectionTest: true, trustReset: true, commandExecution: true, processStreaming: true, fileTransfer: true, tcpForwarding: true, backendRuntimeSetup: options.runtimeSetup === true })),
     listRemoteHosts: vi.fn(async () => []),
     refreshRemoteHostCatalog: vi.fn(() => importResult.promise),
     updateTarget: vi.fn(async () => undefined), saveCredential: options.saveCredential ?? vi.fn(async () => undefined),
     createRemoteHost: vi.fn(async () => host()), updateRemoteHost: vi.fn(async () => host()),
     deleteRemoteHost: vi.fn(async () => undefined), connectRemoteHost: vi.fn(async () => host()),
-    disconnectRemoteHost: vi.fn(async () => host()), testRemoteHostConnection: vi.fn(async () => host()), clearRemoteHostTrust: vi.fn(async () => host())
+    disconnectRemoteHost: vi.fn(async () => host()), testRemoteHostConnection: vi.fn(async () => host()), clearRemoteHostTrust: vi.fn(async () => host()),
+    probeRemoteBackendRuntime: vi.fn(async () => runtime("notInstalled")),
+    installRemoteBackendRuntime: vi.fn(async function* (): AsyncGenerator<RemoteBackendRuntimeInstallEventView> {
+      yield { requestId: "install-one", sequence: 1n, phase: "downloading", runtime: runtime("installing"), observedAt: 4 };
+      yield { requestId: "install-one", sequence: 2n, phase: "complete", runtime: runtime("ready"), observedAt: 5 };
+    }),
+    uninstallRemoteBackendRuntime: vi.fn(async () => runtime("notInstalled"))
   } as unknown as AppController;
   const fixture = {
     controller, importResult,
@@ -335,6 +420,24 @@ async function mountSettings(options: { readonly strict?: boolean; readonly save
   };
   await fixture.render(controller);
   return fixture;
+}
+
+function runtime(state: RemoteBackendRuntimeView["state"]): RemoteBackendRuntimeView {
+  const ready = state === "ready";
+  return {
+    targetId: "target-one",
+    hostId: "build-box",
+    displayName: "Codex",
+    expectedVersion: "0.153.4",
+    ...(ready ? { installedVersion: "0.153.4" } : {}),
+    state,
+    canInstall: state === "notInstalled" || state === "failed" || state === "outcomeUnknown",
+    canReinstall: ready,
+    canUninstall: ready,
+    observedAt: 3,
+    targetRevision: 1n,
+    hostRevision: 1n
+  };
 }
 
 function input(label: string): HTMLInputElement {

@@ -1633,7 +1633,10 @@ export function useAppController(): AppController {
       connectRemoteHost: async (...args: Parameters<OperationApi["connectRemoteHost"]>) => original().connectRemoteHost(...args),
       disconnectRemoteHost: async (...args: Parameters<OperationApi["disconnectRemoteHost"]>) => original().disconnectRemoteHost(...args),
       testRemoteHostConnection: async (...args: Parameters<OperationApi["testRemoteHostConnection"]>) => original().testRemoteHostConnection(...args),
-      clearRemoteHostTrust: async (...args: Parameters<OperationApi["clearRemoteHostTrust"]>) => original().clearRemoteHostTrust(...args)
+      clearRemoteHostTrust: async (...args: Parameters<OperationApi["clearRemoteHostTrust"]>) => original().clearRemoteHostTrust(...args),
+      probeRemoteBackendRuntime: async (...args: Parameters<OperationApi["probeRemoteBackendRuntime"]>) => original().probeRemoteBackendRuntime(...args),
+      installRemoteBackendRuntime: (...args: Parameters<OperationApi["installRemoteBackendRuntime"]>) => original().installRemoteBackendRuntime(...args),
+      uninstallRemoteBackendRuntime: async (...args: Parameters<OperationApi["uninstallRemoteBackendRuntime"]>) => original().uninstallRemoteBackendRuntime(...args)
     };
   }, [artifactGateway]);
   const mcpApi = useMemo(() => {

@@ -233,6 +233,9 @@ describe("Orchestrator application composition", () => {
       expect.objectContaining({ id: "workspace-test:codex", backendId: "codex" }),
       expect.objectContaining({ id: "workspace-test:claude-code", backendId: "claude-code" })
     ]));
+    expect(application.remoteBackendRuntimeSetup?.supportsTarget("workspace-test:codex")).toBe(true);
+    expect(application.remoteBackendRuntimeSetup?.supportsTarget("workspace-test")).toBe(false);
+    expect(application.remoteBackendRuntimeSetup?.supportsTarget("workspace-test:claude-code")).toBe(false);
     expect(application.store.getBackend("pi").descriptor).toMatchObject({
       instanceGeneration: 1,
       health: "healthy"

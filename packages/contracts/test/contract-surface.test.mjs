@@ -77,6 +77,7 @@ test("machine-facing capability identifiers remain exact and globally unique", (
     remoteHostConnectionControl: "remote_host.connection_control",
     remoteHostConnectionTest: "remote_host.connection_test",
     remoteHostTrustReset: "remote_host.trust_reset",
+    remoteHostBackendRuntimeSetup: "remote_host.backend_runtime_setup",
     workspaceFilesWatch: "workspace.files.watch",
     workspaceFilesWrite: "workspace.files.write",
     workspaceGeneratedFiles: "workspace.generated_files",
@@ -118,7 +119,10 @@ test("remote-host requests derive owner identity from authentication", () => {
     contract.ConnectRemoteHostRequestSchema,
     contract.DisconnectRemoteHostRequestSchema,
     contract.TestRemoteHostConnectionRequestSchema,
-    contract.ClearRemoteHostTrustRequestSchema
+    contract.ClearRemoteHostTrustRequestSchema,
+    contract.ProbeRemoteBackendRuntimeRequestSchema,
+    contract.InstallRemoteBackendRuntimeRequestSchema,
+    contract.UninstallRemoteBackendRuntimeRequestSchema
   ];
   for (const schema of requests) {
     assert.equal(fieldNames(schema).has("target_id"), true, `${schema.typeName} must be target-scoped`);
@@ -155,7 +159,10 @@ test("remote-host public projections exclude raw authority and private diagnosti
     contract.RemoteHostFailureSchema,
     contract.RemoteHostCatalogSnapshotSchema,
     contract.RemoteHostChangeSchema,
-    contract.RemoteHostConnectionTestResultSchema
+    contract.RemoteHostConnectionTestResultSchema,
+    contract.RemoteBackendRuntimeSchema,
+    contract.RemoteBackendRuntimeFailureSchema,
+    contract.InstallRemoteBackendRuntimeResponseSchema
   ], [
     "owner_id", "backend_id", "credential_value", "password", "private_key", "private_path",
     "raw_error", "error_message", "raw_command", "command", "presented_key", "key_bytes",

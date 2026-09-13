@@ -36,6 +36,7 @@ export const capabilityNames = {
   remoteHostProcessStreaming: "remote_host.process_streaming",
   remoteHostFileTransfer: "remote_host.file_transfer",
   remoteHostTcpForwarding: "remote_host.tcp_forwarding",
+  remoteHostBackendRuntimeSetup: "remote_host.backend_runtime_setup",
   modelList: "model.list",
   modelSwitch: "model.switch",
   modelEffort: "model.effort",

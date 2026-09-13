@@ -14,6 +14,12 @@ import {
 
 import { fromProtoRevision, ProtoMappingError, toProtoRevision, toProtoTimestamp } from "./proto-mapper.js";
 import {
+  RemoteBackendRuntimeSetupError,
+  type RemoteBackendRuntimeInstallEvent,
+  type RemoteBackendRuntimeSetupManager,
+  type RemoteBackendRuntimeSnapshot
+} from "./remote-backend-runtime-setup.js";
+import {
   RemoteHostRegistry,
   type RemoteHostRegistryChange
 } from "./remote-host-registry.js";
@@ -39,7 +45,8 @@ export function createRemoteHostConnectService(
   registry: RemoteHostRegistry | undefined,
   authenticate: (context: HandlerContext) => RemoteHostRpcOwner,
   onRevoked?: RemoteHostRevocationSubscription,
-  now: () => number = Date.now
+  now: () => number = Date.now,
+  runtimeSetup?: RemoteBackendRuntimeSetupManager
 ): ServiceImpl<typeof contract.RemoteHostService> {
   return {
     getRemoteHostCapabilities: async (request, context) => remoteHostRpc(async () => {
@@ -112,6 +119,15 @@ export function createRemoteHostConnectService(
             contract.RemoteHostCapabilityKind.TCP_FORWARDING,
             contract.capabilityNames.remoteHostTcpForwarding,
             transportSupport(available?.tcpForwarding)
+          ),
+          capability(
+            contract.RemoteHostCapabilityKind.BACKEND_RUNTIME_SETUP,
+            contract.capabilityNames.remoteHostBackendRuntimeSetup,
+            runtimeSetup?.supportsTarget(targetId) === true
+              ? contract.CapabilitySupport.SUPPORTED
+              : runtimeSetup === undefined
+                ? contract.CapabilitySupport.NOT_IMPLEMENTED
+                : contract.CapabilitySupport.UPSTREAM_MISSING
           )
         ],
         observedAt: toProtoTimestamp(now())
@@ -307,8 +323,57 @@ export function createRemoteHostConnectService(
         clearedAt: now()
       });
       return create(contract.ClearRemoteHostTrustResponseSchema, { host: toProtoRemoteHost(host) });
+    }),
+
+    probeRemoteBackendRuntime: async (request, context) => remoteHostRpc(async () => {
+      authenticate(context);
+      const runtime = await requireRuntimeSetup(runtimeSetup).probe({
+        targetId: publicIdentity(request.targetId, "target_id"),
+        hostId: publicHostAlias(request.hostId),
+        expectedTargetRevision: fromProtoRevision(request.expectedTargetRevision, "expected_target_revision"),
+        expectedHostRevision: fromProtoRevision(request.expectedHostRevision, "expected_host_revision")
+      }, context.signal);
+      return create(contract.ProbeRemoteBackendRuntimeResponseSchema, {
+        runtime: toProtoRemoteBackendRuntime(runtime)
+      });
+    }),
+
+    installRemoteBackendRuntime: async function* (request, context) {
+      try {
+        authenticate(context);
+        const events = requireRuntimeSetup(runtimeSetup).install({
+          requestId: publicIdentity(request.requestId, "request_id"),
+          targetId: publicIdentity(request.targetId, "target_id"),
+          hostId: publicHostAlias(request.hostId),
+          expectedTargetRevision: fromProtoRevision(request.expectedTargetRevision, "expected_target_revision"),
+          expectedHostRevision: fromProtoRevision(request.expectedHostRevision, "expected_host_revision"),
+          reinstall: request.reinstall
+        }, context.signal);
+        for await (const event of events) yield toProtoRemoteBackendRuntimeInstallEvent(event);
+      } catch (error) {
+        throw remoteHostConnectError(error);
+      }
+    },
+
+    uninstallRemoteBackendRuntime: async (request, context) => remoteHostRpc(async () => {
+      authenticate(context);
+      const runtime = await requireRuntimeSetup(runtimeSetup).uninstall({
+        requestId: publicIdentity(request.requestId, "request_id"),
+        targetId: publicIdentity(request.targetId, "target_id"),
+        hostId: publicHostAlias(request.hostId),
+        expectedTargetRevision: fromProtoRevision(request.expectedTargetRevision, "expected_target_revision"),
+        expectedHostRevision: fromProtoRevision(request.expectedHostRevision, "expected_host_revision")
+      });
+      return create(contract.UninstallRemoteBackendRuntimeResponseSchema, {
+        runtime: toProtoRemoteBackendRuntime(runtime)
+      });
     })
   } satisfies ServiceImpl<typeof contract.RemoteHostService>;
+}
+
+function requireRuntimeSetup(value: RemoteBackendRuntimeSetupManager | undefined): RemoteBackendRuntimeSetupManager {
+  if (value === undefined) throw new ConnectError("Remote Backend runtime setup is not available.", Code.Unimplemented);
+  return value;
 }
 
 function requireRegistry(value: RemoteHostRegistry | undefined): RemoteHostRegistry {
@@ -514,6 +579,83 @@ function assertPublicAuthentication(
   }
 }
 
+function toProtoRemoteBackendRuntime(value: RemoteBackendRuntimeSnapshot): contract.RemoteBackendRuntime {
+  return create(contract.RemoteBackendRuntimeSchema, {
+    targetId: value.targetId,
+    hostId: value.hostId,
+    displayName: value.displayName,
+    expectedVersion: value.expectedVersion,
+    ...(value.installedVersion === undefined ? {} : { installedVersion: value.installedVersion }),
+    state: toProtoRemoteBackendRuntimeState(value.state),
+    canInstall: value.canInstall,
+    canReinstall: value.canReinstall,
+    canUninstall: value.canUninstall,
+    ...(value.failure === undefined ? {} : {
+      failure: create(contract.RemoteBackendRuntimeFailureSchema, {
+        code: toProtoRemoteBackendRuntimeFailureCode(value.failure.code),
+        retryable: value.failure.retryable
+      })
+    }),
+    observedAt: toProtoTimestamp(value.observedAt),
+    targetRevision: toProtoRevision(value.targetRevision),
+    hostRevision: toProtoRevision(value.hostRevision)
+  });
+}
+
+function toProtoRemoteBackendRuntimeInstallEvent(
+  value: RemoteBackendRuntimeInstallEvent
+): contract.InstallRemoteBackendRuntimeResponse {
+  return create(contract.InstallRemoteBackendRuntimeResponseSchema, {
+    requestId: value.requestId,
+    sequence: value.sequence,
+    phase: toProtoRemoteBackendRuntimeInstallPhase(value.phase),
+    runtime: toProtoRemoteBackendRuntime(value.runtime),
+    observedAt: toProtoTimestamp(value.observedAt)
+  });
+}
+
+function toProtoRemoteBackendRuntimeState(
+  value: RemoteBackendRuntimeSnapshot["state"]
+): contract.RemoteBackendRuntimeState {
+  switch (value) {
+    case "probing": return contract.RemoteBackendRuntimeState.PROBING;
+    case "not_installed": return contract.RemoteBackendRuntimeState.NOT_INSTALLED;
+    case "installing": return contract.RemoteBackendRuntimeState.INSTALLING;
+    case "ready": return contract.RemoteBackendRuntimeState.READY;
+    case "failed": return contract.RemoteBackendRuntimeState.FAILED;
+    case "outcome_unknown": return contract.RemoteBackendRuntimeState.OUTCOME_UNKNOWN;
+  }
+}
+
+function toProtoRemoteBackendRuntimeInstallPhase(
+  value: RemoteBackendRuntimeInstallEvent["phase"]
+): contract.RemoteBackendRuntimeInstallPhase {
+  switch (value) {
+    case "probing": return contract.RemoteBackendRuntimeInstallPhase.PROBING;
+    case "downloading": return contract.RemoteBackendRuntimeInstallPhase.DOWNLOADING;
+    case "installing": return contract.RemoteBackendRuntimeInstallPhase.INSTALLING;
+    case "validating": return contract.RemoteBackendRuntimeInstallPhase.VALIDATING;
+    case "complete": return contract.RemoteBackendRuntimeInstallPhase.COMPLETE;
+    case "failed": return contract.RemoteBackendRuntimeInstallPhase.FAILED;
+    case "outcome_unknown": return contract.RemoteBackendRuntimeInstallPhase.OUTCOME_UNKNOWN;
+  }
+}
+
+function toProtoRemoteBackendRuntimeFailureCode(
+  value: NonNullable<RemoteBackendRuntimeSnapshot["failure"]>["code"]
+): contract.RemoteBackendRuntimeFailureCode {
+  switch (value) {
+    case "aborted": return contract.RemoteBackendRuntimeFailureCode.ABORTED;
+    case "authority_changed": return contract.RemoteBackendRuntimeFailureCode.AUTHORITY_CHANGED;
+    case "host_not_ready": return contract.RemoteBackendRuntimeFailureCode.HOST_NOT_READY;
+    case "not_supported": return contract.RemoteBackendRuntimeFailureCode.NOT_SUPPORTED;
+    case "probe_failed": return contract.RemoteBackendRuntimeFailureCode.PROBE_FAILED;
+    case "install_failed": return contract.RemoteBackendRuntimeFailureCode.INSTALL_FAILED;
+    case "uninstall_failed": return contract.RemoteBackendRuntimeFailureCode.UNINSTALL_FAILED;
+    case "busy": return contract.RemoteBackendRuntimeFailureCode.BUSY;
+  }
+}
+
 class BoundedRemoteHostQueue {
   readonly #signal: AbortSignal;
   readonly #capacity: number;
@@ -575,6 +717,16 @@ function remoteHostConnectError(error: unknown): ConnectError {
   }
   if (error instanceof StoreClosedError) {
     return new ConnectError("Remote Host storage is unavailable.", Code.Unavailable);
+  }
+  if (error instanceof RemoteBackendRuntimeSetupError) {
+    const code = error.code === "aborted"
+      ? Code.Canceled
+      : error.code === "authority_changed"
+        ? Code.Aborted
+        : error.code === "not_supported"
+          ? Code.Unimplemented
+          : Code.FailedPrecondition;
+    return new ConnectError("Remote Backend runtime request failed safely.", code);
   }
   if (isRemoteSshError(error)) {
     const code = error.code === "ABORTED" ? Code.Canceled
