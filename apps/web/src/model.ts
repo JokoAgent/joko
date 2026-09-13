@@ -2089,6 +2089,7 @@ export interface RuntimeToolInputFieldView {
 export interface RuntimeToolView {
   readonly name: string;
   readonly description: string;
+  readonly resourceId?: string;
   readonly fields: readonly RuntimeToolInputFieldView[];
   readonly allowsAdditionalFields: boolean;
   readonly promptGuidelines: readonly string[];
@@ -2440,6 +2441,70 @@ export interface McpCredentialBindingView {
 export interface McpEnvironmentVariableView {
   readonly name: string;
   readonly value: string;
+}
+
+export interface ExtensionCatalogEntryView {
+  readonly id: string;
+  readonly revision: bigint;
+  readonly owner:
+    | { readonly kind: "resource"; readonly resourceId: string; readonly discoveredRevision: string; readonly resourceRevision: bigint }
+    | { readonly kind: "mcp"; readonly serverId: string; readonly serverRevision: bigint };
+  readonly source: "local" | "market";
+  readonly installed: boolean;
+  readonly installState: "available" | "installing" | "installed" | "updateAvailable" | "error";
+  readonly name: string;
+  readonly version?: string;
+  readonly author?: string;
+  readonly description: string;
+  readonly enabled: boolean;
+  readonly sidebarSupported: boolean;
+  readonly sidebarVisible: boolean;
+  readonly tools: readonly { readonly name: string; readonly description: string; readonly requiresPermission: boolean }[];
+  readonly permissions: readonly {
+    readonly id: string;
+    readonly label: string;
+    readonly description: string;
+    readonly required: boolean;
+    readonly granted: boolean;
+  }[];
+  readonly commands: readonly { readonly name: string; readonly description: string; readonly sessionId: string }[];
+  readonly setup: {
+    readonly state: "notRequired" | "required" | "inProgress" | "ready" | "cancelled" | "failed";
+    readonly attemptId?: string;
+    readonly revision: bigint;
+    readonly fields: readonly {
+      readonly id: string;
+      readonly label: string;
+      readonly description: string;
+      readonly kind: "text" | "secret" | "oauth" | "confirmation";
+      readonly required: boolean;
+      readonly configured: boolean;
+      readonly options: readonly string[];
+    }[];
+    readonly error?: string;
+  };
+  readonly useSupported: boolean;
+  readonly error?: string;
+}
+
+export interface ExtensionCatalogView {
+  readonly revision: bigint;
+  readonly extensions: readonly ExtensionCatalogEntryView[];
+  readonly recoveredFromCorruption: boolean;
+}
+
+/** Owner-scoped, one-shot handoff from Extension detail to the delayed-create
+ * composer. The command remains fenced to the exact catalog projection that
+ * advertised it; it is never inferred again from a display name. */
+export interface PendingExtensionUseView {
+  readonly extensionId: string;
+  readonly extensionRevision: string;
+  readonly commandName: string;
+  readonly runtimeSessionId: string;
+  readonly displayName: string;
+  readonly owner:
+    | { readonly kind: "resource"; readonly resourceId: string; readonly discoveredRevision: string; readonly resourceRevision: string }
+    | { readonly kind: "mcp"; readonly serverId: string; readonly serverRevision: string };
 }
 
 export interface BrowserSettingsView {
@@ -2862,6 +2927,9 @@ export interface AppSnapshot {
   readonly browsers: readonly BrowserView[];
   readonly extraDirectories: readonly ExtraDirectoryView[];
   readonly resources: readonly ResourceView[];
+  readonly extensions: readonly ExtensionCatalogEntryView[];
+  readonly extensionCatalogRevision: bigint;
+  readonly extensionCatalogRecovered: boolean;
   readonly commands: readonly RuntimeCommandView[];
   readonly remoteConnections: readonly RemoteConnectionView[];
   readonly devices: readonly DeviceView[];
@@ -3663,6 +3731,36 @@ export interface OperationApi {
   resetModelPriceOverride(backendId: string, providerId: string, modelId: string, signal?: AbortSignal): Promise<ModelPriceOverrideView>;
   terminateRuntimeProcess(process: RuntimeProcessUsageView): Promise<void>;
   listRuntimeTools(sessionId: string): Promise<RuntimeToolCatalogView>;
+  listExtensions(options?: {
+    readonly source?: ExtensionCatalogEntryView["source"];
+    readonly installed?: boolean;
+    readonly query?: string;
+    readonly sessionId?: string;
+    readonly signal?: AbortSignal;
+  }): Promise<ExtensionCatalogView>;
+  getExtension(extensionId: string, sessionId?: string, signal?: AbortSignal): Promise<ExtensionCatalogView>;
+  setExtensionEnabled(extensionId: string, enabled: boolean, expectedRevision: bigint): Promise<void>;
+  setExtensionSidebarVisible(extensionId: string, visible: boolean, expectedRevision: bigint): Promise<void>;
+  beginExtensionSetup(extensionId: string, expectedRevision: bigint): Promise<void>;
+  submitExtensionSetupInteraction(
+    extensionId: string,
+    attemptId: string,
+    fieldId: string,
+    value: string | boolean,
+    expectedRevision: bigint
+  ): Promise<void>;
+  saveExtensionSetupCredential(
+    extensionId: string,
+    attemptId: string,
+    fieldId: string,
+    kind: "apiKey" | "oauth" | "headerSecret",
+    secret: string,
+    expectedRevision: bigint,
+    signal?: AbortSignal
+  ): Promise<void>;
+  completeExtensionSetup(extensionId: string, attemptId: string, expectedRevision: bigint): Promise<void>;
+  cancelExtensionSetup(extensionId: string, attemptId: string, expectedRevision: bigint): Promise<void>;
+  revokeExtensionSetup(extensionId: string, expectedRevision: bigint): Promise<void>;
   listBackgroundTasks(sessionId: string): Promise<readonly BackgroundTaskHistoryView[]>;
   cancelBackgroundTask(sessionId: string, backgroundTaskId: string): Promise<void>;
   listSubagentRuns(sessionId: string, state?: SubagentRunStateView, pageToken?: string, pageSize?: number): Promise<SubagentRunPageView>;
@@ -3838,6 +3936,9 @@ export function emptySnapshot(): AppSnapshot {
     browsers: [],
     extraDirectories: [],
     resources: [],
+    extensions: [],
+    extensionCatalogRevision: 0n,
+    extensionCatalogRecovered: false,
     commands: [],
     remoteConnections: [],
     devices: [],

@@ -6,6 +6,7 @@ import {
   AlignJustify,
   Archive,
   Bot,
+  Boxes,
   CalendarClock,
   Check,
   ChevronDown,
@@ -341,6 +342,11 @@ interface DeleteScheduleRequest {
 export function Sidebar(props: SidebarProps): JSX.Element {
   const { snapshot, route, activeSessionId, t } = props;
   const visibleTargets = useMemo(() => snapshot.targets.filter((target) => !target.archived), [snapshot.targets]);
+  const sidebarExtensions = useMemo(() => snapshot.extensions.filter((extension) => extension.installed
+    && extension.enabled
+    && extension.sidebarSupported
+    && extension.sidebarVisible
+    && (extension.setup.state === "ready" || extension.setup.state === "notRequired")), [snapshot.extensions]);
   const hiddenProjectIds = useMemo(() => new Set(snapshot.targets.filter((target) => target.archived).map((target) => target.id)), [snapshot.targets]);
   const navigateAndClose = (nextRoute: AppRoute): void => {
     props.onNavigate(nextRoute);
@@ -1784,7 +1790,18 @@ export function Sidebar(props: SidebarProps): JSX.Element {
             props.onClose();
           }}
         />}
-        {!searchPopupOpen && pinnedEntries.length === 0 && recent.length === 0 && remoteMachineSessionCount === 0 && <p className="sidebar__empty">{t("session.emptyBody")}</p>}
+        {!searchPopupOpen && sidebarExtensions.length > 0 && <section className="sidebar-extension-shortcuts" aria-label={t("extensions.sidebar")}>
+          <h2>{t("extensions.sidebar")}</h2>
+          {sidebarExtensions.map((extension) => <button
+            type="button"
+            key={extension.id}
+            data-extension-id={extension.id}
+            className={cx(route.kind === "tools" && route.extensionId === extension.id && "is-active")}
+            aria-current={route.kind === "tools" && route.extensionId === extension.id ? "page" : undefined}
+            onClick={() => navigateAndClose({ kind: "tools", extensionId: extension.id })}
+          ><Boxes aria-hidden="true" /><span><strong>{extension.name}</strong><small>{extension.description}</small></span></button>)}
+        </section>}
+        {!searchPopupOpen && pinnedEntries.length === 0 && recent.length === 0 && remoteMachineSessionCount === 0 && sidebarExtensions.length === 0 && <p className="sidebar__empty">{t("session.emptyBody")}</p>}
         </nav>
 
         <nav className="sidebar__utility" aria-label={t("a11y.productNavigation")}>
@@ -1850,6 +1867,14 @@ export function Sidebar(props: SidebarProps): JSX.Element {
             ariaLabel={t("nav.pinned")}
           />
           {railPinnedEntries.length > 0 && <div className="sidebar__rail-section-divider" aria-hidden="true" />}
+          {sidebarExtensions.map((extension) => <IconButton
+            key={extension.id}
+            className={cx("sidebar__rail-extension", route.kind === "tools" && route.extensionId === extension.id && "is-active")}
+            label={extension.name}
+            tip={extension.name}
+            onClick={() => navigateAndClose({ kind: "tools", extensionId: extension.id })}
+          ><Boxes aria-hidden="true" /></IconButton>)}
+          {sidebarExtensions.length > 0 && <div className="sidebar__rail-section-divider" aria-hidden="true" />}
           <div className="sidebar__rail-aggregates">
             <IconButton
               className={cx("sidebar__rail-aggregate", railPanel?.section === "projects" && "is-open")}

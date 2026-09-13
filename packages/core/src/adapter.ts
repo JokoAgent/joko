@@ -273,6 +273,8 @@ export interface RuntimeCommand {
   readonly description: string;
   readonly source: "extension" | "skill" | "prompt";
   readonly path?: string;
+  /** Exact managed Resource owner resolved inside the live runtime. */
+  readonly resourceId?: string;
   readonly loaded: boolean;
 }
 
@@ -345,6 +347,8 @@ export interface RuntimeToolDescriptor {
   readonly promptGuidelines: readonly string[];
   readonly active: boolean;
   readonly sourceInfo: RuntimeToolSourceInfo;
+  /** Exact managed Resource owner resolved inside the live runtime. */
+  readonly resourceId?: string;
 }
 
 export interface RuntimeToolCatalog {

@@ -35,6 +35,7 @@ describe("Tools resource actions", () => {
       sessions: [],
       browsers: [],
       resources: [resource],
+      extensions: [],
       settings: {
         visionBridge: { enabled: false, targetModels: [] },
         browsers: [],

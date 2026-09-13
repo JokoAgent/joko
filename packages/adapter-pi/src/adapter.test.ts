@@ -2214,6 +2214,7 @@ describe("PiBackendAdapter", () => {
         observedAt: expect.any(Number),
         tools: [{
           name: "lookup_records",
+          resourceId: "tool-only-extension",
           active: true,
           description: "Look up records from the approved extension.",
           promptGuidelines: ["Use a narrow query."],

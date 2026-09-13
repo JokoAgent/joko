@@ -2,6 +2,7 @@ export * from "./gen/joko/v1/capability_pb.js";
 export * from "./gen/joko/v1/code_host_pb.js";
 export * from "./gen/joko/v1/common_pb.js";
 export * from "./gen/joko/v1/event_pb.js";
+export * from "./gen/joko/v1/extension_pb.js";
 export * from "./gen/joko/v1/interaction_pb.js";
 export * from "./gen/joko/v1/managed_model_runtime_pb.js";
 export * from "./gen/joko/v1/model_pb.js";

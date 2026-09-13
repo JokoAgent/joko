@@ -37,4 +37,17 @@ describe("runtime command state", () => {
       { name: "review", description: "Review", source: "extension", loaded: true }
     ], 10)).toMatchObject({ format: 1, generation: 2, observedAt: 10 });
   });
+
+  it("keeps exact Resource ownership in command identity and equality", () => {
+    const commands = normalizeRuntimeCommands([
+      { name: "navigate", description: "First", source: "extension", path: "extension.ts", resourceId: "resource-a", loaded: true },
+      { name: "navigate", description: "Second", source: "extension", path: "extension.ts", resourceId: "resource-b", loaded: true }
+    ]);
+
+    expect(commands).toHaveLength(2);
+    expect(commands.map((command) => command.resourceId)).toEqual(["resource-a", "resource-b"]);
+    expect(sameRuntimeCommands(commands, commands.map((command, index) => index === 0
+      ? { ...command, resourceId: "resource-changed" }
+      : command))).toBe(false);
+  });
 });

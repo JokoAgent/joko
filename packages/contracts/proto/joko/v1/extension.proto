@@ -1,0 +1,125 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "joko/v1/common.proto";
+
+enum ExtensionCatalogSource {
+  EXTENSION_CATALOG_SOURCE_UNSPECIFIED = 0;
+  EXTENSION_CATALOG_SOURCE_LOCAL = 1;
+  EXTENSION_CATALOG_SOURCE_MARKET = 2;
+}
+
+enum ExtensionInstallState {
+  EXTENSION_INSTALL_STATE_UNSPECIFIED = 0;
+  EXTENSION_INSTALL_STATE_AVAILABLE = 1;
+  EXTENSION_INSTALL_STATE_INSTALLING = 2;
+  EXTENSION_INSTALL_STATE_INSTALLED = 3;
+  EXTENSION_INSTALL_STATE_UPDATE_AVAILABLE = 4;
+  EXTENSION_INSTALL_STATE_ERROR = 5;
+}
+
+enum ExtensionSetupState {
+  EXTENSION_SETUP_STATE_UNSPECIFIED = 0;
+  EXTENSION_SETUP_STATE_NOT_REQUIRED = 1;
+  EXTENSION_SETUP_STATE_REQUIRED = 2;
+  EXTENSION_SETUP_STATE_IN_PROGRESS = 3;
+  EXTENSION_SETUP_STATE_READY = 4;
+  EXTENSION_SETUP_STATE_CANCELLED = 5;
+  EXTENSION_SETUP_STATE_FAILED = 6;
+}
+
+enum ExtensionSetupFieldKind {
+  EXTENSION_SETUP_FIELD_KIND_UNSPECIFIED = 0;
+  EXTENSION_SETUP_FIELD_KIND_TEXT = 1;
+  EXTENSION_SETUP_FIELD_KIND_SECRET = 2;
+  EXTENSION_SETUP_FIELD_KIND_OAUTH = 3;
+  EXTENSION_SETUP_FIELD_KIND_CONFIRMATION = 4;
+}
+
+message ExtensionResourceOwner {
+  string resource_id = 1;
+  string discovered_revision = 2;
+  Revision resource_version = 3;
+}
+
+message ExtensionMcpOwner {
+  string mcp_server_id = 1;
+  Revision server_revision = 2;
+}
+
+message ExtensionOwner {
+  oneof kind {
+    ExtensionResourceOwner resource = 1;
+    ExtensionMcpOwner mcp = 2;
+  }
+}
+
+message ExtensionToolDescriptor {
+  string name = 1;
+  string description = 2;
+  bool requires_permission = 3;
+}
+
+message ExtensionPermissionDescriptor {
+  string permission_id = 1;
+  string label = 2;
+  string description = 3;
+  bool required = 4;
+  bool granted = 5;
+}
+
+message ExtensionCommandDescriptor {
+  string name = 1;
+  string description = 2;
+  string session_id = 3;
+}
+
+message ExtensionSetupFieldDescriptor {
+  string field_id = 1;
+  string label = 2;
+  string description = 3;
+  ExtensionSetupFieldKind kind = 4;
+  bool required = 5;
+  bool configured = 6;
+  repeated string options = 7;
+}
+
+message ExtensionSetupDescriptor {
+  ExtensionSetupState state = 1;
+  optional string attempt_id = 2;
+  Revision revision = 3;
+  repeated ExtensionSetupFieldDescriptor fields = 4;
+  optional string error = 5;
+}
+
+// Generic Extension projection. Executable bytes and secrets are deliberately
+// absent: owner carries only exact Resource/MCP references and setup carries
+// protected credential readiness.
+message ExtensionCatalogEntry {
+  string extension_id = 1;
+  Revision revision = 2;
+  ExtensionOwner owner = 3;
+  ExtensionCatalogSource source = 4;
+  bool installed = 5;
+  ExtensionInstallState install_state = 6;
+  string name = 7;
+  optional string version = 8;
+  optional string author = 9;
+  string description = 10;
+  bool enabled = 11;
+  bool sidebar_supported = 12;
+  bool sidebar_visible = 13;
+  repeated ExtensionToolDescriptor tools = 14;
+  repeated ExtensionPermissionDescriptor permissions = 15;
+  repeated ExtensionCommandDescriptor commands = 16;
+  ExtensionSetupDescriptor setup = 17;
+  bool use_supported = 18;
+  optional string error = 19;
+}
+
+message ExtensionCatalogSnapshot {
+  Revision revision = 1;
+  repeated ExtensionCatalogEntry entries = 2;
+  bool recovered_from_corruption = 3;
+}

@@ -68,6 +68,11 @@ import {
   ErrorSeverity,
   EventCursorSchema,
   ExtensionWidgetPlacement,
+  ExtensionCatalogSource as ProtoExtensionCatalogSource,
+  ExtensionInstallState as ProtoExtensionInstallState,
+  ExtensionService,
+  ExtensionSetupFieldKind as ProtoExtensionSetupFieldKind,
+  ExtensionSetupState as ProtoExtensionSetupState,
   ExtensionUiEffectKind,
   ExtensionNotificationKind as ProtoExtensionNotificationKind,
   EventService,
@@ -262,6 +267,7 @@ import {
   type Event,
   type ExtraDirectory,
   type ExtensionStatus,
+  type ExtensionCatalogEntry as ProtoExtensionCatalogEntry,
   type ExtensionWidget,
   type FilePreview,
   type FileDiff,
@@ -372,6 +378,8 @@ import type {
   ErrorView,
   ExtraDirectoryView,
   ExtensionStatusView,
+  ExtensionCatalogEntryView,
+  ExtensionCatalogView,
   ExtensionWidgetView,
   InteractionView,
   InteractionResolutionDraft,
@@ -2871,6 +2879,163 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     );
     if (response.catalog === undefined) throw new GatewayError("Orchestrator returned an empty runtime tool catalog.");
     return mapRuntimeToolCatalog(response.catalog);
+  }
+
+  async listExtensions(options: {
+    readonly source?: ExtensionCatalogEntryView["source"];
+    readonly installed?: boolean;
+    readonly query?: string;
+    readonly sessionId?: string;
+    readonly signal?: AbortSignal;
+  } = {}): Promise<ExtensionCatalogView> {
+    const scope = this.captureActionScope(options.signal);
+    const client = createClient(ExtensionService, scope.transport);
+    extensionCatalogAttempts:
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const extensions: ExtensionCatalogEntryView[] = [];
+      const ids = new Set<string>();
+      const consumedTokens = new Set<string>();
+      let pageToken = "";
+      let revision: bigint | undefined;
+      let recoveredFromCorruption = false;
+      let totalSize: number | undefined;
+      for (let pageIndex = 0; pageIndex < MAX_COMPLETE_MESSAGE_SEARCH_PAGES; pageIndex += 1) {
+        scope.signal.throwIfAborted();
+        const response = await client.listExtensions({
+          ...(options.source === undefined ? {} : {
+            source: options.source === "local" ? ProtoExtensionCatalogSource.LOCAL : ProtoExtensionCatalogSource.MARKET
+          }),
+          ...(options.installed === undefined ? {} : { installed: options.installed }),
+          query: options.query ?? "",
+          ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
+          page: { pageSize: 500, pageToken }
+        }, { signal: scope.signal });
+        const pageRevision = response.catalogRevision?.value;
+        if (pageRevision === undefined) throw new GatewayError("Orchestrator returned an Extension catalog without its revision.");
+        if (revision === undefined) {
+          revision = pageRevision;
+          recoveredFromCorruption = response.recoveredFromCorruption;
+        } else if (revision !== pageRevision || recoveredFromCorruption !== response.recoveredFromCorruption) {
+          if (attempt === 0) continue extensionCatalogAttempts;
+          throw new GatewayError("Extension catalog changed repeatedly while it was being loaded.");
+        }
+        const pageTotal = response.page === undefined ? undefined : exactSafeUnsignedNumber(response.page.totalSize);
+        if (pageTotal === undefined) throw new GatewayError("Orchestrator returned an invalid Extension catalog size.");
+        if (totalSize === undefined) totalSize = pageTotal;
+        else if (totalSize !== pageTotal) throw new GatewayError("Orchestrator returned inconsistent Extension catalog sizes.");
+        if (response.extensions.length > 500 || extensions.length + response.extensions.length > pageTotal) {
+          throw new GatewayError("Orchestrator returned an invalid Extension catalog page.");
+        }
+        for (const value of response.extensions) {
+          const mapped = mapExtensionCatalogEntry(value);
+          if (ids.has(mapped.id)) throw new GatewayError("Orchestrator returned a duplicate Extension identity.");
+          ids.add(mapped.id);
+          extensions.push(mapped);
+        }
+        const nextPageToken = response.page?.nextPageToken ?? "";
+        if (nextPageToken === "") {
+          if (extensions.length !== pageTotal) throw new GatewayError("Orchestrator returned an incomplete Extension catalog.");
+          return { revision, extensions, recoveredFromCorruption };
+        }
+        if (nextPageToken === pageToken || consumedTokens.has(nextPageToken)) {
+          throw new GatewayError("Orchestrator returned a cyclic Extension catalog page token.");
+        }
+        consumedTokens.add(nextPageToken);
+        pageToken = nextPageToken;
+      }
+      throw new GatewayError("Extension catalog exceeded the safe pagination limit.");
+    }
+    throw new GatewayError("Extension catalog changed repeatedly while it was being loaded.");
+  }
+
+  async getExtension(extensionId: string, sessionId?: string, signal?: AbortSignal): Promise<ExtensionCatalogView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).getExtension({
+      extensionId,
+      ...(sessionId === undefined ? {} : { sessionId })
+    }, { signal: scope.signal });
+    if (response.extension === undefined || response.catalogRevision?.value === undefined) {
+      throw new GatewayError("Orchestrator returned an incomplete Extension detail.");
+    }
+    return {
+      revision: response.catalogRevision.value,
+      extensions: [mapExtensionCatalogEntry(response.extension)],
+      recoveredFromCorruption: response.recoveredFromCorruption
+    };
+  }
+
+  async setExtensionEnabled(extensionId: string, enabled: boolean, expectedRevision: bigint): Promise<void> {
+    await this.submit({ case: "setExtensionEnabled", value: { extensionId, enabled, expectedRevision: { value: expectedRevision } } }, true);
+  }
+
+  async setExtensionSidebarVisible(extensionId: string, visible: boolean, expectedRevision: bigint): Promise<void> {
+    await this.submit({ case: "setExtensionSidebarVisible", value: { extensionId, visible, expectedRevision: { value: expectedRevision } } }, true);
+  }
+
+  async beginExtensionSetup(extensionId: string, expectedRevision: bigint): Promise<void> {
+    await this.submit({ case: "beginExtensionSetup", value: { extensionId, expectedRevision: { value: expectedRevision } } }, true);
+  }
+
+  async submitExtensionSetupInteraction(
+    extensionId: string,
+    attemptId: string,
+    fieldId: string,
+    value: string | boolean,
+    expectedRevision: bigint
+  ): Promise<void> {
+    await this.submit({
+      case: "submitExtensionSetupInteraction",
+      value: {
+        extensionId,
+        attemptId,
+        fieldId,
+        value: typeof value === "boolean" ? { case: "confirmed", value } : { case: "text", value },
+        expectedRevision: { value: expectedRevision }
+      }
+    }, true);
+  }
+
+  async saveExtensionSetupCredential(
+    extensionId: string,
+    attemptId: string,
+    fieldId: string,
+    kind: "apiKey" | "oauth" | "headerSecret",
+    secret: string,
+    expectedRevision: bigint,
+    signal?: AbortSignal
+  ): Promise<void> {
+    if (secret.length === 0) throw new GatewayError("Extension credential value is required.");
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).beginExtensionSetupCredentialUpload({
+      extensionId,
+      attemptId,
+      fieldId,
+      kind: kind === "oauth" ? CredentialKind.OAUTH : kind === "headerSecret" ? CredentialKind.HEADER_SECRET : CredentialKind.API_KEY
+    }, { signal: scope.signal });
+    const ticketId = await this.uploadCredentialTicket(secret, response.ticket, scope);
+    scope.signal.throwIfAborted();
+    await this.submit({
+      case: "commitExtensionSetupCredential",
+      value: {
+        extensionId,
+        attemptId,
+        fieldId,
+        credentialUploadTicketId: ticketId,
+        expectedRevision: { value: expectedRevision }
+      }
+    }, true, [], scope.signal);
+  }
+
+  async completeExtensionSetup(extensionId: string, attemptId: string, expectedRevision: bigint): Promise<void> {
+    await this.submit({ case: "completeExtensionSetup", value: { extensionId, attemptId, expectedRevision: { value: expectedRevision } } }, true);
+  }
+
+  async cancelExtensionSetup(extensionId: string, attemptId: string, expectedRevision: bigint): Promise<void> {
+    await this.submit({ case: "cancelExtensionSetup", value: { extensionId, attemptId, expectedRevision: { value: expectedRevision } } }, true);
+  }
+
+  async revokeExtensionSetup(extensionId: string, expectedRevision: bigint): Promise<void> {
+    await this.submit({ case: "revokeExtensionSetup", value: { extensionId, expectedRevision: { value: expectedRevision } } }, true);
   }
 
   async listBackgroundTasks(sessionId: string): Promise<readonly BackgroundTaskHistoryView[]> {
@@ -7009,6 +7174,9 @@ export function mapSnapshot(
     browsers: snapshot.browsers.map(mapBrowser),
     extraDirectories: snapshot.extraDirectories.map(mapExtraDirectory),
     resources: snapshot.resources.filter((resource) => resource.state !== ResourceState.REMOVED).map(mapResource),
+    extensions: snapshot.extensionCatalog?.entries.map(mapExtensionCatalogEntry) ?? [],
+    extensionCatalogRevision: snapshot.extensionCatalog?.revision?.value ?? 0n,
+    extensionCatalogRecovered: snapshot.extensionCatalog?.recoveredFromCorruption ?? false,
     commands: snapshot.runtimeCommands.filter((command) => command.loaded).map(mapRuntimeCommand),
     remoteConnections: snapshot.connections.map(mapRemoteConnection),
     devices: snapshot.devices.map(mapDevice),
@@ -9506,6 +9674,121 @@ function mapResource(resource: ManagedResource): ResourceView {
   };
 }
 
+function mapExtensionCatalogEntry(extension: ProtoExtensionCatalogEntry): ExtensionCatalogEntryView {
+  const revision = extension.revision?.value;
+  const setup = extension.setup;
+  if (extension.extensionId.trim() === "" || revision === undefined || revision < 1n || setup?.revision?.value === undefined) {
+    throw new GatewayError("Orchestrator returned an incomplete Extension descriptor.");
+  }
+  const owner = extension.owner?.kind;
+  const mappedOwner: ExtensionCatalogEntryView["owner"] = owner?.case === "resource"
+    ? owner.value.resourceVersion?.value === undefined || owner.value.resourceId.trim() === "" || owner.value.discoveredRevision.trim() === ""
+      ? (() => { throw new GatewayError("Orchestrator returned an incomplete Extension Resource owner."); })()
+      : {
+          kind: "resource",
+          resourceId: owner.value.resourceId,
+          discoveredRevision: owner.value.discoveredRevision,
+          resourceRevision: owner.value.resourceVersion.value
+        }
+    : owner?.case === "mcp"
+      ? owner.value.serverRevision?.value === undefined || owner.value.mcpServerId.trim() === ""
+        ? (() => { throw new GatewayError("Orchestrator returned an incomplete Extension MCP owner."); })()
+        : { kind: "mcp", serverId: owner.value.mcpServerId, serverRevision: owner.value.serverRevision.value }
+      : (() => { throw new GatewayError("Orchestrator returned an Extension without an owner."); })();
+  return {
+    id: extension.extensionId,
+    revision,
+    owner: mappedOwner,
+    source: extension.source === ProtoExtensionCatalogSource.LOCAL
+      ? "local"
+      : extension.source === ProtoExtensionCatalogSource.MARKET
+        ? "market"
+        : (() => { throw new GatewayError("Orchestrator returned an invalid Extension source."); })(),
+    installed: extension.installed,
+    installState: extensionInstallState(extension.installState),
+    name: extension.name,
+    ...(extension.version === undefined ? {} : { version: extension.version }),
+    ...(extension.author === undefined ? {} : { author: extension.author }),
+    description: extension.description,
+    enabled: extension.enabled,
+    sidebarSupported: extension.sidebarSupported,
+    sidebarVisible: extension.sidebarVisible,
+    tools: extension.tools.map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      requiresPermission: tool.requiresPermission
+    })),
+    permissions: extension.permissions.map((permission) => ({
+      id: permission.permissionId,
+      label: permission.label,
+      description: permission.description,
+      required: permission.required,
+      granted: permission.granted
+    })),
+    commands: extension.commands.map((command) => ({
+      name: command.name,
+      description: command.description,
+      sessionId: command.sessionId
+    })),
+    setup: {
+      state: extensionSetupState(setup.state),
+      ...(setup.attemptId === undefined ? {} : { attemptId: setup.attemptId }),
+      revision: setup.revision.value,
+      fields: setup.fields.map((field) => ({
+        id: field.fieldId,
+        label: field.label,
+        description: field.description,
+        kind: extensionSetupFieldKind(field.kind),
+        required: field.required,
+        configured: field.configured,
+        options: [...field.options]
+      })),
+      ...(setup.error === undefined ? {} : { error: setup.error })
+    },
+    useSupported: extension.useSupported,
+    ...(extension.error === undefined ? {} : { error: extension.error })
+  };
+}
+
+function extensionInstallState(value: ProtoExtensionInstallState): ExtensionCatalogEntryView["installState"] {
+  switch (value) {
+    case ProtoExtensionInstallState.AVAILABLE: return "available";
+    case ProtoExtensionInstallState.INSTALLING: return "installing";
+    case ProtoExtensionInstallState.INSTALLED: return "installed";
+    case ProtoExtensionInstallState.UPDATE_AVAILABLE: return "updateAvailable";
+    case ProtoExtensionInstallState.ERROR: return "error";
+    case ProtoExtensionInstallState.UNSPECIFIED:
+    default:
+      throw new GatewayError("Orchestrator returned an invalid Extension install state.");
+  }
+}
+
+function extensionSetupState(value: ProtoExtensionSetupState): ExtensionCatalogEntryView["setup"]["state"] {
+  switch (value) {
+    case ProtoExtensionSetupState.NOT_REQUIRED: return "notRequired";
+    case ProtoExtensionSetupState.REQUIRED: return "required";
+    case ProtoExtensionSetupState.IN_PROGRESS: return "inProgress";
+    case ProtoExtensionSetupState.READY: return "ready";
+    case ProtoExtensionSetupState.CANCELLED: return "cancelled";
+    case ProtoExtensionSetupState.FAILED: return "failed";
+    case ProtoExtensionSetupState.UNSPECIFIED:
+    default:
+      throw new GatewayError("Orchestrator returned an invalid Extension setup state.");
+  }
+}
+
+function extensionSetupFieldKind(value: ProtoExtensionSetupFieldKind): ExtensionCatalogEntryView["setup"]["fields"][number]["kind"] {
+  switch (value) {
+    case ProtoExtensionSetupFieldKind.TEXT: return "text";
+    case ProtoExtensionSetupFieldKind.SECRET: return "secret";
+    case ProtoExtensionSetupFieldKind.OAUTH: return "oauth";
+    case ProtoExtensionSetupFieldKind.CONFIRMATION: return "confirmation";
+    case ProtoExtensionSetupFieldKind.UNSPECIFIED:
+    default:
+      throw new GatewayError("Orchestrator returned an invalid Extension setup field.");
+  }
+}
+
 function mapRuntimeCommand(command: RuntimeCommand): RuntimeCommandView {
   return {
     id: command.commandId,
@@ -9530,6 +9813,7 @@ function mapRuntimeToolCatalog(catalog: RuntimeToolCatalog): RuntimeToolCatalogV
       return {
         name: tool.name,
         description: tool.description,
+        ...(tool.resourceId === "" ? {} : { resourceId: tool.resourceId }),
         fields: tool.inputSchema.fields.map((field) => ({
           path: field.fieldPath,
           title: field.title,

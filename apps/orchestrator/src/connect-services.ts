@@ -124,6 +124,13 @@ import type {
 } from "./credential-manager.js";
 import { ProviderAuthUnsupportedError } from "./credential-manager.js";
 import type { DiagnosticsBundleService } from "./diagnostics-bundle.js";
+import type {
+  ExtensionCatalogDescriptor as NativeExtensionCatalogDescriptor,
+  ExtensionCatalogManager,
+  ExtensionCatalogSnapshot as NativeExtensionCatalogSnapshot,
+  ExtensionRuntimeObservation
+} from "./extension-catalog.js";
+import { extensionMcpInput } from "./extension-catalog.js";
 import type { HistoryMaintenanceJob, HistoryMaintenanceResult, HistoryRetention } from "./history-maintenance.js";
 import type {
   PiProviderAuthFlowRecord,
@@ -364,6 +371,7 @@ interface ConnectServiceDependencies {
   readonly managedModelRuntime?: ManagedModelRuntimeController;
   readonly mcpRouter?: McpRouter;
   readonly piResources?: PiResourceManager;
+  readonly extensionCatalog?: ExtensionCatalogManager;
   readonly piBackendIds?: ReadonlySet<string>;
   readonly diagnosticsBundles?: DiagnosticsBundleService;
   readonly providerAuth?: PiProviderAuthSupervisor;
@@ -519,6 +527,7 @@ export interface ConnectServiceSet {
   readonly settings: ServiceImpl<typeof contract.SettingsService>;
   readonly managedModelRuntime: ServiceImpl<typeof contract.ManagedModelRuntimeService>;
   readonly tool: ServiceImpl<typeof contract.ToolService>;
+  readonly extension: ServiceImpl<typeof contract.ExtensionService>;
   readonly browser: ServiceImpl<typeof contract.BrowserService>;
   readonly remoteHost: ServiceImpl<typeof contract.RemoteHostService>;
   readonly sshKey: ServiceImpl<typeof contract.SshKeyService>;
@@ -838,6 +847,7 @@ export function registerConnectServices(router: ConnectRouter, application: Orch
   router.service(contract.SettingsService, withConnectErrors(services.settings));
   router.service(contract.ManagedModelRuntimeService, withConnectErrors(services.managedModelRuntime));
   router.service(contract.ToolService, withConnectErrors(services.tool));
+  router.service(contract.ExtensionService, withConnectErrors(services.extension));
   router.service(contract.BrowserService, withConnectErrors(services.browser));
   router.service(contract.RemoteHostService, withConnectErrors(services.remoteHost));
   router.service(contract.SshKeyService, withConnectErrors(services.sshKey));
@@ -892,6 +902,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
     ...(application.managedModelRuntime === undefined ? {} : { managedModelRuntime: application.managedModelRuntime }),
     ...(application.mcpRouter === undefined ? {} : { mcpRouter: application.mcpRouter }),
     ...(application.piResources === undefined ? {} : { piResources: application.piResources }),
+    ...(application.extensionCatalog === undefined ? {} : { extensionCatalog: application.extensionCatalog }),
     piBackendIds: new Set(application.adapters
       .filter((adapter): adapter is PiBackendAdapter => adapter instanceof PiBackendAdapter)
       .map((adapter) => adapter.id)),
@@ -3367,6 +3378,79 @@ export function createConnectServices(application: OrchestratorApplication): Con
     }
   } satisfies ServiceImpl<typeof contract.ToolService>;
 
+  const extension = {
+    listExtensions: async (request, context) => {
+      authenticate(context);
+      if (dependencies.extensionCatalog === undefined) {
+        return {
+          extensions: [],
+          catalogRevision: toProtoRevision(0n),
+          recoveredFromCorruption: false,
+          page: emptyPage(request.page)
+        };
+      }
+      const sessionId = request.sessionId === undefined
+        ? undefined
+        : nonBlankRequest(request.sessionId, "session_id");
+      const query = request.query.trim().toLocaleLowerCase("en-US");
+      if (query.length > 256) throw invalidArgument("query exceeds the supported length");
+      const snapshot = await currentExtensionCatalog(dependencies, sessionId);
+      const source = request.source === undefined ? undefined : nativeExtensionSource(request.source);
+      const values = snapshot.entries
+        .filter((entry) => source === undefined || entry.source === source)
+        .filter((entry) => request.installed === undefined || entry.installed === request.installed)
+        .filter((entry) => query === "" || extensionSearchText(entry).includes(query))
+        .map(mapExtensionCatalogEntry);
+      const result = paginate(values, request.page);
+      return {
+        extensions: result.values,
+        catalogRevision: toProtoRevision(snapshot.revision),
+        recoveredFromCorruption: snapshot.recoveredFromCorruption,
+        page: result.page
+      };
+    },
+    getExtension: async (request, context) => {
+      authenticate(context);
+      if (dependencies.extensionCatalog === undefined) {
+        throw new ConnectError("Extension catalog is unavailable.", Code.Unimplemented);
+      }
+      const extensionId = nonBlankRequest(request.extensionId, "extension_id");
+      const sessionId = request.sessionId === undefined
+        ? undefined
+        : nonBlankRequest(request.sessionId, "session_id");
+      const snapshot = await currentExtensionCatalog(dependencies, sessionId);
+      const entry = snapshot.entries.find((candidate) => candidate.id === extensionId);
+      if (entry === undefined) throw new ConnectError("Extension not found.", Code.NotFound);
+      return {
+        extension: mapExtensionCatalogEntry(entry),
+        catalogRevision: toProtoRevision(snapshot.revision),
+        recoveredFromCorruption: snapshot.recoveredFromCorruption
+      };
+    },
+    beginExtensionSetupCredentialUpload: (request, context) => {
+      const connection = authenticate(context);
+      if (dependencies.extensionCatalog === undefined || dependencies.credentials === undefined) {
+        throw new ConnectError("Protected Extension setup is unavailable.", Code.Unimplemented);
+      }
+      reconcileExtensionCatalog(dependencies);
+      const ticket = dependencies.extensionCatalog.beginSetupCredentialUpload({
+        extensionId: nonBlankRequest(request.extensionId, "extension_id"),
+        attemptId: nonBlankRequest(request.attemptId, "attempt_id"),
+        fieldId: nonBlankRequest(request.fieldId, "field_id"),
+        kind: nativeCredentialKind(request.kind, false),
+        connectionId: connection.id
+      });
+      return {
+        ticket: create(contract.CredentialUploadTicketSchema, {
+          ticketId: ticket.credentialUploadTicketId,
+          relativeEndpoint: `/v1/credentials/upload/${encodeURIComponent(ticket.credentialUploadTicketId)}`,
+          expiresAt: toProtoTimestamp(ticket.expiresAt),
+          maximumBytes: BigInt(ticket.maximumBytes)
+        })
+      };
+    }
+  } satisfies ServiceImpl<typeof contract.ExtensionService>;
+
   const browser = {
     listBrowserProviders: async (request, context) => {
       authenticate(context);
@@ -3656,7 +3740,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
     }
   } satisfies ServiceImpl<typeof contract.PiService>;
 
-  return { connection, event, operation, backend, target, session, portableSession, run, subagent, review, queue, scheduler, interaction, workspace, worktree, artifact, historyMaintenance, credential, settings, managedModelRuntime, tool, browser, remoteHost, sshKey, voiceInput, terminal, pi };
+  return { connection, event, operation, backend, target, session, portableSession, run, subagent, review, queue, scheduler, interaction, workspace, worktree, artifact, historyMaintenance, credential, settings, managedModelRuntime, tool, extension, browser, remoteHost, sshKey, voiceInput, terminal, pi };
 }
 
 function requireAuthentication(dependencies: ConnectServiceDependencies, context: HandlerContext): ConnectionRecord {
@@ -8329,6 +8413,204 @@ function mapMcpServerDescriptor(item: NativeMcpServerDescriptor): contract.McpSe
   });
 }
 
+function reconcileExtensionCatalog(dependencies: ConnectServiceDependencies): NativeExtensionCatalogSnapshot {
+  const catalog = dependencies.extensionCatalog;
+  if (catalog === undefined) return { revision: 0n, entries: [], recoveredFromCorruption: false };
+  return catalog.reconcile(
+    dependencies.piResources?.list() ?? [],
+    dependencies.mcpRouter?.list() ?? []
+  );
+}
+
+function requireExtensionMutation(
+  dependencies: ConnectServiceDependencies,
+  extensionId: string,
+  expectedRevision: bigint
+): NativeExtensionCatalogDescriptor {
+  const normalizedId = nonBlankRequest(extensionId, "extension_id");
+  if (dependencies.extensionCatalog === undefined) {
+    throw new ConnectError("Extension catalog is unavailable.", Code.Unimplemented);
+  }
+  const entry = reconcileExtensionCatalog(dependencies).entries.find((candidate) => candidate.id === normalizedId);
+  if (entry === undefined) throw new ConnectError("Extension not found.", Code.NotFound);
+  if (entry.revision !== expectedRevision) {
+    throw new ConnectError("Extension changed concurrently.", Code.Aborted);
+  }
+  return entry;
+}
+
+function extensionCatalogAction<T>(action: () => T): T {
+  try {
+    return action();
+  } catch (error) {
+    if (error instanceof ConnectError || error instanceof StoreError) throw error;
+    const message = redactSecrets(error instanceof Error ? error.message : "Extension catalog mutation failed.");
+    if (/not found/iu.test(message)) throw new ConnectError(message, Code.NotFound);
+    if (/concurrently|stale/iu.test(message)) throw new ConnectError(message, Code.Aborted);
+    if (/invalid/iu.test(message)) throw invalidArgument(message);
+    throw new ConnectError(message, Code.FailedPrecondition);
+  }
+}
+
+async function extensionCatalogEffect<T>(effect: () => Promise<T>): Promise<T> {
+  try {
+    return await effect();
+  } catch (error) {
+    if (error instanceof ConnectError || error instanceof StoreError) throw error;
+    const message = redactSecrets(error instanceof Error ? error.message : "Extension catalog mutation failed.");
+    if (/not found/iu.test(message)) throw new ConnectError(message, Code.NotFound);
+    if (/concurrently|stale/iu.test(message)) throw new ConnectError(message, Code.Aborted);
+    if (/invalid/iu.test(message)) throw invalidArgument(message);
+    throw new ConnectError(message, Code.FailedPrecondition);
+  }
+}
+
+async function currentExtensionCatalog(
+  dependencies: ConnectServiceDependencies,
+  sessionId?: string
+): Promise<NativeExtensionCatalogSnapshot> {
+  const reconciled = reconcileExtensionCatalog(dependencies);
+  if (sessionId === undefined || dependencies.extensionCatalog === undefined) return reconciled;
+  const session = dependencies.store.getSession(sessionId);
+  const backend = dependencies.store.getBackend(session.descriptor.backendId).descriptor;
+  const commands = await dependencies.sessionHost.getCommands(sessionId);
+  const runtime: ExtensionRuntimeObservation = {
+    sessionId,
+    commands,
+    ...(backend.capabilities.get("runtime.tools")?.supported === true
+      ? { tools: (await dependencies.sessionHost.getRuntimeTools(sessionId)).tools }
+      : {})
+  };
+  return dependencies.extensionCatalog.snapshot(runtime);
+}
+
+function extensionSearchText(entry: NativeExtensionCatalogDescriptor): string {
+  return [
+    entry.name,
+    entry.description,
+    entry.author ?? "",
+    ...entry.tools.flatMap((tool) => [tool.name, tool.description]),
+    ...entry.permissions.flatMap((permission) => [permission.label, permission.description])
+  ].join("\n").toLocaleLowerCase("en-US");
+}
+
+function mapExtensionCatalogEntry(item: NativeExtensionCatalogDescriptor): contract.ExtensionCatalogEntry {
+  return create(contract.ExtensionCatalogEntrySchema, {
+    extensionId: item.id,
+    revision: toProtoRevision(item.revision),
+    owner: create(contract.ExtensionOwnerSchema, {
+      kind: item.owner.kind === "resource"
+        ? {
+            case: "resource",
+            value: create(contract.ExtensionResourceOwnerSchema, {
+              resourceId: item.owner.resourceId,
+              discoveredRevision: item.owner.discoveredRevision,
+              resourceVersion: toProtoRevision(item.owner.resourceVersion)
+            })
+          }
+        : {
+            case: "mcp",
+            value: create(contract.ExtensionMcpOwnerSchema, {
+              mcpServerId: item.owner.serverId,
+              serverRevision: toProtoRevision(item.owner.serverRevision)
+            })
+          }
+    }),
+    source: item.source === "local" ? contract.ExtensionCatalogSource.LOCAL : contract.ExtensionCatalogSource.MARKET,
+    installed: item.installed,
+    installState: protoExtensionInstallState(item.installState),
+    name: item.name,
+    ...(item.version === undefined ? {} : { version: item.version }),
+    ...(item.author === undefined ? {} : { author: item.author }),
+    description: item.description,
+    enabled: item.enabled,
+    sidebarSupported: item.sidebarSupported,
+    sidebarVisible: item.sidebarVisible,
+    tools: item.tools.map((tool) => create(contract.ExtensionToolDescriptorSchema, {
+      name: tool.name,
+      description: tool.description,
+      requiresPermission: tool.requiresPermission
+    })),
+    permissions: item.permissions.map((permission) => create(contract.ExtensionPermissionDescriptorSchema, {
+      permissionId: permission.id,
+      label: permission.label,
+      description: permission.description,
+      required: permission.required,
+      granted: permission.granted
+    })),
+    commands: item.commands.map((command) => create(contract.ExtensionCommandDescriptorSchema, {
+      name: command.name,
+      description: command.description,
+      sessionId: command.sessionId
+    })),
+    setup: create(contract.ExtensionSetupDescriptorSchema, {
+      state: protoExtensionSetupState(item.setup.state),
+      ...(item.setup.attemptId === undefined ? {} : { attemptId: item.setup.attemptId }),
+      revision: toProtoRevision(item.setup.revision),
+      fields: item.setup.fields.map((field) => create(contract.ExtensionSetupFieldDescriptorSchema, {
+        fieldId: field.id,
+        label: field.label,
+        description: field.description,
+        kind: protoExtensionSetupFieldKind(field.kind),
+        required: field.required,
+        configured: field.configured,
+        options: [...field.options]
+      })),
+      ...(item.setup.error === undefined ? {} : { error: item.setup.error })
+    }),
+    useSupported: item.useSupported,
+    ...(item.error === undefined ? {} : { error: item.error })
+  });
+}
+
+function mapExtensionCatalogSnapshot(item: NativeExtensionCatalogSnapshot): contract.ExtensionCatalogSnapshot {
+  return create(contract.ExtensionCatalogSnapshotSchema, {
+    revision: toProtoRevision(item.revision),
+    entries: item.entries.map(mapExtensionCatalogEntry),
+    recoveredFromCorruption: item.recoveredFromCorruption
+  });
+}
+
+function nativeExtensionSource(value: contract.ExtensionCatalogSource): NativeExtensionCatalogDescriptor["source"] {
+  if (value === contract.ExtensionCatalogSource.LOCAL) return "local";
+  if (value === contract.ExtensionCatalogSource.MARKET) return "market";
+  throw invalidArgument("source is invalid");
+}
+
+function protoExtensionInstallState(
+  value: NativeExtensionCatalogDescriptor["installState"]
+): contract.ExtensionInstallState {
+  switch (value) {
+    case "available": return contract.ExtensionInstallState.AVAILABLE;
+    case "installing": return contract.ExtensionInstallState.INSTALLING;
+    case "installed": return contract.ExtensionInstallState.INSTALLED;
+    case "update_available": return contract.ExtensionInstallState.UPDATE_AVAILABLE;
+    case "error": return contract.ExtensionInstallState.ERROR;
+  }
+}
+
+function protoExtensionSetupState(value: NativeExtensionCatalogDescriptor["setup"]["state"]): contract.ExtensionSetupState {
+  switch (value) {
+    case "not_required": return contract.ExtensionSetupState.NOT_REQUIRED;
+    case "required": return contract.ExtensionSetupState.REQUIRED;
+    case "in_progress": return contract.ExtensionSetupState.IN_PROGRESS;
+    case "ready": return contract.ExtensionSetupState.READY;
+    case "cancelled": return contract.ExtensionSetupState.CANCELLED;
+    case "failed": return contract.ExtensionSetupState.FAILED;
+  }
+}
+
+function protoExtensionSetupFieldKind(
+  value: NativeExtensionCatalogDescriptor["setup"]["fields"][number]["kind"]
+): contract.ExtensionSetupFieldKind {
+  switch (value) {
+    case "text": return contract.ExtensionSetupFieldKind.TEXT;
+    case "secret": return contract.ExtensionSetupFieldKind.SECRET;
+    case "oauth": return contract.ExtensionSetupFieldKind.OAUTH;
+    case "confirmation": return contract.ExtensionSetupFieldKind.CONFIRMATION;
+  }
+}
+
 function mapMcpToolDescriptor(
   item: NativeMcpServerDescriptor["tools"][number],
   toolProviderId = `mcp:${item.serverId}`
@@ -8439,6 +8721,7 @@ function mapRuntimeToolCatalog(item: RuntimeToolCatalog): contract.RuntimeToolCa
       inputSchema: mapDynamicToolInputSchema(tool.inputSchema),
       promptGuidelines: [...tool.promptGuidelines],
       active: tool.active,
+      resourceId: tool.resourceId ?? "",
       sourceInfo: create(contract.RuntimeToolSourceInfoSchema, {
         path: tool.sourceInfo.path,
         source: tool.sourceInfo.source,
@@ -9312,6 +9595,9 @@ async function enrichSnapshot(
     : [];
   const browserTransfers = includeBrowser ? [...(dependencies.browserTransfers?.list({}) ?? [])] : [];
   const resources = dependencies.piResources?.list(resourceFilterForScope(dependencies, scope)).map(mapManagedResource) ?? projected.resources;
+  const extensionCatalog = owner
+    ? mapExtensionCatalogSnapshot(reconcileExtensionCatalog(dependencies))
+    : projected.extensionCatalog;
   const sessions = projected.sessions;
   const pi = await durablePiSnapshot(
     dependencies,
@@ -9341,6 +9627,7 @@ async function enrichSnapshot(
     mcpServers,
     browsers,
     resources,
+    extensionCatalog,
     settings: owner ? settingsSnapshot(dependencies) : projected.settings,
     browserTransfers,
     pi
@@ -15521,6 +15808,205 @@ async function dispatchMutation(
         false,
         () => dependencies.piResources!.prepareRemove(payload.value.resourceId)
       );
+    }
+    case "setExtensionEnabled": {
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "set_extension_enabled.expected_revision");
+      const entry = requireExtensionMutation(dependencies, payload.value.extensionId, expectedRevision);
+      if (entry.owner.kind === "resource") {
+        const resourceId = entry.owner.resourceId;
+        if (dependencies.piResources === undefined) {
+          return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The managed Resource authority is unavailable.");
+        }
+        const result = await preparedResourceEffectOperation(
+          dependencies,
+          operationId,
+          connection,
+          mutation,
+          payload.case,
+          resourceId,
+          payload.value.enabled,
+          () => {
+            const current = requireExtensionMutation(dependencies, entry.id, expectedRevision);
+            if (current.owner.kind !== "resource" || current.owner.resourceId !== resourceId) {
+              throw new ConnectError("Extension owner changed concurrently.", Code.Aborted);
+            }
+            return dependencies.piResources!.prepareSetEnabled(current.owner.resourceId, payload.value.enabled);
+          }
+        );
+        reconcileExtensionCatalog(dependencies);
+        return result;
+      }
+      if (dependencies.mcpRouter === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The MCP authority is unavailable.");
+      }
+      const serverId = entry.owner.serverId;
+      return effectOperation(dependencies, operationId, connection, mutation, payload.case, {
+        accepted: true,
+        resultCase: "acknowledgement",
+        entityId: entry.id
+      }, async () => extensionCatalogEffect(async () => {
+        const current = requireExtensionMutation(dependencies, entry.id, expectedRevision);
+        if (current.owner.kind !== "mcp" || current.owner.serverId !== serverId) {
+          throw new ConnectError("Extension owner changed concurrently.", Code.Aborted);
+        }
+        const server = dependencies.mcpRouter!.list().find((candidate) => candidate.id === serverId);
+        if (server === undefined) throw new ConnectError("Extension MCP owner not found.", Code.NotFound);
+        await dependencies.mcpRouter!.upsert(extensionMcpInput(server, payload.value.enabled), server.version);
+        await dependencies.refreshPiGeneration?.();
+        reconcileExtensionCatalog(dependencies);
+      }));
+    }
+    case "setExtensionSidebarVisible": {
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "set_extension_sidebar_visible.expected_revision");
+      return presented(await host.mutate({
+        operationId,
+        connection,
+        kind: payload.case,
+        body: mutation,
+        commit: () => {
+          const current = requireExtensionMutation(dependencies, payload.value.extensionId, expectedRevision);
+          extensionCatalogAction(() => dependencies.extensionCatalog!.setSidebarVisible(
+            current.id,
+            payload.value.visible,
+            expectedRevision
+          ));
+          return { accepted: true, resultCase: "acknowledgement", entityId: current.id } satisfies OperationOutcome;
+        }
+      }));
+    }
+    case "beginExtensionSetup": {
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "begin_extension_setup.expected_revision");
+      return presented(await host.mutate({
+        operationId,
+        connection,
+        kind: payload.case,
+        body: mutation,
+        commit: () => {
+          const current = requireExtensionMutation(dependencies, payload.value.extensionId, expectedRevision);
+          extensionCatalogAction(() => dependencies.extensionCatalog!.beginSetup(current.id, expectedRevision));
+          return { accepted: true, resultCase: "acknowledgement", entityId: current.id } satisfies OperationOutcome;
+        }
+      }));
+    }
+    case "submitExtensionSetupInteraction": {
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "submit_extension_setup_interaction.expected_revision");
+      const setupValue = payload.value.value.case === "text"
+        ? payload.value.value.value
+        : payload.value.value.case === "confirmed"
+          ? payload.value.value.value
+          : undefined;
+      if (setupValue === undefined) throw invalidArgument("setup interaction value is required");
+      return presented(await host.mutate({
+        operationId,
+        connection,
+        kind: payload.case,
+        body: mutation,
+        commit: () => {
+          const current = requireExtensionMutation(dependencies, payload.value.extensionId, expectedRevision);
+          extensionCatalogAction(() => dependencies.extensionCatalog!.submitSetupInteraction({
+            extensionId: current.id,
+            attemptId: nonBlankRequest(payload.value.attemptId, "attempt_id"),
+            fieldId: nonBlankRequest(payload.value.fieldId, "field_id"),
+            value: setupValue,
+            expectedRevision
+          }));
+          return { accepted: true, resultCase: "acknowledgement", entityId: current.id } satisfies OperationOutcome;
+        }
+      }));
+    }
+    case "commitExtensionSetupCredential": {
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "commit_extension_setup_credential.expected_revision");
+      const entry = requireExtensionMutation(dependencies, payload.value.extensionId, expectedRevision);
+      return effectOperation(dependencies, operationId, connection, mutation, payload.case, {
+        accepted: true,
+        resultCase: "acknowledgement",
+        entityId: entry.id
+      }, async () => extensionCatalogEffect(async () => {
+        requireExtensionMutation(dependencies, entry.id, expectedRevision);
+        await dependencies.extensionCatalog!.commitSetupCredential({
+          extensionId: entry.id,
+          attemptId: nonBlankRequest(payload.value.attemptId, "attempt_id"),
+          fieldId: nonBlankRequest(payload.value.fieldId, "field_id"),
+          credentialUploadTicketId: nonBlankRequest(payload.value.credentialUploadTicketId, "credential_upload_ticket_id"),
+          connectionId: connection.id,
+          expectedRevision
+        });
+      }));
+    }
+    case "completeExtensionSetup": {
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "complete_extension_setup.expected_revision");
+      const entry = requireExtensionMutation(dependencies, payload.value.extensionId, expectedRevision);
+      const attemptId = nonBlankRequest(payload.value.attemptId, "attempt_id");
+      return effectOperation(dependencies, operationId, connection, mutation, payload.case, {
+        accepted: true,
+        resultCase: "acknowledgement",
+        entityId: entry.id
+      }, async () => extensionCatalogEffect(async () => {
+        const current = requireExtensionMutation(dependencies, entry.id, expectedRevision);
+        dependencies.extensionCatalog!.completeSetup(current.id, attemptId, expectedRevision);
+        if (current.owner.kind === "mcp" && dependencies.mcpRouter !== undefined) {
+          const serverId = current.owner.serverId;
+          const server = dependencies.mcpRouter.list().find((candidate) => candidate.id === serverId);
+          if (server === undefined) throw new ConnectError("Extension MCP owner not found.", Code.NotFound);
+          if (server.enabled) {
+            const restarted = await dependencies.mcpRouter.restart(server.id);
+            await dependencies.refreshPiGeneration?.();
+            if (restarted.state === "error") {
+              dependencies.extensionCatalog!.failSetup(current.id, attemptId, "Connection could not be verified.");
+              reconcileExtensionCatalog(dependencies);
+              throw new ConnectError("Extension connection could not be verified.", Code.Unavailable);
+            }
+          }
+        }
+        reconcileExtensionCatalog(dependencies);
+      }));
+    }
+    case "cancelExtensionSetup": {
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "cancel_extension_setup.expected_revision");
+      return presented(await host.mutate({
+        operationId,
+        connection,
+        kind: payload.case,
+        body: mutation,
+        commit: () => {
+          const current = requireExtensionMutation(dependencies, payload.value.extensionId, expectedRevision);
+          extensionCatalogAction(() => dependencies.extensionCatalog!.cancelSetup(
+            current.id,
+            nonBlankRequest(payload.value.attemptId, "attempt_id"),
+            expectedRevision
+          ));
+          return { accepted: true, resultCase: "acknowledgement", entityId: current.id } satisfies OperationOutcome;
+        }
+      }));
+    }
+    case "revokeExtensionSetup": {
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "revoke_extension_setup.expected_revision");
+      const entry = requireExtensionMutation(dependencies, payload.value.extensionId, expectedRevision);
+      return effectOperation(dependencies, operationId, connection, mutation, payload.case, {
+        accepted: true,
+        resultCase: "acknowledgement",
+        entityId: entry.id
+      }, async () => extensionCatalogEffect(async () => {
+        const current = requireExtensionMutation(dependencies, entry.id, expectedRevision);
+        await dependencies.extensionCatalog!.revokeSetup(current.id, expectedRevision);
+        if (current.owner.kind === "mcp" && dependencies.mcpRouter !== undefined) {
+          const serverId = current.owner.serverId;
+          const server = dependencies.mcpRouter.list().find((candidate) => candidate.id === serverId);
+          if (server?.enabled === true) {
+            await dependencies.mcpRouter.restart(server.id);
+            await dependencies.refreshPiGeneration?.();
+          }
+        }
+        reconcileExtensionCatalog(dependencies);
+      }));
     }
     case "abortToolCall": {
       const projected = listProjectedToolCalls(dependencies.store).find((item) => item.value.toolCallId === payload.value.toolCallId);

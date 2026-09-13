@@ -5,7 +5,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, describe, expect, it, onTestFinished, vi } from "vitest";
 
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
-import { emptySnapshot, type ScheduleView, type SessionView } from "../model.js";
+import { emptySnapshot, type ExtensionCatalogEntryView, type ScheduleView, type SessionView } from "../model.js";
 import { DEFAULT_SIDEBAR_OWNER_LAYOUT, SIDEBAR_DIALOGUE_FILTER_ID, type SidebarDisplayPreferences } from "../sidebar-layout.js";
 import { Sidebar, type SidebarProps } from "./Sidebar.js";
 import { SIDEBAR_HOVER_CARD_CLOSE_DELAY_MS, SIDEBAR_HOVER_CARD_OPEN_DELAY_MS } from "./SidebarHoverCard.js";
@@ -27,6 +27,35 @@ afterEach(async () => {
 });
 
 describe("Sidebar organizer display controls", () => {
+  it("shows only ready enabled Extension shortcuts and opens their exact catalog detail", async () => {
+    const onNavigate = vi.fn();
+    const onClose = vi.fn();
+    const ready = sidebarExtension();
+    const snapshot = {
+      ...emptySnapshot(),
+      revision: 1n,
+      server: { name: "Orchestrator", version: "test", health: "healthy" as const },
+      extensions: [
+        ready,
+        { ...ready, id: "extension_11111111111111111111111111111111", name: "Needs setup", setup: { ...ready.setup, state: "required" as const } },
+        { ...ready, id: "extension_22222222222222222222222222222222", name: "Disabled", enabled: false },
+        { ...ready, id: "extension_33333333333333333333333333333333", name: "Hidden", sidebarVisible: false }
+      ]
+    };
+    const rendered = await renderSidebar(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, vi.fn(), {
+      snapshot,
+      onNavigate,
+      onClose
+    });
+
+    const shortcuts = rendered.container.querySelectorAll<HTMLButtonElement>(".sidebar-extension-shortcuts [data-extension-id]");
+    expect(shortcuts).toHaveLength(1);
+    expect(shortcuts[0]?.textContent).toContain("Ready extension");
+    await act(async () => shortcuts[0]?.click());
+    expect(onNavigate).toHaveBeenCalledWith({ kind: "tools", extensionId: ready.id });
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
   it("offers created-time sorting through the organizer", async () => {
     const onPreferencesChange = vi.fn();
     const rendered = await renderSidebar(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, onPreferencesChange);
@@ -1337,6 +1366,32 @@ function installDragPreviewTokens(): void {
   style.setProperty("--text", "#0d0d0d");
   style.setProperty("--text-soft", "#5f5f5f");
   style.setProperty("--accent", "#ff9800");
+}
+
+function sidebarExtension(): ExtensionCatalogEntryView {
+  return {
+    id: "extension_0123456789abcdef0123456789abcdef",
+    revision: 1n,
+    owner: {
+      kind: "resource",
+      resourceId: "resource-1",
+      discoveredRevision: "sha256:owner",
+      resourceRevision: 1n
+    },
+    source: "local",
+    installed: true,
+    installState: "installed",
+    name: "Ready extension",
+    description: "A ready sidebar extension",
+    enabled: true,
+    sidebarSupported: true,
+    sidebarVisible: true,
+    tools: [],
+    permissions: [],
+    commands: [],
+    setup: { state: "ready", attemptId: "attempt-1", revision: 1n, fields: [] },
+    useSupported: false
+  };
 }
 
 function buttonWithText(container: ParentNode, text: string): HTMLButtonElement {

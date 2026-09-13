@@ -194,7 +194,68 @@ message OperationMutation {
     ClearProviderCredentialSurfaceMutation clear_provider_credential_surface = 178;
     UpdateAuxiliaryTextSettingsMutation update_auxiliary_text_settings = 179;
     UpdateSubagentModelSettingsMutation update_subagent_model_settings = 180;
+    SetExtensionEnabledMutation set_extension_enabled = 181;
+    SetExtensionSidebarVisibleMutation set_extension_sidebar_visible = 182;
+    BeginExtensionSetupMutation begin_extension_setup = 183;
+    SubmitExtensionSetupInteractionMutation submit_extension_setup_interaction = 184;
+    CommitExtensionSetupCredentialMutation commit_extension_setup_credential = 185;
+    CompleteExtensionSetupMutation complete_extension_setup = 186;
+    CancelExtensionSetupMutation cancel_extension_setup = 187;
+    RevokeExtensionSetupMutation revoke_extension_setup = 188;
   }
+}
+
+message SetExtensionEnabledMutation {
+  string extension_id = 1;
+  bool enabled = 2;
+  Revision expected_revision = 3;
+}
+
+message SetExtensionSidebarVisibleMutation {
+  string extension_id = 1;
+  bool visible = 2;
+  Revision expected_revision = 3;
+}
+
+message BeginExtensionSetupMutation {
+  string extension_id = 1;
+  Revision expected_revision = 2;
+}
+
+message SubmitExtensionSetupInteractionMutation {
+  string extension_id = 1;
+  string attempt_id = 2;
+  string field_id = 3;
+  oneof value {
+    string text = 4;
+    bool confirmed = 5;
+  }
+  Revision expected_revision = 6;
+}
+
+message CommitExtensionSetupCredentialMutation {
+  string extension_id = 1;
+  string attempt_id = 2;
+  string field_id = 3;
+  string credential_upload_ticket_id = 4;
+  Revision expected_revision = 5;
+}
+
+message CompleteExtensionSetupMutation {
+  string extension_id = 1;
+  string attempt_id = 2;
+  Revision expected_revision = 3;
+}
+
+message CancelExtensionSetupMutation {
+  string extension_id = 1;
+  string attempt_id = 2;
+  Revision expected_revision = 3;
+}
+
+message RevokeExtensionSetupMutation {
+  string extension_id = 1;
+  Revision expected_revision = 2;
 }
 
 message UpdateVoiceInputServiceSettingsMutation {

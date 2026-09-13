@@ -341,6 +341,7 @@ describe("Backend-neutral live runtime tools", () => {
             tools: [{
               name: "project_search",
               description: "Search the project.",
+              resourceId: "resource-project-search",
               active: true,
               promptGuidelines: ["Prefer exact terms."],
               inputSchema: {
@@ -384,6 +385,7 @@ describe("Backend-neutral live runtime tools", () => {
       tools: [{
         name: "project_search",
         description: "Search the project.",
+        resourceId: "resource-project-search",
         active: true,
         promptGuidelines: ["Prefer exact terms."],
         fields: [{

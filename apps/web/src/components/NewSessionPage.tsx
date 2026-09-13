@@ -28,6 +28,7 @@ import {
 import { modelPreferenceOwnerId } from "../model-picker-preferences.js";
 import { remapComposerInlineMentionReplacement } from "../composer-mention-ranges.js";
 import { composerMentionsAllowed, resolveComposerMentionPolicy } from "../composer-mention-policy.js";
+import { applyPendingExtensionUse, resolvePendingExtensionUse } from "../extension-use-handoff.js";
 import type {
   AppSnapshot,
   AttachmentDraft,
@@ -222,6 +223,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const fullAccessConfirmationRef = useRef<FullAccessConfirmation | undefined>(undefined);
   const mountedRef = useRef(true);
   const controllerRef = useRef(controller);
+  const translatorRef = useRef(t);
   const draftSaveChainRef = useRef<Promise<void>>(Promise.resolve());
   const restoredExecutionRef = useRef<NewSessionLocalDraft | undefined>(undefined);
   const typedPaletteTriggerRef = useRef<"/" | "@" | undefined>(undefined);
@@ -232,6 +234,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const suppressedCommandFromRef = useRef<number | undefined>(undefined);
   const worktreeProbeSequenceRef = useRef(0);
   controllerRef.current = controller;
+  translatorRef.current = t;
   editorDocumentRef.current = editorDocument;
   textRef.current = text;
   mentionsRef.current = mentions;
@@ -541,42 +544,92 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
 
   useEffect(() => {
     let cancelled = false;
+    const requestController = new AbortController();
     setHydrated(false);
+    setDraftError(undefined);
     setSelection(requestedSelection ?? defaultNewSessionSelection(activeTargets, eligibleDialogueBackends));
-    void controllerRef.current.readNewSessionDraft().then((draft) => {
-      if (cancelled || draft === undefined) return;
-      const restoredSelection = requestedSelection
-        ?? parseNewSessionSelection(newSessionSelectionValue(draft.selection), activeTargets, eligibleDialogueBackends)
-        ?? defaultNewSessionSelection(activeTargets, eligibleDialogueBackends);
-      if (restoredSelection === undefined) return;
-      const restored = { ...draft, selection: restoredSelection };
-      const restoredDocument = normalizeComposerDocument(restored.editorDocument, restored.text);
-      const restoredText = composerDocumentPlainText(restoredDocument);
-      const restoredRanges = restoreComposerInlineMentionRanges(restoredText, restored.mentions, restored.inlineMentionRanges);
+    void (async () => {
+      const pendingReader = typeof controllerRef.current.readPendingExtensionUse === "function"
+        ? controllerRef.current.readPendingExtensionUse()
+        : Promise.resolve(undefined);
+      const [draftResult, pendingResult] = await Promise.allSettled([
+        controllerRef.current.readNewSessionDraft(),
+        pendingReader
+      ]);
+      if (cancelled) return;
+      const draft = draftResult.status === "fulfilled" ? draftResult.value : undefined;
+      const pending = pendingResult.status === "fulfilled" ? pendingResult.value : undefined;
+      let hydrationError = draftResult.status === "rejected"
+        ? messageOf(draftResult.reason)
+        : pendingResult.status === "rejected" ? messageOf(pendingResult.reason) : undefined;
+      const restoredSelection = draft === undefined
+        ? requestedSelection ?? defaultNewSessionSelection(activeTargets, eligibleDialogueBackends)
+        : requestedSelection
+          ?? parseNewSessionSelection(newSessionSelectionValue(draft.selection), activeTargets, eligibleDialogueBackends)
+          ?? defaultNewSessionSelection(activeTargets, eligibleDialogueBackends);
+      const restored = draft === undefined || restoredSelection === undefined
+        ? undefined
+        : { ...draft, selection: restoredSelection };
+      let restoredDocument = normalizeComposerDocument(draft?.editorDocument, draft?.text ?? "");
+      let restoredText = composerDocumentPlainText(restoredDocument);
+      const restoredMentions = draft?.mentions ?? [];
+      let restoredRanges = restoreComposerInlineMentionRanges(restoredText, restoredMentions, draft?.inlineMentionRanges);
+
+      if (pending !== undefined) {
+        try {
+          const catalog = await controllerRef.current.getExtension(
+            pending.extensionId,
+            pending.runtimeSessionId,
+            requestController.signal
+          );
+          if (cancelled) return;
+          const extension = resolvePendingExtensionUse(pending, catalog);
+          const applied = extension === undefined
+            ? undefined
+            : applyPendingExtensionUse(restoredDocument, restoredRanges, pending.commandName);
+          if (applied === undefined) {
+            hydrationError = translatorRef.current("extensions.useExpired");
+          } else {
+            restoredDocument = applied.document;
+            restoredText = applied.text;
+            restoredRanges = applied.inlineMentionRanges;
+          }
+          await controllerRef.current.clearPendingExtensionUse();
+        } catch (error) {
+          if (requestController.signal.aborted) return;
+          hydrationError = messageOf(error);
+        }
+      }
+      if (cancelled) return;
+
       restoredExecutionRef.current = restored;
       setSelection(restoredSelection);
       editorDocumentRef.current = restoredDocument;
       setEditorDocument(restoredDocument);
       textRef.current = restoredText;
       setText(restoredText);
-      replaceMentions(restored.mentions, restoredRanges);
+      replaceMentions(restoredMentions, restoredRanges);
       setAttachments((current) => {
         revokeAttachments(current);
-        return restored.attachments.map(withAttachmentPreview);
+        return (draft?.attachments ?? []).map(withAttachmentPreview);
       });
-      setStartKind(restored.nativeStart.kind);
-      setNativeReference(restored.nativeStart.kind === "attach" ? restored.nativeStart.reference : "");
+      setStartKind(draft?.nativeStart.kind ?? "fresh");
+      setNativeReference(draft?.nativeStart.kind === "attach" ? draft.nativeStart.reference : "");
       setNativeSelectionWarning(undefined);
-      setWorktreeEnabled(restored.worktree?.enabled ?? controllerRef.current.state.preferences.newSessionWorktreeEnabled);
-      setWorktreeSourceRef(restored.worktree?.sourceRef);
-      setRefreshWorktreeRemote(restored.worktree?.refreshRemote ?? false);
+      setWorktreeEnabled(draft?.worktree?.enabled ?? controllerRef.current.state.preferences.newSessionWorktreeEnabled);
+      setWorktreeSourceRef(draft?.worktree?.sourceRef);
+      setRefreshWorktreeRemote(draft?.worktree?.refreshRemote ?? false);
+      setDraftError(hydrationError);
       setHydrationRevision((current) => current + 1);
-    }).catch((error: unknown) => {
+    })().catch((error: unknown) => {
       if (!cancelled) setDraftError(messageOf(error));
     }).finally(() => {
       if (!cancelled) setHydrated(true);
     });
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      requestController.abort();
+    };
   }, [initialDialogueBackendId, initialTargetId, profileScope]);
 
   useEffect(() => {

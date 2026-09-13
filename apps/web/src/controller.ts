@@ -46,6 +46,7 @@ import type {
   NativeSessionTreeView,
   NewSessionDraft,
   NewSessionLocalDraft,
+  PendingExtensionUseView,
   SessionMessageSearchCollectionOptions,
   Theme
 } from "./model.js";
@@ -90,7 +91,7 @@ export type AppRoute =
   | { readonly kind: "newSession"; readonly targetId?: string; readonly dialogueBackendId?: string }
   | { readonly kind: "projects"; readonly projectId?: string }
   | { readonly kind: "schedules"; readonly scheduleId?: string }
-  | { readonly kind: "tools" }
+  | { readonly kind: "tools"; readonly extensionId?: string }
   | { readonly kind: "settings" };
 
 export interface BrowserInspectorFocusRequest {
@@ -192,6 +193,9 @@ export interface AppController extends OperationApi {
   readNewSessionDraft(): Promise<NewSessionLocalDraft | undefined>;
   saveNewSessionDraft(draft: NewSessionLocalDraft): Promise<void>;
   clearNewSessionDraft(): Promise<void>;
+  readPendingExtensionUse(): Promise<PendingExtensionUseView | undefined>;
+  savePendingExtensionUse(value: PendingExtensionUseView): Promise<void>;
+  clearPendingExtensionUse(): Promise<void>;
 }
 
 export interface ConnectionSelectionOptions {
@@ -1579,7 +1583,10 @@ export function useAppController(): AppController {
     return {
       readNewSessionDraft: (): Promise<NewSessionLocalDraft | undefined> => requireLocal(draftStore).readNewSessionDraft(scope()),
       saveNewSessionDraft: (draft: NewSessionLocalDraft): Promise<void> => requireLocal(draftStore).saveNewSessionDraft(scope(), draft),
-      clearNewSessionDraft: (): Promise<void> => requireLocal(draftStore).clearNewSessionDraft(scope())
+      clearNewSessionDraft: (): Promise<void> => requireLocal(draftStore).clearNewSessionDraft(scope()),
+      readPendingExtensionUse: (): Promise<PendingExtensionUseView | undefined> => requireLocal(draftStore).readPendingExtensionUse(scope()),
+      savePendingExtensionUse: (value: PendingExtensionUseView): Promise<void> => requireLocal(draftStore).savePendingExtensionUse(scope(), value),
+      clearPendingExtensionUse: (): Promise<void> => requireLocal(draftStore).clearPendingExtensionUse(scope())
     };
   }, [draftStore, newTaskDraftScope, artifactGateway]);
   const readDraft = useCallback<AppController["readDraft"]>((sessionId) => {
@@ -2016,6 +2023,20 @@ export function useAppController(): AppController {
       gateway().resetModelPriceOverride(backendId, providerId, modelId, signal),
     terminateRuntimeProcess: (process) => gateway().terminateRuntimeProcess(process),
     listRuntimeTools: (sessionId) => gateway().listRuntimeTools(sessionId),
+    listExtensions: (options) => gateway().listExtensions(options),
+    getExtension: (extensionId, sessionId, signal) => gateway().getExtension(extensionId, sessionId, signal),
+    setExtensionEnabled: (extensionId, enabled, expectedRevision) => gateway().setExtensionEnabled(extensionId, enabled, expectedRevision),
+    setExtensionSidebarVisible: (extensionId, visible, expectedRevision) => gateway().setExtensionSidebarVisible(extensionId, visible, expectedRevision),
+    beginExtensionSetup: (extensionId, expectedRevision) => gateway().beginExtensionSetup(extensionId, expectedRevision),
+    submitExtensionSetupInteraction: (extensionId, attemptId, fieldId, value, expectedRevision) =>
+      gateway().submitExtensionSetupInteraction(extensionId, attemptId, fieldId, value, expectedRevision),
+    saveExtensionSetupCredential: (extensionId, attemptId, fieldId, kind, secret, expectedRevision, signal) =>
+      gateway().saveExtensionSetupCredential(extensionId, attemptId, fieldId, kind, secret, expectedRevision, signal),
+    completeExtensionSetup: (extensionId, attemptId, expectedRevision) =>
+      gateway().completeExtensionSetup(extensionId, attemptId, expectedRevision),
+    cancelExtensionSetup: (extensionId, attemptId, expectedRevision) =>
+      gateway().cancelExtensionSetup(extensionId, attemptId, expectedRevision),
+    revokeExtensionSetup: (extensionId, expectedRevision) => gateway().revokeExtensionSetup(extensionId, expectedRevision),
     listBackgroundTasks: (sessionId) => gateway().listBackgroundTasks(sessionId),
     cancelBackgroundTask: (sessionId, backgroundTaskId) => gateway().cancelBackgroundTask(sessionId, backgroundTaskId),
     listSubagentRuns: (sessionId, state, pageToken, pageSize) => gateway().listSubagentRuns(sessionId, state, pageToken, pageSize),
@@ -2756,7 +2777,13 @@ export function routeFromHash(hash: string): AppRoute {
     };
   }
   if (parts[0] === "projects") return { kind: "projects", ...(parts[1] === undefined ? {} : { projectId: parts[1] }) };
-  if (parts[0] === "tools") return { kind: "tools" };
+  if (parts[0] === "tools") {
+    const extensionId = query.get("extension")?.trim();
+    return {
+      kind: "tools",
+      ...(extensionId !== undefined && /^extension_[a-f0-9]{32}$/u.test(extensionId) ? { extensionId } : {})
+    };
+  }
   if (parts[0] === "settings") return { kind: "settings" };
   if (parts[0] === "tasks" && parts[1] === "new") {
     const targetId = query.get("target")?.trim();
@@ -2810,6 +2837,11 @@ export function appRouteHash(route: AppRoute): string {
     const query = new URLSearchParams();
     if (route.scheduleId !== undefined) query.set("focus", route.scheduleId);
     return `#/schedules${query.size === 0 ? "" : `?${query.toString()}`}`;
+  }
+  if (route.kind === "tools") {
+    const query = new URLSearchParams();
+    if (route.extensionId !== undefined) query.set("extension", route.extensionId);
+    return `#/tools${query.size === 0 ? "" : `?${query.toString()}`}`;
   }
   return `#/${route.kind}`;
 }

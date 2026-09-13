@@ -2600,7 +2600,7 @@ export function toProtoRuntimeCommand(
       : item.source === "skill"
         ? contract.RuntimeCommandSource.SKILL
         : contract.RuntimeCommandSource.PROMPT,
-    resourceId: "",
+    resourceId: item.resourceId ?? "",
     loaded: item.loaded,
     sessionId: normalizedSessionId
   });
@@ -2624,6 +2624,7 @@ export function fromProtoRuntimeCommand(item: contract.RuntimeCommand): CoreRunt
     name: requireText(item.name, "runtime_command.name"),
     description: item.description,
     source,
+    ...(item.resourceId === "" ? {} : { resourceId: requireText(item.resourceId, "runtime_command.resource_id") }),
     loaded: item.loaded
   };
 }

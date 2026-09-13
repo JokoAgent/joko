@@ -105,6 +105,7 @@ import {
 } from "./credential-manager.js";
 import { CredentialVault } from "./credential-vault.js";
 import { DiagnosticsBundleService } from "./diagnostics-bundle.js";
+import { ExtensionCatalogManager } from "./extension-catalog.js";
 import { HistoryMaintenance } from "./history-maintenance.js";
 import {
   ImageGenerationBridgeToolProvider,
@@ -310,6 +311,7 @@ export interface OrchestratorApplication {
   readonly managedModelRuntime?: ManagedModelRuntimeController;
   readonly mcpRouter?: McpRouter;
   readonly piResources?: PiResourceManager;
+  readonly extensionCatalog?: ExtensionCatalogManager;
   readonly diagnosticsBundles?: DiagnosticsBundleService;
   readonly providerAuth?: PiProviderAuthSupervisor;
   /** Capability-owned, in-memory Provider account quota reader. */
@@ -557,6 +559,9 @@ export async function createOrchestratorApplication(
       : { fetch: dependencies.providerAccountUsageFetch })
   });
   await mcpRouter.initialize();
+  const extensionCatalog = new ExtensionCatalogManager({ store, credentials });
+  extensionCatalog.initialize();
+  extensionCatalog.reconcile(piResources.list(), mcpRouter.list());
   const imageGenerationBridge = new ImageGenerationBridgeToolProvider({
     credentialSurfaces: providerCredentialSurfaces,
     artifacts,
@@ -1765,6 +1770,7 @@ export async function createOrchestratorApplication(
     managedModelRuntime: managedModelRuntimeSystem.controller,
     mcpRouter,
     piResources,
+    extensionCatalog,
     diagnosticsBundles,
     providerAuth,
     providerAccountUsage,

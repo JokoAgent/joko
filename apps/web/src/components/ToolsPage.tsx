@@ -7,6 +7,7 @@ import {
   Boxes,
   Braces,
   CheckCircle2,
+  ChevronLeft,
   Download,
   Globe2,
   Image as ImageIcon,
@@ -15,6 +16,7 @@ import {
   PackageCheck,
   Play,
   RefreshCcw,
+  Search,
   ShieldCheck,
   Trash2,
   Upload,
@@ -24,7 +26,7 @@ import {
 import type { AppController } from "../controller.js";
 import { useLiveBrowserTakeover, withLiveBrowserTakeover } from "../browser-takeover-expiry.js";
 import { browserPageKey } from "../browser-page-key.js";
-import type { AppSnapshot, BrowserActivityView, BrowserCommentDraftItem, BrowserCommentInspectionInputView, BrowserCommentPlacementView, BrowserCommentStyleChangeView, BrowserCommentTargetView, BrowserPageView, BrowserSettingsView, BrowserTakeoverActionView, BrowserTakeoverKeyModifierView, BrowserTakeoverKeyView, BrowserTransferView, BrowserView, McpServerView, ResourceView, SessionView, TimelineItemView } from "../model.js";
+import type { AppSnapshot, BrowserActivityView, BrowserCommentDraftItem, BrowserCommentInspectionInputView, BrowserCommentPlacementView, BrowserCommentStyleChangeView, BrowserCommentTargetView, BrowserPageView, BrowserSettingsView, BrowserTakeoverActionView, BrowserTakeoverKeyModifierView, BrowserTakeoverKeyView, BrowserTransferView, BrowserView, ExtensionCatalogEntryView, McpServerView, ResourceView, SessionView, TimelineItemView } from "../model.js";
 import { nextBrowserCommentMarker, sanitizeBrowserCommentPageUrl } from "../browser-comment-draft.js";
 import { resourceKindsForBackend } from "../resource-capabilities.js";
 import { randomUuid } from "../web-crypto.js";
@@ -34,21 +36,38 @@ import { BrowserCommentPopover, emptyBrowserCommentEditorDraft, hasBrowserCommen
 import { BrowserLostPageCard, BrowserPageRail, type BrowserPageSelection } from "./BrowserPageRail.js";
 import { resolveComposerAttachmentPolicy } from "./composer-behavior.js";
 import type { RunAction, Translator } from "./types.js";
-import { Button, EmptyState, IconButton, Modal, Pill, StatusDot, cx, formatRelativeTime, SelectControl } from "./ui.js";
+import { Button, CheckboxControl, EmptyState, IconButton, Modal, Pill, StatusDot, cx, formatRelativeTime, SelectControl } from "./ui.js";
 import { moveTablistSelection } from "./tablist-navigation.js";
 
-type ToolsTab = "browser" | "resources" | "mcp" | "activity";
+type ToolsTab = "browser" | "extensions" | "resources" | "mcp" | "activity";
 
-export function ToolsPage({ controller, snapshot, locale, t, runAction, onOpenNavigation }: {
+export function ToolsPage({ controller, snapshot, runtimeSessionId, selectedExtensionId, locale, t, runAction, onSelectExtension, onOpenNavigation }: {
   readonly controller: AppController;
   readonly snapshot: AppSnapshot;
+  readonly runtimeSessionId?: string;
+  readonly selectedExtensionId?: string;
   readonly locale: string;
   readonly t: Translator;
   readonly runAction: RunAction;
+  readonly onSelectExtension?: (extensionId: string | undefined) => void;
   readonly onOpenNavigation: () => void;
 }): JSX.Element {
-  const [tab, setTab] = useState<ToolsTab>("browser");
+  const [tab, setTab] = useState<ToolsTab>(selectedExtensionId === undefined ? "browser" : "extensions");
+  const [selectedExtension, setSelectedExtension] = useState(selectedExtensionId);
   const [removeResource, setRemoveResource] = useState<ResourceView>();
+  useEffect(() => {
+    if (selectedExtensionId === undefined) return;
+    setTab("extensions");
+    setSelectedExtension(selectedExtensionId);
+  }, [selectedExtensionId]);
+  const selectExtension = (extensionId: string | undefined): void => {
+    setSelectedExtension(extensionId);
+    onSelectExtension?.(extensionId);
+  };
+  const selectTab = (next: ToolsTab): void => {
+    setTab(next);
+    if (next !== "extensions" && selectedExtension !== undefined) selectExtension(undefined);
+  };
   const activity = useMemo(() => [...snapshot.timelineBySession.values()].flat().filter((item) => item.tool !== undefined).sort((a, b) => b.createdAt - a.createdAt), [snapshot.timelineBySession]);
   const mcpBackends = snapshot.backends.filter((backend) => backend.capabilities.get("tool.mcp")?.supported === true);
   const browserSessions = useMemo(() => [...snapshot.sessions]
@@ -71,13 +90,15 @@ export function ToolsPage({ controller, snapshot, locale, t, runAction, onOpenNa
         <Pill tone={snapshot.browsers.some((browser) => browser.state === "ready") ? "success" : "neutral"}>{t("tools.providerCount", { count: snapshot.browsers.length })}</Pill>
       </header>
       <div className="route-tabs" role="tablist" aria-label={t("tools.title")} aria-orientation="horizontal">
-        <TabButton id="browser" current={tab} onClick={setTab}><Globe2 />{t("tools.browser")}</TabButton>
-        <TabButton id="resources" current={tab} onClick={setTab}><Braces />{t("tools.resources")}<span>{snapshot.resources.length}</span></TabButton>
-        <TabButton id="mcp" current={tab} onClick={setTab}><Boxes />{t("tools.mcp")}</TabButton>
-        <TabButton id="activity" current={tab} onClick={setTab}><Wrench />{t("tools.activity")}<span>{activity.length}</span></TabButton>
+        <TabButton id="browser" current={tab} onClick={selectTab}><Globe2 />{t("tools.browser")}</TabButton>
+        <TabButton id="extensions" current={tab} onClick={selectTab}><Boxes />{t("extensions.title")}<span>{snapshot.extensions.length}</span></TabButton>
+        <TabButton id="resources" current={tab} onClick={selectTab}><Braces />{t("tools.resources")}<span>{snapshot.resources.length}</span></TabButton>
+        <TabButton id="mcp" current={tab} onClick={selectTab}><Boxes />{t("tools.mcp")}</TabButton>
+        <TabButton id="activity" current={tab} onClick={selectTab}><Wrench />{t("tools.activity")}<span>{activity.length}</span></TabButton>
       </div>
       <div id="tools-tabpanel" className="route-page__content" role="tabpanel" aria-labelledby={`tools-tab-${tab}`}>
         {tab === "browser" && <BrowserTools controller={controller} browsers={snapshot.browsers} browserSettings={snapshot.settings.browsers} sessions={browserSessions} commentSessions={browserCommentSessions} locale={locale} t={t} runAction={runAction} />}
+        {tab === "extensions" && <ExtensionTools controller={controller} snapshot={snapshot} runtimeSessionId={runtimeSessionId} selectedId={selectedExtension} t={t} runAction={runAction} onSelect={selectExtension} />}
         {tab === "resources" && <ResourcesTools controller={controller} backends={snapshot.backends} resources={snapshot.resources} t={t} runAction={runAction} onRemove={setRemoveResource} />}
         {tab === "mcp" && <McpTools controller={controller} backends={mcpBackends} servers={snapshot.settings.mcpServers} t={t} runAction={runAction} />}
         {tab === "activity" && <ActivityTools activity={activity} locale={locale} t={t} />}
@@ -810,6 +831,354 @@ function resourceCanToggle(resource: ResourceView): boolean {
 
 function resourceCanUpdate(resource: ResourceView): boolean {
   return ["installed", "loaded", "disabled", "updateAvailable"].includes(resource.state);
+}
+
+type ExtensionFacet = "installed" | "catalog" | "local" | "market";
+
+function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, t, runAction, onSelect }: {
+  readonly controller: AppController;
+  readonly snapshot: AppSnapshot;
+  readonly runtimeSessionId?: string;
+  readonly selectedId?: string;
+  readonly t: Translator;
+  readonly runAction: RunAction;
+  readonly onSelect: (extensionId: string | undefined) => void;
+}): JSX.Element {
+  const [facet, setFacet] = useState<ExtensionFacet>("installed");
+  const [query, setQuery] = useState("");
+  const [entries, setEntries] = useState<readonly ExtensionCatalogEntryView[]>([]);
+  const [catalogRevision, setCatalogRevision] = useState(snapshot.extensionCatalogRevision);
+  const [recovered, setRecovered] = useState(snapshot.extensionCatalogRecovered);
+  const [listLoading, setListLoading] = useState(true);
+  const [listError, setListError] = useState<string>();
+  const [detail, setDetail] = useState<ExtensionCatalogEntryView>();
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState<string>();
+  const [refreshRevision, setRefreshRevision] = useState(0);
+  const [mutationKey, setMutationKey] = useState<string>();
+  const [setupOpen, setSetupOpen] = useState(false);
+  const listRequest = useRef(0);
+  const detailRequest = useRef(0);
+  const detailRetryAbort = useRef<AbortController | undefined>(undefined);
+  const selectedRef = useRef(selectedId);
+  selectedRef.current = selectedId;
+
+  useEffect(() => {
+    const abort = new AbortController();
+    const request = ++listRequest.current;
+    setListLoading(true);
+    setListError(undefined);
+    const timer = window.setTimeout(() => {
+      const filters = extensionFacetFilters(facet);
+      void controller.listExtensions({
+        ...filters,
+        ...(query.trim() === "" ? {} : { query: query.trim() }),
+        ...(runtimeSessionId === undefined ? {} : { sessionId: runtimeSessionId }),
+        signal: abort.signal
+      }).then((catalog) => {
+        if (abort.signal.aborted || request !== listRequest.current) return;
+        setEntries(catalog.extensions);
+        setCatalogRevision(catalog.revision);
+        setRecovered(catalog.recoveredFromCorruption);
+      }).catch((cause: unknown) => {
+        if (!abort.signal.aborted && request === listRequest.current) setListError(extensionErrorMessage(cause, t));
+      }).finally(() => {
+        if (!abort.signal.aborted && request === listRequest.current) setListLoading(false);
+      });
+    }, query.trim() === "" ? 0 : 180);
+    return () => { window.clearTimeout(timer); abort.abort(); };
+  }, [controller, facet, query, refreshRevision, runtimeSessionId]);
+
+  const loadDetail = useCallback(async (extensionId: string, signal?: AbortSignal): Promise<ExtensionCatalogEntryView> => {
+    const catalog = await controller.getExtension(extensionId, runtimeSessionId, signal);
+    const next = catalog.extensions[0];
+    if (next === undefined || next.id !== extensionId) throw new Error(t("extensions.detailUnavailable"));
+    setCatalogRevision(catalog.revision);
+    setRecovered(catalog.recoveredFromCorruption);
+    return next;
+  }, [controller, runtimeSessionId, t]);
+
+  useEffect(() => {
+    detailRetryAbort.current?.abort();
+    detailRetryAbort.current = undefined;
+    setSetupOpen(false);
+    if (selectedId === undefined) {
+      detailRequest.current += 1;
+      setDetail(undefined);
+      setDetailError(undefined);
+      setDetailLoading(false);
+      return;
+    }
+    const abort = new AbortController();
+    const request = ++detailRequest.current;
+    setDetailLoading(true);
+    setDetailError(undefined);
+    void loadDetail(selectedId, abort.signal).then((next) => {
+      if (!abort.signal.aborted && request === detailRequest.current && selectedRef.current === selectedId) setDetail(next);
+    }).catch((cause: unknown) => {
+      if (!abort.signal.aborted && request === detailRequest.current && selectedRef.current === selectedId) setDetailError(extensionErrorMessage(cause, t));
+    }).finally(() => {
+      if (!abort.signal.aborted && request === detailRequest.current && selectedRef.current === selectedId) setDetailLoading(false);
+    });
+    return () => {
+      abort.abort();
+      detailRetryAbort.current?.abort();
+    };
+  }, [loadDetail, selectedId]);
+
+  const refreshSelected = async (extensionId: string): Promise<void> => {
+    const next = await loadDetail(extensionId);
+    if (selectedRef.current === extensionId) {
+      setDetail(next);
+      setDetailError(undefined);
+    }
+    setRefreshRevision((value) => value + 1);
+  };
+  const mutate = (key: string, extensionId: string, action: () => Promise<void>): void => {
+    if (mutationKey !== undefined) return;
+    setMutationKey(key);
+    runAction(key, async () => {
+      try {
+        await action();
+        await refreshSelected(extensionId);
+      } catch (cause) {
+        await refreshSelected(extensionId).catch(() => undefined);
+        throw cause;
+      } finally {
+        setMutationKey((current) => current === key ? undefined : current);
+      }
+    });
+  };
+  const retryDetail = (): void => {
+    const extensionId = selectedRef.current;
+    if (extensionId === undefined) return;
+    detailRetryAbort.current?.abort();
+    const abort = new AbortController();
+    detailRetryAbort.current = abort;
+    const request = ++detailRequest.current;
+    setDetailLoading(true);
+    setDetailError(undefined);
+    void loadDetail(extensionId, abort.signal).then((next) => {
+      if (!abort.signal.aborted && request === detailRequest.current && selectedRef.current === extensionId) setDetail(next);
+    }).catch((cause: unknown) => {
+      if (!abort.signal.aborted && request === detailRequest.current && selectedRef.current === extensionId) setDetailError(extensionErrorMessage(cause, t));
+    }).finally(() => {
+      if (detailRetryAbort.current === abort) detailRetryAbort.current = undefined;
+      if (!abort.signal.aborted && request === detailRequest.current && selectedRef.current === extensionId) setDetailLoading(false);
+    });
+  };
+  const useCommand = (extension: ExtensionCatalogEntryView, command: ExtensionCatalogEntryView["commands"][number]): void => {
+    if (extension.setup.state !== "ready" && extension.setup.state !== "notRequired") {
+      setSetupOpen(true);
+      return;
+    }
+    if (!extension.enabled || !extension.useSupported || mutationKey !== undefined) return;
+    const key = `use-extension:${extension.id}:${command.name}`;
+    setMutationKey(key);
+    runAction(key, async () => {
+      try {
+        await controller.savePendingExtensionUse({
+          extensionId: extension.id,
+          extensionRevision: extension.revision.toString(10),
+          commandName: command.name,
+          runtimeSessionId: command.sessionId,
+          displayName: extension.name,
+          owner: extension.owner.kind === "resource"
+            ? {
+                kind: "resource",
+                resourceId: extension.owner.resourceId,
+                discoveredRevision: extension.owner.discoveredRevision,
+                resourceRevision: extension.owner.resourceRevision.toString(10)
+              }
+            : { kind: "mcp", serverId: extension.owner.serverId, serverRevision: extension.owner.serverRevision.toString(10) }
+        });
+        const resourceId = extension.owner.kind === "resource" ? extension.owner.resourceId : undefined;
+        const resource = resourceId === undefined
+          ? undefined
+          : snapshot.resources.find((candidate) => candidate.id === resourceId);
+        controller.navigate({ kind: "newSession", ...(resource?.targetId === undefined ? {} : { targetId: resource.targetId }) });
+      } finally {
+        setMutationKey((current) => current === key ? undefined : current);
+      }
+    });
+  };
+
+  const selectedDetail = detail?.id === selectedId ? detail : undefined;
+  return <div className={cx("extension-browser", selectedId !== undefined && "has-selection")}>
+    <section className="extension-browser__catalog" aria-label={t("extensions.catalog") }>
+      <div className="extension-browser__controls">
+        <label className="extension-search"><Search aria-hidden="true" /><span className="sr-only">{t("extensions.search")}</span><input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("extensions.searchPlaceholder")} /></label>
+        <div className="extension-facets" role="tablist" aria-label={t("extensions.filter") }>
+          {(["installed", "catalog", "local", "market"] as const).map((value) => <button type="button" role="tab" aria-selected={facet === value} tabIndex={facet === value ? 0 : -1} className={facet === value ? "is-active" : ""} key={value} onKeyDown={(event) => moveTablistSelection(event, "horizontal")} onClick={() => setFacet(value)}>{t(`extensions.facet.${value}`)}</button>)}
+        </div>
+      </div>
+      {recovered && <div className="extension-catalog-warning" role="alert"><AlertTriangle aria-hidden="true" /><span>{t("extensions.recovered")}</span></div>}
+      {listLoading && <p className="extension-browser__status" role="status">{t("extensions.loading")}</p>}
+      {listError !== undefined && <div className="extension-browser__status extension-browser__status--error" role="alert"><span>{listError}</span><Button onClick={() => setRefreshRevision((value) => value + 1)}><RefreshCcw aria-hidden="true" />{t("common.retry")}</Button></div>}
+      {!listLoading && listError === undefined && entries.length === 0 && <EmptyState icon={<Boxes />} title={t("extensions.empty")} body={extensionEmptyBody(facet, t)} />}
+      {listError === undefined && entries.length > 0 && <div className="extension-card-list" aria-busy={listLoading}>{entries.map((extension) => <button
+        type="button"
+        className={cx("extension-card", selectedId === extension.id && "is-active")}
+        key={extension.id}
+        aria-pressed={selectedId === extension.id}
+        onClick={() => onSelect(extension.id)}
+      ><span className="extension-card__icon"><Boxes aria-hidden="true" /></span><span className="extension-card__copy"><strong>{extension.name}</strong><small>{extension.description || t("extensions.noDescription")}</small><span><Pill tone={extensionInstallTone(extension.installState)}>{extensionInstallLabel(extension.installState, t)}</Pill><em>{extension.source === "local" ? t("extensions.local") : t("extensions.market")}</em>{extension.version !== undefined && <em>v{extension.version}</em>}</span></span>{extension.setup.state !== "notRequired" && <Pill tone={extension.setup.state === "ready" ? "success" : extension.setup.state === "failed" ? "danger" : "warning"}>{extensionSetupLabel(extension.setup.state, t)}</Pill>}</button>)}</div>}
+      <p className="extension-browser__revision">{t("extensions.catalogRevision", { revision: catalogRevision.toString(10) })}</p>
+    </section>
+    <section className="extension-browser__detail" aria-label={t("extensions.detail") }>
+      {selectedId === undefined && <EmptyState icon={<Boxes />} title={t("extensions.selectTitle")} body={t("extensions.selectBody")} />}
+      {selectedId !== undefined && <button type="button" className="extension-detail__back" onClick={() => onSelect(undefined)}><ChevronLeft aria-hidden="true" />{t("common.back")}</button>}
+      {detailLoading && <p className="extension-browser__status" role="status">{t("extensions.loadingDetail")}</p>}
+      {detailError !== undefined && <div className="extension-browser__status extension-browser__status--error" role="alert"><span>{detailError}</span><Button onClick={retryDetail}><RefreshCcw aria-hidden="true" />{t("common.retry")}</Button></div>}
+      {!detailLoading && detailError === undefined && selectedDetail !== undefined && <ExtensionDetail
+        extension={selectedDetail}
+        busy={mutationKey !== undefined}
+        t={t}
+        onEnabledChange={(enabled) => mutate(`extension-enabled:${selectedDetail.id}`, selectedDetail.id, () => controller.setExtensionEnabled(selectedDetail.id, enabled, selectedDetail.revision))}
+        onSidebarChange={(visible) => mutate(`extension-sidebar:${selectedDetail.id}`, selectedDetail.id, () => controller.setExtensionSidebarVisible(selectedDetail.id, visible, selectedDetail.revision))}
+        onSetup={() => setSetupOpen(true)}
+        onUse={(command) => useCommand(selectedDetail, command)}
+      />}
+    </section>
+    <ExtensionSetupDialog
+      extension={selectedDetail}
+      open={setupOpen}
+      busy={mutationKey !== undefined}
+      t={t}
+      onClose={() => setSetupOpen(false)}
+      onBegin={() => selectedDetail !== undefined && mutate(`extension-setup-begin:${selectedDetail.id}`, selectedDetail.id, () => controller.beginExtensionSetup(selectedDetail.id, selectedDetail.revision))}
+      onSubmit={(fieldId, value) => {
+        if (selectedDetail?.setup.attemptId === undefined) return;
+        mutate(`extension-setup-field:${selectedDetail.id}:${fieldId}`, selectedDetail.id, () => controller.submitExtensionSetupInteraction(selectedDetail.id, selectedDetail.setup.attemptId!, fieldId, value, selectedDetail.revision));
+      }}
+      onCredential={(fieldId, kind, secret) => {
+        if (selectedDetail?.setup.attemptId === undefined) return;
+        mutate(`extension-setup-secret:${selectedDetail.id}:${fieldId}`, selectedDetail.id, () => controller.saveExtensionSetupCredential(selectedDetail.id, selectedDetail.setup.attemptId!, fieldId, kind, secret, selectedDetail.revision));
+      }}
+      onComplete={() => {
+        if (selectedDetail?.setup.attemptId === undefined) return;
+        mutate(`extension-setup-complete:${selectedDetail.id}`, selectedDetail.id, () => controller.completeExtensionSetup(selectedDetail.id, selectedDetail.setup.attemptId!, selectedDetail.revision));
+      }}
+      onCancel={() => {
+        if (selectedDetail?.setup.attemptId === undefined) return;
+        mutate(`extension-setup-cancel:${selectedDetail.id}`, selectedDetail.id, () => controller.cancelExtensionSetup(selectedDetail.id, selectedDetail.setup.attemptId!, selectedDetail.revision));
+      }}
+      onRevoke={() => selectedDetail !== undefined && mutate(`extension-setup-revoke:${selectedDetail.id}`, selectedDetail.id, () => controller.revokeExtensionSetup(selectedDetail.id, selectedDetail.revision))}
+    />
+  </div>;
+}
+
+function ExtensionDetail({ extension, busy, t, onEnabledChange, onSidebarChange, onSetup, onUse }: {
+  readonly extension: ExtensionCatalogEntryView;
+  readonly busy: boolean;
+  readonly t: Translator;
+  readonly onEnabledChange: (enabled: boolean) => void;
+  readonly onSidebarChange: (visible: boolean) => void;
+  readonly onSetup: () => void;
+  readonly onUse: (command: ExtensionCatalogEntryView["commands"][number]) => void;
+}): JSX.Element {
+  return <article className="extension-detail">
+    <header className="extension-detail__header"><span className="extension-detail__icon"><Boxes aria-hidden="true" /></span><div><p className="eyebrow">{extension.source === "local" ? t("extensions.local") : t("extensions.market")}</p><h2>{extension.name}</h2><p>{extension.description || t("extensions.noDescription")}</p></div><Pill tone={extension.enabled ? "success" : "neutral"}>{extension.enabled ? t("common.enabled") : t("common.disabled")}</Pill></header>
+    {extension.error !== undefined && <p className="extension-detail__error" role="alert"><AlertTriangle aria-hidden="true" />{extension.error}</p>}
+    <dl className="extension-detail__metadata"><div><dt>{t("extensions.version")}</dt><dd>{extension.version ?? t("common.unknown")}</dd></div><div><dt>{t("extensions.author")}</dt><dd>{extension.author ?? t("common.unknown")}</dd></div><div><dt>{t("common.state")}</dt><dd>{extensionInstallLabel(extension.installState, t)}</dd></div><div><dt>{t("extensions.owner")}</dt><dd>{extension.owner.kind === "resource" ? t("extensions.resourceOwner") : t("extensions.mcpOwner")}</dd></div></dl>
+    <section className="extension-detail__settings" aria-label={t("extensions.configuration") }>
+      <label><span><strong>{t("extensions.enabled")}</strong><small>{t("extensions.enabledBody")}</small></span><CheckboxControl checked={extension.enabled} disabled={busy} onChange={(event) => onEnabledChange(event.target.checked)} /></label>
+      {extension.sidebarSupported && <label><span><strong>{t("extensions.showSidebar")}</strong><small>{t("extensions.showSidebarBody")}</small></span><CheckboxControl checked={extension.sidebarVisible} disabled={busy} onChange={(event) => onSidebarChange(event.target.checked)} /></label>}
+      {extension.setup.state !== "notRequired" && <button type="button" disabled={busy} onClick={onSetup}><span><strong>{t("extensions.setup")}</strong><small>{extension.setup.error ?? extensionSetupLabel(extension.setup.state, t)}</small></span><Pill tone={extension.setup.state === "ready" ? "success" : extension.setup.state === "failed" ? "danger" : "warning"}>{extensionSetupLabel(extension.setup.state, t)}</Pill></button>}
+    </section>
+    <ExtensionDetailSection title={t("extensions.commands")} empty={t("extensions.noCommands")} items={extension.commands.map((command) => <div className="extension-capability-row" key={`${command.sessionId}\u0000${command.name}`}><span><strong>/{command.name}</strong><small>{command.description}</small></span><Button tone="primary" disabled={busy || !extension.enabled} onClick={() => onUse(command)}><Play aria-hidden="true" />{extension.setup.state === "ready" || extension.setup.state === "notRequired" ? t("extensions.use") : t("extensions.configureToUse")}</Button></div>)} />
+    <ExtensionDetailSection title={t("extensions.tools")} empty={t("extensions.noTools")} items={extension.tools.map((tool) => <div className="extension-capability-row" key={tool.name}><span><strong>{tool.name}</strong><small>{tool.description}</small></span>{tool.requiresPermission && <Pill tone="warning">{t("extensions.permissionRequired")}</Pill>}</div>)} />
+    <ExtensionDetailSection title={t("extensions.permissions")} empty={t("extensions.noPermissions")} items={extension.permissions.map((permission) => <div className="extension-capability-row" key={permission.id}><span><strong>{permission.label}</strong><small>{permission.description}</small></span><Pill tone={permission.granted ? "success" : permission.required ? "warning" : "neutral"}>{permission.granted ? t("extensions.granted") : permission.required ? t("extensions.required") : t("extensions.optional")}</Pill></div>)} />
+  </article>;
+}
+
+function ExtensionDetailSection({ title, empty, items }: { readonly title: string; readonly empty: string; readonly items: readonly ReactNode[] }): JSX.Element {
+  return <section className="extension-detail__section"><h3>{title}</h3>{items.length === 0 ? <p className="muted">{empty}</p> : <div>{items}</div>}</section>;
+}
+
+function ExtensionSetupDialog({ extension, open, busy, t, onClose, onBegin, onSubmit, onCredential, onComplete, onCancel, onRevoke }: {
+  readonly extension?: ExtensionCatalogEntryView;
+  readonly open: boolean;
+  readonly busy: boolean;
+  readonly t: Translator;
+  readonly onClose: () => void;
+  readonly onBegin: () => void;
+  readonly onSubmit: (fieldId: string, value: string | boolean) => void;
+  readonly onCredential: (fieldId: string, kind: "apiKey" | "oauth" | "headerSecret", secret: string) => void;
+  readonly onComplete: () => void;
+  readonly onCancel: () => void;
+  readonly onRevoke: () => void;
+}): JSX.Element {
+  const [values, setValues] = useState<Readonly<Record<string, string>>>({});
+  const [credentialKinds, setCredentialKinds] = useState<Readonly<Record<string, "apiKey" | "oauth" | "headerSecret">>>({});
+  useEffect(() => { setValues({}); setCredentialKinds({}); }, [extension?.id, extension?.setup.attemptId]);
+  if (extension === undefined) return <></>;
+  const setup = extension.setup;
+  const startable = setup.state === "required" || setup.state === "cancelled" || setup.state === "failed";
+  const complete = setup.fields.every((field) => !field.required || field.configured);
+  return <Modal open={open} title={t("extensions.setupTitle", { name: extension.name })} description={t("extensions.setupBody")} size="medium" onClose={onClose}>
+    <div className="extension-setup" aria-busy={busy}>
+      <div className="extension-setup__state"><Pill tone={setup.state === "ready" ? "success" : setup.state === "failed" ? "danger" : setup.state === "cancelled" ? "neutral" : "warning"}>{extensionSetupLabel(setup.state, t)}</Pill>{setup.attemptId !== undefined && <span>{t("extensions.setupRevision", { revision: setup.revision.toString(10) })}</span>}</div>
+      {setup.error !== undefined && <p className="extension-detail__error" role="alert"><AlertTriangle aria-hidden="true" />{setup.error}</p>}
+      {startable && <div className="extension-setup__intro"><p>{t(setup.state === "failed" ? "extensions.setupFailedBody" : setup.state === "cancelled" ? "extensions.setupCancelledBody" : "extensions.setupRequiredBody")}</p><Button tone="primary" disabled={busy} onClick={onBegin}>{setup.state === "required" ? t("extensions.beginSetup") : t("common.retry")}</Button></div>}
+      {setup.state === "inProgress" && <div className="extension-setup__fields">{setup.fields.map((field) => {
+        const value = values[field.id] ?? "";
+        if (field.kind === "confirmation") return <label className="extension-setup__confirmation" key={field.id}><CheckboxControl checked={field.configured} disabled={busy} onChange={(event) => onSubmit(field.id, event.target.checked)} /><span><strong>{field.label}</strong><small>{field.description}</small></span></label>;
+        const secret = field.kind === "secret" || field.kind === "oauth";
+        const kind = field.kind === "oauth" ? "oauth" : credentialKinds[field.id] ?? "apiKey";
+        return <div className="extension-setup__field" key={field.id}><label><span><strong>{field.label}</strong>{field.configured && <Pill tone="success">{t("extensions.configured")}</Pill>}</span><small>{field.description}</small>{field.options.length > 0
+          ? <SelectControl value={value} disabled={busy} onChange={(event) => setValues((current) => ({ ...current, [field.id]: event.target.value }))}><option value="">{t("extensions.chooseValue")}</option>{field.options.map((option) => <option value={option} key={option}>{option}</option>)}</SelectControl>
+          : <input type={secret ? "password" : "text"} autoComplete="off" value={value} disabled={busy} onChange={(event) => setValues((current) => ({ ...current, [field.id]: event.target.value }))} />}</label>{field.kind === "secret" && <SelectControl aria-label={t("extensions.credentialKind", { name: field.label })} value={kind} disabled={busy} onChange={(event) => setCredentialKinds((current) => ({ ...current, [field.id]: event.target.value as "apiKey" | "oauth" | "headerSecret" }))}><option value="apiKey">{t("extensions.apiKey")}</option><option value="headerSecret">{t("extensions.headerSecret")}</option><option value="oauth">{t("extensions.oauthToken")}</option></SelectControl>}<Button disabled={busy || value.trim() === ""} onClick={() => {
+            if (!secret) {
+              onSubmit(field.id, value);
+              return;
+            }
+            setValues((current) => ({ ...current, [field.id]: "" }));
+            onCredential(field.id, kind, value);
+          }}>{t("common.save")}</Button></div>;
+      })}</div>}
+      {setup.state === "ready" && <div className="extension-setup__intro"><CheckCircle2 aria-hidden="true" /><p>{t("extensions.setupReadyBody")}</p></div>}
+      <div className="modal__actions">
+        <Button disabled={busy} onClick={onClose}>{t("common.close")}</Button>
+        {setup.state === "inProgress" && <Button disabled={busy} onClick={onCancel}>{t("common.cancel")}</Button>}
+        {setup.state === "inProgress" && <Button tone="primary" disabled={busy || !complete} onClick={onComplete}>{t("extensions.completeSetup")}</Button>}
+        {setup.state === "ready" && <Button tone="danger" disabled={busy} onClick={onRevoke}>{t("extensions.revokeSetup")}</Button>}
+      </div>
+    </div>
+  </Modal>;
+}
+
+function extensionFacetFilters(facet: ExtensionFacet): { readonly installed?: boolean; readonly source?: ExtensionCatalogEntryView["source"] } {
+  if (facet === "installed") return { installed: true };
+  if (facet === "local") return { source: "local" };
+  if (facet === "market") return { source: "market" };
+  return {};
+}
+
+function extensionEmptyBody(facet: ExtensionFacet, t: Translator): string {
+  if (facet === "installed") return t("extensions.emptyInstalled");
+  if (facet === "local") return t("extensions.emptyLocal");
+  if (facet === "market") return t("extensions.emptyMarket");
+  return t("extensions.emptyCatalog");
+}
+
+function extensionInstallTone(state: ExtensionCatalogEntryView["installState"]): "success" | "danger" | "warning" | "neutral" {
+  if (state === "installed") return "success";
+  if (state === "error") return "danger";
+  if (state === "installing" || state === "updateAvailable") return "warning";
+  return "neutral";
+}
+
+function extensionInstallLabel(state: ExtensionCatalogEntryView["installState"], t: Translator): string {
+  return t(`extensions.install.${state}`);
+}
+
+function extensionSetupLabel(state: ExtensionCatalogEntryView["setup"]["state"], t: Translator): string {
+  return t(`extensions.setup.${state}`);
+}
+
+function extensionErrorMessage(cause: unknown, t: Translator): string {
+  return cause instanceof Error && cause.message.trim() !== "" ? cause.message : t("extensions.error");
 }
 
 function McpTools({ controller, backends, servers, t, runAction }: { readonly controller: AppController; readonly backends: AppSnapshot["backends"]; readonly servers: readonly McpServerView[]; readonly t: Translator; readonly runAction: RunAction }): JSX.Element {

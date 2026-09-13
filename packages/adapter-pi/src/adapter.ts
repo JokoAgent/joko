@@ -2834,7 +2834,14 @@ export class PiBackendAdapter implements BackendAdapter {
         }
       );
     }
-    return cloneRuntimeToolCatalog(catalog);
+    const cloned = cloneRuntimeToolCatalog(catalog);
+    return {
+      ...cloned,
+      tools: cloned.tools.map((tool) => ({
+        ...tool,
+        ...managedResourceForRuntimePath(runtime.resources, tool.sourceInfo.path)
+      }))
+    };
   }
 
   async getResources(context: AdapterContext): Promise<readonly RuntimeResource[]> {
@@ -5463,6 +5470,9 @@ export class PiBackendAdapter implements BackendAdapter {
           description: command.description ?? "",
           source: command.source,
           path: command.sourceInfo?.path,
+          ...(command.sourceInfo?.path === undefined
+            ? {}
+            : managedResourceForRuntimePath(runtime.resources, command.sourceInfo.path)),
           loaded: true
         })),
       managedInternalNames
@@ -6847,6 +6857,7 @@ function cloneRuntimeToolCatalog(catalog: PiRuntimeToolCatalog): PiRuntimeToolCa
       description: tool.description,
       active: tool.active,
       promptGuidelines: [...tool.promptGuidelines],
+      ...(tool.resourceId === undefined ? {} : { resourceId: tool.resourceId }),
       sourceInfo: { ...tool.sourceInfo },
       inputSchema: {
         allowsAdditionalFields: tool.inputSchema.allowsAdditionalFields,
@@ -6858,6 +6869,16 @@ function cloneRuntimeToolCatalog(catalog: PiRuntimeToolCatalog): PiRuntimeToolCa
       }
     }))
   };
+}
+
+function managedResourceForRuntimePath(
+  resources: readonly RuntimeResource[],
+  path: string
+): { readonly resourceId?: string } {
+  if (!isAbsolute(path)) return {};
+  const matches = resources.filter((resource) => resource.runtimePath !== undefined
+    && isAbsolute(resource.runtimePath) && samePathOrContained(resource.runtimePath, path));
+  return matches.length === 1 ? { resourceId: matches[0]!.id } : {};
 }
 
 function samePathOrContained(root: string, candidate: string): boolean {

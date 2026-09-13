@@ -599,6 +599,12 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     if (sessionId !== undefined) return state.snapshot.sessions.find((session) => session.id === sessionId);
     return [...state.snapshot.sessions].filter((session) => !session.archived).sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.updatedAt - a.updatedAt)[0];
   }, [state.route, state.snapshot.sessions]);
+  const lastRuntimeSessionIdRef = useRef<string | undefined>(activeSession?.id);
+  if (activeSession !== undefined) lastRuntimeSessionIdRef.current = activeSession.id;
+  else if (lastRuntimeSessionIdRef.current !== undefined
+    && !state.snapshot.sessions.some((session) => session.id === lastRuntimeSessionIdRef.current)) {
+    lastRuntimeSessionIdRef.current = undefined;
+  }
   const nativeTaskStatusVisibleSessionIds = useMemo(() => {
     if (state.route.kind !== "session" && state.route.kind !== "files") return [];
     if (state.route.kind === "session" && sessionSplitLayout.root !== undefined) {
@@ -1791,7 +1797,17 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
           {state.route.kind === "files" && <main className="empty-session-page"><EmptyState icon={<AlertTriangle />} title={t("workspace.filesLoadFailed")} body={t("workspace.noWorkspace")} action={<Button onClick={() => { const sessionId = activeSession?.id; controller.navigate(sessionId === undefined ? { kind: "session" } : { kind: "session", sessionId }); }}>{t("workspace.filesBack")}</Button>} /></main>}
           {state.route.kind === "schedules" && <SchedulesPage controller={controller} schedules={state.snapshot.schedules} sessions={state.snapshot.sessions} targets={state.snapshot.targets} models={state.snapshot.models} backends={state.snapshot.backends} extraDirectories={state.snapshot.extraDirectories} focusScheduleId={state.route.scheduleId} locale={state.preferences.locale} t={t} runAction={runAction} onOpenNavigation={() => setWindowNavigationOpen(true)} prepareSessionRemoval={prepareWorktreeRemoval} />}
           {state.route.kind === "projects" && <ProjectsPage controller={controller} snapshot={state.snapshot} focusProjectId={state.route.projectId} t={t} runAction={runAction} onOpenNavigation={() => setWindowNavigationOpen(true)} prepareSessionRemoval={prepareWorktreeRemoval} />}
-          {state.route.kind === "tools" && <ToolsPage controller={controller} snapshot={state.snapshot} locale={state.preferences.locale} t={t} runAction={runAction} onOpenNavigation={() => setWindowNavigationOpen(true)} />}
+          {state.route.kind === "tools" && <ToolsPage
+            controller={controller}
+            snapshot={state.snapshot}
+            runtimeSessionId={lastRuntimeSessionIdRef.current}
+            selectedExtensionId={state.route.extensionId}
+            locale={state.preferences.locale}
+            t={t}
+            runAction={runAction}
+            onSelectExtension={(extensionId) => controller.navigate({ kind: "tools", ...(extensionId === undefined ? {} : { extensionId }) })}
+            onOpenNavigation={() => setWindowNavigationOpen(true)}
+          />}
           {state.route.kind === "settings" && <SettingsPage controller={controller} snapshot={state.snapshot} activeTargetId={settingsTargetIdRef.current} locale={state.preferences.locale} t={t} runAction={runAction} onImportPortableSession={portableImportTargets.length === 0 ? undefined : () => { void choosePortableSessionImport(); }} />}
           </>}
           </Suspense>

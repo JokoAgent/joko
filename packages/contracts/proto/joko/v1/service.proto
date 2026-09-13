@@ -6,6 +6,7 @@ import "google/protobuf/timestamp.proto";
 import "joko/v1/capability.proto";
 import "joko/v1/common.proto";
 import "joko/v1/event.proto";
+import "joko/v1/extension.proto";
 import "joko/v1/interaction.proto";
 import "joko/v1/managed_model_runtime.proto";
 import "joko/v1/model.proto";
@@ -224,6 +225,14 @@ service WorktreeService {
   rpc ProbeTargetWorktree(ProbeTargetWorktreeRequest) returns (ProbeTargetWorktreeResponse);
   rpc ListTargetWorktreeSources(ListTargetWorktreeSourcesRequest) returns (ListTargetWorktreeSourcesResponse);
   rpc GetSessionWorktreeRemovalPreview(GetSessionWorktreeRemovalPreviewRequest) returns (GetSessionWorktreeRemovalPreviewResponse);
+}
+
+service ExtensionService {
+  rpc ListExtensions(ListExtensionsRequest) returns (ListExtensionsResponse);
+  rpc GetExtension(GetExtensionRequest) returns (GetExtensionResponse);
+  // Produces a one-time protected upload ticket. Secret bytes cross only the
+  // authenticated credential upload endpoint and never this RPC.
+  rpc BeginExtensionSetupCredentialUpload(BeginExtensionSetupCredentialUploadRequest) returns (BeginExtensionSetupCredentialUploadResponse);
 }
 
 service SubagentService {
@@ -1633,6 +1642,43 @@ message ListMcpServersRequest {
 message ListMcpServersResponse {
   repeated McpServerDescriptor servers = 1;
   PageInfo page = 2;
+}
+
+message ListExtensionsRequest {
+  optional ExtensionCatalogSource source = 1;
+  optional bool installed = 2;
+  string query = 3;
+  optional string session_id = 4;
+  PageRequest page = 5;
+}
+
+message ListExtensionsResponse {
+  repeated ExtensionCatalogEntry extensions = 1;
+  Revision catalog_revision = 2;
+  bool recovered_from_corruption = 3;
+  PageInfo page = 4;
+}
+
+message GetExtensionRequest {
+  string extension_id = 1;
+  optional string session_id = 2;
+}
+
+message GetExtensionResponse {
+  ExtensionCatalogEntry extension = 1;
+  Revision catalog_revision = 2;
+  bool recovered_from_corruption = 3;
+}
+
+message BeginExtensionSetupCredentialUploadRequest {
+  string extension_id = 1;
+  string attempt_id = 2;
+  string field_id = 3;
+  CredentialKind kind = 4;
+}
+
+message BeginExtensionSetupCredentialUploadResponse {
+  CredentialUploadTicket ticket = 1;
 }
 
 message ListBrowserProvidersRequest {

@@ -42,6 +42,8 @@ export interface PiRuntimeToolDescriptor {
   readonly promptGuidelines: readonly string[];
   readonly active: boolean;
   readonly sourceInfo: PiRuntimeToolSourceInfo;
+  /** Exact managed Resource owner resolved inside the live runtime. */
+  readonly resourceId?: string;
 }
 
 export interface PiRuntimeToolCatalog {

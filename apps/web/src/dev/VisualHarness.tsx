@@ -23,6 +23,8 @@ import type {
   ArtifactView,
   BackendView,
   ComposerDraft,
+  ExtensionCatalogEntryView,
+  ExtensionCatalogView,
   InteractionResolutionDraft,
   InteractionView,
   McpServerView,
@@ -289,6 +291,29 @@ export function VisualHarness(): JSX.Element {
         setState((current) => ({ ...current, route }));
       },
       refresh: async (): Promise<void> => { record("refresh"); },
+      listExtensions: async (options = {}): Promise<ExtensionCatalogView> => {
+        options.signal?.throwIfAborted();
+        const query = options.query?.trim().toLocaleLowerCase("en-US") ?? "";
+        const extensions = state.snapshot.extensions
+          .filter((extension) => options.source === undefined || extension.source === options.source)
+          .filter((extension) => options.installed === undefined || extension.installed === options.installed)
+          .filter((extension) => query === "" || [extension.name, extension.description, extension.author ?? ""]
+            .join("\n").toLocaleLowerCase("en-US").includes(query));
+        return {
+          revision: state.snapshot.extensionCatalogRevision,
+          extensions,
+          recoveredFromCorruption: state.snapshot.extensionCatalogRecovered
+        };
+      },
+      getExtension: async (extensionId, _sessionId, signal): Promise<ExtensionCatalogView> => {
+        signal?.throwIfAborted();
+        return {
+          revision: state.snapshot.extensionCatalogRevision,
+          extensions: state.snapshot.extensions.filter((extension) => extension.id === extensionId),
+          recoveredFromCorruption: state.snapshot.extensionCatalogRecovered
+        };
+      },
+      savePendingExtensionUse: async (value): Promise<void> => { record(`extension-use:${value.extensionId}:${value.commandName}`); },
       beginProviderLogin: async (_backendId, providerId, method): Promise<ProviderLoginFlowView> => {
         const now = FIXED_NOW + sequence.current++;
         const id = `visual-provider-login-${sequence.current}`;
@@ -2587,7 +2612,7 @@ function abortError(): Error {
 }
 
 interface HarnessParameters {
-  readonly scenario: "session" | "question" | "long-question" | "files" | "audio" | "review" | "personalization" | "providers" | "voice" | "automation" | "scheduler" | "connection" | "connections" | "browser" | "background" | "subagents" | "usage";
+  readonly scenario: "session" | "question" | "long-question" | "files" | "audio" | "review" | "personalization" | "providers" | "voice" | "automation" | "scheduler" | "connection" | "connections" | "browser" | "extensions" | "background" | "subagents" | "usage";
   readonly usageState: "ready" | "empty" | "error";
   readonly theme: Theme;
   readonly richCopy: boolean;
@@ -2625,6 +2650,7 @@ function harnessParameters(): HarnessParameters {
       || scenarioValue === "connection"
       || scenarioValue === "connections"
       || scenarioValue === "browser"
+      || scenarioValue === "extensions"
       || scenarioValue === "background"
       || scenarioValue === "subagents"
       || scenarioValue === "usage"
@@ -2722,6 +2748,8 @@ function initialControllerState(parameters: HarnessParameters, files: VisualWork
             ? { kind: "schedules", scheduleId: "visual-schedule-daily" }
           : parameters.scenario === "browser"
             ? { kind: "tools" }
+          : parameters.scenario === "extensions"
+            ? { kind: "tools", extensionId: "extension_0123456789abcdef0123456789abcdef" }
           : { kind: "session", sessionId: "session-1" },
     preferences: {
       ...DEFAULT_UI_PREFERENCES,
@@ -3510,11 +3538,64 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
       requiresExtensionApproval: false,
       postMutationNotice: false
     }],
+    extensions: parameters.scenario === "extensions" ? visualExtensions() : [],
+    extensionCatalogRevision: parameters.scenario === "extensions" ? 12n : 0n,
     commands: [
       { id: "command-review", name: "review", description: "Review the current changes", source: "backend", loaded: true },
       { id: "command-test", name: "test", description: "Run the narrow checks", source: "backend", loaded: true }
     ]
   };
+}
+
+function visualExtensions(): readonly ExtensionCatalogEntryView[] {
+  return [{
+    id: "extension_0123456789abcdef0123456789abcdef",
+    revision: 7n,
+    owner: {
+      kind: "resource",
+      resourceId: "visual-extension-resource",
+      discoveredRevision: "sha256:visual-extension-owner",
+      resourceRevision: 4n
+    },
+    source: "local",
+    installed: true,
+    installState: "installed",
+    name: "Workspace navigator",
+    version: "1.4.0",
+    author: "Joko Labs",
+    description: "Navigate project structure and open focused workspace views.",
+    enabled: true,
+    sidebarSupported: true,
+    sidebarVisible: true,
+    tools: [{ name: "find_workspace_entry", description: "Find an exact file or directory in the active workspace.", requiresPermission: true }],
+    permissions: [{ id: "workspace-read", label: "Workspace read", description: "Reads project names and file metadata after task permission checks.", required: true, granted: true }],
+    commands: [{ name: "open-nav", description: "Start a task with the workspace navigator.", sessionId: "session-1" }],
+    setup: { state: "notRequired", revision: 0n, fields: [] },
+    useSupported: true
+  }, {
+    id: "extension_fedcba9876543210fedcba9876543210",
+    revision: 3n,
+    owner: { kind: "mcp", serverId: "visual-research", serverRevision: 2n },
+    source: "market",
+    installed: true,
+    installState: "installed",
+    name: "Research connector",
+    version: "2.1.0",
+    author: "Example Studio",
+    description: "Search a connected research corpus with protected credentials.",
+    enabled: true,
+    sidebarSupported: true,
+    sidebarVisible: false,
+    tools: [{ name: "search_corpus", description: "Search the configured corpus.", requiresPermission: true }],
+    permissions: [{ id: "credential-header", label: "Protected header", description: "Adds a protected request header.", required: true, granted: false }],
+    commands: [],
+    setup: {
+      state: "required",
+      revision: 0n,
+      fields: [{ id: "api-token", label: "API token", description: "Token used for the research endpoint.", kind: "secret", required: true, configured: false, options: [] }]
+    },
+    useSupported: false
+  }];
 }
 
 function capability(name: string, options: readonly string[] = [], maximumBytes?: number, maximumItems?: number) {
