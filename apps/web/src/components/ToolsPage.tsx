@@ -9,9 +9,11 @@ import {
   CheckCircle2,
   ChevronLeft,
   Download,
+  ExternalLink,
   FolderPlus,
   Globe2,
   Image as ImageIcon,
+  LayoutDashboard,
   Menu,
   MessageSquarePlus,
   PackageCheck,
@@ -47,6 +49,8 @@ import { resolveComposerAttachmentPolicy } from "./composer-behavior.js";
 import type { RunAction, Translator } from "./types.js";
 import { Button, CheckboxControl, EmptyState, IconButton, Modal, Pill, StatusDot, cx, formatRelativeTime, SelectControl } from "./ui.js";
 import { moveTablistSelection } from "./tablist-navigation.js";
+import { extensionMainViewReady } from "./ExtensionMainViewPage.js";
+import { openExtensionWindowFallback } from "../extension-window-navigation.js";
 
 type ToolsTab = "browser" | "extensions" | "resources" | "mcp" | "activity";
 
@@ -1076,6 +1080,16 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, lo
         onPackage={() => openPackage(selectedDetail)}
         onExport={() => setPackageExport(selectedDetail)}
         onRemove={() => setPackageRemoval(selectedDetail)}
+        onOpenMainView={() => controller.navigate({ kind: "extensionMainView", extensionId: selectedDetail.id })}
+        onOpenWindow={() => runAction(`extension-window:${selectedDetail.id}`, async () => {
+          if (window.jokoDesktop?.capabilities.includes("extension.windows") === true) {
+            await window.jokoDesktop.extensionWindows.open(selectedDetail.id);
+            return;
+          }
+          if (openExtensionWindowFallback(window.location, selectedDetail.id) === null) {
+            throw new Error(t("extensions.mainView.windowFailed"));
+          }
+        })}
       />}
     </section>
     <ExtensionSetupDialog
@@ -1148,7 +1162,7 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, lo
   </div>;
 }
 
-function ExtensionDetail({ extension, busy, t, onEnabledChange, onSidebarChange, onSetup, onUse, onPackage, onExport, onRemove }: {
+function ExtensionDetail({ extension, busy, t, onEnabledChange, onSidebarChange, onSetup, onUse, onPackage, onExport, onRemove, onOpenMainView, onOpenWindow }: {
   readonly extension: ExtensionCatalogEntryView;
   readonly busy: boolean;
   readonly t: Translator;
@@ -1159,12 +1173,15 @@ function ExtensionDetail({ extension, busy, t, onEnabledChange, onSidebarChange,
   readonly onPackage: () => void;
   readonly onExport: () => void;
   readonly onRemove: () => void;
+  readonly onOpenMainView: () => void;
+  readonly onOpenWindow: () => void;
 }): JSX.Element {
   const sourceOwned = extension.owner.kind === "source";
   return <article className="extension-detail">
     <header className="extension-detail__header"><span className="extension-detail__icon"><Boxes aria-hidden="true" /></span><div><p className="eyebrow">{extension.source === "local" ? t("extensions.local") : t("extensions.market")}</p><h2>{extension.name}</h2><p>{extension.description || t("extensions.noDescription")}</p></div><Pill tone={sourceOwned ? extensionInstallTone(extension.installState) : extension.enabled ? "success" : "neutral"}>{sourceOwned ? extensionInstallLabel(extension.installState, t) : extension.enabled ? t("common.enabled") : t("common.disabled")}</Pill></header>
     {extension.error !== undefined && <p className="extension-detail__error" role="alert"><AlertTriangle aria-hidden="true" />{extension.error}</p>}
     <dl className="extension-detail__metadata"><div><dt>{t("extensions.version")}</dt><dd>{extension.version ?? t("common.unknown")}</dd></div><div><dt>{t("extensions.author")}</dt><dd>{extension.author ?? t("common.unknown")}</dd></div><div><dt>{t("common.state")}</dt><dd>{extensionInstallLabel(extension.installState, t)}</dd></div><div><dt>{t("extensions.owner")}</dt><dd>{extension.owner.kind === "resource" ? t("extensions.resourceOwner") : extension.owner.kind === "mcp" ? t("extensions.mcpOwner") : t("extensions.sourceOwner")}</dd></div></dl>
+    {extension.mainView !== undefined && <section className="extension-main-view-actions"><LayoutDashboard aria-hidden="true" /><div><strong>{extension.mainView.title ?? t("extensions.mainView.title")}</strong><p>{extensionMainViewReady(extension) ? t("extensions.mainView.readyBody") : t("extensions.mainView.notReadyBody")}</p></div><Button tone="primary" disabled={busy || !extensionMainViewReady(extension)} onClick={onOpenMainView}>{t("extensions.mainView.open")}</Button><Button tone="ghost" disabled={busy || !extensionMainViewReady(extension)} onClick={onOpenWindow}><ExternalLink aria-hidden="true" />{t("extensions.mainView.openWindow")}</Button></section>}
     {sourceOwned ? <section className="extension-source-available"><FolderPlus aria-hidden="true" /><div><strong>{t("extensions.sourceAvailable")}</strong><p>{t("extensions.sourceAvailableBody")}</p></div><Button tone="primary" disabled={busy} onClick={onPackage}><Download aria-hidden="true" />{t("extensions.package.install")}</Button></section> : <section className="extension-detail__settings" aria-label={t("extensions.configuration") }>
       <label><span><strong>{t("extensions.enabled")}</strong><small>{t("extensions.enabledBody")}</small></span><CheckboxControl checked={extension.enabled} disabled={busy} onChange={(event) => onEnabledChange(event.target.checked)} /></label>
       {extension.sidebarSupported && <label><span><strong>{t("extensions.showSidebar")}</strong><small>{t("extensions.showSidebarBody")}</small></span><CheckboxControl checked={extension.sidebarVisible} disabled={busy} onChange={(event) => onSidebarChange(event.target.checked)} /></label>}

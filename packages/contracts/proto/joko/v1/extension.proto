@@ -69,6 +69,20 @@ enum ExtensionPackageExportState {
   EXTENSION_PACKAGE_EXPORT_STATE_CANCELLED = 7;
 }
 
+enum ExtensionMainViewIcon {
+  EXTENSION_MAIN_VIEW_ICON_UNSPECIFIED = 0;
+  EXTENSION_MAIN_VIEW_ICON_ACTIVITY = 1;
+  EXTENSION_MAIN_VIEW_ICON_BOX = 2;
+  EXTENSION_MAIN_VIEW_ICON_CODE = 3;
+  EXTENSION_MAIN_VIEW_ICON_FILE_TEXT = 4;
+  EXTENSION_MAIN_VIEW_ICON_GLOBE = 5;
+  EXTENSION_MAIN_VIEW_ICON_LAYOUT = 6;
+  EXTENSION_MAIN_VIEW_ICON_SEARCH = 7;
+  EXTENSION_MAIN_VIEW_ICON_SPARKLES = 8;
+  EXTENSION_MAIN_VIEW_ICON_TERMINAL = 9;
+  EXTENSION_MAIN_VIEW_ICON_TOOL = 10;
+}
+
 message ExtensionLocalSource {
   string path = 1;
 }
@@ -245,6 +259,26 @@ message ExtensionPackageExportPreview {
   optional ExtensionPackageExportJob active_export = 7;
 }
 
+message ExtensionMainViewDescriptor {
+  optional string title = 1;
+  ExtensionMainViewIcon icon = 2;
+}
+
+// Opaque, process-local surface authority. The endpoint is connection-owned
+// and expires with its exact installed Resource generation.
+message ExtensionMainViewSurface {
+  string surface_id = 1;
+  string extension_id = 2;
+  ExtensionResourceOwner owner = 3;
+  string endpoint = 4;
+  optional string title = 5;
+  ExtensionMainViewIcon icon = 6;
+  google.protobuf.Timestamp expires_at = 7;
+  string backend_id = 8;
+  Revision backend_revision = 9;
+  uint64 backend_generation = 10;
+}
+
 // Generic Extension projection. Executable bytes and secrets are deliberately
 // absent: owner carries only exact Resource/MCP references and setup carries
 // protected credential readiness.
@@ -269,6 +303,7 @@ message ExtensionCatalogEntry {
   bool use_supported = 18;
   optional string error = 19;
   optional ExtensionPackageUpdate update = 20;
+  optional ExtensionMainViewDescriptor main_view = 21;
 }
 
 message ExtensionCatalogSnapshot {

@@ -4,6 +4,7 @@ import type { RuntimeCommand, RuntimeToolDescriptor } from "@joko/core";
 import type { OperationalStore } from "@joko/store";
 
 import type { CredentialKind, CredentialManager } from "./credential-manager.js";
+import type { ExtensionMainViewDescriptor } from "./extension-surface-manifest.js";
 import type { ExtensionSourceDescriptor } from "./extension-source-manager.js";
 import type { McpServerDescriptor, McpServerInput } from "./mcp-router.js";
 import type { PiResourceDescriptor } from "./resource-manager.js";
@@ -80,6 +81,7 @@ export interface ExtensionCatalogDescriptor {
   readonly author?: string;
   readonly description: string;
   readonly enabled: boolean;
+  readonly mainView?: ExtensionMainViewDescriptor & { readonly extensionEntry: string };
   readonly sidebarSupported: boolean;
   readonly sidebarVisible: boolean;
   readonly tools: readonly ExtensionToolDescriptor[];
@@ -151,6 +153,7 @@ interface ExtensionDefinition {
   readonly author?: string;
   readonly description: string;
   readonly enabled: boolean;
+  readonly mainView?: ExtensionMainViewDescriptor & { readonly extensionEntry: string };
   readonly sidebarSupported: boolean;
   readonly tools: readonly ExtensionToolDescriptor[];
   readonly permissions: readonly Omit<ExtensionPermissionDescriptor, "granted">[];
@@ -635,8 +638,9 @@ export class ExtensionCatalogManager {
       ...(definition.author === undefined ? {} : { author: definition.author }),
       description: definition.description,
       enabled: definition.enabled,
+      ...(definition.mainView === undefined ? {} : { mainView: { ...definition.mainView } }),
       sidebarSupported: definition.sidebarSupported,
-      sidebarVisible: record.sidebarVisible,
+      sidebarVisible: definition.sidebarSupported && record.sidebarVisible,
       tools,
       permissions: definition.permissions.map((permission) => ({
         ...permission,
@@ -733,7 +737,10 @@ function projectDefinitions(
         ...(entry.author === undefined ? {} : { author: entry.author }),
         description: entry.description,
         enabled: false,
-        sidebarSupported: false,
+        ...(entry.mainView === undefined ? {} : {
+          mainView: { ...entry.mainView, extensionEntry: entry.extensionRelativePath }
+        }),
+        sidebarSupported: entry.mainView !== undefined,
         tools: [],
         permissions: [],
         setupRequirements: [],
@@ -830,7 +837,10 @@ function projectDefinitions(
         ...(update === undefined ? {} : { update }),
         description: resource.sourceDisplay,
         enabled: resource.enabled,
-        sidebarSupported: true,
+        ...(detail.mainView === undefined || detail.entryPath === undefined ? {} : {
+          mainView: { ...detail.mainView, extensionEntry: detail.entryPath }
+        }),
+        sidebarSupported: detail.mainView !== undefined,
         tools: [],
         permissions,
         setupRequirements: [],
@@ -938,7 +948,7 @@ function mcpDefinition(server: McpServerDescriptor): ExtensionDefinition {
     name: server.displayName,
     description: server.endpointDisplay,
     enabled: server.enabled,
-    sidebarSupported: true,
+    sidebarSupported: false,
     tools,
     permissions,
     setupRequirements: [...credentialRequirements, ...permissionRequirements],

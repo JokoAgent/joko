@@ -92,6 +92,7 @@ export type AppRoute =
   | { readonly kind: "projects"; readonly projectId?: string }
   | { readonly kind: "schedules"; readonly scheduleId?: string }
   | { readonly kind: "tools"; readonly extensionId?: string }
+  | { readonly kind: "extensionMainView"; readonly extensionId: string }
   | { readonly kind: "settings" };
 
 export interface BrowserInspectorFocusRequest {
@@ -2025,6 +2026,10 @@ export function useAppController(): AppController {
     listRuntimeTools: (sessionId) => gateway().listRuntimeTools(sessionId),
     listExtensions: (options) => gateway().listExtensions(options),
     getExtension: (extensionId, sessionId, signal) => gateway().getExtension(extensionId, sessionId, signal),
+    openExtensionMainView: (extensionId, expectedRevision, signal) =>
+      gateway().openExtensionMainView(extensionId, expectedRevision, signal),
+    getExtensionMainViewSurface: (surfaceId, signal) => gateway().getExtensionMainViewSurface(surfaceId, signal),
+    closeExtensionMainView: (surfaceId, signal) => gateway().closeExtensionMainView(surfaceId, signal),
     getExtensionPackagePreview: (extensionId, expectedRevision, backendId, signal) =>
       gateway().getExtensionPackagePreview(extensionId, expectedRevision, backendId, signal),
     adoptExtensionPackage: (preview, allowSourceReplacement, signal) =>
@@ -2802,6 +2807,9 @@ export function routeFromHash(hash: string): AppRoute {
       ...(extensionId !== undefined && /^extension_[a-f0-9]{32}$/u.test(extensionId) ? { extensionId } : {})
     };
   }
+  if (parts[0] === "extensions" && parts[1] !== undefined && /^extension_[a-f0-9]{32}$/u.test(parts[1])) {
+    return { kind: "extensionMainView", extensionId: parts[1] };
+  }
   if (parts[0] === "settings") return { kind: "settings" };
   if (parts[0] === "tasks" && parts[1] === "new") {
     const targetId = query.get("target")?.trim();
@@ -2861,6 +2869,7 @@ export function appRouteHash(route: AppRoute): string {
     if (route.extensionId !== undefined) query.set("extension", route.extensionId);
     return `#/tools${query.size === 0 ? "" : `?${query.toString()}`}`;
   }
+  if (route.kind === "extensionMainView") return `#/extensions/${encodeURIComponent(route.extensionId)}`;
   return `#/${route.kind}`;
 }
 

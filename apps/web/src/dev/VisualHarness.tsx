@@ -25,6 +25,7 @@ import type {
   ComposerDraft,
   ExtensionCatalogEntryView,
   ExtensionCatalogView,
+  ExtensionMainViewSurfaceView,
   ExtensionPackageExportJobView,
   ExtensionPackageExportPreviewView,
   ExtensionPackagePreviewView,
@@ -68,6 +69,7 @@ import { VisualUsageHistoryFixture } from "./VisualUsageHistoryFixture.js";
 import { UsageHistorySection } from "../components/UsageHistorySection.js";
 import { translate } from "../i18n.js";
 import { applyAppearanceTypography, clampCodeSize, clampUiSize, normalizeFontFamily } from "../appearance-settings.js";
+import { VISUAL_EXTENSION_MAIN_VIEW_ENDPOINT } from "./visual-extension-surface-contract.js";
 
 const FIXED_NOW = Date.UTC(2026, 7, 22, 4, 0, 0);
 const VISUAL_WORKSPACE_ID = "visual-workspace";
@@ -317,6 +319,27 @@ export function VisualHarness(): JSX.Element {
           extensions: state.snapshot.extensions.filter((extension) => extension.id === extensionId),
           recoveredFromCorruption: state.snapshot.extensionCatalogRecovered
         };
+      },
+      openExtensionMainView: async (extensionId, expectedRevision, signal): Promise<ExtensionMainViewSurfaceView> => {
+        signal?.throwIfAborted();
+        const extension = state.snapshot.extensions.find((candidate) => candidate.id === extensionId);
+        if (extension === undefined || extension.revision !== expectedRevision || extension.owner.kind !== "resource"
+          || extension.mainView === undefined) throw new Error("The visual Extension main view changed.");
+        record(`extension-main-view:open:${extensionId}`);
+        return visualExtensionMainViewSurface(extension);
+      },
+      getExtensionMainViewSurface: async (surfaceId, signal): Promise<ExtensionMainViewSurfaceView> => {
+        signal?.throwIfAborted();
+        const extension = state.snapshot.extensions.find((candidate) => candidate.id === "extension_0123456789abcdef0123456789abcdef");
+        if (extension === undefined || extension.owner.kind !== "resource" || extension.mainView === undefined
+          || surfaceId !== "extension_surface_0123456789abcdef0123456789abcdef") {
+          throw new Error("The visual Extension main view is unavailable.");
+        }
+        return visualExtensionMainViewSurface(extension);
+      },
+      closeExtensionMainView: async (surfaceId): Promise<boolean> => {
+        record(`extension-main-view:close:${surfaceId}`);
+        return surfaceId === "extension_surface_0123456789abcdef0123456789abcdef";
       },
       getExtensionPackagePreview: async (extensionId, expectedRevision, backendId, signal): Promise<ExtensionPackagePreviewView> => {
         signal?.throwIfAborted();
@@ -2766,6 +2789,7 @@ interface HarnessParameters {
   readonly computerUpdate: "none" | "available" | "downloading" | "installing";
   readonly computerPlatform: "win32" | "darwin";
   readonly worktreeRemoval: "clean" | "dirty" | "unknown";
+  readonly extensionMainView: boolean;
 }
 
 function harnessParameters(): HarnessParameters {
@@ -2818,7 +2842,8 @@ function harnessParameters(): HarnessParameters {
     computerPlatform: query.get("platform") === "darwin" ? "darwin" : "win32",
     worktreeRemoval: query.get("worktree") === "dirty"
       ? "dirty"
-      : query.get("worktree") === "unknown" ? "unknown" : "clean"
+      : query.get("worktree") === "unknown" ? "unknown" : "clean",
+    extensionMainView: query.get("mainView") === "1"
   };
 }
 
@@ -2887,7 +2912,9 @@ function initialControllerState(parameters: HarnessParameters, files: VisualWork
           : parameters.scenario === "browser"
             ? { kind: "tools" }
           : parameters.scenario === "extensions"
-            ? { kind: "tools", extensionId: "extension_0123456789abcdef0123456789abcdef" }
+            ? parameters.extensionMainView
+              ? { kind: "extensionMainView", extensionId: "extension_0123456789abcdef0123456789abcdef" }
+              : { kind: "tools", extensionId: "extension_0123456789abcdef0123456789abcdef" }
           : { kind: "session", sessionId: "session-1" },
     preferences: {
       ...DEFAULT_UI_PREFERENCES,
@@ -3724,6 +3751,7 @@ function visualExtensions(): readonly ExtensionCatalogEntryView[] {
     author: "Joko Labs",
     description: "Navigate project structure and open focused workspace views.",
     enabled: true,
+    mainView: { title: "Workspace overview", icon: "layout" },
     sidebarSupported: true,
     sidebarVisible: true,
     tools: [{ name: "find_workspace_entry", description: "Find an exact file or directory in the active workspace.", requiresPermission: true }],
@@ -3791,6 +3819,26 @@ function visualExtensions(): readonly ExtensionCatalogEntryView[] {
     setup: { state: "notRequired", revision: 0n, fields: [] },
     useSupported: false
   }];
+}
+
+function visualExtensionMainViewSurface(
+  extension: ExtensionCatalogEntryView
+): ExtensionMainViewSurfaceView {
+  if (extension.owner.kind !== "resource" || extension.mainView === undefined) {
+    throw new Error("The visual Extension main view has no Resource authority.");
+  }
+  return {
+    id: "extension_surface_0123456789abcdef0123456789abcdef",
+    extensionId: extension.id,
+    owner: extension.owner,
+    backendId: "visual-backend",
+    backendRevision: 9n,
+    backendGeneration: 1,
+    endpoint: `${window.location.origin}${VISUAL_EXTENSION_MAIN_VIEW_ENDPOINT}`,
+    ...(extension.mainView.title === undefined ? {} : { title: extension.mainView.title }),
+    ...(extension.mainView.icon === undefined ? {} : { icon: extension.mainView.icon }),
+    expiresAt: FIXED_NOW + 10 * 60_000
+  };
 }
 
 function visualExtensionPackagePreview(extension: ExtensionCatalogEntryView, backendId: string): ExtensionPackagePreviewView {

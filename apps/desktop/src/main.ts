@@ -63,6 +63,7 @@ import {
   type DesktopUpdateStatus,
   INSPECTOR_WINDOW_FEATURES,
   INSPECTOR_WINDOW_URL,
+  isDesktopExtensionId,
   isDesktopSessionDragGestureId,
   isDesktopSessionDragPreviewRequest,
   isInspectorWindowOpenRequest,
@@ -257,6 +258,7 @@ import {
   createNavigationPolicy,
   DESKTOP_APP_ENTRY_URL,
   DESKTOP_APP_SCHEME,
+  isAllowedExtensionWindowNavigation,
   isAllowedMainFrameNavigation,
   isAllowedPackagedBundleResource,
   isAllowedRendererNetworkUrl,
@@ -267,6 +269,7 @@ import {
   mergeContentSecurityPolicyHeaders,
   resolvePackagedAppResource,
   runtimeProcessMonitorEntryUrl,
+  shouldMergeDesktopFrameContentSecurityPolicy,
   validateCredentialSecret,
   validateProfileId
 } from "./security.js";
@@ -376,9 +379,12 @@ let managedInspectorWindowState: windowStateKeeper.State | undefined;
 let managedRuntimeProcessMonitorWindowState: windowStateKeeper.State | undefined;
 const sessionWindows = new Map<string, BrowserWindow>();
 const sessionWindowIdsByContents = new Map<WebContents, string>();
+const extensionWindows = new Map<string, BrowserWindow>();
+const extensionWindowIdsByContents = new Map<WebContents, string>();
 const pageSearchTokensByContents = new WeakMap<WebContents, Map<number, number>>();
 const pageSearchResultBindings = new WeakSet<WebContents>();
 const sessionWindowStates = new Map<string, windowStateKeeper.State>();
+const extensionWindowStates = new Map<string, windowStateKeeper.State>();
 const nativeTaskStatusVisibleSessionsByContents = new Map<WebContents, readonly string[]>();
 const sessionDragNativeResultFence = new SessionDragNativeResultFence<
   BrowserWindow,
@@ -478,9 +484,12 @@ const MAXIMUM_NOTIFICATION_BODY_CHARACTERS = 2_000;
 const MAXIMUM_NOTIFICATION_SESSION_ID_CHARACTERS = 256;
 const MAIN_WINDOW_DEFAULT_GEOMETRY = Object.freeze({ width: 1280, height: 800 });
 const SESSION_WINDOW_DEFAULT_GEOMETRY = Object.freeze({ width: 1100, height: 760 });
+const EXTENSION_WINDOW_DEFAULT_GEOMETRY = Object.freeze({ width: 1040, height: 720 });
 const INSPECTOR_WINDOW_DEFAULT_GEOMETRY = Object.freeze({ width: 520, height: 860 });
 const RUNTIME_PROCESS_MONITOR_WINDOW_DEFAULT_GEOMETRY = Object.freeze({ width: 580, height: 520 });
 const SESSION_WINDOW_STATE_PREFIX = "session-window-state-";
+const EXTENSION_WINDOW_STATE_PREFIX = "extension-window-state-";
+const MAXIMUM_EXTENSION_WINDOWS = 32;
 const MAIN_WINDOW_STATE_FILE = "window-state.json";
 const RUNTIME_PROCESS_MONITOR_WINDOW_STATE_FILE = "runtime-process-monitor-window-state.json";
 const WINDOWS_ATTENTION_OVERLAY_SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><circle cx="8" cy="8" r="7" fill="#e5484d"/><circle cx="8" cy="8" r="3" fill="#ffffff"/></svg>';
@@ -593,6 +602,7 @@ if (!app.requestSingleInstanceLock()) {
     sessionDragNativeResultFence.dispose();
     desktopKeepAwakeController?.release();
     destroyRuntimeProcessMonitorWindow();
+    destroyExtensionWindows();
     destroySessionWindows();
     nativeTaskStatusVisibleSessionsByContents.clear();
     macNativeTaskStatusHost?.dispose();
@@ -886,7 +896,7 @@ function createWindow(): void {
     callback({});
   });
   electronSession.webRequest.onHeadersReceived((details, callback) => {
-    if (details.resourceType !== "mainFrame" && details.resourceType !== "subFrame") {
+    if (!shouldMergeDesktopFrameContentSecurityPolicy(details.resourceType, details.url)) {
       callback({ responseHeaders: details.responseHeaders });
       return;
     }
@@ -1147,14 +1157,24 @@ function recordPackagedSmokeProgress(step: string): void {
   }
 }
 
-async function loadUi(window: BrowserWindow, bootSessionId?: string): Promise<void> {
+type DesktopUiWindowIdentity =
+  | { readonly kind: "session"; readonly id: string }
+  | { readonly kind: "extension"; readonly id: string };
+
+async function loadUi(window: BrowserWindow, identity?: DesktopUiWindowIdentity): Promise<void> {
   const withWindowIdentity = (value: string): string => {
-    if (bootSessionId === undefined) return value;
+    if (identity === undefined) return value;
     const url = new URL(value);
     url.search = "";
-    url.searchParams.set("sessionWindow", "1");
-    url.searchParams.set("bootSession", bootSessionId);
-    url.hash = `#/tasks/${encodeURIComponent(bootSessionId)}`;
+    if (identity.kind === "session") {
+      url.searchParams.set("sessionWindow", "1");
+      url.searchParams.set("bootSession", identity.id);
+      url.hash = `#/tasks/${encodeURIComponent(identity.id)}`;
+    } else {
+      url.searchParams.set("extensionWindow", "1");
+      url.searchParams.set("bootExtension", identity.id);
+      url.hash = `#/extensions/${encodeURIComponent(identity.id)}`;
+    }
     return url.href;
   };
   if (navigationPolicy.developmentUrl !== undefined) {
@@ -1166,19 +1186,19 @@ async function loadUi(window: BrowserWindow, bootSessionId?: string): Promise<vo
 }
 
 function desktopRendererLossError(
-  kind: "main" | "session" | "runtime",
+  kind: "main" | "session" | "extension" | "runtime",
   details: { readonly reason: string; readonly exitCode: number }
 ): Error {
   const surface = kind === "main"
     ? "application"
-    : kind === "runtime" ? "runtime resource window" : "task window";
+    : kind === "runtime" ? "runtime resource window" : kind === "extension" ? "Extension window" : "task window";
   return new Error(
     `The ${surface} renderer stopped unexpectedly (${details.reason}, exit ${details.exitCode}).`
   );
 }
 
 async function presentDesktopWindowLoadFailure(
-  kind: "main" | "session" | "runtime",
+  kind: "main" | "session" | "extension" | "runtime",
   error: unknown,
   attempt: number,
   preferredOwner?: BrowserWindow
@@ -1837,7 +1857,7 @@ async function openSessionApplicationWindow(
     if (sessionUiLoadRecovery !== undefined || window.isDestroyed() || quitting) return;
     const options = {
       unavailable: () => window.isDestroyed() || quitting,
-      load: () => loadUi(window, sessionId),
+      load: () => loadUi(window, { kind: "session", id: sessionId }),
       presentFailure: (error: unknown, attempt: number) =>
         presentDesktopWindowLoadFailure("session", error, attempt),
       close: () => {
@@ -1911,6 +1931,152 @@ async function openSessionApplicationWindow(
     clearDesktopNativeTaskStatusVisibility(windowContents);
   });
   beginSessionUiLoadRecovery();
+  return { focusedExisting: false };
+}
+
+async function openExtensionApplicationWindow(
+  extensionId: string
+): Promise<{ readonly focusedExisting: boolean }> {
+  if (!isDesktopExtensionId(extensionId)) throw new TypeError("Extension identity is invalid.");
+  const existing = extensionWindows.get(extensionId);
+  if (existing !== undefined && !existing.isDestroyed()) {
+    showWindowFromTray(existing);
+    return { focusedExisting: true };
+  }
+  if (existing !== undefined) {
+    extensionWindows.delete(extensionId);
+    for (const [contents, ownerId] of extensionWindowIdsByContents) {
+      if (ownerId === extensionId) extensionWindowIdsByContents.delete(contents);
+    }
+    extensionWindowStates.delete(extensionId);
+  }
+  if ([...extensionWindows.values()].filter((candidate) => !candidate.isDestroyed()).length >= MAXIMUM_EXTENSION_WINDOWS) {
+    throw new Error("Extension window capacity reached.");
+  }
+  if (!canShowDesktopWindow({
+    quitting,
+    channelQuitHandoffPending: desktopUpdateChannelQuitHandoffPending,
+    nativeInstallQuitHandoffPending: desktopUpdateNativeInstallQuitHandoffPending,
+    completeExitQuitHandoffPending: desktopCompleteExitQuitHandoffPending
+  })) throw new Error("Extension windows are unavailable while the application is exiting.");
+
+  const frameOptions = process.platform === "darwin"
+    ? { titleBarStyle: "hidden" as const, trafficLightPosition: { x: 12, y: 16 } }
+    : { frame: false };
+  const state = windowStateKeeper({
+    defaultWidth: EXTENSION_WINDOW_DEFAULT_GEOMETRY.width,
+    defaultHeight: EXTENSION_WINDOW_DEFAULT_GEOMETRY.height,
+    file: extensionWindowStateFile(extensionId)
+  });
+  const window = new BrowserWindow({
+    x: state.x,
+    y: state.y,
+    width: state.width,
+    height: state.height,
+    minWidth: 640,
+    minHeight: 480,
+    backgroundColor: "#f2f2f2",
+    title: "Joko",
+    autoHideMenuBar: true,
+    show: false,
+    ...activationClickBrowserWindowOptions(),
+    ...frameOptions,
+    webPreferences: {
+      preload: join(sourceDirectory, "preload.cjs"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      nodeIntegrationInWorker: false,
+      sandbox: true,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
+      webviewTag: false,
+      navigateOnDragDrop: false,
+      safeDialogs: true,
+      spellcheck: false,
+      backgroundThrottling: false
+    }
+  });
+  const windowContents = window.webContents;
+  const attentionSourceId = windowContents.id;
+  extensionWindows.set(extensionId, window);
+  extensionWindowIdsByContents.set(windowContents, extensionId);
+  extensionWindowStates.set(extensionId, state);
+  state.manage(window);
+  windowContents.setZoomFactor(currentWindowZoomFactor);
+
+  let extensionUiLoadRecovery: Promise<void> | undefined;
+  const beginExtensionUiLoadRecovery = (initialFailure?: unknown): void => {
+    if (extensionUiLoadRecovery !== undefined || window.isDestroyed() || quitting) return;
+    const options = {
+      unavailable: () => window.isDestroyed() || quitting,
+      load: () => loadUi(window, { kind: "extension", id: extensionId }),
+      presentFailure: (error: unknown, attempt: number) =>
+        presentDesktopWindowLoadFailure("extension", error, attempt),
+      close: () => {
+        if (!window.isDestroyed()) window.destroy();
+      }
+    };
+    const recovery = initialFailure === undefined
+      ? loadDesktopWindowWithRecovery(options)
+      : recoverDesktopWindowAfterFailure(options, initialFailure);
+    const operation = recovery
+      .then(() => undefined)
+      .catch((error: unknown) => {
+        process.stderr.write(`JOKO_DESKTOP_EXTENSION_WINDOW_RECOVERY_FAILED ${safeSmokeError(error)}\n`);
+      })
+      .finally(() => {
+        if (extensionUiLoadRecovery === operation) extensionUiLoadRecovery = undefined;
+      });
+    extensionUiLoadRecovery = operation;
+  };
+  windowContents.on("did-start-loading", () => {
+    stopGlobalVoiceShortcutCapture(windowContents);
+    releaseApplicationMenuShortcutRecording(windowContents.id);
+    releaseDesktopAttentionSource(attentionSourceId);
+    clearDesktopNativeTaskStatusVisibility(windowContents);
+  });
+  windowContents.on("render-process-gone", (_event, details) => {
+    stopGlobalVoiceShortcutCapture(windowContents);
+    releaseApplicationMenuShortcutRecording(windowContents.id);
+    releaseDesktopAttentionSource(attentionSourceId);
+    clearDesktopNativeTaskStatusVisibility(windowContents);
+    if (!window.isDestroyed() && !quitting) {
+      beginExtensionUiLoadRecovery(desktopRendererLossError("extension", details));
+    }
+  });
+  windowContents.on("will-prevent-unload", notifyDesktopQuitBlocked);
+  windowContents.setWindowOpenHandler(({ url }) => {
+    if (isSafeExternalUrl(url)) void openExternalSafely(url).catch(() => undefined);
+    return { action: "deny" };
+  });
+  windowContents.on("will-navigate", (event, url) => {
+    if (!isAllowedExtensionWindowNavigation(url, extensionId, navigationPolicy)) {
+      event.preventDefault();
+      if (isSafeExternalUrl(url)) void openExternalSafely(url).catch(() => undefined);
+    }
+  });
+  windowContents.on("will-redirect", (event, url) => {
+    if (!isAllowedExtensionWindowNavigation(url, extensionId, navigationPolicy)) event.preventDefault();
+  });
+  windowContents.on("will-attach-webview", (event) => event.preventDefault());
+  windowContents.on("select-bluetooth-device", (event, _devices, callback) => {
+    event.preventDefault();
+    callback("");
+  });
+  windowContents.setWebRTCIPHandlingPolicy("disable_non_proxied_udp");
+  window.once("ready-to-show", () => {
+    if (!window.isDestroyed()) window.show();
+  });
+  window.once("closed", () => {
+    releaseDesktopAttentionSource(attentionSourceId);
+    stopGlobalVoiceShortcutCapture(windowContents);
+    releaseApplicationMenuShortcutRecording(attentionSourceId);
+    if (extensionWindows.get(extensionId) === window) extensionWindows.delete(extensionId);
+    extensionWindowIdsByContents.delete(windowContents);
+    extensionWindowStates.delete(extensionId);
+    clearDesktopNativeTaskStatusVisibility(windowContents);
+  });
+  beginExtensionUiLoadRecovery();
   return { focusedExisting: false };
 }
 
@@ -2082,7 +2248,8 @@ function applicationWindows(): readonly BrowserWindow[] {
     ...(runtimeProcessMonitorWindow === undefined || runtimeProcessMonitorWindow.isDestroyed()
       ? []
       : [runtimeProcessMonitorWindow]),
-    ...[...sessionWindows.values()].filter((window) => !window.isDestroyed())
+    ...[...sessionWindows.values()].filter((window) => !window.isDestroyed()),
+    ...[...extensionWindows.values()].filter((window) => !window.isDestroyed())
   ];
 }
 
@@ -2122,7 +2289,8 @@ function isProviderModelApplicationForeground(): boolean {
     mainWindow,
     inspectorWindow,
     runtimeProcessMonitorWindow,
-    ...sessionWindows.values()
+    ...sessionWindows.values(),
+    ...extensionWindows.values()
   ].some((window) => window !== undefined && !window.isDestroyed() && window.isFocused());
 }
 
@@ -2198,6 +2366,12 @@ async function resetDesktopApplicationLayout(initiatingContents: WebContents): P
     if (window.isDestroyed()) resetDormantManagedWindowState(state);
     else targets.push({ window, state, defaults: SESSION_WINDOW_DEFAULT_GEOMETRY });
   }
+  for (const [extensionId, window] of extensionWindows) {
+    const state = extensionWindowStates.get(extensionId);
+    if (state === undefined) continue;
+    if (window.isDestroyed()) resetDormantManagedWindowState(state);
+    else targets.push({ window, state, defaults: EXTENSION_WINDOW_DEFAULT_GEOMETRY });
+  }
   if (managedInspectorWindowState !== undefined) {
     if (inspectorWindow !== undefined && !inspectorWindow.isDestroyed()) {
       targets.push({ window: inspectorWindow, state: managedInspectorWindowState, defaults: INSPECTOR_WINDOW_DEFAULT_GEOMETRY });
@@ -2218,12 +2392,18 @@ async function resetDesktopApplicationLayout(initiatingContents: WebContents): P
   }
   await resetManagedWindowGeometry(targets);
 
-  const openStateFiles = new Set([...sessionWindows]
+  const openSessionStateFiles = new Set([...sessionWindows]
     .filter(([, window]) => !window.isDestroyed())
     .map(([sessionId]) => sessionWindowStateFile(sessionId)));
+  const openExtensionStateFiles = new Set([...extensionWindows]
+    .filter(([, window]) => !window.isDestroyed())
+    .map(([extensionId]) => extensionWindowStateFile(extensionId)));
   const entries = await readdir(app.getPath("userData"), { withFileTypes: true }).catch(() => []);
   await Promise.all(entries.flatMap((entry) => entry.isFile() && entry.name.startsWith(SESSION_WINDOW_STATE_PREFIX) &&
-    entry.name.endsWith(".json") && !openStateFiles.has(entry.name)
+    entry.name.endsWith(".json") && !openSessionStateFiles.has(entry.name)
+    ? [unlink(join(app.getPath("userData"), entry.name)).catch(() => undefined)]
+    : entry.isFile() && entry.name.startsWith(EXTENSION_WINDOW_STATE_PREFIX) &&
+      entry.name.endsWith(".json") && !openExtensionStateFiles.has(entry.name)
     ? [unlink(join(app.getPath("userData"), entry.name)).catch(() => undefined)]
     : []));
   if (inspectorWindow === undefined || inspectorWindow.isDestroyed()) {
@@ -2240,12 +2420,17 @@ async function resetDesktopApplicationLayout(initiatingContents: WebContents): P
     ...(mainWindow === undefined ? [] : [mainWindow]),
     ...(runtimeProcessMonitorWindow === undefined ? [] : [runtimeProcessMonitorWindow]),
     ...sessionWindows.values(),
+    ...extensionWindows.values(),
     ...(inspectorWindow === undefined ? [] : [inspectorWindow])
   ], initiatingContents);
 }
 
 function sessionWindowStateFile(sessionId: string): string {
   return `${SESSION_WINDOW_STATE_PREFIX}${createHash("sha256").update(sessionId).digest("hex").slice(0, 24)}.json`;
+}
+
+function extensionWindowStateFile(extensionId: string): string {
+  return `${EXTENSION_WINDOW_STATE_PREFIX}${createHash("sha256").update(extensionId).digest("hex").slice(0, 24)}.json`;
 }
 
 function destroySessionWindows(): void {
@@ -3061,6 +3246,16 @@ function broadcastDesktopWindowInteractionSettings(settings: DesktopWindowIntera
   }
 }
 
+function destroyExtensionWindows(): void {
+  const windows = [...extensionWindows.values()];
+  extensionWindows.clear();
+  extensionWindowIdsByContents.clear();
+  extensionWindowStates.clear();
+  for (const window of windows) {
+    if (!window.isDestroyed()) window.destroy();
+  }
+}
+
 function canApplyMainWindowClose(): boolean {
   return canShowDesktopWindow({
     quitting,
@@ -3760,6 +3955,13 @@ function registerIpc(): void {
     }
     return openSessionApplicationWindow(parameters[0]);
   });
+  ipcMain.handle(DESKTOP_CHANNELS.extensionWindowOpen, async (event, ...parameters: unknown[]) => {
+    assertTrustedIpcSender(event);
+    if (parameters.length !== 1 || !isDesktopExtensionId(parameters[0])) {
+      throw new TypeError("Extension window open requires one exact Extension identity.");
+    }
+    return openExtensionApplicationWindow(parameters[0]);
+  });
   ipcMain.handle(DESKTOP_CHANNELS.sessionDragPreviewBegin, (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);
     if (parameters.length !== 1 || !isDesktopSessionDragPreviewRequest(parameters[0]) ||
@@ -3899,10 +4101,16 @@ function registerIpc(): void {
       return;
     }
     const sessionId = sessionWindowIdsByContents.get(event.sender);
-    if (sessionId === undefined || sessionWindows.get(sessionId) !== window) {
-      throw new Error("Desktop close requests are restricted to application windows.");
+    if (sessionId !== undefined && sessionWindows.get(sessionId) === window) {
+      window.close();
+      return;
     }
-    window.close();
+    const extensionId = extensionWindowIdsByContents.get(event.sender);
+    if (extensionId !== undefined && extensionWindows.get(extensionId) === window) {
+      window.close();
+      return;
+    }
+    throw new Error("Desktop close requests are restricted to application windows.");
   });
   ipcMain.handle(DESKTOP_CHANNELS.inspectorWindowReady, (event, ...parameters: unknown[]) => {
     if (parameters.length !== 0) throw new TypeError("Inspector readiness does not accept parameters.");
@@ -4924,7 +5132,10 @@ function trustedApplicationWindowForContents(contents: WebContents): BrowserWind
     return isRuntimeProcessMonitorNavigation(contents.getURL()) ? owner : undefined;
   }
   const sessionId = sessionWindowIdsByContents.get(contents);
-  return sessionId !== undefined && sessionWindows.get(sessionId) === owner ? owner : undefined;
+  if (sessionId !== undefined && sessionWindows.get(sessionId) === owner) return owner;
+  const extensionId = extensionWindowIdsByContents.get(contents);
+  return extensionId !== undefined && extensionWindows.get(extensionId) === owner
+    && isAllowedExtensionWindowNavigation(contents.getURL(), extensionId, navigationPolicy) ? owner : undefined;
 }
 
 function isTrustedApplicationContents(contents: WebContents): boolean {

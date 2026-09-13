@@ -841,6 +841,139 @@ describe("Connect Extension catalog boundary", () => {
     expect(prepareCancel).toHaveBeenCalledWith(pendingJob.id, 1n);
     expect(abort).toHaveBeenCalledWith(pendingJob.id);
   });
+
+  it("opens, probes, closes, and connection-revokes one exact Resource main-view surface", async () => {
+    const discoveredRevision = `sha256:${"a".repeat(64)}`;
+    const mainView = {
+      html: "ui/review/index.html",
+      title: "Review",
+      icon: "layout" as const,
+      extensionEntry: "extensions/review.ts"
+    };
+    const entry = extensionEntry({
+      owner: { kind: "resource", resourceId: "resource-package", discoveredRevision, resourceVersion: 5n },
+      mainView,
+      sidebarSupported: true
+    });
+    const resource = {
+      id: "resource-package",
+      backendId: "pi",
+      kind: "package" as const,
+      scope: "managed" as const,
+      name: "@sample/review",
+      version: "1.0.0",
+      sourceKind: "local" as const,
+      sourceIdentity: "local-review",
+      sourceDisplay: "Review package",
+      canonicalPathFingerprint: `sha256:${"b".repeat(64)}`,
+      symbolicLinkDetected: false,
+      specialFileDetected: false,
+      discoveredRevision,
+      packageIdentity: "@sample/review",
+      resourceDetails: [{
+        kind: "extension" as const,
+        name: "review.ts",
+        entryPath: "extensions/review.ts",
+        mainView: { html: mainView.html, title: mainView.title, icon: mainView.icon },
+        compatibility: "supported" as const,
+        compatibilityIssues: [] as const,
+        detectedApis: [] as const,
+        adaptedApis: [] as const,
+        unsupportedApis: [] as const
+      }],
+      runtimeRequirements: [],
+      warnings: [],
+      disabledLifecycleScripts: [],
+      canToggle: true,
+      requiresExtensionApproval: false,
+      postMutationNotice: false,
+      state: "loaded" as const,
+      enabled: true,
+      versionNumber: 5n,
+      updatedAt: 1
+    };
+    let backendGeneration = 3;
+    const backend = () => ({ revision: 9n, descriptor: { id: "pi", instanceGeneration: backendGeneration } });
+    const authority = {
+      extensionId: entry.id,
+      resourceId: resource.id,
+      backendId: "pi",
+      backendRevision: 9n,
+      backendGeneration: 3,
+      resourceRevision: 5n,
+      discoveredRevision,
+      packageName: "@sample/review",
+      packageVersion: "1.0.0",
+      extensionEntry: "extensions/review.ts",
+      mainView: { html: mainView.html, title: mainView.title, icon: mainView.icon }
+    };
+    const nativeSurface = {
+      id: `extension_surface_${"c".repeat(32)}`,
+      extensionId: entry.id,
+      authority,
+      endpoint: `/v1/extensions/main-views/extension_surface_${"c".repeat(32)}/${"d".repeat(64)}/index.html`,
+      title: "Review",
+      icon: "layout" as const,
+      expiresAt: 1_800_000_060_000
+    };
+    let finalAuthorityFence: (() => void | Promise<void>) | undefined;
+    const open = vi.fn(async (input: { readonly assertAuthorityCurrent: () => void | Promise<void> }) => {
+      finalAuthorityFence = input.assertAuthorityCurrent;
+      return nativeSurface;
+    });
+    const getSurface = vi.fn(async () => nativeSurface);
+    const closeSurface = vi.fn(async () => true);
+    const closeConnection = vi.fn(async () => undefined);
+    let revoked: (() => void) | undefined;
+    const stopRevocation = vi.fn();
+    const fence = vi.fn();
+    const services = createConnectServices(stubApplication({
+      store: { getBackend: backend },
+      connections: {
+        authenticate: () => connection,
+        fence,
+        onRevoked: (_connectionId: string, listener: () => void) => { revoked = listener; return stopRevocation; }
+      },
+      piResources: { list: () => [resource], get: () => resource },
+      extensionCatalog: { reconcile: () => catalog(entry), get: () => entry },
+      extensionMainViews: { open, getSurface, closeSurface, closeConnection },
+      sessionHost: {}
+    }));
+
+    const opened = await invoke<contract.OpenExtensionMainViewResponse>(services.extension.openExtensionMainView, {
+      extensionId: entry.id,
+      expectedRevision: { value: entry.revision }
+    });
+    expect(opened.surface).toMatchObject({
+      surfaceId: nativeSurface.id,
+      extensionId: entry.id,
+      endpoint: nativeSurface.endpoint,
+      title: "Review",
+      icon: contract.ExtensionMainViewIcon.LAYOUT,
+      owner: { resourceId: resource.id, resourceVersion: { value: 5n }, discoveredRevision },
+      backendId: "pi",
+      backendRevision: { value: 9n },
+      backendGeneration: 3n
+    });
+    expect(open).toHaveBeenCalledWith(expect.objectContaining({ authority, connectionId: connection.id }));
+    await finalAuthorityFence?.();
+    expect(fence).toHaveBeenCalledWith(connection);
+    backendGeneration += 1;
+    await expect(Promise.resolve().then(() => finalAuthorityFence?.())).rejects.toThrow(/authority changed/u);
+
+    const probed = await invoke<contract.GetExtensionMainViewSurfaceResponse>(services.extension.getExtensionMainViewSurface, {
+      surfaceId: nativeSurface.id
+    });
+    expect(probed.surface?.surfaceId).toBe(nativeSurface.id);
+    const closed = await invoke<contract.CloseExtensionMainViewResponse>(services.extension.closeExtensionMainView, {
+      surfaceId: nativeSurface.id
+    });
+    expect(closed.closed).toBe(true);
+    expect(getSurface).toHaveBeenCalledWith(nativeSurface.id, connection.id);
+    expect(closeSurface).toHaveBeenCalledWith(nativeSurface.id, connection.id);
+    revoked?.();
+    await vi.waitFor(() => expect(closeConnection).toHaveBeenCalledWith(connection.id));
+  });
 });
 
 function catalog(entry: ExtensionCatalogDescriptor) {

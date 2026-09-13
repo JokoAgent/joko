@@ -10,6 +10,7 @@ describe("public route contract", () => {
       { route: { kind: "schedules", scheduleId: "schedule/one" } as const, hash: "#/schedules?focus=schedule%2Fone" },
       { route: { kind: "schedules" } as const, hash: "#/schedules" },
       { route: { kind: "tools", extensionId: "extension_0123456789abcdef0123456789abcdef" } as const, hash: "#/tools?extension=extension_0123456789abcdef0123456789abcdef" },
+      { route: { kind: "extensionMainView", extensionId: "extension_0123456789abcdef0123456789abcdef" } as const, hash: "#/extensions/extension_0123456789abcdef0123456789abcdef" },
       { route: { kind: "newSession" } as const, hash: "#/tasks/new" },
       { route: { kind: "newSession", targetId: "project/one" } as const, hash: "#/tasks/new?target=project%2Fone" },
       { route: { kind: "newSession", dialogueBackendId: "agent/one" } as const, hash: "#/tasks/new?dialogue=agent%2Fone" }
@@ -20,6 +21,7 @@ describe("public route contract", () => {
     }
     expect(routeFromHash("#/schedules?focus=%20")).toEqual({ kind: "schedules" });
     expect(routeFromHash("#/tools?extension=not-an-extension")).toEqual({ kind: "tools" });
+    expect(routeFromHash("#/extensions/not-an-extension")).toEqual({ kind: "session" });
     expect(routeFromHash("#/tasks/new?target=project&dialogue=agent")).toEqual({ kind: "newSession", targetId: "project" });
     expect(routeFromHash("#/tasks/session-1")).toEqual({ kind: "session", sessionId: "session-1" });
   });

@@ -84,6 +84,7 @@ import {
 } from "./session-split-layout.js";
 import { desktopSessionTaskLink, isSessionApplicationWindow, openSessionWindowFallback, sessionTaskLink } from "./session-window-navigation.js";
 import { desktopDeepLinkRouteHash } from "./desktop-deep-link-navigation.js";
+import { isExtensionApplicationWindow, openExtensionWindowFallback } from "./extension-window-navigation.js";
 import { CLIENT_LAYOUT_RESET_EVENT } from "./client-layout-reset.js";
 import {
   applySessionProjectOverrides,
@@ -94,6 +95,7 @@ import {
   type SessionProjectNavigationPlacement
 } from "./session-project-navigation.js";
 import { isRuntimeProcessMonitorWindow } from "./runtime-process-monitor-window.js";
+import { ExtensionMainViewPage } from "./components/ExtensionMainViewPage.js";
 import { createProviderModelRefreshLifecycle } from "./provider-model-refresh-lifecycle.js";
 import {
   prefetchWorktreeRemovalPreflight,
@@ -164,7 +166,9 @@ function AppControllerRoot(): JSX.Element {
   const t = useCallback((key: Parameters<typeof translate>[1], values?: Parameters<typeof translate>[2]) => translate(controller.state.preferences.locale, key, values), [controller.state.preferences.locale]);
   const runtimeProcessMonitor = typeof window !== "undefined" && isRuntimeProcessMonitorWindow(window.location);
   if (runtimeProcessMonitor) return <><RuntimeProcessMonitorWindow controller={controller} t={t} /><DesktopWindowControls t={t} /></>;
-  const applicationWindowOwner = typeof window !== "undefined" && !isSessionApplicationWindow(window.location);
+  const applicationWindowOwner = typeof window !== "undefined"
+    && !isSessionApplicationWindow(window.location)
+    && !isExtensionApplicationWindow(window.location);
   return <><StartupUpdateOverlay t={t} />{applicationWindowOwner && <DesktopGlobalVoiceBridge controller={controller} />}<AppWithController controller={controller} /><DesktopWindowControls t={t} /></>;
 }
 
@@ -176,6 +180,8 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
 }): JSX.Element {
   const { state } = controller;
   const sessionApplicationWindow = typeof window !== "undefined" && isSessionApplicationWindow(window.location);
+  const extensionApplicationWindow = typeof window !== "undefined" && isExtensionApplicationWindow(window.location);
+  const auxiliaryApplicationWindow = sessionApplicationWindow || extensionApplicationWindow;
   const t = useCallback((key: Parameters<typeof translate>[1], values?: Parameters<typeof translate>[2]) => translate(state.preferences.locale, key, values), [state.preferences.locale]);
   const [renameSession, setRenameSession] = useState<SessionView>();
   const [archiveRemoval, setArchiveRemoval] = useState<SessionRemovalDialogRequest>();
@@ -199,20 +205,20 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     width: NAVIGATION_DEFAULT_WIDTH
   }));
   const setWindowNavigationLayout = useCallback((layout: { readonly mode: NavigationMode; readonly width: number }): void => {
-    if (sessionApplicationWindow) {
+    if (auxiliaryApplicationWindow) {
       setSessionWindowNavigation(layout);
       return;
     }
     void controller.setNavigationLayout(layout);
-  }, [controller, sessionApplicationWindow]);
+  }, [auxiliaryApplicationWindow, controller]);
   const setWindowNavigationOpen = useCallback((open: boolean): void => {
-    if (sessionApplicationWindow) {
+    if (auxiliaryApplicationWindow) {
       setSessionWindowNavigation((current) => ({ ...current, mode: open ? "expanded" : "hidden" }));
       return;
     }
     void controller.setNavigationOpen(open);
-  }, [controller, sessionApplicationWindow]);
-  const effectiveNavigationOpen = sessionApplicationWindow
+  }, [auxiliaryApplicationWindow, controller]);
+  const effectiveNavigationOpen = auxiliaryApplicationWindow
     ? sessionWindowNavigation.mode !== "hidden"
     : state.preferences.navigationOpen;
   const [searchTimelineWindow, setSearchTimelineWindow] = useState<{ readonly sessionId: string; readonly items: readonly TimelineItemView[] }>();
@@ -299,7 +305,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     }
   });
   const providerModelRefreshOwnerKey = state.activeProfile?.id;
-  const providerModelRefreshLifecycleAvailable = !sessionApplicationWindow &&
+  const providerModelRefreshLifecycleAvailable = !auxiliaryApplicationWindow &&
     window.jokoDesktop?.capabilities.includes("provider.modelCatalogLifecycle") === true;
   useEffect(() => {
     providerModelRefreshLifecycleRef.current?.syncConnection({
@@ -342,7 +348,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     const resetView = (): void => {
       setSessionSplitLayout({});
       setFocusedSplitSessionId(layoutRouteSessionIdRef.current);
-      if (sessionApplicationWindow) setSessionWindowNavigation({ mode: "hidden", width: NAVIGATION_DEFAULT_WIDTH });
+      if (auxiliaryApplicationWindow) setSessionWindowNavigation({ mode: "hidden", width: NAVIGATION_DEFAULT_WIDTH });
     };
     window.addEventListener(CLIENT_LAYOUT_RESET_EVENT, resetView);
     const unsubscribe = window.jokoDesktop?.layout?.onReset(() => {
@@ -352,11 +358,11 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       window.removeEventListener(CLIENT_LAYOUT_RESET_EVENT, resetView);
       unsubscribe?.();
     };
-  }, [sessionApplicationWindow]);
+  }, [auxiliaryApplicationWindow]);
   useEffect(() => {
     if (typeof BroadcastChannel === "undefined") return;
     const channel = new BroadcastChannel("joko:application-window-bootstrap");
-    const requestId = sessionApplicationWindow
+    const requestId = auxiliaryApplicationWindow
       ? `${Date.now().toString(36)}-${window.crypto.getRandomValues(new Uint32Array(2)).join("-")}`
       : undefined;
     channel.onmessage = (event: MessageEvent<unknown>): void => {
@@ -382,9 +388,9 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       window.clearTimeout(stop);
       channel.close();
     };
-  }, [sessionApplicationWindow]);
+  }, [auxiliaryApplicationWindow]);
   useEffect(() => {
-    if (!sessionApplicationWindow || !state.ready || state.activeProfile !== undefined ||
+    if (!auxiliaryApplicationWindow || !state.ready || state.activeProfile !== undefined ||
       state.connectionState !== "disconnected" || bootConnectionProfileId === undefined || bootConnectionAttemptedRef.current) return;
     const profile = state.profiles.find((candidate) => candidate.id === bootConnectionProfileId);
     if (profile === undefined) return;
@@ -392,7 +398,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     void controllerRef.current.connect(profile).catch(() => {
       bootConnectionAttemptedRef.current = false;
     });
-  }, [bootConnectionProfileId, sessionApplicationWindow, state.activeProfile, state.connectionState, state.profiles, state.ready]);
+  }, [auxiliaryApplicationWindow, bootConnectionProfileId, state.activeProfile, state.connectionState, state.profiles, state.ready]);
   const sessionNotificationTrackerRef = useRef(new SessionNotificationTracker());
   const scheduleNotificationTrackerRef = useRef(new ScheduleNotificationTracker());
   const notificationOwnerId = state.activeProfile?.serverId;
@@ -400,7 +406,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const attentionBadgeSyncRef = useRef<Promise<void>>(Promise.resolve());
   useEffect(() => {
     const desktop = window.jokoDesktop;
-    const enabled = !sessionApplicationWindow && state.connectionState === "connected" &&
+    const enabled = !auxiliaryApplicationWindow && state.connectionState === "connected" &&
       state.snapshot.revision !== 0n && desktop?.capabilities.includes("attention.badge") === true;
     const delta = reconcileSessionAttentionBadgeProjection(
       attentionBadgeProjectionRef.current,
@@ -419,7 +425,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     });
   }, [
     notificationOwnerId,
-    sessionApplicationWindow,
+    auxiliaryApplicationWindow,
     state.connectionState,
     state.snapshot.revision,
     state.snapshot.sessions
@@ -436,7 +442,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   useEffect(() => {
     const tracker = sessionNotificationTrackerRef.current;
     if (
-      sessionApplicationWindow
+      auxiliaryApplicationWindow
       ||
       notificationOwnerId === undefined
       || state.connectionState !== "connected"
@@ -481,7 +487,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     state.snapshot.revision,
     state.snapshot.schedules,
     state.snapshot.sessions,
-    sessionApplicationWindow,
+    auxiliaryApplicationWindow,
     t
   ]);
   useEffect(() => {
@@ -564,7 +570,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     }
   }, [openPortableSessionImportFile, portableImportTargets.length, t]);
   useEffect(() => {
-    if (sessionApplicationWindow) return;
+    if (auxiliaryApplicationWindow) return;
     const api = window.jokoDesktop?.deepLinks;
     if (api === undefined) return;
     let active = true;
@@ -588,7 +594,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       active = false;
       unsubscribe();
     };
-  }, [sessionApplicationWindow]);
+  }, [auxiliaryApplicationWindow]);
 
   const describeSubmissionError = useCallback((error: unknown) => messageOf(error, t("error.unexpected")), [t]);
   const submitNewSession = useNewSessionSubmission(controller, setActionError, setBusyAction, describeSubmissionError);
@@ -632,14 +638,14 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   useEffect(() => {
     if (splitOwnerId === undefined || splitOwnerRef.current === splitOwnerId) return;
     splitOwnerRef.current = splitOwnerId;
-    const layout = readSessionSplitLayout(splitOwnerId, !sessionApplicationWindow);
+    const layout = readSessionSplitLayout(splitOwnerId, !auxiliaryApplicationWindow);
     setSessionSplitLayout(layout);
     setFocusedSplitSessionId(activeSession?.id ?? sessionSplitPanes(layout.root)[0]?.sessionId);
-  }, [activeSession?.id, sessionApplicationWindow, splitOwnerId]);
+  }, [activeSession?.id, auxiliaryApplicationWindow, splitOwnerId]);
   const commitSessionSplitLayout = useCallback((layout: SessionSplitLayout): void => {
     setSessionSplitLayout(layout);
-    if (splitOwnerId !== undefined) writeSessionSplitLayout(splitOwnerId, layout, !sessionApplicationWindow);
-  }, [sessionApplicationWindow, splitOwnerId]);
+    if (splitOwnerId !== undefined) writeSessionSplitLayout(splitOwnerId, layout, !auxiliaryApplicationWindow);
+  }, [auxiliaryApplicationWindow, splitOwnerId]);
   useEffect(() => {
     if (splitOwnerId === undefined || state.connectionState !== "connected" || state.snapshot.revision === 0n) return;
     const existing = new Set(state.snapshot.sessions.filter((session) => !session.archived).map((session) => session.id));
@@ -1119,7 +1125,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   if (state.connectionState === "connecting" && state.snapshot.revision === 0n) return <>{applicationMenuFeedback}<ConnectingScreen controller={controller} t={t} /></>;
   if (state.snapshot.revision === 0n && state.connectionState !== "connected") return <>{applicationMenuFeedback}<UnavailableScreen controller={controller} t={t} error={state.error} /></>;
 
-  const preferredNavigation = sessionApplicationWindow ? sessionWindowNavigation : {
+  const preferredNavigation = auxiliaryApplicationWindow ? sessionWindowNavigation : {
     mode: state.preferences.navigationMode,
     width: state.preferences.navigationWidth
   } as const;
@@ -1181,7 +1187,9 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   };
   const routeBoundaryKey = routeErrorBoundaryKey(
     state.route.kind,
-    state.route.kind === "session" || state.route.kind === "files" ? state.route.sessionId : undefined
+    state.route.kind === "session" || state.route.kind === "files"
+      ? state.route.sessionId
+      : state.route.kind === "extensionMainView" ? state.route.extensionId : undefined
   );
   const shellOverlays = <>
     <VisionBridgeToasts t={t} />
@@ -1576,7 +1584,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     >
       <NativeTaskStatusBridge
         controller={controller}
-        ownsProjection={!sessionApplicationWindow}
+        ownsProjection={!auxiliaryApplicationWindow}
         visibleSessionIds={nativeTaskStatusVisibleSessionIds}
       />
       <a className="skip-link" href="#main-content">{t("app.skipToContent")}</a>
@@ -1807,6 +1815,23 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
             runAction={runAction}
             onSelectExtension={(extensionId) => controller.navigate({ kind: "tools", ...(extensionId === undefined ? {} : { extensionId }) })}
             onOpenNavigation={() => setWindowNavigationOpen(true)}
+          />}
+          {state.route.kind === "extensionMainView" && <ExtensionMainViewPage
+            controller={controller}
+            extensionId={state.route.extensionId}
+            t={t}
+            navigationOpen={navigationOpen}
+            onOpenNavigation={() => setWindowNavigationOpen(true)}
+            onOpenIndependent={(extensionId) => {
+              if (window.jokoDesktop?.capabilities.includes("extension.windows") === true) {
+                void window.jokoDesktop.extensionWindows.open(extensionId)
+                  .catch(() => setActionError(t("extensions.mainView.windowFailed")));
+                return;
+              }
+              if (openExtensionWindowFallback(window.location, extensionId) === null) {
+                setActionError(t("extensions.mainView.windowFailed"));
+              }
+            }}
           />}
           {state.route.kind === "settings" && <SettingsPage controller={controller} snapshot={state.snapshot} activeTargetId={settingsTargetIdRef.current} locale={state.preferences.locale} t={t} runAction={runAction} onImportPortableSession={portableImportTargets.length === 0 ? undefined : () => { void choosePortableSessionImport(); }} />}
           </>}

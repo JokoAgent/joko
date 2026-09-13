@@ -207,6 +207,7 @@ type JokoDesktopCapability =
   | "attention.badge"
   | "appearance.zoom"
   | "application.menu"
+  | "extension.windows"
   | "inspector.detach"
   | "layout.reset"
   | "microphone.lifecycle"
@@ -308,6 +309,9 @@ interface JokoDesktopApi {
     get(): Promise<JokoDesktopMainWindowCloseSettings>;
     set(change: { readonly behavior: JokoDesktopMainWindowCloseSettings["behavior"]; readonly expectedRevision: number }): Promise<JokoDesktopMainWindowCloseSettings>;
     onChanged(listener: (settings: JokoDesktopMainWindowCloseSettings) => void): () => void;
+  };
+  readonly extensionWindows: {
+    open(extensionId: string): Promise<{ readonly focusedExisting: boolean }>;
   };
   readonly windowInteraction: {
     get(): Promise<{ readonly swallowActivationClick: boolean }>;

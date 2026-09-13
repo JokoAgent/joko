@@ -2464,6 +2464,10 @@ export interface ExtensionCatalogEntryView {
   readonly author?: string;
   readonly description: string;
   readonly enabled: boolean;
+  readonly mainView?: {
+    readonly title?: string;
+    readonly icon?: ExtensionMainViewIconView;
+  };
   readonly sidebarSupported: boolean;
   readonly sidebarVisible: boolean;
   readonly tools: readonly { readonly name: string; readonly description: string; readonly requiresPermission: boolean }[];
@@ -2497,6 +2501,32 @@ export interface ExtensionCatalogEntryView {
   };
   readonly useSupported: boolean;
   readonly error?: string;
+}
+
+export type ExtensionMainViewIconView =
+  | "activity"
+  | "box"
+  | "code"
+  | "fileText"
+  | "globe"
+  | "layout"
+  | "search"
+  | "sparkles"
+  | "terminal"
+  | "tool";
+
+export interface ExtensionMainViewSurfaceView {
+  readonly id: string;
+  readonly extensionId: string;
+  readonly owner: Extract<ExtensionCatalogEntryView["owner"], { readonly kind: "resource" }>;
+  readonly backendId: string;
+  readonly backendRevision: bigint;
+  readonly backendGeneration: number;
+  /** Same-origin, opaque surface URL; never persisted as Extension identity. */
+  readonly endpoint: string;
+  readonly title?: string;
+  readonly icon?: ExtensionMainViewIconView;
+  readonly expiresAt: number;
 }
 
 export type ExtensionPackageActionView = "install" | "update" | "replace";
@@ -3874,6 +3904,9 @@ export interface OperationApi {
     readonly signal?: AbortSignal;
   }): Promise<ExtensionCatalogView>;
   getExtension(extensionId: string, sessionId?: string, signal?: AbortSignal): Promise<ExtensionCatalogView>;
+  openExtensionMainView(extensionId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ExtensionMainViewSurfaceView>;
+  getExtensionMainViewSurface(surfaceId: string, signal?: AbortSignal): Promise<ExtensionMainViewSurfaceView>;
+  closeExtensionMainView(surfaceId: string, signal?: AbortSignal): Promise<boolean>;
   getExtensionPackagePreview(extensionId: string, expectedRevision: bigint, backendId: string, signal?: AbortSignal): Promise<ExtensionPackagePreviewView>;
   adoptExtensionPackage(preview: ExtensionPackagePreviewView, allowSourceReplacement?: boolean, signal?: AbortSignal): Promise<void>;
   removeExtensionPackage(extensionId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<void>;

@@ -189,6 +189,30 @@ describe("ExtensionCatalogManager", () => {
     }
   });
 
+  it("projects a declared main view as the only sidebar-capable Extension surface", async () => {
+    const { store, catalog } = await fixture();
+    const mainView = { html: "ui/navigation/index.html", title: "Navigator", icon: "layout" as const };
+    try {
+      const sourceEntry = source({ entries: [{ ...source().entries[0]!, mainView }] });
+      const available = catalog.reconcile([], [], [sourceEntry]).entries[0]!;
+      expect(available).toMatchObject({ installed: false, mainView, sidebarSupported: true, sidebarVisible: false });
+
+      const installedResource = resource({
+        resourceDetails: [{
+          ...resource().resourceDetails[0]!,
+          entryPath: "extensions/navigation.ts",
+          mainView
+        }]
+      });
+      const installed = catalog.reconcile([installedResource], [], [sourceEntry]).entries[0]!;
+      expect(installed).toMatchObject({ installed: true, enabled: true, mainView, sidebarSupported: true, sidebarVisible: false });
+      const visible = catalog.setSidebarVisible(installed.id, true, installed.revision);
+      expect(visible.sidebarVisible).toBe(true);
+    } finally {
+      store.close();
+    }
+  });
+
   it("projects same-source updates and treats a removed then re-added source as explicit replacement provenance", async () => {
     const { store, catalog } = await fixture();
     try {
@@ -331,11 +355,11 @@ describe("ExtensionCatalogManager", () => {
       expect(credentials.resolve("cred_extension_research")).toBe(secret);
       expect(JSON.stringify(store.listSettings(), (_key, value) => typeof value === "bigint" ? value.toString(10) : value)).not.toContain(secret);
 
-      const withSidebar = catalog.setSidebarVisible(entry.id, true, ready.revision);
-      expect(() => catalog.setSidebarVisible(entry.id, false, ready.revision)).toThrow(/concurrently/u);
+      expect(ready).toMatchObject({ sidebarSupported: false, sidebarVisible: false });
+      expect(() => catalog.setSidebarVisible(entry.id, true, ready.revision)).toThrow(/does not advertise/u);
       const disabled = catalog.reconcile([], [mcp({ enabled: false, state: "disabled", version: 4n })]).entries[0]!;
-      expect(disabled).toMatchObject({ sidebarVisible: true, enabled: false, useSupported: false, setup: { state: "ready" } });
-      expect(disabled.revision).toBeGreaterThan(withSidebar.revision);
+      expect(disabled).toMatchObject({ sidebarVisible: false, enabled: false, useSupported: false, setup: { state: "ready" } });
+      expect(disabled.revision).toBeGreaterThan(ready.revision);
 
       const changedAuthority = catalog.reconcile([], [mcp({
         endpointDisplay: "https://other.example/mcp",
@@ -343,7 +367,7 @@ describe("ExtensionCatalogManager", () => {
         version: 5n
       })]).entries[0]!;
       expect(changedAuthority.setup.state).toBe("required");
-      expect(changedAuthority.sidebarVisible).toBe(true);
+      expect(changedAuthority.sidebarVisible).toBe(false);
     } finally {
       store.close();
     }

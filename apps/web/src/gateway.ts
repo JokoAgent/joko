@@ -69,6 +69,7 @@ import {
   EventCursorSchema,
   ExtensionWidgetPlacement,
   ExtensionCatalogSource as ProtoExtensionCatalogSource,
+  ExtensionMainViewIcon as ProtoExtensionMainViewIcon,
   ExtensionPackageAction as ProtoExtensionPackageAction,
   ExtensionPackageExportState as ProtoExtensionPackageExportState,
   ExtensionSourceKind as ProtoExtensionSourceKind,
@@ -272,6 +273,7 @@ import {
   type ExtraDirectory,
   type ExtensionStatus,
   type ExtensionCatalogEntry as ProtoExtensionCatalogEntry,
+  type ExtensionMainViewSurface as ProtoExtensionMainViewSurface,
   type ExtensionPackageExportAuthority as ProtoExtensionPackageExportAuthority,
   type ExtensionPackageExportJob as ProtoExtensionPackageExportJob,
   type ExtensionPackageExportPreview as ProtoExtensionPackageExportPreview,
@@ -389,6 +391,8 @@ import type {
   ExtensionStatusView,
   ExtensionCatalogEntryView,
   ExtensionCatalogView,
+  ExtensionMainViewIconView,
+  ExtensionMainViewSurfaceView,
   ExtensionPackageExportAuthorityView,
   ExtensionPackageExportCatalogView,
   ExtensionPackageExportJobView,
@@ -2982,6 +2986,39 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       extensions: [mapExtensionCatalogEntry(response.extension)],
       recoveredFromCorruption: response.recoveredFromCorruption
     };
+  }
+
+  async openExtensionMainView(
+    extensionId: string,
+    expectedRevision: bigint,
+    signal?: AbortSignal
+  ): Promise<ExtensionMainViewSurfaceView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).openExtensionMainView({
+      extensionId,
+      expectedRevision: { value: expectedRevision }
+    }, { signal: scope.signal });
+    if (response.surface === undefined) throw new GatewayError("Orchestrator returned an empty Extension main view.");
+    return mapExtensionMainViewSurface(response.surface);
+  }
+
+  async getExtensionMainViewSurface(surfaceId: string, signal?: AbortSignal): Promise<ExtensionMainViewSurfaceView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).getExtensionMainViewSurface(
+      { surfaceId },
+      { signal: scope.signal }
+    );
+    if (response.surface === undefined) throw new GatewayError("Orchestrator returned an empty Extension main-view probe.");
+    return mapExtensionMainViewSurface(response.surface);
+  }
+
+  async closeExtensionMainView(surfaceId: string, signal?: AbortSignal): Promise<boolean> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).closeExtensionMainView(
+      { surfaceId },
+      { signal: scope.signal }
+    );
+    return response.closed;
   }
 
   async getExtensionPackagePreview(
@@ -10054,6 +10091,18 @@ function mapExtensionCatalogEntry(extension: ProtoExtensionCatalogEntry): Extens
       || (extension.update.availableVersion !== undefined && extension.update.availableVersion.trim() === "")
     )
   ) throw new GatewayError("Orchestrator returned an invalid Extension package update.");
+  const mainViewIcon = extension.mainView === undefined ? undefined : extensionMainViewIcon(extension.mainView.icon);
+  const mainView = extension.mainView === undefined ? undefined : {
+    ...(extension.mainView.title === undefined ? {} : { title: extension.mainView.title }),
+    ...(mainViewIcon === undefined ? {} : { icon: mainViewIcon })
+  };
+  if (extension.mainView?.title !== undefined && (
+    extension.mainView.title.trim() !== extension.mainView.title
+    || extension.mainView.title.length === 0
+    || extension.mainView.title.length > 80
+  ) || extension.sidebarSupported !== (mainView !== undefined) || extension.sidebarVisible && mainView === undefined) {
+    throw new GatewayError("Orchestrator returned an invalid Extension main-view capability.");
+  }
   return {
     id: extension.extensionId,
     revision,
@@ -10070,6 +10119,7 @@ function mapExtensionCatalogEntry(extension: ProtoExtensionCatalogEntry): Extens
     ...(extension.author === undefined ? {} : { author: extension.author }),
     description: extension.description,
     enabled: extension.enabled,
+    ...(mainView === undefined ? {} : { mainView }),
     sidebarSupported: extension.sidebarSupported,
     sidebarVisible: extension.sidebarVisible,
     tools: extension.tools.map((tool) => ({
@@ -10114,6 +10164,75 @@ function mapExtensionCatalogEntry(extension: ProtoExtensionCatalogEntry): Extens
     useSupported: extension.useSupported,
     ...(extension.error === undefined ? {} : { error: extension.error })
   };
+}
+
+function mapExtensionMainViewSurface(surface: ProtoExtensionMainViewSurface): ExtensionMainViewSurfaceView {
+  const resourceRevision = surface.owner?.resourceVersion?.value;
+  const backendRevision = surface.backendRevision?.value;
+  const backendGeneration = exactSafeUnsignedNumber(surface.backendGeneration);
+  const expiresAt = surface.expiresAt === undefined ? undefined : timestampMs(surface.expiresAt);
+  const icon = extensionMainViewIcon(surface.icon);
+  if (!/^extension_surface_[a-f0-9]{32}$/u.test(surface.surfaceId)
+    || !/^extension_[a-f0-9]{32}$/u.test(surface.extensionId)
+    || surface.owner === undefined || surface.owner.resourceId.trim() === ""
+    || !/^sha256:[a-f0-9]{64}$/u.test(surface.owner.discoveredRevision)
+    || resourceRevision === undefined || resourceRevision < 1n
+    || surface.backendId.trim() === "" || backendRevision === undefined || backendRevision < 1n
+    || backendGeneration === undefined || expiresAt === undefined || !Number.isSafeInteger(expiresAt) || expiresAt < 0
+    || !validExtensionSurfaceEndpoint(surface.endpoint, surface.surfaceId)
+    || surface.title !== undefined && (surface.title.trim() !== surface.title || surface.title.length === 0 || surface.title.length > 80)) {
+    throw new GatewayError("Orchestrator returned an invalid Extension main-view surface.");
+  }
+  return {
+    id: surface.surfaceId,
+    extensionId: surface.extensionId,
+    owner: {
+      kind: "resource",
+      resourceId: surface.owner.resourceId,
+      discoveredRevision: surface.owner.discoveredRevision,
+      resourceRevision
+    },
+    backendId: surface.backendId,
+    backendRevision,
+    backendGeneration,
+    endpoint: surface.endpoint,
+    ...(surface.title === undefined ? {} : { title: surface.title }),
+    ...(icon === undefined ? {} : { icon }),
+    expiresAt
+  };
+}
+
+function extensionMainViewIcon(value: ProtoExtensionMainViewIcon): ExtensionMainViewIconView | undefined {
+  switch (value) {
+    case ProtoExtensionMainViewIcon.UNSPECIFIED: return undefined;
+    case ProtoExtensionMainViewIcon.ACTIVITY: return "activity";
+    case ProtoExtensionMainViewIcon.BOX: return "box";
+    case ProtoExtensionMainViewIcon.CODE: return "code";
+    case ProtoExtensionMainViewIcon.FILE_TEXT: return "fileText";
+    case ProtoExtensionMainViewIcon.GLOBE: return "globe";
+    case ProtoExtensionMainViewIcon.LAYOUT: return "layout";
+    case ProtoExtensionMainViewIcon.SEARCH: return "search";
+    case ProtoExtensionMainViewIcon.SPARKLES: return "sparkles";
+    case ProtoExtensionMainViewIcon.TERMINAL: return "terminal";
+    case ProtoExtensionMainViewIcon.TOOL: return "tool";
+    default: throw new GatewayError("Orchestrator returned an invalid Extension main-view icon.");
+  }
+}
+
+function validExtensionSurfaceEndpoint(value: string, surfaceId: string): boolean {
+  const prefix = `/v1/extensions/main-views/${surfaceId}/`;
+  if (!value.startsWith(prefix) || value.includes("?") || value.includes("#")) return false;
+  const suffix = value.slice(prefix.length);
+  const separator = suffix.indexOf("/");
+  if (separator !== 64 || !/^[a-f0-9]{64}$/u.test(suffix.slice(0, separator))) return false;
+  const encodedEntry = suffix.slice(separator + 1);
+  if (encodedEntry === "" || encodedEntry.includes("/")) return false;
+  try {
+    const entry = decodeURIComponent(encodedEntry);
+    return entry !== "." && entry !== ".." && !entry.includes("/") && !entry.includes("\\") && !entry.includes("\0");
+  } catch {
+    return false;
+  }
 }
 
 function mapExtensionSourceOwner(

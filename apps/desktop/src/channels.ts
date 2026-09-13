@@ -4,6 +4,7 @@ export const DESKTOP_CHANNELS = {
   windowSetZoomFactor: "joko:window:set-zoom-factor",
   windowClose: "joko:window:close",
   sessionWindowOpen: "joko:session-window:open",
+  extensionWindowOpen: "joko:extension-window:open",
   sessionDragPreviewBegin: "joko:session-drag-preview:begin",
   sessionDragPreviewEnd: "joko:session-drag-preview:end",
   sessionWindowOpenIfDroppedOutside: "joko:session-window:open-if-dropped-outside",
@@ -290,6 +291,14 @@ export interface DesktopAppInfo {
 
 export interface DesktopSessionWindowOpenResult {
   readonly focusedExisting: boolean;
+}
+
+export interface DesktopExtensionWindowOpenResult {
+  readonly focusedExisting: boolean;
+}
+
+export function isDesktopExtensionId(value: unknown): value is string {
+  return typeof value === "string" && /^extension_[a-f0-9]{32}$/u.test(value);
 }
 
 export interface DesktopSessionDragPreviewPalette {

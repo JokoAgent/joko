@@ -27,7 +27,7 @@ afterEach(async () => {
 });
 
 describe("Sidebar organizer display controls", () => {
-  it("shows only ready enabled Extension shortcuts and opens their exact catalog detail", async () => {
+  it("shows only ready enabled Extension shortcuts and opens their exact main view", async () => {
     const onNavigate = vi.fn();
     const onClose = vi.fn();
     const ready = sidebarExtension();
@@ -52,7 +52,7 @@ describe("Sidebar organizer display controls", () => {
     expect(shortcuts).toHaveLength(1);
     expect(shortcuts[0]?.textContent).toContain("Ready extension");
     await act(async () => shortcuts[0]?.click());
-    expect(onNavigate).toHaveBeenCalledWith({ kind: "tools", extensionId: ready.id });
+    expect(onNavigate).toHaveBeenCalledWith({ kind: "extensionMainView", extensionId: ready.id });
     expect(onClose).toHaveBeenCalledOnce();
   });
 
@@ -1383,6 +1383,7 @@ function sidebarExtension(): ExtensionCatalogEntryView {
     installState: "installed",
     name: "Ready extension",
     description: "A ready sidebar extension",
+    mainView: { title: "Ready extension", icon: "layout" },
     enabled: true,
     sidebarSupported: true,
     sidebarVisible: true,

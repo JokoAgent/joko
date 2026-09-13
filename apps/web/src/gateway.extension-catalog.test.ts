@@ -4,6 +4,7 @@ import {
   CredentialKind,
   ExtensionCatalogSource,
   ExtensionInstallState,
+  ExtensionMainViewIcon,
   ExtensionPackageAction,
   ExtensionPackageExportState,
   ExtensionSourceKind,
@@ -264,6 +265,56 @@ describe("Extension catalog gateway", () => {
       allowSourceReplacement: false
     });
     expect(payloads[1]?.value).toMatchObject({ extensionId: preview.extensionId, expectedRevision: { value: 2n } });
+    gateway.disconnect();
+  });
+
+  it("opens, probes, and closes only a strict opaque Extension main-view surface", async () => {
+    const requests: Array<{ readonly method: string; readonly input: any }> = [];
+    const extensionId = "extension_00000000000000000000000000000001";
+    const surfaceId = `extension_surface_${"a".repeat(32)}`;
+    const surface = {
+      surfaceId,
+      extensionId,
+      owner: {
+        resourceId: "resource-1",
+        discoveredRevision: `sha256:${"b".repeat(64)}`,
+        resourceVersion: { value: 4n }
+      },
+      endpoint: `/v1/extensions/main-views/${surfaceId}/${"c".repeat(64)}/index.html`,
+      title: "Review",
+      icon: ExtensionMainViewIcon.LAYOUT,
+      expiresAt: { seconds: 1_800_000_000n, nanos: 0 },
+      backendId: "pi",
+      backendRevision: { value: 9n },
+      backendGeneration: 3n
+    };
+    const gateway = await mount(async (method, input) => {
+      requests.push({ method, input });
+      if (method === "getSnapshot") return { snapshot: {} };
+      if (method === "openExtensionMainView") return { surface };
+      if (method === "getExtensionMainViewSurface") return { surface };
+      if (method === "closeExtensionMainView") return { closed: true };
+      throw new Error(`Unexpected method: ${method}`);
+    });
+
+    await expect(gateway.openExtensionMainView(extensionId, 7n)).resolves.toMatchObject({
+      id: surfaceId,
+      extensionId,
+      owner: { kind: "resource", resourceId: "resource-1", resourceRevision: 4n },
+      endpoint: surface.endpoint,
+      title: "Review",
+      icon: "layout",
+      backendId: "pi",
+      backendRevision: 9n,
+      backendGeneration: 3
+    });
+    await expect(gateway.getExtensionMainViewSurface(surfaceId)).resolves.toMatchObject({ id: surfaceId });
+    await expect(gateway.closeExtensionMainView(surfaceId)).resolves.toBe(true);
+    expect(requests.find((request) => request.method === "openExtensionMainView")?.input)
+      .toEqual({ extensionId, expectedRevision: { value: 7n } });
+
+    surface.endpoint = "https://attacker.test/view.html";
+    await expect(gateway.getExtensionMainViewSurface(surfaceId)).rejects.toThrow(/invalid Extension main-view surface/u);
     gateway.disconnect();
   });
 
@@ -532,6 +583,7 @@ function protoExtension(index: number): object {
     enabled: true,
     sidebarSupported: true,
     sidebarVisible: true,
+    mainView: { title: `Review ${index}`, icon: ExtensionMainViewIcon.LAYOUT },
     commands: [{ name: "review", description: "Review changes", sessionId: "runtime-session" }],
     setup: { state: ExtensionSetupState.NOT_REQUIRED, revision: { value: 0n } },
     useSupported: true

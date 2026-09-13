@@ -12,19 +12,20 @@ export function desktopMainWindowCloseLabels(locale: string): {
 
 export function desktopWindowLoadFailureLabels(
   locale: string,
-  kind: "main" | "session" | "runtime",
+  kind: "main" | "session" | "extension" | "runtime",
   attempt: number
 ): { title: string; message: string; attemptDetail: string; buttons: string[] } {
   const chinese = locale.toLowerCase().startsWith("zh");
   const main = kind === "main";
   const runtime = kind === "runtime";
+  const extension = kind === "extension";
   return {
     title: chinese
-      ? main ? "Joko 无法启动" : runtime ? "Joko 无法打开运行时资源用量" : "Joko 无法打开任务窗口"
-      : main ? "Joko could not start" : runtime ? "Joko could not open runtime resource usage" : "Joko could not open the task window",
+      ? main ? "Joko 无法启动" : runtime ? "Joko 无法打开运行时资源用量" : extension ? "Joko 无法打开扩展窗口" : "Joko 无法打开任务窗口"
+      : main ? "Joko could not start" : runtime ? "Joko could not open runtime resource usage" : extension ? "Joko could not open the Extension window" : "Joko could not open the task window",
     message: chinese
-      ? main ? "Joko 用户界面无法加载。" : runtime ? "运行时资源用量无法加载。" : "任务窗口无法加载。"
-      : main ? "The Joko user interface could not be loaded." : runtime ? "Runtime resource usage could not be loaded." : "The task window could not be loaded.",
+      ? main ? "Joko 用户界面无法加载。" : runtime ? "运行时资源用量无法加载。" : extension ? "扩展窗口无法加载。" : "任务窗口无法加载。"
+      : main ? "The Joko user interface could not be loaded." : runtime ? "Runtime resource usage could not be loaded." : extension ? "The Extension window could not be loaded." : "The task window could not be loaded.",
     attemptDetail: attempt > 1
       ? chinese ? `\n\n第 ${attempt} 次加载失败。` : `\n\nLoad attempt ${attempt} failed.`
       : "",

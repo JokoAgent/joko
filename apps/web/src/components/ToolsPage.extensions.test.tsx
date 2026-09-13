@@ -28,10 +28,52 @@ beforeAll(() => {
 afterEach(async () => {
   for (const root of roots.splice(0).reverse()) await act(async () => root.unmount());
   document.body.replaceChildren();
+  Reflect.deleteProperty(window, "jokoDesktop");
   vi.restoreAllMocks();
 });
 
 describe("Extension catalog interactions", () => {
+  it("opens a ready declared main view in place or through the trusted Desktop window host", async () => {
+    const extension = { ...readyExtension(), mainView: { title: "Review view", icon: "layout" as const } };
+    const view = catalog(extension);
+    const navigate = vi.fn();
+    const open = vi.fn(async () => ({ focusedExisting: false }));
+    Object.defineProperty(window, "jokoDesktop", {
+      configurable: true,
+      value: { capabilities: ["extension.windows"], extensionWindows: { open } }
+    });
+    const { container } = await renderExtensions({
+      extension,
+      controller: {
+        listExtensions: vi.fn(async () => view),
+        getExtension: vi.fn(async () => view),
+        navigate
+      }
+    });
+
+    await act(async () => buttonWithText(container, "Open view").click());
+    expect(navigate).toHaveBeenCalledWith({ kind: "extensionMainView", extensionId: extension.id });
+    await act(async () => buttonWithText(container, "Open in new window").click());
+    await settle();
+    expect(open).toHaveBeenCalledWith(extension.id);
+  });
+
+  it("shows a Source main-view declaration without allowing it to open before installation", async () => {
+    const extension = { ...sourceExtension(), mainView: { title: "Catalog preview", icon: "globe" as const } };
+    const view = catalog(extension);
+    const { container } = await renderExtensions({
+      extension,
+      controller: {
+        listExtensions: vi.fn(async () => view),
+        getExtension: vi.fn(async () => view)
+      }
+    });
+
+    expect(buttonWithText(container, "Open view").disabled).toBe(true);
+    expect(buttonWithText(container, "Open in new window").disabled).toBe(true);
+    expect(container.textContent).toContain("Install, enable, and finish setup before opening this view.");
+  });
+
   it("carries an exact ready command into the delayed-create draft", async () => {
     const extension = readyExtension();
     const view = catalog(extension);

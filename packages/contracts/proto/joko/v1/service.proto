@@ -236,6 +236,9 @@ service ExtensionService {
   rpc GetExtensionPackageExportPreview(GetExtensionPackageExportPreviewRequest) returns (GetExtensionPackageExportPreviewResponse);
   rpc ListExtensionPackageExports(ListExtensionPackageExportsRequest) returns (ListExtensionPackageExportsResponse);
   rpc GetExtensionPackageExport(GetExtensionPackageExportRequest) returns (GetExtensionPackageExportResponse);
+  rpc OpenExtensionMainView(OpenExtensionMainViewRequest) returns (OpenExtensionMainViewResponse);
+  rpc GetExtensionMainViewSurface(GetExtensionMainViewSurfaceRequest) returns (GetExtensionMainViewSurfaceResponse);
+  rpc CloseExtensionMainView(CloseExtensionMainViewRequest) returns (CloseExtensionMainViewResponse);
   // Produces a one-time protected upload ticket. Secret bytes cross only the
   // authenticated credential upload endpoint and never this RPC.
   rpc BeginExtensionSetupCredentialUpload(BeginExtensionSetupCredentialUploadRequest) returns (BeginExtensionSetupCredentialUploadResponse);
@@ -1731,6 +1734,31 @@ message GetExtensionPackageExportRequest {
 message GetExtensionPackageExportResponse {
   ExtensionPackageExportJob export = 1;
   bool recovered_from_corruption = 2;
+}
+
+message OpenExtensionMainViewRequest {
+  string extension_id = 1;
+  Revision expected_revision = 2;
+}
+
+message OpenExtensionMainViewResponse {
+  ExtensionMainViewSurface surface = 1;
+}
+
+message GetExtensionMainViewSurfaceRequest {
+  string surface_id = 1;
+}
+
+message GetExtensionMainViewSurfaceResponse {
+  ExtensionMainViewSurface surface = 1;
+}
+
+message CloseExtensionMainViewRequest {
+  string surface_id = 1;
+}
+
+message CloseExtensionMainViewResponse {
+  bool closed = 1;
 }
 
 message BeginExtensionSetupCredentialUploadRequest {

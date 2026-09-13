@@ -4,6 +4,7 @@ import type {
   DesktopApplicationMenuCommand,
   DesktopApplicationMenuConfigurationPatch,
   DesktopDiscoveredNode,
+  DesktopExtensionWindowOpenResult,
   DesktopDeepLinkNavigation,
   DesktopDeepLinkSettingsSection,
   DesktopFile,
@@ -64,6 +65,7 @@ const DESKTOP_CHANNELS = {
   windowSetZoomFactor: "joko:window:set-zoom-factor",
   windowClose: "joko:window:close",
   sessionWindowOpen: "joko:session-window:open",
+  extensionWindowOpen: "joko:extension-window:open",
   sessionDragPreviewBegin: "joko:session-drag-preview:begin",
   sessionDragPreviewEnd: "joko:session-drag-preview:end",
   sessionWindowOpenIfDroppedOutside: "joko:session-window:open-if-dropped-outside",
@@ -186,6 +188,7 @@ const desktopCapabilities = Object.freeze([
   "selection.quote.contextMenu",
   "runtime.processMonitorWindow",
   "session.windows",
+  "extension.windows",
   "voice.globalDictation",
   "window.activationClick"
 ] as const);
@@ -225,6 +228,13 @@ const desktopApi = Object.freeze({
       }
       return ipcRenderer.invoke(DESKTOP_CHANNELS.sessionWindowOpenIfDroppedOutside, gestureId)
         .then(parseDesktopSessionWindowDropResult);
+    }
+  }),
+  extensionWindows: Object.freeze({
+    open: (extensionId: string): Promise<DesktopExtensionWindowOpenResult> => {
+      if (!isDesktopExtensionId(extensionId)) return Promise.reject(new TypeError("Extension identity is invalid."));
+      return ipcRenderer.invoke(DESKTOP_CHANNELS.extensionWindowOpen, extensionId)
+        .then(parseDesktopExtensionWindowOpenResult);
     }
   }),
   runtimeProcessMonitor: Object.freeze({
@@ -659,6 +669,10 @@ function isDesktopNotificationSessionId(value: unknown): value is string {
     value.trim() === value && !/[\u0000-\u001f\u007f]/u.test(value);
 }
 
+function isDesktopExtensionId(value: unknown): value is string {
+  return typeof value === "string" && /^extension_[a-f0-9]{32}$/u.test(value);
+}
+
 function isDesktopPageSearchRequest(value: unknown): value is DesktopPageSearchRequest {
   return nativeRecord(value) && nativeKeys(value) === "findNext,forward,requestToken,text" &&
     typeof value["text"] === "string" && value["text"].length >= 1 && value["text"].length <= 4_096 &&
@@ -1083,6 +1097,15 @@ function parseDesktopMainWindowCloseSettings(value: unknown): DesktopMainWindowC
     throw new TypeError("Main-window close settings are invalid.");
   }
   return Object.freeze({ behavior: entry["behavior"] as DesktopMainWindowCloseSettings["behavior"], revision: entry["revision"] as number });
+}
+
+function parseDesktopExtensionWindowOpenResult(value: unknown): DesktopExtensionWindowOpenResult {
+  if (typeof value !== "object" || value === null || Array.isArray(value) ||
+    Object.keys(value).join(",") !== "focusedExisting" ||
+    typeof (value as Record<string, unknown>)["focusedExisting"] !== "boolean") {
+    throw new TypeError("Extension window result is invalid.");
+  }
+  return Object.freeze({ focusedExisting: (value as DesktopExtensionWindowOpenResult).focusedExisting });
 }
 
 function parseDesktopWindowInteractionSettings(value: unknown): DesktopWindowInteractionSettings {

@@ -349,6 +349,15 @@ describe("Orchestrator application composition", () => {
       headers: { origin: "http://192.168.1.30:4319", "access-control-request-method": "GET" }
     });
     expect(disabledLanCors.headers["access-control-allow-origin"]).toBeUndefined();
+    const missingExtensionSurface = await server.inject({
+      method: "GET",
+      url: `/v1/extensions/main-views/extension_surface_${"a".repeat(32)}/${"b".repeat(64)}/index.html`
+    });
+    expect(missingExtensionSurface.statusCode).toBe(404);
+    expect(missingExtensionSurface.headers["access-control-allow-origin"]).toBe("null");
+    expect(missingExtensionSurface.headers["x-frame-options"]).toBeUndefined();
+    expect(missingExtensionSurface.headers["content-security-policy"]).toContain("frame-ancestors *");
+    expect(missingExtensionSurface.headers["content-security-policy"]).toContain("connect-src 'none'");
     const lanServer = await createPublicServer({
       ...application,
       config: {

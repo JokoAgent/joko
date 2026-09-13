@@ -10,7 +10,7 @@ export const DESKTOP_CONTENT_SECURITY_POLICY = [
   "default-src 'self'",
   "base-uri 'none'",
   "object-src 'none'",
-  "frame-src 'none'",
+  "frame-src 'self' https: http:",
   "frame-ancestors 'none'",
   "form-action 'none'",
   // diagrams.net's fixed, self-hosted GraphViewer artifact evaluates its
@@ -125,11 +125,48 @@ export function isAllowedDesktopAppEntrySearch(search: string): boolean {
   if ([...query.keys()].join(",") === "runtimeProcessMonitor") {
     return query.get("runtimeProcessMonitor") === "1";
   }
+  if ([...query.keys()].sort().join(",") === "bootExtension,extensionWindow") {
+    return query.get("extensionWindow") === "1" &&
+      /^extension_[a-f0-9]{32}$/u.test(query.get("bootExtension") ?? "");
+  }
   if ([...query.keys()].sort().join(",") !== "bootSession,sessionWindow") return false;
   const sessionId = query.get("bootSession");
   return query.get("sessionWindow") === "1" && typeof sessionId === "string" &&
     sessionId.length >= 1 && sessionId.length <= 256 && sessionId.trim() === sessionId &&
     !/[\u0000-\u001f\u007f]/u.test(sessionId);
+}
+
+export function isAllowedExtensionWindowNavigation(
+  value: string,
+  extensionId: string,
+  policy: DesktopNavigationPolicy
+): boolean {
+  if (!/^extension_[a-f0-9]{32}$/u.test(extensionId) || !isAllowedMainFrameNavigation(value, policy)) return false;
+  try {
+    const url = new URL(value);
+    const keys = [...url.searchParams.keys()].sort();
+    return keys.join(",") === "bootExtension,extensionWindow"
+      && url.searchParams.get("extensionWindow") === "1"
+      && url.searchParams.get("bootExtension") === extensionId;
+  } catch {
+    return false;
+  }
+}
+
+/** Preserve the surface service's stricter CSP instead of intersecting it with the app-frame policy. */
+export function isExtensionMainViewSubframeUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return (url.protocol === "https:" || url.protocol === "http:") && url.username === "" && url.password === ""
+      && url.search === "" && url.hash === ""
+      && /^\/v1\/extensions\/main-views\/extension_surface_[a-f0-9]{32}\/[a-f0-9]{64}\/.+$/u.test(url.pathname);
+  } catch {
+    return false;
+  }
+}
+
+export function shouldMergeDesktopFrameContentSecurityPolicy(resourceType: string, value: string): boolean {
+  return resourceType === "mainFrame" || (resourceType === "subFrame" && !isExtensionMainViewSubframeUrl(value));
 }
 
 /**

@@ -131,6 +131,13 @@ import type {
   ExtensionRuntimeObservation
 } from "./extension-catalog.js";
 import { extensionMcpInput } from "./extension-catalog.js";
+import type { ExtensionMainViewIcon } from "./extension-surface-manifest.js";
+import {
+  ExtensionMainViewError,
+  type ExtensionMainViewAuthority as NativeExtensionMainViewAuthority,
+  type ExtensionMainViewManager,
+  type ExtensionMainViewSurface as NativeExtensionMainViewSurface
+} from "./extension-main-view-manager.js";
 import type {
   ExtensionPackageExportAuthority as NativeExtensionPackageExportAuthority,
   ExtensionPackageExportJob as NativeExtensionPackageExportJob,
@@ -388,6 +395,7 @@ interface ConnectServiceDependencies {
   readonly mcpRouter?: McpRouter;
   readonly piResources?: PiResourceManager;
   readonly extensionCatalog?: ExtensionCatalogManager;
+  readonly extensionMainViews?: ExtensionMainViewManager;
   readonly extensionPackagePublisher?: ExtensionPackagePublisher;
   readonly extensionSources?: ExtensionSourceManager;
   readonly piBackendIds?: ReadonlySet<string>;
@@ -921,6 +929,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
     ...(application.mcpRouter === undefined ? {} : { mcpRouter: application.mcpRouter }),
     ...(application.piResources === undefined ? {} : { piResources: application.piResources }),
     ...(application.extensionCatalog === undefined ? {} : { extensionCatalog: application.extensionCatalog }),
+    ...(application.extensionMainViews === undefined ? {} : { extensionMainViews: application.extensionMainViews }),
     ...(application.extensionPackagePublisher === undefined ? {} : { extensionPackagePublisher: application.extensionPackagePublisher }),
     ...(application.extensionSources === undefined ? {} : { extensionSources: application.extensionSources }),
     piBackendIds: new Set(application.adapters
@@ -999,8 +1008,21 @@ export function createConnectServices(application: OrchestratorApplication): Con
   }
   const operationMutations = new Map<string, contract.OperationMutation>();
   const operationOutcomes = new Map<string, OperationOutcome>();
+  const extensionSurfaceRevocations = new Map<string, () => void>();
 
   const authenticate = (context: HandlerContext): ConnectionRecord => requireAuthentication(dependencies, context);
+  const ensureExtensionSurfaceRevocation = (connectionId: string): void => {
+    if (extensionSurfaceRevocations.has(connectionId) || dependencies.extensionMainViews === undefined) return;
+    const stop = dependencies.connections.onRevoked(connectionId, () => {
+      extensionSurfaceRevocations.delete(connectionId);
+      void dependencies.extensionMainViews!.closeConnection(connectionId);
+    });
+    extensionSurfaceRevocations.set(connectionId, stop);
+  };
+  application.registerServiceCleanup?.(() => {
+    for (const stop of extensionSurfaceRevocations.values()) stop();
+    extensionSurfaceRevocations.clear();
+  });
   const terminal = createTerminalConnectService({
     ...(dependencies.terminals === undefined ? {} : { terminals: dependencies.terminals }),
     store: dependencies.store,
@@ -3571,6 +3593,50 @@ export function createConnectServices(application: OrchestratorApplication): Con
         export: mapExtensionPackageExportJob(dependencies.extensionPackagePublisher!.get(exportId)),
         recoveredFromCorruption: dependencies.extensionPackagePublisher!.recoveredFromCorruption
       }));
+    },
+    openExtensionMainView: async (request, context) => {
+      const connection = authenticate(context);
+      if (dependencies.extensionCatalog === undefined || dependencies.extensionMainViews === undefined || dependencies.piResources === undefined) {
+        throw new ConnectError("Extension main views are unavailable.", Code.Unimplemented);
+      }
+      if (request.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const expectedRevision = fromProtoRevision(request.expectedRevision, "open_extension_main_view.expected_revision");
+      const authority = requireExtensionMainViewAuthority(
+        dependencies,
+        nonBlankRequest(request.extensionId, "extension_id"),
+        expectedRevision
+      );
+      ensureExtensionSurfaceRevocation(connection.id);
+      const assertAuthorityCurrent = (): void => {
+        dependencies.connections.fence(connection);
+        assertCurrentExtensionMainViewAuthority(dependencies, authority);
+      };
+      const surface = await extensionMainViewEffect(() => dependencies.extensionMainViews!.open({
+        authority,
+        connectionId: connection.id,
+        assertAuthorityCurrent
+      }));
+      return { surface: mapExtensionMainViewSurface(surface) };
+    },
+    getExtensionMainViewSurface: async (request, context) => {
+      const connection = authenticate(context);
+      if (dependencies.extensionMainViews === undefined) {
+        throw new ConnectError("Extension main views are unavailable.", Code.Unimplemented);
+      }
+      const surface = await extensionMainViewEffect(() => dependencies.extensionMainViews!.getSurface(
+        nonBlankRequest(request.surfaceId, "surface_id"),
+        connection.id
+      ));
+      return { surface: mapExtensionMainViewSurface(surface) };
+    },
+    closeExtensionMainView: async (request, context) => {
+      const connection = authenticate(context);
+      if (dependencies.extensionMainViews === undefined) return { closed: false };
+      const closed = await extensionMainViewEffect(() => dependencies.extensionMainViews!.closeSurface(
+        nonBlankRequest(request.surfaceId, "surface_id"),
+        connection.id
+      ));
+      return { closed };
     },
     beginExtensionSetupCredentialUpload: (request, context) => {
       const connection = authenticate(context);
@@ -8846,6 +8912,14 @@ function mapExtensionCatalogEntry(item: NativeExtensionCatalogDescriptor): contr
     }),
     useSupported: item.useSupported,
     ...(item.error === undefined ? {} : { error: item.error }),
+    ...(item.mainView === undefined
+      ? {}
+      : {
+          mainView: create(contract.ExtensionMainViewDescriptorSchema, {
+            ...(item.mainView.title === undefined ? {} : { title: item.mainView.title }),
+            icon: protoExtensionMainViewIcon(item.mainView.icon)
+          })
+        }),
     ...(item.update === undefined
       ? {}
       : {
@@ -8861,6 +8935,135 @@ function mapExtensionCatalogEntry(item: NativeExtensionCatalogDescriptor): contr
           })
         })
   });
+}
+
+function requireExtensionMainViewAuthority(
+  dependencies: ConnectServiceDependencies,
+  extensionId: string,
+  expectedExtensionRevision: bigint,
+  currentOnly = false
+): NativeExtensionMainViewAuthority {
+  if (dependencies.piResources === undefined || dependencies.extensionCatalog === undefined) {
+    throw new ConnectError("Extension main views are unavailable.", Code.Unimplemented);
+  }
+  const extension = currentOnly
+    ? requireCurrentExtensionMutation(dependencies, extensionId, expectedExtensionRevision)
+    : requireExtensionMutation(dependencies, extensionId, expectedExtensionRevision);
+  if (extension.owner.kind !== "resource" || !extension.installed || !extension.enabled
+    || extension.mainView === undefined || !extension.sidebarSupported
+    || extension.setup.state !== "ready" && extension.setup.state !== "not_required") {
+    throw new ConnectError("Extension main view is not ready.", Code.FailedPrecondition);
+  }
+  let resource: NativePiResourceDescriptor;
+  try {
+    resource = dependencies.piResources.get(extension.owner.resourceId);
+  } catch (error) {
+    throw new ConnectError(redactSecrets(error instanceof Error ? error.message : "Extension Resource not found."), Code.NotFound);
+  }
+  const matchingDetails = resource.resourceDetails.filter((detail) => detail.kind === "extension"
+    && detail.entryPath === extension.mainView?.extensionEntry
+    && detail.mainView?.html === extension.mainView?.html
+    && detail.mainView?.title === extension.mainView?.title
+    && detail.mainView?.icon === extension.mainView?.icon);
+  if (resource.id !== extension.owner.resourceId || resource.versionNumber !== extension.owner.resourceVersion
+    || resource.discoveredRevision !== extension.owner.discoveredRevision || resource.kind !== "package"
+    || resource.scope !== "managed" || resource.packageIdentity === undefined || !resource.enabled
+    || !["installed", "loaded", "update_available"].includes(resource.state) || matchingDetails.length !== 1
+    || extension.version !== resource.version) {
+    throw new ConnectError("Extension main view does not have a current installed package authority.", Code.FailedPrecondition);
+  }
+  const backend = dependencies.store.getBackend(resource.backendId);
+  return {
+    extensionId: extension.id,
+    resourceId: resource.id,
+    backendId: resource.backendId,
+    backendRevision: backend.revision,
+    backendGeneration: backend.descriptor.instanceGeneration,
+    resourceRevision: resource.versionNumber,
+    discoveredRevision: resource.discoveredRevision,
+    packageName: resource.packageIdentity,
+    ...(resource.version === undefined ? {} : { packageVersion: resource.version }),
+    extensionEntry: extension.mainView.extensionEntry,
+    mainView: {
+      html: extension.mainView.html,
+      ...(extension.mainView.title === undefined ? {} : { title: extension.mainView.title }),
+      ...(extension.mainView.icon === undefined ? {} : { icon: extension.mainView.icon })
+    }
+  };
+}
+
+function assertCurrentExtensionMainViewAuthority(
+  dependencies: ConnectServiceDependencies,
+  expected: NativeExtensionMainViewAuthority
+): void {
+  const current = requireExtensionMainViewAuthority(
+    dependencies,
+    expected.extensionId,
+    dependencies.extensionCatalog!.get(expected.extensionId).revision,
+    true
+  );
+  if (current.extensionId !== expected.extensionId || current.resourceId !== expected.resourceId
+    || current.backendId !== expected.backendId || current.backendRevision !== expected.backendRevision
+    || current.backendGeneration !== expected.backendGeneration || current.resourceRevision !== expected.resourceRevision
+    || current.discoveredRevision !== expected.discoveredRevision || current.packageName !== expected.packageName
+    || current.packageVersion !== expected.packageVersion || current.extensionEntry !== expected.extensionEntry
+    || current.mainView.html !== expected.mainView.html || current.mainView.title !== expected.mainView.title
+    || current.mainView.icon !== expected.mainView.icon) throw new Error("Extension main-view authority changed.");
+}
+
+function mapExtensionMainViewSurface(surface: NativeExtensionMainViewSurface): contract.ExtensionMainViewSurface {
+  return create(contract.ExtensionMainViewSurfaceSchema, {
+    surfaceId: surface.id,
+    extensionId: surface.extensionId,
+    owner: create(contract.ExtensionResourceOwnerSchema, {
+      resourceId: surface.authority.resourceId,
+      discoveredRevision: surface.authority.discoveredRevision,
+      resourceVersion: toProtoRevision(surface.authority.resourceRevision)
+    }),
+    endpoint: surface.endpoint,
+    ...(surface.title === undefined ? {} : { title: surface.title }),
+    icon: protoExtensionMainViewIcon(surface.icon),
+    expiresAt: toProtoTimestamp(surface.expiresAt),
+    backendId: surface.authority.backendId,
+    backendRevision: toProtoRevision(surface.authority.backendRevision),
+    backendGeneration: BigInt(surface.authority.backendGeneration)
+  });
+}
+
+function protoExtensionMainViewIcon(
+  value: ExtensionMainViewIcon | undefined
+): contract.ExtensionMainViewIcon {
+  switch (value) {
+    case "activity": return contract.ExtensionMainViewIcon.ACTIVITY;
+    case "box": return contract.ExtensionMainViewIcon.BOX;
+    case "code": return contract.ExtensionMainViewIcon.CODE;
+    case "file-text": return contract.ExtensionMainViewIcon.FILE_TEXT;
+    case "globe": return contract.ExtensionMainViewIcon.GLOBE;
+    case "layout": return contract.ExtensionMainViewIcon.LAYOUT;
+    case "search": return contract.ExtensionMainViewIcon.SEARCH;
+    case "sparkles": return contract.ExtensionMainViewIcon.SPARKLES;
+    case "terminal": return contract.ExtensionMainViewIcon.TERMINAL;
+    case "tool": return contract.ExtensionMainViewIcon.TOOL;
+    default: return contract.ExtensionMainViewIcon.UNSPECIFIED;
+  }
+}
+
+async function extensionMainViewEffect<T>(effect: () => Promise<T>): Promise<T> {
+  try {
+    return await effect();
+  } catch (error) {
+    if (error instanceof ConnectError || error instanceof StoreError) throw error;
+    if (error instanceof ExtensionMainViewError) {
+      if (error.statusCode === 404) throw new ConnectError("Extension main view not found.", Code.NotFound);
+      if (error.statusCode === 410) throw new ConnectError("Extension main view was revoked.", Code.FailedPrecondition);
+      if (error.statusCode === 429) throw new ConnectError("Extension main-view capacity reached.", Code.ResourceExhausted);
+      throw new ConnectError("Extension main-view request is invalid.", Code.InvalidArgument);
+    }
+    const message = redactSecrets(error instanceof Error ? error.message : "Extension main-view request failed.");
+    if (/not found/iu.test(message)) throw new ConnectError(message, Code.NotFound);
+    if (/changed|concurrent|stale|revoked/iu.test(message)) throw new ConnectError(message, Code.Aborted);
+    throw new ConnectError(message, Code.FailedPrecondition);
+  }
 }
 
 function extensionPackageAcquisition(item: NativeExtensionCatalogDescriptor): {

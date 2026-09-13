@@ -164,6 +164,15 @@ describe("Pi package compatibility details", () => {
           skills: ["skills"],
           prompts: ["prompts"],
           themes: ["themes"]
+        },
+        joko: {
+          extensionSurfaces: {
+            schemaVersion: 1,
+            extensions: [{
+              entry: "extensions/index.ts",
+              mainView: { html: "ui/review/index.html", title: "Review", icon: "layout" }
+            }]
+          }
         }
       }),
       "extensions/index.ts": `
@@ -176,7 +185,8 @@ describe("Pi package compatibility details", () => {
       `,
       "skills/review/SKILL.md": "# Review\n",
       "prompts/check.md": "Check this.\n",
-      "themes/night.json": "{}\n"
+      "themes/night.json": "{}\n",
+      "ui/review/index.html": "<!doctype html><title>Review</title>\n"
     });
     const result = await inspectPiPackageCompatibility(root, {
       currentRuntimeVersion: "0.84.2",
@@ -195,6 +205,8 @@ describe("Pi package compatibility details", () => {
     });
     expect(result.resources.map((resource) => resource.kind)).toEqual(["extension", "skill", "prompt", "theme"]);
     expect(result.resources[0]).toMatchObject({
+      entryPath: "extensions/index.ts",
+      mainView: { html: "ui/review/index.html", title: "Review", icon: "layout" },
       compatibility: "partial",
       adaptedApis: ["setStatus"],
       unsupportedApis: ["setHeader"],
@@ -202,6 +214,26 @@ describe("Pi package compatibility details", () => {
     });
     expect(result.resources[3]).toMatchObject({ compatibility: "unsupported", compatibilityIssues: ["theme-control"] });
     expect(shouldShowPiPackageNotice(result, false)).toBe(true);
+  });
+
+  it("fails closed when a declared main view does not bind to the inspected package tree", async () => {
+    const root = await createFixture({
+      "package.json": JSON.stringify({
+        pi: { extensions: ["extensions/index.ts"] },
+        joko: {
+          extensionSurfaces: {
+            schemaVersion: 1,
+            extensions: [{ entry: "extensions/other.ts", mainView: { html: "ui/review/index.html" } }]
+          }
+        }
+      }),
+      "extensions/index.ts": "export default function setup() {}\n",
+      "ui/review/index.html": "<!doctype html>\n"
+    });
+    await expect(inspectPiPackageCompatibility(root)).resolves.toMatchObject({
+      resources: [],
+      warnings: ["inspection-failed"]
+    });
   });
 
   it("keeps theme-only convention packages visible but non-toggleable", async () => {
