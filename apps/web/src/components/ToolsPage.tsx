@@ -38,6 +38,7 @@ import { BrowserLostPageCard, BrowserPageRail, type BrowserPageSelection } from 
 import {
   ExtensionPackageBatchDialog,
   ExtensionPackageDialog,
+  ExtensionPackageExportDialog,
   ExtensionPackageRemovalDialog,
   type ExtensionPackageIntent
 } from "./ExtensionPackageDialogs.js";
@@ -868,6 +869,7 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, lo
   const [setupOpen, setSetupOpen] = useState(false);
   const [sourcesOpen, setSourcesOpen] = useState(false);
   const [packageIntent, setPackageIntent] = useState<ExtensionPackageIntent>();
+  const [packageExport, setPackageExport] = useState<ExtensionCatalogEntryView>();
   const [packageRemoval, setPackageRemoval] = useState<ExtensionCatalogEntryView>();
   const [packageBatchOpen, setPackageBatchOpen] = useState(false);
   const listRequest = useRef(0);
@@ -1072,6 +1074,7 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, lo
         onSetup={() => setSetupOpen(true)}
         onUse={(command) => useCommand(selectedDetail, command)}
         onPackage={() => openPackage(selectedDetail)}
+        onExport={() => setPackageExport(selectedDetail)}
         onRemove={() => setPackageRemoval(selectedDetail)}
       />}
     </section>
@@ -1121,6 +1124,13 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, lo
         setRefreshRevision((value) => value + 1);
       }}
     />
+    <ExtensionPackageExportDialog
+      controller={controller}
+      extension={packageExport}
+      t={t}
+      runAction={runAction}
+      onClose={() => setPackageExport(undefined)}
+    />
     <ExtensionPackageBatchDialog
       controller={controller}
       resources={snapshot.resources}
@@ -1138,7 +1148,7 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, lo
   </div>;
 }
 
-function ExtensionDetail({ extension, busy, t, onEnabledChange, onSidebarChange, onSetup, onUse, onPackage, onRemove }: {
+function ExtensionDetail({ extension, busy, t, onEnabledChange, onSidebarChange, onSetup, onUse, onPackage, onExport, onRemove }: {
   readonly extension: ExtensionCatalogEntryView;
   readonly busy: boolean;
   readonly t: Translator;
@@ -1147,6 +1157,7 @@ function ExtensionDetail({ extension, busy, t, onEnabledChange, onSidebarChange,
   readonly onSetup: () => void;
   readonly onUse: (command: ExtensionCatalogEntryView["commands"][number]) => void;
   readonly onPackage: () => void;
+  readonly onExport: () => void;
   readonly onRemove: () => void;
 }): JSX.Element {
   const sourceOwned = extension.owner.kind === "source";
@@ -1161,6 +1172,7 @@ function ExtensionDetail({ extension, busy, t, onEnabledChange, onSidebarChange,
     </section>}
     {extension.owner.kind === "resource" && <section className="extension-package-management">
       {extension.update !== undefined && <div className={cx("extension-package-update", extension.update.sourceReplacement && "is-replacement")}><RefreshCcw aria-hidden="true" /><span><strong>{extension.update.sourceReplacement ? t("extensions.package.replacementTitle") : t("extensions.install.updateAvailable")}</strong><small>{extension.version ?? t("common.unknown")} → {extension.update.availableVersion ?? t("common.unknown")}</small></span><Button tone={extension.update.sourceReplacement ? "danger" : "primary"} disabled={busy} onClick={onPackage}>{extension.update.sourceReplacement ? t("extensions.package.replace") : t("extensions.package.update")}</Button></div>}
+      <Button tone="ghost" disabled={busy} onClick={onExport}><Download aria-hidden="true" />{t("extensions.export.open")}</Button>
       <Button tone="ghost" className="danger-text" disabled={busy} onClick={onRemove}><Trash2 aria-hidden="true" />{t("extensions.package.uninstall")}</Button>
     </section>}
     <ExtensionDetailSection title={t("extensions.commands")} empty={t("extensions.noCommands")} items={extension.commands.map((command) => <div className="extension-capability-row" key={`${command.sessionId}\u0000${command.name}`}><span><strong>/{command.name}</strong><small>{command.description}</small></span><Button tone="primary" disabled={busy || !extension.enabled} onClick={() => onUse(command)}><Play aria-hidden="true" />{extension.setup.state === "ready" || extension.setup.state === "notRequired" ? t("extensions.use") : t("extensions.configureToUse")}</Button></div>)} />

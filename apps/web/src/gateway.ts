@@ -70,6 +70,7 @@ import {
   ExtensionWidgetPlacement,
   ExtensionCatalogSource as ProtoExtensionCatalogSource,
   ExtensionPackageAction as ProtoExtensionPackageAction,
+  ExtensionPackageExportState as ProtoExtensionPackageExportState,
   ExtensionSourceKind as ProtoExtensionSourceKind,
   ExtensionSourceState as ProtoExtensionSourceState,
   ExtensionInstallState as ProtoExtensionInstallState,
@@ -271,6 +272,9 @@ import {
   type ExtraDirectory,
   type ExtensionStatus,
   type ExtensionCatalogEntry as ProtoExtensionCatalogEntry,
+  type ExtensionPackageExportAuthority as ProtoExtensionPackageExportAuthority,
+  type ExtensionPackageExportJob as ProtoExtensionPackageExportJob,
+  type ExtensionPackageExportPreview as ProtoExtensionPackageExportPreview,
   type ExtensionPackagePreview as ProtoExtensionPackagePreview,
   type ExtensionSourceDescriptor as ProtoExtensionSourceDescriptor,
   type ExtensionWidget,
@@ -385,6 +389,10 @@ import type {
   ExtensionStatusView,
   ExtensionCatalogEntryView,
   ExtensionCatalogView,
+  ExtensionPackageExportAuthorityView,
+  ExtensionPackageExportCatalogView,
+  ExtensionPackageExportJobView,
+  ExtensionPackageExportPreviewView,
   ExtensionPackagePreviewView,
   ExtensionSourceCatalogView,
   ExtensionSourceDraft,
@@ -3020,6 +3028,119 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       case: "removeExtensionPackage",
       value: { extensionId, expectedRevision: { value: expectedRevision } }
     }, true, [], scope.signal);
+  }
+
+  async getExtensionPackageExportPreview(
+    extensionId: string,
+    expectedRevision: bigint,
+    signal?: AbortSignal
+  ): Promise<ExtensionPackageExportPreviewView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).getExtensionPackageExportPreview({
+      extensionId,
+      expectedRevision: { value: expectedRevision }
+    }, { signal: scope.signal });
+    if (response.preview === undefined) throw new GatewayError("Orchestrator returned an empty Extension package export preview.");
+    return {
+      ...mapExtensionPackageExportPreview(response.preview),
+      recoveredFromCorruption: response.recoveredFromCorruption
+    };
+  }
+
+  async listExtensionPackageExports(
+    extensionId?: string,
+    signal?: AbortSignal
+  ): Promise<ExtensionPackageExportCatalogView> {
+    const scope = this.captureActionScope(signal);
+    const client = createClient(ExtensionService, scope.transport);
+    const exports: ExtensionPackageExportJobView[] = [];
+    const identities = new Set<string>();
+    const consumedTokens = new Set<string>();
+    let pageToken = "";
+    let recoveredFromCorruption: boolean | undefined;
+    let totalSize: number | undefined;
+    for (let pageIndex = 0; pageIndex < MAX_COMPLETE_MESSAGE_SEARCH_PAGES; pageIndex += 1) {
+      scope.signal.throwIfAborted();
+      const response = await client.listExtensionPackageExports({
+        ...(extensionId === undefined ? {} : { extensionId }),
+        page: { pageSize: 500, pageToken }
+      }, { signal: scope.signal });
+      if (recoveredFromCorruption === undefined) recoveredFromCorruption = response.recoveredFromCorruption;
+      else if (recoveredFromCorruption !== response.recoveredFromCorruption) {
+        throw new GatewayError("Extension package export recovery state changed while it was being loaded.");
+      }
+      const pageTotal = response.page === undefined ? undefined : exactSafeUnsignedNumber(response.page.totalSize);
+      if (pageTotal === undefined) throw new GatewayError("Orchestrator returned an invalid Extension package export catalog size.");
+      if (totalSize === undefined) totalSize = pageTotal;
+      else if (totalSize !== pageTotal) throw new GatewayError("Orchestrator returned inconsistent Extension package export catalog sizes.");
+      if (response.exports.length > 500 || exports.length + response.exports.length > pageTotal) {
+        throw new GatewayError("Orchestrator returned an invalid Extension package export page.");
+      }
+      for (const value of response.exports) {
+        const mapped = mapExtensionPackageExportJob(value);
+        if (extensionId !== undefined && mapped.authority.extensionId !== extensionId) {
+          throw new GatewayError("Orchestrator returned an Extension package export outside the requested owner.");
+        }
+        if (identities.has(mapped.id)) throw new GatewayError("Orchestrator returned a duplicate Extension package export identity.");
+        identities.add(mapped.id);
+        exports.push(mapped);
+      }
+      const nextPageToken = response.page?.nextPageToken ?? "";
+      if (nextPageToken === "") {
+        if (exports.length !== pageTotal) throw new GatewayError("Orchestrator returned an incomplete Extension package export catalog.");
+        return { exports, recoveredFromCorruption: recoveredFromCorruption ?? false };
+      }
+      if (nextPageToken === pageToken || consumedTokens.has(nextPageToken)) {
+        throw new GatewayError("Orchestrator returned a cyclic Extension package export page token.");
+      }
+      consumedTokens.add(nextPageToken);
+      pageToken = nextPageToken;
+    }
+    throw new GatewayError("Extension package exports exceeded the safe pagination limit.");
+  }
+
+  async getExtensionPackageExport(exportId: string, signal?: AbortSignal): Promise<ExtensionPackageExportJobView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).getExtensionPackageExport(
+      { exportId },
+      { signal: scope.signal }
+    );
+    if (response.export === undefined) throw new GatewayError("Orchestrator returned an empty Extension package export.");
+    return mapExtensionPackageExportJob(response.export);
+  }
+
+  async startExtensionPackageExport(
+    preview: ExtensionPackageExportPreviewView,
+    signal?: AbortSignal
+  ): Promise<ExtensionPackageExportJobView> {
+    const scope = this.captureActionScope(signal);
+    const operation = await this.submit({
+      case: "startExtensionPackageExport",
+      value: {
+        extensionId: preview.extensionId,
+        expectedExtensionRevision: { value: preview.extensionRevision },
+        resourceId: preview.resourceId,
+        expectedResourceRevision: { value: preview.resourceRevision },
+        backendId: preview.backendId,
+        expectedBackendRevision: { value: preview.backendRevision },
+        expectedBackendGeneration: BigInt(preview.backendGeneration)
+      }
+    }, true, [], scope.signal);
+    if (operation.operationId.trim() === "") throw new GatewayError("Orchestrator returned an Extension package export without an identity.");
+    return this.getExtensionPackageExport(operation.operationId, scope.signal);
+  }
+
+  async cancelExtensionPackageExport(
+    exportId: string,
+    expectedRevision: bigint,
+    signal?: AbortSignal
+  ): Promise<ExtensionPackageExportJobView> {
+    const scope = this.captureActionScope(signal);
+    await this.submit({
+      case: "cancelExtensionPackageExport",
+      value: { exportId, expectedRevision: { value: expectedRevision } }
+    }, true, [], scope.signal);
+    return this.getExtensionPackageExport(exportId, scope.signal);
   }
 
   async getExtensionSourceGitPreflight(signal?: AbortSignal): Promise<ExtensionSourceGitPreflightView> {
@@ -10080,6 +10201,171 @@ function mapExtensionPackagePreview(preview: ProtoExtensionPackagePreview): Exte
     disabledLifecycleScripts: [...preview.disabledLifecycleScripts],
     canToggle: preview.canToggle
   };
+}
+
+function mapExtensionPackageExportAuthority(
+  authority: ProtoExtensionPackageExportAuthority | undefined
+): ExtensionPackageExportAuthorityView {
+  const extensionRevision = authority?.extensionRevision?.value;
+  const resourceRevision = authority?.resourceRevision?.value;
+  const backendRevision = authority?.backendRevision?.value;
+  const backendGeneration = authority === undefined ? undefined : exactSafeUnsignedNumber(authority.backendGeneration);
+  if (
+    authority === undefined
+    || authority.extensionId.trim() === ""
+    || extensionRevision === undefined
+    || extensionRevision < 1n
+    || authority.resourceId.trim() === ""
+    || resourceRevision === undefined
+    || resourceRevision < 1n
+    || !/^sha256:[a-f0-9]{64}$/u.test(authority.discoveredRevision)
+    || authority.backendId.trim() === ""
+    || backendRevision === undefined
+    || backendRevision < 1n
+    || backendGeneration === undefined
+    || backendGeneration < 1
+    || authority.packageName.trim() === ""
+    || (authority.packageVersion !== undefined && authority.packageVersion.trim() === "")
+  ) throw new GatewayError("Orchestrator returned an invalid Extension package export authority.");
+  return {
+    extensionId: authority.extensionId,
+    extensionRevision,
+    resourceId: authority.resourceId,
+    resourceRevision,
+    discoveredRevision: authority.discoveredRevision,
+    backendId: authority.backendId,
+    backendRevision,
+    backendGeneration,
+    packageName: authority.packageName,
+    ...(authority.packageVersion === undefined ? {} : { packageVersion: authority.packageVersion })
+  };
+}
+
+function mapExtensionPackageExportJob(job: ProtoExtensionPackageExportJob): ExtensionPackageExportJobView {
+  const revision = job.revision?.value;
+  const state = extensionPackageExportState(job.state);
+  const authority = mapExtensionPackageExportAuthority(job.authority);
+  const uncompressedBytes = exactSafeUnsignedNumber(job.uncompressedBytes);
+  const createdAt = timestampMs(job.createdAt);
+  const updatedAt = timestampMs(job.updatedAt);
+  const completedAt = job.completedAt === undefined ? undefined : timestampMs(job.completedAt);
+  const active = state === "pending" || state === "snapshotting" || state === "packaging" || state === "verifying";
+  if (
+    job.exportId.trim() === ""
+    || revision === undefined
+    || revision < 1n
+    || job.archiveFormat !== "npm-tar-gzip"
+    || !isSafeArchiveFileName(job.fileName)
+    || !Number.isSafeInteger(job.files)
+    || job.files < 0
+    || uncompressedBytes === undefined
+    || createdAt < 1
+    || updatedAt < createdAt
+    || (active && completedAt !== undefined)
+    || (!active && completedAt === undefined)
+    || (completedAt !== undefined && completedAt < updatedAt)
+    || (state === "ready" ? job.artifact === undefined : job.artifact !== undefined)
+    || (state === "failed" ? job.error?.trim() === "" || job.error === undefined : job.error !== undefined)
+  ) throw new GatewayError("Orchestrator returned an invalid Extension package export job.");
+  const artifact = job.artifact;
+  const artifactBytes = artifact === undefined ? undefined : exactSafeUnsignedNumber(artifact.byteSize);
+  if (
+    artifact !== undefined
+    && (
+      artifact.blobId.trim() === ""
+      || !/^[a-f0-9]{64}$/u.test(artifact.sha256Hex)
+      || artifactBytes === undefined
+      || artifactBytes < 1
+      || artifact.mediaType !== "application/gzip"
+      || artifact.fileName !== job.fileName
+    )
+  ) throw new GatewayError("Orchestrator returned an invalid Extension package export Artifact.");
+  return {
+    id: job.exportId,
+    revision,
+    state,
+    authority,
+    archiveFormat: "npm-tar-gzip",
+    fileName: job.fileName,
+    files: job.files,
+    uncompressedBytes,
+    ...(artifact === undefined ? {} : {
+      artifact: {
+        blobId: artifact.blobId,
+        sha256: artifact.sha256Hex,
+        byteSize: artifactBytes!,
+        mediaType: artifact.mediaType,
+        fileName: artifact.fileName
+      }
+    }),
+    createdAt,
+    updatedAt,
+    ...(completedAt === undefined ? {} : { completedAt }),
+    ...(job.error === undefined ? {} : { error: job.error })
+  };
+}
+
+function mapExtensionPackageExportPreview(preview: ProtoExtensionPackageExportPreview): Omit<ExtensionPackageExportPreviewView, "recoveredFromCorruption"> {
+  const authority = mapExtensionPackageExportAuthority(preview.authority);
+  const maximumUncompressedBytes = exactSafeUnsignedNumber(preview.maximumUncompressedBytes);
+  const activeExport = preview.activeExport === undefined ? undefined : mapExtensionPackageExportJob(preview.activeExport);
+  if (
+    preview.archiveFormat !== "npm-tar-gzip"
+    || !isSafeArchiveFileName(preview.fileName)
+    || !Number.isSafeInteger(preview.maximumEntries)
+    || preview.maximumEntries < 1
+    || maximumUncompressedBytes === undefined
+    || maximumUncompressedBytes < 1
+    || preview.localOnly !== true
+    || (activeExport !== undefined && (
+      !["pending", "snapshotting", "packaging", "verifying"].includes(activeExport.state)
+      || !sameExtensionPackageExportAuthority(activeExport.authority, authority)
+    ))
+  ) throw new GatewayError("Orchestrator returned an invalid Extension package export preview.");
+  return {
+    ...authority,
+    archiveFormat: "npm-tar-gzip",
+    fileName: preview.fileName,
+    maximumEntries: preview.maximumEntries,
+    maximumUncompressedBytes,
+    localOnly: true,
+    ...(activeExport === undefined ? {} : { activeExport })
+  };
+}
+
+function extensionPackageExportState(value: ProtoExtensionPackageExportState): ExtensionPackageExportJobView["state"] {
+  switch (value) {
+    case ProtoExtensionPackageExportState.PENDING: return "pending";
+    case ProtoExtensionPackageExportState.SNAPSHOTTING: return "snapshotting";
+    case ProtoExtensionPackageExportState.PACKAGING: return "packaging";
+    case ProtoExtensionPackageExportState.VERIFYING: return "verifying";
+    case ProtoExtensionPackageExportState.READY: return "ready";
+    case ProtoExtensionPackageExportState.FAILED: return "failed";
+    case ProtoExtensionPackageExportState.CANCELLED: return "cancelled";
+    case ProtoExtensionPackageExportState.UNSPECIFIED:
+    default: throw new GatewayError("Orchestrator returned an invalid Extension package export state.");
+  }
+}
+
+function isSafeArchiveFileName(value: string): boolean {
+  return value.trim() !== "" && value.length <= 255 && value.endsWith(".tgz")
+    && !value.includes("/") && !value.includes("\\") && !value.includes("\0");
+}
+
+function sameExtensionPackageExportAuthority(
+  left: ExtensionPackageExportAuthorityView,
+  right: ExtensionPackageExportAuthorityView
+): boolean {
+  return left.extensionId === right.extensionId
+    && left.extensionRevision === right.extensionRevision
+    && left.resourceId === right.resourceId
+    && left.resourceRevision === right.resourceRevision
+    && left.discoveredRevision === right.discoveredRevision
+    && left.backendId === right.backendId
+    && left.backendRevision === right.backendRevision
+    && left.backendGeneration === right.backendGeneration
+    && left.packageName === right.packageName
+    && left.packageVersion === right.packageVersion;
 }
 
 function extensionPackageAction(value: ProtoExtensionPackageAction): ExtensionPackagePreviewView["action"] {

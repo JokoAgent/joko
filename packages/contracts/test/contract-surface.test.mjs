@@ -326,11 +326,62 @@ test("durable and cross-process field numbers remain stable", () => {
     [contract.OperationMutationSchema, "update_agent_resource_settings", 163],
     [contract.OperationMutationSchema, "update_collaboration_settings", 164],
     [contract.OperationMutationSchema, "update_git_safety_settings", 165],
-    [contract.OperationMutationSchema, "cleanup_git_safety_savepoints", 166]
+    [contract.OperationMutationSchema, "cleanup_git_safety_savepoints", 166],
+    [contract.OperationMutationSchema, "start_extension_package_export", 194],
+    [contract.OperationMutationSchema, "cancel_extension_package_export", 195]
   ];
   for (const [schema, name, number] of expected) {
     assert.equal(field(schema, name).number, number, `${schema.typeName}.${name}`);
   }
+});
+
+test("Extension package export contracts preserve exact local authority and durable control", () => {
+  const methods = methodNames(contract.ExtensionService);
+  assert.equal(methods.has("getExtensionPackageExportPreview"), true);
+  assert.equal(methods.has("listExtensionPackageExports"), true);
+  assert.equal(methods.has("getExtensionPackageExport"), true);
+  const authority = {
+    extensionId: "extension_0123456789abcdef0123456789abcdef",
+    extensionRevision: { value: 7n },
+    resourceId: "resource-package",
+    resourceRevision: { value: 5n },
+    discoveredRevision: `sha256:${"a".repeat(64)}`,
+    backendId: "pi",
+    backendRevision: { value: 9n },
+    backendGeneration: 3n,
+    packageName: "@sample/exportable",
+    packageVersion: "1.2.3"
+  };
+  const preview = roundTrip(contract.ExtensionPackageExportPreviewSchema, {
+    authority,
+    archiveFormat: "npm-tar-gzip",
+    fileName: "sample-exportable-1.2.3.tgz",
+    maximumEntries: 10_000,
+    maximumUncompressedBytes: 67_108_864n,
+    localOnly: true
+  });
+  assert.equal(preview.authority.backendGeneration, 3n);
+  assert.equal(preview.authority.discoveredRevision, authority.discoveredRevision);
+  assert.equal(preview.localOnly, true);
+
+  const start = roundTrip(contract.OperationMutationSchema, {
+    payload: { case: "startExtensionPackageExport", value: {
+      extensionId: authority.extensionId,
+      expectedExtensionRevision: authority.extensionRevision,
+      resourceId: authority.resourceId,
+      expectedResourceRevision: authority.resourceRevision,
+      backendId: authority.backendId,
+      expectedBackendRevision: authority.backendRevision,
+      expectedBackendGeneration: authority.backendGeneration
+    } }
+  });
+  assert.equal(start.payload.case, "startExtensionPackageExport");
+  assert.equal(start.payload.value.expectedBackendGeneration, 3n);
+  const cancel = roundTrip(contract.OperationMutationSchema, {
+    payload: { case: "cancelExtensionPackageExport", value: { exportId: "export-1", expectedRevision: { value: 4n } } }
+  });
+  assert.equal(cancel.payload.case, "cancelExtensionPackageExport");
+  assert.equal(cancel.payload.value.expectedRevision.value, 4n);
 });
 
 test("auxiliary routing preserves ordered exact routes and independent revisions", () => {

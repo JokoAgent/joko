@@ -6,14 +6,17 @@ import type { AppController } from "../controller.js";
 import type {
   BackendView,
   ExtensionCatalogEntryView,
+  ExtensionPackageExportJobView,
+  ExtensionPackageExportPreviewView,
   ExtensionPackagePreviewView,
   ResourceCompatibilityView,
   ResourcePackageWarningView,
   ResourceView
 } from "../model.js";
 import { resourceKindsForBackend } from "../resource-capabilities.js";
+import { ArtifactDownloadButton } from "./ArtifactDownloadButton.js";
 import type { RunAction, Translator } from "./types.js";
-import { Button, CheckboxControl, Modal, Pill, SelectControl } from "./ui.js";
+import { Button, CheckboxControl, formatBytes, Modal, Pill, SelectControl } from "./ui.js";
 
 export interface ExtensionPackageIntent {
   readonly extension: ExtensionCatalogEntryView;
@@ -225,6 +228,180 @@ export function ExtensionPackageRemovalDialog({ controller, extension, t, runAct
     {result === "failed" && <p className="extension-package-result is-failed" role="status"><AlertTriangle aria-hidden="true" />{t("extensions.package.failed")}</p>}
     <div className="modal__actions"><Button disabled={busy} onClick={close}>{result === "success" ? t("common.close") : t("common.cancel")}</Button>{result !== "success" && <Button tone="danger" disabled={busy} onClick={remove}><Trash2 aria-hidden="true" />{t("extensions.package.uninstall")}</Button>}</div>
   </Modal>;
+}
+
+const ACTIVE_EXPORT_STATES = new Set<ExtensionPackageExportJobView["state"]>([
+  "pending", "snapshotting", "packaging", "verifying"
+]);
+
+export function ExtensionPackageExportDialog({ controller, extension, t, runAction, onClose }: {
+  readonly controller: AppController;
+  readonly extension?: ExtensionCatalogEntryView;
+  readonly t: Translator;
+  readonly runAction: RunAction;
+  readonly onClose: () => void;
+}): JSX.Element {
+  const [preview, setPreview] = useState<ExtensionPackageExportPreviewView>();
+  const [job, setJob] = useState<ExtensionPackageExportJobView>();
+  const [loading, setLoading] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string>();
+  const [recovered, setRecovered] = useState(false);
+  const [reloadRevision, setReloadRevision] = useState(0);
+  const generation = useRef(0);
+  const selectedExtensionId = extension?.id;
+
+  useEffect(() => {
+    const request = ++generation.current;
+    setPreview(undefined);
+    setJob(undefined);
+    setError(undefined);
+    setRecovered(false);
+    setBusy(false);
+    if (extension === undefined || extension.owner.kind !== "resource") {
+      setLoading(false);
+      return;
+    }
+    const abort = new AbortController();
+    setLoading(true);
+    void Promise.all([
+      controller.getExtensionPackageExportPreview(extension.id, extension.revision, abort.signal),
+      controller.listExtensionPackageExports(extension.id, abort.signal)
+    ]).then(([nextPreview, catalog]) => {
+      if (abort.signal.aborted || request !== generation.current) return;
+      setPreview(nextPreview);
+      setJob(nextPreview.activeExport ?? catalog.exports[0]);
+      setRecovered(nextPreview.recoveredFromCorruption || catalog.recoveredFromCorruption);
+    }).catch((cause: unknown) => {
+      if (!abort.signal.aborted && request === generation.current) setError(packageError(cause, t));
+    }).finally(() => {
+      if (!abort.signal.aborted && request === generation.current) setLoading(false);
+    });
+    return () => abort.abort();
+  }, [controller, extension, reloadRevision, t]);
+
+  useEffect(() => {
+    if (job === undefined || !ACTIVE_EXPORT_STATES.has(job.state) || selectedExtensionId === undefined) return;
+    const abort = new AbortController();
+    const request = generation.current;
+    const timer = window.setTimeout(() => {
+      void controller.getExtensionPackageExport(job.id, abort.signal).then((next) => {
+        if (
+          abort.signal.aborted
+          || request !== generation.current
+          || next.id !== job.id
+          || next.authority.extensionId !== selectedExtensionId
+        ) return;
+        setJob(next);
+        setError(undefined);
+      }).catch((cause: unknown) => {
+        if (!abort.signal.aborted && request === generation.current) setError(packageError(cause, t));
+      });
+    }, 350);
+    return () => { window.clearTimeout(timer); abort.abort(); };
+  }, [controller, job, selectedExtensionId, t]);
+
+  const close = (): void => {
+    if (busy) return;
+    generation.current += 1;
+    onClose();
+  };
+  const start = (): void => {
+    if (preview === undefined || busy || active) return;
+    const request = generation.current;
+    setBusy(true);
+    setError(undefined);
+    runAction(`extension-package-export:${preview.extensionId}`, async () => {
+      try {
+        const next = await controller.startExtensionPackageExport(preview);
+        if (request === generation.current && next.authority.extensionId === preview.extensionId) setJob(next);
+      } catch (cause) {
+        if (request === generation.current) setError(packageError(cause, t));
+        throw cause;
+      } finally {
+        if (request === generation.current) setBusy(false);
+      }
+    });
+  };
+  const cancel = (): void => {
+    if (job === undefined || !ACTIVE_EXPORT_STATES.has(job.state) || busy) return;
+    const request = generation.current;
+    setBusy(true);
+    setError(undefined);
+    runAction(`extension-package-export-cancel:${job.id}`, async () => {
+      try {
+        const next = await controller.cancelExtensionPackageExport(job.id, job.revision);
+        if (request === generation.current && next.id === job.id) setJob(next);
+      } catch (cause) {
+        if (request === generation.current) setError(packageError(cause, t));
+        throw cause;
+      } finally {
+        if (request === generation.current) setBusy(false);
+      }
+    });
+  };
+  const refresh = (): void => {
+    if (busy || loading) return;
+    setError(undefined);
+    setReloadRevision((value) => value + 1);
+  };
+  const active = job !== undefined && ACTIVE_EXPORT_STATES.has(job.state);
+  const artifact = job?.state === "ready" ? job.artifact : undefined;
+
+  return <Modal
+    open={extension !== undefined}
+    title={t("extensions.export.title", { name: extension?.name ?? t("extensions.title") })}
+    description={t("extensions.export.body")}
+    size="medium"
+    onClose={close}
+  >
+    <div className="extension-package-export" aria-busy={loading || busy}>
+      {loading && <p className="extension-package-dialog__status" role="status"><RefreshCcw aria-hidden="true" />{t("extensions.export.loading")}</p>}
+      {error !== undefined && <p className="extension-detail__error" role="alert"><AlertTriangle aria-hidden="true" />{error}</p>}
+      {recovered && <p className="extension-package-warning" role="status"><AlertTriangle aria-hidden="true" /><span>{t("extensions.export.recovered")}</span></p>}
+      {preview !== undefined && <>
+        <p className="extension-package-export__local"><ShieldAlert aria-hidden="true" /><span><strong>{t("extensions.export.localOnly")}</strong><small>{t("extensions.export.localOnlyBody")}</small></span></p>
+        <dl className="extension-package-export__authority">
+          <div><dt>{t("extensions.package.packageName")}</dt><dd><code>{preview.packageName}</code></dd></div>
+          <div><dt>{t("extensions.version")}</dt><dd>{preview.packageVersion ?? t("common.unknown")}</dd></div>
+          <div><dt>{t("extensions.export.backend")}</dt><dd><code>{preview.backendId}</code><small>{t("extensions.export.backendRevision", { revision: preview.backendRevision.toString(10), generation: preview.backendGeneration })}</small></dd></div>
+          <div><dt>{t("extensions.export.resource")}</dt><dd><code>{preview.resourceId}</code><small>{t("extensions.export.resourceRevision", { revision: preview.resourceRevision.toString(10) })}</small></dd></div>
+        </dl>
+        <p className="extension-package-export__limits">{t("extensions.export.limits", {
+          entries: preview.maximumEntries,
+          bytes: formatBytes(preview.maximumUncompressedBytes)
+        })}</p>
+      </>}
+      {job !== undefined && <section className={`extension-package-export__job is-${job.state}`}>
+        <header><span><strong>{job.fileName}</strong><small>{t("extensions.export.progress", { files: job.files, bytes: formatBytes(job.uncompressedBytes) })}</small></span><Pill tone={exportStateTone(job.state)}>{t(`extensions.export.state.${job.state}`)}</Pill></header>
+        {active && <p role="status"><RefreshCcw aria-hidden="true" />{t("extensions.export.activeBody")}</p>}
+        {job.state === "ready" && <p className="extension-package-result is-success" role="status"><CheckCircle2 aria-hidden="true" />{t("extensions.export.readyBody")}</p>}
+        {job.state === "failed" && <p className="extension-package-result is-failed" role="alert"><AlertTriangle aria-hidden="true" />{job.error ?? t("extensions.export.failedBody")}</p>}
+        {job.state === "cancelled" && <p className="muted">{t("extensions.export.cancelledBody")}</p>}
+      </section>}
+    </div>
+    <div className="modal__actions">
+      <Button disabled={busy} onClick={close}>{t("common.close")}</Button>
+      {error !== undefined && <Button disabled={busy || loading} onClick={refresh}><RefreshCcw aria-hidden="true" />{t("common.retry")}</Button>}
+      {active && <Button tone="danger" disabled={busy} onClick={cancel}>{t("extensions.export.cancel")}</Button>}
+      {!active && preview !== undefined && <Button tone="primary" disabled={busy || loading} onClick={start}>{job === undefined ? t("extensions.export.prepare") : t("extensions.export.prepareAgain")}</Button>}
+      {artifact !== undefined && <ArtifactDownloadButton
+        tone="primary"
+        ownerKey={JSON.stringify([job!.id, job!.revision.toString(10), artifact.blobId])}
+        connectionOwner={controller.downloadArtifact}
+        label={t("extensions.export.download")}
+        errorLabel={t("workspace.downloadUnavailable")}
+        action={(context) => controller.downloadArtifact(artifact.blobId, artifact.fileName, context)}
+      />}
+    </div>
+  </Modal>;
+}
+
+function exportStateTone(state: ExtensionPackageExportJobView["state"]): "success" | "danger" | "warning" | "neutral" {
+  if (state === "ready") return "success";
+  if (state === "failed") return "danger";
+  if (ACTIVE_EXPORT_STATES.has(state)) return "warning";
+  return "neutral";
 }
 
 type BatchState = "pending" | "updating" | "done" | "skipped" | "failed";

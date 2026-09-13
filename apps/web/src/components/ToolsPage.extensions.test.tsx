@@ -11,6 +11,8 @@ import {
   type BackendView,
   type ExtensionCatalogEntryView,
   type ExtensionCatalogView,
+  type ExtensionPackageExportJobView,
+  type ExtensionPackageExportPreviewView,
   type ExtensionPackagePreviewView,
   type ExtensionSourceCatalogView,
   type ResourceView
@@ -330,6 +332,112 @@ describe("Extension catalog interactions", () => {
     expect(dialog.textContent).toContain("Resource package was uninstalled");
   });
 
+  it("confirms exact local-only export authority and exposes only a verified Artifact download", async () => {
+    const extension = readyExtension();
+    const preview = packageExportPreview(extension);
+    const ready = packageExportJob(preview, "ready", 4n);
+    const getExtensionPackageExportPreview = vi.fn(async () => preview);
+    const listExtensionPackageExports = vi.fn(async () => ({ exports: [], recoveredFromCorruption: false }));
+    const startExtensionPackageExport = vi.fn(async () => ready);
+    const downloadArtifact = vi.fn(async () => "dispatched" as const);
+    const { container } = await renderExtensions({
+      extension,
+      resources: [managedResource("resource-1")],
+      backends: [{ ...packageBackend("backend-1"), instanceGeneration: 3 }],
+      controller: {
+        listExtensions: async () => catalog(extension),
+        getExtension: async () => catalog(extension),
+        getExtensionPackageExportPreview,
+        listExtensionPackageExports,
+        startExtensionPackageExport,
+        downloadArtifact
+      }
+    });
+
+    await act(async () => buttonWithText(container, "Prepare local package").click());
+    await settleMany();
+    const dialog = requiredDialog();
+    expect(getExtensionPackageExportPreview).toHaveBeenCalledWith(extension.id, 7n, expect.any(AbortSignal));
+    expect(listExtensionPackageExports).toHaveBeenCalledWith(extension.id, expect.any(AbortSignal));
+    expect(dialog.textContent).toContain("Local export only");
+    expect(dialog.textContent).toContain("does not upload or publish anything");
+    expect(dialog.textContent).toContain("@sample/review");
+    expect(dialog.textContent).toContain("Revision 9 · generation 3");
+    expect(dialog.textContent).toContain("Revision 4");
+
+    await act(async () => buttonWithText(dialog, "Prepare package").click());
+    await settleMany();
+    expect(startExtensionPackageExport).toHaveBeenCalledWith(preview);
+    expect(dialog.textContent).toContain("re-opened, extracted, and verified");
+    await act(async () => buttonWithText(dialog, "Download package").click());
+    await settleMany();
+    expect(downloadArtifact).toHaveBeenCalledWith(
+      ready.artifact?.blobId,
+      ready.fileName,
+      expect.objectContaining({ ownerDocument: document, signal: expect.any(AbortSignal) })
+    );
+  });
+
+  it("retries the complete export preview after an initial read failure", async () => {
+    const extension = readyExtension();
+    const preview = packageExportPreview(extension);
+    const getExtensionPackageExportPreview = vi.fn()
+      .mockRejectedValueOnce(new Error("temporary export read failure"))
+      .mockResolvedValue(preview);
+    const listExtensionPackageExports = vi.fn(async () => ({ exports: [], recoveredFromCorruption: false }));
+    const { container } = await renderExtensions({
+      extension,
+      resources: [managedResource("resource-1")],
+      controller: {
+        listExtensions: async () => catalog(extension),
+        getExtension: async () => catalog(extension),
+        getExtensionPackageExportPreview,
+        listExtensionPackageExports
+      }
+    });
+
+    await act(async () => buttonWithText(container, "Prepare local package").click());
+    await settleMany();
+    const dialog = requiredDialog();
+    expect(dialog.textContent).toContain("temporary export read failure");
+    await act(async () => buttonWithText(dialog, "Retry").click());
+    await settleMany();
+    expect(getExtensionPackageExportPreview).toHaveBeenCalledTimes(2);
+    expect(listExtensionPackageExports).toHaveBeenCalledTimes(2);
+    expect(dialog.textContent).toContain("Local export only");
+  });
+
+  it("shows durable active export progress and revision-fences cancellation", async () => {
+    const extension = readyExtension();
+    const preview = packageExportPreview(extension);
+    const active = packageExportJob(preview, "packaging", 3n);
+    const cancelled = packageExportJob(preview, "cancelled", 4n);
+    const cancelExtensionPackageExport = vi.fn(async () => cancelled);
+    const { container } = await renderExtensions({
+      extension,
+      resources: [managedResource("resource-1")],
+      controller: {
+        listExtensions: async () => catalog(extension),
+        getExtension: async () => catalog(extension),
+        getExtensionPackageExportPreview: async () => ({ ...preview, activeExport: active }),
+        listExtensionPackageExports: async () => ({ exports: [active], recoveredFromCorruption: false }),
+        getExtensionPackageExport: async () => active,
+        cancelExtensionPackageExport
+      }
+    });
+
+    await act(async () => buttonWithText(container, "Prepare local package").click());
+    await settleMany();
+    const dialog = requiredDialog();
+    expect(dialog.textContent).toContain("Packaging");
+    expect(dialog.textContent).toContain("4 files");
+    await act(async () => buttonWithText(dialog, "Cancel preparation").click());
+    await settleMany();
+    expect(cancelExtensionPackageExport).toHaveBeenCalledWith(active.id, 3n);
+    expect(dialog.textContent).toContain("Package preparation was cancelled");
+    expect(dialog.textContent).not.toContain("Download package");
+  });
+
   it("deduplicates batch updates by Resource, skips source changes, and continues after a failure", async () => {
     const first = updateExtension("01", "resource-1", false);
     const duplicate = updateExtension("02", "resource-1", false);
@@ -574,6 +682,69 @@ function packagePreview(
     warnings: ["lifecycleScriptsDisabled"],
     disabledLifecycleScripts: ["postinstall"],
     canToggle: true
+  };
+}
+
+function packageExportPreview(extension: ExtensionCatalogEntryView): ExtensionPackageExportPreviewView {
+  if (extension.owner.kind !== "resource") throw new Error("Export fixture requires an installed Resource owner.");
+  return {
+    extensionId: extension.id,
+    extensionRevision: extension.revision,
+    resourceId: extension.owner.resourceId,
+    resourceRevision: extension.owner.resourceRevision,
+    discoveredRevision: `sha256:${"a".repeat(64)}`,
+    backendId: "backend-1",
+    backendRevision: 9n,
+    backendGeneration: 3,
+    packageName: "@sample/review",
+    ...(extension.version === undefined ? {} : { packageVersion: extension.version }),
+    archiveFormat: "npm-tar-gzip",
+    fileName: "sample-review-1.0.0.tgz",
+    maximumEntries: 10_000,
+    maximumUncompressedBytes: 64 * 1024 * 1024,
+    localOnly: true,
+    recoveredFromCorruption: false
+  };
+}
+
+function packageExportJob(
+  preview: ExtensionPackageExportPreviewView,
+  state: Extract<ExtensionPackageExportJobView["state"], "packaging" | "ready" | "cancelled">,
+  revision: bigint
+): ExtensionPackageExportJobView {
+  const completed = state === "ready" || state === "cancelled";
+  return {
+    id: "extension-export-1",
+    revision,
+    state,
+    authority: {
+      extensionId: preview.extensionId,
+      extensionRevision: preview.extensionRevision,
+      resourceId: preview.resourceId,
+      resourceRevision: preview.resourceRevision,
+      discoveredRevision: preview.discoveredRevision,
+      backendId: preview.backendId,
+      backendRevision: preview.backendRevision,
+      backendGeneration: preview.backendGeneration,
+      packageName: preview.packageName,
+      ...(preview.packageVersion === undefined ? {} : { packageVersion: preview.packageVersion })
+    },
+    archiveFormat: "npm-tar-gzip",
+    fileName: preview.fileName,
+    files: 4,
+    uncompressedBytes: 5_632,
+    ...(state === "ready" ? {
+      artifact: {
+        blobId: "extension-export-artifact",
+        sha256: "b".repeat(64),
+        byteSize: 2_048,
+        mediaType: "application/gzip",
+        fileName: preview.fileName
+      }
+    } : {}),
+    createdAt: Date.UTC(2026, 8, 14),
+    updatedAt: Date.UTC(2026, 8, 14, 0, 0, 1),
+    ...(completed ? { completedAt: Date.UTC(2026, 8, 14, 0, 0, 1) } : {})
   };
 }
 

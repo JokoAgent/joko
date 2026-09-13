@@ -25,6 +25,8 @@ import type {
   ComposerDraft,
   ExtensionCatalogEntryView,
   ExtensionCatalogView,
+  ExtensionPackageExportJobView,
+  ExtensionPackageExportPreviewView,
   ExtensionPackagePreviewView,
   ExtensionSourceCatalogView,
   InteractionResolutionDraft,
@@ -99,6 +101,7 @@ export function VisualHarness(): JSX.Element {
   }), []);
   const providerLoginFlows = useRef(new Map<string, ProviderLoginFlowView>());
   const sequence = useRef(100);
+  const extensionPackageExports = useRef(new Map<string, ExtensionPackageExportJobView>());
   const [state, setState] = useState<ControllerState>(() => initialControllerState(scenario, files));
   const remoteHosts = useMemo(() => new VisualRemoteHostFixture(state.snapshot.targets, target => {
     setState(current => ({ ...current, snapshot: { ...current.snapshot, targets: current.snapshot.targets.map(value => value.id === target.id ? target : value) } }));
@@ -332,6 +335,113 @@ export function VisualHarness(): JSX.Element {
           throw new Error("The visual extension changed. Refresh and try again.");
         }
         record(`extension-package:remove:${extension.owner.resourceId}`);
+      },
+      getExtensionPackageExportPreview: async (extensionId, expectedRevision, signal): Promise<ExtensionPackageExportPreviewView> => {
+        signal?.throwIfAborted();
+        const extension = state.snapshot.extensions.find((candidate) => candidate.id === extensionId);
+        if (extension === undefined || extension.revision !== expectedRevision || extension.owner.kind !== "resource") {
+          throw new Error("The visual installed extension changed. Refresh and try again.");
+        }
+        const activeExport = [...extensionPackageExports.current.values()].find((candidate) => (
+          candidate.authority.extensionId === extensionId
+          && ["pending", "snapshotting", "packaging", "verifying"].includes(candidate.state)
+        ));
+        return visualExtensionPackageExportPreview(extension, state.snapshot, activeExport);
+      },
+      listExtensionPackageExports: async (extensionId, signal) => {
+        signal?.throwIfAborted();
+        return {
+          exports: [...extensionPackageExports.current.values()]
+            .filter((candidate) => extensionId === undefined || candidate.authority.extensionId === extensionId)
+            .sort((left, right) => right.updatedAt - left.updatedAt || right.id.localeCompare(left.id, "en")),
+          recoveredFromCorruption: false
+        };
+      },
+      getExtensionPackageExport: async (exportId, signal): Promise<ExtensionPackageExportJobView> => {
+        signal?.throwIfAborted();
+        const current = extensionPackageExports.current.get(exportId);
+        if (current === undefined) throw new Error("The visual package export does not exist.");
+        const states: Partial<Record<ExtensionPackageExportJobView["state"], ExtensionPackageExportJobView["state"]>> = {
+          pending: "snapshotting",
+          snapshotting: "packaging",
+          packaging: "verifying",
+          verifying: "ready"
+        };
+        const state = states[current.state];
+        if (state === undefined) return current;
+        const now = FIXED_NOW + sequence.current++;
+        const next: ExtensionPackageExportJobView = {
+          ...current,
+          revision: current.revision + 1n,
+          state,
+          files: state === "snapshotting" ? 0 : 4,
+          uncompressedBytes: state === "snapshotting" ? 0 : 5_632,
+          updatedAt: now,
+          ...(state === "ready" ? {
+            completedAt: now,
+            artifact: {
+              blobId: `visual-extension-package-${exportId}`,
+              sha256: "a".repeat(64),
+              byteSize: 2_048,
+              mediaType: "application/gzip",
+              fileName: current.fileName
+            }
+          } : {})
+        };
+        extensionPackageExports.current.set(exportId, next);
+        return next;
+      },
+      startExtensionPackageExport: async (preview, signal): Promise<ExtensionPackageExportJobView> => {
+        signal?.throwIfAborted();
+        if ([...extensionPackageExports.current.values()].some((candidate) => (
+          candidate.authority.extensionId === preview.extensionId
+          && ["pending", "snapshotting", "packaging", "verifying"].includes(candidate.state)
+        ))) throw new Error("The visual extension already has an active package export.");
+        const id = `visual-extension-export-${sequence.current++}`;
+        const now = FIXED_NOW + sequence.current++;
+        const next: ExtensionPackageExportJobView = {
+          id,
+          revision: 1n,
+          state: "pending",
+          authority: {
+            extensionId: preview.extensionId,
+            extensionRevision: preview.extensionRevision,
+            resourceId: preview.resourceId,
+            resourceRevision: preview.resourceRevision,
+            discoveredRevision: preview.discoveredRevision,
+            backendId: preview.backendId,
+            backendRevision: preview.backendRevision,
+            backendGeneration: preview.backendGeneration,
+            packageName: preview.packageName,
+            ...(preview.packageVersion === undefined ? {} : { packageVersion: preview.packageVersion })
+          },
+          archiveFormat: "npm-tar-gzip",
+          fileName: preview.fileName,
+          files: 0,
+          uncompressedBytes: 0,
+          createdAt: now,
+          updatedAt: now
+        };
+        extensionPackageExports.current.set(id, next);
+        record(`extension-package-export:start:${preview.resourceId}`);
+        return next;
+      },
+      cancelExtensionPackageExport: async (exportId, expectedRevision, signal): Promise<ExtensionPackageExportJobView> => {
+        signal?.throwIfAborted();
+        const current = extensionPackageExports.current.get(exportId);
+        if (current === undefined || current.revision !== expectedRevision) throw new Error("The visual package export changed.");
+        if (!["pending", "snapshotting", "packaging", "verifying"].includes(current.state)) throw new Error("The visual package export is already complete.");
+        const now = FIXED_NOW + sequence.current++;
+        const next: ExtensionPackageExportJobView = {
+          ...current,
+          revision: current.revision + 1n,
+          state: "cancelled",
+          updatedAt: now,
+          completedAt: now
+        };
+        extensionPackageExports.current.set(exportId, next);
+        record(`extension-package-export:cancel:${exportId}`);
+        return next;
       },
       getExtensionSourceGitPreflight: async () => ({ available: true, version: "2.51.0", minimumVersion: "2.25" }),
       listExtensionSources: async (signal): Promise<ExtensionSourceCatalogView> => {
@@ -3728,6 +3838,41 @@ function visualExtensionPackagePreview(extension: ExtensionCatalogEntryView, bac
     warnings: ["lifecycleScriptsDisabled"],
     disabledLifecycleScripts: ["postinstall"],
     canToggle: true
+  };
+}
+
+function visualExtensionPackageExportPreview(
+  extension: ExtensionCatalogEntryView,
+  snapshot: AppSnapshot,
+  activeExport?: ExtensionPackageExportJobView
+): ExtensionPackageExportPreviewView {
+  const owner = extension.owner;
+  if (owner.kind !== "resource") throw new Error("The visual extension is not installed from a managed Resource.");
+  const resource = snapshot.resources.find((candidate) => candidate.id === owner.resourceId);
+  if (resource === undefined || resource.scope !== "managed" || resource.kind !== "package") {
+    throw new Error("The visual Extension Resource is unavailable.");
+  }
+  const backend = snapshot.backends.find((candidate) => candidate.id === resource.backendId);
+  const packageName = extension.name === "Release notes" ? "@joko/release-notes" : "@joko/workspace-navigator";
+  const packageVersion = extension.version;
+  return {
+    extensionId: extension.id,
+    extensionRevision: extension.revision,
+    resourceId: resource.id,
+    resourceRevision: owner.resourceRevision,
+    discoveredRevision: owner.discoveredRevision,
+    backendId: resource.backendId,
+    backendRevision: 9n,
+    backendGeneration: backend?.instanceGeneration ?? 1,
+    packageName,
+    ...(packageVersion === undefined ? {} : { packageVersion }),
+    archiveFormat: "npm-tar-gzip",
+    fileName: `${packageName.replace(/^@/u, "").replaceAll("/", "-")}-${packageVersion ?? "package"}.tgz`,
+    maximumEntries: 10_000,
+    maximumUncompressedBytes: 64 * 1024 * 1024,
+    localOnly: true,
+    ...(activeExport === undefined ? {} : { activeExport }),
+    recoveredFromCorruption: false
   };
 }
 

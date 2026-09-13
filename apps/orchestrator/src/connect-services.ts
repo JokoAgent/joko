@@ -131,6 +131,13 @@ import type {
   ExtensionRuntimeObservation
 } from "./extension-catalog.js";
 import { extensionMcpInput } from "./extension-catalog.js";
+import type {
+  ExtensionPackageExportAuthority as NativeExtensionPackageExportAuthority,
+  ExtensionPackageExportJob as NativeExtensionPackageExportJob,
+  ExtensionPackageExportPreview as NativeExtensionPackageExportPreview,
+  ExtensionPackagePublisher,
+  PreparedExtensionPackageExport
+} from "./extension-package-publisher.js";
 import {
   ExtensionSourceError,
   type ExtensionSourceDescriptor as NativeExtensionSourceDescriptor,
@@ -381,6 +388,7 @@ interface ConnectServiceDependencies {
   readonly mcpRouter?: McpRouter;
   readonly piResources?: PiResourceManager;
   readonly extensionCatalog?: ExtensionCatalogManager;
+  readonly extensionPackagePublisher?: ExtensionPackagePublisher;
   readonly extensionSources?: ExtensionSourceManager;
   readonly piBackendIds?: ReadonlySet<string>;
   readonly diagnosticsBundles?: DiagnosticsBundleService;
@@ -913,6 +921,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
     ...(application.mcpRouter === undefined ? {} : { mcpRouter: application.mcpRouter }),
     ...(application.piResources === undefined ? {} : { piResources: application.piResources }),
     ...(application.extensionCatalog === undefined ? {} : { extensionCatalog: application.extensionCatalog }),
+    ...(application.extensionPackagePublisher === undefined ? {} : { extensionPackagePublisher: application.extensionPackagePublisher }),
     ...(application.extensionSources === undefined ? {} : { extensionSources: application.extensionSources }),
     piBackendIds: new Set(application.adapters
       .filter((adapter): adapter is PiBackendAdapter => adapter instanceof PiBackendAdapter)
@@ -3512,6 +3521,55 @@ export function createConnectServices(application: OrchestratorApplication): Con
           packageRoot
         });
         return { preview: mapExtensionPackagePreview(extension, preview) };
+      }));
+    },
+    getExtensionPackageExportPreview: async (request, context) => {
+      authenticate(context);
+      if (
+        dependencies.extensionCatalog === undefined
+        || dependencies.extensionPackagePublisher === undefined
+        || dependencies.piResources === undefined
+      ) {
+        throw new ConnectError("Extension package export is unavailable.", Code.Unimplemented);
+      }
+      if (request.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const expectedRevision = fromProtoRevision(request.expectedRevision, "get_extension_package_export_preview.expected_revision");
+      const authority = requireExtensionPackageExportAuthority(
+        dependencies,
+        nonBlankRequest(request.extensionId, "extension_id"),
+        expectedRevision
+      );
+      return {
+        preview: mapExtensionPackageExportPreview(dependencies.extensionPackagePublisher.preview(authority)),
+        recoveredFromCorruption: dependencies.extensionPackagePublisher.recoveredFromCorruption
+      };
+    },
+    listExtensionPackageExports: (request, context) => {
+      authenticate(context);
+      if (dependencies.extensionPackagePublisher === undefined) {
+        return { exports: [], recoveredFromCorruption: false, page: emptyPage(request.page) };
+      }
+      const extensionId = request.extensionId === undefined
+        ? undefined
+        : nonBlankRequest(request.extensionId, "extension_id");
+      const result = paginate(dependencies.extensionPackagePublisher.list({
+        ...(extensionId === undefined ? {} : { extensionId })
+      }).map(mapExtensionPackageExportJob), request.page);
+      return {
+        exports: result.values,
+        recoveredFromCorruption: dependencies.extensionPackagePublisher.recoveredFromCorruption,
+        page: result.page
+      };
+    },
+    getExtensionPackageExport: (request, context) => {
+      authenticate(context);
+      if (dependencies.extensionPackagePublisher === undefined) {
+        throw new ConnectError("Extension package export is unavailable.", Code.Unimplemented);
+      }
+      const exportId = nonBlankRequest(request.exportId, "export_id");
+      return extensionPublisherAction(() => ({
+        export: mapExtensionPackageExportJob(dependencies.extensionPackagePublisher!.get(exportId)),
+        recoveredFromCorruption: dependencies.extensionPackagePublisher!.recoveredFromCorruption
       }));
     },
     beginExtensionSetupCredentialUpload: (request, context) => {
@@ -8549,6 +8607,93 @@ function requireCurrentExtensionMutation(
   return entry;
 }
 
+function requireExtensionPackageExportAuthority(
+  dependencies: ConnectServiceDependencies,
+  extensionId: string,
+  expectedExtensionRevision: bigint,
+  currentOnly = false,
+  store: OperationalStore = dependencies.store
+): NativeExtensionPackageExportAuthority {
+  if (dependencies.piResources === undefined || dependencies.extensionCatalog === undefined) {
+    throw new ConnectError("Extension package export is unavailable.", Code.Unimplemented);
+  }
+  const extension = currentOnly
+    ? requireCurrentExtensionMutation(dependencies, extensionId, expectedExtensionRevision)
+    : requireExtensionMutation(dependencies, extensionId, expectedExtensionRevision);
+  if (extension.owner.kind !== "resource" || !extension.installed) {
+    throw new ConnectError("Only an installed Resource-owned Extension can be exported.", Code.FailedPrecondition);
+  }
+  let resource: NativePiResourceDescriptor;
+  try {
+    resource = dependencies.piResources.get(extension.owner.resourceId);
+  } catch (error) {
+    throw new ConnectError(redactSecrets(error instanceof Error ? error.message : "Extension Resource not found."), Code.NotFound);
+  }
+  if (
+    resource.id !== extension.owner.resourceId
+    || resource.versionNumber !== extension.owner.resourceVersion
+    || resource.discoveredRevision !== extension.owner.discoveredRevision
+    || resource.kind !== "package"
+    || resource.scope !== "managed"
+    || resource.packageIdentity === undefined
+    || resource.state === "removed"
+    || resource.state === "error"
+    || extension.version !== resource.version
+  ) {
+    throw new ConnectError("Extension package authority is not a current installed managed Resource.", Code.FailedPrecondition);
+  }
+  const backend = store.getBackend(resource.backendId);
+  return {
+    extensionId: extension.id,
+    extensionRevision: extension.revision,
+    resourceId: resource.id,
+    resourceRevision: resource.versionNumber,
+    discoveredRevision: resource.discoveredRevision,
+    backendId: resource.backendId,
+    backendRevision: backend.revision,
+    backendGeneration: backend.descriptor.instanceGeneration,
+    packageName: resource.packageIdentity,
+    ...(resource.version === undefined ? {} : { packageVersion: resource.version })
+  };
+}
+
+function assertExpectedExtensionPackageExportAuthority(
+  authority: NativeExtensionPackageExportAuthority,
+  input: {
+    readonly resourceId: string;
+    readonly resourceRevision: bigint;
+    readonly backendId: string;
+    readonly backendRevision: bigint;
+    readonly backendGeneration: number;
+  }
+): void {
+  if (
+    authority.resourceId !== input.resourceId
+    || authority.resourceRevision !== input.resourceRevision
+    || authority.backendId !== input.backendId
+    || authority.backendRevision !== input.backendRevision
+    || authority.backendGeneration !== input.backendGeneration
+  ) throw new ConnectError("Extension package export authority changed after confirmation.", Code.Aborted);
+}
+
+function assertSameExtensionPackageExportAuthority(
+  expected: NativeExtensionPackageExportAuthority,
+  current: NativeExtensionPackageExportAuthority
+): void {
+  if (
+    expected.extensionId !== current.extensionId
+    || expected.extensionRevision !== current.extensionRevision
+    || expected.resourceId !== current.resourceId
+    || expected.resourceRevision !== current.resourceRevision
+    || expected.discoveredRevision !== current.discoveredRevision
+    || expected.backendId !== current.backendId
+    || expected.backendRevision !== current.backendRevision
+    || expected.backendGeneration !== current.backendGeneration
+    || expected.packageName !== current.packageName
+    || expected.packageVersion !== current.packageVersion
+  ) throw new Error("Extension package export authority changed while work was active.");
+}
+
 function extensionCatalogAction<T>(action: () => T): T {
   try {
     return action();
@@ -8572,6 +8717,28 @@ async function extensionCatalogEffect<T>(effect: () => Promise<T>): Promise<T> {
     if (/concurrently|stale/iu.test(message)) throw new ConnectError(message, Code.Aborted);
     if (/invalid/iu.test(message)) throw invalidArgument(message);
     throw new ConnectError(message, Code.FailedPrecondition);
+  }
+}
+
+function extensionPublisherAction<T>(action: () => T): T {
+  try {
+    return action();
+  } catch (error) {
+    if (error instanceof ConnectError || error instanceof StoreError) throw error;
+    const message = redactSecrets(error instanceof Error ? error.message : "Extension package export failed.");
+    if (/does not exist|not found/iu.test(message)) throw new ConnectError(message, Code.NotFound);
+    if (/changed|concurrently|stale/iu.test(message)) throw new ConnectError(message, Code.Aborted);
+    if (/invalid/iu.test(message)) throw invalidArgument(message);
+    if (/concurrency limit|history is full/iu.test(message)) throw new ConnectError(message, Code.ResourceExhausted);
+    throw new ConnectError(message, Code.FailedPrecondition);
+  }
+}
+
+async function extensionPublisherEffect<T>(effect: () => Promise<T>): Promise<T> {
+  try {
+    return await effect();
+  } catch (error) {
+    return extensionPublisherAction(() => { throw error; });
   }
 }
 
@@ -8762,6 +8929,69 @@ function mapExtensionPackagePreview(
     disabledLifecycleScripts: [...preview.disabledLifecycleScripts],
     canToggle: preview.canToggle
   });
+}
+
+function mapExtensionPackageExportAuthority(
+  authority: NativeExtensionPackageExportAuthority
+): contract.ExtensionPackageExportAuthority {
+  return create(contract.ExtensionPackageExportAuthoritySchema, {
+    extensionId: authority.extensionId,
+    extensionRevision: toProtoRevision(authority.extensionRevision),
+    resourceId: authority.resourceId,
+    resourceRevision: toProtoRevision(authority.resourceRevision),
+    discoveredRevision: authority.discoveredRevision,
+    backendId: authority.backendId,
+    backendRevision: toProtoRevision(authority.backendRevision),
+    backendGeneration: BigInt(authority.backendGeneration),
+    packageName: authority.packageName,
+    ...(authority.packageVersion === undefined ? {} : { packageVersion: authority.packageVersion })
+  });
+}
+
+function mapExtensionPackageExportJob(job: NativeExtensionPackageExportJob): contract.ExtensionPackageExportJob {
+  return create(contract.ExtensionPackageExportJobSchema, {
+    exportId: job.id,
+    revision: toProtoRevision(job.revision),
+    state: protoExtensionPackageExportState(job.state),
+    authority: mapExtensionPackageExportAuthority(job.authority),
+    archiveFormat: job.archiveFormat,
+    fileName: job.fileName,
+    files: job.files,
+    uncompressedBytes: BigInt(job.uncompressedBytes),
+    ...(job.artifact === undefined ? {} : { artifact: toProtoBlobRef(job.artifact) }),
+    createdAt: toProtoTimestamp(job.createdAt),
+    updatedAt: toProtoTimestamp(job.updatedAt),
+    ...(job.completedAt === undefined ? {} : { completedAt: toProtoTimestamp(job.completedAt) }),
+    ...(job.error === undefined ? {} : { error: job.error })
+  });
+}
+
+function mapExtensionPackageExportPreview(
+  preview: NativeExtensionPackageExportPreview
+): contract.ExtensionPackageExportPreview {
+  return create(contract.ExtensionPackageExportPreviewSchema, {
+    authority: mapExtensionPackageExportAuthority(preview),
+    archiveFormat: preview.archiveFormat,
+    fileName: preview.fileName,
+    maximumEntries: preview.maximumEntries,
+    maximumUncompressedBytes: BigInt(preview.maximumUncompressedBytes),
+    localOnly: preview.localOnly,
+    ...(preview.activeExport === undefined ? {} : { activeExport: mapExtensionPackageExportJob(preview.activeExport) })
+  });
+}
+
+function protoExtensionPackageExportState(
+  state: NativeExtensionPackageExportJob["state"]
+): contract.ExtensionPackageExportState {
+  switch (state) {
+    case "pending": return contract.ExtensionPackageExportState.PENDING;
+    case "snapshotting": return contract.ExtensionPackageExportState.SNAPSHOTTING;
+    case "packaging": return contract.ExtensionPackageExportState.PACKAGING;
+    case "verifying": return contract.ExtensionPackageExportState.VERIFYING;
+    case "ready": return contract.ExtensionPackageExportState.READY;
+    case "failed": return contract.ExtensionPackageExportState.FAILED;
+    case "cancelled": return contract.ExtensionPackageExportState.CANCELLED;
+  }
 }
 
 function protoExtensionPackageAction(value: NativePiExtensionPackageAction): contract.ExtensionPackageAction {
@@ -16220,6 +16450,114 @@ async function dispatchMutation(
       );
       return result;
     }
+    case "startExtensionPackageExport": {
+      if (
+        dependencies.extensionCatalog === undefined
+        || dependencies.extensionPackagePublisher === undefined
+        || dependencies.piResources === undefined
+      ) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Extension package export is unavailable.");
+      }
+      if (payload.value.expectedExtensionRevision === undefined) throw invalidArgument("expected_extension_revision is required");
+      if (payload.value.expectedResourceRevision === undefined) throw invalidArgument("expected_resource_revision is required");
+      if (payload.value.expectedBackendRevision === undefined) throw invalidArgument("expected_backend_revision is required");
+      const extensionId = nonBlankRequest(payload.value.extensionId, "extension_id");
+      const expectedExtensionRevision = fromProtoRevision(
+        payload.value.expectedExtensionRevision,
+        "start_extension_package_export.expected_extension_revision"
+      );
+      const expected = {
+        resourceId: nonBlankRequest(payload.value.resourceId, "resource_id"),
+        resourceRevision: fromProtoRevision(
+          payload.value.expectedResourceRevision,
+          "start_extension_package_export.expected_resource_revision"
+        ),
+        backendId: nonBlankRequest(payload.value.backendId, "backend_id"),
+        backendRevision: fromProtoRevision(
+          payload.value.expectedBackendRevision,
+          "start_extension_package_export.expected_backend_revision"
+        ),
+        backendGeneration: safeUnsignedNumber(
+          payload.value.expectedBackendGeneration,
+          "expected_backend_generation"
+        )
+      };
+      let admitted: NativeExtensionPackageExportAuthority | undefined;
+      let prepared: PreparedExtensionPackageExport | undefined;
+      const assertAdmission = (currentOnly = false, store: OperationalStore = dependencies.store) => {
+        const current = requireExtensionPackageExportAuthority(
+          dependencies,
+          extensionId,
+          expectedExtensionRevision,
+          currentOnly,
+          store
+        );
+        assertExpectedExtensionPackageExportAuthority(current, expected);
+        if (admitted === undefined) admitted = current;
+        else assertSameExtensionPackageExportAuthority(admitted, current);
+        return current;
+      };
+      void assertAdmission();
+      return ackOperation(
+        dependencies,
+        operationId,
+        connection,
+        mutation,
+        payload.case,
+        async () => extensionPublisherEffect(async () => {
+          const authority = assertAdmission();
+          prepared = await dependencies.extensionPackagePublisher!.prepareStart({
+            exportId: operationId,
+            authority
+          });
+        }),
+        (store) => { void assertAdmission(true, store); },
+        (commit) => dependencies.extensionPackagePublisher!.completePreparedMutation(
+          requiredPreparedExtensionPackageExport(prepared),
+          (finalize) => commit(finalize)
+        ),
+        async (execution) => {
+          if (execution.replayed) return;
+          dependencies.extensionPackagePublisher!.begin(operationId, () => {
+            const current = requireExtensionPackageExportAuthority(
+              dependencies,
+              extensionId,
+              expectedExtensionRevision,
+              true
+            );
+            assertSameExtensionPackageExportAuthority(admitted!, current);
+          });
+        }
+      );
+    }
+    case "cancelExtensionPackageExport": {
+      if (dependencies.extensionPackagePublisher === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Extension package export is unavailable.");
+      }
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const exportId = nonBlankRequest(payload.value.exportId, "export_id");
+      const expectedRevision = fromProtoRevision(
+        payload.value.expectedRevision,
+        "cancel_extension_package_export.expected_revision"
+      );
+      let prepared: PreparedExtensionPackageExport | undefined;
+      return ackOperation(
+        dependencies,
+        operationId,
+        connection,
+        mutation,
+        payload.case,
+        async () => extensionPublisherEffect(async () => {
+          prepared = await dependencies.extensionPackagePublisher!.prepareCancel(exportId, expectedRevision);
+        }),
+        undefined,
+        (commit) => dependencies.extensionPackagePublisher!.completePreparedMutation(
+          requiredPreparedExtensionPackageExport(prepared),
+          (finalize) => commit(finalize)
+        ),
+        async () => { dependencies.extensionPackagePublisher!.abort(exportId); }
+      );
+    }
     case "setExtensionEnabled": {
       if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
       const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "set_extension_enabled.expected_revision");
@@ -17351,6 +17689,13 @@ function requiredPreparedResourceMutation<T>(
   prepared: PreparedPiResourceMutation<T> | undefined
 ): PreparedPiResourceMutation<T> {
   if (prepared === undefined) throw new StoreError("Managed resource preparation did not produce a catalog mutation.");
+  return prepared;
+}
+
+function requiredPreparedExtensionPackageExport(
+  prepared: PreparedExtensionPackageExport | undefined
+): PreparedExtensionPackageExport {
+  if (prepared === undefined) throw new StoreError("Extension package export preparation did not produce a state mutation.");
   return prepared;
 }
 

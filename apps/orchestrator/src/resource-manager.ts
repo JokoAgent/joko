@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants, createReadStream } from "node:fs";
-import { copyFile, lstat, mkdir, open, readdir, realpath, rename, rm, stat } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, open, readdir, realpath, rename, rm, stat } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import type { ProjectSkillCandidate } from "@joko/adapter-pi";
@@ -276,6 +276,48 @@ export interface PiRuntimeResourceSnapshot {
   readonly resources: readonly RuntimeResource[];
 }
 
+export interface PiInstalledPackageLeaseInput {
+  readonly resourceId: string;
+  readonly backendId: string;
+  readonly expectedResourceVersion: bigint;
+  readonly expectedDiscoveredRevision: string;
+  readonly expectedPackageIdentity: string;
+  readonly expectedPackageVersion?: string;
+}
+
+export interface PiInstalledPackageSnapshotEntry {
+  readonly path: string;
+  readonly kind: "directory" | "file";
+  readonly mode: number;
+  readonly size: number;
+}
+
+export interface PiInstalledPackageSnapshot {
+  readonly discoveredRevision: string;
+  readonly files: number;
+  readonly bytes: number;
+  readonly entries: readonly PiInstalledPackageSnapshotEntry[];
+}
+
+export interface PiPackageCandidateInspection {
+  readonly discoveredRevision: string;
+  readonly files: number;
+  readonly bytes: number;
+  readonly compatibility: PiPackageInspection;
+}
+
+/**
+ * Process-local lease over one exact managed package generation. The path is
+ * deliberately kept behind snapshotTo so consumers cannot turn a private
+ * service path into public identity or bypass the Resource tree checks.
+ */
+export interface PiInstalledPackageLease {
+  readonly resource: PiResourceDescriptor;
+  readonly snapshotTo: (destination: string, signal?: AbortSignal) => Promise<PiInstalledPackageSnapshot>;
+  readonly assertCurrent: (signal?: AbortSignal) => Promise<void>;
+  readonly release: () => Promise<void>;
+}
+
 /** Immutable, path-free text authority captured for one Backend Target runtime. */
 export interface RuntimeTextResourceSeed {
   readonly id: string;
@@ -316,6 +358,8 @@ export class PiResourceManager {
   readonly #acquisition: PiPackageAcquisition;
   readonly #records = new Map<string, StoredResource>();
   readonly #preparedMutations = new WeakMap<object, PreparedCatalogMutation<unknown>>();
+  readonly #installedGenerationLeases = new Map<string, number>();
+  readonly #retiredInstalledGenerations = new Map<string, { readonly record: StoredResource; readonly generation: string }>();
   #initialized = false;
   #tail: Promise<void> = Promise.resolve();
 
@@ -383,6 +427,98 @@ export class PiResourceManager {
   get(resourceId: string): PiResourceDescriptor {
     this.#assertInitialized();
     return publicResource(this.#require(resourceId));
+  }
+
+  get maximumFiles(): number {
+    return this.#maximumFiles;
+  }
+
+  get maximumBytes(): number {
+    return this.#maximumBytes;
+  }
+
+  async acquireInstalledPackage(input: PiInstalledPackageLeaseInput): Promise<PiInstalledPackageLease> {
+    this.#assertInitialized();
+    const resourceId = nonBlank(input.resourceId, "Resource ID");
+    const backendId = nonBlank(input.backendId, "Backend ID");
+    const expectedRevision = normalizedContentRevision(input.expectedDiscoveredRevision, "Resource discovered revision");
+    const expectedIdentity = boundedPackageIdentity(input.expectedPackageIdentity);
+    const expectedVersion = input.expectedPackageVersion === undefined
+      ? undefined
+      : boundedVersion(input.expectedPackageVersion);
+    return this.#mutate(async () => {
+      const record = this.#require(resourceId);
+      this.#assertInstalledPackageLeaseAuthority(record, {
+        backendId,
+        expectedResourceVersion: input.expectedResourceVersion,
+        expectedDiscoveredRevision: expectedRevision,
+        expectedPackageIdentity: expectedIdentity,
+        ...(expectedVersion === undefined ? {} : { expectedPackageVersion: expectedVersion })
+      });
+      await this.#assertInstalledSafe(record);
+      const generation = installedGenerationContainer(this.#managedRoot, record);
+      const generationKey = pathIdentity(generation);
+      this.#installedGenerationLeases.set(generationKey, (this.#installedGenerationLeases.get(generationKey) ?? 0) + 1);
+      const resource = publicResource(record);
+      let released = false;
+      let releaseRequested = false;
+      let releasePromise: Promise<void> | undefined;
+      const assertLeaseOpen = (): void => {
+        if (releaseRequested) throw new Error("Installed package lease has been released.");
+      };
+      return {
+        resource,
+        snapshotTo: async (destination, signal) => {
+          assertLeaseOpen();
+          signal?.throwIfAborted();
+          await this.#assertInstalledPackageLeaseCurrent(record, signal);
+          const snapshot = await snapshotInstalledPackageTree(record.installedPath!, destination, this.#maximumFiles, this.#maximumBytes, signal);
+          if (snapshot.discoveredRevision !== record.discoveredRevision) {
+            throw new Error("Installed package content changed while it was being snapshotted.");
+          }
+          await this.#assertInstalledPackageLeaseCurrent(record, signal);
+          return snapshot;
+        },
+        assertCurrent: async (signal) => {
+          assertLeaseOpen();
+          await this.#assertInstalledPackageLeaseCurrent(record, signal);
+        },
+        release: async () => {
+          if (released) return;
+          releaseRequested = true;
+          releasePromise ??= this.#releaseInstalledPackageGeneration(generationKey).then(
+            () => { released = true; },
+            (error: unknown) => {
+              releasePromise = undefined;
+              throw error;
+            }
+          );
+          await releasePromise;
+        }
+      };
+    });
+  }
+
+  async inspectPackageCandidate(
+    packageRoot: string,
+    backendId: string,
+    signal?: AbortSignal
+  ): Promise<PiPackageCandidateInspection> {
+    this.#assertInitialized();
+    signal?.throwIfAborted();
+    const inspection = await inspectResource(packageRoot, this.#maximumFiles, this.#maximumBytes, signal);
+    const runtimeVersion = this.#runtimeVersion(nonBlank(backendId, "Backend ID"));
+    const compatibility = await inspectPiResourceCompatibility("package", inspection.canonicalPath, {
+      ...(runtimeVersion === undefined ? {} : { currentRuntimeVersion: runtimeVersion }),
+      contentFingerprint: inspection.revision
+    });
+    signal?.throwIfAborted();
+    return {
+      discoveredRevision: inspection.revision,
+      files: inspection.files,
+      bytes: inspection.bytes,
+      compatibility
+    };
   }
 
   /**
@@ -1419,6 +1555,11 @@ export class PiResourceManager {
   async #removeInstalledIncarnation(record: StoredResource): Promise<void> {
     assertExpectedInstalledLocation(this.#managedRoot, record);
     const generation = installedGenerationContainer(this.#managedRoot, record);
+    const generationKey = pathIdentity(generation);
+    if ((this.#installedGenerationLeases.get(generationKey) ?? 0) > 0) {
+      this.#retiredInstalledGenerations.set(generationKey, { record, generation });
+      return;
+    }
     await removeOwnedPath(
       this.#managedRoot,
       generation,
@@ -1428,8 +1569,60 @@ export class PiResourceManager {
   }
 
   async #removeResourceOwner(record: StoredResource): Promise<void> {
-    const owner = resourceOwnerPath(this.#managedRoot, record);
-    await removeOwnedPath(this.#managedRoot, owner, "Removed resource owner");
+    if (record.installedPath !== undefined) {
+      await this.#removeInstalledIncarnation(record);
+      return;
+    }
+    await this.#pruneResourceOwner(record);
+  }
+
+  async #releaseInstalledPackageGeneration(generationKey: string): Promise<void> {
+    await this.#mutate(async () => {
+      const count = this.#installedGenerationLeases.get(generationKey);
+      if (count === undefined || count < 1) throw new Error("Installed package lease accounting is inconsistent.");
+      if (count > 1) {
+        this.#installedGenerationLeases.set(generationKey, count - 1);
+        return;
+      }
+      const retired = this.#retiredInstalledGenerations.get(generationKey);
+      if (retired !== undefined) {
+        await removeOwnedPath(this.#managedRoot, retired.generation, "Retired leased resource generation");
+        await this.#pruneResourceOwner(retired.record);
+        this.#retiredInstalledGenerations.delete(generationKey);
+      }
+      this.#installedGenerationLeases.delete(generationKey);
+    });
+  }
+
+  async #assertInstalledPackageLeaseCurrent(record: StoredResource, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
+    await this.#mutate(async () => {
+      signal?.throwIfAborted();
+      const current = this.#require(record.id);
+      if (current !== record) throw new Error("Installed package Resource changed while it was being exported.");
+      await this.#assertInstalledSafe(current);
+      signal?.throwIfAborted();
+    });
+  }
+
+  #assertInstalledPackageLeaseAuthority(
+    record: StoredResource,
+    input: Omit<PiInstalledPackageLeaseInput, "resourceId">
+  ): void {
+    if (
+      record.backendId !== input.backendId
+      || record.versionNumber !== input.expectedResourceVersion.toString(10)
+      || record.discoveredRevision !== input.expectedDiscoveredRevision
+      || record.kind !== "package"
+      || record.scope !== "managed"
+      || record.installedPath === undefined
+      || record.packageIdentity !== input.expectedPackageIdentity
+      || record.version !== input.expectedPackageVersion
+      || record.state === "removed"
+      || record.state === "error"
+    ) {
+      throw new Error("Installed package Resource no longer matches the confirmed export authority.");
+    }
   }
 
   async #pruneResourceOwner(record: StoredResource): Promise<void> {
@@ -2057,6 +2250,99 @@ async function inspectFile(
   if (!after.isFile() || !sameIdentity(before, after) || before.size !== after.size || before.mtimeMs !== after.mtimeMs) {
     throw new Error("Resource file changed during inspection.");
   }
+}
+
+async function snapshotInstalledPackageTree(
+  sourceRoot: string,
+  destinationRoot: string,
+  maximumEntries: number,
+  maximumBytes: number,
+  signal?: AbortSignal
+): Promise<PiInstalledPackageSnapshot> {
+  signal?.throwIfAborted();
+  const source = normalizedAbsolute(sourceRoot, "Installed package snapshot source");
+  const destination = normalizedAbsolute(destinationRoot, "Installed package snapshot destination");
+  await assertCanonicalDirectory(source, "Installed package snapshot source");
+  await assertCanonicalDirectory(destination, "Installed package snapshot destination");
+  if ((await readdir(destination)).length !== 0) throw new Error("Installed package snapshot destination must be empty.");
+  const entries: PiInstalledPackageSnapshotEntry[] = [];
+  const budget = { files: 0, bytes: 0 };
+
+  const visit = async (sourceDirectory: string, destinationDirectory: string, relativeDirectory: string): Promise<void> => {
+    signal?.throwIfAborted();
+    const directoryBefore = await lstat(sourceDirectory);
+    if (!directoryBefore.isDirectory() || directoryBefore.isSymbolicLink()) {
+      throw new Error("Installed package snapshot contains a symlink, junction, or special directory.");
+    }
+    const canonicalDirectory = await realpath(sourceDirectory);
+    assertWithin(source, canonicalDirectory, "Installed package snapshot directory");
+    const children = await readdir(sourceDirectory, { withFileTypes: true });
+    children.sort((left, right) => left.name.localeCompare(right.name, "en"));
+    for (const child of children) {
+      signal?.throwIfAborted();
+      validateEntryName(child.name);
+      const sourcePath = join(sourceDirectory, child.name);
+      const destinationPath = join(destinationDirectory, child.name);
+      const relativePath = relativeDirectory === "" ? child.name : `${relativeDirectory}/${child.name}`;
+      const before = await lstat(sourcePath);
+      if (child.isSymbolicLink() || before.isSymbolicLink()) {
+        throw new Error("Installed package snapshot contains a symlink or junction.");
+      }
+      const canonical = await realpath(sourcePath);
+      assertWithin(source, canonical, "Installed package snapshot entry");
+      if (child.isDirectory() && before.isDirectory()) {
+        const mode = portablePackageMode(before.mode, true);
+        entries.push({ path: relativePath, kind: "directory", mode, size: 0 });
+        if (entries.length > maximumEntries) throw new Error("Installed package snapshot exceeds its entry limit.");
+        await mkdir(destinationPath, { recursive: false, mode: 0o700 });
+        await visit(canonical, destinationPath, relativePath);
+        await chmod(destinationPath, mode);
+      } else if (child.isFile() && before.isFile()) {
+        budget.files += 1;
+        budget.bytes += before.size;
+        const mode = portablePackageMode(before.mode, false);
+        entries.push({ path: relativePath, kind: "file", mode, size: before.size });
+        if (entries.length > maximumEntries || budget.bytes > maximumBytes) {
+          throw new Error("Installed package snapshot exceeds its entry or byte limit.");
+        }
+        signal?.throwIfAborted();
+        await copyFile(canonical, destinationPath, constants.COPYFILE_EXCL);
+        signal?.throwIfAborted();
+        await chmod(destinationPath, mode);
+      } else {
+        throw new Error("Installed package snapshot contains a special file or changed entry.");
+      }
+      const after = await lstat(sourcePath);
+      if (
+        after.isSymbolicLink()
+        || !sameIdentity(before, after)
+        || before.size !== after.size
+        || before.mtimeMs !== after.mtimeMs
+      ) throw new Error("Installed package entry changed while snapshotting.");
+    }
+    const directoryAfter = await lstat(sourceDirectory);
+    if (
+      !directoryAfter.isDirectory()
+      || directoryAfter.isSymbolicLink()
+      || !sameIdentity(directoryBefore, directoryAfter)
+      || directoryBefore.mtimeMs !== directoryAfter.mtimeMs
+    ) throw new Error("Installed package directory changed while snapshotting.");
+  };
+
+  await visit(source, destination, "");
+  signal?.throwIfAborted();
+  const inspection = await inspectResource(destination, maximumEntries, maximumBytes, signal);
+  return {
+    discoveredRevision: inspection.revision,
+    files: inspection.files,
+    bytes: inspection.bytes,
+    entries: Object.freeze(entries.map((entry) => Object.freeze({ ...entry })))
+  };
+}
+
+function portablePackageMode(sourceMode: number, directory: boolean): number {
+  if (directory) return 0o755;
+  return (sourceMode & 0o111) === 0 ? 0o644 : 0o755;
 }
 
 function runtimeTextState(state: PiResourceState): state is "approved" | "installed" | "loaded" {

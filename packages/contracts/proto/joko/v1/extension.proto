@@ -58,6 +58,17 @@ enum ExtensionPackageAction {
   EXTENSION_PACKAGE_ACTION_REPLACE = 3;
 }
 
+enum ExtensionPackageExportState {
+  EXTENSION_PACKAGE_EXPORT_STATE_UNSPECIFIED = 0;
+  EXTENSION_PACKAGE_EXPORT_STATE_PENDING = 1;
+  EXTENSION_PACKAGE_EXPORT_STATE_SNAPSHOTTING = 2;
+  EXTENSION_PACKAGE_EXPORT_STATE_PACKAGING = 3;
+  EXTENSION_PACKAGE_EXPORT_STATE_VERIFYING = 4;
+  EXTENSION_PACKAGE_EXPORT_STATE_READY = 5;
+  EXTENSION_PACKAGE_EXPORT_STATE_FAILED = 6;
+  EXTENSION_PACKAGE_EXPORT_STATE_CANCELLED = 7;
+}
+
 message ExtensionLocalSource {
   string path = 1;
 }
@@ -193,6 +204,45 @@ message ExtensionPackagePreview {
   repeated ResourcePackageWarning warnings = 14;
   repeated string disabled_lifecycle_scripts = 15;
   bool can_toggle = 16;
+}
+
+message ExtensionPackageExportAuthority {
+  string extension_id = 1;
+  Revision extension_revision = 2;
+  string resource_id = 3;
+  Revision resource_revision = 4;
+  string discovered_revision = 5;
+  string backend_id = 6;
+  Revision backend_revision = 7;
+  uint64 backend_generation = 8;
+  string package_name = 9;
+  optional string package_version = 10;
+}
+
+message ExtensionPackageExportJob {
+  string export_id = 1;
+  Revision revision = 2;
+  ExtensionPackageExportState state = 3;
+  ExtensionPackageExportAuthority authority = 4;
+  string archive_format = 5;
+  string file_name = 6;
+  uint32 files = 7;
+  uint64 uncompressed_bytes = 8;
+  optional BlobRef artifact = 9;
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp updated_at = 11;
+  optional google.protobuf.Timestamp completed_at = 12;
+  optional string error = 13;
+}
+
+message ExtensionPackageExportPreview {
+  ExtensionPackageExportAuthority authority = 1;
+  string archive_format = 2;
+  string file_name = 3;
+  uint32 maximum_entries = 4;
+  uint64 maximum_uncompressed_bytes = 5;
+  bool local_only = 6;
+  optional ExtensionPackageExportJob active_export = 7;
 }
 
 // Generic Extension projection. Executable bytes and secrets are deliberately

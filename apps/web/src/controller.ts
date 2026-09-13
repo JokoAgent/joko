@@ -2031,6 +2031,13 @@ export function useAppController(): AppController {
       gateway().adoptExtensionPackage(preview, allowSourceReplacement, signal),
     removeExtensionPackage: (extensionId, expectedRevision, signal) =>
       gateway().removeExtensionPackage(extensionId, expectedRevision, signal),
+    getExtensionPackageExportPreview: (extensionId, expectedRevision, signal) =>
+      gateway().getExtensionPackageExportPreview(extensionId, expectedRevision, signal),
+    listExtensionPackageExports: (extensionId, signal) => gateway().listExtensionPackageExports(extensionId, signal),
+    getExtensionPackageExport: (exportId, signal) => gateway().getExtensionPackageExport(exportId, signal),
+    startExtensionPackageExport: (preview, signal) => gateway().startExtensionPackageExport(preview, signal),
+    cancelExtensionPackageExport: (exportId, expectedRevision, signal) =>
+      gateway().cancelExtensionPackageExport(exportId, expectedRevision, signal),
     getExtensionSourceGitPreflight: (signal) => gateway().getExtensionSourceGitPreflight(signal),
     listExtensionSources: (signal) => gateway().listExtensionSources(signal),
     addExtensionSource: (source, expectedCatalogRevision) => gateway().addExtensionSource(source, expectedCatalogRevision),

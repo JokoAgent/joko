@@ -624,6 +624,223 @@ describe("Connect Extension catalog boundary", () => {
     expect(phase).toBe("removed");
     expect(currentCatalogEntry()).toMatchObject({ revision: 9n, owner: { kind: "source" } });
   });
+
+  it("previews, starts, lists, cancels, and revision-fences local package export jobs", async () => {
+    const entry = extensionEntry({
+      owner: {
+        kind: "resource",
+        resourceId: "resource-package",
+        discoveredRevision: `sha256:${"a".repeat(64)}`,
+        resourceVersion: 5n
+      },
+      version: "1.2.3"
+    });
+    let resourceVersion = 5n;
+    const resource = () => ({
+      id: "resource-package",
+      backendId: "pi",
+      kind: "package" as const,
+      scope: "managed" as const,
+      name: "@sample/exportable",
+      version: "1.2.3",
+      sourceKind: "local" as const,
+      sourceIdentity: "local-package",
+      sourceDisplay: "Local package",
+      canonicalPathFingerprint: `sha256:${"b".repeat(64)}`,
+      symbolicLinkDetected: false,
+      specialFileDetected: false,
+      discoveredRevision: `sha256:${"a".repeat(64)}`,
+      resourceDetails: [],
+      runtimeRequirements: [],
+      warnings: [],
+      disabledLifecycleScripts: [],
+      canToggle: true,
+      requiresExtensionApproval: false,
+      postMutationNotice: false,
+      state: "installed" as const,
+      enabled: true,
+      versionNumber: resourceVersion,
+      updatedAt: 1,
+      packageIdentity: "@sample/exportable"
+    });
+    const backend = {
+      revision: 9n,
+      descriptor: { id: "pi", instanceGeneration: 3 }
+    };
+    const authority = {
+      extensionId: entry.id,
+      extensionRevision: entry.revision,
+      resourceId: resource().id,
+      resourceRevision: resourceVersion,
+      discoveredRevision: resource().discoveredRevision,
+      backendId: "pi",
+      backendRevision: 9n,
+      backendGeneration: 3,
+      packageName: "@sample/exportable",
+      packageVersion: "1.2.3"
+    };
+    const pendingJob = {
+      id: "extension-export",
+      revision: 1n,
+      state: "pending" as const,
+      authority,
+      archiveFormat: "npm-tar-gzip" as const,
+      fileName: "sample-exportable-1.2.3.tgz",
+      files: 0,
+      uncompressedBytes: 0,
+      createdAt: 1,
+      updatedAt: 1
+    };
+    const readyJob = {
+      ...pendingJob,
+      revision: 4n,
+      state: "ready" as const,
+      files: 3,
+      uncompressedBytes: 123,
+      artifact: {
+        id: "artifact-package",
+        sha256: "c".repeat(64),
+        byteLength: 88,
+        mimeType: "application/gzip",
+        fileName: pendingJob.fileName
+      },
+      updatedAt: 4,
+      completedAt: 4
+    };
+    const extensionCatalog = {
+      reconcile: vi.fn(() => catalog(entry)),
+      get: vi.fn(() => entry)
+    };
+    const piResources = { list: () => [resource()], get: () => resource() };
+    const prepareStart = vi.fn(async ({ exportId }: { readonly exportId: string }) => ({ value: { ...pendingJob, id: exportId } }));
+    const prepareCancel = vi.fn(async () => ({ value: { ...pendingJob, state: "cancelled" } }));
+    const completePreparedMutation = vi.fn(async (_prepared: unknown, completion: (finalize: (store: unknown) => void) => unknown) => completion(() => undefined));
+    let finalAuthorityAssertion: (() => void | Promise<void>) | undefined;
+    const begin = vi.fn((_: string, assertion: () => void | Promise<void>) => { finalAuthorityAssertion = assertion; });
+    const abort = vi.fn();
+    const extensionPackagePublisher = {
+      recoveredFromCorruption: false,
+      preview: vi.fn(() => ({
+        ...authority,
+        archiveFormat: "npm-tar-gzip",
+        fileName: pendingJob.fileName,
+        maximumEntries: 10_000,
+        maximumUncompressedBytes: 256 * 1024 * 1024,
+        localOnly: true
+      })),
+      list: vi.fn(() => [readyJob]),
+      get: vi.fn(() => readyJob),
+      prepareStart,
+      prepareCancel,
+      completePreparedMutation,
+      begin,
+      abort
+    };
+    const operations = new Map<string, OperationRecord<unknown>>();
+    const store = {
+      findOperation: (id: string) => operations.get(id),
+      getOperation: (id: string) => operations.get(id),
+      getBackend: () => backend
+    };
+    const services = createConnectServices(stubApplication({
+      store,
+      piResources,
+      extensionCatalog,
+      extensionPackagePublisher,
+      sessionHost: replayingHost(store, operations)
+    }));
+
+    const preview = await invoke<contract.GetExtensionPackageExportPreviewResponse>(
+      services.extension.getExtensionPackageExportPreview,
+      { extensionId: entry.id, expectedRevision: { value: 7n } }
+    );
+    expect(preview.preview).toMatchObject({
+      archiveFormat: "npm-tar-gzip",
+      fileName: pendingJob.fileName,
+      localOnly: true,
+      authority: {
+        extensionId: entry.id,
+        resourceId: "resource-package",
+        resourceRevision: { value: 5n },
+        backendRevision: { value: 9n },
+        backendGeneration: 3n,
+        packageName: "@sample/exportable",
+        packageVersion: "1.2.3"
+      }
+    });
+    const listed = await invoke<contract.ListExtensionPackageExportsResponse>(services.extension.listExtensionPackageExports, {
+      extensionId: entry.id,
+      page: { pageSize: 10, pageToken: "" }
+    });
+    expect(listed.exports[0]).toMatchObject({
+      exportId: readyJob.id,
+      state: contract.ExtensionPackageExportState.READY,
+      artifact: { blobId: "artifact-package", byteSize: 88n, mediaType: "application/gzip" }
+    });
+    const detail = await invoke<contract.GetExtensionPackageExportResponse>(services.extension.getExtensionPackageExport, {
+      exportId: readyJob.id
+    });
+    expect(detail.export?.revision?.value).toBe(4n);
+
+    const startValue = create(contract.StartExtensionPackageExportMutationSchema, {
+      extensionId: entry.id,
+      expectedExtensionRevision: { value: 7n },
+      resourceId: "resource-package",
+      expectedResourceRevision: { value: 5n },
+      backendId: "pi",
+      expectedBackendRevision: { value: 9n },
+      expectedBackendGeneration: 3n
+    });
+    const startMutation = create(contract.OperationMutationSchema, { payload: {
+      case: "startExtensionPackageExport",
+      value: startValue
+    } });
+    await invoke(services.operation.submitOperation, {
+      operationId: "extension-export",
+      connectionId: connection.id,
+      mutation: startMutation
+    });
+    expect(prepareStart).toHaveBeenCalledWith({ exportId: "extension-export", authority });
+    expect(begin).toHaveBeenCalledOnce();
+    await finalAuthorityAssertion?.();
+    await invoke(services.operation.submitOperation, {
+      operationId: "extension-export",
+      connectionId: connection.id,
+      mutation: startMutation
+    });
+    expect(prepareStart).toHaveBeenCalledOnce();
+    expect(begin).toHaveBeenCalledOnce();
+
+    resourceVersion = 6n;
+    await expect(async () => {
+      await finalAuthorityAssertion?.();
+    }).rejects.toThrow(/current|changed/u);
+    resourceVersion = 5n;
+    const staleStart = create(contract.OperationMutationSchema, { payload: {
+      case: "startExtensionPackageExport",
+      value: create(contract.StartExtensionPackageExportMutationSchema, {
+        ...startValue,
+        expectedBackendRevision: create(contract.RevisionSchema, { value: 8n })
+      })
+    } });
+    await expect(invoke(services.operation.submitOperation, {
+      operationId: "extension-export-stale",
+      connectionId: connection.id,
+      mutation: staleStart
+    })).rejects.toMatchObject({ code: Code.Aborted });
+
+    const cancelMutation = create(contract.OperationMutationSchema, { payload: {
+      case: "cancelExtensionPackageExport",
+      value: { exportId: pendingJob.id, expectedRevision: { value: 1n } }
+    } });
+    await invoke(services.operation.submitOperation, {
+      operationId: "extension-export-cancel",
+      connectionId: connection.id,
+      mutation: cancelMutation
+    });
+    expect(prepareCancel).toHaveBeenCalledWith(pendingJob.id, 1n);
+    expect(abort).toHaveBeenCalledWith(pendingJob.id);
+  });
 });
 
 function catalog(entry: ExtensionCatalogDescriptor) {

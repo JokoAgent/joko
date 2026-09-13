@@ -224,6 +224,9 @@ describe("Orchestrator application composition", () => {
     expect(application.piResources?.list()).toEqual([]);
     expect(application.extensionSources?.snapshot()).toEqual({ revision: 0n, sources: [], recoveredFromCorruption: false });
     expect((await stat(join(dataDirectory, "extension-sources"))).isDirectory()).toBe(true);
+    expect(application.extensionPackagePublisher?.list()).toEqual([]);
+    expect(application.extensionPackagePublisher?.recoveredFromCorruption).toBe(false);
+    expect((await stat(join(dataDirectory, "extension-package-exports", ".working"))).isDirectory()).toBe(true);
     const adapter = application.adapters[0];
     expect(adapter).toBeInstanceOf(PiBackendAdapter);
     expect(application.adapters.map((item) => item.id)).toEqual(["pi", "codex", "claude-code"]);

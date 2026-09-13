@@ -106,6 +106,7 @@ import {
 import { CredentialVault } from "./credential-vault.js";
 import { DiagnosticsBundleService } from "./diagnostics-bundle.js";
 import { ExtensionCatalogManager } from "./extension-catalog.js";
+import { ExtensionPackagePublisher } from "./extension-package-publisher.js";
 import { ExtensionSourceManager } from "./extension-source-manager.js";
 import { HistoryMaintenance } from "./history-maintenance.js";
 import {
@@ -313,6 +314,7 @@ export interface OrchestratorApplication {
   readonly mcpRouter?: McpRouter;
   readonly piResources?: PiResourceManager;
   readonly extensionCatalog?: ExtensionCatalogManager;
+  readonly extensionPackagePublisher?: ExtensionPackagePublisher;
   readonly extensionSources?: ExtensionSourceManager;
   readonly diagnosticsBundles?: DiagnosticsBundleService;
   readonly providerAuth?: PiProviderAuthSupervisor;
@@ -569,6 +571,13 @@ export async function createOrchestratorApplication(
   const extensionCatalog = new ExtensionCatalogManager({ store, credentials });
   extensionCatalog.initialize();
   extensionCatalog.reconcile(piResources.list(), mcpRouter.list(), extensionSources.snapshot().sources);
+  const extensionPackagePublisher = new ExtensionPackagePublisher({
+    store,
+    resources: piResources,
+    artifacts,
+    rootDirectory: join(config.dataDirectory, "extension-package-exports")
+  });
+  await extensionPackagePublisher.initialize();
   const imageGenerationBridge = new ImageGenerationBridgeToolProvider({
     credentialSurfaces: providerCredentialSurfaces,
     artifacts,
@@ -1699,6 +1708,7 @@ export async function createOrchestratorApplication(
   } catch (error) {
     closed = true;
     commandConcurrencyGate.close();
+    await extensionPackagePublisher.close().catch(() => undefined);
     scheduler.stop();
     providerAuth.beginShutdown();
     providerAccountUsage.invalidate();
@@ -1778,6 +1788,7 @@ export async function createOrchestratorApplication(
     mcpRouter,
     piResources,
     extensionCatalog,
+    extensionPackagePublisher,
     extensionSources,
     diagnosticsBundles,
     providerAuth,
@@ -1826,6 +1837,7 @@ export async function createOrchestratorApplication(
         serviceCleanups.clear();
         for (const cleanup of cleanups) await attempt(cleanup);
         await attempt(() => commandConcurrencyGate.close());
+        await attempt(() => extensionPackagePublisher.close());
         if (maintenanceTimer !== undefined) clearInterval(maintenanceTimer);
         await attempt(() => scheduler.stop());
         await attempt(() => sessionNavigation.dispose());

@@ -2525,6 +2525,67 @@ export interface ExtensionPackagePreviewView {
   readonly canToggle: boolean;
 }
 
+export type ExtensionPackageExportStateView =
+  | "pending"
+  | "snapshotting"
+  | "packaging"
+  | "verifying"
+  | "ready"
+  | "failed"
+  | "cancelled";
+
+export interface ExtensionPackageExportAuthorityView {
+  readonly extensionId: string;
+  readonly extensionRevision: bigint;
+  readonly resourceId: string;
+  readonly resourceRevision: bigint;
+  readonly discoveredRevision: string;
+  readonly backendId: string;
+  readonly backendRevision: bigint;
+  readonly backendGeneration: number;
+  readonly packageName: string;
+  readonly packageVersion?: string;
+}
+
+export interface ExtensionPackageExportArtifactView {
+  readonly blobId: string;
+  readonly sha256: string;
+  readonly byteSize: number;
+  readonly mediaType: string;
+  readonly fileName: string;
+}
+
+export interface ExtensionPackageExportJobView {
+  readonly id: string;
+  readonly revision: bigint;
+  readonly state: ExtensionPackageExportStateView;
+  readonly authority: ExtensionPackageExportAuthorityView;
+  readonly archiveFormat: "npm-tar-gzip";
+  readonly fileName: string;
+  readonly files: number;
+  readonly uncompressedBytes: number;
+  readonly artifact?: ExtensionPackageExportArtifactView;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly completedAt?: number;
+  readonly error?: string;
+}
+
+export interface ExtensionPackageExportPreviewView extends ExtensionPackageExportAuthorityView {
+  readonly archiveFormat: "npm-tar-gzip";
+  readonly fileName: string;
+  readonly maximumEntries: number;
+  readonly maximumUncompressedBytes: number;
+  readonly localOnly: true;
+  readonly activeExport?: ExtensionPackageExportJobView;
+  readonly recoveredFromCorruption: boolean;
+}
+
+export interface ExtensionPackageExportCatalogView {
+  readonly exports: readonly ExtensionPackageExportJobView[];
+  readonly recoveredFromCorruption: boolean;
+}
+
 export interface ExtensionCatalogView {
   readonly revision: bigint;
   readonly extensions: readonly ExtensionCatalogEntryView[];
@@ -3816,6 +3877,11 @@ export interface OperationApi {
   getExtensionPackagePreview(extensionId: string, expectedRevision: bigint, backendId: string, signal?: AbortSignal): Promise<ExtensionPackagePreviewView>;
   adoptExtensionPackage(preview: ExtensionPackagePreviewView, allowSourceReplacement?: boolean, signal?: AbortSignal): Promise<void>;
   removeExtensionPackage(extensionId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<void>;
+  getExtensionPackageExportPreview(extensionId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ExtensionPackageExportPreviewView>;
+  listExtensionPackageExports(extensionId?: string, signal?: AbortSignal): Promise<ExtensionPackageExportCatalogView>;
+  getExtensionPackageExport(exportId: string, signal?: AbortSignal): Promise<ExtensionPackageExportJobView>;
+  startExtensionPackageExport(preview: ExtensionPackageExportPreviewView, signal?: AbortSignal): Promise<ExtensionPackageExportJobView>;
+  cancelExtensionPackageExport(exportId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ExtensionPackageExportJobView>;
   getExtensionSourceGitPreflight(signal?: AbortSignal): Promise<ExtensionSourceGitPreflightView>;
   listExtensionSources(signal?: AbortSignal): Promise<ExtensionSourceCatalogView>;
   addExtensionSource(source: ExtensionSourceDraft, expectedCatalogRevision: bigint): Promise<void>;

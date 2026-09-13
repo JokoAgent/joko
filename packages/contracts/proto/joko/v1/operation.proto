@@ -208,6 +208,8 @@ message OperationMutation {
     RemoveExtensionSourceMutation remove_extension_source = 191;
     AdoptExtensionPackageMutation adopt_extension_package = 192;
     RemoveExtensionPackageMutation remove_extension_package = 193;
+    StartExtensionPackageExportMutation start_extension_package_export = 194;
+    CancelExtensionPackageExportMutation cancel_extension_package_export = 195;
   }
 }
 
@@ -244,6 +246,21 @@ message AdoptExtensionPackageMutation {
 
 message RemoveExtensionPackageMutation {
   string extension_id = 1;
+  Revision expected_revision = 2;
+}
+
+message StartExtensionPackageExportMutation {
+  string extension_id = 1;
+  Revision expected_extension_revision = 2;
+  string resource_id = 3;
+  Revision expected_resource_revision = 4;
+  string backend_id = 5;
+  Revision expected_backend_revision = 6;
+  uint64 expected_backend_generation = 7;
+}
+
+message CancelExtensionPackageExportMutation {
+  string export_id = 1;
   Revision expected_revision = 2;
 }
 

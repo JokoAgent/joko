@@ -5,6 +5,7 @@ import {
   ExtensionCatalogSource,
   ExtensionInstallState,
   ExtensionPackageAction,
+  ExtensionPackageExportState,
   ExtensionSourceKind,
   ExtensionSourceState,
   ExtensionSetupState,
@@ -298,6 +299,129 @@ describe("Extension catalog gateway", () => {
     invalid = "ui";
     await expect(gateway.getExtensionPackagePreview("extension_00000000000000000000000000000001", 1n, "pi"))
       .rejects.toThrow("invalid package UI API");
+    gateway.disconnect();
+  });
+
+  it("maps local package export state and revision-fences start, polling, and cancellation", async () => {
+    const requests: Array<{ readonly method: string; readonly input: any }> = [];
+    const extensionId = "extension_00000000000000000000000000000001";
+    const authority = {
+      extensionId,
+      extensionRevision: { value: 7n },
+      resourceId: "resource-package",
+      resourceRevision: { value: 5n },
+      discoveredRevision: `sha256:${"b".repeat(64)}`,
+      backendId: "pi",
+      backendRevision: { value: 9n },
+      backendGeneration: 3n,
+      packageName: "@sample/exportable",
+      packageVersion: "1.2.3"
+    };
+    let cancelled = false;
+    let invalidPreview = false;
+    const exportJob = (exportId: string, state: ExtensionPackageExportState) => ({
+      exportId,
+      revision: { value: state === ExtensionPackageExportState.CANCELLED ? 2n : 1n },
+      state,
+      authority,
+      archiveFormat: "npm-tar-gzip",
+      fileName: "sample-exportable-1.2.3.tgz",
+      files: state === ExtensionPackageExportState.PENDING ? 0 : 4,
+      uncompressedBytes: state === ExtensionPackageExportState.PENDING ? 0n : 5_632n,
+      ...(state === ExtensionPackageExportState.READY ? {
+        artifact: {
+          blobId: "export-artifact",
+          fileName: "sample-exportable-1.2.3.tgz",
+          mediaType: "application/gzip",
+          byteSize: 2_048n,
+          sha256Hex: "c".repeat(64)
+        }
+      } : {}),
+      createdAt: { seconds: 1_700_000_000n, nanos: 0 },
+      updatedAt: { seconds: 1_700_000_001n, nanos: 0 },
+      ...([ExtensionPackageExportState.READY, ExtensionPackageExportState.CANCELLED].includes(state)
+        ? { completedAt: { seconds: 1_700_000_001n, nanos: 0 } }
+        : {})
+    });
+    const gateway = await mount(async (method, input) => {
+      requests.push({ method, input });
+      if (method === "getSnapshot") return { snapshot: {} };
+      if (method === "getExtensionPackageExportPreview") return {
+        preview: {
+          authority,
+          archiveFormat: "npm-tar-gzip",
+          fileName: "sample-exportable-1.2.3.tgz",
+          maximumEntries: 10_000,
+          maximumUncompressedBytes: 67_108_864n,
+          localOnly: !invalidPreview
+        },
+        recoveredFromCorruption: false
+      };
+      if (method === "listExtensionPackageExports") return {
+        exports: [exportJob("ready-export", ExtensionPackageExportState.READY)],
+        recoveredFromCorruption: false,
+        page: { totalSize: 1n, nextPageToken: "" }
+      };
+      if (method === "submitOperation") {
+        if (input.mutation.payload.case === "cancelExtensionPackageExport") cancelled = true;
+        return {
+          operation: {
+            operationId: input.operationId,
+            connectionId: input.connectionId,
+            state: OperationState.SUCCEEDED,
+            result: { payload: { case: "acknowledgement", value: { accepted: true } } }
+          }
+        };
+      }
+      if (method === "getExtensionPackageExport") return {
+        export: exportJob(input.exportId, cancelled ? ExtensionPackageExportState.CANCELLED : ExtensionPackageExportState.PENDING),
+        recoveredFromCorruption: false
+      };
+      throw new Error(`Unexpected method: ${method}`);
+    });
+
+    const preview = await gateway.getExtensionPackageExportPreview(extensionId, 7n);
+    expect(preview).toMatchObject({
+      extensionId,
+      extensionRevision: 7n,
+      resourceId: "resource-package",
+      resourceRevision: 5n,
+      backendRevision: 9n,
+      backendGeneration: 3,
+      localOnly: true,
+      maximumUncompressedBytes: 67_108_864
+    });
+    const catalog = await gateway.listExtensionPackageExports(extensionId);
+    expect(catalog.exports[0]).toMatchObject({
+      id: "ready-export",
+      state: "ready",
+      artifact: { blobId: "export-artifact", byteSize: 2_048, mediaType: "application/gzip" }
+    });
+    const pending = await gateway.startExtensionPackageExport(preview);
+    expect(pending.state).toBe("pending");
+    const cancelledJob = await gateway.cancelExtensionPackageExport(pending.id, pending.revision);
+    expect(cancelledJob).toMatchObject({ id: pending.id, revision: 2n, state: "cancelled" });
+
+    const payloads = requests.filter((request) => request.method === "submitOperation")
+      .map((request) => request.input.mutation.payload);
+    expect(payloads[0]).toMatchObject({
+      case: "startExtensionPackageExport",
+      value: {
+        extensionId,
+        expectedExtensionRevision: { value: 7n },
+        resourceId: "resource-package",
+        expectedResourceRevision: { value: 5n },
+        backendId: "pi",
+        expectedBackendRevision: { value: 9n },
+        expectedBackendGeneration: 3n
+      }
+    });
+    expect(payloads[1]).toMatchObject({
+      case: "cancelExtensionPackageExport",
+      value: { exportId: pending.id, expectedRevision: { value: 1n } }
+    });
+    invalidPreview = true;
+    await expect(gateway.getExtensionPackageExportPreview(extensionId, 7n)).rejects.toThrow("invalid Extension package export preview");
     gateway.disconnect();
   });
 

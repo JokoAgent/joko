@@ -22,6 +22,7 @@ export * from "./credential-vault.js";
 export * from "./diagnostics-bundle.js";
 export * from "./event-hub.js";
 export * from "./extension-catalog.js";
+export * from "./extension-package-publisher.js";
 export * from "./history-maintenance.js";
 export * from "./lan-discovery.js";
 export * from "./local-model-runtime-coordinator.js";
