@@ -2448,7 +2448,14 @@ export interface ExtensionCatalogEntryView {
   readonly revision: bigint;
   readonly owner:
     | { readonly kind: "resource"; readonly resourceId: string; readonly discoveredRevision: string; readonly resourceRevision: bigint }
-    | { readonly kind: "mcp"; readonly serverId: string; readonly serverRevision: bigint };
+    | { readonly kind: "mcp"; readonly serverId: string; readonly serverRevision: bigint }
+    | {
+        readonly kind: "source";
+        readonly sourceId: string;
+        readonly sourceRevision: bigint;
+        readonly entryId: string;
+        readonly contentRevision: string;
+      };
   readonly source: "local" | "market";
   readonly installed: boolean;
   readonly installState: "available" | "installing" | "installed" | "updateAvailable" | "error";
@@ -2492,6 +2499,42 @@ export interface ExtensionCatalogView {
   readonly extensions: readonly ExtensionCatalogEntryView[];
   readonly recoveredFromCorruption: boolean;
 }
+
+export interface ExtensionSourceView {
+  readonly id: string;
+  readonly revision: bigint;
+  readonly kind: "local" | "git";
+  readonly location:
+    | { readonly kind: "local"; readonly path: string }
+    | { readonly kind: "git"; readonly repositoryUrl: string; readonly ref?: string; readonly sparsePaths: readonly string[] };
+  readonly name: string;
+  readonly displayName?: string;
+  readonly state: "ready" | "error";
+  readonly contentRevision: string;
+  readonly discoveredExtensionCount: number;
+  readonly declaredEntryCount: number;
+  readonly skippedEntryCount: number;
+  readonly unreadableEntryCount: number;
+  readonly addedAt: number;
+  readonly refreshedAt?: number;
+  readonly error?: string;
+}
+
+export interface ExtensionSourceCatalogView {
+  readonly revision: bigint;
+  readonly sources: readonly ExtensionSourceView[];
+  readonly recoveredFromCorruption: boolean;
+}
+
+export interface ExtensionSourceGitPreflightView {
+  readonly available: boolean;
+  readonly version?: string;
+  readonly minimumVersion: string;
+}
+
+export type ExtensionSourceDraft =
+  | { readonly kind: "local"; readonly path: string }
+  | { readonly kind: "git"; readonly repositoryUrl: string; readonly ref?: string; readonly sparsePaths: readonly string[] };
 
 /** Owner-scoped, one-shot handoff from Extension detail to the delayed-create
  * composer. The command remains fenced to the exact catalog projection that
@@ -3739,6 +3782,11 @@ export interface OperationApi {
     readonly signal?: AbortSignal;
   }): Promise<ExtensionCatalogView>;
   getExtension(extensionId: string, sessionId?: string, signal?: AbortSignal): Promise<ExtensionCatalogView>;
+  getExtensionSourceGitPreflight(signal?: AbortSignal): Promise<ExtensionSourceGitPreflightView>;
+  listExtensionSources(signal?: AbortSignal): Promise<ExtensionSourceCatalogView>;
+  addExtensionSource(source: ExtensionSourceDraft, expectedCatalogRevision: bigint): Promise<void>;
+  refreshExtensionSource(sourceId: string, expectedRevision: bigint): Promise<void>;
+  removeExtensionSource(sourceId: string, expectedRevision: bigint): Promise<void>;
   setExtensionEnabled(extensionId: string, enabled: boolean, expectedRevision: bigint): Promise<void>;
   setExtensionSidebarVisible(extensionId: string, visible: boolean, expectedRevision: bigint): Promise<void>;
   beginExtensionSetup(extensionId: string, expectedRevision: bigint): Promise<void>;

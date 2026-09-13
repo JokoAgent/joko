@@ -7,6 +7,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { OrchestratorApplication } from "./application.js";
 import { createConnectServices } from "./connect-services.js";
 import type { ExtensionCatalogDescriptor } from "./extension-catalog.js";
+import type { ExtensionSourceDescriptor } from "./extension-source-manager.js";
 
 const connection = {
   id: "connection-extension",
@@ -251,6 +252,75 @@ describe("Connect Extension catalog boundary", () => {
       expectedRevision: 7n
     });
   });
+
+  it("maps exact source/preflight state and submits revision-fenced source lifecycle effects", async () => {
+    const source = extensionSource();
+    const add = vi.fn(async () => source);
+    const refresh = vi.fn(async () => ({ ...source, revision: 5n }));
+    const remove = vi.fn(async () => undefined);
+    const gitPreflight = vi.fn(async () => ({ available: true, version: "2.43.0", minimumVersion: "2.25" }));
+    const sourceSnapshot = vi.fn(() => ({ revision: 4n, sources: [source], recoveredFromCorruption: false }));
+    const auditAvailability = vi.fn(async () => sourceSnapshot());
+    const store = { findOperation: vi.fn(() => undefined) };
+    const reconcile = vi.fn(() => ({ revision: 1n, entries: [], recoveredFromCorruption: false }));
+    const services = createConnectServices(stubApplication({
+      store,
+      extensionSources: { add, refresh, remove, gitPreflight, snapshot: sourceSnapshot, auditAvailability },
+      extensionCatalog: { reconcile },
+      sessionHost: immediateHost(store)
+    }));
+
+    const preflight = await invoke<contract.GetExtensionSourceGitPreflightResponse>(services.extension.getExtensionSourceGitPreflight, {});
+    expect(preflight.preflight).toMatchObject({ available: true, version: "2.43.0", minimumVersion: "2.25" });
+    const listed = await invoke<contract.ListExtensionSourcesResponse>(services.extension.listExtensionSources, {
+      page: { pageSize: 10, pageToken: "" }
+    });
+    expect(listed.catalogRevision?.value).toBe(4n);
+    expect(auditAvailability).toHaveBeenCalledTimes(1);
+    expect(listed.sources).toMatchObject([{
+      sourceId: source.id,
+      revision: { value: 4n },
+      kind: contract.ExtensionSourceKind.LOCAL,
+      location: { kind: { case: "local", value: { path: "D:\\extensions" } } },
+      name: "community-extensions",
+      state: contract.ExtensionSourceState.READY,
+      discoveredExtensionCount: 1,
+      declaredEntryCount: 1
+    }]);
+
+    const addMutation = create(contract.OperationMutationSchema, {
+      payload: {
+        case: "addExtensionSource",
+        value: {
+          source: { kind: { case: "git", value: { repositoryUrl: "https://example.test/extensions.git", sparsePaths: [".agents/plugins"] } } },
+          expectedCatalogRevision: { value: 4n }
+        }
+      }
+    });
+    await invoke(services.operation.submitOperation, { operationId: "extension-source-add", connectionId: connection.id, mutation: addMutation });
+    expect(add).toHaveBeenCalledWith({ kind: "git", repositoryUrl: "https://example.test/extensions.git", sparsePaths: [".agents/plugins"] }, 4n);
+
+    for (const [operationId, mutation, expected] of [
+      ["extension-source-refresh", create(contract.OperationMutationSchema, { payload: { case: "refreshExtensionSource", value: { sourceId: source.id, expectedRevision: { value: 4n } } } }), refresh],
+      ["extension-source-remove", create(contract.OperationMutationSchema, { payload: { case: "removeExtensionSource", value: { sourceId: source.id, expectedRevision: { value: 4n } } } }), remove]
+    ] as const) {
+      await invoke(services.operation.submitOperation, { operationId, connectionId: connection.id, mutation });
+      expect(expected).toHaveBeenCalledWith(source.id, 4n);
+    }
+    expect(reconcile).toHaveBeenCalled();
+
+    const reconcilesBeforeFailure = reconcile.mock.calls.length;
+    refresh.mockRejectedValueOnce(new Error("source discovery failed"));
+    const failedRefresh = create(contract.OperationMutationSchema, {
+      payload: { case: "refreshExtensionSource", value: { sourceId: source.id, expectedRevision: { value: 5n } } }
+    });
+    await expect(invoke(services.operation.submitOperation, {
+      operationId: "extension-source-refresh-failed",
+      connectionId: connection.id,
+      mutation: failedRefresh
+    })).rejects.toThrow("source discovery failed");
+    expect(reconcile).toHaveBeenCalledTimes(reconcilesBeforeFailure + 1);
+  });
 });
 
 function catalog(entry: ExtensionCatalogDescriptor) {
@@ -283,5 +353,37 @@ function extensionEntry(overrides: Partial<ExtensionCatalogDescriptor> = {}): Ex
     setup: { state: "not_required" as const, revision: 0n, fields: [] },
     useSupported: false,
     ...overrides
+  };
+}
+
+function extensionSource(): ExtensionSourceDescriptor {
+  return {
+    id: "extension_source_0123456789abcdef0123456789abcdef",
+    revision: 4n,
+    source: { kind: "local", path: "D:\\extensions" },
+    sourceIdentity: '["local","D:\\\\extensions"]',
+    sourceDisplay: "D:\\extensions",
+    name: "community-extensions",
+    state: "ready",
+    contentRevision: `sha256:${"a".repeat(64)}`,
+    entries: [{
+      id: "extension_source_entry_0123456789abcdef0123456789abcdef",
+      revision: `sha256:${"b".repeat(64)}`,
+      contentRevision: `sha256:${"b".repeat(64)}`,
+      packageContentRevision: `sha256:${"c".repeat(64)}`,
+      resourceId: "resource_market_0123456789abcdef0123456789abcdef",
+      packageRelativePath: "packages/review",
+      extensionRelativePath: "extensions/index.ts",
+      bindingName: "index.ts",
+      bindingOrdinal: 0,
+      name: "Review",
+      packageName: "@sample/review",
+      description: "Review changes"
+    }],
+    declaredEntryCount: 1,
+    skippedEntryCount: 0,
+    unreadableEntryCount: 0,
+    addedAt: 1,
+    refreshedAt: 2
   };
 }

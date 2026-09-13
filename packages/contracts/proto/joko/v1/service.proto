@@ -230,6 +230,8 @@ service WorktreeService {
 service ExtensionService {
   rpc ListExtensions(ListExtensionsRequest) returns (ListExtensionsResponse);
   rpc GetExtension(GetExtensionRequest) returns (GetExtensionResponse);
+  rpc GetExtensionSourceGitPreflight(GetExtensionSourceGitPreflightRequest) returns (GetExtensionSourceGitPreflightResponse);
+  rpc ListExtensionSources(ListExtensionSourcesRequest) returns (ListExtensionSourcesResponse);
   // Produces a one-time protected upload ticket. Secret bytes cross only the
   // authenticated credential upload endpoint and never this RPC.
   rpc BeginExtensionSetupCredentialUpload(BeginExtensionSetupCredentialUploadRequest) returns (BeginExtensionSetupCredentialUploadResponse);
@@ -1668,6 +1670,23 @@ message GetExtensionResponse {
   ExtensionCatalogEntry extension = 1;
   Revision catalog_revision = 2;
   bool recovered_from_corruption = 3;
+}
+
+message GetExtensionSourceGitPreflightRequest {}
+
+message GetExtensionSourceGitPreflightResponse {
+  ExtensionSourceGitPreflight preflight = 1;
+}
+
+message ListExtensionSourcesRequest {
+  PageRequest page = 1;
+}
+
+message ListExtensionSourcesResponse {
+  repeated ExtensionSourceDescriptor sources = 1;
+  Revision catalog_revision = 2;
+  bool recovered_from_corruption = 3;
+  PageInfo page = 4;
 }
 
 message BeginExtensionSetupCredentialUploadRequest {

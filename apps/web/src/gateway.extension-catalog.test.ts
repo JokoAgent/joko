@@ -4,6 +4,8 @@ import {
   CredentialKind,
   ExtensionCatalogSource,
   ExtensionInstallState,
+  ExtensionSourceKind,
+  ExtensionSourceState,
   ExtensionSetupState,
   OperationState
 } from "@joko/contracts";
@@ -149,6 +151,74 @@ describe("Extension catalog gateway", () => {
     });
 
     await expect(gateway.listExtensions()).rejects.toThrow("invalid Extension install state");
+    gateway.disconnect();
+  });
+
+  it("maps exact source descriptors and revision-fences every source mutation", async () => {
+    const requests: Array<{ readonly method: string; readonly input: any }> = [];
+    const gateway = await mount(async (method, input) => {
+      requests.push({ method, input });
+      if (method === "getSnapshot") return { snapshot: {} };
+      if (method === "getExtensionSourceGitPreflight") return {
+        preflight: { available: true, version: "2.51.0", minimumVersion: "2.25.0" }
+      };
+      if (method === "listExtensionSources") return {
+        sources: [{
+          sourceId: "extension_source_0123456789abcdef0123456789abcdef",
+          revision: { value: 7n },
+          kind: ExtensionSourceKind.GIT,
+          location: { kind: { case: "git", value: { repositoryUrl: "https://example.com/extensions.git", ref: "main", sparsePaths: ["packages/review"] } } },
+          name: "review-catalog",
+          displayName: "Review catalog",
+          state: ExtensionSourceState.READY,
+          contentRevision: `sha256:${"a".repeat(64)}`,
+          discoveredExtensionCount: 2,
+          declaredEntryCount: 3,
+          skippedEntryCount: 1,
+          unreadableEntryCount: 0,
+          addedAt: { seconds: 1_700_000_000n, nanos: 0 },
+          refreshedAt: { seconds: 1_700_000_100n, nanos: 0 }
+        }],
+        catalogRevision: { value: 9n },
+        recoveredFromCorruption: false,
+        page: { totalSize: 1n, nextPageToken: "" }
+      };
+      if (method === "submitOperation") return {
+        operation: {
+          operationId: input.operationId,
+          connectionId: input.connectionId,
+          state: OperationState.SUCCEEDED,
+          result: { payload: { case: "acknowledgement", value: { accepted: true } } }
+        }
+      };
+      throw new Error(`Unexpected method: ${method}`);
+    });
+
+    await expect(gateway.getExtensionSourceGitPreflight()).resolves.toEqual({ available: true, version: "2.51.0", minimumVersion: "2.25.0" });
+    await expect(gateway.listExtensionSources()).resolves.toMatchObject({
+      revision: 9n,
+      sources: [{
+        id: "extension_source_0123456789abcdef0123456789abcdef",
+        revision: 7n,
+        kind: "git",
+        location: { kind: "git", repositoryUrl: "https://example.com/extensions.git", ref: "main", sparsePaths: ["packages/review"] },
+        state: "ready",
+        addedAt: 1_700_000_000_000,
+        refreshedAt: 1_700_000_100_000
+      }]
+    });
+    await gateway.addExtensionSource({ kind: "git", repositoryUrl: "git@example.com:team/extensions.git", ref: "v1", sparsePaths: ["tools"] }, 9n);
+    await gateway.refreshExtensionSource("extension_source_0123456789abcdef0123456789abcdef", 7n);
+    await gateway.removeExtensionSource("extension_source_0123456789abcdef0123456789abcdef", 8n);
+
+    const payloads = requests.filter((request) => request.method === "submitOperation").map((request) => request.input.mutation.payload);
+    expect(payloads.map((payload) => payload.case)).toEqual(["addExtensionSource", "refreshExtensionSource", "removeExtensionSource"]);
+    expect(payloads[0]?.value).toMatchObject({
+      source: { kind: { case: "git", value: { repositoryUrl: "git@example.com:team/extensions.git", ref: "v1", sparsePaths: ["tools"] } } },
+      expectedCatalogRevision: { value: 9n }
+    });
+    expect(payloads[1]?.value).toMatchObject({ expectedRevision: { value: 7n } });
+    expect(payloads[2]?.value).toMatchObject({ expectedRevision: { value: 8n } });
     gateway.disconnect();
   });
 });

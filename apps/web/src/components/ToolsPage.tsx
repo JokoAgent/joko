@@ -9,6 +9,7 @@ import {
   CheckCircle2,
   ChevronLeft,
   Download,
+  FolderPlus,
   Globe2,
   Image as ImageIcon,
   Menu,
@@ -34,6 +35,7 @@ import { useAppShortcut } from "../use-app-shortcut.js";
 import { BrowserChrome, type BrowserChromeHandle } from "./BrowserChrome.js";
 import { BrowserCommentPopover, emptyBrowserCommentEditorDraft, hasBrowserCommentDesignDraft, hasBrowserCommentEditorDraft, type BrowserCommentDesignPreview, type BrowserCommentEditorDraft } from "./BrowserCommentPopover.js";
 import { BrowserLostPageCard, BrowserPageRail, type BrowserPageSelection } from "./BrowserPageRail.js";
+import { ExtensionSourceDialog } from "./ExtensionSourceDialog.js";
 import { resolveComposerAttachmentPolicy } from "./composer-behavior.js";
 import type { RunAction, Translator } from "./types.js";
 import { Button, CheckboxControl, EmptyState, IconButton, Modal, Pill, StatusDot, cx, formatRelativeTime, SelectControl } from "./ui.js";
@@ -98,7 +100,7 @@ export function ToolsPage({ controller, snapshot, runtimeSessionId, selectedExte
       </div>
       <div id="tools-tabpanel" className="route-page__content" role="tabpanel" aria-labelledby={`tools-tab-${tab}`}>
         {tab === "browser" && <BrowserTools controller={controller} browsers={snapshot.browsers} browserSettings={snapshot.settings.browsers} sessions={browserSessions} commentSessions={browserCommentSessions} locale={locale} t={t} runAction={runAction} />}
-        {tab === "extensions" && <ExtensionTools controller={controller} snapshot={snapshot} runtimeSessionId={runtimeSessionId} selectedId={selectedExtension} t={t} runAction={runAction} onSelect={selectExtension} />}
+        {tab === "extensions" && <ExtensionTools controller={controller} snapshot={snapshot} runtimeSessionId={runtimeSessionId} selectedId={selectedExtension} locale={locale} t={t} runAction={runAction} onSelect={selectExtension} />}
         {tab === "resources" && <ResourcesTools controller={controller} backends={snapshot.backends} resources={snapshot.resources} t={t} runAction={runAction} onRemove={setRemoveResource} />}
         {tab === "mcp" && <McpTools controller={controller} backends={mcpBackends} servers={snapshot.settings.mcpServers} t={t} runAction={runAction} />}
         {tab === "activity" && <ActivityTools activity={activity} locale={locale} t={t} />}
@@ -835,11 +837,12 @@ function resourceCanUpdate(resource: ResourceView): boolean {
 
 type ExtensionFacet = "installed" | "catalog" | "local" | "market";
 
-function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, t, runAction, onSelect }: {
+function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, locale, t, runAction, onSelect }: {
   readonly controller: AppController;
   readonly snapshot: AppSnapshot;
   readonly runtimeSessionId?: string;
   readonly selectedId?: string;
+  readonly locale: string;
   readonly t: Translator;
   readonly runAction: RunAction;
   readonly onSelect: (extensionId: string | undefined) => void;
@@ -857,6 +860,7 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, t,
   const [refreshRevision, setRefreshRevision] = useState(0);
   const [mutationKey, setMutationKey] = useState<string>();
   const [setupOpen, setSetupOpen] = useState(false);
+  const [sourcesOpen, setSourcesOpen] = useState(false);
   const listRequest = useRef(0);
   const detailRequest = useRef(0);
   const detailRetryAbort = useRef<AbortController | undefined>(undefined);
@@ -968,6 +972,8 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, t,
     });
   };
   const useCommand = (extension: ExtensionCatalogEntryView, command: ExtensionCatalogEntryView["commands"][number]): void => {
+    const owner = extension.owner;
+    if (owner.kind === "source") return;
     if (extension.setup.state !== "ready" && extension.setup.state !== "notRequired") {
       setSetupOpen(true);
       return;
@@ -983,16 +989,16 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, t,
           commandName: command.name,
           runtimeSessionId: command.sessionId,
           displayName: extension.name,
-          owner: extension.owner.kind === "resource"
+          owner: owner.kind === "resource"
             ? {
                 kind: "resource",
-                resourceId: extension.owner.resourceId,
-                discoveredRevision: extension.owner.discoveredRevision,
-                resourceRevision: extension.owner.resourceRevision.toString(10)
+                resourceId: owner.resourceId,
+                discoveredRevision: owner.discoveredRevision,
+                resourceRevision: owner.resourceRevision.toString(10)
               }
-            : { kind: "mcp", serverId: extension.owner.serverId, serverRevision: extension.owner.serverRevision.toString(10) }
+            : { kind: "mcp", serverId: owner.serverId, serverRevision: owner.serverRevision.toString(10) }
         });
-        const resourceId = extension.owner.kind === "resource" ? extension.owner.resourceId : undefined;
+        const resourceId = owner.kind === "resource" ? owner.resourceId : undefined;
         const resource = resourceId === undefined
           ? undefined
           : snapshot.resources.find((candidate) => candidate.id === resourceId);
@@ -1008,8 +1014,9 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, t,
     <section className="extension-browser__catalog" aria-label={t("extensions.catalog") }>
       <div className="extension-browser__controls">
         <label className="extension-search"><Search aria-hidden="true" /><span className="sr-only">{t("extensions.search")}</span><input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("extensions.searchPlaceholder")} /></label>
-        <div className="extension-facets" role="tablist" aria-label={t("extensions.filter") }>
+        <div className="extension-catalog-actions"><div className="extension-facets" role="tablist" aria-label={t("extensions.filter") }>
           {(["installed", "catalog", "local", "market"] as const).map((value) => <button type="button" role="tab" aria-selected={facet === value} tabIndex={facet === value ? 0 : -1} className={facet === value ? "is-active" : ""} key={value} onKeyDown={(event) => moveTablistSelection(event, "horizontal")} onClick={() => setFacet(value)}>{t(`extensions.facet.${value}`)}</button>)}
+        </div><Button tone="ghost" onClick={() => setSourcesOpen(true)}><FolderPlus aria-hidden="true" />{t("extensions.sources.manage")}</Button>
         </div>
       </div>
       {recovered && <div className="extension-catalog-warning" role="alert"><AlertTriangle aria-hidden="true" /><span>{t("extensions.recovered")}</span></div>}
@@ -1065,6 +1072,7 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, t,
       }}
       onRevoke={() => selectedDetail !== undefined && mutate(`extension-setup-revoke:${selectedDetail.id}`, selectedDetail.id, () => controller.revokeExtensionSetup(selectedDetail.id, selectedDetail.revision))}
     />
+    <ExtensionSourceDialog controller={controller} locale={locale} open={sourcesOpen} t={t} runAction={runAction} onClose={() => setSourcesOpen(false)} onCatalogChanged={() => setRefreshRevision((value) => value + 1)} />
   </div>;
 }
 
@@ -1077,15 +1085,16 @@ function ExtensionDetail({ extension, busy, t, onEnabledChange, onSidebarChange,
   readonly onSetup: () => void;
   readonly onUse: (command: ExtensionCatalogEntryView["commands"][number]) => void;
 }): JSX.Element {
+  const sourceOwned = extension.owner.kind === "source";
   return <article className="extension-detail">
-    <header className="extension-detail__header"><span className="extension-detail__icon"><Boxes aria-hidden="true" /></span><div><p className="eyebrow">{extension.source === "local" ? t("extensions.local") : t("extensions.market")}</p><h2>{extension.name}</h2><p>{extension.description || t("extensions.noDescription")}</p></div><Pill tone={extension.enabled ? "success" : "neutral"}>{extension.enabled ? t("common.enabled") : t("common.disabled")}</Pill></header>
+    <header className="extension-detail__header"><span className="extension-detail__icon"><Boxes aria-hidden="true" /></span><div><p className="eyebrow">{extension.source === "local" ? t("extensions.local") : t("extensions.market")}</p><h2>{extension.name}</h2><p>{extension.description || t("extensions.noDescription")}</p></div><Pill tone={sourceOwned ? extensionInstallTone(extension.installState) : extension.enabled ? "success" : "neutral"}>{sourceOwned ? extensionInstallLabel(extension.installState, t) : extension.enabled ? t("common.enabled") : t("common.disabled")}</Pill></header>
     {extension.error !== undefined && <p className="extension-detail__error" role="alert"><AlertTriangle aria-hidden="true" />{extension.error}</p>}
-    <dl className="extension-detail__metadata"><div><dt>{t("extensions.version")}</dt><dd>{extension.version ?? t("common.unknown")}</dd></div><div><dt>{t("extensions.author")}</dt><dd>{extension.author ?? t("common.unknown")}</dd></div><div><dt>{t("common.state")}</dt><dd>{extensionInstallLabel(extension.installState, t)}</dd></div><div><dt>{t("extensions.owner")}</dt><dd>{extension.owner.kind === "resource" ? t("extensions.resourceOwner") : t("extensions.mcpOwner")}</dd></div></dl>
-    <section className="extension-detail__settings" aria-label={t("extensions.configuration") }>
+    <dl className="extension-detail__metadata"><div><dt>{t("extensions.version")}</dt><dd>{extension.version ?? t("common.unknown")}</dd></div><div><dt>{t("extensions.author")}</dt><dd>{extension.author ?? t("common.unknown")}</dd></div><div><dt>{t("common.state")}</dt><dd>{extensionInstallLabel(extension.installState, t)}</dd></div><div><dt>{t("extensions.owner")}</dt><dd>{extension.owner.kind === "resource" ? t("extensions.resourceOwner") : extension.owner.kind === "mcp" ? t("extensions.mcpOwner") : t("extensions.sourceOwner")}</dd></div></dl>
+    {sourceOwned ? <section className="extension-source-available"><FolderPlus aria-hidden="true" /><div><strong>{t("extensions.sourceAvailable")}</strong><p>{t("extensions.sourceAvailableBody")}</p></div></section> : <section className="extension-detail__settings" aria-label={t("extensions.configuration") }>
       <label><span><strong>{t("extensions.enabled")}</strong><small>{t("extensions.enabledBody")}</small></span><CheckboxControl checked={extension.enabled} disabled={busy} onChange={(event) => onEnabledChange(event.target.checked)} /></label>
       {extension.sidebarSupported && <label><span><strong>{t("extensions.showSidebar")}</strong><small>{t("extensions.showSidebarBody")}</small></span><CheckboxControl checked={extension.sidebarVisible} disabled={busy} onChange={(event) => onSidebarChange(event.target.checked)} /></label>}
       {extension.setup.state !== "notRequired" && <button type="button" disabled={busy} onClick={onSetup}><span><strong>{t("extensions.setup")}</strong><small>{extension.setup.error ?? extensionSetupLabel(extension.setup.state, t)}</small></span><Pill tone={extension.setup.state === "ready" ? "success" : extension.setup.state === "failed" ? "danger" : "warning"}>{extensionSetupLabel(extension.setup.state, t)}</Pill></button>}
-    </section>
+    </section>}
     <ExtensionDetailSection title={t("extensions.commands")} empty={t("extensions.noCommands")} items={extension.commands.map((command) => <div className="extension-capability-row" key={`${command.sessionId}\u0000${command.name}`}><span><strong>/{command.name}</strong><small>{command.description}</small></span><Button tone="primary" disabled={busy || !extension.enabled} onClick={() => onUse(command)}><Play aria-hidden="true" />{extension.setup.state === "ready" || extension.setup.state === "notRequired" ? t("extensions.use") : t("extensions.configureToUse")}</Button></div>)} />
     <ExtensionDetailSection title={t("extensions.tools")} empty={t("extensions.noTools")} items={extension.tools.map((tool) => <div className="extension-capability-row" key={tool.name}><span><strong>{tool.name}</strong><small>{tool.description}</small></span>{tool.requiresPermission && <Pill tone="warning">{t("extensions.permissionRequired")}</Pill>}</div>)} />
     <ExtensionDetailSection title={t("extensions.permissions")} empty={t("extensions.noPermissions")} items={extension.permissions.map((permission) => <div className="extension-capability-row" key={permission.id}><span><strong>{permission.label}</strong><small>{permission.description}</small></span><Pill tone={permission.granted ? "success" : permission.required ? "warning" : "neutral"}>{permission.granted ? t("extensions.granted") : permission.required ? t("extensions.required") : t("extensions.optional")}</Pill></div>)} />

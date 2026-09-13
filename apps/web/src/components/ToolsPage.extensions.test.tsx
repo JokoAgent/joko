@@ -6,7 +6,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import type { AppController } from "../controller.js";
 import { translate } from "../i18n.js";
-import { emptySnapshot, type ExtensionCatalogEntryView, type ExtensionCatalogView } from "../model.js";
+import { emptySnapshot, type ExtensionCatalogEntryView, type ExtensionCatalogView, type ExtensionSourceCatalogView } from "../model.js";
 import { ToolsPage } from "./ToolsPage.js";
 
 const roots: Root[] = [];
@@ -126,6 +126,96 @@ describe("Extension catalog interactions", () => {
     );
     expect(secret.value).toBe("");
     expect(submitExtensionSetupInteraction).not.toHaveBeenCalled();
+  });
+
+  it("keeps source-owned entries read-only and revision-fences source lifecycle actions", async () => {
+    const extension: ExtensionCatalogEntryView = {
+      ...readyExtension(),
+      owner: {
+        kind: "source",
+        sourceId: "extension_source_0123456789abcdef0123456789abcdef",
+        sourceRevision: 3n,
+        entryId: "extension_source_entry_0123456789abcdef0123456789abcdef",
+        contentRevision: `sha256:${"a".repeat(64)}`
+      },
+      source: "market",
+      installed: false,
+      installState: "available",
+      enabled: false,
+      sidebarSupported: false,
+      sidebarVisible: false,
+      commands: [],
+      setup: { state: "notRequired", revision: 0n, fields: [] },
+      useSupported: false
+    };
+    const sourceCatalog: ExtensionSourceCatalogView = {
+      revision: 12n,
+      recoveredFromCorruption: false,
+      sources: [{
+        id: "extension_source_0123456789abcdef0123456789abcdef",
+        revision: 3n,
+        kind: "local",
+        location: { kind: "local", path: "D:\\trusted\\extensions" },
+        name: "trusted-tools",
+        displayName: "Trusted tools",
+        state: "ready",
+        contentRevision: `sha256:${"a".repeat(64)}`,
+        discoveredExtensionCount: 1,
+        declaredEntryCount: 1,
+        skippedEntryCount: 0,
+        unreadableEntryCount: 0,
+        addedAt: Date.UTC(2026, 8, 13)
+      }]
+    };
+    const listExtensionSources = vi.fn(async () => sourceCatalog);
+    const getExtensionSourceGitPreflight = vi.fn(async () => ({ available: true, version: "2.51.0", minimumVersion: "2.25.0" }));
+    const addExtensionSource = vi.fn(async () => undefined);
+    const refreshExtensionSource = vi.fn(async () => undefined);
+    const removeExtensionSource = vi.fn(async () => undefined);
+    const setExtensionEnabled = vi.fn(async () => undefined);
+    const { container } = await renderExtensions({
+      extension,
+      controller: {
+        listExtensions: async () => catalog(extension),
+        getExtension: async () => catalog(extension),
+        listExtensionSources,
+        getExtensionSourceGitPreflight,
+        addExtensionSource,
+        refreshExtensionSource,
+        removeExtensionSource,
+        setExtensionEnabled
+      }
+    });
+
+    expect(container.textContent).toContain("Available from a source");
+    expect(container.textContent).toContain("Source catalog");
+    expect(container.querySelector('.extension-detail__settings input[type="checkbox"]')).toBeNull();
+    expect(setExtensionEnabled).not.toHaveBeenCalled();
+
+    await act(async () => buttonWithText(container, "Manage sources").click());
+    await settle();
+    expect(listExtensionSources).toHaveBeenCalledWith(expect.any(AbortSignal));
+    expect(getExtensionSourceGitPreflight).toHaveBeenCalledWith(expect.any(AbortSignal));
+    expect(document.body.textContent).toContain("Trusted tools");
+
+    await act(async () => buttonWithText(document.body, "Add source").click());
+    const path = document.body.querySelector<HTMLInputElement>(".extension-source-editor input");
+    if (path === null) throw new Error("Local source path input was not rendered.");
+    await act(async () => setNativeValue(path, "D:\\more\\extensions"));
+    await act(async () => buttonWithText(document.body, "Discover source").click());
+    await settle();
+    expect(addExtensionSource).toHaveBeenCalledWith({ kind: "local", path: "D:\\more\\extensions" }, 12n);
+
+    await act(async () => buttonWithText(document.body, "Refresh").click());
+    await settle();
+    expect(refreshExtensionSource).toHaveBeenCalledWith(sourceCatalog.sources[0]?.id, 3n);
+
+    await act(async () => buttonWithText(document.body, "Remove").click());
+    const removeButtons = [...document.body.querySelectorAll<HTMLButtonElement>("button")]
+      .filter((button) => button.textContent?.trim() === "Remove");
+    await act(async () => removeButtons.at(-1)?.click());
+    await settle();
+    expect(removeExtensionSource).toHaveBeenCalledWith(sourceCatalog.sources[0]?.id, 3n);
   });
 });
 

@@ -131,6 +131,12 @@ import type {
   ExtensionRuntimeObservation
 } from "./extension-catalog.js";
 import { extensionMcpInput } from "./extension-catalog.js";
+import {
+  ExtensionSourceError,
+  type ExtensionSourceDescriptor as NativeExtensionSourceDescriptor,
+  type ExtensionSourceInput as NativeExtensionSourceInput,
+  type ExtensionSourceManager
+} from "./extension-source-manager.js";
 import type { HistoryMaintenanceJob, HistoryMaintenanceResult, HistoryRetention } from "./history-maintenance.js";
 import type {
   PiProviderAuthFlowRecord,
@@ -372,6 +378,7 @@ interface ConnectServiceDependencies {
   readonly mcpRouter?: McpRouter;
   readonly piResources?: PiResourceManager;
   readonly extensionCatalog?: ExtensionCatalogManager;
+  readonly extensionSources?: ExtensionSourceManager;
   readonly piBackendIds?: ReadonlySet<string>;
   readonly diagnosticsBundles?: DiagnosticsBundleService;
   readonly providerAuth?: PiProviderAuthSupervisor;
@@ -903,6 +910,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
     ...(application.mcpRouter === undefined ? {} : { mcpRouter: application.mcpRouter }),
     ...(application.piResources === undefined ? {} : { piResources: application.piResources }),
     ...(application.extensionCatalog === undefined ? {} : { extensionCatalog: application.extensionCatalog }),
+    ...(application.extensionSources === undefined ? {} : { extensionSources: application.extensionSources }),
     piBackendIds: new Set(application.adapters
       .filter((adapter): adapter is PiBackendAdapter => adapter instanceof PiBackendAdapter)
       .map((adapter) => adapter.id)),
@@ -3425,6 +3433,40 @@ export function createConnectServices(application: OrchestratorApplication): Con
         extension: mapExtensionCatalogEntry(entry),
         catalogRevision: toProtoRevision(snapshot.revision),
         recoveredFromCorruption: snapshot.recoveredFromCorruption
+      };
+    },
+    getExtensionSourceGitPreflight: async (_request, context) => {
+      authenticate(context);
+      if (dependencies.extensionSources === undefined) {
+        throw new ConnectError("Extension sources are unavailable.", Code.Unimplemented);
+      }
+      const preflight = await dependencies.extensionSources.gitPreflight();
+      return {
+        preflight: create(contract.ExtensionSourceGitPreflightSchema, {
+          available: preflight.available,
+          ...(preflight.version === undefined ? {} : { version: preflight.version }),
+          minimumVersion: preflight.minimumVersion
+        })
+      };
+    },
+    listExtensionSources: async (request, context) => {
+      authenticate(context);
+      if (dependencies.extensionSources === undefined) {
+        return {
+          sources: [],
+          catalogRevision: toProtoRevision(0n),
+          recoveredFromCorruption: false,
+          page: emptyPage(request.page)
+        };
+      }
+      const snapshot = await dependencies.extensionSources.auditAvailability();
+      reconcileExtensionCatalog(dependencies);
+      const result = paginate(snapshot.sources.map(mapExtensionSourceDescriptor), request.page);
+      return {
+        sources: result.values,
+        catalogRevision: toProtoRevision(snapshot.revision),
+        recoveredFromCorruption: snapshot.recoveredFromCorruption,
+        page: result.page
       };
     },
     beginExtensionSetupCredentialUpload: (request, context) => {
@@ -8418,7 +8460,8 @@ function reconcileExtensionCatalog(dependencies: ConnectServiceDependencies): Na
   if (catalog === undefined) return { revision: 0n, entries: [], recoveredFromCorruption: false };
   return catalog.reconcile(
     dependencies.piResources?.list() ?? [],
-    dependencies.mcpRouter?.list() ?? []
+    dependencies.mcpRouter?.list() ?? [],
+    dependencies.extensionSources?.snapshot().sources ?? []
   );
 }
 
@@ -8469,6 +8512,7 @@ async function currentExtensionCatalog(
   dependencies: ConnectServiceDependencies,
   sessionId?: string
 ): Promise<NativeExtensionCatalogSnapshot> {
+  await dependencies.extensionSources?.auditAvailability();
   const reconciled = reconcileExtensionCatalog(dependencies);
   if (sessionId === undefined || dependencies.extensionCatalog === undefined) return reconciled;
   const session = dependencies.store.getSession(sessionId);
@@ -8508,11 +8552,19 @@ function mapExtensionCatalogEntry(item: NativeExtensionCatalogDescriptor): contr
               resourceVersion: toProtoRevision(item.owner.resourceVersion)
             })
           }
-        : {
+        : item.owner.kind === "mcp" ? {
             case: "mcp",
             value: create(contract.ExtensionMcpOwnerSchema, {
               mcpServerId: item.owner.serverId,
               serverRevision: toProtoRevision(item.owner.serverRevision)
+            })
+          } : {
+            case: "source",
+            value: create(contract.ExtensionSourceOwnerSchema, {
+              sourceId: item.owner.sourceId,
+              sourceRevision: toProtoRevision(item.owner.sourceRevision),
+              entryId: item.owner.entryId,
+              contentRevision: item.owner.contentRevision
             })
           }
     }),
@@ -8569,6 +8621,74 @@ function mapExtensionCatalogSnapshot(item: NativeExtensionCatalogSnapshot): cont
     entries: item.entries.map(mapExtensionCatalogEntry),
     recoveredFromCorruption: item.recoveredFromCorruption
   });
+}
+
+function mapExtensionSourceDescriptor(item: NativeExtensionSourceDescriptor): contract.ExtensionSourceDescriptor {
+  return create(contract.ExtensionSourceDescriptorSchema, {
+    sourceId: item.id,
+    revision: toProtoRevision(item.revision),
+    kind: item.source.kind === "local" ? contract.ExtensionSourceKind.LOCAL : contract.ExtensionSourceKind.GIT,
+    location: mapExtensionSourceLocation(item.source),
+    name: item.name,
+    ...(item.displayName === undefined ? {} : { displayName: item.displayName }),
+    state: item.state === "ready" ? contract.ExtensionSourceState.READY : contract.ExtensionSourceState.ERROR,
+    contentRevision: item.contentRevision,
+    discoveredExtensionCount: item.entries.length,
+    declaredEntryCount: item.declaredEntryCount,
+    skippedEntryCount: item.skippedEntryCount,
+    unreadableEntryCount: item.unreadableEntryCount,
+    addedAt: toProtoTimestamp(item.addedAt),
+    ...(item.refreshedAt === undefined ? {} : { refreshedAt: toProtoTimestamp(item.refreshedAt) }),
+    ...(item.error === undefined ? {} : { error: item.error })
+  });
+}
+
+function mapExtensionSourceLocation(source: NativeExtensionSourceInput): contract.ExtensionSourceLocation {
+  return create(contract.ExtensionSourceLocationSchema, {
+    kind: source.kind === "local"
+      ? { case: "local", value: create(contract.ExtensionLocalSourceSchema, { path: source.path }) }
+      : {
+          case: "git",
+          value: create(contract.ExtensionGitSourceSchema, {
+            repositoryUrl: source.repositoryUrl,
+            ...(source.ref === undefined ? {} : { ref: source.ref }),
+            sparsePaths: [...source.sparsePaths]
+          })
+        }
+  });
+}
+
+function nativeExtensionSourceLocation(value: contract.ExtensionSourceLocation | undefined): NativeExtensionSourceInput {
+  if (value?.kind.case === "local") {
+    return { kind: "local", path: nonBlankRequest(value.kind.value.path, "source.local.path") };
+  }
+  if (value?.kind.case === "git") {
+    return {
+      kind: "git",
+      repositoryUrl: nonBlankRequest(value.kind.value.repositoryUrl, "source.git.repository_url"),
+      ...(value.kind.value.ref === undefined ? {} : { ref: value.kind.value.ref }),
+      sparsePaths: [...value.kind.value.sparsePaths]
+    };
+  }
+  throw invalidArgument("source location is required");
+}
+
+async function extensionSourceEffect<T>(effect: () => Promise<T>): Promise<T> {
+  try {
+    return await effect();
+  } catch (error) {
+    if (error instanceof ConnectError || error instanceof StoreError) throw error;
+    if (error instanceof ExtensionSourceError) {
+      const message = redactSecrets(error.message);
+      if (error.code === "SOURCE_NOT_FOUND") throw new ConnectError(message, Code.NotFound);
+      if (error.code === "SOURCE_CHANGED") throw new ConnectError(message, Code.Aborted);
+      if (error.code === "SOURCE_GIT_AUTH_FAILED") throw new ConnectError(message, Code.Unauthenticated);
+      if (error.code === "SOURCE_GIT_UNAVAILABLE") throw new ConnectError(message, Code.FailedPrecondition);
+      if (error.code === "SOURCE_GIT_FAILED") throw new ConnectError(message, Code.Unavailable);
+      throw invalidArgument(message);
+    }
+    throw error;
+  }
 }
 
 function nativeExtensionSource(value: contract.ExtensionCatalogSource): NativeExtensionCatalogDescriptor["source"] {
@@ -15809,6 +15929,59 @@ async function dispatchMutation(
         () => dependencies.piResources!.prepareRemove(payload.value.resourceId)
       );
     }
+    case "addExtensionSource": {
+      if (dependencies.extensionSources === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The Extension source authority is unavailable.");
+      }
+      if (payload.value.expectedCatalogRevision === undefined) throw invalidArgument("expected_catalog_revision is required");
+      const expectedRevision = fromProtoRevision(payload.value.expectedCatalogRevision, "add_extension_source.expected_catalog_revision");
+      const source = nativeExtensionSourceLocation(payload.value.source);
+      return effectOperation(dependencies, operationId, connection, mutation, payload.case, {
+        accepted: true,
+        resultCase: "acknowledgement",
+        entityId: "extension-sources"
+      }, async () => extensionSourceEffect(async () => {
+        await dependencies.extensionSources!.add(source, expectedRevision);
+        reconcileExtensionCatalog(dependencies);
+      }));
+    }
+    case "refreshExtensionSource": {
+      if (dependencies.extensionSources === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The Extension source authority is unavailable.");
+      }
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "refresh_extension_source.expected_revision");
+      const sourceId = nonBlankRequest(payload.value.sourceId, "source_id");
+      return effectOperation(dependencies, operationId, connection, mutation, payload.case, {
+        accepted: true,
+        resultCase: "acknowledgement",
+        entityId: sourceId
+      }, async () => extensionSourceEffect(async () => {
+        try {
+          await dependencies.extensionSources!.refresh(sourceId, expectedRevision);
+        } finally {
+          // A failed discovery is itself a durable source state transition:
+          // preserve its old entries but project the recoverable error now.
+          reconcileExtensionCatalog(dependencies);
+        }
+      }));
+    }
+    case "removeExtensionSource": {
+      if (dependencies.extensionSources === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The Extension source authority is unavailable.");
+      }
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "remove_extension_source.expected_revision");
+      const sourceId = nonBlankRequest(payload.value.sourceId, "source_id");
+      return effectOperation(dependencies, operationId, connection, mutation, payload.case, {
+        accepted: true,
+        resultCase: "acknowledgement",
+        entityId: sourceId
+      }, async () => extensionSourceEffect(async () => {
+        await dependencies.extensionSources!.remove(sourceId, expectedRevision);
+        reconcileExtensionCatalog(dependencies);
+      }));
+    }
     case "setExtensionEnabled": {
       if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
       const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "set_extension_enabled.expected_revision");
@@ -15836,6 +16009,9 @@ async function dispatchMutation(
         );
         reconcileExtensionCatalog(dependencies);
         return result;
+      }
+      if (entry.owner.kind === "source") {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Install this catalog entry before enabling it.");
       }
       if (dependencies.mcpRouter === undefined) {
         return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The MCP authority is unavailable.");

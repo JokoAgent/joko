@@ -69,6 +69,8 @@ import {
   EventCursorSchema,
   ExtensionWidgetPlacement,
   ExtensionCatalogSource as ProtoExtensionCatalogSource,
+  ExtensionSourceKind as ProtoExtensionSourceKind,
+  ExtensionSourceState as ProtoExtensionSourceState,
   ExtensionInstallState as ProtoExtensionInstallState,
   ExtensionService,
   ExtensionSetupFieldKind as ProtoExtensionSetupFieldKind,
@@ -268,6 +270,7 @@ import {
   type ExtraDirectory,
   type ExtensionStatus,
   type ExtensionCatalogEntry as ProtoExtensionCatalogEntry,
+  type ExtensionSourceDescriptor as ProtoExtensionSourceDescriptor,
   type ExtensionWidget,
   type FilePreview,
   type FileDiff,
@@ -380,6 +383,10 @@ import type {
   ExtensionStatusView,
   ExtensionCatalogEntryView,
   ExtensionCatalogView,
+  ExtensionSourceCatalogView,
+  ExtensionSourceDraft,
+  ExtensionSourceGitPreflightView,
+  ExtensionSourceView,
   ExtensionWidgetView,
   InteractionView,
   InteractionResolutionDraft,
@@ -600,6 +607,8 @@ const APP_VERSION = "0.1.0";
 const OPERATION_TERMINAL_WAIT_TIMEOUT_MS = 600_000;
 const MAX_COMPLETE_MESSAGE_SEARCH_PAGES = 10_000;
 const MAX_PORTABLE_SESSION_PACKAGE_BYTES = 256 * 1024 * 1024;
+const MAX_EXTENSION_SOURCE_DECLARED_ENTRIES = 512;
+const MAX_EXTENSION_SOURCE_EXTENSIONS = 2_048;
 const PAIRING_WINDOW_CLOSED_MESSAGE = "Pairing is not currently enabled by the owner.";
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const OWNER_SCOPE = { kind: { case: "owner" as const, value: {} } };
@@ -2962,6 +2971,92 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       extensions: [mapExtensionCatalogEntry(response.extension)],
       recoveredFromCorruption: response.recoveredFromCorruption
     };
+  }
+
+  async getExtensionSourceGitPreflight(signal?: AbortSignal): Promise<ExtensionSourceGitPreflightView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport)
+      .getExtensionSourceGitPreflight({}, { signal: scope.signal });
+    const preflight = response.preflight;
+    if (preflight === undefined || preflight.minimumVersion.trim() === "") {
+      throw new GatewayError("Orchestrator returned an incomplete Extension source preflight result.");
+    }
+    return {
+      available: preflight.available,
+      ...(preflight.version === undefined ? {} : { version: preflight.version }),
+      minimumVersion: preflight.minimumVersion
+    };
+  }
+
+  async listExtensionSources(signal?: AbortSignal): Promise<ExtensionSourceCatalogView> {
+    const scope = this.captureActionScope(signal);
+    const client = createClient(ExtensionService, scope.transport);
+    sourceCatalogAttempts:
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const sources: ExtensionSourceView[] = [];
+      const ids = new Set<string>();
+      const consumedTokens = new Set<string>();
+      let pageToken = "";
+      let revision: bigint | undefined;
+      let recoveredFromCorruption = false;
+      let totalSize: number | undefined;
+      for (let pageIndex = 0; pageIndex < MAX_COMPLETE_MESSAGE_SEARCH_PAGES; pageIndex += 1) {
+        scope.signal.throwIfAborted();
+        const response = await client.listExtensionSources({ page: { pageSize: 500, pageToken } }, { signal: scope.signal });
+        const pageRevision = response.catalogRevision?.value;
+        if (pageRevision === undefined) throw new GatewayError("Orchestrator returned Extension sources without a catalog revision.");
+        if (revision === undefined) {
+          revision = pageRevision;
+          recoveredFromCorruption = response.recoveredFromCorruption;
+        } else if (revision !== pageRevision || recoveredFromCorruption !== response.recoveredFromCorruption) {
+          if (attempt === 0) continue sourceCatalogAttempts;
+          throw new GatewayError("Extension sources changed repeatedly while they were being loaded.");
+        }
+        const pageTotal = response.page === undefined ? undefined : exactSafeUnsignedNumber(response.page.totalSize);
+        if (pageTotal === undefined) throw new GatewayError("Orchestrator returned an invalid Extension source catalog size.");
+        if (totalSize === undefined) totalSize = pageTotal;
+        else if (totalSize !== pageTotal) throw new GatewayError("Orchestrator returned inconsistent Extension source catalog sizes.");
+        if (response.sources.length > 500 || sources.length + response.sources.length > pageTotal) {
+          throw new GatewayError("Orchestrator returned an invalid Extension source page.");
+        }
+        for (const value of response.sources) {
+          const mapped = mapExtensionSource(value);
+          if (ids.has(mapped.id)) throw new GatewayError("Orchestrator returned a duplicate Extension source identity.");
+          ids.add(mapped.id);
+          sources.push(mapped);
+        }
+        const nextPageToken = response.page?.nextPageToken ?? "";
+        if (nextPageToken === "") {
+          if (sources.length !== pageTotal) throw new GatewayError("Orchestrator returned an incomplete Extension source catalog.");
+          return { revision, sources, recoveredFromCorruption };
+        }
+        if (nextPageToken === pageToken || consumedTokens.has(nextPageToken)) {
+          throw new GatewayError("Orchestrator returned a cyclic Extension source page token.");
+        }
+        consumedTokens.add(nextPageToken);
+        pageToken = nextPageToken;
+      }
+      throw new GatewayError("Extension sources exceeded the safe pagination limit.");
+    }
+    throw new GatewayError("Extension sources changed repeatedly while they were being loaded.");
+  }
+
+  async addExtensionSource(source: ExtensionSourceDraft, expectedCatalogRevision: bigint): Promise<void> {
+    await this.submit({
+      case: "addExtensionSource",
+      value: {
+        source: extensionSourceLocation(source),
+        expectedCatalogRevision: { value: expectedCatalogRevision }
+      }
+    }, true);
+  }
+
+  async refreshExtensionSource(sourceId: string, expectedRevision: bigint): Promise<void> {
+    await this.submit({ case: "refreshExtensionSource", value: { sourceId, expectedRevision: { value: expectedRevision } } }, true);
+  }
+
+  async removeExtensionSource(sourceId: string, expectedRevision: bigint): Promise<void> {
+    await this.submit({ case: "removeExtensionSource", value: { sourceId, expectedRevision: { value: expectedRevision } } }, true);
   }
 
   async setExtensionEnabled(extensionId: string, enabled: boolean, expectedRevision: bigint): Promise<void> {
@@ -9674,6 +9769,80 @@ function mapResource(resource: ManagedResource): ResourceView {
   };
 }
 
+function extensionSourceLocation(source: ExtensionSourceDraft) {
+  return {
+    kind: source.kind === "local"
+      ? { case: "local" as const, value: { path: source.path } }
+      : {
+          case: "git" as const,
+          value: {
+            repositoryUrl: source.repositoryUrl,
+            ...(source.ref === undefined ? {} : { ref: source.ref }),
+            sparsePaths: [...source.sparsePaths]
+          }
+        }
+  };
+}
+
+function mapExtensionSource(source: ProtoExtensionSourceDescriptor): ExtensionSourceView {
+  const revision = source.revision?.value;
+  if (!/^extension_source_[a-f0-9]{32}$/u.test(source.sourceId) || revision === undefined || revision < 1n
+    || !/^sha256:[a-f0-9]{64}$/u.test(source.contentRevision) || source.name.trim() === "" || source.addedAt === undefined) {
+    throw new GatewayError("Orchestrator returned an incomplete Extension source descriptor.");
+  }
+  const location = source.location?.kind;
+  const mappedLocation: ExtensionSourceView["location"] = location?.case === "local"
+    ? location.value.path.trim() === "" || source.kind !== ProtoExtensionSourceKind.LOCAL
+      ? (() => { throw new GatewayError("Orchestrator returned an invalid local Extension source."); })()
+      : { kind: "local", path: location.value.path }
+    : location?.case === "git"
+      ? location.value.repositoryUrl.trim() === "" || source.kind !== ProtoExtensionSourceKind.GIT
+        ? (() => { throw new GatewayError("Orchestrator returned an invalid Git Extension source."); })()
+        : {
+            kind: "git",
+            repositoryUrl: location.value.repositoryUrl,
+            ...(location.value.ref === undefined ? {} : { ref: location.value.ref }),
+            sparsePaths: [...location.value.sparsePaths]
+          }
+      : (() => { throw new GatewayError("Orchestrator returned an Extension source without its location."); })();
+  const state: ExtensionSourceView["state"] = source.state === ProtoExtensionSourceState.READY
+    ? "ready"
+    : source.state === ProtoExtensionSourceState.ERROR
+      ? "error"
+      : (() => { throw new GatewayError("Orchestrator returned an invalid Extension source state."); })();
+  for (const count of [source.discoveredExtensionCount, source.declaredEntryCount, source.skippedEntryCount, source.unreadableEntryCount]) {
+    if (!Number.isSafeInteger(count) || count < 0) throw new GatewayError("Orchestrator returned invalid Extension source counts.");
+  }
+  if (source.discoveredExtensionCount > MAX_EXTENSION_SOURCE_EXTENSIONS
+    || source.declaredEntryCount > MAX_EXTENSION_SOURCE_DECLARED_ENTRIES
+    || source.skippedEntryCount + source.unreadableEntryCount > source.declaredEntryCount
+    || (state === "error") !== (source.error !== undefined)) {
+    throw new GatewayError("Orchestrator returned inconsistent Extension source state.");
+  }
+  const addedAt = timestampMs(source.addedAt);
+  const refreshedAt = source.refreshedAt === undefined ? undefined : timestampMs(source.refreshedAt);
+  if (!Number.isSafeInteger(addedAt) || addedAt < 0 || (refreshedAt !== undefined && (!Number.isSafeInteger(refreshedAt) || refreshedAt < addedAt))) {
+    throw new GatewayError("Orchestrator returned invalid Extension source timestamps.");
+  }
+  return {
+    id: source.sourceId,
+    revision,
+    kind: mappedLocation.kind,
+    location: mappedLocation,
+    name: source.name,
+    ...(source.displayName === undefined ? {} : { displayName: source.displayName }),
+    state,
+    contentRevision: source.contentRevision,
+    discoveredExtensionCount: source.discoveredExtensionCount,
+    declaredEntryCount: source.declaredEntryCount,
+    skippedEntryCount: source.skippedEntryCount,
+    unreadableEntryCount: source.unreadableEntryCount,
+    addedAt,
+    ...(refreshedAt === undefined ? {} : { refreshedAt }),
+    ...(source.error === undefined ? {} : { error: source.error })
+  };
+}
+
 function mapExtensionCatalogEntry(extension: ProtoExtensionCatalogEntry): ExtensionCatalogEntryView {
   const revision = extension.revision?.value;
   const setup = extension.setup;
@@ -9694,7 +9863,20 @@ function mapExtensionCatalogEntry(extension: ProtoExtensionCatalogEntry): Extens
       ? owner.value.serverRevision?.value === undefined || owner.value.mcpServerId.trim() === ""
         ? (() => { throw new GatewayError("Orchestrator returned an incomplete Extension MCP owner."); })()
         : { kind: "mcp", serverId: owner.value.mcpServerId, serverRevision: owner.value.serverRevision.value }
-      : (() => { throw new GatewayError("Orchestrator returned an Extension without an owner."); })();
+      : owner?.case === "source"
+        ? owner.value.sourceRevision?.value === undefined || owner.value.sourceRevision.value < 1n
+          || !/^extension_source_[a-f0-9]{32}$/u.test(owner.value.sourceId)
+          || !/^extension_source_entry_[a-f0-9]{32}$/u.test(owner.value.entryId)
+          || !/^sha256:[a-f0-9]{64}$/u.test(owner.value.contentRevision)
+          ? (() => { throw new GatewayError("Orchestrator returned an incomplete Extension Source owner."); })()
+          : {
+              kind: "source",
+              sourceId: owner.value.sourceId,
+              sourceRevision: owner.value.sourceRevision.value,
+              entryId: owner.value.entryId,
+              contentRevision: owner.value.contentRevision
+            }
+        : (() => { throw new GatewayError("Orchestrator returned an Extension without an owner."); })();
   return {
     id: extension.extensionId,
     revision,

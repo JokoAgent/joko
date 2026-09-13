@@ -25,6 +25,7 @@ import type {
   ComposerDraft,
   ExtensionCatalogEntryView,
   ExtensionCatalogView,
+  ExtensionSourceCatalogView,
   InteractionResolutionDraft,
   InteractionView,
   McpServerView,
@@ -313,6 +314,14 @@ export function VisualHarness(): JSX.Element {
           recoveredFromCorruption: state.snapshot.extensionCatalogRecovered
         };
       },
+      getExtensionSourceGitPreflight: async () => ({ available: true, version: "2.51.0", minimumVersion: "2.25" }),
+      listExtensionSources: async (signal): Promise<ExtensionSourceCatalogView> => {
+        signal?.throwIfAborted();
+        return visualExtensionSources();
+      },
+      addExtensionSource: async (source, revision): Promise<void> => { record(`extension-source:add:${source.kind}:${revision.toString(10)}`); },
+      refreshExtensionSource: async (sourceId, revision): Promise<void> => { record(`extension-source:refresh:${sourceId}:${revision.toString(10)}`); },
+      removeExtensionSource: async (sourceId, revision): Promise<void> => { record(`extension-source:remove:${sourceId}:${revision.toString(10)}`); },
       savePendingExtensionUse: async (value): Promise<void> => { record(`extension-use:${value.extensionId}:${value.commandName}`); },
       beginProviderLogin: async (_backendId, providerId, method): Promise<ProviderLoginFlowView> => {
         const now = FIXED_NOW + sequence.current++;
@@ -3596,6 +3605,50 @@ function visualExtensions(): readonly ExtensionCatalogEntryView[] {
     },
     useSupported: false
   }];
+}
+
+function visualExtensionSources(): ExtensionSourceCatalogView {
+  return {
+    revision: 6n,
+    recoveredFromCorruption: false,
+    sources: [{
+      id: "extension_source_0123456789abcdef0123456789abcdef",
+      revision: 4n,
+      kind: "git",
+      location: {
+        kind: "git",
+        repositoryUrl: "https://code.example.test/joko/extensions.git",
+        ref: "stable",
+        sparsePaths: ["packages/navigation", "packages/research"]
+      },
+      name: "community-tools",
+      displayName: "Community tools",
+      state: "ready",
+      contentRevision: `sha256:${"a".repeat(64)}`,
+      discoveredExtensionCount: 8,
+      declaredEntryCount: 7,
+      skippedEntryCount: 0,
+      unreadableEntryCount: 0,
+      addedAt: FIXED_NOW - 8 * 86_400_000,
+      refreshedAt: FIXED_NOW - 18 * 60_000
+    }, {
+      id: "extension_source_fedcba9876543210fedcba9876543210",
+      revision: 2n,
+      kind: "local",
+      location: { kind: "local", path: "D:\\extension-lab" },
+      name: "local-lab",
+      displayName: "Local extension lab",
+      state: "error",
+      contentRevision: `sha256:${"b".repeat(64)}`,
+      discoveredExtensionCount: 2,
+      declaredEntryCount: 4,
+      skippedEntryCount: 1,
+      unreadableEntryCount: 1,
+      addedAt: FIXED_NOW - 3 * 86_400_000,
+      refreshedAt: FIXED_NOW - 45 * 60_000,
+      error: "The local source is temporarily unavailable. Restore the folder and refresh it."
+    }]
+  };
 }
 
 function capability(name: string, options: readonly string[] = [], maximumBytes?: number, maximumItems?: number) {

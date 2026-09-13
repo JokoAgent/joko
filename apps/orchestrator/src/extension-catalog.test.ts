@@ -8,6 +8,7 @@ import { describe, expect, it, vi } from "vitest";
 import { CredentialManager } from "./credential-manager.js";
 import { CredentialVault } from "./credential-vault.js";
 import { ExtensionCatalogManager } from "./extension-catalog.js";
+import type { ExtensionSourceDescriptor } from "./extension-source-manager.js";
 import type { McpServerDescriptor } from "./mcp-router.js";
 import type { PiResourceDescriptor } from "./resource-manager.js";
 
@@ -95,6 +96,41 @@ function mcp(overrides: Partial<McpServerDescriptor> = {}): McpServerDescriptor 
   };
 }
 
+function source(overrides: Partial<ExtensionSourceDescriptor> = {}): ExtensionSourceDescriptor {
+  return {
+    id: "extension_source_0123456789abcdef0123456789abcdef",
+    revision: 3n,
+    source: { kind: "git", repositoryUrl: "https://example.test/extensions.git", sparsePaths: [] },
+    sourceIdentity: '["git","https://example.test/extensions.git",null,[]]',
+    sourceDisplay: "https://example.test/extensions.git",
+    name: "community-extensions",
+    state: "ready",
+    contentRevision: `sha256:${"a".repeat(64)}`,
+    entries: [{
+      id: "extension_source_entry_0123456789abcdef0123456789abcdef",
+      revision: `sha256:${"b".repeat(64)}`,
+      contentRevision: `sha256:${"b".repeat(64)}`,
+      packageContentRevision: `sha256:${"c".repeat(64)}`,
+      resourceId: "resource-extension-a",
+      packageRelativePath: "packages/navigation",
+      extensionRelativePath: "extensions/navigation.ts",
+      bindingName: "Workspace navigator",
+      bindingOrdinal: 0,
+      name: "Workspace navigator",
+      packageName: "@sample/navigation",
+      version: "1.2.0",
+      author: "Package Author",
+      description: "Navigate a workspace"
+    }],
+    declaredEntryCount: 1,
+    skippedEntryCount: 0,
+    unreadableEntryCount: 0,
+    addedAt: NOW,
+    refreshedAt: NOW,
+    ...overrides
+  };
+}
+
 describe("ExtensionCatalogManager", () => {
   it("projects installed/local/market detail and exposes Use only for an exact live Resource command", async () => {
     const { store, catalog } = await fixture();
@@ -120,6 +156,34 @@ describe("ExtensionCatalogManager", () => {
       }).entries.find((entry) => entry.id === extension?.id);
       expect(observed?.commands).toEqual([{ name: "open-nav", description: "Open navigation", sessionId: "session-a" }]);
       expect(observed?.useSupported).toBe(true);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("projects an exact source-owned available entry and keeps its Extension ID when Resource takes ownership", async () => {
+    const { store, catalog } = await fixture();
+    try {
+      const available = catalog.reconcile([], [], [source()]).entries[0]!;
+      expect(available).toMatchObject({
+        owner: {
+          kind: "source",
+          sourceId: "extension_source_0123456789abcdef0123456789abcdef",
+          sourceRevision: 3n,
+          entryId: "extension_source_entry_0123456789abcdef0123456789abcdef",
+          contentRevision: `sha256:${"b".repeat(64)}`
+        },
+        source: "market",
+        installed: false,
+        installState: "available",
+        enabled: false,
+        sidebarSupported: false
+      });
+
+      const adopted = catalog.reconcile([resource()], [], [source()]).entries[0]!;
+      expect(adopted.id).toBe(available.id);
+      expect(adopted).toMatchObject({ owner: { kind: "resource", resourceId: "resource-extension-a" }, installed: true });
+      expect(adopted.revision).toBeGreaterThan(available.revision);
     } finally {
       store.close();
     }

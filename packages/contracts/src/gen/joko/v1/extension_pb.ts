@@ -4,6 +4,8 @@
 
 import type { GenEnum, GenFile, GenMessage } from "@bufbuild/protobuf/codegenv2";
 import { enumDesc, fileDesc, messageDesc } from "@bufbuild/protobuf/codegenv2";
+import type { Timestamp } from "@bufbuild/protobuf/wkt";
+import { file_google_protobuf_timestamp } from "@bufbuild/protobuf/wkt";
 import type { Revision } from "./common_pb.js";
 import { file_joko_v1_common } from "./common_pb.js";
 import type { Message } from "@bufbuild/protobuf";
@@ -12,7 +14,80 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file joko/v1/extension.proto.
  */
 export const file_joko_v1_extension: GenFile = /*@__PURE__*/
-  fileDesc("Chdqb2tvL3YxL2V4dGVuc2lvbi5wcm90bxIHam9rby52MSJ3ChZFeHRlbnNpb25SZXNvdXJjZU93bmVyEhMKC3Jlc291cmNlX2lkGAEgASgJEhsKE2Rpc2NvdmVyZWRfcmV2aXNpb24YAiABKAkSKwoQcmVzb3VyY2VfdmVyc2lvbhgDIAEoCzIRLmpva28udjEuUmV2aXNpb24iVgoRRXh0ZW5zaW9uTWNwT3duZXISFQoNbWNwX3NlcnZlcl9pZBgBIAEoCRIqCg9zZXJ2ZXJfcmV2aXNpb24YAiABKAsyES5qb2tvLnYxLlJldmlzaW9uIngKDkV4dGVuc2lvbk93bmVyEjMKCHJlc291cmNlGAEgASgLMh8uam9rby52MS5FeHRlbnNpb25SZXNvdXJjZU93bmVySAASKQoDbWNwGAIgASgLMhouam9rby52MS5FeHRlbnNpb25NY3BPd25lckgAQgYKBGtpbmQiWQoXRXh0ZW5zaW9uVG9vbERlc2NyaXB0b3ISDAoEbmFtZRgBIAEoCRITCgtkZXNjcmlwdGlvbhgCIAEoCRIbChNyZXF1aXJlc19wZXJtaXNzaW9uGAMgASgIIn0KHUV4dGVuc2lvblBlcm1pc3Npb25EZXNjcmlwdG9yEhUKDXBlcm1pc3Npb25faWQYASABKAkSDQoFbGFiZWwYAiABKAkSEwoLZGVzY3JpcHRpb24YAyABKAkSEAoIcmVxdWlyZWQYBCABKAgSDwoHZ3JhbnRlZBgFIAEoCCJTChpFeHRlbnNpb25Db21tYW5kRGVzY3JpcHRvchIMCgRuYW1lGAEgASgJEhMKC2Rlc2NyaXB0aW9uGAIgASgJEhIKCnNlc3Npb25faWQYAyABKAkivAEKHUV4dGVuc2lvblNldHVwRmllbGREZXNjcmlwdG9yEhAKCGZpZWxkX2lkGAEgASgJEg0KBWxhYmVsGAIgASgJEhMKC2Rlc2NyaXB0aW9uGAMgASgJEi4KBGtpbmQYBCABKA4yIC5qb2tvLnYxLkV4dGVuc2lvblNldHVwRmllbGRLaW5kEhAKCHJlcXVpcmVkGAUgASgIEhIKCmNvbmZpZ3VyZWQYBiABKAgSDwoHb3B0aW9ucxgHIAMoCSLqAQoYRXh0ZW5zaW9uU2V0dXBEZXNjcmlwdG9yEisKBXN0YXRlGAEgASgOMhwuam9rby52MS5FeHRlbnNpb25TZXR1cFN0YXRlEhcKCmF0dGVtcHRfaWQYAiABKAlIAIgBARIjCghyZXZpc2lvbhgDIAEoCzIRLmpva28udjEuUmV2aXNpb24SNgoGZmllbGRzGAQgAygLMiYuam9rby52MS5FeHRlbnNpb25TZXR1cEZpZWxkRGVzY3JpcHRvchISCgVlcnJvchgFIAEoCUgBiAEBQg0KC19hdHRlbXB0X2lkQggKBl9lcnJvciKrBQoVRXh0ZW5zaW9uQ2F0YWxvZ0VudHJ5EhQKDGV4dGVuc2lvbl9pZBgBIAEoCRIjCghyZXZpc2lvbhgCIAEoCzIRLmpva28udjEuUmV2aXNpb24SJgoFb3duZXIYAyABKAsyFy5qb2tvLnYxLkV4dGVuc2lvbk93bmVyEi8KBnNvdXJjZRgEIAEoDjIfLmpva28udjEuRXh0ZW5zaW9uQ2F0YWxvZ1NvdXJjZRIRCglpbnN0YWxsZWQYBSABKAgSNQoNaW5zdGFsbF9zdGF0ZRgGIAEoDjIeLmpva28udjEuRXh0ZW5zaW9uSW5zdGFsbFN0YXRlEgwKBG5hbWUYByABKAkSFAoHdmVyc2lvbhgIIAEoCUgAiAEBEhMKBmF1dGhvchgJIAEoCUgBiAEBEhMKC2Rlc2NyaXB0aW9uGAogASgJEg8KB2VuYWJsZWQYCyABKAgSGQoRc2lkZWJhcl9zdXBwb3J0ZWQYDCABKAgSFwoPc2lkZWJhcl92aXNpYmxlGA0gASgIEi8KBXRvb2xzGA4gAygLMiAuam9rby52MS5FeHRlbnNpb25Ub29sRGVzY3JpcHRvchI7CgtwZXJtaXNzaW9ucxgPIAMoCzImLmpva28udjEuRXh0ZW5zaW9uUGVybWlzc2lvbkRlc2NyaXB0b3ISNQoIY29tbWFuZHMYECADKAsyIy5qb2tvLnYxLkV4dGVuc2lvbkNvbW1hbmREZXNjcmlwdG9yEjAKBXNldHVwGBEgASgLMiEuam9rby52MS5FeHRlbnNpb25TZXR1cERlc2NyaXB0b3ISFQoNdXNlX3N1cHBvcnRlZBgSIAEoCBISCgVlcnJvchgTIAEoCUgCiAEBQgoKCF92ZXJzaW9uQgkKB19hdXRob3JCCAoGX2Vycm9yIpMBChhFeHRlbnNpb25DYXRhbG9nU25hcHNob3QSIwoIcmV2aXNpb24YASABKAsyES5qb2tvLnYxLlJldmlzaW9uEi8KB2VudHJpZXMYAiADKAsyHi5qb2tvLnYxLkV4dGVuc2lvbkNhdGFsb2dFbnRyeRIhChlyZWNvdmVyZWRfZnJvbV9jb3JydXB0aW9uGAMgASgIKosBChZFeHRlbnNpb25DYXRhbG9nU291cmNlEigKJEVYVEVOU0lPTl9DQVRBTE9HX1NPVVJDRV9VTlNQRUNJRklFRBAAEiIKHkVYVEVOU0lPTl9DQVRBTE9HX1NPVVJDRV9MT0NBTBABEiMKH0VYVEVOU0lPTl9DQVRBTE9HX1NPVVJDRV9NQVJLRVQQAiqHAgoVRXh0ZW5zaW9uSW5zdGFsbFN0YXRlEicKI0VYVEVOU0lPTl9JTlNUQUxMX1NUQVRFX1VOU1BFQ0lGSUVEEAASJQohRVhURU5TSU9OX0lOU1RBTExfU1RBVEVfQVZBSUxBQkxFEAESJgoiRVhURU5TSU9OX0lOU1RBTExfU1RBVEVfSU5TVEFMTElORxACEiUKIUVYVEVOU0lPTl9JTlNUQUxMX1NUQVRFX0lOU1RBTExFRBADEiwKKEVYVEVOU0lPTl9JTlNUQUxMX1NUQVRFX1VQREFURV9BVkFJTEFCTEUQBBIhCh1FWFRFTlNJT05fSU5TVEFMTF9TVEFURV9FUlJPUhAFKpcCChNFeHRlbnNpb25TZXR1cFN0YXRlEiUKIUVYVEVOU0lPTl9TRVRVUF9TVEFURV9VTlNQRUNJRklFRBAAEiYKIkVYVEVOU0lPTl9TRVRVUF9TVEFURV9OT1RfUkVRVUlSRUQQARIiCh5FWFRFTlNJT05fU0VUVVBfU1RBVEVfUkVRVUlSRUQQAhIlCiFFWFRFTlNJT05fU0VUVVBfU1RBVEVfSU5fUFJPR1JFU1MQAxIfChtFWFRFTlNJT05fU0VUVVBfU1RBVEVfUkVBRFkQBBIjCh9FWFRFTlNJT05fU0VUVVBfU1RBVEVfQ0FOQ0VMTEVEEAUSIAocRVhURU5TSU9OX1NFVFVQX1NUQVRFX0ZBSUxFRBAGKuQBChdFeHRlbnNpb25TZXR1cEZpZWxkS2luZBIqCiZFWFRFTlNJT05fU0VUVVBfRklFTERfS0lORF9VTlNQRUNJRklFRBAAEiMKH0VYVEVOU0lPTl9TRVRVUF9GSUVMRF9LSU5EX1RFWFQQARIlCiFFWFRFTlNJT05fU0VUVVBfRklFTERfS0lORF9TRUNSRVQQAhIkCiBFWFRFTlNJT05fU0VUVVBfRklFTERfS0lORF9PQVVUSBADEisKJ0VYVEVOU0lPTl9TRVRVUF9GSUVMRF9LSU5EX0NPTkZJUk1BVElPThAEYgZwcm90bzM", [file_joko_v1_common]);
+  fileDesc("Chdqb2tvL3YxL2V4dGVuc2lvbi5wcm90bxIHam9rby52MSIkChRFeHRlbnNpb25Mb2NhbFNvdXJjZRIMCgRwYXRoGAEgASgJIlwKEkV4dGVuc2lvbkdpdFNvdXJjZRIWCg5yZXBvc2l0b3J5X3VybBgBIAEoCRIQCgNyZWYYAiABKAlIAIgBARIUCgxzcGFyc2VfcGF0aHMYAyADKAlCBgoEX3JlZiJ9ChdFeHRlbnNpb25Tb3VyY2VMb2NhdGlvbhIuCgVsb2NhbBgBIAEoCzIdLmpva28udjEuRXh0ZW5zaW9uTG9jYWxTb3VyY2VIABIqCgNnaXQYAiABKAsyGy5qb2tvLnYxLkV4dGVuc2lvbkdpdFNvdXJjZUgAQgYKBGtpbmQidwoWRXh0ZW5zaW9uUmVzb3VyY2VPd25lchITCgtyZXNvdXJjZV9pZBgBIAEoCRIbChNkaXNjb3ZlcmVkX3JldmlzaW9uGAIgASgJEisKEHJlc291cmNlX3ZlcnNpb24YAyABKAsyES5qb2tvLnYxLlJldmlzaW9uIlYKEUV4dGVuc2lvbk1jcE93bmVyEhUKDW1jcF9zZXJ2ZXJfaWQYASABKAkSKgoPc2VydmVyX3JldmlzaW9uGAIgASgLMhEuam9rby52MS5SZXZpc2lvbiKBAQoURXh0ZW5zaW9uU291cmNlT3duZXISEQoJc291cmNlX2lkGAEgASgJEioKD3NvdXJjZV9yZXZpc2lvbhgCIAEoCzIRLmpva28udjEuUmV2aXNpb24SEAoIZW50cnlfaWQYAyABKAkSGAoQY29udGVudF9yZXZpc2lvbhgEIAEoCSKpAQoORXh0ZW5zaW9uT3duZXISMwoIcmVzb3VyY2UYASABKAsyHy5qb2tvLnYxLkV4dGVuc2lvblJlc291cmNlT3duZXJIABIpCgNtY3AYAiABKAsyGi5qb2tvLnYxLkV4dGVuc2lvbk1jcE93bmVySAASLwoGc291cmNlGAMgASgLMh0uam9rby52MS5FeHRlbnNpb25Tb3VyY2VPd25lckgAQgYKBGtpbmQiyAQKGUV4dGVuc2lvblNvdXJjZURlc2NyaXB0b3ISEQoJc291cmNlX2lkGAEgASgJEiMKCHJldmlzaW9uGAIgASgLMhEuam9rby52MS5SZXZpc2lvbhIqCgRraW5kGAMgASgOMhwuam9rby52MS5FeHRlbnNpb25Tb3VyY2VLaW5kEjIKCGxvY2F0aW9uGAQgASgLMiAuam9rby52MS5FeHRlbnNpb25Tb3VyY2VMb2NhdGlvbhIMCgRuYW1lGAUgASgJEhkKDGRpc3BsYXlfbmFtZRgGIAEoCUgAiAEBEiwKBXN0YXRlGAcgASgOMh0uam9rby52MS5FeHRlbnNpb25Tb3VyY2VTdGF0ZRIYChBjb250ZW50X3JldmlzaW9uGAggASgJEiIKGmRpc2NvdmVyZWRfZXh0ZW5zaW9uX2NvdW50GAkgASgNEhwKFGRlY2xhcmVkX2VudHJ5X2NvdW50GAogASgNEhsKE3NraXBwZWRfZW50cnlfY291bnQYCyABKA0SHgoWdW5yZWFkYWJsZV9lbnRyeV9jb3VudBgMIAEoDRIsCghhZGRlZF9hdBgNIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASNQoMcmVmcmVzaGVkX2F0GA4gASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcEgBiAEBEhIKBWVycm9yGA8gASgJSAKIAQFCDwoNX2Rpc3BsYXlfbmFtZUIPCg1fcmVmcmVzaGVkX2F0QggKBl9lcnJvciJrChtFeHRlbnNpb25Tb3VyY2VHaXRQcmVmbGlnaHQSEQoJYXZhaWxhYmxlGAEgASgIEhQKB3ZlcnNpb24YAiABKAlIAIgBARIXCg9taW5pbXVtX3ZlcnNpb24YAyABKAlCCgoIX3ZlcnNpb24iWQoXRXh0ZW5zaW9uVG9vbERlc2NyaXB0b3ISDAoEbmFtZRgBIAEoCRITCgtkZXNjcmlwdGlvbhgCIAEoCRIbChNyZXF1aXJlc19wZXJtaXNzaW9uGAMgASgIIn0KHUV4dGVuc2lvblBlcm1pc3Npb25EZXNjcmlwdG9yEhUKDXBlcm1pc3Npb25faWQYASABKAkSDQoFbGFiZWwYAiABKAkSEwoLZGVzY3JpcHRpb24YAyABKAkSEAoIcmVxdWlyZWQYBCABKAgSDwoHZ3JhbnRlZBgFIAEoCCJTChpFeHRlbnNpb25Db21tYW5kRGVzY3JpcHRvchIMCgRuYW1lGAEgASgJEhMKC2Rlc2NyaXB0aW9uGAIgASgJEhIKCnNlc3Npb25faWQYAyABKAkivAEKHUV4dGVuc2lvblNldHVwRmllbGREZXNjcmlwdG9yEhAKCGZpZWxkX2lkGAEgASgJEg0KBWxhYmVsGAIgASgJEhMKC2Rlc2NyaXB0aW9uGAMgASgJEi4KBGtpbmQYBCABKA4yIC5qb2tvLnYxLkV4dGVuc2lvblNldHVwRmllbGRLaW5kEhAKCHJlcXVpcmVkGAUgASgIEhIKCmNvbmZpZ3VyZWQYBiABKAgSDwoHb3B0aW9ucxgHIAMoCSLqAQoYRXh0ZW5zaW9uU2V0dXBEZXNjcmlwdG9yEisKBXN0YXRlGAEgASgOMhwuam9rby52MS5FeHRlbnNpb25TZXR1cFN0YXRlEhcKCmF0dGVtcHRfaWQYAiABKAlIAIgBARIjCghyZXZpc2lvbhgDIAEoCzIRLmpva28udjEuUmV2aXNpb24SNgoGZmllbGRzGAQgAygLMiYuam9rby52MS5FeHRlbnNpb25TZXR1cEZpZWxkRGVzY3JpcHRvchISCgVlcnJvchgFIAEoCUgBiAEBQg0KC19hdHRlbXB0X2lkQggKBl9lcnJvciKrBQoVRXh0ZW5zaW9uQ2F0YWxvZ0VudHJ5EhQKDGV4dGVuc2lvbl9pZBgBIAEoCRIjCghyZXZpc2lvbhgCIAEoCzIRLmpva28udjEuUmV2aXNpb24SJgoFb3duZXIYAyABKAsyFy5qb2tvLnYxLkV4dGVuc2lvbk93bmVyEi8KBnNvdXJjZRgEIAEoDjIfLmpva28udjEuRXh0ZW5zaW9uQ2F0YWxvZ1NvdXJjZRIRCglpbnN0YWxsZWQYBSABKAgSNQoNaW5zdGFsbF9zdGF0ZRgGIAEoDjIeLmpva28udjEuRXh0ZW5zaW9uSW5zdGFsbFN0YXRlEgwKBG5hbWUYByABKAkSFAoHdmVyc2lvbhgIIAEoCUgAiAEBEhMKBmF1dGhvchgJIAEoCUgBiAEBEhMKC2Rlc2NyaXB0aW9uGAogASgJEg8KB2VuYWJsZWQYCyABKAgSGQoRc2lkZWJhcl9zdXBwb3J0ZWQYDCABKAgSFwoPc2lkZWJhcl92aXNpYmxlGA0gASgIEi8KBXRvb2xzGA4gAygLMiAuam9rby52MS5FeHRlbnNpb25Ub29sRGVzY3JpcHRvchI7CgtwZXJtaXNzaW9ucxgPIAMoCzImLmpva28udjEuRXh0ZW5zaW9uUGVybWlzc2lvbkRlc2NyaXB0b3ISNQoIY29tbWFuZHMYECADKAsyIy5qb2tvLnYxLkV4dGVuc2lvbkNvbW1hbmREZXNjcmlwdG9yEjAKBXNldHVwGBEgASgLMiEuam9rby52MS5FeHRlbnNpb25TZXR1cERlc2NyaXB0b3ISFQoNdXNlX3N1cHBvcnRlZBgSIAEoCBISCgVlcnJvchgTIAEoCUgCiAEBQgoKCF92ZXJzaW9uQgkKB19hdXRob3JCCAoGX2Vycm9yIpMBChhFeHRlbnNpb25DYXRhbG9nU25hcHNob3QSIwoIcmV2aXNpb24YASABKAsyES5qb2tvLnYxLlJldmlzaW9uEi8KB2VudHJpZXMYAiADKAsyHi5qb2tvLnYxLkV4dGVuc2lvbkNhdGFsb2dFbnRyeRIhChlyZWNvdmVyZWRfZnJvbV9jb3JydXB0aW9uGAMgASgIKosBChZFeHRlbnNpb25DYXRhbG9nU291cmNlEigKJEVYVEVOU0lPTl9DQVRBTE9HX1NPVVJDRV9VTlNQRUNJRklFRBAAEiIKHkVYVEVOU0lPTl9DQVRBTE9HX1NPVVJDRV9MT0NBTBABEiMKH0VYVEVOU0lPTl9DQVRBTE9HX1NPVVJDRV9NQVJLRVQQAiqHAgoVRXh0ZW5zaW9uSW5zdGFsbFN0YXRlEicKI0VYVEVOU0lPTl9JTlNUQUxMX1NUQVRFX1VOU1BFQ0lGSUVEEAASJQohRVhURU5TSU9OX0lOU1RBTExfU1RBVEVfQVZBSUxBQkxFEAESJgoiRVhURU5TSU9OX0lOU1RBTExfU1RBVEVfSU5TVEFMTElORxACEiUKIUVYVEVOU0lPTl9JTlNUQUxMX1NUQVRFX0lOU1RBTExFRBADEiwKKEVYVEVOU0lPTl9JTlNUQUxMX1NUQVRFX1VQREFURV9BVkFJTEFCTEUQBBIhCh1FWFRFTlNJT05fSU5TVEFMTF9TVEFURV9FUlJPUhAFKpcCChNFeHRlbnNpb25TZXR1cFN0YXRlEiUKIUVYVEVOU0lPTl9TRVRVUF9TVEFURV9VTlNQRUNJRklFRBAAEiYKIkVYVEVOU0lPTl9TRVRVUF9TVEFURV9OT1RfUkVRVUlSRUQQARIiCh5FWFRFTlNJT05fU0VUVVBfU1RBVEVfUkVRVUlSRUQQAhIlCiFFWFRFTlNJT05fU0VUVVBfU1RBVEVfSU5fUFJPR1JFU1MQAxIfChtFWFRFTlNJT05fU0VUVVBfU1RBVEVfUkVBRFkQBBIjCh9FWFRFTlNJT05fU0VUVVBfU1RBVEVfQ0FOQ0VMTEVEEAUSIAocRVhURU5TSU9OX1NFVFVQX1NUQVRFX0ZBSUxFRBAGKuQBChdFeHRlbnNpb25TZXR1cEZpZWxkS2luZBIqCiZFWFRFTlNJT05fU0VUVVBfRklFTERfS0lORF9VTlNQRUNJRklFRBAAEiMKH0VYVEVOU0lPTl9TRVRVUF9GSUVMRF9LSU5EX1RFWFQQARIlCiFFWFRFTlNJT05fU0VUVVBfRklFTERfS0lORF9TRUNSRVQQAhIkCiBFWFRFTlNJT05fU0VUVVBfRklFTERfS0lORF9PQVVUSBADEisKJ0VYVEVOU0lPTl9TRVRVUF9GSUVMRF9LSU5EX0NPTkZJUk1BVElPThAEKnwKE0V4dGVuc2lvblNvdXJjZUtpbmQSJQohRVhURU5TSU9OX1NPVVJDRV9LSU5EX1VOU1BFQ0lGSUVEEAASHwobRVhURU5TSU9OX1NPVVJDRV9LSU5EX0xPQ0FMEAESHQoZRVhURU5TSU9OX1NPVVJDRV9LSU5EX0dJVBACKoIBChRFeHRlbnNpb25Tb3VyY2VTdGF0ZRImCiJFWFRFTlNJT05fU09VUkNFX1NUQVRFX1VOU1BFQ0lGSUVEEAASIAocRVhURU5TSU9OX1NPVVJDRV9TVEFURV9SRUFEWRABEiAKHEVYVEVOU0lPTl9TT1VSQ0VfU1RBVEVfRVJST1IQAmIGcHJvdG8z", [file_google_protobuf_timestamp, file_joko_v1_common]);
+
+/**
+ * @generated from message joko.v1.ExtensionLocalSource
+ */
+export type ExtensionLocalSource = Message<"joko.v1.ExtensionLocalSource"> & {
+  /**
+   * @generated from field: string path = 1;
+   */
+  path: string;
+};
+
+/**
+ * Describes the message joko.v1.ExtensionLocalSource.
+ * Use `create(ExtensionLocalSourceSchema)` to create a new message.
+ */
+export const ExtensionLocalSourceSchema: GenMessage<ExtensionLocalSource> = /*@__PURE__*/
+  messageDesc(file_joko_v1_extension, 0);
+
+/**
+ * @generated from message joko.v1.ExtensionGitSource
+ */
+export type ExtensionGitSource = Message<"joko.v1.ExtensionGitSource"> & {
+  /**
+   * @generated from field: string repository_url = 1;
+   */
+  repositoryUrl: string;
+
+  /**
+   * @generated from field: optional string ref = 2;
+   */
+  ref?: string | undefined;
+
+  /**
+   * @generated from field: repeated string sparse_paths = 3;
+   */
+  sparsePaths: string[];
+};
+
+/**
+ * Describes the message joko.v1.ExtensionGitSource.
+ * Use `create(ExtensionGitSourceSchema)` to create a new message.
+ */
+export const ExtensionGitSourceSchema: GenMessage<ExtensionGitSource> = /*@__PURE__*/
+  messageDesc(file_joko_v1_extension, 1);
+
+/**
+ * @generated from message joko.v1.ExtensionSourceLocation
+ */
+export type ExtensionSourceLocation = Message<"joko.v1.ExtensionSourceLocation"> & {
+  /**
+   * @generated from oneof joko.v1.ExtensionSourceLocation.kind
+   */
+  kind: {
+    /**
+     * @generated from field: joko.v1.ExtensionLocalSource local = 1;
+     */
+    value: ExtensionLocalSource;
+    case: "local";
+  } | {
+    /**
+     * @generated from field: joko.v1.ExtensionGitSource git = 2;
+     */
+    value: ExtensionGitSource;
+    case: "git";
+  } | { case: undefined; value?: undefined };
+};
+
+/**
+ * Describes the message joko.v1.ExtensionSourceLocation.
+ * Use `create(ExtensionSourceLocationSchema)` to create a new message.
+ */
+export const ExtensionSourceLocationSchema: GenMessage<ExtensionSourceLocation> = /*@__PURE__*/
+  messageDesc(file_joko_v1_extension, 2);
 
 /**
  * @generated from message joko.v1.ExtensionResourceOwner
@@ -39,7 +114,7 @@ export type ExtensionResourceOwner = Message<"joko.v1.ExtensionResourceOwner"> &
  * Use `create(ExtensionResourceOwnerSchema)` to create a new message.
  */
 export const ExtensionResourceOwnerSchema: GenMessage<ExtensionResourceOwner> = /*@__PURE__*/
-  messageDesc(file_joko_v1_extension, 0);
+  messageDesc(file_joko_v1_extension, 3);
 
 /**
  * @generated from message joko.v1.ExtensionMcpOwner
@@ -61,7 +136,39 @@ export type ExtensionMcpOwner = Message<"joko.v1.ExtensionMcpOwner"> & {
  * Use `create(ExtensionMcpOwnerSchema)` to create a new message.
  */
 export const ExtensionMcpOwnerSchema: GenMessage<ExtensionMcpOwner> = /*@__PURE__*/
-  messageDesc(file_joko_v1_extension, 1);
+  messageDesc(file_joko_v1_extension, 4);
+
+/**
+ * @generated from message joko.v1.ExtensionSourceOwner
+ */
+export type ExtensionSourceOwner = Message<"joko.v1.ExtensionSourceOwner"> & {
+  /**
+   * @generated from field: string source_id = 1;
+   */
+  sourceId: string;
+
+  /**
+   * @generated from field: joko.v1.Revision source_revision = 2;
+   */
+  sourceRevision?: Revision | undefined;
+
+  /**
+   * @generated from field: string entry_id = 3;
+   */
+  entryId: string;
+
+  /**
+   * @generated from field: string content_revision = 4;
+   */
+  contentRevision: string;
+};
+
+/**
+ * Describes the message joko.v1.ExtensionSourceOwner.
+ * Use `create(ExtensionSourceOwnerSchema)` to create a new message.
+ */
+export const ExtensionSourceOwnerSchema: GenMessage<ExtensionSourceOwner> = /*@__PURE__*/
+  messageDesc(file_joko_v1_extension, 5);
 
 /**
  * @generated from message joko.v1.ExtensionOwner
@@ -82,6 +189,12 @@ export type ExtensionOwner = Message<"joko.v1.ExtensionOwner"> & {
      */
     value: ExtensionMcpOwner;
     case: "mcp";
+  } | {
+    /**
+     * @generated from field: joko.v1.ExtensionSourceOwner source = 3;
+     */
+    value: ExtensionSourceOwner;
+    case: "source";
   } | { case: undefined; value?: undefined };
 };
 
@@ -90,7 +203,121 @@ export type ExtensionOwner = Message<"joko.v1.ExtensionOwner"> & {
  * Use `create(ExtensionOwnerSchema)` to create a new message.
  */
 export const ExtensionOwnerSchema: GenMessage<ExtensionOwner> = /*@__PURE__*/
-  messageDesc(file_joko_v1_extension, 2);
+  messageDesc(file_joko_v1_extension, 6);
+
+/**
+ * @generated from message joko.v1.ExtensionSourceDescriptor
+ */
+export type ExtensionSourceDescriptor = Message<"joko.v1.ExtensionSourceDescriptor"> & {
+  /**
+   * @generated from field: string source_id = 1;
+   */
+  sourceId: string;
+
+  /**
+   * @generated from field: joko.v1.Revision revision = 2;
+   */
+  revision?: Revision | undefined;
+
+  /**
+   * @generated from field: joko.v1.ExtensionSourceKind kind = 3;
+   */
+  kind: ExtensionSourceKind;
+
+  /**
+   * @generated from field: joko.v1.ExtensionSourceLocation location = 4;
+   */
+  location?: ExtensionSourceLocation | undefined;
+
+  /**
+   * @generated from field: string name = 5;
+   */
+  name: string;
+
+  /**
+   * @generated from field: optional string display_name = 6;
+   */
+  displayName?: string | undefined;
+
+  /**
+   * @generated from field: joko.v1.ExtensionSourceState state = 7;
+   */
+  state: ExtensionSourceState;
+
+  /**
+   * @generated from field: string content_revision = 8;
+   */
+  contentRevision: string;
+
+  /**
+   * @generated from field: uint32 discovered_extension_count = 9;
+   */
+  discoveredExtensionCount: number;
+
+  /**
+   * @generated from field: uint32 declared_entry_count = 10;
+   */
+  declaredEntryCount: number;
+
+  /**
+   * @generated from field: uint32 skipped_entry_count = 11;
+   */
+  skippedEntryCount: number;
+
+  /**
+   * @generated from field: uint32 unreadable_entry_count = 12;
+   */
+  unreadableEntryCount: number;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp added_at = 13;
+   */
+  addedAt?: Timestamp | undefined;
+
+  /**
+   * @generated from field: optional google.protobuf.Timestamp refreshed_at = 14;
+   */
+  refreshedAt?: Timestamp | undefined;
+
+  /**
+   * @generated from field: optional string error = 15;
+   */
+  error?: string | undefined;
+};
+
+/**
+ * Describes the message joko.v1.ExtensionSourceDescriptor.
+ * Use `create(ExtensionSourceDescriptorSchema)` to create a new message.
+ */
+export const ExtensionSourceDescriptorSchema: GenMessage<ExtensionSourceDescriptor> = /*@__PURE__*/
+  messageDesc(file_joko_v1_extension, 7);
+
+/**
+ * @generated from message joko.v1.ExtensionSourceGitPreflight
+ */
+export type ExtensionSourceGitPreflight = Message<"joko.v1.ExtensionSourceGitPreflight"> & {
+  /**
+   * @generated from field: bool available = 1;
+   */
+  available: boolean;
+
+  /**
+   * @generated from field: optional string version = 2;
+   */
+  version?: string | undefined;
+
+  /**
+   * @generated from field: string minimum_version = 3;
+   */
+  minimumVersion: string;
+};
+
+/**
+ * Describes the message joko.v1.ExtensionSourceGitPreflight.
+ * Use `create(ExtensionSourceGitPreflightSchema)` to create a new message.
+ */
+export const ExtensionSourceGitPreflightSchema: GenMessage<ExtensionSourceGitPreflight> = /*@__PURE__*/
+  messageDesc(file_joko_v1_extension, 8);
 
 /**
  * @generated from message joko.v1.ExtensionToolDescriptor
@@ -117,7 +344,7 @@ export type ExtensionToolDescriptor = Message<"joko.v1.ExtensionToolDescriptor">
  * Use `create(ExtensionToolDescriptorSchema)` to create a new message.
  */
 export const ExtensionToolDescriptorSchema: GenMessage<ExtensionToolDescriptor> = /*@__PURE__*/
-  messageDesc(file_joko_v1_extension, 3);
+  messageDesc(file_joko_v1_extension, 9);
 
 /**
  * @generated from message joko.v1.ExtensionPermissionDescriptor
@@ -154,7 +381,7 @@ export type ExtensionPermissionDescriptor = Message<"joko.v1.ExtensionPermission
  * Use `create(ExtensionPermissionDescriptorSchema)` to create a new message.
  */
 export const ExtensionPermissionDescriptorSchema: GenMessage<ExtensionPermissionDescriptor> = /*@__PURE__*/
-  messageDesc(file_joko_v1_extension, 4);
+  messageDesc(file_joko_v1_extension, 10);
 
 /**
  * @generated from message joko.v1.ExtensionCommandDescriptor
@@ -181,7 +408,7 @@ export type ExtensionCommandDescriptor = Message<"joko.v1.ExtensionCommandDescri
  * Use `create(ExtensionCommandDescriptorSchema)` to create a new message.
  */
 export const ExtensionCommandDescriptorSchema: GenMessage<ExtensionCommandDescriptor> = /*@__PURE__*/
-  messageDesc(file_joko_v1_extension, 5);
+  messageDesc(file_joko_v1_extension, 11);
 
 /**
  * @generated from message joko.v1.ExtensionSetupFieldDescriptor
@@ -228,7 +455,7 @@ export type ExtensionSetupFieldDescriptor = Message<"joko.v1.ExtensionSetupField
  * Use `create(ExtensionSetupFieldDescriptorSchema)` to create a new message.
  */
 export const ExtensionSetupFieldDescriptorSchema: GenMessage<ExtensionSetupFieldDescriptor> = /*@__PURE__*/
-  messageDesc(file_joko_v1_extension, 6);
+  messageDesc(file_joko_v1_extension, 12);
 
 /**
  * @generated from message joko.v1.ExtensionSetupDescriptor
@@ -265,7 +492,7 @@ export type ExtensionSetupDescriptor = Message<"joko.v1.ExtensionSetupDescriptor
  * Use `create(ExtensionSetupDescriptorSchema)` to create a new message.
  */
 export const ExtensionSetupDescriptorSchema: GenMessage<ExtensionSetupDescriptor> = /*@__PURE__*/
-  messageDesc(file_joko_v1_extension, 7);
+  messageDesc(file_joko_v1_extension, 13);
 
 /**
  * Generic Extension projection. Executable bytes and secrets are deliberately
@@ -376,7 +603,7 @@ export type ExtensionCatalogEntry = Message<"joko.v1.ExtensionCatalogEntry"> & {
  * Use `create(ExtensionCatalogEntrySchema)` to create a new message.
  */
 export const ExtensionCatalogEntrySchema: GenMessage<ExtensionCatalogEntry> = /*@__PURE__*/
-  messageDesc(file_joko_v1_extension, 8);
+  messageDesc(file_joko_v1_extension, 14);
 
 /**
  * @generated from message joko.v1.ExtensionCatalogSnapshot
@@ -403,7 +630,7 @@ export type ExtensionCatalogSnapshot = Message<"joko.v1.ExtensionCatalogSnapshot
  * Use `create(ExtensionCatalogSnapshotSchema)` to create a new message.
  */
 export const ExtensionCatalogSnapshotSchema: GenMessage<ExtensionCatalogSnapshot> = /*@__PURE__*/
-  messageDesc(file_joko_v1_extension, 9);
+  messageDesc(file_joko_v1_extension, 15);
 
 /**
  * @generated from enum joko.v1.ExtensionCatalogSource
@@ -553,4 +780,56 @@ export enum ExtensionSetupFieldKind {
  */
 export const ExtensionSetupFieldKindSchema: GenEnum<ExtensionSetupFieldKind> = /*@__PURE__*/
   enumDesc(file_joko_v1_extension, 3);
+
+/**
+ * @generated from enum joko.v1.ExtensionSourceKind
+ */
+export enum ExtensionSourceKind {
+  /**
+   * @generated from enum value: EXTENSION_SOURCE_KIND_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: EXTENSION_SOURCE_KIND_LOCAL = 1;
+   */
+  LOCAL = 1,
+
+  /**
+   * @generated from enum value: EXTENSION_SOURCE_KIND_GIT = 2;
+   */
+  GIT = 2,
+}
+
+/**
+ * Describes the enum joko.v1.ExtensionSourceKind.
+ */
+export const ExtensionSourceKindSchema: GenEnum<ExtensionSourceKind> = /*@__PURE__*/
+  enumDesc(file_joko_v1_extension, 4);
+
+/**
+ * @generated from enum joko.v1.ExtensionSourceState
+ */
+export enum ExtensionSourceState {
+  /**
+   * @generated from enum value: EXTENSION_SOURCE_STATE_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: EXTENSION_SOURCE_STATE_READY = 1;
+   */
+  READY = 1,
+
+  /**
+   * @generated from enum value: EXTENSION_SOURCE_STATE_ERROR = 2;
+   */
+  ERROR = 2,
+}
+
+/**
+ * Describes the enum joko.v1.ExtensionSourceState.
+ */
+export const ExtensionSourceStateSchema: GenEnum<ExtensionSourceState> = /*@__PURE__*/
+  enumDesc(file_joko_v1_extension, 5);
 

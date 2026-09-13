@@ -5,6 +5,7 @@ package joko.v1;
 import "google/protobuf/timestamp.proto";
 import "joko/v1/capability.proto";
 import "joko/v1/common.proto";
+import "joko/v1/extension.proto";
 import "joko/v1/interaction.proto";
 import "joko/v1/model.proto";
 import "joko/v1/review.proto";
@@ -202,6 +203,9 @@ message OperationMutation {
     CompleteExtensionSetupMutation complete_extension_setup = 186;
     CancelExtensionSetupMutation cancel_extension_setup = 187;
     RevokeExtensionSetupMutation revoke_extension_setup = 188;
+    AddExtensionSourceMutation add_extension_source = 189;
+    RefreshExtensionSourceMutation refresh_extension_source = 190;
+    RemoveExtensionSourceMutation remove_extension_source = 191;
   }
 }
 
@@ -209,6 +213,21 @@ message SetExtensionEnabledMutation {
   string extension_id = 1;
   bool enabled = 2;
   Revision expected_revision = 3;
+}
+
+message AddExtensionSourceMutation {
+  ExtensionSourceLocation source = 1;
+  Revision expected_catalog_revision = 2;
+}
+
+message RefreshExtensionSourceMutation {
+  string source_id = 1;
+  Revision expected_revision = 2;
+}
+
+message RemoveExtensionSourceMutation {
+  string source_id = 1;
+  Revision expected_revision = 2;
 }
 
 message SetExtensionSidebarVisibleMutation {

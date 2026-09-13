@@ -4,6 +4,7 @@ import type { RuntimeCommand, RuntimeToolDescriptor } from "@joko/core";
 import type { OperationalStore } from "@joko/store";
 
 import type { CredentialKind, CredentialManager } from "./credential-manager.js";
+import type { ExtensionSourceDescriptor } from "./extension-source-manager.js";
 import type { McpServerDescriptor, McpServerInput } from "./mcp-router.js";
 import type { PiResourceDescriptor } from "./resource-manager.js";
 
@@ -55,7 +56,14 @@ export interface ExtensionCatalogDescriptor {
   readonly revision: bigint;
   readonly owner:
     | { readonly kind: "resource"; readonly resourceId: string; readonly discoveredRevision: string; readonly resourceVersion: bigint }
-    | { readonly kind: "mcp"; readonly serverId: string; readonly serverRevision: bigint };
+    | { readonly kind: "mcp"; readonly serverId: string; readonly serverRevision: bigint }
+    | {
+        readonly kind: "source";
+        readonly sourceId: string;
+        readonly sourceRevision: bigint;
+        readonly entryId: string;
+        readonly contentRevision: string;
+      };
   readonly source: ExtensionCatalogSource;
   readonly installed: boolean;
   readonly installState: ExtensionInstallState;
@@ -95,7 +103,14 @@ export interface ExtensionCatalogManagerOptions {
 
 export type ExtensionOwnerBinding =
   | { readonly kind: "resource"; readonly resourceId: string; readonly discoveredRevision: string; readonly resourceVersion: bigint }
-  | { readonly kind: "mcp"; readonly serverId: string; readonly serverRevision: bigint };
+  | { readonly kind: "mcp"; readonly serverId: string; readonly serverRevision: bigint }
+  | {
+      readonly kind: "source";
+      readonly sourceId: string;
+      readonly sourceRevision: bigint;
+      readonly entryId: string;
+      readonly contentRevision: string;
+    };
 
 interface SetupRequirement {
   readonly id: string;
@@ -231,9 +246,13 @@ export class ExtensionCatalogManager {
     this.#initialized = true;
   }
 
-  reconcile(resources: readonly PiResourceDescriptor[], mcpServers: readonly McpServerDescriptor[]): ExtensionCatalogSnapshot {
+  reconcile(
+    resources: readonly PiResourceDescriptor[],
+    mcpServers: readonly McpServerDescriptor[],
+    sources: readonly ExtensionSourceDescriptor[] = []
+  ): ExtensionCatalogSnapshot {
     this.#assertInitialized();
-    const definitions = projectDefinitions(resources, mcpServers);
+    const definitions = projectDefinitions(resources, mcpServers, sources);
     const nextDefinitions = new Map(definitions.map((definition) => [definition.id, definition] as const));
     const previousRecords = new Map(this.#records);
     const previousDefinitions = new Map(this.#definitions);
@@ -660,9 +679,53 @@ export class ExtensionCatalogManager {
 
 function projectDefinitions(
   resources: readonly PiResourceDescriptor[],
-  mcpServers: readonly McpServerDescriptor[]
+  mcpServers: readonly McpServerDescriptor[],
+  sources: readonly ExtensionSourceDescriptor[]
 ): readonly ExtensionDefinition[] {
   const definitions: ExtensionDefinition[] = [];
+  for (const source of sources) {
+    for (const entry of source.entries) {
+      const bindingKey = `resource\0${entry.resourceId}\0${entry.bindingName}\0${entry.bindingOrdinal}`;
+      const authorityIdentity = digest({
+        bindingKey,
+        sourceId: source.id,
+        sourceRevision: source.revision.toString(10),
+        entryId: entry.id,
+        contentRevision: entry.contentRevision
+      });
+      definitions.push({
+        id: extensionId(bindingKey),
+        bindingKey,
+        binding: {
+          kind: "source",
+          sourceId: source.id,
+          sourceRevision: source.revision,
+          entryId: entry.id,
+          contentRevision: entry.contentRevision
+        },
+        source: "market",
+        installed: false,
+        installState: source.state === "error" ? "error" : "available",
+        name: entry.name,
+        ...(entry.version === undefined ? {} : { version: entry.version }),
+        ...(entry.author === undefined ? {} : { author: entry.author }),
+        description: entry.description,
+        enabled: false,
+        sidebarSupported: false,
+        tools: [],
+        permissions: [],
+        setupRequirements: [],
+        authorityIdentity,
+        projectionIdentity: digest({
+          authorityIdentity,
+          sourceState: source.state,
+          sourceContentRevision: source.contentRevision,
+          error: source.error
+        }),
+        ...(source.error === undefined ? {} : { error: source.error })
+      });
+    }
+  }
   for (const resource of resources) {
     if (resource.state === "removed") continue;
     const extensionDetails = resource.kind === "extension"
@@ -741,7 +804,11 @@ function projectDefinitions(
     }
   }
   for (const server of mcpServers) definitions.push(mcpDefinition(server));
-  return definitions.sort((left, right) => left.bindingKey.localeCompare(right.bindingKey, "en"));
+  // A deterministic Resource ID is reserved while an entry is source-owned.
+  // Once the Resource intent exists, its later definition wins the same
+  // binding/Extension ID without retaining two catalog rows.
+  return [...new Map(definitions.map((definition) => [definition.id, definition] as const)).values()]
+    .sort((left, right) => left.bindingKey.localeCompare(right.bindingKey, "en"));
 }
 
 export function extensionMcpInput(descriptor: McpServerDescriptor, enabled: boolean): McpServerInput {

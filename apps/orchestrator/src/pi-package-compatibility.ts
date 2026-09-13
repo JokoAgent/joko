@@ -102,6 +102,21 @@ export interface PiPackageInspection {
   readonly compatibilityNotice: boolean;
 }
 
+/** Bounded, non-executing package metadata used by the Extension Source
+ * catalog. It intentionally does not grant Resource approval or inspect
+ * runtime code; the Resource owner repeats its own byte inspection when a
+ * user later adopts the package. */
+export interface PiPackageCatalogInspection {
+  readonly name: string;
+  readonly version?: string;
+  readonly author?: string;
+  readonly description: string;
+  readonly extensions: readonly {
+    readonly relativePath: string;
+    readonly resourceName: string;
+  }[];
+}
+
 const ADAPTED_APIS = new Set<PiExtensionUiApi>([
   "select",
   "confirm",
@@ -380,6 +395,35 @@ export async function inspectPiPackageCompatibility(
       disabledLifecycleScripts: []
     });
   }
+}
+
+export async function inspectPiPackageCatalog(packagePath: string): Promise<PiPackageCatalogInspection> {
+  const source = await canonicalRegularPath(packagePath, undefined, "Package path");
+  if (!(await lstat(source)).isDirectory()) throw new Error("Catalog packages must be directories.");
+  const tree = await enumeratePackageTree(source);
+  const manifestEntry = tree.entries.find((entry) => !entry.directory && entry.relativePath === "package.json");
+  const manifest = manifestEntry === undefined ? {} : await readPackageManifest(manifestEntry.path, source);
+  const piManifest = plainObject(manifest.pi) ? manifest.pi : undefined;
+  const extensionRoots = await packageResourcePaths(tree, piManifest, "extensions");
+  const extensions = collectExtensionFiles(tree, extensionRoots).map((entry) => ({
+    relativePath: toPosix(relative(source, entry)),
+    resourceName: boundedDisplay(basename(entry))
+  }));
+  if (extensions.length === 0) throw new Error("Catalog package does not expose a Pi extension.");
+  const rawAuthor = typeof manifest.author === "string"
+    ? manifest.author
+    : plainObject(manifest.author) && typeof manifest.author.name === "string"
+      ? manifest.author.name
+      : undefined;
+  return {
+    name: boundedDisplay(typeof manifest.name === "string" && manifest.name.trim() !== "" ? manifest.name : basename(source)),
+    ...(typeof manifest.version === "string" && manifest.version.trim() !== ""
+      ? { version: boundedDisplay(manifest.version, 128) }
+      : {}),
+    ...(rawAuthor === undefined || rawAuthor.trim() === "" ? {} : { author: boundedDisplay(rawAuthor, 256) }),
+    description: typeof manifest.description === "string" ? boundedDisplay(manifest.description, 2_048) : "",
+    extensions
+  };
 }
 
 export async function inspectPiResourceCompatibility(
