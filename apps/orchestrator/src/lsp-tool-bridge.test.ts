@@ -87,6 +87,15 @@ describe("LspToolBridgeProvider", () => {
     expect(eligible.detectProject).toHaveBeenCalledWith(eligible.workspaceRoot);
   });
 
+  it("never advertises or executes against a remote Target's local placeholder path", async () => {
+    const remote = providerFixture({ remote: true });
+    expect(remote.provider.includeForTarget("target-trusted")).toBe(false);
+    expect(remote.detectProject).not.toHaveBeenCalled();
+    expect(await remote.provider.callTool("outline", { file: "src/main.ts" }, undefined, context))
+      .toMatchObject({ isError: true, structuredContent: { ok: false, error: { code: "WORKSPACE_UNSAFE" } } });
+    expect(remote.call).not.toHaveBeenCalled();
+  });
+
   it("maps all direct tools to package actions and injects only the authenticated workspace root", async () => {
     const signal = new AbortController().signal;
     const value = providerFixture();
@@ -318,6 +327,7 @@ function providerFixture(options: {
   readonly response?: LspBridgeResponse;
   readonly enabled?: boolean | undefined;
   readonly detected?: boolean;
+  readonly remote?: boolean;
 } = {}) {
   const workspaceRoot = "D:/authenticated-workspace";
   const response = options.response;
@@ -331,9 +341,14 @@ function providerFixture(options: {
   }));
   const resolveAuthenticated = vi.fn(async () => ({
     workspaceRoot,
-    trusted: options.trusted ?? true
+    trusted: options.trusted ?? true,
+    ...(options.remote === true ? { remote: true } : {})
   }));
-  const resolveSnapshot = vi.fn(() => ({ workspaceRoot, trusted: options.trusted ?? true }));
+  const resolveSnapshot = vi.fn(() => ({
+    workspaceRoot,
+    trusted: options.trusted ?? true,
+    ...(options.remote === true ? { remote: true } : {})
+  }));
   const resolver: LspToolTargetResolver = {
     resolveSnapshot,
     resolveAuthenticated

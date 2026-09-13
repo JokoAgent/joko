@@ -106,6 +106,88 @@ describe("TerminalService authority and volatile transport", () => {
     expect(f.store.health().revision).toBe(before.revision);
     expect(f.store.health().globalCursor).toBe(before.globalCursor);
   });
+
+  it("allows many observers but only the current control view can write or resize", async () => {
+    const f = await fixture();
+    const created = await f.service.createTerminal(create(contract.CreateTerminalRequestSchema, {
+      sessionId: "task",
+      requestId: "unique-control-view",
+      initialPalette: palette
+    }), f.context);
+    const terminal = created.terminal!;
+    const reference = { sessionId: "task", terminalId: terminal.id, generation: terminal.generation };
+    const first = await claimControlView(f, terminal, "first-view");
+    const second = await claimControlView(f, terminal, "second-view");
+
+    await expect(f.service.writeTerminal(create(contract.WriteTerminalRequestSchema, {
+      ...reference, writerId: first.viewId, inputSequence: 1n, data: "stale controller"
+    }), f.context)).rejects.toMatchObject({ code: Code.FailedPrecondition });
+    await expect(f.service.resizeTerminal(create(contract.ResizeTerminalRequestSchema, {
+      ...reference, viewId: first.viewId, columns: 90, rows: 30
+    }), f.context)).rejects.toMatchObject({ code: Code.FailedPrecondition });
+    await f.service.writeTerminal(create(contract.WriteTerminalRequestSchema, {
+      ...reference, writerId: second.viewId, inputSequence: 1n, data: "current controller"
+    }), f.context);
+    await f.service.resizeTerminal(create(contract.ResizeTerminalRequestSchema, {
+      ...reference, viewId: second.viewId, columns: 91, rows: 31
+    }), f.context);
+    expect(f.ptys[0]!.write).toHaveBeenCalledExactlyOnceWith("current controller");
+    expect(f.ptys[0]!.resize).toHaveBeenCalledExactlyOnceWith(91, 31);
+
+    await second.close();
+    await expect(f.service.writeTerminal(create(contract.WriteTerminalRequestSchema, {
+      ...reference, writerId: first.viewId, inputSequence: 1n, data: "no implicit takeover"
+    }), f.context)).rejects.toMatchObject({ code: Code.FailedPrecondition });
+    const current = await f.service.getTerminal(create(contract.GetTerminalRequestSchema, reference), f.context);
+    const reclaimed = await f.service.updateTerminalAppearance(create(contract.UpdateTerminalAppearanceRequestSchema, {
+      ...reference,
+      appearance: { viewId: first.viewId, viewRevision: 3n, palette },
+      claimFocus: true,
+      expectedAppearanceRevision: current.appearanceRevision
+    }), f.context);
+    expect(reclaimed).toMatchObject({ accepted: true, ownsDefaults: true });
+    await f.service.writeTerminal(create(contract.WriteTerminalRequestSchema, {
+      ...reference, writerId: first.viewId, inputSequence: 1n, data: "explicit takeover"
+    }), f.context);
+    expect(f.ptys[0]!.write).toHaveBeenLastCalledWith("explicit takeover");
+  });
+
+  it("blocks terminal mutations while a portable task replacement is quiescing but still permits observation and close", async () => {
+    let replacementPending = false;
+    const f = await fixture({ isSessionMutationBlocked: () => replacementPending });
+    const created = await f.service.createTerminal(create(contract.CreateTerminalRequestSchema, {
+      sessionId: "task",
+      requestId: "portable-replacement-fence",
+      initialPalette: palette
+    }), f.context);
+    const terminal = created.terminal!;
+    const reference = { sessionId: "task", terminalId: terminal.id, generation: terminal.generation };
+    const control = await claimControlView(f, terminal, "replacement-view");
+    replacementPending = true;
+
+    expect(await f.service.getTerminalCapabilities(create(contract.GetTerminalCapabilitiesRequestSchema, {
+      sessionId: "task"
+    }), f.context)).toMatchObject({ support: contract.CapabilitySupport.DISABLED_BY_POLICY });
+    await expect(f.service.writeTerminal(create(contract.WriteTerminalRequestSchema, {
+      ...reference,
+      writerId: control.viewId,
+      inputSequence: 1n,
+      data: "must not reach the process"
+    }), f.context)).rejects.toMatchObject({ code: Code.FailedPrecondition });
+    await expect(f.service.resizeTerminal(create(contract.ResizeTerminalRequestSchema, {
+      ...reference,
+      viewId: control.viewId,
+      columns: 90,
+      rows: 30
+    }), f.context)).rejects.toMatchObject({ code: Code.FailedPrecondition });
+    expect((await f.service.getTerminal(create(contract.GetTerminalRequestSchema, reference), f.context)).terminal)
+      .toMatchObject({ id: terminal.id, status: contract.TerminalStatus.RUNNING });
+    await f.service.closeTerminal(create(contract.CloseTerminalRequestSchema, reference), f.context);
+    expect(f.ptys[0]!.write).not.toHaveBeenCalled();
+    expect(f.ptys[0]!.resize).not.toHaveBeenCalled();
+    expect(f.ptys[0]!.kill).toHaveBeenCalledOnce();
+  });
+
   it("allows a confirmed cancelled start to retry the same request identity", async () => {
     const f = await fixture();
     const request = create(contract.CreateTerminalRequestSchema, { initialPalette: palette, sessionId: "task", requestId: "cancelled-start" });
@@ -124,13 +206,17 @@ describe("TerminalService authority and volatile transport", () => {
     expect(f.spawn).toHaveBeenCalledOnce();
     await expect(f.service.createTerminal(create(contract.CreateTerminalRequestSchema, { ...request, columns: 90 }), f.context)).rejects.toMatchObject({ code: Code.AlreadyExists });
     const terminal = first.terminal!;
+    const control = await claimControlView(f, terminal, "view");
     await f.service.resizeTerminal(create(contract.ResizeTerminalRequestSchema, { sessionId: "task", terminalId: terminal.id,
-      generation: terminal.generation, columns: 92, rows: 28 }), f.context);
+      generation: terminal.generation, viewId: control.viewId, columns: 92, rows: 28 }), f.context);
     expect((await f.service.createTerminal(request, f.context)).terminal).toMatchObject({ columns: 92, rows: 28 });
     const input = create(contract.WriteTerminalRequestSchema, { sessionId: "task", terminalId: terminal.id, generation: terminal.generation,
       writerId: "view", inputSequence: 1n, data: "private pasted command\r" });
     const acknowledgements = await Promise.all([f.service.writeTerminal(input, f.context), f.service.writeTerminal(input, f.context)]);
     expect(acknowledgements).toMatchObject([{ nextInputSequence: 2n }, { nextInputSequence: 2n }]);
+    expect(f.ptys[0]!.write).toHaveBeenCalledTimes(1);
+    await expect(f.service.writeTerminal(create(contract.WriteTerminalRequestSchema, { ...input, data: "different private input" }), f.context))
+      .rejects.toMatchObject({ code: Code.AlreadyExists });
     expect(f.ptys[0]!.write).toHaveBeenCalledTimes(1);
     await expect(f.service.writeTerminal(create(contract.WriteTerminalRequestSchema, { ...input, inputSequence: 3n }), f.context)).rejects.toMatchObject({ code: Code.FailedPrecondition });
     await f.provider.kill({ ...f.scope, id: terminal.id!, generation: Number(terminal.generation) });
@@ -149,7 +235,8 @@ describe("TerminalService authority and volatile transport", () => {
     const created = await f.service.createTerminal(create(contract.CreateTerminalRequestSchema, { initialPalette: palette, sessionId: "task", requestId: "queued" }), f.context);
     let acknowledge!: () => void;
     f.ptys[0]!.write.mockImplementationOnce(async () => { await new Promise<void>((done) => { acknowledge = done; }); });
-    const base = { sessionId: "task", terminalId: created.terminal!.id, generation: created.terminal!.generation, writerId: "queued-view" };
+    const control = await claimControlView(f, created.terminal!, "queued-view");
+    const base = { sessionId: "task", terminalId: created.terminal!.id, generation: created.terminal!.generation, writerId: control.viewId };
     const first = f.service.writeTerminal(create(contract.WriteTerminalRequestSchema, { ...base, inputSequence: 1n, data: "first" }), f.context);
     const second = f.service.writeTerminal(create(contract.WriteTerminalRequestSchema, { ...base, inputSequence: 2n, data: "second" }), f.context);
     const outcomes = Promise.allSettled([first, second]);
@@ -160,6 +247,7 @@ describe("TerminalService authority and volatile transport", () => {
       { status: "rejected", reason: { code: Code.Unauthenticated } },
       { status: "rejected", reason: { code: Code.Unauthenticated } }
     ]);
+    await control.close();
     expect(f.ptys[0]!.write).toHaveBeenCalledOnce();
     expect(f.listeners.size).toBe(0);
   });
@@ -190,7 +278,8 @@ describe("TerminalService authority and volatile transport", () => {
     const f = await fixture();
     const created = await f.service.createTerminal(create(contract.CreateTerminalRequestSchema, { initialPalette: palette, sessionId: "task", requestId: "queued-resize" }), f.context);
     const reference = { sessionId: "task", terminalId: created.terminal!.id, generation: created.terminal!.generation };
-    const request = create(contract.ResizeTerminalRequestSchema, { ...reference, columns: 92, rows: 28 });
+    const control = await claimControlView(f, created.terminal!, "resize-view");
+    const request = create(contract.ResizeTerminalRequestSchema, { ...reference, viewId: control.viewId, columns: 92, rows: 28 });
     let finishResize!: () => void;
     f.ptys[0]!.resize.mockImplementationOnce(() => new Promise<void>((resolve) => { finishResize = resolve; }));
     const first = f.service.resizeTerminal(request, f.context);
@@ -239,6 +328,17 @@ describe("TerminalService authority and volatile transport", () => {
       policy: "review_read_only", sourceLeaseFencingToken: 1n, revision: 1n, createdAt: 1, updatedAt: 1 });
     await expect(f.service.createTerminal(create(contract.CreateTerminalRequestSchema, { initialPalette: palette, sessionId: "task", requestId: "read-only" }), f.context)).rejects.toMatchObject({ code: Code.PermissionDenied });
     policy.mockRestore();
+    const scheduleDeletion = vi.spyOn(f.store, "findPendingScheduleDeletionCleanupForSession")
+      .mockReturnValue({} as never);
+    expect(await f.service.getTerminalCapabilities(create(contract.GetTerminalCapabilitiesRequestSchema, {
+      sessionId: "task"
+    }), f.context)).toMatchObject({ support: contract.CapabilitySupport.DISABLED_BY_POLICY });
+    await expect(f.service.createTerminal(create(contract.CreateTerminalRequestSchema, {
+      initialPalette: palette,
+      sessionId: "task",
+      requestId: "schedule-closing"
+    }), f.context)).rejects.toMatchObject({ code: Code.FailedPrecondition });
+    scheduleDeletion.mockRestore();
     f.store.prepareSessionLifecycleCleanup({ sessionId: "task", operationId: "closing", disposition: "archive" });
     await expect(f.service.createTerminal(create(contract.CreateTerminalRequestSchema, { initialPalette: palette, sessionId: "task", requestId: "closing" }), f.context)).rejects.toMatchObject({ code: Code.FailedPrecondition });
     expect(f.spawn).toHaveBeenCalledOnce();
@@ -247,9 +347,10 @@ describe("TerminalService authority and volatile transport", () => {
   it("does not retry uncertain input and closes a process whose workspace authority changes while creating", async () => {
     const f = await fixture();
     const created = await f.service.createTerminal(create(contract.CreateTerminalRequestSchema, { initialPalette: palette, sessionId: "task", requestId: "uncertain" }), f.context);
+    const control = await claimControlView(f, created.terminal!, "uncertain-view");
     f.ptys[0]!.write.mockImplementation(() => { throw new Error("native error with private contents"); });
     const input = create(contract.WriteTerminalRequestSchema, { sessionId: "task", terminalId: created.terminal!.id,
-      generation: created.terminal!.generation, writerId: "uncertain-view", inputSequence: 1n, data: "private" });
+      generation: created.terminal!.generation, writerId: control.viewId, inputSequence: 1n, data: "private" });
     await expect(f.service.writeTerminal(input, f.context)).rejects.toMatchObject({ code: Code.FailedPrecondition });
     await expect(f.service.writeTerminal(input, f.context)).rejects.toMatchObject({ code: Code.FailedPrecondition });
     expect(f.ptys[0]!.write).toHaveBeenCalledTimes(1);
@@ -276,7 +377,45 @@ class FakePty implements TerminalPty {
   exit(event: Parameters<Parameters<TerminalPty["onExit"]>[0]>[0]) { for (const listener of this.exitListeners) listener(event); }
 }
 
-async function fixture(options: Pick<TerminalProviderOptions, "resolveRemoteRuntime"> = {}) {
+async function claimControlView(
+  fixtureValue: Awaited<ReturnType<typeof fixture>>,
+  terminal: { readonly id?: string; readonly generation?: bigint },
+  viewId: string
+) {
+  if (terminal.id === undefined || terminal.id === "" || terminal.generation === undefined) {
+    throw new Error("Terminal control view requires a current terminal identity.");
+  }
+  const controller = new AbortController();
+  const context = { signal: controller.signal } as HandlerContext;
+  const reference = { sessionId: "task", terminalId: terminal.id, generation: terminal.generation };
+  const initialAppearance = { viewId, viewRevision: 1n, palette };
+  const stream = fixtureValue.service.watchTerminal(create(contract.WatchTerminalRequestSchema, {
+    ...reference,
+    appearance: initialAppearance
+  }), context)[Symbol.asyncIterator]();
+  const first = await stream.next();
+  if (first.done || first.value === undefined) throw new Error("Terminal control view did not receive its initial checkpoint.");
+  const claim = await fixtureValue.service.updateTerminalAppearance(create(contract.UpdateTerminalAppearanceRequestSchema, {
+    ...reference,
+    appearance: { ...initialAppearance, viewRevision: 2n },
+    claimFocus: true,
+    expectedAppearanceRevision: first.value.appearanceRevision
+  }), fixtureValue.context);
+  if (!claim.accepted || !claim.ownsDefaults) throw new Error("Terminal control view was not admitted.");
+  let closed = false;
+  const close = async (): Promise<void> => {
+    if (closed) return;
+    closed = true;
+    controller.abort();
+    await stream.return?.();
+  };
+  cleanups.push(close);
+  return { viewId, stream, close };
+}
+
+async function fixture(options: Pick<TerminalProviderOptions, "resolveRemoteRuntime"> & {
+  readonly isSessionMutationBlocked?: (sessionId: string) => boolean;
+} = {}) {
   const root = await mkdtemp(join(tmpdir(), "joko-terminal-service-"));
   const store = new OperationalStore(join(root, "store.db"));
   store.upsertBackend({ id: "test-backend", displayName: "Test backend", version: "test", health: "healthy", adapterKind: "fixture",
@@ -286,13 +425,15 @@ async function fixture(options: Pick<TerminalProviderOptions, "resolveRemoteRunt
     pinned: false, archived: false, permissionMode: "ask", planMode: false, fastMode: false, createdAt: 1, updatedAt: 1 });
   const ptys: FakePty[] = [];
   const spawn = vi.fn<NonNullable<ConstructorParameters<typeof TerminalProvider>[0]>["spawn"] & {}>(() => { const pty = new FakePty(); ptys.push(pty); return pty; });
-  const provider = new TerminalProvider({ ...options, spawn, shells: async () => [{ id: "test-shell", label: "Test shell", executable: process.execPath, args: [], isDefault: true }] });
+  const { isSessionMutationBlocked, ...providerOptions } = options;
+  const provider = new TerminalProvider({ ...providerOptions, spawn, shells: async () => [{ id: "test-shell", label: "Test shell", executable: process.execPath, args: [], isDefault: true }] });
   const listeners = new Set<() => void>();
   let authorized = true;
   let effectiveRoot = root;
   const service = createTerminalConnectService({ terminals: provider, store, effectiveTarget: () => ({ workspaceRoot: effectiveRoot }),
     authenticate: (context) => { if (!authorized) throw new ConnectError("Connection revoked.", Code.Unauthenticated); return { id: (context as HandlerContext & { connectionId?: string }).connectionId ?? "connection" }; },
-    onRevoked: (_id, listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; } });
+    onRevoked: (_id, listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
+    ...(isSessionMutationBlocked === undefined ? {} : { isSessionMutationBlocked }) });
   cleanups.push(async () => { await provider.dispose(); store.close(); await rm(root, { recursive: true, force: true }); });
   return { root, store, ptys, spawn, provider, service, listeners, scope: { sessionId: "task", targetId: "target", workspaceRoot: root },
     context: { signal: new AbortController().signal } as HandlerContext,

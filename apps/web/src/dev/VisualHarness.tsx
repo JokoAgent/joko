@@ -235,6 +235,9 @@ export function VisualHarness(): JSX.Element {
       disconnectRemoteHost: remoteHosts.disconnectRemoteHost,
       testRemoteHostConnection: remoteHosts.testRemoteHostConnection,
       clearRemoteHostTrust: remoteHosts.clearRemoteHostTrust,
+      probeRemoteBackendRuntime: remoteHosts.probeRemoteBackendRuntime,
+      installRemoteBackendRuntime: remoteHosts.installRemoteBackendRuntime,
+      uninstallRemoteBackendRuntime: remoteHosts.uninstallRemoteBackendRuntime,
       saveCredential: scenario.scenario === "providers" ? providerActions.saveCredential : remoteHosts.saveCredential,
       saveProvider: providerActions.saveProvider,
       updateTarget: remoteHosts.updateTarget,
@@ -1429,6 +1432,22 @@ export function VisualHarness(): JSX.Element {
           description: output.description,
           mediaType: "text/plain",
           byteSize: utf8Length(output.text)
+        }));
+      },
+      listArtifactReferenceCatalog: async (targetSessionId, targetGeneration, signal) => {
+        signal?.throwIfAborted();
+        const target = state.snapshot.sessions.find((session) => session.id === targetSessionId);
+        if (!scenario.artifact || target?.generation !== targetGeneration || targetSessionId !== "session-1") return [];
+        return VISUAL_ARTIFACT_OUTPUTS.map((output) => ({
+          id: output.id,
+          blobId: output.id,
+          kind: "file" as const,
+          title: "report.txt",
+          fileName: "report.txt",
+          description: output.description,
+          mediaType: "text/plain",
+          byteSize: utf8Length(output.text),
+          sourceSessionId: "session-1"
         }));
       },
       readSessionArtifact: async (sessionId: string, artifactId: string, signal: AbortSignal): Promise<ArtifactView> => {

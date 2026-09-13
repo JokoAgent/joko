@@ -3,12 +3,52 @@ import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { StdioJsonRpcTransport } from "./transport.js";
+import { StdioJsonRpcTransport, type JsonRpcRecordChannelHandlers } from "./transport.js";
 import { AppServerHost } from "./host.js";
+import { TransportFault } from "./errors.js";
 
 const fixture = fileURLToPath(new URL("./fixtures/fake-app-server.mjs", import.meta.url));
 
 describe("StdioJsonRpcTransport", () => {
+  it("keeps the bounded JSON-RPC engine authoritative over an alternate record channel", async () => {
+    let handlers: JsonRpcRecordChannelHandlers | undefined;
+    let running = false;
+    const writes: string[] = [];
+    const channel = {
+      get running() { return running; },
+      async start(next: JsonRpcRecordChannelHandlers) { handlers = next; running = true; },
+      async write(record: Buffer) {
+        writes.push(record.toString("utf8"));
+        const request = JSON.parse(record.toString("utf8")) as { readonly id: number; readonly method: string };
+        if (request.method === "disconnect") {
+          running = false;
+          await handlers?.onExit(new TransportFault("process_exited", "fixture channel exited.", { stateMayHaveChanged: true }));
+          return;
+        }
+        handlers?.onData(`${JSON.stringify({ id: request.id, result: { method: request.method } })}\n`);
+      },
+      async close() { running = false; }
+    };
+    const transport = new StdioJsonRpcTransport({ channelFactory: () => channel });
+    await transport.start({ onNotification: () => undefined, onRequest: () => undefined, onExit: () => undefined });
+    await expect(transport.request("read", {})).resolves.toEqual({ method: "read" });
+    await expect(transport.request("disconnect", {}, { mutation: true })).rejects.toMatchObject({
+      code: "process_exited",
+      stateMayHaveChanged: true
+    });
+    expect(writes).toHaveLength(2);
+    expect(writes.every((record) => record.endsWith("\n"))).toBe(true);
+    await transport.close();
+    expect(running).toBe(false);
+  });
+
+  it("does not mix an alternate record channel with local process authority", () => {
+    expect(() => new StdioJsonRpcTransport({
+      channelFactory: () => ({ running: false, start: async () => undefined, write: async () => undefined, close: async () => undefined }),
+      command: process.execPath
+    })).toThrow(TypeError);
+  });
+
   it.each(["cancel", "timeout", "stale"] as const)("does not write a queued mutation after %s while the prior write is blocked", async (boundary) => {
     const transport = new StdioJsonRpcTransport({ command: process.execPath, args: [fixture], requestTimeoutMs: 2_000 });
     const cancellation = new AbortController();

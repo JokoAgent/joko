@@ -1,12 +1,13 @@
 import type { AppController } from "../controller.js";
 import { ConnectError, Code } from "@connectrpc/connect";
-import type { RemoteHostCapabilitiesView, RemoteHostDraft, RemoteHostView, TargetView, SshKeyView } from "../model.js";
+import type { RemoteBackendRuntimeInstallEventView, RemoteBackendRuntimeView, RemoteHostCapabilitiesView, RemoteHostDraft, RemoteHostView, TargetView, SshKeyView } from "../model.js";
 
 /** Memory-only settings fixture. No SSH process, credential upload, or network requests. */
 export class VisualRemoteHostFixture {
   readonly #targets: Map<string, TargetView>;
   readonly #hosts = new Map<string, Map<string, RemoteHostView>>();
   readonly #listeners = new Map<string, Set<() => void>>();
+  readonly #runtimeInstalled = new Map<string, boolean>();
   readonly #onTarget: (target: TargetView) => void;
   readonly #keys = new Map<string, SshKeyView>([
     ["visual-work-key", { id: "visual-work-key", name: "id_ed25519", algorithm: "ssh-ed25519", comment: "Development workstation", sha256Fingerprint: "SHA256:WYm7qEkjBWvfSQHJZxtzUKNbTtGtBoSTCBPtmsZfKVU", modifiedAt: 1_783_000_000_000, inAgent: true }],
@@ -24,7 +25,7 @@ export class VisualRemoteHostFixture {
     }]]));
   }
 
-  getRemoteHostCapabilities = async (): Promise<RemoteHostCapabilitiesView> => ({ catalog: true, management: true, connectionControl: true, connectionTest: true, trustReset: true, commandExecution: false, processStreaming: true, fileTransfer: true, tcpForwarding: false });
+  getRemoteHostCapabilities = async (): Promise<RemoteHostCapabilitiesView> => ({ catalog: true, management: true, connectionControl: true, connectionTest: true, trustReset: true, commandExecution: false, processStreaming: true, fileTransfer: true, tcpForwarding: false, backendRuntimeSetup: true });
   listRemoteHosts = async (targetId: string): Promise<readonly RemoteHostView[]> => [...this.catalog(targetId).values()];
   watchRemoteHosts = async function* (this: VisualRemoteHostFixture, targetId: string, signal?: AbortSignal): AsyncGenerator<readonly RemoteHostView[]> {
     const listeners = this.#listeners.get(targetId) ?? new Set(); this.#listeners.set(targetId, listeners);
@@ -55,6 +56,37 @@ export class VisualRemoteHostFixture {
   disconnectRemoteHost = async (targetId: string, hostId: string, revision: bigint): Promise<RemoteHostView> => this.change(targetId, hostId, revision, host => ({ ...host, status: { state: "disconnected", changedAt: 1 } }));
   testRemoteHostConnection = async (targetId: string, hostId: string, revision: bigint): Promise<RemoteHostView> => this.requireHost(targetId, hostId, revision);
   clearRemoteHostTrust = async (targetId: string, hostId: string, revision: bigint): Promise<RemoteHostView> => this.change(targetId, hostId, revision, host => ({ ...host, trust: undefined }));
+  probeRemoteBackendRuntime: AppController["probeRemoteBackendRuntime"] = async (targetId, hostId, targetRevision, hostRevision, signal) => {
+    await Promise.resolve(); signal?.throwIfAborted();
+    return this.runtime(targetId, hostId, targetRevision, hostRevision);
+  };
+  installRemoteBackendRuntime: AppController["installRemoteBackendRuntime"] = async function* (
+    this: VisualRemoteHostFixture,
+    targetId: string,
+    hostId: string,
+    targetRevision: bigint,
+    hostRevision: bigint,
+    _reinstall: boolean,
+    signal?: AbortSignal
+  ): AsyncGenerator<RemoteBackendRuntimeInstallEventView> {
+    const requestId = `visual-runtime-${targetId}-${hostId}`;
+    const phases = ["probing", "downloading", "installing", "validating"] as const;
+    let sequence = 0n;
+    for (const phase of phases) {
+      signal?.throwIfAborted();
+      sequence += 1n;
+      yield { requestId, sequence, phase, runtime: { ...this.runtime(targetId, hostId, targetRevision, hostRevision), state: phase === "probing" ? "probing" : "installing", canInstall: false, canReinstall: false, canUninstall: false }, observedAt: Date.now() };
+      await Promise.resolve();
+    }
+    this.#runtimeInstalled.set(`${targetId}\0${hostId}`, true);
+    sequence += 1n;
+    yield { requestId, sequence, phase: "complete", runtime: this.runtime(targetId, hostId, targetRevision, hostRevision), observedAt: Date.now() };
+  }.bind(this);
+  uninstallRemoteBackendRuntime: AppController["uninstallRemoteBackendRuntime"] = async (targetId, hostId, targetRevision, hostRevision) => {
+    this.runtime(targetId, hostId, targetRevision, hostRevision);
+    this.#runtimeInstalled.set(`${targetId}\0${hostId}`, false);
+    return this.runtime(targetId, hostId, targetRevision, hostRevision);
+  };
   saveCredential: AppController["saveCredential"] = async () => { throw new Error("The visual fixture accepts no private keys."); };
   listSshKeys: AppController["listSshKeys"] = async (signal) => {
     await Promise.resolve(); signal.throwIfAborted();
@@ -95,6 +127,19 @@ export class VisualRemoteHostFixture {
 
   private catalog(targetId: string): Map<string, RemoteHostView> {
     const hosts = this.#hosts.get(targetId); if (hosts === undefined) throw new Error("The project does not exist."); return hosts;
+  }
+  private runtime(targetId: string, hostId: string, targetRevision: bigint, hostRevision: bigint): RemoteBackendRuntimeView {
+    const target = this.#targets.get(targetId);
+    const host = this.requireHost(targetId, hostId, hostRevision);
+    if (target === undefined || target.revision !== targetRevision || host.status.state !== "ready" || host.trust === undefined) throw new Error("The runtime authority changed.");
+    const installed = this.#runtimeInstalled.get(`${targetId}\0${hostId}`) ?? true;
+    return {
+      targetId, hostId, displayName: "Agent runtime", expectedVersion: "0.153.4",
+      ...(installed ? { installedVersion: "0.153.4" } : {}),
+      state: installed ? "ready" : "notInstalled",
+      canInstall: !installed, canReinstall: installed, canUninstall: installed,
+      observedAt: Date.now(), targetRevision, hostRevision
+    };
   }
   private requireKey(id: string, fingerprint: string): SshKeyView {
     const key = this.#keys.get(id);

@@ -35,6 +35,7 @@ async function inspectClaudeSessionRuntimeAssets(runtimeArgument: string, depend
   const runtimeEntry = await regularFile(adapterRoot, resolve(adapterRoot, "dist/sdk-runtime.js"));
   const ownerEntry = await regularFile(adapterRoot, resolve(adapterRoot, "dist/session-sdk-owner.js"));
   const workerEntry = await regularFile(adapterRoot, resolve(adapterRoot, "dist/session-sdk-worker.mjs"));
+  const managerEntry = await regularFile(adapterRoot, resolve(adapterRoot, "dist/remote-manager/manager.mjs"));
   const sdkRoot = resolve(runtimeRoot, "node_modules/@anthropic-ai/claude-agent-sdk");
   const sdkManifest = JSON.parse(await readFile(await regularFile(sdkRoot, resolve(sdkRoot, "package.json")), "utf8")) as {
     name?: string; version?: string; main?: string;
@@ -45,10 +46,10 @@ async function inspectClaudeSessionRuntimeAssets(runtimeArgument: string, depend
   // Resolve from the actual Worker location, just as its dynamic import does.
   const sdkEntry = await regularFile(sdkRoot, createRequire(workerEntry).resolve("@anthropic-ai/claude-agent-sdk"));
   if (!samePath(sdkEntry, resolve(sdkRoot, sdkManifest.main))) throw new Error("The Session SDK resolved an unexpected entry.");
-  const assets = await Promise.all([runtimeEntry, ownerEntry, workerEntry, sdkEntry].map(async (path) => ({
+  const assets = await Promise.all([runtimeEntry, ownerEntry, workerEntry, managerEntry, sdkEntry].map(async (path) => ({
     path, sha256: createHash("sha256").update(await readFile(path)).digest("hex")
   })));
-  return { runtimeRoot, runtimeEntry, ownerEntry, workerEntry, sdkEntry, version: sdkManifest.version, assets };
+  return { runtimeRoot, runtimeEntry, ownerEntry, workerEntry, managerEntry, sdkEntry, version: sdkManifest.version, assets };
 
   function samePath(left: string, right: string) {
     return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right;

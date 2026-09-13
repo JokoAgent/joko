@@ -14,6 +14,11 @@ import { OperationalStore } from "@joko/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { toProtoRevision } from "./proto-mapper.js";
+import type {
+  RemoteBackendRuntimeInstallEvent,
+  RemoteBackendRuntimeSetupManager,
+  RemoteBackendRuntimeSnapshot
+} from "./remote-backend-runtime-setup.js";
 import { createRemoteHostConnectService } from "./remote-host-connect-service.js";
 import {
   RemoteHostRegistry,
@@ -276,6 +281,127 @@ describe("RemoteHostService", () => {
     await expect(iterator.next()).resolves.toMatchObject({ done: true });
   });
 
+  it("projects remote runtime setup capability and preserves exact Target and Host revisions across its stream", async () => {
+    const fixture = createFixture();
+    const hostRecord = fixture.registry.create({
+      targetId: "target-a",
+      id: "build-box",
+      hostname: "build.example.test",
+      user: "maker",
+      source: "manual"
+    });
+    const targetRevision = fixture.store.getTarget("target-a").revision;
+    const notInstalled = runtimeSnapshot(targetRevision, hostRecord.revision, "not_installed");
+    const ready = runtimeSnapshot(targetRevision, hostRecord.revision, "ready");
+    const probe = vi.fn(async () => notInstalled);
+    const install = vi.fn((_input, _signal): AsyncIterable<RemoteBackendRuntimeInstallEvent> => ({
+      async *[Symbol.asyncIterator]() {
+        yield {
+          requestId: "install-runtime",
+          sequence: 1n,
+          phase: "downloading",
+          runtime: { ...notInstalled, state: "installing", canInstall: false },
+          observedAt: fixture.now()
+        };
+        yield {
+          requestId: "install-runtime",
+          sequence: 2n,
+          phase: "complete",
+          runtime: ready,
+          observedAt: fixture.now()
+        };
+      }
+    }));
+    const uninstall = vi.fn(async () => notInstalled);
+    const runtimeSetup = {
+      supportsTarget: vi.fn(() => true),
+      probe,
+      install,
+      uninstall
+    } as unknown as RemoteBackendRuntimeSetupManager;
+    const service = createRemoteHostConnectService(
+      fixture.registry,
+      () => ({ connectionId: "connection-runtime" }),
+      undefined,
+      fixture.now,
+      runtimeSetup
+    );
+
+    const capabilities = await service.getRemoteHostCapabilities(
+      create(contract.GetRemoteHostCapabilitiesRequestSchema, { targetId: "target-a" }),
+      context()
+    );
+    expect(capabilities.capabilities).toContainEqual(expect.objectContaining({
+      kind: contract.RemoteHostCapabilityKind.BACKEND_RUNTIME_SETUP,
+      name: contract.capabilityNames.remoteHostBackendRuntimeSetup,
+      support: contract.CapabilitySupport.SUPPORTED
+    }));
+
+    const probeSignal = new AbortController().signal;
+    const probed = await service.probeRemoteBackendRuntime(create(contract.ProbeRemoteBackendRuntimeRequestSchema, {
+      targetId: "target-a",
+      hostId: "build-box",
+      expectedTargetRevision: toProtoRevision(targetRevision),
+      expectedHostRevision: toProtoRevision(hostRecord.revision)
+    }), context(probeSignal));
+    expect(probe).toHaveBeenCalledWith({
+      targetId: "target-a",
+      hostId: "build-box",
+      expectedTargetRevision: targetRevision,
+      expectedHostRevision: hostRecord.revision
+    }, probeSignal);
+    expect(probed.runtime).toMatchObject({
+      targetId: "target-a",
+      hostId: "build-box",
+      state: contract.RemoteBackendRuntimeState.NOT_INSTALLED,
+      expectedVersion: "0.153.4"
+    });
+
+    const installSignal = new AbortController().signal;
+    const streamed: Array<{
+      readonly sequence?: bigint;
+      readonly phase?: contract.RemoteBackendRuntimeInstallPhase;
+      readonly runtime?: { readonly state?: contract.RemoteBackendRuntimeState };
+    }> = [];
+    for await (const event of service.installRemoteBackendRuntime(create(contract.InstallRemoteBackendRuntimeRequestSchema, {
+      requestId: "install-runtime",
+      targetId: "target-a",
+      hostId: "build-box",
+      expectedTargetRevision: toProtoRevision(targetRevision),
+      expectedHostRevision: toProtoRevision(hostRecord.revision),
+      reinstall: false
+    }), context(installSignal))) streamed.push(event);
+    expect(install).toHaveBeenCalledWith({
+      requestId: "install-runtime",
+      targetId: "target-a",
+      hostId: "build-box",
+      expectedTargetRevision: targetRevision,
+      expectedHostRevision: hostRecord.revision,
+      reinstall: false
+    }, installSignal);
+    expect(streamed.map((event) => [event.sequence, event.phase, event.runtime?.state])).toEqual([
+      [1n, contract.RemoteBackendRuntimeInstallPhase.DOWNLOADING, contract.RemoteBackendRuntimeState.INSTALLING],
+      [2n, contract.RemoteBackendRuntimeInstallPhase.COMPLETE, contract.RemoteBackendRuntimeState.READY]
+    ]);
+
+    const uninstalled = await service.uninstallRemoteBackendRuntime(create(contract.UninstallRemoteBackendRuntimeRequestSchema, {
+      requestId: "uninstall-runtime",
+      targetId: "target-a",
+      hostId: "build-box",
+      expectedTargetRevision: toProtoRevision(targetRevision),
+      expectedHostRevision: toProtoRevision(hostRecord.revision)
+    }), context());
+    expect(uninstall).toHaveBeenCalledWith({
+      requestId: "uninstall-runtime",
+      targetId: "target-a",
+      hostId: "build-box",
+      expectedTargetRevision: targetRevision,
+      expectedHostRevision: hostRecord.revision
+    });
+    expect(uninstalled.runtime?.state).toBe(contract.RemoteBackendRuntimeState.NOT_INSTALLED);
+    expect(safeJson({ probed, streamed, uninstalled })).not.toContain("backendId");
+  });
+
   it("advertises connector absence independently and fails closed when the service is unavailable", async () => {
     const fixture = createFixture();
     const service = createRemoteHostConnectService(
@@ -418,4 +544,26 @@ function safeJson(value: unknown): string {
   return JSON.stringify(value, (_key, entry: unknown) =>
     typeof entry === "bigint" ? entry.toString() : entry
   );
+}
+
+function runtimeSnapshot(
+  targetRevision: bigint,
+  hostRevision: bigint,
+  state: "not_installed" | "ready"
+): RemoteBackendRuntimeSnapshot {
+  const ready = state === "ready";
+  return {
+    targetId: "target-a",
+    hostId: "build-box",
+    displayName: "Codex",
+    expectedVersion: "0.153.4",
+    ...(ready ? { installedVersion: "0.153.4" } : {}),
+    state,
+    canInstall: !ready,
+    canReinstall: ready,
+    canUninstall: ready,
+    observedAt: 10_001,
+    targetRevision,
+    hostRevision
+  };
 }

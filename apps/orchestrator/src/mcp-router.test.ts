@@ -1769,6 +1769,10 @@ describe("McpRouter", () => {
       toolName: "echo"
     })).resolves.toMatchObject({ isError: false });
     bridge.revoke();
+    const expired = router.createPiBridgeSnapshot({ endpoint: "http://127.0.0.1:4318/internal/mcp" });
+    now = expired.expiresAt + 1;
+    expect(() => expired.assertCurrent()).toThrow(/revoked or expired/iu);
+    expect(() => expired.renew()).toThrow(/revoked or expired/iu);
     await router.dispose();
     store.close();
   });
@@ -1877,6 +1881,50 @@ describe("McpRouter", () => {
       serverId: "joko_browser",
       toolName: "list_tools"
     })).rejects.toThrow(/credential/u);
+    await router.dispose();
+    store.close();
+  });
+
+  it("suppresses a service-owned bridge result when its provider generation changes in flight", async () => {
+    const { store, router } = await fixture();
+    const started = deferred<void>();
+    const finish = deferred<void>();
+    let generation = 3;
+    router.registerBridgeToolProvider({
+      id: "joko_generation_fence",
+      get generation() { return generation; },
+      available: true,
+      tools: [{
+        serverId: "joko_generation_fence",
+        name: "wait",
+        description: "Wait for a generation change",
+        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+        requiresPermission: false
+      }],
+      async callTool() {
+        started.resolve();
+        await finish.promise;
+        return { content: [{ type: "text", text: "stale result" }], isError: false };
+      }
+    });
+    const bridge = router.createPiBridgeSnapshot({
+      endpoint: "http://127.0.0.1:4318/internal/mcp",
+      sessionId: "session-1",
+      targetId: "target-1",
+      expectedPiGeneration: 1
+    });
+    const call = router.executeBridgeCall({
+      ...bridgeScope(1),
+      authorization: `Bearer ${bridge.mcpBridge.token}`,
+      generation: 1,
+      serverId: "joko_generation_fence",
+      toolName: "wait"
+    });
+    await started.promise;
+    generation = 4;
+    finish.resolve();
+    expect(await call).toMatchObject({ isError: true, content: [] });
+    bridge.revoke();
     await router.dispose();
     store.close();
   });

@@ -30,16 +30,30 @@ describe("interactive terminal product chain", () => {
     expect(registered).toMatchObject({ kind: TerminalUpdateKind.RESET, activeColorOverrides: "" });
     const focused = await paired.clients.terminal.updateTerminalAppearance({ ...reference, appearance: { ...appearance, viewRevision: 2n, palette: { ...appearance.palette, foregroundRgb: 0x123456 } }, claimFocus: true, expectedAppearanceRevision: registered.appearanceRevision });
     expect(focused).toMatchObject({ accepted: true, ownsDefaults: true, acceptedViewRevision: 2n });
-    await paired.clients.terminal.writeTerminal({ ...reference, writerId: randomUUID(), inputSequence: 1n, data: "query-color" });
+    await paired.clients.terminal.writeTerminal({ ...reference, writerId: appearance.viewId, inputSequence: 1n, data: "query-color" });
     const expectedColor = Buffer.from("\x1b]10;rgb:1212/3434/5656\x1b\\").toString("hex");
     await waitFor(async () => (await paired.clients.terminal.getTerminal(reference)).serialized.includes("COLOR:" + expectedColor), (ready) => ready, "focused terminal color query");
     disconnected.abort();
     await stream.return?.();
     await fixture.application.sessionHost.close(sessionId);
     expect((await paired.clients.terminal.listTerminals({ sessionId })).terminals).toHaveLength(1);
-    await paired.clients.terminal.writeTerminal({ ...reference, writerId: randomUUID(), inputSequence: 1n, data: "private terminal input" });
+    const inputAbort = new AbortController();
+    const inputAppearance = { viewId: randomUUID(), viewRevision: 1n, palette: appearance.palette };
+    const inputStream = paired.clients.terminal.watchTerminal({ ...reference, appearance: inputAppearance }, { signal: inputAbort.signal })[Symbol.asyncIterator]();
+    const inputRegistered = (await inputStream.next()).value!;
+    expect(inputRegistered).toMatchObject({ kind: TerminalUpdateKind.RESET, terminal: { status: TerminalStatus.RUNNING } });
+    const inputFocused = await paired.clients.terminal.updateTerminalAppearance({
+      ...reference,
+      appearance: { ...inputAppearance, viewRevision: 2n },
+      claimFocus: true,
+      expectedAppearanceRevision: inputRegistered.appearanceRevision
+    });
+    expect(inputFocused).toMatchObject({ accepted: true, ownsDefaults: true, acceptedViewRevision: 2n });
+    await paired.clients.terminal.writeTerminal({ ...reference, writerId: inputAppearance.viewId, inputSequence: 1n, data: "private terminal input" });
     let serialized = "";
     await waitFor(async () => { serialized = (await paired.clients.terminal.getTerminal(reference)).serialized; return serialized.includes("INPUT:private terminal input"); }, (ready) => ready, "terminal echo");
+    inputAbort.abort();
+    await inputStream.return?.();
     expect(serialized).toContain("TTY:true:true");
     const activity = await paired.clients.event.getRuntimeActivity({});
     expect(activity.summary?.blockingKinds).toContain(RuntimeActivityKind.USER_SHELL);

@@ -173,10 +173,17 @@ describe("isolated Orchestrator runtime staging", () => {
       version: "0.3.259",
       electronVersion: "39.2.7",
       workerEntry: inspected.workerEntry,
-      assets: expect.arrayContaining([{
-        path: inspected.workerEntry,
-        sha256: createHash("sha256").update(readFileSync(inspected.workerEntry)).digest("hex")
-      }]),
+      managerEntry: inspected.managerEntry,
+      assets: expect.arrayContaining([
+        {
+          path: inspected.workerEntry,
+          sha256: createHash("sha256").update(readFileSync(inspected.workerEntry)).digest("hex")
+        },
+        {
+          path: inspected.managerEntry,
+          sha256: createHash("sha256").update(readFileSync(inspected.managerEntry)).digest("hex")
+        }
+      ]),
       missingSession: true,
       workerRetired: true,
       isolatedProfileUnchanged: true

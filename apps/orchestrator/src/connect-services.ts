@@ -292,6 +292,7 @@ import type { ManagedModelRuntimeController } from "./managed-model-runtime-cont
 import { PortableSessionPackageError } from "./portable-session-package.js";
 import { PortableSessionExportTooLargeError } from "./portable-session-transfer.js";
 import type { RemoteHostRegistry } from "./remote-host-registry.js";
+import type { RemoteBackendRuntimeSetupManager } from "./remote-backend-runtime-setup.js";
 import { createVoiceInputConnectService } from "./voice-input-connect-service.js";
 import type { VoiceInputCoordinator } from "./voice-input-coordinator.js";
 import {
@@ -376,6 +377,7 @@ interface ConnectServiceDependencies {
   readonly sessionNavigation?: SessionNavigationCoordinator;
   readonly reviewCoordinator?: ReviewCoordinator;
   readonly remoteHosts?: RemoteHostRegistry;
+  readonly remoteBackendRuntimeSetup?: RemoteBackendRuntimeSetupManager;
   readonly sshKeys?: OrchestratorApplication["sshKeys"];
   readonly terminals?: TerminalProvider;
   readonly voiceInput?: VoiceInputCoordinator;
@@ -905,6 +907,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
     ...(application.sessionNavigation === undefined ? {} : { sessionNavigation: application.sessionNavigation }),
     ...(application.reviewCoordinator === undefined ? {} : { reviewCoordinator: application.reviewCoordinator }),
     ...(application.remoteHosts === undefined ? {} : { remoteHosts: application.remoteHosts }),
+    ...(application.remoteBackendRuntimeSetup === undefined ? {} : { remoteBackendRuntimeSetup: application.remoteBackendRuntimeSetup }),
     ...(application.sshKeys === undefined ? {} : { sshKeys: application.sshKeys }),
     ...(application.terminals === undefined ? {} : { terminals: application.terminals }),
     ...(application.voiceInput === undefined ? {} : { voiceInput: application.voiceInput }),
@@ -973,6 +976,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
     ...(dependencies.sessionWorktrees === undefined ? {} : { effectiveTarget: (session) => dependencies.sessionWorktrees!.effectiveTarget(session) }),
     authenticate,
     onRevoked: (connectionId, listener) => dependencies.connections.onRevoked(connectionId, listener),
+    isSessionMutationBlocked: (sessionId) => dependencies.sessionHost.isSessionTerminalMutationBlocked(sessionId),
     ...(application.registerServiceCleanup === undefined ? {} : { registerCleanup: (cleanup) => application.registerServiceCleanup!(cleanup) })
   });
   const sshKey = createSshKeyConnectService({
@@ -986,7 +990,8 @@ export function createConnectServices(application: OrchestratorApplication): Con
     dependencies.remoteHosts,
     (context) => ({ connectionId: authenticate(context).id }),
     (connectionId, listener) => dependencies.connections.onRevoked(connectionId, listener),
-    now
+    now,
+    dependencies.remoteBackendRuntimeSetup
   );
   const voiceInput = createVoiceInputConnectService(dependencies.voiceInput, dependencies.voiceInputSettings, (context) => ({
     connectionId: authenticate(context).id
@@ -3873,7 +3878,7 @@ function scheduleDeletionOperationOutcome(
 }
 
 async function cleanupScheduleGeneratedSessions(
-  dependencies: Pick<ConnectServiceDependencies, "store" | "sessionHost" | "sessionWorktrees" | "gitSafety">,
+  dependencies: Pick<ConnectServiceDependencies, "store" | "sessionHost" | "sessionWorktrees" | "gitSafety" | "terminals">,
   manifest: ScheduleDeletionCleanupRecord
 ): Promise<{
   readonly completedSessionIds: readonly string[];
@@ -3895,11 +3900,12 @@ async function cleanupScheduleGeneratedSessions(
     try {
       const worktree = session.descriptor.worktree;
       await dependencies.sessionHost.prepareDestructiveSessionClose(sessionId);
+      await dependencies.sessionHost.closeIfActive(sessionId);
+      // A terminal is a Session-owned process even though it is deliberately
+      // independent from the Backend runtime. Its exit must be confirmed before
+      // an isolated workspace can be archived or released.
+      await dependencies.terminals?.closeSession(sessionId);
       if (manifest.disposition === "delete") {
-        // A generated task can still own a live adapter runtime even without
-        // an isolated workspace. Match ordinary task deletion by fencing that
-        // runtime before any durable tombstone is committed.
-        await dependencies.sessionHost.closeIfActive(sessionId);
         let cleanupError: unknown;
         if (worktree !== undefined) {
           if (dependencies.sessionWorktrees === undefined) {
@@ -3921,10 +3927,6 @@ async function cleanupScheduleGeneratedSessions(
         }
         if (cleanupError !== undefined) throw cleanupError;
       } else {
-        // Archiving is also an input/runtime fence. A task without a worktree,
-        // or one whose worktree is already preserved, may still own a live
-        // native runtime and must be closed before the durable archive bit.
-        await dependencies.sessionHost.closeIfActive(sessionId);
         if (worktree?.state === "active") {
           if (dependencies.sessionWorktrees === undefined) {
             throw new Error("Isolated workspace cleanup is unavailable.");
@@ -3944,7 +3946,7 @@ async function cleanupScheduleGeneratedSessions(
 }
 
 async function cleanupScheduleGeneratedSessionsWithRetry(
-  dependencies: Pick<ConnectServiceDependencies, "store" | "sessionHost" | "sessionWorktrees" | "gitSafety">,
+  dependencies: Pick<ConnectServiceDependencies, "store" | "sessionHost" | "sessionWorktrees" | "gitSafety" | "terminals">,
   manifest: ScheduleDeletionCleanupRecord,
   maximumAttempts = 1
 ): Promise<{

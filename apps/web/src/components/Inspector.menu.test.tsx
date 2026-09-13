@@ -4,6 +4,24 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
+const sortableMock = vi.hoisted(() => {
+  class MockSortable {
+    static active: MockSortable | null = null;
+    static readonly instances: MockSortable[] = [];
+    readonly destroy = vi.fn();
+    readonly option = vi.fn();
+    constructor(readonly element: HTMLElement, readonly options: Record<string, unknown>) {}
+    static create(element: HTMLElement, options: Record<string, unknown>): MockSortable {
+      const instance = new MockSortable(element, options);
+      MockSortable.instances.push(instance);
+      return instance;
+    }
+  }
+  return { MockSortable };
+});
+
+vi.mock("sortablejs", () => ({ default: sortableMock.MockSortable }));
+
 import type { AppController } from "../controller.js";
 import { translate } from "../i18n.js";
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
@@ -25,9 +43,52 @@ afterEach(async () => {
   document.body.replaceChildren();
   window.localStorage.clear();
   document.documentElement.style.removeProperty("--inspector-width");
+  sortableMock.MockSortable.instances.length = 0;
+  sortableMock.MockSortable.active = null;
 });
 
 describe("Inspector menus", () => {
+  it("uses the touch-capable sortable owner and commits tab order back through React", async () => {
+    const host = document.body.appendChild(document.createElement("div"));
+    const root = createRoot(host);
+    roots.push(root);
+    const controller = {
+      state: { preferences: DEFAULT_UI_PREFERENCES },
+      releaseArtifactUrl: vi.fn()
+    } as unknown as AppController;
+    await act(async () => root.render(<Inspector
+      controller={controller}
+      snapshot={emptySnapshot()}
+      session={session()}
+      timeline={[]}
+      open
+      t={t}
+      runAction={(_key, action) => { void action(); }}
+      onClose={vi.fn()}
+      onSelectionQuote={vi.fn()}
+    />));
+    await act(async () => host.querySelector<HTMLButtonElement>(`button[aria-label="${t("inspector.addTab")}"]`)!.click());
+    await act(async () => [...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+      .find((button) => button.textContent === t("nav.tools"))!.click());
+    await settle();
+
+    const sortable = sortableMock.MockSortable.instances[0]!;
+    expect(sortable.options).toMatchObject({ forceFallback: true, fallbackTolerance: 4 });
+    expect(sortable.options.filter).toContain(".inspector-tab__close");
+    const moved = sortable.element.children[0] as HTMLElement;
+    sortable.element.append(moved);
+    await act(async () => (sortable.options.onEnd as (event: Record<string, unknown>) => void)({
+      item: moved,
+      from: sortable.element,
+      oldIndex: 0,
+      newIndex: 1
+    }));
+    expect([...host.querySelectorAll<HTMLButtonElement>('[role="tab"]')].map((tab) => tab.id)).toEqual([
+      "inspector-tab-tools",
+      "inspector-tab-context"
+    ]);
+  });
+
   it("observes existing terminals while creation is unavailable and selects the session's automatic shell without changing the saved preference", async () => {
     const colors = vi.spyOn(window, "getComputedStyle").mockReturnValue({ getPropertyValue: () => "#123456" } as unknown as CSSStyleDeclaration);
     writeTerminalShellPreference("powershell-local");

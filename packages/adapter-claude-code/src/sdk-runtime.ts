@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import type { TargetDescriptor } from "@joko/core";
 import { SessionSdkOwner } from "./session-sdk-owner.js";
 import {
   DurableProcessOwner,
@@ -246,6 +247,24 @@ export interface ClaudeSdkRuntime {
   closeSessionOperations(): Promise<void>;
   /** Confirm hard retirement of every exact local CLI process still owned by this runtime. */
   retireOwnedProcesses?(timeoutMs: number): Promise<void>;
+}
+
+/**
+ * Exact runtime authority for one Target. Remote implementations bind every
+ * SDK operation to one captured Host/SSH generation and expose the canonical
+ * workspace proved by that same capture.
+ */
+export interface ClaudeTargetRuntime {
+  readonly runtime: ClaudeSdkRuntime;
+  readonly workspaceRoot: string;
+  readonly remote: boolean;
+  assertCurrent(): void;
+}
+
+/** Adapter-owned resolver for Target-scoped remote Claude runtimes. */
+export interface ClaudeRemoteRuntimePort {
+  resolve(target: TargetDescriptor, signal?: AbortSignal): Promise<ClaudeTargetRuntime>;
+  close(): Promise<void>;
 }
 
 export interface ClaudeSdkForkOptions {

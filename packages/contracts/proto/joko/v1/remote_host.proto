@@ -117,6 +117,14 @@ service RemoteHostService {
   rpc DisconnectRemoteHost(DisconnectRemoteHostRequest) returns (DisconnectRemoteHostResponse);
   rpc TestRemoteHostConnection(TestRemoteHostConnectionRequest) returns (TestRemoteHostConnectionResponse);
   rpc ClearRemoteHostTrust(ClearRemoteHostTrustRequest) returns (ClearRemoteHostTrustResponse);
+  // Runtime identity is derived from target_id. Clients cannot select a
+  // Backend implementation or a remote filesystem location.
+  rpc ProbeRemoteBackendRuntime(ProbeRemoteBackendRuntimeRequest) returns (ProbeRemoteBackendRuntimeResponse);
+  // The service owns the mutation after admission. A disconnected observer
+  // may attach again with the same request_id, while a different mutation for
+  // the same Target/Host is rejected until the first one reaches a terminal phase.
+  rpc InstallRemoteBackendRuntime(InstallRemoteBackendRuntimeRequest) returns (stream InstallRemoteBackendRuntimeResponse);
+  rpc UninstallRemoteBackendRuntime(UninstallRemoteBackendRuntimeRequest) returns (UninstallRemoteBackendRuntimeResponse);
 }
 
 // Catalog and management remain usable when a connector is unavailable. This
@@ -132,6 +140,7 @@ enum RemoteHostCapabilityKind {
   REMOTE_HOST_CAPABILITY_KIND_PROCESS_STREAMING = 7;
   REMOTE_HOST_CAPABILITY_KIND_FILE_TRANSFER = 8;
   REMOTE_HOST_CAPABILITY_KIND_TCP_FORWARDING = 9;
+  REMOTE_HOST_CAPABILITY_KIND_BACKEND_RUNTIME_SETUP = 10;
 }
 
 message RemoteHostCapabilityDescriptor {
@@ -390,4 +399,102 @@ message ClearRemoteHostTrustRequest {
 
 message ClearRemoteHostTrustResponse {
   RemoteHost host = 1;
+}
+
+enum RemoteBackendRuntimeState {
+  REMOTE_BACKEND_RUNTIME_STATE_UNSPECIFIED = 0;
+  REMOTE_BACKEND_RUNTIME_STATE_PROBING = 1;
+  REMOTE_BACKEND_RUNTIME_STATE_NOT_INSTALLED = 2;
+  REMOTE_BACKEND_RUNTIME_STATE_INSTALLING = 3;
+  REMOTE_BACKEND_RUNTIME_STATE_READY = 4;
+  REMOTE_BACKEND_RUNTIME_STATE_FAILED = 5;
+  // A remote effect may have completed after its SSH authority disappeared.
+  // A fresh read-only probe is the only valid recovery path.
+  REMOTE_BACKEND_RUNTIME_STATE_OUTCOME_UNKNOWN = 6;
+}
+
+enum RemoteBackendRuntimeFailureCode {
+  REMOTE_BACKEND_RUNTIME_FAILURE_CODE_UNSPECIFIED = 0;
+  REMOTE_BACKEND_RUNTIME_FAILURE_CODE_ABORTED = 1;
+  REMOTE_BACKEND_RUNTIME_FAILURE_CODE_AUTHORITY_CHANGED = 2;
+  REMOTE_BACKEND_RUNTIME_FAILURE_CODE_HOST_NOT_READY = 3;
+  REMOTE_BACKEND_RUNTIME_FAILURE_CODE_NOT_SUPPORTED = 4;
+  REMOTE_BACKEND_RUNTIME_FAILURE_CODE_PROBE_FAILED = 5;
+  REMOTE_BACKEND_RUNTIME_FAILURE_CODE_INSTALL_FAILED = 6;
+  REMOTE_BACKEND_RUNTIME_FAILURE_CODE_UNINSTALL_FAILED = 7;
+  REMOTE_BACKEND_RUNTIME_FAILURE_CODE_BUSY = 8;
+}
+
+message RemoteBackendRuntimeFailure {
+  RemoteBackendRuntimeFailureCode code = 1;
+  bool retryable = 2;
+}
+
+// Capability-neutral projection of the one Backend runtime derived from a
+// Target. It deliberately excludes commands, paths, logs and credentials.
+message RemoteBackendRuntime {
+  string target_id = 1;
+  string host_id = 2;
+  string display_name = 3;
+  string expected_version = 4;
+  optional string installed_version = 5;
+  RemoteBackendRuntimeState state = 6;
+  bool can_install = 7;
+  bool can_reinstall = 8;
+  bool can_uninstall = 9;
+  RemoteBackendRuntimeFailure failure = 10;
+  google.protobuf.Timestamp observed_at = 11;
+  Revision target_revision = 12;
+  Revision host_revision = 13;
+}
+
+message ProbeRemoteBackendRuntimeRequest {
+  string target_id = 1;
+  string host_id = 2;
+  Revision expected_target_revision = 3;
+  Revision expected_host_revision = 4;
+}
+
+message ProbeRemoteBackendRuntimeResponse {
+  RemoteBackendRuntime runtime = 1;
+}
+
+enum RemoteBackendRuntimeInstallPhase {
+  REMOTE_BACKEND_RUNTIME_INSTALL_PHASE_UNSPECIFIED = 0;
+  REMOTE_BACKEND_RUNTIME_INSTALL_PHASE_PROBING = 1;
+  REMOTE_BACKEND_RUNTIME_INSTALL_PHASE_DOWNLOADING = 2;
+  REMOTE_BACKEND_RUNTIME_INSTALL_PHASE_INSTALLING = 3;
+  REMOTE_BACKEND_RUNTIME_INSTALL_PHASE_VALIDATING = 4;
+  REMOTE_BACKEND_RUNTIME_INSTALL_PHASE_COMPLETE = 5;
+  REMOTE_BACKEND_RUNTIME_INSTALL_PHASE_FAILED = 6;
+  REMOTE_BACKEND_RUNTIME_INSTALL_PHASE_OUTCOME_UNKNOWN = 7;
+}
+
+message InstallRemoteBackendRuntimeRequest {
+  string request_id = 1;
+  string target_id = 2;
+  string host_id = 3;
+  Revision expected_target_revision = 4;
+  Revision expected_host_revision = 5;
+  bool reinstall = 6;
+}
+
+message InstallRemoteBackendRuntimeResponse {
+  string request_id = 1;
+  uint64 sequence = 2;
+  RemoteBackendRuntimeInstallPhase phase = 3;
+  RemoteBackendRuntime runtime = 4;
+  google.protobuf.Timestamp observed_at = 5;
+}
+
+message UninstallRemoteBackendRuntimeRequest {
+  string request_id = 1;
+  string target_id = 2;
+  string host_id = 3;
+  Revision expected_target_revision = 4;
+  Revision expected_host_revision = 5;
+}
+
+message UninstallRemoteBackendRuntimeResponse {
+  RemoteBackendRuntime runtime = 1;
 }

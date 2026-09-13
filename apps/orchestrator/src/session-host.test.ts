@@ -8,7 +8,11 @@ import { PassThrough, Writable } from "node:stream";
 
 import { create } from "@bufbuild/protobuf";
 import { createPiAdapter, type PiProcessHandle, type PiProcessSpec } from "@joko/adapter-pi";
-import { AppServerHost as CodexAppServerHost, CodexBackendAdapter } from "@joko/adapter-codex";
+import {
+  AppServerHost as CodexAppServerHost,
+  CodexBackendAdapter,
+  type CodexRemoteMcpOpenInput
+} from "@joko/adapter-codex";
 import { FakeCodexAppServer } from "@joko/adapter-codex/testing";
 import * as contract from "@joko/contracts";
 import {
@@ -2774,7 +2778,13 @@ describe("SessionHost", () => {
 
   it("imports a portable task exactly once, rejects duplicates, and replaces only when explicit", async () => {
     const adapter = new PortableFakeAdapter();
-    const fixture = await createFixture(adapter);
+    const cleanupOrder: string[] = [];
+    let terminalCleanupFails = false;
+    const closeSessionTerminals = vi.fn(async (_sessionId: string) => {
+      cleanupOrder.push("terminal");
+      if (terminalCleanupFails) throw new Error("terminal cleanup outcome unknown");
+    });
+    const fixture = await createFixture(adapter, { closeSessionTerminals });
     const sourceSessionId = (await fixture.host.createSession({
       operationId: "create-portable-import-source",
       connection: fixture.connection,
@@ -2911,6 +2921,22 @@ describe("SessionHost", () => {
       operationId: "import-portable-task-duplicate"
     })).rejects.toMatchObject({ publicError: { code: "PORTABLE_SESSION_IMPORT_CONFLICT" } });
 
+    terminalCleanupFails = true;
+    await expect(fixture.host.importPortableSession({
+      ...request,
+      operationId: "import-portable-task-terminal-cleanup-unknown",
+      overwrite: true
+    })).rejects.toBeInstanceOf(OperationPreviouslyFailedError);
+    expect(fixture.store.getSession(imported.value.sessionId).descriptor.deletedAt).toBeUndefined();
+    expect(adapter.importedNativeText).toHaveLength(1);
+
+    terminalCleanupFails = false;
+    cleanupOrder.length = 0;
+    const deleteNative = adapter.deleteSession.bind(adapter);
+    vi.spyOn(adapter, "deleteSession").mockImplementation(async (...args) => {
+      cleanupOrder.push("native");
+      await deleteNative(...args);
+    });
     const replacement = await fixture.host.importPortableSession({
       ...request,
       operationId: "import-portable-task-replacement",
@@ -2921,6 +2947,8 @@ describe("SessionHost", () => {
     expect(fixture.store.getSession(imported.value.sessionId).descriptor.deletedAt).toEqual(expect.any(Number));
     expect(fixture.store.getSession(replacement.value.sessionId).descriptor.title).toBe("Replaced portable task");
     expect(adapter.importedNativeText).toHaveLength(2);
+    expect(closeSessionTerminals).toHaveBeenLastCalledWith(imported.value.sessionId);
+    expect(cleanupOrder).toEqual(["terminal", "native"]);
   });
 
   it("rejects a product-only portable import before creating a disabled model route", async () => {
@@ -9758,6 +9786,180 @@ describe("SessionHost", () => {
     await eventually(() => store.getRun(child!.descriptor.id).descriptor.state === "completed");
   });
 
+  it("reconciles remote Codex text acceptance and terminal receipts with the durable Queue, Run, Attempt, and Operation", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "joko-remote-codex-dispatch-host-"));
+    const store = new OperationalStore(join(directory, "store.db"));
+    const repository = new OperationalArtifactRepository(store);
+    const artifacts = new ArtifactStore({
+      rootDirectory: join(directory, "artifacts"),
+      repository,
+      ingestRoots: [directory]
+    });
+    await artifacts.initialize();
+    const localFake = new FakeCodexAppServer();
+    const remoteFake = new FakeCodexAppServer();
+    const localNativeHost = new CodexAppServerHost({ transportFactory: () => localFake.createTransport() });
+    const remoteNativeHost = new CodexAppServerHost({ transportFactory: () => remoteFake.createTransport() });
+    let authorityCurrent = true;
+    let remoteMcpInput: CodexRemoteMcpOpenInput | undefined;
+    let remoteMcpRetired = false;
+    const releaseRemoteMcp = vi.fn(async () => { remoteMcpRetired = true; });
+    const adapter = new CodexBackendAdapter({
+      id: "codex-remote-mounted",
+      instanceGeneration: 7,
+      host: localNativeHost,
+      profileDirectory: directory,
+      remoteRuntimes: {
+        resolve: async () => ({
+          host: remoteNativeHost,
+          workspaceRoot: "/srv/joko-project",
+          profileKey: "b".repeat(64),
+          executionDomain: "ssh-codex-mounted-fixture",
+          assertCurrent: () => { if (!authorityCurrent) throw new Error("remote authority changed"); },
+          openMcpBridge: async (input) => {
+            remoteMcpInput = input;
+            return {
+              routes: [{
+                serverId: "product-tools",
+                name: "joko_product_tools_fixture",
+                url: "http://127.0.0.1:4317/private-product-tools"
+              }],
+              assertCurrent: () => {
+                if (remoteMcpRetired) throw new Error("remote MCP route retired");
+                input.assertSessionCurrent();
+              },
+              release: releaseRemoteMcp
+            };
+          }
+        }),
+        shutdown: async () => remoteNativeHost.shutdown(),
+        forceShutdown: async () => remoteNativeHost.forceShutdown()
+      }
+    });
+    const descriptor = await adapter.describe();
+    const host = new SessionHost(store, artifacts, [adapter], { backendDescriptors: [descriptor] });
+    cleanups.push(async () => {
+      authorityCurrent = false;
+      await host.dispose().catch(() => undefined);
+      await adapter.dispose().catch(() => undefined);
+      await localNativeHost.shutdown().catch(() => undefined);
+      await remoteNativeHost.shutdown().catch(() => undefined);
+      store.close();
+      rmSync(directory, { recursive: true, force: true });
+    });
+    await host.initialize();
+    const target = {
+      id: "codex-remote-target",
+      backendId: adapter.id,
+      displayName: "Remote Codex target",
+      workspaceRoot: directory,
+      managed: false,
+      trusted: true,
+      remoteWorkspace: { hostId: "remote-host", workspaceRoot: "/srv/joko-project" }
+    } as const;
+    await host.registerTarget(target);
+    const nativeSessionId = remoteFake.seedThread(target.remoteWorkspace.workspaceRoot);
+    const nativeReference = (await adapter.listNativeSessions(target))[0]!.nativeReference;
+    const connection = store.createConnection({
+      id: "codex-remote-connection",
+      name: "Remote Codex device",
+      authKeyDigest: "digest"
+    });
+    const sessionId = (await host.createSession({
+      operationId: "create-remote-codex-attachment",
+      connection,
+      targetId: target.id,
+      title: "Remote Codex task",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false,
+      nativeStart: { kind: "attach", nativeReference }
+    })).value.sessionId;
+    expect(remoteMcpInput).toBeDefined();
+    expect(remoteFake.transport!.requests.findLast((candidate) => candidate.method === "thread/resume")?.params)
+      .toMatchObject({
+        threadId: nativeSessionId,
+        cwd: "/srv/joko-project",
+        config: {
+          "features.apps": false,
+          "features.enable_mcp_apps": false,
+          "features.remote_plugin": false,
+          "mcp_servers.joko_product_tools_fixture.enabled": true,
+          "mcp_servers.joko_product_tools_fixture.url": "http://127.0.0.1:4317/private-product-tools"
+        }
+      });
+    expect(localFake.transport?.requests.some((candidate) =>
+      candidate.method === "thread/resume" || candidate.method === "turn/start"
+    )).toBe(false);
+
+    const observedAdmissions: Array<{
+      readonly operationStatus: string;
+      readonly queueState: string;
+      readonly runState: string;
+      readonly attemptPersisted: boolean;
+    }> = [];
+    const transport = remoteFake.transport!;
+    const request = transport.request.bind(transport);
+    vi.spyOn(transport, "request").mockImplementation((method, params, options) => {
+      if (method === "turn/start") {
+        const operationId = String((params as Record<string, unknown>)["clientUserMessageId"]);
+        const item = store.listQueueItems({ sessionId }).find((candidate) => candidate.operationId === operationId)!;
+        const run = store.getRun(item.runId);
+        observedAdmissions.push({
+          operationStatus: store.getOperation(operationId).status,
+          queueState: item.state,
+          runState: run.descriptor.state,
+          attemptPersisted: item.attemptId !== undefined && store.getAttempt(item.attemptId).descriptor.endedAt === undefined
+        });
+      }
+      return request(method, params, options);
+    });
+
+    const accepted = host.enqueueInput({
+      operationId: "dispatch-remote-codex-text",
+      connection,
+      sessionId,
+      prompt: { text: "Run remotely", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    await eventually(() => store.getQueueItem(accepted.value.queueItemId).state === "backend_accepted");
+    expect(observedAdmissions[0]).toEqual({
+      operationStatus: "completed",
+      queueState: "dispatching",
+      runState: "queued",
+      attemptPersisted: true
+    });
+    expect(remoteFake.transport!.requests.find((candidate) => candidate.method === "turn/start")?.params)
+      .toMatchObject({ threadId: nativeSessionId, cwd: "/srv/joko-project", clientUserMessageId: "dispatch-remote-codex-text" });
+    const remoteMcpCall = remoteMcpInput!.beginToolCall(nativeSessionId);
+    expect(() => remoteMcpCall.assertCurrent()).not.toThrow();
+    expect(remoteMcpCall.signal.aborted).toBe(false);
+    expect(releaseRemoteMcp).not.toHaveBeenCalled();
+    await remoteFake.completeTurn(nativeSessionId, "Remote result");
+    await eventually(() => store.getRun(accepted.value.runId).descriptor.state === "completed");
+    expect(remoteMcpCall.signal.aborted).toBe(true);
+    remoteMcpCall.release();
+    const completedRun = store.getRun(accepted.value.runId).descriptor;
+    expect(store.getQueueItem(accepted.value.queueItemId).state).toBe("completed");
+    expect(store.getAttempt(completedRun.activeAttemptId!).descriptor).toMatchObject({ endedAt: expect.any(Number) });
+
+    remoteFake.dropNextTurnClientId = true;
+    remoteFake.timeoutNextTurnStart = true;
+    const unknown = host.enqueueInput({
+      operationId: "dispatch-remote-codex-unknown",
+      connection,
+      sessionId,
+      prompt: { text: "Do not resend", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    await eventually(() => store.getQueueItem(unknown.value.queueItemId).state === "dispatch_unknown");
+    expect(store.getRun(unknown.value.runId).descriptor).toMatchObject({
+      state: "dispatch_unknown",
+      error: { code: "CODEX_DISPATCH_UNKNOWN", stateMayHaveChanged: true }
+    });
+    expect(store.getAttempt(store.getRun(unknown.value.runId).descriptor.activeAttemptId!).descriptor.error)
+      .toMatchObject({ code: "CODEX_DISPATCH_UNKNOWN", stateMayHaveChanged: true });
+    expect(remoteFake.transport!.requests.filter((candidate) => candidate.method === "turn/start")).toHaveLength(2);
+  });
+
   it("leaves a post-turn plan idle when the user chooses to stay", async () => {
     const adapter = new PostTurnPlanReviewFakeAdapter();
     const fixture = await createFixture(adapter);
@@ -11375,6 +11577,7 @@ async function createFixture(
   hostOptions: {
     readonly workspaceCapture?: WorkspaceRunCapture;
     readonly worktrees?: SessionWorktreeCoordinator;
+    readonly closeSessionTerminals?: (sessionId: string) => Promise<void>;
     readonly monotonicNow?: () => number;
     readonly freezeToolPolicies?: (sessionId: string, targetId: string) => void;
     readonly runSilenceTimeoutMs?: number;

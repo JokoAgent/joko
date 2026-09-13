@@ -20,7 +20,9 @@ describe("CodexNativeTaskProjection", () => {
     const spawn = delegatedSpawn("retained-spawn", "child-one", "running");
     tasks.observeRootNotification("item/completed", { item: spawn });
     tasks.observeDescendantNotification("child-one", "turn/started", { turn: { id: "child-turn", status: "inProgress" } });
+    expect(tasks.ownsActiveThread("child-one")).toBe(true);
     tasks.observeDescendantNotification("child-one", "turn/completed", { turn: { id: "child-turn", status: "completed" } });
+    expect(tasks.ownsActiveThread("child-one")).toBe(false);
     expect(tasks.hasActiveTasks()).toBe(false);
     expect(tasks.mergeHistory(taskHistory(spawn))).toEqual([{ childThreadId: "child-one", parentThreadId: "root-thread" }]);
     expect(tasks.hasActiveTasks()).toBe(false);

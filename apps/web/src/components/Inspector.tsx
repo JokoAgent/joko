@@ -4,7 +4,7 @@ import type { TerminalPaletteView } from "../model.js";
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import "@xterm/xterm/css/xterm.css";
 import "./interactive-terminal.css";
-import type { DragEvent as ReactDragEvent, JSX, KeyboardEvent as ReactKeyboardEvent } from "react";
+import type { JSX, KeyboardEvent as ReactKeyboardEvent } from "react";
 import { createPortal } from "react-dom";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
@@ -95,6 +95,7 @@ import { isWorkspaceFileStaleError } from "./workspace-file-editor.js";
 import { BackgroundTasksPanel } from "./BackgroundTasksPanel.js";
 import { SubagentsPanel } from "./SubagentsPanel.js";
 import { InspectorTabErrorBoundary } from "./InspectorTabErrorBoundary.js";
+import { SortableList } from "./SortableList.js";
 import { BrowserCanvas } from "./ToolsPage.js";
 import { BrowserLostPageCard, BrowserPageRail } from "./BrowserPageRail.js";
 import { resolveComposerAttachmentPolicy } from "./composer-behavior.js";
@@ -149,6 +150,7 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
   readonly onDetachedChange?: (detached: boolean) => void;
   readonly onSelectionQuote: (sessionId: string, quote: ComposerFileSelectionQuoteDraft) => void;
 }): JSX.Element {
+  const reducedMotion = useReducedMotionPreference();
   const [tabBuckets, setTabBuckets] = useState<InspectorTabBuckets>(readInspectorTabBuckets);
   const [panelSide, setPanelSide] = useState<InspectorSide>(readInspectorSide);
   const [maximized, setMaximized] = useState(false);
@@ -156,7 +158,6 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
   const addMenuTriggerRef = useRef<HTMLButtonElement>(null);
   const moreMenuTriggerRef = useRef<HTMLButtonElement>(null);
   const menuPopoverRef = useRef<HTMLDivElement>(null);
-  const [draggedTabId, setDraggedTabId] = useState<string>();
   const [detachedHost, setDetachedHost] = useState<DetachedInspectorHost>();
   const detachedHostRef = useRef<DetachedInspectorHost | undefined>(undefined);
   const onDetachedChangeRef = useRef(onDetachedChange);
@@ -475,7 +476,6 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
 
   useEffect(() => {
     setMenu(undefined);
-    setDraggedTabId(undefined);
   }, [session.id]);
 
   useEffect(() => {
@@ -790,18 +790,6 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
     }
   };
 
-  const dropTab = (event: ReactDragEvent<HTMLDivElement>, targetTabId: string): void => {
-    event.preventDefault();
-    if (draggedTabId === undefined || draggedTabId === targetTabId) return;
-    const orderedIds = bucket.tabs.map((tab) => tab.id).filter((id) => id !== draggedTabId);
-    const targetIndex = orderedIds.indexOf(targetTabId);
-    if (targetIndex < 0) return;
-    const afterTarget = event.clientX >= event.currentTarget.getBoundingClientRect().left + event.currentTarget.clientWidth / 2;
-    orderedIds.splice(targetIndex + (afterTarget ? 1 : 0), 0, draggedTabId);
-    setSessionBucket(reorderVisibleInspectorTabs(storedBucket, orderedIds));
-    setDraggedTabId(undefined);
-  };
-
   const detachInspector = (): void => {
     runAction("inspector-detach", async () => {
       if (!canDetach || detachedHostRef.current !== undefined) return;
@@ -879,23 +867,24 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
       />}
       <header className="inspector__header" data-panel-drag-handle="">
         <div ref={tabListRef} className="inspector-tabs" role="tablist" aria-label={t("a11y.inspectorTabs")}>
-          {bucket.tabs.map((tab) => <InspectorTabPill
-            key={tab.id}
-            tab={tab}
-            active={tab.id === bucket.activeTabId}
-            label={tab.kind === "terminal" ? terminalRecords[tab.id]?.shellLabel ?? t("terminal.title") : inspectorTabLabel(tab.kind, t)}
-            closeLabel={tab.kind === "terminal" ? t("terminal.close") : t("inspector.closeNamedTab", { name: inspectorTabLabel(tab.kind, t) })}
-            onActivate={() => activateTab(tab.id)}
-            onClose={() => closeTab(tab.id)}
-            onKeyDown={(event) => handleTabKey(event, tab.id)}
-            onDragStart={(event) => {
-              setDraggedTabId(tab.id);
-              event.dataTransfer.effectAllowed = "move";
-              event.dataTransfer.setData("text/plain", tab.id);
-            }}
-            onDragEnd={() => setDraggedTabId(undefined)}
-            onDrop={(event) => dropTab(event, tab.id)}
-          />)}
+          <SortableList
+            items={bucket.tabs}
+            getId={(tab) => tab.id}
+            onReorder={(orderedIds) => setSessionBucket(reorderVisibleInspectorTabs(storedBucketRef.current, orderedIds))}
+            reducedMotion={reducedMotion}
+            filter="input, textarea, select, a, .inspector-tab__close, [data-no-drag]"
+            className="inspector-tabs__sortable"
+            rowClassName="inspector-tab-sortable-row"
+            renderItem={(tab) => <InspectorTabPill
+              tab={tab}
+              active={tab.id === bucket.activeTabId}
+              label={tab.kind === "terminal" ? terminalRecords[tab.id]?.shellLabel ?? t("terminal.title") : inspectorTabLabel(tab.kind, t)}
+              closeLabel={tab.kind === "terminal" ? t("terminal.close") : t("inspector.closeNamedTab", { name: inspectorTabLabel(tab.kind, t) })}
+              onActivate={() => activateTab(tab.id)}
+              onClose={() => closeTab(tab.id)}
+              onKeyDown={(event) => handleTabKey(event, tab.id)}
+            />}
+          />
         </div>
         <div className="inspector-menu">
           <IconButton buttonRef={addMenuTriggerRef} label={t("inspector.addTab")} aria-haspopup="menu" aria-expanded={menu === "add"} disabled={terminalPending || addableKinds.length === 0} onClick={() => setMenu((current) => current === "add" ? undefined : "add")}><Plus aria-hidden="true" /></IconButton>
@@ -985,7 +974,7 @@ function InspectorWindowControls({ host, t, onClose }: {
   </div>;
 }
 
-function InspectorTabPill({ tab, active, label, closeLabel, onActivate, onClose, onKeyDown, onDragStart, onDragEnd, onDrop }: {
+function InspectorTabPill({ tab, active, label, closeLabel, onActivate, onClose, onKeyDown }: {
   readonly tab: InspectorTabState;
   readonly active: boolean;
   readonly label: string;
@@ -993,11 +982,8 @@ function InspectorTabPill({ tab, active, label, closeLabel, onActivate, onClose,
   readonly onActivate: () => void;
   readonly onClose: () => void;
   readonly onKeyDown: (event: ReactKeyboardEvent<HTMLButtonElement>) => void;
-  readonly onDragStart: (event: ReactDragEvent<HTMLDivElement>) => void;
-  readonly onDragEnd: () => void;
-  readonly onDrop: (event: ReactDragEvent<HTMLDivElement>) => void;
 }): JSX.Element {
-  return <div className={cx("inspector-tab", active && "is-active")} draggable onDragStart={onDragStart} onDragEnd={onDragEnd} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "move"; }} onDrop={onDrop} onMouseDown={(event) => { if (event.button === 1) event.preventDefault(); }} onAuxClick={(event) => { if (event.button === 1) { event.preventDefault(); onClose(); } }}>
+  return <div className={cx("inspector-tab", active && "is-active")} onMouseDown={(event) => { if (event.button === 1) event.preventDefault(); }} onAuxClick={(event) => { if (event.button === 1) { event.preventDefault(); onClose(); } }}>
     <button id={`inspector-tab-${tab.id}`} type="button" role="tab" aria-selected={active} aria-controls={`inspector-panel-${tab.id}`} tabIndex={active ? 0 : -1} title={label} onClick={onActivate} onKeyDown={onKeyDown}>{inspectorTabIcon(tab.kind)}<span>{label}</span></button>
     <IconButton className="inspector-tab__close" label={closeLabel} onClick={(event) => { event.stopPropagation(); onClose(); }}><X aria-hidden="true" /></IconButton>
   </div>;
@@ -1039,6 +1025,20 @@ function inspectorTabIcon(kind: InspectorTabKind): JSX.Element {
 
 function readInspectorTabBuckets(): InspectorTabBuckets {
   try { return parseInspectorTabBuckets(window.localStorage.getItem(INSPECTOR_TABS_KEY)); } catch { return {}; }
+}
+
+function useReducedMotionPreference(): boolean {
+  const [reduced, setReduced] = useState(() => typeof window.matchMedia === "function"
+    && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") return;
+    const query = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const update = (): void => setReduced(query.matches);
+    query.addEventListener("change", update);
+    update();
+    return () => query.removeEventListener("change", update);
+  }, []);
+  return reduced;
 }
 
 function readInspectorSide(): InspectorSide {

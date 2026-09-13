@@ -12,7 +12,7 @@ import type {
 } from "@joko/core";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
 import { OperationalStore, type StoredSession } from "@joko/store";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { OperationalArtifactRepository } from "./artifact-repository.js";
 import { ArtifactStore } from "./artifact-store.js";
@@ -87,6 +87,22 @@ describe("scheduled isolated workspaces", () => {
       archived: true,
       worktree: { state: "preserved" }
     });
+  });
+
+  it("confirms interactive terminal cleanup before releasing a completed run worktree", async () => {
+    const closeSessionTerminals = vi.fn(async (_sessionId: string) => undefined);
+    const fixture = await createFixture(new CaptureCreateAdapter(), closeSessionTerminals);
+    const releaseWorktree = vi.spyOn(fixture.worktrees, "release");
+    const scheduler = new ScheduleCoordinator(fixture.store, fixture.host);
+    fixture.store.upsertSchedule(worktreeSchedule("schedule-terminal-cleanup"));
+
+    const dispatched = await scheduler.runNowWithResult("schedule-terminal-cleanup", "terminal-cleanup");
+    await eventually(() => fixture.store.getRun(dispatched.runId).descriptor.state === "completed");
+    await fixture.host.reconcileScheduledWorktrees();
+
+    expect(closeSessionTerminals).toHaveBeenCalledExactlyOnceWith(dispatched.sessionId);
+    expect(releaseWorktree).toHaveBeenCalledExactlyOnceWith(dispatched.sessionId);
+    expect(closeSessionTerminals.mock.invocationCallOrder[0]).toBeLessThan(releaseWorktree.mock.invocationCallOrder[0]!);
   });
 
   it("compensates a failed native creation without leaving an owner marker or Session", async () => {
@@ -203,7 +219,10 @@ describe("scheduled isolated workspaces", () => {
   });
 });
 
-async function createFixture(adapter: CaptureCreateAdapter = new CaptureCreateAdapter()) {
+async function createFixture(
+  adapter: CaptureCreateAdapter = new CaptureCreateAdapter(),
+  closeSessionTerminals?: (sessionId: string) => Promise<void>
+) {
   const directory = mkdtempSync(join(tmpdir(), "joko-scheduler-worktree-"));
   const store = new OperationalStore(join(directory, "store.db"));
   const repository = new OperationalArtifactRepository(store);
@@ -215,7 +234,8 @@ async function createFixture(adapter: CaptureCreateAdapter = new CaptureCreateAd
   await artifacts.initialize();
   const worktrees = new FakeSessionWorktrees(store, join(directory, "isolated"));
   const host = new SessionHost(store, artifacts, [adapter], {
-    worktrees: worktrees as unknown as SessionWorktreeCoordinator
+    worktrees: worktrees as unknown as SessionWorktreeCoordinator,
+    ...(closeSessionTerminals === undefined ? {} : { closeSessionTerminals })
   });
   await host.initialize();
   await host.registerTarget({

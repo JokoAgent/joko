@@ -165,7 +165,7 @@ it("owns the emulator, ordered input and recovery while hidden, reattached or re
   vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(420);
   const clipboard = { writeText: vi.fn(async () => undefined) };
   Object.defineProperty(window.navigator, "clipboard", { configurable: true, value: clipboard });
-  const watches: { update: (value: TerminalUpdateView) => void; fail: (reason: Error) => void; signal: AbortSignal; after?: bigint }[] = [];
+  const watches: { update: (value: TerminalUpdateView) => void; fail: (reason: Error) => void; signal: AbortSignal; appearance: TerminalAppearanceView; after?: bigint }[] = [];
   let descriptor = initial;
   const restartedRequests = new Set<string>();
   let restartSpawns = 0;
@@ -174,14 +174,16 @@ it("owns the emulator, ordered input and recovery while hidden, reattached or re
   const writeTerminal = vi.fn().mockImplementationOnce(() => new Promise<void>((resolve) => { finishFirst = resolve; })).mockResolvedValue(undefined);
   const methods = {
     getTerminal: vi.fn(async () => descriptor),
-    watchTerminal: vi.fn(async (_session: string, _id: string, _generation: bigint, _appearance: TerminalAppearanceView, update: (value: TerminalUpdateView) => void, after: bigint | undefined, signal: AbortSignal) => {
+    watchTerminal: vi.fn(async (_session: string, _id: string, _generation: bigint, appearance: TerminalAppearanceView, update: (value: TerminalUpdateView) => void, after: bigint | undefined, signal: AbortSignal) => {
       await new Promise<void>((resolve, reject) => {
-        watches.push({ update, fail: reject, signal, ...(after === undefined ? {} : { after }) });
+        watches.push({ update, fail: reject, signal, appearance, ...(after === undefined ? {} : { after }) });
         signal.addEventListener("abort", () => resolve(), { once: true });
       });
     }),
     updateTerminalAppearance: vi.fn(async (_session: string, _id: string, _generation: bigint, appearance: TerminalAppearanceView) => ({ accepted: true, acceptedViewRevision: appearance.viewRevision, appearanceRevision: 1n, ownsDefaults: true })),
-    writeTerminal, resizeTerminal: vi.fn(async () => undefined), closeTerminal: vi.fn(),
+    writeTerminal,
+    resizeTerminal: vi.fn(async (_session: string, _id: string, _generation: bigint, _viewId: string, _columns: number, _rows: number, _signal?: AbortSignal) => undefined),
+    closeTerminal: vi.fn(),
     restartTerminal: vi.fn(async (_session: string, _id: string, generation: bigint, requestId: string) => {
       if (restartedRequests.has(requestId)) return descriptor;
       if (generation !== descriptor.generation) throw new Error("terminal generation changed");
@@ -215,10 +217,15 @@ it("owns the emulator, ordered input and recovery while hidden, reattached or re
   await act(async () => watches[0]!.update({ appearanceRevision: 1n, activeColorOverrides: "", kind: "output", sequence: 9n, data: "live output" }));
   expect(terminal.write).toHaveBeenLastCalledWith("live output", expect.any(Function));
   await act(async () => terminal.input("a😀b"));
+  expect(writeTerminal).not.toHaveBeenCalled();
+  expect(host.textContent).toContain(t("terminal.inputTooLarge", { maximum: 5 }));
+  await act(async () => terminal.input("a😀"));
   expect(writeTerminal.mock.calls.map((call) => [call[4], call[5]])).toEqual([[1n, "a😀"]]);
+  await act(async () => terminal.input("b"));
   await act(async () => finishFirst());
   expect(writeTerminal.mock.calls.map((call) => [call[4], call[5]])).toEqual([[1n, "a😀"], [2n, "b"]]);
   expect(writeTerminal.mock.calls[0]?.[3]).toBe(writeTerminal.mock.calls[1]?.[3]);
+  expect(writeTerminal.mock.calls[0]?.[3]).toBe(watches[0]!.appearance.viewId);
   terminal.selection = "selected output";
   const copy = new KeyboardEvent("keydown", { code: "KeyC", ctrlKey: true, cancelable: true });
   expect(terminal.key(copy)).toBe(false);
@@ -231,7 +238,20 @@ it("owns the emulator, ordered input and recovery while hidden, reattached or re
   expect(methods.openHttpLink).toHaveBeenCalledWith("https://example.org/osc-link", { forceExternal: true });
   expect(methods.openHttpLink).toHaveBeenCalledWith("https://example.org/bare-link", { forceExternal: true });
   await act(async () => new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve())));
-  expect(methods.resizeTerminal).toHaveBeenCalledWith("session-one", "terminal-one", 1n, 90, 30);
+  expect(methods.resizeTerminal).toHaveBeenCalledWith("session-one", "terminal-one", 1n, expect.any(String), 90, 30, expect.any(AbortSignal));
+  expect(methods.resizeTerminal.mock.calls[0]?.[3]).toBe(watches[0]!.appearance.viewId);
+  const resizeCount = methods.resizeTerminal.mock.calls.length;
+  await act(async () => watches[0]!.update({
+    appearanceRevision: 1n,
+    activeColorOverrides: "",
+    kind: "state",
+    terminal: { ...initial, columns: 120, rows: 40 },
+    sequence: 10n,
+    data: ""
+  }));
+  await act(async () => new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve())));
+  expect(methods.resizeTerminal).toHaveBeenCalledTimes(resizeCount + 1);
+  expect(methods.resizeTerminal).toHaveBeenLastCalledWith("session-one", "terminal-one", 1n, watches[0]!.appearance.viewId, 90, 30, expect.any(AbortSignal));
   await render(false);
   await act(async () => terminal.input("hidden"));
   expect(writeTerminal).toHaveBeenCalledTimes(2);

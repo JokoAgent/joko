@@ -341,6 +341,7 @@ async function runCandidateClaudeSessionSmoke(root) {
     if (parsed?.ok !== true || typeof parsed.runtimeRoot !== "string" ||
         parsed.missingSession !== true || parsed.workerRetired !== true || parsed.isolatedProfileUnchanged !== true ||
         typeof parsed.electronVersion !== "string" || typeof parsed.workerEntry !== "string" ||
+        typeof parsed.managerEntry !== "string" ||
         !samePath(await realpath(parsed.runtimeRoot), root)) {
       throw new Error("The isolated Session SDK smoke returned an invalid runtime identity.");
     }

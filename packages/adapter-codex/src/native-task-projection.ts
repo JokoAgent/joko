@@ -177,6 +177,11 @@ export class CodexNativeTaskProjection {
     return child !== undefined && child.activeTurnId === turnId && activeState(child.state);
   }
 
+  ownsActiveThread(threadId: string): boolean {
+    const child = this.#children.get(threadId)?.child;
+    return child !== undefined && child.activeTurnId !== undefined && activeState(child.state);
+  }
+
   hasActiveTasks(): boolean {
     return [...this.#runs.values()].some((run) => activeState(run.state))
       || [...this.#children.values()].some(({ child }) => activeState(child.state));
