@@ -12,6 +12,7 @@ import {
   sshHostKeyFingerprint,
   type AgentAuthConnection,
   type RemoteFileTransportPort,
+  type RemoteProcessTransportPort,
   type RemoteSshConfigHost,
   type SshConfigFilePort
 } from "@joko/remote-ssh";
@@ -234,6 +235,49 @@ describe("RemoteHostRegistry owner-private catalog", () => {
 });
 
 describe("RemoteHostRegistry credential and lifecycle boundary", () => {
+  it("captures the exact process-stream authority and invalidates it without reconnecting during checks", async () => {
+    const fixture = createFixture();
+    const firstProcesses: RemoteProcessTransportPort = { open: vi.fn(async () => { throw new Error("unused"); }) };
+    const secondProcesses: RemoteProcessTransportPort = { open: vi.fn(async () => { throw new Error("unused"); }) };
+    const capabilities = { commandExecution: false, processStreaming: true, fileTransfer: false, tcpForwarding: false, interactiveTerminal: false };
+    const connect = vi.fn(async (request: ResolvedAgentAuthConnectorRequest) => {
+      await request.verifyHostKey({ algorithm: "ssh-ed25519", key: Uint8Array.of(7, 8, 9) });
+      request.onAuthenticating();
+      return {
+        capabilities,
+        processes: connect.mock.calls.length === 1 ? firstProcesses : secondProcesses,
+        close: async () => undefined
+      };
+    });
+    const registry = fixture.registry({ connector: { capabilities, connect } });
+    const host = registry.create(hostCreate());
+    const first = await registry.captureProcessAuthority(host.targetId, host.id);
+    expect(first.host.id).toBe(host.id);
+    expect(first.lease.processes).toBe(firstProcesses);
+    expect(() => first.assertCurrent()).not.toThrow();
+    const disconnected = await registry.disconnect(host.targetId, host.id, registry.get(host.targetId, host.id).revision);
+    expect(() => first.assertCurrent()).toThrow();
+    expect(connect).toHaveBeenCalledOnce();
+
+    const ready = await registry.connect(host.targetId, host.id, disconnected.revision);
+    expect(ready.ok).toBe(true);
+    const second = await registry.captureProcessAuthority(host.targetId, host.id);
+    expect(second.lease.processes).toBe(secondProcesses);
+    expect(second.leaseGeneration).not.toBe(first.leaseGeneration);
+    expect(() => second.assertCurrent()).not.toThrow();
+    const current = registry.get(host.targetId, host.id);
+    fixture.store.updateRemoteHostStatus({
+      ownerId: current.ownerId,
+      targetId: current.targetId,
+      id: current.id,
+      expectedRevision: current.revision,
+      state: "ready",
+      changedAt: current.status.changedAt + 1
+    });
+    expect(() => second.assertCurrent()).toThrow();
+    expect(connect).toHaveBeenCalledTimes(2);
+  });
+
   it("invalidates a captured file-read authority on disconnect, reconnect and Host revision change without reconnecting during checks", async () => {
     const fixture = createFixture();
     const unavailable = async (): Promise<never> => { throw new Error("No file I/O in authority test."); };

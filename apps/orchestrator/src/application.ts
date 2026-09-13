@@ -53,6 +53,7 @@ import { AndroidAutomationRuntimeFactory } from "@joko/tool-android";
 import { BrowserProvider, type BrowserActivity } from "@joko/tool-browser";
 import { TerminalProvider } from "@joko/tool-terminal";
 import { RemoteTerminalRuntimeResolver } from "./remote-terminal-runtime.js";
+import { RemoteCodexReadRuntimeResolver } from "./remote-codex-read-runtime.js";
 import {
   ComputerRuntime,
   ComputerToolProvider,
@@ -819,6 +820,7 @@ export async function createOrchestratorApplication(
       create: ({ instanceId, generation }) => createCodexAdapter({
         id: instanceId,
         instanceGeneration: generation,
+        remoteReadRuntimes: new RemoteCodexReadRuntimeResolver({ store, registry: remoteHosts }),
         managedProviders: managedRuntime(instanceId, generation, CODEX_MANAGED_PROVIDER_SUPPORT),
         appServer: {
           transport: {

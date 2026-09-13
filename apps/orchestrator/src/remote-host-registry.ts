@@ -344,6 +344,33 @@ export class RemoteHostRegistry {
     return Object.freeze({ hostRevision: host.revision, leaseGeneration, lease, assertCurrent });
   }
 
+  /** Captures one ephemeral process-stream lease; subsequent checks never reconnect. */
+  async captureProcessAuthority(targetId: string, id: string, signal?: AbortSignal): Promise<{
+    readonly host: RemoteHostRecord;
+    readonly hostRevision: bigint;
+    readonly leaseGeneration: number;
+    readonly lease: RemoteSshTransportLease;
+    readonly assertCurrent: () => void;
+  }> {
+    const { host, lease } = await this.transports(targetId, id, signal);
+    const managed = this.#controllers.get(controllerKey(targetId, id));
+    if (managed === undefined) throw new RemoteSshError("CONNECTION_FAILED", "The SSH process authority is unavailable.", false);
+    const leaseGeneration = managed.controller.transportGeneration(managed.scope);
+    const assertCurrent = (): void => {
+      this.assertOpen();
+      if (this.get(targetId, id).revision !== host.revision || this.#controllers.get(controllerKey(targetId, id)) !== managed
+        || managed.controller.transportGeneration(managed.scope) !== leaseGeneration) {
+        throw new RemoteSshError("CONNECTION_FAILED", "The SSH process authority changed. Reopen the remote runtime.", false);
+      }
+      const current = managed.controller.transports(managed.scope);
+      if (!current.capabilities.processStreaming || current.processes === undefined || current.processes !== lease.processes) {
+        throw new RemoteSshError("CONNECTION_FAILED", "The SSH process-stream capability is no longer active.", false);
+      }
+    };
+    assertCurrent();
+    return Object.freeze({ host, hostRevision: host.revision, leaseGeneration, lease, assertCurrent });
+  }
+
   async disconnect(targetId: string, id: string, expectedRevision: bigint): Promise<RemoteHostRecord> {
     this.assertOpen();
     const current = this.get(targetId, id);

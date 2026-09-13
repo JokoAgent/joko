@@ -953,6 +953,81 @@ describe("CodexBackendAdapter", () => {
       .toMatchObject({ cwd: setup.target.workspaceRoot, useStateDbOnly: true });
   });
 
+  it("uses an independently fenced remote Host for discovery, resume inspection, and full history only", async () => {
+    const serviceRoot = await realpath(await mkdtemp(join(tmpdir(), "joko-codex-remote-target-")));
+    const localFake = new FakeCodexAppServer();
+    const remoteFake = new FakeCodexAppServer();
+    const localHost = new AppServerHost({ transportFactory: () => localFake.createTransport() });
+    const remoteHost = new AppServerHost({ transportFactory: () => remoteFake.createTransport() });
+    const profileKey = "a".repeat(64);
+    let current = true;
+    const resolveRemote = vi.fn(async () => ({
+      host: remoteHost,
+      workspaceRoot: "/srv/joko-project",
+      profileKey,
+      executionDomain: "ssh-codex-profile-fixture",
+      assertCurrent: () => { if (!current) throw new Error("remote authority changed"); }
+    }));
+    const shutdownRemote = vi.fn(async () => remoteHost.shutdown());
+    const adapter = new CodexBackendAdapter({
+      id: "codex-test",
+      instanceGeneration: 7,
+      host: localHost,
+      remoteReadRuntimes: {
+        resolve: resolveRemote,
+        shutdown: shutdownRemote,
+        forceShutdown: async () => remoteHost.forceShutdown()
+      }
+    });
+    const target: TargetDescriptor = {
+      id: "target-codex",
+      backendId: "codex-test",
+      displayName: "Remote Codex target",
+      workspaceRoot: serviceRoot,
+      managed: false,
+      trusted: true,
+      remoteWorkspace: { hostId: "remote-host", workspaceRoot: "/srv/joko-project" }
+    };
+    const nativeSessionId = remoteFake.seedThread("/srv/joko-project", [historyTurn(0, "remote answer")]);
+    cleanups.push(async () => {
+      await adapter.dispose();
+      await localHost.shutdown();
+      await remoteHost.shutdown();
+      await rm(serviceRoot, { recursive: true, force: true });
+    });
+
+    const candidates = await adapter.listNativeSessions(target);
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]).toMatchObject({ nativeSessionId, workspaceRoot: "/srv/joko-project", messageCount: 0 });
+    const binding = await adapter.resolveNativeSessionReference(candidates[0]!.nativeReference, target, 1);
+    const bound = context(target, [], { binding, backendInstanceGeneration: 7 });
+    const resumed = await adapter.resumeSession(binding, bound);
+    expect(resumed.binding).toEqual(binding);
+    const projection = await adapter.getNativeHistoryProjection(bound);
+    expect(projection.events.length).toBeGreaterThan(0);
+
+    const beforeRejectedMutations = remoteFake.transport!.requests.length;
+    await expect(adapter.send(prompt("must not dispatch"), context(target, [], {
+      binding,
+      backendInstanceGeneration: 7,
+      operationId: "remote-send"
+    }))).rejects.toMatchObject({ publicError: { code: "CODEX_REMOTE_MUTATION_UNSUPPORTED", stateMayHaveChanged: false } });
+    await expect(adapter.createSession(sessionInput(target), context(target, [], { backendInstanceGeneration: 7 })))
+      .rejects.toMatchObject({ publicError: { code: "CODEX_REMOTE_MUTATION_UNSUPPORTED", stateMayHaveChanged: false } });
+    await expect(adapter.deleteSession(binding, bound))
+      .rejects.toMatchObject({ publicError: { code: "CODEX_REMOTE_MUTATION_UNSUPPORTED", stateMayHaveChanged: false } });
+    expect(remoteFake.transport!.requests).toHaveLength(beforeRejectedMutations);
+    expect(remoteFake.transport!.requests.map((request) => request.method)).not.toContain("thread/resume");
+    expect(localFake.transport).toBeUndefined();
+
+    current = false;
+    await expect(adapter.listNativeSessions(target))
+      .rejects.toMatchObject({ publicError: { code: "CODEX_REMOTE_TARGET_UNAVAILABLE" } });
+    await adapter.dispose();
+    expect(shutdownRemote).toHaveBeenCalledOnce();
+    expect(resolveRemote).toHaveBeenCalled();
+  });
+
   it("reports a side-effect-free continuity gap for validated missing or unresumable native threads", async () => {
     const setup = await createSetup();
     const events: EventPayload[] = [];

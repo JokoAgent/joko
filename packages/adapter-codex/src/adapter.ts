@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { Dirent, Stats } from "node:fs";
 import { mkdtemp, readFile, readdir, realpath, rm, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { basename, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
+import { basename, isAbsolute, join, normalize, posix as posixPath, relative, resolve, sep } from "node:path";
 import {
   CAPABILITIES,
   CapabilityDrivenBackendAdapter,
@@ -106,6 +106,26 @@ export interface CodexAdapterOptions extends CodexInputResolvers {
   readonly profileDirectory?: string;
   /** Exact profile roots used by the read-only local task catalog. */
   readonly catalogProfileDirectories?: readonly string[];
+  /** Owner-private resolver for a Target-bound remote, read-only Codex runtime. */
+  readonly remoteReadRuntimes?: CodexRemoteReadRuntimePort;
+}
+
+export interface CodexRemoteReadRuntime {
+  readonly host: AppServerHost;
+  /** Canonical absolute POSIX workspace root observed on the remote host. */
+  readonly workspaceRoot: string;
+  /** Stable digest for the remote host and isolated Codex profile. */
+  readonly profileKey: string;
+  /** Bounded opaque execution-domain identity, never persisted in a native reference. */
+  readonly executionDomain: string;
+  /** Synchronous target/host/transport generation fence. */
+  readonly assertCurrent: () => void;
+}
+
+export interface CodexRemoteReadRuntimePort {
+  resolve(target: TargetDescriptor, signal?: AbortSignal): Promise<CodexRemoteReadRuntime>;
+  shutdown(): Promise<void>;
+  forceShutdown?(): Promise<void>;
 }
 
 export const CODEX_MANAGED_PROVIDER_SUPPORT: ProviderRuntimeSupport = Object.freeze<ProviderRuntimeSupport>({
@@ -190,6 +210,15 @@ interface SessionRuntime {
   disconnectTerminalEmitted: boolean;
   compaction?: CompactionWaiter;
   rewindUnknown: boolean;
+}
+
+interface CodexReadScope {
+  readonly host: AppServerHost;
+  readonly hostGeneration?: number;
+  readonly workspaceRoot: string;
+  readonly profileKey: string;
+  readonly remote: boolean;
+  readonly assertCurrent: () => void;
 }
 
 interface PendingServerRequest {
@@ -345,6 +374,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   readonly #catalogProfileDirectories: readonly string[] | undefined;
   readonly #catalogSources = new Map<string, CodexCatalogSource>();
   readonly #catalogEntrySources = new WeakMap<NativeSessionCatalogEntry, CodexCatalogSource>();
+  readonly #remoteReadRuntimes: CodexRemoteReadRuntimePort | undefined;
   #catalogMaterializationTail: Promise<void> = Promise.resolve();
   readonly #sessions = new Map<string, SessionRuntime>();
   readonly #sessionMutations = new Map<string, { count: number; rewinding: boolean }>();
@@ -402,6 +432,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     this.#catalogProfileDirectories = options.catalogProfileDirectories === undefined
       ? undefined
       : [...options.catalogProfileDirectories];
+    this.#remoteReadRuntimes = options.remoteReadRuntimes;
     if (!Number.isSafeInteger(this.#instanceGeneration) || this.#instanceGeneration < 1) {
       throw new TypeError("Codex Backend instance generation must be a positive integer.");
     }
@@ -483,41 +514,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   }
 
   async validateTarget(target: TargetDescriptor): Promise<void> {
-    this.#assertOpen();
-    if (target.backendId !== this.id) {
-      throw adapterError({
-        code: "CODEX_TARGET_BACKEND_MISMATCH",
-        message: "The selected Target belongs to another Backend instance.",
-        phase: "provision",
-        recovery: "Choose a Target owned by this Codex Backend instance."
-      });
-    }
-    if (target.remoteWorkspace !== undefined) {
-      throw adapterError({
-        code: "CODEX_REMOTE_TARGET_UNSUPPORTED",
-        message: "This Codex Backend instance does not provide a remote app-server transport.",
-        phase: "provision",
-        recovery: "Use a local Target or a Backend instance configured for the remote host."
-      });
-    }
-    if (!isAbsolute(target.workspaceRoot)) {
-      throw adapterError({
-        code: "CODEX_TARGET_PATH_INVALID",
-        message: "The Target workspace root must be absolute.",
-        phase: "provision",
-        recovery: "Repair the Target workspace binding."
-      });
-    }
-    const info = await stat(target.workspaceRoot).catch(() => undefined);
-    if (info?.isDirectory() !== true) {
-      throw adapterError({
-        code: "CODEX_TARGET_UNAVAILABLE",
-        message: "The Target workspace is unavailable.",
-        phase: "provision",
-        retryable: true,
-        recovery: "Restore the Target workspace and retry."
-      });
-    }
+    await this.#readScope(target);
   }
 
   async createSession(input: CreateNativeSessionInput, context: AdapterContext): Promise<NativeSessionBinding> {
@@ -527,8 +524,11 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   async #createSession(input: CreateNativeSessionInput, context: AdapterContext): Promise<NativeSessionBinding> {
     this.#assertOpen();
     const runtimePolicy = reviewRuntimePolicy(input, context);
-    await this.validateTarget(input.target);
     this.#assertContextTarget(context, input.target);
+    if (input.target.remoteWorkspace !== undefined && input.nativeStart?.kind !== "attach") {
+      throw remoteMutationUnsupported("create or fork a native Session");
+    }
+    await this.validateTarget(input.target);
     if (input.nativeStart?.kind === "attach") {
       const binding = bindingFromReference(input.nativeStart.nativeReference, context.generation);
       const resumed = await this.resumeSession(binding, context);
@@ -670,9 +670,22 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     await this.validateTarget(context.target);
     const resumedBinding = this.#resumeBindingForContext(binding, context);
     const threadId = threadIdFromBinding(resumedBinding);
-    const inspection = await this.#readValidatedNativeThread(threadId, context.target, "provision").catch((error) => {
+    const inspection = await this.#readValidatedNativeThread(
+      threadId,
+      context.target,
+      "provision",
+      context.signal,
+      parseNativeReference(resumedBinding.opaqueRef).profileKey
+    ).catch((error) => {
       throw this.#nativeThreadReadFailure(error, "provision");
     });
+    if (inspection.scope.remote) {
+      inspection.scope.assertCurrent();
+      return stateFromThread(
+        bindingForThread(inspection.thread.id, context.generation, inspection.profileKey),
+        inspection.thread
+      );
+    }
     const current = this.#sessions.get(context.sessionId);
     if (current !== undefined
       && current.threadId === threadId
@@ -717,7 +730,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       }
       thread = { ...thread, turns: parseTurnList(latest.value) };
     }
-    const normalized = bindingForThread(thread.id, context.generation, await this.#activeProfileKey);
+    const normalized = bindingForThread(thread.id, context.generation, inspection.profileKey);
     const record = objectValue(response.value, "resume response");
     const runtime = await this.#installRuntime({
       thread,
@@ -756,7 +769,13 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       if (threadId !== runtime.threadId) throw invalidReviewProfile();
       return stateFromRuntime(runtime);
     }
-    const inspected = await this.#readValidatedNativeThread(threadId, context.target, "probe").catch((error) => {
+    const inspected = await this.#readValidatedNativeThread(
+      threadId,
+      context.target,
+      "probe",
+      context.signal,
+      parseNativeReference(binding.opaqueRef).profileKey
+    ).catch((error) => {
       throw this.#requestFailure(error, "probe", "CODEX_NATIVE_SESSION_UNAVAILABLE", false);
     });
     const thread = inspected.thread;
@@ -774,10 +793,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     target: TargetDescriptor,
     generation: number
   ): Promise<NativeSessionBinding> {
-    await this.validateTarget(target);
-    const threadId = nativeThreadId(nativeReference);
+    const parsed = parseNativeReference(nativeReference);
     try {
-      const { thread } = await this.#readValidatedNativeThread(threadId, target, "probe");
+      await this.#readValidatedNativeThread(parsed.threadId, target, "probe", undefined, parsed.profileKey);
       return bindingFromReference(nativeReference, generation);
     } catch (error) {
       throw this.#nativeThreadReadFailure(error, "probe");
@@ -785,9 +803,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   }
 
   async listNativeSessions(target: TargetDescriptor): Promise<readonly NativeSessionCandidate[]> {
-    await this.validateTarget(target);
-    const cwd = await realpath(target.workspaceRoot);
-    const activeProfileKey = await this.#activeProfileKey;
+    const scope = await this.#readScope(target);
+    const cwd = scope.workspaceRoot;
     const candidates: NativeSessionCandidate[] = [];
     const nativeIds = new Set<string>();
     const seenCursors = new Set<string>();
@@ -799,21 +816,24 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           throw paginationError("CODEX_THREAD_PAGINATION_LIMIT", "native Session discovery");
         }
         const pageLimit = Math.min(100, this.#maximumDiscoveredThreads - candidates.length);
-        const response = await this.#host.request("thread/list", {
+        scope.assertCurrent();
+        const response = await scope.host.request("thread/list", {
           limit: pageLimit,
           cwd,
           useStateDbOnly: true,
           ...(cursor === undefined ? {} : { cursor })
-        });
+        }, { beforeDispatch: scope.assertCurrent });
+        scope.assertCurrent();
+        if (scope.hostGeneration !== undefined && response.hostGeneration !== scope.hostGeneration) throw remoteReadStale();
         pages += 1;
         const page = parseThreadList(response.value, pageLimit);
         for (const thread of page.threads) {
           if (nativeIds.has(thread.id)
             || !isValidNativeThreadId(thread.id)
-            || !(await nativeThreadMatchesWorkspace(thread, cwd))) continue;
+            || !(await nativeThreadMatchesWorkspace(thread, cwd, scope.remote))) continue;
           nativeIds.add(thread.id);
           candidates.push({
-            nativeReference: referenceForThread(thread.id, activeProfileKey),
+            nativeReference: referenceForThread(thread.id, scope.profileKey),
             nativeSessionId: thread.id,
             ...(thread.name === null || thread.name === undefined ? {} : { name: thread.name }),
             ...(thread.cwd === undefined ? {} : { workspaceRoot: thread.cwd }),
@@ -821,10 +841,14 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             modifiedAt: Math.max(0, Math.trunc((thread.updatedAt ?? thread.createdAt ?? 0) * 1_000)),
             state: thread.status?.["type"] === "systemError" ? "error" : "ready"
           });
-          if (candidates.length >= this.#maximumDiscoveredThreads) return candidates;
+          if (candidates.length >= this.#maximumDiscoveredThreads) {
+            scope.assertCurrent();
+            return candidates;
+          }
         }
         cursor = nextPaginationCursor(page.nextCursor, seenCursors, "CODEX_THREAD_PAGINATION_INVALID", "native Session discovery");
       } while (cursor !== undefined);
+      scope.assertCurrent();
       return candidates;
     } catch (error) {
       throw this.#requestFailure(error, "probe", "CODEX_THREAD_DISCOVERY_FAILED", false);
@@ -930,6 +954,19 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       });
     }
     const currentBinding = this.#resumeBindingForContext(binding, context);
+    if (context.target.remoteWorkspace !== undefined) {
+      try {
+        const scope = await this.#readScope(context.target, context.signal);
+        if (parseNativeReference(currentBinding.opaqueRef).profileKey !== scope.profileKey) throw invalidNativeReference();
+        const history = await this.#readRemoteCompleteHistory(scope, currentBinding, context);
+        history.assertCurrent();
+        const projection = projectCodexNativeHistory(history.thread, { maximumEvents: this.#maximumHistoryEvents });
+        history.assertCurrent();
+        return projection;
+      } catch (error) {
+        throw this.#requestFailure(error, "probe", "CODEX_NATIVE_HISTORY_UNAVAILABLE", false);
+      }
+    }
     const runtime = await this.#requireRuntime(context);
     this.#assertStandardRuntime(runtime, "read native history");
     this.#assertHistoryRuntimeFence(runtime, context, currentBinding, runtime.hostGeneration);
@@ -952,6 +989,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     this.#assertOpen();
     assertDispatchNotCancelled(context.signal);
     this.#assertBackendContext(context);
+    if (context.target.remoteWorkspace !== undefined) throw remoteMutationUnsupported("send native input");
     // Steering owns the currently attached turn before any asynchronous preparation.
     let runtime = input.disposition === "steer"
       ? this.#sessions.get(context.sessionId)
@@ -1192,6 +1230,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     assertStandardReviewContext(context, "delete native Session state");
     this.#assertOpen();
     this.#assertBackendContext(context);
+    if (context.target.remoteWorkspace !== undefined) throw remoteMutationUnsupported("delete native Session state");
     const threadId = threadIdFromBinding(binding);
     const profileKey = await this.#activeProfileKey;
     this.#assertOpen();
@@ -1307,6 +1346,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     this.#assertOpen();
     this.#assertBackendContext(context);
     assertDispatchNotCancelled(context.signal);
+    if (context.target.remoteWorkspace !== undefined) throw remoteMutationUnsupported("rewind native history");
     if (summarize || customInstructions !== undefined) return this.unsupported("session.tree.summary");
     const runtime = this.#sessions.get(context.sessionId);
     if (runtime === undefined || !this.#matchesCoreFence(runtime, context)) throw nativeHistoryReadFailure("STALE");
@@ -1740,7 +1780,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       this.#cancelPendingServerRequests(runtime);
     }
     await Promise.allSettled(runtimes.map((runtime) => this.#releaseRuntimeSubscription(runtime, false)));
-    if (this.#ownsHost) await this.#host.shutdown();
+    await Promise.all([
+      ...(this.#ownsHost ? [this.#host.shutdown()] : []),
+      ...(this.#remoteReadRuntimes === undefined ? [] : [this.#remoteReadRuntimes.shutdown()])
+    ]);
   }
 
   async #forceDisposeRuntimes(): Promise<void> {
@@ -1767,7 +1810,12 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       this.#cancelPendingServerRequests(runtime);
     }
     await Promise.allSettled(runtimes.map((runtime) => this.#releaseRuntimeSubscription(runtime, false)));
-    if (this.#ownsHost) await this.#host.forceShutdown();
+    await Promise.all([
+      ...(this.#ownsHost ? [this.#host.forceShutdown()] : []),
+      ...(this.#remoteReadRuntimes === undefined
+        ? []
+        : [this.#remoteReadRuntimes.forceShutdown?.() ?? this.#remoteReadRuntimes.shutdown()])
+    ]);
   }
 
   async #resumeNativeThread(
@@ -1799,24 +1847,144 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     return response;
   }
 
+  async #readScope(target: TargetDescriptor, signal?: AbortSignal): Promise<CodexReadScope> {
+    this.#assertOpen();
+    if (target.backendId !== this.id) {
+      throw adapterError({
+        code: "CODEX_TARGET_BACKEND_MISMATCH",
+        message: "The selected Target belongs to another Backend instance.",
+        phase: "provision",
+        recovery: "Choose a Target owned by this Codex Backend instance."
+      });
+    }
+    if (target.remoteWorkspace === undefined) {
+      if (!isAbsolute(target.workspaceRoot)) {
+        throw adapterError({
+          code: "CODEX_TARGET_PATH_INVALID",
+          message: "The Target workspace root must be absolute.",
+          phase: "provision",
+          recovery: "Repair the Target workspace binding."
+        });
+      }
+      const info = await stat(target.workspaceRoot).catch(() => undefined);
+      if (info?.isDirectory() !== true) {
+        throw adapterError({
+          code: "CODEX_TARGET_UNAVAILABLE",
+          message: "The Target workspace is unavailable.",
+          phase: "provision",
+          retryable: true,
+          recovery: "Restore the Target workspace and retry."
+        });
+      }
+      return {
+        host: this.#host,
+        workspaceRoot: await realpath(target.workspaceRoot),
+        profileKey: await this.#activeProfileKey,
+        remote: false,
+        assertCurrent: () => {
+          this.#assertOpen();
+          if (target.backendId !== this.id) throw remoteReadStale();
+        }
+      };
+    }
+    if (!isNormalizedAbsolutePosixPath(target.remoteWorkspace.workspaceRoot)) {
+      throw adapterError({
+        code: "CODEX_REMOTE_TARGET_PATH_INVALID",
+        message: "The remote Target workspace root must be a normalized absolute POSIX path.",
+        phase: "provision",
+        recovery: "Repair the remote Target workspace binding."
+      });
+    }
+    if (this.#remoteReadRuntimes === undefined) {
+      throw adapterError({
+        code: "CODEX_REMOTE_TARGET_UNSUPPORTED",
+        message: "This Codex Backend instance does not provide a remote app-server transport.",
+        phase: "provision",
+        recovery: "Configure the remote Codex runtime before opening this Target."
+      });
+    }
+    try {
+      if (signal?.aborted) throw remoteReadCancelled();
+      const runtime = await this.#remoteReadRuntimes.resolve(target, signal);
+      if (!isNormalizedAbsolutePosixPath(runtime.workspaceRoot)
+        || !validReferenceDigest(runtime.profileKey)
+        || !validExecutionDomain(runtime.executionDomain)) {
+        throw new ProtocolShapeError("remote Codex runtime scope is invalid");
+      }
+      runtime.assertCurrent();
+      const hostGeneration = await runtime.host.ensureStarted();
+      runtime.assertCurrent();
+      if (!runtime.host.isActiveGeneration(hostGeneration)
+        || versionFromUserAgent(runtime.host.initializeResult?.userAgent) !== AUDITED_APP_SERVER_VERSION) {
+        throw adapterError({
+          code: "CODEX_REMOTE_VERSION_INCOMPATIBLE",
+          message: `The remote Codex runtime must match the audited ${AUDITED_APP_SERVER_VERSION} app-server protocol.`,
+          phase: "provision",
+          recovery: "Install the fixed Joko-owned Codex runtime on the remote host and retry."
+        });
+      }
+      return {
+        host: runtime.host,
+        hostGeneration,
+        workspaceRoot: runtime.workspaceRoot,
+        profileKey: runtime.profileKey,
+        remote: true,
+        assertCurrent: () => {
+          this.#assertOpen();
+          runtime.assertCurrent();
+          if (!runtime.host.isActiveGeneration(hostGeneration)) throw remoteReadStale();
+        }
+      };
+    } catch (error) {
+      if (error instanceof Error && "publicError" in error) throw error;
+      if (signal?.aborted) throw remoteReadCancelled();
+      throw adapterError({
+        code: "CODEX_REMOTE_TARGET_UNAVAILABLE",
+        message: "The remote Codex read runtime is unavailable for this exact Target binding.",
+        phase: "provision",
+        retryable: true,
+        recovery: "Reconnect the remote host, verify the fixed Codex runtime, and retry."
+      });
+    }
+  }
+
   async #readValidatedNativeThread(
     threadId: string,
     target: TargetDescriptor,
-    phase: "probe" | "provision"
+    phase: "probe" | "provision",
+    signal?: AbortSignal,
+    expectedProfileKey?: string
   ): Promise<{
     readonly thread: NativeThread;
     readonly hostGeneration: number;
     readonly workspaceRoot: string;
+    readonly profileKey: string;
+    readonly scope: CodexReadScope;
   }> {
-    const workspaceRoot = await realpath(target.workspaceRoot);
-    const response = await this.#host.request("thread/read", { threadId, includeTurns: false });
+    const scope = await this.#readScope(target, signal);
+    if (expectedProfileKey !== undefined && expectedProfileKey !== scope.profileKey) throw invalidNativeReference();
+    scope.assertCurrent();
+    const response = await scope.host.request("thread/read", { threadId, includeTurns: false }, {
+      beforeDispatch: scope.assertCurrent,
+      ...(signal === undefined ? {} : { signal })
+    });
+    scope.assertCurrent();
+    if (scope.hostGeneration !== undefined && response.hostGeneration !== scope.hostGeneration) throw remoteReadStale();
     const thread = parseThreadResult(response.value);
-    await assertNativeThreadTarget(thread, threadId, workspaceRoot, phase);
-    return { thread, hostGeneration: response.hostGeneration, workspaceRoot };
+    await assertNativeThreadTarget(thread, threadId, scope.workspaceRoot, phase, scope.remote);
+    scope.assertCurrent();
+    return {
+      thread,
+      hostGeneration: response.hostGeneration,
+      workspaceRoot: scope.workspaceRoot,
+      profileKey: scope.profileKey,
+      scope
+    };
   }
 
   async #requireRuntime(context: AdapterContext): Promise<SessionRuntime> {
     this.#assertBackendContext(context);
+    if (context.target.remoteWorkspace !== undefined) throw remoteMutationUnsupported("mutate native Session state");
     const runtime = this.#sessions.get(context.sessionId);
     if (runtime !== undefined && this.#matchesCoreFence(runtime, context) && this.#host.isActiveGeneration(runtime.hostGeneration)) {
       runtime.context = context;
@@ -2857,40 +3025,82 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const hostGeneration = runtime.hostGeneration;
     const threadId = runtime.threadId;
     const historyRevision = this.#host.historyRevision(threadId, hostGeneration);
+    return this.#readCompleteHistoryFromHost({
+      host: this.#host,
+      hostGeneration,
+      threadId,
+      workspaceRoot: runtime.reviewWorkingDirectory ?? runtime.targetWorkspaceRoot,
+      remote: false,
+      signal: AbortSignal.any([context.signal, runtime.dispatchLifetime.signal]),
+      assertOwner: () => {
+      this.#assertHistoryRuntimeFence(runtime, context, binding, hostGeneration);
+      if (historyRevision === undefined || this.#host.historyRevision(threadId, hostGeneration) !== historyRevision) {
+        throw nativeHistoryReadFailure("STALE");
+      }
+      }
+    });
+  }
+
+  async #readRemoteCompleteHistory(
+    scope: CodexReadScope,
+    binding: NativeSessionBinding,
+    context: AdapterContext
+  ): Promise<{ readonly thread: NativeThread; readonly assertCurrent: () => void }> {
+    const hostGeneration = scope.hostGeneration;
+    if (hostGeneration === undefined) throw remoteReadStale();
+    const threadId = threadIdFromBinding(binding);
+    return this.#readCompleteHistoryFromHost({
+      host: scope.host,
+      hostGeneration,
+      threadId,
+      workspaceRoot: scope.workspaceRoot,
+      remote: true,
+      signal: context.signal,
+      assertOwner: () => this.#assertRemoteHistoryFence(scope, binding, context, hostGeneration)
+    });
+  }
+
+  async #readCompleteHistoryFromHost(input: {
+    readonly host: AppServerHost;
+    readonly hostGeneration: number;
+    readonly threadId: string;
+    readonly workspaceRoot: string;
+    readonly remote: boolean;
+    readonly signal: AbortSignal;
+    readonly assertOwner: () => void;
+  }): Promise<{ readonly thread: NativeThread; readonly assertCurrent: () => void }> {
     const deadline = performance.now() + this.#historyReadTimeoutMs;
     const timedOut = new AbortController();
-    const signal = AbortSignal.any([context.signal, runtime.dispatchLifetime.signal, timedOut.signal]);
+    const signal = AbortSignal.any([input.signal, timedOut.signal]);
     const timer = setTimeout(() => timedOut.abort(), this.#historyReadTimeoutMs);
     timer.unref?.();
     const assertCurrent = (): void => {
       if (timedOut.signal.aborted || performance.now() >= deadline) throw nativeHistoryReadFailure("TIMEOUT");
       if (signal.aborted) throw nativeHistoryReadFailure("CANCELLED");
-      this.#assertHistoryRuntimeFence(runtime, context, binding, hostGeneration);
-      if (historyRevision === undefined || this.#host.historyRevision(threadId, hostGeneration) !== historyRevision) {
-        throw nativeHistoryReadFailure("STALE");
-      }
+      input.assertOwner();
+      if (!input.host.isActiveGeneration(input.hostGeneration)) throw nativeHistoryReadFailure("STALE");
     };
     let bytes = 0;
     const request = async (method: string, params: JsonObject): Promise<JsonValue> => {
       assertCurrent();
-      const result = await waitForHistoryRead(this.#host.request(method, params, {
+      const result = await waitForHistoryRead(input.host.request(method, params, {
         signal, timeoutMs: Math.max(1, Math.ceil(deadline - performance.now())), beforeDispatch: assertCurrent
       }), signal, () => nativeHistoryReadFailure(timedOut.signal.aborted ? "TIMEOUT" : "CANCELLED"));
       assertCurrent();
-      if (result.hostGeneration !== hostGeneration) throw nativeHistoryReadFailure("STALE");
+      if (result.hostGeneration !== input.hostGeneration) throw nativeHistoryReadFailure("STALE");
       bytes += serializedByteLength(result.value);
       if (bytes > this.#maximumHistoryBytes) throw nativeHistoryReadFailure("SIZE_LIMIT");
       return result.value;
     };
     const readMetadata = async (): Promise<NativeThread> => {
-      const value = await request("thread/read", { threadId, includeTurns: false });
+      const value = await request("thread/read", { threadId: input.threadId, includeTurns: false });
       const raw = objectValue(objectValue(value, "thread metadata result")["thread"], "thread metadata");
       if (!Array.isArray(raw["turns"]) || raw["turns"].length !== 0) {
         throw new ProtocolShapeError("thread metadata must not contain history turns");
       }
       const thread = parseThreadResult(value);
       await waitForHistoryRead(assertNativeThreadTarget(
-        thread, threadId, runtime.reviewWorkingDirectory ?? runtime.targetWorkspaceRoot, "probe"
+        thread, input.threadId, input.workspaceRoot, "probe", input.remote
       ), signal, () => nativeHistoryReadFailure(timedOut.signal.aborted ? "TIMEOUT" : "CANCELLED"));
       assertCurrent();
       return thread;
@@ -2908,7 +3118,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       do {
         if (++pages > this.#maximumHistoryPages) throw nativeHistoryReadFailure("SIZE_LIMIT");
         const page = parseFullTurnPage(await request("thread/turns/list", {
-          threadId, sortDirection: "asc", itemsView: "full", limit: 100,
+          threadId: input.threadId, sortDirection: "asc", itemsView: "full", limit: 100,
           ...(cursor === undefined ? {} : { cursor })
         }), { maximumTurns: 100, maximumItems: this.#maximumHistoryItems });
         assertCurrent();
@@ -2934,7 +3144,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       // Public pages have no atomic snapshot token. Re-read the newest full turn
       // and metadata as optimistic evidence, in addition to the wire-arrival fence.
       const tail = parseFullTurnPage(await request("thread/turns/list", {
-        threadId, sortDirection: "desc", itemsView: "full", limit: 1
+        threadId: input.threadId, sortDirection: "desc", itemsView: "full", limit: 1
       }), { maximumTurns: 1, maximumItems: this.#maximumHistoryItems });
       const latestMetadata = await readMetadata();
       assertCurrent();
@@ -3082,6 +3292,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       && runtime.targetId === context.target.id
       && context.target.backendId === this.id
       && equalNativePaths(runtime.targetWorkspaceRoot, context.target.workspaceRoot)
+      && sameRemoteWorkspace(runtime.context.target.remoteWorkspace, context.target.remoteWorkspace)
       && runtime.sessionGeneration === context.generation
       && runtime.runtimePolicy === (context.runtimePolicy === "review_read_only" ? "review_read_only" : "standard")
       && runtime.backendInstanceGeneration === this.#instanceGeneration
@@ -3151,6 +3362,33 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     }
   }
 
+  #assertRemoteHistoryFence(
+    scope: CodexReadScope,
+    binding: NativeSessionBinding,
+    context: AdapterContext,
+    hostGeneration: number
+  ): void {
+    this.#assertContextTarget(context, context.target);
+    scope.assertCurrent();
+    const currentBinding = context.binding;
+    if (currentBinding === undefined
+      || currentBinding.generation !== context.generation
+      || binding.generation !== context.generation
+      || currentBinding.opaqueRef !== binding.opaqueRef
+      || threadIdFromBinding(currentBinding) !== threadIdFromBinding(binding)) {
+      throw adapterError({
+        code: "CODEX_SESSION_BINDING_MISMATCH",
+        message: "The remote Codex native history binding changed before the read could be committed.",
+        phase: "probe",
+        recovery: "Refresh the durable Session binding before reading native history."
+      });
+    }
+    if (parseNativeReference(binding.opaqueRef).profileKey !== scope.profileKey
+      || !scope.host.isActiveGeneration(hostGeneration)) {
+      throw nativeHistoryReadFailure("STALE");
+    }
+  }
+
   #assertStandardRuntime(runtime: SessionRuntime, operation: string): void {
     if (runtime.runtimePolicy === "standard") return;
     throw adapterError({
@@ -3213,7 +3451,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     if (context.target.id !== target.id
       || context.target.backendId !== this.id
       || target.backendId !== this.id
-      || !equalNativePaths(context.target.workspaceRoot, target.workspaceRoot)) {
+      || !equalNativePaths(context.target.workspaceRoot, target.workspaceRoot)
+      || !sameRemoteWorkspace(context.target.remoteWorkspace, target.remoteWorkspace)) {
       throw adapterError({
         code: "CODEX_CONTEXT_TARGET_MISMATCH",
         message: "The Codex operation context does not match the requested Target.",
@@ -4212,9 +4451,10 @@ async function assertNativeThreadTarget(
   thread: NativeThread,
   expectedThreadId: string,
   workspaceRoot: string,
-  phase: "probe" | "provision"
+  phase: "probe" | "provision",
+  remote = false
 ): Promise<void> {
-  if (thread.id !== expectedThreadId || !(await nativeThreadMatchesWorkspace(thread, workspaceRoot))) {
+  if (thread.id !== expectedThreadId || !(await nativeThreadMatchesWorkspace(thread, workspaceRoot, remote))) {
     throw adapterError({
       code: "CODEX_NATIVE_SESSION_TARGET_MISMATCH",
       message: "The Codex native Session identity or workspace does not match the selected Target.",
@@ -4224,8 +4464,14 @@ async function assertNativeThreadTarget(
   }
 }
 
-async function nativeThreadMatchesWorkspace(thread: NativeThread, workspaceRoot: string): Promise<boolean> {
-  if (thread.cwd === undefined || !isAbsolute(thread.cwd)) return false;
+async function nativeThreadMatchesWorkspace(thread: NativeThread, workspaceRoot: string, remote = false): Promise<boolean> {
+  if (thread.cwd === undefined) return false;
+  if (remote) {
+    return isNormalizedAbsolutePosixPath(thread.cwd)
+      && isNormalizedAbsolutePosixPath(workspaceRoot)
+      && thread.cwd === workspaceRoot;
+  }
+  if (!isAbsolute(thread.cwd)) return false;
   let nativeWorkspace: string;
   try {
     nativeWorkspace = await realpath(thread.cwd);
@@ -4241,6 +4487,59 @@ function equalNativePaths(left: string, right: string): boolean {
   return process.platform === "win32"
     ? normalizedLeft.toLocaleLowerCase("en-US") === normalizedRight.toLocaleLowerCase("en-US")
     : normalizedLeft === normalizedRight;
+}
+
+function isNormalizedAbsolutePosixPath(value: string): boolean {
+  return value.length > 0
+    && value.length <= 16_384
+    && !/[\u0000-\u001f\u007f\\]/u.test(value)
+    && posixPath.isAbsolute(value)
+    && posixPath.normalize(value) === value;
+}
+
+function validExecutionDomain(value: string): boolean {
+  return value.length > 0 && value.length <= 4_096 && !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
+function sameRemoteWorkspace(
+  left: TargetDescriptor["remoteWorkspace"],
+  right: TargetDescriptor["remoteWorkspace"]
+): boolean {
+  return left === undefined
+    ? right === undefined
+    : right !== undefined && left.hostId === right.hostId && left.workspaceRoot === right.workspaceRoot;
+}
+
+function remoteMutationUnsupported(operation: string) {
+  return adapterError({
+    code: "CODEX_REMOTE_MUTATION_UNSUPPORTED",
+    message: `The remote Codex read plane cannot ${operation}.`,
+    phase: "dispatch",
+    stateMayHaveChanged: false,
+    recovery: "Use remote discovery and history inspection, or choose a local Codex Target for mutations."
+  });
+}
+
+function remoteReadStale() {
+  return adapterError({
+    code: "CODEX_REMOTE_RUNTIME_STALE",
+    message: "The remote Codex Target, host, or transport authority changed during the read.",
+    phase: "probe",
+    retryable: true,
+    stateMayHaveChanged: false,
+    recovery: "Refresh the remote Target and retry the read."
+  });
+}
+
+function remoteReadCancelled() {
+  return adapterError({
+    code: "CODEX_REMOTE_READ_CANCELLED",
+    message: "The remote Codex read was cancelled.",
+    phase: "probe",
+    retryable: true,
+    stateMayHaveChanged: false,
+    recovery: "Retry the read when the remote Target is still current."
+  });
 }
 
 function backendGeneration(context: AdapterContext): number {

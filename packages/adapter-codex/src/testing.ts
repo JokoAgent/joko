@@ -158,6 +158,13 @@ export class FakeCodexAppServer {
     return transport;
   }
 
+  seedThread(cwd: string, turns: readonly JsonObject[] = []): string {
+    const thread = this.#newThread(cwd);
+    thread.historyMode = "paginated";
+    thread.turns.push(...turns.map((turn) => structuredClone(turn)));
+    return thread.id;
+  }
+
   async completeTurn(threadId: string, text = "completed response"): Promise<void> {
     const transport = this.#requireTransport();
     const thread = this.#thread(threadId);
