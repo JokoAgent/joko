@@ -35,6 +35,12 @@ import { useAppShortcut } from "../use-app-shortcut.js";
 import { BrowserChrome, type BrowserChromeHandle } from "./BrowserChrome.js";
 import { BrowserCommentPopover, emptyBrowserCommentEditorDraft, hasBrowserCommentDesignDraft, hasBrowserCommentEditorDraft, type BrowserCommentDesignPreview, type BrowserCommentEditorDraft } from "./BrowserCommentPopover.js";
 import { BrowserLostPageCard, BrowserPageRail, type BrowserPageSelection } from "./BrowserPageRail.js";
+import {
+  ExtensionPackageBatchDialog,
+  ExtensionPackageDialog,
+  ExtensionPackageRemovalDialog,
+  type ExtensionPackageIntent
+} from "./ExtensionPackageDialogs.js";
 import { ExtensionSourceDialog } from "./ExtensionSourceDialog.js";
 import { resolveComposerAttachmentPolicy } from "./composer-behavior.js";
 import type { RunAction, Translator } from "./types.js";
@@ -861,6 +867,9 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, lo
   const [mutationKey, setMutationKey] = useState<string>();
   const [setupOpen, setSetupOpen] = useState(false);
   const [sourcesOpen, setSourcesOpen] = useState(false);
+  const [packageIntent, setPackageIntent] = useState<ExtensionPackageIntent>();
+  const [packageRemoval, setPackageRemoval] = useState<ExtensionCatalogEntryView>();
+  const [packageBatchOpen, setPackageBatchOpen] = useState(false);
   const listRequest = useRef(0);
   const detailRequest = useRef(0);
   const detailRetryAbort = useRef<AbortController | undefined>(undefined);
@@ -1009,6 +1018,23 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, lo
     });
   };
 
+  const openPackage = (extension: ExtensionCatalogEntryView): void => {
+    const ownerResourceId = extension.owner.kind === "resource" ? extension.owner.resourceId : undefined;
+    const ownerBackendId = ownerResourceId === undefined
+      ? undefined
+      : snapshot.resources.find((resource) => resource.id === ownerResourceId)?.backendId;
+    const sessionBackendId = runtimeSessionId === undefined
+      ? undefined
+      : snapshot.sessions.find((session) => session.id === runtimeSessionId)?.backendId;
+    const capableBackends = snapshot.backends.filter((backend) => resourceKindsForBackend(backend).includes("package"));
+    const backendId = ownerBackendId
+      ?? capableBackends.find((backend) => backend.id === sessionBackendId)?.id
+      ?? capableBackends[0]?.id
+      ?? "";
+    setPackageIntent({ extension, backendId });
+  };
+  const hasPackageUpdates = [...snapshot.extensions, ...entries].some((extension) => extension.owner.kind === "resource" && extension.update !== undefined);
+
   const selectedDetail = detail?.id === selectedId ? detail : undefined;
   return <div className={cx("extension-browser", selectedId !== undefined && "has-selection")}>
     <section className="extension-browser__catalog" aria-label={t("extensions.catalog") }>
@@ -1016,7 +1042,7 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, lo
         <label className="extension-search"><Search aria-hidden="true" /><span className="sr-only">{t("extensions.search")}</span><input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("extensions.searchPlaceholder")} /></label>
         <div className="extension-catalog-actions"><div className="extension-facets" role="tablist" aria-label={t("extensions.filter") }>
           {(["installed", "catalog", "local", "market"] as const).map((value) => <button type="button" role="tab" aria-selected={facet === value} tabIndex={facet === value ? 0 : -1} className={facet === value ? "is-active" : ""} key={value} onKeyDown={(event) => moveTablistSelection(event, "horizontal")} onClick={() => setFacet(value)}>{t(`extensions.facet.${value}`)}</button>)}
-        </div><Button tone="ghost" onClick={() => setSourcesOpen(true)}><FolderPlus aria-hidden="true" />{t("extensions.sources.manage")}</Button>
+        </div>{hasPackageUpdates && <Button tone="ghost" onClick={() => setPackageBatchOpen(true)}><PackageCheck aria-hidden="true" />{t("extensions.package.updateAll")}</Button>}<Button tone="ghost" onClick={() => setSourcesOpen(true)}><FolderPlus aria-hidden="true" />{t("extensions.sources.manage")}</Button>
         </div>
       </div>
       {recovered && <div className="extension-catalog-warning" role="alert"><AlertTriangle aria-hidden="true" /><span>{t("extensions.recovered")}</span></div>}
@@ -1045,6 +1071,8 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, lo
         onSidebarChange={(visible) => mutate(`extension-sidebar:${selectedDetail.id}`, selectedDetail.id, () => controller.setExtensionSidebarVisible(selectedDetail.id, visible, selectedDetail.revision))}
         onSetup={() => setSetupOpen(true)}
         onUse={(command) => useCommand(selectedDetail, command)}
+        onPackage={() => openPackage(selectedDetail)}
+        onRemove={() => setPackageRemoval(selectedDetail)}
       />}
     </section>
     <ExtensionSetupDialog
@@ -1072,11 +1100,45 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, lo
       }}
       onRevoke={() => selectedDetail !== undefined && mutate(`extension-setup-revoke:${selectedDetail.id}`, selectedDetail.id, () => controller.revokeExtensionSetup(selectedDetail.id, selectedDetail.revision))}
     />
+    <ExtensionPackageDialog
+      controller={controller}
+      backends={snapshot.backends}
+      resources={snapshot.resources}
+      intent={packageIntent}
+      t={t}
+      runAction={runAction}
+      onClose={() => setPackageIntent(undefined)}
+      onChanged={refreshSelected}
+    />
+    <ExtensionPackageRemovalDialog
+      controller={controller}
+      extension={packageRemoval}
+      t={t}
+      runAction={runAction}
+      onClose={() => setPackageRemoval(undefined)}
+      onChanged={async () => {
+        onSelect(undefined);
+        setRefreshRevision((value) => value + 1);
+      }}
+    />
+    <ExtensionPackageBatchDialog
+      controller={controller}
+      resources={snapshot.resources}
+      open={packageBatchOpen}
+      t={t}
+      runAction={runAction}
+      onClose={() => setPackageBatchOpen(false)}
+      onChanged={async () => {
+        const current = selectedRef.current;
+        if (current !== undefined) await refreshSelected(current).catch(() => undefined);
+        else setRefreshRevision((value) => value + 1);
+      }}
+    />
     <ExtensionSourceDialog controller={controller} locale={locale} open={sourcesOpen} t={t} runAction={runAction} onClose={() => setSourcesOpen(false)} onCatalogChanged={() => setRefreshRevision((value) => value + 1)} />
   </div>;
 }
 
-function ExtensionDetail({ extension, busy, t, onEnabledChange, onSidebarChange, onSetup, onUse }: {
+function ExtensionDetail({ extension, busy, t, onEnabledChange, onSidebarChange, onSetup, onUse, onPackage, onRemove }: {
   readonly extension: ExtensionCatalogEntryView;
   readonly busy: boolean;
   readonly t: Translator;
@@ -1084,16 +1146,22 @@ function ExtensionDetail({ extension, busy, t, onEnabledChange, onSidebarChange,
   readonly onSidebarChange: (visible: boolean) => void;
   readonly onSetup: () => void;
   readonly onUse: (command: ExtensionCatalogEntryView["commands"][number]) => void;
+  readonly onPackage: () => void;
+  readonly onRemove: () => void;
 }): JSX.Element {
   const sourceOwned = extension.owner.kind === "source";
   return <article className="extension-detail">
     <header className="extension-detail__header"><span className="extension-detail__icon"><Boxes aria-hidden="true" /></span><div><p className="eyebrow">{extension.source === "local" ? t("extensions.local") : t("extensions.market")}</p><h2>{extension.name}</h2><p>{extension.description || t("extensions.noDescription")}</p></div><Pill tone={sourceOwned ? extensionInstallTone(extension.installState) : extension.enabled ? "success" : "neutral"}>{sourceOwned ? extensionInstallLabel(extension.installState, t) : extension.enabled ? t("common.enabled") : t("common.disabled")}</Pill></header>
     {extension.error !== undefined && <p className="extension-detail__error" role="alert"><AlertTriangle aria-hidden="true" />{extension.error}</p>}
     <dl className="extension-detail__metadata"><div><dt>{t("extensions.version")}</dt><dd>{extension.version ?? t("common.unknown")}</dd></div><div><dt>{t("extensions.author")}</dt><dd>{extension.author ?? t("common.unknown")}</dd></div><div><dt>{t("common.state")}</dt><dd>{extensionInstallLabel(extension.installState, t)}</dd></div><div><dt>{t("extensions.owner")}</dt><dd>{extension.owner.kind === "resource" ? t("extensions.resourceOwner") : extension.owner.kind === "mcp" ? t("extensions.mcpOwner") : t("extensions.sourceOwner")}</dd></div></dl>
-    {sourceOwned ? <section className="extension-source-available"><FolderPlus aria-hidden="true" /><div><strong>{t("extensions.sourceAvailable")}</strong><p>{t("extensions.sourceAvailableBody")}</p></div></section> : <section className="extension-detail__settings" aria-label={t("extensions.configuration") }>
+    {sourceOwned ? <section className="extension-source-available"><FolderPlus aria-hidden="true" /><div><strong>{t("extensions.sourceAvailable")}</strong><p>{t("extensions.sourceAvailableBody")}</p></div><Button tone="primary" disabled={busy} onClick={onPackage}><Download aria-hidden="true" />{t("extensions.package.install")}</Button></section> : <section className="extension-detail__settings" aria-label={t("extensions.configuration") }>
       <label><span><strong>{t("extensions.enabled")}</strong><small>{t("extensions.enabledBody")}</small></span><CheckboxControl checked={extension.enabled} disabled={busy} onChange={(event) => onEnabledChange(event.target.checked)} /></label>
       {extension.sidebarSupported && <label><span><strong>{t("extensions.showSidebar")}</strong><small>{t("extensions.showSidebarBody")}</small></span><CheckboxControl checked={extension.sidebarVisible} disabled={busy} onChange={(event) => onSidebarChange(event.target.checked)} /></label>}
       {extension.setup.state !== "notRequired" && <button type="button" disabled={busy} onClick={onSetup}><span><strong>{t("extensions.setup")}</strong><small>{extension.setup.error ?? extensionSetupLabel(extension.setup.state, t)}</small></span><Pill tone={extension.setup.state === "ready" ? "success" : extension.setup.state === "failed" ? "danger" : "warning"}>{extensionSetupLabel(extension.setup.state, t)}</Pill></button>}
+    </section>}
+    {extension.owner.kind === "resource" && <section className="extension-package-management">
+      {extension.update !== undefined && <div className={cx("extension-package-update", extension.update.sourceReplacement && "is-replacement")}><RefreshCcw aria-hidden="true" /><span><strong>{extension.update.sourceReplacement ? t("extensions.package.replacementTitle") : t("extensions.install.updateAvailable")}</strong><small>{extension.version ?? t("common.unknown")} → {extension.update.availableVersion ?? t("common.unknown")}</small></span><Button tone={extension.update.sourceReplacement ? "danger" : "primary"} disabled={busy} onClick={onPackage}>{extension.update.sourceReplacement ? t("extensions.package.replace") : t("extensions.package.update")}</Button></div>}
+      <Button tone="ghost" className="danger-text" disabled={busy} onClick={onRemove}><Trash2 aria-hidden="true" />{t("extensions.package.uninstall")}</Button>
     </section>}
     <ExtensionDetailSection title={t("extensions.commands")} empty={t("extensions.noCommands")} items={extension.commands.map((command) => <div className="extension-capability-row" key={`${command.sessionId}\u0000${command.name}`}><span><strong>/{command.name}</strong><small>{command.description}</small></span><Button tone="primary" disabled={busy || !extension.enabled} onClick={() => onUse(command)}><Play aria-hidden="true" />{extension.setup.state === "ready" || extension.setup.state === "notRequired" ? t("extensions.use") : t("extensions.configureToUse")}</Button></div>)} />
     <ExtensionDetailSection title={t("extensions.tools")} empty={t("extensions.noTools")} items={extension.tools.map((tool) => <div className="extension-capability-row" key={tool.name}><span><strong>{tool.name}</strong><small>{tool.description}</small></span>{tool.requiresPermission && <Pill tone="warning">{t("extensions.permissionRequired")}</Pill>}</div>)} />

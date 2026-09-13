@@ -78,6 +78,49 @@ function immediateHost(store: object, extra: Record<string, unknown> = {}) {
   };
 }
 
+function replayingHost(
+  store: object,
+  operations: Map<string, OperationRecord<unknown>>,
+  extra: Record<string, unknown> = {}
+) {
+  return {
+    mutate: async (input: {
+      readonly operationId: string;
+      readonly kind: string;
+      readonly body: unknown;
+      readonly precondition?: (value: object) => void;
+      readonly effect?: () => Promise<void>;
+      readonly commit: (value: object) => unknown;
+      readonly complete?: (
+        commit: (finalize?: (value: object) => void) => {
+          readonly replayed: boolean;
+          readonly value: unknown;
+          readonly operation: OperationRecord<unknown>;
+        }
+      ) => Promise<{
+        readonly replayed: boolean;
+        readonly value: unknown;
+        readonly operation: OperationRecord<unknown>;
+      }>;
+    }) => {
+      const existing = operations.get(input.operationId);
+      if (existing !== undefined) return { replayed: true, value: existing.response, operation: existing };
+      input.precondition?.(store);
+      await input.effect?.();
+      const commit = (finalize?: (value: object) => void) => {
+        input.precondition?.(store);
+        finalize?.(store);
+        const value = input.commit(store);
+        const operation = completedRecord(input.operationId, input.kind, input.body, value);
+        operations.set(input.operationId, operation);
+        return { replayed: false, value, operation };
+      };
+      return input.complete === undefined ? commit() : input.complete(commit);
+    },
+    ...extra
+  };
+}
+
 describe("Connect Extension catalog boundary", () => {
   it("maps a filtered runtime-backed catalog and preserves its owner and revision identity", async () => {
     const base = extensionEntry();
@@ -320,6 +363,266 @@ describe("Connect Extension catalog boundary", () => {
       mutation: failedRefresh
     })).rejects.toThrow("source discovery failed");
     expect(reconcile).toHaveBeenCalledTimes(reconcilesBeforeFailure + 1);
+  });
+
+  it("previews, commits, replays, and uninstalls one exact Source package through the Resource owner", async () => {
+    const source = extensionSource();
+    const sourceEntry = source.entries[0]!;
+    let phase: "source" | "installed" | "removed" = "source";
+    const sourceCatalogEntry = (revision: bigint): ExtensionCatalogDescriptor => extensionEntry({
+      revision,
+      owner: {
+        kind: "source",
+        sourceId: source.id,
+        sourceRevision: source.revision,
+        entryId: sourceEntry.id,
+        contentRevision: sourceEntry.contentRevision
+      },
+      source: "market",
+      installed: false,
+      installState: "available",
+      name: sourceEntry.name,
+      version: "1.0.0",
+      enabled: false,
+      sidebarSupported: false,
+      sidebarVisible: false
+    });
+    const resource = {
+      id: sourceEntry.resourceId,
+      backendId: "pi",
+      kind: "package" as const,
+      scope: "managed" as const,
+      name: "@sample/review",
+      version: "1.0.0",
+      sourceKind: "extension_source" as const,
+      sourceIdentity: "extension-source-package",
+      sourceDisplay: source.sourceDisplay,
+      canonicalPathFingerprint: `sha256:${"d".repeat(64)}`,
+      symbolicLinkDetected: false,
+      specialFileDetected: false,
+      discoveredRevision: sourceEntry.packageContentRevision,
+      packageIdentity: "@sample/review",
+      extensionSource: {
+        sourceId: source.id,
+        sourceRevision: source.revision,
+        packageRelativePath: sourceEntry.packageRelativePath,
+        packageContentRevision: sourceEntry.packageContentRevision
+      },
+      resourceDetails: [{
+        kind: "extension" as const,
+        name: sourceEntry.bindingName,
+        compatibility: "supported" as const,
+        compatibilityIssues: [] as const,
+        detectedApis: ["notify" as const],
+        adaptedApis: ["notify" as const],
+        unsupportedApis: [] as const
+      }],
+      runtimeRequirements: [{ packageName: "@earendil-works/pi-coding-agent", range: "^0.84.0", currentVersion: "0.84.2", compatible: true }],
+      warnings: ["lifecycle-scripts-disabled" as const],
+      disabledLifecycleScripts: ["postinstall"],
+      canToggle: true,
+      requiresExtensionApproval: false,
+      postMutationNotice: true,
+      state: "installed" as const,
+      enabled: false,
+      versionNumber: 1n,
+      updatedAt: 4
+    };
+    const removedResource = { ...resource, state: "removed" as const, versionNumber: 2n };
+    const installedCatalogEntry = extensionEntry({
+      revision: 8n,
+      owner: { kind: "resource", resourceId: resource.id, discoveredRevision: resource.discoveredRevision, resourceVersion: 1n },
+      source: "market",
+      name: sourceEntry.name,
+      version: "1.0.0",
+      enabled: false,
+      sidebarVisible: false
+    });
+    let installedRevision = 8n;
+    const currentCatalogEntry = (): ExtensionCatalogDescriptor => phase === "installed"
+      ? { ...installedCatalogEntry, revision: installedRevision }
+      : sourceCatalogEntry(phase === "removed" ? 9n : 7n);
+    let failCommittedCatalogRefresh = false;
+    const extensionCatalog = {
+      reconcile: vi.fn(() => {
+        if (failCommittedCatalogRefresh && phase === "installed") {
+          failCommittedCatalogRefresh = false;
+          throw new Error("catalog persistence unavailable");
+        }
+        return catalog(currentCatalogEntry());
+      }),
+      snapshot: vi.fn(() => catalog(currentCatalogEntry())),
+      get: vi.fn(() => currentCatalogEntry())
+    };
+    const preview = {
+      action: "install" as const,
+      resourceId: resource.id,
+      backendId: "pi",
+      packageName: "@sample/review",
+      availableVersion: "1.0.0",
+      sourceReplacement: false,
+      preservesEnabled: false,
+      resourceDetails: resource.resourceDetails,
+      runtimeRequirements: resource.runtimeRequirements,
+      warnings: resource.warnings,
+      disabledLifecycleScripts: resource.disabledLifecycleScripts,
+      canToggle: true
+    };
+    const assertCurrent = vi.fn();
+    const release = vi.fn();
+    const withEntry = vi.fn(async (input: unknown, action: (entry: typeof sourceEntry, root: string) => Promise<unknown>) => {
+      expect(input).toMatchObject({ sourceId: source.id, sourceRevision: source.revision, entryId: sourceEntry.id, contentRevision: sourceEntry.contentRevision });
+      return action(sourceEntry, "D:\\leased-package");
+    });
+    const acquireEntry = vi.fn(async () => ({ source, entry: sourceEntry, packageRoot: "D:\\leased-package", assertCurrent, release }));
+    const extensionSources = { snapshot: () => ({ revision: 4n, sources: [source], recoveredFromCorruption: false }), get: () => source, withEntry, acquireEntry };
+    const previewExtensionPackage = vi.fn(async () => preview);
+    const prepareExtensionPackage = vi.fn(async () => ({
+      preview,
+      mutation: { value: resource, revokesRuntimeAuthority: false, fixtureKind: "install" }
+    }));
+    let backendGeneration = 3;
+    let removalDrift: "extension" | "backend" | undefined;
+    const prepareRemove = vi.fn(async () => {
+      if (removalDrift === "extension") installedRevision += 1n;
+      if (removalDrift === "backend") backendGeneration += 1;
+      return { value: removedResource, revokesRuntimeAuthority: false, fixtureKind: "remove" };
+    });
+    const completePreparedMutation = vi.fn(async (prepared: any, completion: (finalize: (store: unknown) => void) => unknown) =>
+      completion(() => { phase = prepared.fixtureKind === "remove" ? "removed" : "installed"; }));
+    const piResources = {
+      list: () => phase === "installed" ? [resource] : phase === "removed" ? [removedResource] : [],
+      get: () => phase === "removed" ? removedResource : resource,
+      previewExtensionPackage,
+      prepareExtensionPackage,
+      prepareRemove,
+      completePreparedMutation
+    };
+    const operations = new Map<string, OperationRecord<unknown>>();
+    const store = {
+      findOperation: (id: string) => operations.get(id),
+      getOperation: (id: string) => operations.get(id),
+      getBackend: () => ({ descriptor: {
+        id: "pi",
+        adapterKind: "pi",
+        instanceGeneration: backendGeneration,
+        capabilities: new Map([["runtime.resources", { key: "runtime.resources", supported: true, options: ["extension", "package"] }]])
+      } }),
+      appendDiagnostic: vi.fn()
+    };
+    const fence = Symbol("resource-catalog");
+    const fenceBackendResourceCatalogs = vi.fn(() => fence);
+    const completeBackendResourceCatalogRefresh = vi.fn();
+    const host = replayingHost(store, operations, { fenceBackendResourceCatalogs, completeBackendResourceCatalogRefresh });
+    const refreshPiGeneration = vi.fn(async () => undefined);
+    const services = createConnectServices(stubApplication({
+      store,
+      piResources,
+      extensionSources,
+      extensionCatalog,
+      sessionHost: host,
+      piBackendIds: new Set(["pi"]),
+      refreshPiGeneration
+    }));
+
+    const wirePreview = await invoke<contract.GetExtensionPackagePreviewResponse>(services.extension.getExtensionPackagePreview, {
+      extensionId: sourceCatalogEntry(7n).id,
+      expectedRevision: { value: 7n },
+      backendId: "pi"
+    });
+    expect(wirePreview.preview).toMatchObject({
+      extensionId: sourceCatalogEntry(7n).id,
+      extensionRevision: { value: 7n },
+      action: contract.ExtensionPackageAction.INSTALL,
+      resourceId: resource.id,
+      backendId: "pi",
+      packageName: "@sample/review",
+      compatibilityDetails: [{ kind: contract.ResourceKind.EXTENSION, compatibility: contract.ResourceCompatibility.SUPPORTED }],
+      runtimeRequirements: [{ status: contract.ResourceRuntimeRequirementStatus.COMPATIBLE }],
+      warnings: [contract.ResourcePackageWarning.LIFECYCLE_SCRIPTS_DISABLED],
+      disabledLifecycleScripts: ["postinstall"]
+    });
+
+    const adopt = create(contract.OperationMutationSchema, { payload: { case: "adoptExtensionPackage", value: {
+      extensionId: sourceCatalogEntry(7n).id,
+      expectedRevision: { value: 7n },
+      backendId: "pi",
+      expectedAction: contract.ExtensionPackageAction.INSTALL
+    } } });
+    failCommittedCatalogRefresh = true;
+    const installed = await invoke<contract.SubmitOperationResponse>(services.operation.submitOperation, {
+      operationId: "extension-package-install",
+      connectionId: connection.id,
+      mutation: adopt
+    });
+    expect(installed.operation?.state).toBe(contract.OperationState.SUCCEEDED);
+    expect(installed.operation?.result?.payload.case).toBe("resource");
+    expect(phase).toBe("installed");
+    expect(prepareExtensionPackage).toHaveBeenCalledWith(expect.objectContaining({
+      resourceId: resource.id,
+      backendId: "pi",
+      sourceId: source.id,
+      sourceRevision: source.revision,
+      packageRoot: "D:\\leased-package",
+      approvedByConnectionId: connection.id,
+      expectedAction: "install",
+      allowSourceReplacement: false
+    }));
+    expect(assertCurrent).toHaveBeenCalledTimes(1);
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(fenceBackendResourceCatalogs).toHaveBeenCalledWith("pi");
+    expect(refreshPiGeneration).toHaveBeenCalledTimes(1);
+    expect(completeBackendResourceCatalogRefresh).toHaveBeenCalledWith("pi", fence, true);
+    expect(store.appendDiagnostic).toHaveBeenCalledWith(expect.objectContaining({
+      code: "EXTENSION_CATALOG_REFRESH_FAILED",
+      details: { extensionId: sourceCatalogEntry(7n).id }
+    }));
+
+    await invoke(services.operation.submitOperation, {
+      operationId: "extension-package-install",
+      connectionId: connection.id,
+      mutation: adopt
+    });
+    expect(acquireEntry).toHaveBeenCalledTimes(1);
+    expect(prepareExtensionPackage).toHaveBeenCalledTimes(1);
+    expect(refreshPiGeneration).toHaveBeenCalledTimes(1);
+
+    await expect(invoke(services.extension.getExtensionPackagePreview, {
+      extensionId: installedCatalogEntry.id,
+      expectedRevision: { value: 7n },
+      backendId: "pi"
+    })).rejects.toMatchObject({ code: Code.Aborted });
+
+    const remove = create(contract.OperationMutationSchema, { payload: { case: "removeExtensionPackage", value: {
+      extensionId: installedCatalogEntry.id,
+      expectedRevision: { value: 8n }
+    } } });
+    removalDrift = "extension";
+    await expect(invoke(services.operation.submitOperation, {
+      operationId: "extension-package-remove-stale-extension",
+      connectionId: connection.id,
+      mutation: remove
+    })).rejects.toMatchObject({ code: Code.Aborted });
+    expect(phase).toBe("installed");
+    installedRevision = 8n;
+
+    removalDrift = "backend";
+    await expect(invoke(services.operation.submitOperation, {
+      operationId: "extension-package-remove-stale-backend",
+      connectionId: connection.id,
+      mutation: remove
+    })).rejects.toMatchObject({ code: Code.Aborted });
+    expect(phase).toBe("installed");
+    removalDrift = undefined;
+
+    await invoke(services.operation.submitOperation, {
+      operationId: "extension-package-remove",
+      connectionId: connection.id,
+      mutation: remove
+    });
+    expect(prepareRemove).toHaveBeenCalledWith(resource.id);
+    expect(phase).toBe("removed");
+    expect(currentCatalogEntry()).toMatchObject({ revision: 9n, owner: { kind: "source" } });
   });
 });
 

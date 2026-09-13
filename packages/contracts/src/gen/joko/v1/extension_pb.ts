@@ -8,13 +8,15 @@ import type { Timestamp } from "@bufbuild/protobuf/wkt";
 import { file_google_protobuf_timestamp } from "@bufbuild/protobuf/wkt";
 import type { Revision } from "./common_pb.js";
 import { file_joko_v1_common } from "./common_pb.js";
+import type { ResourceCompatibilityDetail, ResourcePackageWarning, ResourceRuntimeRequirement } from "./settings_pb.js";
+import { file_joko_v1_settings } from "./settings_pb.js";
 import type { Message } from "@bufbuild/protobuf";
 
 /**
  * Describes the file joko/v1/extension.proto.
  */
 export const file_joko_v1_extension: GenFile = /*@__PURE__*/
-  fileDesc("Chdqb2tvL3YxL2V4dGVuc2lvbi5wcm90bxIHam9rby52MSIkChRFeHRlbnNpb25Mb2NhbFNvdXJjZRIMCgRwYXRoGAEgASgJIlwKEkV4dGVuc2lvbkdpdFNvdXJjZRIWCg5yZXBvc2l0b3J5X3VybBgBIAEoCRIQCgNyZWYYAiABKAlIAIgBARIUCgxzcGFyc2VfcGF0aHMYAyADKAlCBgoEX3JlZiJ9ChdFeHRlbnNpb25Tb3VyY2VMb2NhdGlvbhIuCgVsb2NhbBgBIAEoCzIdLmpva28udjEuRXh0ZW5zaW9uTG9jYWxTb3VyY2VIABIqCgNnaXQYAiABKAsyGy5qb2tvLnYxLkV4dGVuc2lvbkdpdFNvdXJjZUgAQgYKBGtpbmQidwoWRXh0ZW5zaW9uUmVzb3VyY2VPd25lchITCgtyZXNvdXJjZV9pZBgBIAEoCRIbChNkaXNjb3ZlcmVkX3JldmlzaW9uGAIgASgJEisKEHJlc291cmNlX3ZlcnNpb24YAyABKAsyES5qb2tvLnYxLlJldmlzaW9uIlYKEUV4dGVuc2lvbk1jcE93bmVyEhUKDW1jcF9zZXJ2ZXJfaWQYASABKAkSKgoPc2VydmVyX3JldmlzaW9uGAIgASgLMhEuam9rby52MS5SZXZpc2lvbiKBAQoURXh0ZW5zaW9uU291cmNlT3duZXISEQoJc291cmNlX2lkGAEgASgJEioKD3NvdXJjZV9yZXZpc2lvbhgCIAEoCzIRLmpva28udjEuUmV2aXNpb24SEAoIZW50cnlfaWQYAyABKAkSGAoQY29udGVudF9yZXZpc2lvbhgEIAEoCSKpAQoORXh0ZW5zaW9uT3duZXISMwoIcmVzb3VyY2UYASABKAsyHy5qb2tvLnYxLkV4dGVuc2lvblJlc291cmNlT3duZXJIABIpCgNtY3AYAiABKAsyGi5qb2tvLnYxLkV4dGVuc2lvbk1jcE93bmVySAASLwoGc291cmNlGAMgASgLMh0uam9rby52MS5FeHRlbnNpb25Tb3VyY2VPd25lckgAQgYKBGtpbmQiyAQKGUV4dGVuc2lvblNvdXJjZURlc2NyaXB0b3ISEQoJc291cmNlX2lkGAEgASgJEiMKCHJldmlzaW9uGAIgASgLMhEuam9rby52MS5SZXZpc2lvbhIqCgRraW5kGAMgASgOMhwuam9rby52MS5FeHRlbnNpb25Tb3VyY2VLaW5kEjIKCGxvY2F0aW9uGAQgASgLMiAuam9rby52MS5FeHRlbnNpb25Tb3VyY2VMb2NhdGlvbhIMCgRuYW1lGAUgASgJEhkKDGRpc3BsYXlfbmFtZRgGIAEoCUgAiAEBEiwKBXN0YXRlGAcgASgOMh0uam9rby52MS5FeHRlbnNpb25Tb3VyY2VTdGF0ZRIYChBjb250ZW50X3JldmlzaW9uGAggASgJEiIKGmRpc2NvdmVyZWRfZXh0ZW5zaW9uX2NvdW50GAkgASgNEhwKFGRlY2xhcmVkX2VudHJ5X2NvdW50GAogASgNEhsKE3NraXBwZWRfZW50cnlfY291bnQYCyABKA0SHgoWdW5yZWFkYWJsZV9lbnRyeV9jb3VudBgMIAEoDRIsCghhZGRlZF9hdBgNIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASNQoMcmVmcmVzaGVkX2F0GA4gASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcEgBiAEBEhIKBWVycm9yGA8gASgJSAKIAQFCDwoNX2Rpc3BsYXlfbmFtZUIPCg1fcmVmcmVzaGVkX2F0QggKBl9lcnJvciJrChtFeHRlbnNpb25Tb3VyY2VHaXRQcmVmbGlnaHQSEQoJYXZhaWxhYmxlGAEgASgIEhQKB3ZlcnNpb24YAiABKAlIAIgBARIXCg9taW5pbXVtX3ZlcnNpb24YAyABKAlCCgoIX3ZlcnNpb24iWQoXRXh0ZW5zaW9uVG9vbERlc2NyaXB0b3ISDAoEbmFtZRgBIAEoCRITCgtkZXNjcmlwdGlvbhgCIAEoCRIbChNyZXF1aXJlc19wZXJtaXNzaW9uGAMgASgIIn0KHUV4dGVuc2lvblBlcm1pc3Npb25EZXNjcmlwdG9yEhUKDXBlcm1pc3Npb25faWQYASABKAkSDQoFbGFiZWwYAiABKAkSEwoLZGVzY3JpcHRpb24YAyABKAkSEAoIcmVxdWlyZWQYBCABKAgSDwoHZ3JhbnRlZBgFIAEoCCJTChpFeHRlbnNpb25Db21tYW5kRGVzY3JpcHRvchIMCgRuYW1lGAEgASgJEhMKC2Rlc2NyaXB0aW9uGAIgASgJEhIKCnNlc3Npb25faWQYAyABKAkivAEKHUV4dGVuc2lvblNldHVwRmllbGREZXNjcmlwdG9yEhAKCGZpZWxkX2lkGAEgASgJEg0KBWxhYmVsGAIgASgJEhMKC2Rlc2NyaXB0aW9uGAMgASgJEi4KBGtpbmQYBCABKA4yIC5qb2tvLnYxLkV4dGVuc2lvblNldHVwRmllbGRLaW5kEhAKCHJlcXVpcmVkGAUgASgIEhIKCmNvbmZpZ3VyZWQYBiABKAgSDwoHb3B0aW9ucxgHIAMoCSLqAQoYRXh0ZW5zaW9uU2V0dXBEZXNjcmlwdG9yEisKBXN0YXRlGAEgASgOMhwuam9rby52MS5FeHRlbnNpb25TZXR1cFN0YXRlEhcKCmF0dGVtcHRfaWQYAiABKAlIAIgBARIjCghyZXZpc2lvbhgDIAEoCzIRLmpva28udjEuUmV2aXNpb24SNgoGZmllbGRzGAQgAygLMiYuam9rby52MS5FeHRlbnNpb25TZXR1cEZpZWxkRGVzY3JpcHRvchISCgVlcnJvchgFIAEoCUgBiAEBQg0KC19hdHRlbXB0X2lkQggKBl9lcnJvciKrBQoVRXh0ZW5zaW9uQ2F0YWxvZ0VudHJ5EhQKDGV4dGVuc2lvbl9pZBgBIAEoCRIjCghyZXZpc2lvbhgCIAEoCzIRLmpva28udjEuUmV2aXNpb24SJgoFb3duZXIYAyABKAsyFy5qb2tvLnYxLkV4dGVuc2lvbk93bmVyEi8KBnNvdXJjZRgEIAEoDjIfLmpva28udjEuRXh0ZW5zaW9uQ2F0YWxvZ1NvdXJjZRIRCglpbnN0YWxsZWQYBSABKAgSNQoNaW5zdGFsbF9zdGF0ZRgGIAEoDjIeLmpva28udjEuRXh0ZW5zaW9uSW5zdGFsbFN0YXRlEgwKBG5hbWUYByABKAkSFAoHdmVyc2lvbhgIIAEoCUgAiAEBEhMKBmF1dGhvchgJIAEoCUgBiAEBEhMKC2Rlc2NyaXB0aW9uGAogASgJEg8KB2VuYWJsZWQYCyABKAgSGQoRc2lkZWJhcl9zdXBwb3J0ZWQYDCABKAgSFwoPc2lkZWJhcl92aXNpYmxlGA0gASgIEi8KBXRvb2xzGA4gAygLMiAuam9rby52MS5FeHRlbnNpb25Ub29sRGVzY3JpcHRvchI7CgtwZXJtaXNzaW9ucxgPIAMoCzImLmpva28udjEuRXh0ZW5zaW9uUGVybWlzc2lvbkRlc2NyaXB0b3ISNQoIY29tbWFuZHMYECADKAsyIy5qb2tvLnYxLkV4dGVuc2lvbkNvbW1hbmREZXNjcmlwdG9yEjAKBXNldHVwGBEgASgLMiEuam9rby52MS5FeHRlbnNpb25TZXR1cERlc2NyaXB0b3ISFQoNdXNlX3N1cHBvcnRlZBgSIAEoCBISCgVlcnJvchgTIAEoCUgCiAEBQgoKCF92ZXJzaW9uQgkKB19hdXRob3JCCAoGX2Vycm9yIpMBChhFeHRlbnNpb25DYXRhbG9nU25hcHNob3QSIwoIcmV2aXNpb24YASABKAsyES5qb2tvLnYxLlJldmlzaW9uEi8KB2VudHJpZXMYAiADKAsyHi5qb2tvLnYxLkV4dGVuc2lvbkNhdGFsb2dFbnRyeRIhChlyZWNvdmVyZWRfZnJvbV9jb3JydXB0aW9uGAMgASgIKosBChZFeHRlbnNpb25DYXRhbG9nU291cmNlEigKJEVYVEVOU0lPTl9DQVRBTE9HX1NPVVJDRV9VTlNQRUNJRklFRBAAEiIKHkVYVEVOU0lPTl9DQVRBTE9HX1NPVVJDRV9MT0NBTBABEiMKH0VYVEVOU0lPTl9DQVRBTE9HX1NPVVJDRV9NQVJLRVQQAiqHAgoVRXh0ZW5zaW9uSW5zdGFsbFN0YXRlEicKI0VYVEVOU0lPTl9JTlNUQUxMX1NUQVRFX1VOU1BFQ0lGSUVEEAASJQohRVhURU5TSU9OX0lOU1RBTExfU1RBVEVfQVZBSUxBQkxFEAESJgoiRVhURU5TSU9OX0lOU1RBTExfU1RBVEVfSU5TVEFMTElORxACEiUKIUVYVEVOU0lPTl9JTlNUQUxMX1NUQVRFX0lOU1RBTExFRBADEiwKKEVYVEVOU0lPTl9JTlNUQUxMX1NUQVRFX1VQREFURV9BVkFJTEFCTEUQBBIhCh1FWFRFTlNJT05fSU5TVEFMTF9TVEFURV9FUlJPUhAFKpcCChNFeHRlbnNpb25TZXR1cFN0YXRlEiUKIUVYVEVOU0lPTl9TRVRVUF9TVEFURV9VTlNQRUNJRklFRBAAEiYKIkVYVEVOU0lPTl9TRVRVUF9TVEFURV9OT1RfUkVRVUlSRUQQARIiCh5FWFRFTlNJT05fU0VUVVBfU1RBVEVfUkVRVUlSRUQQAhIlCiFFWFRFTlNJT05fU0VUVVBfU1RBVEVfSU5fUFJPR1JFU1MQAxIfChtFWFRFTlNJT05fU0VUVVBfU1RBVEVfUkVBRFkQBBIjCh9FWFRFTlNJT05fU0VUVVBfU1RBVEVfQ0FOQ0VMTEVEEAUSIAocRVhURU5TSU9OX1NFVFVQX1NUQVRFX0ZBSUxFRBAGKuQBChdFeHRlbnNpb25TZXR1cEZpZWxkS2luZBIqCiZFWFRFTlNJT05fU0VUVVBfRklFTERfS0lORF9VTlNQRUNJRklFRBAAEiMKH0VYVEVOU0lPTl9TRVRVUF9GSUVMRF9LSU5EX1RFWFQQARIlCiFFWFRFTlNJT05fU0VUVVBfRklFTERfS0lORF9TRUNSRVQQAhIkCiBFWFRFTlNJT05fU0VUVVBfRklFTERfS0lORF9PQVVUSBADEisKJ0VYVEVOU0lPTl9TRVRVUF9GSUVMRF9LSU5EX0NPTkZJUk1BVElPThAEKnwKE0V4dGVuc2lvblNvdXJjZUtpbmQSJQohRVhURU5TSU9OX1NPVVJDRV9LSU5EX1VOU1BFQ0lGSUVEEAASHwobRVhURU5TSU9OX1NPVVJDRV9LSU5EX0xPQ0FMEAESHQoZRVhURU5TSU9OX1NPVVJDRV9LSU5EX0dJVBACKoIBChRFeHRlbnNpb25Tb3VyY2VTdGF0ZRImCiJFWFRFTlNJT05fU09VUkNFX1NUQVRFX1VOU1BFQ0lGSUVEEAASIAocRVhURU5TSU9OX1NPVVJDRV9TVEFURV9SRUFEWRABEiAKHEVYVEVOU0lPTl9TT1VSQ0VfU1RBVEVfRVJST1IQAmIGcHJvdG8z", [file_google_protobuf_timestamp, file_joko_v1_common]);
+  fileDesc("Chdqb2tvL3YxL2V4dGVuc2lvbi5wcm90bxIHam9rby52MSIkChRFeHRlbnNpb25Mb2NhbFNvdXJjZRIMCgRwYXRoGAEgASgJIlwKEkV4dGVuc2lvbkdpdFNvdXJjZRIWCg5yZXBvc2l0b3J5X3VybBgBIAEoCRIQCgNyZWYYAiABKAlIAIgBARIUCgxzcGFyc2VfcGF0aHMYAyADKAlCBgoEX3JlZiJ9ChdFeHRlbnNpb25Tb3VyY2VMb2NhdGlvbhIuCgVsb2NhbBgBIAEoCzIdLmpva28udjEuRXh0ZW5zaW9uTG9jYWxTb3VyY2VIABIqCgNnaXQYAiABKAsyGy5qb2tvLnYxLkV4dGVuc2lvbkdpdFNvdXJjZUgAQgYKBGtpbmQidwoWRXh0ZW5zaW9uUmVzb3VyY2VPd25lchITCgtyZXNvdXJjZV9pZBgBIAEoCRIbChNkaXNjb3ZlcmVkX3JldmlzaW9uGAIgASgJEisKEHJlc291cmNlX3ZlcnNpb24YAyABKAsyES5qb2tvLnYxLlJldmlzaW9uIlYKEUV4dGVuc2lvbk1jcE93bmVyEhUKDW1jcF9zZXJ2ZXJfaWQYASABKAkSKgoPc2VydmVyX3JldmlzaW9uGAIgASgLMhEuam9rby52MS5SZXZpc2lvbiKBAQoURXh0ZW5zaW9uU291cmNlT3duZXISEQoJc291cmNlX2lkGAEgASgJEioKD3NvdXJjZV9yZXZpc2lvbhgCIAEoCzIRLmpva28udjEuUmV2aXNpb24SEAoIZW50cnlfaWQYAyABKAkSGAoQY29udGVudF9yZXZpc2lvbhgEIAEoCSKpAQoORXh0ZW5zaW9uT3duZXISMwoIcmVzb3VyY2UYASABKAsyHy5qb2tvLnYxLkV4dGVuc2lvblJlc291cmNlT3duZXJIABIpCgNtY3AYAiABKAsyGi5qb2tvLnYxLkV4dGVuc2lvbk1jcE93bmVySAASLwoGc291cmNlGAMgASgLMh0uam9rby52MS5FeHRlbnNpb25Tb3VyY2VPd25lckgAQgYKBGtpbmQiyAQKGUV4dGVuc2lvblNvdXJjZURlc2NyaXB0b3ISEQoJc291cmNlX2lkGAEgASgJEiMKCHJldmlzaW9uGAIgASgLMhEuam9rby52MS5SZXZpc2lvbhIqCgRraW5kGAMgASgOMhwuam9rby52MS5FeHRlbnNpb25Tb3VyY2VLaW5kEjIKCGxvY2F0aW9uGAQgASgLMiAuam9rby52MS5FeHRlbnNpb25Tb3VyY2VMb2NhdGlvbhIMCgRuYW1lGAUgASgJEhkKDGRpc3BsYXlfbmFtZRgGIAEoCUgAiAEBEiwKBXN0YXRlGAcgASgOMh0uam9rby52MS5FeHRlbnNpb25Tb3VyY2VTdGF0ZRIYChBjb250ZW50X3JldmlzaW9uGAggASgJEiIKGmRpc2NvdmVyZWRfZXh0ZW5zaW9uX2NvdW50GAkgASgNEhwKFGRlY2xhcmVkX2VudHJ5X2NvdW50GAogASgNEhsKE3NraXBwZWRfZW50cnlfY291bnQYCyABKA0SHgoWdW5yZWFkYWJsZV9lbnRyeV9jb3VudBgMIAEoDRIsCghhZGRlZF9hdBgNIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASNQoMcmVmcmVzaGVkX2F0GA4gASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcEgBiAEBEhIKBWVycm9yGA8gASgJSAKIAQFCDwoNX2Rpc3BsYXlfbmFtZUIPCg1fcmVmcmVzaGVkX2F0QggKBl9lcnJvciJrChtFeHRlbnNpb25Tb3VyY2VHaXRQcmVmbGlnaHQSEQoJYXZhaWxhYmxlGAEgASgIEhQKB3ZlcnNpb24YAiABKAlIAIgBARIXCg9taW5pbXVtX3ZlcnNpb24YAyABKAlCCgoIX3ZlcnNpb24iWQoXRXh0ZW5zaW9uVG9vbERlc2NyaXB0b3ISDAoEbmFtZRgBIAEoCRITCgtkZXNjcmlwdGlvbhgCIAEoCRIbChNyZXF1aXJlc19wZXJtaXNzaW9uGAMgASgIIn0KHUV4dGVuc2lvblBlcm1pc3Npb25EZXNjcmlwdG9yEhUKDXBlcm1pc3Npb25faWQYASABKAkSDQoFbGFiZWwYAiABKAkSEwoLZGVzY3JpcHRpb24YAyABKAkSEAoIcmVxdWlyZWQYBCABKAgSDwoHZ3JhbnRlZBgFIAEoCCJTChpFeHRlbnNpb25Db21tYW5kRGVzY3JpcHRvchIMCgRuYW1lGAEgASgJEhMKC2Rlc2NyaXB0aW9uGAIgASgJEhIKCnNlc3Npb25faWQYAyABKAkivAEKHUV4dGVuc2lvblNldHVwRmllbGREZXNjcmlwdG9yEhAKCGZpZWxkX2lkGAEgASgJEg0KBWxhYmVsGAIgASgJEhMKC2Rlc2NyaXB0aW9uGAMgASgJEi4KBGtpbmQYBCABKA4yIC5qb2tvLnYxLkV4dGVuc2lvblNldHVwRmllbGRLaW5kEhAKCHJlcXVpcmVkGAUgASgIEhIKCmNvbmZpZ3VyZWQYBiABKAgSDwoHb3B0aW9ucxgHIAMoCSLqAQoYRXh0ZW5zaW9uU2V0dXBEZXNjcmlwdG9yEisKBXN0YXRlGAEgASgOMhwuam9rby52MS5FeHRlbnNpb25TZXR1cFN0YXRlEhcKCmF0dGVtcHRfaWQYAiABKAlIAIgBARIjCghyZXZpc2lvbhgDIAEoCzIRLmpva28udjEuUmV2aXNpb24SNgoGZmllbGRzGAQgAygLMiYuam9rby52MS5FeHRlbnNpb25TZXR1cEZpZWxkRGVzY3JpcHRvchISCgVlcnJvchgFIAEoCUgBiAEBQg0KC19hdHRlbXB0X2lkQggKBl9lcnJvciKZAQoWRXh0ZW5zaW9uUGFja2FnZVVwZGF0ZRItCgZzb3VyY2UYASABKAsyHS5qb2tvLnYxLkV4dGVuc2lvblNvdXJjZU93bmVyEh4KEWF2YWlsYWJsZV92ZXJzaW9uGAIgASgJSACIAQESGgoSc291cmNlX3JlcGxhY2VtZW50GAMgASgIQhQKEl9hdmFpbGFibGVfdmVyc2lvbiKKAQofRXh0ZW5zaW9uUGFja2FnZUN1cnJlbnRSZXNvdXJjZRITCgtyZXNvdXJjZV9pZBgBIAEoCRIsChFyZXNvdXJjZV9yZXZpc2lvbhgCIAEoCzIRLmpva28udjEuUmV2aXNpb24SDAoEbmFtZRgDIAEoCRIWCg5zb3VyY2VfZGlzcGxheRgEIAEoCSLCBQoXRXh0ZW5zaW9uUGFja2FnZVByZXZpZXcSFAoMZXh0ZW5zaW9uX2lkGAEgASgJEi0KEmV4dGVuc2lvbl9yZXZpc2lvbhgCIAEoCzIRLmpva28udjEuUmV2aXNpb24SLwoGYWN0aW9uGAMgASgOMh8uam9rby52MS5FeHRlbnNpb25QYWNrYWdlQWN0aW9uEhMKC3Jlc291cmNlX2lkGAQgASgJEhIKCmJhY2tlbmRfaWQYBSABKAkSFAoMcGFja2FnZV9uYW1lGAYgASgJEh4KEWluc3RhbGxlZF92ZXJzaW9uGAcgASgJSACIAQESHgoRYXZhaWxhYmxlX3ZlcnNpb24YCCABKAlIAYgBARJHChBjdXJyZW50X3Jlc291cmNlGAkgASgLMiguam9rby52MS5FeHRlbnNpb25QYWNrYWdlQ3VycmVudFJlc291cmNlSAKIAQESGgoSc291cmNlX3JlcGxhY2VtZW50GAogASgIEhkKEXByZXNlcnZlc19lbmFibGVkGAsgASgIEkMKFWNvbXBhdGliaWxpdHlfZGV0YWlscxgMIAMoCzIkLmpva28udjEuUmVzb3VyY2VDb21wYXRpYmlsaXR5RGV0YWlsEkEKFHJ1bnRpbWVfcmVxdWlyZW1lbnRzGA0gAygLMiMuam9rby52MS5SZXNvdXJjZVJ1bnRpbWVSZXF1aXJlbWVudBIxCgh3YXJuaW5ncxgOIAMoDjIfLmpva28udjEuUmVzb3VyY2VQYWNrYWdlV2FybmluZxIiChpkaXNhYmxlZF9saWZlY3ljbGVfc2NyaXB0cxgPIAMoCRISCgpjYW5fdG9nZ2xlGBAgASgIQhQKEl9pbnN0YWxsZWRfdmVyc2lvbkIUChJfYXZhaWxhYmxlX3ZlcnNpb25CEwoRX2N1cnJlbnRfcmVzb3VyY2Ui7AUKFUV4dGVuc2lvbkNhdGFsb2dFbnRyeRIUCgxleHRlbnNpb25faWQYASABKAkSIwoIcmV2aXNpb24YAiABKAsyES5qb2tvLnYxLlJldmlzaW9uEiYKBW93bmVyGAMgASgLMhcuam9rby52MS5FeHRlbnNpb25Pd25lchIvCgZzb3VyY2UYBCABKA4yHy5qb2tvLnYxLkV4dGVuc2lvbkNhdGFsb2dTb3VyY2USEQoJaW5zdGFsbGVkGAUgASgIEjUKDWluc3RhbGxfc3RhdGUYBiABKA4yHi5qb2tvLnYxLkV4dGVuc2lvbkluc3RhbGxTdGF0ZRIMCgRuYW1lGAcgASgJEhQKB3ZlcnNpb24YCCABKAlIAIgBARITCgZhdXRob3IYCSABKAlIAYgBARITCgtkZXNjcmlwdGlvbhgKIAEoCRIPCgdlbmFibGVkGAsgASgIEhkKEXNpZGViYXJfc3VwcG9ydGVkGAwgASgIEhcKD3NpZGViYXJfdmlzaWJsZRgNIAEoCBIvCgV0b29scxgOIAMoCzIgLmpva28udjEuRXh0ZW5zaW9uVG9vbERlc2NyaXB0b3ISOwoLcGVybWlzc2lvbnMYDyADKAsyJi5qb2tvLnYxLkV4dGVuc2lvblBlcm1pc3Npb25EZXNjcmlwdG9yEjUKCGNvbW1hbmRzGBAgAygLMiMuam9rby52MS5FeHRlbnNpb25Db21tYW5kRGVzY3JpcHRvchIwCgVzZXR1cBgRIAEoCzIhLmpva28udjEuRXh0ZW5zaW9uU2V0dXBEZXNjcmlwdG9yEhUKDXVzZV9zdXBwb3J0ZWQYEiABKAgSEgoFZXJyb3IYEyABKAlIAogBARI0CgZ1cGRhdGUYFCABKAsyHy5qb2tvLnYxLkV4dGVuc2lvblBhY2thZ2VVcGRhdGVIA4gBAUIKCghfdmVyc2lvbkIJCgdfYXV0aG9yQggKBl9lcnJvckIJCgdfdXBkYXRlIpMBChhFeHRlbnNpb25DYXRhbG9nU25hcHNob3QSIwoIcmV2aXNpb24YASABKAsyES5qb2tvLnYxLlJldmlzaW9uEi8KB2VudHJpZXMYAiADKAsyHi5qb2tvLnYxLkV4dGVuc2lvbkNhdGFsb2dFbnRyeRIhChlyZWNvdmVyZWRfZnJvbV9jb3JydXB0aW9uGAMgASgIKosBChZFeHRlbnNpb25DYXRhbG9nU291cmNlEigKJEVYVEVOU0lPTl9DQVRBTE9HX1NPVVJDRV9VTlNQRUNJRklFRBAAEiIKHkVYVEVOU0lPTl9DQVRBTE9HX1NPVVJDRV9MT0NBTBABEiMKH0VYVEVOU0lPTl9DQVRBTE9HX1NPVVJDRV9NQVJLRVQQAiqHAgoVRXh0ZW5zaW9uSW5zdGFsbFN0YXRlEicKI0VYVEVOU0lPTl9JTlNUQUxMX1NUQVRFX1VOU1BFQ0lGSUVEEAASJQohRVhURU5TSU9OX0lOU1RBTExfU1RBVEVfQVZBSUxBQkxFEAESJgoiRVhURU5TSU9OX0lOU1RBTExfU1RBVEVfSU5TVEFMTElORxACEiUKIUVYVEVOU0lPTl9JTlNUQUxMX1NUQVRFX0lOU1RBTExFRBADEiwKKEVYVEVOU0lPTl9JTlNUQUxMX1NUQVRFX1VQREFURV9BVkFJTEFCTEUQBBIhCh1FWFRFTlNJT05fSU5TVEFMTF9TVEFURV9FUlJPUhAFKpcCChNFeHRlbnNpb25TZXR1cFN0YXRlEiUKIUVYVEVOU0lPTl9TRVRVUF9TVEFURV9VTlNQRUNJRklFRBAAEiYKIkVYVEVOU0lPTl9TRVRVUF9TVEFURV9OT1RfUkVRVUlSRUQQARIiCh5FWFRFTlNJT05fU0VUVVBfU1RBVEVfUkVRVUlSRUQQAhIlCiFFWFRFTlNJT05fU0VUVVBfU1RBVEVfSU5fUFJPR1JFU1MQAxIfChtFWFRFTlNJT05fU0VUVVBfU1RBVEVfUkVBRFkQBBIjCh9FWFRFTlNJT05fU0VUVVBfU1RBVEVfQ0FOQ0VMTEVEEAUSIAocRVhURU5TSU9OX1NFVFVQX1NUQVRFX0ZBSUxFRBAGKuQBChdFeHRlbnNpb25TZXR1cEZpZWxkS2luZBIqCiZFWFRFTlNJT05fU0VUVVBfRklFTERfS0lORF9VTlNQRUNJRklFRBAAEiMKH0VYVEVOU0lPTl9TRVRVUF9GSUVMRF9LSU5EX1RFWFQQARIlCiFFWFRFTlNJT05fU0VUVVBfRklFTERfS0lORF9TRUNSRVQQAhIkCiBFWFRFTlNJT05fU0VUVVBfRklFTERfS0lORF9PQVVUSBADEisKJ0VYVEVOU0lPTl9TRVRVUF9GSUVMRF9LSU5EX0NPTkZJUk1BVElPThAEKnwKE0V4dGVuc2lvblNvdXJjZUtpbmQSJQohRVhURU5TSU9OX1NPVVJDRV9LSU5EX1VOU1BFQ0lGSUVEEAASHwobRVhURU5TSU9OX1NPVVJDRV9LSU5EX0xPQ0FMEAESHQoZRVhURU5TSU9OX1NPVVJDRV9LSU5EX0dJVBACKoIBChRFeHRlbnNpb25Tb3VyY2VTdGF0ZRImCiJFWFRFTlNJT05fU09VUkNFX1NUQVRFX1VOU1BFQ0lGSUVEEAASIAocRVhURU5TSU9OX1NPVVJDRV9TVEFURV9SRUFEWRABEiAKHEVYVEVOU0lPTl9TT1VSQ0VfU1RBVEVfRVJST1IQAiqzAQoWRXh0ZW5zaW9uUGFja2FnZUFjdGlvbhIoCiRFWFRFTlNJT05fUEFDS0FHRV9BQ1RJT05fVU5TUEVDSUZJRUQQABIkCiBFWFRFTlNJT05fUEFDS0FHRV9BQ1RJT05fSU5TVEFMTBABEiMKH0VYVEVOU0lPTl9QQUNLQUdFX0FDVElPTl9VUERBVEUQAhIkCiBFWFRFTlNJT05fUEFDS0FHRV9BQ1RJT05fUkVQTEFDRRADYgZwcm90bzM", [file_google_protobuf_timestamp, file_joko_v1_common, file_joko_v1_settings]);
 
 /**
  * @generated from message joko.v1.ExtensionLocalSource
@@ -495,6 +497,157 @@ export const ExtensionSetupDescriptorSchema: GenMessage<ExtensionSetupDescriptor
   messageDesc(file_joko_v1_extension, 13);
 
 /**
+ * @generated from message joko.v1.ExtensionPackageUpdate
+ */
+export type ExtensionPackageUpdate = Message<"joko.v1.ExtensionPackageUpdate"> & {
+  /**
+   * @generated from field: joko.v1.ExtensionSourceOwner source = 1;
+   */
+  source?: ExtensionSourceOwner | undefined;
+
+  /**
+   * @generated from field: optional string available_version = 2;
+   */
+  availableVersion?: string | undefined;
+
+  /**
+   * @generated from field: bool source_replacement = 3;
+   */
+  sourceReplacement: boolean;
+};
+
+/**
+ * Describes the message joko.v1.ExtensionPackageUpdate.
+ * Use `create(ExtensionPackageUpdateSchema)` to create a new message.
+ */
+export const ExtensionPackageUpdateSchema: GenMessage<ExtensionPackageUpdate> = /*@__PURE__*/
+  messageDesc(file_joko_v1_extension, 14);
+
+/**
+ * @generated from message joko.v1.ExtensionPackageCurrentResource
+ */
+export type ExtensionPackageCurrentResource = Message<"joko.v1.ExtensionPackageCurrentResource"> & {
+  /**
+   * @generated from field: string resource_id = 1;
+   */
+  resourceId: string;
+
+  /**
+   * @generated from field: joko.v1.Revision resource_revision = 2;
+   */
+  resourceRevision?: Revision | undefined;
+
+  /**
+   * @generated from field: string name = 3;
+   */
+  name: string;
+
+  /**
+   * @generated from field: string source_display = 4;
+   */
+  sourceDisplay: string;
+};
+
+/**
+ * Describes the message joko.v1.ExtensionPackageCurrentResource.
+ * Use `create(ExtensionPackageCurrentResourceSchema)` to create a new message.
+ */
+export const ExtensionPackageCurrentResourceSchema: GenMessage<ExtensionPackageCurrentResource> = /*@__PURE__*/
+  messageDesc(file_joko_v1_extension, 15);
+
+/**
+ * @generated from message joko.v1.ExtensionPackagePreview
+ */
+export type ExtensionPackagePreview = Message<"joko.v1.ExtensionPackagePreview"> & {
+  /**
+   * @generated from field: string extension_id = 1;
+   */
+  extensionId: string;
+
+  /**
+   * @generated from field: joko.v1.Revision extension_revision = 2;
+   */
+  extensionRevision?: Revision | undefined;
+
+  /**
+   * @generated from field: joko.v1.ExtensionPackageAction action = 3;
+   */
+  action: ExtensionPackageAction;
+
+  /**
+   * @generated from field: string resource_id = 4;
+   */
+  resourceId: string;
+
+  /**
+   * @generated from field: string backend_id = 5;
+   */
+  backendId: string;
+
+  /**
+   * @generated from field: string package_name = 6;
+   */
+  packageName: string;
+
+  /**
+   * @generated from field: optional string installed_version = 7;
+   */
+  installedVersion?: string | undefined;
+
+  /**
+   * @generated from field: optional string available_version = 8;
+   */
+  availableVersion?: string | undefined;
+
+  /**
+   * @generated from field: optional joko.v1.ExtensionPackageCurrentResource current_resource = 9;
+   */
+  currentResource?: ExtensionPackageCurrentResource | undefined;
+
+  /**
+   * @generated from field: bool source_replacement = 10;
+   */
+  sourceReplacement: boolean;
+
+  /**
+   * @generated from field: bool preserves_enabled = 11;
+   */
+  preservesEnabled: boolean;
+
+  /**
+   * @generated from field: repeated joko.v1.ResourceCompatibilityDetail compatibility_details = 12;
+   */
+  compatibilityDetails: ResourceCompatibilityDetail[];
+
+  /**
+   * @generated from field: repeated joko.v1.ResourceRuntimeRequirement runtime_requirements = 13;
+   */
+  runtimeRequirements: ResourceRuntimeRequirement[];
+
+  /**
+   * @generated from field: repeated joko.v1.ResourcePackageWarning warnings = 14;
+   */
+  warnings: ResourcePackageWarning[];
+
+  /**
+   * @generated from field: repeated string disabled_lifecycle_scripts = 15;
+   */
+  disabledLifecycleScripts: string[];
+
+  /**
+   * @generated from field: bool can_toggle = 16;
+   */
+  canToggle: boolean;
+};
+
+/**
+ * Describes the message joko.v1.ExtensionPackagePreview.
+ * Use `create(ExtensionPackagePreviewSchema)` to create a new message.
+ */
+export const ExtensionPackagePreviewSchema: GenMessage<ExtensionPackagePreview> = /*@__PURE__*/
+  messageDesc(file_joko_v1_extension, 16);
+
+/**
  * Generic Extension projection. Executable bytes and secrets are deliberately
  * absent: owner carries only exact Resource/MCP references and setup carries
  * protected credential readiness.
@@ -596,6 +749,11 @@ export type ExtensionCatalogEntry = Message<"joko.v1.ExtensionCatalogEntry"> & {
    * @generated from field: optional string error = 19;
    */
   error?: string | undefined;
+
+  /**
+   * @generated from field: optional joko.v1.ExtensionPackageUpdate update = 20;
+   */
+  update?: ExtensionPackageUpdate | undefined;
 };
 
 /**
@@ -603,7 +761,7 @@ export type ExtensionCatalogEntry = Message<"joko.v1.ExtensionCatalogEntry"> & {
  * Use `create(ExtensionCatalogEntrySchema)` to create a new message.
  */
 export const ExtensionCatalogEntrySchema: GenMessage<ExtensionCatalogEntry> = /*@__PURE__*/
-  messageDesc(file_joko_v1_extension, 14);
+  messageDesc(file_joko_v1_extension, 17);
 
 /**
  * @generated from message joko.v1.ExtensionCatalogSnapshot
@@ -630,7 +788,7 @@ export type ExtensionCatalogSnapshot = Message<"joko.v1.ExtensionCatalogSnapshot
  * Use `create(ExtensionCatalogSnapshotSchema)` to create a new message.
  */
 export const ExtensionCatalogSnapshotSchema: GenMessage<ExtensionCatalogSnapshot> = /*@__PURE__*/
-  messageDesc(file_joko_v1_extension, 15);
+  messageDesc(file_joko_v1_extension, 18);
 
 /**
  * @generated from enum joko.v1.ExtensionCatalogSource
@@ -832,4 +990,35 @@ export enum ExtensionSourceState {
  */
 export const ExtensionSourceStateSchema: GenEnum<ExtensionSourceState> = /*@__PURE__*/
   enumDesc(file_joko_v1_extension, 5);
+
+/**
+ * @generated from enum joko.v1.ExtensionPackageAction
+ */
+export enum ExtensionPackageAction {
+  /**
+   * @generated from enum value: EXTENSION_PACKAGE_ACTION_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: EXTENSION_PACKAGE_ACTION_INSTALL = 1;
+   */
+  INSTALL = 1,
+
+  /**
+   * @generated from enum value: EXTENSION_PACKAGE_ACTION_UPDATE = 2;
+   */
+  UPDATE = 2,
+
+  /**
+   * @generated from enum value: EXTENSION_PACKAGE_ACTION_REPLACE = 3;
+   */
+  REPLACE = 3,
+}
+
+/**
+ * Describes the enum joko.v1.ExtensionPackageAction.
+ */
+export const ExtensionPackageActionSchema: GenEnum<ExtensionPackageAction> = /*@__PURE__*/
+  enumDesc(file_joko_v1_extension, 6);
 

@@ -6,7 +6,15 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import type { AppController } from "../controller.js";
 import { translate } from "../i18n.js";
-import { emptySnapshot, type ExtensionCatalogEntryView, type ExtensionCatalogView, type ExtensionSourceCatalogView } from "../model.js";
+import {
+  emptySnapshot,
+  type BackendView,
+  type ExtensionCatalogEntryView,
+  type ExtensionCatalogView,
+  type ExtensionPackagePreviewView,
+  type ExtensionSourceCatalogView,
+  type ResourceView
+} from "../model.js";
 import { ToolsPage } from "./ToolsPage.js";
 
 const roots: Root[] = [];
@@ -217,10 +225,159 @@ describe("Extension catalog interactions", () => {
     await settle();
     expect(removeExtensionSource).toHaveBeenCalledWith(sourceCatalog.sources[0]?.id, 3n);
   });
+
+  it("previews exact package facts before installing and reports the completed result", async () => {
+    const source = sourceExtension();
+    let current = source;
+    const preview = packagePreview(source, "install", "resource-catalog");
+    const getExtensionPackagePreview = vi.fn(async () => preview);
+    const adoptExtensionPackage = vi.fn(async () => {
+      current = {
+        ...source,
+        revision: 8n,
+        owner: { kind: "resource", resourceId: "resource-catalog", discoveredRevision: `sha256:${"b".repeat(64)}`, resourceRevision: 1n },
+        installed: true,
+        installState: "installed",
+        version: "2.0.0"
+      };
+    });
+    const { container } = await renderExtensions({
+      extension: source,
+      controller: {
+        listExtensions: async () => catalog(current),
+        getExtension: async () => {
+          if (current.owner.kind === "resource") throw new Error("detail refresh failed after commit");
+          return catalog(current);
+        },
+        getExtensionPackagePreview,
+        adoptExtensionPackage
+      }
+    });
+
+    await act(async () => buttonWithText(container, "Install").click());
+    await settle();
+    const dialog = requiredDialog();
+    expect(getExtensionPackagePreview).toHaveBeenCalledWith(source.id, 7n, "backend-1", expect.any(AbortSignal));
+    expect(dialog.textContent).toContain("@sample/review");
+    expect(dialog.textContent).toContain("2.0.0");
+    expect(dialog.textContent).toContain("Lifecycle scripts were disabled");
+    expect(dialog.textContent).toContain("postinstall");
+    expect(dialog.textContent).toContain("@earendil-works/pi-coding-agent");
+
+    await act(async () => buttonWithText(dialog, "Install").click());
+    await settleMany();
+    expect(adoptExtensionPackage).toHaveBeenCalledWith(preview, false);
+    expect(dialog.textContent).toContain("The package operation completed");
+  });
+
+  it("requires explicit confirmation for a package source replacement", async () => {
+    const extension: ExtensionCatalogEntryView = {
+      ...readyExtension(),
+      installState: "updateAvailable",
+      update: { source: sourceOwner("b"), availableVersion: "2.0.0", sourceReplacement: true }
+    };
+    const preview: ExtensionPackagePreviewView = {
+      ...packagePreview(extension, "replace", "resource-replacement"),
+      currentResource: { resourceId: "resource-1", resourceRevision: 4n, name: "Review tools", sourceDisplay: "Original source" },
+      sourceReplacement: true,
+      preservesEnabled: true,
+      installedVersion: "1.0.0"
+    };
+    const adoptExtensionPackage = vi.fn(async () => undefined);
+    const { container } = await renderExtensions({
+      extension,
+      controller: {
+        listExtensions: async () => catalog(extension),
+        getExtension: async () => catalog(extension),
+        getExtensionPackagePreview: vi.fn(async () => preview),
+        adoptExtensionPackage
+      }
+    });
+
+    await act(async () => buttonWithText(container, "Replace").click());
+    await settle();
+    const dialog = requiredDialog();
+    const confirm = buttonWithText(dialog, "Replace");
+    expect(confirm.disabled).toBe(true);
+    expect(dialog.textContent).toContain("Original source");
+    const checkbox = dialog.querySelector<HTMLInputElement>('input[type="checkbox"]');
+    if (checkbox === null) throw new Error("Replacement confirmation was not rendered.");
+    await act(async () => checkbox.click());
+    expect(confirm.disabled).toBe(false);
+    await act(async () => confirm.click());
+    await settleMany();
+    expect(adoptExtensionPackage).toHaveBeenCalledWith(preview, true);
+  });
+
+  it("revision-fences whole-package uninstall and keeps its result visible", async () => {
+    const extension = readyExtension();
+    const removeExtensionPackage = vi.fn(async () => undefined);
+    const { container } = await renderExtensions({
+      extension,
+      controller: {
+        listExtensions: async () => catalog(extension),
+        getExtension: async () => catalog(extension),
+        removeExtensionPackage
+      }
+    });
+
+    await act(async () => buttonWithText(container, "Uninstall").click());
+    const dialog = requiredDialog();
+    expect(dialog.textContent).toContain("entire managed Resource package");
+    await act(async () => buttonWithText(dialog, "Uninstall").click());
+    await settleMany();
+    expect(removeExtensionPackage).toHaveBeenCalledWith(extension.id, 7n);
+    expect(dialog.textContent).toContain("Resource package was uninstalled");
+  });
+
+  it("deduplicates batch updates by Resource, skips source changes, and continues after a failure", async () => {
+    const first = updateExtension("01", "resource-1", false);
+    const duplicate = updateExtension("02", "resource-1", false);
+    const second = updateExtension("03", "resource-2", false);
+    const replacement = updateExtension("04", "resource-3", true);
+    const extensions = [first, duplicate, second, replacement];
+    const listExtensions = vi.fn(async () => ({ revision: 21n, extensions, recoveredFromCorruption: false }));
+    const getExtensionPackagePreview = vi.fn(async (extensionId: string) => {
+      const extension = extensions.find((candidate) => candidate.id === extensionId);
+      if (extension === undefined || extension.owner.kind !== "resource") throw new Error("missing fixture");
+      return packagePreview(extension, "update", extension.owner.resourceId);
+    });
+    const adoptExtensionPackage = vi.fn(async (preview: ExtensionPackagePreviewView) => {
+      if (preview.resourceId === "resource-1") throw new Error("first package failed");
+    });
+    const { container } = await renderExtensions({
+      extension: first,
+      extensions,
+      resources: [managedResource("resource-1"), managedResource("resource-2"), managedResource("resource-3")],
+      controller: {
+        listExtensions,
+        getExtension: async () => ({ revision: 21n, extensions: [first], recoveredFromCorruption: false }),
+        getExtensionPackagePreview,
+        adoptExtensionPackage
+      }
+    });
+
+    await act(async () => buttonWithText(container, "Update all").click());
+    await settle();
+    const dialog = requiredDialog();
+    expect(dialog.querySelectorAll(".extension-package-batch__row")).toHaveLength(3);
+    await act(async () => buttonWithText(dialog, "Update packages").click());
+    await settleMany();
+
+    expect(getExtensionPackagePreview).toHaveBeenCalledTimes(2);
+    expect(adoptExtensionPackage).toHaveBeenCalledTimes(2);
+    expect(adoptExtensionPackage.mock.calls.map(([preview]) => preview.resourceId)).toEqual(["resource-1", "resource-2"]);
+    expect(dialog.textContent).toContain("first package failed");
+    expect(dialog.textContent).toContain("Source changes require individual review");
+    expect(dialog.textContent).toContain("1 updated, 1 failed, 1 skipped");
+  });
 });
 
 async function renderExtensions(input: {
   readonly extension: ExtensionCatalogEntryView;
+  readonly extensions?: readonly ExtensionCatalogEntryView[];
+  readonly resources?: readonly ResourceView[];
+  readonly backends?: readonly BackendView[];
   readonly controller: Partial<AppController>;
 }): Promise<{ readonly container: HTMLDivElement }> {
   const container = document.createElement("div");
@@ -230,8 +387,9 @@ async function renderExtensions(input: {
   const snapshot = {
     ...emptySnapshot(),
     extensionCatalogRevision: 11n,
-    extensions: [input.extension],
-    resources: [{
+    extensions: input.extensions ?? [input.extension],
+    backends: input.backends ?? [packageBackend("backend-1")],
+    resources: input.resources ?? [{
       id: "resource-1",
       backendId: "backend-1",
       targetId: "target-1",
@@ -270,6 +428,44 @@ async function renderExtensions(input: {
   return { container };
 }
 
+function packageBackend(id: string): BackendView {
+  return {
+    id,
+    name: id === "backend-1" ? "Pi" : id,
+    version: "0.84.4",
+    health: "healthy",
+    installationState: "installed",
+    capabilities: new Map([["runtime.resources", {
+      name: "runtime.resources",
+      supported: true,
+      options: ["package", "extension"],
+      maximumItems: 1_000
+    }]])
+  };
+}
+
+function managedResource(id: string, backendId = "backend-1", version = "1.0.0"): ResourceView {
+  return {
+    id,
+    backendId,
+    name: id,
+    version,
+    kind: "package",
+    scope: "managed",
+    state: "loaded",
+    enabled: true,
+    source: "Review catalog",
+    discoveredRevision: `sha256:${id}`,
+    compatibilityDetails: [],
+    runtimeRequirements: [],
+    warnings: [],
+    disabledLifecycleScripts: [],
+    canToggle: true,
+    requiresExtensionApproval: false,
+    postMutationNotice: false
+  };
+}
+
 function readyExtension(): ExtensionCatalogEntryView {
   return {
     id: "extension_0123456789abcdef0123456789abcdef",
@@ -298,6 +494,89 @@ function readyExtension(): ExtensionCatalogEntryView {
   };
 }
 
+function sourceOwner(seed = "a"): Extract<ExtensionCatalogEntryView["owner"], { readonly kind: "source" }> {
+  return {
+    kind: "source",
+    sourceId: `extension_source_${seed.repeat(32)}`,
+    sourceRevision: 3n,
+    entryId: `extension_source_entry_${seed.repeat(32)}`,
+    contentRevision: `sha256:${seed.repeat(64)}`
+  };
+}
+
+function sourceExtension(): ExtensionCatalogEntryView {
+  return {
+    ...readyExtension(),
+    owner: sourceOwner(),
+    source: "market",
+    installed: false,
+    installState: "available",
+    version: "2.0.0",
+    enabled: false,
+    sidebarSupported: false,
+    sidebarVisible: false,
+    commands: [],
+    setup: { state: "notRequired", revision: 0n, fields: [] },
+    useSupported: false
+  };
+}
+
+function updateExtension(seed: string, resourceId: string, sourceReplacement: boolean): ExtensionCatalogEntryView {
+  return {
+    ...readyExtension(),
+    id: `extension_${seed.padStart(32, "0")}`,
+    owner: { kind: "resource", resourceId, discoveredRevision: `sha256:${resourceId}`, resourceRevision: 4n },
+    name: `Package ${resourceId}`,
+    installState: "updateAvailable",
+    update: { source: sourceOwner(sourceReplacement ? "c" : "a"), availableVersion: "2.0.0", sourceReplacement }
+  };
+}
+
+function packagePreview(
+  extension: ExtensionCatalogEntryView,
+  action: ExtensionPackagePreviewView["action"],
+  resourceId: string
+): ExtensionPackagePreviewView {
+  const currentResource = extension.owner.kind !== "resource" || action === "install"
+    ? undefined
+    : {
+        resourceId: extension.owner.resourceId,
+        resourceRevision: extension.owner.resourceRevision,
+        name: extension.name,
+        sourceDisplay: "Review catalog"
+      };
+  return {
+    extensionId: extension.id,
+    extensionRevision: extension.revision,
+    action,
+    resourceId,
+    backendId: "backend-1",
+    packageName: "@sample/review",
+    ...(currentResource === undefined ? {} : { currentResource, installedVersion: extension.version }),
+    availableVersion: "2.0.0",
+    sourceReplacement: action === "replace",
+    preservesEnabled: action !== "install" && extension.enabled,
+    compatibilityDetails: [{
+      kind: "extension",
+      name: "review",
+      compatibility: "supported",
+      issues: [],
+      detectedApis: ["notify"],
+      adaptedApis: ["notify"],
+      unsupportedApis: []
+    }],
+    runtimeRequirements: [{
+      packageName: "@earendil-works/pi-coding-agent",
+      range: "^0.84.0",
+      currentVersion: "0.84.4",
+      status: "compatible"
+    }],
+    warnings: ["lifecycleScriptsDisabled"],
+    disabledLifecycleScripts: ["postinstall"],
+    canToggle: true
+  };
+}
+
 function catalog(extension: ExtensionCatalogEntryView): ExtensionCatalogView {
   return { revision: 11n, extensions: [extension], recoveredFromCorruption: false };
 }
@@ -307,6 +586,13 @@ function buttonWithText(container: ParentNode, text: string): HTMLButtonElement 
     .find((candidate) => candidate.textContent?.trim() === text);
   if (button === undefined) throw new Error(`Expected button ${text}.`);
   return button;
+}
+
+function requiredDialog(): HTMLElement {
+  const dialogs = [...document.body.querySelectorAll<HTMLElement>('[role="dialog"]')];
+  const dialog = dialogs.at(-1);
+  if (dialog === undefined) throw new Error("Expected an open dialog.");
+  return dialog;
 }
 
 function setNativeValue(input: HTMLInputElement, value: string): void {
@@ -321,4 +607,8 @@ async function settle(): Promise<void> {
     await new Promise((resolve) => window.setTimeout(resolve, 0));
     await Promise.resolve();
   });
+}
+
+async function settleMany(): Promise<void> {
+  for (let index = 0; index < 5; index += 1) await settle();
 }

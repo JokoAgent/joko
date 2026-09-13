@@ -316,7 +316,7 @@ describe("ExtensionSourceManager", () => {
     }
   });
 
-  it("removes source visibility before lease-delayed Git cache cleanup and never deletes local directories", async () => {
+  it("removes source visibility before lease-delayed Git cache cleanup, revokes exact leases, and never deletes local directories", async () => {
     const git: ExtensionSourceGitExecutor = async (args) => {
       if (args[0] === "--version") return { stdout: "git version 2.43.0\n", stderr: "" };
       if (args[0] === "clone") {
@@ -332,25 +332,20 @@ describe("ExtensionSourceManager", () => {
       await writeMarket(localRoot, "local-catalog", [{ path: "packages/local", label: "Local" }]);
       const local = await manager.add({ kind: "local", path: localRoot }, 0n);
       const source = await manager.add({ kind: "git", repositoryUrl: "https://example.test/extensions.git", sparsePaths: [] }, 1n);
-      let release!: () => void;
-      let leasedRoot = "";
-      const gate = new Promise<void>((resolvePromise) => { release = resolvePromise; });
-      const reading = manager.withEntry({
+      const lease = await manager.acquireEntry({
         sourceId: source.id,
         sourceRevision: source.revision,
         entryId: source.entries[0]!.id,
         contentRevision: source.entries[0]!.contentRevision
-      }, async (_entry, packageRoot) => {
-        leasedRoot = packageRoot;
-        await gate;
-        return readFile(join(packageRoot, "package.json"), "utf8");
       });
-      await waitFor(() => leasedRoot !== "");
+      const leasedRoot = lease.packageRoot;
+      await expect(readFile(join(leasedRoot, "package.json"), "utf8")).resolves.toContain("Review");
       await manager.remove(source.id, source.revision);
       expect(manager.snapshot().sources.map((item) => item.id)).toEqual([local.id]);
       expect(existsSync(leasedRoot)).toBe(true);
-      release();
-      await expect(reading).resolves.toContain("Review");
+      expect(() => lease.assertCurrent()).toThrow(/not found|changed/iu);
+      lease.release();
+      lease.release();
       await waitFor(() => !existsSync(leasedRoot));
       await manager.remove(local.id, local.revision);
       expect(existsSync(localRoot)).toBe(true);

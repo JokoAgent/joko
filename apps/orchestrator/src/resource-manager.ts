@@ -28,6 +28,7 @@ import {
 
 export type PiResourceKind = "extension" | "skill" | "prompt" | "theme" | "package";
 export type PiResourceScope = "user" | "global" | "project" | "managed";
+export type PiResourceSourceKind = PiPackageSource["kind"] | "extension_source";
 export type PiResourceState =
   | "discovered"
   | "awaiting_approval"
@@ -48,7 +49,7 @@ export interface PiResourceDescriptor {
   readonly scope: PiResourceScope;
   readonly name: string;
   readonly version?: string;
-  readonly sourceKind: PiPackageSource["kind"];
+  readonly sourceKind: PiResourceSourceKind;
   readonly sourceIdentity: string;
   readonly sourceDisplay: string;
   readonly canonicalPathFingerprint: string;
@@ -70,11 +71,32 @@ export interface PiResourceDescriptor {
   readonly versionNumber: bigint;
   readonly updatedAt: number;
   readonly error?: string;
+  /** Exact package identity read from the installed package manifest. */
+  readonly packageIdentity?: string;
+  /** Provenance for packages adopted from the independent Extension Source owner. */
+  readonly extensionSource?: {
+    readonly sourceId: string;
+    readonly sourceRevision: bigint;
+    readonly packageRelativePath: string;
+    readonly packageContentRevision: string;
+  };
 }
 
-interface StoredResource extends Omit<PiResourceDescriptor, "versionNumber"> {
+interface StoredExtensionSourcePackage {
+  readonly kind: "extension_source";
+  readonly sourceId: string;
+  readonly sourceRevision: string;
+  readonly sourceIdentity: string;
+  readonly sourceDisplay: string;
+  readonly packageRelativePath: string;
+  readonly packageContentRevision: string;
+}
+
+type StoredResourceSource = PiPackageSource | StoredExtensionSourcePackage;
+
+interface StoredResource extends Omit<PiResourceDescriptor, "versionNumber" | "extensionSource"> {
   readonly versionNumber: string;
-  readonly source: PiPackageSource;
+  readonly source: StoredResourceSource;
   readonly canonicalPath?: string;
   readonly workspaceRoot?: string;
   readonly installedPath?: string;
@@ -146,6 +168,74 @@ export interface UpdatePiResourceInput {
   readonly source?: PiPackageSource;
   readonly requestedVersion?: string;
   readonly approvedByConnectionId: string;
+}
+
+export type PiExtensionPackageAction = "install" | "update" | "replace";
+
+/** Source-owned package facts passed only while the caller holds its exact generation lease. */
+export interface PiExtensionSourcePackageInput {
+  readonly resourceId: string;
+  readonly backendId: string;
+  readonly sourceId: string;
+  readonly sourceRevision: bigint;
+  readonly sourceIdentity: string;
+  readonly sourceDisplay: string;
+  readonly packageRelativePath: string;
+  readonly packageContentRevision: string;
+  readonly packageName: string;
+  readonly version?: string;
+  readonly bindingName: string;
+  readonly bindingOrdinal: number;
+  readonly packageRoot: string;
+}
+
+export interface PiExtensionPackagePreview {
+  readonly action: PiExtensionPackageAction;
+  readonly resourceId: string;
+  readonly backendId: string;
+  readonly packageName: string;
+  readonly availableVersion?: string;
+  readonly installedVersion?: string;
+  readonly currentResource?: {
+    readonly resourceId: string;
+    readonly resourceVersion: bigint;
+    readonly name: string;
+    readonly sourceDisplay: string;
+  };
+  readonly sourceReplacement: boolean;
+  readonly preservesEnabled: boolean;
+  readonly resourceDetails: readonly PiPackageResourceDetail[];
+  readonly runtimeRequirements: readonly PiPackageRuntimeRequirement[];
+  readonly warnings: readonly PiPackageWarning[];
+  readonly disabledLifecycleScripts: readonly string[];
+  readonly canToggle: boolean;
+}
+
+export interface PreparePiExtensionPackageInput extends PiExtensionSourcePackageInput {
+  readonly approvedByConnectionId: string;
+  readonly expectedAction: PiExtensionPackageAction;
+  readonly expectedCurrentResourceId?: string;
+  readonly expectedCurrentResourceVersion?: bigint;
+  readonly allowSourceReplacement: boolean;
+}
+
+export interface PreparedPiExtensionPackageMutation {
+  readonly preview: PiExtensionPackagePreview;
+  readonly mutation: PreparedPiResourceMutation<PiResourceDescriptor>;
+}
+
+interface InspectedExtensionPackage {
+  readonly inspection: ResourceInspection;
+  readonly compatibility: PiPackageInspection;
+}
+
+interface ExtensionPackagePlan {
+  readonly action: PiExtensionPackageAction;
+  readonly resourceId: string;
+  readonly backendId: string;
+  readonly target?: StoredResource;
+  readonly current?: StoredResource;
+  readonly sourceReplacement: boolean;
 }
 
 const preparedPiResourceMutationBrand = Symbol("PreparedPiResourceMutation");
@@ -401,6 +491,9 @@ export class PiResourceManager {
     const approvalRevision = piPackageSourceApprovalRevision(source);
     const now = this.#now();
     const previous = this.#records.get(id);
+    if (previous?.source.kind === "extension_source") {
+      throw new Error("Pi resource ID is already reserved by an Extension Source package.");
+    }
     if (previous !== undefined && (
       previous.backendId !== input.backendId || previous.targetId !== input.targetId ||
       previous.kind !== "package" || previous.scope !== input.scope ||
@@ -505,6 +598,180 @@ export class PiResourceManager {
     return this.#completePreparedStandalone(await this.prepareDiscoverPackage(input));
   }
 
+  /**
+   * Inspect an Extension Source package without adopting its bytes. The caller
+   * must keep the exact Source generation leased for the duration of this
+   * call; the returned facts are advisory until a later revision-fenced
+   * mutation repeats the inspection.
+   */
+  async previewExtensionPackage(input: PiExtensionSourcePackageInput): Promise<PiExtensionPackagePreview> {
+    this.#assertInitialized();
+    const inspected = await this.#inspectExtensionSourcePackage(input);
+    return publicExtensionPackagePreview(this.#planExtensionPackage(input, inspected), inspected.compatibility);
+  }
+
+  /**
+   * Copy one exact Source-owned package into a Resource-owned candidate and
+   * prepare its catalog adoption. No durable Resource state changes until the
+   * enclosing Operation adopts `mutation`; a failed or stale completion
+   * removes only the candidate and leaves the previous generation intact.
+   */
+  async prepareExtensionPackage(
+    input: PreparePiExtensionPackageInput
+  ): Promise<PreparedPiExtensionPackageMutation> {
+    this.#assertInitialized();
+    const inspected = await this.#inspectExtensionSourcePackage(input);
+    const plan = this.#planExtensionPackage(input, inspected);
+    const preview = publicExtensionPackagePreview(plan, inspected.compatibility);
+    const currentId = preview.currentResource?.resourceId;
+    const currentVersion = preview.currentResource?.resourceVersion;
+    if (
+      preview.action !== input.expectedAction
+      || currentId !== input.expectedCurrentResourceId
+      || currentVersion !== input.expectedCurrentResourceVersion
+    ) {
+      throw new Error("Extension package installation facts changed after confirmation.");
+    }
+    if (preview.sourceReplacement && !input.allowSourceReplacement) {
+      throw new Error("Replacing an installed package from another source requires explicit confirmation.");
+    }
+
+    const source: StoredExtensionSourcePackage = {
+      kind: "extension_source",
+      sourceId: normalizedExtensionSourceId(input.sourceId),
+      sourceRevision: normalizedDecimalRevision(input.sourceRevision, "Extension source revision"),
+      sourceIdentity: nonBlank(input.sourceIdentity, "Extension source identity"),
+      sourceDisplay: nonBlank(input.sourceDisplay, "Extension source display"),
+      packageRelativePath: normalizeExtensionPackagePath(input.packageRelativePath),
+      packageContentRevision: normalizedContentRevision(input.packageContentRevision, "Extension source package revision")
+    };
+    const expectedTarget = plan.target;
+    const replaced = plan.current?.id === input.resourceId ? undefined : plan.current;
+    const ownerSeed: StoredResource = {
+      id: input.resourceId,
+      backendId: nonBlank(input.backendId, "Backend ID"),
+      kind: "package",
+      scope: "managed",
+      name: inspected.compatibility.name,
+      ...(inspected.compatibility.version === undefined ? {} : { version: inspected.compatibility.version }),
+      sourceKind: "extension_source",
+      sourceIdentity: extensionSourcePackageIdentity(source),
+      sourceDisplay: source.sourceDisplay,
+      canonicalPathFingerprint: extensionSourcePackageFingerprint(source),
+      symbolicLinkDetected: false,
+      specialFileDetected: false,
+      discoveredRevision: inspected.inspection.revision,
+      packageIdentity: inspected.compatibility.name,
+      ...compatibilityFields(inspected.compatibility, false),
+      ...(inspected.compatibility.extensionContentFingerprint === undefined
+        ? {}
+        : { extensionApprovedRevision: inspected.compatibility.extensionContentFingerprint }),
+      state: "installed",
+      enabled: false,
+      approvedAt: this.#now(),
+      approvedByConnectionId: nonBlank(input.approvedByConnectionId, "Approving connection ID"),
+      versionNumber: ((expectedTarget === undefined ? 0n : BigInt(expectedTarget.versionNumber)) + 1n).toString(10),
+      updatedAt: this.#now(),
+      source
+    };
+
+    const owner = resourceOwnerPath(this.#managedRoot, ownerSeed);
+    await mkdir(owner, { recursive: true, mode: 0o700 });
+    await assertContainedRegularDirectory(this.#managedRoot, owner, "Managed resource owner directory");
+    const generations = join(owner, RESOURCE_GENERATIONS_DIRECTORY);
+    await mkdir(generations, { recursive: true, mode: 0o700 });
+    await assertContainedRegularDirectory(this.#managedRoot, generations, "Managed resource generations directory");
+    const generation = randomUUID();
+    const candidateContainer = join(generations, generation);
+    const stage = join(this.#managedRoot, ".staging", `resource-${generation}`);
+    await mkdir(stage, { recursive: false, mode: 0o700 });
+    let candidatePublished = false;
+    try {
+      const sourceInspection = await inspectResource(input.packageRoot, this.#maximumFiles, this.#maximumBytes);
+      if (
+        !samePath(sourceInspection.canonicalPath, inspected.inspection.canonicalPath)
+        || sourceInspection.revision !== inspected.inspection.revision
+      ) {
+        throw new Error("Extension source package changed during Resource preparation.");
+      }
+      const payloadName = safePayloadName(inspected.compatibility.name);
+      const stagedPayload = join(stage, payloadName);
+      await mkdir(stagedPayload, { recursive: false, mode: 0o700 });
+      await copyTreeFailClosed(
+        sourceInspection.canonicalPath,
+        sourceInspection.canonicalPath,
+        stagedPayload,
+        { files: 0, bytes: 0, maxFiles: this.#maximumFiles, maxBytes: this.#maximumBytes }
+      );
+      const stagedInspection = await inspectResource(stagedPayload, this.#maximumFiles, this.#maximumBytes);
+      if (stagedInspection.revision !== sourceInspection.revision) {
+        throw new Error("Extension source package changed during staged installation.");
+      }
+      await rename(stage, candidateContainer);
+      candidatePublished = true;
+      const installedPath = join(candidateContainer, payloadName);
+      await assertContainedPath(this.#managedRoot, installedPath, "Installed extension package candidate");
+      const installedInspection = await inspectResource(installedPath, this.#maximumFiles, this.#maximumBytes);
+      if (installedInspection.revision !== source.packageContentRevision) {
+        throw new Error("Installed extension package does not match the approved Source bytes.");
+      }
+      const runtimeVersion = this.#runtimeVersion(input.backendId);
+      const compatibility = await inspectPiResourceCompatibility("package", installedPath, {
+        ...(runtimeVersion === undefined ? {} : { currentRuntimeVersion: runtimeVersion }),
+        contentFingerprint: installedInspection.revision
+      });
+      assertExtensionPackageSelection(input, compatibility);
+      const preservesExplicitDisable = plan.current?.state === "disabled";
+      const preservesEnabled = plan.current?.enabled === true && compatibility.canToggle;
+      const updated: StoredResource = {
+        ...ownerSeed,
+        name: compatibility.name,
+        ...(compatibility.version === undefined ? {} : { version: compatibility.version }),
+        installedPath,
+        discoveredRevision: installedInspection.revision,
+        packageIdentity: compatibility.name,
+        ...compatibilityFields(compatibility, false),
+        ...(compatibility.extensionContentFingerprint === undefined
+          ? {}
+          : { extensionApprovedRevision: compatibility.extensionContentFingerprint }),
+        state: preservesExplicitDisable ? "disabled" : "installed",
+        enabled: preservesEnabled,
+        updatedAt: this.#now()
+      };
+      assertExpectedInstalledLocation(this.#managedRoot, updated);
+      const entries: PreparedCatalogEntry[] = [{ id: updated.id, expected: expectedTarget, next: updated }];
+      if (replaced !== undefined) {
+        const { pendingUpdate: _pendingUpdate, ...withoutPendingUpdate } = omitInstalledPath(replaced);
+        entries.push({
+          id: replaced.id,
+          expected: replaced,
+          next: {
+            ...withoutPendingUpdate,
+            state: "removed",
+            enabled: false,
+            versionNumber: (BigInt(replaced.versionNumber) + 1n).toString(10),
+            updatedAt: this.#now()
+          }
+        });
+      }
+      const mutation = this.#prepareMutation(entries, publicResource(updated), undefined, {
+        rollback: () => this.#removeCandidateGeneration(updated, candidateContainer),
+        cleanupAfterCommit: async () => {
+          if (expectedTarget?.installedPath !== undefined) {
+            await this.#removeInstalledIncarnation(expectedTarget).catch(() => undefined);
+          }
+          if (replaced !== undefined) await this.#removeResourceOwner(replaced).catch(() => undefined);
+        }
+      });
+      return { preview, mutation };
+    } catch (error) {
+      await rm(stage, { recursive: true, force: true }).catch(() => undefined);
+      if (candidatePublished) await this.#removeCandidateGeneration(ownerSeed, candidateContainer).catch(() => undefined);
+      else await this.#pruneResourceOwner(ownerSeed).catch(() => undefined);
+      throw error;
+    }
+  }
+
   /** Discover adapter-native project resources after explicit Target trust. */
   async prepareDiscoverProjectResources(
     input: DiscoverProjectResourcesInput
@@ -589,6 +856,8 @@ export class PiResourceManager {
       if (inspection.revision !== discoveredRevision || !samePath(inspection.canonicalPath, current.canonicalPath)) {
         throw new Error("Resource changed after discovery and must be discovered again.");
       }
+    } else if (current.source.kind === "extension_source") {
+      throw new Error("Extension Source package approval must use its exact catalog entry.");
     } else if (current.kind !== "package" || piPackageSourceApprovalRevision(current.source) !== discoveredRevision) {
       throw new Error("Package acquisition source changed after discovery and must be discovered again.");
     }
@@ -635,6 +904,9 @@ export class PiResourceManager {
     const current = this.#require(resourceId);
     if (!(current.state === "installed" || current.state === "loaded" || current.state === "disabled" || current.state === "update_available")) {
       throw new Error("Only an installed resource can be updated.");
+    }
+    if (current.source.kind === "extension_source") {
+      throw new Error("Extension Source packages must be updated through their revision-fenced catalog entry.");
     }
     this.#assertStoredProjectTargetTrusted(current);
     if (input.source !== undefined && input.requestedVersion !== undefined) throw new Error("Typed resource acquisition and requested_version cannot both be set.");
@@ -693,6 +965,9 @@ export class PiResourceManager {
       ...(compatibility === undefined
         ? emptyCompatibilityFields()
         : compatibilityFields(compatibility, false)),
+      ...(current.kind === "package" && compatibility !== undefined
+        ? { packageIdentity: compatibility.name }
+        : {}),
       ...(compatibility?.extensionContentFingerprint === undefined
         ? {}
         : { extensionApprovedRevision: compatibility.extensionContentFingerprint }),
@@ -1168,6 +1443,93 @@ export class PiResourceManager {
     }
   }
 
+  async #inspectExtensionSourcePackage(
+    input: PiExtensionSourcePackageInput
+  ): Promise<InspectedExtensionPackage> {
+    validateResourceId(input.resourceId);
+    normalizedExtensionSourceId(input.sourceId);
+    normalizedDecimalRevision(input.sourceRevision, "Extension source revision");
+    nonBlank(input.sourceIdentity, "Extension source identity");
+    nonBlank(input.sourceDisplay, "Extension source display");
+    normalizeExtensionPackagePath(input.packageRelativePath);
+    const expectedRevision = normalizedContentRevision(
+      input.packageContentRevision,
+      "Extension source package revision"
+    );
+    if (!Number.isSafeInteger(input.bindingOrdinal) || input.bindingOrdinal < 0) {
+      throw new Error("Extension source binding ordinal is invalid.");
+    }
+    nonBlank(input.bindingName, "Extension source binding name");
+    const backendId = nonBlank(input.backendId, "Backend ID");
+    const inspection = await inspectResource(input.packageRoot, this.#maximumFiles, this.#maximumBytes);
+    const rootInfo = await lstat(inspection.canonicalPath);
+    if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) {
+      throw new Error("Extension source package must be a regular directory.");
+    }
+    if (inspection.revision !== expectedRevision) {
+      throw new Error("Extension source package changed after discovery.");
+    }
+    const runtimeVersion = this.#runtimeVersion(backendId);
+    const compatibility = await inspectPiResourceCompatibility("package", inspection.canonicalPath, {
+      ...(runtimeVersion === undefined ? {} : { currentRuntimeVersion: runtimeVersion }),
+      contentFingerprint: inspection.revision
+    });
+    assertExtensionPackageSelection(input, compatibility);
+    return { inspection, compatibility };
+  }
+
+  #planExtensionPackage(
+    input: PiExtensionSourcePackageInput,
+    inspected: InspectedExtensionPackage
+  ): ExtensionPackagePlan {
+    const target = this.#records.get(input.resourceId);
+    if (target !== undefined && target.state !== "removed" && target.installedPath === undefined) {
+      throw new Error("The reserved Resource identity is already used by an uninstalled Resource intent.");
+    }
+    if (target?.installedPath !== undefined) {
+      if (target.kind !== "package" || target.packageIdentity !== inspected.compatibility.name) {
+        throw new Error("The reserved Resource identity is already bound to another package.");
+      }
+      if (target.backendId !== input.backendId) {
+        throw new Error("Choose the Backend that owns the currently installed package.");
+      }
+    }
+    const conflicts = [...this.#records.values()].filter((record) =>
+      record.id !== input.resourceId
+      && record.kind === "package"
+      && record.installedPath !== undefined
+      && record.state !== "removed"
+      && record.packageIdentity === inspected.compatibility.name
+    );
+    if (conflicts.length > 1) {
+      throw new Error("Multiple installed Resources claim the same package identity; remove the ambiguity before replacing it.");
+    }
+    const current = target?.installedPath === undefined ? conflicts[0] : target;
+    if (current !== undefined && current.backendId !== input.backendId) {
+      throw new Error("Choose the Backend that owns the currently installed package.");
+    }
+    if (
+      current?.id === input.resourceId
+      && current.source.kind === "extension_source"
+      && current.source.sourceId === input.sourceId
+      && current.source.packageRelativePath === normalizeExtensionPackagePath(input.packageRelativePath)
+      && current.discoveredRevision === inspected.inspection.revision
+    ) {
+      throw new Error("The selected Extension package is already installed at this revision.");
+    }
+    const sameSource = current?.source.kind === "extension_source"
+      && current.source.sourceId === input.sourceId
+      && current.source.packageRelativePath === normalizeExtensionPackagePath(input.packageRelativePath);
+    return {
+      action: current === undefined ? "install" : sameSource && current.id === input.resourceId ? "update" : "replace",
+      resourceId: input.resourceId,
+      backendId: input.backendId,
+      ...(target === undefined ? {} : { target }),
+      ...(current === undefined ? {} : { current }),
+      sourceReplacement: current !== undefined && !sameSource
+    };
+  }
+
   async #prepareInstalledMutation(
     expected: StoredResource,
     approved: StoredResource
@@ -1176,6 +1538,9 @@ export class PiResourceManager {
     if (approved.state !== "approved") throw new Error("Resource must be approved before installation.");
     if (approved.approvedAt === undefined || approved.approvedByConnectionId === undefined) {
       throw new Error("Resource installation requires an explicit owner approval.");
+    }
+    if (approved.source.kind === "extension_source") {
+      throw new Error("Extension Source packages require their leased Resource adoption path.");
     }
     this.#assertStoredProjectTargetTrusted(approved);
     if (approved.source.kind === "local") await this.#assertSourceUnchanged(approved);
@@ -1259,6 +1624,7 @@ export class PiResourceManager {
         ...approvedBase,
         installedPath,
         discoveredRevision: installedInspection.revision,
+        ...(approved.kind === "package" ? { packageIdentity: compatibility.name } : {}),
         ...compatibilityFields(compatibility, requiresExtensionApproval),
         ...(extensionApprovedRevision === undefined ? {} : { extensionApprovedRevision }),
         ...(acquiredVersion === undefined ? {} : { version: acquiredVersion }),
@@ -1404,6 +1770,7 @@ export class PiResourceManager {
       symbolicLinkDetected: false,
       specialFileDetected: false,
       discoveredRevision: inspection.revision,
+      ...(input.kind === "package" ? { packageIdentity: compatibility.name } : {}),
       ...compatibilityFields(compatibility, compatibility.extensionContentFingerprint !== undefined),
       state: "awaiting_approval",
       enabled: false,
@@ -1588,6 +1955,7 @@ export class PiResourceManager {
     const { extensionApprovedRevision: _previousApproval, ...base } = record;
     return {
       ...base,
+      ...(record.kind === "package" ? { packageIdentity: inspection.name } : {}),
       ...compatibilityFields(inspection, requiresExtensionApproval),
       ...(extensionApprovedRevision === undefined ? {} : { extensionApprovedRevision })
     };
@@ -1856,8 +2224,114 @@ function publicResource(record: StoredResource): PiResourceDescriptor {
     ...(record.approvedByConnectionId === undefined ? {} : { approvedByConnectionId: record.approvedByConnectionId }),
     versionNumber: BigInt(record.versionNumber),
     updatedAt: record.updatedAt,
-    ...(record.error === undefined ? {} : { error: record.error })
+    ...(record.error === undefined ? {} : { error: record.error }),
+    ...(record.packageIdentity === undefined ? {} : { packageIdentity: record.packageIdentity }),
+    ...(record.source.kind !== "extension_source"
+      ? {}
+      : {
+          extensionSource: {
+            sourceId: record.source.sourceId,
+            sourceRevision: BigInt(record.source.sourceRevision),
+            packageRelativePath: record.source.packageRelativePath,
+            packageContentRevision: record.source.packageContentRevision
+          }
+        })
   };
+}
+
+function publicExtensionPackagePreview(
+  plan: ExtensionPackagePlan,
+  compatibility: PiPackageInspection
+): PiExtensionPackagePreview {
+  const current = plan.current;
+  return {
+    action: plan.action,
+    resourceId: plan.resourceId,
+    backendId: plan.backendId,
+    packageName: compatibility.name,
+    ...(compatibility.version === undefined ? {} : { availableVersion: compatibility.version }),
+    ...(current?.version === undefined ? {} : { installedVersion: current.version }),
+    ...(current === undefined
+      ? {}
+      : {
+          currentResource: {
+            resourceId: current.id,
+            resourceVersion: BigInt(current.versionNumber),
+            name: current.name,
+            sourceDisplay: current.sourceDisplay
+          }
+        }),
+    sourceReplacement: plan.sourceReplacement,
+    preservesEnabled: current?.enabled === true && compatibility.canToggle,
+    resourceDetails: compatibility.resources.map(copyResourceDetail),
+    runtimeRequirements: compatibility.runtimeRequirements.map((requirement) => ({ ...requirement })),
+    warnings: [...compatibility.warnings],
+    disabledLifecycleScripts: [...compatibility.disabledLifecycleScripts],
+    canToggle: compatibility.canToggle
+  };
+}
+
+function assertExtensionPackageSelection(
+  input: PiExtensionSourcePackageInput,
+  compatibility: PiPackageInspection
+): void {
+  if (compatibility.name !== nonBlank(input.packageName, "Extension source package name")) {
+    throw new Error("Extension source package identity changed after discovery.");
+  }
+  const expectedVersion = input.version === undefined ? undefined : boundedVersion(input.version);
+  if (compatibility.version !== expectedVersion) {
+    throw new Error("Extension source package version changed after discovery.");
+  }
+  let ordinal = 0;
+  const selected = compatibility.resources.find((detail) => {
+    if (detail.kind !== "extension" || detail.name !== input.bindingName) return false;
+    const matches = ordinal === input.bindingOrdinal;
+    ordinal += 1;
+    return matches;
+  });
+  if (selected === undefined) {
+    throw new Error("The selected Extension binding changed after discovery.");
+  }
+}
+
+function normalizedExtensionSourceId(value: string): string {
+  const id = nonBlank(value, "Extension source ID");
+  if (!/^extension_source_[a-f0-9]{32}$/u.test(id)) throw new Error("Extension source ID is invalid.");
+  return id;
+}
+
+function normalizedDecimalRevision(value: bigint, label: string): string {
+  if (value < 1n) throw new Error(`${label} is invalid.`);
+  return value.toString(10);
+}
+
+function normalizedContentRevision(value: string, label: string): string {
+  if (!/^sha256:[a-f0-9]{64}$/u.test(value)) throw new Error(`${label} is invalid.`);
+  return value;
+}
+
+function normalizeExtensionPackagePath(value: string): string {
+  const path = nonBlank(value, "Extension source package path");
+  if (
+    path.length > 512
+    || path.includes("\\")
+    || path.startsWith("/")
+    || isAbsolute(path)
+    || path.split("/").some((part) => part === "" || part === "." || part === ".." || part.toLowerCase() === ".git")
+  ) {
+    throw new Error("Extension source package path is invalid.");
+  }
+  return path;
+}
+
+function extensionSourcePackageIdentity(source: StoredExtensionSourcePackage): string {
+  return `extension-source:${createHash("sha256")
+    .update(`${source.sourceIdentity}\0${source.packageRelativePath}`)
+    .digest("hex")}`;
+}
+
+function extensionSourcePackageFingerprint(source: StoredExtensionSourcePackage): string {
+  return `sha256:${createHash("sha256").update(extensionSourcePackageIdentity(source)).digest("hex")}`;
 }
 
 function storedUpdateIntentIdentity(intent: StoredResourceUpdateIntent): string {
@@ -1948,7 +2422,8 @@ function resourceCompatibilityIdentity(record: StoredResource): string {
     requiresExtensionApproval: record.requiresExtensionApproval,
     extensionContentFingerprint: record.extensionContentFingerprint,
     extensionApprovedRevision: record.extensionApprovedRevision,
-    postMutationNotice: record.postMutationNotice
+    postMutationNotice: record.postMutationNotice,
+    packageIdentity: record.packageIdentity
   });
 }
 
@@ -2051,16 +2526,18 @@ function validateStringEnumList(value: readonly string[], allowed: ReadonlySet<s
 
 function validateStoredResource(value: StoredResource): StoredResource {
   if (!value || typeof value !== "object") throw new Error("Stored Pi resource is malformed.");
-  const stored = value as StoredResource & { readonly source?: PiPackageSource };
+  const stored = value as StoredResource & { readonly source?: StoredResourceSource };
   validateResourceId(stored.id);
   validateKind(stored.kind);
   validateScope(stored.scope);
   validateState(stored.state);
   if (!/^\d+$/u.test(stored.versionNumber) || !Number.isSafeInteger(stored.updatedAt)) throw new Error("Stored Pi resource version is malformed.");
   if (stored.source === undefined) throw new Error("Stored Pi resource source is missing.");
-  const source = normalizePiPackageSource(stored.source);
-  if (JSON.stringify(source) !== JSON.stringify(stored.source)) throw new Error("Stored Pi resource source is not canonical.");
-  if (source.kind !== "local" && stored.kind !== "package") throw new Error("Only package resources may use npm or git acquisition.");
+  const source = stored.source.kind === "extension_source"
+    ? validateStoredExtensionSourcePackage(stored.source)
+    : normalizePiPackageSource(stored.source);
+  if (!sameFlatRecord(source, stored.source)) throw new Error("Stored Pi resource source is not canonical.");
+  if (source.kind !== "local" && stored.kind !== "package") throw new Error("Only package resources may use managed package acquisition.");
   let canonicalPath: string | undefined;
   if (source.kind === "local") {
     canonicalPath = normalizedAbsolute(stored.canonicalPath!, "Stored canonical resource path");
@@ -2075,15 +2552,23 @@ function validateStoredResource(value: StoredResource): StoredResource {
   if (stored.scope !== "project" && (stored.targetId !== undefined || stored.workspaceRoot !== undefined)) {
     throw new Error("Stored non-project resource crosses a Target trust boundary.");
   }
-  const sourceIdentity = stored.kind === "package"
-    ? piPackageSourceIdentity(source)
+  const sourceIdentity = source.kind === "extension_source"
+    ? extensionSourcePackageIdentity(source)
+    : stored.kind === "package"
+      ? piPackageSourceIdentity(source)
     : `${stored.kind}:${pathIdentity(canonicalPath!)}`;
   if (stored.sourceKind !== source.kind || stored.sourceIdentity !== sourceIdentity) {
     throw new Error("Stored Pi resource source identity is malformed.");
   }
-  const sourceDisplay = source.kind === "local" ? basename(canonicalPath!) : piPackageSourceDisplay(source);
+  const sourceDisplay = source.kind === "local"
+    ? basename(canonicalPath!)
+    : source.kind === "extension_source"
+      ? source.sourceDisplay
+      : piPackageSourceDisplay(source);
   const canonicalPathFingerprint = source.kind === "local"
     ? pathFingerprint(canonicalPath!)
+    : source.kind === "extension_source"
+      ? extensionSourcePackageFingerprint(source)
     : `sha256:${createHash("sha256").update(sourceIdentity).digest("hex")}`;
   if (stored.sourceDisplay !== sourceDisplay || stored.canonicalPathFingerprint !== canonicalPathFingerprint) {
     throw new Error("Stored Pi resource source metadata is malformed.");
@@ -2101,11 +2586,14 @@ function validateStoredResource(value: StoredResource): StoredResource {
   const storedCompatibility = validateStoredCompatibility(stored);
   let pendingUpdate: StoredResourceUpdateIntent | undefined;
   if (stored.pendingUpdate !== undefined) {
+    if (source.kind === "extension_source") {
+      throw new Error("Stored Extension Source resources cannot contain a generic update intent.");
+    }
     if (!stored.pendingUpdate || typeof stored.pendingUpdate !== "object") {
       throw new Error("Stored resource update intent is malformed.");
     }
     const pendingSource = normalizePiPackageSource(stored.pendingUpdate.source);
-    if (JSON.stringify(pendingSource) !== JSON.stringify(stored.pendingUpdate.source)) {
+    if (!sameFlatRecord(pendingSource, stored.pendingUpdate.source)) {
       throw new Error("Stored resource update source is not canonical.");
     }
     if (stored.kind !== "package" && pendingSource.kind !== "local") {
@@ -2141,6 +2629,12 @@ function validateStoredResource(value: StoredResource): StoredResource {
   if (extensionApprovedRevision !== undefined && !/^sha256:[a-f0-9]{64}$/u.test(extensionApprovedRevision)) {
     throw new Error("Stored extension approval fingerprint is malformed.");
   }
+  const packageIdentity = stored.packageIdentity === undefined
+    ? undefined
+    : boundedPackageIdentity(stored.packageIdentity);
+  if (stored.kind === "package" && stored.installedPath !== undefined && packageIdentity === undefined) {
+    throw new Error("Stored installed package Resource is missing its package identity.");
+  }
   const {
     source: _source,
     sourceKind: _sourceKind,
@@ -2165,8 +2659,32 @@ function validateStoredResource(value: StoredResource): StoredResource {
     ...(pendingUpdate === undefined ? {} : { pendingUpdate }),
     ...(canonicalPath === undefined ? {} : { canonicalPath }),
     ...(stored.version === undefined ? {} : { version: boundedVersion(stored.version) }),
+    ...(packageIdentity === undefined ? {} : { packageIdentity }),
     ...(stored.error === undefined ? {} : { error: redactSecrets(stored.error).slice(0, 2_048) })
   };
+}
+
+function validateStoredExtensionSourcePackage(value: StoredExtensionSourcePackage): StoredExtensionSourcePackage {
+  if (!value || typeof value !== "object" || value.kind !== "extension_source") {
+    throw new Error("Stored Extension Source provenance is malformed.");
+  }
+  const sourceRevision = value.sourceRevision;
+  if (!/^[1-9]\d*$/u.test(sourceRevision)) throw new Error("Stored Extension Source revision is malformed.");
+  return {
+    kind: "extension_source",
+    sourceId: normalizedExtensionSourceId(value.sourceId),
+    sourceRevision,
+    sourceIdentity: nonBlank(value.sourceIdentity, "Stored Extension source identity"),
+    sourceDisplay: nonBlank(value.sourceDisplay, "Stored Extension source display"),
+    packageRelativePath: normalizeExtensionPackagePath(value.packageRelativePath),
+    packageContentRevision: normalizedContentRevision(value.packageContentRevision, "Stored Extension source package revision")
+  };
+}
+
+function sameFlatRecord(left: object, right: object): boolean {
+  const entries = (value: object): readonly (readonly [string, unknown])[] => Object.entries(value)
+    .sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey, "en"));
+  return JSON.stringify(entries(left)) === JSON.stringify(entries(right));
 }
 
 function omitInstalledPath(record: StoredResource): Omit<StoredResource, "installedPath"> {
@@ -2337,6 +2855,12 @@ function boundedVersion(value: string): string {
   const version = nonBlank(value, "Resource version");
   if (version.length > 128) throw new Error("Resource version is too long.");
   return version;
+}
+
+function boundedPackageIdentity(value: string): string {
+  const identity = nonBlank(value, "Resource package identity");
+  if (identity.length > 214) throw new Error("Resource package identity is too long.");
+  return identity;
 }
 
 function nonBlank(value: string, label: string): string {

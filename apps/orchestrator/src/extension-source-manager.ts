@@ -68,6 +68,16 @@ export interface ExtensionSourceGitPreflight {
   readonly minimumVersion: string;
 }
 
+export interface ExtensionSourceEntryLease {
+  readonly source: ExtensionSourceDescriptor;
+  readonly entry: ExtensionSourceEntryDescriptor;
+  readonly packageRoot: string;
+  /** Synchronous final fence used inside the Operation/Resource commit. */
+  readonly assertCurrent: () => void;
+  /** Idempotently releases the immutable Git generation after completion. */
+  readonly release: () => void;
+}
+
 export interface ExtensionSourceManagerOptions {
   readonly store: OperationalStore;
   readonly cacheRoot: string;
@@ -490,6 +500,21 @@ export class ExtensionSourceManager {
     readonly entryId: string;
     readonly contentRevision: string;
   }, read: (entry: ExtensionSourceEntryDescriptor, packageRoot: string) => Promise<T>): Promise<T> {
+    const lease = await this.acquireEntry(input);
+    try {
+      return await read(lease.entry, lease.packageRoot);
+    } finally {
+      lease.release();
+    }
+  }
+
+  /** Acquire an exact Source entry across an asynchronous Operation prepare + commit. */
+  async acquireEntry(input: {
+    readonly sourceId: string;
+    readonly sourceRevision: bigint;
+    readonly entryId: string;
+    readonly contentRevision: string;
+  }): Promise<ExtensionSourceEntryLease> {
     this.#assertInitialized();
     const source = this.#requireSourceRevision(input.sourceId, input.sourceRevision);
     const entry = source.entries.find((candidate) => candidate.id === input.entryId);
@@ -498,20 +523,36 @@ export class ExtensionSourceManager {
     }
     const root = source.source.kind === "local" ? source.source.path : this.#acquireCurrentGeneration(source);
     if (root === undefined) throw new ExtensionSourceError("SOURCE_CHANGED", "Extension source generation is unavailable.");
-    if (source.source.kind === "git") retainCachedPath(root);
+    const retained = source.source.kind === "git";
+    if (retained) retainCachedPath(root);
+    let released = false;
     try {
       const packageRoot = await canonicalContainedDirectory(root, entry.packageRelativePath, "Extension package");
-      try {
-        const currentContentRevision = await fingerprintPackageContent(packageRoot, discoveryBudget());
-        if (currentContentRevision !== entry.packageContentRevision) {
-          throw new Error("content changed");
+      const currentContentRevision = await fingerprintPackageContent(packageRoot, discoveryBudget());
+      if (currentContentRevision !== entry.packageContentRevision) throw new Error("content changed");
+      return Object.freeze({
+        source: publicSource(source),
+        entry: copyEntry(entry),
+        packageRoot,
+        assertCurrent: () => {
+          const current = this.#requireSourceRevision(input.sourceId, input.sourceRevision);
+          const currentEntry = current.entries.find((candidate) => candidate.id === input.entryId);
+          if (currentEntry === undefined || currentEntry.contentRevision !== input.contentRevision) {
+            throw new ExtensionSourceError("SOURCE_CHANGED", "Extension source entry changed concurrently.");
+          }
+          if (current.source.kind === "git" && this.#acquireCurrentGeneration(current) !== root) {
+            throw new ExtensionSourceError("SOURCE_CHANGED", "Extension source generation changed concurrently.");
+          }
+        },
+        release: () => {
+          if (released) return;
+          released = true;
+          if (retained) releaseCachedPath(root);
         }
-      } catch {
-        throw new ExtensionSourceError("SOURCE_CHANGED", "Extension source entry changed concurrently.");
-      }
-      return await read(copyEntry(entry), packageRoot);
-    } finally {
-      if (source.source.kind === "git") releaseCachedPath(root);
+      });
+    } catch {
+      if (retained && !released) releaseCachedPath(root);
+      throw new ExtensionSourceError("SOURCE_CHANGED", "Extension source entry changed concurrently.");
     }
   }
 

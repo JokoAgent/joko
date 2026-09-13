@@ -134,6 +134,7 @@ import { extensionMcpInput } from "./extension-catalog.js";
 import {
   ExtensionSourceError,
   type ExtensionSourceDescriptor as NativeExtensionSourceDescriptor,
+  type ExtensionSourceEntryLease,
   type ExtensionSourceInput as NativeExtensionSourceInput,
   type ExtensionSourceManager
 } from "./extension-source-manager.js";
@@ -240,6 +241,8 @@ import {
 } from "./native-state-observation.js";
 import { materializedRuntimeCommands, SESSION_RUNTIME_COMMANDS_SETTING_KEY } from "./runtime-command-state.js";
 import type {
+  PiExtensionPackageAction as NativePiExtensionPackageAction,
+  PiExtensionPackagePreview as NativePiExtensionPackagePreview,
   PiResourceDescriptor as NativePiResourceDescriptor,
   PiResourceKind as NativePiResourceKind,
   PiResourceManager,
@@ -3468,6 +3471,48 @@ export function createConnectServices(application: OrchestratorApplication): Con
         recoveredFromCorruption: snapshot.recoveredFromCorruption,
         page: result.page
       };
+    },
+    getExtensionPackagePreview: async (request, context) => {
+      authenticate(context);
+      if (
+        dependencies.extensionCatalog === undefined
+        || dependencies.extensionSources === undefined
+        || dependencies.piResources === undefined
+      ) {
+        throw new ConnectError("Extension package installation is unavailable.", Code.Unimplemented);
+      }
+      if (request.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const expectedRevision = fromProtoRevision(request.expectedRevision, "get_extension_package_preview.expected_revision");
+      const extensionId = nonBlankRequest(request.extensionId, "extension_id");
+      const backendId = nonBlankRequest(request.backendId, "backend_id");
+      const extension = requireExtensionMutation(dependencies, extensionId, expectedRevision);
+      const acquisition = extensionPackageAcquisition(extension);
+      const admission = backendResourceAdmission(dependencies, backendId, dependencies.store);
+      if (!admission.kinds.includes("package")) {
+        throw new ConnectError("The selected Backend does not support managed package resources.", Code.FailedPrecondition);
+      }
+      return extensionSourceEffect(() => dependencies.extensionSources!.withEntry(acquisition, async (entry, packageRoot) => {
+        const source = dependencies.extensionSources!.get(acquisition.sourceId);
+        if (source.revision !== acquisition.sourceRevision) {
+          throw new ExtensionSourceError("SOURCE_CHANGED", "Extension source changed concurrently.");
+        }
+        const preview = await dependencies.piResources!.previewExtensionPackage({
+          resourceId: entry.resourceId,
+          backendId,
+          sourceId: source.id,
+          sourceRevision: source.revision,
+          sourceIdentity: source.sourceIdentity,
+          sourceDisplay: source.sourceDisplay,
+          packageRelativePath: entry.packageRelativePath,
+          packageContentRevision: entry.packageContentRevision,
+          packageName: entry.packageName,
+          ...(entry.version === undefined ? {} : { version: entry.version }),
+          bindingName: entry.bindingName,
+          bindingOrdinal: entry.bindingOrdinal,
+          packageRoot
+        });
+        return { preview: mapExtensionPackagePreview(extension, preview) };
+      }));
     },
     beginExtensionSetupCredentialUpload: (request, context) => {
       const connection = authenticate(context);
@@ -8482,6 +8527,28 @@ function requireExtensionMutation(
   return entry;
 }
 
+/** Read-only final fence for use inside an enclosing Store transaction. */
+function requireCurrentExtensionMutation(
+  dependencies: ConnectServiceDependencies,
+  extensionId: string,
+  expectedRevision: bigint
+): NativeExtensionCatalogDescriptor {
+  const normalizedId = nonBlankRequest(extensionId, "extension_id");
+  if (dependencies.extensionCatalog === undefined) {
+    throw new ConnectError("Extension catalog is unavailable.", Code.Unimplemented);
+  }
+  let entry: NativeExtensionCatalogDescriptor;
+  try {
+    entry = dependencies.extensionCatalog.get(normalizedId);
+  } catch {
+    throw new ConnectError("Extension not found.", Code.NotFound);
+  }
+  if (entry.revision !== expectedRevision) {
+    throw new ConnectError("Extension changed concurrently.", Code.Aborted);
+  }
+  return entry;
+}
+
 function extensionCatalogAction<T>(action: () => T): T {
   try {
     return action();
@@ -8611,8 +8678,108 @@ function mapExtensionCatalogEntry(item: NativeExtensionCatalogDescriptor): contr
       ...(item.setup.error === undefined ? {} : { error: item.setup.error })
     }),
     useSupported: item.useSupported,
-    ...(item.error === undefined ? {} : { error: item.error })
+    ...(item.error === undefined ? {} : { error: item.error }),
+    ...(item.update === undefined
+      ? {}
+      : {
+          update: create(contract.ExtensionPackageUpdateSchema, {
+            source: create(contract.ExtensionSourceOwnerSchema, {
+              sourceId: item.update.sourceId,
+              sourceRevision: toProtoRevision(item.update.sourceRevision),
+              entryId: item.update.entryId,
+              contentRevision: item.update.contentRevision
+            }),
+            ...(item.update.availableVersion === undefined ? {} : { availableVersion: item.update.availableVersion }),
+            sourceReplacement: item.update.sourceReplacement
+          })
+        })
   });
+}
+
+function extensionPackageAcquisition(item: NativeExtensionCatalogDescriptor): {
+  readonly sourceId: string;
+  readonly sourceRevision: bigint;
+  readonly entryId: string;
+  readonly contentRevision: string;
+} {
+  if (item.owner.kind === "source") return item.owner;
+  if (item.owner.kind === "resource" && item.update !== undefined) {
+    return {
+      sourceId: item.update.sourceId,
+      sourceRevision: item.update.sourceRevision,
+      entryId: item.update.entryId,
+      contentRevision: item.update.contentRevision
+    };
+  }
+  throw new ConnectError("The Extension has no installable package revision.", Code.FailedPrecondition);
+}
+
+function mapExtensionPackagePreview(
+  extension: NativeExtensionCatalogDescriptor,
+  preview: NativePiExtensionPackagePreview
+): contract.ExtensionPackagePreview {
+  return create(contract.ExtensionPackagePreviewSchema, {
+    extensionId: extension.id,
+    extensionRevision: toProtoRevision(extension.revision),
+    action: protoExtensionPackageAction(preview.action),
+    resourceId: preview.resourceId,
+    backendId: preview.backendId,
+    packageName: preview.packageName,
+    ...(preview.installedVersion === undefined ? {} : { installedVersion: preview.installedVersion }),
+    ...(preview.availableVersion === undefined ? {} : { availableVersion: preview.availableVersion }),
+    ...(preview.currentResource === undefined
+      ? {}
+      : {
+          currentResource: create(contract.ExtensionPackageCurrentResourceSchema, {
+            resourceId: preview.currentResource.resourceId,
+            resourceRevision: toProtoRevision(preview.currentResource.resourceVersion),
+            name: preview.currentResource.name,
+            sourceDisplay: preview.currentResource.sourceDisplay
+          })
+        }),
+    sourceReplacement: preview.sourceReplacement,
+    preservesEnabled: preview.preservesEnabled,
+    compatibilityDetails: preview.resourceDetails.map((detail) => create(contract.ResourceCompatibilityDetailSchema, {
+      kind: protoResourceKind(detail.kind),
+      name: detail.name,
+      compatibility: protoResourceCompatibility(detail.compatibility),
+      issues: detail.compatibilityIssues.map(protoResourceCompatibilityIssue),
+      detectedApis: detail.detectedApis.map(protoResourceUiApi),
+      adaptedApis: detail.adaptedApis.map(protoResourceUiApi),
+      unsupportedApis: detail.unsupportedApis.map(protoResourceUiApi)
+    })),
+    runtimeRequirements: preview.runtimeRequirements.map((requirement) => create(contract.ResourceRuntimeRequirementSchema, {
+      packageName: requirement.packageName,
+      range: requirement.range,
+      ...(requirement.currentVersion === undefined ? {} : { currentVersion: requirement.currentVersion }),
+      status: requirement.compatible === true
+        ? contract.ResourceRuntimeRequirementStatus.COMPATIBLE
+        : requirement.compatible === false
+          ? contract.ResourceRuntimeRequirementStatus.INCOMPATIBLE
+          : contract.ResourceRuntimeRequirementStatus.UNKNOWN
+    })),
+    warnings: preview.warnings.map(protoResourcePackageWarning),
+    disabledLifecycleScripts: [...preview.disabledLifecycleScripts],
+    canToggle: preview.canToggle
+  });
+}
+
+function protoExtensionPackageAction(value: NativePiExtensionPackageAction): contract.ExtensionPackageAction {
+  switch (value) {
+    case "install": return contract.ExtensionPackageAction.INSTALL;
+    case "update": return contract.ExtensionPackageAction.UPDATE;
+    case "replace": return contract.ExtensionPackageAction.REPLACE;
+  }
+}
+
+function nativeExtensionPackageAction(value: contract.ExtensionPackageAction): NativePiExtensionPackageAction {
+  switch (value) {
+    case contract.ExtensionPackageAction.INSTALL: return "install";
+    case contract.ExtensionPackageAction.UPDATE: return "update";
+    case contract.ExtensionPackageAction.REPLACE: return "replace";
+    case contract.ExtensionPackageAction.UNSPECIFIED:
+    default: throw invalidArgument("expected_action is invalid");
+  }
 }
 
 function mapExtensionCatalogSnapshot(item: NativeExtensionCatalogSnapshot): contract.ExtensionCatalogSnapshot {
@@ -11337,6 +11504,7 @@ function protoResourceAcquisitionKind(value: NativePiResourceDescriptor["sourceK
     case "local": return contract.ResourceAcquisitionKind.LOCAL;
     case "npm": return contract.ResourceAcquisitionKind.NPM;
     case "git": return contract.ResourceAcquisitionKind.GIT;
+    case "extension_source": return contract.ResourceAcquisitionKind.EXTENSION_SOURCE;
     default: return contract.ResourceAcquisitionKind.UNSPECIFIED;
   }
 }
@@ -15982,6 +16150,76 @@ async function dispatchMutation(
         reconcileExtensionCatalog(dependencies);
       }));
     }
+    case "adoptExtensionPackage": {
+      if (
+        dependencies.extensionCatalog === undefined
+        || dependencies.extensionSources === undefined
+        || dependencies.piResources === undefined
+      ) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Extension package installation is unavailable.");
+      }
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "adopt_extension_package.expected_revision");
+      const expectedAction = nativeExtensionPackageAction(payload.value.expectedAction);
+      const extensionId = nonBlankRequest(payload.value.extensionId, "extension_id");
+      const backendId = nonBlankRequest(payload.value.backendId, "backend_id");
+      const expectedCurrentResourceId = payload.value.expectedCurrentResourceId === ""
+        ? undefined
+        : nonBlankRequest(payload.value.expectedCurrentResourceId, "expected_current_resource_id");
+      const expectedCurrentResourceVersion = payload.value.expectedCurrentResourceRevision === undefined
+        ? undefined
+        : fromProtoRevision(payload.value.expectedCurrentResourceRevision, "adopt_extension_package.expected_current_resource_revision");
+      if ((expectedCurrentResourceId === undefined) !== (expectedCurrentResourceVersion === undefined)) {
+        throw invalidArgument("expected_current_resource_id and expected_current_resource_revision must be supplied together");
+      }
+      // Reconcile before entering the Operation transaction. Final fences use
+      // the catalog's read-only current definition so a rejected transaction
+      // cannot leave its in-memory projection ahead of rolled-back storage.
+      void requireExtensionMutation(dependencies, extensionId, expectedRevision);
+      return adoptExtensionPackageEffectOperation(dependencies, operationId, connection, mutation, payload.case, {
+        extensionId,
+        expectedRevision,
+        backendId,
+        expectedAction,
+        ...(expectedCurrentResourceId === undefined ? {} : { expectedCurrentResourceId }),
+        ...(expectedCurrentResourceVersion === undefined ? {} : { expectedCurrentResourceVersion }),
+        allowSourceReplacement: payload.value.allowSourceReplacement
+      });
+    }
+    case "removeExtensionPackage": {
+      if (dependencies.piResources === undefined || dependencies.extensionCatalog === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Extension package removal is unavailable.");
+      }
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "remove_extension_package.expected_revision");
+      const extensionId = nonBlankRequest(payload.value.extensionId, "extension_id");
+      const extension = requireExtensionMutation(dependencies, extensionId, expectedRevision);
+      if (extension.owner.kind !== "resource") {
+        throw new ConnectError("Only an installed Resource-owned Extension can be removed.", Code.FailedPrecondition);
+      }
+      const resourceId = extension.owner.resourceId;
+      const result = await preparedResourceEffectOperation(
+        dependencies,
+        operationId,
+        connection,
+        mutation,
+        payload.case,
+        resourceId,
+        false,
+        () => dependencies.piResources!.prepareRemove(resourceId),
+        {
+          fenceBackendIdentity: true,
+          precondition: () => {
+            const current = requireCurrentExtensionMutation(dependencies, extensionId, expectedRevision);
+            if (current.owner.kind !== "resource" || current.owner.resourceId !== resourceId) {
+              throw new ConnectError("Extension owner changed concurrently.", Code.Aborted);
+            }
+          },
+          afterCommit: () => reconcileCommittedExtensionCatalog(dependencies, extensionId)
+        }
+      );
+      return result;
+    }
     case "setExtensionEnabled": {
       if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
       const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "set_extension_enabled.expected_revision");
@@ -16883,6 +17121,128 @@ async function effectOperation(
   }));
 }
 
+interface AdoptExtensionPackageOperationInput {
+  readonly extensionId: string;
+  readonly expectedRevision: bigint;
+  readonly backendId: string;
+  readonly expectedAction: NativePiExtensionPackageAction;
+  readonly expectedCurrentResourceId?: string;
+  readonly expectedCurrentResourceVersion?: bigint;
+  readonly allowSourceReplacement: boolean;
+}
+
+async function adoptExtensionPackageEffectOperation(
+  dependencies: ConnectServiceDependencies,
+  operationId: string,
+  connection: ConnectionRecord,
+  mutation: contract.OperationMutation,
+  kind: string,
+  input: AdoptExtensionPackageOperationInput
+): Promise<PresentedOperation> {
+  let admittedCapability: BackendResourceAdmission | undefined;
+  let admittedAcquisition: ReturnType<typeof extensionPackageAcquisition> | undefined;
+  let lease: ExtensionSourceEntryLease | undefined;
+  let prepared: PreparedPiResourceMutation<NativePiResourceDescriptor> | undefined;
+  let resourceCatalogFence: symbol | undefined;
+  const assertAuthority = (store: OperationalStore): ReturnType<typeof extensionPackageAcquisition> => {
+    const observed = backendResourceAdmission(dependencies, input.backendId, store);
+    if (!observed.kinds.includes("package")) {
+      throw new ConnectError("The selected Backend does not support managed package resources.", Code.FailedPrecondition);
+    }
+    if (admittedCapability === undefined) admittedCapability = observed;
+    else if (
+      admittedCapability.backendId !== observed.backendId
+      || admittedCapability.instanceGeneration !== observed.instanceGeneration
+      || !sameResourceKinds(admittedCapability.kinds, observed.kinds)
+    ) {
+      throw new ConnectError("Managed resource Backend authority changed while the Extension operation was in progress.", Code.Aborted);
+    }
+    const extension = requireCurrentExtensionMutation(dependencies, input.extensionId, input.expectedRevision);
+    const acquisition = extensionPackageAcquisition(extension);
+    if (admittedAcquisition === undefined) admittedAcquisition = acquisition;
+    else if (!sameExtensionPackageAcquisition(admittedAcquisition, acquisition)) {
+      throw new ConnectError("Extension source selection changed while the operation was in progress.", Code.Aborted);
+    }
+    return acquisition;
+  };
+  try {
+    const execution = await extensionSourceEffect(() => dependencies.sessionHost.mutate<OperationOutcome>({
+      operationId,
+      connection,
+      kind,
+      body: mutation,
+      commit: () => ({
+        accepted: true,
+        resultCase: "resource",
+        entityId: requiredPreparedResourceMutation(prepared).value.id
+      }),
+      precondition: (store) => { void assertAuthority(store); },
+      effect: async () => {
+        const acquisition = assertAuthority(dependencies.store);
+        lease = await dependencies.extensionSources!.acquireEntry(acquisition);
+        const source = lease.source;
+        const entry = lease.entry;
+        const planned = await dependencies.piResources!.prepareExtensionPackage({
+          resourceId: entry.resourceId,
+          backendId: input.backendId,
+          sourceId: source.id,
+          sourceRevision: source.revision,
+          sourceIdentity: source.sourceIdentity,
+          sourceDisplay: source.sourceDisplay,
+          packageRelativePath: entry.packageRelativePath,
+          packageContentRevision: entry.packageContentRevision,
+          packageName: entry.packageName,
+          ...(entry.version === undefined ? {} : { version: entry.version }),
+          bindingName: entry.bindingName,
+          bindingOrdinal: entry.bindingOrdinal,
+          packageRoot: lease.packageRoot,
+          approvedByConnectionId: connection.id,
+          expectedAction: input.expectedAction,
+          ...(input.expectedCurrentResourceId === undefined ? {} : { expectedCurrentResourceId: input.expectedCurrentResourceId }),
+          ...(input.expectedCurrentResourceVersion === undefined ? {} : { expectedCurrentResourceVersion: input.expectedCurrentResourceVersion }),
+          allowSourceReplacement: input.allowSourceReplacement
+        });
+        prepared = planned.mutation;
+      },
+      complete: (commit) => dependencies.piResources!.completePreparedMutation(
+        requiredPreparedResourceMutation(prepared),
+        (finalize) => {
+          lease?.assertCurrent();
+          void assertAuthority(dependencies.store);
+          const completed = commit(finalize);
+          resourceCatalogFence = dependencies.sessionHost.fenceBackendResourceCatalogs(input.backendId);
+          return completed;
+        }
+      )
+    }));
+    if (!execution.replayed) {
+      if (prepared === undefined || resourceCatalogFence === undefined) {
+        throw new StoreError("Extension package operation completed without its Resource fence.");
+      }
+      reconcileCommittedExtensionCatalog(dependencies, input.extensionId);
+      await reconcileCommittedResourceRuntime(
+        dependencies,
+        input.backendId,
+        prepared.value.id,
+        resourceCatalogFence
+      );
+    }
+    return presented(execution);
+  } finally {
+    lease?.release();
+  }
+}
+
+function sameExtensionPackageAcquisition(
+  left: ReturnType<typeof extensionPackageAcquisition>,
+  right: ReturnType<typeof extensionPackageAcquisition>
+): boolean {
+  return left.sourceId === right.sourceId
+    && left.sourceRevision === right.sourceRevision
+    && left.entryId === right.entryId
+    && left.contentRevision === right.contentRevision;
+}
+
 async function preparedResourceEffectOperation(
   dependencies: ConnectServiceDependencies,
   operationId: string,
@@ -16891,9 +17251,15 @@ async function preparedResourceEffectOperation(
   kind: string,
   resourceId: string,
   requireCapability: boolean,
-  prepare: () => Promise<PreparedPiResourceMutation<NativePiResourceDescriptor>>
+  prepare: () => Promise<PreparedPiResourceMutation<NativePiResourceDescriptor>>,
+  options: {
+    readonly fenceBackendIdentity?: boolean;
+    readonly precondition?: (store: OperationalStore) => void;
+    readonly afterCommit?: () => void;
+  } = {}
 ): Promise<PresentedOperation> {
   let admittedBackendId: string | undefined;
+  let admittedBackendInstanceGeneration: number | undefined;
   let admittedCapability: BackendResourceAdmission | undefined;
   let prepared: PreparedPiResourceMutation<NativePiResourceDescriptor> | undefined;
   let resourceCatalogFence: symbol | undefined;
@@ -16923,7 +17289,17 @@ async function preparedResourceEffectOperation(
           Code.Aborted
         );
       }
+    } else if (options.fenceBackendIdentity === true) {
+      const observed = store.getBackend(resource.backendId).descriptor.instanceGeneration;
+      if (admittedBackendInstanceGeneration === undefined) admittedBackendInstanceGeneration = observed;
+      else if (observed !== admittedBackendInstanceGeneration) {
+        throw new ConnectError(
+          "Managed resource Backend authority changed while the operation was in progress.",
+          Code.Aborted
+        );
+      }
     }
+    options.precondition?.(store);
     return resource;
   };
   const execution = await dependencies.sessionHost.mutate<OperationOutcome>({
@@ -16949,6 +17325,7 @@ async function preparedResourceEffectOperation(
   if (!execution.replayed) {
     if (admittedBackendId === undefined) throw new StoreError("Managed resource operation completed without Backend authority.");
     if (resourceCatalogFence === undefined) throw new StoreError("Managed resource operation completed without a runtime catalog fence.");
+    options.afterCommit?.();
     await reconcileCommittedResourceRuntime(dependencies, admittedBackendId, resourceId, resourceCatalogFence);
   }
   return presented(execution);
@@ -17140,6 +17517,29 @@ async function reconcileCommittedResourceRuntime(
     } catch {
       // Store shutdown must not turn a durably completed Operation into an
       // in-memory-only failure response.
+    }
+  }
+}
+
+function reconcileCommittedExtensionCatalog(
+  dependencies: ConnectServiceDependencies,
+  extensionId: string
+): void {
+  try {
+    reconcileExtensionCatalog(dependencies);
+  } catch {
+    // Resource bytes and the Operation have already committed. Keep that
+    // result stable; a later catalog read can retry this derived projection.
+    try {
+      dependencies.store.appendDiagnostic({
+        severity: "warning",
+        component: "extension-catalog",
+        code: "EXTENSION_CATALOG_REFRESH_FAILED",
+        message: "A managed Extension package change was saved, but its catalog projection has not refreshed yet.",
+        details: { extensionId }
+      });
+    } catch {
+      // Store shutdown does not invalidate the completed package Operation.
     }
   }
 }

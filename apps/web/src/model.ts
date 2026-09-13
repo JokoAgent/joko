@@ -2490,8 +2490,39 @@ export interface ExtensionCatalogEntryView {
     }[];
     readonly error?: string;
   };
+  readonly update?: {
+    readonly source: Extract<ExtensionCatalogEntryView["owner"], { readonly kind: "source" }>;
+    readonly availableVersion?: string;
+    readonly sourceReplacement: boolean;
+  };
   readonly useSupported: boolean;
   readonly error?: string;
+}
+
+export type ExtensionPackageActionView = "install" | "update" | "replace";
+
+export interface ExtensionPackagePreviewView {
+  readonly extensionId: string;
+  readonly extensionRevision: bigint;
+  readonly action: ExtensionPackageActionView;
+  readonly resourceId: string;
+  readonly backendId: string;
+  readonly packageName: string;
+  readonly installedVersion?: string;
+  readonly availableVersion?: string;
+  readonly currentResource?: {
+    readonly resourceId: string;
+    readonly resourceRevision: bigint;
+    readonly name: string;
+    readonly sourceDisplay: string;
+  };
+  readonly sourceReplacement: boolean;
+  readonly preservesEnabled: boolean;
+  readonly compatibilityDetails: readonly ResourceCompatibilityDetailView[];
+  readonly runtimeRequirements: readonly ResourceRuntimeRequirementView[];
+  readonly warnings: readonly ResourcePackageWarningView[];
+  readonly disabledLifecycleScripts: readonly string[];
+  readonly canToggle: boolean;
 }
 
 export interface ExtensionCatalogView {
@@ -3782,6 +3813,9 @@ export interface OperationApi {
     readonly signal?: AbortSignal;
   }): Promise<ExtensionCatalogView>;
   getExtension(extensionId: string, sessionId?: string, signal?: AbortSignal): Promise<ExtensionCatalogView>;
+  getExtensionPackagePreview(extensionId: string, expectedRevision: bigint, backendId: string, signal?: AbortSignal): Promise<ExtensionPackagePreviewView>;
+  adoptExtensionPackage(preview: ExtensionPackagePreviewView, allowSourceReplacement?: boolean, signal?: AbortSignal): Promise<void>;
+  removeExtensionPackage(extensionId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<void>;
   getExtensionSourceGitPreflight(signal?: AbortSignal): Promise<ExtensionSourceGitPreflightView>;
   listExtensionSources(signal?: AbortSignal): Promise<ExtensionSourceCatalogView>;
   addExtensionSource(source: ExtensionSourceDraft, expectedCatalogRevision: bigint): Promise<void>;

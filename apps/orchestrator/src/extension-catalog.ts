@@ -69,6 +69,14 @@ export interface ExtensionCatalogDescriptor {
   readonly installState: ExtensionInstallState;
   readonly name: string;
   readonly version?: string;
+  readonly update?: {
+    readonly sourceId: string;
+    readonly sourceRevision: bigint;
+    readonly entryId: string;
+    readonly contentRevision: string;
+    readonly availableVersion?: string;
+    readonly sourceReplacement: boolean;
+  };
   readonly author?: string;
   readonly description: string;
   readonly enabled: boolean;
@@ -132,6 +140,14 @@ interface ExtensionDefinition {
   readonly installState: ExtensionInstallState;
   readonly name: string;
   readonly version?: string;
+  readonly update?: {
+    readonly sourceId: string;
+    readonly sourceRevision: bigint;
+    readonly entryId: string;
+    readonly contentRevision: string;
+    readonly availableVersion?: string;
+    readonly sourceReplacement: boolean;
+  };
   readonly author?: string;
   readonly description: string;
   readonly enabled: boolean;
@@ -615,6 +631,7 @@ export class ExtensionCatalogManager {
       installState: definition.installState,
       name: definition.name,
       ...(definition.version === undefined ? {} : { version: definition.version }),
+      ...(definition.update === undefined ? {} : { update: { ...definition.update } }),
       ...(definition.author === undefined ? {} : { author: definition.author }),
       description: definition.description,
       enabled: definition.enabled,
@@ -683,9 +700,14 @@ function projectDefinitions(
   sources: readonly ExtensionSourceDescriptor[]
 ): readonly ExtensionDefinition[] {
   const definitions: ExtensionDefinition[] = [];
+  const sourceCandidates = new Map<string, {
+    readonly source: ExtensionSourceDescriptor;
+    readonly entry: ExtensionSourceDescriptor["entries"][number];
+  }>();
   for (const source of sources) {
     for (const entry of source.entries) {
       const bindingKey = `resource\0${entry.resourceId}\0${entry.bindingName}\0${entry.bindingOrdinal}`;
+      sourceCandidates.set(bindingKey, { source, entry });
       const authorityIdentity = digest({
         bindingKey,
         sourceId: source.id,
@@ -751,9 +773,29 @@ function projectDefinitions(
       const bindingKey = `resource\0${resource.id}\0${detail.name}\0${ordinal}`;
       const id = extensionId(bindingKey);
       const installed = ["installed", "loaded", "disabled", "update_available"].includes(resource.state);
+      const sourceCandidate = sourceCandidates.get(bindingKey);
+      const update = installed
+        && sourceCandidate?.source.state === "ready"
+        && (
+          resource.extensionSource?.sourceId !== sourceCandidate.source.id
+          || resource.discoveredRevision !== sourceCandidate.entry.packageContentRevision
+        )
+        ? {
+            sourceId: sourceCandidate.source.id,
+            sourceRevision: sourceCandidate.source.revision,
+            entryId: sourceCandidate.entry.id,
+            contentRevision: sourceCandidate.entry.contentRevision,
+            ...(sourceCandidate.entry.version === undefined ? {} : { availableVersion: sourceCandidate.entry.version }),
+            sourceReplacement: resource.extensionSource?.sourceId !== sourceCandidate.source.id
+          }
+        : undefined;
+      const updateIdentity = update === undefined ? undefined : {
+        ...update,
+        sourceRevision: update.sourceRevision.toString(10)
+      };
       const installState: ExtensionInstallState = resource.state === "installing"
         ? "installing"
-        : resource.state === "update_available"
+        : resource.state === "update_available" || update !== undefined
           ? "update_available"
           : resource.state === "error"
             ? "error"
@@ -785,6 +827,7 @@ function projectDefinitions(
         installState,
         name: detail.name || resource.name,
         ...(resource.version === undefined ? {} : { version: resource.version }),
+        ...(update === undefined ? {} : { update }),
         description: resource.sourceDisplay,
         enabled: resource.enabled,
         sidebarSupported: true,
@@ -797,6 +840,7 @@ function projectDefinitions(
           resourceVersion: resource.versionNumber.toString(10),
           state: resource.state,
           enabled: resource.enabled,
+          update: updateIdentity,
           error: resource.error
         }),
         ...(resource.error === undefined ? {} : { error: resource.error })

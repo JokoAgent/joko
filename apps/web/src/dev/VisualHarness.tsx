@@ -25,6 +25,7 @@ import type {
   ComposerDraft,
   ExtensionCatalogEntryView,
   ExtensionCatalogView,
+  ExtensionPackagePreviewView,
   ExtensionSourceCatalogView,
   InteractionResolutionDraft,
   InteractionView,
@@ -313,6 +314,24 @@ export function VisualHarness(): JSX.Element {
           extensions: state.snapshot.extensions.filter((extension) => extension.id === extensionId),
           recoveredFromCorruption: state.snapshot.extensionCatalogRecovered
         };
+      },
+      getExtensionPackagePreview: async (extensionId, expectedRevision, backendId, signal): Promise<ExtensionPackagePreviewView> => {
+        signal?.throwIfAborted();
+        const extension = state.snapshot.extensions.find((candidate) => candidate.id === extensionId);
+        if (extension === undefined || extension.revision !== expectedRevision) throw new Error("The visual extension changed. Refresh and try again.");
+        if (!state.snapshot.backends.some((backend) => backend.id === backendId)) throw new Error("The visual backend is unavailable.");
+        return visualExtensionPackagePreview(extension, backendId);
+      },
+      adoptExtensionPackage: async (preview, allowSourceReplacement): Promise<void> => {
+        if (preview.sourceReplacement && allowSourceReplacement !== true) throw new Error("Confirm the visual source replacement first.");
+        record(`extension-package:${preview.action}:${preview.resourceId}`);
+      },
+      removeExtensionPackage: async (extensionId, expectedRevision): Promise<void> => {
+        const extension = state.snapshot.extensions.find((candidate) => candidate.id === extensionId);
+        if (extension === undefined || extension.revision !== expectedRevision || extension.owner.kind !== "resource") {
+          throw new Error("The visual extension changed. Refresh and try again.");
+        }
+        record(`extension-package:remove:${extension.owner.resourceId}`);
       },
       getExtensionSourceGitPreflight: async () => ({ available: true, version: "2.51.0", minimumVersion: "2.25" }),
       listExtensionSources: async (signal): Promise<ExtensionSourceCatalogView> => {
@@ -2843,6 +2862,9 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
     capabilities.set("input.text", capability("input.text"));
     capabilities.set("input.mention", capability("input.mention", ["artifact"]));
   }
+  if (parameters.scenario === "extensions") {
+    capabilities.set("runtime.resources", capability("runtime.resources", ["package", "extension"]));
+  }
   const providerConfiguration: AppSnapshot["settings"]["providers"][number] = {
     id: "api",
     name: "api",
@@ -3546,7 +3568,25 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
       canToggle: true,
       requiresExtensionApproval: false,
       postMutationNotice: false
-    }],
+    }, ...(parameters.scenario === "extensions" ? [{
+      id: "visual-extension-resource",
+      backendId: "visual-backend",
+      name: "@joko/workspace-navigator",
+      version: "1.4.0",
+      kind: "package",
+      scope: "managed",
+      state: "updateAvailable",
+      enabled: true,
+      source: "Community tools / packages/navigation",
+      discoveredRevision: `sha256:${"c".repeat(64)}`,
+      compatibilityDetails: [],
+      runtimeRequirements: [],
+      warnings: [],
+      disabledLifecycleScripts: [],
+      canToggle: true,
+      requiresExtensionApproval: false,
+      postMutationNotice: true
+    } as const] : [])],
     extensions: parameters.scenario === "extensions" ? visualExtensions() : [],
     extensionCatalogRevision: parameters.scenario === "extensions" ? 12n : 0n,
     commands: [
@@ -3580,6 +3620,17 @@ function visualExtensions(): readonly ExtensionCatalogEntryView[] {
     permissions: [{ id: "workspace-read", label: "Workspace read", description: "Reads project names and file metadata after task permission checks.", required: true, granted: true }],
     commands: [{ name: "open-nav", description: "Start a task with the workspace navigator.", sessionId: "session-1" }],
     setup: { state: "notRequired", revision: 0n, fields: [] },
+    update: {
+      source: {
+        kind: "source",
+        sourceId: "extension_source_0123456789abcdef0123456789abcdef",
+        sourceRevision: 4n,
+        entryId: "extension_source_entry_0123456789abcdef0123456789abcdef",
+        contentRevision: `sha256:${"a".repeat(64)}`
+      },
+      availableVersion: "1.5.0",
+      sourceReplacement: false
+    },
     useSupported: true
   }, {
     id: "extension_fedcba9876543210fedcba9876543210",
@@ -3604,7 +3655,80 @@ function visualExtensions(): readonly ExtensionCatalogEntryView[] {
       fields: [{ id: "api-token", label: "API token", description: "Token used for the research endpoint.", kind: "secret", required: true, configured: false, options: [] }]
     },
     useSupported: false
+  }, {
+    id: "extension_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    revision: 2n,
+    owner: {
+      kind: "source",
+      sourceId: "extension_source_0123456789abcdef0123456789abcdef",
+      sourceRevision: 4n,
+      entryId: "extension_source_entry_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      contentRevision: `sha256:${"a".repeat(64)}`
+    },
+    source: "market",
+    installed: false,
+    installState: "available",
+    name: "Release notes",
+    version: "2.0.0",
+    author: "Joko Labs",
+    description: "Prepare concise release notes from committed workspace changes.",
+    enabled: false,
+    sidebarSupported: false,
+    sidebarVisible: false,
+    tools: [{ name: "draft_release_notes", description: "Draft release notes for the selected revision range.", requiresPermission: true }],
+    permissions: [{ id: "workspace-read", label: "Workspace read", description: "Reads committed changes after task permission checks.", required: true, granted: false }],
+    commands: [],
+    setup: { state: "notRequired", revision: 0n, fields: [] },
+    useSupported: false
   }];
+}
+
+function visualExtensionPackagePreview(extension: ExtensionCatalogEntryView, backendId: string): ExtensionPackagePreviewView {
+  const installed = extension.owner.kind === "resource";
+  const action: ExtensionPackagePreviewView["action"] = installed
+    ? extension.update?.sourceReplacement === true ? "replace" : "update"
+    : "install";
+  const resourceId = installed ? extension.owner.resourceId : "visual-release-notes-resource";
+  return {
+    extensionId: extension.id,
+    extensionRevision: extension.revision,
+    action,
+    resourceId,
+    backendId,
+    packageName: extension.name === "Release notes" ? "@joko/release-notes" : "@joko/workspace-navigator",
+    ...(installed
+      ? {
+          installedVersion: extension.version,
+          currentResource: {
+            resourceId: extension.owner.resourceId,
+            resourceRevision: extension.owner.resourceRevision,
+            name: extension.name,
+            sourceDisplay: "Community tools / packages/navigation"
+          }
+        }
+      : {}),
+    availableVersion: extension.update?.availableVersion ?? extension.version,
+    sourceReplacement: action === "replace",
+    preservesEnabled: installed && extension.enabled,
+    compatibilityDetails: [{
+      kind: "extension",
+      name: extension.name,
+      compatibility: "supported",
+      issues: [],
+      detectedApis: ["notify"],
+      adaptedApis: ["notify"],
+      unsupportedApis: []
+    }],
+    runtimeRequirements: [{
+      packageName: "@earendil-works/pi-coding-agent",
+      range: "^0.84.0",
+      currentVersion: "0.84.4",
+      status: "compatible"
+    }],
+    warnings: ["lifecycleScriptsDisabled"],
+    disabledLifecycleScripts: ["postinstall"],
+    canToggle: true
+  };
 }
 
 function visualExtensionSources(): ExtensionSourceCatalogView {

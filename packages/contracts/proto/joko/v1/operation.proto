@@ -206,6 +206,8 @@ message OperationMutation {
     AddExtensionSourceMutation add_extension_source = 189;
     RefreshExtensionSourceMutation refresh_extension_source = 190;
     RemoveExtensionSourceMutation remove_extension_source = 191;
+    AdoptExtensionPackageMutation adopt_extension_package = 192;
+    RemoveExtensionPackageMutation remove_extension_package = 193;
   }
 }
 
@@ -227,6 +229,21 @@ message RefreshExtensionSourceMutation {
 
 message RemoveExtensionSourceMutation {
   string source_id = 1;
+  Revision expected_revision = 2;
+}
+
+message AdoptExtensionPackageMutation {
+  string extension_id = 1;
+  Revision expected_revision = 2;
+  string backend_id = 3;
+  ExtensionPackageAction expected_action = 4;
+  string expected_current_resource_id = 5;
+  optional Revision expected_current_resource_revision = 6;
+  bool allow_source_replacement = 7;
+}
+
+message RemoveExtensionPackageMutation {
+  string extension_id = 1;
   Revision expected_revision = 2;
 }
 

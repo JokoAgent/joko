@@ -4,6 +4,7 @@ package joko.v1;
 
 import "google/protobuf/timestamp.proto";
 import "joko/v1/common.proto";
+import "joko/v1/settings.proto";
 
 enum ExtensionCatalogSource {
   EXTENSION_CATALOG_SOURCE_UNSPECIFIED = 0;
@@ -48,6 +49,13 @@ enum ExtensionSourceState {
   EXTENSION_SOURCE_STATE_UNSPECIFIED = 0;
   EXTENSION_SOURCE_STATE_READY = 1;
   EXTENSION_SOURCE_STATE_ERROR = 2;
+}
+
+enum ExtensionPackageAction {
+  EXTENSION_PACKAGE_ACTION_UNSPECIFIED = 0;
+  EXTENSION_PACKAGE_ACTION_INSTALL = 1;
+  EXTENSION_PACKAGE_ACTION_UPDATE = 2;
+  EXTENSION_PACKAGE_ACTION_REPLACE = 3;
 }
 
 message ExtensionLocalSource {
@@ -155,6 +163,38 @@ message ExtensionSetupDescriptor {
   optional string error = 5;
 }
 
+message ExtensionPackageUpdate {
+  ExtensionSourceOwner source = 1;
+  optional string available_version = 2;
+  bool source_replacement = 3;
+}
+
+message ExtensionPackageCurrentResource {
+  string resource_id = 1;
+  Revision resource_revision = 2;
+  string name = 3;
+  string source_display = 4;
+}
+
+message ExtensionPackagePreview {
+  string extension_id = 1;
+  Revision extension_revision = 2;
+  ExtensionPackageAction action = 3;
+  string resource_id = 4;
+  string backend_id = 5;
+  string package_name = 6;
+  optional string installed_version = 7;
+  optional string available_version = 8;
+  optional ExtensionPackageCurrentResource current_resource = 9;
+  bool source_replacement = 10;
+  bool preserves_enabled = 11;
+  repeated ResourceCompatibilityDetail compatibility_details = 12;
+  repeated ResourceRuntimeRequirement runtime_requirements = 13;
+  repeated ResourcePackageWarning warnings = 14;
+  repeated string disabled_lifecycle_scripts = 15;
+  bool can_toggle = 16;
+}
+
 // Generic Extension projection. Executable bytes and secrets are deliberately
 // absent: owner carries only exact Resource/MCP references and setup carries
 // protected credential readiness.
@@ -178,6 +218,7 @@ message ExtensionCatalogEntry {
   ExtensionSetupDescriptor setup = 17;
   bool use_supported = 18;
   optional string error = 19;
+  optional ExtensionPackageUpdate update = 20;
 }
 
 message ExtensionCatalogSnapshot {

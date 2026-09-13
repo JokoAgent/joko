@@ -189,6 +189,85 @@ describe("ExtensionCatalogManager", () => {
     }
   });
 
+  it("projects same-source updates and treats a removed then re-added source as explicit replacement provenance", async () => {
+    const { store, catalog } = await fixture();
+    try {
+      const original = source({
+        entries: [{
+          ...source().entries[0]!,
+          packageContentRevision: `sha256:${"d".repeat(64)}`
+        }]
+      });
+      const installed = resource({
+        kind: "package",
+        sourceKind: "extension_source",
+        sourceIdentity: "extension-source-package",
+        sourceDisplay: original.sourceDisplay,
+        discoveredRevision: `sha256:${"d".repeat(64)}`,
+        packageIdentity: "@sample/navigation",
+        extensionSource: {
+          sourceId: original.id,
+          sourceRevision: original.revision,
+          packageRelativePath: "packages/navigation",
+          packageContentRevision: `sha256:${"d".repeat(64)}`
+        },
+        requiresExtensionApproval: false
+      });
+      const current = catalog.reconcile([installed], [], [original]).entries[0]!;
+      expect(current.installState).toBe("installed");
+      expect(current.update).toBeUndefined();
+
+      const refreshed = source({
+        revision: 4n,
+        entries: [{
+          ...source().entries[0]!,
+          revision: `sha256:${"e".repeat(64)}`,
+          contentRevision: `sha256:${"e".repeat(64)}`,
+          packageContentRevision: `sha256:${"f".repeat(64)}`,
+          version: "2.0.0"
+        }]
+      });
+      const update = catalog.reconcile([installed], [], [refreshed]).entries[0]!;
+      expect(update.id).toBe(current.id);
+      expect(update.revision).toBeGreaterThan(current.revision);
+      expect(update).toMatchObject({
+        installState: "update_available",
+        update: {
+          sourceId: original.id,
+          sourceRevision: 4n,
+          entryId: refreshed.entries[0]!.id,
+          contentRevision: refreshed.entries[0]!.contentRevision,
+          availableVersion: "2.0.0",
+          sourceReplacement: false
+        }
+      });
+
+      const removed = catalog.reconcile([installed], [], []).entries[0]!;
+      expect(removed.installState).toBe("installed");
+      expect(removed.update).toBeUndefined();
+      const readded = source({
+        id: "extension_source_fedcba9876543210fedcba9876543210",
+        revision: 1n,
+        entries: [{
+          ...original.entries[0]!,
+          id: "extension_source_entry_fedcba9876543210fedcba9876543210"
+        }]
+      });
+      const replacement = catalog.reconcile([installed], [], [readded]).entries[0]!;
+      expect(replacement).toMatchObject({
+        installState: "update_available",
+        update: {
+          sourceId: readded.id,
+          sourceRevision: 1n,
+          entryId: readded.entries[0]!.id,
+          sourceReplacement: true
+        }
+      });
+    } finally {
+      store.close();
+    }
+  });
+
   it("advances exact owner revisions and rolls back an unpublished reconcile", async () => {
     const { store, catalog } = await fixture();
     try {

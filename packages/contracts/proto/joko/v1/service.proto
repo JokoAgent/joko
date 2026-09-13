@@ -232,6 +232,7 @@ service ExtensionService {
   rpc GetExtension(GetExtensionRequest) returns (GetExtensionResponse);
   rpc GetExtensionSourceGitPreflight(GetExtensionSourceGitPreflightRequest) returns (GetExtensionSourceGitPreflightResponse);
   rpc ListExtensionSources(ListExtensionSourcesRequest) returns (ListExtensionSourcesResponse);
+  rpc GetExtensionPackagePreview(GetExtensionPackagePreviewRequest) returns (GetExtensionPackagePreviewResponse);
   // Produces a one-time protected upload ticket. Secret bytes cross only the
   // authenticated credential upload endpoint and never this RPC.
   rpc BeginExtensionSetupCredentialUpload(BeginExtensionSetupCredentialUploadRequest) returns (BeginExtensionSetupCredentialUploadResponse);
@@ -1687,6 +1688,16 @@ message ListExtensionSourcesResponse {
   Revision catalog_revision = 2;
   bool recovered_from_corruption = 3;
   PageInfo page = 4;
+}
+
+message GetExtensionPackagePreviewRequest {
+  string extension_id = 1;
+  Revision expected_revision = 2;
+  string backend_id = 3;
+}
+
+message GetExtensionPackagePreviewResponse {
+  ExtensionPackagePreview preview = 1;
 }
 
 message BeginExtensionSetupCredentialUploadRequest {

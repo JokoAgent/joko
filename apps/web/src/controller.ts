@@ -2025,6 +2025,12 @@ export function useAppController(): AppController {
     listRuntimeTools: (sessionId) => gateway().listRuntimeTools(sessionId),
     listExtensions: (options) => gateway().listExtensions(options),
     getExtension: (extensionId, sessionId, signal) => gateway().getExtension(extensionId, sessionId, signal),
+    getExtensionPackagePreview: (extensionId, expectedRevision, backendId, signal) =>
+      gateway().getExtensionPackagePreview(extensionId, expectedRevision, backendId, signal),
+    adoptExtensionPackage: (preview, allowSourceReplacement, signal) =>
+      gateway().adoptExtensionPackage(preview, allowSourceReplacement, signal),
+    removeExtensionPackage: (extensionId, expectedRevision, signal) =>
+      gateway().removeExtensionPackage(extensionId, expectedRevision, signal),
     getExtensionSourceGitPreflight: (signal) => gateway().getExtensionSourceGitPreflight(signal),
     listExtensionSources: (signal) => gateway().listExtensionSources(signal),
     addExtensionSource: (source, expectedCatalogRevision) => gateway().addExtensionSource(source, expectedCatalogRevision),

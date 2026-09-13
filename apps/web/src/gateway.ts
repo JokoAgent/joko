@@ -69,6 +69,7 @@ import {
   EventCursorSchema,
   ExtensionWidgetPlacement,
   ExtensionCatalogSource as ProtoExtensionCatalogSource,
+  ExtensionPackageAction as ProtoExtensionPackageAction,
   ExtensionSourceKind as ProtoExtensionSourceKind,
   ExtensionSourceState as ProtoExtensionSourceState,
   ExtensionInstallState as ProtoExtensionInstallState,
@@ -270,6 +271,7 @@ import {
   type ExtraDirectory,
   type ExtensionStatus,
   type ExtensionCatalogEntry as ProtoExtensionCatalogEntry,
+  type ExtensionPackagePreview as ProtoExtensionPackagePreview,
   type ExtensionSourceDescriptor as ProtoExtensionSourceDescriptor,
   type ExtensionWidget,
   type FilePreview,
@@ -383,6 +385,7 @@ import type {
   ExtensionStatusView,
   ExtensionCatalogEntryView,
   ExtensionCatalogView,
+  ExtensionPackagePreviewView,
   ExtensionSourceCatalogView,
   ExtensionSourceDraft,
   ExtensionSourceGitPreflightView,
@@ -2971,6 +2974,52 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       extensions: [mapExtensionCatalogEntry(response.extension)],
       recoveredFromCorruption: response.recoveredFromCorruption
     };
+  }
+
+  async getExtensionPackagePreview(
+    extensionId: string,
+    expectedRevision: bigint,
+    backendId: string,
+    signal?: AbortSignal
+  ): Promise<ExtensionPackagePreviewView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).getExtensionPackagePreview({
+      extensionId,
+      expectedRevision: { value: expectedRevision },
+      backendId
+    }, { signal: scope.signal });
+    if (response.preview === undefined) throw new GatewayError("Orchestrator returned an empty Extension package preview.");
+    return mapExtensionPackagePreview(response.preview);
+  }
+
+  async adoptExtensionPackage(
+    preview: ExtensionPackagePreviewView,
+    allowSourceReplacement = false,
+    signal?: AbortSignal
+  ): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    await this.submit({
+      case: "adoptExtensionPackage",
+      value: {
+        extensionId: preview.extensionId,
+        expectedRevision: { value: preview.extensionRevision },
+        backendId: preview.backendId,
+        expectedAction: protoExtensionPackageAction(preview.action),
+        expectedCurrentResourceId: preview.currentResource?.resourceId ?? "",
+        ...(preview.currentResource === undefined
+          ? {}
+          : { expectedCurrentResourceRevision: { value: preview.currentResource.resourceRevision } }),
+        allowSourceReplacement
+      }
+    }, true, [], scope.signal);
+  }
+
+  async removeExtensionPackage(extensionId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    await this.submit({
+      case: "removeExtensionPackage",
+      value: { extensionId, expectedRevision: { value: expectedRevision } }
+    }, true, [], scope.signal);
   }
 
   async getExtensionSourceGitPreflight(signal?: AbortSignal): Promise<ExtensionSourceGitPreflightView> {
@@ -9877,6 +9926,13 @@ function mapExtensionCatalogEntry(extension: ProtoExtensionCatalogEntry): Extens
               contentRevision: owner.value.contentRevision
             }
         : (() => { throw new GatewayError("Orchestrator returned an Extension without an owner."); })();
+  if (
+    extension.update !== undefined
+    && (
+      mappedOwner.kind !== "resource"
+      || (extension.update.availableVersion !== undefined && extension.update.availableVersion.trim() === "")
+    )
+  ) throw new GatewayError("Orchestrator returned an invalid Extension package update.");
   return {
     id: extension.extensionId,
     revision,
@@ -9927,9 +9983,178 @@ function mapExtensionCatalogEntry(extension: ProtoExtensionCatalogEntry): Extens
       })),
       ...(setup.error === undefined ? {} : { error: setup.error })
     },
+    ...(extension.update === undefined ? {} : {
+      update: {
+        source: mapExtensionSourceOwner(extension.update.source),
+        ...(extension.update.availableVersion === undefined ? {} : { availableVersion: extension.update.availableVersion }),
+        sourceReplacement: extension.update.sourceReplacement
+      }
+    }),
     useSupported: extension.useSupported,
     ...(extension.error === undefined ? {} : { error: extension.error })
   };
+}
+
+function mapExtensionSourceOwner(
+  owner: { readonly sourceId: string; readonly sourceRevision?: { readonly value: bigint }; readonly entryId: string; readonly contentRevision: string } | undefined
+): Extract<ExtensionCatalogEntryView["owner"], { readonly kind: "source" }> {
+  if (
+    owner?.sourceRevision?.value === undefined
+    || owner.sourceRevision.value < 1n
+    || !/^extension_source_[a-f0-9]{32}$/u.test(owner.sourceId)
+    || !/^extension_source_entry_[a-f0-9]{32}$/u.test(owner.entryId)
+    || !/^sha256:[a-f0-9]{64}$/u.test(owner.contentRevision)
+  ) throw new GatewayError("Orchestrator returned an incomplete Extension Source owner.");
+  return {
+    kind: "source",
+    sourceId: owner.sourceId,
+    sourceRevision: owner.sourceRevision.value,
+    entryId: owner.entryId,
+    contentRevision: owner.contentRevision
+  };
+}
+
+function mapExtensionPackagePreview(preview: ProtoExtensionPackagePreview): ExtensionPackagePreviewView {
+  const extensionRevision = preview.extensionRevision?.value;
+  const action = extensionPackageAction(preview.action);
+  const current = preview.currentResource;
+  if (
+    preview.extensionId.trim() === ""
+    || extensionRevision === undefined
+    || extensionRevision < 1n
+    || preview.resourceId.trim() === ""
+    || preview.backendId.trim() === ""
+    || preview.packageName.trim() === ""
+    || (preview.installedVersion !== undefined && preview.installedVersion.trim() === "")
+    || (preview.availableVersion !== undefined && preview.availableVersion.trim() === "")
+    || (action === "install" ? current !== undefined || preview.sourceReplacement : current === undefined)
+    || preview.sourceReplacement !== (action === "replace")
+    || (action === "update" && preview.resourceId !== current?.resourceId)
+    || (action === "replace" && preview.resourceId === current?.resourceId)
+  ) throw new GatewayError("Orchestrator returned an invalid Extension package preview.");
+  if (
+    current !== undefined
+    && (
+      current.resourceId.trim() === ""
+      || current.resourceRevision?.value === undefined
+      || current.resourceRevision.value < 1n
+      || current.name.trim() === ""
+      || current.sourceDisplay.trim() === ""
+    )
+  ) throw new GatewayError("Orchestrator returned an invalid current Extension Resource.");
+  return {
+    extensionId: preview.extensionId,
+    extensionRevision,
+    action,
+    resourceId: preview.resourceId,
+    backendId: preview.backendId,
+    packageName: preview.packageName,
+    ...(preview.installedVersion === undefined ? {} : { installedVersion: preview.installedVersion }),
+    ...(preview.availableVersion === undefined ? {} : { availableVersion: preview.availableVersion }),
+    ...(current === undefined ? {} : {
+      currentResource: {
+        resourceId: current.resourceId,
+        resourceRevision: current.resourceRevision!.value,
+        name: current.name,
+        sourceDisplay: current.sourceDisplay
+      }
+    }),
+    sourceReplacement: preview.sourceReplacement,
+    preservesEnabled: preview.preservesEnabled,
+    compatibilityDetails: preview.compatibilityDetails.map((detail) => ({
+      kind: strictResourceKind(detail.kind),
+      name: detail.name,
+      compatibility: strictResourceCompatibility(detail.compatibility),
+      issues: detail.issues.map(strictResourceCompatibilityIssue),
+      detectedApis: detail.detectedApis.map(strictResourceUiApi),
+      adaptedApis: detail.adaptedApis.map(strictResourceUiApi),
+      unsupportedApis: detail.unsupportedApis.map(strictResourceUiApi)
+    })),
+    runtimeRequirements: preview.runtimeRequirements.map((requirement) => ({
+      packageName: requirement.packageName,
+      range: requirement.range,
+      ...(requirement.currentVersion === undefined ? {} : { currentVersion: requirement.currentVersion }),
+      status: strictResourceRuntimeRequirementStatus(requirement.status)
+    })),
+    warnings: preview.warnings.map(strictResourcePackageWarning),
+    disabledLifecycleScripts: [...preview.disabledLifecycleScripts],
+    canToggle: preview.canToggle
+  };
+}
+
+function extensionPackageAction(value: ProtoExtensionPackageAction): ExtensionPackagePreviewView["action"] {
+  switch (value) {
+    case ProtoExtensionPackageAction.INSTALL: return "install";
+    case ProtoExtensionPackageAction.UPDATE: return "update";
+    case ProtoExtensionPackageAction.REPLACE: return "replace";
+    case ProtoExtensionPackageAction.UNSPECIFIED:
+    default: throw new GatewayError("Orchestrator returned an invalid Extension package action.");
+  }
+}
+
+function protoExtensionPackageAction(value: ExtensionPackagePreviewView["action"]): ProtoExtensionPackageAction {
+  switch (value) {
+    case "install": return ProtoExtensionPackageAction.INSTALL;
+    case "update": return ProtoExtensionPackageAction.UPDATE;
+    case "replace": return ProtoExtensionPackageAction.REPLACE;
+  }
+}
+
+function strictResourceKind(value: ResourceKind): ResourceView["kind"] {
+  switch (value) {
+    case ResourceKind.EXTENSION: return "extension";
+    case ResourceKind.SKILL: return "skill";
+    case ResourceKind.PROMPT_TEMPLATE: return "prompt";
+    case ResourceKind.PACKAGE: return "package";
+    case ResourceKind.THEME: return "theme";
+    case ResourceKind.UNSPECIFIED:
+    default: throw new GatewayError("Orchestrator returned an invalid package Resource kind.");
+  }
+}
+
+function strictResourceCompatibility(value: ResourceCompatibility): ResourceView["compatibilityDetails"][number]["compatibility"] {
+  switch (value) {
+    case ResourceCompatibility.SUPPORTED: return "supported";
+    case ResourceCompatibility.PARTIAL: return "partial";
+    case ResourceCompatibility.UNSUPPORTED: return "unsupported";
+    case ResourceCompatibility.UNKNOWN: return "unknown";
+    case ResourceCompatibility.UNSPECIFIED:
+    default: throw new GatewayError("Orchestrator returned an invalid package compatibility state.");
+  }
+}
+
+function strictResourceCompatibilityIssue(
+  value: ResourceCompatibilityIssue
+): ResourceView["compatibilityDetails"][number]["issues"][number] {
+  const mapped = resourceCompatibilityIssue(value);
+  if (mapped === "unknown") {
+    throw new GatewayError("Orchestrator returned an invalid package compatibility issue.");
+  }
+  return mapped;
+}
+
+function strictResourceUiApi(value: ResourceUiApi): ResourceView["compatibilityDetails"][number]["detectedApis"][number] {
+  const mapped = resourceUiApi(value);
+  if (mapped === "unknown") throw new GatewayError("Orchestrator returned an invalid package UI API.");
+  return mapped;
+}
+
+function strictResourceRuntimeRequirementStatus(
+  value: ResourceRuntimeRequirementStatus
+): ResourceView["runtimeRequirements"][number]["status"] {
+  switch (value) {
+    case ResourceRuntimeRequirementStatus.COMPATIBLE: return "compatible";
+    case ResourceRuntimeRequirementStatus.INCOMPATIBLE: return "incompatible";
+    case ResourceRuntimeRequirementStatus.UNKNOWN: return "unknown";
+    case ResourceRuntimeRequirementStatus.UNSPECIFIED:
+    default: throw new GatewayError("Orchestrator returned an invalid package runtime requirement state.");
+  }
+}
+
+function strictResourcePackageWarning(value: ResourcePackageWarning): ResourceView["warnings"][number] {
+  const mapped = resourcePackageWarning(value);
+  if (mapped === "unknown") throw new GatewayError("Orchestrator returned an invalid package warning.");
+  return mapped;
 }
 
 function extensionInstallState(value: ProtoExtensionInstallState): ExtensionCatalogEntryView["installState"] {

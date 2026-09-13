@@ -4,10 +4,16 @@ import {
   CredentialKind,
   ExtensionCatalogSource,
   ExtensionInstallState,
+  ExtensionPackageAction,
   ExtensionSourceKind,
   ExtensionSourceState,
   ExtensionSetupState,
-  OperationState
+  OperationState,
+  ResourceCompatibility,
+  ResourceKind,
+  ResourcePackageWarning,
+  ResourceRuntimeRequirementStatus,
+  ResourceUiApi
 } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -151,6 +157,147 @@ describe("Extension catalog gateway", () => {
     });
 
     await expect(gateway.listExtensions()).rejects.toThrow("invalid Extension install state");
+    gateway.disconnect();
+  });
+
+  it("maps exact package previews and revision-fences adopt and uninstall mutations", async () => {
+    const requests: Array<{ readonly method: string; readonly input: any }> = [];
+    const source = {
+      sourceId: "extension_source_0123456789abcdef0123456789abcdef",
+      sourceRevision: { value: 9n },
+      entryId: "extension_source_entry_0123456789abcdef0123456789abcdef",
+      contentRevision: `sha256:${"a".repeat(64)}`
+    };
+    const gateway = await mount(async (method, input) => {
+      requests.push({ method, input });
+      if (method === "getSnapshot") return { snapshot: {} };
+      if (method === "listExtensions") return {
+        extensions: [{
+          ...protoExtension(1),
+          installState: ExtensionInstallState.UPDATE_AVAILABLE,
+          update: { source, availableVersion: "2.0.0", sourceReplacement: false }
+        }],
+        catalogRevision: { value: 12n },
+        recoveredFromCorruption: false,
+        page: { totalSize: 1n, nextPageToken: "" }
+      };
+      if (method === "getExtensionPackagePreview") return {
+        preview: {
+          extensionId: "extension_00000000000000000000000000000001",
+          extensionRevision: { value: 1n },
+          action: ExtensionPackageAction.UPDATE,
+          resourceId: "resource-1",
+          backendId: "pi",
+          packageName: "@sample/review",
+          installedVersion: "1.0.0",
+          availableVersion: "2.0.0",
+          currentResource: { resourceId: "resource-1", resourceRevision: { value: 4n }, name: "@sample/review", sourceDisplay: "Review catalog" },
+          sourceReplacement: false,
+          preservesEnabled: true,
+          compatibilityDetails: [{
+            kind: ResourceKind.EXTENSION,
+            name: "review",
+            compatibility: ResourceCompatibility.PARTIAL,
+            detectedApis: [ResourceUiApi.NOTIFY],
+            adaptedApis: [ResourceUiApi.NOTIFY]
+          }],
+          runtimeRequirements: [{
+            packageName: "@earendil-works/pi-coding-agent",
+            range: "^0.84.0",
+            currentVersion: "0.84.4",
+            status: ResourceRuntimeRequirementStatus.COMPATIBLE
+          }],
+          warnings: [ResourcePackageWarning.LIFECYCLE_SCRIPTS_DISABLED],
+          disabledLifecycleScripts: ["postinstall"],
+          canToggle: true
+        }
+      };
+      if (method === "submitOperation") return {
+        operation: {
+          operationId: input.operationId,
+          connectionId: input.connectionId,
+          state: OperationState.SUCCEEDED,
+          result: { payload: { case: "acknowledgement", value: { accepted: true } } }
+        }
+      };
+      throw new Error(`Unexpected method: ${method}`);
+    });
+
+    const catalog = await gateway.listExtensions();
+    expect(catalog.extensions[0]?.update).toEqual({
+      source: { kind: "source", sourceId: source.sourceId, sourceRevision: 9n, entryId: source.entryId, contentRevision: source.contentRevision },
+      availableVersion: "2.0.0",
+      sourceReplacement: false
+    });
+    const preview = await gateway.getExtensionPackagePreview(catalog.extensions[0]!.id, 1n, "pi");
+    expect(preview).toMatchObject({
+      action: "update",
+      resourceId: "resource-1",
+      backendId: "pi",
+      installedVersion: "1.0.0",
+      availableVersion: "2.0.0",
+      preservesEnabled: true,
+      currentResource: { resourceId: "resource-1", resourceRevision: 4n },
+      compatibilityDetails: [{ kind: "extension", compatibility: "partial", detectedApis: ["notify"] }],
+      runtimeRequirements: [{ status: "compatible" }],
+      warnings: ["lifecycleScriptsDisabled"],
+      disabledLifecycleScripts: ["postinstall"]
+    });
+    await gateway.adoptExtensionPackage(preview);
+    await gateway.removeExtensionPackage(preview.extensionId, 2n);
+
+    expect(requests.find((request) => request.method === "getExtensionPackagePreview")?.input).toMatchObject({
+      extensionId: preview.extensionId,
+      expectedRevision: { value: 1n },
+      backendId: "pi"
+    });
+    const payloads = requests.filter((request) => request.method === "submitOperation").map((request) => request.input.mutation.payload);
+    expect(payloads.map((payload) => payload.case)).toEqual(["adoptExtensionPackage", "removeExtensionPackage"]);
+    expect(payloads[0]?.value).toMatchObject({
+      extensionId: preview.extensionId,
+      expectedRevision: { value: 1n },
+      backendId: "pi",
+      expectedAction: ExtensionPackageAction.UPDATE,
+      expectedCurrentResourceId: "resource-1",
+      expectedCurrentResourceRevision: { value: 4n },
+      allowSourceReplacement: false
+    });
+    expect(payloads[1]?.value).toMatchObject({ extensionId: preview.extensionId, expectedRevision: { value: 2n } });
+    gateway.disconnect();
+  });
+
+  it("fails closed when a package preview carries an unknown current-v1 enum", async () => {
+    let invalid: "action" | "warning" | "ui" = "action";
+    const gateway = await mount(async (method) => {
+      if (method === "getSnapshot") return { snapshot: {} };
+      if (method === "getExtensionPackagePreview") return {
+        preview: {
+          extensionId: "extension_00000000000000000000000000000001",
+          extensionRevision: { value: 1n },
+          action: invalid === "action" ? 99 : ExtensionPackageAction.INSTALL,
+          resourceId: "resource-1",
+          backendId: "pi",
+          packageName: "@sample/review",
+          compatibilityDetails: invalid === "ui" ? [{
+            kind: ResourceKind.EXTENSION,
+            name: "review",
+            compatibility: ResourceCompatibility.SUPPORTED,
+            detectedApis: [99]
+          }] : [],
+          warnings: invalid === "warning" ? [99] : []
+        }
+      };
+      throw new Error(`Unexpected method: ${method}`);
+    });
+
+    await expect(gateway.getExtensionPackagePreview("extension_00000000000000000000000000000001", 1n, "pi"))
+      .rejects.toThrow("invalid Extension package action");
+    invalid = "warning";
+    await expect(gateway.getExtensionPackagePreview("extension_00000000000000000000000000000001", 1n, "pi"))
+      .rejects.toThrow("invalid package warning");
+    invalid = "ui";
+    await expect(gateway.getExtensionPackagePreview("extension_00000000000000000000000000000001", 1n, "pi"))
+      .rejects.toThrow("invalid package UI API");
     gateway.disconnect();
   });
 
