@@ -20,13 +20,38 @@ it("resolves the committed task Artifact and rejects foreign, unowned, expired, 
   const expired = await f.ingest("expired", "one", 1);
   const deleted = await f.ingest("deleted", "one");
   f.store.deleteArtifact(deleted.id);
-  const resolved = await f.resolve(owned.id, f.context, new AbortController().signal);
+  const resolved = await f.resolve(owned.id, "one", f.context, new AbortController().signal);
   expect(resolved.blob).toEqual(f.store.getArtifact(owned.id).blob);
   expect(resolved.path).toBe(owned.storagePath);
   expect(resolved.assertCurrent).not.toThrow();
-  for (const id of [foreign.id, unowned.id, expired.id, deleted.id, "missing", "../foreign"])
-    await expect(f.resolve(id, f.context, new AbortController().signal)).rejects.toThrow();
+  for (const [id, sourceSessionId] of [
+    [foreign.id, "two"],
+    [unowned.id, "one"],
+    [expired.id, "one"],
+    [deleted.id, "one"],
+    ["missing", "one"],
+    ["../foreign", "one"]
+  ] as const) {
+    await expect(f.resolve(id, sourceSessionId, f.context, new AbortController().signal)).rejects.toThrow();
+  }
   expect(f.resolveBlobPath).toHaveBeenCalledTimes(1);
+});
+
+it("resolves a cross-task Artifact only through the exact Queue-private authority snapshot", async () => {
+  const f = await fixture();
+  const artifact = await f.ingest("foreign", "two");
+  const snapshot = f.store.captureArtifactReferenceSnapshot("one", "two", artifact.id, 0);
+  const context = { ...f.context, artifactReferenceSnapshots: [snapshot] };
+
+  const resolved = await f.resolve(artifact.id, "two", context, new AbortController().signal);
+  expect(resolved.path).toBe(artifact.storagePath);
+  expect(resolved.assertCurrent).not.toThrow();
+
+  f.store.updateSession("two", {
+    binding: { ...f.store.getSession("two").descriptor.binding, generation: 2 }
+  });
+  expect(resolved.assertCurrent).toThrow();
+  await expect(f.resolve(artifact.id, "two", context, new AbortController().signal)).rejects.toThrow();
 });
 
 it.each(["deleted", "archived", "target", "worktree", "generation", "backend", "cancelled"] as const)(
@@ -36,7 +61,7 @@ it.each(["deleted", "archived", "target", "worktree", "generation", "backend", "
     const abort = new AbortController();
     let release!: (path: string) => void;
     f.resolveBlobPath.mockImplementationOnce(() => new Promise<string>((resolve) => { release = resolve; }));
-    const pending = f.resolve(owned.id, f.context, abort.signal);
+    const pending = f.resolve(owned.id, "one", f.context, abort.signal);
     const rejected = expect(pending).rejects.toThrow();
     expect(f.resolveBlobPath).toHaveBeenCalledOnce();
     if (change === "deleted") f.store.deleteArtifact(owned.id);
@@ -54,7 +79,7 @@ it.each(["deleted", "archived", "target", "worktree", "generation", "backend", "
 it("checks the retained canonical record again after file preparation", async () => {
   const f = await fixture();
   const owned = await f.ingest("owned", "one");
-  const resolved = await f.resolve(owned.id, f.context, new AbortController().signal);
+  const resolved = await f.resolve(owned.id, "one", f.context, new AbortController().signal);
   f.store.deleteArtifact(owned.id);
   expect(resolved.assertCurrent).toThrow();
 });

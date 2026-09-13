@@ -6,7 +6,7 @@ import {
   COMPOSER_ROUTE_REFERENCE_NODE_TYPE
 } from "./composer-paste-pipeline.js";
 import type {
-  ArtifactView,
+  ArtifactReferenceCatalogItemView,
   ComposerMentionDraft,
   ComposerInlineMentionRange,
   ComposerTokenMentionDraft,
@@ -99,8 +99,9 @@ export function composerMentionCatalog(
   workspaceId: string | undefined,
   resources: readonly SessionResourceView[],
   indexedPaths: readonly string[] = [],
-  artifacts: readonly ArtifactView[] = [],
-  sessions: readonly SessionView[] = []
+  artifacts: readonly ArtifactReferenceCatalogItemView[] = [],
+  sessions: readonly SessionView[] = [],
+  artifactSourceSessions: readonly SessionView[] = sessions
 ): readonly ComposerMentionCatalogItem[] {
   const result = flattenWorkspaceCatalog(entries, workspaceId);
   result.push(...workspaceFileIndexCatalog(indexedPaths, workspaceId));
@@ -125,14 +126,24 @@ export function composerMentionCatalog(
       }
     });
   }
+  const artifactSourceNames = new Map(artifactSourceSessions.map((session) => [session.id, session.name]));
   for (const artifact of artifacts) {
-    if (artifact.id.length === 0) continue;
+    if (artifact.id.length === 0 || artifact.sourceSessionId.length === 0) continue;
     const name = artifact.title || artifact.fileName;
     if (name.trim() === "") continue;
+    const identity = `artifact:${artifact.sourceSessionId}:${artifact.id}`;
+    const sourceName = artifactSourceNames.get(artifact.sourceSessionId)?.trim() || artifact.sourceSessionId;
     result.push({
-      id: `artifact:${artifact.id}`, kind: "artifact", name, path: name,
-      meta: [artifact.description, artifact.fileName === name ? undefined : artifact.fileName, artifact.mediaType].filter(Boolean).join(" · "),
-      mention: { id: `artifact:${artifact.id}`, kind: "artifact", reference: artifact.id, label: name, token: serializeComposerMentionPath(name) }
+      id: identity, kind: "artifact", name, path: name,
+      meta: [sourceName, artifact.description, artifact.fileName === name ? undefined : artifact.fileName, artifact.mediaType].filter(Boolean).join(" · "),
+      mention: {
+        id: identity,
+        kind: "artifact",
+        sourceSessionId: artifact.sourceSessionId,
+        reference: artifact.id,
+        label: name,
+        token: serializeComposerMentionPath(name)
+      }
     });
   }
   for (const session of sessions) {

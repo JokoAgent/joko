@@ -228,6 +228,17 @@ describe("structured composer message references", () => {
     expect(current).toBeUndefined();
   });
 
+  it("round-trips exact Artifact source identities and rejects the old source-less shape", () => {
+    const mentions = [
+      { id: "artifact:source-one:shared", kind: "artifact", sourceSessionId: "source-one", reference: "shared", label: "Report", token: "@Report" },
+      { id: "artifact:source-two:shared", kind: "artifact", sourceSessionId: "source-two", reference: "shared", label: "Report", token: "@Report" }
+    ];
+    expect(normalizeComposerMentions(mentions)).toEqual(mentions);
+    expect(normalizeComposerMentions([
+      { id: "artifact:legacy:shared", kind: "artifact", reference: "shared", label: "Report", token: "@Report" }
+    ])).toEqual([]);
+  });
+
   it("drops malformed message references from untrusted IndexedDB data", () => {
     expect(normalizeComposerMentions([
       { id: "bad-role", kind: "message", reference: "m1", label: "Task", sessionId: "s1", role: "tool" },

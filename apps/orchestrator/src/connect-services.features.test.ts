@@ -597,6 +597,110 @@ describe("Connect typed feature boundaries", () => {
     })).rejects.toMatchObject({ code: Code.Aborted });
   });
 
+  it("lists the revision-fenced cross-task Artifact catalog only for an exact capable receiving task", async () => {
+    const revision = 11n;
+    const artifacts = ["artifact-source-one", "artifact-source-two"].map((id, index) => ({
+      blob: {
+        id,
+        sha256: String(index + 3).repeat(64),
+        byteLength: 4,
+        mimeType: "text/plain",
+        fileName: `${id}.txt`
+      },
+      storageKey: `sha256/${id}`,
+      sessionId: `source-session-${index + 1}`,
+      metadata: { kind: "file", title: id },
+      createdAt: 2 - index,
+      revision
+    }));
+    let targetGeneration = 3;
+    let targetArchived = false;
+    let artifactMentionSupported = true;
+    const listArtifacts = vi.fn((options: { readonly offset?: number; readonly limit?: number }) =>
+      artifacts.slice(options.offset ?? 0, (options.offset ?? 0) + (options.limit ?? 500)));
+    const store = {
+      health: () => ({ revision }),
+      listArtifacts,
+      countArtifacts: () => artifacts.length,
+      getSession: (id: string) => ({
+        revision: 5n,
+        descriptor: {
+          id,
+          backendId: "artifact-backend",
+          targetId: "artifact-target",
+          title: "Receiving task",
+          binding: { opaqueRef: "native/receiving", generation: targetGeneration },
+          pinned: false,
+          archived: targetArchived,
+          permissionMode: "ask" as const,
+          planMode: false,
+          fastMode: false,
+          createdAt: 1,
+          updatedAt: 1
+        }
+      }),
+      getBackend: () => ({
+        revision: 7n,
+        descriptor: {
+          capabilities: new Map([[contract.capabilityNames.inputMention, {
+            key: contract.capabilityNames.inputMention,
+            supported: artifactMentionSupported,
+            options: artifactMentionSupported ? ["artifact"] : []
+          }]])
+        }
+      })
+    };
+    const services = createConnectServices(stubApplication({ store }));
+    const request = {
+      referenceTargetSessionId: "receiving-session",
+      referenceTargetGeneration: 3n,
+      page: { pageSize: 1 }
+    };
+
+    const first = await invoke<contract.ListArtifactsResponse>(services.artifact.listArtifacts, request);
+    expect(first.artifacts).toEqual([
+      expect.objectContaining({ artifactId: "artifact-source-one", sessionId: "source-session-1" })
+    ]);
+    expect(first.revision?.value).toBe(revision);
+    expect(first.page).toMatchObject({ totalSize: 2n });
+    expect(first.page?.nextPageToken).not.toBe("");
+    expect(listArtifacts).toHaveBeenLastCalledWith({ referenceCatalog: true, limit: 1, offset: 0 });
+
+    const second = await invoke<contract.ListArtifactsResponse>(services.artifact.listArtifacts, {
+      ...request,
+      page: { pageSize: 1, pageToken: first.page!.nextPageToken }
+    });
+    expect(second.artifacts).toEqual([
+      expect.objectContaining({ artifactId: "artifact-source-two", sessionId: "source-session-2" })
+    ]);
+    expect(second.page?.nextPageToken).toBe("");
+
+    await expect(invoke(services.artifact.listArtifacts, {
+      ...request,
+      sessionId: "source-session-1"
+    })).rejects.toMatchObject({ code: Code.InvalidArgument });
+    await expect(invoke(services.artifact.listArtifacts, {
+      referenceTargetSessionId: "receiving-session",
+      page: { pageSize: 1 }
+    })).rejects.toMatchObject({ code: Code.InvalidArgument });
+    await expect(invoke(services.artifact.listArtifacts, {
+      referenceTargetSessionId: "receiving-session",
+      referenceTargetGeneration: 0n,
+      page: { pageSize: 1 }
+    })).rejects.toMatchObject({ code: Code.InvalidArgument });
+
+    targetGeneration = 4;
+    await expect(invoke(services.artifact.listArtifacts, request)).rejects.toThrow();
+    targetGeneration = 3;
+    artifactMentionSupported = false;
+    await expect(invoke(services.artifact.listArtifacts, request))
+      .rejects.toMatchObject({ code: Code.FailedPrecondition });
+    artifactMentionSupported = true;
+    targetArchived = true;
+    await expect(invoke(services.artifact.listArtifacts, request))
+      .rejects.toMatchObject({ code: Code.FailedPrecondition });
+  });
+
   it("moves only Session navigation placement through a durable operation", async () => {
     let stored: StoredSession = {
       revision: 7n,

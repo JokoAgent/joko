@@ -28,7 +28,7 @@ describe("queue input preview", () => {
       text,
       inputMentions: [
         { kind: "workspace", workspaceId: "workspace", relativePath: "second.ts", displayText: "@Same", directory: false },
-        { kind: "artifact", artifactId: "first-artifact", displayText: "@Same" }
+        { kind: "artifact", sourceSessionId: "source-task", artifactId: "first-artifact", displayText: "@Same" }
       ],
       mentionRanges: [
         { start: first, end: first + "@Same".length, mentionIndex: 1 },

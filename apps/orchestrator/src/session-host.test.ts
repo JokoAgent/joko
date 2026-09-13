@@ -235,7 +235,7 @@ describe("SessionHost", () => {
         { kind: "workspace_directory", label: "sources", reference: "src" },
         { kind: "workspace_file", label: "lines", reference: "src/main.ts", lineRange: { startLine: 1, endLine: 2 } },
         { kind: "resource", label: "Skill", reference: "resource-1", discoveredRevision: "revision-1", resourceVersion: "2", runtimeGeneration },
-        { kind: "artifact", label: "Report", reference: "artifact-1" }
+        { kind: "artifact", label: "Report", reference: "artifact-1", sourceSessionId: created.value.sessionId }
       ];
       for (const mention of mentions) {
         const check = () => fixture.host.assertInputCapabilities(created.value.sessionId, {
@@ -281,7 +281,7 @@ describe("SessionHost", () => {
         images: [], files: [], disposition: "prompt",
         mentions: [
           { kind: "session", label: "Earlier", reference: sourceSessionId },
-          { kind: "artifact", label: "Report", reference: "artifact-one" }
+          { kind: "artifact", label: "Report", reference: "artifact-one", sourceSessionId: destinationSessionId }
         ],
         mentionRanges: [
           { start: 8, end: 16, mentionIndex: 0 },
@@ -293,6 +293,7 @@ describe("SessionHost", () => {
     expect(durableBody.sessionReferenceSnapshots).toEqual([
       expect.objectContaining({ mentionIndex: 0, sessionId: sourceSessionId })
     ]);
+    expect(durableBody.artifactReferenceSnapshots).toBeUndefined();
     expect(JSON.stringify(durableBody)).not.toContain("Investigate");
     expect(JSON.stringify(durableBody)).not.toContain("bounded answer");
 
@@ -320,7 +321,10 @@ describe("SessionHost", () => {
 
     const dispatched = adapter.inputs[0]!;
     expect(dispatched.sessionReferenceSnapshots).toBeUndefined();
-    expect(dispatched.mentions).toEqual([{ kind: "artifact", label: "Report", reference: "artifact-one" }]);
+    expect(dispatched.artifactReferenceSnapshots).toBeUndefined();
+    expect(dispatched.mentions).toEqual([{
+      kind: "artifact", label: "Report", reference: "artifact-one", sourceSessionId: destinationSessionId
+    }]);
     expect(dispatched.mentionRanges).toEqual([{ start: 28, end: 35, mentionIndex: 0 }]);
     expect(dispatched.text).toContain("Please Compare @Earlier and @Report");
     expect(dispatched.text).toContain("[JOKO_TASK_REFERENCE_DATA_V1]");
@@ -329,6 +333,177 @@ describe("SessionHost", () => {
     expect(dispatched.text).not.toContain("Late expansion must stay out");
     expect(Buffer.byteLength(dispatched.text.slice(dispatched.text.indexOf("[JOKO_TASK_REFERENCE_DATA_V1]")), "utf8"))
       .toBeLessThanOrEqual(32 * 1_024);
+  });
+
+  it("captures cross-task Artifact authority privately, transfers only surviving Queue occurrences, and dispatches it only through context", async () => {
+    const adapter = new SessionReferenceCaptureFakeAdapter();
+    const fixture = await createFixture(adapter);
+    const create = async (operationId: string): Promise<string> => (await fixture.host.createSession({
+      operationId,
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: operationId,
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const firstSourceId = await create("create-artifact-reference-source-first");
+    const secondSourceId = await create("create-artifact-reference-source-second");
+    const destinationId = await create("create-artifact-reference-destination");
+    const put = (id: string, sourceSessionId: string, digest: string) => fixture.store.putArtifact({
+      id,
+      sha256: digest.repeat(64),
+      byteLength: 4,
+      mimeType: "text/plain",
+      fileName: `${id}.txt`,
+      storageKey: `sha256/${id}`,
+      sessionId: sourceSessionId,
+      metadata: {}
+    });
+    const first = put("artifact-reference-first", firstSourceId, "a");
+    const second = put("artifact-reference-second", secondSourceId, "b");
+    fixture.store.setQueuePaused({
+      sessionId: destinationId,
+      paused: true,
+      traceId: "test:artifact-reference:pause"
+    });
+    const queued = fixture.host.enqueueInput({
+      operationId: "send-cross-task-artifact-references",
+      connection: fixture.connection,
+      sessionId: destinationId,
+      prompt: {
+        text: "@First @Second",
+        images: [],
+        files: [],
+        disposition: "prompt",
+        mentions: [
+          { kind: "artifact", label: "First", reference: first.blob.id, sourceSessionId: firstSourceId },
+          { kind: "artifact", label: "Second", reference: second.blob.id, sourceSessionId: secondSourceId }
+        ],
+        mentionRanges: [
+          { start: 0, end: 6, mentionIndex: 0 },
+          { start: 7, end: 14, mentionIndex: 1 }
+        ]
+      }
+    });
+    const current = fixture.store.getQueueItem(queued.value.queueItemId);
+    expect(current.body.artifactReferenceSnapshots).toEqual([
+      expect.objectContaining({
+        mentionIndex: 0,
+        sourceSessionId: firstSourceId,
+        targetSessionId: destinationId,
+        artifactId: first.blob.id
+      }),
+      expect.objectContaining({
+        mentionIndex: 1,
+        sourceSessionId: secondSourceId,
+        targetSessionId: destinationId,
+        artifactId: second.blob.id
+      })
+    ]);
+    expect(JSON.stringify(current.body.artifactReferenceSnapshots)).not.toContain(first.storageKey);
+    expect(JSON.stringify(current.body.artifactReferenceSnapshots)).not.toContain(second.storageKey);
+
+    const edited = fixture.host.canonicalQueueItemEdit(current, {
+      text: "@Second",
+      images: [],
+      files: [],
+      disposition: "prompt",
+      mentions: [{
+        kind: "artifact",
+        label: "Second",
+        reference: second.blob.id,
+        sourceSessionId: secondSourceId
+      }],
+      mentionRanges: [{ start: 0, end: 7, mentionIndex: 0 }]
+    }, [{ start: 0, end: 7, replacementText: "" }]);
+    expect(edited.artifactReferenceSnapshots).toEqual([
+      { ...current.body.artifactReferenceSnapshots![1]!, mentionIndex: 0 }
+    ]);
+    fixture.store.editQueueItem({
+      queueItemId: current.id,
+      body: edited,
+      traceId: "test:artifact-reference:edit"
+    });
+    fixture.store.setQueuePaused({
+      sessionId: destinationId,
+      paused: false,
+      traceId: "test:artifact-reference:resume"
+    });
+    fixture.host.requestQueueDrain(destinationId);
+    await eventually(() => adapter.inputs.length === 1);
+
+    expect(adapter.inputs[0]).toMatchObject({
+      text: "@Second",
+      mentions: [{
+        kind: "artifact",
+        label: "Second",
+        reference: second.blob.id,
+        sourceSessionId: secondSourceId
+      }]
+    });
+    expect(adapter.inputs[0]?.artifactReferenceSnapshots).toBeUndefined();
+    expect(adapter.contexts[0]?.artifactReferenceSnapshots).toEqual(edited.artifactReferenceSnapshots);
+    expect(fixture.store.assertArtifactReferenceSnapshot(
+      adapter.contexts[0]!.artifactReferenceSnapshots![0]!
+    ).blob).toEqual(second.blob);
+  });
+
+  it("fails a queued cross-task Artifact before native send when its source binding changes", async () => {
+    const adapter = new SessionReferenceCaptureFakeAdapter();
+    const fixture = await createFixture(adapter);
+    const create = async (operationId: string): Promise<string> => (await fixture.host.createSession({
+      operationId,
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: operationId,
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const sourceId = await create("create-revoked-artifact-source");
+    const destinationId = await create("create-revoked-artifact-destination");
+    const artifact = fixture.store.putArtifact({
+      id: "artifact-revoked-before-send",
+      sha256: "c".repeat(64),
+      byteLength: 4,
+      mimeType: "text/plain",
+      storageKey: "sha256/artifact-revoked-before-send",
+      sessionId: sourceId,
+      metadata: {}
+    });
+    fixture.store.setQueuePaused({ sessionId: destinationId, paused: true, traceId: "test:revoked-artifact:pause" });
+    const queued = fixture.host.enqueueInput({
+      operationId: "send-revoked-cross-task-artifact",
+      connection: fixture.connection,
+      sessionId: destinationId,
+      prompt: {
+        text: "Use @Artifact",
+        images: [],
+        files: [],
+        disposition: "prompt",
+        mentions: [{
+          kind: "artifact",
+          label: "Artifact",
+          reference: artifact.blob.id,
+          sourceSessionId: sourceId
+        }],
+        mentionRanges: [{ start: 4, end: 13, mentionIndex: 0 }]
+      }
+    });
+    const source = fixture.store.getSession(sourceId);
+    fixture.store.updateSession(sourceId, {
+      binding: {
+        ...source.descriptor.binding,
+        opaqueRef: `${source.descriptor.binding.opaqueRef}/rebound`,
+        generation: source.descriptor.binding.generation + 1
+      }
+    }, source.revision);
+    fixture.store.setQueuePaused({ sessionId: destinationId, paused: false, traceId: "test:revoked-artifact:resume" });
+    fixture.host.requestQueueDrain(destinationId);
+    await eventually(() => fixture.store.getQueueItem(queued.value.queueItemId).state === "failed");
+    expect(adapter.inputs).toEqual([]);
+    expect(adapter.contexts).toEqual([]);
   });
 
   it("replays Queue text edits and retains only the exact surviving historical-task fences", async () => {
@@ -372,7 +547,7 @@ describe("SessionHost", () => {
         disposition: "prompt",
         mentions: [
           { kind: "session", label: "Same", reference: firstSourceId },
-          { kind: "artifact", label: "Detached", reference: "artifact-detached" },
+          { kind: "artifact", label: "Detached", reference: "artifact-detached", sourceSessionId: destinationId },
           { kind: "session", label: "Same", reference: secondSourceId }
         ],
         mentionRanges: [
@@ -391,7 +566,7 @@ describe("SessionHost", () => {
       files: [],
       disposition: "prompt",
       mentions: [
-        { kind: "artifact", label: "Detached", reference: "artifact-detached" },
+        { kind: "artifact", label: "Detached", reference: "artifact-detached", sourceSessionId: destinationId },
         { kind: "session", label: "Same", reference: secondSourceId }
       ],
       mentionRanges: [{ start: 0, end: 5, mentionIndex: 1 }]
@@ -699,7 +874,9 @@ describe("SessionHost", () => {
     fixture.store.setQueuePaused({ sessionId, paused: true, traceId: "test:reference:pause" });
     const queued = fixture.host.enqueueInput({
       operationId: "send-reference-capability-loss", connection: fixture.connection, sessionId,
-      prompt: { text: "", images: [], files: [], mentions: [{ kind: "artifact", label: "Report", reference: "artifact-1" }], disposition: "prompt" }
+      prompt: { text: "", images: [], files: [], mentions: [{
+        kind: "artifact", label: "Report", reference: "artifact-1", sourceSessionId: sessionId
+      }], disposition: "prompt" }
     });
     expect(fixture.store.getQueueItem(queued.value.queueItemId).state).toBe("accepted");
     const backend = fixture.store.getBackend(fixture.store.getSession(sessionId).descriptor.backendId).descriptor;
@@ -3684,7 +3861,7 @@ describe("SessionHost", () => {
         text: "@report pasted",
         images: [],
         files: [],
-        mentions: [{ kind: "artifact", label: "report", reference: "artifact-one" }],
+        mentions: [{ kind: "artifact", label: "report", reference: "artifact-one", sourceSessionId: sessionId }],
         disposition: "prompt",
         mentionRanges: [{ start: 0, end: 7, mentionIndex: 0 }],
         pastedTextRanges: [{ start: 0, end: 7, display: "Pasted reference" }]
@@ -3711,7 +3888,7 @@ describe("SessionHost", () => {
       text: "@report inspect",
       images: [],
       files: [],
-      mentions: [{ kind: "artifact", label: "report", reference }],
+      mentions: [{ kind: "artifact", label: "report", reference, sourceSessionId: sessionId }],
       mentionRanges: [{ start: 0, end: 7, mentionIndex: 0 }],
       disposition: "prompt"
     });
@@ -3811,7 +3988,7 @@ describe("SessionHost", () => {
       text: "same native body",
       images: [],
       files: [],
-      mentions: [{ kind: "artifact", label: "report", reference: "artifact-private" }],
+      mentions: [{ kind: "artifact", label: "report", reference: "artifact-private", sourceSessionId: sessionId }],
       disposition: "prompt"
     };
     const execution = fixture.host.enqueueInput({
@@ -11789,6 +11966,7 @@ class TieredUsageFakeAdapter extends FakeBackendAdapter {
 
 class SessionReferenceCaptureFakeAdapter extends FakeBackendAdapter {
   readonly inputs: PromptInput[] = [];
+  readonly contexts: AdapterContext[] = [];
 
   constructor() {
     super({
@@ -11803,6 +11981,7 @@ class SessionReferenceCaptureFakeAdapter extends FakeBackendAdapter {
 
   override async send(input: PromptInput, context: AdapterContext): Promise<void> {
     this.inputs.push(input);
+    this.contexts.push(context);
     await super.send(input, context);
   }
 }

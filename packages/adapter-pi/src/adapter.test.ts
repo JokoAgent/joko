@@ -560,7 +560,7 @@ describe("PiBackendAdapter", () => {
       await expect(adapter.navigateTree({ kind: "session_start" }, false, makeContext(target, []), undefined, navigationAuthority)).rejects.toMatchObject({ publicError: { code: "PI_REWIND_START_UNAVAILABLE" } });
       for (const mention of [
         { kind: "workspace_directory", label: "source", reference: "src" },
-        { kind: "artifact", label: "Export", reference: "artifact-one" },
+        { kind: "artifact", label: "Export", reference: "artifact-one", sourceSessionId: "source-task" },
         { kind: "workspace_file", label: "lines", reference: "src/main.ts", lineRange: { startLine: 1, endLine: 2 } }
       ] as const) {
         await expect(adapter.send({ text: "", images: [], files: [], mentions: [mention], disposition: "prompt" }, makeContext(target, [])))

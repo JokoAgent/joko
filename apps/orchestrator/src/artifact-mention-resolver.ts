@@ -11,11 +11,23 @@ export function createArtifactMentionResolver(options: {
   readonly now?: () => number;
 }): ArtifactMentionResolver {
   const now = options.now ?? Date.now;
-  return async (artifactId, context, signal) => {
-    if (artifactId.length === 0 || artifactId.length > 1_024 || /[\u0000-\u001f\u007f]/u.test(artifactId)) throw unavailable();
+  return async (artifactId, sourceSessionId, context, signal) => {
+    if (artifactId.length === 0 || artifactId.length > 1_024 || /[\u0000-\u001f\u007f]/u.test(artifactId)
+      || sourceSessionId.length === 0 || sourceSessionId.length > 1_024
+      || sourceSessionId !== sourceSessionId.trim() || /[\u0000-\u001f\u007f]/u.test(sourceSessionId)) {
+      throw unavailable();
+    }
     const originalTarget = options.store.getTarget(context.target.id);
     const originalArtifact = options.store.getArtifact(artifactId);
     const originalWorktree = operationBodyHash(options.store.getSession(context.sessionId).descriptor.worktree ?? null);
+    const crossTask = sourceSessionId !== context.sessionId;
+    const referenceSnapshot = crossTask
+      ? context.artifactReferenceSnapshots?.find((snapshot) =>
+          snapshot.sourceSessionId === sourceSessionId
+          && snapshot.targetSessionId === context.sessionId
+          && snapshot.artifactId === artifactId)
+      : undefined;
+    if (crossTask && referenceSnapshot === undefined) throw unavailable();
     const assertCurrent = (): void => {
       signal.throwIfAborted();
       context.signal.throwIfAborted();
@@ -33,10 +45,13 @@ export function createArtifactMentionResolver(options: {
         || effectiveTarget.backendId !== context.target.backendId || effectiveTarget.workspaceRoot !== context.target.workspaceRoot
         || effectiveTarget.trusted !== context.target.trusted || context.target.remoteWorkspace !== undefined
         || session.descriptor.remoteWorkspace !== undefined) throw unavailable();
-      const artifact = options.store.getArtifact(artifactId);
+      const artifact = crossTask
+        ? options.store.assertArtifactReferenceSnapshot(referenceSnapshot!)
+        : options.store.getArtifact(artifactId);
       const metadata = artifact.metadata as { readonly expiresAt?: unknown } | null;
       const expiresAt = metadata !== null && typeof metadata === "object" ? metadata.expiresAt : undefined;
-      if (artifact.sessionId !== context.sessionId || artifact.revision !== originalArtifact.revision
+      if (artifact.sessionId !== sourceSessionId || originalArtifact.sessionId !== sourceSessionId
+        || artifact.revision !== originalArtifact.revision
         || artifact.storageKey !== originalArtifact.storageKey || artifact.deletedAt !== undefined
         || (expiresAt !== undefined && (typeof expiresAt !== "number" || !Number.isFinite(expiresAt) || expiresAt <= now()))) {
         throw unavailable();

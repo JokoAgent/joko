@@ -6,6 +6,7 @@ import { performance } from "node:perf_hooks";
 import type {
   AdapterContext,
   ApprovedDirectory,
+  ArtifactReferenceSnapshot,
   BackendAdapter,
   BackendDescriptor,
   BlobRef,
@@ -152,6 +153,7 @@ import {
 
 const MAXIMUM_APPEND_SYSTEM_PROMPT_CHARACTERS = 8_000;
 const MAXIMUM_SESSION_REFERENCES = 8;
+const MAXIMUM_ARTIFACT_REFERENCES = 16;
 const MAXIMUM_SESSION_REFERENCE_MESSAGES = 20;
 const MAXIMUM_SESSION_REFERENCE_BYTES = 32 * 1024;
 const MAXIMUM_QUEUE_TEXT_EDIT_SPLICES = 4_096;
@@ -4481,7 +4483,7 @@ export class SessionHost {
    * Reconcile a public Queue edit with the durable input authority that the
    * public contract intentionally does not expose. Queue editing may remove
    * accepted references, but it cannot add, reorder, or retarget them, and a
-   * retained Session mention keeps its original admission fence.
+   * retained Session or cross-task Artifact mention keeps its original fence.
    */
   canonicalQueueItemEdit(
     current: QueueItemRecord,
@@ -4502,6 +4504,22 @@ export class SessionHost {
             throw inputCapabilityError(
               "INPUT_SESSION_REFERENCE_SNAPSHOT_INVALID",
               "The queued input contains an unowned historical-task fence."
+            );
+          }
+          return [];
+        })();
+    const currentArtifactSnapshots = current.body.mentions.some((mention) =>
+      mention.kind === "artifact" && mention.sourceSessionId !== current.sessionId)
+      ? this.validatedArtifactReferenceSnapshots(
+          current.sessionId,
+          current.body.mentions,
+          current.body.artifactReferenceSnapshots
+        )
+      : (() => {
+          if ((current.body.artifactReferenceSnapshots?.length ?? 0) > 0) {
+            throw inputCapabilityError(
+              "INPUT_ARTIFACT_REFERENCE_SNAPSHOT_INVALID",
+              "The queued input contains an unowned cross-task Artifact fence."
             );
           }
           return [];
@@ -4572,8 +4590,25 @@ export class SessionHost {
       }
       return [{ ...snapshot, mentionIndex }];
     });
+    const artifactSnapshotsByMentionIndex = new Map(
+      currentArtifactSnapshots.map((snapshot) => [snapshot.mentionIndex, snapshot] as const)
+    );
+    const artifactReferenceSnapshots = mentions.flatMap((mention, mentionIndex) => {
+      if (mention.kind !== "artifact" || mention.sourceSessionId === current.sessionId) return [];
+      const originalMentionIndex = retainedMentionIndexes[mentionIndex]!;
+      const snapshot = artifactSnapshotsByMentionIndex.get(originalMentionIndex);
+      if (snapshot === undefined || snapshot.sourceSessionId !== mention.sourceSessionId
+        || snapshot.artifactId !== mention.reference) {
+        throw inputCapabilityError(
+          "INPUT_ARTIFACT_REFERENCE_SNAPSHOT_INVALID",
+          "A retained cross-task Artifact reference lost its exact admission fence."
+        );
+      }
+      return [{ ...snapshot, mentionIndex }];
+    });
     const {
       sessionReferenceSnapshots: _untrustedSnapshots,
+      artifactReferenceSnapshots: _untrustedArtifactSnapshots,
       automaticContinuation: _untrustedContinuation,
       quotesEncoded: _untrustedQuotesEncoded,
       pastedTextRanges: _untrustedPastedTextRanges,
@@ -4591,10 +4626,11 @@ export class SessionHost {
         : { pastedTextRanges: replayed.pastedTextRanges }),
       ...(mentionRanges.length === 0 ? {} : { mentionRanges }),
       ...(sessionReferenceSnapshots.length === 0 ? {} : { sessionReferenceSnapshots }),
+      ...(artifactReferenceSnapshots.length === 0 ? {} : { artifactReferenceSnapshots }),
       ...(current.body.automaticContinuation === undefined
         ? {}
         : { automaticContinuation: current.body.automaticContinuation })
-    }, { preserveSessionReferenceSnapshots: true });
+    }, { preserveSessionReferenceSnapshots: true, preserveArtifactReferenceSnapshots: true });
   }
 
   assertInputCapabilities(sessionId: string, prompt: PromptInput): void {
@@ -4606,6 +4642,19 @@ export class SessionHost {
     if (prompt.files.length > 0) required.add("input.file");
     if (prompt.mentions.length > 0) required.add("input.mention");
     for (const mention of prompt.mentions) {
+      if (mention.kind === "artifact" && (
+        mention.reference.length === 0 || mention.reference.length > 1_024
+        || mention.reference !== mention.reference.trim()
+        || mention.sourceSessionId.length === 0 || mention.sourceSessionId.length > 1_024
+        || mention.sourceSessionId !== mention.sourceSessionId.trim()
+        || /[\u0000-\u001f\u007f\u2028\u2029]/u.test(mention.reference)
+        || /[\u0000-\u001f\u007f\u2028\u2029]/u.test(mention.sourceSessionId)
+      )) {
+        throw inputCapabilityError(
+          "INPUT_ARTIFACT_IDENTITY_INVALID",
+          "An Artifact reference requires exact bounded source-task and object identities."
+        );
+      }
       if ((mention.kind === "workspace_file" || mention.kind === "workspace_directory")
         && mention.workspaceId !== undefined && mention.workspaceId !== this.inputWorkspaceId(sessionId)) {
         throw inputCapabilityError("INPUT_WORKSPACE_STALE", "The workspace reference does not belong to the task's current workspace.");
@@ -4699,7 +4748,10 @@ export class SessionHost {
   private canonicalQueuedPrompt(
     sessionId: string,
     prompt: PromptInput,
-    options: { readonly preserveSessionReferenceSnapshots?: boolean } = {}
+    options: {
+      readonly preserveSessionReferenceSnapshots?: boolean;
+      readonly preserveArtifactReferenceSnapshots?: boolean;
+    } = {}
   ): PromptInput {
     const workspaceId = prompt.mentions.some((mention) =>
       mention.kind === "workspace_file" || mention.kind === "workspace_directory")
@@ -4717,6 +4769,25 @@ export class SessionHost {
     });
     const sessionMentionIndexes = mentions.flatMap((mention, mentionIndex) =>
       mention.kind === "session" ? [mentionIndex] : []);
+    const artifactMentionIndexes = mentions.flatMap((mention, mentionIndex) =>
+      mention.kind === "artifact" ? [mentionIndex] : []);
+    if (artifactMentionIndexes.length > MAXIMUM_ARTIFACT_REFERENCES) {
+      throw inputCapabilityError(
+        "INPUT_ARTIFACT_REFERENCE_LIMIT",
+        `Task input cannot reference more than ${MAXIMUM_ARTIFACT_REFERENCES} Artifacts.`
+      );
+    }
+    const artifactIdentities = artifactMentionIndexes.map((mentionIndex) => {
+      const mention = mentions[mentionIndex]!;
+      if (mention.kind !== "artifact") throw new StoreError("Artifact mention indexing changed during admission.");
+      return `${mention.sourceSessionId}\u0000${mention.reference}`;
+    });
+    if (new Set(artifactIdentities).size !== artifactIdentities.length) {
+      throw inputCapabilityError(
+        "INPUT_ARTIFACT_REFERENCE_DUPLICATE",
+        "The same source Artifact can be referenced only once in one input."
+      );
+    }
     if (sessionMentionIndexes.length > MAXIMUM_SESSION_REFERENCES) {
       throw inputCapabilityError(
         "INPUT_SESSION_REFERENCE_LIMIT",
@@ -4730,7 +4801,11 @@ export class SessionHost {
         "A historical task can be referenced only once in one input."
       );
     }
-    const { sessionReferenceSnapshots: suppliedSnapshots, ...publicPrompt } = prompt;
+    const {
+      sessionReferenceSnapshots: suppliedSnapshots,
+      artifactReferenceSnapshots: suppliedArtifactSnapshots,
+      ...publicPrompt
+    } = prompt;
     if (sessionMentionIndexes.length === 0) {
       if (suppliedSnapshots !== undefined && suppliedSnapshots.length > 0) {
         throw inputCapabilityError(
@@ -4738,9 +4813,18 @@ export class SessionHost {
           "Task input contains a historical-task fence without a Session mention."
         );
       }
-      return { ...publicPrompt, mentions };
+      if (suppliedArtifactSnapshots !== undefined && suppliedArtifactSnapshots.length > 0
+        && artifactMentionIndexes.every((mentionIndex) => {
+          const mention = mentions[mentionIndex]!;
+          return mention.kind !== "artifact" || mention.sourceSessionId === sessionId;
+        })) {
+        throw inputCapabilityError(
+          "INPUT_ARTIFACT_REFERENCE_SNAPSHOT_INVALID",
+          "Task input contains a cross-task Artifact fence without a cross-task mention."
+        );
+      }
     }
-    const snapshots = options.preserveSessionReferenceSnapshots === true
+    const snapshots = sessionMentionIndexes.length === 0 ? [] : options.preserveSessionReferenceSnapshots === true
       ? this.validatedSessionReferenceSnapshots(sessionId, mentions, suppliedSnapshots)
       : sessionMentionIndexes.map((mentionIndex) => {
           const mention = mentions[mentionIndex]!;
@@ -4760,7 +4844,119 @@ export class SessionHost {
           }
           return snapshot;
         });
-    return { ...publicPrompt, mentions, sessionReferenceSnapshots: snapshots };
+    const crossTaskArtifactIndexes = artifactMentionIndexes.filter((mentionIndex) => {
+      const mention = mentions[mentionIndex]!;
+      return mention.kind === "artifact" && mention.sourceSessionId !== sessionId;
+    });
+    if (crossTaskArtifactIndexes.length === 0 && (suppliedArtifactSnapshots?.length ?? 0) > 0) {
+      throw inputCapabilityError(
+        "INPUT_ARTIFACT_REFERENCE_SNAPSHOT_INVALID",
+        "Task input contains a cross-task Artifact fence without a cross-task mention."
+      );
+    }
+    const artifactSnapshots = crossTaskArtifactIndexes.length === 0 ? []
+      : options.preserveArtifactReferenceSnapshots === true
+        ? this.validatedArtifactReferenceSnapshots(sessionId, mentions, suppliedArtifactSnapshots)
+        : crossTaskArtifactIndexes.map((mentionIndex) => {
+            const mention = mentions[mentionIndex]!;
+            if (mention.kind !== "artifact") throw new StoreError("Artifact mention indexing changed during admission.");
+            try {
+              return this.#store.captureArtifactReferenceSnapshot(
+                sessionId,
+                mention.sourceSessionId,
+                mention.reference,
+                mentionIndex
+              );
+            } catch {
+              throw inputCapabilityError(
+                "INPUT_ARTIFACT_REFERENCE_UNAVAILABLE",
+                "The selected Artifact is unavailable under the exact source-task authority."
+              );
+            }
+          });
+    return {
+      ...publicPrompt,
+      mentions,
+      ...(snapshots.length === 0 ? {} : { sessionReferenceSnapshots: snapshots }),
+      ...(artifactSnapshots.length === 0 ? {} : { artifactReferenceSnapshots: artifactSnapshots })
+    };
+  }
+
+  private validatedArtifactReferenceSnapshots(
+    targetSessionId: string,
+    mentions: PromptInput["mentions"],
+    snapshots: readonly ArtifactReferenceSnapshot[] | undefined
+  ): readonly ArtifactReferenceSnapshot[] {
+    const expected = mentions.flatMap((mention, mentionIndex) =>
+      mention.kind === "artifact" && mention.sourceSessionId !== targetSessionId
+        ? [{ mention, mentionIndex }]
+        : []);
+    if (snapshots === undefined || snapshots.length !== expected.length) {
+      throw inputCapabilityError(
+        "INPUT_ARTIFACT_REFERENCE_SNAPSHOT_INVALID",
+        "Queued cross-task Artifact references are missing their exact admission fences."
+      );
+    }
+    const byIndex = new Map<number, ArtifactReferenceSnapshot>();
+    for (const snapshot of snapshots) {
+      if (!Number.isSafeInteger(snapshot.mentionIndex) || snapshot.mentionIndex < 0
+        || byIndex.has(snapshot.mentionIndex)) {
+        throw inputCapabilityError(
+          "INPUT_ARTIFACT_REFERENCE_SNAPSHOT_INVALID",
+          "A cross-task Artifact admission fence has an invalid or duplicate index."
+        );
+      }
+      byIndex.set(snapshot.mentionIndex, snapshot);
+    }
+    return expected.map(({ mention, mentionIndex }) => {
+      const snapshot = byIndex.get(mentionIndex);
+      if (snapshot === undefined || snapshot.sourceSessionId !== mention.sourceSessionId
+        || snapshot.artifactId !== mention.reference || snapshot.targetSessionId !== targetSessionId
+        || !/^sha256:[a-f0-9]{64}$/u.test(snapshot.sourceAuthorityFingerprint)
+        || !/^sha256:[a-f0-9]{64}$/u.test(snapshot.targetAuthorityFingerprint)
+        || !/^sha256:[a-f0-9]{64}$/u.test(snapshot.artifactFingerprint)
+        || !/^[1-9][0-9]{0,18}$/u.test(snapshot.artifactRevision)) {
+        throw inputCapabilityError(
+          "INPUT_ARTIFACT_REFERENCE_SNAPSHOT_INVALID",
+          "A cross-task Artifact admission fence does not match its typed mention."
+        );
+      }
+      return snapshot;
+    });
+  }
+
+  /** Revalidate cross-task Artifact authority immediately before any Backend
+   * turn mutation. The validated fences travel only in AdapterContext; the
+   * public prompt never receives or exposes them. */
+  private artifactReferencesForDispatch(
+    targetSessionId: string,
+    prompt: PromptInput
+  ): readonly ArtifactReferenceSnapshot[] {
+    const hasCrossTaskArtifact = prompt.mentions.some((mention) =>
+      mention.kind === "artifact" && mention.sourceSessionId !== targetSessionId);
+    if (!hasCrossTaskArtifact) {
+      if ((prompt.artifactReferenceSnapshots?.length ?? 0) > 0) {
+        throw inputCapabilityError(
+          "INPUT_ARTIFACT_REFERENCE_SNAPSHOT_INVALID",
+          "The queued input contains an unowned cross-task Artifact fence."
+        );
+      }
+      return [];
+    }
+    const snapshots = this.validatedArtifactReferenceSnapshots(
+      targetSessionId,
+      prompt.mentions,
+      prompt.artifactReferenceSnapshots
+    );
+    try {
+      for (const snapshot of snapshots) this.#store.assertArtifactReferenceSnapshot(snapshot);
+    } catch {
+      throw inputCapabilityError(
+        "INPUT_ARTIFACT_REFERENCE_UNAVAILABLE",
+        "A referenced Artifact is no longer available under its admitted source-task authority."
+      );
+    }
+    return snapshots;
   }
 
   private validatedSessionReferenceSnapshots(
@@ -4800,6 +4996,11 @@ export class SessionHost {
   }
 
   private resolveSessionReferencesForDispatch(sessionId: string, prompt: PromptInput): PromptInput {
+    const {
+      sessionReferenceSnapshots: _sessionReferenceSnapshots,
+      artifactReferenceSnapshots: _artifactReferenceSnapshots,
+      ...adapterPrompt
+    } = prompt;
     const sessionMentions = prompt.mentions.flatMap((mention, mentionIndex) => mention.kind === "session"
       ? [{ mention, mentionIndex }]
       : []);
@@ -4810,7 +5011,7 @@ export class SessionHost {
           "The queued input contains an unowned historical-task fence."
         );
       }
-      return prompt;
+      return adapterPrompt;
     }
     const snapshots = this.validatedSessionReferenceSnapshots(
       sessionId,
@@ -4853,7 +5054,6 @@ export class SessionHost {
       const mentionIndex = replacementIndexes.get(range.mentionIndex);
       return mentionIndex === undefined ? [] : [{ ...range, mentionIndex }];
     });
-    const { sessionReferenceSnapshots: _snapshots, ...adapterPrompt } = prompt;
     return {
       ...adapterPrompt,
       text: `${prompt.text}${prompt.text.length === 0 ? "" : "\n\n"}${appendix}`,
@@ -9199,7 +9399,10 @@ export class SessionHost {
     const source = this.#store.getQueueItem(pending.sourceQueueItemId);
     let replayBody: PromptInput;
     try {
-      replayBody = this.canonicalQueuedPrompt(sessionId, source.body, { preserveSessionReferenceSnapshots: true });
+      replayBody = this.canonicalQueuedPrompt(sessionId, source.body, {
+        preserveSessionReferenceSnapshots: true,
+        preserveArtifactReferenceSnapshots: true
+      });
       assertPromptInlineTextRanges(replayBody);
       this.assertInputCapabilities(sessionId, replayBody);
     } catch (error) {
@@ -9507,7 +9710,11 @@ export class SessionHost {
               .catch((error: unknown) => this.recordFailure("workspace-baseline", error));
           }
           this.assertSessionNotPendingScheduleDeletion(sessionId);
-          const context = await this.beginTurnOverrideLease(item, active, stored);
+          const artifactReferenceSnapshots = this.artifactReferencesForDispatch(sessionId, item.body);
+          const baseContext = await this.beginTurnOverrideLease(item, active, stored);
+          const context: AdapterContext = artifactReferenceSnapshots.length === 0
+            ? baseContext
+            : { ...baseContext, artifactReferenceSnapshots };
           this.assertSessionNotPendingScheduleDeletion(sessionId);
           this.assertDispatchAdmissionOwner(
             item,
@@ -12545,6 +12752,9 @@ function sameQueueMention(
       && left.discoveredRevision === right.discoveredRevision
       && left.resourceVersion === right.resourceVersion
       && left.runtimeGeneration === right.runtimeGeneration;
+  }
+  if (left.kind === "artifact") {
+    return right.kind === "artifact" && left.sourceSessionId === right.sourceSessionId;
   }
   return true;
 }

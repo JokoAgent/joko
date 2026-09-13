@@ -21,8 +21,8 @@ describe("inline text ranges", () => {
 
 describe("input mention ranges", () => {
   const mentions = [
-    { kind: "artifact" as const, label: "report.txt", reference: "artifact-one" },
-    { kind: "artifact" as const, label: "report.txt", reference: "artifact-two" }
+    { kind: "artifact" as const, label: "report.txt", reference: "artifact-one", sourceSessionId: "source-one" },
+    { kind: "artifact" as const, label: "report.txt", reference: "artifact-two", sourceSessionId: "source-two" }
   ];
   const text = "😀 @report.txt @report.txt @report.txt paste";
   const ranges = [

@@ -1271,6 +1271,10 @@ message ListArtifactsRequest {
   string run_id = 2;
   optional ArtifactKind kind = 3;
   PageRequest page = 4;
+  // When present, list the complete committed catalog eligible for an
+  // explicit mention in this exact receiving task rather than one source.
+  string reference_target_session_id = 5;
+  optional uint64 reference_target_generation = 6;
 }
 
 message ListArtifactsResponse {

@@ -225,9 +225,23 @@ export type MentionInput = MentionInputBase & (
       readonly runtimeGeneration: number;
       readonly lineRange?: never;
     }
-  | { readonly kind: "artifact"; readonly lineRange?: never }
+  | { readonly kind: "artifact"; readonly sourceSessionId: string; readonly lineRange?: never }
   | { readonly kind: "session"; readonly lineRange?: never }
 );
+
+/** Queue-private authority for one cross-task Artifact mention. Public
+ * contracts carry sourceSessionId + Artifact ID only and never accept this
+ * snapshot. The Store is the sole capture and validation owner. */
+export interface ArtifactReferenceSnapshot {
+  readonly mentionIndex: number;
+  readonly sourceSessionId: string;
+  readonly artifactId: string;
+  readonly sourceAuthorityFingerprint: string;
+  readonly targetSessionId: string;
+  readonly targetAuthorityFingerprint: string;
+  readonly artifactRevision: string;
+  readonly artifactFingerprint: string;
+}
 
 /** Host-authored durable fence for one Session mention in a queued prompt.
  * The public input carries only the source Session identity; referenced
@@ -331,6 +345,10 @@ export interface PromptInput {
   /** Queue-only authority for typed Session mentions. Public mappers never
    * accept or emit this field, and dispatch removes it before Adapter input. */
   readonly sessionReferenceSnapshots?: readonly SessionReferenceSnapshot[];
+  /** Queue-only authority for cross-task Artifact mentions. Public mappers
+   * never accept or emit this field; Adapter dispatch receives it only through
+   * the service-owned context and removes it from the prompt. */
+  readonly artifactReferenceSnapshots?: readonly ArtifactReferenceSnapshot[];
   readonly disposition: InputDisposition;
   /** True only when the product encoded inline quote atoms into text. */
   readonly quotesEncoded?: boolean;

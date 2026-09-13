@@ -21,7 +21,7 @@ import type { ComposerSendShortcutPreference } from "../local-state.js";
 import { modelSourceAccess } from "../model-source-access.js";
 import { remapComposerInlineMentionReplacement } from "../composer-mention-ranges.js";
 import { ModelSourceNotice } from "./ModelSourceNotice.js";
-import type { ArtifactView, AttachmentDraft, BackendView, BrowserCommentDraftItem, ComposerDraft, ComposerMentionDraft, ComposerMessageMentionDraft, ComposerSelectionQuoteDraft, DeliveryMode, ExtraDirectoryView, QueueControlView, QueueItemView, RuntimeCommandView, SessionResourceView, SessionView, UsageTokensView, WorkspaceView } from "../model.js";
+import type { ArtifactReferenceCatalogItemView, AttachmentDraft, BackendView, BrowserCommentDraftItem, ComposerDraft, ComposerMentionDraft, ComposerMessageMentionDraft, ComposerSelectionQuoteDraft, DeliveryMode, ExtraDirectoryView, QueueControlView, QueueItemView, RuntimeCommandView, SessionResourceView, SessionView, UsageTokensView, WorkspaceView } from "../model.js";
 import { browserCommentPreviewTag, removeBrowserCommentAndRepairChains } from "../browser-comment-draft.js";
 import { appendQuoteToComposerDocument, appendTextToComposerDocument, composerDocumentIsEmpty, composerDocumentKeepingQuotes, composerDocumentPlainText, composerDocumentQuotes, emptyComposerDocument, joinComposerDocuments, normalizeComposerDocument, plainTextToComposerDocument } from "../composer-quote-document.js";
 import { advertisedQueueDeliveryModes } from "./backend-control-capabilities.js";
@@ -87,7 +87,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   readonly workspace?: WorkspaceView;
   readonly extraDirectories: readonly ExtraDirectoryView[];
   readonly resources: readonly SessionResourceView[];
-  readonly artifacts?: readonly ArtifactView[];
+  readonly artifacts?: readonly ArtifactReferenceCatalogItemView[];
   readonly sessions?: readonly SessionView[];
   readonly commands: readonly RuntimeCommandView[];
   readonly messageHistory: readonly ComposerHistoryEntry[];
@@ -1428,9 +1428,10 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       mentionPolicy.resources ? resources : [],
       matchingWorkspaceMentionIndex?.paths ?? [],
       mentionPolicy.artifacts ? artifacts ?? [] : [],
-      mentionPolicy.sessions ? sessions ?? [] : []
+      mentionPolicy.sessions ? sessions ?? [] : [],
+      controller.state.snapshot.sessions
     ).filter((item) => item.kind !== "file" || mentionPolicy.files),
-    [matchingWorkspaceMentionIndex?.paths, resources, artifacts, sessions, mentionPolicy, workspaceMentionsAvailable, workspace?.entries, workspace?.id]
+    [controller.state.snapshot.sessions, matchingWorkspaceMentionIndex?.paths, resources, artifacts, sessions, mentionPolicy, workspaceMentionsAvailable, workspace?.entries, workspace?.id]
   );
   const knownWorkspacePaths = useMemo(() => workspace === undefined
     ? []

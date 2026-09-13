@@ -11,6 +11,7 @@ import type {
   NativeSessionStart,
   PermissionMode,
   PromptInput,
+  ArtifactReferenceSnapshot,
   ProviderModel,
   SessionId,
   TargetDescriptor,
@@ -39,6 +40,9 @@ export interface AdapterContext {
   readonly extraDirectories?: readonly ApprovedDirectory[];
   /** Current service-owned ordered policy authority for this Backend/Target/workspace. */
   readonly policySnapshot?: PolicySnapshot;
+  /** Queue-private grants for cross-task Artifact mentions in this invocation.
+   * These are captured and validated by Store/Host, never by a client. */
+  readonly artifactReferenceSnapshots?: readonly ArtifactReferenceSnapshot[];
   readonly signal: AbortSignal;
   readonly emit: (payload: EventPayload, metadata?: AdapterEventMetadata) => Promise<void>;
   readonly requestInteraction: (
@@ -55,6 +59,7 @@ export interface AdapterContext {
  * into an immutable local file without exposing storage paths to clients. */
 export type ArtifactMentionResolver = (
   artifactId: string,
+  sourceSessionId: string,
   context: AdapterContext,
   signal: AbortSignal
 ) => Promise<{

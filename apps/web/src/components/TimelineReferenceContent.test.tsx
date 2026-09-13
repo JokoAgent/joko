@@ -122,7 +122,7 @@ describe("timeline reference content", () => {
     const node = (ownerKey: string) => <SentMessageReferenceText text="@report.txt @report.txt @report.txt"
       inputMentions={[
         { kind: "workspace", workspaceId: "w", relativePath: "report.txt", displayText: "report.txt", directory: false },
-        { kind: "artifact", artifactId: artifact.id, displayText: "report.txt" }
+        { kind: "artifact", sourceSessionId: "source-task", artifactId: artifact.id, displayText: "report.txt" }
       ]} mentionRanges={[{ start: 0, end: 11, mentionIndex: 1 }, { start: 12, end: 23, mentionIndex: 0 }]}
       actions={{ ownerKey, sessionId: "task", workspaceId: "w", t, onReadArtifact: read, renderArtifactPreview: preview }} />;
     const mounted = mount(node("first"));
@@ -131,7 +131,7 @@ describe("timeline reference content", () => {
     expect(mounted.host.textContent).toBe("@report.txt @report.txt @report.txt");
     const button = () => mounted.host.querySelector<HTMLButtonElement>("button")!;
     await act(async () => { button().click(); button().click(); });
-    expect(read).toHaveBeenCalledExactlyOnceWith("task", artifact.id, expect.any(AbortSignal));
+    expect(read).toHaveBeenCalledExactlyOnceWith("source-task", artifact.id, expect.any(AbortSignal));
     expect(preview).not.toHaveBeenCalled();
     const oldSignal = read.mock.calls[0]![2];
     act(() => mounted.root.render(node("second")));

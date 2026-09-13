@@ -114,7 +114,7 @@ it("keeps accepted input atoms static, steers by queue identity and closes an un
     ...item("structured", 0),
     text,
     quotesEncoded: true,
-    inputMentions: [{ kind: "artifact", artifactId: "artifact-1", displayText: "@report" }],
+    inputMentions: [{ kind: "artifact", sourceSessionId: "source-task", artifactId: "artifact-1", displayText: "@report" }],
     mentionRanges: [{ start: mentionStart, end: mentionStart + "@report".length, mentionIndex: 0 }],
     attachments: [{ kind: "file", label: "notes.txt" }]
   };
@@ -144,7 +144,7 @@ it("carries only untouched same-label references through the textarea's actual e
     ...item("same-labels", 0),
     text: "@same @same",
     inputMentions: [
-      { kind: "artifact", artifactId: "first", displayText: "same" },
+      { kind: "artifact", sourceSessionId: "source-task", artifactId: "first", displayText: "same" },
       { kind: "workspace", workspaceId: "workspace", relativePath: "second.ts", displayText: "same", directory: false }
     ],
     mentionRanges: [

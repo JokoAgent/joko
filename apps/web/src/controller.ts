@@ -1655,6 +1655,7 @@ export function useAppController(): AppController {
     return {
       refresh: async () => original().refresh(),
       listSessionArtifacts: async (...args: Parameters<OperationApi["listSessionArtifacts"]>) => original().listSessionArtifacts(...args),
+      listArtifactReferenceCatalog: async (...args: Parameters<OperationApi["listArtifactReferenceCatalog"]>) => original().listArtifactReferenceCatalog(...args),
       readSessionArtifact: async (...args: Parameters<OperationApi["readSessionArtifact"]>) => original().readSessionArtifact(...args),
       send: async (...args: Parameters<OperationApi["send"]>) => original().send(...args),
       createTarget: async (...args: Parameters<OperationApi["createTarget"]>) => original().createTarget(...args),

@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { ProviderApiCompatibility, ProviderConfigurationField } from "@joko/contracts";
 import { AuthenticationState, BackgroundTaskState, CompactionState, ContextRebuildReason, EventSchema, InlineTextRangeSchema, InputContentSchema, InputMentionRangeSchema, InstallationState, InteractionState, MessageInputDelivery, ModelPriceSource, QueueSourceKind, ReviewFreshnessState, RetryState, RunState, ScheduleExecutionMode, ScheduleFireSource, ScheduleRunPhase, ScheduleSessionMode, ToolCallOutputMode } from "@joko/contracts";
-import type { EventPayload, PiEventMetadata, ProviderModel, SubagentRunDetail, SubagentTranscriptEntry } from "@joko/core";
+import type { EventPayload, PiEventMetadata, PromptInput, ProviderModel, SubagentRunDetail, SubagentTranscriptEntry } from "@joko/core";
 import { OperationConflictError, type ArtifactRecord, type InteractionRecord, type PersistedEvent, type QueueItemRecord, type ScheduleRecord, type ScheduleRunRecord, type StoredAttempt, type StoredBackend, type StoredRun, type StoredSession } from "@joko/store";
 
 import {
@@ -14,6 +14,7 @@ import {
   fromProtoInputContent,
   fromProtoInteraction,
   fromProtoInteractionDecision,
+  fromProtoQueueItem,
   fromProtoSchedule,
   fromProtoSession,
   fromProtoSubagentRunDetail,
@@ -741,7 +742,12 @@ describe("proto mapper", () => {
         { kind: "workspace_file" as const, workspaceId: "workspace-1", label: "selected lines", reference: "README.md", lineRange: { startLine: 2, endLine: 5 } },
         { kind: "workspace_directory" as const, workspaceId: "workspace-1", label: "sources", reference: "src" },
         { kind: "resource" as const, label: "Docs", reference: "resource-1", discoveredRevision: "revision-1", resourceVersion: "9", runtimeGeneration: 4 },
-        { kind: "artifact" as const, label: "Report", reference: "artifact-1" },
+        {
+          kind: "artifact" as const,
+          label: "Report",
+          reference: "artifact-1",
+          sourceSessionId: "session-artifact-source"
+        },
         { kind: "session" as const, label: "Earlier task", reference: "task/earlier" }
       ],
       disposition: "steer" as const,
@@ -762,10 +768,103 @@ describe("proto mapper", () => {
     expect(fromProtoInputContent(wire, "steer")).toEqual(input);
   });
 
+  it("keeps Artifact source identity in public Queue projections without leaking its private grant", () => {
+    const publicInput: PromptInput = {
+      text: "@Report",
+      images: [],
+      files: [],
+      mentions: [{
+        kind: "artifact",
+        label: "Report",
+        reference: "artifact-public",
+        sourceSessionId: "session-source"
+      }],
+      mentionRanges: [{ start: 0, end: 7, mentionIndex: 0 }],
+      disposition: "prompt"
+    };
+    const durableInput: PromptInput = {
+      ...publicInput,
+      artifactReferenceSnapshots: [{
+        mentionIndex: 0,
+        sourceSessionId: "session-source",
+        artifactId: "artifact-public",
+        sourceAuthorityFingerprint: `sha256:${"a".repeat(64)}`,
+        targetSessionId: "session-target",
+        targetAuthorityFingerprint: `sha256:${"b".repeat(64)}`,
+        artifactRevision: "3",
+        artifactFingerprint: `sha256:${"c".repeat(64)}`
+      }]
+    };
+    const queue: QueueItemRecord = {
+      id: "queue-artifact-reference",
+      sessionId: "session-target",
+      runId: "run-artifact-reference",
+      operationId: "operation-artifact-reference",
+      disposition: "prompt",
+      state: "accepted",
+      bodyHash: "d".repeat(64),
+      body: durableInput,
+      position: 0,
+      createdAt: 1,
+      updatedAt: 1,
+      editLocked: false,
+      revision: 1n
+    };
+
+    const wire = toProtoQueueItem(queue, {
+      backendId: "backend-target",
+      targetId: "target-target",
+      source: "user",
+      generation: 2
+    });
+    expect(wire.input?.parts).toContainEqual(expect.objectContaining({
+      content: {
+        case: "artifactMention",
+        value: expect.objectContaining({
+          artifactId: "artifact-public",
+          sourceSessionId: "session-source"
+        })
+      }
+    }));
+    const restored = fromProtoQueueItem(wire);
+    expect(restored.body).toEqual(publicInput);
+    expect(restored.body).not.toHaveProperty("artifactReferenceSnapshots");
+  });
+
   it("rejects malformed task mention identity at the wire boundary", () => {
     expect(() => fromProtoInputContent(create(InputContentSchema, {
       parts: [{ content: { case: "sessionMention", value: { sessionId: " task", displayText: "Earlier" } } }]
     }))).toThrow(ProtoMappingError);
+  });
+
+  it("rejects missing or malformed Artifact and source Session identities at the public boundary", () => {
+    expect(() => fromProtoInputContent(create(InputContentSchema, {
+      parts: [{ content: { case: "artifactMention", value: { artifactId: "artifact-1" } } }]
+    }))).toThrow(expect.objectContaining({ fieldPath: "input.parts.artifact_mention.source_session_id" }));
+    expect(() => fromProtoInputContent(create(InputContentSchema, {
+      parts: [{ content: {
+        case: "artifactMention",
+        value: { artifactId: " artifact-1", sourceSessionId: "session-source" }
+      } }]
+    }))).toThrow(expect.objectContaining({ fieldPath: "input.parts.artifact_mention.artifact_id" }));
+    expect(() => fromProtoInputContent(create(InputContentSchema, {
+      parts: [{ content: {
+        case: "artifactMention",
+        value: { artifactId: "artifact-1", sourceSessionId: "session-source\n" }
+      } }]
+    }))).toThrow(expect.objectContaining({ fieldPath: "input.parts.artifact_mention.source_session_id" }));
+    expect(() => toProtoInputContent({
+      text: "",
+      images: [],
+      files: [],
+      mentions: [{
+        kind: "artifact",
+        label: "Report",
+        reference: "artifact-1",
+        sourceSessionId: ""
+      }],
+      disposition: "prompt"
+    })).toThrow(expect.objectContaining({ fieldPath: "input.artifact_mention.source_session_id" }));
   });
 
   it("rejects the former ID-only resource mention wire shape", () => {
@@ -863,7 +962,12 @@ describe("proto mapper", () => {
       images: [],
       files: [{ blob: { id: "attachment", sha256: "a".repeat(64), byteLength: 1, mimeType: "text/plain", fileName: "report.txt" } }],
       mentions: [
-        { kind: "artifact" as const, label: "report.txt", reference: "artifact-one" },
+        {
+          kind: "artifact" as const,
+          label: "report.txt",
+          reference: "artifact-one",
+          sourceSessionId: "session-artifact-source"
+        },
         { kind: "workspace_file" as const, workspaceId: "workspace-other", label: "report.txt", reference: "report.txt" },
         { kind: "resource" as const, label: "non-inline", reference: "resource-one", discoveredRevision: "revision-one", resourceVersion: "5", runtimeGeneration: 4 }
       ],
@@ -898,7 +1002,12 @@ describe("proto mapper", () => {
     const acceptedInput = {
       text: "@report.txt",
       images: [], files: [],
-      mentions: [{ kind: "artifact" as const, label: "report.txt", reference: "artifact-exact" }],
+      mentions: [{
+        kind: "artifact" as const,
+        label: "report.txt",
+        reference: "artifact-exact",
+        sourceSessionId: "session-artifact-source"
+      }],
       mentionRanges: [{ start: 0, end: 11, mentionIndex: 0 }],
       disposition: "steer" as const
     };
@@ -919,7 +1028,10 @@ describe("proto mapper", () => {
       userInputAccepted: true,
       userInput: { parts: [
         { content: { case: "text", value: "@report.txt" } },
-        { content: { case: "artifactMention", value: { artifactId: "artifact-exact" } } }
+        { content: {
+          case: "artifactMention",
+          value: { artifactId: "artifact-exact", sourceSessionId: "session-artifact-source" }
+        } }
       ], mentionRanges: acceptedInput.mentionRanges },
       nativeIdentity: { entryId: "native-user-entry" }
     } });

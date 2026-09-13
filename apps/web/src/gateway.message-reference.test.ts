@@ -66,10 +66,10 @@ describe("structured message-reference gateway wiring", () => {
     await gateway.send("session-current", {
       text: "@report", attachments: [], deliveryMode: "prompt",
       inlineMentionRanges: [{ mentionId: "artifact:report", from: 0, to: 7 }],
-      mentions: [{ id: "artifact:report", kind: "artifact", reference: "artifact-opaque", label: "report", token: "@report" }]
+      mentions: [{ id: "artifact:report", kind: "artifact", sourceSessionId: "source-task", reference: "artifact-opaque", label: "report", token: "@report" }]
     }, { expectedGeneration: 1n });
     expect(payloads[2]?.value.input.parts.at(-1).content).toMatchObject({
-      case: "artifactMention", value: { artifactId: "artifact-opaque", displayText: "report" }
+      case: "artifactMention", value: { sourceSessionId: "source-task", artifactId: "artifact-opaque", displayText: "report" }
     });
     expect(payloads[2]?.value.input.mentionRanges).toMatchObject([{ start: 0, end: 7, mentionIndex: 0 }]);
     await gateway.send("session-current", {
@@ -127,7 +127,7 @@ describe("structured message-reference gateway wiring", () => {
     }
     await expect(gateway.send("session-current", {
       text: "@report", attachments: [], deliveryMode: "prompt",
-      mentions: [{ id: "artifact:report", kind: "artifact", reference: "artifact-opaque", label: "report", token: "@report" }]
+      mentions: [{ id: "artifact:report", kind: "artifact", sourceSessionId: "source-task", reference: "artifact-opaque", label: "report", token: "@report" }]
     }, { expectedGeneration: 1n })).rejects.toThrow("invalid mention occurrences");
     gateway.disconnect();
   });

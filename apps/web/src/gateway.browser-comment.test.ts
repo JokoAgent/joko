@@ -62,7 +62,7 @@ describe("Browser page comments at the send boundary", () => {
     await gateway.send("session-1", {
       text: "Please place @same and @same.",
       attachments: [],
-      mentions: [{ id: "b", kind: "artifact", reference: "artifact-b", label: "same", token: "@same" }, { id: "a", kind: "artifact", reference: "artifact-a", label: "same", token: "@same" }],
+      mentions: [{ id: "b", kind: "artifact", sourceSessionId: "source-b", reference: "artifact-b", label: "same", token: "@same" }, { id: "a", kind: "artifact", sourceSessionId: "source-a", reference: "artifact-a", label: "same", token: "@same" }],
       inlineMentionRanges: [{ mentionId: "a", from: 13, to: 18 }, { mentionId: "b", from: 23, to: 28 }],
       deliveryMode: "prompt",
       browserComments: Array.from({ length: 17 }, (_value, index) => ({

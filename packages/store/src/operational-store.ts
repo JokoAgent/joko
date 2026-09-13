@@ -15,6 +15,7 @@ import * as sqliteVec from "sqlite-vec";
 
 import type {
   AttemptDescriptor,
+  ArtifactReferenceSnapshot,
   BackendDescriptor,
   Capability,
   EventPayload,
@@ -255,6 +256,9 @@ type ArtifactListOptions = {
   readonly kind?: ArtifactKindFilter;
   readonly includeDeleted?: boolean;
   readonly includeCleared?: boolean;
+  /** Public cross-task mention directory: committed objects whose source task
+   * still exists. This never includes private staging. */
+  readonly referenceCatalog?: boolean;
   readonly limit?: number;
   readonly offset?: number;
 };
@@ -455,6 +459,14 @@ function artifactSqlFilter(options: ArtifactListOptions): SqlFilter {
       AND artifact.rowid <= reset.cleared_through_artifact_rowid
   )`];
   const params: Array<string | number> = [];
+  if (options.referenceCatalog === true) {
+    clauses.push("artifact.session_id IS NOT NULL");
+    clauses.push(`EXISTS (
+      SELECT 1 FROM product_sessions AS artifact_source
+      WHERE artifact_source.id = artifact.session_id
+        AND artifact_source.deleted_at IS NULL
+    )`);
+  }
   if (options.sessionId !== undefined) {
     clauses.push("artifact.session_id = ?");
     params.push(options.sessionId);
@@ -8180,6 +8192,117 @@ export class OperationalStore {
     };
   }
 
+  /** Capture a one-Queue-item delegation from one task's committed Artifact to
+   * another task. Only fingerprints are persisted, never paths or Blob data. */
+  captureArtifactReferenceSnapshot(
+    targetSessionId: string,
+    sourceSessionId: string,
+    artifactId: string,
+    mentionIndex: number
+  ): ArtifactReferenceSnapshot {
+    this.assertOpen();
+    const normalizedTargetSessionId = nonBlank(targetSessionId, "Artifact reference target Session ID");
+    const normalizedSourceSessionId = nonBlank(sourceSessionId, "Artifact reference source Session ID");
+    const normalizedArtifactId = nonBlank(artifactId, "Artifact reference ID");
+    if (normalizedTargetSessionId === normalizedSourceSessionId) {
+      throw new StoreError("A cross-task Artifact snapshot requires distinct source and target Sessions.");
+    }
+    if (!Number.isSafeInteger(mentionIndex) || mentionIndex < 0) {
+      throw new StoreError("Artifact reference mention index is invalid.");
+    }
+    const source = this.getSession(normalizedSourceSessionId);
+    const target = this.getSession(normalizedTargetSessionId);
+    if (source.descriptor.deletedAt !== undefined) throw new StoreError("The Artifact source Session was deleted.");
+    if (target.descriptor.deletedAt !== undefined || target.descriptor.archived) {
+      throw new StoreError("The Artifact target Session is archived or deleted.");
+    }
+    const artifact = this.artifactReferenceRecord(normalizedSourceSessionId, normalizedArtifactId);
+    return {
+      mentionIndex,
+      sourceSessionId: normalizedSourceSessionId,
+      artifactId: normalizedArtifactId,
+      sourceAuthorityFingerprint: this.artifactReferenceSessionAuthorityFingerprint(source, true),
+      targetSessionId: normalizedTargetSessionId,
+      targetAuthorityFingerprint: this.artifactReferenceSessionAuthorityFingerprint(target, false),
+      artifactRevision: artifact.revision.toString(10),
+      artifactFingerprint: artifactReferenceRecordFingerprint(artifact)
+    };
+  }
+
+  /** Revalidate a previously captured cross-task delegation without ever
+   * refreshing it from current public identities. */
+  assertArtifactReferenceSnapshot(snapshot: ArtifactReferenceSnapshot): ArtifactRecord {
+    this.assertOpen();
+    assertArtifactReferenceSnapshotShape(snapshot);
+    if (snapshot.sourceSessionId === snapshot.targetSessionId) {
+      throw new StoreError("A cross-task Artifact snapshot cannot target its source Session.");
+    }
+    const source = this.getSession(snapshot.sourceSessionId);
+    const target = this.getSession(snapshot.targetSessionId);
+    if (source.descriptor.deletedAt !== undefined) throw new StoreError("The Artifact source Session was deleted.");
+    if (target.descriptor.deletedAt !== undefined || target.descriptor.archived) {
+      throw new StoreError("The Artifact target Session is archived or deleted.");
+    }
+    if (this.artifactReferenceSessionAuthorityFingerprint(source, true) !== snapshot.sourceAuthorityFingerprint
+      || this.artifactReferenceSessionAuthorityFingerprint(target, false) !== snapshot.targetAuthorityFingerprint) {
+      throw new StoreError("The cross-task Artifact authority changed after admission.");
+    }
+    const artifact = this.artifactReferenceRecord(snapshot.sourceSessionId, snapshot.artifactId);
+    if (artifact.revision.toString(10) !== snapshot.artifactRevision
+      || artifactReferenceRecordFingerprint(artifact) !== snapshot.artifactFingerprint) {
+      throw new StoreError("The cross-task Artifact changed after admission.");
+    }
+    return artifact;
+  }
+
+  private artifactReferenceRecord(sourceSessionId: string, artifactId: string): ArtifactRecord {
+    const row = this.database.prepare(`
+      SELECT artifact.*
+      FROM artifacts AS artifact
+      WHERE artifact.id = ?
+        AND artifact.session_id = ?
+        AND artifact.deleted_at IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM session_reset_boundaries AS reset
+          WHERE reset.session_id = artifact.session_id
+            AND artifact.rowid <= reset.cleared_through_artifact_rowid
+        )
+      LIMIT 1
+    `).get(artifactId, sourceSessionId) as Row | undefined;
+    if (row === undefined) throw new StoreError("The committed Artifact is unavailable in its source Session.");
+    const artifact = artifactFromRow(row);
+    const metadata = artifact.metadata as { readonly expiresAt?: unknown } | null;
+    const expiresAt = metadata !== null && typeof metadata === "object" ? metadata.expiresAt : undefined;
+    if (expiresAt !== undefined
+      && (typeof expiresAt !== "number" || !Number.isSafeInteger(expiresAt) || expiresAt <= this.now())) {
+      throw new StoreError("The committed Artifact has expired.");
+    }
+    return artifact;
+  }
+
+  private artifactReferenceSessionAuthorityFingerprint(session: StoredSession, source: boolean): string {
+    const target = this.getTarget(session.descriptor.targetId);
+    const backend = this.getBackend(session.descriptor.backendId);
+    return operationBodyHash({
+      session: {
+        id: session.descriptor.id,
+        backendId: session.descriptor.backendId,
+        targetId: session.descriptor.targetId,
+        bindingFingerprint: nativeBindingFingerprint(session.descriptor.binding.opaqueRef),
+        ...(source ? { generation: session.descriptor.binding.generation } : {}),
+        worktreeFingerprint: operationBodyHash(session.descriptor.worktree ?? null),
+        remoteWorkspaceFingerprint: operationBodyHash(session.descriptor.remoteWorkspace ?? null)
+      },
+      target: {
+        id: target.descriptor.id,
+        backendId: target.descriptor.backendId,
+        revision: target.revision.toString(10),
+        descriptorFingerprint: operationBodyHash(target.descriptor)
+      },
+      ...(source ? { backendInstanceGeneration: backend.descriptor.instanceGeneration } : {})
+    });
+  }
+
   /** Resolve the latest visible user/assistant messages at an admission fence.
    * Current tombstones and binding ownership still apply, so deletion or reset
    * can revoke content after a destination input was queued. */
@@ -14646,6 +14769,45 @@ function assertRemoteHostAuthentication(
   if ((mode === "private_key") !== (credentialReferenceId !== undefined) ||
     (mode === "node_key") !== (nodeKey !== undefined)) {
     throw new StoreError("Remote Host authentication metadata is inconsistent.");
+  }
+}
+
+function artifactReferenceRecordFingerprint(artifact: ArtifactRecord): string {
+  return operationBodyHash({
+    blob: artifact.blob,
+    storageKey: artifact.storageKey,
+    sessionId: artifact.sessionId,
+    runId: artifact.runId,
+    metadata: artifact.metadata
+  });
+}
+
+function assertArtifactReferenceSnapshotShape(snapshot: ArtifactReferenceSnapshot): void {
+  if (!Number.isSafeInteger(snapshot.mentionIndex) || snapshot.mentionIndex < 0) {
+    throw new StoreError("Artifact reference snapshot mention index is invalid.");
+  }
+  for (const [label, value] of [
+    ["source Session ID", snapshot.sourceSessionId],
+    ["target Session ID", snapshot.targetSessionId],
+    ["Artifact ID", snapshot.artifactId]
+  ] as const) {
+    if (typeof value !== "string" || value.length === 0 || value.length > 1_024
+      || value !== value.trim() || /[\u0000-\u001f\u007f\u2028\u2029]/u.test(value)) {
+      throw new StoreError(`Artifact reference snapshot ${label} is invalid.`);
+    }
+  }
+  for (const [label, value] of [
+    ["source authority", snapshot.sourceAuthorityFingerprint],
+    ["target authority", snapshot.targetAuthorityFingerprint],
+    ["Artifact", snapshot.artifactFingerprint]
+  ] as const) {
+    if (typeof value !== "string" || !/^sha256:[a-f0-9]{64}$/u.test(value)) {
+      throw new StoreError(`Artifact reference snapshot ${label} fingerprint is invalid.`);
+    }
+  }
+  if (typeof snapshot.artifactRevision !== "string" || !/^[1-9][0-9]{0,18}$/u.test(snapshot.artifactRevision)
+    || BigInt(snapshot.artifactRevision) > 9_223_372_036_854_775_807n) {
+    throw new StoreError("Artifact reference snapshot revision is invalid.");
   }
 }
 

@@ -14,7 +14,7 @@ export interface ClaudeInputResolvers {
   readonly readBlob?: (blob: BlobRef) => Promise<{ readonly data: Uint8Array; readonly mimeType?: string }>;
   /** Resolves an immutable Artifact to its host-owned regular file. */
   readonly resolveFile?: (blob: BlobRef, context: AdapterContext) => Promise<string>;
-  /** Resolves only a committed Artifact in the original task's authority. */
+  /** Resolves only a committed Artifact in the source task's authority. */
   readonly resolveArtifactMention?: ArtifactMentionResolver;
 }
 
@@ -105,9 +105,14 @@ export async function prepareClaudePrompt(
         || /[\u0000-\u001f\u007f]/u.test(mention.reference) || mention.lineRange !== undefined) {
         throw inputError("ARTIFACT_REFERENCE_INVALID", "An Artifact mention requires a bounded canonical identity.");
       }
-      const resolved = await resolvers.resolveArtifactMention(mention.reference, context, signal).catch(() => {
+      const resolved = await resolvers.resolveArtifactMention(
+        mention.reference,
+        mention.sourceSessionId,
+        context,
+        signal
+      ).catch(() => {
         signal.throwIfAborted();
-        throw inputError("ARTIFACT_UNAVAILABLE", "The referenced Artifact is unavailable in this task.");
+        throw inputError("ARTIFACT_UNAVAILABLE", "The referenced Artifact is unavailable in its source task.");
       });
       signal.throwIfAborted();
       const blob = resolved.blob;
@@ -119,7 +124,7 @@ export async function prepareClaudePrompt(
       await verifyFileContent(path, blob, signal);
       mentionAuthorities.push(() => {
         try { resolved.assertCurrent(); }
-        catch { throw inputError("ARTIFACT_UNAVAILABLE", "The referenced Artifact changed while input was prepared."); }
+        catch { throw inputError("ARTIFACT_UNAVAILABLE", "The referenced Artifact changed in its source task while input was prepared."); }
       });
       text.push(`Artifact reference: ${JSON.stringify({ name: mention.label, path })}`);
       continue;

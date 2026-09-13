@@ -1103,8 +1103,15 @@ export function toProtoInputContent(input: PromptInput): InputContent {
         content: {
           case: "artifactMention",
           value: message<contract.ArtifactMention>("joko.v1.ArtifactMention", {
-            artifactId: mention.reference,
-            displayText: mention.label
+            artifactId: checkedArtifactMentionId(
+              mention.reference,
+              "input.artifact_mention.artifact_id"
+            ),
+            displayText: mention.label,
+            sourceSessionId: checkedSessionMentionId(
+              mention.sourceSessionId,
+              "input.artifact_mention.source_session_id"
+            )
           })
         }
       }));
@@ -1200,11 +1207,18 @@ export function fromProtoInputContent(
         break;
       }
       case "artifactMention":
-        if (part.content.value.artifactId.length === 0 || part.content.value.artifactId.length > 1_024
-          || /[\u0000-\u001f\u007f]/u.test(part.content.value.artifactId)) {
-          throw new ProtoMappingError("invalid_argument", "input.parts.artifact_mention.artifact_id", "A bounded Artifact identity is required.");
-        }
-        mentions.push({ kind: "artifact", label: part.content.value.displayText, reference: part.content.value.artifactId });
+        mentions.push({
+          kind: "artifact",
+          label: part.content.value.displayText,
+          reference: checkedArtifactMentionId(
+            part.content.value.artifactId,
+            "input.parts.artifact_mention.artifact_id"
+          ),
+          sourceSessionId: checkedSessionMentionId(
+            part.content.value.sourceSessionId,
+            "input.parts.artifact_mention.source_session_id"
+          )
+        });
         break;
       case "sessionMention":
         mentions.push({
@@ -4434,6 +4448,14 @@ function checkedSessionMentionId(value: string, fieldPath: string): string {
   if (value.length === 0 || value.length > 1_024 || value !== value.trim()
     || /[\u0000-\u001f\u007f\u2028\u2029]/u.test(value)) {
     throw new ProtoMappingError("invalid_argument", fieldPath, "A bounded Session identity is required.");
+  }
+  return value;
+}
+
+function checkedArtifactMentionId(value: string, fieldPath: string): string {
+  if (value.length === 0 || value.length > 1_024 || value !== value.trim()
+    || /[\u0000-\u001f\u007f\u2028\u2029]/u.test(value)) {
+    throw new ProtoMappingError("invalid_argument", fieldPath, "A bounded Artifact identity is required.");
   }
   return value;
 }

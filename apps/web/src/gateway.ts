@@ -335,6 +335,7 @@ import type {
   ArtifactStorageMaintenanceView,
   ArtifactStorageReconcileView,
   ArtifactStorageScanView,
+  ArtifactReferenceCatalogItemView,
   ArtifactView,
   ArtifactDownloadContext,
   ArtifactDownloadOutcome,
@@ -839,6 +840,84 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     throw new GatewayError("Artifact catalog changed repeatedly while it was being loaded.");
   }
 
+  async listArtifactReferenceCatalog(
+    targetSessionId: string,
+    targetGeneration: bigint,
+    signal?: AbortSignal
+  ): Promise<readonly ArtifactReferenceCatalogItemView[]> {
+    if (!validSessionMentionId(targetSessionId)) {
+      throw new GatewayError("An Artifact reference catalog requires its exact receiving task identity.");
+    }
+    if (targetGeneration < 1n || targetGeneration > 18_446_744_073_709_551_615n) {
+      throw new GatewayError("An Artifact reference catalog requires the receiving task generation.");
+    }
+    const scope = this.captureActionScope(signal);
+    const client = createClient(ArtifactService, scope.transport);
+
+    artifactReferenceCatalogAttempts:
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const artifacts: ArtifactReferenceCatalogItemView[] = [];
+      const artifactIdentities = new Set<string>();
+      const consumedTokens = new Set<string>();
+      let pageToken = "";
+      let revision: bigint | undefined;
+      let totalSize: number | undefined;
+      let received = 0;
+      try {
+        for (let pageIndex = 0; pageIndex < MAX_COMPLETE_MESSAGE_SEARCH_PAGES; pageIndex += 1) {
+          scope.signal.throwIfAborted();
+          if (pageToken !== "") {
+            if (consumedTokens.has(pageToken)) throw new GatewayError("Orchestrator returned a cyclic Artifact reference catalog page token.");
+            consumedTokens.add(pageToken);
+          }
+          const response = await client.listArtifacts(
+            {
+              referenceTargetSessionId: targetSessionId,
+              referenceTargetGeneration: targetGeneration,
+              page: { pageSize: 500, pageToken }
+            },
+            { signal: scope.signal }
+          );
+          scope.signal.throwIfAborted();
+          const pageRevision = response.revision?.value;
+          if (pageRevision === undefined) throw new GatewayError("Orchestrator returned an Artifact reference catalog without its durable revision.");
+          if (revision === undefined) revision = pageRevision;
+          else if (revision !== pageRevision) {
+            if (attempt === 0) continue artifactReferenceCatalogAttempts;
+            throw new GatewayError("Artifact reference catalog changed repeatedly while it was being loaded.");
+          }
+          const page = response.page;
+          const pageTotal = page === undefined ? undefined : exactSafeUnsignedNumber(page.totalSize);
+          if (pageTotal === undefined) throw new GatewayError("Orchestrator returned an invalid Artifact reference catalog size.");
+          if (totalSize === undefined) totalSize = pageTotal;
+          else if (totalSize !== pageTotal) throw new GatewayError("Orchestrator returned inconsistent Artifact reference catalog sizes.");
+          if (response.artifacts.length > 500 || received + response.artifacts.length > pageTotal) {
+            throw new GatewayError("Orchestrator returned an invalid Artifact reference catalog page.");
+          }
+          for (const artifact of response.artifacts) {
+            const mapped = mapArtifactReferenceCatalogItem(artifact, artifactIdentities);
+            if (mapped !== undefined) artifacts.push(mapped);
+          }
+          received += response.artifacts.length;
+          const nextPageToken = page?.nextPageToken ?? "";
+          if (nextPageToken === "") {
+            if (received !== pageTotal) throw new GatewayError("Orchestrator returned an incomplete Artifact reference catalog.");
+            return artifacts;
+          }
+          if (received >= pageTotal || nextPageToken === pageToken || consumedTokens.has(nextPageToken)) {
+            throw new GatewayError("Orchestrator returned an invalid Artifact reference catalog pagination boundary.");
+          }
+          pageToken = nextPageToken;
+        }
+      } catch (error) {
+        if (attempt === 0 && isRevisionDriftError(error)) continue;
+        throw error;
+      }
+      throw new GatewayError("Artifact reference catalog exceeded the safe pagination limit.");
+    }
+    throw new GatewayError("Artifact reference catalog changed repeatedly while it was being loaded.");
+  }
+
   async getArtifactStorageStats(protectedSha256: readonly string[] = []): Promise<ArtifactStorageMaintenanceView> {
     const client = createClient(ArtifactService, this.requireTransport());
     const response = await client.getArtifactStorageStats({ protectedSha256: artifactProtectedSha256(protectedSha256) });
@@ -1162,6 +1241,10 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const document = normalizeComposerDocument(draft.editorDocument, draft.text);
     const mentions = [...draft.mentions];
     if (mentions.some((mention) => mention.kind === "workspace" && !mention.workspaceId)) throw new GatewayError("A workspace mention requires its original workspace identity.");
+    if (mentions.some((mention) => mention.kind === "artifact"
+      && (!validSessionMentionId(mention.sourceSessionId) || !validResourceIdentityText(mention.reference)))) {
+      throw new GatewayError("An Artifact mention requires its original task and object identity.");
+    }
     const occurrences = normalizeComposerInlineMentionRanges(draft.inlineMentionRanges, composerDocumentPlainText(document), mentions);
     if (occurrences === undefined) throw new GatewayError("The task input has invalid mention occurrences.");
     const serialized = serializeComposerDocument(document, occurrences);
@@ -1193,7 +1276,11 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           ...(mention.lineRange === undefined ? {} : { lineRange: mention.lineRange })
         } } });
       } else if (mention.kind === "artifact") {
-        parts.push({ content: { case: "artifactMention", value: { artifactId: mention.reference, displayText: mention.label } } });
+        parts.push({ content: { case: "artifactMention", value: {
+          sourceSessionId: mention.sourceSessionId,
+          artifactId: mention.reference,
+          displayText: mention.label
+        } } });
       } else if (mention.kind === "session") {
         if (!validSessionMentionId(mention.reference)) {
           throw new GatewayError("A task mention requires its exact task identity.");
@@ -10602,14 +10689,39 @@ function mapSessionArtifactCatalogItem(
   expectedSessionId: string,
   seenArtifactIds: Set<string>
 ): ArtifactView | undefined {
+  if (artifact.sessionId !== expectedSessionId) {
+    throw new GatewayError("Orchestrator returned an invalid Artifact catalog identity.");
+  }
+  return mapArtifactCatalogItem(artifact, artifact.artifactId, seenArtifactIds);
+}
+
+function mapArtifactReferenceCatalogItem(
+  artifact: Artifact,
+  seenArtifactIdentities: Set<string>
+): ArtifactReferenceCatalogItemView | undefined {
+  if (!validSessionMentionId(artifact.sessionId)) {
+    throw new GatewayError("Orchestrator returned an invalid Artifact reference catalog source task.");
+  }
+  const mapped = mapArtifactCatalogItem(
+    artifact,
+    `${artifact.sessionId}\u0000${artifact.artifactId}`,
+    seenArtifactIdentities
+  );
+  return mapped === undefined ? undefined : { ...mapped, sourceSessionId: artifact.sessionId };
+}
+
+function mapArtifactCatalogItem(
+  artifact: Artifact,
+  identity: string,
+  seenArtifactIdentities: Set<string>
+): ArtifactView | undefined {
   const blob = artifact.blob;
   const byteSize = blob === undefined ? undefined : exactSafeUnsignedNumber(blob.byteSize);
   const createdAt = artifact.createdAt === undefined ? undefined : timestampMs(artifact.createdAt);
   const expiresAt = artifact.expiresAt === undefined ? undefined : timestampMs(artifact.expiresAt);
   if (
     !validResourceIdentityText(artifact.artifactId)
-    || artifact.sessionId !== expectedSessionId
-    || seenArtifactIds.has(artifact.artifactId)
+    || seenArtifactIdentities.has(identity)
     || blob === undefined
     || !validResourceIdentityText(blob.blobId)
     || !/^[a-f0-9]{64}$/u.test(blob.sha256Hex)
@@ -10621,7 +10733,7 @@ function mapSessionArtifactCatalogItem(
     || expiresAt !== undefined && (!Number.isSafeInteger(expiresAt) || expiresAt < 0)
     || !artifactCatalogKind(artifact.kind)
   ) throw new GatewayError("Orchestrator returned an invalid Artifact catalog identity.");
-  seenArtifactIds.add(artifact.artifactId);
+  seenArtifactIdentities.add(identity);
   if (expiresAt !== undefined && expiresAt <= Date.now()) return undefined;
   const mapped = mapArtifact(artifact);
   if ((mapped.title || mapped.fileName).trim() === "") {
@@ -11138,8 +11250,10 @@ function messageInputMentions(input: any): NonNullable<TimelineItemView["inputMe
       }];
     }
     if (content?.case === "artifactMention") {
-      if (!value.artifactId) throw new GatewayError("Orchestrator returned an Artifact mention without its identity.");
-      return [{ kind: "artifact", artifactId: value.artifactId, displayText: value.displayText }];
+      if (!validSessionMentionId(value.sourceSessionId) || !validResourceIdentityText(value.artifactId)) {
+        throw new GatewayError("Orchestrator returned an Artifact mention without its original task and object identity.");
+      }
+      return [{ kind: "artifact", sourceSessionId: value.sourceSessionId, artifactId: value.artifactId, displayText: value.displayText }];
     }
     if (content?.case === "sessionMention") {
       if (!validSessionMentionId(value.sessionId)) throw new GatewayError("Orchestrator returned a task mention without its identity.");

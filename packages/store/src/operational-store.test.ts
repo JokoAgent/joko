@@ -4164,6 +4164,131 @@ describe("OperationalStore", () => {
     expect(find()).toBeUndefined();
   });
 
+  it("persists exact cross-task Artifact fences and revokes them on source, object, Target, and clear drift", () => {
+    const fixture = createFixture();
+    let { store } = fixture;
+    const sourceId = "session-artifact-source";
+    store.createSession({
+      ...store.getSession("session-1").descriptor,
+      id: sourceId,
+      title: "Artifact source",
+      binding: { opaqueRef: "native/artifact-source.jsonl", generation: 0 }
+    });
+    const put = (id: string) => store.putArtifact({
+      id,
+      sha256: id === "artifact-cross-task" ? "b".repeat(64) : "c".repeat(64),
+      byteLength: 12,
+      mimeType: "text/plain",
+      fileName: `${id}.txt`,
+      storageKey: `sha256/${id}`,
+      sessionId: sourceId,
+      metadata: {}
+    });
+    const artifact = put("artifact-cross-task");
+    const snapshot = store.captureArtifactReferenceSnapshot(
+      "session-1",
+      sourceId,
+      artifact.blob.id,
+      2
+    );
+
+    expect(snapshot).toMatchObject({
+      mentionIndex: 2,
+      sourceSessionId: sourceId,
+      targetSessionId: "session-1",
+      artifactId: artifact.blob.id,
+      artifactRevision: artifact.revision.toString(10),
+      sourceAuthorityFingerprint: expect.stringMatching(/^sha256:[a-f0-9]{64}$/u),
+      targetAuthorityFingerprint: expect.stringMatching(/^sha256:[a-f0-9]{64}$/u),
+      artifactFingerprint: expect.stringMatching(/^sha256:[a-f0-9]{64}$/u)
+    });
+    expect(JSON.stringify(snapshot)).not.toContain("native/artifact-source.jsonl");
+    expect(JSON.stringify(snapshot)).not.toContain(artifact.storageKey);
+    expect(JSON.stringify(snapshot)).not.toContain(artifact.blob.fileName!);
+    expect(store.assertArtifactReferenceSnapshot(snapshot)).toEqual(artifact);
+    expect(store.listArtifacts({ referenceCatalog: true }).map((entry) => entry.blob.id))
+      .toEqual([artifact.blob.id]);
+    expect(store.countArtifacts({ referenceCatalog: true })).toBe(1);
+
+    const filePath = store.filePath;
+    store.close();
+    store = new OperationalStore(filePath);
+    fixture.replaceStore(store);
+    expect(store.assertArtifactReferenceSnapshot(snapshot)).toEqual(artifact);
+
+    const source = store.getSession(sourceId);
+    store.updateSession(sourceId, {
+      binding: {
+        ...source.descriptor.binding,
+        opaqueRef: "native/artifact-source-rebound.jsonl",
+        generation: source.descriptor.binding.generation + 1
+      }
+    }, source.revision);
+    expect(() => store.assertArtifactReferenceSnapshot(snapshot)).toThrow(/authority changed/u);
+
+    const reboundSnapshot = store.captureArtifactReferenceSnapshot("session-1", sourceId, artifact.blob.id, 0);
+    store.deleteArtifact(artifact.blob.id);
+    expect(() => store.assertArtifactReferenceSnapshot(reboundSnapshot)).toThrow(/unavailable/u);
+
+    const replacement = put("artifact-target-fence");
+    const targetSnapshot = store.captureArtifactReferenceSnapshot("session-1", sourceId, replacement.blob.id, 0);
+    const target = store.getTarget("target-1").descriptor;
+    store.upsertTarget({ ...target, displayName: "Changed workspace" });
+    expect(() => store.assertArtifactReferenceSnapshot(targetSnapshot)).toThrow(/authority changed/u);
+
+    const clearSnapshot = store.captureArtifactReferenceSnapshot("session-1", sourceId, replacement.blob.id, 0);
+    const beforeReset = store.getSession(sourceId).descriptor;
+    store.runOperation(
+      { id: "operation:clear-artifact-source", kind: "reset", body: { sessionId: sourceId } },
+      (transaction) => transaction.commitSessionReset({
+        sessionId: sourceId,
+        sourceBinding: beforeReset.binding,
+        binding: {
+          ...beforeReset.binding,
+          opaqueRef: "native/artifact-source-cleared.jsonl",
+          generation: beforeReset.binding.generation + 1
+        },
+        operationId: "operation:clear-artifact-source",
+        traceId: "artifact-reference:clear"
+      })
+    );
+    expect(() => store.assertArtifactReferenceSnapshot(clearSnapshot)).toThrow();
+    expect(store.listArtifacts({ referenceCatalog: true })).toEqual([]);
+    expect(store.countArtifacts({ referenceCatalog: true })).toBe(0);
+  });
+
+  it("excludes deleted source tasks and private staging from the Artifact reference catalog", () => {
+    const { store } = createFixture();
+    const sourceId = "session-deleted-artifact-source";
+    store.createSession({
+      ...store.getSession("session-1").descriptor,
+      id: sourceId,
+      binding: { opaqueRef: "native/deleted-artifact-source.jsonl", generation: 0 }
+    });
+    store.putArtifact({
+      id: "artifact-committed-source",
+      sha256: "d".repeat(64),
+      byteLength: 4,
+      mimeType: "text/plain",
+      storageKey: "sha256/committed-source",
+      sessionId: sourceId,
+      metadata: {}
+    });
+    store.putArtifact({
+      id: "artifact-private-staging",
+      sha256: "e".repeat(64),
+      byteLength: 4,
+      mimeType: "text/plain",
+      storageKey: "sha256/private-staging",
+      metadata: { expiresAt: Date.now() + 60_000 }
+    });
+    expect(store.listArtifacts({ referenceCatalog: true }).map((entry) => entry.blob.id))
+      .toEqual(["artifact-committed-source"]);
+    const source = store.getSession(sourceId);
+    store.updateSession(sourceId, { archived: true, deletedAt: Date.now() }, source.revision);
+    expect(store.listArtifacts({ referenceCatalog: true })).toEqual([]);
+  });
+
   it("round-trips Backend Provider and tool catalogs without losing typed metadata", () => {
     const store = createStore();
     const backend = store.upsertBackend({

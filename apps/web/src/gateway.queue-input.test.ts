@@ -91,7 +91,7 @@ describe("queued structured input gateway", () => {
     const acceptedInput = create(InputContentSchema, {
       parts: [
         { content: { case: "text", value: text } },
-        { content: { case: "artifactMention", value: { artifactId: "artifact-1", displayText: "same" } } },
+        { content: { case: "artifactMention", value: { sourceSessionId: "artifact-source", artifactId: "artifact-1", displayText: "same" } } },
         { content: { case: "workspaceMention", value: { workspaceId: "workspace-1", relativePath: "src/report.ts", displayText: "same" } } },
         { content: { case: "resourceMention", value: { resourceId: "resource-1", displayText: "release", discoveredRevision: "sha256:resource", resourceVersion: 3n, runtimeGeneration: 2n } } },
         { content: { case: "sessionMention", value: { sessionId: "earlier-task", displayText: "earlier" } } },
@@ -159,7 +159,7 @@ describe("queued structured input gateway", () => {
         { start: secondMention, end: secondMention + 5, mentionIndex: 0 }
       ],
       inputMentions: [
-        { kind: "artifact", artifactId: "artifact-1" },
+        { kind: "artifact", sourceSessionId: "artifact-source", artifactId: "artifact-1" },
         { kind: "workspace", workspaceId: "workspace-1", relativePath: "src/report.ts" },
         { kind: "resource", resourceId: "resource-1", resourceVersion: "3", runtimeGeneration: 2 },
         { kind: "session", sessionId: "earlier-task" }

@@ -76,7 +76,7 @@ describe("timeline references", () => {
     const text = "😀 @report.txt @report.txt @report.txt";
     const mentions: readonly TimelineInputMentionView[] = [
       { kind: "workspace", workspaceId: "w", relativePath: "report.txt", displayText: "report.txt", directory: false },
-      { kind: "artifact", artifactId: "report-two", displayText: "report.txt" }
+      { kind: "artifact", sourceSessionId: "source-task", artifactId: "report-two", displayText: "report.txt" }
     ];
     const ranges = [{ start: 3, end: 14, mentionIndex: 1 }, { start: 15, end: 26, mentionIndex: 0 }];
     const segments = sentInputMentionSegments(text, mentions, ranges);

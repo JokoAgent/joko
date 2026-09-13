@@ -642,9 +642,11 @@ message WorkspaceMention {
 }
 
 message ArtifactMention {
-  // Committed canonical identity in the receiving task, resolved by the service.
+  // Committed canonical identity resolved by the service. Both fields are
+  // required; the source task is never inferred from the receiving task.
   string artifact_id = 1;
   string display_text = 2;
+  string source_session_id = 3;
 }
 
 message SessionMention {

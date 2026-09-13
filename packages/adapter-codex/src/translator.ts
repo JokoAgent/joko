@@ -95,7 +95,7 @@ export async function translatePromptInput(
           code: "CODEX_ARTIFACT_REFERENCE_INVALID",
           message: "An Artifact mention requires a bounded canonical identity.",
           phase: "dispatch",
-          recovery: "Choose the Artifact again from this task's current catalog."
+          recovery: "Choose the Artifact again from its source task's current catalog."
         });
       }
       continue;
@@ -234,14 +234,20 @@ export async function translatePromptInput(
       textParts.push(`Workspace file reference: ${JSON.stringify({ name: mention.label, path })}`);
       continue;
     }
-    const resolved = await resolvers.resolveArtifactMention!(mention.reference, context, context.signal).catch(() => {
+    if (mention.kind !== "artifact") throw unsupportedMention();
+    const resolved = await resolvers.resolveArtifactMention!(
+      mention.reference,
+      mention.sourceSessionId,
+      context,
+      context.signal
+    ).catch(() => {
       context.signal.throwIfAborted();
       throw adapterError({
         code: "CODEX_ARTIFACT_UNAVAILABLE",
-        message: "The referenced Artifact is unavailable in this task.",
+        message: "The referenced Artifact is unavailable in its source task.",
         phase: "dispatch",
         retryable: true,
-        recovery: "Refresh this task's Artifact catalog and explicitly retry."
+        recovery: "Refresh the source task's Artifact catalog and explicitly retry."
       });
     });
     if (resolved.blob.id !== mention.reference) {
@@ -249,7 +255,7 @@ export async function translatePromptInput(
         code: "CODEX_ARTIFACT_REFERENCE_INVALID",
         message: "The resolved Artifact does not match its canonical identity.",
         phase: "dispatch",
-        recovery: "Choose the Artifact again from this task's current catalog."
+        recovery: "Choose the Artifact again from its source task's current catalog."
       });
     }
     validateFileBlob(resolved.blob, maximumFileBytes, "CODEX_ARTIFACT_REFERENCE_INVALID");
@@ -261,9 +267,9 @@ export async function translatePromptInput(
         context.signal.throwIfAborted();
         throw adapterError({
           code: "CODEX_ARTIFACT_UNAVAILABLE",
-          message: "The referenced Artifact changed while input was prepared.",
+          message: "The referenced Artifact changed in its source task while input was prepared.",
           phase: "dispatch",
-          recovery: "Refresh this task's Artifact catalog and explicitly retry."
+          recovery: "Refresh the source task's Artifact catalog and explicitly retry."
         });
       }
     };

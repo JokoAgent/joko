@@ -671,7 +671,7 @@ export interface TimelineInlineTextRangeView {
 export type TimelineInputMentionView =
   | { readonly kind: "workspace"; readonly workspaceId: string; readonly relativePath: string; readonly displayText: string; readonly directory: boolean; readonly lineRange?: { readonly startLine: number; readonly endLine: number } }
   | { readonly kind: "resource"; readonly resourceId: string; readonly displayText: string; readonly discoveredRevision: string; readonly resourceVersion: string; readonly runtimeGeneration: number }
-  | { readonly kind: "artifact"; readonly artifactId: string; readonly displayText: string }
+  | { readonly kind: "artifact"; readonly sourceSessionId: string; readonly artifactId: string; readonly displayText: string }
   | { readonly kind: "session"; readonly sessionId: string; readonly displayText: string };
 
 export interface TimelineInputMentionRangeView {
@@ -884,6 +884,12 @@ export interface ArtifactView {
   readonly byteSize: number;
   readonly downloadUrl?: string;
   readonly audioMetadata?: AudioArtifactMetadataView;
+}
+
+/** A canonical Artifact that may be explicitly referenced by another task. */
+export interface ArtifactReferenceCatalogItemView extends ArtifactView {
+  /** Original task authority; never inferred from the receiving task. */
+  readonly sourceSessionId: string;
 }
 
 export interface AudioArtifactMetadataView {
@@ -3116,6 +3122,7 @@ export type ComposerTokenMentionDraft = ComposerTokenMentionBaseDraft & (
     }
   | {
       readonly kind: "artifact";
+      readonly sourceSessionId: string;
       readonly workspaceId?: never;
       readonly directory?: never;
       readonly lineRange?: never;
@@ -3460,6 +3467,7 @@ export interface OperationApi {
   refreshProviderAccountUsage(backendId: string, providerId: string): Promise<void>;
   getArtifactStorageStats(protectedSha256?: readonly string[]): Promise<ArtifactStorageMaintenanceView>;
   listSessionArtifacts(sessionId: string, signal?: AbortSignal): Promise<readonly ArtifactView[]>;
+  listArtifactReferenceCatalog(targetSessionId: string, targetGeneration: bigint, signal?: AbortSignal): Promise<readonly ArtifactReferenceCatalogItemView[]>;
   readSessionArtifact(sessionId: string, artifactId: string, signal: AbortSignal): Promise<ArtifactView>;
   scanArtifactStorage(protectedSha256?: readonly string[]): Promise<ArtifactStorageScanView>;
   reconcileArtifactStorage(protectedSha256?: readonly string[]): Promise<ArtifactStorageReconcileView>;

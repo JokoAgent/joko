@@ -1772,7 +1772,7 @@ describe("incremental event projection", () => {
       { content: { case: "resourceMention" as const, value: {
         resourceId: "resource", displayText: "same", discoveredRevision: "revision-one", resourceVersion: 7n, runtimeGeneration: 3n
       } } },
-      { content: { case: "artifactMention" as const, value: { artifactId: "artifact", displayText: "same" } } },
+      { content: { case: "artifactMention" as const, value: { sourceSessionId: "artifact-source", artifactId: "artifact", displayText: "same" } } },
       { content: { case: "sessionMention" as const, value: { sessionId: "earlier", displayText: "same" } } }
     ], mentionRanges: [{ start: 0, end: 5, mentionIndex: 2 }, { start: 6, end: 11, mentionIndex: 0 }, { start: 12, end: 17, mentionIndex: 2 }] };
     const started = create(EventSchema, { eventId: "receipt", cursor: { generation: 1n, sequence: 1n }, identity: { sessionId: "s" }, payload: { kind: { case: "messageStarted", value: {
@@ -1783,7 +1783,7 @@ describe("incremental event projection", () => {
     expect(row).toMatchObject({ text: "@same @same @same", userInputAccepted: true, mentionRanges: input.mentionRanges, inputMentions: [
       { kind: "workspace", workspaceId: "workspace", relativePath: "src/main.ts", displayText: "same", directory: false, lineRange: { startLine: 2, endLine: 3 } },
       { kind: "resource", resourceId: "resource", displayText: "same", discoveredRevision: "revision-one", resourceVersion: "7", runtimeGeneration: 3 },
-      { kind: "artifact", artifactId: "artifact", displayText: "same" },
+      { kind: "artifact", sourceSessionId: "artifact-source", artifactId: "artifact", displayText: "same" },
       { kind: "session", sessionId: "earlier", displayText: "same" }
     ] });
     const completed = create(EventSchema, { eventId: "echo", cursor: { generation: 1n, sequence: 2n }, identity: { sessionId: "s" }, payload: { kind: { case: "messageCompleted", value: {
@@ -1803,17 +1803,24 @@ describe("incremental event projection", () => {
     } } } });
     expect(() => projectSnapshotEvent(raw, mapSnapshot(raw), oldResourceShape)).toThrow("exact runtime identity");
 
+    const oldArtifactShape = create(EventSchema, { eventId: "old-artifact", identity: { sessionId: "s" }, cursor: { generation: 1n, sequence: 1n }, payload: { kind: { case: "messageStarted", value: {
+      messageId: "m", role: MessageRole.USER, userInputAccepted: true, userInput: { ...input, parts: input.parts.map((part) => part.content.case === "artifactMention"
+        ? { content: { case: "artifactMention" as const, value: { artifactId: "artifact", displayText: "same" } } }
+        : part) }
+    } } } });
+    expect(() => projectSnapshotEvent(raw, mapSnapshot(raw), oldArtifactShape)).toThrow("original task and object identity");
+
     const splitText = create(EventSchema, { eventId: "split", identity: { sessionId: "split" }, cursor: { generation: 1n, sequence: 1n }, payload: { kind: { case: "messageStarted", value: {
       messageId: "split", role: MessageRole.USER, userInputAccepted: true, userInput: { parts: [
         { content: { case: "text", value: "@sa" } },
         { content: { case: "text", value: "me" } },
-        { content: { case: "artifactMention", value: { artifactId: "artifact-split", displayText: "same" } } }
+        { content: { case: "artifactMention", value: { sourceSessionId: "artifact-source", artifactId: "artifact-split", displayText: "same" } } }
       ], mentionRanges: [{ start: 0, end: 5, mentionIndex: 0 }] }
     } } } });
     expect(projectSnapshotEvent(raw, mapSnapshot(raw), splitText).snapshot.timelineBySession.get("split")?.[0]).toMatchObject({
       text: "@same",
       mentionRanges: [{ start: 0, end: 5, mentionIndex: 0 }],
-      inputMentions: [{ kind: "artifact", artifactId: "artifact-split" }]
+      inputMentions: [{ kind: "artifact", sourceSessionId: "artifact-source", artifactId: "artifact-split" }]
     });
   });
 

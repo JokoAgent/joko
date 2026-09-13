@@ -430,7 +430,15 @@ function validateMentionInput(value: unknown): asserts value is MentionInput {
     );
     return;
   }
-  assertExactKeys(value, ["kind", "label", "reference"], "artifact mention");
+  boundedNonEmptyString(value["reference"], "artifact mention identity", 1_024);
+  boundedNonEmptyString(value["sourceSessionId"], "artifact mention source Session ID", 1_024);
+  if (value["reference"] !== value["reference"].trim()
+    || value["sourceSessionId"] !== value["sourceSessionId"].trim()
+    || /[\u0000-\u001f\u007f\u2028\u2029]/u.test(value["reference"])
+    || /[\u0000-\u001f\u007f\u2028\u2029]/u.test(value["sourceSessionId"])) {
+    throw invalid("Portable Session Artifact mention identity is invalid.");
+  }
+  assertExactKeys(value, ["kind", "label", "reference", "sourceSessionId"], "artifact mention");
 }
 
 function validateWorkspaceLineRange(value: unknown): void {
@@ -523,7 +531,11 @@ function projectAcceptedInputMentions(
     const mentionIndex = replacementIndexes.get(range.mentionIndex);
     return mentionIndex === undefined ? [] : [{ ...range, mentionIndex }];
   });
-  const { sessionReferenceSnapshots: _sessionReferenceSnapshots, ...portableInput } = input;
+  const {
+    sessionReferenceSnapshots: _sessionReferenceSnapshots,
+    artifactReferenceSnapshots: _artifactReferenceSnapshots,
+    ...portableInput
+  } = input;
   return {
     ...portableInput,
     mentions,

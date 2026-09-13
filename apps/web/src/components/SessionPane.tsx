@@ -17,7 +17,7 @@ import {
 import type { AppController, AppRoute } from "../controller.js";
 import { modelPreferenceOwnerId } from "../model-picker-preferences.js";
 import { isRoutableConversationModel } from "../model-capabilities.js";
-import type { ArtifactView, AttachmentDraft, NativeNavigationTargetView, BackendView, ComposerSelectionQuoteDraft, ErrorView, ExtensionStatusView, ExtensionWidgetView, ExtraDirectoryView, InteractionView, ModelView, PermissionMode, QueueControlView, QueueItemView, ResourceView, RuntimeCommandView, SessionResourceView, SessionView, SubagentRunDetailView, SubagentRunView, TargetView, TimelineItemView, UsageTokensView, WorkspaceRewindPreviewView, WorkspaceView } from "../model.js";
+import type { ArtifactReferenceCatalogItemView, AttachmentDraft, NativeNavigationTargetView, BackendView, ComposerSelectionQuoteDraft, ErrorView, ExtensionStatusView, ExtensionWidgetView, ExtraDirectoryView, InteractionView, ModelView, PermissionMode, QueueControlView, QueueItemView, ResourceView, RuntimeCommandView, SessionResourceView, SessionView, SubagentRunDetailView, SubagentRunView, TargetView, TimelineItemView, UsageTokensView, WorkspaceRewindPreviewView, WorkspaceView } from "../model.js";
 import { composerDocumentFromEditedEncodedMessage, composerDocumentFromMessage, composerDocumentPlainText, plainTextToComposerDocument } from "../composer-quote-document.js";
 import type { RunAction, Translator } from "./types.js";
 import { Button, IconButton, Modal, Pill, StatusDot, cx, CheckboxControl } from "./ui.js";
@@ -184,7 +184,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   }>();
   const [liveArtifactCatalog, setLiveArtifactCatalog] = useState<{
     readonly owner: object;
-    readonly artifacts: readonly ArtifactView[];
+    readonly artifacts: readonly ArtifactReferenceCatalogItemView[];
   }>();
   const [errorTailRevision, setErrorTailRevision] = useState(0);
   const [bottomInset, setBottomInset] = useState(0);
@@ -235,6 +235,11 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   const compactGuardRef = useRef(new SessionScopedRequestGuard());
   const messageDeleteGuardRef = useRef(new SessionScopedRequestGuard());
   const paneRef = useRef<HTMLElement>(null);
+  const artifactCatalogDocumentEpochRef = useRef(0);
+  const [artifactCatalogDocumentOwner, setArtifactCatalogDocumentOwner] = useState<{
+    readonly document: Document;
+    readonly epoch: number;
+  }>();
   const rewindEpochRef = useRef(0);
   const rewindDocumentRef = useRef<{ document: Document; remove: () => void } | undefined>(undefined);
   useLayoutEffect(() => {
@@ -245,10 +250,31 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
     setComposerDraftReplacement(undefined);
     setMessageRewind(undefined);
     setRewindPreview(undefined);
-    if (document === undefined) { rewindDocumentRef.current = undefined; return; }
-    const retire = () => { rewindEpochRef.current += 1; setComposerDraftReplacement(undefined); setMessageRewind(undefined); setRewindPreview(undefined); };
+    artifactCatalogDocumentEpochRef.current += 1;
+    if (document === undefined) {
+      rewindDocumentRef.current = undefined;
+      setArtifactCatalogDocumentOwner(undefined);
+      return;
+    }
+    setArtifactCatalogDocumentOwner({ document, epoch: artifactCatalogDocumentEpochRef.current });
+    const retire = () => {
+      rewindEpochRef.current += 1;
+      artifactCatalogDocumentEpochRef.current += 1;
+      setComposerDraftReplacement(undefined);
+      setMessageRewind(undefined);
+      setRewindPreview(undefined);
+      setArtifactCatalogDocumentOwner(undefined);
+    };
+    const restore = () => {
+      artifactCatalogDocumentEpochRef.current += 1;
+      setArtifactCatalogDocumentOwner({ document, epoch: artifactCatalogDocumentEpochRef.current });
+    };
     document.defaultView?.addEventListener("pagehide", retire);
-    rewindDocumentRef.current = { document, remove: () => document.defaultView?.removeEventListener("pagehide", retire) };
+    document.defaultView?.addEventListener("pageshow", restore);
+    rewindDocumentRef.current = { document, remove: () => {
+      document.defaultView?.removeEventListener("pagehide", retire);
+      document.defaultView?.removeEventListener("pageshow", restore);
+    } };
   });
   useLayoutEffect(() => {
     rewindEpochRef.current += 1;
@@ -614,17 +640,27 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
     : []).sort().join("\u0001"), [timeline]);
   const artifactCatalogOwner = useMemo(() => ({}), [
     artifactRefreshKey,
+    artifactCatalogDocumentOwner?.document,
+    artifactCatalogDocumentOwner?.epoch,
+    backend?.id,
     backend?.instanceGeneration,
+    backend?.version,
     canListSessionArtifacts,
     controller.state.activeProfile?.id,
+    controller.state.activeProfile?.origin,
     controller.state.activeProfile?.serverId,
     controller.state.connectionState,
+    controller.state.snapshot.generation,
+    controller.state.snapshot.revision,
     session.backendId,
     session.generation,
     session.id,
-    session.targetId
+    session.targetId,
+    target?.revision,
+    workspace?.id,
+    workspace?.revision
   ]);
-  const liveArtifacts = liveArtifactCatalog?.owner === artifactCatalogOwner
+  const liveArtifacts = artifactCatalogDocumentOwner !== undefined && liveArtifactCatalog?.owner === artifactCatalogOwner
     ? liveArtifactCatalog.artifacts
     : [];
   const historicalSessionMentionCandidates = useMemo(
@@ -672,11 +708,11 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   useEffect(() => {
     const request = new AbortController();
     let current = true;
-    if (!canListSessionArtifacts) return () => {
+    if (!canListSessionArtifacts || artifactCatalogDocumentOwner === undefined) return () => {
       current = false;
       request.abort();
     };
-    void controllerRef.current.listSessionArtifacts(session.id, request.signal).then((catalog) => {
+    void controllerRef.current.listArtifactReferenceCatalog(session.id, session.generation, request.signal).then((catalog) => {
       if (current) setLiveArtifactCatalog({ owner: artifactCatalogOwner, artifacts: catalog });
     }).catch(() => {
       if (current && !request.signal.aborted) setLiveArtifactCatalog({ owner: artifactCatalogOwner, artifacts: [] });
@@ -685,7 +721,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
       current = false;
       request.abort();
     };
-  }, [artifactCatalogOwner, canListSessionArtifacts, session.id]);
+  }, [artifactCatalogDocumentOwner, artifactCatalogOwner, canListSessionArtifacts, session.generation, session.id]);
 
   useEffect(() => {
     setComposerMessageMentionInsertion(undefined);

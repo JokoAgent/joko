@@ -2934,7 +2934,7 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
         : "Inspect the coding interface across runtime, interaction, and recovery surfaces.",
       ...(parameters.artifact ? {
         userInputAccepted: true as const,
-        inputMentions: [{ kind: "artifact" as const, artifactId: "visual-artifact-two", displayText: "@report.txt" }],
+        inputMentions: [{ kind: "artifact" as const, sourceSessionId: "session-1", artifactId: "visual-artifact-two", displayText: "@report.txt" }],
         mentionRanges: [{ start: 24, end: 35, mentionIndex: 0 }]
       } : {}),
       ...(parameters.scenario === "files" ? { attachments: [visualAudioArtifact()] } : {}) },

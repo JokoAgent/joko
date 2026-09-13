@@ -97,7 +97,12 @@ describe("CodexBackendAdapter", () => {
         resourceVersion: "1",
         runtimeGeneration: 1
       },
-      { kind: "artifact", label: "Export", reference: "artifact-one" },
+      {
+        kind: "artifact",
+        label: "Export",
+        reference: "artifact-one",
+        sourceSessionId: "session-artifact-source"
+      },
       { kind: "workspace_file", label: "lines", reference: "src/main.ts", lineRange: { startLine: 1, endLine: 2 } }
     ] as const) {
       await expect(setup.adapter.send({ ...prompt(""), mentions: [mention] }, context(setup.target, [], { binding, backendInstanceGeneration: 7, operationId: "unsupported-mention" })))
@@ -108,6 +113,7 @@ describe("CodexBackendAdapter", () => {
 
   it("resolves a canonical Artifact through its service authority and rechecks it at native dispatch", async () => {
     const bytes = Buffer.from("canonical artifact", "utf8");
+    const sourceSessionId = "session-artifact-source";
     let artifactPath = "";
     let current = true;
     const assertCurrent = vi.fn(() => { if (!current) throw new Error("retired authority"); });
@@ -145,6 +151,7 @@ describe("CodexBackendAdapter", () => {
         kind: "artifact",
         label: "Report",
         reference: "artifact-one",
+        sourceSessionId,
         lineRange: { startLine: 1, endLine: 2 }
       } as unknown as MentionInput]
     }, { ...owner, operationId: "artifact-line-range" })).rejects.toMatchObject({
@@ -153,9 +160,9 @@ describe("CodexBackendAdapter", () => {
     expect(resolveArtifactMention).not.toHaveBeenCalled();
     await setup.adapter.send({
       ...prompt("Inspect"),
-      mentions: [{ kind: "artifact", label: "Report", reference: "artifact-one" }]
+      mentions: [{ kind: "artifact", label: "Report", reference: "artifact-one", sourceSessionId }]
     }, owner);
-    expect(resolveArtifactMention).toHaveBeenCalledWith("artifact-one", owner, owner.signal);
+    expect(resolveArtifactMention).toHaveBeenCalledWith("artifact-one", sourceSessionId, owner, owner.signal);
     expect(assertCurrent.mock.calls.length).toBeGreaterThanOrEqual(3);
     expect(setup.fake.transport?.requests.find((request) => request.method === "turn/start")?.params).toMatchObject({
       input: [{
@@ -174,8 +181,9 @@ describe("CodexBackendAdapter", () => {
     };
     await expect(setup.adapter.send({
       ...prompt("Again"),
-      mentions: [{ kind: "artifact", label: "Report", reference: "artifact-one" }]
+      mentions: [{ kind: "artifact", label: "Report", reference: "artifact-one", sourceSessionId }]
     }, { ...owner, operationId: "retired-artifact" })).rejects.toMatchObject({
+      message: "The referenced Artifact changed in its source task while input was prepared.",
       publicError: { code: "CODEX_ARTIFACT_UNAVAILABLE", stateMayHaveChanged: false }
     });
     expect(setup.fake.transport?.requests.filter((request) => request.method === "turn/start")).toHaveLength(1);
@@ -204,7 +212,12 @@ describe("CodexBackendAdapter", () => {
     );
     await expect(setup.adapter.send({
       ...prompt("Inspect"),
-      mentions: [{ kind: "artifact", label: "Report", reference: "artifact-tampered" }]
+      mentions: [{
+        kind: "artifact",
+        label: "Report",
+        reference: "artifact-tampered",
+        sourceSessionId: "session-artifact-source"
+      }]
     }, context(setup.target, [], {
       binding,
       backendInstanceGeneration: 7,

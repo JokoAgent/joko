@@ -2739,11 +2739,26 @@ export function createConnectServices(application: OrchestratorApplication): Con
   const artifact = {
     listArtifacts: (request, context) => {
       authenticate(context);
+      const sessionId = request.sessionId ?? "";
+      const runId = request.runId ?? "";
+      const referenceTargetSessionId = request.referenceTargetSessionId ?? "";
+      const referenceCatalog = referenceTargetSessionId !== "";
+      if (!referenceCatalog && request.referenceTargetGeneration !== undefined) {
+        throw invalidArgument("reference_target_generation requires reference_target_session_id");
+      }
+      if (referenceCatalog && (sessionId !== "" || runId !== "" || request.kind !== undefined)) {
+        throw invalidArgument("reference_target_session_id cannot be combined with Artifact source filters");
+      }
+      const referenceTargetGeneration = referenceCatalog
+        ? artifactReferenceGeneration(request.referenceTargetGeneration)
+        : undefined;
       const kind = coreArtifactListKind(request.kind);
       const queryKey = artifactPageQueryKey(
-        request.sessionId,
-        request.runId,
-        kind?.unsupported === true ? `unsupported:${request.kind ?? ""}` : kind?.kind ?? ""
+        sessionId,
+        runId,
+        kind?.unsupported === true ? `unsupported:${request.kind ?? ""}` : kind?.kind ?? "",
+        referenceTargetSessionId,
+        referenceTargetGeneration
       );
       const cursor = decodeArtifactPageToken(request.page?.pageToken ?? "");
       if (cursor !== undefined && cursor.queryKey !== queryKey) {
@@ -2758,6 +2773,23 @@ export function createConnectServices(application: OrchestratorApplication): Con
           Code.Aborted
         );
       }
+      if (referenceCatalog) {
+        const target = dependencies.store.getSession(referenceTargetSessionId);
+        if (target.descriptor.deletedAt !== undefined || target.descriptor.archived) {
+          throw new ConnectError("The receiving Session is unavailable for Artifact references.", Code.FailedPrecondition);
+        }
+        if (target.descriptor.binding.generation !== referenceTargetGeneration) {
+          throw new StaleGenerationError(referenceTargetGeneration!, target.descriptor.binding.generation);
+        }
+        const mentionCapability = dependencies.store.getBackend(target.descriptor.backendId).descriptor.capabilities
+          .get(contract.capabilityNames.inputMention);
+        if (mentionCapability?.supported !== true || mentionCapability.options?.includes("artifact") !== true) {
+          throw new ConnectError(
+            "The receiving Session Backend does not support Artifact mentions.",
+            Code.FailedPrecondition
+          );
+        }
+      }
       if (kind?.unsupported === true) {
         if (offset !== 0) throw new ConnectError("Artifact page token is outside the current result set.", Code.FailedPrecondition);
         return {
@@ -2767,8 +2799,9 @@ export function createConnectServices(application: OrchestratorApplication): Con
         };
       }
       const query = {
-        ...(request.sessionId === "" ? {} : { sessionId: request.sessionId }),
-        ...(request.runId === "" ? {} : { runId: request.runId }),
+        ...(referenceCatalog ? { referenceCatalog: true as const } : {}),
+        ...(sessionId === "" ? {} : { sessionId }),
+        ...(runId === "" ? {} : { runId }),
         ...(kind?.kind === undefined ? {} : { kind: kind.kind }),
         limit,
         offset
@@ -4734,11 +4767,31 @@ interface ArtifactPageCursor {
   readonly offset: number;
 }
 
-function artifactPageQueryKey(sessionId: string, runId: string, kind: string): string {
+function artifactPageQueryKey(
+  sessionId: string,
+  runId: string,
+  kind: string,
+  referenceTargetSessionId = "",
+  referenceTargetGeneration?: number
+): string {
   return createHash("sha256")
     .update("joko.artifact-page-query.v1\0")
-    .update(JSON.stringify([sessionId, runId, kind]))
+    .update(JSON.stringify([
+      sessionId,
+      runId,
+      kind,
+      referenceTargetSessionId,
+      referenceTargetGeneration ?? null
+    ]))
     .digest("hex");
+}
+
+function artifactReferenceGeneration(value: bigint | undefined): number {
+  if (value === undefined) throw invalidArgument("reference_target_generation is required");
+  if (value < 1n || value > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw invalidArgument("reference_target_generation must be a positive safe integer");
+  }
+  return Number(value);
 }
 
 function encodeArtifactPageToken(cursor: ArtifactPageCursor): string {

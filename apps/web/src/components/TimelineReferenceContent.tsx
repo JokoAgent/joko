@@ -97,7 +97,7 @@ function TimelineArtifactMention({ mention, actions, children }: {
   const [trigger, setTrigger] = useState<HTMLButtonElement | null>(null);
   const [epoch, setEpoch] = useState(0);
   const ownerDocument = trigger?.ownerDocument;
-  const sourceOwner = useMemo(() => ({}), [actions.ownerKey, actions.sessionId, actions.sourceKey, actions.onReadArtifact, mention.artifactId, ownerDocument, epoch]);
+  const sourceOwner = useMemo(() => ({}), [actions.ownerKey, actions.sessionId, actions.sourceKey, actions.onReadArtifact, mention.sourceSessionId, mention.artifactId, ownerDocument, epoch]);
   const scopeRef = useRef<AbortController | undefined>(undefined);
   const requestRef = useRef<AbortController | undefined>(undefined);
   const [state, setState] = useState<{ readonly owner: object; readonly status: "loading" | "error" | "ready"; readonly artifact?: ArtifactView }>();
@@ -124,7 +124,7 @@ function TimelineArtifactMention({ mention, actions, children }: {
     const signal = AbortSignal.any([scope.signal, request.signal]);
     const isCurrent = (): boolean => !signal.aborted && scopeRef.current === scope && requestRef.current === request;
     setState({ owner: sourceOwner, status: "loading" });
-    void read(actions.sessionId, mention.artifactId, signal).then((artifact) => {
+    void read(mention.sourceSessionId, mention.artifactId, signal).then((artifact) => {
       if (!isCurrent()) return;
       if (artifact.id !== mention.artifactId || artifact.blobId === "") throw new Error("The referenced Artifact is unavailable.");
       setState({ owner: sourceOwner, status: "ready", artifact });

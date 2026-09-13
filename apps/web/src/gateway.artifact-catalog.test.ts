@@ -73,6 +73,84 @@ describe("task Artifact catalog gateway", () => {
       gateway.disconnect();
     }
   });
+
+  it("collects the formal cross-task reference catalog with source identities and exact receiving generation", async () => {
+    const requests: Array<{
+      readonly sessionId?: string;
+      readonly referenceTargetSessionId?: string;
+      readonly referenceTargetGeneration?: bigint;
+      readonly page?: { readonly pageToken?: string };
+    }> = [];
+    const responses = [
+      responsePage([artifact("source-one", "source-session-one")], "page-two", 3n, 12n),
+      responsePage([
+        artifact("source-two", "source-session-two"),
+        artifact("expired-reference", "source-session-three", create(TimestampSchema, { seconds: 1n }))
+      ], "", 3n, 12n)
+    ];
+    const gateway = gatewayFor((input) => {
+      requests.push(input as typeof requests[number]);
+      const value = responses.shift();
+      if (value === undefined) throw new Error("Unexpected Artifact reference page.");
+      return value;
+    });
+    await gateway.connect();
+    try {
+      await expect(gateway.listArtifactReferenceCatalog("receiving-session", 7n)).resolves.toEqual([
+        expect.objectContaining({ id: "source-one", sourceSessionId: "source-session-one" }),
+        expect.objectContaining({ id: "source-two", sourceSessionId: "source-session-two" })
+      ]);
+      expect(requests).toEqual([
+        expect.objectContaining({
+          referenceTargetSessionId: "receiving-session",
+          referenceTargetGeneration: 7n,
+          page: expect.objectContaining({ pageToken: "" })
+        }),
+        expect.objectContaining({
+          referenceTargetSessionId: "receiving-session",
+          referenceTargetGeneration: 7n,
+          page: expect.objectContaining({ pageToken: "page-two" })
+        })
+      ]);
+      expect(requests.every((request) => !request.sessionId)).toBe(true);
+    } finally {
+      gateway.disconnect();
+    }
+  });
+
+  it("restarts the whole Artifact reference catalog after revision drift", async () => {
+    let call = 0;
+    const gateway = gatewayFor(() => {
+      call += 1;
+      if (call === 1) return responsePage([artifact("stale", "source-stale")], "stale-next", 2n, 20n);
+      if (call === 2) throw new ConnectError("catalog changed", Code.Aborted);
+      return responsePage([artifact("current", "source-current")], "", 1n, 21n);
+    });
+    await gateway.connect();
+    try {
+      await expect(gateway.listArtifactReferenceCatalog("receiving-session", 7n)).resolves.toEqual([
+        expect.objectContaining({ id: "current", sourceSessionId: "source-current" })
+      ]);
+      expect(call).toBe(3);
+    } finally {
+      gateway.disconnect();
+    }
+  });
+
+  it("fails closed on an invalid Artifact reference source or receiving identity", async () => {
+    const listArtifacts = vi.fn(() => responsePage([artifact("foreign", "")], "", 1n, 7n));
+    const gateway = gatewayFor(listArtifacts);
+    await gateway.connect();
+    try {
+      await expect(gateway.listArtifactReferenceCatalog("receiving-session", 7n))
+        .rejects.toThrow("invalid Artifact reference catalog source task");
+      await expect(gateway.listArtifactReferenceCatalog("", 7n)).rejects.toThrow("receiving task identity");
+      await expect(gateway.listArtifactReferenceCatalog("receiving-session", 0n)).rejects.toThrow("receiving task generation");
+      expect(listArtifacts).toHaveBeenCalledOnce();
+    } finally {
+      gateway.disconnect();
+    }
+  });
 });
 
 function artifact(

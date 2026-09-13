@@ -25,7 +25,7 @@ describe("durable composer mention inventory", () => {
 
   it("isolates equal task IDs on different servers and preserves each server's draft", async () => {
     const state = memoryLocalState();
-    const mentions: ComposerMentionDraft[] = [{ id: "artifact:one", kind: "artifact", reference: "one", label: "Report", token: "@Report" }];
+    const mentions: ComposerMentionDraft[] = [{ id: "artifact:one", kind: "artifact", sourceSessionId: "source-one", reference: "one", label: "Report", token: "@Report" }];
     const draft = { text: "First server @Report", deliveryMode: "prompt" as const, mentions, attachments: [],
       inlineMentionRanges: [{ mentionId: "artifact:one", from: 13, to: 20 }] };
     await state.saveDraft("server-one", "same-session", draft);
@@ -129,9 +129,9 @@ describe("durable composer mention inventory", () => {
 
 function occurrenceDraft(): ComposerDraft {
   return { text: "@X @X @X @src @Tool @Earlier", deliveryMode: "prompt", attachments: [], mentions: [
-    { id: "artifact:b", kind: "artifact", reference: "b", label: "X", token: "@X" },
+    { id: "artifact:b", kind: "artifact", sourceSessionId: "source-b", reference: "b", label: "X", token: "@X" },
     { id: "workspace:w", kind: "workspace", reference: "src", label: "src", token: "@src", workspaceId: "w", directory: true },
-    { id: "artifact:a", kind: "artifact", reference: "a", label: "X", token: "@X" },
+    { id: "artifact:a", kind: "artifact", sourceSessionId: "source-a", reference: "a", label: "X", token: "@X" },
     { id: "resource:r", kind: "resource", reference: "r", label: "Tool", token: "@Tool", discoveredRevision: "revision-r", resourceVersion: "4", runtimeGeneration: 2 },
     { id: "session:earlier", kind: "session", reference: "task/earlier", label: "Earlier", token: "@Earlier" },
     { id: "message:m", kind: "message", reference: "m", label: "Message", sessionId: "s", role: "assistant" }

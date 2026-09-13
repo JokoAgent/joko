@@ -6,7 +6,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import type { AppController, ControllerState } from "../controller.js";
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
-import { emptySnapshot, type ArtifactView, type BackendView, type SessionResourceView, type SessionView } from "../model.js";
+import { emptySnapshot, type ArtifactReferenceCatalogItemView, type ArtifactView, type BackendView, type SessionResourceView, type SessionView } from "../model.js";
 import { SessionPane } from "./SessionPane.js";
 
 vi.mock("./Composer.js", async () => {
@@ -88,12 +88,13 @@ describe("SessionPane live resource catalog", () => {
   });
 
   it("uses the complete Artifact query and retires a prior task generation response", async () => {
-    const pending: Array<(artifacts: readonly ArtifactView[]) => void> = [];
-    const listSessionArtifacts = vi.fn<AppController["listSessionArtifacts"]>(() => new Promise((resolve) => {
+    const pending: Array<(artifacts: readonly ArtifactReferenceCatalogItemView[]) => void> = [];
+    const listArtifactReferenceCatalog = vi.fn<AppController["listArtifactReferenceCatalog"]>(() => new Promise((resolve) => {
       pending.push(resolve);
     }));
+    const listSessionArtifacts = vi.fn<AppController["listSessionArtifacts"]>(async () => []);
     const first = session(1n);
-    const controller = controllerFor(first, vi.fn(async () => []), listSessionArtifacts);
+    const controller = controllerFor(first, vi.fn(async () => []), listArtifactReferenceCatalog, listSessionArtifacts);
     const backend = artifactBackend();
     const container = document.body.appendChild(document.createElement("div"));
     const root = createRoot(container);
@@ -127,15 +128,68 @@ describe("SessionPane live resource catalog", () => {
     />));
 
     await render(first);
-    await vi.waitFor(() => expect(listSessionArtifacts).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(listArtifactReferenceCatalog).toHaveBeenCalledTimes(1));
+    expect(listArtifactReferenceCatalog).toHaveBeenLastCalledWith(first.id, first.generation, expect.any(AbortSignal));
+    expect(listSessionArtifacts).not.toHaveBeenCalled();
     expect(artifactCatalog(container)).toEqual([]);
 
     await render(session(2n));
-    await vi.waitFor(() => expect(listSessionArtifacts).toHaveBeenCalledTimes(2));
-    await act(async () => pending[0]?.([artifact("old-generation")]));
+    await vi.waitFor(() => expect(listArtifactReferenceCatalog).toHaveBeenCalledTimes(2));
+    await act(async () => pending[0]?.([referenceArtifact("old-generation")]));
     expect(artifactCatalog(container)).toEqual([]);
-    await act(async () => pending[1]?.([artifact("catalog-artifact")]));
-    await vi.waitFor(() => expect(artifactCatalog(container)).toEqual([artifact("catalog-artifact")]));
+    await act(async () => pending[1]?.([referenceArtifact("catalog-artifact")]));
+    await vi.waitFor(() => expect(artifactCatalog(container)).toEqual([referenceArtifact("catalog-artifact")]));
+  });
+
+  it("retires the Artifact reference catalog with its browser document", async () => {
+    const pending: Array<{
+      readonly signal?: AbortSignal;
+      readonly resolve: (artifacts: readonly ArtifactReferenceCatalogItemView[]) => void;
+    }> = [];
+    const listArtifactReferenceCatalog = vi.fn<AppController["listArtifactReferenceCatalog"]>((_id, _generation, signal) =>
+      new Promise((resolve) => pending.push({ signal, resolve })));
+    const current = session(1n);
+    const controller = controllerFor(current, vi.fn(async () => []), listArtifactReferenceCatalog);
+    const container = document.body.appendChild(document.createElement("div"));
+    const root = createRoot(container);
+    roots.push(root);
+    await act(async () => root.render(<SessionPane
+      controller={controller}
+      session={current}
+      backend={artifactBackend()}
+      models={[]}
+      timeline={[]}
+      timelineHasEarlier={false}
+      timelineHistoryLoading={false}
+      onLoadEarlierTimeline={async () => undefined}
+      extensionWidgets={[]}
+      extensionStatuses={[]}
+      queue={[]}
+      extraDirectories={[]}
+      resources={[]}
+      commandRefreshSignal={[]}
+      remainingInteractions={0}
+      navigationOpen
+      inspectorOpen
+      t={(key) => key}
+      runAction={(_key, action) => { void action(); }}
+      onOpenNavigation={() => undefined}
+      onOpenInspector={() => undefined}
+      onRename={() => undefined}
+      onArchive={() => undefined}
+      onDelete={() => undefined}
+    />));
+    await vi.waitFor(() => expect(listArtifactReferenceCatalog).toHaveBeenCalledTimes(1));
+    await act(async () => pending[0]!.resolve([referenceArtifact("before-pagehide")]));
+    await vi.waitFor(() => expect(artifactCatalog(container)).toEqual([referenceArtifact("before-pagehide")]));
+
+    await act(async () => window.dispatchEvent(new Event("pagehide")));
+    expect(pending[0]?.signal?.aborted).toBe(true);
+    expect(artifactCatalog(container)).toEqual([]);
+    await act(async () => window.dispatchEvent(new Event("pageshow")));
+    await vi.waitFor(() => expect(listArtifactReferenceCatalog).toHaveBeenCalledTimes(2));
+    await act(async () => pending[1]!.resolve([referenceArtifact("after-pageshow")]));
+    await vi.waitFor(() => expect(artifactCatalog(container)).toEqual([referenceArtifact("after-pageshow")]));
   });
 });
 
@@ -157,6 +211,10 @@ function artifact(id: string): ArtifactView {
     mediaType: "text/plain",
     byteSize: 4
   };
+}
+
+function referenceArtifact(id: string, sourceSessionId = "source-session"): ArtifactReferenceCatalogItemView {
+  return { ...artifact(id), sourceSessionId };
 }
 
 function resource(runtimeGeneration: number): SessionResourceView {
@@ -216,6 +274,7 @@ function session(generation: bigint): SessionView {
 function controllerFor(
   sourceSession: SessionView,
   listSessionResources: AppController["listSessionResources"],
+  listArtifactReferenceCatalog: AppController["listArtifactReferenceCatalog"] = async () => [],
   listSessionArtifacts: AppController["listSessionArtifacts"] = async () => []
 ): AppController {
   const snapshot = { ...emptySnapshot(), sessions: [sourceSession], backends: [resourceBackend()] };
@@ -234,5 +293,5 @@ function controllerFor(
     preferences: DEFAULT_UI_PREFERENCES,
     extensionNotifications: []
   };
-  return { state, listSessionResources, listSessionArtifacts } as unknown as AppController;
+  return { state, listSessionResources, listSessionArtifacts, listArtifactReferenceCatalog } as unknown as AppController;
 }

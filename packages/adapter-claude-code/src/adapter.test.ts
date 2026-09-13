@@ -903,7 +903,7 @@ describe("ClaudeCodeAdapter", () => {
     expect(replacement.version).toContain("cli-2.1.241");
   });
 
-  test("dispatches immutable images and bounded file references through the native content contract", async () => {
+  test("dispatches immutable images, bounded files, and a source-qualified Artifact through the native content contract", async () => {
     const workspace = await mkdtemp(join(tmpdir(), "joko-claude-input-"));
     const workspaceTarget = { ...target, workspaceRoot: await realpath(workspace) };
     const attachmentPath = join(workspaceTarget.workspaceRoot, "attached.txt");
@@ -916,6 +916,7 @@ describe("ClaudeCodeAdapter", () => {
     const readBlob = vi.fn(async () => ({ data: image.data, mimeType: "image/png" }));
     const resolveFile = vi.fn(async () => attachmentPath);
     const artifactBlob = { id: "mentioned-artifact", sha256: createHash("sha256").update("attachment").digest("hex"), byteLength: 10, mimeType: "text/plain" };
+    const artifactSourceSessionId = "artifact-source-session";
     const assertArtifactCurrent = vi.fn();
     const resolveArtifactMention = vi.fn(async () => ({ blob: artifactBlob, path: attachmentPath, assertCurrent: assertArtifactCurrent }));
     const runtime = new FakeSdkRuntime({ initialFrameOverrides: { cwd: workspaceTarget.workspaceRoot } });
@@ -935,7 +936,7 @@ describe("ClaudeCodeAdapter", () => {
           { kind: "workspace_file", label: "mentioned", reference: "mentioned.txt" },
           { kind: "workspace_directory", label: "sources", reference: "source files" },
           { kind: "workspace_file", label: "selected lines", reference: "mentioned.txt", lineRange: { startLine: 1, endLine: 1 } },
-          { kind: "artifact", label: "prior output", reference: artifactBlob.id }
+          { kind: "artifact", label: "prior output", reference: artifactBlob.id, sourceSessionId: artifactSourceSessionId }
         ]
       }, active.context);
       expect(runtime.queries[0]!.receivedInputs[0]!.message.content).toEqual([
@@ -951,7 +952,12 @@ describe("ClaudeCodeAdapter", () => {
       ]);
       expect(resolveFile).toHaveBeenCalledWith(expect.objectContaining({ fileName: "attached.txt" }), active.context);
       expect(readBlob).toHaveBeenCalledOnce();
-      expect(resolveArtifactMention).toHaveBeenCalledWith(artifactBlob.id, active.context, expect.any(AbortSignal));
+      expect(resolveArtifactMention).toHaveBeenCalledWith(
+        artifactBlob.id,
+        artifactSourceSessionId,
+        active.context,
+        expect.any(AbortSignal)
+      );
       expect(assertArtifactCurrent).toHaveBeenCalled();
     } finally {
       await adapter.dispose();
@@ -1127,6 +1133,7 @@ describe("ClaudeCodeAdapter", () => {
     const path = join(workspace, "report.txt");
     await writeFile(path, "report");
     const blob = { id: "report", sha256: createHash("sha256").update("report").digest("hex"), byteLength: 6, mimeType: "text/plain" };
+    const sourceSessionId = "artifact-source-session";
     let mode: "mismatch" | "retired" | "valid" = "mismatch";
     const runtime = new FakeSdkRuntime();
     const adapter = adapterFor(runtime, { resolveArtifactMention: async () => ({
@@ -1135,12 +1142,21 @@ describe("ClaudeCodeAdapter", () => {
     }) });
     try {
       const binding = await adapter.createSession(createInput(), contextFor().context);
-      const prompt = { ...textPrompt(""), mentions: [{ kind: "artifact" as const, label: "report", reference: blob.id }] };
+      const prompt = { ...textPrompt(""), mentions: [{
+        kind: "artifact" as const,
+        label: "report",
+        reference: blob.id,
+        sourceSessionId
+      }] };
       await expect(adapter.send(prompt, contextFor(binding, { operationId: "mismatch" }).context))
         .rejects.toMatchObject({ publicError: { code: "ARTIFACT_REFERENCE_INVALID", stateMayHaveChanged: false } });
       mode = "retired";
       await expect(adapter.send(prompt, contextFor(binding, { operationId: "retired" }).context))
-        .rejects.toMatchObject({ publicError: { code: "ARTIFACT_UNAVAILABLE", stateMayHaveChanged: false } });
+        .rejects.toMatchObject({ publicError: {
+          code: "ARTIFACT_UNAVAILABLE",
+          message: "The referenced Artifact changed in its source task while input was prepared.",
+          stateMayHaveChanged: false
+        } });
       expect(runtime.queries[0]!.receivedInputs).toEqual([]);
       mode = "valid";
       await adapter.send(prompt, contextFor(binding, { operationId: "valid" }).context);
@@ -1153,9 +1169,15 @@ describe("ClaudeCodeAdapter", () => {
     const path = join(workspace, "report.txt");
     await writeFile(path, "report");
     const blob = { id: "report", sha256: createHash("sha256").update("report").digest("hex"), byteLength: 6, mimeType: "text/plain" };
+    const sourceSessionId = "artifact-source-session";
     let deleted = false;
     const assertArtifactCurrent = vi.fn();
-    const resolveArtifactMention: NonNullable<ClaudeCodeAdapterOptions["resolveArtifactMention"]> = async (_id, _context, signal) => ({
+    const resolveArtifactMention: NonNullable<ClaudeCodeAdapterOptions["resolveArtifactMention"]> = async (
+      _id,
+      _sourceSessionId,
+      _context,
+      signal
+    ) => ({
       blob, path, assertCurrent: () => {
         signal.throwIfAborted();
         assertArtifactCurrent();
@@ -1190,7 +1212,7 @@ describe("ClaudeCodeAdapter", () => {
       const context = { ...contextFor(binding, { operationId: "artifact-input" }).context,
         ...(waiting === "managed admission" ? { modelSelection: { providerId: "configured-provider", modelId: "configured-model" } } : {}) };
       const sending = adapter.send({ ...textPrompt(""), ...(waiting === "unread steer" ? { disposition: "steer" as const } : {}),
-        mentions: [{ kind: "artifact", label: "report", reference: blob.id }] }, context);
+        mentions: [{ kind: "artifact", label: "report", reference: blob.id, sourceSessionId }] }, context);
       const rejected = expect(sending).rejects.toMatchObject({ publicError: { code: "ARTIFACT_UNAVAILABLE", stateMayHaveChanged: false } });
       if (waiting === "managed admission") await vi.waitFor(() => expect(finishActivation).toBeTypeOf("function"));
       else await vi.waitFor(() => expect(assertArtifactCurrent).toHaveBeenCalled());
@@ -1205,7 +1227,12 @@ describe("ClaudeCodeAdapter", () => {
         query.push(resultMessage(binding.nativeSessionId!, { result: "Done", totalCostUsd: 0 }));
         await eventually(() => parent.events.some((event) => event.type === "done"));
         deleted = false;
-        await adapter.send({ ...textPrompt(""), mentions: [{ kind: "artifact", label: "report", reference: blob.id }] },
+        await adapter.send({ ...textPrompt(""), mentions: [{
+          kind: "artifact",
+          label: "report",
+          reference: blob.id,
+          sourceSessionId
+        }] },
           contextFor(binding, { operationId: "current-artifact" }).context);
         expect(query.receivedInputs).toHaveLength(2);
       }

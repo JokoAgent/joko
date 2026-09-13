@@ -85,8 +85,18 @@ function acceptedInput(): PromptInput {
         lineRange: { startLine: 2, endLine: 5 }
       },
       { kind: "resource", label: "resource", reference: "resource-one", discoveredRevision: "revision-one", resourceVersion: "7", runtimeGeneration: 3 },
-      { kind: "artifact", label: "artifact", reference: sourceArtifact.id },
-      { kind: "artifact", label: "orphan", reference: "unrepresented-artifact" }
+      {
+        kind: "artifact",
+        label: "artifact",
+        reference: sourceArtifact.id,
+        sourceSessionId: "session-source"
+      },
+      {
+        kind: "artifact",
+        label: "orphan",
+        reference: "unrepresented-artifact",
+        sourceSessionId: "session-source"
+      }
     ],
     disposition: "steer",
     quotesEncoded: true,
@@ -156,6 +166,42 @@ describe("portable Session message projection", () => {
     expect(() => encodePortableSessionProjection(projected)).not.toThrow();
   });
 
+  it("retains public Artifact source identity while stripping its Queue-private authority", () => {
+    const source = acceptedEvent();
+    if (source.payload.type !== "message_complete" || source.payload.acceptedInput === undefined) {
+      throw new Error("Expected accepted input.");
+    }
+    const projected = projectPortableSessionMessages([{
+      ...source,
+      payload: {
+        ...source.payload,
+        acceptedInput: {
+          ...source.payload.acceptedInput,
+          artifactReferenceSnapshots: [{
+            mentionIndex: 2,
+            sourceSessionId: "session-source",
+            artifactId: sourceArtifact.id,
+            sourceAuthorityFingerprint: `sha256:${"a".repeat(64)}`,
+            targetSessionId: "session-target",
+            targetAuthorityFingerprint: `sha256:${"b".repeat(64)}`,
+            artifactRevision: "4",
+            artifactFingerprint: `sha256:${"c".repeat(64)}`
+          }]
+        }
+      }
+    }]);
+    const accepted = projected.messages[0]?.acceptedInput;
+    expect(accepted?.mentions).toContainEqual({
+      kind: "artifact",
+      label: "artifact",
+      reference: sourceArtifact.id,
+      sourceSessionId: "session-source"
+    });
+    expect(accepted).not.toHaveProperty("artifactReferenceSnapshots");
+    expect(Buffer.from(encodePortableSessionProjection(projected)).toString("utf8"))
+      .not.toContain("sourceAuthorityFingerprint");
+  });
+
   it("accepts exactly the format message limit and rejects the 100001st message", { timeout: 20_000 }, () => {
     const source = event();
     const exact = Array<PersistedEvent>(MAXIMUM_PORTABLE_SESSION_MESSAGES).fill(source);
@@ -208,6 +254,11 @@ describe("portable Session message projection", () => {
     rejects({ ...input, files: [{ ...input.files[0], workspacePath: 42 }] });
     rejects({ ...input, mentions: [{ kind: "workspace_file", label: "source", reference: "src/main.ts" }] });
     rejects({ ...input, mentions: [{ kind: "resource", label: "resource", reference: "resource-one" }] });
+    rejects({ ...input, mentions: [{ kind: "artifact", label: "artifact", reference: sourceArtifact.id }] });
+    rejects({ ...input, mentions: [{
+      kind: "artifact", label: "artifact", reference: sourceArtifact.id, sourceSessionId: " session-source"
+    }] });
+    rejects({ ...input, artifactReferenceSnapshots: [] });
     rejects({ ...input, mentions: [{
       kind: "workspace_directory", workspaceId: "source-workspace", label: "source", reference: "src",
       lineRange: { startLine: 1, endLine: 2 }
@@ -290,7 +341,12 @@ describe("portable Session message projection", () => {
       text: acceptedInput().text,
       images: [{ blob: receivedBlob, alt: "Input preview" }],
       files: [{ blob: receivedFile }],
-      mentions: [{ kind: "artifact", label: "artifact", reference: receivedArtifact.id }]
+      mentions: [{
+        kind: "artifact",
+        label: "artifact",
+        reference: receivedArtifact.id,
+        sourceSessionId: "session-source"
+      }]
     });
     expect(rebound.messages[0]?.acceptedInput?.files[0]).not.toHaveProperty("workspacePath");
     expect(rebound.messages[0]?.acceptedInput?.mentionRanges).toEqual([
@@ -347,7 +403,12 @@ describe("portable Session message projection", () => {
       mentions: [
         { kind: "workspace_file", workspaceId: "source-workspace", label: "workspace", reference: "src/main.ts" },
         { kind: "resource", label: "resource", reference: "resource-one", discoveredRevision: "revision-one", resourceVersion: "7", runtimeGeneration: 3 },
-        { kind: "artifact", label: "artifact", reference: sourceArtifact.id }
+        {
+          kind: "artifact",
+          label: "artifact",
+          reference: sourceArtifact.id,
+          sourceSessionId: "session-source"
+        }
       ]
     });
     expect(filtered.messages[0]?.acceptedInput?.mentionRanges?.map((range) => range.mentionIndex)).toEqual([0, 1, 2, 2]);

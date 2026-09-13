@@ -86,12 +86,39 @@ describe("inline composer mention syntax", () => {
 describe("composer mention catalog and ranking", () => {
   it("keeps canonical artifacts with equal names distinct by opaque identity", () => {
     const artifacts = ["first", "second"].map((id) => ({
-      id, blobId: `bytes-${id}`, title: "Report", kind: "file" as const, fileName: "report.txt", mediaType: "text/plain", byteSize: 4
+      id, sourceSessionId: "task-one", blobId: `bytes-${id}`, title: "Report", kind: "file" as const, fileName: "report.txt", mediaType: "text/plain", byteSize: 4
     }));
     const items = composerMentionCatalog([], undefined, [], [], [...artifacts, artifacts[0]!]);
     expect(items.map((item) => item.mention?.reference)).toEqual(["first", "second"]);
     expect(items.every((item) => item.kind === "artifact" && item.mention?.kind === "artifact")).toBe(true);
     expect(items[1]?.mention?.token).toBe("@Report");
+  });
+
+  it("keeps equal Artifact IDs distinct by source task and shows the source task name", () => {
+    const sourceSessions = [session("source-one", "First task"), session("source-two", "Second task")];
+    const artifacts = sourceSessions.map((source) => ({
+      id: "shared-artifact-id",
+      sourceSessionId: source.id,
+      blobId: `bytes-${source.id}`,
+      title: "Report",
+      kind: "file" as const,
+      fileName: "report.txt",
+      mediaType: "text/plain",
+      byteSize: 4
+    }));
+    const items = composerMentionCatalog([], undefined, [], [], artifacts, [], sourceSessions);
+    expect(items.map((item) => item.id)).toEqual([
+      "artifact:source-one:shared-artifact-id",
+      "artifact:source-two:shared-artifact-id"
+    ]);
+    expect(items.map((item) => item.mention)).toEqual([
+      expect.objectContaining({ kind: "artifact", sourceSessionId: "source-one", reference: "shared-artifact-id" }),
+      expect.objectContaining({ kind: "artifact", sourceSessionId: "source-two", reference: "shared-artifact-id" })
+    ]);
+    expect(items.map((item) => item.meta)).toEqual([
+      "First task · report.txt · text/plain",
+      "Second task · report.txt · text/plain"
+    ]);
   });
 
   it("keeps historical tasks with equal titles distinct and excludes closed tasks", () => {

@@ -21,10 +21,10 @@ const roots: Root[] = [];
 const session: SessionView = { id: "task-one", backendId: "backend-one", targetId: "target-one", name: "Task one", state: "idle",
   pinned: false, archived: false, generation: 1n, fastMode: false, permissionMode: "ask", planMode: false, updatedAt: 0 };
 const draft: ComposerDraft = { text: "Read @export", attachments: [], deliveryMode: "prompt", inlineMentionRanges: [{ mentionId: "mention-one", from: 5, to: 12 }], mentions: [
-  { id: "mention-one", kind: "artifact", reference: "artifact-one", label: "Export", token: "@export" }
+  { id: "mention-one", kind: "artifact", sourceSessionId: session.id, reference: "artifact-one", label: "Export", token: "@export" }
 ] };
 const mentionCases: readonly { readonly kind: string; readonly mention: ComposerTokenMentionDraft; readonly options: string[] }[] = [
-  { kind: "artifact", mention: { id: "mention-one", kind: "artifact", reference: "artifact-one", label: "Export", token: "@export" }, options: ["artifact"] },
+  { kind: "artifact", mention: { id: "mention-one", kind: "artifact", sourceSessionId: session.id, reference: "artifact-one", label: "Export", token: "@export" }, options: ["artifact"] },
   { kind: "file", mention: { id: "mention-one", kind: "workspace", reference: "artifact-one", label: "Export", token: "@export", workspaceId: "workspace" }, options: ["workspace_file"] },
   { kind: "directory", mention: { id: "mention-one", kind: "workspace", reference: "artifact-one", label: "Export", token: "@export", workspaceId: "workspace", directory: true }, options: ["workspace_directory"] },
   { kind: "line range", mention: { id: "mention-one", kind: "workspace", reference: "artifact-one", label: "Export", token: "@export", workspaceId: "workspace", lineRange: { startLine: 1, endLine: 2 } }, options: ["workspace_file", "workspace_line_range"] },
@@ -77,7 +77,7 @@ it("limits an Artifact-only palette to canonical Artifacts despite loaded worksp
       { path: "private.ts", name: "private.ts", kind: "file", generated: false }
     ] },
     resources: [{ sessionId: session.id, id: "resource", name: "Hidden resource", kind: "skill", discoveredRevision: "revision-one", resourceVersion: "1", runtimeGeneration: 1 }],
-    artifacts: ["one", "two"].map((id) => ({ id, blobId: id, title: `Export ${id}`, fileName: `${id}.txt`, kind: "file", mediaType: "text/plain", byteSize: 1 }))
+    artifacts: ["one", "two"].map((id) => ({ id, sourceSessionId: session.id, blobId: id, title: `Export ${id}`, fileName: `${id}.txt`, kind: "file", mediaType: "text/plain", byteSize: 1 }))
   });
   await view.render({ supported: true, options: ["artifact"] });
   await act(async () => view.host.querySelector<HTMLButtonElement>('button[aria-label="common.add"]')!.click());
@@ -105,8 +105,8 @@ it("keeps Joko message references sendable without Backend mention support", asy
 
 it("sends only the retained exact Artifact after deleting the other same-named occurrences from a restored draft", async () => {
   const sameName: ComposerDraft = { ...draft, text: "@Export @Export @Export", mentions: [
-    { id: "a", kind: "artifact", reference: "artifact-a", label: "Export", token: "@Export" },
-    { id: "b", kind: "artifact", reference: "artifact-b", label: "Export", token: "@Export" }
+    { id: "a", kind: "artifact", sourceSessionId: session.id, reference: "artifact-a", label: "Export", token: "@Export" },
+    { id: "b", kind: "artifact", sourceSessionId: "task-source", reference: "artifact-b", label: "Export", token: "@Export" }
   ], inlineMentionRanges: [
     { mentionId: "b", from: 0, to: 7 }, { mentionId: "a", from: 8, to: 15 }, { mentionId: "b", from: 16, to: 23 }
   ] };

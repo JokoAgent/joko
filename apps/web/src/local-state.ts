@@ -806,7 +806,11 @@ export function normalizeComposerMentions(value: unknown): readonly ComposerMent
     }
     if ((record["kind"] !== "workspace" && record["kind"] !== "resource" && record["kind"] !== "artifact" && record["kind"] !== "session")
       || typeof record["token"] !== "string") continue;
-    if (record["kind"] === "artifact" && (record["workspaceId"] !== undefined || !validMessageIdentity(record["reference"]))) continue;
+    if (record["kind"] === "artifact" && (
+      record["workspaceId"] !== undefined
+      || !validMessageIdentity(record["reference"])
+      || !validSessionMentionIdentity(record["sourceSessionId"])
+    )) continue;
     if (record["kind"] === "session" && (
       record["workspaceId"] !== undefined || record["directory"] !== undefined || record["lineRange"] !== undefined
       || !validSessionMentionIdentity(record["reference"])
@@ -839,7 +843,8 @@ export function normalizeComposerMentions(value: unknown): readonly ComposerMent
         kind: "artifact",
         reference: record["reference"],
         label: record["label"],
-        token: record["token"]
+        token: record["token"],
+        sourceSessionId: String(record["sourceSessionId"])
       });
       seenIds.add(record["id"]);
       continue;
