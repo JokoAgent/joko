@@ -1,0 +1,226 @@
+.memory-settings {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding-bottom: 18px;
+}
+
+.memory-settings__heading {
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.memory-settings__heading > div:first-child {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.memory-settings__heading h2 {
+  margin: 0;
+  color: var(--text);
+  font-size: var(--text-16);
+  font-weight: 500;
+  line-height: 1.2;
+}
+
+.memory-settings__heading p {
+  margin: 0;
+  color: var(--text-soft);
+  font-size: var(--text-13);
+  line-height: 1.5;
+}
+
+.memory-settings__card {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface-raised);
+}
+
+.memory-settings__row {
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 16px;
+  transition: opacity .15s ease;
+}
+
+.memory-settings__row + .memory-settings__row {
+  border-top: 1px solid var(--line);
+}
+
+.memory-settings__row[data-disabled="true"] {
+  opacity: .5;
+}
+
+.memory-settings__icon {
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+}
+
+.memory-settings__icon svg {
+  width: 18px;
+  height: 18px;
+}
+
+.memory-settings__icon--maker svg {
+  stroke-width: 1.8;
+}
+
+.memory-settings__copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.memory-settings__copy strong {
+  color: var(--text);
+  font-size: var(--text-14);
+  font-weight: 500;
+  line-height: 1;
+}
+
+.memory-settings__copy > span {
+  color: var(--text-soft);
+  font-size: var(--text-12);
+  line-height: 1;
+}
+
+.memory-settings__copy small {
+  color: var(--amber);
+  font-size: var(--text-10);
+  line-height: 1.35;
+}
+
+.memory-settings__actions {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.memory-settings__actions .switch {
+  flex: 0 0 auto;
+  cursor: pointer;
+}
+
+.memory-settings__reset.icon-button {
+  width: 30px;
+  height: 30px;
+  min-height: 30px;
+  border-radius: 8px;
+  color: var(--text-soft);
+}
+
+.memory-settings__reset.icon-button:hover:not(:disabled) {
+  background: var(--surface);
+  color: var(--text);
+}
+
+.memory-settings__reset svg {
+  width: 16px;
+  height: 16px;
+}
+
+.memory-settings__empty,
+.memory-settings__notice {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: var(--text-10);
+  line-height: 1.45;
+}
+
+.memory-settings__confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 0;
+}
+
+.modal.memory-settings__confirm {
+  width: min(calc(100% - 36px), 400px);
+  max-width: 400px;
+  border: 0;
+  border-radius: 12px;
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-lg);
+}
+
+.modal.memory-settings__confirm .modal__header {
+  border-bottom: 0;
+  padding: 16px 16px 0;
+}
+
+.modal.memory-settings__confirm .modal__header h2 {
+  font-size: 18px;
+  font-weight: 500;
+  letter-spacing: 0;
+  line-height: 1.4;
+}
+
+.modal.memory-settings__confirm .modal__header p {
+  margin-top: 8px;
+  font-size: 16px;
+  line-height: 1.5;
+}
+
+.modal.memory-settings__confirm .modal__body {
+  padding: 24px 16px 16px;
+}
+
+.modal.memory-settings__confirm .button {
+  min-width: 96px;
+  min-height: 37px;
+  padding: 9px 24px;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+@media (max-width: 680px) {
+  .memory-settings__row {
+    grid-template-columns: 36px minmax(0, 1fr);
+  }
+
+  .memory-settings__actions {
+    grid-column: 2;
+    justify-content: flex-end;
+  }
+
+  .modal-layer:has(.memory-settings__confirm) {
+    place-items: center;
+    padding: 18px;
+  }
+
+  .modal.memory-settings__confirm {
+    width: min(calc(100% - 36px), 400px);
+    border: 0;
+    border-radius: 12px;
+  }
+
+  .modal.memory-settings__confirm .modal__header {
+    padding: 16px 16px 0;
+  }
+
+  .modal.memory-settings__confirm .modal__body {
+    padding: 24px 16px 16px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .memory-settings__row {
+    transition: none;
+  }
+}

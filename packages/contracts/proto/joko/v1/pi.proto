@@ -1,0 +1,541 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+import "joko/v1/common.proto";
+import "joko/v1/interaction.proto";
+import "joko/v1/model.proto";
+import "joko/v1/settings.proto";
+import "joko/v1/tool.proto";
+
+enum PiNativeSessionCandidateState {
+  PI_NATIVE_SESSION_CANDIDATE_STATE_UNSPECIFIED = 0;
+  PI_NATIVE_SESSION_CANDIDATE_STATE_READY = 1;
+  PI_NATIVE_SESSION_CANDIDATE_STATE_ERROR = 2;
+}
+
+message PiNativeSessionCandidate {
+  string native_session_id = 1;
+  string native_reference = 2;
+  string name = 3;
+  string workspace_root = 4;
+  uint64 message_count = 5;
+  google.protobuf.Timestamp modified_at = 6;
+  PiNativeSessionCandidateState state = 7;
+  optional string bound_session_id = 8;
+}
+
+// Namespaced authoritative Pi projection captured together with a public
+// Snapshot. It is populated only for Pi-capable scopes. Shared reducers must
+// remain correct when this message is absent.
+message PiSnapshot {
+  repeated PiSessionSnapshot sessions = 1;
+  repeated ManagedResource resources = 2;
+  repeated PiNativeSessionCandidate native_sessions = 3;
+  Revision revision = 4;
+  google.protobuf.Timestamp captured_at = 5;
+}
+
+message PiSessionSnapshot {
+  string backend_id = 1;
+  string target_id = 2;
+  string product_session_id = 3;
+  PiSessionState session_state = 4;
+  PiSessionTreeUpdate session_tree = 5;
+  repeated PiNativeMessage messages = 6;
+  repeated PiSessionEntry entries = 7;
+  repeated PiForkCandidate fork_candidates = 8;
+  repeated PiSlashCommand commands = 9;
+  string active_leaf_id = 10;
+  bool messages_complete = 11;
+  bool entries_complete = 12;
+  Revision revision = 13;
+  // Describes only the provenance/freshness of session_state. Messages,
+  // entries, and tree retain their own completeness boundaries above.
+  PiStateObservation observation = 14;
+}
+
+enum PiStateObservationSource {
+  PI_STATE_OBSERVATION_SOURCE_UNSPECIFIED = 0;
+  // A previously successful generation-fenced Pi observation materialized in Orchestrator.
+  PI_STATE_OBSERVATION_SOURCE_DURABLE_RPC = 1;
+  // The response was read from the currently attached Pi runtime.
+  PI_STATE_OBSERVATION_SOURCE_LIVE_RPC = 2;
+}
+
+enum PiStateObservationCompleteness {
+  PI_STATE_OBSERVATION_COMPLETENESS_UNSPECIFIED = 0;
+  // No successful native observation exists. session_state must be absent.
+  PI_STATE_OBSERVATION_COMPLETENESS_UNOBSERVED = 1;
+  // Backend-neutral native state exists but the Pi-specific state is absent.
+  PI_STATE_OBSERVATION_COMPLETENESS_PARTIAL = 2;
+  // Every PiSessionState field came from one generation-fenced Pi observation
+  // cycle (native RPC reads plus Adapter-owned acknowledged controls).
+  PI_STATE_OBSERVATION_COMPLETENESS_COMPLETE = 3;
+  // The exact observation is retained, but its runtime binding/generation is
+  // no longer current and must not be presented as present-tense authority.
+  PI_STATE_OBSERVATION_COMPLETENESS_STALE = 4;
+}
+
+message PiStateObservation {
+  PiStateObservationSource source = 1;
+  PiStateObservationCompleteness completeness = 2;
+  uint64 runtime_generation = 3;
+  google.protobuf.Timestamp observed_at = 4;
+  bool binding_current = 5;
+}
+
+// Namespaced metadata emitted by the Pi adapter. Shared reducers must not need
+// this message to finish a run; it preserves Pi-native detail for Pi panels.
+message PiEventMetadata {
+  oneof payload {
+    PiRpcAcknowledgement rpc_acknowledgement = 1;
+    PiSessionState native_state = 2;
+    PiMessageLifecycle message_lifecycle = 3;
+    PiToolLifecycle tool_lifecycle = 4;
+    PiBashUpdate bash_update = 5;
+    PiQueueUpdate queue_update = 6;
+    PiCompactionUpdate compaction_update = 7;
+    PiRetryUpdate retry_update = 8;
+    PiSessionIdentityUpdate session_identity_update = 9;
+    PiSessionTreeUpdate session_tree_update = 10;
+    PiCommandCatalogUpdate command_catalog_update = 11;
+    PiExtensionUiEffect extension_ui_effect = 12;
+    PiResourceUpdate resource_update = 13;
+    PiModelUpdate model_update = 14;
+    PiDiagnosticMetadata diagnostic = 15;
+  }
+}
+
+enum PiRpcCommandKind {
+  PI_RPC_COMMAND_KIND_UNSPECIFIED = 0;
+  PI_RPC_COMMAND_KIND_PROMPT = 1;
+  PI_RPC_COMMAND_KIND_STEER = 2;
+  PI_RPC_COMMAND_KIND_FOLLOW_UP = 3;
+  PI_RPC_COMMAND_KIND_ABORT = 4;
+  PI_RPC_COMMAND_KIND_NEW_SESSION = 5;
+  PI_RPC_COMMAND_KIND_GET_STATE = 6;
+  PI_RPC_COMMAND_KIND_SET_MODEL = 7;
+  PI_RPC_COMMAND_KIND_CYCLE_MODEL = 8;
+  PI_RPC_COMMAND_KIND_GET_AVAILABLE_MODELS = 9;
+  PI_RPC_COMMAND_KIND_SET_THINKING_LEVEL = 10;
+  PI_RPC_COMMAND_KIND_CYCLE_THINKING_LEVEL = 11;
+  PI_RPC_COMMAND_KIND_GET_AVAILABLE_THINKING_LEVELS = 12;
+  PI_RPC_COMMAND_KIND_SET_STEERING_MODE = 13;
+  PI_RPC_COMMAND_KIND_SET_FOLLOW_UP_MODE = 14;
+  PI_RPC_COMMAND_KIND_COMPACT = 15;
+  PI_RPC_COMMAND_KIND_SET_AUTO_COMPACTION = 16;
+  PI_RPC_COMMAND_KIND_SET_AUTO_RETRY = 17;
+  PI_RPC_COMMAND_KIND_ABORT_RETRY = 18;
+  PI_RPC_COMMAND_KIND_BASH = 19;
+  PI_RPC_COMMAND_KIND_ABORT_BASH = 20;
+  PI_RPC_COMMAND_KIND_GET_SESSION_STATS = 21;
+  PI_RPC_COMMAND_KIND_EXPORT_HTML = 22;
+  PI_RPC_COMMAND_KIND_SWITCH_SESSION = 23;
+  PI_RPC_COMMAND_KIND_FORK = 24;
+  PI_RPC_COMMAND_KIND_CLONE = 25;
+  PI_RPC_COMMAND_KIND_GET_FORK_MESSAGES = 26;
+  PI_RPC_COMMAND_KIND_GET_ENTRIES = 27;
+  PI_RPC_COMMAND_KIND_GET_TREE = 28;
+  PI_RPC_COMMAND_KIND_GET_LAST_ASSISTANT_TEXT = 29;
+  PI_RPC_COMMAND_KIND_SET_SESSION_NAME = 30;
+  PI_RPC_COMMAND_KIND_GET_MESSAGES = 31;
+  PI_RPC_COMMAND_KIND_GET_COMMANDS = 32;
+}
+
+message PiRpcAcknowledgement {
+  string rpc_request_id = 1;
+  PiRpcCommandKind command = 2;
+  bool accepted = 3;
+  bool cancelled = 4;
+  ErrorInfo error = 5;
+}
+
+message PiSessionState {
+  string native_session_id = 1;
+  string native_session_name = 2;
+  string native_session_file_display = 3;
+  ModelKey model = 4;
+  string thinking_level = 5;
+  bool streaming = 6;
+  bool compacting = 7;
+  PiQueueMode steering_mode = 8;
+  PiQueueMode follow_up_mode = 9;
+  bool auto_compaction = 10;
+  bool auto_retry = 11;
+  uint64 message_count = 12;
+  uint64 pending_message_count = 13;
+  string active_leaf_id = 14;
+}
+
+enum PiMessageLifecycleKind {
+  PI_MESSAGE_LIFECYCLE_KIND_UNSPECIFIED = 0;
+  PI_MESSAGE_LIFECYCLE_KIND_AGENT_START = 1;
+  PI_MESSAGE_LIFECYCLE_KIND_TURN_START = 2;
+  PI_MESSAGE_LIFECYCLE_KIND_MESSAGE_START = 3;
+  PI_MESSAGE_LIFECYCLE_KIND_MESSAGE_UPDATE = 4;
+  PI_MESSAGE_LIFECYCLE_KIND_MESSAGE_END = 5;
+  PI_MESSAGE_LIFECYCLE_KIND_TURN_END = 6;
+  PI_MESSAGE_LIFECYCLE_KIND_AGENT_END = 7;
+}
+
+message PiMessageLifecycle {
+  PiMessageLifecycleKind kind = 1;
+  string native_message_id = 2;
+  string native_entry_id = 3;
+  string role = 4;
+  uint32 content_index = 5;
+  string parent_entry_id = 6;
+}
+
+enum PiBuiltInToolKind {
+  PI_BUILT_IN_TOOL_KIND_UNSPECIFIED = 0;
+  PI_BUILT_IN_TOOL_KIND_READ = 1;
+  PI_BUILT_IN_TOOL_KIND_WRITE = 2;
+  PI_BUILT_IN_TOOL_KIND_EDIT = 3;
+  PI_BUILT_IN_TOOL_KIND_BASH = 4;
+  PI_BUILT_IN_TOOL_KIND_CUSTOM = 5;
+  PI_BUILT_IN_TOOL_KIND_MCP_BRIDGE = 6;
+}
+
+message PiToolLifecycle {
+  string native_tool_call_id = 1;
+  string tool_name = 2;
+  PiBuiltInToolKind built_in_kind = 3;
+  PiToolPhase phase = 4;
+  uint32 content_index = 5;
+}
+
+enum PiToolPhase {
+  PI_TOOL_PHASE_UNSPECIFIED = 0;
+  PI_TOOL_PHASE_START = 1;
+  PI_TOOL_PHASE_UPDATE = 2;
+  PI_TOOL_PHASE_END = 3;
+}
+
+message PiBashUpdate {
+  string native_bash_id = 1;
+  string command_display = 2;
+  string stdout_delta = 3;
+  string stderr_delta = 4;
+  bool completed = 5;
+  int32 exit_code = 6;
+  bool excluded_from_context = 7;
+}
+
+message PiQueueUpdate {
+  repeated PiQueuedMessage steering = 1;
+  repeated PiQueuedMessage follow_up = 2;
+  PiQueueMode steering_mode = 3;
+  PiQueueMode follow_up_mode = 4;
+}
+
+message PiQueuedMessage {
+  string native_queue_id = 1;
+  string text_preview = 2;
+  uint32 image_count = 3;
+  google.protobuf.Timestamp queued_at = 4;
+}
+
+enum PiCompactionTrigger {
+  PI_COMPACTION_TRIGGER_UNSPECIFIED = 0;
+  PI_COMPACTION_TRIGGER_AUTOMATIC = 1;
+  PI_COMPACTION_TRIGGER_MANUAL = 2;
+  PI_COMPACTION_TRIGGER_BRANCH = 3;
+}
+
+enum PiCompactionState {
+  PI_COMPACTION_STATE_UNSPECIFIED = 0;
+  PI_COMPACTION_STATE_STARTED = 1;
+  PI_COMPACTION_STATE_RETRYING = 2;
+  PI_COMPACTION_STATE_COMPLETED = 3;
+  PI_COMPACTION_STATE_NO_OP = 4;
+  PI_COMPACTION_STATE_ABORTED = 5;
+  PI_COMPACTION_STATE_FAILED = 6;
+}
+
+message PiCompactionUpdate {
+  string compaction_id = 1;
+  PiCompactionTrigger trigger = 2;
+  PiCompactionState state = 3;
+  string boundary_entry_id = 4;
+  uint64 tokens_before = 5;
+  uint64 tokens_after = 6;
+  string summary_preview = 7;
+  ErrorInfo error = 8;
+  // Preserves Pi's exact trigger reason instead of collapsing threshold and overflow.
+  string reason = 9;
+  optional bool will_retry = 10;
+}
+
+enum PiRetryState {
+  PI_RETRY_STATE_UNSPECIFIED = 0;
+  PI_RETRY_STATE_WAITING = 1;
+  PI_RETRY_STATE_STARTED = 2;
+  PI_RETRY_STATE_SUCCEEDED = 3;
+  PI_RETRY_STATE_ABORTED = 4;
+  PI_RETRY_STATE_EXHAUSTED = 5;
+}
+
+message PiRetryUpdate {
+  PiRetryState state = 1;
+  uint32 attempt_number = 2;
+  google.protobuf.Timestamp retry_at = 3;
+  string reason = 4;
+  ErrorInfo error = 5;
+}
+
+message PiSessionIdentityUpdate {
+  string previous_native_session_id = 1;
+  string native_session_id = 2;
+  string native_session_name = 3;
+  string native_session_file_display = 4;
+  string active_leaf_id = 5;
+  PiSessionIdentityChangeKind change = 6;
+}
+
+enum PiSessionIdentityChangeKind {
+  PI_SESSION_IDENTITY_CHANGE_KIND_UNSPECIFIED = 0;
+  PI_SESSION_IDENTITY_CHANGE_KIND_CREATED = 1;
+  PI_SESSION_IDENTITY_CHANGE_KIND_RESUMED = 2;
+  PI_SESSION_IDENTITY_CHANGE_KIND_SWITCHED = 3;
+  PI_SESSION_IDENTITY_CHANGE_KIND_RENAMED = 4;
+  PI_SESSION_IDENTITY_CHANGE_KIND_FORKED = 5;
+  PI_SESSION_IDENTITY_CHANGE_KIND_CLONED = 6;
+  PI_SESSION_IDENTITY_CHANGE_KIND_BRANCH_NAVIGATED = 7;
+  PI_SESSION_IDENTITY_CHANGE_KIND_DELETED = 8;
+}
+
+message PiSessionTreeUpdate {
+  string native_session_id = 1;
+  string active_leaf_id = 2;
+  // Stack-safe preorder representation. Every node declares its direct child
+  // count in `child_count`.
+  repeated PiSessionTreeNode flat_nodes = 3;
+  uint32 root_count = 4;
+}
+
+message PiSessionTreeNode {
+  string entry_id = 1;
+  string parent_id = 2;
+  PiSessionEntryKind kind = 3;
+  string role = 4;
+  string text_preview = 5;
+  string branch_summary = 6;
+  google.protobuf.Timestamp created_at = 7;
+  bool active = 8;
+  uint32 child_count = 9;
+}
+
+enum PiSessionEntryKind {
+  PI_SESSION_ENTRY_KIND_UNSPECIFIED = 0;
+  PI_SESSION_ENTRY_KIND_SESSION = 1;
+  PI_SESSION_ENTRY_KIND_MESSAGE = 2;
+  PI_SESSION_ENTRY_KIND_MODEL_CHANGE = 3;
+  PI_SESSION_ENTRY_KIND_THINKING_LEVEL_CHANGE = 4;
+  PI_SESSION_ENTRY_KIND_COMPACTION = 5;
+  PI_SESSION_ENTRY_KIND_BRANCH_SUMMARY = 6;
+  PI_SESSION_ENTRY_KIND_CUSTOM_MESSAGE = 7;
+  PI_SESSION_ENTRY_KIND_LABEL = 8;
+}
+
+message PiCommandCatalogUpdate {
+  repeated PiSlashCommand commands = 1;
+}
+
+message PiSlashCommand {
+  string name = 1;
+  string description = 2;
+  PiCommandSource source = 3;
+  PiSourceInfo source_info = 4;
+}
+
+enum PiCommandSource {
+  PI_COMMAND_SOURCE_UNSPECIFIED = 0;
+  PI_COMMAND_SOURCE_EXTENSION = 1;
+  PI_COMMAND_SOURCE_PROMPT = 2;
+  PI_COMMAND_SOURCE_SKILL = 3;
+}
+
+message PiSourceInfo {
+  string resource_id = 1;
+  ResourceScope scope = 2;
+  string source_display = 3;
+  string package_name = 4;
+}
+
+message PiExtensionUiEffect {
+  string request_id = 1;
+  string extension_id = 2;
+  oneof effect {
+    PiExtensionNotify notify = 10;
+    PiExtensionStatus status = 11;
+    PiExtensionWidget widget = 12;
+    PiExtensionTitle title = 13;
+    PiExtensionEditorText editor_text = 14;
+  }
+}
+
+enum PiNotificationKind {
+  PI_NOTIFICATION_KIND_UNSPECIFIED = 0;
+  PI_NOTIFICATION_KIND_INFO = 1;
+  PI_NOTIFICATION_KIND_WARNING = 2;
+  PI_NOTIFICATION_KIND_ERROR = 3;
+}
+
+message PiExtensionNotify {
+  string message = 1;
+  PiNotificationKind kind = 2;
+}
+
+message PiExtensionStatus {
+  string status_key = 1;
+  optional string status_text = 2;
+}
+
+enum PiWidgetPlacement {
+  PI_WIDGET_PLACEMENT_UNSPECIFIED = 0;
+  PI_WIDGET_PLACEMENT_ABOVE_EDITOR = 1;
+  PI_WIDGET_PLACEMENT_BELOW_EDITOR = 2;
+}
+
+message PiExtensionWidget {
+  string widget_key = 1;
+  repeated string lines = 2;
+  PiWidgetPlacement placement = 3;
+  bool removed = 4;
+}
+
+message PiExtensionTitle {
+  string title = 1;
+}
+
+message PiExtensionEditorText {
+  string text = 1;
+}
+
+message PiResourceUpdate {
+  ManagedResource resource = 1;
+  PiResourceUpdateKind update_kind = 2;
+}
+
+enum PiResourceUpdateKind {
+  PI_RESOURCE_UPDATE_KIND_UNSPECIFIED = 0;
+  PI_RESOURCE_UPDATE_KIND_DISCOVERED = 1;
+  PI_RESOURCE_UPDATE_KIND_APPROVED = 2;
+  PI_RESOURCE_UPDATE_KIND_INSTALLED = 3;
+  PI_RESOURCE_UPDATE_KIND_UPDATED = 4;
+  PI_RESOURCE_UPDATE_KIND_ENABLED = 5;
+  PI_RESOURCE_UPDATE_KIND_DISABLED = 6;
+  PI_RESOURCE_UPDATE_KIND_LOADED = 7;
+  PI_RESOURCE_UPDATE_KIND_REMOVED = 8;
+  PI_RESOURCE_UPDATE_KIND_FAILED = 9;
+}
+
+message PiModelUpdate {
+  ModelKey previous_model = 1;
+  ModelKey model = 2;
+  string thinking_level = 3;
+  bool scoped_model = 4;
+  uint64 context_window_tokens = 5;
+}
+
+message PiDiagnosticMetadata {
+  PiRpcCommandKind command = 1;
+  string native_event_type = 2;
+  int32 process_exit_code = 3;
+  string sanitized_stderr_excerpt = 4;
+  uint64 jsonl_line_number = 5;
+  string parse_error = 6;
+}
+
+enum PiMessageRole {
+  PI_MESSAGE_ROLE_UNSPECIFIED = 0;
+  PI_MESSAGE_ROLE_USER = 1;
+  PI_MESSAGE_ROLE_ASSISTANT = 2;
+  PI_MESSAGE_ROLE_TOOL_RESULT = 3;
+  PI_MESSAGE_ROLE_CUSTOM = 4;
+}
+
+message PiNativeMessage {
+  string native_message_id = 1;
+  string native_entry_id = 2;
+  PiMessageRole role = 3;
+  repeated PiMessagePart parts = 4;
+  Usage usage = 5;
+  google.protobuf.Timestamp created_at = 6;
+}
+
+message PiMessagePart {
+  oneof content {
+    string text = 1;
+    PiThinkingContent thinking = 2;
+    ImageRef image = 3;
+    PiToolCallContent tool_call = 4;
+    PiToolResultContent tool_result = 5;
+  }
+}
+
+message PiThinkingContent {
+  string text = 1;
+  bool hidden = 2;
+}
+
+message PiToolCallContent {
+  string native_tool_call_id = 1;
+  string tool_name = 2;
+  repeated DisplayArgument arguments = 3;
+}
+
+message PiToolResultContent {
+  string native_tool_call_id = 1;
+  string tool_name = 2;
+  ToolResult result = 3;
+  bool error = 4;
+}
+
+message PiSessionEntry {
+  string entry_id = 1;
+  string parent_id = 2;
+  google.protobuf.Timestamp created_at = 3;
+  oneof payload {
+    PiNativeMessage message = 10;
+    PiModelChangeEntry model_change = 11;
+    PiThinkingLevelChangeEntry thinking_level_change = 12;
+    PiCompactionEntry compaction = 13;
+    PiBranchSummaryEntry branch_summary = 14;
+    PiCustomEntry custom = 15;
+  }
+}
+
+message PiModelChangeEntry {
+  ModelKey model = 1;
+}
+
+message PiThinkingLevelChangeEntry {
+  string thinking_level = 1;
+}
+
+message PiCompactionEntry {
+  string boundary_entry_id = 1;
+  string summary = 2;
+  uint64 tokens_before = 3;
+  uint64 tokens_after = 4;
+}
+
+message PiBranchSummaryEntry {
+  string branch_from_entry_id = 1;
+  string summary = 2;
+}
+
+message PiCustomEntry {
+  string custom_type = 1;
+  string text_preview = 2;
+  BlobRef sanitized_payload_artifact = 3;
+}
+
+message PiForkCandidate {
+  string entry_id = 1;
+  string text = 2;
+}

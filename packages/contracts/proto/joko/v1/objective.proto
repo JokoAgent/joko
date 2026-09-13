@@ -1,0 +1,124 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+import "joko/v1/common.proto";
+
+// One durable, autonomous continuation objective owned by a product Session.
+// The service owns dispatch and recovery; clients may only advance this state
+// through revision- and owner-generation-fenced mutations.
+message Objective {
+  string session_id = 1;
+  string text = 2;
+  ObjectiveStatus status = 3;
+  optional uint64 token_budget = 4;
+  optional uint32 maximum_turns = 5;
+  optional uint32 no_progress_turn_limit = 6;
+  uint32 turns_used = 7;
+  uint64 tokens_used = 8;
+  uint32 no_progress_turns = 9;
+  string last_reason = 10;
+  uint64 owner_generation = 11;
+  uint64 session_generation = 12;
+  optional string pending_run_id = 13;
+  optional string pending_queue_item_id = 14;
+  google.protobuf.Timestamp started_at = 15;
+  EntityVersion version = 16;
+}
+
+enum ObjectiveStatus {
+  OBJECTIVE_STATUS_UNSPECIFIED = 0;
+  OBJECTIVE_STATUS_ACTIVE = 1;
+  OBJECTIVE_STATUS_PAUSED = 2;
+  OBJECTIVE_STATUS_BLOCKED = 3;
+  OBJECTIVE_STATUS_COMPLETE = 4;
+  OBJECTIVE_STATUS_BUDGET_LIMITED = 5;
+  OBJECTIVE_STATUS_USAGE_LIMITED = 6;
+  // The Backend may have accepted the last continuation. Automatic replay is
+  // forbidden until the owner explicitly reconciles or replaces the state.
+  OBJECTIVE_STATUS_DISPATCH_UNKNOWN = 7;
+}
+
+message ObjectiveLimits {
+  optional uint64 token_budget = 1;
+  optional uint32 maximum_turns = 2;
+  optional uint32 no_progress_turn_limit = 3;
+}
+
+message GetObjectiveRequest {
+  string session_id = 1;
+}
+
+message GetObjectiveResponse {
+  optional Objective objective = 1;
+}
+
+message WatchObjectiveRequest {
+  string session_id = 1;
+  optional Revision after_revision = 2;
+}
+
+message WatchObjectiveResponse {
+  optional Objective objective = 1;
+  // True when the durable row was explicitly cleared.
+  bool cleared = 2;
+}
+
+message SetObjectiveRequest {
+  string request_id = 1;
+  string session_id = 2;
+  string text = 3;
+  ObjectiveLimits limits = 4;
+  optional uint64 expected_session_generation = 5;
+}
+
+message UpdateObjectiveRequest {
+  string request_id = 1;
+  string session_id = 2;
+  Revision expected_revision = 3;
+  uint64 expected_owner_generation = 4;
+  optional string text = 5;
+  oneof token_budget_update {
+    uint64 token_budget = 6;
+    bool clear_token_budget = 7;
+  }
+  oneof maximum_turns_update {
+    uint32 maximum_turns = 8;
+    bool clear_maximum_turns = 9;
+  }
+  oneof no_progress_turn_limit_update {
+    uint32 no_progress_turn_limit = 10;
+    bool clear_no_progress_turn_limit = 11;
+  }
+}
+
+message PauseObjectiveRequest {
+  string request_id = 1;
+  string session_id = 2;
+  Revision expected_revision = 3;
+  uint64 expected_owner_generation = 4;
+  string reason = 5;
+}
+
+message ResumeObjectiveRequest {
+  string request_id = 1;
+  string session_id = 2;
+  Revision expected_revision = 3;
+  uint64 expected_owner_generation = 4;
+}
+
+message ClearObjectiveRequest {
+  string request_id = 1;
+  string session_id = 2;
+  Revision expected_revision = 3;
+  uint64 expected_owner_generation = 4;
+}
+
+message ObjectiveMutationResponse {
+  Objective objective = 1;
+}
+
+message ClearObjectiveResponse {
+  bool cleared = 1;
+}

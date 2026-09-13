@@ -1,0 +1,376 @@
+.workspace-file-body {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--surface);
+  color: var(--text);
+}
+
+.workspace-file-body__state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+  color: var(--text-faint);
+  font-size: var(--text-13);
+  text-align: center;
+}
+
+.workspace-file-body__state.is-error { color: var(--red); }
+
+.workspace-file-body__truncated {
+  position: relative;
+  z-index: 3;
+  flex: 0 0 auto;
+  margin: 12px 30px 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 12px;
+  background: color-mix(in srgb, var(--surface-raised) 96%, transparent);
+  color: var(--text-soft);
+  box-shadow: var(--shadow-sm);
+  font-size: var(--text-11);
+}
+
+.workspace-file-body[data-file-kind="text"],
+.workspace-file-body[data-file-kind="markdown"],
+.workspace-file-body[data-file-kind="drawio"] {
+  display: flex;
+  flex-direction: column;
+}
+
+.workspace-file-body__text-stage,
+.workspace-file-body__source {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+}
+
+.workspace-file-body__text-stage {
+  height: auto;
+  flex: 1 1 auto;
+}
+
+.workspace-file-body__source {
+  z-index: 1;
+}
+
+.workspace-file-body > .workspace-document-search-bar {
+  position: absolute;
+  z-index: 8;
+  top: 14px;
+  right: 18px;
+}
+
+.workspace-file-body .workspace-file-editor-pane {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  margin-top: 0;
+  border-radius: 0;
+}
+
+.workspace-file-body .workspace-file-editor-pane__status {
+  top: 14px;
+  right: 18px;
+}
+
+.workspace-file-body__inline-empty {
+  width: 100%;
+  height: 100%;
+  min-height: 160px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: var(--text-faint);
+  font-size: var(--text-13);
+  text-align: center;
+}
+
+.workspace-file-body__inline-empty > svg { width: 28px; height: 28px; }
+
+.workspace-drawio-preview {
+  width: 100%;
+  height: 100%;
+  position: relative;
+  overflow: auto;
+  background: var(--surface);
+  color-scheme: light dark;
+}
+
+.workspace-drawio-preview__stage {
+  min-width: 0;
+  min-height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.workspace-drawio-preview__stage > div { max-width: 100%; }
+
+.workspace-drawio-preview__loading {
+  position: absolute;
+  right: 0;
+  bottom: 12px;
+  left: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  color: var(--text-faint);
+  font-size: var(--text-12);
+}
+
+.workspace-drawio-preview__fallback {
+  width: 100%;
+  height: 100%;
+  min-height: 180px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 20px;
+  padding: 32px;
+  color: var(--text);
+  text-align: center;
+}
+
+.workspace-drawio-preview__file-icon {
+  width: 64px;
+  height: 64px;
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: var(--surface-hover);
+  color: var(--text-faint);
+}
+
+.workspace-drawio-preview__file-icon > svg { width: 32px; height: 32px; }
+
+.workspace-drawio-preview__fallback-copy {
+  min-width: 0;
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+}
+
+.workspace-drawio-preview__fallback-copy > strong {
+  max-width: min(520px, 100%);
+  overflow: hidden;
+  font-size: var(--text-16);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-drawio-preview__metadata {
+  color: var(--text-faint);
+  font-size: var(--text-12);
+}
+
+.workspace-drawio-preview__fallback-copy > p {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: var(--text-13);
+}
+
+.workspace-drawio-preview__retry svg { width: 14px; height: 14px; }
+
+.workspace-file-body--media {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding: 24px 32px;
+}
+
+.workspace-file-body__media-stage {
+  width: 100%;
+  min-height: 0;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.workspace-file-body__image-open,
+.workspace-file-body__media-stage > video {
+  min-width: 0;
+  min-height: 0;
+  max-width: 100%;
+  max-height: 100%;
+}
+
+.workspace-file-body__image-open {
+  display: grid;
+  place-items: center;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  cursor: zoom-in;
+}
+
+.workspace-file-body__image-open:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.workspace-file-body__image-open > img,
+.workspace-file-body__media-stage > video {
+  min-width: 0;
+  min-height: 0;
+  max-width: 100%;
+  max-height: 100%;
+  display: block;
+  border-radius: 8px;
+  background: #ececea;
+  object-fit: contain;
+}
+
+[data-theme="dark"] .workspace-file-body__image-open > img { background: #2c2c2a; }
+.workspace-file-body__media-stage > video { background: #000; }
+
+.workspace-file-body__model-stage {
+  position: relative;
+  width: min(100%, 1024px);
+  height: min(100%, 768px);
+  min-height: 240px;
+}
+
+.workspace-file-body__model-open {
+  position: absolute;
+  z-index: 2;
+  top: 12px;
+  right: 12px;
+  width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgb(255 255 255 / .16);
+  border-radius: 999px;
+  padding: 0;
+  background: rgb(28 28 28 / .72);
+  color: rgb(255 255 255 / .9);
+  box-shadow: var(--shadow-sm);
+  backdrop-filter: blur(12px);
+}
+
+.workspace-file-body__model-open:hover { background: rgb(28 28 28 / .88); color: #fff; }
+.workspace-file-body__model-open:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.workspace-file-body__model-open svg { width: 15px; height: 15px; }
+
+.workspace-file-body__meta {
+  flex: 0 0 auto;
+  color: var(--text-faint);
+  font-size: var(--text-11);
+}
+
+.workspace-file-body__download {
+  min-height: 30px;
+  flex: 0 0 auto;
+}
+
+.workspace-file-body__download svg { width: 14px; height: 14px; }
+.workspace-file-body__download-error { color: var(--red); font-size: var(--text-11); }
+
+.workspace-file-body--pdf {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--surface-sunken);
+}
+
+.workspace-file-body__pdf-stage {
+  width: 100%;
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: auto;
+}
+
+.workspace-file-body__pdf-stage > .workspace-file-body__inline-empty { min-height: 100%; }
+
+.workspace-file-body__pdf-document {
+  position: relative;
+  min-width: 100%;
+  min-height: 100%;
+}
+
+.workspace-file-body__pdf-pages {
+  width: max-content;
+  min-width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 24px 16px;
+}
+
+.workspace-file-body__pdf-pages > canvas {
+  display: block;
+  flex: 0 0 auto;
+  border-radius: 2px;
+  background: #fff;
+  box-shadow: var(--shadow-sm);
+}
+
+.workspace-file-body__pdf-loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--text-faint);
+  font-size: var(--text-12);
+  pointer-events: none;
+}
+
+.workspace-file-body__pdf-footer {
+  min-width: 0;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  border-top: 1px solid var(--line);
+  padding: 10px 20px;
+  background: var(--surface);
+}
+
+.workspace-file-body--unsupported {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 20px;
+  padding: 32px;
+  text-align: center;
+}
+
+.workspace-file-body__file-icon {
+  width: 64px;
+  height: 64px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: var(--surface-hover);
+  color: var(--text-faint);
+}
+
+.workspace-file-body__file-icon svg { width: 32px; height: 32px; }
+.workspace-file-body--unsupported > div { display: grid; justify-items: center; gap: 6px; }
+.workspace-file-body--unsupported strong { font-size: var(--text-16); font-weight: 600; }
+.workspace-file-body--unsupported p { margin: 0; color: var(--text-faint); font-size: var(--text-13); }

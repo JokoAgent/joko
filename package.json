@@ -1,0 +1,45 @@
+{
+  "name": "joko",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.22.0",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "build": "pnpm -r --if-present build",
+    "check": "pnpm codegen:check && pnpm boundaries && pnpm -r --if-present build && pnpm -r --if-present typecheck",
+    "test": "pnpm -r --workspace-concurrency=1 --if-present test",
+    "test:ci": "pnpm -r --workspace-concurrency=1 --no-bail --if-present test",
+    "test:e2e": "pnpm --filter @joko/e2e test",
+    "test:soak": "pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts src/soak-fault.e2e.test.ts",
+    "stage:desktop:orchestrator-runtime": "node apps/desktop/scripts/clean-orchestrator-runtime-inputs.mjs && pnpm --filter-prod @joko/orchestrator... build && pnpm --filter @joko/desktop build:runtime-stager && pnpm --filter @joko/desktop stage:orchestrator-runtime",
+    "build:desktop:staged": "pnpm --filter @joko/web build && pnpm stage:desktop:orchestrator-runtime && pnpm --filter @joko/desktop build",
+    "build:desktop:unpacked": "pnpm build:desktop:staged && pnpm --filter @joko/desktop package:dir",
+    "build:desktop:distribution": "pnpm build:desktop:staged && pnpm --filter @joko/desktop package:artifacts",
+    "test:desktop:host": "pnpm --filter @joko/desktop test:electron-host",
+    "test:desktop:artifact": "pnpm --filter @joko/desktop test:packaged-artifact",
+    "test:backend:real:probe": "pnpm test:backend:real:probe:codex && pnpm test:backend:real:probe:claude-code",
+    "test:backend:real:probe:codex": "pnpm --filter @joko/adapter-codex test:real:probe",
+    "test:backend:real:probe:claude-code": "pnpm --filter @joko/adapter-claude-code test:real:probe",
+    "test:provider:real:paid-smoke:pi": "pnpm --filter @joko/adapter-pi exec vitest run src/real-provider.opt-in.test.ts",
+    "test:provider:real:paid-smoke:claude-code": "pnpm --filter @joko/adapter-claude-code test:real:paid-smoke",
+    "codegen": "buf generate",
+    "codegen:check": "buf lint && vitest run scripts/check-codegen.test.ts && tsx scripts/check-codegen.ts",
+    "boundaries": "vitest run scripts/check-boundaries.test.ts scripts/check-source-policy.test.ts && tsx scripts/check-boundaries.ts && tsx scripts/check-source-policy.ts",
+    "dev": "pnpm --filter @joko/orchestrator dev",
+    "dev:web": "pnpm --filter @joko/web dev",
+    "preview:task-status": "pnpm --filter @joko/desktop build && pnpm --filter @joko/desktop preview:task-status",
+    "prepare:desktop:dev": "pnpm --filter @joko/web build && pnpm --filter-prod @joko/orchestrator... build && pnpm --filter @joko/desktop build",
+    "dev:desktop": "pnpm --filter @joko/desktop dev"
+  },
+  "devDependencies": {
+    "@bufbuild/buf": "1.72.0",
+    "@bufbuild/protoc-gen-es": "2.14.0",
+    "@types/node": "24.12.4",
+    "tsx": "4.22.1",
+    "typescript": "5.9.3",
+    "vitest": "4.1.9"
+  }
+}

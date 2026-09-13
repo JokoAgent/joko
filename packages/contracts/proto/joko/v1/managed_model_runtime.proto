@@ -1,0 +1,242 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "joko/v1/common.proto";
+
+enum ManagedModelRuntimeState {
+  MANAGED_MODEL_RUNTIME_STATE_UNSPECIFIED = 0;
+  MANAGED_MODEL_RUNTIME_STATE_ABSENT = 1;
+  MANAGED_MODEL_RUNTIME_STATE_STOPPED = 2;
+  MANAGED_MODEL_RUNTIME_STATE_STARTING = 3;
+  MANAGED_MODEL_RUNTIME_STATE_READY = 4;
+  MANAGED_MODEL_RUNTIME_STATE_PORT_CONFLICT = 5;
+  MANAGED_MODEL_RUNTIME_STATE_INSTALLING = 6;
+  MANAGED_MODEL_RUNTIME_STATE_ERROR = 7;
+}
+
+enum ManagedModelRuntimeSource {
+  MANAGED_MODEL_RUNTIME_SOURCE_UNSPECIFIED = 0;
+  MANAGED_MODEL_RUNTIME_SOURCE_RUNNING = 1;
+  MANAGED_MODEL_RUNTIME_SOURCE_APPLICATION = 2;
+  MANAGED_MODEL_RUNTIME_SOURCE_CLI = 3;
+  MANAGED_MODEL_RUNTIME_SOURCE_MANAGED_SIDECAR = 4;
+  MANAGED_MODEL_RUNTIME_SOURCE_NONE = 5;
+}
+
+enum ManagedModelRuntimeTransferKind {
+  MANAGED_MODEL_RUNTIME_TRANSFER_KIND_UNSPECIFIED = 0;
+  MANAGED_MODEL_RUNTIME_TRANSFER_KIND_RUNTIME_INSTALL = 1;
+  MANAGED_MODEL_RUNTIME_TRANSFER_KIND_MODEL_PULL = 2;
+}
+
+enum ManagedModelRuntimeTransferPhase {
+  MANAGED_MODEL_RUNTIME_TRANSFER_PHASE_UNSPECIFIED = 0;
+  MANAGED_MODEL_RUNTIME_TRANSFER_PHASE_STARTING = 1;
+  MANAGED_MODEL_RUNTIME_TRANSFER_PHASE_RESOLVING = 2;
+  MANAGED_MODEL_RUNTIME_TRANSFER_PHASE_MANIFEST = 3;
+  MANAGED_MODEL_RUNTIME_TRANSFER_PHASE_DOWNLOADING = 4;
+  MANAGED_MODEL_RUNTIME_TRANSFER_PHASE_VERIFYING = 5;
+  MANAGED_MODEL_RUNTIME_TRANSFER_PHASE_EXTRACTING = 6;
+  MANAGED_MODEL_RUNTIME_TRANSFER_PHASE_WRITING = 7;
+  MANAGED_MODEL_RUNTIME_TRANSFER_PHASE_PROMOTING = 8;
+  MANAGED_MODEL_RUNTIME_TRANSFER_PHASE_SUCCESS = 9;
+  MANAGED_MODEL_RUNTIME_TRANSFER_PHASE_PAUSED = 10;
+  MANAGED_MODEL_RUNTIME_TRANSFER_PHASE_CANCELLED = 11;
+  MANAGED_MODEL_RUNTIME_TRANSFER_PHASE_ERROR = 12;
+}
+
+enum ManagedModelRuntimeResourceState {
+  MANAGED_MODEL_RUNTIME_RESOURCE_STATE_UNSPECIFIED = 0;
+  MANAGED_MODEL_RUNTIME_RESOURCE_STATE_SUFFICIENT = 1;
+  MANAGED_MODEL_RUNTIME_RESOURCE_STATE_CONSTRAINED = 2;
+  MANAGED_MODEL_RUNTIME_RESOURCE_STATE_INSUFFICIENT = 3;
+  MANAGED_MODEL_RUNTIME_RESOURCE_STATE_UNKNOWN = 4;
+}
+
+enum ManagedModelRuntimeErrorCode {
+  MANAGED_MODEL_RUNTIME_ERROR_CODE_UNSPECIFIED = 0;
+  MANAGED_MODEL_RUNTIME_ERROR_CODE_OWNER_CHANGED = 1;
+  MANAGED_MODEL_RUNTIME_ERROR_CODE_RUNTIME_UNREACHABLE = 2;
+  MANAGED_MODEL_RUNTIME_ERROR_CODE_PORT_CONFLICT = 3;
+  MANAGED_MODEL_RUNTIME_ERROR_CODE_UNSUPPORTED_PLATFORM = 4;
+  MANAGED_MODEL_RUNTIME_ERROR_CODE_INSTALL_BUSY = 5;
+  MANAGED_MODEL_RUNTIME_ERROR_CODE_PULL_BUSY = 6;
+  MANAGED_MODEL_RUNTIME_ERROR_CODE_MODEL_INVALID = 7;
+  MANAGED_MODEL_RUNTIME_ERROR_CODE_MODEL_NOT_FOUND = 8;
+  MANAGED_MODEL_RUNTIME_ERROR_CODE_MODEL_UNAUTHORIZED = 9;
+  MANAGED_MODEL_RUNTIME_ERROR_CODE_MODEL_INCOMPATIBLE = 10;
+  MANAGED_MODEL_RUNTIME_ERROR_CODE_DISK_SPACE_LOW = 11;
+  MANAGED_MODEL_RUNTIME_ERROR_CODE_DOWNLOAD_REJECTED = 12;
+  MANAGED_MODEL_RUNTIME_ERROR_CODE_DOWNLOAD_TOO_LARGE = 13;
+  MANAGED_MODEL_RUNTIME_ERROR_CODE_DOWNLOAD_TIMEOUT = 14;
+  MANAGED_MODEL_RUNTIME_ERROR_CODE_CHECKSUM_MISMATCH = 15;
+  MANAGED_MODEL_RUNTIME_ERROR_CODE_ARCHIVE_REJECTED = 16;
+  MANAGED_MODEL_RUNTIME_ERROR_CODE_START_FAILED = 17;
+  MANAGED_MODEL_RUNTIME_ERROR_CODE_OPERATION_CANCELLED = 18;
+  MANAGED_MODEL_RUNTIME_ERROR_CODE_RUNTIME_ERROR = 19;
+}
+
+message ManagedModelRuntimeCapabilities {
+  bool can_install = 1;
+  bool can_cancel_install = 2;
+  bool can_start = 3;
+  bool can_list_models = 4;
+  bool can_pull_models = 5;
+  bool can_delete_models = 6;
+  bool can_pause_pulls = 7;
+  bool can_resume_pulls = 8;
+  bool can_cancel_pulls = 9;
+  bool supports_custom_models = 10;
+  bool supports_curated_catalog = 11;
+  bool supports_model_preflight = 12;
+}
+
+message ManagedModelRuntimePreflight {
+  bool allowed = 1;
+  ManagedModelRuntimeResourceState memory = 2;
+  ManagedModelRuntimeResourceState disk = 3;
+  uint64 required_disk_bytes = 4;
+  ManagedModelRuntimeErrorCode error_code = 5;
+}
+
+message ManagedModelRuntimeModel {
+  string model_name = 1;
+  string display_name = 2;
+  optional uint64 size_bytes = 3;
+  optional uint64 context_window_tokens = 4;
+  bool supports_tools = 5;
+  bool supports_images = 6;
+  string required_runtime_version = 7;
+}
+
+message ManagedModelRuntimeCatalogModel {
+  string catalog_id = 1;
+  string model_name = 2;
+  string display_name = 3;
+  uint64 size_bytes = 4;
+  uint32 minimum_memory_gb = 5;
+  bool platform_limited = 6;
+  bool recommended = 7;
+  ManagedModelRuntimePreflight preflight = 8;
+}
+
+message ManagedModelRuntimeTransfer {
+  ManagedModelRuntimeTransferKind kind = 1;
+  string model_name = 2;
+  ManagedModelRuntimeTransferPhase phase = 3;
+  optional uint64 completed_bytes = 4;
+  optional uint64 total_bytes = 5;
+  optional uint32 percent = 6;
+  optional uint64 bytes_per_second = 7;
+  bool done = 8;
+  ManagedModelRuntimeErrorCode error_code = 9;
+}
+
+message ManagedModelRuntime {
+  string runtime_id = 1;
+  string display_name = 2;
+  ManagedModelRuntimeState state = 3;
+  ManagedModelRuntimeSource source = 4;
+  string version = 5;
+  ManagedModelRuntimeCapabilities capabilities = 6;
+  ManagedModelRuntimePreflight install_preflight = 7;
+  repeated ManagedModelRuntimeModel installed_models = 8;
+  repeated ManagedModelRuntimeCatalogModel catalog = 9;
+  repeated ManagedModelRuntimeTransfer transfers = 10;
+  ManagedModelRuntimeErrorCode error_code = 11;
+  string error_message = 12;
+  EntityVersion entity_version = 13;
+}
+
+message ListManagedModelRuntimesRequest {}
+
+message ListManagedModelRuntimesResponse {
+  repeated ManagedModelRuntime runtimes = 1;
+}
+
+message GetManagedModelRuntimeRequest {
+  string runtime_id = 1;
+}
+
+message GetManagedModelRuntimeResponse {
+  ManagedModelRuntime runtime = 1;
+}
+
+message StartManagedModelRuntimeRequest {
+  string runtime_id = 1;
+}
+
+message StartManagedModelRuntimeResponse {
+  ManagedModelRuntime runtime = 1;
+}
+
+message InstallManagedModelRuntimeRequest {
+  string runtime_id = 1;
+}
+
+message InstallManagedModelRuntimeResponse {
+  ManagedModelRuntime runtime = 1;
+}
+
+message CancelManagedModelRuntimeInstallRequest {
+  string runtime_id = 1;
+}
+
+message CancelManagedModelRuntimeInstallResponse {
+  ManagedModelRuntime runtime = 1;
+}
+
+message PullManagedModelRequest {
+  string runtime_id = 1;
+  string model_name = 2;
+}
+
+message PullManagedModelResponse {
+  ManagedModelRuntime runtime = 1;
+}
+
+message PauseManagedModelPullRequest {
+  string runtime_id = 1;
+  string model_name = 2;
+}
+
+message PauseManagedModelPullResponse {
+  ManagedModelRuntime runtime = 1;
+}
+
+message ResumeManagedModelPullRequest {
+  string runtime_id = 1;
+  string model_name = 2;
+}
+
+message ResumeManagedModelPullResponse {
+  ManagedModelRuntime runtime = 1;
+}
+
+message CancelManagedModelPullRequest {
+  string runtime_id = 1;
+  string model_name = 2;
+}
+
+message CancelManagedModelPullResponse {
+  ManagedModelRuntime runtime = 1;
+}
+
+message DeleteManagedModelRequest {
+  string runtime_id = 1;
+  string model_name = 2;
+}
+
+message DeleteManagedModelResponse {
+  ManagedModelRuntime runtime = 1;
+}
+
+message GetManagedModelPreflightRequest {
+  string runtime_id = 1;
+  string catalog_id = 2;
+}
+
+message GetManagedModelPreflightResponse {
+  ManagedModelRuntimePreflight preflight = 1;
+}

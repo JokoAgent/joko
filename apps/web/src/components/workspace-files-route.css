@@ -1,0 +1,233 @@
+.workspace-files-shell-sidebar {
+  grid-column: 1;
+  min-width: 0;
+  border-right-color: var(--line);
+}
+
+.workspace-files-shell-main {
+  grid-column: 2;
+  min-width: 0;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+.workspace-files-sidebar.workspace-files-shell-sidebar__body {
+  height: auto;
+  flex: 1 1 auto;
+}
+
+.workspace-files-shell-rail {
+  gap: 8px;
+}
+
+.workspace-files-route {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  overflow: hidden;
+  background: var(--bg);
+  outline: none;
+}
+
+.workspace-files-route.is-resizing {
+  cursor: col-resize;
+  user-select: none;
+}
+
+.workspace-files-route__document {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  position: relative;
+  flex: 1 1 auto;
+  flex-direction: column;
+  overflow: hidden;
+  border-right: 1px solid var(--line);
+  background: var(--bg);
+  contain: layout paint style;
+}
+
+.workspace-files-route__body {
+  min-width: 0;
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+.workspace-files-route__interaction-slot {
+  width: 100%;
+  max-width: 914px;
+  flex: 0 0 auto;
+  margin-inline: auto;
+  padding: 12px 16px;
+}
+
+.workspace-files-route__interaction-slot:empty {
+  display: none;
+}
+
+.workspace-files-route__interaction-slot > .interaction-takeover {
+  border-top: 0;
+  padding: 0;
+  background: transparent;
+}
+
+.workspace-files-route__interaction-slot > .interaction-takeover-minimized {
+  width: 100%;
+  margin: 0;
+}
+
+.workspace-files-route__separator {
+  width: 4px;
+  height: 100%;
+  position: absolute;
+  z-index: 10;
+  inset: 0 0 0 auto;
+  cursor: col-resize;
+  touch-action: none;
+  outline: 0;
+}
+
+.workspace-files-route__separator > span {
+  width: 1px;
+  position: absolute;
+  inset: 0 0 0 auto;
+  background: transparent;
+  transition: background 150ms ease;
+}
+
+.workspace-files-route__separator:hover > span,
+.workspace-files-route__separator:focus-visible > span,
+.workspace-files-route.is-resizing .workspace-files-route__separator > span {
+  background: var(--accent-edge);
+}
+
+.workspace-files-route__chat {
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  overflow: hidden;
+  overscroll-behavior: contain;
+  outline: none;
+  background: var(--surface);
+  contain: layout paint style;
+  transition: width 250ms cubic-bezier(.4, 0, .2, 1);
+}
+
+.workspace-files-route__chat.is-dragging {
+  transition: none;
+}
+
+.workspace-files-route__chat-pane {
+  min-width: 0;
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.workspace-files-route__chat-pane > * {
+  height: 100%;
+  min-height: 0;
+}
+
+.workspace-files-route__chat-scrim {
+  display: none;
+}
+
+/* Session tabs already name the active task in the Files rail. The explicit
+   presentation keeps the remaining conversation and composer dense even if
+   the user widens the rail beyond the automatic compact breakpoint. */
+.session-pane--files-rail .timeline__virtual {
+  width: min(calc(100% - 40px), 914px);
+}
+
+.session-pane--files-rail .composer-region {
+  padding-right: 10px;
+  padding-bottom: 12px;
+  padding-left: 10px;
+}
+
+.session-pane--files-rail .composer__controls .control-chip {
+  display: none;
+}
+
+.session-pane--files-rail .composer__controls .control-toggle {
+  width: 30px;
+  justify-content: center;
+  padding-inline: 0;
+  font-size: 0;
+}
+
+.session-pane--files-rail .composer__controls .control-select .select-control {
+  max-width: 112px;
+}
+
+.session-pane--files-rail .composer__controls .control-select--effort .select-control {
+  max-width: 72px;
+}
+
+.interaction-files-rail-placeholder {
+  width: min(calc(100% - 20px), 914px);
+  margin: 0 auto 12px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 12px;
+  padding: 12px 16px;
+  background: var(--surface);
+  color: var(--text-faint);
+  font-size: var(--text-12);
+  line-height: 1.4;
+  text-align: center;
+}
+
+.workspace-files-leave-dialog .modal__actions {
+  margin-top: 0;
+}
+
+@media (max-width: 980px) {
+  .workspace-files-route {
+    position: relative;
+  }
+
+  .workspace-files-route__separator {
+    display: none;
+  }
+
+  .workspace-files-route__chat-scrim {
+    display: block;
+    position: absolute;
+    z-index: 60;
+    inset: 0;
+    border: 0;
+    background: rgb(0 0 0 / .28);
+    backdrop-filter: blur(1px);
+    -webkit-app-region: no-drag;
+  }
+
+  .workspace-files-route__chat {
+    max-width: min(420px, calc(100% - 42px));
+    position: absolute;
+    z-index: 70;
+    inset: 0 0 0 auto;
+    box-shadow: var(--shadow-lg);
+  }
+}
+
+@media (max-width: 640px) {
+  .workspace-files-route__chat {
+    max-width: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .workspace-files-route__chat,
+  .workspace-files-route__separator > span {
+    transition: none;
+  }
+}
