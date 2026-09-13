@@ -351,6 +351,7 @@ export class RemoteHostRegistry {
     readonly leaseGeneration: number;
     readonly lease: RemoteSshTransportLease;
     readonly assertCurrent: () => void;
+    readonly assertForwardingCurrent: () => void;
   }> {
     const { host, lease } = await this.transports(targetId, id, signal);
     const managed = this.#controllers.get(controllerKey(targetId, id));
@@ -367,8 +368,15 @@ export class RemoteHostRegistry {
         throw new RemoteSshError("CONNECTION_FAILED", "The SSH process-stream capability is no longer active.", false);
       }
     };
+    const assertForwardingCurrent = (): void => {
+      assertCurrent();
+      const current = managed.controller.transports(managed.scope);
+      if (!current.capabilities.tcpForwarding || current.forwarding === undefined || current.forwarding !== lease.forwarding) {
+        throw new RemoteSshError("CONNECTION_FAILED", "The SSH reverse-forwarding capability is no longer active.", false);
+      }
+    };
     assertCurrent();
-    return Object.freeze({ host, hostRevision: host.revision, leaseGeneration, lease, assertCurrent });
+    return Object.freeze({ host, hostRevision: host.revision, leaseGeneration, lease, assertCurrent, assertForwardingCurrent });
   }
 
   async disconnect(targetId: string, id: string, expectedRevision: bigint): Promise<RemoteHostRecord> {

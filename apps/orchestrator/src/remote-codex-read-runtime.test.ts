@@ -6,12 +6,14 @@ import type {
   RemoteProcessHandle,
   RemoteProcessStartRequest,
   RemoteProcessTransportPort,
+  RemoteForwardingTransportPort,
   RemoteSshTransportLease
 } from "@joko/remote-ssh";
 import type { RemoteHostRecord, StoredTarget } from "@joko/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RemoteCodexRuntimeResolver } from "./remote-codex-read-runtime.js";
 import type { RemoteHostRegistry } from "./remote-host-registry.js";
+import type { RemoteCodexMcpBridgeManager } from "./remote-codex-mcp-bridge.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 
@@ -111,6 +113,31 @@ describe("RemoteCodexRuntimeResolver", () => {
     })).rejects.toMatchObject({ stateMayHaveChanged: true });
     expect(disconnected.processes.clientMessages.filter((message) => message.method === "turn/start")).toHaveLength(1);
   });
+
+  it("opens and retires MCP routes through the forwarding capability captured with the app-server process", async () => {
+    const released = vi.fn(async () => undefined);
+    const shutdown = vi.fn(async () => undefined);
+    const open = vi.fn(async (authority, input) => {
+      authority.assertCurrent();
+      authority.assertForwardingCurrent();
+      expect(authority.forwarding).toBeDefined();
+      expect(input).toMatchObject({ sessionId: "session-one", targetId: "target-codex", generation: 2, threadId: "thread-one" });
+      return { routes: [], assertCurrent: authority.assertCurrent, release: released };
+    });
+    const fixture = createFixture({ mcpBridge: { open, shutdown } });
+    cleanups.push(() => fixture.resolver.forceShutdown());
+    const runtime = await fixture.resolver.resolve(fixture.target);
+    const bridge = await runtime.openMcpBridge!({
+      sessionId: "session-one", targetId: fixture.target.id, generation: 2, threadId: "thread-one",
+      assertSessionCurrent: () => undefined,
+      beginToolCall: () => { throw new Error("No call expected."); }
+    });
+    expect(open).toHaveBeenCalledOnce();
+    fixture.authorityCurrent = false;
+    expect(() => bridge.assertCurrent()).toThrow("SSH authority changed");
+    await fixture.resolver.forceShutdown();
+    expect(shutdown).toHaveBeenCalledOnce();
+  });
 });
 
 interface FixtureOptions {
@@ -118,6 +145,7 @@ interface FixtureOptions {
   readonly probeVersion?: string;
   readonly stderr?: string;
   readonly disconnectOnMethod?: string;
+  readonly mcpBridge?: Pick<RemoteCodexMcpBridgeManager, "open" | "shutdown">;
 }
 
 function createFixture(options: FixtureOptions) {
@@ -146,6 +174,10 @@ function createFixture(options: FixtureOptions) {
     revision: 7n
   };
   const processes = new FakeRemoteProcesses(options);
+  const forwarding: RemoteForwardingTransportPort = {
+    open: async () => { throw new Error("Unexpected forwarding stream."); },
+    listen: async () => { throw new Error("Unexpected reverse-forward listener."); }
+  };
   const lease: RemoteSshTransportLease = {
     capabilities: {
       commandExecution: true,
@@ -154,7 +186,8 @@ function createFixture(options: FixtureOptions) {
       fileTransfer: true,
       tcpForwarding: true
     },
-    processes
+    processes,
+    forwarding
   };
   const fixture = {
     target,
@@ -175,11 +208,13 @@ function createFixture(options: FixtureOptions) {
     hostRevision: host.revision,
     leaseGeneration: 3,
     lease,
-    assertCurrent: () => { if (!fixture.authorityCurrent) throw new Error("SSH authority changed"); }
+    assertCurrent: () => { if (!fixture.authorityCurrent) throw new Error("SSH authority changed"); },
+    assertForwardingCurrent: () => { if (!fixture.authorityCurrent) throw new Error("SSH forwarding authority changed"); }
   }));
   const resolver = new RemoteCodexRuntimeResolver({
     store: { getTarget: () => fixture.stored },
-    registry: { captureProcessAuthority: fixture.capture } as unknown as Pick<RemoteHostRegistry, "captureProcessAuthority">
+    registry: { captureProcessAuthority: fixture.capture } as unknown as Pick<RemoteHostRegistry, "captureProcessAuthority">,
+    ...(options.mcpBridge === undefined ? {} : { mcpBridge: options.mcpBridge })
   });
   return Object.assign(fixture, { resolver });
 }

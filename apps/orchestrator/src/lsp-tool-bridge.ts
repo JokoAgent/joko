@@ -37,7 +37,8 @@ export function resolveAuthenticatedLspTarget(
   }
   return {
     workspaceRoot: session.worktree?.path ?? target.workspaceRoot,
-    trusted: target.trusted
+    trusted: target.trusted,
+    ...(target.remoteWorkspace === undefined ? {} : { remote: true })
   };
 }
 
@@ -127,6 +128,7 @@ const TOOLS: readonly McpToolDescriptor[] = Object.freeze([
 export interface AuthenticatedLspTarget {
   readonly workspaceRoot: string;
   readonly trusted: boolean;
+  readonly remote?: boolean;
 }
 
 /** The snapshot check is intentionally separate from the authenticated call
@@ -189,6 +191,7 @@ export class LspToolBridgeProvider implements BridgeToolProvider {
       if (!this.#isUserEnabled()) return false;
       const target = this.#targetResolver.resolveSnapshot(targetId);
       return target.trusted === true
+        && target.remote !== true
         && typeof target.workspaceRoot === "string"
         && this.#detectProject(target.workspaceRoot);
     } catch {
@@ -209,7 +212,7 @@ export class LspToolBridgeProvider implements BridgeToolProvider {
       const parsed = parseArguments(name, arguments_);
       const target = await this.#targetResolver.resolveAuthenticated(context);
       if (target === null || typeof target !== "object" || target.trusted !== true
-        || typeof target.workspaceRoot !== "string") {
+        || target.remote === true || typeof target.workspaceRoot !== "string") {
         throw new LspToolError("WORKSPACE_UNSAFE", "Language tools are available only for a trusted target.");
       }
       const request = requestFor(name, parsed, target.workspaceRoot);

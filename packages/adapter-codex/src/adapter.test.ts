@@ -18,7 +18,13 @@ import type {
 } from "@joko/core";
 import { CAPABILITIES } from "@joko/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { CodexBackendAdapter, CODEX_MANAGED_PROVIDER_SUPPORT, type CodexAdapterOptions } from "./adapter.js";
+import {
+  CodexBackendAdapter,
+  CODEX_MANAGED_PROVIDER_SUPPORT,
+  type CodexAdapterOptions,
+  type CodexRemoteMcpOpenInput,
+  type CodexRemoteRuntime
+} from "./adapter.js";
 import { AppServerHost } from "./host.js";
 import { TransportFault } from "./errors.js";
 import type { JsonObject } from "./protocol.js";
@@ -1002,6 +1008,132 @@ describe("CodexBackendAdapter", () => {
     ]));
     expect(setup.localFake.transport).toBeUndefined();
     expect(setup.resolveRemote).toHaveBeenCalled();
+  });
+
+  it("isolates remote MCP config and fences calls to the active native thread without replacing a busy runtime", async () => {
+    let bridgeGeneration = 1;
+    const opened: CodexRemoteMcpOpenInput[] = [];
+    const released: number[] = [];
+    const setup = await createRemoteSetup({
+      openMcpBridge: async (input) => {
+        const capturedGeneration = bridgeGeneration;
+        let retired = false;
+        opened.push(input);
+        return {
+          routes: [{
+            serverId: "tools",
+            name: `joko_tools_generation_${capturedGeneration}`,
+            url: `http://127.0.0.1:4100/private-${capturedGeneration}`
+          }],
+          assertCurrent: () => {
+            if (retired || bridgeGeneration !== capturedGeneration) throw new Error("bridge changed");
+            input.assertSessionCurrent();
+          },
+          release: async () => {
+            if (retired) return;
+            retired = true;
+            released.push(capturedGeneration);
+          }
+        };
+      }
+    });
+    setup.remoteFake.reviewConfig = {
+      mcp_servers: { docs: { command: "docs-server" } },
+      plugins: { "plugin@remote": { mcp_servers: { plugin_docs: { url: "https://example.invalid/mcp" } } } }
+    };
+    setup.remoteFake.reviewMcpStatuses.push(
+      { name: "docs", authStatus: "unsupported", resourceTemplates: [], resources: [], tools: {} },
+      { name: "plugin_docs", authStatus: "unsupported", resourceTemplates: [], resources: [], tools: {} },
+      { name: "codex_apps", authStatus: "unsupported", resourceTemplates: [], resources: [], tools: {} }
+    );
+    const threadId = setup.remoteFake.seedThread("/srv/joko-project");
+    const candidate = (await setup.adapter.listNativeSessions(setup.target))[0]!;
+    const binding = await setup.adapter.resolveNativeSessionReference(candidate.nativeReference, setup.target, 1);
+    const bound = context(setup.target, [], { binding, backendInstanceGeneration: 7 });
+    await setup.adapter.resumeSession(binding, bound);
+
+    const resume = setup.remoteFake.transport!.requests.find((request) => request.method === "thread/resume")!;
+    expect(resume.params).toMatchObject({
+      config: {
+        "features.apps": false,
+        "features.enable_mcp_apps": false,
+        "features.remote_plugin": false,
+        "mcp_servers.docs.enabled": false,
+        "plugins.\"plugin@remote\".mcp_servers.plugin_docs.enabled": false,
+        "mcp_servers.joko_tools_generation_1.enabled": true,
+        "mcp_servers.joko_tools_generation_1.url": "http://127.0.0.1:4100/private-1"
+      }
+    });
+    expect(JSON.stringify(resume.params)).not.toContain("docs-server");
+    expect(JSON.stringify(resume.params)).not.toContain("example.invalid");
+
+    await setup.adapter.setPermissionMode("auto", bound);
+    expect(setup.remoteFake.transport!.requests.findLast((request) => request.method === "thread/resume")?.params)
+      .toMatchObject({ config: expect.objectContaining({
+        "mcp_servers.docs.enabled": false,
+        "mcp_servers.joko_tools_generation_1.url": "http://127.0.0.1:4100/private-1"
+      }) });
+
+    await setup.adapter.send(prompt("use a remote tool"), context(setup.target, [], {
+      binding,
+      backendInstanceGeneration: 7,
+      operationId: "remote-mcp-turn"
+    }));
+    const call = opened[0]!.beginToolCall(threadId);
+    expect(() => call.assertCurrent()).not.toThrow();
+    expect(() => opened[0]!.beginToolCall("unowned-native-thread")).toThrow();
+
+    bridgeGeneration = 2;
+    const resumeCountWhileBusy = setup.remoteFake.transport!.requests.filter((request) => request.method === "thread/resume").length;
+    await setup.adapter.setName("Busy route stays attached", bound);
+    expect(opened).toHaveLength(1);
+    expect(setup.remoteFake.transport!.requests.filter((request) => request.method === "thread/resume"))
+      .toHaveLength(resumeCountWhileBusy);
+    expect(() => call.assertCurrent()).toThrow();
+
+    await setup.remoteFake.completeTurn(threadId);
+    expect(call.signal.aborted).toBe(true);
+    call.release();
+    await setup.adapter.send(prompt("replace at the idle boundary"), context(setup.target, [], {
+      binding,
+      backendInstanceGeneration: 7,
+      operationId: "remote-mcp-next-turn"
+    }));
+    expect(opened).toHaveLength(2);
+    expect(released).toContain(1);
+    expect(setup.remoteFake.transport!.requests.findLast((request) => request.method === "thread/resume")?.params)
+      .toMatchObject({ config: expect.objectContaining({
+        "mcp_servers.joko_tools_generation_2.url": "http://127.0.0.1:4100/private-2"
+      }) });
+    const childThreadId = "remote-owned-child";
+    await setup.remoteFake.transport!.emitNotification("thread/started", {
+      thread: { id: childThreadId, parentThreadId: threadId, agentRole: "worker" }
+    });
+    await setup.remoteFake.transport!.emitNotification("turn/started", {
+      threadId: childThreadId,
+      turn: { id: "remote-child-turn", status: "inProgress", items: [], error: null }
+    });
+    await setup.remoteFake.transport!.emitNotification("item/started", {
+      threadId,
+      turnId: "turn-2",
+      item: {
+        type: "collabAgentToolCall",
+        id: "remote-spawn-call",
+        tool: "spawnAgent",
+        status: "inProgress",
+        senderThreadId: threadId,
+        receiverThreadIds: [childThreadId],
+        agentsStates: { [childThreadId]: { status: "running", message: null } }
+      }
+    });
+    const childCall = opened[1]!.beginToolCall(childThreadId);
+    expect(() => childCall.assertCurrent()).not.toThrow();
+    await setup.remoteFake.transport!.emitNotification("turn/completed", {
+      threadId: childThreadId,
+      turn: { id: "remote-child-turn", status: "completed", items: [], error: null }
+    });
+    expect(childCall.signal.aborted).toBe(true);
+    childCall.release();
   });
 
   it("rejects unsupported remote Codex mutations and attachments before native effect", async () => {
@@ -3009,7 +3141,9 @@ async function createSetup(
   return { adapter, fake, host, target };
 }
 
-async function createRemoteSetup() {
+async function createRemoteSetup(options: {
+  readonly openMcpBridge?: CodexRemoteRuntime["openMcpBridge"];
+} = {}) {
   const serviceRoot = await realpath(await mkdtemp(join(tmpdir(), "joko-codex-remote-target-")));
   const localFake = new FakeCodexAppServer();
   const remoteFake = new FakeCodexAppServer();
@@ -3022,7 +3156,8 @@ async function createRemoteSetup() {
     workspaceRoot: "/srv/joko-project",
     profileKey,
     executionDomain: "ssh-codex-profile-fixture",
-    assertCurrent: () => { if (!current) throw new Error("remote authority changed"); }
+    assertCurrent: () => { if (!current) throw new Error("remote authority changed"); },
+    ...(options.openMcpBridge === undefined ? {} : { openMcpBridge: options.openMcpBridge })
   }));
   const adapter = new CodexBackendAdapter({
     id: "codex-test",

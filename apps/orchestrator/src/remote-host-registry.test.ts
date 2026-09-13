@@ -12,6 +12,7 @@ import {
   sshHostKeyFingerprint,
   type AgentAuthConnection,
   type RemoteFileTransportPort,
+  type RemoteForwardingTransportPort,
   type RemoteProcessTransportPort,
   type RemoteSshConfigHost,
   type SshConfigFilePort
@@ -239,13 +240,17 @@ describe("RemoteHostRegistry credential and lifecycle boundary", () => {
     const fixture = createFixture();
     const firstProcesses: RemoteProcessTransportPort = { open: vi.fn(async () => { throw new Error("unused"); }) };
     const secondProcesses: RemoteProcessTransportPort = { open: vi.fn(async () => { throw new Error("unused"); }) };
-    const capabilities = { commandExecution: false, processStreaming: true, fileTransfer: false, tcpForwarding: false, interactiveTerminal: false };
+    const unusedForward = (): Promise<never> => Promise.reject(new Error("unused"));
+    const firstForwarding: RemoteForwardingTransportPort = { open: unusedForward, listen: unusedForward };
+    const secondForwarding: RemoteForwardingTransportPort = { open: unusedForward, listen: unusedForward };
+    const capabilities = { commandExecution: false, processStreaming: true, fileTransfer: false, tcpForwarding: true, interactiveTerminal: false };
     const connect = vi.fn(async (request: ResolvedAgentAuthConnectorRequest) => {
       await request.verifyHostKey({ algorithm: "ssh-ed25519", key: Uint8Array.of(7, 8, 9) });
       request.onAuthenticating();
       return {
         capabilities,
         processes: connect.mock.calls.length === 1 ? firstProcesses : secondProcesses,
+        forwarding: connect.mock.calls.length === 1 ? firstForwarding : secondForwarding,
         close: async () => undefined
       };
     });
@@ -254,7 +259,9 @@ describe("RemoteHostRegistry credential and lifecycle boundary", () => {
     const first = await registry.captureProcessAuthority(host.targetId, host.id);
     expect(first.host.id).toBe(host.id);
     expect(first.lease.processes).toBe(firstProcesses);
+    expect(first.lease.forwarding).toBe(firstForwarding);
     expect(() => first.assertCurrent()).not.toThrow();
+    expect(() => first.assertForwardingCurrent()).not.toThrow();
     const disconnected = await registry.disconnect(host.targetId, host.id, registry.get(host.targetId, host.id).revision);
     expect(() => first.assertCurrent()).toThrow();
     expect(connect).toHaveBeenCalledOnce();
@@ -263,8 +270,10 @@ describe("RemoteHostRegistry credential and lifecycle boundary", () => {
     expect(ready.ok).toBe(true);
     const second = await registry.captureProcessAuthority(host.targetId, host.id);
     expect(second.lease.processes).toBe(secondProcesses);
+    expect(second.lease.forwarding).toBe(secondForwarding);
     expect(second.leaseGeneration).not.toBe(first.leaseGeneration);
     expect(() => second.assertCurrent()).not.toThrow();
+    expect(() => second.assertForwardingCurrent()).not.toThrow();
     const current = registry.get(host.targetId, host.id);
     fixture.store.updateRemoteHostStatus({
       ownerId: current.ownerId,

@@ -8,7 +8,11 @@ import { PassThrough, Writable } from "node:stream";
 
 import { create } from "@bufbuild/protobuf";
 import { createPiAdapter, type PiProcessHandle, type PiProcessSpec } from "@joko/adapter-pi";
-import { AppServerHost as CodexAppServerHost, CodexBackendAdapter } from "@joko/adapter-codex";
+import {
+  AppServerHost as CodexAppServerHost,
+  CodexBackendAdapter,
+  type CodexRemoteMcpOpenInput
+} from "@joko/adapter-codex";
 import { FakeCodexAppServer } from "@joko/adapter-codex/testing";
 import * as contract from "@joko/contracts";
 import {
@@ -9773,6 +9777,9 @@ describe("SessionHost", () => {
     const localNativeHost = new CodexAppServerHost({ transportFactory: () => localFake.createTransport() });
     const remoteNativeHost = new CodexAppServerHost({ transportFactory: () => remoteFake.createTransport() });
     let authorityCurrent = true;
+    let remoteMcpInput: CodexRemoteMcpOpenInput | undefined;
+    let remoteMcpRetired = false;
+    const releaseRemoteMcp = vi.fn(async () => { remoteMcpRetired = true; });
     const adapter = new CodexBackendAdapter({
       id: "codex-remote-mounted",
       instanceGeneration: 7,
@@ -9784,7 +9791,22 @@ describe("SessionHost", () => {
           workspaceRoot: "/srv/joko-project",
           profileKey: "b".repeat(64),
           executionDomain: "ssh-codex-mounted-fixture",
-          assertCurrent: () => { if (!authorityCurrent) throw new Error("remote authority changed"); }
+          assertCurrent: () => { if (!authorityCurrent) throw new Error("remote authority changed"); },
+          openMcpBridge: async (input) => {
+            remoteMcpInput = input;
+            return {
+              routes: [{
+                serverId: "product-tools",
+                name: "joko_product_tools_fixture",
+                url: "http://127.0.0.1:4317/private-product-tools"
+              }],
+              assertCurrent: () => {
+                if (remoteMcpRetired) throw new Error("remote MCP route retired");
+                input.assertSessionCurrent();
+              },
+              release: releaseRemoteMcp
+            };
+          }
         }),
         shutdown: async () => remoteNativeHost.shutdown(),
         forceShutdown: async () => remoteNativeHost.forceShutdown()
@@ -9829,6 +9851,22 @@ describe("SessionHost", () => {
       planMode: false,
       nativeStart: { kind: "attach", nativeReference }
     })).value.sessionId;
+    expect(remoteMcpInput).toBeDefined();
+    expect(remoteFake.transport!.requests.findLast((candidate) => candidate.method === "thread/resume")?.params)
+      .toMatchObject({
+        threadId: nativeSessionId,
+        cwd: "/srv/joko-project",
+        config: {
+          "features.apps": false,
+          "features.enable_mcp_apps": false,
+          "features.remote_plugin": false,
+          "mcp_servers.joko_product_tools_fixture.enabled": true,
+          "mcp_servers.joko_product_tools_fixture.url": "http://127.0.0.1:4317/private-product-tools"
+        }
+      });
+    expect(localFake.transport?.requests.some((candidate) =>
+      candidate.method === "thread/resume" || candidate.method === "turn/start"
+    )).toBe(false);
 
     const observedAdmissions: Array<{
       readonly operationStatus: string;
@@ -9868,8 +9906,14 @@ describe("SessionHost", () => {
     });
     expect(remoteFake.transport!.requests.find((candidate) => candidate.method === "turn/start")?.params)
       .toMatchObject({ threadId: nativeSessionId, cwd: "/srv/joko-project", clientUserMessageId: "dispatch-remote-codex-text" });
+    const remoteMcpCall = remoteMcpInput!.beginToolCall(nativeSessionId);
+    expect(() => remoteMcpCall.assertCurrent()).not.toThrow();
+    expect(remoteMcpCall.signal.aborted).toBe(false);
+    expect(releaseRemoteMcp).not.toHaveBeenCalled();
     await remoteFake.completeTurn(nativeSessionId, "Remote result");
     await eventually(() => store.getRun(accepted.value.runId).descriptor.state === "completed");
+    expect(remoteMcpCall.signal.aborted).toBe(true);
+    remoteMcpCall.release();
     const completedRun = store.getRun(accepted.value.runId).descriptor;
     expect(store.getQueueItem(accepted.value.queueItemId).state).toBe("completed");
     expect(store.getAttempt(completedRun.activeAttemptId!).descriptor).toMatchObject({ endedAt: expect.any(Number) });

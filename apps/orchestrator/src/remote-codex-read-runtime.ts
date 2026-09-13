@@ -5,6 +5,7 @@ import {
   AppServerHost,
   StdioJsonRpcTransport,
   TransportFault,
+  type CodexRemoteMcpOpenInput,
   type CodexRemoteRuntime,
   type CodexRemoteRuntimePort,
   type JsonRpcRecordChannel,
@@ -18,6 +19,7 @@ import type {
 } from "@joko/remote-ssh";
 import type { OperationalStore, RemoteHostRecord, StoredTarget } from "@joko/store";
 import type { RemoteHostRegistry } from "./remote-host-registry.js";
+import type { RemoteCodexMcpBridgeManager } from "./remote-codex-mcp-bridge.js";
 
 const EXPECTED_CODEX_VERSION = "0.153.4";
 const EXPECTED_CODEX_VERSION_OUTPUT = `codex-cli ${EXPECTED_CODEX_VERSION}`;
@@ -56,12 +58,14 @@ interface ResolverEntry {
 export interface RemoteCodexRuntimeResolverOptions {
   readonly store: Pick<OperationalStore, "getTarget">;
   readonly registry: Pick<RemoteHostRegistry, "captureProcessAuthority">;
+  readonly mcpBridge?: Pick<RemoteCodexMcpBridgeManager, "open" | "shutdown">;
 }
 
 /** Target- and SSH-generation-bound owner for a remote Codex runtime. */
 export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
   readonly #store: Pick<OperationalStore, "getTarget">;
   readonly #registry: Pick<RemoteHostRegistry, "captureProcessAuthority">;
+  readonly #mcpBridge: RemoteCodexRuntimeResolverOptions["mcpBridge"];
   readonly #entries = new Map<string, ResolverEntry>();
   readonly #flights = new Map<string, Promise<CodexRemoteRuntime>>();
   #closed = false;
@@ -69,6 +73,7 @@ export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
   constructor(options: RemoteCodexRuntimeResolverOptions) {
     this.#store = options.store;
     this.#registry = options.registry;
+    this.#mcpBridge = options.mcpBridge;
   }
 
   async resolve(target: TargetDescriptor, signal?: AbortSignal): Promise<CodexRemoteRuntime> {
@@ -106,6 +111,7 @@ export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
     await Promise.allSettled([...this.#flights.values()]);
     const entries = [...this.#entries.values()];
     this.#entries.clear();
+    await this.#mcpBridge?.shutdown();
     await Promise.allSettled(entries.map((entry) => entry.runtime.host.shutdown()));
   }
 
@@ -113,6 +119,7 @@ export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
     this.#closed = true;
     const entries = [...this.#entries.values()];
     this.#entries.clear();
+    await this.#mcpBridge?.shutdown();
     await Promise.allSettled(entries.map((entry) => entry.runtime.host.forceShutdown()));
   }
 
@@ -158,7 +165,25 @@ export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
       workspaceRoot: installation.workspaceRoot,
       profileKey,
       executionDomain,
-      assertCurrent
+      assertCurrent,
+      ...(this.#mcpBridge === undefined ? {} : {
+        openMcpBridge: async (input: CodexRemoteMcpOpenInput) => {
+          assertCurrent();
+          const bridge = await this.#mcpBridge!.open({
+            forwarding: authority.lease.forwarding,
+            assertCurrent: authority.assertCurrent,
+            assertForwardingCurrent: authority.assertForwardingCurrent
+          }, input);
+          try {
+            assertCurrent();
+            bridge.assertCurrent();
+            return bridge;
+          } catch (error) {
+            await bridge.release();
+            throw error;
+          }
+        }
+      })
     });
     entry = Object.freeze({
       targetId: target.id,

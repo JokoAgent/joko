@@ -54,6 +54,7 @@ import { BrowserProvider, type BrowserActivity } from "@joko/tool-browser";
 import { TerminalProvider } from "@joko/tool-terminal";
 import { RemoteTerminalRuntimeResolver } from "./remote-terminal-runtime.js";
 import { RemoteCodexRuntimeResolver } from "./remote-codex-read-runtime.js";
+import { RemoteCodexMcpBridgeManager } from "./remote-codex-mcp-bridge.js";
 import {
   ComputerRuntime,
   ComputerToolProvider,
@@ -581,7 +582,11 @@ export async function createOrchestratorApplication(
     targetResolver: {
       resolveSnapshot: (targetId) => {
         const target = store.getTarget(targetId).descriptor;
-        return { workspaceRoot: target.workspaceRoot, trusted: target.trusted };
+        return {
+          workspaceRoot: target.workspaceRoot,
+          trusted: target.trusted,
+          remote: target.remoteWorkspace !== undefined
+        };
       },
       resolveAuthenticated: (context) => resolveAuthenticatedLspTarget(store, context)
     }
@@ -597,10 +602,13 @@ export async function createOrchestratorApplication(
   const unregisterVisionBridgeTools = mcpRouter.registerBridgeToolProvider(
     new VisionBridgeToolProvider({
       vision: visionBridge,
-      allowedRoots: (context) => [
-        store.getTarget(context.targetId).descriptor.workspaceRoot,
-        config.artifactDirectory
-      ]
+      allowedRoots: (context) => {
+        const target = store.getTarget(context.targetId).descriptor;
+        return [
+          ...(target.remoteWorkspace === undefined ? [target.workspaceRoot] : []),
+          config.artifactDirectory
+        ];
+      }
     })
   );
   const scheduleHookScripts = new ScheduleHookScriptInstaller({
@@ -820,7 +828,15 @@ export async function createOrchestratorApplication(
       create: ({ instanceId, generation }) => createCodexAdapter({
         id: instanceId,
         instanceGeneration: generation,
-        remoteRuntimes: new RemoteCodexRuntimeResolver({ store, registry: remoteHosts }),
+        remoteRuntimes: new RemoteCodexRuntimeResolver({
+          store,
+          registry: remoteHosts,
+          mcpBridge: new RemoteCodexMcpBridgeManager({
+            router: mcpRouter,
+            includeToolPolicy: (sessionId, targetId, policyId) =>
+              toolPolicies.enabledForSession(sessionId, targetId, policyId)
+          })
+        }),
         managedProviders: managedRuntime(instanceId, generation, CODEX_MANAGED_PROVIDER_SUPPORT),
         appServer: {
           transport: {

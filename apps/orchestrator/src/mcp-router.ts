@@ -326,6 +326,8 @@ export interface McpBridgeCallResult {
 export interface PiMcpBridgeSnapshot {
   readonly mcpBridge: PiMcpBridgeOptions;
   readonly expiresAt: number;
+  /** Recheck that this exact immutable grant is still live. */
+  assertCurrent(): void;
   /** Extend this exact immutable grant without changing its token or tool snapshot. */
   renew(ttlMs?: number): number;
   revoke(): void;
@@ -799,9 +801,14 @@ export class McpRouter {
         })
       },
       get expiresAt() { return grant.expiresAt; },
+      assertCurrent: () => {
+        this.#purgeGrants();
+        if (this.#grants.get(key) !== grant) throw new Error("MCP bridge grant is revoked or expired.");
+      },
       renew: (renewalTtlMs?: number) => {
+        this.#purgeGrants();
         const current = this.#grants.get(key);
-        if (current !== grant) throw new Error("MCP bridge grant is revoked.");
+        if (current !== grant) throw new Error("MCP bridge grant is revoked or expired.");
         const renewalTtl = renewalTtlMs ?? this.#bridgeGrantTtlMs;
         if (!Number.isSafeInteger(renewalTtl) || renewalTtl < 1_000 || renewalTtl > this.#bridgeGrantTtlMs) {
           throw new Error("MCP bridge renewal lifetime is invalid.");
@@ -1804,13 +1811,20 @@ export class McpRouter {
     readonly result: McpCallResult;
     readonly hostImages: readonly BridgeToolImageOutput[];
   }> {
-    if (!provider.available || provider.generation !== expectedGeneration) {
-      throw new Error("Bridge Tool Provider generation is unavailable or fenced.");
-    }
-    if (!provider.tools.some((tool) => tool.name === toolName)) {
-      throw new Error("Bridge Tool is not part of the fenced discovery snapshot.");
-    }
+    const assertCurrent = (): void => {
+      signal?.throwIfAborted();
+      if (this.#bridgeToolProviders.get(provider.id) !== provider
+        || !provider.available
+        || provider.generation !== expectedGeneration) {
+        throw new Error("Bridge Tool Provider generation is unavailable or fenced.");
+      }
+      if (!provider.tools.some((tool) => tool.name === toolName)) {
+        throw new Error("Bridge Tool is not part of the fenced discovery snapshot.");
+      }
+    };
+    assertCurrent();
     const result = await provider.callTool(toolName, arguments_, signal, context);
+    assertCurrent();
     const hostImages = normalizeBridgeToolImageOutputs(
       result.hostImages,
       this.#resultCapacityBytes,

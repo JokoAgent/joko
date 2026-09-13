@@ -120,6 +120,40 @@ export interface CodexRemoteRuntime {
   readonly executionDomain: string;
   /** Synchronous target/host/transport generation fence. */
   readonly assertCurrent: () => void;
+  /** Owner-private, Target-bound standard MCP route factory. */
+  readonly openMcpBridge?: (input: CodexRemoteMcpOpenInput) => Promise<CodexRemoteMcpRuntimeLease>;
+}
+
+export interface CodexRemoteMcpCallLease {
+  readonly signal: AbortSignal;
+  readonly assertCurrent: () => void;
+  readonly release: () => void;
+}
+
+export interface CodexRemoteMcpRoute {
+  readonly serverId: string;
+  /** Codex-safe per-Session server name. */
+  readonly name: string;
+  /** Private remote-loopback route. It never contains the McpRouter bearer. */
+  readonly url: string;
+}
+
+export interface CodexRemoteMcpRuntimeLease {
+  readonly routes: readonly CodexRemoteMcpRoute[];
+  readonly assertCurrent: () => void;
+  readonly release: () => Promise<void>;
+}
+
+export interface CodexRemoteMcpOpenInput {
+  readonly sessionId: string;
+  readonly targetId: string;
+  readonly generation: number;
+  readonly threadId: string;
+  readonly signal?: AbortSignal;
+  /** Rechecks the Adapter/Session/Target authority without requiring an installed runtime. */
+  readonly assertSessionCurrent: () => void;
+  /** Acquires the active native root-or-descendant turn fence for one call. */
+  readonly beginToolCall: (threadId: string) => CodexRemoteMcpCallLease;
 }
 
 export interface CodexRemoteRuntimePort {
@@ -189,7 +223,10 @@ interface SessionRuntime {
   subscriptionFlight?: Promise<HostSubscription>;
   state: TranslatorState;
   readonly pendingServerRequests: Map<string, PendingServerRequest>;
+  readonly pendingRemoteMcpCalls: Set<PendingRemoteMcpCall>;
   readonly nativeTasks: CodexNativeTaskProjection;
+  readonly remoteMcp?: CodexRemoteMcpRuntimeLease;
+  readonly nativeConfiguration?: JsonObject;
   providerId?: string;
   modelId?: string;
   effort?: string;
@@ -222,6 +259,7 @@ interface CodexReadScope {
   readonly workspaceRoot: string;
   readonly profileKey: string;
   readonly remote: boolean;
+  readonly openMcpBridge?: CodexRemoteRuntime["openMcpBridge"];
   readonly assertAuthorityCurrent: () => void;
   readonly assertCurrent: () => void;
 }
@@ -700,7 +738,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       && current.profileKey === inspection.profileKey
       && current.hostGeneration === inspection.hostGeneration
       && this.#matchesCoreFence(current, context)
-      && this.#isRuntimeCurrent(current, current.hostGeneration)) {
+      && this.#isRuntimeCurrent(current, current.hostGeneration)
+      && this.#remoteMcpCanRemain(current)) {
       current.context = context;
       return stateFromRuntime(current);
     }
@@ -712,54 +751,97 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       try { await inspection.scope.host.releaseUnboundThread(threadId, inspection.hostGeneration); }
       catch { managedRoute.dispose(); throw managedRouteUnavailable(true); }
     }
+    let remoteMcp: CodexRemoteMcpRuntimeLease | undefined;
+    let nativeConfiguration: JsonObject | undefined;
+    if (inspection.scope.remote) {
+      try {
+        if (inspection.scope.openMcpBridge !== undefined) {
+          remoteMcp = await inspection.scope.openMcpBridge({
+            sessionId: context.sessionId,
+            targetId: context.target.id,
+            generation: context.generation,
+            threadId,
+            signal: context.signal,
+            assertSessionCurrent: () => {
+              this.#assertOpen();
+              this.#assertContextTarget(context, context.target);
+              inspection.scope.assertCurrent();
+            },
+            beginToolCall: (requestThreadId) => {
+              if (remoteMcp === undefined) throw remoteMcpUnavailable();
+              return this.#beginRemoteMcpCall(context.sessionId, remoteMcp, requestThreadId);
+            }
+          });
+        }
+        nativeConfiguration = await this.#buildRemoteMcpConfiguration(
+          inspection.scope,
+          remoteMcp?.routes ?? [],
+          context.signal
+        );
+      } catch (error) {
+        await remoteMcp?.release().catch(() => undefined);
+        if (error instanceof Error && "publicError" in error) throw error;
+        throw remoteMcpUnavailable();
+      }
+    }
     const response = await this.#resumeNativeThread(
       inspection.scope,
       threadId,
       inspection.workspaceRoot,
       inspection.hostGeneration,
       inspection.scope.remote ? undefined : context.modelSelection,
-      managedRoute
-    ).catch((error) => {
+      managedRoute,
+      nativeConfiguration
+    ).catch(async (error) => {
       managedRoute?.dispose();
+      await remoteMcp?.release().catch(() => undefined);
       throw this.#nativeThreadResumeFailure(error);
     });
-    let thread = parseThreadResult(response.value);
-    if (thread.status?.["type"] === "active" && thread.turns.length === 0) {
-      const latest = await inspection.scope.host.request("thread/turns/list", {
-        threadId,
-        limit: 1,
-        sortDirection: "desc",
-        itemsView: "notLoaded"
-      }, { signal: context.signal, beforeDispatch: inspection.scope.assertCurrent });
-      if (latest.hostGeneration !== response.hostGeneration) {
-        throw adapterError({
-          code: "CODEX_RUNTIME_GENERATION_STALE",
-          message: "The Codex app-server generation changed while recovering the active turn.",
-          phase: "provision",
-          stateMayHaveChanged: true,
-          recovery: "Resume the native thread through the current Backend instance."
-        });
+    try {
+      let thread = parseThreadResult(response.value);
+      if (thread.status?.["type"] === "active" && thread.turns.length === 0) {
+        const latest = await inspection.scope.host.request("thread/turns/list", {
+          threadId,
+          limit: 1,
+          sortDirection: "desc",
+          itemsView: "notLoaded"
+        }, { signal: context.signal, beforeDispatch: inspection.scope.assertCurrent });
+        if (latest.hostGeneration !== response.hostGeneration) {
+          throw adapterError({
+            code: "CODEX_RUNTIME_GENERATION_STALE",
+            message: "The Codex app-server generation changed while recovering the active turn.",
+            phase: "provision",
+            stateMayHaveChanged: true,
+            recovery: "Resume the native thread through the current Backend instance."
+          });
+        }
+        thread = { ...thread, turns: parseTurnList(latest.value) };
       }
-      thread = { ...thread, turns: parseTurnList(latest.value) };
+      const normalized = bindingForThread(thread.id, context.generation, inspection.profileKey);
+      const record = objectValue(response.value, "resume response");
+      const runtime = await this.#installRuntime({
+        scope: inspection.scope,
+        thread,
+        binding: normalized,
+        context,
+        hostGeneration: response.hostGeneration,
+        permissionMode: permissionModeFromResponse(record),
+        managedRoute,
+        remoteMcp,
+        nativeConfiguration,
+        providerId: optionalString(record["modelProvider"]),
+        modelId: optionalString(record["model"]),
+        effort: optionalString(record["reasoningEffort"]) ?? optionalString(record["effort"]),
+        fastMode: isFastServiceTier(record["serviceTier"]),
+        observedFastMode: observedFastServiceTier(record),
+        name: thread.name ?? undefined
+      });
+      return stateFromRuntime(runtime);
+    } catch (error) {
+      managedRoute?.dispose();
+      await remoteMcp?.release().catch(() => undefined);
+      throw error;
     }
-    const normalized = bindingForThread(thread.id, context.generation, inspection.profileKey);
-    const record = objectValue(response.value, "resume response");
-    const runtime = await this.#installRuntime({
-      scope: inspection.scope,
-      thread,
-      binding: normalized,
-      context,
-      hostGeneration: response.hostGeneration,
-      permissionMode: permissionModeFromResponse(record),
-      managedRoute,
-      providerId: optionalString(record["modelProvider"]),
-      modelId: optionalString(record["model"]),
-      effort: optionalString(record["reasoningEffort"]) ?? optionalString(record["effort"]),
-      fastMode: isFastServiceTier(record["serviceTier"]),
-      observedFastMode: observedFastServiceTier(record),
-      name: thread.name ?? undefined
-    });
-    return stateFromRuntime(runtime);
   }
 
   async inspectSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState> {
@@ -1174,6 +1256,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       }, { mutation: true, signal, beforeDispatch });
       this.#assertRuntimeFence(runtime, context, response.hostGeneration);
       this.#cancelPendingServerRequests(runtime, (pending) => pending.turnId === turnId);
+      this.#cancelPendingRemoteMcpCalls(runtime, (pending) => pending.threadId === runtime.threadId);
     } catch (error) {
       throw this.#requestFailure(error, "dispatch", "CODEX_TURN_INTERRUPT_FAILED", false);
     }
@@ -1606,6 +1689,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       threadId: runtime.threadId,
       cwd: runtime.targetWorkspaceRoot,
       excludeTurns: true,
+      ...(runtime.nativeConfiguration === undefined ? {} : { config: runtime.nativeConfiguration }),
       ...permissionParams(mode)
     }, {
       mutation: true,
@@ -1877,15 +1961,20 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     workspaceRoot: string,
     expectedHostGeneration: number,
     selection?: { readonly providerId: string; readonly modelId: string },
-    managedRoute?: ManagedProviderRouteBinding
+    managedRoute?: ManagedProviderRouteBinding,
+    nativeConfiguration?: JsonObject
   ) {
     scope.assertCurrent();
+    const managedConfiguration = this.#nativeRouteConfiguration(managedRoute);
+    const configuration = managedConfiguration === undefined && nativeConfiguration === undefined
+      ? undefined
+      : { ...managedConfiguration, ...nativeConfiguration };
     const response = await scope.host.request("thread/resume", {
       threadId,
       cwd: workspaceRoot,
       excludeTurns: true,
       ...(selection === undefined ? {} : { modelProvider: selection.providerId, model: selection.modelId }),
-      ...(this.#nativeRouteConfiguration(managedRoute) === undefined ? {} : { config: this.#nativeRouteConfiguration(managedRoute)! })
+      ...(configuration === undefined ? {} : { config: configuration })
     }, { mutation: false, beforeDispatch: scope.assertCurrent });
     scope.assertCurrent();
     if (response.hostGeneration !== expectedHostGeneration) {
@@ -1990,6 +2079,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         workspaceRoot: runtime.workspaceRoot,
         profileKey: runtime.profileKey,
         remote: true,
+        ...(runtime.openMcpBridge === undefined ? {} : { openMcpBridge: runtime.openMcpBridge }),
         assertAuthorityCurrent: () => {
           this.#assertOpen();
           try {
@@ -2076,7 +2166,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const runtime = this.#sessions.get(context.sessionId);
     if (runtime !== undefined
       && this.#matchesCoreFence(runtime, context)
-      && this.#isRuntimeCurrent(runtime, runtime.hostGeneration)) {
+      && this.#isRuntimeCurrent(runtime, runtime.hostGeneration)
+      && this.#remoteMcpCanRemain(runtime)) {
       runtime.context = context;
       return runtime;
     }
@@ -2154,6 +2245,160 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         } }
       })
     };
+  }
+
+  async #buildRemoteMcpConfiguration(
+    scope: CodexReadScope,
+    routes: readonly CodexRemoteMcpRoute[],
+    signal?: AbortSignal
+  ): Promise<JsonObject> {
+    if (!scope.remote || scope.hostGeneration === undefined) throw remoteMcpUnavailable();
+    scope.assertCurrent();
+    let config: JsonObject;
+    try {
+      const response = await scope.host.request("config/read", {
+        cwd: scope.workspaceRoot,
+        includeLayers: false
+      }, { signal, beforeDispatch: scope.assertCurrent });
+      if (response.hostGeneration !== scope.hostGeneration) throw remoteRuntimeStale();
+      config = reviewEffectiveConfig(response.value);
+    } catch (error) {
+      if (error instanceof Error && "publicError" in error) throw error;
+      throw remoteMcpUnavailable();
+    }
+
+    const configuredMcp = optionalReviewObject(config["mcp_servers"]);
+    const configuredPlugins = optionalReviewObject(config["plugins"]);
+    const configuredMcpNames = new Set<string>();
+    const transportMcpNames = new Set<string>();
+    for (const [name, rawConfig] of Object.entries(configuredMcp)) {
+      if (!validRemoteMcpConfigIdentity(name)) throw remoteMcpUnavailable();
+      if (!hasReviewMcpTransport(rawConfig)) continue;
+      configuredMcpNames.add(name);
+      transportMcpNames.add(name);
+    }
+    const pluginMcp = new Map<string, Set<string>>();
+    for (const [pluginId, rawPlugin] of Object.entries(configuredPlugins)) {
+      if (!validRemoteMcpConfigIdentity(pluginId)) throw remoteMcpUnavailable();
+      const servers = optionalReviewObject(optionalReviewObject(rawPlugin)["mcp_servers"]);
+      const names = new Set<string>();
+      for (const [name, rawConfig] of Object.entries(servers)) {
+        if (!validRemoteMcpConfigIdentity(name)) throw remoteMcpUnavailable();
+        if (!hasReviewMcpTransport(rawConfig)) continue;
+        names.add(name);
+        transportMcpNames.add(name);
+      }
+      if (names.size > 0) pluginMcp.set(pluginId, names);
+    }
+
+    const observedMcpNames = new Set<string>();
+    const cursors = new Set<string>();
+    let cursor: string | null = null;
+    for (let page = 0; page < REVIEW_MAXIMUM_INVENTORY_PAGES; page += 1) {
+      let response;
+      try {
+        response = await scope.host.request("mcpServerStatus/list", {
+          cursor,
+          limit: 100,
+          detail: "toolsAndAuthOnly",
+          threadId: null
+        }, { signal, beforeDispatch: scope.assertCurrent });
+      } catch {
+        throw remoteMcpUnavailable();
+      }
+      if (response.hostGeneration !== scope.hostGeneration) throw remoteRuntimeStale();
+      const pageResult = reviewMcpStatusPage(response.value);
+      for (const name of pageResult.names) {
+        observedMcpNames.add(name);
+        if (observedMcpNames.size > REVIEW_MAXIMUM_INVENTORY_ITEMS) throw remoteMcpUnavailable();
+      }
+      if (pageResult.nextCursor === null) break;
+      if (cursors.has(pageResult.nextCursor)) throw remoteMcpUnavailable();
+      cursors.add(pageResult.nextCursor);
+      cursor = pageResult.nextCursor;
+      if (page + 1 === REVIEW_MAXIMUM_INVENTORY_PAGES) throw remoteMcpUnavailable();
+    }
+
+    const staleJokoNames = [...observedMcpNames].filter((name) =>
+      name.startsWith("joko_") && !transportMcpNames.has(name));
+    const unknownMcpNames = [...observedMcpNames].filter((name) =>
+      name !== "codex_apps" && !transportMcpNames.has(name) && !staleJokoNames.includes(name));
+    if (unknownMcpNames.length > 0) throw remoteMcpUnavailable();
+    const routeNames = new Set<string>();
+    for (const route of routes) {
+      if (!validRemoteMcpRoute(route)
+        || routeNames.has(route.name)
+        || configuredMcpNames.has(route.name)
+        || observedMcpNames.has(route.name)) throw remoteMcpUnavailable();
+      routeNames.add(route.name);
+    }
+
+    const remoteConfig: JsonObject = {
+      "features.apps": false,
+      "features.enable_mcp_apps": false,
+      "features.remote_plugin": false
+    };
+    for (const name of [...configuredMcpNames, ...staleJokoNames]) {
+      remoteConfig[`mcp_servers.${renderReviewConfigSegment(name)}.enabled`] = false;
+    }
+    for (const [pluginId, names] of pluginMcp) {
+      for (const name of names) {
+        remoteConfig[
+          `plugins.${quoteReviewConfigSegment(pluginId)}.mcp_servers.${renderReviewConfigSegment(name)}.enabled`
+        ] = false;
+      }
+    }
+    for (const route of routes) {
+      const prefix = `mcp_servers.${route.name}`;
+      remoteConfig[`${prefix}.url`] = route.url;
+      remoteConfig[`${prefix}.enabled`] = true;
+      remoteConfig[`${prefix}.startup_timeout_sec`] = 60;
+      remoteConfig[`${prefix}.tool_timeout_sec`] = 600;
+    }
+    scope.assertCurrent();
+    return remoteConfig;
+  }
+
+  #beginRemoteMcpCall(
+    sessionId: string,
+    expectedLease: CodexRemoteMcpRuntimeLease,
+    threadId: string
+  ): CodexRemoteMcpCallLease {
+    const runtime = this.#sessions.get(sessionId);
+    const abort = new AbortController();
+    let released = false;
+    let pending: PendingRemoteMcpCall;
+    const assertCurrent = (): void => {
+      abort.signal.throwIfAborted();
+      if (released || runtime === undefined
+        || !runtime.pendingRemoteMcpCalls.has(pending)
+        || runtime.remoteMcp !== expectedLease
+        || runtime.runtimePolicy !== "standard"
+        || !this.#isRuntimeCurrent(runtime, runtime.hostGeneration)) throw remoteMcpCallStale();
+      expectedLease.assertCurrent();
+      const rootActive = threadId === runtime.threadId
+        && runtime.state.activeTurnId !== undefined
+        && !runtime.state.terminalTurnIds.has(runtime.state.activeTurnId);
+      if (!rootActive && !runtime.nativeTasks.ownsActiveThread(threadId)) throw remoteMcpCallStale();
+    };
+    const release = (): void => {
+      if (released) return;
+      released = true;
+      runtime?.dispatchLifetime.signal.removeEventListener("abort", cancel);
+      runtime?.pendingRemoteMcpCalls.delete(pending);
+    };
+    const cancel = (): void => abort.abort();
+    pending = { threadId, abort, cancel, release };
+    if (runtime === undefined) throw remoteMcpCallStale();
+    runtime.pendingRemoteMcpCalls.add(pending);
+    runtime.dispatchLifetime.signal.addEventListener("abort", cancel, { once: true });
+    try {
+      assertCurrent();
+      return { signal: abort.signal, assertCurrent, release };
+    } catch (error) {
+      release();
+      throw error;
+    }
   }
 
   #assertManagedRouteResponse(record: JsonObject, route?: ManagedProviderRouteBinding): void {
@@ -2482,6 +2727,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   async #installRuntime(input: {
     readonly scope: CodexReadScope;
     readonly managedRoute?: ManagedProviderRouteBinding | undefined;
+    readonly remoteMcp?: CodexRemoteMcpRuntimeLease | undefined;
+    readonly nativeConfiguration?: JsonObject | undefined;
     readonly thread: NativeThread;
     readonly binding: NativeSessionBinding;
     readonly context: AdapterContext;
@@ -2499,6 +2746,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     if (input.scope.remote && (input.managedRoute !== undefined || input.reviewWorkingDirectory !== undefined)) {
       throw remoteMutationUnsupported("apply a local Provider or Review runtime profile");
     }
+    if (!input.scope.remote && (input.remoteMcp !== undefined || input.nativeConfiguration !== undefined)) {
+      throw remoteMcpUnavailable();
+    }
+    input.remoteMcp?.assertCurrent();
     if (input.scope.hostGeneration !== undefined
       && input.scope.hostGeneration !== input.hostGeneration) throw remoteRuntimeStale();
     if (parseNativeReference(input.binding.opaqueRef).profileKey !== input.scope.profileKey) {
@@ -2572,7 +2823,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       hostGeneration: input.hostGeneration,
       state,
       pendingServerRequests: new Map(),
+      pendingRemoteMcpCalls: new Set(),
       nativeTasks,
+      ...(input.remoteMcp === undefined ? {} : { remoteMcp: input.remoteMcp }),
+      ...(input.nativeConfiguration === undefined ? {} : { nativeConfiguration: input.nativeConfiguration }),
       ...(input.providerId === undefined ? {} : { providerId: input.providerId }),
       ...(input.modelId === undefined ? {} : { modelId: input.modelId }),
       ...(input.effort === undefined ? {} : { effort: input.effort }),
@@ -2665,6 +2919,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
               runtime,
               (pending) => pending.threadId === threadId && pending.turnId === turnId
             );
+            this.#cancelPendingRemoteMcpCalls(runtime, (pending) => pending.threadId === threadId);
           }
           await this.#applyNativeTaskEffects(
             runtime,
@@ -2951,6 +3206,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         runtime,
         (pending) => pending.threadId === runtime.threadId && pending.turnId === turnId
       );
+      this.#cancelPendingRemoteMcpCalls(runtime, (pending) => pending.threadId === runtime.threadId);
       return true;
     }
     if (method.startsWith("item/")) {
@@ -2982,9 +3238,21 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     }
   }
 
+  #cancelPendingRemoteMcpCalls(
+    runtime: SessionRuntime,
+    predicate: (pending: PendingRemoteMcpCall) => boolean = () => true
+  ): void {
+    for (const pending of runtime.pendingRemoteMcpCalls) {
+      if (!predicate(pending)) continue;
+      pending.cancel();
+    }
+  }
+
   async #releaseRuntimeSubscription(runtime: SessionRuntime, unsubscribe: boolean): Promise<void> {
     this.#releaseManagedOperation(runtime);
     runtime.managedRoute?.dispose();
+    this.#cancelPendingRemoteMcpCalls(runtime);
+    await runtime.remoteMcp?.release().catch(() => undefined);
     runtime.planReview?.abort.abort();
     runtime.planReview = undefined;
     runtime.planTurnIds.clear();
@@ -3491,6 +3759,16 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   #isExecutionAuthorityCurrent(runtime: SessionRuntime): boolean {
     try { runtime.assertExecutionCurrent(); return true; }
     catch { return false; }
+  }
+
+  #remoteMcpCanRemain(runtime: SessionRuntime): boolean {
+    if (!runtime.remote || runtime.remoteMcp === undefined) return true;
+    try {
+      runtime.remoteMcp.assertCurrent();
+      return true;
+    } catch {
+      return runtime.state.activeTurnId !== undefined || runtime.nativeTasks.hasActiveTasks();
+    }
   }
 
   #assertRuntimeFence(
@@ -4687,6 +4965,13 @@ function equalNativePaths(left: string, right: string): boolean {
     : normalizedLeft === normalizedRight;
 }
 
+interface PendingRemoteMcpCall {
+  readonly threadId: string;
+  readonly abort: AbortController;
+  readonly cancel: () => void;
+  readonly release: () => void;
+}
+
 function isNormalizedAbsolutePosixPath(value: string): boolean {
   return value.length > 0
     && value.length <= 16_384
@@ -4697,6 +4982,23 @@ function isNormalizedAbsolutePosixPath(value: string): boolean {
 
 function validExecutionDomain(value: string): boolean {
   return value.length > 0 && value.length <= 4_096 && !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
+function validRemoteMcpRoute(route: CodexRemoteMcpRoute): boolean {
+  if (route.serverId.length === 0 || route.serverId.length > 512
+    || !/^joko_[A-Za-z0-9_-]{1,64}$/u.test(route.name)) return false;
+  try {
+    const url = new URL(route.url);
+    const loopback = url.hostname === "127.0.0.1" || url.hostname === "[::1]" || url.hostname === "::1" || url.hostname === "localhost";
+    return url.protocol === "http:" && loopback && url.username === "" && url.password === ""
+      && url.search === "" && url.hash === "" && url.pathname.length > 1;
+  } catch {
+    return false;
+  }
+}
+
+function validRemoteMcpConfigIdentity(value: string): boolean {
+  return value.length > 0 && value.length <= 512 && !/[\u0000-\u001f\u007f]/u.test(value);
 }
 
 function sameRemoteWorkspace(
@@ -4737,6 +5039,28 @@ function remoteRuntimeCancelled() {
     retryable: true,
     stateMayHaveChanged: false,
     recovery: "Retry the read when the remote Target is still current."
+  });
+}
+
+function remoteMcpUnavailable() {
+  return adapterError({
+    code: "CODEX_REMOTE_MCP_UNAVAILABLE",
+    message: "The remote Codex MCP route could not be isolated for this Session.",
+    phase: "provision",
+    retryable: true,
+    stateMayHaveChanged: false,
+    recovery: "Reconnect the exact remote Target and retry after its MCP inventory and SSH forwarding are available."
+  });
+}
+
+function remoteMcpCallStale() {
+  return adapterError({
+    code: "CODEX_REMOTE_MCP_CALL_STALE",
+    message: "The remote Codex tool call no longer belongs to an active native turn.",
+    phase: "stream",
+    retryable: false,
+    stateMayHaveChanged: false,
+    recovery: "Continue only from the current Session, Target, and native turn."
   });
 }
 
