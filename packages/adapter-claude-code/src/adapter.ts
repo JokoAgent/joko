@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
+import { isAbsolute, join, normalize, posix as remotePath, relative, resolve, sep } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import {
   createChildRuntimeEnvironment,
@@ -80,9 +80,11 @@ import {
   type ClaudeSdkModelInfo,
   type ClaudeSdkPermissionMode,
   type ClaudeSdkQuery,
+  type ClaudeRemoteRuntimePort,
   type ClaudeSdkRuntime,
   type ClaudeSdkSessionInfo,
   type ClaudeSdkSessionMessage,
+  type ClaudeTargetRuntime,
   type ClaudeSdkUserMessage
 } from "./sdk-runtime.js";
 import {
@@ -306,6 +308,8 @@ export interface ClaudeCodeAdapterOptions extends ClaudeInputResolvers {
   readonly instanceGeneration: number;
   readonly id?: string;
   readonly runtime?: ClaudeSdkRuntime;
+  /** Resolves an exact SSH-bound SDK runtime for remote Targets. */
+  readonly remoteRuntimes?: ClaudeRemoteRuntimePort;
   readonly environment?: Readonly<Record<string, string | undefined>>;
   /** Opaque Orchestrator-owned persistence boundary for the native subscription account. */
   readonly credentialPort?: ClaudeCodeCredentialPort;
@@ -416,6 +420,10 @@ interface NativeRuntime {
   readonly gate: AsyncInputGate<ClaudeSdkUserMessage>;
   readonly abortController: AbortController;
   readonly query: ClaudeSdkQuery;
+  readonly sdkRuntime: ClaudeSdkRuntime;
+  readonly runtimeWorkspaceRoot: string;
+  readonly remote: boolean;
+  readonly assertRuntimeCurrent: () => void;
   readonly baseContext: AdapterContext;
   readonly nativeTasks: ClaudeNativeTaskProjection;
   readonly runtimePolicy: "standard" | "review_read_only";
@@ -427,6 +435,7 @@ interface NativeRuntime {
   readonly toolNames: Map<string, string>;
   consumer: Promise<void>;
   closed: boolean;
+  retirementConfirmed: boolean;
   nativeTaskProjectionEnabled: boolean;
   steerEnabled: boolean;
   inputPreparation?: AbortController;
@@ -454,6 +463,8 @@ interface CatalogBindingSource {
 export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
   override readonly id: string;
   readonly #runtime: ClaudeSdkRuntime;
+  readonly #remoteRuntimes: ClaudeRemoteRuntimePort | undefined;
+  readonly #resolvedTargetRuntimes = new Set<ClaudeSdkRuntime>();
   readonly #instanceGeneration: number;
   readonly #environment: Readonly<Record<string, string>>;
   readonly #managedProviders: ManagedProviderRuntimePort | undefined;
@@ -528,6 +539,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       environment: this.#environment,
       sessionOperationTimeoutMs: this.#initializationTimeoutMs
     });
+    this.#remoteRuntimes = options.remoteRuntimes;
+    this.#resolvedTargetRuntimes.add(this.#runtime);
     this.#interruptTimeoutMs = positiveTimeout(options.interruptTimeoutMs, DEFAULT_INTERRUPT_TIMEOUT_MS);
     this.#nativeContinuationGraceMs = positiveTimeout(
       options.nativeContinuationGraceMs,
@@ -829,12 +842,13 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         recovery: "Select a Target owned by the Claude Code Backend."
       });
     }
-    if (target.remoteWorkspace !== undefined) {
-      throw claudeCodeError("TARGET_LOCATION_UNSUPPORTED", "Claude Code currently requires a local workspace.", "target", {
-        recovery: "Choose a local Target for this Backend."
-      });
+    if (target.remoteWorkspace === undefined) {
+      await validateCanonicalDirectory(target.workspaceRoot, "Target workspace");
+      return;
     }
-    await validateCanonicalDirectory(target.workspaceRoot, "Target workspace");
+    validateRemoteTarget(target);
+    const scoped = await this.#targetRuntime(target);
+    scoped.assertCurrent();
   }
 
   async resolveNativeSessionReference(
@@ -843,25 +857,29 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     generation: number
   ): Promise<NativeSessionBinding> {
     await this.validateTarget(target);
+    const scoped = await this.#targetRuntime(target);
     const nativeSessionId = parseNativeSessionReference(nativeReference);
-    const info = await this.#sessionInfo(nativeSessionId, target);
+    const info = await this.#sessionInfo(nativeSessionId, target, undefined, scoped);
     if (info === undefined) throw continuityGap();
-    assertSessionInfo(info, nativeSessionId, target.workspaceRoot);
+    assertSessionInfo(info, nativeSessionId, scoped.workspaceRoot, scoped.remote);
     return bindingFor(nativeSessionId, generation);
   }
 
   async listNativeSessions(target: TargetDescriptor): Promise<readonly NativeSessionCandidate[]> {
     this.#assertUsable();
     await this.validateTarget(target);
+    const scoped = await this.#targetRuntime(target);
     let sessions: readonly ClaudeSdkSessionInfo[];
     try {
-      sessions = await this.#runtime.listSessions({
-        dir: target.workspaceRoot,
+      scoped.assertCurrent();
+      sessions = await scoped.runtime.listSessions({
+        dir: scoped.workspaceRoot,
         limit: this.#maximumDiscoveredSessions,
         offset: 0,
         includeWorktrees: false,
         includeProgrammatic: true
       });
+      scoped.assertCurrent();
     } catch {
       throw claudeCodeError(
         "NATIVE_SESSION_DISCOVERY_FAILED",
@@ -885,7 +903,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     const candidates: NativeSessionCandidate[] = [];
     const seen = new Set<string>();
     for (const session of sessions) {
-      const candidate = nativeSessionCandidate(session, target, this.#projection);
+      const candidate = nativeSessionCandidate(session, scoped.workspaceRoot, scoped.remote, this.#projection);
       if (candidate === undefined || seen.has(candidate.nativeReference)) continue;
       seen.add(candidate.nativeReference);
       candidates.push(candidate);
@@ -959,7 +977,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     if (this.#sessions.has(context.sessionId)) {
       throw claudeCodeError("SESSION_ALREADY_ATTACHED", "This product Session already has a native runtime.", "session");
     }
-    const extraDirectories = await this.#validateExtraDirectories(context.extraDirectories ?? []);
+    const extraDirectories = await this.#validateExtraDirectories(context.extraDirectories ?? [], context.target);
     if (input.nativeStart?.kind === "attach") {
       const binding = await this.resolveNativeSessionReference(
         input.nativeStart.nativeReference,
@@ -1025,7 +1043,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     const runtime = await this.#startRuntime(resumedBinding, context, {
       resume: true,
       permissionMode: "ask",
-      additionalDirectories: await this.#validateExtraDirectories(context.extraDirectories ?? []),
+      additionalDirectories: await this.#validateExtraDirectories(context.extraDirectories ?? [], context.target),
       appendSystemPrompt: context.appendSystemPrompt,
       runtimePolicy
     });
@@ -1042,9 +1060,10 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     }
     assertStandardReviewContext(context, "inspect a detached native Session");
     const nativeSessionId = parseBinding(binding);
-    const info = await this.#sessionInfo(nativeSessionId, context.target);
+    const scoped = await this.#targetRuntime(context.target, context.signal);
+    const info = await this.#sessionInfo(nativeSessionId, context.target, context.signal, scoped);
     if (info === undefined) throw continuityGap();
-    assertSessionInfo(info, nativeSessionId, context.target.workspaceRoot);
+    assertSessionInfo(info, nativeSessionId, scoped.workspaceRoot, scoped.remote);
     return {
       binding,
       ...(info.customTitle === undefined ? {} : { name: this.#projection.text(info.customTitle, 512) }),
@@ -1067,19 +1086,21 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     const nativeSessionId = parseBinding(binding);
     if (nativeSessionId !== runtime.nativeSessionId) throw continuityGap();
 
-    const info = await this.#sessionInfo(nativeSessionId, context.target);
+    const info = await this.#sessionInfo(nativeSessionId, context.target, context.signal, targetRuntimeOf(runtime));
     this.#assertCurrent(runtime, context, binding);
     if (info === undefined) throw continuityGap();
-    assertSessionInfo(info, nativeSessionId, context.target.workspaceRoot);
+    assertSessionInfo(info, nativeSessionId, runtime.runtimeWorkspaceRoot, runtime.remote);
 
     let messages: readonly ClaudeSdkSessionMessage[];
     try {
-      messages = await this.#runtime.getSessionMessages(nativeSessionId, {
-        dir: context.target.workspaceRoot,
+      runtime.assertRuntimeCurrent();
+      messages = await runtime.sdkRuntime.getSessionMessages(nativeSessionId, {
+        dir: runtime.runtimeWorkspaceRoot,
         limit: MAX_NATIVE_HISTORY_MESSAGES + 1,
         offset: 0,
         includeSystemMessages: true
       });
+      runtime.assertRuntimeCurrent();
     } catch {
       throw claudeCodeError(
         "NATIVE_HISTORY_READ_FAILED",
@@ -1093,10 +1114,10 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       );
     }
     this.#assertCurrent(runtime, context, binding);
-    const confirmedInfo = await this.#sessionInfo(nativeSessionId, context.target);
+    const confirmedInfo = await this.#sessionInfo(nativeSessionId, context.target, context.signal, targetRuntimeOf(runtime));
     this.#assertCurrent(runtime, context, binding);
     if (confirmedInfo === undefined) throw continuityGap();
-    assertSessionInfo(confirmedInfo, nativeSessionId, context.target.workspaceRoot);
+    assertSessionInfo(confirmedInfo, nativeSessionId, runtime.runtimeWorkspaceRoot, runtime.remote);
     if (!Array.isArray(messages)) throw invalidNativeHistory();
     if (messages.length > MAX_NATIVE_HISTORY_MESSAGES) {
       throw claudeCodeError(
@@ -1133,6 +1154,11 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     this.#assertBindingContext(binding, context);
     const runtime = this.#sessions.get(context.sessionId);
     if (runtime === undefined) return;
+    if (runtime.closed && runtime.remote && !runtime.retirementConfirmed) {
+      this.#assertRetirementContext(runtime, context, binding);
+      await this.#retireRuntime(runtime);
+      return;
+    }
     this.#assertCurrent(runtime, context, binding);
     await this.#retireRuntime(runtime);
   }
@@ -1150,7 +1176,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     await this.validateTarget(context.target);
     this.#assertBindingContext(binding, context);
     const nativeSessionId = parseBinding(binding);
-    if (this.#runtime.ownsSessionFork(nativeSessionId)
+    const targetRuntime = await this.#targetRuntime(context.target, context.signal);
+    if (targetRuntime.runtime.ownsSessionFork(nativeSessionId)
       || [...this.#sessions.values()].some((runtime) => runtime.nativeSessionId === nativeSessionId && runtime.productSessionId !== context.sessionId)) {
       throw claudeCodeError("NATIVE_SESSION_DELETE_BUSY", "The native Session still has an active owner.", "session_delete", {
         retryable: true,
@@ -1166,19 +1193,25 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       throw claudeCodeError("NATIVE_SESSION_DELETE_CANCELLED", "The native Session delete was cancelled before dispatch.", "session_delete");
     }
     try {
-      const info = await this.#runtime.getSessionInfo(nativeSessionId, { dir: context.target.workspaceRoot, signal: context.signal });
+      targetRuntime.assertCurrent();
+      const info = await targetRuntime.runtime.getSessionInfo(nativeSessionId, {
+        dir: targetRuntime.workspaceRoot,
+        signal: context.signal
+      });
       await this.validateTarget(context.target);
+      targetRuntime.assertCurrent();
       context.signal.throwIfAborted();
       this.#assertBindingContext(binding, context);
-      if (this.#runtime.ownsSessionFork(nativeSessionId)
+      if (targetRuntime.runtime.ownsSessionFork(nativeSessionId)
         || [...this.#sessions.values()].some((active) => active.nativeSessionId === nativeSessionId)) {
         throw new Error("The native Session acquired another runtime owner.");
       }
       // The SDK may search related worktree stores for this UUID. Metadata is
       // the public authority for the exact workspace selected by this delete.
       if (info === undefined) throw continuityGap();
-      assertSessionInfo(info, nativeSessionId, context.target.workspaceRoot);
-      await this.#runtime.deleteSession(nativeSessionId, { dir: context.target.workspaceRoot, signal: context.signal });
+      assertSessionInfo(info, nativeSessionId, targetRuntime.workspaceRoot, targetRuntime.remote);
+      await targetRuntime.runtime.deleteSession(nativeSessionId, { dir: targetRuntime.workspaceRoot, signal: context.signal });
+      targetRuntime.assertCurrent();
     } catch {
       throw claudeCodeError("NATIVE_SESSION_DELETE_UNKNOWN", "The native Session delete outcome is unknown.", "session_delete", {
         retryable: true,
@@ -1205,6 +1238,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     validatePrompt(input);
     if (input.disposition === "steer") return this.#steer(input, context);
     let runtime = this.#requireIdleRuntime(context);
+    assertRemotePromptSupported(input, runtime);
     if (runtime.managedRoute !== undefined && (context.modelSelection?.providerId !== runtime.managedRoute.providerId
       || context.modelSelection.modelId !== runtime.managedRoute.model.modelId)) throw managedRouteUnavailable();
     const operationId = context.operationId;
@@ -1354,6 +1388,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
 
   async #steer(input: PromptInput, context: AdapterContext): Promise<void> {
     const runtime = this.#requireRuntime(context);
+    assertRemotePromptSupported(input, runtime);
     this.#assertStandardRuntime(runtime, "steer an active turn");
     if (!runtime.steerEnabled || !runtime.capabilities.has("interrupt_receipt_v1")) {
       throw claudeCodeError("BACKEND_CAPABILITY_UNAVAILABLE", "The native runtime cannot acknowledge same-turn input safely.", "dispatch");
@@ -1538,12 +1573,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       assertClaudeDerivationTarget(
         context.target,
         derivedTarget,
-        this.#runtime.supportsWorkspaceDerivation === true
+        runtime.sdkRuntime.supportsWorkspaceDerivation === true
       );
     }
     this.#assertStandardRuntime(runtime, "derive native history");
     if (context.signal.aborted) throw claudeCodeError(entryId === undefined ? "NATIVE_SESSION_CLONE_CANCELLED" : "NATIVE_SESSION_FORK_CANCELLED", "The native Session copy was cancelled.", phase);
-    if (runtime.nativeTasks.hasActiveTasks() || this.#runtime.ownsSessionFork(runtime.nativeSessionId)) {
+    if (runtime.nativeTasks.hasActiveTasks() || runtime.sdkRuntime.ownsSessionFork(runtime.nativeSessionId)) {
       throw claudeCodeError("SESSION_BUSY", "Native history still has an active writer.", phase, {
         recovery: "Wait for native work to finish before copying this Session."
       });
@@ -1564,12 +1599,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       signal.throwIfAborted();
       this.#assertCurrent(runtime, context, context.binding);
       if (info === undefined) throw continuityGap();
-      assertSessionInfo(info, runtime.nativeSessionId, runtime.target.workspaceRoot);
+      assertSessionInfo(info, runtime.nativeSessionId, runtime.runtimeWorkspaceRoot, runtime.remote);
       let sourceHistory: readonly ValidatedHistoryMessage[] | undefined;
       let boundaryId: string | undefined;
       let prefix: readonly ValidatedHistoryMessage[] | undefined;
       if (entryId !== undefined) {
-        const history = await this.#readForkHistory(runtime.nativeSessionId, runtime.target, signal);
+        const history = await this.#readForkHistory(runtime, runtime.nativeSessionId, signal);
         sourceHistory = history.entries;
         const selectedIndex = sourceHistory.findIndex((entry) => entry.uuid === entryId.toLowerCase());
         const selected = sourceHistory[selectedIndex];
@@ -1585,8 +1620,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       this.#assertCurrent(runtime, context, context.binding);
       if (runtime.nativeTasks.hasActiveTasks()) throw claudeCodeError("SESSION_BUSY", "Native history still has an active writer.", phase);
       dispatched = true;
-      const result = await this.#runtime.forkSession(runtime.nativeSessionId, {
-        dir: derivedTarget.workspaceRoot,
+      runtime.assertRuntimeCurrent();
+      const result = await runtime.sdkRuntime.forkSession(runtime.nativeSessionId, {
+        dir: effectiveTargetWorkspace(derivedTarget),
         ...(boundaryId === undefined ? {} : { upToMessageId: boundaryId }),
         signal,
         recordSessionId: (sessionId) => {
@@ -1600,6 +1636,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
           registered = binding;
         }
       });
+      runtime.assertRuntimeCurrent();
       signal.throwIfAborted();
       this.#assertCurrent(runtime, context, context.binding);
       if (registered === undefined || registered.nativeSessionId !== result.sessionId.toLowerCase()) throw new Error("Native Session copy lacks its receipt.");
@@ -1608,9 +1645,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       signal.throwIfAborted();
       this.#assertCurrent(runtime, context, context.binding);
       if (derivedInfo === undefined) throw continuityGap();
-      assertSessionInfo(derivedInfo, result.sessionId, derivedTarget.workspaceRoot);
+      assertSessionInfo(derivedInfo, result.sessionId, effectiveTargetWorkspace(derivedTarget), runtime.remote);
       if (sourceHistory !== undefined && prefix !== undefined) {
-        const derivedHistory = await this.#readForkHistory(result.sessionId, derivedTarget, signal);
+        const derivedHistory = await this.#readForkHistory(runtime, result.sessionId, signal, effectiveTargetWorkspace(derivedTarget));
         const derivedMessages = derivedHistory.entries.filter((entry) => entry.type !== "system");
         const sourceIds = new Set(sourceHistory.map((entry) => entry.uuid));
         if (derivedHistory.entries.some((entry) => entry.child || sourceIds.has(entry.uuid))
@@ -1633,13 +1670,15 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     }
   }
 
-  async #readForkHistory(nativeSessionId: string, target: TargetDescriptor, signal: AbortSignal): Promise<{
+  async #readForkHistory(runtime: NativeRuntime, nativeSessionId: string, signal: AbortSignal, workspaceRoot = runtime.runtimeWorkspaceRoot): Promise<{
     readonly messages: readonly ClaudeSdkSessionMessage[];
     readonly entries: readonly ValidatedHistoryMessage[];
   }> {
-    const messages = await waitFor(this.#runtime.getSessionMessages(nativeSessionId, {
-      dir: target.workspaceRoot, limit: MAX_NATIVE_HISTORY_MESSAGES + 1, offset: 0, includeSystemMessages: true, signal
+    runtime.assertRuntimeCurrent();
+    const messages = await waitFor(runtime.sdkRuntime.getSessionMessages(nativeSessionId, {
+      dir: workspaceRoot, limit: MAX_NATIVE_HISTORY_MESSAGES + 1, offset: 0, includeSystemMessages: true, signal
     }), this.#initializationTimeoutMs, signal, () => new SessionSdkFailure("TIMEOUT", false));
+    runtime.assertRuntimeCurrent();
     signal.throwIfAborted();
     if (!Array.isArray(messages) || messages.length > MAX_NATIVE_HISTORY_MESSAGES) throw invalidNativeHistory();
     const entries = messages.map((message) => validatedHistoryMessage(message, nativeSessionId));
@@ -1656,7 +1695,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     signal.throwIfAborted();
     this.#assertCurrent(runtime, context, context.binding);
     if (info === undefined) throw continuityGap();
-    assertSessionInfo(info, runtime.nativeSessionId, runtime.target.workspaceRoot);
+    assertSessionInfo(info, runtime.nativeSessionId, runtime.runtimeWorkspaceRoot, runtime.remote);
     if (!Number.isFinite(initialInfo.lastModified) || info.lastModified !== initialInfo.lastModified || runtime.nativeTasks.hasActiveTasks()) {
       throw claudeCodeError("NATIVE_SESSION_FORK_SOURCE_CHANGED", "Native history changed while its fork was being prepared.", "session_fork");
     }
@@ -1786,10 +1825,10 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         this.#initializationTimeoutMs, context.signal, managedRouteUnavailable);
       this.#assertCurrent(runtime, context, context.binding);
       if (info === undefined) throw continuityGap();
-      assertSessionInfo(info, runtime.nativeSessionId, runtime.target.workspaceRoot);
+      assertSessionInfo(info, runtime.nativeSessionId, runtime.runtimeWorkspaceRoot, runtime.remote);
       retired = true;
       await this.#retireRuntime(runtime);
-      await waitFor(this.#runtime.retireQuery(runtime.query, this.#teardownTimeoutMs), this.#teardownTimeoutMs,
+      await waitFor(runtime.sdkRuntime.retireQuery(runtime.query, this.#teardownTimeoutMs), this.#teardownTimeoutMs,
         context.signal, () => managedRouteUnavailable(true));
       context.signal.throwIfAborted();
       const retainedEffort = normalizeProductEffort(runtime.effort);
@@ -1872,7 +1911,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
   ): Promise<void> {
     const runtime = this.#requireIdleRuntime(context);
     this.#assertStandardRuntime(runtime, "change additional directories");
-    const validated = await this.#validateExtraDirectories(directories);
+    const validated = await this.#validateExtraDirectories(directories, runtime.target);
     const paths = validated.map((directory) => directory.path);
     await this.#runIdleControl(runtime, context, "extra_directories", async (acknowledge) => {
       await runtime.query.applyFlagSettings({ permissions: { additionalDirectories: paths } });
@@ -1882,24 +1921,27 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
   }
 
   override async dispose(): Promise<void> {
-    this.#managedProviders?.dispose();
+    const failures: unknown[] = [];
+    try { this.#managedProviders?.dispose(); }
+    catch (error) { failures.push(error); }
     if (this.#disposed) {
-      await Promise.all([this.#runtime.closeSessionOperations(), this.#runtime.retireOwnedProcesses?.(this.#teardownTimeoutMs)]);
+      try { await this.#closeSdkRuntimes(); }
+      catch (error) { failures.push(error); }
+      throwCombinedFailures(failures, "Claude Code Adapter resources could not all retire.");
       return;
     }
     this.#disposed = true;
-    const sessionRetirement = this.#runtime.closeSessionOperations();
-    void sessionRetirement.catch(() => undefined);
-    let authorizationError: unknown;
     try {
       await this.#oauthAccount?.dispose();
     } catch (error) {
-      authorizationError = error;
+      failures.push(error);
     }
     const runtimes = [...this.#sessions.values()];
-    await Promise.all(runtimes.map(async (runtime) => this.#retireRuntime(runtime)));
-    await Promise.all([sessionRetirement, this.#runtime.retireOwnedProcesses?.(this.#teardownTimeoutMs)]);
-    if (authorizationError !== undefined) throw authorizationError;
+    const retirement = await Promise.allSettled(runtimes.map(async (runtime) => this.#retireRuntime(runtime)));
+    failures.push(...retirement.flatMap((result) => result.status === "rejected" ? [result.reason] : []));
+    try { await this.#closeSdkRuntimes(); }
+    catch (error) { failures.push(error); }
+    throwCombinedFailures(failures, "Claude Code Adapter resources could not all retire.");
   }
 
   async quiesceForReplacement(): Promise<void> {
@@ -1907,20 +1949,21 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
   }
 
   async forceDispose(): Promise<void> {
-    this.#managedProviders?.dispose();
+    const failures: unknown[] = [];
+    try { this.#managedProviders?.dispose(); }
+    catch (error) { failures.push(error); }
     this.#disposed = true;
-    const sessionRetirement = this.#runtime.closeSessionOperations();
-    void sessionRetirement.catch(() => undefined);
-    let authorizationError: unknown;
     try {
       await this.#oauthAccount?.dispose();
     } catch (error) {
-      authorizationError = error;
+      failures.push(error);
     }
     const runtimes = [...this.#sessions.values()];
-    await Promise.all(runtimes.map(async (runtime) => this.#retireRuntime(runtime, false)));
-    await Promise.all([sessionRetirement, this.#runtime.retireOwnedProcesses?.(this.#teardownTimeoutMs)]);
-    if (authorizationError !== undefined) throw authorizationError;
+    const retirement = await Promise.allSettled(runtimes.map(async (runtime) => this.#retireRuntime(runtime, false)));
+    failures.push(...retirement.flatMap((result) => result.status === "rejected" ? [result.reason] : []));
+    try { await this.#closeSdkRuntimes(); }
+    catch (error) { failures.push(error); }
+    throwCombinedFailures(failures, "Claude Code Adapter resources could not all retire.");
   }
 
   async #startRuntime(
@@ -1950,11 +1993,13 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       || launch.additionalDirectories.length !== 0
     )) throw invalidReviewProfile();
     this.#assertBindingContext(binding, context);
+    const scoped = await this.#targetRuntime(context.target, context.signal);
+    scoped.assertCurrent();
     const nativeSessionId = parseBinding(binding);
     if (launch.resume) {
-      const info = await this.#sessionInfo(nativeSessionId, context.target);
+      const info = await this.#sessionInfo(nativeSessionId, context.target, context.signal, scoped);
       if (info === undefined) throw continuityGap();
-      assertSessionInfo(info, nativeSessionId, context.target.workspaceRoot);
+      assertSessionInfo(info, nativeSessionId, scoped.workspaceRoot, scoped.remote);
     }
     const providerId = launch.providerId ?? context.modelSelection?.providerId;
     const modelId = launch.modelId ?? context.modelSelection?.modelId;
@@ -2023,7 +2068,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       );
     }
     let runtime: NativeRuntime | undefined;
-    const startedQuery = await this.#createQuery(gate, abortController, nativeSessionId, context, launch, managedRoute, (...args) => {
+    const startedQuery = await this.#createQuery(scoped, gate, abortController, nativeSessionId, context, launch, managedRoute, (...args) => {
       if (runtime === undefined) {
         return Promise.resolve({ behavior: "deny", message: "The native Session is not ready." });
       }
@@ -2043,6 +2088,10 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         gate,
         abortController,
         query,
+        sdkRuntime: scoped.runtime,
+        runtimeWorkspaceRoot: scoped.workspaceRoot,
+        remote: scoped.remote,
+        assertRuntimeCurrent: scoped.assertCurrent,
         baseContext: context,
         nativeTasks: new ClaudeNativeTaskProjection({
           sessionId: context.sessionId,
@@ -2058,6 +2107,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         toolNames: new Map(),
         consumer: Promise.resolve(),
         closed: false,
+        retirementConfirmed: false,
         nativeTaskProjectionEnabled: false,
         steerEnabled: false,
         controlUncertain: false,
@@ -2130,6 +2180,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
   }
 
   async #createQuery(
+    scoped: ClaudeTargetRuntime,
     gate: AsyncInputGate<ClaudeSdkUserMessage>,
     abortController: AbortController,
     nativeSessionId: string,
@@ -2183,7 +2234,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       if (runtimeAuthorization !== undefined && !runtimeAuthorization.isCurrent()) {
         throw new Error("The subscription authorization changed before native startup.");
       }
-      const query = await this.#runtime.query({
+      scoped.assertCurrent();
+      const query = await scoped.runtime.query({
         prompt: gate,
         options: {
           abortController,
@@ -2191,7 +2243,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
           allowDangerouslySkipPermissions: launch.runtimePolicy === "standard",
           ...(launch.runtimePolicy === "review_read_only" ? { agents: {} } : {}),
           canUseTool,
-          cwd: context.target.workspaceRoot,
+          cwd: scoped.workspaceRoot,
           env: {
             ...this.#environment,
             ...runtimeAuthorization?.environment,
@@ -2258,6 +2310,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
             : { type: "preset", preset: "claude_code" }
         }
       });
+      scoped.assertCurrent();
       if (runtimeAuthorization !== undefined && !runtimeAuthorization.isCurrent()) {
         abortController.abort();
         query.close();
@@ -2268,11 +2321,11 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         subagentModel,
         releaseAuthorization: () => runtimeAuthorization?.release()
       };
-    } catch {
+    } catch (error) {
       runtimeAuthorization?.release();
       throw claudeCodeError("NATIVE_RUNTIME_START_FAILED", "The Claude Code runtime could not start.", "session_start", {
         retryable: true,
-        stateMayHaveChanged: false,
+        stateMayHaveChanged: runtimeFailureMayHaveChanged(error),
         recovery: "Verify the installed SDK and native CLI, then retry."
       });
     }
@@ -2306,7 +2359,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       const cliVersion = stringValue(envelope["claude_code_version"]);
       const observedCwd = stringValue(envelope["cwd"]);
       if (observedId === undefined || cliVersion === undefined || observedCwd === undefined) throw continuityGap();
-      assertSessionTarget(observedCwd, runtime.target.workspaceRoot);
+      runtime.assertRuntimeCurrent();
+      assertSessionTarget(observedCwd, runtime.runtimeWorkspaceRoot, runtime.remote);
       this.#lastCliVersion = this.#projection.text(cliVersion, 128);
       if (runtime.subagentModel !== undefined && !supportsSubagentDefaultModel(this.#lastCliVersion)) {
         throw subagentDefaultModelUnavailable(true);
@@ -3238,48 +3292,68 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     waitForConsumer = true,
     taskFailure?: PublicError
   ): Promise<void> {
-    if (runtime.closed) return;
-    runtime.managedRoute?.dispose();
-    const retiringTurn = runtime.activeTurn;
-    if (retiringTurn !== undefined) {
-      retiringTurn.stopping = true;
-      retiringTurn.terminalClaimed = true;
-      retiringTurn.interruptConfirmation?.reject(turnAbortUnknown("The runtime retired before interrupt confirmation.")());
-      for (const steer of retiringTurn.steers.values()) {
-        steer.admission.reject(dispatchError("The runtime retired before same-turn admission was confirmed.", steer.consumed));
-        steer.cancellation.abort(steerNotActive());
+    if (runtime.retirementConfirmed) return;
+    if (!runtime.closed) {
+      runtime.managedRoute?.dispose();
+      const retiringTurn = runtime.activeTurn;
+      if (retiringTurn !== undefined) {
+        retiringTurn.stopping = true;
+        retiringTurn.terminalClaimed = true;
+        retiringTurn.interruptConfirmation?.reject(turnAbortUnknown("The runtime retired before interrupt confirmation.")());
+        for (const steer of retiringTurn.steers.values()) {
+          steer.admission.reject(dispatchError("The runtime retired before same-turn admission was confirmed.", steer.consumed));
+          steer.cancellation.abort(steerNotActive());
+        }
       }
-    }
-    runtime.inputPreparation?.abort(claudeCodeError(
-      "BACKEND_GENERATION_MISMATCH",
-      "The native runtime was retired before input preparation finished.",
-      "generation",
-      { recovery: "Refresh Session state before retrying." }
-    ));
-    if (runtime.activeTurn !== undefined) this.#clearNativeContinuation(runtime.activeTurn);
-    if (runtime.nativeTaskProjectionEnabled) {
+      runtime.inputPreparation?.abort(claudeCodeError(
+        "BACKEND_GENERATION_MISMATCH",
+        "The native runtime was retired before input preparation finished.",
+        "generation",
+        { recovery: "Refresh Session state before retrying." }
+      ));
+      if (runtime.activeTurn !== undefined) this.#clearNativeContinuation(runtime.activeTurn);
+      if (runtime.nativeTaskProjectionEnabled) {
+        try {
+          await this.#publishNativeTaskEmissions(
+            runtime,
+            runtime.nativeTasks.terminateActive(taskFailure === undefined ? "stopped" : "failed", taskFailure)
+          );
+        } catch {
+          // Runtime retirement remains authoritative when terminal task publication fails.
+        }
+      }
+      runtime.closed = true;
+      const reason = new Error("The native runtime was retired.");
+      runtime.activeTurn?.admission.reject(reason);
+      runtime.activeTurn?.eventsReady.resolve(undefined);
+      runtime.gate.close(reason);
+      runtime.abortController.abort();
       try {
-        await this.#publishNativeTaskEmissions(
-          runtime,
-          runtime.nativeTasks.terminateActive(taskFailure === undefined ? "stopped" : "failed", taskFailure)
-        );
+        runtime.query.close();
       } catch {
-        // Runtime retirement remains authoritative when terminal task publication fails.
+        // The AbortController and closed generation fence remain authoritative.
       }
     }
-    runtime.closed = true;
+    if (runtime.remote) {
+      try {
+        await runtime.sdkRuntime.retireQuery(runtime.query, this.#teardownTimeoutMs);
+        runtime.assertRuntimeCurrent();
+      } catch {
+        throw claudeCodeError(
+          "REMOTE_QUERY_RETIREMENT_UNKNOWN",
+          "The remote Claude Code Query did not confirm exact process retirement.",
+          "session_close",
+          {
+            retryable: true,
+            stateMayHaveChanged: true,
+            recovery: "Reconnect the exact Remote Host and inspect the native Session before resuming it."
+          }
+        );
+      }
+    }
+    runtime.retirementConfirmed = true;
     if (this.#sessions.get(runtime.productSessionId) === runtime) {
       this.#sessions.delete(runtime.productSessionId);
-    }
-    const reason = new Error("The native runtime was retired.");
-    runtime.activeTurn?.admission.reject(reason);
-    runtime.activeTurn?.eventsReady.resolve(undefined);
-    runtime.gate.close(reason);
-    runtime.abortController.abort();
-    try {
-      runtime.query.close();
-    } catch {
-      // The AbortController and closed generation fence remain authoritative.
     }
     if (waitForConsumer) await settleWithin(runtime.consumer, this.#teardownTimeoutMs);
   }
@@ -3287,12 +3361,25 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
   async #retireAuthorizedRuntimes(): Promise<void> {
     const runtimes = [...this.#sessions.values()];
     await Promise.all(runtimes.map(async (runtime) => this.#retireRuntime(runtime)));
-    await this.#runtime.retireOwnedProcesses?.(this.#teardownTimeoutMs);
+    await Promise.all([...this.#resolvedTargetRuntimes].map(async (sdkRuntime) =>
+      sdkRuntime.retireOwnedProcesses?.(this.#teardownTimeoutMs)));
   }
 
-  async #sessionInfo(nativeSessionId: string, target: TargetDescriptor, signal?: AbortSignal) {
+  async #sessionInfo(
+    nativeSessionId: string,
+    target: TargetDescriptor,
+    signal?: AbortSignal,
+    existing?: ClaudeTargetRuntime
+  ) {
     try {
-      return await this.#runtime.getSessionInfo(nativeSessionId, { dir: target.workspaceRoot, ...(signal === undefined ? {} : { signal }) });
+      const scoped = existing ?? await this.#targetRuntime(target, signal);
+      scoped.assertCurrent();
+      const info = await scoped.runtime.getSessionInfo(nativeSessionId, {
+        dir: scoped.workspaceRoot,
+        ...(signal === undefined ? {} : { signal })
+      });
+      scoped.assertCurrent();
+      return info;
     } catch {
       throw claudeCodeError("NATIVE_SESSION_INSPECTION_FAILED", "The native Session could not be inspected.", "session_inspect", {
         retryable: true,
@@ -3300,6 +3387,65 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         recovery: "Verify the SDK installation and native Session store, then retry."
       });
     }
+  }
+
+  async #targetRuntime(target: TargetDescriptor, signal?: AbortSignal): Promise<ClaudeTargetRuntime> {
+    if (target.remoteWorkspace === undefined) {
+      return Object.freeze({
+        runtime: this.#runtime,
+        workspaceRoot: target.workspaceRoot,
+        remote: false,
+        assertCurrent: () => {}
+      });
+    }
+    validateRemoteTarget(target);
+    if (this.#remoteRuntimes === undefined) {
+      throw claudeCodeError(
+        "REMOTE_RUNTIME_UNAVAILABLE",
+        "The remote Claude Code runtime is unavailable.",
+        "target",
+        { retryable: true, recovery: "Install the fixed remote runtime for this Target, then retry." }
+      );
+    }
+    try {
+      signal?.throwIfAborted();
+      const scoped = await this.#remoteRuntimes.resolve(target, signal);
+      signal?.throwIfAborted();
+      if (!scoped.remote || scoped.workspaceRoot !== target.remoteWorkspace.workspaceRoot) {
+        throw new Error("The remote runtime returned a different workspace authority.");
+      }
+      scoped.assertCurrent();
+      this.#resolvedTargetRuntimes.add(scoped.runtime);
+      return scoped;
+    } catch (error) {
+      if (error instanceof JokoError) throw error;
+      throw claudeCodeError(
+        "REMOTE_RUNTIME_UNAVAILABLE",
+        "The remote Claude Code runtime could not be opened for this Target.",
+        "target",
+        {
+          retryable: true,
+          stateMayHaveChanged: false,
+          recovery: "Reconnect the exact Remote Host, verify its fixed runtime, and retry."
+        }
+      );
+    }
+  }
+
+  async #closeSdkRuntimes(): Promise<void> {
+    const runtimes = [...this.#resolvedTargetRuntimes];
+    const settled = await Promise.allSettled(runtimes.map(async (runtime) => {
+      const failures: unknown[] = [];
+      try { await runtime.closeSessionOperations(); }
+      catch (error) { failures.push(error); }
+      try { await runtime.retireOwnedProcesses?.(this.#teardownTimeoutMs); }
+      catch (error) { failures.push(error); }
+      throwCombinedFailures(failures, "One Claude SDK runtime could not retire.");
+    }));
+    const failures = settled.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+    try { await this.#remoteRuntimes?.close(); }
+    catch (error) { failures.push(error); }
+    throwCombinedFailures(failures, "Claude SDK runtimes could not all retire.");
   }
 
   #observeProbe(probe: ClaudeSdkProbe, installed: boolean): void {
@@ -3331,7 +3477,18 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     this.#authenticationState = authenticationStateFor(initialization.account, apiKeySource);
   }
 
-  async #validateExtraDirectories(directories: readonly ApprovedDirectory[]): Promise<readonly ApprovedDirectory[]> {
+  async #validateExtraDirectories(
+    directories: readonly ApprovedDirectory[],
+    target: TargetDescriptor
+  ): Promise<readonly ApprovedDirectory[]> {
+    if (target.remoteWorkspace !== undefined && directories.length > 0) {
+      throw claudeCodeError(
+        "REMOTE_EXTRA_DIRECTORIES_UNSUPPORTED",
+        "Remote additional directories require their own Host-bound authority.",
+        "extra_directories",
+        { recovery: "Remove additional directories from this remote Session and retry." }
+      );
+    }
     const seen = new Set<string>();
     const validated: ApprovedDirectory[] = [];
     for (const directory of directories) {
@@ -3369,7 +3526,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
 
   #requireIdleRuntime(context: AdapterContext): NativeRuntime {
     const runtime = this.#requireRuntime(context);
-    if (this.#runtime.ownsSessionFork(runtime.nativeSessionId)) {
+    if (runtime.sdkRuntime.ownsSessionFork(runtime.nativeSessionId)) {
       throw claudeCodeError("SESSION_BUSY", "A native Session copy still owns this history.", "control", {
         recovery: "Wait for the native Session copy to retire before continuing."
       });
@@ -3401,10 +3558,49 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
   }
 
   #assertCurrent(runtime: NativeRuntime, context: AdapterContext, binding?: NativeSessionBinding): void {
+    try {
+      runtime.assertRuntimeCurrent();
+    } catch {
+      throw claudeCodeError("BACKEND_GENERATION_MISMATCH", "The remote runtime authority no longer matches this request.", "generation", {
+        recovery: "Refresh the Remote Host and Session state before retrying."
+      });
+    }
     if (!this.#matchesContext(runtime, context, binding)) {
       throw claudeCodeError("BACKEND_GENERATION_MISMATCH", "The native runtime fence no longer matches this request.", "generation", {
         recovery: "Refresh Session state before retrying."
       });
+    }
+  }
+
+  #assertRetirementContext(runtime: NativeRuntime, context: AdapterContext, binding: NativeSessionBinding): void {
+    try {
+      runtime.assertRuntimeCurrent();
+    } catch {
+      throw claudeCodeError(
+        "BACKEND_GENERATION_MISMATCH",
+        "The remote runtime authority no longer matches this retirement request.",
+        "generation",
+        { recovery: "Reconnect the exact Remote Host before retrying retirement." }
+      );
+    }
+    if (this.#sessions.get(runtime.productSessionId) !== runtime
+      || runtime.productSessionId !== context.sessionId
+      || runtime.sessionGeneration !== context.generation
+      || runtime.backendInstanceGeneration !== context.backendInstanceGeneration
+      || runtime.runtimePolicy !== (context.runtimePolicy === "review_read_only" ? "review_read_only" : "standard")
+      || runtime.target.id !== context.target.id
+      || runtime.target.backendId !== context.target.backendId
+      || runtime.target.managed !== context.target.managed
+      || runtime.target.trusted !== context.target.trusted
+      || !sameTargetWorkspace(runtime.target, context.target)
+      || binding.opaqueRef !== runtime.binding.opaqueRef
+      || binding.generation !== runtime.binding.generation) {
+      throw claudeCodeError(
+        "BACKEND_GENERATION_MISMATCH",
+        "The retired native runtime fence no longer matches this request.",
+        "generation",
+        { recovery: "Refresh Session state before retrying retirement." }
+      );
     }
   }
 
@@ -3418,7 +3614,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       && runtime.target.backendId === context.target.backendId
       && runtime.target.managed === context.target.managed
       && runtime.target.trusted === context.target.trusted
-      && canonicalPathKey(runtime.target.workspaceRoot) === canonicalPathKey(context.target.workspaceRoot)
+      && sameTargetWorkspace(runtime.target, context.target)
       && (binding === undefined || (
         binding.opaqueRef === runtime.binding.opaqueRef
         && binding.generation === runtime.binding.generation
@@ -3426,7 +3622,13 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
   }
 
   #isRuntimeCurrent(runtime: NativeRuntime): boolean {
-    return !runtime.closed && this.#sessions.get(runtime.productSessionId) === runtime;
+    if (runtime.closed || this.#sessions.get(runtime.productSessionId) !== runtime) return false;
+    try {
+      runtime.assertRuntimeCurrent();
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   #isTurnCurrent(runtime: NativeRuntime, turn: ActiveTurn): boolean {
@@ -4280,12 +4482,13 @@ function messageBlockCharacters(block: MessageBlock): number {
 
 function nativeSessionCandidate(
   info: ClaudeSdkSessionInfo,
-  target: TargetDescriptor,
+  workspaceRoot: string,
+  remote: boolean,
   projection: SafeProjection
 ): NativeSessionCandidate | undefined {
   try {
     const nativeSessionId = normalizeNativeSessionId(info.sessionId);
-    assertSessionTarget(info.cwd, target.workspaceRoot);
+    assertSessionTarget(info.cwd, workspaceRoot, remote);
     if (!Number.isSafeInteger(info.lastModified) || info.lastModified < 0) return undefined;
     const name = projection.text(info.customTitle ?? info.summary, 512).trim();
     return {
@@ -4359,11 +4562,26 @@ function assertSameTarget(left: TargetDescriptor, right: TargetDescriptor): void
     || left.backendId !== right.backendId
     || left.managed !== right.managed
     || left.trusted !== right.trusted
-    || canonicalPathKey(left.workspaceRoot) !== canonicalPathKey(right.workspaceRoot)) {
+    || !sameTargetWorkspace(left, right)) {
     throw claudeCodeError("TARGET_CONTEXT_MISMATCH", "The creation input and Adapter context identify different Targets.", "target", {
       recovery: "Refresh the Target and retry Session creation."
     });
   }
+}
+
+function assertRemotePromptSupported(input: PromptInput, runtime: NativeRuntime): void {
+  if (!runtime.remote) return;
+  const pathBackedMention = input.mentions.some((mention) => mention.kind !== "resource");
+  if (input.files.length === 0 && !pathBackedMention) return;
+  throw claudeCodeError(
+    "REMOTE_FILE_INPUT_UNSUPPORTED",
+    "Remote Claude Code file input requires a Host-bound file authority.",
+    "input",
+    {
+      stateMayHaveChanged: false,
+      recovery: "Send text, inline images, or approved text resources, or move the file into a supported remote-file flow."
+    }
+  );
 }
 
 function assertClaudeDerivationTarget(
@@ -4391,15 +4609,20 @@ function assertClaudeDerivationTarget(
 function assertSessionInfo(
   info: ClaudeSdkSessionInfo,
   expectedSessionId: string,
-  expectedCwd: string
+  expectedCwd: string,
+  remote = false
 ): void {
   if (normalizeNativeSessionId(info.sessionId) !== expectedSessionId) throw continuityGap();
-  assertSessionTarget(info.cwd, expectedCwd);
+  assertSessionTarget(info.cwd, expectedCwd, remote);
 }
 
-function assertSessionTarget(observedCwd: string | undefined, expectedCwd: string): void {
-  if (observedCwd === undefined || !isAbsolute(observedCwd)
-    || canonicalPathKey(observedCwd) !== canonicalPathKey(expectedCwd)) throw continuityGap();
+function assertSessionTarget(observedCwd: string | undefined, expectedCwd: string, remote = false): void {
+  if (observedCwd === undefined) throw continuityGap();
+  if (remote) {
+    if (!normalizedAbsoluteRemotePath(observedCwd) || observedCwd !== expectedCwd) throw continuityGap();
+    return;
+  }
+  if (!isAbsolute(observedCwd) || canonicalPathKey(observedCwd) !== canonicalPathKey(expectedCwd)) throw continuityGap();
 }
 
 function assertFullAccessTarget(mode: PermissionMode, target: TargetDescriptor, phase: string): void {
@@ -4454,6 +4677,51 @@ function normalizeEffort(value: string | undefined): typeof EFFORT_LEVELS[number
 
 function findModel(models: readonly ClaudeSdkModelInfo[], modelId: string): ClaudeSdkModelInfo | undefined {
   return models.find((model) => model.value === modelId || model.resolvedModel === modelId);
+}
+
+function validateRemoteTarget(target: TargetDescriptor): void {
+  const binding = target.remoteWorkspace;
+  if (binding === undefined
+    || binding.hostId.length === 0
+    || binding.hostId.length > 256
+    || /[\u0000-\u001f\u007f]/u.test(binding.hostId)
+    || !normalizedAbsoluteRemotePath(binding.workspaceRoot)) {
+    throw claudeCodeError("REMOTE_TARGET_INVALID", "The remote Claude Code Target binding is invalid.", "target", {
+      recovery: "Select a canonical absolute workspace on a ready Remote Host."
+    });
+  }
+}
+
+function normalizedAbsoluteRemotePath(value: string): boolean {
+  return value.length > 0
+    && value.length <= 16_384
+    && !/[\u0000-\u001f\u007f\\]/u.test(value)
+    && remotePath.isAbsolute(value)
+    && remotePath.normalize(value) === value;
+}
+
+function effectiveTargetWorkspace(target: TargetDescriptor): string {
+  return target.remoteWorkspace?.workspaceRoot ?? target.workspaceRoot;
+}
+
+function sameTargetWorkspace(left: TargetDescriptor, right: TargetDescriptor): boolean {
+  if (left.remoteWorkspace === undefined || right.remoteWorkspace === undefined) {
+    return left.remoteWorkspace === undefined
+      && right.remoteWorkspace === undefined
+      && canonicalPathKey(left.workspaceRoot) === canonicalPathKey(right.workspaceRoot);
+  }
+  return left.workspaceRoot === right.workspaceRoot
+    && left.remoteWorkspace.hostId === right.remoteWorkspace.hostId
+    && left.remoteWorkspace.workspaceRoot === right.remoteWorkspace.workspaceRoot;
+}
+
+function targetRuntimeOf(runtime: NativeRuntime): ClaudeTargetRuntime {
+  return {
+    runtime: runtime.sdkRuntime,
+    workspaceRoot: runtime.runtimeWorkspaceRoot,
+    remote: runtime.remote,
+    assertCurrent: runtime.assertRuntimeCurrent
+  };
 }
 
 function assertFastModeSupported(runtime: NativeRuntime): void {
@@ -4828,6 +5096,18 @@ function nativeTaskControlUnavailable(): JokoError {
 
 function positiveTimeout(value: number | undefined, fallback: number): number {
   return value !== undefined && Number.isSafeInteger(value) && value > 0 ? value : fallback;
+}
+
+function throwCombinedFailures(failures: readonly unknown[], message: string): void {
+  if (failures.length === 0) return;
+  if (failures.length === 1) throw failures[0];
+  throw new AggregateError(failures, message);
+}
+
+function runtimeFailureMayHaveChanged(error: unknown): boolean {
+  return typeof error === "object"
+    && error !== null
+    && (error as Readonly<Record<string, unknown>>)["stateMayHaveChanged"] === true;
 }
 
 function positiveBound(value: number | undefined, fallback: number, maximum: number): number {

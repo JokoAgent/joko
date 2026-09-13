@@ -9,6 +9,14 @@ import {
   uninstallRemoteCodex,
   type RemoteCodexInstallPhase
 } from "./remote-codex-installation.js";
+import {
+  REMOTE_CLAUDE_EXPECTED_VERSION,
+  RemoteClaudeInstallationError,
+  installRemoteClaude,
+  probeRemoteClaudeInstallation,
+  uninstallRemoteClaude,
+  type RemoteClaudeInstallPhase
+} from "./remote-claude-installation.js";
 import type { RemoteHostRegistry } from "./remote-host-registry.js";
 
 const MAXIMUM_TERMINAL_REQUESTS = 128;
@@ -523,6 +531,23 @@ export function createRemoteCodexRuntimeSetupProvider(backendId: string): Remote
   return Object.freeze(provider);
 }
 
+export function createRemoteClaudeRuntimeSetupProvider(backendId: string): RemoteBackendRuntimeSetupProvider {
+  const provider: RemoteBackendRuntimeSetupProvider = {
+    backendId,
+    displayName: "Claude Code",
+    expectedVersion: REMOTE_CLAUDE_EXPECTED_VERSION,
+    probe: async (context, signal) => setupProbe(await probeRemoteClaudeInstallation(context.processes, "/", context.assertCurrent, signal)),
+    install: async (context, reinstall, signal, onPhase) => setupProbe(await installRemoteClaude(context.processes, {
+      reinstall,
+      assertCurrent: context.assertCurrent,
+      signal,
+      onPhase: (phase: RemoteClaudeInstallPhase) => onPhase(phase)
+    })),
+    uninstall: async (context, signal) => setupProbe(await uninstallRemoteClaude(context.processes, context.assertCurrent, signal))
+  };
+  return Object.freeze(provider);
+}
+
 function setupProbe(value: { readonly state: "ready" | "not_installed"; readonly installedVersion?: string }): ProviderProbe {
   return Object.freeze({ state: value.state, ...(value.installedVersion === undefined ? {} : { installedVersion: value.installedVersion }) });
 }
@@ -570,12 +595,16 @@ function runtimeFailureCode(
 ): RemoteBackendRuntimeFailureCode {
   if (error instanceof RemoteBackendRuntimeSetupError) return error.code;
   if (error instanceof RemoteCodexInstallationError && error.code === "busy") return "busy";
+  if (error instanceof RemoteClaudeInstallationError && error.code === "busy") return "busy";
   return signal.aborted ? "aborted" : fallback;
 }
 
 function remoteEffectMayHaveChanged(error: unknown, effectStarted: boolean): boolean {
   if (!effectStarted) return false;
-  return !(error instanceof RemoteCodexInstallationError) || error.stateMayHaveChanged;
+  return !(
+    error instanceof RemoteCodexInstallationError
+    || error instanceof RemoteClaudeInstallationError
+  ) || error.stateMayHaveChanged;
 }
 
 function failure(code: RemoteBackendRuntimeFailureCode): RemoteBackendRuntimeFailure {

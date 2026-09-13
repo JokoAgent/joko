@@ -55,6 +55,7 @@ import { TerminalProvider } from "@joko/tool-terminal";
 import { RemoteTerminalRuntimeResolver } from "./remote-terminal-runtime.js";
 import { RemoteCodexRuntimeResolver } from "./remote-codex-read-runtime.js";
 import { RemoteCodexMcpBridgeManager } from "./remote-codex-mcp-bridge.js";
+import { RemoteClaudeRuntimeResolver } from "./remote-claude-runtime.js";
 import {
   ComputerRuntime,
   ComputerToolProvider,
@@ -140,6 +141,7 @@ import { PiResourceManager } from "./resource-manager.js";
 import { RemoteHostRegistry } from "./remote-host-registry.js";
 import {
   RemoteBackendRuntimeSetupManager,
+  createRemoteClaudeRuntimeSetupProvider,
   createRemoteCodexRuntimeSetupProvider
 } from "./remote-backend-runtime-setup.js";
 import { RemotePiProcessFactory } from "./remote-pi-process.js";
@@ -793,7 +795,10 @@ export async function createOrchestratorApplication(
   const remoteBackendRuntimeSetup = new RemoteBackendRuntimeSetupManager({
     store,
     registry: remoteHosts,
-    providers: [createRemoteCodexRuntimeSetupProvider(codexBackendId)]
+    providers: [
+      createRemoteCodexRuntimeSetupProvider(codexBackendId),
+      createRemoteClaudeRuntimeSetupProvider(claudeCodeBackendId)
+    ]
   });
   const claudeCodeCredentialPort = createClaudeCodeCredentialPort(
     credentials,
@@ -884,6 +889,10 @@ export async function createOrchestratorApplication(
       create: ({ instanceId, generation }) => createClaudeCodeAdapter({
         id: instanceId,
         instanceGeneration: generation,
+        remoteRuntimes: new RemoteClaudeRuntimeResolver({
+          store,
+          registry: remoteHosts
+        }),
         managedProviders: managedRuntime(instanceId, generation, CLAUDE_MANAGED_PROVIDER_SUPPORT),
         credentialPort: claudeCodeCredentialPort,
         resolveSubagentModel: (providerId) => subagentModels.resolve(instanceId, providerId),

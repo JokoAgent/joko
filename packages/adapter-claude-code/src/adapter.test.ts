@@ -20,6 +20,7 @@ import { ClaudeCodeAdapter, type ClaudeCodeAdapterOptions } from "./adapter.js";
 import { SessionSdkFailure } from "./session-sdk-owner.js";
 import {
   CLAUDE_AGENT_SDK_VERSION,
+  type ClaudeRemoteRuntimePort,
   type ClaudeCanUseToolOptions,
   type ClaudeSdkGetSessionMessagesOptions,
   type ClaudeSdkForkOptions,
@@ -1651,6 +1652,134 @@ describe("ClaudeCodeAdapter", () => {
       publicError: { code: "TARGET_BACKEND_MISMATCH" }
     });
     await expect(adapter.validateTarget({ ...target, backendId: "claude-local-one" })).resolves.toBeUndefined();
+  });
+
+  test("routes a remote Target through its exact runtime and rejects local path authority before native input", async () => {
+    const remoteTarget: TargetDescriptor = {
+      ...target,
+      id: "target-remote",
+      workspaceRoot: "D:\\service-owned-placeholder",
+      remoteWorkspace: { hostId: "host-a", workspaceRoot: "/srv/project" }
+    };
+    const localRuntime = new FakeSdkRuntime();
+    const remoteRuntime = new FakeSdkRuntime({ initialFrameOverrides: { cwd: "/srv/project" } });
+    remoteRuntime.supportsWorkspaceDerivation = false;
+    const nativeSessionId = randomUUID();
+    remoteRuntime.sessions.set(nativeSessionId, {
+      ...sessionInfo(nativeSessionId),
+      cwd: "/srv/project"
+    });
+    let authorityCurrent = true;
+    const close = vi.fn(async () => undefined);
+    const resolveRemote = vi.fn(async () => ({
+      runtime: remoteRuntime,
+      workspaceRoot: "/srv/project",
+      remote: true,
+      assertCurrent: () => { if (!authorityCurrent) throw new Error("Remote authority changed."); }
+    }));
+    const remoteRuntimes: ClaudeRemoteRuntimePort = { resolve: resolveRemote, close };
+    const resolveFile = vi.fn(async () => { throw new Error("Remote files must not resolve locally."); });
+    const adapter = adapterFor(localRuntime, { remoteRuntimes, resolveFile });
+
+    await adapter.validateTarget(remoteTarget);
+    expect(resolveRemote).toHaveBeenCalledWith(remoteTarget, undefined);
+    await expect(adapter.listNativeSessions(remoteTarget)).resolves.toEqual([
+      expect.objectContaining({ nativeReference: `claude-code:session:${nativeSessionId}` })
+    ]);
+    expect(remoteRuntime.listOptions).toEqual([expect.objectContaining({ dir: "/srv/project" })]);
+    expect(localRuntime.listOptions).toEqual([]);
+
+    const binding = await adapter.createSession(
+      createInput({ target: remoteTarget }),
+      contextFor(undefined, { target: remoteTarget }).context
+    );
+    expect(remoteRuntime.queries[0]!.params.options.cwd).toBe("/srv/project");
+    expect(localRuntime.queries).toEqual([]);
+    const rejected = contextFor(binding, { target: remoteTarget, operationId: "remote-file" });
+    await expect(adapter.send({
+      ...textPrompt("Do not resolve this locally."),
+      files: [{ blob: { id: "remote-file", sha256: "a".repeat(64), byteLength: 1, mimeType: "text/plain" } }]
+    }, rejected.context)).rejects.toMatchObject({
+      publicError: { code: "REMOTE_FILE_INPUT_UNSUPPORTED", stateMayHaveChanged: false }
+    });
+    expect(resolveFile).not.toHaveBeenCalled();
+    expect(remoteRuntime.queries[0]!.receivedInputs).toEqual([]);
+
+    const accepted = contextFor(binding, { target: remoteTarget, operationId: "remote-text" });
+    await adapter.send(textPrompt("Run remotely."), accepted.context);
+    expect(remoteRuntime.queries[0]!.receivedInputs[0]!.message.content).toBe("Run remotely.");
+    remoteRuntime.queries[0]!.push(resultMessage(binding.nativeSessionId!, { result: "done", totalCostUsd: 0 }));
+    await eventually(() => accepted.events.some((event) => event.type === "done"));
+
+    authorityCurrent = false;
+    await expect(adapter.send(textPrompt("Must not cross a stale lease."), contextFor(binding, {
+      target: remoteTarget,
+      operationId: "stale-remote"
+    }).context)).rejects.toMatchObject({ publicError: { code: "BACKEND_GENERATION_MISMATCH" } });
+    expect(remoteRuntime.queries[0]!.receivedInputs).toHaveLength(1);
+    authorityCurrent = true;
+
+    remoteRuntime.retirementFailure = true;
+    await expect(adapter.closeSession(binding, contextFor(binding, { target: remoteTarget }).context))
+      .rejects.toMatchObject({ publicError: { code: "REMOTE_QUERY_RETIREMENT_UNKNOWN", stateMayHaveChanged: true } });
+    await expect(adapter.resumeSession(binding, contextFor(binding, { target: remoteTarget }).context))
+      .rejects.toMatchObject({ publicError: { code: "BACKEND_GENERATION_MISMATCH" } });
+    expect(remoteRuntime.queries).toHaveLength(1);
+    remoteRuntime.retirementFailure = false;
+    await adapter.closeSession(binding, contextFor(binding, { target: remoteTarget }).context);
+    expect(remoteRuntime.retiredQueries).toEqual([remoteRuntime.queries[0], remoteRuntime.queries[0]]);
+    await adapter.dispose();
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  test("closes the remote runtime owner even when an SDK cleanup boundary fails", async () => {
+    const runtime = new FakeSdkRuntime();
+    runtime.closeSessionOperationsFailure = true;
+    const close = vi.fn(async () => undefined);
+    const adapter = adapterFor(runtime, {
+      remoteRuntimes: {
+        resolve: async () => {
+          throw new Error("Unexpected remote runtime resolution.");
+        },
+        close
+      }
+    });
+
+    await expect(adapter.dispose()).rejects.toThrow("The controlled Session SDK cleanup failed.");
+    expect(runtime.closeSessionOperationsCalls).toBe(1);
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  test("preserves an unknown remote Query start outcome when the manager generation changes", async () => {
+    const remoteTarget: TargetDescriptor = {
+      ...target,
+      id: "target-remote-manager-replacement",
+      workspaceRoot: "D:\\service-owned-placeholder",
+      remoteWorkspace: { hostId: "host-a", workspaceRoot: "/srv/project" }
+    };
+    const runtime = new FakeSdkRuntime();
+    runtime.queryFailure = Object.assign(new Error("manager generation changed"), {
+      stateMayHaveChanged: true
+    });
+    const adapter = adapterFor(new FakeSdkRuntime(), {
+      remoteRuntimes: {
+        resolve: async () => ({
+          runtime,
+          workspaceRoot: "/srv/project",
+          remote: true,
+          assertCurrent: () => undefined
+        }),
+        close: async () => undefined
+      }
+    });
+
+    await expect(adapter.createSession(
+      createInput({ target: remoteTarget }),
+      contextFor(undefined, { target: remoteTarget }).context
+    )).rejects.toMatchObject({
+      publicError: { code: "NATIVE_RUNTIME_START_FAILED", stateMayHaveChanged: true }
+    });
+    await adapter.dispose();
   });
 
   test("redacts probe diagnostics before they enter the Backend descriptor", async () => {
@@ -3347,6 +3476,8 @@ class FakeSdkRuntime implements ClaudeSdkRuntime {
   readonly pendingForkIds = new Set<string>();
   forkHandler?: (sessionId: string, options: ClaudeSdkForkOptions) => Promise<{ readonly sessionId: string }>;
   readonly listOptions: ClaudeSdkListSessionsOptions[] = [];
+  closeSessionOperationsCalls = 0;
+  closeSessionOperationsFailure = false;
   readonly messageOptions: {
     readonly sessionId: string;
     readonly options: ClaudeSdkGetSessionMessagesOptions;
@@ -3361,6 +3492,7 @@ class FakeSdkRuntime implements ClaudeSdkRuntime {
   queryInitialization: ClaudeSdkInitializationResult = initialization();
   probeCliVersion: string | undefined = "2.1.259";
   probeApiKeySource: string | undefined = "none";
+  queryFailure: unknown = undefined;
 
   constructor(options: FakeRuntimeOptions = {}) {
     this.options = options;
@@ -3379,6 +3511,7 @@ class FakeSdkRuntime implements ClaudeSdkRuntime {
   }
 
   query(params: ClaudeSdkQueryParams): Promise<ClaudeSdkQuery> {
+    if (this.queryFailure !== undefined) return Promise.reject(this.queryFailure);
     const nativeSessionId = params.options.resume ?? params.options.sessionId;
     if (nativeSessionId === undefined) throw new Error("Fake Query requires a native Session ID.");
     const query = new FakeQuery(params, this.queryInitialization, this.options.leaveOutputOpenOnClose ?? false,
@@ -3432,7 +3565,10 @@ class FakeSdkRuntime implements ClaudeSdkRuntime {
     return this.pendingForkIds.has(sessionId);
   }
 
-  async closeSessionOperations(): Promise<void> {}
+  async closeSessionOperations(): Promise<void> {
+    this.closeSessionOperationsCalls += 1;
+    if (this.closeSessionOperationsFailure) throw new Error("The controlled Session SDK cleanup failed.");
+  }
 
   async forkSession(sessionId: string, options: ClaudeSdkForkOptions): Promise<{ readonly sessionId: string }> {
     this.forks.push({ sourceId: sessionId, options });
