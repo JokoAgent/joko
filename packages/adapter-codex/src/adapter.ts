@@ -106,11 +106,11 @@ export interface CodexAdapterOptions extends CodexInputResolvers {
   readonly profileDirectory?: string;
   /** Exact profile roots used by the read-only local task catalog. */
   readonly catalogProfileDirectories?: readonly string[];
-  /** Owner-private resolver for a Target-bound remote, read-only Codex runtime. */
-  readonly remoteReadRuntimes?: CodexRemoteReadRuntimePort;
+  /** Owner-private resolver for a Target-bound remote Codex runtime. */
+  readonly remoteRuntimes?: CodexRemoteRuntimePort;
 }
 
-export interface CodexRemoteReadRuntime {
+export interface CodexRemoteRuntime {
   readonly host: AppServerHost;
   /** Canonical absolute POSIX workspace root observed on the remote host. */
   readonly workspaceRoot: string;
@@ -122,8 +122,8 @@ export interface CodexRemoteReadRuntime {
   readonly assertCurrent: () => void;
 }
 
-export interface CodexRemoteReadRuntimePort {
-  resolve(target: TargetDescriptor, signal?: AbortSignal): Promise<CodexRemoteReadRuntime>;
+export interface CodexRemoteRuntimePort {
+  resolve(target: TargetDescriptor, signal?: AbortSignal): Promise<CodexRemoteRuntime>;
   shutdown(): Promise<void>;
   forceShutdown?(): Promise<void>;
 }
@@ -168,6 +168,10 @@ export interface CodexNativeAccountOperations {
 }
 
 interface SessionRuntime {
+  readonly host: AppServerHost;
+  readonly profileKey: string;
+  readonly remote: boolean;
+  readonly assertExecutionCurrent: () => void;
   managedRoute: ManagedProviderRouteBinding | undefined;
   managedOperation: { readonly id: string; lease?: ManagedProviderOperationLease } | undefined;
   routeUnknown: boolean;
@@ -218,6 +222,7 @@ interface CodexReadScope {
   readonly workspaceRoot: string;
   readonly profileKey: string;
   readonly remote: boolean;
+  readonly assertAuthorityCurrent: () => void;
   readonly assertCurrent: () => void;
 }
 
@@ -374,7 +379,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   readonly #catalogProfileDirectories: readonly string[] | undefined;
   readonly #catalogSources = new Map<string, CodexCatalogSource>();
   readonly #catalogEntrySources = new WeakMap<NativeSessionCatalogEntry, CodexCatalogSource>();
-  readonly #remoteReadRuntimes: CodexRemoteReadRuntimePort | undefined;
+  readonly #remoteRuntimes: CodexRemoteRuntimePort | undefined;
   #catalogMaterializationTail: Promise<void> = Promise.resolve();
   readonly #sessions = new Map<string, SessionRuntime>();
   readonly #sessionMutations = new Map<string, { count: number; rewinding: boolean }>();
@@ -432,7 +437,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     this.#catalogProfileDirectories = options.catalogProfileDirectories === undefined
       ? undefined
       : [...options.catalogProfileDirectories];
-    this.#remoteReadRuntimes = options.remoteReadRuntimes;
+    this.#remoteRuntimes = options.remoteRuntimes;
     if (!Number.isSafeInteger(this.#instanceGeneration) || this.#instanceGeneration < 1) {
       throw new TypeError("Codex Backend instance generation must be a positive integer.");
     }
@@ -528,7 +533,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     if (input.target.remoteWorkspace !== undefined && input.nativeStart?.kind !== "attach") {
       throw remoteMutationUnsupported("create or fork a native Session");
     }
-    await this.validateTarget(input.target);
+    const scope = await this.#readScope(input.target, context.signal);
     if (input.nativeStart?.kind === "attach") {
       const binding = bindingFromReference(input.nativeStart.nativeReference, context.generation);
       const resumed = await this.resumeSession(binding, context);
@@ -602,7 +607,11 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     }
     let response;
     try {
-      response = await this.#host.request(request.method, request.params, { mutation: true });
+      response = await scope.host.request(request.method, request.params, {
+        mutation: true,
+        signal: context.signal,
+        beforeDispatch: scope.assertCurrent
+      });
     } catch (error) {
       if (reviewWorkingDirectory !== undefined) await removeReviewWorkingDirectory(reviewWorkingDirectory);
       managedRoute?.dispose();
@@ -629,8 +638,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         if (reviewWorkingDirectory === undefined) throw invalidReviewProfile();
         assertReviewThreadStarted(record, thread, cwd, reviewWorkingDirectory);
       }
-      binding = bindingForThread(thread.id, context.generation, await this.#activeProfileKey);
+      binding = bindingForThread(thread.id, context.generation, scope.profileKey);
       runtime = await this.#installRuntime({
+        scope,
         thread,
         binding,
         context,
@@ -653,7 +663,11 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       throw error;
     }
     if (input.name !== undefined) {
-      await this.#host.request("thread/name/set", { threadId: thread.id, name: input.name }, { mutation: true }).catch(() => undefined);
+      await scope.host.request("thread/name/set", { threadId: thread.id, name: input.name }, {
+        mutation: true,
+        signal: context.signal,
+        beforeDispatch: scope.assertCurrent
+      }).catch(() => undefined);
       if (this.#isRuntimeCurrent(runtime, response.hostGeneration)) runtime.name = input.name;
     }
     return binding;
@@ -679,33 +693,31 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     ).catch((error) => {
       throw this.#nativeThreadReadFailure(error, "provision");
     });
-    if (inspection.scope.remote) {
-      inspection.scope.assertCurrent();
-      return stateFromThread(
-        bindingForThread(inspection.thread.id, context.generation, inspection.profileKey),
-        inspection.thread
-      );
-    }
     const current = this.#sessions.get(context.sessionId);
     if (current !== undefined
       && current.threadId === threadId
+      && current.host === inspection.scope.host
+      && current.profileKey === inspection.profileKey
       && current.hostGeneration === inspection.hostGeneration
       && this.#matchesCoreFence(current, context)
-      && this.#host.isActiveGeneration(current.hostGeneration)) {
+      && this.#isRuntimeCurrent(current, current.hostGeneration)) {
       current.context = context;
       return stateFromRuntime(current);
     }
-    const managedRoute = await this.#prepareManagedRoute(context.modelSelection?.providerId, context.modelSelection?.modelId, context);
+    const managedRoute = inspection.scope.remote
+      ? undefined
+      : await this.#prepareManagedRoute(context.modelSelection?.providerId, context.modelSelection?.modelId, context);
     if (managedRoute !== undefined) {
       if (inspection.thread.status?.["type"] === "active") { managedRoute.dispose(); throw managedRouteUnavailable(true); }
-      try { await this.#host.releaseUnboundThread(threadId, inspection.hostGeneration); }
+      try { await inspection.scope.host.releaseUnboundThread(threadId, inspection.hostGeneration); }
       catch { managedRoute.dispose(); throw managedRouteUnavailable(true); }
     }
     const response = await this.#resumeNativeThread(
+      inspection.scope,
       threadId,
       inspection.workspaceRoot,
       inspection.hostGeneration,
-      context.modelSelection,
+      inspection.scope.remote ? undefined : context.modelSelection,
       managedRoute
     ).catch((error) => {
       managedRoute?.dispose();
@@ -713,12 +725,12 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     });
     let thread = parseThreadResult(response.value);
     if (thread.status?.["type"] === "active" && thread.turns.length === 0) {
-      const latest = await this.#host.request("thread/turns/list", {
+      const latest = await inspection.scope.host.request("thread/turns/list", {
         threadId,
         limit: 1,
         sortDirection: "desc",
         itemsView: "notLoaded"
-      });
+      }, { signal: context.signal, beforeDispatch: inspection.scope.assertCurrent });
       if (latest.hostGeneration !== response.hostGeneration) {
         throw adapterError({
           code: "CODEX_RUNTIME_GENERATION_STALE",
@@ -733,6 +745,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const normalized = bindingForThread(thread.id, context.generation, inspection.profileKey);
     const record = objectValue(response.value, "resume response");
     const runtime = await this.#installRuntime({
+      scope: inspection.scope,
       thread,
       binding: normalized,
       context,
@@ -780,7 +793,12 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     });
     const thread = inspected.thread;
     const runtime = this.#sessions.get(context.sessionId);
-    if (runtime !== undefined && this.#matchesCoreFence(runtime, context)) {
+    if (runtime !== undefined
+      && runtime.host === inspected.scope.host
+      && runtime.hostGeneration === inspected.hostGeneration
+      && runtime.profileKey === inspected.profileKey
+      && this.#matchesCoreFence(runtime, context)
+      && this.#isRuntimeCurrent(runtime, runtime.hostGeneration)) {
       runtime.context = context;
       runtime.name = thread.name ?? runtime.name;
       return stateFromRuntime(runtime, thread);
@@ -824,7 +842,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           ...(cursor === undefined ? {} : { cursor })
         }, { beforeDispatch: scope.assertCurrent });
         scope.assertCurrent();
-        if (scope.hostGeneration !== undefined && response.hostGeneration !== scope.hostGeneration) throw remoteReadStale();
+        if (scope.hostGeneration !== undefined && response.hostGeneration !== scope.hostGeneration) throw remoteRuntimeStale();
         pages += 1;
         const page = parseThreadList(response.value, pageLimit);
         for (const thread of page.threads) {
@@ -989,7 +1007,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     this.#assertOpen();
     assertDispatchNotCancelled(context.signal);
     this.#assertBackendContext(context);
-    if (context.target.remoteWorkspace !== undefined) throw remoteMutationUnsupported("send native input");
+    if (context.target.remoteWorkspace !== undefined
+      && (input.images.length !== 0 || input.files.length !== 0 || input.mentions.length !== 0)) {
+      throw remoteMutationUnsupported("dispatch attachments or typed mentions");
+    }
     // Steering owns the currently attached turn before any asynchronous preparation.
     let runtime = input.disposition === "steer"
       ? this.#sessions.get(context.sessionId)
@@ -1014,16 +1035,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const expectedTurnId = input.disposition === "steer" ? runtime.state.activeTurnId : undefined;
     const assertDispatchReady = () => {
       assertDispatchNotCancelled(dispatchSignal);
-      if (!this.#matchesCoreFence(runtime, context)
-        || runtime.hostGeneration !== hostGeneration
-        || !this.#host.isActiveGeneration(hostGeneration)) {
-        throw adapterError({
-          code: "CODEX_RUNTIME_GENERATION_STALE",
-          message: "The Codex runtime changed before input dispatch.",
-          phase: "dispatch",
-          recovery: "Refresh the Session and Backend instance before sending the input."
-        });
-      }
+      this.#assertRuntimeDispatchFence(runtime, context, hostGeneration);
       if (input.disposition === "steer" && (expectedTurnId === undefined
         || runtime.state.activeTurnId !== expectedTurnId
         || runtime.state.terminalTurnIds.has(expectedTurnId))) {
@@ -1058,7 +1070,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     assertNativeDispatchReady();
     const clientUserMessageId = context.operationId;
     const collaborationMode = runtime.runtimePolicy === "standard"
-      && supportsNativeCollaboration(this.#host.initializeResult?.userAgent)
+      && supportsNativeCollaboration(runtime.host.initializeResult?.userAgent)
       ? collaborationModeForTurn(runtime)
       : undefined;
     if (input.disposition !== "steer") {
@@ -1070,7 +1082,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     let acceptedResponseShapePending = false;
     try {
       if (input.disposition === "steer") {
-        const response = await this.#host.request("turn/steer", {
+        const response = await runtime.host.request("turn/steer", {
           threadId: runtime.threadId,
           clientUserMessageId,
           input: [...nativeInput.input],
@@ -1086,11 +1098,11 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       }
       await this.#activateManagedOperation(runtime, context);
       assertNativeDispatchReady();
-      const response = await this.#host.request("turn/start", {
+      const response = await runtime.host.request("turn/start", {
         threadId: runtime.threadId,
         clientUserMessageId,
         input: [...nativeInput.input],
-        cwd: runtime.reviewWorkingDirectory ?? context.target.workspaceRoot,
+        cwd: runtime.reviewWorkingDirectory ?? runtime.targetWorkspaceRoot,
         ...(runtime.modelId === undefined ? {} : { model: runtime.modelId }),
         ...(runtime.effort === undefined ? {} : { effort: runtime.effort }),
         ...(collaborationMode === undefined ? {} : { collaborationMode }),
@@ -1152,15 +1164,18 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     this.#releaseManagedOperation(runtime);
     const turnId = runtime.state.activeTurnId;
     if (turnId === undefined) return;
+    const hostGeneration = runtime.hostGeneration;
+    const signal = AbortSignal.any([context.signal, runtime.dispatchLifetime.signal]);
+    const beforeDispatch = () => this.#assertRuntimeDispatchFence(runtime, context, hostGeneration);
     try {
-      const response = await this.#host.request("turn/interrupt", {
+      const response = await runtime.host.request("turn/interrupt", {
         threadId: runtime.threadId,
         turnId
-      }, { mutation: true });
+      }, { mutation: true, signal, beforeDispatch });
       this.#assertRuntimeFence(runtime, context, response.hostGeneration);
       this.#cancelPendingServerRequests(runtime, (pending) => pending.turnId === turnId);
     } catch (error) {
-      throw this.#requestFailure(error, "dispatch", "CODEX_TURN_INTERRUPT_FAILED", true);
+      throw this.#requestFailure(error, "dispatch", "CODEX_TURN_INTERRUPT_FAILED", false);
     }
   }
 
@@ -1278,8 +1293,12 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     }
     const runtime = await this.#requireRuntime(context);
     this.#assertStandardRuntime(runtime, "rename the native thread");
-    const response = await this.#host.request("thread/name/set", { threadId: runtime.threadId, name }, { mutation: true })
-      .catch((error) => { throw this.#requestFailure(error, "dispatch", "CODEX_SESSION_RENAME_FAILED", true); });
+    const hostGeneration = runtime.hostGeneration;
+    const response = await runtime.host.request("thread/name/set", { threadId: runtime.threadId, name }, {
+      mutation: true,
+      signal: context.signal,
+      beforeDispatch: () => this.#assertRuntimeDispatchFence(runtime, context, hostGeneration)
+    }).catch((error) => { throw this.#requestFailure(error, "dispatch", "CODEX_SESSION_RENAME_FAILED", false); });
     this.#assertRuntimeFence(runtime, context, response.hostGeneration);
     runtime.name = name;
   }
@@ -1289,6 +1308,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   }
 
   async #compact(customInstructions: string | undefined, context: AdapterContext): Promise<"compacted" | "noop"> {
+    if (context.target.remoteWorkspace !== undefined) throw remoteMutationUnsupported("compact native history");
     if (customInstructions !== undefined && customInstructions.trim().length > 0) {
       return this.unsupported("context.compact.custom_instructions");
     }
@@ -1325,6 +1345,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   }
 
   async #fork(entryId: string, context: AdapterContext, derivation: NativeSessionDerivation): Promise<NativeSessionForkResult> {
+    if (context.target.remoteWorkspace !== undefined) throw remoteMutationUnsupported("fork the native thread");
     const runtime = await this.#requireRuntime(context);
     this.#assertStandardRuntime(runtime, "fork the native thread");
     return {
@@ -1337,6 +1358,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   }
 
   async #clone(context: AdapterContext, derivation: NativeSessionDerivation): Promise<NativeSessionBinding> {
+    if (context.target.remoteWorkspace !== undefined) throw remoteMutationUnsupported("clone the native thread");
     const runtime = await this.#requireRuntime(context);
     this.#assertStandardRuntime(runtime, "clone the native thread");
     return this.#forkThread(runtime, context, derivation);
@@ -1453,7 +1475,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   async #setModel(providerId: string, modelId: string, context: AdapterContext): Promise<ProviderModel> {
     let runtime = await this.#requireRuntime(context);
     this.#assertStandardRuntime(runtime, "change the model");
-    const models = this.#withManagedModels(this.#models.length === 0 ? await this.listModels() : this.#models);
+    const models = runtime.remote
+      ? await this.#listRuntimeModels(runtime, context)
+      : this.#withManagedModels(this.#models.length === 0 ? await this.listModels() : this.#models);
     const model = models.find((candidate) => candidate.providerId === providerId && candidate.modelId === modelId);
     if (model === undefined) {
       throw adapterError({
@@ -1463,7 +1487,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         recovery: "Refresh the model catalog and choose an available model."
       });
     }
-    if (runtime.providerId !== providerId || runtime.managedRoute !== undefined || this.#managedProviders?.hasProvider(providerId)) {
+    if (runtime.remote && providerId !== this.#providerId) throw managedRouteUnavailable();
+    if (!runtime.remote
+      && (runtime.providerId !== providerId || runtime.managedRoute !== undefined || this.#managedProviders?.hasProvider(providerId))) {
       runtime = await this.#switchNativeRoute(runtime, providerId, modelId, context);
     }
     const nextEffort = runtime.effort !== undefined && model.thinkingLevels.includes(runtime.effort)
@@ -1472,11 +1498,16 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const collaborationMode = runtime.collaborationTouched
       ? collaborationModeValue(runtime.planMode, modelId, nextEffort, runtime.planMode ? null : "")
       : undefined;
-    const response = await this.#host.request("thread/settings/update", {
+    const hostGeneration = runtime.hostGeneration;
+    const response = await runtime.host.request("thread/settings/update", {
       threadId: runtime.threadId,
       model: modelId,
       ...(collaborationMode === undefined ? {} : { collaborationMode })
-    }, { mutation: true }).catch((error) => { throw this.#requestFailure(error, "dispatch", "CODEX_MODEL_SWITCH_FAILED", true); });
+    }, {
+      mutation: true,
+      signal: context.signal,
+      beforeDispatch: () => this.#assertRuntimeDispatchFence(runtime, context, hostGeneration)
+    }).catch((error) => { throw this.#requestFailure(error, "dispatch", "CODEX_MODEL_SWITCH_FAILED", false); });
     this.#assertRuntimeFence(runtime, context, response.hostGeneration);
     runtime.providerId = providerId;
     runtime.modelId = modelId;
@@ -1493,7 +1524,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   async #setEffort(level: string, context: AdapterContext): Promise<void> {
     const runtime = await this.#requireRuntime(context);
     this.#assertStandardRuntime(runtime, "change reasoning effort");
-    const model = await this.#requireRuntimeModel(runtime);
+    const model = await this.#requireRuntimeModel(runtime, context);
     if (!model.thinkingLevels.includes(level)) {
       throw adapterError({
         code: "CODEX_EFFORT_UNAVAILABLE",
@@ -1505,12 +1536,17 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const collaborationMode = runtime.collaborationTouched
       ? collaborationModeValue(runtime.planMode, runtime.modelId!, level, runtime.planMode ? null : "")
       : undefined;
-    const response = await this.#host.request("thread/settings/update", {
+    const hostGeneration = runtime.hostGeneration;
+    const response = await runtime.host.request("thread/settings/update", {
       threadId: runtime.threadId,
       effort: level,
       ...(collaborationMode === undefined ? {} : { collaborationMode })
-    }, { mutation: true }).catch((error) => {
-      throw this.#requestFailure(error, "dispatch", "CODEX_EFFORT_SWITCH_FAILED", true);
+    }, {
+      mutation: true,
+      signal: context.signal,
+      beforeDispatch: () => this.#assertRuntimeDispatchFence(runtime, context, hostGeneration)
+    }).catch((error) => {
+      throw this.#requestFailure(error, "dispatch", "CODEX_EFFORT_SWITCH_FAILED", false);
     });
     this.#assertRuntimeFence(runtime, context, response.hostGeneration);
     runtime.effort = level;
@@ -1525,7 +1561,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const runtime = await this.#requireRuntime(context);
     this.#assertStandardRuntime(runtime, "change Fast Mode");
     if (enabled) {
-      const model = await this.#requireRuntimeModel(runtime);
+      const model = await this.#requireRuntimeModel(runtime, context);
       if (!model.supportsFastMode) {
         throw adapterError({
           code: "CODEX_FAST_MODE_UNAVAILABLE",
@@ -1535,11 +1571,16 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         });
       }
     }
-    const response = await this.#host.request("thread/settings/update", {
+    const hostGeneration = runtime.hostGeneration;
+    const response = await runtime.host.request("thread/settings/update", {
       threadId: runtime.threadId,
       serviceTier: enabled ? "fast" : null
-    }, { mutation: true }).catch((error) => {
-      throw this.#requestFailure(error, "dispatch", "CODEX_FAST_MODE_SWITCH_FAILED", true);
+    }, {
+      mutation: true,
+      signal: context.signal,
+      beforeDispatch: () => this.#assertRuntimeDispatchFence(runtime, context, hostGeneration)
+    }).catch((error) => {
+      throw this.#requestFailure(error, "dispatch", "CODEX_FAST_MODE_SWITCH_FAILED", false);
     });
     this.#assertRuntimeFence(runtime, context, response.hostGeneration);
     runtime.fastMode = enabled;
@@ -1560,17 +1601,24 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     }
     const runtime = await this.#requireRuntime(context);
     this.#assertStandardRuntime(runtime, "change permission mode");
-    const response = await this.#host.request("thread/resume", {
+    const hostGeneration = runtime.hostGeneration;
+    const response = await runtime.host.request("thread/resume", {
       threadId: runtime.threadId,
+      cwd: runtime.targetWorkspaceRoot,
       excludeTurns: true,
       ...permissionParams(mode)
-    }, { mutation: true }).catch((error) => { throw this.#requestFailure(error, "dispatch", "CODEX_PERMISSION_MODE_FAILED", true); });
+    }, {
+      mutation: true,
+      signal: context.signal,
+      beforeDispatch: () => this.#assertRuntimeDispatchFence(runtime, context, hostGeneration)
+    }).catch((error) => { throw this.#requestFailure(error, "dispatch", "CODEX_PERMISSION_MODE_FAILED", false); });
     this.#assertRuntimeFence(runtime, context, response.hostGeneration);
     runtime.permissionMode = mode;
   }
 
   supportsDetachedSessionDeletion(context: AdapterContext): boolean {
     return context.runtimePolicy !== "review_read_only"
+      && context.target.remoteWorkspace === undefined
       && context.target.backendId === this.id
       && context.backendInstanceGeneration === this.#instanceGeneration;
   }
@@ -1580,21 +1628,26 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   }
 
   async #setPlanMode(enabled: boolean, context: AdapterContext): Promise<void> {
-    if (!supportsNativeCollaboration(this.#host.initializeResult?.userAgent)) {
+    const runtime = await this.#requireRuntime(context);
+    if (!supportsNativeCollaboration(runtime.host.initializeResult?.userAgent)) {
       return this.unsupported("plan_mode");
     }
-    const runtime = await this.#requireRuntime(context);
     this.#assertStandardRuntime(runtime, "change Plan mode");
-    const model = await this.#requireRuntimeModel(runtime);
+    const model = await this.#requireRuntimeModel(runtime, context);
     const effort = runtime.effort !== undefined && model.thinkingLevels.includes(runtime.effort)
       ? runtime.effort
       : undefined;
     runtime.state.observedFastMode = undefined;
-    const response = await this.#host.request("thread/settings/update", {
+    const hostGeneration = runtime.hostGeneration;
+    const response = await runtime.host.request("thread/settings/update", {
       threadId: runtime.threadId,
       collaborationMode: collaborationModeValue(enabled, model.modelId, effort, null)
-    }, { mutation: true }).catch((error) => {
-      throw this.#requestFailure(error, "dispatch", "CODEX_PLAN_MODE_FAILED", true);
+    }, {
+      mutation: true,
+      signal: context.signal,
+      beforeDispatch: () => this.#assertRuntimeDispatchFence(runtime, context, hostGeneration)
+    }).catch((error) => {
+      throw this.#requestFailure(error, "dispatch", "CODEX_PLAN_MODE_FAILED", false);
     });
     this.#assertRuntimeFence(runtime, context, response.hostGeneration);
     runtime.planMode = enabled;
@@ -1782,7 +1835,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     await Promise.allSettled(runtimes.map((runtime) => this.#releaseRuntimeSubscription(runtime, false)));
     await Promise.all([
       ...(this.#ownsHost ? [this.#host.shutdown()] : []),
-      ...(this.#remoteReadRuntimes === undefined ? [] : [this.#remoteReadRuntimes.shutdown()])
+      ...(this.#remoteRuntimes === undefined ? [] : [this.#remoteRuntimes.shutdown()])
     ]);
   }
 
@@ -1812,26 +1865,29 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     await Promise.allSettled(runtimes.map((runtime) => this.#releaseRuntimeSubscription(runtime, false)));
     await Promise.all([
       ...(this.#ownsHost ? [this.#host.forceShutdown()] : []),
-      ...(this.#remoteReadRuntimes === undefined
+      ...(this.#remoteRuntimes === undefined
         ? []
-        : [this.#remoteReadRuntimes.forceShutdown?.() ?? this.#remoteReadRuntimes.shutdown()])
+        : [this.#remoteRuntimes.forceShutdown?.() ?? this.#remoteRuntimes.shutdown()])
     ]);
   }
 
   async #resumeNativeThread(
+    scope: CodexReadScope,
     threadId: string,
     workspaceRoot: string,
     expectedHostGeneration: number,
     selection?: { readonly providerId: string; readonly modelId: string },
     managedRoute?: ManagedProviderRouteBinding
   ) {
-    const response = await this.#host.request("thread/resume", {
+    scope.assertCurrent();
+    const response = await scope.host.request("thread/resume", {
       threadId,
       cwd: workspaceRoot,
       excludeTurns: true,
       ...(selection === undefined ? {} : { modelProvider: selection.providerId, model: selection.modelId }),
       ...(this.#nativeRouteConfiguration(managedRoute) === undefined ? {} : { config: this.#nativeRouteConfiguration(managedRoute)! })
-    }, { mutation: false });
+    }, { mutation: false, beforeDispatch: scope.assertCurrent });
+    scope.assertCurrent();
     if (response.hostGeneration !== expectedHostGeneration) {
       throw adapterError({
         code: "CODEX_RUNTIME_GENERATION_STALE",
@@ -1842,7 +1898,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       });
     }
     const thread = parseThreadResult(response.value);
-    await assertNativeThreadTarget(thread, threadId, workspaceRoot, "provision");
+    await assertNativeThreadTarget(thread, threadId, workspaceRoot, "provision", scope.remote);
+    scope.assertCurrent();
     this.#assertManagedRouteResponse(objectValue(response.value, "resume response"), managedRoute);
     return response;
   }
@@ -1881,9 +1938,13 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         workspaceRoot: await realpath(target.workspaceRoot),
         profileKey: await this.#activeProfileKey,
         remote: false,
+        assertAuthorityCurrent: () => {
+          this.#assertOpen();
+          if (target.backendId !== this.id) throw remoteRuntimeStale();
+        },
         assertCurrent: () => {
           this.#assertOpen();
-          if (target.backendId !== this.id) throw remoteReadStale();
+          if (target.backendId !== this.id) throw remoteRuntimeStale();
         }
       };
     }
@@ -1895,7 +1956,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         recovery: "Repair the remote Target workspace binding."
       });
     }
-    if (this.#remoteReadRuntimes === undefined) {
+    if (this.#remoteRuntimes === undefined) {
       throw adapterError({
         code: "CODEX_REMOTE_TARGET_UNSUPPORTED",
         message: "This Codex Backend instance does not provide a remote app-server transport.",
@@ -1904,8 +1965,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       });
     }
     try {
-      if (signal?.aborted) throw remoteReadCancelled();
-      const runtime = await this.#remoteReadRuntimes.resolve(target, signal);
+      if (signal?.aborted) throw remoteRuntimeCancelled();
+      const runtime = await this.#remoteRuntimes.resolve(target, signal);
       if (!isNormalizedAbsolutePosixPath(runtime.workspaceRoot)
         || !validReferenceDigest(runtime.profileKey)
         || !validExecutionDomain(runtime.executionDomain)) {
@@ -1929,18 +1990,30 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         workspaceRoot: runtime.workspaceRoot,
         profileKey: runtime.profileKey,
         remote: true,
+        assertAuthorityCurrent: () => {
+          this.#assertOpen();
+          try {
+            runtime.assertCurrent();
+          } catch {
+            throw remoteRuntimeStale();
+          }
+        },
         assertCurrent: () => {
           this.#assertOpen();
-          runtime.assertCurrent();
-          if (!runtime.host.isActiveGeneration(hostGeneration)) throw remoteReadStale();
+          try {
+            runtime.assertCurrent();
+          } catch {
+            throw remoteRuntimeStale();
+          }
+          if (!runtime.host.isActiveGeneration(hostGeneration)) throw remoteRuntimeStale();
         }
       };
     } catch (error) {
       if (error instanceof Error && "publicError" in error) throw error;
-      if (signal?.aborted) throw remoteReadCancelled();
+      if (signal?.aborted) throw remoteRuntimeCancelled();
       throw adapterError({
         code: "CODEX_REMOTE_TARGET_UNAVAILABLE",
-        message: "The remote Codex read runtime is unavailable for this exact Target binding.",
+        message: "The remote Codex runtime is unavailable for this exact Target binding.",
         phase: "provision",
         retryable: true,
         recovery: "Reconnect the remote host, verify the fixed Codex runtime, and retry."
@@ -1969,7 +2042,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       ...(signal === undefined ? {} : { signal })
     });
     scope.assertCurrent();
-    if (scope.hostGeneration !== undefined && response.hostGeneration !== scope.hostGeneration) throw remoteReadStale();
+    if (scope.hostGeneration !== undefined && response.hostGeneration !== scope.hostGeneration) throw remoteRuntimeStale();
     const thread = parseThreadResult(response.value);
     await assertNativeThreadTarget(thread, threadId, scope.workspaceRoot, phase, scope.remote);
     scope.assertCurrent();
@@ -1982,11 +2055,28 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     };
   }
 
+  #scopeForRuntime(runtime: SessionRuntime): CodexReadScope {
+    const assertAuthorityCurrent = () => runtime.assertExecutionCurrent();
+    return {
+      host: runtime.host,
+      hostGeneration: runtime.hostGeneration,
+      workspaceRoot: runtime.targetWorkspaceRoot,
+      profileKey: runtime.profileKey,
+      remote: runtime.remote,
+      assertAuthorityCurrent,
+      assertCurrent: () => {
+        assertAuthorityCurrent();
+        if (!runtime.host.isActiveGeneration(runtime.hostGeneration)) throw remoteRuntimeStale();
+      }
+    };
+  }
+
   async #requireRuntime(context: AdapterContext): Promise<SessionRuntime> {
     this.#assertBackendContext(context);
-    if (context.target.remoteWorkspace !== undefined) throw remoteMutationUnsupported("mutate native Session state");
     const runtime = this.#sessions.get(context.sessionId);
-    if (runtime !== undefined && this.#matchesCoreFence(runtime, context) && this.#host.isActiveGeneration(runtime.hostGeneration)) {
+    if (runtime !== undefined
+      && this.#matchesCoreFence(runtime, context)
+      && this.#isRuntimeCurrent(runtime, runtime.hostGeneration)) {
       runtime.context = context;
       return runtime;
     }
@@ -2075,6 +2165,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   async #activateManagedOperation(runtime: SessionRuntime, context: AdapterContext): Promise<void> {
     if (runtime.routeUnknown) throw managedRouteUnavailable(true);
     const route = runtime.managedRoute;
+    if (runtime.remote) {
+      if (route !== undefined) throw managedRouteUnavailable();
+      return;
+    }
     if (route === undefined) {
       if (runtime.providerId !== undefined && this.#managedProviders?.hasProvider(runtime.providerId)) throw managedRouteUnavailable();
       return;
@@ -2117,13 +2211,21 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       // Native resume on an already loaded thread ignores changed Provider config.
       await this.#releaseRuntimeSubscription(runtime, false);
       assertCurrent();
-      await this.#host.releaseUnboundThread(runtime.threadId, generation);
+      await runtime.host.releaseUnboundThread(runtime.threadId, generation);
       assertCurrent();
-      const response = await this.#resumeNativeThread(runtime.threadId, runtime.targetWorkspaceRoot, generation, { providerId, modelId }, route);
+      const response = await this.#resumeNativeThread(
+        this.#scopeForRuntime(runtime),
+        runtime.threadId,
+        runtime.targetWorkspaceRoot,
+        generation,
+        { providerId, modelId },
+        route
+      );
       assertCurrent();
       const record = objectValue(response.value, "route resume response");
       if (record["modelProvider"] !== providerId || record["model"] !== modelId) throw managedRouteUnavailable(true);
       const next = await this.#installRuntime({
+        scope: this.#scopeForRuntime(runtime),
         thread: parseThreadResult(response.value), binding: runtime.binding, context, hostGeneration: generation,
         permissionMode: runtime.permissionMode, providerId, modelId, managedRoute: route,
         effort: runtime.effort, fastMode: runtime.fastMode, name: runtime.name
@@ -2191,7 +2293,52 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     return model;
   }
 
-  async #requireRuntimeModel(runtime: SessionRuntime): Promise<ProviderModel> {
+  async #listRuntimeModels(runtime: SessionRuntime, context: AdapterContext): Promise<readonly ProviderModel[]> {
+    const models: ProviderModel[] = [];
+    const nativeIds = new Set<string>();
+    const seenCursors = new Set<string>();
+    const hostGeneration = runtime.hostGeneration;
+    let cursor: string | undefined;
+    let pages = 0;
+    try {
+      do {
+        if (pages >= this.#maximumPaginationPages) {
+          throw paginationError("CODEX_MODEL_PAGINATION_LIMIT", "runtime model discovery");
+        }
+        const pageLimit = Math.min(100, this.#maximumModels - models.length);
+        const response = await runtime.host.request("model/list", {
+          limit: pageLimit,
+          includeHidden: true,
+          ...(cursor === undefined ? {} : { cursor })
+        }, {
+          signal: context.signal,
+          beforeDispatch: () => this.#assertRuntimeDispatchFence(runtime, context, hostGeneration)
+        });
+        this.#assertRuntimeDispatchFence(runtime, context, response.hostGeneration);
+        pages += 1;
+        const page = parseModels(response.value, pageLimit);
+        for (const native of page.models) {
+          const identity = `${native.id}\0${native.model}`;
+          if (nativeIds.has(identity)) continue;
+          nativeIds.add(identity);
+          models.push(modelFromNative(native, this.#providerId));
+          if (models.length >= this.#maximumModels) return models;
+        }
+        cursor = nextPaginationCursor(
+          page.nextCursor,
+          seenCursors,
+          "CODEX_MODEL_PAGINATION_INVALID",
+          "runtime model discovery"
+        );
+      } while (cursor !== undefined);
+      return models;
+    } catch (error) {
+      if (error instanceof Error && "publicError" in error) throw error;
+      throw this.#requestFailure(error, "probe", "CODEX_MODEL_DISCOVERY_FAILED", false);
+    }
+  }
+
+  async #requireRuntimeModel(runtime: SessionRuntime, context: AdapterContext): Promise<ProviderModel> {
     const providerId = runtime.providerId;
     const modelId = runtime.modelId;
     if (providerId === undefined || modelId === undefined) {
@@ -2202,7 +2349,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         recovery: "Select a model before changing its reasoning controls."
       });
     }
-    const models = this.#models.length === 0 ? await this.listModels() : this.#models;
+    const models = runtime.remote
+      ? await this.#listRuntimeModels(runtime, context)
+      : this.#models.length === 0 ? await this.listModels() : this.#models;
     const model = models.find((candidate) => candidate.providerId === providerId && candidate.modelId === modelId);
     if (model === undefined) {
       throw adapterError({
@@ -2331,6 +2480,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   }
 
   async #installRuntime(input: {
+    readonly scope: CodexReadScope;
     readonly managedRoute?: ManagedProviderRouteBinding | undefined;
     readonly thread: NativeThread;
     readonly binding: NativeSessionBinding;
@@ -2345,13 +2495,24 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     readonly name?: string;
     readonly reviewWorkingDirectory?: string;
   }): Promise<SessionRuntime> {
-    const targetWorkspaceRoot = await realpath(input.context.target.workspaceRoot);
+    input.scope.assertCurrent();
+    if (input.scope.remote && (input.managedRoute !== undefined || input.reviewWorkingDirectory !== undefined)) {
+      throw remoteMutationUnsupported("apply a local Provider or Review runtime profile");
+    }
+    if (input.scope.hostGeneration !== undefined
+      && input.scope.hostGeneration !== input.hostGeneration) throw remoteRuntimeStale();
+    if (parseNativeReference(input.binding.opaqueRef).profileKey !== input.scope.profileKey) {
+      throw invalidNativeReference();
+    }
+    const targetWorkspaceRoot = input.scope.workspaceRoot;
     await assertNativeThreadTarget(
       input.thread,
       threadIdFromBinding(input.binding),
       input.reviewWorkingDirectory ?? targetWorkspaceRoot,
-      "provision"
+      "provision",
+      input.scope.remote
     );
+    input.scope.assertCurrent();
     const previous = this.#sessions.get(input.context.sessionId);
     if (previous !== undefined) {
       previous.dispatchLifetime.abort();
@@ -2392,6 +2553,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       ? []
       : nativeTasks.seed(input.thread);
     const runtime: SessionRuntime = {
+      host: input.scope.host,
+      profileKey: input.scope.profileKey,
+      remote: input.scope.remote,
+      assertExecutionCurrent: input.scope.assertAuthorityCurrent,
       managedRoute: input.managedRoute,
       managedOperation: undefined,
       routeUnknown: false,
@@ -2429,7 +2594,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     this.#sessions.set(input.context.sessionId, runtime);
     runtime.state.observedFastMode = input.observedFastMode;
     try {
-      const subscriptionFlight = this.#host.subscribe(input.thread.id, input.hostGeneration, {
+      const subscriptionFlight = runtime.host.subscribe(input.thread.id, input.hostGeneration, {
         onNotification: async (method, params) => {
           if (!this.#isRuntimeCurrent(runtime, input.hostGeneration)) return;
           if (method === "serverRequest/resolved") {
@@ -2531,7 +2696,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             return response;
           }
           if (descendantRequest && method === "item/tool/requestUserInput") return { answers: {} };
-          const interaction = interactionFromServerRequest(requestId, method, params, runtime.context.target.workspaceRoot);
+          const interaction = interactionFromServerRequest(requestId, method, params, runtime.targetWorkspaceRoot);
           if (interaction === undefined) return undefined;
           const key = rpcRequestKey(requestId);
           if (runtime.pendingServerRequests.has(key)) return undefined;
@@ -2643,7 +2808,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         });
       }
       for (const lineage of seededDescendants) {
-        await this.#host.registerDescendantThread(
+        await runtime.host.registerDescendantThread(
           lineage.childThreadId,
           lineage.parentThreadId,
           input.hostGeneration
@@ -2741,7 +2906,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     );
     for (const lineage of effects.lineages) {
       if (!this.#isRuntimeCurrent(runtime, hostGeneration)) return;
-      await this.#host.registerDescendantThread(
+      await runtime.host.registerDescendantThread(
         lineage.childThreadId,
         lineage.parentThreadId,
         hostGeneration
@@ -2761,7 +2926,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   ): Promise<void> {
     for (const payload of payloads) {
       if (!this.#matchesCallbackFence(runtime, hostGeneration)
-        || (requireHostActive && !this.#host.isActiveGeneration(hostGeneration))) return;
+        || (requireHostActive && !runtime.host.isActiveGeneration(hostGeneration))) return;
       await runtime.context.emit(payload, {
         namespace: "codex.native_tasks",
         fields: { method, descendant }
@@ -3024,17 +3189,17 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const binding = runtime.binding;
     const hostGeneration = runtime.hostGeneration;
     const threadId = runtime.threadId;
-    const historyRevision = this.#host.historyRevision(threadId, hostGeneration);
+    const historyRevision = runtime.host.historyRevision(threadId, hostGeneration);
     return this.#readCompleteHistoryFromHost({
-      host: this.#host,
+      host: runtime.host,
       hostGeneration,
       threadId,
       workspaceRoot: runtime.reviewWorkingDirectory ?? runtime.targetWorkspaceRoot,
-      remote: false,
+      remote: runtime.remote,
       signal: AbortSignal.any([context.signal, runtime.dispatchLifetime.signal]),
       assertOwner: () => {
       this.#assertHistoryRuntimeFence(runtime, context, binding, hostGeneration);
-      if (historyRevision === undefined || this.#host.historyRevision(threadId, hostGeneration) !== historyRevision) {
+      if (historyRevision === undefined || runtime.host.historyRevision(threadId, hostGeneration) !== historyRevision) {
         throw nativeHistoryReadFailure("STALE");
       }
       }
@@ -3047,7 +3212,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     context: AdapterContext
   ): Promise<{ readonly thread: NativeThread; readonly assertCurrent: () => void }> {
     const hostGeneration = scope.hostGeneration;
-    if (hostGeneration === undefined) throw remoteReadStale();
+    if (hostGeneration === undefined) throw remoteRuntimeStale();
     const threadId = threadIdFromBinding(binding);
     return this.#readCompleteHistoryFromHost({
       host: scope.host,
@@ -3291,8 +3456,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       && runtime.sessionId === context.sessionId
       && runtime.targetId === context.target.id
       && context.target.backendId === this.id
-      && equalNativePaths(runtime.targetWorkspaceRoot, context.target.workspaceRoot)
+      && runtime.remote === (context.target.remoteWorkspace !== undefined)
+      && (runtime.remote || equalNativePaths(runtime.targetWorkspaceRoot, context.target.workspaceRoot))
       && sameRemoteWorkspace(runtime.context.target.remoteWorkspace, context.target.remoteWorkspace)
+      && parseNativeReference(runtime.binding.opaqueRef).profileKey === runtime.profileKey
       && runtime.sessionGeneration === context.generation
       && runtime.runtimePolicy === (context.runtimePolicy === "review_read_only" ? "review_read_only" : "standard")
       && runtime.backendInstanceGeneration === this.#instanceGeneration
@@ -3301,20 +3468,29 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   }
 
   #isRuntimeCurrent(runtime: SessionRuntime, hostGeneration: number): boolean {
-    return this.#matchesCallbackFence(runtime, hostGeneration) && this.#host.isActiveGeneration(hostGeneration);
+    return this.#matchesCallbackFence(runtime, hostGeneration)
+      && runtime.host.isActiveGeneration(hostGeneration);
   }
 
   #matchesCallbackFence(runtime: SessionRuntime, hostGeneration: number): boolean {
-    return !runtime.closed
+    return this.#isExecutionAuthorityCurrent(runtime)
+      && !runtime.closed
       && runtime.hostGeneration === hostGeneration
       && runtime.targetId === runtime.context.target.id
       && runtime.context.target.backendId === this.id
-      && equalNativePaths(runtime.targetWorkspaceRoot, runtime.context.target.workspaceRoot)
+      && runtime.remote === (runtime.context.target.remoteWorkspace !== undefined)
+      && (runtime.remote || equalNativePaths(runtime.targetWorkspaceRoot, runtime.context.target.workspaceRoot))
+      && parseNativeReference(runtime.binding.opaqueRef).profileKey === runtime.profileKey
       && runtime.sessionGeneration === runtime.context.generation
       && runtime.runtimePolicy === (runtime.context.runtimePolicy === "review_read_only" ? "review_read_only" : "standard")
       && runtime.backendInstanceGeneration === this.#instanceGeneration
       && runtime.backendInstanceGeneration === backendGeneration(runtime.context)
       && this.#sessions.get(runtime.sessionId) === runtime;
+  }
+
+  #isExecutionAuthorityCurrent(runtime: SessionRuntime): boolean {
+    try { runtime.assertExecutionCurrent(); return true; }
+    catch { return false; }
   }
 
   #assertRuntimeFence(
@@ -3323,9 +3499,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     hostGeneration: number,
     requireHostActive = true
   ): void {
-    if (!this.#matchesCoreFence(runtime, context)
+    if (!this.#isExecutionAuthorityCurrent(runtime)
+      || !this.#matchesCoreFence(runtime, context)
       || runtime.hostGeneration !== hostGeneration
-      || (requireHostActive && !this.#host.isActiveGeneration(hostGeneration))) {
+      || (requireHostActive && !runtime.host.isActiveGeneration(hostGeneration))) {
       throw adapterError({
         code: "CODEX_RUNTIME_GENERATION_STALE",
         message: "The Codex runtime generation changed before the result could be committed.",
@@ -3360,6 +3537,27 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         recovery: "Refresh the durable Session binding before reading native history."
       });
     }
+  }
+
+  #assertRuntimeDispatchFence(
+    runtime: SessionRuntime,
+    context: AdapterContext,
+    hostGeneration: number
+  ): void {
+    let executionCurrent = true;
+    try { runtime.assertExecutionCurrent(); }
+    catch { executionCurrent = false; }
+    if (executionCurrent
+      && this.#matchesCoreFence(runtime, context)
+      && runtime.hostGeneration === hostGeneration
+      && runtime.host.isActiveGeneration(hostGeneration)) return;
+    throw adapterError({
+      code: "CODEX_RUNTIME_GENERATION_STALE",
+      message: "The Codex runtime changed before input dispatch.",
+      phase: "dispatch",
+      stateMayHaveChanged: false,
+      recovery: "Refresh the Session and Backend instance before sending the input."
+    });
   }
 
   #assertRemoteHistoryFence(
@@ -4513,14 +4711,14 @@ function sameRemoteWorkspace(
 function remoteMutationUnsupported(operation: string) {
   return adapterError({
     code: "CODEX_REMOTE_MUTATION_UNSUPPORTED",
-    message: `The remote Codex read plane cannot ${operation}.`,
+    message: `The remote Codex runtime cannot ${operation}.`,
     phase: "dispatch",
     stateMayHaveChanged: false,
-    recovery: "Use remote discovery and history inspection, or choose a local Codex Target for mutations."
+    recovery: "Use the supported remote text controls, or choose a local Codex Target for this operation."
   });
 }
 
-function remoteReadStale() {
+function remoteRuntimeStale() {
   return adapterError({
     code: "CODEX_REMOTE_RUNTIME_STALE",
     message: "The remote Codex Target, host, or transport authority changed during the read.",
@@ -4531,10 +4729,10 @@ function remoteReadStale() {
   });
 }
 
-function remoteReadCancelled() {
+function remoteRuntimeCancelled() {
   return adapterError({
     code: "CODEX_REMOTE_READ_CANCELLED",
-    message: "The remote Codex read was cancelled.",
+    message: "The remote Codex runtime operation was cancelled.",
     phase: "probe",
     retryable: true,
     stateMayHaveChanged: false,

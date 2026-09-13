@@ -5,8 +5,8 @@ import {
   AppServerHost,
   StdioJsonRpcTransport,
   TransportFault,
-  type CodexRemoteReadRuntime,
-  type CodexRemoteReadRuntimePort,
+  type CodexRemoteRuntime,
+  type CodexRemoteRuntimePort,
   type JsonRpcRecordChannel,
   type JsonRpcRecordChannelHandlers
 } from "@joko/adapter-codex";
@@ -50,28 +50,28 @@ interface ResolverEntry {
   readonly targetRevision: bigint;
   readonly targetSignature: string;
   readonly authority: ProcessAuthority;
-  readonly runtime: CodexRemoteReadRuntime;
+  readonly runtime: CodexRemoteRuntime;
 }
 
-export interface RemoteCodexReadRuntimeResolverOptions {
+export interface RemoteCodexRuntimeResolverOptions {
   readonly store: Pick<OperationalStore, "getTarget">;
   readonly registry: Pick<RemoteHostRegistry, "captureProcessAuthority">;
 }
 
-/** Target- and SSH-generation-bound owner for the remote Codex read plane. */
-export class RemoteCodexReadRuntimeResolver implements CodexRemoteReadRuntimePort {
+/** Target- and SSH-generation-bound owner for a remote Codex runtime. */
+export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
   readonly #store: Pick<OperationalStore, "getTarget">;
   readonly #registry: Pick<RemoteHostRegistry, "captureProcessAuthority">;
   readonly #entries = new Map<string, ResolverEntry>();
-  readonly #flights = new Map<string, Promise<CodexRemoteReadRuntime>>();
+  readonly #flights = new Map<string, Promise<CodexRemoteRuntime>>();
   #closed = false;
 
-  constructor(options: RemoteCodexReadRuntimeResolverOptions) {
+  constructor(options: RemoteCodexRuntimeResolverOptions) {
     this.#store = options.store;
     this.#registry = options.registry;
   }
 
-  async resolve(target: TargetDescriptor, signal?: AbortSignal): Promise<CodexRemoteReadRuntime> {
+  async resolve(target: TargetDescriptor, signal?: AbortSignal): Promise<CodexRemoteRuntime> {
     this.#assertOpen();
     if (signal?.aborted) throw remoteRuntimeFault("The remote Codex runtime lookup was cancelled.");
     const stored = this.#storedTarget(target);
@@ -121,7 +121,7 @@ export class RemoteCodexReadRuntimeResolver implements CodexRemoteReadRuntimePor
     stored: StoredTarget,
     signature: string,
     signal?: AbortSignal
-  ): Promise<CodexRemoteReadRuntime> {
+  ): Promise<CodexRemoteRuntime> {
     const binding = requireRemoteBinding(target);
     const authority = await this.#registry.captureProcessAuthority(target.id, binding.hostId, signal);
     const processes = requireProcesses(authority.lease);
@@ -153,7 +153,7 @@ export class RemoteCodexReadRuntimeResolver implements CodexRemoteReadRuntimePor
         })
       })
     });
-    const runtime: CodexRemoteReadRuntime = Object.freeze({
+    const runtime: CodexRemoteRuntime = Object.freeze({
       host,
       workspaceRoot: installation.workspaceRoot,
       profileKey,

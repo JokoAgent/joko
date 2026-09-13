@@ -953,79 +953,132 @@ describe("CodexBackendAdapter", () => {
       .toMatchObject({ cwd: setup.target.workspaceRoot, useStateDbOnly: true });
   });
 
-  it("uses an independently fenced remote Host for discovery, resume inspection, and full history only", async () => {
-    const serviceRoot = await realpath(await mkdtemp(join(tmpdir(), "joko-codex-remote-target-")));
-    const localFake = new FakeCodexAppServer();
-    const remoteFake = new FakeCodexAppServer();
-    const localHost = new AppServerHost({ transportFactory: () => localFake.createTransport() });
-    const remoteHost = new AppServerHost({ transportFactory: () => remoteFake.createTransport() });
-    const profileKey = "a".repeat(64);
-    let current = true;
-    const resolveRemote = vi.fn(async () => ({
-      host: remoteHost,
-      workspaceRoot: "/srv/joko-project",
-      profileKey,
-      executionDomain: "ssh-codex-profile-fixture",
-      assertCurrent: () => { if (!current) throw new Error("remote authority changed"); }
-    }));
-    const shutdownRemote = vi.fn(async () => remoteHost.shutdown());
-    const adapter = new CodexBackendAdapter({
-      id: "codex-test",
-      instanceGeneration: 7,
-      host: localHost,
-      remoteReadRuntimes: {
-        resolve: resolveRemote,
-        shutdown: shutdownRemote,
-        forceShutdown: async () => remoteHost.forceShutdown()
-      }
-    });
-    const target: TargetDescriptor = {
-      id: "target-codex",
-      backendId: "codex-test",
-      displayName: "Remote Codex target",
-      workspaceRoot: serviceRoot,
-      managed: false,
-      trusted: true,
-      remoteWorkspace: { hostId: "remote-host", workspaceRoot: "/srv/joko-project" }
-    };
-    const nativeSessionId = remoteFake.seedThread("/srv/joko-project", [historyTurn(0, "remote answer")]);
-    cleanups.push(async () => {
-      await adapter.dispose();
-      await localHost.shutdown();
-      await remoteHost.shutdown();
-      await rm(serviceRoot, { recursive: true, force: true });
-    });
-
-    const candidates = await adapter.listNativeSessions(target);
+  it("uses one independently fenced remote Host for discovery, subscribed runtime, text controls, and history", async () => {
+    const setup = await createRemoteSetup();
+    const nativeSessionId = setup.remoteFake.seedThread("/srv/joko-project", [historyTurn(0, "remote answer")]);
+    const candidates = await setup.adapter.listNativeSessions(setup.target);
     expect(candidates).toHaveLength(1);
     expect(candidates[0]).toMatchObject({ nativeSessionId, workspaceRoot: "/srv/joko-project", messageCount: 0 });
-    const binding = await adapter.resolveNativeSessionReference(candidates[0]!.nativeReference, target, 1);
-    const bound = context(target, [], { binding, backendInstanceGeneration: 7 });
-    const resumed = await adapter.resumeSession(binding, bound);
+    const binding = await setup.adapter.resolveNativeSessionReference(candidates[0]!.nativeReference, setup.target, 1);
+    const events: EventPayload[] = [];
+    const bound = context(setup.target, events, { binding, backendInstanceGeneration: 7 });
+    const resumed = await setup.adapter.resumeSession(binding, bound);
     expect(resumed.binding).toEqual(binding);
-    const projection = await adapter.getNativeHistoryProjection(bound);
+    expect(setup.remoteFake.transport!.requests.filter((request) => request.method === "thread/resume")).toHaveLength(1);
+    const projection = await setup.adapter.getNativeHistoryProjection(bound);
     expect(projection.events.length).toBeGreaterThan(0);
 
-    const beforeRejectedMutations = remoteFake.transport!.requests.length;
-    await expect(adapter.send(prompt("must not dispatch"), context(target, [], {
+    await setup.adapter.send(prompt("remote prompt"), context(setup.target, events, {
       binding,
       backendInstanceGeneration: 7,
       operationId: "remote-send"
-    }))).rejects.toMatchObject({ publicError: { code: "CODEX_REMOTE_MUTATION_UNSUPPORTED", stateMayHaveChanged: false } });
-    await expect(adapter.createSession(sessionInput(target), context(target, [], { backendInstanceGeneration: 7 })))
-      .rejects.toMatchObject({ publicError: { code: "CODEX_REMOTE_MUTATION_UNSUPPORTED", stateMayHaveChanged: false } });
-    await expect(adapter.deleteSession(binding, bound))
-      .rejects.toMatchObject({ publicError: { code: "CODEX_REMOTE_MUTATION_UNSUPPORTED", stateMayHaveChanged: false } });
-    expect(remoteFake.transport!.requests).toHaveLength(beforeRejectedMutations);
-    expect(remoteFake.transport!.requests.map((request) => request.method)).not.toContain("thread/resume");
-    expect(localFake.transport).toBeUndefined();
+    }));
+    await setup.adapter.send({ ...prompt("remote steer"), disposition: "steer" }, context(setup.target, events, {
+      binding,
+      backendInstanceGeneration: 7,
+      operationId: "remote-steer"
+    }));
+    expect(setup.remoteFake.transport!.requests.find((request) => request.method === "turn/start")?.params)
+      .toMatchObject({ threadId: nativeSessionId, cwd: "/srv/joko-project", clientUserMessageId: "remote-send" });
+    expect(setup.remoteFake.transport!.requests.find((request) => request.method === "turn/steer")?.params)
+      .toMatchObject({ threadId: nativeSessionId, expectedTurnId: "turn-1", clientUserMessageId: "remote-steer" });
+    await setup.remoteFake.completeTurn(nativeSessionId, "remote completion");
+    expect(events).toContainEqual({ type: "done", outcome: "completed" });
 
-    current = false;
-    await expect(adapter.listNativeSessions(target))
-      .rejects.toMatchObject({ publicError: { code: "CODEX_REMOTE_TARGET_UNAVAILABLE" } });
-    await adapter.dispose();
-    expect(shutdownRemote).toHaveBeenCalledOnce();
-    expect(resolveRemote).toHaveBeenCalled();
+    await setup.adapter.setName("Remote task", bound);
+    await setup.adapter.setModel("openai", "gpt-test", bound);
+    await setup.adapter.setEffort("high", bound);
+    await setup.adapter.setFastMode(true, bound);
+    await setup.adapter.setPermissionMode("auto", bound);
+    await setup.adapter.setPlanMode(true, bound);
+    await setup.adapter.send(prompt("interrupt me"), context(setup.target, events, {
+      binding,
+      backendInstanceGeneration: 7,
+      operationId: "remote-interrupt-turn"
+    }));
+    await setup.adapter.abort(bound);
+    expect(setup.remoteFake.transport!.requests.map((request) => request.method)).toEqual(expect.arrayContaining([
+      "thread/name/set", "model/list", "thread/settings/update", "thread/resume", "turn/interrupt"
+    ]));
+    expect(setup.localFake.transport).toBeUndefined();
+    expect(setup.resolveRemote).toHaveBeenCalled();
+  });
+
+  it("rejects unsupported remote Codex mutations and attachments before native effect", async () => {
+    const setup = await createRemoteSetup();
+    const nativeSessionId = setup.remoteFake.seedThread("/srv/joko-project");
+    const candidate = (await setup.adapter.listNativeSessions(setup.target))[0]!;
+    const binding = await setup.adapter.resolveNativeSessionReference(candidate.nativeReference, setup.target, 1);
+    const bound = context(setup.target, [], { binding, backendInstanceGeneration: 7 });
+    await setup.adapter.resumeSession(binding, bound);
+    const beforeRejectedMutations = setup.remoteFake.transport!.requests.length;
+    await expect(setup.adapter.send({
+      ...prompt("must not dispatch"),
+      images: [{ blob: { id: "remote-image", byteLength: 1, sha256: "a".repeat(64), mimeType: "image/png" } }]
+    }, context(setup.target, [], {
+      binding,
+      backendInstanceGeneration: 7,
+      operationId: "remote-attachment"
+    }))).rejects.toMatchObject({ publicError: { code: "CODEX_REMOTE_MUTATION_UNSUPPORTED", stateMayHaveChanged: false } });
+    await expect(setup.adapter.createSession(sessionInput(setup.target), context(setup.target, [], { backendInstanceGeneration: 7 })))
+      .rejects.toMatchObject({ publicError: { code: "CODEX_REMOTE_MUTATION_UNSUPPORTED", stateMayHaveChanged: false } });
+    await expect(setup.adapter.deleteSession(binding, bound))
+      .rejects.toMatchObject({ publicError: { code: "CODEX_REMOTE_MUTATION_UNSUPPORTED", stateMayHaveChanged: false } });
+    expect(setup.remoteFake.transport!.requests).toHaveLength(beforeRejectedMutations);
+    expect(setup.remoteFake.transport!.requests.filter((request) => request.method === "turn/start")).toEqual([]);
+    expect(setup.remoteFake.threads.has(nativeSessionId)).toBe(true);
+  });
+
+  it("never resends uncertain remote input and rejects authority drift at the final pre-write fence", async () => {
+    const setup = await createRemoteSetup();
+    const nativeSessionId = setup.remoteFake.seedThread("/srv/joko-project");
+    const candidate = (await setup.adapter.listNativeSessions(setup.target))[0]!;
+    const binding = await setup.adapter.resolveNativeSessionReference(candidate.nativeReference, setup.target, 1);
+    const bound = context(setup.target, [], { binding, backendInstanceGeneration: 7 });
+    await setup.adapter.resumeSession(binding, bound);
+
+    setup.remoteFake.dropNextTurnClientId = true;
+    setup.remoteFake.timeoutNextTurnStart = true;
+    await expect(setup.adapter.send(prompt("uncertain remote input"), context(setup.target, [], {
+      binding,
+      backendInstanceGeneration: 7,
+      operationId: "remote-unknown"
+    }))).rejects.toMatchObject({ publicError: { code: "CODEX_DISPATCH_UNKNOWN", stateMayHaveChanged: true } });
+    expect(setup.remoteFake.transport!.requests.filter((request) => request.method === "turn/start")).toHaveLength(1);
+
+    const transport = setup.remoteFake.transport!;
+    const request = transport.request.bind(transport);
+    vi.spyOn(transport, "request").mockImplementation((method, params, options) => {
+      if (method === "turn/steer") setup.setCurrent(false);
+      return request(method, params, options);
+    });
+    const beforeSteer = transport.requests.filter((value) => value.method === "turn/steer").length;
+    await expect(setup.adapter.send({ ...prompt("stale steer"), disposition: "steer" }, context(setup.target, [], {
+      binding,
+      backendInstanceGeneration: 7,
+      operationId: "remote-stale-steer"
+    }))).rejects.toMatchObject({ publicError: { code: "CODEX_RUNTIME_GENERATION_STALE", stateMayHaveChanged: false } });
+    expect(transport.requests.filter((value) => value.method === "turn/steer")).toHaveLength(beforeSteer);
+    expect(setup.remoteFake.threads.get(nativeSessionId)?.turns).toHaveLength(1);
+  });
+
+  it("terminalizes only the subscribed remote runtime when its owning Host disconnects", async () => {
+    const setup = await createRemoteSetup();
+    const nativeSessionId = setup.remoteFake.seedThread("/srv/joko-project");
+    const candidate = (await setup.adapter.listNativeSessions(setup.target))[0]!;
+    const binding = await setup.adapter.resolveNativeSessionReference(candidate.nativeReference, setup.target, 1);
+    const events: EventPayload[] = [];
+    const bound = context(setup.target, events, { binding, backendInstanceGeneration: 7, operationId: "remote-disconnect" });
+    await setup.adapter.resumeSession(binding, bound);
+    await setup.adapter.send(prompt("disconnect after acceptance"), bound);
+    await setup.remoteFake.transport!.exit(true);
+
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "error",
+      terminal: true,
+      error: expect.objectContaining({ code: "CODEX_APP_SERVER_DISCONNECTED", stateMayHaveChanged: true })
+    }));
+    expect(events).toContainEqual({ type: "done", outcome: "failed" });
   });
 
   it("reports a side-effect-free continuity gap for validated missing or unresumable native threads", async () => {
@@ -2954,6 +3007,58 @@ async function createSetup(
     await rm(workspaceRoot, { recursive: true, force: true });
   });
   return { adapter, fake, host, target };
+}
+
+async function createRemoteSetup() {
+  const serviceRoot = await realpath(await mkdtemp(join(tmpdir(), "joko-codex-remote-target-")));
+  const localFake = new FakeCodexAppServer();
+  const remoteFake = new FakeCodexAppServer();
+  const localHost = new AppServerHost({ transportFactory: () => localFake.createTransport() });
+  const remoteHost = new AppServerHost({ transportFactory: () => remoteFake.createTransport() });
+  const profileKey = "a".repeat(64);
+  let current = true;
+  const resolveRemote = vi.fn(async () => ({
+    host: remoteHost,
+    workspaceRoot: "/srv/joko-project",
+    profileKey,
+    executionDomain: "ssh-codex-profile-fixture",
+    assertCurrent: () => { if (!current) throw new Error("remote authority changed"); }
+  }));
+  const adapter = new CodexBackendAdapter({
+    id: "codex-test",
+    instanceGeneration: 7,
+    host: localHost,
+    remoteRuntimes: {
+      resolve: resolveRemote,
+      shutdown: async () => remoteHost.shutdown(),
+      forceShutdown: async () => remoteHost.forceShutdown()
+    }
+  });
+  const target: TargetDescriptor = {
+    id: "target-codex",
+    backendId: "codex-test",
+    displayName: "Remote Codex target",
+    workspaceRoot: serviceRoot,
+    managed: false,
+    trusted: true,
+    remoteWorkspace: { hostId: "remote-host", workspaceRoot: "/srv/joko-project" }
+  };
+  cleanups.push(async () => {
+    await adapter.dispose();
+    await localHost.shutdown();
+    await remoteHost.shutdown();
+    await rm(serviceRoot, { recursive: true, force: true });
+  });
+  return {
+    adapter,
+    localFake,
+    remoteFake,
+    localHost,
+    remoteHost,
+    resolveRemote,
+    target,
+    setCurrent: (value: boolean) => { current = value; }
+  };
 }
 
 async function createRewindSetup(adapterOptions: Omit<CodexAdapterOptions, "id" | "instanceGeneration" | "host"> = {}) {

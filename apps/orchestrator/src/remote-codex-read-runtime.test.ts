@@ -10,7 +10,7 @@ import type {
 } from "@joko/remote-ssh";
 import type { RemoteHostRecord, StoredTarget } from "@joko/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { RemoteCodexReadRuntimeResolver } from "./remote-codex-read-runtime.js";
+import { RemoteCodexRuntimeResolver } from "./remote-codex-read-runtime.js";
 import type { RemoteHostRegistry } from "./remote-host-registry.js";
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -19,7 +19,7 @@ afterEach(async () => {
   await Promise.allSettled(cleanups.splice(0).map((cleanup) => cleanup()));
 });
 
-describe("RemoteCodexReadRuntimeResolver", () => {
+describe("RemoteCodexRuntimeResolver", () => {
   it("uses the fixed isolated runtime, bootstraps the daemon, and carries JSON-RPC over its bounded WebSocket proxy", async () => {
     const fixture = createFixture({ daemonInitiallyReady: false });
     cleanups.push(() => fixture.resolver.forceShutdown());
@@ -88,12 +88,36 @@ describe("RemoteCodexReadRuntimeResolver", () => {
     sshDrift.authorityCurrent = false;
     expect(() => sshRuntime.assertCurrent()).toThrow("SSH authority changed");
   });
+
+  it("rejects authority drift before a mutation write and marks a post-write disconnect uncertain", async () => {
+    const stale = createFixture({});
+    cleanups.push(() => stale.resolver.forceShutdown());
+    const staleRuntime = await stale.resolver.resolve(stale.target);
+    await staleRuntime.host.ensureStarted();
+    stale.authorityCurrent = false;
+    await expect(staleRuntime.host.request("turn/start", { threadId: "thread-one", input: [] }, {
+      mutation: true,
+      beforeDispatch: staleRuntime.assertCurrent
+    })).rejects.toThrow("SSH authority changed");
+    expect(stale.processes.clientMessages.map((message) => message.method)).not.toContain("turn/start");
+
+    const disconnected = createFixture({ disconnectOnMethod: "turn/start" });
+    cleanups.push(() => disconnected.resolver.forceShutdown());
+    const disconnectedRuntime = await disconnected.resolver.resolve(disconnected.target);
+    await disconnectedRuntime.host.ensureStarted();
+    await expect(disconnectedRuntime.host.request("turn/start", { threadId: "thread-one", input: [] }, {
+      mutation: true,
+      beforeDispatch: disconnectedRuntime.assertCurrent
+    })).rejects.toMatchObject({ stateMayHaveChanged: true });
+    expect(disconnected.processes.clientMessages.filter((message) => message.method === "turn/start")).toHaveLength(1);
+  });
 });
 
 interface FixtureOptions {
   readonly daemonInitiallyReady?: boolean;
   readonly probeVersion?: string;
   readonly stderr?: string;
+  readonly disconnectOnMethod?: string;
 }
 
 function createFixture(options: FixtureOptions) {
@@ -153,7 +177,7 @@ function createFixture(options: FixtureOptions) {
     lease,
     assertCurrent: () => { if (!fixture.authorityCurrent) throw new Error("SSH authority changed"); }
   }));
-  const resolver = new RemoteCodexReadRuntimeResolver({
+  const resolver = new RemoteCodexRuntimeResolver({
     store: { getTarget: () => fixture.stored },
     registry: { captureProcessAuthority: fixture.capture } as unknown as Pick<RemoteHostRegistry, "captureProcessAuthority">
   });
@@ -166,11 +190,13 @@ class FakeRemoteProcesses implements RemoteProcessTransportPort {
   #daemonReady: boolean;
   readonly #probeVersion: string;
   readonly #stderr: string;
+  readonly #disconnectOnMethod: string | undefined;
 
   constructor(options: FixtureOptions) {
     this.#daemonReady = options.daemonInitiallyReady ?? true;
     this.#probeVersion = options.probeVersion ?? "codex-cli 0.153.4";
     this.#stderr = options.stderr ?? "";
+    this.#disconnectOnMethod = options.disconnectOnMethod;
   }
 
   async open(request: RemoteProcessStartRequest): Promise<RemoteProcessHandle> {
@@ -252,6 +278,10 @@ class FakeRemoteProcesses implements RemoteProcessTransportPort {
     const message = JSON.parse(frame.payload.toString("utf8")) as { readonly method: string; readonly id?: number };
     this.clientMessages.push(message);
     if (message.id === undefined) return;
+    if (message.method === this.#disconnectOnMethod) {
+      processHandle.finish(1);
+      return;
+    }
     const result = message.method === "initialize"
       ? {
           userAgent: "codex-cli/0.153.4 (linux; x86_64) joko/0.1.0",
