@@ -3384,12 +3384,19 @@ export class SessionHost {
       this.assertSessionDerivationSource(source);
       const sourceContext = sideEffectLease.context;
       this.assertSessionDerivationTarget(admittedTarget, source, sourceContext);
-      const derivedWorktree = source.descriptor.worktree === undefined
-        ? undefined
-        : await this.#worktrees!.derive({
+      const derivesWorkspace = this.#store.getBackend(source.descriptor.backendId)
+        .descriptor.capabilities.get("workspace.derive")?.supported === true;
+      const derivedWorktree = source.descriptor.worktree !== undefined
+        ? await this.#worktrees!.derive({
             sessionId,
             sourceSessionId: source.descriptor.id
-          });
+          })
+        : derivesWorkspace && source.descriptor.remoteWorkspace === undefined
+          ? await this.#worktrees!.deriveFromCheckout({
+              sessionId,
+              sourceSessionId: source.descriptor.id
+            })
+          : undefined;
       if (derivedWorktree !== undefined) acquiredDerivedWorktreeSessionId = sessionId;
       const derivationTarget = derivedWorktree === undefined
         ? sourceContext.target
@@ -3517,7 +3524,7 @@ export class SessionHost {
       await this.cleanupNativeSessionDerivation(claim.operation.id);
       const derivationReceipt = this.#store.findNativeSessionDerivation(claim.operation.id);
       if (acquiredDerivedWorktreeSessionId !== undefined
-        && derivationReceipt?.state !== "recorded"
+        && (derivationReceipt === undefined || derivationReceipt.state === "cleaned")
         && this.#worktrees !== undefined) {
         await this.#worktrees.release(acquiredDerivedWorktreeSessionId)
           .catch((cleanupError: unknown) => this.recordDerivationFailure("derived_worktree_cleanup", cleanupError));
@@ -3546,22 +3553,25 @@ export class SessionHost {
         recovery: "Restore the source task's isolated workspace before deriving it."
       });
     }
-    if (worktree === undefined) return;
-    if (this.#worktrees === undefined
-      || this.#store.getBackend(source.descriptor.backendId).descriptor.capabilities.get("workspace.derive")?.supported !== true) {
+    const derivesWorkspace = this.#store.getBackend(source.descriptor.backendId)
+      .descriptor.capabilities.get("workspace.derive")?.supported === true;
+    const requiresLocalIsolation = worktree !== undefined
+      || (source.descriptor.remoteWorkspace === undefined && derivesWorkspace);
+    if (!requiresLocalIsolation) return;
+    if (this.#worktrees === undefined || !derivesWorkspace) {
       throw new JokoError({
         code: "SESSION_DERIVATION_WORKTREE_UNSUPPORTED",
         message: "This Backend cannot derive a native task into an independent workspace.",
         phase: "capability",
         retryable: false,
         stateMayHaveChanged: false,
-        recovery: "Use a Backend that advertises workspace.derive or derive a task without an isolated workspace."
+        recovery: "Use a Backend that advertises workspace.derive with an available workspace coordinator."
       });
     }
     if (this.hasDurableSessionWork(source.descriptor.id)) {
       throw new JokoError({
         code: "SESSION_DERIVATION_WORKTREE_BUSY",
-        message: "The isolated source workspace still has active or queued work.",
+        message: "The source workspace still has active or queued work.",
         phase: "workspace",
         retryable: true,
         stateMayHaveChanged: false,
@@ -3685,11 +3695,9 @@ export class SessionHost {
           // The durable claim remains reserved; startup converts an unfinished
           // claim to unknown instead of repeating a possibly completed delete.
         }
-        if (derivedWorktreeSessionId !== undefined && this.#worktrees !== undefined) {
-          await this.#worktrees.release(derivedWorktreeSessionId)
-            .catch((cleanupError: unknown) => this.recordDerivationFailure("derived_worktree_cleanup", cleanupError));
-          derivedWorktreeSessionId = undefined;
-        }
+        // An unknown detached-native deletion still owns its exact workspace.
+        // Keep the lease across restart; releasing it here could destroy a cwd
+        // that the native task may still be using.
       }
       this.recordDerivationFailure("native_session_derivation_cleanup", error);
     } finally {

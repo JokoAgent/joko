@@ -81,6 +81,16 @@ export interface WorktreeDeriveRequest {
   readonly sourceLeaseId: string;
 }
 
+/** Create a distinct lease from an ordinary primary Git checkout selected by
+ * a durable product Session/Target owner. Unlike WorktreeDeriveRequest there
+ * is no existing managed lease, so the service revalidates the checkout
+ * identity and content before and after creating the derived lease. */
+export interface WorktreeCheckoutDeriveRequest {
+  readonly sessionId: string;
+  readonly sourceSessionId: string;
+  readonly sourceCwd: string;
+}
+
 /** Inspect only the checkout owned by an exact durable Session lease. */
 export interface WorktreeRemovalPreviewRequest {
   readonly sessionId: string;

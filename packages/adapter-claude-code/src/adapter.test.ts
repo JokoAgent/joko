@@ -2828,6 +2828,34 @@ describe("ClaudeCodeAdapter", () => {
     await adapter.dispose();
   });
 
+  test("does not advertise or dispatch cross-workspace derivation without a native migration primitive", async () => {
+    const runtime = new FakeSdkRuntime();
+    runtime.supportsWorkspaceDerivation = false;
+    const adapter = adapterFor(runtime);
+    const binding = await adapter.createSession(createInput(), contextFor().context);
+    const source = contextFor(binding, { operationId: "unsupported-workspace-copy" });
+    const derivedWorkspace = await mkdtemp(join(tmpdir(), "joko-claude-unsupported-derived-workspace-"));
+    try {
+      const derivedTarget = { ...source.context.target, workspaceRoot: derivedWorkspace };
+
+      expect((await adapter.describe()).capabilities.get("workspace.derive")).toMatchObject({ supported: false });
+      await expect(adapter.clone(source.context, {
+        sessionId: "unsupported-derived-product",
+        target: derivedTarget,
+        recordBinding: vi.fn()
+      })).rejects.toMatchObject({
+        publicError: {
+          code: "SESSION_DERIVATION_TARGET_MISMATCH",
+          stateMayHaveChanged: false
+        }
+      });
+      expect(runtime.forks).toEqual([]);
+    } finally {
+      await adapter.dispose();
+      await rm(derivedWorkspace, { recursive: true, force: true, maxRetries: 3 });
+    }
+  });
+
   test.each(["user", "assistant"] as const)("forks through the exact persisted %s boundary with independent native identities", async (role) => {
     const runtime = new FakeSdkRuntime();
     const adapter = adapterFor(runtime);
@@ -3304,6 +3332,7 @@ function forkHistory(sessionId: string): ClaudeSdkSessionMessage[] {
 
 class FakeSdkRuntime implements ClaudeSdkRuntime {
   readonly packageVersion = CLAUDE_AGENT_SDK_VERSION;
+  supportsWorkspaceDerivation = true;
   readonly queries: FakeQuery[] = [];
   retirementFailure = false;
   readonly retiredQueries: ClaudeSdkQuery[] = [];

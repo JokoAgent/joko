@@ -85,7 +85,6 @@ export class SessionWorktreeCoordinator {
       .filter((setting) => setting.key === SCHEDULED_WORKTREE_OWNER_SETTING_KEY)
       .map((setting) => setting.scopeId);
     const pendingDerivationSessionIds = this.#store.listUnadoptedNativeSessionDerivations()
-      .filter((record) => record.state === "recorded")
       .map((record) => record.sessionId);
     const liveSessionIds = sessions
       .filter((session) => !session.descriptor.archived)
@@ -202,6 +201,44 @@ export class SessionWorktreeCoordinator {
     if (!result.ok) throw new SessionWorktreeCoordinatorError(result.error.code);
     const binding = worktreeBindingFor(input.sessionId, result.value.lease);
     const target = this.#store.getTarget(source.descriptor.targetId).descriptor;
+    try {
+      await this.#workspaces.register({
+        id: binding.workspaceId,
+        root: binding.path,
+        displayName: `${target.displayName} · ${binding.branch}`,
+        trusted: target.trusted
+      });
+    } catch (error) {
+      await this.#service.release(input.sessionId).catch(() => undefined);
+      throw error;
+    }
+    return binding;
+  }
+
+  async deriveFromCheckout(input: DeriveSessionWorktreeInput): Promise<SessionWorktreeBinding | undefined> {
+    this.#requireInitialized();
+    const source = this.#store.getSession(input.sourceSessionId);
+    if (source.descriptor.worktree !== undefined) {
+      throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+    }
+    const target = this.#store.getTarget(source.descriptor.targetId).descriptor;
+    if (source.descriptor.remoteWorkspace !== undefined || target.remoteWorkspace !== undefined) return undefined;
+    const detection = await this.#service.detectCwd(target.workspaceRoot);
+    if (!detection.ok) {
+      const eligibility = probeEligibility(detection.error.code);
+      if (eligibility === "not_git_repository") return undefined;
+      throw new SessionWorktreeCoordinatorError(detection.error.code);
+    }
+    if (detection.value.isLinkedWorktree) {
+      throw new SessionWorktreeCoordinatorError("CWD_IS_WORKTREE");
+    }
+    const result = await this.#service.deriveFromCheckout({
+      sessionId: input.sessionId,
+      sourceSessionId: input.sourceSessionId,
+      sourceCwd: target.workspaceRoot
+    });
+    if (!result.ok) throw new SessionWorktreeCoordinatorError(result.error.code);
+    const binding = worktreeBindingFor(input.sessionId, result.value.lease);
     try {
       await this.#workspaces.register({
         id: binding.workspaceId,

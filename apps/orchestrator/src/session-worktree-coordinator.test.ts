@@ -126,6 +126,148 @@ describe("SessionWorktreeCoordinator lifecycle", () => {
       .toBe("new content\n");
   });
 
+  test("isolates an ordinary primary checkout and retains unknown detached cleanup across restart", { timeout: 60_000 }, async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-primary-derived-worktree-"));
+    const repositoryRoot = await createRepository(join(root, "project"));
+    const store = new OperationalStore(join(root, "store.db"));
+    const artifactRepository = new OperationalArtifactRepository(store);
+    const artifacts = new ArtifactStore({
+      rootDirectory: join(root, "artifacts"),
+      repository: artifactRepository,
+      ingestRoots: [root]
+    });
+    await artifacts.initialize();
+    const workspaces = new WorkspaceService();
+    const worktrees = new SessionWorktreeCoordinator({
+      store,
+      workspaces,
+      storageRoot: join(root, "isolated")
+    });
+    const adapter = new TargetCaptureAdapter();
+    const host = new SessionHost(store, artifacts, [adapter], { worktrees });
+    await worktrees.initialize();
+    await host.initialize();
+    await host.registerTarget({
+      id: "ordinary-target",
+      backendId: adapter.id,
+      displayName: "Ordinary project",
+      workspaceRoot: repositoryRoot,
+      managed: false,
+      trusted: true
+    });
+    const connection = store.createConnection({
+      id: "ordinary-connection",
+      name: "Test device",
+      authKeyDigest: "ordinary-digest"
+    });
+    cleanups.push(async () => {
+      await host.dispose().catch(() => undefined);
+      worktrees.dispose();
+      await workspaces.close().catch(() => undefined);
+      store.close();
+      await rm(root, { recursive: true, force: true, maxRetries: 3 });
+    });
+
+    const sourceId = (await host.createSession({
+      operationId: "create-ordinary-derivation-source",
+      connection,
+      targetId: "ordinary-target",
+      title: "Ordinary source task",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    expect(store.getSession(sourceId).descriptor.worktree).toBeUndefined();
+    await writeFile(join(repositoryRoot, "tracked.txt"), "staged ordinary state\n", "utf8");
+    await git(repositoryRoot, ["add", "tracked.txt"]);
+    await writeFile(join(repositoryRoot, "tracked.txt"), "final ordinary state\n", "utf8");
+    await writeFile(join(repositoryRoot, "ordinary-untracked.txt"), "ordinary untracked\n", "utf8");
+    const sourceHead = (await git(repositoryRoot, ["rev-parse", "HEAD"])).trim();
+    const sourceStatus = await git(repositoryRoot, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+    const sourceIndex = await git(repositoryRoot, ["diff", "--cached", "--binary"]);
+    const sourceWorktree = await git(repositoryRoot, ["diff", "--binary"]);
+
+    const derivedId = (await host.deriveSession({
+      operationId: "clone-ordinary-source",
+      connection,
+      sourceSessionId: sourceId,
+      title: "Ordinary derived task",
+      kind: "clone"
+    })).value.sessionId;
+    const derived = store.getSession(derivedId).descriptor;
+    if (derived.worktree === undefined) throw new Error("Expected an independently derived workspace binding.");
+
+    expect(resolve(derived.worktree.path)).not.toBe(resolve(repositoryRoot));
+    expect(derived.worktree.sourceCommit).toBe(sourceHead);
+    expect(await git(derived.worktree.path, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]))
+      .toBe(sourceStatus);
+    expect(await git(derived.worktree.path, ["diff", "--cached", "--binary"])).toBe(sourceIndex);
+    expect(await git(derived.worktree.path, ["diff", "--binary"])).toBe(sourceWorktree);
+    expect((await git(repositoryRoot, ["rev-parse", "HEAD"])).trim()).toBe(sourceHead);
+    expect(await git(repositoryRoot, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]))
+      .toBe(sourceStatus);
+    expect(adapter.deriveRoots).toEqual([resolve(derived.worktree.path)]);
+    expect(workspaces.listRegistrations()).toContainEqual(expect.objectContaining({
+      id: derived.worktree.workspaceId,
+      root: resolve(derived.worktree.path)
+    }));
+
+    await host.resume(derivedId);
+    expect(adapter.resumeRoots.at(-1)).toBe(resolve(derived.worktree.path));
+    const sent = host.enqueueInput({
+      operationId: "send-ordinary-derived-worktree",
+      connection,
+      sessionId: derivedId,
+      prompt: { text: "continue ordinary derived task", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    await eventually(() => adapter.sendRoots.includes(resolve(derived.worktree!.path)));
+    await eventually(() => ["backend_accepted", "completed"].includes(store.getQueueItem(sent.value.queueItemId).state));
+    expect(adapter.observedTrackedContents.at(-1)?.replaceAll("\r\n", "\n")).toBe("final ordinary state\n");
+
+    adapter.failAfterClone = true;
+    adapter.failDelete = true;
+    await expect(host.deriveSession({
+      operationId: "clone-ordinary-source-unknown-cleanup",
+      connection,
+      sourceSessionId: sourceId,
+      title: "Unknown cleanup task",
+      kind: "clone"
+    })).rejects.toThrow();
+    const unknown = store.findNativeSessionDerivation("clone-ordinary-source-unknown-cleanup");
+    expect(unknown).toMatchObject({ state: "cleanup_unknown" });
+    expect(worktrees.activeWorkspacePath(unknown!.sessionId, unknown!.effectiveWorkspaceRoot))
+      .toBe(resolve(unknown!.effectiveWorkspaceRoot));
+    expect(adapter.deleteRoots.at(-1)).toBe(resolve(unknown!.effectiveWorkspaceRoot));
+
+    await host.dispose();
+    worktrees.dispose();
+    await workspaces.close();
+
+    const restartedWorkspaces = new WorkspaceService();
+    const restartedWorktrees = new SessionWorktreeCoordinator({
+      store,
+      workspaces: restartedWorkspaces,
+      storageRoot: join(root, "isolated")
+    });
+    const restartedAdapter = new TargetCaptureAdapter();
+    const restartedHost = new SessionHost(store, artifacts, [restartedAdapter], { worktrees: restartedWorktrees });
+    cleanups.push(async () => {
+      await restartedHost.dispose().catch(() => undefined);
+      restartedWorktrees.dispose();
+      await restartedWorkspaces.close().catch(() => undefined);
+    });
+    await restartedWorktrees.initialize();
+    expect(restartedWorktrees.activeWorkspacePath(unknown!.sessionId, unknown!.effectiveWorkspaceRoot))
+      .toBe(resolve(unknown!.effectiveWorkspaceRoot));
+    await restartedHost.initialize();
+    expect(store.findNativeSessionDerivation(unknown!.operationId)?.state).toBe("cleanup_unknown");
+    expect(restartedAdapter.deleteRoots).toEqual([]);
+    expect(restartedWorktrees.activeWorkspacePath(unknown!.sessionId, unknown!.effectiveWorkspaceRoot))
+      .toBe(resolve(unknown!.effectiveWorkspaceRoot));
+    await restartedHost.resume(derivedId);
+    expect(restartedAdapter.resumeRoots.at(-1)).toBe(resolve(derived.worktree.path));
+  });
+
   test("derives an independent checkout and resumes the detached native binding from its copied cwd", { timeout: 60_000 }, async () => {
     const root = await mkdtemp(join(tmpdir(), "joko-derived-worktree-"));
     const repositoryRoot = await createRepository(join(root, "project"));
@@ -302,6 +444,7 @@ class TargetCaptureAdapter extends FakeBackendAdapter {
   readonly resumeRoots: string[] = [];
   readonly deleteRoots: string[] = [];
   failAfterClone = false;
+  failDelete = false;
 
   constructor() {
     super({
@@ -325,6 +468,7 @@ class TargetCaptureAdapter extends FakeBackendAdapter {
   override async deleteSession(binding: NativeSessionBinding, context: AdapterContext): Promise<void> {
     this.deleteRoots.push(resolve(context.target.workspaceRoot));
     await super.deleteSession(binding, context);
+    if (this.failDelete) throw new Error("The detached native deletion outcome is unknown.");
   }
 
   override async resumeSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState> {

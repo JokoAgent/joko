@@ -152,4 +152,52 @@ describe("SessionSdkOwner", () => {
       await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
     }
   });
+
+  test("proves the published mutation directory does not migrate a copied Session cwd", { timeout: 30_000 }, async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-session-sdk-cwd-"));
+    const profile = join(root, "profile");
+    const sourceWorkspace = join(root, "source-workspace");
+    const requestedWorkspace = join(root, "requested-workspace");
+    const storageName = "cwd-proof-project";
+    const project = join(profile, "projects", storageName);
+    await Promise.all([
+      mkdir(project, { recursive: true }),
+      mkdir(sourceWorkspace),
+      mkdir(requestedWorkspace)
+    ]);
+    const messageId = randomUUID();
+    await writeFile(join(project, sourceId + ".jsonl"), JSON.stringify({
+      type: "user",
+      uuid: messageId,
+      parentUuid: null,
+      sessionId: sourceId,
+      cwd: sourceWorkspace,
+      timestamp: new Date(0).toISOString(),
+      message: { role: "user", content: "source cwd" }
+    }) + "\n");
+    const owner = new SessionSdkOwner({
+      environment: { CLAUDE_CONFIG_DIR: profile, CLAUDE_CODE_PROJECT_DIR_NAME: storageName },
+      timeoutMs: 10_000,
+      cleanupTimeoutMs: 2_000,
+      workerFactory: (_url, options) => new Worker(new URL("./session-sdk-worker.mts", import.meta.url), options)
+    });
+    try {
+      const result = await owner.run({
+        kind: "forkSession",
+        sessionId: sourceId,
+        options: { dir: requestedWorkspace }
+      }, { recordSessionId: () => undefined }) as { sessionId: string };
+      const info = await owner.run({
+        kind: "getSessionInfo",
+        sessionId: result.sessionId,
+        options: { dir: requestedWorkspace }
+      }) as { cwd?: string };
+
+      expect(info.cwd).toBe(sourceWorkspace);
+      expect(info.cwd).not.toBe(requestedWorkspace);
+    } finally {
+      await owner.retire();
+      await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    }
+  });
 });

@@ -127,6 +127,70 @@ describe("EphemeralWorktreeService", () => {
       .toEqual(["derived-session", "source-session"]);
   });
 
+  test("derives an ordinary primary checkout without mutating or leasing the source", { timeout: 20_000 }, async () => {
+    const fixture = await createRepositoryFixture();
+    const service = new EphemeralWorktreeService({ storageRoot: fixture.storageRoot });
+    unwrap(await service.initialize());
+    await writeFile(join(fixture.repositoryRoot, "tracked.txt"), "staged ordinary state\n", "utf8");
+    await git(fixture.repositoryRoot, ["add", "tracked.txt"]);
+    await writeFile(join(fixture.repositoryRoot, "tracked.txt"), "final ordinary state\n", "utf8");
+    await writeFile(join(fixture.repositoryRoot, "ordinary-untracked.txt"), "ordinary untracked\n", "utf8");
+    const sourceHead = (await git(fixture.repositoryRoot, ["rev-parse", "HEAD"])).trim();
+    const sourceStatus = await git(fixture.repositoryRoot, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+    const sourceIndex = await git(fixture.repositoryRoot, ["diff", "--cached", "--binary"]);
+    const sourceWorktree = await git(fixture.repositoryRoot, ["diff", "--binary"]);
+
+    const derived = unwrap(await service.deriveFromCheckout({
+      sessionId: "ordinary-derived-session",
+      sourceSessionId: "ordinary-source-session",
+      sourceCwd: join(fixture.repositoryRoot, "src")
+    }));
+
+    expect(derived).toMatchObject({ existing: false });
+    expect(derived.lease.path).not.toBe(fixture.repositoryRoot);
+    expect(derived.lease.source).toMatchObject({
+      ref: sourceHead,
+      commit: sourceHead,
+      strategy: "explicit",
+      refreshed: false,
+      reason: "derived_session_snapshot"
+    });
+    expect((await git(derived.lease.path, ["rev-parse", "HEAD"])).trim()).toBe(sourceHead);
+    expect(await git(derived.lease.path, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]))
+      .toBe(sourceStatus);
+    expect(await git(derived.lease.path, ["diff", "--cached", "--binary"])).toBe(sourceIndex);
+    expect(await git(derived.lease.path, ["diff", "--binary"])).toBe(sourceWorktree);
+    expect((await readFile(join(derived.lease.path, "ordinary-untracked.txt"), "utf8")).replaceAll("\r\n", "\n"))
+      .toBe("ordinary untracked\n");
+    expect((await git(fixture.repositoryRoot, ["rev-parse", "HEAD"])).trim()).toBe(sourceHead);
+    expect(await git(fixture.repositoryRoot, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]))
+      .toBe(sourceStatus);
+    expect(service.snapshot().active.map((lease) => lease.sessionId)).toEqual(["ordinary-derived-session"]);
+  });
+
+  test("rejects ordinary checkout derivation before allocation when snapshot content is unsafe", async () => {
+    const fixture = await createRepositoryFixture();
+    const service = new EphemeralWorktreeService({ storageRoot: fixture.storageRoot });
+    unwrap(await service.initialize());
+
+    await git(fixture.repositoryRoot, ["update-index", "--skip-worktree", "tracked.txt"]);
+    expectFailure(await service.deriveFromCheckout({
+      sessionId: "unsafe-index-derived",
+      sourceSessionId: "ordinary-source",
+      sourceCwd: fixture.repositoryRoot
+    }), "SESSION_CONFLICT");
+    expect(service.snapshot().active).toEqual([]);
+
+    await git(fixture.repositoryRoot, ["update-index", "--no-skip-worktree", "tracked.txt"]);
+    await writeFile(join(fixture.repositoryRoot, "private.ignored"), "must not be omitted\n", "utf8");
+    expectFailure(await service.deriveFromCheckout({
+      sessionId: "ignored-content-derived",
+      sourceSessionId: "ordinary-source",
+      sourceCwd: fixture.repositoryRoot
+    }), "SESSION_CONFLICT");
+    expect(service.snapshot().active).toEqual([]);
+  });
+
   test("retains every valid worktree source after the thousandth local branch", { timeout: 15_000 }, async () => {
     const fixture = await createRepositoryFixture();
     const head = (await git(fixture.repositoryRoot, ["rev-parse", "HEAD"])).trim();
@@ -1031,6 +1095,11 @@ describe("EphemeralWorktreeService", () => {
 
     expect(unwrap(await service.detectCwd(linkedPath)).isLinkedWorktree).toBe(true);
     expectFailure(await service.acquire({ sessionId: "linked", cwd: linkedPath }), "CWD_IS_WORKTREE");
+    expectFailure(await service.deriveFromCheckout({
+      sessionId: "linked-derived",
+      sourceSessionId: "linked-source",
+      sourceCwd: linkedPath
+    }), "CWD_IS_WORKTREE");
     expectFailure(await service.resolveSource({ cwd: fixture.repositoryRoot, sourceRef: "missing-ref" }), "SOURCE_NOT_FOUND");
 
     const controller = new AbortController();

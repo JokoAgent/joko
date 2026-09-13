@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { Worker } from "node:worker_threads";
 import { create } from "@bufbuild/protobuf";
 import { CLAUDE_AGENT_SDK_VERSION, ClaudeCodeAdapter } from "@joko/adapter-claude-code";
@@ -40,7 +41,15 @@ it("adopts a Claude fork through HTTP and rebuilds its message identities before
     const sourceId = await attachSource(fixture, paired, seed.sourceId);
     const sourceTimeline = await timeline(paired.clients, sourceId);
     const anchor = messageAnchor(sourceTimeline, seed.messageIds[1]!);
-    const sourceBinding = fixture.application.store.getSession(sourceId).descriptor.binding;
+    const sourceDescriptor = fixture.application.store.getSession(sourceId).descriptor;
+    const sourceBinding = sourceDescriptor.binding;
+    expect(sourceDescriptor.worktree).toBeUndefined();
+    expect(fixture.application.store.getBackend(backendId).descriptor.capabilities.get("workspace.derive"))
+      .toMatchObject({ supported: false });
+    const sourceHead = (await git(seed.workspace, ["rev-parse", "HEAD"])).trim();
+    const sourceStatus = await git(seed.workspace, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+    const sourceIndex = await git(seed.workspace, ["diff", "--cached", "--binary"]);
+    const sourceWorktree = await git(seed.workspace, ["diff", "--binary"]);
     const operationId = randomUUID();
     const mutation = forkMutation(sourceId, seed.messageIds[1]!, anchor);
     let nativeOperationId: string | undefined;
@@ -53,9 +62,20 @@ it("adopts a Claude fork through HTTP and rebuilds its message identities before
       });
       expect(fixture!.application.store.listSessions()).toHaveLength(1);
     };
-    const derivedId = sessionIdFrom(await submit(paired.clients.operation, paired.connectionId, mutation, operationId));
-    const derivedBinding = fixture.application.store.getSession(derivedId).descriptor.binding;
+    const forkOperation = await submit(paired.clients.operation, paired.connectionId, mutation, operationId);
+    expect(forkOperation.error).toBeUndefined();
+    expect(forkOperation.state).toBe(OperationState.SUCCEEDED);
+    const derivedId = sessionIdFrom(forkOperation);
+    const derivedDescriptor = fixture.application.store.getSession(derivedId).descriptor;
+    const derivedBinding = derivedDescriptor.binding;
+    expect(derivedDescriptor.worktree).toBeUndefined();
     expect(derivedBinding.nativeSessionId).not.toBe(sourceBinding.nativeSessionId);
+    expect(resolve(started.runtime.forks[0]!.dir)).toBe(resolve(seed.workspace));
+    expect((await git(seed.workspace, ["rev-parse", "HEAD"])).trim()).toBe(sourceHead);
+    expect(await git(seed.workspace, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]))
+      .toBe(sourceStatus);
+    expect(await git(seed.workspace, ["diff", "--cached", "--binary"])).toBe(sourceIndex);
+    expect(await git(seed.workspace, ["diff", "--binary"])).toBe(sourceWorktree);
     expect(fixture.application.store.findNativeSessionDerivation(nativeOperationId!)).toMatchObject({ state: "adopted", sessionId: derivedId, binding: derivedBinding });
     expect(fixture.application.store.getSession(derivedId).descriptor.derivationOrigin).toEqual({ kind: "fork", sourceSessionId: sourceId, sourceMessageId: anchor.messageId, sourceEventId: anchor.eventId });
     await resume(paired.clients, paired.connectionId, derivedId);
@@ -82,7 +102,10 @@ it("adopts a Claude fork through HTTP and rebuilds its message identities before
     const secondId = sessionIdFrom(await submit(paired.clients.operation, paired.connectionId,
       forkMutation(derivedId, derivedEntryId, messageAnchor(derivedTimeline, derivedEntryId))));
     expect(started.runtime.forks.map((call) => call.upToMessageId)).toEqual([seed.messageIds[1], derivedEntryId]);
-    expect(fixture.application.store.getSession(secondId).descriptor.binding.nativeSessionId).not.toBe(derivedBinding.nativeSessionId);
+    const secondDescriptor = fixture.application.store.getSession(secondId).descriptor;
+    expect(secondDescriptor.worktree).toBeUndefined();
+    expect(secondDescriptor.binding.nativeSessionId).not.toBe(derivedBinding.nativeSessionId);
+    expect(resolve(started.runtime.forks[1]!.dir)).toBe(resolve(seed.workspace));
 
     await fixture.close({ removeRoot: false });
     started = await start(seed);
@@ -92,6 +115,7 @@ it("adopts a Claude fork through HTTP and rebuilds its message identities before
     expect(started.runtime.forks).toEqual([]);
     expect(started.runtime.deletes).toEqual([]);
     expect(fixture.application.store.findNativeSessionDerivation(nativeOperationId!)?.state).toBe("adopted");
+    expect(fixture.application.store.getSession(derivedId).descriptor.worktree).toBeUndefined();
     for (const sessionId of [sourceId, derivedId]) await resume(clients, paired.connectionId, sessionId);
     const restored = historyMessages(await timeline(clients, derivedId));
     expect(restored.map((event) => event.eventId)).toEqual(derivedMessages.map((event) => event.eventId));
@@ -118,6 +142,8 @@ it.each(["unobserved", "validation", "cleanup-unknown"] as const)("keeps a %s Cl
     const failed = await submit(paired.clients.operation, paired.connectionId, mutation, operationId);
     expect(failed).toMatchObject({ state: OperationState.FAILED, error: { code: "NATIVE_SESSION_FORK_UNKNOWN" } });
     expect(started.runtime.forks).toHaveLength(1);
+    const forkDirectory = started.runtime.forks[0]!.dir;
+    expect(resolve(forkDirectory)).toBe(resolve(seed.workspace));
     expect(started.runtime.created).toHaveLength(1);
     const nativeId = started.runtime.created[0]!;
     const nativeOperation = fixture.application.store.listOperations().find((operation) => operation.kind === "fork_session");
@@ -130,7 +156,7 @@ it.each(["unobserved", "validation", "cleanup-unknown"] as const)("keeps a %s Cl
     } else {
       expect(receipt?.state).toBe(failure === "validation" ? "cleaned" : "cleanup_unknown");
       expect(started.runtime.deletes).toEqual([nativeId]);
-      expect(await started.runtime.getSessionInfo(nativeId, { dir: seed.workspace })).toBeUndefined();
+      expect(await started.runtime.getSessionInfo(nativeId, { dir: forkDirectory })).toBeUndefined();
     }
     expect(fixture.application.store.listSessions()).toHaveLength(1);
     expect(await readFile(seed.sourcePath, "utf8")).toBe(seed.transcript);
@@ -267,6 +293,15 @@ async function seedNativeHistory() {
   const profile = join(root, "native-profile");
   const project = join(profile, "projects", storageName);
   await Promise.all([mkdir(project, { recursive: true }), mkdir(workspace)]);
+  await git(workspace, ["init", "--initial-branch=main"]);
+  await git(workspace, ["config", "user.name", "Joko Test"]);
+  await git(workspace, ["config", "user.email", "test@invalid.example"]);
+  await writeFile(join(workspace, "tracked.txt"), "initial\n", "utf8");
+  await git(workspace, ["add", "tracked.txt"]);
+  await git(workspace, ["commit", "-m", "initial"]);
+  await writeFile(join(workspace, "tracked.txt"), "staged source state\n", "utf8");
+  await git(workspace, ["add", "tracked.txt"]);
+  await writeFile(join(workspace, "tracked.txt"), "final source state\n", "utf8");
   const sourceId = randomUUID();
   const messageIds: string[] = [randomUUID(), randomUUID(), randomUUID()];
   const transcript = messageIds.map((uuid, index) => JSON.stringify({
@@ -323,7 +358,8 @@ function messageAnchor(events: readonly Event[], nativeId: string) {
 /** Real fixed SDK Session filesystem APIs; the Query has no model traffic. */
 class LocalSessionRuntime implements ClaudeSdkRuntime {
   readonly packageVersion = CLAUDE_AGENT_SDK_VERSION;
-  readonly forks: { sourceId: string; upToMessageId?: string }[] = [];
+  readonly supportsWorkspaceDerivation = false;
+  readonly forks: { sourceId: string; dir: string; upToMessageId?: string }[] = [];
   readonly created: string[] = [];
   readonly deletes: string[] = [];
   readonly #owner: SessionSdkOwner;
@@ -353,7 +389,8 @@ class LocalSessionRuntime implements ClaudeSdkRuntime {
     return await this.#owner.run({ kind: "listSessions", options }) as readonly ClaudeSdkSessionInfo[];
   }
   async forkSession(sessionId: string, options: ClaudeSdkForkOptions) {
-    this.forks.push({ sourceId: sessionId, ...(options.upToMessageId === undefined ? {} : { upToMessageId: options.upToMessageId }) });
+    this.forks.push({ sourceId: sessionId, dir: options.dir,
+      ...(options.upToMessageId === undefined ? {} : { upToMessageId: options.upToMessageId }) });
     const result = await this.#owner.run({ kind: "forkSession", sessionId, options: { dir: options.dir, ...(options.upToMessageId === undefined ? {} : { upToMessageId: options.upToMessageId }) } }, {
       signal: options.signal,
       recordSessionId: (id) => {
@@ -389,4 +426,24 @@ class IdleQuery implements ClaudeSdkQuery {
   async setModel() {}
   async applyFlagSettings() {}
   close() { this.#finish(); }
+}
+
+async function git(cwd: string, args: readonly string[]): Promise<string> {
+  const environment: NodeJS.ProcessEnv = { ...process.env, LC_ALL: "C" };
+  for (const key of ["GIT_COMMON_DIR", "GIT_DIR", "GIT_INDEX_FILE", "GIT_WORK_TREE"]) delete environment[key];
+  return new Promise<string>((resolveResult, reject) => {
+    execFile("git", [...args], {
+      cwd,
+      encoding: "utf8",
+      env: environment,
+      maxBuffer: 2 * 1024 * 1024,
+      windowsHide: true
+    }, (error, stdout, stderr) => {
+      if (error !== null) {
+        reject(new Error(`Git fixture command failed: ${stderr.trim()}`, { cause: error }));
+        return;
+      }
+      resolveResult(stdout);
+    });
+  });
 }

@@ -33,6 +33,7 @@ import {
   type WorktreeAcquireRequest,
   type WorktreeAcquisition,
   type WorktreeCallOptions,
+  type WorktreeCheckoutDeriveRequest,
   type WorktreeCwdDetection,
   type WorktreeDeriveRequest,
   type WorktreeInitialization,
@@ -62,6 +63,12 @@ export interface EphemeralWorktreeServiceOptions {
 interface DestructionResult {
   readonly pathRemoved: boolean;
   readonly branchPreserved: boolean;
+}
+
+interface WorktreeSnapshotSource {
+  readonly sessionId: string;
+  readonly path: string;
+  readonly repositoryRoot: string;
 }
 
 const SNAPSHOT_IDENTITY_ENVIRONMENT = Object.freeze({
@@ -271,51 +278,115 @@ export class EphemeralWorktreeService {
       if (sourceHead === undefined) {
         throw new WorktreeServiceError("SESSION_CONFLICT", "The source worktree has no stable HEAD commit.");
       }
-      const snapshotSha = await this.#createDirtySnapshotObject(source, control);
-      if (!(await this.#sourceSnapshotStillCurrent(source, sourceHead, snapshotSha, control))) {
-        throw new WorktreeServiceError("SESSION_CONFLICT", "The source worktree changed while it was being captured.");
-      }
-
-      let created: ManagedWorktreeEntry | undefined;
-      try {
-        created = await this.#createEntry(repositoryDetection, accepted.sessionId, {
-          ref: sourceHead,
-          commit: sourceHead,
-          refreshed: false,
-          strategy: "explicit",
-          reason: "derived_session_snapshot"
-        }, control);
-        if (snapshotSha !== undefined) {
-          await runGit(["stash", "apply", "--index", snapshotSha], created.path, control);
-          if (!(await this.#snapshotMatchesWorktree(created, snapshotSha, control))) {
-            throw new WorktreeServiceError(
-              "SESSION_CONFLICT",
-              "The derived worktree did not reproduce the captured source state."
-            );
-          }
-        } else if (!(await isWorktreeCompletelyClean(created.path, control))) {
-          throw new WorktreeServiceError("SESSION_CONFLICT", "The clean derived worktree changed during creation.");
-        }
-        if (await worktreeHeadCommit(created.path, control) !== sourceHead
-          || !(await this.#sourceSnapshotStillCurrent(source, sourceHead, snapshotSha, control))) {
-          throw new WorktreeServiceError("SESSION_CONFLICT", "The source worktree changed before derivation completed.");
-        }
-        return Object.freeze({ lease: leaseFromEntry(created), existing: false });
-      } catch (error) {
-        if (created !== undefined) {
-          try {
-            await this.#destroyEntry(created, control);
-          } catch {
-            if (isTerminalError(error)) throw error;
-            throw new WorktreeServiceError(
-              "CLEANUP_FAILED",
-              "A failed derived worktree could not be destroyed safely."
-            );
-          }
-        }
-        throw error;
-      }
+      return this.#deriveCapturedCheckout(
+        accepted.sessionId,
+        source,
+        repositoryDetection,
+        sourceHead,
+        (snapshotSha) => this.#sourceSnapshotStillCurrent(source, sourceHead, snapshotSha, control),
+        control
+      );
     });
+  }
+
+  deriveFromCheckout(
+    request: WorktreeCheckoutDeriveRequest,
+    options?: WorktreeCallOptions
+  ): Promise<WorktreeResult<WorktreeAcquisition>> {
+    return this.#serialize(options, true, async (control) => {
+      const accepted = validateCheckoutDeriveRequest(request);
+      const detection = await probeWorktreeCwd(accepted.sourceCwd, control);
+      if (detection.isLinkedWorktree) {
+        throw new WorktreeServiceError(
+          "CWD_IS_WORKTREE",
+          "An externally linked worktree cannot be used as an ordinary checkout derivation source."
+        );
+      }
+      this.#assertRepositorySeparated(detection.repositoryRoot);
+      const source: WorktreeSnapshotSource = {
+        sessionId: accepted.sourceSessionId,
+        path: detection.repositoryRoot,
+        repositoryRoot: detection.repositoryRoot
+      };
+      return this.#deriveCapturedCheckout(
+        accepted.sessionId,
+        source,
+        detection,
+        detection.headCommit,
+        async (snapshotSha) => {
+          const current = await probeWorktreeCwd(accepted.sourceCwd, control);
+          if (
+            current.isLinkedWorktree
+            || !samePath(current.cwd, detection.cwd)
+            || !samePath(current.repositoryRoot, detection.repositoryRoot)
+            || !samePath(current.gitCommonDirectory, detection.gitCommonDirectory)
+          ) return false;
+          return this.#sourceSnapshotStillCurrent(source, detection.headCommit, snapshotSha, control);
+        },
+        control
+      );
+    });
+  }
+
+  async #deriveCapturedCheckout(
+    sessionId: string,
+    source: WorktreeSnapshotSource,
+    repositoryDetection: WorktreeCwdDetection,
+    sourceHead: string,
+    sourceStillCurrent: (snapshotSha: string | undefined) => Promise<boolean>,
+    control: WorktreeOperationControl
+  ): Promise<WorktreeAcquisition> {
+    const store = this.#requireStore();
+    if (store.entries().some((entry) => entry.sessionId === sessionId)) {
+      throw new WorktreeServiceError(
+        "SESSION_CONFLICT",
+        "The derived Session already owns a worktree lease.",
+        { sessionId }
+      );
+    }
+    const snapshotSha = await this.#createDirtySnapshotObject(source, control, true);
+    if (!(await sourceStillCurrent(snapshotSha))) {
+      throw new WorktreeServiceError("SESSION_CONFLICT", "The source checkout changed while it was being captured.");
+    }
+
+    let created: ManagedWorktreeEntry | undefined;
+    try {
+      created = await this.#createEntry(repositoryDetection, sessionId, {
+        ref: sourceHead,
+        commit: sourceHead,
+        refreshed: false,
+        strategy: "explicit",
+        reason: "derived_session_snapshot"
+      }, control);
+      if (snapshotSha !== undefined) {
+        await runGit(["stash", "apply", "--index", snapshotSha], created.path, control);
+        if (!(await this.#snapshotMatchesWorktree(created, snapshotSha, control))) {
+          throw new WorktreeServiceError(
+            "SESSION_CONFLICT",
+            "The derived worktree did not reproduce the captured source state."
+          );
+        }
+      } else if (!(await isWorktreeCompletelyClean(created.path, control))) {
+        throw new WorktreeServiceError("SESSION_CONFLICT", "The clean derived worktree changed during creation.");
+      }
+      if (await worktreeHeadCommit(created.path, control) !== sourceHead || !(await sourceStillCurrent(snapshotSha))) {
+        throw new WorktreeServiceError("SESSION_CONFLICT", "The source checkout changed before derivation completed.");
+      }
+      return Object.freeze({ lease: leaseFromEntry(created), existing: false });
+    } catch (error) {
+      if (created !== undefined) {
+        try {
+          await this.#destroyEntry(created, control);
+        } catch {
+          if (isTerminalError(error)) throw error;
+          throw new WorktreeServiceError(
+            "CLEANUP_FAILED",
+            "A failed derived worktree could not be destroyed safely."
+          );
+        }
+      }
+      throw error;
+    }
   }
 
   previewRemoval(
@@ -839,7 +910,7 @@ export class EphemeralWorktreeService {
   }
 
   async #sourceSnapshotStillCurrent(
-    entry: ManagedWorktreeEntry,
+    entry: WorktreeSnapshotSource,
     expectedHead: string,
     snapshotSha: string | undefined,
     control: WorktreeOperationControl
@@ -851,16 +922,33 @@ export class EphemeralWorktreeService {
   }
 
   async #createDirtySnapshotObject(
-    entry: ManagedWorktreeEntry,
-    control: WorktreeOperationControl
+    entry: WorktreeSnapshotSource,
+    control: WorktreeOperationControl,
+    requireDerivableContent = false
   ): Promise<string | undefined> {
-    if (await hasUnsafeTrackedIndexFlags(entry.path, control)) return undefined;
+    if (await hasUnsafeTrackedIndexFlags(entry.path, control)) {
+      if (requireDerivableContent) {
+        throw new WorktreeServiceError(
+          "SESSION_CONFLICT",
+          "The source checkout uses index flags that cannot be captured safely."
+        );
+      }
+      return undefined;
+    }
     const status = await runGit(
       ["status", "--porcelain=v2", "-z", "--untracked-files=all", "--ignored=matching"],
       entry.path,
       control
     );
-    if (snapshotHasUnsupportedContent(status.stdout)) return undefined;
+    if (snapshotHasUnsupportedContent(status.stdout)) {
+      if (requireDerivableContent) {
+        throw new WorktreeServiceError(
+          "SESSION_CONFLICT",
+          "The source checkout contains ignored or nested repository state that cannot be captured safely."
+        );
+      }
+      return undefined;
+    }
 
     const untracked = (await runGit(
       ["ls-files", "--others", "--exclude-standard", "-z"],
@@ -882,7 +970,7 @@ export class EphemeralWorktreeService {
   }
 
   async #createSnapshotWithUntracked(
-    entry: ManagedWorktreeEntry,
+    entry: WorktreeSnapshotSource,
     marker: string,
     trackedSha: string | undefined,
     untracked: readonly string[],
@@ -958,7 +1046,7 @@ export class EphemeralWorktreeService {
   }
 
   async #commitSnapshotTree(
-    entry: ManagedWorktreeEntry,
+    entry: WorktreeSnapshotSource,
     tree: string,
     parents: readonly string[],
     message: string,
@@ -974,7 +1062,7 @@ export class EphemeralWorktreeService {
   }
 
   async #snapshotMatchesWorktree(
-    entry: ManagedWorktreeEntry,
+    entry: WorktreeSnapshotSource,
     expectedSha: string,
     control: WorktreeOperationControl
   ): Promise<boolean> {
@@ -988,7 +1076,7 @@ export class EphemeralWorktreeService {
   }
 
   async #snapshotContentIdentity(
-    entry: ManagedWorktreeEntry,
+    entry: WorktreeSnapshotSource,
     snapshotSha: string,
     control: WorktreeOperationControl
   ): Promise<string> {
@@ -1638,6 +1726,19 @@ function validateDeriveRequest(value: unknown): WorktreeDeriveRequest {
     throw invalidArgument("sourceLeaseId", "The source worktree lease id is invalid.");
   }
   return { sessionId, sourceSessionId, sourceLeaseId };
+}
+
+function validateCheckoutDeriveRequest(value: unknown): WorktreeCheckoutDeriveRequest {
+  if (!isRecord(value) || hasUnsupportedKeys(value, ["sessionId", "sourceSessionId", "sourceCwd"])) {
+    throw invalidArgument("request", "The checkout derivation request is invalid.");
+  }
+  const sessionId = validateSessionId(value["sessionId"]);
+  const sourceSessionId = validateSessionId(value["sourceSessionId"]);
+  if (sessionId === sourceSessionId) {
+    throw invalidArgument("sessionId", "A derived worktree requires a distinct Session owner.");
+  }
+  if (typeof value["sourceCwd"] !== "string") throw invalidArgument("sourceCwd", "sourceCwd must be a string.");
+  return { sessionId, sourceSessionId, sourceCwd: value["sourceCwd"] };
 }
 
 function validateRemovalPreviewRequest(value: unknown): WorktreeRemovalPreviewRequest {

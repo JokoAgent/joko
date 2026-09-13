@@ -225,6 +225,11 @@ export interface ClaudeSdkProbe {
 
 export interface ClaudeSdkRuntime {
   readonly packageVersion: string;
+  /** True only when the injected runtime can create and subsequently resume a
+   * public SDK fork in a different canonical workspace. The fixed filesystem
+   * SDK runtime does not provide that migration primitive: ForkSessionOptions.dir
+   * selects the source project store and does not rewrite the copied cwd. */
+  readonly supportsWorkspaceDerivation?: boolean;
   probe(input: ClaudeSdkProbeInput): Promise<ClaudeSdkProbe>;
   query(params: ClaudeSdkQueryParams): Promise<ClaudeSdkQuery>;
   /** Confirm retirement of this exact Query before resuming its native Session. */
@@ -265,6 +270,7 @@ interface LoadedSdkModule {
 
 export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
   readonly packageVersion = CLAUDE_AGENT_SDK_VERSION;
+  readonly supportsWorkspaceDerivation = false;
   readonly #processOwner: DurableProcessOwner | undefined;
   readonly #retirementTimeoutMs: number;
   readonly #sessionOwner: SessionSdkOwner;

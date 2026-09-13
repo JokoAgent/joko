@@ -683,6 +683,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       error: descriptorError,
       capabilities: capabilityManifest(
         installed,
+        this.#runtime.supportsWorkspaceDerivation === true,
         supportsIsolatedReview(this.#lastCliVersion),
         supportsNativeTaskProjection(this.#lastCliVersion),
         supportsSteer(this.#lastCliVersion),
@@ -1534,7 +1535,11 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     const phase = replacement ? "session_navigation" : entryId === undefined ? "session_clone" : "session_fork";
     const derivedTarget = "target" in derivation ? derivation.target : context.target;
     if ("target" in derivation) {
-      assertClaudeDerivationTarget(context.target, derivedTarget);
+      assertClaudeDerivationTarget(
+        context.target,
+        derivedTarget,
+        this.#runtime.supportsWorkspaceDerivation === true
+      );
     }
     this.#assertStandardRuntime(runtime, "derive native history");
     if (context.signal.aborted) throw claudeCodeError(entryId === undefined ? "NATIVE_SESSION_CLONE_CANCELLED" : "NATIVE_SESSION_FORK_CANCELLED", "The native Session copy was cancelled.", phase);
@@ -3918,6 +3923,7 @@ function projectedUserBlocks(content: unknown, projection: SafeProjection): read
 
 function capabilityManifest(
   installed: boolean,
+  workspaceDerivationSupported: boolean,
   isolatedReviewSupported: boolean,
   nativeTasksSupported: boolean,
   steerSupported: boolean,
@@ -3935,7 +3941,6 @@ function capabilityManifest(
     "session.resume",
     "session.clone",
     "session.fork",
-    "workspace.derive",
     "session.rewind",
     "session.detach",
     "session.discovery",
@@ -3957,6 +3962,7 @@ function capabilityManifest(
     "interaction.question",
     "interaction.plan_review"
   ]);
+  if (workspaceDerivationSupported) supported.add("workspace.derive");
   if (inputResolvers.readBlob !== undefined) supported.add("input.image");
   if (inputResolvers.resolveFile !== undefined) supported.add("input.file");
   if (textResourcesSupported) supported.add("runtime.resources");
@@ -4360,13 +4366,19 @@ function assertSameTarget(left: TargetDescriptor, right: TargetDescriptor): void
   }
 }
 
-function assertClaudeDerivationTarget(source: TargetDescriptor, derived: TargetDescriptor): void {
+function assertClaudeDerivationTarget(
+  source: TargetDescriptor,
+  derived: TargetDescriptor,
+  workspaceDerivationSupported: boolean
+): void {
   if (source.id !== derived.id
     || source.backendId !== derived.backendId
     || source.managed !== derived.managed
     || source.trusted !== derived.trusted
     || source.remoteWorkspace?.hostId !== derived.remoteWorkspace?.hostId
-    || source.remoteWorkspace?.workspaceRoot !== derived.remoteWorkspace?.workspaceRoot) {
+    || source.remoteWorkspace?.workspaceRoot !== derived.remoteWorkspace?.workspaceRoot
+    || (!workspaceDerivationSupported
+      && canonicalPathKey(source.workspaceRoot) !== canonicalPathKey(derived.workspaceRoot))) {
     throw claudeCodeError(
       "SESSION_DERIVATION_TARGET_MISMATCH",
       "The derived workspace does not preserve the source Target identity.",
