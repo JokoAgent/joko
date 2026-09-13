@@ -63,6 +63,9 @@ it("maps terminal ownership and optional checkpoints, rejects broken streams and
   await expect(gateway.watchTerminal("task", "pty", 2n, appearance, updates)).rejects.toThrow("generation");
   wrongOwner = true;
   await expect(gateway.getTerminal("task", "pty")).rejects.toThrow("owner");
+  wrongOwner = false;
+  await gateway.resizeTerminal("task", "pty", 2n, "view", 90, 30);
+  expect(requests.at(-1)?.input).toMatchObject({ viewId: "view", columns: 90, rows: 30 });
   failWrite = true;
   await expect(gateway.writeTerminal("task", "pty", 2n, "writer", 1n, "input")).rejects.toThrow("acknowledgement lost");
   expect(requests.filter((request) => request.name === "writeTerminal")).toHaveLength(1);

@@ -2778,7 +2778,13 @@ describe("SessionHost", () => {
 
   it("imports a portable task exactly once, rejects duplicates, and replaces only when explicit", async () => {
     const adapter = new PortableFakeAdapter();
-    const fixture = await createFixture(adapter);
+    const cleanupOrder: string[] = [];
+    let terminalCleanupFails = false;
+    const closeSessionTerminals = vi.fn(async (_sessionId: string) => {
+      cleanupOrder.push("terminal");
+      if (terminalCleanupFails) throw new Error("terminal cleanup outcome unknown");
+    });
+    const fixture = await createFixture(adapter, { closeSessionTerminals });
     const sourceSessionId = (await fixture.host.createSession({
       operationId: "create-portable-import-source",
       connection: fixture.connection,
@@ -2915,6 +2921,22 @@ describe("SessionHost", () => {
       operationId: "import-portable-task-duplicate"
     })).rejects.toMatchObject({ publicError: { code: "PORTABLE_SESSION_IMPORT_CONFLICT" } });
 
+    terminalCleanupFails = true;
+    await expect(fixture.host.importPortableSession({
+      ...request,
+      operationId: "import-portable-task-terminal-cleanup-unknown",
+      overwrite: true
+    })).rejects.toBeInstanceOf(OperationPreviouslyFailedError);
+    expect(fixture.store.getSession(imported.value.sessionId).descriptor.deletedAt).toBeUndefined();
+    expect(adapter.importedNativeText).toHaveLength(1);
+
+    terminalCleanupFails = false;
+    cleanupOrder.length = 0;
+    const deleteNative = adapter.deleteSession.bind(adapter);
+    vi.spyOn(adapter, "deleteSession").mockImplementation(async (...args) => {
+      cleanupOrder.push("native");
+      await deleteNative(...args);
+    });
     const replacement = await fixture.host.importPortableSession({
       ...request,
       operationId: "import-portable-task-replacement",
@@ -2925,6 +2947,8 @@ describe("SessionHost", () => {
     expect(fixture.store.getSession(imported.value.sessionId).descriptor.deletedAt).toEqual(expect.any(Number));
     expect(fixture.store.getSession(replacement.value.sessionId).descriptor.title).toBe("Replaced portable task");
     expect(adapter.importedNativeText).toHaveLength(2);
+    expect(closeSessionTerminals).toHaveBeenLastCalledWith(imported.value.sessionId);
+    expect(cleanupOrder).toEqual(["terminal", "native"]);
   });
 
   it("rejects a product-only portable import before creating a disabled model route", async () => {
@@ -11553,6 +11577,7 @@ async function createFixture(
   hostOptions: {
     readonly workspaceCapture?: WorkspaceRunCapture;
     readonly worktrees?: SessionWorktreeCoordinator;
+    readonly closeSessionTerminals?: (sessionId: string) => Promise<void>;
     readonly monotonicNow?: () => number;
     readonly freezeToolPolicies?: (sessionId: string, targetId: string) => void;
     readonly runSilenceTimeoutMs?: number;

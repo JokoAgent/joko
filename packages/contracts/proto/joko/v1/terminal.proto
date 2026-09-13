@@ -180,6 +180,7 @@ message WriteTerminalRequest {
   // One ephemeral writer per mounted view; sequence begins at 1 and advances
   // only in a FIFO input stream. Repeated acknowledged sequences never write
   // twice. A lost response must not cause a new sequence with the same bytes.
+  // This identity must equal the active Watch appearance view_id.
   string writer_id = 4;
   uint64 input_sequence = 5;
   string data = 6;
@@ -195,6 +196,8 @@ message ResizeTerminalRequest {
   uint64 generation = 3;
   uint32 columns = 4;
   uint32 rows = 5;
+  // The active Watch appearance view_id that currently owns control.
+  string view_id = 6;
 }
 
 message ResizeTerminalResponse {

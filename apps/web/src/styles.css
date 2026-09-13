@@ -298,7 +298,7 @@ time { color: var(--text-faint); font-size: var(--text-11); white-space: nowrap;
 :root[data-desktop-platform="darwin"] .app.navigation-hidden .empty-session-page > header { padding-left: 78px; }
 :root[data-desktop-platform="darwin"] .app.navigation-hidden .route-header { padding-left: max(78px, clamp(22px, 4vw, 52px)); }
 :root[data-desktop-platform="darwin"] .inspector__header { height: 46px; min-height: 46px; align-items: center; }
-:root[data-desktop-platform="darwin"] .inspector-tabs { align-items: center; }
+:root[data-desktop-platform="darwin"] .inspector-tabs__sortable { align-items: center; }
 :root[data-desktop-platform="darwin"] .inspector-tab { border-bottom-width: 1px; border-radius: 8px; }
 :root[data-desktop-platform="darwin"] .inspector__header > .icon-button,
 :root[data-desktop-platform="darwin"] .inspector-menu > .icon-button { margin-block: 0; }
@@ -1778,7 +1778,7 @@ button.attachment-chip__content:focus-visible { outline: 2px solid var(--accent-
 .inspector.is-detached.is-left { border: 0; }
 .inspector.is-detached .inspector__resize { display: none; }
 :root[data-desktop-platform] .inspector.is-detached .inspector__header { height: 36px; min-height: 36px; align-items: end; padding: 0 4px 0 8px; }
-:root[data-desktop-platform] .inspector.is-detached .inspector-tabs { align-items: end; }
+:root[data-desktop-platform] .inspector.is-detached .inspector-tabs__sortable { align-items: end; }
 :root[data-desktop-platform] .inspector.is-detached .inspector-tab { border-bottom-width: 0; border-radius: 8px 8px 0 0; }
 .inspector-window-controls { height: 28px; display: flex; position: fixed; z-index: 900; top: 9px; right: 8px; gap: 2px; -webkit-app-region: no-drag; }
 .inspector-window-controls > button { width: 28px; height: 28px; display: grid; place-items: center; border-radius: 0; background: transparent; color: var(--text-faint); transition: color .15s, background .15s; }
@@ -1796,8 +1796,10 @@ button.attachment-chip__content:focus-visible { outline: 2px solid var(--accent-
 .inspector__resize:hover::after, .inspector__resize:focus-visible::after { background: var(--accent-edge); }
 .inspector__resize:focus-visible { outline: 0; }
 .inspector__header { height: 36px; min-height: 36px; display: flex; align-items: end; gap: 2px; border-bottom: 1px solid var(--line); padding: 0 4px 0 8px; background: var(--surface); }
-.inspector-tabs { min-width: 0; display: flex; flex: 1; align-items: end; gap: 4px; overflow-x: auto; scrollbar-width: none; }
+.inspector-tabs { min-width: 0; flex: 1; overflow-x: auto; scrollbar-width: none; }
 .inspector-tabs::-webkit-scrollbar { display: none; }
+.inspector-tabs__sortable { width: max-content; min-width: 100%; display: flex; align-items: end; gap: 4px; }
+.inspector-tab-sortable-row { flex: 0 0 auto; }
 .inspector-tab { height: 30px; display: flex; flex: 0 0 auto; align-items: center; gap: 1px; border: 1px solid transparent; border-bottom: 0; border-radius: 8px 8px 0 0; color: var(--text-soft); cursor: grab; transition: background .12s ease, border-color .12s ease, color .12s ease; }
 .inspector-tab:hover { background: var(--surface-hover); color: var(--text); }
 .inspector-tab.is-active { border-color: var(--line); background: var(--surface-raised); color: var(--text); }

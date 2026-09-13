@@ -49,6 +49,8 @@ export function SortableList<T>({
   useEffect(() => {
     const container = containerRef.current;
     if (container === null) return;
+    const ownerDocument = container.ownerDocument;
+    const ownerWindow = ownerDocument.defaultView;
     const sortable = Sortable.create(container, {
       animation: reducedMotion ? 0 : 150,
       disabled,
@@ -71,9 +73,9 @@ export function SortableList<T>({
           Math.min(24, Math.max(0, rect.height / 2))
         );
       },
-      onStart: () => document.body.classList.add(SORTING_BODY_CLASS),
+      onStart: () => ownerDocument.body.classList.add(SORTING_BODY_CLASS),
       onEnd: (event: SortableEvent) => {
-        document.body.classList.remove(SORTING_BODY_CLASS);
+        ownerDocument.body.classList.remove(SORTING_BODY_CLASS);
         const aborted = abortNextEndRef.current;
         abortNextEndRef.current = false;
         const oldIndex = event.oldIndex;
@@ -90,17 +92,17 @@ export function SortableList<T>({
     const abortIfActive = (): void => {
       if (Sortable.active !== sortable) return;
       abortNextEndRef.current = true;
-      document.dispatchEvent(new Event("pointercancel"));
+      ownerDocument.dispatchEvent(new (ownerWindow?.Event ?? Event)("pointercancel"));
     };
     const onVisibilityChange = (): void => {
-      if (document.visibilityState === "hidden") abortIfActive();
+      if (ownerDocument.visibilityState === "hidden") abortIfActive();
     };
-    window.addEventListener("blur", abortIfActive);
-    document.addEventListener("visibilitychange", onVisibilityChange);
+    ownerWindow?.addEventListener("blur", abortIfActive);
+    ownerDocument.addEventListener("visibilitychange", onVisibilityChange);
     return () => {
-      window.removeEventListener("blur", abortIfActive);
-      document.removeEventListener("visibilitychange", onVisibilityChange);
-      document.body.classList.remove(SORTING_BODY_CLASS);
+      ownerWindow?.removeEventListener("blur", abortIfActive);
+      ownerDocument.removeEventListener("visibilitychange", onVisibilityChange);
+      ownerDocument.body.classList.remove(SORTING_BODY_CLASS);
       sortable.destroy();
       sortableRef.current = null;
     };

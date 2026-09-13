@@ -30,6 +30,7 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
   const connectionRef = useRef(connection);
   connectionRef.current = connection;
   const [error, setError] = useState<string>();
+  const [inputNotice, setInputNotice] = useState<string>();
   const [revision, setRevision] = useState(0);
   const [restarting, setRestarting] = useState(false);
   const restartAttemptRef = useRef<{ readonly scope: string; readonly generation: bigint; readonly id: string; pending: boolean } | undefined>(undefined);
@@ -39,7 +40,7 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
   const dimensionsRef = useRef("");
   const overridesRef = useRef("");
   const displayAbortRef = useRef(new AbortController());
-  const appearanceRef = useRef<{ signal: AbortSignal; synchronize: (focus: boolean) => Promise<void>; cancelFocus: () => void; captureInput: () => { readonly signal: AbortSignal; readonly ready: Promise<void> } } | undefined>(undefined);
+  const appearanceRef = useRef<{ signal: AbortSignal; viewId: string; synchronize: (focus: boolean) => Promise<void>; cancelFocus: () => void; captureControl: () => { readonly signal: AbortSignal; readonly ready: Promise<void> } } | undefined>(undefined);
   const connectionOwner = controller.watchTerminal;
   const writerRef = useRef({ id: randomUuid(), sequence: 0n, generation: 0n, blocked: false, chain: Promise.resolve() });
   const scope = `${controller.state.activeProfile?.serverId ?? ""}\u0000${controller.state.activeProfile?.id ?? ""}\u0000${sessionId}\u0000${terminalId}`;
@@ -85,6 +86,7 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
     setDescriptor(undefined);
     setRestarting(false);
     setError(undefined);
+    setInputNotice(undefined);
     focusAfterConnectRef.current = undefined;
     const queries = suppressTerminalQueryReplies(terminal);
     terminal.attachCustomKeyEventHandler((event) => {
@@ -98,37 +100,42 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
     const input = terminal.onData((data) => {
       const current = descriptorRef.current;
       if (current === undefined || current.status !== "running" || connectionRef.current !== "ready" || !latest.current.active || latest.current.capabilities.support === "disabledByPolicy" || latest.current.controller.state.connectionState !== "connected") return;
-      if (writerRef.current.generation !== current.generation) writerRef.current = { id: randomUuid(), sequence: 0n, generation: current.generation, blocked: false, chain: Promise.resolve() };
-      const writer = writerRef.current;
-      if (writer.blocked) return;
+      if (data === "") return;
+      const maximumInputBytes = latest.current.capabilities.maximumInputBytes;
+      if (terminalInputByteLength(data) > maximumInputBytes) {
+        setInputNotice(latest.current.t("terminal.inputTooLarge", { maximum: maximumInputBytes }));
+        return;
+      }
+      setInputNotice(undefined);
       const appearance = appearanceRef.current;
       if (appearance === undefined || appearance.signal.aborted) return;
-      const admission = appearance.captureInput();
+      if (writerRef.current.generation !== current.generation || writerRef.current.id !== appearance.viewId) writerRef.current = { id: appearance.viewId, sequence: 0n, generation: current.generation, blocked: false, chain: Promise.resolve() };
+      const writer = writerRef.current;
+      if (writer.blocked) return;
+      const admission = appearance.captureControl();
       void admission.ready.catch(() => undefined);
       let sent = false;
-      for (const chunk of terminalInputChunks(data, latest.current.capabilities.maximumInputBytes)) {
-        writer.chain = writer.chain.then(async () => {
-          if (writer.blocked || !alive || writerRef.current !== writer || descriptorRef.current?.generation !== current.generation) return;
-          try { await admission.ready; }
-          catch (failure) {
-            if (!(failure instanceof DOMException && failure.name === "AbortError") && !appearance.signal.aborted) writer.blocked = true;
-            return;
-          }
-          if (appearance.signal.aborted || appearanceRef.current !== appearance || writerRef.current !== writer) return;
-          if (admission.signal.aborted || latest.current.capabilities.support === "disabledByPolicy") {
-            if (sent) { writer.blocked = true; terminal.options.disableStdin = true; setError(latest.current.t("terminal.inputUncertain")); }
-            return;
-          }
-          const sequence = ++writer.sequence;
-          sent = true;
-          await api.writeTerminal(sessionId, terminalId, current.generation, writer.id, sequence, chunk, admission.signal);
-        }).catch(() => {
-          writer.blocked = true;
-          if (!alive || scopeRef.current !== scope || writerRef.current !== writer || descriptorRef.current?.generation !== current.generation) return;
-          terminal.options.disableStdin = true;
-          setError(latest.current.t("terminal.inputUncertain"));
-        });
-      }
+      writer.chain = writer.chain.then(async () => {
+        if (writer.blocked || !alive || writerRef.current !== writer || descriptorRef.current?.generation !== current.generation) return;
+        try { await admission.ready; }
+        catch (failure) {
+          if (!(failure instanceof DOMException && failure.name === "AbortError") && !appearance.signal.aborted) writer.blocked = true;
+          return;
+        }
+        if (appearance.signal.aborted || appearanceRef.current !== appearance || writerRef.current !== writer) return;
+        if (admission.signal.aborted || latest.current.capabilities.support === "disabledByPolicy") {
+          if (sent) { writer.blocked = true; terminal.options.disableStdin = true; setError(latest.current.t("terminal.inputUncertain")); }
+          return;
+        }
+        const sequence = ++writer.sequence;
+        sent = true;
+        await api.writeTerminal(sessionId, terminalId, current.generation, writer.id, sequence, data, admission.signal);
+      }).catch(() => {
+        writer.blocked = true;
+        if (!alive || scopeRef.current !== scope || writerRef.current !== writer || descriptorRef.current?.generation !== current.generation) return;
+        terminal.options.disableStdin = true;
+        setError(latest.current.t("terminal.inputUncertain"));
+      });
     });
     let frame: number | undefined;
     let resizeChain = Promise.resolve();
@@ -146,12 +153,18 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
         if (columns !== terminal.cols || rows !== terminal.rows) terminal.resize(columns, rows);
         const current = descriptorRef.current;
         if (current === undefined || current.status !== "running" || latest.current.capabilities.support === "disabledByPolicy" || latest.current.controller.state.connectionState !== "connected") return;
+        const appearance = appearanceRef.current;
+        if (appearance === undefined || appearance.signal.aborted || slot.ownerDocument.visibilityState !== "visible"
+          || !slot.ownerDocument.hasFocus() || !slot.contains(slot.ownerDocument.activeElement)) return;
+        const admission = appearance.captureControl();
         const nextDimensions = `${current.generation}:${columns}:${rows}`;
         if (dimensionsRef.current === nextDimensions) return;
         dimensionsRef.current = nextDimensions;
         resizeChain = resizeChain.then(async () => {
           if (!alive || latest.current.capabilities.support === "disabledByPolicy" || latest.current.controller.state.connectionState !== "connected") { dimensionsRef.current = ""; return; }
-          await api.resizeTerminal(sessionId, terminalId, current.generation, columns, rows);
+          await admission.ready;
+          if (admission.signal.aborted || appearanceRef.current !== appearance) { dimensionsRef.current = ""; return; }
+          await api.resizeTerminal(sessionId, terminalId, current.generation, appearance.viewId, columns, rows, admission.signal);
         }).catch(() => { dimensionsRef.current = ""; });
       });
     };
@@ -217,6 +230,7 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
       });
     };
     const accept = (value: TerminalView): void => {
+      if (value.columns !== terminal.cols || value.rows !== terminal.rows) dimensionsRef.current = "";
       const attempt = restartAttemptRef.current;
       if (attempt?.scope === scope && attempt.generation !== value.generation) {
         restartAttemptRef.current = undefined;
@@ -232,7 +246,9 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
     const focused = (): boolean => latest.current.active && latest.current.controller.watchTerminal === connectionOwner
       && latest.current.controller.state.connectionState === "connected" && slot.ownerDocument.visibilityState === "visible"
       && slot.ownerDocument.hasFocus() && slot.contains(slot.ownerDocument.activeElement);
-    const focus = (): void => { if (focused()) void appearanceRef.current?.synchronize(true).catch(() => undefined); };
+    const focus = (): void => {
+      if (focused()) void appearanceRef.current?.synchronize(true).then(() => fitRef.current()).catch(() => undefined);
+    };
     const blur = (): void => { if (!focused()) appearanceRef.current?.cancelFocus(); };
     slot.addEventListener("focusin", focus);
     slot.addEventListener("focusout", blur);
@@ -275,6 +291,7 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
         const value = await api.getTerminal(sessionId, terminalId, 0n, signal);
         if (!current()) return;
         accept(value);
+        writerRef.current = { id: viewId, sequence: 0n, generation: value.generation, blocked: false, chain: Promise.resolve() };
         if (cursorRef.current?.generation !== value.generation) cursorRef.current = undefined;
         const synchronize = (claim: boolean): Promise<void> => {
           const claimSignal = claim ? AbortSignal.any([signal, focusLifetime.signal]) : signal;
@@ -321,7 +338,7 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
           });
           return task;
         };
-        const appearance = { signal, synchronize, cancelFocus, captureInput: () => ({ signal: AbortSignal.any([signal, focusLifetime.signal]), ready: synchronize(true) }) };
+        const appearance = { signal, viewId, synchronize, cancelFocus, captureControl: () => ({ signal: AbortSignal.any([signal, focusLifetime.signal]), ready: synchronize(true) }) };
         appearanceRef.current = appearance;
         const initialAppearance = { viewId, viewRevision, palette: readTerminalAppearance(slot).palette };
         await api.watchTerminal(sessionId, terminalId, value.generation, initialAppearance, async (update) => {
@@ -400,8 +417,9 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
 
   const reconnect = (): void => {
     focusAfterConnectRef.current ??= { scope, element: slotRef.current?.ownerDocument.activeElement ?? null };
-    writerRef.current = { id: randomUuid(), sequence: 0n, generation: descriptorRef.current?.generation ?? 0n, blocked: false, chain: Promise.resolve() };
+    writerRef.current = { id: "", sequence: 0n, generation: descriptorRef.current?.generation ?? 0n, blocked: false, chain: Promise.resolve() };
     setError(undefined);
+    setInputNotice(undefined);
     setRevision((value) => value + 1);
   };
   const restart = async (): Promise<void> => {
@@ -427,9 +445,10 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
   return <section className="interactive-terminal" aria-label={t("terminal.title")}>
     <header><span title={descriptor?.cwd}>{descriptor?.shellLabel ?? t("terminal.title")}</span><Pill tone={descriptor?.status === "running" ? "accent" : "neutral"}>{descriptor?.status === "running" ? t("terminal.running") : descriptor?.status === "closed" ? t("terminal.closed") : descriptor?.status === "failed" ? t(descriptor.failureCode === "TERMINAL_UNKNOWN" && !descriptor.exitConfirmed ? "terminal.stateUnknown" : "terminal.failed") : descriptor?.status === "exited" ? descriptor.exitSignal !== undefined && descriptor.exitSignal !== 0 ? t("terminal.signalled", { signal: descriptor.exitSignal }) : t("terminal.exited", { code: descriptor.exitCode ?? t("terminal.exitUnknown") }) : t("terminal.connecting")}</Pill></header>
     <div ref={slotRef} className="interactive-terminal__screen" aria-label={t("terminal.screen")} />
-    {(connection !== "ready" || error !== undefined || descriptor?.status !== "running" || policyDisabled) && <div className="interactive-terminal__status" role="status">
+    {(connection !== "ready" || error !== undefined || inputNotice !== undefined || descriptor?.status !== "running" || policyDisabled) && <div className="interactive-terminal__status" role="status">
       {policyDisabled && <p>{capabilities.reason ?? t("terminal.unavailable")}</p>}
       {error !== undefined ? <p>{error}</p> : connection !== "ready" ? <p>{t(connected ? connection === "connecting" ? "terminal.connecting" : "terminal.reconnecting" : "terminal.disconnected")}</p> : null}
+      {inputNotice !== undefined && <p>{inputNotice}</p>}
       {descriptor !== undefined && descriptor.status !== "running" && descriptor.status !== "closed" && !descriptor.exitConfirmed && <p>{t(descriptor.failureCode === "TERMINAL_UNKNOWN" ? "terminal.transportUnconfirmed" : "terminal.exitUnconfirmed")}</p>}
       {descriptor !== undefined && descriptor.status !== "running" && descriptor.status !== "closed" && descriptor.exitConfirmed && <Button disabled={restarting || !connected || policyDisabled} onClick={() => void restart()}><RotateCw aria-hidden="true" />{t("terminal.restart")}</Button>}
       {(error !== undefined || descriptor !== undefined && descriptor.status !== "running" && descriptor.status !== "closed" && !descriptor.exitConfirmed) && <Button disabled={restarting || !connected} onClick={reconnect}>{t("terminal.reconnect")}</Button>}
@@ -456,17 +475,12 @@ function suppressTerminalQueryReplies(terminal: Terminal) {
   ];
 }
 
-function terminalInputChunks(data: string, maximum: number): readonly string[] {
-  const chunks: string[] = [];
-  let chunk = "";
+function terminalInputByteLength(data: string): number {
   let size = 0;
   for (const character of data) {
     const code = character.codePointAt(0)!;
     const bytes = code <= 0x7f ? 1 : code <= 0x7ff ? 2 : code <= 0xffff ? 3 : 4;
-    if (size + bytes > maximum && chunk !== "") { chunks.push(chunk); chunk = ""; size = 0; }
-    chunk += character;
     size += bytes;
   }
-  if (chunk !== "") chunks.push(chunk);
-  return chunks;
+  return size;
 }

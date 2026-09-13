@@ -718,6 +718,9 @@ export class SessionHost {
     readonly authKeyDigest: string;
     readonly task: Promise<OperationExecution<ImportPortableSessionResult>>;
   }>();
+  /** Terminal effects must not enter while an overwritten portable Session
+   * is being quiesced and replaced. */
+  readonly #portableReplacementFences = new Map<string, symbol>();
   readonly #portableImportDrafts = new Map<string, PortableImportDraft>();
   readonly #nativeBindingLocks = new Map<string, Promise<void>>();
   readonly #turnOverrideLeases = new Map<string, TurnOverrideLease>();
@@ -757,6 +760,7 @@ export class SessionHost {
   readonly #workspaceCapture: WorkspaceRunCapture | undefined;
   readonly #freezeToolPolicies: ((sessionId: string, targetId: string) => void) | undefined;
   readonly #onSessionRuntimeClosed: ((sessionId: string) => void) | undefined;
+  readonly #closeSessionTerminals: ((sessionId: string) => Promise<void>) | undefined;
   readonly #scheduleRunNotifications: ScheduleRunNotificationController | undefined;
   readonly #worktrees: SessionWorktreeCoordinator | undefined;
   readonly #usageOwnerId: string;
@@ -789,6 +793,8 @@ export class SessionHost {
       readonly workspaceCapture?: WorkspaceRunCapture;
       readonly freezeToolPolicies?: (sessionId: string, targetId: string) => void;
       readonly onSessionRuntimeClosed?: (sessionId: string) => void;
+      /** Confirm user-owned interactive processes before releasing a Session workspace. */
+      readonly closeSessionTerminals?: (sessionId: string) => Promise<void>;
       readonly scheduleRunNotifications?: ScheduleRunNotificationController;
       readonly worktrees?: SessionWorktreeCoordinator;
       readonly monotonicNow?: () => number;
@@ -828,6 +834,7 @@ export class SessionHost {
     this.#workspaceCapture = options.workspaceCapture;
     this.#freezeToolPolicies = options.freezeToolPolicies;
     this.#onSessionRuntimeClosed = options.onSessionRuntimeClosed;
+    this.#closeSessionTerminals = options.closeSessionTerminals;
     this.#scheduleRunNotifications = options.scheduleRunNotifications;
     this.#worktrees = options.worktrees;
     this.#usageOwnerId = options.usageOwnerId ?? "orchestrator";
@@ -1768,6 +1775,7 @@ export class SessionHost {
         this.clearTurnOverrideLeases(sessionId);
         this.#releaseSessionTools(sessionId);
       }
+      await this.#closeSessionTerminals?.(sessionId);
     }
     const current = this.#store.findSetting("service", sessionId, SCHEDULED_WORKTREE_OWNER_SETTING_KEY);
     const currentOwner = scheduledWorktreeOwner(current?.value);
@@ -5514,6 +5522,10 @@ export class SessionHost {
     return this.importPortableSessionPrepared(input);
   }
 
+  isSessionTerminalMutationBlocked(sessionId: string): boolean {
+    return this.#portableReplacementFences.has(sessionId);
+  }
+
   async inspectPortableSessionImport(input: {
     readonly connection: ConnectionRecord;
     readonly package: BlobRef;
@@ -7565,6 +7577,7 @@ export class SessionHost {
     this.#draining.clear();
     this.#creationLocks.clear();
     this.#portableImportLocks.clear();
+    this.#portableReplacementFences.clear();
     this.#portableImportDrafts.clear();
     this.#nativeBindingLocks.clear();
     this.#nativeSessionCatalogFlights.clear();
@@ -7663,6 +7676,7 @@ export class SessionHost {
     let backendInstanceGeneration: number | undefined;
     let resourceCatalogEpoch: bigint | undefined;
     let releaseBackendAdmission: (() => void) | undefined;
+    let releasePortableReplacementFence: (() => void) | undefined;
     try {
       const target = this.#store.getTarget(input.targetId);
       let providerId = input.providerId;
@@ -7738,6 +7752,15 @@ export class SessionHost {
       replaced = findPortableImportConflict(this.#store, input.targetId, input.package.sha256);
       if (replaced !== undefined) {
         if (!input.overwrite) throw portableImportConflict(replaced.descriptor.id);
+        if (this.#portableReplacementFences.has(replaced.descriptor.id)) throw portableReplacementBusy();
+        const replacementSessionId = replaced.descriptor.id;
+        const replacementFence = Symbol(replacementSessionId);
+        this.#portableReplacementFences.set(replacementSessionId, replacementFence);
+        releasePortableReplacementFence = () => {
+          if (this.#portableReplacementFences.get(replacementSessionId) === replacementFence) {
+            this.#portableReplacementFences.delete(replacementSessionId);
+          }
+        };
         this.assertPortableReplacementIdle(replaced.descriptor.id);
         const active = this.#active.get(replaced.descriptor.id);
         if (active !== undefined) {
@@ -7751,6 +7774,7 @@ export class SessionHost {
           this.clearTurnOverrideLeases(replaced.descriptor.id);
           this.#releaseSessionTools(replaced.descriptor.id);
         }
+        await this.#closeSessionTerminals?.(replaced.descriptor.id);
       }
 
       const sessionWorktree = input.worktree === undefined
@@ -7998,6 +8022,7 @@ export class SessionHost {
     } finally {
       this.#store.releaseArtifactStaging(stagedPortableArtifacts);
       releaseBackendAdmission?.();
+      releasePortableReplacementFence?.();
     }
   }
 
@@ -8010,14 +8035,7 @@ export class SessionHost {
       || this.#messageDeletionLocks.has(sessionId)
       || this.#sessionResetLocks.has(sessionId)
       || this.compactionBlocksDispatch(sessionId)) {
-      throw new JokoError({
-        code: "PORTABLE_SESSION_REPLACEMENT_BUSY",
-        message: "The existing imported task is still active and cannot be replaced.",
-        phase: "session",
-        retryable: true,
-        stateMayHaveChanged: false,
-        recovery: "Wait for its run, interaction, background work, shell, and compaction to finish, then retry."
-      });
+      throw portableReplacementBusy();
     }
   }
 
@@ -12412,6 +12430,17 @@ function portableImportConflict(sessionId: string): JokoError {
     retryable: false,
     stateMayHaveChanged: false,
     recovery: `Open task '${sessionId}' or explicitly replace it.`
+  });
+}
+
+function portableReplacementBusy(): JokoError {
+  return new JokoError({
+    code: "PORTABLE_SESSION_REPLACEMENT_BUSY",
+    message: "The existing imported task is still active and cannot be replaced.",
+    phase: "session",
+    retryable: true,
+    stateMayHaveChanged: false,
+    recovery: "Wait for its run, interaction, background work, shell, and compaction to finish, then retry."
   });
 }
 

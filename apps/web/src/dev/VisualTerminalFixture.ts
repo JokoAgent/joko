@@ -87,7 +87,7 @@ export class VisualTerminalFixture {
     }
     await this.#output(terminal, output);
   };
-  readonly resizeTerminal: OperationApi["resizeTerminal"] = async (sessionId, terminalId, generation, columns, rows) => {
+  readonly resizeTerminal: OperationApi["resizeTerminal"] = async (sessionId, terminalId, generation, _viewId, columns, rows) => {
     const terminal = this.#require(sessionId, terminalId, generation);
     terminal.descriptor = { ...terminal.descriptor, columns, rows, updatedAt: Date.now() };
     await this.#state(terminal);

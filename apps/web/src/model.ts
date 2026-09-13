@@ -3489,7 +3489,7 @@ export interface OperationApi {
   watchTerminal(sessionId: string, terminalId: string, generation: bigint, appearance: TerminalAppearanceView, onUpdate: (update: TerminalUpdateView) => void | Promise<void>, afterSequence?: bigint, signal?: AbortSignal): Promise<void>;
   updateTerminalAppearance(sessionId: string, terminalId: string, generation: bigint, appearance: TerminalAppearanceView, claimFocus: boolean, expectedAppearanceRevision: bigint, signal?: AbortSignal): Promise<TerminalAppearanceResultView>;
   writeTerminal(sessionId: string, terminalId: string, generation: bigint, writerId: string, inputSequence: bigint, data: string, signal?: AbortSignal): Promise<void>;
-  resizeTerminal(sessionId: string, terminalId: string, generation: bigint, columns: number, rows: number, signal?: AbortSignal): Promise<void>;
+  resizeTerminal(sessionId: string, terminalId: string, generation: bigint, viewId: string, columns: number, rows: number, signal?: AbortSignal): Promise<void>;
   restartTerminal(sessionId: string, terminalId: string, generation: bigint, requestId: string, signal?: AbortSignal): Promise<TerminalView>;
   closeTerminal(sessionId: string, terminalId: string, generation: bigint, signal?: AbortSignal): Promise<void>;
   refresh(): Promise<void>;

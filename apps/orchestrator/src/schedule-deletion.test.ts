@@ -129,6 +129,30 @@ describe("durable Schedule deletion", () => {
     });
   });
 
+  it("confirms interactive terminal cleanup before releasing a generated task worktree", async () => {
+    const fixture = createFixture({ withWorktree: true });
+    const order: string[] = [];
+    const closeNative = vi.fn(async () => { order.push("native"); });
+    const closeTerminals = vi.fn(async () => { order.push("terminal"); });
+    const releaseWorktree = vi.fn(async () => { order.push("worktree"); });
+    const services = servicesFor(fixture, closeNative, undefined, {
+      closeTerminals,
+      sessionWorktrees: { archive: vi.fn(async () => undefined), release: releaseWorktree }
+    });
+
+    const response = await services.operation.submitOperation(deleteRequest(
+      fixture.connection.id,
+      "delete-generated-terminal-worktree",
+      fixture.scheduleId
+    ), context());
+
+    expect(response.operation?.result?.payload).toMatchObject({
+      case: "scheduleDeletion",
+      value: { completedSessionIds: [fixture.generatedSessionId], failures: [] }
+    });
+    expect(order).toEqual(["native", "terminal", "worktree"]);
+  });
+
   it("persists deletion intent before coordinator idle and re-snapshots a generated task created by an earlier flight", async () => {
     const fixture = createFixture();
     let releaseBegin!: () => void;
@@ -377,7 +401,14 @@ describe("durable Schedule deletion", () => {
 function servicesFor(
   fixture: ReturnType<typeof createFixture>,
   close: (sessionId: string) => Promise<void>,
-  prepareDestructiveSessionClose: (sessionId: string) => Promise<void> = async () => undefined
+  prepareDestructiveSessionClose: (sessionId: string) => Promise<void> = async () => undefined,
+  options: {
+    readonly closeTerminals?: (sessionId: string) => Promise<void>;
+    readonly sessionWorktrees?: {
+      readonly archive: (sessionId: string) => Promise<void>;
+      readonly release: (sessionId: string) => Promise<void>;
+    };
+  } = {}
 ) {
   const sessionHost = durableMutationHost(
     fixture.store,
@@ -399,6 +430,8 @@ function servicesFor(
     workspaces: {},
     workspaceChanges: {},
     sessionHost,
+    terminals: { closeSession: options.closeTerminals ?? (async () => undefined) },
+    ...(options.sessionWorktrees === undefined ? {} : { sessionWorktrees: options.sessionWorktrees }),
     scheduler: {
       beginScheduleDeletion: fixture.beginScheduleDeletion,
       releaseScheduleDeletion: fixture.releaseScheduleDeletion
@@ -490,7 +523,7 @@ function context(): never {
   return { requestHeader: new Headers(), signal: new AbortController().signal } as never;
 }
 
-function createFixture() {
+function createFixture(options: { readonly withWorktree?: boolean } = {}) {
   const directory = mkdtempSync(join(tmpdir(), "joko-schedule-deletion-"));
   const store = new OperationalStore(join(directory, "store.sqlite"));
   cleanups.push(() => {
@@ -551,6 +584,22 @@ function createFixture() {
     permissionMode: "ask",
     planMode: false,
     fastMode: false,
+    ...(options.withWorktree !== true ? {} : {
+      worktree: {
+        leaseId: "lease-generated",
+        workspaceId: "workspace-generated",
+        path: join(directory, "generated-worktree"),
+        repositoryRoot: directory,
+        branch: "codex/generated",
+        sourceRef: "refs/heads/main",
+        sourceCommit: "a".repeat(40),
+        sourceStrategy: "current_branch" as const,
+        sourceRefreshed: false,
+        state: "active" as const,
+        acquiredAt: 1,
+        updatedAt: 1
+      }
+    }),
     automationOrigin: {
       kind: "scheduler",
       scheduleId,

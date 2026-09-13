@@ -1033,7 +1033,8 @@ export async function createOrchestratorApplication(
     onSessionRuntimeClosed: (sessionId) => {
       androidRuntimeForSessionCleanup?.closeSession(sessionId);
       void computerBridgeForSessionCleanup?.closeSession(sessionId).catch(() => undefined);
-    }
+    },
+    closeSessionTerminals: (sessionId) => terminals.closeSession(sessionId)
   });
   let backendLifecycleTail: Promise<void> = Promise.resolve();
   const runBackendLifecycle = <T>(action: () => Promise<T>): Promise<T> => {
