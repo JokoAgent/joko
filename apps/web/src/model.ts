@@ -4854,8 +4854,8 @@ export interface OperationApi {
   }): Promise<void>;
   restoreMemoryDefaults(): Promise<void>;
   resetMemory(scope: "curated" | "backend", backendId?: string): Promise<{
-    readonly removedEntries: number;
-    readonly removedTargets: number;
+    readonly removedEntries?: number;
+    readonly removedTargets?: number;
   }>;
   updateVisionBridgeSettings(patch: {
     readonly enabled?: boolean;

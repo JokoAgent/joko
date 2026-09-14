@@ -11,7 +11,7 @@ import "./PersonalizationMemorySettings.css";
 
 type ResetTarget =
   | { readonly kind: "curated" }
-  | { readonly kind: "backend"; readonly backendId: string; readonly backendName: string };
+  | { readonly kind: "backend"; readonly backendId: string; readonly backendName: string; readonly native: boolean };
 
 function BackendMemoryMark({ native }: { readonly native: boolean }): JSX.Element {
   if (native) return <Sparkles />;
@@ -113,14 +113,19 @@ export function PersonalizationMemorySettings({ controller, snapshot, runAction,
         const result = target.kind === "curated"
           ? await controller.resetMemory("curated")
           : await controller.resetMemory("backend", target.backendId);
-        onSuccess(t(
-          target.kind === "curated"
-            ? result.removedEntries === 1 ? "settings.memory.toast.makerResetOne" : "settings.memory.toast.makerResetOther"
-            : result.removedEntries === 1 ? "settings.memory.toast.backendResetOne" : "settings.memory.toast.backendResetOther",
-          target.kind === "curated"
-            ? { count: result.removedEntries }
-            : { backend: target.backendName, count: result.removedEntries }
-        ));
+        const count = result.removedEntries;
+        if (target.kind === "backend" && count === undefined) {
+          onSuccess(t("settings.memory.toast.backendResetGeneric", { backend: target.backendName }));
+        } else {
+          onSuccess(t(
+            target.kind === "curated"
+              ? count === 1 ? "settings.memory.toast.makerResetOne" : "settings.memory.toast.makerResetOther"
+              : count === 1 ? "settings.memory.toast.backendResetOne" : "settings.memory.toast.backendResetOther",
+            target.kind === "curated"
+              ? { count: count ?? 0 }
+              : { backend: target.backendName, count: count ?? 0 }
+          ));
+        }
       } finally {
         markPending(key, false);
       }
@@ -130,7 +135,12 @@ export function PersonalizationMemorySettings({ controller, snapshot, runAction,
     ? t("settings.memory.resetBackendTitle", { backend: resetTarget.backendName })
     : t("settings.memory.resetMakerTitle");
   const resetDescription = resetTarget?.kind === "backend"
-    ? t("settings.memory.resetBackendDescription", { backend: resetTarget.backendName })
+    ? t(
+        resetTarget.native
+          ? "settings.memory.resetNativeBackendDescription"
+          : "settings.memory.resetBackendDescription",
+        { backend: resetTarget.backendName }
+      )
     : t("settings.memory.resetMakerDescription");
 
   return (
@@ -209,7 +219,7 @@ export function PersonalizationMemorySettings({ controller, snapshot, runAction,
                 className="memory-settings__reset"
                 label={t("settings.memory.resetBackendTitle", { backend: backendName })}
                 disabled={disabled || pending.has(`reset:${backend.backendId}`)}
-                onClick={() => setResetTarget({ kind: "backend", backendId: backend.backendId, backendName })}
+                onClick={() => setResetTarget({ kind: "backend", backendId: backend.backendId, backendName, native })}
               ><RotateCcw aria-hidden="true" /></IconButton>}
             </span>
           </div>;

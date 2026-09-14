@@ -6288,8 +6288,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   }
 
   async resetMemory(scope: "curated" | "backend", backendId?: string): Promise<{
-    readonly removedEntries: number;
-    readonly removedTargets: number;
+    readonly removedEntries?: number;
+    readonly removedTargets?: number;
   }> {
     const operation = await this.submit({
       case: "resetMemory",
@@ -6301,8 +6301,12 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const result = operation.result?.payload;
     if (result?.case !== "memoryReset") throw new GatewayError("Orchestrator returned no Memory reset result.");
     return {
-      removedEntries: numberValue(result.value.removedEntries),
-      removedTargets: numberValue(result.value.removedTargets)
+      ...(result.value.removedEntries === undefined
+        ? {}
+        : { removedEntries: numberValue(result.value.removedEntries) }),
+      ...(result.value.removedTargets === undefined
+        ? {}
+        : { removedTargets: numberValue(result.value.removedTargets) })
     };
   }
 

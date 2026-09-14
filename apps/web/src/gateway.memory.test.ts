@@ -4,6 +4,7 @@ import {
   BackendMemoryKind,
   CapabilitySupport,
   GetSnapshotResponseSchema,
+  MemoryResetResultSchema,
   MemoryResetScope,
   OperationState,
   SnapshotSchema,
@@ -56,6 +57,7 @@ describe("OrchestratorGateway Memory reset scopes", () => {
       {},
       () => transport((method, input) => {
         mutations.push(input.mutation.payload.value);
+        const nativeReset = mutations.length === 3;
         return response(method, create(SubmitOperationResponseSchema, {
           operation: {
             operationId: input.operationId,
@@ -64,7 +66,9 @@ describe("OrchestratorGateway Memory reset scopes", () => {
             result: {
               payload: {
                 case: "memoryReset",
-                value: { removedEntries: 2n, removedTargets: 1n }
+                value: create(MemoryResetResultSchema, nativeReset
+                  ? {}
+                  : { removedEntries: 2n, removedTargets: 1n })
               }
             }
           }
@@ -75,9 +79,11 @@ describe("OrchestratorGateway Memory reset scopes", () => {
 
     await expect(gateway.resetMemory("curated")).resolves.toEqual({ removedEntries: 2, removedTargets: 1 });
     await expect(gateway.resetMemory("backend", "memory-capable")).resolves.toEqual({ removedEntries: 2, removedTargets: 1 });
+    await expect(gateway.resetMemory("backend", "codex")).resolves.toEqual({});
     expect(mutations).toMatchObject([
       { scope: MemoryResetScope.CURATED, backendId: "" },
-      { scope: MemoryResetScope.BACKEND, backendId: "memory-capable" }
+      { scope: MemoryResetScope.BACKEND, backendId: "memory-capable" },
+      { scope: MemoryResetScope.BACKEND, backendId: "codex" }
     ]);
     gateway.disconnect();
   });

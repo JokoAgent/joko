@@ -93,7 +93,8 @@ describe("PersonalizationMemorySettings", () => {
 
   it("keeps Backend-native memory mutually exclusive with Maker Memory and hides an unimplemented reset", async () => {
     const update = vi.fn(async () => undefined);
-    const controller = { updateMemorySettings: update } as unknown as AppController;
+    const reset = vi.fn(async () => ({}));
+    const controller = { updateMemorySettings: update, resetMemory: reset } as unknown as AppController;
     const onSuccess = vi.fn();
     const blocked = await render(controller, nativeSnapshot(true), () => undefined);
     expect(blocked.textContent).toContain("Uses Claude Code's private native memory across tasks.");
@@ -107,13 +108,21 @@ describe("PersonalizationMemorySettings", () => {
     await act(async () => toggle.click());
     expect(update).toHaveBeenCalledWith({ backendId: "claude-code", backendEnabled: false });
 
-    const live = await render(controller, nativeSnapshot(false, true), undefined, onSuccess);
+    const live = await render(controller, nativeSnapshot(false, true, true), undefined, onSuccess);
     expect(live.textContent).toContain("Active local sessions update immediately");
     expect(live.textContent).toContain("Remote hosts keep their own setting.");
     const liveToggle = live.querySelector<HTMLButtonElement>('button[aria-label="Toggle Codex Auto Memory"]')!;
     await act(async () => liveToggle.click());
     expect(update).toHaveBeenCalledWith({ backendId: "codex", backendEnabled: false });
     expect(onSuccess).toHaveBeenLastCalledWith("Codex Auto Memory disabled");
+
+    const resetButton = live.querySelector<HTMLButtonElement>('button[aria-label="Reset Codex Auto Memory?"]')!;
+    await act(async () => resetButton.click());
+    expect(document.body.textContent).toContain("deletes all Codex native memory owned by this local Joko service");
+    expect(document.activeElement?.getAttribute("aria-label")).toBe("Back");
+    await act(async () => document.body.querySelector<HTMLButtonElement>(".modal .button--primary")!.click());
+    expect(reset).toHaveBeenCalledWith("backend", "codex");
+    expect(onSuccess).toHaveBeenLastCalledWith("Codex Auto Memory reset");
   });
 });
 
@@ -171,7 +180,11 @@ function snapshot(makerEnabled: boolean): AppSnapshot {
   };
 }
 
-function nativeSnapshot(makerEnabled: boolean, updatesActiveLocalSessions = false): AppSnapshot {
+function nativeSnapshot(
+  makerEnabled: boolean,
+  updatesActiveLocalSessions = false,
+  resettable = false
+): AppSnapshot {
   const value = snapshot(makerEnabled);
   const backendId = updatesActiveLocalSessions ? "codex" : "claude-code";
   const name = updatesActiveLocalSessions ? "Codex" : "Claude Code";
@@ -189,7 +202,7 @@ function nativeSnapshot(makerEnabled: boolean, updatesActiveLocalSessions = fals
           reason: "",
           entryCount: 0,
           kind: "native_auto_memory",
-          resettable: false,
+          resettable,
           updatesActiveLocalSessions
         }]
       }

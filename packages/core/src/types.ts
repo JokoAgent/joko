@@ -32,6 +32,8 @@ export interface Capability {
 export const MEMORY_NATIVE_LIVE_LOCAL_OPTION = "live_local" as const;
 /** `memory.native` remains disabled until the user saves an explicit Backend preference. */
 export const MEMORY_NATIVE_DEFAULT_DISABLED_OPTION = "default_disabled" as const;
+/** `memory.native` can destructively reset only the native memory owned by this local Backend runtime. */
+export const MEMORY_NATIVE_RESET_LOCAL_OPTION = "reset_local" as const;
 
 export type CapabilityManifest = ReadonlyMap<string, Capability>;
 

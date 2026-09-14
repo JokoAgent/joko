@@ -707,8 +707,8 @@ export function VisualHarness(): JSX.Element {
         }));
       },
       resetMemory: async (scope: "curated" | "backend", backendId?: string): Promise<{
-        readonly removedEntries: number;
-        readonly removedTargets: number;
+        readonly removedEntries?: number;
+        readonly removedTargets?: number;
       }> => {
         const current = state.snapshot.settings.memory;
         const digestEntries = current.backends.reduce((total, backend) => total + backend.entryCount, 0);

@@ -10,6 +10,7 @@ import {
   JokoError,
   MEMORY_NATIVE_DEFAULT_DISABLED_OPTION,
   MEMORY_NATIVE_LIVE_LOCAL_OPTION,
+  MEMORY_NATIVE_RESET_LOCAL_OPTION,
   type AdapterContext,
   type BackendDescriptor,
   type Capability,
@@ -28,6 +29,7 @@ import {
   type NativeSessionForkResult,
   type NativeSessionNavigation,
   type NativeSessionNavigationResult,
+  type NativeMemoryResetResult,
   type NativeHistoryProjection,
   type NativeNavigationTarget,
   type NativeSessionState,
@@ -586,6 +588,44 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         false,
         () => this.#assertOpen()
       );
+    });
+  }
+
+  async resetNativeMemory(): Promise<NativeMemoryResetResult> {
+    if (this.#resolveNativeMemoryEnabled === undefined) return this.unsupported("memory.native");
+    return this.#withNativeMemoryReconcile(async () => {
+      this.#assertOpen();
+      try {
+        await this.#host.ensureStarted();
+      } catch (error) {
+        throw this.#requestFailure(error, "dispatch", "CODEX_NATIVE_MEMORY_RESET_FAILED", false);
+      }
+      this.#assertOpen();
+      if (!supportsNativeMemoryRuntime(this.#host)) return this.unsupported("memory.native");
+      let response;
+      try {
+        response = await this.#host.request("memory/reset", {}, {
+          mutation: true,
+          beforeDispatch: () => this.#assertOpen()
+        });
+      } catch (error) {
+        throw this.#requestFailure(error, "dispatch", "CODEX_NATIVE_MEMORY_RESET_FAILED", false);
+      }
+      this.#assertOpen();
+      try {
+        objectValue(response.value, "native memory reset response");
+      } catch {
+        throw adapterError({
+          code: "CODEX_NATIVE_MEMORY_RESET_ACK_INVALID",
+          message: "Codex did not confirm the native-memory reset.",
+          phase: "dispatch",
+          retryable: false,
+          stateMayHaveChanged: true,
+          recovery: "Inspect native memory state before explicitly issuing a new reset operation."
+        });
+      }
+      // The fixed app-server confirms completion but exposes no trustworthy counts.
+      return {};
     });
   }
 
@@ -3778,7 +3818,11 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           : {}),
         ...(key === "memory.native" && available && this.#resolveNativeMemoryEnabled !== undefined
           && supportsNativeMemoryRuntime(this.#host)
-          ? { options: [MEMORY_NATIVE_LIVE_LOCAL_OPTION, MEMORY_NATIVE_DEFAULT_DISABLED_OPTION] }
+          ? { options: [
+              MEMORY_NATIVE_LIVE_LOCAL_OPTION,
+              MEMORY_NATIVE_DEFAULT_DISABLED_OPTION,
+              MEMORY_NATIVE_RESET_LOCAL_OPTION
+            ] }
           : {})
       }];
     }));

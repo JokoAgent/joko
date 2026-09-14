@@ -2258,7 +2258,7 @@ describe("CodexBackendAdapter", () => {
     expect(descriptor.capabilities.get("memory.native")).toEqual({
       key: "memory.native",
       supported: true,
-      options: ["live_local", "default_disabled"]
+      options: ["live_local", "default_disabled", "reset_local"]
     });
 
     const binding = await setup.adapter.createSession(
@@ -2357,6 +2357,59 @@ describe("CodexBackendAdapter", () => {
     expect(restartedRequests[restartedOverride]?.params).toEqual({ enablement: { memories: true } });
   });
 
+  it("resets only the fixed local Codex native-memory owner and preserves unknown counts", async () => {
+    const setup = await createSetup(7, { resolveNativeMemoryEnabled: () => true });
+
+    await expect(setup.adapter.resetNativeMemory()).resolves.toEqual({});
+    expect(setup.fake.nativeMemoryResetCount).toBe(1);
+    expect(setup.fake.transport?.requests.find((request) => request.method === "memory/reset"))
+      .toMatchObject({ params: {}, options: { mutation: true } });
+
+    setup.fake.failNextNativeMemoryReset = true;
+    await expect(setup.adapter.resetNativeMemory()).rejects.toMatchObject({
+      publicError: {
+        code: "CODEX_NATIVE_MEMORY_RESET_FAILED",
+        stateMayHaveChanged: false
+      }
+    });
+    expect(setup.fake.nativeMemoryResetCount).toBe(1);
+
+    setup.fake.malformedNextNativeMemoryReset = true;
+    await expect(setup.adapter.resetNativeMemory()).rejects.toMatchObject({
+      publicError: {
+        code: "CODEX_NATIVE_MEMORY_RESET_ACK_INVALID",
+        stateMayHaveChanged: true
+      }
+    });
+    expect(setup.fake.nativeMemoryResetCount).toBe(2);
+  });
+
+  it("marks a lost Codex native-memory reset acknowledgement unknown and never touches a remote runtime", async () => {
+    const setup = await createRemoteSetup({ resolveNativeMemoryEnabled: () => true });
+    await setup.adapter.describe();
+    const transport = setup.localFake.transport!;
+    const request = transport.request.bind(transport);
+    vi.spyOn(transport, "request").mockImplementation(async (method, params, options) => {
+      if (method === "memory/reset") {
+        options?.beforeDispatch?.();
+        transport.requests.push({ method, params, options: options ?? {} });
+        throw new TransportFault("request_timeout", "Fixture acknowledgement was lost.", {
+          stateMayHaveChanged: true
+        });
+      }
+      return request(method, params, options);
+    });
+
+    await expect(setup.adapter.resetNativeMemory()).rejects.toMatchObject({
+      publicError: {
+        code: "CODEX_NATIVE_MEMORY_RESET_FAILED",
+        stateMayHaveChanged: true,
+        retryable: true
+      }
+    });
+    expect(setup.remoteFake.transport).toBeUndefined();
+  });
+
   it("fails closed before native Session mutation when Codex memory authority or acknowledgement is unavailable", async () => {
     const unavailable = await createSetup(7, {
       resolveNativeMemoryEnabled: async () => { throw new Error("private setting failure"); }
@@ -2405,6 +2458,9 @@ describe("CodexBackendAdapter", () => {
       key: "memory.native",
       supported: false,
       reason: "upstream_missing"
+    });
+    await expect(setup.adapter.resetNativeMemory()).rejects.toMatchObject({
+      publicError: { code: "BACKEND_CAPABILITY_UNAVAILABLE", stateMayHaveChanged: false }
     });
     const binding = await setup.adapter.createSession(
       sessionInput(setup.target),

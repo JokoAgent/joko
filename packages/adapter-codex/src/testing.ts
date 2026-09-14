@@ -145,6 +145,9 @@ export class FakeCodexAppServer {
   failNextThreadResumeCode: number | undefined;
   failNextNativeMemoryEnablement = false;
   malformedNextNativeMemoryEnablement = false;
+  failNextNativeMemoryReset = false;
+  malformedNextNativeMemoryReset = false;
+  nativeMemoryResetCount = 0;
   nativeMemoryEnabled = false;
   userAgent = "joko/0.153.4 (Windows 10.0.26200; x86_64) unknown (joko; 0.1.0)";
   codexHome = "/private";
@@ -304,6 +307,17 @@ export class FakeCodexAppServer {
         }
         return { enablement: { memories: this.nativeMemoryEnabled } };
       }
+      case "memory/reset":
+        if (this.failNextNativeMemoryReset) {
+          this.failNextNativeMemoryReset = false;
+          throw new RpcRemoteFault(-32001);
+        }
+        this.nativeMemoryResetCount++;
+        if (this.malformedNextNativeMemoryReset) {
+          this.malformedNextNativeMemoryReset = false;
+          return null;
+        }
+        return {};
       case "mcpServerStatus/list":
         return { data: [...this.reviewMcpStatuses], nextCursor: null };
       case "account/read":

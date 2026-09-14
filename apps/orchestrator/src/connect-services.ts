@@ -19,7 +19,7 @@ import {
   DEFAULT_COLLABORATION_SETTINGS,
   type ManagedProcessPriority
 } from "@joko/runtime-governance";
-import { JokoError, MEMORY_NATIVE_DEFAULT_DISABLED_OPTION, MEMORY_NATIVE_LIVE_LOCAL_OPTION, redactSecrets, type BackendAdapter, type BackendDescriptor, type BackendToolDescriptor, type BlobRef, type DynamicInputFieldType, type NativeSessionCandidate as CoreNativeSessionCandidate, type NativeSessionCatalogEntry as CoreNativeSessionCatalogEntry, type PermissionMode as CorePermissionMode, type PiNativeStateMetadata, type PromptInput, type ProviderModel, type RuntimeCommand, type RuntimeResource, type RuntimeToolCatalog, type SessionTree, type SessionTreeNode, type TurnExecutionOverrides } from "@joko/core";
+import { JokoError, MEMORY_NATIVE_DEFAULT_DISABLED_OPTION, MEMORY_NATIVE_LIVE_LOCAL_OPTION, MEMORY_NATIVE_RESET_LOCAL_OPTION, redactSecrets, type BackendAdapter, type BackendDescriptor, type BackendToolDescriptor, type BlobRef, type DynamicInputFieldType, type NativeMemoryResetResult, type NativeSessionCandidate as CoreNativeSessionCandidate, type NativeSessionCatalogEntry as CoreNativeSessionCatalogEntry, type PermissionMode as CorePermissionMode, type PiNativeStateMetadata, type PromptInput, type ProviderModel, type RuntimeCommand, type RuntimeResource, type RuntimeToolCatalog, type SessionTree, type SessionTreeNode, type TurnExecutionOverrides } from "@joko/core";
 import {
   AsyncTransactionError,
   AuthorizationError,
@@ -792,8 +792,8 @@ interface OperationOutcome {
   readonly unsupportedReason?: string;
   readonly compactSessionOutcome?: "compacted" | "noop";
   readonly memoryReset?: {
-    readonly removedEntries: number;
-    readonly removedTargets: number;
+    readonly removedEntries?: number;
+    readonly removedTargets?: number;
   };
   readonly scheduleRunsReadCount?: number;
   readonly scheduleDeletion?: {
@@ -5439,8 +5439,12 @@ function operationResult(
     payload = {
       case: "memoryReset",
       value: create(contract.MemoryResetResultSchema, {
-        removedEntries: BigInt(outcome.memoryReset.removedEntries),
-        removedTargets: BigInt(outcome.memoryReset.removedTargets)
+        ...(outcome.memoryReset.removedEntries === undefined
+          ? {}
+          : { removedEntries: BigInt(outcome.memoryReset.removedEntries) }),
+        ...(outcome.memoryReset.removedTargets === undefined
+          ? {}
+          : { removedTargets: BigInt(outcome.memoryReset.removedTargets) })
       })
     };
     return create(contract.OperationResultSchema, { payload });
@@ -11960,6 +11964,29 @@ function updatesActiveLocalMemorySessions(descriptor: BackendDescriptor): boolea
   return descriptor.capabilities.get("memory.native")?.options?.includes(MEMORY_NATIVE_LIVE_LOCAL_OPTION) === true;
 }
 
+function resetsLocalNativeMemory(descriptor: BackendDescriptor): boolean {
+  return descriptor.capabilities.get("memory.native")?.options?.includes(MEMORY_NATIVE_RESET_LOCAL_OPTION) === true;
+}
+
+function validateNativeMemoryResetResult(value: NativeMemoryResetResult): NativeMemoryResetResult {
+  for (const count of [value.removedEntries, value.removedTargets]) {
+    if (count !== undefined && (!Number.isSafeInteger(count) || count < 0)) {
+      throw new JokoError({
+        code: "NATIVE_MEMORY_RESET_RESULT_INVALID",
+        message: "The Backend returned an invalid native-memory reset result.",
+        phase: "dispatch",
+        retryable: false,
+        stateMayHaveChanged: true,
+        recovery: "Inspect native memory state before explicitly issuing a new reset operation."
+      });
+    }
+  }
+  return {
+    ...(value.removedEntries === undefined ? {} : { removedEntries: value.removedEntries }),
+    ...(value.removedTargets === undefined ? {} : { removedTargets: value.removedTargets })
+  };
+}
+
 function backendMemoryDefaultEnabled(descriptor: BackendDescriptor): boolean {
   return descriptor.capabilities.get("memory.native")?.options
     ?.includes(MEMORY_NATIVE_DEFAULT_DISABLED_OPTION) !== true;
@@ -12366,7 +12393,7 @@ function settingsSnapshot(dependencies: ConnectServiceDependencies): contract.Se
         kind: role === "native_auto_memory"
           ? contract.BackendMemoryKind.NATIVE_AUTO_MEMORY
           : contract.BackendMemoryKind.COMPACTION_DIGEST,
-        resettable: role === "compaction_digest",
+        resettable: role === "compaction_digest" || resetsLocalNativeMemory(item.descriptor),
         updatesActiveLocalSessions: updatesActiveLocalMemorySessions(item.descriptor)
       }))
     }),
@@ -17251,7 +17278,8 @@ async function dispatchMutation(
           "Maker Memory is not configured on this Orchestrator node."
         );
       }
-      let reset: () => { readonly removedEntries: number; readonly removedTargets: number };
+      let reset: (() => { readonly removedEntries: number; readonly removedTargets: number }) | undefined;
+      let nativeBackendId: string | undefined;
       switch (payload.value.scope) {
         case contract.MemoryResetScope.CURATED:
           if (payload.value.backendId.trim() !== "") {
@@ -17268,10 +17296,14 @@ async function dispatchMutation(
           } catch {
             throw new ConnectError("Memory Backend not found.", Code.NotFound);
           }
-          if (backendMemoryRole(backend) !== "compaction_digest") {
-            throw new ConnectError("Backend does not support resettable compaction memory.", Code.FailedPrecondition);
+          const role = backendMemoryRole(backend);
+          if (role === "compaction_digest") {
+            reset = () => memory.reset("backend", backendId);
+          } else if (role === "native_auto_memory" && resetsLocalNativeMemory(backend)) {
+            nativeBackendId = backendId;
+          } else {
+            throw new ConnectError("Backend does not support resettable memory.", Code.FailedPrecondition);
           }
-          reset = () => memory.reset("backend", backendId);
           break;
         }
         case contract.MemoryResetScope.UNSPECIFIED:
@@ -17279,10 +17311,70 @@ async function dispatchMutation(
         default:
           throw invalidArgument("reset_memory.scope is invalid");
       }
-      // dispatchMutation is reachable only after owner authentication. The
-      // Curated scope spans all Targets without touching Backend-owned digests;
-      // Backend scope spans all Targets for one capability-assigned Backend.
-      // No Memory body is copied into the durable Operation result.
+      if (nativeBackendId !== undefined) {
+        const backendId = nativeBackendId;
+        let resetResult: NativeMemoryResetResult | undefined;
+        const assertCurrentOwner = (store: OperationalStore): void => {
+          let descriptor: BackendDescriptor;
+          try {
+            descriptor = store.getBackend(backendId).descriptor;
+          } catch {
+            throw new JokoError({
+              code: "NATIVE_MEMORY_RESET_OWNER_UNAVAILABLE",
+              message: "The native-memory reset owner is no longer available.",
+              phase: "capability",
+              retryable: false,
+              stateMayHaveChanged: false,
+              recovery: "Refresh Backend settings before explicitly issuing a new reset operation."
+            });
+          }
+          if (backendMemoryRole(descriptor) !== "native_auto_memory" || !resetsLocalNativeMemory(descriptor)) {
+            throw new JokoError({
+              code: "NATIVE_MEMORY_RESET_OWNER_UNAVAILABLE",
+              message: "The Backend no longer advertises native-memory reset.",
+              phase: "capability",
+              retryable: false,
+              stateMayHaveChanged: false,
+              recovery: "Refresh Backend settings before explicitly issuing a new reset operation."
+            });
+          }
+        };
+        const execution = await host.mutate({
+          operationId,
+          connection,
+          kind: payload.case,
+          body: mutation,
+          precondition: assertCurrentOwner,
+          effect: async () => {
+            resetResult = await host.invokeBackendAdapter(backendId, async (adapter) => {
+              if (adapter.resetNativeMemory === undefined) {
+                throw new JokoError({
+                  code: "NATIVE_MEMORY_RESET_OWNER_UNAVAILABLE",
+                  message: "The advertised native-memory reset owner is unavailable.",
+                  phase: "capability",
+                  retryable: false,
+                  stateMayHaveChanged: false,
+                  recovery: "Refresh Backend settings before explicitly issuing a new reset operation."
+                });
+              }
+              return validateNativeMemoryResetResult(await adapter.resetNativeMemory());
+            });
+          },
+          commit: () => {
+            if (resetResult === undefined) {
+              throw new StoreError("Native-memory reset completed without a result.");
+            }
+            return {
+              accepted: true,
+              memoryReset: resetResult
+            } satisfies OperationOutcome;
+          }
+        });
+        return presented(execution);
+      }
+      if (reset === undefined) throw new StoreError("Memory reset owner was not resolved.");
+      // Store-owned curated/digest resets remain synchronous and never touch
+      // Backend-native persistence. No Memory body enters the Operation result.
       const execution = await host.mutate({
         operationId,
         connection,

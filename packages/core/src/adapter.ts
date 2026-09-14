@@ -278,6 +278,13 @@ export interface RuntimeCommand {
   readonly loaded: boolean;
 }
 
+export interface NativeMemoryResetResult {
+  /** Omitted when the native owner does not expose a trustworthy count. */
+  readonly removedEntries?: number;
+  /** Omitted when the native owner does not expose a trustworthy target count. */
+  readonly removedTargets?: number;
+}
+
 export interface RuntimeResource {
   readonly id: string;
   readonly kind: "extension" | "skill" | "prompt" | "package";
@@ -447,6 +454,8 @@ export interface BackendAdapter {
   setAutoRetry(enabled: boolean, context: AdapterContext): Promise<void>;
   /** Reconcile the durable Backend-native memory preference with a live local runtime, if one exists. */
   reconcileNativeMemory?(): Promise<"immediate" | "next_session">;
+  /** Destructively reset only the Backend-native memory owned by this local runtime. */
+  resetNativeMemory?(): Promise<NativeMemoryResetResult>;
   /** Update the capability owner's default for runtimes created later. */
   configureSilentEncryptedRetry?(enabled: boolean): Promise<void>;
   /** Capability-gated transport recovery for Responses reasoning ciphertext. */

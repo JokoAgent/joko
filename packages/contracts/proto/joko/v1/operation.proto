@@ -980,9 +980,9 @@ message UpdateMemorySettingsMutation {
 
 enum MemoryResetScope {
   MEMORY_RESET_SCOPE_UNSPECIFIED = 0;
-  // All curated Maker Memory across Targets; Backend-owned digests are retained.
+  // All curated Maker Memory across Targets; Backend-owned memory is retained.
   MEMORY_RESET_SCOPE_CURATED = 1;
-  // Digests owned by backend_id across Targets; curated Maker Memory is retained.
+  // Memory owned by backend_id; curated Maker Memory and other Backends are retained.
   MEMORY_RESET_SCOPE_BACKEND = 2;
 }
 
@@ -1540,8 +1540,9 @@ message ScheduleDeletionResult {
 }
 
 message MemoryResetResult {
-  uint64 removed_entries = 1;
-  uint64 removed_targets = 2;
+  // Native owners may confirm reset without exposing a trustworthy count.
+  optional uint64 removed_entries = 1;
+  optional uint64 removed_targets = 2;
 }
 
 message Acknowledgement {
