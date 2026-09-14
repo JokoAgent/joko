@@ -474,6 +474,7 @@ interface NativeRuntime {
   inputPreparation?: AbortController;
   pendingControl?: symbol;
   controlUncertain: boolean;
+  freshSessionCanRestart: boolean;
   activeTurn?: ActiveTurn;
   initialization?: ClaudeSdkInitializationResult;
   modelId?: string;
@@ -1397,6 +1398,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       await waitFor(
         runtime.gate.offer(nativeInput, () => {
           turn.inputConsumed = true;
+          runtime.freshSessionCanRestart = false;
         }, preparationSignal, () => {
           prepared.assertCurrent();
           this.#assertCurrent(runtime, context, context.binding);
@@ -1868,16 +1870,40 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       const info = await waitFor(this.#sessionInfo(runtime.nativeSessionId, runtime.target, context.signal),
         this.#initializationTimeoutMs, context.signal, managedRouteUnavailable);
       this.#assertCurrent(runtime, context, context.binding);
-      if (info === undefined) throw continuityGap();
-      assertSessionInfo(info, runtime.nativeSessionId, runtime.runtimeWorkspaceRoot, runtime.remote);
+      let confirmFreshAfterRetirement = false;
+      if (info === undefined) {
+        if (!runtime.freshSessionCanRestart) throw continuityGap();
+        if (await this.#sessionHasHistory(runtime, context.signal)) throw continuityGap();
+        this.#assertCurrent(runtime, context, context.binding);
+        confirmFreshAfterRetirement = true;
+      } else {
+        assertSessionInfo(info, runtime.nativeSessionId, runtime.runtimeWorkspaceRoot, runtime.remote);
+      }
       retired = true;
       await this.#retireRuntime(runtime);
-      await waitFor(runtime.sdkRuntime.retireQuery(runtime.query, this.#teardownTimeoutMs), this.#teardownTimeoutMs,
-        context.signal, () => managedRouteUnavailable(true));
+      if (!runtime.remote) {
+        await waitFor(runtime.sdkRuntime.retireQuery(runtime.query, this.#teardownTimeoutMs), this.#teardownTimeoutMs,
+          context.signal, () => managedRouteUnavailable(true));
+      }
+      let restartFresh = false;
+      if (confirmFreshAfterRetirement) {
+        const confirmedInfo = await waitFor(this.#sessionInfo(
+          runtime.nativeSessionId,
+          runtime.target,
+          context.signal,
+          targetRuntimeOf(runtime)
+        ), this.#initializationTimeoutMs, context.signal, () => managedRouteUnavailable(true));
+        if (confirmedInfo === undefined) {
+          if (await this.#sessionHasHistory(runtime, context.signal)) throw continuityGap();
+          restartFresh = true;
+        } else {
+          assertSessionInfo(confirmedInfo, runtime.nativeSessionId, runtime.runtimeWorkspaceRoot, runtime.remote);
+        }
+      }
       context.signal.throwIfAborted();
       const retainedEffort = normalizeProductEffort(runtime.effort);
       const replacement = await this.#startRuntime(runtime.binding, context, {
-        resume: true, providerId, modelId,
+        resume: !restartFresh, providerId, modelId,
         permissionMode: runtime.permissionMode, fastMode: false,
         ...(retainedEffort !== undefined && model.thinkingLevels.includes(retainedEffort) ? { effort: retainedEffort } : {}),
         additionalDirectories: runtime.additionalDirectories,
@@ -2192,6 +2218,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         nativeTaskProjectionEnabled: false,
         steerEnabled: false,
         controlUncertain: false,
+        freshSessionCanRestart: !launch.resume,
         modelId: launch.modelId,
         effort: launch.effort,
         fastMode: false,
@@ -3691,6 +3718,38 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       scoped.assertCurrent();
       return info;
     } catch {
+      throw claudeCodeError("NATIVE_SESSION_INSPECTION_FAILED", "The native Session could not be inspected.", "session_inspect", {
+        retryable: true,
+        stateMayHaveChanged: false,
+        recovery: "Verify the SDK installation and native Session store, then retry."
+      });
+    }
+  }
+
+  async #sessionHasHistory(runtime: NativeRuntime, signal: AbortSignal): Promise<boolean> {
+    try {
+      runtime.assertRuntimeCurrent();
+      const messages = await waitFor(runtime.sdkRuntime.getSessionMessages(runtime.nativeSessionId, {
+        dir: runtime.runtimeWorkspaceRoot,
+        limit: 1,
+        offset: 0,
+        includeSystemMessages: true,
+        signal
+      }), this.#initializationTimeoutMs, signal, () => claudeCodeError(
+        "NATIVE_SESSION_INSPECTION_FAILED",
+        "The native Session could not be inspected.",
+        "session_inspect",
+        {
+          retryable: true,
+          stateMayHaveChanged: false,
+          recovery: "Verify the SDK installation and native Session store, then retry."
+        }
+      ));
+      runtime.assertRuntimeCurrent();
+      if (!Array.isArray(messages) || messages.length > 1) throw new Error("Invalid native Session history inspection result.");
+      return messages.length > 0;
+    } catch (error) {
+      if (error instanceof JokoError) throw error;
       throw claudeCodeError("NATIVE_SESSION_INSPECTION_FAILED", "The native Session could not be inspected.", "session_inspect", {
         retryable: true,
         stateMayHaveChanged: false,

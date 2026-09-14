@@ -238,7 +238,7 @@ describe("ClaudeCodeAdapter", () => {
     }
   });
 
-  test("passes the same managed model limit snapshot to an exact remote Query", async () => {
+  test("passes managed limits remotely and restarts an unpersisted Query on the same native identity", async () => {
     const managed = managedProviderFixture();
     const remoteTarget: TargetDescriptor = {
       ...target,
@@ -285,6 +285,20 @@ describe("ClaudeCodeAdapter", () => {
         }
       }
     });
+    remoteRuntime.sessions.clear();
+    const selected = await adapter.setModel("configured-provider", "second-model", contextFor(binding, { target: remoteTarget }).context);
+    expect(selected.modelId).toBe("second-model");
+    expect(remoteRuntime.queries[0]!.closeCalls).toBe(1);
+    expect(remoteRuntime.retiredQueries).toEqual([remoteRuntime.queries[0]]);
+    expect(remoteRuntime.queries[1]!.params.options).toMatchObject({
+      sessionId: binding.nativeSessionId,
+      model: "second-model",
+      env: {
+        CLAUDE_CODE_MAX_CONTEXT_TOKENS: "128000",
+        CLAUDE_CODE_MAX_OUTPUT_TOKENS: "8000"
+      }
+    });
+    expect(remoteRuntime.queries[1]!.params.options.resume).toBeUndefined();
     await adapter.closeSession(binding, contextFor(binding, { target: remoteTarget }).context);
     await adapter.dispose();
     expect(close).toHaveBeenCalledOnce();
@@ -374,21 +388,301 @@ describe("ClaudeCodeAdapter", () => {
     await adapter.dispose();
   });
 
-  test.each(["missing history", "unknown close"])("does not dispatch a new prompt during route refresh with %s", async (failure) => {
+  test.each(["selection", "input"])("restarts the same fresh native identity before %s when no Session was persisted", async (action) => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "configured-model" } });
+    let nativeMemoryEnabled = false;
+    let subagentModel: string | undefined = "compatible-model";
+    const adapter = adapterFor(runtime, {
+      managedProviders: managed.port,
+      resolveNativeMemoryEnabled: () => nativeMemoryEnabled,
+      resolveSubagentModel: () => subagentModel
+    });
+    const binding = await adapter.createSession(createInput({
+      providerId: "configured-provider", modelId: "configured-model", effort: "high", permissionMode: "auto"
+    }), {
+      ...contextFor().context,
+      extraDirectories: [{ id: "workspace", path: process.cwd(), access: "read_write" }]
+    });
+    const source = contextFor(binding, { operationId: "fresh-route" });
+    const context = { ...source.context, modelSelection: { providerId: "configured-provider", modelId: "configured-model" } };
+    runtime.sessions.clear();
+    managed.revision = "revision-two";
+    nativeMemoryEnabled = true;
+    subagentModel = undefined;
+    if (action === "selection") await adapter.setModel("configured-provider", "configured-model", context);
+    else await adapter.send(textPrompt("first persisted input"), context);
+    expect(runtime.queries).toHaveLength(2);
+    expect(runtime.queries[0]!.closeCalls).toBe(1);
+    expect(runtime.queries[0]!.receivedInputs).toEqual([]);
+    expect(runtime.retiredQueries).toEqual([runtime.queries[0]]);
+    expect(runtime.queries[1]!.params.options).toMatchObject({
+      sessionId: binding.nativeSessionId,
+      model: "configured-model",
+      effort: "high",
+      permissionMode: runtime.queries[0]!.params.options.permissionMode,
+      additionalDirectories: [process.cwd()],
+      settings: { autoMemoryEnabled: true, autoDreamEnabled: true }
+    });
+    expect(runtime.queries[1]!.params.options.resume).toBeUndefined();
+    expect(runtime.queries[0]!.params.options.env["CLAUDE_CODE_SUBAGENT_MODEL"]).toBe("compatible-model");
+    expect(runtime.queries[1]!.params.options.env["CLAUDE_CODE_SUBAGENT_MODEL"]).toBeUndefined();
+    expect(managed.activations).toHaveLength(action === "selection" ? 0 : 1);
+    if (action === "input") {
+      expect(runtime.queries[1]!.receivedInputs[0]!.message.content).toBe("first persisted input");
+    }
+    await adapter.dispose();
+  });
+
+  test("restarts an unpersisted managed Query on the native provider without changing its identity", async () => {
     const managed = managedProviderFixture();
     const runtime = new FakeSdkRuntime();
     const adapter = adapterFor(runtime, { managedProviders: managed.port });
-    const binding = await adapter.createSession(createInput({ providerId: "configured-provider", modelId: "configured-model" }), contextFor().context);
-    if (failure === "missing history") runtime.sessions.clear();
-    else runtime.retirementFailure = true;
+    const binding = await adapter.createSession(createInput({
+      providerId: "configured-provider", modelId: "configured-model"
+    }), contextFor().context);
+    runtime.sessions.clear();
+    const selected = await adapter.setModel("claude-code", "model-b", contextFor(binding).context);
+    expect(selected).toMatchObject({ providerId: "claude-code", modelId: "model-b" });
+    expect(runtime.queries).toHaveLength(2);
+    expect(runtime.queries[0]!.receivedInputs).toEqual([]);
+    expect(runtime.retiredQueries).toEqual([runtime.queries[0]]);
+    expect(runtime.queries[1]!.params.options).toMatchObject({
+      sessionId: binding.nativeSessionId,
+      model: "model-b"
+    });
+    expect(runtime.queries[1]!.params.options.resume).toBeUndefined();
+    expect(runtime.queries[1]!.params.options.env["CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"]).toBeUndefined();
+    expect(managed.activations).toEqual([]);
+    await adapter.dispose();
+  });
+
+  test("does not treat missing metadata as an empty Session after native input was consumed", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "configured-model" } });
+    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    const binding = await adapter.createSession(createInput({
+      providerId: "configured-provider", modelId: "configured-model"
+    }), contextFor().context);
+    const first = contextFor(binding, { operationId: "persist-before-missing" });
+    await adapter.send(textPrompt("persisted input"), {
+      ...first.context, modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+    });
+    runtime.queries[0]!.push(resultMessage(binding.nativeSessionId!, { result: "done", totalCostUsd: 0 }));
+    await eventually(() => first.events.some((event) => event.type === "done"));
+    await vi.waitFor(async () => {
+      await expect(adapter.inspectSession(binding, contextFor(binding).context))
+        .resolves.toMatchObject({ streaming: false });
+    });
+    runtime.sessions.clear();
     managed.revision = "revision-two";
-    await expect(adapter.send(textPrompt("not sent"), { ...contextFor(binding, { operationId: "failed-revision" }).context,
-      modelSelection: { providerId: "configured-provider", modelId: "configured-model" } }))
-      .rejects.toMatchObject({ publicError: { stateMayHaveChanged: failure === "unknown close" } });
+    await expect(adapter.send(textPrompt("not sent"), {
+      ...contextFor(binding, { operationId: "missing-after-input" }).context,
+      modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+    })).rejects.toMatchObject({ publicError: { stateMayHaveChanged: false } });
+    expect(runtime.queries).toHaveLength(1);
+    expect(runtime.queries[0]!.receivedInputs.map((input) => input.message.content)).toEqual(["persisted input"]);
+    expect(managed.activations).toHaveLength(1);
+    await adapter.dispose();
+  });
+
+  test("does not replace a fresh Query when public Session history is already present", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime();
+    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    const binding = await adapter.createSession(createInput({
+      providerId: "configured-provider", modelId: "configured-model"
+    }), contextFor().context);
+    runtime.sessions.clear();
+    runtime.messages.set(binding.nativeSessionId!, [historyMessage(
+      "user",
+      randomUUID(),
+      binding.nativeSessionId!,
+      { role: "user", content: "history owned by another writer" }
+    )]);
+    managed.revision = "revision-two";
+    await expect(adapter.setModel(
+      "configured-provider",
+      "configured-model",
+      contextFor(binding).context
+    )).rejects.toMatchObject({
+      publicError: { code: "NATIVE_SESSION_CONTINUITY_GAP", stateMayHaveChanged: false }
+    });
+    expect(runtime.queries).toHaveLength(1);
+    expect(runtime.queries[0]!.closeCalls).toBe(0);
+    expect(runtime.messageOptions).toEqual([{
+      sessionId: binding.nativeSessionId,
+      options: expect.objectContaining({ limit: 1, offset: 0, includeSystemMessages: true })
+    }]);
+    await adapter.dispose();
+  });
+
+  test("keeps the fresh Query when public Session history inspection is uncertain", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime();
+    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    const binding = await adapter.createSession(createInput({
+      providerId: "configured-provider", modelId: "configured-model"
+    }), contextFor().context);
+    runtime.sessions.clear();
+    vi.spyOn(runtime, "getSessionMessages").mockRejectedValue(new Error("Native history is unavailable."));
+    managed.revision = "revision-two";
+    await expect(adapter.setModel(
+      "configured-provider",
+      "configured-model",
+      contextFor(binding).context
+    )).rejects.toMatchObject({
+      publicError: { code: "NATIVE_SESSION_INSPECTION_FAILED", stateMayHaveChanged: false }
+    });
+    expect(runtime.queries).toHaveLength(1);
+    expect(runtime.queries[0]!.closeCalls).toBe(0);
+    await adapter.dispose();
+  });
+
+  test("does not treat a resumed Query with missing metadata as a fresh empty Session", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime();
+    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    const binding = await adapter.createSession(createInput({
+      providerId: "configured-provider", modelId: "configured-model"
+    }), contextFor().context);
+    await adapter.closeSession(binding, contextFor(binding).context);
+    const resumedBinding = { ...binding, generation: 2 };
+    const context = {
+      ...contextFor(resumedBinding, { generation: 2 }).context,
+      modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+    };
+    await adapter.resumeSession(binding, context);
+    runtime.sessions.clear();
+    managed.revision = "revision-two";
+    await expect(adapter.setModel("configured-provider", "configured-model", context))
+      .rejects.toMatchObject({
+        publicError: { code: "NATIVE_SESSION_CONTINUITY_GAP", stateMayHaveChanged: false }
+      });
+    expect(runtime.queries).toHaveLength(2);
+    expect(runtime.queries[1]!.closeCalls).toBe(0);
+    expect(runtime.queries[1]!.receivedInputs).toEqual([]);
+    await adapter.dispose();
+  });
+
+  test("does not dispatch a new prompt when fresh Query retirement is unknown", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime();
+    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    const binding = await adapter.createSession(createInput({
+      providerId: "configured-provider", modelId: "configured-model"
+    }), contextFor().context);
+    runtime.sessions.clear();
+    runtime.retirementFailure = true;
+    managed.revision = "revision-two";
+    await expect(adapter.send(textPrompt("not sent"), {
+      ...contextFor(binding, { operationId: "unknown-fresh-retirement" }).context,
+      modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+    })).rejects.toMatchObject({ publicError: { stateMayHaveChanged: true } });
     expect(runtime.queries).toHaveLength(1);
     expect(runtime.queries[0]!.receivedInputs).toEqual([]);
-    expect(runtime.retiredQueries).toHaveLength(failure === "unknown close" ? 1 : 0);
+    expect(runtime.retiredQueries).toEqual([runtime.queries[0]]);
     expect(managed.activations).toEqual([]);
+    await adapter.dispose();
+  });
+
+  test.each(["metadata", "history"] as const)(
+    "rechecks %s after exact retirement before choosing a fresh restart",
+    async (appears) => {
+      const managed = managedProviderFixture();
+      const runtime = new FakeSdkRuntime();
+      const adapter = adapterFor(runtime, { managedProviders: managed.port });
+      const binding = await adapter.createSession(createInput({
+        providerId: "configured-provider", modelId: "configured-model"
+      }), contextFor().context);
+      runtime.sessions.clear();
+      managed.revision = "revision-two";
+      vi.spyOn(runtime, "retireQuery").mockImplementation(async (query) => {
+        runtime.retiredQueries.push(query);
+        if (appears === "metadata") {
+          runtime.sessions.set(binding.nativeSessionId!, sessionInfo(binding.nativeSessionId!));
+        } else {
+          runtime.messages.set(binding.nativeSessionId!, [historyMessage(
+            "user",
+            randomUUID(),
+            binding.nativeSessionId!,
+            { role: "user", content: "persisted during retirement" }
+          )]);
+        }
+      });
+      const changing = adapter.setModel("configured-provider", "configured-model", contextFor(binding).context);
+      if (appears === "metadata") {
+        await expect(changing).resolves.toMatchObject({ modelId: "configured-model" });
+        expect(runtime.queries).toHaveLength(2);
+        expect(runtime.queries[1]!.params.options.resume).toBe(binding.nativeSessionId);
+        expect(runtime.queries[1]!.params.options.sessionId).toBeUndefined();
+      } else {
+        await expect(changing).rejects.toMatchObject({
+          publicError: { code: "MANAGED_PROVIDER_ROUTE_UNAVAILABLE", stateMayHaveChanged: true }
+        });
+        expect(runtime.queries).toHaveLength(1);
+      }
+      expect(runtime.queries[0]!.receivedInputs).toEqual([]);
+      await adapter.dispose();
+    }
+  );
+
+  test.each(["cancelled after retirement", "replacement startup failure"] as const)(
+    "does not reconstruct or dispatch an unpersisted Session after %s",
+    async (failure) => {
+      const managed = managedProviderFixture();
+      const runtime = new FakeSdkRuntime();
+      const adapter = adapterFor(runtime, { managedProviders: managed.port });
+      const binding = await adapter.createSession(createInput({
+        providerId: "configured-provider", modelId: "configured-model"
+      }), contextFor().context);
+      runtime.sessions.clear();
+      managed.revision = "revision-two";
+      const cancellation = new AbortController();
+      if (failure === "cancelled after retirement") {
+        vi.spyOn(runtime, "retireQuery").mockImplementation(async (query) => {
+          runtime.retiredQueries.push(query);
+          cancellation.abort();
+        });
+      } else {
+        runtime.queryFailure = new Error("The replacement Query could not start.");
+      }
+      await expect(adapter.setModel("configured-provider", "configured-model", {
+        ...contextFor(binding).context,
+        signal: cancellation.signal
+      })).rejects.toMatchObject({
+        publicError: { code: "MANAGED_PROVIDER_ROUTE_UNAVAILABLE", stateMayHaveChanged: true }
+      });
+      expect(runtime.queries).toHaveLength(1);
+      expect(runtime.queries[0]!.closeCalls).toBe(1);
+      expect(runtime.queries[0]!.receivedInputs).toEqual([]);
+      expect(runtime.retiredQueries).toEqual([runtime.queries[0]]);
+      expect(managed.activations).toEqual([]);
+      await adapter.dispose();
+    }
+  );
+
+  test("retires a fresh replacement whose first init frame does not confirm the selected route", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "another-model" } });
+    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    const binding = await adapter.createSession(createInput({
+      providerId: "configured-provider", modelId: "configured-model"
+    }), contextFor().context);
+    runtime.sessions.clear();
+    managed.revision = "revision-two";
+    await expect(adapter.send(textPrompt("must not continue on a mismatched route"), {
+      ...contextFor(binding, { operationId: "mismatched-fresh-route" }).context,
+      modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+    })).rejects.toMatchObject({
+      publicError: { code: "MANAGED_PROVIDER_ROUTE_UNAVAILABLE", stateMayHaveChanged: true }
+    });
+    expect(runtime.queries).toHaveLength(2);
+    expect(runtime.queries[0]!.receivedInputs).toEqual([]);
+    expect(runtime.queries[1]!.receivedInputs).toHaveLength(1);
+    expect(runtime.queries[1]!.closeCalls).toBe(1);
+    expect(managed.activations).toHaveLength(1);
+    expect(managed.activations[0]!.release).toHaveBeenCalledOnce();
     await adapter.dispose();
   });
 
