@@ -6,6 +6,7 @@ export {
 } from "./adapter.js";
 export {
   CLAUDE_AGENT_SDK_PACKAGE,
+  CLAUDE_AGENT_SDK_CLI_VERSION,
   CLAUDE_AGENT_SDK_VERSION,
   type ClaudeRemoteRuntimePort,
   type ClaudeTargetRuntime,

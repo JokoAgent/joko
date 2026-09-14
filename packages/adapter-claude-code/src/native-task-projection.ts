@@ -37,6 +37,12 @@ export interface NativeTaskTermination {
   readonly toolUseId: string;
 }
 
+export interface NativeWakeNotification {
+  readonly context: AdapterContext;
+  readonly rawTaskId: string;
+  readonly state: "completed" | "failed" | "stopped";
+}
+
 type PendingChildFrame =
   | { readonly kind: "assistant"; readonly envelope: Readonly<Record<string, unknown>>; readonly occurredAt: number }
   | { readonly kind: "user"; readonly envelope: Readonly<Record<string, unknown>>; readonly occurredAt: number }
@@ -77,6 +83,8 @@ interface NativeTaskRecord {
   isSubagent: boolean;
   excludedFromSubagents: boolean;
   skipTranscript: boolean;
+  terminalNotificationObserved: boolean;
+  continuationNotificationPublished: boolean;
   startedAt: number;
   updatedAt: number;
   endedAt?: number;
@@ -94,6 +102,7 @@ export class ClaudeNativeTaskProjection {
   readonly #pendingChildren = new Map<string, PendingChildFrame[]>();
   readonly #seenSystemFrames = new Set<string>();
   readonly #terminatedTools = new Map<string, AdapterContext>();
+  readonly #wakeNotifications = new Map<string, NativeWakeNotification>();
   #pendingChildFrameCount = 0;
 
   constructor(options: {
@@ -199,6 +208,12 @@ export class ClaudeNativeTaskProjection {
     return terminated;
   }
 
+  takeWakeNotifications(): readonly NativeWakeNotification[] {
+    const notifications = [...this.#wakeNotifications.values()];
+    this.#wakeNotifications.clear();
+    return notifications;
+  }
+
   confirmStopped(rawTaskId: string): readonly NativeTaskEmission[] {
     const task = this.#tasks.get(rawTaskId);
     if (task === undefined || !activeState(task.state)) return [];
@@ -208,6 +223,8 @@ export class ClaudeNativeTaskProjection {
     task.updatedAt = occurredAt;
     task.endedAt = occurredAt;
     task.error = undefined;
+    task.terminalNotificationObserved = true;
+    this.#queueWakeNotification(task);
     this.#markTerminatedTool(task);
     this.#activity(task, "stopped", "stopped", "Stopped by native task control.", occurredAt);
     const transcript = task.skipTranscript || !task.isSubagent || task.excludedFromSubagents
@@ -317,6 +334,8 @@ export class ClaudeNativeTaskProjection {
     task.error = task.state === "failed"
       ? nativeTaskError(task.summary ?? "The native task failed.")
       : undefined;
+    task.terminalNotificationObserved = true;
+    this.#queueWakeNotification(task);
     this.#markTerminatedTool(task);
     this.#activity(task, task.state, task.state, task.summary, task.updatedAt, task.lastToolName);
     const transcript = task.skipTranscript || !task.isSubagent || task.excludedFromSubagents
@@ -551,6 +570,8 @@ export class ClaudeNativeTaskProjection {
       isSubagent: false,
       excludedFromSubagents: false,
       skipTranscript: false,
+      terminalNotificationObserved: false,
+      continuationNotificationPublished: false,
       startedAt: occurredAt,
       updatedAt: occurredAt
     };
@@ -578,6 +599,7 @@ export class ClaudeNativeTaskProjection {
     } else if (observedType !== undefined && NATIVE_NON_AGENT_TASK_TYPES.has(observedType) && !task.isSubagent) {
       task.excludedFromSubagents = true;
     }
+    this.#queueWakeNotification(task);
   }
 
   #bindTaskTool(task: NativeTaskRecord, rawToolUseId: string, scope: ToolScope | undefined): void {
@@ -603,6 +625,17 @@ export class ClaudeNativeTaskProjection {
 
   #markTerminatedTool(task: NativeTaskRecord): void {
     if (task.toolUseId !== undefined) this.#terminatedTools.set(task.toolUseId, task.context);
+  }
+
+  #queueWakeNotification(task: NativeTaskRecord): void {
+    if (!task.wake || !task.terminalNotificationObserved || task.continuationNotificationPublished
+      || (task.state !== "completed" && task.state !== "failed" && task.state !== "stopped")) return;
+    task.continuationNotificationPublished = true;
+    this.#wakeNotifications.set(task.rawId, {
+      context: task.context,
+      rawTaskId: task.rawId,
+      state: task.state
+    });
   }
 
   #assignmentEntries(task: NativeTaskRecord): readonly SubagentTranscriptEntry[] {

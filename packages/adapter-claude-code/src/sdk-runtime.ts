@@ -9,6 +9,10 @@ import {
 
 export const CLAUDE_AGENT_SDK_PACKAGE = "@anthropic-ai/claude-agent-sdk";
 export const CLAUDE_AGENT_SDK_VERSION = "0.3.259";
+/** The fixed SDK package metadata binds its bundled executable to this exact
+ * CLI version. This is authoritative only while no executable override is
+ * supplied; an override must still prove its own version through a live init. */
+export const CLAUDE_AGENT_SDK_CLI_VERSION = "2.1.259";
 
 export type ClaudeSdkPermissionMode =
   | "default"
@@ -233,6 +237,9 @@ export interface ClaudeSdkProbe {
 
 export interface ClaudeSdkRuntime {
   readonly packageVersion: string;
+  /** Exact CLI version declared by this runtime's bundled executable. Callers
+   * may trust it only when they did not supply an executable override. */
+  readonly bundledCliVersion?: string;
   /** True only when the injected runtime can create and subsequently resume a
    * public SDK fork in a different canonical workspace. The fixed filesystem
    * SDK runtime does not provide that migration primitive: ForkSessionOptions.dir
@@ -296,6 +303,7 @@ interface LoadedSdkModule {
 
 export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
   readonly packageVersion = CLAUDE_AGENT_SDK_VERSION;
+  readonly bundledCliVersion = CLAUDE_AGENT_SDK_CLI_VERSION;
   readonly supportsWorkspaceDerivation = false;
   readonly #processOwner: DurableProcessOwner | undefined;
   readonly #retirementTimeoutMs: number;
@@ -364,11 +372,13 @@ export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
       query = warmQuery.query(emptySdkInput());
       const initialization = await query.initializationResult() as unknown as ClaudeSdkInitializationResult;
       const observation = await observeStartupInitialization(query, input.initializationTimeoutMs);
+      const cliVersion = observation.cliVersion
+        ?? (input.pathToClaudeCodeExecutable === undefined ? CLAUDE_AGENT_SDK_CLI_VERSION : undefined);
       return {
         installed: true,
         packageVersion: this.packageVersion,
         initialization,
-        ...(observation.cliVersion === undefined ? {} : { cliVersion: observation.cliVersion }),
+        ...(cliVersion === undefined ? {} : { cliVersion }),
         ...(observation.apiKeySource === undefined ? {} : { apiKeySource: observation.apiKeySource })
       };
     } catch {

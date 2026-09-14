@@ -53,15 +53,138 @@ describe("ClaudeCodeAdapter", () => {
     const adapter = adapterFor(runtime, { managedProviders: managed.port });
     expect((await adapter.describe()).models.find((model) => model.providerId === "configured-provider")!.thinkingLevels).toEqual(["high"]);
     const binding = await adapter.createSession(createInput({ providerId: "configured-provider", modelId: "configured-model", effort: "high" }), contextFor().context);
-    expect(runtime.queries[0]!.params.options.effort).toBe("xhigh");
+    expect(runtime.queries[0]!.params.options.effort).toBeUndefined();
+    expect(runtime.queries[0]!.params.options.settings).toMatchObject({
+      modelOverrides: {},
+      modelSettings: {
+        "configured-model": { effortLevel: "xhigh" },
+        "compatible-model": { effortLevel: "xhigh" },
+        "incompatible-thinking": { effortLevel: "xhigh" }
+      }
+    });
+    expect(runtime.queries[0]!.params.options.settings?.modelSettings).not.toHaveProperty("second-model");
     const source = contextFor(binding, { operationId: "mapped-effort" });
     const context = { ...source.context, modelSelection: { providerId: "configured-provider", modelId: "configured-model" } };
     await expect(adapter.setEffort("low", context)).rejects.toThrow();
     expect(runtime.queries[0]!.settingCalls).toEqual([]);
     await adapter.setEffort("high", context);
-    expect(runtime.queries[0]!.settingCalls).toEqual([{ effortLevel: "xhigh" }]);
+    expect(runtime.queries).toHaveLength(1);
+    expect(runtime.queries[0]!.settingCalls).toEqual([]);
     await adapter.send(textPrompt("mapped effort"), context);
     expect((await adapter.inspectSession(binding, context)).effort).toBe("high");
+    await adapter.dispose();
+  });
+
+  test.each([
+    { label: "persisted local", remote: false, fresh: false },
+    { label: "fresh remote", remote: true, fresh: true }
+  ])("restarts the exact $label managed Query when effort changes", async ({ remote, fresh }) => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime();
+    const selectedTarget: TargetDescriptor = remote
+      ? {
+          ...target,
+          id: "target-remote-managed-effort",
+          workspaceRoot: "D:\\service-owned-placeholder",
+          remoteWorkspace: { hostId: "host-effort", workspaceRoot: "/srv/effort" }
+        }
+      : target;
+    const adapter = adapterFor(remote ? new FakeSdkRuntime() : runtime, {
+      managedProviders: managed.port,
+      ...(remote
+        ? {
+            remoteRuntimes: {
+              resolve: async () => ({
+                runtime,
+                workspaceRoot: "/srv/effort",
+                remote: true,
+                assertCurrent: () => undefined
+              }),
+              close: async () => undefined
+            }
+          }
+        : {})
+    });
+    const binding = await adapter.createSession(createInput({
+      target: selectedTarget,
+      providerId: "configured-provider",
+      modelId: "configured-model",
+      effort: "low"
+    }), contextFor(undefined, { target: selectedTarget }).context);
+    if (fresh) runtime.sessions.clear();
+    const context = contextFor(binding, { target: selectedTarget }).context;
+    await adapter.setEffort("high", context);
+    expect(runtime.queries).toHaveLength(2);
+    expect(runtime.queries[0]!.closeCalls).toBe(1);
+    expect(runtime.queries[0]!.settingCalls).toEqual([]);
+    expect(runtime.retiredQueries).toEqual([runtime.queries[0]]);
+    expect(runtime.queries[1]!.params.options).toMatchObject({
+      model: "configured-model",
+      settings: {
+        modelOverrides: {},
+        modelSettings: {
+          "configured-model": { effortLevel: "high" },
+          "compatible-model": { effortLevel: "high" },
+          "incompatible-thinking": { effortLevel: "high" }
+        }
+      }
+    });
+    expect(runtime.queries[1]!.params.options.effort).toBeUndefined();
+    expect(runtime.queries[1]!.params.options[fresh ? "sessionId" : "resume"]).toBe(binding.nativeSessionId);
+    expect(runtime.queries[1]!.params.options[fresh ? "resume" : "sessionId"]).toBeUndefined();
+    expect((await adapter.inspectSession(binding, context)).effort).toBe("high");
+    await adapter.dispose();
+  });
+
+  test("falls back to the native subtask default and denies an explicit model when its selected effort is disabled", async () => {
+    const managed = managedProviderFixture({}, { "compatible-model": { high: null } });
+    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "configured-model", effort: "high" } });
+    const adapter = adapterFor(runtime, {
+      managedProviders: managed.port,
+      resolveSubagentModel: () => "compatible-model"
+    });
+    const binding = await adapter.createSession(createInput({
+      providerId: "configured-provider",
+      modelId: "configured-model",
+      effort: "high"
+    }), contextFor().context);
+    expect(runtime.queries[0]!.params.options.env["CLAUDE_CODE_SUBAGENT_MODEL"]).toBeUndefined();
+    expect(runtime.queries[0]!.params.options.settings?.modelSettings).not.toHaveProperty("compatible-model");
+    const active = contextFor(binding, { operationId: "disabled-child-effort" });
+    await adapter.send(textPrompt("delegate only if exact"), {
+      ...active.context,
+      modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+    });
+    const preToolUse = runtime.queries[0]!.params.options.hooks?.PreToolUse?.[0]?.hooks[0];
+    if (preToolUse === undefined) throw new Error("Expected managed subtask hooks.");
+    await expect(preToolUse({
+      hook_event_name: "PreToolUse",
+      session_id: binding.nativeSessionId!,
+      transcript_path: "D:\\private\\transcript.jsonl",
+      cwd: target.workspaceRoot,
+      tool_name: "Agent",
+      tool_input: { model: "compatible-model" },
+      tool_use_id: "disabled-child"
+    }, "disabled-child", { signal: new AbortController().signal }))
+      .resolves.toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+    expect(managed.subtaskActivations).toHaveLength(1);
+    expect(managed.subtaskActivations[0]!.release).toHaveBeenCalledOnce();
+    await adapter.dispose();
+  });
+
+  test("uses the public Query-global effort only when per-model settings cannot express the parent mapping", async () => {
+    const managed = managedProviderFixture({ high: "max" });
+    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "configured-model", effort: "max" } });
+    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    const binding = await adapter.createSession(createInput({
+      providerId: "configured-provider",
+      modelId: "configured-model",
+      effort: "high"
+    }), contextFor().context);
+    expect(runtime.queries[0]!.params.options.effort).toBe("max");
+    expect(runtime.queries[0]!.params.options.settings?.modelSettings).toBeUndefined();
+    expect(runtime.queries[0]!.params.options.settings).toMatchObject({ modelOverrides: {} });
+    await adapter.closeSession(binding, contextFor(binding).context);
     await adapter.dispose();
   });
 
@@ -136,9 +259,9 @@ describe("ClaudeCodeAdapter", () => {
     expect(managed.port.dispose).toHaveBeenCalledOnce();
   });
 
-  test("leases an exact compatible managed subtask route before Full access and revokes every native lifecycle boundary", async () => {
+  test("leases exact same-limit managed subtask effort routes before Full access and revokes every native lifecycle boundary", async () => {
     const managed = managedProviderFixture();
-    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "configured-model" } });
+    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "configured-model", effort: "low" } });
     const adapter = adapterFor(runtime, {
       managedProviders: managed.port,
       resolveSubagentModel: () => "compatible-model"
@@ -147,6 +270,7 @@ describe("ClaudeCodeAdapter", () => {
       const binding = await adapter.createSession(createInput({
         providerId: "configured-provider",
         modelId: "configured-model",
+        effort: "low",
         permissionMode: "bypassPermissions"
       }), contextFor().context);
       const active = contextFor(binding, { operationId: "managed-subtask-turn" });
@@ -196,9 +320,23 @@ describe("ClaudeCodeAdapter", () => {
       await expect(preToolUse(agentInput("agent-incompatible-limits", "second-model"), "agent-incompatible-limits", { signal: hookSignal }))
         .resolves.toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
       await expect(preToolUse(agentInput("agent-incompatible-thinking", "incompatible-thinking"), "agent-incompatible-thinking", { signal: hookSignal }))
-        .resolves.toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+        .resolves.toEqual({ continue: true });
       expect(managed.subtaskActivations).toHaveLength(3);
       expect(managed.subtaskActivations[1]!.release).toHaveBeenCalledOnce();
+      expect(managed.subtaskActivations[2]!.release).not.toHaveBeenCalled();
+      expect(query.params.options.effort).toBeUndefined();
+      expect(query.params.options.settings).toMatchObject({
+        modelSettings: {
+          "configured-model": { effortLevel: "low" },
+          "compatible-model": { effortLevel: "low" },
+          "incompatible-thinking": { effortLevel: "medium" }
+        }
+      });
+      await postToolUse({
+        ...agentInput("agent-incompatible-thinking", "incompatible-thinking"),
+        hook_event_name: "PostToolUse",
+        tool_response: "completed"
+      }, "agent-incompatible-thinking", { signal: hookSignal });
       expect(managed.subtaskActivations[2]!.release).toHaveBeenCalledOnce();
       await expect(preToolUse(agentInput("agent-incompatible-limits", "second-model"), "agent-incompatible-limits", { signal: hookSignal }))
         .resolves.toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
@@ -229,9 +367,36 @@ describe("ClaudeCodeAdapter", () => {
       await vi.waitFor(() => expect(managed.subtaskActivations[4]!.release).toHaveBeenCalledOnce());
 
       await preToolUse(agentInput("agent-parent-terminal"), "agent-parent-terminal", { signal: hookSignal });
-      query.push(resultMessage(binding.nativeSessionId!, { result: "done", totalCostUsd: 0 }));
+      query.push(taskStarted(binding.nativeSessionId!, "task-parent-terminal", "agent-parent-terminal", {
+        taskType: "local_agent", description: "asynchronous managed child"
+      }));
+      await postToolUse({
+        ...agentInput("agent-parent-terminal"),
+        hook_event_name: "PostToolUse",
+        tool_response: {
+          status: "async_launched",
+          agentId: "task-parent-terminal",
+          description: "asynchronous managed child",
+          prompt: "finish later",
+          outputFile: "D:\\private\\task.output"
+        }
+      }, "agent-parent-terminal", { signal: hookSignal });
+      expect(managed.subtaskActivations[5]!.release).not.toHaveBeenCalled();
+      query.push(taskNotification(binding.nativeSessionId!, "task-parent-terminal", "agent-parent-terminal", {
+        status: "completed", summary: "done", outputFile: "D:\\private\\task.output",
+        totalTokens: 1, toolUses: 0, durationMs: 1
+      }));
+      await vi.waitFor(() => expect(managed.subtaskActivations[5]!.release).toHaveBeenCalledOnce());
+      expect(() => managed.activations[0]!.input.assertCurrent()).not.toThrow();
+      query.push(resultMessage(binding.nativeSessionId!, { result: "foreground done", totalCostUsd: 0 }));
+      await eventually(() => active.events.some((event) => event.type === "usage"));
+      expect(active.events.some((event) => event.type === "done")).toBe(false);
+      expect(managed.activations[0]!.release).not.toHaveBeenCalled();
+      query.push(assistantMessage(binding.nativeSessionId!, "managed-continuation", [{
+        type: "text", text: "continued done"
+      }]));
+      query.push(automaticContinuationResult(binding.nativeSessionId!, "continued done", 0));
       await eventually(() => active.events.some((event) => event.type === "done"));
-      expect(managed.subtaskActivations[5]!.release).toHaveBeenCalledOnce();
       expect(managed.activations[0]!.release).toHaveBeenCalledOnce();
     } finally {
       await adapter.dispose();
@@ -380,7 +545,12 @@ describe("ClaudeCodeAdapter", () => {
     else await adapter.send(textPrompt("new revision input"), context);
     expect(runtime.queries).toHaveLength(2);
     expect(runtime.queries[0]!.closeCalls).toBe(1);
-    expect(runtime.queries[1]!.params.options).toMatchObject({ resume: binding.nativeSessionId, model: "configured-model", effort: "high" });
+    expect(runtime.queries[1]!.params.options).toMatchObject({
+      resume: binding.nativeSessionId,
+      model: "configured-model",
+      settings: { modelSettings: { "configured-model": { effortLevel: "high" } } }
+    });
+    expect(runtime.queries[1]!.params.options.effort).toBeUndefined();
     expect(runtime.retiredQueries).toEqual([runtime.queries[0]]);
     expect(managed.activations).toHaveLength(action === "selection" ? 0 : 1);
     expect(runtime.queries[0]!.receivedInputs).toEqual([]);
@@ -419,11 +589,15 @@ describe("ClaudeCodeAdapter", () => {
     expect(runtime.queries[1]!.params.options).toMatchObject({
       sessionId: binding.nativeSessionId,
       model: "configured-model",
-      effort: "high",
       permissionMode: runtime.queries[0]!.params.options.permissionMode,
       additionalDirectories: [process.cwd()],
-      settings: { autoMemoryEnabled: true, autoDreamEnabled: true }
+      settings: {
+        autoMemoryEnabled: true,
+        autoDreamEnabled: true,
+        modelSettings: { "configured-model": { effortLevel: "high" } }
+      }
     });
+    expect(runtime.queries[1]!.params.options.effort).toBeUndefined();
     expect(runtime.queries[1]!.params.options.resume).toBeUndefined();
     expect(runtime.queries[0]!.params.options.env["CLAUDE_CODE_SUBAGENT_MODEL"]).toBe("compatible-model");
     expect(runtime.queries[1]!.params.options.env["CLAUDE_CODE_SUBAGENT_MODEL"]).toBeUndefined();
@@ -1092,6 +1266,39 @@ describe("ClaudeCodeAdapter", () => {
       expect(runtime.queries[2]!.params.options.env["CLAUDE_CODE_SUBAGENT_MODEL"]).toBeUndefined();
       expect(runtime.queries[2]!.params.options.env["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"]).toBeUndefined();
       expect(resolveSubagentModel).toHaveBeenCalledTimes(3);
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
+  test("uses an exact bundled CLI binding for the first configured subtask default", async () => {
+    const runtime = new FakeSdkRuntime();
+    runtime.probeCliVersion = undefined;
+    runtime.bundledCliVersion = "2.1.259";
+    const adapter = adapterFor(runtime, { resolveSubagentModel: () => "model-a" });
+    try {
+      await adapter.createSession(createInput(), contextFor().context);
+      expect(runtime.probeInputs).toEqual([]);
+      expect(runtime.queries[0]!.params.options.env["CLAUDE_CODE_SUBAGENT_MODEL"]).toBe("model-a");
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
+  test("does not trust a bundled CLI binding for an executable override", async () => {
+    const runtime = new FakeSdkRuntime();
+    runtime.probeCliVersion = undefined;
+    runtime.bundledCliVersion = "2.1.259";
+    const adapter = adapterFor(runtime, {
+      pathToClaudeCodeExecutable: "D:\\custom\\claude.exe",
+      resolveSubagentModel: () => "model-a"
+    });
+    try {
+      await expect(adapter.createSession(createInput(), contextFor().context)).rejects.toMatchObject({
+        publicError: { code: "SUBAGENT_MODEL_DEFAULT_UNAVAILABLE" }
+      });
+      expect(runtime.probeInputs).toHaveLength(1);
+      expect(runtime.queries).toEqual([]);
     } finally {
       await adapter.dispose();
     }
@@ -2705,7 +2912,7 @@ describe("ClaudeCodeAdapter", () => {
       type: "text",
       text: "continued parent answer"
     }]));
-    query.push(resultMessage(binding.nativeSessionId!, { result: "continued parent answer", totalCostUsd: 0.3 }));
+    query.push(automaticContinuationResult(binding.nativeSessionId!, "continued parent answer", 0.3));
     await eventually(() => active.events.some((event) => event.type === "done"));
 
     const transcript = active.events
@@ -2795,15 +3002,44 @@ describe("ClaudeCodeAdapter", () => {
     await adapter.closeSession(binding, contextFor(binding).context);
   });
 
-  test("confirms an explicit wake-task stop without waiting for a provider echo", async () => {
-    const runtime = new FakeSdkRuntime({ autoAdmitTurns: true });
-    const adapter = adapterFor(runtime);
-    const binding = await adapter.createSession(createInput(), contextFor().context);
+  test("confirms an async managed wake-task stop before its foreground Result without waiting for a provider echo", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime({
+      autoAdmitTurns: true,
+      initialFrameOverrides: { model: "configured-model", effort: "low" }
+    });
+    const adapter = adapterFor(runtime, {
+      managedProviders: managed.port,
+      resolveSubagentModel: () => "compatible-model"
+    });
+    const binding = await adapter.createSession(createInput({
+      providerId: "configured-provider",
+      modelId: "configured-model",
+      effort: "low"
+    }), contextFor().context);
     const active = contextFor(binding, { operationId: "stop-awaiting-native-task" });
-    await adapter.send(textPrompt("start delegated work"), active.context);
+    const managedContext = {
+      ...active.context,
+      modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+    };
+    await adapter.send(textPrompt("start delegated work"), managedContext);
     const query = runtime.queries[0]!;
     const rawTaskId = "wake-task-without-stop-echo";
     const toolUseId = "wake-tool-without-stop-echo";
+    const preToolUse = query.params.options.hooks?.PreToolUse?.[0]?.hooks[0];
+    const postToolUse = query.params.options.hooks?.PostToolUse?.[0]?.hooks[0];
+    if (preToolUse === undefined || postToolUse === undefined) throw new Error("Expected managed subtask hooks.");
+    const hookInput = {
+      hook_event_name: "PreToolUse" as const,
+      session_id: binding.nativeSessionId!,
+      transcript_path: "D:\\private\\transcript.jsonl",
+      cwd: target.workspaceRoot,
+      tool_name: "Agent",
+      tool_input: {},
+      tool_use_id: toolUseId
+    };
+    await expect(preToolUse(hookInput, toolUseId, { signal: new AbortController().signal }))
+      .resolves.toEqual({ continue: true });
     query.push(assistantMessage(binding.nativeSessionId!, "wake-parent-tool", [{
       type: "tool_use",
       id: toolUseId,
@@ -2814,19 +3050,24 @@ describe("ClaudeCodeAdapter", () => {
       taskType: "local_agent",
       description: "Inspector"
     }));
+    await postToolUse({
+      ...hookInput,
+      hook_event_name: "PostToolUse",
+      tool_response: { status: "async_launched", agentId: rawTaskId }
+    }, toolUseId, { signal: new AbortController().signal });
+    expect(managed.subtaskActivations[0]!.release).not.toHaveBeenCalled();
     await eventually(() => active.events.some((event) => event.type === "background_task"));
     const publicTaskId = active.events.find((event): event is Extract<EventPayload, { type: "background_task" }> =>
       event.type === "background_task")!.taskId;
-    query.push(resultMessage(binding.nativeSessionId!, { result: "Waiting for delegated work", totalCostUsd: 0.1 }));
-    await eventually(() => active.events.some((event) => event.type === "usage"));
-    expect(active.events.some((event) => event.type === "done")).toBe(false);
 
     await adapter.controlSubagent({
       runId: publicTaskId,
       childId: `${publicTaskId}:child`,
       action: "stop"
-    }, active.context);
+    }, managedContext);
 
+    expect(managed.subtaskActivations[0]!.release).toHaveBeenCalledOnce();
+    query.push(resultMessage(binding.nativeSessionId!, { result: "Delegated work stopped", totalCostUsd: 0.1 }));
     await eventually(() => active.events.some((event) => event.type === "done"));
     expect(query.stopTaskCalls).toEqual([rawTaskId]);
     expect(active.events.filter((event) => event.type === "done")).toEqual([{ type: "done", outcome: "completed" }]);
@@ -4093,7 +4334,10 @@ interface FakeRuntimeOptions {
   readonly probeInstalled?: boolean;
 }
 
-function managedProviderFixture(thinkingLevelMap: Readonly<Record<string, string | null>> = {}) {
+function managedProviderFixture(
+  thinkingLevelMap: Readonly<Record<string, string | null>> = {},
+  modelThinkingOverrides: Readonly<Record<string, Readonly<Record<string, string | null>>>> = {}
+) {
   const token = "private-model-proxy-fixture-token";
   const models: ProviderModel[] = ["configured-model", "compatible-model", "second-model", "incompatible-thinking"].map((modelId) => ({
     providerId: "configured-provider", modelId, displayName: modelId, api: "anthropic-messages",
@@ -4103,7 +4347,11 @@ function managedProviderFixture(thinkingLevelMap: Readonly<Record<string, string
     cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 }
   }));
   const thinkingMapFor = (modelId: string) => Object.freeze(
-    modelId === "incompatible-thinking" ? { ...thinkingLevelMap, low: "medium" } : { ...thinkingLevelMap }
+    {
+      ...thinkingLevelMap,
+      ...(modelId === "incompatible-thinking" ? { low: "medium" } : {}),
+      ...modelThinkingOverrides[modelId]
+    }
   );
   const activations: { input: Parameters<ManagedProviderRouteBinding["activate"]>[0]; release: ReturnType<typeof vi.fn> }[] = [];
   const subtaskActivations: {
@@ -4157,6 +4405,7 @@ function forkHistory(sessionId: string): ClaudeSdkSessionMessage[] {
 
 class FakeSdkRuntime implements ClaudeSdkRuntime {
   readonly packageVersion = CLAUDE_AGENT_SDK_VERSION;
+  bundledCliVersion: string | undefined;
   supportsWorkspaceDerivation = true;
   readonly queries: FakeQuery[] = [];
   retirementFailure = false;
@@ -4799,6 +5048,16 @@ function resultMessage(
     terminal_reason: options.terminalReason ?? "completed",
     uuid: randomUUID(),
     session_id: sessionId
+  };
+}
+
+function automaticContinuationResult(sessionId: string, result: string, totalCostUsd: number) {
+  return {
+    ...resultMessage(sessionId, { result, totalCostUsd }),
+    origin: { kind: "task-notification" },
+    // Explicit null prevents the fake Query from filling the last human UUID;
+    // the projection normalizes it to the fixed SDK's absent meta-turn field.
+    user_message_uuid: null
   };
 }
 

@@ -140,6 +140,7 @@ const MAX_DESCRIPTOR_ITEMS = 4_096;
 const MAX_PERMISSION_RULES = 256;
 const MAX_PERMISSION_RULE_CONTENT = 4_096;
 const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
+const PERSISTED_MODEL_EFFORT_LEVELS = ["low", "medium", "high", "xhigh"] as const;
 const DEFAULT_SETTING_SOURCES = ["user", "project", "local"] as const;
 const ISOLATED_REVIEW_CLI_VERSION = [2, 1, 259] as const;
 const NATIVE_TASK_CLI_VERSION = [2, 1, 259] as const;
@@ -385,9 +386,11 @@ interface ActiveTurn {
   inputConsumed: boolean;
   nativeIdentityConfirmed: boolean;
   terminalClaimed: boolean;
+  managedAuthorityRevoked: boolean;
   awaitingNativeContinuation: boolean;
   nativeContinuationSegment: boolean;
   readonly continuationTaskIds: Set<string>;
+  readonly pendingContinuationTaskIds: Set<string>;
   continuationTimer?: ReturnType<typeof setTimeout>;
   frameCount: number;
   projectedCharacters: number;
@@ -443,6 +446,7 @@ interface PendingPermission {
 
 interface NativeRuntime {
   readonly managedRoute?: ManagedProviderRouteBinding;
+  readonly managedEffortSnapshot?: ManagedQueryEffortSnapshot;
   readonly productSessionId: string;
   readonly target: TargetDescriptor;
   readonly binding: NativeSessionBinding;
@@ -487,6 +491,16 @@ interface NativeRuntime {
   additionalDirectories: readonly ApprovedDirectory[];
   lastUsage?: UsageSnapshot;
   lastTotalCostUsd: number;
+}
+
+type NativeEffort = typeof EFFORT_LEVELS[number];
+type PersistedModelEffort = typeof PERSISTED_MODEL_EFFORT_LEVELS[number];
+
+interface ManagedQueryEffortSnapshot {
+  readonly productEffort: string | undefined;
+  readonly nativeByModel: ReadonlyMap<string, NativeEffort | undefined>;
+  readonly modelSettings?: Readonly<Record<string, { readonly effortLevel: PersistedModelEffort }>>;
+  readonly globalEffort?: NativeEffort;
 }
 
 interface CatalogBindingSource {
@@ -1324,7 +1338,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
           assertCurrent: () => {
             this.#assertCurrent(runtime, context, context.binding);
             if (runtime.inputPreparation === preparation && !preparationSignal.aborted) return;
-            if (runtime.activeTurn?.operationId !== operationId || runtime.activeTurn.terminalClaimed || runtime.activeTurn.stopping) {
+            if (runtime.activeTurn?.operationId !== operationId || runtime.activeTurn.terminalClaimed
+              || runtime.activeTurn.managedAuthorityRevoked) {
               throw new Error("The managed model operation is no longer active.");
             }
           }
@@ -1371,9 +1386,11 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       inputConsumed: false,
       nativeIdentityConfirmed: false,
       terminalClaimed: false,
+      managedAuthorityRevoked: false,
       awaitingNativeContinuation: false,
       nativeContinuationSegment: false,
       continuationTaskIds: new Set(),
+      pendingContinuationTaskIds: new Set(),
       frameCount: 0,
       projectedCharacters: 0,
       childOutputObserved: false,
@@ -1848,13 +1865,25 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     return providerModel(model, this.#projection);
   }
 
-  async #replaceModelRoute(runtime: NativeRuntime, providerId: string, modelId: string, context: AdapterContext): Promise<ProviderModel> {
+  async #replaceModelRoute(
+    runtime: NativeRuntime,
+    providerId: string,
+    modelId: string,
+    context: AdapterContext,
+    replacementEffort?: string
+  ): Promise<ProviderModel> {
     const managed = providerId !== PROVIDER_ID;
     const model = managed ? this.#managedProviders?.listModels().find((entry) => entry.providerId === providerId && entry.modelId === modelId)
       : (() => { const native = findModel(runtime.initialization?.models ?? [], modelId); return native === undefined ? undefined : providerModel(native, this.#projection); })();
     if (model === undefined) throw managedRouteUnavailable();
-    if (managed) validateManagedThinkingMap(this.#managedProviders!.getThinkingLevelMap(providerId, modelId));
-    if (runtime.managedRoute?.providerId === providerId && runtime.managedRoute.model.modelId === modelId) {
+    if (managed) {
+      managedModelLimitEnvironment(model);
+      const mapping = this.#managedProviders!.getThinkingLevelMap(providerId, modelId);
+      validateManagedThinkingMap(mapping);
+      if (replacementEffort !== undefined) managedNativeEffort(model, mapping, replacementEffort);
+    }
+    if (replacementEffort === undefined
+      && runtime.managedRoute?.providerId === providerId && runtime.managedRoute.model.modelId === modelId) {
       try {
         runtime.managedRoute.assertCurrent();
         return managedProviderModel(runtime.managedRoute.model, runtime.managedRoute.thinkingLevelMap);
@@ -1901,7 +1930,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         }
       }
       context.signal.throwIfAborted();
-      const retainedEffort = normalizeProductEffort(runtime.effort);
+      const retainedEffort = replacementEffort ?? normalizeProductEffort(runtime.effort);
       const replacement = await this.#startRuntime(runtime.binding, context, {
         resume: !restartFresh, providerId, modelId,
         permissionMode: runtime.permissionMode, fastMode: false,
@@ -1934,6 +1963,25 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     const runtime = this.#requireIdleRuntime(context);
     this.#assertStandardRuntime(runtime, "change reasoning effort");
     const nativeEffort = assertEffortSupported(runtime, effort);
+    if (runtime.managedRoute !== undefined) {
+      if (runtime.effort === effort) {
+        try {
+          runtime.managedRoute.assertCurrent();
+          return;
+        } catch {
+          // Rebuild the exact route below so the next request cannot use a
+          // stale per-model effort table.
+        }
+      }
+      await this.#replaceModelRoute(
+        runtime,
+        runtime.managedRoute.providerId,
+        runtime.managedRoute.model.modelId,
+        context,
+        effort
+      );
+      return;
+    }
     await this.#runIdleControl(runtime, context, "effort", async (acknowledge) => {
       await runtime.query.applyFlagSettings({ effortLevel: nativeEffort });
       acknowledge();
@@ -2186,6 +2234,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       runtime = {
         productSessionId: context.sessionId,
         ...(managedRoute === undefined ? {} : { managedRoute }),
+        ...(startedQuery.managedEffortSnapshot === undefined
+          ? {}
+          : { managedEffortSnapshot: startedQuery.managedEffortSnapshot }),
         target: context.target,
         binding,
         sessionGeneration: context.generation,
@@ -2315,7 +2366,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       toolUseId: string | undefined,
       options: { readonly signal: AbortSignal }
     ) => Promise<ClaudeSdkHookOutput>
-  ): Promise<{ readonly query: ClaudeSdkQuery; readonly subagentModel: string | undefined; releaseAuthorization(): void }> {
+  ): Promise<{
+    readonly query: ClaudeSdkQuery;
+    readonly subagentModel: string | undefined;
+    readonly managedEffortSnapshot: ManagedQueryEffortSnapshot | undefined;
+    releaseAuthorization(): void;
+  }> {
     let subagentModel: string | undefined;
     try {
       subagentModel = launch.runtimePolicy === "standard" ? this.#resolveSubagentModel?.(managedRoute?.providerId ?? PROVIDER_ID) : undefined;
@@ -2325,12 +2381,27 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         recovery: "Reload the subtask model setting and retry."
       });
     }
+    if (subagentModel !== undefined && (typeof subagentModel !== "string" || subagentModel.length === 0 || subagentModel.length > 512
+      || /[\s\x00-\x1f\x7f]/u.test(subagentModel))) {
+      throw claudeCodeError("SUBAGENT_MODEL_INVALID", "The configured subtask model has an invalid identifier.", "session_start", {
+        recovery: "Choose an available subtask model in Settings, then retry."
+      });
+    }
+    const managedEffortSnapshot = launch.runtimePolicy === "standard" && managedRoute !== undefined
+      ? managedQueryEffortSnapshot(managedRoute, this.#managedProviders!, launch.effort)
+      : undefined;
+    // A stored default that this exact Query cannot represent is known to be
+    // inapplicable before native startup. Preserve the product setting and let
+    // the Query use its native default instead of spawning a request that the
+    // route hook would have to deny.
+    if (subagentModel !== undefined && managedEffortSnapshot !== undefined
+      && !managedEffortSnapshot.nativeByModel.has(subagentModel)) {
+      subagentModel = undefined;
+    }
     if (subagentModel !== undefined) {
-      if (typeof subagentModel !== "string" || subagentModel.length === 0 || subagentModel.length > 512
-        || /[\s\x00-\x1f\x7f]/u.test(subagentModel)) {
-        throw claudeCodeError("SUBAGENT_MODEL_INVALID", "The configured subtask model has an invalid identifier.", "session_start", {
-          recovery: "Choose an available subtask model in Settings, then retry."
-        });
+      if (this.#lastCliVersion === undefined && this.#pathToExecutable === undefined) {
+        const bundledCliVersion = this.#projection.text(scoped.runtime.bundledCliVersion, 128).trim();
+        if (bundledCliVersion.length > 0) this.#lastCliVersion = bundledCliVersion;
       }
       if (this.#lastCliVersion === undefined) await this.describe();
       if (!supportsSubagentDefaultModel(this.#lastCliVersion)) throw subagentDefaultModelUnavailable();
@@ -2429,6 +2500,14 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
                   // The fixed CLI additionally filters provider-related `env`
                   // keys when CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST is set.
                   apiKeyHelper: "",
+                  ...(managedRoute === undefined ? {} : {
+                    // Model aliases are part of request authority for a managed
+                    // route, so lower-precedence settings cannot remap them.
+                    modelOverrides: {},
+                    ...(managedEffortSnapshot?.modelSettings === undefined
+                      ? {}
+                      : { modelSettings: managedEffortSnapshot.modelSettings })
+                  }),
                   ...(nativeMemoryEnabled === undefined
                     ? {}
                     : { autoMemoryEnabled: nativeMemoryEnabled, autoDreamEnabled: nativeMemoryEnabled }),
@@ -2439,8 +2518,11 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
                 }
               }),
           ...(runtimeAuthorization === undefined ? {} : { getOAuthToken: runtimeAuthorization.getOAuthToken }),
-          ...(launch.effort === undefined ? {} : { effort: managedRoute === undefined ? requiredNativeEffort(launch.effort)
-            : managedNativeEffort(managedRoute.model, managedRoute.thinkingLevelMap, launch.effort) }),
+          ...(launch.effort === undefined ? {} : managedRoute === undefined
+            ? { effort: requiredNativeEffort(launch.effort) }
+            : managedEffortSnapshot?.globalEffort === undefined
+              ? {}
+              : { effort: managedEffortSnapshot.globalEffort }),
           ...(launch.runtimePolicy === "standard" ? { forwardSubagentText: true } : {}),
           ...(launch.runtimePolicy === "standard" && managedRoute !== undefined
             ? { hooks: managedSubtaskHooks(managedSubtaskHook) }
@@ -2481,6 +2563,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       return {
         query,
         subagentModel,
+        managedEffortSnapshot,
         releaseAuthorization: () => runtimeAuthorization?.release()
       };
     } catch (error) {
@@ -2835,7 +2918,10 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     const wakeTaskIds = result.error === undefined
       && result.outcome === "completed"
       && runtime.nativeTaskProjectionEnabled
-      ? runtime.nativeTasks.activeWakeTaskIds()
+      ? [...new Set([
+          ...runtime.nativeTasks.activeWakeTaskIds(),
+          ...turn.pendingContinuationTaskIds
+        ])]
       : [];
     if (wakeTaskIds.length > 0) {
       this.#awaitNativeContinuation(turn, wakeTaskIds);
@@ -2854,8 +2940,13 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
   #awaitNativeContinuation(turn: ActiveTurn, rawTaskIds: readonly string[]): void {
     this.#clearNativeContinuationTimer(turn);
     turn.awaitingNativeContinuation = true;
+    // The foreground result is only an intermediate provider boundary while
+    // an SDK wake task owns an automatic continuation. Keep both parent and
+    // delegated route leases current across that gap.
+    turn.stopping = false;
     turn.continuationTaskIds.clear();
     for (const rawTaskId of rawTaskIds) addBoundedIdentity(turn.continuationTaskIds, rawTaskId);
+    turn.pendingContinuationTaskIds.clear();
   }
 
   #beginNativeContinuationSegment(turn: ActiveTurn): void {
@@ -2865,6 +2956,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     turn.stopping = false;
     turn.interruptConfirmation = undefined;
     turn.continuationTaskIds.clear();
+    turn.pendingContinuationTaskIds.clear();
     turn.blocks.splice(0);
     turn.stream.reset();
     turn.assistantError = undefined;
@@ -2941,6 +3033,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     this.#clearNativeContinuationTimer(turn);
     turn.awaitingNativeContinuation = false;
     turn.continuationTaskIds.clear();
+    turn.pendingContinuationTaskIds.clear();
     turn.stream.reset();
   }
 
@@ -3031,7 +3124,16 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         || input.hook_event_name === "PostToolUseFailure")
         && (input.tool_name === "Agent" || input.tool_name === "Task")) {
         const releaseId = managedSubtaskToolUseId(input.tool_use_id, callbackToolUseId);
-        if (releaseId !== undefined) releaseManagedSubtaskLease(runtime.activeTurn, releaseId);
+        if (releaseId !== undefined && input.hook_event_name === "PostToolUse"
+          && record(input.tool_response)?.["status"] === "async_launched") {
+          const rawTaskId = managedSubtaskToolUseId(
+            stringValue(record(input.tool_response)?.["agentId"]),
+            undefined
+          );
+          if (rawTaskId !== undefined) addManagedContinuationIdentity(runtime.activeTurn, rawTaskId);
+        } else if (releaseId !== undefined) {
+          releaseManagedSubtaskLease(runtime.activeTurn, releaseId);
+        }
       }
       return { continue: true };
     }
@@ -3114,7 +3216,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
           modelId,
           signal: lifetimeSignal,
           assertCurrent: () => {
-            if (!this.#isTurnCurrent(runtime, turn) || turn.stopping || turn.terminalClaimed) {
+            if (!this.#isTurnCurrent(runtime, turn) || turn.terminalClaimed || turn.managedAuthorityRevoked) {
               throw new Error("The delegated model turn is no longer current.");
             }
             const current = turn.subtaskRouteLeases.get(toolUseId);
@@ -3130,7 +3232,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
             || turn.subtaskRouteAdmissions.get(toolUseId) !== admission
             || turn.subtaskRouteLeases.has(toolUseId)
             || lease.model.providerId !== route.providerId || lease.model.modelId !== modelId
-            || lease.model.api !== route.protocol || !managedSubtaskConfigurationCompatible(route, lease)) {
+            || lease.model.api !== route.protocol || !managedSubtaskConfigurationCompatible(runtime, lease)) {
             lease.release();
             throw new Error("The delegated model authorization expired before admission.");
           }
@@ -3517,6 +3619,15 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         await emission.context.emit(emission.payload, { namespace: "claude-code.native_tasks", fields });
       }
     } finally {
+      for (const notification of runtime.nativeTasks.takeWakeNotifications()) {
+        const turn = runtime.activeTurn;
+        if (turn?.context !== notification.context || turn.terminalClaimed) continue;
+        if (notification.state === "stopped") {
+          turn.pendingContinuationTaskIds.delete(notification.rawTaskId);
+          continue;
+        }
+        addManagedContinuationIdentity(turn, notification.rawTaskId);
+      }
       for (const terminated of runtime.nativeTasks.takeTerminatedTools()) {
         const turn = runtime.activeTurn;
         if (turn?.context === terminated.context) {
@@ -4138,43 +4249,46 @@ function releaseManagedSubtaskLease(turn: ActiveTurn | undefined, toolUseId: str
 }
 
 function releaseManagedTurnLeases(turn: ActiveTurn): void {
+  turn.managedAuthorityRevoked = true;
   for (const pending of turn.subtaskRouteAdmissions.values()) pending.cancellation.abort();
   turn.subtaskRouteAdmissions.clear();
   for (const granted of turn.subtaskRouteLeases.values()) granted.lease.release();
   turn.subtaskRouteLeases.clear();
   turn.subtaskRouteDecisions.clear();
+  turn.pendingContinuationTaskIds.clear();
   turn.providerLease?.release();
 }
 
+function addManagedContinuationIdentity(turn: ActiveTurn | undefined, rawTaskId: string): void {
+  if (turn === undefined || turn.terminalClaimed || rawTaskId.length === 0 || rawTaskId.length > 512
+    || /[\x00-\x1f\x7f]/u.test(rawTaskId)) return;
+  const tasks = turn.awaitingNativeContinuation
+    ? turn.continuationTaskIds
+    : turn.pendingContinuationTaskIds;
+  addBoundedIdentity(tasks, rawTaskId);
+}
+
 function managedSubtaskConfigurationCompatible(
-  parent: ManagedProviderRouteBinding,
+  runtime: NativeRuntime,
   child: ManagedProviderSubtaskLease
 ): boolean {
+  const parent = runtime.managedRoute;
+  const effortSnapshot = runtime.managedEffortSnapshot;
+  if (parent === undefined || effortSnapshot === undefined) return false;
   try {
-    return isDeepStrictEqual(
+    if (!isDeepStrictEqual(
       managedModelLimitEnvironment(parent.model),
       managedModelLimitEnvironment(child.model)
-    ) && isDeepStrictEqual(
-      managedThinkingSignature(parent.model, parent.thinkingLevelMap),
-      managedThinkingSignature(child.model, child.thinkingLevelMap)
-    );
+    )) return false;
+    validateManagedThinkingMap(child.thinkingLevelMap);
+    if (!effortSnapshot.nativeByModel.has(child.model.modelId)) return false;
+    const expected = effortSnapshot.nativeByModel.get(child.model.modelId);
+    return effortSnapshot.productEffort === undefined
+      ? expected === undefined
+      : expected === managedNativeEffort(child.model, child.thinkingLevelMap, effortSnapshot.productEffort);
   } catch {
     return false;
   }
-}
-
-function managedThinkingSignature(
-  model: ProviderModel,
-  mapping: Readonly<Record<string, string | null>>
-): Readonly<Record<string, string>> {
-  validateManagedThinkingMap(mapping);
-  const signature: Record<string, string> = {};
-  for (const level of model.thinkingLevels) {
-    if (mapping[level] === null) continue;
-    const native = normalizeEffort(mapping[level] ?? level);
-    if (native !== undefined) signature[level] = native;
-  }
-  return Object.freeze(signature);
 }
 
 function reviewRuntimePolicy(
@@ -4906,8 +5020,12 @@ function assertResultOwnership(
     && (userMessageUuid.toLowerCase() === turn.userMessageUuid
       || (turn.steers.get(userMessageUuid.toLowerCase())?.consumed === true && identities.has(turn.userMessageUuid)));
   if (turn.nativeContinuationSegment) {
-    if (originKind !== undefined && originKind !== "human") throw turnOwnershipGap();
-    if (userMessageUuid !== undefined && !belongsToTurn) throw turnOwnershipGap();
+    // A fixed-CLI wake continuation is a synthetic meta turn. Its exact
+    // `task-notification` provenance plus the already-active notification
+    // claim is the ownership proof; it must not impersonate a human UUID.
+    if (originKind !== "task-notification" || userMessageUuid !== undefined || identities.size !== 0) {
+      throw turnOwnershipGap();
+    }
     return;
   }
   if (originKind !== "human") throw turnOwnershipGap();
@@ -5339,6 +5457,130 @@ function validateManagedThinkingMap(mapping: Readonly<Record<string, string | nu
       recovery: "Choose a supported native effort level or disable the declared effort."
     });
   }
+}
+
+function managedQueryEffortSnapshot(
+  route: ManagedProviderRouteBinding,
+  providers: ManagedProviderRuntimePort,
+  productEffort: string | undefined
+): ManagedQueryEffortSnapshot {
+  try { route.assertCurrent(); }
+  catch { throw managedRouteUnavailable(); }
+  if (!validManagedModelIdentity(route.model.modelId)) throw managedRouteUnavailable();
+  validateManagedThinkingMap(route.thinkingLevelMap);
+  const parentLimits = managedModelLimitEnvironment(route.model);
+  const parentNative = productEffort === undefined
+    ? undefined
+    : managedNativeEffort(route.model, route.thinkingLevelMap, productEffort);
+  const listed = providers.listModels();
+  if (listed.length > MAX_DESCRIPTOR_ITEMS) throw managedRouteUnavailable();
+  const counts = new Map<string, number>();
+  for (const model of listed) {
+    if (model.providerId === route.providerId) {
+      counts.set(model.modelId, (counts.get(model.modelId) ?? 0) + 1);
+    }
+  }
+  const candidates: {
+    readonly modelId: string;
+    readonly nativeEffort: NativeEffort | undefined;
+    readonly settingsKey: string | undefined;
+  }[] = [{
+    modelId: route.model.modelId,
+    nativeEffort: parentNative,
+    settingsKey: productEffort === undefined ? undefined : fixedManagedModelSettingsKey(route.model.modelId)
+  }];
+  for (const model of listed) {
+    if (model.providerId !== route.providerId || model.modelId === route.model.modelId
+      || counts.get(model.modelId) !== 1 || model.api !== route.protocol
+      || !validManagedModelIdentity(model.modelId)) continue;
+    try {
+      if (!isDeepStrictEqual(parentLimits, managedModelLimitEnvironment(model))) continue;
+      const mapping = providers.getThinkingLevelMap(route.providerId, model.modelId);
+      validateManagedThinkingMap(mapping);
+      const nativeEffort = productEffort === undefined
+        ? undefined
+        : managedNativeEffort(model, mapping, productEffort);
+      candidates.push({
+        modelId: model.modelId,
+        nativeEffort,
+        settingsKey: productEffort === undefined ? undefined : fixedManagedModelSettingsKey(model.modelId)
+      });
+    } catch {
+      // One inapplicable catalog entry must not make the exact parent route
+      // unusable. It remains outside this Query's delegated-model snapshot.
+    }
+  }
+  try { route.assertCurrent(); }
+  catch { throw managedRouteUnavailable(); }
+  if (productEffort === undefined) {
+    return {
+      productEffort: undefined,
+      nativeByModel: new Map(candidates.map((candidate) => [candidate.modelId, undefined]))
+    };
+  }
+  const parentKey = candidates[0]!.settingsKey;
+  if (parentNative === undefined) throw managedRouteUnavailable();
+  if (parentNative === "max" || parentKey === undefined) {
+    return {
+      productEffort,
+      globalEffort: parentNative,
+      nativeByModel: new Map(candidates
+        .filter((candidate) => candidate.nativeEffort === parentNative)
+        .map((candidate) => [candidate.modelId, candidate.nativeEffort]))
+    };
+  }
+  const groups = new Map<string, typeof candidates>();
+  for (const candidate of candidates) {
+    if (candidate.nativeEffort === "max" || candidate.settingsKey === undefined) continue;
+    const group = groups.get(candidate.settingsKey) ?? [];
+    group.push(candidate);
+    groups.set(candidate.settingsKey, group);
+  }
+  const modelSettings: Record<string, { readonly effortLevel: PersistedModelEffort }> = Object.create(null);
+  const nativeByModel = new Map<string, NativeEffort | undefined>();
+  for (const [settingsKey, group] of groups) {
+    const parent = group.find((candidate) => candidate.modelId === route.model.modelId);
+    const selectedNative = parent?.nativeEffort
+      ?? (new Set(group.map((candidate) => candidate.nativeEffort)).size === 1 ? group[0]!.nativeEffort : undefined);
+    if (selectedNative === undefined || selectedNative === "max") continue;
+    modelSettings[settingsKey] = Object.freeze({ effortLevel: selectedNative });
+    for (const candidate of group) {
+      if (candidate.nativeEffort === selectedNative) nativeByModel.set(candidate.modelId, candidate.nativeEffort);
+    }
+  }
+  if (!nativeByModel.has(route.model.modelId)) throw managedRouteUnavailable();
+  return {
+    productEffort,
+    nativeByModel,
+    modelSettings: Object.freeze(modelSettings)
+  };
+}
+
+function validManagedModelIdentity(value: string): boolean {
+  return value.length > 0 && value.length <= 512 && !/[\s\x00-\x1f\x7f]/u.test(value);
+}
+
+/** Mirrors the deterministic identity spelling used by the fixed CLI 2.1.259
+ * for settings keys. Native tier aliases depend on account configuration and
+ * therefore deliberately fall back to a Query-global effort. */
+function fixedManagedModelSettingsKey(value: string): string | undefined {
+  if (!validManagedModelIdentity(value)) return undefined;
+  let key = value.toLowerCase().replace(/\[1m\]$/iu, "");
+  if (["sonnet", "opus", "haiku", "fable", "best", "opusplan"].includes(key)
+    || Object.hasOwn(Object.prototype, key)) return undefined;
+  for (const identity of [
+    "claude-fable-5-1", "claude-fable-5", "claude-mythos-5-1", "claude-mythos-5",
+    "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
+    "claude-opus-4-5", "claude-opus-4-1", "claude-sonnet-5", "claude-sonnet-4-6",
+    "claude-sonnet-4-5", "claude-haiku-4-5", "claude-3-7-sonnet", "claude-3-5-sonnet",
+    "claude-3-5-haiku", "claude-3-opus", "claude-3-sonnet", "claude-3-haiku"
+  ]) {
+    if (key.includes(identity)) return identity;
+  }
+  if (/claude-opus-4(?!-\d(?!\d))/u.test(key)) return "claude-opus-4-0";
+  if (/claude-sonnet-4(?!-\d(?!\d))/u.test(key)) return "claude-sonnet-4-0";
+  key = key.replace(/-\d{8}$/u, "");
+  return Object.hasOwn(Object.prototype, key) ? undefined : key;
 }
 
 function managedNativeEffort(model: ProviderModel, mapping: Readonly<Record<string, string | null>>, level: string): typeof EFFORT_LEVELS[number] {
