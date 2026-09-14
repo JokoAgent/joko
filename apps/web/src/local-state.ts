@@ -1,4 +1,4 @@
-import type { AttachmentDraft, BrowserCommentDraftItem, ComposerDraft, ComposerMentionDraft, ConnectionProfile, Locale, MachineCacheView, NewSessionLocalDraft, PermissionMode, Theme } from "./model.js";
+import type { AttachmentDraft, BrowserCommentDraftItem, ComposerDraft, ComposerMentionDraft, ConnectionProfile, Locale, MachineCacheView, NewSessionLocalDraft, PendingExtensionUseView, PermissionMode, Theme } from "./model.js";
 import { normalizeBrowserCommentStyleChanges, normalizeBrowserCommentTarget, sanitizeBrowserCommentPageUrl } from "./browser-comment-draft.js";
 import { normalizeMachineCache, normalizeMachineSelection, type MachineSelection } from "./machine-federation.js";
 import {
@@ -31,6 +31,7 @@ const SECRET_STORE = "secrets";
 const KEY_STORE = "keys";
 const DRAFT_STORE = "drafts";
 const NEW_SESSION_DRAFT_PREFIX = "new-session\u0000";
+const PENDING_EXTENSION_USE_PREFIX = "pending-extension-use\u0000";
 const PREFERENCE_STORE = "preferences";
 const MACHINE_CACHE_STORE = "machine-caches";
 const CURRENT_OBJECT_STORES = [
@@ -574,9 +575,26 @@ export class LocalState {
     return normalizeNewSessionLocalDraft({ ...record, attachments });
   }
 
+  async savePendingExtensionUse(scope: string, value: PendingExtensionUseView): Promise<void> {
+    const normalized = normalizePendingExtensionUse(value);
+    if (normalized === undefined) throw new Error("The Extension use handoff is invalid.");
+    await this.put(DRAFT_STORE, pendingExtensionUseKey(scope), normalized);
+  }
+
+  async readPendingExtensionUse(scope: string): Promise<PendingExtensionUseView | undefined> {
+    return normalizePendingExtensionUse(await this.get<unknown>(DRAFT_STORE, pendingExtensionUseKey(scope)));
+  }
+
+  async clearPendingExtensionUse(scope: string): Promise<void> {
+    const transaction = this.#database.transaction(DRAFT_STORE, "readwrite");
+    transaction.objectStore(DRAFT_STORE).delete(pendingExtensionUseKey(scope));
+    await transactionDone(transaction);
+  }
+
   async clearNewSessionDraft(scope: string): Promise<void> {
     const transaction = this.#database.transaction(DRAFT_STORE, "readwrite");
     transaction.objectStore(DRAFT_STORE).delete(newSessionDraftKey(scope));
+    transaction.objectStore(DRAFT_STORE).delete(pendingExtensionUseKey(scope));
     await transactionDone(transaction);
   }
 
@@ -729,6 +747,63 @@ export function normalizeNewSessionLocalDraft(value: unknown): NewSessionLocalDr
     attachments,
     ...(extraDirectoryIds === undefined ? {} : { extraDirectoryIds })
   };
+}
+
+export function normalizePendingExtensionUse(value: unknown): PendingExtensionUseView | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const ownerValue = record["owner"];
+  if (ownerValue === null || typeof ownerValue !== "object" || Array.isArray(ownerValue)) return undefined;
+  const ownerRecord = ownerValue as Record<string, unknown>;
+  const owner: PendingExtensionUseView["owner"] | undefined = ownerRecord["kind"] === "resource"
+    && validExtensionIdentity(ownerRecord["resourceId"])
+    && validExtensionIdentity(ownerRecord["discoveredRevision"])
+    && validPositiveDecimal(ownerRecord["resourceRevision"])
+    ? {
+        kind: "resource",
+        resourceId: ownerRecord["resourceId"],
+        discoveredRevision: ownerRecord["discoveredRevision"],
+        resourceRevision: ownerRecord["resourceRevision"]
+      }
+    : ownerRecord["kind"] === "mcp"
+      && validExtensionIdentity(ownerRecord["serverId"])
+      && validPositiveDecimal(ownerRecord["serverRevision"])
+      ? { kind: "mcp", serverId: ownerRecord["serverId"], serverRevision: ownerRecord["serverRevision"] }
+      : undefined;
+  if (owner === undefined
+    || typeof record["extensionId"] !== "string"
+    || !/^extension_[a-f0-9]{32}$/u.test(record["extensionId"])
+    || !validPositiveDecimal(record["extensionRevision"])
+    || !validExtensionCommandName(record["commandName"])
+    || !validExtensionIdentity(record["runtimeSessionId"])
+    || !validExtensionDisplayName(record["displayName"])) return undefined;
+  return {
+    extensionId: record["extensionId"],
+    extensionRevision: record["extensionRevision"],
+    commandName: record["commandName"],
+    runtimeSessionId: record["runtimeSessionId"],
+    displayName: record["displayName"],
+    owner
+  };
+}
+
+function validExtensionIdentity(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 4_096
+    && value === value.trim() && !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
+function validPositiveDecimal(value: unknown): value is string {
+  return typeof value === "string" && /^[1-9][0-9]*$/u.test(value);
+}
+
+function validExtensionCommandName(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 256
+    && value === value.trim() && !/[\s\u0000-\u001f\u007f]/u.test(value);
+}
+
+function validExtensionDisplayName(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 512
+    && value === value.trim() && !/[\u0000-\u001f\u007f]/u.test(value);
 }
 
 function normalizeNewSessionWorktreeDraft(
@@ -1040,6 +1115,11 @@ function safeMediaType(value: unknown): string {
 function newSessionDraftKey(scope: string): string {
   if (scope.length === 0) throw new Error("A new-task draft scope is required.");
   return `${NEW_SESSION_DRAFT_PREFIX}${scope}`;
+}
+
+function pendingExtensionUseKey(scope: string): string {
+  if (scope.length === 0) throw new Error("A new-task draft scope is required.");
+  return `${PENDING_EXTENSION_USE_PREFIX}${scope}`;
 }
 
 function openCurrentDatabase(): Promise<IDBDatabase> {

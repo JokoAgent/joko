@@ -34,6 +34,7 @@ import type {
   ProviderModel,
   PublicError,
   RuntimeCommand,
+  RuntimeResource,
   RuntimeToolCatalog,
   SessionDescriptor,
   SessionReferenceSnapshot,
@@ -9702,12 +9703,16 @@ export class SessionHost {
               recovery: "Retry after Backend instance replacement finishes."
             });
           }
-          if (item.body.mentions.some((mention) => mention.kind === "resource")) {
-            // Resource authority is live and process-scoped. Re-observe it
-            // after activation so a queued item cannot dispatch from the UI's
-            // earlier catalog or an in-memory catalog lost across restart.
-            await this.getResources(sessionId);
-          }
+          // Resource authority is live and process-scoped. Re-observe the
+          // complete catalog after activation so this accepted turn can bind
+          // both loaded exposure and any typed mention to the exact runtime
+          // generation. Review runtimes deliberately have no Resource surface.
+          const resourceCapability = this.#store.getBackend(
+            this.#store.getSession(sessionId).descriptor.backendId
+          ).descriptor.capabilities.get("runtime.resources");
+          const dispatchResources: readonly RuntimeResource[] = reviewReadOnly || resourceCapability?.supported !== true
+            ? []
+            : await this.getResources(sessionId);
           this.assertSessionNotPendingScheduleDeletion(sessionId);
           const stored = this.#store.getSession(sessionId);
           const target = this.targetForSession(stored);
@@ -9788,6 +9793,19 @@ export class SessionHost {
               operationId: item.operationId
             });
             markNativeDispatchRecoveryAccepted(store, sessionId, item.id);
+            if (!reviewReadOnly) {
+              appendAcceptedResourceUsageEvidence(store, {
+                backendId: stored.descriptor.backendId,
+                targetId: stored.descriptor.targetId,
+                sessionId,
+                runId: run.descriptor.id,
+                ...(attemptId === undefined ? {} : { attemptId }),
+                operationId: item.operationId,
+                generation: stored.descriptor.binding.generation,
+                resources: dispatchResources,
+                mentions: dispatchBody.mentions
+              });
+            }
           });
           this.refreshRunSilenceWatchdog(sessionId);
           if (reviewReadOnly) {
@@ -12251,6 +12269,149 @@ function nestedOperationFailure(error: unknown): unknown {
 
 function stableId(prefix: string, operationId: string): string {
   return `${prefix}-${createHash("sha256").update(operationId).digest("hex").slice(0, 24)}`;
+}
+
+function appendAcceptedResourceUsageEvidence(
+  store: OperationalStore,
+  input: {
+    readonly backendId: string;
+    readonly targetId: string;
+    readonly sessionId: string;
+    readonly runId: string;
+    readonly attemptId?: string;
+    readonly operationId: string;
+    readonly generation: number;
+    readonly resources: readonly RuntimeResource[];
+    readonly mentions: PromptInput["mentions"];
+  }
+): void {
+  for (const resource of input.resources) {
+    const occurrenceId = stableId(
+      "resource-load",
+      `${input.runId}\0${input.generation}\0${resource.id}`
+    );
+    const payload = exactRuntimeResourceUsagePayload(
+      resource,
+      input.generation,
+      occurrenceId,
+      "runtime_confirmed_resource_load"
+    );
+    if (payload === undefined) continue;
+    store.appendEventIfAbsent({
+      id: stableId("event-resource-usage", occurrenceId),
+      backendId: input.backendId,
+      targetId: input.targetId,
+      sessionId: input.sessionId,
+      runId: input.runId,
+      ...(input.attemptId === undefined ? {} : { attemptId: input.attemptId }),
+      operationId: input.operationId,
+      generation: input.generation,
+      traceId: `resource-usage:${occurrenceId}`,
+      payload
+    });
+  }
+
+  for (const [mentionIndex, mention] of input.mentions.entries()) {
+    if (mention.kind !== "resource") continue;
+    const matches = input.resources.filter((resource) => resource.id === mention.reference);
+    if (matches.length !== 1) continue;
+    const resource = matches[0]!;
+    if (
+      resource.revision !== mention.discoveredRevision
+      || resource.resourceVersion?.toString(10) !== mention.resourceVersion
+      || resource.runtimeGeneration !== mention.runtimeGeneration
+      || mention.runtimeGeneration !== input.generation
+    ) continue;
+    const occurrenceId = stableId(
+      "resource-mention",
+      `${input.runId}\0${input.generation}\0${mentionIndex}\0${resource.id}`
+    );
+    const payload = exactRuntimeResourceUsagePayload(
+      resource,
+      input.generation,
+      occurrenceId,
+      "structured_resource_mention"
+    );
+    if (payload === undefined) continue;
+    store.appendEventIfAbsent({
+      id: stableId("event-resource-usage", occurrenceId),
+      backendId: input.backendId,
+      targetId: input.targetId,
+      sessionId: input.sessionId,
+      runId: input.runId,
+      ...(input.attemptId === undefined ? {} : { attemptId: input.attemptId }),
+      operationId: input.operationId,
+      generation: input.generation,
+      traceId: `resource-usage:${occurrenceId}`,
+      payload
+    });
+  }
+}
+
+function exactRuntimeResourceUsagePayload(
+  resource: RuntimeResource,
+  generation: number,
+  occurrenceId: string,
+  source: "structured_resource_mention" | "runtime_confirmed_resource_load"
+): Extract<EventPayload, { readonly type: "resource_usage" }> | undefined {
+  const maximumRevision = 18_446_744_073_709_551_615n;
+  if (
+    resource.state !== "loaded"
+    || resource.runtimeGeneration !== generation
+    || !Number.isSafeInteger(generation)
+    || generation < 1
+    || !validResourceUsageIdentity(resource.id, 4_096)
+    || !validResourceUsageIdentity(resource.revision, 4_096)
+    || typeof resource.resourceVersion !== "bigint"
+    || resource.resourceVersion < 1n
+    || resource.resourceVersion > maximumRevision
+    || resource.version !== undefined && !validResourceUsageIdentity(resource.version, 256)
+  ) return undefined;
+  const market = resource.market;
+  if (market !== undefined && (
+    !validResourceUsageIdentity(market.sourceId, 512)
+    || typeof market.sourceRevision !== "bigint"
+    || market.sourceRevision < 1n
+    || market.sourceRevision > maximumRevision
+    || !validResourceUsageIdentity(market.entryId, 512)
+    || typeof market.entryRevision !== "bigint"
+    || market.entryRevision < 1n
+    || market.entryRevision > maximumRevision
+    || !validResourceUsageIdentity(market.entryContentRevision, 4_096)
+    || !validResourceUsageIdentity(market.installedContentRevision, 4_096)
+  )) return undefined;
+  return {
+    type: "resource_usage",
+    occurrenceId,
+    resourceId: resource.id,
+    entityRevision: resource.resourceVersion.toString(10),
+    contentRevision: resource.revision!,
+    runtimeGeneration: generation,
+    ...(resource.version === undefined ? {} : { version: resource.version }),
+    ...(market === undefined
+      ? {}
+      : {
+          market: {
+            sourceId: market.sourceId,
+            sourceRevision: market.sourceRevision.toString(10),
+            entryId: market.entryId,
+            entryRevision: market.entryRevision.toString(10),
+            entryContentRevision: market.entryContentRevision,
+            installedContentRevision: market.installedContentRevision
+          }
+        }),
+    source,
+    activity: "passive",
+    action: "exposure"
+  };
+}
+
+function validResourceUsageIdentity(value: unknown, maximum: number): value is string {
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= maximum
+    && value === value.trim()
+    && !/[\u0000-\u001f\u007f\u2028\u2029]/u.test(value);
 }
 
 function portableActivationReadyRecord(updatedAt = Date.now()): PortableImportActivationRecord {

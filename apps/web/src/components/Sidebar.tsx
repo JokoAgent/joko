@@ -4,8 +4,11 @@ import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useSta
 import { createPortal } from "react-dom";
 import {
   AlignJustify,
+  Activity,
   Archive,
   Bot,
+  Box,
+  Boxes,
   CalendarClock,
   Check,
   ChevronDown,
@@ -15,16 +18,20 @@ import {
   CircleDot,
   Clock,
   Coins,
+  Code2,
   Copy,
   Ellipsis,
   ExternalLink,
   FileOutput,
+  FileText,
   Filter,
   FolderOpen,
   FolderKanban,
   Folders,
   GitBranch,
   GitPullRequest,
+  Globe2,
+  LayoutDashboard,
   LayoutGrid,
   LayoutList,
   Laptop,
@@ -36,18 +43,20 @@ import {
   Pin,
   Play,
   Search,
+  Sparkles,
   Settings,
   SlidersHorizontal,
   SquarePen,
   Rows2,
   Trash2,
+  Terminal,
   Undo2,
   Wallet,
   Wrench,
   X
 } from "lucide-react";
 import type { AppRoute } from "../controller.js";
-import type { AppSnapshot, ConnectionProfile, FederatedSessionMessageSearchMatchView, MachineCacheView, MachinePresenceView, MachineSessionCacheView, ScheduleView, SessionMessageSearchFiltersView, SessionMessageSearchMatchView, SessionView, TargetView } from "../model.js";
+import type { AppSnapshot, ConnectionProfile, ExtensionCatalogEntryView, FederatedSessionMessageSearchMatchView, MachineCacheView, MachinePresenceView, MachineSessionCacheView, ScheduleView, SessionMessageSearchFiltersView, SessionMessageSearchMatchView, SessionView, TargetView } from "../model.js";
 import { selectedRemoteMachineCaches, type MachineSelection } from "../machine-federation.js";
 import type { NavigationMode } from "../navigation-layout.js";
 import {
@@ -124,6 +133,22 @@ import { SESSION_SPLIT_DRAG_TYPE } from "./SessionSplitView.js";
 import { SESSION_LINK_DRAG_MIME } from "./composer-internal-drop.js";
 import { MachineSwitcherMenu } from "./MachineSwitcherMenu.js";
 import { scheduleDisplayStatus } from "./scheduler-list.js";
+
+function ExtensionShortcutIcon({ extension }: { readonly extension: ExtensionCatalogEntryView }): JSX.Element {
+  switch (extension.mainView?.icon) {
+    case "activity": return <Activity aria-hidden="true" />;
+    case "box": return <Box aria-hidden="true" />;
+    case "code": return <Code2 aria-hidden="true" />;
+    case "fileText": return <FileText aria-hidden="true" />;
+    case "globe": return <Globe2 aria-hidden="true" />;
+    case "layout": return <LayoutDashboard aria-hidden="true" />;
+    case "search": return <Search aria-hidden="true" />;
+    case "sparkles": return <Sparkles aria-hidden="true" />;
+    case "terminal": return <Terminal aria-hidden="true" />;
+    case "tool": return <Wrench aria-hidden="true" />;
+    default: return <Boxes aria-hidden="true" />;
+  }
+}
 import { ScheduleDeleteDialog } from "./ScheduleDeleteDialog.js";
 import type { GeneratedSessionDisposition, ScheduleDeletionPreview } from "../schedule-deletion.js";
 import { CodeHostPullRequestSidebarBadge, codeHostPullRequestTooltip } from "./CodeHostPullRequestSummary.js";
@@ -341,6 +366,11 @@ interface DeleteScheduleRequest {
 export function Sidebar(props: SidebarProps): JSX.Element {
   const { snapshot, route, activeSessionId, t } = props;
   const visibleTargets = useMemo(() => snapshot.targets.filter((target) => !target.archived), [snapshot.targets]);
+  const sidebarExtensions = useMemo(() => snapshot.extensions.filter((extension) => extension.installed
+    && extension.enabled
+    && extension.sidebarSupported
+    && extension.sidebarVisible
+    && (extension.setup.state === "ready" || extension.setup.state === "notRequired")), [snapshot.extensions]);
   const hiddenProjectIds = useMemo(() => new Set(snapshot.targets.filter((target) => target.archived).map((target) => target.id)), [snapshot.targets]);
   const navigateAndClose = (nextRoute: AppRoute): void => {
     props.onNavigate(nextRoute);
@@ -1784,7 +1814,18 @@ export function Sidebar(props: SidebarProps): JSX.Element {
             props.onClose();
           }}
         />}
-        {!searchPopupOpen && pinnedEntries.length === 0 && recent.length === 0 && remoteMachineSessionCount === 0 && <p className="sidebar__empty">{t("session.emptyBody")}</p>}
+        {!searchPopupOpen && sidebarExtensions.length > 0 && <section className="sidebar-extension-shortcuts" aria-label={t("extensions.sidebar")}>
+          <h2>{t("extensions.sidebar")}</h2>
+          {sidebarExtensions.map((extension) => <button
+            type="button"
+            key={extension.id}
+            data-extension-id={extension.id}
+            className={cx(route.kind === "extensionMainView" && route.extensionId === extension.id && "is-active")}
+            aria-current={route.kind === "extensionMainView" && route.extensionId === extension.id ? "page" : undefined}
+            onClick={() => navigateAndClose({ kind: "extensionMainView", extensionId: extension.id })}
+          ><ExtensionShortcutIcon extension={extension} /><span><strong>{extension.mainView?.title ?? extension.name}</strong><small>{extension.description}</small></span></button>)}
+        </section>}
+        {!searchPopupOpen && pinnedEntries.length === 0 && recent.length === 0 && remoteMachineSessionCount === 0 && sidebarExtensions.length === 0 && <p className="sidebar__empty">{t("session.emptyBody")}</p>}
         </nav>
 
         <nav className="sidebar__utility" aria-label={t("a11y.productNavigation")}>
@@ -1850,6 +1891,14 @@ export function Sidebar(props: SidebarProps): JSX.Element {
             ariaLabel={t("nav.pinned")}
           />
           {railPinnedEntries.length > 0 && <div className="sidebar__rail-section-divider" aria-hidden="true" />}
+          {sidebarExtensions.map((extension) => <IconButton
+            key={extension.id}
+            className={cx("sidebar__rail-extension", route.kind === "extensionMainView" && route.extensionId === extension.id && "is-active")}
+            label={extension.mainView?.title ?? extension.name}
+            tip={extension.mainView?.title ?? extension.name}
+            onClick={() => navigateAndClose({ kind: "extensionMainView", extensionId: extension.id })}
+          ><ExtensionShortcutIcon extension={extension} /></IconButton>)}
+          {sidebarExtensions.length > 0 && <div className="sidebar__rail-section-divider" aria-hidden="true" />}
           <div className="sidebar__rail-aggregates">
             <IconButton
               className={cx("sidebar__rail-aggregate", railPanel?.section === "projects" && "is-open")}

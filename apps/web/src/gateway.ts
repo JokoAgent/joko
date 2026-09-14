@@ -54,6 +54,8 @@ import {
   ComputerAutomationRuntimeState,
   ComputerAutomationUpdatePhase,
   CompactSessionOutcome,
+  CollaborationRole as ProtoCollaborationRole,
+  CollaborationScopeKind as ProtoCollaborationScopeKind,
   CompactionState,
   ContextRebuildReason,
   CompositeArgumentKind,
@@ -68,6 +70,21 @@ import {
   ErrorSeverity,
   EventCursorSchema,
   ExtensionWidgetPlacement,
+  ExtensionCatalogSource as ProtoExtensionCatalogSource,
+  ExtensionLibraryEntryKind as ProtoExtensionLibraryEntryKind,
+  ExtensionLibraryCallSchema,
+  ExtensionLibraryLocationKind as ProtoExtensionLibraryLocationKind,
+  ExtensionLibraryState as ProtoExtensionLibraryState,
+  ExtensionLibraryUnavailableReason as ProtoExtensionLibraryUnavailableReason,
+  ExtensionMainViewIcon as ProtoExtensionMainViewIcon,
+  ExtensionPackageAction as ProtoExtensionPackageAction,
+  ExtensionPackageExportState as ProtoExtensionPackageExportState,
+  ExtensionSourceKind as ProtoExtensionSourceKind,
+  ExtensionSourceState as ProtoExtensionSourceState,
+  ExtensionInstallState as ProtoExtensionInstallState,
+  ExtensionService,
+  ExtensionSetupFieldKind as ProtoExtensionSetupFieldKind,
+  ExtensionSetupState as ProtoExtensionSetupState,
   ExtensionUiEffectKind,
   ExtensionNotificationKind as ProtoExtensionNotificationKind,
   EventService,
@@ -153,12 +170,15 @@ import {
   ResourceAcquisitionSourceSchema,
   ResourceCompatibility,
   ResourceCompatibilityIssue,
+  ResourceAcquisitionKind,
   ResourceKind,
   ResourcePackageWarning,
   ResourcePermissionAction,
   ResourceRuntimeRequirementStatus,
   ResourceScope,
   ResourceState,
+  ResourceUsageComparisonUnavailableReason as ProtoResourceUsageComparisonUnavailableReason,
+  ResourceUsageSource as ProtoResourceUsageSource,
   ResourceUiApi,
   RecoveryActionKind,
   ReviewAttachmentKind,
@@ -211,6 +231,26 @@ import {
   SessionState,
   SessionTitleSuggestionStatus,
   SessionWorktreeState,
+  SkillDiffChangeKind,
+  SkillDraftKind,
+  SkillFileKind,
+  SkillMarketInstallAction as ProtoSkillMarketInstallAction,
+  SkillMarketInstallConfirmationReason as ProtoSkillMarketInstallConfirmationReason,
+  SkillMarketInstallStatusState as ProtoSkillMarketInstallStatusState,
+  SkillMarketPreviewUnavailableReason as ProtoSkillMarketPreviewUnavailableReason,
+  SkillMarketSort,
+  SkillMarketSourceKind as ProtoSkillMarketSourceKind,
+  SkillMarketSourceState as ProtoSkillMarketSourceState,
+  SkillMarketSyncJobState as ProtoSkillMarketSyncJobState,
+  SkillMarketSyncOutcome as ProtoSkillMarketSyncOutcome,
+  SkillPublicationGateStatus as ProtoSkillPublicationGateStatus,
+  SkillPublicationMode as ProtoSkillPublicationMode,
+  SkillPublicationPublisher as ProtoSkillPublicationPublisher,
+  SkillPublicationState as ProtoSkillPublicationState,
+  SkillPublicationVerdict as ProtoSkillPublicationVerdict,
+  SkillPublicationVisibility as ProtoSkillPublicationVisibility,
+  SkillRecoveryStatus,
+  SkillService,
   SubagentActivityKind,
   SubagentControlAction,
   SubagentParentContext,
@@ -253,6 +293,7 @@ import {
   type BrowserProvider,
   type BrowserTransfer,
   type Connection,
+  type CollaborationDirectory as ProtoCollaborationDirectory,
   type ContextUsage as ProtoContextUsage,
   type CredentialDescriptor,
   type Device,
@@ -262,6 +303,22 @@ import {
   type Event,
   type ExtraDirectory,
   type ExtensionStatus,
+  type ExtensionCatalogEntry as ProtoExtensionCatalogEntry,
+  type ExtensionLibraryCallResult as ProtoExtensionLibraryCallResult,
+  type ExtensionLibraryEntry as ProtoExtensionLibraryEntry,
+  type ExtensionLibraryGraceEntry as ProtoExtensionLibraryGraceEntry,
+  type ExtensionLibraryLocation as ProtoExtensionLibraryLocation,
+  type ExtensionLibraryOverview as ProtoExtensionLibraryOverview,
+  type ExtensionLibrarySession as ProtoExtensionLibrarySession,
+  type ExtensionLibrarySqlResult as ProtoExtensionLibrarySqlResult,
+  type ExtensionLibrarySqlValue as ProtoExtensionLibrarySqlValue,
+  type ExtensionLibraryTrashEntry as ProtoExtensionLibraryTrashEntry,
+  type ExtensionMainViewSurface as ProtoExtensionMainViewSurface,
+  type ExtensionPackageExportAuthority as ProtoExtensionPackageExportAuthority,
+  type ExtensionPackageExportJob as ProtoExtensionPackageExportJob,
+  type ExtensionPackageExportPreview as ProtoExtensionPackageExportPreview,
+  type ExtensionPackagePreview as ProtoExtensionPackagePreview,
+  type ExtensionSourceDescriptor as ProtoExtensionSourceDescriptor,
   type ExtensionWidget,
   type FilePreview,
   type FileDiff,
@@ -289,6 +346,9 @@ import {
   type QuestionAnswer,
   type QuestionChoice,
   type QuestionField,
+  type ResourceUsageMetrics as ProtoResourceUsageMetrics,
+  type ResourceUsageReport as ProtoResourceUsageReport,
+  type ResourceUsageVersionBreakdown as ProtoResourceUsageVersionBreakdown,
   type Schedule,
   type SchedulerRuntimeSnapshot as ProtoSchedulerRuntimeSnapshot,
   type ScheduleRunHistory,
@@ -298,6 +358,36 @@ import {
   type SessionMessageSearchMatch,
   type Session,
   type SessionStatistics as ProtoSessionStatistics,
+  type SkillDescriptor as ProtoSkillDescriptor,
+  type SkillDiff as ProtoSkillDiff,
+  type SkillDiffChange as ProtoSkillDiffChange,
+  type SkillDraft as ProtoSkillDraft,
+  type SkillFileContent as ProtoSkillFileContent,
+  type SkillFileEntry as ProtoSkillFileEntry,
+  type SkillMarketArchiveEntry as ProtoSkillMarketArchiveEntry,
+  type SkillAccessPolicy as ProtoSkillAccessPolicy,
+  type SkillMarketEntry as ProtoSkillMarketEntry,
+  type SkillMarketEntryIdentity as ProtoSkillMarketEntryIdentity,
+  type SkillMarketInstallPlan as ProtoSkillMarketInstallPlan,
+  type SkillMarketInstallPreview as ProtoSkillMarketInstallPreview,
+  type SkillMarketInstallStatus as ProtoSkillMarketInstallStatus,
+  type SkillMarketInstallTarget as ProtoSkillMarketInstallTarget,
+  type SkillMarketPreview as ProtoSkillMarketPreview,
+  type SkillMarketPreviewFile as ProtoSkillMarketPreviewFile,
+  type SkillMarketSourceDescriptor as ProtoSkillMarketSourceDescriptor,
+  type SkillMarketSyncBaseline as ProtoSkillMarketSyncBaseline,
+  type SkillMarketSyncJob as ProtoSkillMarketSyncJob,
+  type SkillMarketSyncJobAuthority as ProtoSkillMarketSyncJobAuthority,
+  type SkillMarketSyncPolicy as ProtoSkillMarketSyncPolicy,
+  type SkillMarketSyncTarget as ProtoSkillMarketSyncTarget,
+  type SkillPublicationAuthority as ProtoSkillPublicationAuthority,
+  type SkillPublicationGate as ProtoSkillPublicationGate,
+  type SkillPublicationJob as ProtoSkillPublicationJob,
+  type SkillPublicationMetadata as ProtoSkillPublicationMetadata,
+  type SkillPublicationPreview as ProtoSkillPublicationPreview,
+  type SkillPublicationResult as ProtoSkillPublicationResult,
+  type SkillRecovery as ProtoSkillRecovery,
+  type SkillSession as ProtoSkillSession,
   type Snapshot,
   type Usage as ProtoUsage,
   type UsageCurrencyTotal as ProtoUsageCurrencyTotal,
@@ -372,6 +462,30 @@ import type {
   ErrorView,
   ExtraDirectoryView,
   ExtensionStatusView,
+  ExtensionCatalogEntryView,
+  ExtensionCatalogView,
+  ExtensionLibraryCallResultView,
+  ExtensionLibraryCallView,
+  ExtensionLibraryEntryView,
+  ExtensionLibraryGraceEntryView,
+  ExtensionLibraryLocationValidationView,
+  ExtensionLibraryLocationView,
+  ExtensionLibraryOverviewView,
+  ExtensionLibrarySessionView,
+  ExtensionLibrarySqlResultView,
+  ExtensionLibrarySqlValueView,
+  ExtensionLibraryTrashEntryView,
+  ExtensionMainViewIconView,
+  ExtensionMainViewSurfaceView,
+  ExtensionPackageExportAuthorityView,
+  ExtensionPackageExportCatalogView,
+  ExtensionPackageExportJobView,
+  ExtensionPackageExportPreviewView,
+  ExtensionPackagePreviewView,
+  ExtensionSourceCatalogView,
+  ExtensionSourceDraft,
+  ExtensionSourceGitPreflightView,
+  ExtensionSourceView,
   ExtensionWidgetView,
   InteractionView,
   InteractionResolutionDraft,
@@ -401,6 +515,10 @@ import type {
   ReviewRunView,
   ResourceView,
   ResourceDraft,
+  ResourceUsageMetricsView,
+  ResourceUsageReportView,
+  ResourceUsageSourceView,
+  ResourceUsageVersionBreakdownView,
   RuntimeCommandView,
   SessionResourceView,
   RuntimeProcessUsageSnapshotView,
@@ -430,6 +548,52 @@ import type {
   SessionView,
   SessionWorktreeRemovalPreviewView,
   SessionWorktreeView,
+  SkillCatalogView,
+  CollaborationDirectoryView,
+  CollaborationScopeKindView,
+  CollaborationScopeView,
+  SkillDescriptorView,
+  SkillDiffChangeView,
+  SkillDiffView,
+  SkillDraftView,
+  SkillFileContentView,
+  SkillFileEntryView,
+  SkillMarketArchiveEntryView,
+  SkillMarketArchivePageView,
+  SkillMarketCatalogPageView,
+  SkillMarketEntryIdentityView,
+  SkillMarketEntryView,
+  SkillAccessPolicyView,
+  SkillMarketGitPreflightView,
+  SkillMarketInstallPlanView,
+  SkillMarketInstallPreviewView,
+  SkillMarketInstallStatusView,
+  SkillMarketInstallTargetView,
+  SkillMarketPreviewFileView,
+  SkillMarketPreviewView,
+  SkillMarketSourceCatalogView,
+  SkillMarketSourceDraft,
+  SkillMarketSourceView,
+  SkillMarketSortView,
+  SkillMarketSyncBaselineView,
+  SkillMarketSyncCatalogView,
+  SkillMarketSyncJobAuthorityView,
+  SkillMarketSyncJobStateView,
+  SkillMarketSyncJobView,
+  SkillMarketSyncOutcomeView,
+  SkillMarketSyncPolicyView,
+  SkillMarketSyncTargetView,
+  SkillPublicationAuthorityView,
+  SkillPublicationAccessSelectionView,
+  SkillPublicationGateView,
+  SkillPublicationJobView,
+  SkillPublicationMetadataView,
+  SkillPublicationPreviewView,
+  SkillPublicationResultView,
+  SkillPublicationStateView,
+  SkillMutationResultView,
+  SkillRecoveryView,
+  SkillSessionView,
   SubagentControlActionView,
   SubagentRunDetailView,
   SubagentRunPageView,
@@ -592,6 +756,8 @@ const APP_VERSION = "0.1.0";
 const OPERATION_TERMINAL_WAIT_TIMEOUT_MS = 600_000;
 const MAX_COMPLETE_MESSAGE_SEARCH_PAGES = 10_000;
 const MAX_PORTABLE_SESSION_PACKAGE_BYTES = 256 * 1024 * 1024;
+const MAX_EXTENSION_SOURCE_DECLARED_ENTRIES = 512;
+const MAX_EXTENSION_SOURCE_EXTENSIONS = 2_048;
 const PAIRING_WINDOW_CLOSED_MESSAGE = "Pairing is not currently enabled by the owner.";
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const OWNER_SCOPE = { kind: { case: "owner" as const, value: {} } };
@@ -2692,6 +2858,859 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     await this.submit({ case: "removeResource", value: { resourceId } }, true);
   }
 
+  async listSkills(options: {
+    readonly query?: string;
+    readonly backendId?: string;
+    readonly targetId?: string;
+    readonly scope?: SkillDescriptorView["scope"];
+    readonly signal?: AbortSignal;
+  } = {}): Promise<SkillCatalogView> {
+    const scope = this.captureActionScope(options.signal);
+    const client = createClient(SkillService, scope.transport);
+    skillsCatalogAttempts:
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const skills: SkillDescriptorView[] = [];
+      const identities = new Set<string>();
+      const consumedTokens = new Set<string>();
+      let pageToken = "";
+      let revision: bigint | undefined;
+      let totalSize: number | undefined;
+      for (let pageIndex = 0; pageIndex < MAX_COMPLETE_MESSAGE_SEARCH_PAGES; pageIndex += 1) {
+        scope.signal.throwIfAborted();
+        const response = await client.listSkills({
+          query: options.query ?? "",
+          backendId: options.backendId ?? "",
+          targetId: options.targetId ?? "",
+          ...(options.scope === undefined ? {} : { scope: protoResourceScope(options.scope) }),
+          page: { pageSize: 500, pageToken }
+        }, { signal: scope.signal });
+        const pageRevision = response.catalogRevision?.value;
+        if (pageRevision === undefined) throw new GatewayError("The service returned Skills without a catalog revision.");
+        if (revision === undefined) revision = pageRevision;
+        else if (revision !== pageRevision) {
+          if (attempt === 0) continue skillsCatalogAttempts;
+          throw new GatewayError("Skills changed repeatedly while they were being loaded.");
+        }
+        const pageTotal = response.page === undefined ? undefined : exactSafeUnsignedNumber(response.page.totalSize);
+        if (pageTotal === undefined) throw new GatewayError("The service returned an invalid Skill catalog size.");
+        if (totalSize === undefined) totalSize = pageTotal;
+        else if (totalSize !== pageTotal) throw new GatewayError("The service returned inconsistent Skill catalog sizes.");
+        if (response.skills.length > 500 || skills.length + response.skills.length > pageTotal) {
+          throw new GatewayError("The service returned an invalid Skill catalog page.");
+        }
+        for (const value of response.skills) {
+          const mapped = mapSkillDescriptor(value);
+          if (identities.has(mapped.id)) throw new GatewayError("The service returned a duplicate Skill identity.");
+          identities.add(mapped.id);
+          skills.push(mapped);
+        }
+        const nextPageToken = response.page?.nextPageToken ?? "";
+        if (nextPageToken === "") {
+          if (skills.length !== pageTotal) throw new GatewayError("The service returned an incomplete Skill catalog.");
+          return { revision, skills };
+        }
+        if (nextPageToken === pageToken || consumedTokens.has(nextPageToken)) {
+          throw new GatewayError("The service returned a cyclic Skill catalog page token.");
+        }
+        consumedTokens.add(nextPageToken);
+        pageToken = nextPageToken;
+      }
+      throw new GatewayError("Skills exceeded the safe pagination limit.");
+    }
+    throw new GatewayError("Skills changed repeatedly while they were being loaded.");
+  }
+
+  async getSkillResourceUsageReport(
+    resourceId: string,
+    timeZone: string,
+    signal?: AbortSignal
+  ): Promise<ResourceUsageReportView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).getSkillResourceUsageReport(
+      { resourceId, timeZone },
+      { signal: scope.signal }
+    );
+    if (response.report === undefined) throw new GatewayError("The service returned an empty Resource usage report.");
+    return mapResourceUsageReport(response.report, resourceId, timeZone);
+  }
+
+  async openSkill(skillId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<SkillSessionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).openSkill({
+      skillId,
+      expectedResourceRevision: { value: expectedRevision }
+    }, { signal: scope.signal });
+    if (response.skill === undefined) throw new GatewayError("The service returned an empty Skill session.");
+    const session = mapSkillSession(response.skill);
+    try {
+      const files = await this.listSkillFiles(session.id, "", scope.signal);
+      return { ...session, files };
+    } catch (error) {
+      void this.closeSkill(session.id).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async listSkillFiles(sessionId: string, parentKey = "", signal?: AbortSignal): Promise<readonly SkillFileEntryView[]> {
+    const scope = this.captureActionScope(signal);
+    const client = createClient(SkillService, scope.transport);
+    const files: SkillFileEntryView[] = [];
+    const keys = new Set<string>();
+    const consumedTokens = new Set<string>();
+    let pageToken = "";
+    let totalSize: number | undefined;
+    for (let pageIndex = 0; pageIndex < MAX_COMPLETE_MESSAGE_SEARCH_PAGES; pageIndex += 1) {
+      scope.signal.throwIfAborted();
+      const response = await client.listSkillFiles(
+        { sessionId, parentKey, page: { pageSize: 500, pageToken } },
+        { signal: scope.signal }
+      );
+      const pageTotal = response.page === undefined ? undefined : exactSafeUnsignedNumber(response.page.totalSize);
+      if (pageTotal === undefined || pageTotal > 10_000 || (totalSize !== undefined && totalSize !== pageTotal)) {
+        throw new GatewayError("The service returned an invalid Skill file-list size.");
+      }
+      totalSize = pageTotal;
+      if (response.files.length > 500 || files.length + response.files.length > pageTotal) {
+        throw new GatewayError("The service returned an invalid Skill file-list page.");
+      }
+      for (const value of response.files) {
+        const mapped = mapSkillFileEntry(value);
+        if (keys.has(mapped.key)) throw new GatewayError("The service returned a duplicate Skill file key.");
+        keys.add(mapped.key);
+        files.push(mapped);
+      }
+      const nextPageToken = response.page?.nextPageToken ?? "";
+      if (nextPageToken === "") {
+        if (files.length !== pageTotal) throw new GatewayError("The service returned an incomplete Skill file list.");
+        return files;
+      }
+      if (nextPageToken === pageToken || consumedTokens.has(nextPageToken)) {
+        throw new GatewayError("The service returned a cyclic Skill file-list page token.");
+      }
+      consumedTokens.add(nextPageToken);
+      pageToken = nextPageToken;
+    }
+    throw new GatewayError("Skill files exceeded the safe pagination limit.");
+  }
+
+  async readSkillFile(sessionId: string, key: string, signal?: AbortSignal): Promise<SkillFileContentView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).readSkillFile(
+      { sessionId, key },
+      { signal: scope.signal }
+    );
+    if (response.file === undefined) throw new GatewayError("The service returned an empty Skill file.");
+    return mapSkillFileContent(response.file);
+  }
+
+  async getSkillDiff(sessionId: string, signal?: AbortSignal): Promise<SkillDiffView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).getSkillDiff(
+      { sessionId },
+      { signal: scope.signal }
+    );
+    if (response.diff === undefined) throw new GatewayError("The service returned an empty Skill diff.");
+    return mapSkillDiff(response.diff);
+  }
+
+  async prepareSkillFileEdit(
+    sessionId: string,
+    key: string,
+    expectedFileRevision: string,
+    content: string,
+    signal?: AbortSignal
+  ): Promise<SkillDraftView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).prepareSkillFileEdit(
+      { sessionId, key, expectedFileRevision, content },
+      { signal: scope.signal }
+    );
+    if (response.draft === undefined) throw new GatewayError("The service returned an empty Skill draft.");
+    return mapSkillDraft(response.draft);
+  }
+
+  async prepareSkillRename(sessionId: string, name: string, signal?: AbortSignal): Promise<SkillDraftView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).prepareSkillRename(
+      { sessionId, name },
+      { signal: scope.signal }
+    );
+    if (response.draft === undefined) throw new GatewayError("The service returned an empty Skill rename draft.");
+    return mapSkillDraft(response.draft);
+  }
+
+  async applySkillDraft(draft: SkillDraftView, signal?: AbortSignal): Promise<SkillMutationResultView> {
+    const scope = this.captureActionScope(signal);
+    return skillMutationResult(await this.submit(
+      { case: "applySkillDraft", value: { draftId: draft.id } },
+      true,
+      [],
+      scope.signal
+    ));
+  }
+
+  async setSkillEnabled(skill: SkillDescriptorView, enabled: boolean, signal?: AbortSignal): Promise<SkillMutationResultView> {
+    const scope = this.captureActionScope(signal);
+    return skillMutationResult(await this.submit({
+      case: "setSkillEnabled",
+      value: { skillId: skill.id, expectedResourceRevision: { value: skill.revision }, enabled }
+    }, true, [], scope.signal));
+  }
+
+  async deleteSkill(session: SkillSessionView, confirmation: string, signal?: AbortSignal): Promise<SkillMutationResultView> {
+    const scope = this.captureActionScope(signal);
+    return skillMutationResult(await this.submit({
+      case: "deleteSkill",
+      value: { sessionId: session.id, confirmation }
+    }, true, [], scope.signal));
+  }
+
+  async listSkillRecoveries(signal?: AbortSignal): Promise<readonly SkillRecoveryView[]> {
+    const scope = this.captureActionScope(signal);
+    const client = createClient(SkillService, scope.transport);
+    const recoveries: SkillRecoveryView[] = [];
+    const ids = new Set<string>();
+    const consumedTokens = new Set<string>();
+    let pageToken = "";
+    let totalSize: number | undefined;
+    for (let pageIndex = 0; pageIndex < MAX_COMPLETE_MESSAGE_SEARCH_PAGES; pageIndex += 1) {
+      scope.signal.throwIfAborted();
+      const response = await client.listSkillRecoveries(
+        { page: { pageSize: 500, pageToken } },
+        { signal: scope.signal }
+      );
+      const pageTotal = response.page === undefined ? undefined : exactSafeUnsignedNumber(response.page.totalSize);
+      if (pageTotal === undefined || (totalSize !== undefined && totalSize !== pageTotal)) {
+        throw new GatewayError("The service returned an invalid Skill recovery-list size.");
+      }
+      totalSize = pageTotal;
+      if (response.recoveries.length > 500 || recoveries.length + response.recoveries.length > pageTotal) {
+        throw new GatewayError("The service returned an invalid Skill recovery-list page.");
+      }
+      for (const value of response.recoveries) {
+        const mapped = mapSkillRecovery(value);
+        if (ids.has(mapped.id)) throw new GatewayError("The service returned a duplicate Skill recovery.");
+        ids.add(mapped.id);
+        recoveries.push(mapped);
+      }
+      const nextPageToken = response.page?.nextPageToken ?? "";
+      if (nextPageToken === "") {
+        if (recoveries.length !== pageTotal) throw new GatewayError("The service returned an incomplete Skill recovery list.");
+        return recoveries;
+      }
+      if (nextPageToken === pageToken || consumedTokens.has(nextPageToken)) {
+        throw new GatewayError("The service returned a cyclic Skill recovery-list page token.");
+      }
+      consumedTokens.add(nextPageToken);
+      pageToken = nextPageToken;
+    }
+    throw new GatewayError("Skill recoveries exceeded the safe pagination limit.");
+  }
+
+  async closeSkill(sessionId: string, signal?: AbortSignal): Promise<boolean> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).closeSkill({ sessionId }, { signal: scope.signal });
+    return response.closed;
+  }
+
+  async getSkillMarketGitPreflight(signal?: AbortSignal): Promise<SkillMarketGitPreflightView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport)
+      .getSkillMarketGitPreflight({}, { signal: scope.signal });
+    const preflight = response.preflight;
+    if (preflight === undefined || preflight.minimumVersion.trim() === "") {
+      throw new GatewayError("The service returned an incomplete Skill market Git preflight result.");
+    }
+    return {
+      available: preflight.available,
+      ...(preflight.version === undefined ? {} : { version: preflight.version }),
+      minimumVersion: preflight.minimumVersion
+    };
+  }
+
+  async listSkillMarketSources(signal?: AbortSignal): Promise<SkillMarketSourceCatalogView> {
+    const scope = this.captureActionScope(signal);
+    const client = createClient(SkillService, scope.transport);
+    sourceCatalogAttempts:
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const sources: SkillMarketSourceView[] = [];
+      const ids = new Set<string>();
+      const consumedTokens = new Set<string>();
+      let pageToken = "";
+      let revision: bigint | undefined;
+      let recoveredFromCorruption = false;
+      let totalSize: number | undefined;
+      for (let pageIndex = 0; pageIndex < MAX_COMPLETE_MESSAGE_SEARCH_PAGES; pageIndex += 1) {
+        scope.signal.throwIfAborted();
+        const response = await client.listSkillMarketSources(
+          { page: { pageSize: 500, pageToken } },
+          { signal: scope.signal }
+        );
+        const pageRevision = response.catalogRevision?.value;
+        if (pageRevision === undefined) throw new GatewayError("The service returned Skill market sources without a catalog revision.");
+        if (revision === undefined) {
+          revision = pageRevision;
+          recoveredFromCorruption = response.recoveredFromCorruption;
+        } else if (revision !== pageRevision || recoveredFromCorruption !== response.recoveredFromCorruption) {
+          if (attempt === 0) continue sourceCatalogAttempts;
+          throw new GatewayError("Skill market sources changed repeatedly while they were being loaded.");
+        }
+        const pageTotal = response.page === undefined ? undefined : exactSafeUnsignedNumber(response.page.totalSize);
+        if (pageTotal === undefined || (totalSize !== undefined && totalSize !== pageTotal)) {
+          throw new GatewayError("The service returned an invalid Skill market source catalog size.");
+        }
+        totalSize = pageTotal;
+        if (response.sources.length > 500 || sources.length + response.sources.length > pageTotal) {
+          throw new GatewayError("The service returned an invalid Skill market source page.");
+        }
+        for (const value of response.sources) {
+          const mapped = mapSkillMarketSource(value);
+          if (ids.has(mapped.id)) throw new GatewayError("The service returned a duplicate Skill market source identity.");
+          ids.add(mapped.id);
+          sources.push(mapped);
+        }
+        const nextPageToken = response.page?.nextPageToken ?? "";
+        if (nextPageToken === "") {
+          if (sources.length !== pageTotal) throw new GatewayError("The service returned an incomplete Skill market source catalog.");
+          return { revision, sources, recoveredFromCorruption };
+        }
+        if (nextPageToken === pageToken || consumedTokens.has(nextPageToken)) {
+          throw new GatewayError("The service returned a cyclic Skill market source page token.");
+        }
+        consumedTokens.add(nextPageToken);
+        pageToken = nextPageToken;
+      }
+      throw new GatewayError("Skill market sources exceeded the safe pagination limit.");
+    }
+    throw new GatewayError("Skill market sources changed repeatedly while they were being loaded.");
+  }
+
+  async addSkillMarketSource(
+    source: SkillMarketSourceDraft,
+    expectedCatalogRevision: bigint,
+    signal?: AbortSignal
+  ): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    await this.submit({
+      case: "addSkillMarketSource",
+      value: {
+        source: protoSkillMarketSource(source),
+        expectedCatalogRevision: { value: expectedCatalogRevision }
+      }
+    }, true, [], scope.signal);
+  }
+
+  async refreshSkillMarketSource(sourceId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    await this.submit({
+      case: "refreshSkillMarketSource",
+      value: { sourceId, expectedRevision: { value: expectedRevision } }
+    }, true, [], scope.signal);
+  }
+
+  async removeSkillMarketSource(sourceId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    await this.submit({
+      case: "removeSkillMarketSource",
+      value: { sourceId, expectedRevision: { value: expectedRevision } }
+    }, true, [], scope.signal);
+  }
+
+  async listSkillMarketCatalog(options: {
+    readonly expectedRevision?: bigint;
+    readonly query?: string;
+    readonly category?: string;
+    readonly sort?: SkillMarketSortView;
+    readonly pageToken?: string;
+    readonly pageSize?: number;
+    readonly signal?: AbortSignal;
+  } = {}): Promise<SkillMarketCatalogPageView> {
+    const scope = this.captureActionScope(options.signal);
+    const pageSize = Math.min(Math.max(Math.trunc(options.pageSize ?? 24), 1), 100);
+    const response = await createClient(SkillService, scope.transport).listSkillMarketCatalog({
+      ...(options.expectedRevision === undefined ? {} : { expectedCatalogRevision: { value: options.expectedRevision } }),
+      query: options.query?.trim() ?? "",
+      category: options.category?.trim() ?? "",
+      sort: protoSkillMarketSort(options.sort ?? "trending"),
+      page: { pageSize, pageToken: options.pageToken ?? "" }
+    }, { signal: scope.signal });
+    const revision = response.catalogRevision?.value;
+    const totalSize = response.page === undefined ? undefined : exactSafeUnsignedNumber(response.page.totalSize);
+    if (revision === undefined || totalSize === undefined || response.sourceCount < 0 || !Number.isSafeInteger(response.sourceCount)
+      || response.entries.length > pageSize || response.entries.length > totalSize) {
+      throw new GatewayError("The service returned an invalid Skill market catalog page.");
+    }
+    const identities = new Set<string>();
+    const entries = response.entries.map((value) => {
+      const entry = mapSkillMarketEntry(value);
+      const key = `${entry.identity.sourceId}\0${entry.identity.entryId}`;
+      if (identities.has(key)) throw new GatewayError("The service returned a duplicate Skill market entry identity.");
+      identities.add(key);
+      return entry;
+    });
+    if (response.page?.nextPageToken === "" && entries.length > totalSize) {
+      throw new GatewayError("The service returned an inconsistent Skill market catalog page.");
+    }
+    const categories = response.categories.map((value) => value.trim());
+    if (categories.some((value) => value === "") || new Set(categories).size !== categories.length) {
+      throw new GatewayError("The service returned invalid Skill market categories.");
+    }
+    return {
+      revision,
+      entries,
+      categories,
+      sourceCount: response.sourceCount,
+      totalSize,
+      ...(response.page?.nextPageToken ? { nextPageToken: response.page.nextPageToken } : {})
+    };
+  }
+
+  async getSkillMarketEntry(identity: SkillMarketEntryIdentityView, signal?: AbortSignal): Promise<SkillMarketEntryView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).getSkillMarketEntry(
+      { identity: protoSkillMarketIdentity(identity) },
+      { signal: scope.signal }
+    );
+    if (response.entry === undefined) throw new GatewayError("The service returned an empty Skill market entry.");
+    return mapSkillMarketEntry(response.entry);
+  }
+
+  async openSkillMarketPreview(identity: SkillMarketEntryIdentityView, signal?: AbortSignal): Promise<SkillMarketPreviewView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).openSkillMarketPreview(
+      { identity: protoSkillMarketIdentity(identity) },
+      { signal: scope.signal }
+    );
+    if (response.preview === undefined) throw new GatewayError("The service returned an empty Skill market preview.");
+    return mapSkillMarketPreview(response.preview);
+  }
+
+  async listSkillMarketPreviewFiles(
+    preview: SkillMarketPreviewView,
+    pageToken = "",
+    pageSize = 100,
+    signal?: AbortSignal
+  ): Promise<SkillMarketArchivePageView> {
+    const scope = this.captureActionScope(signal);
+    const size = Math.min(Math.max(Math.trunc(pageSize), 1), 500);
+    const response = await createClient(SkillService, scope.transport).listSkillMarketPreviewFiles({
+      previewId: preview.id,
+      expectedSnapshotRevision: preview.snapshotRevision,
+      page: { pageSize: size, pageToken }
+    }, { signal: scope.signal });
+    const totalSize = response.page === undefined ? undefined : exactSafeUnsignedNumber(response.page.totalSize);
+    if (response.snapshotRevision !== preview.snapshotRevision || totalSize === undefined
+      || response.files.length > size || response.files.length > totalSize) {
+      throw new GatewayError("The service returned an invalid Skill market preview file page.");
+    }
+    const keys = new Set<string>();
+    const files = response.files.map((value) => {
+      const file = mapSkillMarketArchiveEntry(value);
+      if (keys.has(file.key)) throw new GatewayError("The service returned a duplicate Skill market preview file key.");
+      keys.add(file.key);
+      return file;
+    });
+    return {
+      snapshotRevision: response.snapshotRevision,
+      files,
+      totalSize,
+      ...(response.page?.nextPageToken ? { nextPageToken: response.page.nextPageToken } : {})
+    };
+  }
+
+  async readSkillMarketPreviewFile(
+    preview: SkillMarketPreviewView,
+    key: string,
+    signal?: AbortSignal
+  ): Promise<SkillMarketPreviewFileView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).readSkillMarketPreviewFile({
+      previewId: preview.id,
+      expectedSnapshotRevision: preview.snapshotRevision,
+      key
+    }, { signal: scope.signal });
+    if (response.file === undefined) throw new GatewayError("The service returned an empty Skill market preview file.");
+    return mapSkillMarketPreviewFile(response.file, preview);
+  }
+
+  async closeSkillMarketPreview(previewId: string, signal?: AbortSignal): Promise<boolean> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).closeSkillMarketPreview(
+      { previewId },
+      { signal: scope.signal }
+    );
+    return response.closed;
+  }
+
+  async createSkillMarketInstallPlan(
+    identity: SkillMarketEntryIdentityView,
+    target: SkillMarketInstallTargetView,
+    signal?: AbortSignal
+  ): Promise<SkillMarketInstallPlanView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).createSkillMarketInstallPlan({
+      identity: protoSkillMarketIdentity(identity),
+      target: protoSkillMarketInstallTarget(target)
+    }, { signal: scope.signal });
+    if (response.plan === undefined) throw new GatewayError("The service returned an empty Skill market install plan.");
+    return mapSkillMarketInstallPlan(response.plan);
+  }
+
+  async getSkillMarketInstallPlan(planId: string, signal?: AbortSignal): Promise<SkillMarketInstallPlanView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).getSkillMarketInstallPlan(
+      { planId },
+      { signal: scope.signal }
+    );
+    if (response.plan === undefined) throw new GatewayError("The service returned an empty Skill market install plan.");
+    return mapSkillMarketInstallPlan(response.plan);
+  }
+
+  async closeSkillMarketInstallPlan(planId: string, signal?: AbortSignal): Promise<boolean> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).closeSkillMarketInstallPlan(
+      { planId },
+      { signal: scope.signal }
+    );
+    return response.closed;
+  }
+
+  async installSkillMarketPlan(
+    plan: SkillMarketInstallPlanView,
+    confirmReplacement: boolean,
+    signal?: AbortSignal
+  ): Promise<SkillMutationResultView> {
+    const scope = this.captureActionScope(signal);
+    return skillMutationResult(await this.submit({
+      case: "installSkillMarketPlan",
+      value: {
+        planId: plan.id,
+        expectedCandidateRevision: plan.preview.candidateRevision,
+        confirmReplacement
+      }
+    }, true, [], scope.signal));
+  }
+
+  async listSkillMarketSyncPolicies(signal?: AbortSignal): Promise<SkillMarketSyncCatalogView<SkillMarketSyncPolicyView>> {
+    const scope = this.captureActionScope(signal);
+    const client = createClient(SkillService, scope.transport);
+    const items: SkillMarketSyncPolicyView[] = [];
+    const identities = new Set<string>();
+    const consumedTokens = new Set<string>();
+    let pageToken = "";
+    let totalSize: number | undefined;
+    let recoveredFromCorruption: boolean | undefined;
+    for (let pageIndex = 0; pageIndex < MAX_COMPLETE_MESSAGE_SEARCH_PAGES; pageIndex += 1) {
+      const response = await client.listSkillMarketSyncPolicies(
+        { page: { pageSize: 500, pageToken } },
+        { signal: scope.signal }
+      );
+      const pageTotal = response.page === undefined ? undefined : exactSafeUnsignedNumber(response.page.totalSize);
+      if (pageTotal === undefined || (totalSize !== undefined && totalSize !== pageTotal)
+        || (recoveredFromCorruption !== undefined && recoveredFromCorruption !== response.recoveredFromCorruption)) {
+        throw new GatewayError("The service returned an inconsistent Skill market sync policy page.");
+      }
+      totalSize = pageTotal;
+      recoveredFromCorruption = response.recoveredFromCorruption;
+      for (const value of response.policies) {
+        const mapped = mapSkillMarketSyncPolicy(value);
+        if (identities.has(mapped.resourceId)) throw new GatewayError("The service returned a duplicate Skill market sync policy.");
+        identities.add(mapped.resourceId);
+        items.push(mapped);
+      }
+      if (items.length > pageTotal) throw new GatewayError("The service returned too many Skill market sync policies.");
+      const next = response.page?.nextPageToken ?? "";
+      if (next === "") {
+        if (items.length !== pageTotal) throw new GatewayError("The service returned an incomplete Skill market sync policy catalog.");
+        return { items, recoveredFromCorruption: recoveredFromCorruption ?? false };
+      }
+      if (next === pageToken || consumedTokens.has(next)) throw new GatewayError("The service returned a cyclic Skill market sync policy page token.");
+      consumedTokens.add(next);
+      pageToken = next;
+    }
+    throw new GatewayError("Skill market sync policies exceeded the safe pagination limit.");
+  }
+
+  async listSkillMarketSyncJobs(
+    resourceId?: string,
+    signal?: AbortSignal
+  ): Promise<SkillMarketSyncCatalogView<SkillMarketSyncJobView>> {
+    const scope = this.captureActionScope(signal);
+    const client = createClient(SkillService, scope.transport);
+    const items: SkillMarketSyncJobView[] = [];
+    const identities = new Set<string>();
+    const consumedTokens = new Set<string>();
+    let pageToken = "";
+    let totalSize: number | undefined;
+    let recoveredFromCorruption: boolean | undefined;
+    for (let pageIndex = 0; pageIndex < MAX_COMPLETE_MESSAGE_SEARCH_PAGES; pageIndex += 1) {
+      const response = await client.listSkillMarketSyncJobs({
+        ...(resourceId === undefined ? {} : { resourceId }),
+        page: { pageSize: 500, pageToken }
+      }, { signal: scope.signal });
+      const pageTotal = response.page === undefined ? undefined : exactSafeUnsignedNumber(response.page.totalSize);
+      if (pageTotal === undefined || (totalSize !== undefined && totalSize !== pageTotal)
+        || (recoveredFromCorruption !== undefined && recoveredFromCorruption !== response.recoveredFromCorruption)) {
+        throw new GatewayError("The service returned an inconsistent Skill market sync job page.");
+      }
+      totalSize = pageTotal;
+      recoveredFromCorruption = response.recoveredFromCorruption;
+      for (const value of response.jobs) {
+        const mapped = mapSkillMarketSyncJob(value);
+        if ((resourceId !== undefined && mapped.policyResourceId !== resourceId) || identities.has(mapped.id)) {
+          throw new GatewayError("The service returned an invalid Skill market sync job identity.");
+        }
+        identities.add(mapped.id);
+        items.push(mapped);
+      }
+      if (items.length > pageTotal) throw new GatewayError("The service returned too many Skill market sync jobs.");
+      const next = response.page?.nextPageToken ?? "";
+      if (next === "") {
+        if (items.length !== pageTotal) throw new GatewayError("The service returned an incomplete Skill market sync job catalog.");
+        return { items, recoveredFromCorruption: recoveredFromCorruption ?? false };
+      }
+      if (next === pageToken || consumedTokens.has(next)) throw new GatewayError("The service returned a cyclic Skill market sync job page token.");
+      consumedTokens.add(next);
+      pageToken = next;
+    }
+    throw new GatewayError("Skill market sync jobs exceeded the safe pagination limit.");
+  }
+
+  async getSkillMarketSyncJob(jobId: string, signal?: AbortSignal): Promise<SkillMarketSyncJobView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).getSkillMarketSyncJob(
+      { jobId },
+      { signal: scope.signal }
+    );
+    if (response.job === undefined) throw new GatewayError("The service returned an empty Skill market sync job.");
+    return mapSkillMarketSyncJob(response.job);
+  }
+
+  async enableSkillMarketSync(
+    resourceId: string,
+    expectedResourceRevision: bigint,
+    target: SkillMarketInstallTargetView,
+    signal?: AbortSignal
+  ): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    await this.submit({
+      case: "enableSkillMarketSync",
+      value: { resourceId, expectedResourceRevision: { value: expectedResourceRevision }, target: protoSkillMarketInstallTarget(target) }
+    }, true, [], scope.signal);
+  }
+
+  async disableSkillMarketSync(policy: SkillMarketSyncPolicyView, signal?: AbortSignal): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    await this.submit({
+      case: "disableSkillMarketSync",
+      value: { resourceId: policy.resourceId, expectedPolicyRevision: { value: policy.revision } }
+    }, true, [], scope.signal);
+  }
+
+  async enqueueSkillMarketSync(policy: SkillMarketSyncPolicyView, signal?: AbortSignal): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    await this.submit({
+      case: "enqueueSkillMarketSync",
+      value: { resourceId: policy.resourceId, expectedPolicyRevision: { value: policy.revision } }
+    }, true, [], scope.signal);
+  }
+
+  async cancelSkillMarketSync(job: SkillMarketSyncJobView, signal?: AbortSignal): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    await this.submit({
+      case: "cancelSkillMarketSync",
+      value: { jobId: job.id, expectedRevision: { value: job.revision } }
+    }, true, [], scope.signal);
+  }
+
+  async retrySkillMarketSync(job: SkillMarketSyncJobView, signal?: AbortSignal): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    await this.submit({
+      case: "retrySkillMarketSync",
+      value: { jobId: job.id, expectedRevision: { value: job.revision } }
+    }, true, [], scope.signal);
+  }
+
+  async getSkillPublicationPreview(
+    resourceId: string,
+    expectedResourceRevision: bigint,
+    sourceId: string,
+    expectedSourceRevision: bigint,
+    slug?: string,
+    signal?: AbortSignal
+  ): Promise<SkillPublicationPreviewView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).getSkillPublicationPreview({
+      resourceId,
+      expectedResourceRevision: { value: expectedResourceRevision },
+      sourceId,
+      expectedSourceRevision: { value: expectedSourceRevision },
+      ...(slug === undefined ? {} : { slug })
+    }, { signal: scope.signal });
+    if (response.preview === undefined) throw new GatewayError("The service returned an empty Skill publication preview.");
+    return mapSkillPublicationPreview(response.preview);
+  }
+
+  async listSkillPublicationJobs(
+    resourceId?: string,
+    signal?: AbortSignal
+  ): Promise<SkillMarketSyncCatalogView<SkillPublicationJobView>> {
+    const scope = this.captureActionScope(signal);
+    const client = createClient(SkillService, scope.transport);
+    const items: SkillPublicationJobView[] = [];
+    const identities = new Set<string>();
+    const consumedTokens = new Set<string>();
+    let pageToken = "";
+    let totalSize: number | undefined;
+    let recoveredFromCorruption: boolean | undefined;
+    for (let pageIndex = 0; pageIndex < MAX_COMPLETE_MESSAGE_SEARCH_PAGES; pageIndex += 1) {
+      const response = await client.listSkillPublicationJobs({
+        ...(resourceId === undefined ? {} : { resourceId }),
+        page: { pageSize: 500, pageToken }
+      }, { signal: scope.signal });
+      const pageTotal = response.page === undefined ? undefined : exactSafeUnsignedNumber(response.page.totalSize);
+      if (pageTotal === undefined || (totalSize !== undefined && totalSize !== pageTotal)
+        || (recoveredFromCorruption !== undefined && recoveredFromCorruption !== response.recoveredFromCorruption)) {
+        throw new GatewayError("The service returned an inconsistent Skill publication page.");
+      }
+      totalSize = pageTotal;
+      recoveredFromCorruption = response.recoveredFromCorruption;
+      for (const value of response.jobs) {
+        const mapped = mapSkillPublicationJob(value);
+        if ((resourceId !== undefined && mapped.authority.resourceId !== resourceId) || identities.has(mapped.id)) {
+          throw new GatewayError("The service returned an invalid Skill publication identity.");
+        }
+        identities.add(mapped.id);
+        items.push(mapped);
+      }
+      if (items.length > pageTotal) throw new GatewayError("The service returned too many Skill publication jobs.");
+      const next = response.page?.nextPageToken ?? "";
+      if (next === "") {
+        if (items.length !== pageTotal) throw new GatewayError("The service returned an incomplete Skill publication catalog.");
+        return { items, recoveredFromCorruption: recoveredFromCorruption ?? false };
+      }
+      if (next === pageToken || consumedTokens.has(next)) throw new GatewayError("The service returned a cyclic Skill publication page token.");
+      consumedTokens.add(next);
+      pageToken = next;
+    }
+    throw new GatewayError("Skill publications exceeded the safe pagination limit.");
+  }
+
+  async getSkillPublicationJob(jobId: string, signal?: AbortSignal): Promise<SkillPublicationJobView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).getSkillPublicationJob(
+      { jobId },
+      { signal: scope.signal }
+    );
+    if (response.job === undefined) throw new GatewayError("The service returned an empty Skill publication job.");
+    return mapSkillPublicationJob(response.job);
+  }
+
+  async getCollaborationDirectory(signal?: AbortSignal): Promise<CollaborationDirectoryView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).getCollaborationDirectory({}, { signal: scope.signal });
+    if (response.directory === undefined) throw new GatewayError("The service returned an empty collaboration directory.");
+    return mapCollaborationDirectory(response.directory);
+  }
+
+  async createCollaborationScope(
+    kind: CollaborationScopeKindView,
+    name: string,
+    expectedCatalogRevision: bigint,
+    signal?: AbortSignal
+  ): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    await this.submit({
+      case: "createCollaborationScope",
+      value: {
+        expectedCatalogRevision: { value: expectedCatalogRevision },
+        kind: protoCollaborationScopeKind(kind),
+        name
+      }
+    }, true, [], scope.signal);
+  }
+
+  async updateCollaborationScope(scopeValue: CollaborationScopeView, name: string, signal?: AbortSignal): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    await this.submit({
+      case: "updateCollaborationScope",
+      value: { scopeId: scopeValue.id, expectedRevision: { value: scopeValue.revision }, name }
+    }, true, [], scope.signal);
+  }
+
+  async deleteCollaborationScope(scopeValue: CollaborationScopeView, signal?: AbortSignal): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    await this.submit({
+      case: "deleteCollaborationScope",
+      value: { scopeId: scopeValue.id, expectedRevision: { value: scopeValue.revision } }
+    }, true, [], scope.signal);
+  }
+
+  async updateSkillMarketAccess(
+    entry: SkillMarketEntryView,
+    collaborationRevision: bigint,
+    selection: SkillPublicationAccessSelectionView,
+    signal?: AbortSignal
+  ): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    await this.submit({
+      case: "updateSkillMarketAccess",
+      value: {
+        identity: protoSkillMarketIdentity(entry.identity),
+        expectedAccessRevision: { value: entry.access.revision },
+        expectedCollaborationRevision: { value: collaborationRevision },
+        publisher: protoSkillPublicationPublisher(selection.publisher),
+        ...(selection.publisherScopeId === undefined ? {} : { publisherScopeId: selection.publisherScopeId }),
+        visibility: protoSkillPublicationVisibility(selection.visibility),
+        audienceScopeIds: [...selection.audienceScopeIds]
+      }
+    }, true, [], scope.signal);
+  }
+
+  async startSkillPublication(
+    preview: SkillPublicationPreviewView,
+    metadata: SkillPublicationMetadataView,
+    access: SkillPublicationAccessSelectionView,
+    signal?: AbortSignal
+  ): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    const authority = preview.authority;
+    await this.submit({
+      case: "startSkillPublication",
+      value: {
+        resourceId: authority.resourceId,
+        expectedResourceRevision: { value: authority.resourceRevision },
+        expectedObservedRevision: authority.observedRevision,
+        sourceId: authority.sourceId,
+        expectedSourceRevision: { value: authority.sourceRevision },
+        expectedSourceContentRevision: authority.sourceContentRevision,
+        ...(authority.existingEntryId === undefined ? {} : { expectedExistingEntryId: authority.existingEntryId }),
+        expectedCollaborationRevision: { value: preview.collaborationRevision },
+        metadata: protoSkillPublicationMetadata(metadata),
+        publisher: protoSkillPublicationPublisher(access.publisher),
+        ...(access.publisherScopeId === undefined ? {} : { publisherScopeId: access.publisherScopeId }),
+        visibility: protoSkillPublicationVisibility(access.visibility),
+        audienceScopeIds: [...access.audienceScopeIds]
+      }
+    }, true, [], scope.signal);
+  }
+
+  async cancelSkillPublication(job: SkillPublicationJobView, signal?: AbortSignal): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    await this.submit({
+      case: "cancelSkillPublication",
+      value: { jobId: job.id, expectedRevision: { value: job.revision } }
+    }, true, [], scope.signal);
+  }
+
+  async retrySkillPublication(job: SkillPublicationJobView, signal?: AbortSignal): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    await this.submit({
+      case: "retrySkillPublication",
+      value: { jobId: job.id, expectedRevision: { value: job.revision } }
+    }, true, [], scope.signal);
+  }
+
   async listCommands(sessionId: string): Promise<readonly RuntimeCommandView[]> {
     const client = createClient(SessionService, this.requireTransport());
     const response = await client.listRuntimeCommands({ sessionId }, this.#abort === undefined ? undefined : { signal: this.#abort.signal });
@@ -2871,6 +3890,678 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     );
     if (response.catalog === undefined) throw new GatewayError("Orchestrator returned an empty runtime tool catalog.");
     return mapRuntimeToolCatalog(response.catalog);
+  }
+
+  async listExtensions(options: {
+    readonly source?: ExtensionCatalogEntryView["source"];
+    readonly installed?: boolean;
+    readonly query?: string;
+    readonly sessionId?: string;
+    readonly signal?: AbortSignal;
+  } = {}): Promise<ExtensionCatalogView> {
+    const scope = this.captureActionScope(options.signal);
+    const client = createClient(ExtensionService, scope.transport);
+    extensionCatalogAttempts:
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const extensions: ExtensionCatalogEntryView[] = [];
+      const ids = new Set<string>();
+      const consumedTokens = new Set<string>();
+      let pageToken = "";
+      let revision: bigint | undefined;
+      let recoveredFromCorruption = false;
+      let totalSize: number | undefined;
+      for (let pageIndex = 0; pageIndex < MAX_COMPLETE_MESSAGE_SEARCH_PAGES; pageIndex += 1) {
+        scope.signal.throwIfAborted();
+        const response = await client.listExtensions({
+          ...(options.source === undefined ? {} : {
+            source: options.source === "local" ? ProtoExtensionCatalogSource.LOCAL : ProtoExtensionCatalogSource.MARKET
+          }),
+          ...(options.installed === undefined ? {} : { installed: options.installed }),
+          query: options.query ?? "",
+          ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
+          page: { pageSize: 500, pageToken }
+        }, { signal: scope.signal });
+        const pageRevision = response.catalogRevision?.value;
+        if (pageRevision === undefined) throw new GatewayError("Orchestrator returned an Extension catalog without its revision.");
+        if (revision === undefined) {
+          revision = pageRevision;
+          recoveredFromCorruption = response.recoveredFromCorruption;
+        } else if (revision !== pageRevision || recoveredFromCorruption !== response.recoveredFromCorruption) {
+          if (attempt === 0) continue extensionCatalogAttempts;
+          throw new GatewayError("Extension catalog changed repeatedly while it was being loaded.");
+        }
+        const pageTotal = response.page === undefined ? undefined : exactSafeUnsignedNumber(response.page.totalSize);
+        if (pageTotal === undefined) throw new GatewayError("Orchestrator returned an invalid Extension catalog size.");
+        if (totalSize === undefined) totalSize = pageTotal;
+        else if (totalSize !== pageTotal) throw new GatewayError("Orchestrator returned inconsistent Extension catalog sizes.");
+        if (response.extensions.length > 500 || extensions.length + response.extensions.length > pageTotal) {
+          throw new GatewayError("Orchestrator returned an invalid Extension catalog page.");
+        }
+        for (const value of response.extensions) {
+          const mapped = mapExtensionCatalogEntry(value);
+          if (ids.has(mapped.id)) throw new GatewayError("Orchestrator returned a duplicate Extension identity.");
+          ids.add(mapped.id);
+          extensions.push(mapped);
+        }
+        const nextPageToken = response.page?.nextPageToken ?? "";
+        if (nextPageToken === "") {
+          if (extensions.length !== pageTotal) throw new GatewayError("Orchestrator returned an incomplete Extension catalog.");
+          return { revision, extensions, recoveredFromCorruption };
+        }
+        if (nextPageToken === pageToken || consumedTokens.has(nextPageToken)) {
+          throw new GatewayError("Orchestrator returned a cyclic Extension catalog page token.");
+        }
+        consumedTokens.add(nextPageToken);
+        pageToken = nextPageToken;
+      }
+      throw new GatewayError("Extension catalog exceeded the safe pagination limit.");
+    }
+    throw new GatewayError("Extension catalog changed repeatedly while it was being loaded.");
+  }
+
+  async getExtension(extensionId: string, sessionId?: string, signal?: AbortSignal): Promise<ExtensionCatalogView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).getExtension({
+      extensionId,
+      ...(sessionId === undefined ? {} : { sessionId })
+    }, { signal: scope.signal });
+    if (response.extension === undefined || response.catalogRevision?.value === undefined) {
+      throw new GatewayError("Orchestrator returned an incomplete Extension detail.");
+    }
+    return {
+      revision: response.catalogRevision.value,
+      extensions: [mapExtensionCatalogEntry(response.extension)],
+      recoveredFromCorruption: response.recoveredFromCorruption
+    };
+  }
+
+  async openExtensionMainView(
+    extensionId: string,
+    expectedRevision: bigint,
+    signal?: AbortSignal
+  ): Promise<ExtensionMainViewSurfaceView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).openExtensionMainView({
+      extensionId,
+      expectedRevision: { value: expectedRevision }
+    }, { signal: scope.signal });
+    if (response.surface === undefined) throw new GatewayError("Orchestrator returned an empty Extension main view.");
+    return mapExtensionMainViewSurface(response.surface);
+  }
+
+  async getExtensionMainViewSurface(surfaceId: string, signal?: AbortSignal): Promise<ExtensionMainViewSurfaceView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).getExtensionMainViewSurface(
+      { surfaceId },
+      { signal: scope.signal }
+    );
+    if (response.surface === undefined) throw new GatewayError("Orchestrator returned an empty Extension main-view probe.");
+    return mapExtensionMainViewSurface(response.surface);
+  }
+
+  async closeExtensionMainView(surfaceId: string, signal?: AbortSignal): Promise<boolean> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).closeExtensionMainView(
+      { surfaceId },
+      { signal: scope.signal }
+    );
+    return response.closed;
+  }
+
+  async getExtensionLibraryOverview(
+    extensionId: string,
+    expectedRevision: bigint,
+    signal?: AbortSignal
+  ): Promise<ExtensionLibraryOverviewView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).getExtensionLibraryOverview({
+      extensionId,
+      expectedRevision: { value: expectedRevision }
+    }, { signal: scope.signal });
+    if (response.library === undefined) throw new GatewayError("Orchestrator returned an empty Extension Library overview.");
+    return mapExtensionLibraryOverview(response.library);
+  }
+
+  async validateExtensionLibraryLocation(
+    extensionId: string,
+    expectedRevision: bigint,
+    candidate: string,
+    signal?: AbortSignal
+  ): Promise<ExtensionLibraryLocationValidationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).validateExtensionLibraryLocation({
+      extensionId,
+      expectedRevision: { value: expectedRevision },
+      candidate
+    }, { signal: scope.signal });
+    if (response.validation === undefined) throw new GatewayError("Orchestrator returned an empty Extension Library location validation.");
+    return {
+      libraryRoot: response.validation.libraryRoot,
+      warnings: [...response.validation.warnings],
+      ...(response.validation.diskFreeBytes === undefined ? {} : { diskFreeBytes: response.validation.diskFreeBytes })
+    };
+  }
+
+  async relocateExtensionLibrary(
+    extensionId: string,
+    expectedRevision: bigint,
+    destination: { readonly kind: "default" } | { readonly kind: "custom"; readonly candidate: string },
+    signal?: AbortSignal
+  ): Promise<{ readonly changed: boolean; readonly migrationId?: string; readonly location: ExtensionLibraryLocationView; readonly files: number; readonly bytes: bigint; readonly warnings: readonly string[]; readonly graceId?: string }> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).relocateExtensionLibrary({
+      extensionId,
+      expectedRevision: { value: expectedRevision },
+      destinationKind: destination.kind === "default"
+        ? ProtoExtensionLibraryLocationKind.DEFAULT
+        : ProtoExtensionLibraryLocationKind.CUSTOM,
+      ...(destination.kind === "custom" ? { candidate: destination.candidate } : {})
+    }, { signal: scope.signal });
+    if (response.location === undefined) throw new GatewayError("Orchestrator returned an incomplete Extension Library relocation.");
+    return {
+      changed: response.changed,
+      ...(response.migrationId === undefined ? {} : { migrationId: response.migrationId }),
+      location: mapExtensionLibraryLocation(response.location),
+      files: response.files,
+      bytes: response.bytes,
+      warnings: [...response.warnings],
+      ...(response.graceId === undefined ? {} : { graceId: response.graceId })
+    };
+  }
+
+  async rebindExtensionLibrary(
+    extensionId: string,
+    expectedRevision: bigint,
+    candidate: string,
+    signal?: AbortSignal
+  ): Promise<{ readonly location: ExtensionLibraryLocationView; readonly warnings: readonly string[] }> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).rebindExtensionLibrary({
+      extensionId,
+      expectedRevision: { value: expectedRevision },
+      candidate
+    }, { signal: scope.signal });
+    if (response.location === undefined) throw new GatewayError("Orchestrator returned an incomplete Extension Library rebind.");
+    return { location: mapExtensionLibraryLocation(response.location), warnings: [...response.warnings] };
+  }
+
+  async unbindExtensionLibrary(
+    extensionId: string,
+    expectedRevision: bigint,
+    signal?: AbortSignal
+  ): Promise<{ readonly detachedPath?: string }> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).unbindExtensionLibrary({
+      extensionId,
+      expectedRevision: { value: expectedRevision }
+    }, { signal: scope.signal });
+    return { ...(response.detachedPath === undefined ? {} : { detachedPath: response.detachedPath }) };
+  }
+
+  async repairExtensionLibraryState(signal?: AbortSignal): Promise<{ readonly recoveredFromPrevious: boolean; readonly bindings: number; readonly trash: number }> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).repairExtensionLibraryState({}, { signal: scope.signal });
+    return { recoveredFromPrevious: response.recoveredFromPrevious, bindings: response.bindings, trash: response.trash };
+  }
+
+  async repairExtensionLibraryMetadata(
+    extensionId: string,
+    expectedRevision: bigint,
+    signal?: AbortSignal
+  ): Promise<ExtensionLibraryOverviewView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).repairExtensionLibraryMetadata({
+      extensionId,
+      expectedRevision: { value: expectedRevision }
+    }, { signal: scope.signal });
+    if (response.library === undefined) throw new GatewayError("Orchestrator returned an empty repaired Extension Library.");
+    return mapExtensionLibraryOverview(response.library);
+  }
+
+  async trashExtensionLibrary(
+    extensionId: string,
+    expectedRevision: bigint,
+    confirmation: string,
+    signal?: AbortSignal
+  ): Promise<ExtensionLibraryTrashEntryView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).trashExtensionLibrary({
+      extensionId,
+      expectedRevision: { value: expectedRevision },
+      confirmation
+    }, { signal: scope.signal });
+    if (response.trash === undefined) throw new GatewayError("Orchestrator returned an empty Extension Library trash record.");
+    return mapExtensionLibraryTrash(response.trash);
+  }
+
+  async listExtensionLibraryTrash(extensionId?: string, signal?: AbortSignal): Promise<readonly ExtensionLibraryTrashEntryView[]> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).listExtensionLibraryTrash(
+      { ...(extensionId === undefined ? {} : { extensionId }) },
+      { signal: scope.signal }
+    );
+    return response.trash.map(mapExtensionLibraryTrash);
+  }
+
+  async restoreExtensionLibraryTrash(
+    trashId: string,
+    confirmation: string,
+    destination?: { readonly kind: "default" } | { readonly kind: "custom"; readonly candidate: string },
+    signal?: AbortSignal
+  ): Promise<{ readonly extensionId: string; readonly location: ExtensionLibraryLocationView }> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).restoreExtensionLibraryTrash({
+      trashId,
+      confirmation,
+      destinationKind: destination === undefined
+        ? ProtoExtensionLibraryLocationKind.UNSPECIFIED
+        : destination.kind === "default"
+          ? ProtoExtensionLibraryLocationKind.DEFAULT
+          : ProtoExtensionLibraryLocationKind.CUSTOM,
+      ...(destination?.kind === "custom" ? { candidate: destination.candidate } : {})
+    }, { signal: scope.signal });
+    if (response.location === undefined || response.extensionId.length === 0) {
+      throw new GatewayError("Orchestrator returned an incomplete Extension Library restore.");
+    }
+    return { extensionId: response.extensionId, location: mapExtensionLibraryLocation(response.location) };
+  }
+
+  async purgeExtensionLibraryTrash(trashId: string, confirmation: string, signal?: AbortSignal): Promise<boolean> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).purgeExtensionLibraryTrash(
+      { trashId, confirmation },
+      { signal: scope.signal }
+    );
+    return response.purged;
+  }
+
+  async listExtensionLibraryGrace(extensionId?: string, signal?: AbortSignal): Promise<readonly ExtensionLibraryGraceEntryView[]> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).listExtensionLibraryGrace(
+      { ...(extensionId === undefined ? {} : { extensionId }) },
+      { signal: scope.signal }
+    );
+    return response.grace.map(mapExtensionLibraryGrace);
+  }
+
+  async rollbackExtensionLibrary(
+    extensionId: string,
+    expectedRevision: bigint,
+    graceId: string,
+    signal?: AbortSignal
+  ): Promise<{ readonly location: ExtensionLibraryLocationView; readonly graceId: string }> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).rollbackExtensionLibrary({
+      extensionId,
+      expectedRevision: { value: expectedRevision },
+      graceId
+    }, { signal: scope.signal });
+    if (response.location === undefined || response.graceId.length === 0) {
+      throw new GatewayError("Orchestrator returned an incomplete Extension Library rollback.");
+    }
+    return { location: mapExtensionLibraryLocation(response.location), graceId: response.graceId };
+  }
+
+  async purgeExpiredExtensionLibraries(signal?: AbortSignal): Promise<{ readonly trash: number; readonly grace: number }> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).purgeExpiredExtensionLibraries({}, { signal: scope.signal });
+    return { trash: response.trash, grace: response.grace };
+  }
+
+  async openExtensionLibrary(
+    extensionId: string,
+    expectedRevision: bigint,
+    signal?: AbortSignal
+  ): Promise<ExtensionLibrarySessionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).openExtensionLibrary({
+      extensionId,
+      expectedRevision: { value: expectedRevision }
+    }, { signal: scope.signal });
+    if (response.library === undefined) throw new GatewayError("Orchestrator returned an empty Extension Library session.");
+    return mapExtensionLibrarySession(response.library);
+  }
+
+  async callExtensionLibrary(
+    sessionId: string,
+    call: ExtensionLibraryCallView,
+    signal?: AbortSignal
+  ): Promise<ExtensionLibraryCallResultView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).callExtensionLibrary({
+      sessionId,
+      call: mapExtensionLibraryCall(call)
+    }, { signal: scope.signal });
+    if (response.result === undefined) throw new GatewayError("Orchestrator returned an empty Extension Library call result.");
+    return mapExtensionLibraryCallResult(response.result);
+  }
+
+  async closeExtensionLibrary(sessionId: string, signal?: AbortSignal): Promise<boolean> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).closeExtensionLibrary(
+      { sessionId },
+      { signal: scope.signal }
+    );
+    return response.closed;
+  }
+
+  async getExtensionPackagePreview(
+    extensionId: string,
+    expectedRevision: bigint,
+    backendId: string,
+    signal?: AbortSignal
+  ): Promise<ExtensionPackagePreviewView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).getExtensionPackagePreview({
+      extensionId,
+      expectedRevision: { value: expectedRevision },
+      backendId
+    }, { signal: scope.signal });
+    if (response.preview === undefined) throw new GatewayError("Orchestrator returned an empty Extension package preview.");
+    return mapExtensionPackagePreview(response.preview);
+  }
+
+  async adoptExtensionPackage(
+    preview: ExtensionPackagePreviewView,
+    allowSourceReplacement = false,
+    signal?: AbortSignal
+  ): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    await this.submit({
+      case: "adoptExtensionPackage",
+      value: {
+        extensionId: preview.extensionId,
+        expectedRevision: { value: preview.extensionRevision },
+        backendId: preview.backendId,
+        expectedAction: protoExtensionPackageAction(preview.action),
+        expectedCurrentResourceId: preview.currentResource?.resourceId ?? "",
+        ...(preview.currentResource === undefined
+          ? {}
+          : { expectedCurrentResourceRevision: { value: preview.currentResource.resourceRevision } }),
+        allowSourceReplacement
+      }
+    }, true, [], scope.signal);
+  }
+
+  async removeExtensionPackage(extensionId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    await this.submit({
+      case: "removeExtensionPackage",
+      value: { extensionId, expectedRevision: { value: expectedRevision } }
+    }, true, [], scope.signal);
+  }
+
+  async getExtensionPackageExportPreview(
+    extensionId: string,
+    expectedRevision: bigint,
+    signal?: AbortSignal
+  ): Promise<ExtensionPackageExportPreviewView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).getExtensionPackageExportPreview({
+      extensionId,
+      expectedRevision: { value: expectedRevision }
+    }, { signal: scope.signal });
+    if (response.preview === undefined) throw new GatewayError("Orchestrator returned an empty Extension package export preview.");
+    return {
+      ...mapExtensionPackageExportPreview(response.preview),
+      recoveredFromCorruption: response.recoveredFromCorruption
+    };
+  }
+
+  async listExtensionPackageExports(
+    extensionId?: string,
+    signal?: AbortSignal
+  ): Promise<ExtensionPackageExportCatalogView> {
+    const scope = this.captureActionScope(signal);
+    const client = createClient(ExtensionService, scope.transport);
+    const exports: ExtensionPackageExportJobView[] = [];
+    const identities = new Set<string>();
+    const consumedTokens = new Set<string>();
+    let pageToken = "";
+    let recoveredFromCorruption: boolean | undefined;
+    let totalSize: number | undefined;
+    for (let pageIndex = 0; pageIndex < MAX_COMPLETE_MESSAGE_SEARCH_PAGES; pageIndex += 1) {
+      scope.signal.throwIfAborted();
+      const response = await client.listExtensionPackageExports({
+        ...(extensionId === undefined ? {} : { extensionId }),
+        page: { pageSize: 500, pageToken }
+      }, { signal: scope.signal });
+      if (recoveredFromCorruption === undefined) recoveredFromCorruption = response.recoveredFromCorruption;
+      else if (recoveredFromCorruption !== response.recoveredFromCorruption) {
+        throw new GatewayError("Extension package export recovery state changed while it was being loaded.");
+      }
+      const pageTotal = response.page === undefined ? undefined : exactSafeUnsignedNumber(response.page.totalSize);
+      if (pageTotal === undefined) throw new GatewayError("Orchestrator returned an invalid Extension package export catalog size.");
+      if (totalSize === undefined) totalSize = pageTotal;
+      else if (totalSize !== pageTotal) throw new GatewayError("Orchestrator returned inconsistent Extension package export catalog sizes.");
+      if (response.exports.length > 500 || exports.length + response.exports.length > pageTotal) {
+        throw new GatewayError("Orchestrator returned an invalid Extension package export page.");
+      }
+      for (const value of response.exports) {
+        const mapped = mapExtensionPackageExportJob(value);
+        if (extensionId !== undefined && mapped.authority.extensionId !== extensionId) {
+          throw new GatewayError("Orchestrator returned an Extension package export outside the requested owner.");
+        }
+        if (identities.has(mapped.id)) throw new GatewayError("Orchestrator returned a duplicate Extension package export identity.");
+        identities.add(mapped.id);
+        exports.push(mapped);
+      }
+      const nextPageToken = response.page?.nextPageToken ?? "";
+      if (nextPageToken === "") {
+        if (exports.length !== pageTotal) throw new GatewayError("Orchestrator returned an incomplete Extension package export catalog.");
+        return { exports, recoveredFromCorruption: recoveredFromCorruption ?? false };
+      }
+      if (nextPageToken === pageToken || consumedTokens.has(nextPageToken)) {
+        throw new GatewayError("Orchestrator returned a cyclic Extension package export page token.");
+      }
+      consumedTokens.add(nextPageToken);
+      pageToken = nextPageToken;
+    }
+    throw new GatewayError("Extension package exports exceeded the safe pagination limit.");
+  }
+
+  async getExtensionPackageExport(exportId: string, signal?: AbortSignal): Promise<ExtensionPackageExportJobView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).getExtensionPackageExport(
+      { exportId },
+      { signal: scope.signal }
+    );
+    if (response.export === undefined) throw new GatewayError("Orchestrator returned an empty Extension package export.");
+    return mapExtensionPackageExportJob(response.export);
+  }
+
+  async startExtensionPackageExport(
+    preview: ExtensionPackageExportPreviewView,
+    signal?: AbortSignal
+  ): Promise<ExtensionPackageExportJobView> {
+    const scope = this.captureActionScope(signal);
+    const operation = await this.submit({
+      case: "startExtensionPackageExport",
+      value: {
+        extensionId: preview.extensionId,
+        expectedExtensionRevision: { value: preview.extensionRevision },
+        resourceId: preview.resourceId,
+        expectedResourceRevision: { value: preview.resourceRevision },
+        backendId: preview.backendId,
+        expectedBackendRevision: { value: preview.backendRevision },
+        expectedBackendGeneration: BigInt(preview.backendGeneration)
+      }
+    }, true, [], scope.signal);
+    if (operation.operationId.trim() === "") throw new GatewayError("Orchestrator returned an Extension package export without an identity.");
+    return this.getExtensionPackageExport(operation.operationId, scope.signal);
+  }
+
+  async cancelExtensionPackageExport(
+    exportId: string,
+    expectedRevision: bigint,
+    signal?: AbortSignal
+  ): Promise<ExtensionPackageExportJobView> {
+    const scope = this.captureActionScope(signal);
+    await this.submit({
+      case: "cancelExtensionPackageExport",
+      value: { exportId, expectedRevision: { value: expectedRevision } }
+    }, true, [], scope.signal);
+    return this.getExtensionPackageExport(exportId, scope.signal);
+  }
+
+  async getExtensionSourceGitPreflight(signal?: AbortSignal): Promise<ExtensionSourceGitPreflightView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport)
+      .getExtensionSourceGitPreflight({}, { signal: scope.signal });
+    const preflight = response.preflight;
+    if (preflight === undefined || preflight.minimumVersion.trim() === "") {
+      throw new GatewayError("Orchestrator returned an incomplete Extension source preflight result.");
+    }
+    return {
+      available: preflight.available,
+      ...(preflight.version === undefined ? {} : { version: preflight.version }),
+      minimumVersion: preflight.minimumVersion
+    };
+  }
+
+  async listExtensionSources(signal?: AbortSignal): Promise<ExtensionSourceCatalogView> {
+    const scope = this.captureActionScope(signal);
+    const client = createClient(ExtensionService, scope.transport);
+    sourceCatalogAttempts:
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const sources: ExtensionSourceView[] = [];
+      const ids = new Set<string>();
+      const consumedTokens = new Set<string>();
+      let pageToken = "";
+      let revision: bigint | undefined;
+      let recoveredFromCorruption = false;
+      let totalSize: number | undefined;
+      for (let pageIndex = 0; pageIndex < MAX_COMPLETE_MESSAGE_SEARCH_PAGES; pageIndex += 1) {
+        scope.signal.throwIfAborted();
+        const response = await client.listExtensionSources({ page: { pageSize: 500, pageToken } }, { signal: scope.signal });
+        const pageRevision = response.catalogRevision?.value;
+        if (pageRevision === undefined) throw new GatewayError("Orchestrator returned Extension sources without a catalog revision.");
+        if (revision === undefined) {
+          revision = pageRevision;
+          recoveredFromCorruption = response.recoveredFromCorruption;
+        } else if (revision !== pageRevision || recoveredFromCorruption !== response.recoveredFromCorruption) {
+          if (attempt === 0) continue sourceCatalogAttempts;
+          throw new GatewayError("Extension sources changed repeatedly while they were being loaded.");
+        }
+        const pageTotal = response.page === undefined ? undefined : exactSafeUnsignedNumber(response.page.totalSize);
+        if (pageTotal === undefined) throw new GatewayError("Orchestrator returned an invalid Extension source catalog size.");
+        if (totalSize === undefined) totalSize = pageTotal;
+        else if (totalSize !== pageTotal) throw new GatewayError("Orchestrator returned inconsistent Extension source catalog sizes.");
+        if (response.sources.length > 500 || sources.length + response.sources.length > pageTotal) {
+          throw new GatewayError("Orchestrator returned an invalid Extension source page.");
+        }
+        for (const value of response.sources) {
+          const mapped = mapExtensionSource(value);
+          if (ids.has(mapped.id)) throw new GatewayError("Orchestrator returned a duplicate Extension source identity.");
+          ids.add(mapped.id);
+          sources.push(mapped);
+        }
+        const nextPageToken = response.page?.nextPageToken ?? "";
+        if (nextPageToken === "") {
+          if (sources.length !== pageTotal) throw new GatewayError("Orchestrator returned an incomplete Extension source catalog.");
+          return { revision, sources, recoveredFromCorruption };
+        }
+        if (nextPageToken === pageToken || consumedTokens.has(nextPageToken)) {
+          throw new GatewayError("Orchestrator returned a cyclic Extension source page token.");
+        }
+        consumedTokens.add(nextPageToken);
+        pageToken = nextPageToken;
+      }
+      throw new GatewayError("Extension sources exceeded the safe pagination limit.");
+    }
+    throw new GatewayError("Extension sources changed repeatedly while they were being loaded.");
+  }
+
+  async addExtensionSource(source: ExtensionSourceDraft, expectedCatalogRevision: bigint): Promise<void> {
+    await this.submit({
+      case: "addExtensionSource",
+      value: {
+        source: extensionSourceLocation(source),
+        expectedCatalogRevision: { value: expectedCatalogRevision }
+      }
+    }, true);
+  }
+
+  async refreshExtensionSource(sourceId: string, expectedRevision: bigint): Promise<void> {
+    await this.submit({ case: "refreshExtensionSource", value: { sourceId, expectedRevision: { value: expectedRevision } } }, true);
+  }
+
+  async removeExtensionSource(sourceId: string, expectedRevision: bigint): Promise<void> {
+    await this.submit({ case: "removeExtensionSource", value: { sourceId, expectedRevision: { value: expectedRevision } } }, true);
+  }
+
+  async setExtensionEnabled(extensionId: string, enabled: boolean, expectedRevision: bigint): Promise<void> {
+    await this.submit({ case: "setExtensionEnabled", value: { extensionId, enabled, expectedRevision: { value: expectedRevision } } }, true);
+  }
+
+  async setExtensionSidebarVisible(extensionId: string, visible: boolean, expectedRevision: bigint): Promise<void> {
+    await this.submit({ case: "setExtensionSidebarVisible", value: { extensionId, visible, expectedRevision: { value: expectedRevision } } }, true);
+  }
+
+  async beginExtensionSetup(extensionId: string, expectedRevision: bigint): Promise<void> {
+    await this.submit({ case: "beginExtensionSetup", value: { extensionId, expectedRevision: { value: expectedRevision } } }, true);
+  }
+
+  async submitExtensionSetupInteraction(
+    extensionId: string,
+    attemptId: string,
+    fieldId: string,
+    value: string | boolean,
+    expectedRevision: bigint
+  ): Promise<void> {
+    await this.submit({
+      case: "submitExtensionSetupInteraction",
+      value: {
+        extensionId,
+        attemptId,
+        fieldId,
+        value: typeof value === "boolean" ? { case: "confirmed", value } : { case: "text", value },
+        expectedRevision: { value: expectedRevision }
+      }
+    }, true);
+  }
+
+  async saveExtensionSetupCredential(
+    extensionId: string,
+    attemptId: string,
+    fieldId: string,
+    kind: "apiKey" | "oauth" | "headerSecret",
+    secret: string,
+    expectedRevision: bigint,
+    signal?: AbortSignal
+  ): Promise<void> {
+    if (secret.length === 0) throw new GatewayError("Extension credential value is required.");
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).beginExtensionSetupCredentialUpload({
+      extensionId,
+      attemptId,
+      fieldId,
+      kind: kind === "oauth" ? CredentialKind.OAUTH : kind === "headerSecret" ? CredentialKind.HEADER_SECRET : CredentialKind.API_KEY
+    }, { signal: scope.signal });
+    const ticketId = await this.uploadCredentialTicket(secret, response.ticket, scope);
+    scope.signal.throwIfAborted();
+    await this.submit({
+      case: "commitExtensionSetupCredential",
+      value: {
+        extensionId,
+        attemptId,
+        fieldId,
+        credentialUploadTicketId: ticketId,
+        expectedRevision: { value: expectedRevision }
+      }
+    }, true, [], scope.signal);
+  }
+
+  async completeExtensionSetup(extensionId: string, attemptId: string, expectedRevision: bigint): Promise<void> {
+    await this.submit({ case: "completeExtensionSetup", value: { extensionId, attemptId, expectedRevision: { value: expectedRevision } } }, true);
+  }
+
+  async cancelExtensionSetup(extensionId: string, attemptId: string, expectedRevision: bigint): Promise<void> {
+    await this.submit({ case: "cancelExtensionSetup", value: { extensionId, attemptId, expectedRevision: { value: expectedRevision } } }, true);
+  }
+
+  async revokeExtensionSetup(extensionId: string, expectedRevision: bigint): Promise<void> {
+    await this.submit({ case: "revokeExtensionSetup", value: { extensionId, expectedRevision: { value: expectedRevision } } }, true);
   }
 
   async listBackgroundTasks(sessionId: string): Promise<readonly BackgroundTaskHistoryView[]> {
@@ -7009,6 +8700,9 @@ export function mapSnapshot(
     browsers: snapshot.browsers.map(mapBrowser),
     extraDirectories: snapshot.extraDirectories.map(mapExtraDirectory),
     resources: snapshot.resources.filter((resource) => resource.state !== ResourceState.REMOVED).map(mapResource),
+    extensions: snapshot.extensionCatalog?.entries.map(mapExtensionCatalogEntry) ?? [],
+    extensionCatalogRevision: snapshot.extensionCatalog?.revision?.value ?? 0n,
+    extensionCatalogRecovered: snapshot.extensionCatalog?.recoveredFromCorruption ?? false,
     commands: snapshot.runtimeCommands.filter((command) => command.loaded).map(mapRuntimeCommand),
     remoteConnections: snapshot.connections.map(mapRemoteConnection),
     devices: snapshot.devices.map(mapDevice),
@@ -9506,6 +11200,2366 @@ function mapResource(resource: ManagedResource): ResourceView {
   };
 }
 
+const RESOURCE_USAGE_COUNT_KEYS = [
+  "samples",
+  "strongActive",
+  "semiActive",
+  "passiveExposures",
+  "reads",
+  "rereads",
+  "toolCalls",
+  "toolErrors",
+  "commands",
+  "commandFailures"
+] as const;
+
+function mapResourceUsageReport(
+  report: ProtoResourceUsageReport,
+  requestedResourceId: string,
+  requestedTimeZone: string
+): ResourceUsageReportView {
+  if (
+    requestedResourceId.trim() === "" || requestedResourceId.length > 4_096 ||
+    report.resourceId !== requestedResourceId || report.timeZone !== requestedTimeZone ||
+    !validResourceUsageTimeZone(report.timeZone) || !validResourceUsageDay(report.fromDay) ||
+    !validResourceUsageDay(report.throughDay) || report.days.length !== 30 ||
+    addResourceUsageDays(report.fromDay, 29) !== report.throughDay
+  ) throw new GatewayError("The service returned an invalid Resource usage report authority.");
+
+  const days = report.days.map((day, index) => {
+    const expectedDay = addResourceUsageDays(report.fromDay, index);
+    if (day.localDay !== expectedDay) throw new GatewayError("The service returned an invalid Resource usage day series.");
+    return { localDay: day.localDay, metrics: mapResourceUsageMetrics(day.metrics) };
+  });
+  const totals = mapResourceUsageMetrics(report.totals);
+
+  const sourceIdentities = new Set<ResourceUsageSourceView>();
+  const sources = report.sources.map((entry) => {
+    const source = mapResourceUsageSource(entry.source);
+    if (sourceIdentities.has(source)) throw new GatewayError("The service returned duplicate Resource usage sources.");
+    sourceIdentities.add(source);
+    return { source, metrics: mapResourceUsageMetrics(entry.metrics) };
+  });
+
+  const agentIdentities = new Set<string>();
+  const agents = report.agents.map((entry) => {
+    const backendId = entry.backendId;
+    if (
+      backendId.trim() === "" || backendId.length > 4_096 || privatePathLikeLabel(backendId) ||
+      agentIdentities.has(backendId)
+    ) throw new GatewayError("The service returned an invalid Resource usage Backend breakdown.");
+    agentIdentities.add(backendId);
+    return { backendId, metrics: mapResourceUsageMetrics(entry.metrics) };
+  });
+
+  const versionIdentities = new Set<string>();
+  const versions = report.versions.map((entry) => {
+    const mapped = mapResourceUsageVersion(entry);
+    const identity = resourceUsageVersionKey(mapped);
+    if (versionIdentities.has(identity)) throw new GatewayError("The service returned duplicate Resource usage versions.");
+    versionIdentities.add(identity);
+    return mapped;
+  });
+
+  if (
+    !resourceUsageCountsMatch(days, totals) ||
+    !resourceUsageCountsMatch(sources, totals) ||
+    !resourceUsageCountsMatch(agents, totals) ||
+    !resourceUsageCountsMatch(versions, totals)
+  ) throw new GatewayError("The service returned inconsistent Resource usage totals.");
+
+  const comparison = mapResourceUsageComparison(report, versions);
+  const projection = mapResourceUsageProjection(report);
+  return {
+    resourceId: report.resourceId,
+    timeZone: report.timeZone,
+    fromDay: report.fromDay,
+    throughDay: report.throughDay,
+    days,
+    totals,
+    sources,
+    agents,
+    versions,
+    comparison,
+    projection
+  };
+}
+
+function mapResourceUsageMetrics(value: ProtoResourceUsageMetrics | undefined): ResourceUsageMetricsView {
+  if (value === undefined) throw new GatewayError("The service returned incomplete Resource usage metrics.");
+  const metrics = {
+    samples: exactSafeUnsignedNumber(value.samples),
+    strongActive: exactSafeUnsignedNumber(value.strongActive),
+    semiActive: exactSafeUnsignedNumber(value.semiActive),
+    passiveExposures: exactSafeUnsignedNumber(value.passiveExposures),
+    reads: exactSafeUnsignedNumber(value.reads),
+    rereads: exactSafeUnsignedNumber(value.rereads),
+    toolCalls: exactSafeUnsignedNumber(value.toolCalls),
+    toolErrors: exactSafeUnsignedNumber(value.toolErrors),
+    commands: exactSafeUnsignedNumber(value.commands),
+    commandFailures: exactSafeUnsignedNumber(value.commandFailures)
+  };
+  if (Object.values(metrics).some((entry) => entry === undefined)) {
+    throw new GatewayError("The service returned unsafe Resource usage metrics.");
+  }
+  const safe = metrics as { readonly [K in typeof RESOURCE_USAGE_COUNT_KEYS[number]]: number };
+  if (
+    safe.strongActive + safe.semiActive + safe.passiveExposures !== safe.samples ||
+    safe.rereads > safe.reads || safe.reads > safe.samples ||
+    safe.toolErrors > safe.toolCalls || safe.toolCalls > safe.samples ||
+    safe.commandFailures > safe.commands || safe.commands > safe.samples ||
+    safe.reads + safe.toolCalls + safe.commands > safe.samples
+  ) throw new GatewayError("The service returned inconsistent Resource usage metrics.");
+  const latestUsedAt = optionalResourceUsageTimestamp(value.latestUsedAt);
+  return { ...safe, ...(latestUsedAt === undefined ? {} : { latestUsedAt }) };
+}
+
+function mapResourceUsageSource(value: ProtoResourceUsageSource): ResourceUsageSourceView {
+  switch (value) {
+    case ProtoResourceUsageSource.STRUCTURED_RESOURCE_MENTION: return "structuredResourceMention";
+    case ProtoResourceUsageSource.NATIVE_SKILL_COMMAND: return "nativeSkillCommand";
+    case ProtoResourceUsageSource.RUNTIME_CONFIRMED_RESOURCE_LOAD: return "runtimeConfirmedResourceLoad";
+    case ProtoResourceUsageSource.EXACT_FILE_READ: return "exactFileRead";
+    case ProtoResourceUsageSource.RUNTIME_TOOL_CALL: return "runtimeToolCall";
+    default: throw new GatewayError("The service returned an unknown Resource usage source.");
+  }
+}
+
+function mapResourceUsageVersion(value: ProtoResourceUsageVersionBreakdown): ResourceUsageVersionBreakdownView {
+  const revision = value.identity?.resourceRevision?.value;
+  const contentRevision = value.identity?.contentRevision ?? "";
+  const version = value.identity?.version;
+  if (
+    revision === undefined || revision < 1n ||
+    !/^sha256:[a-f0-9]{64}$/u.test(contentRevision) ||
+    (version !== undefined && (version.trim() === "" || version.length > 256))
+  ) throw new GatewayError("The service returned an invalid Resource usage version identity.");
+  const metrics = mapResourceUsageMetrics(value.metrics);
+  const firstUsedAt = optionalResourceUsageTimestamp(value.firstUsedAt);
+  if ((metrics.samples === 0) !== (firstUsedAt === undefined)) {
+    throw new GatewayError("The service returned inconsistent Resource usage version timing.");
+  }
+  return {
+    identity: {
+      resourceRevision: revision,
+      contentRevision,
+      ...(version === undefined ? {} : { version })
+    },
+    metrics,
+    ...(firstUsedAt === undefined ? {} : { firstUsedAt })
+  };
+}
+
+function mapResourceUsageComparison(
+  report: ProtoResourceUsageReport,
+  versions: readonly ResourceUsageVersionBreakdownView[]
+): ResourceUsageReportView["comparison"] {
+  const value = report.comparison;
+  if (value === undefined || !Number.isSafeInteger(value.minimumSamples) || value.minimumSamples < 1) {
+    throw new GatewayError("The service returned an invalid Resource usage comparison.");
+  }
+  const current = value.current === undefined ? undefined : mapResourceUsageVersion(value.current);
+  const previous = value.previous === undefined ? undefined : mapResourceUsageVersion(value.previous);
+  for (const compared of [current, previous]) {
+    if (compared === undefined) continue;
+    const canonical = versions.find((entry) => resourceUsageVersionKey(entry) === resourceUsageVersionKey(compared));
+    if (canonical === undefined || !resourceUsageMetricsEqual(canonical.metrics, compared.metrics)
+      || canonical.firstUsedAt !== compared.firstUsedAt) {
+      throw new GatewayError("The service returned an unanchored Resource usage comparison.");
+    }
+  }
+  const unavailableReason = value.unavailableReason === undefined
+    ? undefined
+    : mapResourceUsageComparisonReason(value.unavailableReason);
+  if (value.available) {
+    if (
+      unavailableReason !== undefined || current === undefined || previous === undefined ||
+      current.metrics.samples < value.minimumSamples || previous.metrics.samples < value.minimumSamples
+    ) throw new GatewayError("The service returned an inconsistent available Resource usage comparison.");
+  } else {
+    const validUnavailable = unavailableReason === "noCurrentVersion"
+      ? current === undefined && previous === undefined
+      : unavailableReason === "noPreviousVersion"
+        ? current !== undefined && previous === undefined
+        : unavailableReason === "currentSamples"
+          ? current !== undefined && previous !== undefined && current.metrics.samples < value.minimumSamples
+          : unavailableReason === "previousSamples"
+            ? current !== undefined && previous !== undefined
+              && current.metrics.samples >= value.minimumSamples
+              && previous.metrics.samples < value.minimumSamples
+            : false;
+    if (!validUnavailable) throw new GatewayError("The service returned an inconsistent unavailable Resource usage comparison.");
+  }
+  return {
+    available: value.available,
+    minimumSamples: value.minimumSamples,
+    ...(unavailableReason === undefined ? {} : { unavailableReason }),
+    ...(current === undefined ? {} : { current }),
+    ...(previous === undefined ? {} : { previous })
+  };
+}
+
+function mapResourceUsageComparisonReason(
+  value: ProtoResourceUsageComparisonUnavailableReason
+): NonNullable<ResourceUsageReportView["comparison"]["unavailableReason"]> {
+  switch (value) {
+    case ProtoResourceUsageComparisonUnavailableReason.NO_CURRENT_VERSION: return "noCurrentVersion";
+    case ProtoResourceUsageComparisonUnavailableReason.NO_PREVIOUS_VERSION: return "noPreviousVersion";
+    case ProtoResourceUsageComparisonUnavailableReason.CURRENT_SAMPLES: return "currentSamples";
+    case ProtoResourceUsageComparisonUnavailableReason.PREVIOUS_SAMPLES: return "previousSamples";
+    default: throw new GatewayError("The service returned an unknown Resource usage comparison reason.");
+  }
+}
+
+function mapResourceUsageProjection(report: ProtoResourceUsageReport): ResourceUsageReportView["projection"] {
+  const value = report.projection;
+  if (
+    value === undefined || !Number.isSafeInteger(value.streamCount) || value.streamCount < 0 ||
+    !Number.isSafeInteger(value.pendingStreamCount) || value.pendingStreamCount < 0 ||
+    value.pendingStreamCount > value.streamCount
+  ) throw new GatewayError("The service returned an invalid Resource usage projection status.");
+  const lastProjectedAt = optionalResourceUsageTimestamp(value.lastProjectedAt);
+  const failureIdentities = new Set<string>();
+  const failures = value.failures.map((failure) => {
+    const source = mapResourceUsageSource(failure.source);
+    const retryAt = requiredResourceUsageTimestamp(failure.retryAt);
+    const identity = `${failure.sessionId}\u0000${source}`;
+    if (
+      failure.sessionId.trim() === "" || failure.sessionId.length > 4_096 ||
+      !Number.isSafeInteger(failure.attempts) || failure.attempts < 1 ||
+      !/^[A-Z][A-Z0-9_]{0,127}$/u.test(failure.errorCode) || failureIdentities.has(identity)
+    ) throw new GatewayError("The service returned an invalid Resource usage projection failure.");
+    failureIdentities.add(identity);
+    return { sessionId: failure.sessionId, source, attempts: failure.attempts, retryAt, errorCode: failure.errorCode };
+  });
+  if (
+    failures.length > value.pendingStreamCount ||
+    value.complete !== (value.pendingStreamCount === 0 && failures.length === 0)
+  ) throw new GatewayError("The service returned an inconsistent Resource usage projection status.");
+  return {
+    complete: value.complete,
+    streamCount: value.streamCount,
+    pendingStreamCount: value.pendingStreamCount,
+    ...(lastProjectedAt === undefined ? {} : { lastProjectedAt }),
+    failures
+  };
+}
+
+function resourceUsageCountsMatch(
+  values: readonly { readonly metrics: ResourceUsageMetricsView }[],
+  totals: ResourceUsageMetricsView
+): boolean {
+  return RESOURCE_USAGE_COUNT_KEYS.every((key) => {
+    let sum = 0;
+    for (const value of values) {
+      sum += value.metrics[key];
+      if (!Number.isSafeInteger(sum)) return false;
+    }
+    return sum === totals[key];
+  });
+}
+
+function resourceUsageMetricsEqual(left: ResourceUsageMetricsView, right: ResourceUsageMetricsView): boolean {
+  return RESOURCE_USAGE_COUNT_KEYS.every((key) => left[key] === right[key])
+    && left.latestUsedAt === right.latestUsedAt;
+}
+
+function resourceUsageVersionKey(value: ResourceUsageVersionBreakdownView): string {
+  return `${value.identity.contentRevision}\u0000${value.identity.version ?? ""}`;
+}
+
+function validResourceUsageTimeZone(value: string): boolean {
+  if (value.trim() === "" || value.length > 128 || value !== value.trim() || /[\u0000\r\n]/u.test(value)) return false;
+  try {
+    new Intl.DateTimeFormat("en", { timeZone: value }).format(0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function validResourceUsageDay(value: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/u.test(value)) return false;
+  const timestamp = Date.parse(`${value}T00:00:00.000Z`);
+  return Number.isFinite(timestamp) && new Date(timestamp).toISOString().slice(0, 10) === value;
+}
+
+function addResourceUsageDays(value: string, amount: number): string {
+  if (!validResourceUsageDay(value)) throw new GatewayError("The service returned an invalid Resource usage calendar day.");
+  const date = new Date(`${value}T00:00:00.000Z`);
+  date.setUTCDate(date.getUTCDate() + amount);
+  return date.toISOString().slice(0, 10);
+}
+
+function optionalResourceUsageTimestamp(
+  value: { readonly seconds: bigint; readonly nanos: number } | undefined
+): number | undefined {
+  if (value === undefined) return undefined;
+  return requiredResourceUsageTimestamp(value);
+}
+
+function requiredResourceUsageTimestamp(
+  value: { readonly seconds: bigint; readonly nanos: number } | undefined
+): number {
+  if (
+    value === undefined || value.seconds < 0n || value.nanos < 0 || value.nanos >= 1_000_000_000 ||
+    !Number.isSafeInteger(value.nanos)
+  ) throw new GatewayError("The service returned an invalid Resource usage timestamp.");
+  const seconds = Number(value.seconds);
+  const result = seconds * 1_000 + Math.floor(value.nanos / 1_000_000);
+  if (!Number.isSafeInteger(seconds) || !Number.isSafeInteger(result)) {
+    throw new GatewayError("The service returned an unsafe Resource usage timestamp.");
+  }
+  return result;
+}
+
+function mapSkillDescriptor(skill: ProtoSkillDescriptor): SkillDescriptorView {
+  const revision = skill.entityVersion?.revision?.value;
+  const scope = skill.scope === ResourceScope.GLOBAL
+    ? "global" as const
+    : skill.scope === ResourceScope.PROJECT
+      ? "project" as const
+      : undefined;
+  if (
+    skill.skillId.trim() === "" || skill.backendId.trim() === "" || skill.name.trim() === "" ||
+    skill.sourceLabel.trim() === "" || privatePathLikeLabel(skill.sourceLabel) || scope === undefined ||
+    revision === undefined || revision < 1n || skill.approvedRevision.trim() === "" || skill.updatedAt === undefined
+  ) throw new GatewayError("The service returned an incomplete or path-bearing Skill descriptor.");
+  return {
+    id: skill.skillId,
+    backendId: skill.backendId,
+    ...(skill.targetId === "" ? {} : { targetId: skill.targetId }),
+    scope,
+    name: skill.name,
+    sourceLabel: skill.sourceLabel,
+    state: resourceState(skill.state),
+    enabled: skill.enabled,
+    canToggle: skill.canToggle,
+    contentAvailable: skill.contentAvailable,
+    canEdit: skill.canEdit,
+    canDelete: skill.canDelete,
+    revision,
+    approvedRevision: skill.approvedRevision,
+    updatedAt: timestampMs(skill.updatedAt)
+  };
+}
+
+function mapSkillFileEntry(file: ProtoSkillFileEntry): SkillFileEntryView {
+  const kind = file.kind === SkillFileKind.DIRECTORY
+    ? "directory" as const
+    : file.kind === SkillFileKind.FILE
+      ? "file" as const
+      : undefined;
+  const size = exactSafeUnsignedNumber(file.size);
+  if (kind === undefined || size === undefined || !portableSkillKey(file.key) || !portableSkillName(file.name)) {
+    throw new GatewayError("The service returned an invalid Skill file entry.");
+  }
+  return { key: file.key, name: file.name, kind, size, editable: file.editable };
+}
+
+function mapSkillFileContent(file: ProtoSkillFileContent): SkillFileContentView {
+  const size = exactSafeUnsignedNumber(file.size);
+  if (size === undefined || !portableSkillKey(file.key) || file.revision.trim() === "") {
+    throw new GatewayError("The service returned an invalid Skill file.");
+  }
+  return { key: file.key, content: file.content, revision: file.revision, size, editable: file.editable };
+}
+
+function mapSkillDiffChange(change: ProtoSkillDiffChange): SkillDiffChangeView {
+  const kind = change.kind === SkillDiffChangeKind.ADDED
+    ? "added" as const
+    : change.kind === SkillDiffChangeKind.MODIFIED
+      ? "modified" as const
+      : change.kind === SkillDiffChangeKind.DELETED
+        ? "deleted" as const
+        : undefined;
+  if (kind === undefined || !portableSkillKey(change.key)) throw new GatewayError("The service returned an invalid Skill diff change.");
+  return {
+    key: change.key,
+    kind,
+    binary: change.binary,
+    ...(change.unifiedDiff === "" ? {} : { unifiedDiff: change.unifiedDiff })
+  };
+}
+
+function mapSkillDiff(diff: ProtoSkillDiff): SkillDiffView {
+  return {
+    available: diff.available,
+    ...(diff.reason === "" ? {} : { reason: diff.reason }),
+    changes: diff.changes.map(mapSkillDiffChange),
+    truncated: diff.truncated
+  };
+}
+
+function mapSkillSession(session: ProtoSkillSession): SkillSessionView {
+  const fileCount = exactSafeUnsignedNumber(session.fileCount);
+  const bytes = exactSafeUnsignedNumber(session.bytes);
+  if (
+    session.skill === undefined || session.metadata === undefined || session.diff === undefined ||
+    session.sessionId.trim() === "" || session.observedRevision.trim() === "" || session.expiresAt === undefined ||
+    fileCount === undefined || bytes === undefined
+  ) throw new GatewayError("The service returned an incomplete Skill session.");
+  let frontmatter: unknown;
+  try {
+    frontmatter = JSON.parse(session.metadata.frontmatterJson);
+  } catch {
+    throw new GatewayError("The service returned invalid Skill frontmatter metadata.");
+  }
+  if (typeof frontmatter !== "object" || frontmatter === null || Array.isArray(frontmatter)) {
+    throw new GatewayError("The service returned invalid Skill frontmatter metadata.");
+  }
+  return {
+    id: session.sessionId,
+    skill: mapSkillDescriptor(session.skill),
+    observedRevision: session.observedRevision,
+    dirty: session.dirty,
+    baselineAvailable: session.baselineAvailable,
+    metadata: {
+      ...(session.metadata.name === "" ? {} : { name: session.metadata.name }),
+      ...(session.metadata.description === "" ? {} : { description: session.metadata.description }),
+      ...(session.metadata.version === "" ? {} : { version: session.metadata.version }),
+      frontmatter: frontmatter as Readonly<Record<string, unknown>>,
+      ...(session.metadata.parseError === "" ? {} : { parseError: session.metadata.parseError })
+    },
+    files: [],
+    fileCount,
+    bytes,
+    diff: mapSkillDiff(session.diff),
+    expiresAt: timestampMs(session.expiresAt)
+  };
+}
+
+function mapSkillDraft(draft: ProtoSkillDraft): SkillDraftView {
+  const kind = draft.kind === SkillDraftKind.EDIT
+    ? "edit" as const
+    : draft.kind === SkillDraftKind.RENAME
+      ? "rename" as const
+      : undefined;
+  const resourceRevision = draft.resourceRevision?.value;
+  if (
+    kind === undefined || draft.draftId.trim() === "" || draft.sessionId.trim() === "" || draft.skillId.trim() === "" ||
+    draft.name.trim() === "" || resourceRevision === undefined || resourceRevision < 1n ||
+    draft.observedRevision.trim() === "" || draft.expiresAt === undefined
+  ) throw new GatewayError("The service returned an incomplete Skill draft.");
+  return {
+    id: draft.draftId,
+    sessionId: draft.sessionId,
+    skillId: draft.skillId,
+    kind,
+    name: draft.name,
+    resourceRevision,
+    observedRevision: draft.observedRevision,
+    changes: draft.changes.map(mapSkillDiffChange),
+    expiresAt: timestampMs(draft.expiresAt)
+  };
+}
+
+function mapSkillRecovery(recovery: ProtoSkillRecovery): SkillRecoveryView {
+  const scope = recovery.scope === ResourceScope.GLOBAL
+    ? "global" as const
+    : recovery.scope === ResourceScope.PROJECT
+      ? "project" as const
+      : undefined;
+  const status = recovery.status === SkillRecoveryStatus.READY
+    ? "ready" as const
+    : recovery.status === SkillRecoveryStatus.MISSING
+      ? "missing" as const
+      : undefined;
+  const files = exactSafeUnsignedNumber(recovery.files);
+  const bytes = exactSafeUnsignedNumber(recovery.bytes);
+  if (
+    scope === undefined || status === undefined || files === undefined || bytes === undefined ||
+    recovery.recoveryId.trim() === "" || recovery.skillId.trim() === "" || recovery.backendId.trim() === "" ||
+    recovery.name.trim() === "" || recovery.revision.trim() === "" || recovery.createdAt === undefined
+  ) throw new GatewayError("The service returned an incomplete Skill recovery.");
+  return {
+    id: recovery.recoveryId,
+    skillId: recovery.skillId,
+    backendId: recovery.backendId,
+    ...(recovery.targetId === "" ? {} : { targetId: recovery.targetId }),
+    scope,
+    name: recovery.name,
+    revision: recovery.revision,
+    files,
+    bytes,
+    createdAt: timestampMs(recovery.createdAt),
+    status
+  };
+}
+
+function skillMutationResult(operation: Operation): SkillMutationResultView {
+  const payload = operation.result?.payload;
+  if (payload?.case !== "skill") throw new GatewayError("The service completed the Skill operation without a Skill result.");
+  return {
+    ...(payload.value.skill === undefined ? {} : { skill: mapSkillDescriptor(payload.value.skill) }),
+    ...(payload.value.replacedSkillId === "" ? {} : { replacedSkillId: payload.value.replacedSkillId }),
+    ...(payload.value.recoveryId === "" ? {} : { recoveryId: payload.value.recoveryId })
+  };
+}
+
+function protoSkillMarketSource(source: SkillMarketSourceDraft) {
+  return {
+    kind: source.kind === "local"
+      ? { case: "local" as const, value: { serverPath: source.serverPath } }
+      : {
+          case: "git" as const,
+          value: {
+            repositoryUrl: source.repositoryUrl,
+            ...(source.ref === undefined ? {} : { ref: source.ref }),
+            sparsePaths: [...source.sparsePaths]
+          }
+        }
+  };
+}
+
+function protoSkillMarketIdentity(identity: SkillMarketEntryIdentityView) {
+  return {
+    sourceId: identity.sourceId,
+    sourceRevision: { value: identity.sourceRevision },
+    entryId: identity.entryId,
+    entryRevision: { value: identity.entryRevision },
+    contentRevision: identity.contentRevision
+  };
+}
+
+function protoSkillMarketInstallTarget(target: SkillMarketInstallTargetView) {
+  return {
+    backendId: target.backendId,
+    scope: target.scope === "global" ? ResourceScope.GLOBAL : ResourceScope.PROJECT,
+    ...(target.targetId === undefined ? {} : { targetId: target.targetId }),
+    ...(target.relativeParent === undefined ? {} : { relativeParent: target.relativeParent })
+  };
+}
+
+function protoSkillMarketSort(sort: SkillMarketSortView): SkillMarketSort {
+  switch (sort) {
+    case "trending": return SkillMarketSort.TRENDING;
+    case "downloads": return SkillMarketSort.DOWNLOADS;
+    case "updated": return SkillMarketSort.UPDATED;
+    case "created": return SkillMarketSort.CREATED;
+  }
+}
+
+function mapSkillMarketSource(source: ProtoSkillMarketSourceDescriptor): SkillMarketSourceView {
+  const revision = source.revision?.value;
+  const state = source.state === ProtoSkillMarketSourceState.READY
+    ? "ready" as const
+    : source.state === ProtoSkillMarketSourceState.ERROR
+      ? "error" as const
+      : undefined;
+  const kind = source.kind === ProtoSkillMarketSourceKind.LOCAL
+    ? "local" as const
+    : source.kind === ProtoSkillMarketSourceKind.GIT
+      ? "git" as const
+      : undefined;
+  const addedAt = source.addedAt === undefined ? undefined : timestampMs(source.addedAt);
+  const refreshedAt = source.refreshedAt === undefined ? undefined : timestampMs(source.refreshedAt);
+  if (!/^skill_market_source_[a-f0-9]{32}$/u.test(source.sourceId) || revision === undefined || revision < 1n
+    || kind === undefined || state === undefined || source.display.trim() === "" || privatePathLikeLabel(source.display)
+    || source.name.trim() === "" || privatePathLikeLabel(source.name) || (source.displayName !== undefined && privatePathLikeLabel(source.displayName))
+    || !/^sha256:[a-f0-9]{64}$/u.test(source.contentRevision) || !Number.isSafeInteger(source.entryCount) || source.entryCount < 0
+    || addedAt === undefined || !Number.isSafeInteger(addedAt) || addedAt < 0
+    || (refreshedAt !== undefined && (!Number.isSafeInteger(refreshedAt) || refreshedAt < addedAt))
+    || (state === "error") !== (source.error !== undefined)) {
+    throw new GatewayError("The service returned an invalid or path-bearing Skill market source.");
+  }
+  return {
+    id: source.sourceId,
+    revision,
+    kind,
+    display: source.display,
+    name: source.name,
+    ...(source.displayName === undefined ? {} : { displayName: source.displayName }),
+    state,
+    contentRevision: source.contentRevision,
+    entryCount: source.entryCount,
+    addedAt,
+    ...(refreshedAt === undefined ? {} : { refreshedAt }),
+    ...(source.error === undefined ? {} : { error: source.error })
+  };
+}
+
+function mapSkillMarketIdentity(identity: ProtoSkillMarketEntryIdentity | undefined): SkillMarketEntryIdentityView {
+  const sourceRevision = identity?.sourceRevision?.value;
+  const entryRevision = identity?.entryRevision?.value;
+  if (identity === undefined || !/^skill_market_source_[a-f0-9]{32}$/u.test(identity.sourceId)
+    || !/^skill_market_entry_[a-f0-9]{32}$/u.test(identity.entryId)
+    || sourceRevision === undefined || sourceRevision < 1n || entryRevision === undefined || entryRevision < 1n
+    || !/^sha256:[a-f0-9]{64}$/u.test(identity.contentRevision)) {
+    throw new GatewayError("The service returned an invalid Skill market entry identity.");
+  }
+  return {
+    sourceId: identity.sourceId,
+    sourceRevision,
+    entryId: identity.entryId,
+    entryRevision,
+    contentRevision: identity.contentRevision
+  };
+}
+
+function mapSkillMarketEntry(entry: ProtoSkillMarketEntry): SkillMarketEntryView {
+  const downloads = exactSafeUnsignedNumber(entry.downloads);
+  const archiveBytes = exactSafeUnsignedNumber(entry.archiveBytes);
+  const sourceState = entry.sourceState === ProtoSkillMarketSourceState.READY
+    ? "ready" as const
+    : entry.sourceState === ProtoSkillMarketSourceState.ERROR
+      ? "error" as const
+      : undefined;
+  const createdAt = entry.createdAt === undefined ? undefined : timestampMs(entry.createdAt);
+  const updatedAt = entry.updatedAt === undefined ? undefined : timestampMs(entry.updatedAt);
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(entry.slug) || entry.name.trim() === ""
+    || (entry.category !== undefined && entry.category.trim() === "")
+    || (entry.changelog !== undefined && entry.changelog.trim() === "")
+    || entry.version.trim() === "" || entry.sourceName.trim() === "" || privatePathLikeLabel(entry.sourceName)
+    || (entry.sourceDisplayName !== undefined && privatePathLikeLabel(entry.sourceDisplayName))
+    || entry.tags.some((value) => value.trim() === "") || new Set(entry.tags).size !== entry.tags.length
+    || downloads === undefined || archiveBytes === undefined || !Number.isFinite(entry.trendScore) || entry.trendScore < 0
+    || sourceState === undefined || createdAt === undefined || updatedAt === undefined || createdAt < 0 || updatedAt < createdAt
+    || (sourceState === "error") !== (entry.sourceError !== undefined)) {
+    throw new GatewayError("The service returned an invalid or path-bearing Skill market entry.");
+  }
+  const installStatuses = entry.installStatuses.map(mapSkillMarketInstallStatus);
+  const access = mapSkillAccessPolicy(entry.access);
+  if (new Set(installStatuses.map((status) => status.resourceId)).size !== installStatuses.length) {
+    throw new GatewayError("The service returned duplicate Skill market install statuses.");
+  }
+  return {
+    identity: mapSkillMarketIdentity(entry.identity),
+    slug: entry.slug,
+    name: entry.name,
+    ...(entry.author === undefined ? {} : { author: entry.author }),
+    description: entry.description,
+    ...(entry.category === undefined ? {} : { category: entry.category }),
+    tags: [...entry.tags],
+    version: entry.version,
+    ...(entry.changelog === undefined ? {} : { changelog: entry.changelog }),
+    createdAt,
+    updatedAt,
+    downloads,
+    trendScore: entry.trendScore,
+    archiveBytes,
+    sourceName: entry.sourceName,
+    ...(entry.sourceDisplayName === undefined ? {} : { sourceDisplayName: entry.sourceDisplayName }),
+    sourceState,
+    ...(entry.sourceError === undefined ? {} : { sourceError: entry.sourceError }),
+    installStatuses,
+    access,
+    canManage: entry.canManage
+  };
+}
+
+function mapSkillAccessPolicy(policy: ProtoSkillAccessPolicy | undefined): SkillAccessPolicyView {
+  const revision = policy?.revision?.value;
+  const publisher = policy?.publisher;
+  const visibility = policy?.visibility === ProtoSkillPublicationVisibility.PUBLIC
+    ? "public" as const
+    : policy?.visibility === ProtoSkillPublicationVisibility.DEPARTMENT
+      ? "department" as const
+      : policy?.visibility === ProtoSkillPublicationVisibility.PRIVATE
+        ? "private" as const
+        : undefined;
+  const ids = policy?.audienceScopeIds ?? [];
+  if (policy === undefined || publisher === undefined || revision === undefined || revision < 1n || visibility === undefined
+    || ids.some((id) => !validCollaborationId(id)) || new Set(ids).size !== ids.length) {
+    throw new GatewayError("The service returned an invalid Skill access policy.");
+  }
+  if (publisher.kind === ProtoSkillPublicationPublisher.PERSONAL
+    && publisher.actorId !== undefined && publisher.scopeId === undefined && publisher.sourceId === undefined
+    && visibility !== "department" && ids.length === 0 && validCollaborationId(publisher.actorId)) {
+    return { revision, publisher: { kind: "personal", actorId: publisher.actorId }, visibility, audienceScopeIds: [] };
+  }
+  if (publisher.kind === ProtoSkillPublicationPublisher.TEAM
+    && publisher.scopeId !== undefined && publisher.actorId === undefined && publisher.sourceId === undefined
+    && validCollaborationId(publisher.scopeId)
+    && (visibility === "public" && ids.length === 0 || visibility === "department" && ids.length > 0)) {
+    return { revision, publisher: { kind: "team", scopeId: publisher.scopeId }, visibility, audienceScopeIds: [...ids] };
+  }
+  if (publisher.kind === ProtoSkillPublicationPublisher.EXTERNAL
+    && publisher.sourceId !== undefined && publisher.actorId === undefined && publisher.scopeId === undefined
+    && validCollaborationId(publisher.sourceId) && visibility === "public" && ids.length === 0) {
+    return { revision, publisher: { kind: "external", sourceId: publisher.sourceId }, visibility, audienceScopeIds: [] };
+  }
+  throw new GatewayError("The service returned an inconsistent Skill access policy.");
+}
+
+function mapCollaborationDirectory(directory: ProtoCollaborationDirectory): CollaborationDirectoryView {
+  const revision = directory.revision?.value;
+  const unavailableReason = directory.unavailableReason === undefined || directory.unavailableReason === ""
+    ? undefined
+    : directory.unavailableReason;
+  if (revision === undefined || revision < 0n
+    || (unavailableReason !== undefined && (!validPublicationText(unavailableReason, 512) || containsPrivatePath(unavailableReason)))) {
+    throw new GatewayError("The service returned an invalid collaboration directory.");
+  }
+  if (!directory.available) {
+    if (revision !== 0n || directory.actor !== undefined || directory.scopes.length !== 0 || unavailableReason === undefined) {
+      throw new GatewayError("The service returned an inconsistent unavailable collaboration directory.");
+    }
+    return {
+      available: false,
+      revision,
+      scopes: [],
+      recoveredFromCorruption: directory.recoveredFromCorruption,
+      unavailableReason
+    };
+  }
+  const actor = directory.actor;
+  if (revision < 1n || actor === undefined || !validCollaborationId(actor.actorId)
+    || !validPublicationText(actor.displayName, 128) || privatePathLikeLabel(actor.displayName)) {
+    throw new GatewayError("The service returned an invalid collaboration identity.");
+  }
+  const scopes = directory.scopes.map((scope) => {
+    const scopeRevision = scope.revision?.value;
+    const kind = scope.kind === ProtoCollaborationScopeKind.TEAM
+      ? "team" as const
+      : scope.kind === ProtoCollaborationScopeKind.DEPARTMENT
+        ? "department" as const
+        : undefined;
+    const members = scope.members.map((member) => {
+      const role = member.role === ProtoCollaborationRole.VIEWER
+        ? "viewer" as const
+        : member.role === ProtoCollaborationRole.PUBLISHER
+          ? "publisher" as const
+          : member.role === ProtoCollaborationRole.ADMINISTRATOR
+            ? "administrator" as const
+            : undefined;
+      if (!validCollaborationId(member.actorId) || role === undefined) {
+        throw new GatewayError("The service returned an invalid collaboration membership.");
+      }
+      return { actorId: member.actorId, role };
+    });
+    if (!validCollaborationId(scope.scopeId) || scopeRevision === undefined || scopeRevision < 1n || kind === undefined
+      || !validPublicationText(scope.name, 128) || privatePathLikeLabel(scope.name)
+      || members.length === 0 || new Set(members.map((member) => member.actorId)).size !== members.length
+      || !members.some((member) => member.actorId === actor.actorId)) {
+      throw new GatewayError("The service returned an invalid collaboration scope.");
+    }
+    return { id: scope.scopeId, revision: scopeRevision, kind, name: scope.name, members };
+  });
+  if (new Set(scopes.map((scope) => scope.id)).size !== scopes.length || unavailableReason !== undefined) {
+    throw new GatewayError("The service returned an inconsistent collaboration directory.");
+  }
+  return {
+    available: true,
+    revision,
+    actor: { id: actor.actorId, displayName: actor.displayName },
+    scopes,
+    recoveredFromCorruption: directory.recoveredFromCorruption
+  };
+}
+
+function mapSkillMarketInstallStatus(status: ProtoSkillMarketInstallStatus): SkillMarketInstallStatusView {
+  const resourceRevision = status.resourceRevision?.value;
+  const scope = status.scope === ResourceScope.GLOBAL
+    ? "global" as const
+    : status.scope === ResourceScope.PROJECT
+      ? "project" as const
+      : undefined;
+  const state = status.state === ProtoSkillMarketInstallStatusState.INSTALLED
+    ? "installed" as const
+    : status.state === ProtoSkillMarketInstallStatusState.UPDATE_AVAILABLE
+      ? "updateAvailable" as const
+      : status.state === ProtoSkillMarketInstallStatusState.CONFLICT
+        ? "conflict" as const
+        : undefined;
+  if (status.resourceId.trim() === "" || status.backendId.trim() === "" || resourceRevision === undefined
+    || resourceRevision < 1n || scope === undefined || state === undefined
+    || (scope === "global" && (status.targetId !== undefined || status.relativeParent !== undefined))
+    || (scope === "project" && (status.targetId === undefined || status.targetId.trim() === ""
+      || status.relativeParent === undefined || !portableSkillKey(status.relativeParent)))
+    || (status.installedVersion !== undefined && status.installedVersion.trim() === "")) {
+    throw new GatewayError("The service returned an invalid Skill market install status.");
+  }
+  return {
+    resourceId: status.resourceId,
+    resourceRevision,
+    backendId: status.backendId,
+    ...(status.targetId === undefined ? {} : { targetId: status.targetId }),
+    scope,
+    ...(status.relativeParent === undefined ? {} : { relativeParent: status.relativeParent }),
+    state,
+    ...(status.installedVersion === undefined ? {} : { installedVersion: status.installedVersion })
+  };
+}
+
+function mapSkillMarketArchiveEntry(file: ProtoSkillMarketArchiveEntry): SkillMarketArchiveEntryView {
+  const kind = file.kind === SkillFileKind.DIRECTORY
+    ? "directory" as const
+    : file.kind === SkillFileKind.FILE
+      ? "file" as const
+      : undefined;
+  const size = exactSafeUnsignedNumber(file.size);
+  if (kind === undefined || size === undefined || !portableSkillKey(file.key)) {
+    throw new GatewayError("The service returned an invalid Skill market archive entry.");
+  }
+  return { key: file.key, kind, size };
+}
+
+function mapSkillMarketPreview(preview: ProtoSkillMarketPreview): SkillMarketPreviewView {
+  const files = exactSafeUnsignedNumber(preview.files);
+  const bytes = exactSafeUnsignedNumber(preview.bytes);
+  if (!/^skill_market_preview_[a-f0-9]{32}$/u.test(preview.previewId)
+    || !/^sha256:[a-f0-9]{64}$/u.test(preview.snapshotRevision) || files === undefined || bytes === undefined
+    || preview.entry === undefined || preview.expiresAt === undefined) {
+    throw new GatewayError("The service returned an invalid Skill market preview.");
+  }
+  return {
+    id: preview.previewId,
+    entry: mapSkillMarketEntry(preview.entry),
+    snapshotRevision: preview.snapshotRevision,
+    files,
+    bytes,
+    expiresAt: timestampMs(preview.expiresAt)
+  };
+}
+
+function mapSkillMarketPreviewFile(
+  file: ProtoSkillMarketPreviewFile,
+  preview: SkillMarketPreviewView
+): SkillMarketPreviewFileView {
+  const size = exactSafeUnsignedNumber(file.size);
+  const unavailableReason = file.unavailableReason === undefined
+    ? undefined
+    : file.unavailableReason === ProtoSkillMarketPreviewUnavailableReason.BINARY
+      ? "binary" as const
+      : file.unavailableReason === ProtoSkillMarketPreviewUnavailableReason.TOO_LARGE
+        ? "tooLarge" as const
+        : null;
+  if (file.previewId !== preview.id || file.snapshotRevision !== preview.snapshotRevision
+    || !portableSkillKey(file.key) || size === undefined || unavailableReason === null
+    || file.previewable !== (file.content !== undefined) || file.previewable === (unavailableReason !== undefined)) {
+    throw new GatewayError("The service returned an invalid Skill market preview file.");
+  }
+  return {
+    previewId: file.previewId,
+    snapshotRevision: file.snapshotRevision,
+    key: file.key,
+    size,
+    previewable: file.previewable,
+    ...(file.content === undefined ? {} : { content: file.content }),
+    ...(unavailableReason === undefined ? {} : { unavailableReason })
+  };
+}
+
+function mapSkillMarketInstallTarget(target: {
+  readonly backendId: string;
+  readonly scope: ResourceScope;
+  readonly targetId?: string;
+  readonly relativeParent?: string;
+} | undefined): SkillMarketInstallTargetView {
+  const scope = target?.scope === ResourceScope.GLOBAL
+    ? "global" as const
+    : target?.scope === ResourceScope.PROJECT
+      ? "project" as const
+      : undefined;
+  if (target === undefined || target.backendId.trim() === "" || scope === undefined
+    || (scope === "global" && (target.targetId !== undefined || target.relativeParent !== undefined))
+    || (scope === "project" && (target.targetId?.trim() ?? "") === "")
+    || (target.relativeParent !== undefined && !portableSkillKey(target.relativeParent))) {
+    throw new GatewayError("The service returned an invalid Skill market install target.");
+  }
+  return {
+    backendId: target.backendId,
+    scope,
+    ...(target.targetId === undefined ? {} : { targetId: target.targetId }),
+    ...(target.relativeParent === undefined ? {} : { relativeParent: target.relativeParent })
+  };
+}
+
+function mapSkillMarketCurrentResource(value: NonNullable<ProtoSkillMarketInstallPreview["currentResource"]>) {
+  const resourceRevision = value.resourceRevision?.value;
+  const sourceKind = value.sourceKind === ResourceAcquisitionKind.LOCAL
+    ? "local" as const
+    : value.sourceKind === ResourceAcquisitionKind.NPM
+      ? "npm" as const
+      : value.sourceKind === ResourceAcquisitionKind.GIT
+        ? "git" as const
+        : value.sourceKind === ResourceAcquisitionKind.EXTENSION_SOURCE
+          ? "extensionSource" as const
+          : value.sourceKind === ResourceAcquisitionKind.SKILL_MARKET
+            ? "skillMarket" as const
+            : undefined;
+  if (value.resourceId.trim() === "" || resourceRevision === undefined || resourceRevision < 1n || value.name.trim() === ""
+    || sourceKind === undefined || value.sourceDisplay.trim() === "" || privatePathLikeLabel(value.sourceDisplay)
+    || value.discoveredRevision.trim() === "" || value.observedRevision.trim() === "") {
+    throw new GatewayError("The service returned an invalid or path-bearing current Skill resource.");
+  }
+  return {
+    resourceId: value.resourceId,
+    resourceRevision,
+    name: value.name,
+    ...(value.version === undefined ? {} : { version: value.version }),
+    sourceKind,
+    sourceDisplay: value.sourceDisplay,
+    discoveredRevision: value.discoveredRevision,
+    observedRevision: value.observedRevision,
+    dirty: value.dirty
+  };
+}
+
+function mapSkillMarketInstallPreview(preview: ProtoSkillMarketInstallPreview): SkillMarketInstallPreviewView {
+  const action = preview.action === ProtoSkillMarketInstallAction.INSTALL
+    ? "install" as const
+    : preview.action === ProtoSkillMarketInstallAction.UPDATE
+      ? "update" as const
+      : preview.action === ProtoSkillMarketInstallAction.REPLACE
+        ? "replace" as const
+        : undefined;
+  const files = exactSafeUnsignedNumber(preview.files);
+  const bytes = exactSafeUnsignedNumber(preview.bytes);
+  if (action === undefined || preview.resourceId.trim() === "" || preview.name.trim() === ""
+    || preview.availableVersion.trim() === "" || !/^sha256:[a-f0-9]{64}$/u.test(preview.candidateRevision)
+    || files === undefined || bytes === undefined || (preview.diffAvailable === false && preview.changes.length > 0)) {
+    throw new GatewayError("The service returned an invalid Skill market install preview.");
+  }
+  return {
+    action,
+    resourceId: preview.resourceId,
+    target: mapSkillMarketInstallTarget(preview.target),
+    name: preview.name,
+    availableVersion: preview.availableVersion,
+    candidateRevision: preview.candidateRevision,
+    files,
+    bytes,
+    ...(preview.currentResource === undefined ? {} : { currentResource: mapSkillMarketCurrentResource(preview.currentResource) }),
+    unregisteredDestination: preview.unregisteredDestination,
+    sourceReplacement: preview.sourceReplacement,
+    preservesEnabled: preview.preservesEnabled,
+    diffAvailable: preview.diffAvailable,
+    ...(preview.diffReason === undefined ? {} : { diffReason: preview.diffReason }),
+    changes: preview.changes.map(mapSkillDiffChange),
+    diffTruncated: preview.diffTruncated
+  };
+}
+
+function mapSkillMarketConfirmationReason(
+  value: ProtoSkillMarketInstallConfirmationReason
+): SkillMarketInstallPlanView["confirmationReasons"][number] {
+  switch (value) {
+    case ProtoSkillMarketInstallConfirmationReason.SOURCE_REPLACEMENT: return "sourceReplacement";
+    case ProtoSkillMarketInstallConfirmationReason.LOCAL_OWNERSHIP: return "localOwnership";
+    case ProtoSkillMarketInstallConfirmationReason.DIRTY_CONTENT: return "dirtyContent";
+    case ProtoSkillMarketInstallConfirmationReason.UNREGISTERED_DESTINATION: return "unregisteredDestination";
+    case ProtoSkillMarketInstallConfirmationReason.DOWNGRADE: return "downgrade";
+    default: throw new GatewayError("The service returned an invalid Skill market confirmation reason.");
+  }
+}
+
+function mapSkillMarketInstallPlan(plan: ProtoSkillMarketInstallPlan): SkillMarketInstallPlanView {
+  if (!/^skill_market_install_[a-f0-9]{32}$/u.test(plan.planId) || plan.entry === undefined || plan.target === undefined
+    || plan.preview === undefined || plan.expiresAt === undefined) {
+    throw new GatewayError("The service returned an invalid Skill market install plan.");
+  }
+  const target = mapSkillMarketInstallTarget(plan.target);
+  const preview = mapSkillMarketInstallPreview(plan.preview);
+  const confirmationReasons = plan.confirmationReasons.map(mapSkillMarketConfirmationReason);
+  if (new Set(confirmationReasons).size !== confirmationReasons.length
+    || plan.requiresConfirmation !== (confirmationReasons.length > 0)
+    || JSON.stringify(target) !== JSON.stringify(preview.target)) {
+    throw new GatewayError("The service returned an inconsistent Skill market install plan.");
+  }
+  return {
+    id: plan.planId,
+    entry: mapSkillMarketEntry(plan.entry),
+    target,
+    preview,
+    confirmationReasons,
+    requiresConfirmation: plan.requiresConfirmation,
+    expiresAt: timestampMs(plan.expiresAt)
+  };
+}
+
+function mapSkillMarketSyncTarget(target: ProtoSkillMarketSyncTarget | undefined): SkillMarketSyncTargetView {
+  const mapped = mapSkillMarketInstallTarget(target);
+  const targetRevision = target?.targetRevision?.value;
+  if (targetRevision !== undefined && targetRevision < 1n) {
+    throw new GatewayError("The service returned an invalid Skill market sync target revision.");
+  }
+  return { ...mapped, ...(targetRevision === undefined ? {} : { targetRevision }) };
+}
+
+function mapSkillMarketSyncBaseline(baseline: ProtoSkillMarketSyncBaseline | undefined): SkillMarketSyncBaselineView {
+  const resourceRevision = baseline?.resourceRevision?.value;
+  const sourceRevision = baseline?.sourceRevision?.value;
+  const entryRevision = baseline?.entryRevision?.value;
+  if (baseline === undefined || resourceRevision === undefined || resourceRevision < 1n
+    || sourceRevision === undefined || sourceRevision < 1n || entryRevision === undefined || entryRevision < 1n
+    || !/^sha256:[a-f0-9]{64}$/u.test(baseline.resourceContentRevision)
+    || !/^sha256:[a-f0-9]{64}$/u.test(baseline.installedContentRevision)
+    || !/^sha256:[a-f0-9]{64}$/u.test(baseline.entryContentRevision) || baseline.installedVersion.trim() === "") {
+    throw new GatewayError("The service returned an invalid Skill market sync baseline.");
+  }
+  return {
+    resourceRevision,
+    resourceContentRevision: baseline.resourceContentRevision,
+    installedContentRevision: baseline.installedContentRevision,
+    installedVersion: baseline.installedVersion,
+    sourceRevision,
+    entryRevision,
+    entryContentRevision: baseline.entryContentRevision
+  };
+}
+
+function mapSkillMarketSyncPolicy(policy: ProtoSkillMarketSyncPolicy): SkillMarketSyncPolicyView {
+  const revision = policy.revision?.value;
+  if (policy.resourceId.trim() === "" || revision === undefined || revision < 1n
+    || !/^skill_market_source_[a-f0-9]{32}$/u.test(policy.sourceId)
+    || !/^skill_market_entry_[a-f0-9]{32}$/u.test(policy.entryId)
+    || policy.target === undefined || policy.baseline === undefined || policy.createdAt === undefined || policy.updatedAt === undefined) {
+    throw new GatewayError("The service returned an invalid Skill market sync policy.");
+  }
+  const createdAt = timestampMs(policy.createdAt);
+  const updatedAt = timestampMs(policy.updatedAt);
+  if (updatedAt < createdAt) throw new GatewayError("The service returned invalid Skill market sync policy timestamps.");
+  return {
+    resourceId: policy.resourceId,
+    revision,
+    enabled: policy.enabled,
+    sourceId: policy.sourceId,
+    entryId: policy.entryId,
+    target: mapSkillMarketSyncTarget(policy.target),
+    baseline: mapSkillMarketSyncBaseline(policy.baseline),
+    createdAt,
+    updatedAt,
+    ...(policy.disabledReason === undefined ? {} : { disabledReason: policy.disabledReason })
+  };
+}
+
+function mapSkillMarketSyncAuthority(authority: ProtoSkillMarketSyncJobAuthority | undefined): SkillMarketSyncJobAuthorityView {
+  if (authority === undefined || !/^skill_market_source_[a-f0-9]{32}$/u.test(authority.sourceId)
+    || !/^skill_market_entry_[a-f0-9]{32}$/u.test(authority.entryId)
+    || authority.target === undefined || authority.baseline === undefined) {
+    throw new GatewayError("The service returned an invalid Skill market sync job authority.");
+  }
+  return {
+    sourceId: authority.sourceId,
+    entryId: authority.entryId,
+    target: mapSkillMarketSyncTarget(authority.target),
+    baseline: mapSkillMarketSyncBaseline(authority.baseline)
+  };
+}
+
+function mapSkillMarketSyncJobState(value: ProtoSkillMarketSyncJobState): SkillMarketSyncJobStateView {
+  switch (value) {
+    case ProtoSkillMarketSyncJobState.PENDING_REVALIDATION: return "pendingRevalidation";
+    case ProtoSkillMarketSyncJobState.RUNNING: return "running";
+    case ProtoSkillMarketSyncJobState.CANCELLING: return "cancelling";
+    case ProtoSkillMarketSyncJobState.SUCCEEDED: return "succeeded";
+    case ProtoSkillMarketSyncJobState.UP_TO_DATE: return "upToDate";
+    case ProtoSkillMarketSyncJobState.BLOCKED: return "blocked";
+    case ProtoSkillMarketSyncJobState.FAILED: return "failed";
+    case ProtoSkillMarketSyncJobState.CANCELLED: return "cancelled";
+    default: throw new GatewayError("The service returned an invalid Skill market sync job state.");
+  }
+}
+
+function mapSkillMarketSyncOutcome(value: ProtoSkillMarketSyncOutcome): SkillMarketSyncOutcomeView {
+  switch (value) {
+    case ProtoSkillMarketSyncOutcome.UPDATED: return "updated";
+    case ProtoSkillMarketSyncOutcome.ALREADY_CURRENT: return "alreadyCurrent";
+    case ProtoSkillMarketSyncOutcome.DOWNGRADE_BLOCKED: return "downgradeBlocked";
+    case ProtoSkillMarketSyncOutcome.DIRTY_CONTENT: return "dirtyContent";
+    case ProtoSkillMarketSyncOutcome.OWNER_CHANGED: return "ownerChanged";
+    case ProtoSkillMarketSyncOutcome.TARGET_CHANGED: return "targetChanged";
+    case ProtoSkillMarketSyncOutcome.RESOURCE_REMOVED: return "resourceRemoved";
+    case ProtoSkillMarketSyncOutcome.CANCELLED: return "cancelled";
+    default: throw new GatewayError("The service returned an invalid Skill market sync outcome.");
+  }
+}
+
+function mapSkillMarketSyncJob(job: ProtoSkillMarketSyncJob): SkillMarketSyncJobView {
+  const revision = job.revision?.value;
+  const policyRevision = job.policyRevision?.value;
+  if (!/^skill_sync_[a-f0-9]{32}$/u.test(job.jobId) || revision === undefined || revision < 1n
+    || job.policyResourceId.trim() === "" || policyRevision === undefined || policyRevision < 1n
+    || job.authority === undefined || !Number.isSafeInteger(job.attempt) || job.attempt < 1
+    || job.createdAt === undefined || job.updatedAt === undefined) {
+    throw new GatewayError("The service returned an invalid Skill market sync job.");
+  }
+  const createdAt = timestampMs(job.createdAt);
+  const updatedAt = timestampMs(job.updatedAt);
+  const completedAt = job.completedAt === undefined ? undefined : timestampMs(job.completedAt);
+  if (updatedAt < createdAt || (completedAt !== undefined && completedAt < createdAt)) {
+    throw new GatewayError("The service returned invalid Skill market sync job timestamps.");
+  }
+  return {
+    id: job.jobId,
+    revision,
+    state: mapSkillMarketSyncJobState(job.state),
+    policyResourceId: job.policyResourceId,
+    policyRevision,
+    authority: mapSkillMarketSyncAuthority(job.authority),
+    attempt: job.attempt,
+    ...(job.retryOfJobId === undefined ? {} : { retryOfJobId: job.retryOfJobId }),
+    ...(job.availableVersion === undefined ? {} : { availableVersion: job.availableVersion }),
+    ...(job.outcome === undefined ? {} : { outcome: mapSkillMarketSyncOutcome(job.outcome) }),
+    ...(job.error === undefined ? {} : { error: job.error }),
+    createdAt,
+    updatedAt,
+    ...(completedAt === undefined ? {} : { completedAt })
+  };
+}
+
+function protoSkillPublicationMetadata(metadata: SkillPublicationMetadataView) {
+  return {
+    slug: metadata.slug,
+    name: metadata.name,
+    ...(metadata.author === undefined ? {} : { author: metadata.author }),
+    description: metadata.description,
+    ...(metadata.category === undefined ? {} : { category: metadata.category }),
+    tags: [...metadata.tags],
+    version: metadata.version,
+    ...(metadata.changelog === undefined ? {} : { changelog: metadata.changelog })
+  };
+}
+
+function mapSkillPublicationMetadata(metadata: ProtoSkillPublicationMetadata | undefined): SkillPublicationMetadataView {
+  if (metadata === undefined || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(metadata.slug)
+    || !validPublicationText(metadata.name, 64)
+    || !validPublicationText(metadata.description, 2_000, true)
+    || !/^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u.test(metadata.version)
+    || (metadata.author !== undefined && !validPublicationText(metadata.author, 128))
+    || (metadata.category !== undefined && !validPublicationText(metadata.category, 64))
+    || (metadata.changelog !== undefined && !validPublicationText(metadata.changelog, 280))
+    || metadata.tags.length > 20 || metadata.tags.some((tag) => !validPublicationText(tag, 48))
+    || new Set(metadata.tags.map((tag) => tag.toLocaleLowerCase("en-US"))).size !== metadata.tags.length) {
+    throw new GatewayError("The service returned invalid Skill publication metadata.");
+  }
+  return {
+    slug: metadata.slug,
+    name: metadata.name,
+    ...(metadata.author === undefined ? {} : { author: metadata.author }),
+    description: metadata.description,
+    ...(metadata.category === undefined ? {} : { category: metadata.category }),
+    tags: [...metadata.tags],
+    version: metadata.version,
+    ...(metadata.changelog === undefined ? {} : { changelog: metadata.changelog })
+  };
+}
+
+function mapSkillPublicationAuthority(authority: ProtoSkillPublicationAuthority | undefined): SkillPublicationAuthorityView {
+  const resourceRevision = authority?.resourceRevision?.value;
+  const sourceRevision = authority?.sourceRevision?.value;
+  const scope = authority?.scope === ResourceScope.GLOBAL
+    ? "global" as const
+    : authority?.scope === ResourceScope.PROJECT
+      ? "project" as const
+      : undefined;
+  if (authority === undefined || authority.resourceId.trim() === "" || resourceRevision === undefined || resourceRevision < 1n
+    || !/^sha256:[a-f0-9]{64}$/u.test(authority.observedRevision) || authority.backendId.trim() === "" || scope === undefined
+    || (scope === "global" && authority.targetId !== undefined)
+    || (scope === "project" && (authority.targetId?.trim() ?? "") === "")
+    || !/^skill_market_source_[a-f0-9]{32}$/u.test(authority.sourceId) || sourceRevision === undefined || sourceRevision < 1n
+    || !/^sha256:[a-f0-9]{64}$/u.test(authority.sourceContentRevision)
+    || authority.sourceDisplay.trim() === "" || containsPrivatePath(authority.sourceDisplay)
+    || (authority.existingEntryId !== undefined && !/^skill_market_entry_[a-f0-9]{32}$/u.test(authority.existingEntryId))) {
+    throw new GatewayError("The service returned invalid or path-bearing Skill publication authority.");
+  }
+  return {
+    resourceId: authority.resourceId,
+    resourceRevision,
+    observedRevision: authority.observedRevision,
+    backendId: authority.backendId,
+    ...(authority.targetId === undefined ? {} : { targetId: authority.targetId }),
+    scope,
+    sourceId: authority.sourceId,
+    sourceRevision,
+    sourceContentRevision: authority.sourceContentRevision,
+    sourceDisplay: authority.sourceDisplay,
+    ...(authority.existingEntryId === undefined ? {} : { existingEntryId: authority.existingEntryId })
+  };
+}
+
+function mapSkillPublicationGate(gate: ProtoSkillPublicationGate): SkillPublicationGateView {
+  const id = gate.gateId === "metadata" || gate.gateId === "package" || gate.gateId === "sensitive_content"
+    || gate.gateId === "source_authority" ? gate.gateId : undefined;
+  const status = gate.status === ProtoSkillPublicationGateStatus.PENDING
+    ? "pending" as const
+    : gate.status === ProtoSkillPublicationGateStatus.PASSED
+      ? "passed" as const
+      : gate.status === ProtoSkillPublicationGateStatus.BLOCKED
+        ? "blocked" as const
+        : undefined;
+  if (id === undefined || status === undefined || !validPublicationText(gate.label, 80) || gate.issues.length > 20) {
+    throw new GatewayError("The service returned an invalid Skill publication gate.");
+  }
+  const issues = gate.issues.map((issue) => {
+    if (!/^[A-Z][A-Z0-9_]{0,63}$/u.test(issue.code) || !validPublicationText(issue.message, 512)
+      || containsPrivatePath(issue.message)
+      || (issue.path !== undefined && !portableSkillKey(issue.path))) {
+      throw new GatewayError("The service returned an invalid Skill publication gate issue.");
+    }
+    return {
+      code: issue.code,
+      message: issue.message,
+      ...(issue.path === undefined ? {} : { path: issue.path })
+    };
+  });
+  return { id, label: gate.label, status, issues };
+}
+
+function mapSkillPublicationResult(result: ProtoSkillPublicationResult | undefined): SkillPublicationResultView {
+  const sourceRevision = result?.sourceRevision?.value;
+  const entryRevision = result?.entryRevision?.value;
+  if (result === undefined || !/^skill_market_source_[a-f0-9]{32}$/u.test(result.sourceId)
+    || sourceRevision === undefined || sourceRevision < 1n
+    || !/^skill_market_entry_[a-f0-9]{32}$/u.test(result.entryId)
+    || entryRevision === undefined || entryRevision < 1n
+    || !/^sha256:[a-f0-9]{64}$/u.test(result.entryContentRevision)
+    || !/^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u.test(result.version)) {
+    throw new GatewayError("The service returned an invalid Skill publication result.");
+  }
+  return {
+    sourceId: result.sourceId,
+    sourceRevision,
+    entryId: result.entryId,
+    entryRevision,
+    entryContentRevision: result.entryContentRevision,
+    version: result.version
+  };
+}
+
+function mapSkillPublicationState(value: ProtoSkillPublicationState): SkillPublicationStateView {
+  switch (value) {
+    case ProtoSkillPublicationState.PENDING: return "pending";
+    case ProtoSkillPublicationState.SNAPSHOTTING: return "snapshotting";
+    case ProtoSkillPublicationState.PACKAGING: return "packaging";
+    case ProtoSkillPublicationState.SCANNING: return "scanning";
+    case ProtoSkillPublicationState.COMMITTING: return "committing";
+    case ProtoSkillPublicationState.RECONCILING: return "reconciling";
+    case ProtoSkillPublicationState.CANCELLING: return "cancelling";
+    case ProtoSkillPublicationState.PUBLISHED: return "published";
+    case ProtoSkillPublicationState.BLOCKED: return "blocked";
+    case ProtoSkillPublicationState.FAILED: return "failed";
+    case ProtoSkillPublicationState.CANCELLED: return "cancelled";
+    default: throw new GatewayError("The service returned an invalid Skill publication state.");
+  }
+}
+
+function mapSkillPublicationJob(job: ProtoSkillPublicationJob): SkillPublicationJobView {
+  const revision = job.revision?.value;
+  const accessRevision = job.accessRevision?.value;
+  const files = exactSafeUnsignedNumber(job.files);
+  const uncompressedBytes = exactSafeUnsignedNumber(job.uncompressedBytes);
+  const archiveBytes = exactSafeUnsignedNumber(job.archiveBytes);
+  const publisher = job.publisher === ProtoSkillPublicationPublisher.PERSONAL
+    ? "personal" as const
+    : job.publisher === ProtoSkillPublicationPublisher.TEAM
+      ? "team" as const
+      : undefined;
+  const visibility = job.visibility === ProtoSkillPublicationVisibility.PUBLIC
+    ? "public" as const
+    : job.visibility === ProtoSkillPublicationVisibility.DEPARTMENT
+      ? "department" as const
+      : job.visibility === ProtoSkillPublicationVisibility.PRIVATE
+        ? "private" as const
+        : undefined;
+  const accessShapeValid = publisher === "personal"
+    ? job.publisherScopeId === undefined && visibility !== "department" && job.audienceScopeIds.length === 0
+    : publisher === "team"
+      ? job.publisherScopeId !== undefined && validCollaborationId(job.publisherScopeId)
+        && (visibility === "public" && job.audienceScopeIds.length === 0
+          || visibility === "department" && job.audienceScopeIds.length > 0)
+      : false;
+  if (!/^skill_publication_[a-f0-9]{32}$/u.test(job.jobId) || revision === undefined || revision < 1n
+    || accessRevision === undefined || accessRevision < 1n || job.authority === undefined || job.metadata === undefined
+    || publisher === undefined || visibility === undefined || !accessShapeValid
+    || job.audienceScopeIds.some((id) => !validCollaborationId(id))
+    || new Set(job.audienceScopeIds).size !== job.audienceScopeIds.length
+    || files === undefined || uncompressedBytes === undefined
+    || archiveBytes === undefined || !Number.isSafeInteger(job.attempt) || job.attempt < 1
+    || job.gates.length !== 4 || job.createdAt === undefined || job.updatedAt === undefined) {
+    throw new GatewayError("The service returned an invalid Skill publication job.");
+  }
+  const state = mapSkillPublicationState(job.state);
+  const terminal = state === "published" || state === "blocked" || state === "failed" || state === "cancelled";
+  const verdict = job.verdict === ProtoSkillPublicationVerdict.PENDING
+    ? "pending" as const
+    : job.verdict === ProtoSkillPublicationVerdict.PASSED
+      ? "passed" as const
+      : job.verdict === ProtoSkillPublicationVerdict.BLOCKED
+        ? "blocked" as const
+        : undefined;
+  const gates = job.gates.map(mapSkillPublicationGate);
+  const expectedGateIds: SkillPublicationGateView["id"][] = ["metadata", "package", "sensitive_content", "source_authority"];
+  const createdAt = timestampMs(job.createdAt);
+  const updatedAt = timestampMs(job.updatedAt);
+  const completedAt = job.completedAt === undefined ? undefined : timestampMs(job.completedAt);
+  if (verdict === undefined || gates.some((gate, index) => gate.id !== expectedGateIds[index])
+    || updatedAt < createdAt || terminal !== (completedAt !== undefined)
+    || (completedAt !== undefined && completedAt < updatedAt) || terminal && job.cancellable
+    || (state === "published") !== (job.result !== undefined)
+    || state === "published" && (verdict !== "passed" || gates.some((gate) => gate.status !== "passed"))
+    || state === "blocked" && (verdict !== "blocked" || !gates.some((gate) => gate.status === "blocked"))
+    || ((state === "failed" || state === "reconciling" || state === "cancelled") !== (job.error !== undefined))
+    || (job.error !== undefined && (!validPublicationText(job.error, 2_048) || containsPrivatePath(job.error)))) {
+    throw new GatewayError("The service returned an inconsistent Skill publication job.");
+  }
+  return {
+    id: job.jobId,
+    revision,
+    state,
+    authority: mapSkillPublicationAuthority(job.authority),
+    metadata: mapSkillPublicationMetadata(job.metadata),
+    publisher,
+    ...(job.publisherScopeId === undefined ? {} : { publisherScopeId: job.publisherScopeId }),
+    visibility,
+    audienceScopeIds: [...job.audienceScopeIds],
+    accessRevision,
+    gates,
+    verdict,
+    files,
+    uncompressedBytes,
+    archiveBytes,
+    attempt: job.attempt,
+    ...(job.retryOfJobId === undefined ? {} : { retryOfJobId: job.retryOfJobId }),
+    ...(job.result === undefined ? {} : { result: mapSkillPublicationResult(job.result) }),
+    createdAt,
+    updatedAt,
+    ...(completedAt === undefined ? {} : { completedAt }),
+    ...(job.error === undefined ? {} : { error: job.error }),
+    cancellable: job.cancellable
+  };
+}
+
+function mapSkillPublicationPreview(preview: ProtoSkillPublicationPreview): SkillPublicationPreviewView {
+  const mode = preview.mode === ProtoSkillPublicationMode.FIRST
+    ? "first" as const
+    : preview.mode === ProtoSkillPublicationMode.VERSION
+      ? "version" as const
+      : undefined;
+  const collaborationRevision = preview.collaborationRevision?.value;
+  const collaborationUnavailableReason = preview.collaborationUnavailableReason === ""
+    ? undefined
+    : preview.collaborationUnavailableReason;
+  const collaborationAvailable = preview.personalPublisherAvailable;
+  if (preview.authority === undefined || preview.source === undefined || mode === undefined
+    || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(preview.suggestedSlug)
+    || !/^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u.test(preview.suggestedVersion)
+    || collaborationRevision === undefined || collaborationRevision < 0n
+    || preview.departmentVisibilityAvailable && !preview.teamPublisherAvailable
+    || collaborationAvailable !== preview.publicVisibilityAvailable
+    || collaborationAvailable !== preview.privateVisibilityAvailable
+    || (!collaborationAvailable && (collaborationRevision !== 0n || preview.teamPublisherAvailable
+      || preview.departmentVisibilityAvailable || collaborationUnavailableReason === undefined))
+    || (collaborationAvailable && collaborationRevision < 1n)
+    || (collaborationUnavailableReason !== undefined
+      && (!validPublicationText(collaborationUnavailableReason, 512) || containsPrivatePath(collaborationUnavailableReason)))) {
+    throw new GatewayError("The service returned an invalid Skill publication preview.");
+  }
+  const authority = mapSkillPublicationAuthority(preview.authority);
+  const source = mapSkillMarketSource(preview.source);
+  const existingEntry = preview.existingEntry === undefined ? undefined : mapSkillMarketEntry(preview.existingEntry);
+  if (source.id !== authority.sourceId || source.revision !== authority.sourceRevision
+    || source.contentRevision !== authority.sourceContentRevision || source.state !== "ready" || source.kind !== "local"
+    || (mode === "first") !== (existingEntry === undefined)
+    || (existingEntry === undefined) !== (authority.existingEntryId === undefined)
+    || existingEntry !== undefined && (existingEntry.identity.entryId !== authority.existingEntryId
+      || existingEntry.slug !== preview.suggestedSlug)) {
+    throw new GatewayError("The service returned an inconsistent Skill publication preview.");
+  }
+  return {
+    authority,
+    source,
+    mode,
+    suggestedSlug: preview.suggestedSlug,
+    suggestedVersion: preview.suggestedVersion,
+    ...(existingEntry === undefined ? {} : { existingEntry }),
+    dirty: preview.dirty,
+    collaborationRevision,
+    personalPublisherAvailable: preview.personalPublisherAvailable,
+    teamPublisherAvailable: preview.teamPublisherAvailable,
+    publicVisibilityAvailable: preview.publicVisibilityAvailable,
+    departmentVisibilityAvailable: preview.departmentVisibilityAvailable,
+    privateVisibilityAvailable: preview.privateVisibilityAvailable,
+    ...(collaborationUnavailableReason === undefined ? {} : { collaborationUnavailableReason })
+  };
+}
+
+function privatePathLikeLabel(value: string): boolean {
+  return /^[A-Za-z]:[\\/]/u.test(value) || /^\\\\/u.test(value) || value.startsWith("/");
+}
+
+function validCollaborationId(value: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(value);
+}
+
+function protoCollaborationScopeKind(value: CollaborationScopeKindView): ProtoCollaborationScopeKind {
+  return value === "team" ? ProtoCollaborationScopeKind.TEAM : ProtoCollaborationScopeKind.DEPARTMENT;
+}
+
+function protoSkillPublicationPublisher(value: SkillPublicationAccessSelectionView["publisher"]): ProtoSkillPublicationPublisher {
+  return value === "personal" ? ProtoSkillPublicationPublisher.PERSONAL : ProtoSkillPublicationPublisher.TEAM;
+}
+
+function protoSkillPublicationVisibility(value: SkillPublicationAccessSelectionView["visibility"]): ProtoSkillPublicationVisibility {
+  if (value === "public") return ProtoSkillPublicationVisibility.PUBLIC;
+  if (value === "department") return ProtoSkillPublicationVisibility.DEPARTMENT;
+  return ProtoSkillPublicationVisibility.PRIVATE;
+}
+
+function validPublicationText(value: string, maximum: number, allowEmpty = false): boolean {
+  return value === value.trim() && value.length <= maximum && (allowEmpty || value !== "")
+    && !/[\u0000-\u001f\u007f\u200e\u200f\u202a-\u202e\u2066-\u2069]/u.test(value);
+}
+
+function containsPrivatePath(value: string): boolean {
+  return /[A-Za-z]:[\\/]/u.test(value)
+    || /\\\\[^\\\s"']+[\\/]/u.test(value)
+    || /(?:^|[\s"'(])\/(?:[^/\s"'()]+\/)+[^/\s"'()]*/u.test(value);
+}
+
+function portableSkillName(value: string): boolean {
+  return value.length > 0 && value !== "." && value !== ".." && !value.includes("/") && !value.includes("\\") && !value.includes("\0");
+}
+
+function portableSkillKey(value: string): boolean {
+  return value.length > 0 && !value.startsWith("/") && !value.includes("\\") && !value.includes("\0")
+    && value.split("/").every(portableSkillName);
+}
+
+function extensionSourceLocation(source: ExtensionSourceDraft) {
+  return {
+    kind: source.kind === "local"
+      ? { case: "local" as const, value: { path: source.path } }
+      : {
+          case: "git" as const,
+          value: {
+            repositoryUrl: source.repositoryUrl,
+            ...(source.ref === undefined ? {} : { ref: source.ref }),
+            sparsePaths: [...source.sparsePaths]
+          }
+        }
+  };
+}
+
+function mapExtensionSource(source: ProtoExtensionSourceDescriptor): ExtensionSourceView {
+  const revision = source.revision?.value;
+  if (!/^extension_source_[a-f0-9]{32}$/u.test(source.sourceId) || revision === undefined || revision < 1n
+    || !/^sha256:[a-f0-9]{64}$/u.test(source.contentRevision) || source.name.trim() === "" || source.addedAt === undefined) {
+    throw new GatewayError("Orchestrator returned an incomplete Extension source descriptor.");
+  }
+  const location = source.location?.kind;
+  const mappedLocation: ExtensionSourceView["location"] = location?.case === "local"
+    ? location.value.path.trim() === "" || source.kind !== ProtoExtensionSourceKind.LOCAL
+      ? (() => { throw new GatewayError("Orchestrator returned an invalid local Extension source."); })()
+      : { kind: "local", path: location.value.path }
+    : location?.case === "git"
+      ? location.value.repositoryUrl.trim() === "" || source.kind !== ProtoExtensionSourceKind.GIT
+        ? (() => { throw new GatewayError("Orchestrator returned an invalid Git Extension source."); })()
+        : {
+            kind: "git",
+            repositoryUrl: location.value.repositoryUrl,
+            ...(location.value.ref === undefined ? {} : { ref: location.value.ref }),
+            sparsePaths: [...location.value.sparsePaths]
+          }
+      : (() => { throw new GatewayError("Orchestrator returned an Extension source without its location."); })();
+  const state: ExtensionSourceView["state"] = source.state === ProtoExtensionSourceState.READY
+    ? "ready"
+    : source.state === ProtoExtensionSourceState.ERROR
+      ? "error"
+      : (() => { throw new GatewayError("Orchestrator returned an invalid Extension source state."); })();
+  for (const count of [source.discoveredExtensionCount, source.declaredEntryCount, source.skippedEntryCount, source.unreadableEntryCount]) {
+    if (!Number.isSafeInteger(count) || count < 0) throw new GatewayError("Orchestrator returned invalid Extension source counts.");
+  }
+  if (source.discoveredExtensionCount > MAX_EXTENSION_SOURCE_EXTENSIONS
+    || source.declaredEntryCount > MAX_EXTENSION_SOURCE_DECLARED_ENTRIES
+    || source.skippedEntryCount + source.unreadableEntryCount > source.declaredEntryCount
+    || (state === "error") !== (source.error !== undefined)) {
+    throw new GatewayError("Orchestrator returned inconsistent Extension source state.");
+  }
+  const addedAt = timestampMs(source.addedAt);
+  const refreshedAt = source.refreshedAt === undefined ? undefined : timestampMs(source.refreshedAt);
+  if (!Number.isSafeInteger(addedAt) || addedAt < 0 || (refreshedAt !== undefined && (!Number.isSafeInteger(refreshedAt) || refreshedAt < addedAt))) {
+    throw new GatewayError("Orchestrator returned invalid Extension source timestamps.");
+  }
+  return {
+    id: source.sourceId,
+    revision,
+    kind: mappedLocation.kind,
+    location: mappedLocation,
+    name: source.name,
+    ...(source.displayName === undefined ? {} : { displayName: source.displayName }),
+    state,
+    contentRevision: source.contentRevision,
+    discoveredExtensionCount: source.discoveredExtensionCount,
+    declaredEntryCount: source.declaredEntryCount,
+    skippedEntryCount: source.skippedEntryCount,
+    unreadableEntryCount: source.unreadableEntryCount,
+    addedAt,
+    ...(refreshedAt === undefined ? {} : { refreshedAt }),
+    ...(source.error === undefined ? {} : { error: source.error })
+  };
+}
+
+function mapExtensionCatalogEntry(extension: ProtoExtensionCatalogEntry): ExtensionCatalogEntryView {
+  const revision = extension.revision?.value;
+  const setup = extension.setup;
+  if (extension.extensionId.trim() === "" || revision === undefined || revision < 1n || setup?.revision?.value === undefined) {
+    throw new GatewayError("Orchestrator returned an incomplete Extension descriptor.");
+  }
+  const owner = extension.owner?.kind;
+  const mappedOwner: ExtensionCatalogEntryView["owner"] = owner?.case === "resource"
+    ? owner.value.resourceVersion?.value === undefined || owner.value.resourceId.trim() === "" || owner.value.discoveredRevision.trim() === ""
+      ? (() => { throw new GatewayError("Orchestrator returned an incomplete Extension Resource owner."); })()
+      : {
+          kind: "resource",
+          resourceId: owner.value.resourceId,
+          discoveredRevision: owner.value.discoveredRevision,
+          resourceRevision: owner.value.resourceVersion.value
+        }
+    : owner?.case === "mcp"
+      ? owner.value.serverRevision?.value === undefined || owner.value.mcpServerId.trim() === ""
+        ? (() => { throw new GatewayError("Orchestrator returned an incomplete Extension MCP owner."); })()
+        : { kind: "mcp", serverId: owner.value.mcpServerId, serverRevision: owner.value.serverRevision.value }
+      : owner?.case === "source"
+        ? owner.value.sourceRevision?.value === undefined || owner.value.sourceRevision.value < 1n
+          || !/^extension_source_[a-f0-9]{32}$/u.test(owner.value.sourceId)
+          || !/^extension_source_entry_[a-f0-9]{32}$/u.test(owner.value.entryId)
+          || !/^sha256:[a-f0-9]{64}$/u.test(owner.value.contentRevision)
+          ? (() => { throw new GatewayError("Orchestrator returned an incomplete Extension Source owner."); })()
+          : {
+              kind: "source",
+              sourceId: owner.value.sourceId,
+              sourceRevision: owner.value.sourceRevision.value,
+              entryId: owner.value.entryId,
+              contentRevision: owner.value.contentRevision
+            }
+        : (() => { throw new GatewayError("Orchestrator returned an Extension without an owner."); })();
+  if (
+    extension.update !== undefined
+    && (
+      mappedOwner.kind !== "resource"
+      || (extension.update.availableVersion !== undefined && extension.update.availableVersion.trim() === "")
+    )
+  ) throw new GatewayError("Orchestrator returned an invalid Extension package update.");
+  const mainViewIcon = extension.mainView === undefined ? undefined : extensionMainViewIcon(extension.mainView.icon);
+  const mainView = extension.mainView === undefined ? undefined : {
+    ...(extension.mainView.title === undefined ? {} : { title: extension.mainView.title }),
+    ...(mainViewIcon === undefined ? {} : { icon: mainViewIcon })
+  };
+  if (extension.mainView?.title !== undefined && (
+    extension.mainView.title.trim() !== extension.mainView.title
+    || extension.mainView.title.length === 0
+    || extension.mainView.title.length > 80
+  ) || extension.sidebarSupported !== (mainView !== undefined) || extension.sidebarVisible && mainView === undefined) {
+    throw new GatewayError("Orchestrator returned an invalid Extension main-view capability.");
+  }
+  const library = extension.library === undefined
+    ? undefined
+    : extension.library.schemaVersion === 1
+      ? { schemaVersion: 1 as const }
+      : (() => { throw new GatewayError("Orchestrator returned an invalid Extension Library capability."); })();
+  return {
+    id: extension.extensionId,
+    revision,
+    owner: mappedOwner,
+    source: extension.source === ProtoExtensionCatalogSource.LOCAL
+      ? "local"
+      : extension.source === ProtoExtensionCatalogSource.MARKET
+        ? "market"
+        : (() => { throw new GatewayError("Orchestrator returned an invalid Extension source."); })(),
+    installed: extension.installed,
+    installState: extensionInstallState(extension.installState),
+    name: extension.name,
+    ...(extension.version === undefined ? {} : { version: extension.version }),
+    ...(extension.author === undefined ? {} : { author: extension.author }),
+    description: extension.description,
+    enabled: extension.enabled,
+    ...(mainView === undefined ? {} : { mainView }),
+    ...(library === undefined ? {} : { library }),
+    sidebarSupported: extension.sidebarSupported,
+    sidebarVisible: extension.sidebarVisible,
+    tools: extension.tools.map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      requiresPermission: tool.requiresPermission
+    })),
+    permissions: extension.permissions.map((permission) => ({
+      id: permission.permissionId,
+      label: permission.label,
+      description: permission.description,
+      required: permission.required,
+      granted: permission.granted
+    })),
+    commands: extension.commands.map((command) => ({
+      name: command.name,
+      description: command.description,
+      sessionId: command.sessionId
+    })),
+    setup: {
+      state: extensionSetupState(setup.state),
+      ...(setup.attemptId === undefined ? {} : { attemptId: setup.attemptId }),
+      revision: setup.revision.value,
+      fields: setup.fields.map((field) => ({
+        id: field.fieldId,
+        label: field.label,
+        description: field.description,
+        kind: extensionSetupFieldKind(field.kind),
+        required: field.required,
+        configured: field.configured,
+        options: [...field.options]
+      })),
+      ...(setup.error === undefined ? {} : { error: setup.error })
+    },
+    ...(extension.update === undefined ? {} : {
+      update: {
+        source: mapExtensionSourceOwner(extension.update.source),
+        ...(extension.update.availableVersion === undefined ? {} : { availableVersion: extension.update.availableVersion }),
+        sourceReplacement: extension.update.sourceReplacement
+      }
+    }),
+    useSupported: extension.useSupported,
+    ...(extension.error === undefined ? {} : { error: extension.error })
+  };
+}
+
+function mapExtensionMainViewSurface(surface: ProtoExtensionMainViewSurface): ExtensionMainViewSurfaceView {
+  const resourceRevision = surface.owner?.resourceVersion?.value;
+  const backendRevision = surface.backendRevision?.value;
+  const backendGeneration = exactSafeUnsignedNumber(surface.backendGeneration);
+  const expiresAt = surface.expiresAt === undefined ? undefined : timestampMs(surface.expiresAt);
+  const icon = extensionMainViewIcon(surface.icon);
+  if (!/^extension_surface_[a-f0-9]{32}$/u.test(surface.surfaceId)
+    || !/^extension_[a-f0-9]{32}$/u.test(surface.extensionId)
+    || surface.owner === undefined || surface.owner.resourceId.trim() === ""
+    || !/^sha256:[a-f0-9]{64}$/u.test(surface.owner.discoveredRevision)
+    || resourceRevision === undefined || resourceRevision < 1n
+    || surface.backendId.trim() === "" || backendRevision === undefined || backendRevision < 1n
+    || backendGeneration === undefined || expiresAt === undefined || !Number.isSafeInteger(expiresAt) || expiresAt < 0
+    || !validExtensionSurfaceEndpoint(surface.endpoint, surface.surfaceId)
+    || surface.title !== undefined && (surface.title.trim() !== surface.title || surface.title.length === 0 || surface.title.length > 80)) {
+    throw new GatewayError("Orchestrator returned an invalid Extension main-view surface.");
+  }
+  return {
+    id: surface.surfaceId,
+    extensionId: surface.extensionId,
+    owner: {
+      kind: "resource",
+      resourceId: surface.owner.resourceId,
+      discoveredRevision: surface.owner.discoveredRevision,
+      resourceRevision
+    },
+    backendId: surface.backendId,
+    backendRevision,
+    backendGeneration,
+    endpoint: surface.endpoint,
+    ...(surface.title === undefined ? {} : { title: surface.title }),
+    ...(icon === undefined ? {} : { icon }),
+    expiresAt
+  };
+}
+
+function mapExtensionLibraryOverview(value: ProtoExtensionLibraryOverview): ExtensionLibraryOverviewView {
+  const state = extensionLibraryState(value.state);
+  const unavailableReason = extensionLibraryUnavailableReason(value.unavailableReason);
+  if (!/^extension_[a-f0-9]{32}$/u.test(value.extensionId) || value.name.trim() === ""
+    || !Number.isSafeInteger(value.files) || value.files < 0 || !Number.isSafeInteger(value.trashCount) || value.trashCount < 0
+    || !Number.isSafeInteger(value.graceCount) || value.graceCount < 0 || value.bytes < 0n || value.softLimitBytes < 1n
+    || value.diskFreeBytes !== undefined && value.diskFreeBytes < 0n
+    || state === "unavailable" && unavailableReason === undefined
+    || state !== "unavailable" && unavailableReason !== undefined
+    || value.operation !== undefined && (value.operation.operationId.trim() === "" || value.operation.phase.trim() === "")) {
+    throw new GatewayError("Orchestrator returned an invalid Extension Library overview.");
+  }
+  return {
+    extensionId: value.extensionId,
+    name: value.name,
+    state,
+    ...(unavailableReason === undefined ? {} : { unavailableReason }),
+    ...(value.location === undefined ? {} : { location: mapExtensionLibraryLocation(value.location) }),
+    files: value.files,
+    bytes: value.bytes,
+    ...(value.diskFreeBytes === undefined ? {} : { diskFreeBytes: value.diskFreeBytes }),
+    softLimitBytes: value.softLimitBytes,
+    softLimitExceeded: value.softLimitExceeded,
+    orphaned: value.orphaned,
+    trashCount: value.trashCount,
+    graceCount: value.graceCount,
+    ...(value.operation === undefined ? {} : { operation: { id: value.operation.operationId, phase: value.operation.phase } })
+  };
+}
+
+function extensionLibraryState(value: ProtoExtensionLibraryState): ExtensionLibraryOverviewView["state"] {
+  switch (value) {
+    case ProtoExtensionLibraryState.READY: return "ready";
+    case ProtoExtensionLibraryState.READ_ONLY: return "readOnly";
+    case ProtoExtensionLibraryState.UNAVAILABLE: return "unavailable";
+    default: throw new GatewayError("Orchestrator returned an invalid Extension Library state.");
+  }
+}
+
+function extensionLibraryUnavailableReason(
+  value: ProtoExtensionLibraryUnavailableReason
+): ExtensionLibraryOverviewView["unavailableReason"] {
+  switch (value) {
+    case ProtoExtensionLibraryUnavailableReason.UNSPECIFIED: return undefined;
+    case ProtoExtensionLibraryUnavailableReason.METADATA_CORRUPT: return "metadataCorrupt";
+    case ProtoExtensionLibraryUnavailableReason.FILE_LIMIT: return "fileLimit";
+    case ProtoExtensionLibraryUnavailableReason.IO: return "io";
+    case ProtoExtensionLibraryUnavailableReason.OPERATION_IN_PROGRESS: return "operationInProgress";
+    case ProtoExtensionLibraryUnavailableReason.DISK_MISSING: return "diskMissing";
+    case ProtoExtensionLibraryUnavailableReason.BINDING_MOVED: return "bindingMoved";
+    case ProtoExtensionLibraryUnavailableReason.STATE_CORRUPT: return "stateCorrupt";
+    default: throw new GatewayError("Orchestrator returned an invalid Extension Library unavailable reason.");
+  }
+}
+
+function mapExtensionLibraryLocation(value: ProtoExtensionLibraryLocation): ExtensionLibraryLocationView {
+  const generation = value.generation?.value;
+  const kind = value.kind === ProtoExtensionLibraryLocationKind.DEFAULT
+    ? "default" as const
+    : value.kind === ProtoExtensionLibraryLocationKind.CUSTOM
+      ? "custom" as const
+      : undefined;
+  if (kind === undefined || value.path.trim() === "" || generation === undefined || generation < 1n) {
+    throw new GatewayError("Orchestrator returned an invalid Extension Library location.");
+  }
+  return { kind, path: value.path, generation };
+}
+
+function mapExtensionLibrarySession(value: ProtoExtensionLibrarySession): ExtensionLibrarySessionView {
+  const expiresAt = requiredExtensionLibraryTimestamp(value.expiresAt, "session expiry");
+  const generation = value.bindingGeneration?.value;
+  const limits = value.limits;
+  if (!/^library_session_[a-f0-9]{32}$/u.test(value.sessionId)
+    || !/^extension_[a-f0-9]{32}$/u.test(value.extensionId) || generation === undefined || generation < 1n
+    || limits === undefined || limits.maximumReadBytes < 1n || limits.maximumWriteBytes < 1n
+    || limits.maximumStreamBytes < limits.maximumWriteBytes || limits.maximumPathCharacters < 1
+    || limits.maximumPathSegments < 1 || limits.maximumListPageSize < 1 || limits.maximumFiles < 1
+    || limits.softLimitBytes < 1n || limits.diskReserveBytes < 1n) {
+    throw new GatewayError("Orchestrator returned an invalid Extension Library session.");
+  }
+  return {
+    id: value.sessionId,
+    extensionId: value.extensionId,
+    expiresAt,
+    bindingGeneration: generation,
+    limits: {
+      maximumReadBytes: limits.maximumReadBytes,
+      maximumWriteBytes: limits.maximumWriteBytes,
+      maximumStreamBytes: limits.maximumStreamBytes,
+      maximumPathCharacters: limits.maximumPathCharacters,
+      maximumPathSegments: limits.maximumPathSegments,
+      maximumListPageSize: limits.maximumListPageSize,
+      maximumFiles: limits.maximumFiles,
+      softLimitBytes: limits.softLimitBytes,
+      diskReserveBytes: limits.diskReserveBytes
+    }
+  };
+}
+
+function mapExtensionLibraryTrash(value: ProtoExtensionLibraryTrashEntry): ExtensionLibraryTrashEntryView {
+  if (!/^library_trash_[a-f0-9]{32}$/u.test(value.trashId) || !/^extension_[a-f0-9]{32}$/u.test(value.extensionId)
+    || value.name.trim() === "" || !Number.isSafeInteger(value.files) || value.files < 0 || value.bytes < 0n) {
+    throw new GatewayError("Orchestrator returned an invalid Extension Library trash record.");
+  }
+  const deletedAt = requiredExtensionLibraryTimestamp(value.deletedAt, "trash deletion");
+  const expiresAt = requiredExtensionLibraryTimestamp(value.expiresAt, "trash expiry");
+  if (expiresAt <= deletedAt) throw new GatewayError("Orchestrator returned an invalid Extension Library trash retention window.");
+  return { id: value.trashId, extensionId: value.extensionId, name: value.name, deletedAt, expiresAt, files: value.files, bytes: value.bytes };
+}
+
+function mapExtensionLibraryGrace(value: ProtoExtensionLibraryGraceEntry): ExtensionLibraryGraceEntryView {
+  if (!/^library_grace_[a-f0-9]{32}$/u.test(value.graceId) || !/^extension_[a-f0-9]{32}$/u.test(value.extensionId)
+    || value.name.trim() === "" || !Number.isSafeInteger(value.files) || value.files < 0 || value.bytes < 0n) {
+    throw new GatewayError("Orchestrator returned an invalid Extension Library grace record.");
+  }
+  const createdAt = requiredExtensionLibraryTimestamp(value.createdAt, "grace creation");
+  const expiresAt = requiredExtensionLibraryTimestamp(value.expiresAt, "grace expiry");
+  if (expiresAt <= createdAt) throw new GatewayError("Orchestrator returned an invalid Extension Library grace window.");
+  return { id: value.graceId, extensionId: value.extensionId, name: value.name, createdAt, expiresAt, files: value.files, bytes: value.bytes };
+}
+
+function mapExtensionLibraryCall(call: ExtensionLibraryCallView) {
+  const statement = (value: { readonly sql: string; readonly parameters?: readonly ExtensionLibrarySqlValueView[] }) => ({
+    sql: value.sql,
+    parameters: (value.parameters ?? []).map(mapExtensionLibrarySqlValueInput)
+  });
+  switch (call.kind) {
+    case "read": return create(ExtensionLibraryCallSchema, { operation: { case: "read", value: {
+      path: call.path,
+      ...(call.offset === undefined ? {} : { offset: call.offset }),
+      ...(call.length === undefined ? {} : { length: call.length })
+    } } });
+    case "write": return create(ExtensionLibraryCallSchema, { operation: { case: "write", value: {
+      path: call.path, content: call.content, ifNotExists: call.ifNotExists ?? false
+    } } });
+    case "stat": return create(ExtensionLibraryCallSchema, { operation: { case: "stat", value: { path: call.path } } });
+    case "list": return create(ExtensionLibraryCallSchema, { operation: { case: "list", value: {
+      ...(call.path === undefined ? {} : { path: call.path }),
+      recursive: call.recursive ?? false,
+      ...(call.limit === undefined ? {} : { limit: call.limit }),
+      ...(call.cursor === undefined ? {} : { cursor: call.cursor })
+    } } });
+    case "mkdir": return create(ExtensionLibraryCallSchema, { operation: { case: "mkdir", value: { path: call.path } } });
+    case "delete": return create(ExtensionLibraryCallSchema, { operation: { case: "delete", value: { path: call.path, recursive: call.recursive ?? false } } });
+    case "rename": return create(ExtensionLibraryCallSchema, { operation: { case: "rename", value: { from: call.from, to: call.to, overwrite: call.overwrite ?? false } } });
+    case "writeBegin": return create(ExtensionLibraryCallSchema, { operation: { case: "writeBegin", value: {
+      path: call.path,
+      totalBytes: call.totalBytes,
+      ...(call.sha256 === undefined ? {} : { sha256: call.sha256 }),
+      ifNotExists: call.ifNotExists ?? false
+    } } });
+    case "writeChunk": return create(ExtensionLibraryCallSchema, { operation: { case: "writeChunk", value: {
+      streamId: call.streamId, sequence: call.sequence, content: call.content
+    } } });
+    case "writeCommit": return create(ExtensionLibraryCallSchema, { operation: { case: "writeCommit", value: { streamId: call.streamId } } });
+    case "writeAbort": return create(ExtensionLibraryCallSchema, { operation: { case: "writeAbort", value: { streamId: call.streamId } } });
+    case "sqlOpen": return create(ExtensionLibraryCallSchema, { operation: { case: "sqlOpen", value: {
+      path: call.path, create: call.create ?? false, readOnly: call.readOnly ?? false
+    } } });
+    case "sqlExecute": return create(ExtensionLibraryCallSchema, { operation: { case: "sqlExecute", value: {
+      handleId: call.handleId, statement: statement(call.statement)
+    } } });
+    case "sqlBatch": return create(ExtensionLibraryCallSchema, { operation: { case: "sqlBatch", value: {
+      handleId: call.handleId, statements: call.statements.map(statement)
+    } } });
+    case "sqlMigrate": return create(ExtensionLibraryCallSchema, { operation: { case: "sqlMigrate", value: {
+      handleId: call.handleId,
+      migrations: call.migrations.map((migration) => ({ version: migration.version, statements: [...migration.statements] }))
+    } } });
+    case "sqlBackup": return create(ExtensionLibraryCallSchema, { operation: { case: "sqlBackup", value: {
+      handleId: call.handleId, targetPath: call.targetPath
+    } } });
+    case "sqlCheck": return create(ExtensionLibraryCallSchema, { operation: { case: "sqlCheck", value: { handleId: call.handleId } } });
+    case "sqlClose": return create(ExtensionLibraryCallSchema, { operation: { case: "sqlClose", value: { handleId: call.handleId } } });
+  }
+}
+
+function mapExtensionLibrarySqlValueInput(value: ExtensionLibrarySqlValueView) {
+  switch (value.kind) {
+    case "null": return { value: { case: "nullValue" as const, value: true } };
+    case "number": return { value: { case: "numberValue" as const, value: value.value } };
+    case "integer": return { value: { case: "integerValue" as const, value: value.value.toString(10) } };
+    case "text": return { value: { case: "textValue" as const, value: value.value } };
+    case "blob": return { value: { case: "blobValue" as const, value: value.value } };
+  }
+}
+
+function mapExtensionLibraryCallResult(value: ProtoExtensionLibraryCallResult): ExtensionLibraryCallResultView {
+  switch (value.result.case) {
+    case "read":
+      if (!validLibraryRelativePath(value.result.value.path) || !/^[a-f0-9]{64}$/u.test(value.result.value.sha256)) {
+        throw new GatewayError("Orchestrator returned an invalid Extension Library read result.");
+      }
+      return { kind: "read", path: value.result.value.path, content: Uint8Array.from(value.result.value.content), sha256: value.result.value.sha256 };
+    case "write":
+      if (!validLibraryRelativePath(value.result.value.path) || value.result.value.bytes < 0n || !/^[a-f0-9]{64}$/u.test(value.result.value.sha256)) {
+        throw new GatewayError("Orchestrator returned an invalid Extension Library write result.");
+      }
+      return { kind: "write", path: value.result.value.path, bytes: value.result.value.bytes, sha256: value.result.value.sha256 };
+    case "stat": return { kind: "stat", entry: mapExtensionLibraryEntry(value.result.value) };
+    case "list": return {
+      kind: "list",
+      entries: value.result.value.entries.map(mapExtensionLibraryEntry),
+      ...(value.result.value.nextCursor === undefined ? {} : { nextCursor: value.result.value.nextCursor })
+    };
+    case "path":
+      if (!validLibraryRelativePath(value.result.value.path)) throw new GatewayError("Orchestrator returned an invalid Extension Library path result.");
+      return { kind: "path", path: value.result.value.path, existed: value.result.value.existed };
+    case "rename":
+      if (!validLibraryRelativePath(value.result.value.from) || !validLibraryRelativePath(value.result.value.to)) {
+        throw new GatewayError("Orchestrator returned an invalid Extension Library rename result.");
+      }
+      return { kind: "rename", from: value.result.value.from, to: value.result.value.to };
+    case "stream": {
+      if (!/^library_stream_[a-f0-9]{32}$/u.test(value.result.value.streamId) || value.result.value.receivedBytes < 0n
+        || !Number.isSafeInteger(value.result.value.nextSequence) || value.result.value.nextSequence < 0) {
+        throw new GatewayError("Orchestrator returned an invalid Extension Library stream result.");
+      }
+      return {
+        kind: "stream",
+        streamId: value.result.value.streamId,
+        receivedBytes: value.result.value.receivedBytes,
+        nextSequence: value.result.value.nextSequence,
+        ...(value.result.value.expiresAt === undefined ? {} : { expiresAt: requiredExtensionLibraryTimestamp(value.result.value.expiresAt, "stream expiry") }),
+        aborted: value.result.value.aborted
+      };
+    }
+    case "sqlHandle":
+      if (value.result.value.handleId.trim() === "" || !validLibraryRelativePath(value.result.value.path)) {
+        throw new GatewayError("Orchestrator returned an invalid Extension Library SQLite handle.");
+      }
+      return {
+        kind: "sqlHandle",
+        handleId: value.result.value.handleId,
+        path: value.result.value.path,
+        readOnly: value.result.value.readOnly,
+        userVersion: value.result.value.userVersion
+      };
+    case "sqlResult": return { kind: "sqlResult", value: mapExtensionLibrarySqlResult(value.result.value) };
+    case "sqlBatch": return { kind: "sqlBatch", results: value.result.value.results.map(mapExtensionLibrarySqlResult) };
+    case "sqlVersion": return {
+      kind: "sqlVersion",
+      userVersion: value.result.value.userVersion,
+      ...(value.result.value.path === undefined ? {} : { path: value.result.value.path })
+    };
+    case "boolean": return { kind: "boolean", value: value.result.value.value };
+    default: throw new GatewayError("Orchestrator returned an unknown Extension Library call result.");
+  }
+}
+
+function mapExtensionLibraryEntry(value: ProtoExtensionLibraryEntry): ExtensionLibraryEntryView {
+  const kind = value.kind === ProtoExtensionLibraryEntryKind.FILE
+    ? "file" as const
+    : value.kind === ProtoExtensionLibraryEntryKind.DIRECTORY
+      ? "directory" as const
+      : undefined;
+  if (kind === undefined || !validLibraryRelativePath(value.path) || value.bytes < 0n) {
+    throw new GatewayError("Orchestrator returned an invalid Extension Library entry.");
+  }
+  return { path: value.path, kind, bytes: value.bytes, modifiedAt: requiredExtensionLibraryTimestamp(value.modifiedAt, "entry modification") };
+}
+
+function mapExtensionLibrarySqlResult(value: ProtoExtensionLibrarySqlResult): ExtensionLibrarySqlResultView {
+  if (!/^(?:0|[1-9][0-9]*)$/u.test(value.changes)
+    || value.lastInsertRowId !== undefined && !/^-?(?:0|[1-9][0-9]*)$/u.test(value.lastInsertRowId)) {
+    throw new GatewayError("Orchestrator returned invalid Extension Library SQLite counters.");
+  }
+  return {
+    rows: value.rows.map((row) => ({ cells: row.cells.map((cell) => {
+      if (cell.name.trim() === "" || cell.value === undefined) throw new GatewayError("Orchestrator returned an invalid Extension Library SQLite cell.");
+      return { name: cell.name, value: mapExtensionLibrarySqlValue(cell.value) };
+    }) })),
+    changes: BigInt(value.changes),
+    ...(value.lastInsertRowId === undefined ? {} : { lastInsertRowId: BigInt(value.lastInsertRowId) })
+  };
+}
+
+function mapExtensionLibrarySqlValue(value: ProtoExtensionLibrarySqlValue): ExtensionLibrarySqlValueView {
+  switch (value.value.case) {
+    case "nullValue":
+      if (!value.value.value) throw new GatewayError("Orchestrator returned an invalid Extension Library SQLite null.");
+      return { kind: "null" };
+    case "numberValue":
+      if (!Number.isFinite(value.value.value)) throw new GatewayError("Orchestrator returned a non-finite Extension Library SQLite number.");
+      return { kind: "number", value: value.value.value };
+    case "integerValue":
+      if (!/^-?(?:0|[1-9][0-9]*)$/u.test(value.value.value)) throw new GatewayError("Orchestrator returned an invalid Extension Library SQLite integer.");
+      return { kind: "integer", value: BigInt(value.value.value) };
+    case "textValue": return { kind: "text", value: value.value.value };
+    case "blobValue": return { kind: "blob", value: Uint8Array.from(value.value.value) };
+    default: throw new GatewayError("Orchestrator returned an empty Extension Library SQLite value.");
+  }
+}
+
+function requiredExtensionLibraryTimestamp(
+  value: { readonly seconds: bigint; readonly nanos: number } | undefined,
+  label: string
+): number {
+  const mapped = timestampMs(value);
+  if (value === undefined || !Number.isSafeInteger(mapped) || mapped < 0 || value.nanos < 0 || value.nanos >= 1_000_000_000) {
+    throw new GatewayError(`Orchestrator returned an invalid Extension Library ${label}.`);
+  }
+  return mapped;
+}
+
+function validLibraryRelativePath(value: string): boolean {
+  if (value.length === 0 || value.length > 512 || value.includes("\\") || value.startsWith("/") || /^[A-Za-z]:/u.test(value)) return false;
+  const segments = value.split("/");
+  return segments.length <= 32 && segments.every((segment) => segment.length > 0 && segment !== "." && segment !== "..");
+}
+
+function extensionMainViewIcon(value: ProtoExtensionMainViewIcon): ExtensionMainViewIconView | undefined {
+  switch (value) {
+    case ProtoExtensionMainViewIcon.UNSPECIFIED: return undefined;
+    case ProtoExtensionMainViewIcon.ACTIVITY: return "activity";
+    case ProtoExtensionMainViewIcon.BOX: return "box";
+    case ProtoExtensionMainViewIcon.CODE: return "code";
+    case ProtoExtensionMainViewIcon.FILE_TEXT: return "fileText";
+    case ProtoExtensionMainViewIcon.GLOBE: return "globe";
+    case ProtoExtensionMainViewIcon.LAYOUT: return "layout";
+    case ProtoExtensionMainViewIcon.SEARCH: return "search";
+    case ProtoExtensionMainViewIcon.SPARKLES: return "sparkles";
+    case ProtoExtensionMainViewIcon.TERMINAL: return "terminal";
+    case ProtoExtensionMainViewIcon.TOOL: return "tool";
+    default: throw new GatewayError("Orchestrator returned an invalid Extension main-view icon.");
+  }
+}
+
+function validExtensionSurfaceEndpoint(value: string, surfaceId: string): boolean {
+  const prefix = `/v1/extensions/main-views/${surfaceId}/`;
+  if (!value.startsWith(prefix) || value.includes("?") || value.includes("#")) return false;
+  const suffix = value.slice(prefix.length);
+  const separator = suffix.indexOf("/");
+  if (separator !== 64 || !/^[a-f0-9]{64}$/u.test(suffix.slice(0, separator))) return false;
+  const encodedEntry = suffix.slice(separator + 1);
+  if (encodedEntry === "" || encodedEntry.includes("/")) return false;
+  try {
+    const entry = decodeURIComponent(encodedEntry);
+    return entry !== "." && entry !== ".." && !entry.includes("/") && !entry.includes("\\") && !entry.includes("\0");
+  } catch {
+    return false;
+  }
+}
+
+function mapExtensionSourceOwner(
+  owner: { readonly sourceId: string; readonly sourceRevision?: { readonly value: bigint }; readonly entryId: string; readonly contentRevision: string } | undefined
+): Extract<ExtensionCatalogEntryView["owner"], { readonly kind: "source" }> {
+  if (
+    owner?.sourceRevision?.value === undefined
+    || owner.sourceRevision.value < 1n
+    || !/^extension_source_[a-f0-9]{32}$/u.test(owner.sourceId)
+    || !/^extension_source_entry_[a-f0-9]{32}$/u.test(owner.entryId)
+    || !/^sha256:[a-f0-9]{64}$/u.test(owner.contentRevision)
+  ) throw new GatewayError("Orchestrator returned an incomplete Extension Source owner.");
+  return {
+    kind: "source",
+    sourceId: owner.sourceId,
+    sourceRevision: owner.sourceRevision.value,
+    entryId: owner.entryId,
+    contentRevision: owner.contentRevision
+  };
+}
+
+function mapExtensionPackagePreview(preview: ProtoExtensionPackagePreview): ExtensionPackagePreviewView {
+  const extensionRevision = preview.extensionRevision?.value;
+  const action = extensionPackageAction(preview.action);
+  const current = preview.currentResource;
+  if (
+    preview.extensionId.trim() === ""
+    || extensionRevision === undefined
+    || extensionRevision < 1n
+    || preview.resourceId.trim() === ""
+    || preview.backendId.trim() === ""
+    || preview.packageName.trim() === ""
+    || (preview.installedVersion !== undefined && preview.installedVersion.trim() === "")
+    || (preview.availableVersion !== undefined && preview.availableVersion.trim() === "")
+    || (action === "install" ? current !== undefined || preview.sourceReplacement : current === undefined)
+    || preview.sourceReplacement !== (action === "replace")
+    || (action === "update" && preview.resourceId !== current?.resourceId)
+    || (action === "replace" && preview.resourceId === current?.resourceId)
+  ) throw new GatewayError("Orchestrator returned an invalid Extension package preview.");
+  if (
+    current !== undefined
+    && (
+      current.resourceId.trim() === ""
+      || current.resourceRevision?.value === undefined
+      || current.resourceRevision.value < 1n
+      || current.name.trim() === ""
+      || current.sourceDisplay.trim() === ""
+    )
+  ) throw new GatewayError("Orchestrator returned an invalid current Extension Resource.");
+  return {
+    extensionId: preview.extensionId,
+    extensionRevision,
+    action,
+    resourceId: preview.resourceId,
+    backendId: preview.backendId,
+    packageName: preview.packageName,
+    ...(preview.installedVersion === undefined ? {} : { installedVersion: preview.installedVersion }),
+    ...(preview.availableVersion === undefined ? {} : { availableVersion: preview.availableVersion }),
+    ...(current === undefined ? {} : {
+      currentResource: {
+        resourceId: current.resourceId,
+        resourceRevision: current.resourceRevision!.value,
+        name: current.name,
+        sourceDisplay: current.sourceDisplay
+      }
+    }),
+    sourceReplacement: preview.sourceReplacement,
+    preservesEnabled: preview.preservesEnabled,
+    compatibilityDetails: preview.compatibilityDetails.map((detail) => ({
+      kind: strictResourceKind(detail.kind),
+      name: detail.name,
+      compatibility: strictResourceCompatibility(detail.compatibility),
+      issues: detail.issues.map(strictResourceCompatibilityIssue),
+      detectedApis: detail.detectedApis.map(strictResourceUiApi),
+      adaptedApis: detail.adaptedApis.map(strictResourceUiApi),
+      unsupportedApis: detail.unsupportedApis.map(strictResourceUiApi)
+    })),
+    runtimeRequirements: preview.runtimeRequirements.map((requirement) => ({
+      packageName: requirement.packageName,
+      range: requirement.range,
+      ...(requirement.currentVersion === undefined ? {} : { currentVersion: requirement.currentVersion }),
+      status: strictResourceRuntimeRequirementStatus(requirement.status)
+    })),
+    warnings: preview.warnings.map(strictResourcePackageWarning),
+    disabledLifecycleScripts: [...preview.disabledLifecycleScripts],
+    canToggle: preview.canToggle
+  };
+}
+
+function mapExtensionPackageExportAuthority(
+  authority: ProtoExtensionPackageExportAuthority | undefined
+): ExtensionPackageExportAuthorityView {
+  const extensionRevision = authority?.extensionRevision?.value;
+  const resourceRevision = authority?.resourceRevision?.value;
+  const backendRevision = authority?.backendRevision?.value;
+  const backendGeneration = authority === undefined ? undefined : exactSafeUnsignedNumber(authority.backendGeneration);
+  if (
+    authority === undefined
+    || authority.extensionId.trim() === ""
+    || extensionRevision === undefined
+    || extensionRevision < 1n
+    || authority.resourceId.trim() === ""
+    || resourceRevision === undefined
+    || resourceRevision < 1n
+    || !/^sha256:[a-f0-9]{64}$/u.test(authority.discoveredRevision)
+    || authority.backendId.trim() === ""
+    || backendRevision === undefined
+    || backendRevision < 1n
+    || backendGeneration === undefined
+    || backendGeneration < 1
+    || authority.packageName.trim() === ""
+    || (authority.packageVersion !== undefined && authority.packageVersion.trim() === "")
+  ) throw new GatewayError("Orchestrator returned an invalid Extension package export authority.");
+  return {
+    extensionId: authority.extensionId,
+    extensionRevision,
+    resourceId: authority.resourceId,
+    resourceRevision,
+    discoveredRevision: authority.discoveredRevision,
+    backendId: authority.backendId,
+    backendRevision,
+    backendGeneration,
+    packageName: authority.packageName,
+    ...(authority.packageVersion === undefined ? {} : { packageVersion: authority.packageVersion })
+  };
+}
+
+function mapExtensionPackageExportJob(job: ProtoExtensionPackageExportJob): ExtensionPackageExportJobView {
+  const revision = job.revision?.value;
+  const state = extensionPackageExportState(job.state);
+  const authority = mapExtensionPackageExportAuthority(job.authority);
+  const uncompressedBytes = exactSafeUnsignedNumber(job.uncompressedBytes);
+  const createdAt = timestampMs(job.createdAt);
+  const updatedAt = timestampMs(job.updatedAt);
+  const completedAt = job.completedAt === undefined ? undefined : timestampMs(job.completedAt);
+  const active = state === "pending" || state === "snapshotting" || state === "packaging" || state === "verifying";
+  if (
+    job.exportId.trim() === ""
+    || revision === undefined
+    || revision < 1n
+    || job.archiveFormat !== "npm-tar-gzip"
+    || !isSafeArchiveFileName(job.fileName)
+    || !Number.isSafeInteger(job.files)
+    || job.files < 0
+    || uncompressedBytes === undefined
+    || createdAt < 1
+    || updatedAt < createdAt
+    || (active && completedAt !== undefined)
+    || (!active && completedAt === undefined)
+    || (completedAt !== undefined && completedAt < updatedAt)
+    || (state === "ready" ? job.artifact === undefined : job.artifact !== undefined)
+    || (state === "failed" ? job.error?.trim() === "" || job.error === undefined : job.error !== undefined)
+  ) throw new GatewayError("Orchestrator returned an invalid Extension package export job.");
+  const artifact = job.artifact;
+  const artifactBytes = artifact === undefined ? undefined : exactSafeUnsignedNumber(artifact.byteSize);
+  if (
+    artifact !== undefined
+    && (
+      artifact.blobId.trim() === ""
+      || !/^[a-f0-9]{64}$/u.test(artifact.sha256Hex)
+      || artifactBytes === undefined
+      || artifactBytes < 1
+      || artifact.mediaType !== "application/gzip"
+      || artifact.fileName !== job.fileName
+    )
+  ) throw new GatewayError("Orchestrator returned an invalid Extension package export Artifact.");
+  return {
+    id: job.exportId,
+    revision,
+    state,
+    authority,
+    archiveFormat: "npm-tar-gzip",
+    fileName: job.fileName,
+    files: job.files,
+    uncompressedBytes,
+    ...(artifact === undefined ? {} : {
+      artifact: {
+        blobId: artifact.blobId,
+        sha256: artifact.sha256Hex,
+        byteSize: artifactBytes!,
+        mediaType: artifact.mediaType,
+        fileName: artifact.fileName
+      }
+    }),
+    createdAt,
+    updatedAt,
+    ...(completedAt === undefined ? {} : { completedAt }),
+    ...(job.error === undefined ? {} : { error: job.error })
+  };
+}
+
+function mapExtensionPackageExportPreview(preview: ProtoExtensionPackageExportPreview): Omit<ExtensionPackageExportPreviewView, "recoveredFromCorruption"> {
+  const authority = mapExtensionPackageExportAuthority(preview.authority);
+  const maximumUncompressedBytes = exactSafeUnsignedNumber(preview.maximumUncompressedBytes);
+  const activeExport = preview.activeExport === undefined ? undefined : mapExtensionPackageExportJob(preview.activeExport);
+  if (
+    preview.archiveFormat !== "npm-tar-gzip"
+    || !isSafeArchiveFileName(preview.fileName)
+    || !Number.isSafeInteger(preview.maximumEntries)
+    || preview.maximumEntries < 1
+    || maximumUncompressedBytes === undefined
+    || maximumUncompressedBytes < 1
+    || preview.localOnly !== true
+    || (activeExport !== undefined && (
+      !["pending", "snapshotting", "packaging", "verifying"].includes(activeExport.state)
+      || !sameExtensionPackageExportAuthority(activeExport.authority, authority)
+    ))
+  ) throw new GatewayError("Orchestrator returned an invalid Extension package export preview.");
+  return {
+    ...authority,
+    archiveFormat: "npm-tar-gzip",
+    fileName: preview.fileName,
+    maximumEntries: preview.maximumEntries,
+    maximumUncompressedBytes,
+    localOnly: true,
+    ...(activeExport === undefined ? {} : { activeExport })
+  };
+}
+
+function extensionPackageExportState(value: ProtoExtensionPackageExportState): ExtensionPackageExportJobView["state"] {
+  switch (value) {
+    case ProtoExtensionPackageExportState.PENDING: return "pending";
+    case ProtoExtensionPackageExportState.SNAPSHOTTING: return "snapshotting";
+    case ProtoExtensionPackageExportState.PACKAGING: return "packaging";
+    case ProtoExtensionPackageExportState.VERIFYING: return "verifying";
+    case ProtoExtensionPackageExportState.READY: return "ready";
+    case ProtoExtensionPackageExportState.FAILED: return "failed";
+    case ProtoExtensionPackageExportState.CANCELLED: return "cancelled";
+    case ProtoExtensionPackageExportState.UNSPECIFIED:
+    default: throw new GatewayError("Orchestrator returned an invalid Extension package export state.");
+  }
+}
+
+function isSafeArchiveFileName(value: string): boolean {
+  return value.trim() !== "" && value.length <= 255 && value.endsWith(".tgz")
+    && !value.includes("/") && !value.includes("\\") && !value.includes("\0");
+}
+
+function sameExtensionPackageExportAuthority(
+  left: ExtensionPackageExportAuthorityView,
+  right: ExtensionPackageExportAuthorityView
+): boolean {
+  return left.extensionId === right.extensionId
+    && left.extensionRevision === right.extensionRevision
+    && left.resourceId === right.resourceId
+    && left.resourceRevision === right.resourceRevision
+    && left.discoveredRevision === right.discoveredRevision
+    && left.backendId === right.backendId
+    && left.backendRevision === right.backendRevision
+    && left.backendGeneration === right.backendGeneration
+    && left.packageName === right.packageName
+    && left.packageVersion === right.packageVersion;
+}
+
+function extensionPackageAction(value: ProtoExtensionPackageAction): ExtensionPackagePreviewView["action"] {
+  switch (value) {
+    case ProtoExtensionPackageAction.INSTALL: return "install";
+    case ProtoExtensionPackageAction.UPDATE: return "update";
+    case ProtoExtensionPackageAction.REPLACE: return "replace";
+    case ProtoExtensionPackageAction.UNSPECIFIED:
+    default: throw new GatewayError("Orchestrator returned an invalid Extension package action.");
+  }
+}
+
+function protoExtensionPackageAction(value: ExtensionPackagePreviewView["action"]): ProtoExtensionPackageAction {
+  switch (value) {
+    case "install": return ProtoExtensionPackageAction.INSTALL;
+    case "update": return ProtoExtensionPackageAction.UPDATE;
+    case "replace": return ProtoExtensionPackageAction.REPLACE;
+  }
+}
+
+function strictResourceKind(value: ResourceKind): ResourceView["kind"] {
+  switch (value) {
+    case ResourceKind.EXTENSION: return "extension";
+    case ResourceKind.SKILL: return "skill";
+    case ResourceKind.PROMPT_TEMPLATE: return "prompt";
+    case ResourceKind.PACKAGE: return "package";
+    case ResourceKind.THEME: return "theme";
+    case ResourceKind.UNSPECIFIED:
+    default: throw new GatewayError("Orchestrator returned an invalid package Resource kind.");
+  }
+}
+
+function strictResourceCompatibility(value: ResourceCompatibility): ResourceView["compatibilityDetails"][number]["compatibility"] {
+  switch (value) {
+    case ResourceCompatibility.SUPPORTED: return "supported";
+    case ResourceCompatibility.PARTIAL: return "partial";
+    case ResourceCompatibility.UNSUPPORTED: return "unsupported";
+    case ResourceCompatibility.UNKNOWN: return "unknown";
+    case ResourceCompatibility.UNSPECIFIED:
+    default: throw new GatewayError("Orchestrator returned an invalid package compatibility state.");
+  }
+}
+
+function strictResourceCompatibilityIssue(
+  value: ResourceCompatibilityIssue
+): ResourceView["compatibilityDetails"][number]["issues"][number] {
+  const mapped = resourceCompatibilityIssue(value);
+  if (mapped === "unknown") {
+    throw new GatewayError("Orchestrator returned an invalid package compatibility issue.");
+  }
+  return mapped;
+}
+
+function strictResourceUiApi(value: ResourceUiApi): ResourceView["compatibilityDetails"][number]["detectedApis"][number] {
+  const mapped = resourceUiApi(value);
+  if (mapped === "unknown") throw new GatewayError("Orchestrator returned an invalid package UI API.");
+  return mapped;
+}
+
+function strictResourceRuntimeRequirementStatus(
+  value: ResourceRuntimeRequirementStatus
+): ResourceView["runtimeRequirements"][number]["status"] {
+  switch (value) {
+    case ResourceRuntimeRequirementStatus.COMPATIBLE: return "compatible";
+    case ResourceRuntimeRequirementStatus.INCOMPATIBLE: return "incompatible";
+    case ResourceRuntimeRequirementStatus.UNKNOWN: return "unknown";
+    case ResourceRuntimeRequirementStatus.UNSPECIFIED:
+    default: throw new GatewayError("Orchestrator returned an invalid package runtime requirement state.");
+  }
+}
+
+function strictResourcePackageWarning(value: ResourcePackageWarning): ResourceView["warnings"][number] {
+  const mapped = resourcePackageWarning(value);
+  if (mapped === "unknown") throw new GatewayError("Orchestrator returned an invalid package warning.");
+  return mapped;
+}
+
+function extensionInstallState(value: ProtoExtensionInstallState): ExtensionCatalogEntryView["installState"] {
+  switch (value) {
+    case ProtoExtensionInstallState.AVAILABLE: return "available";
+    case ProtoExtensionInstallState.INSTALLING: return "installing";
+    case ProtoExtensionInstallState.INSTALLED: return "installed";
+    case ProtoExtensionInstallState.UPDATE_AVAILABLE: return "updateAvailable";
+    case ProtoExtensionInstallState.ERROR: return "error";
+    case ProtoExtensionInstallState.UNSPECIFIED:
+    default:
+      throw new GatewayError("Orchestrator returned an invalid Extension install state.");
+  }
+}
+
+function extensionSetupState(value: ProtoExtensionSetupState): ExtensionCatalogEntryView["setup"]["state"] {
+  switch (value) {
+    case ProtoExtensionSetupState.NOT_REQUIRED: return "notRequired";
+    case ProtoExtensionSetupState.REQUIRED: return "required";
+    case ProtoExtensionSetupState.IN_PROGRESS: return "inProgress";
+    case ProtoExtensionSetupState.READY: return "ready";
+    case ProtoExtensionSetupState.CANCELLED: return "cancelled";
+    case ProtoExtensionSetupState.FAILED: return "failed";
+    case ProtoExtensionSetupState.UNSPECIFIED:
+    default:
+      throw new GatewayError("Orchestrator returned an invalid Extension setup state.");
+  }
+}
+
+function extensionSetupFieldKind(value: ProtoExtensionSetupFieldKind): ExtensionCatalogEntryView["setup"]["fields"][number]["kind"] {
+  switch (value) {
+    case ProtoExtensionSetupFieldKind.TEXT: return "text";
+    case ProtoExtensionSetupFieldKind.SECRET: return "secret";
+    case ProtoExtensionSetupFieldKind.OAUTH: return "oauth";
+    case ProtoExtensionSetupFieldKind.CONFIRMATION: return "confirmation";
+    case ProtoExtensionSetupFieldKind.UNSPECIFIED:
+    default:
+      throw new GatewayError("Orchestrator returned an invalid Extension setup field.");
+  }
+}
+
 function mapRuntimeCommand(command: RuntimeCommand): RuntimeCommandView {
   return {
     id: command.commandId,
@@ -9530,6 +13584,7 @@ function mapRuntimeToolCatalog(catalog: RuntimeToolCatalog): RuntimeToolCatalogV
       return {
         name: tool.name,
         description: tool.description,
+        ...(tool.resourceId === "" ? {} : { resourceId: tool.resourceId }),
         fields: tool.inputSchema.fields.map((field) => ({
           path: field.fieldPath,
           title: field.title,
@@ -11581,6 +15636,7 @@ function capabilityOptions(options: any): readonly string[] {
     if (options.kind.value.supportsPlanMode === true) modes.push("planMode");
     return modes;
   }
+  if (options?.kind?.case === "runtime") return [...(options.kind.value.resourceKinds ?? [])];
   return [];
 }
 

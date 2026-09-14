@@ -65,6 +65,12 @@ export class PiEventTranslator {
     this.#context = context;
   }
 
+  /** Exact result established by the most recently translated native
+   * lifecycle terminal. Callers use this only after agent_settled completes. */
+  terminalOutcome(): "completed" | "aborted" | "failed" {
+    return this.#lastOutcome;
+  }
+
   /**
    * Strip Pi's inline image bytes from a native JSONL entry and replace them
    * with durable BlobRefs before the value crosses the Adapter boundary.

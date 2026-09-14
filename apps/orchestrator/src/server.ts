@@ -10,6 +10,7 @@ import type { OrchestratorApplication } from "./application.js";
 import { isLoopbackHost, isPrivateLanHost, isPrivateLanHttpOrigin, readTls } from "./config.js";
 import { registerConnectServices } from "./connect-services.js";
 import { ConnectionAuthenticationError } from "./connection-manager.js";
+import { ExtensionMainViewError, surfaceHeaders } from "./extension-main-view-manager.js";
 import type { NativeAuthRunnerProof, RemoteNativeAuthRunnerAttestation } from "./native-auth-recovery.js";
 
 export const JOKO_DESKTOP_APP_ORIGIN = "joko://app";
@@ -17,7 +18,7 @@ export const ORCHESTRATOR_WEB_CONTENT_SECURITY_POLICY = [
   "default-src 'self'",
   "base-uri 'none'",
   "object-src 'none'",
-  "frame-src 'none'",
+  "frame-src 'self'",
   "frame-ancestors 'none'",
   "form-action 'self'",
   // The fixed, self-hosted diagram viewer evaluates its internal graph codec.
@@ -57,6 +58,11 @@ export async function createPublicServer(application: OrchestratorApplication): 
     if (!permitted) return reply.code(403).send({ error: "Insecure Orchestrator access is limited to the configured local network." });
   });
   server.addHook("onSend", async (request, reply, payload) => {
+    if (isExtensionMainViewRequest(request.url)) {
+      for (const [name, value] of Object.entries(surfaceHeaders())) reply.header(name, value);
+      if (tls !== undefined) reply.header("strict-transport-security", "max-age=31536000; includeSubDomains");
+      return payload;
+    }
     reply.header("x-content-type-options", "nosniff");
     reply.header("x-frame-options", "DENY");
     reply.header("referrer-policy", "no-referrer");
@@ -104,6 +110,39 @@ export async function createPublicServer(application: OrchestratorApplication): 
     version: "0.1.0",
     schemaVersion: application.store.health().schemaVersion
   }));
+
+  server.route<{ Params: { surfaceId: string; token: string; "*": string } }>({
+    method: ["DELETE", "GET", "HEAD", "PATCH", "POST", "PUT"],
+    url: "/v1/extensions/main-views/:surfaceId/:token/*",
+    handler: async (request, reply) => {
+      if (!isExtensionMainViewRequest(request.url)) {
+        return reply.code(404).send({ error: "Extension main view is unavailable." });
+      }
+      if (application.extensionMainViews === undefined) {
+        return reply.code(404).send({ error: "Extension main view is unavailable." });
+      }
+      try {
+        const asset = await application.extensionMainViews.serve({
+          surfaceId: request.params.surfaceId,
+          token: request.params.token,
+          assetPath: request.params["*"],
+          method: request.method,
+          rangeRequested: request.headers.range !== undefined
+        });
+        reply.type(asset.mimeType);
+        reply.header("content-length", String(asset.contentLength));
+        if (request.method === "HEAD") return reply.code(asset.status).send();
+        return reply.code(asset.status).send(asset.body);
+      } catch (error) {
+        if (error instanceof ExtensionMainViewError) {
+          if (error.statusCode === 405) reply.header("allow", "GET, HEAD");
+          if (error.statusCode === 416) reply.header("content-range", "bytes */0");
+          return reply.code(error.statusCode).send({ error: "Extension main-view asset is unavailable." });
+        }
+        throw error;
+      }
+    }
+  });
 
   server.put<{ Params: { ticketId: string } }>(
     "/v1/credentials/upload/:ticketId",
@@ -199,6 +238,10 @@ export async function createPublicServer(application: OrchestratorApplication): 
   }
 
   return server;
+}
+
+export function isExtensionMainViewRequest(url: string): boolean {
+  return /^\/v1\/extensions\/main-views\/extension_surface_[a-f0-9]{32}\/[a-f0-9]{64}\/[^?#]+$/u.test(url);
 }
 
 /**

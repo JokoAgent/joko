@@ -222,6 +222,17 @@ describe("Orchestrator application composition", () => {
     ]));
     expect(application.mcpRouter?.list()).toEqual([]);
     expect(application.piResources?.list()).toEqual([]);
+    expect(application.skillMarket?.snapshot()).toEqual({ revision: 0n, sources: [], recoveredFromCorruption: false });
+    expect(application.skillMarketSync?.listPolicies()).toEqual([]);
+    expect(application.skillMarketSync?.listJobs()).toEqual([]);
+    expect(application.skillPublication?.list()).toEqual([]);
+    expect((await stat(join(dataDirectory, "skill-market"))).isDirectory()).toBe(true);
+    expect((await stat(join(dataDirectory, "skill-publications", ".working"))).isDirectory()).toBe(true);
+    expect(application.extensionSources?.snapshot()).toEqual({ revision: 0n, sources: [], recoveredFromCorruption: false });
+    expect((await stat(join(dataDirectory, "extension-sources"))).isDirectory()).toBe(true);
+    expect(application.extensionPackagePublisher?.list()).toEqual([]);
+    expect(application.extensionPackagePublisher?.recoveredFromCorruption).toBe(false);
+    expect((await stat(join(dataDirectory, "extension-package-exports", ".working"))).isDirectory()).toBe(true);
     const adapter = application.adapters[0];
     expect(adapter).toBeInstanceOf(PiBackendAdapter);
     expect(application.adapters.map((item) => item.id)).toEqual(["pi", "codex", "claude-code"]);
@@ -344,6 +355,15 @@ describe("Orchestrator application composition", () => {
       headers: { origin: "http://192.168.1.30:4319", "access-control-request-method": "GET" }
     });
     expect(disabledLanCors.headers["access-control-allow-origin"]).toBeUndefined();
+    const missingExtensionSurface = await server.inject({
+      method: "GET",
+      url: `/v1/extensions/main-views/extension_surface_${"a".repeat(32)}/${"b".repeat(64)}/index.html`
+    });
+    expect(missingExtensionSurface.statusCode).toBe(404);
+    expect(missingExtensionSurface.headers["access-control-allow-origin"]).toBe("null");
+    expect(missingExtensionSurface.headers["x-frame-options"]).toBeUndefined();
+    expect(missingExtensionSurface.headers["content-security-policy"]).toContain("frame-ancestors *");
+    expect(missingExtensionSurface.headers["content-security-policy"]).toContain("connect-src 'none'");
     const lanServer = await createPublicServer({
       ...application,
       config: {

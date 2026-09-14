@@ -7,7 +7,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { composerDocumentPlainText, plainTextToComposerDocument } from "../composer-quote-document.js";
 import type { AppController } from "../controller.js";
-import { emptySnapshot, type AppSnapshot, type ComposerDraft, type ComposerInlineMentionRange, type NewSessionLocalDraft } from "../model.js";
+import {
+  emptySnapshot,
+  type AppSnapshot,
+  type ComposerDraft,
+  type ComposerInlineMentionRange,
+  type ExtensionCatalogEntryView,
+  type NewSessionLocalDraft,
+  type PendingExtensionUseView
+} from "../model.js";
 import type { DelayedNewSessionDraft } from "../new-session-flow.js";
 import { NewSessionPage } from "./NewSessionPage.js";
 
@@ -70,6 +78,36 @@ afterEach(async () => {
 });
 
 describe("NewSessionPage typed slash commands", () => {
+  it("hydrates and retires an exact one-shot Extension Use handoff", async () => {
+    const pending: PendingExtensionUseView = {
+      extensionId: "extension_0123456789abcdef0123456789abcdef",
+      extensionRevision: "7",
+      commandName: "open-nav",
+      runtimeSessionId: "runtime-session",
+      displayName: "Workspace navigator",
+      owner: {
+        kind: "resource",
+        resourceId: "resource-extension-a",
+        discoveredRevision: "sha256:resource-generation-a",
+        resourceRevision: "4"
+      }
+    };
+    const getExtension = vi.fn(async (_extensionId: string, _sessionId?: string, _signal?: AbortSignal) => ({
+      revision: 9n,
+      extensions: [extension()],
+      recoveredFromCorruption: false
+    }));
+    const clearPendingExtensionUse = vi.fn(async () => undefined);
+
+    await renderPage(vi.fn(async () => undefined), { pending, getExtension, clearPendingExtensionUse });
+    await act(async () => vi.waitFor(() => expect(editorElement?.textContent).toBe("/open-nav")));
+
+    expect(getExtension).toHaveBeenCalledOnce();
+    expect(getExtension.mock.calls[0]?.slice(0, 2)).toEqual([pending.extensionId, pending.runtimeSessionId]);
+    expect(getExtension.mock.calls[0]?.[2]).toBeInstanceOf(AbortSignal);
+    expect(clearPendingExtensionUse).toHaveBeenCalledOnce();
+  });
+
   it("keeps the editor focused, filters a live query, and does not open during IME composition", async () => {
     const onSubmit = vi.fn(async (_session: DelayedNewSessionDraft, _input: ComposerDraft) => undefined);
     await renderPage(onSubmit);
@@ -136,7 +174,14 @@ describe("NewSessionPage typed slash commands", () => {
   });
 });
 
-async function renderPage(onSubmit: (session: DelayedNewSessionDraft, input: ComposerDraft) => Promise<void>): Promise<void> {
+async function renderPage(
+  onSubmit: (session: DelayedNewSessionDraft, input: ComposerDraft) => Promise<void>,
+  options: {
+    readonly pending?: PendingExtensionUseView;
+    readonly getExtension?: AppController["getExtension"];
+    readonly clearPendingExtensionUse?: AppController["clearPendingExtensionUse"];
+  } = {}
+): Promise<void> {
   const snapshotValue = snapshot();
   const controller = {
     state: {
@@ -146,6 +191,9 @@ async function renderPage(onSubmit: (session: DelayedNewSessionDraft, input: Com
     },
     readNewSessionDraft: vi.fn(async () => draft()),
     saveNewSessionDraft: vi.fn(async () => undefined),
+    readPendingExtensionUse: vi.fn(async () => options.pending),
+    getExtension: options.getExtension ?? vi.fn(async () => ({ revision: 0n, extensions: [], recoveredFromCorruption: false })),
+    clearPendingExtensionUse: options.clearPendingExtensionUse ?? vi.fn(async () => undefined),
     probeTargetWorktree: vi.fn(async (targetId: string) => ({ targetId, eligibility: "unavailable", canRefreshRemote: false })),
     listTargetWorktreeSources: vi.fn(async () => []),
     setNewSessionWorktreeEnabled: vi.fn(async () => undefined)
@@ -166,6 +214,32 @@ async function renderPage(onSubmit: (session: DelayedNewSessionDraft, input: Com
     await flush();
   });
   required(editorElement).focus();
+}
+
+function extension(): ExtensionCatalogEntryView {
+  return {
+    id: "extension_0123456789abcdef0123456789abcdef",
+    revision: 7n,
+    owner: {
+      kind: "resource",
+      resourceId: "resource-extension-a",
+      discoveredRevision: "sha256:resource-generation-a",
+      resourceRevision: 4n
+    },
+    source: "local",
+    installed: true,
+    installState: "installed",
+    name: "Workspace navigator",
+    description: "Navigate this workspace",
+    enabled: true,
+    sidebarSupported: true,
+    sidebarVisible: false,
+    tools: [],
+    permissions: [],
+    commands: [{ name: "open-nav", description: "Open navigation", sessionId: "runtime-session" }],
+    setup: { state: "notRequired", revision: 0n, fields: [] },
+    useSupported: true
+  };
 }
 
 async function edit(text: string, caret: number, composing: boolean): Promise<void> {

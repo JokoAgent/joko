@@ -1203,6 +1203,237 @@ describe("PiResourceManager", () => {
     }
     store.close();
   });
+
+  it("leases and atomically replaces a managed Skill generation without exposing its owner path", async () => {
+    const { root, store, manager } = await fixture();
+    const source = join(root, "managed-skill-source");
+    await mkdir(source);
+    await writeFile(join(source, "SKILL.md"), "---\nname: managed-skill\n---\nold\n", "utf8");
+    const discovered = await manager.discover({
+      id: "managed-skill-content",
+      backendId: "pi",
+      kind: "skill",
+      scope: "managed",
+      source: { kind: "local", path: source },
+      name: "managed-skill"
+    });
+    const approved = await manager.approve(discovered.id, discovered.discoveredRevision, "connection-a");
+    const installed = await manager.install(approved.id);
+    const enabled = await manager.setEnabled(installed.id, true);
+    const lease = await manager.acquireSkillContent({
+      resourceId: enabled.id,
+      expectedResourceVersion: enabled.versionNumber
+    });
+    expect(lease.dirty).toBe(false);
+    expect(stringify(lease)).not.toContain(root);
+    const snapshot = join(root, "managed-skill-snapshot");
+    await mkdir(snapshot);
+    expect((await lease.snapshotTo(snapshot)).discoveredRevision).toBe(enabled.discoveredRevision);
+
+    const candidate = join(root, "managed-skill-candidate");
+    await mkdir(candidate);
+    await writeFile(join(candidate, "SKILL.md"), "---\nname: managed-skill\n---\nnew\n", "utf8");
+    await writeFile(join(candidate, "notes.md"), "notes\n", "utf8");
+    const prepared = await manager.prepareReplaceSkillContent({
+      resourceId: enabled.id,
+      expectedResourceVersion: enabled.versionNumber,
+      expectedObservedRevision: lease.observedRevision,
+      candidateRoot: candidate,
+      changedByConnectionId: "connection-a"
+    });
+    const result = await manager.completePreparedMutation(prepared, (finalize) => store.transaction((transaction) => {
+      finalize(transaction);
+      return prepared.value;
+    }));
+    expect(result.resource.enabled).toBe(true);
+    expect(result.resource.state).toBe("installed");
+    expect(result.resource.discoveredRevision).not.toBe(enabled.discoveredRevision);
+    await expect(lease.assertCurrent()).rejects.toThrow(/authority changed/u);
+    await lease.release();
+
+    const nextLease = await manager.acquireSkillContent({
+      resourceId: result.resource.id,
+      expectedResourceVersion: result.resource.versionNumber
+    });
+    const nextSnapshot = join(root, "managed-skill-next-snapshot");
+    await mkdir(nextSnapshot);
+    await nextLease.snapshotTo(nextSnapshot);
+    expect(await readFile(join(nextSnapshot, "SKILL.md"), "utf8")).toContain("new");
+    expect(await readFile(join(nextSnapshot, "notes.md"), "utf8")).toBe("notes\n");
+    await nextLease.release();
+    store.close();
+  });
+
+  it("publishes, renames, removes, and rolls back project Skill content at the Resource boundary", async () => {
+    const { root, store, manager } = await fixture();
+    const workspace = join(root, "workspace");
+    const skillsRoot = join(workspace, ".pi", "skills");
+    const source = join(skillsRoot, "project-skill");
+    await mkdir(source, { recursive: true });
+    await writeFile(join(source, "SKILL.md"), "---\nname: project-skill\n---\napproved\n", "utf8");
+    registerTarget(store, { id: "target-project-skill", root: workspace, trusted: true });
+    const [discovered] = await manager.discoverProjectResources({
+      backendId: "pi",
+      targetId: "target-project-skill",
+      kinds: ["skill"]
+    });
+    const approved = await manager.approve(discovered!.id, discovered!.discoveredRevision, "connection-project");
+    await writeFile(join(source, "SKILL.md"), "---\nname: project-skill\n---\nexternal\n", "utf8");
+    const dirtyLease = await manager.acquireSkillContent({
+      resourceId: approved.id,
+      expectedResourceVersion: approved.versionNumber
+    });
+    expect(dirtyLease.dirty).toBe(true);
+
+    const candidate = join(root, "project-skill-candidate");
+    await mkdir(candidate);
+    await writeFile(join(candidate, "SKILL.md"), "---\nname: project-skill\n---\nedited\n", "utf8");
+    const failed = await manager.prepareReplaceSkillContent({
+      resourceId: approved.id,
+      expectedResourceVersion: approved.versionNumber,
+      expectedObservedRevision: dirtyLease.observedRevision,
+      candidateRoot: candidate,
+      changedByConnectionId: "connection-project"
+    });
+    await expect(manager.completePreparedMutation(failed, (finalize) => store.transaction((transaction) => {
+      finalize(transaction);
+      throw new Error("store failed");
+    }))).rejects.toThrow(/store failed/u);
+    expect(await readFile(join(source, "SKILL.md"), "utf8")).toContain("external");
+    expect(manager.get(approved.id).versionNumber).toBe(approved.versionNumber);
+    await dirtyLease.release();
+
+    const currentLease = await manager.acquireSkillContent({
+      resourceId: approved.id,
+      expectedResourceVersion: approved.versionNumber
+    });
+    const renamedCandidate = join(root, "project-skill-renamed-candidate");
+    await mkdir(renamedCandidate);
+    await writeFile(join(renamedCandidate, "SKILL.md"), "---\nname: renamed-skill\n---\nrenamed\n", "utf8");
+    const renamedPlan = await manager.prepareReplaceSkillContent({
+      resourceId: approved.id,
+      expectedResourceVersion: approved.versionNumber,
+      expectedObservedRevision: currentLease.observedRevision,
+      candidateRoot: renamedCandidate,
+      changedByConnectionId: "connection-project",
+      name: "renamed-skill"
+    });
+    const renamed = await manager.completePreparedMutation(renamedPlan, (finalize) => store.transaction((transaction) => {
+      finalize(transaction);
+      return renamedPlan.value;
+    }));
+    expect(renamed.replacedResourceId).toBe(approved.id);
+    expect(manager.get(approved.id).state).toBe("removed");
+    expect(await pathExists(source)).toBe(false);
+    const renamedPath = join(skillsRoot, "renamed-skill");
+    expect(await readFile(join(renamedPath, "SKILL.md"), "utf8")).toContain("renamed");
+    await currentLease.release();
+
+    const renamedLease = await manager.acquireSkillContent({
+      resourceId: renamed.resource.id,
+      expectedResourceVersion: renamed.resource.versionNumber
+    });
+    const recovery = join(root, "skill-recovery");
+    await mkdir(recovery);
+    const removal = await manager.prepareRemoveSkillContent({
+      resourceId: renamed.resource.id,
+      expectedResourceVersion: renamed.resource.versionNumber,
+      expectedObservedRevision: renamedLease.observedRevision,
+      recoveryDestination: recovery
+    });
+    const removed = await manager.completePreparedMutation(removal, (finalize) => store.transaction((transaction) => {
+      finalize(transaction);
+      return removal.value;
+    }));
+    expect(removed.state).toBe("removed");
+    expect(await pathExists(renamedPath)).toBe(false);
+    expect(await readFile(join(recovery, "SKILL.md"), "utf8")).toContain("renamed");
+    await renamedLease.release();
+    store.close();
+  });
+
+  it("recovers project Skill transactions after restart on both sides of the Store commit boundary", async () => {
+    const { root, store, manager } = await fixture();
+    const workspace = join(root, "workspace-skill-restart");
+    const skillsRoot = join(workspace, ".agents", "skills");
+    const source = join(skillsRoot, "restart-skill");
+    await mkdir(source, { recursive: true });
+    await writeFile(join(source, "SKILL.md"), "---\nname: restart-skill\n---\noriginal\n", "utf8");
+    registerTarget(store, { id: "target-skill-restart", root: workspace, trusted: true });
+    const [discovered] = await manager.discoverProjectResources({
+      backendId: "pi",
+      targetId: "target-skill-restart",
+      kinds: ["skill"]
+    });
+    const approved = await manager.approve(discovered!.id, discovered!.discoveredRevision, "connection-restart");
+    const originalLease = await manager.acquireSkillContent({
+      resourceId: approved.id,
+      expectedResourceVersion: approved.versionNumber
+    });
+    const firstCandidate = join(root, "skill-restart-candidate-one");
+    await mkdir(firstCandidate);
+    await writeFile(join(firstCandidate, "SKILL.md"), "---\nname: restart-skill\n---\nuncommitted\n", "utf8");
+    await manager.prepareReplaceSkillContent({
+      resourceId: approved.id,
+      expectedResourceVersion: approved.versionNumber,
+      expectedObservedRevision: originalLease.observedRevision,
+      candidateRoot: firstCandidate,
+      changedByConnectionId: "connection-restart"
+    });
+    await originalLease.release();
+    expect(await readFile(join(source, "SKILL.md"), "utf8")).toContain("uncommitted");
+
+    const rolledBack = new PiResourceManager({ store, managedRoot: join(root, "managed") });
+    await rolledBack.initialize();
+    expect(await readFile(join(source, "SKILL.md"), "utf8")).toContain("original");
+    expect(await readdir(join(root, "managed", ".skill-transactions"))).toEqual([]);
+    expect(await directoryMissingOrEmpty(join(skillsRoot, ".joko-skill-transactions"))).toBe(true);
+
+    const currentLease = await rolledBack.acquireSkillContent({
+      resourceId: approved.id,
+      expectedResourceVersion: approved.versionNumber
+    });
+    const secondCandidate = join(root, "skill-restart-candidate-two");
+    await mkdir(secondCandidate);
+    await writeFile(join(secondCandidate, "SKILL.md"), "---\nname: restart-skill\n---\ncommitted\n", "utf8");
+    const committedPlan = await rolledBack.prepareReplaceSkillContent({
+      resourceId: approved.id,
+      expectedResourceVersion: approved.versionNumber,
+      expectedObservedRevision: currentLease.observedRevision,
+      candidateRoot: secondCandidate,
+      changedByConnectionId: "connection-restart"
+    });
+    await currentLease.release();
+    persistPreparedSkillRecord(store, committedPlan.value.resource);
+
+    const finalized = new PiResourceManager({ store, managedRoot: join(root, "managed") });
+    await finalized.initialize();
+    expect(finalized.get(approved.id).versionNumber).toBe(committedPlan.value.resource.versionNumber);
+    expect(await readFile(join(source, "SKILL.md"), "utf8")).toContain("committed");
+    expect(await readdir(join(root, "managed", ".skill-transactions"))).toEqual([]);
+    expect(await directoryMissingOrEmpty(join(skillsRoot, ".joko-skill-transactions"))).toBe(true);
+
+    const committedLease = await finalized.acquireSkillContent({
+      resourceId: approved.id,
+      expectedResourceVersion: committedPlan.value.resource.versionNumber
+    });
+    const recovery = join(root, "skill-restart-recovery");
+    await mkdir(recovery);
+    await finalized.prepareRemoveSkillContent({
+      resourceId: approved.id,
+      expectedResourceVersion: committedPlan.value.resource.versionNumber,
+      expectedObservedRevision: committedLease.observedRevision,
+      recoveryDestination: recovery
+    });
+    await committedLease.release();
+    expect(await pathExists(source)).toBe(false);
+
+    const removalRolledBack = new PiResourceManager({ store, managedRoot: join(root, "managed") });
+    await removalRolledBack.initialize();
+    expect(await readFile(join(source, "SKILL.md"), "utf8")).toContain("committed");
+    expect(await readdir(join(root, "managed", ".skill-transactions"))).toEqual([]);
+    store.close();
+  });
 });
 
 function stringify(value: unknown): string {
@@ -1219,6 +1450,11 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
+async function directoryMissingOrEmpty(path: string): Promise<boolean> {
+  if (!await pathExists(path)) return true;
+  return (await readdir(path)).length === 0;
+}
+
 async function findNamedFiles(root: string, name: string): Promise<readonly string[]> {
   if (!await pathExists(root)) return [];
   const matches: string[] = [];
@@ -1231,4 +1467,37 @@ async function findNamedFiles(root: string, name: string): Promise<readonly stri
   };
   await visit(root);
   return matches.sort((left, right) => left.localeCompare(right, "en"));
+}
+
+function persistPreparedSkillRecord(
+  store: OperationalStore,
+  resource: ReturnType<PiResourceManager["get"]>
+): void {
+  const catalog = store.getSetting<{
+    readonly format: 1;
+    readonly records: readonly Record<string, unknown>[];
+  }>("service", "orchestrator", "pi_resource_catalog").value;
+  store.setSetting("service", "orchestrator", "pi_resource_catalog", {
+    format: 1,
+    records: catalog.records.map((record) => record["id"] === resource.id
+      ? {
+          ...record,
+          name: resource.name,
+          discoveredRevision: resource.discoveredRevision,
+          resourceDetails: resource.resourceDetails,
+          runtimeRequirements: resource.runtimeRequirements,
+          warnings: resource.warnings,
+          disabledLifecycleScripts: resource.disabledLifecycleScripts,
+          canToggle: resource.canToggle,
+          requiresExtensionApproval: resource.requiresExtensionApproval,
+          postMutationNotice: resource.postMutationNotice,
+          state: resource.state,
+          enabled: resource.enabled,
+          approvedAt: resource.approvedAt,
+          approvedByConnectionId: resource.approvedByConnectionId,
+          versionNumber: resource.versionNumber.toString(10),
+          updatedAt: resource.updatedAt
+        }
+      : record)
+  });
 }

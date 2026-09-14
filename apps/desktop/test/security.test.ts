@@ -15,6 +15,7 @@ import {
   isAllowedMainFrameNavigation,
   isAllowedPackagedBundleResource,
   isAllowedRendererNetworkUrl,
+  isExtensionMainViewSubframeUrl,
   isRelativeBundleAssetReference,
   isSafeExternalUrl,
   isSecureStorageBackend,
@@ -23,6 +24,7 @@ import {
   mediaTypeForPath,
   mergeContentSecurityPolicyHeaders,
   resolvePackagedAppResource,
+  shouldMergeDesktopFrameContentSecurityPolicy,
   validateCredentialSecret,
   validateProfileId
 } from "../src/security.js";
@@ -142,6 +144,7 @@ describe("Desktop security policy", () => {
     expect(headers["X-Test"]).toEqual(["one"]);
     expect(headers["Content-Security-Policy"]).toEqual(["default-src 'none'", DESKTOP_CONTENT_SECURITY_POLICY]);
     expect(DESKTOP_CONTENT_SECURITY_POLICY).toContain("frame-ancestors 'none'");
+    expect(DESKTOP_CONTENT_SECURITY_POLICY).toContain("frame-src 'self' https: http:");
     expect(DESKTOP_CONTENT_SECURITY_POLICY).toContain("object-src 'none'");
     expect(DESKTOP_CONTENT_SECURITY_POLICY).toContain("script-src 'self' 'unsafe-eval'");
     expect(DESKTOP_CONTENT_SECURITY_POLICY).toContain("img-src 'self' data: blob: https: http:");
@@ -149,6 +152,21 @@ describe("Desktop security policy", () => {
     expect(DESKTOP_CONTENT_SECURITY_POLICY).toContain("connect-src 'self' blob:");
     expect(DESKTOP_CONTENT_SECURITY_POLICY).toContain("media-src 'self' data: blob:");
     expect(DESKTOP_CONTENT_SECURITY_POLICY).toContain("http:");
+  });
+
+  it("preserves only exact opaque Extension surface CSP on HTTP(S) subframes", () => {
+    const exact = "https://orchestrator.example/v1/extensions/main-views/extension_surface_0123456789abcdef0123456789abcdef/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/index.html";
+    expect(isExtensionMainViewSubframeUrl(exact)).toBe(true);
+    expect(isExtensionMainViewSubframeUrl(exact.replace("https:", "http:"))).toBe(true);
+    expect(isExtensionMainViewSubframeUrl(`${exact}?auth=secret`)).toBe(false);
+    expect(isExtensionMainViewSubframeUrl(exact.replace("extension_surface_", "surface_"))).toBe(false);
+    expect(isExtensionMainViewSubframeUrl(exact.replace(/\/[a-f0-9]{64}\//u, "/short/"))).toBe(false);
+    expect(isExtensionMainViewSubframeUrl(`https://user:secret@orchestrator.example${new URL(exact).pathname}`)).toBe(false);
+    expect(isExtensionMainViewSubframeUrl("joko://app/index.html")).toBe(false);
+    expect(shouldMergeDesktopFrameContentSecurityPolicy("subFrame", exact)).toBe(false);
+    expect(shouldMergeDesktopFrameContentSecurityPolicy("mainFrame", exact)).toBe(true);
+    expect(shouldMergeDesktopFrameContentSecurityPolicy("script", exact)).toBe(false);
+    expect(shouldMergeDesktopFrameContentSecurityPolicy("subFrame", "https://example.test/ordinary.html")).toBe(true);
   });
 
   it("rejects Linux safeStorage plaintext fallback and validates renderer-controlled values", () => {

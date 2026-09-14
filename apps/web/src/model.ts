@@ -2017,6 +2017,592 @@ export interface ResourceView {
   readonly error?: string;
 }
 
+export type SkillScopeView = "global" | "project";
+
+export interface SkillDescriptorView {
+  readonly id: string;
+  readonly backendId: string;
+  readonly targetId?: string;
+  readonly scope: SkillScopeView;
+  readonly name: string;
+  /** Path-free basename or package label supplied by the service. */
+  readonly sourceLabel: string;
+  readonly state: ResourceView["state"];
+  readonly enabled: boolean;
+  readonly canToggle: boolean;
+  readonly contentAvailable: boolean;
+  readonly canEdit: boolean;
+  readonly canDelete: boolean;
+  readonly revision: bigint;
+  readonly approvedRevision: string;
+  readonly updatedAt: number;
+}
+
+export interface SkillCatalogView {
+  readonly revision: bigint;
+  readonly skills: readonly SkillDescriptorView[];
+}
+
+export interface SkillMetadataView {
+  readonly name?: string;
+  readonly description?: string;
+  readonly version?: string;
+  readonly frontmatter: Readonly<Record<string, unknown>>;
+  readonly parseError?: string;
+}
+
+export interface SkillFileEntryView {
+  readonly key: string;
+  readonly name: string;
+  readonly kind: "directory" | "file";
+  readonly size: number;
+  readonly editable: boolean;
+}
+
+export interface SkillFileContentView {
+  readonly key: string;
+  readonly content: string;
+  readonly revision: string;
+  readonly size: number;
+  readonly editable: boolean;
+}
+
+export interface SkillDiffChangeView {
+  readonly key: string;
+  readonly kind: "added" | "modified" | "deleted";
+  readonly binary: boolean;
+  readonly unifiedDiff?: string;
+}
+
+export interface SkillDiffView {
+  readonly available: boolean;
+  readonly reason?: string;
+  readonly changes: readonly SkillDiffChangeView[];
+  readonly truncated: boolean;
+}
+
+export interface SkillSessionView {
+  readonly id: string;
+  readonly skill: SkillDescriptorView;
+  readonly observedRevision: string;
+  readonly dirty: boolean;
+  readonly baselineAvailable: boolean;
+  readonly metadata: SkillMetadataView;
+  readonly files: readonly SkillFileEntryView[];
+  readonly fileCount: number;
+  readonly bytes: number;
+  readonly diff: SkillDiffView;
+  readonly expiresAt: number;
+}
+
+export type ResourceUsageSourceView =
+  | "structuredResourceMention"
+  | "nativeSkillCommand"
+  | "runtimeConfirmedResourceLoad"
+  | "exactFileRead"
+  | "runtimeToolCall";
+
+export interface ResourceUsageMetricsView {
+  readonly samples: number;
+  readonly strongActive: number;
+  readonly semiActive: number;
+  readonly passiveExposures: number;
+  readonly reads: number;
+  readonly rereads: number;
+  readonly toolCalls: number;
+  readonly toolErrors: number;
+  readonly commands: number;
+  readonly commandFailures: number;
+  readonly latestUsedAt?: number;
+}
+
+export interface ResourceUsageVersionIdentityView {
+  readonly resourceRevision: bigint;
+  readonly contentRevision: string;
+  readonly version?: string;
+}
+
+export interface ResourceUsageVersionBreakdownView {
+  readonly identity: ResourceUsageVersionIdentityView;
+  readonly metrics: ResourceUsageMetricsView;
+  readonly firstUsedAt?: number;
+}
+
+export interface ResourceUsageReportView {
+  readonly resourceId: string;
+  readonly timeZone: string;
+  readonly fromDay: string;
+  readonly throughDay: string;
+  readonly days: readonly {
+    readonly localDay: string;
+    readonly metrics: ResourceUsageMetricsView;
+  }[];
+  readonly totals: ResourceUsageMetricsView;
+  readonly sources: readonly {
+    readonly source: ResourceUsageSourceView;
+    readonly metrics: ResourceUsageMetricsView;
+  }[];
+  readonly agents: readonly {
+    readonly backendId: string;
+    readonly metrics: ResourceUsageMetricsView;
+  }[];
+  readonly versions: readonly ResourceUsageVersionBreakdownView[];
+  readonly comparison: {
+    readonly available: boolean;
+    readonly minimumSamples: number;
+    readonly unavailableReason?: "noCurrentVersion" | "noPreviousVersion" | "currentSamples" | "previousSamples";
+    readonly current?: ResourceUsageVersionBreakdownView;
+    readonly previous?: ResourceUsageVersionBreakdownView;
+  };
+  readonly projection: {
+    readonly complete: boolean;
+    readonly streamCount: number;
+    readonly pendingStreamCount: number;
+    readonly lastProjectedAt?: number;
+    readonly failures: readonly {
+      readonly sessionId: string;
+      readonly source: ResourceUsageSourceView;
+      readonly attempts: number;
+      readonly retryAt: number;
+      readonly errorCode: string;
+    }[];
+  };
+}
+
+export interface SkillDraftView {
+  readonly id: string;
+  readonly sessionId: string;
+  readonly skillId: string;
+  readonly kind: "edit" | "rename";
+  readonly name: string;
+  readonly resourceRevision: bigint;
+  readonly observedRevision: string;
+  readonly changes: readonly SkillDiffChangeView[];
+  readonly expiresAt: number;
+}
+
+export interface SkillRecoveryView {
+  readonly id: string;
+  readonly skillId: string;
+  readonly backendId: string;
+  readonly targetId?: string;
+  readonly scope: SkillScopeView;
+  readonly name: string;
+  readonly revision: string;
+  readonly files: number;
+  readonly bytes: number;
+  readonly createdAt: number;
+  readonly status: "ready" | "missing";
+}
+
+export interface SkillMutationResultView {
+  readonly skill?: SkillDescriptorView;
+  readonly replacedSkillId?: string;
+  readonly recoveryId?: string;
+}
+
+export type SkillMarketSourceDraft =
+  | { readonly kind: "local"; readonly serverPath: string }
+  | { readonly kind: "git"; readonly repositoryUrl: string; readonly ref?: string; readonly sparsePaths: readonly string[] };
+
+export interface SkillMarketGitPreflightView {
+  readonly available: boolean;
+  readonly version?: string;
+  readonly minimumVersion: string;
+}
+
+/** Path-free market source projection. Source locations are write-only. */
+export interface SkillMarketSourceView {
+  readonly id: string;
+  readonly revision: bigint;
+  readonly kind: "local" | "git";
+  readonly display: string;
+  readonly name: string;
+  readonly displayName?: string;
+  readonly state: "ready" | "error";
+  readonly contentRevision: string;
+  readonly entryCount: number;
+  readonly addedAt: number;
+  readonly refreshedAt?: number;
+  readonly error?: string;
+}
+
+export interface SkillMarketSourceCatalogView {
+  readonly revision: bigint;
+  readonly sources: readonly SkillMarketSourceView[];
+  readonly recoveredFromCorruption: boolean;
+}
+
+export interface SkillMarketEntryIdentityView {
+  readonly sourceId: string;
+  readonly sourceRevision: bigint;
+  readonly entryId: string;
+  readonly entryRevision: bigint;
+  readonly contentRevision: string;
+}
+
+export type CollaborationScopeKindView = "team" | "department";
+export type CollaborationRoleView = "viewer" | "publisher" | "administrator";
+
+export interface CollaborationActorView {
+  readonly id: string;
+  readonly displayName: string;
+}
+
+export interface CollaborationMembershipView {
+  readonly actorId: string;
+  readonly role: CollaborationRoleView;
+}
+
+export interface CollaborationScopeView {
+  readonly id: string;
+  readonly revision: bigint;
+  readonly kind: CollaborationScopeKindView;
+  readonly name: string;
+  readonly members: readonly CollaborationMembershipView[];
+}
+
+export interface CollaborationDirectoryView {
+  readonly available: boolean;
+  readonly revision: bigint;
+  readonly actor?: CollaborationActorView;
+  readonly scopes: readonly CollaborationScopeView[];
+  readonly recoveredFromCorruption: boolean;
+  readonly unavailableReason?: string;
+}
+
+export type SkillAccessPublisherView =
+  | { readonly kind: "personal"; readonly actorId: string }
+  | { readonly kind: "team"; readonly scopeId: string }
+  | { readonly kind: "external"; readonly sourceId: string };
+
+export interface SkillAccessPolicyView {
+  readonly revision: bigint;
+  readonly publisher: SkillAccessPublisherView;
+  readonly visibility: "public" | "department" | "private";
+  readonly audienceScopeIds: readonly string[];
+}
+
+export interface SkillPublicationAccessSelectionView {
+  readonly publisher: "personal" | "team";
+  readonly publisherScopeId?: string;
+  readonly visibility: "public" | "department" | "private";
+  readonly audienceScopeIds: readonly string[];
+}
+
+export interface SkillMarketEntryView {
+  readonly identity: SkillMarketEntryIdentityView;
+  readonly slug: string;
+  readonly name: string;
+  readonly author?: string;
+  readonly description: string;
+  readonly category?: string;
+  readonly tags: readonly string[];
+  readonly version: string;
+  readonly changelog?: string;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly downloads: number;
+  readonly trendScore: number;
+  readonly archiveBytes: number;
+  readonly sourceName: string;
+  readonly sourceDisplayName?: string;
+  readonly sourceState: "ready" | "error";
+  readonly sourceError?: string;
+  readonly installStatuses: readonly SkillMarketInstallStatusView[];
+  readonly access: SkillAccessPolicyView;
+  readonly canManage: boolean;
+}
+
+export interface SkillMarketInstallStatusView {
+  readonly resourceId: string;
+  readonly resourceRevision: bigint;
+  readonly backendId: string;
+  readonly targetId?: string;
+  readonly scope: SkillScopeView;
+  readonly relativeParent?: string;
+  readonly state: "installed" | "updateAvailable" | "conflict";
+  readonly installedVersion?: string;
+}
+
+export type SkillMarketSortView = "trending" | "downloads" | "updated" | "created";
+
+export interface SkillMarketCatalogPageView {
+  readonly revision: bigint;
+  readonly entries: readonly SkillMarketEntryView[];
+  readonly categories: readonly string[];
+  readonly sourceCount: number;
+  readonly totalSize: number;
+  readonly nextPageToken?: string;
+}
+
+export interface SkillMarketArchiveEntryView {
+  readonly key: string;
+  readonly kind: "directory" | "file";
+  readonly size: number;
+}
+
+export interface SkillMarketArchivePageView {
+  readonly snapshotRevision: string;
+  readonly files: readonly SkillMarketArchiveEntryView[];
+  readonly totalSize: number;
+  readonly nextPageToken?: string;
+}
+
+export interface SkillMarketPreviewView {
+  readonly id: string;
+  readonly entry: SkillMarketEntryView;
+  readonly snapshotRevision: string;
+  readonly files: number;
+  readonly bytes: number;
+  readonly expiresAt: number;
+}
+
+export interface SkillMarketPreviewFileView {
+  readonly previewId: string;
+  readonly snapshotRevision: string;
+  readonly key: string;
+  readonly size: number;
+  readonly previewable: boolean;
+  readonly content?: string;
+  readonly unavailableReason?: "binary" | "tooLarge";
+}
+
+export interface SkillMarketInstallTargetView {
+  readonly backendId: string;
+  readonly scope: SkillScopeView;
+  readonly targetId?: string;
+  readonly relativeParent?: string;
+}
+
+export interface SkillMarketCurrentResourceView {
+  readonly resourceId: string;
+  readonly resourceRevision: bigint;
+  readonly name: string;
+  readonly version?: string;
+  readonly sourceKind: "local" | "npm" | "git" | "extensionSource" | "skillMarket";
+  readonly sourceDisplay: string;
+  readonly discoveredRevision: string;
+  readonly observedRevision: string;
+  readonly dirty: boolean;
+}
+
+export type SkillMarketInstallActionView = "install" | "update" | "replace";
+export type SkillMarketInstallConfirmationReasonView =
+  | "sourceReplacement"
+  | "localOwnership"
+  | "dirtyContent"
+  | "unregisteredDestination"
+  | "downgrade";
+
+export interface SkillMarketInstallPreviewView {
+  readonly action: SkillMarketInstallActionView;
+  readonly resourceId: string;
+  readonly target: SkillMarketInstallTargetView;
+  readonly name: string;
+  readonly availableVersion: string;
+  readonly candidateRevision: string;
+  readonly files: number;
+  readonly bytes: number;
+  readonly currentResource?: SkillMarketCurrentResourceView;
+  readonly unregisteredDestination: boolean;
+  readonly sourceReplacement: boolean;
+  readonly preservesEnabled: boolean;
+  readonly diffAvailable: boolean;
+  readonly diffReason?: string;
+  readonly changes: readonly SkillDiffChangeView[];
+  readonly diffTruncated: boolean;
+}
+
+export interface SkillMarketInstallPlanView {
+  readonly id: string;
+  readonly entry: SkillMarketEntryView;
+  readonly target: SkillMarketInstallTargetView;
+  readonly preview: SkillMarketInstallPreviewView;
+  readonly confirmationReasons: readonly SkillMarketInstallConfirmationReasonView[];
+  readonly requiresConfirmation: boolean;
+  readonly expiresAt: number;
+}
+
+export interface SkillMarketSyncTargetView extends SkillMarketInstallTargetView {
+  readonly targetRevision?: bigint;
+}
+
+export interface SkillMarketSyncBaselineView {
+  readonly resourceRevision: bigint;
+  readonly resourceContentRevision: string;
+  readonly installedContentRevision: string;
+  readonly installedVersion: string;
+  readonly sourceRevision: bigint;
+  readonly entryRevision: bigint;
+  readonly entryContentRevision: string;
+}
+
+export interface SkillMarketSyncPolicyView {
+  readonly resourceId: string;
+  readonly revision: bigint;
+  readonly enabled: boolean;
+  readonly sourceId: string;
+  readonly entryId: string;
+  readonly target: SkillMarketSyncTargetView;
+  readonly baseline: SkillMarketSyncBaselineView;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly disabledReason?: string;
+}
+
+export type SkillMarketSyncJobStateView =
+  | "pendingRevalidation"
+  | "running"
+  | "cancelling"
+  | "succeeded"
+  | "upToDate"
+  | "blocked"
+  | "failed"
+  | "cancelled";
+
+export type SkillMarketSyncOutcomeView =
+  | "updated"
+  | "alreadyCurrent"
+  | "downgradeBlocked"
+  | "dirtyContent"
+  | "ownerChanged"
+  | "targetChanged"
+  | "resourceRemoved"
+  | "cancelled";
+
+export interface SkillMarketSyncJobAuthorityView {
+  readonly sourceId: string;
+  readonly entryId: string;
+  readonly target: SkillMarketSyncTargetView;
+  readonly baseline: SkillMarketSyncBaselineView;
+}
+
+export interface SkillMarketSyncJobView {
+  readonly id: string;
+  readonly revision: bigint;
+  readonly state: SkillMarketSyncJobStateView;
+  readonly policyResourceId: string;
+  readonly policyRevision: bigint;
+  readonly authority: SkillMarketSyncJobAuthorityView;
+  readonly attempt: number;
+  readonly retryOfJobId?: string;
+  readonly availableVersion?: string;
+  readonly outcome?: SkillMarketSyncOutcomeView;
+  readonly error?: string;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly completedAt?: number;
+}
+
+export interface SkillMarketSyncCatalogView<T> {
+  readonly items: readonly T[];
+  readonly recoveredFromCorruption: boolean;
+}
+
+export interface SkillPublicationMetadataView {
+  readonly slug: string;
+  readonly name: string;
+  readonly author?: string;
+  readonly description: string;
+  readonly category?: string;
+  readonly tags: readonly string[];
+  readonly version: string;
+  readonly changelog?: string;
+}
+
+export interface SkillPublicationAuthorityView {
+  readonly resourceId: string;
+  readonly resourceRevision: bigint;
+  readonly observedRevision: string;
+  readonly backendId: string;
+  readonly targetId?: string;
+  readonly scope: SkillScopeView;
+  readonly sourceId: string;
+  readonly sourceRevision: bigint;
+  readonly sourceContentRevision: string;
+  readonly sourceDisplay: string;
+  readonly existingEntryId?: string;
+}
+
+export interface SkillPublicationGateIssueView {
+  readonly code: string;
+  readonly message: string;
+  readonly path?: string;
+}
+
+export interface SkillPublicationGateView {
+  readonly id: "metadata" | "package" | "sensitive_content" | "source_authority";
+  readonly label: string;
+  readonly status: "pending" | "passed" | "blocked";
+  readonly issues: readonly SkillPublicationGateIssueView[];
+}
+
+export interface SkillPublicationResultView {
+  readonly sourceId: string;
+  readonly sourceRevision: bigint;
+  readonly entryId: string;
+  readonly entryRevision: bigint;
+  readonly entryContentRevision: string;
+  readonly version: string;
+}
+
+export type SkillPublicationStateView =
+  | "pending"
+  | "snapshotting"
+  | "packaging"
+  | "scanning"
+  | "committing"
+  | "reconciling"
+  | "cancelling"
+  | "published"
+  | "blocked"
+  | "failed"
+  | "cancelled";
+
+export interface SkillPublicationJobView {
+  readonly id: string;
+  readonly revision: bigint;
+  readonly state: SkillPublicationStateView;
+  readonly authority: SkillPublicationAuthorityView;
+  readonly metadata: SkillPublicationMetadataView;
+  readonly publisher: "personal" | "team";
+  readonly publisherScopeId?: string;
+  readonly visibility: "public" | "department" | "private";
+  readonly audienceScopeIds: readonly string[];
+  readonly accessRevision: bigint;
+  readonly gates: readonly SkillPublicationGateView[];
+  readonly verdict: "pending" | "passed" | "blocked";
+  readonly files: number;
+  readonly uncompressedBytes: number;
+  readonly archiveBytes: number;
+  readonly attempt: number;
+  readonly retryOfJobId?: string;
+  readonly result?: SkillPublicationResultView;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly completedAt?: number;
+  readonly error?: string;
+  readonly cancellable: boolean;
+}
+
+export interface SkillPublicationPreviewView {
+  readonly authority: SkillPublicationAuthorityView;
+  readonly source: SkillMarketSourceView;
+  readonly mode: "first" | "version";
+  readonly suggestedSlug: string;
+  readonly suggestedVersion: string;
+  readonly existingEntry?: SkillMarketEntryView;
+  readonly dirty: boolean;
+  readonly collaborationRevision: bigint;
+  readonly personalPublisherAvailable: boolean;
+  readonly teamPublisherAvailable: boolean;
+  readonly publicVisibilityAvailable: boolean;
+  readonly departmentVisibilityAvailable: boolean;
+  readonly privateVisibilityAvailable: boolean;
+  readonly collaborationUnavailableReason?: string;
+}
+
 /** Exact loaded resource identity owned by one live task runtime. */
 export interface SessionResourceView {
   readonly sessionId: string;
@@ -2089,6 +2675,7 @@ export interface RuntimeToolInputFieldView {
 export interface RuntimeToolView {
   readonly name: string;
   readonly description: string;
+  readonly resourceId?: string;
   readonly fields: readonly RuntimeToolInputFieldView[];
   readonly allowsAdditionalFields: boolean;
   readonly promptGuidelines: readonly string[];
@@ -2440,6 +3027,372 @@ export interface McpCredentialBindingView {
 export interface McpEnvironmentVariableView {
   readonly name: string;
   readonly value: string;
+}
+
+export interface ExtensionCatalogEntryView {
+  readonly id: string;
+  readonly revision: bigint;
+  readonly owner:
+    | { readonly kind: "resource"; readonly resourceId: string; readonly discoveredRevision: string; readonly resourceRevision: bigint }
+    | { readonly kind: "mcp"; readonly serverId: string; readonly serverRevision: bigint }
+    | {
+        readonly kind: "source";
+        readonly sourceId: string;
+        readonly sourceRevision: bigint;
+        readonly entryId: string;
+        readonly contentRevision: string;
+      };
+  readonly source: "local" | "market";
+  readonly installed: boolean;
+  readonly installState: "available" | "installing" | "installed" | "updateAvailable" | "error";
+  readonly name: string;
+  readonly version?: string;
+  readonly author?: string;
+  readonly description: string;
+  readonly enabled: boolean;
+  readonly mainView?: {
+    readonly title?: string;
+    readonly icon?: ExtensionMainViewIconView;
+  };
+  readonly library?: { readonly schemaVersion: 1 };
+  readonly sidebarSupported: boolean;
+  readonly sidebarVisible: boolean;
+  readonly tools: readonly { readonly name: string; readonly description: string; readonly requiresPermission: boolean }[];
+  readonly permissions: readonly {
+    readonly id: string;
+    readonly label: string;
+    readonly description: string;
+    readonly required: boolean;
+    readonly granted: boolean;
+  }[];
+  readonly commands: readonly { readonly name: string; readonly description: string; readonly sessionId: string }[];
+  readonly setup: {
+    readonly state: "notRequired" | "required" | "inProgress" | "ready" | "cancelled" | "failed";
+    readonly attemptId?: string;
+    readonly revision: bigint;
+    readonly fields: readonly {
+      readonly id: string;
+      readonly label: string;
+      readonly description: string;
+      readonly kind: "text" | "secret" | "oauth" | "confirmation";
+      readonly required: boolean;
+      readonly configured: boolean;
+      readonly options: readonly string[];
+    }[];
+    readonly error?: string;
+  };
+  readonly update?: {
+    readonly source: Extract<ExtensionCatalogEntryView["owner"], { readonly kind: "source" }>;
+    readonly availableVersion?: string;
+    readonly sourceReplacement: boolean;
+  };
+  readonly useSupported: boolean;
+  readonly error?: string;
+}
+
+export type ExtensionMainViewIconView =
+  | "activity"
+  | "box"
+  | "code"
+  | "fileText"
+  | "globe"
+  | "layout"
+  | "search"
+  | "sparkles"
+  | "terminal"
+  | "tool";
+
+export interface ExtensionMainViewSurfaceView {
+  readonly id: string;
+  readonly extensionId: string;
+  readonly owner: Extract<ExtensionCatalogEntryView["owner"], { readonly kind: "resource" }>;
+  readonly backendId: string;
+  readonly backendRevision: bigint;
+  readonly backendGeneration: number;
+  /** Same-origin, opaque surface URL; never persisted as Extension identity. */
+  readonly endpoint: string;
+  readonly title?: string;
+  readonly icon?: ExtensionMainViewIconView;
+  readonly expiresAt: number;
+}
+
+export type ExtensionLibraryStateView = "ready" | "readOnly" | "unavailable";
+export type ExtensionLibraryUnavailableReasonView =
+  | "metadataCorrupt"
+  | "fileLimit"
+  | "io"
+  | "operationInProgress"
+  | "diskMissing"
+  | "bindingMoved"
+  | "stateCorrupt";
+
+export interface ExtensionLibraryLocationView {
+  readonly kind: "default" | "custom";
+  /** Trusted management display only; never forwarded to an Extension frame. */
+  readonly path: string;
+  readonly generation: bigint;
+}
+
+export interface ExtensionLibraryOverviewView {
+  readonly extensionId: string;
+  readonly name: string;
+  readonly state: ExtensionLibraryStateView;
+  readonly unavailableReason?: ExtensionLibraryUnavailableReasonView;
+  readonly location?: ExtensionLibraryLocationView;
+  readonly files: number;
+  readonly bytes: bigint;
+  readonly diskFreeBytes?: bigint;
+  readonly softLimitBytes: bigint;
+  readonly softLimitExceeded: boolean;
+  readonly orphaned: boolean;
+  readonly trashCount: number;
+  readonly graceCount: number;
+  readonly operation?: { readonly id: string; readonly phase: string };
+}
+
+export interface ExtensionLibraryLocationValidationView {
+  readonly libraryRoot: string;
+  readonly warnings: readonly string[];
+  readonly diskFreeBytes?: bigint;
+}
+
+export interface ExtensionLibrarySessionView {
+  readonly id: string;
+  readonly extensionId: string;
+  readonly expiresAt: number;
+  readonly bindingGeneration: bigint;
+  readonly limits: {
+    readonly maximumReadBytes: bigint;
+    readonly maximumWriteBytes: bigint;
+    readonly maximumStreamBytes: bigint;
+    readonly maximumPathCharacters: number;
+    readonly maximumPathSegments: number;
+    readonly maximumListPageSize: number;
+    readonly maximumFiles: number;
+    readonly softLimitBytes: bigint;
+    readonly diskReserveBytes: bigint;
+  };
+}
+
+export interface ExtensionLibraryEntryView {
+  readonly path: string;
+  readonly kind: "file" | "directory";
+  readonly bytes: bigint;
+  readonly modifiedAt: number;
+}
+
+export type ExtensionLibrarySqlValueView =
+  | { readonly kind: "null" }
+  | { readonly kind: "number"; readonly value: number }
+  | { readonly kind: "integer"; readonly value: bigint }
+  | { readonly kind: "text"; readonly value: string }
+  | { readonly kind: "blob"; readonly value: Uint8Array };
+
+export interface ExtensionLibrarySqlStatementView {
+  readonly sql: string;
+  readonly parameters?: readonly ExtensionLibrarySqlValueView[];
+}
+
+export type ExtensionLibraryCallView =
+  | { readonly kind: "read"; readonly path: string; readonly offset?: bigint; readonly length?: bigint }
+  | { readonly kind: "write"; readonly path: string; readonly content: Uint8Array; readonly ifNotExists?: boolean }
+  | { readonly kind: "stat"; readonly path: string }
+  | { readonly kind: "list"; readonly path?: string; readonly recursive?: boolean; readonly limit?: number; readonly cursor?: string }
+  | { readonly kind: "mkdir"; readonly path: string }
+  | { readonly kind: "delete"; readonly path: string; readonly recursive?: boolean }
+  | { readonly kind: "rename"; readonly from: string; readonly to: string; readonly overwrite?: boolean }
+  | { readonly kind: "writeBegin"; readonly path: string; readonly totalBytes: bigint; readonly sha256?: string; readonly ifNotExists?: boolean }
+  | { readonly kind: "writeChunk"; readonly streamId: string; readonly sequence: number; readonly content: Uint8Array }
+  | { readonly kind: "writeCommit"; readonly streamId: string }
+  | { readonly kind: "writeAbort"; readonly streamId: string }
+  | { readonly kind: "sqlOpen"; readonly path: string; readonly create?: boolean; readonly readOnly?: boolean }
+  | { readonly kind: "sqlExecute"; readonly handleId: string; readonly statement: ExtensionLibrarySqlStatementView }
+  | { readonly kind: "sqlBatch"; readonly handleId: string; readonly statements: readonly ExtensionLibrarySqlStatementView[] }
+  | { readonly kind: "sqlMigrate"; readonly handleId: string; readonly migrations: readonly { readonly version: number; readonly statements: readonly string[] }[] }
+  | { readonly kind: "sqlBackup"; readonly handleId: string; readonly targetPath: string }
+  | { readonly kind: "sqlCheck" | "sqlClose"; readonly handleId: string };
+
+export interface ExtensionLibrarySqlResultView {
+  readonly rows: readonly { readonly cells: readonly { readonly name: string; readonly value: ExtensionLibrarySqlValueView }[] }[];
+  readonly changes: bigint;
+  readonly lastInsertRowId?: bigint;
+}
+
+export type ExtensionLibraryCallResultView =
+  | { readonly kind: "read"; readonly path: string; readonly content: Uint8Array; readonly sha256: string }
+  | { readonly kind: "write"; readonly path: string; readonly bytes: bigint; readonly sha256: string }
+  | { readonly kind: "stat"; readonly entry: ExtensionLibraryEntryView }
+  | { readonly kind: "list"; readonly entries: readonly ExtensionLibraryEntryView[]; readonly nextCursor?: string }
+  | { readonly kind: "path"; readonly path: string; readonly existed: boolean }
+  | { readonly kind: "rename"; readonly from: string; readonly to: string }
+  | { readonly kind: "stream"; readonly streamId: string; readonly receivedBytes: bigint; readonly nextSequence: number; readonly expiresAt?: number; readonly aborted: boolean }
+  | { readonly kind: "sqlHandle"; readonly handleId: string; readonly path: string; readonly readOnly: boolean; readonly userVersion: number }
+  | { readonly kind: "sqlResult"; readonly value: ExtensionLibrarySqlResultView }
+  | { readonly kind: "sqlBatch"; readonly results: readonly ExtensionLibrarySqlResultView[] }
+  | { readonly kind: "sqlVersion"; readonly userVersion: number; readonly path?: string }
+  | { readonly kind: "boolean"; readonly value: boolean };
+
+export interface ExtensionLibraryTrashEntryView {
+  readonly id: string;
+  readonly extensionId: string;
+  readonly name: string;
+  readonly deletedAt: number;
+  readonly expiresAt: number;
+  readonly files: number;
+  readonly bytes: bigint;
+}
+
+export interface ExtensionLibraryGraceEntryView {
+  readonly id: string;
+  readonly extensionId: string;
+  readonly name: string;
+  readonly createdAt: number;
+  readonly expiresAt: number;
+  readonly files: number;
+  readonly bytes: bigint;
+}
+
+export type ExtensionPackageActionView = "install" | "update" | "replace";
+
+export interface ExtensionPackagePreviewView {
+  readonly extensionId: string;
+  readonly extensionRevision: bigint;
+  readonly action: ExtensionPackageActionView;
+  readonly resourceId: string;
+  readonly backendId: string;
+  readonly packageName: string;
+  readonly installedVersion?: string;
+  readonly availableVersion?: string;
+  readonly currentResource?: {
+    readonly resourceId: string;
+    readonly resourceRevision: bigint;
+    readonly name: string;
+    readonly sourceDisplay: string;
+  };
+  readonly sourceReplacement: boolean;
+  readonly preservesEnabled: boolean;
+  readonly compatibilityDetails: readonly ResourceCompatibilityDetailView[];
+  readonly runtimeRequirements: readonly ResourceRuntimeRequirementView[];
+  readonly warnings: readonly ResourcePackageWarningView[];
+  readonly disabledLifecycleScripts: readonly string[];
+  readonly canToggle: boolean;
+}
+
+export type ExtensionPackageExportStateView =
+  | "pending"
+  | "snapshotting"
+  | "packaging"
+  | "verifying"
+  | "ready"
+  | "failed"
+  | "cancelled";
+
+export interface ExtensionPackageExportAuthorityView {
+  readonly extensionId: string;
+  readonly extensionRevision: bigint;
+  readonly resourceId: string;
+  readonly resourceRevision: bigint;
+  readonly discoveredRevision: string;
+  readonly backendId: string;
+  readonly backendRevision: bigint;
+  readonly backendGeneration: number;
+  readonly packageName: string;
+  readonly packageVersion?: string;
+}
+
+export interface ExtensionPackageExportArtifactView {
+  readonly blobId: string;
+  readonly sha256: string;
+  readonly byteSize: number;
+  readonly mediaType: string;
+  readonly fileName: string;
+}
+
+export interface ExtensionPackageExportJobView {
+  readonly id: string;
+  readonly revision: bigint;
+  readonly state: ExtensionPackageExportStateView;
+  readonly authority: ExtensionPackageExportAuthorityView;
+  readonly archiveFormat: "npm-tar-gzip";
+  readonly fileName: string;
+  readonly files: number;
+  readonly uncompressedBytes: number;
+  readonly artifact?: ExtensionPackageExportArtifactView;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly completedAt?: number;
+  readonly error?: string;
+}
+
+export interface ExtensionPackageExportPreviewView extends ExtensionPackageExportAuthorityView {
+  readonly archiveFormat: "npm-tar-gzip";
+  readonly fileName: string;
+  readonly maximumEntries: number;
+  readonly maximumUncompressedBytes: number;
+  readonly localOnly: true;
+  readonly activeExport?: ExtensionPackageExportJobView;
+  readonly recoveredFromCorruption: boolean;
+}
+
+export interface ExtensionPackageExportCatalogView {
+  readonly exports: readonly ExtensionPackageExportJobView[];
+  readonly recoveredFromCorruption: boolean;
+}
+
+export interface ExtensionCatalogView {
+  readonly revision: bigint;
+  readonly extensions: readonly ExtensionCatalogEntryView[];
+  readonly recoveredFromCorruption: boolean;
+}
+
+export interface ExtensionSourceView {
+  readonly id: string;
+  readonly revision: bigint;
+  readonly kind: "local" | "git";
+  readonly location:
+    | { readonly kind: "local"; readonly path: string }
+    | { readonly kind: "git"; readonly repositoryUrl: string; readonly ref?: string; readonly sparsePaths: readonly string[] };
+  readonly name: string;
+  readonly displayName?: string;
+  readonly state: "ready" | "error";
+  readonly contentRevision: string;
+  readonly discoveredExtensionCount: number;
+  readonly declaredEntryCount: number;
+  readonly skippedEntryCount: number;
+  readonly unreadableEntryCount: number;
+  readonly addedAt: number;
+  readonly refreshedAt?: number;
+  readonly error?: string;
+}
+
+export interface ExtensionSourceCatalogView {
+  readonly revision: bigint;
+  readonly sources: readonly ExtensionSourceView[];
+  readonly recoveredFromCorruption: boolean;
+}
+
+export interface ExtensionSourceGitPreflightView {
+  readonly available: boolean;
+  readonly version?: string;
+  readonly minimumVersion: string;
+}
+
+export type ExtensionSourceDraft =
+  | { readonly kind: "local"; readonly path: string }
+  | { readonly kind: "git"; readonly repositoryUrl: string; readonly ref?: string; readonly sparsePaths: readonly string[] };
+
+/** Owner-scoped, one-shot handoff from Extension detail to the delayed-create
+ * composer. The command remains fenced to the exact catalog projection that
+ * advertised it; it is never inferred again from a display name. */
+export interface PendingExtensionUseView {
+  readonly extensionId: string;
+  readonly extensionRevision: string;
+  readonly commandName: string;
+  readonly runtimeSessionId: string;
+  readonly displayName: string;
+  readonly owner:
+    | { readonly kind: "resource"; readonly resourceId: string; readonly discoveredRevision: string; readonly resourceRevision: string }
+    | { readonly kind: "mcp"; readonly serverId: string; readonly serverRevision: string };
 }
 
 export interface BrowserSettingsView {
@@ -2862,6 +3815,9 @@ export interface AppSnapshot {
   readonly browsers: readonly BrowserView[];
   readonly extraDirectories: readonly ExtraDirectoryView[];
   readonly resources: readonly ResourceView[];
+  readonly extensions: readonly ExtensionCatalogEntryView[];
+  readonly extensionCatalogRevision: bigint;
+  readonly extensionCatalogRecovered: boolean;
   readonly commands: readonly RuntimeCommandView[];
   readonly remoteConnections: readonly RemoteConnectionView[];
   readonly devices: readonly DeviceView[];
@@ -3648,6 +4604,67 @@ export interface OperationApi {
   addResource(draft: ResourceDraft): Promise<void>;
   setResourceEnabled(resourceId: string, enabled: boolean): Promise<void>;
   removeResource(resourceId: string): Promise<void>;
+  listSkills(options?: {
+    readonly query?: string;
+    readonly backendId?: string;
+    readonly targetId?: string;
+    readonly scope?: SkillScopeView;
+    readonly signal?: AbortSignal;
+  }): Promise<SkillCatalogView>;
+  getSkillResourceUsageReport(resourceId: string, timeZone: string, signal?: AbortSignal): Promise<ResourceUsageReportView>;
+  openSkill(skillId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<SkillSessionView>;
+  listSkillFiles(sessionId: string, parentKey?: string, signal?: AbortSignal): Promise<readonly SkillFileEntryView[]>;
+  readSkillFile(sessionId: string, key: string, signal?: AbortSignal): Promise<SkillFileContentView>;
+  getSkillDiff(sessionId: string, signal?: AbortSignal): Promise<SkillDiffView>;
+  prepareSkillFileEdit(sessionId: string, key: string, expectedFileRevision: string, content: string, signal?: AbortSignal): Promise<SkillDraftView>;
+  prepareSkillRename(sessionId: string, name: string, signal?: AbortSignal): Promise<SkillDraftView>;
+  applySkillDraft(draft: SkillDraftView, signal?: AbortSignal): Promise<SkillMutationResultView>;
+  setSkillEnabled(skill: SkillDescriptorView, enabled: boolean, signal?: AbortSignal): Promise<SkillMutationResultView>;
+  deleteSkill(session: SkillSessionView, confirmation: string, signal?: AbortSignal): Promise<SkillMutationResultView>;
+  listSkillRecoveries(signal?: AbortSignal): Promise<readonly SkillRecoveryView[]>;
+  closeSkill(sessionId: string, signal?: AbortSignal): Promise<boolean>;
+  getSkillMarketGitPreflight(signal?: AbortSignal): Promise<SkillMarketGitPreflightView>;
+  listSkillMarketSources(signal?: AbortSignal): Promise<SkillMarketSourceCatalogView>;
+  addSkillMarketSource(source: SkillMarketSourceDraft, expectedCatalogRevision: bigint, signal?: AbortSignal): Promise<void>;
+  refreshSkillMarketSource(sourceId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<void>;
+  removeSkillMarketSource(sourceId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<void>;
+  listSkillMarketCatalog(options?: {
+    readonly expectedRevision?: bigint;
+    readonly query?: string;
+    readonly category?: string;
+    readonly sort?: SkillMarketSortView;
+    readonly pageToken?: string;
+    readonly pageSize?: number;
+    readonly signal?: AbortSignal;
+  }): Promise<SkillMarketCatalogPageView>;
+  getSkillMarketEntry(identity: SkillMarketEntryIdentityView, signal?: AbortSignal): Promise<SkillMarketEntryView>;
+  openSkillMarketPreview(identity: SkillMarketEntryIdentityView, signal?: AbortSignal): Promise<SkillMarketPreviewView>;
+  listSkillMarketPreviewFiles(preview: SkillMarketPreviewView, pageToken?: string, pageSize?: number, signal?: AbortSignal): Promise<SkillMarketArchivePageView>;
+  readSkillMarketPreviewFile(preview: SkillMarketPreviewView, key: string, signal?: AbortSignal): Promise<SkillMarketPreviewFileView>;
+  closeSkillMarketPreview(previewId: string, signal?: AbortSignal): Promise<boolean>;
+  createSkillMarketInstallPlan(identity: SkillMarketEntryIdentityView, target: SkillMarketInstallTargetView, signal?: AbortSignal): Promise<SkillMarketInstallPlanView>;
+  getSkillMarketInstallPlan(planId: string, signal?: AbortSignal): Promise<SkillMarketInstallPlanView>;
+  closeSkillMarketInstallPlan(planId: string, signal?: AbortSignal): Promise<boolean>;
+  installSkillMarketPlan(plan: SkillMarketInstallPlanView, confirmReplacement: boolean, signal?: AbortSignal): Promise<SkillMutationResultView>;
+  listSkillMarketSyncPolicies(signal?: AbortSignal): Promise<SkillMarketSyncCatalogView<SkillMarketSyncPolicyView>>;
+  listSkillMarketSyncJobs(resourceId?: string, signal?: AbortSignal): Promise<SkillMarketSyncCatalogView<SkillMarketSyncJobView>>;
+  getSkillMarketSyncJob(jobId: string, signal?: AbortSignal): Promise<SkillMarketSyncJobView>;
+  enableSkillMarketSync(resourceId: string, expectedResourceRevision: bigint, target: SkillMarketInstallTargetView, signal?: AbortSignal): Promise<void>;
+  disableSkillMarketSync(policy: SkillMarketSyncPolicyView, signal?: AbortSignal): Promise<void>;
+  enqueueSkillMarketSync(policy: SkillMarketSyncPolicyView, signal?: AbortSignal): Promise<void>;
+  cancelSkillMarketSync(job: SkillMarketSyncJobView, signal?: AbortSignal): Promise<void>;
+  retrySkillMarketSync(job: SkillMarketSyncJobView, signal?: AbortSignal): Promise<void>;
+  getSkillPublicationPreview(resourceId: string, expectedResourceRevision: bigint, sourceId: string, expectedSourceRevision: bigint, slug?: string, signal?: AbortSignal): Promise<SkillPublicationPreviewView>;
+  listSkillPublicationJobs(resourceId?: string, signal?: AbortSignal): Promise<SkillMarketSyncCatalogView<SkillPublicationJobView>>;
+  getSkillPublicationJob(jobId: string, signal?: AbortSignal): Promise<SkillPublicationJobView>;
+  getCollaborationDirectory(signal?: AbortSignal): Promise<CollaborationDirectoryView>;
+  createCollaborationScope(kind: CollaborationScopeKindView, name: string, expectedCatalogRevision: bigint, signal?: AbortSignal): Promise<void>;
+  updateCollaborationScope(scope: CollaborationScopeView, name: string, signal?: AbortSignal): Promise<void>;
+  deleteCollaborationScope(scope: CollaborationScopeView, signal?: AbortSignal): Promise<void>;
+  updateSkillMarketAccess(entry: SkillMarketEntryView, collaborationRevision: bigint, selection: SkillPublicationAccessSelectionView, signal?: AbortSignal): Promise<void>;
+  startSkillPublication(preview: SkillPublicationPreviewView, metadata: SkillPublicationMetadataView, access: SkillPublicationAccessSelectionView, signal?: AbortSignal): Promise<void>;
+  cancelSkillPublication(job: SkillPublicationJobView, signal?: AbortSignal): Promise<void>;
+  retrySkillPublication(job: SkillPublicationJobView, signal?: AbortSignal): Promise<void>;
   listCommands(sessionId: string): Promise<readonly RuntimeCommandView[]>;
   listSessionResources(sessionId: string, signal?: AbortSignal): Promise<readonly SessionResourceView[]>;
   listRuntimeProcesses(backendId: string, signal?: AbortSignal): Promise<RuntimeProcessUsageSnapshotView>;
@@ -3663,6 +4680,69 @@ export interface OperationApi {
   resetModelPriceOverride(backendId: string, providerId: string, modelId: string, signal?: AbortSignal): Promise<ModelPriceOverrideView>;
   terminateRuntimeProcess(process: RuntimeProcessUsageView): Promise<void>;
   listRuntimeTools(sessionId: string): Promise<RuntimeToolCatalogView>;
+  listExtensions(options?: {
+    readonly source?: ExtensionCatalogEntryView["source"];
+    readonly installed?: boolean;
+    readonly query?: string;
+    readonly sessionId?: string;
+    readonly signal?: AbortSignal;
+  }): Promise<ExtensionCatalogView>;
+  getExtension(extensionId: string, sessionId?: string, signal?: AbortSignal): Promise<ExtensionCatalogView>;
+  openExtensionMainView(extensionId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ExtensionMainViewSurfaceView>;
+  getExtensionMainViewSurface(surfaceId: string, signal?: AbortSignal): Promise<ExtensionMainViewSurfaceView>;
+  closeExtensionMainView(surfaceId: string, signal?: AbortSignal): Promise<boolean>;
+  getExtensionLibraryOverview(extensionId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ExtensionLibraryOverviewView>;
+  validateExtensionLibraryLocation(extensionId: string, expectedRevision: bigint, candidate: string, signal?: AbortSignal): Promise<ExtensionLibraryLocationValidationView>;
+  relocateExtensionLibrary(extensionId: string, expectedRevision: bigint, destination: { readonly kind: "default" } | { readonly kind: "custom"; readonly candidate: string }, signal?: AbortSignal): Promise<{ readonly changed: boolean; readonly migrationId?: string; readonly location: ExtensionLibraryLocationView; readonly files: number; readonly bytes: bigint; readonly warnings: readonly string[]; readonly graceId?: string }>;
+  rebindExtensionLibrary(extensionId: string, expectedRevision: bigint, candidate: string, signal?: AbortSignal): Promise<{ readonly location: ExtensionLibraryLocationView; readonly warnings: readonly string[] }>;
+  unbindExtensionLibrary(extensionId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<{ readonly detachedPath?: string }>;
+  repairExtensionLibraryState(signal?: AbortSignal): Promise<{ readonly recoveredFromPrevious: boolean; readonly bindings: number; readonly trash: number }>;
+  repairExtensionLibraryMetadata(extensionId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ExtensionLibraryOverviewView>;
+  trashExtensionLibrary(extensionId: string, expectedRevision: bigint, confirmation: string, signal?: AbortSignal): Promise<ExtensionLibraryTrashEntryView>;
+  listExtensionLibraryTrash(extensionId?: string, signal?: AbortSignal): Promise<readonly ExtensionLibraryTrashEntryView[]>;
+  restoreExtensionLibraryTrash(trashId: string, confirmation: string, destination?: { readonly kind: "default" } | { readonly kind: "custom"; readonly candidate: string }, signal?: AbortSignal): Promise<{ readonly extensionId: string; readonly location: ExtensionLibraryLocationView }>;
+  purgeExtensionLibraryTrash(trashId: string, confirmation: string, signal?: AbortSignal): Promise<boolean>;
+  listExtensionLibraryGrace(extensionId?: string, signal?: AbortSignal): Promise<readonly ExtensionLibraryGraceEntryView[]>;
+  rollbackExtensionLibrary(extensionId: string, expectedRevision: bigint, graceId: string, signal?: AbortSignal): Promise<{ readonly location: ExtensionLibraryLocationView; readonly graceId: string }>;
+  purgeExpiredExtensionLibraries(signal?: AbortSignal): Promise<{ readonly trash: number; readonly grace: number }>;
+  openExtensionLibrary(extensionId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ExtensionLibrarySessionView>;
+  callExtensionLibrary(sessionId: string, call: ExtensionLibraryCallView, signal?: AbortSignal): Promise<ExtensionLibraryCallResultView>;
+  closeExtensionLibrary(sessionId: string, signal?: AbortSignal): Promise<boolean>;
+  getExtensionPackagePreview(extensionId: string, expectedRevision: bigint, backendId: string, signal?: AbortSignal): Promise<ExtensionPackagePreviewView>;
+  adoptExtensionPackage(preview: ExtensionPackagePreviewView, allowSourceReplacement?: boolean, signal?: AbortSignal): Promise<void>;
+  removeExtensionPackage(extensionId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<void>;
+  getExtensionPackageExportPreview(extensionId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ExtensionPackageExportPreviewView>;
+  listExtensionPackageExports(extensionId?: string, signal?: AbortSignal): Promise<ExtensionPackageExportCatalogView>;
+  getExtensionPackageExport(exportId: string, signal?: AbortSignal): Promise<ExtensionPackageExportJobView>;
+  startExtensionPackageExport(preview: ExtensionPackageExportPreviewView, signal?: AbortSignal): Promise<ExtensionPackageExportJobView>;
+  cancelExtensionPackageExport(exportId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ExtensionPackageExportJobView>;
+  getExtensionSourceGitPreflight(signal?: AbortSignal): Promise<ExtensionSourceGitPreflightView>;
+  listExtensionSources(signal?: AbortSignal): Promise<ExtensionSourceCatalogView>;
+  addExtensionSource(source: ExtensionSourceDraft, expectedCatalogRevision: bigint): Promise<void>;
+  refreshExtensionSource(sourceId: string, expectedRevision: bigint): Promise<void>;
+  removeExtensionSource(sourceId: string, expectedRevision: bigint): Promise<void>;
+  setExtensionEnabled(extensionId: string, enabled: boolean, expectedRevision: bigint): Promise<void>;
+  setExtensionSidebarVisible(extensionId: string, visible: boolean, expectedRevision: bigint): Promise<void>;
+  beginExtensionSetup(extensionId: string, expectedRevision: bigint): Promise<void>;
+  submitExtensionSetupInteraction(
+    extensionId: string,
+    attemptId: string,
+    fieldId: string,
+    value: string | boolean,
+    expectedRevision: bigint
+  ): Promise<void>;
+  saveExtensionSetupCredential(
+    extensionId: string,
+    attemptId: string,
+    fieldId: string,
+    kind: "apiKey" | "oauth" | "headerSecret",
+    secret: string,
+    expectedRevision: bigint,
+    signal?: AbortSignal
+  ): Promise<void>;
+  completeExtensionSetup(extensionId: string, attemptId: string, expectedRevision: bigint): Promise<void>;
+  cancelExtensionSetup(extensionId: string, attemptId: string, expectedRevision: bigint): Promise<void>;
+  revokeExtensionSetup(extensionId: string, expectedRevision: bigint): Promise<void>;
   listBackgroundTasks(sessionId: string): Promise<readonly BackgroundTaskHistoryView[]>;
   cancelBackgroundTask(sessionId: string, backgroundTaskId: string): Promise<void>;
   listSubagentRuns(sessionId: string, state?: SubagentRunStateView, pageToken?: string, pageSize?: number): Promise<SubagentRunPageView>;
@@ -3838,6 +4918,9 @@ export function emptySnapshot(): AppSnapshot {
     browsers: [],
     extraDirectories: [],
     resources: [],
+    extensions: [],
+    extensionCatalogRevision: 0n,
+    extensionCatalogRecovered: false,
     commands: [],
     remoteConnections: [],
     devices: [],

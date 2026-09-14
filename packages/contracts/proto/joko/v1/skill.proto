@@ -1,0 +1,617 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+import "joko/v1/common.proto";
+import "joko/v1/settings.proto";
+
+message SkillDescriptor {
+  string skill_id = 1;
+  string backend_id = 2;
+  string target_id = 3;
+  ResourceScope scope = 4;
+  string name = 5;
+  // Path-free basename or package label; never a service-node path.
+  string source_label = 6;
+  ResourceState state = 7;
+  bool enabled = 8;
+  bool can_toggle = 9;
+  bool content_available = 10;
+  bool can_edit = 11;
+  bool can_delete = 12;
+  EntityVersion entity_version = 13;
+  string approved_revision = 14;
+  google.protobuf.Timestamp updated_at = 15;
+}
+
+message SkillMetadata {
+  string name = 1;
+  string description = 2;
+  string version = 3;
+  // JSON projection of bounded YAML frontmatter. Sensitive fields are redacted.
+  string frontmatter_json = 4;
+  string parse_error = 5;
+}
+
+enum SkillFileKind {
+  SKILL_FILE_KIND_UNSPECIFIED = 0;
+  SKILL_FILE_KIND_DIRECTORY = 1;
+  SKILL_FILE_KIND_FILE = 2;
+}
+
+message SkillFileEntry {
+  // Portable, Skill-root-relative key. Backslashes and traversal are invalid.
+  string key = 1;
+  string name = 2;
+  SkillFileKind kind = 3;
+  uint64 size = 4;
+  bool editable = 5;
+}
+
+message SkillFileContent {
+  string key = 1;
+  string content = 2;
+  string revision = 3;
+  uint64 size = 4;
+  bool editable = 5;
+}
+
+enum SkillDiffChangeKind {
+  SKILL_DIFF_CHANGE_KIND_UNSPECIFIED = 0;
+  SKILL_DIFF_CHANGE_KIND_ADDED = 1;
+  SKILL_DIFF_CHANGE_KIND_MODIFIED = 2;
+  SKILL_DIFF_CHANGE_KIND_DELETED = 3;
+}
+
+message SkillDiffChange {
+  string key = 1;
+  SkillDiffChangeKind kind = 2;
+  bool binary = 3;
+  string unified_diff = 4;
+}
+
+message SkillDiff {
+  bool available = 1;
+  string reason = 2;
+  repeated SkillDiffChange changes = 3;
+  bool truncated = 4;
+}
+
+message SkillSession {
+  reserved 7;
+  string session_id = 1;
+  SkillDescriptor skill = 2;
+  string observed_revision = 3;
+  bool dirty = 4;
+  bool baseline_available = 5;
+  SkillMetadata metadata = 6;
+  uint64 file_count = 8;
+  uint64 bytes = 9;
+  SkillDiff diff = 10;
+  google.protobuf.Timestamp expires_at = 11;
+}
+
+enum SkillDraftKind {
+  SKILL_DRAFT_KIND_UNSPECIFIED = 0;
+  SKILL_DRAFT_KIND_EDIT = 1;
+  SKILL_DRAFT_KIND_RENAME = 2;
+}
+
+message SkillDraft {
+  string draft_id = 1;
+  string session_id = 2;
+  string skill_id = 3;
+  SkillDraftKind kind = 4;
+  string name = 5;
+  Revision resource_revision = 6;
+  string observed_revision = 7;
+  repeated SkillDiffChange changes = 8;
+  google.protobuf.Timestamp expires_at = 9;
+}
+
+enum SkillRecoveryStatus {
+  SKILL_RECOVERY_STATUS_UNSPECIFIED = 0;
+  SKILL_RECOVERY_STATUS_READY = 1;
+  SKILL_RECOVERY_STATUS_MISSING = 2;
+}
+
+message SkillRecovery {
+  string recovery_id = 1;
+  string skill_id = 2;
+  string backend_id = 3;
+  string target_id = 4;
+  ResourceScope scope = 5;
+  string name = 6;
+  string revision = 7;
+  uint64 files = 8;
+  uint64 bytes = 9;
+  google.protobuf.Timestamp created_at = 10;
+  SkillRecoveryStatus status = 11;
+}
+
+message SkillMutationResult {
+  SkillDescriptor skill = 1;
+  // Present only when a project directory rename replaced its path-derived ID.
+  string replaced_skill_id = 2;
+  string recovery_id = 3;
+}
+
+enum SkillMarketSourceKind {
+  SKILL_MARKET_SOURCE_KIND_UNSPECIFIED = 0;
+  SKILL_MARKET_SOURCE_KIND_LOCAL = 1;
+  SKILL_MARKET_SOURCE_KIND_GIT = 2;
+}
+
+enum SkillMarketSourceState {
+  SKILL_MARKET_SOURCE_STATE_UNSPECIFIED = 0;
+  SKILL_MARKET_SOURCE_STATE_READY = 1;
+  SKILL_MARKET_SOURCE_STATE_ERROR = 2;
+}
+
+enum SkillMarketSort {
+  SKILL_MARKET_SORT_UNSPECIFIED = 0;
+  SKILL_MARKET_SORT_TRENDING = 1;
+  SKILL_MARKET_SORT_DOWNLOADS = 2;
+  SKILL_MARKET_SORT_UPDATED = 3;
+  SKILL_MARKET_SORT_CREATED = 4;
+}
+
+enum SkillMarketPreviewUnavailableReason {
+  SKILL_MARKET_PREVIEW_UNAVAILABLE_REASON_UNSPECIFIED = 0;
+  SKILL_MARKET_PREVIEW_UNAVAILABLE_REASON_BINARY = 1;
+  SKILL_MARKET_PREVIEW_UNAVAILABLE_REASON_TOO_LARGE = 2;
+}
+
+enum SkillMarketInstallAction {
+  SKILL_MARKET_INSTALL_ACTION_UNSPECIFIED = 0;
+  SKILL_MARKET_INSTALL_ACTION_INSTALL = 1;
+  SKILL_MARKET_INSTALL_ACTION_UPDATE = 2;
+  SKILL_MARKET_INSTALL_ACTION_REPLACE = 3;
+}
+
+enum SkillMarketInstallStatusState {
+  SKILL_MARKET_INSTALL_STATUS_STATE_UNSPECIFIED = 0;
+  SKILL_MARKET_INSTALL_STATUS_STATE_INSTALLED = 1;
+  SKILL_MARKET_INSTALL_STATUS_STATE_UPDATE_AVAILABLE = 2;
+  SKILL_MARKET_INSTALL_STATUS_STATE_CONFLICT = 3;
+}
+
+enum SkillMarketInstallConfirmationReason {
+  SKILL_MARKET_INSTALL_CONFIRMATION_REASON_UNSPECIFIED = 0;
+  SKILL_MARKET_INSTALL_CONFIRMATION_REASON_SOURCE_REPLACEMENT = 1;
+  SKILL_MARKET_INSTALL_CONFIRMATION_REASON_LOCAL_OWNERSHIP = 2;
+  SKILL_MARKET_INSTALL_CONFIRMATION_REASON_DIRTY_CONTENT = 3;
+  SKILL_MARKET_INSTALL_CONFIRMATION_REASON_UNREGISTERED_DESTINATION = 4;
+  SKILL_MARKET_INSTALL_CONFIRMATION_REASON_DOWNGRADE = 5;
+}
+
+enum SkillMarketSyncJobState {
+  SKILL_MARKET_SYNC_JOB_STATE_UNSPECIFIED = 0;
+  SKILL_MARKET_SYNC_JOB_STATE_PENDING_REVALIDATION = 1;
+  SKILL_MARKET_SYNC_JOB_STATE_RUNNING = 2;
+  SKILL_MARKET_SYNC_JOB_STATE_CANCELLING = 3;
+  SKILL_MARKET_SYNC_JOB_STATE_SUCCEEDED = 4;
+  SKILL_MARKET_SYNC_JOB_STATE_UP_TO_DATE = 5;
+  SKILL_MARKET_SYNC_JOB_STATE_BLOCKED = 6;
+  SKILL_MARKET_SYNC_JOB_STATE_FAILED = 7;
+  SKILL_MARKET_SYNC_JOB_STATE_CANCELLED = 8;
+}
+
+enum SkillMarketSyncOutcome {
+  SKILL_MARKET_SYNC_OUTCOME_UNSPECIFIED = 0;
+  SKILL_MARKET_SYNC_OUTCOME_UPDATED = 1;
+  SKILL_MARKET_SYNC_OUTCOME_ALREADY_CURRENT = 2;
+  SKILL_MARKET_SYNC_OUTCOME_DOWNGRADE_BLOCKED = 3;
+  SKILL_MARKET_SYNC_OUTCOME_DIRTY_CONTENT = 4;
+  SKILL_MARKET_SYNC_OUTCOME_OWNER_CHANGED = 5;
+  SKILL_MARKET_SYNC_OUTCOME_TARGET_CHANGED = 6;
+  SKILL_MARKET_SYNC_OUTCOME_RESOURCE_REMOVED = 7;
+  SKILL_MARKET_SYNC_OUTCOME_CANCELLED = 8;
+}
+
+enum SkillPublicationState {
+  SKILL_PUBLICATION_STATE_UNSPECIFIED = 0;
+  SKILL_PUBLICATION_STATE_PENDING = 1;
+  SKILL_PUBLICATION_STATE_SNAPSHOTTING = 2;
+  SKILL_PUBLICATION_STATE_PACKAGING = 3;
+  SKILL_PUBLICATION_STATE_SCANNING = 4;
+  SKILL_PUBLICATION_STATE_COMMITTING = 5;
+  SKILL_PUBLICATION_STATE_RECONCILING = 6;
+  SKILL_PUBLICATION_STATE_CANCELLING = 7;
+  SKILL_PUBLICATION_STATE_PUBLISHED = 8;
+  SKILL_PUBLICATION_STATE_BLOCKED = 9;
+  SKILL_PUBLICATION_STATE_FAILED = 10;
+  SKILL_PUBLICATION_STATE_CANCELLED = 11;
+}
+
+enum SkillPublicationGateStatus {
+  SKILL_PUBLICATION_GATE_STATUS_UNSPECIFIED = 0;
+  SKILL_PUBLICATION_GATE_STATUS_PENDING = 1;
+  SKILL_PUBLICATION_GATE_STATUS_PASSED = 2;
+  SKILL_PUBLICATION_GATE_STATUS_BLOCKED = 3;
+}
+
+enum SkillPublicationVerdict {
+  SKILL_PUBLICATION_VERDICT_UNSPECIFIED = 0;
+  SKILL_PUBLICATION_VERDICT_PENDING = 1;
+  SKILL_PUBLICATION_VERDICT_PASSED = 2;
+  SKILL_PUBLICATION_VERDICT_BLOCKED = 3;
+}
+
+enum SkillPublicationMode {
+  SKILL_PUBLICATION_MODE_UNSPECIFIED = 0;
+  SKILL_PUBLICATION_MODE_FIRST = 1;
+  SKILL_PUBLICATION_MODE_VERSION = 2;
+}
+
+enum SkillPublicationPublisher {
+  SKILL_PUBLICATION_PUBLISHER_UNSPECIFIED = 0;
+  SKILL_PUBLICATION_PUBLISHER_PERSONAL = 1;
+  SKILL_PUBLICATION_PUBLISHER_TEAM = 2;
+  // Read-only catalog provenance for entries not published by this identity owner.
+  SKILL_PUBLICATION_PUBLISHER_EXTERNAL = 3;
+}
+
+enum SkillPublicationVisibility {
+  SKILL_PUBLICATION_VISIBILITY_UNSPECIFIED = 0;
+  SKILL_PUBLICATION_VISIBILITY_PUBLIC = 1;
+  SKILL_PUBLICATION_VISIBILITY_DEPARTMENT = 2;
+  SKILL_PUBLICATION_VISIBILITY_PRIVATE = 3;
+}
+
+enum CollaborationScopeKind {
+  COLLABORATION_SCOPE_KIND_UNSPECIFIED = 0;
+  COLLABORATION_SCOPE_KIND_TEAM = 1;
+  COLLABORATION_SCOPE_KIND_DEPARTMENT = 2;
+}
+
+enum CollaborationRole {
+  COLLABORATION_ROLE_UNSPECIFIED = 0;
+  COLLABORATION_ROLE_VIEWER = 1;
+  COLLABORATION_ROLE_PUBLISHER = 2;
+  COLLABORATION_ROLE_ADMINISTRATOR = 3;
+}
+
+message CollaborationActor {
+  string actor_id = 1;
+  string display_name = 2;
+}
+
+message CollaborationMembership {
+  string actor_id = 1;
+  CollaborationRole role = 2;
+}
+
+message CollaborationScope {
+  string scope_id = 1;
+  Revision revision = 2;
+  CollaborationScopeKind kind = 3;
+  string name = 4;
+  repeated CollaborationMembership members = 5;
+}
+
+message CollaborationDirectory {
+  bool available = 1;
+  Revision revision = 2;
+  optional CollaborationActor actor = 3;
+  repeated CollaborationScope scopes = 4;
+  bool recovered_from_corruption = 5;
+  optional string unavailable_reason = 6;
+}
+
+message SkillAccessPublisher {
+  SkillPublicationPublisher kind = 1;
+  optional string actor_id = 2;
+  optional string scope_id = 3;
+  optional string source_id = 4;
+}
+
+message SkillAccessPolicy {
+  Revision revision = 1;
+  SkillAccessPublisher publisher = 2;
+  SkillPublicationVisibility visibility = 3;
+  repeated string audience_scope_ids = 4;
+}
+
+message SkillMarketLocalSource {
+  // Write-only service-node directory explicitly selected by the user.
+  string server_path = 1;
+}
+
+message SkillMarketGitSource {
+  string repository_url = 1;
+  optional string ref = 2;
+  repeated string sparse_paths = 3;
+}
+
+message SkillMarketSourceLocation {
+  oneof kind {
+    SkillMarketLocalSource local = 1;
+    SkillMarketGitSource git = 2;
+  }
+}
+
+message SkillMarketSourceDescriptor {
+  string source_id = 1;
+  Revision revision = 2;
+  SkillMarketSourceKind kind = 3;
+  // Path-free basename, repository label, or manifest display name.
+  string display = 4;
+  string name = 5;
+  optional string display_name = 6;
+  SkillMarketSourceState state = 7;
+  string content_revision = 8;
+  uint32 entry_count = 9;
+  google.protobuf.Timestamp added_at = 10;
+  optional google.protobuf.Timestamp refreshed_at = 11;
+  optional string error = 12;
+}
+
+message SkillMarketGitPreflight {
+  bool available = 1;
+  optional string version = 2;
+  string minimum_version = 3;
+}
+
+message SkillMarketEntryIdentity {
+  string source_id = 1;
+  Revision source_revision = 2;
+  string entry_id = 3;
+  Revision entry_revision = 4;
+  string content_revision = 5;
+}
+
+message SkillMarketEntry {
+  SkillMarketEntryIdentity identity = 1;
+  string slug = 2;
+  string name = 3;
+  optional string author = 4;
+  string description = 5;
+  optional string category = 6;
+  repeated string tags = 7;
+  string version = 8;
+  google.protobuf.Timestamp created_at = 9;
+  google.protobuf.Timestamp updated_at = 10;
+  uint64 downloads = 11;
+  double trend_score = 12;
+  uint64 archive_bytes = 13;
+  string source_name = 14;
+  optional string source_display_name = 15;
+  SkillMarketSourceState source_state = 16;
+  optional string source_error = 17;
+  repeated SkillMarketInstallStatus install_statuses = 18;
+  optional string changelog = 19;
+  SkillAccessPolicy access = 20;
+  bool can_manage = 21;
+}
+
+message SkillMarketInstallStatus {
+  string resource_id = 1;
+  Revision resource_revision = 2;
+  string backend_id = 3;
+  optional string target_id = 4;
+  ResourceScope scope = 5;
+  SkillMarketInstallStatusState state = 6;
+  optional string installed_version = 7;
+  optional string relative_parent = 8;
+}
+
+message SkillMarketArchiveEntry {
+  string key = 1;
+  SkillFileKind kind = 2;
+  uint64 size = 3;
+}
+
+message SkillMarketPreview {
+  string preview_id = 1;
+  SkillMarketEntry entry = 2;
+  string snapshot_revision = 3;
+  uint64 files = 4;
+  uint64 bytes = 5;
+  google.protobuf.Timestamp expires_at = 6;
+}
+
+message SkillMarketPreviewFile {
+  string preview_id = 1;
+  string snapshot_revision = 2;
+  string key = 3;
+  uint64 size = 4;
+  bool previewable = 5;
+  optional string content = 6;
+  optional SkillMarketPreviewUnavailableReason unavailable_reason = 7;
+}
+
+message SkillMarketInstallTarget {
+  string backend_id = 1;
+  ResourceScope scope = 2;
+  optional string target_id = 3;
+  optional string relative_parent = 4;
+}
+
+message SkillMarketCurrentResource {
+  string resource_id = 1;
+  Revision resource_revision = 2;
+  string name = 3;
+  optional string version = 4;
+  ResourceAcquisitionKind source_kind = 5;
+  string source_display = 6;
+  string discovered_revision = 7;
+  string observed_revision = 8;
+  bool dirty = 9;
+}
+
+message SkillMarketInstallPreview {
+  SkillMarketInstallAction action = 1;
+  string resource_id = 2;
+  SkillMarketInstallTarget target = 3;
+  string name = 4;
+  string available_version = 5;
+  string candidate_revision = 6;
+  uint64 files = 7;
+  uint64 bytes = 8;
+  optional SkillMarketCurrentResource current_resource = 9;
+  bool unregistered_destination = 10;
+  bool source_replacement = 11;
+  bool preserves_enabled = 12;
+  bool diff_available = 13;
+  optional string diff_reason = 14;
+  repeated SkillDiffChange changes = 15;
+  bool diff_truncated = 16;
+}
+
+message SkillMarketInstallPlan {
+  string plan_id = 1;
+  SkillMarketEntry entry = 2;
+  SkillMarketInstallTarget target = 3;
+  SkillMarketInstallPreview preview = 4;
+  repeated SkillMarketInstallConfirmationReason confirmation_reasons = 5;
+  bool requires_confirmation = 6;
+  google.protobuf.Timestamp expires_at = 7;
+}
+
+message SkillMarketSyncTarget {
+  string backend_id = 1;
+  ResourceScope scope = 2;
+  optional string target_id = 3;
+  optional string relative_parent = 4;
+  optional Revision target_revision = 5;
+}
+
+message SkillMarketSyncBaseline {
+  Revision resource_revision = 1;
+  string resource_content_revision = 2;
+  string installed_content_revision = 3;
+  string installed_version = 4;
+  Revision source_revision = 5;
+  Revision entry_revision = 6;
+  string entry_content_revision = 7;
+}
+
+message SkillMarketSyncPolicy {
+  string resource_id = 1;
+  Revision revision = 2;
+  bool enabled = 3;
+  string source_id = 4;
+  string entry_id = 5;
+  SkillMarketSyncTarget target = 6;
+  SkillMarketSyncBaseline baseline = 7;
+  google.protobuf.Timestamp created_at = 8;
+  google.protobuf.Timestamp updated_at = 9;
+  optional string disabled_reason = 10;
+}
+
+message SkillMarketSyncJobAuthority {
+  string source_id = 1;
+  string entry_id = 2;
+  SkillMarketSyncTarget target = 3;
+  SkillMarketSyncBaseline baseline = 4;
+}
+
+message SkillMarketSyncJob {
+  string job_id = 1;
+  Revision revision = 2;
+  SkillMarketSyncJobState state = 3;
+  string policy_resource_id = 4;
+  Revision policy_revision = 5;
+  SkillMarketSyncJobAuthority authority = 6;
+  uint32 attempt = 7;
+  optional string retry_of_job_id = 8;
+  optional string available_version = 9;
+  optional SkillMarketSyncOutcome outcome = 10;
+  optional string error = 11;
+  google.protobuf.Timestamp created_at = 12;
+  google.protobuf.Timestamp updated_at = 13;
+  optional google.protobuf.Timestamp completed_at = 14;
+}
+
+message SkillPublicationMetadata {
+  string slug = 1;
+  string name = 2;
+  optional string author = 3;
+  string description = 4;
+  optional string category = 5;
+  repeated string tags = 6;
+  string version = 7;
+  optional string changelog = 8;
+}
+
+message SkillPublicationAuthority {
+  string resource_id = 1;
+  Revision resource_revision = 2;
+  string observed_revision = 3;
+  string backend_id = 4;
+  optional string target_id = 5;
+  ResourceScope scope = 6;
+  string source_id = 7;
+  Revision source_revision = 8;
+  string source_content_revision = 9;
+  // Path-free source display owned by the service.
+  string source_display = 10;
+  optional string existing_entry_id = 11;
+}
+
+message SkillPublicationGateIssue {
+  string code = 1;
+  string message = 2;
+  optional string path = 3;
+}
+
+message SkillPublicationGate {
+  string gate_id = 1;
+  string label = 2;
+  SkillPublicationGateStatus status = 3;
+  repeated SkillPublicationGateIssue issues = 4;
+}
+
+message SkillPublicationResult {
+  string source_id = 1;
+  Revision source_revision = 2;
+  string entry_id = 3;
+  Revision entry_revision = 4;
+  string entry_content_revision = 5;
+  string version = 6;
+}
+
+message SkillPublicationJob {
+  string job_id = 1;
+  Revision revision = 2;
+  SkillPublicationState state = 3;
+  SkillPublicationAuthority authority = 4;
+  SkillPublicationMetadata metadata = 5;
+  SkillPublicationPublisher publisher = 6;
+  SkillPublicationVisibility visibility = 7;
+  repeated SkillPublicationGate gates = 8;
+  SkillPublicationVerdict verdict = 9;
+  uint64 files = 10;
+  uint64 uncompressed_bytes = 11;
+  uint64 archive_bytes = 12;
+  uint32 attempt = 13;
+  optional string retry_of_job_id = 14;
+  optional SkillPublicationResult result = 15;
+  google.protobuf.Timestamp created_at = 16;
+  google.protobuf.Timestamp updated_at = 17;
+  optional google.protobuf.Timestamp completed_at = 18;
+  optional string error = 19;
+  bool cancellable = 20;
+  optional string publisher_scope_id = 21;
+  repeated string audience_scope_ids = 22;
+  Revision access_revision = 23;
+}
+
+message SkillPublicationPreview {
+  SkillPublicationAuthority authority = 1;
+  SkillMarketSourceDescriptor source = 2;
+  SkillPublicationMode mode = 3;
+  string suggested_slug = 4;
+  string suggested_version = 5;
+  optional SkillMarketEntry existing_entry = 6;
+  bool dirty = 7;
+  bool personal_publisher_available = 8;
+  bool team_publisher_available = 9;
+  bool public_visibility_available = 10;
+  bool department_visibility_available = 11;
+  bool private_visibility_available = 12;
+  string collaboration_unavailable_reason = 13;
+  Revision collaboration_revision = 14;
+}

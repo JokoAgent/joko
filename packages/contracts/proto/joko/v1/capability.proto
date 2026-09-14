@@ -124,6 +124,8 @@ message RuntimeCapabilityOptions {
   bool reports_resources = 2;
   bool background_tasks = 3;
   google.protobuf.Duration minimum_poll_interval = 4;
+  // Stable resource kinds supported by runtime.resources, for example "skill".
+  repeated string resource_kinds = 5;
 }
 
 message ToolCapabilityOptions {

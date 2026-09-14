@@ -80,6 +80,7 @@ message RuntimeToolDescriptor {
   repeated string prompt_guidelines = 4;
   bool active = 5;
   RuntimeToolSourceInfo source_info = 6;
+  string resource_id = 7;
 }
 
 message RuntimeToolCatalog {

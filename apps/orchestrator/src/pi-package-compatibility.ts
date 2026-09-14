@@ -7,6 +7,12 @@ import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } 
 import { parse } from "@babel/parser";
 import { minimatch } from "minimatch";
 
+import {
+  parseExtensionSurfaceManifest,
+  type ExtensionLibraryDescriptor,
+  type ExtensionMainViewDescriptor
+} from "./extension-surface-manifest.js";
+
 export type PiPackageCompatibility = "supported" | "partial" | "unsupported" | "unknown";
 
 export type PiPackageCompatibilityIssue =
@@ -70,6 +76,10 @@ export interface PiExtensionCompatibilityAnalysis {
 export interface PiPackageResourceDetail {
   readonly kind: PiPackageResourceDetailKind;
   readonly name: string;
+  /** Exact package-relative runtime entry for Extension resources. */
+  readonly entryPath?: string;
+  readonly mainView?: ExtensionMainViewDescriptor;
+  readonly library?: ExtensionLibraryDescriptor;
   readonly compatibility: PiPackageCompatibility;
   readonly compatibilityIssues: readonly PiPackageCompatibilityIssue[];
   readonly detectedApis: readonly PiExtensionUiApi[];
@@ -100,6 +110,23 @@ export interface PiPackageInspection {
   readonly canToggle: boolean;
   readonly extensionContentFingerprint?: string;
   readonly compatibilityNotice: boolean;
+}
+
+/** Bounded, non-executing package metadata used by the Extension Source
+ * catalog. It intentionally does not grant Resource approval or inspect
+ * runtime code; the Resource owner repeats its own byte inspection when a
+ * user later adopts the package. */
+export interface PiPackageCatalogInspection {
+  readonly name: string;
+  readonly version?: string;
+  readonly author?: string;
+  readonly description: string;
+  readonly extensions: readonly {
+    readonly relativePath: string;
+    readonly resourceName: string;
+    readonly mainView?: ExtensionMainViewDescriptor;
+    readonly library?: ExtensionLibraryDescriptor;
+  }[];
 }
 
 const ADAPTED_APIS = new Set<PiExtensionUiApi>([
@@ -342,8 +369,18 @@ export async function inspectPiPackageCompatibility(
     const skillPaths = collectSkillFiles(tree, resourceGroups[1]);
     const promptPaths = collectFilesWithSuffix(tree, resourceGroups[2], [".md"]);
     const themePaths = collectFilesWithSuffix(tree, resourceGroups[3], [".json"]);
+    const extensionRelativePaths = extensionPaths.map((entry) => toPosix(relative(source, entry)));
+    const surfaces = parseExtensionSurfaceManifest(
+      manifest,
+      extensionRelativePaths,
+      tree.entries.filter((entry) => !entry.directory).map((entry) => entry.relativePath)
+    );
+    const surfaceByEntry = new Map(surfaces.map((surface) => [surface.entry, surface] as const));
     const extensionResources: PiPackageResourceDetail[] = [];
-    for (const entry of extensionPaths) extensionResources.push(await extensionDetail(source, entry));
+    for (const entry of extensionPaths) {
+      const entryPath = toPosix(relative(source, entry));
+      extensionResources.push(await extensionDetail(source, entry, entryPath, surfaceByEntry.get(entryPath)));
+    }
     const resources: PiPackageResourceDetail[] = [
       ...extensionResources,
       ...skillPaths.map((path) => basicResourceDetail("skill", basename(dirname(path)), "supported")),
@@ -380,6 +417,49 @@ export async function inspectPiPackageCompatibility(
       disabledLifecycleScripts: []
     });
   }
+}
+
+export async function inspectPiPackageCatalog(packagePath: string): Promise<PiPackageCatalogInspection> {
+  const source = await canonicalRegularPath(packagePath, undefined, "Package path");
+  if (!(await lstat(source)).isDirectory()) throw new Error("Catalog packages must be directories.");
+  const tree = await enumeratePackageTree(source);
+  const manifestEntry = tree.entries.find((entry) => !entry.directory && entry.relativePath === "package.json");
+  const manifest = manifestEntry === undefined ? {} : await readPackageManifest(manifestEntry.path, source);
+  const piManifest = plainObject(manifest.pi) ? manifest.pi : undefined;
+  const extensionRoots = await packageResourcePaths(tree, piManifest, "extensions");
+  const extensionPaths = collectExtensionFiles(tree, extensionRoots);
+  const extensionRelativePaths = extensionPaths.map((entry) => toPosix(relative(source, entry)));
+  const surfaces = parseExtensionSurfaceManifest(
+    manifest,
+    extensionRelativePaths,
+    tree.entries.filter((entry) => !entry.directory).map((entry) => entry.relativePath)
+  );
+  const surfaceByEntry = new Map(surfaces.map((surface) => [surface.entry, surface] as const));
+  const extensions = extensionPaths.map((entry) => {
+    const relativePath = toPosix(relative(source, entry));
+    const surface = surfaceByEntry.get(relativePath);
+    return {
+      relativePath,
+      resourceName: boundedDisplay(basename(entry)),
+      ...(surface?.mainView === undefined ? {} : { mainView: surface.mainView }),
+      ...(surface?.library === undefined ? {} : { library: surface.library })
+    };
+  });
+  if (extensions.length === 0) throw new Error("Catalog package does not expose a Pi extension.");
+  const rawAuthor = typeof manifest.author === "string"
+    ? manifest.author
+    : plainObject(manifest.author) && typeof manifest.author.name === "string"
+      ? manifest.author.name
+      : undefined;
+  return {
+    name: boundedDisplay(typeof manifest.name === "string" && manifest.name.trim() !== "" ? manifest.name : basename(source)),
+    ...(typeof manifest.version === "string" && manifest.version.trim() !== ""
+      ? { version: boundedDisplay(manifest.version, 128) }
+      : {}),
+    ...(rawAuthor === undefined || rawAuthor.trim() === "" ? {} : { author: boundedDisplay(rawAuthor, 256) }),
+    description: typeof manifest.description === "string" ? boundedDisplay(manifest.description, 2_048) : "",
+    extensions
+  };
 }
 
 export async function inspectPiResourceCompatibility(
@@ -427,7 +507,8 @@ export async function inspectPiResourceCompatibility(
         warnings: resources.length === 0 ? [...new Set([...inspected.warnings, "no-resources" as const])] : inspected.warnings
       });
     }
-    const detail = await extensionDetail(info.isDirectory() ? canonical : dirname(canonical), entry);
+    const detailRoot = info.isDirectory() ? canonical : dirname(canonical);
+    const detail = await extensionDetail(detailRoot, entry, toPosix(relative(detailRoot, entry)));
     return completePackageInspection({
       name: boundedDisplay(basename(canonical)),
       resources: [detail],
@@ -476,12 +557,20 @@ function basicResourceDetail(
   };
 }
 
-async function extensionDetail(root: string, entry: string): Promise<PiPackageResourceDetail> {
+async function extensionDetail(
+  root: string,
+  entry: string,
+  entryPath = toPosix(relative(root, entry)),
+  surface?: { readonly mainView?: ExtensionMainViewDescriptor; readonly library?: ExtensionLibraryDescriptor }
+): Promise<PiPackageResourceDetail> {
   try {
     const analysis = await analyzePiExtensionCompatibility(entry, root);
     return {
       kind: "extension",
       name: boundedDisplay(basename(entry)),
+      entryPath,
+      ...(surface?.mainView === undefined ? {} : { mainView: surface.mainView }),
+      ...(surface?.library === undefined ? {} : { library: surface.library }),
       compatibility: analysis.compatibility,
       compatibilityIssues: analysis.compatibilityIssues,
       detectedApis: analysis.detectedApis,
@@ -490,7 +579,10 @@ async function extensionDetail(root: string, entry: string): Promise<PiPackageRe
     };
   } catch {
     return {
-      ...basicResourceDetail("extension", basename(entry), "unknown", ["analysis-incomplete"])
+      ...basicResourceDetail("extension", basename(entry), "unknown", ["analysis-incomplete"]),
+      entryPath,
+      ...(surface?.mainView === undefined ? {} : { mainView: surface.mainView }),
+      ...(surface?.library === undefined ? {} : { library: surface.library })
     };
   }
 }

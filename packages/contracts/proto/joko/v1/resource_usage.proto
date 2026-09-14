@@ -1,0 +1,144 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+import "joko/v1/common.proto";
+
+enum ResourceUsageSource {
+  RESOURCE_USAGE_SOURCE_UNSPECIFIED = 0;
+  RESOURCE_USAGE_SOURCE_STRUCTURED_RESOURCE_MENTION = 1;
+  RESOURCE_USAGE_SOURCE_NATIVE_SKILL_COMMAND = 2;
+  RESOURCE_USAGE_SOURCE_RUNTIME_CONFIRMED_RESOURCE_LOAD = 3;
+  RESOURCE_USAGE_SOURCE_EXACT_FILE_READ = 4;
+  RESOURCE_USAGE_SOURCE_RUNTIME_TOOL_CALL = 5;
+}
+
+enum ResourceUsageActivity {
+  RESOURCE_USAGE_ACTIVITY_UNSPECIFIED = 0;
+  RESOURCE_USAGE_ACTIVITY_STRONG_ACTIVE = 1;
+  RESOURCE_USAGE_ACTIVITY_SEMI_ACTIVE = 2;
+  RESOURCE_USAGE_ACTIVITY_PASSIVE = 3;
+}
+
+enum ResourceUsageAction {
+  RESOURCE_USAGE_ACTION_UNSPECIFIED = 0;
+  RESOURCE_USAGE_ACTION_EXPOSURE = 1;
+  RESOURCE_USAGE_ACTION_READ = 2;
+  RESOURCE_USAGE_ACTION_REREAD = 3;
+  RESOURCE_USAGE_ACTION_TOOL_SUCCEEDED = 4;
+  RESOURCE_USAGE_ACTION_TOOL_FAILED = 5;
+  RESOURCE_USAGE_ACTION_COMMAND_SUCCEEDED = 6;
+  RESOURCE_USAGE_ACTION_COMMAND_FAILED = 7;
+}
+
+message ResourceUsageMarketProvenance {
+  string source_id = 1;
+  Revision source_revision = 2;
+  string entry_id = 3;
+  Revision entry_revision = 4;
+  string entry_content_revision = 5;
+  string installed_content_revision = 6;
+}
+
+// Exact, content-free Resource evidence. Session/run/Backend/event/time are
+// authoritative on the enclosing Event identity and envelope.
+message ResourceUsageRecordedEvent {
+  string occurrence_id = 1;
+  string resource_id = 2;
+  Revision resource_revision = 3;
+  string content_revision = 4;
+  uint64 runtime_generation = 5;
+  optional string version = 6;
+  optional ResourceUsageMarketProvenance market = 7;
+  ResourceUsageSource source = 8;
+  ResourceUsageActivity activity = 9;
+  ResourceUsageAction action = 10;
+}
+
+message ResourceUsageMetrics {
+  uint64 samples = 1;
+  uint64 strong_active = 2;
+  uint64 semi_active = 3;
+  uint64 passive_exposures = 4;
+  uint64 reads = 5;
+  uint64 rereads = 6;
+  uint64 tool_calls = 7;
+  uint64 tool_errors = 8;
+  uint64 commands = 9;
+  uint64 command_failures = 10;
+  optional google.protobuf.Timestamp latest_used_at = 11;
+}
+
+message ResourceUsageSourceBreakdown {
+  ResourceUsageSource source = 1;
+  ResourceUsageMetrics metrics = 2;
+}
+
+message ResourceUsageAgentBreakdown {
+  string backend_id = 1;
+  ResourceUsageMetrics metrics = 2;
+}
+
+message ResourceUsageVersionIdentity {
+  Revision resource_revision = 1;
+  string content_revision = 2;
+  optional string version = 3;
+}
+
+message ResourceUsageVersionBreakdown {
+  ResourceUsageVersionIdentity identity = 1;
+  ResourceUsageMetrics metrics = 2;
+  optional google.protobuf.Timestamp first_used_at = 3;
+}
+
+message ResourceUsageDay {
+  string local_day = 1;
+  ResourceUsageMetrics metrics = 2;
+}
+
+enum ResourceUsageComparisonUnavailableReason {
+  RESOURCE_USAGE_COMPARISON_UNAVAILABLE_REASON_UNSPECIFIED = 0;
+  RESOURCE_USAGE_COMPARISON_UNAVAILABLE_REASON_NO_CURRENT_VERSION = 1;
+  RESOURCE_USAGE_COMPARISON_UNAVAILABLE_REASON_NO_PREVIOUS_VERSION = 2;
+  RESOURCE_USAGE_COMPARISON_UNAVAILABLE_REASON_CURRENT_SAMPLES = 3;
+  RESOURCE_USAGE_COMPARISON_UNAVAILABLE_REASON_PREVIOUS_SAMPLES = 4;
+}
+
+message ResourceUsageVersionComparison {
+  bool available = 1;
+  uint32 minimum_samples = 2;
+  optional ResourceUsageComparisonUnavailableReason unavailable_reason = 3;
+  optional ResourceUsageVersionBreakdown current = 4;
+  optional ResourceUsageVersionBreakdown previous = 5;
+}
+
+message ResourceUsageProjectionFailure {
+  string session_id = 1;
+  ResourceUsageSource source = 2;
+  uint32 attempts = 3;
+  google.protobuf.Timestamp retry_at = 4;
+  string error_code = 5;
+}
+
+message ResourceUsageProjectionStatus {
+  bool complete = 1;
+  uint32 stream_count = 2;
+  uint32 pending_stream_count = 3;
+  optional google.protobuf.Timestamp last_projected_at = 4;
+  repeated ResourceUsageProjectionFailure failures = 5;
+}
+
+message ResourceUsageReport {
+  string resource_id = 1;
+  string time_zone = 2;
+  string from_day = 3;
+  string through_day = 4;
+  repeated ResourceUsageDay days = 5;
+  ResourceUsageMetrics totals = 6;
+  repeated ResourceUsageSourceBreakdown sources = 7;
+  repeated ResourceUsageAgentBreakdown agents = 8;
+  repeated ResourceUsageVersionBreakdown versions = 9;
+  ResourceUsageVersionComparison comparison = 10;
+  ResourceUsageProjectionStatus projection = 11;
+}

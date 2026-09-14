@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { DEFAULT_UI_PREFERENCES, normalizeComposerMentions, normalizeNewSessionLocalDraft, normalizeUiPreferences } from "./local-state.js";
+import { DEFAULT_UI_PREFERENCES, normalizeComposerMentions, normalizeNewSessionLocalDraft, normalizePendingExtensionUse, normalizeUiPreferences } from "./local-state.js";
 import { plainTextToComposerDocument } from "./composer-quote-document.js";
 
 describe("durable UI preferences", () => {
@@ -88,6 +88,35 @@ describe("durable UI preferences", () => {
   });
 });
 describe("owner-scoped delayed-create drafts", () => {
+  it("retains only the exact revision-fenced Extension use handoff", () => {
+    const handoff = {
+      extensionId: "extension_0123456789abcdef0123456789abcdef",
+      extensionRevision: "7",
+      commandName: "review",
+      runtimeSessionId: "session-runtime-1",
+      displayName: "Review tools",
+      owner: {
+        kind: "resource",
+        resourceId: "resource-1",
+        discoveredRevision: "sha256:owner",
+        resourceRevision: "4"
+      },
+      secret: "must-not-survive"
+    };
+
+    expect(normalizePendingExtensionUse(handoff)).toEqual({
+      extensionId: handoff.extensionId,
+      extensionRevision: "7",
+      commandName: "review",
+      runtimeSessionId: "session-runtime-1",
+      displayName: "Review tools",
+      owner: handoff.owner
+    });
+    expect(normalizePendingExtensionUse({ ...handoff, extensionRevision: "0" })).toBeUndefined();
+    expect(normalizePendingExtensionUse({ ...handoff, runtimeSessionId: " bad\nsession " })).toBeUndefined();
+    expect(normalizePendingExtensionUse({ ...handoff, owner: { ...handoff.owner, discoveredRevision: "" } })).toBeUndefined();
+  });
+
   it("restores bounded attachment bytes and opaque approved-directory IDs without paths", () => {
     const image = new File([new Uint8Array([1, 2, 3])], "capture.png", { type: "image/png", lastModified: 42 });
     const draft = normalizeNewSessionLocalDraft({

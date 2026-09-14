@@ -23,6 +23,7 @@ import {
   claudeSessionElectronSmokeSource,
   copyRegularTree,
   digestFile,
+  extensionLibraryElectronSmokeSource,
   removeSafeTemporaryDirectory,
   replaceDirectoryFromPrepared,
   rewriteRuntimePackageManifestFile,
@@ -98,6 +99,7 @@ try {
   const optionalDependency = await assertOptionalDependencyPreserved(candidateRoot);
   const importSmoke = await runCandidateImportSmoke(candidateRoot);
   const sqliteVecSmoke = await runCandidateSqliteVecSmoke(candidateRoot);
+  const extensionLibrarySmoke = await runCandidateExtensionLibrarySmoke(candidateRoot);
   const terminalSmoke = await runCandidateTerminalSmoke(candidateRoot);
   const claudeSessionSmoke = await runCandidateClaudeSessionSmoke(candidateRoot);
   const orchestratorSmoke = await runCandidateOrchestratorSmoke(candidateRoot);
@@ -125,6 +127,7 @@ try {
     piCliResolvedWithinCandidate: importSmoke.piCli,
     npmRuntime: importSmoke.npmRuntime,
     sqliteVec: sqliteVecSmoke,
+    extensionLibrary: extensionLibrarySmoke,
     terminal: terminalSmoke,
     claudeSession: claudeSessionSmoke,
     orchestratorHealth: orchestratorSmoke.health,
@@ -299,6 +302,33 @@ async function runCandidateSqliteVecSmoke(root) {
       nativePackageRoot: parsed.nativePackageRoot,
       nativeBinary: parsed.nativeBinary
     };
+  } finally {
+    await rm(smokePath, { force: false });
+  }
+}
+
+async function runCandidateExtensionLibrarySmoke(root) {
+  const smokePath = join(root, ".joko-runtime-extension-library-smoke.mjs");
+  await writeFile(smokePath, `${extensionLibraryElectronSmokeSource()}\n`, {
+    flag: "wx",
+    mode: 0o600
+  });
+  try {
+    const result = await runCommand(electronExecutable(), [smokePath, root], {
+      cwd: root,
+      environment: electronNodeEnvironment(),
+      timeoutMs: 45_000,
+      label: "isolated Electron-Node Extension Library smoke"
+    });
+    const parsed = JSON.parse(result.stdout);
+    if (parsed?.ok !== true || typeof parsed.runtimeRoot !== "string" ||
+        parsed.version !== "1" || parsed.sqlite !== true || parsed.changes !== 1 ||
+        parsed.selectedValue !== "electron-worker" || typeof parsed.electronVersion !== "string" ||
+        typeof parsed.managerEntry !== "string" || typeof parsed.workerEntry !== "string" ||
+        !samePath(await realpath(parsed.runtimeRoot), root)) {
+      throw new Error("The isolated Extension Library smoke returned an invalid runtime identity or SQLite result.");
+    }
+    return parsed;
   } finally {
     await rm(smokePath, { force: false });
   }

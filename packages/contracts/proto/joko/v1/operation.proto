@@ -5,11 +5,13 @@ package joko.v1;
 import "google/protobuf/timestamp.proto";
 import "joko/v1/capability.proto";
 import "joko/v1/common.proto";
+import "joko/v1/extension.proto";
 import "joko/v1/interaction.proto";
 import "joko/v1/model.proto";
 import "joko/v1/review.proto";
 import "joko/v1/runtime.proto";
 import "joko/v1/settings.proto";
+import "joko/v1/skill.proto";
 import "joko/v1/subagent.proto";
 import "joko/v1/tool.proto";
 import "joko/v1/workspace.proto";
@@ -194,7 +196,254 @@ message OperationMutation {
     ClearProviderCredentialSurfaceMutation clear_provider_credential_surface = 178;
     UpdateAuxiliaryTextSettingsMutation update_auxiliary_text_settings = 179;
     UpdateSubagentModelSettingsMutation update_subagent_model_settings = 180;
+    SetExtensionEnabledMutation set_extension_enabled = 181;
+    SetExtensionSidebarVisibleMutation set_extension_sidebar_visible = 182;
+    BeginExtensionSetupMutation begin_extension_setup = 183;
+    SubmitExtensionSetupInteractionMutation submit_extension_setup_interaction = 184;
+    CommitExtensionSetupCredentialMutation commit_extension_setup_credential = 185;
+    CompleteExtensionSetupMutation complete_extension_setup = 186;
+    CancelExtensionSetupMutation cancel_extension_setup = 187;
+    RevokeExtensionSetupMutation revoke_extension_setup = 188;
+    AddExtensionSourceMutation add_extension_source = 189;
+    RefreshExtensionSourceMutation refresh_extension_source = 190;
+    RemoveExtensionSourceMutation remove_extension_source = 191;
+    AdoptExtensionPackageMutation adopt_extension_package = 192;
+    RemoveExtensionPackageMutation remove_extension_package = 193;
+    StartExtensionPackageExportMutation start_extension_package_export = 194;
+    CancelExtensionPackageExportMutation cancel_extension_package_export = 195;
+    ApplySkillDraftMutation apply_skill_draft = 196;
+    SetSkillEnabledMutation set_skill_enabled = 197;
+    DeleteSkillMutation delete_skill = 198;
+    AddSkillMarketSourceMutation add_skill_market_source = 199;
+    RefreshSkillMarketSourceMutation refresh_skill_market_source = 200;
+    RemoveSkillMarketSourceMutation remove_skill_market_source = 201;
+    InstallSkillMarketPlanMutation install_skill_market_plan = 202;
+    EnableSkillMarketSyncMutation enable_skill_market_sync = 203;
+    DisableSkillMarketSyncMutation disable_skill_market_sync = 204;
+    EnqueueSkillMarketSyncMutation enqueue_skill_market_sync = 205;
+    CancelSkillMarketSyncMutation cancel_skill_market_sync = 206;
+    RetrySkillMarketSyncMutation retry_skill_market_sync = 207;
+    StartSkillPublicationMutation start_skill_publication = 208;
+    CancelSkillPublicationMutation cancel_skill_publication = 209;
+    RetrySkillPublicationMutation retry_skill_publication = 210;
+    UpdateSkillMarketAccessMutation update_skill_market_access = 211;
+    CreateCollaborationScopeMutation create_collaboration_scope = 212;
+    UpdateCollaborationScopeMutation update_collaboration_scope = 213;
+    DeleteCollaborationScopeMutation delete_collaboration_scope = 214;
   }
+}
+
+message ApplySkillDraftMutation {
+  string draft_id = 1;
+}
+
+message SetSkillEnabledMutation {
+  string skill_id = 1;
+  Revision expected_resource_revision = 2;
+  bool enabled = 3;
+}
+
+message DeleteSkillMutation {
+  string session_id = 1;
+  string confirmation = 2;
+}
+
+message AddSkillMarketSourceMutation {
+  SkillMarketSourceLocation source = 1;
+  Revision expected_catalog_revision = 2;
+}
+
+message RefreshSkillMarketSourceMutation {
+  string source_id = 1;
+  Revision expected_revision = 2;
+}
+
+message RemoveSkillMarketSourceMutation {
+  string source_id = 1;
+  Revision expected_revision = 2;
+}
+
+message InstallSkillMarketPlanMutation {
+  string plan_id = 1;
+  string expected_candidate_revision = 2;
+  bool confirm_replacement = 3;
+}
+
+message EnableSkillMarketSyncMutation {
+  string resource_id = 1;
+  Revision expected_resource_revision = 2;
+  SkillMarketInstallTarget target = 3;
+}
+
+message DisableSkillMarketSyncMutation {
+  string resource_id = 1;
+  Revision expected_policy_revision = 2;
+}
+
+message EnqueueSkillMarketSyncMutation {
+  string resource_id = 1;
+  Revision expected_policy_revision = 2;
+}
+
+message CancelSkillMarketSyncMutation {
+  string job_id = 1;
+  Revision expected_revision = 2;
+}
+
+message RetrySkillMarketSyncMutation {
+  string job_id = 1;
+  Revision expected_revision = 2;
+}
+
+message StartSkillPublicationMutation {
+  string resource_id = 1;
+  Revision expected_resource_revision = 2;
+  string expected_observed_revision = 3;
+  string source_id = 4;
+  Revision expected_source_revision = 5;
+  string expected_source_content_revision = 6;
+  optional string expected_existing_entry_id = 7;
+  SkillPublicationMetadata metadata = 8;
+  SkillPublicationPublisher publisher = 9;
+  SkillPublicationVisibility visibility = 10;
+  optional string publisher_scope_id = 11;
+  repeated string audience_scope_ids = 12;
+  Revision expected_collaboration_revision = 13;
+}
+
+message UpdateSkillMarketAccessMutation {
+  SkillMarketEntryIdentity identity = 1;
+  Revision expected_access_revision = 2;
+  SkillPublicationPublisher publisher = 3;
+  optional string publisher_scope_id = 4;
+  SkillPublicationVisibility visibility = 5;
+  repeated string audience_scope_ids = 6;
+  Revision expected_collaboration_revision = 7;
+}
+
+message CreateCollaborationScopeMutation {
+  Revision expected_catalog_revision = 1;
+  CollaborationScopeKind kind = 2;
+  string name = 3;
+}
+
+message UpdateCollaborationScopeMutation {
+  string scope_id = 1;
+  Revision expected_revision = 2;
+  string name = 3;
+}
+
+message DeleteCollaborationScopeMutation {
+  string scope_id = 1;
+  Revision expected_revision = 2;
+}
+
+message CancelSkillPublicationMutation {
+  string job_id = 1;
+  Revision expected_revision = 2;
+}
+
+message RetrySkillPublicationMutation {
+  string job_id = 1;
+  Revision expected_revision = 2;
+}
+
+message SetExtensionEnabledMutation {
+  string extension_id = 1;
+  bool enabled = 2;
+  Revision expected_revision = 3;
+}
+
+message AddExtensionSourceMutation {
+  ExtensionSourceLocation source = 1;
+  Revision expected_catalog_revision = 2;
+}
+
+message RefreshExtensionSourceMutation {
+  string source_id = 1;
+  Revision expected_revision = 2;
+}
+
+message RemoveExtensionSourceMutation {
+  string source_id = 1;
+  Revision expected_revision = 2;
+}
+
+message AdoptExtensionPackageMutation {
+  string extension_id = 1;
+  Revision expected_revision = 2;
+  string backend_id = 3;
+  ExtensionPackageAction expected_action = 4;
+  string expected_current_resource_id = 5;
+  optional Revision expected_current_resource_revision = 6;
+  bool allow_source_replacement = 7;
+}
+
+message RemoveExtensionPackageMutation {
+  string extension_id = 1;
+  Revision expected_revision = 2;
+}
+
+message StartExtensionPackageExportMutation {
+  string extension_id = 1;
+  Revision expected_extension_revision = 2;
+  string resource_id = 3;
+  Revision expected_resource_revision = 4;
+  string backend_id = 5;
+  Revision expected_backend_revision = 6;
+  uint64 expected_backend_generation = 7;
+}
+
+message CancelExtensionPackageExportMutation {
+  string export_id = 1;
+  Revision expected_revision = 2;
+}
+
+message SetExtensionSidebarVisibleMutation {
+  string extension_id = 1;
+  bool visible = 2;
+  Revision expected_revision = 3;
+}
+
+message BeginExtensionSetupMutation {
+  string extension_id = 1;
+  Revision expected_revision = 2;
+}
+
+message SubmitExtensionSetupInteractionMutation {
+  string extension_id = 1;
+  string attempt_id = 2;
+  string field_id = 3;
+  oneof value {
+    string text = 4;
+    bool confirmed = 5;
+  }
+  Revision expected_revision = 6;
+}
+
+message CommitExtensionSetupCredentialMutation {
+  string extension_id = 1;
+  string attempt_id = 2;
+  string field_id = 3;
+  string credential_upload_ticket_id = 4;
+  Revision expected_revision = 5;
+}
+
+message CompleteExtensionSetupMutation {
+  string extension_id = 1;
+  string attempt_id = 2;
+  Revision expected_revision = 3;
+}
+
+message CancelExtensionSetupMutation {
+  string extension_id = 1;
+  string attempt_id = 2;
+  Revision expected_revision = 3;
+}
+
+message RevokeExtensionSetupMutation {
+  string extension_id = 1;
+  Revision expected_revision = 2;
 }
 
 message UpdateVoiceInputServiceSettingsMutation {
@@ -1268,6 +1517,7 @@ message OperationResult {
     DeviceControlRelation device_control_relation = 32;
     ScheduleRunsReadResult schedule_runs_read = 33;
     ScheduleDeletionResult schedule_deletion = 34;
+    SkillMutationResult skill = 35;
   }
 }
 

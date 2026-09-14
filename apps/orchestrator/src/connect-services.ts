@@ -36,6 +36,8 @@ import {
   StoreError,
   UsageReportQueryError,
   UsageReportCapacityError,
+  ResourceUsageReportQueryError,
+  ResourceUsageReportCapacityError,
   MESSAGE_SEARCH_EMBEDDING_MODEL_ID,
   operationBodyHash
 } from "@joko/store";
@@ -124,6 +126,47 @@ import type {
 } from "./credential-manager.js";
 import { ProviderAuthUnsupportedError } from "./credential-manager.js";
 import type { DiagnosticsBundleService } from "./diagnostics-bundle.js";
+import type {
+  ExtensionCatalogDescriptor as NativeExtensionCatalogDescriptor,
+  ExtensionCatalogManager,
+  ExtensionCatalogSnapshot as NativeExtensionCatalogSnapshot,
+  ExtensionRuntimeObservation
+} from "./extension-catalog.js";
+import { extensionMcpInput } from "./extension-catalog.js";
+import {
+  type ExtensionLibraryAuthority as NativeExtensionLibraryAuthority,
+  type ExtensionLibraryAuthorityChangeLease,
+  ExtensionLibraryManager,
+  type ExtensionLibraryOverview as NativeExtensionLibraryOverview,
+  type ExtensionLibraryTrashEntry as NativeExtensionLibraryTrashEntry,
+  type ExtensionLibraryGraceEntry as NativeExtensionLibraryGraceEntry
+} from "./extension-library-manager.js";
+import {
+  ExtensionLibraryError,
+  type ExtensionLibraryEntry,
+  type ExtensionLibraryWriteResult
+} from "./extension-library-vault.js";
+import type { ExtensionMainViewIcon } from "./extension-surface-manifest.js";
+import {
+  ExtensionMainViewError,
+  type ExtensionMainViewAuthority as NativeExtensionMainViewAuthority,
+  type ExtensionMainViewManager,
+  type ExtensionMainViewSurface as NativeExtensionMainViewSurface
+} from "./extension-main-view-manager.js";
+import type {
+  ExtensionPackageExportAuthority as NativeExtensionPackageExportAuthority,
+  ExtensionPackageExportJob as NativeExtensionPackageExportJob,
+  ExtensionPackageExportPreview as NativeExtensionPackageExportPreview,
+  ExtensionPackagePublisher,
+  PreparedExtensionPackageExport
+} from "./extension-package-publisher.js";
+import {
+  ExtensionSourceError,
+  type ExtensionSourceDescriptor as NativeExtensionSourceDescriptor,
+  type ExtensionSourceEntryLease,
+  type ExtensionSourceInput as NativeExtensionSourceInput,
+  type ExtensionSourceManager
+} from "./extension-source-manager.js";
 import type { HistoryMaintenanceJob, HistoryMaintenanceResult, HistoryRetention } from "./history-maintenance.js";
 import type {
   PiProviderAuthFlowRecord,
@@ -227,12 +270,66 @@ import {
 } from "./native-state-observation.js";
 import { materializedRuntimeCommands, SESSION_RUNTIME_COMMANDS_SETTING_KEY } from "./runtime-command-state.js";
 import type {
+  PiExtensionPackageAction as NativePiExtensionPackageAction,
+  PiExtensionPackagePreview as NativePiExtensionPackagePreview,
+  PiMarketSkillTargetInput,
   PiResourceDescriptor as NativePiResourceDescriptor,
   PiResourceKind as NativePiResourceKind,
   PiResourceManager,
   PiResourceState as NativePiResourceState,
+  PiSkillContentMutationResult,
   PreparedPiResourceMutation
 } from "./resource-manager.js";
+import {
+  skillCatalogEntryFromResource,
+  type PreparedSkillMutation,
+  type SkillCatalogEntry as NativeSkillCatalogEntry,
+  type SkillDiff as NativeSkillDiff,
+  type SkillDraftPreview as NativeSkillDraftPreview,
+  type SkillFileContent as NativeSkillFileContent,
+  type SkillFileEntry as NativeSkillFileEntry,
+  type SkillManager,
+  type SkillRecoveryRecord as NativeSkillRecoveryRecord,
+  type SkillSessionDetails as NativeSkillSessionDetails
+} from "./skill-manager.js";
+import {
+  SkillMarketError,
+  type PreparedSkillMarketInstallation,
+  type SkillMarketArchiveEntry as NativeSkillMarketArchiveEntry,
+  type SkillMarketCatalogItem as NativeSkillMarketCatalogItem,
+  type SkillMarketEntryIdentity as NativeSkillMarketEntryIdentity,
+  type SkillMarketInstallPlanDescriptor as NativeSkillMarketInstallPlan,
+  type SkillMarketManager,
+  type SkillMarketPublicationMetadata as NativeSkillPublicationMetadata,
+  type SkillMarketPreviewDescriptor as NativeSkillMarketPreview,
+  type SkillMarketPreviewFile as NativeSkillMarketPreviewFile,
+  type SkillMarketSourceDescriptor as NativeSkillMarketSourceDescriptor,
+  type SkillMarketSourceInput as NativeSkillMarketSourceInput
+} from "./skill-market-manager.js";
+import type {
+  SkillMarketSyncBaseline as NativeSkillMarketSyncBaseline,
+  SkillMarketSyncJob as NativeSkillMarketSyncJob,
+  SkillMarketSyncJobAuthority as NativeSkillMarketSyncJobAuthority,
+  SkillMarketSyncManager,
+  SkillMarketSyncPolicy as NativeSkillMarketSyncPolicy,
+  SkillMarketSyncTarget as NativeSkillMarketSyncTarget
+} from "./skill-market-sync-manager.js";
+import {
+  skillPublicationJobId,
+  type SkillPublicationAuthority as NativeSkillPublicationAuthority,
+  type SkillPublicationGate as NativeSkillPublicationGate,
+  type SkillPublicationJob as NativeSkillPublicationJob,
+  type SkillPublicationManager,
+  type SkillPublicationPreview as NativeSkillPublicationPreview,
+  type SkillPublicationResult as NativeSkillPublicationResult
+} from "./skill-publication-manager.js";
+import {
+  CollaborationError,
+  type CollaborationDirectory as NativeCollaborationDirectory,
+  type CollaborationManager,
+  type CollaborationScope as NativeCollaborationScope,
+  type SkillAccessPolicy as NativeSkillAccessPolicy
+} from "./collaboration-manager.js";
 import {
   normalizePiPackageSource,
   piPackageSourceIdentity,
@@ -364,6 +461,16 @@ interface ConnectServiceDependencies {
   readonly managedModelRuntime?: ManagedModelRuntimeController;
   readonly mcpRouter?: McpRouter;
   readonly piResources?: PiResourceManager;
+  readonly skills?: SkillManager;
+  readonly skillMarket?: SkillMarketManager;
+  readonly skillMarketSync?: SkillMarketSyncManager;
+  readonly skillPublication?: SkillPublicationManager;
+  readonly collaboration?: CollaborationManager;
+  readonly extensionCatalog?: ExtensionCatalogManager;
+  readonly extensionLibraries?: ExtensionLibraryManager;
+  readonly extensionMainViews?: ExtensionMainViewManager;
+  readonly extensionPackagePublisher?: ExtensionPackagePublisher;
+  readonly extensionSources?: ExtensionSourceManager;
   readonly piBackendIds?: ReadonlySet<string>;
   readonly diagnosticsBundles?: DiagnosticsBundleService;
   readonly providerAuth?: PiProviderAuthSupervisor;
@@ -519,6 +626,8 @@ export interface ConnectServiceSet {
   readonly settings: ServiceImpl<typeof contract.SettingsService>;
   readonly managedModelRuntime: ServiceImpl<typeof contract.ManagedModelRuntimeService>;
   readonly tool: ServiceImpl<typeof contract.ToolService>;
+  readonly extension: ServiceImpl<typeof contract.ExtensionService>;
+  readonly skill: ServiceImpl<typeof contract.SkillService>;
   readonly browser: ServiceImpl<typeof contract.BrowserService>;
   readonly remoteHost: ServiceImpl<typeof contract.RemoteHostService>;
   readonly sshKey: ServiceImpl<typeof contract.SshKeyService>;
@@ -577,6 +686,8 @@ function toConnectError(error: unknown): ConnectError {
   if (error instanceof InvalidStateTransitionError) return new ConnectError(error.message, Code.FailedPrecondition);
   if (error instanceof UsageReportQueryError) return new ConnectError(error.message, Code.InvalidArgument);
   if (error instanceof UsageReportCapacityError) return new ConnectError(error.message, Code.ResourceExhausted);
+  if (error instanceof ResourceUsageReportQueryError) return new ConnectError(error.message, Code.InvalidArgument);
+  if (error instanceof ResourceUsageReportCapacityError) return new ConnectError(error.message, Code.ResourceExhausted);
   if (error instanceof RevisionConflictError || error instanceof StaleGenerationError) {
     return new ConnectError(error.message, Code.Aborted);
   }
@@ -719,6 +830,8 @@ interface OperationOutcome {
     readonly expiresAt?: number;
   };
   readonly browserTransferBinaryBase64?: string;
+  readonly skillReplacedId?: string;
+  readonly skillRecoveryId?: string;
 }
 
 interface PresentedOperation {
@@ -838,6 +951,8 @@ export function registerConnectServices(router: ConnectRouter, application: Orch
   router.service(contract.SettingsService, withConnectErrors(services.settings));
   router.service(contract.ManagedModelRuntimeService, withConnectErrors(services.managedModelRuntime));
   router.service(contract.ToolService, withConnectErrors(services.tool));
+  router.service(contract.ExtensionService, withConnectErrors(services.extension));
+  router.service(contract.SkillService, withConnectErrors(services.skill));
   router.service(contract.BrowserService, withConnectErrors(services.browser));
   router.service(contract.RemoteHostService, withConnectErrors(services.remoteHost));
   router.service(contract.SshKeyService, withConnectErrors(services.sshKey));
@@ -892,6 +1007,16 @@ export function createConnectServices(application: OrchestratorApplication): Con
     ...(application.managedModelRuntime === undefined ? {} : { managedModelRuntime: application.managedModelRuntime }),
     ...(application.mcpRouter === undefined ? {} : { mcpRouter: application.mcpRouter }),
     ...(application.piResources === undefined ? {} : { piResources: application.piResources }),
+    ...(application.skills === undefined ? {} : { skills: application.skills }),
+    ...(application.skillMarket === undefined ? {} : { skillMarket: application.skillMarket }),
+    ...(application.skillMarketSync === undefined ? {} : { skillMarketSync: application.skillMarketSync }),
+    ...(application.skillPublication === undefined ? {} : { skillPublication: application.skillPublication }),
+    ...(application.collaboration === undefined ? {} : { collaboration: application.collaboration }),
+    ...(application.extensionCatalog === undefined ? {} : { extensionCatalog: application.extensionCatalog }),
+    ...(application.extensionLibraries === undefined ? {} : { extensionLibraries: application.extensionLibraries }),
+    ...(application.extensionMainViews === undefined ? {} : { extensionMainViews: application.extensionMainViews }),
+    ...(application.extensionPackagePublisher === undefined ? {} : { extensionPackagePublisher: application.extensionPackagePublisher }),
+    ...(application.extensionSources === undefined ? {} : { extensionSources: application.extensionSources }),
     piBackendIds: new Set(application.adapters
       .filter((adapter): adapter is PiBackendAdapter => adapter instanceof PiBackendAdapter)
       .map((adapter) => adapter.id)),
@@ -968,8 +1093,28 @@ export function createConnectServices(application: OrchestratorApplication): Con
   }
   const operationMutations = new Map<string, contract.OperationMutation>();
   const operationOutcomes = new Map<string, OperationOutcome>();
+  const extensionSurfaceRevocations = new Map<string, () => void>();
 
   const authenticate = (context: HandlerContext): ConnectionRecord => requireAuthentication(dependencies, context);
+  const ensureExtensionSurfaceRevocation = (connectionId: string): void => {
+    if (extensionSurfaceRevocations.has(connectionId)
+      || dependencies.extensionMainViews === undefined && dependencies.extensionLibraries === undefined
+        && dependencies.skills === undefined && dependencies.skillMarket === undefined) return;
+    const stop = dependencies.connections.onRevoked(connectionId, () => {
+      extensionSurfaceRevocations.delete(connectionId);
+      void Promise.all([
+        dependencies.extensionMainViews?.closeConnection(connectionId),
+        dependencies.extensionLibraries?.closeConnection(connectionId),
+        dependencies.skills?.revokeConnection(connectionId),
+        dependencies.skillMarket?.closeConnection(connectionId)
+      ]);
+    });
+    extensionSurfaceRevocations.set(connectionId, stop);
+  };
+  application.registerServiceCleanup?.(() => {
+    for (const stop of extensionSurfaceRevocations.values()) stop();
+    extensionSurfaceRevocations.clear();
+  });
   const terminal = createTerminalConnectService({
     ...(dependencies.terminals === undefined ? {} : { terminals: dependencies.terminals }),
     store: dependencies.store,
@@ -3367,6 +3512,807 @@ export function createConnectServices(application: OrchestratorApplication): Con
     }
   } satisfies ServiceImpl<typeof contract.ToolService>;
 
+  const extension = {
+    listExtensions: async (request, context) => {
+      authenticate(context);
+      if (dependencies.extensionCatalog === undefined) {
+        return {
+          extensions: [],
+          catalogRevision: toProtoRevision(0n),
+          recoveredFromCorruption: false,
+          page: emptyPage(request.page)
+        };
+      }
+      const sessionId = request.sessionId === undefined
+        ? undefined
+        : nonBlankRequest(request.sessionId, "session_id");
+      const query = request.query.trim().toLocaleLowerCase("en-US");
+      if (query.length > 256) throw invalidArgument("query exceeds the supported length");
+      const snapshot = await currentExtensionCatalog(dependencies, sessionId);
+      const source = request.source === undefined ? undefined : nativeExtensionSource(request.source);
+      const values = snapshot.entries
+        .filter((entry) => source === undefined || entry.source === source)
+        .filter((entry) => request.installed === undefined || entry.installed === request.installed)
+        .filter((entry) => query === "" || extensionSearchText(entry).includes(query))
+        .map(mapExtensionCatalogEntry);
+      const result = paginate(values, request.page);
+      return {
+        extensions: result.values,
+        catalogRevision: toProtoRevision(snapshot.revision),
+        recoveredFromCorruption: snapshot.recoveredFromCorruption,
+        page: result.page
+      };
+    },
+    getExtension: async (request, context) => {
+      authenticate(context);
+      if (dependencies.extensionCatalog === undefined) {
+        throw new ConnectError("Extension catalog is unavailable.", Code.Unimplemented);
+      }
+      const extensionId = nonBlankRequest(request.extensionId, "extension_id");
+      const sessionId = request.sessionId === undefined
+        ? undefined
+        : nonBlankRequest(request.sessionId, "session_id");
+      const snapshot = await currentExtensionCatalog(dependencies, sessionId);
+      const entry = snapshot.entries.find((candidate) => candidate.id === extensionId);
+      if (entry === undefined) throw new ConnectError("Extension not found.", Code.NotFound);
+      return {
+        extension: mapExtensionCatalogEntry(entry),
+        catalogRevision: toProtoRevision(snapshot.revision),
+        recoveredFromCorruption: snapshot.recoveredFromCorruption
+      };
+    },
+    getExtensionSourceGitPreflight: async (_request, context) => {
+      authenticate(context);
+      if (dependencies.extensionSources === undefined) {
+        throw new ConnectError("Extension sources are unavailable.", Code.Unimplemented);
+      }
+      const preflight = await dependencies.extensionSources.gitPreflight();
+      return {
+        preflight: create(contract.ExtensionSourceGitPreflightSchema, {
+          available: preflight.available,
+          ...(preflight.version === undefined ? {} : { version: preflight.version }),
+          minimumVersion: preflight.minimumVersion
+        })
+      };
+    },
+    listExtensionSources: async (request, context) => {
+      authenticate(context);
+      if (dependencies.extensionSources === undefined) {
+        return {
+          sources: [],
+          catalogRevision: toProtoRevision(0n),
+          recoveredFromCorruption: false,
+          page: emptyPage(request.page)
+        };
+      }
+      const snapshot = await dependencies.extensionSources.auditAvailability();
+      reconcileExtensionCatalog(dependencies);
+      const result = paginate(snapshot.sources.map(mapExtensionSourceDescriptor), request.page);
+      return {
+        sources: result.values,
+        catalogRevision: toProtoRevision(snapshot.revision),
+        recoveredFromCorruption: snapshot.recoveredFromCorruption,
+        page: result.page
+      };
+    },
+    getExtensionPackagePreview: async (request, context) => {
+      authenticate(context);
+      if (
+        dependencies.extensionCatalog === undefined
+        || dependencies.extensionSources === undefined
+        || dependencies.piResources === undefined
+      ) {
+        throw new ConnectError("Extension package installation is unavailable.", Code.Unimplemented);
+      }
+      if (request.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const expectedRevision = fromProtoRevision(request.expectedRevision, "get_extension_package_preview.expected_revision");
+      const extensionId = nonBlankRequest(request.extensionId, "extension_id");
+      const backendId = nonBlankRequest(request.backendId, "backend_id");
+      const extension = requireExtensionMutation(dependencies, extensionId, expectedRevision);
+      const acquisition = extensionPackageAcquisition(extension);
+      const admission = backendResourceAdmission(dependencies, backendId, dependencies.store);
+      if (!admission.kinds.includes("package")) {
+        throw new ConnectError("The selected Backend does not support managed package resources.", Code.FailedPrecondition);
+      }
+      return extensionSourceEffect(() => dependencies.extensionSources!.withEntry(acquisition, async (entry, packageRoot) => {
+        const source = dependencies.extensionSources!.get(acquisition.sourceId);
+        if (source.revision !== acquisition.sourceRevision) {
+          throw new ExtensionSourceError("SOURCE_CHANGED", "Extension source changed concurrently.");
+        }
+        const preview = await dependencies.piResources!.previewExtensionPackage({
+          resourceId: entry.resourceId,
+          backendId,
+          sourceId: source.id,
+          sourceRevision: source.revision,
+          sourceIdentity: source.sourceIdentity,
+          sourceDisplay: source.sourceDisplay,
+          packageRelativePath: entry.packageRelativePath,
+          packageContentRevision: entry.packageContentRevision,
+          packageName: entry.packageName,
+          ...(entry.version === undefined ? {} : { version: entry.version }),
+          bindingName: entry.bindingName,
+          bindingOrdinal: entry.bindingOrdinal,
+          packageRoot
+        });
+        return { preview: mapExtensionPackagePreview(extension, preview) };
+      }));
+    },
+    getExtensionPackageExportPreview: async (request, context) => {
+      authenticate(context);
+      if (
+        dependencies.extensionCatalog === undefined
+        || dependencies.extensionPackagePublisher === undefined
+        || dependencies.piResources === undefined
+      ) {
+        throw new ConnectError("Extension package export is unavailable.", Code.Unimplemented);
+      }
+      if (request.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const expectedRevision = fromProtoRevision(request.expectedRevision, "get_extension_package_export_preview.expected_revision");
+      const authority = requireExtensionPackageExportAuthority(
+        dependencies,
+        nonBlankRequest(request.extensionId, "extension_id"),
+        expectedRevision
+      );
+      return {
+        preview: mapExtensionPackageExportPreview(dependencies.extensionPackagePublisher.preview(authority)),
+        recoveredFromCorruption: dependencies.extensionPackagePublisher.recoveredFromCorruption
+      };
+    },
+    listExtensionPackageExports: (request, context) => {
+      authenticate(context);
+      if (dependencies.extensionPackagePublisher === undefined) {
+        return { exports: [], recoveredFromCorruption: false, page: emptyPage(request.page) };
+      }
+      const extensionId = request.extensionId === undefined
+        ? undefined
+        : nonBlankRequest(request.extensionId, "extension_id");
+      const result = paginate(dependencies.extensionPackagePublisher.list({
+        ...(extensionId === undefined ? {} : { extensionId })
+      }).map(mapExtensionPackageExportJob), request.page);
+      return {
+        exports: result.values,
+        recoveredFromCorruption: dependencies.extensionPackagePublisher.recoveredFromCorruption,
+        page: result.page
+      };
+    },
+    getExtensionPackageExport: (request, context) => {
+      authenticate(context);
+      if (dependencies.extensionPackagePublisher === undefined) {
+        throw new ConnectError("Extension package export is unavailable.", Code.Unimplemented);
+      }
+      const exportId = nonBlankRequest(request.exportId, "export_id");
+      return extensionPublisherAction(() => ({
+        export: mapExtensionPackageExportJob(dependencies.extensionPackagePublisher!.get(exportId)),
+        recoveredFromCorruption: dependencies.extensionPackagePublisher!.recoveredFromCorruption
+      }));
+    },
+    openExtensionMainView: async (request, context) => {
+      const connection = authenticate(context);
+      if (dependencies.extensionCatalog === undefined || dependencies.extensionMainViews === undefined || dependencies.piResources === undefined) {
+        throw new ConnectError("Extension main views are unavailable.", Code.Unimplemented);
+      }
+      if (request.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const expectedRevision = fromProtoRevision(request.expectedRevision, "open_extension_main_view.expected_revision");
+      const authority = requireExtensionMainViewAuthority(
+        dependencies,
+        nonBlankRequest(request.extensionId, "extension_id"),
+        expectedRevision
+      );
+      ensureExtensionSurfaceRevocation(connection.id);
+      const assertAuthorityCurrent = (): void => {
+        dependencies.connections.fence(connection);
+        assertCurrentExtensionMainViewAuthority(dependencies, authority);
+      };
+      const surface = await extensionMainViewEffect(() => dependencies.extensionMainViews!.open({
+        authority,
+        connectionId: connection.id,
+        assertAuthorityCurrent
+      }));
+      return { surface: mapExtensionMainViewSurface(surface) };
+    },
+    getExtensionMainViewSurface: async (request, context) => {
+      const connection = authenticate(context);
+      if (dependencies.extensionMainViews === undefined) {
+        throw new ConnectError("Extension main views are unavailable.", Code.Unimplemented);
+      }
+      const surface = await extensionMainViewEffect(() => dependencies.extensionMainViews!.getSurface(
+        nonBlankRequest(request.surfaceId, "surface_id"),
+        connection.id
+      ));
+      return { surface: mapExtensionMainViewSurface(surface) };
+    },
+    closeExtensionMainView: async (request, context) => {
+      const connection = authenticate(context);
+      if (dependencies.extensionMainViews === undefined) return { closed: false };
+      const closed = await extensionMainViewEffect(() => dependencies.extensionMainViews!.closeSurface(
+        nonBlankRequest(request.surfaceId, "surface_id"),
+        connection.id
+      ));
+      return { closed };
+    },
+    getExtensionLibraryOverview: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireExtensionLibraryManager(dependencies);
+      const authority = requestExtensionLibraryAuthority(dependencies, request.extensionId, request.expectedRevision, "get_extension_library_overview");
+      const assertAuthorityCurrent = extensionLibraryAuthorityFence(dependencies, connection, authority);
+      return extensionLibraryEffect(async () => ({
+        library: mapExtensionLibraryOverview(await manager.overview({ authority, assertAuthorityCurrent }))
+      }));
+    },
+    validateExtensionLibraryLocation: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireExtensionLibraryManager(dependencies);
+      const authority = requestExtensionLibraryAuthority(dependencies, request.extensionId, request.expectedRevision, "validate_extension_library_location");
+      const validation = await extensionLibraryEffect(() => manager.validateLocation({
+        authority,
+        candidate: nonBlankRequest(request.candidate, "candidate"),
+        assertAuthorityCurrent: extensionLibraryAuthorityFence(dependencies, connection, authority)
+      }));
+      return {
+        validation: create(contract.ExtensionLibraryLocationValidationSchema, {
+          libraryRoot: validation.libraryRoot,
+          warnings: [...validation.warnings],
+          ...(validation.diskFreeBytes === undefined ? {} : { diskFreeBytes: BigInt(validation.diskFreeBytes) })
+        })
+      };
+    },
+    relocateExtensionLibrary: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireExtensionLibraryManager(dependencies);
+      const authority = requestExtensionLibraryAuthority(dependencies, request.extensionId, request.expectedRevision, "relocate_extension_library");
+      const result = await extensionLibraryEffect(() => manager.relocate({
+        authority,
+        destination: nativeExtensionLibraryDestination(request.destinationKind, request.candidate, false),
+        assertAuthorityCurrent: extensionLibraryAuthorityFence(dependencies, connection, authority)
+      }));
+      return {
+        changed: result.changed,
+        ...(result.migrationId === undefined ? {} : { migrationId: result.migrationId }),
+        location: mapExtensionLibraryLocation(result.location),
+        files: result.files,
+        bytes: BigInt(result.bytes),
+        warnings: [...result.warnings],
+        ...(result.graceId === undefined ? {} : { graceId: result.graceId })
+      };
+    },
+    rebindExtensionLibrary: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireExtensionLibraryManager(dependencies);
+      const authority = requestExtensionLibraryAuthority(dependencies, request.extensionId, request.expectedRevision, "rebind_extension_library");
+      const result = await extensionLibraryEffect(() => manager.rebind({
+        authority,
+        candidate: nonBlankRequest(request.candidate, "candidate"),
+        assertAuthorityCurrent: extensionLibraryAuthorityFence(dependencies, connection, authority)
+      }));
+      return { location: mapExtensionLibraryLocation(result.location), warnings: [...result.warnings] };
+    },
+    unbindExtensionLibrary: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireExtensionLibraryManager(dependencies);
+      const authority = requestExtensionLibraryAuthority(dependencies, request.extensionId, request.expectedRevision, "unbind_extension_library");
+      const result = await extensionLibraryEffect(() => manager.unbind({
+        authority,
+        assertAuthorityCurrent: extensionLibraryAuthorityFence(dependencies, connection, authority)
+      }));
+      return { detachedPath: result.detachedPath };
+    },
+    repairExtensionLibraryState: async (_request, context) => {
+      authenticate(context);
+      const manager = requireExtensionLibraryManager(dependencies);
+      const result = await extensionLibraryEffect(() => manager.repairState());
+      return { recoveredFromPrevious: result.recoveredFromPrevious, bindings: result.bindings, trash: result.trash };
+    },
+    repairExtensionLibraryMetadata: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireExtensionLibraryManager(dependencies);
+      const authority = requestExtensionLibraryAuthority(dependencies, request.extensionId, request.expectedRevision, "repair_extension_library_metadata");
+      const result = await extensionLibraryEffect(() => manager.repairMetadata({
+        authority,
+        assertAuthorityCurrent: extensionLibraryAuthorityFence(dependencies, connection, authority)
+      }));
+      return { library: mapExtensionLibraryOverview(result) };
+    },
+    trashExtensionLibrary: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireExtensionLibraryManager(dependencies);
+      const authority = requestExtensionLibraryAuthority(dependencies, request.extensionId, request.expectedRevision, "trash_extension_library");
+      const result = await extensionLibraryEffect(() => manager.trashLibrary({
+        authority,
+        confirmation: request.confirmation,
+        assertAuthorityCurrent: extensionLibraryAuthorityFence(dependencies, connection, authority)
+      }));
+      return { trash: mapExtensionLibraryTrash(result) };
+    },
+    listExtensionLibraryTrash: (request, context) => {
+      authenticate(context);
+      const manager = requireExtensionLibraryManager(dependencies);
+      return extensionLibraryEffect(() => ({
+        trash: manager.listTrash(request.extensionId).map(mapExtensionLibraryTrash)
+      }));
+    },
+    restoreExtensionLibraryTrash: async (request, context) => {
+      authenticate(context);
+      const manager = requireExtensionLibraryManager(dependencies);
+      const destination = nativeExtensionLibraryDestination(request.destinationKind, request.candidate, true);
+      const result = await extensionLibraryEffect(() => manager.restoreTrash({
+        trashId: nonBlankRequest(request.trashId, "trash_id"),
+        confirmation: request.confirmation,
+        ...(destination === undefined ? {} : { destination })
+      }));
+      return { extensionId: result.extensionId, location: mapExtensionLibraryLocation(result.location) };
+    },
+    purgeExtensionLibraryTrash: async (request, context) => {
+      authenticate(context);
+      const manager = requireExtensionLibraryManager(dependencies);
+      const purged = await extensionLibraryEffect(() => manager.purgeTrash({
+        trashId: nonBlankRequest(request.trashId, "trash_id"),
+        confirmation: request.confirmation
+      }));
+      return { purged };
+    },
+    listExtensionLibraryGrace: (request, context) => {
+      authenticate(context);
+      const manager = requireExtensionLibraryManager(dependencies);
+      return extensionLibraryEffect(() => ({ grace: manager.listGrace(request.extensionId).map(mapExtensionLibraryGrace) }));
+    },
+    rollbackExtensionLibrary: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireExtensionLibraryManager(dependencies);
+      const authority = requestExtensionLibraryAuthority(dependencies, request.extensionId, request.expectedRevision, "rollback_extension_library");
+      const result = await extensionLibraryEffect(() => manager.rollbackRelocation({
+        authority,
+        graceId: nonBlankRequest(request.graceId, "grace_id"),
+        assertAuthorityCurrent: extensionLibraryAuthorityFence(dependencies, connection, authority)
+      }));
+      return { location: mapExtensionLibraryLocation(result.location), graceId: result.graceId };
+    },
+    purgeExpiredExtensionLibraries: async (_request, context) => {
+      authenticate(context);
+      const manager = requireExtensionLibraryManager(dependencies);
+      return extensionLibraryEffect(() => manager.purgeExpired());
+    },
+    openExtensionLibrary: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireExtensionLibraryManager(dependencies);
+      const authority = requestExtensionLibraryAuthority(dependencies, request.extensionId, request.expectedRevision, "open_extension_library");
+      ensureExtensionSurfaceRevocation(connection.id);
+      const library = await extensionLibraryEffect(() => manager.openSession({
+        authority,
+        connectionId: connection.id,
+        assertAuthorityCurrent: extensionLibraryAuthorityFence(dependencies, connection, authority)
+      }));
+      return { library: mapExtensionLibrarySession(library) };
+    },
+    callExtensionLibrary: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireExtensionLibraryManager(dependencies);
+      if (request.call === undefined || request.call.operation.case === undefined) throw invalidArgument("call.operation is required");
+      return {
+        result: await extensionLibraryEffect(() => dispatchExtensionLibraryCall(
+          manager,
+          nonBlankRequest(request.sessionId, "session_id"),
+          connection.id,
+          request.call!
+        ))
+      };
+    },
+    closeExtensionLibrary: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireExtensionLibraryManager(dependencies);
+      const closed = await extensionLibraryEffect(() => manager.closeSession(
+        nonBlankRequest(request.sessionId, "session_id"),
+        connection.id
+      ));
+      return { closed };
+    },
+    beginExtensionSetupCredentialUpload: (request, context) => {
+      const connection = authenticate(context);
+      if (dependencies.extensionCatalog === undefined || dependencies.credentials === undefined) {
+        throw new ConnectError("Protected Extension setup is unavailable.", Code.Unimplemented);
+      }
+      reconcileExtensionCatalog(dependencies);
+      const ticket = dependencies.extensionCatalog.beginSetupCredentialUpload({
+        extensionId: nonBlankRequest(request.extensionId, "extension_id"),
+        attemptId: nonBlankRequest(request.attemptId, "attempt_id"),
+        fieldId: nonBlankRequest(request.fieldId, "field_id"),
+        kind: nativeCredentialKind(request.kind, false),
+        connectionId: connection.id
+      });
+      return {
+        ticket: create(contract.CredentialUploadTicketSchema, {
+          ticketId: ticket.credentialUploadTicketId,
+          relativeEndpoint: `/v1/credentials/upload/${encodeURIComponent(ticket.credentialUploadTicketId)}`,
+          expiresAt: toProtoTimestamp(ticket.expiresAt),
+          maximumBytes: BigInt(ticket.maximumBytes)
+        })
+      };
+    }
+  } satisfies ServiceImpl<typeof contract.ExtensionService>;
+
+  const skill = {
+    listSkills: async (request, context) => {
+      authenticate(context);
+      if (dependencies.skills === undefined) {
+        return { skills: [], catalogRevision: toProtoRevision(0n), page: emptyPage(request.page) };
+      }
+      const requestedQuery = request.query ?? "";
+      const backendId = request.backendId ?? "";
+      const targetId = request.targetId ?? "";
+      if (requestedQuery.length > 256) throw invalidArgument("query exceeds the supported length");
+      const scope = request.scope === undefined ? undefined : nativeSkillScope(request.scope);
+      const snapshot = await skillEffect(() => dependencies.skills!.reconcile());
+      const query = requestedQuery.trim().toLocaleLowerCase("en-US");
+      const values = snapshot.skills
+        .filter((entry) => backendId === "" || entry.backendId === backendId)
+        .filter((entry) => targetId === "" || entry.targetId === targetId)
+        .filter((entry) => scope === undefined || entry.scope === scope)
+        .filter((entry) => query === "" || `${entry.name}\n${entry.sourceLabel}\n${entry.backendId}`.toLocaleLowerCase("en-US").includes(query))
+        .map(mapSkillDescriptor);
+      const result = paginate(values, request.page);
+      return { skills: result.values, catalogRevision: toProtoRevision(snapshot.revision), page: result.page };
+    },
+    openSkill: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireSkillManager(dependencies);
+      if (request.expectedResourceRevision === undefined) throw invalidArgument("expected_resource_revision is required");
+      ensureExtensionSurfaceRevocation(connection.id);
+      const opened = await skillEffect(() => manager.openSkill(
+        connection.id,
+        nonBlankRequest(request.skillId, "skill_id"),
+        fromProtoRevision(request.expectedResourceRevision, "open_skill.expected_resource_revision")
+      ));
+      return { skill: mapSkillSession(opened) };
+    },
+    listSkillFiles: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireSkillManager(dependencies);
+      const files = await skillEffect(() => manager.listFiles(
+        connection.id,
+        nonBlankRequest(request.sessionId, "session_id"),
+        request.parentKey
+      ));
+      const result = paginate(files.map(mapSkillFileEntry), request.page);
+      return { files: result.values, page: result.page };
+    },
+    readSkillFile: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireSkillManager(dependencies);
+      const file = await skillEffect(() => manager.readFile(
+        connection.id,
+        nonBlankRequest(request.sessionId, "session_id"),
+        nonBlankRequest(request.key, "key")
+      ));
+      return { file: mapSkillFileContent(file) };
+    },
+    getSkillDiff: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireSkillManager(dependencies);
+      const diff = await skillEffect(() => manager.getDiff(
+        connection.id,
+        nonBlankRequest(request.sessionId, "session_id")
+      ));
+      return { diff: mapSkillDiff(diff) };
+    },
+    prepareSkillFileEdit: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireSkillManager(dependencies);
+      const draft = await skillEffect(() => manager.prepareFileEdit({
+        connectionId: connection.id,
+        sessionId: nonBlankRequest(request.sessionId, "session_id"),
+        key: nonBlankRequest(request.key, "key"),
+        expectedFileRevision: nonBlankRequest(request.expectedFileRevision, "expected_file_revision"),
+        content: request.content
+      }));
+      return { draft: mapSkillDraft(draft) };
+    },
+    prepareSkillRename: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireSkillManager(dependencies);
+      const draft = await skillEffect(() => manager.prepareRename({
+        connectionId: connection.id,
+        sessionId: nonBlankRequest(request.sessionId, "session_id"),
+        name: nonBlankRequest(request.name, "name")
+      }));
+      return { draft: mapSkillDraft(draft) };
+    },
+    listSkillRecoveries: async (request, context) => {
+      authenticate(context);
+      const manager = requireSkillManager(dependencies);
+      const recoveries = await skillEffect(() => manager.listRecoveries());
+      const result = paginate(recoveries.map(mapSkillRecovery), request.page);
+      return { recoveries: result.values, page: result.page };
+    },
+    closeSkill: async (request, context) => {
+      const connection = authenticate(context);
+      if (dependencies.skills === undefined) return { closed: false };
+      const closed = await skillEffect(() => dependencies.skills!.closeSession(
+        connection.id,
+        nonBlankRequest(request.sessionId, "session_id")
+      ));
+      return { closed };
+    },
+    getSkillMarketGitPreflight: async (_request, context) => {
+      authenticate(context);
+      const manager = requireSkillMarketManager(dependencies);
+      const preflight = await skillMarketEffect(() => manager.gitPreflight());
+      return {
+        preflight: create(contract.SkillMarketGitPreflightSchema, {
+          available: preflight.available,
+          ...(preflight.version === undefined ? {} : { version: preflight.version }),
+          minimumVersion: preflight.minimumVersion
+        })
+      };
+    },
+    listSkillMarketSources: (request, context) => {
+      authenticate(context);
+      if (dependencies.skillMarket === undefined) {
+        return { sources: [], catalogRevision: toProtoRevision(0n), recoveredFromCorruption: false, page: emptyPage(request.page) };
+      }
+      return skillMarketEffectSync(() => {
+        const snapshot = dependencies.skillMarket!.snapshot();
+        const window = revisionPageWindow(request.page, "skill-market-sources", snapshot.revision.toString(10), "sources", 500);
+        const selected = snapshot.sources.slice(window.offset, window.offset + window.size);
+        const next = window.offset + selected.length;
+        return {
+          sources: selected.map(mapSkillMarketSource),
+          catalogRevision: toProtoRevision(snapshot.revision),
+          recoveredFromCorruption: snapshot.recoveredFromCorruption,
+          page: create(contract.PageInfoSchema, {
+            nextPageToken: next < snapshot.sources.length
+              ? encodeRevisionPageToken("skill-market-sources", snapshot.revision.toString(10), "sources", next)
+              : "",
+            totalSize: BigInt(snapshot.sources.length)
+          })
+        };
+      });
+    },
+    listSkillMarketCatalog: (request, context) => {
+      authenticate(context);
+      if (dependencies.skillMarket === undefined) {
+        return { entries: [], catalogRevision: toProtoRevision(0n), categories: [], sourceCount: 0, page: emptyPage(request.page) };
+      }
+      return skillMarketEffectSync(() => {
+        const query = request.query;
+        const category = request.category;
+        const sort = nativeSkillMarketSort(request.sort);
+        const fingerprint = createHash("sha256").update(JSON.stringify([query, category, sort])).digest("hex");
+        const cursor = decodeRevisionPageToken(request.page?.pageToken ?? "", "skill-market-catalog", fingerprint);
+        const requestRevision = request.expectedCatalogRevision === undefined
+          ? undefined
+          : fromProtoRevision(request.expectedCatalogRevision, "list_skill_market_catalog.expected_catalog_revision");
+        if (cursor !== undefined && requestRevision !== undefined && cursor.revision !== requestRevision.toString(10)) {
+          throw invalidArgument("page_token does not match expected_catalog_revision");
+        }
+        const expectedRevision = cursor === undefined
+          ? requestRevision ?? dependencies.skillMarket!.snapshot().revision
+          : BigInt(cursor.revision);
+        const size = Math.min(Math.max(request.page?.pageSize || 100, 1), 100);
+        const result = dependencies.skillMarket!.listCatalog({
+          expectedRevision,
+          ...(query === "" ? {} : { query }),
+          ...(category === "" ? {} : { category }),
+          sort,
+          offset: cursor?.offset ?? 0,
+          pageSize: size
+        });
+        return {
+          entries: result.items.map(mapSkillMarketEntry),
+          catalogRevision: toProtoRevision(result.revision),
+          categories: [...result.categories],
+          sourceCount: result.sourceCount,
+          page: create(contract.PageInfoSchema, {
+            nextPageToken: result.nextOffset === undefined
+              ? ""
+              : encodeRevisionPageToken("skill-market-catalog", result.revision.toString(10), fingerprint, result.nextOffset),
+            totalSize: BigInt(result.total)
+          })
+        };
+      });
+    },
+    getSkillMarketEntry: (request, context) => {
+      authenticate(context);
+      const manager = requireSkillMarketManager(dependencies);
+      return skillMarketEffectSync(() => ({ entry: mapSkillMarketEntry(manager.getEntry(nativeSkillMarketIdentity(request.identity))) }));
+    },
+    openSkillMarketPreview: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireSkillMarketManager(dependencies);
+      ensureExtensionSurfaceRevocation(connection.id);
+      const preview = await skillMarketEffect(() => manager.openPreview(
+        connection.id,
+        nativeSkillMarketIdentity(request.identity),
+        context.signal
+      ));
+      return { preview: mapSkillMarketPreview(preview) };
+    },
+    listSkillMarketPreviewFiles: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireSkillMarketManager(dependencies);
+      const offset = decodePageToken(request.page?.pageToken ?? "");
+      const size = Math.min(Math.max(request.page?.pageSize || 100, 1), 500);
+      const result = await skillMarketEffect(() => manager.listPreviewFiles({
+        connectionId: connection.id,
+        previewId: nonBlankRequest(request.previewId, "preview_id"),
+        expectedSnapshotRevision: nonBlankRequest(request.expectedSnapshotRevision, "expected_snapshot_revision"),
+        offset,
+        pageSize: size
+      }));
+      return {
+        files: result.items.map(mapSkillMarketArchiveEntry),
+        snapshotRevision: result.snapshotRevision,
+        page: create(contract.PageInfoSchema, {
+          nextPageToken: result.nextOffset === undefined ? "" : encodePageToken(result.nextOffset),
+          totalSize: BigInt(result.total)
+        })
+      };
+    },
+    readSkillMarketPreviewFile: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireSkillMarketManager(dependencies);
+      const file = await skillMarketEffect(() => manager.readPreviewFile({
+        connectionId: connection.id,
+        previewId: nonBlankRequest(request.previewId, "preview_id"),
+        expectedSnapshotRevision: nonBlankRequest(request.expectedSnapshotRevision, "expected_snapshot_revision"),
+        key: nonBlankRequest(request.key, "key")
+      }, context.signal));
+      return { file: mapSkillMarketPreviewFile(file) };
+    },
+    closeSkillMarketPreview: async (request, context) => {
+      const connection = authenticate(context);
+      if (dependencies.skillMarket === undefined) return { closed: false };
+      const closed = await skillMarketEffect(() => dependencies.skillMarket!.closePreview(
+        connection.id,
+        nonBlankRequest(request.previewId, "preview_id")
+      ));
+      return { closed };
+    },
+    createSkillMarketInstallPlan: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireSkillMarketManager(dependencies);
+      ensureExtensionSurfaceRevocation(connection.id);
+      const plan = await skillMarketEffect(() => manager.createInstallPlan(
+        connection.id,
+        nativeSkillMarketIdentity(request.identity),
+        nativeSkillMarketInstallTarget(request.target),
+        context.signal
+      ));
+      return { plan: mapSkillMarketInstallPlan(plan) };
+    },
+    getSkillMarketInstallPlan: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireSkillMarketManager(dependencies);
+      const plan = await skillMarketEffect(() => manager.getInstallPlan(
+        connection.id,
+        nonBlankRequest(request.planId, "plan_id")
+      ));
+      return { plan: mapSkillMarketInstallPlan(plan) };
+    },
+    closeSkillMarketInstallPlan: async (request, context) => {
+      const connection = authenticate(context);
+      if (dependencies.skillMarket === undefined) return { closed: false };
+      const closed = await skillMarketEffect(() => dependencies.skillMarket!.closeInstallPlan(
+        connection.id,
+        nonBlankRequest(request.planId, "plan_id")
+      ));
+      return { closed };
+    },
+    listSkillMarketSyncPolicies: (request, context) => {
+      authenticate(context);
+      if (dependencies.skillMarketSync === undefined) {
+        return { policies: [], recoveredFromCorruption: false, page: emptyPage(request.page) };
+      }
+      return skillMarketEffectSync(() => {
+        const result = paginate(dependencies.skillMarketSync!.listPolicies().map(mapSkillMarketSyncPolicy), request.page);
+        return {
+          policies: result.values,
+          recoveredFromCorruption: dependencies.skillMarketSync!.recoveredFromCorruption,
+          page: result.page
+        };
+      });
+    },
+    listSkillMarketSyncJobs: (request, context) => {
+      authenticate(context);
+      if (dependencies.skillMarketSync === undefined) {
+        return { jobs: [], recoveredFromCorruption: false, page: emptyPage(request.page) };
+      }
+      return skillMarketEffectSync(() => {
+        const result = paginate(dependencies.skillMarketSync!.listJobs({
+          ...(request.resourceId === undefined
+            ? {}
+            : { resourceId: nonBlankRequest(request.resourceId, "resource_id") })
+        }).map(mapSkillMarketSyncJob), request.page);
+        return {
+          jobs: result.values,
+          recoveredFromCorruption: dependencies.skillMarketSync!.recoveredFromCorruption,
+          page: result.page
+        };
+      });
+    },
+    getSkillMarketSyncJob: (request, context) => {
+      authenticate(context);
+      const manager = requireSkillMarketSyncManager(dependencies);
+      return skillMarketEffectSync(() => ({
+        job: mapSkillMarketSyncJob(manager.getJob(nonBlankRequest(request.jobId, "job_id"))),
+        recoveredFromCorruption: manager.recoveredFromCorruption
+      }));
+    },
+    getSkillPublicationPreview: async (request, context) => {
+      authenticate(context);
+      const manager = requireSkillPublicationManager(dependencies);
+      if (request.expectedResourceRevision === undefined) throw invalidArgument("expected_resource_revision is required");
+      if (request.expectedSourceRevision === undefined) throw invalidArgument("expected_source_revision is required");
+      const preview = await skillEffect(() => manager.preview({
+        resourceId: nonBlankRequest(request.resourceId, "resource_id"),
+        expectedResourceRevision: fromProtoRevision(
+          request.expectedResourceRevision,
+          "get_skill_publication_preview.expected_resource_revision"
+        ),
+        sourceId: nonBlankRequest(request.sourceId, "source_id"),
+        expectedSourceRevision: fromProtoRevision(
+          request.expectedSourceRevision,
+          "get_skill_publication_preview.expected_source_revision"
+        ),
+        ...(request.slug === undefined ? {} : { slug: request.slug })
+      }));
+      return { preview: mapSkillPublicationPreview(preview) };
+    },
+    listSkillPublicationJobs: (request, context) => {
+      authenticate(context);
+      if (dependencies.skillPublication === undefined) {
+        return { jobs: [], recoveredFromCorruption: false, page: emptyPage(request.page) };
+      }
+      return skillMarketEffectSync(() => {
+        const result = paginate(dependencies.skillPublication!.list({
+          ...(request.resourceId === undefined
+            ? {}
+            : { resourceId: nonBlankRequest(request.resourceId, "resource_id") })
+        }).map(mapSkillPublicationJob), request.page);
+        return {
+          jobs: result.values,
+          recoveredFromCorruption: dependencies.skillPublication!.recoveredFromCorruption,
+          page: result.page
+        };
+      });
+    },
+    getSkillPublicationJob: (request, context) => {
+      authenticate(context);
+      const manager = requireSkillPublicationManager(dependencies);
+      return skillMarketEffectSync(() => ({
+        job: mapSkillPublicationJob(manager.get(nonBlankRequest(request.jobId, "job_id"))),
+        recoveredFromCorruption: manager.recoveredFromCorruption
+      }));
+    },
+    getCollaborationDirectory: (_request, context) => {
+      authenticate(context);
+      const directory = dependencies.collaboration?.snapshot() ?? {
+        available: false,
+        revision: 0n,
+        scopes: [],
+        recoveredFromCorruption: false,
+        unavailableReason: "Collaboration identity is unavailable."
+      };
+      return { directory: mapCollaborationDirectory(directory) };
+    },
+    getSkillResourceUsageReport: (request, context) => {
+      authenticate(context);
+      const resourceId = nonBlankRequest(request.resourceId, "resource_id");
+      const current = dependencies.piResources?.list({ kind: "skill" })
+        .find((resource) => resource.id === resourceId);
+      const report = dependencies.store.getResourceUsageReport({
+        resourceId,
+        timeZone: nonBlankRequest(request.timeZone, "time_zone"),
+        ...(current === undefined ? {} : {
+          current: {
+            entityRevision: current.versionNumber.toString(10),
+            contentRevision: current.discoveredRevision,
+            ...(current.version === undefined ? {} : { version: current.version })
+          }
+        })
+      });
+      return { report: mapResourceUsageReport(report) };
+    }
+  } satisfies ServiceImpl<typeof contract.SkillService>;
+
   const browser = {
     listBrowserProviders: async (request, context) => {
       authenticate(context);
@@ -3656,7 +4602,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
     }
   } satisfies ServiceImpl<typeof contract.PiService>;
 
-  return { connection, event, operation, backend, target, session, portableSession, run, subagent, review, queue, scheduler, interaction, workspace, worktree, artifact, historyMaintenance, credential, settings, managedModelRuntime, tool, browser, remoteHost, sshKey, voiceInput, terminal, pi };
+  return { connection, event, operation, backend, target, session, portableSession, run, subagent, review, queue, scheduler, interaction, workspace, worktree, artifact, historyMaintenance, credential, settings, managedModelRuntime, tool, extension, skill, browser, remoteHost, sshKey, voiceInput, terminal, pi };
 }
 
 function requireAuthentication(dependencies: ConnectServiceDependencies, context: HandlerContext): ConnectionRecord {
@@ -4642,6 +5588,20 @@ function operationResult(
         if (item !== undefined) payload = { case: "resource", value: mapManagedResource(item) };
         break;
       }
+      case "skill": {
+        const item = dependencies.piResources?.get(outcome.entityId);
+        if (item !== undefined && item.kind === "skill") {
+          payload = {
+            case: "skill",
+            value: create(contract.SkillMutationResultSchema, {
+              skill: mapSkillDescriptor(skillCatalogEntryFromResource(item)),
+              replacedSkillId: outcome.skillReplacedId ?? "",
+              recoveryId: outcome.skillRecoveryId ?? ""
+            })
+          };
+        }
+        break;
+      }
       case "diagnosticsBundle": {
         const artifactId = dependencies.diagnosticsArtifacts.get(outcome.entityId) ?? outcome.entityId;
         payload = { case: "diagnosticsBundle", value: toProtoArtifact(dependencies.store.getArtifact(artifactId)) };
@@ -5003,7 +5963,13 @@ function outcomeFromRecord(record: OperationRecord<unknown>): OperationOutcome {
       }),
       ...(stringValue(response["browserTransferBinaryBase64"]) === undefined
         ? {}
-        : { browserTransferBinaryBase64: stringValue(response["browserTransferBinaryBase64"]) })
+        : { browserTransferBinaryBase64: stringValue(response["browserTransferBinaryBase64"]) }),
+      ...(stringValue(response["skillReplacedId"]) === undefined
+        ? {}
+        : { skillReplacedId: stringValue(response["skillReplacedId"]) }),
+      ...(stringValue(response["skillRecoveryId"]) === undefined
+        ? {}
+        : { skillRecoveryId: stringValue(response["skillRecoveryId"]) })
     };
   }
   if (typeof response["sessionId"] === "string") return { accepted: true, resultCase: "session", entityId: response["sessionId"] };
@@ -6706,6 +7672,78 @@ function backendProviderOperations(descriptor: BackendDescriptor): {
   };
 }
 
+interface RevisionPageCursor {
+  readonly kind: string;
+  readonly revision: string;
+  readonly fingerprint: string;
+  readonly offset: number;
+}
+
+interface RevisionPageWindow {
+  readonly offset: number;
+  readonly size: number;
+}
+
+function revisionPageWindow(
+  request: contract.PageRequest | undefined,
+  kind: string,
+  revision: string,
+  fingerprint: string,
+  maximumSize: number
+): RevisionPageWindow {
+  const cursor = decodeRevisionPageToken(request?.pageToken ?? "", kind, fingerprint);
+  if (cursor !== undefined && cursor.revision !== revision) {
+    throw new ConnectError(
+      "Skill market catalog changed while the result set was being paged; restart from the first page.",
+      Code.Aborted
+    );
+  }
+  return {
+    offset: cursor?.offset ?? 0,
+    size: Math.min(Math.max(request?.pageSize || DEFAULT_PAGE_SIZE, 1), maximumSize)
+  };
+}
+
+function encodeRevisionPageToken(
+  kind: string,
+  revision: string,
+  fingerprint: string,
+  offset: number
+): string {
+  return Buffer.from(JSON.stringify({ version: 1, kind, revision, fingerprint, offset }), "utf8").toString("base64url");
+}
+
+function decodeRevisionPageToken(
+  token: string,
+  expectedKind: string,
+  expectedFingerprint: string
+): RevisionPageCursor | undefined {
+  if (token === "") return undefined;
+  if (token.length > 1_024 || !/^[A-Za-z0-9_-]+$/u.test(token)) throw invalidArgument("page_token is malformed");
+  try {
+    const decoded = Buffer.from(token, "base64url").toString("utf8");
+    if (Buffer.from(decoded, "utf8").toString("base64url") !== token) throw new Error("non-canonical");
+    const record = asRecord(JSON.parse(decoded) as unknown);
+    const keys = Object.keys(record).sort().join(",");
+    if (keys !== "fingerprint,kind,offset,revision,version" || record["version"] !== 1) throw new Error("shape");
+    const kind = record["kind"];
+    const revision = record["revision"];
+    const fingerprint = record["fingerprint"];
+    const offset = record["offset"];
+    if (typeof kind !== "string" || kind.length === 0 || kind.length > 64) throw new Error("kind");
+    if (typeof revision !== "string" || !/^(?:0|[1-9][0-9]*)$/u.test(revision)) throw new Error("revision");
+    if (typeof fingerprint !== "string" || fingerprint.length === 0 || fingerprint.length > 128) throw new Error("fingerprint");
+    if (typeof offset !== "number" || !Number.isSafeInteger(offset) || offset < 0) throw new Error("offset");
+    if (kind !== expectedKind || fingerprint !== expectedFingerprint) {
+      throw invalidArgument("page_token does not match the Skill market query");
+    }
+    return { kind, revision, fingerprint, offset };
+  } catch (error) {
+    if (error instanceof ConnectError) throw error;
+    throw invalidArgument("page_token is malformed");
+  }
+}
+
 function reserveAllProviderCredentialSurfaces(dependencies: ConnectServiceDependencies): void {
   if (dependencies.credentials === undefined) return;
   for (const record of dependencies.store.listBackends()) {
@@ -8329,6 +9367,2093 @@ function mapMcpServerDescriptor(item: NativeMcpServerDescriptor): contract.McpSe
   });
 }
 
+function reconcileExtensionCatalog(dependencies: ConnectServiceDependencies): NativeExtensionCatalogSnapshot {
+  const catalog = dependencies.extensionCatalog;
+  if (catalog === undefined) return { revision: 0n, entries: [], recoveredFromCorruption: false };
+  return catalog.reconcile(
+    dependencies.piResources?.list() ?? [],
+    dependencies.mcpRouter?.list() ?? [],
+    dependencies.extensionSources?.snapshot().sources ?? []
+  );
+}
+
+function requireExtensionMutation(
+  dependencies: ConnectServiceDependencies,
+  extensionId: string,
+  expectedRevision: bigint
+): NativeExtensionCatalogDescriptor {
+  const normalizedId = nonBlankRequest(extensionId, "extension_id");
+  if (dependencies.extensionCatalog === undefined) {
+    throw new ConnectError("Extension catalog is unavailable.", Code.Unimplemented);
+  }
+  const entry = reconcileExtensionCatalog(dependencies).entries.find((candidate) => candidate.id === normalizedId);
+  if (entry === undefined) throw new ConnectError("Extension not found.", Code.NotFound);
+  if (entry.revision !== expectedRevision) {
+    throw new ConnectError("Extension changed concurrently.", Code.Aborted);
+  }
+  return entry;
+}
+
+/** Read-only final fence for use inside an enclosing Store transaction. */
+function requireCurrentExtensionMutation(
+  dependencies: ConnectServiceDependencies,
+  extensionId: string,
+  expectedRevision: bigint
+): NativeExtensionCatalogDescriptor {
+  const normalizedId = nonBlankRequest(extensionId, "extension_id");
+  if (dependencies.extensionCatalog === undefined) {
+    throw new ConnectError("Extension catalog is unavailable.", Code.Unimplemented);
+  }
+  let entry: NativeExtensionCatalogDescriptor;
+  try {
+    entry = dependencies.extensionCatalog.get(normalizedId);
+  } catch {
+    throw new ConnectError("Extension not found.", Code.NotFound);
+  }
+  if (entry.revision !== expectedRevision) {
+    throw new ConnectError("Extension changed concurrently.", Code.Aborted);
+  }
+  return entry;
+}
+
+function requireExtensionPackageExportAuthority(
+  dependencies: ConnectServiceDependencies,
+  extensionId: string,
+  expectedExtensionRevision: bigint,
+  currentOnly = false,
+  store: OperationalStore = dependencies.store
+): NativeExtensionPackageExportAuthority {
+  if (dependencies.piResources === undefined || dependencies.extensionCatalog === undefined) {
+    throw new ConnectError("Extension package export is unavailable.", Code.Unimplemented);
+  }
+  const extension = currentOnly
+    ? requireCurrentExtensionMutation(dependencies, extensionId, expectedExtensionRevision)
+    : requireExtensionMutation(dependencies, extensionId, expectedExtensionRevision);
+  if (extension.owner.kind !== "resource" || !extension.installed) {
+    throw new ConnectError("Only an installed Resource-owned Extension can be exported.", Code.FailedPrecondition);
+  }
+  let resource: NativePiResourceDescriptor;
+  try {
+    resource = dependencies.piResources.get(extension.owner.resourceId);
+  } catch (error) {
+    throw new ConnectError(redactSecrets(error instanceof Error ? error.message : "Extension Resource not found."), Code.NotFound);
+  }
+  if (
+    resource.id !== extension.owner.resourceId
+    || resource.versionNumber !== extension.owner.resourceVersion
+    || resource.discoveredRevision !== extension.owner.discoveredRevision
+    || resource.kind !== "package"
+    || resource.scope !== "managed"
+    || resource.packageIdentity === undefined
+    || resource.state === "removed"
+    || resource.state === "error"
+    || extension.version !== resource.version
+  ) {
+    throw new ConnectError("Extension package authority is not a current installed managed Resource.", Code.FailedPrecondition);
+  }
+  const backend = store.getBackend(resource.backendId);
+  return {
+    extensionId: extension.id,
+    extensionRevision: extension.revision,
+    resourceId: resource.id,
+    resourceRevision: resource.versionNumber,
+    discoveredRevision: resource.discoveredRevision,
+    backendId: resource.backendId,
+    backendRevision: backend.revision,
+    backendGeneration: backend.descriptor.instanceGeneration,
+    packageName: resource.packageIdentity,
+    ...(resource.version === undefined ? {} : { packageVersion: resource.version })
+  };
+}
+
+function assertExpectedExtensionPackageExportAuthority(
+  authority: NativeExtensionPackageExportAuthority,
+  input: {
+    readonly resourceId: string;
+    readonly resourceRevision: bigint;
+    readonly backendId: string;
+    readonly backendRevision: bigint;
+    readonly backendGeneration: number;
+  }
+): void {
+  if (
+    authority.resourceId !== input.resourceId
+    || authority.resourceRevision !== input.resourceRevision
+    || authority.backendId !== input.backendId
+    || authority.backendRevision !== input.backendRevision
+    || authority.backendGeneration !== input.backendGeneration
+  ) throw new ConnectError("Extension package export authority changed after confirmation.", Code.Aborted);
+}
+
+function assertSameExtensionPackageExportAuthority(
+  expected: NativeExtensionPackageExportAuthority,
+  current: NativeExtensionPackageExportAuthority
+): void {
+  if (
+    expected.extensionId !== current.extensionId
+    || expected.extensionRevision !== current.extensionRevision
+    || expected.resourceId !== current.resourceId
+    || expected.resourceRevision !== current.resourceRevision
+    || expected.discoveredRevision !== current.discoveredRevision
+    || expected.backendId !== current.backendId
+    || expected.backendRevision !== current.backendRevision
+    || expected.backendGeneration !== current.backendGeneration
+    || expected.packageName !== current.packageName
+    || expected.packageVersion !== current.packageVersion
+  ) throw new Error("Extension package export authority changed while work was active.");
+}
+
+function extensionCatalogAction<T>(action: () => T): T {
+  try {
+    return action();
+  } catch (error) {
+    if (error instanceof ConnectError || error instanceof StoreError) throw error;
+    const message = redactSecrets(error instanceof Error ? error.message : "Extension catalog mutation failed.");
+    if (/not found/iu.test(message)) throw new ConnectError(message, Code.NotFound);
+    if (/concurrently|stale/iu.test(message)) throw new ConnectError(message, Code.Aborted);
+    if (/invalid/iu.test(message)) throw invalidArgument(message);
+    throw new ConnectError(message, Code.FailedPrecondition);
+  }
+}
+
+async function extensionCatalogEffect<T>(effect: () => Promise<T>): Promise<T> {
+  try {
+    return await effect();
+  } catch (error) {
+    if (error instanceof ConnectError || error instanceof StoreError) throw error;
+    const message = redactSecrets(error instanceof Error ? error.message : "Extension catalog mutation failed.");
+    if (/not found/iu.test(message)) throw new ConnectError(message, Code.NotFound);
+    if (/concurrently|stale/iu.test(message)) throw new ConnectError(message, Code.Aborted);
+    if (/invalid/iu.test(message)) throw invalidArgument(message);
+    throw new ConnectError(message, Code.FailedPrecondition);
+  }
+}
+
+function extensionPublisherAction<T>(action: () => T): T {
+  try {
+    return action();
+  } catch (error) {
+    if (error instanceof ConnectError || error instanceof StoreError) throw error;
+    const message = redactSecrets(error instanceof Error ? error.message : "Extension package export failed.");
+    if (/does not exist|not found/iu.test(message)) throw new ConnectError(message, Code.NotFound);
+    if (/changed|concurrently|stale/iu.test(message)) throw new ConnectError(message, Code.Aborted);
+    if (/invalid/iu.test(message)) throw invalidArgument(message);
+    if (/concurrency limit|history is full/iu.test(message)) throw new ConnectError(message, Code.ResourceExhausted);
+    throw new ConnectError(message, Code.FailedPrecondition);
+  }
+}
+
+async function extensionPublisherEffect<T>(effect: () => Promise<T>): Promise<T> {
+  try {
+    return await effect();
+  } catch (error) {
+    return extensionPublisherAction(() => { throw error; });
+  }
+}
+
+async function currentExtensionCatalog(
+  dependencies: ConnectServiceDependencies,
+  sessionId?: string
+): Promise<NativeExtensionCatalogSnapshot> {
+  await dependencies.extensionSources?.auditAvailability();
+  const reconciled = reconcileExtensionCatalog(dependencies);
+  if (sessionId === undefined || dependencies.extensionCatalog === undefined) return reconciled;
+  const session = dependencies.store.getSession(sessionId);
+  const backend = dependencies.store.getBackend(session.descriptor.backendId).descriptor;
+  const commands = await dependencies.sessionHost.getCommands(sessionId);
+  const runtime: ExtensionRuntimeObservation = {
+    sessionId,
+    commands,
+    ...(backend.capabilities.get("runtime.tools")?.supported === true
+      ? { tools: (await dependencies.sessionHost.getRuntimeTools(sessionId)).tools }
+      : {})
+  };
+  return dependencies.extensionCatalog.snapshot(runtime);
+}
+
+function extensionSearchText(entry: NativeExtensionCatalogDescriptor): string {
+  return [
+    entry.name,
+    entry.description,
+    entry.author ?? "",
+    ...entry.tools.flatMap((tool) => [tool.name, tool.description]),
+    ...entry.permissions.flatMap((permission) => [permission.label, permission.description])
+  ].join("\n").toLocaleLowerCase("en-US");
+}
+
+function mapExtensionCatalogEntry(item: NativeExtensionCatalogDescriptor): contract.ExtensionCatalogEntry {
+  return create(contract.ExtensionCatalogEntrySchema, {
+    extensionId: item.id,
+    revision: toProtoRevision(item.revision),
+    owner: create(contract.ExtensionOwnerSchema, {
+      kind: item.owner.kind === "resource"
+        ? {
+            case: "resource",
+            value: create(contract.ExtensionResourceOwnerSchema, {
+              resourceId: item.owner.resourceId,
+              discoveredRevision: item.owner.discoveredRevision,
+              resourceVersion: toProtoRevision(item.owner.resourceVersion)
+            })
+          }
+        : item.owner.kind === "mcp" ? {
+            case: "mcp",
+            value: create(contract.ExtensionMcpOwnerSchema, {
+              mcpServerId: item.owner.serverId,
+              serverRevision: toProtoRevision(item.owner.serverRevision)
+            })
+          } : {
+            case: "source",
+            value: create(contract.ExtensionSourceOwnerSchema, {
+              sourceId: item.owner.sourceId,
+              sourceRevision: toProtoRevision(item.owner.sourceRevision),
+              entryId: item.owner.entryId,
+              contentRevision: item.owner.contentRevision
+            })
+          }
+    }),
+    source: item.source === "local" ? contract.ExtensionCatalogSource.LOCAL : contract.ExtensionCatalogSource.MARKET,
+    installed: item.installed,
+    installState: protoExtensionInstallState(item.installState),
+    name: item.name,
+    ...(item.version === undefined ? {} : { version: item.version }),
+    ...(item.author === undefined ? {} : { author: item.author }),
+    description: item.description,
+    enabled: item.enabled,
+    sidebarSupported: item.sidebarSupported,
+    sidebarVisible: item.sidebarVisible,
+    tools: item.tools.map((tool) => create(contract.ExtensionToolDescriptorSchema, {
+      name: tool.name,
+      description: tool.description,
+      requiresPermission: tool.requiresPermission
+    })),
+    permissions: item.permissions.map((permission) => create(contract.ExtensionPermissionDescriptorSchema, {
+      permissionId: permission.id,
+      label: permission.label,
+      description: permission.description,
+      required: permission.required,
+      granted: permission.granted
+    })),
+    commands: item.commands.map((command) => create(contract.ExtensionCommandDescriptorSchema, {
+      name: command.name,
+      description: command.description,
+      sessionId: command.sessionId
+    })),
+    setup: create(contract.ExtensionSetupDescriptorSchema, {
+      state: protoExtensionSetupState(item.setup.state),
+      ...(item.setup.attemptId === undefined ? {} : { attemptId: item.setup.attemptId }),
+      revision: toProtoRevision(item.setup.revision),
+      fields: item.setup.fields.map((field) => create(contract.ExtensionSetupFieldDescriptorSchema, {
+        fieldId: field.id,
+        label: field.label,
+        description: field.description,
+        kind: protoExtensionSetupFieldKind(field.kind),
+        required: field.required,
+        configured: field.configured,
+        options: [...field.options]
+      })),
+      ...(item.setup.error === undefined ? {} : { error: item.setup.error })
+    }),
+    useSupported: item.useSupported,
+    ...(item.error === undefined ? {} : { error: item.error }),
+    ...(item.mainView === undefined
+      ? {}
+      : {
+          mainView: create(contract.ExtensionMainViewDescriptorSchema, {
+            ...(item.mainView.title === undefined ? {} : { title: item.mainView.title }),
+            icon: protoExtensionMainViewIcon(item.mainView.icon)
+          })
+        }),
+    ...(item.library === undefined
+      ? {}
+      : {
+          library: create(contract.ExtensionLibraryDescriptorSchema, {
+            schemaVersion: item.library.schemaVersion
+          })
+        }),
+    ...(item.update === undefined
+      ? {}
+      : {
+          update: create(contract.ExtensionPackageUpdateSchema, {
+            source: create(contract.ExtensionSourceOwnerSchema, {
+              sourceId: item.update.sourceId,
+              sourceRevision: toProtoRevision(item.update.sourceRevision),
+              entryId: item.update.entryId,
+              contentRevision: item.update.contentRevision
+            }),
+            ...(item.update.availableVersion === undefined ? {} : { availableVersion: item.update.availableVersion }),
+            sourceReplacement: item.update.sourceReplacement
+          })
+        })
+  });
+}
+
+function requireExtensionMainViewAuthority(
+  dependencies: ConnectServiceDependencies,
+  extensionId: string,
+  expectedExtensionRevision: bigint,
+  currentOnly = false
+): NativeExtensionMainViewAuthority {
+  if (dependencies.piResources === undefined || dependencies.extensionCatalog === undefined) {
+    throw new ConnectError("Extension main views are unavailable.", Code.Unimplemented);
+  }
+  const extension = currentOnly
+    ? requireCurrentExtensionMutation(dependencies, extensionId, expectedExtensionRevision)
+    : requireExtensionMutation(dependencies, extensionId, expectedExtensionRevision);
+  if (extension.owner.kind !== "resource" || !extension.installed || !extension.enabled
+    || extension.mainView === undefined || !extension.sidebarSupported
+    || extension.setup.state !== "ready" && extension.setup.state !== "not_required") {
+    throw new ConnectError("Extension main view is not ready.", Code.FailedPrecondition);
+  }
+  let resource: NativePiResourceDescriptor;
+  try {
+    resource = dependencies.piResources.get(extension.owner.resourceId);
+  } catch (error) {
+    throw new ConnectError(redactSecrets(error instanceof Error ? error.message : "Extension Resource not found."), Code.NotFound);
+  }
+  const matchingDetails = resource.resourceDetails.filter((detail) => detail.kind === "extension"
+    && detail.entryPath === extension.mainView?.extensionEntry
+    && detail.mainView?.html === extension.mainView?.html
+    && detail.mainView?.title === extension.mainView?.title
+    && detail.mainView?.icon === extension.mainView?.icon
+    && detail.library?.schemaVersion === extension.library?.schemaVersion
+    && (detail.library === undefined) === (extension.library === undefined));
+  if (resource.id !== extension.owner.resourceId || resource.versionNumber !== extension.owner.resourceVersion
+    || resource.discoveredRevision !== extension.owner.discoveredRevision || resource.kind !== "package"
+    || resource.scope !== "managed" || resource.packageIdentity === undefined || !resource.enabled
+    || !["installed", "loaded", "update_available"].includes(resource.state) || matchingDetails.length !== 1
+    || extension.version !== resource.version) {
+    throw new ConnectError("Extension main view does not have a current installed package authority.", Code.FailedPrecondition);
+  }
+  const backend = dependencies.store.getBackend(resource.backendId);
+  return {
+    extensionId: extension.id,
+    resourceId: resource.id,
+    backendId: resource.backendId,
+    backendRevision: backend.revision,
+    backendGeneration: backend.descriptor.instanceGeneration,
+    resourceRevision: resource.versionNumber,
+    discoveredRevision: resource.discoveredRevision,
+    packageName: resource.packageIdentity,
+    ...(resource.version === undefined ? {} : { packageVersion: resource.version }),
+    extensionEntry: extension.mainView.extensionEntry,
+    mainView: {
+      html: extension.mainView.html,
+      ...(extension.mainView.title === undefined ? {} : { title: extension.mainView.title }),
+      ...(extension.mainView.icon === undefined ? {} : { icon: extension.mainView.icon })
+    },
+    ...(extension.library === undefined ? {} : { library: { schemaVersion: extension.library.schemaVersion } })
+  };
+}
+
+function assertCurrentExtensionMainViewAuthority(
+  dependencies: ConnectServiceDependencies,
+  expected: NativeExtensionMainViewAuthority
+): void {
+  const current = requireExtensionMainViewAuthority(
+    dependencies,
+    expected.extensionId,
+    dependencies.extensionCatalog!.get(expected.extensionId).revision,
+    true
+  );
+  if (current.extensionId !== expected.extensionId || current.resourceId !== expected.resourceId
+    || current.backendId !== expected.backendId || current.backendRevision !== expected.backendRevision
+    || current.backendGeneration !== expected.backendGeneration || current.resourceRevision !== expected.resourceRevision
+    || current.discoveredRevision !== expected.discoveredRevision || current.packageName !== expected.packageName
+    || current.packageVersion !== expected.packageVersion || current.extensionEntry !== expected.extensionEntry
+    || current.mainView.html !== expected.mainView.html || current.mainView.title !== expected.mainView.title
+    || current.mainView.icon !== expected.mainView.icon
+    || current.library?.schemaVersion !== expected.library?.schemaVersion
+    || (current.library === undefined) !== (expected.library === undefined)) throw new Error("Extension main-view authority changed.");
+}
+
+function requestExtensionLibraryAuthority(
+  dependencies: ConnectServiceDependencies,
+  extensionId: string,
+  expectedRevision: contract.Revision | undefined,
+  field: string
+): NativeExtensionLibraryAuthority {
+  if (expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+  return requireExtensionLibraryAuthority(
+    dependencies,
+    nonBlankRequest(extensionId, "extension_id"),
+    fromProtoRevision(expectedRevision, `${field}.expected_revision`)
+  );
+}
+
+function requireExtensionLibraryAuthority(
+  dependencies: ConnectServiceDependencies,
+  extensionId: string,
+  expectedExtensionRevision: bigint,
+  currentOnly = false
+): NativeExtensionLibraryAuthority {
+  if (dependencies.piResources === undefined || dependencies.extensionCatalog === undefined) {
+    throw new ConnectError("Extension Libraries are unavailable.", Code.Unimplemented);
+  }
+  const extension = currentOnly
+    ? requireCurrentExtensionMutation(dependencies, extensionId, expectedExtensionRevision)
+    : requireExtensionMutation(dependencies, extensionId, expectedExtensionRevision);
+  if (extension.owner.kind !== "resource" || !extension.installed || !extension.enabled || extension.library === undefined
+    || extension.setup.state !== "ready" && extension.setup.state !== "not_required") {
+    throw new ConnectError("Extension Library is not ready.", Code.FailedPrecondition);
+  }
+  let resource: NativePiResourceDescriptor;
+  try {
+    resource = dependencies.piResources.get(extension.owner.resourceId);
+  } catch {
+    throw new ConnectError("Extension Library Resource not found.", Code.NotFound);
+  }
+  const matchingDetails = resource.resourceDetails.filter((detail) => detail.kind === "extension"
+    && detail.entryPath === extension.library?.extensionEntry
+    && detail.library?.schemaVersion === extension.library?.schemaVersion);
+  if (resource.id !== extension.owner.resourceId || resource.versionNumber !== extension.owner.resourceVersion
+    || resource.discoveredRevision !== extension.owner.discoveredRevision || resource.kind !== "package"
+    || resource.scope !== "managed" || !resource.enabled
+    || !["installed", "loaded", "update_available"].includes(resource.state) || matchingDetails.length !== 1) {
+    throw new ConnectError("Extension Library does not have a current installed package authority.", Code.FailedPrecondition);
+  }
+  const backend = dependencies.store.getBackend(resource.backendId);
+  return {
+    extensionId: extension.id,
+    extensionRevision: extension.revision,
+    resourceId: resource.id,
+    resourceRevision: resource.versionNumber,
+    discoveredRevision: resource.discoveredRevision,
+    backendId: resource.backendId,
+    backendRevision: backend.revision,
+    backendGeneration: backend.descriptor.instanceGeneration,
+    name: extension.name,
+    library: { schemaVersion: 1, extensionEntry: extension.library.extensionEntry }
+  };
+}
+
+function assertCurrentExtensionLibraryAuthority(
+  dependencies: ConnectServiceDependencies,
+  expected: NativeExtensionLibraryAuthority
+): void {
+  const current = requireExtensionLibraryAuthority(
+    dependencies,
+    expected.extensionId,
+    dependencies.extensionCatalog!.get(expected.extensionId).revision,
+    true
+  );
+  if (current.extensionId !== expected.extensionId || current.extensionRevision !== expected.extensionRevision
+    || current.resourceId !== expected.resourceId || current.resourceRevision !== expected.resourceRevision
+    || current.discoveredRevision !== expected.discoveredRevision || current.backendId !== expected.backendId
+    || current.backendRevision !== expected.backendRevision || current.backendGeneration !== expected.backendGeneration
+    || current.library.schemaVersion !== expected.library.schemaVersion
+    || current.library.extensionEntry !== expected.library.extensionEntry) {
+    throw new Error("Extension Library authority changed.");
+  }
+}
+
+function extensionLibraryAuthorityFence(
+  dependencies: ConnectServiceDependencies,
+  connection: ConnectionRecord,
+  authority: NativeExtensionLibraryAuthority
+): () => void {
+  return () => {
+    dependencies.connections.fence(connection);
+    assertCurrentExtensionLibraryAuthority(dependencies, authority);
+  };
+}
+
+function requireExtensionLibraryManager(dependencies: ConnectServiceDependencies): ExtensionLibraryManager {
+  if (dependencies.extensionLibraries === undefined) throw new ConnectError("Extension Libraries are unavailable.", Code.Unimplemented);
+  return dependencies.extensionLibraries;
+}
+
+function requireSkillManager(dependencies: ConnectServiceDependencies): SkillManager {
+  if (dependencies.skills === undefined) throw new ConnectError("Skill management is unavailable.", Code.Unimplemented);
+  return dependencies.skills;
+}
+
+function requireSkillMarketManager(dependencies: ConnectServiceDependencies): SkillMarketManager {
+  if (dependencies.skillMarket === undefined) throw new ConnectError("Skill market management is unavailable.", Code.Unimplemented);
+  return dependencies.skillMarket;
+}
+
+function requireSkillMarketSyncManager(dependencies: ConnectServiceDependencies): SkillMarketSyncManager {
+  if (dependencies.skillMarketSync === undefined) throw new ConnectError("Skill market synchronization is unavailable.", Code.Unimplemented);
+  return dependencies.skillMarketSync;
+}
+
+function requireSkillPublicationManager(dependencies: ConnectServiceDependencies): SkillPublicationManager {
+  if (dependencies.skillPublication === undefined) throw new ConnectError("Skill publication is unavailable.", Code.Unimplemented);
+  return dependencies.skillPublication;
+}
+
+async function skillEffect<T>(effect: () => Promise<T>): Promise<T> {
+  try {
+    return await effect();
+  } catch (error) {
+    if (error instanceof ConnectError) throw error;
+    const raw = error instanceof Error ? error.message : "Skill operation failed.";
+    const message = redactSecrets(raw)
+      .replace(/[A-Za-z]:[\\/][^\s"'<>|]*/gu, "[private path]")
+      .replace(/\\\\[^\s"'<>|]+/gu, "[private path]")
+      .replace(/\/(?:[^\s"'<>|/]+\/)+[^\s"'<>|/]*/gu, "[private path]")
+      .replace(/~\/[^\s"'<>|]*/gu, "[private path]")
+      .slice(0, 512);
+    const code = /does not exist|not found/iu.test(message) ? Code.NotFound
+      : /another connection|belongs to/iu.test(message) ? Code.PermissionDenied
+        : /too many|byte limit|exceeds/iu.test(message) ? Code.ResourceExhausted
+          : /stale|changed|authority|expired|fenced|trusted|rollback target/iu.test(message) ? Code.Aborted
+            : /invalid|required|must|excluded|confirmation|only an existing|already has/iu.test(message) ? Code.InvalidArgument
+              : Code.FailedPrecondition;
+    throw new ConnectError(message, code);
+  }
+}
+
+async function skillMarketEffect<T>(effect: () => Promise<T>): Promise<T> {
+  try {
+    return await effect();
+  } catch (error) {
+    throw skillMarketConnectError(error);
+  }
+}
+
+function skillMarketEffectSync<T>(effect: () => T): T {
+  try {
+    return effect();
+  } catch (error) {
+    throw skillMarketConnectError(error);
+  }
+}
+
+function skillMarketConnectError(error: unknown): ConnectError {
+  if (error instanceof ConnectError) return error;
+  const raw = error instanceof Error ? error.message : "Skill market operation failed.";
+  const message = redactSecrets(raw)
+    .replace(/[A-Za-z]:[\\/][^\s"'<>|]*/gu, "[private path]")
+    .replace(/\\\\[^\s"'<>|]+/gu, "[private path]")
+    .replace(/\/(?:[^\s"'<>|/]+\/)+[^\s"'<>|/]*/gu, "[private path]")
+    .replace(/~\/[^\s"'<>|]*/gu, "[private path]")
+    .slice(0, 512);
+  if (error instanceof SkillMarketError) {
+    const code = error.code === "SOURCE_NOT_FOUND" || error.code === "ENTRY_NOT_FOUND"
+      || error.code === "PREVIEW_NOT_FOUND" || error.code === "INSTALL_PLAN_NOT_FOUND"
+      ? Code.NotFound
+      : error.code === "SOURCE_CHANGED" || error.code === "CATALOG_CHANGED"
+        || error.code === "PREVIEW_CHANGED" || error.code === "INSTALL_PLAN_CHANGED" || error.code === "MUTATION_BUSY"
+        ? Code.Aborted
+        : error.code === "SOURCE_GIT_UNAVAILABLE" || error.code === "SOURCE_GIT_REF_NOT_FOUND"
+          ? Code.FailedPrecondition
+          : error.code === "SOURCE_GIT_AUTH_FAILED"
+            ? Code.PermissionDenied
+            : Code.InvalidArgument;
+    return new ConnectError(message, code);
+  }
+  const code = /does not exist|not found/iu.test(message) ? Code.NotFound
+    : /changed|stale|authority|concurrent|expired|fenced|being changed/iu.test(message) ? Code.Aborted
+      : /too many|limit|exceeds|capacity/iu.test(message) ? Code.ResourceExhausted
+        : /invalid|required|must|confirmation|only|cannot/iu.test(message) ? Code.InvalidArgument
+          : Code.FailedPrecondition;
+  return new ConnectError(message, code);
+}
+
+function collaborationEffectSync<T>(effect: () => T): T {
+  try {
+    return effect();
+  } catch (error) {
+    if (error instanceof ConnectError) throw error;
+    const message = redactSecrets(error instanceof Error ? error.message : "Collaboration operation failed.").slice(0, 512);
+    if (error instanceof CollaborationError) {
+      const code = error.code === "COLLABORATION_SCOPE_NOT_FOUND" ? Code.NotFound
+        : error.code === "COLLABORATION_CHANGED" ? Code.Aborted
+          : error.code === "COLLABORATION_PERMISSION_DENIED" ? Code.PermissionDenied
+            : error.code === "COLLABORATION_UNAVAILABLE" || error.code === "COLLABORATION_SCOPE_IN_USE" ? Code.FailedPrecondition
+              : Code.InvalidArgument;
+      throw new ConnectError(message, code);
+    }
+    throw new ConnectError(message, Code.FailedPrecondition);
+  }
+}
+
+function nativeSkillMarketSource(value: contract.SkillMarketSourceLocation | undefined): NativeSkillMarketSourceInput {
+  if (value === undefined || value.kind.case === undefined) throw invalidArgument("source is required");
+  if (value.kind.case === "local") {
+    return { kind: "local", path: nonBlankRequest(value.kind.value.serverPath, "source.local.server_path") };
+  }
+  if (value.kind.case === "git") {
+    return {
+      kind: "git",
+      repositoryUrl: nonBlankRequest(value.kind.value.repositoryUrl, "source.git.repository_url"),
+      ...(value.kind.value.ref === undefined ? {} : { ref: value.kind.value.ref }),
+      sparsePaths: [...value.kind.value.sparsePaths]
+    };
+  }
+  throw invalidArgument("source kind is invalid");
+}
+
+function nativeSkillMarketIdentity(value: contract.SkillMarketEntryIdentity | undefined): NativeSkillMarketEntryIdentity {
+  if (value === undefined || value.sourceRevision === undefined || value.entryRevision === undefined) {
+    throw invalidArgument("Skill market entry identity and revisions are required");
+  }
+  return {
+    sourceId: nonBlankRequest(value.sourceId, "identity.source_id"),
+    sourceRevision: fromProtoRevision(value.sourceRevision, "identity.source_revision"),
+    entryId: nonBlankRequest(value.entryId, "identity.entry_id"),
+    entryRevision: fromProtoRevision(value.entryRevision, "identity.entry_revision"),
+    contentRevision: nonBlankRequest(value.contentRevision, "identity.content_revision")
+  };
+}
+
+function nativeSkillMarketInstallTarget(value: contract.SkillMarketInstallTarget | undefined): PiMarketSkillTargetInput {
+  if (value === undefined) throw invalidArgument("target is required");
+  const backendId = nonBlankRequest(value.backendId, "target.backend_id");
+  if (value.scope === contract.ResourceScope.GLOBAL) {
+    if (value.targetId !== undefined || value.relativeParent !== undefined) {
+      throw invalidArgument("global target cannot include project fields");
+    }
+    return { backendId, scope: "global" };
+  }
+  if (value.scope === contract.ResourceScope.PROJECT) {
+    return {
+      backendId,
+      scope: "project",
+      targetId: nonBlankRequest(value.targetId ?? "", "target.target_id"),
+      ...(value.relativeParent === undefined ? {} : { relativeParent: value.relativeParent })
+    };
+  }
+  throw invalidArgument("target.scope must be GLOBAL or PROJECT");
+}
+
+function nativeSkillMarketSort(value: contract.SkillMarketSort): "trending" | "downloads" | "updated" | "created" {
+  switch (value) {
+    case contract.SkillMarketSort.TRENDING: return "trending";
+    case contract.SkillMarketSort.DOWNLOADS: return "downloads";
+    case contract.SkillMarketSort.UPDATED: return "updated";
+    case contract.SkillMarketSort.CREATED: return "created";
+    default: throw invalidArgument("sort is required");
+  }
+}
+
+function mapSkillMarketSource(value: NativeSkillMarketSourceDescriptor): contract.SkillMarketSourceDescriptor {
+  return create(contract.SkillMarketSourceDescriptorSchema, {
+    sourceId: value.id,
+    revision: toProtoRevision(value.revision),
+    kind: value.kind === "local" ? contract.SkillMarketSourceKind.LOCAL : contract.SkillMarketSourceKind.GIT,
+    display: value.display,
+    name: value.name,
+    ...(value.displayName === undefined ? {} : { displayName: value.displayName }),
+    state: value.state === "ready" ? contract.SkillMarketSourceState.READY : contract.SkillMarketSourceState.ERROR,
+    contentRevision: value.contentRevision,
+    entryCount: value.entryCount,
+    addedAt: toProtoTimestamp(value.addedAt),
+    ...(value.refreshedAt === undefined ? {} : { refreshedAt: toProtoTimestamp(value.refreshedAt) }),
+    ...(value.error === undefined ? {} : { error: value.error })
+  });
+}
+
+function mapSkillMarketIdentity(value: NativeSkillMarketCatalogItem): contract.SkillMarketEntryIdentity {
+  return create(contract.SkillMarketEntryIdentitySchema, {
+    sourceId: value.sourceId,
+    sourceRevision: toProtoRevision(value.sourceRevision),
+    entryId: value.id,
+    entryRevision: toProtoRevision(value.revision),
+    contentRevision: value.contentRevision
+  });
+}
+
+function mapSkillMarketEntry(value: NativeSkillMarketCatalogItem): contract.SkillMarketEntry {
+  return create(contract.SkillMarketEntrySchema, {
+    identity: mapSkillMarketIdentity(value),
+    slug: value.slug,
+    name: value.name,
+    ...(value.author === undefined ? {} : { author: value.author }),
+    description: value.description,
+    ...(value.category === undefined ? {} : { category: value.category }),
+    tags: [...value.tags],
+    version: value.version,
+    ...(value.changelog === undefined ? {} : { changelog: value.changelog }),
+    createdAt: toProtoTimestamp(value.createdAt),
+    updatedAt: toProtoTimestamp(value.updatedAt),
+    downloads: BigInt(value.downloads),
+    trendScore: value.trendScore,
+    archiveBytes: BigInt(value.archiveBytes),
+    sourceName: value.sourceName,
+    ...(value.sourceDisplayName === undefined ? {} : { sourceDisplayName: value.sourceDisplayName }),
+    sourceState: value.sourceState === "ready" ? contract.SkillMarketSourceState.READY : contract.SkillMarketSourceState.ERROR,
+    ...(value.sourceError === undefined ? {} : { sourceError: value.sourceError }),
+    installStatuses: value.installStatuses.map((status) => create(contract.SkillMarketInstallStatusSchema, {
+      resourceId: status.resourceId,
+      resourceRevision: toProtoRevision(status.resourceRevision),
+      backendId: status.backendId,
+      ...(status.targetId === undefined ? {} : { targetId: status.targetId }),
+      scope: status.scope === "project" ? contract.ResourceScope.PROJECT : contract.ResourceScope.GLOBAL,
+      ...(status.relativeParent === undefined ? {} : { relativeParent: status.relativeParent }),
+      state: status.state === "installed"
+        ? contract.SkillMarketInstallStatusState.INSTALLED
+        : status.state === "update_available"
+          ? contract.SkillMarketInstallStatusState.UPDATE_AVAILABLE
+          : contract.SkillMarketInstallStatusState.CONFLICT,
+      ...(status.installedVersion === undefined ? {} : { installedVersion: status.installedVersion })
+    })),
+    access: mapSkillAccessPolicy(value.access),
+    canManage: value.canManage
+  });
+}
+
+function mapSkillAccessPolicy(value: NativeSkillAccessPolicy): contract.SkillAccessPolicy {
+  return create(contract.SkillAccessPolicySchema, {
+    revision: toProtoRevision(value.revision),
+    publisher: create(contract.SkillAccessPublisherSchema, {
+      kind: value.publisher.kind === "personal" ? contract.SkillPublicationPublisher.PERSONAL
+        : value.publisher.kind === "team" ? contract.SkillPublicationPublisher.TEAM
+          : contract.SkillPublicationPublisher.EXTERNAL,
+      ...(value.publisher.kind === "personal" ? { actorId: value.publisher.actorId }
+        : value.publisher.kind === "team" ? { scopeId: value.publisher.scopeId }
+          : { sourceId: value.publisher.sourceId })
+    }),
+    visibility: protoSkillPublicationVisibility(value.visibility),
+    audienceScopeIds: [...value.audienceScopeIds]
+  });
+}
+
+function mapSkillMarketArchiveEntry(value: NativeSkillMarketArchiveEntry): contract.SkillMarketArchiveEntry {
+  return create(contract.SkillMarketArchiveEntrySchema, {
+    key: value.key,
+    kind: value.kind === "directory" ? contract.SkillFileKind.DIRECTORY : contract.SkillFileKind.FILE,
+    size: BigInt(value.size)
+  });
+}
+
+function mapSkillMarketPreview(value: NativeSkillMarketPreview): contract.SkillMarketPreview {
+  return create(contract.SkillMarketPreviewSchema, {
+    previewId: value.id,
+    entry: mapSkillMarketEntry(value.entry),
+    snapshotRevision: value.snapshotRevision,
+    files: BigInt(value.files),
+    bytes: BigInt(value.bytes),
+    expiresAt: toProtoTimestamp(value.expiresAt)
+  });
+}
+
+function mapSkillMarketPreviewFile(value: NativeSkillMarketPreviewFile): contract.SkillMarketPreviewFile {
+  return create(contract.SkillMarketPreviewFileSchema, {
+    previewId: value.previewId,
+    snapshotRevision: value.snapshotRevision,
+    key: value.key,
+    size: BigInt(value.size),
+    previewable: value.previewable,
+    ...(value.content === undefined ? {} : { content: value.content }),
+    ...(value.unavailableReason === undefined
+      ? {}
+      : {
+          unavailableReason: value.unavailableReason === "BINARY"
+            ? contract.SkillMarketPreviewUnavailableReason.BINARY
+            : contract.SkillMarketPreviewUnavailableReason.TOO_LARGE
+        })
+  });
+}
+
+function mapSkillMarketInstallTarget(value: NativeSkillMarketInstallPlan["target"]): contract.SkillMarketInstallTarget {
+  return create(contract.SkillMarketInstallTargetSchema, {
+    backendId: value.backendId,
+    scope: value.scope === "global" ? contract.ResourceScope.GLOBAL : contract.ResourceScope.PROJECT,
+    ...(value.targetId === undefined ? {} : { targetId: value.targetId }),
+    ...(value.relativeParent === undefined ? {} : { relativeParent: value.relativeParent })
+  });
+}
+
+function mapSkillMarketInstallPlan(value: NativeSkillMarketInstallPlan): contract.SkillMarketInstallPlan {
+  const preview = value.resourcePreview;
+  return create(contract.SkillMarketInstallPlanSchema, {
+    planId: value.id,
+    entry: mapSkillMarketEntry(value.entry),
+    target: mapSkillMarketInstallTarget(value.target),
+    preview: create(contract.SkillMarketInstallPreviewSchema, {
+      action: preview.action === "install" ? contract.SkillMarketInstallAction.INSTALL
+        : preview.action === "update" ? contract.SkillMarketInstallAction.UPDATE : contract.SkillMarketInstallAction.REPLACE,
+      resourceId: preview.resourceId,
+      target: mapSkillMarketInstallTarget(value.target),
+      name: preview.name,
+      availableVersion: preview.availableVersion,
+      candidateRevision: preview.candidateRevision,
+      files: BigInt(preview.files),
+      bytes: BigInt(preview.bytes),
+      ...(preview.currentResource === undefined
+        ? {}
+        : {
+            currentResource: create(contract.SkillMarketCurrentResourceSchema, {
+              resourceId: preview.currentResource.resourceId,
+              resourceRevision: toProtoRevision(preview.currentResource.resourceVersion),
+              name: preview.currentResource.name,
+              ...(preview.currentResource.version === undefined ? {} : { version: preview.currentResource.version }),
+              sourceKind: protoResourceAcquisitionKind(preview.currentResource.sourceKind),
+              sourceDisplay: preview.currentResource.sourceDisplay,
+              discoveredRevision: preview.currentResource.discoveredRevision,
+              observedRevision: preview.currentResource.observedRevision,
+              dirty: preview.currentResource.dirty
+            })
+          }),
+      unregisteredDestination: preview.unregisteredDestination,
+      sourceReplacement: preview.sourceReplacement,
+      preservesEnabled: preview.preservesEnabled,
+      diffAvailable: preview.diffAvailable,
+      ...(preview.diffReason === undefined ? {} : { diffReason: preview.diffReason }),
+      changes: preview.changes.map(mapSkillDiffChange),
+      diffTruncated: preview.diffTruncated
+    }),
+    confirmationReasons: value.confirmationReasons.map((reason) => {
+      switch (reason) {
+        case "SOURCE_REPLACEMENT": return contract.SkillMarketInstallConfirmationReason.SOURCE_REPLACEMENT;
+        case "LOCAL_OWNERSHIP": return contract.SkillMarketInstallConfirmationReason.LOCAL_OWNERSHIP;
+        case "DIRTY_CONTENT": return contract.SkillMarketInstallConfirmationReason.DIRTY_CONTENT;
+        case "UNREGISTERED_DESTINATION": return contract.SkillMarketInstallConfirmationReason.UNREGISTERED_DESTINATION;
+        case "DOWNGRADE": return contract.SkillMarketInstallConfirmationReason.DOWNGRADE;
+      }
+    }),
+    requiresConfirmation: value.requiresConfirmation,
+    expiresAt: toProtoTimestamp(value.expiresAt)
+  });
+}
+
+function mapSkillMarketSyncTarget(value: NativeSkillMarketSyncTarget): contract.SkillMarketSyncTarget {
+  return create(contract.SkillMarketSyncTargetSchema, {
+    backendId: value.backendId,
+    scope: value.scope === "global" ? contract.ResourceScope.GLOBAL : contract.ResourceScope.PROJECT,
+    ...(value.targetId === undefined ? {} : { targetId: value.targetId }),
+    ...(value.relativeParent === undefined ? {} : { relativeParent: value.relativeParent }),
+    ...(value.targetRevision === undefined ? {} : { targetRevision: toProtoRevision(value.targetRevision) })
+  });
+}
+
+function mapSkillMarketSyncBaseline(value: NativeSkillMarketSyncBaseline): contract.SkillMarketSyncBaseline {
+  return create(contract.SkillMarketSyncBaselineSchema, {
+    resourceRevision: toProtoRevision(value.resourceVersion),
+    resourceContentRevision: value.resourceContentRevision,
+    installedContentRevision: value.installedContentRevision,
+    installedVersion: value.installedVersion,
+    sourceRevision: toProtoRevision(value.sourceRevision),
+    entryRevision: toProtoRevision(value.entryRevision),
+    entryContentRevision: value.entryContentRevision
+  });
+}
+
+function mapSkillMarketSyncPolicy(value: NativeSkillMarketSyncPolicy): contract.SkillMarketSyncPolicy {
+  return create(contract.SkillMarketSyncPolicySchema, {
+    resourceId: value.resourceId,
+    revision: toProtoRevision(value.revision),
+    enabled: value.enabled,
+    sourceId: value.sourceId,
+    entryId: value.entryId,
+    target: mapSkillMarketSyncTarget(value.target),
+    baseline: mapSkillMarketSyncBaseline(value.baseline),
+    createdAt: toProtoTimestamp(value.createdAt),
+    updatedAt: toProtoTimestamp(value.updatedAt),
+    ...(value.disabledReason === undefined ? {} : { disabledReason: value.disabledReason })
+  });
+}
+
+function mapSkillMarketSyncAuthority(value: NativeSkillMarketSyncJobAuthority): contract.SkillMarketSyncJobAuthority {
+  return create(contract.SkillMarketSyncJobAuthoritySchema, {
+    sourceId: value.sourceId,
+    entryId: value.entryId,
+    target: mapSkillMarketSyncTarget(value.target),
+    baseline: mapSkillMarketSyncBaseline(value.baseline)
+  });
+}
+
+function mapSkillMarketSyncJob(value: NativeSkillMarketSyncJob): contract.SkillMarketSyncJob {
+  return create(contract.SkillMarketSyncJobSchema, {
+    jobId: value.id,
+    revision: toProtoRevision(value.revision),
+    state: protoSkillMarketSyncJobState(value.state),
+    policyResourceId: value.policyResourceId,
+    policyRevision: toProtoRevision(value.policyRevision),
+    authority: mapSkillMarketSyncAuthority(value.authority),
+    attempt: value.attempt,
+    ...(value.retryOfJobId === undefined ? {} : { retryOfJobId: value.retryOfJobId }),
+    ...(value.availableVersion === undefined ? {} : { availableVersion: value.availableVersion }),
+    ...(value.outcome === undefined ? {} : { outcome: protoSkillMarketSyncOutcome(value.outcome) }),
+    ...(value.error === undefined ? {} : { error: value.error }),
+    createdAt: toProtoTimestamp(value.createdAt),
+    updatedAt: toProtoTimestamp(value.updatedAt),
+    ...(value.completedAt === undefined ? {} : { completedAt: toProtoTimestamp(value.completedAt) })
+  });
+}
+
+function protoSkillMarketSyncJobState(value: NativeSkillMarketSyncJob["state"]): contract.SkillMarketSyncJobState {
+  switch (value) {
+    case "pending_revalidation": return contract.SkillMarketSyncJobState.PENDING_REVALIDATION;
+    case "running": return contract.SkillMarketSyncJobState.RUNNING;
+    case "cancelling": return contract.SkillMarketSyncJobState.CANCELLING;
+    case "succeeded": return contract.SkillMarketSyncJobState.SUCCEEDED;
+    case "up_to_date": return contract.SkillMarketSyncJobState.UP_TO_DATE;
+    case "blocked": return contract.SkillMarketSyncJobState.BLOCKED;
+    case "failed": return contract.SkillMarketSyncJobState.FAILED;
+    case "cancelled": return contract.SkillMarketSyncJobState.CANCELLED;
+  }
+}
+
+function protoSkillMarketSyncOutcome(value: NonNullable<NativeSkillMarketSyncJob["outcome"]>): contract.SkillMarketSyncOutcome {
+  switch (value) {
+    case "UPDATED": return contract.SkillMarketSyncOutcome.UPDATED;
+    case "ALREADY_CURRENT": return contract.SkillMarketSyncOutcome.ALREADY_CURRENT;
+    case "DOWNGRADE_BLOCKED": return contract.SkillMarketSyncOutcome.DOWNGRADE_BLOCKED;
+    case "DIRTY_CONTENT": return contract.SkillMarketSyncOutcome.DIRTY_CONTENT;
+    case "OWNER_CHANGED": return contract.SkillMarketSyncOutcome.OWNER_CHANGED;
+    case "TARGET_CHANGED": return contract.SkillMarketSyncOutcome.TARGET_CHANGED;
+    case "RESOURCE_REMOVED": return contract.SkillMarketSyncOutcome.RESOURCE_REMOVED;
+    case "CANCELLED": return contract.SkillMarketSyncOutcome.CANCELLED;
+  }
+}
+
+function nativeSkillPublicationMetadata(value: contract.SkillPublicationMetadata | undefined): NativeSkillPublicationMetadata {
+  if (value === undefined) throw invalidArgument("metadata is required");
+  return {
+    slug: value.slug,
+    name: value.name,
+    ...(value.author === undefined ? {} : { author: value.author }),
+    description: value.description,
+    ...(value.category === undefined ? {} : { category: value.category }),
+    tags: [...value.tags],
+    version: value.version,
+    ...(value.changelog === undefined ? {} : { changelog: value.changelog })
+  };
+}
+
+function nativeSkillPublicationPublisher(value: contract.SkillPublicationPublisher): "personal" | "team" {
+  if (value === contract.SkillPublicationPublisher.PERSONAL) return "personal";
+  if (value === contract.SkillPublicationPublisher.TEAM) return "team";
+  throw invalidArgument("publisher must be PERSONAL or TEAM");
+}
+
+function nativeCollaborationScopeKind(value: contract.CollaborationScopeKind): "team" | "department" {
+  if (value === contract.CollaborationScopeKind.TEAM) return "team";
+  if (value === contract.CollaborationScopeKind.DEPARTMENT) return "department";
+  throw invalidArgument("collaboration scope kind is required");
+}
+
+function nativeSkillPublicationVisibility(value: contract.SkillPublicationVisibility): "public" | "department" | "private" {
+  if (value === contract.SkillPublicationVisibility.PUBLIC) return "public";
+  if (value === contract.SkillPublicationVisibility.DEPARTMENT) return "department";
+  if (value === contract.SkillPublicationVisibility.PRIVATE) return "private";
+  throw invalidArgument("visibility is required");
+}
+
+function protoSkillPublicationVisibility(value: "public" | "department" | "private"): contract.SkillPublicationVisibility {
+  return value === "public" ? contract.SkillPublicationVisibility.PUBLIC
+    : value === "department" ? contract.SkillPublicationVisibility.DEPARTMENT
+      : contract.SkillPublicationVisibility.PRIVATE;
+}
+
+function mapSkillPublicationMetadata(value: NativeSkillPublicationMetadata): contract.SkillPublicationMetadata {
+  return create(contract.SkillPublicationMetadataSchema, {
+    slug: value.slug,
+    name: value.name,
+    ...(value.author === undefined ? {} : { author: value.author }),
+    description: value.description,
+    ...(value.category === undefined ? {} : { category: value.category }),
+    tags: [...value.tags],
+    version: value.version,
+    ...(value.changelog === undefined ? {} : { changelog: value.changelog })
+  });
+}
+
+function mapSkillPublicationAuthority(value: NativeSkillPublicationAuthority): contract.SkillPublicationAuthority {
+  return create(contract.SkillPublicationAuthoritySchema, {
+    resourceId: value.resourceId,
+    resourceRevision: toProtoRevision(value.resourceRevision),
+    observedRevision: value.observedRevision,
+    backendId: value.backendId,
+    ...(value.targetId === undefined ? {} : { targetId: value.targetId }),
+    scope: value.scope === "project" ? contract.ResourceScope.PROJECT : contract.ResourceScope.GLOBAL,
+    sourceId: value.sourceId,
+    sourceRevision: toProtoRevision(value.sourceRevision),
+    sourceContentRevision: value.sourceContentRevision,
+    sourceDisplay: value.sourceDisplay,
+    ...(value.existingEntryId === undefined ? {} : { existingEntryId: value.existingEntryId })
+  });
+}
+
+function mapSkillPublicationGate(value: NativeSkillPublicationGate): contract.SkillPublicationGate {
+  return create(contract.SkillPublicationGateSchema, {
+    gateId: value.id,
+    label: value.label,
+    status: value.status === "pending" ? contract.SkillPublicationGateStatus.PENDING
+      : value.status === "passed" ? contract.SkillPublicationGateStatus.PASSED
+        : contract.SkillPublicationGateStatus.BLOCKED,
+    issues: value.issues.map((issue) => create(contract.SkillPublicationGateIssueSchema, {
+      code: issue.code,
+      message: issue.message,
+      ...(issue.path === undefined ? {} : { path: issue.path })
+    }))
+  });
+}
+
+function mapSkillPublicationResult(value: NativeSkillPublicationResult): contract.SkillPublicationResult {
+  return create(contract.SkillPublicationResultSchema, {
+    sourceId: value.sourceId,
+    sourceRevision: toProtoRevision(value.sourceRevision),
+    entryId: value.entryId,
+    entryRevision: toProtoRevision(value.entryRevision),
+    entryContentRevision: value.entryContentRevision,
+    version: value.version
+  });
+}
+
+function mapSkillPublicationJob(value: NativeSkillPublicationJob): contract.SkillPublicationJob {
+  return create(contract.SkillPublicationJobSchema, {
+    jobId: value.id,
+    revision: toProtoRevision(value.revision),
+    state: protoSkillPublicationState(value.state),
+    authority: mapSkillPublicationAuthority(value.authority),
+    metadata: mapSkillPublicationMetadata(value.metadata),
+    publisher: value.publisher === "team" ? contract.SkillPublicationPublisher.TEAM : contract.SkillPublicationPublisher.PERSONAL,
+    visibility: protoSkillPublicationVisibility(value.visibility),
+    gates: value.gates.map(mapSkillPublicationGate),
+    verdict: value.verdict === "pending" ? contract.SkillPublicationVerdict.PENDING
+      : value.verdict === "passed" ? contract.SkillPublicationVerdict.PASSED
+        : contract.SkillPublicationVerdict.BLOCKED,
+    files: BigInt(value.files),
+    uncompressedBytes: BigInt(value.uncompressedBytes),
+    archiveBytes: BigInt(value.archiveBytes),
+    attempt: value.attempt,
+    ...(value.retryOfJobId === undefined ? {} : { retryOfJobId: value.retryOfJobId }),
+    ...(value.result === undefined ? {} : { result: mapSkillPublicationResult(value.result) }),
+    createdAt: toProtoTimestamp(value.createdAt),
+    updatedAt: toProtoTimestamp(value.updatedAt),
+    ...(value.completedAt === undefined ? {} : { completedAt: toProtoTimestamp(value.completedAt) }),
+    ...(value.error === undefined ? {} : { error: value.error }),
+    cancellable: value.cancellable,
+    ...(value.publisherScopeId === undefined ? {} : { publisherScopeId: value.publisherScopeId }),
+    audienceScopeIds: [...value.audienceScopeIds],
+    accessRevision: toProtoRevision(value.accessRevision)
+  });
+}
+
+function mapCollaborationScope(value: NativeCollaborationScope): contract.CollaborationScope {
+  return create(contract.CollaborationScopeSchema, {
+    scopeId: value.id,
+    revision: toProtoRevision(value.revision),
+    kind: value.kind === "team" ? contract.CollaborationScopeKind.TEAM : contract.CollaborationScopeKind.DEPARTMENT,
+    name: value.name,
+    members: value.members.map((member) => create(contract.CollaborationMembershipSchema, {
+      actorId: member.actorId,
+      role: member.role === "viewer" ? contract.CollaborationRole.VIEWER
+        : member.role === "publisher" ? contract.CollaborationRole.PUBLISHER
+          : contract.CollaborationRole.ADMINISTRATOR
+    }))
+  });
+}
+
+function mapCollaborationDirectory(value: NativeCollaborationDirectory): contract.CollaborationDirectory {
+  return create(contract.CollaborationDirectorySchema, {
+    available: value.available,
+    revision: toProtoRevision(value.revision),
+    ...(value.actor === undefined ? {} : {
+      actor: create(contract.CollaborationActorSchema, {
+        actorId: value.actor.id,
+        displayName: value.actor.displayName
+      })
+    }),
+    scopes: value.scopes.map(mapCollaborationScope),
+    recoveredFromCorruption: value.recoveredFromCorruption,
+    ...(value.unavailableReason === undefined ? {} : { unavailableReason: value.unavailableReason })
+  });
+}
+
+function mapResourceUsageSource(
+  value: import("@joko/core").ResourceUsageSource
+): contract.ResourceUsageSource {
+  switch (value) {
+    case "structured_resource_mention": return contract.ResourceUsageSource.STRUCTURED_RESOURCE_MENTION;
+    case "native_skill_command": return contract.ResourceUsageSource.NATIVE_SKILL_COMMAND;
+    case "runtime_confirmed_resource_load": return contract.ResourceUsageSource.RUNTIME_CONFIRMED_RESOURCE_LOAD;
+    case "exact_file_read": return contract.ResourceUsageSource.EXACT_FILE_READ;
+    case "runtime_tool_call": return contract.ResourceUsageSource.RUNTIME_TOOL_CALL;
+  }
+}
+
+function mapResourceUsageMetrics(
+  value: import("@joko/store").ResourceUsageMetrics
+): contract.ResourceUsageMetrics {
+  return create(contract.ResourceUsageMetricsSchema, {
+    samples: BigInt(value.samples),
+    strongActive: BigInt(value.strongActive),
+    semiActive: BigInt(value.semiActive),
+    passiveExposures: BigInt(value.passiveExposures),
+    reads: BigInt(value.reads),
+    rereads: BigInt(value.rereads),
+    toolCalls: BigInt(value.toolCalls),
+    toolErrors: BigInt(value.toolErrors),
+    commands: BigInt(value.commands),
+    commandFailures: BigInt(value.commandFailures),
+    ...(value.latestUsedAt === undefined ? {} : { latestUsedAt: toProtoTimestamp(value.latestUsedAt) })
+  });
+}
+
+function mapResourceUsageVersion(
+  value: import("@joko/store").ResourceUsageVersionBreakdown
+): contract.ResourceUsageVersionBreakdown {
+  return create(contract.ResourceUsageVersionBreakdownSchema, {
+    identity: create(contract.ResourceUsageVersionIdentitySchema, {
+      resourceRevision: toProtoRevision(BigInt(value.identity.entityRevision)),
+      contentRevision: value.identity.contentRevision,
+      version: value.identity.version
+    }),
+    metrics: mapResourceUsageMetrics(value.metrics),
+    ...(value.firstUsedAt === undefined ? {} : { firstUsedAt: toProtoTimestamp(value.firstUsedAt) })
+  });
+}
+
+function mapResourceUsageComparisonReason(
+  value: NonNullable<import("@joko/store").ResourceUsageVersionComparison["unavailableReason"]>
+): contract.ResourceUsageComparisonUnavailableReason {
+  switch (value) {
+    case "no_current_version": return contract.ResourceUsageComparisonUnavailableReason.NO_CURRENT_VERSION;
+    case "no_previous_version": return contract.ResourceUsageComparisonUnavailableReason.NO_PREVIOUS_VERSION;
+    case "current_samples": return contract.ResourceUsageComparisonUnavailableReason.CURRENT_SAMPLES;
+    case "previous_samples": return contract.ResourceUsageComparisonUnavailableReason.PREVIOUS_SAMPLES;
+  }
+}
+
+function mapResourceUsageReport(
+  value: import("@joko/store").ResourceUsageReport
+): contract.ResourceUsageReport {
+  return create(contract.ResourceUsageReportSchema, {
+    resourceId: value.resourceId,
+    timeZone: value.timeZone,
+    fromDay: value.fromDay,
+    throughDay: value.throughDay,
+    days: value.days.map((day) => create(contract.ResourceUsageDaySchema, {
+      localDay: day.localDay,
+      metrics: mapResourceUsageMetrics(day.metrics)
+    })),
+    totals: mapResourceUsageMetrics(value.totals),
+    sources: value.sources.map((source) => create(contract.ResourceUsageSourceBreakdownSchema, {
+      source: mapResourceUsageSource(source.source),
+      metrics: mapResourceUsageMetrics(source.metrics)
+    })),
+    agents: value.agents.map((agent) => create(contract.ResourceUsageAgentBreakdownSchema, {
+      backendId: agent.backendId,
+      metrics: mapResourceUsageMetrics(agent.metrics)
+    })),
+    versions: value.versions.map(mapResourceUsageVersion),
+    comparison: create(contract.ResourceUsageVersionComparisonSchema, {
+      available: value.comparison.available,
+      minimumSamples: value.comparison.minimumSamples,
+      ...(value.comparison.unavailableReason === undefined ? {} : {
+        unavailableReason: mapResourceUsageComparisonReason(value.comparison.unavailableReason)
+      }),
+      ...(value.comparison.current === undefined ? {} : { current: mapResourceUsageVersion(value.comparison.current) }),
+      ...(value.comparison.previous === undefined ? {} : { previous: mapResourceUsageVersion(value.comparison.previous) })
+    }),
+    projection: create(contract.ResourceUsageProjectionStatusSchema, {
+      complete: value.projection.complete,
+      streamCount: value.projection.streamCount,
+      pendingStreamCount: value.projection.pendingStreamCount,
+      ...(value.projection.lastProjectedAt === undefined ? {} : {
+        lastProjectedAt: toProtoTimestamp(value.projection.lastProjectedAt)
+      }),
+      failures: value.projection.failures.map((failure) => create(contract.ResourceUsageProjectionFailureSchema, {
+        sessionId: failure.sessionId,
+        source: mapResourceUsageSource(failure.source),
+        attempts: failure.attempts,
+        retryAt: toProtoTimestamp(failure.retryAt),
+        errorCode: failure.errorCode
+      }))
+    })
+  });
+}
+
+function protoSkillPublicationState(value: NativeSkillPublicationJob["state"]): contract.SkillPublicationState {
+  switch (value) {
+    case "pending": return contract.SkillPublicationState.PENDING;
+    case "snapshotting": return contract.SkillPublicationState.SNAPSHOTTING;
+    case "packaging": return contract.SkillPublicationState.PACKAGING;
+    case "scanning": return contract.SkillPublicationState.SCANNING;
+    case "committing": return contract.SkillPublicationState.COMMITTING;
+    case "reconciling": return contract.SkillPublicationState.RECONCILING;
+    case "cancelling": return contract.SkillPublicationState.CANCELLING;
+    case "published": return contract.SkillPublicationState.PUBLISHED;
+    case "blocked": return contract.SkillPublicationState.BLOCKED;
+    case "failed": return contract.SkillPublicationState.FAILED;
+    case "cancelled": return contract.SkillPublicationState.CANCELLED;
+  }
+}
+
+function mapSkillPublicationPreview(value: NativeSkillPublicationPreview): contract.SkillPublicationPreview {
+  return create(contract.SkillPublicationPreviewSchema, {
+    authority: mapSkillPublicationAuthority(value.authority),
+    source: mapSkillMarketSource(value.source),
+    mode: value.mode === "first" ? contract.SkillPublicationMode.FIRST : contract.SkillPublicationMode.VERSION,
+    suggestedSlug: value.suggestedSlug,
+    suggestedVersion: value.suggestedVersion,
+    ...(value.existingEntry === undefined ? {} : { existingEntry: mapSkillMarketEntry(value.existingEntry) }),
+    dirty: value.dirty,
+    personalPublisherAvailable: value.personalPublisherAvailable,
+    teamPublisherAvailable: value.teamPublisherAvailable,
+    publicVisibilityAvailable: value.publicVisibilityAvailable,
+    departmentVisibilityAvailable: value.departmentVisibilityAvailable,
+    privateVisibilityAvailable: value.privateVisibilityAvailable,
+    collaborationUnavailableReason: value.collaborationUnavailableReason ?? "",
+    collaborationRevision: toProtoRevision(value.collaborationRevision)
+  });
+}
+
+function nativeSkillScope(value: contract.ResourceScope): NativeSkillCatalogEntry["scope"] {
+  if (value === contract.ResourceScope.GLOBAL || value === contract.ResourceScope.MANAGED || value === contract.ResourceScope.USER) return "global";
+  if (value === contract.ResourceScope.PROJECT) return "project";
+  throw invalidArgument("scope is invalid for Skill management");
+}
+
+function mapSkillDescriptor(item: NativeSkillCatalogEntry): contract.SkillDescriptor {
+  return create(contract.SkillDescriptorSchema, {
+    skillId: item.id,
+    backendId: item.backendId,
+    targetId: item.targetId ?? "",
+    scope: item.scope === "project" ? contract.ResourceScope.PROJECT : contract.ResourceScope.GLOBAL,
+    name: item.name,
+    sourceLabel: item.sourceLabel,
+    state: protoResourceState(item.state),
+    enabled: item.enabled,
+    canToggle: item.canToggle,
+    contentAvailable: item.contentAvailable,
+    canEdit: item.canEdit,
+    canDelete: item.canDelete,
+    entityVersion: toProtoEntityVersion(item.resourceVersion, 0, item.updatedAt),
+    approvedRevision: item.approvedRevision,
+    updatedAt: toProtoTimestamp(item.updatedAt)
+  });
+}
+
+function mapSkillFileEntry(item: NativeSkillFileEntry): contract.SkillFileEntry {
+  return create(contract.SkillFileEntrySchema, {
+    key: item.key,
+    name: item.name,
+    kind: item.kind === "directory" ? contract.SkillFileKind.DIRECTORY : contract.SkillFileKind.FILE,
+    size: BigInt(item.size),
+    editable: item.editable
+  });
+}
+
+function mapSkillFileContent(item: NativeSkillFileContent): contract.SkillFileContent {
+  return create(contract.SkillFileContentSchema, {
+    key: item.key,
+    content: item.content,
+    revision: item.revision,
+    size: BigInt(item.size),
+    editable: item.editable
+  });
+}
+
+function mapSkillDiff(item: NativeSkillDiff): contract.SkillDiff {
+  return create(contract.SkillDiffSchema, {
+    available: item.available,
+    reason: item.reason ?? "",
+    changes: item.changes.map(mapSkillDiffChange),
+    truncated: item.truncated
+  });
+}
+
+function mapSkillDiffChange(item: NativeSkillDiff["changes"][number]): contract.SkillDiffChange {
+  return create(contract.SkillDiffChangeSchema, {
+    key: item.key,
+    kind: item.kind === "added" ? contract.SkillDiffChangeKind.ADDED
+      : item.kind === "modified" ? contract.SkillDiffChangeKind.MODIFIED
+        : contract.SkillDiffChangeKind.DELETED,
+    binary: item.binary,
+    unifiedDiff: item.unifiedDiff ?? ""
+  });
+}
+
+function mapSkillSession(item: NativeSkillSessionDetails): contract.SkillSession {
+  return create(contract.SkillSessionSchema, {
+    sessionId: item.sessionId,
+    skill: mapSkillDescriptor(item.skill),
+    observedRevision: item.observedRevision,
+    dirty: item.dirty,
+    baselineAvailable: item.baselineAvailable,
+    metadata: create(contract.SkillMetadataSchema, {
+      name: item.metadata.name ?? "",
+      description: item.metadata.description ?? "",
+      version: item.metadata.version ?? "",
+      frontmatterJson: item.metadata.frontmatterJson,
+      parseError: item.metadata.parseError ?? ""
+    }),
+    fileCount: BigInt(item.fileCount),
+    bytes: BigInt(item.bytes),
+    diff: mapSkillDiff(item.diff),
+    expiresAt: toProtoTimestamp(item.expiresAt)
+  });
+}
+
+function mapSkillDraft(item: NativeSkillDraftPreview): contract.SkillDraft {
+  return create(contract.SkillDraftSchema, {
+    draftId: item.draftId,
+    sessionId: item.sessionId,
+    skillId: item.skillId,
+    kind: item.kind === "edit" ? contract.SkillDraftKind.EDIT : contract.SkillDraftKind.RENAME,
+    name: item.name,
+    resourceRevision: toProtoRevision(item.resourceVersion),
+    observedRevision: item.observedRevision,
+    changes: item.changes.map(mapSkillDiffChange),
+    expiresAt: toProtoTimestamp(item.expiresAt)
+  });
+}
+
+function mapSkillRecovery(item: NativeSkillRecoveryRecord): contract.SkillRecovery {
+  return create(contract.SkillRecoverySchema, {
+    recoveryId: item.id,
+    skillId: item.skillId,
+    backendId: item.backendId,
+    targetId: item.targetId ?? "",
+    scope: item.scope === "project" ? contract.ResourceScope.PROJECT : contract.ResourceScope.GLOBAL,
+    name: item.name,
+    revision: item.revision,
+    files: BigInt(item.files),
+    bytes: BigInt(item.bytes),
+    createdAt: toProtoTimestamp(item.createdAt),
+    status: item.status === "ready" ? contract.SkillRecoveryStatus.READY : contract.SkillRecoveryStatus.MISSING
+  });
+}
+
+function nativeExtensionLibraryDestination(
+  kind: contract.ExtensionLibraryLocationKind,
+  candidate: string | undefined,
+  allowUnspecified: false
+): { readonly kind: "default" } | { readonly kind: "custom"; readonly candidate: string };
+function nativeExtensionLibraryDestination(
+  kind: contract.ExtensionLibraryLocationKind,
+  candidate: string | undefined,
+  allowUnspecified: true
+): { readonly kind: "default" } | { readonly kind: "custom"; readonly candidate: string } | undefined;
+function nativeExtensionLibraryDestination(
+  kind: contract.ExtensionLibraryLocationKind,
+  candidate: string | undefined,
+  allowUnspecified: boolean
+): { readonly kind: "default" } | { readonly kind: "custom"; readonly candidate: string } | undefined {
+  if (kind === contract.ExtensionLibraryLocationKind.UNSPECIFIED && allowUnspecified) return undefined;
+  if (kind === contract.ExtensionLibraryLocationKind.DEFAULT) {
+    if (candidate !== undefined) throw invalidArgument("candidate must be absent for a default Library location");
+    return { kind: "default" };
+  }
+  if (kind === contract.ExtensionLibraryLocationKind.CUSTOM) {
+    return { kind: "custom", candidate: nonBlankRequest(candidate ?? "", "candidate") };
+  }
+  throw invalidArgument("destination_kind is unsupported");
+}
+
+async function extensionLibraryEffect<T>(action: () => T | Promise<T>): Promise<T> {
+  try {
+    return await action();
+  } catch (error) {
+    if (!(error instanceof ExtensionLibraryError)) throw error;
+    const code = error.code === "PATH_INVALID" || error.code === "SQL_REJECTED"
+      ? Code.InvalidArgument
+      : error.code === "NOT_FOUND"
+        ? Code.NotFound
+        : error.code === "ALREADY_EXISTS"
+          ? Code.AlreadyExists
+          : error.code === "TOO_LARGE" || error.code === "FILE_LIMIT" || error.code === "RESULT_LIMIT" || error.code === "DISK_FULL"
+            ? Code.ResourceExhausted
+            : error.code === "CONFLICT"
+              ? Code.Aborted
+              : error.code === "READ_ONLY" || error.code === "UNAVAILABLE" || error.code === "CORRUPT" || error.code === "SQL_FAILED"
+                ? Code.FailedPrecondition
+                : Code.Internal;
+    throw new ConnectError(redactSecrets(error.message), code);
+  }
+}
+
+function mapExtensionLibraryLocation(location: {
+  readonly kind: "default" | "custom";
+  readonly path: string;
+  readonly generation: bigint;
+}): contract.ExtensionLibraryLocation {
+  return create(contract.ExtensionLibraryLocationSchema, {
+    kind: location.kind === "default"
+      ? contract.ExtensionLibraryLocationKind.DEFAULT
+      : contract.ExtensionLibraryLocationKind.CUSTOM,
+    path: location.path,
+    generation: toProtoRevision(location.generation)
+  });
+}
+
+function mapExtensionLibraryOverview(item: NativeExtensionLibraryOverview): contract.ExtensionLibraryOverview {
+  const state = item.state === "ready"
+    ? contract.ExtensionLibraryState.READY
+    : item.state === "read_only"
+      ? contract.ExtensionLibraryState.READ_ONLY
+      : contract.ExtensionLibraryState.UNAVAILABLE;
+  const reasons: Readonly<Record<NonNullable<NativeExtensionLibraryOverview["reason"]>, contract.ExtensionLibraryUnavailableReason>> = {
+    metadata_corrupt: contract.ExtensionLibraryUnavailableReason.METADATA_CORRUPT,
+    file_limit: contract.ExtensionLibraryUnavailableReason.FILE_LIMIT,
+    io: contract.ExtensionLibraryUnavailableReason.IO,
+    operation_in_progress: contract.ExtensionLibraryUnavailableReason.OPERATION_IN_PROGRESS,
+    disk_missing: contract.ExtensionLibraryUnavailableReason.DISK_MISSING,
+    binding_moved: contract.ExtensionLibraryUnavailableReason.BINDING_MOVED,
+    state_corrupt: contract.ExtensionLibraryUnavailableReason.STATE_CORRUPT
+  };
+  return create(contract.ExtensionLibraryOverviewSchema, {
+    extensionId: item.extensionId,
+    name: item.name,
+    state,
+    unavailableReason: item.reason === undefined
+      ? contract.ExtensionLibraryUnavailableReason.UNSPECIFIED
+      : reasons[item.reason],
+    ...(item.location === undefined ? {} : { location: mapExtensionLibraryLocation(item.location) }),
+    files: item.usage.files,
+    bytes: BigInt(item.usage.bytes),
+    ...(item.diskFreeBytes === undefined ? {} : { diskFreeBytes: BigInt(item.diskFreeBytes) }),
+    softLimitBytes: BigInt(item.softLimitBytes),
+    softLimitExceeded: item.softLimitExceeded,
+    orphaned: item.orphaned,
+    trashCount: item.trashCount,
+    graceCount: item.graceCount,
+    ...(item.operation === undefined
+      ? {}
+      : {
+          operation: create(contract.ExtensionLibraryOperationStatusSchema, {
+            operationId: item.operation.id,
+            phase: item.operation.phase
+          })
+        })
+  });
+}
+
+function mapExtensionLibrarySession(item: Awaited<ReturnType<ExtensionLibraryManager["openSession"]>>): contract.ExtensionLibrarySession {
+  return create(contract.ExtensionLibrarySessionSchema, {
+    sessionId: item.sessionId,
+    extensionId: item.extensionId,
+    expiresAt: toProtoTimestamp(item.expiresAt),
+    bindingGeneration: toProtoRevision(item.bindingGeneration),
+    limits: create(contract.ExtensionLibraryLimitsSchema, {
+      maximumReadBytes: BigInt(item.capabilities.maximumReadBytes),
+      maximumWriteBytes: BigInt(item.capabilities.maximumWriteBytes),
+      maximumStreamBytes: BigInt(item.capabilities.maximumStreamBytes),
+      maximumPathCharacters: item.capabilities.maximumPathCharacters,
+      maximumPathSegments: item.capabilities.maximumPathSegments,
+      maximumListPageSize: item.capabilities.maximumListPageSize,
+      maximumFiles: item.capabilities.maximumFiles,
+      softLimitBytes: BigInt(8 * 1024 * 1024 * 1024),
+      diskReserveBytes: BigInt(1024 * 1024 * 1024)
+    })
+  });
+}
+
+function mapExtensionLibraryEntry(item: ExtensionLibraryEntry): contract.ExtensionLibraryEntry {
+  return create(contract.ExtensionLibraryEntrySchema, {
+    path: item.path,
+    kind: item.kind === "file" ? contract.ExtensionLibraryEntryKind.FILE : contract.ExtensionLibraryEntryKind.DIRECTORY,
+    bytes: BigInt(item.bytes),
+    modifiedAt: toProtoTimestamp(item.modifiedAt)
+  });
+}
+
+function mapExtensionLibraryTrash(item: NativeExtensionLibraryTrashEntry): contract.ExtensionLibraryTrashEntry {
+  return create(contract.ExtensionLibraryTrashEntrySchema, {
+    trashId: item.trashId,
+    extensionId: item.extensionId,
+    name: item.name,
+    deletedAt: toProtoTimestamp(item.deletedAt),
+    expiresAt: toProtoTimestamp(item.expiresAt),
+    files: item.files,
+    bytes: BigInt(item.bytes)
+  });
+}
+
+function mapExtensionLibraryGrace(item: NativeExtensionLibraryGraceEntry): contract.ExtensionLibraryGraceEntry {
+  return create(contract.ExtensionLibraryGraceEntrySchema, {
+    graceId: item.graceId,
+    extensionId: item.extensionId,
+    name: item.name,
+    createdAt: toProtoTimestamp(item.createdAt),
+    expiresAt: toProtoTimestamp(item.expiresAt),
+    files: item.files,
+    bytes: BigInt(item.bytes)
+  });
+}
+
+async function dispatchExtensionLibraryCall(
+  manager: ExtensionLibraryManager,
+  sessionId: string,
+  connectionId: string,
+  call: contract.ExtensionLibraryCall
+): Promise<contract.ExtensionLibraryCallResult> {
+  const operation = call.operation;
+  switch (operation.case) {
+    case "read": {
+      const value = await manager.read(sessionId, connectionId, {
+        path: operation.value.path,
+        ...(operation.value.offset === undefined ? {} : { offset: safeLibraryNumber(operation.value.offset, "read.offset") }),
+        ...(operation.value.length === undefined ? {} : { length: safeLibraryNumber(operation.value.length, "read.length") })
+      });
+      return create(contract.ExtensionLibraryCallResultSchema, {
+        result: { case: "read", value: create(contract.ExtensionLibraryReadResultSchema, {
+          path: value.path,
+          content: value.bytes,
+          sha256: value.sha256
+        }) }
+      });
+    }
+    case "write": {
+      const value = await manager.write(sessionId, connectionId, {
+        path: operation.value.path,
+        bytes: operation.value.content,
+        ifNotExists: operation.value.ifNotExists
+      });
+      return libraryWriteCallResult(value);
+    }
+    case "stat": {
+      const value = await manager.stat(sessionId, connectionId, operation.value.path);
+      return create(contract.ExtensionLibraryCallResultSchema, {
+        result: { case: "stat", value: mapExtensionLibraryEntry(value) }
+      });
+    }
+    case "list": {
+      const value = await manager.list(sessionId, connectionId, {
+        ...(operation.value.path === undefined ? {} : { path: operation.value.path }),
+        recursive: operation.value.recursive,
+        ...(operation.value.limit === undefined ? {} : { limit: operation.value.limit }),
+        ...(operation.value.cursor === undefined ? {} : { cursor: operation.value.cursor })
+      });
+      return create(contract.ExtensionLibraryCallResultSchema, {
+        result: { case: "list", value: create(contract.ExtensionLibraryListResultSchema, {
+          entries: value.entries.map(mapExtensionLibraryEntry),
+          ...(value.nextCursor === undefined ? {} : { nextCursor: value.nextCursor })
+        }) }
+      });
+    }
+    case "mkdir":
+    case "delete": {
+      const value = operation.case === "mkdir"
+        ? await manager.mkdir(sessionId, connectionId, operation.value.path)
+        : await manager.delete(sessionId, connectionId, operation.value.path, operation.value.recursive);
+      return create(contract.ExtensionLibraryCallResultSchema, {
+        result: { case: "path", value: create(contract.ExtensionLibraryPathResultSchema, value) }
+      });
+    }
+    case "rename": {
+      const value = await manager.rename(sessionId, connectionId, {
+        from: operation.value.from,
+        to: operation.value.to,
+        overwrite: operation.value.overwrite
+      });
+      return create(contract.ExtensionLibraryCallResultSchema, {
+        result: { case: "rename", value: create(contract.ExtensionLibraryRenameResultSchema, value) }
+      });
+    }
+    case "writeBegin": {
+      const value = await manager.writeBegin(sessionId, connectionId, {
+        path: operation.value.path,
+        totalBytes: safeLibraryNumber(operation.value.totalBytes, "write_begin.total_bytes"),
+        ...(operation.value.sha256 === undefined ? {} : { sha256: operation.value.sha256 }),
+        ifNotExists: operation.value.ifNotExists
+      });
+      return create(contract.ExtensionLibraryCallResultSchema, {
+        result: { case: "stream", value: create(contract.ExtensionLibraryStreamResultSchema, {
+          streamId: value.streamId,
+          receivedBytes: 0n,
+          nextSequence: value.nextSequence,
+          expiresAt: toProtoTimestamp(value.expiresAt),
+          aborted: false
+        }) }
+      });
+    }
+    case "writeChunk": {
+      const value = await manager.writeChunk(sessionId, connectionId, {
+        streamId: operation.value.streamId,
+        sequence: operation.value.sequence,
+        bytes: operation.value.content
+      });
+      return create(contract.ExtensionLibraryCallResultSchema, {
+        result: { case: "stream", value: create(contract.ExtensionLibraryStreamResultSchema, {
+          streamId: operation.value.streamId,
+          receivedBytes: BigInt(value.receivedBytes),
+          nextSequence: value.nextSequence,
+          expiresAt: toProtoTimestamp(value.expiresAt),
+          aborted: false
+        }) }
+      });
+    }
+    case "writeCommit":
+      return libraryWriteCallResult(await manager.writeCommit(sessionId, connectionId, operation.value.streamId));
+    case "writeAbort": {
+      const aborted = await manager.writeAbort(sessionId, connectionId, operation.value.streamId);
+      return create(contract.ExtensionLibraryCallResultSchema, {
+        result: { case: "stream", value: create(contract.ExtensionLibraryStreamResultSchema, {
+          streamId: operation.value.streamId,
+          receivedBytes: 0n,
+          nextSequence: 0,
+          aborted
+        }) }
+      });
+    }
+    case "sqlOpen": {
+      const value = await manager.databaseOpen(sessionId, connectionId, {
+        path: operation.value.path,
+        create: operation.value.create,
+        readonly: operation.value.readOnly
+      });
+      return create(contract.ExtensionLibraryCallResultSchema, {
+        result: { case: "sqlHandle", value: create(contract.ExtensionLibrarySqlHandleSchema, {
+          handleId: value.handleId,
+          path: value.path,
+          readOnly: value.readonly,
+          userVersion: value.userVersion
+        }) }
+      });
+    }
+    case "sqlExecute": {
+      const statement = requiredLibrarySqlStatement(operation.value.statement);
+      const value = await manager.databaseExecute(
+        sessionId,
+        connectionId,
+        operation.value.handleId,
+        statement.sql,
+        statement.parameters.map(nativeExtensionLibrarySqlValue)
+      );
+      return librarySqlCallResult(value);
+    }
+    case "sqlBatch": {
+      const values = await manager.databaseBatch(sessionId, connectionId, operation.value.handleId, operation.value.statements.map((statement) => ({
+        sql: statement.sql,
+        parameters: statement.parameters.map(nativeExtensionLibrarySqlValue)
+      })));
+      return create(contract.ExtensionLibraryCallResultSchema, {
+        result: { case: "sqlBatch", value: create(contract.ExtensionLibrarySqlBatchResultSchema, {
+          results: values.map(mapExtensionLibrarySqlResult)
+        }) }
+      });
+    }
+    case "sqlMigrate": {
+      const version = await manager.databaseMigrate(sessionId, connectionId, operation.value.handleId, operation.value.migrations.map((migration) => ({
+        version: migration.version,
+        statements: [...migration.statements]
+      })));
+      return create(contract.ExtensionLibraryCallResultSchema, {
+        result: { case: "sqlVersion", value: create(contract.ExtensionLibrarySqlVersionResultSchema, { userVersion: version }) }
+      });
+    }
+    case "sqlBackup": {
+      const value = await manager.databaseBackup(sessionId, connectionId, operation.value.handleId, operation.value.targetPath);
+      return create(contract.ExtensionLibraryCallResultSchema, {
+        result: { case: "sqlVersion", value: create(contract.ExtensionLibrarySqlVersionResultSchema, {
+          userVersion: value.userVersion,
+          path: value.path
+        }) }
+      });
+    }
+    case "sqlCheck": {
+      const value = await manager.databaseCheck(sessionId, connectionId, operation.value.handleId);
+      return libraryBooleanCallResult(value.ok);
+    }
+    case "sqlClose":
+      await manager.databaseClose(sessionId, connectionId, operation.value.handleId);
+      return libraryBooleanCallResult(true);
+    default:
+      throw invalidArgument("call.operation is unsupported");
+  }
+}
+
+function requiredLibrarySqlStatement(value: contract.ExtensionLibrarySqlStatement | undefined): contract.ExtensionLibrarySqlStatement {
+  if (value === undefined) throw invalidArgument("sql statement is required");
+  return value;
+}
+
+function nativeExtensionLibrarySqlValue(value: contract.ExtensionLibrarySqlValue): import("./extension-library-sql.js").ExtensionLibrarySqlValue {
+  switch (value.value.case) {
+    case "nullValue":
+      if (!value.value.value) throw invalidArgument("null_value must be true");
+      return null;
+    case "numberValue":
+      if (!Number.isFinite(value.value.value)) throw invalidArgument("number_value must be finite");
+      return value.value.value;
+    case "integerValue": {
+      if (!/^-?(?:0|[1-9][0-9]*)$/u.test(value.value.value)) throw invalidArgument("integer_value is invalid");
+      const integer = BigInt(value.value.value);
+      if (integer < -9_223_372_036_854_775_808n || integer > 9_223_372_036_854_775_807n) {
+        throw invalidArgument("integer_value exceeds SQLite int64");
+      }
+      return integer;
+    }
+    case "textValue":
+      return value.value.value;
+    case "blobValue":
+      return Uint8Array.from(value.value.value);
+    default:
+      throw invalidArgument("SQL value is required");
+  }
+}
+
+function mapExtensionLibrarySqlValue(value: import("./extension-library-sql.js").ExtensionLibrarySqlValue): contract.ExtensionLibrarySqlValue {
+  const mapped = value === null
+    ? { case: "nullValue" as const, value: true }
+    : typeof value === "number"
+      ? { case: "numberValue" as const, value }
+      : typeof value === "bigint"
+        ? { case: "integerValue" as const, value: value.toString(10) }
+        : typeof value === "string"
+          ? { case: "textValue" as const, value }
+          : { case: "blobValue" as const, value };
+  return create(contract.ExtensionLibrarySqlValueSchema, { value: mapped });
+}
+
+function mapExtensionLibrarySqlResult(value: import("./extension-library-sql.js").ExtensionLibrarySqlResult): contract.ExtensionLibrarySqlResult {
+  return create(contract.ExtensionLibrarySqlResultSchema, {
+    rows: value.rows.map((row) => create(contract.ExtensionLibrarySqlRowSchema, {
+      cells: Object.entries(row).map(([name, cell]) => create(contract.ExtensionLibrarySqlCellSchema, {
+        name,
+        value: mapExtensionLibrarySqlValue(cell)
+      }))
+    })),
+    changes: value.changes.toString(10),
+    ...(value.lastInsertRowid === undefined ? {} : { lastInsertRowId: value.lastInsertRowid.toString(10) })
+  });
+}
+
+function libraryWriteCallResult(value: ExtensionLibraryWriteResult): contract.ExtensionLibraryCallResult {
+  return create(contract.ExtensionLibraryCallResultSchema, {
+    result: { case: "write", value: create(contract.ExtensionLibraryWriteResultSchema, {
+      path: value.path,
+      bytes: BigInt(value.bytes),
+      sha256: value.sha256
+    }) }
+  });
+}
+
+function librarySqlCallResult(value: import("./extension-library-sql.js").ExtensionLibrarySqlResult): contract.ExtensionLibraryCallResult {
+  return create(contract.ExtensionLibraryCallResultSchema, {
+    result: { case: "sqlResult", value: mapExtensionLibrarySqlResult(value) }
+  });
+}
+
+function libraryBooleanCallResult(value: boolean): contract.ExtensionLibraryCallResult {
+  return create(contract.ExtensionLibraryCallResultSchema, {
+    result: { case: "boolean", value: create(contract.ExtensionLibraryBooleanResultSchema, { value }) }
+  });
+}
+
+function safeLibraryNumber(value: bigint, field: string): number {
+  const result = Number(value);
+  if (!Number.isSafeInteger(result) || result < 0) throw invalidArgument(`${field} exceeds the supported integer range`);
+  return result;
+}
+
+function mapExtensionMainViewSurface(surface: NativeExtensionMainViewSurface): contract.ExtensionMainViewSurface {
+  return create(contract.ExtensionMainViewSurfaceSchema, {
+    surfaceId: surface.id,
+    extensionId: surface.extensionId,
+    owner: create(contract.ExtensionResourceOwnerSchema, {
+      resourceId: surface.authority.resourceId,
+      discoveredRevision: surface.authority.discoveredRevision,
+      resourceVersion: toProtoRevision(surface.authority.resourceRevision)
+    }),
+    endpoint: surface.endpoint,
+    ...(surface.title === undefined ? {} : { title: surface.title }),
+    icon: protoExtensionMainViewIcon(surface.icon),
+    expiresAt: toProtoTimestamp(surface.expiresAt),
+    backendId: surface.authority.backendId,
+    backendRevision: toProtoRevision(surface.authority.backendRevision),
+    backendGeneration: BigInt(surface.authority.backendGeneration)
+  });
+}
+
+function protoExtensionMainViewIcon(
+  value: ExtensionMainViewIcon | undefined
+): contract.ExtensionMainViewIcon {
+  switch (value) {
+    case "activity": return contract.ExtensionMainViewIcon.ACTIVITY;
+    case "box": return contract.ExtensionMainViewIcon.BOX;
+    case "code": return contract.ExtensionMainViewIcon.CODE;
+    case "file-text": return contract.ExtensionMainViewIcon.FILE_TEXT;
+    case "globe": return contract.ExtensionMainViewIcon.GLOBE;
+    case "layout": return contract.ExtensionMainViewIcon.LAYOUT;
+    case "search": return contract.ExtensionMainViewIcon.SEARCH;
+    case "sparkles": return contract.ExtensionMainViewIcon.SPARKLES;
+    case "terminal": return contract.ExtensionMainViewIcon.TERMINAL;
+    case "tool": return contract.ExtensionMainViewIcon.TOOL;
+    default: return contract.ExtensionMainViewIcon.UNSPECIFIED;
+  }
+}
+
+async function extensionMainViewEffect<T>(effect: () => Promise<T>): Promise<T> {
+  try {
+    return await effect();
+  } catch (error) {
+    if (error instanceof ConnectError || error instanceof StoreError) throw error;
+    if (error instanceof ExtensionMainViewError) {
+      if (error.statusCode === 404) throw new ConnectError("Extension main view not found.", Code.NotFound);
+      if (error.statusCode === 410) throw new ConnectError("Extension main view was revoked.", Code.FailedPrecondition);
+      if (error.statusCode === 429) throw new ConnectError("Extension main-view capacity reached.", Code.ResourceExhausted);
+      throw new ConnectError("Extension main-view request is invalid.", Code.InvalidArgument);
+    }
+    const message = redactSecrets(error instanceof Error ? error.message : "Extension main-view request failed.");
+    if (/not found/iu.test(message)) throw new ConnectError(message, Code.NotFound);
+    if (/changed|concurrent|stale|revoked/iu.test(message)) throw new ConnectError(message, Code.Aborted);
+    throw new ConnectError(message, Code.FailedPrecondition);
+  }
+}
+
+function extensionPackageAcquisition(item: NativeExtensionCatalogDescriptor): {
+  readonly sourceId: string;
+  readonly sourceRevision: bigint;
+  readonly entryId: string;
+  readonly contentRevision: string;
+} {
+  if (item.owner.kind === "source") return item.owner;
+  if (item.owner.kind === "resource" && item.update !== undefined) {
+    return {
+      sourceId: item.update.sourceId,
+      sourceRevision: item.update.sourceRevision,
+      entryId: item.update.entryId,
+      contentRevision: item.update.contentRevision
+    };
+  }
+  throw new ConnectError("The Extension has no installable package revision.", Code.FailedPrecondition);
+}
+
+function mapExtensionPackagePreview(
+  extension: NativeExtensionCatalogDescriptor,
+  preview: NativePiExtensionPackagePreview
+): contract.ExtensionPackagePreview {
+  return create(contract.ExtensionPackagePreviewSchema, {
+    extensionId: extension.id,
+    extensionRevision: toProtoRevision(extension.revision),
+    action: protoExtensionPackageAction(preview.action),
+    resourceId: preview.resourceId,
+    backendId: preview.backendId,
+    packageName: preview.packageName,
+    ...(preview.installedVersion === undefined ? {} : { installedVersion: preview.installedVersion }),
+    ...(preview.availableVersion === undefined ? {} : { availableVersion: preview.availableVersion }),
+    ...(preview.currentResource === undefined
+      ? {}
+      : {
+          currentResource: create(contract.ExtensionPackageCurrentResourceSchema, {
+            resourceId: preview.currentResource.resourceId,
+            resourceRevision: toProtoRevision(preview.currentResource.resourceVersion),
+            name: preview.currentResource.name,
+            sourceDisplay: preview.currentResource.sourceDisplay
+          })
+        }),
+    sourceReplacement: preview.sourceReplacement,
+    preservesEnabled: preview.preservesEnabled,
+    compatibilityDetails: preview.resourceDetails.map((detail) => create(contract.ResourceCompatibilityDetailSchema, {
+      kind: protoResourceKind(detail.kind),
+      name: detail.name,
+      compatibility: protoResourceCompatibility(detail.compatibility),
+      issues: detail.compatibilityIssues.map(protoResourceCompatibilityIssue),
+      detectedApis: detail.detectedApis.map(protoResourceUiApi),
+      adaptedApis: detail.adaptedApis.map(protoResourceUiApi),
+      unsupportedApis: detail.unsupportedApis.map(protoResourceUiApi)
+    })),
+    runtimeRequirements: preview.runtimeRequirements.map((requirement) => create(contract.ResourceRuntimeRequirementSchema, {
+      packageName: requirement.packageName,
+      range: requirement.range,
+      ...(requirement.currentVersion === undefined ? {} : { currentVersion: requirement.currentVersion }),
+      status: requirement.compatible === true
+        ? contract.ResourceRuntimeRequirementStatus.COMPATIBLE
+        : requirement.compatible === false
+          ? contract.ResourceRuntimeRequirementStatus.INCOMPATIBLE
+          : contract.ResourceRuntimeRequirementStatus.UNKNOWN
+    })),
+    warnings: preview.warnings.map(protoResourcePackageWarning),
+    disabledLifecycleScripts: [...preview.disabledLifecycleScripts],
+    canToggle: preview.canToggle
+  });
+}
+
+function mapExtensionPackageExportAuthority(
+  authority: NativeExtensionPackageExportAuthority
+): contract.ExtensionPackageExportAuthority {
+  return create(contract.ExtensionPackageExportAuthoritySchema, {
+    extensionId: authority.extensionId,
+    extensionRevision: toProtoRevision(authority.extensionRevision),
+    resourceId: authority.resourceId,
+    resourceRevision: toProtoRevision(authority.resourceRevision),
+    discoveredRevision: authority.discoveredRevision,
+    backendId: authority.backendId,
+    backendRevision: toProtoRevision(authority.backendRevision),
+    backendGeneration: BigInt(authority.backendGeneration),
+    packageName: authority.packageName,
+    ...(authority.packageVersion === undefined ? {} : { packageVersion: authority.packageVersion })
+  });
+}
+
+function mapExtensionPackageExportJob(job: NativeExtensionPackageExportJob): contract.ExtensionPackageExportJob {
+  return create(contract.ExtensionPackageExportJobSchema, {
+    exportId: job.id,
+    revision: toProtoRevision(job.revision),
+    state: protoExtensionPackageExportState(job.state),
+    authority: mapExtensionPackageExportAuthority(job.authority),
+    archiveFormat: job.archiveFormat,
+    fileName: job.fileName,
+    files: job.files,
+    uncompressedBytes: BigInt(job.uncompressedBytes),
+    ...(job.artifact === undefined ? {} : { artifact: toProtoBlobRef(job.artifact) }),
+    createdAt: toProtoTimestamp(job.createdAt),
+    updatedAt: toProtoTimestamp(job.updatedAt),
+    ...(job.completedAt === undefined ? {} : { completedAt: toProtoTimestamp(job.completedAt) }),
+    ...(job.error === undefined ? {} : { error: job.error })
+  });
+}
+
+function mapExtensionPackageExportPreview(
+  preview: NativeExtensionPackageExportPreview
+): contract.ExtensionPackageExportPreview {
+  return create(contract.ExtensionPackageExportPreviewSchema, {
+    authority: mapExtensionPackageExportAuthority(preview),
+    archiveFormat: preview.archiveFormat,
+    fileName: preview.fileName,
+    maximumEntries: preview.maximumEntries,
+    maximumUncompressedBytes: BigInt(preview.maximumUncompressedBytes),
+    localOnly: preview.localOnly,
+    ...(preview.activeExport === undefined ? {} : { activeExport: mapExtensionPackageExportJob(preview.activeExport) })
+  });
+}
+
+function protoExtensionPackageExportState(
+  state: NativeExtensionPackageExportJob["state"]
+): contract.ExtensionPackageExportState {
+  switch (state) {
+    case "pending": return contract.ExtensionPackageExportState.PENDING;
+    case "snapshotting": return contract.ExtensionPackageExportState.SNAPSHOTTING;
+    case "packaging": return contract.ExtensionPackageExportState.PACKAGING;
+    case "verifying": return contract.ExtensionPackageExportState.VERIFYING;
+    case "ready": return contract.ExtensionPackageExportState.READY;
+    case "failed": return contract.ExtensionPackageExportState.FAILED;
+    case "cancelled": return contract.ExtensionPackageExportState.CANCELLED;
+  }
+}
+
+function protoExtensionPackageAction(value: NativePiExtensionPackageAction): contract.ExtensionPackageAction {
+  switch (value) {
+    case "install": return contract.ExtensionPackageAction.INSTALL;
+    case "update": return contract.ExtensionPackageAction.UPDATE;
+    case "replace": return contract.ExtensionPackageAction.REPLACE;
+  }
+}
+
+function nativeExtensionPackageAction(value: contract.ExtensionPackageAction): NativePiExtensionPackageAction {
+  switch (value) {
+    case contract.ExtensionPackageAction.INSTALL: return "install";
+    case contract.ExtensionPackageAction.UPDATE: return "update";
+    case contract.ExtensionPackageAction.REPLACE: return "replace";
+    case contract.ExtensionPackageAction.UNSPECIFIED:
+    default: throw invalidArgument("expected_action is invalid");
+  }
+}
+
+function mapExtensionCatalogSnapshot(item: NativeExtensionCatalogSnapshot): contract.ExtensionCatalogSnapshot {
+  return create(contract.ExtensionCatalogSnapshotSchema, {
+    revision: toProtoRevision(item.revision),
+    entries: item.entries.map(mapExtensionCatalogEntry),
+    recoveredFromCorruption: item.recoveredFromCorruption
+  });
+}
+
+function mapExtensionSourceDescriptor(item: NativeExtensionSourceDescriptor): contract.ExtensionSourceDescriptor {
+  return create(contract.ExtensionSourceDescriptorSchema, {
+    sourceId: item.id,
+    revision: toProtoRevision(item.revision),
+    kind: item.source.kind === "local" ? contract.ExtensionSourceKind.LOCAL : contract.ExtensionSourceKind.GIT,
+    location: mapExtensionSourceLocation(item.source),
+    name: item.name,
+    ...(item.displayName === undefined ? {} : { displayName: item.displayName }),
+    state: item.state === "ready" ? contract.ExtensionSourceState.READY : contract.ExtensionSourceState.ERROR,
+    contentRevision: item.contentRevision,
+    discoveredExtensionCount: item.entries.length,
+    declaredEntryCount: item.declaredEntryCount,
+    skippedEntryCount: item.skippedEntryCount,
+    unreadableEntryCount: item.unreadableEntryCount,
+    addedAt: toProtoTimestamp(item.addedAt),
+    ...(item.refreshedAt === undefined ? {} : { refreshedAt: toProtoTimestamp(item.refreshedAt) }),
+    ...(item.error === undefined ? {} : { error: item.error })
+  });
+}
+
+function mapExtensionSourceLocation(source: NativeExtensionSourceInput): contract.ExtensionSourceLocation {
+  return create(contract.ExtensionSourceLocationSchema, {
+    kind: source.kind === "local"
+      ? { case: "local", value: create(contract.ExtensionLocalSourceSchema, { path: source.path }) }
+      : {
+          case: "git",
+          value: create(contract.ExtensionGitSourceSchema, {
+            repositoryUrl: source.repositoryUrl,
+            ...(source.ref === undefined ? {} : { ref: source.ref }),
+            sparsePaths: [...source.sparsePaths]
+          })
+        }
+  });
+}
+
+function nativeExtensionSourceLocation(value: contract.ExtensionSourceLocation | undefined): NativeExtensionSourceInput {
+  if (value?.kind.case === "local") {
+    return { kind: "local", path: nonBlankRequest(value.kind.value.path, "source.local.path") };
+  }
+  if (value?.kind.case === "git") {
+    return {
+      kind: "git",
+      repositoryUrl: nonBlankRequest(value.kind.value.repositoryUrl, "source.git.repository_url"),
+      ...(value.kind.value.ref === undefined ? {} : { ref: value.kind.value.ref }),
+      sparsePaths: [...value.kind.value.sparsePaths]
+    };
+  }
+  throw invalidArgument("source location is required");
+}
+
+async function extensionSourceEffect<T>(effect: () => Promise<T>): Promise<T> {
+  try {
+    return await effect();
+  } catch (error) {
+    if (error instanceof ConnectError || error instanceof StoreError) throw error;
+    if (error instanceof ExtensionSourceError) {
+      const message = redactSecrets(error.message);
+      if (error.code === "SOURCE_NOT_FOUND") throw new ConnectError(message, Code.NotFound);
+      if (error.code === "SOURCE_CHANGED") throw new ConnectError(message, Code.Aborted);
+      if (error.code === "SOURCE_GIT_AUTH_FAILED") throw new ConnectError(message, Code.Unauthenticated);
+      if (error.code === "SOURCE_GIT_UNAVAILABLE") throw new ConnectError(message, Code.FailedPrecondition);
+      if (error.code === "SOURCE_GIT_FAILED") throw new ConnectError(message, Code.Unavailable);
+      throw invalidArgument(message);
+    }
+    throw error;
+  }
+}
+
+function nativeExtensionSource(value: contract.ExtensionCatalogSource): NativeExtensionCatalogDescriptor["source"] {
+  if (value === contract.ExtensionCatalogSource.LOCAL) return "local";
+  if (value === contract.ExtensionCatalogSource.MARKET) return "market";
+  throw invalidArgument("source is invalid");
+}
+
+function protoExtensionInstallState(
+  value: NativeExtensionCatalogDescriptor["installState"]
+): contract.ExtensionInstallState {
+  switch (value) {
+    case "available": return contract.ExtensionInstallState.AVAILABLE;
+    case "installing": return contract.ExtensionInstallState.INSTALLING;
+    case "installed": return contract.ExtensionInstallState.INSTALLED;
+    case "update_available": return contract.ExtensionInstallState.UPDATE_AVAILABLE;
+    case "error": return contract.ExtensionInstallState.ERROR;
+  }
+}
+
+function protoExtensionSetupState(value: NativeExtensionCatalogDescriptor["setup"]["state"]): contract.ExtensionSetupState {
+  switch (value) {
+    case "not_required": return contract.ExtensionSetupState.NOT_REQUIRED;
+    case "required": return contract.ExtensionSetupState.REQUIRED;
+    case "in_progress": return contract.ExtensionSetupState.IN_PROGRESS;
+    case "ready": return contract.ExtensionSetupState.READY;
+    case "cancelled": return contract.ExtensionSetupState.CANCELLED;
+    case "failed": return contract.ExtensionSetupState.FAILED;
+  }
+}
+
+function protoExtensionSetupFieldKind(
+  value: NativeExtensionCatalogDescriptor["setup"]["fields"][number]["kind"]
+): contract.ExtensionSetupFieldKind {
+  switch (value) {
+    case "text": return contract.ExtensionSetupFieldKind.TEXT;
+    case "secret": return contract.ExtensionSetupFieldKind.SECRET;
+    case "oauth": return contract.ExtensionSetupFieldKind.OAUTH;
+    case "confirmation": return contract.ExtensionSetupFieldKind.CONFIRMATION;
+  }
+}
+
 function mapMcpToolDescriptor(
   item: NativeMcpServerDescriptor["tools"][number],
   toolProviderId = `mcp:${item.serverId}`
@@ -8439,6 +11564,7 @@ function mapRuntimeToolCatalog(item: RuntimeToolCatalog): contract.RuntimeToolCa
       inputSchema: mapDynamicToolInputSchema(tool.inputSchema),
       promptGuidelines: [...tool.promptGuidelines],
       active: tool.active,
+      resourceId: tool.resourceId ?? "",
       sourceInfo: create(contract.RuntimeToolSourceInfoSchema, {
         path: tool.sourceInfo.path,
         source: tool.sourceInfo.source,
@@ -9312,6 +12438,9 @@ async function enrichSnapshot(
     : [];
   const browserTransfers = includeBrowser ? [...(dependencies.browserTransfers?.list({}) ?? [])] : [];
   const resources = dependencies.piResources?.list(resourceFilterForScope(dependencies, scope)).map(mapManagedResource) ?? projected.resources;
+  const extensionCatalog = owner
+    ? mapExtensionCatalogSnapshot(reconcileExtensionCatalog(dependencies))
+    : projected.extensionCatalog;
   const sessions = projected.sessions;
   const pi = await durablePiSnapshot(
     dependencies,
@@ -9341,6 +12470,7 @@ async function enrichSnapshot(
     mcpServers,
     browsers,
     resources,
+    extensionCatalog,
     settings: owner ? settingsSnapshot(dependencies) : projected.settings,
     browserTransfers,
     pi
@@ -10930,6 +14060,8 @@ function protoResourceAcquisitionKind(value: NativePiResourceDescriptor["sourceK
     case "local": return contract.ResourceAcquisitionKind.LOCAL;
     case "npm": return contract.ResourceAcquisitionKind.NPM;
     case "git": return contract.ResourceAcquisitionKind.GIT;
+    case "extension_source": return contract.ResourceAcquisitionKind.EXTENSION_SOURCE;
+    case "skill_market": return contract.ResourceAcquisitionKind.SKILL_MARKET;
     default: return contract.ResourceAcquisitionKind.UNSPECIFIED;
   }
 }
@@ -15493,7 +18625,8 @@ async function dispatchMutation(
           ...(payload.value.requestedVersion === "" ? {} : { requestedVersion: payload.value.requestedVersion }),
           ...(acquisition === undefined ? {} : { source: acquisition }),
           approvedByConnectionId: connection.id
-        })
+        }),
+        { extensionLibraryAuthorityChange: "revoke" }
       );
     }
     case "setResourceEnabled": {
@@ -15506,7 +18639,8 @@ async function dispatchMutation(
         payload.case,
         payload.value.resourceId,
         payload.value.enabled,
-        () => dependencies.piResources!.prepareSetEnabled(payload.value.resourceId, payload.value.enabled)
+        () => dependencies.piResources!.prepareSetEnabled(payload.value.resourceId, payload.value.enabled),
+        payload.value.enabled ? {} : { extensionLibraryAuthorityChange: "revoke" }
       );
     }
     case "removeResource": {
@@ -15519,8 +18653,927 @@ async function dispatchMutation(
         payload.case,
         payload.value.resourceId,
         false,
-        () => dependencies.piResources!.prepareRemove(payload.value.resourceId)
+        () => dependencies.piResources!.prepareRemove(payload.value.resourceId),
+        { extensionLibraryAuthorityChange: "orphan" }
       );
+    }
+    case "applySkillDraft": {
+      if (dependencies.skills === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Skill management is unavailable.");
+      }
+      return preparedSkillEffectOperation(
+        dependencies,
+        operationId,
+        connection,
+        mutation,
+        payload.case,
+        () => dependencies.skills!.prepareApplyDraft(
+          connection.id,
+          nonBlankRequest(payload.value.draftId, "draft_id")
+        ),
+        (value) => value.resource
+      );
+    }
+    case "setSkillEnabled": {
+      if (dependencies.skills === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Skill management is unavailable.");
+      }
+      if (payload.value.expectedResourceRevision === undefined) throw invalidArgument("expected_resource_revision is required");
+      return preparedSkillEffectOperation(
+        dependencies,
+        operationId,
+        connection,
+        mutation,
+        payload.case,
+        () => dependencies.skills!.prepareSetEnabled({
+          resourceId: nonBlankRequest(payload.value.skillId, "skill_id"),
+          expectedResourceVersion: fromProtoRevision(
+            payload.value.expectedResourceRevision,
+            "set_skill_enabled.expected_resource_revision"
+          ),
+          enabled: payload.value.enabled
+        }),
+        (value) => value
+      );
+    }
+    case "deleteSkill": {
+      if (dependencies.skills === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Skill management is unavailable.");
+      }
+      return preparedSkillEffectOperation(
+        dependencies,
+        operationId,
+        connection,
+        mutation,
+        payload.case,
+        () => dependencies.skills!.prepareDelete({
+          connectionId: connection.id,
+          sessionId: nonBlankRequest(payload.value.sessionId, "session_id"),
+          confirmation: payload.value.confirmation
+        }),
+        (value) => value
+      );
+    }
+    case "addSkillMarketSource": {
+      if (dependencies.skillMarket === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Skill market source management is unavailable.");
+      }
+      if (payload.value.expectedCatalogRevision === undefined) throw invalidArgument("expected_catalog_revision is required");
+      const expectedRevision = fromProtoRevision(
+        payload.value.expectedCatalogRevision,
+        "add_skill_market_source.expected_catalog_revision"
+      );
+      const source = nativeSkillMarketSource(payload.value.source);
+      return effectOperation(dependencies, operationId, connection, mutation, payload.case, {
+        accepted: true,
+        resultCase: "acknowledgement",
+        entityId: "skill-market-sources"
+      }, async () => skillMarketEffect(async () => {
+        await dependencies.skillMarket!.add(source, expectedRevision);
+      }));
+    }
+    case "refreshSkillMarketSource": {
+      if (dependencies.skillMarket === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Skill market source management is unavailable.");
+      }
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const sourceId = nonBlankRequest(payload.value.sourceId, "source_id");
+      const expectedRevision = fromProtoRevision(
+        payload.value.expectedRevision,
+        "refresh_skill_market_source.expected_revision"
+      );
+      return effectOperation(dependencies, operationId, connection, mutation, payload.case, {
+        accepted: true,
+        resultCase: "acknowledgement",
+        entityId: sourceId
+      }, async () => skillMarketEffect(async () => {
+        await dependencies.skillMarket!.refresh(sourceId, expectedRevision);
+      }));
+    }
+    case "removeSkillMarketSource": {
+      if (dependencies.skillMarket === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Skill market source management is unavailable.");
+      }
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const sourceId = nonBlankRequest(payload.value.sourceId, "source_id");
+      const expectedRevision = fromProtoRevision(
+        payload.value.expectedRevision,
+        "remove_skill_market_source.expected_revision"
+      );
+      return effectOperation(dependencies, operationId, connection, mutation, payload.case, {
+        accepted: true,
+        resultCase: "acknowledgement",
+        entityId: sourceId
+      }, async () => skillMarketEffect(async () => {
+        await dependencies.skillMarket!.remove(sourceId, expectedRevision);
+      }));
+    }
+    case "installSkillMarketPlan": {
+      if (dependencies.skillMarket === undefined || dependencies.piResources === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Skill market installation is unavailable.");
+      }
+      let prepared: PreparedSkillMarketInstallation | undefined;
+      let resource: NativePiResourceDescriptor | undefined;
+      let resourceCatalogFence: symbol | undefined;
+      const execution = await dependencies.sessionHost.mutate<OperationOutcome>({
+        operationId,
+        connection,
+        kind: payload.case,
+        body: mutation,
+        effect: async () => {
+          prepared = await skillMarketEffect(() => dependencies.skillMarket!.prepareInstall({
+            connectionId: connection.id,
+            planId: nonBlankRequest(payload.value.planId, "plan_id"),
+            expectedCandidateRevision: nonBlankRequest(
+              payload.value.expectedCandidateRevision,
+              "expected_candidate_revision"
+            ),
+            confirmReplacement: payload.value.confirmReplacement
+          }));
+          resource = prepared.mutation.value;
+        },
+        commit: () => {
+          if (prepared === undefined || resource === undefined) {
+            throw new StoreError("Skill market installation completed without a prepared Resource mutation.");
+          }
+          const currentResourceId = prepared.plan.resourcePreview.currentResource?.resourceId;
+          return {
+            accepted: true,
+            resultCase: "skill",
+            entityId: resource.id,
+            ...(currentResourceId === undefined || currentResourceId === resource.id
+              ? {}
+              : { skillReplacedId: currentResourceId })
+          } satisfies OperationOutcome;
+        },
+        complete: (commit) => skillMarketEffect(() => requiredPreparedSkillMarketInstallation(prepared).complete(
+          (finalize) => {
+            const completed = commit(finalize);
+            resourceCatalogFence = dependencies.sessionHost.fenceBackendResourceCatalogs(resource!.backendId);
+            return completed;
+          }
+        ))
+      });
+      if (!execution.replayed) {
+        if (resource === undefined || resourceCatalogFence === undefined) {
+          throw new StoreError("Skill market installation completed without its Resource runtime fence.");
+        }
+        await reconcileCommittedResourceRuntime(
+          dependencies,
+          resource.backendId,
+          resource.id,
+          resourceCatalogFence
+        );
+      }
+      return presented(execution);
+    }
+    case "enableSkillMarketSync": {
+      if (dependencies.skillMarketSync === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Skill market synchronization is unavailable.");
+      }
+      if (payload.value.expectedResourceRevision === undefined) throw invalidArgument("expected_resource_revision is required");
+      const resourceId = nonBlankRequest(payload.value.resourceId, "resource_id");
+      const expectedResourceVersion = fromProtoRevision(
+        payload.value.expectedResourceRevision,
+        "enable_skill_market_sync.expected_resource_revision"
+      );
+      const target = nativeSkillMarketInstallTarget(payload.value.target);
+      return effectOperation(dependencies, operationId, connection, mutation, payload.case, {
+        accepted: true,
+        resultCase: "acknowledgement",
+        entityId: resourceId
+      }, async () => skillMarketEffect(async () => {
+        await dependencies.skillMarketSync!.enable({ resourceId, expectedResourceVersion, target });
+      }));
+    }
+    case "disableSkillMarketSync": {
+      if (dependencies.skillMarketSync === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Skill market synchronization is unavailable.");
+      }
+      if (payload.value.expectedPolicyRevision === undefined) throw invalidArgument("expected_policy_revision is required");
+      const resourceId = nonBlankRequest(payload.value.resourceId, "resource_id");
+      const expectedRevision = fromProtoRevision(
+        payload.value.expectedPolicyRevision,
+        "disable_skill_market_sync.expected_policy_revision"
+      );
+      return effectOperation(dependencies, operationId, connection, mutation, payload.case, {
+        accepted: true,
+        resultCase: "acknowledgement",
+        entityId: resourceId
+      }, async () => skillMarketEffect(async () => {
+        await dependencies.skillMarketSync!.disable(resourceId, expectedRevision);
+      }));
+    }
+    case "enqueueSkillMarketSync": {
+      if (dependencies.skillMarketSync === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Skill market synchronization is unavailable.");
+      }
+      if (payload.value.expectedPolicyRevision === undefined) throw invalidArgument("expected_policy_revision is required");
+      const resourceId = nonBlankRequest(payload.value.resourceId, "resource_id");
+      const expectedRevision = fromProtoRevision(
+        payload.value.expectedPolicyRevision,
+        "enqueue_skill_market_sync.expected_policy_revision"
+      );
+      let jobId: string | undefined;
+      return ackOperation(
+        dependencies,
+        operationId,
+        connection,
+        mutation,
+        payload.case,
+        async () => skillMarketEffect(async () => {
+          jobId = (await dependencies.skillMarketSync!.enqueue(resourceId, expectedRevision)).id;
+        }),
+        undefined,
+        undefined,
+        async (completed) => {
+          if (!completed.replayed && jobId !== undefined) dependencies.skillMarketSync!.begin(jobId);
+        }
+      );
+    }
+    case "cancelSkillMarketSync": {
+      if (dependencies.skillMarketSync === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Skill market synchronization is unavailable.");
+      }
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const jobId = nonBlankRequest(payload.value.jobId, "job_id");
+      const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "cancel_skill_market_sync.expected_revision");
+      return effectOperation(dependencies, operationId, connection, mutation, payload.case, {
+        accepted: true,
+        resultCase: "acknowledgement",
+        entityId: jobId
+      }, async () => skillMarketEffect(async () => {
+        await dependencies.skillMarketSync!.cancel(jobId, expectedRevision);
+      }));
+    }
+    case "retrySkillMarketSync": {
+      if (dependencies.skillMarketSync === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Skill market synchronization is unavailable.");
+      }
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const previousJobId = nonBlankRequest(payload.value.jobId, "job_id");
+      const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "retry_skill_market_sync.expected_revision");
+      let jobId: string | undefined;
+      return ackOperation(
+        dependencies,
+        operationId,
+        connection,
+        mutation,
+        payload.case,
+        async () => skillMarketEffect(async () => {
+          jobId = (await dependencies.skillMarketSync!.retry(previousJobId, expectedRevision)).id;
+        }),
+        undefined,
+        undefined,
+        async (completed) => {
+          if (!completed.replayed && jobId !== undefined) dependencies.skillMarketSync!.begin(jobId);
+        }
+      );
+    }
+    case "startSkillPublication": {
+      if (dependencies.skillPublication === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Skill publication is unavailable.");
+      }
+      if (payload.value.expectedResourceRevision === undefined) throw invalidArgument("expected_resource_revision is required");
+      if (payload.value.expectedSourceRevision === undefined) throw invalidArgument("expected_source_revision is required");
+      if (payload.value.expectedCollaborationRevision === undefined) throw invalidArgument("expected_collaboration_revision is required");
+      const jobId = skillPublicationJobId(operationId);
+      return ackOperation(
+        dependencies,
+        operationId,
+        connection,
+        mutation,
+        payload.case,
+        async () => skillEffect(async () => {
+          await dependencies.skillPublication!.start({
+            jobId,
+            resourceId: nonBlankRequest(payload.value.resourceId, "resource_id"),
+            expectedResourceRevision: fromProtoRevision(
+              payload.value.expectedResourceRevision,
+              "start_skill_publication.expected_resource_revision"
+            ),
+            expectedObservedRevision: nonBlankRequest(
+              payload.value.expectedObservedRevision,
+              "expected_observed_revision"
+            ),
+            sourceId: nonBlankRequest(payload.value.sourceId, "source_id"),
+            expectedSourceRevision: fromProtoRevision(
+              payload.value.expectedSourceRevision,
+              "start_skill_publication.expected_source_revision"
+            ),
+            expectedSourceContentRevision: nonBlankRequest(
+              payload.value.expectedSourceContentRevision,
+              "expected_source_content_revision"
+            ),
+            ...(payload.value.expectedExistingEntryId === undefined
+              ? {}
+              : { expectedExistingEntryId: payload.value.expectedExistingEntryId }),
+            expectedCollaborationRevision: fromProtoRevision(
+              payload.value.expectedCollaborationRevision,
+              "start_skill_publication.expected_collaboration_revision"
+            ),
+            metadata: nativeSkillPublicationMetadata(payload.value.metadata),
+            publisher: nativeSkillPublicationPublisher(payload.value.publisher),
+            ...(payload.value.publisherScopeId === undefined ? {} : {
+              publisherScopeId: nonBlankRequest(payload.value.publisherScopeId, "publisher_scope_id")
+            }),
+            visibility: nativeSkillPublicationVisibility(payload.value.visibility),
+            audienceScopeIds: payload.value.audienceScopeIds.map((scopeId) => nonBlankRequest(scopeId, "audience_scope_ids"))
+          });
+        }),
+        undefined,
+        undefined,
+        async (completed) => {
+          if (!completed.replayed) dependencies.skillPublication!.begin(jobId);
+        }
+      );
+    }
+    case "cancelSkillPublication": {
+      if (dependencies.skillPublication === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Skill publication is unavailable.");
+      }
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const jobId = nonBlankRequest(payload.value.jobId, "job_id");
+      const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "cancel_skill_publication.expected_revision");
+      return effectOperation(dependencies, operationId, connection, mutation, payload.case, {
+        accepted: true,
+        resultCase: "acknowledgement",
+        entityId: jobId
+      }, async () => skillEffect(async () => {
+        await dependencies.skillPublication!.cancel(jobId, expectedRevision);
+      }));
+    }
+    case "retrySkillPublication": {
+      if (dependencies.skillPublication === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Skill publication is unavailable.");
+      }
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const previousJobId = nonBlankRequest(payload.value.jobId, "job_id");
+      const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "retry_skill_publication.expected_revision");
+      let resumedJobId: string | undefined;
+      return ackOperation(
+        dependencies,
+        operationId,
+        connection,
+        mutation,
+        payload.case,
+        async () => skillEffect(async () => {
+          resumedJobId = (await dependencies.skillPublication!.retry(
+            previousJobId,
+            expectedRevision,
+            skillPublicationJobId(operationId)
+          )).id;
+        }),
+        undefined,
+        undefined,
+        async (completed) => {
+          if (!completed.replayed && resumedJobId !== undefined) dependencies.skillPublication!.begin(resumedJobId);
+        }
+      );
+    }
+    case "updateSkillMarketAccess": {
+      if (dependencies.skillMarket === undefined || dependencies.collaboration === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Skill visibility management is unavailable.");
+      }
+      if (payload.value.expectedAccessRevision === undefined) throw invalidArgument("expected_access_revision is required");
+      if (payload.value.expectedCollaborationRevision === undefined) throw invalidArgument("expected_collaboration_revision is required");
+      const identity = nativeSkillMarketIdentity(payload.value.identity);
+      const expectedAccessRevision = fromProtoRevision(payload.value.expectedAccessRevision, "update_skill_market_access.expected_access_revision");
+      const publisher = nativeSkillPublicationPublisher(payload.value.publisher);
+      const visibility = nativeSkillPublicationVisibility(payload.value.visibility);
+      return ackOperation(
+        dependencies,
+        operationId,
+        connection,
+        mutation,
+        payload.case,
+        async () => skillMarketEffect(async () => {
+          await dependencies.skillMarket!.updateEntryAccess({
+            identity,
+            expectedAccessRevision,
+            expectedCollaborationRevision: fromProtoRevision(
+              payload.value.expectedCollaborationRevision!,
+              "update_skill_market_access.expected_collaboration_revision"
+            ),
+            selection: {
+              publisher,
+              ...(payload.value.publisherScopeId === undefined ? {} : {
+                publisherScopeId: nonBlankRequest(payload.value.publisherScopeId, "publisher_scope_id")
+              }),
+              visibility,
+              audienceScopeIds: payload.value.audienceScopeIds.map((scopeId) => nonBlankRequest(scopeId, "audience_scope_ids"))
+            }
+          });
+        })
+      );
+    }
+    case "createCollaborationScope": {
+      if (dependencies.collaboration === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Collaboration scope management is unavailable.");
+      }
+      if (payload.value.expectedCatalogRevision === undefined) throw invalidArgument("expected_catalog_revision is required");
+      return ackOperation(
+        dependencies,
+        operationId,
+        connection,
+        mutation,
+        payload.case,
+        async () => {
+          collaborationEffectSync(() => dependencies.collaboration!.createScope({
+            expectedCatalogRevision: fromProtoRevision(payload.value.expectedCatalogRevision!, "create_collaboration_scope.expected_catalog_revision"),
+            kind: nativeCollaborationScopeKind(payload.value.kind),
+            name: nonBlankRequest(payload.value.name, "name")
+          }));
+        }
+      );
+    }
+    case "updateCollaborationScope": {
+      if (dependencies.collaboration === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Collaboration scope management is unavailable.");
+      }
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      return ackOperation(
+        dependencies,
+        operationId,
+        connection,
+        mutation,
+        payload.case,
+        async () => {
+          collaborationEffectSync(() => dependencies.collaboration!.updateScope({
+            scopeId: nonBlankRequest(payload.value.scopeId, "scope_id"),
+            expectedRevision: fromProtoRevision(payload.value.expectedRevision!, "update_collaboration_scope.expected_revision"),
+            name: nonBlankRequest(payload.value.name, "name")
+          }));
+        }
+      );
+    }
+    case "deleteCollaborationScope": {
+      if (dependencies.collaboration === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Collaboration scope management is unavailable.");
+      }
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      return ackOperation(
+        dependencies,
+        operationId,
+        connection,
+        mutation,
+        payload.case,
+        async () => collaborationEffectSync(() => {
+          const scopeId = nonBlankRequest(payload.value.scopeId, "scope_id");
+          if (dependencies.skillMarket?.usesCollaborationScope(scopeId) === true
+            || dependencies.skillPublication?.usesCollaborationScope(scopeId) === true) {
+            throw new CollaborationError(
+              "COLLABORATION_SCOPE_IN_USE",
+              "The collaboration scope is referenced by a Skill publication or access policy."
+            );
+          }
+          dependencies.collaboration!.removeScope({
+            scopeId,
+            expectedRevision: fromProtoRevision(payload.value.expectedRevision!, "delete_collaboration_scope.expected_revision")
+          });
+        })
+      );
+    }
+    case "addExtensionSource": {
+      if (dependencies.extensionSources === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The Extension source authority is unavailable.");
+      }
+      if (payload.value.expectedCatalogRevision === undefined) throw invalidArgument("expected_catalog_revision is required");
+      const expectedRevision = fromProtoRevision(payload.value.expectedCatalogRevision, "add_extension_source.expected_catalog_revision");
+      const source = nativeExtensionSourceLocation(payload.value.source);
+      return effectOperation(dependencies, operationId, connection, mutation, payload.case, {
+        accepted: true,
+        resultCase: "acknowledgement",
+        entityId: "extension-sources"
+      }, async () => extensionSourceEffect(async () => {
+        await dependencies.extensionSources!.add(source, expectedRevision);
+        reconcileExtensionCatalog(dependencies);
+      }));
+    }
+    case "refreshExtensionSource": {
+      if (dependencies.extensionSources === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The Extension source authority is unavailable.");
+      }
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "refresh_extension_source.expected_revision");
+      const sourceId = nonBlankRequest(payload.value.sourceId, "source_id");
+      return effectOperation(dependencies, operationId, connection, mutation, payload.case, {
+        accepted: true,
+        resultCase: "acknowledgement",
+        entityId: sourceId
+      }, async () => extensionSourceEffect(async () => {
+        try {
+          await dependencies.extensionSources!.refresh(sourceId, expectedRevision);
+        } finally {
+          // A failed discovery is itself a durable source state transition:
+          // preserve its old entries but project the recoverable error now.
+          reconcileExtensionCatalog(dependencies);
+        }
+      }));
+    }
+    case "removeExtensionSource": {
+      if (dependencies.extensionSources === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The Extension source authority is unavailable.");
+      }
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "remove_extension_source.expected_revision");
+      const sourceId = nonBlankRequest(payload.value.sourceId, "source_id");
+      return effectOperation(dependencies, operationId, connection, mutation, payload.case, {
+        accepted: true,
+        resultCase: "acknowledgement",
+        entityId: sourceId
+      }, async () => extensionSourceEffect(async () => {
+        await dependencies.extensionSources!.remove(sourceId, expectedRevision);
+        reconcileExtensionCatalog(dependencies);
+      }));
+    }
+    case "adoptExtensionPackage": {
+      if (
+        dependencies.extensionCatalog === undefined
+        || dependencies.extensionSources === undefined
+        || dependencies.piResources === undefined
+      ) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Extension package installation is unavailable.");
+      }
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "adopt_extension_package.expected_revision");
+      const expectedAction = nativeExtensionPackageAction(payload.value.expectedAction);
+      const extensionId = nonBlankRequest(payload.value.extensionId, "extension_id");
+      const backendId = nonBlankRequest(payload.value.backendId, "backend_id");
+      const expectedCurrentResourceId = payload.value.expectedCurrentResourceId === ""
+        ? undefined
+        : nonBlankRequest(payload.value.expectedCurrentResourceId, "expected_current_resource_id");
+      const expectedCurrentResourceVersion = payload.value.expectedCurrentResourceRevision === undefined
+        ? undefined
+        : fromProtoRevision(payload.value.expectedCurrentResourceRevision, "adopt_extension_package.expected_current_resource_revision");
+      if ((expectedCurrentResourceId === undefined) !== (expectedCurrentResourceVersion === undefined)) {
+        throw invalidArgument("expected_current_resource_id and expected_current_resource_revision must be supplied together");
+      }
+      // Reconcile before entering the Operation transaction. Final fences use
+      // the catalog's read-only current definition so a rejected transaction
+      // cannot leave its in-memory projection ahead of rolled-back storage.
+      void requireExtensionMutation(dependencies, extensionId, expectedRevision);
+      return adoptExtensionPackageEffectOperation(dependencies, operationId, connection, mutation, payload.case, {
+        extensionId,
+        expectedRevision,
+        backendId,
+        expectedAction,
+        ...(expectedCurrentResourceId === undefined ? {} : { expectedCurrentResourceId }),
+        ...(expectedCurrentResourceVersion === undefined ? {} : { expectedCurrentResourceVersion }),
+        allowSourceReplacement: payload.value.allowSourceReplacement
+      });
+    }
+    case "removeExtensionPackage": {
+      if (dependencies.piResources === undefined || dependencies.extensionCatalog === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Extension package removal is unavailable.");
+      }
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "remove_extension_package.expected_revision");
+      const extensionId = nonBlankRequest(payload.value.extensionId, "extension_id");
+      const extension = requireExtensionMutation(dependencies, extensionId, expectedRevision);
+      if (extension.owner.kind !== "resource") {
+        throw new ConnectError("Only an installed Resource-owned Extension can be removed.", Code.FailedPrecondition);
+      }
+      const resourceId = extension.owner.resourceId;
+      const result = await preparedResourceEffectOperation(
+        dependencies,
+        operationId,
+        connection,
+        mutation,
+        payload.case,
+        resourceId,
+        false,
+        () => dependencies.piResources!.prepareRemove(resourceId),
+        {
+          fenceBackendIdentity: true,
+          precondition: () => {
+            const current = requireCurrentExtensionMutation(dependencies, extensionId, expectedRevision);
+            if (current.owner.kind !== "resource" || current.owner.resourceId !== resourceId) {
+              throw new ConnectError("Extension owner changed concurrently.", Code.Aborted);
+            }
+          },
+          afterCommit: () => {
+            reconcileCommittedExtensionCatalog(dependencies, extensionId);
+          },
+          extensionLibraryAuthorityChange: "orphan"
+        }
+      );
+      return result;
+    }
+    case "startExtensionPackageExport": {
+      if (
+        dependencies.extensionCatalog === undefined
+        || dependencies.extensionPackagePublisher === undefined
+        || dependencies.piResources === undefined
+      ) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Extension package export is unavailable.");
+      }
+      if (payload.value.expectedExtensionRevision === undefined) throw invalidArgument("expected_extension_revision is required");
+      if (payload.value.expectedResourceRevision === undefined) throw invalidArgument("expected_resource_revision is required");
+      if (payload.value.expectedBackendRevision === undefined) throw invalidArgument("expected_backend_revision is required");
+      const extensionId = nonBlankRequest(payload.value.extensionId, "extension_id");
+      const expectedExtensionRevision = fromProtoRevision(
+        payload.value.expectedExtensionRevision,
+        "start_extension_package_export.expected_extension_revision"
+      );
+      const expected = {
+        resourceId: nonBlankRequest(payload.value.resourceId, "resource_id"),
+        resourceRevision: fromProtoRevision(
+          payload.value.expectedResourceRevision,
+          "start_extension_package_export.expected_resource_revision"
+        ),
+        backendId: nonBlankRequest(payload.value.backendId, "backend_id"),
+        backendRevision: fromProtoRevision(
+          payload.value.expectedBackendRevision,
+          "start_extension_package_export.expected_backend_revision"
+        ),
+        backendGeneration: safeUnsignedNumber(
+          payload.value.expectedBackendGeneration,
+          "expected_backend_generation"
+        )
+      };
+      let admitted: NativeExtensionPackageExportAuthority | undefined;
+      let prepared: PreparedExtensionPackageExport | undefined;
+      const assertAdmission = (currentOnly = false, store: OperationalStore = dependencies.store) => {
+        const current = requireExtensionPackageExportAuthority(
+          dependencies,
+          extensionId,
+          expectedExtensionRevision,
+          currentOnly,
+          store
+        );
+        assertExpectedExtensionPackageExportAuthority(current, expected);
+        if (admitted === undefined) admitted = current;
+        else assertSameExtensionPackageExportAuthority(admitted, current);
+        return current;
+      };
+      void assertAdmission();
+      return ackOperation(
+        dependencies,
+        operationId,
+        connection,
+        mutation,
+        payload.case,
+        async () => extensionPublisherEffect(async () => {
+          const authority = assertAdmission();
+          prepared = await dependencies.extensionPackagePublisher!.prepareStart({
+            exportId: operationId,
+            authority
+          });
+        }),
+        (store) => { void assertAdmission(true, store); },
+        (commit) => dependencies.extensionPackagePublisher!.completePreparedMutation(
+          requiredPreparedExtensionPackageExport(prepared),
+          (finalize) => commit(finalize)
+        ),
+        async (execution) => {
+          if (execution.replayed) return;
+          dependencies.extensionPackagePublisher!.begin(operationId, () => {
+            const current = requireExtensionPackageExportAuthority(
+              dependencies,
+              extensionId,
+              expectedExtensionRevision,
+              true
+            );
+            assertSameExtensionPackageExportAuthority(admitted!, current);
+          });
+        }
+      );
+    }
+    case "cancelExtensionPackageExport": {
+      if (dependencies.extensionPackagePublisher === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Extension package export is unavailable.");
+      }
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const exportId = nonBlankRequest(payload.value.exportId, "export_id");
+      const expectedRevision = fromProtoRevision(
+        payload.value.expectedRevision,
+        "cancel_extension_package_export.expected_revision"
+      );
+      let prepared: PreparedExtensionPackageExport | undefined;
+      return ackOperation(
+        dependencies,
+        operationId,
+        connection,
+        mutation,
+        payload.case,
+        async () => extensionPublisherEffect(async () => {
+          prepared = await dependencies.extensionPackagePublisher!.prepareCancel(exportId, expectedRevision);
+        }),
+        undefined,
+        (commit) => dependencies.extensionPackagePublisher!.completePreparedMutation(
+          requiredPreparedExtensionPackageExport(prepared),
+          (finalize) => commit(finalize)
+        ),
+        async () => { dependencies.extensionPackagePublisher!.abort(exportId); }
+      );
+    }
+    case "setExtensionEnabled": {
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "set_extension_enabled.expected_revision");
+      const entry = requireExtensionMutation(dependencies, payload.value.extensionId, expectedRevision);
+      if (entry.owner.kind === "resource") {
+        const resourceId = entry.owner.resourceId;
+        if (dependencies.piResources === undefined) {
+          return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The managed Resource authority is unavailable.");
+        }
+        const result = await preparedResourceEffectOperation(
+          dependencies,
+          operationId,
+          connection,
+          mutation,
+          payload.case,
+          resourceId,
+          payload.value.enabled,
+          () => {
+            const current = requireExtensionMutation(dependencies, entry.id, expectedRevision);
+            if (current.owner.kind !== "resource" || current.owner.resourceId !== resourceId) {
+              throw new ConnectError("Extension owner changed concurrently.", Code.Aborted);
+            }
+            return dependencies.piResources!.prepareSetEnabled(current.owner.resourceId, payload.value.enabled);
+          },
+          {
+            afterCommit: () => { reconcileCommittedExtensionCatalog(dependencies, entry.id); },
+            ...(payload.value.enabled
+              ? {}
+              : { extensionLibraryAuthorityChange: "revoke" })
+          }
+        );
+        return result;
+      }
+      if (entry.owner.kind === "source") {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Install this catalog entry before enabling it.");
+      }
+      if (dependencies.mcpRouter === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The MCP authority is unavailable.");
+      }
+      const serverId = entry.owner.serverId;
+      return effectOperation(dependencies, operationId, connection, mutation, payload.case, {
+        accepted: true,
+        resultCase: "acknowledgement",
+        entityId: entry.id
+      }, async () => extensionCatalogEffect(async () => {
+        const current = requireExtensionMutation(dependencies, entry.id, expectedRevision);
+        if (current.owner.kind !== "mcp" || current.owner.serverId !== serverId) {
+          throw new ConnectError("Extension owner changed concurrently.", Code.Aborted);
+        }
+        const server = dependencies.mcpRouter!.list().find((candidate) => candidate.id === serverId);
+        if (server === undefined) throw new ConnectError("Extension MCP owner not found.", Code.NotFound);
+        await dependencies.mcpRouter!.upsert(extensionMcpInput(server, payload.value.enabled), server.version);
+        await dependencies.refreshPiGeneration?.();
+        reconcileExtensionCatalog(dependencies);
+      }));
+    }
+    case "setExtensionSidebarVisible": {
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "set_extension_sidebar_visible.expected_revision");
+      return presented(await host.mutate({
+        operationId,
+        connection,
+        kind: payload.case,
+        body: mutation,
+        commit: () => {
+          const current = requireExtensionMutation(dependencies, payload.value.extensionId, expectedRevision);
+          extensionCatalogAction(() => dependencies.extensionCatalog!.setSidebarVisible(
+            current.id,
+            payload.value.visible,
+            expectedRevision
+          ));
+          return { accepted: true, resultCase: "acknowledgement", entityId: current.id } satisfies OperationOutcome;
+        }
+      }));
+    }
+    case "beginExtensionSetup": {
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "begin_extension_setup.expected_revision");
+      return presented(await host.mutate({
+        operationId,
+        connection,
+        kind: payload.case,
+        body: mutation,
+        commit: () => {
+          const current = requireExtensionMutation(dependencies, payload.value.extensionId, expectedRevision);
+          extensionCatalogAction(() => dependencies.extensionCatalog!.beginSetup(current.id, expectedRevision));
+          return { accepted: true, resultCase: "acknowledgement", entityId: current.id } satisfies OperationOutcome;
+        }
+      }));
+    }
+    case "submitExtensionSetupInteraction": {
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "submit_extension_setup_interaction.expected_revision");
+      const setupValue = payload.value.value.case === "text"
+        ? payload.value.value.value
+        : payload.value.value.case === "confirmed"
+          ? payload.value.value.value
+          : undefined;
+      if (setupValue === undefined) throw invalidArgument("setup interaction value is required");
+      return presented(await host.mutate({
+        operationId,
+        connection,
+        kind: payload.case,
+        body: mutation,
+        commit: () => {
+          const current = requireExtensionMutation(dependencies, payload.value.extensionId, expectedRevision);
+          extensionCatalogAction(() => dependencies.extensionCatalog!.submitSetupInteraction({
+            extensionId: current.id,
+            attemptId: nonBlankRequest(payload.value.attemptId, "attempt_id"),
+            fieldId: nonBlankRequest(payload.value.fieldId, "field_id"),
+            value: setupValue,
+            expectedRevision
+          }));
+          return { accepted: true, resultCase: "acknowledgement", entityId: current.id } satisfies OperationOutcome;
+        }
+      }));
+    }
+    case "commitExtensionSetupCredential": {
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "commit_extension_setup_credential.expected_revision");
+      const entry = requireExtensionMutation(dependencies, payload.value.extensionId, expectedRevision);
+      return effectOperation(dependencies, operationId, connection, mutation, payload.case, {
+        accepted: true,
+        resultCase: "acknowledgement",
+        entityId: entry.id
+      }, async () => extensionCatalogEffect(async () => {
+        requireExtensionMutation(dependencies, entry.id, expectedRevision);
+        await dependencies.extensionCatalog!.commitSetupCredential({
+          extensionId: entry.id,
+          attemptId: nonBlankRequest(payload.value.attemptId, "attempt_id"),
+          fieldId: nonBlankRequest(payload.value.fieldId, "field_id"),
+          credentialUploadTicketId: nonBlankRequest(payload.value.credentialUploadTicketId, "credential_upload_ticket_id"),
+          connectionId: connection.id,
+          expectedRevision
+        });
+      }));
+    }
+    case "completeExtensionSetup": {
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "complete_extension_setup.expected_revision");
+      const entry = requireExtensionMutation(dependencies, payload.value.extensionId, expectedRevision);
+      const attemptId = nonBlankRequest(payload.value.attemptId, "attempt_id");
+      return effectOperation(dependencies, operationId, connection, mutation, payload.case, {
+        accepted: true,
+        resultCase: "acknowledgement",
+        entityId: entry.id
+      }, async () => extensionCatalogEffect(async () => {
+        const current = requireExtensionMutation(dependencies, entry.id, expectedRevision);
+        dependencies.extensionCatalog!.completeSetup(current.id, attemptId, expectedRevision);
+        if (current.owner.kind === "mcp" && dependencies.mcpRouter !== undefined) {
+          const serverId = current.owner.serverId;
+          const server = dependencies.mcpRouter.list().find((candidate) => candidate.id === serverId);
+          if (server === undefined) throw new ConnectError("Extension MCP owner not found.", Code.NotFound);
+          if (server.enabled) {
+            const restarted = await dependencies.mcpRouter.restart(server.id);
+            await dependencies.refreshPiGeneration?.();
+            if (restarted.state === "error") {
+              dependencies.extensionCatalog!.failSetup(current.id, attemptId, "Connection could not be verified.");
+              reconcileExtensionCatalog(dependencies);
+              throw new ConnectError("Extension connection could not be verified.", Code.Unavailable);
+            }
+          }
+        }
+        reconcileExtensionCatalog(dependencies);
+      }));
+    }
+    case "cancelExtensionSetup": {
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "cancel_extension_setup.expected_revision");
+      return presented(await host.mutate({
+        operationId,
+        connection,
+        kind: payload.case,
+        body: mutation,
+        commit: () => {
+          const current = requireExtensionMutation(dependencies, payload.value.extensionId, expectedRevision);
+          extensionCatalogAction(() => dependencies.extensionCatalog!.cancelSetup(
+            current.id,
+            nonBlankRequest(payload.value.attemptId, "attempt_id"),
+            expectedRevision
+          ));
+          return { accepted: true, resultCase: "acknowledgement", entityId: current.id } satisfies OperationOutcome;
+        }
+      }));
+    }
+    case "revokeExtensionSetup": {
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "revoke_extension_setup.expected_revision");
+      const entry = requireExtensionMutation(dependencies, payload.value.extensionId, expectedRevision);
+      return effectOperation(dependencies, operationId, connection, mutation, payload.case, {
+        accepted: true,
+        resultCase: "acknowledgement",
+        entityId: entry.id
+      }, async () => extensionCatalogEffect(async () => {
+        const current = requireExtensionMutation(dependencies, entry.id, expectedRevision);
+        await dependencies.extensionCatalog!.revokeSetup(current.id, expectedRevision);
+        if (current.owner.kind === "mcp" && dependencies.mcpRouter !== undefined) {
+          const serverId = current.owner.serverId;
+          const server = dependencies.mcpRouter.list().find((candidate) => candidate.id === serverId);
+          if (server?.enabled === true) {
+            await dependencies.mcpRouter.restart(server.id);
+            await dependencies.refreshPiGeneration?.();
+          }
+        }
+        reconcileExtensionCatalog(dependencies);
+      }));
     }
     case "abortToolCall": {
       const projected = listProjectedToolCalls(dependencies.store).find((item) => item.value.toolCallId === payload.value.toolCallId);
@@ -16221,6 +20274,175 @@ async function effectOperation(
   }));
 }
 
+interface AdoptExtensionPackageOperationInput {
+  readonly extensionId: string;
+  readonly expectedRevision: bigint;
+  readonly backendId: string;
+  readonly expectedAction: NativePiExtensionPackageAction;
+  readonly expectedCurrentResourceId?: string;
+  readonly expectedCurrentResourceVersion?: bigint;
+  readonly allowSourceReplacement: boolean;
+}
+
+async function adoptExtensionPackageEffectOperation(
+  dependencies: ConnectServiceDependencies,
+  operationId: string,
+  connection: ConnectionRecord,
+  mutation: contract.OperationMutation,
+  kind: string,
+  input: AdoptExtensionPackageOperationInput
+): Promise<PresentedOperation> {
+  let admittedCapability: BackendResourceAdmission | undefined;
+  let admittedAcquisition: ReturnType<typeof extensionPackageAcquisition> | undefined;
+  let lease: ExtensionSourceEntryLease | undefined;
+  let libraryAuthorityLease: ExtensionLibraryAuthorityChangeLease | undefined;
+  let libraryAuthorityChanges: readonly ResourceExtensionLibraryAuthority[] | undefined;
+  let prepared: PreparedPiResourceMutation<NativePiResourceDescriptor> | undefined;
+  let resourceCatalogFence: symbol | undefined;
+  const assertAuthority = (store: OperationalStore): ReturnType<typeof extensionPackageAcquisition> => {
+    const observed = backendResourceAdmission(dependencies, input.backendId, store);
+    if (!observed.kinds.includes("package")) {
+      throw new ConnectError("The selected Backend does not support managed package resources.", Code.FailedPrecondition);
+    }
+    if (admittedCapability === undefined) admittedCapability = observed;
+    else if (
+      admittedCapability.backendId !== observed.backendId
+      || admittedCapability.instanceGeneration !== observed.instanceGeneration
+      || !sameResourceKinds(admittedCapability.kinds, observed.kinds)
+    ) {
+      throw new ConnectError("Managed resource Backend authority changed while the Extension operation was in progress.", Code.Aborted);
+    }
+    const extension = requireCurrentExtensionMutation(dependencies, input.extensionId, input.expectedRevision);
+    const acquisition = extensionPackageAcquisition(extension);
+    if (admittedAcquisition === undefined) admittedAcquisition = acquisition;
+    else if (!sameExtensionPackageAcquisition(admittedAcquisition, acquisition)) {
+      throw new ConnectError("Extension source selection changed while the operation was in progress.", Code.Aborted);
+    }
+    const currentResourceId = extension.owner.kind === "resource"
+      ? extension.owner.resourceId
+      : input.expectedCurrentResourceId;
+    if (currentResourceId !== undefined && dependencies.extensionLibraries !== undefined) {
+      const observed = resourceExtensionLibraryAuthorities(dependencies, currentResourceId);
+      if (libraryAuthorityChanges === undefined) libraryAuthorityChanges = observed;
+      else if (!sameResourceExtensionLibraryAuthorities(libraryAuthorityChanges, observed)) {
+        throw new ConnectError("Extension Library authority changed while the package operation was in progress.", Code.Aborted);
+      }
+    }
+    return acquisition;
+  };
+  try {
+    const execution = await extensionSourceEffect(() => dependencies.sessionHost.mutate<OperationOutcome>({
+      operationId,
+      connection,
+      kind,
+      body: mutation,
+      commit: () => ({
+        accepted: true,
+        resultCase: "resource",
+        entityId: requiredPreparedResourceMutation(prepared).value.id
+      }),
+      precondition: (store) => { void assertAuthority(store); },
+      effect: async () => {
+        const acquisition = assertAuthority(dependencies.store);
+        lease = await dependencies.extensionSources!.acquireEntry(acquisition);
+        const source = lease.source;
+        const entry = lease.entry;
+        const planned = await dependencies.piResources!.prepareExtensionPackage({
+          resourceId: entry.resourceId,
+          backendId: input.backendId,
+          sourceId: source.id,
+          sourceRevision: source.revision,
+          sourceIdentity: source.sourceIdentity,
+          sourceDisplay: source.sourceDisplay,
+          packageRelativePath: entry.packageRelativePath,
+          packageContentRevision: entry.packageContentRevision,
+          packageName: entry.packageName,
+          ...(entry.version === undefined ? {} : { version: entry.version }),
+          bindingName: entry.bindingName,
+          bindingOrdinal: entry.bindingOrdinal,
+          packageRoot: lease.packageRoot,
+          approvedByConnectionId: connection.id,
+          expectedAction: input.expectedAction,
+          ...(input.expectedCurrentResourceId === undefined ? {} : { expectedCurrentResourceId: input.expectedCurrentResourceId }),
+          ...(input.expectedCurrentResourceVersion === undefined ? {} : { expectedCurrentResourceVersion: input.expectedCurrentResourceVersion }),
+          allowSourceReplacement: input.allowSourceReplacement
+        });
+        prepared = planned.mutation;
+        if (libraryAuthorityChanges !== undefined && libraryAuthorityChanges.length > 0) {
+          libraryAuthorityLease = await dependencies.extensionLibraries?.acquireAuthorityChanges(
+            libraryAuthorityChanges.map((change) => change.extensionId)
+          );
+        }
+      },
+      complete: (commit) => dependencies.piResources!.completePreparedMutation(
+        requiredPreparedResourceMutation(prepared),
+        (finalize) => {
+          lease?.assertCurrent();
+          void assertAuthority(dependencies.store);
+          const completed = commit(finalize);
+          resourceCatalogFence = dependencies.sessionHost.fenceBackendResourceCatalogs(input.backendId);
+          return completed;
+        }
+      )
+    }));
+    if (!execution.replayed) {
+      if (prepared === undefined || resourceCatalogFence === undefined) {
+        throw new StoreError("Extension package operation completed without its Resource fence.");
+      }
+      reconcileCommittedExtensionCatalog(dependencies, input.extensionId);
+      await reconcileCommittedResourceRuntime(
+        dependencies,
+        input.backendId,
+        prepared.value.id,
+        resourceCatalogFence
+      );
+    }
+    return presented(execution);
+  } finally {
+    try {
+      await libraryAuthorityLease?.release();
+    } finally {
+      lease?.release();
+    }
+  }
+}
+
+function sameExtensionPackageAcquisition(
+  left: ReturnType<typeof extensionPackageAcquisition>,
+  right: ReturnType<typeof extensionPackageAcquisition>
+): boolean {
+  return left.sourceId === right.sourceId
+    && left.sourceRevision === right.sourceRevision
+    && left.entryId === right.entryId
+    && left.contentRevision === right.contentRevision;
+}
+
+interface ResourceExtensionLibraryAuthority {
+  readonly extensionId: string;
+  readonly name: string;
+}
+
+function resourceExtensionLibraryAuthorities(
+  dependencies: ConnectServiceDependencies,
+  resourceId: string
+): readonly ResourceExtensionLibraryAuthority[] {
+  if (dependencies.extensionCatalog === undefined) return [];
+  return dependencies.extensionCatalog.snapshot().entries
+    .filter((entry) => entry.owner.kind === "resource" && entry.owner.resourceId === resourceId && entry.library !== undefined)
+    .map((entry) => ({ extensionId: entry.id, name: entry.name }))
+    .sort((left, right) => left.extensionId.localeCompare(right.extensionId, "en"));
+}
+
+function sameResourceExtensionLibraryAuthorities(
+  left: readonly ResourceExtensionLibraryAuthority[],
+  right: readonly ResourceExtensionLibraryAuthority[]
+): boolean {
+  return left.length === right.length && left.every((entry, index) => {
+    const candidate = right[index];
+    return candidate !== undefined && candidate.extensionId === entry.extensionId && candidate.name === entry.name;
+  });
+}
+
 async function preparedResourceEffectOperation(
   dependencies: ConnectServiceDependencies,
   operationId: string,
@@ -16229,12 +20451,22 @@ async function preparedResourceEffectOperation(
   kind: string,
   resourceId: string,
   requireCapability: boolean,
-  prepare: () => Promise<PreparedPiResourceMutation<NativePiResourceDescriptor>>
+  prepare: () => Promise<PreparedPiResourceMutation<NativePiResourceDescriptor>>,
+  options: {
+    readonly fenceBackendIdentity?: boolean;
+    readonly precondition?: (store: OperationalStore) => void;
+    readonly afterCommit?: () => void | Promise<void>;
+    readonly extensionLibraryAuthorityChange?: "revoke" | "orphan";
+  } = {}
 ): Promise<PresentedOperation> {
   let admittedBackendId: string | undefined;
+  let admittedBackendInstanceGeneration: number | undefined;
   let admittedCapability: BackendResourceAdmission | undefined;
   let prepared: PreparedPiResourceMutation<NativePiResourceDescriptor> | undefined;
   let resourceCatalogFence: symbol | undefined;
+  let libraryAuthorityLease: ExtensionLibraryAuthorityChangeLease | undefined;
+  let libraryAuthorityChanges: readonly ResourceExtensionLibraryAuthority[] | undefined;
+  let committed = false;
   const assertResourceAuthority = (store: OperationalStore): NativePiResourceDescriptor => {
     if (dependencies.piResources === undefined) throw new Error("The managed resource authority is unavailable.");
     const resource = dependencies.piResources.get(resourceId);
@@ -16261,35 +20493,136 @@ async function preparedResourceEffectOperation(
           Code.Aborted
         );
       }
+    } else if (options.fenceBackendIdentity === true) {
+      const observed = store.getBackend(resource.backendId).descriptor.instanceGeneration;
+      if (admittedBackendInstanceGeneration === undefined) admittedBackendInstanceGeneration = observed;
+      else if (observed !== admittedBackendInstanceGeneration) {
+        throw new ConnectError(
+          "Managed resource Backend authority changed while the operation was in progress.",
+          Code.Aborted
+        );
+      }
+    }
+    options.precondition?.(store);
+    if (options.extensionLibraryAuthorityChange !== undefined && dependencies.extensionLibraries !== undefined) {
+      const observed = resourceExtensionLibraryAuthorities(dependencies, resourceId);
+      if (libraryAuthorityChanges === undefined) libraryAuthorityChanges = observed;
+      else if (!sameResourceExtensionLibraryAuthorities(libraryAuthorityChanges, observed)) {
+        throw new ConnectError("Extension Library authority changed while the Resource operation was in progress.", Code.Aborted);
+      }
     }
     return resource;
   };
+  try {
+    const execution = await dependencies.sessionHost.mutate<OperationOutcome>({
+      operationId,
+      connection,
+      kind,
+      body: mutation,
+      commit: () => ({ accepted: true, resultCase: "resource", entityId: resourceId }),
+      precondition: (store) => { void assertResourceAuthority(store); },
+      effect: async () => {
+        void assertResourceAuthority(dependencies.store);
+        prepared = await prepare();
+        const authorityChanges = libraryAuthorityChanges;
+        if (authorityChanges !== undefined && authorityChanges.length > 0) {
+          libraryAuthorityLease = await dependencies.extensionLibraries?.acquireAuthorityChanges(
+            authorityChanges.map((change) => change.extensionId)
+          );
+        }
+      },
+      complete: (commit) => dependencies.piResources!.completePreparedMutation(
+        requiredPreparedResourceMutation(prepared),
+        (finalize) => {
+          const execution = commit(finalize);
+          committed = true;
+          resourceCatalogFence = dependencies.sessionHost.fenceBackendResourceCatalogs(admittedBackendId!);
+          return execution;
+        }
+      )
+    });
+    if (!execution.replayed) {
+      if (admittedBackendId === undefined) throw new StoreError("Managed resource operation completed without Backend authority.");
+      if (resourceCatalogFence === undefined) throw new StoreError("Managed resource operation completed without a runtime catalog fence.");
+      await options.afterCommit?.();
+      await reconcileCommittedResourceRuntime(dependencies, admittedBackendId, resourceId, resourceCatalogFence);
+    }
+    return presented(execution);
+  } finally {
+    await libraryAuthorityLease?.release(committed
+      ? {
+          orphaned: options.extensionLibraryAuthorityChange === "orphan"
+            ? libraryAuthorityChanges?.map((change) => ({ extensionId: change.extensionId, name: change.name })) ?? []
+            : []
+        }
+      : undefined);
+  }
+}
+
+async function preparedSkillEffectOperation<T>(
+  dependencies: ConnectServiceDependencies,
+  operationId: string,
+  connection: ConnectionRecord,
+  mutation: contract.OperationMutation,
+  kind: string,
+  prepare: () => Promise<PreparedSkillMutation<T>>,
+  resourceFromValue: (value: T) => NativePiResourceDescriptor
+): Promise<PresentedOperation> {
+  if (dependencies.skills === undefined) {
+    return unsupportedOperation(dependencies, operationId, connection, mutation, kind, "Skill management is unavailable.");
+  }
+  let prepared: PreparedSkillMutation<T> | undefined;
+  let resource: NativePiResourceDescriptor | undefined;
+  let resourceCatalogFence: symbol | undefined;
   const execution = await dependencies.sessionHost.mutate<OperationOutcome>({
     operationId,
     connection,
     kind,
     body: mutation,
-    commit: () => ({ accepted: true, resultCase: "resource", entityId: resourceId }),
-    precondition: (store) => { void assertResourceAuthority(store); },
     effect: async () => {
-      void assertResourceAuthority(dependencies.store);
-      prepared = await prepare();
+      prepared = await skillEffect(prepare);
+      resource = resourceFromValue(prepared.value);
     },
-    complete: (commit) => dependencies.piResources!.completePreparedMutation(
-      requiredPreparedResourceMutation(prepared),
+    commit: () => {
+      if (prepared === undefined || resource === undefined) throw new StoreError("Skill operation completed without a prepared Resource mutation.");
+      const content = prepared.value as PiSkillContentMutationResult | NativePiResourceDescriptor;
+      const replacedResourceId = "resource" in content ? content.replacedResourceId : undefined;
+      return {
+        accepted: true,
+        resultCase: "skill",
+        entityId: resource.id,
+        ...(replacedResourceId === undefined ? {} : { skillReplacedId: replacedResourceId }),
+        ...(prepared.recoveryId === undefined ? {} : { skillRecoveryId: prepared.recoveryId })
+      } satisfies OperationOutcome;
+    },
+    complete: (commit) => skillEffect(() => dependencies.skills!.completePreparedMutation(
+      requiredPreparedSkillMutation(prepared),
       (finalize) => {
-        const execution = commit(finalize);
-        resourceCatalogFence = dependencies.sessionHost.fenceBackendResourceCatalogs(admittedBackendId!);
-        return execution;
+        const completed = commit(finalize);
+        resourceCatalogFence = dependencies.sessionHost.fenceBackendResourceCatalogs(resource!.backendId);
+        return completed;
       }
-    )
+    ))
   });
   if (!execution.replayed) {
-    if (admittedBackendId === undefined) throw new StoreError("Managed resource operation completed without Backend authority.");
-    if (resourceCatalogFence === undefined) throw new StoreError("Managed resource operation completed without a runtime catalog fence.");
-    await reconcileCommittedResourceRuntime(dependencies, admittedBackendId, resourceId, resourceCatalogFence);
+    if (resource === undefined || resourceCatalogFence === undefined) {
+      throw new StoreError("Skill operation completed without its Resource runtime fence.");
+    }
+    await reconcileCommittedResourceRuntime(dependencies, resource.backendId, resource.id, resourceCatalogFence);
   }
   return presented(execution);
+}
+
+function requiredPreparedSkillMutation<T>(prepared: PreparedSkillMutation<T> | undefined): PreparedSkillMutation<T> {
+  if (prepared === undefined) throw new StoreError("Skill operation preparation did not produce a Resource mutation.");
+  return prepared;
+}
+
+function requiredPreparedSkillMarketInstallation(
+  prepared: PreparedSkillMarketInstallation | undefined
+): PreparedSkillMarketInstallation {
+  if (prepared === undefined) throw new StoreError("Skill market installation did not produce a Resource mutation.");
+  return prepared;
 }
 
 interface BackendResourceAdmission {
@@ -16312,6 +20645,13 @@ function requiredPreparedResourceMutation<T>(
   prepared: PreparedPiResourceMutation<T> | undefined
 ): PreparedPiResourceMutation<T> {
   if (prepared === undefined) throw new StoreError("Managed resource preparation did not produce a catalog mutation.");
+  return prepared;
+}
+
+function requiredPreparedExtensionPackageExport(
+  prepared: PreparedExtensionPackageExport | undefined
+): PreparedExtensionPackageExport {
+  if (prepared === undefined) throw new StoreError("Extension package export preparation did not produce a state mutation.");
   return prepared;
 }
 
@@ -16478,6 +20818,29 @@ async function reconcileCommittedResourceRuntime(
     } catch {
       // Store shutdown must not turn a durably completed Operation into an
       // in-memory-only failure response.
+    }
+  }
+}
+
+function reconcileCommittedExtensionCatalog(
+  dependencies: ConnectServiceDependencies,
+  extensionId: string
+): void {
+  try {
+    reconcileExtensionCatalog(dependencies);
+  } catch {
+    // Resource bytes and the Operation have already committed. Keep that
+    // result stable; a later catalog read can retry this derived projection.
+    try {
+      dependencies.store.appendDiagnostic({
+        severity: "warning",
+        component: "extension-catalog",
+        code: "EXTENSION_CATALOG_REFRESH_FAILED",
+        message: "A managed Extension package change was saved, but its catalog projection has not refreshed yet.",
+        details: { extensionId }
+      });
+    } catch {
+      // Store shutdown does not invalidate the completed package Operation.
     }
   }
 }

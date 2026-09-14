@@ -44,7 +44,9 @@ it("uses the authenticated live task resource catalog through durable queue disp
   const profile = {
     ...PI_LIKE_PROFILE,
     capabilities: [
-      ...PI_LIKE_PROFILE.capabilities.filter((entry) => entry.key !== "input.mention"),
+      ...PI_LIKE_PROFILE.capabilities.filter((entry) =>
+        entry.key !== "input.mention" && entry.key !== "runtime.resources"),
+      { key: "runtime.resources", supported: true, options: ["skill", "prompt"] },
       { key: "input.mention", supported: true, options: ["resource"] }
     ]
   };
