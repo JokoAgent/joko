@@ -9,6 +9,7 @@ import { minimatch } from "minimatch";
 
 import {
   parseExtensionSurfaceManifest,
+  type ExtensionLibraryDescriptor,
   type ExtensionMainViewDescriptor
 } from "./extension-surface-manifest.js";
 
@@ -78,6 +79,7 @@ export interface PiPackageResourceDetail {
   /** Exact package-relative runtime entry for Extension resources. */
   readonly entryPath?: string;
   readonly mainView?: ExtensionMainViewDescriptor;
+  readonly library?: ExtensionLibraryDescriptor;
   readonly compatibility: PiPackageCompatibility;
   readonly compatibilityIssues: readonly PiPackageCompatibilityIssue[];
   readonly detectedApis: readonly PiExtensionUiApi[];
@@ -123,6 +125,7 @@ export interface PiPackageCatalogInspection {
     readonly relativePath: string;
     readonly resourceName: string;
     readonly mainView?: ExtensionMainViewDescriptor;
+    readonly library?: ExtensionLibraryDescriptor;
   }[];
 }
 
@@ -372,11 +375,11 @@ export async function inspectPiPackageCompatibility(
       extensionRelativePaths,
       tree.entries.filter((entry) => !entry.directory).map((entry) => entry.relativePath)
     );
-    const mainViews = new Map(surfaces.map((surface) => [surface.entry, surface.mainView] as const));
+    const surfaceByEntry = new Map(surfaces.map((surface) => [surface.entry, surface] as const));
     const extensionResources: PiPackageResourceDetail[] = [];
     for (const entry of extensionPaths) {
       const entryPath = toPosix(relative(source, entry));
-      extensionResources.push(await extensionDetail(source, entry, entryPath, mainViews.get(entryPath)));
+      extensionResources.push(await extensionDetail(source, entry, entryPath, surfaceByEntry.get(entryPath)));
     }
     const resources: PiPackageResourceDetail[] = [
       ...extensionResources,
@@ -431,14 +434,15 @@ export async function inspectPiPackageCatalog(packagePath: string): Promise<PiPa
     extensionRelativePaths,
     tree.entries.filter((entry) => !entry.directory).map((entry) => entry.relativePath)
   );
-  const mainViews = new Map(surfaces.map((surface) => [surface.entry, surface.mainView] as const));
+  const surfaceByEntry = new Map(surfaces.map((surface) => [surface.entry, surface] as const));
   const extensions = extensionPaths.map((entry) => {
     const relativePath = toPosix(relative(source, entry));
-    const mainView = mainViews.get(relativePath);
+    const surface = surfaceByEntry.get(relativePath);
     return {
       relativePath,
       resourceName: boundedDisplay(basename(entry)),
-      ...(mainView === undefined ? {} : { mainView })
+      ...(surface?.mainView === undefined ? {} : { mainView: surface.mainView }),
+      ...(surface?.library === undefined ? {} : { library: surface.library })
     };
   });
   if (extensions.length === 0) throw new Error("Catalog package does not expose a Pi extension.");
@@ -557,7 +561,7 @@ async function extensionDetail(
   root: string,
   entry: string,
   entryPath = toPosix(relative(root, entry)),
-  mainView?: ExtensionMainViewDescriptor
+  surface?: { readonly mainView?: ExtensionMainViewDescriptor; readonly library?: ExtensionLibraryDescriptor }
 ): Promise<PiPackageResourceDetail> {
   try {
     const analysis = await analyzePiExtensionCompatibility(entry, root);
@@ -565,7 +569,8 @@ async function extensionDetail(
       kind: "extension",
       name: boundedDisplay(basename(entry)),
       entryPath,
-      ...(mainView === undefined ? {} : { mainView }),
+      ...(surface?.mainView === undefined ? {} : { mainView: surface.mainView }),
+      ...(surface?.library === undefined ? {} : { library: surface.library }),
       compatibility: analysis.compatibility,
       compatibilityIssues: analysis.compatibilityIssues,
       detectedApis: analysis.detectedApis,
@@ -576,7 +581,8 @@ async function extensionDetail(
     return {
       ...basicResourceDetail("extension", basename(entry), "unknown", ["analysis-incomplete"]),
       entryPath,
-      ...(mainView === undefined ? {} : { mainView })
+      ...(surface?.mainView === undefined ? {} : { mainView: surface.mainView }),
+      ...(surface?.library === undefined ? {} : { library: surface.library })
     };
   }
 }

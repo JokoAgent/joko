@@ -5,6 +5,12 @@ import type {
   DesktopApplicationMenuConfigurationPatch,
   DesktopDiscoveredNode,
   DesktopExtensionWindowOpenResult,
+  DesktopExtensionLibraryBeginSaveRequest,
+  DesktopExtensionLibraryClipboardRequest,
+  DesktopExtensionLibraryCommitSaveRequest,
+  DesktopExtensionLibraryLocationSelection,
+  DesktopExtensionLibraryRevealRequest,
+  DesktopExtensionLibrarySaveSelection,
   DesktopDeepLinkNavigation,
   DesktopDeepLinkSettingsSection,
   DesktopFile,
@@ -66,6 +72,12 @@ const DESKTOP_CHANNELS = {
   windowClose: "joko:window:close",
   sessionWindowOpen: "joko:session-window:open",
   extensionWindowOpen: "joko:extension-window:open",
+  extensionLibraryPickLocation: "joko:extension-library:pick-location",
+  extensionLibraryReveal: "joko:extension-library:reveal",
+  extensionLibraryBeginSave: "joko:extension-library:save:begin",
+  extensionLibraryCommitSave: "joko:extension-library:save:commit",
+  extensionLibraryCancelSave: "joko:extension-library:save:cancel",
+  extensionLibraryClipboardWrite: "joko:extension-library:clipboard-write",
   sessionDragPreviewBegin: "joko:session-drag-preview:begin",
   sessionDragPreviewEnd: "joko:session-drag-preview:end",
   sessionWindowOpenIfDroppedOutside: "joko:session-window:open-if-dropped-outside",
@@ -189,6 +201,8 @@ const desktopCapabilities = Object.freeze([
   "runtime.processMonitorWindow",
   "session.windows",
   "extension.windows",
+  "extension.libraryLocationPicker",
+  "extension.libraryGestures",
   "voice.globalDictation",
   "window.activationClick"
 ] as const);
@@ -235,6 +249,35 @@ const desktopApi = Object.freeze({
       if (!isDesktopExtensionId(extensionId)) return Promise.reject(new TypeError("Extension identity is invalid."));
       return ipcRenderer.invoke(DESKTOP_CHANNELS.extensionWindowOpen, extensionId)
         .then(parseDesktopExtensionWindowOpenResult);
+    }
+  }),
+  extensionLibraries: Object.freeze({
+    pickLocation: (): Promise<DesktopExtensionLibraryLocationSelection> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.extensionLibraryPickLocation)
+        .then(parseDesktopExtensionLibraryLocationSelection),
+    reveal: (request: DesktopExtensionLibraryRevealRequest): Promise<boolean> => {
+      if (!isDesktopExtensionLibraryRevealRequest(request)) return Promise.reject(new TypeError("Extension Library reveal request is invalid."));
+      return ipcRenderer.invoke(DESKTOP_CHANNELS.extensionLibraryReveal, request).then(parseDesktopBoolean);
+    },
+    beginSave: (request: DesktopExtensionLibraryBeginSaveRequest): Promise<DesktopExtensionLibrarySaveSelection> => {
+      if (!isDesktopExtensionLibraryBeginSaveRequest(request)) return Promise.reject(new TypeError("Extension Library save request is invalid."));
+      return ipcRenderer.invoke(DESKTOP_CHANNELS.extensionLibraryBeginSave, request)
+        .then(parseDesktopExtensionLibrarySaveSelection);
+    },
+    commitSave: (request: DesktopExtensionLibraryCommitSaveRequest): Promise<number> => {
+      if (!isDesktopExtensionLibraryCommitSaveRequest(request)) return Promise.reject(new TypeError("Extension Library save commit is invalid."));
+      return ipcRenderer.invoke(DESKTOP_CHANNELS.extensionLibraryCommitSave, request).then(parseExtensionLibraryByteCount);
+    },
+    cancelSave: (ticketId: string): Promise<void> => {
+      if (!EXTENSION_LIBRARY_SAVE_TICKET.test(ticketId)) return Promise.reject(new TypeError("Extension Library save ticket is invalid."));
+      return ipcRenderer.invoke(DESKTOP_CHANNELS.extensionLibraryCancelSave, ticketId).then(() => undefined);
+    },
+    clipboardWrite: (request: DesktopExtensionLibraryClipboardRequest): Promise<number> => {
+      if (!isDesktopExtensionLibraryClipboardRequest(request)) return Promise.reject(new TypeError("Extension Library clipboard request is invalid."));
+      return ipcRenderer.invoke(DESKTOP_CHANNELS.extensionLibraryClipboardWrite, {
+        extensionId: request.extensionId,
+        bytes: new Uint8Array(request.bytes)
+      }).then(parseExtensionLibraryByteCount);
     }
   }),
   runtimeProcessMonitor: Object.freeze({
@@ -1106,6 +1149,94 @@ function parseDesktopExtensionWindowOpenResult(value: unknown): DesktopExtension
     throw new TypeError("Extension window result is invalid.");
   }
   return Object.freeze({ focusedExisting: (value as DesktopExtensionWindowOpenResult).focusedExisting });
+}
+
+function parseDesktopExtensionLibraryLocationSelection(value: unknown): DesktopExtensionLibraryLocationSelection {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new TypeError("Extension Library location selection is invalid.");
+  }
+  const record = value as Record<string, unknown>;
+  if (record["cancelled"] === true && Object.keys(record).join(",") === "cancelled") {
+    return Object.freeze({ cancelled: true });
+  }
+  if (record["cancelled"] !== false || Object.keys(record).sort().join(",") !== "cancelled,path"
+    || typeof record["path"] !== "string" || record["path"].length === 0 || record["path"].length > 32_768
+    || record["path"].trim() !== record["path"] || record["path"].includes("\0")) {
+    throw new TypeError("Extension Library location selection is invalid.");
+  }
+  return Object.freeze({ cancelled: false, path: record["path"] });
+}
+
+const EXTENSION_LIBRARY_SAVE_TICKET = /^extension_library_save_[a-f0-9]{32}$/u;
+const EXTENSION_LIBRARY_PATH_SEGMENT = /^[A-Za-z0-9_@][A-Za-z0-9_@.+ -]*$/u;
+const EXTENSION_LIBRARY_WINDOWS_RESERVED = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/iu;
+const EXTENSION_LIBRARY_SQLITE_SIDECAR = /\.sqlite-(?:wal|shm|journal)$/iu;
+
+function isDesktopExtensionLibraryRevealRequest(value: unknown): value is DesktopExtensionLibraryRevealRequest {
+  if (!exactRecord(value, ["extensionId", "root", "path"])) return false;
+  return isDesktopExtensionId(value["extensionId"]) && isBoundedHostPath(value["root"])
+    && isPortableExtensionLibraryPath(value["path"]);
+}
+
+function isDesktopExtensionLibraryBeginSaveRequest(value: unknown): value is DesktopExtensionLibraryBeginSaveRequest {
+  if (!exactRecord(value, ["extensionId", "name"])) return false;
+  const name = value["name"];
+  return isDesktopExtensionId(value["extensionId"]) && typeof name === "string" && name.length >= 1 && name.length <= 255
+    && name === name.trim() && !/[\u0000-\u001f\u007f<>:"\/\\|?*]/u.test(name)
+    && !name.startsWith(".") && !name.endsWith(".") && !name.endsWith(" ")
+    && !EXTENSION_LIBRARY_WINDOWS_RESERVED.test(name);
+}
+
+function isDesktopExtensionLibraryCommitSaveRequest(value: unknown): value is DesktopExtensionLibraryCommitSaveRequest {
+  if (!exactRecord(value, ["extensionId", "ticketId", "root", "path"])) return false;
+  return isDesktopExtensionId(value["extensionId"])
+    && typeof value["ticketId"] === "string" && EXTENSION_LIBRARY_SAVE_TICKET.test(value["ticketId"])
+    && isBoundedHostPath(value["root"]) && isPortableExtensionLibraryPath(value["path"]);
+}
+
+function isDesktopExtensionLibraryClipboardRequest(value: unknown): value is DesktopExtensionLibraryClipboardRequest {
+  if (!exactRecord(value, ["extensionId", "bytes"]) || !isDesktopExtensionId(value["extensionId"])
+    || !(value["bytes"] instanceof Uint8Array) || value["bytes"].byteLength < 8
+    || value["bytes"].byteLength > 16 * 1024 * 1024) return false;
+  const bytes = value["bytes"];
+  return bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47
+    && bytes[4] === 0x0d && bytes[5] === 0x0a && bytes[6] === 0x1a && bytes[7] === 0x0a;
+}
+
+function parseDesktopExtensionLibrarySaveSelection(value: unknown): DesktopExtensionLibrarySaveSelection {
+  if (exactRecord(value, ["cancelled"]) && value["cancelled"] === true) return Object.freeze({ cancelled: true });
+  if (exactRecord(value, ["cancelled", "ticketId"]) && value["cancelled"] === false
+    && typeof value["ticketId"] === "string" && EXTENSION_LIBRARY_SAVE_TICKET.test(value["ticketId"])) {
+    return Object.freeze({ cancelled: false, ticketId: value["ticketId"] });
+  }
+  throw new TypeError("Extension Library save selection is invalid.");
+}
+
+function parseExtensionLibraryByteCount(value: unknown): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0 || (value as number) > 8 * 1024 * 1024 * 1024) {
+    throw new TypeError("Extension Library native byte count is invalid.");
+  }
+  return value as number;
+}
+
+function isBoundedHostPath(value: unknown): value is string {
+  return typeof value === "string" && value.length >= 1 && value.length <= 32_768
+    && value === value.trim() && !value.includes("\0");
+}
+
+function isPortableExtensionLibraryPath(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 512 || value !== value.trim()
+    || value.includes("\\") || value.includes(":") || value.startsWith("/")) return false;
+  const segments = value.split("/");
+  return segments.length <= 32 && segments.every((segment) => segment !== "" && segment !== "." && segment !== ".."
+    && !segment.startsWith(".") && !segment.endsWith(".") && !segment.endsWith(" ")
+    && EXTENSION_LIBRARY_PATH_SEGMENT.test(segment) && !EXTENSION_LIBRARY_WINDOWS_RESERVED.test(segment)
+    && !EXTENSION_LIBRARY_SQLITE_SIDECAR.test(segment));
+}
+
+function exactRecord(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    && Object.keys(value).sort().join(",") === [...keys].sort().join(",");
 }
 
 function parseDesktopWindowInteractionSettings(value: unknown): DesktopWindowInteractionSettings {

@@ -15,6 +15,7 @@ import {
   auditTerminalRuntimeAssets,
   copyRegularTree,
   claudeSessionElectronSmokeSource,
+  extensionLibraryElectronSmokeSource,
   replaceDirectoryFromPrepared,
   rewriteRuntimePackageManifest,
   ORCHESTRATOR_BUNDLED_NPM_RUNTIME,
@@ -108,7 +109,7 @@ describe("isolated Orchestrator runtime staging", () => {
       ok: true,
       runtimeRoot: realpathSync(fixture.runtimeRoot),
       version: "v0.1.9",
-      electronVersion: "39.2.7"
+      electronVersion: "43.6.0"
     });
   });
 
@@ -126,6 +127,28 @@ describe("isolated Orchestrator runtime staging", () => {
     expect(invalidResult.stderr).toMatch(/extension|sqlite|vec0/iu);
   });
 
+  it("runs the built Extension Library SQLite Worker under Electron-Node", () => {
+    const runtimeRoot = realpathSync(resolve(import.meta.dirname, "../../orchestrator"));
+    const smokeRoot = temporaryDirectory("extension-library-electron");
+    const smokePath = resolve(smokeRoot, "extension-library-smoke.mjs");
+    writeFileSync(smokePath, `${extensionLibraryElectronSmokeSource()}\n`);
+    const result = runNativeProbe({ runtimeRoot, smokePath });
+    expect(result.error, result.stderr).toBeUndefined();
+    expect(result.signal).toBeNull();
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      ok: true,
+      runtimeRoot,
+      managerEntry: realpathSync(resolve(runtimeRoot, "dist", "extension-library-manager.js")),
+      workerEntry: realpathSync(resolve(runtimeRoot, "dist", "extension-library-sql-worker.js")),
+      version: "1",
+      electronVersion: "43.6.0",
+      sqlite: true,
+      changes: 1,
+      selectedValue: "electron-worker"
+    });
+  }, 50_000);
+
   it("runs a relocated native terminal through TTY, resize, input and exit under Electron-Node", async () => {
     const fixture = await terminalRuntimeFixture("terminal-electron");
     const result = runNativeProbe(fixture);
@@ -137,7 +160,7 @@ describe("isolated Orchestrator runtime staging", () => {
       runtimeRoot: realpathSync(fixture.runtimeRoot),
       nativeBinary: fixture.nativeBinary,
       version: "1.1.0",
-      electronVersion: "39.2.7",
+      electronVersion: "43.6.0",
       tty: true,
       input: true,
       resized: true,
@@ -171,7 +194,7 @@ describe("isolated Orchestrator runtime staging", () => {
       ok: true,
       runtimeRoot: realpathSync(fixture.runtimeRoot),
       version: "0.3.259",
-      electronVersion: "39.2.7",
+      electronVersion: "43.6.0",
       workerEntry: inspected.workerEntry,
       managerEntry: inspected.managerEntry,
       assets: expect.arrayContaining([

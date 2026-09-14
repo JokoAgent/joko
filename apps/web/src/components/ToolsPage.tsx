@@ -50,6 +50,7 @@ import type { RunAction, Translator } from "./types.js";
 import { Button, CheckboxControl, EmptyState, IconButton, Modal, Pill, StatusDot, cx, formatRelativeTime, SelectControl } from "./ui.js";
 import { moveTablistSelection } from "./tablist-navigation.js";
 import { extensionMainViewReady } from "./ExtensionMainViewPage.js";
+import { ExtensionLibrarySection } from "./ExtensionLibrarySection.js";
 import { openExtensionWindowFallback } from "../extension-window-navigation.js";
 
 type ToolsTab = "browser" | "extensions" | "resources" | "mcp" | "activity";
@@ -1070,7 +1071,9 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, lo
       {detailLoading && <p className="extension-browser__status" role="status">{t("extensions.loadingDetail")}</p>}
       {detailError !== undefined && <div className="extension-browser__status extension-browser__status--error" role="alert"><span>{detailError}</span><Button onClick={retryDetail}><RefreshCcw aria-hidden="true" />{t("common.retry")}</Button></div>}
       {!detailLoading && detailError === undefined && selectedDetail !== undefined && <ExtensionDetail
+        controller={controller}
         extension={selectedDetail}
+        locale={locale}
         busy={mutationKey !== undefined}
         t={t}
         onEnabledChange={(enabled) => mutate(`extension-enabled:${selectedDetail.id}`, selectedDetail.id, () => controller.setExtensionEnabled(selectedDetail.id, enabled, selectedDetail.revision))}
@@ -1162,8 +1165,10 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, lo
   </div>;
 }
 
-function ExtensionDetail({ extension, busy, t, onEnabledChange, onSidebarChange, onSetup, onUse, onPackage, onExport, onRemove, onOpenMainView, onOpenWindow }: {
+function ExtensionDetail({ controller, extension, locale, busy, t, onEnabledChange, onSidebarChange, onSetup, onUse, onPackage, onExport, onRemove, onOpenMainView, onOpenWindow }: {
+  readonly controller: AppController;
   readonly extension: ExtensionCatalogEntryView;
+  readonly locale: string;
   readonly busy: boolean;
   readonly t: Translator;
   readonly onEnabledChange: (enabled: boolean) => void;
@@ -1182,6 +1187,7 @@ function ExtensionDetail({ extension, busy, t, onEnabledChange, onSidebarChange,
     {extension.error !== undefined && <p className="extension-detail__error" role="alert"><AlertTriangle aria-hidden="true" />{extension.error}</p>}
     <dl className="extension-detail__metadata"><div><dt>{t("extensions.version")}</dt><dd>{extension.version ?? t("common.unknown")}</dd></div><div><dt>{t("extensions.author")}</dt><dd>{extension.author ?? t("common.unknown")}</dd></div><div><dt>{t("common.state")}</dt><dd>{extensionInstallLabel(extension.installState, t)}</dd></div><div><dt>{t("extensions.owner")}</dt><dd>{extension.owner.kind === "resource" ? t("extensions.resourceOwner") : extension.owner.kind === "mcp" ? t("extensions.mcpOwner") : t("extensions.sourceOwner")}</dd></div></dl>
     {extension.mainView !== undefined && <section className="extension-main-view-actions"><LayoutDashboard aria-hidden="true" /><div><strong>{extension.mainView.title ?? t("extensions.mainView.title")}</strong><p>{extensionMainViewReady(extension) ? t("extensions.mainView.readyBody") : t("extensions.mainView.notReadyBody")}</p></div><Button tone="primary" disabled={busy || !extensionMainViewReady(extension)} onClick={onOpenMainView}>{t("extensions.mainView.open")}</Button><Button tone="ghost" disabled={busy || !extensionMainViewReady(extension)} onClick={onOpenWindow}><ExternalLink aria-hidden="true" />{t("extensions.mainView.openWindow")}</Button></section>}
+    {extension.library !== undefined && <ExtensionLibrarySection controller={controller} extension={extension} locale={locale} disabled={busy} t={t} />}
     {sourceOwned ? <section className="extension-source-available"><FolderPlus aria-hidden="true" /><div><strong>{t("extensions.sourceAvailable")}</strong><p>{t("extensions.sourceAvailableBody")}</p></div><Button tone="primary" disabled={busy} onClick={onPackage}><Download aria-hidden="true" />{t("extensions.package.install")}</Button></section> : <section className="extension-detail__settings" aria-label={t("extensions.configuration") }>
       <label><span><strong>{t("extensions.enabled")}</strong><small>{t("extensions.enabledBody")}</small></span><CheckboxControl checked={extension.enabled} disabled={busy} onChange={(event) => onEnabledChange(event.target.checked)} /></label>
       {extension.sidebarSupported && <label><span><strong>{t("extensions.showSidebar")}</strong><small>{t("extensions.showSidebarBody")}</small></span><CheckboxControl checked={extension.sidebarVisible} disabled={busy} onChange={(event) => onSidebarChange(event.target.checked)} /></label>}

@@ -3,7 +3,7 @@ import { constants } from "node:fs";
 import { lstat, mkdir, open, readdir, realpath, rm } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
-import type { ExtensionMainViewDescriptor } from "./extension-surface-manifest.js";
+import type { ExtensionLibraryDescriptor, ExtensionMainViewDescriptor } from "./extension-surface-manifest.js";
 import { inspectPiPackageCatalog } from "./pi-package-compatibility.js";
 import type { PiInstalledPackageLease, PiResourceManager } from "./resource-manager.js";
 
@@ -36,6 +36,7 @@ export interface ExtensionMainViewAuthority {
   readonly packageVersion?: string;
   readonly extensionEntry: string;
   readonly mainView: ExtensionMainViewDescriptor;
+  readonly library?: ExtensionLibraryDescriptor;
 }
 
 export interface ExtensionMainViewSurface {
@@ -95,6 +96,8 @@ const SAFE_CONNECTION_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u;
 const DEFAULT_TTL_MS = 10 * 60_000;
 const DEFAULT_MAXIMUM_SURFACES = 32;
 const DEFAULT_MAXIMUM_ASSET_BYTES = 256 * 1024 * 1024;
+const LIBRARY_BRIDGE_ASSET = "__joko_extension_library_bridge__.js";
+const LIBRARY_BRIDGE_SCRIPT = Buffer.from(`(()=>{"use strict";const p=new Map();let n=0;addEventListener("message",e=>{if(e.source!==parent)return;const d=e.data;if(!d||d.type!=="joko:extension-library-response"||d.version!==1||typeof d.id!=="string")return;const f=p.get(d.id);if(!f)return;const v=d.ok===true&&d.result&&typeof d.result==="object"?Object.freeze({...d.result,ok:true}):d.ok===false&&d.error&&typeof d.error.code==="string"&&typeof d.error.message==="string"?Object.freeze({ok:false,errorCode:d.error.code,message:d.error.message}):null;if(!v)return;p.delete(d.id);clearTimeout(f.t);f.r(v)});const library=operation=>new Promise(r=>{const b=new Uint8Array(16);crypto.getRandomValues(b);const id="library_"+(++n).toString(36)+"_"+Array.from(b,x=>x.toString(16).padStart(2,"0")).join("");const t=setTimeout(()=>{p.delete(id);r(Object.freeze({ok:false,errorCode:"TIMEOUT",message:"Extension Library request timed out."}))},60000);p.set(id,{r,t});parent.postMessage({type:"joko:extension-library-request",version:1,id,operation},"*")});Object.defineProperty(window,"joko",{value:Object.freeze({library}),writable:false,configurable:false})})();`, "utf8");
 
 const MIME_TYPES: Readonly<Record<string, string>> = {
   ".css": "text/css; charset=utf-8",
@@ -198,6 +201,7 @@ export class ExtensionMainViewManager {
         const catalog = await inspectPiPackageCatalog(packageRoot);
         const extension = catalog.extensions.find((entry) => entry.relativePath === input.authority.extensionEntry);
         if (extension === undefined || !sameMainView(extension.mainView, input.authority.mainView)
+          || !sameLibrary(extension.library, input.authority.library)
           || catalog.name !== input.authority.packageName
           || catalog.version !== input.authority.packageVersion) {
           throw new Error("Extension main-view declaration changed while its surface was opening.");
@@ -292,15 +296,28 @@ export class ExtensionMainViewManager {
         await this.#destroy(surface);
         throw new ExtensionMainViewError(410, "Extension main view was revoked.");
       }
+      if (input.assetPath === LIBRARY_BRIDGE_ASSET && surface.authority.library !== undefined) {
+        return {
+          status: 200,
+          mimeType: MIME_TYPES[".js"]!,
+          contentLength: LIBRARY_BRIDGE_SCRIPT.byteLength,
+          ...(input.method === "HEAD" ? {} : { body: Buffer.from(LIBRARY_BRIDGE_SCRIPT) }),
+          headers: surfaceHeaders()
+        };
+      }
       const candidate = safeAssetPath(surface.viewRoot, input.assetPath);
       const mimeType = MIME_TYPES[extname(candidate).toLowerCase()];
       if (mimeType === undefined) throw new ExtensionMainViewError(404, "Extension main-view asset type is not allowed.");
-      const file = await readStableAsset(surface.viewRoot, candidate, this.#maximumAssetBytes, input.method === "HEAD");
+      const entrypoint = resolve(surface.viewRoot, basename(surface.authority.mainView.html));
+      const injectLibrary = samePath(candidate, entrypoint) && mimeType.startsWith("text/html")
+        && surface.authority.library !== undefined;
+      const file = await readStableAsset(surface.viewRoot, candidate, this.#maximumAssetBytes, input.method === "HEAD" && !injectLibrary);
+      const transformed = injectLibrary && file.body !== undefined ? injectLibraryBridge(file.body) : file.body;
       return {
         status: 200,
         mimeType,
-        contentLength: file.size,
-        ...(file.body === undefined ? {} : { body: file.body }),
+        contentLength: transformed?.byteLength ?? file.size,
+        ...(input.method === "HEAD" || transformed === undefined ? {} : { body: transformed }),
         headers: surfaceHeaders()
       };
     });
@@ -388,14 +405,40 @@ function validateAuthority(authority: ExtensionMainViewAuthority): void {
     || authority.packageName.trim() === "" || authority.extensionEntry.trim() === "") {
     throw new Error("Extension main-view authority is invalid.");
   }
+  if (authority.library !== undefined && authority.library.schemaVersion !== 1) {
+    throw new Error("Extension main-view Library authority is invalid.");
+  }
 }
 
 function copyAuthority(authority: ExtensionMainViewAuthority): ExtensionMainViewAuthority {
-  return { ...authority, mainView: { ...authority.mainView } };
+  return { ...authority, mainView: { ...authority.mainView }, ...(authority.library === undefined ? {} : { library: { ...authority.library } }) };
 }
 
 function sameMainView(left: ExtensionMainViewDescriptor | undefined, right: ExtensionMainViewDescriptor): boolean {
   return left?.html === right.html && left.title === right.title && left.icon === right.icon;
+}
+
+function sameLibrary(left: ExtensionLibraryDescriptor | undefined, right: ExtensionLibraryDescriptor | undefined): boolean {
+  return left?.schemaVersion === right?.schemaVersion && (left === undefined) === (right === undefined);
+}
+
+function injectLibraryBridge(html: Buffer): Buffer {
+  const source = html.toString("utf8");
+  if (!Buffer.from(source, "utf8").equals(html)) {
+    throw new ExtensionMainViewError(410, "Extension main-view entry HTML is not valid UTF-8.");
+  }
+  const tag = `<script src="./${LIBRARY_BRIDGE_ASSET}"></script>`;
+  const head = /<head(?:\s[^>]*)?>/iu.exec(source);
+  if (head !== null && head.index !== undefined) {
+    const offset = head.index + head[0].length;
+    return Buffer.from(`${source.slice(0, offset)}${tag}${source.slice(offset)}`, "utf8");
+  }
+  const htmlTag = /<html(?:\s[^>]*)?>/iu.exec(source);
+  if (htmlTag !== null && htmlTag.index !== undefined) {
+    const offset = htmlTag.index + htmlTag[0].length;
+    return Buffer.from(`${source.slice(0, offset)}<head>${tag}</head>${source.slice(offset)}`, "utf8");
+  }
+  return Buffer.from(`${tag}${source}`, "utf8");
 }
 
 function tokenDigest(token: string): Buffer {

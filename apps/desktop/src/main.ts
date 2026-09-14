@@ -205,6 +205,15 @@ import {
   readPrivateFile,
   readRegularFileSnapshot
 } from "./secure-files.js";
+import {
+  atomicCopyExtensionLibraryFile,
+  ExtensionLibraryGestureCoordinator,
+  parseExtensionLibraryBeginSaveRequest,
+  parseExtensionLibraryClipboardRequest,
+  parseExtensionLibraryCommitSaveRequest,
+  parseExtensionLibraryRevealRequest,
+  resolveVerifiedExtensionLibraryFile
+} from "./extension-library-gestures.js";
 import { installSelectionContextMenu, setSelectionContextMenuLocale } from "./selection-context-menu.js";
 import { NativeFileClipboard, type FileCopyScope } from "./native-file-clipboard.js";
 import { bundledElectronUpdater, createElectronUpdateDriver } from "./electron-update-driver.js";
@@ -475,6 +484,8 @@ const MAXIMUM_ATTACHMENT_FILES = 32;
 const MAXIMUM_NATIVE_FILE_BYTES = 256 * 1024 * 1024;
 let nativeFileClipboard: NativeFileClipboard | undefined;
 const nativeFileCopyScopes = new WeakMap<WebContents, FileCopyScope>();
+const extensionLibraryGestures = new ExtensionLibraryGestureCoordinator<WebContents>();
+const extensionLibraryGestureScopes = new WeakSet<WebContents>();
 const TRAY_ICON_DATA_URL_PREFIX = "data:image/png;base64,";
 const MAXIMUM_TRAY_ICON_DATA_URL_LENGTH = 512 * 1024;
 const EXPECTED_TRAY_ICON_SIZE = 256;
@@ -980,6 +991,12 @@ function createWindow(): void {
           "      window.jokoDesktop &&",
           "      typeof window.jokoDesktop.platform === 'string' &&",
           "      typeof window.jokoDesktop.chooseFiles === 'function' &&",
+          "      typeof window.jokoDesktop.extensionLibraries?.pickLocation === 'function' &&",
+          "      typeof window.jokoDesktop.extensionLibraries?.reveal === 'function' &&",
+          "      typeof window.jokoDesktop.extensionLibraries?.beginSave === 'function' &&",
+          "      typeof window.jokoDesktop.extensionLibraries?.commitSave === 'function' &&",
+          "      typeof window.jokoDesktop.extensionLibraries?.cancelSave === 'function' &&",
+          "      typeof window.jokoDesktop.extensionLibraries?.clipboardWrite === 'function' &&",
           "      typeof window.jokoDesktop.deepLinks?.takePending === 'function' &&",
           "      typeof window.jokoDesktop.deepLinks?.onNavigate === 'function' &&",
           "      typeof window.jokoDesktop.discovery?.scan === 'function' &&",
@@ -3962,6 +3979,79 @@ function registerIpc(): void {
     }
     return openExtensionApplicationWindow(parameters[0]);
   });
+  ipcMain.handle(DESKTOP_CHANNELS.extensionLibraryPickLocation, async (event, ...parameters: unknown[]) => {
+    const owner = assertFocusedTrustedIpcSender(event);
+    if (parameters.length !== 0) throw new TypeError("Extension Library location selection does not accept parameters.");
+    const selection = await dialog.showOpenDialog(owner, {
+      title: "Choose an Extension Library location",
+      properties: ["openDirectory"]
+    });
+    const selected = selection.canceled ? undefined : selection.filePaths[0];
+    return selected === undefined
+      ? { cancelled: true as const }
+      : { cancelled: false as const, path: resolve(selected) };
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.extensionLibraryReveal, async (event, ...parameters: unknown[]) => {
+    assertFocusedTrustedIpcSender(event);
+    if (parameters.length !== 1) throw new TypeError("Extension Library reveal requires one request.");
+    const request = parseExtensionLibraryRevealRequest(parameters[0]);
+    extensionLibraryGestures.attempt(request.extensionId, "reveal");
+    const file = await resolveVerifiedExtensionLibraryFile(request.root, request.path);
+    assertFocusedTrustedIpcSender(event);
+    shell.showItemInFolder(file.absolutePath);
+    return true;
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.extensionLibraryBeginSave, async (event, ...parameters: unknown[]) => {
+    const owner = assertFocusedTrustedIpcSender(event);
+    if (parameters.length !== 1) throw new TypeError("Extension Library save requires one request.");
+    const request = parseExtensionLibraryBeginSaveRequest(parameters[0]);
+    extensionLibraryGestures.attempt(request.extensionId, "saveAs");
+    extensionLibraryGestures.beginSaveDialog();
+    let selection: Awaited<ReturnType<typeof dialog.showSaveDialog>>;
+    try {
+      selection = await dialog.showSaveDialog(owner, {
+        title: "Save an Extension Library file",
+        defaultPath: request.name,
+        ...(desktopFileExtension(request.name) === undefined
+          ? {}
+          : { filters: [{ name: "Extension Library file", extensions: [desktopFileExtension(request.name)!] }] })
+      });
+    } finally {
+      extensionLibraryGestures.endSaveDialog();
+    }
+    if (selection.canceled || selection.filePath === undefined) return { cancelled: true as const };
+    assertTrustedIpcSender(event);
+    trackExtensionLibraryGestureScope(event.sender);
+    return {
+      cancelled: false as const,
+      ticketId: extensionLibraryGestures.issueSaveTicket(event.sender, request.extensionId, resolve(selection.filePath))
+    };
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.extensionLibraryCommitSave, async (event, ...parameters: unknown[]) => {
+    assertTrustedIpcSender(event);
+    if (parameters.length !== 1) throw new TypeError("Extension Library save commit requires one request.");
+    const request = parseExtensionLibraryCommitSaveRequest(parameters[0]);
+    const destination = extensionLibraryGestures.takeSaveTicket(event.sender, request.extensionId, request.ticketId);
+    return atomicCopyExtensionLibraryFile(request.root, request.path, destination);
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.extensionLibraryCancelSave, (event, ...parameters: unknown[]) => {
+    assertTrustedIpcSender(event);
+    if (parameters.length !== 1 || typeof parameters[0] !== "string") {
+      throw new TypeError("Extension Library save cancellation requires one ticket identity.");
+    }
+    extensionLibraryGestures.cancelSaveTicket(event.sender, parameters[0]);
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.extensionLibraryClipboardWrite, (event, ...parameters: unknown[]) => {
+    assertFocusedTrustedIpcSender(event);
+    if (parameters.length !== 1) throw new TypeError("Extension Library clipboard write requires one request.");
+    const request = parseExtensionLibraryClipboardRequest(parameters[0]);
+    extensionLibraryGestures.attempt(request.extensionId, "clipboardWrite");
+    const image = nativeImage.createFromBuffer(Buffer.from(request.bytes));
+    if (image.isEmpty()) throw new TypeError("Extension Library clipboard PNG could not be decoded.");
+    assertFocusedTrustedIpcSender(event);
+    clipboard.writeImage(image);
+    return request.bytes.byteLength;
+  });
   ipcMain.handle(DESKTOP_CHANNELS.sessionDragPreviewBegin, (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);
     if (parameters.length !== 1 || !isDesktopSessionDragPreviewRequest(parameters[0]) ||
@@ -5099,6 +5189,15 @@ function assertTrustedIpcSender(event: IpcMainInvokeEvent): void {
   }
 }
 
+function assertFocusedTrustedIpcSender(event: IpcMainInvokeEvent): BrowserWindow {
+  assertTrustedIpcSender(event);
+  const owner = trustedApplicationWindowForContents(event.sender);
+  if (owner === undefined || owner.isDestroyed() || !owner.isFocused()) {
+    throw new Error("Desktop user gesture requires a focused trusted Joko application window.");
+  }
+  return owner;
+}
+
 function fileCopyScope(event: IpcMainInvokeEvent): FileCopyScope {
   const contents = event.sender;
   const existing = nativeFileCopyScopes.get(contents);
@@ -5122,6 +5221,22 @@ function fileCopyScope(event: IpcMainInvokeEvent): FileCopyScope {
   contents.once("destroyed", retire);
   nativeFileCopyScopes.set(contents, scope);
   return scope;
+}
+
+function trackExtensionLibraryGestureScope(contents: WebContents): void {
+  if (extensionLibraryGestureScopes.has(contents)) return;
+  extensionLibraryGestureScopes.add(contents);
+  const retire = (): void => {
+    extensionLibraryGestures.retireScope(contents);
+    extensionLibraryGestureScopes.delete(contents);
+    contents.removeListener("did-start-navigation", navigate);
+    contents.removeListener("destroyed", retire);
+  };
+  const navigate = (_event: unknown, _url: string, isInPlace: boolean, isMainFrame: boolean): void => {
+    if (isMainFrame && !isInPlace) retire();
+  };
+  contents.on("did-start-navigation", navigate);
+  contents.once("destroyed", retire);
 }
 
 function trustedApplicationWindowForContents(contents: WebContents): BrowserWindow | undefined {

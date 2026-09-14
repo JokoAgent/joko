@@ -2,7 +2,7 @@
   "$schema": "https://raw.githubusercontent.com/electron-userland/electron-builder/v26.15.3/packages/app-builder-lib/scheme.json",
   "appId": "app.joko.desktop",
   "productName": "Joko",
-  "electronVersion": "39.2.7",
+  "electronVersion": "43.6.0",
   "asar": false,
   "compression": "normal",
   "npmRebuild": false,

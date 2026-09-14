@@ -6,6 +6,7 @@ import {
   BrowserService,
   ConnectionService,
   EventService,
+  ExtensionService,
   InteractionService,
   OperationService,
   PiService,
@@ -24,6 +25,7 @@ import {
 export interface E2eClients {
   readonly connection: Client<typeof ConnectionService>;
   readonly event: Client<typeof EventService>;
+  readonly extension: Client<typeof ExtensionService>;
   readonly operation: Client<typeof OperationService>;
   readonly backend: Client<typeof BackendService>;
   readonly target: Client<typeof TargetService>;
@@ -66,6 +68,7 @@ export function createE2eClients(baseUrl: string, authKey?: string, timeoutMs = 
   return {
     connection: createClient(ConnectionService, transport),
     event: createClient(EventService, transport),
+    extension: createClient(ExtensionService, transport),
     operation: createClient(OperationService, transport),
     backend: createClient(BackendService, transport),
     target: createClient(TargetService, transport),

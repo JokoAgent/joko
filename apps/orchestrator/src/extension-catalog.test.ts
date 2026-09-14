@@ -213,6 +213,29 @@ describe("ExtensionCatalogManager", () => {
     }
   });
 
+  it("keeps a declared Library capability on the stable Source-to-Resource Extension identity", async () => {
+    const { store, catalog } = await fixture();
+    const library = { schemaVersion: 1 as const };
+    try {
+      const sourceEntry = source({ entries: [{ ...source().entries[0]!, library }] });
+      const available = catalog.reconcile([], [], [sourceEntry]).entries[0]!;
+      expect(available).toMatchObject({ installed: false, library });
+
+      const installedResource = resource({
+        resourceDetails: [{
+          ...resource().resourceDetails[0]!,
+          entryPath: "extensions/navigation.ts",
+          library
+        }]
+      });
+      const installed = catalog.reconcile([installedResource], [], [sourceEntry]).entries[0]!;
+      expect(installed.id).toBe(available.id);
+      expect(installed).toMatchObject({ installed: true, enabled: true, library });
+    } finally {
+      store.close();
+    }
+  });
+
   it("projects same-source updates and treats a removed then re-added source as explicit replacement provenance", async () => {
     const { store, catalog } = await fixture();
     try {
@@ -296,10 +319,13 @@ describe("ExtensionCatalogManager", () => {
     const { store, catalog } = await fixture();
     try {
       const initial = catalog.reconcile([resource()], []).entries[0]!;
+      const authorityChanged = vi.fn();
+      const stop = catalog.onAuthorityChanged(authorityChanged);
       const persistence = vi.spyOn(store, "setSetting");
       persistence.mockImplementationOnce(() => { throw new Error("storage unavailable"); });
 
       expect(() => catalog.reconcile([resource({ versionNumber: 5n })], [])).toThrow("storage unavailable");
+      expect(authorityChanged).not.toHaveBeenCalled();
       expect(catalog.snapshot().entries[0]).toMatchObject({
         revision: initial.revision,
         owner: { kind: "resource", resourceVersion: 4n }
@@ -308,6 +334,8 @@ describe("ExtensionCatalogManager", () => {
       const advanced = catalog.reconcile([resource({ versionNumber: 5n })], []).entries[0]!;
       expect(advanced.revision).toBeGreaterThan(initial.revision);
       expect(advanced.owner).toMatchObject({ kind: "resource", resourceVersion: 5n });
+      expect(authorityChanged).toHaveBeenCalledWith([initial.id]);
+      stop();
     } finally {
       store.close();
     }

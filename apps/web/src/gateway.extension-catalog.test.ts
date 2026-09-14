@@ -4,6 +4,9 @@ import {
   CredentialKind,
   ExtensionCatalogSource,
   ExtensionInstallState,
+  ExtensionLibraryEntryKind,
+  ExtensionLibraryLocationKind,
+  ExtensionLibraryState,
   ExtensionMainViewIcon,
   ExtensionPackageAction,
   ExtensionPackageExportState,
@@ -315,6 +318,163 @@ describe("Extension catalog gateway", () => {
 
     surface.endpoint = "https://attacker.test/view.html";
     await expect(gateway.getExtensionMainViewSurface(surfaceId)).rejects.toThrow(/invalid Extension main-view surface/u);
+    gateway.disconnect();
+  });
+
+  it("maps every Extension Library management and sandbox call without exposing a root to the session", async () => {
+    const requests: Array<{ readonly method: string; readonly input: any }> = [];
+    const extensionId = "extension_00000000000000000000000000000001";
+    const location = { kind: ExtensionLibraryLocationKind.CUSTOM, path: "D:\\Libraries\\canvas", generation: { value: 4n } };
+    const overview = {
+      extensionId,
+      name: "Canvas",
+      state: ExtensionLibraryState.READY,
+      location,
+      files: 2,
+      bytes: 9n,
+      diskFreeBytes: 100n,
+      softLimitBytes: 8_589_934_592n,
+      softLimitExceeded: false,
+      orphaned: false,
+      trashCount: 1,
+      graceCount: 1
+    };
+    const trash = {
+      trashId: `library_trash_${"a".repeat(32)}`,
+      extensionId,
+      name: "Canvas",
+      deletedAt: { seconds: 1_800_000_000n, nanos: 0 },
+      expiresAt: { seconds: 1_802_592_000n, nanos: 0 },
+      files: 2,
+      bytes: 9n
+    };
+    const grace = {
+      graceId: `library_grace_${"b".repeat(32)}`,
+      extensionId,
+      name: "Canvas",
+      createdAt: { seconds: 1_800_000_000n, nanos: 0 },
+      expiresAt: { seconds: 1_801_209_600n, nanos: 0 },
+      files: 2,
+      bytes: 9n
+    };
+    const sessionId = `library_session_${"c".repeat(32)}`;
+    let invalidOverview = false;
+    const gateway = await mount(async (method, input) => {
+      requests.push({ method, input });
+      if (method === "getSnapshot") return { snapshot: {} };
+      if (method === "getExtensionLibraryOverview") return { library: { ...overview, state: invalidOverview ? 99 : overview.state } };
+      if (method === "validateExtensionLibraryLocation") return { validation: { libraryRoot: location.path, warnings: ["cloud_sync_location"], diskFreeBytes: 100n } };
+      if (method === "relocateExtensionLibrary") return { changed: true, migrationId: "migration", location, files: 2, bytes: 9n, warnings: [], graceId: grace.graceId };
+      if (method === "rebindExtensionLibrary") return { location, warnings: [] };
+      if (method === "unbindExtensionLibrary") return { detachedPath: location.path };
+      if (method === "repairExtensionLibraryState") return { recoveredFromPrevious: true, bindings: 1, trash: 1 };
+      if (method === "repairExtensionLibraryMetadata") return { library: overview };
+      if (method === "trashExtensionLibrary") return { trash };
+      if (method === "listExtensionLibraryTrash") return { trash: [trash] };
+      if (method === "restoreExtensionLibraryTrash") return { extensionId, location };
+      if (method === "purgeExtensionLibraryTrash") return { purged: true };
+      if (method === "listExtensionLibraryGrace") return { grace: [grace] };
+      if (method === "rollbackExtensionLibrary") return { location, graceId: grace.graceId };
+      if (method === "purgeExpiredExtensionLibraries") return { trash: 1, grace: 2 };
+      if (method === "openExtensionLibrary") return {
+        library: {
+          sessionId,
+          extensionId,
+          expiresAt: { seconds: 1_800_000_000n, nanos: 0 },
+          bindingGeneration: { value: 4n },
+          limits: {
+            maximumReadBytes: 16_777_216n,
+            maximumWriteBytes: 16_777_216n,
+            maximumStreamBytes: 8_589_934_592n,
+            maximumPathCharacters: 512,
+            maximumPathSegments: 32,
+            maximumListPageSize: 500,
+            maximumFiles: 50_000,
+            softLimitBytes: 8_589_934_592n,
+            diskReserveBytes: 1_073_741_824n
+          }
+        }
+      };
+      if (method === "callExtensionLibrary") {
+        if (input.call.operation.case === "sqlExecute") return { result: { result: { case: "sqlResult", value: {
+          rows: [{ cells: [
+            { name: "id", value: { value: { case: "integerValue", value: "9" } } },
+            { name: "data", value: { value: { case: "blobValue", value: new Uint8Array([1, 2]) } } }
+          ] }],
+          changes: "0"
+        } } } };
+        return { result: { result: { case: "write", value: {
+          path: "notes/one.txt", bytes: 3n, sha256: "d".repeat(64)
+        } } } };
+      }
+      if (method === "closeExtensionLibrary") return { closed: true };
+      throw new Error(`Unexpected method: ${method}`);
+    });
+
+    await expect(gateway.getExtensionLibraryOverview(extensionId, 7n)).resolves.toMatchObject({
+      extensionId,
+      state: "ready",
+      location: { kind: "custom", generation: 4n },
+      bytes: 9n
+    });
+    await expect(gateway.validateExtensionLibraryLocation(extensionId, 7n, "D:\\Libraries")).resolves.toMatchObject({
+      libraryRoot: location.path,
+      warnings: ["cloud_sync_location"]
+    });
+    await gateway.relocateExtensionLibrary(extensionId, 7n, { kind: "custom", candidate: "D:\\Libraries" });
+    await gateway.rebindExtensionLibrary(extensionId, 7n, "D:\\Libraries");
+    await gateway.unbindExtensionLibrary(extensionId, 7n);
+    await gateway.repairExtensionLibraryState();
+    await gateway.repairExtensionLibraryMetadata(extensionId, 7n);
+    await expect(gateway.trashExtensionLibrary(extensionId, 7n, "Canvas")).resolves.toMatchObject({ id: trash.trashId, bytes: 9n });
+    await expect(gateway.listExtensionLibraryTrash(extensionId)).resolves.toHaveLength(1);
+    await gateway.restoreExtensionLibraryTrash(trash.trashId, "Canvas", { kind: "custom", candidate: "D:\\Libraries" });
+    await expect(gateway.purgeExtensionLibraryTrash(trash.trashId, "Canvas")).resolves.toBe(true);
+    await expect(gateway.listExtensionLibraryGrace(extensionId)).resolves.toMatchObject([{ id: grace.graceId }]);
+    await gateway.rollbackExtensionLibrary(extensionId, 7n, grace.graceId);
+    await expect(gateway.purgeExpiredExtensionLibraries()).resolves.toEqual({ trash: 1, grace: 2 });
+    const opened = await gateway.openExtensionLibrary(extensionId, 7n);
+    expect(opened).toMatchObject({ id: sessionId, bindingGeneration: 4n, limits: { maximumFiles: 50_000 } });
+    expect(opened).not.toHaveProperty("path");
+    await expect(gateway.callExtensionLibrary(sessionId, {
+      kind: "write",
+      path: "notes/one.txt",
+      content: new Uint8Array([1, 2, 3]),
+      ifNotExists: true
+    })).resolves.toMatchObject({ kind: "write", path: "notes/one.txt", bytes: 3n });
+    await expect(gateway.callExtensionLibrary(sessionId, {
+      kind: "sqlExecute",
+      handleId: "handle-1",
+      statement: {
+        sql: "SELECT ?, ?",
+        parameters: [{ kind: "integer", value: 9n }, { kind: "blob", value: new Uint8Array([1, 2]) }]
+      }
+    })).resolves.toMatchObject({
+      kind: "sqlResult",
+      value: { rows: [{ cells: [
+        { name: "id", value: { kind: "integer", value: 9n } },
+        { name: "data", value: { kind: "blob", value: new Uint8Array([1, 2]) } }
+      ] }] }
+    });
+    await expect(gateway.closeExtensionLibrary(sessionId)).resolves.toBe(true);
+
+    expect(requests.find((request) => request.method === "relocateExtensionLibrary")?.input).toMatchObject({
+      extensionId,
+      expectedRevision: { value: 7n },
+      destinationKind: ExtensionLibraryLocationKind.CUSTOM,
+      candidate: "D:\\Libraries"
+    });
+    const sqlRequest = requests.filter((request) => request.method === "callExtensionLibrary")[1]?.input;
+    expect(sqlRequest.call.operation).toMatchObject({
+      case: "sqlExecute",
+      value: { statement: { parameters: [
+        { value: { case: "integerValue", value: "9" } },
+        { value: { case: "blobValue", value: new Uint8Array([1, 2]) } }
+      ] } }
+    });
+
+    invalidOverview = true;
+    await expect(gateway.getExtensionLibraryOverview(extensionId, 7n)).rejects.toThrow(/invalid Extension Library state/u);
     gateway.disconnect();
   });
 

@@ -22,10 +22,15 @@ export interface ExtensionMainViewDescriptor {
   readonly icon?: ExtensionMainViewIcon;
 }
 
+export interface ExtensionLibraryDescriptor {
+  readonly schemaVersion: 1;
+}
+
 export interface ExtensionSurfaceBinding {
   /** Exact package-relative runtime Extension entry. */
   readonly entry: string;
-  readonly mainView: ExtensionMainViewDescriptor;
+  readonly mainView?: ExtensionMainViewDescriptor;
+  readonly library?: ExtensionLibraryDescriptor;
 }
 
 const EXTENSION_SUFFIXES = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]);
@@ -63,29 +68,44 @@ export function parseExtensionSurfaceManifest(
   const result: ExtensionSurfaceBinding[] = [];
   for (const rawBinding of surfaces.extensions) {
     const binding = requirePlainObject(rawBinding, "Extension surface declaration");
-    requireExactKeys(binding, ["entry", "mainView"], ["entry", "mainView"], "Extension surface declaration");
+    requireExactKeys(binding, ["entry", "mainView", "library"], ["entry"], "Extension surface declaration");
     const entry = requirePortablePath(binding.entry, "Extension surface entry");
     if (!EXTENSION_SUFFIXES.has(extname(entry).toLowerCase())) throw new Error("Extension surface entry has an unsupported file type.");
     if (!discoveredEntries.has(entry)) throw new Error("Extension surface entry does not exactly match a discovered Extension.");
     if (seenEntries.has(entry)) throw new Error("Extension surface entry is declared more than once.");
     seenEntries.add(entry);
 
-    const rawMainView = requirePlainObject(binding.mainView, "Extension main view");
-    requireExactKeys(rawMainView, ["html", "title", "icon"], ["html"], "Extension main view");
-    const html = requirePortablePath(rawMainView.html, "Extension main-view HTML");
-    if (extname(html) !== ".html" || posix.dirname(html) === ".") {
-      throw new Error("Extension main-view HTML must be a lowercase .html file in a self-contained directory.");
+    if (binding.mainView === undefined && binding.library === undefined) {
+      throw new Error("Extension surface declaration must advertise at least one current capability.");
     }
-    if (!discoveredFiles.has(html)) throw new Error("Extension main-view HTML is not an inspected regular package file.");
-    const title = rawMainView.title === undefined ? undefined : requireTitle(rawMainView.title);
-    const icon = rawMainView.icon === undefined ? undefined : requireIcon(rawMainView.icon);
-    result.push({
-      entry,
-      mainView: {
+    let mainView: ExtensionMainViewDescriptor | undefined;
+    if (binding.mainView !== undefined) {
+      const rawMainView = requirePlainObject(binding.mainView, "Extension main view");
+      requireExactKeys(rawMainView, ["html", "title", "icon"], ["html"], "Extension main view");
+      const html = requirePortablePath(rawMainView.html, "Extension main-view HTML");
+      if (extname(html) !== ".html" || posix.dirname(html) === ".") {
+        throw new Error("Extension main-view HTML must be a lowercase .html file in a self-contained directory.");
+      }
+      if (!discoveredFiles.has(html)) throw new Error("Extension main-view HTML is not an inspected regular package file.");
+      const title = rawMainView.title === undefined ? undefined : requireTitle(rawMainView.title);
+      const icon = rawMainView.icon === undefined ? undefined : requireIcon(rawMainView.icon);
+      mainView = {
         html,
         ...(title === undefined ? {} : { title }),
         ...(icon === undefined ? {} : { icon })
-      }
+      };
+    }
+    let library: ExtensionLibraryDescriptor | undefined;
+    if (binding.library !== undefined) {
+      const rawLibrary = requirePlainObject(binding.library, "Extension Library declaration");
+      requireExactKeys(rawLibrary, ["schemaVersion"], ["schemaVersion"], "Extension Library declaration");
+      if (rawLibrary.schemaVersion !== 1) throw new Error("Extension Library schemaVersion must be 1.");
+      library = { schemaVersion: 1 };
+    }
+    result.push({
+      entry,
+      ...(mainView === undefined ? {} : { mainView }),
+      ...(library === undefined ? {} : { library })
     });
   }
   return result;
@@ -100,6 +120,16 @@ export function isExtensionMainViewDescriptor(value: unknown): value is Extensio
     if (value.title !== undefined) requireTitle(value.title);
     if (value.icon !== undefined) requireIcon(value.icon);
     return true;
+  } catch {
+    return false;
+  }
+}
+
+export function isExtensionLibraryDescriptor(value: unknown): value is ExtensionLibraryDescriptor {
+  if (!isPlainObject(value)) return false;
+  try {
+    requireExactKeys(value, ["schemaVersion"], ["schemaVersion"], "Extension Library declaration");
+    return value.schemaVersion === 1;
   } catch {
     return false;
   }

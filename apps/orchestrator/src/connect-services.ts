@@ -131,6 +131,19 @@ import type {
   ExtensionRuntimeObservation
 } from "./extension-catalog.js";
 import { extensionMcpInput } from "./extension-catalog.js";
+import {
+  type ExtensionLibraryAuthority as NativeExtensionLibraryAuthority,
+  type ExtensionLibraryAuthorityChangeLease,
+  ExtensionLibraryManager,
+  type ExtensionLibraryOverview as NativeExtensionLibraryOverview,
+  type ExtensionLibraryTrashEntry as NativeExtensionLibraryTrashEntry,
+  type ExtensionLibraryGraceEntry as NativeExtensionLibraryGraceEntry
+} from "./extension-library-manager.js";
+import {
+  ExtensionLibraryError,
+  type ExtensionLibraryEntry,
+  type ExtensionLibraryWriteResult
+} from "./extension-library-vault.js";
 import type { ExtensionMainViewIcon } from "./extension-surface-manifest.js";
 import {
   ExtensionMainViewError,
@@ -395,6 +408,7 @@ interface ConnectServiceDependencies {
   readonly mcpRouter?: McpRouter;
   readonly piResources?: PiResourceManager;
   readonly extensionCatalog?: ExtensionCatalogManager;
+  readonly extensionLibraries?: ExtensionLibraryManager;
   readonly extensionMainViews?: ExtensionMainViewManager;
   readonly extensionPackagePublisher?: ExtensionPackagePublisher;
   readonly extensionSources?: ExtensionSourceManager;
@@ -929,6 +943,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
     ...(application.mcpRouter === undefined ? {} : { mcpRouter: application.mcpRouter }),
     ...(application.piResources === undefined ? {} : { piResources: application.piResources }),
     ...(application.extensionCatalog === undefined ? {} : { extensionCatalog: application.extensionCatalog }),
+    ...(application.extensionLibraries === undefined ? {} : { extensionLibraries: application.extensionLibraries }),
     ...(application.extensionMainViews === undefined ? {} : { extensionMainViews: application.extensionMainViews }),
     ...(application.extensionPackagePublisher === undefined ? {} : { extensionPackagePublisher: application.extensionPackagePublisher }),
     ...(application.extensionSources === undefined ? {} : { extensionSources: application.extensionSources }),
@@ -1012,10 +1027,14 @@ export function createConnectServices(application: OrchestratorApplication): Con
 
   const authenticate = (context: HandlerContext): ConnectionRecord => requireAuthentication(dependencies, context);
   const ensureExtensionSurfaceRevocation = (connectionId: string): void => {
-    if (extensionSurfaceRevocations.has(connectionId) || dependencies.extensionMainViews === undefined) return;
+    if (extensionSurfaceRevocations.has(connectionId)
+      || dependencies.extensionMainViews === undefined && dependencies.extensionLibraries === undefined) return;
     const stop = dependencies.connections.onRevoked(connectionId, () => {
       extensionSurfaceRevocations.delete(connectionId);
-      void dependencies.extensionMainViews!.closeConnection(connectionId);
+      void Promise.all([
+        dependencies.extensionMainViews?.closeConnection(connectionId),
+        dependencies.extensionLibraries?.closeConnection(connectionId)
+      ]);
     });
     extensionSurfaceRevocations.set(connectionId, stop);
   };
@@ -3634,6 +3653,181 @@ export function createConnectServices(application: OrchestratorApplication): Con
       if (dependencies.extensionMainViews === undefined) return { closed: false };
       const closed = await extensionMainViewEffect(() => dependencies.extensionMainViews!.closeSurface(
         nonBlankRequest(request.surfaceId, "surface_id"),
+        connection.id
+      ));
+      return { closed };
+    },
+    getExtensionLibraryOverview: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireExtensionLibraryManager(dependencies);
+      const authority = requestExtensionLibraryAuthority(dependencies, request.extensionId, request.expectedRevision, "get_extension_library_overview");
+      const assertAuthorityCurrent = extensionLibraryAuthorityFence(dependencies, connection, authority);
+      return extensionLibraryEffect(async () => ({
+        library: mapExtensionLibraryOverview(await manager.overview({ authority, assertAuthorityCurrent }))
+      }));
+    },
+    validateExtensionLibraryLocation: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireExtensionLibraryManager(dependencies);
+      const authority = requestExtensionLibraryAuthority(dependencies, request.extensionId, request.expectedRevision, "validate_extension_library_location");
+      const validation = await extensionLibraryEffect(() => manager.validateLocation({
+        authority,
+        candidate: nonBlankRequest(request.candidate, "candidate"),
+        assertAuthorityCurrent: extensionLibraryAuthorityFence(dependencies, connection, authority)
+      }));
+      return {
+        validation: create(contract.ExtensionLibraryLocationValidationSchema, {
+          libraryRoot: validation.libraryRoot,
+          warnings: [...validation.warnings],
+          ...(validation.diskFreeBytes === undefined ? {} : { diskFreeBytes: BigInt(validation.diskFreeBytes) })
+        })
+      };
+    },
+    relocateExtensionLibrary: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireExtensionLibraryManager(dependencies);
+      const authority = requestExtensionLibraryAuthority(dependencies, request.extensionId, request.expectedRevision, "relocate_extension_library");
+      const result = await extensionLibraryEffect(() => manager.relocate({
+        authority,
+        destination: nativeExtensionLibraryDestination(request.destinationKind, request.candidate, false),
+        assertAuthorityCurrent: extensionLibraryAuthorityFence(dependencies, connection, authority)
+      }));
+      return {
+        changed: result.changed,
+        ...(result.migrationId === undefined ? {} : { migrationId: result.migrationId }),
+        location: mapExtensionLibraryLocation(result.location),
+        files: result.files,
+        bytes: BigInt(result.bytes),
+        warnings: [...result.warnings],
+        ...(result.graceId === undefined ? {} : { graceId: result.graceId })
+      };
+    },
+    rebindExtensionLibrary: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireExtensionLibraryManager(dependencies);
+      const authority = requestExtensionLibraryAuthority(dependencies, request.extensionId, request.expectedRevision, "rebind_extension_library");
+      const result = await extensionLibraryEffect(() => manager.rebind({
+        authority,
+        candidate: nonBlankRequest(request.candidate, "candidate"),
+        assertAuthorityCurrent: extensionLibraryAuthorityFence(dependencies, connection, authority)
+      }));
+      return { location: mapExtensionLibraryLocation(result.location), warnings: [...result.warnings] };
+    },
+    unbindExtensionLibrary: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireExtensionLibraryManager(dependencies);
+      const authority = requestExtensionLibraryAuthority(dependencies, request.extensionId, request.expectedRevision, "unbind_extension_library");
+      const result = await extensionLibraryEffect(() => manager.unbind({
+        authority,
+        assertAuthorityCurrent: extensionLibraryAuthorityFence(dependencies, connection, authority)
+      }));
+      return { detachedPath: result.detachedPath };
+    },
+    repairExtensionLibraryState: async (_request, context) => {
+      authenticate(context);
+      const manager = requireExtensionLibraryManager(dependencies);
+      const result = await extensionLibraryEffect(() => manager.repairState());
+      return { recoveredFromPrevious: result.recoveredFromPrevious, bindings: result.bindings, trash: result.trash };
+    },
+    repairExtensionLibraryMetadata: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireExtensionLibraryManager(dependencies);
+      const authority = requestExtensionLibraryAuthority(dependencies, request.extensionId, request.expectedRevision, "repair_extension_library_metadata");
+      const result = await extensionLibraryEffect(() => manager.repairMetadata({
+        authority,
+        assertAuthorityCurrent: extensionLibraryAuthorityFence(dependencies, connection, authority)
+      }));
+      return { library: mapExtensionLibraryOverview(result) };
+    },
+    trashExtensionLibrary: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireExtensionLibraryManager(dependencies);
+      const authority = requestExtensionLibraryAuthority(dependencies, request.extensionId, request.expectedRevision, "trash_extension_library");
+      const result = await extensionLibraryEffect(() => manager.trashLibrary({
+        authority,
+        confirmation: request.confirmation,
+        assertAuthorityCurrent: extensionLibraryAuthorityFence(dependencies, connection, authority)
+      }));
+      return { trash: mapExtensionLibraryTrash(result) };
+    },
+    listExtensionLibraryTrash: (request, context) => {
+      authenticate(context);
+      const manager = requireExtensionLibraryManager(dependencies);
+      return extensionLibraryEffect(() => ({
+        trash: manager.listTrash(request.extensionId).map(mapExtensionLibraryTrash)
+      }));
+    },
+    restoreExtensionLibraryTrash: async (request, context) => {
+      authenticate(context);
+      const manager = requireExtensionLibraryManager(dependencies);
+      const destination = nativeExtensionLibraryDestination(request.destinationKind, request.candidate, true);
+      const result = await extensionLibraryEffect(() => manager.restoreTrash({
+        trashId: nonBlankRequest(request.trashId, "trash_id"),
+        confirmation: request.confirmation,
+        ...(destination === undefined ? {} : { destination })
+      }));
+      return { extensionId: result.extensionId, location: mapExtensionLibraryLocation(result.location) };
+    },
+    purgeExtensionLibraryTrash: async (request, context) => {
+      authenticate(context);
+      const manager = requireExtensionLibraryManager(dependencies);
+      const purged = await extensionLibraryEffect(() => manager.purgeTrash({
+        trashId: nonBlankRequest(request.trashId, "trash_id"),
+        confirmation: request.confirmation
+      }));
+      return { purged };
+    },
+    listExtensionLibraryGrace: (request, context) => {
+      authenticate(context);
+      const manager = requireExtensionLibraryManager(dependencies);
+      return extensionLibraryEffect(() => ({ grace: manager.listGrace(request.extensionId).map(mapExtensionLibraryGrace) }));
+    },
+    rollbackExtensionLibrary: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireExtensionLibraryManager(dependencies);
+      const authority = requestExtensionLibraryAuthority(dependencies, request.extensionId, request.expectedRevision, "rollback_extension_library");
+      const result = await extensionLibraryEffect(() => manager.rollbackRelocation({
+        authority,
+        graceId: nonBlankRequest(request.graceId, "grace_id"),
+        assertAuthorityCurrent: extensionLibraryAuthorityFence(dependencies, connection, authority)
+      }));
+      return { location: mapExtensionLibraryLocation(result.location), graceId: result.graceId };
+    },
+    purgeExpiredExtensionLibraries: async (_request, context) => {
+      authenticate(context);
+      const manager = requireExtensionLibraryManager(dependencies);
+      return extensionLibraryEffect(() => manager.purgeExpired());
+    },
+    openExtensionLibrary: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireExtensionLibraryManager(dependencies);
+      const authority = requestExtensionLibraryAuthority(dependencies, request.extensionId, request.expectedRevision, "open_extension_library");
+      ensureExtensionSurfaceRevocation(connection.id);
+      const library = await extensionLibraryEffect(() => manager.openSession({
+        authority,
+        connectionId: connection.id,
+        assertAuthorityCurrent: extensionLibraryAuthorityFence(dependencies, connection, authority)
+      }));
+      return { library: mapExtensionLibrarySession(library) };
+    },
+    callExtensionLibrary: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireExtensionLibraryManager(dependencies);
+      if (request.call === undefined || request.call.operation.case === undefined) throw invalidArgument("call.operation is required");
+      return {
+        result: await extensionLibraryEffect(() => dispatchExtensionLibraryCall(
+          manager,
+          nonBlankRequest(request.sessionId, "session_id"),
+          connection.id,
+          request.call!
+        ))
+      };
+    },
+    closeExtensionLibrary: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireExtensionLibraryManager(dependencies);
+      const closed = await extensionLibraryEffect(() => manager.closeSession(
+        nonBlankRequest(request.sessionId, "session_id"),
         connection.id
       ));
       return { closed };
@@ -8920,6 +9114,13 @@ function mapExtensionCatalogEntry(item: NativeExtensionCatalogDescriptor): contr
             icon: protoExtensionMainViewIcon(item.mainView.icon)
           })
         }),
+    ...(item.library === undefined
+      ? {}
+      : {
+          library: create(contract.ExtensionLibraryDescriptorSchema, {
+            schemaVersion: item.library.schemaVersion
+          })
+        }),
     ...(item.update === undefined
       ? {}
       : {
@@ -8964,7 +9165,9 @@ function requireExtensionMainViewAuthority(
     && detail.entryPath === extension.mainView?.extensionEntry
     && detail.mainView?.html === extension.mainView?.html
     && detail.mainView?.title === extension.mainView?.title
-    && detail.mainView?.icon === extension.mainView?.icon);
+    && detail.mainView?.icon === extension.mainView?.icon
+    && detail.library?.schemaVersion === extension.library?.schemaVersion
+    && (detail.library === undefined) === (extension.library === undefined));
   if (resource.id !== extension.owner.resourceId || resource.versionNumber !== extension.owner.resourceVersion
     || resource.discoveredRevision !== extension.owner.discoveredRevision || resource.kind !== "package"
     || resource.scope !== "managed" || resource.packageIdentity === undefined || !resource.enabled
@@ -8988,7 +9191,8 @@ function requireExtensionMainViewAuthority(
       html: extension.mainView.html,
       ...(extension.mainView.title === undefined ? {} : { title: extension.mainView.title }),
       ...(extension.mainView.icon === undefined ? {} : { icon: extension.mainView.icon })
-    }
+    },
+    ...(extension.library === undefined ? {} : { library: { schemaVersion: extension.library.schemaVersion } })
   };
 }
 
@@ -9008,7 +9212,528 @@ function assertCurrentExtensionMainViewAuthority(
     || current.discoveredRevision !== expected.discoveredRevision || current.packageName !== expected.packageName
     || current.packageVersion !== expected.packageVersion || current.extensionEntry !== expected.extensionEntry
     || current.mainView.html !== expected.mainView.html || current.mainView.title !== expected.mainView.title
-    || current.mainView.icon !== expected.mainView.icon) throw new Error("Extension main-view authority changed.");
+    || current.mainView.icon !== expected.mainView.icon
+    || current.library?.schemaVersion !== expected.library?.schemaVersion
+    || (current.library === undefined) !== (expected.library === undefined)) throw new Error("Extension main-view authority changed.");
+}
+
+function requestExtensionLibraryAuthority(
+  dependencies: ConnectServiceDependencies,
+  extensionId: string,
+  expectedRevision: contract.Revision | undefined,
+  field: string
+): NativeExtensionLibraryAuthority {
+  if (expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+  return requireExtensionLibraryAuthority(
+    dependencies,
+    nonBlankRequest(extensionId, "extension_id"),
+    fromProtoRevision(expectedRevision, `${field}.expected_revision`)
+  );
+}
+
+function requireExtensionLibraryAuthority(
+  dependencies: ConnectServiceDependencies,
+  extensionId: string,
+  expectedExtensionRevision: bigint,
+  currentOnly = false
+): NativeExtensionLibraryAuthority {
+  if (dependencies.piResources === undefined || dependencies.extensionCatalog === undefined) {
+    throw new ConnectError("Extension Libraries are unavailable.", Code.Unimplemented);
+  }
+  const extension = currentOnly
+    ? requireCurrentExtensionMutation(dependencies, extensionId, expectedExtensionRevision)
+    : requireExtensionMutation(dependencies, extensionId, expectedExtensionRevision);
+  if (extension.owner.kind !== "resource" || !extension.installed || !extension.enabled || extension.library === undefined
+    || extension.setup.state !== "ready" && extension.setup.state !== "not_required") {
+    throw new ConnectError("Extension Library is not ready.", Code.FailedPrecondition);
+  }
+  let resource: NativePiResourceDescriptor;
+  try {
+    resource = dependencies.piResources.get(extension.owner.resourceId);
+  } catch {
+    throw new ConnectError("Extension Library Resource not found.", Code.NotFound);
+  }
+  const matchingDetails = resource.resourceDetails.filter((detail) => detail.kind === "extension"
+    && detail.entryPath === extension.library?.extensionEntry
+    && detail.library?.schemaVersion === extension.library?.schemaVersion);
+  if (resource.id !== extension.owner.resourceId || resource.versionNumber !== extension.owner.resourceVersion
+    || resource.discoveredRevision !== extension.owner.discoveredRevision || resource.kind !== "package"
+    || resource.scope !== "managed" || !resource.enabled
+    || !["installed", "loaded", "update_available"].includes(resource.state) || matchingDetails.length !== 1) {
+    throw new ConnectError("Extension Library does not have a current installed package authority.", Code.FailedPrecondition);
+  }
+  const backend = dependencies.store.getBackend(resource.backendId);
+  return {
+    extensionId: extension.id,
+    extensionRevision: extension.revision,
+    resourceId: resource.id,
+    resourceRevision: resource.versionNumber,
+    discoveredRevision: resource.discoveredRevision,
+    backendId: resource.backendId,
+    backendRevision: backend.revision,
+    backendGeneration: backend.descriptor.instanceGeneration,
+    name: extension.name,
+    library: { schemaVersion: 1, extensionEntry: extension.library.extensionEntry }
+  };
+}
+
+function assertCurrentExtensionLibraryAuthority(
+  dependencies: ConnectServiceDependencies,
+  expected: NativeExtensionLibraryAuthority
+): void {
+  const current = requireExtensionLibraryAuthority(
+    dependencies,
+    expected.extensionId,
+    dependencies.extensionCatalog!.get(expected.extensionId).revision,
+    true
+  );
+  if (current.extensionId !== expected.extensionId || current.extensionRevision !== expected.extensionRevision
+    || current.resourceId !== expected.resourceId || current.resourceRevision !== expected.resourceRevision
+    || current.discoveredRevision !== expected.discoveredRevision || current.backendId !== expected.backendId
+    || current.backendRevision !== expected.backendRevision || current.backendGeneration !== expected.backendGeneration
+    || current.library.schemaVersion !== expected.library.schemaVersion
+    || current.library.extensionEntry !== expected.library.extensionEntry) {
+    throw new Error("Extension Library authority changed.");
+  }
+}
+
+function extensionLibraryAuthorityFence(
+  dependencies: ConnectServiceDependencies,
+  connection: ConnectionRecord,
+  authority: NativeExtensionLibraryAuthority
+): () => void {
+  return () => {
+    dependencies.connections.fence(connection);
+    assertCurrentExtensionLibraryAuthority(dependencies, authority);
+  };
+}
+
+function requireExtensionLibraryManager(dependencies: ConnectServiceDependencies): ExtensionLibraryManager {
+  if (dependencies.extensionLibraries === undefined) throw new ConnectError("Extension Libraries are unavailable.", Code.Unimplemented);
+  return dependencies.extensionLibraries;
+}
+
+function nativeExtensionLibraryDestination(
+  kind: contract.ExtensionLibraryLocationKind,
+  candidate: string | undefined,
+  allowUnspecified: false
+): { readonly kind: "default" } | { readonly kind: "custom"; readonly candidate: string };
+function nativeExtensionLibraryDestination(
+  kind: contract.ExtensionLibraryLocationKind,
+  candidate: string | undefined,
+  allowUnspecified: true
+): { readonly kind: "default" } | { readonly kind: "custom"; readonly candidate: string } | undefined;
+function nativeExtensionLibraryDestination(
+  kind: contract.ExtensionLibraryLocationKind,
+  candidate: string | undefined,
+  allowUnspecified: boolean
+): { readonly kind: "default" } | { readonly kind: "custom"; readonly candidate: string } | undefined {
+  if (kind === contract.ExtensionLibraryLocationKind.UNSPECIFIED && allowUnspecified) return undefined;
+  if (kind === contract.ExtensionLibraryLocationKind.DEFAULT) {
+    if (candidate !== undefined) throw invalidArgument("candidate must be absent for a default Library location");
+    return { kind: "default" };
+  }
+  if (kind === contract.ExtensionLibraryLocationKind.CUSTOM) {
+    return { kind: "custom", candidate: nonBlankRequest(candidate ?? "", "candidate") };
+  }
+  throw invalidArgument("destination_kind is unsupported");
+}
+
+async function extensionLibraryEffect<T>(action: () => T | Promise<T>): Promise<T> {
+  try {
+    return await action();
+  } catch (error) {
+    if (!(error instanceof ExtensionLibraryError)) throw error;
+    const code = error.code === "PATH_INVALID" || error.code === "SQL_REJECTED"
+      ? Code.InvalidArgument
+      : error.code === "NOT_FOUND"
+        ? Code.NotFound
+        : error.code === "ALREADY_EXISTS"
+          ? Code.AlreadyExists
+          : error.code === "TOO_LARGE" || error.code === "FILE_LIMIT" || error.code === "RESULT_LIMIT" || error.code === "DISK_FULL"
+            ? Code.ResourceExhausted
+            : error.code === "CONFLICT"
+              ? Code.Aborted
+              : error.code === "READ_ONLY" || error.code === "UNAVAILABLE" || error.code === "CORRUPT" || error.code === "SQL_FAILED"
+                ? Code.FailedPrecondition
+                : Code.Internal;
+    throw new ConnectError(redactSecrets(error.message), code);
+  }
+}
+
+function mapExtensionLibraryLocation(location: {
+  readonly kind: "default" | "custom";
+  readonly path: string;
+  readonly generation: bigint;
+}): contract.ExtensionLibraryLocation {
+  return create(contract.ExtensionLibraryLocationSchema, {
+    kind: location.kind === "default"
+      ? contract.ExtensionLibraryLocationKind.DEFAULT
+      : contract.ExtensionLibraryLocationKind.CUSTOM,
+    path: location.path,
+    generation: toProtoRevision(location.generation)
+  });
+}
+
+function mapExtensionLibraryOverview(item: NativeExtensionLibraryOverview): contract.ExtensionLibraryOverview {
+  const state = item.state === "ready"
+    ? contract.ExtensionLibraryState.READY
+    : item.state === "read_only"
+      ? contract.ExtensionLibraryState.READ_ONLY
+      : contract.ExtensionLibraryState.UNAVAILABLE;
+  const reasons: Readonly<Record<NonNullable<NativeExtensionLibraryOverview["reason"]>, contract.ExtensionLibraryUnavailableReason>> = {
+    metadata_corrupt: contract.ExtensionLibraryUnavailableReason.METADATA_CORRUPT,
+    file_limit: contract.ExtensionLibraryUnavailableReason.FILE_LIMIT,
+    io: contract.ExtensionLibraryUnavailableReason.IO,
+    operation_in_progress: contract.ExtensionLibraryUnavailableReason.OPERATION_IN_PROGRESS,
+    disk_missing: contract.ExtensionLibraryUnavailableReason.DISK_MISSING,
+    binding_moved: contract.ExtensionLibraryUnavailableReason.BINDING_MOVED,
+    state_corrupt: contract.ExtensionLibraryUnavailableReason.STATE_CORRUPT
+  };
+  return create(contract.ExtensionLibraryOverviewSchema, {
+    extensionId: item.extensionId,
+    name: item.name,
+    state,
+    unavailableReason: item.reason === undefined
+      ? contract.ExtensionLibraryUnavailableReason.UNSPECIFIED
+      : reasons[item.reason],
+    ...(item.location === undefined ? {} : { location: mapExtensionLibraryLocation(item.location) }),
+    files: item.usage.files,
+    bytes: BigInt(item.usage.bytes),
+    ...(item.diskFreeBytes === undefined ? {} : { diskFreeBytes: BigInt(item.diskFreeBytes) }),
+    softLimitBytes: BigInt(item.softLimitBytes),
+    softLimitExceeded: item.softLimitExceeded,
+    orphaned: item.orphaned,
+    trashCount: item.trashCount,
+    graceCount: item.graceCount,
+    ...(item.operation === undefined
+      ? {}
+      : {
+          operation: create(contract.ExtensionLibraryOperationStatusSchema, {
+            operationId: item.operation.id,
+            phase: item.operation.phase
+          })
+        })
+  });
+}
+
+function mapExtensionLibrarySession(item: Awaited<ReturnType<ExtensionLibraryManager["openSession"]>>): contract.ExtensionLibrarySession {
+  return create(contract.ExtensionLibrarySessionSchema, {
+    sessionId: item.sessionId,
+    extensionId: item.extensionId,
+    expiresAt: toProtoTimestamp(item.expiresAt),
+    bindingGeneration: toProtoRevision(item.bindingGeneration),
+    limits: create(contract.ExtensionLibraryLimitsSchema, {
+      maximumReadBytes: BigInt(item.capabilities.maximumReadBytes),
+      maximumWriteBytes: BigInt(item.capabilities.maximumWriteBytes),
+      maximumStreamBytes: BigInt(item.capabilities.maximumStreamBytes),
+      maximumPathCharacters: item.capabilities.maximumPathCharacters,
+      maximumPathSegments: item.capabilities.maximumPathSegments,
+      maximumListPageSize: item.capabilities.maximumListPageSize,
+      maximumFiles: item.capabilities.maximumFiles,
+      softLimitBytes: BigInt(8 * 1024 * 1024 * 1024),
+      diskReserveBytes: BigInt(1024 * 1024 * 1024)
+    })
+  });
+}
+
+function mapExtensionLibraryEntry(item: ExtensionLibraryEntry): contract.ExtensionLibraryEntry {
+  return create(contract.ExtensionLibraryEntrySchema, {
+    path: item.path,
+    kind: item.kind === "file" ? contract.ExtensionLibraryEntryKind.FILE : contract.ExtensionLibraryEntryKind.DIRECTORY,
+    bytes: BigInt(item.bytes),
+    modifiedAt: toProtoTimestamp(item.modifiedAt)
+  });
+}
+
+function mapExtensionLibraryTrash(item: NativeExtensionLibraryTrashEntry): contract.ExtensionLibraryTrashEntry {
+  return create(contract.ExtensionLibraryTrashEntrySchema, {
+    trashId: item.trashId,
+    extensionId: item.extensionId,
+    name: item.name,
+    deletedAt: toProtoTimestamp(item.deletedAt),
+    expiresAt: toProtoTimestamp(item.expiresAt),
+    files: item.files,
+    bytes: BigInt(item.bytes)
+  });
+}
+
+function mapExtensionLibraryGrace(item: NativeExtensionLibraryGraceEntry): contract.ExtensionLibraryGraceEntry {
+  return create(contract.ExtensionLibraryGraceEntrySchema, {
+    graceId: item.graceId,
+    extensionId: item.extensionId,
+    name: item.name,
+    createdAt: toProtoTimestamp(item.createdAt),
+    expiresAt: toProtoTimestamp(item.expiresAt),
+    files: item.files,
+    bytes: BigInt(item.bytes)
+  });
+}
+
+async function dispatchExtensionLibraryCall(
+  manager: ExtensionLibraryManager,
+  sessionId: string,
+  connectionId: string,
+  call: contract.ExtensionLibraryCall
+): Promise<contract.ExtensionLibraryCallResult> {
+  const operation = call.operation;
+  switch (operation.case) {
+    case "read": {
+      const value = await manager.read(sessionId, connectionId, {
+        path: operation.value.path,
+        ...(operation.value.offset === undefined ? {} : { offset: safeLibraryNumber(operation.value.offset, "read.offset") }),
+        ...(operation.value.length === undefined ? {} : { length: safeLibraryNumber(operation.value.length, "read.length") })
+      });
+      return create(contract.ExtensionLibraryCallResultSchema, {
+        result: { case: "read", value: create(contract.ExtensionLibraryReadResultSchema, {
+          path: value.path,
+          content: value.bytes,
+          sha256: value.sha256
+        }) }
+      });
+    }
+    case "write": {
+      const value = await manager.write(sessionId, connectionId, {
+        path: operation.value.path,
+        bytes: operation.value.content,
+        ifNotExists: operation.value.ifNotExists
+      });
+      return libraryWriteCallResult(value);
+    }
+    case "stat": {
+      const value = await manager.stat(sessionId, connectionId, operation.value.path);
+      return create(contract.ExtensionLibraryCallResultSchema, {
+        result: { case: "stat", value: mapExtensionLibraryEntry(value) }
+      });
+    }
+    case "list": {
+      const value = await manager.list(sessionId, connectionId, {
+        ...(operation.value.path === undefined ? {} : { path: operation.value.path }),
+        recursive: operation.value.recursive,
+        ...(operation.value.limit === undefined ? {} : { limit: operation.value.limit }),
+        ...(operation.value.cursor === undefined ? {} : { cursor: operation.value.cursor })
+      });
+      return create(contract.ExtensionLibraryCallResultSchema, {
+        result: { case: "list", value: create(contract.ExtensionLibraryListResultSchema, {
+          entries: value.entries.map(mapExtensionLibraryEntry),
+          ...(value.nextCursor === undefined ? {} : { nextCursor: value.nextCursor })
+        }) }
+      });
+    }
+    case "mkdir":
+    case "delete": {
+      const value = operation.case === "mkdir"
+        ? await manager.mkdir(sessionId, connectionId, operation.value.path)
+        : await manager.delete(sessionId, connectionId, operation.value.path, operation.value.recursive);
+      return create(contract.ExtensionLibraryCallResultSchema, {
+        result: { case: "path", value: create(contract.ExtensionLibraryPathResultSchema, value) }
+      });
+    }
+    case "rename": {
+      const value = await manager.rename(sessionId, connectionId, {
+        from: operation.value.from,
+        to: operation.value.to,
+        overwrite: operation.value.overwrite
+      });
+      return create(contract.ExtensionLibraryCallResultSchema, {
+        result: { case: "rename", value: create(contract.ExtensionLibraryRenameResultSchema, value) }
+      });
+    }
+    case "writeBegin": {
+      const value = await manager.writeBegin(sessionId, connectionId, {
+        path: operation.value.path,
+        totalBytes: safeLibraryNumber(operation.value.totalBytes, "write_begin.total_bytes"),
+        ...(operation.value.sha256 === undefined ? {} : { sha256: operation.value.sha256 }),
+        ifNotExists: operation.value.ifNotExists
+      });
+      return create(contract.ExtensionLibraryCallResultSchema, {
+        result: { case: "stream", value: create(contract.ExtensionLibraryStreamResultSchema, {
+          streamId: value.streamId,
+          receivedBytes: 0n,
+          nextSequence: value.nextSequence,
+          expiresAt: toProtoTimestamp(value.expiresAt),
+          aborted: false
+        }) }
+      });
+    }
+    case "writeChunk": {
+      const value = await manager.writeChunk(sessionId, connectionId, {
+        streamId: operation.value.streamId,
+        sequence: operation.value.sequence,
+        bytes: operation.value.content
+      });
+      return create(contract.ExtensionLibraryCallResultSchema, {
+        result: { case: "stream", value: create(contract.ExtensionLibraryStreamResultSchema, {
+          streamId: operation.value.streamId,
+          receivedBytes: BigInt(value.receivedBytes),
+          nextSequence: value.nextSequence,
+          expiresAt: toProtoTimestamp(value.expiresAt),
+          aborted: false
+        }) }
+      });
+    }
+    case "writeCommit":
+      return libraryWriteCallResult(await manager.writeCommit(sessionId, connectionId, operation.value.streamId));
+    case "writeAbort": {
+      const aborted = await manager.writeAbort(sessionId, connectionId, operation.value.streamId);
+      return create(contract.ExtensionLibraryCallResultSchema, {
+        result: { case: "stream", value: create(contract.ExtensionLibraryStreamResultSchema, {
+          streamId: operation.value.streamId,
+          receivedBytes: 0n,
+          nextSequence: 0,
+          aborted
+        }) }
+      });
+    }
+    case "sqlOpen": {
+      const value = await manager.databaseOpen(sessionId, connectionId, {
+        path: operation.value.path,
+        create: operation.value.create,
+        readonly: operation.value.readOnly
+      });
+      return create(contract.ExtensionLibraryCallResultSchema, {
+        result: { case: "sqlHandle", value: create(contract.ExtensionLibrarySqlHandleSchema, {
+          handleId: value.handleId,
+          path: value.path,
+          readOnly: value.readonly,
+          userVersion: value.userVersion
+        }) }
+      });
+    }
+    case "sqlExecute": {
+      const statement = requiredLibrarySqlStatement(operation.value.statement);
+      const value = await manager.databaseExecute(
+        sessionId,
+        connectionId,
+        operation.value.handleId,
+        statement.sql,
+        statement.parameters.map(nativeExtensionLibrarySqlValue)
+      );
+      return librarySqlCallResult(value);
+    }
+    case "sqlBatch": {
+      const values = await manager.databaseBatch(sessionId, connectionId, operation.value.handleId, operation.value.statements.map((statement) => ({
+        sql: statement.sql,
+        parameters: statement.parameters.map(nativeExtensionLibrarySqlValue)
+      })));
+      return create(contract.ExtensionLibraryCallResultSchema, {
+        result: { case: "sqlBatch", value: create(contract.ExtensionLibrarySqlBatchResultSchema, {
+          results: values.map(mapExtensionLibrarySqlResult)
+        }) }
+      });
+    }
+    case "sqlMigrate": {
+      const version = await manager.databaseMigrate(sessionId, connectionId, operation.value.handleId, operation.value.migrations.map((migration) => ({
+        version: migration.version,
+        statements: [...migration.statements]
+      })));
+      return create(contract.ExtensionLibraryCallResultSchema, {
+        result: { case: "sqlVersion", value: create(contract.ExtensionLibrarySqlVersionResultSchema, { userVersion: version }) }
+      });
+    }
+    case "sqlBackup": {
+      const value = await manager.databaseBackup(sessionId, connectionId, operation.value.handleId, operation.value.targetPath);
+      return create(contract.ExtensionLibraryCallResultSchema, {
+        result: { case: "sqlVersion", value: create(contract.ExtensionLibrarySqlVersionResultSchema, {
+          userVersion: value.userVersion,
+          path: value.path
+        }) }
+      });
+    }
+    case "sqlCheck": {
+      const value = await manager.databaseCheck(sessionId, connectionId, operation.value.handleId);
+      return libraryBooleanCallResult(value.ok);
+    }
+    case "sqlClose":
+      await manager.databaseClose(sessionId, connectionId, operation.value.handleId);
+      return libraryBooleanCallResult(true);
+    default:
+      throw invalidArgument("call.operation is unsupported");
+  }
+}
+
+function requiredLibrarySqlStatement(value: contract.ExtensionLibrarySqlStatement | undefined): contract.ExtensionLibrarySqlStatement {
+  if (value === undefined) throw invalidArgument("sql statement is required");
+  return value;
+}
+
+function nativeExtensionLibrarySqlValue(value: contract.ExtensionLibrarySqlValue): import("./extension-library-sql.js").ExtensionLibrarySqlValue {
+  switch (value.value.case) {
+    case "nullValue":
+      if (!value.value.value) throw invalidArgument("null_value must be true");
+      return null;
+    case "numberValue":
+      if (!Number.isFinite(value.value.value)) throw invalidArgument("number_value must be finite");
+      return value.value.value;
+    case "integerValue": {
+      if (!/^-?(?:0|[1-9][0-9]*)$/u.test(value.value.value)) throw invalidArgument("integer_value is invalid");
+      const integer = BigInt(value.value.value);
+      if (integer < -9_223_372_036_854_775_808n || integer > 9_223_372_036_854_775_807n) {
+        throw invalidArgument("integer_value exceeds SQLite int64");
+      }
+      return integer;
+    }
+    case "textValue":
+      return value.value.value;
+    case "blobValue":
+      return Uint8Array.from(value.value.value);
+    default:
+      throw invalidArgument("SQL value is required");
+  }
+}
+
+function mapExtensionLibrarySqlValue(value: import("./extension-library-sql.js").ExtensionLibrarySqlValue): contract.ExtensionLibrarySqlValue {
+  const mapped = value === null
+    ? { case: "nullValue" as const, value: true }
+    : typeof value === "number"
+      ? { case: "numberValue" as const, value }
+      : typeof value === "bigint"
+        ? { case: "integerValue" as const, value: value.toString(10) }
+        : typeof value === "string"
+          ? { case: "textValue" as const, value }
+          : { case: "blobValue" as const, value };
+  return create(contract.ExtensionLibrarySqlValueSchema, { value: mapped });
+}
+
+function mapExtensionLibrarySqlResult(value: import("./extension-library-sql.js").ExtensionLibrarySqlResult): contract.ExtensionLibrarySqlResult {
+  return create(contract.ExtensionLibrarySqlResultSchema, {
+    rows: value.rows.map((row) => create(contract.ExtensionLibrarySqlRowSchema, {
+      cells: Object.entries(row).map(([name, cell]) => create(contract.ExtensionLibrarySqlCellSchema, {
+        name,
+        value: mapExtensionLibrarySqlValue(cell)
+      }))
+    })),
+    changes: value.changes.toString(10),
+    ...(value.lastInsertRowid === undefined ? {} : { lastInsertRowId: value.lastInsertRowid.toString(10) })
+  });
+}
+
+function libraryWriteCallResult(value: ExtensionLibraryWriteResult): contract.ExtensionLibraryCallResult {
+  return create(contract.ExtensionLibraryCallResultSchema, {
+    result: { case: "write", value: create(contract.ExtensionLibraryWriteResultSchema, {
+      path: value.path,
+      bytes: BigInt(value.bytes),
+      sha256: value.sha256
+    }) }
+  });
+}
+
+function librarySqlCallResult(value: import("./extension-library-sql.js").ExtensionLibrarySqlResult): contract.ExtensionLibraryCallResult {
+  return create(contract.ExtensionLibraryCallResultSchema, {
+    result: { case: "sqlResult", value: mapExtensionLibrarySqlResult(value) }
+  });
+}
+
+function libraryBooleanCallResult(value: boolean): contract.ExtensionLibraryCallResult {
+  return create(contract.ExtensionLibraryCallResultSchema, {
+    result: { case: "boolean", value: create(contract.ExtensionLibraryBooleanResultSchema, { value }) }
+  });
+}
+
+function safeLibraryNumber(value: bigint, field: string): number {
+  const result = Number(value);
+  if (!Number.isSafeInteger(result) || result < 0) throw invalidArgument(`${field} exceeds the supported integer range`);
+  return result;
 }
 
 function mapExtensionMainViewSurface(surface: NativeExtensionMainViewSurface): contract.ExtensionMainViewSurface {
@@ -16501,7 +17226,8 @@ async function dispatchMutation(
           ...(payload.value.requestedVersion === "" ? {} : { requestedVersion: payload.value.requestedVersion }),
           ...(acquisition === undefined ? {} : { source: acquisition }),
           approvedByConnectionId: connection.id
-        })
+        }),
+        { extensionLibraryAuthorityChange: "revoke" }
       );
     }
     case "setResourceEnabled": {
@@ -16514,7 +17240,8 @@ async function dispatchMutation(
         payload.case,
         payload.value.resourceId,
         payload.value.enabled,
-        () => dependencies.piResources!.prepareSetEnabled(payload.value.resourceId, payload.value.enabled)
+        () => dependencies.piResources!.prepareSetEnabled(payload.value.resourceId, payload.value.enabled),
+        payload.value.enabled ? {} : { extensionLibraryAuthorityChange: "revoke" }
       );
     }
     case "removeResource": {
@@ -16527,7 +17254,8 @@ async function dispatchMutation(
         payload.case,
         payload.value.resourceId,
         false,
-        () => dependencies.piResources!.prepareRemove(payload.value.resourceId)
+        () => dependencies.piResources!.prepareRemove(payload.value.resourceId),
+        { extensionLibraryAuthorityChange: "orphan" }
       );
     }
     case "addExtensionSource": {
@@ -16648,7 +17376,10 @@ async function dispatchMutation(
               throw new ConnectError("Extension owner changed concurrently.", Code.Aborted);
             }
           },
-          afterCommit: () => reconcileCommittedExtensionCatalog(dependencies, extensionId)
+          afterCommit: () => {
+            reconcileCommittedExtensionCatalog(dependencies, extensionId);
+          },
+          extensionLibraryAuthorityChange: "orphan"
         }
       );
       return result;
@@ -16784,9 +17515,14 @@ async function dispatchMutation(
               throw new ConnectError("Extension owner changed concurrently.", Code.Aborted);
             }
             return dependencies.piResources!.prepareSetEnabled(current.owner.resourceId, payload.value.enabled);
+          },
+          {
+            afterCommit: () => { reconcileCommittedExtensionCatalog(dependencies, entry.id); },
+            ...(payload.value.enabled
+              ? {}
+              : { extensionLibraryAuthorityChange: "revoke" })
           }
         );
-        reconcileExtensionCatalog(dependencies);
         return result;
       }
       if (entry.owner.kind === "source") {
@@ -17683,6 +18419,8 @@ async function adoptExtensionPackageEffectOperation(
   let admittedCapability: BackendResourceAdmission | undefined;
   let admittedAcquisition: ReturnType<typeof extensionPackageAcquisition> | undefined;
   let lease: ExtensionSourceEntryLease | undefined;
+  let libraryAuthorityLease: ExtensionLibraryAuthorityChangeLease | undefined;
+  let libraryAuthorityChanges: readonly ResourceExtensionLibraryAuthority[] | undefined;
   let prepared: PreparedPiResourceMutation<NativePiResourceDescriptor> | undefined;
   let resourceCatalogFence: symbol | undefined;
   const assertAuthority = (store: OperationalStore): ReturnType<typeof extensionPackageAcquisition> => {
@@ -17703,6 +18441,16 @@ async function adoptExtensionPackageEffectOperation(
     if (admittedAcquisition === undefined) admittedAcquisition = acquisition;
     else if (!sameExtensionPackageAcquisition(admittedAcquisition, acquisition)) {
       throw new ConnectError("Extension source selection changed while the operation was in progress.", Code.Aborted);
+    }
+    const currentResourceId = extension.owner.kind === "resource"
+      ? extension.owner.resourceId
+      : input.expectedCurrentResourceId;
+    if (currentResourceId !== undefined && dependencies.extensionLibraries !== undefined) {
+      const observed = resourceExtensionLibraryAuthorities(dependencies, currentResourceId);
+      if (libraryAuthorityChanges === undefined) libraryAuthorityChanges = observed;
+      else if (!sameResourceExtensionLibraryAuthorities(libraryAuthorityChanges, observed)) {
+        throw new ConnectError("Extension Library authority changed while the package operation was in progress.", Code.Aborted);
+      }
     }
     return acquisition;
   };
@@ -17744,6 +18492,11 @@ async function adoptExtensionPackageEffectOperation(
           allowSourceReplacement: input.allowSourceReplacement
         });
         prepared = planned.mutation;
+        if (libraryAuthorityChanges !== undefined && libraryAuthorityChanges.length > 0) {
+          libraryAuthorityLease = await dependencies.extensionLibraries?.acquireAuthorityChanges(
+            libraryAuthorityChanges.map((change) => change.extensionId)
+          );
+        }
       },
       complete: (commit) => dependencies.piResources!.completePreparedMutation(
         requiredPreparedResourceMutation(prepared),
@@ -17770,7 +18523,11 @@ async function adoptExtensionPackageEffectOperation(
     }
     return presented(execution);
   } finally {
-    lease?.release();
+    try {
+      await libraryAuthorityLease?.release();
+    } finally {
+      lease?.release();
+    }
   }
 }
 
@@ -17782,6 +18539,32 @@ function sameExtensionPackageAcquisition(
     && left.sourceRevision === right.sourceRevision
     && left.entryId === right.entryId
     && left.contentRevision === right.contentRevision;
+}
+
+interface ResourceExtensionLibraryAuthority {
+  readonly extensionId: string;
+  readonly name: string;
+}
+
+function resourceExtensionLibraryAuthorities(
+  dependencies: ConnectServiceDependencies,
+  resourceId: string
+): readonly ResourceExtensionLibraryAuthority[] {
+  if (dependencies.extensionCatalog === undefined) return [];
+  return dependencies.extensionCatalog.snapshot().entries
+    .filter((entry) => entry.owner.kind === "resource" && entry.owner.resourceId === resourceId && entry.library !== undefined)
+    .map((entry) => ({ extensionId: entry.id, name: entry.name }))
+    .sort((left, right) => left.extensionId.localeCompare(right.extensionId, "en"));
+}
+
+function sameResourceExtensionLibraryAuthorities(
+  left: readonly ResourceExtensionLibraryAuthority[],
+  right: readonly ResourceExtensionLibraryAuthority[]
+): boolean {
+  return left.length === right.length && left.every((entry, index) => {
+    const candidate = right[index];
+    return candidate !== undefined && candidate.extensionId === entry.extensionId && candidate.name === entry.name;
+  });
 }
 
 async function preparedResourceEffectOperation(
@@ -17796,7 +18579,8 @@ async function preparedResourceEffectOperation(
   options: {
     readonly fenceBackendIdentity?: boolean;
     readonly precondition?: (store: OperationalStore) => void;
-    readonly afterCommit?: () => void;
+    readonly afterCommit?: () => void | Promise<void>;
+    readonly extensionLibraryAuthorityChange?: "revoke" | "orphan";
   } = {}
 ): Promise<PresentedOperation> {
   let admittedBackendId: string | undefined;
@@ -17804,6 +18588,9 @@ async function preparedResourceEffectOperation(
   let admittedCapability: BackendResourceAdmission | undefined;
   let prepared: PreparedPiResourceMutation<NativePiResourceDescriptor> | undefined;
   let resourceCatalogFence: symbol | undefined;
+  let libraryAuthorityLease: ExtensionLibraryAuthorityChangeLease | undefined;
+  let libraryAuthorityChanges: readonly ResourceExtensionLibraryAuthority[] | undefined;
+  let committed = false;
   const assertResourceAuthority = (store: OperationalStore): NativePiResourceDescriptor => {
     if (dependencies.piResources === undefined) throw new Error("The managed resource authority is unavailable.");
     const resource = dependencies.piResources.get(resourceId);
@@ -17841,35 +18628,59 @@ async function preparedResourceEffectOperation(
       }
     }
     options.precondition?.(store);
+    if (options.extensionLibraryAuthorityChange !== undefined && dependencies.extensionLibraries !== undefined) {
+      const observed = resourceExtensionLibraryAuthorities(dependencies, resourceId);
+      if (libraryAuthorityChanges === undefined) libraryAuthorityChanges = observed;
+      else if (!sameResourceExtensionLibraryAuthorities(libraryAuthorityChanges, observed)) {
+        throw new ConnectError("Extension Library authority changed while the Resource operation was in progress.", Code.Aborted);
+      }
+    }
     return resource;
   };
-  const execution = await dependencies.sessionHost.mutate<OperationOutcome>({
-    operationId,
-    connection,
-    kind,
-    body: mutation,
-    commit: () => ({ accepted: true, resultCase: "resource", entityId: resourceId }),
-    precondition: (store) => { void assertResourceAuthority(store); },
-    effect: async () => {
-      void assertResourceAuthority(dependencies.store);
-      prepared = await prepare();
-    },
-    complete: (commit) => dependencies.piResources!.completePreparedMutation(
-      requiredPreparedResourceMutation(prepared),
-      (finalize) => {
-        const execution = commit(finalize);
-        resourceCatalogFence = dependencies.sessionHost.fenceBackendResourceCatalogs(admittedBackendId!);
-        return execution;
-      }
-    )
-  });
-  if (!execution.replayed) {
-    if (admittedBackendId === undefined) throw new StoreError("Managed resource operation completed without Backend authority.");
-    if (resourceCatalogFence === undefined) throw new StoreError("Managed resource operation completed without a runtime catalog fence.");
-    options.afterCommit?.();
-    await reconcileCommittedResourceRuntime(dependencies, admittedBackendId, resourceId, resourceCatalogFence);
+  try {
+    const execution = await dependencies.sessionHost.mutate<OperationOutcome>({
+      operationId,
+      connection,
+      kind,
+      body: mutation,
+      commit: () => ({ accepted: true, resultCase: "resource", entityId: resourceId }),
+      precondition: (store) => { void assertResourceAuthority(store); },
+      effect: async () => {
+        void assertResourceAuthority(dependencies.store);
+        prepared = await prepare();
+        const authorityChanges = libraryAuthorityChanges;
+        if (authorityChanges !== undefined && authorityChanges.length > 0) {
+          libraryAuthorityLease = await dependencies.extensionLibraries?.acquireAuthorityChanges(
+            authorityChanges.map((change) => change.extensionId)
+          );
+        }
+      },
+      complete: (commit) => dependencies.piResources!.completePreparedMutation(
+        requiredPreparedResourceMutation(prepared),
+        (finalize) => {
+          const execution = commit(finalize);
+          committed = true;
+          resourceCatalogFence = dependencies.sessionHost.fenceBackendResourceCatalogs(admittedBackendId!);
+          return execution;
+        }
+      )
+    });
+    if (!execution.replayed) {
+      if (admittedBackendId === undefined) throw new StoreError("Managed resource operation completed without Backend authority.");
+      if (resourceCatalogFence === undefined) throw new StoreError("Managed resource operation completed without a runtime catalog fence.");
+      await options.afterCommit?.();
+      await reconcileCommittedResourceRuntime(dependencies, admittedBackendId, resourceId, resourceCatalogFence);
+    }
+    return presented(execution);
+  } finally {
+    await libraryAuthorityLease?.release(committed
+      ? {
+          orphaned: options.extensionLibraryAuthorityChange === "orphan"
+            ? libraryAuthorityChanges?.map((change) => ({ extensionId: change.extensionId, name: change.name })) ?? []
+            : []
+        }
+      : undefined);
   }
-  return presented(execution);
 }
 
 interface BackendResourceAdmission {

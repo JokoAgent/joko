@@ -5,6 +5,12 @@ export const DESKTOP_CHANNELS = {
   windowClose: "joko:window:close",
   sessionWindowOpen: "joko:session-window:open",
   extensionWindowOpen: "joko:extension-window:open",
+  extensionLibraryPickLocation: "joko:extension-library:pick-location",
+  extensionLibraryReveal: "joko:extension-library:reveal",
+  extensionLibraryBeginSave: "joko:extension-library:save:begin",
+  extensionLibraryCommitSave: "joko:extension-library:save:commit",
+  extensionLibraryCancelSave: "joko:extension-library:save:cancel",
+  extensionLibraryClipboardWrite: "joko:extension-library:clipboard-write",
   sessionDragPreviewBegin: "joko:session-drag-preview:begin",
   sessionDragPreviewEnd: "joko:session-drag-preview:end",
   sessionWindowOpenIfDroppedOutside: "joko:session-window:open-if-dropped-outside",
@@ -295,6 +301,37 @@ export interface DesktopSessionWindowOpenResult {
 
 export interface DesktopExtensionWindowOpenResult {
   readonly focusedExisting: boolean;
+}
+
+export type DesktopExtensionLibraryLocationSelection =
+  | { readonly cancelled: true }
+  | { readonly cancelled: false; readonly path: string };
+
+export interface DesktopExtensionLibraryRevealRequest {
+  readonly extensionId: string;
+  readonly root: string;
+  readonly path: string;
+}
+
+export interface DesktopExtensionLibraryBeginSaveRequest {
+  readonly extensionId: string;
+  readonly name: string;
+}
+
+export type DesktopExtensionLibrarySaveSelection =
+  | { readonly cancelled: true }
+  | { readonly cancelled: false; readonly ticketId: string };
+
+export interface DesktopExtensionLibraryCommitSaveRequest {
+  readonly extensionId: string;
+  readonly ticketId: string;
+  readonly root: string;
+  readonly path: string;
+}
+
+export interface DesktopExtensionLibraryClipboardRequest {
+  readonly extensionId: string;
+  readonly bytes: Uint8Array;
 }
 
 export function isDesktopExtensionId(value: unknown): value is string {

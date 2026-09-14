@@ -2468,6 +2468,7 @@ export interface ExtensionCatalogEntryView {
     readonly title?: string;
     readonly icon?: ExtensionMainViewIconView;
   };
+  readonly library?: { readonly schemaVersion: 1 };
   readonly sidebarSupported: boolean;
   readonly sidebarVisible: boolean;
   readonly tools: readonly { readonly name: string; readonly description: string; readonly requiresPermission: boolean }[];
@@ -2527,6 +2528,142 @@ export interface ExtensionMainViewSurfaceView {
   readonly title?: string;
   readonly icon?: ExtensionMainViewIconView;
   readonly expiresAt: number;
+}
+
+export type ExtensionLibraryStateView = "ready" | "readOnly" | "unavailable";
+export type ExtensionLibraryUnavailableReasonView =
+  | "metadataCorrupt"
+  | "fileLimit"
+  | "io"
+  | "operationInProgress"
+  | "diskMissing"
+  | "bindingMoved"
+  | "stateCorrupt";
+
+export interface ExtensionLibraryLocationView {
+  readonly kind: "default" | "custom";
+  /** Trusted management display only; never forwarded to an Extension frame. */
+  readonly path: string;
+  readonly generation: bigint;
+}
+
+export interface ExtensionLibraryOverviewView {
+  readonly extensionId: string;
+  readonly name: string;
+  readonly state: ExtensionLibraryStateView;
+  readonly unavailableReason?: ExtensionLibraryUnavailableReasonView;
+  readonly location?: ExtensionLibraryLocationView;
+  readonly files: number;
+  readonly bytes: bigint;
+  readonly diskFreeBytes?: bigint;
+  readonly softLimitBytes: bigint;
+  readonly softLimitExceeded: boolean;
+  readonly orphaned: boolean;
+  readonly trashCount: number;
+  readonly graceCount: number;
+  readonly operation?: { readonly id: string; readonly phase: string };
+}
+
+export interface ExtensionLibraryLocationValidationView {
+  readonly libraryRoot: string;
+  readonly warnings: readonly string[];
+  readonly diskFreeBytes?: bigint;
+}
+
+export interface ExtensionLibrarySessionView {
+  readonly id: string;
+  readonly extensionId: string;
+  readonly expiresAt: number;
+  readonly bindingGeneration: bigint;
+  readonly limits: {
+    readonly maximumReadBytes: bigint;
+    readonly maximumWriteBytes: bigint;
+    readonly maximumStreamBytes: bigint;
+    readonly maximumPathCharacters: number;
+    readonly maximumPathSegments: number;
+    readonly maximumListPageSize: number;
+    readonly maximumFiles: number;
+    readonly softLimitBytes: bigint;
+    readonly diskReserveBytes: bigint;
+  };
+}
+
+export interface ExtensionLibraryEntryView {
+  readonly path: string;
+  readonly kind: "file" | "directory";
+  readonly bytes: bigint;
+  readonly modifiedAt: number;
+}
+
+export type ExtensionLibrarySqlValueView =
+  | { readonly kind: "null" }
+  | { readonly kind: "number"; readonly value: number }
+  | { readonly kind: "integer"; readonly value: bigint }
+  | { readonly kind: "text"; readonly value: string }
+  | { readonly kind: "blob"; readonly value: Uint8Array };
+
+export interface ExtensionLibrarySqlStatementView {
+  readonly sql: string;
+  readonly parameters?: readonly ExtensionLibrarySqlValueView[];
+}
+
+export type ExtensionLibraryCallView =
+  | { readonly kind: "read"; readonly path: string; readonly offset?: bigint; readonly length?: bigint }
+  | { readonly kind: "write"; readonly path: string; readonly content: Uint8Array; readonly ifNotExists?: boolean }
+  | { readonly kind: "stat"; readonly path: string }
+  | { readonly kind: "list"; readonly path?: string; readonly recursive?: boolean; readonly limit?: number; readonly cursor?: string }
+  | { readonly kind: "mkdir"; readonly path: string }
+  | { readonly kind: "delete"; readonly path: string; readonly recursive?: boolean }
+  | { readonly kind: "rename"; readonly from: string; readonly to: string; readonly overwrite?: boolean }
+  | { readonly kind: "writeBegin"; readonly path: string; readonly totalBytes: bigint; readonly sha256?: string; readonly ifNotExists?: boolean }
+  | { readonly kind: "writeChunk"; readonly streamId: string; readonly sequence: number; readonly content: Uint8Array }
+  | { readonly kind: "writeCommit"; readonly streamId: string }
+  | { readonly kind: "writeAbort"; readonly streamId: string }
+  | { readonly kind: "sqlOpen"; readonly path: string; readonly create?: boolean; readonly readOnly?: boolean }
+  | { readonly kind: "sqlExecute"; readonly handleId: string; readonly statement: ExtensionLibrarySqlStatementView }
+  | { readonly kind: "sqlBatch"; readonly handleId: string; readonly statements: readonly ExtensionLibrarySqlStatementView[] }
+  | { readonly kind: "sqlMigrate"; readonly handleId: string; readonly migrations: readonly { readonly version: number; readonly statements: readonly string[] }[] }
+  | { readonly kind: "sqlBackup"; readonly handleId: string; readonly targetPath: string }
+  | { readonly kind: "sqlCheck" | "sqlClose"; readonly handleId: string };
+
+export interface ExtensionLibrarySqlResultView {
+  readonly rows: readonly { readonly cells: readonly { readonly name: string; readonly value: ExtensionLibrarySqlValueView }[] }[];
+  readonly changes: bigint;
+  readonly lastInsertRowId?: bigint;
+}
+
+export type ExtensionLibraryCallResultView =
+  | { readonly kind: "read"; readonly path: string; readonly content: Uint8Array; readonly sha256: string }
+  | { readonly kind: "write"; readonly path: string; readonly bytes: bigint; readonly sha256: string }
+  | { readonly kind: "stat"; readonly entry: ExtensionLibraryEntryView }
+  | { readonly kind: "list"; readonly entries: readonly ExtensionLibraryEntryView[]; readonly nextCursor?: string }
+  | { readonly kind: "path"; readonly path: string; readonly existed: boolean }
+  | { readonly kind: "rename"; readonly from: string; readonly to: string }
+  | { readonly kind: "stream"; readonly streamId: string; readonly receivedBytes: bigint; readonly nextSequence: number; readonly expiresAt?: number; readonly aborted: boolean }
+  | { readonly kind: "sqlHandle"; readonly handleId: string; readonly path: string; readonly readOnly: boolean; readonly userVersion: number }
+  | { readonly kind: "sqlResult"; readonly value: ExtensionLibrarySqlResultView }
+  | { readonly kind: "sqlBatch"; readonly results: readonly ExtensionLibrarySqlResultView[] }
+  | { readonly kind: "sqlVersion"; readonly userVersion: number; readonly path?: string }
+  | { readonly kind: "boolean"; readonly value: boolean };
+
+export interface ExtensionLibraryTrashEntryView {
+  readonly id: string;
+  readonly extensionId: string;
+  readonly name: string;
+  readonly deletedAt: number;
+  readonly expiresAt: number;
+  readonly files: number;
+  readonly bytes: bigint;
+}
+
+export interface ExtensionLibraryGraceEntryView {
+  readonly id: string;
+  readonly extensionId: string;
+  readonly name: string;
+  readonly createdAt: number;
+  readonly expiresAt: number;
+  readonly files: number;
+  readonly bytes: bigint;
 }
 
 export type ExtensionPackageActionView = "install" | "update" | "replace";
@@ -3907,6 +4044,23 @@ export interface OperationApi {
   openExtensionMainView(extensionId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ExtensionMainViewSurfaceView>;
   getExtensionMainViewSurface(surfaceId: string, signal?: AbortSignal): Promise<ExtensionMainViewSurfaceView>;
   closeExtensionMainView(surfaceId: string, signal?: AbortSignal): Promise<boolean>;
+  getExtensionLibraryOverview(extensionId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ExtensionLibraryOverviewView>;
+  validateExtensionLibraryLocation(extensionId: string, expectedRevision: bigint, candidate: string, signal?: AbortSignal): Promise<ExtensionLibraryLocationValidationView>;
+  relocateExtensionLibrary(extensionId: string, expectedRevision: bigint, destination: { readonly kind: "default" } | { readonly kind: "custom"; readonly candidate: string }, signal?: AbortSignal): Promise<{ readonly changed: boolean; readonly migrationId?: string; readonly location: ExtensionLibraryLocationView; readonly files: number; readonly bytes: bigint; readonly warnings: readonly string[]; readonly graceId?: string }>;
+  rebindExtensionLibrary(extensionId: string, expectedRevision: bigint, candidate: string, signal?: AbortSignal): Promise<{ readonly location: ExtensionLibraryLocationView; readonly warnings: readonly string[] }>;
+  unbindExtensionLibrary(extensionId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<{ readonly detachedPath?: string }>;
+  repairExtensionLibraryState(signal?: AbortSignal): Promise<{ readonly recoveredFromPrevious: boolean; readonly bindings: number; readonly trash: number }>;
+  repairExtensionLibraryMetadata(extensionId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ExtensionLibraryOverviewView>;
+  trashExtensionLibrary(extensionId: string, expectedRevision: bigint, confirmation: string, signal?: AbortSignal): Promise<ExtensionLibraryTrashEntryView>;
+  listExtensionLibraryTrash(extensionId?: string, signal?: AbortSignal): Promise<readonly ExtensionLibraryTrashEntryView[]>;
+  restoreExtensionLibraryTrash(trashId: string, confirmation: string, destination?: { readonly kind: "default" } | { readonly kind: "custom"; readonly candidate: string }, signal?: AbortSignal): Promise<{ readonly extensionId: string; readonly location: ExtensionLibraryLocationView }>;
+  purgeExtensionLibraryTrash(trashId: string, confirmation: string, signal?: AbortSignal): Promise<boolean>;
+  listExtensionLibraryGrace(extensionId?: string, signal?: AbortSignal): Promise<readonly ExtensionLibraryGraceEntryView[]>;
+  rollbackExtensionLibrary(extensionId: string, expectedRevision: bigint, graceId: string, signal?: AbortSignal): Promise<{ readonly location: ExtensionLibraryLocationView; readonly graceId: string }>;
+  purgeExpiredExtensionLibraries(signal?: AbortSignal): Promise<{ readonly trash: number; readonly grace: number }>;
+  openExtensionLibrary(extensionId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ExtensionLibrarySessionView>;
+  callExtensionLibrary(sessionId: string, call: ExtensionLibraryCallView, signal?: AbortSignal): Promise<ExtensionLibraryCallResultView>;
+  closeExtensionLibrary(sessionId: string, signal?: AbortSignal): Promise<boolean>;
   getExtensionPackagePreview(extensionId: string, expectedRevision: bigint, backendId: string, signal?: AbortSignal): Promise<ExtensionPackagePreviewView>;
   adoptExtensionPackage(preview: ExtensionPackagePreviewView, allowSourceReplacement?: boolean, signal?: AbortSignal): Promise<void>;
   removeExtensionPackage(extensionId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<void>;

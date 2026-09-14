@@ -83,6 +83,36 @@ enum ExtensionMainViewIcon {
   EXTENSION_MAIN_VIEW_ICON_TOOL = 10;
 }
 
+enum ExtensionLibraryState {
+  EXTENSION_LIBRARY_STATE_UNSPECIFIED = 0;
+  EXTENSION_LIBRARY_STATE_READY = 1;
+  EXTENSION_LIBRARY_STATE_READ_ONLY = 2;
+  EXTENSION_LIBRARY_STATE_UNAVAILABLE = 3;
+}
+
+enum ExtensionLibraryUnavailableReason {
+  EXTENSION_LIBRARY_UNAVAILABLE_REASON_UNSPECIFIED = 0;
+  EXTENSION_LIBRARY_UNAVAILABLE_REASON_METADATA_CORRUPT = 1;
+  EXTENSION_LIBRARY_UNAVAILABLE_REASON_FILE_LIMIT = 2;
+  EXTENSION_LIBRARY_UNAVAILABLE_REASON_IO = 3;
+  EXTENSION_LIBRARY_UNAVAILABLE_REASON_OPERATION_IN_PROGRESS = 4;
+  EXTENSION_LIBRARY_UNAVAILABLE_REASON_DISK_MISSING = 5;
+  EXTENSION_LIBRARY_UNAVAILABLE_REASON_BINDING_MOVED = 6;
+  EXTENSION_LIBRARY_UNAVAILABLE_REASON_STATE_CORRUPT = 7;
+}
+
+enum ExtensionLibraryLocationKind {
+  EXTENSION_LIBRARY_LOCATION_KIND_UNSPECIFIED = 0;
+  EXTENSION_LIBRARY_LOCATION_KIND_DEFAULT = 1;
+  EXTENSION_LIBRARY_LOCATION_KIND_CUSTOM = 2;
+}
+
+enum ExtensionLibraryEntryKind {
+  EXTENSION_LIBRARY_ENTRY_KIND_UNSPECIFIED = 0;
+  EXTENSION_LIBRARY_ENTRY_KIND_FILE = 1;
+  EXTENSION_LIBRARY_ENTRY_KIND_DIRECTORY = 2;
+}
+
 message ExtensionLocalSource {
   string path = 1;
 }
@@ -264,6 +294,310 @@ message ExtensionMainViewDescriptor {
   ExtensionMainViewIcon icon = 2;
 }
 
+message ExtensionLibraryDescriptor {
+  uint32 schema_version = 1;
+}
+
+message ExtensionLibraryLimits {
+  uint64 maximum_read_bytes = 1;
+  uint64 maximum_write_bytes = 2;
+  uint64 maximum_stream_bytes = 3;
+  uint32 maximum_path_characters = 4;
+  uint32 maximum_path_segments = 5;
+  uint32 maximum_list_page_size = 6;
+  uint32 maximum_files = 7;
+  uint64 soft_limit_bytes = 8;
+  uint64 disk_reserve_bytes = 9;
+}
+
+message ExtensionLibraryLocation {
+  ExtensionLibraryLocationKind kind = 1;
+  string path = 2;
+  Revision generation = 3;
+}
+
+message ExtensionLibraryOperationStatus {
+  string operation_id = 1;
+  string phase = 2;
+}
+
+message ExtensionLibraryOverview {
+  string extension_id = 1;
+  string name = 2;
+  ExtensionLibraryState state = 3;
+  ExtensionLibraryUnavailableReason unavailable_reason = 4;
+  optional ExtensionLibraryLocation location = 5;
+  uint32 files = 6;
+  uint64 bytes = 7;
+  optional uint64 disk_free_bytes = 8;
+  uint64 soft_limit_bytes = 9;
+  bool soft_limit_exceeded = 10;
+  bool orphaned = 11;
+  uint32 trash_count = 12;
+  uint32 grace_count = 13;
+  optional ExtensionLibraryOperationStatus operation = 14;
+}
+
+message ExtensionLibraryLocationValidation {
+  string library_root = 1;
+  repeated string warnings = 2;
+  optional uint64 disk_free_bytes = 3;
+}
+
+message ExtensionLibrarySession {
+  string session_id = 1;
+  string extension_id = 2;
+  google.protobuf.Timestamp expires_at = 3;
+  Revision binding_generation = 4;
+  ExtensionLibraryLimits limits = 5;
+}
+
+message ExtensionLibraryEntry {
+  string path = 1;
+  ExtensionLibraryEntryKind kind = 2;
+  uint64 bytes = 3;
+  google.protobuf.Timestamp modified_at = 4;
+}
+
+message ExtensionLibraryReadOperation {
+  string path = 1;
+  optional uint64 offset = 2;
+  optional uint64 length = 3;
+}
+
+message ExtensionLibraryWriteOperation {
+  string path = 1;
+  bytes content = 2;
+  bool if_not_exists = 3;
+}
+
+message ExtensionLibraryStatOperation {
+  string path = 1;
+}
+
+message ExtensionLibraryListOperation {
+  optional string path = 1;
+  bool recursive = 2;
+  optional uint32 limit = 3;
+  optional string cursor = 4;
+}
+
+message ExtensionLibraryMkdirOperation {
+  string path = 1;
+}
+
+message ExtensionLibraryDeleteOperation {
+  string path = 1;
+  bool recursive = 2;
+}
+
+message ExtensionLibraryRenameOperation {
+  string from = 1;
+  string to = 2;
+  bool overwrite = 3;
+}
+
+message ExtensionLibraryWriteBeginOperation {
+  string path = 1;
+  uint64 total_bytes = 2;
+  optional string sha256 = 3;
+  bool if_not_exists = 4;
+}
+
+message ExtensionLibraryWriteChunkOperation {
+  string stream_id = 1;
+  uint32 sequence = 2;
+  bytes content = 3;
+}
+
+message ExtensionLibraryWriteCommitOperation {
+  string stream_id = 1;
+}
+
+message ExtensionLibraryWriteAbortOperation {
+  string stream_id = 1;
+}
+
+message ExtensionLibrarySqlValue {
+  oneof value {
+    bool null_value = 1;
+    double number_value = 2;
+    string integer_value = 3;
+    string text_value = 4;
+    bytes blob_value = 5;
+  }
+}
+
+message ExtensionLibrarySqlCell {
+  string name = 1;
+  ExtensionLibrarySqlValue value = 2;
+}
+
+message ExtensionLibrarySqlRow {
+  repeated ExtensionLibrarySqlCell cells = 1;
+}
+
+message ExtensionLibrarySqlStatement {
+  string sql = 1;
+  repeated ExtensionLibrarySqlValue parameters = 2;
+}
+
+message ExtensionLibrarySqlOpenOperation {
+  string path = 1;
+  bool create = 2;
+  bool read_only = 3;
+}
+
+message ExtensionLibrarySqlExecuteOperation {
+  string handle_id = 1;
+  ExtensionLibrarySqlStatement statement = 2;
+}
+
+message ExtensionLibrarySqlBatchOperation {
+  string handle_id = 1;
+  repeated ExtensionLibrarySqlStatement statements = 2;
+}
+
+message ExtensionLibrarySqlMigration {
+  uint32 version = 1;
+  repeated string statements = 2;
+}
+
+message ExtensionLibrarySqlMigrateOperation {
+  string handle_id = 1;
+  repeated ExtensionLibrarySqlMigration migrations = 2;
+}
+
+message ExtensionLibrarySqlBackupOperation {
+  string handle_id = 1;
+  string target_path = 2;
+}
+
+message ExtensionLibrarySqlHandleOperation {
+  string handle_id = 1;
+}
+
+message ExtensionLibraryCall {
+  oneof operation {
+    ExtensionLibraryReadOperation read = 1;
+    ExtensionLibraryWriteOperation write = 2;
+    ExtensionLibraryStatOperation stat = 3;
+    ExtensionLibraryListOperation list = 4;
+    ExtensionLibraryMkdirOperation mkdir = 5;
+    ExtensionLibraryDeleteOperation delete = 6;
+    ExtensionLibraryRenameOperation rename = 7;
+    ExtensionLibraryWriteBeginOperation write_begin = 8;
+    ExtensionLibraryWriteChunkOperation write_chunk = 9;
+    ExtensionLibraryWriteCommitOperation write_commit = 10;
+    ExtensionLibraryWriteAbortOperation write_abort = 11;
+    ExtensionLibrarySqlOpenOperation sql_open = 12;
+    ExtensionLibrarySqlExecuteOperation sql_execute = 13;
+    ExtensionLibrarySqlBatchOperation sql_batch = 14;
+    ExtensionLibrarySqlMigrateOperation sql_migrate = 15;
+    ExtensionLibrarySqlBackupOperation sql_backup = 16;
+    ExtensionLibrarySqlHandleOperation sql_check = 17;
+    ExtensionLibrarySqlHandleOperation sql_close = 18;
+  }
+}
+
+message ExtensionLibraryReadResult {
+  string path = 1;
+  bytes content = 2;
+  string sha256 = 3;
+}
+
+message ExtensionLibraryWriteResult {
+  string path = 1;
+  uint64 bytes = 2;
+  string sha256 = 3;
+}
+
+message ExtensionLibraryListResult {
+  repeated ExtensionLibraryEntry entries = 1;
+  optional string next_cursor = 2;
+}
+
+message ExtensionLibraryPathResult {
+  string path = 1;
+  bool existed = 2;
+}
+
+message ExtensionLibraryRenameResult {
+  string from = 1;
+  string to = 2;
+}
+
+message ExtensionLibraryStreamResult {
+  string stream_id = 1;
+  uint64 received_bytes = 2;
+  uint32 next_sequence = 3;
+  optional google.protobuf.Timestamp expires_at = 4;
+  bool aborted = 5;
+}
+
+message ExtensionLibrarySqlHandle {
+  string handle_id = 1;
+  string path = 2;
+  bool read_only = 3;
+  uint32 user_version = 4;
+}
+
+message ExtensionLibrarySqlResult {
+  repeated ExtensionLibrarySqlRow rows = 1;
+  string changes = 2;
+  optional string last_insert_row_id = 3;
+}
+
+message ExtensionLibrarySqlBatchResult {
+  repeated ExtensionLibrarySqlResult results = 1;
+}
+
+message ExtensionLibrarySqlVersionResult {
+  uint32 user_version = 1;
+  optional string path = 2;
+}
+
+message ExtensionLibraryBooleanResult {
+  bool value = 1;
+}
+
+message ExtensionLibraryCallResult {
+  oneof result {
+    ExtensionLibraryReadResult read = 1;
+    ExtensionLibraryWriteResult write = 2;
+    ExtensionLibraryEntry stat = 3;
+    ExtensionLibraryListResult list = 4;
+    ExtensionLibraryPathResult path = 5;
+    ExtensionLibraryRenameResult rename = 6;
+    ExtensionLibraryStreamResult stream = 7;
+    ExtensionLibrarySqlHandle sql_handle = 8;
+    ExtensionLibrarySqlResult sql_result = 9;
+    ExtensionLibrarySqlBatchResult sql_batch = 10;
+    ExtensionLibrarySqlVersionResult sql_version = 11;
+    ExtensionLibraryBooleanResult boolean = 12;
+  }
+}
+
+message ExtensionLibraryTrashEntry {
+  string trash_id = 1;
+  string extension_id = 2;
+  string name = 3;
+  google.protobuf.Timestamp deleted_at = 4;
+  google.protobuf.Timestamp expires_at = 5;
+  uint32 files = 6;
+  uint64 bytes = 7;
+}
+
+message ExtensionLibraryGraceEntry {
+  string grace_id = 1;
+  string extension_id = 2;
+  string name = 3;
+  google.protobuf.Timestamp created_at = 4;
+  google.protobuf.Timestamp expires_at = 5;
+  uint32 files = 6;
+  uint64 bytes = 7;
+}
+
 // Opaque, process-local surface authority. The endpoint is connection-owned
 // and expires with its exact installed Resource generation.
 message ExtensionMainViewSurface {
@@ -304,6 +638,7 @@ message ExtensionCatalogEntry {
   optional string error = 19;
   optional ExtensionPackageUpdate update = 20;
   optional ExtensionMainViewDescriptor main_view = 21;
+  optional ExtensionLibraryDescriptor library = 22;
 }
 
 message ExtensionCatalogSnapshot {

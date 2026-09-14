@@ -239,6 +239,23 @@ service ExtensionService {
   rpc OpenExtensionMainView(OpenExtensionMainViewRequest) returns (OpenExtensionMainViewResponse);
   rpc GetExtensionMainViewSurface(GetExtensionMainViewSurfaceRequest) returns (GetExtensionMainViewSurfaceResponse);
   rpc CloseExtensionMainView(CloseExtensionMainViewRequest) returns (CloseExtensionMainViewResponse);
+  rpc GetExtensionLibraryOverview(GetExtensionLibraryOverviewRequest) returns (GetExtensionLibraryOverviewResponse);
+  rpc ValidateExtensionLibraryLocation(ValidateExtensionLibraryLocationRequest) returns (ValidateExtensionLibraryLocationResponse);
+  rpc RelocateExtensionLibrary(RelocateExtensionLibraryRequest) returns (RelocateExtensionLibraryResponse);
+  rpc RebindExtensionLibrary(RebindExtensionLibraryRequest) returns (RebindExtensionLibraryResponse);
+  rpc UnbindExtensionLibrary(UnbindExtensionLibraryRequest) returns (UnbindExtensionLibraryResponse);
+  rpc RepairExtensionLibraryState(RepairExtensionLibraryStateRequest) returns (RepairExtensionLibraryStateResponse);
+  rpc RepairExtensionLibraryMetadata(RepairExtensionLibraryMetadataRequest) returns (RepairExtensionLibraryMetadataResponse);
+  rpc TrashExtensionLibrary(TrashExtensionLibraryRequest) returns (TrashExtensionLibraryResponse);
+  rpc ListExtensionLibraryTrash(ListExtensionLibraryTrashRequest) returns (ListExtensionLibraryTrashResponse);
+  rpc RestoreExtensionLibraryTrash(RestoreExtensionLibraryTrashRequest) returns (RestoreExtensionLibraryTrashResponse);
+  rpc PurgeExtensionLibraryTrash(PurgeExtensionLibraryTrashRequest) returns (PurgeExtensionLibraryTrashResponse);
+  rpc ListExtensionLibraryGrace(ListExtensionLibraryGraceRequest) returns (ListExtensionLibraryGraceResponse);
+  rpc RollbackExtensionLibrary(RollbackExtensionLibraryRequest) returns (RollbackExtensionLibraryResponse);
+  rpc PurgeExpiredExtensionLibraries(PurgeExpiredExtensionLibrariesRequest) returns (PurgeExpiredExtensionLibrariesResponse);
+  rpc OpenExtensionLibrary(OpenExtensionLibraryRequest) returns (OpenExtensionLibraryResponse);
+  rpc CallExtensionLibrary(CallExtensionLibraryRequest) returns (CallExtensionLibraryResponse);
+  rpc CloseExtensionLibrary(CloseExtensionLibraryRequest) returns (CloseExtensionLibraryResponse);
   // Produces a one-time protected upload ticket. Secret bytes cross only the
   // authenticated credential upload endpoint and never this RPC.
   rpc BeginExtensionSetupCredentialUpload(BeginExtensionSetupCredentialUploadRequest) returns (BeginExtensionSetupCredentialUploadResponse);
@@ -1758,6 +1775,170 @@ message CloseExtensionMainViewRequest {
 }
 
 message CloseExtensionMainViewResponse {
+  bool closed = 1;
+}
+
+message GetExtensionLibraryOverviewRequest {
+  string extension_id = 1;
+  Revision expected_revision = 2;
+}
+
+message GetExtensionLibraryOverviewResponse {
+  ExtensionLibraryOverview library = 1;
+}
+
+message ValidateExtensionLibraryLocationRequest {
+  string extension_id = 1;
+  Revision expected_revision = 2;
+  string candidate = 3;
+}
+
+message ValidateExtensionLibraryLocationResponse {
+  ExtensionLibraryLocationValidation validation = 1;
+}
+
+message RelocateExtensionLibraryRequest {
+  string extension_id = 1;
+  Revision expected_revision = 2;
+  ExtensionLibraryLocationKind destination_kind = 3;
+  optional string candidate = 4;
+}
+
+message RelocateExtensionLibraryResponse {
+  bool changed = 1;
+  optional string migration_id = 2;
+  ExtensionLibraryLocation location = 3;
+  uint32 files = 4;
+  uint64 bytes = 5;
+  repeated string warnings = 6;
+  optional string grace_id = 7;
+}
+
+message RebindExtensionLibraryRequest {
+  string extension_id = 1;
+  Revision expected_revision = 2;
+  string candidate = 3;
+}
+
+message RebindExtensionLibraryResponse {
+  ExtensionLibraryLocation location = 1;
+  repeated string warnings = 2;
+}
+
+message UnbindExtensionLibraryRequest {
+  string extension_id = 1;
+  Revision expected_revision = 2;
+}
+
+message UnbindExtensionLibraryResponse {
+  optional string detached_path = 1;
+}
+
+message RepairExtensionLibraryStateRequest {}
+
+message RepairExtensionLibraryStateResponse {
+  bool recovered_from_previous = 1;
+  uint32 bindings = 2;
+  uint32 trash = 3;
+}
+
+message RepairExtensionLibraryMetadataRequest {
+  string extension_id = 1;
+  Revision expected_revision = 2;
+}
+
+message RepairExtensionLibraryMetadataResponse {
+  ExtensionLibraryOverview library = 1;
+}
+
+message TrashExtensionLibraryRequest {
+  string extension_id = 1;
+  Revision expected_revision = 2;
+  string confirmation = 3;
+}
+
+message TrashExtensionLibraryResponse {
+  ExtensionLibraryTrashEntry trash = 1;
+}
+
+message ListExtensionLibraryTrashRequest {
+  optional string extension_id = 1;
+}
+
+message ListExtensionLibraryTrashResponse {
+  repeated ExtensionLibraryTrashEntry trash = 1;
+}
+
+message RestoreExtensionLibraryTrashRequest {
+  string trash_id = 1;
+  string confirmation = 2;
+  ExtensionLibraryLocationKind destination_kind = 3;
+  optional string candidate = 4;
+}
+
+message RestoreExtensionLibraryTrashResponse {
+  string extension_id = 1;
+  ExtensionLibraryLocation location = 2;
+}
+
+message PurgeExtensionLibraryTrashRequest {
+  string trash_id = 1;
+  string confirmation = 2;
+}
+
+message PurgeExtensionLibraryTrashResponse {
+  bool purged = 1;
+}
+
+message ListExtensionLibraryGraceRequest {
+  optional string extension_id = 1;
+}
+
+message ListExtensionLibraryGraceResponse {
+  repeated ExtensionLibraryGraceEntry grace = 1;
+}
+
+message RollbackExtensionLibraryRequest {
+  string extension_id = 1;
+  Revision expected_revision = 2;
+  string grace_id = 3;
+}
+
+message RollbackExtensionLibraryResponse {
+  ExtensionLibraryLocation location = 1;
+  string grace_id = 2;
+}
+
+message PurgeExpiredExtensionLibrariesRequest {}
+
+message PurgeExpiredExtensionLibrariesResponse {
+  uint32 trash = 1;
+  uint32 grace = 2;
+}
+
+message OpenExtensionLibraryRequest {
+  string extension_id = 1;
+  Revision expected_revision = 2;
+}
+
+message OpenExtensionLibraryResponse {
+  ExtensionLibrarySession library = 1;
+}
+
+message CallExtensionLibraryRequest {
+  string session_id = 1;
+  ExtensionLibraryCall call = 2;
+}
+
+message CallExtensionLibraryResponse {
+  ExtensionLibraryCallResult result = 1;
+}
+
+message CloseExtensionLibraryRequest {
+  string session_id = 1;
+}
+
+message CloseExtensionLibraryResponse {
   bool closed = 1;
 }
 

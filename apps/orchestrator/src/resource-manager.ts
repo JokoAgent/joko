@@ -25,7 +25,7 @@ import {
   type PiPackageRuntimeRequirement,
   type PiPackageWarning
 } from "./pi-package-compatibility.js";
-import { isExtensionMainViewDescriptor } from "./extension-surface-manifest.js";
+import { isExtensionLibraryDescriptor, isExtensionMainViewDescriptor } from "./extension-surface-manifest.js";
 
 export type PiResourceKind = "extension" | "skill" | "prompt" | "theme" | "package";
 export type PiResourceScope = "user" | "global" | "project" | "managed";
@@ -2693,6 +2693,7 @@ function copyResourceDetail(detail: PiPackageResourceDetail): PiPackageResourceD
     name: detail.name,
     ...(detail.entryPath === undefined ? {} : { entryPath: detail.entryPath }),
     ...(detail.mainView === undefined ? {} : { mainView: { ...detail.mainView } }),
+    ...(detail.library === undefined ? {} : { library: { ...detail.library } }),
     compatibility: detail.compatibility,
     compatibilityIssues: [...detail.compatibilityIssues],
     detectedApis: [...detail.detectedApis],
@@ -2765,11 +2766,12 @@ function validateStoredResourceDetails(value: readonly PiPackageResourceDetail[]
       !detail || typeof detail !== "object" || !kinds.has(detail.kind) || !compatibility.has(detail.compatibility)
       || typeof detail.name !== "string" || detail.name.trim() === "" || detail.name.length > 256
       || Object.keys(detail).some((key) => ![
-        "kind", "name", "entryPath", "mainView", "compatibility", "compatibilityIssues", "detectedApis", "adaptedApis", "unsupportedApis"
+        "kind", "name", "entryPath", "mainView", "library", "compatibility", "compatibilityIssues", "detectedApis", "adaptedApis", "unsupportedApis"
       ].includes(key))
       || detail.kind === "extension" !== (typeof detail.entryPath === "string")
       || detail.entryPath !== undefined && !isStoredPackageRelativePath(detail.entryPath)
       || detail.mainView !== undefined && (detail.kind !== "extension" || !isExtensionMainViewDescriptor(detail.mainView))
+      || detail.library !== undefined && (detail.kind !== "extension" || !isExtensionLibraryDescriptor(detail.library))
     ) throw new Error("Stored resource compatibility detail is malformed.");
     const compatibilityIssues = validateStringEnumList(detail.compatibilityIssues, issues, "compatibility issue");
     const detectedApis = validateStringEnumList(detail.detectedApis, apis, "detected API");
@@ -2780,6 +2782,7 @@ function validateStoredResourceDetails(value: readonly PiPackageResourceDetail[]
       name: detail.name,
       ...(detail.entryPath === undefined ? {} : { entryPath: detail.entryPath }),
       ...(detail.mainView === undefined ? {} : { mainView: { ...detail.mainView } }),
+      ...(detail.library === undefined ? {} : { library: { ...detail.library } }),
       compatibility: detail.compatibility,
       compatibilityIssues: compatibilityIssues as PiPackageResourceDetail["compatibilityIssues"],
       detectedApis: detectedApis as PiPackageResourceDetail["detectedApis"],

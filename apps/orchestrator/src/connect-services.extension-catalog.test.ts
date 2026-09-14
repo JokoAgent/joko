@@ -436,6 +436,7 @@ describe("Connect Extension catalog boundary", () => {
       name: sourceEntry.name,
       version: "1.0.0",
       enabled: false,
+      library: { schemaVersion: 1, extensionEntry: "extensions/index.ts" },
       sidebarVisible: false
     });
     let installedRevision = 8n;
@@ -515,11 +516,15 @@ describe("Connect Extension catalog boundary", () => {
     const completeBackendResourceCatalogRefresh = vi.fn();
     const host = replayingHost(store, operations, { fenceBackendResourceCatalogs, completeBackendResourceCatalogRefresh });
     const refreshPiGeneration = vi.fn(async () => undefined);
+    const releaseLibraryAuthority = vi.fn(async () => undefined);
+    const acquireAuthorityChange = vi.fn(async () => ({ release: releaseLibraryAuthority }));
+    const acquireAuthorityChanges = vi.fn(async () => ({ release: releaseLibraryAuthority }));
     const services = createConnectServices(stubApplication({
       store,
       piResources,
       extensionSources,
       extensionCatalog,
+      extensionLibraries: { acquireAuthorityChange, acquireAuthorityChanges },
       sessionHost: host,
       piBackendIds: new Set(["pi"]),
       refreshPiGeneration
@@ -572,6 +577,9 @@ describe("Connect Extension catalog boundary", () => {
     expect(release).toHaveBeenCalledTimes(1);
     expect(fenceBackendResourceCatalogs).toHaveBeenCalledWith("pi");
     expect(refreshPiGeneration).toHaveBeenCalledTimes(1);
+    expect(acquireAuthorityChange).not.toHaveBeenCalled();
+    expect(acquireAuthorityChanges).not.toHaveBeenCalled();
+    expect(releaseLibraryAuthority).not.toHaveBeenCalled();
     expect(completeBackendResourceCatalogRefresh).toHaveBeenCalledWith("pi", fence, true);
     expect(store.appendDiagnostic).toHaveBeenCalledWith(expect.objectContaining({
       code: "EXTENSION_CATALOG_REFRESH_FAILED",
@@ -586,6 +594,9 @@ describe("Connect Extension catalog boundary", () => {
     expect(acquireEntry).toHaveBeenCalledTimes(1);
     expect(prepareExtensionPackage).toHaveBeenCalledTimes(1);
     expect(refreshPiGeneration).toHaveBeenCalledTimes(1);
+    expect(acquireAuthorityChange).not.toHaveBeenCalled();
+    expect(acquireAuthorityChanges).not.toHaveBeenCalled();
+    expect(releaseLibraryAuthority).not.toHaveBeenCalled();
 
     await expect(invoke(services.extension.getExtensionPackagePreview, {
       extensionId: installedCatalogEntry.id,
@@ -623,6 +634,128 @@ describe("Connect Extension catalog boundary", () => {
     expect(prepareRemove).toHaveBeenCalledWith(resource.id);
     expect(phase).toBe("removed");
     expect(currentCatalogEntry()).toMatchObject({ revision: 9n, owner: { kind: "source" } });
+    expect(acquireAuthorityChange).not.toHaveBeenCalled();
+    expect(acquireAuthorityChanges).toHaveBeenCalledTimes(3);
+    expect(acquireAuthorityChanges).toHaveBeenLastCalledWith([installedCatalogEntry.id]);
+    expect(releaseLibraryAuthority).toHaveBeenCalledTimes(3);
+    expect(releaseLibraryAuthority).toHaveBeenLastCalledWith({
+      orphaned: [{ extensionId: installedCatalogEntry.id, name: installedCatalogEntry.name }]
+    });
+  });
+
+  it("fences every Library surface in a package across generic Resource disable and removal", async () => {
+    const resourceId = "resource-package-libraries";
+    const first = extensionEntry({
+      id: `extension_${"1".repeat(32)}`,
+      name: "First Library",
+      owner: { kind: "resource", resourceId, discoveredRevision: "sha256:libraries", resourceVersion: 4n },
+      library: { schemaVersion: 1, extensionEntry: "extensions/first.ts" }
+    });
+    const second = extensionEntry({
+      id: `extension_${"2".repeat(32)}`,
+      name: "Second Library",
+      owner: { kind: "resource", resourceId, discoveredRevision: "sha256:libraries", resourceVersion: 4n },
+      library: { schemaVersion: 1, extensionEntry: "extensions/second.ts" }
+    });
+    let enabled = true;
+    let removed = false;
+    const resource = () => ({
+      id: resourceId,
+      backendId: "pi",
+      kind: "package" as const,
+      enabled,
+      state: removed ? "removed" as const : "installed" as const,
+      versionNumber: removed ? 6n : enabled ? 4n : 5n
+    });
+    const events: string[] = [];
+    const prepareSetEnabled = vi.fn(async () => ({
+      value: { ...resource(), enabled: false, versionNumber: 5n },
+      revokesRuntimeAuthority: true,
+      fixtureKind: "disable"
+    }));
+    const prepareRemove = vi.fn(async () => ({
+      value: { ...resource(), state: "removed" as const, versionNumber: 6n },
+      revokesRuntimeAuthority: true,
+      fixtureKind: "remove"
+    }));
+    const completePreparedMutation = vi.fn(async (prepared: any, completion: (finalize: () => void) => unknown) => completion(() => {
+      events.push(`commit:${prepared.fixtureKind}`);
+      if (prepared.fixtureKind === "disable") enabled = false;
+      else removed = true;
+    }));
+    const release = vi.fn(async (options?: unknown) => {
+      events.push(`release:${JSON.stringify(options)}`);
+    });
+    const acquireAuthorityChanges = vi.fn(async (extensionIds: readonly string[]) => {
+      events.push(`acquire:${extensionIds.join(",")}`);
+      return { release };
+    });
+    const operations = new Map<string, OperationRecord<unknown>>();
+    const fence = Symbol("resource-catalog");
+    const store = {
+      findOperation: (id: string) => operations.get(id),
+      getOperation: (id: string) => operations.get(id),
+      getBackend: () => ({ descriptor: { id: "pi", adapterKind: "pi", instanceGeneration: 3 } }),
+      appendDiagnostic: vi.fn()
+    };
+    const refreshPiGeneration = vi.fn(async () => { events.push("runtime"); });
+    const services = createConnectServices(stubApplication({
+      store,
+      piResources: {
+        get: resource,
+        list: () => [resource()],
+        prepareSetEnabled,
+        prepareRemove,
+        completePreparedMutation
+      },
+      extensionCatalog: {
+        snapshot: () => ({ revision: 1n, entries: [second, first], recoveredFromCorruption: false })
+      },
+      extensionLibraries: { acquireAuthorityChanges },
+      sessionHost: replayingHost(store, operations, {
+        fenceBackendResourceCatalogs: () => fence,
+        completeBackendResourceCatalogRefresh: vi.fn()
+      }),
+      piBackendIds: new Set(["pi"]),
+      refreshPiGeneration
+    }));
+
+    const disable = create(contract.OperationMutationSchema, { payload: {
+      case: "setResourceEnabled",
+      value: { resourceId, enabled: false }
+    } });
+    await invoke(services.operation.submitOperation, {
+      operationId: "generic-package-disable",
+      connectionId: connection.id,
+      mutation: disable
+    });
+    expect(acquireAuthorityChanges).toHaveBeenLastCalledWith([first.id, second.id]);
+    expect(events).toEqual([
+      `acquire:${first.id},${second.id}`,
+      "commit:disable",
+      "runtime",
+      "release:{\"orphaned\":[]}"
+    ]);
+
+    events.length = 0;
+    const remove = create(contract.OperationMutationSchema, { payload: {
+      case: "removeResource",
+      value: { resourceId }
+    } });
+    await invoke(services.operation.submitOperation, {
+      operationId: "generic-package-remove",
+      connectionId: connection.id,
+      mutation: remove
+    });
+    expect(events).toEqual([
+      `acquire:${first.id},${second.id}`,
+      "commit:remove",
+      "runtime",
+      `release:${JSON.stringify({ orphaned: [
+        { extensionId: first.id, name: first.name },
+        { extensionId: second.id, name: second.name }
+      ] })}`
+    ]);
   });
 
   it("previews, starts, lists, cancels, and revision-fences local package export jobs", async () => {
@@ -853,6 +986,7 @@ describe("Connect Extension catalog boundary", () => {
     const entry = extensionEntry({
       owner: { kind: "resource", resourceId: "resource-package", discoveredRevision, resourceVersion: 5n },
       mainView,
+      library: { schemaVersion: 1, extensionEntry: "extensions/review.ts" },
       sidebarSupported: true
     });
     const resource = {
@@ -875,6 +1009,7 @@ describe("Connect Extension catalog boundary", () => {
         name: "review.ts",
         entryPath: "extensions/review.ts",
         mainView: { html: mainView.html, title: mainView.title, icon: mainView.icon },
+        library: { schemaVersion: 1 },
         compatibility: "supported" as const,
         compatibilityIssues: [] as const,
         detectedApis: [] as const,
@@ -905,7 +1040,8 @@ describe("Connect Extension catalog boundary", () => {
       packageName: "@sample/review",
       packageVersion: "1.0.0",
       extensionEntry: "extensions/review.ts",
-      mainView: { html: mainView.html, title: mainView.title, icon: mainView.icon }
+      mainView: { html: mainView.html, title: mainView.title, icon: mainView.icon },
+      library: { schemaVersion: 1 }
     };
     const nativeSurface = {
       id: `extension_surface_${"c".repeat(32)}`,

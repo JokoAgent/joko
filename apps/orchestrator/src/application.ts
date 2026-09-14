@@ -106,6 +106,7 @@ import {
 import { CredentialVault } from "./credential-vault.js";
 import { DiagnosticsBundleService } from "./diagnostics-bundle.js";
 import { ExtensionCatalogManager } from "./extension-catalog.js";
+import { ExtensionLibraryManager } from "./extension-library-manager.js";
 import { ExtensionMainViewManager } from "./extension-main-view-manager.js";
 import { ExtensionPackagePublisher } from "./extension-package-publisher.js";
 import { ExtensionSourceManager } from "./extension-source-manager.js";
@@ -315,6 +316,7 @@ export interface OrchestratorApplication {
   readonly mcpRouter?: McpRouter;
   readonly piResources?: PiResourceManager;
   readonly extensionCatalog?: ExtensionCatalogManager;
+  readonly extensionLibraries?: ExtensionLibraryManager;
   readonly extensionMainViews?: ExtensionMainViewManager;
   readonly extensionPackagePublisher?: ExtensionPackagePublisher;
   readonly extensionSources?: ExtensionSourceManager;
@@ -580,6 +582,14 @@ export async function createOrchestratorApplication(
     rootDirectory: join(config.dataDirectory, "extension-package-exports")
   });
   await extensionPackagePublisher.initialize();
+  const extensionLibraries = new ExtensionLibraryManager({
+    rootDirectory: join(config.dataDirectory, "extension-libraries"),
+    managedRoots: [config.dataDirectory]
+  });
+  await extensionLibraries.initialize();
+  const stopExtensionLibraryAuthorityNotifications = extensionCatalog.onAuthorityChanged((extensionIds) => {
+    extensionLibraries.signalAuthorityChanges(extensionIds);
+  });
   const extensionMainViews = new ExtensionMainViewManager({
     resources: piResources,
     rootDirectory: join(config.dataDirectory, "extension-main-views")
@@ -1715,6 +1725,8 @@ export async function createOrchestratorApplication(
   } catch (error) {
     closed = true;
     commandConcurrencyGate.close();
+    stopExtensionLibraryAuthorityNotifications();
+    await extensionLibraries.close().catch(() => undefined);
     await extensionMainViews.close().catch(() => undefined);
     await extensionPackagePublisher.close().catch(() => undefined);
     scheduler.stop();
@@ -1796,6 +1808,7 @@ export async function createOrchestratorApplication(
     mcpRouter,
     piResources,
     extensionCatalog,
+    extensionLibraries,
     extensionMainViews,
     extensionPackagePublisher,
     extensionSources,
@@ -1846,6 +1859,8 @@ export async function createOrchestratorApplication(
         serviceCleanups.clear();
         for (const cleanup of cleanups) await attempt(cleanup);
         await attempt(() => commandConcurrencyGate.close());
+        await attempt(() => stopExtensionLibraryAuthorityNotifications());
+        await attempt(() => extensionLibraries.close());
         await attempt(() => extensionMainViews.close());
         await attempt(() => extensionPackagePublisher.close());
         if (maintenanceTimer !== undefined) clearInterval(maintenanceTimer);

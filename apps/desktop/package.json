@@ -34,7 +34,7 @@
   "devDependencies": {
     "@joko/web": "workspace:*",
     "@types/node": "24.12.4",
-    "electron": "39.2.7",
+    "electron": "43.6.0",
     "electron-builder": "26.15.3",
     "tsx": "4.22.1",
     "typescript": "5.9.3",

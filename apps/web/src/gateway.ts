@@ -69,6 +69,11 @@ import {
   EventCursorSchema,
   ExtensionWidgetPlacement,
   ExtensionCatalogSource as ProtoExtensionCatalogSource,
+  ExtensionLibraryEntryKind as ProtoExtensionLibraryEntryKind,
+  ExtensionLibraryCallSchema,
+  ExtensionLibraryLocationKind as ProtoExtensionLibraryLocationKind,
+  ExtensionLibraryState as ProtoExtensionLibraryState,
+  ExtensionLibraryUnavailableReason as ProtoExtensionLibraryUnavailableReason,
   ExtensionMainViewIcon as ProtoExtensionMainViewIcon,
   ExtensionPackageAction as ProtoExtensionPackageAction,
   ExtensionPackageExportState as ProtoExtensionPackageExportState,
@@ -273,6 +278,15 @@ import {
   type ExtraDirectory,
   type ExtensionStatus,
   type ExtensionCatalogEntry as ProtoExtensionCatalogEntry,
+  type ExtensionLibraryCallResult as ProtoExtensionLibraryCallResult,
+  type ExtensionLibraryEntry as ProtoExtensionLibraryEntry,
+  type ExtensionLibraryGraceEntry as ProtoExtensionLibraryGraceEntry,
+  type ExtensionLibraryLocation as ProtoExtensionLibraryLocation,
+  type ExtensionLibraryOverview as ProtoExtensionLibraryOverview,
+  type ExtensionLibrarySession as ProtoExtensionLibrarySession,
+  type ExtensionLibrarySqlResult as ProtoExtensionLibrarySqlResult,
+  type ExtensionLibrarySqlValue as ProtoExtensionLibrarySqlValue,
+  type ExtensionLibraryTrashEntry as ProtoExtensionLibraryTrashEntry,
   type ExtensionMainViewSurface as ProtoExtensionMainViewSurface,
   type ExtensionPackageExportAuthority as ProtoExtensionPackageExportAuthority,
   type ExtensionPackageExportJob as ProtoExtensionPackageExportJob,
@@ -391,6 +405,17 @@ import type {
   ExtensionStatusView,
   ExtensionCatalogEntryView,
   ExtensionCatalogView,
+  ExtensionLibraryCallResultView,
+  ExtensionLibraryCallView,
+  ExtensionLibraryEntryView,
+  ExtensionLibraryGraceEntryView,
+  ExtensionLibraryLocationValidationView,
+  ExtensionLibraryLocationView,
+  ExtensionLibraryOverviewView,
+  ExtensionLibrarySessionView,
+  ExtensionLibrarySqlResultView,
+  ExtensionLibrarySqlValueView,
+  ExtensionLibraryTrashEntryView,
   ExtensionMainViewIconView,
   ExtensionMainViewSurfaceView,
   ExtensionPackageExportAuthorityView,
@@ -3016,6 +3041,243 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const scope = this.captureActionScope(signal);
     const response = await createClient(ExtensionService, scope.transport).closeExtensionMainView(
       { surfaceId },
+      { signal: scope.signal }
+    );
+    return response.closed;
+  }
+
+  async getExtensionLibraryOverview(
+    extensionId: string,
+    expectedRevision: bigint,
+    signal?: AbortSignal
+  ): Promise<ExtensionLibraryOverviewView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).getExtensionLibraryOverview({
+      extensionId,
+      expectedRevision: { value: expectedRevision }
+    }, { signal: scope.signal });
+    if (response.library === undefined) throw new GatewayError("Orchestrator returned an empty Extension Library overview.");
+    return mapExtensionLibraryOverview(response.library);
+  }
+
+  async validateExtensionLibraryLocation(
+    extensionId: string,
+    expectedRevision: bigint,
+    candidate: string,
+    signal?: AbortSignal
+  ): Promise<ExtensionLibraryLocationValidationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).validateExtensionLibraryLocation({
+      extensionId,
+      expectedRevision: { value: expectedRevision },
+      candidate
+    }, { signal: scope.signal });
+    if (response.validation === undefined) throw new GatewayError("Orchestrator returned an empty Extension Library location validation.");
+    return {
+      libraryRoot: response.validation.libraryRoot,
+      warnings: [...response.validation.warnings],
+      ...(response.validation.diskFreeBytes === undefined ? {} : { diskFreeBytes: response.validation.diskFreeBytes })
+    };
+  }
+
+  async relocateExtensionLibrary(
+    extensionId: string,
+    expectedRevision: bigint,
+    destination: { readonly kind: "default" } | { readonly kind: "custom"; readonly candidate: string },
+    signal?: AbortSignal
+  ): Promise<{ readonly changed: boolean; readonly migrationId?: string; readonly location: ExtensionLibraryLocationView; readonly files: number; readonly bytes: bigint; readonly warnings: readonly string[]; readonly graceId?: string }> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).relocateExtensionLibrary({
+      extensionId,
+      expectedRevision: { value: expectedRevision },
+      destinationKind: destination.kind === "default"
+        ? ProtoExtensionLibraryLocationKind.DEFAULT
+        : ProtoExtensionLibraryLocationKind.CUSTOM,
+      ...(destination.kind === "custom" ? { candidate: destination.candidate } : {})
+    }, { signal: scope.signal });
+    if (response.location === undefined) throw new GatewayError("Orchestrator returned an incomplete Extension Library relocation.");
+    return {
+      changed: response.changed,
+      ...(response.migrationId === undefined ? {} : { migrationId: response.migrationId }),
+      location: mapExtensionLibraryLocation(response.location),
+      files: response.files,
+      bytes: response.bytes,
+      warnings: [...response.warnings],
+      ...(response.graceId === undefined ? {} : { graceId: response.graceId })
+    };
+  }
+
+  async rebindExtensionLibrary(
+    extensionId: string,
+    expectedRevision: bigint,
+    candidate: string,
+    signal?: AbortSignal
+  ): Promise<{ readonly location: ExtensionLibraryLocationView; readonly warnings: readonly string[] }> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).rebindExtensionLibrary({
+      extensionId,
+      expectedRevision: { value: expectedRevision },
+      candidate
+    }, { signal: scope.signal });
+    if (response.location === undefined) throw new GatewayError("Orchestrator returned an incomplete Extension Library rebind.");
+    return { location: mapExtensionLibraryLocation(response.location), warnings: [...response.warnings] };
+  }
+
+  async unbindExtensionLibrary(
+    extensionId: string,
+    expectedRevision: bigint,
+    signal?: AbortSignal
+  ): Promise<{ readonly detachedPath?: string }> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).unbindExtensionLibrary({
+      extensionId,
+      expectedRevision: { value: expectedRevision }
+    }, { signal: scope.signal });
+    return { ...(response.detachedPath === undefined ? {} : { detachedPath: response.detachedPath }) };
+  }
+
+  async repairExtensionLibraryState(signal?: AbortSignal): Promise<{ readonly recoveredFromPrevious: boolean; readonly bindings: number; readonly trash: number }> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).repairExtensionLibraryState({}, { signal: scope.signal });
+    return { recoveredFromPrevious: response.recoveredFromPrevious, bindings: response.bindings, trash: response.trash };
+  }
+
+  async repairExtensionLibraryMetadata(
+    extensionId: string,
+    expectedRevision: bigint,
+    signal?: AbortSignal
+  ): Promise<ExtensionLibraryOverviewView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).repairExtensionLibraryMetadata({
+      extensionId,
+      expectedRevision: { value: expectedRevision }
+    }, { signal: scope.signal });
+    if (response.library === undefined) throw new GatewayError("Orchestrator returned an empty repaired Extension Library.");
+    return mapExtensionLibraryOverview(response.library);
+  }
+
+  async trashExtensionLibrary(
+    extensionId: string,
+    expectedRevision: bigint,
+    confirmation: string,
+    signal?: AbortSignal
+  ): Promise<ExtensionLibraryTrashEntryView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).trashExtensionLibrary({
+      extensionId,
+      expectedRevision: { value: expectedRevision },
+      confirmation
+    }, { signal: scope.signal });
+    if (response.trash === undefined) throw new GatewayError("Orchestrator returned an empty Extension Library trash record.");
+    return mapExtensionLibraryTrash(response.trash);
+  }
+
+  async listExtensionLibraryTrash(extensionId?: string, signal?: AbortSignal): Promise<readonly ExtensionLibraryTrashEntryView[]> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).listExtensionLibraryTrash(
+      { ...(extensionId === undefined ? {} : { extensionId }) },
+      { signal: scope.signal }
+    );
+    return response.trash.map(mapExtensionLibraryTrash);
+  }
+
+  async restoreExtensionLibraryTrash(
+    trashId: string,
+    confirmation: string,
+    destination?: { readonly kind: "default" } | { readonly kind: "custom"; readonly candidate: string },
+    signal?: AbortSignal
+  ): Promise<{ readonly extensionId: string; readonly location: ExtensionLibraryLocationView }> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).restoreExtensionLibraryTrash({
+      trashId,
+      confirmation,
+      destinationKind: destination === undefined
+        ? ProtoExtensionLibraryLocationKind.UNSPECIFIED
+        : destination.kind === "default"
+          ? ProtoExtensionLibraryLocationKind.DEFAULT
+          : ProtoExtensionLibraryLocationKind.CUSTOM,
+      ...(destination?.kind === "custom" ? { candidate: destination.candidate } : {})
+    }, { signal: scope.signal });
+    if (response.location === undefined || response.extensionId.length === 0) {
+      throw new GatewayError("Orchestrator returned an incomplete Extension Library restore.");
+    }
+    return { extensionId: response.extensionId, location: mapExtensionLibraryLocation(response.location) };
+  }
+
+  async purgeExtensionLibraryTrash(trashId: string, confirmation: string, signal?: AbortSignal): Promise<boolean> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).purgeExtensionLibraryTrash(
+      { trashId, confirmation },
+      { signal: scope.signal }
+    );
+    return response.purged;
+  }
+
+  async listExtensionLibraryGrace(extensionId?: string, signal?: AbortSignal): Promise<readonly ExtensionLibraryGraceEntryView[]> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).listExtensionLibraryGrace(
+      { ...(extensionId === undefined ? {} : { extensionId }) },
+      { signal: scope.signal }
+    );
+    return response.grace.map(mapExtensionLibraryGrace);
+  }
+
+  async rollbackExtensionLibrary(
+    extensionId: string,
+    expectedRevision: bigint,
+    graceId: string,
+    signal?: AbortSignal
+  ): Promise<{ readonly location: ExtensionLibraryLocationView; readonly graceId: string }> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).rollbackExtensionLibrary({
+      extensionId,
+      expectedRevision: { value: expectedRevision },
+      graceId
+    }, { signal: scope.signal });
+    if (response.location === undefined || response.graceId.length === 0) {
+      throw new GatewayError("Orchestrator returned an incomplete Extension Library rollback.");
+    }
+    return { location: mapExtensionLibraryLocation(response.location), graceId: response.graceId };
+  }
+
+  async purgeExpiredExtensionLibraries(signal?: AbortSignal): Promise<{ readonly trash: number; readonly grace: number }> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).purgeExpiredExtensionLibraries({}, { signal: scope.signal });
+    return { trash: response.trash, grace: response.grace };
+  }
+
+  async openExtensionLibrary(
+    extensionId: string,
+    expectedRevision: bigint,
+    signal?: AbortSignal
+  ): Promise<ExtensionLibrarySessionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).openExtensionLibrary({
+      extensionId,
+      expectedRevision: { value: expectedRevision }
+    }, { signal: scope.signal });
+    if (response.library === undefined) throw new GatewayError("Orchestrator returned an empty Extension Library session.");
+    return mapExtensionLibrarySession(response.library);
+  }
+
+  async callExtensionLibrary(
+    sessionId: string,
+    call: ExtensionLibraryCallView,
+    signal?: AbortSignal
+  ): Promise<ExtensionLibraryCallResultView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).callExtensionLibrary({
+      sessionId,
+      call: mapExtensionLibraryCall(call)
+    }, { signal: scope.signal });
+    if (response.result === undefined) throw new GatewayError("Orchestrator returned an empty Extension Library call result.");
+    return mapExtensionLibraryCallResult(response.result);
+  }
+
+  async closeExtensionLibrary(sessionId: string, signal?: AbortSignal): Promise<boolean> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).closeExtensionLibrary(
+      { sessionId },
       { signal: scope.signal }
     );
     return response.closed;
@@ -10103,6 +10365,11 @@ function mapExtensionCatalogEntry(extension: ProtoExtensionCatalogEntry): Extens
   ) || extension.sidebarSupported !== (mainView !== undefined) || extension.sidebarVisible && mainView === undefined) {
     throw new GatewayError("Orchestrator returned an invalid Extension main-view capability.");
   }
+  const library = extension.library === undefined
+    ? undefined
+    : extension.library.schemaVersion === 1
+      ? { schemaVersion: 1 as const }
+      : (() => { throw new GatewayError("Orchestrator returned an invalid Extension Library capability."); })();
   return {
     id: extension.extensionId,
     revision,
@@ -10120,6 +10387,7 @@ function mapExtensionCatalogEntry(extension: ProtoExtensionCatalogEntry): Extens
     description: extension.description,
     enabled: extension.enabled,
     ...(mainView === undefined ? {} : { mainView }),
+    ...(library === undefined ? {} : { library }),
     sidebarSupported: extension.sidebarSupported,
     sidebarVisible: extension.sidebarVisible,
     tools: extension.tools.map((tool) => ({
@@ -10200,6 +10468,317 @@ function mapExtensionMainViewSurface(surface: ProtoExtensionMainViewSurface): Ex
     ...(icon === undefined ? {} : { icon }),
     expiresAt
   };
+}
+
+function mapExtensionLibraryOverview(value: ProtoExtensionLibraryOverview): ExtensionLibraryOverviewView {
+  const state = extensionLibraryState(value.state);
+  const unavailableReason = extensionLibraryUnavailableReason(value.unavailableReason);
+  if (!/^extension_[a-f0-9]{32}$/u.test(value.extensionId) || value.name.trim() === ""
+    || !Number.isSafeInteger(value.files) || value.files < 0 || !Number.isSafeInteger(value.trashCount) || value.trashCount < 0
+    || !Number.isSafeInteger(value.graceCount) || value.graceCount < 0 || value.bytes < 0n || value.softLimitBytes < 1n
+    || value.diskFreeBytes !== undefined && value.diskFreeBytes < 0n
+    || state === "unavailable" && unavailableReason === undefined
+    || state !== "unavailable" && unavailableReason !== undefined
+    || value.operation !== undefined && (value.operation.operationId.trim() === "" || value.operation.phase.trim() === "")) {
+    throw new GatewayError("Orchestrator returned an invalid Extension Library overview.");
+  }
+  return {
+    extensionId: value.extensionId,
+    name: value.name,
+    state,
+    ...(unavailableReason === undefined ? {} : { unavailableReason }),
+    ...(value.location === undefined ? {} : { location: mapExtensionLibraryLocation(value.location) }),
+    files: value.files,
+    bytes: value.bytes,
+    ...(value.diskFreeBytes === undefined ? {} : { diskFreeBytes: value.diskFreeBytes }),
+    softLimitBytes: value.softLimitBytes,
+    softLimitExceeded: value.softLimitExceeded,
+    orphaned: value.orphaned,
+    trashCount: value.trashCount,
+    graceCount: value.graceCount,
+    ...(value.operation === undefined ? {} : { operation: { id: value.operation.operationId, phase: value.operation.phase } })
+  };
+}
+
+function extensionLibraryState(value: ProtoExtensionLibraryState): ExtensionLibraryOverviewView["state"] {
+  switch (value) {
+    case ProtoExtensionLibraryState.READY: return "ready";
+    case ProtoExtensionLibraryState.READ_ONLY: return "readOnly";
+    case ProtoExtensionLibraryState.UNAVAILABLE: return "unavailable";
+    default: throw new GatewayError("Orchestrator returned an invalid Extension Library state.");
+  }
+}
+
+function extensionLibraryUnavailableReason(
+  value: ProtoExtensionLibraryUnavailableReason
+): ExtensionLibraryOverviewView["unavailableReason"] {
+  switch (value) {
+    case ProtoExtensionLibraryUnavailableReason.UNSPECIFIED: return undefined;
+    case ProtoExtensionLibraryUnavailableReason.METADATA_CORRUPT: return "metadataCorrupt";
+    case ProtoExtensionLibraryUnavailableReason.FILE_LIMIT: return "fileLimit";
+    case ProtoExtensionLibraryUnavailableReason.IO: return "io";
+    case ProtoExtensionLibraryUnavailableReason.OPERATION_IN_PROGRESS: return "operationInProgress";
+    case ProtoExtensionLibraryUnavailableReason.DISK_MISSING: return "diskMissing";
+    case ProtoExtensionLibraryUnavailableReason.BINDING_MOVED: return "bindingMoved";
+    case ProtoExtensionLibraryUnavailableReason.STATE_CORRUPT: return "stateCorrupt";
+    default: throw new GatewayError("Orchestrator returned an invalid Extension Library unavailable reason.");
+  }
+}
+
+function mapExtensionLibraryLocation(value: ProtoExtensionLibraryLocation): ExtensionLibraryLocationView {
+  const generation = value.generation?.value;
+  const kind = value.kind === ProtoExtensionLibraryLocationKind.DEFAULT
+    ? "default" as const
+    : value.kind === ProtoExtensionLibraryLocationKind.CUSTOM
+      ? "custom" as const
+      : undefined;
+  if (kind === undefined || value.path.trim() === "" || generation === undefined || generation < 1n) {
+    throw new GatewayError("Orchestrator returned an invalid Extension Library location.");
+  }
+  return { kind, path: value.path, generation };
+}
+
+function mapExtensionLibrarySession(value: ProtoExtensionLibrarySession): ExtensionLibrarySessionView {
+  const expiresAt = requiredExtensionLibraryTimestamp(value.expiresAt, "session expiry");
+  const generation = value.bindingGeneration?.value;
+  const limits = value.limits;
+  if (!/^library_session_[a-f0-9]{32}$/u.test(value.sessionId)
+    || !/^extension_[a-f0-9]{32}$/u.test(value.extensionId) || generation === undefined || generation < 1n
+    || limits === undefined || limits.maximumReadBytes < 1n || limits.maximumWriteBytes < 1n
+    || limits.maximumStreamBytes < limits.maximumWriteBytes || limits.maximumPathCharacters < 1
+    || limits.maximumPathSegments < 1 || limits.maximumListPageSize < 1 || limits.maximumFiles < 1
+    || limits.softLimitBytes < 1n || limits.diskReserveBytes < 1n) {
+    throw new GatewayError("Orchestrator returned an invalid Extension Library session.");
+  }
+  return {
+    id: value.sessionId,
+    extensionId: value.extensionId,
+    expiresAt,
+    bindingGeneration: generation,
+    limits: {
+      maximumReadBytes: limits.maximumReadBytes,
+      maximumWriteBytes: limits.maximumWriteBytes,
+      maximumStreamBytes: limits.maximumStreamBytes,
+      maximumPathCharacters: limits.maximumPathCharacters,
+      maximumPathSegments: limits.maximumPathSegments,
+      maximumListPageSize: limits.maximumListPageSize,
+      maximumFiles: limits.maximumFiles,
+      softLimitBytes: limits.softLimitBytes,
+      diskReserveBytes: limits.diskReserveBytes
+    }
+  };
+}
+
+function mapExtensionLibraryTrash(value: ProtoExtensionLibraryTrashEntry): ExtensionLibraryTrashEntryView {
+  if (!/^library_trash_[a-f0-9]{32}$/u.test(value.trashId) || !/^extension_[a-f0-9]{32}$/u.test(value.extensionId)
+    || value.name.trim() === "" || !Number.isSafeInteger(value.files) || value.files < 0 || value.bytes < 0n) {
+    throw new GatewayError("Orchestrator returned an invalid Extension Library trash record.");
+  }
+  const deletedAt = requiredExtensionLibraryTimestamp(value.deletedAt, "trash deletion");
+  const expiresAt = requiredExtensionLibraryTimestamp(value.expiresAt, "trash expiry");
+  if (expiresAt <= deletedAt) throw new GatewayError("Orchestrator returned an invalid Extension Library trash retention window.");
+  return { id: value.trashId, extensionId: value.extensionId, name: value.name, deletedAt, expiresAt, files: value.files, bytes: value.bytes };
+}
+
+function mapExtensionLibraryGrace(value: ProtoExtensionLibraryGraceEntry): ExtensionLibraryGraceEntryView {
+  if (!/^library_grace_[a-f0-9]{32}$/u.test(value.graceId) || !/^extension_[a-f0-9]{32}$/u.test(value.extensionId)
+    || value.name.trim() === "" || !Number.isSafeInteger(value.files) || value.files < 0 || value.bytes < 0n) {
+    throw new GatewayError("Orchestrator returned an invalid Extension Library grace record.");
+  }
+  const createdAt = requiredExtensionLibraryTimestamp(value.createdAt, "grace creation");
+  const expiresAt = requiredExtensionLibraryTimestamp(value.expiresAt, "grace expiry");
+  if (expiresAt <= createdAt) throw new GatewayError("Orchestrator returned an invalid Extension Library grace window.");
+  return { id: value.graceId, extensionId: value.extensionId, name: value.name, createdAt, expiresAt, files: value.files, bytes: value.bytes };
+}
+
+function mapExtensionLibraryCall(call: ExtensionLibraryCallView) {
+  const statement = (value: { readonly sql: string; readonly parameters?: readonly ExtensionLibrarySqlValueView[] }) => ({
+    sql: value.sql,
+    parameters: (value.parameters ?? []).map(mapExtensionLibrarySqlValueInput)
+  });
+  switch (call.kind) {
+    case "read": return create(ExtensionLibraryCallSchema, { operation: { case: "read", value: {
+      path: call.path,
+      ...(call.offset === undefined ? {} : { offset: call.offset }),
+      ...(call.length === undefined ? {} : { length: call.length })
+    } } });
+    case "write": return create(ExtensionLibraryCallSchema, { operation: { case: "write", value: {
+      path: call.path, content: call.content, ifNotExists: call.ifNotExists ?? false
+    } } });
+    case "stat": return create(ExtensionLibraryCallSchema, { operation: { case: "stat", value: { path: call.path } } });
+    case "list": return create(ExtensionLibraryCallSchema, { operation: { case: "list", value: {
+      ...(call.path === undefined ? {} : { path: call.path }),
+      recursive: call.recursive ?? false,
+      ...(call.limit === undefined ? {} : { limit: call.limit }),
+      ...(call.cursor === undefined ? {} : { cursor: call.cursor })
+    } } });
+    case "mkdir": return create(ExtensionLibraryCallSchema, { operation: { case: "mkdir", value: { path: call.path } } });
+    case "delete": return create(ExtensionLibraryCallSchema, { operation: { case: "delete", value: { path: call.path, recursive: call.recursive ?? false } } });
+    case "rename": return create(ExtensionLibraryCallSchema, { operation: { case: "rename", value: { from: call.from, to: call.to, overwrite: call.overwrite ?? false } } });
+    case "writeBegin": return create(ExtensionLibraryCallSchema, { operation: { case: "writeBegin", value: {
+      path: call.path,
+      totalBytes: call.totalBytes,
+      ...(call.sha256 === undefined ? {} : { sha256: call.sha256 }),
+      ifNotExists: call.ifNotExists ?? false
+    } } });
+    case "writeChunk": return create(ExtensionLibraryCallSchema, { operation: { case: "writeChunk", value: {
+      streamId: call.streamId, sequence: call.sequence, content: call.content
+    } } });
+    case "writeCommit": return create(ExtensionLibraryCallSchema, { operation: { case: "writeCommit", value: { streamId: call.streamId } } });
+    case "writeAbort": return create(ExtensionLibraryCallSchema, { operation: { case: "writeAbort", value: { streamId: call.streamId } } });
+    case "sqlOpen": return create(ExtensionLibraryCallSchema, { operation: { case: "sqlOpen", value: {
+      path: call.path, create: call.create ?? false, readOnly: call.readOnly ?? false
+    } } });
+    case "sqlExecute": return create(ExtensionLibraryCallSchema, { operation: { case: "sqlExecute", value: {
+      handleId: call.handleId, statement: statement(call.statement)
+    } } });
+    case "sqlBatch": return create(ExtensionLibraryCallSchema, { operation: { case: "sqlBatch", value: {
+      handleId: call.handleId, statements: call.statements.map(statement)
+    } } });
+    case "sqlMigrate": return create(ExtensionLibraryCallSchema, { operation: { case: "sqlMigrate", value: {
+      handleId: call.handleId,
+      migrations: call.migrations.map((migration) => ({ version: migration.version, statements: [...migration.statements] }))
+    } } });
+    case "sqlBackup": return create(ExtensionLibraryCallSchema, { operation: { case: "sqlBackup", value: {
+      handleId: call.handleId, targetPath: call.targetPath
+    } } });
+    case "sqlCheck": return create(ExtensionLibraryCallSchema, { operation: { case: "sqlCheck", value: { handleId: call.handleId } } });
+    case "sqlClose": return create(ExtensionLibraryCallSchema, { operation: { case: "sqlClose", value: { handleId: call.handleId } } });
+  }
+}
+
+function mapExtensionLibrarySqlValueInput(value: ExtensionLibrarySqlValueView) {
+  switch (value.kind) {
+    case "null": return { value: { case: "nullValue" as const, value: true } };
+    case "number": return { value: { case: "numberValue" as const, value: value.value } };
+    case "integer": return { value: { case: "integerValue" as const, value: value.value.toString(10) } };
+    case "text": return { value: { case: "textValue" as const, value: value.value } };
+    case "blob": return { value: { case: "blobValue" as const, value: value.value } };
+  }
+}
+
+function mapExtensionLibraryCallResult(value: ProtoExtensionLibraryCallResult): ExtensionLibraryCallResultView {
+  switch (value.result.case) {
+    case "read":
+      if (!validLibraryRelativePath(value.result.value.path) || !/^[a-f0-9]{64}$/u.test(value.result.value.sha256)) {
+        throw new GatewayError("Orchestrator returned an invalid Extension Library read result.");
+      }
+      return { kind: "read", path: value.result.value.path, content: Uint8Array.from(value.result.value.content), sha256: value.result.value.sha256 };
+    case "write":
+      if (!validLibraryRelativePath(value.result.value.path) || value.result.value.bytes < 0n || !/^[a-f0-9]{64}$/u.test(value.result.value.sha256)) {
+        throw new GatewayError("Orchestrator returned an invalid Extension Library write result.");
+      }
+      return { kind: "write", path: value.result.value.path, bytes: value.result.value.bytes, sha256: value.result.value.sha256 };
+    case "stat": return { kind: "stat", entry: mapExtensionLibraryEntry(value.result.value) };
+    case "list": return {
+      kind: "list",
+      entries: value.result.value.entries.map(mapExtensionLibraryEntry),
+      ...(value.result.value.nextCursor === undefined ? {} : { nextCursor: value.result.value.nextCursor })
+    };
+    case "path":
+      if (!validLibraryRelativePath(value.result.value.path)) throw new GatewayError("Orchestrator returned an invalid Extension Library path result.");
+      return { kind: "path", path: value.result.value.path, existed: value.result.value.existed };
+    case "rename":
+      if (!validLibraryRelativePath(value.result.value.from) || !validLibraryRelativePath(value.result.value.to)) {
+        throw new GatewayError("Orchestrator returned an invalid Extension Library rename result.");
+      }
+      return { kind: "rename", from: value.result.value.from, to: value.result.value.to };
+    case "stream": {
+      if (!/^library_stream_[a-f0-9]{32}$/u.test(value.result.value.streamId) || value.result.value.receivedBytes < 0n
+        || !Number.isSafeInteger(value.result.value.nextSequence) || value.result.value.nextSequence < 0) {
+        throw new GatewayError("Orchestrator returned an invalid Extension Library stream result.");
+      }
+      return {
+        kind: "stream",
+        streamId: value.result.value.streamId,
+        receivedBytes: value.result.value.receivedBytes,
+        nextSequence: value.result.value.nextSequence,
+        ...(value.result.value.expiresAt === undefined ? {} : { expiresAt: requiredExtensionLibraryTimestamp(value.result.value.expiresAt, "stream expiry") }),
+        aborted: value.result.value.aborted
+      };
+    }
+    case "sqlHandle":
+      if (value.result.value.handleId.trim() === "" || !validLibraryRelativePath(value.result.value.path)) {
+        throw new GatewayError("Orchestrator returned an invalid Extension Library SQLite handle.");
+      }
+      return {
+        kind: "sqlHandle",
+        handleId: value.result.value.handleId,
+        path: value.result.value.path,
+        readOnly: value.result.value.readOnly,
+        userVersion: value.result.value.userVersion
+      };
+    case "sqlResult": return { kind: "sqlResult", value: mapExtensionLibrarySqlResult(value.result.value) };
+    case "sqlBatch": return { kind: "sqlBatch", results: value.result.value.results.map(mapExtensionLibrarySqlResult) };
+    case "sqlVersion": return {
+      kind: "sqlVersion",
+      userVersion: value.result.value.userVersion,
+      ...(value.result.value.path === undefined ? {} : { path: value.result.value.path })
+    };
+    case "boolean": return { kind: "boolean", value: value.result.value.value };
+    default: throw new GatewayError("Orchestrator returned an unknown Extension Library call result.");
+  }
+}
+
+function mapExtensionLibraryEntry(value: ProtoExtensionLibraryEntry): ExtensionLibraryEntryView {
+  const kind = value.kind === ProtoExtensionLibraryEntryKind.FILE
+    ? "file" as const
+    : value.kind === ProtoExtensionLibraryEntryKind.DIRECTORY
+      ? "directory" as const
+      : undefined;
+  if (kind === undefined || !validLibraryRelativePath(value.path) || value.bytes < 0n) {
+    throw new GatewayError("Orchestrator returned an invalid Extension Library entry.");
+  }
+  return { path: value.path, kind, bytes: value.bytes, modifiedAt: requiredExtensionLibraryTimestamp(value.modifiedAt, "entry modification") };
+}
+
+function mapExtensionLibrarySqlResult(value: ProtoExtensionLibrarySqlResult): ExtensionLibrarySqlResultView {
+  if (!/^(?:0|[1-9][0-9]*)$/u.test(value.changes)
+    || value.lastInsertRowId !== undefined && !/^-?(?:0|[1-9][0-9]*)$/u.test(value.lastInsertRowId)) {
+    throw new GatewayError("Orchestrator returned invalid Extension Library SQLite counters.");
+  }
+  return {
+    rows: value.rows.map((row) => ({ cells: row.cells.map((cell) => {
+      if (cell.name.trim() === "" || cell.value === undefined) throw new GatewayError("Orchestrator returned an invalid Extension Library SQLite cell.");
+      return { name: cell.name, value: mapExtensionLibrarySqlValue(cell.value) };
+    }) })),
+    changes: BigInt(value.changes),
+    ...(value.lastInsertRowId === undefined ? {} : { lastInsertRowId: BigInt(value.lastInsertRowId) })
+  };
+}
+
+function mapExtensionLibrarySqlValue(value: ProtoExtensionLibrarySqlValue): ExtensionLibrarySqlValueView {
+  switch (value.value.case) {
+    case "nullValue":
+      if (!value.value.value) throw new GatewayError("Orchestrator returned an invalid Extension Library SQLite null.");
+      return { kind: "null" };
+    case "numberValue":
+      if (!Number.isFinite(value.value.value)) throw new GatewayError("Orchestrator returned a non-finite Extension Library SQLite number.");
+      return { kind: "number", value: value.value.value };
+    case "integerValue":
+      if (!/^-?(?:0|[1-9][0-9]*)$/u.test(value.value.value)) throw new GatewayError("Orchestrator returned an invalid Extension Library SQLite integer.");
+      return { kind: "integer", value: BigInt(value.value.value) };
+    case "textValue": return { kind: "text", value: value.value.value };
+    case "blobValue": return { kind: "blob", value: Uint8Array.from(value.value.value) };
+    default: throw new GatewayError("Orchestrator returned an empty Extension Library SQLite value.");
+  }
+}
+
+function requiredExtensionLibraryTimestamp(
+  value: { readonly seconds: bigint; readonly nanos: number } | undefined,
+  label: string
+): number {
+  const mapped = timestampMs(value);
+  if (value === undefined || !Number.isSafeInteger(mapped) || mapped < 0 || value.nanos < 0 || value.nanos >= 1_000_000_000) {
+    throw new GatewayError(`Orchestrator returned an invalid Extension Library ${label}.`);
+  }
+  return mapped;
+}
+
+function validLibraryRelativePath(value: string): boolean {
+  if (value.length === 0 || value.length > 512 || value.includes("\\") || value.startsWith("/") || /^[A-Za-z]:/u.test(value)) return false;
+  const segments = value.split("/");
+  return segments.length <= 32 && segments.every((segment) => segment.length > 0 && segment !== "." && segment !== "..");
 }
 
 function extensionMainViewIcon(value: ProtoExtensionMainViewIcon): ExtensionMainViewIconView | undefined {

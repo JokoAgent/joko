@@ -328,7 +328,8 @@ test("durable and cross-process field numbers remain stable", () => {
     [contract.OperationMutationSchema, "update_git_safety_settings", 165],
     [contract.OperationMutationSchema, "cleanup_git_safety_savepoints", 166],
     [contract.OperationMutationSchema, "start_extension_package_export", 194],
-    [contract.OperationMutationSchema, "cancel_extension_package_export", 195]
+    [contract.OperationMutationSchema, "cancel_extension_package_export", 195],
+    [contract.ExtensionCatalogEntrySchema, "library", 22]
   ];
   for (const [schema, name, number] of expected) {
     assert.equal(field(schema, name).number, number, `${schema.typeName}.${name}`);
@@ -382,6 +383,61 @@ test("Extension package export contracts preserve exact local authority and dura
   });
   assert.equal(cancel.payload.case, "cancelExtensionPackageExport");
   assert.equal(cancel.payload.value.expectedRevision.value, 4n);
+});
+
+test("Extension Library keeps management paths separate from sandboxed relative-key operations", () => {
+  const methods = methodNames(contract.ExtensionService);
+  for (const name of [
+    "getExtensionLibraryOverview",
+    "validateExtensionLibraryLocation",
+    "relocateExtensionLibrary",
+    "rebindExtensionLibrary",
+    "unbindExtensionLibrary",
+    "repairExtensionLibraryState",
+    "repairExtensionLibraryMetadata",
+    "trashExtensionLibrary",
+    "listExtensionLibraryTrash",
+    "restoreExtensionLibraryTrash",
+    "purgeExtensionLibraryTrash",
+    "listExtensionLibraryGrace",
+    "rollbackExtensionLibrary",
+    "purgeExpiredExtensionLibraries",
+    "openExtensionLibrary",
+    "callExtensionLibrary",
+    "closeExtensionLibrary"
+  ]) assert.equal(methods.has(name), true, name);
+
+  assert.deepEqual(oneofMembers(contract.ExtensionLibraryCallSchema, "operation"), [
+    "read", "write", "stat", "list", "mkdir", "delete", "rename",
+    "write_begin", "write_chunk", "write_commit", "write_abort",
+    "sql_open", "sql_execute", "sql_batch", "sql_migrate", "sql_backup", "sql_check", "sql_close"
+  ]);
+  assert.deepEqual(oneofMembers(contract.ExtensionLibrarySqlValueSchema, "value"), [
+    "null_value", "number_value", "integer_value", "text_value", "blob_value"
+  ]);
+  assertNoFields([
+    contract.ExtensionLibrarySessionSchema,
+    contract.ExtensionLibraryCallSchema,
+    contract.ExtensionLibraryCallResultSchema,
+    contract.OpenExtensionLibraryRequestSchema,
+    contract.CallExtensionLibraryRequestSchema
+  ], ["absolute_path", "library_root", "owner_id", "binding_path", "credential"]);
+
+  const call = roundTrip(contract.ExtensionLibraryCallSchema, {
+    operation: { case: "sqlExecute", value: {
+      handleId: "db-1",
+      statement: {
+        sql: "SELECT ?, ?",
+        parameters: [
+          { value: { case: "integerValue", value: "9223372036854775807" } },
+          { value: { case: "blobValue", value: Uint8Array.from([1, 2, 3]) } }
+        ]
+      }
+    } }
+  });
+  assert.equal(call.operation.case, "sqlExecute");
+  assert.equal(call.operation.value.statement.parameters[0].value.value, "9223372036854775807");
+  assert.deepEqual([...call.operation.value.statement.parameters[1].value.value], [1, 2, 3]);
 });
 
 test("auxiliary routing preserves ordered exact routes and independent revisions", () => {

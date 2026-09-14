@@ -82,6 +82,7 @@ export interface ExtensionCatalogDescriptor {
   readonly description: string;
   readonly enabled: boolean;
   readonly mainView?: ExtensionMainViewDescriptor & { readonly extensionEntry: string };
+  readonly library?: { readonly schemaVersion: 1; readonly extensionEntry: string };
   readonly sidebarSupported: boolean;
   readonly sidebarVisible: boolean;
   readonly tools: readonly ExtensionToolDescriptor[];
@@ -154,6 +155,7 @@ interface ExtensionDefinition {
   readonly description: string;
   readonly enabled: boolean;
   readonly mainView?: ExtensionMainViewDescriptor & { readonly extensionEntry: string };
+  readonly library?: { readonly schemaVersion: 1; readonly extensionEntry: string };
   readonly sidebarSupported: boolean;
   readonly tools: readonly ExtensionToolDescriptor[];
   readonly permissions: readonly Omit<ExtensionPermissionDescriptor, "granted">[];
@@ -229,6 +231,7 @@ export class ExtensionCatalogManager {
   readonly #definitions = new Map<string, ExtensionDefinition>();
   readonly #tickets = new Map<string, SetupCredentialTicket>();
   readonly #managedCredentialReferences = new Set<string>();
+  readonly #authorityChangeListeners = new Set<(extensionIds: readonly string[]) => void>();
   #catalogRevision = 0n;
   #initialized = false;
   #recoveredFromCorruption = false;
@@ -265,6 +268,11 @@ export class ExtensionCatalogManager {
     this.#initialized = true;
   }
 
+  onAuthorityChanged(listener: (extensionIds: readonly string[]) => void): () => void {
+    this.#authorityChangeListeners.add(listener);
+    return () => { this.#authorityChangeListeners.delete(listener); };
+  }
+
   reconcile(
     resources: readonly PiResourceDescriptor[],
     mcpServers: readonly McpServerDescriptor[],
@@ -277,6 +285,7 @@ export class ExtensionCatalogManager {
     const previousDefinitions = new Map(this.#definitions);
     const previousCatalogRevision = this.#catalogRevision;
     const previousRecoveryPersistencePending = this.#recoveryPersistencePending;
+    const changedExtensionIds = new Set<string>();
     let changed = this.#recoveryPersistencePending;
     try {
       for (const definition of definitions) {
@@ -291,6 +300,7 @@ export class ExtensionCatalogManager {
             revision: "1",
             updatedAt: this.#now()
           });
+          changedExtensionIds.add(definition.id);
           changed = true;
           continue;
         }
@@ -305,12 +315,14 @@ export class ExtensionCatalogManager {
           updatedAt: this.#now(),
           ...(authorityChanged ? { authorization: undefined, attempt: undefined } : {})
         });
+        changedExtensionIds.add(definition.id);
         changed = true;
       }
 
       for (const id of this.#records.keys()) {
         if (nextDefinitions.has(id)) continue;
         this.#records.delete(id);
+        changedExtensionIds.add(id);
         changed = true;
       }
       this.#definitions.clear();
@@ -329,6 +341,7 @@ export class ExtensionCatalogManager {
       this.#recoveryPersistencePending = previousRecoveryPersistencePending;
       throw error;
     }
+    this.#notifyAuthorityChanged(changedExtensionIds);
     return this.snapshot();
   }
 
@@ -639,6 +652,7 @@ export class ExtensionCatalogManager {
       description: definition.description,
       enabled: definition.enabled,
       ...(definition.mainView === undefined ? {} : { mainView: { ...definition.mainView } }),
+      ...(definition.library === undefined ? {} : { library: { ...definition.library } }),
       sidebarSupported: definition.sidebarSupported,
       sidebarVisible: definition.sidebarSupported && record.sidebarVisible,
       tools,
@@ -666,6 +680,15 @@ export class ExtensionCatalogManager {
       if (previous === undefined) this.#records.delete(next.id);
       else this.#records.set(next.id, previous);
       throw error;
+    }
+    this.#notifyAuthorityChanged([next.id]);
+  }
+
+  #notifyAuthorityChanged(extensionIds: Iterable<string>): void {
+    const changed = [...new Set(extensionIds)].sort((left, right) => left.localeCompare(right, "en"));
+    if (changed.length === 0) return;
+    for (const listener of this.#authorityChangeListeners) {
+      try { listener(changed); } catch { /* Persisted authority remains canonical; consumers re-fence on access. */ }
     }
   }
 
@@ -740,6 +763,9 @@ function projectDefinitions(
         ...(entry.mainView === undefined ? {} : {
           mainView: { ...entry.mainView, extensionEntry: entry.extensionRelativePath }
         }),
+        ...(entry.library === undefined ? {} : {
+          library: { ...entry.library, extensionEntry: entry.extensionRelativePath }
+        }),
         sidebarSupported: entry.mainView !== undefined,
         tools: [],
         permissions: [],
@@ -749,6 +775,7 @@ function projectDefinitions(
           authorityIdentity,
           sourceState: source.state,
           sourceContentRevision: source.contentRevision,
+          library: entry.library ?? null,
           error: source.error
         }),
         ...(source.error === undefined ? {} : { error: source.error })
@@ -840,6 +867,9 @@ function projectDefinitions(
         ...(detail.mainView === undefined || detail.entryPath === undefined ? {} : {
           mainView: { ...detail.mainView, extensionEntry: detail.entryPath }
         }),
+        ...(detail.library === undefined || detail.entryPath === undefined ? {} : {
+          library: { ...detail.library, extensionEntry: detail.entryPath }
+        }),
         sidebarSupported: detail.mainView !== undefined,
         tools: [],
         permissions,
@@ -850,6 +880,7 @@ function projectDefinitions(
           resourceVersion: resource.versionNumber.toString(10),
           state: resource.state,
           enabled: resource.enabled,
+          library: detail.library ?? null,
           update: updateIdentity,
           error: resource.error
         }),

@@ -39,6 +39,7 @@ async function fixture(options: { readonly now?: () => number; readonly ttlMs?: 
   let current = true;
   let releases = 0;
   let surfaceManifest = authority.mainView;
+  let surfaceLibrary: ExtensionMainViewAuthority["library"];
   const acquireInstalledPackage = vi.fn(async (): Promise<PiInstalledPackageLease> => ({
     resource: {} as PiInstalledPackageLease["resource"],
     snapshotTo: async (destination) => {
@@ -51,12 +52,17 @@ async function fixture(options: { readonly now?: () => number; readonly ttlMs?: 
         joko: {
           extensionSurfaces: {
             schemaVersion: 1,
-            extensions: [{ entry: authority.extensionEntry, mainView: surfaceManifest }]
+            extensions: [{
+              entry: authority.extensionEntry,
+              mainView: surfaceManifest,
+              ...(surfaceLibrary === undefined ? {} : { library: surfaceLibrary })
+            }]
           }
         }
       }), "utf8");
       await writeFile(join(destination, "extensions", "review.ts"), "export default function setup() {}\n", "utf8");
       await writeFile(join(destination, "ui", "review", "index.html"), "<!doctype html><script type=\"module\" src=\"./app.js\"></script>\n", "utf8");
+      await writeFile(join(destination, "ui", "review", "secondary.html"), "<!doctype html><p>Secondary</p>\n", "utf8");
       await writeFile(join(destination, "ui", "review", "app.js"), "document.body.dataset.ready = 'true';\n", "utf8");
       return { discoveredRevision: REVISION, files: 4, bytes: 512, entries: [] };
     },
@@ -75,6 +81,7 @@ async function fixture(options: { readonly now?: () => number; readonly ttlMs?: 
     acquireInstalledPackage,
     setCurrent(value: boolean) { current = value; },
     setSurfaceManifest(value: typeof surfaceManifest) { surfaceManifest = value; },
+    setSurfaceLibrary(value: typeof surfaceLibrary) { surfaceLibrary = value; },
     releases: () => releases
   };
 }
@@ -142,6 +149,44 @@ describe("ExtensionMainViewManager", () => {
     }
   });
 
+  it("injects the bounded Library bootstrap only into a declared entry document", async () => {
+    const libraryAuthority: ExtensionMainViewAuthority = { ...authority, library: { schemaVersion: 1 } };
+    const { manager, setSurfaceLibrary } = await fixture();
+    setSurfaceLibrary(libraryAuthority.library);
+    try {
+      const surface = await manager.open({
+        authority: libraryAuthority,
+        connectionId: "connection-a",
+        assertAuthorityCurrent: () => undefined
+      });
+      const [, surfaceId, token, entry] = /main-views\/([^/]+)\/([^/]+)\/(.+)$/u.exec(surface.endpoint)!;
+      const html = await manager.serve({ surfaceId: surfaceId!, token: token!, assetPath: entry!, method: "GET" });
+      const text = html.body!.toString("utf8");
+      expect(text).toContain('<script src="./__joko_extension_library_bridge__.js"></script>');
+      expect(html.contentLength).toBe(html.body!.byteLength);
+
+      const head = await manager.serve({ surfaceId: surfaceId!, token: token!, assetPath: entry!, method: "HEAD" });
+      expect(head.body).toBeUndefined();
+      expect(head.contentLength).toBe(html.contentLength);
+
+      const bootstrap = await manager.serve({
+        surfaceId: surfaceId!, token: token!, assetPath: "__joko_extension_library_bridge__.js", method: "GET"
+      });
+      const bootstrapText = bootstrap.body?.toString("utf8") ?? "";
+      expect(bootstrapText).toContain("joko:extension-library-request");
+      expect(bootstrapText).toContain("Object.freeze({...d.result,ok:true})");
+      expect(bootstrapText).toContain("errorCode:d.error.code");
+      expect(bootstrap.headers["content-security-policy"]).toContain("script-src 'self'");
+
+      const secondary = await manager.serve({
+        surfaceId: surfaceId!, token: token!, assetPath: "secondary.html", method: "GET"
+      });
+      expect(secondary.body?.toString("utf8")).not.toContain("__joko_extension_library_bridge__.js");
+    } finally {
+      await manager.close();
+    }
+  });
+
   it("revokes immediately when Resource authority changes and expires idle leases", async () => {
     let now = 1_800_000_000_000;
     const { manager, setCurrent, releases } = await fixture({ now: () => now, ttlMs: 1_000 });
@@ -169,6 +214,18 @@ describe("ExtensionMainViewManager", () => {
     const { manager, setSurfaceManifest, releases } = await fixture();
     try {
       setSurfaceManifest({ ...authority.mainView, title: "Changed" });
+      await expect(manager.open({ authority, connectionId: "connection-a", assertAuthorityCurrent: () => undefined }))
+        .rejects.toThrow(/declaration changed/u);
+      expect(releases()).toBe(1);
+    } finally {
+      await manager.close();
+    }
+  });
+
+  it("rejects a Library declaration that is absent from the exact surface authority", async () => {
+    const { manager, setSurfaceLibrary, releases } = await fixture();
+    try {
+      setSurfaceLibrary({ schemaVersion: 1 });
       await expect(manager.open({ authority, connectionId: "connection-a", assertAuthorityCurrent: () => undefined }))
         .rejects.toThrow(/declaration changed/u);
       expect(releases()).toBe(1);

@@ -9,7 +9,9 @@ import type { OperationalStore } from "@joko/store";
 
 import { inspectPiPackageCatalog } from "./pi-package-compatibility.js";
 import {
+  isExtensionLibraryDescriptor,
   isExtensionMainViewDescriptor,
+  type ExtensionLibraryDescriptor,
   type ExtensionMainViewDescriptor
 } from "./extension-surface-manifest.js";
 
@@ -35,6 +37,7 @@ export interface ExtensionSourceEntryDescriptor {
   readonly bindingName: string;
   readonly bindingOrdinal: number;
   readonly mainView?: ExtensionMainViewDescriptor;
+  readonly library?: ExtensionLibraryDescriptor;
   readonly name: string;
   readonly packageName: string;
   readonly version?: string;
@@ -764,6 +767,7 @@ async function discoverMarketplace(
           author: inspection.author ?? null,
           description: inspection.description,
           mainView: extension.mainView ?? null,
+          library: extension.library ?? null,
           packageContentRevision
         });
         entries.push({
@@ -777,6 +781,7 @@ async function discoverMarketplace(
           bindingName: extension.resourceName,
           bindingOrdinal: ordinal,
           ...(extension.mainView === undefined ? {} : { mainView: { ...extension.mainView } }),
+          ...(extension.library === undefined ? {} : { library: { ...extension.library } }),
           name: inspection.extensions.length === 1 ? packageLabel : `${packageLabel} · ${basename(extension.relativePath)}`,
           packageName: inspection.name,
           ...(inspection.version === undefined ? {} : { version: inspection.version }),
@@ -1033,7 +1038,8 @@ function copySource(source: ExtensionSourceInput): ExtensionSourceInput {
 function copyEntry(entry: StoredExtensionSourceEntry): ExtensionSourceEntryDescriptor {
   return {
     ...entry,
-    ...(entry.mainView === undefined ? {} : { mainView: { ...entry.mainView } })
+    ...(entry.mainView === undefined ? {} : { mainView: { ...entry.mainView } }),
+    ...(entry.library === undefined ? {} : { library: { ...entry.library } })
   };
 }
 
@@ -1091,7 +1097,7 @@ function validateStoredSource(value: unknown): StoredExtensionSource {
 function validateStoredEntry(value: unknown): StoredExtensionSourceEntry {
   if (!plainObject(value) || !exactKeys(value, [
     "id", "revision", "contentRevision", "packageContentRevision", "resourceId", "packageRelativePath", "extensionRelativePath", "bindingName", "bindingOrdinal",
-    "mainView", "name", "packageName", "version", "author", "description"
+    "mainView", "library", "name", "packageName", "version", "author", "description"
   ]) || typeof value.id !== "string" || !ENTRY_ID.test(value.id) || typeof value.revision !== "string" || !CONTENT_REVISION.test(value.revision)
     || typeof value.contentRevision !== "string" || value.contentRevision !== value.revision
     || typeof value.packageContentRevision !== "string" || !CONTENT_REVISION.test(value.packageContentRevision)
@@ -1099,6 +1105,7 @@ function validateStoredEntry(value: unknown): StoredExtensionSourceEntry {
     || normalizeRelativePath(value.packageRelativePath) !== value.packageRelativePath || normalizeRelativePath(value.extensionRelativePath) !== value.extensionRelativePath
     || typeof value.bindingName !== "string" || value.bindingName.trim() === "" || typeof value.bindingOrdinal !== "number" || !Number.isSafeInteger(value.bindingOrdinal) || value.bindingOrdinal < 0
     || value.mainView !== undefined && !isExtensionMainViewDescriptor(value.mainView)
+    || value.library !== undefined && !isExtensionLibraryDescriptor(value.library)
     || typeof value.name !== "string" || value.name.trim() === "" || typeof value.packageName !== "string" || value.packageName.trim() === ""
     || value.version !== undefined && (typeof value.version !== "string" || value.version.trim() === "")
     || value.author !== undefined && (typeof value.author !== "string" || value.author.trim() === "")

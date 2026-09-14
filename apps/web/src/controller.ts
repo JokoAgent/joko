@@ -2030,6 +2030,34 @@ export function useAppController(): AppController {
       gateway().openExtensionMainView(extensionId, expectedRevision, signal),
     getExtensionMainViewSurface: (surfaceId, signal) => gateway().getExtensionMainViewSurface(surfaceId, signal),
     closeExtensionMainView: (surfaceId, signal) => gateway().closeExtensionMainView(surfaceId, signal),
+    getExtensionLibraryOverview: (extensionId, expectedRevision, signal) =>
+      gateway().getExtensionLibraryOverview(extensionId, expectedRevision, signal),
+    validateExtensionLibraryLocation: (extensionId, expectedRevision, candidate, signal) =>
+      gateway().validateExtensionLibraryLocation(extensionId, expectedRevision, candidate, signal),
+    relocateExtensionLibrary: (extensionId, expectedRevision, destination, signal) =>
+      gateway().relocateExtensionLibrary(extensionId, expectedRevision, destination, signal),
+    rebindExtensionLibrary: (extensionId, expectedRevision, candidate, signal) =>
+      gateway().rebindExtensionLibrary(extensionId, expectedRevision, candidate, signal),
+    unbindExtensionLibrary: (extensionId, expectedRevision, signal) =>
+      gateway().unbindExtensionLibrary(extensionId, expectedRevision, signal),
+    repairExtensionLibraryState: (signal) => gateway().repairExtensionLibraryState(signal),
+    repairExtensionLibraryMetadata: (extensionId, expectedRevision, signal) =>
+      gateway().repairExtensionLibraryMetadata(extensionId, expectedRevision, signal),
+    trashExtensionLibrary: (extensionId, expectedRevision, confirmation, signal) =>
+      gateway().trashExtensionLibrary(extensionId, expectedRevision, confirmation, signal),
+    listExtensionLibraryTrash: (extensionId, signal) => gateway().listExtensionLibraryTrash(extensionId, signal),
+    restoreExtensionLibraryTrash: (trashId, confirmation, destination, signal) =>
+      gateway().restoreExtensionLibraryTrash(trashId, confirmation, destination, signal),
+    purgeExtensionLibraryTrash: (trashId, confirmation, signal) =>
+      gateway().purgeExtensionLibraryTrash(trashId, confirmation, signal),
+    listExtensionLibraryGrace: (extensionId, signal) => gateway().listExtensionLibraryGrace(extensionId, signal),
+    rollbackExtensionLibrary: (extensionId, expectedRevision, graceId, signal) =>
+      gateway().rollbackExtensionLibrary(extensionId, expectedRevision, graceId, signal),
+    purgeExpiredExtensionLibraries: (signal) => gateway().purgeExpiredExtensionLibraries(signal),
+    openExtensionLibrary: (extensionId, expectedRevision, signal) =>
+      gateway().openExtensionLibrary(extensionId, expectedRevision, signal),
+    callExtensionLibrary: (sessionId, call, signal) => gateway().callExtensionLibrary(sessionId, call, signal),
+    closeExtensionLibrary: (sessionId, signal) => gateway().closeExtensionLibrary(sessionId, signal),
     getExtensionPackagePreview: (extensionId, expectedRevision, backendId, signal) =>
       gateway().getExtensionPackagePreview(extensionId, expectedRevision, backendId, signal),
     adoptExtensionPackage: (preview, allowSourceReplacement, signal) =>
