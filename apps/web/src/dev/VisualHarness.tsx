@@ -23,6 +23,13 @@ import type {
   ArtifactView,
   BackendView,
   ComposerDraft,
+  ExtensionCatalogEntryView,
+  ExtensionCatalogView,
+  ExtensionMainViewSurfaceView,
+  ExtensionPackageExportJobView,
+  ExtensionPackageExportPreviewView,
+  ExtensionPackagePreviewView,
+  ExtensionSourceCatalogView,
   InteractionResolutionDraft,
   InteractionView,
   McpServerView,
@@ -62,6 +69,7 @@ import { VisualUsageHistoryFixture } from "./VisualUsageHistoryFixture.js";
 import { UsageHistorySection } from "../components/UsageHistorySection.js";
 import { translate } from "../i18n.js";
 import { applyAppearanceTypography, clampCodeSize, clampUiSize, normalizeFontFamily } from "../appearance-settings.js";
+import { VISUAL_EXTENSION_MAIN_VIEW_ENDPOINT } from "./visual-extension-surface-contract.js";
 
 const FIXED_NOW = Date.UTC(2026, 7, 22, 4, 0, 0);
 const VISUAL_WORKSPACE_ID = "visual-workspace";
@@ -95,6 +103,7 @@ export function VisualHarness(): JSX.Element {
   }), []);
   const providerLoginFlows = useRef(new Map<string, ProviderLoginFlowView>());
   const sequence = useRef(100);
+  const extensionPackageExports = useRef(new Map<string, ExtensionPackageExportJobView>());
   const [state, setState] = useState<ControllerState>(() => initialControllerState(scenario, files));
   const remoteHosts = useMemo(() => new VisualRemoteHostFixture(state.snapshot.targets, target => {
     setState(current => ({ ...current, snapshot: { ...current.snapshot, targets: current.snapshot.targets.map(value => value.id === target.id ? target : value) } }));
@@ -289,6 +298,183 @@ export function VisualHarness(): JSX.Element {
         setState((current) => ({ ...current, route }));
       },
       refresh: async (): Promise<void> => { record("refresh"); },
+      listExtensions: async (options = {}): Promise<ExtensionCatalogView> => {
+        options.signal?.throwIfAborted();
+        const query = options.query?.trim().toLocaleLowerCase("en-US") ?? "";
+        const extensions = state.snapshot.extensions
+          .filter((extension) => options.source === undefined || extension.source === options.source)
+          .filter((extension) => options.installed === undefined || extension.installed === options.installed)
+          .filter((extension) => query === "" || [extension.name, extension.description, extension.author ?? ""]
+            .join("\n").toLocaleLowerCase("en-US").includes(query));
+        return {
+          revision: state.snapshot.extensionCatalogRevision,
+          extensions,
+          recoveredFromCorruption: state.snapshot.extensionCatalogRecovered
+        };
+      },
+      getExtension: async (extensionId, _sessionId, signal): Promise<ExtensionCatalogView> => {
+        signal?.throwIfAborted();
+        return {
+          revision: state.snapshot.extensionCatalogRevision,
+          extensions: state.snapshot.extensions.filter((extension) => extension.id === extensionId),
+          recoveredFromCorruption: state.snapshot.extensionCatalogRecovered
+        };
+      },
+      openExtensionMainView: async (extensionId, expectedRevision, signal): Promise<ExtensionMainViewSurfaceView> => {
+        signal?.throwIfAborted();
+        const extension = state.snapshot.extensions.find((candidate) => candidate.id === extensionId);
+        if (extension === undefined || extension.revision !== expectedRevision || extension.owner.kind !== "resource"
+          || extension.mainView === undefined) throw new Error("The visual Extension main view changed.");
+        record(`extension-main-view:open:${extensionId}`);
+        return visualExtensionMainViewSurface(extension);
+      },
+      getExtensionMainViewSurface: async (surfaceId, signal): Promise<ExtensionMainViewSurfaceView> => {
+        signal?.throwIfAborted();
+        const extension = state.snapshot.extensions.find((candidate) => candidate.id === "extension_0123456789abcdef0123456789abcdef");
+        if (extension === undefined || extension.owner.kind !== "resource" || extension.mainView === undefined
+          || surfaceId !== "extension_surface_0123456789abcdef0123456789abcdef") {
+          throw new Error("The visual Extension main view is unavailable.");
+        }
+        return visualExtensionMainViewSurface(extension);
+      },
+      closeExtensionMainView: async (surfaceId): Promise<boolean> => {
+        record(`extension-main-view:close:${surfaceId}`);
+        return surfaceId === "extension_surface_0123456789abcdef0123456789abcdef";
+      },
+      getExtensionPackagePreview: async (extensionId, expectedRevision, backendId, signal): Promise<ExtensionPackagePreviewView> => {
+        signal?.throwIfAborted();
+        const extension = state.snapshot.extensions.find((candidate) => candidate.id === extensionId);
+        if (extension === undefined || extension.revision !== expectedRevision) throw new Error("The visual extension changed. Refresh and try again.");
+        if (!state.snapshot.backends.some((backend) => backend.id === backendId)) throw new Error("The visual backend is unavailable.");
+        return visualExtensionPackagePreview(extension, backendId);
+      },
+      adoptExtensionPackage: async (preview, allowSourceReplacement): Promise<void> => {
+        if (preview.sourceReplacement && allowSourceReplacement !== true) throw new Error("Confirm the visual source replacement first.");
+        record(`extension-package:${preview.action}:${preview.resourceId}`);
+      },
+      removeExtensionPackage: async (extensionId, expectedRevision): Promise<void> => {
+        const extension = state.snapshot.extensions.find((candidate) => candidate.id === extensionId);
+        if (extension === undefined || extension.revision !== expectedRevision || extension.owner.kind !== "resource") {
+          throw new Error("The visual extension changed. Refresh and try again.");
+        }
+        record(`extension-package:remove:${extension.owner.resourceId}`);
+      },
+      getExtensionPackageExportPreview: async (extensionId, expectedRevision, signal): Promise<ExtensionPackageExportPreviewView> => {
+        signal?.throwIfAborted();
+        const extension = state.snapshot.extensions.find((candidate) => candidate.id === extensionId);
+        if (extension === undefined || extension.revision !== expectedRevision || extension.owner.kind !== "resource") {
+          throw new Error("The visual installed extension changed. Refresh and try again.");
+        }
+        const activeExport = [...extensionPackageExports.current.values()].find((candidate) => (
+          candidate.authority.extensionId === extensionId
+          && ["pending", "snapshotting", "packaging", "verifying"].includes(candidate.state)
+        ));
+        return visualExtensionPackageExportPreview(extension, state.snapshot, activeExport);
+      },
+      listExtensionPackageExports: async (extensionId, signal) => {
+        signal?.throwIfAborted();
+        return {
+          exports: [...extensionPackageExports.current.values()]
+            .filter((candidate) => extensionId === undefined || candidate.authority.extensionId === extensionId)
+            .sort((left, right) => right.updatedAt - left.updatedAt || right.id.localeCompare(left.id, "en")),
+          recoveredFromCorruption: false
+        };
+      },
+      getExtensionPackageExport: async (exportId, signal): Promise<ExtensionPackageExportJobView> => {
+        signal?.throwIfAborted();
+        const current = extensionPackageExports.current.get(exportId);
+        if (current === undefined) throw new Error("The visual package export does not exist.");
+        const states: Partial<Record<ExtensionPackageExportJobView["state"], ExtensionPackageExportJobView["state"]>> = {
+          pending: "snapshotting",
+          snapshotting: "packaging",
+          packaging: "verifying",
+          verifying: "ready"
+        };
+        const state = states[current.state];
+        if (state === undefined) return current;
+        const now = FIXED_NOW + sequence.current++;
+        const next: ExtensionPackageExportJobView = {
+          ...current,
+          revision: current.revision + 1n,
+          state,
+          files: state === "snapshotting" ? 0 : 4,
+          uncompressedBytes: state === "snapshotting" ? 0 : 5_632,
+          updatedAt: now,
+          ...(state === "ready" ? {
+            completedAt: now,
+            artifact: {
+              blobId: `visual-extension-package-${exportId}`,
+              sha256: "a".repeat(64),
+              byteSize: 2_048,
+              mediaType: "application/gzip",
+              fileName: current.fileName
+            }
+          } : {})
+        };
+        extensionPackageExports.current.set(exportId, next);
+        return next;
+      },
+      startExtensionPackageExport: async (preview, signal): Promise<ExtensionPackageExportJobView> => {
+        signal?.throwIfAborted();
+        if ([...extensionPackageExports.current.values()].some((candidate) => (
+          candidate.authority.extensionId === preview.extensionId
+          && ["pending", "snapshotting", "packaging", "verifying"].includes(candidate.state)
+        ))) throw new Error("The visual extension already has an active package export.");
+        const id = `visual-extension-export-${sequence.current++}`;
+        const now = FIXED_NOW + sequence.current++;
+        const next: ExtensionPackageExportJobView = {
+          id,
+          revision: 1n,
+          state: "pending",
+          authority: {
+            extensionId: preview.extensionId,
+            extensionRevision: preview.extensionRevision,
+            resourceId: preview.resourceId,
+            resourceRevision: preview.resourceRevision,
+            discoveredRevision: preview.discoveredRevision,
+            backendId: preview.backendId,
+            backendRevision: preview.backendRevision,
+            backendGeneration: preview.backendGeneration,
+            packageName: preview.packageName,
+            ...(preview.packageVersion === undefined ? {} : { packageVersion: preview.packageVersion })
+          },
+          archiveFormat: "npm-tar-gzip",
+          fileName: preview.fileName,
+          files: 0,
+          uncompressedBytes: 0,
+          createdAt: now,
+          updatedAt: now
+        };
+        extensionPackageExports.current.set(id, next);
+        record(`extension-package-export:start:${preview.resourceId}`);
+        return next;
+      },
+      cancelExtensionPackageExport: async (exportId, expectedRevision, signal): Promise<ExtensionPackageExportJobView> => {
+        signal?.throwIfAborted();
+        const current = extensionPackageExports.current.get(exportId);
+        if (current === undefined || current.revision !== expectedRevision) throw new Error("The visual package export changed.");
+        if (!["pending", "snapshotting", "packaging", "verifying"].includes(current.state)) throw new Error("The visual package export is already complete.");
+        const now = FIXED_NOW + sequence.current++;
+        const next: ExtensionPackageExportJobView = {
+          ...current,
+          revision: current.revision + 1n,
+          state: "cancelled",
+          updatedAt: now,
+          completedAt: now
+        };
+        extensionPackageExports.current.set(exportId, next);
+        record(`extension-package-export:cancel:${exportId}`);
+        return next;
+      },
+      getExtensionSourceGitPreflight: async () => ({ available: true, version: "2.51.0", minimumVersion: "2.25" }),
+      listExtensionSources: async (signal): Promise<ExtensionSourceCatalogView> => {
+        signal?.throwIfAborted();
+        return visualExtensionSources();
+      },
+      addExtensionSource: async (source, revision): Promise<void> => { record(`extension-source:add:${source.kind}:${revision.toString(10)}`); },
+      refreshExtensionSource: async (sourceId, revision): Promise<void> => { record(`extension-source:refresh:${sourceId}:${revision.toString(10)}`); },
+      removeExtensionSource: async (sourceId, revision): Promise<void> => { record(`extension-source:remove:${sourceId}:${revision.toString(10)}`); },
+      savePendingExtensionUse: async (value): Promise<void> => { record(`extension-use:${value.extensionId}:${value.commandName}`); },
       beginProviderLogin: async (_backendId, providerId, method): Promise<ProviderLoginFlowView> => {
         const now = FIXED_NOW + sequence.current++;
         const id = `visual-provider-login-${sequence.current}`;
@@ -2587,7 +2773,7 @@ function abortError(): Error {
 }
 
 interface HarnessParameters {
-  readonly scenario: "session" | "question" | "long-question" | "files" | "audio" | "review" | "personalization" | "providers" | "voice" | "automation" | "scheduler" | "connection" | "connections" | "browser" | "background" | "subagents" | "usage";
+  readonly scenario: "session" | "question" | "long-question" | "files" | "audio" | "review" | "personalization" | "providers" | "voice" | "automation" | "scheduler" | "connection" | "connections" | "browser" | "extensions" | "background" | "subagents" | "usage";
   readonly usageState: "ready" | "empty" | "error";
   readonly theme: Theme;
   readonly richCopy: boolean;
@@ -2603,6 +2789,7 @@ interface HarnessParameters {
   readonly computerUpdate: "none" | "available" | "downloading" | "installing";
   readonly computerPlatform: "win32" | "darwin";
   readonly worktreeRemoval: "clean" | "dirty" | "unknown";
+  readonly extensionMainView: boolean;
 }
 
 function harnessParameters(): HarnessParameters {
@@ -2625,6 +2812,7 @@ function harnessParameters(): HarnessParameters {
       || scenarioValue === "connection"
       || scenarioValue === "connections"
       || scenarioValue === "browser"
+      || scenarioValue === "extensions"
       || scenarioValue === "background"
       || scenarioValue === "subagents"
       || scenarioValue === "usage"
@@ -2654,7 +2842,8 @@ function harnessParameters(): HarnessParameters {
     computerPlatform: query.get("platform") === "darwin" ? "darwin" : "win32",
     worktreeRemoval: query.get("worktree") === "dirty"
       ? "dirty"
-      : query.get("worktree") === "unknown" ? "unknown" : "clean"
+      : query.get("worktree") === "unknown" ? "unknown" : "clean",
+    extensionMainView: query.get("mainView") === "1"
   };
 }
 
@@ -2722,6 +2911,10 @@ function initialControllerState(parameters: HarnessParameters, files: VisualWork
             ? { kind: "schedules", scheduleId: "visual-schedule-daily" }
           : parameters.scenario === "browser"
             ? { kind: "tools" }
+          : parameters.scenario === "extensions"
+            ? parameters.extensionMainView
+              ? { kind: "extensionMainView", extensionId: "extension_0123456789abcdef0123456789abcdef" }
+              : { kind: "tools", extensionId: "extension_0123456789abcdef0123456789abcdef" }
           : { kind: "session", sessionId: "session-1" },
     preferences: {
       ...DEFAULT_UI_PREFERENCES,
@@ -2805,6 +2998,9 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
   if (parameters.artifact) {
     capabilities.set("input.text", capability("input.text"));
     capabilities.set("input.mention", capability("input.mention", ["artifact"]));
+  }
+  if (parameters.scenario === "extensions") {
+    capabilities.set("runtime.resources", capability("runtime.resources", ["package", "extension"]));
   }
   const providerConfiguration: AppSnapshot["settings"]["providers"][number] = {
     id: "api",
@@ -3509,11 +3705,266 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
       canToggle: true,
       requiresExtensionApproval: false,
       postMutationNotice: false
-    }],
+    }, ...(parameters.scenario === "extensions" ? [{
+      id: "visual-extension-resource",
+      backendId: "visual-backend",
+      name: "@joko/workspace-navigator",
+      version: "1.4.0",
+      kind: "package",
+      scope: "managed",
+      state: "updateAvailable",
+      enabled: true,
+      source: "Community tools / packages/navigation",
+      discoveredRevision: `sha256:${"c".repeat(64)}`,
+      compatibilityDetails: [],
+      runtimeRequirements: [],
+      warnings: [],
+      disabledLifecycleScripts: [],
+      canToggle: true,
+      requiresExtensionApproval: false,
+      postMutationNotice: true
+    } as const] : [])],
+    extensions: parameters.scenario === "extensions" ? visualExtensions() : [],
+    extensionCatalogRevision: parameters.scenario === "extensions" ? 12n : 0n,
     commands: [
       { id: "command-review", name: "review", description: "Review the current changes", source: "backend", loaded: true },
       { id: "command-test", name: "test", description: "Run the narrow checks", source: "backend", loaded: true }
     ]
+  };
+}
+
+function visualExtensions(): readonly ExtensionCatalogEntryView[] {
+  return [{
+    id: "extension_0123456789abcdef0123456789abcdef",
+    revision: 7n,
+    owner: {
+      kind: "resource",
+      resourceId: "visual-extension-resource",
+      discoveredRevision: "sha256:visual-extension-owner",
+      resourceRevision: 4n
+    },
+    source: "local",
+    installed: true,
+    installState: "installed",
+    name: "Workspace navigator",
+    version: "1.4.0",
+    author: "Joko Labs",
+    description: "Navigate project structure and open focused workspace views.",
+    enabled: true,
+    mainView: { title: "Workspace overview", icon: "layout" },
+    sidebarSupported: true,
+    sidebarVisible: true,
+    tools: [{ name: "find_workspace_entry", description: "Find an exact file or directory in the active workspace.", requiresPermission: true }],
+    permissions: [{ id: "workspace-read", label: "Workspace read", description: "Reads project names and file metadata after task permission checks.", required: true, granted: true }],
+    commands: [{ name: "open-nav", description: "Start a task with the workspace navigator.", sessionId: "session-1" }],
+    setup: { state: "notRequired", revision: 0n, fields: [] },
+    update: {
+      source: {
+        kind: "source",
+        sourceId: "extension_source_0123456789abcdef0123456789abcdef",
+        sourceRevision: 4n,
+        entryId: "extension_source_entry_0123456789abcdef0123456789abcdef",
+        contentRevision: `sha256:${"a".repeat(64)}`
+      },
+      availableVersion: "1.5.0",
+      sourceReplacement: false
+    },
+    useSupported: true
+  }, {
+    id: "extension_fedcba9876543210fedcba9876543210",
+    revision: 3n,
+    owner: { kind: "mcp", serverId: "visual-research", serverRevision: 2n },
+    source: "market",
+    installed: true,
+    installState: "installed",
+    name: "Research connector",
+    version: "2.1.0",
+    author: "Example Studio",
+    description: "Search a connected research corpus with protected credentials.",
+    enabled: true,
+    sidebarSupported: true,
+    sidebarVisible: false,
+    tools: [{ name: "search_corpus", description: "Search the configured corpus.", requiresPermission: true }],
+    permissions: [{ id: "credential-header", label: "Protected header", description: "Adds a protected request header.", required: true, granted: false }],
+    commands: [],
+    setup: {
+      state: "required",
+      revision: 0n,
+      fields: [{ id: "api-token", label: "API token", description: "Token used for the research endpoint.", kind: "secret", required: true, configured: false, options: [] }]
+    },
+    useSupported: false
+  }, {
+    id: "extension_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    revision: 2n,
+    owner: {
+      kind: "source",
+      sourceId: "extension_source_0123456789abcdef0123456789abcdef",
+      sourceRevision: 4n,
+      entryId: "extension_source_entry_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      contentRevision: `sha256:${"a".repeat(64)}`
+    },
+    source: "market",
+    installed: false,
+    installState: "available",
+    name: "Release notes",
+    version: "2.0.0",
+    author: "Joko Labs",
+    description: "Prepare concise release notes from committed workspace changes.",
+    enabled: false,
+    sidebarSupported: false,
+    sidebarVisible: false,
+    tools: [{ name: "draft_release_notes", description: "Draft release notes for the selected revision range.", requiresPermission: true }],
+    permissions: [{ id: "workspace-read", label: "Workspace read", description: "Reads committed changes after task permission checks.", required: true, granted: false }],
+    commands: [],
+    setup: { state: "notRequired", revision: 0n, fields: [] },
+    useSupported: false
+  }];
+}
+
+function visualExtensionMainViewSurface(
+  extension: ExtensionCatalogEntryView
+): ExtensionMainViewSurfaceView {
+  if (extension.owner.kind !== "resource" || extension.mainView === undefined) {
+    throw new Error("The visual Extension main view has no Resource authority.");
+  }
+  return {
+    id: "extension_surface_0123456789abcdef0123456789abcdef",
+    extensionId: extension.id,
+    owner: extension.owner,
+    backendId: "visual-backend",
+    backendRevision: 9n,
+    backendGeneration: 1,
+    endpoint: `${window.location.origin}${VISUAL_EXTENSION_MAIN_VIEW_ENDPOINT}`,
+    ...(extension.mainView.title === undefined ? {} : { title: extension.mainView.title }),
+    ...(extension.mainView.icon === undefined ? {} : { icon: extension.mainView.icon }),
+    expiresAt: FIXED_NOW + 10 * 60_000
+  };
+}
+
+function visualExtensionPackagePreview(extension: ExtensionCatalogEntryView, backendId: string): ExtensionPackagePreviewView {
+  const installed = extension.owner.kind === "resource";
+  const action: ExtensionPackagePreviewView["action"] = installed
+    ? extension.update?.sourceReplacement === true ? "replace" : "update"
+    : "install";
+  const resourceId = installed ? extension.owner.resourceId : "visual-release-notes-resource";
+  return {
+    extensionId: extension.id,
+    extensionRevision: extension.revision,
+    action,
+    resourceId,
+    backendId,
+    packageName: extension.name === "Release notes" ? "@joko/release-notes" : "@joko/workspace-navigator",
+    ...(installed
+      ? {
+          installedVersion: extension.version,
+          currentResource: {
+            resourceId: extension.owner.resourceId,
+            resourceRevision: extension.owner.resourceRevision,
+            name: extension.name,
+            sourceDisplay: "Community tools / packages/navigation"
+          }
+        }
+      : {}),
+    availableVersion: extension.update?.availableVersion ?? extension.version,
+    sourceReplacement: action === "replace",
+    preservesEnabled: installed && extension.enabled,
+    compatibilityDetails: [{
+      kind: "extension",
+      name: extension.name,
+      compatibility: "supported",
+      issues: [],
+      detectedApis: ["notify"],
+      adaptedApis: ["notify"],
+      unsupportedApis: []
+    }],
+    runtimeRequirements: [{
+      packageName: "@earendil-works/pi-coding-agent",
+      range: "^0.84.0",
+      currentVersion: "0.84.4",
+      status: "compatible"
+    }],
+    warnings: ["lifecycleScriptsDisabled"],
+    disabledLifecycleScripts: ["postinstall"],
+    canToggle: true
+  };
+}
+
+function visualExtensionPackageExportPreview(
+  extension: ExtensionCatalogEntryView,
+  snapshot: AppSnapshot,
+  activeExport?: ExtensionPackageExportJobView
+): ExtensionPackageExportPreviewView {
+  const owner = extension.owner;
+  if (owner.kind !== "resource") throw new Error("The visual extension is not installed from a managed Resource.");
+  const resource = snapshot.resources.find((candidate) => candidate.id === owner.resourceId);
+  if (resource === undefined || resource.scope !== "managed" || resource.kind !== "package") {
+    throw new Error("The visual Extension Resource is unavailable.");
+  }
+  const backend = snapshot.backends.find((candidate) => candidate.id === resource.backendId);
+  const packageName = extension.name === "Release notes" ? "@joko/release-notes" : "@joko/workspace-navigator";
+  const packageVersion = extension.version;
+  return {
+    extensionId: extension.id,
+    extensionRevision: extension.revision,
+    resourceId: resource.id,
+    resourceRevision: owner.resourceRevision,
+    discoveredRevision: owner.discoveredRevision,
+    backendId: resource.backendId,
+    backendRevision: 9n,
+    backendGeneration: backend?.instanceGeneration ?? 1,
+    packageName,
+    ...(packageVersion === undefined ? {} : { packageVersion }),
+    archiveFormat: "npm-tar-gzip",
+    fileName: `${packageName.replace(/^@/u, "").replaceAll("/", "-")}-${packageVersion ?? "package"}.tgz`,
+    maximumEntries: 10_000,
+    maximumUncompressedBytes: 64 * 1024 * 1024,
+    localOnly: true,
+    ...(activeExport === undefined ? {} : { activeExport }),
+    recoveredFromCorruption: false
+  };
+}
+
+function visualExtensionSources(): ExtensionSourceCatalogView {
+  return {
+    revision: 6n,
+    recoveredFromCorruption: false,
+    sources: [{
+      id: "extension_source_0123456789abcdef0123456789abcdef",
+      revision: 4n,
+      kind: "git",
+      location: {
+        kind: "git",
+        repositoryUrl: "https://code.example.test/joko/extensions.git",
+        ref: "stable",
+        sparsePaths: ["packages/navigation", "packages/research"]
+      },
+      name: "community-tools",
+      displayName: "Community tools",
+      state: "ready",
+      contentRevision: `sha256:${"a".repeat(64)}`,
+      discoveredExtensionCount: 8,
+      declaredEntryCount: 7,
+      skippedEntryCount: 0,
+      unreadableEntryCount: 0,
+      addedAt: FIXED_NOW - 8 * 86_400_000,
+      refreshedAt: FIXED_NOW - 18 * 60_000
+    }, {
+      id: "extension_source_fedcba9876543210fedcba9876543210",
+      revision: 2n,
+      kind: "local",
+      location: { kind: "local", path: "D:\\extension-lab" },
+      name: "local-lab",
+      displayName: "Local extension lab",
+      state: "error",
+      contentRevision: `sha256:${"b".repeat(64)}`,
+      discoveredExtensionCount: 2,
+      declaredEntryCount: 4,
+      skippedEntryCount: 1,
+      unreadableEntryCount: 1,
+      addedAt: FIXED_NOW - 3 * 86_400_000,
+      refreshedAt: FIXED_NOW - 45 * 60_000,
+      error: "The local source is temporarily unavailable. Restore the folder and refresh it."
+    }]
   };
 }
 

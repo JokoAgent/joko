@@ -61,12 +61,12 @@ describe("Desktop distribution", () => {
     });
     expect(manifest.devDependencies).toMatchObject({
       "@joko/web": "workspace:*",
-      electron: "39.2.7",
+      electron: "43.6.0",
       "electron-builder": "26.15.3"
     });
     expect(manifest.scripts?.["package:dir"]).toContain("--dir --publish never");
     expect(manifest.scripts?.["package:artifacts"]).toContain("--publish never");
-    expect(config.electronVersion).toBe("39.2.7");
+    expect(config.electronVersion).toBe("43.6.0");
     expect(config.publish).toBeNull();
     expect(workspace).toContain("electron-winstaller: false");
     expect(workspace).not.toContain("electron-winstaller: true");

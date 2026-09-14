@@ -3,10 +3,11 @@ import react from "@vitejs/plugin-react";
 
 import { modelViewerAssetsPlugin } from "./model-viewer-assets.js";
 import { pdfJsAssetsPlugin } from "./pdfjs-assets.js";
+import { visualExtensionSurfacePlugin } from "./src/dev/visual-extension-surface-plugin.js";
 
 export default defineConfig({
   base: "./",
-  plugins: [react(), pdfJsAssetsPlugin(), modelViewerAssetsPlugin()],
+  plugins: [react(), pdfJsAssetsPlugin(), modelViewerAssetsPlugin(), visualExtensionSurfacePlugin()],
   server: {
     strictPort: true
   },

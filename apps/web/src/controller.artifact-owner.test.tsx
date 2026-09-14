@@ -40,7 +40,14 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   const saveDraft = vi.fn(async () => undefined);
   const readDraftSnapshot = vi.fn(async () => ({ revision: 0 }));
   const saveDraftIfRevision = vi.fn(async () => 1);
-  const newDraftMethods = ["readNewSessionDraft", "saveNewSessionDraft", "clearNewSessionDraft"] as const;
+  const newDraftMethods = [
+    "readNewSessionDraft",
+    "saveNewSessionDraft",
+    "clearNewSessionDraft",
+    "readPendingExtensionUse",
+    "savePendingExtensionUse",
+    "clearPendingExtensionUse"
+  ] as const;
   const newDraftCalls = Object.fromEntries(newDraftMethods.map((method) => [method, vi.fn(async () => undefined)])) as Record<typeof newDraftMethods[number], ReturnType<typeof vi.fn>>;
   const workspaceMethods = ["listWorkspaceChangeSets", "previewWorkspaceRewind", "executeWorkspaceRewind"] as const;
   const workspaceCalls = new Map<string, Record<typeof workspaceMethods[number], ReturnType<typeof vi.fn>>>();
@@ -291,9 +298,28 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   const newTaskDraft = { selection: { kind: "dialogue" as const, backendId: "backend" }, nativeStart: { kind: "fresh" as const }, providerId: "provider", modelId: "model", fastMode: false, permissionMode: "ask" as const, planMode: false, text: "New task", editorDocument: { type: "doc", content: [] }, mentions: [], attachments: [] };
   await firstController.saveNewSessionDraft(newTaskDraft);
   await firstController.clearNewSessionDraft();
+  const pendingExtensionUse = {
+    extensionId: "extension_0123456789abcdef0123456789abcdef",
+    extensionRevision: "7",
+    commandName: "open-nav",
+    runtimeSessionId: "session-runtime",
+    displayName: "Workspace navigator",
+    owner: {
+      kind: "resource" as const,
+      resourceId: "resource-extension-a",
+      discoveredRevision: "sha256:resource-generation-a",
+      resourceRevision: "4"
+    }
+  };
+  await firstController.readPendingExtensionUse();
+  await firstController.savePendingExtensionUse(pendingExtensionUse);
+  await firstController.clearPendingExtensionUse();
   expect(newDraftCalls.readNewSessionDraft).toHaveBeenLastCalledWith(`${first.serverId}\u0000${first.id}`);
   expect(newDraftCalls.clearNewSessionDraft).toHaveBeenLastCalledWith(`${first.serverId}\u0000${first.id}`);
   expect(newDraftCalls.saveNewSessionDraft).toHaveBeenLastCalledWith(`${first.serverId}\u0000${first.id}`, newTaskDraft);
+  expect(newDraftCalls.readPendingExtensionUse).toHaveBeenLastCalledWith(`${first.serverId}\u0000${first.id}`);
+  expect(newDraftCalls.clearPendingExtensionUse).toHaveBeenLastCalledWith(`${first.serverId}\u0000${first.id}`);
+  expect(newDraftCalls.savePendingExtensionUse).toHaveBeenLastCalledWith(`${first.serverId}\u0000${first.id}`, pendingExtensionUse);
   for (const method of workspaceMethods) {
     const call = firstController[method] as (...args: any[]) => Promise<unknown>;
     await expect(call("workspace", "preview", "change", false)).rejects.toThrow("Workspace owner disconnected");

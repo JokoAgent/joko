@@ -6,7 +6,12 @@ import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { claudeSessionElectronSmokeSource, sqliteVecElectronSmokeSource, terminalElectronSmokeSource } from "../dist/runtime-staging.js";
+import {
+  claudeSessionElectronSmokeSource,
+  extensionLibraryElectronSmokeSource,
+  sqliteVecElectronSmokeSource,
+  terminalElectronSmokeSource
+} from "../dist/runtime-staging.js";
 
 // Without arguments this exercises the staged development host. `--unpacked`
 // launches electron-builder's real app.isPackaged output with its external
@@ -25,6 +30,7 @@ if (process.platform === "linux" && !process.env.DISPLAY && !process.env.WAYLAND
   throw new Error("Packaged desktop smoke requires a display server on Linux. Run it under `xvfb-run -a` in headless environments.");
 }
 let sqliteVecSmoke;
+let extensionLibrarySmoke;
 let terminalSmoke;
 let claudeSessionSmoke;
 try {
@@ -38,6 +44,16 @@ try {
     "sqlite-vec",
     sqliteVecElectronSmokeSource(process.platform, process.arch)
   );
+  extensionLibrarySmoke = await runNativeElectronSmoke(
+    executable,
+    resolveOrchestratorRuntimeRoot(executable, useUnpackedArtifact),
+    markerDirectory,
+    "extension-library",
+    extensionLibraryElectronSmokeSource()
+  );
+  if (extensionLibrarySmoke.sqlite !== true || extensionLibrarySmoke.changes !== 1 || extensionLibrarySmoke.selectedValue !== "electron-worker") {
+    throw new Error("Electron-Node Extension Library smoke returned an invalid SQLite round trip.");
+  }
   terminalSmoke = await runNativeElectronSmoke(
     executable,
     resolveOrchestratorRuntimeRoot(executable, useUnpackedArtifact),
@@ -58,7 +74,7 @@ try {
   if (claudeSessionSmoke.missingSession !== true || claudeSessionSmoke.workerRetired !== true || claudeSessionSmoke.isolatedProfileUnchanged !== true) {
     throw new Error("Electron-Node Session SDK smoke returned an invalid Worker result.");
   }
-  process.stdout.write(`${JSON.stringify({ event: "JOKO_DESKTOP_NATIVE_RUNTIME_SMOKE_OK", sqliteVec: sqliteVecSmoke, terminal: terminalSmoke, claudeSession: claudeSessionSmoke })}\n`);
+  process.stdout.write(`${JSON.stringify({ event: "JOKO_DESKTOP_NATIVE_RUNTIME_SMOKE_OK", sqliteVec: sqliteVecSmoke, extensionLibrary: extensionLibrarySmoke, terminal: terminalSmoke, claudeSession: claudeSessionSmoke })}\n`);
 } catch (error) {
   rmSync(markerDirectory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   throw error;
@@ -135,7 +151,7 @@ if (
   connectSmoke.observations.publicRequestSeen || !managedOrchestratorStopped
 ) {
   throw new Error(
-    `Packaged desktop smoke failed (platform=${process.platform}, timeoutMs=${timeoutMs}, code=${String(result.code)}, signal=${String(result.signal)}, marker=${marker}, progress=${progress}, sqliteVec=${sqliteVecSmoke.version}, connect=${JSON.stringify(connectSmoke.observations)}): ${stderr.slice(-1_000)}`
+    `Packaged desktop smoke failed (platform=${process.platform}, timeoutMs=${timeoutMs}, code=${String(result.code)}, signal=${String(result.signal)}, marker=${marker}, progress=${progress}, sqliteVec=${sqliteVecSmoke.version}, extensionLibrary=${extensionLibrarySmoke.version}, connect=${JSON.stringify(connectSmoke.observations)}): ${stderr.slice(-1_000)}`
   );
 }
 

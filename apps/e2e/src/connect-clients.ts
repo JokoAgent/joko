@@ -6,6 +6,7 @@ import {
   BrowserService,
   ConnectionService,
   EventService,
+  ExtensionService,
   InteractionService,
   OperationService,
   PiService,
@@ -15,6 +16,7 @@ import {
   SchedulerService,
   SessionService,
   SettingsService,
+  SkillService,
   TargetService,
   TerminalService,
   ToolService,
@@ -24,12 +26,14 @@ import {
 export interface E2eClients {
   readonly connection: Client<typeof ConnectionService>;
   readonly event: Client<typeof EventService>;
+  readonly extension: Client<typeof ExtensionService>;
   readonly operation: Client<typeof OperationService>;
   readonly backend: Client<typeof BackendService>;
   readonly target: Client<typeof TargetService>;
   readonly session: Client<typeof SessionService>;
   readonly portableSession: Client<typeof PortableSessionService>;
   readonly settings: Client<typeof SettingsService>;
+  readonly skill: Client<typeof SkillService>;
   readonly run: Client<typeof RunService>;
   readonly queue: Client<typeof QueueService>;
   readonly scheduler: Client<typeof SchedulerService>;
@@ -66,12 +70,14 @@ export function createE2eClients(baseUrl: string, authKey?: string, timeoutMs = 
   return {
     connection: createClient(ConnectionService, transport),
     event: createClient(EventService, transport),
+    extension: createClient(ExtensionService, transport),
     operation: createClient(OperationService, transport),
     backend: createClient(BackendService, transport),
     target: createClient(TargetService, transport),
     session: createClient(SessionService, transport),
     portableSession: createClient(PortableSessionService, transport),
     settings: createClient(SettingsService, transport),
+    skill: createClient(SkillService, transport),
     run: createClient(RunService, transport),
     queue: createClient(QueueService, transport),
     scheduler: createClient(SchedulerService, transport),

@@ -207,6 +207,9 @@ type JokoDesktopCapability =
   | "attention.badge"
   | "appearance.zoom"
   | "application.menu"
+  | "extension.libraryGestures"
+  | "extension.libraryLocationPicker"
+  | "extension.windows"
   | "inspector.detach"
   | "layout.reset"
   | "microphone.lifecycle"
@@ -308,6 +311,24 @@ interface JokoDesktopApi {
     get(): Promise<JokoDesktopMainWindowCloseSettings>;
     set(change: { readonly behavior: JokoDesktopMainWindowCloseSettings["behavior"]; readonly expectedRevision: number }): Promise<JokoDesktopMainWindowCloseSettings>;
     onChanged(listener: (settings: JokoDesktopMainWindowCloseSettings) => void): () => void;
+  };
+  readonly extensionWindows: {
+    open(extensionId: string): Promise<{ readonly focusedExisting: boolean }>;
+  };
+  readonly extensionLibraries: {
+    pickLocation(): Promise<{ readonly cancelled: true } | { readonly cancelled: false; readonly path: string }>;
+    reveal(request: { readonly extensionId: string; readonly root: string; readonly path: string }): Promise<boolean>;
+    beginSave(request: { readonly extensionId: string; readonly name: string }): Promise<
+      { readonly cancelled: true } | { readonly cancelled: false; readonly ticketId: string }
+    >;
+    commitSave(request: {
+      readonly extensionId: string;
+      readonly ticketId: string;
+      readonly root: string;
+      readonly path: string;
+    }): Promise<number>;
+    cancelSave(ticketId: string): Promise<void>;
+    clipboardWrite(request: { readonly extensionId: string; readonly bytes: Uint8Array }): Promise<number>;
   };
   readonly windowInteraction: {
     get(): Promise<{ readonly swallowActivationClick: boolean }>;

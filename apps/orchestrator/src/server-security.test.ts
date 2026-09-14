@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { createInternalServer, ORCHESTRATOR_WEB_CONTENT_SECURITY_POLICY } from "./server.js";
+import { createInternalServer, isExtensionMainViewRequest, ORCHESTRATOR_WEB_CONTENT_SECURITY_POLICY } from "./server.js";
 import type { OrchestratorApplication } from "./application.js";
 
 describe("Orchestrator Web content security policy", () => {
@@ -36,6 +36,15 @@ describe("Orchestrator Web content security policy", () => {
     expect(ORCHESTRATOR_WEB_CONTENT_SECURITY_POLICY).toContain("media-src 'self' blob: data:");
     expect(ORCHESTRATOR_WEB_CONTENT_SECURITY_POLICY).toContain("connect-src 'self' blob:");
     expect(ORCHESTRATOR_WEB_CONTENT_SECURITY_POLICY).toContain("script-src 'self' 'unsafe-eval'");
-    expect(ORCHESTRATOR_WEB_CONTENT_SECURITY_POLICY).toContain("frame-src 'none'");
+    expect(ORCHESTRATOR_WEB_CONTENT_SECURITY_POLICY).toContain("frame-src 'self'");
+  });
+
+  it("recognizes only exact opaque Extension surface routes", () => {
+    const route = `/v1/extensions/main-views/extension_surface_${"a".repeat(32)}/${"b".repeat(64)}/index.html`;
+    expect(isExtensionMainViewRequest(route)).toBe(true);
+    expect(isExtensionMainViewRequest(`${route}?debug=1`)).toBe(false);
+    expect(isExtensionMainViewRequest(route.replace("extension_surface_", "surface_"))).toBe(false);
+    expect(isExtensionMainViewRequest(route.replace(`/${"b".repeat(64)}/`, "/short/"))).toBe(false);
+    expect(isExtensionMainViewRequest("/v1/extensions/main-views/")).toBe(false);
   });
 });

@@ -326,10 +326,294 @@ test("durable and cross-process field numbers remain stable", () => {
     [contract.OperationMutationSchema, "update_agent_resource_settings", 163],
     [contract.OperationMutationSchema, "update_collaboration_settings", 164],
     [contract.OperationMutationSchema, "update_git_safety_settings", 165],
-    [contract.OperationMutationSchema, "cleanup_git_safety_savepoints", 166]
+    [contract.OperationMutationSchema, "cleanup_git_safety_savepoints", 166],
+    [contract.OperationMutationSchema, "start_extension_package_export", 194],
+    [contract.OperationMutationSchema, "cancel_extension_package_export", 195],
+    [contract.OperationMutationSchema, "apply_skill_draft", 196],
+    [contract.OperationMutationSchema, "set_skill_enabled", 197],
+    [contract.OperationMutationSchema, "delete_skill", 198],
+    [contract.OperationMutationSchema, "add_skill_market_source", 199],
+    [contract.OperationMutationSchema, "refresh_skill_market_source", 200],
+    [contract.OperationMutationSchema, "remove_skill_market_source", 201],
+    [contract.OperationMutationSchema, "install_skill_market_plan", 202],
+    [contract.OperationMutationSchema, "enable_skill_market_sync", 203],
+    [contract.OperationMutationSchema, "disable_skill_market_sync", 204],
+    [contract.OperationMutationSchema, "enqueue_skill_market_sync", 205],
+    [contract.OperationMutationSchema, "cancel_skill_market_sync", 206],
+    [contract.OperationMutationSchema, "retry_skill_market_sync", 207],
+    [contract.OperationResultSchema, "skill", 35],
+    [contract.ListSkillFilesRequestSchema, "page", 3],
+    [contract.ListSkillFilesResponseSchema, "page", 2],
+    [contract.ListSkillRecoveriesRequestSchema, "page", 1],
+    [contract.ListSkillRecoveriesResponseSchema, "page", 2],
+    [contract.ExtensionCatalogEntrySchema, "library", 22]
   ];
   for (const [schema, name, number] of expected) {
     assert.equal(field(schema, name).number, number, `${schema.typeName}.${name}`);
+  }
+});
+
+test("Extension package export contracts preserve exact local authority and durable control", () => {
+  const methods = methodNames(contract.ExtensionService);
+  assert.equal(methods.has("getExtensionPackageExportPreview"), true);
+  assert.equal(methods.has("listExtensionPackageExports"), true);
+  assert.equal(methods.has("getExtensionPackageExport"), true);
+  const authority = {
+    extensionId: "extension_0123456789abcdef0123456789abcdef",
+    extensionRevision: { value: 7n },
+    resourceId: "resource-package",
+    resourceRevision: { value: 5n },
+    discoveredRevision: `sha256:${"a".repeat(64)}`,
+    backendId: "pi",
+    backendRevision: { value: 9n },
+    backendGeneration: 3n,
+    packageName: "@sample/exportable",
+    packageVersion: "1.2.3"
+  };
+  const preview = roundTrip(contract.ExtensionPackageExportPreviewSchema, {
+    authority,
+    archiveFormat: "npm-tar-gzip",
+    fileName: "sample-exportable-1.2.3.tgz",
+    maximumEntries: 10_000,
+    maximumUncompressedBytes: 67_108_864n,
+    localOnly: true
+  });
+  assert.equal(preview.authority.backendGeneration, 3n);
+  assert.equal(preview.authority.discoveredRevision, authority.discoveredRevision);
+  assert.equal(preview.localOnly, true);
+
+  const start = roundTrip(contract.OperationMutationSchema, {
+    payload: { case: "startExtensionPackageExport", value: {
+      extensionId: authority.extensionId,
+      expectedExtensionRevision: authority.extensionRevision,
+      resourceId: authority.resourceId,
+      expectedResourceRevision: authority.resourceRevision,
+      backendId: authority.backendId,
+      expectedBackendRevision: authority.backendRevision,
+      expectedBackendGeneration: authority.backendGeneration
+    } }
+  });
+  assert.equal(start.payload.case, "startExtensionPackageExport");
+  assert.equal(start.payload.value.expectedBackendGeneration, 3n);
+  const cancel = roundTrip(contract.OperationMutationSchema, {
+    payload: { case: "cancelExtensionPackageExport", value: { exportId: "export-1", expectedRevision: { value: 4n } } }
+  });
+  assert.equal(cancel.payload.case, "cancelExtensionPackageExport");
+  assert.equal(cancel.payload.value.expectedRevision.value, 4n);
+});
+
+test("Extension Library keeps management paths separate from sandboxed relative-key operations", () => {
+  const methods = methodNames(contract.ExtensionService);
+  for (const name of [
+    "getExtensionLibraryOverview",
+    "validateExtensionLibraryLocation",
+    "relocateExtensionLibrary",
+    "rebindExtensionLibrary",
+    "unbindExtensionLibrary",
+    "repairExtensionLibraryState",
+    "repairExtensionLibraryMetadata",
+    "trashExtensionLibrary",
+    "listExtensionLibraryTrash",
+    "restoreExtensionLibraryTrash",
+    "purgeExtensionLibraryTrash",
+    "listExtensionLibraryGrace",
+    "rollbackExtensionLibrary",
+    "purgeExpiredExtensionLibraries",
+    "openExtensionLibrary",
+    "callExtensionLibrary",
+    "closeExtensionLibrary"
+  ]) assert.equal(methods.has(name), true, name);
+
+  assert.deepEqual(oneofMembers(contract.ExtensionLibraryCallSchema, "operation"), [
+    "read", "write", "stat", "list", "mkdir", "delete", "rename",
+    "write_begin", "write_chunk", "write_commit", "write_abort",
+    "sql_open", "sql_execute", "sql_batch", "sql_migrate", "sql_backup", "sql_check", "sql_close"
+  ]);
+  assert.deepEqual(oneofMembers(contract.ExtensionLibrarySqlValueSchema, "value"), [
+    "null_value", "number_value", "integer_value", "text_value", "blob_value"
+  ]);
+  assertNoFields([
+    contract.ExtensionLibrarySessionSchema,
+    contract.ExtensionLibraryCallSchema,
+    contract.ExtensionLibraryCallResultSchema,
+    contract.OpenExtensionLibraryRequestSchema,
+    contract.CallExtensionLibraryRequestSchema
+  ], ["absolute_path", "library_root", "owner_id", "binding_path", "credential"]);
+
+  const call = roundTrip(contract.ExtensionLibraryCallSchema, {
+    operation: { case: "sqlExecute", value: {
+      handleId: "db-1",
+      statement: {
+        sql: "SELECT ?, ?",
+        parameters: [
+          { value: { case: "integerValue", value: "9223372036854775807" } },
+          { value: { case: "blobValue", value: Uint8Array.from([1, 2, 3]) } }
+        ]
+      }
+    } }
+  });
+  assert.equal(call.operation.case, "sqlExecute");
+  assert.equal(call.operation.value.statement.parameters[0].value.value, "9223372036854775807");
+  assert.deepEqual([...call.operation.value.statement.parameters[1].value.value], [1, 2, 3]);
+});
+
+test("Skill management is path-private and mutations retain exact revision authority", () => {
+  const methods = methodNames(contract.SkillService);
+  for (const name of [
+    "listSkills", "openSkill", "listSkillFiles", "readSkillFile", "getSkillDiff",
+    "prepareSkillFileEdit", "prepareSkillRename", "listSkillRecoveries", "closeSkill"
+  ]) assert.equal(methods.has(name), true, name);
+
+  assertNoFields([
+    contract.SkillDescriptorSchema,
+    contract.SkillMetadataSchema,
+    contract.SkillFileEntrySchema,
+    contract.SkillDiffChangeSchema,
+    contract.SkillSessionSchema,
+    contract.SkillDraftSchema,
+    contract.SkillRecoverySchema,
+    contract.SkillMutationResultSchema,
+    contract.ListSkillsRequestSchema,
+    contract.OpenSkillRequestSchema,
+    contract.ListSkillFilesRequestSchema,
+    contract.ReadSkillFileRequestSchema,
+    contract.GetSkillDiffRequestSchema,
+    contract.PrepareSkillRenameRequestSchema,
+    contract.CloseSkillRequestSchema
+  ], [
+    "path", "absolute_path", "local_path", "source_path", "root", "workspace_root",
+    "candidate_path", "recovery_path", "owner_id", "credential", "credential_value"
+  ]);
+
+  const descriptor = {
+    skillId: "resource-skill",
+    backendId: "pi",
+    scope: contract.ResourceScope.GLOBAL,
+    name: "review-helper",
+    sourceLabel: "review-helper",
+    state: contract.ResourceState.LOADED,
+    enabled: true,
+    canToggle: true,
+    contentAvailable: true,
+    canEdit: true,
+    canDelete: true,
+    entityVersion: { revision: { value: 9007199254740993n }, generation: 0n },
+    approvedRevision: `sha256:${"a".repeat(64)}`
+  };
+  const session = roundTrip(contract.SkillSessionSchema, {
+    sessionId: "skill_session_0123456789abcdef0123456789abcdef",
+    skill: descriptor,
+    observedRevision: `sha256:${"b".repeat(64)}`,
+    dirty: true,
+    baselineAvailable: true,
+    diff: { available: true, changes: [{ key: "SKILL.md", kind: contract.SkillDiffChangeKind.MODIFIED, unifiedDiff: "-old\n+new\n" }] }
+  });
+  assert.equal(session.skill.entityVersion.revision.value, 9007199254740993n);
+  assert.equal(fieldNames(contract.SkillSessionSchema).has("files"), false);
+  const listing = roundTrip(contract.ListSkillFilesResponseSchema, {
+    files: [{ key: "references/guide.md", name: "guide.md", kind: contract.SkillFileKind.FILE, size: 42n, editable: true }],
+    page: { totalSize: 1n }
+  });
+  assert.equal(listing.files[0].key, "references/guide.md");
+
+  const apply = roundTrip(contract.OperationMutationSchema, {
+    payload: { case: "applySkillDraft", value: { draftId: "skill_draft_0123456789abcdef0123456789abcdef" } }
+  });
+  const toggle = roundTrip(contract.OperationMutationSchema, {
+    payload: { case: "setSkillEnabled", value: {
+      skillId: descriptor.skillId,
+      expectedResourceRevision: descriptor.entityVersion.revision,
+      enabled: false
+    } }
+  });
+  const remove = roundTrip(contract.OperationMutationSchema, {
+    payload: { case: "deleteSkill", value: { sessionId: session.sessionId, confirmation: descriptor.name } }
+  });
+  assert.equal(apply.payload.case, "applySkillDraft");
+  assert.equal(toggle.payload.value.expectedResourceRevision.value, 9007199254740993n);
+  assert.equal(remove.payload.value.confirmation, descriptor.name);
+});
+
+test("Skill market contracts preserve exact source, install, and durable sync authority without leaking service paths", () => {
+  const methods = methodNames(contract.SkillService);
+  for (const name of [
+    "getSkillMarketGitPreflight", "listSkillMarketSources", "listSkillMarketCatalog", "getSkillMarketEntry",
+    "openSkillMarketPreview", "listSkillMarketPreviewFiles", "readSkillMarketPreviewFile", "closeSkillMarketPreview",
+    "createSkillMarketInstallPlan", "getSkillMarketInstallPlan", "closeSkillMarketInstallPlan",
+    "listSkillMarketSyncPolicies", "listSkillMarketSyncJobs", "getSkillMarketSyncJob"
+  ]) assert.equal(methods.has(name), true, name);
+
+  assertNoFields([
+    contract.SkillMarketSourceDescriptorSchema,
+    contract.SkillMarketEntrySchema,
+    contract.SkillMarketPreviewSchema,
+    contract.SkillMarketPreviewFileSchema,
+    contract.SkillMarketInstallPlanSchema,
+    contract.SkillMarketInstallPreviewSchema,
+    contract.SkillMarketCurrentResourceSchema,
+    contract.SkillMarketSyncPolicySchema,
+    contract.SkillMarketSyncJobSchema,
+    contract.ListSkillMarketSourcesResponseSchema,
+    contract.ListSkillMarketCatalogResponseSchema,
+    contract.OpenSkillMarketPreviewResponseSchema,
+    contract.CreateSkillMarketInstallPlanResponseSchema
+  ], [
+    "path", "server_path", "absolute_path", "source_path", "archive_path", "cache_root",
+    "generation", "generation_path", "candidate_path", "workspace_root", "credential", "credential_value"
+  ]);
+
+  const identity = {
+    sourceId: "skill_market_source_0123456789abcdef0123456789abcdef",
+    sourceRevision: { value: 9007199254740993n },
+    entryId: "skill_market_entry_0123456789abcdef0123456789abcdef",
+    entryRevision: { value: 9007199254740995n },
+    contentRevision: `sha256:${"a".repeat(64)}`
+  };
+  const entry = roundTrip(contract.SkillMarketEntrySchema, {
+    identity,
+    slug: "writer",
+    name: "Writer",
+    description: "Writing helper",
+    category: "Writing",
+    tags: ["writing"],
+    version: "1.2.3",
+    downloads: 42n,
+    trendScore: 3.5,
+    archiveBytes: 1024n,
+    sourceName: "team-skills",
+    sourceState: contract.SkillMarketSourceState.READY
+  });
+  assert.equal(entry.identity.sourceRevision.value, 9007199254740993n);
+  assert.equal(entry.identity.entryRevision.value, 9007199254740995n);
+
+  const globalTarget = roundTrip(contract.SkillMarketInstallTargetSchema, {
+    backendId: "pi",
+    scope: contract.ResourceScope.GLOBAL
+  });
+  assert.equal(globalTarget.targetId, undefined);
+  assert.equal(globalTarget.relativeParent, undefined);
+  const customTarget = roundTrip(contract.SkillMarketInstallTargetSchema, {
+    backendId: "pi",
+    scope: contract.ResourceScope.PROJECT,
+    targetId: "target-a",
+    relativeParent: ".joko/skills"
+  });
+  assert.equal(customTarget.relativeParent, ".joko/skills");
+
+  const mutations = [
+    { case: "addSkillMarketSource", value: { source: { kind: { case: "local", value: { serverPath: "D:/selected/skills" } } }, expectedCatalogRevision: { value: 1n } } },
+    { case: "refreshSkillMarketSource", value: { sourceId: identity.sourceId, expectedRevision: identity.sourceRevision } },
+    { case: "removeSkillMarketSource", value: { sourceId: identity.sourceId, expectedRevision: identity.sourceRevision } },
+    { case: "installSkillMarketPlan", value: { planId: "skill_market_install_0123456789abcdef0123456789abcdef", expectedCandidateRevision: identity.contentRevision, confirmReplacement: true } },
+    { case: "enableSkillMarketSync", value: { resourceId: "resource-skill", expectedResourceRevision: { value: 7n }, target: customTarget } },
+    { case: "disableSkillMarketSync", value: { resourceId: "resource-skill", expectedPolicyRevision: { value: 8n } } },
+    { case: "enqueueSkillMarketSync", value: { resourceId: "resource-skill", expectedPolicyRevision: { value: 8n } } },
+    { case: "cancelSkillMarketSync", value: { jobId: "skill_sync_0123456789abcdef0123456789abcdef", expectedRevision: { value: 9n } } },
+    { case: "retrySkillMarketSync", value: { jobId: "skill_sync_0123456789abcdef0123456789abcdef", expectedRevision: { value: 10n } } }
+  ];
+  for (const payload of mutations) {
+    const decoded = roundTrip(contract.OperationMutationSchema, { payload });
+    assert.equal(decoded.payload.case, payload.case);
   }
 });
 
@@ -402,7 +686,14 @@ test("public enum wire numbers remain stable", () => {
     [contract.EntityKind, { DEVICE_CONTROL_RELATION: 23 }],
     [contract.GitDiffSource, { UNSTAGED: 1, STAGED: 2, COMMIT: 3, BRANCH: 4, LAST_TURN: 5, TURN_SET: 6 }],
     [contract.WorkspaceDiffAction, { STAGE: 1, UNSTAGE: 2, REVERT: 3 }],
-    [contract.ResourceAcquisitionKind, { LOCAL: 1, NPM: 2, GIT: 3 }],
+    [contract.ResourceAcquisitionKind, { LOCAL: 1, NPM: 2, GIT: 3, EXTENSION_SOURCE: 4, SKILL_MARKET: 5 }],
+    [contract.SkillMarketSourceKind, { LOCAL: 1, GIT: 2 }],
+    [contract.SkillMarketSort, { TRENDING: 1, DOWNLOADS: 2, UPDATED: 3, CREATED: 4 }],
+    [contract.SkillMarketInstallAction, { INSTALL: 1, UPDATE: 2, REPLACE: 3 }],
+    [contract.SkillMarketSyncJobState, {
+      PENDING_REVALIDATION: 1, RUNNING: 2, CANCELLING: 3, SUCCEEDED: 4,
+      UP_TO_DATE: 5, BLOCKED: 6, FAILED: 7, CANCELLED: 8
+    }],
     [contract.ResourceKind, { THEME: 5 }],
     [contract.ResourceCompatibility, { SUPPORTED: 1, PARTIAL: 2, UNSUPPORTED: 3, UNKNOWN: 4 }],
     [contract.ResourcePackageWarning, { LIFECYCLE_SCRIPTS_DISABLED: 4 }],

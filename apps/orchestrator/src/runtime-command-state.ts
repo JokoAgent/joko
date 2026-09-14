@@ -6,6 +6,7 @@ const MAX_COMMANDS = 4_096;
 const MAX_NAME_LENGTH = 512;
 const MAX_DESCRIPTION_LENGTH = 4_096;
 const MAX_PATH_LENGTH = 4_096;
+const MAX_RESOURCE_ID_LENGTH = 256;
 
 export interface MaterializedRuntimeCommands {
   readonly format: 1;
@@ -75,6 +76,7 @@ export function sameRuntimeCommands(
       command.description === candidate.description &&
       command.source === candidate.source &&
       command.path === candidate.path &&
+      command.resourceId === candidate.resourceId &&
       command.loaded === candidate.loaded;
   });
 }
@@ -92,11 +94,15 @@ function normalizeRuntimeCommand(value: RuntimeCommand, index: number): RuntimeC
   if (typeof value["loaded"] !== "boolean") throw new Error(`Runtime command ${index} has an invalid loaded state.`);
   const description = safeText(value["description"], MAX_DESCRIPTION_LENGTH).trim();
   const path = value["path"] === undefined ? undefined : safeText(value["path"], MAX_PATH_LENGTH).trim();
+  const resourceId = value["resourceId"] === undefined
+    ? undefined
+    : safeText(value["resourceId"], MAX_RESOURCE_ID_LENGTH).trim();
   return {
     name,
     description,
     source,
     ...(path === undefined || path === "" ? {} : { path }),
+    ...(resourceId === undefined || resourceId === "" ? {} : { resourceId }),
     loaded: value["loaded"]
   };
 }
@@ -107,7 +113,7 @@ function safeText(value: unknown, maximum: number): string {
 }
 
 function runtimeCommandIdentity(command: RuntimeCommand): string {
-  return `${command.source}\0${command.name}\0${command.path ?? ""}`;
+  return `${command.source}\0${command.name}\0${command.path ?? ""}\0${command.resourceId ?? ""}`;
 }
 
 function compareRuntimeCommands(left: RuntimeCommand, right: RuntimeCommand): number {

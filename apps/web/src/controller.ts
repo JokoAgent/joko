@@ -46,6 +46,7 @@ import type {
   NativeSessionTreeView,
   NewSessionDraft,
   NewSessionLocalDraft,
+  PendingExtensionUseView,
   SessionMessageSearchCollectionOptions,
   Theme
 } from "./model.js";
@@ -90,7 +91,8 @@ export type AppRoute =
   | { readonly kind: "newSession"; readonly targetId?: string; readonly dialogueBackendId?: string }
   | { readonly kind: "projects"; readonly projectId?: string }
   | { readonly kind: "schedules"; readonly scheduleId?: string }
-  | { readonly kind: "tools" }
+  | { readonly kind: "tools"; readonly extensionId?: string }
+  | { readonly kind: "extensionMainView"; readonly extensionId: string }
   | { readonly kind: "settings" };
 
 export interface BrowserInspectorFocusRequest {
@@ -192,6 +194,9 @@ export interface AppController extends OperationApi {
   readNewSessionDraft(): Promise<NewSessionLocalDraft | undefined>;
   saveNewSessionDraft(draft: NewSessionLocalDraft): Promise<void>;
   clearNewSessionDraft(): Promise<void>;
+  readPendingExtensionUse(): Promise<PendingExtensionUseView | undefined>;
+  savePendingExtensionUse(value: PendingExtensionUseView): Promise<void>;
+  clearPendingExtensionUse(): Promise<void>;
 }
 
 export interface ConnectionSelectionOptions {
@@ -1579,7 +1584,10 @@ export function useAppController(): AppController {
     return {
       readNewSessionDraft: (): Promise<NewSessionLocalDraft | undefined> => requireLocal(draftStore).readNewSessionDraft(scope()),
       saveNewSessionDraft: (draft: NewSessionLocalDraft): Promise<void> => requireLocal(draftStore).saveNewSessionDraft(scope(), draft),
-      clearNewSessionDraft: (): Promise<void> => requireLocal(draftStore).clearNewSessionDraft(scope())
+      clearNewSessionDraft: (): Promise<void> => requireLocal(draftStore).clearNewSessionDraft(scope()),
+      readPendingExtensionUse: (): Promise<PendingExtensionUseView | undefined> => requireLocal(draftStore).readPendingExtensionUse(scope()),
+      savePendingExtensionUse: (value: PendingExtensionUseView): Promise<void> => requireLocal(draftStore).savePendingExtensionUse(scope(), value),
+      clearPendingExtensionUse: (): Promise<void> => requireLocal(draftStore).clearPendingExtensionUse(scope())
     };
   }, [draftStore, newTaskDraftScope, artifactGateway]);
   const readDraft = useCallback<AppController["readDraft"]>((sessionId) => {
@@ -2002,6 +2010,65 @@ export function useAppController(): AppController {
     addResource: (draft) => gateway().addResource(draft),
     setResourceEnabled: (resourceId, enabled) => gateway().setResourceEnabled(resourceId, enabled),
     removeResource: (resourceId) => gateway().removeResource(resourceId),
+    listSkills: (options) => gateway().listSkills(options),
+    getSkillResourceUsageReport: (resourceId, timeZone, signal) =>
+      gateway().getSkillResourceUsageReport(resourceId, timeZone, signal),
+    openSkill: (skillId, expectedRevision, signal) => gateway().openSkill(skillId, expectedRevision, signal),
+    listSkillFiles: (sessionId, parentKey, signal) => gateway().listSkillFiles(sessionId, parentKey, signal),
+    readSkillFile: (sessionId, key, signal) => gateway().readSkillFile(sessionId, key, signal),
+    getSkillDiff: (sessionId, signal) => gateway().getSkillDiff(sessionId, signal),
+    prepareSkillFileEdit: (sessionId, key, expectedFileRevision, content, signal) =>
+      gateway().prepareSkillFileEdit(sessionId, key, expectedFileRevision, content, signal),
+    prepareSkillRename: (sessionId, name, signal) => gateway().prepareSkillRename(sessionId, name, signal),
+    applySkillDraft: (draft, signal) => gateway().applySkillDraft(draft, signal),
+    setSkillEnabled: (skill, enabled, signal) => gateway().setSkillEnabled(skill, enabled, signal),
+    deleteSkill: (session, confirmation, signal) => gateway().deleteSkill(session, confirmation, signal),
+    listSkillRecoveries: (signal) => gateway().listSkillRecoveries(signal),
+    closeSkill: (sessionId, signal) => gateway().closeSkill(sessionId, signal),
+    getSkillMarketGitPreflight: (signal) => gateway().getSkillMarketGitPreflight(signal),
+    listSkillMarketSources: (signal) => gateway().listSkillMarketSources(signal),
+    addSkillMarketSource: (source, expectedCatalogRevision, signal) =>
+      gateway().addSkillMarketSource(source, expectedCatalogRevision, signal),
+    refreshSkillMarketSource: (sourceId, expectedRevision, signal) =>
+      gateway().refreshSkillMarketSource(sourceId, expectedRevision, signal),
+    removeSkillMarketSource: (sourceId, expectedRevision, signal) =>
+      gateway().removeSkillMarketSource(sourceId, expectedRevision, signal),
+    listSkillMarketCatalog: (options) => gateway().listSkillMarketCatalog(options),
+    getSkillMarketEntry: (identity, signal) => gateway().getSkillMarketEntry(identity, signal),
+    openSkillMarketPreview: (identity, signal) => gateway().openSkillMarketPreview(identity, signal),
+    listSkillMarketPreviewFiles: (preview, pageToken, pageSize, signal) =>
+      gateway().listSkillMarketPreviewFiles(preview, pageToken, pageSize, signal),
+    readSkillMarketPreviewFile: (preview, key, signal) => gateway().readSkillMarketPreviewFile(preview, key, signal),
+    closeSkillMarketPreview: (previewId, signal) => gateway().closeSkillMarketPreview(previewId, signal),
+    createSkillMarketInstallPlan: (identity, target, signal) =>
+      gateway().createSkillMarketInstallPlan(identity, target, signal),
+    getSkillMarketInstallPlan: (planId, signal) => gateway().getSkillMarketInstallPlan(planId, signal),
+    closeSkillMarketInstallPlan: (planId, signal) => gateway().closeSkillMarketInstallPlan(planId, signal),
+    installSkillMarketPlan: (plan, confirmReplacement, signal) =>
+      gateway().installSkillMarketPlan(plan, confirmReplacement, signal),
+    listSkillMarketSyncPolicies: (signal) => gateway().listSkillMarketSyncPolicies(signal),
+    listSkillMarketSyncJobs: (resourceId, signal) => gateway().listSkillMarketSyncJobs(resourceId, signal),
+    getSkillMarketSyncJob: (jobId, signal) => gateway().getSkillMarketSyncJob(jobId, signal),
+    enableSkillMarketSync: (resourceId, expectedResourceRevision, target, signal) =>
+      gateway().enableSkillMarketSync(resourceId, expectedResourceRevision, target, signal),
+    disableSkillMarketSync: (policy, signal) => gateway().disableSkillMarketSync(policy, signal),
+    enqueueSkillMarketSync: (policy, signal) => gateway().enqueueSkillMarketSync(policy, signal),
+    cancelSkillMarketSync: (job, signal) => gateway().cancelSkillMarketSync(job, signal),
+    retrySkillMarketSync: (job, signal) => gateway().retrySkillMarketSync(job, signal),
+    getSkillPublicationPreview: (resourceId, expectedResourceRevision, sourceId, expectedSourceRevision, slug, signal) =>
+      gateway().getSkillPublicationPreview(resourceId, expectedResourceRevision, sourceId, expectedSourceRevision, slug, signal),
+    listSkillPublicationJobs: (resourceId, signal) => gateway().listSkillPublicationJobs(resourceId, signal),
+    getSkillPublicationJob: (jobId, signal) => gateway().getSkillPublicationJob(jobId, signal),
+    getCollaborationDirectory: (signal) => gateway().getCollaborationDirectory(signal),
+    createCollaborationScope: (kind, name, expectedCatalogRevision, signal) =>
+      gateway().createCollaborationScope(kind, name, expectedCatalogRevision, signal),
+    updateCollaborationScope: (scope, name, signal) => gateway().updateCollaborationScope(scope, name, signal),
+    deleteCollaborationScope: (scope, signal) => gateway().deleteCollaborationScope(scope, signal),
+    updateSkillMarketAccess: (entry, collaborationRevision, selection, signal) =>
+      gateway().updateSkillMarketAccess(entry, collaborationRevision, selection, signal),
+    startSkillPublication: (preview, metadata, access, signal) => gateway().startSkillPublication(preview, metadata, access, signal),
+    cancelSkillPublication: (job, signal) => gateway().cancelSkillPublication(job, signal),
+    retrySkillPublication: (job, signal) => gateway().retrySkillPublication(job, signal),
     listCommands: (sessionId) => gateway().listCommands(sessionId),
     listSessionResources: (sessionId, signal) => gateway().listSessionResources(sessionId, signal),
     listRuntimeProcesses: (backendId, signal) => gateway().listRuntimeProcesses(backendId, signal),
@@ -2016,6 +2083,70 @@ export function useAppController(): AppController {
       gateway().resetModelPriceOverride(backendId, providerId, modelId, signal),
     terminateRuntimeProcess: (process) => gateway().terminateRuntimeProcess(process),
     listRuntimeTools: (sessionId) => gateway().listRuntimeTools(sessionId),
+    listExtensions: (options) => gateway().listExtensions(options),
+    getExtension: (extensionId, sessionId, signal) => gateway().getExtension(extensionId, sessionId, signal),
+    openExtensionMainView: (extensionId, expectedRevision, signal) =>
+      gateway().openExtensionMainView(extensionId, expectedRevision, signal),
+    getExtensionMainViewSurface: (surfaceId, signal) => gateway().getExtensionMainViewSurface(surfaceId, signal),
+    closeExtensionMainView: (surfaceId, signal) => gateway().closeExtensionMainView(surfaceId, signal),
+    getExtensionLibraryOverview: (extensionId, expectedRevision, signal) =>
+      gateway().getExtensionLibraryOverview(extensionId, expectedRevision, signal),
+    validateExtensionLibraryLocation: (extensionId, expectedRevision, candidate, signal) =>
+      gateway().validateExtensionLibraryLocation(extensionId, expectedRevision, candidate, signal),
+    relocateExtensionLibrary: (extensionId, expectedRevision, destination, signal) =>
+      gateway().relocateExtensionLibrary(extensionId, expectedRevision, destination, signal),
+    rebindExtensionLibrary: (extensionId, expectedRevision, candidate, signal) =>
+      gateway().rebindExtensionLibrary(extensionId, expectedRevision, candidate, signal),
+    unbindExtensionLibrary: (extensionId, expectedRevision, signal) =>
+      gateway().unbindExtensionLibrary(extensionId, expectedRevision, signal),
+    repairExtensionLibraryState: (signal) => gateway().repairExtensionLibraryState(signal),
+    repairExtensionLibraryMetadata: (extensionId, expectedRevision, signal) =>
+      gateway().repairExtensionLibraryMetadata(extensionId, expectedRevision, signal),
+    trashExtensionLibrary: (extensionId, expectedRevision, confirmation, signal) =>
+      gateway().trashExtensionLibrary(extensionId, expectedRevision, confirmation, signal),
+    listExtensionLibraryTrash: (extensionId, signal) => gateway().listExtensionLibraryTrash(extensionId, signal),
+    restoreExtensionLibraryTrash: (trashId, confirmation, destination, signal) =>
+      gateway().restoreExtensionLibraryTrash(trashId, confirmation, destination, signal),
+    purgeExtensionLibraryTrash: (trashId, confirmation, signal) =>
+      gateway().purgeExtensionLibraryTrash(trashId, confirmation, signal),
+    listExtensionLibraryGrace: (extensionId, signal) => gateway().listExtensionLibraryGrace(extensionId, signal),
+    rollbackExtensionLibrary: (extensionId, expectedRevision, graceId, signal) =>
+      gateway().rollbackExtensionLibrary(extensionId, expectedRevision, graceId, signal),
+    purgeExpiredExtensionLibraries: (signal) => gateway().purgeExpiredExtensionLibraries(signal),
+    openExtensionLibrary: (extensionId, expectedRevision, signal) =>
+      gateway().openExtensionLibrary(extensionId, expectedRevision, signal),
+    callExtensionLibrary: (sessionId, call, signal) => gateway().callExtensionLibrary(sessionId, call, signal),
+    closeExtensionLibrary: (sessionId, signal) => gateway().closeExtensionLibrary(sessionId, signal),
+    getExtensionPackagePreview: (extensionId, expectedRevision, backendId, signal) =>
+      gateway().getExtensionPackagePreview(extensionId, expectedRevision, backendId, signal),
+    adoptExtensionPackage: (preview, allowSourceReplacement, signal) =>
+      gateway().adoptExtensionPackage(preview, allowSourceReplacement, signal),
+    removeExtensionPackage: (extensionId, expectedRevision, signal) =>
+      gateway().removeExtensionPackage(extensionId, expectedRevision, signal),
+    getExtensionPackageExportPreview: (extensionId, expectedRevision, signal) =>
+      gateway().getExtensionPackageExportPreview(extensionId, expectedRevision, signal),
+    listExtensionPackageExports: (extensionId, signal) => gateway().listExtensionPackageExports(extensionId, signal),
+    getExtensionPackageExport: (exportId, signal) => gateway().getExtensionPackageExport(exportId, signal),
+    startExtensionPackageExport: (preview, signal) => gateway().startExtensionPackageExport(preview, signal),
+    cancelExtensionPackageExport: (exportId, expectedRevision, signal) =>
+      gateway().cancelExtensionPackageExport(exportId, expectedRevision, signal),
+    getExtensionSourceGitPreflight: (signal) => gateway().getExtensionSourceGitPreflight(signal),
+    listExtensionSources: (signal) => gateway().listExtensionSources(signal),
+    addExtensionSource: (source, expectedCatalogRevision) => gateway().addExtensionSource(source, expectedCatalogRevision),
+    refreshExtensionSource: (sourceId, expectedRevision) => gateway().refreshExtensionSource(sourceId, expectedRevision),
+    removeExtensionSource: (sourceId, expectedRevision) => gateway().removeExtensionSource(sourceId, expectedRevision),
+    setExtensionEnabled: (extensionId, enabled, expectedRevision) => gateway().setExtensionEnabled(extensionId, enabled, expectedRevision),
+    setExtensionSidebarVisible: (extensionId, visible, expectedRevision) => gateway().setExtensionSidebarVisible(extensionId, visible, expectedRevision),
+    beginExtensionSetup: (extensionId, expectedRevision) => gateway().beginExtensionSetup(extensionId, expectedRevision),
+    submitExtensionSetupInteraction: (extensionId, attemptId, fieldId, value, expectedRevision) =>
+      gateway().submitExtensionSetupInteraction(extensionId, attemptId, fieldId, value, expectedRevision),
+    saveExtensionSetupCredential: (extensionId, attemptId, fieldId, kind, secret, expectedRevision, signal) =>
+      gateway().saveExtensionSetupCredential(extensionId, attemptId, fieldId, kind, secret, expectedRevision, signal),
+    completeExtensionSetup: (extensionId, attemptId, expectedRevision) =>
+      gateway().completeExtensionSetup(extensionId, attemptId, expectedRevision),
+    cancelExtensionSetup: (extensionId, attemptId, expectedRevision) =>
+      gateway().cancelExtensionSetup(extensionId, attemptId, expectedRevision),
+    revokeExtensionSetup: (extensionId, expectedRevision) => gateway().revokeExtensionSetup(extensionId, expectedRevision),
     listBackgroundTasks: (sessionId) => gateway().listBackgroundTasks(sessionId),
     cancelBackgroundTask: (sessionId, backgroundTaskId) => gateway().cancelBackgroundTask(sessionId, backgroundTaskId),
     listSubagentRuns: (sessionId, state, pageToken, pageSize) => gateway().listSubagentRuns(sessionId, state, pageToken, pageSize),
@@ -2756,7 +2887,16 @@ export function routeFromHash(hash: string): AppRoute {
     };
   }
   if (parts[0] === "projects") return { kind: "projects", ...(parts[1] === undefined ? {} : { projectId: parts[1] }) };
-  if (parts[0] === "tools") return { kind: "tools" };
+  if (parts[0] === "tools") {
+    const extensionId = query.get("extension")?.trim();
+    return {
+      kind: "tools",
+      ...(extensionId !== undefined && /^extension_[a-f0-9]{32}$/u.test(extensionId) ? { extensionId } : {})
+    };
+  }
+  if (parts[0] === "extensions" && parts[1] !== undefined && /^extension_[a-f0-9]{32}$/u.test(parts[1])) {
+    return { kind: "extensionMainView", extensionId: parts[1] };
+  }
   if (parts[0] === "settings") return { kind: "settings" };
   if (parts[0] === "tasks" && parts[1] === "new") {
     const targetId = query.get("target")?.trim();
@@ -2811,6 +2951,12 @@ export function appRouteHash(route: AppRoute): string {
     if (route.scheduleId !== undefined) query.set("focus", route.scheduleId);
     return `#/schedules${query.size === 0 ? "" : `?${query.toString()}`}`;
   }
+  if (route.kind === "tools") {
+    const query = new URLSearchParams();
+    if (route.extensionId !== undefined) query.set("extension", route.extensionId);
+    return `#/tools${query.size === 0 ? "" : `?${query.toString()}`}`;
+  }
+  if (route.kind === "extensionMainView") return `#/extensions/${encodeURIComponent(route.extensionId)}`;
   return `#/${route.kind}`;
 }
 

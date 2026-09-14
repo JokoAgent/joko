@@ -10,7 +10,8 @@ export const SCHEMA_VERSION = 1;
 // DDL: changing one must reject an existing development database for rebuild.
 const DURABLE_JSON_SHAPE_BASELINE = [
   "interaction-question-request:single/multiple.allowOther=required",
-  "interaction-question-decision:text|single(choice|other)|multiple(choiceIds+optionalOtherText)|boolean"
+  "interaction-question-decision:text|single(choice|other)|multiple(choiceIds+optionalOtherText)|boolean",
+  "resource-usage-event:exact-v1"
 ].join("\n");
 
 const SCHEMA_MARKER_SCHEMA = `
@@ -187,6 +188,97 @@ CREATE TABLE events (
         namespace TEXT,
         metadata_json TEXT,
         UNIQUE(session_id, session_sequence)
+      ) STRICT;
+
+CREATE TABLE resource_usage_evidence (
+        event_cursor INTEGER PRIMARY KEY REFERENCES events(global_cursor) ON DELETE CASCADE,
+        occurrence_id TEXT NOT NULL CHECK (
+          length(trim(occurrence_id)) BETWEEN 1 AND 512
+          AND instr(occurrence_id, char(0)) = 0
+        ),
+        session_id TEXT NOT NULL REFERENCES product_sessions(id) ON DELETE CASCADE,
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        backend_id TEXT NOT NULL REFERENCES backends(id) ON DELETE RESTRICT,
+        resource_id TEXT NOT NULL CHECK (length(trim(resource_id)) BETWEEN 1 AND 4096),
+        entity_revision TEXT NOT NULL CHECK (
+          length(entity_revision) BETWEEN 1 AND 20
+          AND entity_revision NOT GLOB '*[^0-9]*'
+          AND substr(entity_revision, 1, 1) <> '0'
+        ),
+        content_revision TEXT NOT NULL CHECK (length(trim(content_revision)) BETWEEN 1 AND 4096),
+        runtime_generation INTEGER NOT NULL CHECK (runtime_generation >= 1),
+        version TEXT CHECK (version IS NULL OR length(trim(version)) BETWEEN 1 AND 256),
+        market_source_id TEXT,
+        market_source_revision TEXT,
+        market_entry_id TEXT,
+        market_entry_revision TEXT,
+        market_entry_content_revision TEXT,
+        installed_content_revision TEXT,
+        source TEXT NOT NULL CHECK (source IN (
+          'structured_resource_mention', 'native_skill_command',
+          'runtime_confirmed_resource_load', 'exact_file_read', 'runtime_tool_call'
+        )),
+        activity TEXT NOT NULL CHECK (activity IN ('strong_active', 'semi_active', 'passive')),
+        action TEXT NOT NULL CHECK (action IN (
+          'exposure', 'read', 'reread', 'tool_succeeded', 'tool_failed',
+          'command_succeeded', 'command_failed'
+        )),
+        occurred_at INTEGER NOT NULL CHECK (occurred_at >= 0),
+        UNIQUE(session_id, source, occurrence_id),
+        CHECK (
+          (market_source_id IS NULL AND market_source_revision IS NULL
+            AND market_entry_id IS NULL AND market_entry_revision IS NULL
+            AND market_entry_content_revision IS NULL AND installed_content_revision IS NULL)
+          OR (length(trim(market_source_id)) BETWEEN 1 AND 512
+            AND length(market_source_revision) BETWEEN 1 AND 20
+            AND market_source_revision NOT GLOB '*[^0-9]*'
+            AND substr(market_source_revision, 1, 1) <> '0'
+            AND length(trim(market_entry_id)) BETWEEN 1 AND 512
+            AND length(market_entry_revision) BETWEEN 1 AND 20
+            AND market_entry_revision NOT GLOB '*[^0-9]*'
+            AND substr(market_entry_revision, 1, 1) <> '0'
+            AND length(trim(market_entry_content_revision)) BETWEEN 1 AND 4096
+            AND length(trim(installed_content_revision)) BETWEEN 1 AND 4096)
+        ),
+        CHECK (
+          (source IN ('structured_resource_mention', 'runtime_confirmed_resource_load')
+            AND activity = 'passive' AND action = 'exposure')
+          OR (source = 'native_skill_command' AND activity = 'strong_active'
+            AND action IN ('command_succeeded', 'command_failed'))
+          OR (source = 'exact_file_read' AND activity = 'semi_active'
+            AND action IN ('read', 'reread'))
+          OR (source = 'runtime_tool_call' AND activity = 'strong_active'
+            AND action IN ('tool_succeeded', 'tool_failed'))
+        )
+      ) STRICT;
+
+CREATE INDEX resource_usage_evidence_resource_time
+      ON resource_usage_evidence(resource_id, occurred_at, event_cursor);
+
+CREATE INDEX resource_usage_evidence_session_source
+      ON resource_usage_evidence(session_id, source, event_cursor);
+
+CREATE TABLE resource_usage_projection_cursors (
+        session_id TEXT NOT NULL REFERENCES product_sessions(id) ON DELETE CASCADE,
+        source TEXT NOT NULL CHECK (source IN (
+          'structured_resource_mention', 'native_skill_command',
+          'runtime_confirmed_resource_load', 'exact_file_read', 'runtime_tool_call'
+        )),
+        last_event_cursor INTEGER NOT NULL CHECK (last_event_cursor >= 0),
+        last_projected_at INTEGER CHECK (last_projected_at IS NULL OR last_projected_at >= 0),
+        failure_count INTEGER NOT NULL CHECK (failure_count >= 0),
+        retry_after INTEGER CHECK (retry_after IS NULL OR retry_after >= 0),
+        error_code TEXT CHECK (
+          error_code IS NULL OR (
+            length(error_code) BETWEEN 1 AND 64
+            AND error_code NOT GLOB '*[^A-Z0-9_]*'
+          )
+        ),
+        PRIMARY KEY(session_id, source),
+        CHECK (
+          (failure_count = 0 AND retry_after IS NULL AND error_code IS NULL)
+          OR (failure_count > 0 AND retry_after IS NOT NULL AND error_code IS NOT NULL)
+        )
       ) STRICT;
 
 CREATE TABLE interactions (

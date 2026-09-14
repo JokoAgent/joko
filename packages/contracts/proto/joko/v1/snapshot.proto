@@ -5,6 +5,7 @@ package joko.v1;
 import "google/protobuf/timestamp.proto";
 import "joko/v1/common.proto";
 import "joko/v1/event.proto";
+import "joko/v1/extension.proto";
 import "joko/v1/interaction.proto";
 import "joko/v1/model.proto";
 import "joko/v1/operation.proto";
@@ -95,6 +96,7 @@ message Snapshot {
   repeated QueueControl queue_controls = 39;
   repeated ReviewRun review_runs = 40;
   repeated DeviceControlRelation device_control_relations = 41;
+  ExtensionCatalogSnapshot extension_catalog = 42;
   // Optional Pi-native authority for Pi-capable scopes. Public fields above
   // remain the backend-neutral source consumed by shared reducers.
   PiSnapshot pi = 100;

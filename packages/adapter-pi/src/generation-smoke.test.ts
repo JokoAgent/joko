@@ -444,13 +444,19 @@ describe("real Pi managed generation smoke", () => {
       const resumed = await adapter.resumeSession(binding, secondContext);
       expect(resumed.binding.opaqueRef).toBe(binding.opaqueRef);
       await expect(adapter.getCommands(secondContext)).resolves.toEqual(
-        expect.arrayContaining([expect.objectContaining({ name: "managed-smoke", source: "extension", loaded: true })])
+        expect.arrayContaining([expect.objectContaining({
+          name: "managed-smoke",
+          source: "extension",
+          resourceId: "smoke-extension",
+          loaded: true
+        })])
       );
       await expect(adapter.getRuntimeTools(secondContext)).resolves.toMatchObject({
         runtimeGeneration: 2,
         observedAt: expect.any(Number),
         tools: expect.arrayContaining([expect.objectContaining({
           name: "managed_lookup",
+          resourceId: "smoke-tool-only-extension",
           active: true,
           description: "Tool-only managed extension used by the runtime catalog smoke test.",
           sourceInfo: expect.objectContaining({ scope: "temporary", origin: "top-level" }),

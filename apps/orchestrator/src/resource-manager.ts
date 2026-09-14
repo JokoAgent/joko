@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants, createReadStream } from "node:fs";
-import { copyFile, lstat, mkdir, open, readdir, realpath, rename, rm, stat } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import type { ProjectSkillCandidate } from "@joko/adapter-pi";
@@ -25,9 +25,11 @@ import {
   type PiPackageRuntimeRequirement,
   type PiPackageWarning
 } from "./pi-package-compatibility.js";
+import { isExtensionLibraryDescriptor, isExtensionMainViewDescriptor } from "./extension-surface-manifest.js";
 
 export type PiResourceKind = "extension" | "skill" | "prompt" | "theme" | "package";
 export type PiResourceScope = "user" | "global" | "project" | "managed";
+export type PiResourceSourceKind = PiPackageSource["kind"] | "extension_source" | "skill_market";
 export type PiResourceState =
   | "discovered"
   | "awaiting_approval"
@@ -48,7 +50,7 @@ export interface PiResourceDescriptor {
   readonly scope: PiResourceScope;
   readonly name: string;
   readonly version?: string;
-  readonly sourceKind: PiPackageSource["kind"];
+  readonly sourceKind: PiResourceSourceKind;
   readonly sourceIdentity: string;
   readonly sourceDisplay: string;
   readonly canonicalPathFingerprint: string;
@@ -70,11 +72,57 @@ export interface PiResourceDescriptor {
   readonly versionNumber: bigint;
   readonly updatedAt: number;
   readonly error?: string;
+  /** Exact package identity read from the installed package manifest. */
+  readonly packageIdentity?: string;
+  /** Provenance for packages adopted from the independent Extension Source owner. */
+  readonly extensionSource?: {
+    readonly sourceId: string;
+    readonly sourceRevision: bigint;
+    readonly packageRelativePath: string;
+    readonly packageContentRevision: string;
+  };
+  /** Path-free provenance for a standalone Skill installed from a user-added market. */
+  readonly skillMarket?: {
+    readonly sourceId: string;
+    readonly sourceRevision: bigint;
+    readonly entryId: string;
+    readonly entryRevision: bigint;
+    readonly entryContentRevision: string;
+    /** Exact Skill tree revision originally adopted from this market entry. */
+    readonly installedContentRevision: string;
+    /** Portable Target-relative parent for project placements; absent for global. */
+    readonly relativeParent?: string;
+  };
 }
 
-interface StoredResource extends Omit<PiResourceDescriptor, "versionNumber"> {
+interface StoredExtensionSourcePackage {
+  readonly kind: "extension_source";
+  readonly sourceId: string;
+  readonly sourceRevision: string;
+  readonly sourceIdentity: string;
+  readonly sourceDisplay: string;
+  readonly packageRelativePath: string;
+  readonly packageContentRevision: string;
+}
+
+interface StoredSkillMarketSource {
+  readonly kind: "skill_market";
+  readonly sourceId: string;
+  readonly sourceRevision: string;
+  readonly entryId: string;
+  readonly entryRevision: string;
+  readonly entryContentRevision: string;
+  readonly installedContentRevision: string;
+  readonly sourceName: string;
+  readonly slug: string;
+  readonly relativeParent?: string;
+}
+
+type StoredResourceSource = PiPackageSource | StoredExtensionSourcePackage | StoredSkillMarketSource;
+
+interface StoredResource extends Omit<PiResourceDescriptor, "versionNumber" | "extensionSource" | "skillMarket"> {
   readonly versionNumber: string;
-  readonly source: PiPackageSource;
+  readonly source: StoredResourceSource;
   readonly canonicalPath?: string;
   readonly workspaceRoot?: string;
   readonly installedPath?: string;
@@ -98,6 +146,42 @@ interface StoredResourceUpdateIntent {
 interface StoredResourceCatalog {
   readonly format: 1;
   readonly records: readonly StoredResource[];
+}
+
+interface ProjectSkillTransactionJournal {
+  readonly format: 1;
+  readonly kind: "replace" | "remove";
+  readonly transactionId: string;
+  readonly backendId: string;
+  readonly targetId: string;
+  readonly workspaceRoot: string;
+  readonly sourcePath: string;
+  readonly destinationPath: string;
+  readonly expectedResourceId: string;
+  readonly expectedVersionNumber: string;
+  readonly expectedRevision: string;
+  readonly committedResourceId: string;
+  readonly committedVersionNumber: string;
+  readonly committedRevision: string;
+}
+
+interface ProjectMarketSkillTransactionJournal {
+  readonly format: 1;
+  readonly kind: "market_install";
+  readonly transactionId: string;
+  readonly backendId: string;
+  readonly targetId: string;
+  readonly workspaceRoot: string;
+  readonly destinationPath: string;
+  readonly resourceId: string;
+  readonly expectedResourceVersion: string | null;
+  readonly expectedResourceRevision: string | null;
+  readonly expectedDestinationRevision: string | null;
+  readonly committedResourceVersion: string;
+  readonly committedRevision: string;
+  readonly sourceId: string;
+  readonly entryId: string;
+  readonly entryContentRevision: string;
 }
 
 export interface PiResourceManagerOptions {
@@ -130,6 +214,84 @@ export interface DiscoverProjectResourcesInput {
   readonly kinds: readonly PiResourceKind[];
 }
 
+export type PiMarketSkillAction = "install" | "update" | "replace";
+
+/** Market-owned, path-free facts supplied while its exact archive lease is held. */
+export interface PiMarketSkillSourceInput {
+  readonly sourceId: string;
+  readonly sourceRevision: bigint;
+  readonly entryId: string;
+  readonly entryRevision: bigint;
+  readonly entryContentRevision: string;
+  readonly sourceName: string;
+  readonly slug: string;
+  readonly version: string;
+  readonly candidateRoot: string;
+}
+
+export interface PiMarketSkillTargetInput {
+  readonly backendId: string;
+  readonly scope: "global" | "project";
+  readonly targetId?: string;
+  /** Omitted means .agents/skills. Otherwise this is a portable Target-relative parent. */
+  readonly relativeParent?: string;
+}
+
+export interface PiMarketSkillDiffChange {
+  readonly key: string;
+  readonly kind: "added" | "modified" | "deleted";
+  readonly binary: boolean;
+  readonly unifiedDiff?: string;
+}
+
+export interface PiMarketSkillPreview {
+  readonly action: PiMarketSkillAction;
+  readonly resourceId: string;
+  readonly backendId: string;
+  readonly targetId?: string;
+  readonly scope: "global" | "project";
+  readonly relativeParent?: string;
+  readonly name: string;
+  readonly availableVersion: string;
+  readonly candidateRevision: string;
+  readonly files: number;
+  readonly bytes: number;
+  readonly currentResource?: {
+    readonly resourceId: string;
+    readonly resourceVersion: bigint;
+    readonly name: string;
+    readonly version?: string;
+    readonly sourceKind: PiResourceSourceKind;
+    readonly sourceDisplay: string;
+    readonly discoveredRevision: string;
+    readonly observedRevision: string;
+    readonly dirty: boolean;
+  };
+  readonly unregisteredDestination: boolean;
+  readonly sourceReplacement: boolean;
+  readonly preservesEnabled: boolean;
+  readonly diffAvailable: boolean;
+  readonly diffReason?: string;
+  readonly changes: readonly PiMarketSkillDiffChange[];
+  readonly diffTruncated: boolean;
+}
+
+export interface PreparePiMarketSkillInput extends PiMarketSkillSourceInput, PiMarketSkillTargetInput {
+  readonly approvedByConnectionId: string;
+  readonly expectedAction: PiMarketSkillAction;
+  readonly expectedResourceId: string;
+  readonly expectedCurrentResourceId?: string;
+  readonly expectedCurrentResourceVersion?: bigint;
+  readonly expectedCurrentObservedRevision?: string;
+  readonly expectedUnregisteredDestination: boolean;
+  readonly allowReplacement: boolean;
+}
+
+export interface PreparedPiMarketSkillMutation {
+  readonly preview: PiMarketSkillPreview;
+  readonly mutation: PreparedPiResourceMutation<PiResourceDescriptor>;
+}
+
 export interface DiscoverPiPackageInput {
   readonly id?: string;
   readonly backendId: string;
@@ -146,6 +308,91 @@ export interface UpdatePiResourceInput {
   readonly source?: PiPackageSource;
   readonly requestedVersion?: string;
   readonly approvedByConnectionId: string;
+}
+
+export type PiExtensionPackageAction = "install" | "update" | "replace";
+
+/** Source-owned package facts passed only while the caller holds its exact generation lease. */
+export interface PiExtensionSourcePackageInput {
+  readonly resourceId: string;
+  readonly backendId: string;
+  readonly sourceId: string;
+  readonly sourceRevision: bigint;
+  readonly sourceIdentity: string;
+  readonly sourceDisplay: string;
+  readonly packageRelativePath: string;
+  readonly packageContentRevision: string;
+  readonly packageName: string;
+  readonly version?: string;
+  readonly bindingName: string;
+  readonly bindingOrdinal: number;
+  readonly packageRoot: string;
+}
+
+export interface PiExtensionPackagePreview {
+  readonly action: PiExtensionPackageAction;
+  readonly resourceId: string;
+  readonly backendId: string;
+  readonly packageName: string;
+  readonly availableVersion?: string;
+  readonly installedVersion?: string;
+  readonly currentResource?: {
+    readonly resourceId: string;
+    readonly resourceVersion: bigint;
+    readonly name: string;
+    readonly sourceDisplay: string;
+  };
+  readonly sourceReplacement: boolean;
+  readonly preservesEnabled: boolean;
+  readonly resourceDetails: readonly PiPackageResourceDetail[];
+  readonly runtimeRequirements: readonly PiPackageRuntimeRequirement[];
+  readonly warnings: readonly PiPackageWarning[];
+  readonly disabledLifecycleScripts: readonly string[];
+  readonly canToggle: boolean;
+}
+
+export interface PreparePiExtensionPackageInput extends PiExtensionSourcePackageInput {
+  readonly approvedByConnectionId: string;
+  readonly expectedAction: PiExtensionPackageAction;
+  readonly expectedCurrentResourceId?: string;
+  readonly expectedCurrentResourceVersion?: bigint;
+  readonly allowSourceReplacement: boolean;
+}
+
+export interface PreparedPiExtensionPackageMutation {
+  readonly preview: PiExtensionPackagePreview;
+  readonly mutation: PreparedPiResourceMutation<PiResourceDescriptor>;
+}
+
+interface InspectedExtensionPackage {
+  readonly inspection: ResourceInspection;
+  readonly compatibility: PiPackageInspection;
+}
+
+interface ExtensionPackagePlan {
+  readonly action: PiExtensionPackageAction;
+  readonly resourceId: string;
+  readonly backendId: string;
+  readonly target?: StoredResource;
+  readonly current?: StoredResource;
+  readonly sourceReplacement: boolean;
+}
+
+interface InspectedMarketSkill {
+  readonly inspection: ResourceInspection;
+  readonly compatibility: PiPackageInspection;
+  readonly workspaceRoot?: string;
+  readonly relativeParent?: string;
+  readonly destination?: string;
+  readonly resourceId: string;
+  readonly current?: StoredResource;
+  readonly currentInspection?: ResourceInspection;
+  readonly unregisteredDestination: boolean;
+  readonly sourceReplacement: boolean;
+  readonly diffAvailable: boolean;
+  readonly diffReason?: string;
+  readonly changes: readonly PiMarketSkillDiffChange[];
+  readonly diffTruncated: boolean;
 }
 
 const preparedPiResourceMutationBrand = Symbol("PreparedPiResourceMutation");
@@ -186,6 +433,88 @@ export interface PiRuntimeResourceSnapshot {
   readonly resources: readonly RuntimeResource[];
 }
 
+export interface PiInstalledPackageLeaseInput {
+  readonly resourceId: string;
+  readonly backendId: string;
+  readonly expectedResourceVersion: bigint;
+  readonly expectedDiscoveredRevision: string;
+  readonly expectedPackageIdentity: string;
+  readonly expectedPackageVersion?: string;
+}
+
+export interface PiInstalledPackageSnapshotEntry {
+  readonly path: string;
+  readonly kind: "directory" | "file";
+  readonly mode: number;
+  readonly size: number;
+}
+
+export interface PiInstalledPackageSnapshot {
+  readonly discoveredRevision: string;
+  readonly files: number;
+  readonly bytes: number;
+  readonly entries: readonly PiInstalledPackageSnapshotEntry[];
+}
+
+export interface PiPackageCandidateInspection {
+  readonly discoveredRevision: string;
+  readonly files: number;
+  readonly bytes: number;
+  readonly compatibility: PiPackageInspection;
+}
+
+/**
+ * Process-local lease over one exact managed package generation. The path is
+ * deliberately kept behind snapshotTo so consumers cannot turn a private
+ * service path into public identity or bypass the Resource tree checks.
+ */
+export interface PiInstalledPackageLease {
+  readonly resource: PiResourceDescriptor;
+  readonly snapshotTo: (destination: string, signal?: AbortSignal) => Promise<PiInstalledPackageSnapshot>;
+  readonly assertCurrent: (signal?: AbortSignal) => Promise<void>;
+  readonly release: () => Promise<void>;
+}
+
+export interface PiSkillContentLeaseInput {
+  readonly resourceId: string;
+  readonly expectedResourceVersion: bigint;
+}
+
+export interface PiSkillContentLease {
+  readonly resource: PiResourceDescriptor;
+  /** Revision approved by the Resource owner. */
+  readonly approvedRevision: string;
+  /** Exact revision observed when this lease was acquired. */
+  readonly observedRevision: string;
+  readonly dirty: boolean;
+  readonly snapshotTo: (destination: string, signal?: AbortSignal) => Promise<PiInstalledPackageSnapshot>;
+  readonly assertCurrent: (signal?: AbortSignal) => Promise<void>;
+  readonly release: () => Promise<void>;
+}
+
+export interface PreparePiSkillContentInput {
+  readonly resourceId: string;
+  readonly expectedResourceVersion: bigint;
+  readonly expectedObservedRevision: string;
+  readonly candidateRoot: string;
+  readonly changedByConnectionId: string;
+  readonly name?: string;
+}
+
+export interface PiSkillContentMutationResult {
+  readonly resource: PiResourceDescriptor;
+  /** A project directory rename changes the path-derived Resource identity. */
+  readonly replacedResourceId?: string;
+}
+
+export interface PrepareRemovePiSkillContentInput {
+  readonly resourceId: string;
+  readonly expectedResourceVersion: bigint;
+  readonly expectedObservedRevision: string;
+  /** Empty, private directory owned by the Skill content manager. */
+  readonly recoveryDestination: string;
+}
+
 /** Immutable, path-free text authority captured for one Backend Target runtime. */
 export interface RuntimeTextResourceSeed {
   readonly id: string;
@@ -200,8 +529,19 @@ export interface RuntimeTextResourceSeed {
 }
 
 const MAXIMUM_RUNTIME_TEXT_RESOURCE_BYTES = 256 * 1024;
+const MAXIMUM_MARKET_DIFF_CHANGES = 1_000;
+const MAXIMUM_MARKET_DIFF_TEXT_BYTES = 2 * 1024 * 1024;
+const MAXIMUM_MARKET_UNIFIED_DIFF_BYTES = 2 * 1024 * 1024;
 const RESOURCE_GENERATIONS_DIRECTORY = ".generations";
 const RESOURCE_GENERATION_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const PROJECT_SKILL_TRANSACTION_JOURNALS_DIRECTORY = ".skill-transactions";
+const PROJECT_MARKET_SKILL_TRANSACTION_JOURNALS_DIRECTORY = ".skill-market-transactions";
+const PROJECT_SKILL_TRANSACTION_DIRECTORY = ".joko-skill-transactions";
+const PROJECT_SKILL_TRANSACTION_JOURNAL_PATTERN = /^([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.json$/u;
+const PROJECT_SKILL_TRANSACTION_TEMP_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.tmp$/u;
+const PROJECT_MARKET_SKILL_TRANSACTION_JOURNAL_PATTERN = /^([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.json$/u;
+const PROJECT_MARKET_SKILL_TRANSACTION_TEMP_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.tmp$/u;
+const MAXIMUM_PROJECT_SKILL_TRANSACTION_JOURNAL_BYTES = 32 * 1024;
 const MISSING_INSTALLED_RESOURCE_ERROR = "Installed resource payload is missing.";
 
 export interface PiResourceLoadObservation {
@@ -226,6 +566,8 @@ export class PiResourceManager {
   readonly #acquisition: PiPackageAcquisition;
   readonly #records = new Map<string, StoredResource>();
   readonly #preparedMutations = new WeakMap<object, PreparedCatalogMutation<unknown>>();
+  readonly #installedGenerationLeases = new Map<string, number>();
+  readonly #retiredInstalledGenerations = new Map<string, { readonly record: StoredResource; readonly generation: string }>();
   #initialized = false;
   #tail: Promise<void> = Promise.resolve();
 
@@ -238,7 +580,7 @@ export class PiResourceManager {
     this.#scopeId = options.scopeId ?? "orchestrator";
     this.#now = options.now ?? Date.now;
     this.#maximumFiles = options.maximumFiles ?? 10_000;
-    this.#maximumBytes = options.maximumBytes ?? 256 * 1024 * 1024;
+    this.#maximumBytes = options.maximumBytes ?? 500 * 1024 * 1024;
     this.#acquisition = options.acquisition ?? new DefaultPiPackageAcquisition();
     if (!Number.isSafeInteger(this.#maximumFiles) || this.#maximumFiles < 1) throw new RangeError("Resource file limit is invalid.");
     if (!Number.isSafeInteger(this.#maximumBytes) || this.#maximumBytes < 1) throw new RangeError("Resource byte limit is invalid.");
@@ -248,8 +590,8 @@ export class PiResourceManager {
     if (this.#initialized) return;
     await mkdir(this.#managedRoot, { recursive: true, mode: 0o700 });
     await assertCanonicalDirectory(this.#managedRoot, "Managed resource root");
-    await Promise.all(["extensions", "skills", "prompts", "themes", "packages", ".staging"].map((name) => mkdir(join(this.#managedRoot, name), { recursive: true, mode: 0o700 })));
-    for (const name of ["extensions", "skills", "prompts", "themes", "packages", ".staging"]) {
+    await Promise.all(["extensions", "skills", "prompts", "themes", "packages", ".staging", PROJECT_SKILL_TRANSACTION_JOURNALS_DIRECTORY, PROJECT_MARKET_SKILL_TRANSACTION_JOURNALS_DIRECTORY].map((name) => mkdir(join(this.#managedRoot, name), { recursive: true, mode: 0o700 })));
+    for (const name of ["extensions", "skills", "prompts", "themes", "packages", ".staging", PROJECT_SKILL_TRANSACTION_JOURNALS_DIRECTORY, PROJECT_MARKET_SKILL_TRANSACTION_JOURNALS_DIRECTORY]) {
       await assertContainedRegularDirectory(this.#managedRoot, join(this.#managedRoot, name), `Managed resource ${name} directory`);
     }
     const setting = this.#store.findSetting<StoredResourceCatalog>("service", this.#scopeId, "pi_resource_catalog");
@@ -261,6 +603,8 @@ export class PiResourceManager {
         this.#records.set(record.id, record);
       }
     }
+    await this.#recoverProjectSkillTransactions();
+    await this.#recoverProjectMarketSkillTransactions();
     const recoveryChanged = await this.#recoverOrphanedFilesystemState();
     let compatibilityChanged = false;
     for (const [id, record] of this.#records) {
@@ -293,6 +637,326 @@ export class PiResourceManager {
   get(resourceId: string): PiResourceDescriptor {
     this.#assertInitialized();
     return publicResource(this.#require(resourceId));
+  }
+
+  get maximumFiles(): number {
+    return this.#maximumFiles;
+  }
+
+  get maximumBytes(): number {
+    return this.#maximumBytes;
+  }
+
+  async acquireInstalledPackage(input: PiInstalledPackageLeaseInput): Promise<PiInstalledPackageLease> {
+    this.#assertInitialized();
+    const resourceId = nonBlank(input.resourceId, "Resource ID");
+    const backendId = nonBlank(input.backendId, "Backend ID");
+    const expectedRevision = normalizedContentRevision(input.expectedDiscoveredRevision, "Resource discovered revision");
+    const expectedIdentity = boundedPackageIdentity(input.expectedPackageIdentity);
+    const expectedVersion = input.expectedPackageVersion === undefined
+      ? undefined
+      : boundedVersion(input.expectedPackageVersion);
+    return this.#mutate(async () => {
+      const record = this.#require(resourceId);
+      this.#assertInstalledPackageLeaseAuthority(record, {
+        backendId,
+        expectedResourceVersion: input.expectedResourceVersion,
+        expectedDiscoveredRevision: expectedRevision,
+        expectedPackageIdentity: expectedIdentity,
+        ...(expectedVersion === undefined ? {} : { expectedPackageVersion: expectedVersion })
+      });
+      await this.#assertInstalledSafe(record);
+      const generation = installedGenerationContainer(this.#managedRoot, record);
+      const generationKey = pathIdentity(generation);
+      this.#installedGenerationLeases.set(generationKey, (this.#installedGenerationLeases.get(generationKey) ?? 0) + 1);
+      const resource = publicResource(record);
+      let released = false;
+      let releaseRequested = false;
+      let releasePromise: Promise<void> | undefined;
+      const assertLeaseOpen = (): void => {
+        if (releaseRequested) throw new Error("Installed package lease has been released.");
+      };
+      return {
+        resource,
+        snapshotTo: async (destination, signal) => {
+          assertLeaseOpen();
+          signal?.throwIfAborted();
+          await this.#assertInstalledPackageLeaseCurrent(record, signal);
+          const snapshot = await snapshotInstalledPackageTree(record.installedPath!, destination, this.#maximumFiles, this.#maximumBytes, signal);
+          if (snapshot.discoveredRevision !== record.discoveredRevision) {
+            throw new Error("Installed package content changed while it was being snapshotted.");
+          }
+          await this.#assertInstalledPackageLeaseCurrent(record, signal);
+          return snapshot;
+        },
+        assertCurrent: async (signal) => {
+          assertLeaseOpen();
+          await this.#assertInstalledPackageLeaseCurrent(record, signal);
+        },
+        release: async () => {
+          if (released) return;
+          releaseRequested = true;
+          releasePromise ??= this.#releaseInstalledPackageGeneration(generationKey).then(
+            () => { released = true; },
+            (error: unknown) => {
+              releasePromise = undefined;
+              throw error;
+            }
+          );
+          await releasePromise;
+        }
+      };
+    });
+  }
+
+  /**
+   * Acquire path-private authority over one standalone Skill. Project content
+   * may be externally dirty; the lease records that exact observed tree while
+   * keeping the approved Resource revision separate.
+   */
+  async acquireSkillContent(input: PiSkillContentLeaseInput): Promise<PiSkillContentLease> {
+    this.#assertInitialized();
+    const resourceId = nonBlank(input.resourceId, "Resource ID");
+    return this.#mutate(async () => {
+      const record = this.#require(resourceId);
+      this.#assertSkillContentAuthority(record, input.expectedResourceVersion);
+      const root = await this.#skillContentRoot(record);
+      const inspection = await inspectSkillPackage(root, this.#maximumFiles, this.#maximumBytes);
+      if (!samePath(root, inspection.canonicalPath)) throw new Error("Skill content root changed identity.");
+      if (!isDirectProjectResource(record) && inspection.revision !== record.discoveredRevision) {
+        throw new Error("Installed Skill content changed and is fenced.");
+      }
+      const generation = record.installedPath === undefined
+        ? undefined
+        : installedGenerationContainer(this.#managedRoot, record);
+      const generationKey = generation === undefined ? undefined : pathIdentity(generation);
+      if (generationKey !== undefined) {
+        this.#installedGenerationLeases.set(generationKey, (this.#installedGenerationLeases.get(generationKey) ?? 0) + 1);
+      }
+      const resource = publicResource(record);
+      const observedRevision = inspection.revision;
+      let released = false;
+      let releaseRequested = false;
+      let releasePromise: Promise<void> | undefined;
+      const assertLeaseOpen = (): void => {
+        if (releaseRequested) throw new Error("Skill content lease has been released.");
+      };
+      const assertCurrent = async (signal?: AbortSignal): Promise<void> => {
+        assertLeaseOpen();
+        signal?.throwIfAborted();
+        const current = this.#records.get(record.id);
+        if (current !== record) throw new Error("Skill Resource authority changed after the content lease was acquired.");
+        this.#assertSkillContentAuthority(record, input.expectedResourceVersion);
+        const currentRoot = await this.#skillContentRoot(record, signal);
+        const currentInspection = await inspectSkillPackage(currentRoot, this.#maximumFiles, this.#maximumBytes, signal);
+        if (!samePath(currentRoot, currentInspection.canonicalPath) || currentInspection.revision !== observedRevision) {
+          throw new Error("Skill content changed after the content lease was acquired.");
+        }
+      };
+      return {
+        resource,
+        approvedRevision: record.discoveredRevision,
+        observedRevision,
+        dirty: observedRevision !== record.discoveredRevision,
+        snapshotTo: async (destination, signal) => {
+          await assertCurrent(signal);
+          const snapshot = await snapshotInstalledPackageTree(root, destination, this.#maximumFiles, this.#maximumBytes, signal);
+          if (snapshot.discoveredRevision !== observedRevision) {
+            throw new Error("Skill content changed while it was being snapshotted.");
+          }
+          await assertCurrent(signal);
+          return snapshot;
+        },
+        assertCurrent,
+        release: async () => {
+          if (released) return;
+          releaseRequested = true;
+          if (generationKey === undefined) {
+            released = true;
+            return;
+          }
+          releasePromise ??= this.#releaseInstalledPackageGeneration(generationKey).then(
+            () => { released = true; },
+            (error: unknown) => {
+              releasePromise = undefined;
+              throw error;
+            }
+          );
+          await releasePromise;
+        }
+      };
+    });
+  }
+
+  /** Stage an exact Skill snapshot and publish it through Resource authority. */
+  async prepareReplaceSkillContent(
+    input: PreparePiSkillContentInput
+  ): Promise<PreparedPiResourceMutation<PiSkillContentMutationResult>> {
+    this.#assertInitialized();
+    const current = this.#require(nonBlank(input.resourceId, "Resource ID"));
+    this.#assertSkillContentAuthority(current, input.expectedResourceVersion);
+    const expectedObservedRevision = normalizedContentRevision(input.expectedObservedRevision, "Observed Skill revision");
+    const changedByConnectionId = nonBlank(input.changedByConnectionId, "Changing connection ID");
+    const requestedName = input.name === undefined ? current.name : portableSkillName(input.name);
+    const candidateRoot = await canonicalDirectory(input.candidateRoot, "Skill candidate root");
+    const candidateInspection = await inspectSkillPackage(candidateRoot, this.#maximumFiles, this.#maximumBytes);
+    const runtimeVersion = this.#runtimeVersion(current.backendId);
+    const compatibility = await inspectPiResourceCompatibility("skill", candidateRoot, {
+      ...(runtimeVersion === undefined ? {} : { currentRuntimeVersion: runtimeVersion }),
+      contentFingerprint: candidateInspection.revision
+    });
+    if (!compatibility.canToggle) throw new Error("Skill candidate does not contain usable runtime content.");
+
+    if (isDirectProjectResource(current)) {
+      return this.#prepareProjectSkillContentMutation(
+        current,
+        expectedObservedRevision,
+        candidateRoot,
+        candidateInspection,
+        compatibility,
+        requestedName,
+        changedByConnectionId
+      );
+    }
+    if (current.installedPath === undefined) throw new Error("Global Skill content is not installed.");
+    if (expectedObservedRevision !== current.discoveredRevision) throw new Error("Observed Skill revision is stale.");
+    await this.#assertInstalledSafe(current);
+    return this.#prepareManagedSkillContentMutation(
+      current,
+      candidateRoot,
+      candidateInspection,
+      compatibility,
+      requestedName,
+      changedByConnectionId
+    );
+  }
+
+  /**
+   * Prepare physical removal while retaining an exact private recovery copy.
+   * Project content is moved behind a sibling transaction fence before the
+   * Resource record can be committed, so a Store failure can restore it.
+   */
+  async prepareRemoveSkillContent(
+    input: PrepareRemovePiSkillContentInput
+  ): Promise<PreparedPiResourceMutation<PiResourceDescriptor>> {
+    this.#assertInitialized();
+    const current = this.#require(nonBlank(input.resourceId, "Resource ID"));
+    this.#assertSkillContentAuthority(current, input.expectedResourceVersion);
+    const expectedObservedRevision = normalizedContentRevision(input.expectedObservedRevision, "Observed Skill revision");
+    const recoveryDestination = await canonicalDirectory(input.recoveryDestination, "Skill recovery destination");
+    if ((await readdir(recoveryDestination)).length !== 0) throw new Error("Skill recovery destination must be empty.");
+    const sourceRoot = await this.#skillContentRoot(current);
+    const observed = await inspectSkillPackage(sourceRoot, this.#maximumFiles, this.#maximumBytes);
+    if (observed.revision !== expectedObservedRevision) throw new Error("Observed Skill revision is stale.");
+    const recovery = await snapshotInstalledPackageTree(
+      sourceRoot,
+      recoveryDestination,
+      this.#maximumFiles,
+      this.#maximumBytes
+    );
+    if (recovery.discoveredRevision !== expectedObservedRevision) {
+      await rm(recoveryDestination, { recursive: true, force: true }).catch(() => undefined);
+      throw new Error("Skill content changed while its recovery copy was created.");
+    }
+    const { pendingUpdate: _pendingUpdate, ...withoutPendingUpdate } = omitInstalledPath(current);
+    const removed: StoredResource = {
+      ...withoutPendingUpdate,
+      state: "removed",
+      enabled: false,
+      versionNumber: (BigInt(current.versionNumber) + 1n).toString(10),
+      updatedAt: this.#now()
+    };
+
+    if (!isDirectProjectResource(current)) {
+      await this.#assertInstalledSafe(current);
+      return this.#prepareMutation(
+        [{ id: current.id, expected: current, next: removed }],
+        publicResource(removed),
+        undefined,
+        {
+          rollback: () => rm(recoveryDestination, { recursive: true, force: true }),
+          cleanupAfterCommit: () => this.#removeInstalledIncarnation(current)
+        }
+      );
+    }
+
+    const workspaceRoot = this.#assertTrustedProjectTarget(current.backendId, current.targetId, current.workspaceRoot);
+    const targetId = current.targetId!;
+    const parent = dirname(current.canonicalPath);
+    assertWithin(workspaceRoot, parent, "Project Skill parent");
+    const transactionRoot = join(parent, PROJECT_SKILL_TRANSACTION_DIRECTORY);
+    await mkdir(transactionRoot, { recursive: true, mode: 0o700 });
+    await assertContainedRegularDirectory(workspaceRoot, transactionRoot, "Project Skill transaction directory");
+    const transactionId = randomUUID();
+    const journal: ProjectSkillTransactionJournal = {
+      format: 1,
+      kind: "remove",
+      transactionId,
+      backendId: current.backendId,
+      targetId,
+      workspaceRoot,
+      sourcePath: current.canonicalPath,
+      destinationPath: current.canonicalPath,
+      expectedResourceId: current.id,
+      expectedVersionNumber: current.versionNumber,
+      expectedRevision: expectedObservedRevision,
+      committedResourceId: removed.id,
+      committedVersionNumber: removed.versionNumber,
+      committedRevision: removed.discoveredRevision
+    };
+    let journalPath: string | undefined;
+    try {
+      journalPath = await this.#writeProjectSkillTransactionJournal(journal);
+      const beforeMove = await inspectSkillPackage(current.canonicalPath, this.#maximumFiles, this.#maximumBytes);
+      this.#assertTrustedProjectTarget(current.backendId, current.targetId, workspaceRoot);
+      if (beforeMove.revision !== expectedObservedRevision) throw new Error("Project Skill changed before removal.");
+      await rename(current.canonicalPath, join(transactionRoot, `${transactionId}.deleted`));
+      return this.#prepareMutation(
+        [{ id: current.id, expected: current, next: removed }],
+        publicResource(removed),
+        () => this.#assertTrustedProjectTarget(current.backendId, current.targetId, workspaceRoot),
+        {
+          rollback: async () => {
+            await this.#recoverProjectSkillTransaction(journalPath!, journal);
+            await rm(recoveryDestination, { recursive: true, force: true });
+          },
+          cleanupAfterCommit: () => this.#recoverProjectSkillTransaction(journalPath!, journal)
+        }
+      );
+    } catch (error) {
+      if (journalPath !== undefined) {
+        try {
+          await this.#recoverProjectSkillTransaction(journalPath, journal);
+        } catch (recoveryError) {
+          throw new AggregateError([error, recoveryError], "Project Skill removal failed and its durable rollback requires recovery.");
+        }
+      }
+      await rm(recoveryDestination, { recursive: true, force: true }).catch(() => undefined);
+      if (await directoryIsEmpty(transactionRoot)) await rm(transactionRoot, { recursive: true, force: true }).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async inspectPackageCandidate(
+    packageRoot: string,
+    backendId: string,
+    signal?: AbortSignal
+  ): Promise<PiPackageCandidateInspection> {
+    this.#assertInitialized();
+    signal?.throwIfAborted();
+    const inspection = await inspectResource(packageRoot, this.#maximumFiles, this.#maximumBytes, signal);
+    const runtimeVersion = this.#runtimeVersion(nonBlank(backendId, "Backend ID"));
+    const compatibility = await inspectPiResourceCompatibility("package", inspection.canonicalPath, {
+      ...(runtimeVersion === undefined ? {} : { currentRuntimeVersion: runtimeVersion }),
+      contentFingerprint: inspection.revision
+    });
+    signal?.throwIfAborted();
+    return {
+      discoveredRevision: inspection.revision,
+      files: inspection.files,
+      bytes: inspection.bytes,
+      compatibility
+    };
   }
 
   /**
@@ -339,13 +1003,25 @@ export class PiResourceManager {
     });
   }
 
+  /** Discard an inspected mutation and remove only its private/staged candidate. */
+  async discardPreparedMutation<T>(prepared: PreparedPiResourceMutation<T>): Promise<void> {
+    this.#assertInitialized();
+    await this.#mutate(async () => {
+      const internal = this.#preparedMutations.get(prepared as object) as PreparedCatalogMutation<T> | undefined;
+      if (internal === undefined) throw new Error("Prepared resource mutation does not belong to this manager.");
+      if (internal.completed) return;
+      internal.completed = true;
+      await internal.rollbackFilesystem?.();
+    });
+  }
+
   async prepareDiscover(input: DiscoverPiResourceInput): Promise<PreparedPiResourceMutation<PiResourceDescriptor>> {
     this.#assertInitialized();
     validateKind(input.kind);
     validateScope(input.scope);
     const source = normalizePiPackageSource(input.source);
     if (source.kind !== "local") throw new Error("Direct resources require a local acquisition source.");
-    const inspection = await inspectResource(source.path, this.#maximumFiles, this.#maximumBytes);
+    const inspection = await inspectResourceForKind(input.kind, source.path, this.#maximumFiles, this.#maximumBytes);
     const runtimeVersion = this.#runtimeVersion(input.backendId);
     const compatibility = await inspectPiResourceCompatibility(input.kind, inspection.canonicalPath, {
       ...(runtimeVersion === undefined ? {} : { currentRuntimeVersion: runtimeVersion }),
@@ -401,6 +1077,9 @@ export class PiResourceManager {
     const approvalRevision = piPackageSourceApprovalRevision(source);
     const now = this.#now();
     const previous = this.#records.get(id);
+    if (previous?.source.kind === "extension_source" || previous?.source.kind === "skill_market") {
+      throw new Error("Pi resource ID is already reserved by a source-owned Resource.");
+    }
     if (previous !== undefined && (
       previous.backendId !== input.backendId || previous.targetId !== input.targetId ||
       previous.kind !== "package" || previous.scope !== input.scope ||
@@ -505,6 +1184,517 @@ export class PiResourceManager {
     return this.#completePreparedStandalone(await this.prepareDiscoverPackage(input));
   }
 
+  /**
+   * Inspect an Extension Source package without adopting its bytes. The caller
+   * must keep the exact Source generation leased for the duration of this
+   * call; the returned facts are advisory until a later revision-fenced
+   * mutation repeats the inspection.
+   */
+  async previewExtensionPackage(input: PiExtensionSourcePackageInput): Promise<PiExtensionPackagePreview> {
+    this.#assertInitialized();
+    const inspected = await this.#inspectExtensionSourcePackage(input);
+    return publicExtensionPackagePreview(this.#planExtensionPackage(input, inspected), inspected.compatibility);
+  }
+
+  /**
+   * Copy one exact Source-owned package into a Resource-owned candidate and
+   * prepare its catalog adoption. No durable Resource state changes until the
+   * enclosing Operation adopts `mutation`; a failed or stale completion
+   * removes only the candidate and leaves the previous generation intact.
+   */
+  async prepareExtensionPackage(
+    input: PreparePiExtensionPackageInput
+  ): Promise<PreparedPiExtensionPackageMutation> {
+    this.#assertInitialized();
+    const inspected = await this.#inspectExtensionSourcePackage(input);
+    const plan = this.#planExtensionPackage(input, inspected);
+    const preview = publicExtensionPackagePreview(plan, inspected.compatibility);
+    const currentId = preview.currentResource?.resourceId;
+    const currentVersion = preview.currentResource?.resourceVersion;
+    if (
+      preview.action !== input.expectedAction
+      || currentId !== input.expectedCurrentResourceId
+      || currentVersion !== input.expectedCurrentResourceVersion
+    ) {
+      throw new Error("Extension package installation facts changed after confirmation.");
+    }
+    if (preview.sourceReplacement && !input.allowSourceReplacement) {
+      throw new Error("Replacing an installed package from another source requires explicit confirmation.");
+    }
+
+    const source: StoredExtensionSourcePackage = {
+      kind: "extension_source",
+      sourceId: normalizedExtensionSourceId(input.sourceId),
+      sourceRevision: normalizedDecimalRevision(input.sourceRevision, "Extension source revision"),
+      sourceIdentity: nonBlank(input.sourceIdentity, "Extension source identity"),
+      sourceDisplay: nonBlank(input.sourceDisplay, "Extension source display"),
+      packageRelativePath: normalizeExtensionPackagePath(input.packageRelativePath),
+      packageContentRevision: normalizedContentRevision(input.packageContentRevision, "Extension source package revision")
+    };
+    const expectedTarget = plan.target;
+    const replaced = plan.current?.id === input.resourceId ? undefined : plan.current;
+    const ownerSeed: StoredResource = {
+      id: input.resourceId,
+      backendId: nonBlank(input.backendId, "Backend ID"),
+      kind: "package",
+      scope: "managed",
+      name: inspected.compatibility.name,
+      ...(inspected.compatibility.version === undefined ? {} : { version: inspected.compatibility.version }),
+      sourceKind: "extension_source",
+      sourceIdentity: extensionSourcePackageIdentity(source),
+      sourceDisplay: source.sourceDisplay,
+      canonicalPathFingerprint: extensionSourcePackageFingerprint(source),
+      symbolicLinkDetected: false,
+      specialFileDetected: false,
+      discoveredRevision: inspected.inspection.revision,
+      packageIdentity: inspected.compatibility.name,
+      ...compatibilityFields(inspected.compatibility, false),
+      ...(inspected.compatibility.extensionContentFingerprint === undefined
+        ? {}
+        : { extensionApprovedRevision: inspected.compatibility.extensionContentFingerprint }),
+      state: "installed",
+      enabled: false,
+      approvedAt: this.#now(),
+      approvedByConnectionId: nonBlank(input.approvedByConnectionId, "Approving connection ID"),
+      versionNumber: ((expectedTarget === undefined ? 0n : BigInt(expectedTarget.versionNumber)) + 1n).toString(10),
+      updatedAt: this.#now(),
+      source
+    };
+
+    const owner = resourceOwnerPath(this.#managedRoot, ownerSeed);
+    await mkdir(owner, { recursive: true, mode: 0o700 });
+    await assertContainedRegularDirectory(this.#managedRoot, owner, "Managed resource owner directory");
+    const generations = join(owner, RESOURCE_GENERATIONS_DIRECTORY);
+    await mkdir(generations, { recursive: true, mode: 0o700 });
+    await assertContainedRegularDirectory(this.#managedRoot, generations, "Managed resource generations directory");
+    const generation = randomUUID();
+    const candidateContainer = join(generations, generation);
+    const stage = join(this.#managedRoot, ".staging", `resource-${generation}`);
+    await mkdir(stage, { recursive: false, mode: 0o700 });
+    let candidatePublished = false;
+    try {
+      const sourceInspection = await inspectResource(input.packageRoot, this.#maximumFiles, this.#maximumBytes);
+      if (
+        !samePath(sourceInspection.canonicalPath, inspected.inspection.canonicalPath)
+        || sourceInspection.revision !== inspected.inspection.revision
+      ) {
+        throw new Error("Extension source package changed during Resource preparation.");
+      }
+      const payloadName = safePayloadName(inspected.compatibility.name);
+      const stagedPayload = join(stage, payloadName);
+      await mkdir(stagedPayload, { recursive: false, mode: 0o700 });
+      await copyTreeFailClosed(
+        sourceInspection.canonicalPath,
+        sourceInspection.canonicalPath,
+        stagedPayload,
+        { files: 0, bytes: 0, maxFiles: this.#maximumFiles, maxBytes: this.#maximumBytes }
+      );
+      const stagedInspection = await inspectResource(stagedPayload, this.#maximumFiles, this.#maximumBytes);
+      if (stagedInspection.revision !== sourceInspection.revision) {
+        throw new Error("Extension source package changed during staged installation.");
+      }
+      await rename(stage, candidateContainer);
+      candidatePublished = true;
+      const installedPath = join(candidateContainer, payloadName);
+      await assertContainedPath(this.#managedRoot, installedPath, "Installed extension package candidate");
+      const installedInspection = await inspectResource(installedPath, this.#maximumFiles, this.#maximumBytes);
+      if (installedInspection.revision !== source.packageContentRevision) {
+        throw new Error("Installed extension package does not match the approved Source bytes.");
+      }
+      const runtimeVersion = this.#runtimeVersion(input.backendId);
+      const compatibility = await inspectPiResourceCompatibility("package", installedPath, {
+        ...(runtimeVersion === undefined ? {} : { currentRuntimeVersion: runtimeVersion }),
+        contentFingerprint: installedInspection.revision
+      });
+      assertExtensionPackageSelection(input, compatibility);
+      const preservesExplicitDisable = plan.current?.state === "disabled";
+      const preservesEnabled = plan.current?.enabled === true && compatibility.canToggle;
+      const updated: StoredResource = {
+        ...ownerSeed,
+        name: compatibility.name,
+        ...(compatibility.version === undefined ? {} : { version: compatibility.version }),
+        installedPath,
+        discoveredRevision: installedInspection.revision,
+        packageIdentity: compatibility.name,
+        ...compatibilityFields(compatibility, false),
+        ...(compatibility.extensionContentFingerprint === undefined
+          ? {}
+          : { extensionApprovedRevision: compatibility.extensionContentFingerprint }),
+        state: preservesExplicitDisable ? "disabled" : "installed",
+        enabled: preservesEnabled,
+        updatedAt: this.#now()
+      };
+      assertExpectedInstalledLocation(this.#managedRoot, updated);
+      const entries: PreparedCatalogEntry[] = [{ id: updated.id, expected: expectedTarget, next: updated }];
+      if (replaced !== undefined) {
+        const { pendingUpdate: _pendingUpdate, ...withoutPendingUpdate } = omitInstalledPath(replaced);
+        entries.push({
+          id: replaced.id,
+          expected: replaced,
+          next: {
+            ...withoutPendingUpdate,
+            state: "removed",
+            enabled: false,
+            versionNumber: (BigInt(replaced.versionNumber) + 1n).toString(10),
+            updatedAt: this.#now()
+          }
+        });
+      }
+      const mutation = this.#prepareMutation(entries, publicResource(updated), undefined, {
+        rollback: () => this.#removeCandidateGeneration(updated, candidateContainer),
+        cleanupAfterCommit: async () => {
+          if (expectedTarget?.installedPath !== undefined) {
+            await this.#removeInstalledIncarnation(expectedTarget).catch(() => undefined);
+          }
+          if (replaced !== undefined) await this.#removeResourceOwner(replaced).catch(() => undefined);
+        }
+      });
+      return { preview, mutation };
+    } catch (error) {
+      await rm(stage, { recursive: true, force: true }).catch(() => undefined);
+      if (candidatePublished) await this.#removeCandidateGeneration(ownerSeed, candidateContainer).catch(() => undefined);
+      else await this.#pruneResourceOwner(ownerSeed).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  /** Inspect a leased market archive against the exact install slot without changing Resource authority. */
+  async previewMarketSkill(input: PiMarketSkillSourceInput & PiMarketSkillTargetInput): Promise<PiMarketSkillPreview> {
+    this.#assertInitialized();
+    return publicMarketSkillPreview(input, await this.#inspectMarketSkill(input));
+  }
+
+  /**
+   * Publish one exact, already verified market Skill. The candidate remains
+   * path-private; only Source/entry revisions are retained as provenance.
+   */
+  async prepareMarketSkill(input: PreparePiMarketSkillInput): Promise<PreparedPiMarketSkillMutation> {
+    this.#assertInitialized();
+    const inspected = await this.#inspectMarketSkill(input);
+    const preview = publicMarketSkillPreview(input, inspected);
+    if (
+      preview.action !== input.expectedAction
+      || preview.resourceId !== input.expectedResourceId
+      || preview.currentResource?.resourceId !== input.expectedCurrentResourceId
+      || preview.currentResource?.resourceVersion !== input.expectedCurrentResourceVersion
+      || preview.currentResource?.observedRevision !== input.expectedCurrentObservedRevision
+      || preview.unregisteredDestination !== input.expectedUnregisteredDestination
+    ) throw new Error("Skill market installation facts changed after confirmation.");
+    const requiresReplacement = preview.action === "replace"
+      || preview.unregisteredDestination
+      || preview.currentResource?.dirty === true;
+    if (requiresReplacement && !input.allowReplacement) {
+      throw new Error("Replacing existing or locally changed Skill content requires explicit confirmation.");
+    }
+
+    const source = normalizeStoredSkillMarketSource(input, inspected.inspection.revision);
+    const expectedTarget = this.#records.get(inspected.resourceId);
+    const replaced = inspected.current?.id === inspected.resourceId ? undefined : inspected.current;
+    const now = this.#now();
+    const preservesEnabled = inspected.current?.enabled === true && inspected.compatibility.canToggle;
+    const preservesExplicitDisable = inspected.current?.state === "disabled";
+    const base: StoredResource = {
+      id: inspected.resourceId,
+      backendId: nonBlank(input.backendId, "Backend ID"),
+      ...(input.scope === "project" ? { targetId: nonBlank(input.targetId!, "Target ID") } : {}),
+      kind: "skill",
+      scope: input.scope,
+      name: source.slug,
+      version: boundedVersion(input.version),
+      sourceKind: "skill_market",
+      sourceIdentity: skillMarketSourceIdentity(source),
+      sourceDisplay: skillMarketSourceDisplay(source),
+      canonicalPathFingerprint: input.scope === "project"
+        ? pathFingerprint(inspected.destination!)
+        : skillMarketSourceFingerprint(source),
+      symbolicLinkDetected: false,
+      specialFileDetected: false,
+      discoveredRevision: inspected.inspection.revision,
+      ...compatibilityFields(inspected.compatibility, false),
+      state: preservesExplicitDisable ? "disabled" : input.scope === "project" ? "approved" : "installed",
+      enabled: preservesEnabled,
+      approvedAt: now,
+      approvedByConnectionId: nonBlank(input.approvedByConnectionId, "Approving connection ID"),
+      versionNumber: ((expectedTarget === undefined ? 0n : BigInt(expectedTarget.versionNumber)) + 1n).toString(10),
+      updatedAt: now,
+      source,
+      ...(input.scope === "project"
+        ? { workspaceRoot: inspected.workspaceRoot!, canonicalPath: inspected.destination! }
+        : {})
+    };
+    const mutation = input.scope === "global"
+      ? await this.#prepareManagedMarketSkill(base, expectedTarget, replaced, inspected)
+      : await this.#prepareProjectMarketSkill(base, expectedTarget, inspected);
+    return { preview, mutation };
+  }
+
+  async #inspectMarketSkill(input: PiMarketSkillSourceInput & PiMarketSkillTargetInput): Promise<InspectedMarketSkill> {
+    const backendId = nonBlank(input.backendId, "Backend ID");
+    if (!this.#backendSupportsResourceKind(backendId, "skill")) {
+      throw new Error("Selected Backend does not advertise Skill resources.");
+    }
+    const source = normalizeStoredSkillMarketSource(input);
+    const candidateRoot = await canonicalDirectory(input.candidateRoot, "Skill market candidate");
+    const inspection = await inspectSkillPackage(candidateRoot, this.#maximumFiles, this.#maximumBytes);
+    const runtimeVersion = this.#runtimeVersion(backendId);
+    const compatibility = await inspectPiResourceCompatibility("skill", candidateRoot, {
+      ...(runtimeVersion === undefined ? {} : { currentRuntimeVersion: runtimeVersion }),
+      contentFingerprint: inspection.revision
+    });
+    if (!compatibility.canToggle) throw new Error("Skill market candidate has no usable Skill content.");
+
+    let workspaceRoot: string | undefined;
+    let relativeParent: string | undefined;
+    let destination: string | undefined;
+    let resourceId: string;
+    let current: StoredResource | undefined;
+    let currentInspection: ResourceInspection | undefined;
+    let unregisteredDestination = false;
+    let beforeRoot: string | undefined;
+    let diffAvailable = true;
+    let diffReason: string | undefined;
+
+    if (input.scope === "global") {
+      if (input.targetId !== undefined || input.relativeParent !== undefined) {
+        throw new Error("Global Skill market targets cannot declare a Target or project parent.");
+      }
+      resourceId = marketGlobalSkillResourceId(backendId, source.slug);
+      const conflicts = [...this.#records.values()].filter((record) =>
+        record.backendId === backendId && record.targetId === undefined && record.scope !== "project"
+        && record.kind === "skill" && record.name === source.slug && record.state !== "removed");
+      if (conflicts.length > 1) throw new Error("Multiple global Skills already claim this install name.");
+      current = conflicts[0];
+      if (current?.installedPath !== undefined) {
+        assertExpectedInstalledLocation(this.#managedRoot, current);
+        await assertContainedPath(this.#managedRoot, current.installedPath, "Existing global Skill");
+        currentInspection = await inspectSkillPackage(current.installedPath, this.#maximumFiles, this.#maximumBytes);
+        beforeRoot = current.installedPath;
+      } else if (current !== undefined) {
+        diffAvailable = false;
+        diffReason = "Existing Skill content is not installed, so its overwrite baseline is unavailable.";
+      }
+    } else if (input.scope === "project") {
+      const targetId = nonBlank(input.targetId!, "Target ID");
+      workspaceRoot = this.#assertTrustedProjectTarget(backendId, targetId);
+      relativeParent = input.relativeParent === undefined
+        ? ".agents/skills"
+        : portableProjectSkillParent(input.relativeParent);
+      const parent = await resolveProjectSkillParent(workspaceRoot, relativeParent, false);
+      destination = join(parent, source.slug);
+      assertWithin(workspaceRoot, destination, "Project Skill market destination");
+      resourceId = stableDiscoveredResourceId(backendId, targetId, "skill", destination);
+      const stored = this.#records.get(resourceId);
+      if (stored !== undefined && stored.state !== "removed") {
+        if (stored.kind !== "skill" || stored.scope !== "project" || stored.backendId !== backendId || stored.targetId !== targetId
+          || !isDirectProjectResource(stored) || !samePath(stored.canonicalPath, destination)) {
+          throw new Error("Project Skill install slot is owned by a different Resource.");
+        }
+        current = stored;
+      }
+      const destinationInfo = await optionalLstat(destination);
+      if (destinationInfo !== undefined) {
+        if (!destinationInfo.isDirectory() || destinationInfo.isSymbolicLink()) {
+          throw new Error("Project Skill install destination is not a regular directory.");
+        }
+        currentInspection = await inspectSkillPackage(destination, this.#maximumFiles, this.#maximumBytes);
+        beforeRoot = destination;
+        unregisteredDestination = current === undefined;
+      } else if (current !== undefined) {
+        throw new Error("Registered project Skill content is missing.");
+      }
+      this.#assertTrustedProjectTarget(backendId, targetId, workspaceRoot);
+    } else {
+      throw new Error("Skill market target scope is invalid.");
+    }
+
+    const sameMarketEntry = current?.source.kind === "skill_market"
+      && current.source.sourceId === source.sourceId
+      && current.source.entryId === source.entryId;
+    const sourceReplacement = current !== undefined && !sameMarketEntry;
+    const action: PiMarketSkillAction = current === undefined && !unregisteredDestination
+      ? "install"
+      : sameMarketEntry && current?.id === resourceId
+        ? "update"
+        : "replace";
+    const diff = diffAvailable
+      ? await compareMarketSkillTrees(beforeRoot, candidateRoot)
+      : { changes: [] as readonly PiMarketSkillDiffChange[], truncated: false };
+    // Every filesystem inspection above yields; repeat durable and Target
+    // authority before publishing advisory facts.
+    if (!this.#backendSupportsResourceKind(backendId, "skill")) throw new Error("Selected Backend Skill capability changed.");
+    if (input.scope === "project") this.#assertTrustedProjectTarget(backendId, input.targetId, workspaceRoot);
+    const liveCurrent = current === undefined ? undefined : this.#records.get(current.id);
+    if (liveCurrent !== current) throw new Error("Skill Resource authority changed during market preview.");
+    return {
+      inspection,
+      compatibility,
+      ...(workspaceRoot === undefined ? {} : { workspaceRoot }),
+      ...(relativeParent === undefined ? {} : { relativeParent }),
+      ...(destination === undefined ? {} : { destination }),
+      resourceId,
+      ...(current === undefined ? {} : { current }),
+      ...(currentInspection === undefined ? {} : { currentInspection }),
+      unregisteredDestination,
+      sourceReplacement,
+      diffAvailable,
+      ...(diffReason === undefined ? {} : { diffReason }),
+      changes: diff.changes,
+      diffTruncated: diff.truncated
+    };
+  }
+
+  async #prepareManagedMarketSkill(
+    seed: StoredResource,
+    expectedTarget: StoredResource | undefined,
+    replaced: StoredResource | undefined,
+    inspected: InspectedMarketSkill
+  ): Promise<PreparedPiResourceMutation<PiResourceDescriptor>> {
+    const owner = resourceOwnerPath(this.#managedRoot, seed);
+    await mkdir(owner, { recursive: true, mode: 0o700 });
+    await assertContainedRegularDirectory(this.#managedRoot, owner, "Managed Skill owner directory");
+    const generations = join(owner, RESOURCE_GENERATIONS_DIRECTORY);
+    await mkdir(generations, { recursive: true, mode: 0o700 });
+    await assertContainedRegularDirectory(this.#managedRoot, generations, "Managed Skill generations directory");
+    const generation = randomUUID();
+    const candidateContainer = join(generations, generation);
+    const stage = join(this.#managedRoot, ".staging", `market-skill-${generation}`);
+    const stagedPayload = join(stage, safePayloadName(seed.name));
+    await mkdir(stage, { recursive: false, mode: 0o700 });
+    let published = false;
+    try {
+      await mkdir(stagedPayload, { recursive: false, mode: 0o700 });
+      await copyTreeFailClosed(inspected.inspection.canonicalPath, inspected.inspection.canonicalPath, stagedPayload, {
+        files: 0,
+        bytes: 0,
+        maxFiles: this.#maximumFiles,
+        maxBytes: this.#maximumBytes
+      });
+      await syncTreeForPublish(stagedPayload);
+      const stagedInspection = await inspectSkillPackage(stagedPayload, this.#maximumFiles, this.#maximumBytes);
+      if (stagedInspection.revision !== inspected.inspection.revision) throw new Error("Skill market candidate changed while it was staged.");
+      await rename(stage, candidateContainer);
+      published = true;
+      const installedPath = join(candidateContainer, safePayloadName(seed.name));
+      const installedInspection = await inspectSkillPackage(installedPath, this.#maximumFiles, this.#maximumBytes);
+      if (installedInspection.revision !== inspected.inspection.revision) throw new Error("Published market Skill differs from its candidate.");
+      const updated: StoredResource = { ...seed, installedPath };
+      assertExpectedInstalledLocation(this.#managedRoot, updated);
+      const entries: PreparedCatalogEntry[] = [{ id: updated.id, expected: expectedTarget, next: updated }];
+      if (replaced !== undefined) {
+        const { pendingUpdate: _pendingUpdate, ...withoutPending } = omitInstalledPath(replaced);
+        entries.push({
+          id: replaced.id,
+          expected: replaced,
+          next: {
+            ...withoutPending,
+            state: "removed",
+            enabled: false,
+            versionNumber: (BigInt(replaced.versionNumber) + 1n).toString(10),
+            updatedAt: this.#now()
+          }
+        });
+      }
+      return this.#prepareMutation(entries, publicResource(updated), undefined, {
+        rollback: () => this.#removeCandidateGeneration(seed, candidateContainer),
+        cleanupAfterCommit: async () => {
+          if (expectedTarget?.installedPath !== undefined) await this.#removeInstalledIncarnation(expectedTarget).catch(() => undefined);
+          if (replaced !== undefined) await this.#removeResourceOwner(replaced).catch(() => undefined);
+        }
+      });
+    } catch (error) {
+      await rm(stage, { recursive: true, force: true }).catch(() => undefined);
+      if (published) await this.#removeCandidateGeneration(seed, candidateContainer).catch(() => undefined);
+      else await this.#pruneResourceOwner(seed).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async #prepareProjectMarketSkill(
+    updated: StoredResource,
+    expected: StoredResource | undefined,
+    inspected: InspectedMarketSkill
+  ): Promise<PreparedPiResourceMutation<PiResourceDescriptor>> {
+    const workspaceRoot = inspected.workspaceRoot!;
+    const destination = inspected.destination!;
+    const parent = await resolveProjectSkillParent(workspaceRoot, inspected.relativeParent!, true);
+    if (!samePath(destination, join(parent, updated.name))) throw new Error("Project Skill destination changed while its parent was prepared.");
+    const transactionRoot = join(parent, PROJECT_SKILL_TRANSACTION_DIRECTORY);
+    await mkdir(transactionRoot, { recursive: true, mode: 0o700 });
+    await assertContainedRegularDirectory(workspaceRoot, transactionRoot, "Project Skill transaction directory");
+    const transactionId = randomUUID();
+    const stage = join(transactionRoot, `${transactionId}.stage`);
+    const backup = join(transactionRoot, `${transactionId}.backup`);
+    const journal: ProjectMarketSkillTransactionJournal = {
+      format: 1,
+      kind: "market_install",
+      transactionId,
+      backendId: updated.backendId,
+      targetId: updated.targetId!,
+      workspaceRoot,
+      destinationPath: destination,
+      resourceId: updated.id,
+      expectedResourceVersion: expected?.versionNumber ?? null,
+      expectedResourceRevision: expected?.discoveredRevision ?? null,
+      expectedDestinationRevision: inspected.currentInspection?.revision ?? null,
+      committedResourceVersion: updated.versionNumber,
+      committedRevision: updated.discoveredRevision,
+      sourceId: (updated.source as StoredSkillMarketSource).sourceId,
+      entryId: (updated.source as StoredSkillMarketSource).entryId,
+      entryContentRevision: (updated.source as StoredSkillMarketSource).entryContentRevision
+    };
+    let journalPath: string | undefined;
+    try {
+      journalPath = await this.#writeProjectMarketSkillTransactionJournal(journal);
+      await mkdir(stage, { recursive: false, mode: 0o700 });
+      await copyTreeFailClosed(inspected.inspection.canonicalPath, inspected.inspection.canonicalPath, stage, {
+        files: 0,
+        bytes: 0,
+        maxFiles: this.#maximumFiles,
+        maxBytes: this.#maximumBytes
+      });
+      await syncTreeForPublish(stage);
+      const stagedInspection = await inspectSkillPackage(stage, this.#maximumFiles, this.#maximumBytes);
+      if (stagedInspection.revision !== inspected.inspection.revision) throw new Error("Skill market candidate changed while it was staged.");
+      const currentDestination = await optionalLstat(destination);
+      if (journal.expectedDestinationRevision === null) {
+        if (currentDestination !== undefined) throw new Error("Project Skill destination became occupied before installation.");
+      } else {
+        if (currentDestination === undefined) throw new Error("Project Skill destination disappeared before replacement.");
+        const observed = await inspectSkillPackage(destination, this.#maximumFiles, this.#maximumBytes);
+        if (observed.revision !== journal.expectedDestinationRevision) throw new Error("Project Skill destination changed before replacement.");
+        await rename(destination, backup);
+      }
+      try {
+        await rename(stage, destination);
+      } catch (error) {
+        if (await optionalLstat(backup) !== undefined && await optionalLstat(destination) === undefined) await rename(backup, destination);
+        throw error;
+      }
+      const published = await inspectSkillPackage(destination, this.#maximumFiles, this.#maximumBytes);
+      if (published.revision !== inspected.inspection.revision) throw new Error("Published project market Skill differs from its candidate.");
+      return this.#prepareMutation(
+        [{ id: updated.id, expected, next: updated }],
+        publicResource(updated),
+        () => this.#assertTrustedProjectTarget(updated.backendId, updated.targetId, workspaceRoot),
+        {
+          rollback: () => this.#recoverProjectMarketSkillTransaction(journalPath!, journal),
+          cleanupAfterCommit: () => this.#recoverProjectMarketSkillTransaction(journalPath!, journal)
+        }
+      );
+    } catch (error) {
+      if (journalPath !== undefined) {
+        try {
+          await this.#recoverProjectMarketSkillTransaction(journalPath, journal);
+        } catch (recoveryError) {
+          throw new AggregateError([error, recoveryError], "Project market Skill publication failed and its durable rollback requires recovery.");
+        }
+      }
+      await rm(stage, { recursive: true, force: true }).catch(() => undefined);
+      if (await directoryIsEmpty(transactionRoot)) await rm(transactionRoot, { recursive: true, force: true }).catch(() => undefined);
+      throw error;
+    }
+  }
+
   /** Discover adapter-native project resources after explicit Target trust. */
   async prepareDiscoverProjectResources(
     input: DiscoverProjectResourcesInput
@@ -525,7 +1715,7 @@ export class PiResourceManager {
     // unsafe or incompatible candidate therefore prevents every catalog write.
     const runtimeVersion = this.#runtimeVersion(backendId);
     const inspected = await Promise.all(candidates.map(async (candidate) => {
-      const inspection = await inspectResource(candidate.sourcePath, this.#maximumFiles, this.#maximumBytes);
+      const inspection = await inspectResourceForKind(candidate.kind, candidate.sourcePath, this.#maximumFiles, this.#maximumBytes);
       const compatibility = await inspectPiResourceCompatibility(candidate.kind, inspection.canonicalPath, {
         ...(runtimeVersion === undefined ? {} : { currentRuntimeVersion: runtimeVersion }),
         contentFingerprint: inspection.revision
@@ -584,11 +1774,13 @@ export class PiResourceManager {
       await this.#assertInstalledSafe(current);
     } else if (current.source.kind === "local") {
       if (current.canonicalPath === undefined) throw new Error("Local resource is missing its canonical source path.");
-      const inspection = await inspectResource(current.canonicalPath, this.#maximumFiles, this.#maximumBytes);
+      const inspection = await inspectResourceForKind(current.kind, current.canonicalPath, this.#maximumFiles, this.#maximumBytes);
       if (current.workspaceRoot !== undefined) assertWithin(current.workspaceRoot, inspection.canonicalPath, "Project resource");
       if (inspection.revision !== discoveredRevision || !samePath(inspection.canonicalPath, current.canonicalPath)) {
         throw new Error("Resource changed after discovery and must be discovered again.");
       }
+    } else if (current.source.kind === "extension_source" || current.source.kind === "skill_market") {
+      throw new Error("Source-owned resource approval must use its exact catalog entry.");
     } else if (current.kind !== "package" || piPackageSourceApprovalRevision(current.source) !== discoveredRevision) {
       throw new Error("Package acquisition source changed after discovery and must be discovered again.");
     }
@@ -636,6 +1828,9 @@ export class PiResourceManager {
     if (!(current.state === "installed" || current.state === "loaded" || current.state === "disabled" || current.state === "update_available")) {
       throw new Error("Only an installed resource can be updated.");
     }
+    if (current.source.kind === "extension_source" || current.source.kind === "skill_market") {
+      throw new Error("Source-owned resources must be updated through their revision-fenced catalog entry.");
+    }
     this.#assertStoredProjectTargetTrusted(current);
     if (input.source !== undefined && input.requestedVersion !== undefined) throw new Error("Typed resource acquisition and requested_version cannot both be set.");
     if (input.source !== undefined && input.source.kind !== "local" && current.kind !== "package") {
@@ -651,7 +1846,7 @@ export class PiResourceManager {
         : pendingUpdate?.source ?? current.source;
     let inspection: ResourceInspection | undefined;
     if (requestedSource.kind === "local") {
-      inspection = await inspectResource(requestedSource.path, this.#maximumFiles, this.#maximumBytes);
+      inspection = await inspectResourceForKind(current.kind, requestedSource.path, this.#maximumFiles, this.#maximumBytes);
       if (current.workspaceRoot !== undefined) assertWithin(current.workspaceRoot, inspection.canonicalPath, "Project resource");
     }
     const requestedIdentity = current.kind === "package"
@@ -693,6 +1888,9 @@ export class PiResourceManager {
       ...(compatibility === undefined
         ? emptyCompatibilityFields()
         : compatibilityFields(compatibility, false)),
+      ...(current.kind === "package" && compatibility !== undefined
+        ? { packageIdentity: compatibility.name }
+        : {}),
       ...(compatibility?.extensionContentFingerprint === undefined
         ? {}
         : { extensionApprovedRevision: compatibility.extensionContentFingerprint }),
@@ -868,7 +2066,7 @@ export class PiResourceManager {
   /** Callback passed directly to PiAdapterOptions.approveProjectSkill. */
   async approveProjectSkill(candidate: ProjectSkillCandidate): Promise<boolean> {
     this.#assertInitialized();
-    const inspection = await inspectResource(candidate.sourcePath, this.#maximumFiles, this.#maximumBytes).catch(() => undefined);
+    const inspection = await inspectSkillPackage(candidate.sourcePath, this.#maximumFiles, this.#maximumBytes).catch(() => undefined);
     if (inspection === undefined) return false;
     for (const record of this.#records.values()) {
       try { this.#assertStoredProjectTargetTrusted(record); } catch { continue; }
@@ -876,7 +2074,7 @@ export class PiResourceManager {
         this.#backendSupportsResourceKind(record.backendId, record.kind) &&
         record.kind === "skill" &&
         record.scope === "project" &&
-        record.source.kind === "local" &&
+        isDirectProjectResource(record) &&
         record.canonicalPath !== undefined &&
         record.enabled &&
         (record.state === "approved" || record.state === "loaded") &&
@@ -929,7 +2127,7 @@ export class PiResourceManager {
         signal.throwIfAborted();
         this.#assertStoredProjectTargetTrusted(record);
         const root = await this.#runtimeTextRoot(record, signal);
-        const before = await inspectResource(root, this.#maximumFiles, this.#maximumBytes, signal);
+        const before = await inspectResourceForKind(record.kind, root, this.#maximumFiles, this.#maximumBytes, signal);
         assertApprovedRuntimeTextInspection(record, root, before);
         const content = await readRuntimeTextContent(
           root,
@@ -941,7 +2139,7 @@ export class PiResourceManager {
         if (totalTextBytes > this.#maximumBytes) {
           throw new Error("Runtime text resource snapshot exceeds the configured byte limit.");
         }
-        const after = await inspectResource(root, this.#maximumFiles, this.#maximumBytes, signal);
+        const after = await inspectResourceForKind(record.kind, root, this.#maximumFiles, this.#maximumBytes, signal);
         assertApprovedRuntimeTextInspection(record, root, after);
         if (before.revision !== after.revision || !samePath(before.canonicalPath, after.canonicalPath)) {
           throw new Error("Runtime text resource changed while its content was read.");
@@ -1042,7 +2240,21 @@ export class PiResourceManager {
         revision: record.discoveredRevision,
         resourceVersion: BigInt(record.versionNumber),
         runtimePath: path,
-        ...(record.version === undefined ? {} : { detail: `version ${record.version}` })
+        ...(record.version === undefined
+          ? {}
+          : { version: record.version, detail: `version ${record.version}` }),
+        ...(record.source.kind === "skill_market"
+          ? {
+              market: {
+                sourceId: record.source.sourceId,
+                sourceRevision: BigInt(record.source.sourceRevision),
+                entryId: record.source.entryId,
+                entryRevision: BigInt(record.source.entryRevision),
+                entryContentRevision: record.source.entryContentRevision,
+                installedContentRevision: record.source.installedContentRevision
+              }
+            }
+          : {})
       });
     }
     return {
@@ -1053,6 +2265,468 @@ export class PiResourceManager {
       packages: paths.package.sort(),
       resources
     };
+  }
+
+  async #writeProjectSkillTransactionJournal(journal: ProjectSkillTransactionJournal): Promise<string> {
+    const validated = this.#validateProjectSkillTransactionJournal(journal, journal.transactionId);
+    const root = join(this.#managedRoot, PROJECT_SKILL_TRANSACTION_JOURNALS_DIRECTORY);
+    const destination = join(root, `${validated.transactionId}.json`);
+    const temporary = join(root, `${validated.transactionId}.tmp`);
+    if (await optionalLstat(destination) !== undefined || await optionalLstat(temporary) !== undefined) {
+      throw new Error("Project Skill transaction journal already exists.");
+    }
+    const handle = await open(temporary, "wx", 0o600);
+    try {
+      await handle.writeFile(`${JSON.stringify(validated)}\n`, "utf8");
+      await handle.sync();
+    } catch (error) {
+      await handle.close().catch(() => undefined);
+      await rm(temporary, { force: true }).catch(() => undefined);
+      throw error;
+    }
+    await handle.close();
+    try {
+      await rename(temporary, destination);
+      return destination;
+    } catch (error) {
+      await rm(temporary, { force: true }).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async #recoverProjectSkillTransactions(): Promise<void> {
+    const root = join(this.#managedRoot, PROJECT_SKILL_TRANSACTION_JOURNALS_DIRECTORY);
+    const entries = await readdir(root, { withFileTypes: true });
+    entries.sort((left, right) => left.name.localeCompare(right.name, "en"));
+    for (const entry of entries) {
+      validateEntryName(entry.name);
+      const path = join(root, entry.name);
+      if (PROJECT_SKILL_TRANSACTION_TEMP_PATTERN.test(entry.name)) {
+        await removeOwnedPath(root, path, "Incomplete project Skill transaction journal");
+        continue;
+      }
+      const match = PROJECT_SKILL_TRANSACTION_JOURNAL_PATTERN.exec(entry.name);
+      if (match === null || !entry.isFile() || entry.isSymbolicLink()) {
+        throw new Error("Project Skill transaction journal directory contains an unsupported current-v1 entry.");
+      }
+      const info = await lstat(path);
+      if (!info.isFile() || info.isSymbolicLink() || info.size < 2 || info.size > MAXIMUM_PROJECT_SKILL_TRANSACTION_JOURNAL_BYTES) {
+        throw new Error("Project Skill transaction journal is malformed.");
+      }
+      await assertContainedPath(root, path, "Project Skill transaction journal");
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(await readFile(path, "utf8"));
+      } catch {
+        throw new Error("Project Skill transaction journal is not valid JSON.");
+      }
+      const journal = this.#validateProjectSkillTransactionJournal(parsed, match[1]!);
+      await this.#recoverProjectSkillTransaction(path, journal);
+    }
+  }
+
+  #validateProjectSkillTransactionJournal(value: unknown, expectedTransactionId: string): ProjectSkillTransactionJournal {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw new Error("Project Skill transaction journal is malformed.");
+    }
+    const record = value as Record<string, unknown>;
+    const keys = [
+      "format", "kind", "transactionId", "backendId", "targetId", "workspaceRoot",
+      "sourcePath", "destinationPath", "expectedResourceId", "expectedVersionNumber",
+      "expectedRevision", "committedResourceId", "committedVersionNumber", "committedRevision"
+    ];
+    if (Object.keys(record).length !== keys.length || keys.some((key) => !(key in record))) {
+      throw new Error("Project Skill transaction journal has unsupported fields.");
+    }
+    const transactionId = requiredJournalString(record, "transactionId");
+    if (record["format"] !== 1 || transactionId !== expectedTransactionId || !RESOURCE_GENERATION_PATTERN.test(transactionId)) {
+      throw new Error("Project Skill transaction journal identity is malformed.");
+    }
+    const kind = record["kind"];
+    if (kind !== "replace" && kind !== "remove") throw new Error("Project Skill transaction kind is malformed.");
+    const backendId = requiredJournalString(record, "backendId");
+    const targetId = requiredJournalString(record, "targetId");
+    const workspaceRoot = normalizedAbsolute(requiredJournalString(record, "workspaceRoot"), "Project Skill transaction workspace");
+    const sourcePath = normalizedAbsolute(requiredJournalString(record, "sourcePath"), "Project Skill transaction source");
+    const destinationPath = normalizedAbsolute(requiredJournalString(record, "destinationPath"), "Project Skill transaction destination");
+    const expectedResourceId = requiredJournalString(record, "expectedResourceId");
+    const committedResourceId = requiredJournalString(record, "committedResourceId");
+    validateResourceId(expectedResourceId);
+    validateResourceId(committedResourceId);
+    const expectedVersionNumber = journalVersion(record, "expectedVersionNumber");
+    const committedVersionNumber = journalVersion(record, "committedVersionNumber");
+    const expectedRevision = normalizedContentRevision(requiredJournalString(record, "expectedRevision"), "Project Skill transaction source revision");
+    const committedRevision = normalizedContentRevision(requiredJournalString(record, "committedRevision"), "Project Skill transaction committed revision");
+    const authority = this.#records.get(expectedResourceId);
+    if (
+      authority === undefined || !isDirectProjectResource(authority) || authority.kind !== "skill"
+      || authority.backendId !== backendId || authority.targetId !== targetId
+      || authority.workspaceRoot === undefined || !samePath(authority.workspaceRoot, workspaceRoot)
+      || !samePath(authority.canonicalPath, sourcePath)
+    ) throw new Error("Project Skill transaction journal does not match durable Resource authority.");
+    assertWithin(workspaceRoot, sourcePath, "Project Skill transaction source");
+    assertWithin(workspaceRoot, destinationPath, "Project Skill transaction destination");
+    if (!samePath(dirname(sourcePath), dirname(destinationPath))) {
+      throw new Error("Project Skill transaction destination must remain beside its source.");
+    }
+    validateEntryName(basename(sourcePath));
+    validateEntryName(basename(destinationPath));
+    if (kind === "remove") {
+      if (
+        !samePath(sourcePath, destinationPath) || committedResourceId !== expectedResourceId
+        || BigInt(committedVersionNumber) !== BigInt(expectedVersionNumber) + 1n
+        || committedRevision !== expectedRevision
+      ) throw new Error("Project Skill removal transaction journal is inconsistent.");
+    } else if (committedResourceId === expectedResourceId) {
+      if (!samePath(sourcePath, destinationPath) || BigInt(committedVersionNumber) !== BigInt(expectedVersionNumber) + 1n) {
+        throw new Error("Project Skill replacement transaction journal is inconsistent.");
+      }
+    } else {
+      if (
+        samePath(sourcePath, destinationPath) || committedVersionNumber !== "1"
+        || committedResourceId !== stableDiscoveredResourceId(backendId, targetId, "skill", destinationPath)
+      ) throw new Error("Project Skill rename transaction journal is inconsistent.");
+      portableSkillName(basename(destinationPath));
+    }
+    return {
+      format: 1,
+      kind,
+      transactionId,
+      backendId,
+      targetId,
+      workspaceRoot,
+      sourcePath,
+      destinationPath,
+      expectedResourceId,
+      expectedVersionNumber,
+      expectedRevision,
+      committedResourceId,
+      committedVersionNumber,
+      committedRevision
+    };
+  }
+
+  async #recoverProjectSkillTransaction(journalPath: string, raw: ProjectSkillTransactionJournal): Promise<void> {
+    const journalsRoot = join(this.#managedRoot, PROJECT_SKILL_TRANSACTION_JOURNALS_DIRECTORY);
+    const expectedJournalPath = join(journalsRoot, `${raw.transactionId}.json`);
+    if (!samePath(journalPath, expectedJournalPath)) throw new Error("Project Skill transaction journal path is invalid.");
+    const journal = this.#validateProjectSkillTransactionJournal(raw, raw.transactionId);
+    const expected = this.#records.get(journal.expectedResourceId)!;
+    const expectedCurrent = expected.versionNumber === journal.expectedVersionNumber
+      && isDirectProjectResource(expected)
+      && samePath(expected.canonicalPath, journal.sourcePath);
+    const committed = this.#records.get(journal.committedResourceId);
+    const committedCurrent = committed !== undefined
+      && isDirectProjectResource(committed)
+      && committed.kind === "skill"
+      && committed.backendId === journal.backendId
+      && committed.targetId === journal.targetId
+      && samePath(committed.canonicalPath, journal.destinationPath)
+      && BigInt(committed.versionNumber) >= BigInt(journal.committedVersionNumber)
+      && (journal.kind !== "remove" || committed.state === "removed");
+    if (expectedCurrent === committedCurrent) {
+      throw new Error("Project Skill transaction cannot be matched to exactly one durable catalog state.");
+    }
+    const transactionRoot = join(dirname(journal.sourcePath), PROJECT_SKILL_TRANSACTION_DIRECTORY);
+    const transactionRootInfo = await optionalLstat(transactionRoot);
+    if (transactionRootInfo !== undefined) {
+      if (!transactionRootInfo.isDirectory() || transactionRootInfo.isSymbolicLink()) {
+        throw new Error("Project Skill transaction directory is not a regular directory.");
+      }
+      await assertContainedRegularDirectory(journal.workspaceRoot, transactionRoot, "Project Skill transaction directory");
+    }
+    if (committedCurrent) await this.#finalizeProjectSkillTransaction(transactionRoot, journal);
+    else await this.#rollbackProjectSkillTransaction(transactionRoot, journal);
+    await removeOwnedPath(journalsRoot, journalPath, "Completed project Skill transaction journal");
+    if (await directoryIsEmpty(transactionRoot)) await rm(transactionRoot, { recursive: true, force: true });
+  }
+
+  async #finalizeProjectSkillTransaction(transactionRoot: string, journal: ProjectSkillTransactionJournal): Promise<void> {
+    if (await optionalLstat(transactionRoot) === undefined) return;
+    if (journal.kind === "replace") {
+      await removeOwnedPath(transactionRoot, join(transactionRoot, `${journal.transactionId}.stage`), "Project Skill transaction stage");
+      await removeOwnedPath(transactionRoot, join(transactionRoot, `${journal.transactionId}.backup`), "Project Skill transaction backup");
+    } else {
+      await removeOwnedPath(transactionRoot, join(transactionRoot, `${journal.transactionId}.deleted`), "Project Skill removal tombstone");
+    }
+  }
+
+  async #rollbackProjectSkillTransaction(transactionRoot: string, journal: ProjectSkillTransactionJournal): Promise<void> {
+    if (journal.kind === "remove") {
+      const tombstone = join(transactionRoot, `${journal.transactionId}.deleted`);
+      if (await optionalLstat(tombstone) !== undefined) {
+        const tombstoneInspection = await inspectSkillPackage(tombstone, this.#maximumFiles, this.#maximumBytes);
+        if (tombstoneInspection.revision !== journal.expectedRevision) throw new Error("Project Skill removal tombstone changed before rollback.");
+        if (await optionalLstat(journal.sourcePath) === undefined) {
+          await rename(tombstone, journal.sourcePath);
+        } else {
+          const sourceInspection = await inspectSkillPackage(journal.sourcePath, this.#maximumFiles, this.#maximumBytes);
+          if (sourceInspection.revision !== journal.expectedRevision) throw new Error("Project Skill removal rollback target is occupied.");
+          await removeOwnedPath(transactionRoot, tombstone, "Project Skill removal duplicate tombstone");
+        }
+      } else if (await optionalLstat(journal.sourcePath) === undefined) {
+        throw new Error("Project Skill removal rollback content is missing.");
+      }
+      return;
+    }
+
+    const stage = join(transactionRoot, `${journal.transactionId}.stage`);
+    const backup = join(transactionRoot, `${journal.transactionId}.backup`);
+    const backupInfo = await optionalLstat(backup);
+    if (backupInfo !== undefined) {
+      const backupInspection = await inspectSkillPackage(backup, this.#maximumFiles, this.#maximumBytes);
+      if (backupInspection.revision !== journal.expectedRevision) throw new Error("Project Skill transaction backup changed before rollback.");
+      if (samePath(journal.sourcePath, journal.destinationPath)) {
+        const sourceInfo = await optionalLstat(journal.sourcePath);
+        if (sourceInfo === undefined) {
+          await rename(backup, journal.sourcePath);
+        } else {
+          const sourceInspection = await inspectSkillPackage(journal.sourcePath, this.#maximumFiles, this.#maximumBytes);
+          if (sourceInspection.revision === journal.committedRevision && journal.committedRevision !== journal.expectedRevision) {
+            await removeOwnedPath(transactionRoot, stage, "Project Skill transaction stage");
+            await rename(journal.sourcePath, stage);
+            await rename(backup, journal.sourcePath);
+          } else if (sourceInspection.revision === journal.expectedRevision) {
+            await removeOwnedPath(transactionRoot, backup, "Project Skill duplicate transaction backup");
+          } else {
+            throw new Error("Project Skill transaction rollback target changed unexpectedly.");
+          }
+        }
+      } else {
+        const destinationInfo = await optionalLstat(journal.destinationPath);
+        if (destinationInfo !== undefined) {
+          const destinationInspection = await inspectSkillPackage(journal.destinationPath, this.#maximumFiles, this.#maximumBytes);
+          if (destinationInspection.revision !== journal.committedRevision) {
+            throw new Error("Renamed project Skill changed before rollback.");
+          }
+          await removeOwnedPath(transactionRoot, stage, "Project Skill transaction stage");
+          await rename(journal.destinationPath, stage);
+        }
+        const sourceInfo = await optionalLstat(journal.sourcePath);
+        if (sourceInfo === undefined) {
+          await rename(backup, journal.sourcePath);
+        } else {
+          const sourceInspection = await inspectSkillPackage(journal.sourcePath, this.#maximumFiles, this.#maximumBytes);
+          if (sourceInspection.revision !== journal.expectedRevision) throw new Error("Project Skill rename rollback target is occupied.");
+          await removeOwnedPath(transactionRoot, backup, "Project Skill duplicate transaction backup");
+        }
+      }
+    } else {
+      if (await optionalLstat(journal.sourcePath) === undefined) {
+        throw new Error("Project Skill transaction rollback content is missing.");
+      }
+      if (!samePath(journal.sourcePath, journal.destinationPath) && await optionalLstat(journal.destinationPath) !== undefined) {
+        throw new Error("Project Skill rename rollback backup is missing.");
+      }
+    }
+    await removeOwnedPath(transactionRoot, stage, "Project Skill transaction stage");
+  }
+
+  async #writeProjectMarketSkillTransactionJournal(journal: ProjectMarketSkillTransactionJournal): Promise<string> {
+    const validated = this.#validateProjectMarketSkillTransactionJournal(journal, journal.transactionId);
+    const root = join(this.#managedRoot, PROJECT_MARKET_SKILL_TRANSACTION_JOURNALS_DIRECTORY);
+    const destination = join(root, `${validated.transactionId}.json`);
+    const temporary = join(root, `${validated.transactionId}.tmp`);
+    if (await optionalLstat(destination) !== undefined || await optionalLstat(temporary) !== undefined) {
+      throw new Error("Project market Skill transaction journal already exists.");
+    }
+    const handle = await open(temporary, "wx", 0o600);
+    try {
+      await handle.writeFile(`${JSON.stringify(validated)}\n`, "utf8");
+      await handle.sync();
+    } catch (error) {
+      await handle.close().catch(() => undefined);
+      await rm(temporary, { force: true }).catch(() => undefined);
+      throw error;
+    }
+    await handle.close();
+    try {
+      await rename(temporary, destination);
+      return destination;
+    } catch (error) {
+      await rm(temporary, { force: true }).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async #recoverProjectMarketSkillTransactions(): Promise<void> {
+    const root = join(this.#managedRoot, PROJECT_MARKET_SKILL_TRANSACTION_JOURNALS_DIRECTORY);
+    const entries = await readdir(root, { withFileTypes: true });
+    entries.sort((left, right) => left.name.localeCompare(right.name, "en"));
+    for (const entry of entries) {
+      validateEntryName(entry.name);
+      const path = join(root, entry.name);
+      if (PROJECT_MARKET_SKILL_TRANSACTION_TEMP_PATTERN.test(entry.name)) {
+        await removeOwnedPath(root, path, "Incomplete project market Skill transaction journal");
+        continue;
+      }
+      const match = PROJECT_MARKET_SKILL_TRANSACTION_JOURNAL_PATTERN.exec(entry.name);
+      if (match === null || !entry.isFile() || entry.isSymbolicLink()) {
+        throw new Error("Project market Skill transaction journal directory contains an unsupported current-v1 entry.");
+      }
+      const info = await lstat(path);
+      if (!info.isFile() || info.isSymbolicLink() || info.size < 2 || info.size > MAXIMUM_PROJECT_SKILL_TRANSACTION_JOURNAL_BYTES) {
+        throw new Error("Project market Skill transaction journal is malformed.");
+      }
+      await assertContainedPath(root, path, "Project market Skill transaction journal");
+      let parsed: unknown;
+      try { parsed = JSON.parse(await readFile(path, "utf8")); } catch {
+        throw new Error("Project market Skill transaction journal is not valid JSON.");
+      }
+      await this.#recoverProjectMarketSkillTransaction(path, this.#validateProjectMarketSkillTransactionJournal(parsed, match[1]!));
+    }
+  }
+
+  #validateProjectMarketSkillTransactionJournal(value: unknown, expectedTransactionId: string): ProjectMarketSkillTransactionJournal {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw new Error("Project market Skill transaction journal is malformed.");
+    }
+    const record = value as Record<string, unknown>;
+    const keys = [
+      "format", "kind", "transactionId", "backendId", "targetId", "workspaceRoot", "destinationPath", "resourceId",
+      "expectedResourceVersion", "expectedResourceRevision", "expectedDestinationRevision", "committedResourceVersion",
+      "committedRevision", "sourceId", "entryId", "entryContentRevision"
+    ];
+    if (Object.keys(record).length !== keys.length || keys.some((key) => !(key in record))) {
+      throw new Error("Project market Skill transaction journal has unsupported fields.");
+    }
+    const transactionId = requiredJournalString(record, "transactionId");
+    if (record["format"] !== 1 || record["kind"] !== "market_install" || transactionId !== expectedTransactionId
+      || !RESOURCE_GENERATION_PATTERN.test(transactionId)) throw new Error("Project market Skill transaction identity is malformed.");
+    const backendId = requiredJournalString(record, "backendId");
+    const targetId = requiredJournalString(record, "targetId");
+    const workspaceRoot = normalizedAbsolute(requiredJournalString(record, "workspaceRoot"), "Project market Skill workspace");
+    const destinationPath = normalizedAbsolute(requiredJournalString(record, "destinationPath"), "Project market Skill destination");
+    assertWithin(workspaceRoot, destinationPath, "Project market Skill destination");
+    validateEntryName(basename(destinationPath));
+    portableSkillName(basename(destinationPath));
+    const resourceId = requiredJournalString(record, "resourceId");
+    validateResourceId(resourceId);
+    if (resourceId !== stableDiscoveredResourceId(backendId, targetId, "skill", destinationPath)) {
+      throw new Error("Project market Skill transaction Resource identity is malformed.");
+    }
+    const expectedResourceVersion = nullableJournalVersion(record, "expectedResourceVersion");
+    const expectedResourceRevision = nullableJournalRevision(record, "expectedResourceRevision");
+    if ((expectedResourceVersion === null) !== (expectedResourceRevision === null)) {
+      throw new Error("Project market Skill expected Resource authority is incomplete.");
+    }
+    const expectedDestinationRevision = nullableJournalRevision(record, "expectedDestinationRevision");
+    const committedResourceVersion = journalVersion(record, "committedResourceVersion");
+    if (BigInt(committedResourceVersion) !== (expectedResourceVersion === null ? 1n : BigInt(expectedResourceVersion) + 1n)) {
+      throw new Error("Project market Skill committed Resource revision is malformed.");
+    }
+    const committedRevision = normalizedContentRevision(requiredJournalString(record, "committedRevision"), "Project market Skill committed revision");
+    const sourceId = normalizedMarketSourceId(requiredJournalString(record, "sourceId"));
+    const entryId = normalizedMarketEntryId(requiredJournalString(record, "entryId"));
+    const entryContentRevision = normalizedContentRevision(requiredJournalString(record, "entryContentRevision"), "Project market Skill entry revision");
+    return {
+      format: 1,
+      kind: "market_install",
+      transactionId,
+      backendId,
+      targetId,
+      workspaceRoot,
+      destinationPath,
+      resourceId,
+      expectedResourceVersion,
+      expectedResourceRevision,
+      expectedDestinationRevision,
+      committedResourceVersion,
+      committedRevision,
+      sourceId,
+      entryId,
+      entryContentRevision
+    };
+  }
+
+  async #recoverProjectMarketSkillTransaction(journalPath: string, raw: ProjectMarketSkillTransactionJournal): Promise<void> {
+    const journalsRoot = join(this.#managedRoot, PROJECT_MARKET_SKILL_TRANSACTION_JOURNALS_DIRECTORY);
+    const expectedPath = join(journalsRoot, `${raw.transactionId}.json`);
+    if (!samePath(journalPath, expectedPath)) throw new Error("Project market Skill transaction journal path is invalid.");
+    const journal = this.#validateProjectMarketSkillTransactionJournal(raw, raw.transactionId);
+    const resource = this.#records.get(journal.resourceId);
+    const expectedCurrent = journal.expectedResourceVersion === null
+      ? resource === undefined
+      : resource !== undefined
+        && resource.versionNumber === journal.expectedResourceVersion
+        && resource.discoveredRevision === journal.expectedResourceRevision;
+    const committedCurrent = resource !== undefined
+      && resource.kind === "skill"
+      && resource.scope === "project"
+      && resource.backendId === journal.backendId
+      && resource.targetId === journal.targetId
+      && resource.versionNumber === journal.committedResourceVersion
+      && resource.discoveredRevision === journal.committedRevision
+      && isDirectProjectResource(resource)
+      && samePath(resource.canonicalPath, journal.destinationPath)
+      && resource.source.kind === "skill_market"
+      && resource.source.sourceId === journal.sourceId
+      && resource.source.entryId === journal.entryId
+      && resource.source.entryContentRevision === journal.entryContentRevision;
+    if (expectedCurrent === committedCurrent) {
+      throw new Error("Project market Skill transaction cannot be matched to exactly one durable catalog state.");
+    }
+    const transactionRoot = join(dirname(journal.destinationPath), PROJECT_SKILL_TRANSACTION_DIRECTORY);
+    const transactionInfo = await optionalLstat(transactionRoot);
+    if (transactionInfo !== undefined) {
+      if (!transactionInfo.isDirectory() || transactionInfo.isSymbolicLink()) throw new Error("Project market Skill transaction directory is unsafe.");
+      await assertContainedRegularDirectory(journal.workspaceRoot, transactionRoot, "Project market Skill transaction directory");
+    }
+    if (committedCurrent) await this.#finalizeProjectMarketSkillTransaction(transactionRoot, journal);
+    else await this.#rollbackProjectMarketSkillTransaction(transactionRoot, journal);
+    await removeOwnedPath(journalsRoot, journalPath, "Completed project market Skill transaction journal");
+    if (await directoryIsEmpty(transactionRoot)) await rm(transactionRoot, { recursive: true, force: true });
+  }
+
+  async #finalizeProjectMarketSkillTransaction(
+    transactionRoot: string,
+    journal: ProjectMarketSkillTransactionJournal
+  ): Promise<void> {
+    const destination = await inspectSkillPackage(journal.destinationPath, this.#maximumFiles, this.#maximumBytes);
+    if (destination.revision !== journal.committedRevision) throw new Error("Committed project market Skill changed before recovery finalized.");
+    if (await optionalLstat(transactionRoot) === undefined) return;
+    await removeOwnedPath(transactionRoot, join(transactionRoot, `${journal.transactionId}.stage`), "Project market Skill transaction stage");
+    await removeOwnedPath(transactionRoot, join(transactionRoot, `${journal.transactionId}.backup`), "Project market Skill transaction backup");
+  }
+
+  async #rollbackProjectMarketSkillTransaction(
+    transactionRoot: string,
+    journal: ProjectMarketSkillTransactionJournal
+  ): Promise<void> {
+    const stage = join(transactionRoot, `${journal.transactionId}.stage`);
+    const backup = join(transactionRoot, `${journal.transactionId}.backup`);
+    const destinationInfo = await optionalLstat(journal.destinationPath);
+    const destinationRevision = destinationInfo === undefined
+      ? undefined
+      : (await inspectSkillPackage(journal.destinationPath, this.#maximumFiles, this.#maximumBytes)).revision;
+    const backupInfo = await optionalLstat(backup);
+    if (journal.expectedDestinationRevision === null) {
+      if (backupInfo !== undefined) throw new Error("New project market Skill transaction unexpectedly has a backup.");
+      if (destinationRevision !== undefined) {
+        if (destinationRevision !== journal.committedRevision) throw new Error("New project market Skill destination changed before rollback.");
+        await removeOwnedPath(transactionRoot, stage, "Project market Skill rollback stage");
+        await rename(journal.destinationPath, stage);
+      }
+    } else {
+      if (backupInfo !== undefined) {
+        const backupRevision = (await inspectSkillPackage(backup, this.#maximumFiles, this.#maximumBytes)).revision;
+        if (backupRevision !== journal.expectedDestinationRevision) throw new Error("Project market Skill backup changed before rollback.");
+        if (destinationRevision === undefined) {
+          await rename(backup, journal.destinationPath);
+        } else if (destinationRevision === journal.committedRevision) {
+          await removeOwnedPath(transactionRoot, stage, "Project market Skill rollback stage");
+          await rename(journal.destinationPath, stage);
+          await rename(backup, journal.destinationPath);
+        } else if (destinationRevision === journal.expectedDestinationRevision) {
+          await removeOwnedPath(transactionRoot, backup, "Project market Skill duplicate backup");
+        } else {
+          throw new Error("Project market Skill destination changed before rollback.");
+        }
+      } else if (destinationRevision !== journal.expectedDestinationRevision) {
+        throw new Error("Project market Skill rollback backup is missing.");
+      }
+    }
+    await removeOwnedPath(transactionRoot, stage, "Project market Skill transaction stage");
   }
 
   async #recoverOrphanedFilesystemState(): Promise<boolean> {
@@ -1144,6 +2818,11 @@ export class PiResourceManager {
   async #removeInstalledIncarnation(record: StoredResource): Promise<void> {
     assertExpectedInstalledLocation(this.#managedRoot, record);
     const generation = installedGenerationContainer(this.#managedRoot, record);
+    const generationKey = pathIdentity(generation);
+    if ((this.#installedGenerationLeases.get(generationKey) ?? 0) > 0) {
+      this.#retiredInstalledGenerations.set(generationKey, { record, generation });
+      return;
+    }
     await removeOwnedPath(
       this.#managedRoot,
       generation,
@@ -1153,8 +2832,60 @@ export class PiResourceManager {
   }
 
   async #removeResourceOwner(record: StoredResource): Promise<void> {
-    const owner = resourceOwnerPath(this.#managedRoot, record);
-    await removeOwnedPath(this.#managedRoot, owner, "Removed resource owner");
+    if (record.installedPath !== undefined) {
+      await this.#removeInstalledIncarnation(record);
+      return;
+    }
+    await this.#pruneResourceOwner(record);
+  }
+
+  async #releaseInstalledPackageGeneration(generationKey: string): Promise<void> {
+    await this.#mutate(async () => {
+      const count = this.#installedGenerationLeases.get(generationKey);
+      if (count === undefined || count < 1) throw new Error("Installed package lease accounting is inconsistent.");
+      if (count > 1) {
+        this.#installedGenerationLeases.set(generationKey, count - 1);
+        return;
+      }
+      const retired = this.#retiredInstalledGenerations.get(generationKey);
+      if (retired !== undefined) {
+        await removeOwnedPath(this.#managedRoot, retired.generation, "Retired leased resource generation");
+        await this.#pruneResourceOwner(retired.record);
+        this.#retiredInstalledGenerations.delete(generationKey);
+      }
+      this.#installedGenerationLeases.delete(generationKey);
+    });
+  }
+
+  async #assertInstalledPackageLeaseCurrent(record: StoredResource, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
+    await this.#mutate(async () => {
+      signal?.throwIfAborted();
+      const current = this.#require(record.id);
+      if (current !== record) throw new Error("Installed package Resource changed while it was being exported.");
+      await this.#assertInstalledSafe(current);
+      signal?.throwIfAborted();
+    });
+  }
+
+  #assertInstalledPackageLeaseAuthority(
+    record: StoredResource,
+    input: Omit<PiInstalledPackageLeaseInput, "resourceId">
+  ): void {
+    if (
+      record.backendId !== input.backendId
+      || record.versionNumber !== input.expectedResourceVersion.toString(10)
+      || record.discoveredRevision !== input.expectedDiscoveredRevision
+      || record.kind !== "package"
+      || record.scope !== "managed"
+      || record.installedPath === undefined
+      || record.packageIdentity !== input.expectedPackageIdentity
+      || record.version !== input.expectedPackageVersion
+      || record.state === "removed"
+      || record.state === "error"
+    ) {
+      throw new Error("Installed package Resource no longer matches the confirmed export authority.");
+    }
   }
 
   async #pruneResourceOwner(record: StoredResource): Promise<void> {
@@ -1168,6 +2899,93 @@ export class PiResourceManager {
     }
   }
 
+  async #inspectExtensionSourcePackage(
+    input: PiExtensionSourcePackageInput
+  ): Promise<InspectedExtensionPackage> {
+    validateResourceId(input.resourceId);
+    normalizedExtensionSourceId(input.sourceId);
+    normalizedDecimalRevision(input.sourceRevision, "Extension source revision");
+    nonBlank(input.sourceIdentity, "Extension source identity");
+    nonBlank(input.sourceDisplay, "Extension source display");
+    normalizeExtensionPackagePath(input.packageRelativePath);
+    const expectedRevision = normalizedContentRevision(
+      input.packageContentRevision,
+      "Extension source package revision"
+    );
+    if (!Number.isSafeInteger(input.bindingOrdinal) || input.bindingOrdinal < 0) {
+      throw new Error("Extension source binding ordinal is invalid.");
+    }
+    nonBlank(input.bindingName, "Extension source binding name");
+    const backendId = nonBlank(input.backendId, "Backend ID");
+    const inspection = await inspectResource(input.packageRoot, this.#maximumFiles, this.#maximumBytes);
+    const rootInfo = await lstat(inspection.canonicalPath);
+    if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) {
+      throw new Error("Extension source package must be a regular directory.");
+    }
+    if (inspection.revision !== expectedRevision) {
+      throw new Error("Extension source package changed after discovery.");
+    }
+    const runtimeVersion = this.#runtimeVersion(backendId);
+    const compatibility = await inspectPiResourceCompatibility("package", inspection.canonicalPath, {
+      ...(runtimeVersion === undefined ? {} : { currentRuntimeVersion: runtimeVersion }),
+      contentFingerprint: inspection.revision
+    });
+    assertExtensionPackageSelection(input, compatibility);
+    return { inspection, compatibility };
+  }
+
+  #planExtensionPackage(
+    input: PiExtensionSourcePackageInput,
+    inspected: InspectedExtensionPackage
+  ): ExtensionPackagePlan {
+    const target = this.#records.get(input.resourceId);
+    if (target !== undefined && target.state !== "removed" && target.installedPath === undefined) {
+      throw new Error("The reserved Resource identity is already used by an uninstalled Resource intent.");
+    }
+    if (target?.installedPath !== undefined) {
+      if (target.kind !== "package" || target.packageIdentity !== inspected.compatibility.name) {
+        throw new Error("The reserved Resource identity is already bound to another package.");
+      }
+      if (target.backendId !== input.backendId) {
+        throw new Error("Choose the Backend that owns the currently installed package.");
+      }
+    }
+    const conflicts = [...this.#records.values()].filter((record) =>
+      record.id !== input.resourceId
+      && record.kind === "package"
+      && record.installedPath !== undefined
+      && record.state !== "removed"
+      && record.packageIdentity === inspected.compatibility.name
+    );
+    if (conflicts.length > 1) {
+      throw new Error("Multiple installed Resources claim the same package identity; remove the ambiguity before replacing it.");
+    }
+    const current = target?.installedPath === undefined ? conflicts[0] : target;
+    if (current !== undefined && current.backendId !== input.backendId) {
+      throw new Error("Choose the Backend that owns the currently installed package.");
+    }
+    if (
+      current?.id === input.resourceId
+      && current.source.kind === "extension_source"
+      && current.source.sourceId === input.sourceId
+      && current.source.packageRelativePath === normalizeExtensionPackagePath(input.packageRelativePath)
+      && current.discoveredRevision === inspected.inspection.revision
+    ) {
+      throw new Error("The selected Extension package is already installed at this revision.");
+    }
+    const sameSource = current?.source.kind === "extension_source"
+      && current.source.sourceId === input.sourceId
+      && current.source.packageRelativePath === normalizeExtensionPackagePath(input.packageRelativePath);
+    return {
+      action: current === undefined ? "install" : sameSource && current.id === input.resourceId ? "update" : "replace",
+      resourceId: input.resourceId,
+      backendId: input.backendId,
+      ...(target === undefined ? {} : { target }),
+      ...(current === undefined ? {} : { current }),
+      sourceReplacement: current !== undefined && !sameSource
+    };
+  }
+
   async #prepareInstalledMutation(
     expected: StoredResource,
     approved: StoredResource
@@ -1176,6 +2994,9 @@ export class PiResourceManager {
     if (approved.state !== "approved") throw new Error("Resource must be approved before installation.");
     if (approved.approvedAt === undefined || approved.approvedByConnectionId === undefined) {
       throw new Error("Resource installation requires an explicit owner approval.");
+    }
+    if (approved.source.kind === "extension_source" || approved.source.kind === "skill_market") {
+      throw new Error("Source-owned resources require their leased Resource adoption path.");
     }
     this.#assertStoredProjectTargetTrusted(approved);
     if (approved.source.kind === "local") await this.#assertSourceUnchanged(approved);
@@ -1205,7 +3026,7 @@ export class PiResourceManager {
       if (approved.source.kind === "local") {
         if (approved.canonicalPath === undefined) throw new Error("Local resource is missing its canonical source path.");
         sourceRoot = approved.canonicalPath;
-        sourceInspection = await inspectResource(sourceRoot, this.#maximumFiles, this.#maximumBytes);
+        sourceInspection = await inspectResourceForKind(approved.kind, sourceRoot, this.#maximumFiles, this.#maximumBytes);
       } else {
         const acquired = await this.#acquisition.acquire({
           source: approved.source,
@@ -1229,7 +3050,7 @@ export class PiResourceManager {
       } else {
         throw new Error("Approved resource source is no longer a regular file or directory.");
       }
-      const stagedInspection = await inspectResource(stagedPayload, this.#maximumFiles, this.#maximumBytes);
+      const stagedInspection = await inspectResourceForKind(approved.kind, stagedPayload, this.#maximumFiles, this.#maximumBytes);
       if (stagedInspection.revision !== sourceInspection.revision) throw new Error("Resource changed during staged installation.");
       if (approved.source.kind === "local") await this.#assertSourceUnchanged(approved);
       else await rm(acquisitionRoot, { recursive: true, force: true });
@@ -1237,7 +3058,7 @@ export class PiResourceManager {
       candidatePublished = true;
       const installedPath = join(candidateContainer, payloadName);
       await assertContainedPath(this.#managedRoot, installedPath, "Installed resource candidate");
-      const installedInspection = await inspectResource(installedPath, this.#maximumFiles, this.#maximumBytes);
+      const installedInspection = await inspectResourceForKind(approved.kind, installedPath, this.#maximumFiles, this.#maximumBytes);
       const installedRuntimeVersion = this.#runtimeVersion(approved.backendId);
       const compatibility = await inspectPiResourceCompatibility(approved.kind, installedPath, {
         ...(installedRuntimeVersion === undefined ? {} : { currentRuntimeVersion: installedRuntimeVersion }),
@@ -1259,6 +3080,7 @@ export class PiResourceManager {
         ...approvedBase,
         installedPath,
         discoveredRevision: installedInspection.revision,
+        ...(approved.kind === "package" ? { packageIdentity: compatibility.name } : {}),
         ...compatibilityFields(compatibility, requiresExtensionApproval),
         ...(extensionApprovedRevision === undefined ? {} : { extensionApprovedRevision }),
         ...(acquiredVersion === undefined ? {} : { version: acquiredVersion }),
@@ -1289,10 +3111,268 @@ export class PiResourceManager {
     }
   }
 
+  #assertSkillContentAuthority(record: StoredResource, expectedResourceVersion: bigint): void {
+    if (record.kind !== "skill") throw new Error("Resource is not a Skill.");
+    if (record.state === "removed") throw new Error("Removed Skill content is unavailable.");
+    if (BigInt(record.versionNumber) !== expectedResourceVersion) throw new Error("Skill Resource revision is stale.");
+    this.#assertStoredProjectTargetTrusted(record);
+    if (isDirectProjectResource(record)) {
+      if (!(record.state === "approved" || record.state === "disabled" || record.state === "loaded")) {
+        throw new Error("Project Skill is not approved.");
+      }
+      return;
+    }
+    if (record.source.kind === "extension_source" || record.kind !== "skill") {
+      throw new Error("Package-owned Skills must be changed through their package owner.");
+    }
+    if (record.installedPath === undefined || !(record.state === "installed" || record.state === "disabled" || record.state === "loaded")) {
+      throw new Error("Global Skill is not installed.");
+    }
+  }
+
+  async #skillContentRoot(record: StoredResource, signal?: AbortSignal): Promise<string> {
+    signal?.throwIfAborted();
+    if (isDirectProjectResource(record)) {
+      const workspaceRoot = this.#assertTrustedProjectTarget(record.backendId, record.targetId, record.workspaceRoot);
+      assertWithin(workspaceRoot, record.canonicalPath, "Project Skill content");
+      await assertCanonicalDirectory(record.canonicalPath, "Project Skill content");
+      return record.canonicalPath;
+    }
+    if (record.installedPath === undefined) throw new Error("Global Skill content is not installed.");
+    assertExpectedInstalledLocation(this.#managedRoot, record);
+    await assertContainedRegularDirectory(this.#managedRoot, record.installedPath, "Global Skill content");
+    return record.installedPath;
+  }
+
+  async #prepareManagedSkillContentMutation(
+    current: StoredResource,
+    candidateRoot: string,
+    candidateInspection: ResourceInspection,
+    compatibility: PiPackageInspection,
+    requestedName: string,
+    changedByConnectionId: string
+  ): Promise<PreparedPiResourceMutation<PiSkillContentMutationResult>> {
+    if (current.installedPath === undefined) throw new Error("Global Skill content is not installed.");
+    assertExpectedInstalledLocation(this.#managedRoot, current);
+    const owner = resourceOwnerPath(this.#managedRoot, current);
+    const generations = join(owner, RESOURCE_GENERATIONS_DIRECTORY);
+    await assertContainedRegularDirectory(this.#managedRoot, generations, "Managed Skill generations directory");
+    const generation = randomUUID();
+    const candidateContainer = join(generations, generation);
+    const stage = join(this.#managedRoot, ".staging", `skill-${generation}`);
+    await mkdir(stage, { recursive: false, mode: 0o700 });
+    const payloadName = installedPayloadName(current);
+    const stagedPayload = join(stage, payloadName);
+    let published = false;
+    try {
+      await mkdir(stagedPayload, { recursive: false, mode: 0o700 });
+      await copyTreeFailClosed(candidateRoot, candidateRoot, stagedPayload, {
+        files: 0,
+        bytes: 0,
+        maxFiles: this.#maximumFiles,
+        maxBytes: this.#maximumBytes
+      });
+      await syncTreeForPublish(stagedPayload);
+      const stagedInspection = await inspectSkillPackage(stagedPayload, this.#maximumFiles, this.#maximumBytes);
+      if (stagedInspection.revision !== candidateInspection.revision) throw new Error("Skill candidate changed while it was staged.");
+      await this.#assertInstalledSafe(current);
+      await rename(stage, candidateContainer);
+      published = true;
+      const installedPath = join(candidateContainer, payloadName);
+      const installedInspection = await inspectSkillPackage(installedPath, this.#maximumFiles, this.#maximumBytes);
+      if (installedInspection.revision !== candidateInspection.revision) throw new Error("Published Skill generation differs from its draft.");
+      const { pendingUpdate: _pendingUpdate, error: _error, ...base } = current;
+      const updated: StoredResource = {
+        ...base,
+        name: requestedName,
+        installedPath,
+        discoveredRevision: installedInspection.revision,
+        ...compatibilityFields(compatibility, false),
+        state: current.state === "disabled" ? "disabled" : "installed",
+        enabled: current.enabled,
+        approvedAt: this.#now(),
+        approvedByConnectionId: changedByConnectionId,
+        versionNumber: (BigInt(current.versionNumber) + 1n).toString(10),
+        updatedAt: this.#now()
+      };
+      assertExpectedInstalledLocation(this.#managedRoot, updated);
+      const resource = publicResource(updated);
+      return this.#prepareMutation(
+        [{ id: current.id, expected: current, next: updated }],
+        { resource },
+        undefined,
+        {
+          rollback: () => this.#removeCandidateGeneration(current, candidateContainer),
+          cleanupAfterCommit: () => this.#removeInstalledIncarnation(current)
+        }
+      );
+    } catch (error) {
+      await rm(stage, { recursive: true, force: true }).catch(() => undefined);
+      if (published) await this.#removeCandidateGeneration(current, candidateContainer).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async #prepareProjectSkillContentMutation(
+    current: StoredResource & {
+      readonly source: Extract<StoredResourceSource, { readonly kind: "local" | "skill_market" }>;
+      readonly canonicalPath: string;
+    },
+    expectedObservedRevision: string,
+    candidateRoot: string,
+    candidateInspection: ResourceInspection,
+    compatibility: PiPackageInspection,
+    requestedName: string,
+    changedByConnectionId: string
+  ): Promise<PreparedPiResourceMutation<PiSkillContentMutationResult>> {
+    const workspaceRoot = this.#assertTrustedProjectTarget(current.backendId, current.targetId, current.workspaceRoot);
+    const targetId = current.targetId!;
+    const currentInspection = await inspectSkillPackage(current.canonicalPath, this.#maximumFiles, this.#maximumBytes);
+    if (!samePath(currentInspection.canonicalPath, current.canonicalPath) || currentInspection.revision !== expectedObservedRevision) {
+      throw new Error("Observed Skill revision is stale.");
+    }
+    const parent = dirname(current.canonicalPath);
+    assertWithin(workspaceRoot, parent, "Project Skill parent");
+    await assertCanonicalDirectory(parent, "Project Skill parent");
+    const renaming = requestedName !== basename(current.canonicalPath);
+    const destination = renaming ? join(parent, requestedName) : current.canonicalPath;
+    if (renaming && await optionalLstat(destination) !== undefined) throw new Error("A Skill with that name already exists in this scope.");
+    const { pendingUpdate: _pendingUpdate, error: _error, ...base } = current;
+    const nextState = current.state === "disabled" ? "disabled" : "approved";
+    let entries: readonly PreparedCatalogEntry[];
+    let result: PiSkillContentMutationResult;
+    let committed: StoredResource;
+    if (renaming) {
+      const nextId = stableDiscoveredResourceId(current.backendId, targetId, "skill", destination);
+      if (this.#records.has(nextId)) throw new Error("The renamed Skill Resource identity already exists.");
+      const removed: StoredResource = {
+        ...base,
+        state: "removed",
+        enabled: false,
+        versionNumber: (BigInt(current.versionNumber) + 1n).toString(10),
+        updatedAt: this.#now()
+      };
+      const next: StoredResource = {
+        ...base,
+        id: nextId,
+        name: requestedName,
+        source: { kind: "local", path: destination },
+        sourceIdentity: `skill:${pathIdentity(destination)}`,
+        sourceDisplay: requestedName,
+        canonicalPath: destination,
+        canonicalPathFingerprint: pathFingerprint(destination),
+        discoveredRevision: candidateInspection.revision,
+        ...compatibilityFields(compatibility, false),
+        state: nextState,
+        enabled: current.enabled,
+        approvedAt: this.#now(),
+        approvedByConnectionId: changedByConnectionId,
+        versionNumber: "1",
+        updatedAt: this.#now()
+      };
+      entries = [
+        { id: current.id, expected: current, next: removed },
+        { id: nextId, expected: undefined, next }
+      ];
+      committed = next;
+      result = { resource: publicResource(next), replacedResourceId: current.id };
+    } else {
+      const updated: StoredResource = {
+        ...base,
+        name: requestedName,
+        discoveredRevision: candidateInspection.revision,
+        ...compatibilityFields(compatibility, false),
+        state: nextState,
+        enabled: current.enabled,
+        approvedAt: this.#now(),
+        approvedByConnectionId: changedByConnectionId,
+        versionNumber: (BigInt(current.versionNumber) + 1n).toString(10),
+        updatedAt: this.#now()
+      };
+      entries = [{ id: current.id, expected: current, next: updated }];
+      committed = updated;
+      result = { resource: publicResource(updated) };
+    }
+
+    const transactionRoot = join(parent, PROJECT_SKILL_TRANSACTION_DIRECTORY);
+    await mkdir(transactionRoot, { recursive: true, mode: 0o700 });
+    await assertContainedRegularDirectory(workspaceRoot, transactionRoot, "Project Skill transaction directory");
+    const transactionId = randomUUID();
+    const stage = join(transactionRoot, `${transactionId}.stage`);
+    const backup = join(transactionRoot, `${transactionId}.backup`);
+    const journal: ProjectSkillTransactionJournal = {
+      format: 1,
+      kind: "replace",
+      transactionId,
+      backendId: current.backendId,
+      targetId,
+      workspaceRoot,
+      sourcePath: current.canonicalPath,
+      destinationPath: destination,
+      expectedResourceId: current.id,
+      expectedVersionNumber: current.versionNumber,
+      expectedRevision: expectedObservedRevision,
+      committedResourceId: committed.id,
+      committedVersionNumber: committed.versionNumber,
+      committedRevision: committed.discoveredRevision
+    };
+    let journalPath: string | undefined;
+    try {
+      journalPath = await this.#writeProjectSkillTransactionJournal(journal);
+      await mkdir(stage, { recursive: false, mode: 0o700 });
+      await copyTreeFailClosed(candidateRoot, candidateRoot, stage, {
+        files: 0,
+        bytes: 0,
+        maxFiles: this.#maximumFiles,
+        maxBytes: this.#maximumBytes
+      });
+      await syncTreeForPublish(stage);
+      const stagedInspection = await inspectSkillPackage(stage, this.#maximumFiles, this.#maximumBytes);
+      if (stagedInspection.revision !== candidateInspection.revision) throw new Error("Skill candidate changed while it was staged.");
+      const beforeSwitch = await inspectSkillPackage(current.canonicalPath, this.#maximumFiles, this.#maximumBytes);
+      this.#assertTrustedProjectTarget(current.backendId, current.targetId, workspaceRoot);
+      if (!samePath(beforeSwitch.canonicalPath, current.canonicalPath) || beforeSwitch.revision !== expectedObservedRevision) {
+        throw new Error("Project Skill changed before its staged content could be published.");
+      }
+      await rename(current.canonicalPath, backup);
+      try {
+        await rename(stage, destination);
+      } catch (error) {
+        await rename(backup, current.canonicalPath);
+        throw error;
+      }
+      const publishedInspection = await inspectSkillPackage(destination, this.#maximumFiles, this.#maximumBytes);
+      if (publishedInspection.revision !== candidateInspection.revision) throw new Error("Published project Skill differs from its draft.");
+      return this.#prepareMutation(
+        entries,
+        result,
+        () => this.#assertTrustedProjectTarget(current.backendId, current.targetId, workspaceRoot),
+        {
+          rollback: () => this.#recoverProjectSkillTransaction(journalPath!, journal),
+          cleanupAfterCommit: () => this.#recoverProjectSkillTransaction(journalPath!, journal)
+        }
+      );
+    } catch (error) {
+      if (journalPath !== undefined) {
+        try {
+          await this.#recoverProjectSkillTransaction(journalPath, journal);
+        } catch (recoveryError) {
+          throw new AggregateError([error, recoveryError], "Project Skill publication failed and its durable rollback requires recovery.");
+        }
+      }
+      await rm(stage, { recursive: true, force: true }).catch(() => undefined);
+      if (await directoryIsEmpty(transactionRoot)) await rm(transactionRoot, { recursive: true, force: true }).catch(() => undefined);
+      throw error;
+    }
+  }
+
   async #assertSourceUnchanged(record: StoredResource): Promise<void> {
     this.#assertStoredProjectTargetTrusted(record);
-    if (record.source.kind !== "local" || record.canonicalPath === undefined) throw new Error("Resource does not have a local approved source.");
-    const inspection = await inspectResource(record.canonicalPath, this.#maximumFiles, this.#maximumBytes);
+    if (
+      record.canonicalPath === undefined
+      || !(record.source.kind === "local" || record.source.kind === "skill_market" && record.scope === "project")
+    ) throw new Error("Resource does not have direct content authority.");
+    const inspection = await inspectResourceForKind(record.kind, record.canonicalPath, this.#maximumFiles, this.#maximumBytes);
     if (record.workspaceRoot !== undefined) assertWithin(record.workspaceRoot, inspection.canonicalPath, "Project resource");
     if (!samePath(inspection.canonicalPath, record.canonicalPath) || inspection.revision !== record.discoveredRevision) {
       throw new Error("Approved resource changed and is fenced until it is discovered and approved again.");
@@ -1303,7 +3383,7 @@ export class PiResourceManager {
     if (record.installedPath === undefined) throw new Error("Resource has no installed payload.");
     assertExpectedInstalledLocation(this.#managedRoot, record);
     await assertContainedPath(this.#managedRoot, record.installedPath, "Installed resource payload");
-    const inspection = await inspectResource(record.installedPath, this.#maximumFiles, this.#maximumBytes);
+    const inspection = await inspectResourceForKind(record.kind, record.installedPath, this.#maximumFiles, this.#maximumBytes);
     if (inspection.revision !== record.discoveredRevision) throw new Error("Installed resource content changed and is fenced.");
   }
 
@@ -1404,6 +3484,7 @@ export class PiResourceManager {
       symbolicLinkDetected: false,
       specialFileDetected: false,
       discoveredRevision: inspection.revision,
+      ...(input.kind === "package" ? { packageIdentity: compatibility.name } : {}),
       ...compatibilityFields(compatibility, compatibility.extensionContentFingerprint !== undefined),
       state: "awaiting_approval",
       enabled: false,
@@ -1588,18 +3669,21 @@ export class PiResourceManager {
     const { extensionApprovedRevision: _previousApproval, ...base } = record;
     return {
       ...base,
+      ...(record.kind === "package" ? { packageIdentity: inspection.name } : {}),
       ...compatibilityFields(inspection, requiresExtensionApproval),
       ...(extensionApprovedRevision === undefined ? {} : { extensionApprovedRevision })
     };
   }
 }
 
-interface ResourceInspection {
+export interface PiSkillPackageInspection {
   readonly canonicalPath: string;
   readonly revision: string;
   readonly files: number;
   readonly bytes: number;
 }
+
+type ResourceInspection = PiSkillPackageInspection;
 
 interface CopyBudget { files: number; bytes: number; readonly maxFiles: number; readonly maxBytes: number }
 
@@ -1624,6 +3708,118 @@ async function inspectResource(
   else await inspectDirectory(canonicalPath, canonicalPath, "", hash, budget, signal);
   signal?.throwIfAborted();
   return { canonicalPath, revision: `sha256:${hash.digest("hex")}`, files: budget.files, bytes: budget.bytes };
+}
+
+async function inspectSkillPackage(
+  sourcePath: string,
+  maximumFiles: number,
+  maximumBytes: number,
+  signal?: AbortSignal
+): Promise<ResourceInspection> {
+  const inspection = await inspectResource(sourcePath, maximumFiles, maximumBytes, signal);
+  const rootInfo = await lstat(inspection.canonicalPath);
+  if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) throw new Error("Skill content must be a regular directory.");
+  const manifest = join(inspection.canonicalPath, "SKILL.md");
+  const manifestInfo = await lstat(manifest).catch(() => undefined);
+  if (manifestInfo === undefined || !manifestInfo.isFile() || manifestInfo.isSymbolicLink()) {
+    throw new Error("Skill content must contain a regular SKILL.md file.");
+  }
+  const canonicalManifest = await realpath(manifest);
+  if (!samePath(manifest, canonicalManifest)) throw new Error("Skill SKILL.md contains a path alias or junction.");
+  assertWithin(inspection.canonicalPath, canonicalManifest, "Skill manifest");
+  await assertStableUtf8File(canonicalManifest, signal);
+  await assertPortableSkillTreeKeys(inspection.canonicalPath, inspection.canonicalPath, "");
+  signal?.throwIfAborted();
+  return inspection;
+}
+
+/**
+ * Validate one path-private Skill tree with the same limits and portability
+ * rules used by Resource adoption. Market acquisition calls this only after
+ * archive extraction and never projects the canonical path onto the wire.
+ */
+export function inspectPiSkillPackage(
+  sourcePath: string,
+  maximumFiles: number,
+  maximumBytes: number,
+  signal?: AbortSignal
+): Promise<PiSkillPackageInspection> {
+  return inspectSkillPackage(sourcePath, maximumFiles, maximumBytes, signal);
+}
+
+function inspectResourceForKind(
+  kind: PiResourceKind,
+  sourcePath: string,
+  maximumFiles: number,
+  maximumBytes: number,
+  signal?: AbortSignal
+): Promise<ResourceInspection> {
+  return kind === "skill"
+    ? inspectSkillPackage(sourcePath, maximumFiles, maximumBytes, signal)
+    : inspectResource(sourcePath, maximumFiles, maximumBytes, signal);
+}
+
+async function assertStableUtf8File(path: string, signal?: AbortSignal): Promise<void> {
+  const before = await lstat(path);
+  if (!before.isFile() || before.isSymbolicLink()) throw new Error("Skill SKILL.md must be a regular UTF-8 file.");
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  try {
+    for await (const chunk of createReadStream(path, { signal })) {
+      decoder.decode(chunk, { stream: true });
+    }
+    decoder.decode();
+  } catch (error) {
+    signal?.throwIfAborted();
+    if (error instanceof TypeError) throw new Error("Skill SKILL.md must be valid UTF-8.");
+    throw error;
+  }
+  const after = await lstat(path);
+  if (!after.isFile() || after.isSymbolicLink() || !sameIdentity(before, after) || before.size !== after.size || before.mtimeMs !== after.mtimeMs) {
+    throw new Error("Skill SKILL.md changed while its UTF-8 content was validated.");
+  }
+}
+
+async function assertPortableSkillTreeKeys(root: string, directory: string, parentKey: string): Promise<void> {
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const key = parentKey === "" ? entry.name : `${parentKey}/${entry.name}`;
+    const parts = key.split("/");
+    if (
+      key.length > 512 || parts.length > 32 || /[<>:"|?*\u0000-\u001f]/u.test(entry.name)
+      || /[. ]$/u.test(entry.name) || isWindowsReservedSkillName(entry.name)
+    ) throw new Error("Skill content contains a non-portable path key.");
+    if (entry.isDirectory()) await assertPortableSkillTreeKeys(root, join(directory, entry.name), key);
+  }
+  assertWithin(root, directory, "Skill portable path");
+}
+
+function isWindowsReservedSkillName(value: string): boolean {
+  const stem = value.split(".", 1)[0]!.toUpperCase();
+  return stem === "CON" || stem === "PRN" || stem === "AUX" || stem === "NUL"
+    || /^COM[1-9]$/u.test(stem) || /^LPT[1-9]$/u.test(stem);
+}
+
+async function syncTreeForPublish(root: string): Promise<void> {
+  const entries = await readdir(root, { withFileTypes: true });
+  entries.sort((left, right) => left.name.localeCompare(right.name, "en"));
+  for (const entry of entries) {
+    validateEntryName(entry.name);
+    const path = join(root, entry.name);
+    const info = await lstat(path);
+    if (entry.isSymbolicLink() || info.isSymbolicLink()) throw new Error("Skill publish tree contains a symlink or junction.");
+    if (entry.isDirectory() && info.isDirectory()) {
+      await syncTreeForPublish(path);
+      continue;
+    }
+    if (!entry.isFile() || !info.isFile()) throw new Error("Skill publish tree contains a special file.");
+    // Windows requires a writable handle for FlushFileBuffers even though no
+    // bytes are changed here. The staged copy is service-owned and writable.
+    const handle = await open(path, "r+");
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  }
 }
 
 async function inspectDirectory(
@@ -1689,6 +3885,99 @@ async function inspectFile(
   if (!after.isFile() || !sameIdentity(before, after) || before.size !== after.size || before.mtimeMs !== after.mtimeMs) {
     throw new Error("Resource file changed during inspection.");
   }
+}
+
+async function snapshotInstalledPackageTree(
+  sourceRoot: string,
+  destinationRoot: string,
+  maximumEntries: number,
+  maximumBytes: number,
+  signal?: AbortSignal
+): Promise<PiInstalledPackageSnapshot> {
+  signal?.throwIfAborted();
+  const source = normalizedAbsolute(sourceRoot, "Installed package snapshot source");
+  const destination = normalizedAbsolute(destinationRoot, "Installed package snapshot destination");
+  await assertCanonicalDirectory(source, "Installed package snapshot source");
+  await assertCanonicalDirectory(destination, "Installed package snapshot destination");
+  if ((await readdir(destination)).length !== 0) throw new Error("Installed package snapshot destination must be empty.");
+  const entries: PiInstalledPackageSnapshotEntry[] = [];
+  const budget = { files: 0, bytes: 0 };
+
+  const visit = async (sourceDirectory: string, destinationDirectory: string, relativeDirectory: string): Promise<void> => {
+    signal?.throwIfAborted();
+    const directoryBefore = await lstat(sourceDirectory);
+    if (!directoryBefore.isDirectory() || directoryBefore.isSymbolicLink()) {
+      throw new Error("Installed package snapshot contains a symlink, junction, or special directory.");
+    }
+    const canonicalDirectory = await realpath(sourceDirectory);
+    assertWithin(source, canonicalDirectory, "Installed package snapshot directory");
+    const children = await readdir(sourceDirectory, { withFileTypes: true });
+    children.sort((left, right) => left.name.localeCompare(right.name, "en"));
+    for (const child of children) {
+      signal?.throwIfAborted();
+      validateEntryName(child.name);
+      const sourcePath = join(sourceDirectory, child.name);
+      const destinationPath = join(destinationDirectory, child.name);
+      const relativePath = relativeDirectory === "" ? child.name : `${relativeDirectory}/${child.name}`;
+      const before = await lstat(sourcePath);
+      if (child.isSymbolicLink() || before.isSymbolicLink()) {
+        throw new Error("Installed package snapshot contains a symlink or junction.");
+      }
+      const canonical = await realpath(sourcePath);
+      assertWithin(source, canonical, "Installed package snapshot entry");
+      if (child.isDirectory() && before.isDirectory()) {
+        const mode = portablePackageMode(before.mode, true);
+        entries.push({ path: relativePath, kind: "directory", mode, size: 0 });
+        if (entries.length > maximumEntries) throw new Error("Installed package snapshot exceeds its entry limit.");
+        await mkdir(destinationPath, { recursive: false, mode: 0o700 });
+        await visit(canonical, destinationPath, relativePath);
+        await chmod(destinationPath, mode);
+      } else if (child.isFile() && before.isFile()) {
+        budget.files += 1;
+        budget.bytes += before.size;
+        const mode = portablePackageMode(before.mode, false);
+        entries.push({ path: relativePath, kind: "file", mode, size: before.size });
+        if (entries.length > maximumEntries || budget.bytes > maximumBytes) {
+          throw new Error("Installed package snapshot exceeds its entry or byte limit.");
+        }
+        signal?.throwIfAborted();
+        await copyFile(canonical, destinationPath, constants.COPYFILE_EXCL);
+        signal?.throwIfAborted();
+        await chmod(destinationPath, mode);
+      } else {
+        throw new Error("Installed package snapshot contains a special file or changed entry.");
+      }
+      const after = await lstat(sourcePath);
+      if (
+        after.isSymbolicLink()
+        || !sameIdentity(before, after)
+        || before.size !== after.size
+        || before.mtimeMs !== after.mtimeMs
+      ) throw new Error("Installed package entry changed while snapshotting.");
+    }
+    const directoryAfter = await lstat(sourceDirectory);
+    if (
+      !directoryAfter.isDirectory()
+      || directoryAfter.isSymbolicLink()
+      || !sameIdentity(directoryBefore, directoryAfter)
+      || directoryBefore.mtimeMs !== directoryAfter.mtimeMs
+    ) throw new Error("Installed package directory changed while snapshotting.");
+  };
+
+  await visit(source, destination, "");
+  signal?.throwIfAborted();
+  const inspection = await inspectResource(destination, maximumEntries, maximumBytes, signal);
+  return {
+    discoveredRevision: inspection.revision,
+    files: inspection.files,
+    bytes: inspection.bytes,
+    entries: Object.freeze(entries.map((entry) => Object.freeze({ ...entry })))
+  };
+}
+
+function portablePackageMode(sourceMode: number, directory: boolean): number {
+  if (directory) return 0o755;
+  return (sourceMode & 0o111) === 0 ? 0o644 : 0o755;
 }
 
 function runtimeTextState(state: PiResourceState): state is "approved" | "installed" | "loaded" {
@@ -1824,6 +4113,196 @@ async function copyTreeFailClosed(root: string, source: string, destination: str
   }
 }
 
+function publicMarketSkillPreview(
+  input: PiMarketSkillSourceInput & PiMarketSkillTargetInput,
+  inspected: InspectedMarketSkill
+): PiMarketSkillPreview {
+  const source = normalizeStoredSkillMarketSource(input);
+  const current = inspected.current;
+  const observedRevision = inspected.currentInspection?.revision ?? current?.discoveredRevision;
+  const sameMarketEntry = current?.source.kind === "skill_market"
+    && current.source.sourceId === source.sourceId
+    && current.source.entryId === source.entryId;
+  const action: PiMarketSkillAction = current === undefined && !inspected.unregisteredDestination
+    ? "install"
+    : sameMarketEntry && current?.id === inspected.resourceId
+      ? "update"
+      : "replace";
+  const marketDirty = current?.source.kind === "skill_market"
+    && current.discoveredRevision !== current.source.installedContentRevision;
+  return {
+    action,
+    resourceId: inspected.resourceId,
+    backendId: input.backendId,
+    ...(input.scope === "project" ? { targetId: input.targetId } : {}),
+    scope: input.scope,
+    ...(inspected.relativeParent === undefined ? {} : { relativeParent: inspected.relativeParent }),
+    name: source.slug,
+    availableVersion: boundedVersion(input.version),
+    candidateRevision: inspected.inspection.revision,
+    files: inspected.inspection.files,
+    bytes: inspected.inspection.bytes,
+    ...(current === undefined
+      ? {}
+      : {
+          currentResource: {
+            resourceId: current.id,
+            resourceVersion: BigInt(current.versionNumber),
+            name: current.name,
+            ...(current.version === undefined ? {} : { version: current.version }),
+            sourceKind: current.sourceKind,
+            sourceDisplay: current.sourceDisplay,
+            discoveredRevision: current.discoveredRevision,
+            observedRevision: observedRevision!,
+            dirty: marketDirty || observedRevision !== current.discoveredRevision
+          }
+        }),
+    unregisteredDestination: inspected.unregisteredDestination,
+    sourceReplacement: inspected.sourceReplacement,
+    preservesEnabled: current?.enabled === true && inspected.compatibility.canToggle,
+    diffAvailable: inspected.diffAvailable,
+    ...(inspected.diffReason === undefined ? {} : { diffReason: inspected.diffReason }),
+    changes: inspected.changes.map((change) => ({ ...change })),
+    diffTruncated: inspected.diffTruncated
+  };
+}
+
+function marketGlobalSkillResourceId(backendId: string, name: string): string {
+  return `resource_skill_market_${createHash("sha256").update(`${backendId}\0global\0${name}`).digest("hex").slice(0, 32)}`;
+}
+
+function portableProjectSkillParent(value: string): string {
+  const path = nonBlank(value, "Project Skill parent");
+  if (path.length > 512 || path.includes("\\") || path.startsWith("/") || isAbsolute(path) || /^[A-Za-z]:/u.test(path)) {
+    throw new Error("Project Skill parent must be a portable Target-relative path.");
+  }
+  const parts = path.split("/");
+  if (parts.length > 32 || parts.some((part) => part === "" || part === "." || part === "..")) {
+    throw new Error("Project Skill parent must be a portable Target-relative path.");
+  }
+  for (const part of parts) {
+    validateEntryName(part);
+    if (/[<>:"|?*\u0000-\u001f]/u.test(part) || /[. ]$/u.test(part) || isWindowsReservedSkillName(part)) {
+      throw new Error("Project Skill parent contains a non-portable path component.");
+    }
+  }
+  return path;
+}
+
+async function resolveProjectSkillParent(workspaceRoot: string, relativeParent: string, create: boolean): Promise<string> {
+  const root = await canonicalDirectory(workspaceRoot, "Project Skill workspace");
+  const portable = portableProjectSkillParent(relativeParent);
+  let current = root;
+  for (const part of portable.split("/")) {
+    const candidate = join(current, part);
+    assertWithin(root, candidate, "Project Skill parent");
+    let info = await optionalLstat(candidate);
+    if (info === undefined) {
+      if (!create) {
+        current = candidate;
+        continue;
+      }
+      await mkdir(candidate, { recursive: false, mode: 0o700 });
+      info = await lstat(candidate);
+    }
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("Project Skill parent contains a symlink or non-directory entry.");
+    const canonical = await realpath(candidate);
+    assertWithin(root, canonical, "Project Skill parent");
+    if (!samePath(candidate, canonical)) throw new Error("Project Skill parent contains a path alias or junction.");
+    current = candidate;
+  }
+  return current;
+}
+
+interface MarketDiffFile {
+  readonly hash: string;
+  readonly text?: string;
+}
+
+async function compareMarketSkillTrees(
+  beforeRoot: string | undefined,
+  afterRoot: string
+): Promise<{ readonly changes: readonly PiMarketSkillDiffChange[]; readonly truncated: boolean }> {
+  const [before, after] = await Promise.all([
+    beforeRoot === undefined ? Promise.resolve(new Map<string, MarketDiffFile>()) : collectMarketDiffFiles(beforeRoot),
+    collectMarketDiffFiles(afterRoot)
+  ]);
+  const keys = [...new Set([...before.keys(), ...after.keys()])].sort((left, right) => left.localeCompare(right, "en"));
+  const changes: PiMarketSkillDiffChange[] = [];
+  let diffBytes = 0;
+  let truncated = false;
+  for (const key of keys) {
+    const left = before.get(key);
+    const right = after.get(key);
+    if (left?.hash === right?.hash) continue;
+    if (changes.length >= MAXIMUM_MARKET_DIFF_CHANGES) {
+      truncated = true;
+      break;
+    }
+    const kind = left === undefined ? "added" : right === undefined ? "deleted" : "modified";
+    const binary = left?.text === undefined && left !== undefined || right?.text === undefined && right !== undefined;
+    let unifiedDiff: string | undefined;
+    if (!binary) {
+      const candidate = marketWholeFileDiff(key, left?.text ?? "", right?.text ?? "");
+      const bytes = Buffer.byteLength(candidate, "utf8");
+      if (diffBytes + bytes <= MAXIMUM_MARKET_UNIFIED_DIFF_BYTES) {
+        unifiedDiff = candidate;
+        diffBytes += bytes;
+      } else truncated = true;
+    }
+    changes.push({ key, kind, binary, ...(unifiedDiff === undefined ? {} : { unifiedDiff }) });
+  }
+  return { changes, truncated };
+}
+
+async function collectMarketDiffFiles(root: string): Promise<Map<string, MarketDiffFile>> {
+  await assertCanonicalDirectory(root, "Skill diff root");
+  const files = new Map<string, MarketDiffFile>();
+  const visit = async (directory: string, parentKey: string): Promise<void> => {
+    const entries = await readdir(directory, { withFileTypes: true });
+    entries.sort((left, right) => left.name.localeCompare(right.name, "en"));
+    for (const entry of entries) {
+      validateEntryName(entry.name);
+      const key = parentKey === "" ? entry.name : `${parentKey}/${entry.name}`;
+      const path = join(directory, entry.name);
+      const before = await lstat(path);
+      if (entry.isSymbolicLink() || before.isSymbolicLink()) throw new Error("Skill diff contains a symlink or junction.");
+      if (entry.isDirectory() && before.isDirectory()) await visit(path, key);
+      else if (entry.isFile() && before.isFile()) {
+        const bytes = await readFile(path);
+        let text: string | undefined;
+        if (bytes.byteLength <= MAXIMUM_MARKET_DIFF_TEXT_BYTES) {
+          try {
+            text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+            if (text.includes("\0")) text = undefined;
+          } catch { /* binary */ }
+        }
+        const after = await lstat(path);
+        if (!sameIdentity(before, after) || before.size !== after.size || before.mtimeMs !== after.mtimeMs) {
+          throw new Error("Skill diff content changed while it was read.");
+        }
+        files.set(key, { hash: createHash("sha256").update(bytes).digest("hex"), ...(text === undefined ? {} : { text }) });
+      } else throw new Error("Skill diff contains a special file.");
+    }
+  };
+  await visit(root, "");
+  return files;
+}
+
+function marketWholeFileDiff(key: string, before: string, after: string): string {
+  const left = marketSplitLines(before);
+  const right = marketSplitLines(after);
+  const header = `--- a/${key}\n+++ b/${key}\n@@ -1,${left.length} +1,${right.length} @@\n`;
+  return `${header}${left.map((line) => `-${line}`).join("\n")}${left.length > 0 ? "\n" : ""}${right.map((line) => `+${line}`).join("\n")}${right.length > 0 ? "\n" : ""}`;
+}
+
+function marketSplitLines(value: string): string[] {
+  if (value === "") return [];
+  const lines = value.replaceAll("\r\n", "\n").split("\n");
+  if (lines.at(-1) === "") lines.pop();
+  return lines;
+}
+
 function publicResource(record: StoredResource): PiResourceDescriptor {
   return {
     id: record.id,
@@ -1856,8 +4335,126 @@ function publicResource(record: StoredResource): PiResourceDescriptor {
     ...(record.approvedByConnectionId === undefined ? {} : { approvedByConnectionId: record.approvedByConnectionId }),
     versionNumber: BigInt(record.versionNumber),
     updatedAt: record.updatedAt,
-    ...(record.error === undefined ? {} : { error: record.error })
+    ...(record.error === undefined ? {} : { error: record.error }),
+    ...(record.packageIdentity === undefined ? {} : { packageIdentity: record.packageIdentity }),
+    ...(record.source.kind === "extension_source"
+      ? {
+          extensionSource: {
+            sourceId: record.source.sourceId,
+            sourceRevision: BigInt(record.source.sourceRevision),
+            packageRelativePath: record.source.packageRelativePath,
+            packageContentRevision: record.source.packageContentRevision
+          }
+        }
+      : record.source.kind === "skill_market"
+        ? {
+            skillMarket: {
+              sourceId: record.source.sourceId,
+              sourceRevision: BigInt(record.source.sourceRevision),
+              entryId: record.source.entryId,
+              entryRevision: BigInt(record.source.entryRevision),
+              entryContentRevision: record.source.entryContentRevision,
+              installedContentRevision: record.source.installedContentRevision,
+              ...(record.source.relativeParent === undefined ? {} : { relativeParent: record.source.relativeParent })
+            }
+          }
+        : {})
   };
+}
+
+function publicExtensionPackagePreview(
+  plan: ExtensionPackagePlan,
+  compatibility: PiPackageInspection
+): PiExtensionPackagePreview {
+  const current = plan.current;
+  return {
+    action: plan.action,
+    resourceId: plan.resourceId,
+    backendId: plan.backendId,
+    packageName: compatibility.name,
+    ...(compatibility.version === undefined ? {} : { availableVersion: compatibility.version }),
+    ...(current?.version === undefined ? {} : { installedVersion: current.version }),
+    ...(current === undefined
+      ? {}
+      : {
+          currentResource: {
+            resourceId: current.id,
+            resourceVersion: BigInt(current.versionNumber),
+            name: current.name,
+            sourceDisplay: current.sourceDisplay
+          }
+        }),
+    sourceReplacement: plan.sourceReplacement,
+    preservesEnabled: current?.enabled === true && compatibility.canToggle,
+    resourceDetails: compatibility.resources.map(copyResourceDetail),
+    runtimeRequirements: compatibility.runtimeRequirements.map((requirement) => ({ ...requirement })),
+    warnings: [...compatibility.warnings],
+    disabledLifecycleScripts: [...compatibility.disabledLifecycleScripts],
+    canToggle: compatibility.canToggle
+  };
+}
+
+function assertExtensionPackageSelection(
+  input: PiExtensionSourcePackageInput,
+  compatibility: PiPackageInspection
+): void {
+  if (compatibility.name !== nonBlank(input.packageName, "Extension source package name")) {
+    throw new Error("Extension source package identity changed after discovery.");
+  }
+  const expectedVersion = input.version === undefined ? undefined : boundedVersion(input.version);
+  if (compatibility.version !== expectedVersion) {
+    throw new Error("Extension source package version changed after discovery.");
+  }
+  let ordinal = 0;
+  const selected = compatibility.resources.find((detail) => {
+    if (detail.kind !== "extension" || detail.name !== input.bindingName) return false;
+    const matches = ordinal === input.bindingOrdinal;
+    ordinal += 1;
+    return matches;
+  });
+  if (selected === undefined) {
+    throw new Error("The selected Extension binding changed after discovery.");
+  }
+}
+
+function normalizedExtensionSourceId(value: string): string {
+  const id = nonBlank(value, "Extension source ID");
+  if (!/^extension_source_[a-f0-9]{32}$/u.test(id)) throw new Error("Extension source ID is invalid.");
+  return id;
+}
+
+function normalizedDecimalRevision(value: bigint, label: string): string {
+  if (value < 1n) throw new Error(`${label} is invalid.`);
+  return value.toString(10);
+}
+
+function normalizedContentRevision(value: string, label: string): string {
+  if (!/^sha256:[a-f0-9]{64}$/u.test(value)) throw new Error(`${label} is invalid.`);
+  return value;
+}
+
+function normalizeExtensionPackagePath(value: string): string {
+  const path = nonBlank(value, "Extension source package path");
+  if (
+    path.length > 512
+    || path.includes("\\")
+    || path.startsWith("/")
+    || isAbsolute(path)
+    || path.split("/").some((part) => part === "" || part === "." || part === ".." || part.toLowerCase() === ".git")
+  ) {
+    throw new Error("Extension source package path is invalid.");
+  }
+  return path;
+}
+
+function extensionSourcePackageIdentity(source: StoredExtensionSourcePackage): string {
+  return `extension-source:${createHash("sha256")
+    .update(`${source.sourceIdentity}\0${source.packageRelativePath}`)
+    .digest("hex")}`;
+}
+
+function extensionSourcePackageFingerprint(source: StoredExtensionSourcePackage): string {
+  return `sha256:${createHash("sha256").update(extensionSourcePackageIdentity(source)).digest("hex")}`;
 }
 
 function storedUpdateIntentIdentity(intent: StoredResourceUpdateIntent): string {
@@ -1930,6 +4527,9 @@ function copyResourceDetail(detail: PiPackageResourceDetail): PiPackageResourceD
   return {
     kind: detail.kind,
     name: detail.name,
+    ...(detail.entryPath === undefined ? {} : { entryPath: detail.entryPath }),
+    ...(detail.mainView === undefined ? {} : { mainView: { ...detail.mainView } }),
+    ...(detail.library === undefined ? {} : { library: { ...detail.library } }),
     compatibility: detail.compatibility,
     compatibilityIssues: [...detail.compatibilityIssues],
     detectedApis: [...detail.detectedApis],
@@ -1948,7 +4548,8 @@ function resourceCompatibilityIdentity(record: StoredResource): string {
     requiresExtensionApproval: record.requiresExtensionApproval,
     extensionContentFingerprint: record.extensionContentFingerprint,
     extensionApprovedRevision: record.extensionApprovedRevision,
-    postMutationNotice: record.postMutationNotice
+    postMutationNotice: record.postMutationNotice,
+    packageIdentity: record.packageIdentity
   });
 }
 
@@ -2000,6 +4601,13 @@ function validateStoredResourceDetails(value: readonly PiPackageResourceDetail[]
     if (
       !detail || typeof detail !== "object" || !kinds.has(detail.kind) || !compatibility.has(detail.compatibility)
       || typeof detail.name !== "string" || detail.name.trim() === "" || detail.name.length > 256
+      || Object.keys(detail).some((key) => ![
+        "kind", "name", "entryPath", "mainView", "library", "compatibility", "compatibilityIssues", "detectedApis", "adaptedApis", "unsupportedApis"
+      ].includes(key))
+      || detail.kind === "extension" !== (typeof detail.entryPath === "string")
+      || detail.entryPath !== undefined && !isStoredPackageRelativePath(detail.entryPath)
+      || detail.mainView !== undefined && (detail.kind !== "extension" || !isExtensionMainViewDescriptor(detail.mainView))
+      || detail.library !== undefined && (detail.kind !== "extension" || !isExtensionLibraryDescriptor(detail.library))
     ) throw new Error("Stored resource compatibility detail is malformed.");
     const compatibilityIssues = validateStringEnumList(detail.compatibilityIssues, issues, "compatibility issue");
     const detectedApis = validateStringEnumList(detail.detectedApis, apis, "detected API");
@@ -2008,6 +4616,9 @@ function validateStoredResourceDetails(value: readonly PiPackageResourceDetail[]
     return {
       kind: detail.kind,
       name: detail.name,
+      ...(detail.entryPath === undefined ? {} : { entryPath: detail.entryPath }),
+      ...(detail.mainView === undefined ? {} : { mainView: { ...detail.mainView } }),
+      ...(detail.library === undefined ? {} : { library: { ...detail.library } }),
       compatibility: detail.compatibility,
       compatibilityIssues: compatibilityIssues as PiPackageResourceDetail["compatibilityIssues"],
       detectedApis: detectedApis as PiPackageResourceDetail["detectedApis"],
@@ -2015,6 +4626,11 @@ function validateStoredResourceDetails(value: readonly PiPackageResourceDetail[]
       unsupportedApis: unsupportedApis as PiPackageResourceDetail["unsupportedApis"]
     };
   });
+}
+
+function isStoredPackageRelativePath(value: string): boolean {
+  return value.length > 0 && value.length <= 2_048 && value === value.trim() && !value.includes("\\") && !value.startsWith("/")
+    && !/^[A-Za-z]:/u.test(value) && value.split("/").every((part) => part !== "" && part !== "." && part !== "..");
 }
 
 function validateStoredRuntimeRequirements(value: readonly PiPackageRuntimeRequirement[]): readonly PiPackageRuntimeRequirement[] {
@@ -2051,18 +4667,25 @@ function validateStringEnumList(value: readonly string[], allowed: ReadonlySet<s
 
 function validateStoredResource(value: StoredResource): StoredResource {
   if (!value || typeof value !== "object") throw new Error("Stored Pi resource is malformed.");
-  const stored = value as StoredResource & { readonly source?: PiPackageSource };
+  const stored = value as StoredResource & { readonly source?: StoredResourceSource };
   validateResourceId(stored.id);
   validateKind(stored.kind);
   validateScope(stored.scope);
   validateState(stored.state);
   if (!/^\d+$/u.test(stored.versionNumber) || !Number.isSafeInteger(stored.updatedAt)) throw new Error("Stored Pi resource version is malformed.");
   if (stored.source === undefined) throw new Error("Stored Pi resource source is missing.");
-  const source = normalizePiPackageSource(stored.source);
-  if (JSON.stringify(source) !== JSON.stringify(stored.source)) throw new Error("Stored Pi resource source is not canonical.");
-  if (source.kind !== "local" && stored.kind !== "package") throw new Error("Only package resources may use npm or git acquisition.");
+  const source = stored.source.kind === "extension_source"
+    ? validateStoredExtensionSourcePackage(stored.source)
+    : stored.source.kind === "skill_market"
+      ? validateStoredSkillMarketSource(stored.source)
+      : normalizePiPackageSource(stored.source);
+  if (!sameFlatRecord(source, stored.source)) throw new Error("Stored Pi resource source is not canonical.");
+  if (source.kind !== "local" && source.kind !== "skill_market" && stored.kind !== "package") {
+    throw new Error("Only package resources may use managed package acquisition.");
+  }
+  if (source.kind === "skill_market" && stored.kind !== "skill") throw new Error("Skill market provenance may only own a Skill Resource.");
   let canonicalPath: string | undefined;
-  if (source.kind === "local") {
+  if (source.kind === "local" || source.kind === "skill_market" && stored.scope === "project") {
     canonicalPath = normalizedAbsolute(stored.canonicalPath!, "Stored canonical resource path");
   } else if (stored.canonicalPath !== undefined) {
     throw new Error("Stored remote resource contains a local canonical path.");
@@ -2075,16 +4698,34 @@ function validateStoredResource(value: StoredResource): StoredResource {
   if (stored.scope !== "project" && (stored.targetId !== undefined || stored.workspaceRoot !== undefined)) {
     throw new Error("Stored non-project resource crosses a Target trust boundary.");
   }
-  const sourceIdentity = stored.kind === "package"
-    ? piPackageSourceIdentity(source)
+  if (source.kind === "skill_market" && (
+    stored.scope === "project" && stored.installedPath !== undefined
+    || stored.scope !== "project" && stored.scope !== "global"
+  )) throw new Error("Stored Skill market Resource has an invalid install scope.");
+  const sourceIdentity = source.kind === "extension_source"
+    ? extensionSourcePackageIdentity(source)
+    : source.kind === "skill_market"
+      ? skillMarketSourceIdentity(source)
+    : stored.kind === "package"
+      ? piPackageSourceIdentity(source)
     : `${stored.kind}:${pathIdentity(canonicalPath!)}`;
   if (stored.sourceKind !== source.kind || stored.sourceIdentity !== sourceIdentity) {
     throw new Error("Stored Pi resource source identity is malformed.");
   }
-  const sourceDisplay = source.kind === "local" ? basename(canonicalPath!) : piPackageSourceDisplay(source);
+  const sourceDisplay = source.kind === "local"
+    ? basename(canonicalPath!)
+    : source.kind === "extension_source"
+      ? source.sourceDisplay
+      : source.kind === "skill_market"
+        ? skillMarketSourceDisplay(source)
+      : piPackageSourceDisplay(source);
   const canonicalPathFingerprint = source.kind === "local"
     ? pathFingerprint(canonicalPath!)
-    : `sha256:${createHash("sha256").update(sourceIdentity).digest("hex")}`;
+    : source.kind === "extension_source"
+      ? extensionSourcePackageFingerprint(source)
+      : source.kind === "skill_market"
+        ? stored.scope === "project" ? pathFingerprint(canonicalPath!) : skillMarketSourceFingerprint(source)
+      : `sha256:${createHash("sha256").update(sourceIdentity).digest("hex")}`;
   if (stored.sourceDisplay !== sourceDisplay || stored.canonicalPathFingerprint !== canonicalPathFingerprint) {
     throw new Error("Stored Pi resource source metadata is malformed.");
   }
@@ -2101,11 +4742,14 @@ function validateStoredResource(value: StoredResource): StoredResource {
   const storedCompatibility = validateStoredCompatibility(stored);
   let pendingUpdate: StoredResourceUpdateIntent | undefined;
   if (stored.pendingUpdate !== undefined) {
+    if (source.kind === "extension_source" || source.kind === "skill_market") {
+      throw new Error("Stored source-owned resources cannot contain a generic update intent.");
+    }
     if (!stored.pendingUpdate || typeof stored.pendingUpdate !== "object") {
       throw new Error("Stored resource update intent is malformed.");
     }
     const pendingSource = normalizePiPackageSource(stored.pendingUpdate.source);
-    if (JSON.stringify(pendingSource) !== JSON.stringify(stored.pendingUpdate.source)) {
+    if (!sameFlatRecord(pendingSource, stored.pendingUpdate.source)) {
       throw new Error("Stored resource update source is not canonical.");
     }
     if (stored.kind !== "package" && pendingSource.kind !== "local") {
@@ -2141,6 +4785,12 @@ function validateStoredResource(value: StoredResource): StoredResource {
   if (extensionApprovedRevision !== undefined && !/^sha256:[a-f0-9]{64}$/u.test(extensionApprovedRevision)) {
     throw new Error("Stored extension approval fingerprint is malformed.");
   }
+  const packageIdentity = stored.packageIdentity === undefined
+    ? undefined
+    : boundedPackageIdentity(stored.packageIdentity);
+  if (stored.kind === "package" && stored.installedPath !== undefined && packageIdentity === undefined) {
+    throw new Error("Stored installed package Resource is missing its package identity.");
+  }
   const {
     source: _source,
     sourceKind: _sourceKind,
@@ -2165,8 +4815,94 @@ function validateStoredResource(value: StoredResource): StoredResource {
     ...(pendingUpdate === undefined ? {} : { pendingUpdate }),
     ...(canonicalPath === undefined ? {} : { canonicalPath }),
     ...(stored.version === undefined ? {} : { version: boundedVersion(stored.version) }),
+    ...(packageIdentity === undefined ? {} : { packageIdentity }),
     ...(stored.error === undefined ? {} : { error: redactSecrets(stored.error).slice(0, 2_048) })
   };
+}
+
+function validateStoredExtensionSourcePackage(value: StoredExtensionSourcePackage): StoredExtensionSourcePackage {
+  if (!value || typeof value !== "object" || value.kind !== "extension_source") {
+    throw new Error("Stored Extension Source provenance is malformed.");
+  }
+  const sourceRevision = value.sourceRevision;
+  if (!/^[1-9]\d*$/u.test(sourceRevision)) throw new Error("Stored Extension Source revision is malformed.");
+  return {
+    kind: "extension_source",
+    sourceId: normalizedExtensionSourceId(value.sourceId),
+    sourceRevision,
+    sourceIdentity: nonBlank(value.sourceIdentity, "Stored Extension source identity"),
+    sourceDisplay: nonBlank(value.sourceDisplay, "Stored Extension source display"),
+    packageRelativePath: normalizeExtensionPackagePath(value.packageRelativePath),
+    packageContentRevision: normalizedContentRevision(value.packageContentRevision, "Stored Extension source package revision")
+  };
+}
+
+function normalizeStoredSkillMarketSource(
+  value: Pick<PiMarketSkillSourceInput, "sourceId" | "sourceRevision" | "entryId" | "entryRevision" | "entryContentRevision" | "sourceName" | "slug"> & { readonly relativeParent?: string },
+  installedContentRevision = value.entryContentRevision
+): StoredSkillMarketSource {
+  const sourceName = nonBlank(value.sourceName, "Skill market source name");
+  if (sourceName.length > 128) throw new Error("Skill market source name is too long.");
+  return {
+    kind: "skill_market",
+    sourceId: normalizedMarketSourceId(value.sourceId),
+    sourceRevision: normalizedDecimalRevision(value.sourceRevision, "Skill market source revision"),
+    entryId: normalizedMarketEntryId(value.entryId),
+    entryRevision: normalizedDecimalRevision(value.entryRevision, "Skill market entry revision"),
+    entryContentRevision: normalizedContentRevision(value.entryContentRevision, "Skill market entry content revision"),
+    installedContentRevision: normalizedContentRevision(installedContentRevision, "Installed market Skill content revision"),
+    sourceName,
+    slug: portableSkillName(value.slug),
+    ...(value.relativeParent === undefined ? {} : { relativeParent: portableProjectSkillParent(value.relativeParent) })
+  };
+}
+
+function validateStoredSkillMarketSource(value: StoredSkillMarketSource): StoredSkillMarketSource {
+  if (!value || typeof value !== "object" || value.kind !== "skill_market") {
+    throw new Error("Stored Skill market provenance is malformed.");
+  }
+  const normalized = normalizeStoredSkillMarketSource({
+    sourceId: value.sourceId,
+    sourceRevision: BigInt(value.sourceRevision),
+    entryId: value.entryId,
+    entryRevision: BigInt(value.entryRevision),
+    entryContentRevision: value.entryContentRevision,
+    sourceName: value.sourceName,
+    slug: value.slug,
+    ...(value.relativeParent === undefined ? {} : { relativeParent: value.relativeParent })
+  }, value.installedContentRevision);
+  if (!sameFlatRecord(normalized, value)) throw new Error("Stored Skill market provenance is not canonical.");
+  return normalized;
+}
+
+function normalizedMarketSourceId(value: string): string {
+  const id = nonBlank(value, "Skill market source ID");
+  if (!/^skill_market_source_[a-f0-9]{32}$/u.test(id)) throw new Error("Skill market source ID is invalid.");
+  return id;
+}
+
+function normalizedMarketEntryId(value: string): string {
+  const id = nonBlank(value, "Skill market entry ID");
+  if (!/^skill_market_entry_[a-f0-9]{32}$/u.test(id)) throw new Error("Skill market entry ID is invalid.");
+  return id;
+}
+
+function skillMarketSourceIdentity(source: StoredSkillMarketSource): string {
+  return `skill-market:${createHash("sha256").update(`${source.sourceId}\0${source.entryId}`).digest("hex")}`;
+}
+
+function skillMarketSourceDisplay(source: StoredSkillMarketSource): string {
+  return `${source.sourceName} · ${source.slug}`;
+}
+
+function skillMarketSourceFingerprint(source: StoredSkillMarketSource): string {
+  return `sha256:${createHash("sha256").update(JSON.stringify(source)).digest("hex")}`;
+}
+
+function sameFlatRecord(left: object, right: object): boolean {
+  const entries = (value: object): readonly (readonly [string, unknown])[] => Object.entries(value)
+    .sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey, "en"));
+  return JSON.stringify(entries(left)) === JSON.stringify(entries(right));
 }
 
 function omitInstalledPath(record: StoredResource): Omit<StoredResource, "installedPath"> {
@@ -2221,6 +4957,14 @@ function safeId(id: string): string {
 function safePayloadName(name: string): string {
   const value = name.replace(/[<>:"/\\|?*\u0000-\u001f]/gu, "_").trim();
   return value === "" || value === "." || value === ".." || value === RESOURCE_GENERATIONS_DIRECTORY ? "resource" : value;
+}
+
+function portableSkillName(value: string): string {
+  const name = nonBlank(value, "Skill name");
+  if (name.length > 100 || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(name)) {
+    throw new Error("Skill name must use lowercase letters, numbers, and single hyphens.");
+  }
+  return name;
 }
 
 function validateResourceId(id: string): void {
@@ -2327,10 +5071,12 @@ function pathIdentity(path: string): string {
 }
 
 function isDirectProjectResource(record: StoredResource): record is StoredResource & {
-  readonly source: Extract<PiPackageSource, { readonly kind: "local" }>;
+  readonly source: Extract<StoredResourceSource, { readonly kind: "local" | "skill_market" }>;
   readonly canonicalPath: string;
 } {
-  return record.scope === "project" && record.source.kind === "local" && record.canonicalPath !== undefined;
+  return record.scope === "project"
+    && (record.source.kind === "local" || record.source.kind === "skill_market")
+    && record.canonicalPath !== undefined;
 }
 
 function boundedVersion(value: string): string {
@@ -2339,10 +5085,40 @@ function boundedVersion(value: string): string {
   return version;
 }
 
+function boundedPackageIdentity(value: string): string {
+  const identity = nonBlank(value, "Resource package identity");
+  if (identity.length > 214) throw new Error("Resource package identity is too long.");
+  return identity;
+}
+
 function nonBlank(value: string, label: string): string {
   const normalized = value.trim();
   if (normalized === "" || normalized.includes("\0")) throw new Error(`${label} must not be blank.`);
   return normalized;
+}
+
+function requiredJournalString(record: Readonly<Record<string, unknown>>, key: string): string {
+  const value = record[key];
+  if (typeof value !== "string" || value.length === 0 || value.includes("\0")) {
+    throw new Error(`Project Skill transaction journal ${key} is malformed.`);
+  }
+  return value;
+}
+
+function journalVersion(record: Readonly<Record<string, unknown>>, key: string): string {
+  const value = requiredJournalString(record, key);
+  if (!/^\d+$/u.test(value)) throw new Error(`Project Skill transaction journal ${key} is malformed.`);
+  return BigInt(value).toString(10);
+}
+
+function nullableJournalVersion(record: Readonly<Record<string, unknown>>, key: string): string | null {
+  if (record[key] === null) return null;
+  return journalVersion(record, key);
+}
+
+function nullableJournalRevision(record: Readonly<Record<string, unknown>>, key: string): string | null {
+  if (record[key] === null) return null;
+  return normalizedContentRevision(requiredJournalString(record, key), `Project Skill transaction ${key}`);
 }
 
 async function removeOwnedPath(root: string, path: string, label: string): Promise<void> {
