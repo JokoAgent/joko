@@ -30,6 +30,7 @@ import {
   type NativeSessionNavigation,
   type NativeSessionNavigationResult,
   type NativeMemoryResetResult,
+  type NativeMemoryStatus,
   type NativeHistoryProjection,
   type NativeNavigationTarget,
   type NativeSessionState,
@@ -591,6 +592,77 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     });
   }
 
+  async readNativeMemoryStatus(signal?: AbortSignal): Promise<NativeMemoryStatus> {
+    if (this.#resolveNativeMemoryEnabled === undefined) return this.unsupported("memory.native");
+    return this.#withNativeMemoryReconcile(async () => {
+      this.#assertOpen();
+      if (signal?.aborted) {
+        throw this.#requestFailure(
+          new TransportFault("closed", "The native-memory status read was cancelled."),
+          "probe",
+          "CODEX_NATIVE_MEMORY_STATUS_FAILED",
+          false
+        );
+      }
+      let hostGeneration: number;
+      try {
+        hostGeneration = await this.#host.ensureStarted();
+      } catch (error) {
+        throw this.#requestFailure(error, "probe", "CODEX_NATIVE_MEMORY_STATUS_FAILED", false);
+      }
+      const assertCurrent = () => {
+        this.#assertOpen();
+        if (signal?.aborted) {
+          throw new TransportFault("closed", "The native-memory status read was cancelled.");
+        }
+        if (!this.#host.isActiveGeneration(hostGeneration)) {
+          throw new TransportFault("process_exited", "The native-memory status owner changed.");
+        }
+      };
+      assertCurrent();
+      if (!supportsNativeMemoryRuntime(this.#host)) return this.unsupported("memory.native");
+      const desiredEnabled = await this.#readNativeMemoryPreference();
+      assertCurrent();
+      await this.#applyNativeMemoryPreference(this.#host, desiredEnabled, true, assertCurrent, signal);
+      assertCurrent();
+      let response;
+      try {
+        response = await this.#host.request("config/read", { includeLayers: false }, {
+          signal,
+          beforeDispatch: assertCurrent
+        });
+        assertCurrent();
+      } catch (error) {
+        throw this.#requestFailure(error, "probe", "CODEX_NATIVE_MEMORY_STATUS_FAILED", false);
+      }
+      let enabled: boolean;
+      try {
+        const record = objectValue(response.value, "native memory status response");
+        const config = objectValue(record["config"], "native memory effective config");
+        const features = objectValue(config["features"], "native memory effective features");
+        if (typeof features["memories"] !== "boolean") {
+          throw new ProtocolShapeError("Native memory enablement is missing");
+        }
+        enabled = features["memories"];
+      } catch {
+        throw adapterError({
+          code: "CODEX_NATIVE_MEMORY_STATUS_INVALID",
+          message: "Codex returned an invalid native-memory status.",
+          phase: "probe",
+          retryable: false,
+          stateMayHaveChanged: false,
+          recovery: "Keep the runtime status unavailable until Codex returns the fixed effective configuration shape."
+        });
+      }
+      if (enabled !== desiredEnabled
+        && this.#nativeMemoryOverride?.host === this.#host
+        && this.#nativeMemoryOverride.hostGeneration === hostGeneration) {
+        this.#nativeMemoryOverride = undefined;
+      }
+      return { enabled };
+    });
+  }
+
   async resetNativeMemory(): Promise<NativeMemoryResetResult> {
     if (this.#resolveNativeMemoryEnabled === undefined) return this.unsupported("memory.native");
     return this.#withNativeMemoryReconcile(async () => {
@@ -611,7 +683,6 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       } catch (error) {
         throw this.#requestFailure(error, "dispatch", "CODEX_NATIVE_MEMORY_RESET_FAILED", false);
       }
-      this.#assertOpen();
       try {
         objectValue(response.value, "native memory reset response");
       } catch {

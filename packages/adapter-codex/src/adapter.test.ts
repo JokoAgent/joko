@@ -2384,6 +2384,94 @@ describe("CodexBackendAdapter", () => {
     expect(setup.fake.nativeMemoryResetCount).toBe(2);
   });
 
+  it("keeps a completed Codex native-memory reset authoritative across Adapter disposal", async () => {
+    const setup = await createSetup(7, { resolveNativeMemoryEnabled: () => true });
+    await setup.adapter.describe();
+    const transport = setup.fake.transport!;
+    const request = transport.request.bind(transport);
+    let releaseResponse!: () => void;
+    let markResetCompleted!: () => void;
+    const responseGate = new Promise<void>((resolve) => { releaseResponse = resolve; });
+    const resetCompleted = new Promise<void>((resolve) => { markResetCompleted = resolve; });
+    vi.spyOn(transport, "request").mockImplementation(async (method, params, options) => {
+      const result = await request(method, params, options);
+      if (method === "memory/reset") {
+        markResetCompleted();
+        await responseGate;
+      }
+      return result;
+    });
+
+    const reset = setup.adapter.resetNativeMemory();
+    await resetCompleted;
+    expect(setup.fake.nativeMemoryResetCount).toBe(1);
+    await setup.adapter.dispose();
+    releaseResponse();
+
+    await expect(reset).resolves.toEqual({});
+  });
+
+  it("reads effective Codex native-memory status from the exact local runtime and re-pushes after restart", async () => {
+    let enabled = true;
+    const setup = await createRemoteSetup({ resolveNativeMemoryEnabled: () => enabled });
+
+    await expect(setup.adapter.readNativeMemoryStatus()).resolves.toEqual({ enabled: true });
+    let requests = setup.localFake.transport!.requests;
+    expect(requests.findIndex((request) => request.method === "experimentalFeature/enablement/set"))
+      .toBeLessThan(requests.findIndex((request) => request.method === "config/read"));
+    expect(setup.resolveRemote).not.toHaveBeenCalled();
+    expect(setup.remoteFake.transport).toBeUndefined();
+
+    enabled = false;
+    await expect(setup.adapter.readNativeMemoryStatus()).resolves.toEqual({ enabled: false });
+    expect(setup.localFake.nativeMemoryEnabled).toBe(false);
+
+    await setup.localFake.transport!.exit(false);
+    enabled = true;
+    await expect(setup.adapter.readNativeMemoryStatus()).resolves.toEqual({ enabled: true });
+    requests = setup.localFake.transport!.requests;
+    expect(requests.findIndex((request) => request.method === "experimentalFeature/enablement/set"))
+      .toBeLessThan(requests.findIndex((request) => request.method === "config/read"));
+    expect(setup.resolveRemote).not.toHaveBeenCalled();
+    expect(setup.remoteFake.transport).toBeUndefined();
+  });
+
+  it("fails closed for unconfirmed, malformed, failed, or cancelled Codex native-memory status", async () => {
+    const setup = await createSetup(7, { resolveNativeMemoryEnabled: () => true });
+
+    setup.fake.malformedNextNativeMemoryEnablement = true;
+    await expect(setup.adapter.readNativeMemoryStatus()).rejects.toMatchObject({
+      publicError: { code: "CODEX_NATIVE_MEMORY_ACK_INVALID", stateMayHaveChanged: true }
+    });
+    expect(setup.fake.transport?.requests.some((request) => request.method === "config/read")).toBe(false);
+
+    setup.fake.nextNativeMemoryStatusResponse = { config: { features: {} } };
+    await expect(setup.adapter.readNativeMemoryStatus()).rejects.toMatchObject({
+      publicError: { code: "CODEX_NATIVE_MEMORY_STATUS_INVALID", stateMayHaveChanged: false }
+    });
+
+    setup.fake.failNextNativeMemoryStatus = true;
+    await expect(setup.adapter.readNativeMemoryStatus()).rejects.toMatchObject({
+      publicError: { code: "CODEX_NATIVE_MEMORY_STATUS_FAILED", stateMayHaveChanged: false }
+    });
+
+    setup.fake.nextNativeMemoryStatusResponse = { config: { features: { memories: false } } };
+    await expect(setup.adapter.readNativeMemoryStatus()).resolves.toEqual({ enabled: false });
+    const reconcileCount = setup.fake.transport!.requests.filter((request) =>
+      request.method === "experimentalFeature/enablement/set").length;
+    await expect(setup.adapter.readNativeMemoryStatus()).resolves.toEqual({ enabled: true });
+    expect(setup.fake.transport!.requests.filter((request) =>
+      request.method === "experimentalFeature/enablement/set")).toHaveLength(reconcileCount + 1);
+
+    const cancelled = new AbortController();
+    cancelled.abort();
+    const requestsBeforeCancel = setup.fake.transport!.requests.length;
+    await expect(setup.adapter.readNativeMemoryStatus(cancelled.signal)).rejects.toMatchObject({
+      publicError: { code: "CODEX_NATIVE_MEMORY_STATUS_FAILED", stateMayHaveChanged: false }
+    });
+    expect(setup.fake.transport!.requests).toHaveLength(requestsBeforeCancel);
+  });
+
   it("marks a lost Codex native-memory reset acknowledgement unknown and never touches a remote runtime", async () => {
     const setup = await createRemoteSetup({ resolveNativeMemoryEnabled: () => true });
     await setup.adapter.describe();

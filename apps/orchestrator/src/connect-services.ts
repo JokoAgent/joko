@@ -12004,12 +12004,16 @@ function validateNativeMemoryStatus(value: unknown): NativeMemoryStatus {
     throw invalidNativeMemoryStatus();
   }
   const status = value as NativeMemoryStatus;
+  if (status.enabled !== undefined && typeof status.enabled !== "boolean") {
+    throw invalidNativeMemoryStatus();
+  }
   for (const count of [status.entryCount, status.sizeBytes]) {
     if (count !== undefined && (!Number.isSafeInteger(count) || count < 0)) {
       throw invalidNativeMemoryStatus();
     }
   }
   return {
+    ...(status.enabled === undefined ? {} : { enabled: status.enabled }),
     ...(status.entryCount === undefined ? {} : { entryCount: status.entryCount }),
     ...(status.sizeBytes === undefined ? {} : { sizeBytes: status.sizeBytes })
   };
@@ -12099,12 +12103,14 @@ function backendMemoryDefaultEnabled(descriptor: BackendDescriptor): boolean {
 async function reconcileNativeMemorySettings(
   dependencies: ConnectServiceDependencies
 ): Promise<void> {
-  const backendIds = dependencies.store.listBackends()
+  const backends = dependencies.store.listBackends()
     .map((item) => item.descriptor)
-    .filter(updatesActiveLocalMemorySessions)
-    .map((descriptor) => descriptor.id);
+    .filter(updatesActiveLocalMemorySessions);
   const failures: string[] = [];
-  await Promise.all(backendIds.map(async (backendId) => {
+  await Promise.all(backends.map(async (descriptor) => {
+    const backendId = descriptor.id;
+    const statusEpoch = beginNativeMemoryStatusRefresh(dependencies, backendId);
+    invalidateNativeMemoryStatus(dependencies, backendId, undefined, statusEpoch);
     try {
       await dependencies.sessionHost.invokeBackendAdapter(backendId, async (adapter) => {
         if (adapter.reconcileNativeMemory === undefined) {
@@ -12486,15 +12492,18 @@ function settingsSnapshot(dependencies: ConnectServiceDependencies): contract.Se
       entryCount: BigInt(memoryState?.entryCount ?? 0),
       backends: memoryBackendRecords.map(({ item, role }) => {
         const nativeStatus = dependencies.nativeMemoryStatuses.get(item.descriptor.id);
+        const currentNativeStatus = nativeStatus !== undefined
+            && nativeStatus.backendInstanceGeneration === item.descriptor.instanceGeneration
+          ? nativeStatus.status
+          : undefined;
         const entryCount = role === "compaction_digest"
           ? memoryState?.backendEntryCount[item.descriptor.id] ?? 0
-          : nativeStatus !== undefined
-              && nativeStatus.backendInstanceGeneration === item.descriptor.instanceGeneration
-            ? nativeStatus.status.entryCount
-            : undefined;
+          : currentNativeStatus?.entryCount;
         return create(contract.BackendMemorySettingsSchema, {
           backendId: item.descriptor.id,
-          enabled: memoryState?.backendEnabled[item.descriptor.id] ?? false,
+          enabled: role === "native_auto_memory" && currentNativeStatus?.enabled !== undefined
+            ? currentNativeStatus.enabled
+            : memoryState?.backendEnabled[item.descriptor.id] ?? false,
           support: dependencies.makerMemory === undefined
             ? contract.CapabilitySupport.TEMPORARILY_UNAVAILABLE
             : contract.CapabilitySupport.SUPPORTED,

@@ -147,6 +147,8 @@ export class FakeCodexAppServer {
   malformedNextNativeMemoryEnablement = false;
   failNextNativeMemoryReset = false;
   malformedNextNativeMemoryReset = false;
+  failNextNativeMemoryStatus = false;
+  nextNativeMemoryStatusResponse: JsonValue | undefined;
   nativeMemoryResetCount = 0;
   nativeMemoryEnabled = false;
   userAgent = "joko/0.153.4 (Windows 10.0.26200; x86_64) unknown (joko; 0.1.0)";
@@ -291,8 +293,23 @@ export class FakeCodexAppServer {
             errors: [...this.reviewSkillErrors]
           }]
         };
-      case "config/read":
-        return { config: structuredClone(this.reviewConfig), origins: {}, layers: null };
+      case "config/read": {
+        if (this.failNextNativeMemoryStatus) {
+          this.failNextNativeMemoryStatus = false;
+          throw new RpcRemoteFault(-32001);
+        }
+        if (this.nextNativeMemoryStatusResponse !== undefined) {
+          const response = this.nextNativeMemoryStatusResponse;
+          this.nextNativeMemoryStatusResponse = undefined;
+          return structuredClone(response);
+        }
+        const config = structuredClone(this.reviewConfig);
+        const configuredFeatures = isObject(config["features"])
+          ? config["features"] as JsonObject
+          : {};
+        config["features"] = { ...configuredFeatures, memories: this.nativeMemoryEnabled };
+        return { config, origins: {}, layers: null };
+      }
       case "experimentalFeature/enablement/set": {
         if (this.failNextNativeMemoryEnablement) {
           this.failNextNativeMemoryEnablement = false;

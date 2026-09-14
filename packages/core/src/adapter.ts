@@ -286,6 +286,8 @@ export interface NativeMemoryResetResult {
 }
 
 export interface NativeMemoryStatus {
+  /** Effective native-runtime enablement; omitted when it cannot be read authoritatively. */
+  readonly enabled?: boolean;
   /** Omitted when the native owner cannot produce a trustworthy count. */
   readonly entryCount?: number;
   /** Private storage size metadata; public projections may deliberately omit it. */

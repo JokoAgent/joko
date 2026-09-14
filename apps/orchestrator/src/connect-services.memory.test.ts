@@ -243,10 +243,15 @@ describe("Connect Maker Memory owner and reset scopes", () => {
       }]])
     };
     let statusMode: "four" | "zero" | "failure" | "stale" = "four";
+    let statusEnabled = false;
     const readNativeMemoryStatus = vi.fn(async () => {
       if (statusMode === "failure") throw new Error("private profile failure");
       if (statusMode === "stale") descriptor = { ...descriptor, instanceGeneration: 2 };
-      return { entryCount: statusMode === "four" ? 4 : 0, sizeBytes: statusMode === "four" ? 40 : 0 };
+      return {
+        enabled: statusEnabled,
+        entryCount: statusMode === "four" ? 4 : 0,
+        sizeBytes: statusMode === "four" ? 40 : 0
+      };
     });
     const resetNativeMemory = vi.fn(async () => {
       statusMode = "zero";
@@ -287,7 +292,10 @@ describe("Connect Maker Memory owner and reset scopes", () => {
       context: unknown
     ) => Promise<{ settings?: contract.SettingsSnapshot }>;
 
-    expect((await getSettings({}, context())).settings?.memory?.backends[0]?.entryCount).toBe(4n);
+    expect((await getSettings({}, context())).settings?.memory?.backends[0]).toMatchObject({
+      enabled: false,
+      entryCount: 4n
+    });
     const reset = await submitReset<contract.SubmitOperationResponse>(services.operation.submitOperation, {
       operationId: "memory-reset-claude-native",
       connectionId: owner.id,
@@ -301,12 +309,110 @@ describe("Connect Maker Memory owner and reset scopes", () => {
     expect(resetNativeMemory).toHaveBeenCalledOnce();
     expect(readNativeMemoryStatus).toHaveBeenCalledTimes(2);
     statusMode = "failure";
+    expect((await getSettings({}, context())).settings?.memory?.backends[0]).toMatchObject({ enabled: true });
     expect((await getSettings({}, context())).settings?.memory?.backends[0]?.entryCount).toBeUndefined();
     statusMode = "zero";
-    expect((await getSettings({}, context())).settings?.memory?.backends[0]?.entryCount).toBe(0n);
+    statusEnabled = true;
+    expect((await getSettings({}, context())).settings?.memory?.backends[0]).toMatchObject({
+      enabled: true,
+      entryCount: 0n
+    });
     statusMode = "stale";
-    expect((await getSettings({}, context())).settings?.memory?.backends[0]?.entryCount).toBeUndefined();
-    expect(readNativeMemoryStatus).toHaveBeenCalledTimes(5);
+    statusEnabled = false;
+    const stale = (await getSettings({}, context())).settings?.memory?.backends[0];
+    expect(stale?.enabled).toBe(true);
+    expect(stale?.entryCount).toBeUndefined();
+    expect(readNativeMemoryStatus).toHaveBeenCalledTimes(6);
+  });
+
+  it("does not let a status read started before a durable native-memory update overwrite the new choice", async () => {
+    const descriptor = {
+      id: "codex-memory",
+      instanceGeneration: 1,
+      capabilities: new Map([["memory.native", {
+        key: "memory.native",
+        supported: true,
+        options: [MEMORY_NATIVE_LIVE_LOCAL_OPTION, MEMORY_NATIVE_DEFAULT_DISABLED_OPTION]
+      }]])
+    };
+    let settings = {
+      format: 1 as const,
+      makerEnabled: false,
+      backendEnabled: { [descriptor.id]: false } as Readonly<Record<string, boolean>>
+    };
+    let releaseStatus!: () => void;
+    let markStatusStarted!: () => void;
+    const statusStarted = new Promise<void>((resolve) => { markStatusStarted = resolve; });
+    const statusGate = new Promise<void>((resolve) => { releaseStatus = resolve; });
+    const readNativeMemoryStatus = vi.fn(async () => {
+      markStatusStarted();
+      await statusGate;
+      return { enabled: false };
+    });
+    const reconcileNativeMemory = vi.fn(async () => "immediate" as const);
+    const adapter = {
+      id: descriptor.id,
+      readNativeMemoryStatus,
+      reconcileNativeMemory
+    } as unknown as BackendAdapter;
+    const store = {
+      findOperation: () => undefined,
+      findSetting: () => undefined,
+      setSetting: (_scope: string, _scopeId: string, _key: string, value: typeof settings) => { settings = value; },
+      getBackend: () => ({ descriptor }),
+      listBackends: () => [{ descriptor, revision: 1n, updatedAt: 1 }],
+      listConnections: () => [],
+      listTargets: () => [],
+      health: () => ({ revision: 1n }),
+      appendDiagnostic: vi.fn(),
+      messageEmbeddingStatus: () => ({
+        vectorAvailable: false,
+        modelId: "",
+        pendingCount: 0,
+        runningCount: 0,
+        doneCount: 0,
+        failedCount: 0
+      })
+    };
+    const makerMemory = {
+      patchedSettings: (patch: { readonly backendId?: string; readonly backendEnabled?: boolean }) => ({
+        ...settings,
+        backendEnabled: patch.backendEnabled === undefined
+          ? settings.backendEnabled
+          : { ...settings.backendEnabled, [patch.backendId!]: patch.backendEnabled }
+      }),
+      reconcileSettingsChange: vi.fn(async () => true),
+      snapshot: () => ({
+        makerEnabled: settings.makerEnabled,
+        customized: true,
+        entryCount: 0,
+        backendEnabled: settings.backendEnabled,
+        backendEntryCount: { [descriptor.id]: 0 }
+      })
+    };
+    const services = createConnectServices(stubApplication({
+      store,
+      adapters: [adapter],
+      makerMemory,
+      sessionHost: immediateHost(store, adapter)
+    }));
+    const getSettings = services.settings.getSettings as unknown as (
+      request: unknown,
+      context: unknown
+    ) => Promise<{ settings?: contract.SettingsSnapshot }>;
+
+    const pendingStatus = getSettings({}, context());
+    await statusStarted;
+    await submitMemoryUpdate(services.operation.submitOperation, {
+      operationId: "memory-native-update-during-status",
+      connectionId: owner.id,
+      backendId: descriptor.id,
+      backendEnabled: true
+    });
+    releaseStatus();
+
+    expect((await pendingStatus).settings?.memory?.backends[0]?.enabled).toBe(true);
+    expect(reconcileNativeMemory).toHaveBeenCalledOnce();
   });
 
   it("does not invoke a native reset owner unless the capability option and method agree", async () => {
