@@ -2017,6 +2017,116 @@ export interface ResourceView {
   readonly error?: string;
 }
 
+export type SkillScopeView = "global" | "project";
+
+export interface SkillDescriptorView {
+  readonly id: string;
+  readonly backendId: string;
+  readonly targetId?: string;
+  readonly scope: SkillScopeView;
+  readonly name: string;
+  /** Path-free basename or package label supplied by the service. */
+  readonly sourceLabel: string;
+  readonly state: ResourceView["state"];
+  readonly enabled: boolean;
+  readonly canToggle: boolean;
+  readonly contentAvailable: boolean;
+  readonly canEdit: boolean;
+  readonly canDelete: boolean;
+  readonly revision: bigint;
+  readonly approvedRevision: string;
+  readonly updatedAt: number;
+}
+
+export interface SkillCatalogView {
+  readonly revision: bigint;
+  readonly skills: readonly SkillDescriptorView[];
+}
+
+export interface SkillMetadataView {
+  readonly name?: string;
+  readonly description?: string;
+  readonly version?: string;
+  readonly frontmatter: Readonly<Record<string, unknown>>;
+  readonly parseError?: string;
+}
+
+export interface SkillFileEntryView {
+  readonly key: string;
+  readonly name: string;
+  readonly kind: "directory" | "file";
+  readonly size: number;
+  readonly editable: boolean;
+}
+
+export interface SkillFileContentView {
+  readonly key: string;
+  readonly content: string;
+  readonly revision: string;
+  readonly size: number;
+  readonly editable: boolean;
+}
+
+export interface SkillDiffChangeView {
+  readonly key: string;
+  readonly kind: "added" | "modified" | "deleted";
+  readonly binary: boolean;
+  readonly unifiedDiff?: string;
+}
+
+export interface SkillDiffView {
+  readonly available: boolean;
+  readonly reason?: string;
+  readonly changes: readonly SkillDiffChangeView[];
+  readonly truncated: boolean;
+}
+
+export interface SkillSessionView {
+  readonly id: string;
+  readonly skill: SkillDescriptorView;
+  readonly observedRevision: string;
+  readonly dirty: boolean;
+  readonly baselineAvailable: boolean;
+  readonly metadata: SkillMetadataView;
+  readonly files: readonly SkillFileEntryView[];
+  readonly fileCount: number;
+  readonly bytes: number;
+  readonly diff: SkillDiffView;
+  readonly expiresAt: number;
+}
+
+export interface SkillDraftView {
+  readonly id: string;
+  readonly sessionId: string;
+  readonly skillId: string;
+  readonly kind: "edit" | "rename";
+  readonly name: string;
+  readonly resourceRevision: bigint;
+  readonly observedRevision: string;
+  readonly changes: readonly SkillDiffChangeView[];
+  readonly expiresAt: number;
+}
+
+export interface SkillRecoveryView {
+  readonly id: string;
+  readonly skillId: string;
+  readonly backendId: string;
+  readonly targetId?: string;
+  readonly scope: SkillScopeView;
+  readonly name: string;
+  readonly revision: string;
+  readonly files: number;
+  readonly bytes: number;
+  readonly createdAt: number;
+  readonly status: "ready" | "missing";
+}
+
+export interface SkillMutationResultView {
+  readonly skill?: SkillDescriptorView;
+  readonly replacedSkillId?: string;
+  readonly recoveryId?: string;
+}
+
 /** Exact loaded resource identity owned by one live task runtime. */
 export interface SessionResourceView {
   readonly sessionId: string;
@@ -4018,6 +4128,24 @@ export interface OperationApi {
   addResource(draft: ResourceDraft): Promise<void>;
   setResourceEnabled(resourceId: string, enabled: boolean): Promise<void>;
   removeResource(resourceId: string): Promise<void>;
+  listSkills(options?: {
+    readonly query?: string;
+    readonly backendId?: string;
+    readonly targetId?: string;
+    readonly scope?: SkillScopeView;
+    readonly signal?: AbortSignal;
+  }): Promise<SkillCatalogView>;
+  openSkill(skillId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<SkillSessionView>;
+  listSkillFiles(sessionId: string, parentKey?: string, signal?: AbortSignal): Promise<readonly SkillFileEntryView[]>;
+  readSkillFile(sessionId: string, key: string, signal?: AbortSignal): Promise<SkillFileContentView>;
+  getSkillDiff(sessionId: string, signal?: AbortSignal): Promise<SkillDiffView>;
+  prepareSkillFileEdit(sessionId: string, key: string, expectedFileRevision: string, content: string, signal?: AbortSignal): Promise<SkillDraftView>;
+  prepareSkillRename(sessionId: string, name: string, signal?: AbortSignal): Promise<SkillDraftView>;
+  applySkillDraft(draft: SkillDraftView, signal?: AbortSignal): Promise<SkillMutationResultView>;
+  setSkillEnabled(skill: SkillDescriptorView, enabled: boolean, signal?: AbortSignal): Promise<SkillMutationResultView>;
+  deleteSkill(session: SkillSessionView, confirmation: string, signal?: AbortSignal): Promise<SkillMutationResultView>;
+  listSkillRecoveries(signal?: AbortSignal): Promise<readonly SkillRecoveryView[]>;
+  closeSkill(sessionId: string, signal?: AbortSignal): Promise<boolean>;
   listCommands(sessionId: string): Promise<readonly RuntimeCommandView[]>;
   listSessionResources(sessionId: string, signal?: AbortSignal): Promise<readonly SessionResourceView[]>;
   listRuntimeProcesses(backendId: string, signal?: AbortSignal): Promise<RuntimeProcessUsageSnapshotView>;

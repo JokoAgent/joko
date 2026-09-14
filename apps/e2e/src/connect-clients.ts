@@ -16,6 +16,7 @@ import {
   SchedulerService,
   SessionService,
   SettingsService,
+  SkillService,
   TargetService,
   TerminalService,
   ToolService,
@@ -32,6 +33,7 @@ export interface E2eClients {
   readonly session: Client<typeof SessionService>;
   readonly portableSession: Client<typeof PortableSessionService>;
   readonly settings: Client<typeof SettingsService>;
+  readonly skill: Client<typeof SkillService>;
   readonly run: Client<typeof RunService>;
   readonly queue: Client<typeof QueueService>;
   readonly scheduler: Client<typeof SchedulerService>;
@@ -75,6 +77,7 @@ export function createE2eClients(baseUrl: string, authKey?: string, timeoutMs = 
     session: createClient(SessionService, transport),
     portableSession: createClient(PortableSessionService, transport),
     settings: createClient(SettingsService, transport),
+    skill: createClient(SkillService, transport),
     run: createClient(RunService, transport),
     queue: createClient(QueueService, transport),
     scheduler: createClient(SchedulerService, transport),

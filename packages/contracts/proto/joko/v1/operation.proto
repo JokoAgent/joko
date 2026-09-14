@@ -11,6 +11,7 @@ import "joko/v1/model.proto";
 import "joko/v1/review.proto";
 import "joko/v1/runtime.proto";
 import "joko/v1/settings.proto";
+import "joko/v1/skill.proto";
 import "joko/v1/subagent.proto";
 import "joko/v1/tool.proto";
 import "joko/v1/workspace.proto";
@@ -210,7 +211,25 @@ message OperationMutation {
     RemoveExtensionPackageMutation remove_extension_package = 193;
     StartExtensionPackageExportMutation start_extension_package_export = 194;
     CancelExtensionPackageExportMutation cancel_extension_package_export = 195;
+    ApplySkillDraftMutation apply_skill_draft = 196;
+    SetSkillEnabledMutation set_skill_enabled = 197;
+    DeleteSkillMutation delete_skill = 198;
   }
+}
+
+message ApplySkillDraftMutation {
+  string draft_id = 1;
+}
+
+message SetSkillEnabledMutation {
+  string skill_id = 1;
+  Revision expected_resource_revision = 2;
+  bool enabled = 3;
+}
+
+message DeleteSkillMutation {
+  string session_id = 1;
+  string confirmation = 2;
 }
 
 message SetExtensionEnabledMutation {
@@ -1382,6 +1401,7 @@ message OperationResult {
     DeviceControlRelation device_control_relation = 32;
     ScheduleRunsReadResult schedule_runs_read = 33;
     ScheduleDeletionResult schedule_deletion = 34;
+    SkillMutationResult skill = 35;
   }
 }
 

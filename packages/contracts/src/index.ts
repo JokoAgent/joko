@@ -15,6 +15,7 @@ export * from "./gen/joko/v1/runtime_pb.js";
 export * from "./gen/joko/v1/review_pb.js";
 export * from "./gen/joko/v1/service_pb.js";
 export * from "./gen/joko/v1/settings_pb.js";
+export * from "./gen/joko/v1/skill_pb.js";
 export * from "./gen/joko/v1/subagent_pb.js";
 export * from "./gen/joko/v1/snapshot_pb.js";
 export * from "./gen/joko/v1/tool_pb.js";

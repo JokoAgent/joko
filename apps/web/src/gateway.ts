@@ -226,6 +226,11 @@ import {
   SessionState,
   SessionTitleSuggestionStatus,
   SessionWorktreeState,
+  SkillDiffChangeKind,
+  SkillDraftKind,
+  SkillFileKind,
+  SkillRecoveryStatus,
+  SkillService,
   SubagentActivityKind,
   SubagentControlAction,
   SubagentParentContext,
@@ -329,6 +334,14 @@ import {
   type SessionMessageSearchMatch,
   type Session,
   type SessionStatistics as ProtoSessionStatistics,
+  type SkillDescriptor as ProtoSkillDescriptor,
+  type SkillDiff as ProtoSkillDiff,
+  type SkillDiffChange as ProtoSkillDiffChange,
+  type SkillDraft as ProtoSkillDraft,
+  type SkillFileContent as ProtoSkillFileContent,
+  type SkillFileEntry as ProtoSkillFileEntry,
+  type SkillRecovery as ProtoSkillRecovery,
+  type SkillSession as ProtoSkillSession,
   type Snapshot,
   type Usage as ProtoUsage,
   type UsageCurrencyTotal as ProtoUsageCurrencyTotal,
@@ -485,6 +498,16 @@ import type {
   SessionView,
   SessionWorktreeRemovalPreviewView,
   SessionWorktreeView,
+  SkillCatalogView,
+  SkillDescriptorView,
+  SkillDiffChangeView,
+  SkillDiffView,
+  SkillDraftView,
+  SkillFileContentView,
+  SkillFileEntryView,
+  SkillMutationResultView,
+  SkillRecoveryView,
+  SkillSessionView,
   SubagentControlActionView,
   SubagentRunDetailView,
   SubagentRunPageView,
@@ -2747,6 +2770,247 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
 
   async removeResource(resourceId: string): Promise<void> {
     await this.submit({ case: "removeResource", value: { resourceId } }, true);
+  }
+
+  async listSkills(options: {
+    readonly query?: string;
+    readonly backendId?: string;
+    readonly targetId?: string;
+    readonly scope?: SkillDescriptorView["scope"];
+    readonly signal?: AbortSignal;
+  } = {}): Promise<SkillCatalogView> {
+    const scope = this.captureActionScope(options.signal);
+    const client = createClient(SkillService, scope.transport);
+    skillsCatalogAttempts:
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const skills: SkillDescriptorView[] = [];
+      const identities = new Set<string>();
+      const consumedTokens = new Set<string>();
+      let pageToken = "";
+      let revision: bigint | undefined;
+      let totalSize: number | undefined;
+      for (let pageIndex = 0; pageIndex < MAX_COMPLETE_MESSAGE_SEARCH_PAGES; pageIndex += 1) {
+        scope.signal.throwIfAborted();
+        const response = await client.listSkills({
+          query: options.query ?? "",
+          backendId: options.backendId ?? "",
+          targetId: options.targetId ?? "",
+          ...(options.scope === undefined ? {} : { scope: protoResourceScope(options.scope) }),
+          page: { pageSize: 500, pageToken }
+        }, { signal: scope.signal });
+        const pageRevision = response.catalogRevision?.value;
+        if (pageRevision === undefined) throw new GatewayError("The service returned Skills without a catalog revision.");
+        if (revision === undefined) revision = pageRevision;
+        else if (revision !== pageRevision) {
+          if (attempt === 0) continue skillsCatalogAttempts;
+          throw new GatewayError("Skills changed repeatedly while they were being loaded.");
+        }
+        const pageTotal = response.page === undefined ? undefined : exactSafeUnsignedNumber(response.page.totalSize);
+        if (pageTotal === undefined) throw new GatewayError("The service returned an invalid Skill catalog size.");
+        if (totalSize === undefined) totalSize = pageTotal;
+        else if (totalSize !== pageTotal) throw new GatewayError("The service returned inconsistent Skill catalog sizes.");
+        if (response.skills.length > 500 || skills.length + response.skills.length > pageTotal) {
+          throw new GatewayError("The service returned an invalid Skill catalog page.");
+        }
+        for (const value of response.skills) {
+          const mapped = mapSkillDescriptor(value);
+          if (identities.has(mapped.id)) throw new GatewayError("The service returned a duplicate Skill identity.");
+          identities.add(mapped.id);
+          skills.push(mapped);
+        }
+        const nextPageToken = response.page?.nextPageToken ?? "";
+        if (nextPageToken === "") {
+          if (skills.length !== pageTotal) throw new GatewayError("The service returned an incomplete Skill catalog.");
+          return { revision, skills };
+        }
+        if (nextPageToken === pageToken || consumedTokens.has(nextPageToken)) {
+          throw new GatewayError("The service returned a cyclic Skill catalog page token.");
+        }
+        consumedTokens.add(nextPageToken);
+        pageToken = nextPageToken;
+      }
+      throw new GatewayError("Skills exceeded the safe pagination limit.");
+    }
+    throw new GatewayError("Skills changed repeatedly while they were being loaded.");
+  }
+
+  async openSkill(skillId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<SkillSessionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).openSkill({
+      skillId,
+      expectedResourceRevision: { value: expectedRevision }
+    }, { signal: scope.signal });
+    if (response.skill === undefined) throw new GatewayError("The service returned an empty Skill session.");
+    const session = mapSkillSession(response.skill);
+    try {
+      const files = await this.listSkillFiles(session.id, "", scope.signal);
+      return { ...session, files };
+    } catch (error) {
+      void this.closeSkill(session.id).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async listSkillFiles(sessionId: string, parentKey = "", signal?: AbortSignal): Promise<readonly SkillFileEntryView[]> {
+    const scope = this.captureActionScope(signal);
+    const client = createClient(SkillService, scope.transport);
+    const files: SkillFileEntryView[] = [];
+    const keys = new Set<string>();
+    const consumedTokens = new Set<string>();
+    let pageToken = "";
+    let totalSize: number | undefined;
+    for (let pageIndex = 0; pageIndex < MAX_COMPLETE_MESSAGE_SEARCH_PAGES; pageIndex += 1) {
+      scope.signal.throwIfAborted();
+      const response = await client.listSkillFiles(
+        { sessionId, parentKey, page: { pageSize: 500, pageToken } },
+        { signal: scope.signal }
+      );
+      const pageTotal = response.page === undefined ? undefined : exactSafeUnsignedNumber(response.page.totalSize);
+      if (pageTotal === undefined || pageTotal > 10_000 || (totalSize !== undefined && totalSize !== pageTotal)) {
+        throw new GatewayError("The service returned an invalid Skill file-list size.");
+      }
+      totalSize = pageTotal;
+      if (response.files.length > 500 || files.length + response.files.length > pageTotal) {
+        throw new GatewayError("The service returned an invalid Skill file-list page.");
+      }
+      for (const value of response.files) {
+        const mapped = mapSkillFileEntry(value);
+        if (keys.has(mapped.key)) throw new GatewayError("The service returned a duplicate Skill file key.");
+        keys.add(mapped.key);
+        files.push(mapped);
+      }
+      const nextPageToken = response.page?.nextPageToken ?? "";
+      if (nextPageToken === "") {
+        if (files.length !== pageTotal) throw new GatewayError("The service returned an incomplete Skill file list.");
+        return files;
+      }
+      if (nextPageToken === pageToken || consumedTokens.has(nextPageToken)) {
+        throw new GatewayError("The service returned a cyclic Skill file-list page token.");
+      }
+      consumedTokens.add(nextPageToken);
+      pageToken = nextPageToken;
+    }
+    throw new GatewayError("Skill files exceeded the safe pagination limit.");
+  }
+
+  async readSkillFile(sessionId: string, key: string, signal?: AbortSignal): Promise<SkillFileContentView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).readSkillFile(
+      { sessionId, key },
+      { signal: scope.signal }
+    );
+    if (response.file === undefined) throw new GatewayError("The service returned an empty Skill file.");
+    return mapSkillFileContent(response.file);
+  }
+
+  async getSkillDiff(sessionId: string, signal?: AbortSignal): Promise<SkillDiffView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).getSkillDiff(
+      { sessionId },
+      { signal: scope.signal }
+    );
+    if (response.diff === undefined) throw new GatewayError("The service returned an empty Skill diff.");
+    return mapSkillDiff(response.diff);
+  }
+
+  async prepareSkillFileEdit(
+    sessionId: string,
+    key: string,
+    expectedFileRevision: string,
+    content: string,
+    signal?: AbortSignal
+  ): Promise<SkillDraftView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).prepareSkillFileEdit(
+      { sessionId, key, expectedFileRevision, content },
+      { signal: scope.signal }
+    );
+    if (response.draft === undefined) throw new GatewayError("The service returned an empty Skill draft.");
+    return mapSkillDraft(response.draft);
+  }
+
+  async prepareSkillRename(sessionId: string, name: string, signal?: AbortSignal): Promise<SkillDraftView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).prepareSkillRename(
+      { sessionId, name },
+      { signal: scope.signal }
+    );
+    if (response.draft === undefined) throw new GatewayError("The service returned an empty Skill rename draft.");
+    return mapSkillDraft(response.draft);
+  }
+
+  async applySkillDraft(draft: SkillDraftView, signal?: AbortSignal): Promise<SkillMutationResultView> {
+    const scope = this.captureActionScope(signal);
+    return skillMutationResult(await this.submit(
+      { case: "applySkillDraft", value: { draftId: draft.id } },
+      true,
+      [],
+      scope.signal
+    ));
+  }
+
+  async setSkillEnabled(skill: SkillDescriptorView, enabled: boolean, signal?: AbortSignal): Promise<SkillMutationResultView> {
+    const scope = this.captureActionScope(signal);
+    return skillMutationResult(await this.submit({
+      case: "setSkillEnabled",
+      value: { skillId: skill.id, expectedResourceRevision: { value: skill.revision }, enabled }
+    }, true, [], scope.signal));
+  }
+
+  async deleteSkill(session: SkillSessionView, confirmation: string, signal?: AbortSignal): Promise<SkillMutationResultView> {
+    const scope = this.captureActionScope(signal);
+    return skillMutationResult(await this.submit({
+      case: "deleteSkill",
+      value: { sessionId: session.id, confirmation }
+    }, true, [], scope.signal));
+  }
+
+  async listSkillRecoveries(signal?: AbortSignal): Promise<readonly SkillRecoveryView[]> {
+    const scope = this.captureActionScope(signal);
+    const client = createClient(SkillService, scope.transport);
+    const recoveries: SkillRecoveryView[] = [];
+    const ids = new Set<string>();
+    const consumedTokens = new Set<string>();
+    let pageToken = "";
+    let totalSize: number | undefined;
+    for (let pageIndex = 0; pageIndex < MAX_COMPLETE_MESSAGE_SEARCH_PAGES; pageIndex += 1) {
+      scope.signal.throwIfAborted();
+      const response = await client.listSkillRecoveries(
+        { page: { pageSize: 500, pageToken } },
+        { signal: scope.signal }
+      );
+      const pageTotal = response.page === undefined ? undefined : exactSafeUnsignedNumber(response.page.totalSize);
+      if (pageTotal === undefined || (totalSize !== undefined && totalSize !== pageTotal)) {
+        throw new GatewayError("The service returned an invalid Skill recovery-list size.");
+      }
+      totalSize = pageTotal;
+      if (response.recoveries.length > 500 || recoveries.length + response.recoveries.length > pageTotal) {
+        throw new GatewayError("The service returned an invalid Skill recovery-list page.");
+      }
+      for (const value of response.recoveries) {
+        const mapped = mapSkillRecovery(value);
+        if (ids.has(mapped.id)) throw new GatewayError("The service returned a duplicate Skill recovery.");
+        ids.add(mapped.id);
+        recoveries.push(mapped);
+      }
+      const nextPageToken = response.page?.nextPageToken ?? "";
+      if (nextPageToken === "") {
+        if (recoveries.length !== pageTotal) throw new GatewayError("The service returned an incomplete Skill recovery list.");
+        return recoveries;
+      }
+      if (nextPageToken === pageToken || consumedTokens.has(nextPageToken)) {
+        throw new GatewayError("The service returned a cyclic Skill recovery-list page token.");
+      }
+      consumedTokens.add(nextPageToken);
+      pageToken = nextPageToken;
+    }
+    throw new GatewayError("Skill recoveries exceeded the safe pagination limit.");
+  }
+
+  async closeSkill(sessionId: string, signal?: AbortSignal): Promise<boolean> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).closeSkill({ sessionId }, { signal: scope.signal });
+    return response.closed;
   }
 
   async listCommands(sessionId: string): Promise<readonly RuntimeCommandView[]> {
@@ -10236,6 +10500,203 @@ function mapResource(resource: ManagedResource): ResourceView {
     postMutationNotice: resource.postMutationNotice,
     ...(resource.error?.message ? { error: presentJokoServiceTerminology(resource.error.message) } : {})
   };
+}
+
+function mapSkillDescriptor(skill: ProtoSkillDescriptor): SkillDescriptorView {
+  const revision = skill.entityVersion?.revision?.value;
+  const scope = skill.scope === ResourceScope.GLOBAL
+    ? "global" as const
+    : skill.scope === ResourceScope.PROJECT
+      ? "project" as const
+      : undefined;
+  if (
+    skill.skillId.trim() === "" || skill.backendId.trim() === "" || skill.name.trim() === "" ||
+    skill.sourceLabel.trim() === "" || privatePathLikeLabel(skill.sourceLabel) || scope === undefined ||
+    revision === undefined || revision < 1n || skill.approvedRevision.trim() === "" || skill.updatedAt === undefined
+  ) throw new GatewayError("The service returned an incomplete or path-bearing Skill descriptor.");
+  return {
+    id: skill.skillId,
+    backendId: skill.backendId,
+    ...(skill.targetId === "" ? {} : { targetId: skill.targetId }),
+    scope,
+    name: skill.name,
+    sourceLabel: skill.sourceLabel,
+    state: resourceState(skill.state),
+    enabled: skill.enabled,
+    canToggle: skill.canToggle,
+    contentAvailable: skill.contentAvailable,
+    canEdit: skill.canEdit,
+    canDelete: skill.canDelete,
+    revision,
+    approvedRevision: skill.approvedRevision,
+    updatedAt: timestampMs(skill.updatedAt)
+  };
+}
+
+function mapSkillFileEntry(file: ProtoSkillFileEntry): SkillFileEntryView {
+  const kind = file.kind === SkillFileKind.DIRECTORY
+    ? "directory" as const
+    : file.kind === SkillFileKind.FILE
+      ? "file" as const
+      : undefined;
+  const size = exactSafeUnsignedNumber(file.size);
+  if (kind === undefined || size === undefined || !portableSkillKey(file.key) || !portableSkillName(file.name)) {
+    throw new GatewayError("The service returned an invalid Skill file entry.");
+  }
+  return { key: file.key, name: file.name, kind, size, editable: file.editable };
+}
+
+function mapSkillFileContent(file: ProtoSkillFileContent): SkillFileContentView {
+  const size = exactSafeUnsignedNumber(file.size);
+  if (size === undefined || !portableSkillKey(file.key) || file.revision.trim() === "") {
+    throw new GatewayError("The service returned an invalid Skill file.");
+  }
+  return { key: file.key, content: file.content, revision: file.revision, size, editable: file.editable };
+}
+
+function mapSkillDiffChange(change: ProtoSkillDiffChange): SkillDiffChangeView {
+  const kind = change.kind === SkillDiffChangeKind.ADDED
+    ? "added" as const
+    : change.kind === SkillDiffChangeKind.MODIFIED
+      ? "modified" as const
+      : change.kind === SkillDiffChangeKind.DELETED
+        ? "deleted" as const
+        : undefined;
+  if (kind === undefined || !portableSkillKey(change.key)) throw new GatewayError("The service returned an invalid Skill diff change.");
+  return {
+    key: change.key,
+    kind,
+    binary: change.binary,
+    ...(change.unifiedDiff === "" ? {} : { unifiedDiff: change.unifiedDiff })
+  };
+}
+
+function mapSkillDiff(diff: ProtoSkillDiff): SkillDiffView {
+  return {
+    available: diff.available,
+    ...(diff.reason === "" ? {} : { reason: diff.reason }),
+    changes: diff.changes.map(mapSkillDiffChange),
+    truncated: diff.truncated
+  };
+}
+
+function mapSkillSession(session: ProtoSkillSession): SkillSessionView {
+  const fileCount = exactSafeUnsignedNumber(session.fileCount);
+  const bytes = exactSafeUnsignedNumber(session.bytes);
+  if (
+    session.skill === undefined || session.metadata === undefined || session.diff === undefined ||
+    session.sessionId.trim() === "" || session.observedRevision.trim() === "" || session.expiresAt === undefined ||
+    fileCount === undefined || bytes === undefined
+  ) throw new GatewayError("The service returned an incomplete Skill session.");
+  let frontmatter: unknown;
+  try {
+    frontmatter = JSON.parse(session.metadata.frontmatterJson);
+  } catch {
+    throw new GatewayError("The service returned invalid Skill frontmatter metadata.");
+  }
+  if (typeof frontmatter !== "object" || frontmatter === null || Array.isArray(frontmatter)) {
+    throw new GatewayError("The service returned invalid Skill frontmatter metadata.");
+  }
+  return {
+    id: session.sessionId,
+    skill: mapSkillDescriptor(session.skill),
+    observedRevision: session.observedRevision,
+    dirty: session.dirty,
+    baselineAvailable: session.baselineAvailable,
+    metadata: {
+      ...(session.metadata.name === "" ? {} : { name: session.metadata.name }),
+      ...(session.metadata.description === "" ? {} : { description: session.metadata.description }),
+      ...(session.metadata.version === "" ? {} : { version: session.metadata.version }),
+      frontmatter: frontmatter as Readonly<Record<string, unknown>>,
+      ...(session.metadata.parseError === "" ? {} : { parseError: session.metadata.parseError })
+    },
+    files: [],
+    fileCount,
+    bytes,
+    diff: mapSkillDiff(session.diff),
+    expiresAt: timestampMs(session.expiresAt)
+  };
+}
+
+function mapSkillDraft(draft: ProtoSkillDraft): SkillDraftView {
+  const kind = draft.kind === SkillDraftKind.EDIT
+    ? "edit" as const
+    : draft.kind === SkillDraftKind.RENAME
+      ? "rename" as const
+      : undefined;
+  const resourceRevision = draft.resourceRevision?.value;
+  if (
+    kind === undefined || draft.draftId.trim() === "" || draft.sessionId.trim() === "" || draft.skillId.trim() === "" ||
+    draft.name.trim() === "" || resourceRevision === undefined || resourceRevision < 1n ||
+    draft.observedRevision.trim() === "" || draft.expiresAt === undefined
+  ) throw new GatewayError("The service returned an incomplete Skill draft.");
+  return {
+    id: draft.draftId,
+    sessionId: draft.sessionId,
+    skillId: draft.skillId,
+    kind,
+    name: draft.name,
+    resourceRevision,
+    observedRevision: draft.observedRevision,
+    changes: draft.changes.map(mapSkillDiffChange),
+    expiresAt: timestampMs(draft.expiresAt)
+  };
+}
+
+function mapSkillRecovery(recovery: ProtoSkillRecovery): SkillRecoveryView {
+  const scope = recovery.scope === ResourceScope.GLOBAL
+    ? "global" as const
+    : recovery.scope === ResourceScope.PROJECT
+      ? "project" as const
+      : undefined;
+  const status = recovery.status === SkillRecoveryStatus.READY
+    ? "ready" as const
+    : recovery.status === SkillRecoveryStatus.MISSING
+      ? "missing" as const
+      : undefined;
+  const files = exactSafeUnsignedNumber(recovery.files);
+  const bytes = exactSafeUnsignedNumber(recovery.bytes);
+  if (
+    scope === undefined || status === undefined || files === undefined || bytes === undefined ||
+    recovery.recoveryId.trim() === "" || recovery.skillId.trim() === "" || recovery.backendId.trim() === "" ||
+    recovery.name.trim() === "" || recovery.revision.trim() === "" || recovery.createdAt === undefined
+  ) throw new GatewayError("The service returned an incomplete Skill recovery.");
+  return {
+    id: recovery.recoveryId,
+    skillId: recovery.skillId,
+    backendId: recovery.backendId,
+    ...(recovery.targetId === "" ? {} : { targetId: recovery.targetId }),
+    scope,
+    name: recovery.name,
+    revision: recovery.revision,
+    files,
+    bytes,
+    createdAt: timestampMs(recovery.createdAt),
+    status
+  };
+}
+
+function skillMutationResult(operation: Operation): SkillMutationResultView {
+  const payload = operation.result?.payload;
+  if (payload?.case !== "skill") throw new GatewayError("The service completed the Skill operation without a Skill result.");
+  return {
+    ...(payload.value.skill === undefined ? {} : { skill: mapSkillDescriptor(payload.value.skill) }),
+    ...(payload.value.replacedSkillId === "" ? {} : { replacedSkillId: payload.value.replacedSkillId }),
+    ...(payload.value.recoveryId === "" ? {} : { recoveryId: payload.value.recoveryId })
+  };
+}
+
+function privatePathLikeLabel(value: string): boolean {
+  return /^[A-Za-z]:[\\/]/u.test(value) || /^\\\\/u.test(value) || value.startsWith("/");
+}
+
+function portableSkillName(value: string): boolean {
+  return value.length > 0 && value !== "." && value !== ".." && !value.includes("/") && !value.includes("\\") && !value.includes("\0");
+}
+
+function portableSkillKey(value: string): boolean {
+  return value.length > 0 && !value.startsWith("/") && !value.includes("\\") && !value.includes("\0")
+    && value.split("/").every(portableSkillName);
 }
 
 function extensionSourceLocation(source: ExtensionSourceDraft) {

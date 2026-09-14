@@ -329,6 +329,14 @@ test("durable and cross-process field numbers remain stable", () => {
     [contract.OperationMutationSchema, "cleanup_git_safety_savepoints", 166],
     [contract.OperationMutationSchema, "start_extension_package_export", 194],
     [contract.OperationMutationSchema, "cancel_extension_package_export", 195],
+    [contract.OperationMutationSchema, "apply_skill_draft", 196],
+    [contract.OperationMutationSchema, "set_skill_enabled", 197],
+    [contract.OperationMutationSchema, "delete_skill", 198],
+    [contract.OperationResultSchema, "skill", 35],
+    [contract.ListSkillFilesRequestSchema, "page", 3],
+    [contract.ListSkillFilesResponseSchema, "page", 2],
+    [contract.ListSkillRecoveriesRequestSchema, "page", 1],
+    [contract.ListSkillRecoveriesResponseSchema, "page", 2],
     [contract.ExtensionCatalogEntrySchema, "library", 22]
   ];
   for (const [schema, name, number] of expected) {
@@ -438,6 +446,83 @@ test("Extension Library keeps management paths separate from sandboxed relative-
   assert.equal(call.operation.case, "sqlExecute");
   assert.equal(call.operation.value.statement.parameters[0].value.value, "9223372036854775807");
   assert.deepEqual([...call.operation.value.statement.parameters[1].value.value], [1, 2, 3]);
+});
+
+test("Skill management is path-private and mutations retain exact revision authority", () => {
+  const methods = methodNames(contract.SkillService);
+  for (const name of [
+    "listSkills", "openSkill", "listSkillFiles", "readSkillFile", "getSkillDiff",
+    "prepareSkillFileEdit", "prepareSkillRename", "listSkillRecoveries", "closeSkill"
+  ]) assert.equal(methods.has(name), true, name);
+
+  assertNoFields([
+    contract.SkillDescriptorSchema,
+    contract.SkillMetadataSchema,
+    contract.SkillFileEntrySchema,
+    contract.SkillDiffChangeSchema,
+    contract.SkillSessionSchema,
+    contract.SkillDraftSchema,
+    contract.SkillRecoverySchema,
+    contract.SkillMutationResultSchema,
+    contract.ListSkillsRequestSchema,
+    contract.OpenSkillRequestSchema,
+    contract.ListSkillFilesRequestSchema,
+    contract.ReadSkillFileRequestSchema,
+    contract.GetSkillDiffRequestSchema,
+    contract.PrepareSkillRenameRequestSchema,
+    contract.CloseSkillRequestSchema
+  ], [
+    "path", "absolute_path", "local_path", "source_path", "root", "workspace_root",
+    "candidate_path", "recovery_path", "owner_id", "credential", "credential_value"
+  ]);
+
+  const descriptor = {
+    skillId: "resource-skill",
+    backendId: "pi",
+    scope: contract.ResourceScope.GLOBAL,
+    name: "review-helper",
+    sourceLabel: "review-helper",
+    state: contract.ResourceState.LOADED,
+    enabled: true,
+    canToggle: true,
+    contentAvailable: true,
+    canEdit: true,
+    canDelete: true,
+    entityVersion: { revision: { value: 9007199254740993n }, generation: 0n },
+    approvedRevision: `sha256:${"a".repeat(64)}`
+  };
+  const session = roundTrip(contract.SkillSessionSchema, {
+    sessionId: "skill_session_0123456789abcdef0123456789abcdef",
+    skill: descriptor,
+    observedRevision: `sha256:${"b".repeat(64)}`,
+    dirty: true,
+    baselineAvailable: true,
+    diff: { available: true, changes: [{ key: "SKILL.md", kind: contract.SkillDiffChangeKind.MODIFIED, unifiedDiff: "-old\n+new\n" }] }
+  });
+  assert.equal(session.skill.entityVersion.revision.value, 9007199254740993n);
+  assert.equal(fieldNames(contract.SkillSessionSchema).has("files"), false);
+  const listing = roundTrip(contract.ListSkillFilesResponseSchema, {
+    files: [{ key: "references/guide.md", name: "guide.md", kind: contract.SkillFileKind.FILE, size: 42n, editable: true }],
+    page: { totalSize: 1n }
+  });
+  assert.equal(listing.files[0].key, "references/guide.md");
+
+  const apply = roundTrip(contract.OperationMutationSchema, {
+    payload: { case: "applySkillDraft", value: { draftId: "skill_draft_0123456789abcdef0123456789abcdef" } }
+  });
+  const toggle = roundTrip(contract.OperationMutationSchema, {
+    payload: { case: "setSkillEnabled", value: {
+      skillId: descriptor.skillId,
+      expectedResourceRevision: descriptor.entityVersion.revision,
+      enabled: false
+    } }
+  });
+  const remove = roundTrip(contract.OperationMutationSchema, {
+    payload: { case: "deleteSkill", value: { sessionId: session.sessionId, confirmation: descriptor.name } }
+  });
+  assert.equal(apply.payload.case, "applySkillDraft");
+  assert.equal(toggle.payload.value.expectedResourceRevision.value, 9007199254740993n);
+  assert.equal(remove.payload.value.confirmation, descriptor.name);
 });
 
 test("auxiliary routing preserves ordered exact routes and independent revisions", () => {

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants, createReadStream } from "node:fs";
-import { chmod, copyFile, lstat, mkdir, open, readdir, realpath, rename, rm, stat } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import type { ProjectSkillCandidate } from "@joko/adapter-pi";
@@ -121,6 +121,23 @@ interface StoredResourceUpdateIntent {
 interface StoredResourceCatalog {
   readonly format: 1;
   readonly records: readonly StoredResource[];
+}
+
+interface ProjectSkillTransactionJournal {
+  readonly format: 1;
+  readonly kind: "replace" | "remove";
+  readonly transactionId: string;
+  readonly backendId: string;
+  readonly targetId: string;
+  readonly workspaceRoot: string;
+  readonly sourcePath: string;
+  readonly destinationPath: string;
+  readonly expectedResourceId: string;
+  readonly expectedVersionNumber: string;
+  readonly expectedRevision: string;
+  readonly committedResourceId: string;
+  readonly committedVersionNumber: string;
+  readonly committedRevision: string;
 }
 
 export interface PiResourceManagerOptions {
@@ -319,6 +336,46 @@ export interface PiInstalledPackageLease {
   readonly release: () => Promise<void>;
 }
 
+export interface PiSkillContentLeaseInput {
+  readonly resourceId: string;
+  readonly expectedResourceVersion: bigint;
+}
+
+export interface PiSkillContentLease {
+  readonly resource: PiResourceDescriptor;
+  /** Revision approved by the Resource owner. */
+  readonly approvedRevision: string;
+  /** Exact revision observed when this lease was acquired. */
+  readonly observedRevision: string;
+  readonly dirty: boolean;
+  readonly snapshotTo: (destination: string, signal?: AbortSignal) => Promise<PiInstalledPackageSnapshot>;
+  readonly assertCurrent: (signal?: AbortSignal) => Promise<void>;
+  readonly release: () => Promise<void>;
+}
+
+export interface PreparePiSkillContentInput {
+  readonly resourceId: string;
+  readonly expectedResourceVersion: bigint;
+  readonly expectedObservedRevision: string;
+  readonly candidateRoot: string;
+  readonly changedByConnectionId: string;
+  readonly name?: string;
+}
+
+export interface PiSkillContentMutationResult {
+  readonly resource: PiResourceDescriptor;
+  /** A project directory rename changes the path-derived Resource identity. */
+  readonly replacedResourceId?: string;
+}
+
+export interface PrepareRemovePiSkillContentInput {
+  readonly resourceId: string;
+  readonly expectedResourceVersion: bigint;
+  readonly expectedObservedRevision: string;
+  /** Empty, private directory owned by the Skill content manager. */
+  readonly recoveryDestination: string;
+}
+
 /** Immutable, path-free text authority captured for one Backend Target runtime. */
 export interface RuntimeTextResourceSeed {
   readonly id: string;
@@ -335,6 +392,11 @@ export interface RuntimeTextResourceSeed {
 const MAXIMUM_RUNTIME_TEXT_RESOURCE_BYTES = 256 * 1024;
 const RESOURCE_GENERATIONS_DIRECTORY = ".generations";
 const RESOURCE_GENERATION_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const PROJECT_SKILL_TRANSACTION_JOURNALS_DIRECTORY = ".skill-transactions";
+const PROJECT_SKILL_TRANSACTION_DIRECTORY = ".joko-skill-transactions";
+const PROJECT_SKILL_TRANSACTION_JOURNAL_PATTERN = /^([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.json$/u;
+const PROJECT_SKILL_TRANSACTION_TEMP_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.tmp$/u;
+const MAXIMUM_PROJECT_SKILL_TRANSACTION_JOURNAL_BYTES = 32 * 1024;
 const MISSING_INSTALLED_RESOURCE_ERROR = "Installed resource payload is missing.";
 
 export interface PiResourceLoadObservation {
@@ -373,7 +435,7 @@ export class PiResourceManager {
     this.#scopeId = options.scopeId ?? "orchestrator";
     this.#now = options.now ?? Date.now;
     this.#maximumFiles = options.maximumFiles ?? 10_000;
-    this.#maximumBytes = options.maximumBytes ?? 256 * 1024 * 1024;
+    this.#maximumBytes = options.maximumBytes ?? 500 * 1024 * 1024;
     this.#acquisition = options.acquisition ?? new DefaultPiPackageAcquisition();
     if (!Number.isSafeInteger(this.#maximumFiles) || this.#maximumFiles < 1) throw new RangeError("Resource file limit is invalid.");
     if (!Number.isSafeInteger(this.#maximumBytes) || this.#maximumBytes < 1) throw new RangeError("Resource byte limit is invalid.");
@@ -383,8 +445,8 @@ export class PiResourceManager {
     if (this.#initialized) return;
     await mkdir(this.#managedRoot, { recursive: true, mode: 0o700 });
     await assertCanonicalDirectory(this.#managedRoot, "Managed resource root");
-    await Promise.all(["extensions", "skills", "prompts", "themes", "packages", ".staging"].map((name) => mkdir(join(this.#managedRoot, name), { recursive: true, mode: 0o700 })));
-    for (const name of ["extensions", "skills", "prompts", "themes", "packages", ".staging"]) {
+    await Promise.all(["extensions", "skills", "prompts", "themes", "packages", ".staging", PROJECT_SKILL_TRANSACTION_JOURNALS_DIRECTORY].map((name) => mkdir(join(this.#managedRoot, name), { recursive: true, mode: 0o700 })));
+    for (const name of ["extensions", "skills", "prompts", "themes", "packages", ".staging", PROJECT_SKILL_TRANSACTION_JOURNALS_DIRECTORY]) {
       await assertContainedRegularDirectory(this.#managedRoot, join(this.#managedRoot, name), `Managed resource ${name} directory`);
     }
     const setting = this.#store.findSetting<StoredResourceCatalog>("service", this.#scopeId, "pi_resource_catalog");
@@ -396,6 +458,7 @@ export class PiResourceManager {
         this.#records.set(record.id, record);
       }
     }
+    await this.#recoverProjectSkillTransactions();
     const recoveryChanged = await this.#recoverOrphanedFilesystemState();
     let compatibilityChanged = false;
     for (const [id, record] of this.#records) {
@@ -500,6 +563,234 @@ export class PiResourceManager {
     });
   }
 
+  /**
+   * Acquire path-private authority over one standalone Skill. Project content
+   * may be externally dirty; the lease records that exact observed tree while
+   * keeping the approved Resource revision separate.
+   */
+  async acquireSkillContent(input: PiSkillContentLeaseInput): Promise<PiSkillContentLease> {
+    this.#assertInitialized();
+    const resourceId = nonBlank(input.resourceId, "Resource ID");
+    return this.#mutate(async () => {
+      const record = this.#require(resourceId);
+      this.#assertSkillContentAuthority(record, input.expectedResourceVersion);
+      const root = await this.#skillContentRoot(record);
+      const inspection = await inspectSkillPackage(root, this.#maximumFiles, this.#maximumBytes);
+      if (!samePath(root, inspection.canonicalPath)) throw new Error("Skill content root changed identity.");
+      if (!isDirectProjectResource(record) && inspection.revision !== record.discoveredRevision) {
+        throw new Error("Installed Skill content changed and is fenced.");
+      }
+      const generation = record.installedPath === undefined
+        ? undefined
+        : installedGenerationContainer(this.#managedRoot, record);
+      const generationKey = generation === undefined ? undefined : pathIdentity(generation);
+      if (generationKey !== undefined) {
+        this.#installedGenerationLeases.set(generationKey, (this.#installedGenerationLeases.get(generationKey) ?? 0) + 1);
+      }
+      const resource = publicResource(record);
+      const observedRevision = inspection.revision;
+      let released = false;
+      let releaseRequested = false;
+      let releasePromise: Promise<void> | undefined;
+      const assertLeaseOpen = (): void => {
+        if (releaseRequested) throw new Error("Skill content lease has been released.");
+      };
+      const assertCurrent = async (signal?: AbortSignal): Promise<void> => {
+        assertLeaseOpen();
+        signal?.throwIfAborted();
+        const current = this.#records.get(record.id);
+        if (current !== record) throw new Error("Skill Resource authority changed after the content lease was acquired.");
+        this.#assertSkillContentAuthority(record, input.expectedResourceVersion);
+        const currentRoot = await this.#skillContentRoot(record, signal);
+        const currentInspection = await inspectSkillPackage(currentRoot, this.#maximumFiles, this.#maximumBytes, signal);
+        if (!samePath(currentRoot, currentInspection.canonicalPath) || currentInspection.revision !== observedRevision) {
+          throw new Error("Skill content changed after the content lease was acquired.");
+        }
+      };
+      return {
+        resource,
+        approvedRevision: record.discoveredRevision,
+        observedRevision,
+        dirty: observedRevision !== record.discoveredRevision,
+        snapshotTo: async (destination, signal) => {
+          await assertCurrent(signal);
+          const snapshot = await snapshotInstalledPackageTree(root, destination, this.#maximumFiles, this.#maximumBytes, signal);
+          if (snapshot.discoveredRevision !== observedRevision) {
+            throw new Error("Skill content changed while it was being snapshotted.");
+          }
+          await assertCurrent(signal);
+          return snapshot;
+        },
+        assertCurrent,
+        release: async () => {
+          if (released) return;
+          releaseRequested = true;
+          if (generationKey === undefined) {
+            released = true;
+            return;
+          }
+          releasePromise ??= this.#releaseInstalledPackageGeneration(generationKey).then(
+            () => { released = true; },
+            (error: unknown) => {
+              releasePromise = undefined;
+              throw error;
+            }
+          );
+          await releasePromise;
+        }
+      };
+    });
+  }
+
+  /** Stage an exact Skill snapshot and publish it through Resource authority. */
+  async prepareReplaceSkillContent(
+    input: PreparePiSkillContentInput
+  ): Promise<PreparedPiResourceMutation<PiSkillContentMutationResult>> {
+    this.#assertInitialized();
+    const current = this.#require(nonBlank(input.resourceId, "Resource ID"));
+    this.#assertSkillContentAuthority(current, input.expectedResourceVersion);
+    const expectedObservedRevision = normalizedContentRevision(input.expectedObservedRevision, "Observed Skill revision");
+    const changedByConnectionId = nonBlank(input.changedByConnectionId, "Changing connection ID");
+    const requestedName = input.name === undefined ? current.name : portableSkillName(input.name);
+    const candidateRoot = await canonicalDirectory(input.candidateRoot, "Skill candidate root");
+    const candidateInspection = await inspectSkillPackage(candidateRoot, this.#maximumFiles, this.#maximumBytes);
+    const runtimeVersion = this.#runtimeVersion(current.backendId);
+    const compatibility = await inspectPiResourceCompatibility("skill", candidateRoot, {
+      ...(runtimeVersion === undefined ? {} : { currentRuntimeVersion: runtimeVersion }),
+      contentFingerprint: candidateInspection.revision
+    });
+    if (!compatibility.canToggle) throw new Error("Skill candidate does not contain usable runtime content.");
+
+    if (isDirectProjectResource(current)) {
+      return this.#prepareProjectSkillContentMutation(
+        current,
+        expectedObservedRevision,
+        candidateRoot,
+        candidateInspection,
+        compatibility,
+        requestedName,
+        changedByConnectionId
+      );
+    }
+    if (current.installedPath === undefined) throw new Error("Global Skill content is not installed.");
+    if (expectedObservedRevision !== current.discoveredRevision) throw new Error("Observed Skill revision is stale.");
+    await this.#assertInstalledSafe(current);
+    return this.#prepareManagedSkillContentMutation(
+      current,
+      candidateRoot,
+      candidateInspection,
+      compatibility,
+      requestedName,
+      changedByConnectionId
+    );
+  }
+
+  /**
+   * Prepare physical removal while retaining an exact private recovery copy.
+   * Project content is moved behind a sibling transaction fence before the
+   * Resource record can be committed, so a Store failure can restore it.
+   */
+  async prepareRemoveSkillContent(
+    input: PrepareRemovePiSkillContentInput
+  ): Promise<PreparedPiResourceMutation<PiResourceDescriptor>> {
+    this.#assertInitialized();
+    const current = this.#require(nonBlank(input.resourceId, "Resource ID"));
+    this.#assertSkillContentAuthority(current, input.expectedResourceVersion);
+    const expectedObservedRevision = normalizedContentRevision(input.expectedObservedRevision, "Observed Skill revision");
+    const recoveryDestination = await canonicalDirectory(input.recoveryDestination, "Skill recovery destination");
+    if ((await readdir(recoveryDestination)).length !== 0) throw new Error("Skill recovery destination must be empty.");
+    const sourceRoot = await this.#skillContentRoot(current);
+    const observed = await inspectSkillPackage(sourceRoot, this.#maximumFiles, this.#maximumBytes);
+    if (observed.revision !== expectedObservedRevision) throw new Error("Observed Skill revision is stale.");
+    const recovery = await snapshotInstalledPackageTree(
+      sourceRoot,
+      recoveryDestination,
+      this.#maximumFiles,
+      this.#maximumBytes
+    );
+    if (recovery.discoveredRevision !== expectedObservedRevision) {
+      await rm(recoveryDestination, { recursive: true, force: true }).catch(() => undefined);
+      throw new Error("Skill content changed while its recovery copy was created.");
+    }
+    const { pendingUpdate: _pendingUpdate, ...withoutPendingUpdate } = omitInstalledPath(current);
+    const removed: StoredResource = {
+      ...withoutPendingUpdate,
+      state: "removed",
+      enabled: false,
+      versionNumber: (BigInt(current.versionNumber) + 1n).toString(10),
+      updatedAt: this.#now()
+    };
+
+    if (!isDirectProjectResource(current)) {
+      await this.#assertInstalledSafe(current);
+      return this.#prepareMutation(
+        [{ id: current.id, expected: current, next: removed }],
+        publicResource(removed),
+        undefined,
+        {
+          rollback: () => rm(recoveryDestination, { recursive: true, force: true }),
+          cleanupAfterCommit: () => this.#removeInstalledIncarnation(current)
+        }
+      );
+    }
+
+    const workspaceRoot = this.#assertTrustedProjectTarget(current.backendId, current.targetId, current.workspaceRoot);
+    const targetId = current.targetId!;
+    const parent = dirname(current.canonicalPath);
+    assertWithin(workspaceRoot, parent, "Project Skill parent");
+    const transactionRoot = join(parent, PROJECT_SKILL_TRANSACTION_DIRECTORY);
+    await mkdir(transactionRoot, { recursive: true, mode: 0o700 });
+    await assertContainedRegularDirectory(workspaceRoot, transactionRoot, "Project Skill transaction directory");
+    const transactionId = randomUUID();
+    const journal: ProjectSkillTransactionJournal = {
+      format: 1,
+      kind: "remove",
+      transactionId,
+      backendId: current.backendId,
+      targetId,
+      workspaceRoot,
+      sourcePath: current.canonicalPath,
+      destinationPath: current.canonicalPath,
+      expectedResourceId: current.id,
+      expectedVersionNumber: current.versionNumber,
+      expectedRevision: expectedObservedRevision,
+      committedResourceId: removed.id,
+      committedVersionNumber: removed.versionNumber,
+      committedRevision: removed.discoveredRevision
+    };
+    let journalPath: string | undefined;
+    try {
+      journalPath = await this.#writeProjectSkillTransactionJournal(journal);
+      const beforeMove = await inspectSkillPackage(current.canonicalPath, this.#maximumFiles, this.#maximumBytes);
+      this.#assertTrustedProjectTarget(current.backendId, current.targetId, workspaceRoot);
+      if (beforeMove.revision !== expectedObservedRevision) throw new Error("Project Skill changed before removal.");
+      await rename(current.canonicalPath, join(transactionRoot, `${transactionId}.deleted`));
+      return this.#prepareMutation(
+        [{ id: current.id, expected: current, next: removed }],
+        publicResource(removed),
+        () => this.#assertTrustedProjectTarget(current.backendId, current.targetId, workspaceRoot),
+        {
+          rollback: async () => {
+            await this.#recoverProjectSkillTransaction(journalPath!, journal);
+            await rm(recoveryDestination, { recursive: true, force: true });
+          },
+          cleanupAfterCommit: () => this.#recoverProjectSkillTransaction(journalPath!, journal)
+        }
+      );
+    } catch (error) {
+      if (journalPath !== undefined) {
+        try {
+          await this.#recoverProjectSkillTransaction(journalPath, journal);
+        } catch (recoveryError) {
+          throw new AggregateError([error, recoveryError], "Project Skill removal failed and its durable rollback requires recovery.");
+        }
+      }
+      await rm(recoveryDestination, { recursive: true, force: true }).catch(() => undefined);
+      if (await directoryIsEmpty(transactionRoot)) await rm(transactionRoot, { recursive: true, force: true }).catch(() => undefined);
+      throw error;
+    }
+  }
+
   async inspectPackageCandidate(
     packageRoot: string,
     backendId: string,
@@ -572,7 +863,7 @@ export class PiResourceManager {
     validateScope(input.scope);
     const source = normalizePiPackageSource(input.source);
     if (source.kind !== "local") throw new Error("Direct resources require a local acquisition source.");
-    const inspection = await inspectResource(source.path, this.#maximumFiles, this.#maximumBytes);
+    const inspection = await inspectResourceForKind(input.kind, source.path, this.#maximumFiles, this.#maximumBytes);
     const runtimeVersion = this.#runtimeVersion(input.backendId);
     const compatibility = await inspectPiResourceCompatibility(input.kind, inspection.canonicalPath, {
       ...(runtimeVersion === undefined ? {} : { currentRuntimeVersion: runtimeVersion }),
@@ -929,7 +1220,7 @@ export class PiResourceManager {
     // unsafe or incompatible candidate therefore prevents every catalog write.
     const runtimeVersion = this.#runtimeVersion(backendId);
     const inspected = await Promise.all(candidates.map(async (candidate) => {
-      const inspection = await inspectResource(candidate.sourcePath, this.#maximumFiles, this.#maximumBytes);
+      const inspection = await inspectResourceForKind(candidate.kind, candidate.sourcePath, this.#maximumFiles, this.#maximumBytes);
       const compatibility = await inspectPiResourceCompatibility(candidate.kind, inspection.canonicalPath, {
         ...(runtimeVersion === undefined ? {} : { currentRuntimeVersion: runtimeVersion }),
         contentFingerprint: inspection.revision
@@ -988,7 +1279,7 @@ export class PiResourceManager {
       await this.#assertInstalledSafe(current);
     } else if (current.source.kind === "local") {
       if (current.canonicalPath === undefined) throw new Error("Local resource is missing its canonical source path.");
-      const inspection = await inspectResource(current.canonicalPath, this.#maximumFiles, this.#maximumBytes);
+      const inspection = await inspectResourceForKind(current.kind, current.canonicalPath, this.#maximumFiles, this.#maximumBytes);
       if (current.workspaceRoot !== undefined) assertWithin(current.workspaceRoot, inspection.canonicalPath, "Project resource");
       if (inspection.revision !== discoveredRevision || !samePath(inspection.canonicalPath, current.canonicalPath)) {
         throw new Error("Resource changed after discovery and must be discovered again.");
@@ -1060,7 +1351,7 @@ export class PiResourceManager {
         : pendingUpdate?.source ?? current.source;
     let inspection: ResourceInspection | undefined;
     if (requestedSource.kind === "local") {
-      inspection = await inspectResource(requestedSource.path, this.#maximumFiles, this.#maximumBytes);
+      inspection = await inspectResourceForKind(current.kind, requestedSource.path, this.#maximumFiles, this.#maximumBytes);
       if (current.workspaceRoot !== undefined) assertWithin(current.workspaceRoot, inspection.canonicalPath, "Project resource");
     }
     const requestedIdentity = current.kind === "package"
@@ -1280,7 +1571,7 @@ export class PiResourceManager {
   /** Callback passed directly to PiAdapterOptions.approveProjectSkill. */
   async approveProjectSkill(candidate: ProjectSkillCandidate): Promise<boolean> {
     this.#assertInitialized();
-    const inspection = await inspectResource(candidate.sourcePath, this.#maximumFiles, this.#maximumBytes).catch(() => undefined);
+    const inspection = await inspectSkillPackage(candidate.sourcePath, this.#maximumFiles, this.#maximumBytes).catch(() => undefined);
     if (inspection === undefined) return false;
     for (const record of this.#records.values()) {
       try { this.#assertStoredProjectTargetTrusted(record); } catch { continue; }
@@ -1341,7 +1632,7 @@ export class PiResourceManager {
         signal.throwIfAborted();
         this.#assertStoredProjectTargetTrusted(record);
         const root = await this.#runtimeTextRoot(record, signal);
-        const before = await inspectResource(root, this.#maximumFiles, this.#maximumBytes, signal);
+        const before = await inspectResourceForKind(record.kind, root, this.#maximumFiles, this.#maximumBytes, signal);
         assertApprovedRuntimeTextInspection(record, root, before);
         const content = await readRuntimeTextContent(
           root,
@@ -1353,7 +1644,7 @@ export class PiResourceManager {
         if (totalTextBytes > this.#maximumBytes) {
           throw new Error("Runtime text resource snapshot exceeds the configured byte limit.");
         }
-        const after = await inspectResource(root, this.#maximumFiles, this.#maximumBytes, signal);
+        const after = await inspectResourceForKind(record.kind, root, this.#maximumFiles, this.#maximumBytes, signal);
         assertApprovedRuntimeTextInspection(record, root, after);
         if (before.revision !== after.revision || !samePath(before.canonicalPath, after.canonicalPath)) {
           throw new Error("Runtime text resource changed while its content was read.");
@@ -1465,6 +1756,261 @@ export class PiResourceManager {
       packages: paths.package.sort(),
       resources
     };
+  }
+
+  async #writeProjectSkillTransactionJournal(journal: ProjectSkillTransactionJournal): Promise<string> {
+    const validated = this.#validateProjectSkillTransactionJournal(journal, journal.transactionId);
+    const root = join(this.#managedRoot, PROJECT_SKILL_TRANSACTION_JOURNALS_DIRECTORY);
+    const destination = join(root, `${validated.transactionId}.json`);
+    const temporary = join(root, `${validated.transactionId}.tmp`);
+    if (await optionalLstat(destination) !== undefined || await optionalLstat(temporary) !== undefined) {
+      throw new Error("Project Skill transaction journal already exists.");
+    }
+    const handle = await open(temporary, "wx", 0o600);
+    try {
+      await handle.writeFile(`${JSON.stringify(validated)}\n`, "utf8");
+      await handle.sync();
+    } catch (error) {
+      await handle.close().catch(() => undefined);
+      await rm(temporary, { force: true }).catch(() => undefined);
+      throw error;
+    }
+    await handle.close();
+    try {
+      await rename(temporary, destination);
+      return destination;
+    } catch (error) {
+      await rm(temporary, { force: true }).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async #recoverProjectSkillTransactions(): Promise<void> {
+    const root = join(this.#managedRoot, PROJECT_SKILL_TRANSACTION_JOURNALS_DIRECTORY);
+    const entries = await readdir(root, { withFileTypes: true });
+    entries.sort((left, right) => left.name.localeCompare(right.name, "en"));
+    for (const entry of entries) {
+      validateEntryName(entry.name);
+      const path = join(root, entry.name);
+      if (PROJECT_SKILL_TRANSACTION_TEMP_PATTERN.test(entry.name)) {
+        await removeOwnedPath(root, path, "Incomplete project Skill transaction journal");
+        continue;
+      }
+      const match = PROJECT_SKILL_TRANSACTION_JOURNAL_PATTERN.exec(entry.name);
+      if (match === null || !entry.isFile() || entry.isSymbolicLink()) {
+        throw new Error("Project Skill transaction journal directory contains an unsupported current-v1 entry.");
+      }
+      const info = await lstat(path);
+      if (!info.isFile() || info.isSymbolicLink() || info.size < 2 || info.size > MAXIMUM_PROJECT_SKILL_TRANSACTION_JOURNAL_BYTES) {
+        throw new Error("Project Skill transaction journal is malformed.");
+      }
+      await assertContainedPath(root, path, "Project Skill transaction journal");
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(await readFile(path, "utf8"));
+      } catch {
+        throw new Error("Project Skill transaction journal is not valid JSON.");
+      }
+      const journal = this.#validateProjectSkillTransactionJournal(parsed, match[1]!);
+      await this.#recoverProjectSkillTransaction(path, journal);
+    }
+  }
+
+  #validateProjectSkillTransactionJournal(value: unknown, expectedTransactionId: string): ProjectSkillTransactionJournal {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw new Error("Project Skill transaction journal is malformed.");
+    }
+    const record = value as Record<string, unknown>;
+    const keys = [
+      "format", "kind", "transactionId", "backendId", "targetId", "workspaceRoot",
+      "sourcePath", "destinationPath", "expectedResourceId", "expectedVersionNumber",
+      "expectedRevision", "committedResourceId", "committedVersionNumber", "committedRevision"
+    ];
+    if (Object.keys(record).length !== keys.length || keys.some((key) => !(key in record))) {
+      throw new Error("Project Skill transaction journal has unsupported fields.");
+    }
+    const transactionId = requiredJournalString(record, "transactionId");
+    if (record["format"] !== 1 || transactionId !== expectedTransactionId || !RESOURCE_GENERATION_PATTERN.test(transactionId)) {
+      throw new Error("Project Skill transaction journal identity is malformed.");
+    }
+    const kind = record["kind"];
+    if (kind !== "replace" && kind !== "remove") throw new Error("Project Skill transaction kind is malformed.");
+    const backendId = requiredJournalString(record, "backendId");
+    const targetId = requiredJournalString(record, "targetId");
+    const workspaceRoot = normalizedAbsolute(requiredJournalString(record, "workspaceRoot"), "Project Skill transaction workspace");
+    const sourcePath = normalizedAbsolute(requiredJournalString(record, "sourcePath"), "Project Skill transaction source");
+    const destinationPath = normalizedAbsolute(requiredJournalString(record, "destinationPath"), "Project Skill transaction destination");
+    const expectedResourceId = requiredJournalString(record, "expectedResourceId");
+    const committedResourceId = requiredJournalString(record, "committedResourceId");
+    validateResourceId(expectedResourceId);
+    validateResourceId(committedResourceId);
+    const expectedVersionNumber = journalVersion(record, "expectedVersionNumber");
+    const committedVersionNumber = journalVersion(record, "committedVersionNumber");
+    const expectedRevision = normalizedContentRevision(requiredJournalString(record, "expectedRevision"), "Project Skill transaction source revision");
+    const committedRevision = normalizedContentRevision(requiredJournalString(record, "committedRevision"), "Project Skill transaction committed revision");
+    const authority = this.#records.get(expectedResourceId);
+    if (
+      authority === undefined || !isDirectProjectResource(authority) || authority.kind !== "skill"
+      || authority.backendId !== backendId || authority.targetId !== targetId
+      || authority.workspaceRoot === undefined || !samePath(authority.workspaceRoot, workspaceRoot)
+      || !samePath(authority.canonicalPath, sourcePath)
+    ) throw new Error("Project Skill transaction journal does not match durable Resource authority.");
+    assertWithin(workspaceRoot, sourcePath, "Project Skill transaction source");
+    assertWithin(workspaceRoot, destinationPath, "Project Skill transaction destination");
+    if (!samePath(dirname(sourcePath), dirname(destinationPath))) {
+      throw new Error("Project Skill transaction destination must remain beside its source.");
+    }
+    validateEntryName(basename(sourcePath));
+    validateEntryName(basename(destinationPath));
+    if (kind === "remove") {
+      if (
+        !samePath(sourcePath, destinationPath) || committedResourceId !== expectedResourceId
+        || BigInt(committedVersionNumber) !== BigInt(expectedVersionNumber) + 1n
+        || committedRevision !== expectedRevision
+      ) throw new Error("Project Skill removal transaction journal is inconsistent.");
+    } else if (committedResourceId === expectedResourceId) {
+      if (!samePath(sourcePath, destinationPath) || BigInt(committedVersionNumber) !== BigInt(expectedVersionNumber) + 1n) {
+        throw new Error("Project Skill replacement transaction journal is inconsistent.");
+      }
+    } else {
+      if (
+        samePath(sourcePath, destinationPath) || committedVersionNumber !== "1"
+        || committedResourceId !== stableDiscoveredResourceId(backendId, targetId, "skill", destinationPath)
+      ) throw new Error("Project Skill rename transaction journal is inconsistent.");
+      portableSkillName(basename(destinationPath));
+    }
+    return {
+      format: 1,
+      kind,
+      transactionId,
+      backendId,
+      targetId,
+      workspaceRoot,
+      sourcePath,
+      destinationPath,
+      expectedResourceId,
+      expectedVersionNumber,
+      expectedRevision,
+      committedResourceId,
+      committedVersionNumber,
+      committedRevision
+    };
+  }
+
+  async #recoverProjectSkillTransaction(journalPath: string, raw: ProjectSkillTransactionJournal): Promise<void> {
+    const journalsRoot = join(this.#managedRoot, PROJECT_SKILL_TRANSACTION_JOURNALS_DIRECTORY);
+    const expectedJournalPath = join(journalsRoot, `${raw.transactionId}.json`);
+    if (!samePath(journalPath, expectedJournalPath)) throw new Error("Project Skill transaction journal path is invalid.");
+    const journal = this.#validateProjectSkillTransactionJournal(raw, raw.transactionId);
+    const expected = this.#records.get(journal.expectedResourceId)!;
+    const expectedCurrent = expected.versionNumber === journal.expectedVersionNumber
+      && isDirectProjectResource(expected)
+      && samePath(expected.canonicalPath, journal.sourcePath);
+    const committed = this.#records.get(journal.committedResourceId);
+    const committedCurrent = committed !== undefined
+      && isDirectProjectResource(committed)
+      && committed.kind === "skill"
+      && committed.backendId === journal.backendId
+      && committed.targetId === journal.targetId
+      && samePath(committed.canonicalPath, journal.destinationPath)
+      && BigInt(committed.versionNumber) >= BigInt(journal.committedVersionNumber)
+      && (journal.kind !== "remove" || committed.state === "removed");
+    if (expectedCurrent === committedCurrent) {
+      throw new Error("Project Skill transaction cannot be matched to exactly one durable catalog state.");
+    }
+    const transactionRoot = join(dirname(journal.sourcePath), PROJECT_SKILL_TRANSACTION_DIRECTORY);
+    const transactionRootInfo = await optionalLstat(transactionRoot);
+    if (transactionRootInfo !== undefined) {
+      if (!transactionRootInfo.isDirectory() || transactionRootInfo.isSymbolicLink()) {
+        throw new Error("Project Skill transaction directory is not a regular directory.");
+      }
+      await assertContainedRegularDirectory(journal.workspaceRoot, transactionRoot, "Project Skill transaction directory");
+    }
+    if (committedCurrent) await this.#finalizeProjectSkillTransaction(transactionRoot, journal);
+    else await this.#rollbackProjectSkillTransaction(transactionRoot, journal);
+    await removeOwnedPath(journalsRoot, journalPath, "Completed project Skill transaction journal");
+    if (await directoryIsEmpty(transactionRoot)) await rm(transactionRoot, { recursive: true, force: true });
+  }
+
+  async #finalizeProjectSkillTransaction(transactionRoot: string, journal: ProjectSkillTransactionJournal): Promise<void> {
+    if (await optionalLstat(transactionRoot) === undefined) return;
+    if (journal.kind === "replace") {
+      await removeOwnedPath(transactionRoot, join(transactionRoot, `${journal.transactionId}.stage`), "Project Skill transaction stage");
+      await removeOwnedPath(transactionRoot, join(transactionRoot, `${journal.transactionId}.backup`), "Project Skill transaction backup");
+    } else {
+      await removeOwnedPath(transactionRoot, join(transactionRoot, `${journal.transactionId}.deleted`), "Project Skill removal tombstone");
+    }
+  }
+
+  async #rollbackProjectSkillTransaction(transactionRoot: string, journal: ProjectSkillTransactionJournal): Promise<void> {
+    if (journal.kind === "remove") {
+      const tombstone = join(transactionRoot, `${journal.transactionId}.deleted`);
+      if (await optionalLstat(tombstone) !== undefined) {
+        const tombstoneInspection = await inspectSkillPackage(tombstone, this.#maximumFiles, this.#maximumBytes);
+        if (tombstoneInspection.revision !== journal.expectedRevision) throw new Error("Project Skill removal tombstone changed before rollback.");
+        if (await optionalLstat(journal.sourcePath) === undefined) {
+          await rename(tombstone, journal.sourcePath);
+        } else {
+          const sourceInspection = await inspectSkillPackage(journal.sourcePath, this.#maximumFiles, this.#maximumBytes);
+          if (sourceInspection.revision !== journal.expectedRevision) throw new Error("Project Skill removal rollback target is occupied.");
+          await removeOwnedPath(transactionRoot, tombstone, "Project Skill removal duplicate tombstone");
+        }
+      } else if (await optionalLstat(journal.sourcePath) === undefined) {
+        throw new Error("Project Skill removal rollback content is missing.");
+      }
+      return;
+    }
+
+    const stage = join(transactionRoot, `${journal.transactionId}.stage`);
+    const backup = join(transactionRoot, `${journal.transactionId}.backup`);
+    const backupInfo = await optionalLstat(backup);
+    if (backupInfo !== undefined) {
+      const backupInspection = await inspectSkillPackage(backup, this.#maximumFiles, this.#maximumBytes);
+      if (backupInspection.revision !== journal.expectedRevision) throw new Error("Project Skill transaction backup changed before rollback.");
+      if (samePath(journal.sourcePath, journal.destinationPath)) {
+        const sourceInfo = await optionalLstat(journal.sourcePath);
+        if (sourceInfo === undefined) {
+          await rename(backup, journal.sourcePath);
+        } else {
+          const sourceInspection = await inspectSkillPackage(journal.sourcePath, this.#maximumFiles, this.#maximumBytes);
+          if (sourceInspection.revision === journal.committedRevision && journal.committedRevision !== journal.expectedRevision) {
+            await removeOwnedPath(transactionRoot, stage, "Project Skill transaction stage");
+            await rename(journal.sourcePath, stage);
+            await rename(backup, journal.sourcePath);
+          } else if (sourceInspection.revision === journal.expectedRevision) {
+            await removeOwnedPath(transactionRoot, backup, "Project Skill duplicate transaction backup");
+          } else {
+            throw new Error("Project Skill transaction rollback target changed unexpectedly.");
+          }
+        }
+      } else {
+        const destinationInfo = await optionalLstat(journal.destinationPath);
+        if (destinationInfo !== undefined) {
+          const destinationInspection = await inspectSkillPackage(journal.destinationPath, this.#maximumFiles, this.#maximumBytes);
+          if (destinationInspection.revision !== journal.committedRevision) {
+            throw new Error("Renamed project Skill changed before rollback.");
+          }
+          await removeOwnedPath(transactionRoot, stage, "Project Skill transaction stage");
+          await rename(journal.destinationPath, stage);
+        }
+        const sourceInfo = await optionalLstat(journal.sourcePath);
+        if (sourceInfo === undefined) {
+          await rename(backup, journal.sourcePath);
+        } else {
+          const sourceInspection = await inspectSkillPackage(journal.sourcePath, this.#maximumFiles, this.#maximumBytes);
+          if (sourceInspection.revision !== journal.expectedRevision) throw new Error("Project Skill rename rollback target is occupied.");
+          await removeOwnedPath(transactionRoot, backup, "Project Skill duplicate transaction backup");
+        }
+      }
+    } else {
+      if (await optionalLstat(journal.sourcePath) === undefined) {
+        throw new Error("Project Skill transaction rollback content is missing.");
+      }
+      if (!samePath(journal.sourcePath, journal.destinationPath) && await optionalLstat(journal.destinationPath) !== undefined) {
+        throw new Error("Project Skill rename rollback backup is missing.");
+      }
+    }
+    await removeOwnedPath(transactionRoot, stage, "Project Skill transaction stage");
   }
 
   async #recoverOrphanedFilesystemState(): Promise<boolean> {
@@ -1764,7 +2310,7 @@ export class PiResourceManager {
       if (approved.source.kind === "local") {
         if (approved.canonicalPath === undefined) throw new Error("Local resource is missing its canonical source path.");
         sourceRoot = approved.canonicalPath;
-        sourceInspection = await inspectResource(sourceRoot, this.#maximumFiles, this.#maximumBytes);
+        sourceInspection = await inspectResourceForKind(approved.kind, sourceRoot, this.#maximumFiles, this.#maximumBytes);
       } else {
         const acquired = await this.#acquisition.acquire({
           source: approved.source,
@@ -1788,7 +2334,7 @@ export class PiResourceManager {
       } else {
         throw new Error("Approved resource source is no longer a regular file or directory.");
       }
-      const stagedInspection = await inspectResource(stagedPayload, this.#maximumFiles, this.#maximumBytes);
+      const stagedInspection = await inspectResourceForKind(approved.kind, stagedPayload, this.#maximumFiles, this.#maximumBytes);
       if (stagedInspection.revision !== sourceInspection.revision) throw new Error("Resource changed during staged installation.");
       if (approved.source.kind === "local") await this.#assertSourceUnchanged(approved);
       else await rm(acquisitionRoot, { recursive: true, force: true });
@@ -1796,7 +2342,7 @@ export class PiResourceManager {
       candidatePublished = true;
       const installedPath = join(candidateContainer, payloadName);
       await assertContainedPath(this.#managedRoot, installedPath, "Installed resource candidate");
-      const installedInspection = await inspectResource(installedPath, this.#maximumFiles, this.#maximumBytes);
+      const installedInspection = await inspectResourceForKind(approved.kind, installedPath, this.#maximumFiles, this.#maximumBytes);
       const installedRuntimeVersion = this.#runtimeVersion(approved.backendId);
       const compatibility = await inspectPiResourceCompatibility(approved.kind, installedPath, {
         ...(installedRuntimeVersion === undefined ? {} : { currentRuntimeVersion: installedRuntimeVersion }),
@@ -1849,10 +2395,265 @@ export class PiResourceManager {
     }
   }
 
+  #assertSkillContentAuthority(record: StoredResource, expectedResourceVersion: bigint): void {
+    if (record.kind !== "skill") throw new Error("Resource is not a Skill.");
+    if (record.state === "removed") throw new Error("Removed Skill content is unavailable.");
+    if (BigInt(record.versionNumber) !== expectedResourceVersion) throw new Error("Skill Resource revision is stale.");
+    this.#assertStoredProjectTargetTrusted(record);
+    if (isDirectProjectResource(record)) {
+      if (!(record.state === "approved" || record.state === "disabled" || record.state === "loaded")) {
+        throw new Error("Project Skill is not approved.");
+      }
+      return;
+    }
+    if (record.source.kind === "extension_source" || record.kind !== "skill") {
+      throw new Error("Package-owned Skills must be changed through their package owner.");
+    }
+    if (record.installedPath === undefined || !(record.state === "installed" || record.state === "disabled" || record.state === "loaded")) {
+      throw new Error("Global Skill is not installed.");
+    }
+  }
+
+  async #skillContentRoot(record: StoredResource, signal?: AbortSignal): Promise<string> {
+    signal?.throwIfAborted();
+    if (isDirectProjectResource(record)) {
+      const workspaceRoot = this.#assertTrustedProjectTarget(record.backendId, record.targetId, record.workspaceRoot);
+      assertWithin(workspaceRoot, record.canonicalPath, "Project Skill content");
+      await assertCanonicalDirectory(record.canonicalPath, "Project Skill content");
+      return record.canonicalPath;
+    }
+    if (record.installedPath === undefined) throw new Error("Global Skill content is not installed.");
+    assertExpectedInstalledLocation(this.#managedRoot, record);
+    await assertContainedRegularDirectory(this.#managedRoot, record.installedPath, "Global Skill content");
+    return record.installedPath;
+  }
+
+  async #prepareManagedSkillContentMutation(
+    current: StoredResource,
+    candidateRoot: string,
+    candidateInspection: ResourceInspection,
+    compatibility: PiPackageInspection,
+    requestedName: string,
+    changedByConnectionId: string
+  ): Promise<PreparedPiResourceMutation<PiSkillContentMutationResult>> {
+    if (current.installedPath === undefined) throw new Error("Global Skill content is not installed.");
+    assertExpectedInstalledLocation(this.#managedRoot, current);
+    const owner = resourceOwnerPath(this.#managedRoot, current);
+    const generations = join(owner, RESOURCE_GENERATIONS_DIRECTORY);
+    await assertContainedRegularDirectory(this.#managedRoot, generations, "Managed Skill generations directory");
+    const generation = randomUUID();
+    const candidateContainer = join(generations, generation);
+    const stage = join(this.#managedRoot, ".staging", `skill-${generation}`);
+    await mkdir(stage, { recursive: false, mode: 0o700 });
+    const payloadName = installedPayloadName(current);
+    const stagedPayload = join(stage, payloadName);
+    let published = false;
+    try {
+      await mkdir(stagedPayload, { recursive: false, mode: 0o700 });
+      await copyTreeFailClosed(candidateRoot, candidateRoot, stagedPayload, {
+        files: 0,
+        bytes: 0,
+        maxFiles: this.#maximumFiles,
+        maxBytes: this.#maximumBytes
+      });
+      await syncTreeForPublish(stagedPayload);
+      const stagedInspection = await inspectSkillPackage(stagedPayload, this.#maximumFiles, this.#maximumBytes);
+      if (stagedInspection.revision !== candidateInspection.revision) throw new Error("Skill candidate changed while it was staged.");
+      await this.#assertInstalledSafe(current);
+      await rename(stage, candidateContainer);
+      published = true;
+      const installedPath = join(candidateContainer, payloadName);
+      const installedInspection = await inspectSkillPackage(installedPath, this.#maximumFiles, this.#maximumBytes);
+      if (installedInspection.revision !== candidateInspection.revision) throw new Error("Published Skill generation differs from its draft.");
+      const { pendingUpdate: _pendingUpdate, error: _error, ...base } = current;
+      const updated: StoredResource = {
+        ...base,
+        name: requestedName,
+        installedPath,
+        discoveredRevision: installedInspection.revision,
+        ...compatibilityFields(compatibility, false),
+        state: current.state === "disabled" ? "disabled" : "installed",
+        enabled: current.enabled,
+        approvedAt: this.#now(),
+        approvedByConnectionId: changedByConnectionId,
+        versionNumber: (BigInt(current.versionNumber) + 1n).toString(10),
+        updatedAt: this.#now()
+      };
+      assertExpectedInstalledLocation(this.#managedRoot, updated);
+      const resource = publicResource(updated);
+      return this.#prepareMutation(
+        [{ id: current.id, expected: current, next: updated }],
+        { resource },
+        undefined,
+        {
+          rollback: () => this.#removeCandidateGeneration(current, candidateContainer),
+          cleanupAfterCommit: () => this.#removeInstalledIncarnation(current)
+        }
+      );
+    } catch (error) {
+      await rm(stage, { recursive: true, force: true }).catch(() => undefined);
+      if (published) await this.#removeCandidateGeneration(current, candidateContainer).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async #prepareProjectSkillContentMutation(
+    current: StoredResource & {
+      readonly source: Extract<PiPackageSource, { readonly kind: "local" }>;
+      readonly canonicalPath: string;
+    },
+    expectedObservedRevision: string,
+    candidateRoot: string,
+    candidateInspection: ResourceInspection,
+    compatibility: PiPackageInspection,
+    requestedName: string,
+    changedByConnectionId: string
+  ): Promise<PreparedPiResourceMutation<PiSkillContentMutationResult>> {
+    const workspaceRoot = this.#assertTrustedProjectTarget(current.backendId, current.targetId, current.workspaceRoot);
+    const targetId = current.targetId!;
+    const currentInspection = await inspectSkillPackage(current.canonicalPath, this.#maximumFiles, this.#maximumBytes);
+    if (!samePath(currentInspection.canonicalPath, current.canonicalPath) || currentInspection.revision !== expectedObservedRevision) {
+      throw new Error("Observed Skill revision is stale.");
+    }
+    const parent = dirname(current.canonicalPath);
+    assertWithin(workspaceRoot, parent, "Project Skill parent");
+    await assertCanonicalDirectory(parent, "Project Skill parent");
+    const renaming = requestedName !== basename(current.canonicalPath);
+    const destination = renaming ? join(parent, requestedName) : current.canonicalPath;
+    if (renaming && await optionalLstat(destination) !== undefined) throw new Error("A Skill with that name already exists in this scope.");
+    const { pendingUpdate: _pendingUpdate, error: _error, ...base } = current;
+    const nextState = current.state === "disabled" ? "disabled" : "approved";
+    let entries: readonly PreparedCatalogEntry[];
+    let result: PiSkillContentMutationResult;
+    let committed: StoredResource;
+    if (renaming) {
+      const nextId = stableDiscoveredResourceId(current.backendId, targetId, "skill", destination);
+      if (this.#records.has(nextId)) throw new Error("The renamed Skill Resource identity already exists.");
+      const removed: StoredResource = {
+        ...base,
+        state: "removed",
+        enabled: false,
+        versionNumber: (BigInt(current.versionNumber) + 1n).toString(10),
+        updatedAt: this.#now()
+      };
+      const next: StoredResource = {
+        ...base,
+        id: nextId,
+        name: requestedName,
+        source: { kind: "local", path: destination },
+        sourceIdentity: `skill:${pathIdentity(destination)}`,
+        sourceDisplay: requestedName,
+        canonicalPath: destination,
+        canonicalPathFingerprint: pathFingerprint(destination),
+        discoveredRevision: candidateInspection.revision,
+        ...compatibilityFields(compatibility, false),
+        state: nextState,
+        enabled: current.enabled,
+        approvedAt: this.#now(),
+        approvedByConnectionId: changedByConnectionId,
+        versionNumber: "1",
+        updatedAt: this.#now()
+      };
+      entries = [
+        { id: current.id, expected: current, next: removed },
+        { id: nextId, expected: undefined, next }
+      ];
+      committed = next;
+      result = { resource: publicResource(next), replacedResourceId: current.id };
+    } else {
+      const updated: StoredResource = {
+        ...base,
+        name: requestedName,
+        discoveredRevision: candidateInspection.revision,
+        ...compatibilityFields(compatibility, false),
+        state: nextState,
+        enabled: current.enabled,
+        approvedAt: this.#now(),
+        approvedByConnectionId: changedByConnectionId,
+        versionNumber: (BigInt(current.versionNumber) + 1n).toString(10),
+        updatedAt: this.#now()
+      };
+      entries = [{ id: current.id, expected: current, next: updated }];
+      committed = updated;
+      result = { resource: publicResource(updated) };
+    }
+
+    const transactionRoot = join(parent, PROJECT_SKILL_TRANSACTION_DIRECTORY);
+    await mkdir(transactionRoot, { recursive: true, mode: 0o700 });
+    await assertContainedRegularDirectory(workspaceRoot, transactionRoot, "Project Skill transaction directory");
+    const transactionId = randomUUID();
+    const stage = join(transactionRoot, `${transactionId}.stage`);
+    const backup = join(transactionRoot, `${transactionId}.backup`);
+    const journal: ProjectSkillTransactionJournal = {
+      format: 1,
+      kind: "replace",
+      transactionId,
+      backendId: current.backendId,
+      targetId,
+      workspaceRoot,
+      sourcePath: current.canonicalPath,
+      destinationPath: destination,
+      expectedResourceId: current.id,
+      expectedVersionNumber: current.versionNumber,
+      expectedRevision: expectedObservedRevision,
+      committedResourceId: committed.id,
+      committedVersionNumber: committed.versionNumber,
+      committedRevision: committed.discoveredRevision
+    };
+    let journalPath: string | undefined;
+    try {
+      journalPath = await this.#writeProjectSkillTransactionJournal(journal);
+      await mkdir(stage, { recursive: false, mode: 0o700 });
+      await copyTreeFailClosed(candidateRoot, candidateRoot, stage, {
+        files: 0,
+        bytes: 0,
+        maxFiles: this.#maximumFiles,
+        maxBytes: this.#maximumBytes
+      });
+      await syncTreeForPublish(stage);
+      const stagedInspection = await inspectSkillPackage(stage, this.#maximumFiles, this.#maximumBytes);
+      if (stagedInspection.revision !== candidateInspection.revision) throw new Error("Skill candidate changed while it was staged.");
+      const beforeSwitch = await inspectSkillPackage(current.canonicalPath, this.#maximumFiles, this.#maximumBytes);
+      this.#assertTrustedProjectTarget(current.backendId, current.targetId, workspaceRoot);
+      if (!samePath(beforeSwitch.canonicalPath, current.canonicalPath) || beforeSwitch.revision !== expectedObservedRevision) {
+        throw new Error("Project Skill changed before its staged content could be published.");
+      }
+      await rename(current.canonicalPath, backup);
+      try {
+        await rename(stage, destination);
+      } catch (error) {
+        await rename(backup, current.canonicalPath);
+        throw error;
+      }
+      const publishedInspection = await inspectSkillPackage(destination, this.#maximumFiles, this.#maximumBytes);
+      if (publishedInspection.revision !== candidateInspection.revision) throw new Error("Published project Skill differs from its draft.");
+      return this.#prepareMutation(
+        entries,
+        result,
+        () => this.#assertTrustedProjectTarget(current.backendId, current.targetId, workspaceRoot),
+        {
+          rollback: () => this.#recoverProjectSkillTransaction(journalPath!, journal),
+          cleanupAfterCommit: () => this.#recoverProjectSkillTransaction(journalPath!, journal)
+        }
+      );
+    } catch (error) {
+      if (journalPath !== undefined) {
+        try {
+          await this.#recoverProjectSkillTransaction(journalPath, journal);
+        } catch (recoveryError) {
+          throw new AggregateError([error, recoveryError], "Project Skill publication failed and its durable rollback requires recovery.");
+        }
+      }
+      await rm(stage, { recursive: true, force: true }).catch(() => undefined);
+      if (await directoryIsEmpty(transactionRoot)) await rm(transactionRoot, { recursive: true, force: true }).catch(() => undefined);
+      throw error;
+    }
+  }
+
   async #assertSourceUnchanged(record: StoredResource): Promise<void> {
     this.#assertStoredProjectTargetTrusted(record);
     if (record.source.kind !== "local" || record.canonicalPath === undefined) throw new Error("Resource does not have a local approved source.");
-    const inspection = await inspectResource(record.canonicalPath, this.#maximumFiles, this.#maximumBytes);
+    const inspection = await inspectResourceForKind(record.kind, record.canonicalPath, this.#maximumFiles, this.#maximumBytes);
     if (record.workspaceRoot !== undefined) assertWithin(record.workspaceRoot, inspection.canonicalPath, "Project resource");
     if (!samePath(inspection.canonicalPath, record.canonicalPath) || inspection.revision !== record.discoveredRevision) {
       throw new Error("Approved resource changed and is fenced until it is discovered and approved again.");
@@ -1863,7 +2664,7 @@ export class PiResourceManager {
     if (record.installedPath === undefined) throw new Error("Resource has no installed payload.");
     assertExpectedInstalledLocation(this.#managedRoot, record);
     await assertContainedPath(this.#managedRoot, record.installedPath, "Installed resource payload");
-    const inspection = await inspectResource(record.installedPath, this.#maximumFiles, this.#maximumBytes);
+    const inspection = await inspectResourceForKind(record.kind, record.installedPath, this.#maximumFiles, this.#maximumBytes);
     if (inspection.revision !== record.discoveredRevision) throw new Error("Installed resource content changed and is fenced.");
   }
 
@@ -2186,6 +2987,104 @@ async function inspectResource(
   else await inspectDirectory(canonicalPath, canonicalPath, "", hash, budget, signal);
   signal?.throwIfAborted();
   return { canonicalPath, revision: `sha256:${hash.digest("hex")}`, files: budget.files, bytes: budget.bytes };
+}
+
+async function inspectSkillPackage(
+  sourcePath: string,
+  maximumFiles: number,
+  maximumBytes: number,
+  signal?: AbortSignal
+): Promise<ResourceInspection> {
+  const inspection = await inspectResource(sourcePath, maximumFiles, maximumBytes, signal);
+  const rootInfo = await lstat(inspection.canonicalPath);
+  if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) throw new Error("Skill content must be a regular directory.");
+  const manifest = join(inspection.canonicalPath, "SKILL.md");
+  const manifestInfo = await lstat(manifest).catch(() => undefined);
+  if (manifestInfo === undefined || !manifestInfo.isFile() || manifestInfo.isSymbolicLink()) {
+    throw new Error("Skill content must contain a regular SKILL.md file.");
+  }
+  const canonicalManifest = await realpath(manifest);
+  if (!samePath(manifest, canonicalManifest)) throw new Error("Skill SKILL.md contains a path alias or junction.");
+  assertWithin(inspection.canonicalPath, canonicalManifest, "Skill manifest");
+  await assertStableUtf8File(canonicalManifest, signal);
+  await assertPortableSkillTreeKeys(inspection.canonicalPath, inspection.canonicalPath, "");
+  signal?.throwIfAborted();
+  return inspection;
+}
+
+function inspectResourceForKind(
+  kind: PiResourceKind,
+  sourcePath: string,
+  maximumFiles: number,
+  maximumBytes: number,
+  signal?: AbortSignal
+): Promise<ResourceInspection> {
+  return kind === "skill"
+    ? inspectSkillPackage(sourcePath, maximumFiles, maximumBytes, signal)
+    : inspectResource(sourcePath, maximumFiles, maximumBytes, signal);
+}
+
+async function assertStableUtf8File(path: string, signal?: AbortSignal): Promise<void> {
+  const before = await lstat(path);
+  if (!before.isFile() || before.isSymbolicLink()) throw new Error("Skill SKILL.md must be a regular UTF-8 file.");
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  try {
+    for await (const chunk of createReadStream(path, { signal })) {
+      decoder.decode(chunk, { stream: true });
+    }
+    decoder.decode();
+  } catch (error) {
+    signal?.throwIfAborted();
+    if (error instanceof TypeError) throw new Error("Skill SKILL.md must be valid UTF-8.");
+    throw error;
+  }
+  const after = await lstat(path);
+  if (!after.isFile() || after.isSymbolicLink() || !sameIdentity(before, after) || before.size !== after.size || before.mtimeMs !== after.mtimeMs) {
+    throw new Error("Skill SKILL.md changed while its UTF-8 content was validated.");
+  }
+}
+
+async function assertPortableSkillTreeKeys(root: string, directory: string, parentKey: string): Promise<void> {
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const key = parentKey === "" ? entry.name : `${parentKey}/${entry.name}`;
+    const parts = key.split("/");
+    if (
+      key.length > 512 || parts.length > 32 || /[<>:"|?*\u0000-\u001f]/u.test(entry.name)
+      || /[. ]$/u.test(entry.name) || isWindowsReservedSkillName(entry.name)
+    ) throw new Error("Skill content contains a non-portable path key.");
+    if (entry.isDirectory()) await assertPortableSkillTreeKeys(root, join(directory, entry.name), key);
+  }
+  assertWithin(root, directory, "Skill portable path");
+}
+
+function isWindowsReservedSkillName(value: string): boolean {
+  const stem = value.split(".", 1)[0]!.toUpperCase();
+  return stem === "CON" || stem === "PRN" || stem === "AUX" || stem === "NUL"
+    || /^COM[1-9]$/u.test(stem) || /^LPT[1-9]$/u.test(stem);
+}
+
+async function syncTreeForPublish(root: string): Promise<void> {
+  const entries = await readdir(root, { withFileTypes: true });
+  entries.sort((left, right) => left.name.localeCompare(right.name, "en"));
+  for (const entry of entries) {
+    validateEntryName(entry.name);
+    const path = join(root, entry.name);
+    const info = await lstat(path);
+    if (entry.isSymbolicLink() || info.isSymbolicLink()) throw new Error("Skill publish tree contains a symlink or junction.");
+    if (entry.isDirectory() && info.isDirectory()) {
+      await syncTreeForPublish(path);
+      continue;
+    }
+    if (!entry.isFile() || !info.isFile()) throw new Error("Skill publish tree contains a special file.");
+    // Windows requires a writable handle for FlushFileBuffers even though no
+    // bytes are changed here. The staged copy is service-owned and writable.
+    const handle = await open(path, "r+");
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  }
 }
 
 async function inspectDirectory(
@@ -3046,6 +3945,14 @@ function safePayloadName(name: string): string {
   return value === "" || value === "." || value === ".." || value === RESOURCE_GENERATIONS_DIRECTORY ? "resource" : value;
 }
 
+function portableSkillName(value: string): string {
+  const name = nonBlank(value, "Skill name");
+  if (name.length > 100 || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(name)) {
+    throw new Error("Skill name must use lowercase letters, numbers, and single hyphens.");
+  }
+  return name;
+}
+
 function validateResourceId(id: string): void {
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(id)) throw new Error("Pi resource ID is invalid.");
 }
@@ -3172,6 +4079,20 @@ function nonBlank(value: string, label: string): string {
   const normalized = value.trim();
   if (normalized === "" || normalized.includes("\0")) throw new Error(`${label} must not be blank.`);
   return normalized;
+}
+
+function requiredJournalString(record: Readonly<Record<string, unknown>>, key: string): string {
+  const value = record[key];
+  if (typeof value !== "string" || value.length === 0 || value.includes("\0")) {
+    throw new Error(`Project Skill transaction journal ${key} is malformed.`);
+  }
+  return value;
+}
+
+function journalVersion(record: Readonly<Record<string, unknown>>, key: string): string {
+  const value = requiredJournalString(record, key);
+  if (!/^\d+$/u.test(value)) throw new Error(`Project Skill transaction journal ${key} is malformed.`);
+  return BigInt(value).toString(10);
 }
 
 async function removeOwnedPath(root: string, path: string, label: string): Promise<void> {

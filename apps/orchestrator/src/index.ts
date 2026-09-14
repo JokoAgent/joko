@@ -38,6 +38,7 @@ export * from "./pi-provider-auth-supervisor.js";
 export * from "./pi-package-compatibility.js";
 export * from "./proto-mapper.js";
 export * from "./resource-manager.js";
+export * from "./skill-manager.js";
 export * from "./runtime-governance-settings.js";
 export * from "./remote-host-connect-service.js";
 export * from "./remote-host-registry.js";

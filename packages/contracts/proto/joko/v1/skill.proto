@@ -1,0 +1,138 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+import "joko/v1/common.proto";
+import "joko/v1/settings.proto";
+
+message SkillDescriptor {
+  string skill_id = 1;
+  string backend_id = 2;
+  string target_id = 3;
+  ResourceScope scope = 4;
+  string name = 5;
+  // Path-free basename or package label; never a service-node path.
+  string source_label = 6;
+  ResourceState state = 7;
+  bool enabled = 8;
+  bool can_toggle = 9;
+  bool content_available = 10;
+  bool can_edit = 11;
+  bool can_delete = 12;
+  EntityVersion entity_version = 13;
+  string approved_revision = 14;
+  google.protobuf.Timestamp updated_at = 15;
+}
+
+message SkillMetadata {
+  string name = 1;
+  string description = 2;
+  string version = 3;
+  // JSON projection of bounded YAML frontmatter. Sensitive fields are redacted.
+  string frontmatter_json = 4;
+  string parse_error = 5;
+}
+
+enum SkillFileKind {
+  SKILL_FILE_KIND_UNSPECIFIED = 0;
+  SKILL_FILE_KIND_DIRECTORY = 1;
+  SKILL_FILE_KIND_FILE = 2;
+}
+
+message SkillFileEntry {
+  // Portable, Skill-root-relative key. Backslashes and traversal are invalid.
+  string key = 1;
+  string name = 2;
+  SkillFileKind kind = 3;
+  uint64 size = 4;
+  bool editable = 5;
+}
+
+message SkillFileContent {
+  string key = 1;
+  string content = 2;
+  string revision = 3;
+  uint64 size = 4;
+  bool editable = 5;
+}
+
+enum SkillDiffChangeKind {
+  SKILL_DIFF_CHANGE_KIND_UNSPECIFIED = 0;
+  SKILL_DIFF_CHANGE_KIND_ADDED = 1;
+  SKILL_DIFF_CHANGE_KIND_MODIFIED = 2;
+  SKILL_DIFF_CHANGE_KIND_DELETED = 3;
+}
+
+message SkillDiffChange {
+  string key = 1;
+  SkillDiffChangeKind kind = 2;
+  bool binary = 3;
+  string unified_diff = 4;
+}
+
+message SkillDiff {
+  bool available = 1;
+  string reason = 2;
+  repeated SkillDiffChange changes = 3;
+  bool truncated = 4;
+}
+
+message SkillSession {
+  reserved 7;
+  string session_id = 1;
+  SkillDescriptor skill = 2;
+  string observed_revision = 3;
+  bool dirty = 4;
+  bool baseline_available = 5;
+  SkillMetadata metadata = 6;
+  uint64 file_count = 8;
+  uint64 bytes = 9;
+  SkillDiff diff = 10;
+  google.protobuf.Timestamp expires_at = 11;
+}
+
+enum SkillDraftKind {
+  SKILL_DRAFT_KIND_UNSPECIFIED = 0;
+  SKILL_DRAFT_KIND_EDIT = 1;
+  SKILL_DRAFT_KIND_RENAME = 2;
+}
+
+message SkillDraft {
+  string draft_id = 1;
+  string session_id = 2;
+  string skill_id = 3;
+  SkillDraftKind kind = 4;
+  string name = 5;
+  Revision resource_revision = 6;
+  string observed_revision = 7;
+  repeated SkillDiffChange changes = 8;
+  google.protobuf.Timestamp expires_at = 9;
+}
+
+enum SkillRecoveryStatus {
+  SKILL_RECOVERY_STATUS_UNSPECIFIED = 0;
+  SKILL_RECOVERY_STATUS_READY = 1;
+  SKILL_RECOVERY_STATUS_MISSING = 2;
+}
+
+message SkillRecovery {
+  string recovery_id = 1;
+  string skill_id = 2;
+  string backend_id = 3;
+  string target_id = 4;
+  ResourceScope scope = 5;
+  string name = 6;
+  string revision = 7;
+  uint64 files = 8;
+  uint64 bytes = 9;
+  google.protobuf.Timestamp created_at = 10;
+  SkillRecoveryStatus status = 11;
+}
+
+message SkillMutationResult {
+  SkillDescriptor skill = 1;
+  // Present only when a project directory rename replaced its path-derived ID.
+  string replaced_skill_id = 2;
+  string recovery_id = 3;
+}

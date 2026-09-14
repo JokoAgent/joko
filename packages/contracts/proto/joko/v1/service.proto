@@ -16,6 +16,7 @@ import "joko/v1/portable_session.proto";
 import "joko/v1/runtime.proto";
 import "joko/v1/review.proto";
 import "joko/v1/settings.proto";
+import "joko/v1/skill.proto";
 import "joko/v1/snapshot.proto";
 import "joko/v1/subagent.proto";
 import "joko/v1/tool.proto";
@@ -259,6 +260,18 @@ service ExtensionService {
   // Produces a one-time protected upload ticket. Secret bytes cross only the
   // authenticated credential upload endpoint and never this RPC.
   rpc BeginExtensionSetupCredentialUpload(BeginExtensionSetupCredentialUploadRequest) returns (BeginExtensionSetupCredentialUploadResponse);
+}
+
+service SkillService {
+  rpc ListSkills(ListSkillsRequest) returns (ListSkillsResponse);
+  rpc OpenSkill(OpenSkillRequest) returns (OpenSkillResponse);
+  rpc ListSkillFiles(ListSkillFilesRequest) returns (ListSkillFilesResponse);
+  rpc ReadSkillFile(ReadSkillFileRequest) returns (ReadSkillFileResponse);
+  rpc GetSkillDiff(GetSkillDiffRequest) returns (GetSkillDiffResponse);
+  rpc PrepareSkillFileEdit(PrepareSkillFileEditRequest) returns (PrepareSkillFileEditResponse);
+  rpc PrepareSkillRename(PrepareSkillRenameRequest) returns (PrepareSkillRenameResponse);
+  rpc ListSkillRecoveries(ListSkillRecoveriesRequest) returns (ListSkillRecoveriesResponse);
+  rpc CloseSkill(CloseSkillRequest) returns (CloseSkillResponse);
 }
 
 service SubagentService {
@@ -2087,6 +2100,94 @@ message UpdateBrowserCommentDesignResponse {
   // Reconciliation returns the authoritative, ephemeral projection for the
   // current live document. These placements are never durable state.
   repeated BrowserCommentPlacement placements = 1;
+}
+
+message ListSkillsRequest {
+  string query = 1;
+  string backend_id = 2;
+  string target_id = 3;
+  optional ResourceScope scope = 4;
+  PageRequest page = 5;
+}
+
+message ListSkillsResponse {
+  repeated SkillDescriptor skills = 1;
+  Revision catalog_revision = 2;
+  PageInfo page = 3;
+}
+
+message OpenSkillRequest {
+  string skill_id = 1;
+  Revision expected_resource_revision = 2;
+}
+
+message OpenSkillResponse {
+  SkillSession skill = 1;
+}
+
+message ListSkillFilesRequest {
+  string session_id = 1;
+  string parent_key = 2;
+  PageRequest page = 3;
+}
+
+message ListSkillFilesResponse {
+  repeated SkillFileEntry files = 1;
+  PageInfo page = 2;
+}
+
+message ReadSkillFileRequest {
+  string session_id = 1;
+  string key = 2;
+}
+
+message ReadSkillFileResponse {
+  SkillFileContent file = 1;
+}
+
+message GetSkillDiffRequest {
+  string session_id = 1;
+}
+
+message GetSkillDiffResponse {
+  SkillDiff diff = 1;
+}
+
+message PrepareSkillFileEditRequest {
+  string session_id = 1;
+  string key = 2;
+  string expected_file_revision = 3;
+  string content = 4;
+}
+
+message PrepareSkillFileEditResponse {
+  SkillDraft draft = 1;
+}
+
+message PrepareSkillRenameRequest {
+  string session_id = 1;
+  string name = 2;
+}
+
+message PrepareSkillRenameResponse {
+  SkillDraft draft = 1;
+}
+
+message ListSkillRecoveriesRequest {
+  PageRequest page = 1;
+}
+
+message ListSkillRecoveriesResponse {
+  repeated SkillRecovery recoveries = 1;
+  PageInfo page = 2;
+}
+
+message CloseSkillRequest {
+  string session_id = 1;
+}
+
+message CloseSkillResponse {
+  bool closed = 1;
 }
 
 message GetPiSessionStateRequest {

@@ -143,6 +143,7 @@ import { OperationalWorkspaceSnapshotRepository } from "./operational-workspace-
 import { PiProviderAuthSupervisor } from "./pi-provider-auth-supervisor.js";
 import { ProviderAccountUsageProvider } from "./provider-account-usage.js";
 import { PiResourceManager } from "./resource-manager.js";
+import { SkillManager } from "./skill-manager.js";
 import { RemoteHostRegistry } from "./remote-host-registry.js";
 import {
   RemoteBackendRuntimeSetupManager,
@@ -315,6 +316,7 @@ export interface OrchestratorApplication {
   readonly managedModelRuntime?: ManagedModelRuntimeController;
   readonly mcpRouter?: McpRouter;
   readonly piResources?: PiResourceManager;
+  readonly skills?: SkillManager;
   readonly extensionCatalog?: ExtensionCatalogManager;
   readonly extensionLibraries?: ExtensionLibraryManager;
   readonly extensionMainViews?: ExtensionMainViewManager;
@@ -537,6 +539,12 @@ export async function createOrchestratorApplication(
     managedRoot: join(config.piAgentHome, "managed-resources")
   });
   await piResources.initialize();
+  const skills = new SkillManager({
+    resources: piResources,
+    store,
+    rootDirectory: join(config.dataDirectory, "skills")
+  });
+  await skills.initialize();
   const trustedManagedRunnerScriptSha256 = createHash("sha256")
     .update(MANAGED_SUBAGENT_RUNNER_SOURCE, "utf8").digest("hex");
   const trustedManagedRunnerNodeExecutable = await realpath(process.execPath);
@@ -1726,6 +1734,7 @@ export async function createOrchestratorApplication(
     closed = true;
     commandConcurrencyGate.close();
     stopExtensionLibraryAuthorityNotifications();
+    await skills.close().catch(() => undefined);
     await extensionLibraries.close().catch(() => undefined);
     await extensionMainViews.close().catch(() => undefined);
     await extensionPackagePublisher.close().catch(() => undefined);
@@ -1807,6 +1816,7 @@ export async function createOrchestratorApplication(
     managedModelRuntime: managedModelRuntimeSystem.controller,
     mcpRouter,
     piResources,
+    skills,
     extensionCatalog,
     extensionLibraries,
     extensionMainViews,
@@ -1860,6 +1870,7 @@ export async function createOrchestratorApplication(
         for (const cleanup of cleanups) await attempt(cleanup);
         await attempt(() => commandConcurrencyGate.close());
         await attempt(() => stopExtensionLibraryAuthorityNotifications());
+        await attempt(() => skills.close());
         await attempt(() => extensionLibraries.close());
         await attempt(() => extensionMainViews.close());
         await attempt(() => extensionPackagePublisher.close());

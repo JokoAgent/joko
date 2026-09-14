@@ -21,6 +21,7 @@ import {
   RefreshCcw,
   Search,
   ShieldCheck,
+  Sparkles,
   Trash2,
   Upload,
   Wrench,
@@ -52,8 +53,9 @@ import { moveTablistSelection } from "./tablist-navigation.js";
 import { extensionMainViewReady } from "./ExtensionMainViewPage.js";
 import { ExtensionLibrarySection } from "./ExtensionLibrarySection.js";
 import { openExtensionWindowFallback } from "../extension-window-navigation.js";
+import { SkillTools } from "./SkillTools.js";
 
-type ToolsTab = "browser" | "extensions" | "resources" | "mcp" | "activity";
+type ToolsTab = "browser" | "extensions" | "skills" | "resources" | "mcp" | "activity";
 
 export function ToolsPage({ controller, snapshot, runtimeSessionId, selectedExtensionId, locale, t, runAction, onSelectExtension, onOpenNavigation }: {
   readonly controller: AppController;
@@ -106,6 +108,7 @@ export function ToolsPage({ controller, snapshot, runtimeSessionId, selectedExte
       <div className="route-tabs" role="tablist" aria-label={t("tools.title")} aria-orientation="horizontal">
         <TabButton id="browser" current={tab} onClick={selectTab}><Globe2 />{t("tools.browser")}</TabButton>
         <TabButton id="extensions" current={tab} onClick={selectTab}><Boxes />{t("extensions.title")}<span>{snapshot.extensions.length}</span></TabButton>
+        <TabButton id="skills" current={tab} onClick={selectTab}><Sparkles />{t("skills.title")}<span>{snapshot.resources.filter((resource) => resource.kind === "skill" && resource.state !== "removed").length}</span></TabButton>
         <TabButton id="resources" current={tab} onClick={selectTab}><Braces />{t("tools.resources")}<span>{snapshot.resources.length}</span></TabButton>
         <TabButton id="mcp" current={tab} onClick={selectTab}><Boxes />{t("tools.mcp")}</TabButton>
         <TabButton id="activity" current={tab} onClick={selectTab}><Wrench />{t("tools.activity")}<span>{activity.length}</span></TabButton>
@@ -113,6 +116,7 @@ export function ToolsPage({ controller, snapshot, runtimeSessionId, selectedExte
       <div id="tools-tabpanel" className="route-page__content" role="tabpanel" aria-labelledby={`tools-tab-${tab}`}>
         {tab === "browser" && <BrowserTools controller={controller} browsers={snapshot.browsers} browserSettings={snapshot.settings.browsers} sessions={browserSessions} commentSessions={browserCommentSessions} locale={locale} t={t} runAction={runAction} />}
         {tab === "extensions" && <ExtensionTools controller={controller} snapshot={snapshot} runtimeSessionId={runtimeSessionId} selectedId={selectedExtension} locale={locale} t={t} runAction={runAction} onSelect={selectExtension} />}
+        {tab === "skills" && <SkillTools controller={controller} backends={snapshot.backends} targets={snapshot.targets} locale={locale} t={t} />}
         {tab === "resources" && <ResourcesTools controller={controller} backends={snapshot.backends} resources={snapshot.resources} t={t} runAction={runAction} onRemove={setRemoveResource} />}
         {tab === "mcp" && <McpTools controller={controller} backends={mcpBackends} servers={snapshot.settings.mcpServers} t={t} runAction={runAction} />}
         {tab === "activity" && <ActivityTools activity={activity} locale={locale} t={t} />}

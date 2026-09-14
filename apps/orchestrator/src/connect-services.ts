@@ -274,8 +274,21 @@ import type {
   PiResourceKind as NativePiResourceKind,
   PiResourceManager,
   PiResourceState as NativePiResourceState,
+  PiSkillContentMutationResult,
   PreparedPiResourceMutation
 } from "./resource-manager.js";
+import {
+  skillCatalogEntryFromResource,
+  type PreparedSkillMutation,
+  type SkillCatalogEntry as NativeSkillCatalogEntry,
+  type SkillDiff as NativeSkillDiff,
+  type SkillDraftPreview as NativeSkillDraftPreview,
+  type SkillFileContent as NativeSkillFileContent,
+  type SkillFileEntry as NativeSkillFileEntry,
+  type SkillManager,
+  type SkillRecoveryRecord as NativeSkillRecoveryRecord,
+  type SkillSessionDetails as NativeSkillSessionDetails
+} from "./skill-manager.js";
 import {
   normalizePiPackageSource,
   piPackageSourceIdentity,
@@ -407,6 +420,7 @@ interface ConnectServiceDependencies {
   readonly managedModelRuntime?: ManagedModelRuntimeController;
   readonly mcpRouter?: McpRouter;
   readonly piResources?: PiResourceManager;
+  readonly skills?: SkillManager;
   readonly extensionCatalog?: ExtensionCatalogManager;
   readonly extensionLibraries?: ExtensionLibraryManager;
   readonly extensionMainViews?: ExtensionMainViewManager;
@@ -568,6 +582,7 @@ export interface ConnectServiceSet {
   readonly managedModelRuntime: ServiceImpl<typeof contract.ManagedModelRuntimeService>;
   readonly tool: ServiceImpl<typeof contract.ToolService>;
   readonly extension: ServiceImpl<typeof contract.ExtensionService>;
+  readonly skill: ServiceImpl<typeof contract.SkillService>;
   readonly browser: ServiceImpl<typeof contract.BrowserService>;
   readonly remoteHost: ServiceImpl<typeof contract.RemoteHostService>;
   readonly sshKey: ServiceImpl<typeof contract.SshKeyService>;
@@ -768,6 +783,8 @@ interface OperationOutcome {
     readonly expiresAt?: number;
   };
   readonly browserTransferBinaryBase64?: string;
+  readonly skillReplacedId?: string;
+  readonly skillRecoveryId?: string;
 }
 
 interface PresentedOperation {
@@ -888,6 +905,7 @@ export function registerConnectServices(router: ConnectRouter, application: Orch
   router.service(contract.ManagedModelRuntimeService, withConnectErrors(services.managedModelRuntime));
   router.service(contract.ToolService, withConnectErrors(services.tool));
   router.service(contract.ExtensionService, withConnectErrors(services.extension));
+  router.service(contract.SkillService, withConnectErrors(services.skill));
   router.service(contract.BrowserService, withConnectErrors(services.browser));
   router.service(contract.RemoteHostService, withConnectErrors(services.remoteHost));
   router.service(contract.SshKeyService, withConnectErrors(services.sshKey));
@@ -942,6 +960,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
     ...(application.managedModelRuntime === undefined ? {} : { managedModelRuntime: application.managedModelRuntime }),
     ...(application.mcpRouter === undefined ? {} : { mcpRouter: application.mcpRouter }),
     ...(application.piResources === undefined ? {} : { piResources: application.piResources }),
+    ...(application.skills === undefined ? {} : { skills: application.skills }),
     ...(application.extensionCatalog === undefined ? {} : { extensionCatalog: application.extensionCatalog }),
     ...(application.extensionLibraries === undefined ? {} : { extensionLibraries: application.extensionLibraries }),
     ...(application.extensionMainViews === undefined ? {} : { extensionMainViews: application.extensionMainViews }),
@@ -1028,12 +1047,13 @@ export function createConnectServices(application: OrchestratorApplication): Con
   const authenticate = (context: HandlerContext): ConnectionRecord => requireAuthentication(dependencies, context);
   const ensureExtensionSurfaceRevocation = (connectionId: string): void => {
     if (extensionSurfaceRevocations.has(connectionId)
-      || dependencies.extensionMainViews === undefined && dependencies.extensionLibraries === undefined) return;
+      || dependencies.extensionMainViews === undefined && dependencies.extensionLibraries === undefined && dependencies.skills === undefined) return;
     const stop = dependencies.connections.onRevoked(connectionId, () => {
       extensionSurfaceRevocations.delete(connectionId);
       void Promise.all([
         dependencies.extensionMainViews?.closeConnection(connectionId),
-        dependencies.extensionLibraries?.closeConnection(connectionId)
+        dependencies.extensionLibraries?.closeConnection(connectionId),
+        dependencies.skills?.revokeConnection(connectionId)
       ]);
     });
     extensionSurfaceRevocations.set(connectionId, stop);
@@ -3856,6 +3876,110 @@ export function createConnectServices(application: OrchestratorApplication): Con
     }
   } satisfies ServiceImpl<typeof contract.ExtensionService>;
 
+  const skill = {
+    listSkills: async (request, context) => {
+      authenticate(context);
+      if (dependencies.skills === undefined) {
+        return { skills: [], catalogRevision: toProtoRevision(0n), page: emptyPage(request.page) };
+      }
+      const requestedQuery = request.query ?? "";
+      const backendId = request.backendId ?? "";
+      const targetId = request.targetId ?? "";
+      if (requestedQuery.length > 256) throw invalidArgument("query exceeds the supported length");
+      const scope = request.scope === undefined ? undefined : nativeSkillScope(request.scope);
+      const snapshot = await skillEffect(() => dependencies.skills!.reconcile());
+      const query = requestedQuery.trim().toLocaleLowerCase("en-US");
+      const values = snapshot.skills
+        .filter((entry) => backendId === "" || entry.backendId === backendId)
+        .filter((entry) => targetId === "" || entry.targetId === targetId)
+        .filter((entry) => scope === undefined || entry.scope === scope)
+        .filter((entry) => query === "" || `${entry.name}\n${entry.sourceLabel}\n${entry.backendId}`.toLocaleLowerCase("en-US").includes(query))
+        .map(mapSkillDescriptor);
+      const result = paginate(values, request.page);
+      return { skills: result.values, catalogRevision: toProtoRevision(snapshot.revision), page: result.page };
+    },
+    openSkill: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireSkillManager(dependencies);
+      if (request.expectedResourceRevision === undefined) throw invalidArgument("expected_resource_revision is required");
+      ensureExtensionSurfaceRevocation(connection.id);
+      const opened = await skillEffect(() => manager.openSkill(
+        connection.id,
+        nonBlankRequest(request.skillId, "skill_id"),
+        fromProtoRevision(request.expectedResourceRevision, "open_skill.expected_resource_revision")
+      ));
+      return { skill: mapSkillSession(opened) };
+    },
+    listSkillFiles: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireSkillManager(dependencies);
+      const files = await skillEffect(() => manager.listFiles(
+        connection.id,
+        nonBlankRequest(request.sessionId, "session_id"),
+        request.parentKey
+      ));
+      const result = paginate(files.map(mapSkillFileEntry), request.page);
+      return { files: result.values, page: result.page };
+    },
+    readSkillFile: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireSkillManager(dependencies);
+      const file = await skillEffect(() => manager.readFile(
+        connection.id,
+        nonBlankRequest(request.sessionId, "session_id"),
+        nonBlankRequest(request.key, "key")
+      ));
+      return { file: mapSkillFileContent(file) };
+    },
+    getSkillDiff: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireSkillManager(dependencies);
+      const diff = await skillEffect(() => manager.getDiff(
+        connection.id,
+        nonBlankRequest(request.sessionId, "session_id")
+      ));
+      return { diff: mapSkillDiff(diff) };
+    },
+    prepareSkillFileEdit: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireSkillManager(dependencies);
+      const draft = await skillEffect(() => manager.prepareFileEdit({
+        connectionId: connection.id,
+        sessionId: nonBlankRequest(request.sessionId, "session_id"),
+        key: nonBlankRequest(request.key, "key"),
+        expectedFileRevision: nonBlankRequest(request.expectedFileRevision, "expected_file_revision"),
+        content: request.content
+      }));
+      return { draft: mapSkillDraft(draft) };
+    },
+    prepareSkillRename: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireSkillManager(dependencies);
+      const draft = await skillEffect(() => manager.prepareRename({
+        connectionId: connection.id,
+        sessionId: nonBlankRequest(request.sessionId, "session_id"),
+        name: nonBlankRequest(request.name, "name")
+      }));
+      return { draft: mapSkillDraft(draft) };
+    },
+    listSkillRecoveries: async (request, context) => {
+      authenticate(context);
+      const manager = requireSkillManager(dependencies);
+      const recoveries = await skillEffect(() => manager.listRecoveries());
+      const result = paginate(recoveries.map(mapSkillRecovery), request.page);
+      return { recoveries: result.values, page: result.page };
+    },
+    closeSkill: async (request, context) => {
+      const connection = authenticate(context);
+      if (dependencies.skills === undefined) return { closed: false };
+      const closed = await skillEffect(() => dependencies.skills!.closeSession(
+        connection.id,
+        nonBlankRequest(request.sessionId, "session_id")
+      ));
+      return { closed };
+    }
+  } satisfies ServiceImpl<typeof contract.SkillService>;
+
   const browser = {
     listBrowserProviders: async (request, context) => {
       authenticate(context);
@@ -4145,7 +4269,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
     }
   } satisfies ServiceImpl<typeof contract.PiService>;
 
-  return { connection, event, operation, backend, target, session, portableSession, run, subagent, review, queue, scheduler, interaction, workspace, worktree, artifact, historyMaintenance, credential, settings, managedModelRuntime, tool, extension, browser, remoteHost, sshKey, voiceInput, terminal, pi };
+  return { connection, event, operation, backend, target, session, portableSession, run, subagent, review, queue, scheduler, interaction, workspace, worktree, artifact, historyMaintenance, credential, settings, managedModelRuntime, tool, extension, skill, browser, remoteHost, sshKey, voiceInput, terminal, pi };
 }
 
 function requireAuthentication(dependencies: ConnectServiceDependencies, context: HandlerContext): ConnectionRecord {
@@ -5131,6 +5255,20 @@ function operationResult(
         if (item !== undefined) payload = { case: "resource", value: mapManagedResource(item) };
         break;
       }
+      case "skill": {
+        const item = dependencies.piResources?.get(outcome.entityId);
+        if (item !== undefined && item.kind === "skill") {
+          payload = {
+            case: "skill",
+            value: create(contract.SkillMutationResultSchema, {
+              skill: mapSkillDescriptor(skillCatalogEntryFromResource(item)),
+              replacedSkillId: outcome.skillReplacedId ?? "",
+              recoveryId: outcome.skillRecoveryId ?? ""
+            })
+          };
+        }
+        break;
+      }
       case "diagnosticsBundle": {
         const artifactId = dependencies.diagnosticsArtifacts.get(outcome.entityId) ?? outcome.entityId;
         payload = { case: "diagnosticsBundle", value: toProtoArtifact(dependencies.store.getArtifact(artifactId)) };
@@ -5492,7 +5630,13 @@ function outcomeFromRecord(record: OperationRecord<unknown>): OperationOutcome {
       }),
       ...(stringValue(response["browserTransferBinaryBase64"]) === undefined
         ? {}
-        : { browserTransferBinaryBase64: stringValue(response["browserTransferBinaryBase64"]) })
+        : { browserTransferBinaryBase64: stringValue(response["browserTransferBinaryBase64"]) }),
+      ...(stringValue(response["skillReplacedId"]) === undefined
+        ? {}
+        : { skillReplacedId: stringValue(response["skillReplacedId"]) }),
+      ...(stringValue(response["skillRecoveryId"]) === undefined
+        ? {}
+        : { skillRecoveryId: stringValue(response["skillRecoveryId"]) })
     };
   }
   if (typeof response["sessionId"] === "string") return { accepted: true, resultCase: "session", entityId: response["sessionId"] };
@@ -9311,6 +9455,150 @@ function extensionLibraryAuthorityFence(
 function requireExtensionLibraryManager(dependencies: ConnectServiceDependencies): ExtensionLibraryManager {
   if (dependencies.extensionLibraries === undefined) throw new ConnectError("Extension Libraries are unavailable.", Code.Unimplemented);
   return dependencies.extensionLibraries;
+}
+
+function requireSkillManager(dependencies: ConnectServiceDependencies): SkillManager {
+  if (dependencies.skills === undefined) throw new ConnectError("Skill management is unavailable.", Code.Unimplemented);
+  return dependencies.skills;
+}
+
+async function skillEffect<T>(effect: () => Promise<T>): Promise<T> {
+  try {
+    return await effect();
+  } catch (error) {
+    if (error instanceof ConnectError) throw error;
+    const raw = error instanceof Error ? error.message : "Skill operation failed.";
+    const message = redactSecrets(raw)
+      .replace(/[A-Za-z]:[\\/][^\s"'<>|]*/gu, "[private path]")
+      .replace(/\\\\[^\s"'<>|]+/gu, "[private path]")
+      .replace(/\/(?:[^\s"'<>|/]+\/)+[^\s"'<>|/]*/gu, "[private path]")
+      .replace(/~\/[^\s"'<>|]*/gu, "[private path]")
+      .slice(0, 512);
+    const code = /does not exist|not found/iu.test(message) ? Code.NotFound
+      : /another connection|belongs to/iu.test(message) ? Code.PermissionDenied
+        : /too many|byte limit|exceeds/iu.test(message) ? Code.ResourceExhausted
+          : /stale|changed|authority|expired|fenced|trusted|rollback target/iu.test(message) ? Code.Aborted
+            : /invalid|required|must|excluded|confirmation|only an existing|already has/iu.test(message) ? Code.InvalidArgument
+              : Code.FailedPrecondition;
+    throw new ConnectError(message, code);
+  }
+}
+
+function nativeSkillScope(value: contract.ResourceScope): NativeSkillCatalogEntry["scope"] {
+  if (value === contract.ResourceScope.GLOBAL || value === contract.ResourceScope.MANAGED || value === contract.ResourceScope.USER) return "global";
+  if (value === contract.ResourceScope.PROJECT) return "project";
+  throw invalidArgument("scope is invalid for Skill management");
+}
+
+function mapSkillDescriptor(item: NativeSkillCatalogEntry): contract.SkillDescriptor {
+  return create(contract.SkillDescriptorSchema, {
+    skillId: item.id,
+    backendId: item.backendId,
+    targetId: item.targetId ?? "",
+    scope: item.scope === "project" ? contract.ResourceScope.PROJECT : contract.ResourceScope.GLOBAL,
+    name: item.name,
+    sourceLabel: item.sourceLabel,
+    state: protoResourceState(item.state),
+    enabled: item.enabled,
+    canToggle: item.canToggle,
+    contentAvailable: item.contentAvailable,
+    canEdit: item.canEdit,
+    canDelete: item.canDelete,
+    entityVersion: toProtoEntityVersion(item.resourceVersion, 0, item.updatedAt),
+    approvedRevision: item.approvedRevision,
+    updatedAt: toProtoTimestamp(item.updatedAt)
+  });
+}
+
+function mapSkillFileEntry(item: NativeSkillFileEntry): contract.SkillFileEntry {
+  return create(contract.SkillFileEntrySchema, {
+    key: item.key,
+    name: item.name,
+    kind: item.kind === "directory" ? contract.SkillFileKind.DIRECTORY : contract.SkillFileKind.FILE,
+    size: BigInt(item.size),
+    editable: item.editable
+  });
+}
+
+function mapSkillFileContent(item: NativeSkillFileContent): contract.SkillFileContent {
+  return create(contract.SkillFileContentSchema, {
+    key: item.key,
+    content: item.content,
+    revision: item.revision,
+    size: BigInt(item.size),
+    editable: item.editable
+  });
+}
+
+function mapSkillDiff(item: NativeSkillDiff): contract.SkillDiff {
+  return create(contract.SkillDiffSchema, {
+    available: item.available,
+    reason: item.reason ?? "",
+    changes: item.changes.map(mapSkillDiffChange),
+    truncated: item.truncated
+  });
+}
+
+function mapSkillDiffChange(item: NativeSkillDiff["changes"][number]): contract.SkillDiffChange {
+  return create(contract.SkillDiffChangeSchema, {
+    key: item.key,
+    kind: item.kind === "added" ? contract.SkillDiffChangeKind.ADDED
+      : item.kind === "modified" ? contract.SkillDiffChangeKind.MODIFIED
+        : contract.SkillDiffChangeKind.DELETED,
+    binary: item.binary,
+    unifiedDiff: item.unifiedDiff ?? ""
+  });
+}
+
+function mapSkillSession(item: NativeSkillSessionDetails): contract.SkillSession {
+  return create(contract.SkillSessionSchema, {
+    sessionId: item.sessionId,
+    skill: mapSkillDescriptor(item.skill),
+    observedRevision: item.observedRevision,
+    dirty: item.dirty,
+    baselineAvailable: item.baselineAvailable,
+    metadata: create(contract.SkillMetadataSchema, {
+      name: item.metadata.name ?? "",
+      description: item.metadata.description ?? "",
+      version: item.metadata.version ?? "",
+      frontmatterJson: item.metadata.frontmatterJson,
+      parseError: item.metadata.parseError ?? ""
+    }),
+    fileCount: BigInt(item.fileCount),
+    bytes: BigInt(item.bytes),
+    diff: mapSkillDiff(item.diff),
+    expiresAt: toProtoTimestamp(item.expiresAt)
+  });
+}
+
+function mapSkillDraft(item: NativeSkillDraftPreview): contract.SkillDraft {
+  return create(contract.SkillDraftSchema, {
+    draftId: item.draftId,
+    sessionId: item.sessionId,
+    skillId: item.skillId,
+    kind: item.kind === "edit" ? contract.SkillDraftKind.EDIT : contract.SkillDraftKind.RENAME,
+    name: item.name,
+    resourceRevision: toProtoRevision(item.resourceVersion),
+    observedRevision: item.observedRevision,
+    changes: item.changes.map(mapSkillDiffChange),
+    expiresAt: toProtoTimestamp(item.expiresAt)
+  });
+}
+
+function mapSkillRecovery(item: NativeSkillRecoveryRecord): contract.SkillRecovery {
+  return create(contract.SkillRecoverySchema, {
+    recoveryId: item.id,
+    skillId: item.skillId,
+    backendId: item.backendId,
+    targetId: item.targetId ?? "",
+    scope: item.scope === "project" ? contract.ResourceScope.PROJECT : contract.ResourceScope.GLOBAL,
+    name: item.name,
+    revision: item.revision,
+    files: BigInt(item.files),
+    bytes: BigInt(item.bytes),
+    createdAt: toProtoTimestamp(item.createdAt),
+    status: item.status === "ready" ? contract.SkillRecoveryStatus.READY : contract.SkillRecoveryStatus.MISSING
+  });
 }
 
 function nativeExtensionLibraryDestination(
@@ -17258,6 +17546,63 @@ async function dispatchMutation(
         { extensionLibraryAuthorityChange: "orphan" }
       );
     }
+    case "applySkillDraft": {
+      if (dependencies.skills === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Skill management is unavailable.");
+      }
+      return preparedSkillEffectOperation(
+        dependencies,
+        operationId,
+        connection,
+        mutation,
+        payload.case,
+        () => dependencies.skills!.prepareApplyDraft(
+          connection.id,
+          nonBlankRequest(payload.value.draftId, "draft_id")
+        ),
+        (value) => value.resource
+      );
+    }
+    case "setSkillEnabled": {
+      if (dependencies.skills === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Skill management is unavailable.");
+      }
+      if (payload.value.expectedResourceRevision === undefined) throw invalidArgument("expected_resource_revision is required");
+      return preparedSkillEffectOperation(
+        dependencies,
+        operationId,
+        connection,
+        mutation,
+        payload.case,
+        () => dependencies.skills!.prepareSetEnabled({
+          resourceId: nonBlankRequest(payload.value.skillId, "skill_id"),
+          expectedResourceVersion: fromProtoRevision(
+            payload.value.expectedResourceRevision,
+            "set_skill_enabled.expected_resource_revision"
+          ),
+          enabled: payload.value.enabled
+        }),
+        (value) => value
+      );
+    }
+    case "deleteSkill": {
+      if (dependencies.skills === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Skill management is unavailable.");
+      }
+      return preparedSkillEffectOperation(
+        dependencies,
+        operationId,
+        connection,
+        mutation,
+        payload.case,
+        () => dependencies.skills!.prepareDelete({
+          connectionId: connection.id,
+          sessionId: nonBlankRequest(payload.value.sessionId, "session_id"),
+          confirmation: payload.value.confirmation
+        }),
+        (value) => value
+      );
+    }
     case "addExtensionSource": {
       if (dependencies.extensionSources === undefined) {
         return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The Extension source authority is unavailable.");
@@ -18681,6 +19026,65 @@ async function preparedResourceEffectOperation(
         }
       : undefined);
   }
+}
+
+async function preparedSkillEffectOperation<T>(
+  dependencies: ConnectServiceDependencies,
+  operationId: string,
+  connection: ConnectionRecord,
+  mutation: contract.OperationMutation,
+  kind: string,
+  prepare: () => Promise<PreparedSkillMutation<T>>,
+  resourceFromValue: (value: T) => NativePiResourceDescriptor
+): Promise<PresentedOperation> {
+  if (dependencies.skills === undefined) {
+    return unsupportedOperation(dependencies, operationId, connection, mutation, kind, "Skill management is unavailable.");
+  }
+  let prepared: PreparedSkillMutation<T> | undefined;
+  let resource: NativePiResourceDescriptor | undefined;
+  let resourceCatalogFence: symbol | undefined;
+  const execution = await dependencies.sessionHost.mutate<OperationOutcome>({
+    operationId,
+    connection,
+    kind,
+    body: mutation,
+    effect: async () => {
+      prepared = await skillEffect(prepare);
+      resource = resourceFromValue(prepared.value);
+    },
+    commit: () => {
+      if (prepared === undefined || resource === undefined) throw new StoreError("Skill operation completed without a prepared Resource mutation.");
+      const content = prepared.value as PiSkillContentMutationResult | NativePiResourceDescriptor;
+      const replacedResourceId = "resource" in content ? content.replacedResourceId : undefined;
+      return {
+        accepted: true,
+        resultCase: "skill",
+        entityId: resource.id,
+        ...(replacedResourceId === undefined ? {} : { skillReplacedId: replacedResourceId }),
+        ...(prepared.recoveryId === undefined ? {} : { skillRecoveryId: prepared.recoveryId })
+      } satisfies OperationOutcome;
+    },
+    complete: (commit) => skillEffect(() => dependencies.skills!.completePreparedMutation(
+      requiredPreparedSkillMutation(prepared),
+      (finalize) => {
+        const completed = commit(finalize);
+        resourceCatalogFence = dependencies.sessionHost.fenceBackendResourceCatalogs(resource!.backendId);
+        return completed;
+      }
+    ))
+  });
+  if (!execution.replayed) {
+    if (resource === undefined || resourceCatalogFence === undefined) {
+      throw new StoreError("Skill operation completed without its Resource runtime fence.");
+    }
+    await reconcileCommittedResourceRuntime(dependencies, resource.backendId, resource.id, resourceCatalogFence);
+  }
+  return presented(execution);
+}
+
+function requiredPreparedSkillMutation<T>(prepared: PreparedSkillMutation<T> | undefined): PreparedSkillMutation<T> {
+  if (prepared === undefined) throw new StoreError("Skill operation preparation did not produce a Resource mutation.");
+  return prepared;
 }
 
 interface BackendResourceAdmission {
