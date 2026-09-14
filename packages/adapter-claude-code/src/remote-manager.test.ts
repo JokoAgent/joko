@@ -90,6 +90,14 @@ describe("remote Claude manager protocol", () => {
       updatedInput: { path: "/srv/project/a.ts" }
     }]);
     expect(sdk.queries[0]?.oauthTokens).toEqual([CALLBACK_TOKEN]);
+    expect(sdk.queries[0]?.hookResults).toEqual([{
+      continue: true,
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: "fixture denied"
+      }
+    }]);
 
     await Promise.all([
       first.request("query.setModel", { queryId: QUERY_ID, attachmentId: attachment, model: "claude-fixture" }),
@@ -204,6 +212,7 @@ class FakeQuery implements AsyncIterable<unknown> {
   readonly inputs: unknown[] = [];
   readonly permissionResults: unknown[] = [];
   readonly oauthTokens: unknown[] = [];
+  readonly hookResults: unknown[] = [];
   readonly controls: unknown[][] = [];
   readonly #output = new AsyncQueue<unknown>();
   readonly #params: { readonly prompt: AsyncIterable<unknown>; readonly options: Record<string, unknown> };
@@ -238,6 +247,18 @@ class FakeQuery implements AsyncIterable<unknown> {
         signal: new AbortController().signal,
         onDecline: () => undefined
       }));
+      const hooks = this.#params.options["hooks"] as Record<string, Array<{
+        hooks: Array<(input: Record<string, unknown>, toolUseId: string, options: { signal: AbortSignal }) => Promise<unknown>>;
+      }>>;
+      this.hookResults.push(await hooks["PreToolUse"]![0]!.hooks[0]!({
+        hook_event_name: "PreToolUse",
+        session_id: SESSION_ID,
+        transcript_path: "/srv/private/transcript.jsonl",
+        cwd: "/srv/project",
+        tool_name: "Agent",
+        tool_input: { model: "child-model" },
+        tool_use_id: "agent-one"
+      }, "agent-one", { signal: new AbortController().signal }));
       this.emit({ type: "assistant", uuid: randomUUID() });
     }
     this.#output.close();
@@ -378,7 +399,16 @@ class FrameClient {
       } else if (frame["kind"] === "callback") {
         const value = frame["callback"] === "canUseTool"
           ? { behavior: "allow", updatedInput: { path: "/srv/project/a.ts" } }
-          : { value: CALLBACK_TOKEN, declined: false };
+          : frame["callback"] === "hook"
+            ? {
+                continue: true,
+                hookSpecificOutput: {
+                  hookEventName: "PreToolUse",
+                  permissionDecision: "deny",
+                  permissionDecisionReason: "fixture denied"
+                }
+              }
+            : { value: CALLBACK_TOKEN, declined: false };
         this.#socket.write(`${JSON.stringify({
           v: 1,
           kind: "callback_result",
@@ -403,15 +433,16 @@ class FrameClient {
 function queryOptions(): Record<string, unknown> {
   return {
     additionalDirectories: [],
-    allowDangerouslySkipPermissions: false,
+    allowDangerouslySkipPermissions: true,
     cwd: "/srv/project",
     env: { CLAUDE_CODE_OAUTH_TOKEN: "startup-token" },
     extraArgs: { "replay-user-messages": null },
     getOAuthToken: true,
+    hooks: { PreToolUse: [{ matcher: "Agent", hookCount: 1 }] },
     includePartialMessages: true,
     mcpServers: {},
     model: "claude-fixture",
-    permissionMode: "default",
+    permissionMode: "bypassPermissions",
     persistSession: true,
     sessionId: SESSION_ID,
     settingSources: [],

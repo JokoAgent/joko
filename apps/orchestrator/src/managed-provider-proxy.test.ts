@@ -68,7 +68,7 @@ async function fixture(nativeResponses = false) {
     const ticket = credentials.createUploadTicket(); credentials.upload(ticket.credentialUploadTicketId, secret);
     await credentials.commitUpload({ credentialUploadTicketId: ticket.credentialUploadTicketId, credentialReferenceId: reference, displayName: "Provider credential", kind: "api_key" });
     await providers.upsertConfiguration({ providerId: "provider", displayName: "Provider", kind: "custom_endpoint", enabled: true, expectedVersion: revision,
-      runtimes: [{ backendId: "runtime", provider: { id: "provider", api: "openai-responses", baseUrl: endpoint, apiKeyEnv: "PROVIDER_KEY", models: [{ id: "model", input: ["text"] }] },
+      runtimes: [{ backendId: "runtime", provider: { id: "provider", api: "openai-responses", baseUrl: endpoint, apiKeyEnv: "PROVIDER_KEY", models: [{ id: "model", input: ["text"] }, { id: "child-model", input: ["text"] }] },
         credentialBindings: { PROVIDER_KEY: reference }, credentialOrigin: endpoint, requestPath: "/custom/responses" }] });
   };
   await write(0n, "first-private-provider-credential");
@@ -167,6 +167,67 @@ describe("Managed Provider native proxy", () => {
       expect(stored).toContain('"runtimes"');
       expect(stored).not.toContain(f.token);
       expect(stored).not.toContain("private-provider-credential");
+    } finally { await f.dispose(); }
+  });
+
+  it("routes only an explicitly leased delegated model and revokes it independently", async () => {
+    const f = await fixture();
+    try {
+      const binding = await f.port.prepare(f.owner);
+      const parent = new AbortController();
+      const parentLease = await binding.activate({
+        operationId: "operation-with-subtask",
+        signal: parent.signal,
+        assertCurrent: () => undefined
+      });
+      const request = (model: string) => fetch(`${binding.baseUrl}/responses`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${f.token}`, "content-type": "application/json" },
+        body: JSON.stringify({ model, input: "fixture" })
+      });
+      expect((await request("child-model")).status).toBe(400);
+      const delegated = await binding.authorizeSubtask!({
+        operationId: "operation-with-subtask",
+        requestId: "agent-tool-one",
+        modelId: "child-model",
+        signal: parent.signal,
+        assertCurrent: () => undefined
+      });
+      expect(await (await request("child-model")).text()).toBe("data: fixture\n\n");
+      expect(f.received.at(-1)).toEqual({
+        path: "/custom/responses",
+        model: "child-model",
+        authorization: "Bearer first-private-provider-credential"
+      });
+      delegated.release();
+      expect((await request("child-model")).status).toBe(400);
+      expect(await (await request("model")).text()).toBe("data: fixture\n\n");
+
+      await expect(binding.authorizeSubtask!({
+        operationId: "another-operation",
+        requestId: "agent-tool-two",
+        modelId: "child-model",
+        signal: parent.signal,
+        assertCurrent: () => undefined
+      })).rejects.toThrow("unavailable");
+
+      const inFlight = await binding.authorizeSubtask!({
+        operationId: "operation-with-subtask",
+        requestId: "agent-tool-three",
+        modelId: "child-model",
+        signal: parent.signal,
+        assertCurrent: () => undefined
+      });
+      f.hold();
+      const childResponse = await request("child-model");
+      const childReading = childResponse.text().catch(() => "aborted");
+      await vi.waitFor(() => expect(f.received.at(-1)?.model).toBe("child-model"));
+      inFlight.release();
+      expect(await childReading).toBe("aborted");
+      await vi.waitFor(() => expect(f.closed()).toBe(true));
+      parentLease.release();
+      expect((await request("model")).status).toBe(409);
+      binding.dispose();
     } finally { await f.dispose(); }
   });
 

@@ -64,6 +64,11 @@ export interface ClaudeCanUseToolOptions {
   readonly requestId: string;
 }
 
+export type ClaudeSdkHookEvent = NativeHookEvent;
+export type ClaudeSdkHookInput = NativeHookInput;
+export type ClaudeSdkHookOutput = NativeHookJSONOutput;
+export type ClaudeSdkHooks = Partial<Record<NativeHookEvent, NativeHookCallbackMatcher[]>>;
+
 export interface ClaudeSdkOAuthTokenOptions {
   readonly signal: AbortSignal;
   readonly onDecline?: () => void;
@@ -146,6 +151,7 @@ export interface ClaudeSdkQueryOptions {
   readonly getOAuthToken?: ClaudeSdkOAuthTokenProvider;
   readonly effort?: "low" | "medium" | "high" | "xhigh" | "max";
   readonly forwardSubagentText?: boolean;
+  readonly hooks?: ClaudeSdkHooks;
   readonly includePartialMessages: true;
   readonly disallowedTools?: readonly string[];
   readonly mcpServers?: Readonly<Record<string, never>>;
@@ -406,6 +412,7 @@ export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
       ...(params.options.forwardSubagentText === undefined
         ? {}
         : { forwardSubagentText: params.options.forwardSubagentText }),
+      ...(params.options.hooks === undefined ? {} : { hooks: params.options.hooks }),
       includePartialMessages: params.options.includePartialMessages,
       ...(params.options.disallowedTools === undefined
         ? {}
@@ -649,6 +656,10 @@ function positiveTimeout(value: number | undefined, fallback: number): number {
   return resolved;
 }
 import type {
+  HookCallbackMatcher as NativeHookCallbackMatcher,
+  HookEvent as NativeHookEvent,
+  HookInput as NativeHookInput,
+  HookJSONOutput as NativeHookJSONOutput,
   Options as NativeOptions,
   Query as NativeQuery,
   SDKUserMessage as NativeSdkUserMessage,

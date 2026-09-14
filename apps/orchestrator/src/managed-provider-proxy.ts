@@ -11,6 +11,7 @@ import type { ProviderCatalogManager, ProviderInferenceRoute } from "./credentia
 const BODY_LIMIT = 32 * 1024 * 1024;
 const ENVIRONMENT_NAME = "JOKO_PROVIDER_PROXY_TOKEN";
 const MAXIMUM_BINDINGS = 4_096;
+const MAXIMUM_SUBTASK_ROUTES = 256;
 const REQUEST_TIMEOUT_MS = 10 * 60_000;
 
 interface RuntimeOwner {
@@ -23,6 +24,17 @@ interface RuntimeOwner {
 
 interface ActiveOperation {
   readonly operationId: string;
+  readonly route: ProviderInferenceRoute;
+  readonly abort: AbortController;
+  readonly assertCurrent: () => void;
+  readonly release: () => void;
+  readonly subtasks: Map<string, ActiveSubtaskRoute>;
+}
+
+interface ActiveSubtaskRoute {
+  readonly requestId: string;
+  readonly modelId: string;
+  readonly revision: string;
   readonly route: ProviderInferenceRoute;
   readonly abort: AbortController;
   readonly assertCurrent: () => void;
@@ -152,14 +164,66 @@ export class ManagedProviderProxy {
             const release = () => {
               operation.signal.removeEventListener("abort", release);
               if (state.active === active) state.active = undefined;
+              for (const subtask of active.subtasks.values()) subtask.release();
               abort.abort();
             };
             const active: ActiveOperation = { operationId: operation.operationId, route, abort,
-              assertCurrent: operation.assertCurrent, release };
+              assertCurrent: operation.assertCurrent, release, subtasks: new Map() };
             state.active = active;
             operation.signal.addEventListener("abort", release, { once: true });
             if (operation.signal.aborted) release();
             return { release } satisfies ManagedProviderOperationLease;
+          },
+          authorizeSubtask: async (subtask) => {
+            assertCurrent();
+            this.#assertOwner(state.owner);
+            const active = state.active;
+            if (active === undefined || active.operationId !== subtask.operationId || active.abort.signal.aborted
+              || subtask.signal.aborted || subtask.requestId.trim() === "" || subtask.requestId.length > 512
+              || subtask.modelId.trim() === "" || subtask.modelId.length > 512
+              || active.subtasks.has(subtask.requestId) || active.subtasks.size >= MAXIMUM_SUBTASK_ROUTES) {
+              throw unavailable();
+            }
+            active.assertCurrent();
+            subtask.assertCurrent();
+            const entry = this.#providers.get(state.owner.backendId, state.providerId);
+            const model = entry.provider.models.find((candidate) => candidate.id === subtask.modelId);
+            const protocol = model?.api ?? entry.provider.api;
+            const identity = this.#providers.describeInferenceRoute(state.owner.backendId, state.providerId, subtask.modelId);
+            const route = this.#providers.resolveInferenceRoute(state.owner.backendId, state.providerId, subtask.modelId);
+            if (model === undefined || protocol !== state.protocol || identity === undefined || route === undefined
+              || route.providerId !== state.providerId || route.modelId !== subtask.modelId
+              || route.api !== state.protocol || route.generationId !== identity.generationId) throw unavailable();
+            const abort = new AbortController();
+            let released = false;
+            const release = () => {
+              if (released) return;
+              released = true;
+              subtask.signal.removeEventListener("abort", release);
+              if (active.subtasks.get(subtask.requestId) === granted) active.subtasks.delete(subtask.requestId);
+              abort.abort();
+            };
+            const granted: ActiveSubtaskRoute = {
+              requestId: subtask.requestId,
+              modelId: subtask.modelId,
+              revision: identity.generationId,
+              route,
+              abort,
+              assertCurrent: subtask.assertCurrent,
+              release
+            };
+            active.subtasks.set(subtask.requestId, granted);
+            subtask.signal.addEventListener("abort", release, { once: true });
+            if (subtask.signal.aborted) release();
+            return {
+              model: {
+                ...piProviderModel(entry.provider, model),
+                contextWindow: model.contextWindow ?? 0,
+                maxOutputTokens: model.maxTokens ?? 0
+              },
+              thinkingLevelMap: Object.freeze({ ...model.thinkingLevelMap }),
+              release
+            };
           },
           dispose: () => { state.active?.release(); this.#bindings.delete(state.id); }
         };
@@ -191,6 +255,15 @@ export class ManagedProviderProxy {
     operation.assertCurrent();
   }
 
+  #assertSubtask(state: BindingState, operation: ActiveOperation, subtask: ActiveSubtaskRoute): void {
+    this.#assertOperation(state, operation);
+    if (operation.subtasks.get(subtask.requestId) !== subtask || subtask.abort.signal.aborted
+      || subtask.route.generationId !== subtask.revision || subtask.route.backendId !== state.owner.backendId
+      || subtask.route.providerId !== state.providerId || subtask.route.modelId !== subtask.modelId
+      || subtask.route.api !== state.protocol) throw unavailable();
+    subtask.assertCurrent();
+  }
+
   async #handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const match = /^\/managed\/([a-f0-9-]{36})(\/[^?#]*)$/u.exec(request.url ?? "");
     const state = match === null ? undefined : this.#bindings.get(match[1]!);
@@ -204,7 +277,7 @@ export class ManagedProviderProxy {
     request.once("aborted", close);
     response.once("close", close);
     const timeout = setTimeout(close, REQUEST_TIMEOUT_MS);
-    const signal = AbortSignal.any([operation.abort.signal, abort.signal]);
+    let signal = AbortSignal.any([operation.abort.signal, abort.signal]);
     try {
       this.#assertOperation(state, operation);
       const chunks: Buffer[] = []; let size = 0;
@@ -218,8 +291,17 @@ export class ManagedProviderProxy {
       let parsed: unknown;
       try { parsed = JSON.parse(body.toString("utf8")); } catch { fail(response, 400); return; }
       if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)
-        || (parsed as { model?: unknown }).model !== state.modelId) { fail(response, 400); return; }
-      const route = operation.route;
+        || typeof (parsed as { model?: unknown }).model !== "string") { fail(response, 400); return; }
+      const requestedModel = (parsed as { model: string }).model;
+      let route = operation.route;
+      let subtask: ActiveSubtaskRoute | undefined;
+      if (requestedModel !== state.modelId) {
+        subtask = [...operation.subtasks.values()].find((candidate) => candidate.modelId === requestedModel && !candidate.abort.signal.aborted);
+        if (subtask === undefined) { fail(response, 400); return; }
+        this.#assertSubtask(state, operation, subtask);
+        route = subtask.route;
+        signal = AbortSignal.any([operation.abort.signal, subtask.abort.signal, abort.signal]);
+      }
       const base = new URL(route.baseUrl.endsWith("/") ? route.baseUrl : `${route.baseUrl}/`);
       const endpoint = route.requestPath === undefined
         ? new URL(match![2]!.slice(1), base)
@@ -231,9 +313,11 @@ export class ManagedProviderProxy {
       }
       for (const [name, value] of Object.entries(route.headers)) headers.set(name, value);
       if (route.authorization !== undefined) headers.set("authorization", route.authorization);
-      this.#assertOperation(state, operation);
+      if (subtask === undefined) this.#assertOperation(state, operation);
+      else this.#assertSubtask(state, operation, subtask);
       const upstream = await this.#fetch(endpoint, { method: "POST", headers, body, redirect: "manual", signal });
-      this.#assertOperation(state, operation);
+      if (subtask === undefined) this.#assertOperation(state, operation);
+      else this.#assertSubtask(state, operation, subtask);
       if (!upstream.ok || upstream.body === null) {
         await upstream.body?.cancel();
         fail(response, upstream.status >= 400 && upstream.status <= 599 ? upstream.status : 502);
@@ -244,7 +328,8 @@ export class ManagedProviderProxy {
       try {
         for (;;) {
           const chunk = await reader.read();
-          this.#assertOperation(state, operation);
+          if (subtask === undefined) this.#assertOperation(state, operation);
+          else this.#assertSubtask(state, operation, subtask);
           if (chunk.done) break;
           if (!response.write(chunk.value)) await once(response, "drain", { signal });
         }

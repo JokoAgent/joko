@@ -32,6 +32,11 @@ export interface NativeTaskEmission {
   readonly payload: NativeTaskPayload;
 }
 
+export interface NativeTaskTermination {
+  readonly context: AdapterContext;
+  readonly toolUseId: string;
+}
+
 type PendingChildFrame =
   | { readonly kind: "assistant"; readonly envelope: Readonly<Record<string, unknown>>; readonly occurredAt: number }
   | { readonly kind: "user"; readonly envelope: Readonly<Record<string, unknown>>; readonly occurredAt: number }
@@ -88,6 +93,7 @@ export class ClaudeNativeTaskProjection {
   readonly #toolScopes = new Map<string, ToolScope>();
   readonly #pendingChildren = new Map<string, PendingChildFrame[]>();
   readonly #seenSystemFrames = new Set<string>();
+  readonly #terminatedTools = new Map<string, AdapterContext>();
   #pendingChildFrameCount = 0;
 
   constructor(options: {
@@ -187,6 +193,12 @@ export class ClaudeNativeTaskProjection {
     return this.#tasks.get(rawTaskId)?.state;
   }
 
+  takeTerminatedTools(): readonly NativeTaskTermination[] {
+    const terminated = [...this.#terminatedTools].map(([toolUseId, context]) => ({ context, toolUseId }));
+    this.#terminatedTools.clear();
+    return terminated;
+  }
+
   confirmStopped(rawTaskId: string): readonly NativeTaskEmission[] {
     const task = this.#tasks.get(rawTaskId);
     if (task === undefined || !activeState(task.state)) return [];
@@ -196,6 +208,7 @@ export class ClaudeNativeTaskProjection {
     task.updatedAt = occurredAt;
     task.endedAt = occurredAt;
     task.error = undefined;
+    this.#markTerminatedTool(task);
     this.#activity(task, "stopped", "stopped", "Stopped by native task control.", occurredAt);
     const transcript = task.skipTranscript || !task.isSubagent || task.excludedFromSubagents
       ? []
@@ -237,6 +250,7 @@ export class ClaudeNativeTaskProjection {
       } else {
         task.error = undefined;
       }
+      this.#markTerminatedTool(task);
       this.#activity(task, state, state, state === "failed" ? task.error?.message : "Stopped with the native runtime.", occurredAt);
       const transcript = task.skipTranscript || !task.isSubagent || task.excludedFromSubagents
         ? []
@@ -303,6 +317,7 @@ export class ClaudeNativeTaskProjection {
     task.error = task.state === "failed"
       ? nativeTaskError(task.summary ?? "The native task failed.")
       : undefined;
+    this.#markTerminatedTool(task);
     this.#activity(task, task.state, task.state, task.summary, task.updatedAt, task.lastToolName);
     const transcript = task.skipTranscript || !task.isSubagent || task.excludedFromSubagents
       ? []
@@ -344,6 +359,7 @@ export class ClaudeNativeTaskProjection {
     } else if (task.state !== "failed") {
       task.error = undefined;
     }
+    if (!activeState(task.state)) this.#markTerminatedTool(task);
     const kind = task.state === "queued" || task.state === "running" ? "progress" : task.state;
     this.#activity(task, kind, task.state, task.summary, task.updatedAt, task.lastToolName);
     return this.#snapshot(task, this.#assignmentEntries(task));
@@ -582,6 +598,11 @@ export class ClaudeNativeTaskProjection {
     if (scope?.parentTaskId !== undefined) task.parentTaskId = scope.parentTaskId;
     if (scope !== undefined) task.context = scope.context;
     if (scope?.agentCandidate === true && !task.excludedFromSubagents) task.isSubagent = true;
+    if (!activeState(task.state)) this.#markTerminatedTool(task);
+  }
+
+  #markTerminatedTool(task: NativeTaskRecord): void {
+    if (task.toolUseId !== undefined) this.#terminatedTools.set(task.toolUseId, task.context);
   }
 
   #assignmentEntries(task: NativeTaskRecord): readonly SubagentTranscriptEntry[] {

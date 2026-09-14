@@ -136,6 +136,108 @@ describe("ClaudeCodeAdapter", () => {
     expect(managed.port.dispose).toHaveBeenCalledOnce();
   });
 
+  test("leases an exact compatible managed subtask route before Full access and revokes every native lifecycle boundary", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "configured-model" } });
+    const adapter = adapterFor(runtime, {
+      managedProviders: managed.port,
+      resolveSubagentModel: () => "compatible-model"
+    });
+    try {
+      const binding = await adapter.createSession(createInput({
+        providerId: "configured-provider",
+        modelId: "configured-model",
+        permissionMode: "bypassPermissions"
+      }), contextFor().context);
+      const active = contextFor(binding, { operationId: "managed-subtask-turn" });
+      await adapter.send(textPrompt("delegate exactly"), {
+        ...active.context,
+        modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+      });
+      const query = runtime.queries[0]!;
+      const preToolUse = query.params.options.hooks?.PreToolUse?.[0]?.hooks[0];
+      const permissionDenied = query.params.options.hooks?.PermissionDenied?.[0]?.hooks[0];
+      const postToolUse = query.params.options.hooks?.PostToolUse?.[0]?.hooks[0];
+      if (preToolUse === undefined || permissionDenied === undefined || postToolUse === undefined) {
+        throw new Error("Expected managed subtask hooks.");
+      }
+      const hookSignal = new AbortController().signal;
+      const agentInput = (toolUseId: string, model?: string) => ({
+        hook_event_name: "PreToolUse" as const,
+        session_id: binding.nativeSessionId!, transcript_path: "D:\\private\\transcript.jsonl", cwd: target.workspaceRoot,
+        tool_name: "Agent", tool_input: model === undefined ? {} : { model }, tool_use_id: toolUseId
+      });
+
+      await expect(Promise.all([
+        preToolUse(agentInput("agent-default"), "agent-default", { signal: hookSignal }),
+        preToolUse(agentInput("agent-default"), "agent-default", { signal: hookSignal })
+      ])).resolves.toEqual([{ continue: true }, { continue: true }]);
+      expect(managed.subtaskActivations).toHaveLength(1);
+      expect(managed.subtaskActivations[0]!.input).toMatchObject({
+        operationId: "managed-subtask-turn", requestId: "agent-default", modelId: "compatible-model"
+      });
+      expect(() => managed.subtaskActivations[0]!.input.assertCurrent()).not.toThrow();
+      await preToolUse(agentInput("agent-default"), "agent-default", { signal: hookSignal });
+      expect(managed.subtaskActivations).toHaveLength(1);
+      await expect(preToolUse(agentInput("agent-default", "configured-model"), "agent-default", { signal: hookSignal }))
+        .resolves.toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+
+      await expect(preToolUse(agentInput("agent-parent", "configured-model"), "agent-parent", { signal: hookSignal }))
+        .resolves.toEqual({ continue: true });
+      await expect(preToolUse(agentInput("agent-parent", "compatible-model"), "agent-parent", { signal: hookSignal }))
+        .resolves.toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+      expect(managed.subtaskActivations).toHaveLength(1);
+      await expect(preToolUse(agentInput("agent-default", "second-model"), "agent-default", { signal: hookSignal }))
+        .resolves.toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+      await expect(preToolUse(agentInput("agent-missing", "missing-model"), "agent-missing", { signal: hookSignal }))
+        .resolves.toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+      expect(managed.subtaskActivations).toHaveLength(1);
+
+      await expect(preToolUse(agentInput("agent-incompatible-limits", "second-model"), "agent-incompatible-limits", { signal: hookSignal }))
+        .resolves.toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+      await expect(preToolUse(agentInput("agent-incompatible-thinking", "incompatible-thinking"), "agent-incompatible-thinking", { signal: hookSignal }))
+        .resolves.toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+      expect(managed.subtaskActivations).toHaveLength(3);
+      expect(managed.subtaskActivations[1]!.release).toHaveBeenCalledOnce();
+      expect(managed.subtaskActivations[2]!.release).toHaveBeenCalledOnce();
+      await expect(preToolUse(agentInput("agent-incompatible-limits", "second-model"), "agent-incompatible-limits", { signal: hookSignal }))
+        .resolves.toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+      expect(managed.subtaskActivations).toHaveLength(3);
+
+      await permissionDenied({
+        ...agentInput("agent-default"), hook_event_name: "PermissionDenied", reason: "native spawn denied"
+      }, "agent-default", { signal: hookSignal });
+      expect(managed.subtaskActivations[0]!.release).toHaveBeenCalledOnce();
+      expect(() => managed.subtaskActivations[0]!.input.assertCurrent()).toThrow();
+
+      await preToolUse(agentInput("agent-success"), "agent-success", { signal: hookSignal });
+      await postToolUse({
+        ...agentInput("agent-success"), hook_event_name: "PostToolUse", tool_response: "completed"
+      }, "agent-success", { signal: hookSignal });
+      expect(managed.subtaskActivations[3]!.release).toHaveBeenCalledOnce();
+
+      await preToolUse(agentInput("agent-terminal"), "agent-terminal", { signal: hookSignal });
+      const terminal = taskNotification(binding.nativeSessionId!, "task-terminal", "agent-terminal", {
+        status: "completed", summary: "done", outputFile: "D:\\private\\task.output",
+        totalTokens: 1, toolUses: 1, durationMs: 1
+      });
+      const { tool_use_id: _lateToolUseId, ...terminalBeforeBinding } = terminal;
+      query.push(terminalBeforeBinding);
+      query.push(taskStarted(binding.nativeSessionId!, "task-terminal", "agent-terminal", {
+        taskType: "local_agent", description: "already terminal"
+      }));
+      await vi.waitFor(() => expect(managed.subtaskActivations[4]!.release).toHaveBeenCalledOnce());
+
+      await preToolUse(agentInput("agent-parent-terminal"), "agent-parent-terminal", { signal: hookSignal });
+      query.push(resultMessage(binding.nativeSessionId!, { result: "done", totalCostUsd: 0 }));
+      await eventually(() => active.events.some((event) => event.type === "done"));
+      expect(managed.subtaskActivations[5]!.release).toHaveBeenCalledOnce();
+      expect(managed.activations[0]!.release).toHaveBeenCalledOnce();
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
   test("passes the same managed model limit snapshot to an exact remote Query", async () => {
     const managed = managedProviderFixture();
     const remoteTarget: TargetDescriptor = {
@@ -3699,13 +3801,21 @@ interface FakeRuntimeOptions {
 
 function managedProviderFixture(thinkingLevelMap: Readonly<Record<string, string | null>> = {}) {
   const token = "private-model-proxy-fixture-token";
-  const models: ProviderModel[] = ["configured-model", "second-model"].map((modelId, index) => ({
+  const models: ProviderModel[] = ["configured-model", "compatible-model", "second-model", "incompatible-thinking"].map((modelId) => ({
     providerId: "configured-provider", modelId, displayName: modelId, api: "anthropic-messages",
-    contextWindow: index === 0 ? 64_000 : 128_000, maxOutputTokens: index === 0 ? 4_000 : 8_000,
+    contextWindow: modelId === "second-model" ? 128_000 : 64_000,
+    maxOutputTokens: modelId === "second-model" ? 8_000 : 4_000,
     supportsImages: true, supportsFastMode: true, thinkingLevels: ["low", "high", "unavailable"],
     cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 }
   }));
+  const thinkingMapFor = (modelId: string) => Object.freeze(
+    modelId === "incompatible-thinking" ? { ...thinkingLevelMap, low: "medium" } : { ...thinkingLevelMap }
+  );
   const activations: { input: Parameters<ManagedProviderRouteBinding["activate"]>[0]; release: ReturnType<typeof vi.fn> }[] = [];
+  const subtaskActivations: {
+    input: Parameters<NonNullable<ManagedProviderRouteBinding["authorizeSubtask"]>>[0];
+    release: ReturnType<typeof vi.fn>;
+  }[] = [];
   let enabled = true;
   let revision = "revision-one";
   const port: ManagedProviderRuntimePort = {
@@ -3714,7 +3824,7 @@ function managedProviderFixture(thinkingLevelMap: Readonly<Record<string, string
     dispose: vi.fn(),
     hasProvider: (providerId) => providerId === "configured-provider",
     listModels: () => models,
-    getThinkingLevelMap: () => Object.freeze({ ...thinkingLevelMap }),
+    getThinkingLevelMap: (_providerId, modelId) => thinkingMapFor(modelId),
     listProviders: () => [{ providerId: "configured-provider", displayName: "Configured Provider", api: "anthropic-messages",
       authenticationState: "authenticated", loginMethods: [], supportsLogin: false, supportsLogout: false, supportsRefresh: true, supportsModelRefresh: true }],
     prepare: async (owner) => {
@@ -3722,14 +3832,23 @@ function managedProviderFixture(thinkingLevelMap: Readonly<Record<string, string
       let disposed = false;
       const preparedRevision = revision;
       const assertCurrent = () => { if (!enabled || disposed || preparedRevision !== revision) throw new Error("The managed route is stale."); };
-      return { providerId: owner.providerId, model: models.find((model) => model.modelId === owner.modelId)!, thinkingLevelMap: Object.freeze({ ...thinkingLevelMap }), protocol: "anthropic-messages",
+      const selected = models.find((model) => model.modelId === owner.modelId)!;
+      return { providerId: owner.providerId, model: selected, thinkingLevelMap: thinkingMapFor(selected.modelId), protocol: "anthropic-messages",
         revision: preparedRevision, baseUrl: "http://127.0.0.1:31415/routes/fixture", apiKeyEnvironment: "JOKO_MODEL_PROXY_TOKEN",
         assertCurrent, activate: async (input) => { assertCurrent(); input.assertCurrent(); const release = vi.fn(); activations.push({ input, release }); return { release }; },
+        authorizeSubtask: async (input) => {
+          assertCurrent(); input.assertCurrent();
+          const model = models.find((candidate) => candidate.modelId === input.modelId);
+          if (model === undefined) throw new Error("The delegated model route is unavailable.");
+          const release = vi.fn();
+          subtaskActivations.push({ input, release });
+          return { model, thinkingLevelMap: thinkingMapFor(model.modelId), release };
+        },
         dispose: () => { disposed = true; }
       };
     }
   };
-  return { port, token, activations, get enabled() { return enabled; }, set enabled(value: boolean) { enabled = value; },
+  return { port, token, activations, subtaskActivations, get enabled() { return enabled; }, set enabled(value: boolean) { enabled = value; },
     get revision() { return revision; }, set revision(value: string) { revision = value; } };
 }
 

@@ -19,6 +19,12 @@ export interface ManagedProviderOperationLease {
   release(): void;
 }
 
+/** Exact delegated-model snapshot captured with its independent request lease. */
+export interface ManagedProviderSubtaskLease extends ManagedProviderOperationLease {
+  readonly model: ProviderModel;
+  readonly thinkingLevelMap: Readonly<Record<string, string | null>>;
+}
+
 /** A non-secret native configuration template; it cannot authorize HTTP requests. */
 export interface ManagedProviderRouteBinding {
   readonly providerId: string;
@@ -38,6 +44,19 @@ export interface ManagedProviderRouteBinding {
     /** Synchronous Adapter owner check, repeated at every HTTP dispatch. */
     readonly assertCurrent: () => void;
   }): Promise<ManagedProviderOperationLease>;
+  /**
+   * Authorize one exact native delegated-task model inside the already-active
+   * parent operation. The parent Provider is fixed by this binding; callers
+   * cannot use this lease to cross Provider or Backend ownership.
+   */
+  readonly authorizeSubtask?: (input: {
+    readonly operationId: string;
+    readonly requestId: string;
+    readonly modelId: string;
+    readonly signal: AbortSignal;
+    /** Synchronous Adapter owner check, repeated at every delegated HTTP dispatch. */
+    readonly assertCurrent: () => void;
+  }) => Promise<ManagedProviderSubtaskLease>;
   /** Idempotently releases the template and every remaining operation. */
   dispose(): void;
 }

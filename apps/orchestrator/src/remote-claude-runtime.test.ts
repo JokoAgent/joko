@@ -105,7 +105,17 @@ describe("RemoteClaudeRuntimeResolver", () => {
       updatedInput: { path: "/srv/project/a.ts" }
     }));
     const oauth = vi.fn(async () => "refreshed-oauth-token");
-    const query = await binding.runtime.query(queryParams(permission, oauth));
+    const managedHook = vi.fn(async () => ({
+      continue: true,
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse" as const,
+        permissionDecision: "deny" as const,
+        permissionDecisionReason: "fixture denied"
+      }
+    }));
+    const query = await binding.runtime.query(queryParams(permission, oauth, true, {
+      PreToolUse: [{ matcher: "Agent", hooks: [managedHook] }]
+    }));
 
     await waitUntil(() => fixture.processes.inputRequests.length === 2);
     expect(fixture.processes.startRequests).toHaveLength(2);
@@ -138,12 +148,23 @@ describe("RemoteClaudeRuntimeResolver", () => {
       declined: false
     });
     expect(oauth).toHaveBeenCalledOnce();
+    await expect(fixture.processes.invokeCallback("hook", {
+      event: "PreToolUse", matcherIndex: 0, hookIndex: 0, toolUseId: "agent-one",
+      input: {
+        hook_event_name: "PreToolUse", session_id: SESSION_ID, transcript_path: "/srv/private/transcript.jsonl",
+        cwd: "/srv/project", tool_name: "Agent", tool_input: { model: "child-model" }, tool_use_id: "agent-one"
+      }
+    })).resolves.toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+    expect(managedHook).toHaveBeenCalledWith(expect.objectContaining({ tool_name: "Agent" }), "agent-one", {
+      signal: expect.any(AbortSignal)
+    });
 
     const startOptions = fixture.processes.startRequests.at(-1)?.params.options as Record<string, unknown>;
     expect(startOptions.env).toMatchObject({
       ANTHROPIC_AUTH_TOKEN: "private-fixture-token",
       ANTHROPIC_BASE_URL: "http://127.0.0.1:39001/v1"
     });
+    expect(startOptions.hooks).toEqual({ PreToolUse: [{ matcher: "Agent", hookCount: 1 }] });
     expect(fixture.forwarding.listen).toHaveBeenCalledWith(expect.objectContaining({
       localDestinationHost: "127.0.0.1",
       localDestinationPort: 4567,
@@ -356,12 +377,14 @@ class FakeClaudeManagerProcesses implements RemoteProcessTransportPort {
     query.process.finish(1);
   }
 
-  invokeCallback(callback: "canUseTool" | "oauth", value: unknown): Promise<unknown> {
+  invokeCallback(callback: "canUseTool" | "oauth" | "hook", value: unknown): Promise<unknown> {
     const query = this.#query;
     if (query === undefined) return Promise.reject(new Error("No query is attached."));
     const callbackId = callback === "oauth"
       ? "55555555-5555-4555-8555-555555555555"
-      : "66666666-6666-4666-8666-666666666666";
+      : callback === "hook"
+        ? "99999999-9999-4999-8999-999999999999"
+        : "66666666-6666-4666-8666-666666666666";
     query.process.send({ v: 1, kind: "callback", callbackId, queryId: query.queryId, callback, value });
     return new Promise((resolve, reject) => this.#callbacks.set(callbackId, { resolve, reject }));
   }
@@ -585,7 +608,8 @@ class FixtureProcess extends EventEmitter implements RemoteProcessHandle {
 function queryParams(
   canUseTool: ClaudeSdkQueryOptions["canUseTool"] = async (_tool, input) => ({ behavior: "allow", updatedInput: { ...input } }),
   getOAuthToken: ClaudeSdkQueryOptions["getOAuthToken"] = async () => null,
-  includeProviderRoute = true
+  includeProviderRoute = true,
+  hooks?: ClaudeSdkQueryOptions["hooks"]
 ): ClaudeSdkQueryParams {
   const prompt = (async function* (): AsyncGenerator<ClaudeSdkUserMessage> {
     yield {
@@ -609,6 +633,7 @@ function queryParams(
         ANTHROPIC_AUTH_TOKEN: "private-fixture-token"
       } : {},
       getOAuthToken,
+      ...(hooks === undefined ? {} : { hooks }),
       includePartialMessages: true,
       permissionMode: "default",
       persistSession: true,

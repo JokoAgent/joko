@@ -28,6 +28,7 @@ import {
   type ManagedProviderRuntimePort,
   type ManagedProviderRouteBinding,
   type ManagedProviderOperationLease,
+  type ManagedProviderSubtaskLease,
   type ProviderRuntimeSupport,
   type NativeHistoryProjectedEvent,
   type NativeHistoryProjection,
@@ -78,6 +79,9 @@ import {
   type ClaudePermissionResult,
   type ClaudePermissionUpdate,
   type ClaudeSdkAccountInfo,
+  type ClaudeSdkHookInput,
+  type ClaudeSdkHookOutput,
+  type ClaudeSdkHooks,
   type ClaudeSdkProbe,
   type ClaudeSdkInitializationResult,
   type ClaudeSdkModelInfo,
@@ -360,6 +364,12 @@ interface ActiveTurn {
   readonly backendInstanceGeneration: number;
   readonly queryGeneration: number;
   readonly operationId: string;
+  readonly subtaskRouteLeases: Map<string, {
+    readonly modelId: string;
+    readonly lease: ManagedProviderOperationLease;
+  }>;
+  readonly subtaskRouteAdmissions: Map<string, ManagedSubtaskRouteAdmission>;
+  readonly subtaskRouteDecisions: Map<string, ManagedSubtaskRouteDecision>;
   readonly userMessageUuid: string;
   readonly admission: Deferred<void>;
   readonly eventsReady: Deferred<void>;
@@ -389,6 +399,17 @@ interface ActiveTurn {
   parentStreamUsage: UsageSnapshot;
   parentStreamSegment?: ParentStreamSegment;
   assistantError?: string;
+}
+
+interface ManagedSubtaskRouteAdmission {
+  readonly modelId: string;
+  readonly cancellation: AbortController;
+  readonly result: Promise<ClaudeSdkHookOutput>;
+}
+
+interface ManagedSubtaskRouteDecision {
+  readonly modelId: string;
+  closed: boolean;
 }
 
 interface SteerAdmission {
@@ -1332,6 +1353,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       backendInstanceGeneration: this.#instanceGeneration,
       queryGeneration: runtime.queryGeneration,
       operationId,
+      subtaskRouteLeases: new Map(),
+      subtaskRouteAdmissions: new Map(),
+      subtaskRouteDecisions: new Map(),
       userMessageUuid: operationUuid(operationId),
       admission: deferred<void>(),
       eventsReady: deferred<void>(),
@@ -1499,7 +1523,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     const turn = runtime.activeTurn;
     if (turn === undefined) return;
     turn.stopping = true;
-    turn.providerLease?.release();
+    releaseManagedTurnLeases(turn);
     turn.interruptConfirmation ??= deferred<void>();
     void turn.interruptConfirmation.promise.catch(() => undefined);
     let wakeTaskIds: readonly string[] = [];
@@ -2127,6 +2151,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         return Promise.resolve({ behavior: "deny", message: "The native Session is not ready." });
       }
       return this.#canUseTool(runtime, ...args);
+    }, async (input, toolUseId, options) => {
+      if (runtime === undefined) return denyManagedSubtask("The native Session is not ready.");
+      return this.#managedSubtaskHook(runtime, input, toolUseId, options.signal);
     }).catch((error: unknown) => { abortController.abort(); managedRoute?.dispose(); throw error; });
     const query = startedQuery.query;
     try {
@@ -2255,7 +2282,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       toolName: string,
       input: Readonly<Record<string, unknown>>,
       options: ClaudeCanUseToolOptions
-    ) => Promise<ClaudePermissionResult>
+    ) => Promise<ClaudePermissionResult>,
+    managedSubtaskHook: (
+      input: ClaudeSdkHookInput,
+      toolUseId: string | undefined,
+      options: { readonly signal: AbortSignal }
+    ) => Promise<ClaudeSdkHookOutput>
   ): Promise<{ readonly query: ClaudeSdkQuery; readonly subagentModel: string | undefined; releaseAuthorization(): void }> {
     let subagentModel: string | undefined;
     try {
@@ -2383,6 +2415,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
           ...(launch.effort === undefined ? {} : { effort: managedRoute === undefined ? requiredNativeEffort(launch.effort)
             : managedNativeEffort(managedRoute.model, managedRoute.thinkingLevelMap, launch.effort) }),
           ...(launch.runtimePolicy === "standard" ? { forwardSubagentText: true } : {}),
+          ...(launch.runtimePolicy === "standard" && managedRoute !== undefined
+            ? { hooks: managedSubtaskHooks(managedSubtaskHook) }
+            : {}),
           ...(launch.runtimePolicy === "standard" ? { extraArgs: { "replay-user-messages": null } } : {}),
           includePartialMessages: true,
           ...(launch.runtimePolicy === "review_read_only"
@@ -2781,7 +2816,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     }
     turn.terminalClaimed = true;
     await this.#settleSteers(runtime, turn, result.outcome, result.error);
-    turn.providerLease?.release();
+    releaseManagedTurnLeases(turn);
     await this.#emit(runtime, turn, { type: "done", outcome: result.outcome });
     if (this.#isTurnCurrent(runtime, turn)) {
       this.#clearNativeContinuation(turn);
@@ -2863,7 +2898,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     if (!this.#isTurnCurrent(runtime, turn) || !turn.awaitingNativeContinuation || turn.terminalClaimed) return;
     turn.terminalClaimed = true;
     this.#clearNativeContinuation(turn);
-    turn.providerLease?.release();
+    releaseManagedTurnLeases(turn);
     await this.#settleSteers(runtime, turn, outcome);
     await this.#emit(runtime, turn, { type: "done", outcome });
     if (this.#isTurnCurrent(runtime, turn)) runtime.activeTurn = undefined;
@@ -2956,6 +2991,165 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     } finally {
       await this.#retireRuntime(runtime, false, publicError);
     }
+  }
+
+  async #managedSubtaskHook(
+    runtime: NativeRuntime,
+    input: ClaudeSdkHookInput,
+    callbackToolUseId: string | undefined,
+    callbackSignal: AbortSignal
+  ): Promise<ClaudeSdkHookOutput> {
+    if (input.hook_event_name !== "PreToolUse") {
+      if ((input.hook_event_name === "PermissionDenied" || input.hook_event_name === "PostToolUse"
+        || input.hook_event_name === "PostToolUseFailure")
+        && (input.tool_name === "Agent" || input.tool_name === "Task")) {
+        const releaseId = managedSubtaskToolUseId(input.tool_use_id, callbackToolUseId);
+        if (releaseId !== undefined) releaseManagedSubtaskLease(runtime.activeTurn, releaseId);
+      }
+      return { continue: true };
+    }
+    if (input.tool_name !== "Agent" && input.tool_name !== "Task") return { continue: true };
+    const turn = runtime.activeTurn;
+    const toolUseId = managedSubtaskToolUseId(input.tool_use_id, callbackToolUseId);
+    if (turn === undefined || toolUseId === undefined || input.session_id !== runtime.nativeSessionId
+      || !this.#isTurnCurrent(runtime, turn) || turn.stopping || turn.terminalClaimed || callbackSignal.aborted) {
+      return denyManagedSubtask("The delegated model request no longer belongs to the active turn.");
+    }
+    const toolInput = record(input.tool_input);
+    if (toolInput === undefined) return denyManagedSubtask("The delegated model request was invalid.");
+    const explicit = Object.prototype.hasOwnProperty.call(toolInput, "model") ? toolInput["model"] : undefined;
+    if (explicit !== undefined && typeof explicit !== "string") {
+      return denyManagedSubtask("The delegated model identity was invalid.");
+    }
+    const rawModel = typeof explicit === "string" ? explicit : runtime.subagentModel;
+    const modelId = rawModel === undefined || rawModel === "" || rawModel === "inherit" ? undefined : rawModel;
+    if (modelId !== undefined && (modelId.length > 512 || modelId.trim() !== modelId
+      || /[\s\x00-\x1f\x7f]/u.test(modelId))) {
+      return denyManagedSubtask("The delegated model identity was invalid.");
+    }
+    const route = runtime.managedRoute;
+    if (route === undefined) return denyManagedSubtask("The delegated model route is unavailable.");
+    const effectiveModelId = modelId ?? route.model.modelId;
+    let decision = turn.subtaskRouteDecisions.get(toolUseId);
+    if (decision !== undefined && decision.modelId !== effectiveModelId) {
+      return denyManagedSubtask("The repeated delegated model request changed identity.");
+    }
+    if (decision?.closed === true) {
+      return denyManagedSubtask("The delegated model request is no longer active.");
+    }
+    if (decision === undefined) {
+      if (turn.subtaskRouteDecisions.size >= MAX_SESSION_TOOL_NAMES) {
+        return denyManagedSubtask("The delegated model request limit was reached.");
+      }
+      decision = { modelId: effectiveModelId, closed: false };
+      turn.subtaskRouteDecisions.set(toolUseId, decision);
+    }
+    const existing = turn.subtaskRouteLeases.get(toolUseId);
+    if (existing !== undefined) {
+      return existing.modelId === modelId
+        ? { continue: true }
+        : denyManagedSubtask("The repeated delegated model request changed identity.");
+    }
+    const pending = turn.subtaskRouteAdmissions.get(toolUseId);
+    if (pending !== undefined) {
+      if (pending.modelId !== modelId) {
+        return denyManagedSubtask("The repeated delegated model request changed identity.");
+      }
+      try {
+        return await waitFor(
+          pending.result,
+          this.#admissionTimeoutMs,
+          callbackSignal,
+          () => new Error("The delegated model authorization timed out.")
+        );
+      } catch {
+        return denyManagedSubtask("The delegated model route could not be authorized.");
+      }
+    }
+    if (modelId === undefined || modelId === route.model.modelId) return { continue: true };
+    const authorize = route?.authorizeSubtask;
+    const model = this.#managedProviders?.listModels().find((candidate) =>
+      candidate.providerId === route?.providerId && candidate.modelId === modelId);
+    if (route === undefined || authorize === undefined || model === undefined) {
+      decision.closed = true;
+      return denyManagedSubtask("The delegated model is unavailable from the parent Provider route.");
+    }
+    const attempt = new AbortController();
+    const lifetimeSignal = AbortSignal.any([turn.context.signal, runtime.abortController.signal, attempt.signal]);
+    const callbackLifetime = AbortSignal.any([callbackSignal, lifetimeSignal]);
+    let admission!: ManagedSubtaskRouteAdmission;
+    const result = Promise.resolve().then(async (): Promise<ClaudeSdkHookOutput> => {
+      let authorization: Promise<ManagedProviderSubtaskLease>;
+      try {
+        authorization = authorize({
+          operationId: turn.operationId,
+          requestId: toolUseId,
+          modelId,
+          signal: lifetimeSignal,
+          assertCurrent: () => {
+            if (!this.#isTurnCurrent(runtime, turn) || turn.stopping || turn.terminalClaimed) {
+              throw new Error("The delegated model turn is no longer current.");
+            }
+            const current = turn.subtaskRouteLeases.get(toolUseId);
+            if (current === undefined && turn.subtaskRouteAdmissions.get(toolUseId) !== admission) {
+              throw new Error("The delegated model request is no longer authorized.");
+            }
+            if (current !== undefined && current.modelId !== modelId) {
+              throw new Error("The delegated model request identity changed.");
+            }
+          }
+        }).then((lease) => {
+          if (callbackLifetime.aborted || !this.#isTurnCurrent(runtime, turn) || turn.stopping || turn.terminalClaimed
+            || turn.subtaskRouteAdmissions.get(toolUseId) !== admission
+            || turn.subtaskRouteLeases.has(toolUseId)
+            || lease.model.providerId !== route.providerId || lease.model.modelId !== modelId
+            || lease.model.api !== route.protocol || !managedSubtaskConfigurationCompatible(route, lease)) {
+            lease.release();
+            throw new Error("The delegated model authorization expired before admission.");
+          }
+          return lease;
+        });
+      } catch {
+        attempt.abort();
+        decision.closed = true;
+        return denyManagedSubtask("The delegated model route could not be authorized.");
+      }
+      let lease: ManagedProviderSubtaskLease;
+      try {
+        lease = await waitFor(
+          authorization,
+          this.#admissionTimeoutMs,
+          callbackLifetime,
+          () => new Error("The delegated model authorization timed out.")
+        );
+      } catch {
+        attempt.abort();
+        decision.closed = true;
+        void authorization.then((late) => late.release()).catch(() => undefined);
+        return denyManagedSubtask("The delegated model route could not be authorized.");
+      }
+      if (callbackLifetime.aborted || !this.#isTurnCurrent(runtime, turn) || turn.stopping || turn.terminalClaimed
+        || turn.subtaskRouteAdmissions.get(toolUseId) !== admission) {
+        attempt.abort();
+        decision.closed = true;
+        lease.release();
+        return denyManagedSubtask("The delegated model request expired before native spawn.");
+      }
+      turn.subtaskRouteLeases.set(toolUseId, { modelId, lease });
+      turn.subtaskRouteAdmissions.delete(toolUseId);
+      return { continue: true };
+    }).catch(() => {
+      decision.closed = true;
+      return denyManagedSubtask("The delegated model route could not be authorized.");
+    });
+    admission = { modelId, cancellation: attempt, result };
+    turn.subtaskRouteAdmissions.set(toolUseId, admission);
+    void result.finally(() => {
+      if (turn.subtaskRouteAdmissions.get(toolUseId) === admission) {
+        turn.subtaskRouteAdmissions.delete(toolUseId);
+      }
+    });
+    return result;
   }
 
   async #canUseTool(
@@ -3282,17 +3476,26 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     runtime: NativeRuntime,
     emissions: readonly NativeTaskEmission[]
   ): Promise<void> {
-    for (const emission of emissions) {
-      if (!this.#matchesContext(runtime, emission.context)) return;
-      const fields: Record<string, string | number | boolean> = {
-        queryGeneration: runtime.queryGeneration,
-        sessionGeneration: runtime.sessionGeneration,
-        nativeTaskProjection: true
-      };
-      if (runtime.backendInstanceGeneration !== undefined) {
-        fields["backendInstanceGeneration"] = runtime.backendInstanceGeneration;
+    try {
+      for (const emission of emissions) {
+        if (!this.#matchesContext(runtime, emission.context)) return;
+        const fields: Record<string, string | number | boolean> = {
+          queryGeneration: runtime.queryGeneration,
+          sessionGeneration: runtime.sessionGeneration,
+          nativeTaskProjection: true
+        };
+        if (runtime.backendInstanceGeneration !== undefined) {
+          fields["backendInstanceGeneration"] = runtime.backendInstanceGeneration;
+        }
+        await emission.context.emit(emission.payload, { namespace: "claude-code.native_tasks", fields });
       }
-      await emission.context.emit(emission.payload, { namespace: "claude-code.native_tasks", fields });
+    } finally {
+      for (const terminated of runtime.nativeTasks.takeTerminatedTools()) {
+        const turn = runtime.activeTurn;
+        if (turn?.context === terminated.context) {
+          releaseManagedSubtaskLease(turn, terminated.toolUseId);
+        }
+      }
     }
   }
 
@@ -3400,11 +3603,11 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
   ): Promise<void> {
     if (runtime.retirementConfirmed) return;
     if (!runtime.closed) {
-      runtime.managedRoute?.dispose();
       const retiringTurn = runtime.activeTurn;
       if (retiringTurn !== undefined) {
         retiringTurn.stopping = true;
         retiringTurn.terminalClaimed = true;
+        releaseManagedTurnLeases(retiringTurn);
         retiringTurn.interruptConfirmation?.reject(turnAbortUnknown("The runtime retired before interrupt confirmation.")());
         for (const steer of retiringTurn.steers.values()) {
           steer.admission.reject(dispatchError("The runtime retired before same-turn admission was confirmed.", steer.consumed));
@@ -3428,6 +3631,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
           // Runtime retirement remains authoritative when terminal task publication fails.
         }
       }
+      runtime.managedRoute?.dispose();
       runtime.closed = true;
       const reason = new Error("The native runtime was retired.");
       runtime.activeTurn?.admission.reject(reason);
@@ -3809,6 +4013,109 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
 
 export function createClaudeCodeAdapter(options: ClaudeCodeAdapterOptions): ClaudeCodeAdapter {
   return new ClaudeCodeAdapter(options);
+}
+
+function managedSubtaskHooks(
+  callback: (
+    input: ClaudeSdkHookInput,
+    toolUseId: string | undefined,
+    options: { readonly signal: AbortSignal }
+  ) => Promise<ClaudeSdkHookOutput>
+): ClaudeSdkHooks {
+  return {
+    PreToolUse: [
+      { matcher: "Agent", hooks: [callback] },
+      { matcher: "Task", hooks: [callback] }
+    ],
+    PermissionDenied: [
+      { matcher: "Agent", hooks: [callback] },
+      { matcher: "Task", hooks: [callback] }
+    ],
+    PostToolUse: [
+      { matcher: "Agent", hooks: [callback] },
+      { matcher: "Task", hooks: [callback] }
+    ],
+    PostToolUseFailure: [
+      { matcher: "Agent", hooks: [callback] },
+      { matcher: "Task", hooks: [callback] }
+    ]
+  };
+}
+
+function denyManagedSubtask(reason: string): ClaudeSdkHookOutput {
+  return {
+    continue: true,
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: reason
+    }
+  };
+}
+
+function managedSubtaskToolUseId(
+  inputId: string | undefined,
+  callbackId: string | undefined
+): string | undefined {
+  if (typeof inputId !== "string" || inputId.length === 0 || inputId.length > 512
+    || /[\x00-\x1f\x7f]/u.test(inputId)
+    || (callbackId !== undefined && callbackId !== inputId)) return undefined;
+  return inputId;
+}
+
+function releaseManagedSubtaskLease(turn: ActiveTurn | undefined, toolUseId: string): void {
+  if (turn === undefined) return;
+  const decision = turn.subtaskRouteDecisions.get(toolUseId);
+  if (decision !== undefined) decision.closed = true;
+  const pending = turn.subtaskRouteAdmissions.get(toolUseId);
+  if (pending !== undefined) {
+    turn.subtaskRouteAdmissions.delete(toolUseId);
+    pending.cancellation.abort();
+  }
+  const granted = turn.subtaskRouteLeases.get(toolUseId);
+  if (granted === undefined) return;
+  turn.subtaskRouteLeases.delete(toolUseId);
+  granted.lease.release();
+}
+
+function releaseManagedTurnLeases(turn: ActiveTurn): void {
+  for (const pending of turn.subtaskRouteAdmissions.values()) pending.cancellation.abort();
+  turn.subtaskRouteAdmissions.clear();
+  for (const granted of turn.subtaskRouteLeases.values()) granted.lease.release();
+  turn.subtaskRouteLeases.clear();
+  turn.subtaskRouteDecisions.clear();
+  turn.providerLease?.release();
+}
+
+function managedSubtaskConfigurationCompatible(
+  parent: ManagedProviderRouteBinding,
+  child: ManagedProviderSubtaskLease
+): boolean {
+  try {
+    return isDeepStrictEqual(
+      managedModelLimitEnvironment(parent.model),
+      managedModelLimitEnvironment(child.model)
+    ) && isDeepStrictEqual(
+      managedThinkingSignature(parent.model, parent.thinkingLevelMap),
+      managedThinkingSignature(child.model, child.thinkingLevelMap)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function managedThinkingSignature(
+  model: ProviderModel,
+  mapping: Readonly<Record<string, string | null>>
+): Readonly<Record<string, string>> {
+  validateManagedThinkingMap(mapping);
+  const signature: Record<string, string> = {};
+  for (const level of model.thinkingLevels) {
+    if (mapping[level] === null) continue;
+    const native = normalizeEffort(mapping[level] ?? level);
+    if (native !== undefined) signature[level] = native;
+  }
+  return Object.freeze(signature);
 }
 
 function reviewRuntimePolicy(

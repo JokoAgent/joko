@@ -21,6 +21,8 @@ const MAX_QUEUED_INPUT_BYTES = 32 * 1024 * 1024;
 const MAX_TERMINAL_QUERIES = 128;
 const MAX_CALLBACKS_PER_CONNECTION = 256;
 const CALLBACK_TIMEOUT_MS = 30 * 60_000;
+const MAX_HOOK_PAYLOAD_BYTES = 1024 * 1024;
+const REMOTE_HOOK_EVENTS = new Set(["PreToolUse", "PermissionDenied", "PostToolUse", "PostToolUseFailure"]);
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const UTF8 = new TextDecoder("utf-8", { fatal: true });
 const ENVIRONMENT_PREFIXES = ["ANTHROPIC_", "CLAUDE_", "AWS_", "GOOGLE_", "AZURE_", "CLOUD_ML_"];
@@ -562,6 +564,7 @@ function queryOptions(value, query) {
   const tmpRoot = join(remoteRoot, "tmp");
   const executable = absolutePath(process.env.JOKO_CLAUDE_EXECUTABLE);
   const env = remoteEnvironment(value.env, configRoot, tmpRoot);
+  const hooks = hookOptions(value.hooks, query);
   const options = {
     abortController: query.abortController,
     additionalDirectories: stringArray(value.additionalDirectories, "additional directories", 64, 16_384).map(absolutePath),
@@ -592,6 +595,7 @@ function queryOptions(value, query) {
     } } : {}),
     ...(value.effort === undefined ? {} : { effort: effort(value.effort) }),
     ...(value.forwardSubagentText === true ? { forwardSubagentText: true } : {}),
+    ...(hooks === undefined ? {} : { hooks }),
     includePartialMessages: true,
     ...(value.disallowedTools === undefined ? {} : { disallowedTools: stringArray(value.disallowedTools, "disallowed tools", 256, 512) }),
     ...(value.mcpServers === undefined ? {} : { mcpServers: emptyRecord(value.mcpServers, "MCP servers") }),
@@ -613,6 +617,80 @@ function queryOptions(value, query) {
   };
   if (options.additionalDirectories.length > 0) throw fault("remote_extra_directories_unsupported", false);
   return options;
+}
+
+function hookOptions(value, query) {
+  if (value === undefined) return undefined;
+  if (!record(value) || Object.keys(value).length === 0 || Object.keys(value).length > REMOTE_HOOK_EVENTS.size) {
+    throw fault("hook_manifest_invalid", false);
+  }
+  const output = {};
+  let callbackCount = 0;
+  for (const [event, rawMatchers] of Object.entries(value)) {
+    if (!REMOTE_HOOK_EVENTS.has(event) || !Array.isArray(rawMatchers)
+      || rawMatchers.length === 0 || rawMatchers.length > MAX_CALLBACKS_PER_CONNECTION) {
+      throw fault("hook_manifest_invalid", false);
+    }
+    output[event] = rawMatchers.map((rawMatcher, matcherIndex) => {
+      if (!record(rawMatcher)) throw fault("hook_manifest_invalid", false);
+      const hookCount = boundedInteger(rawMatcher.hookCount, "hook count", 1, MAX_CALLBACKS_PER_CONNECTION);
+      callbackCount += hookCount;
+      if (callbackCount > MAX_CALLBACKS_PER_CONNECTION) throw fault("hook_manifest_invalid", false);
+      const matcher = optionalString(rawMatcher.matcher, "hook matcher", 512);
+      const timeout = rawMatcher.timeout === undefined
+        ? undefined
+        : boundedInteger(rawMatcher.timeout, "hook timeout", 1, 3_600);
+      return {
+        ...(matcher === undefined ? {} : { matcher }),
+        hooks: Array.from({ length: hookCount }, (_, hookIndex) => async (input, toolUseID, options) => {
+          try {
+            const result = await query.connection?.callback(query, "hook", hookCallbackValue(
+              event,
+              matcherIndex,
+              hookIndex,
+              input,
+              toolUseID
+            ), options.signal);
+            return hookResult(result);
+          } catch {
+            if (event !== "PreToolUse") query.abortController.abort();
+            return failedHookResult(event);
+          }
+        }),
+        ...(timeout === undefined ? {} : { timeout })
+      };
+    });
+  }
+  return output;
+}
+
+function hookCallbackValue(event, matcherIndex, hookIndex, input, toolUseId) {
+  if (!record(input) || input.hook_event_name !== event
+    || (toolUseId !== undefined && (typeof toolUseId !== "string" || toolUseId.length === 0
+      || Buffer.byteLength(toolUseId, "utf8") > 512 || /[\u0000-\u001f\u007f]/u.test(toolUseId)))) {
+    throw fault("callback_invalid", false);
+  }
+  const value = { event, matcherIndex, hookIndex, input, ...(toolUseId === undefined ? {} : { toolUseId }) };
+  if (jsonBytes(value) > MAX_HOOK_PAYLOAD_BYTES) throw fault("callback_invalid", false);
+  return value;
+}
+
+function hookResult(value) {
+  if (!record(value) || jsonBytes(value) > MAX_HOOK_PAYLOAD_BYTES) throw fault("callback_invalid", false);
+  return value;
+}
+
+function failedHookResult(event) {
+  return event === "PreToolUse"
+    ? {
+        continue: true,
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason: "The remote delegated-model authority is unavailable."
+        }
+      }
+    : { continue: true };
 }
 
 function spawnOwned(query, options) {
@@ -1089,6 +1167,11 @@ function record(value) {
 
 function digest(value) {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function jsonBytes(value) {
+  try { return Buffer.byteLength(JSON.stringify(value), "utf8"); }
+  catch { return Number.POSITIVE_INFINITY; }
 }
 
 function invalid() { throw fault("invalid_request", false); }
