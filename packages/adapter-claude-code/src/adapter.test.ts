@@ -99,8 +99,10 @@ describe("ClaudeCodeAdapter", () => {
     expect(options.env["ANTHROPIC_API_KEY"]).toBe(managed.token);
     expect(options.env["JOKO_MODEL_PROXY_TOKEN"]).toBeUndefined();
     expect(options.env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"]).toBe("1");
+    expect(options.env["CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"]).toBe("1");
     expect(options.env["ANTHROPIC_BASE_URL"]).toBe("http://127.0.0.1:31415/routes/fixture");
-    expect(options.settingSources).toEqual([]);
+    expect(options.settingSources).toEqual(["user", "project", "local"]);
+    expect(options.settings).toMatchObject({ apiKeyHelper: "", fastMode: false });
     expect(JSON.stringify(options.settings)).not.toContain(managed.token);
     expect(managed.activations).toHaveLength(0);
     const source = contextFor(binding, { operationId: "managed-first-turn" });
@@ -552,7 +554,7 @@ describe("ClaudeCodeAdapter", () => {
     expect(descriptor.capabilities.get("model.fast_mode")?.supported).toBe(true);
     expect(descriptor.models.map((model) => model.supportsFastMode)).toEqual([true, false]);
     const binding = await adapter.createSession(createInput({ modelId: "model-a-20260801", fastMode: true }), contextFor().context);
-    expect(runtime.queries[0]!.params.options.settings).toEqual({ fastMode: true });
+    expect(runtime.queries[0]!.params.options.settings).toEqual({ apiKeyHelper: "", fastMode: true });
     await expect(adapter.inspectSession(binding, contextFor(binding).context)).resolves.toMatchObject({ fastMode: true });
     await adapter.dispose();
     const unavailable = new FakeSdkRuntime();
@@ -697,7 +699,7 @@ describe("ClaudeCodeAdapter", () => {
     const binding = await adapter.createSession(createInput({ modelId: "model-a" }), contextFor().context);
     const context = contextFor(binding).context;
     const query = runtime.queries[0]!;
-    expect(query.params.options.settings).toEqual({ fastMode: false });
+    expect(query.params.options.settings).toEqual({ apiKeyHelper: "", fastMode: false });
     await expect(adapter.setFastMode(true, { ...context, signal: AbortSignal.abort() }))
       .rejects.toMatchObject({ publicError: { code: "NATIVE_CONTROL_ABORTED", stateMayHaveChanged: false } });
     expect(query.settingCalls).toEqual([]);
@@ -738,7 +740,7 @@ describe("ClaudeCodeAdapter", () => {
     const context = contextFor(resumedBinding, { generation: 2 }).context;
     await adapter.resumeSession(binding, context);
     const resumedQuery = runtime.queries[1]!;
-    expect(resumedQuery.params.options.settings).toBeUndefined();
+    expect(resumedQuery.params.options.settings).toEqual({ apiKeyHelper: "" });
     await adapter.setModel("claude-code", "model-a", context);
     await adapter.setFastMode(true, context);
     expect(resumedQuery.settingCalls).toEqual([{ fastMode: true }]);
@@ -883,6 +885,7 @@ describe("ClaudeCodeAdapter", () => {
     expect(runtime.queries).toEqual([]);
     expect(runtime.probeInputs).toEqual([expect.objectContaining({
       cwd: probeCwd,
+      settings: { apiKeyHelper: "" },
       settingSources: ["user", "project", "local"],
       initializationTimeoutMs: 500
     })]);
@@ -1860,6 +1863,7 @@ describe("ClaudeCodeAdapter", () => {
     expect(query.params.options.forwardSubagentText).toBe(true);
     expect(query.params.options.persistSession).toBe(true);
     expect(query.params.options.settingSources).toEqual(["user", "project", "local"]);
+    expect(query.params.options.settings).toMatchObject({ apiKeyHelper: "", fastMode: false });
     expect(query.params.options.additionalDirectories).toEqual([process.cwd()]);
     expect(query.params.options.systemPrompt.append).toBe("Use the product workflow.");
     expect(query.params.options.title).toBe("SDK session");

@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, readdir, mkdir, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, mkdir, rm, writeFile } from "node:fs/promises";
 import { createServer, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,12 +8,30 @@ import { ClaudeCodeAdapter } from "./adapter.js";
 
 const enabled = process.env["JOKO_CLAUDE_LOCAL_GATEWAY_PROBE"] === "1";
 
-test.skipIf(!enabled)("uses the fixed SDK against a local gateway and scrubs the proxy credential from native tool children", async () => {
+test.skipIf(!enabled)("uses the fixed SDK against a local gateway, preserves safe settings, and scrubs the proxy credential from native tool children", async () => {
   const directory = await mkdtemp(join(tmpdir(), "joko-claude-local-gateway-"));
   const workspaceRoot = join(directory, "workspace");
   const configDirectory = join(directory, "profile");
   await mkdir(workspaceRoot);
   await mkdir(configDirectory);
+  const projectSettingsDirectory = join(workspaceRoot, ".claude");
+  await mkdir(projectSettingsDirectory);
+  const hostileToken = "settings-must-not-own-provider-route";
+  await writeFile(join(configDirectory, "settings.json"), JSON.stringify({
+    apiKeyHelper: "joko-api-key-helper-must-not-run",
+    env: {
+      ANTHROPIC_API_KEY: hostileToken,
+      ANTHROPIC_BASE_URL: "http://127.0.0.1:9/hostile",
+      CLAUDE_CODE_USE_BEDROCK: "1",
+      JOKO_NATIVE_SETTINGS_ORDER: "user"
+    }
+  }));
+  await writeFile(join(projectSettingsDirectory, "settings.json"), JSON.stringify({
+    env: { JOKO_NATIVE_SETTINGS_ORDER: "project" }
+  }));
+  await writeFile(join(projectSettingsDirectory, "settings.local.json"), JSON.stringify({
+    env: { JOKO_NATIVE_SETTINGS_ORDER: "local" }
+  }));
   const token = "local-gateway-fixture-credential";
   const model: ProviderModel = { providerId: "local-gateway", modelId: "joko-local-model", displayName: "Local model",
     api: "anthropic-messages", contextWindow: 64_000, maxOutputTokens: 4_000, supportsImages: false, thinkingLevels: ["high"],
@@ -135,7 +153,7 @@ function sendMessage(response: ServerResponse, model: string, hasToolResult: boo
   send("content_block_start", { index: 0, content_block: hasToolResult ? { type: "text", text: "" }
     : { type: "tool_use", id: "toolu_local_environment", name: "Bash", input: {} } });
   send("content_block_delta", { index: 0, delta: hasToolResult ? { type: "text_delta", text: "Local check complete." }
-    : { type: "input_json_delta", partial_json: JSON.stringify({ command: 'test -z "${ANTHROPIC_API_KEY-}" && test -z "${ANTHROPIC_AUTH_TOKEN-}" && test -z "${JOKO_MODEL_PROXY_TOKEN-}" && printf joko-tool-environment-scrubbed', description: "Check the local tool environment without printing credentials" }) } });
+    : { type: "input_json_delta", partial_json: JSON.stringify({ command: 'test "$JOKO_NATIVE_SETTINGS_ORDER" = "local" && test -z "${ANTHROPIC_API_KEY-}" && test -z "${ANTHROPIC_AUTH_TOKEN-}" && test -z "${JOKO_MODEL_PROXY_TOKEN-}" && printf joko-tool-environment-scrubbed', description: "Check the local tool environment without printing credentials" }) } });
   send("content_block_stop", { index: 0 });
   send("message_delta", { delta: { stop_reason: hasToolResult ? "end_turn" : "tool_use", stop_sequence: null }, usage: { output_tokens: 10 } });
   send("message_stop", {});

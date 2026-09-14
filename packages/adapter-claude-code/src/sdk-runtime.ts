@@ -211,6 +211,7 @@ export interface ClaudeSdkProbeInput {
   readonly env: Readonly<Record<string, string | undefined>>;
   readonly getOAuthToken?: ClaudeSdkOAuthTokenProvider;
   readonly pathToClaudeCodeExecutable?: string;
+  readonly settings: Exclude<NativeOptions["settings"], string>;
   readonly settingSources: readonly ("user" | "project" | "local")[];
   readonly initializationTimeoutMs: number;
 }
@@ -346,6 +347,7 @@ export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
             : { pathToClaudeCodeExecutable: input.pathToClaudeCodeExecutable }),
           permissionMode: "dontAsk",
           persistSession: false,
+          settings: { ...input.settings },
           ...(this.#processOwner === undefined
             ? {}
             : { spawnClaudeCodeProcess: (options) => this.#spawnOwnedProcess(options) }),

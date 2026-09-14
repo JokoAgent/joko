@@ -608,6 +608,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         },
         ...(runtimeAuthorization === undefined ? {} : { getOAuthToken: runtimeAuthorization.getOAuthToken }),
         ...(this.#pathToExecutable === undefined ? {} : { pathToClaudeCodeExecutable: this.#pathToExecutable }),
+        settings: { apiKeyHelper: "" },
         settingSources: [...this.#settingSources],
         initializationTimeoutMs: this.#initializationTimeoutMs
       });
@@ -2278,7 +2279,16 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
                   }
                 }
               }
-            : launch.fastMode === undefined ? {} : { settings: { fastMode: launch.fastMode } }),
+            : {
+                settings: {
+                  // Filesystem settings remain available below, but a native
+                  // helper must never replace the Host-owned credential path.
+                  // The fixed CLI additionally filters provider-related `env`
+                  // keys when CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST is set.
+                  apiKeyHelper: "",
+                  ...(launch.fastMode === undefined ? {} : { fastMode: launch.fastMode })
+                }
+              }),
           ...(runtimeAuthorization === undefined ? {} : { getOAuthToken: runtimeAuthorization.getOAuthToken }),
           ...(launch.effort === undefined ? {} : { effort: managedRoute === undefined ? requiredNativeEffort(launch.effort)
             : managedNativeEffort(managedRoute.model, managedRoute.thinkingLevelMap, launch.effort) }),
@@ -2298,7 +2308,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
           permissionMode: toSdkPermissionMode(launch.permissionMode),
           persistSession: launch.runtimePolicy !== "review_read_only",
           ...(launch.resume ? { resume: nativeSessionId } : { sessionId: nativeSessionId }),
-          settingSources: launch.runtimePolicy === "review_read_only" || managedRoute !== undefined ? [] : [...this.#settingSources],
+          settingSources: launch.runtimePolicy === "review_read_only" ? [] : [...this.#settingSources],
           systemPrompt: {
             type: "preset",
             preset: "claude_code",
