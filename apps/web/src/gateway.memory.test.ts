@@ -42,11 +42,32 @@ describe("OrchestratorGateway Memory reset scopes", () => {
       enabled: true,
       supported: true,
       reason: "",
-      entryCount: 0,
       kind: "native_auto_memory",
       resettable: false,
       updatesActiveLocalSessions: true
     }]);
+  });
+
+  it("preserves an explicit zero native-memory count without inventing one when status is absent", () => {
+    const settings = (entryCount?: bigint) => mapSnapshot(create(SnapshotSchema, {
+      settings: {
+        auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" },
+        agentResource: {},
+        collaboration: {},
+        gitSafety: {},
+        memory: {
+          backends: [{
+            backendId: "claude-code",
+            support: CapabilitySupport.SUPPORTED,
+            kind: BackendMemoryKind.NATIVE_AUTO_MEMORY,
+            ...(entryCount === undefined ? {} : { entryCount })
+          }]
+        }
+      }
+    })).settings.memory.backends[0];
+
+    expect(settings()).not.toHaveProperty("entryCount");
+    expect(settings(0n)).toHaveProperty("entryCount", 0);
   });
 
   it("sends distinct CURATED and capability-owned BACKEND mutations", async () => {

@@ -285,6 +285,13 @@ export interface NativeMemoryResetResult {
   readonly removedTargets?: number;
 }
 
+export interface NativeMemoryStatus {
+  /** Omitted when the native owner cannot produce a trustworthy count. */
+  readonly entryCount?: number;
+  /** Private storage size metadata; public projections may deliberately omit it. */
+  readonly sizeBytes?: number;
+}
+
 export interface RuntimeResource {
   readonly id: string;
   readonly kind: "extension" | "skill" | "prompt" | "package";
@@ -454,6 +461,8 @@ export interface BackendAdapter {
   setAutoRetry(enabled: boolean, context: AdapterContext): Promise<void>;
   /** Reconcile the durable Backend-native memory preference with a live local runtime, if one exists. */
   reconcileNativeMemory?(): Promise<"immediate" | "next_session">;
+  /** Read content-free status from the Backend-native memory owned by this local runtime. */
+  readNativeMemoryStatus?(signal?: AbortSignal): Promise<NativeMemoryStatus>;
   /** Destructively reset only the Backend-native memory owned by this local runtime. */
   resetNativeMemory?(): Promise<NativeMemoryResetResult>;
   /** Update the capability owner's default for runtimes created later. */

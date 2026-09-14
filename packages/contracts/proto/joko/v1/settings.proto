@@ -945,7 +945,8 @@ message BackendMemorySettings {
   bool enabled = 2;
   CapabilitySupport support = 3;
   string reason = 4;
-  uint64 entry_count = 5;
+  // Absent when a Backend-native owner cannot produce a trustworthy local count.
+  optional uint64 entry_count = 5;
   BackendMemoryKind kind = 6;
   bool resettable = 7;
   bool updates_active_local_sessions = 8;

@@ -3697,7 +3697,7 @@ export interface SettingsView {
       readonly enabled: boolean;
       readonly supported: boolean;
       readonly reason: string;
-      readonly entryCount: number;
+      readonly entryCount?: number;
       readonly kind: "compaction_digest" | "native_auto_memory";
       readonly resettable: boolean;
       readonly updatesActiveLocalSessions: boolean;

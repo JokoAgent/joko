@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -1547,7 +1547,8 @@ describe("ClaudeCodeAdapter", () => {
 
     expect((await adapter.describe()).capabilities.get("memory.native")).toEqual({
       key: "memory.native",
-      supported: true
+      supported: true,
+      options: ["reset_local"]
     });
     const binding = await adapter.createSession(createInput(), contextFor().context);
     expect(runtime.queries[0]!.params.options.settings).toMatchObject({
@@ -1569,6 +1570,127 @@ describe("ClaudeCodeAdapter", () => {
     });
     expect(resolveNativeMemoryEnabled).toHaveBeenCalledTimes(2);
     await adapter.dispose();
+  });
+
+  test("reports and resets only regular native memory beneath the exact local profile", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-claude-native-memory-"));
+    const configDirectory = join(root, "profile");
+    const firstMemory = join(configDirectory, "projects", "first", "memory");
+    const secondMemory = join(configDirectory, "projects", "second", "memory");
+    const remoteResolve = vi.fn();
+    const adapter = adapterFor(new FakeSdkRuntime(), {
+      environment: { CLAUDE_CONFIG_DIR: configDirectory },
+      resolveNativeMemoryEnabled: () => true,
+      remoteRuntimes: { resolve: remoteResolve, close: async () => undefined }
+    });
+    try {
+      await Promise.all([
+        mkdir(join(firstMemory, "nested"), { recursive: true }),
+        mkdir(secondMemory, { recursive: true })
+      ]);
+      await Promise.all([
+        writeFile(join(firstMemory, "MEMORY.md"), "first"),
+        writeFile(join(firstMemory, "notes.md"), "second"),
+        writeFile(join(firstMemory, "ignored.txt"), "ignored"),
+        writeFile(join(firstMemory, "nested", "ignored.md"), "nested"),
+        writeFile(join(secondMemory, "topic.md"), "third"),
+        writeFile(join(configDirectory, "projects", "first", "session.jsonl"), "history"),
+        writeFile(join(configDirectory, "settings.json"), "settings")
+      ]);
+
+      expect((await adapter.describe()).capabilities.get("memory.native")).toEqual({
+        key: "memory.native",
+        supported: true,
+        options: ["reset_local"]
+      });
+      await expect(adapter.readNativeMemoryStatus()).resolves.toEqual({
+        entryCount: 3,
+        sizeBytes: 16
+      });
+      await expect(adapter.resetNativeMemory()).resolves.toEqual({
+        removedEntries: 3,
+        removedTargets: 2
+      });
+      await expect(adapter.readNativeMemoryStatus()).resolves.toEqual({ entryCount: 0, sizeBytes: 0 });
+      await expect(readFile(join(configDirectory, "projects", "first", "session.jsonl"), "utf8"))
+        .resolves.toBe("history");
+      await expect(readFile(join(configDirectory, "settings.json"), "utf8")).resolves.toBe("settings");
+      expect(remoteResolve).not.toHaveBeenCalled();
+    } finally {
+      await adapter.dispose();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("treats a missing local profile as known empty memory", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-claude-native-memory-missing-"));
+    const adapter = adapterFor(new FakeSdkRuntime(), {
+      environment: { CLAUDE_CONFIG_DIR: join(root, "not-created") },
+      resolveNativeMemoryEnabled: () => true
+    });
+    try {
+      await expect(adapter.readNativeMemoryStatus()).resolves.toEqual({ entryCount: 0, sizeBytes: 0 });
+      await expect(adapter.resetNativeMemory()).resolves.toEqual({ removedEntries: 0, removedTargets: 0 });
+    } finally {
+      await adapter.dispose();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects an aliased native memory directory without following or deleting it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-claude-native-memory-alias-"));
+    const outside = await mkdtemp(join(tmpdir(), "joko-claude-native-memory-outside-"));
+    const configDirectory = join(root, "profile");
+    const projectDirectory = join(configDirectory, "projects", "project");
+    const adapter = adapterFor(new FakeSdkRuntime(), {
+      environment: { CLAUDE_CONFIG_DIR: configDirectory },
+      resolveNativeMemoryEnabled: () => true
+    });
+    try {
+      await mkdir(projectDirectory, { recursive: true });
+      await writeFile(join(outside, "MEMORY.md"), "must remain");
+      await symlink(outside, join(projectDirectory, "memory"), "junction");
+
+      await expect(adapter.readNativeMemoryStatus()).rejects.toMatchObject({
+        publicError: { code: "CLAUDE_NATIVE_MEMORY_PATH_UNSAFE", stateMayHaveChanged: false }
+      });
+      await expect(adapter.resetNativeMemory()).rejects.toMatchObject({
+        publicError: { code: "CLAUDE_NATIVE_MEMORY_PATH_UNSAFE", stateMayHaveChanged: false }
+      });
+      await expect(readFile(join(outside, "MEMORY.md"), "utf8")).resolves.toBe("must remain");
+    } finally {
+      await adapter.dispose();
+      await rm(root, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects an aliased native memory project without following or deleting it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-claude-native-project-alias-"));
+    const outside = await mkdtemp(join(tmpdir(), "joko-claude-native-project-outside-"));
+    const configDirectory = join(root, "profile");
+    const adapter = adapterFor(new FakeSdkRuntime(), {
+      environment: { CLAUDE_CONFIG_DIR: configDirectory },
+      resolveNativeMemoryEnabled: () => true
+    });
+    try {
+      await mkdir(join(configDirectory, "projects"), { recursive: true });
+      await mkdir(join(outside, "memory"), { recursive: true });
+      await writeFile(join(outside, "memory", "MEMORY.md"), "must remain");
+      await symlink(outside, join(configDirectory, "projects", "project"), "junction");
+
+      await expect(adapter.readNativeMemoryStatus()).rejects.toMatchObject({
+        publicError: { code: "CLAUDE_NATIVE_MEMORY_PATH_UNSAFE", stateMayHaveChanged: false }
+      });
+      await expect(adapter.resetNativeMemory()).rejects.toMatchObject({
+        publicError: { code: "CLAUDE_NATIVE_MEMORY_PATH_UNSAFE", stateMayHaveChanged: false }
+      });
+      await expect(readFile(join(outside, "memory", "MEMORY.md"), "utf8")).resolves.toBe("must remain");
+    } finally {
+      await adapter.dispose();
+      await rm(root, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
+    }
   });
 
   test.each([

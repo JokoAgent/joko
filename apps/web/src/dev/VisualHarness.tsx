@@ -711,7 +711,7 @@ export function VisualHarness(): JSX.Element {
         readonly removedTargets?: number;
       }> => {
         const current = state.snapshot.settings.memory;
-        const digestEntries = current.backends.reduce((total, backend) => total + backend.entryCount, 0);
+        const digestEntries = current.backends.reduce((total, backend) => total + (backend.entryCount ?? 0), 0);
         const removedEntries = scope === "curated"
           ? Math.max(0, current.entryCount - digestEntries)
           : current.backends.find((backend) => backend.backendId === backendId)?.entryCount ?? 0;

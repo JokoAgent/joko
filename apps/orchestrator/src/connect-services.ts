@@ -19,7 +19,7 @@ import {
   DEFAULT_COLLABORATION_SETTINGS,
   type ManagedProcessPriority
 } from "@joko/runtime-governance";
-import { JokoError, MEMORY_NATIVE_DEFAULT_DISABLED_OPTION, MEMORY_NATIVE_LIVE_LOCAL_OPTION, MEMORY_NATIVE_RESET_LOCAL_OPTION, redactSecrets, type BackendAdapter, type BackendDescriptor, type BackendToolDescriptor, type BlobRef, type DynamicInputFieldType, type NativeMemoryResetResult, type NativeSessionCandidate as CoreNativeSessionCandidate, type NativeSessionCatalogEntry as CoreNativeSessionCatalogEntry, type PermissionMode as CorePermissionMode, type PiNativeStateMetadata, type PromptInput, type ProviderModel, type RuntimeCommand, type RuntimeResource, type RuntimeToolCatalog, type SessionTree, type SessionTreeNode, type TurnExecutionOverrides } from "@joko/core";
+import { JokoError, MEMORY_NATIVE_DEFAULT_DISABLED_OPTION, MEMORY_NATIVE_LIVE_LOCAL_OPTION, MEMORY_NATIVE_RESET_LOCAL_OPTION, redactSecrets, type BackendAdapter, type BackendDescriptor, type BackendToolDescriptor, type BlobRef, type DynamicInputFieldType, type NativeMemoryResetResult, type NativeMemoryStatus, type NativeSessionCandidate as CoreNativeSessionCandidate, type NativeSessionCatalogEntry as CoreNativeSessionCatalogEntry, type PermissionMode as CorePermissionMode, type PiNativeStateMetadata, type PromptInput, type ProviderModel, type RuntimeCommand, type RuntimeResource, type RuntimeToolCatalog, type SessionTree, type SessionTreeNode, type TurnExecutionOverrides } from "@joko/core";
 import {
   AsyncTransactionError,
   AuthorizationError,
@@ -497,6 +497,8 @@ interface ConnectServiceDependencies {
   readonly backendProviderLoginTails: Map<string, Promise<void>>;
   readonly diagnosticsArtifacts: Map<string, string>;
   readonly browserTransferOperations: Map<string, string>;
+  readonly nativeMemoryStatuses: Map<string, NativeMemoryStatusObservation>;
+  readonly nativeMemoryStatusEpochs: Map<string, bigint>;
   readonly managedWorkspaceRoot?: string;
   /** Public, credential-free LAN bootstrap projection. */
   readonly discoveredNodes?: () => readonly DiscoveredNodeRecord[];
@@ -513,6 +515,11 @@ interface ConnectServiceDependencies {
   readonly now?: () => number;
   /** Optional durable Browser activity projection supplied by the process composition root. */
   readonly browserActivities?: () => readonly NativeBrowserActivity[];
+}
+
+interface NativeMemoryStatusObservation {
+  readonly backendInstanceGeneration: number;
+  readonly status: NativeMemoryStatus;
 }
 
 function toProtoRuntimeActivityKind(kind: SessionRuntimeActivityKind): contract.RuntimeActivityKind {
@@ -967,6 +974,8 @@ export function createConnectServices(application: OrchestratorApplication): Con
   const backendProviderLoginTails = new Map<string, Promise<void>>();
   const diagnosticsArtifacts = new Map<string, string>();
   const browserTransferOperations = new Map<string, string>();
+  const nativeMemoryStatuses = new Map<string, NativeMemoryStatusObservation>();
+  const nativeMemoryStatusEpochs = new Map<string, bigint>();
   const projectAutomations = new ProjectAutomationConfigController({ store: application.store });
   const dependencies: ConnectServiceDependencies = {
     connections: application.connections,
@@ -1047,6 +1056,8 @@ export function createConnectServices(application: OrchestratorApplication): Con
     backendProviderLoginTails,
     diagnosticsArtifacts,
     browserTransferOperations,
+    nativeMemoryStatuses,
+    nativeMemoryStatusEpochs,
     ...(application.config.dataDirectory === undefined ? {} : { managedWorkspaceRoot: join(application.config.dataDirectory, "managed-workspaces") }),
     browserActivities: () => application.browserActivity,
     ...(application.lanDiscovery === undefined ? {} : { discoveredNodes: () => application.lanDiscovery.list() }),
@@ -3447,8 +3458,9 @@ export function createConnectServices(application: OrchestratorApplication): Con
   } satisfies ServiceImpl<typeof contract.CredentialService>;
 
   const settings = {
-    getSettings: (_request, context) => {
+    getSettings: async (_request, context) => {
       authenticate(context);
+      await refreshNativeMemoryStatuses(dependencies, context.signal);
       return { settings: settingsSnapshot(dependencies) };
     }
   } satisfies ServiceImpl<typeof contract.SettingsService>;
@@ -11987,6 +11999,98 @@ function validateNativeMemoryResetResult(value: NativeMemoryResetResult): Native
   };
 }
 
+function validateNativeMemoryStatus(value: unknown): NativeMemoryStatus {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw invalidNativeMemoryStatus();
+  }
+  const status = value as NativeMemoryStatus;
+  for (const count of [status.entryCount, status.sizeBytes]) {
+    if (count !== undefined && (!Number.isSafeInteger(count) || count < 0)) {
+      throw invalidNativeMemoryStatus();
+    }
+  }
+  return {
+    ...(status.entryCount === undefined ? {} : { entryCount: status.entryCount }),
+    ...(status.sizeBytes === undefined ? {} : { sizeBytes: status.sizeBytes })
+  };
+}
+
+function invalidNativeMemoryStatus(): JokoError {
+  return new JokoError({
+    code: "NATIVE_MEMORY_STATUS_INVALID",
+    message: "The Backend returned an invalid native-memory status.",
+    phase: "projection",
+    retryable: false,
+    stateMayHaveChanged: false,
+    recovery: "Keep the native-memory count unavailable until Backend status can be refreshed."
+  });
+}
+
+async function refreshNativeMemoryStatuses(
+  dependencies: ConnectServiceDependencies,
+  signal?: AbortSignal
+): Promise<void> {
+  signal?.throwIfAborted();
+  const adapters = new Map(dependencies.adapters().map((adapter) => [adapter.id, adapter] as const));
+  const nativeBackends = dependencies.store.listBackends()
+    .filter((item) => backendMemoryRole(item.descriptor) === "native_auto_memory");
+  await Promise.all(nativeBackends.map(async ({ descriptor }) => {
+    const refreshEpoch = beginNativeMemoryStatusRefresh(dependencies, descriptor.id);
+    const advertisedAdapter = adapters.get(descriptor.id);
+    if (advertisedAdapter?.readNativeMemoryStatus === undefined) {
+      invalidateNativeMemoryStatus(dependencies, descriptor.id, descriptor.instanceGeneration, refreshEpoch);
+      return;
+    }
+    try {
+      const observation = await dependencies.sessionHost.invokeBackendAdapter(
+        descriptor.id,
+        async (adapter, backendInstanceGeneration) => {
+          if (adapter.readNativeMemoryStatus === undefined) return undefined;
+          const status = validateNativeMemoryStatus(await adapter.readNativeMemoryStatus(signal));
+          return { backendInstanceGeneration, status } satisfies NativeMemoryStatusObservation;
+        }
+      );
+      signal?.throwIfAborted();
+      if (observation === undefined) {
+        invalidateNativeMemoryStatus(dependencies, descriptor.id, descriptor.instanceGeneration, refreshEpoch);
+        return;
+      }
+      const current = dependencies.store.getBackend(descriptor.id).descriptor;
+      if (current.instanceGeneration !== observation.backendInstanceGeneration
+        || dependencies.nativeMemoryStatusEpochs.get(descriptor.id) !== refreshEpoch) return;
+      dependencies.nativeMemoryStatuses.set(descriptor.id, observation);
+    } catch {
+      invalidateNativeMemoryStatus(dependencies, descriptor.id, descriptor.instanceGeneration, refreshEpoch);
+      signal?.throwIfAborted();
+    }
+  }));
+}
+
+function invalidateNativeMemoryStatus(
+  dependencies: ConnectServiceDependencies,
+  backendId: string,
+  backendInstanceGeneration?: number,
+  refreshEpoch?: bigint
+): void {
+  if (refreshEpoch !== undefined
+    && dependencies.nativeMemoryStatusEpochs.get(backendId) !== refreshEpoch) return;
+  const current = dependencies.nativeMemoryStatuses.get(backendId);
+  if (current !== undefined
+    && (backendInstanceGeneration === undefined
+      || current.backendInstanceGeneration === backendInstanceGeneration)) {
+    dependencies.nativeMemoryStatuses.delete(backendId);
+  }
+}
+
+function beginNativeMemoryStatusRefresh(
+  dependencies: ConnectServiceDependencies,
+  backendId: string
+): bigint {
+  const next = (dependencies.nativeMemoryStatusEpochs.get(backendId) ?? 0n) + 1n;
+  dependencies.nativeMemoryStatusEpochs.set(backendId, next);
+  return next;
+}
+
 function backendMemoryDefaultEnabled(descriptor: BackendDescriptor): boolean {
   return descriptor.capabilities.get("memory.native")?.options
     ?.includes(MEMORY_NATIVE_DEFAULT_DISABLED_OPTION) !== true;
@@ -12380,22 +12484,31 @@ function settingsSnapshot(dependencies: ConnectServiceDependencies): contract.Se
       makerReason,
       customized: memoryState?.customized ?? false,
       entryCount: BigInt(memoryState?.entryCount ?? 0),
-      backends: memoryBackendRecords.map(({ item, role }) => create(contract.BackendMemorySettingsSchema, {
-        backendId: item.descriptor.id,
-        enabled: memoryState?.backendEnabled[item.descriptor.id] ?? false,
-        support: dependencies.makerMemory === undefined
-          ? contract.CapabilitySupport.TEMPORARILY_UNAVAILABLE
-          : contract.CapabilitySupport.SUPPORTED,
-        reason: dependencies.makerMemory === undefined
-          ? "Memory storage is unavailable on this Orchestrator node."
-          : "",
-        entryCount: BigInt(memoryState?.backendEntryCount[item.descriptor.id] ?? 0),
-        kind: role === "native_auto_memory"
-          ? contract.BackendMemoryKind.NATIVE_AUTO_MEMORY
-          : contract.BackendMemoryKind.COMPACTION_DIGEST,
-        resettable: role === "compaction_digest" || resetsLocalNativeMemory(item.descriptor),
-        updatesActiveLocalSessions: updatesActiveLocalMemorySessions(item.descriptor)
-      }))
+      backends: memoryBackendRecords.map(({ item, role }) => {
+        const nativeStatus = dependencies.nativeMemoryStatuses.get(item.descriptor.id);
+        const entryCount = role === "compaction_digest"
+          ? memoryState?.backendEntryCount[item.descriptor.id] ?? 0
+          : nativeStatus !== undefined
+              && nativeStatus.backendInstanceGeneration === item.descriptor.instanceGeneration
+            ? nativeStatus.status.entryCount
+            : undefined;
+        return create(contract.BackendMemorySettingsSchema, {
+          backendId: item.descriptor.id,
+          enabled: memoryState?.backendEnabled[item.descriptor.id] ?? false,
+          support: dependencies.makerMemory === undefined
+            ? contract.CapabilitySupport.TEMPORARILY_UNAVAILABLE
+            : contract.CapabilitySupport.SUPPORTED,
+          reason: dependencies.makerMemory === undefined
+            ? "Memory storage is unavailable on this Orchestrator node."
+            : "",
+          ...(entryCount === undefined ? {} : { entryCount: BigInt(entryCount) }),
+          kind: role === "native_auto_memory"
+            ? contract.BackendMemoryKind.NATIVE_AUTO_MEMORY
+            : contract.BackendMemoryKind.COMPACTION_DIGEST,
+          resettable: role === "compaction_digest" || resetsLocalNativeMemory(item.descriptor),
+          updatesActiveLocalSessions: updatesActiveLocalMemorySessions(item.descriptor)
+        });
+      })
     }),
     voiceInput: dependencies.voiceInputSettings?.snapshot(),
     revision: toProtoRevision(health.revision)
@@ -12426,6 +12539,7 @@ async function enrichSnapshot(
   const scopeCase = scope.kind.case;
   const owner = scopeCase === "owner";
   const toolScopeId = scopeCase === "tool" ? scope.kind.value.toolProviderId : undefined;
+  if (owner) await refreshNativeMemoryStatuses(dependencies, signal);
 
   const providerRecords = dependencies.providers?.list();
   const backendRecords = new Map(dependencies.store.listBackends().map((record) => [
@@ -17346,19 +17460,43 @@ async function dispatchMutation(
           body: mutation,
           precondition: assertCurrentOwner,
           effect: async () => {
-            resetResult = await host.invokeBackendAdapter(backendId, async (adapter) => {
-              if (adapter.resetNativeMemory === undefined) {
-                throw new JokoError({
-                  code: "NATIVE_MEMORY_RESET_OWNER_UNAVAILABLE",
-                  message: "The advertised native-memory reset owner is unavailable.",
-                  phase: "capability",
-                  retryable: false,
-                  stateMayHaveChanged: false,
-                  recovery: "Refresh Backend settings before explicitly issuing a new reset operation."
-                });
-              }
-              return validateNativeMemoryResetResult(await adapter.resetNativeMemory());
-            });
+            let resetGeneration: number | undefined;
+            const resetStatusEpoch = beginNativeMemoryStatusRefresh(dependencies, backendId);
+            try {
+              resetResult = await host.invokeBackendAdapter(backendId, async (adapter, backendInstanceGeneration) => {
+                resetGeneration = backendInstanceGeneration;
+                if (adapter.resetNativeMemory === undefined) {
+                  throw new JokoError({
+                    code: "NATIVE_MEMORY_RESET_OWNER_UNAVAILABLE",
+                    message: "The advertised native-memory reset owner is unavailable.",
+                    phase: "capability",
+                    retryable: false,
+                    stateMayHaveChanged: false,
+                    recovery: "Refresh Backend settings before explicitly issuing a new reset operation."
+                  });
+                }
+                const result = validateNativeMemoryResetResult(await adapter.resetNativeMemory());
+                if (adapter.readNativeMemoryStatus !== undefined) {
+                  try {
+                    const status = validateNativeMemoryStatus(await adapter.readNativeMemoryStatus());
+                    if (dependencies.nativeMemoryStatusEpochs.get(backendId) === resetStatusEpoch) {
+                      dependencies.nativeMemoryStatuses.set(backendId, { backendInstanceGeneration, status });
+                    }
+                  } catch {
+                    invalidateNativeMemoryStatus(
+                      dependencies,
+                      backendId,
+                      backendInstanceGeneration,
+                      resetStatusEpoch
+                    );
+                  }
+                }
+                return result;
+              });
+            } catch (error) {
+              invalidateNativeMemoryStatus(dependencies, backendId, resetGeneration, resetStatusEpoch);
+              throw error;
+            }
           },
           commit: () => {
             if (resetResult === undefined) {

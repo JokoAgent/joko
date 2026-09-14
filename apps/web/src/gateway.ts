@@ -14045,7 +14045,7 @@ function mapSettings(settings: SettingsSnapshot | undefined): SettingsView {
         enabled: backend.enabled,
         supported: backend.support === CapabilitySupport.SUPPORTED,
         reason: backend.reason,
-        entryCount: numberValue(backend.entryCount),
+        ...(backend.entryCount === undefined ? {} : { entryCount: numberValue(backend.entryCount) }),
         kind: backendMemoryKind(backend.kind),
         resettable: backend.resettable,
         updatesActiveLocalSessions: backend.updatesActiveLocalSessions

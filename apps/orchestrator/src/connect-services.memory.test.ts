@@ -232,6 +232,83 @@ describe("Connect Maker Memory owner and reset scopes", () => {
     expect(result.value.removedTargets).toBeUndefined();
   });
 
+  it("projects only trustworthy current-generation native-memory status and preserves explicit zero", async () => {
+    let descriptor = {
+      id: "claude-memory",
+      instanceGeneration: 1,
+      capabilities: new Map([["memory.native", {
+        key: "memory.native",
+        supported: true,
+        options: [MEMORY_NATIVE_RESET_LOCAL_OPTION]
+      }]])
+    };
+    let statusMode: "four" | "zero" | "failure" | "stale" = "four";
+    const readNativeMemoryStatus = vi.fn(async () => {
+      if (statusMode === "failure") throw new Error("private profile failure");
+      if (statusMode === "stale") descriptor = { ...descriptor, instanceGeneration: 2 };
+      return { entryCount: statusMode === "four" ? 4 : 0, sizeBytes: statusMode === "four" ? 40 : 0 };
+    });
+    const resetNativeMemory = vi.fn(async () => {
+      statusMode = "zero";
+      return { removedEntries: 4, removedTargets: 2 };
+    });
+    const adapter = { id: descriptor.id, readNativeMemoryStatus, resetNativeMemory } as unknown as BackendAdapter;
+    const store = {
+      findOperation: () => undefined,
+      findSetting: () => undefined,
+      getBackend: () => ({ descriptor }),
+      listBackends: () => [{ descriptor, revision: 1n, updatedAt: 1 }],
+      listConnections: () => [],
+      listTargets: () => [],
+      health: () => ({ revision: 1n }),
+      messageEmbeddingStatus: () => ({
+        vectorAvailable: false,
+        modelId: "",
+        pendingCount: 0,
+        runningCount: 0,
+        doneCount: 0,
+        failedCount: 0
+      })
+    };
+    const services = createConnectServices(stubApplication({
+      store,
+      adapters: [adapter],
+      makerMemory: { snapshot: () => ({
+        makerEnabled: false,
+        customized: false,
+        entryCount: 0,
+        backendEnabled: { [descriptor.id]: true },
+        backendEntryCount: { [descriptor.id]: 0 }
+      }) },
+      sessionHost: immediateHost(store, adapter)
+    }));
+    const getSettings = services.settings.getSettings as unknown as (
+      request: unknown,
+      context: unknown
+    ) => Promise<{ settings?: contract.SettingsSnapshot }>;
+
+    expect((await getSettings({}, context())).settings?.memory?.backends[0]?.entryCount).toBe(4n);
+    const reset = await submitReset<contract.SubmitOperationResponse>(services.operation.submitOperation, {
+      operationId: "memory-reset-claude-native",
+      connectionId: owner.id,
+      scope: contract.MemoryResetScope.BACKEND,
+      backendId: descriptor.id
+    });
+    expect(reset.operation?.result?.payload).toMatchObject({
+      case: "memoryReset",
+      value: { removedEntries: 4n, removedTargets: 2n }
+    });
+    expect(resetNativeMemory).toHaveBeenCalledOnce();
+    expect(readNativeMemoryStatus).toHaveBeenCalledTimes(2);
+    statusMode = "failure";
+    expect((await getSettings({}, context())).settings?.memory?.backends[0]?.entryCount).toBeUndefined();
+    statusMode = "zero";
+    expect((await getSettings({}, context())).settings?.memory?.backends[0]?.entryCount).toBe(0n);
+    statusMode = "stale";
+    expect((await getSettings({}, context())).settings?.memory?.backends[0]?.entryCount).toBeUndefined();
+    expect(readNativeMemoryStatus).toHaveBeenCalledTimes(5);
+  });
+
   it("does not invoke a native reset owner unless the capability option and method agree", async () => {
     const descriptor = {
       id: "native-without-reset-owner",

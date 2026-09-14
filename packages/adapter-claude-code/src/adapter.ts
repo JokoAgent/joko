@@ -12,6 +12,7 @@ import {
   CapabilityDrivenBackendAdapter,
   HOST_COMPOSED_CAPABILITIES,
   JokoError,
+  MEMORY_NATIVE_RESET_LOCAL_OPTION,
   type AdapterContext,
   type AdapterEventMetadata,
   type ApprovedDirectory,
@@ -30,6 +31,8 @@ import {
   type ProviderRuntimeSupport,
   type NativeHistoryProjectedEvent,
   type NativeHistoryProjection,
+  type NativeMemoryResetResult,
+  type NativeMemoryStatus,
   type NativeSessionBinding,
   type NativeSessionDerivation,
   type NativeSessionForkResult,
@@ -102,6 +105,11 @@ import {
   isNativeTaskSystemSubtype,
   type NativeTaskEmission
 } from "./native-task-projection.js";
+import {
+  ClaudeNativeMemoryFilesystemError,
+  resetClaudeNativeMemory,
+  scanClaudeNativeMemory
+} from "./native-memory.js";
 
 const ADAPTER_ID = "claude-code";
 const PROVIDER_ID = "claude-code";
@@ -487,6 +495,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
   readonly #resolveTextResources: ClaudeTextResourceResolver | undefined;
   readonly #resolveSubagentModel: ClaudeCodeAdapterOptions["resolveSubagentModel"];
   readonly #resolveNativeMemoryEnabled: ClaudeCodeAdapterOptions["resolveNativeMemoryEnabled"];
+  readonly #nativeMemoryConfigDirectory: string;
   readonly #projection: SafeProjection;
   readonly #now: () => number;
   readonly #oauthAccount: ClaudeCodeOAuthAccount | undefined;
@@ -500,6 +509,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
   #externalAccountDetected = false;
   #ownsCredential = false;
   #disposed = false;
+  #nativeMemoryOperationTail: Promise<void> = Promise.resolve();
 
   constructor(options: ClaudeCodeAdapterOptions) {
     super();
@@ -528,7 +538,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     const environmentHome = childEnvironment.environment[process.platform === "win32" ? "USERPROFILE" : "HOME"] ?? homedir();
     const configDirectory = childEnvironment.environment["CLAUDE_CONFIG_DIR"] ?? join(environmentHome, ".claude");
     if (!isAbsolute(configDirectory)) throw new TypeError("The native Session configuration directory must be absolute.");
-    this.#environment = Object.freeze({ ...childEnvironment.environment, CLAUDE_CONFIG_DIR: resolve(configDirectory).normalize("NFC") });
+    const nativeMemoryConfigDirectory = resolve(configDirectory).normalize("NFC");
+    this.#environment = Object.freeze({ ...childEnvironment.environment, CLAUDE_CONFIG_DIR: nativeMemoryConfigDirectory });
+    this.#nativeMemoryConfigDirectory = nativeMemoryConfigDirectory;
     this.#pathToExecutable = options.pathToClaudeCodeExecutable;
     if (options.probeCwd !== undefined && !isAbsolute(options.probeCwd)) {
       throw new TypeError("probeCwd must be an absolute path.");
@@ -1952,6 +1964,33 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     throwCombinedFailures(failures, "Claude Code Adapter resources could not all retire.");
   }
 
+  async readNativeMemoryStatus(signal?: AbortSignal): Promise<NativeMemoryStatus> {
+    if (this.#resolveNativeMemoryEnabled === undefined) return this.unsupported("memory.native");
+    return this.#withNativeMemoryOperation(async () => {
+      this.#assertUsable();
+      try {
+        const status = await scanClaudeNativeMemory(this.#nativeMemoryConfigDirectory, signal);
+        this.#assertUsable();
+        return { entryCount: status.entryCount, sizeBytes: status.sizeBytes };
+      } catch (error) {
+        throw nativeMemoryFilesystemError(error, "status");
+      }
+    });
+  }
+
+  async resetNativeMemory(): Promise<NativeMemoryResetResult> {
+    if (this.#resolveNativeMemoryEnabled === undefined) return this.unsupported("memory.native");
+    return this.#withNativeMemoryOperation(async () => {
+      this.#assertUsable();
+      try {
+        const result = await resetClaudeNativeMemory(this.#nativeMemoryConfigDirectory);
+        return result;
+      } catch (error) {
+        throw nativeMemoryFilesystemError(error, "reset");
+      }
+    });
+  }
+
   async quiesceForReplacement(): Promise<void> {
     await this.#oauthAccount?.quiesceForReplacement();
   }
@@ -1972,6 +2011,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     try { await this.#closeSdkRuntimes(); }
     catch (error) { failures.push(error); }
     throwCombinedFailures(failures, "Claude Code Adapter resources could not all retire.");
+  }
+
+  #withNativeMemoryOperation<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.#nativeMemoryOperationTail.then(operation, operation);
+    this.#nativeMemoryOperationTail = result.then(() => undefined, () => undefined);
+    return result;
   }
 
   async #startRuntime(
@@ -4268,6 +4313,8 @@ function capabilityManifest(
             ]
           : key === "runtime.resources" && textResourcesSupported
             ? ["skill", "prompt"]
+          : key === "memory.native" && available && nativeMemoryConfigured
+            ? [MEMORY_NATIVE_RESET_LOCAL_OPTION]
         : undefined;
     return [key, {
       key,
@@ -4387,6 +4434,32 @@ function invalidForkBoundary(): JokoError {
     stateMayHaveChanged: false,
     recovery: "Refresh native history and select a persisted user or assistant message."
   });
+}
+
+function nativeMemoryFilesystemError(error: unknown, operation: "status" | "reset"): JokoError {
+  if (error instanceof JokoError) return error;
+  const filesystem = error instanceof ClaudeNativeMemoryFilesystemError ? error : undefined;
+  const unsafe = filesystem?.failure === "unsafe_path" || filesystem?.failure === "changed";
+  return claudeCodeError(
+    unsafe ? "CLAUDE_NATIVE_MEMORY_PATH_UNSAFE" : operation === "status"
+      ? "CLAUDE_NATIVE_MEMORY_STATUS_FAILED"
+      : "CLAUDE_NATIVE_MEMORY_RESET_FAILED",
+    unsafe
+      ? "Claude native memory storage could not be proven to belong to the local profile."
+      : operation === "status"
+        ? "Claude native memory status could not be read."
+        : "Claude native memory could not be reset completely.",
+    operation === "status" ? "memory_status" : "memory_reset",
+    {
+      retryable: !unsafe && filesystem?.stateMayHaveChanged !== true,
+      stateMayHaveChanged: filesystem?.stateMayHaveChanged ?? false,
+      recovery: filesystem?.stateMayHaveChanged === true
+        ? "Inspect local native memory state before explicitly issuing another reset."
+        : unsafe
+          ? "Remove filesystem aliases from the local native profile before retrying."
+          : "Verify access to the local native profile and retry."
+    }
+  );
 }
 
 function containsManagedResourceExpansion(content: unknown): boolean {
