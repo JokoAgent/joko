@@ -261,6 +261,10 @@ describe("Orchestrator application composition", () => {
       instanceGeneration: 1,
       installationState: "installed"
     });
+    expect(application.store.getBackend("claude-code").descriptor.providerRuntimeSupport).toMatchObject({
+      protocols: ["anthropic-messages"],
+      fields: expect.arrayContaining(["model_limits"])
+    });
     const claudeCapabilities = application.store.getBackend("claude-code").descriptor.capabilities;
     expect(claudeCapabilities.get("workspace.extra_dirs")?.supported).toBe(true);
     expect(claudeCapabilities.get("runtime.resources")).toMatchObject({

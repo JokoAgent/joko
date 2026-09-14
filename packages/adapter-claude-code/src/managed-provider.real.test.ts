@@ -2,9 +2,11 @@ import { mkdtemp, readFile, readdir, mkdir, rm, writeFile } from "node:fs/promis
 import { createServer, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { query, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { AdapterContext, EventPayload, ManagedProviderRuntimePort, ManagedProviderRouteBinding, ProviderModel, TargetDescriptor } from "@joko/core";
+import { createChildRuntimeEnvironment } from "@joko/runtime-governance";
 import { expect, test, vi } from "vitest";
-import { ClaudeCodeAdapter } from "./adapter.js";
+import { ClaudeCodeAdapter, managedModelLimitEnvironment } from "./adapter.js";
 
 const enabled = process.env["JOKO_CLAUDE_LOCAL_GATEWAY_PROBE"] === "1";
 
@@ -23,6 +25,10 @@ test.skipIf(!enabled)("uses the fixed SDK against a local gateway, preserves saf
       ANTHROPIC_API_KEY: hostileToken,
       ANTHROPIC_BASE_URL: "http://127.0.0.1:9/hostile",
       CLAUDE_CODE_USE_BEDROCK: "1",
+      CLAUDE_CODE_MAX_CONTEXT_TOKENS: "999999",
+      CLAUDE_CODE_AUTO_COMPACT_WINDOW: "999999",
+      CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: "1",
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: "123",
       JOKO_NATIVE_SETTINGS_ORDER: "user"
     }
   }));
@@ -36,7 +42,8 @@ test.skipIf(!enabled)("uses the fixed SDK against a local gateway, preserves saf
   const model: ProviderModel = { providerId: "local-gateway", modelId: "joko-local-model", displayName: "Local model",
     api: "anthropic-messages", contextWindow: 64_000, maxOutputTokens: 4_000, supportsImages: false, thinkingLevels: ["high"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
-  const requests: { path: string; model: unknown; authenticated: boolean; messages: unknown; outputConfig: unknown; hasBashTool: boolean }[] = [];
+  const requests: { path: string; model: unknown; authenticated: boolean; messages: unknown; outputConfig: unknown;
+    maxTokens: unknown; hasBashTool: boolean }[] = [];
   const failures: string[] = [];
   const deniedPaths: string[] = [];
   let currentOperation: Parameters<ManagedProviderRouteBinding["activate"]>[0] | undefined;
@@ -59,10 +66,11 @@ test.skipIf(!enabled)("uses the fixed SDK against a local gateway, preserves saf
         if (bytes > 2_000_000) throw new Error("Local fixture body exceeded its bound.");
         chunks.push(Buffer.from(chunk));
       }
-      const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { model?: unknown; messages?: unknown; output_config?: unknown; tools?: { name?: string }[] };
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { model?: unknown; messages?: unknown;
+        output_config?: unknown; max_tokens?: unknown; tools?: { name?: string }[] };
       const authenticated = request.headers["x-api-key"] === token;
       requests.push({ path: request.url ?? "", model: body.model, authenticated, messages: body.messages, outputConfig: body.output_config,
-        hasBashTool: body.tools?.some((tool) => tool.name === "Bash") === true });
+        maxTokens: body.max_tokens, hasBashTool: body.tools?.some((tool) => tool.name === "Bash") === true });
       if (!authenticated || body.model !== model.modelId) throw new Error("Unexpected local route identity.");
       if (request.url?.split("?")[0] === "/v1/messages/count_tokens") {
         response.writeHead(200, { "content-type": "application/json" });
@@ -83,7 +91,7 @@ test.skipIf(!enabled)("uses the fixed SDK against a local gateway, preserves saf
   if (address === null || typeof address === "string") throw new Error("The local gateway did not bind.");
   const baseUrl = `http://127.0.0.1:${address.port}`;
   const port: ManagedProviderRuntimePort = {
-    support: { protocols: ["anthropic-messages"], fields: ["headers"] },
+    support: { protocols: ["anthropic-messages"], fields: ["headers", "model_limits"] },
     environment: { JOKO_MODEL_PROXY_TOKEN: token }, secretEnvironmentNames: ["JOKO_MODEL_PROXY_TOKEN"],
     dispose: () => { disposed = true; },
     hasProvider: (providerId) => providerId === model.providerId,
@@ -131,6 +139,10 @@ test.skipIf(!enabled)("uses the fixed SDK against a local gateway, preserves saf
     expect(turnRequests.length).toBeGreaterThanOrEqual(2);
     expect(turnRequests.every((request) => (request.outputConfig as { effort?: unknown } | undefined)?.effort === "xhigh"),
       JSON.stringify(turnRequests.map((request) => ({ path: request.path, outputConfig: request.outputConfig })))).toBe(true);
+    expect(turnRequests.every((request) => request.maxTokens === model.maxOutputTokens),
+      JSON.stringify(turnRequests.map((request) => ({ path: request.path, maxTokens: request.maxTokens })))).toBe(true);
+    expect(events.filter((event): event is Extract<EventPayload, { type: "usage" }> => event.type === "usage").at(-1)?.usage.contextWindow)
+      .toBe(model.contextWindow);
     expect(released).toBe(true);
     expect(() => currentOperation!.assertCurrent()).toThrow();
     expect(JSON.stringify(events)).not.toContain(token);
@@ -141,7 +153,71 @@ test.skipIf(!enabled)("uses the fixed SDK against a local gateway, preserves saf
     await adapter.dispose();
     server.closeAllConnections();
     await new Promise<void>((resolvePromise) => server.close(() => resolvePromise()));
-    await rm(directory, { recursive: true, force: true });
+    await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+}, 75_000);
+
+test.skipIf(!enabled)("applies managed context windows to the fixed SDK native working-window control", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "joko-claude-context-policy-"));
+  const server = createServer((request, response) => {
+    request.resume();
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ input_tokens: 100 }));
+  });
+  await new Promise<void>((resolvePromise) => server.listen(0, "127.0.0.1", resolvePromise));
+  const address = server.address();
+  if (address === null || typeof address === "string") throw new Error("The context fixture did not bind.");
+  try {
+    for (const contextWindow of [64_000, 128_000]) {
+      const model: ProviderModel = {
+        providerId: "local-gateway", modelId: "joko-context-model", displayName: "Context model",
+        api: "anthropic-messages", contextWindow, maxOutputTokens: 4_000, supportsImages: false, thinkingLevels: [],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+      };
+      const limits = managedModelLimitEnvironment(model);
+      let releasePrompt!: () => void;
+      const pendingPrompt = new Promise<void>((resolvePromise) => { releasePrompt = resolvePromise; });
+      async function* prompt(): AsyncGenerator<SDKUserMessage> { await pendingPrompt; }
+      const environment = createChildRuntimeEnvironment({
+        overrides: {
+          HOME: directory,
+          USERPROFILE: directory,
+          CLAUDE_CONFIG_DIR: directory,
+          ANTHROPIC_BASE_URL: `http://127.0.0.1:${address.port}`,
+          ANTHROPIC_API_KEY: "fake-context-test-key",
+          CLAUDE_CODE_OAUTH_TOKEN: undefined,
+          ...limits
+        }
+      }).environment;
+      const nativeQuery = query({
+        prompt: prompt(),
+        options: {
+          cwd: directory,
+          model: model.modelId,
+          tools: [],
+          mcpServers: {},
+          settingSources: [],
+          systemPrompt: "Context control test.",
+          env: environment,
+          settings: { env: { ...limits } }
+        }
+      });
+      try {
+        const usage = await nativeQuery.getContextUsage({ detail: "summary" });
+        // Provider-routed model ids have no built-in capacity, so the fixed
+        // CLI reports the host-declared working window directly.
+        expect(usage.rawMaxTokens).toBe(contextWindow);
+        expect(usage.maxTokens).toBe(contextWindow);
+        expect(usage.isAutoCompactEnabled).toBe(true);
+      } finally {
+        nativeQuery.close();
+        releasePrompt();
+      }
+    }
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolvePromise) => server.close(() => resolvePromise()));
+    await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 }, 75_000);
 

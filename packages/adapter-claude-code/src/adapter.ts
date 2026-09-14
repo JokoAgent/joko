@@ -109,6 +109,8 @@ const OPAQUE_REFERENCE_PREFIX = "claude-code:session:";
 const DEFAULT_INITIALIZATION_TIMEOUT_MS = 20_000;
 const DEFAULT_ADMISSION_TIMEOUT_MS = 20_000;
 const DEFAULT_TEARDOWN_TIMEOUT_MS = 5_000;
+const DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT = 90;
+const NATIVE_AUTO_COMPACT_WINDOW_MINIMUM = 100_000;
 const DEFAULT_INTERRUPT_TIMEOUT_MS = 5_000;
 const DEFAULT_NATIVE_CONTINUATION_GRACE_MS = 60_000;
 const DEFAULT_MAXIMUM_DISCOVERED_SESSIONS = 200;
@@ -2024,6 +2026,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
           || managedRoute.model.api !== "anthropic-messages") throw managedRouteUnavailable();
         managedRoute.assertCurrent();
         validateManagedThinkingMap(managedRoute.thinkingLevelMap);
+        managedModelLimitEnvironment(managedRoute.model);
         if (launch.effort !== undefined) managedNativeEffort(managedRoute.model, managedRoute.thinkingLevelMap, launch.effort);
       } catch (error) {
         managedRoute?.dispose();
@@ -2236,6 +2239,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         throw new Error("The subscription authorization changed before native startup.");
       }
       scoped.assertCurrent();
+      const managedLimitEnvironment = managedRoute === undefined
+        ? undefined
+        : managedModelLimitEnvironment(managedRoute.model);
       const query = await scoped.runtime.query({
         prompt: gate,
         options: {
@@ -2248,7 +2254,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
           env: {
             ...this.#environment,
             ...runtimeAuthorization?.environment,
-            ...(managedRoute === undefined ? {} : managedQueryEnvironment(managedRoute, this.#managedProviders!, this.#environment)),
+            ...(managedRoute === undefined ? {} : managedQueryEnvironment(
+              managedRoute,
+              this.#managedProviders!,
+              this.#environment,
+              managedLimitEnvironment!
+            )),
             CLAUDE_CODE_SUBAGENT_MODEL: subagentModel,
             CLAUDE_CODE_SUBAGENT_MODEL_FORCE: undefined
           },
@@ -2286,6 +2297,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
                   // The fixed CLI additionally filters provider-related `env`
                   // keys when CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST is set.
                   apiKeyHelper: "",
+                  ...(managedLimitEnvironment === undefined || Object.keys(managedLimitEnvironment).length === 0
+                    ? {}
+                    : { env: { ...managedLimitEnvironment } }),
                   ...(launch.fastMode === undefined ? {} : { fastMode: launch.fastMode })
                 }
               }),
@@ -2643,8 +2657,14 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     if (queuedCount !== undefined && (!Number.isSafeInteger(queuedCount) || (queuedCount as number) !== 0)) {
       throw steerOutcomeUnknown();
     }
+    const appliedContextWindow = runtime.managedRoute === undefined
+      ? undefined
+      : managedModelLimit(runtime.managedRoute.model.contextWindow, "context window");
+    const usage = appliedContextWindow === undefined
+      ? result.usage
+      : { ...result.usage, contextWindow: appliedContextWindow };
     runtime.lastTotalCostUsd = result.totalCostUsd;
-    runtime.lastUsage = result.usage;
+    runtime.lastUsage = usage;
     const hasText = turn.blocks.some((block) => block.kind === "text");
     if (!hasText && result.fallbackText !== undefined && result.fallbackText.length > 0) {
       appendTurnBlocks(turn, [{ kind: "text", text: result.fallbackText }]);
@@ -2663,7 +2683,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       });
       if (!this.#isTurnCurrent(runtime, turn) || turn.terminalClaimed) return;
     }
-    await this.#emit(runtime, turn, { type: "usage", usage: result.usage });
+    await this.#emit(runtime, turn, { type: "usage", usage });
     if (!this.#isTurnCurrent(runtime, turn) || turn.terminalClaimed) return;
     if (result.error !== undefined) {
       if (result.error.code === "CLAUDE_CODE_AUTHENTICATION_FAILED") {
@@ -4820,7 +4840,7 @@ export const CLAUDE_MANAGED_PROVIDER_SUPPORT: ProviderRuntimeSupport = Object.fr
   protocols: Object.freeze(["anthropic-messages"] as const),
   fields: Object.freeze([
     "request_path", "models_endpoint", "headers", "keyless", "auth_header",
-    "model_costs", "model_input_modalities", "model_thinking_levels"
+    "model_limits", "model_costs", "model_input_modalities", "model_thinking_levels"
   ] as const)
 });
 
@@ -4857,7 +4877,42 @@ function managedNativeEffort(model: ProviderModel, mapping: Readonly<Record<stri
 
 function managedProviderModel(model: ProviderModel, mapping: Readonly<Record<string, string | null>>): ProviderModel {
   validateManagedThinkingMap(mapping);
+  managedModelLimitEnvironment(model);
   return { ...model, supportsFastMode: false, thinkingLevels: model.thinkingLevels.filter((level) => mapping[level] !== null && normalizeEffort(mapping[level] ?? level) !== undefined) };
+}
+
+export function managedModelLimitEnvironment(model: ProviderModel): Readonly<Record<string, string>> {
+  const contextWindow = managedModelLimit(model.contextWindow, "context window");
+  const maxOutputTokens = managedModelLimit(model.maxOutputTokens, "maximum output");
+  const environment: Record<string, string> = {};
+  if (contextWindow !== undefined) {
+    environment["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = String(contextWindow);
+    // Claude 2.1.259 resolves known model capacity before MAX_CONTEXT_TOKENS.
+    // AUTO_COMPACT_WINDOW is the native working-window control. Its 100K floor
+    // is compensated with the native percentage override for smaller budgets.
+    environment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = String(contextWindow);
+    environment["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = String(
+      DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT
+        * Math.min(1, contextWindow / NATIVE_AUTO_COMPACT_WINDOW_MINIMUM)
+    );
+  }
+  if (maxOutputTokens !== undefined) {
+    environment["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = String(maxOutputTokens);
+  }
+  return Object.freeze(environment);
+}
+
+function managedModelLimit(value: number, label: string): number | undefined {
+  if (value === 0) return undefined;
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw claudeCodeError(
+      "MANAGED_PROVIDER_MODEL_LIMIT_INVALID",
+      `The configured model ${label} limit is invalid.`,
+      "model",
+      { recovery: "Set a positive whole-token limit or clear the optional model limit." }
+    );
+  }
+  return value;
 }
 
 function managedRouteUnavailable(stateMayHaveChanged = false): JokoError {
@@ -4868,7 +4923,8 @@ function managedRouteUnavailable(stateMayHaveChanged = false): JokoError {
 }
 
 function managedQueryEnvironment(route: ManagedProviderRouteBinding, port: ManagedProviderRuntimePort,
-  environment: Readonly<Record<string, string>>): Readonly<Record<string, string | undefined>> {
+  environment: Readonly<Record<string, string>>,
+  modelLimits: Readonly<Record<string, string>>): Readonly<Record<string, string | undefined>> {
   const token = port.environment[route.apiKeyEnvironment];
   const endpoint = new URL(route.baseUrl);
   if (route.protocol !== "anthropic-messages" || token === undefined || token.length === 0
@@ -4878,6 +4934,7 @@ function managedQueryEnvironment(route: ManagedProviderRouteBinding, port: Manag
   return {
     ...managedAuthEnvironmentOverrides(),
     ...Object.fromEntries(port.secretEnvironmentNames.map((key) => [key, undefined])),
+    ...modelLimits,
     CLAUDE_CONFIG_DIR: environment["CLAUDE_CONFIG_DIR"],
     CLAUDE_CODE_GIT_BASH_PATH: environment["CLAUDE_CODE_GIT_BASH_PATH"],
     CLAUDE_CODE_SHELL: environment["CLAUDE_CODE_SHELL"],

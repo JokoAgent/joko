@@ -93,7 +93,7 @@ describe("ClaudeCodeAdapter", () => {
     const descriptor = await adapter.describe();
     expect(descriptor.models.find((model) => model.providerId === "configured-provider")).toMatchObject({ modelId: "configured-model", supportsImages: true,
       supportsFastMode: false, thinkingLevels: ["low", "high"] });
-    expect(descriptor.providerRuntimeSupport).toEqual({ protocols: ["anthropic-messages"], fields: ["headers", "model_input_modalities"] });
+    expect(descriptor.providerRuntimeSupport).toEqual({ protocols: ["anthropic-messages"], fields: ["headers", "model_input_modalities", "model_limits"] });
     const binding = await adapter.createSession(createInput({ providerId: "configured-provider", modelId: "configured-model" }), contextFor().context);
     const options = runtime.queries[0]!.params.options;
     expect(options.env["ANTHROPIC_API_KEY"]).toBe(managed.token);
@@ -101,8 +101,21 @@ describe("ClaudeCodeAdapter", () => {
     expect(options.env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"]).toBe("1");
     expect(options.env["CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"]).toBe("1");
     expect(options.env["ANTHROPIC_BASE_URL"]).toBe("http://127.0.0.1:31415/routes/fixture");
+    expect(options.env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"]).toBe("64000");
+    expect(options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]).toBe("64000");
+    expect(options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"]).toBe("57.6");
+    expect(options.env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"]).toBe("4000");
     expect(options.settingSources).toEqual(["user", "project", "local"]);
-    expect(options.settings).toMatchObject({ apiKeyHelper: "", fastMode: false });
+    expect(options.settings).toMatchObject({
+      apiKeyHelper: "",
+      env: {
+        CLAUDE_CODE_MAX_CONTEXT_TOKENS: "64000",
+        CLAUDE_CODE_AUTO_COMPACT_WINDOW: "64000",
+        CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: "57.6",
+        CLAUDE_CODE_MAX_OUTPUT_TOKENS: "4000"
+      },
+      fastMode: false
+    });
     expect(JSON.stringify(options.settings)).not.toContain(managed.token);
     expect(managed.activations).toHaveLength(0);
     const source = contextFor(binding, { operationId: "managed-first-turn" });
@@ -113,12 +126,63 @@ describe("ClaudeCodeAdapter", () => {
     expect(() => managed.activations[0]!.input.assertCurrent()).not.toThrow();
     runtime.queries[0]!.push(resultMessage(binding.nativeSessionId!, { result: `Output ${managed.token}`, totalCostUsd: 0 }));
     await eventually(() => source.events.some((event) => event.type === "done"));
+    expect(source.events.filter((event): event is Extract<EventPayload, { type: "usage" }> => event.type === "usage").at(-1)?.usage.contextWindow)
+      .toBe(64_000);
     expect(managed.activations[0]!.release).toHaveBeenCalledOnce();
     expect(() => managed.activations[0]!.input.assertCurrent()).toThrow();
     expect(JSON.stringify(source.events)).not.toContain(managed.token);
     expect(JSON.stringify(descriptor)).not.toContain(managed.token);
     await adapter.dispose();
     expect(managed.port.dispose).toHaveBeenCalledOnce();
+  });
+
+  test("passes the same managed model limit snapshot to an exact remote Query", async () => {
+    const managed = managedProviderFixture();
+    const remoteTarget: TargetDescriptor = {
+      ...target,
+      id: "target-remote-managed-limits",
+      workspaceRoot: "D:\\service-owned-placeholder",
+      remoteWorkspace: { hostId: "host-a", workspaceRoot: "/srv/project" }
+    };
+    const remoteRuntime = new FakeSdkRuntime({ initialFrameOverrides: { cwd: "/srv/project", model: "configured-model" } });
+    const close = vi.fn(async () => undefined);
+    const adapter = adapterFor(new FakeSdkRuntime(), {
+      managedProviders: managed.port,
+      remoteRuntimes: {
+        resolve: async () => ({
+          runtime: remoteRuntime,
+          workspaceRoot: "/srv/project",
+          remote: true,
+          assertCurrent: () => undefined
+        }),
+        close
+      }
+    });
+    const binding = await adapter.createSession(
+      createInput({ target: remoteTarget, providerId: "configured-provider", modelId: "configured-model" }),
+      contextFor(undefined, { target: remoteTarget }).context
+    );
+    expect(remoteRuntime.queries).toHaveLength(1);
+    expect(remoteRuntime.queries[0]!.params.options).toMatchObject({
+      cwd: "/srv/project",
+      env: {
+        CLAUDE_CODE_MAX_CONTEXT_TOKENS: "64000",
+        CLAUDE_CODE_AUTO_COMPACT_WINDOW: "64000",
+        CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: "57.6",
+        CLAUDE_CODE_MAX_OUTPUT_TOKENS: "4000"
+      },
+      settings: {
+        env: {
+          CLAUDE_CODE_MAX_CONTEXT_TOKENS: "64000",
+          CLAUDE_CODE_AUTO_COMPACT_WINDOW: "64000",
+          CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: "57.6",
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: "4000"
+        }
+      }
+    });
+    await adapter.closeSession(binding, contextFor(binding, { target: remoteTarget }).context);
+    await adapter.dispose();
+    expect(close).toHaveBeenCalledOnce();
   });
 
   test("revokes the managed HTTP lease as Stop starts while native cancellation confirmation is still pending", async () => {
@@ -152,10 +216,18 @@ describe("ClaudeCodeAdapter", () => {
     const restored = await adapter.resumeSession(binding, context);
     expect(restored).toMatchObject({ providerId: "configured-provider", modelId: "configured-model", binding: { generation: 2 } });
     expect(runtime.queries[1]!.params.options).toMatchObject({ resume: binding.nativeSessionId, model: "configured-model" });
+    expect(runtime.queries[1]!.params.options.env).toMatchObject({
+      CLAUDE_CODE_MAX_CONTEXT_TOKENS: "64000",
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: "4000"
+    });
     const selected = await adapter.setModel("configured-provider", "second-model", { ...context, binding: restored.binding });
     expect(selected.modelId).toBe("second-model");
     expect(runtime.queries[1]!.closeCalls).toBe(1);
     expect(runtime.queries[2]!.params.options).toMatchObject({ resume: binding.nativeSessionId, model: "second-model" });
+    expect(runtime.queries[2]!.params.options.env).toMatchObject({
+      CLAUDE_CODE_MAX_CONTEXT_TOKENS: "128000",
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: "8000"
+    });
     expect(managed.activations).toEqual([]);
     await adapter.dispose();
   });
@@ -227,6 +299,30 @@ describe("ClaudeCodeAdapter", () => {
     await expect(adapter.createSession(createInput({ providerId: "configured-provider", modelId: "configured-model" }), contextFor().context))
       .rejects.toMatchObject({ publicError: { code: "MANAGED_PROVIDER_ROUTE_UNAVAILABLE", stateMayHaveChanged: false } });
     expect(dispose).toHaveBeenCalledOnce();
+    expect(runtime.queries).toEqual([]);
+    await adapter.dispose();
+  });
+
+  test("rejects invalid managed model limits before advertising the model or creating a Query", async () => {
+    const managed = managedProviderFixture();
+    const invalidModel = { ...managed.port.listModels()[0]!, contextWindow: -1 };
+    const port: ManagedProviderRuntimePort = {
+      ...managed.port,
+      listModels: () => [invalidModel],
+      prepare: async (owner) => {
+        const route = await managed.port.prepare(owner);
+        return { ...route, model: invalidModel };
+      }
+    };
+    const runtime = new FakeSdkRuntime();
+    const adapter = adapterFor(runtime, { managedProviders: port });
+    expect((await adapter.describe()).models.some((model) => model.providerId === "configured-provider")).toBe(false);
+    await expect(adapter.createSession(
+      createInput({ providerId: "configured-provider", modelId: "configured-model" }),
+      contextFor().context
+    )).rejects.toMatchObject({
+      publicError: { code: "MANAGED_PROVIDER_MODEL_LIMIT_INVALID", stateMayHaveChanged: false }
+    });
     expect(runtime.queries).toEqual([]);
     await adapter.dispose();
   });
@@ -3421,9 +3517,10 @@ interface FakeRuntimeOptions {
 
 function managedProviderFixture(thinkingLevelMap: Readonly<Record<string, string | null>> = {}) {
   const token = "private-model-proxy-fixture-token";
-  const models: ProviderModel[] = ["configured-model", "second-model"].map((modelId) => ({
+  const models: ProviderModel[] = ["configured-model", "second-model"].map((modelId, index) => ({
     providerId: "configured-provider", modelId, displayName: modelId, api: "anthropic-messages",
-    contextWindow: 64_000, maxOutputTokens: 4_000, supportsImages: true, supportsFastMode: true, thinkingLevels: ["low", "high", "unavailable"],
+    contextWindow: index === 0 ? 64_000 : 128_000, maxOutputTokens: index === 0 ? 4_000 : 8_000,
+    supportsImages: true, supportsFastMode: true, thinkingLevels: ["low", "high", "unavailable"],
     cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 }
   }));
   const activations: { input: Parameters<ManagedProviderRouteBinding["activate"]>[0]; release: ReturnType<typeof vi.fn> }[] = [];
