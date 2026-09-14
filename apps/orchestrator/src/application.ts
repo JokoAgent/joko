@@ -147,6 +147,7 @@ import { SkillManager } from "./skill-manager.js";
 import { SkillMarketManager } from "./skill-market-manager.js";
 import { SkillMarketSyncManager } from "./skill-market-sync-manager.js";
 import { SkillMutationCoordinator } from "./skill-mutation-coordinator.js";
+import { SkillPublicationManager } from "./skill-publication-manager.js";
 import { RemoteHostRegistry } from "./remote-host-registry.js";
 import {
   RemoteBackendRuntimeSetupManager,
@@ -322,6 +323,7 @@ export interface OrchestratorApplication {
   readonly skills?: SkillManager;
   readonly skillMarket?: SkillMarketManager;
   readonly skillMarketSync?: SkillMarketSyncManager;
+  readonly skillPublication?: SkillPublicationManager;
   readonly extensionCatalog?: ExtensionCatalogManager;
   readonly extensionLibraries?: ExtensionLibraryManager;
   readonly extensionMainViews?: ExtensionMainViewManager;
@@ -552,6 +554,13 @@ export async function createOrchestratorApplication(
     mutationCoordinator: skillMutations
   });
   await skillMarket.initialize();
+  const skillPublication = new SkillPublicationManager({
+    store,
+    resources: piResources,
+    market: skillMarket,
+    rootDirectory: join(config.dataDirectory, "skill-publications")
+  });
+  await skillPublication.initialize();
   let reconcileSkillMarketResourceRuntime: (resource: {
     readonly resourceId: string;
     readonly backendId: string;
@@ -1790,6 +1799,7 @@ export async function createOrchestratorApplication(
     commandConcurrencyGate.close();
     stopExtensionLibraryAuthorityNotifications();
     await skillMarketSync.close().catch(() => undefined);
+    await skillPublication.close().catch(() => undefined);
     await skills.close().catch(() => undefined);
     await skillMarket.close().catch(() => undefined);
     await extensionLibraries.close().catch(() => undefined);
@@ -1876,6 +1886,7 @@ export async function createOrchestratorApplication(
     skills,
     skillMarket,
     skillMarketSync,
+    skillPublication,
     extensionCatalog,
     extensionLibraries,
     extensionMainViews,
@@ -1930,6 +1941,7 @@ export async function createOrchestratorApplication(
         await attempt(() => commandConcurrencyGate.close());
         await attempt(() => stopExtensionLibraryAuthorityNotifications());
         await attempt(() => skillMarketSync.close());
+        await attempt(() => skillPublication.close());
         await attempt(() => skills.close());
         await attempt(() => skillMarket.close());
         await attempt(() => extensionLibraries.close());

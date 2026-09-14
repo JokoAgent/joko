@@ -286,6 +286,9 @@ service SkillService {
   rpc ListSkillMarketSyncPolicies(ListSkillMarketSyncPoliciesRequest) returns (ListSkillMarketSyncPoliciesResponse);
   rpc ListSkillMarketSyncJobs(ListSkillMarketSyncJobsRequest) returns (ListSkillMarketSyncJobsResponse);
   rpc GetSkillMarketSyncJob(GetSkillMarketSyncJobRequest) returns (GetSkillMarketSyncJobResponse);
+  rpc GetSkillPublicationPreview(GetSkillPublicationPreviewRequest) returns (GetSkillPublicationPreviewResponse);
+  rpc ListSkillPublicationJobs(ListSkillPublicationJobsRequest) returns (ListSkillPublicationJobsResponse);
+  rpc GetSkillPublicationJob(GetSkillPublicationJobRequest) returns (GetSkillPublicationJobResponse);
 }
 
 service SubagentService {
@@ -2335,6 +2338,38 @@ message GetSkillMarketSyncJobRequest {
 
 message GetSkillMarketSyncJobResponse {
   SkillMarketSyncJob job = 1;
+  bool recovered_from_corruption = 2;
+}
+
+message GetSkillPublicationPreviewRequest {
+  string resource_id = 1;
+  Revision expected_resource_revision = 2;
+  string source_id = 3;
+  Revision expected_source_revision = 4;
+  optional string slug = 5;
+}
+
+message GetSkillPublicationPreviewResponse {
+  SkillPublicationPreview preview = 1;
+}
+
+message ListSkillPublicationJobsRequest {
+  optional string resource_id = 1;
+  PageRequest page = 2;
+}
+
+message ListSkillPublicationJobsResponse {
+  repeated SkillPublicationJob jobs = 1;
+  bool recovered_from_corruption = 2;
+  PageInfo page = 3;
+}
+
+message GetSkillPublicationJobRequest {
+  string job_id = 1;
+}
+
+message GetSkillPublicationJobResponse {
+  SkillPublicationJob job = 1;
   bool recovered_from_corruption = 2;
 }
 

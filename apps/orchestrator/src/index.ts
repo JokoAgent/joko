@@ -41,6 +41,7 @@ export * from "./resource-manager.js";
 export * from "./skill-manager.js";
 export * from "./skill-market-manager.js";
 export * from "./skill-market-sync-manager.js";
+export * from "./skill-publication-manager.js";
 export * from "./skill-mutation-coordinator.js";
 export * from "./runtime-governance-settings.js";
 export * from "./remote-host-connect-service.js";

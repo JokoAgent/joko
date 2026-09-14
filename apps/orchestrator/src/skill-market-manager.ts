@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { constants, createReadStream, existsSync, lstatSync, readFileSync } from "node:fs";
-import { lstat, mkdir, open, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, open, readdir, realpath, rename, rm, rmdir, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -48,9 +48,10 @@ export interface SkillMarketEntryDescriptor {
   readonly name: string;
   readonly author?: string;
   readonly description: string;
-  readonly category: string;
+  readonly category?: string;
   readonly tags: readonly string[];
   readonly version: string;
+  readonly changelog?: string;
   readonly createdAt: number;
   readonly updatedAt: number;
   readonly downloads: number;
@@ -207,6 +208,62 @@ export interface SkillMarketManagerOptions {
   readonly installPlanTtlMs?: number;
 }
 
+export interface SkillMarketPublicationMetadata {
+  readonly slug: string;
+  readonly name: string;
+  readonly author?: string;
+  readonly description: string;
+  readonly category?: string;
+  readonly tags: readonly string[];
+  readonly version: string;
+  readonly changelog?: string;
+}
+
+export interface SkillMarketPublicationTarget {
+  readonly source: SkillMarketSourceDescriptor;
+  readonly existingEntry?: SkillMarketCatalogItem;
+}
+
+export interface SkillMarketPublicationIntent {
+  readonly beforeManifestSha256: string;
+  readonly nextManifestSha256: string;
+  readonly archiveRelativePath: string;
+  readonly archiveBytes: number;
+  readonly archiveSha256: string;
+}
+
+export interface SkillMarketPublicationResult {
+  readonly source: SkillMarketSourceDescriptor;
+  readonly entry: SkillMarketCatalogItem;
+}
+
+export interface CommitSkillMarketPublicationInput {
+  readonly jobId: string;
+  readonly sourceId: string;
+  readonly expectedSourceRevision: bigint;
+  readonly expectedSourceContentRevision: string;
+  readonly expectedExistingEntryId?: string;
+  readonly metadata: SkillMarketPublicationMetadata;
+  readonly archivePath: string;
+  readonly archiveBytes: number;
+  readonly archiveSha256: string;
+  readonly recoveredIntent?: SkillMarketPublicationIntent;
+}
+
+export interface RecoverSkillMarketPublicationInput {
+  readonly jobId: string;
+  readonly sourceId: string;
+  readonly expectedSourceContentRevision: string;
+  readonly metadata: SkillMarketPublicationMetadata;
+  readonly intent: SkillMarketPublicationIntent;
+}
+
+export interface SkillMarketPublicationCommitCallbacks<T> {
+  readonly beforeSwitch: (intent: SkillMarketPublicationIntent) => void | Promise<void>;
+  readonly afterFinalSwitch?: () => void;
+  readonly finalize: (store: OperationalStore, result: SkillMarketPublicationResult) => T;
+}
+
 export type SkillMarketInstallConfirmationReason =
   | "SOURCE_REPLACEMENT"
   | "LOCAL_OWNERSHIP"
@@ -257,6 +314,9 @@ export type SkillMarketErrorCode =
   | "PREVIEW_CHANGED"
   | "INSTALL_PLAN_NOT_FOUND"
   | "INSTALL_PLAN_CHANGED"
+  | "PUBLICATION_INVALID"
+  | "PUBLICATION_CHANGED"
+  | "PUBLICATION_UNAVAILABLE"
   | "MUTATION_BUSY";
 
 export class SkillMarketError extends Error {
@@ -366,6 +426,7 @@ const SOURCE_SETTING_KEY = "skill_market_sources";
 const MARKETPLACE_MANIFEST = join(".agents", "skills", "marketplace.json");
 const SOURCE_ID = /^skill_market_source_[a-f0-9]{32}$/u;
 const ENTRY_ID = /^skill_market_entry_[a-f0-9]{32}$/u;
+const PUBLICATION_JOB_ID = /^skill_publication_[a-f0-9]{32}$/u;
 const DECIMAL_REVISION = /^(?:0|[1-9][0-9]*)$/u;
 const CONTENT_REVISION = /^sha256:[a-f0-9]{64}$/u;
 const ARCHIVE_SHA256 = /^[a-f0-9]{64}$/u;
@@ -390,6 +451,7 @@ const MAXIMUM_PREVIEW_TEXT_BYTES = 2 * 1024 * 1024;
 const MAXIMUM_NAME_CHARACTERS = 128;
 const MAXIMUM_DESCRIPTION_CHARACTERS = 8_192;
 const MAXIMUM_CATEGORY_CHARACTERS = 64;
+const MAXIMUM_CHANGELOG_CHARACTERS = 280;
 const MAXIMUM_TAGS = 20;
 const MAXIMUM_TAG_CHARACTERS = 48;
 const MAXIMUM_QUERY_CHARACTERS = 256;
@@ -484,6 +546,7 @@ export class SkillMarketManager {
   readonly #installPlans = new Map<string, InstallPlanSession>();
   readonly #generationLeases = new Map<string, number>();
   readonly #deferredGenerationRemovals = new Map<string, { readonly path: string; readonly skip: () => boolean }>();
+  readonly #cleanupTasks = new Set<Promise<void>>();
   #catalogRevision = 0n;
   #initialized = false;
   #recoveredFromCorruption = false;
@@ -574,6 +637,53 @@ export class SkillMarketManager {
     return publicSource(this.#requireSource(sourceId));
   }
 
+  getPublicationTarget(sourceId: string, expectedRevision: bigint, slug?: string): SkillMarketPublicationTarget {
+    this.#assertInitialized();
+    const source = this.#requireSourceRevision(sourceId, expectedRevision);
+    if (source.source.kind !== "local") {
+      throw marketError("PUBLICATION_UNAVAILABLE", "Git Skill market sources are read-only until an authenticated commit owner is configured.");
+    }
+    if (source.state !== "ready") throw marketError("PUBLICATION_UNAVAILABLE", "This local Skill market source is not ready for publication.");
+    const normalizedSlug = slug === undefined || slug.trim() === "" ? undefined : publicationSlug(slug);
+    const existing = normalizedSlug === undefined ? undefined : source.entries.find((entry) => entry.slug === normalizedSlug);
+    return {
+      source: publicSource(source),
+      ...(existing === undefined ? {} : { existingEntry: publicCatalogItem(source, existing, this.#resources) })
+    };
+  }
+
+  /** Re-read an exact local publication destination for the machine authority gate. */
+  async verifyPublicationTarget(input: {
+    readonly sourceId: string;
+    readonly expectedRevision: bigint;
+    readonly expectedContentRevision: string;
+    readonly slug: string;
+    readonly expectedExistingEntryId?: string;
+    readonly signal?: AbortSignal;
+  }): Promise<void> {
+    return this.#mutate(async () => {
+      input.signal?.throwIfAborted();
+      const current = this.#requireSourceRevision(input.sourceId, input.expectedRevision);
+      if (current.source.kind !== "local" || current.state !== "ready"
+        || current.contentRevision !== input.expectedContentRevision) {
+        throw marketError("PUBLICATION_CHANGED", "The selected Skill market source changed after confirmation.");
+      }
+      const slug = publicationSlug(input.slug);
+      const existing = current.entries.find((entry) => entry.slug === slug);
+      if (existing?.id !== input.expectedExistingEntryId) {
+        throw marketError("PUBLICATION_CHANGED", "The selected Skill market entry changed after confirmation.");
+      }
+      const root = await canonicalDirectory(current.source.path, "Local Skill market source");
+      if (normalizedPath(root) !== normalizedPath(current.source.path)) {
+        throw marketError("PUBLICATION_CHANGED", "The local Skill market source changed identity.");
+      }
+      const discovered = await discoverSkillMarket(root, current.id, undefined, input.signal);
+      if (discovered.contentRevision !== current.contentRevision) {
+        throw marketError("PUBLICATION_CHANGED", "The local Skill market source changed after confirmation.");
+      }
+    });
+  }
+
   getEntry(identity: SkillMarketEntryIdentity): SkillMarketCatalogItem {
     this.#assertInitialized();
     const { source, entry } = this.#requireEntry(identity);
@@ -601,9 +711,10 @@ export class SkillMarketManager {
       throw marketError("SOURCE_INVALID", `Skill market page size must be between 1 and ${MAXIMUM_CATALOG_PAGE}.`);
     }
     const all = [...this.#records.values()].flatMap((source) => source.entries.map((entry) => publicCatalogItem(source, entry, this.#resources)));
-    const categories = [...new Set(all.map((entry) => entry.category))].sort((left, right) => left.localeCompare(right, "en"));
+    const categories = [...new Set(all.flatMap((entry) => entry.category === undefined ? [] : [entry.category]))]
+      .sort((left, right) => left.localeCompare(right, "en"));
     const filtered = all
-      .filter((entry) => category === undefined || entry.category.toLocaleLowerCase("en-US") === category)
+      .filter((entry) => category === undefined || entry.category?.toLocaleLowerCase("en-US") === category)
       .filter((entry) => query === undefined || marketSearchText(entry).includes(query))
       .sort(catalogComparator(input.sort));
     const items = filtered.slice(input.offset, input.offset + input.pageSize);
@@ -744,7 +855,10 @@ export class SkillMarketManager {
         }
         this.#replaceState(next, this.#catalogRevision + 1n);
         if (current.source.kind === "git" && oldGeneration !== undefined && oldGeneration !== acquired.generation) {
-          void this.#removeGenerationPath(join(this.#slot(current), "versions", oldGeneration), () => this.#isCurrentGeneration(current.id, oldGeneration));
+          this.#scheduleCleanup(this.#removeGenerationPath(
+            join(this.#slot(current), "versions", oldGeneration),
+            () => this.#isCurrentGeneration(current.id, oldGeneration)
+          ));
         }
         return publicSource(nextRecord);
       } catch (error) {
@@ -775,9 +889,150 @@ export class SkillMarketManager {
       this.#persist(next, this.#catalogRevision + 1n);
       this.#replaceState(next, this.#catalogRevision + 1n);
       if (current.source.kind === "git") {
-        void this.#removeGenerationPath(this.#slot(current), () => this.#records.has(current.id)
-          || [...this.#records.values()].some((record) => record.sourceIdentity === current.sourceIdentity));
+        this.#scheduleCleanup(this.#removeGenerationPath(this.#slot(current), () => this.#records.has(current.id)
+          || [...this.#records.values()].some((record) => record.sourceIdentity === current.sourceIdentity)));
       }
+    });
+  }
+
+  /**
+   * Publish one verified archive into an exact registered local source. The
+   * callback persists the publication job in the same Store transaction as
+   * the refreshed source catalog.
+   */
+  async commitLocalPublication<T>(
+    input: CommitSkillMarketPublicationInput,
+    callbacks: SkillMarketPublicationCommitCallbacks<T>,
+    signal?: AbortSignal
+  ): Promise<{ readonly result: SkillMarketPublicationResult; readonly value: T }> {
+    return this.#mutate(async () => {
+      this.#assertInitialized();
+      signal?.throwIfAborted();
+      const jobId = publicationJobId(input.jobId);
+      const current = this.#requireSourceRevision(input.sourceId, input.expectedSourceRevision);
+      if (current.source.kind !== "local") {
+        throw marketError("PUBLICATION_UNAVAILABLE", "Only registered local Skill market sources can receive publications.");
+      }
+      if (current.state !== "ready" || current.contentRevision !== input.expectedSourceContentRevision) {
+        throw marketError("PUBLICATION_CHANGED", "The Skill market source changed after publication was confirmed.");
+      }
+      const metadata = normalizeSkillMarketPublicationMetadata(input.metadata);
+      assertExpectedPublicationEntry(current, metadata, input.expectedExistingEntryId);
+      const root = await canonicalDirectory(current.source.path, "Local Skill market source");
+      if (normalizedPath(root) !== normalizedPath(current.source.path)) {
+        throw marketError("PUBLICATION_CHANGED", "The local Skill market source changed identity.");
+      }
+      const beforeDiscovery = await discoverSkillMarket(root, current.id, undefined, signal);
+      if (beforeDiscovery.contentRevision !== current.contentRevision) {
+        throw marketError("PUBLICATION_CHANGED", "The local Skill market source changed before publication commit.");
+      }
+      const archive = await inspectPublicationArchive(
+        input.archivePath,
+        input.archiveBytes,
+        input.archiveSha256,
+        signal
+      );
+      const archiveRelativePath = publicationArchiveRelativePath(metadata, archive.identity.digest);
+      const manifestPath = join(root, MARKETPLACE_MANIFEST);
+      const beforeManifest = await readStableAbsoluteFile(manifestPath, root, MANIFEST_MAXIMUM_BYTES, signal);
+      const beforeManifestSha256 = createHash("sha256").update(beforeManifest).digest("hex");
+      const nextManifest = publicationManifestBytes(current, metadata, archiveRelativePath, archive.identity, this.#now());
+      const nextManifestSha256 = createHash("sha256").update(nextManifest).digest("hex");
+      const intent: SkillMarketPublicationIntent = {
+        beforeManifestSha256,
+        nextManifestSha256,
+        archiveRelativePath,
+        archiveBytes: archive.identity.size,
+        archiveSha256: archive.identity.digest
+      };
+      if (input.recoveredIntent !== undefined && !samePublicationIntent(input.recoveredIntent, intent)) {
+        throw marketError("PUBLICATION_CHANGED", "The recovered publication intent no longer matches the source or archive.");
+      }
+      await callbacks.beforeSwitch(intent);
+      signal?.throwIfAborted();
+      const paths = publicationRecoveryPaths(root, jobId);
+      let archiveCreated = false;
+      let finalSwitched = false;
+      try {
+        archiveCreated = await installImmutablePublicationArchive(root, archive.identity, archiveRelativePath, signal);
+        signal?.throwIfAborted();
+        await switchPublicationManifest(
+          paths,
+          beforeManifestSha256,
+          nextManifest,
+          nextManifestSha256,
+          () => {
+            finalSwitched = true;
+            callbacks.afterFinalSwitch?.();
+          },
+          signal
+        );
+        const discovered = await discoverSkillMarket(root, current.id, undefined);
+        const nextRecord = adoptPublishedDiscovery(current, discovered, metadata, intent, this.#now());
+        const nextRevision = this.#catalogRevision + 1n;
+        const next = new Map(this.#records).set(current.id, nextRecord);
+        const result = publicationResult(nextRecord, metadata.slug, this.#resources);
+        const value = this.#store.transaction((store) => {
+          this.#persist(next, nextRevision, store);
+          return callbacks.finalize(store, result);
+        });
+        this.#replaceState(next, nextRevision);
+        await cleanupPublicationRecoveryFiles(paths);
+        return { result, value };
+      } catch (error) {
+        if (!finalSwitched) {
+          await restorePublicationManifestBeforeSwitch(paths, beforeManifestSha256, nextManifestSha256).catch(() => undefined);
+          if (archiveCreated) {
+            await removeUncommittedPublicationArchive(root, archiveRelativePath, archive.identity).catch(() => undefined);
+          }
+        }
+        throw error;
+      }
+    });
+  }
+
+  /** Recover a job that may have crossed the manifest final-switch boundary. */
+  async recoverLocalPublication<T>(
+    input: RecoverSkillMarketPublicationInput,
+    finalize: (store: OperationalStore, result: SkillMarketPublicationResult) => T
+  ): Promise<
+    | { readonly committed: false }
+    | { readonly committed: true; readonly result: SkillMarketPublicationResult; readonly value: T }
+  > {
+    return this.#mutate(async () => {
+      this.#assertInitialized();
+      const jobId = publicationJobId(input.jobId);
+      const current = this.#requireSource(input.sourceId);
+      if (current.source.kind !== "local") {
+        throw marketError("PUBLICATION_UNAVAILABLE", "Only registered local Skill market sources can recover publications.");
+      }
+      const metadata = normalizeSkillMarketPublicationMetadata(input.metadata);
+      const intent = normalizePublicationIntent(input.intent);
+      const root = await canonicalDirectory(current.source.path, "Local Skill market source");
+      if (normalizedPath(root) !== normalizedPath(current.source.path)) {
+        throw marketError("PUBLICATION_CHANGED", "The local Skill market source changed identity during recovery.");
+      }
+      const paths = publicationRecoveryPaths(root, jobId);
+      const recovery = await recoverPublicationManifest(paths, intent);
+      if (recovery === "before") return { committed: false };
+      const discovered = await discoverSkillMarket(root, current.id, undefined);
+      if (current.contentRevision !== input.expectedSourceContentRevision && current.contentRevision !== discovered.contentRevision) {
+        throw marketError("PUBLICATION_CHANGED", "The Skill market source changed outside the recovering publication.");
+      }
+      const nextRecord = current.contentRevision === discovered.contentRevision
+        ? current
+        : adoptPublishedDiscovery(current, discovered, metadata, intent, this.#now());
+      const changed = nextRecord !== current;
+      const nextRevision = changed ? this.#catalogRevision + 1n : this.#catalogRevision;
+      const next = changed ? new Map(this.#records).set(current.id, nextRecord) : new Map(this.#records);
+      const result = publicationResult(nextRecord, metadata.slug, this.#resources);
+      const value = this.#store.transaction((store) => {
+        if (changed) this.#persist(next, nextRevision, store);
+        return finalize(store, result);
+      });
+      if (changed) this.#replaceState(next, nextRevision);
+      await cleanupPublicationRecoveryFiles(paths);
+      return { committed: true, result, value };
     });
   }
 
@@ -1158,6 +1413,8 @@ export class SkillMarketManager {
   async close(): Promise<void> {
     for (const preview of [...this.#previews.values()]) await this.#retirePreview(preview);
     for (const plan of [...this.#installPlans.values()]) await this.#retireInstallPlan(plan);
+    await this.#drainGenerationRemovals().catch(() => undefined);
+    await Promise.allSettled([...this.#cleanupTasks]);
   }
 
   #assertInitialized(): void {
@@ -1195,8 +1452,8 @@ export class SkillMarketManager {
     return { source, entry };
   }
 
-  #persist(records: ReadonlyMap<string, StoredSkillMarketSource>, revision: bigint): void {
-    this.#store.setSetting("service", this.#scopeId, SOURCE_SETTING_KEY, {
+  #persist(records: ReadonlyMap<string, StoredSkillMarketSource>, revision: bigint, store: OperationalStore = this.#store): void {
+    store.setSetting("service", this.#scopeId, SOURCE_SETTING_KEY, {
       format: 1,
       revision: revision.toString(10),
       sources: [...records.values()].sort((left, right) => left.id.localeCompare(right.id, "en"))
@@ -1313,7 +1570,12 @@ export class SkillMarketManager {
     const count = this.#generationLeases.get(key) ?? 0;
     if (count <= 1) this.#generationLeases.delete(key);
     else this.#generationLeases.set(key, count - 1);
-    void this.#drainGenerationRemovals();
+    this.#scheduleCleanup(this.#drainGenerationRemovals());
+  }
+
+  #scheduleCleanup(task: Promise<void>): void {
+    const tracked = task.catch(() => undefined).finally(() => this.#cleanupTasks.delete(tracked));
+    this.#cleanupTasks.add(tracked);
   }
 
   async #removeGenerationPath(path: string, skip: () => boolean): Promise<void> {
@@ -1420,6 +1682,503 @@ export class SkillMarketManager {
   }
 }
 
+interface PublicationRecoveryPaths {
+  readonly root: string;
+  readonly directory: string;
+  readonly manifest: string;
+  readonly before: string;
+  readonly next: string;
+}
+
+function publicationJobId(value: string): string {
+  if (!PUBLICATION_JOB_ID.test(value)) throw marketError("PUBLICATION_INVALID", "Skill publication job ID is invalid.");
+  return value;
+}
+
+function publicationSlug(value: string): string {
+  try {
+    return boundedSlug(value);
+  } catch {
+    throw marketError("PUBLICATION_INVALID", "Skill publication slug must use lowercase words separated by hyphens.");
+  }
+}
+
+export function normalizeSkillMarketPublicationMetadata(value: SkillMarketPublicationMetadata): SkillMarketPublicationMetadata {
+  try {
+    const slug = publicationSlug(value.slug);
+    const name = boundedText(value.name, "Skill publication display name", 64);
+    const author = value.author === undefined || value.author === ""
+      ? undefined
+      : boundedText(value.author, "Skill publication author", MAXIMUM_NAME_CHARACTERS);
+    const description = boundedText(value.description, "Skill publication description", 2_000, true);
+    const category = value.category === undefined || value.category === ""
+      ? undefined
+      : boundedText(value.category, "Skill publication category", MAXIMUM_CATEGORY_CHARACTERS);
+    const tags = boundedTags(value.tags);
+    const version = boundedVersion(value.version);
+    if (!/^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u.test(version)) {
+      throw marketError("PUBLICATION_INVALID", "Skill publication version must use canonical major.minor.patch form.");
+    }
+    const changelog = value.changelog === undefined || value.changelog === ""
+      ? undefined
+      : boundedText(value.changelog, "Skill publication changelog", MAXIMUM_CHANGELOG_CHARACTERS);
+    return {
+      slug,
+      name,
+      ...(author === undefined ? {} : { author }),
+      description,
+      ...(category === undefined ? {} : { category }),
+      tags,
+      version,
+      ...(changelog === undefined ? {} : { changelog })
+    };
+  } catch (error) {
+    if (error instanceof SkillMarketError && error.code === "PUBLICATION_INVALID") throw error;
+    throw marketError("PUBLICATION_INVALID", boundedFailure(error instanceof Error ? error.message : String(error)) || "Skill publication metadata is invalid.");
+  }
+}
+
+function assertExpectedPublicationEntry(
+  source: StoredSkillMarketSource,
+  metadata: SkillMarketPublicationMetadata,
+  expectedEntryId: string | undefined
+): void {
+  const existing = source.entries.find((entry) => entry.slug === metadata.slug);
+  if (expectedEntryId === undefined) {
+    if (existing !== undefined) {
+      throw marketError("PUBLICATION_CHANGED", "This Skill slug already exists in the selected source; publish it as a new version.");
+    }
+    if (source.entries.length >= MAXIMUM_ENTRIES) throw marketError("PUBLICATION_UNAVAILABLE", "The selected Skill market source is full.");
+    return;
+  }
+  if (!ENTRY_ID.test(expectedEntryId) || existing?.id !== expectedEntryId) {
+    throw marketError("PUBLICATION_CHANGED", "The published Skill entry changed after the version form was opened.");
+  }
+  if (semver.compare(metadata.version, existing.version) <= 0) {
+    throw marketError("PUBLICATION_INVALID", `Skill publication version must be greater than ${existing.version}.`);
+  }
+  if (metadata.changelog === undefined) {
+    throw marketError("PUBLICATION_INVALID", "A changelog is required when publishing a new Skill version.");
+  }
+}
+
+function publicationArchiveRelativePath(metadata: SkillMarketPublicationMetadata, sha256: string): string {
+  if (!ARCHIVE_SHA256.test(sha256)) throw marketError("PUBLICATION_INVALID", "Skill publication archive SHA-256 is invalid.");
+  return portableSourceRelativePath(
+    `archives/${metadata.slug}/${metadata.version}-${sha256.slice(0, 16)}.tgz`,
+    "Skill publication archive"
+  );
+}
+
+async function inspectPublicationArchive(
+  archivePath: string,
+  declaredBytes: number,
+  declaredSha256: string,
+  signal?: AbortSignal
+): Promise<{ readonly identity: ArchiveFileIdentity; readonly entries: readonly SkillMarketArchiveEntry[] }> {
+  if (!isAbsolute(archivePath) || resolve(archivePath) !== archivePath || basename(archivePath) !== "package.tgz") {
+    throw marketError("PUBLICATION_INVALID", "Skill publication archive path is invalid.");
+  }
+  if (!Number.isSafeInteger(declaredBytes) || declaredBytes < 1 || declaredBytes > MAXIMUM_ARCHIVE_BYTES
+    || !ARCHIVE_SHA256.test(declaredSha256)) {
+    throw marketError("PUBLICATION_INVALID", "Skill publication archive identity is invalid.");
+  }
+  try {
+    return await inspectMarketArchive(dirname(archivePath), basename(archivePath), declaredBytes, declaredSha256, signal);
+  } catch (error) {
+    if (isAbortError(error)) throw error;
+    throw marketError("PUBLICATION_INVALID", boundedFailure(error instanceof Error ? error.message : String(error)) || "Skill publication archive is invalid.");
+  }
+}
+
+function publicationManifestBytes(
+  source: StoredSkillMarketSource,
+  metadata: SkillMarketPublicationMetadata,
+  archiveRelativePath: string,
+  archive: ArchiveFileIdentity,
+  now: number
+): Buffer {
+  const existing = source.entries.find((entry) => entry.slug === metadata.slug);
+  const at = Math.max(now, existing?.createdAt ?? 0);
+  const category = metadata.category ?? existing?.category;
+  const entry = {
+    slug: metadata.slug,
+    name: metadata.name,
+    ...(metadata.author === undefined ? {} : { author: metadata.author }),
+    description: metadata.description,
+    ...(category === undefined ? {} : { category }),
+    tags: [...metadata.tags],
+    version: metadata.version,
+    ...(metadata.changelog === undefined ? {} : { changelog: metadata.changelog }),
+    createdAt: new Date(existing?.createdAt ?? at).toISOString(),
+    updatedAt: new Date(at).toISOString(),
+    downloads: existing?.downloads ?? 0,
+    trendScore: existing?.trendScore ?? 0,
+    archive: archiveRelativePath,
+    compressedBytes: archive.size,
+    sha256: archive.digest
+  };
+  const entries = source.entries
+    .filter((candidate) => candidate.slug !== metadata.slug)
+    .map(storedEntryManifestValue)
+    .concat(entry)
+    .sort((left, right) => left.slug.localeCompare(right.slug, "en"));
+  const encoded = Buffer.from(`${JSON.stringify({
+    format: 1,
+    name: source.name,
+    ...(source.displayName === undefined ? {} : { displayName: source.displayName }),
+    entries
+  }, undefined, 2)}\n`, "utf8");
+  if (encoded.length > MANIFEST_MAXIMUM_BYTES) throw marketError("PUBLICATION_UNAVAILABLE", "The updated Skill market manifest exceeds its size limit.");
+  return encoded;
+}
+
+function storedEntryManifestValue(entry: StoredSkillMarketEntry): {
+  readonly slug: string;
+  readonly name: string;
+  readonly author?: string;
+  readonly description: string;
+  readonly category?: string;
+  readonly tags: readonly string[];
+  readonly version: string;
+  readonly changelog?: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly downloads: number;
+  readonly trendScore: number;
+  readonly archive: string;
+  readonly compressedBytes: number;
+  readonly sha256: string;
+} {
+  return {
+    slug: entry.slug,
+    name: entry.name,
+    ...(entry.author === undefined ? {} : { author: entry.author }),
+    description: entry.description,
+    ...(entry.category === undefined ? {} : { category: entry.category }),
+    tags: [...entry.tags],
+    version: entry.version,
+    ...(entry.changelog === undefined ? {} : { changelog: entry.changelog }),
+    createdAt: new Date(entry.createdAt).toISOString(),
+    updatedAt: new Date(entry.updatedAt).toISOString(),
+    downloads: entry.downloads,
+    trendScore: entry.trendScore,
+    archive: entry.archiveRelativePath,
+    compressedBytes: entry.archiveBytes,
+    sha256: entry.archiveSha256
+  };
+}
+
+function samePublicationIntent(left: SkillMarketPublicationIntent, right: SkillMarketPublicationIntent): boolean {
+  return left.beforeManifestSha256 === right.beforeManifestSha256
+    && left.nextManifestSha256 === right.nextManifestSha256
+    && left.archiveRelativePath === right.archiveRelativePath
+    && left.archiveBytes === right.archiveBytes
+    && left.archiveSha256 === right.archiveSha256;
+}
+
+function normalizePublicationIntent(value: SkillMarketPublicationIntent): SkillMarketPublicationIntent {
+  if (!ARCHIVE_SHA256.test(value.beforeManifestSha256) || !ARCHIVE_SHA256.test(value.nextManifestSha256)
+    || !ARCHIVE_SHA256.test(value.archiveSha256) || !Number.isSafeInteger(value.archiveBytes)
+    || value.archiveBytes < 1 || value.archiveBytes > MAXIMUM_ARCHIVE_BYTES) {
+    throw marketError("PUBLICATION_INVALID", "Stored Skill publication intent is invalid.");
+  }
+  return {
+    beforeManifestSha256: value.beforeManifestSha256,
+    nextManifestSha256: value.nextManifestSha256,
+    archiveRelativePath: portableSourceRelativePath(value.archiveRelativePath, "Skill publication archive"),
+    archiveBytes: value.archiveBytes,
+    archiveSha256: value.archiveSha256
+  };
+}
+
+function publicationRecoveryPaths(root: string, jobId: string): PublicationRecoveryPaths {
+  const directory = join(root, ".agents", "skills");
+  const suffix = createHash("sha256").update(jobId).digest("hex").slice(0, 24);
+  return {
+    root,
+    directory,
+    manifest: join(directory, "marketplace.json"),
+    before: join(directory, `.joko-publish-${suffix}.before`),
+    next: join(directory, `.joko-publish-${suffix}.next`)
+  };
+}
+
+async function installImmutablePublicationArchive(
+  sourceRoot: string,
+  archive: ArchiveFileIdentity,
+  relativePath: string,
+  signal?: AbortSignal
+): Promise<boolean> {
+  signal?.throwIfAborted();
+  const parts = relativePath.split("/");
+  const fileName = parts.pop()!;
+  let directory = sourceRoot;
+  for (const part of parts) {
+    directory = join(directory, part);
+    await mkdir(directory, { recursive: false, mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "EEXIST") throw error;
+    });
+    await assertContainedDirectory(sourceRoot, directory, "Skill publication archive directory");
+  }
+  const destination = join(directory, fileName);
+  const existing = await lstat(destination).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return undefined;
+    throw error;
+  });
+  if (existing !== undefined) {
+    const observed = await stableArchiveIdentity(sourceRoot, relativePath, signal);
+    if (observed.size !== archive.size || observed.digest !== archive.digest) {
+      throw marketError("PUBLICATION_CHANGED", "The immutable publication archive path is already occupied by different content.");
+    }
+    return false;
+  }
+  let created = false;
+  const input = await open(archive.path, constants.O_RDONLY);
+  let output: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    output = await open(destination, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
+    created = true;
+    const chunk = Buffer.allocUnsafe(1024 * 1024);
+    let position = 0;
+    while (position < archive.size) {
+      signal?.throwIfAborted();
+      const { bytesRead } = await input.read(chunk, 0, Math.min(chunk.length, archive.size - position), position);
+      if (bytesRead === 0) throw new Error("Skill publication archive ended while it was copied.");
+      let written = 0;
+      while (written < bytesRead) {
+        const result = await output.write(chunk, written, bytesRead - written, position + written);
+        if (result.bytesWritten === 0) throw new Error("Skill publication archive could not be written completely.");
+        written += result.bytesWritten;
+      }
+      position += bytesRead;
+    }
+    await output.sync();
+  } catch (error) {
+    if (created) await rm(destination, { force: true }).catch(() => undefined);
+    throw error;
+  } finally {
+    await input.close();
+    await output?.close().catch(() => undefined);
+  }
+  const observed = await stableArchiveIdentity(sourceRoot, relativePath, signal);
+  if (observed.size !== archive.size || observed.digest !== archive.digest) {
+    await rm(destination, { force: true }).catch(() => undefined);
+    throw marketError("PUBLICATION_CHANGED", "The publication archive changed while it was copied.");
+  }
+  await syncDirectory(directory);
+  return true;
+}
+
+async function switchPublicationManifest(
+  paths: PublicationRecoveryPaths,
+  beforeSha256: string,
+  nextManifest: Buffer,
+  nextSha256: string,
+  afterFinalSwitch: () => void,
+  signal?: AbortSignal
+): Promise<void> {
+  await assertContainedDirectory(paths.root, paths.directory, "Skill publication manifest directory");
+  const current = await publicationFileSha256(paths.manifest, paths.root);
+  if (current !== beforeSha256) throw marketError("PUBLICATION_CHANGED", "The Skill market manifest changed before final switch.");
+  await ensurePublicationRecoveryFile(paths.next, paths.root, nextManifest, nextSha256);
+  const previousBackup = await publicationFileSha256(paths.before, paths.root);
+  if (previousBackup !== undefined) {
+    if (previousBackup !== beforeSha256) throw marketError("PUBLICATION_CHANGED", "A conflicting publication recovery file already exists.");
+    await rm(paths.before, { force: true });
+  }
+  signal?.throwIfAborted();
+  await renameWithRetry(paths.manifest, paths.before);
+  await syncDirectory(paths.directory);
+  try {
+    signal?.throwIfAborted();
+    await renameWithRetry(paths.next, paths.manifest);
+    afterFinalSwitch();
+    await syncDirectory(paths.directory);
+  } catch (error) {
+    if (!existsSync(paths.manifest) && existsSync(paths.before)) {
+      await renameWithRetry(paths.before, paths.manifest).catch(() => undefined);
+      await syncDirectory(paths.directory).catch(() => undefined);
+    }
+    throw error;
+  }
+}
+
+async function recoverPublicationManifest(
+  paths: PublicationRecoveryPaths,
+  intent: SkillMarketPublicationIntent
+): Promise<"before" | "after"> {
+  await assertContainedDirectory(paths.root, paths.directory, "Skill publication manifest directory");
+  const current = await publicationFileSha256(paths.manifest, paths.root);
+  const before = await publicationFileSha256(paths.before, paths.root);
+  const next = await publicationFileSha256(paths.next, paths.root);
+  if (current === intent.nextManifestSha256) return "after";
+  if (current === intent.beforeManifestSha256) {
+    if (before !== undefined && before !== intent.beforeManifestSha256 || next !== undefined && next !== intent.nextManifestSha256) {
+      throw marketError("PUBLICATION_CHANGED", "Skill publication recovery files were changed externally.");
+    }
+    await cleanupPublicationRecoveryFiles(paths);
+    return "before";
+  }
+  if (current === undefined && before === intent.beforeManifestSha256 && next === intent.nextManifestSha256) {
+    await renameWithRetry(paths.next, paths.manifest);
+    await syncDirectory(paths.directory);
+    return "after";
+  }
+  if (current === undefined && before === intent.beforeManifestSha256 && next === undefined) {
+    await renameWithRetry(paths.before, paths.manifest);
+    await syncDirectory(paths.directory);
+    return "before";
+  }
+  throw marketError("PUBLICATION_CHANGED", "The Skill market manifest cannot be safely reconciled with the publication journal.");
+}
+
+async function restorePublicationManifestBeforeSwitch(
+  paths: PublicationRecoveryPaths,
+  beforeSha256: string,
+  nextSha256: string
+): Promise<void> {
+  const current = await publicationFileSha256(paths.manifest, paths.root);
+  const backup = await publicationFileSha256(paths.before, paths.root);
+  if (current === undefined && backup === beforeSha256) {
+    await renameWithRetry(paths.before, paths.manifest);
+    await syncDirectory(paths.directory);
+  }
+  if (await publicationFileSha256(paths.manifest, paths.root) !== beforeSha256) return;
+  const stableBackup = await publicationFileSha256(paths.before, paths.root);
+  const stableNext = await publicationFileSha256(paths.next, paths.root);
+  if ((stableBackup === undefined || stableBackup === beforeSha256)
+    && (stableNext === undefined || stableNext === nextSha256)) {
+    await cleanupPublicationRecoveryFiles(paths);
+  }
+}
+
+async function removeUncommittedPublicationArchive(
+  root: string,
+  relativePath: string,
+  expected: ArchiveFileIdentity
+): Promise<void> {
+  const observed = await stableArchiveIdentity(root, relativePath);
+  if (observed.size !== expected.size || observed.digest !== expected.digest) {
+    throw marketError("PUBLICATION_CHANGED", "The uncommitted publication archive changed before cleanup.");
+  }
+  await rm(observed.path, { force: true });
+  let directory = dirname(observed.path);
+  await syncDirectory(directory);
+  while (normalizedPath(directory) !== normalizedPath(root)) {
+    if ((await readdir(directory)).length > 0) break;
+    const parent = dirname(directory);
+    await rmdir(directory);
+    await syncDirectory(parent);
+    directory = parent;
+  }
+}
+
+async function ensurePublicationRecoveryFile(path: string, root: string, content: Buffer, sha256: string): Promise<void> {
+  const existing = await publicationFileSha256(path, root);
+  if (existing !== undefined) {
+    if (existing !== sha256) throw marketError("PUBLICATION_CHANGED", "A conflicting publication recovery file already exists.");
+    return;
+  }
+  const handle = await open(path, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
+  try {
+    await handle.writeFile(content);
+    await handle.sync();
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    await rm(path, { force: true }).catch(() => undefined);
+    throw error;
+  }
+  await handle.close();
+}
+
+async function publicationFileSha256(path: string, root: string): Promise<string | undefined> {
+  try {
+    const bytes = await readStableAbsoluteFile(path, root, MANIFEST_MAXIMUM_BYTES);
+    return createHash("sha256").update(bytes).digest("hex");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+async function cleanupPublicationRecoveryFiles(paths: PublicationRecoveryPaths): Promise<void> {
+  await rm(paths.before, { force: true });
+  await rm(paths.next, { force: true });
+  await syncDirectory(paths.directory);
+}
+
+async function syncDirectory(path: string): Promise<void> {
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(path, constants.O_RDONLY);
+    await handle.sync();
+  } catch (error) {
+    if (!["EACCES", "EISDIR", "EINVAL", "EPERM"].includes(String((error as NodeJS.ErrnoException).code ?? ""))) throw error;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+function adoptPublishedDiscovery(
+  current: StoredSkillMarketSource,
+  discovered: DiscoveredSkillMarket,
+  metadata: SkillMarketPublicationMetadata,
+  intent: SkillMarketPublicationIntent,
+  now: number
+): StoredSkillMarketSource {
+  const published = discovered.entries.find((entry) => entry.slug === metadata.slug);
+  const previous = current.entries.find((entry) => entry.slug === metadata.slug);
+  const category = metadata.category ?? previous?.category;
+  if (published === undefined
+    || published.name !== metadata.name
+    || published.author !== metadata.author
+    || published.description !== metadata.description
+    || published.category !== category
+    || published.version !== metadata.version
+    || published.changelog !== metadata.changelog
+    || published.tags.length !== metadata.tags.length
+    || published.tags.some((tag, index) => tag !== metadata.tags[index])
+    || published.archiveRelativePath !== intent.archiveRelativePath
+    || published.archiveBytes !== intent.archiveBytes
+    || published.archiveSha256 !== intent.archiveSha256) {
+    throw marketError("PUBLICATION_CHANGED", "The committed Skill market entry does not match the publication journal.");
+  }
+  const previousBySlug = new Map(current.entries.map((entry) => [entry.slug, entry]));
+  const history: Record<string, string> = { ...current.entryRevisionHistory };
+  for (const entry of discovered.entries) {
+    const old = previousBySlug.get(entry.slug);
+    const last = history[entry.slug];
+    history[entry.slug] = old?.contentRevision === entry.contentRevision ? old.revision : increment(last ?? "0");
+  }
+  if (Object.keys(history).length > MAXIMUM_ENTRY_REVISION_HISTORY) {
+    throw marketError("PUBLICATION_UNAVAILABLE", "The Skill market source has exceeded its stable entry identity limit.");
+  }
+  const entries = discovered.entries.map((entry) => ({ ...entry, revision: history[entry.slug]! }));
+  const { displayName: _displayName, error: _error, ...base } = current;
+  return {
+    ...base,
+    revision: increment(current.revision),
+    name: discovered.name,
+    ...(discovered.displayName === undefined ? {} : { displayName: discovered.displayName }),
+    state: "ready",
+    contentRevision: discovered.contentRevision,
+    entries,
+    entryRevisionHistory: history,
+    refreshedAt: now
+  };
+}
+
+function publicationResult(
+  source: StoredSkillMarketSource,
+  slug: string,
+  resources?: PiResourceManager
+): SkillMarketPublicationResult {
+  const entry = source.entries.find((candidate) => candidate.slug === slug);
+  if (entry === undefined) throw marketError("PUBLICATION_CHANGED", "The published Skill entry is missing after source reconciliation.");
+  return { source: publicSource(source), entry: publicCatalogItem(source, entry, resources) };
+}
+
 async function discoverSkillMarket(
   sourceRoot: string,
   sourceId: string,
@@ -1459,7 +2218,7 @@ async function discoverSkillMarket(
   for (const rawEntry of raw.entries) {
     signal?.throwIfAborted();
     if (!plainObject(rawEntry) || !exactKeys(rawEntry, [
-      "slug", "name", "author", "description", "category", "tags", "version", "createdAt", "updatedAt",
+      "slug", "name", "author", "description", "category", "tags", "version", "changelog", "createdAt", "updatedAt",
       "downloads", "trendScore", "archive", "compressedBytes", "sha256"
     ])) throw marketError("SOURCE_MANIFEST_INVALID", "Skill market entry shape is invalid.");
     const slug = boundedSlug(rawEntry.slug);
@@ -1468,9 +2227,14 @@ async function discoverSkillMarket(
     const entryName = boundedText(rawEntry.name, "Skill market entry name", MAXIMUM_NAME_CHARACTERS);
     const author = rawEntry.author === undefined ? undefined : boundedText(rawEntry.author, "Skill market entry author", MAXIMUM_NAME_CHARACTERS);
     const description = boundedText(rawEntry.description, "Skill market entry description", MAXIMUM_DESCRIPTION_CHARACTERS, true);
-    const category = boundedText(rawEntry.category, "Skill market entry category", MAXIMUM_CATEGORY_CHARACTERS);
+    const category = rawEntry.category === undefined
+      ? undefined
+      : boundedText(rawEntry.category, "Skill market entry category", MAXIMUM_CATEGORY_CHARACTERS);
     const tags = boundedTags(rawEntry.tags);
     const version = boundedVersion(rawEntry.version);
+    const changelog = rawEntry.changelog === undefined
+      ? undefined
+      : boundedText(rawEntry.changelog, "Skill market entry changelog", MAXIMUM_CHANGELOG_CHARACTERS, true);
     const createdAt = boundedTimestamp(rawEntry.createdAt, "Skill market entry createdAt");
     const updatedAt = boundedTimestamp(rawEntry.updatedAt, "Skill market entry updatedAt");
     if (updatedAt < createdAt) throw marketError("SOURCE_MANIFEST_INVALID", "Skill market entry updatedAt cannot precede createdAt.");
@@ -1501,9 +2265,10 @@ async function discoverSkillMarket(
       name: entryName,
       author: author ?? null,
       description,
-      category,
+      category: category ?? null,
       tags,
       version,
+      ...(changelog === undefined ? {} : { changelog }),
       createdAt,
       updatedAt,
       downloads,
@@ -1520,9 +2285,10 @@ async function discoverSkillMarket(
       name: entryName,
       ...(author === undefined ? {} : { author }),
       description,
-      category,
+      ...(category === undefined ? {} : { category }),
       tags,
       version,
+      ...(changelog === undefined ? {} : { changelog }),
       createdAt,
       updatedAt,
       downloads,
@@ -1924,9 +2690,10 @@ function publicEntry(entry: StoredSkillMarketEntry): SkillMarketEntryDescriptor 
     name: entry.name,
     ...(entry.author === undefined ? {} : { author: entry.author }),
     description: entry.description,
-    category: entry.category,
+    ...(entry.category === undefined ? {} : { category: entry.category }),
     tags: [...entry.tags],
     version: entry.version,
+    ...(entry.changelog === undefined ? {} : { changelog: entry.changelog }),
     createdAt: entry.createdAt,
     updatedAt: entry.updatedAt,
     downloads: entry.downloads,
@@ -2053,7 +2820,7 @@ function catalogComparator(sort: SkillMarketSort): (left: SkillMarketCatalogItem
 }
 
 function marketSearchText(entry: SkillMarketCatalogItem): string {
-  return [entry.slug, entry.name, entry.author ?? "", entry.description, entry.category, ...entry.tags, entry.sourceName, entry.sourceDisplayName ?? ""]
+  return [entry.slug, entry.name, entry.author ?? "", entry.description, entry.category ?? "", entry.changelog ?? "", ...entry.tags, entry.sourceName, entry.sourceDisplayName ?? ""]
     .join("\n")
     .toLocaleLowerCase("en-US");
 }
@@ -2284,7 +3051,15 @@ function sameFilesystemIdentity(
 async function removePrivatePath(path: string): Promise<void> {
   const exact = normalizedAbsolute(path, "Private Skill market path");
   if (dirname(exact) === exact) throw new Error("Refusing to remove a filesystem root.");
-  await rm(exact, { recursive: true, force: true });
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await rm(exact, { recursive: true, force: true, maxRetries: 2, retryDelay: 50 });
+      return;
+    } catch (error) {
+      if (attempt >= 4 || !["EACCES", "EBUSY", "ENOTEMPTY", "EPERM"].includes(String((error as NodeJS.ErrnoException).code ?? ""))) throw error;
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 50 * (attempt + 1)));
+    }
+  }
 }
 
 async function cloneGitSource(
@@ -2489,7 +3264,7 @@ function validateStoredSource(value: unknown): StoredSkillMarketSource {
 
 function validateStoredEntry(value: unknown, sourceId: string, history: Readonly<Record<string, string>>): StoredSkillMarketEntry {
   if (!plainObject(value) || !exactKeys(value, [
-    "id", "sourceId", "revision", "contentRevision", "slug", "name", "author", "description", "category", "tags", "version",
+    "id", "sourceId", "revision", "contentRevision", "slug", "name", "author", "description", "category", "tags", "version", "changelog",
     "createdAt", "updatedAt", "downloads", "trendScore", "archiveBytes", "archiveRelativePath", "archiveSha256", "archiveEntries"
   ])) throw new Error("Stored Skill market entry shape is invalid.");
   if (typeof value.slug !== "string" || !SLUG.test(value.slug)
@@ -2500,9 +3275,10 @@ function validateStoredEntry(value: unknown, sourceId: string, history: Readonly
     || typeof value.name !== "string" || storedBoundedText(value.name, MAXIMUM_NAME_CHARACTERS, false) !== value.name
     || value.author !== undefined && (typeof value.author !== "string" || storedBoundedText(value.author, MAXIMUM_NAME_CHARACTERS, false) !== value.author)
     || typeof value.description !== "string" || storedBoundedText(value.description, MAXIMUM_DESCRIPTION_CHARACTERS, true) !== value.description
-    || typeof value.category !== "string" || storedBoundedText(value.category, MAXIMUM_CATEGORY_CHARACTERS, false) !== value.category
+    || value.category !== undefined && (typeof value.category !== "string" || storedBoundedText(value.category, MAXIMUM_CATEGORY_CHARACTERS, false) !== value.category)
     || !Array.isArray(value.tags) || value.tags.length > MAXIMUM_TAGS
     || typeof value.version !== "string" || semver.valid(value.version) !== value.version
+    || value.changelog !== undefined && (typeof value.changelog !== "string" || storedBoundedText(value.changelog, MAXIMUM_CHANGELOG_CHARACTERS, true) !== value.changelog)
     || typeof value.createdAt !== "number" || !Number.isSafeInteger(value.createdAt) || value.createdAt < 0
     || typeof value.updatedAt !== "number" || !Number.isSafeInteger(value.updatedAt) || value.updatedAt < value.createdAt
     || typeof value.downloads !== "number" || !Number.isSafeInteger(value.downloads) || value.downloads < 0
@@ -2523,9 +3299,10 @@ function validateStoredEntry(value: unknown, sourceId: string, history: Readonly
     name: value.name,
     author: value.author ?? null,
     description: value.description,
-    category: value.category,
+    category: value.category ?? null,
     tags,
     version: value.version,
+    ...(value.changelog === undefined ? {} : { changelog: value.changelog }),
     createdAt: value.createdAt,
     updatedAt: value.updatedAt,
     downloads: value.downloads,

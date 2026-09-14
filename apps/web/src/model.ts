@@ -2173,9 +2173,10 @@ export interface SkillMarketEntryView {
   readonly name: string;
   readonly author?: string;
   readonly description: string;
-  readonly category: string;
+  readonly category?: string;
   readonly tags: readonly string[];
   readonly version: string;
+  readonly changelog?: string;
   readonly createdAt: number;
   readonly updatedAt: number;
   readonly downloads: number;
@@ -2372,6 +2373,105 @@ export interface SkillMarketSyncJobView {
 export interface SkillMarketSyncCatalogView<T> {
   readonly items: readonly T[];
   readonly recoveredFromCorruption: boolean;
+}
+
+export interface SkillPublicationMetadataView {
+  readonly slug: string;
+  readonly name: string;
+  readonly author?: string;
+  readonly description: string;
+  readonly category?: string;
+  readonly tags: readonly string[];
+  readonly version: string;
+  readonly changelog?: string;
+}
+
+export interface SkillPublicationAuthorityView {
+  readonly resourceId: string;
+  readonly resourceRevision: bigint;
+  readonly observedRevision: string;
+  readonly backendId: string;
+  readonly targetId?: string;
+  readonly scope: SkillScopeView;
+  readonly sourceId: string;
+  readonly sourceRevision: bigint;
+  readonly sourceContentRevision: string;
+  readonly sourceDisplay: string;
+  readonly existingEntryId?: string;
+}
+
+export interface SkillPublicationGateIssueView {
+  readonly code: string;
+  readonly message: string;
+  readonly path?: string;
+}
+
+export interface SkillPublicationGateView {
+  readonly id: "metadata" | "package" | "sensitive_content" | "source_authority";
+  readonly label: string;
+  readonly status: "pending" | "passed" | "blocked";
+  readonly issues: readonly SkillPublicationGateIssueView[];
+}
+
+export interface SkillPublicationResultView {
+  readonly sourceId: string;
+  readonly sourceRevision: bigint;
+  readonly entryId: string;
+  readonly entryRevision: bigint;
+  readonly entryContentRevision: string;
+  readonly version: string;
+}
+
+export type SkillPublicationStateView =
+  | "pending"
+  | "snapshotting"
+  | "packaging"
+  | "scanning"
+  | "committing"
+  | "reconciling"
+  | "cancelling"
+  | "published"
+  | "blocked"
+  | "failed"
+  | "cancelled";
+
+export interface SkillPublicationJobView {
+  readonly id: string;
+  readonly revision: bigint;
+  readonly state: SkillPublicationStateView;
+  readonly authority: SkillPublicationAuthorityView;
+  readonly metadata: SkillPublicationMetadataView;
+  readonly publisher: "personal";
+  readonly visibility: "public";
+  readonly gates: readonly SkillPublicationGateView[];
+  readonly verdict: "pending" | "passed" | "blocked";
+  readonly files: number;
+  readonly uncompressedBytes: number;
+  readonly archiveBytes: number;
+  readonly attempt: number;
+  readonly retryOfJobId?: string;
+  readonly result?: SkillPublicationResultView;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly completedAt?: number;
+  readonly error?: string;
+  readonly cancellable: boolean;
+}
+
+export interface SkillPublicationPreviewView {
+  readonly authority: SkillPublicationAuthorityView;
+  readonly source: SkillMarketSourceView;
+  readonly mode: "first" | "version";
+  readonly suggestedSlug: string;
+  readonly suggestedVersion: string;
+  readonly existingEntry?: SkillMarketEntryView;
+  readonly dirty: boolean;
+  readonly personalPublisherAvailable: true;
+  readonly teamPublisherAvailable: false;
+  readonly publicVisibilityAvailable: true;
+  readonly departmentVisibilityAvailable: false;
+  readonly privateVisibilityAvailable: false;
+  readonly collaborationUnavailableReason: string;
 }
 
 /** Exact loaded resource identity owned by one live task runtime. */
@@ -4424,6 +4524,12 @@ export interface OperationApi {
   enqueueSkillMarketSync(policy: SkillMarketSyncPolicyView, signal?: AbortSignal): Promise<void>;
   cancelSkillMarketSync(job: SkillMarketSyncJobView, signal?: AbortSignal): Promise<void>;
   retrySkillMarketSync(job: SkillMarketSyncJobView, signal?: AbortSignal): Promise<void>;
+  getSkillPublicationPreview(resourceId: string, expectedResourceRevision: bigint, sourceId: string, expectedSourceRevision: bigint, slug?: string, signal?: AbortSignal): Promise<SkillPublicationPreviewView>;
+  listSkillPublicationJobs(resourceId?: string, signal?: AbortSignal): Promise<SkillMarketSyncCatalogView<SkillPublicationJobView>>;
+  getSkillPublicationJob(jobId: string, signal?: AbortSignal): Promise<SkillPublicationJobView>;
+  startSkillPublication(preview: SkillPublicationPreviewView, metadata: SkillPublicationMetadataView, signal?: AbortSignal): Promise<void>;
+  cancelSkillPublication(job: SkillPublicationJobView, signal?: AbortSignal): Promise<void>;
+  retrySkillPublication(job: SkillPublicationJobView, signal?: AbortSignal): Promise<void>;
   listCommands(sessionId: string): Promise<readonly RuntimeCommandView[]>;
   listSessionResources(sessionId: string, signal?: AbortSignal): Promise<readonly SessionResourceView[]>;
   listRuntimeProcesses(backendId: string, signal?: AbortSignal): Promise<RuntimeProcessUsageSnapshotView>;

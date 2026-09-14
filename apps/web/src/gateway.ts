@@ -239,6 +239,12 @@ import {
   SkillMarketSourceState as ProtoSkillMarketSourceState,
   SkillMarketSyncJobState as ProtoSkillMarketSyncJobState,
   SkillMarketSyncOutcome as ProtoSkillMarketSyncOutcome,
+  SkillPublicationGateStatus as ProtoSkillPublicationGateStatus,
+  SkillPublicationMode as ProtoSkillPublicationMode,
+  SkillPublicationPublisher as ProtoSkillPublicationPublisher,
+  SkillPublicationState as ProtoSkillPublicationState,
+  SkillPublicationVerdict as ProtoSkillPublicationVerdict,
+  SkillPublicationVisibility as ProtoSkillPublicationVisibility,
   SkillRecoveryStatus,
   SkillService,
   SubagentActivityKind,
@@ -365,6 +371,12 @@ import {
   type SkillMarketSyncJobAuthority as ProtoSkillMarketSyncJobAuthority,
   type SkillMarketSyncPolicy as ProtoSkillMarketSyncPolicy,
   type SkillMarketSyncTarget as ProtoSkillMarketSyncTarget,
+  type SkillPublicationAuthority as ProtoSkillPublicationAuthority,
+  type SkillPublicationGate as ProtoSkillPublicationGate,
+  type SkillPublicationJob as ProtoSkillPublicationJob,
+  type SkillPublicationMetadata as ProtoSkillPublicationMetadata,
+  type SkillPublicationPreview as ProtoSkillPublicationPreview,
+  type SkillPublicationResult as ProtoSkillPublicationResult,
   type SkillRecovery as ProtoSkillRecovery,
   type SkillSession as ProtoSkillSession,
   type Snapshot,
@@ -554,6 +566,13 @@ import type {
   SkillMarketSyncOutcomeView,
   SkillMarketSyncPolicyView,
   SkillMarketSyncTargetView,
+  SkillPublicationAuthorityView,
+  SkillPublicationGateView,
+  SkillPublicationJobView,
+  SkillPublicationMetadataView,
+  SkillPublicationPreviewView,
+  SkillPublicationResultView,
+  SkillPublicationStateView,
   SkillMutationResultView,
   SkillRecoveryView,
   SkillSessionView,
@@ -3476,6 +3495,121 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const scope = this.captureActionScope(signal);
     await this.submit({
       case: "retrySkillMarketSync",
+      value: { jobId: job.id, expectedRevision: { value: job.revision } }
+    }, true, [], scope.signal);
+  }
+
+  async getSkillPublicationPreview(
+    resourceId: string,
+    expectedResourceRevision: bigint,
+    sourceId: string,
+    expectedSourceRevision: bigint,
+    slug?: string,
+    signal?: AbortSignal
+  ): Promise<SkillPublicationPreviewView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).getSkillPublicationPreview({
+      resourceId,
+      expectedResourceRevision: { value: expectedResourceRevision },
+      sourceId,
+      expectedSourceRevision: { value: expectedSourceRevision },
+      ...(slug === undefined ? {} : { slug })
+    }, { signal: scope.signal });
+    if (response.preview === undefined) throw new GatewayError("The service returned an empty Skill publication preview.");
+    return mapSkillPublicationPreview(response.preview);
+  }
+
+  async listSkillPublicationJobs(
+    resourceId?: string,
+    signal?: AbortSignal
+  ): Promise<SkillMarketSyncCatalogView<SkillPublicationJobView>> {
+    const scope = this.captureActionScope(signal);
+    const client = createClient(SkillService, scope.transport);
+    const items: SkillPublicationJobView[] = [];
+    const identities = new Set<string>();
+    const consumedTokens = new Set<string>();
+    let pageToken = "";
+    let totalSize: number | undefined;
+    let recoveredFromCorruption: boolean | undefined;
+    for (let pageIndex = 0; pageIndex < MAX_COMPLETE_MESSAGE_SEARCH_PAGES; pageIndex += 1) {
+      const response = await client.listSkillPublicationJobs({
+        ...(resourceId === undefined ? {} : { resourceId }),
+        page: { pageSize: 500, pageToken }
+      }, { signal: scope.signal });
+      const pageTotal = response.page === undefined ? undefined : exactSafeUnsignedNumber(response.page.totalSize);
+      if (pageTotal === undefined || (totalSize !== undefined && totalSize !== pageTotal)
+        || (recoveredFromCorruption !== undefined && recoveredFromCorruption !== response.recoveredFromCorruption)) {
+        throw new GatewayError("The service returned an inconsistent Skill publication page.");
+      }
+      totalSize = pageTotal;
+      recoveredFromCorruption = response.recoveredFromCorruption;
+      for (const value of response.jobs) {
+        const mapped = mapSkillPublicationJob(value);
+        if ((resourceId !== undefined && mapped.authority.resourceId !== resourceId) || identities.has(mapped.id)) {
+          throw new GatewayError("The service returned an invalid Skill publication identity.");
+        }
+        identities.add(mapped.id);
+        items.push(mapped);
+      }
+      if (items.length > pageTotal) throw new GatewayError("The service returned too many Skill publication jobs.");
+      const next = response.page?.nextPageToken ?? "";
+      if (next === "") {
+        if (items.length !== pageTotal) throw new GatewayError("The service returned an incomplete Skill publication catalog.");
+        return { items, recoveredFromCorruption: recoveredFromCorruption ?? false };
+      }
+      if (next === pageToken || consumedTokens.has(next)) throw new GatewayError("The service returned a cyclic Skill publication page token.");
+      consumedTokens.add(next);
+      pageToken = next;
+    }
+    throw new GatewayError("Skill publications exceeded the safe pagination limit.");
+  }
+
+  async getSkillPublicationJob(jobId: string, signal?: AbortSignal): Promise<SkillPublicationJobView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).getSkillPublicationJob(
+      { jobId },
+      { signal: scope.signal }
+    );
+    if (response.job === undefined) throw new GatewayError("The service returned an empty Skill publication job.");
+    return mapSkillPublicationJob(response.job);
+  }
+
+  async startSkillPublication(
+    preview: SkillPublicationPreviewView,
+    metadata: SkillPublicationMetadataView,
+    signal?: AbortSignal
+  ): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    const authority = preview.authority;
+    await this.submit({
+      case: "startSkillPublication",
+      value: {
+        resourceId: authority.resourceId,
+        expectedResourceRevision: { value: authority.resourceRevision },
+        expectedObservedRevision: authority.observedRevision,
+        sourceId: authority.sourceId,
+        expectedSourceRevision: { value: authority.sourceRevision },
+        expectedSourceContentRevision: authority.sourceContentRevision,
+        ...(authority.existingEntryId === undefined ? {} : { expectedExistingEntryId: authority.existingEntryId }),
+        metadata: protoSkillPublicationMetadata(metadata),
+        publisher: ProtoSkillPublicationPublisher.PERSONAL,
+        visibility: ProtoSkillPublicationVisibility.PUBLIC
+      }
+    }, true, [], scope.signal);
+  }
+
+  async cancelSkillPublication(job: SkillPublicationJobView, signal?: AbortSignal): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    await this.submit({
+      case: "cancelSkillPublication",
+      value: { jobId: job.id, expectedRevision: { value: job.revision } }
+    }, true, [], scope.signal);
+  }
+
+  async retrySkillPublication(job: SkillPublicationJobView, signal?: AbortSignal): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    await this.submit({
+      case: "retrySkillPublication",
       value: { jobId: job.id, expectedRevision: { value: job.revision } }
     }, true, [], scope.signal);
   }
@@ -11263,7 +11397,9 @@ function mapSkillMarketEntry(entry: ProtoSkillMarketEntry): SkillMarketEntryView
       : undefined;
   const createdAt = entry.createdAt === undefined ? undefined : timestampMs(entry.createdAt);
   const updatedAt = entry.updatedAt === undefined ? undefined : timestampMs(entry.updatedAt);
-  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(entry.slug) || entry.name.trim() === "" || entry.category.trim() === ""
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(entry.slug) || entry.name.trim() === ""
+    || (entry.category !== undefined && entry.category.trim() === "")
+    || (entry.changelog !== undefined && entry.changelog.trim() === "")
     || entry.version.trim() === "" || entry.sourceName.trim() === "" || privatePathLikeLabel(entry.sourceName)
     || (entry.sourceDisplayName !== undefined && privatePathLikeLabel(entry.sourceDisplayName))
     || entry.tags.some((value) => value.trim() === "") || new Set(entry.tags).size !== entry.tags.length
@@ -11282,9 +11418,10 @@ function mapSkillMarketEntry(entry: ProtoSkillMarketEntry): SkillMarketEntryView
     name: entry.name,
     ...(entry.author === undefined ? {} : { author: entry.author }),
     description: entry.description,
-    category: entry.category,
+    ...(entry.category === undefined ? {} : { category: entry.category }),
     tags: [...entry.tags],
     version: entry.version,
+    ...(entry.changelog === undefined ? {} : { changelog: entry.changelog }),
     createdAt,
     updatedAt,
     downloads,
@@ -11650,8 +11787,258 @@ function mapSkillMarketSyncJob(job: ProtoSkillMarketSyncJob): SkillMarketSyncJob
   };
 }
 
+function protoSkillPublicationMetadata(metadata: SkillPublicationMetadataView) {
+  return {
+    slug: metadata.slug,
+    name: metadata.name,
+    ...(metadata.author === undefined ? {} : { author: metadata.author }),
+    description: metadata.description,
+    ...(metadata.category === undefined ? {} : { category: metadata.category }),
+    tags: [...metadata.tags],
+    version: metadata.version,
+    ...(metadata.changelog === undefined ? {} : { changelog: metadata.changelog })
+  };
+}
+
+function mapSkillPublicationMetadata(metadata: ProtoSkillPublicationMetadata | undefined): SkillPublicationMetadataView {
+  if (metadata === undefined || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(metadata.slug)
+    || !validPublicationText(metadata.name, 64)
+    || !validPublicationText(metadata.description, 2_000, true)
+    || !/^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u.test(metadata.version)
+    || (metadata.author !== undefined && !validPublicationText(metadata.author, 128))
+    || (metadata.category !== undefined && !validPublicationText(metadata.category, 64))
+    || (metadata.changelog !== undefined && !validPublicationText(metadata.changelog, 280))
+    || metadata.tags.length > 20 || metadata.tags.some((tag) => !validPublicationText(tag, 48))
+    || new Set(metadata.tags.map((tag) => tag.toLocaleLowerCase("en-US"))).size !== metadata.tags.length) {
+    throw new GatewayError("The service returned invalid Skill publication metadata.");
+  }
+  return {
+    slug: metadata.slug,
+    name: metadata.name,
+    ...(metadata.author === undefined ? {} : { author: metadata.author }),
+    description: metadata.description,
+    ...(metadata.category === undefined ? {} : { category: metadata.category }),
+    tags: [...metadata.tags],
+    version: metadata.version,
+    ...(metadata.changelog === undefined ? {} : { changelog: metadata.changelog })
+  };
+}
+
+function mapSkillPublicationAuthority(authority: ProtoSkillPublicationAuthority | undefined): SkillPublicationAuthorityView {
+  const resourceRevision = authority?.resourceRevision?.value;
+  const sourceRevision = authority?.sourceRevision?.value;
+  const scope = authority?.scope === ResourceScope.GLOBAL
+    ? "global" as const
+    : authority?.scope === ResourceScope.PROJECT
+      ? "project" as const
+      : undefined;
+  if (authority === undefined || authority.resourceId.trim() === "" || resourceRevision === undefined || resourceRevision < 1n
+    || !/^sha256:[a-f0-9]{64}$/u.test(authority.observedRevision) || authority.backendId.trim() === "" || scope === undefined
+    || (scope === "global" && authority.targetId !== undefined)
+    || (scope === "project" && (authority.targetId?.trim() ?? "") === "")
+    || !/^skill_market_source_[a-f0-9]{32}$/u.test(authority.sourceId) || sourceRevision === undefined || sourceRevision < 1n
+    || !/^sha256:[a-f0-9]{64}$/u.test(authority.sourceContentRevision)
+    || authority.sourceDisplay.trim() === "" || containsPrivatePath(authority.sourceDisplay)
+    || (authority.existingEntryId !== undefined && !/^skill_market_entry_[a-f0-9]{32}$/u.test(authority.existingEntryId))) {
+    throw new GatewayError("The service returned invalid or path-bearing Skill publication authority.");
+  }
+  return {
+    resourceId: authority.resourceId,
+    resourceRevision,
+    observedRevision: authority.observedRevision,
+    backendId: authority.backendId,
+    ...(authority.targetId === undefined ? {} : { targetId: authority.targetId }),
+    scope,
+    sourceId: authority.sourceId,
+    sourceRevision,
+    sourceContentRevision: authority.sourceContentRevision,
+    sourceDisplay: authority.sourceDisplay,
+    ...(authority.existingEntryId === undefined ? {} : { existingEntryId: authority.existingEntryId })
+  };
+}
+
+function mapSkillPublicationGate(gate: ProtoSkillPublicationGate): SkillPublicationGateView {
+  const id = gate.gateId === "metadata" || gate.gateId === "package" || gate.gateId === "sensitive_content"
+    || gate.gateId === "source_authority" ? gate.gateId : undefined;
+  const status = gate.status === ProtoSkillPublicationGateStatus.PENDING
+    ? "pending" as const
+    : gate.status === ProtoSkillPublicationGateStatus.PASSED
+      ? "passed" as const
+      : gate.status === ProtoSkillPublicationGateStatus.BLOCKED
+        ? "blocked" as const
+        : undefined;
+  if (id === undefined || status === undefined || !validPublicationText(gate.label, 80) || gate.issues.length > 20) {
+    throw new GatewayError("The service returned an invalid Skill publication gate.");
+  }
+  const issues = gate.issues.map((issue) => {
+    if (!/^[A-Z][A-Z0-9_]{0,63}$/u.test(issue.code) || !validPublicationText(issue.message, 512)
+      || containsPrivatePath(issue.message)
+      || (issue.path !== undefined && !portableSkillKey(issue.path))) {
+      throw new GatewayError("The service returned an invalid Skill publication gate issue.");
+    }
+    return {
+      code: issue.code,
+      message: issue.message,
+      ...(issue.path === undefined ? {} : { path: issue.path })
+    };
+  });
+  return { id, label: gate.label, status, issues };
+}
+
+function mapSkillPublicationResult(result: ProtoSkillPublicationResult | undefined): SkillPublicationResultView {
+  const sourceRevision = result?.sourceRevision?.value;
+  const entryRevision = result?.entryRevision?.value;
+  if (result === undefined || !/^skill_market_source_[a-f0-9]{32}$/u.test(result.sourceId)
+    || sourceRevision === undefined || sourceRevision < 1n
+    || !/^skill_market_entry_[a-f0-9]{32}$/u.test(result.entryId)
+    || entryRevision === undefined || entryRevision < 1n
+    || !/^sha256:[a-f0-9]{64}$/u.test(result.entryContentRevision)
+    || !/^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u.test(result.version)) {
+    throw new GatewayError("The service returned an invalid Skill publication result.");
+  }
+  return {
+    sourceId: result.sourceId,
+    sourceRevision,
+    entryId: result.entryId,
+    entryRevision,
+    entryContentRevision: result.entryContentRevision,
+    version: result.version
+  };
+}
+
+function mapSkillPublicationState(value: ProtoSkillPublicationState): SkillPublicationStateView {
+  switch (value) {
+    case ProtoSkillPublicationState.PENDING: return "pending";
+    case ProtoSkillPublicationState.SNAPSHOTTING: return "snapshotting";
+    case ProtoSkillPublicationState.PACKAGING: return "packaging";
+    case ProtoSkillPublicationState.SCANNING: return "scanning";
+    case ProtoSkillPublicationState.COMMITTING: return "committing";
+    case ProtoSkillPublicationState.RECONCILING: return "reconciling";
+    case ProtoSkillPublicationState.CANCELLING: return "cancelling";
+    case ProtoSkillPublicationState.PUBLISHED: return "published";
+    case ProtoSkillPublicationState.BLOCKED: return "blocked";
+    case ProtoSkillPublicationState.FAILED: return "failed";
+    case ProtoSkillPublicationState.CANCELLED: return "cancelled";
+    default: throw new GatewayError("The service returned an invalid Skill publication state.");
+  }
+}
+
+function mapSkillPublicationJob(job: ProtoSkillPublicationJob): SkillPublicationJobView {
+  const revision = job.revision?.value;
+  const files = exactSafeUnsignedNumber(job.files);
+  const uncompressedBytes = exactSafeUnsignedNumber(job.uncompressedBytes);
+  const archiveBytes = exactSafeUnsignedNumber(job.archiveBytes);
+  if (!/^skill_publication_[a-f0-9]{32}$/u.test(job.jobId) || revision === undefined || revision < 1n
+    || job.authority === undefined || job.metadata === undefined || job.publisher !== ProtoSkillPublicationPublisher.PERSONAL
+    || job.visibility !== ProtoSkillPublicationVisibility.PUBLIC || files === undefined || uncompressedBytes === undefined
+    || archiveBytes === undefined || !Number.isSafeInteger(job.attempt) || job.attempt < 1
+    || job.gates.length !== 4 || job.createdAt === undefined || job.updatedAt === undefined) {
+    throw new GatewayError("The service returned an invalid Skill publication job.");
+  }
+  const state = mapSkillPublicationState(job.state);
+  const terminal = state === "published" || state === "blocked" || state === "failed" || state === "cancelled";
+  const verdict = job.verdict === ProtoSkillPublicationVerdict.PENDING
+    ? "pending" as const
+    : job.verdict === ProtoSkillPublicationVerdict.PASSED
+      ? "passed" as const
+      : job.verdict === ProtoSkillPublicationVerdict.BLOCKED
+        ? "blocked" as const
+        : undefined;
+  const gates = job.gates.map(mapSkillPublicationGate);
+  const expectedGateIds: SkillPublicationGateView["id"][] = ["metadata", "package", "sensitive_content", "source_authority"];
+  const createdAt = timestampMs(job.createdAt);
+  const updatedAt = timestampMs(job.updatedAt);
+  const completedAt = job.completedAt === undefined ? undefined : timestampMs(job.completedAt);
+  if (verdict === undefined || gates.some((gate, index) => gate.id !== expectedGateIds[index])
+    || updatedAt < createdAt || terminal !== (completedAt !== undefined)
+    || (completedAt !== undefined && completedAt < updatedAt) || terminal && job.cancellable
+    || (state === "published") !== (job.result !== undefined)
+    || state === "published" && (verdict !== "passed" || gates.some((gate) => gate.status !== "passed"))
+    || state === "blocked" && (verdict !== "blocked" || !gates.some((gate) => gate.status === "blocked"))
+    || ((state === "failed" || state === "reconciling" || state === "cancelled") !== (job.error !== undefined))
+    || (job.error !== undefined && (!validPublicationText(job.error, 2_048) || containsPrivatePath(job.error)))) {
+    throw new GatewayError("The service returned an inconsistent Skill publication job.");
+  }
+  return {
+    id: job.jobId,
+    revision,
+    state,
+    authority: mapSkillPublicationAuthority(job.authority),
+    metadata: mapSkillPublicationMetadata(job.metadata),
+    publisher: "personal",
+    visibility: "public",
+    gates,
+    verdict,
+    files,
+    uncompressedBytes,
+    archiveBytes,
+    attempt: job.attempt,
+    ...(job.retryOfJobId === undefined ? {} : { retryOfJobId: job.retryOfJobId }),
+    ...(job.result === undefined ? {} : { result: mapSkillPublicationResult(job.result) }),
+    createdAt,
+    updatedAt,
+    ...(completedAt === undefined ? {} : { completedAt }),
+    ...(job.error === undefined ? {} : { error: job.error }),
+    cancellable: job.cancellable
+  };
+}
+
+function mapSkillPublicationPreview(preview: ProtoSkillPublicationPreview): SkillPublicationPreviewView {
+  const mode = preview.mode === ProtoSkillPublicationMode.FIRST
+    ? "first" as const
+    : preview.mode === ProtoSkillPublicationMode.VERSION
+      ? "version" as const
+      : undefined;
+  if (preview.authority === undefined || preview.source === undefined || mode === undefined
+    || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(preview.suggestedSlug)
+    || !/^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u.test(preview.suggestedVersion)
+    || !preview.personalPublisherAvailable || preview.teamPublisherAvailable
+    || !preview.publicVisibilityAvailable || preview.departmentVisibilityAvailable || preview.privateVisibilityAvailable
+    || !validPublicationText(preview.collaborationUnavailableReason, 512)
+    || containsPrivatePath(preview.collaborationUnavailableReason)) {
+    throw new GatewayError("The service returned an invalid Skill publication preview.");
+  }
+  const authority = mapSkillPublicationAuthority(preview.authority);
+  const source = mapSkillMarketSource(preview.source);
+  const existingEntry = preview.existingEntry === undefined ? undefined : mapSkillMarketEntry(preview.existingEntry);
+  if (source.id !== authority.sourceId || source.revision !== authority.sourceRevision
+    || source.contentRevision !== authority.sourceContentRevision || source.state !== "ready" || source.kind !== "local"
+    || (mode === "first") !== (existingEntry === undefined)
+    || (existingEntry === undefined) !== (authority.existingEntryId === undefined)
+    || existingEntry !== undefined && (existingEntry.identity.entryId !== authority.existingEntryId
+      || existingEntry.slug !== preview.suggestedSlug)) {
+    throw new GatewayError("The service returned an inconsistent Skill publication preview.");
+  }
+  return {
+    authority,
+    source,
+    mode,
+    suggestedSlug: preview.suggestedSlug,
+    suggestedVersion: preview.suggestedVersion,
+    ...(existingEntry === undefined ? {} : { existingEntry }),
+    dirty: preview.dirty,
+    personalPublisherAvailable: true,
+    teamPublisherAvailable: false,
+    publicVisibilityAvailable: true,
+    departmentVisibilityAvailable: false,
+    privateVisibilityAvailable: false,
+    collaborationUnavailableReason: preview.collaborationUnavailableReason
+  };
+}
+
 function privatePathLikeLabel(value: string): boolean {
   return /^[A-Za-z]:[\\/]/u.test(value) || /^\\\\/u.test(value) || value.startsWith("/");
+}
+
+function validPublicationText(value: string, maximum: number, allowEmpty = false): boolean {
+  return value === value.trim() && value.length <= maximum && (allowEmpty || value !== "")
+    && !/[\u0000-\u001f\u007f\u200e\u200f\u202a-\u202e\u2066-\u2069]/u.test(value);
+}
+
+function containsPrivatePath(value: string): boolean {
+  return /[A-Za-z]:[\\/]/u.test(value)
+    || /\\\\[^\\\s"']+[\\/]/u.test(value)
+    || /(?:^|[\s"'(])\/(?:[^/\s"'()]+\/)+[^/\s"'()]*/u.test(value);
 }
 
 function portableSkillName(value: string): boolean {

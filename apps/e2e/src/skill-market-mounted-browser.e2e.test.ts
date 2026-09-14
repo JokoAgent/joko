@@ -98,6 +98,46 @@ describe("mounted Skill market surface", () => {
     await page.locator(".skill-market-controls").getByRole("button", { name: "Refresh", exact: true }).click();
     await expectText(card, "Installed", "synchronized market install state");
 
+    await skillTabs.getByRole("tab", { name: "Installed", exact: true }).click();
+    const globalGroup = page.locator(".skill-catalog__groups > section").filter({ hasText: "Global" });
+    const installedSkill = globalGroup.locator("button.skill-card", { hasText: MARKET_SLUG });
+    await installedSkill.waitFor({ state: "visible", timeout: 20_000 });
+    await installedSkill.click();
+    await page.locator(".skill-detail h2", { hasText: MARKET_SLUG }).waitFor({ state: "visible", timeout: 20_000 });
+    await page.getByRole("button", { name: "Publish", exact: true }).click();
+
+    const publication = page.getByRole("dialog", { name: `Publish ${MARKET_SLUG}` });
+    await publication.waitFor({ state: "visible", timeout: 20_000 });
+    expect(await overflow(page)).toBeLessThanOrEqual(1);
+    await publication.getByRole("button", { name: "Review publication target", exact: true }).click();
+    await publication.getByText("New version", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
+    expect(await publication.locator('input[type="radio"]:disabled').count()).toBe(3);
+    expect(await publication.getByText("Team and restricted visibility require", { exact: false }).count()).toBeGreaterThan(0);
+    expect(await publicationFormColumns(page)).toBe(2);
+    const publishVersion = publication.getByRole("button", { name: "Publish new version", exact: true });
+    expect(await publishVersion.isDisabled()).toBe(true);
+    await publication.getByLabel("Version", { exact: true }).fill("1.2.0");
+    await publication.getByLabel("Changelog · required", { exact: true }).fill("Published through mounted production Chromium.");
+    expect(await publishVersion.isEnabled()).toBe(true);
+
+    await page.setViewportSize({ width: 390, height: 844 });
+    expect(await publicationFormColumns(page)).toBe(1);
+    expect(await overflow(page)).toBeLessThanOrEqual(1);
+    await publishVersion.click();
+    await waitFor(
+      () => publication.textContent(),
+      (text) => text?.includes("Version 1.2.0 is published") === true,
+      "mounted Skill publication completion",
+      30_000
+    );
+    const publicationGates = publication.locator(".skill-publication__gates > section");
+    expect(await publicationGates.count()).toBe(4);
+    for (let index = 0; index < 4; index += 1) await expectText(publicationGates.nth(index), "Passed", `publication gate ${index + 1}`);
+    await publication.getByRole("button", { name: "Open in Skill market", exact: true }).click();
+    await page.locator(".skill-market-detail h2", { hasText: MARKET_NAME }).waitFor({ state: "visible", timeout: 20_000 });
+    await page.getByText("version: 1.2.0", { exact: false }).waitFor({ state: "visible", timeout: 20_000 });
+    expect(await overflow(page)).toBeLessThanOrEqual(1);
+
     await page.setViewportSize({ width: 390, height: 844 });
     const closeNavigation = page.getByLabel("Task navigation").getByRole("button", { name: "Close navigation" });
     if (await closeNavigation.isVisible()) await closeNavigation.click();
@@ -190,6 +230,15 @@ async function columnsAreSideBySide(page: Page): Promise<boolean> {
 
 async function overflow(page: Page): Promise<number> {
   return page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+}
+
+async function publicationFormColumns(page: Page): Promise<number> {
+  return page.evaluate(() => {
+    const labels = [...document.querySelectorAll<HTMLElement>(".skill-publication__form > label:not(.is-wide)")];
+    if (labels.length < 2) return 0;
+    const firstTop = labels[0]!.getBoundingClientRect().top;
+    return labels.filter((label) => Math.abs(label.getBoundingClientRect().top - firstTop) < 1).length;
+  });
 }
 
 function nonBlankEnvironment(name: string): string | undefined {

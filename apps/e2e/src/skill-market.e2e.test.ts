@@ -21,6 +21,13 @@ import {
   SkillMarketSort,
   SkillMarketSyncJobState,
   SkillMarketSyncOutcome,
+  SkillPublicationGateStatus,
+  SkillPublicationMode,
+  SkillPublicationPublisher,
+  SkillPublicationState,
+  SkillPublicationVerdict,
+  SkillPublicationVisibility,
+  StartSkillPublicationMutationSchema,
   TargetState,
   type Operation,
   type OperationMutation,
@@ -175,13 +182,108 @@ describe("production Skill market chain", () => {
     expect(catalog.entries[0]?.installStatuses.find((status) => status.resourceId === globalSkill.skillId))
       .toMatchObject({ state: SkillMarketInstallStatusState.INSTALLED, installedVersion: "1.1.0" });
 
+    const publicationResource = required(
+      (await paired.clients.skill.listSkills({ page: { pageSize: 500 } })).skills.find((skill) => skill.skillId === globalSkill.skillId),
+      "publication Skill Resource"
+    );
+    const publicationEntry = required(catalog.entries[0], "publication destination entry");
+    const publicationPreview = required((await paired.clients.skill.getSkillPublicationPreview({
+      resourceId: publicationResource.skillId,
+      expectedResourceRevision: publicationResource.entityVersion?.revision,
+      sourceId: required(publicationEntry.identity, "publication destination identity").sourceId,
+      expectedSourceRevision: publicationEntry.identity?.sourceRevision,
+      slug: MARKET_SLUG
+    })).preview, "publication preview");
+    expect(publicationPreview).toMatchObject({
+      mode: SkillPublicationMode.VERSION,
+      suggestedSlug: MARKET_SLUG,
+      suggestedVersion: "1.1.1",
+      personalPublisherAvailable: true,
+      teamPublisherAvailable: false,
+      publicVisibilityAvailable: true,
+      departmentVisibilityAvailable: false,
+      privateVisibilityAvailable: false
+    });
+    const publicationAuthority = required(publicationPreview.authority, "publication authority");
+    await succeed(paired, {
+      case: "startSkillPublication",
+      value: create(StartSkillPublicationMutationSchema, {
+        resourceId: publicationAuthority.resourceId,
+        expectedResourceRevision: publicationAuthority.resourceRevision,
+        expectedObservedRevision: publicationAuthority.observedRevision,
+        sourceId: publicationAuthority.sourceId,
+        expectedSourceRevision: publicationAuthority.sourceRevision,
+        expectedSourceContentRevision: publicationAuthority.sourceContentRevision,
+        expectedExistingEntryId: publicationAuthority.existingEntryId,
+        metadata: {
+          slug: MARKET_SLUG,
+          name: MARKET_NAME,
+          author: "Joko E2E",
+          description: "Production Skill market fixture",
+          tags: ["writing", "production"],
+          version: "1.2.0",
+          changelog: "Publish through the production HTTP chain."
+        },
+        publisher: SkillPublicationPublisher.PERSONAL,
+        visibility: SkillPublicationVisibility.PUBLIC
+      })
+    }, "publish the exact Skill version");
+    const publications = await waitFor(
+      () => paired.clients.skill.listSkillPublicationJobs({ resourceId: publicationResource.skillId, page: { pageSize: 100 } }),
+      (value) => value.jobs.some((job) => job.state === SkillPublicationState.PUBLISHED),
+      "the production Skill publication job",
+      20_000
+    );
+    const published = required(publications.jobs.find((job) => job.state === SkillPublicationState.PUBLISHED), "published Skill job");
+    expect(published).toMatchObject({
+      verdict: SkillPublicationVerdict.PASSED,
+      metadata: { slug: MARKET_SLUG, version: "1.2.0", changelog: "Publish through the production HTTP chain." },
+      cancellable: false
+    });
+    expect(published.gates).toHaveLength(4);
+    expect(published.gates.every((gate) => gate.status === SkillPublicationGateStatus.PASSED)).toBe(true);
+    const publicationResult = required(published.result, "published market identity");
+    const exactPublishedEntry = required((await paired.clients.skill.getSkillMarketEntry({
+      identity: {
+        sourceId: publicationResult.sourceId,
+        sourceRevision: publicationResult.sourceRevision,
+        entryId: publicationResult.entryId,
+        entryRevision: publicationResult.entryRevision,
+        contentRevision: publicationResult.entryContentRevision
+      }
+    })).entry, "exact published entry");
+    expect(exactPublishedEntry).toMatchObject({ slug: MARKET_SLUG, version: "1.2.0" });
+    const publishedPreview = required((await paired.clients.skill.openSkillMarketPreview({ identity: exactPublishedEntry.identity })).preview, "published preview");
+    const publishedManifest = required((await paired.clients.skill.readSkillMarketPreviewFile({
+      previewId: publishedPreview.previewId,
+      expectedSnapshotRevision: publishedPreview.snapshotRevision,
+      key: "SKILL.md"
+    })).file, "published manifest");
+    expect(publishedManifest.content).toContain("version: 1.2.0");
+    await paired.clients.skill.closeSkillMarketPreview({ previewId: publishedPreview.previewId });
+    const installedSession = required((await paired.clients.skill.openSkill({
+      skillId: publicationResource.skillId,
+      expectedResourceRevision: publicationResource.entityVersion?.revision
+    })).skill, "installed Skill after publication");
+    const installedManifest = required((await paired.clients.skill.readSkillFile({
+      sessionId: installedSession.sessionId,
+      key: "SKILL.md"
+    })).file, "installed manifest after publication");
+    expect(installedManifest.content).toContain("version: 1.1.0");
+    expect(installedManifest.content).not.toContain("version: 1.2.0");
+    await paired.clients.skill.closeSkill({ sessionId: installedSession.sessionId });
+    expect(privateJson({ publicationPreview, publications, exactPublishedEntry, publishedPreview, publishedManifest })).not.toContain(fixture.rootDirectory);
+
     await fixture.close({ removeRoot: false });
     fixture = undefined;
     fixture = await SkillMarketSystemFixture.start({ rootDirectory, keepRoot: true });
     paired = await fixture.pair("Skill market restart owner");
     const restartedCatalog = await paired.clients.skill.listSkillMarketCatalog({ sort: SkillMarketSort.UPDATED, page: { pageSize: 100 } });
     expect(restartedCatalog.entries[0]?.installStatuses.find((status) => status.resourceId === globalSkill.skillId))
-      .toMatchObject({ state: SkillMarketInstallStatusState.INSTALLED, installedVersion: "1.1.0" });
+      .toMatchObject({ state: SkillMarketInstallStatusState.UPDATE_AVAILABLE, installedVersion: "1.1.0" });
+    expect(restartedCatalog.entries[0]).toMatchObject({ version: "1.2.0" });
+    expect((await paired.clients.skill.listSkillPublicationJobs({ resourceId: globalSkill.skillId, page: { pageSize: 100 } })).jobs)
+      .toMatchObject([{ state: SkillPublicationState.PUBLISHED, result: { version: "1.2.0" } }]);
     expect((await paired.clients.skill.listSkillMarketSyncPolicies({ page: { pageSize: 100 } })).policies)
       .toMatchObject([{ resourceId: globalSkill.skillId, enabled: true }]);
 

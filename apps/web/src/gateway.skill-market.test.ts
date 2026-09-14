@@ -14,7 +14,13 @@ import {
   SkillMarketSourceKind,
   SkillMarketSourceState,
   SkillMarketSyncJobState,
-  SkillMarketSyncOutcome
+  SkillMarketSyncOutcome,
+  SkillPublicationGateStatus,
+  SkillPublicationMode,
+  SkillPublicationPublisher,
+  SkillPublicationState,
+  SkillPublicationVerdict,
+  SkillPublicationVisibility
 } from "@joko/contracts";
 import { describe, expect, it, vi } from "vitest";
 
@@ -25,6 +31,7 @@ const ENTRY_ID = "skill_market_entry_0123456789abcdef0123456789abcdef";
 const PREVIEW_ID = "skill_market_preview_0123456789abcdef0123456789abcdef";
 const PLAN_ID = "skill_market_install_0123456789abcdef0123456789abcdef";
 const JOB_ID = "skill_sync_0123456789abcdef0123456789abcdef";
+const PUBLICATION_ID = "skill_publication_0123456789abcdef0123456789abcdef";
 const HASH = `sha256:${"a".repeat(64)}`;
 const OTHER_HASH = `sha256:${"b".repeat(64)}`;
 
@@ -62,6 +69,11 @@ describe("Skill market gateway", () => {
         jobs: [protoJob()], recoveredFromCorruption: false, page: { totalSize: 1n, nextPageToken: "" }
       };
       if (method === "getSkillMarketSyncJob") return { job: protoJob(), recoveredFromCorruption: false };
+      if (method === "getSkillPublicationPreview") return { preview: protoPublicationPreview() };
+      if (method === "listSkillPublicationJobs") return {
+        jobs: [protoPublicationJob()], recoveredFromCorruption: false, page: { totalSize: 1n, nextPageToken: "" }
+      };
+      if (method === "getSkillPublicationJob") return { job: protoPublicationJob(), recoveredFromCorruption: false };
       if (method === "submitOperation") return {
         operation: {
           operationId: input.operationId,
@@ -111,6 +123,21 @@ describe("Skill market gateway", () => {
     await gateway.cancelSkillMarketSync(job);
     await gateway.retrySkillMarketSync(job);
 
+    const publicationPreview = await gateway.getSkillPublicationPreview("resource-skill", 7n, SOURCE_ID, 2n);
+    const publications = await gateway.listSkillPublicationJobs("resource-skill");
+    const publication = publications.items[0]!;
+    expect(publicationPreview).toMatchObject({
+      mode: "first", suggestedSlug: "draft-skill", suggestedVersion: "1.0.0",
+      teamPublisherAvailable: false, privateVisibilityAvailable: false
+    });
+    expect(publication).toMatchObject({ id: PUBLICATION_ID, state: "published", verdict: "passed", result: { version: "1.0.0" } });
+    await expect(gateway.getSkillPublicationJob(publication.id)).resolves.toEqual(publication);
+    await gateway.startSkillPublication(publicationPreview, {
+      slug: "draft-skill", name: "Draft Skill", description: "Publish safely.", tags: ["writing"], version: "1.0.0"
+    });
+    await gateway.cancelSkillPublication(publication);
+    await gateway.retrySkillPublication(publication);
+
     await gateway.addSkillMarketSource({ kind: "local", serverPath: "D:\\private\\skill-market" }, sources.revision);
     await gateway.refreshSkillMarketSource(sources.sources[0]!.id, sources.sources[0]!.revision);
     await gateway.removeSkillMarketSource(sources.sources[0]!.id, sources.sources[0]!.revision);
@@ -130,11 +157,19 @@ describe("Skill market gateway", () => {
       { case: "enqueueSkillMarketSync", value: { resourceId: "resource-skill", expectedPolicyRevision: { value: 3n } } },
       { case: "cancelSkillMarketSync", value: { jobId: JOB_ID, expectedRevision: { value: 5n } } },
       { case: "retrySkillMarketSync", value: { jobId: JOB_ID, expectedRevision: { value: 5n } } },
+      { case: "startSkillPublication", value: {
+        resourceId: "resource-skill", expectedResourceRevision: { value: 7n }, expectedObservedRevision: HASH,
+        sourceId: SOURCE_ID, expectedSourceRevision: { value: 2n }, expectedSourceContentRevision: HASH,
+        metadata: { slug: "draft-skill", version: "1.0.0" },
+        publisher: SkillPublicationPublisher.PERSONAL, visibility: SkillPublicationVisibility.PUBLIC
+      } },
+      { case: "cancelSkillPublication", value: { jobId: PUBLICATION_ID, expectedRevision: { value: 6n } } },
+      { case: "retrySkillPublication", value: { jobId: PUBLICATION_ID, expectedRevision: { value: 6n } } },
       { case: "addSkillMarketSource", value: { expectedCatalogRevision: { value: 9n }, source: { kind: { case: "local", value: { serverPath: "D:\\private\\skill-market" } } } } },
       { case: "refreshSkillMarketSource", value: { sourceId: SOURCE_ID, expectedRevision: { value: 2n } } },
       { case: "removeSkillMarketSource", value: { sourceId: SOURCE_ID, expectedRevision: { value: 2n } } }
     ]);
-    const publicProjection = JSON.stringify({ sources, firstPage, entry, preview, plan, policies, jobs }, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value);
+    const publicProjection = JSON.stringify({ sources, firstPage, entry, preview, plan, policies, jobs, publicationPreview, publications }, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value);
     expect(publicProjection).not.toMatch(/[A-Za-z]:[\\/]|\/home\//u);
     gateway.disconnect();
   });
@@ -158,6 +193,37 @@ describe("Skill market gateway", () => {
     await expect(gateway.listSkillMarketSources()).rejects.toThrow("path-bearing Skill market source");
     invalid = "file";
     await expect(gateway.readSkillMarketPreviewFile(mappedPreview(), "SKILL.md")).rejects.toThrow("invalid Skill market preview file");
+    gateway.disconnect();
+  });
+
+  it("fails closed on publication paths and unknown publication state", async () => {
+    let invalid: "authority" | "state" | "error" = "authority";
+    const gateway = await mount(async (method) => {
+      if (method === "getSnapshot") return { snapshot: {} };
+      if (method === "getSkillPublicationPreview" && invalid === "authority") return {
+        preview: {
+          ...protoPublicationPreview(),
+          authority: { ...protoPublicationAuthority(), sourceDisplay: "Local source D:\\private\\market" }
+        }
+      };
+      if (method === "listSkillPublicationJobs" && invalid === "state") return {
+        jobs: [{ ...protoPublicationJob(), state: 999 }], recoveredFromCorruption: false,
+        page: { totalSize: 1n, nextPageToken: "" }
+      };
+      if (method === "listSkillPublicationJobs" && invalid === "error") return {
+        jobs: [protoFailedPublicationJob("Commit failed at D:\\private\\market\\manifest.json")],
+        recoveredFromCorruption: false, page: { totalSize: 1n, nextPageToken: "" }
+      };
+      throw new Error(`Unexpected method: ${method}`);
+    });
+    await expect(gateway.getSkillPublicationPreview("resource-skill", 7n, SOURCE_ID, 2n))
+      .rejects.toThrow("path-bearing Skill publication authority");
+    invalid = "state";
+    await expect(gateway.listSkillPublicationJobs("resource-skill"))
+      .rejects.toThrow("invalid Skill publication state");
+    invalid = "error";
+    await expect(gateway.listSkillPublicationJobs("resource-skill"))
+      .rejects.toThrow("inconsistent Skill publication job");
     gateway.disconnect();
   });
 });
@@ -267,6 +333,60 @@ function protoJob(): object {
     authority: { sourceId: SOURCE_ID, entryId: ENTRY_ID, target: protoTarget(), baseline: protoBaseline() },
     attempt: 1, availableVersion: "2.0.0", outcome: SkillMarketSyncOutcome.DIRTY_CONTENT,
     error: "Installed content changed.", createdAt: timestamp(), updatedAt: timestamp(1_700_000_100n), completedAt: timestamp(1_700_000_100n)
+  };
+}
+
+function protoPublicationAuthority(): object {
+  return {
+    resourceId: "resource-skill", resourceRevision: { value: 7n }, observedRevision: HASH,
+    backendId: "pi", scope: ResourceScope.GLOBAL, sourceId: SOURCE_ID, sourceRevision: { value: 2n },
+    sourceContentRevision: HASH, sourceDisplay: "team-skills"
+  };
+}
+
+function protoPublicationGates(): object[] {
+  return ["metadata", "package", "sensitive_content", "source_authority"].map((gateId) => ({
+    gateId, label: gateId, status: SkillPublicationGateStatus.PASSED, issues: []
+  }));
+}
+
+function protoPublicationPreview(): object {
+  return {
+    authority: protoPublicationAuthority(), source: protoSource(), mode: SkillPublicationMode.FIRST,
+    suggestedSlug: "draft-skill", suggestedVersion: "1.0.0", dirty: false,
+    personalPublisherAvailable: true, teamPublisherAvailable: false,
+    publicVisibilityAvailable: true, departmentVisibilityAvailable: false, privateVisibilityAvailable: false,
+    collaborationUnavailableReason: "A collaboration identity owner is not configured."
+  };
+}
+
+function protoPublicationJob(): object {
+  return {
+    jobId: PUBLICATION_ID, revision: { value: 6n }, state: SkillPublicationState.PUBLISHED,
+    authority: protoPublicationAuthority(),
+    metadata: { slug: "draft-skill", name: "Draft Skill", description: "Publish safely.", tags: ["writing"], version: "1.0.0" },
+    publisher: SkillPublicationPublisher.PERSONAL, visibility: SkillPublicationVisibility.PUBLIC,
+    gates: protoPublicationGates(), verdict: SkillPublicationVerdict.PASSED,
+    files: 2n, uncompressedBytes: 256n, archiveBytes: 128n, attempt: 1,
+    result: {
+      sourceId: SOURCE_ID, sourceRevision: { value: 3n }, entryId: ENTRY_ID, entryRevision: { value: 1n },
+      entryContentRevision: OTHER_HASH, version: "1.0.0"
+    },
+    createdAt: timestamp(), updatedAt: timestamp(1_700_000_100n), completedAt: timestamp(1_700_000_100n), cancellable: false
+  };
+}
+
+function protoFailedPublicationJob(error: string): object {
+  return {
+    ...protoPublicationJob(),
+    state: SkillPublicationState.FAILED,
+    gates: ["metadata", "package", "sensitive_content", "source_authority"].map((gateId) => ({
+      gateId, label: gateId, status: SkillPublicationGateStatus.PENDING, issues: []
+    })),
+    verdict: SkillPublicationVerdict.PENDING,
+    result: undefined,
+    error,
+    cancellable: false
   };
 }
 

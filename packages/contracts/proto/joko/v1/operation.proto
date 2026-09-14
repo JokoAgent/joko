@@ -223,6 +223,9 @@ message OperationMutation {
     EnqueueSkillMarketSyncMutation enqueue_skill_market_sync = 205;
     CancelSkillMarketSyncMutation cancel_skill_market_sync = 206;
     RetrySkillMarketSyncMutation retry_skill_market_sync = 207;
+    StartSkillPublicationMutation start_skill_publication = 208;
+    CancelSkillPublicationMutation cancel_skill_publication = 209;
+    RetrySkillPublicationMutation retry_skill_publication = 210;
   }
 }
 
@@ -284,6 +287,29 @@ message CancelSkillMarketSyncMutation {
 }
 
 message RetrySkillMarketSyncMutation {
+  string job_id = 1;
+  Revision expected_revision = 2;
+}
+
+message StartSkillPublicationMutation {
+  string resource_id = 1;
+  Revision expected_resource_revision = 2;
+  string expected_observed_revision = 3;
+  string source_id = 4;
+  Revision expected_source_revision = 5;
+  string expected_source_content_revision = 6;
+  optional string expected_existing_entry_id = 7;
+  SkillPublicationMetadata metadata = 8;
+  SkillPublicationPublisher publisher = 9;
+  SkillPublicationVisibility visibility = 10;
+}
+
+message CancelSkillPublicationMutation {
+  string job_id = 1;
+  Revision expected_revision = 2;
+}
+
+message RetrySkillPublicationMutation {
   string job_id = 1;
   Revision expected_revision = 2;
 }

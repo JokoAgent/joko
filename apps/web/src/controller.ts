@@ -2053,6 +2053,13 @@ export function useAppController(): AppController {
     enqueueSkillMarketSync: (policy, signal) => gateway().enqueueSkillMarketSync(policy, signal),
     cancelSkillMarketSync: (job, signal) => gateway().cancelSkillMarketSync(job, signal),
     retrySkillMarketSync: (job, signal) => gateway().retrySkillMarketSync(job, signal),
+    getSkillPublicationPreview: (resourceId, expectedResourceRevision, sourceId, expectedSourceRevision, slug, signal) =>
+      gateway().getSkillPublicationPreview(resourceId, expectedResourceRevision, sourceId, expectedSourceRevision, slug, signal),
+    listSkillPublicationJobs: (resourceId, signal) => gateway().listSkillPublicationJobs(resourceId, signal),
+    getSkillPublicationJob: (jobId, signal) => gateway().getSkillPublicationJob(jobId, signal),
+    startSkillPublication: (preview, metadata, signal) => gateway().startSkillPublication(preview, metadata, signal),
+    cancelSkillPublication: (job, signal) => gateway().cancelSkillPublication(job, signal),
+    retrySkillPublication: (job, signal) => gateway().retrySkillPublication(job, signal),
     listCommands: (sessionId) => gateway().listCommands(sessionId),
     listSessionResources: (sessionId, signal) => gateway().listSessionResources(sessionId, signal),
     listRuntimeProcesses: (backendId, signal) => gateway().listRuntimeProcesses(backendId, signal),

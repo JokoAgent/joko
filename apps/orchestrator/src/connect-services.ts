@@ -298,6 +298,7 @@ import {
   type SkillMarketEntryIdentity as NativeSkillMarketEntryIdentity,
   type SkillMarketInstallPlanDescriptor as NativeSkillMarketInstallPlan,
   type SkillMarketManager,
+  type SkillMarketPublicationMetadata as NativeSkillPublicationMetadata,
   type SkillMarketPreviewDescriptor as NativeSkillMarketPreview,
   type SkillMarketPreviewFile as NativeSkillMarketPreviewFile,
   type SkillMarketSourceDescriptor as NativeSkillMarketSourceDescriptor,
@@ -311,6 +312,15 @@ import type {
   SkillMarketSyncPolicy as NativeSkillMarketSyncPolicy,
   SkillMarketSyncTarget as NativeSkillMarketSyncTarget
 } from "./skill-market-sync-manager.js";
+import {
+  skillPublicationJobId,
+  type SkillPublicationAuthority as NativeSkillPublicationAuthority,
+  type SkillPublicationGate as NativeSkillPublicationGate,
+  type SkillPublicationJob as NativeSkillPublicationJob,
+  type SkillPublicationManager,
+  type SkillPublicationPreview as NativeSkillPublicationPreview,
+  type SkillPublicationResult as NativeSkillPublicationResult
+} from "./skill-publication-manager.js";
 import {
   normalizePiPackageSource,
   piPackageSourceIdentity,
@@ -445,6 +455,7 @@ interface ConnectServiceDependencies {
   readonly skills?: SkillManager;
   readonly skillMarket?: SkillMarketManager;
   readonly skillMarketSync?: SkillMarketSyncManager;
+  readonly skillPublication?: SkillPublicationManager;
   readonly extensionCatalog?: ExtensionCatalogManager;
   readonly extensionLibraries?: ExtensionLibraryManager;
   readonly extensionMainViews?: ExtensionMainViewManager;
@@ -987,6 +998,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
     ...(application.skills === undefined ? {} : { skills: application.skills }),
     ...(application.skillMarket === undefined ? {} : { skillMarket: application.skillMarket }),
     ...(application.skillMarketSync === undefined ? {} : { skillMarketSync: application.skillMarketSync }),
+    ...(application.skillPublication === undefined ? {} : { skillPublication: application.skillPublication }),
     ...(application.extensionCatalog === undefined ? {} : { extensionCatalog: application.extensionCatalog }),
     ...(application.extensionLibraries === undefined ? {} : { extensionLibraries: application.extensionLibraries }),
     ...(application.extensionMainViews === undefined ? {} : { extensionMainViews: application.extensionMainViews }),
@@ -4208,6 +4220,52 @@ export function createConnectServices(application: OrchestratorApplication): Con
       const manager = requireSkillMarketSyncManager(dependencies);
       return skillMarketEffectSync(() => ({
         job: mapSkillMarketSyncJob(manager.getJob(nonBlankRequest(request.jobId, "job_id"))),
+        recoveredFromCorruption: manager.recoveredFromCorruption
+      }));
+    },
+    getSkillPublicationPreview: async (request, context) => {
+      authenticate(context);
+      const manager = requireSkillPublicationManager(dependencies);
+      if (request.expectedResourceRevision === undefined) throw invalidArgument("expected_resource_revision is required");
+      if (request.expectedSourceRevision === undefined) throw invalidArgument("expected_source_revision is required");
+      const preview = await skillEffect(() => manager.preview({
+        resourceId: nonBlankRequest(request.resourceId, "resource_id"),
+        expectedResourceRevision: fromProtoRevision(
+          request.expectedResourceRevision,
+          "get_skill_publication_preview.expected_resource_revision"
+        ),
+        sourceId: nonBlankRequest(request.sourceId, "source_id"),
+        expectedSourceRevision: fromProtoRevision(
+          request.expectedSourceRevision,
+          "get_skill_publication_preview.expected_source_revision"
+        ),
+        ...(request.slug === undefined ? {} : { slug: request.slug })
+      }));
+      return { preview: mapSkillPublicationPreview(preview) };
+    },
+    listSkillPublicationJobs: (request, context) => {
+      authenticate(context);
+      if (dependencies.skillPublication === undefined) {
+        return { jobs: [], recoveredFromCorruption: false, page: emptyPage(request.page) };
+      }
+      return skillMarketEffectSync(() => {
+        const result = paginate(dependencies.skillPublication!.list({
+          ...(request.resourceId === undefined
+            ? {}
+            : { resourceId: nonBlankRequest(request.resourceId, "resource_id") })
+        }).map(mapSkillPublicationJob), request.page);
+        return {
+          jobs: result.values,
+          recoveredFromCorruption: dependencies.skillPublication!.recoveredFromCorruption,
+          page: result.page
+        };
+      });
+    },
+    getSkillPublicationJob: (request, context) => {
+      authenticate(context);
+      const manager = requireSkillPublicationManager(dependencies);
+      return skillMarketEffectSync(() => ({
+        job: mapSkillPublicationJob(manager.get(nonBlankRequest(request.jobId, "job_id"))),
         recoveredFromCorruption: manager.recoveredFromCorruption
       }));
     }
@@ -9777,6 +9835,11 @@ function requireSkillMarketSyncManager(dependencies: ConnectServiceDependencies)
   return dependencies.skillMarketSync;
 }
 
+function requireSkillPublicationManager(dependencies: ConnectServiceDependencies): SkillPublicationManager {
+  if (dependencies.skillPublication === undefined) throw new ConnectError("Skill publication is unavailable.", Code.Unimplemented);
+  return dependencies.skillPublication;
+}
+
 async function skillEffect<T>(effect: () => Promise<T>): Promise<T> {
   try {
     return await effect();
@@ -9939,9 +10002,10 @@ function mapSkillMarketEntry(value: NativeSkillMarketCatalogItem): contract.Skil
     name: value.name,
     ...(value.author === undefined ? {} : { author: value.author }),
     description: value.description,
-    category: value.category,
+    ...(value.category === undefined ? {} : { category: value.category }),
     tags: [...value.tags],
     version: value.version,
+    ...(value.changelog === undefined ? {} : { changelog: value.changelog }),
     createdAt: toProtoTimestamp(value.createdAt),
     updatedAt: toProtoTimestamp(value.updatedAt),
     downloads: BigInt(value.downloads),
@@ -10156,6 +10220,146 @@ function protoSkillMarketSyncOutcome(value: NonNullable<NativeSkillMarketSyncJob
     case "RESOURCE_REMOVED": return contract.SkillMarketSyncOutcome.RESOURCE_REMOVED;
     case "CANCELLED": return contract.SkillMarketSyncOutcome.CANCELLED;
   }
+}
+
+function nativeSkillPublicationMetadata(value: contract.SkillPublicationMetadata | undefined): NativeSkillPublicationMetadata {
+  if (value === undefined) throw invalidArgument("metadata is required");
+  return {
+    slug: value.slug,
+    name: value.name,
+    ...(value.author === undefined ? {} : { author: value.author }),
+    description: value.description,
+    ...(value.category === undefined ? {} : { category: value.category }),
+    tags: [...value.tags],
+    version: value.version,
+    ...(value.changelog === undefined ? {} : { changelog: value.changelog })
+  };
+}
+
+function nativeSkillPublicationPublisher(value: contract.SkillPublicationPublisher): "personal" {
+  if (value !== contract.SkillPublicationPublisher.PERSONAL) throw invalidArgument("publisher must be PERSONAL");
+  return "personal";
+}
+
+function nativeSkillPublicationVisibility(value: contract.SkillPublicationVisibility): "public" {
+  if (value !== contract.SkillPublicationVisibility.PUBLIC) throw invalidArgument("visibility must be PUBLIC");
+  return "public";
+}
+
+function mapSkillPublicationMetadata(value: NativeSkillPublicationMetadata): contract.SkillPublicationMetadata {
+  return create(contract.SkillPublicationMetadataSchema, {
+    slug: value.slug,
+    name: value.name,
+    ...(value.author === undefined ? {} : { author: value.author }),
+    description: value.description,
+    ...(value.category === undefined ? {} : { category: value.category }),
+    tags: [...value.tags],
+    version: value.version,
+    ...(value.changelog === undefined ? {} : { changelog: value.changelog })
+  });
+}
+
+function mapSkillPublicationAuthority(value: NativeSkillPublicationAuthority): contract.SkillPublicationAuthority {
+  return create(contract.SkillPublicationAuthoritySchema, {
+    resourceId: value.resourceId,
+    resourceRevision: toProtoRevision(value.resourceRevision),
+    observedRevision: value.observedRevision,
+    backendId: value.backendId,
+    ...(value.targetId === undefined ? {} : { targetId: value.targetId }),
+    scope: value.scope === "project" ? contract.ResourceScope.PROJECT : contract.ResourceScope.GLOBAL,
+    sourceId: value.sourceId,
+    sourceRevision: toProtoRevision(value.sourceRevision),
+    sourceContentRevision: value.sourceContentRevision,
+    sourceDisplay: value.sourceDisplay,
+    ...(value.existingEntryId === undefined ? {} : { existingEntryId: value.existingEntryId })
+  });
+}
+
+function mapSkillPublicationGate(value: NativeSkillPublicationGate): contract.SkillPublicationGate {
+  return create(contract.SkillPublicationGateSchema, {
+    gateId: value.id,
+    label: value.label,
+    status: value.status === "pending" ? contract.SkillPublicationGateStatus.PENDING
+      : value.status === "passed" ? contract.SkillPublicationGateStatus.PASSED
+        : contract.SkillPublicationGateStatus.BLOCKED,
+    issues: value.issues.map((issue) => create(contract.SkillPublicationGateIssueSchema, {
+      code: issue.code,
+      message: issue.message,
+      ...(issue.path === undefined ? {} : { path: issue.path })
+    }))
+  });
+}
+
+function mapSkillPublicationResult(value: NativeSkillPublicationResult): contract.SkillPublicationResult {
+  return create(contract.SkillPublicationResultSchema, {
+    sourceId: value.sourceId,
+    sourceRevision: toProtoRevision(value.sourceRevision),
+    entryId: value.entryId,
+    entryRevision: toProtoRevision(value.entryRevision),
+    entryContentRevision: value.entryContentRevision,
+    version: value.version
+  });
+}
+
+function mapSkillPublicationJob(value: NativeSkillPublicationJob): contract.SkillPublicationJob {
+  return create(contract.SkillPublicationJobSchema, {
+    jobId: value.id,
+    revision: toProtoRevision(value.revision),
+    state: protoSkillPublicationState(value.state),
+    authority: mapSkillPublicationAuthority(value.authority),
+    metadata: mapSkillPublicationMetadata(value.metadata),
+    publisher: contract.SkillPublicationPublisher.PERSONAL,
+    visibility: contract.SkillPublicationVisibility.PUBLIC,
+    gates: value.gates.map(mapSkillPublicationGate),
+    verdict: value.verdict === "pending" ? contract.SkillPublicationVerdict.PENDING
+      : value.verdict === "passed" ? contract.SkillPublicationVerdict.PASSED
+        : contract.SkillPublicationVerdict.BLOCKED,
+    files: BigInt(value.files),
+    uncompressedBytes: BigInt(value.uncompressedBytes),
+    archiveBytes: BigInt(value.archiveBytes),
+    attempt: value.attempt,
+    ...(value.retryOfJobId === undefined ? {} : { retryOfJobId: value.retryOfJobId }),
+    ...(value.result === undefined ? {} : { result: mapSkillPublicationResult(value.result) }),
+    createdAt: toProtoTimestamp(value.createdAt),
+    updatedAt: toProtoTimestamp(value.updatedAt),
+    ...(value.completedAt === undefined ? {} : { completedAt: toProtoTimestamp(value.completedAt) }),
+    ...(value.error === undefined ? {} : { error: value.error }),
+    cancellable: value.cancellable
+  });
+}
+
+function protoSkillPublicationState(value: NativeSkillPublicationJob["state"]): contract.SkillPublicationState {
+  switch (value) {
+    case "pending": return contract.SkillPublicationState.PENDING;
+    case "snapshotting": return contract.SkillPublicationState.SNAPSHOTTING;
+    case "packaging": return contract.SkillPublicationState.PACKAGING;
+    case "scanning": return contract.SkillPublicationState.SCANNING;
+    case "committing": return contract.SkillPublicationState.COMMITTING;
+    case "reconciling": return contract.SkillPublicationState.RECONCILING;
+    case "cancelling": return contract.SkillPublicationState.CANCELLING;
+    case "published": return contract.SkillPublicationState.PUBLISHED;
+    case "blocked": return contract.SkillPublicationState.BLOCKED;
+    case "failed": return contract.SkillPublicationState.FAILED;
+    case "cancelled": return contract.SkillPublicationState.CANCELLED;
+  }
+}
+
+function mapSkillPublicationPreview(value: NativeSkillPublicationPreview): contract.SkillPublicationPreview {
+  return create(contract.SkillPublicationPreviewSchema, {
+    authority: mapSkillPublicationAuthority(value.authority),
+    source: mapSkillMarketSource(value.source),
+    mode: value.mode === "first" ? contract.SkillPublicationMode.FIRST : contract.SkillPublicationMode.VERSION,
+    suggestedSlug: value.suggestedSlug,
+    suggestedVersion: value.suggestedVersion,
+    ...(value.existingEntry === undefined ? {} : { existingEntry: mapSkillMarketEntry(value.existingEntry) }),
+    dirty: value.dirty,
+    personalPublisherAvailable: value.personalPublisherAvailable,
+    teamPublisherAvailable: value.teamPublisherAvailable,
+    publicVisibilityAvailable: value.publicVisibilityAvailable,
+    departmentVisibilityAvailable: value.departmentVisibilityAvailable,
+    privateVisibilityAvailable: value.privateVisibilityAvailable,
+    collaborationUnavailableReason: value.collaborationUnavailableReason
+  });
 }
 
 function nativeSkillScope(value: contract.ResourceScope): NativeSkillCatalogEntry["scope"] {
@@ -18491,6 +18695,98 @@ async function dispatchMutation(
         undefined,
         async (completed) => {
           if (!completed.replayed && jobId !== undefined) dependencies.skillMarketSync!.begin(jobId);
+        }
+      );
+    }
+    case "startSkillPublication": {
+      if (dependencies.skillPublication === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Skill publication is unavailable.");
+      }
+      if (payload.value.expectedResourceRevision === undefined) throw invalidArgument("expected_resource_revision is required");
+      if (payload.value.expectedSourceRevision === undefined) throw invalidArgument("expected_source_revision is required");
+      const jobId = skillPublicationJobId(operationId);
+      return ackOperation(
+        dependencies,
+        operationId,
+        connection,
+        mutation,
+        payload.case,
+        async () => skillEffect(async () => {
+          await dependencies.skillPublication!.start({
+            jobId,
+            resourceId: nonBlankRequest(payload.value.resourceId, "resource_id"),
+            expectedResourceRevision: fromProtoRevision(
+              payload.value.expectedResourceRevision,
+              "start_skill_publication.expected_resource_revision"
+            ),
+            expectedObservedRevision: nonBlankRequest(
+              payload.value.expectedObservedRevision,
+              "expected_observed_revision"
+            ),
+            sourceId: nonBlankRequest(payload.value.sourceId, "source_id"),
+            expectedSourceRevision: fromProtoRevision(
+              payload.value.expectedSourceRevision,
+              "start_skill_publication.expected_source_revision"
+            ),
+            expectedSourceContentRevision: nonBlankRequest(
+              payload.value.expectedSourceContentRevision,
+              "expected_source_content_revision"
+            ),
+            ...(payload.value.expectedExistingEntryId === undefined
+              ? {}
+              : { expectedExistingEntryId: payload.value.expectedExistingEntryId }),
+            metadata: nativeSkillPublicationMetadata(payload.value.metadata),
+            publisher: nativeSkillPublicationPublisher(payload.value.publisher),
+            visibility: nativeSkillPublicationVisibility(payload.value.visibility)
+          });
+        }),
+        undefined,
+        undefined,
+        async (completed) => {
+          if (!completed.replayed) dependencies.skillPublication!.begin(jobId);
+        }
+      );
+    }
+    case "cancelSkillPublication": {
+      if (dependencies.skillPublication === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Skill publication is unavailable.");
+      }
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const jobId = nonBlankRequest(payload.value.jobId, "job_id");
+      const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "cancel_skill_publication.expected_revision");
+      return effectOperation(dependencies, operationId, connection, mutation, payload.case, {
+        accepted: true,
+        resultCase: "acknowledgement",
+        entityId: jobId
+      }, async () => skillEffect(async () => {
+        await dependencies.skillPublication!.cancel(jobId, expectedRevision);
+      }));
+    }
+    case "retrySkillPublication": {
+      if (dependencies.skillPublication === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Skill publication is unavailable.");
+      }
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      const previousJobId = nonBlankRequest(payload.value.jobId, "job_id");
+      const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "retry_skill_publication.expected_revision");
+      let resumedJobId: string | undefined;
+      return ackOperation(
+        dependencies,
+        operationId,
+        connection,
+        mutation,
+        payload.case,
+        async () => skillEffect(async () => {
+          resumedJobId = (await dependencies.skillPublication!.retry(
+            previousJobId,
+            expectedRevision,
+            skillPublicationJobId(operationId)
+          )).id;
+        }),
+        undefined,
+        undefined,
+        async (completed) => {
+          if (!completed.replayed && resumedJobId !== undefined) dependencies.skillPublication!.begin(resumedJobId);
         }
       );
     }

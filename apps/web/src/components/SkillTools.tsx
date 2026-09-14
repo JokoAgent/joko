@@ -14,7 +14,8 @@ import {
   RefreshCcw,
   Search,
   Sparkles,
-  Trash2
+  Trash2,
+  Upload
 } from "lucide-react";
 
 import type { AppController } from "../controller.js";
@@ -25,6 +26,8 @@ import type {
   SkillDraftView,
   SkillFileContentView,
   SkillFileEntryView,
+  SkillMarketEntryIdentityView,
+  SkillPublicationResultView,
   SkillRecoveryView,
   SkillScopeView,
   SkillSessionView,
@@ -33,6 +36,7 @@ import type {
 import type { Translator } from "./types.js";
 import { moveTablistSelection } from "./tablist-navigation.js";
 import { SkillMarketCatalogTools, SkillMarketSourcesTools } from "./SkillMarketTools.js";
+import { SkillPublicationDialog } from "./SkillPublicationTools.js";
 import { Button, EmptyState, IconButton, Modal, Pill, SelectControl, cx, formatRelativeTime } from "./ui.js";
 
 type LoadState<T> =
@@ -82,6 +86,17 @@ export function SkillTools({ controller, backends, targets, locale, t }: {
   readonly t: Translator;
 }): JSX.Element {
   const [tab, setTab] = useState<"installed" | "market" | "sources">("installed");
+  const [marketHandoff, setMarketHandoff] = useState<SkillMarketEntryIdentityView>();
+  const openPublishedEntry = (result: SkillPublicationResultView): void => {
+    setMarketHandoff({
+      sourceId: result.sourceId,
+      sourceRevision: result.sourceRevision,
+      entryId: result.entryId,
+      entryRevision: result.entryRevision,
+      contentRevision: result.entryContentRevision
+    });
+    setTab("market");
+  };
   return <div className="skill-hub">
     <div className="skill-hub__tabs" role="tablist" aria-label={t("skills.sections.label")}>
       {(["installed", "market", "sources"] as const).map((value) => <button
@@ -95,18 +110,19 @@ export function SkillTools({ controller, backends, targets, locale, t }: {
         onClick={() => setTab(value)}
       >{t(`skills.sections.${value}`)}</button>)}
     </div>
-    {tab === "installed" && <LocalSkillTools controller={controller} backends={backends} targets={targets} locale={locale} t={t} />}
-    {tab === "market" && <SkillMarketCatalogTools controller={controller} backends={backends} targets={targets} locale={locale} t={t} onOpenSources={() => setTab("sources")} />}
+    {tab === "installed" && <LocalSkillTools controller={controller} backends={backends} targets={targets} locale={locale} t={t} onOpenPublished={openPublishedEntry} />}
+    {tab === "market" && <SkillMarketCatalogTools controller={controller} backends={backends} targets={targets} locale={locale} t={t} initialSelection={marketHandoff} onOpenSources={() => setTab("sources")} />}
     {tab === "sources" && <SkillMarketSourcesTools controller={controller} locale={locale} t={t} onOpenMarket={() => setTab("market")} />}
   </div>;
 }
 
-function LocalSkillTools({ controller, backends, targets, locale, t }: {
+function LocalSkillTools({ controller, backends, targets, locale, t, onOpenPublished }: {
   readonly controller: AppController;
   readonly backends: readonly BackendView[];
   readonly targets: readonly TargetView[];
   readonly locale: string;
   readonly t: Translator;
+  readonly onOpenPublished: (result: SkillPublicationResultView) => void;
 }): JSX.Element {
   const [query, setQuery] = useState("");
   const [scope, setScope] = useState<"all" | SkillScopeView>("all");
@@ -124,6 +140,7 @@ function LocalSkillTools({ controller, backends, targets, locale, t }: {
   const [renameOpen, setRenameOpen] = useState(false);
   const [renameValue, setRenameValue] = useState("");
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const [publishOpen, setPublishOpen] = useState(false);
   const [deleteConfirmation, setDeleteConfirmation] = useState("");
   const [recoveries, setRecoveries] = useState<readonly SkillRecoveryView[]>([]);
   const [recoveryError, setRecoveryError] = useState<string>();
@@ -200,6 +217,7 @@ function LocalSkillTools({ controller, backends, targets, locale, t }: {
     setEditorText("");
     setActionError(undefined);
     setPreview(undefined);
+    setPublishOpen(false);
     if (selected === undefined) {
       setSessionState(undefined);
       return () => abort.abort();
@@ -422,6 +440,7 @@ function LocalSkillTools({ controller, backends, targets, locale, t }: {
           onRetryFile={() => setFileRefreshSequence((value) => value + 1)}
           onToggle={toggleEnabled}
           onRename={() => { setRenameValue(session.skill.name); setRenameOpen(true); setActionError(undefined); }}
+          onPublish={() => { setPublishOpen(true); setActionError(undefined); }}
           onDelete={() => { setDeleteConfirmation(""); setDeleteOpen(true); setActionError(undefined); }}
         />}
       </section>
@@ -450,6 +469,16 @@ function LocalSkillTools({ controller, backends, targets, locale, t }: {
       <div className="modal__actions"><Button disabled={busy} onClick={() => setDeleteOpen(false)}>{t("common.cancel")}</Button><Button tone="danger" disabled={busy || deleteConfirmation !== session?.skill.name} onClick={confirmDelete}><Trash2 aria-hidden="true" />{t("common.delete")}</Button></div>
     </Modal>
 
+    {publishOpen && session !== undefined && <SkillPublicationDialog
+      controller={controller}
+      session={session}
+      locale={locale}
+      t={t}
+      onClose={() => setPublishOpen(false)}
+      onPublished={loadCatalog}
+      onOpenPublished={onOpenPublished}
+    />}
+
     <Modal open={recoveryNotice !== undefined} title={t("skills.deletedTitle")} description={t("skills.deletedBody")} size="small" onClose={() => setRecoveryNotice(undefined)}>
       <p className="skill-recovery-id"><span>{t("skills.recoveryId")}</span><code>{recoveryNotice}</code></p>
       <div className="modal__actions"><Button tone="primary" onClick={() => setRecoveryNotice(undefined)}>{t("common.close")}</Button></div>
@@ -457,7 +486,7 @@ function LocalSkillTools({ controller, backends, targets, locale, t }: {
   </>;
 }
 
-function SkillDetail({ controller, session, headingRef, selectedFileKey, fileState, editing, editorText, dirty, busy, actionError, t, onSelectFile, onEditorText, onEdit, onCancelEdit, onPrepareEdit, onRetryFile, onToggle, onRename, onDelete }: {
+function SkillDetail({ controller, session, headingRef, selectedFileKey, fileState, editing, editorText, dirty, busy, actionError, t, onSelectFile, onEditorText, onEdit, onCancelEdit, onPrepareEdit, onRetryFile, onToggle, onRename, onPublish, onDelete }: {
   readonly controller: AppController;
   readonly session: SkillSessionView;
   readonly headingRef: RefObject<HTMLHeadingElement | null>;
@@ -477,6 +506,7 @@ function SkillDetail({ controller, session, headingRef, selectedFileKey, fileSta
   readonly onRetryFile: () => void;
   readonly onToggle: () => void;
   readonly onRename: () => void;
+  readonly onPublish: () => void;
   readonly onDelete: () => void;
 }): JSX.Element {
   const skill = session.skill;
@@ -486,6 +516,7 @@ function SkillDetail({ controller, session, headingRef, selectedFileKey, fileSta
       <div><p className="eyebrow">{t("skills.detailEyebrow")}</p><h2 ref={headingRef} tabIndex={-1}>{skill.name}</h2><p>{session.metadata.description ?? t("skills.noDescription")}</p></div>
       <div className="skill-detail__actions">
         {skill.canToggle && <Button disabled={busy} onClick={onToggle}>{skill.enabled ? t("common.disable") : t("common.enable")}</Button>}
+        {skill.canEdit && <Button disabled={busy || editing || !skill.contentAvailable} onClick={onPublish}><Upload aria-hidden="true" />{t("skills.publish.open")}</Button>}
         {skill.canEdit && <Button disabled={busy || editing} onClick={onRename}>{t("skills.rename")}</Button>}
         {skill.canDelete && <IconButton disabled={busy || editing} label={t("skills.deleteTitle", { name: skill.name })} onClick={onDelete}><Trash2 aria-hidden="true" /></IconButton>}
       </div>

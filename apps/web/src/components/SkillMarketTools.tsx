@@ -26,6 +26,7 @@ import type {
   SkillDescriptorView,
   SkillMarketArchivePageView,
   SkillMarketCatalogPageView,
+  SkillMarketEntryIdentityView,
   SkillMarketEntryView,
   SkillMarketGitPreflightView,
   SkillMarketInstallPlanView,
@@ -179,12 +180,13 @@ interface CatalogCursor {
   readonly revision?: bigint;
 }
 
-export function SkillMarketCatalogTools({ controller, backends, targets, locale, t, onOpenSources }: {
+export function SkillMarketCatalogTools({ controller, backends, targets, locale, t, initialSelection, onOpenSources }: {
   readonly controller: AppController;
   readonly backends: readonly BackendView[];
   readonly targets: readonly TargetView[];
   readonly locale: string;
   readonly t: Translator;
+  readonly initialSelection?: SkillMarketEntryIdentityView;
   readonly onOpenSources: () => void;
 }): JSX.Element {
   const [query, setQuery] = useState("");
@@ -192,12 +194,12 @@ export function SkillMarketCatalogTools({ controller, backends, targets, locale,
   const [sort, setSort] = useState<SkillMarketSortView>("trending");
   const [cursors, setCursors] = useState<readonly CatalogCursor[]>([{ token: "" }]);
   const [catalog, setCatalog] = useState<LoadState<SkillMarketCatalogPageView>>({ kind: "loading" });
-  const [selected, setSelected] = useState<SkillMarketEntryView>();
+  const [selected, setSelected] = useState<SkillMarketEntryIdentityView | undefined>(initialSelection);
   const [detail, setDetail] = useState<LoadState<{ readonly entry: SkillMarketEntryView; readonly preview: SkillMarketPreviewView; readonly files: SkillMarketArchivePageView }> | undefined>();
   const [selectedFile, setSelectedFile] = useState<string>();
   const [file, setFile] = useState<LoadState<SkillMarketPreviewFileView> | undefined>();
   const [installEntry, setInstallEntry] = useState<SkillMarketEntryView>();
-  const [mobileDetail, setMobileDetail] = useState(false);
+  const [mobileDetail, setMobileDetail] = useState(initialSelection !== undefined);
   const [reload, setReload] = useState(0);
   const [detailReload, setDetailReload] = useState(0);
   const catalogRequest = useRef(0);
@@ -250,7 +252,7 @@ export function SkillMarketCatalogTools({ controller, backends, targets, locale,
     }
     setDetail({ kind: "loading" });
     let opened: SkillMarketPreviewView | undefined;
-    void controller.getSkillMarketEntry(selected.identity, abort.signal).then(async (entry) => {
+    void controller.getSkillMarketEntry(selected, abort.signal).then(async (entry) => {
       const preview = await controller.openSkillMarketPreview(entry.identity, abort.signal);
       opened = preview;
       const files = await controller.listSkillMarketPreviewFiles(preview, "", 100, abort.signal);
@@ -272,7 +274,7 @@ export function SkillMarketCatalogTools({ controller, backends, targets, locale,
         void controller.closeSkillMarketPreview(opened.id).catch(() => undefined);
       }
     };
-  }, [controller, detailReload, selected?.identity.contentRevision, selected?.identity.entryRevision, selected?.identity.sourceRevision, t]);
+  }, [controller, detailReload, selected?.contentRevision, selected?.entryRevision, selected?.sourceRevision, t]);
 
   const readyDetail = detail?.kind === "ready" ? detail.value : undefined;
   useEffect(() => {
@@ -304,7 +306,7 @@ export function SkillMarketCatalogTools({ controller, backends, targets, locale,
       if (target.ownerDocument.activeElement === target) restoreCatalogFocus.current = false;
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [catalog.kind, mobileDetail, selected?.identity.entryId, selected?.identity.sourceId]);
+  }, [catalog.kind, mobileDetail, selected?.entryId, selected?.sourceId]);
 
   const loadMoreFiles = (): void => {
     if (readyDetail?.files.nextPageToken === undefined) return;
@@ -322,7 +324,7 @@ export function SkillMarketCatalogTools({ controller, backends, targets, locale,
 
   const page = catalog.kind === "ready" ? catalog.value : undefined;
   const selectEntry = (entry: SkillMarketEntryView): void => {
-    setSelected(entry);
+    setSelected(entry.identity);
     setMobileDetail(true);
   };
   return <>
@@ -339,12 +341,12 @@ export function SkillMarketCatalogTools({ controller, backends, targets, locale,
         {page !== undefined && page.sourceCount === 0 && <EmptyState icon={<FolderOpen />} title={t("skills.market.noSources")} body={t("skills.market.noSourcesBody")} action={<Button tone="primary" onClick={onOpenSources}>{t("skills.market.manageSources")}</Button>} />}
         {page !== undefined && page.sourceCount > 0 && page.entries.length === 0 && <EmptyState icon={<Sparkles />} title={t("skills.market.empty")} body={t("skills.market.emptyBody")} />}
         {page !== undefined && page.entries.length > 0 && <div className="skill-market-card-list">{page.entries.map((entry) => <button
-          ref={selected?.identity.entryId === entry.identity.entryId && selected.identity.sourceId === entry.identity.sourceId ? selectedButton : undefined}
+          ref={selected?.entryId === entry.identity.entryId && selected.sourceId === entry.identity.sourceId ? selectedButton : undefined}
           type="button"
-          className={cx("skill-market-card", selected?.identity.entryId === entry.identity.entryId && selected.identity.sourceId === entry.identity.sourceId && "is-active")}
+          className={cx("skill-market-card", selected?.entryId === entry.identity.entryId && selected.sourceId === entry.identity.sourceId && "is-active")}
           key={`${entry.identity.sourceId}:${entry.identity.entryId}`}
           onClick={() => selectEntry(entry)}
-        ><span className="skill-market-card__icon"><Sparkles aria-hidden="true" /></span><span className="skill-market-card__copy"><strong>{entry.name}</strong><small>{entry.description || t("skills.market.noDescription")}</small><span><MarketStatusPill entry={entry} t={t} /><Pill tone={entry.sourceState === "ready" ? "neutral" : "danger"}>{entry.category}</Pill><em>v{entry.version}</em><em>{t("skills.market.downloads", { count: entry.downloads })}</em></span></span><ChevronRight aria-hidden="true" /></button>)}</div>}
+        ><span className="skill-market-card__icon"><Sparkles aria-hidden="true" /></span><span className="skill-market-card__copy"><strong>{entry.name}</strong><small>{entry.description || t("skills.market.noDescription")}</small><span><MarketStatusPill entry={entry} t={t} />{entry.category !== undefined && <Pill tone={entry.sourceState === "ready" ? "neutral" : "danger"}>{entry.category}</Pill>}<em>v{entry.version}</em><em>{t("skills.market.downloads", { count: entry.downloads })}</em></span></span><ChevronRight aria-hidden="true" /></button>)}</div>}
         {page !== undefined && <footer className="skill-market-pagination"><span>{t("skills.market.results", { count: page.totalSize })}</span><div><Button disabled={cursors.length === 1} onClick={() => setCursors((value) => value.slice(0, -1))}>{t("common.previous")}</Button><Button disabled={page.nextPageToken === undefined} onClick={() => {
           if (page.nextPageToken !== undefined) setCursors((value) => [...value, { token: page.nextPageToken!, revision: page.revision }]);
         }}>{t("common.next")}</Button></div></footer>}
@@ -357,7 +359,7 @@ export function SkillMarketCatalogTools({ controller, backends, targets, locale,
         {readyDetail !== undefined && <article className="skill-market-detail">
           <header><div><p className="eyebrow">{readyDetail.entry.sourceDisplayName ?? readyDetail.entry.sourceName}</p><h2 ref={detailHeading} tabIndex={-1}>{readyDetail.entry.name}</h2><p>{readyDetail.entry.description || t("skills.market.noDescription")}</p></div><Pill tone={readyDetail.entry.sourceState === "ready" ? "success" : "danger"}>v{readyDetail.entry.version}</Pill></header>
           {readyDetail.entry.sourceError !== undefined && <InlineNotice tone="error" message={readyDetail.entry.sourceError} />}
-          <dl className="skill-market-metadata"><div><dt>{t("skills.market.author")}</dt><dd>{readyDetail.entry.author ?? t("common.unknown")}</dd></div><div><dt>{t("skills.market.category")}</dt><dd>{readyDetail.entry.category}</dd></div><div><dt>{t("skills.market.updated")}</dt><dd>{formatRelativeTime(readyDetail.entry.updatedAt, locale)}</dd></div><div><dt>{t("skills.market.size")}</dt><dd>{formatBytes(readyDetail.entry.archiveBytes)}</dd></div></dl>
+          <dl className="skill-market-metadata"><div><dt>{t("skills.market.author")}</dt><dd>{readyDetail.entry.author ?? t("common.unknown")}</dd></div><div><dt>{t("skills.market.category")}</dt><dd>{readyDetail.entry.category ?? t("common.unknown")}</dd></div><div><dt>{t("skills.market.updated")}</dt><dd>{formatRelativeTime(readyDetail.entry.updatedAt, locale)}</dd></div><div><dt>{t("skills.market.size")}</dt><dd>{formatBytes(readyDetail.entry.archiveBytes)}</dd></div></dl>
           <div className="skill-market-tags">{readyDetail.entry.tags.map((tag) => <Pill key={tag}>{tag}</Pill>)}</div>
           <MarketInstallStatusDetails entry={readyDetail.entry} backends={backends} targets={targets} t={t} />
           <div className="skill-market-detail__actions"><Button tone="primary" disabled={readyDetail.entry.sourceState !== "ready"} onClick={() => setInstallEntry(readyDetail.entry)}><Download aria-hidden="true" />{t("skills.market.install.open")}</Button><span>{t("skills.market.preview.summary", { files: readyDetail.preview.files, size: formatBytes(readyDetail.preview.bytes) })}</span></div>

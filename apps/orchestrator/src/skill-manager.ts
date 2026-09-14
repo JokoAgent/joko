@@ -13,6 +13,7 @@ import type {
   PiSkillContentMutationResult,
   PreparedPiResourceMutation
 } from "./resource-manager.js";
+import { isSensitiveSkillPath } from "./skill-content-policy.js";
 import {
   SkillMutationCoordinator,
   skillResourceMutationKey,
@@ -1001,7 +1002,7 @@ async function listVisibleChildren(
   const result: SkillFileEntry[] = [];
   for (const entry of await readdir(directory, { withFileTypes: true })) {
     const key = parentKey === "" ? entry.name : `${parentKey}/${entry.name}`;
-    if (isExcludedSkillKey(key)) continue;
+    if (isSensitiveSkillPath(key)) continue;
     const path = join(directory, entry.name);
     const child = await lstat(path);
     if (entry.isSymbolicLink() || child.isSymbolicLink()) throw new Error("Skill snapshot contains a symlink or junction.");
@@ -1023,7 +1024,7 @@ async function readVisibleTextFile(
   maximumEditBytes: number
 ): Promise<SkillFileContent> {
   const normalized = portableKey(key, false);
-  if (isExcludedSkillKey(normalized)) throw new Error("Skill path is excluded from content browsing.");
+  if (isSensitiveSkillPath(normalized)) throw new Error("Skill path is excluded from content browsing.");
   const path = resolvePortableKey(root, normalized, false);
   const before = await lstat(path);
   if (!before.isFile() || before.isSymbolicLink()) throw new Error("Skill content target is not a regular file.");
@@ -1093,7 +1094,7 @@ async function collectVisibleFiles(root: string, maximumTextBytes: number): Prom
   const visit = async (directory: string, parentKey: string): Promise<void> => {
     for (const entry of await readdir(directory, { withFileTypes: true })) {
       const key = parentKey === "" ? entry.name : `${parentKey}/${entry.name}`;
-      if (isExcludedSkillKey(key)) continue;
+      if (isSensitiveSkillPath(key)) continue;
       const path = join(directory, entry.name);
       const info = await lstat(path);
       if (entry.isSymbolicLink() || info.isSymbolicLink()) throw new Error("Skill snapshot contains a symlink or junction.");
@@ -1256,26 +1257,6 @@ function isWindowsReservedName(value: string): boolean {
   const stem = value.split(".", 1)[0]!.toUpperCase();
   return stem === "CON" || stem === "PRN" || stem === "AUX" || stem === "NUL"
     || /^COM[1-9]$/u.test(stem) || /^LPT[1-9]$/u.test(stem);
-}
-
-function isExcludedSkillKey(value: string): boolean {
-  const key = value.replaceAll("\\", "/").replace(/^\/+|\/+$/gu, "").toLowerCase();
-  if (key === "") return false;
-  const parts = key.split("/");
-  const excludedDirectories = new Set([
-    ".git", ".hg", ".svn", ".venv", "node_modules", "__macosx",
-    ".aws", ".ssh", ".gnupg", ".kube", ".docker", ".azure"
-  ]);
-  if (parts.some((part) => excludedDirectories.has(part))) return true;
-  if (key === ".config/gcloud" || key.startsWith(".config/gcloud/")) return true;
-  const name = parts.at(-1)!;
-  if (name === ".env" || name.startsWith(".env.")) return true;
-  if ([".npmrc", ".pypirc", ".netrc", "_netrc", ".terraformrc", "terraform.rc", "credentials.tfrc.json", ".ds_store"].includes(name)) return true;
-  if (/^(?:id_rsa|id_dsa|id_ecdsa|id_ed25519)(?:\.pub)?$/u.test(name)) return true;
-  if (/^(?:credentials|secrets?)(?:\.[a-z0-9_-]+)?\.(?:json|ya?ml|toml|ini|conf)$/u.test(name)) return true;
-  if (/(?:^|\/)\.m2\/settings(?:-security)?\.xml$/u.test(key)) return true;
-  if (name.endsWith(".xdt-tmp") || /^skill\.md\.xdt-rename-[a-f0-9-]+$/u.test(name) || name.startsWith("._")) return true;
-  return false;
 }
 
 async function assertPrivateContained(root: string, path: string, label: string): Promise<void> {

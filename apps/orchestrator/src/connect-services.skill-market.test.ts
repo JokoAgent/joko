@@ -16,6 +16,7 @@ import { SessionHost } from "./session-host.js";
 import { SkillMarketManager } from "./skill-market-manager.js";
 import { SkillMarketSyncManager } from "./skill-market-sync-manager.js";
 import { SkillMutationCoordinator } from "./skill-mutation-coordinator.js";
+import { SkillPublicationManager } from "./skill-publication-manager.js";
 import { mkdtemp } from "./test-paths.js";
 
 const cleanups: Array<() => Promise<void> | void> = [];
@@ -230,6 +231,93 @@ describe("Connect Skill market boundary", () => {
     });
     expectPathPrivate(projected, fixture.root);
   });
+
+  it("publishes an exact Resource to a local source and projects durable review gates without private paths", async () => {
+    const fixture = await createFixture();
+    const skillRoot = join(fixture.root, "publishable-skill");
+    await mkdir(skillRoot, { recursive: true });
+    await writeFile(join(skillRoot, "SKILL.md"), "---\nname: release-notes\ndescription: Draft release notes\n---\n# Release notes\n", "utf8");
+    const discovered = await fixture.resources.discover({
+      id: "skill-global-release-notes",
+      backendId: "pi",
+      kind: "skill",
+      scope: "managed",
+      source: { kind: "local", path: skillRoot },
+      name: "release-notes"
+    });
+    const approved = await fixture.resources.approve(discovered.id, discovered.discoveredRevision, CONNECTION_ID);
+    const resource = await fixture.resources.install(approved.id);
+    const sourceRoot = await writeMarket(fixture.root, "publication-market", []);
+    const source = await fixture.market.add({ kind: "local", path: sourceRoot }, 0n);
+
+    const preview = await invoke<contract.GetSkillPublicationPreviewResponse>(
+      fixture.services.skill.getSkillPublicationPreview,
+      {
+        resourceId: resource.id,
+        expectedResourceRevision: { value: resource.versionNumber },
+        sourceId: source.id,
+        expectedSourceRevision: { value: source.revision }
+      }
+    );
+    expect(preview.preview).toMatchObject({
+      mode: contract.SkillPublicationMode.FIRST,
+      suggestedSlug: "release-notes",
+      suggestedVersion: "1.0.0",
+      personalPublisherAvailable: true,
+      teamPublisherAvailable: false,
+      publicVisibilityAvailable: true,
+      departmentVisibilityAvailable: false,
+      privateVisibilityAvailable: false
+    });
+    expectPathPrivate(preview, fixture.root);
+
+    const authority = preview.preview!.authority!;
+    const submitted = await submit(fixture, "publish-release-notes", {
+      case: "startSkillPublication",
+      value: create(contract.StartSkillPublicationMutationSchema, {
+        resourceId: authority.resourceId,
+        expectedResourceRevision: authority.resourceRevision,
+        expectedObservedRevision: authority.observedRevision,
+        sourceId: authority.sourceId,
+        expectedSourceRevision: authority.sourceRevision,
+        expectedSourceContentRevision: authority.sourceContentRevision,
+        metadata: {
+          slug: "release-notes",
+          name: "Release notes",
+          description: "Creates release notes.",
+          tags: ["writing"],
+          version: "1.0.0"
+        },
+        publisher: contract.SkillPublicationPublisher.PERSONAL,
+        visibility: contract.SkillPublicationVisibility.PUBLIC
+      })
+    });
+    expect(submitted.operation?.state).toBe(contract.OperationState.SUCCEEDED);
+    const nativeJob = fixture.publication.list({ resourceId: resource.id })[0]!;
+    await fixture.publication.wait(nativeJob.id);
+
+    const jobs = await invoke<contract.ListSkillPublicationJobsResponse>(
+      fixture.services.skill.listSkillPublicationJobs,
+      { resourceId: resource.id, page: { pageSize: 10 } }
+    );
+    expect(jobs.jobs).toHaveLength(1);
+    expect(jobs.jobs[0]).toMatchObject({
+      state: contract.SkillPublicationState.PUBLISHED,
+      verdict: contract.SkillPublicationVerdict.PASSED,
+      metadata: { slug: "release-notes", version: "1.0.0" },
+      result: { version: "1.0.0" },
+      cancellable: false
+    });
+    expect(jobs.jobs[0]!.gates.every((gate) => gate.status === contract.SkillPublicationGateStatus.PASSED)).toBe(true);
+    expectPathPrivate(jobs, fixture.root);
+
+    const exact = await invoke<contract.GetSkillPublicationJobResponse>(
+      fixture.services.skill.getSkillPublicationJob,
+      { jobId: jobs.jobs[0]!.jobId }
+    );
+    expect(exact.job?.result?.entryContentRevision).toMatch(/^sha256:/u);
+    expectPathPrivate(exact, fixture.root);
+  });
 });
 
 const CONNECTION_ID = "connection-skill-market";
@@ -266,6 +354,13 @@ async function createFixture() {
     mutationCoordinator: mutations
   });
   await market.initialize();
+  const publication = new SkillPublicationManager({
+    store,
+    resources,
+    market,
+    rootDirectory: join(root, "skill-publications")
+  });
+  await publication.initialize();
   const sync = new SkillMarketSyncManager({ store, resources, market });
   await sync.initialize();
   const sessionHost = new SessionHost(store, {} as never, []);
@@ -292,6 +387,7 @@ async function createFixture() {
     piResources: resources,
     skillMarket: market,
     skillMarketSync: sync,
+    skillPublication: publication,
     refreshPiGeneration,
     browserActivity: [],
     close: async () => undefined
@@ -299,12 +395,13 @@ async function createFixture() {
   const services = createConnectServices(application);
   cleanups.push(async () => {
     await sync.close();
+    await publication.close();
     await market.close();
     await sessionHost.dispose();
     store.close();
     await rm(root, { recursive: true, force: true });
   });
-  return Object.assign(state, { root, store, resources, market, sync, services, refreshPiGeneration });
+  return Object.assign(state, { root, store, resources, market, sync, publication, services, refreshPiGeneration });
 }
 
 async function writeMarket(

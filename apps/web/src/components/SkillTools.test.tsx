@@ -10,6 +10,10 @@ import type {
   BackendView,
   SkillDescriptorView,
   SkillDraftView,
+  SkillMarketEntryView,
+  SkillMarketSourceView,
+  SkillPublicationJobView,
+  SkillPublicationPreviewView,
   SkillRecoveryView,
   SkillSessionView,
   TargetView
@@ -208,6 +212,81 @@ describe("SkillTools", () => {
     Object.defineProperty(window, "innerWidth", { configurable: true, value: 1024 });
   });
 
+  it("publishes only a manageable Skill and hands the exact result directly to its market detail", async () => {
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 390 });
+    const preview = publicationPreviewFixture();
+    const published = publicationJobFixture();
+    let started = false;
+    const getSkillMarketEntry = vi.fn(async () => marketEntryFixture());
+    const controller = skillController({
+      listSkillMarketSources: vi.fn(async () => ({ revision: 4n, sources: [marketSourceFixture()], recoveredFromCorruption: false })),
+      getSkillPublicationPreview: vi.fn(async () => preview),
+      listSkillPublicationJobs: vi.fn(async () => ({ items: started ? [published] : [], recoveredFromCorruption: false })),
+      startSkillPublication: vi.fn(async () => { started = true; }),
+      getSkillPublicationJob: vi.fn(async () => published),
+      cancelSkillPublication: vi.fn(async () => undefined),
+      retrySkillPublication: vi.fn(async () => undefined),
+      listSkillMarketCatalog: vi.fn(async () => ({
+        revision: published.result!.sourceRevision,
+        entries: [marketEntryFixture()],
+        categories: [],
+        sourceCount: 1,
+        totalSize: 1
+      })),
+      getSkillMarketEntry,
+      openSkillMarketPreview: vi.fn(async () => ({
+        id: "skill-market-preview",
+        entry: marketEntryFixture(),
+        snapshotRevision: HASH_B,
+        files: 1,
+        bytes: 96,
+        expiresAt: Date.now() + 60_000
+      })),
+      listSkillMarketPreviewFiles: vi.fn(async () => ({
+        snapshotRevision: HASH_B,
+        files: [{ key: "SKILL.md", kind: "file" as const, size: 96 }],
+        totalSize: 1
+      })),
+      readSkillMarketPreviewFile: vi.fn(async () => ({
+        previewId: "skill-market-preview",
+        snapshotRevision: HASH_B,
+        key: "SKILL.md",
+        size: 96,
+        previewable: true,
+        content: "# Published"
+      })),
+      closeSkillMarketPreview: vi.fn(async () => true)
+    });
+    const container = await renderSkills(controller);
+    await settle();
+
+    await act(async () => buttonWithText(container, "Publish").click());
+    await settle();
+    const dialog = required(document.body.querySelector<HTMLElement>('[role="dialog"]'));
+    await act(async () => buttonWithText(dialog, "Review publication target").click());
+    await settle();
+    await act(async () => buttonWithText(dialog, "Publish Skill").click());
+    await settle();
+    await act(async () => buttonWithText(dialog, "Open in Skill market").click());
+    await settle(140);
+
+    const identity = marketEntryFixture().identity;
+    expect(getSkillMarketEntry).toHaveBeenCalledWith(identity, expect.any(AbortSignal));
+    expect(container.textContent).toContain("Published Review helper");
+    expect(container.textContent).toContain("# Published");
+    expect(container.querySelector(".skill-market-browser--mobile-detail")).not.toBeNull();
+    expect(document.body.querySelector('[role="dialog"]')).toBeNull();
+
+    const unmanaged = { ...globalSkill(), canEdit: false, canDelete: false };
+    const unmanagedController = skillController({
+      listSkills: vi.fn(async () => ({ revision: 1n, skills: [unmanaged] })),
+      openSkill: vi.fn(async () => sessionFor(unmanaged))
+    });
+    const unmanagedContainer = await renderSkills(unmanagedController);
+    await settle();
+    expect([...unmanagedContainer.querySelectorAll("button")].some((button) => button.textContent?.trim() === "Publish")).toBe(false);
+  });
+
   it("groups global and project identities without using service paths and classifies diff rows", () => {
     expect(groupSkillCatalog([projectSkill(), globalSkill()], targets, "Global", "Project")).toMatchObject([
       { key: "global", label: "Global", skills: [{ id: "resource-global" }] },
@@ -352,6 +431,114 @@ const backends: readonly BackendView[] = [{
   capabilities: new Map()
 }];
 
+const HASH_A = `sha256:${"a".repeat(64)}`;
+const HASH_B = `sha256:${"b".repeat(64)}`;
+
+function marketSourceFixture(): SkillMarketSourceView {
+  return {
+    id: "skill_market_source_0123456789abcdef0123456789abcdef",
+    revision: 4n,
+    kind: "local",
+    display: "local-publishing",
+    name: "local-publishing",
+    displayName: "Local publishing",
+    state: "ready",
+    contentRevision: HASH_A,
+    entryCount: 0,
+    addedAt: 1_700_000_000_000
+  };
+}
+
+function publicationPreviewFixture(): SkillPublicationPreviewView {
+  return {
+    authority: {
+      resourceId: "resource-global",
+      resourceRevision: 1n,
+      observedRevision: HASH_A,
+      backendId: "pi",
+      scope: "global",
+      sourceId: marketSourceFixture().id,
+      sourceRevision: 4n,
+      sourceContentRevision: HASH_A,
+      sourceDisplay: "Local publishing"
+    },
+    source: marketSourceFixture(),
+    mode: "first",
+    suggestedSlug: "review-helper",
+    suggestedVersion: "1.0.0",
+    dirty: false,
+    personalPublisherAvailable: true,
+    teamPublisherAvailable: false,
+    publicVisibilityAvailable: true,
+    departmentVisibilityAvailable: false,
+    privateVisibilityAvailable: false,
+    collaborationUnavailableReason: "Team and restricted visibility require a configured collaboration identity owner."
+  };
+}
+
+function publicationJobFixture(): SkillPublicationJobView {
+  return {
+    id: "skill_publication_0123456789abcdef0123456789abcdef",
+    revision: 7n,
+    state: "published",
+    authority: publicationPreviewFixture().authority,
+    metadata: {
+      slug: "review-helper",
+      name: "Review helper",
+      description: "Review safely",
+      tags: [],
+      version: "1.0.0"
+    },
+    publisher: "personal",
+    visibility: "public",
+    gates: (["metadata", "package", "sensitive_content", "source_authority"] as const).map((id) => ({ id, label: id, status: "passed", issues: [] })),
+    verdict: "passed",
+    files: 1,
+    uncompressedBytes: 96,
+    archiveBytes: 80,
+    attempt: 1,
+    result: {
+      sourceId: marketSourceFixture().id,
+      sourceRevision: 5n,
+      entryId: "skill_market_entry_0123456789abcdef0123456789abcdef",
+      entryRevision: 1n,
+      entryContentRevision: HASH_B,
+      version: "1.0.0"
+    },
+    createdAt: 1_700_000_000_000,
+    updatedAt: 1_700_000_000_100,
+    completedAt: 1_700_000_000_100,
+    cancellable: false
+  };
+}
+
+function marketEntryFixture(): SkillMarketEntryView {
+  const result = publicationJobFixture().result!;
+  return {
+    identity: {
+      sourceId: result.sourceId,
+      sourceRevision: result.sourceRevision,
+      entryId: result.entryId,
+      entryRevision: result.entryRevision,
+      contentRevision: result.entryContentRevision
+    },
+    slug: "review-helper",
+    name: "Published Review helper",
+    description: "Review safely",
+    tags: [],
+    version: result.version,
+    createdAt: 1_700_000_000_000,
+    updatedAt: 1_700_000_000_100,
+    downloads: 0,
+    trendScore: 0,
+    archiveBytes: 80,
+    sourceName: "local-publishing",
+    sourceDisplayName: "Local publishing",
+    sourceState: "ready",
+    installStatuses: []
+  };
+}
+
 async function renderSkills(controller: AppController): Promise<HTMLDivElement> {
   const container = document.createElement("div");
   document.body.append(container);
@@ -361,8 +548,8 @@ async function renderSkills(controller: AppController): Promise<HTMLDivElement> 
   return container;
 }
 
-async function settle(): Promise<void> {
-  await act(async () => { await new Promise((resolve) => window.setTimeout(resolve, 10)); });
+async function settle(milliseconds = 10): Promise<void> {
+  await act(async () => { await new Promise((resolve) => window.setTimeout(resolve, milliseconds)); });
 }
 
 function buttonWithText(container: ParentNode, text: string | RegExp): HTMLButtonElement {

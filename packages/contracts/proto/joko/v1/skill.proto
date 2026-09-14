@@ -210,6 +210,51 @@ enum SkillMarketSyncOutcome {
   SKILL_MARKET_SYNC_OUTCOME_CANCELLED = 8;
 }
 
+enum SkillPublicationState {
+  SKILL_PUBLICATION_STATE_UNSPECIFIED = 0;
+  SKILL_PUBLICATION_STATE_PENDING = 1;
+  SKILL_PUBLICATION_STATE_SNAPSHOTTING = 2;
+  SKILL_PUBLICATION_STATE_PACKAGING = 3;
+  SKILL_PUBLICATION_STATE_SCANNING = 4;
+  SKILL_PUBLICATION_STATE_COMMITTING = 5;
+  SKILL_PUBLICATION_STATE_RECONCILING = 6;
+  SKILL_PUBLICATION_STATE_CANCELLING = 7;
+  SKILL_PUBLICATION_STATE_PUBLISHED = 8;
+  SKILL_PUBLICATION_STATE_BLOCKED = 9;
+  SKILL_PUBLICATION_STATE_FAILED = 10;
+  SKILL_PUBLICATION_STATE_CANCELLED = 11;
+}
+
+enum SkillPublicationGateStatus {
+  SKILL_PUBLICATION_GATE_STATUS_UNSPECIFIED = 0;
+  SKILL_PUBLICATION_GATE_STATUS_PENDING = 1;
+  SKILL_PUBLICATION_GATE_STATUS_PASSED = 2;
+  SKILL_PUBLICATION_GATE_STATUS_BLOCKED = 3;
+}
+
+enum SkillPublicationVerdict {
+  SKILL_PUBLICATION_VERDICT_UNSPECIFIED = 0;
+  SKILL_PUBLICATION_VERDICT_PENDING = 1;
+  SKILL_PUBLICATION_VERDICT_PASSED = 2;
+  SKILL_PUBLICATION_VERDICT_BLOCKED = 3;
+}
+
+enum SkillPublicationMode {
+  SKILL_PUBLICATION_MODE_UNSPECIFIED = 0;
+  SKILL_PUBLICATION_MODE_FIRST = 1;
+  SKILL_PUBLICATION_MODE_VERSION = 2;
+}
+
+enum SkillPublicationPublisher {
+  SKILL_PUBLICATION_PUBLISHER_UNSPECIFIED = 0;
+  SKILL_PUBLICATION_PUBLISHER_PERSONAL = 1;
+}
+
+enum SkillPublicationVisibility {
+  SKILL_PUBLICATION_VISIBILITY_UNSPECIFIED = 0;
+  SKILL_PUBLICATION_VISIBILITY_PUBLIC = 1;
+}
+
 message SkillMarketLocalSource {
   // Write-only service-node directory explicitly selected by the user.
   string server_path = 1;
@@ -264,7 +309,7 @@ message SkillMarketEntry {
   string name = 3;
   optional string author = 4;
   string description = 5;
-  string category = 6;
+  optional string category = 6;
   repeated string tags = 7;
   string version = 8;
   google.protobuf.Timestamp created_at = 9;
@@ -277,6 +322,7 @@ message SkillMarketEntry {
   SkillMarketSourceState source_state = 16;
   optional string source_error = 17;
   repeated SkillMarketInstallStatus install_statuses = 18;
+  optional string changelog = 19;
 }
 
 message SkillMarketInstallStatus {
@@ -416,4 +462,91 @@ message SkillMarketSyncJob {
   google.protobuf.Timestamp created_at = 12;
   google.protobuf.Timestamp updated_at = 13;
   optional google.protobuf.Timestamp completed_at = 14;
+}
+
+message SkillPublicationMetadata {
+  string slug = 1;
+  string name = 2;
+  optional string author = 3;
+  string description = 4;
+  optional string category = 5;
+  repeated string tags = 6;
+  string version = 7;
+  optional string changelog = 8;
+}
+
+message SkillPublicationAuthority {
+  string resource_id = 1;
+  Revision resource_revision = 2;
+  string observed_revision = 3;
+  string backend_id = 4;
+  optional string target_id = 5;
+  ResourceScope scope = 6;
+  string source_id = 7;
+  Revision source_revision = 8;
+  string source_content_revision = 9;
+  // Path-free source display owned by the service.
+  string source_display = 10;
+  optional string existing_entry_id = 11;
+}
+
+message SkillPublicationGateIssue {
+  string code = 1;
+  string message = 2;
+  optional string path = 3;
+}
+
+message SkillPublicationGate {
+  string gate_id = 1;
+  string label = 2;
+  SkillPublicationGateStatus status = 3;
+  repeated SkillPublicationGateIssue issues = 4;
+}
+
+message SkillPublicationResult {
+  string source_id = 1;
+  Revision source_revision = 2;
+  string entry_id = 3;
+  Revision entry_revision = 4;
+  string entry_content_revision = 5;
+  string version = 6;
+}
+
+message SkillPublicationJob {
+  string job_id = 1;
+  Revision revision = 2;
+  SkillPublicationState state = 3;
+  SkillPublicationAuthority authority = 4;
+  SkillPublicationMetadata metadata = 5;
+  SkillPublicationPublisher publisher = 6;
+  SkillPublicationVisibility visibility = 7;
+  repeated SkillPublicationGate gates = 8;
+  SkillPublicationVerdict verdict = 9;
+  uint64 files = 10;
+  uint64 uncompressed_bytes = 11;
+  uint64 archive_bytes = 12;
+  uint32 attempt = 13;
+  optional string retry_of_job_id = 14;
+  optional SkillPublicationResult result = 15;
+  google.protobuf.Timestamp created_at = 16;
+  google.protobuf.Timestamp updated_at = 17;
+  optional google.protobuf.Timestamp completed_at = 18;
+  optional string error = 19;
+  bool cancellable = 20;
+}
+
+message SkillPublicationPreview {
+  SkillPublicationAuthority authority = 1;
+  SkillMarketSourceDescriptor source = 2;
+  SkillPublicationMode mode = 3;
+  string suggested_slug = 4;
+  string suggested_version = 5;
+  optional SkillMarketEntry existing_entry = 6;
+  bool dirty = 7;
+  bool personal_publisher_available = 8;
+  bool team_publisher_available = 9;
+  bool public_visibility_available = 10;
+  bool department_visibility_available = 11;
+  bool private_visibility_available = 12;
+  string collaboration_unavailable_reason = 13;
 }
