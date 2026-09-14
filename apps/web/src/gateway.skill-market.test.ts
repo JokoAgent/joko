@@ -1,10 +1,13 @@
 import { create } from "@bufbuild/protobuf";
 import type { Transport } from "@connectrpc/connect";
 import {
+  CollaborationRole,
+  CollaborationScopeKind,
   OperationState,
   ResourceAcquisitionKind,
   ResourceScope,
   ResourceState,
+  ResourceUsageSource,
   SkillDiffChangeKind,
   SkillFileKind,
   SkillMarketInstallAction,
@@ -74,6 +77,7 @@ describe("Skill market gateway", () => {
         jobs: [protoPublicationJob()], recoveredFromCorruption: false, page: { totalSize: 1n, nextPageToken: "" }
       };
       if (method === "getSkillPublicationJob") return { job: protoPublicationJob(), recoveredFromCorruption: false };
+      if (method === "getCollaborationDirectory") return { directory: protoCollaborationDirectory() };
       if (method === "submitOperation") return {
         operation: {
           operationId: input.operationId,
@@ -128,15 +132,22 @@ describe("Skill market gateway", () => {
     const publication = publications.items[0]!;
     expect(publicationPreview).toMatchObject({
       mode: "first", suggestedSlug: "draft-skill", suggestedVersion: "1.0.0",
-      teamPublisherAvailable: false, privateVisibilityAvailable: false
+      teamPublisherAvailable: false, privateVisibilityAvailable: true
     });
     expect(publication).toMatchObject({ id: PUBLICATION_ID, state: "published", verdict: "passed", result: { version: "1.0.0" } });
     await expect(gateway.getSkillPublicationJob(publication.id)).resolves.toEqual(publication);
     await gateway.startSkillPublication(publicationPreview, {
       slug: "draft-skill", name: "Draft Skill", description: "Publish safely.", tags: ["writing"], version: "1.0.0"
-    });
+    }, { publisher: "personal", visibility: "private", audienceScopeIds: [] });
     await gateway.cancelSkillPublication(publication);
     await gateway.retrySkillPublication(publication);
+
+    const collaboration = await gateway.getCollaborationDirectory();
+    expect(collaboration).toMatchObject({ available: true, revision: 4n, actor: { displayName: "Local owner" }, scopes: [{ kind: "team" }] });
+    await gateway.createCollaborationScope("department", "Engineering", collaboration.revision);
+    await gateway.updateCollaborationScope(collaboration.scopes[0]!, "Platform core");
+    await gateway.deleteCollaborationScope(collaboration.scopes[0]!);
+    await gateway.updateSkillMarketAccess(entry, collaboration.revision, { publisher: "personal", visibility: "private", audienceScopeIds: [] });
 
     await gateway.addSkillMarketSource({ kind: "local", serverPath: "D:\\private\\skill-market" }, sources.revision);
     await gateway.refreshSkillMarketSource(sources.sources[0]!.id, sources.sources[0]!.revision);
@@ -160,11 +171,19 @@ describe("Skill market gateway", () => {
       { case: "startSkillPublication", value: {
         resourceId: "resource-skill", expectedResourceRevision: { value: 7n }, expectedObservedRevision: HASH,
         sourceId: SOURCE_ID, expectedSourceRevision: { value: 2n }, expectedSourceContentRevision: HASH,
+        expectedCollaborationRevision: { value: 1n },
         metadata: { slug: "draft-skill", version: "1.0.0" },
-        publisher: SkillPublicationPublisher.PERSONAL, visibility: SkillPublicationVisibility.PUBLIC
+        publisher: SkillPublicationPublisher.PERSONAL, visibility: SkillPublicationVisibility.PRIVATE
       } },
       { case: "cancelSkillPublication", value: { jobId: PUBLICATION_ID, expectedRevision: { value: 6n } } },
       { case: "retrySkillPublication", value: { jobId: PUBLICATION_ID, expectedRevision: { value: 6n } } },
+      { case: "createCollaborationScope", value: { expectedCatalogRevision: { value: 4n }, kind: CollaborationScopeKind.DEPARTMENT, name: "Engineering" } },
+      { case: "updateCollaborationScope", value: { scopeId: "collaboration_scope_test", expectedRevision: { value: 2n }, name: "Platform core" } },
+      { case: "deleteCollaborationScope", value: { scopeId: "collaboration_scope_test", expectedRevision: { value: 2n } } },
+      { case: "updateSkillMarketAccess", value: {
+        expectedAccessRevision: { value: 1n }, expectedCollaborationRevision: { value: 4n },
+        publisher: SkillPublicationPublisher.PERSONAL, visibility: SkillPublicationVisibility.PRIVATE
+      } },
       { case: "addSkillMarketSource", value: { expectedCatalogRevision: { value: 9n }, source: { kind: { case: "local", value: { serverPath: "D:\\private\\skill-market" } } } } },
       { case: "refreshSkillMarketSource", value: { sourceId: SOURCE_ID, expectedRevision: { value: 2n } } },
       { case: "removeSkillMarketSource", value: { sourceId: SOURCE_ID, expectedRevision: { value: 2n } } }
@@ -193,6 +212,64 @@ describe("Skill market gateway", () => {
     await expect(gateway.listSkillMarketSources()).rejects.toThrow("path-bearing Skill market source");
     invalid = "file";
     await expect(gateway.readSkillMarketPreviewFile(mappedPreview(), "SKILL.md")).rejects.toThrow("invalid Skill market preview file");
+    gateway.disconnect();
+  });
+
+  it("maps an exact 30-day Resource usage report and preserves its requested calendar authority", async () => {
+    const requests: Array<{ readonly method: string; readonly input: any }> = [];
+    const gateway = await mount(async (method, input) => {
+      requests.push({ method, input });
+      if (method === "getSnapshot") return { snapshot: {} };
+      if (method === "getSkillResourceUsageReport") return { report: protoResourceUsageReport() };
+      throw new Error(`Unexpected method: ${method}`);
+    });
+
+    const report = await gateway.getSkillResourceUsageReport("resource-skill", "Asia/Shanghai");
+    expect(report).toMatchObject({
+      resourceId: "resource-skill",
+      timeZone: "Asia/Shanghai",
+      fromDay: "2026-08-16",
+      throughDay: "2026-09-14",
+      totals: { samples: 10, strongActive: 5, passiveExposures: 5, toolCalls: 5, toolErrors: 1 },
+      sources: [
+        { source: "runtimeConfirmedResourceLoad", metrics: { samples: 5 } },
+        { source: "runtimeToolCall", metrics: { samples: 5 } }
+      ],
+      agents: [{ backendId: "pi", metrics: { samples: 10 } }],
+      comparison: {
+        available: true,
+        minimumSamples: 5,
+        current: { identity: { resourceRevision: 8n, version: "2.0.0" }, metrics: { samples: 5 } },
+        previous: { identity: { resourceRevision: 7n, version: "1.0.0" }, metrics: { samples: 5 } }
+      },
+      projection: { complete: true, streamCount: 2, pendingStreamCount: 0, failures: [] }
+    });
+    expect(report.days).toHaveLength(30);
+    expect(report.days.at(-1)).toMatchObject({ localDay: "2026-09-14", metrics: { samples: 10 } });
+    expect(requests.find((request) => request.method === "getSkillResourceUsageReport")?.input)
+      .toEqual({ resourceId: "resource-skill", timeZone: "Asia/Shanghai" });
+    expect(JSON.stringify(report, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value))
+      .not.toMatch(/[A-Za-z]:[\\/]|\/home\//u);
+    gateway.disconnect();
+  });
+
+  it("fails closed on discontinuous or unknown Resource usage evidence", async () => {
+    let invalid: "day" | "source" = "day";
+    const gateway = await mount(async (method) => {
+      if (method === "getSnapshot") return { snapshot: {} };
+      if (method === "getSkillResourceUsageReport") {
+        const report = protoResourceUsageReport() as any;
+        if (invalid === "day") report.days[8].localDay = "2026-08-30";
+        else report.sources[0].source = 999;
+        return { report };
+      }
+      throw new Error(`Unexpected method: ${method}`);
+    });
+    await expect(gateway.getSkillResourceUsageReport("resource-skill", "Asia/Shanghai"))
+      .rejects.toThrow("invalid Resource usage day series");
+    invalid = "source";
+    await expect(gateway.getSkillResourceUsageReport("resource-skill", "Asia/Shanghai"))
+      .rejects.toThrow("unknown Resource usage source");
     gateway.disconnect();
   });
 
@@ -254,6 +331,13 @@ function protoEntry(): object {
     description: "Review a change safely.", category: "Productivity", tags: ["review", "safe"], version: "2.0.0",
     createdAt: timestamp(), updatedAt: timestamp(1_700_000_100n), downloads: 42n, trendScore: 9.5, archiveBytes: 512n,
     sourceName: "team-skills", sourceDisplayName: "Team Skills", sourceState: SkillMarketSourceState.READY,
+    access: {
+      revision: { value: 1n },
+      publisher: { kind: SkillPublicationPublisher.EXTERNAL, sourceId: SOURCE_ID },
+      visibility: SkillPublicationVisibility.PUBLIC,
+      audienceScopeIds: []
+    },
+    canManage: false,
     installStatuses: [{
       resourceId: "resource-skill", resourceRevision: { value: 7n }, backendId: "pi",
       scope: ResourceScope.GLOBAL, state: SkillMarketInstallStatusState.UPDATE_AVAILABLE, installedVersion: "1.0.0"
@@ -355,7 +439,8 @@ function protoPublicationPreview(): object {
     authority: protoPublicationAuthority(), source: protoSource(), mode: SkillPublicationMode.FIRST,
     suggestedSlug: "draft-skill", suggestedVersion: "1.0.0", dirty: false,
     personalPublisherAvailable: true, teamPublisherAvailable: false,
-    publicVisibilityAvailable: true, departmentVisibilityAvailable: false, privateVisibilityAvailable: false,
+    publicVisibilityAvailable: true, departmentVisibilityAvailable: false, privateVisibilityAvailable: true,
+    collaborationRevision: { value: 1n },
     collaborationUnavailableReason: "A collaboration identity owner is not configured."
   };
 }
@@ -366,6 +451,7 @@ function protoPublicationJob(): object {
     authority: protoPublicationAuthority(),
     metadata: { slug: "draft-skill", name: "Draft Skill", description: "Publish safely.", tags: ["writing"], version: "1.0.0" },
     publisher: SkillPublicationPublisher.PERSONAL, visibility: SkillPublicationVisibility.PUBLIC,
+    audienceScopeIds: [], accessRevision: { value: 1n },
     gates: protoPublicationGates(), verdict: SkillPublicationVerdict.PASSED,
     files: 2n, uncompressedBytes: 256n, archiveBytes: 128n, attempt: 1,
     result: {
@@ -373,6 +459,22 @@ function protoPublicationJob(): object {
       entryContentRevision: OTHER_HASH, version: "1.0.0"
     },
     createdAt: timestamp(), updatedAt: timestamp(1_700_000_100n), completedAt: timestamp(1_700_000_100n), cancellable: false
+  };
+}
+
+function protoCollaborationDirectory(): object {
+  return {
+    available: true,
+    revision: { value: 4n },
+    actor: { actorId: "collaboration_actor_test", displayName: "Local owner" },
+    scopes: [{
+      scopeId: "collaboration_scope_test",
+      revision: { value: 2n },
+      kind: CollaborationScopeKind.TEAM,
+      name: "Platform",
+      members: [{ actorId: "collaboration_actor_test", role: CollaborationRole.ADMINISTRATOR }]
+    }],
+    recoveredFromCorruption: false
   };
 }
 
@@ -387,6 +489,72 @@ function protoFailedPublicationJob(error: string): object {
     result: undefined,
     error,
     cancellable: false
+  };
+}
+
+function protoResourceUsageReport(): object {
+  const passive = protoResourceUsageMetrics(5, { passiveExposures: 5n }, 1_699_999_900n);
+  const active = protoResourceUsageMetrics(5, { strongActive: 5n, toolCalls: 5n, toolErrors: 1n }, 1_700_000_100n);
+  const totals = protoResourceUsageMetrics(10, {
+    strongActive: 5n,
+    passiveExposures: 5n,
+    toolCalls: 5n,
+    toolErrors: 1n
+  }, 1_700_000_100n);
+  const previous = {
+    identity: { resourceRevision: { value: 7n }, contentRevision: HASH, version: "1.0.0" },
+    metrics: passive,
+    firstUsedAt: timestamp(1_699_999_800n)
+  };
+  const current = {
+    identity: { resourceRevision: { value: 8n }, contentRevision: OTHER_HASH, version: "2.0.0" },
+    metrics: active,
+    firstUsedAt: timestamp(1_700_000_000n)
+  };
+  return {
+    resourceId: "resource-skill",
+    timeZone: "Asia/Shanghai",
+    fromDay: "2026-08-16",
+    throughDay: "2026-09-14",
+    days: Array.from({ length: 30 }, (_value, index) => ({
+      localDay: new Date(Date.UTC(2026, 7, 16 + index)).toISOString().slice(0, 10),
+      metrics: index === 29 ? totals : protoResourceUsageMetrics(0)
+    })),
+    totals,
+    sources: [
+      { source: ResourceUsageSource.RUNTIME_CONFIRMED_RESOURCE_LOAD, metrics: passive },
+      { source: ResourceUsageSource.RUNTIME_TOOL_CALL, metrics: active }
+    ],
+    agents: [{ backendId: "pi", metrics: totals }],
+    versions: [current, previous],
+    comparison: { available: true, minimumSamples: 5, current, previous },
+    projection: {
+      complete: true,
+      streamCount: 2,
+      pendingStreamCount: 0,
+      lastProjectedAt: timestamp(1_700_000_200n),
+      failures: []
+    }
+  };
+}
+
+function protoResourceUsageMetrics(
+  samples: number,
+  values: Partial<Record<"strongActive" | "semiActive" | "passiveExposures" | "reads" | "rereads" | "toolCalls" | "toolErrors" | "commands" | "commandFailures", bigint>> = {},
+  latestUsedAt?: bigint
+): object {
+  return {
+    samples: BigInt(samples),
+    strongActive: values.strongActive ?? 0n,
+    semiActive: values.semiActive ?? 0n,
+    passiveExposures: values.passiveExposures ?? 0n,
+    reads: values.reads ?? 0n,
+    rereads: values.rereads ?? 0n,
+    toolCalls: values.toolCalls ?? 0n,
+    toolErrors: values.toolErrors ?? 0n,
+    commands: values.commands ?? 0n,
+    commandFailures: values.commandFailures ?? 0n,
+    ...(latestUsedAt === undefined ? {} : { latestUsedAt: timestamp(latestUsedAt) })
   };
 }
 

@@ -4769,6 +4769,63 @@ html[data-desktop-platform="darwin"] .runtime-process-window__titlebar { padding
 .skill-callout--danger > svg { color: var(--red); }
 .skill-inline-error { display: flex; align-items: flex-start; gap: 7px; margin: 10px 0; color: var(--red); font-size: var(--text-10); line-height: 1.45; overflow-wrap: anywhere; }
 .skill-inline-error > svg { width: 15px; height: 15px; flex: 0 0 auto; }
+.skill-usage { display: grid; gap: 12px; margin: 16px 0; border: 1px solid var(--line); border-radius: 13px; padding: 13px; background: var(--surface); }
+.skill-usage__header { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; }
+.skill-usage__header > div { min-width: 0; }
+.skill-usage__header h3 { margin: 1px 0 3px; font-size: var(--text-14); }
+.skill-usage__header p:not(.eyebrow) { margin: 0; color: var(--text-soft); font-size: var(--text-9); line-height: 1.45; }
+.skill-usage__header > .button { min-height: 30px; flex: 0 0 auto; padding: 4px 8px; font-size: var(--text-9); }
+.skill-usage__state { min-height: 118px; display: flex; align-items: center; justify-content: center; gap: 8px; border-radius: 10px; background: var(--surface-sunken); color: var(--text-faint); font-size: var(--text-10); }
+.skill-usage__state > svg { width: 16px; height: 16px; flex: 0 0 auto; }
+.skill-usage__state.is-error { color: var(--red); }
+.skill-usage__state > span { max-width: 520px; overflow-wrap: anywhere; }
+.skill-usage__state > .button { min-height: 28px; margin-inline-start: 4px; padding: 3px 8px; }
+.skill-usage__report { min-width: 0; display: grid; gap: 11px; }
+.skill-usage__degraded { display: grid; grid-template-columns: 17px minmax(0, 1fr) auto; align-items: start; gap: 8px; border: 1px solid color-mix(in srgb, var(--amber) 30%, var(--line)); border-radius: 9px; padding: 9px 10px; background: color-mix(in srgb, var(--amber) 7%, var(--surface)); }
+.skill-usage__degraded > svg { width: 16px; height: 16px; color: var(--amber); }
+.skill-usage__degraded > span { display: grid; gap: 2px; }
+.skill-usage__degraded strong { font-size: var(--text-10); }
+.skill-usage__degraded small { color: var(--text-soft); font-size: var(--text-9); line-height: 1.4; }
+.skill-usage__degraded > .button { min-height: 28px; padding: 3px 8px; }
+.skill-usage__summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 7px; margin: 0; }
+.skill-usage__summary > div { min-width: 0; display: grid; gap: 5px; border: 1px solid var(--line); border-radius: 9px; padding: 9px; background: var(--surface-raised); }
+.skill-usage__summary dt { min-width: 0; display: flex; align-items: center; gap: 5px; color: var(--text-faint); font-size: var(--text-8); }
+.skill-usage__summary dt > svg { width: 13px; height: 13px; flex: 0 0 auto; }
+.skill-usage__summary dt > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.skill-usage__summary dd { margin: 0; font-size: var(--text-18); font-weight: 720; letter-spacing: -.025em; }
+.skill-usage__summary > .is-danger dt, .skill-usage__summary > .is-danger dd { color: var(--red); }
+.skill-usage__latest { display: grid; grid-template-columns: auto auto minmax(0, 1fr); align-items: baseline; gap: 7px; margin: 0; color: var(--text-faint); font-size: var(--text-8); }
+.skill-usage__latest strong { color: var(--text); font-size: var(--text-9); }
+.skill-usage__latest small { justify-self: end; color: var(--text-faint); }
+.skill-usage__trend { display: grid; gap: 7px; border: 1px solid var(--line); border-radius: 10px; padding: 10px; background: var(--surface-raised); }
+.skill-usage__trend > header { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.skill-usage__trend h4, .skill-usage__breakdowns h4, .skill-usage__comparison h4 { margin: 0; font-size: var(--text-10); }
+.skill-usage__trend > header span { color: var(--text-faint); font-size: var(--text-8); }
+.skill-usage__bars { height: 88px; display: grid; grid-template-columns: repeat(30, minmax(2px, 1fr)); align-items: end; gap: clamp(1px, .35vw, 4px); border-bottom: 1px solid var(--line); padding-top: 5px; }
+.skill-usage__bars > span { height: 100%; display: flex; align-items: end; }
+.skill-usage__bars i { width: 100%; min-height: 1px; border-radius: 3px 3px 0 0; background: color-mix(in srgb, var(--accent) 72%, var(--purple)); }
+.skill-usage__trend > footer { display: flex; justify-content: space-between; color: var(--text-faint); font-family: var(--font-mono); font-size: var(--text-8); }
+.skill-usage__breakdowns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.skill-usage__breakdowns > section { min-width: 0; display: grid; align-content: start; gap: 7px; border: 1px solid var(--line); border-radius: 10px; padding: 10px; background: var(--surface-raised); }
+.skill-usage__breakdowns p { margin: 0; color: var(--text-faint); font-size: var(--text-9); }
+.skill-usage__breakdowns ol { display: grid; gap: 7px; margin: 0; padding: 0; list-style: none; }
+.skill-usage__breakdowns li { min-width: 0; display: grid; gap: 3px; }
+.skill-usage__breakdowns li > span { min-width: 0; display: flex; justify-content: space-between; gap: 8px; font-size: var(--text-8); }
+.skill-usage__breakdowns li strong { overflow: hidden; color: var(--text-soft); font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.skill-usage__breakdowns li small { flex: 0 0 auto; color: var(--text-faint); }
+.skill-usage__breakdowns li > i { height: 4px; overflow: hidden; border-radius: 999px; background: var(--surface-sunken); }
+.skill-usage__breakdowns li > i > b { height: 100%; display: block; border-radius: inherit; background: var(--accent); }
+.skill-usage__comparison { display: grid; gap: 9px; border: 1px solid var(--line); border-radius: 10px; padding: 10px; background: var(--surface-raised); }
+.skill-usage__comparison > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 9px; }
+.skill-usage__comparison > header p { margin: 3px 0 0; color: var(--text-faint); font-size: var(--text-8); line-height: 1.4; }
+.skill-usage__comparison-note { margin: 0; border-radius: 7px; padding: 8px; background: var(--surface-sunken); color: var(--text-soft); font-size: var(--text-9); }
+.skill-usage__version-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
+.skill-usage__version-grid > div { min-width: 0; display: grid; gap: 2px; border-radius: 8px; padding: 8px; background: var(--surface-sunken); }
+.skill-usage__version-grid span { color: var(--text-faint); font-size: var(--text-8); }
+.skill-usage__version-grid strong { overflow: hidden; font-size: var(--text-12); text-overflow: ellipsis; white-space: nowrap; }
+.skill-usage__version-grid small { color: var(--text-soft); font-size: var(--text-8); }
+.skill-usage__version-grid > .skill-usage__delta { align-content: center; text-align: center; }
+.skill-usage__version-grid > .skill-usage__delta strong { font-size: var(--text-16); }
 .skill-content-workbench { min-height: 390px; display: grid; grid-template-columns: minmax(180px, 27%) minmax(0, 1fr); overflow: hidden; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
 .skill-file-tree { min-width: 0; overflow-y: auto; border-right: 1px solid var(--line); padding: 8px 6px; background: var(--surface-sunken); }
 .skill-file-tree > h3 { margin: 0 0 7px; padding: 0 7px; color: var(--text-faint); font-size: var(--text-8); letter-spacing: .06em; text-transform: uppercase; }
@@ -4868,6 +4925,9 @@ html[data-desktop-platform="darwin"] .runtime-process-window__titlebar { padding
 .skill-market-metadata dt, .skill-market-current dt { color: var(--text-faint); font-size: var(--text-8); letter-spacing: .05em; text-transform: uppercase; }
 .skill-market-metadata dd, .skill-market-current dd { min-width: 0; margin: 0; overflow: hidden; font-size: var(--text-10); text-overflow: ellipsis; white-space: nowrap; }
 .skill-market-tags { display: flex; flex-wrap: wrap; gap: 5px; }
+.skill-market-access { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 14px; border: 1px solid var(--line); border-radius: 12px; padding: 11px 12px; background: var(--surface-sunken); }
+.skill-market-access h3 { margin: 0; font-size: var(--text-11); }
+.skill-market-access p { margin: 3px 0 0; color: var(--text-soft); font-size: var(--text-9); }
 .skill-market-placement-status { margin: 15px 0 4px; border: 1px solid var(--line); border-radius: 12px; padding: 12px; background: color-mix(in srgb, var(--surface-raised) 82%, transparent); }
 .skill-market-placement-status > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 .skill-market-placement-status h3 { margin: 0; font-size: var(--text-11); }
@@ -4902,7 +4962,32 @@ html[data-desktop-platform="darwin"] .runtime-process-window__titlebar { padding
 .skill-market-notice.is-warning { border-color: color-mix(in srgb, var(--amber) 34%, var(--line)); }
 .skill-market-notice.is-warning > svg { color: var(--amber); }
 .skill-market-notice.is-success > svg { color: var(--green); }
+.skill-market-access-editor { display: grid; gap: 11px; }
+.skill-market-access-editor > p { margin: 0; color: var(--text-soft); font-size: var(--text-10); }
+.skill-market-access-editor fieldset { display: flex; flex-wrap: wrap; gap: 9px; border: 1px solid var(--line); border-radius: 10px; padding: 10px; }
+.skill-market-access-editor legend { padding: 0 4px; color: var(--text-soft); font-size: var(--text-9); }
+.skill-market-access-editor label { display: flex; align-items: center; gap: 5px; font-size: var(--text-9); }
+.skill-market-access-editor label.is-disabled { color: var(--text-faint); }
 .skill-market-sources { min-height: min(690px, calc(100vh - 295px)); overflow-y: auto; border: 1px solid var(--line); border-radius: 15px; padding: clamp(16px, 3vw, 28px); background: var(--surface-raised); box-shadow: var(--shadow-sm); }
+.skill-collaboration { min-height: min(690px, calc(100vh - 295px)); overflow-y: auto; border: 1px solid var(--line); border-radius: 15px; padding: clamp(16px, 3vw, 28px); background: var(--surface-raised); box-shadow: var(--shadow-sm); }
+.skill-collaboration__notice { display: flex; align-items: flex-start; gap: 7px; margin: 12px 0; border: 1px solid var(--line); border-radius: 9px; padding: 9px 10px; color: var(--text-soft); font-size: var(--text-10); }
+.skill-collaboration__notice > svg { width: 16px; height: 16px; flex: 0 0 auto; }
+.skill-collaboration__notice.is-error { border-color: color-mix(in srgb, var(--red) 32%, var(--line)); color: var(--red); }
+.skill-collaboration__identity { display: grid; grid-template-columns: 42px minmax(0, 1fr) auto; align-items: center; gap: 11px; margin: 14px 0; border: 1px solid var(--line); border-radius: 12px; padding: 11px; background: var(--surface); }
+.skill-collaboration__identity > svg, .skill-collaboration__icon { width: 42px; height: 42px; display: grid; place-items: center; border-radius: 11px; padding: 11px; background: var(--purple-soft); color: var(--purple); }
+.skill-collaboration__identity > div { min-width: 0; display: grid; gap: 2px; }
+.skill-collaboration__identity span, .skill-collaboration__identity small { color: var(--text-faint); font-size: var(--text-9); }
+.skill-collaboration__create { display: grid; grid-template-columns: minmax(150px, .45fr) minmax(190px, 1fr) auto; align-items: end; gap: 9px; margin: 13px 0; border: 1px solid var(--line); border-radius: 12px; padding: 12px; background: var(--surface-sunken); }
+.skill-collaboration__create label, .skill-collaboration__rename label { display: grid; gap: 5px; color: var(--text-soft); font-size: var(--text-9); }
+.skill-collaboration__create input, .skill-collaboration__rename input { width: 100%; min-height: 36px; border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; outline: 0; background: var(--surface-raised); color: var(--text); font: inherit; }
+.skill-collaboration__create input:focus, .skill-collaboration__rename input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent); }
+.skill-collaboration__list { display: grid; gap: 8px; margin-top: 12px; }
+.skill-collaboration__list > article { display: grid; grid-template-columns: 42px minmax(0, 1fr) auto; align-items: center; gap: 11px; border: 1px solid var(--line); border-radius: 11px; padding: 11px; background: var(--surface); }
+.skill-collaboration__list > article > div:nth-child(2) { min-width: 0; display: grid; gap: 3px; }
+.skill-collaboration__list > article > div:nth-child(2) > span { display: flex; align-items: center; gap: 7px; }
+.skill-collaboration__list small { color: var(--text-faint); font-size: var(--text-9); }
+.skill-collaboration__list > article > div:last-child { display: flex; gap: 5px; }
+.skill-collaboration__rename { display: grid; gap: 12px; }
 .skill-market-page-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
 .skill-market-page-header h2 { margin: 1px 0 4px; font-size: var(--text-22); }
 .skill-market-page-header p:not(.eyebrow) { max-width: 680px; margin: 0; color: var(--text-soft); line-height: 1.5; }
@@ -4985,6 +5070,10 @@ html[data-desktop-platform="darwin"] .runtime-process-window__titlebar { padding
 .skill-publication__access legend { padding: 0 4px; color: var(--text-soft); font-size: var(--text-9); }
 .skill-publication__access label { display: flex; align-items: center; gap: 5px; font-size: var(--text-9); }
 .skill-publication__access label.is-disabled { color: var(--text-faint); }
+.skill-publication__access .skill-publication__scope, .skill-publication__audiences { width: 100%; display: grid; gap: 6px; }
+.skill-publication__access .skill-publication__scope { align-items: stretch; }
+.skill-publication__audiences > span, .skill-publication__scope > span { color: var(--text-faint); font-size: var(--text-8); }
+.skill-publication__audiences > label { display: flex; }
 .skill-publication__access > p { grid-column: 1 / -1; display: flex; align-items: flex-start; gap: 6px; color: var(--text-faint); font-size: var(--text-9); line-height: 1.45; }
 .skill-publication__access > p > svg { width: 15px; height: 15px; flex: 0 0 auto; color: var(--amber); }
 .skill-publication__publish-action { display: flex; justify-content: flex-end; }
@@ -5006,6 +5095,7 @@ html[data-desktop-platform="darwin"] .runtime-process-window__titlebar { padding
 .skill-publication__job-detail { min-width: 0; display: grid; gap: 10px; padding: 11px; }
 .skill-publication__job-detail > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
 .skill-publication__job-detail > header small { color: var(--text-faint); font-size: var(--text-8); }
+.skill-publication__job-access { color: var(--text-faint); font-size: var(--text-9); }
 .skill-publication__gates { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
 .skill-publication__gates > section { display: flex; align-items: flex-start; gap: 7px; border: 1px solid var(--line); border-radius: 8px; padding: 8px; background: var(--surface-raised); }
 .skill-publication__gates > section > svg { width: 15px; height: 15px; flex: 0 0 auto; color: var(--text-faint); }
@@ -5032,6 +5122,14 @@ html[data-desktop-platform="darwin"] .runtime-process-window__titlebar { padding
   .skill-detail__header { flex-wrap: wrap; }
   .skill-detail__actions { width: 100%; justify-content: flex-end; }
   .skill-detail__metadata { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .skill-usage__header { flex-direction: column; }
+  .skill-usage__header > .button { align-self: flex-end; }
+  .skill-usage__summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .skill-usage__latest { grid-template-columns: auto minmax(0, 1fr); }
+  .skill-usage__latest small { grid-column: 1 / -1; justify-self: start; }
+  .skill-usage__breakdowns { grid-template-columns: minmax(0, 1fr); }
+  .skill-usage__version-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .skill-usage__version-grid > .skill-usage__delta { grid-column: 1 / -1; }
   .skill-content-workbench { grid-template-columns: minmax(0, 1fr); }
   .skill-file-tree { max-height: 230px; border-right: 0; border-bottom: 1px solid var(--line); }
   .skill-file-preview__body > pre, .skill-file-preview__body > textarea { min-height: 300px; }

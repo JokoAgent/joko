@@ -294,6 +294,15 @@ export interface RuntimeResource {
   /** Product runtime generation that made the observation. Required for loaded promotion. */
   readonly runtimeGeneration?: number;
   readonly version?: string;
+  /** Path-free provenance for a Skill installed from a user-owned market. */
+  readonly market?: {
+    readonly sourceId: string;
+    readonly sourceRevision: bigint;
+    readonly entryId: string;
+    readonly entryRevision: bigint;
+    readonly entryContentRevision: string;
+    readonly installedContentRevision: string;
+  };
   readonly detail?: string;
 }
 

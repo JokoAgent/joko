@@ -11,6 +11,11 @@ import { parseDocument } from "yaml";
 
 import { isSensitiveSkillPath, looksLikeSecretMaterial } from "./skill-content-policy.js";
 import {
+  type CollaborationManager,
+  type SkillAccessPolicy,
+  type SkillPublicationSelection
+} from "./collaboration-manager.js";
+import {
   normalizeSkillMarketPublicationMetadata,
   type SkillMarketCatalogItem,
   type SkillMarketManager,
@@ -42,8 +47,8 @@ export type SkillPublicationState =
 export type SkillPublicationGateStatus = "pending" | "passed" | "blocked";
 export type SkillPublicationVerdict = "pending" | "passed" | "blocked";
 export type SkillPublicationMode = "first" | "version";
-export type SkillPublicationPublisher = "personal";
-export type SkillPublicationVisibility = "public";
+export type SkillPublicationPublisher = "personal" | "team";
+export type SkillPublicationVisibility = "public" | "department" | "private";
 
 export interface SkillPublicationGateIssue {
   readonly code: string;
@@ -88,7 +93,10 @@ export interface SkillPublicationJob {
   readonly authority: SkillPublicationAuthority;
   readonly metadata: SkillMarketPublicationMetadata;
   readonly publisher: SkillPublicationPublisher;
+  readonly publisherScopeId?: string;
   readonly visibility: SkillPublicationVisibility;
+  readonly audienceScopeIds: readonly string[];
+  readonly accessRevision: bigint;
   readonly gates: readonly SkillPublicationGate[];
   readonly verdict: SkillPublicationVerdict;
   readonly files: number;
@@ -112,12 +120,13 @@ export interface SkillPublicationPreview {
   readonly suggestedVersion: string;
   readonly existingEntry?: SkillMarketCatalogItem;
   readonly dirty: boolean;
-  readonly personalPublisherAvailable: true;
-  readonly teamPublisherAvailable: false;
-  readonly publicVisibilityAvailable: true;
-  readonly departmentVisibilityAvailable: false;
-  readonly privateVisibilityAvailable: false;
-  readonly collaborationUnavailableReason: string;
+  readonly collaborationRevision: bigint;
+  readonly personalPublisherAvailable: boolean;
+  readonly teamPublisherAvailable: boolean;
+  readonly publicVisibilityAvailable: boolean;
+  readonly departmentVisibilityAvailable: boolean;
+  readonly privateVisibilityAvailable: boolean;
+  readonly collaborationUnavailableReason?: string;
 }
 
 export interface GetSkillPublicationPreviewInput {
@@ -137,9 +146,12 @@ export interface StartSkillPublicationInput {
   readonly expectedSourceRevision: bigint;
   readonly expectedSourceContentRevision: string;
   readonly expectedExistingEntryId?: string;
+  readonly expectedCollaborationRevision: bigint;
   readonly metadata: SkillMarketPublicationMetadata;
   readonly publisher: SkillPublicationPublisher;
+  readonly publisherScopeId?: string;
   readonly visibility: SkillPublicationVisibility;
+  readonly audienceScopeIds: readonly string[];
   readonly attempt?: number;
   readonly retryOfJobId?: string;
 }
@@ -153,6 +165,7 @@ export interface SkillPublicationManagerOptions {
   readonly now?: () => number;
   readonly maximumRecords?: number;
   readonly maximumConcurrentJobs?: number;
+  readonly collaboration?: CollaborationManager;
   /** Owning-test seam invoked only after a durable public phase transition. */
   readonly afterStatePersisted?: (job: SkillPublicationJob) => void | Promise<void>;
 }
@@ -167,12 +180,17 @@ interface StoredSkillPublicationResult extends Omit<SkillPublicationResult, "sou
   readonly entryRevision: string;
 }
 
+interface StoredSkillAccessPolicy extends Omit<SkillAccessPolicy, "revision"> {
+  readonly revision: string;
+}
+
 interface StoredSkillPublicationJob extends Omit<
   SkillPublicationJob,
-  "revision" | "authority" | "result" | "cancellable"
+  "revision" | "authority" | "result" | "cancellable" | "publisher" | "publisherScopeId" | "visibility" | "audienceScopeIds" | "accessRevision"
 > {
   readonly revision: string;
   readonly authority: StoredSkillPublicationAuthority;
+  readonly access: StoredSkillAccessPolicy;
   readonly intent?: SkillMarketPublicationIntent;
   readonly result?: StoredSkillPublicationResult;
 }
@@ -198,7 +216,7 @@ const ACTIVE_PRECOMMIT = new Set<SkillPublicationState>([
   "pending", "snapshotting", "packaging", "scanning", "committing", "cancelling"
 ]);
 const TERMINAL = new Set<SkillPublicationState>(["published", "blocked", "failed", "cancelled"]);
-const COLLABORATION_UNAVAILABLE = "Team and restricted visibility require a configured collaboration identity owner.";
+const COLLABORATION_UNAVAILABLE = "Publishing requires an available collaboration identity owner.";
 const MAXIMUM_SCAN_TEXT_BYTES = 2 * 1024 * 1024;
 const MAXIMUM_GATE_ISSUES = 20;
 
@@ -226,6 +244,7 @@ export class SkillPublicationManager {
   readonly #now: () => number;
   readonly #maximumRecords: number;
   readonly #maximumConcurrentJobs: number;
+  readonly #collaboration?: CollaborationManager;
   readonly #afterStatePersisted?: SkillPublicationManagerOptions["afterStatePersisted"];
   readonly #records = new Map<string, StoredSkillPublicationJob>();
   readonly #active = new Map<string, ActivePublication>();
@@ -247,6 +266,7 @@ export class SkillPublicationManager {
     this.#now = options.now ?? Date.now;
     this.#maximumRecords = options.maximumRecords ?? 128;
     this.#maximumConcurrentJobs = options.maximumConcurrentJobs ?? 2;
+    this.#collaboration = options.collaboration;
     this.#afterStatePersisted = options.afterStatePersisted;
     if (!Number.isSafeInteger(this.#maximumRecords) || this.#maximumRecords < 1 || this.#maximumRecords > 1_000) {
       throw new Error("Skill publication history limit is invalid.");
@@ -314,6 +334,7 @@ export class SkillPublicationManager {
         suggestedSlug
       );
       const existing = target.existingEntry;
+      const capabilities = this.#collaborationCapabilities();
       return {
         authority: publicationAuthority(resource, lease, target.source, existing?.id),
         source: target.source,
@@ -322,16 +343,52 @@ export class SkillPublicationManager {
         suggestedVersion: suggestedPublicationVersion(resource.version, existing?.version),
         ...(existing === undefined ? {} : { existingEntry: copyMarketEntry(existing) }),
         dirty: lease.dirty,
-        personalPublisherAvailable: true,
-        teamPublisherAvailable: false,
-        publicVisibilityAvailable: true,
-        departmentVisibilityAvailable: false,
-        privateVisibilityAvailable: false,
-        collaborationUnavailableReason: COLLABORATION_UNAVAILABLE
+        collaborationRevision: capabilities.revision,
+        personalPublisherAvailable: capabilities.available,
+        teamPublisherAvailable: capabilities.available && capabilities.team,
+        publicVisibilityAvailable: capabilities.available,
+        departmentVisibilityAvailable: capabilities.available && capabilities.team && capabilities.department,
+        privateVisibilityAvailable: capabilities.available,
+        ...(capabilities.reason === undefined ? {} : { collaborationUnavailableReason: capabilities.reason })
       };
     } finally {
       await lease.release();
     }
+  }
+
+  #collaborationCapabilities(): {
+    readonly available: boolean;
+    readonly revision: bigint;
+    readonly team: boolean;
+    readonly department: boolean;
+    readonly reason?: string;
+  } {
+    const collaboration = this.#collaboration;
+    if (collaboration === undefined) return {
+      available: false,
+      revision: 0n,
+      team: false,
+      department: false,
+      reason: COLLABORATION_UNAVAILABLE
+    };
+    const snapshot = collaboration.snapshot();
+    if (!snapshot.available) return {
+      available: false,
+      revision: snapshot.revision,
+      team: false,
+      department: false,
+      reason: snapshot.unavailableReason ?? COLLABORATION_UNAVAILABLE
+    };
+    const capabilities = collaboration.publicationCapabilities();
+    return {
+      available: true,
+      revision: snapshot.revision,
+      team: capabilities.teamScopes.length > 0,
+      department: capabilities.departmentScopes.length > 0,
+      ...((capabilities.teamScopes.length === 0 || capabilities.departmentScopes.length === 0)
+        ? { reason: "Create the required team and department scopes to enable restricted team publishing." }
+        : {})
+    };
   }
 
   list(filter: { readonly resourceId?: string } = {}): readonly SkillPublicationJob[] {
@@ -351,11 +408,23 @@ export class SkillPublicationManager {
     return publicJob(record, this.#active.get(record.id)?.finalSwitched === true);
   }
 
+  usesCollaborationScope(scopeId: string): boolean {
+    this.#assertInitialized();
+    const id = entityId(scopeId, "Collaboration scope ID");
+    return [...this.#records.values()].some((record) => {
+      if (TERMINAL.has(record.state)) return false;
+      const access = publicAccess(record.access);
+      return access.publisher.kind === "team" && access.publisher.scopeId === id
+        || access.audienceScopeIds.includes(id);
+    });
+  }
+
   async start(input: StartSkillPublicationInput): Promise<SkillPublicationJob> {
     this.#assertInitialized();
     if (this.#closing) throw new Error("Skill publication manager is closing.");
     const normalized = await this.#validateStart(input);
     return this.#mutate(async () => {
+      this.#collaboration?.assertRevision(normalized.collaborationRevision);
       if (this.#records.has(normalized.jobId)) throw new Error("Skill publication job ID already exists.");
       const active = [...this.#records.values()].filter((record) => !TERMINAL.has(record.state));
       if (active.length >= this.#maximumConcurrentJobs) throw new Error("The Skill publication concurrency limit has been reached.");
@@ -376,8 +445,7 @@ export class SkillPublicationManager {
         state: "pending",
         authority: storedAuthority(normalized.authority),
         metadata: normalized.metadata,
-        publisher: "personal",
-        visibility: "public",
+        access: storedAccess(normalized.access),
         gates: pendingPublicationGates(),
         verdict: "pending",
         files: 0,
@@ -461,6 +529,7 @@ export class SkillPublicationManager {
       throw new Error("Only blocked, failed, or cancelled Skill publications can be retried.");
     }
     const authority = publicAuthority(previous.authority);
+    const previousAccess = publicAccess(previous.access);
     return this.start({
       jobId: normalizedJobId(nextJobId),
       resourceId: authority.resourceId,
@@ -470,9 +539,12 @@ export class SkillPublicationManager {
       expectedSourceRevision: authority.sourceRevision,
       expectedSourceContentRevision: authority.sourceContentRevision,
       ...(authority.existingEntryId === undefined ? {} : { expectedExistingEntryId: authority.existingEntryId }),
+      expectedCollaborationRevision: this.#collaboration?.snapshot().revision ?? 0n,
       metadata: previous.metadata,
-      publisher: previous.publisher,
-      visibility: previous.visibility,
+      publisher: previousAccess.publisher.kind === "team" ? "team" : "personal",
+      ...(previousAccess.publisher.kind === "team" ? { publisherScopeId: previousAccess.publisher.scopeId } : {}),
+      visibility: previousAccess.visibility,
+      audienceScopeIds: previousAccess.audienceScopeIds,
       attempt: previous.attempt + 1,
       retryOfJobId: previous.id
     });
@@ -498,12 +570,19 @@ export class SkillPublicationManager {
     readonly jobId: string;
     readonly authority: SkillPublicationAuthority;
     readonly metadata: SkillMarketPublicationMetadata;
+    readonly access: SkillAccessPolicy;
+    readonly collaborationRevision: bigint;
     readonly attempt: number;
     readonly retryOfJobId?: string;
   }> {
     const jobId = normalizedJobId(input.jobId);
-    if (input.publisher !== "personal") throw new Error(COLLABORATION_UNAVAILABLE);
-    if (input.visibility !== "public") throw new Error(COLLABORATION_UNAVAILABLE);
+    const collaboration = this.#collaboration;
+    if (collaboration === undefined) throw new Error(COLLABORATION_UNAVAILABLE);
+    const collaborationRevision = nonNegativeRevision(
+      input.expectedCollaborationRevision,
+      "Collaboration catalog revision"
+    );
+    collaboration.assertRevision(collaborationRevision);
     const metadata = normalizeSkillMarketPublicationMetadata(input.metadata);
     const resourceId = entityId(input.resourceId, "Skill Resource ID");
     const expectedResourceRevision = positiveRevision(input.expectedResourceRevision, "Skill Resource revision");
@@ -530,6 +609,12 @@ export class SkillPublicationManager {
           ? "The existing Skill market entry disappeared after the publication form was opened."
           : "This Skill slug already exists or changed after the publication form was opened.");
       }
+      const access = collaboration.authorizePublication({
+        publisher: input.publisher,
+        ...(input.publisherScopeId === undefined ? {} : { publisherScopeId: input.publisherScopeId }),
+        visibility: input.visibility,
+        audienceScopeIds: input.audienceScopeIds
+      }, target.existingEntry?.access);
       if (target.existingEntry !== undefined) {
         if (semver.compare(metadata.version, target.existingEntry.version) <= 0) {
           throw new Error(`Skill publication version must be greater than ${target.existingEntry.version}.`);
@@ -543,6 +628,8 @@ export class SkillPublicationManager {
         jobId,
         authority: publicationAuthority(resource, lease, target.source, expectedExistingEntryId),
         metadata,
+        access,
+        collaborationRevision,
         attempt,
         ...(retryOfJobId === undefined ? {} : { retryOfJobId })
       };
@@ -579,6 +666,7 @@ export class SkillPublicationManager {
         sourceId: initial.authority.sourceId,
         expectedSourceContentRevision: initial.authority.sourceContentRevision,
         metadata: initial.metadata,
+        access: publicAccess(initial.access),
         intent: initial.intent
       }, (store, result) => {
         const current = this.#require(jobId);
@@ -669,6 +757,7 @@ export class SkillPublicationManager {
         archivePath,
         archiveBytes: archive.bytes,
         archiveSha256: archive.sha256,
+        access: publicAccess(initial.access),
         ...(initial.intent === undefined ? {} : { recoveredIntent: initial.intent })
       }, {
         beforeSwitch: async (intent) => {
@@ -898,14 +987,18 @@ function publicResult(value: StoredSkillPublicationResult): SkillPublicationResu
 }
 
 function publicJob(value: StoredSkillPublicationJob, finalSwitched: boolean): SkillPublicationJob {
+  const access = publicAccess(value.access);
   return {
     id: value.id,
     revision: BigInt(value.revision),
     state: value.state,
     authority: publicAuthority(value.authority),
     metadata: { ...value.metadata, tags: [...value.metadata.tags] },
-    publisher: value.publisher,
-    visibility: value.visibility,
+    publisher: access.publisher.kind === "team" ? "team" : "personal",
+    ...(access.publisher.kind === "team" ? { publisherScopeId: access.publisher.scopeId } : {}),
+    visibility: access.visibility,
+    audienceScopeIds: [...access.audienceScopeIds],
+    accessRevision: access.revision,
     gates: copyGates(value.gates),
     verdict: value.verdict,
     files: value.files,
@@ -925,8 +1018,31 @@ function publicJob(value: StoredSkillPublicationJob, finalSwitched: boolean): Sk
 function copyMarketEntry(value: SkillMarketCatalogItem): SkillMarketCatalogItem {
   return {
     ...value,
+    access: {
+      ...value.access,
+      publisher: { ...value.access.publisher },
+      audienceScopeIds: [...value.access.audienceScopeIds]
+    },
     tags: [...value.tags],
     installStatuses: value.installStatuses.map((status) => ({ ...status }))
+  };
+}
+
+function storedAccess(value: SkillAccessPolicy): StoredSkillAccessPolicy {
+  return {
+    ...value,
+    revision: value.revision.toString(10),
+    publisher: { ...value.publisher },
+    audienceScopeIds: [...value.audienceScopeIds]
+  };
+}
+
+function publicAccess(value: StoredSkillAccessPolicy): SkillAccessPolicy {
+  return {
+    ...value,
+    revision: BigInt(value.revision),
+    publisher: { ...value.publisher },
+    audienceScopeIds: [...value.audienceScopeIds]
   };
 }
 
@@ -1267,6 +1383,11 @@ function positiveRevision(value: bigint, label: string): bigint {
   return value;
 }
 
+function nonNegativeRevision(value: bigint, label: string): bigint {
+  if (value < 0n) throw new Error(`${label} is invalid.`);
+  return value;
+}
+
 function increment(value: string): string {
   if (!DECIMAL.test(value)) throw new Error("Stored Skill publication revision is invalid.");
   return (BigInt(value) + 1n).toString(10);
@@ -1303,7 +1424,7 @@ function validateStoredCatalog(value: unknown, maximumRecords: number): StoredSk
 
 function validateStoredJob(value: unknown): StoredSkillPublicationJob {
   const object = strictObject(value, [
-    "id", "revision", "state", "authority", "metadata", "publisher", "visibility", "gates", "verdict",
+    "id", "revision", "state", "authority", "metadata", "access", "gates", "verdict",
     "files", "uncompressedBytes", "archiveBytes", "attempt", "retryOfJobId", "intent", "result",
     "createdAt", "updatedAt", "completedAt", "error"
   ], "Skill publication job");
@@ -1313,9 +1434,7 @@ function validateStoredJob(value: unknown): StoredSkillPublicationJob {
   const state = object.state;
   const authority = validateStoredAuthority(object.authority);
   const metadata = normalizeSkillMarketPublicationMetadata(object.metadata as SkillMarketPublicationMetadata);
-  if (object.publisher !== "personal" || object.visibility !== "public") {
-    throw new Error("Stored Skill publication publisher or visibility is invalid.");
-  }
+  const access = validateStoredAccess(object.access);
   const gates = validateStoredGates(object.gates);
   if (object.verdict !== "pending" && object.verdict !== "passed" && object.verdict !== "blocked") {
     throw new Error("Skill publication verdict is invalid.");
@@ -1357,8 +1476,7 @@ function validateStoredJob(value: unknown): StoredSkillPublicationJob {
     state,
     authority,
     metadata,
-    publisher: "personal",
-    visibility: "public",
+    access,
     gates,
     verdict,
     files,
@@ -1404,6 +1522,38 @@ function validateStoredAuthority(value: unknown): StoredSkillPublicationAuthorit
     sourceDisplay,
     ...(existingEntryId === undefined ? {} : { existingEntryId })
   };
+}
+
+function validateStoredAccess(value: unknown): StoredSkillAccessPolicy {
+  const object = strictObject(value, ["revision", "publisher", "visibility", "audienceScopeIds"], "Skill publication access");
+  const revision = storedPositiveRevision(object.revision, "Skill publication access revision");
+  const publisherObject = strictObject(object.publisher, object.publisher !== null && typeof object.publisher === "object"
+    && (object.publisher as Record<string, unknown>).kind === "team"
+    ? ["kind", "scopeId"]
+    : ["kind", "actorId"], "Skill publication publisher");
+  const publisher = publisherObject.kind === "personal"
+    ? { kind: "personal" as const, actorId: entityId(stringValue(publisherObject.actorId, "Publisher actor ID"), "Publisher actor ID") }
+    : publisherObject.kind === "team"
+      ? { kind: "team" as const, scopeId: entityId(stringValue(publisherObject.scopeId, "Publisher team scope ID"), "Publisher team scope ID") }
+      : (() => { throw new Error("Stored Skill publication publisher is invalid."); })();
+  if (object.visibility !== "public" && object.visibility !== "department" && object.visibility !== "private") {
+    throw new Error("Stored Skill publication visibility is invalid.");
+  }
+  if (!Array.isArray(object.audienceScopeIds) || object.audienceScopeIds.length > 256) {
+    throw new Error("Stored Skill publication audience is invalid.");
+  }
+  const audienceScopeIds = object.audienceScopeIds.map((scopeId) => entityId(stringValue(scopeId, "Audience scope ID"), "Audience scope ID"));
+  if (new Set(audienceScopeIds).size !== audienceScopeIds.length
+    || audienceScopeIds.some((scopeId, index) => index > 0 && audienceScopeIds[index - 1]!.localeCompare(scopeId, "en") >= 0)) {
+    throw new Error("Stored Skill publication audience must be unique and ordered.");
+  }
+  if (publisher.kind === "personal" && (object.visibility === "department" || audienceScopeIds.length !== 0)
+    || publisher.kind === "team" && (object.visibility === "private"
+      || object.visibility === "public" && audienceScopeIds.length !== 0
+      || object.visibility === "department" && audienceScopeIds.length === 0)) {
+    throw new Error("Stored Skill publication access combination is invalid.");
+  }
+  return { revision, publisher, visibility: object.visibility, audienceScopeIds };
 }
 
 function validateStoredResult(value: unknown): StoredSkillPublicationResult {

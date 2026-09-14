@@ -248,11 +248,70 @@ enum SkillPublicationMode {
 enum SkillPublicationPublisher {
   SKILL_PUBLICATION_PUBLISHER_UNSPECIFIED = 0;
   SKILL_PUBLICATION_PUBLISHER_PERSONAL = 1;
+  SKILL_PUBLICATION_PUBLISHER_TEAM = 2;
+  // Read-only catalog provenance for entries not published by this identity owner.
+  SKILL_PUBLICATION_PUBLISHER_EXTERNAL = 3;
 }
 
 enum SkillPublicationVisibility {
   SKILL_PUBLICATION_VISIBILITY_UNSPECIFIED = 0;
   SKILL_PUBLICATION_VISIBILITY_PUBLIC = 1;
+  SKILL_PUBLICATION_VISIBILITY_DEPARTMENT = 2;
+  SKILL_PUBLICATION_VISIBILITY_PRIVATE = 3;
+}
+
+enum CollaborationScopeKind {
+  COLLABORATION_SCOPE_KIND_UNSPECIFIED = 0;
+  COLLABORATION_SCOPE_KIND_TEAM = 1;
+  COLLABORATION_SCOPE_KIND_DEPARTMENT = 2;
+}
+
+enum CollaborationRole {
+  COLLABORATION_ROLE_UNSPECIFIED = 0;
+  COLLABORATION_ROLE_VIEWER = 1;
+  COLLABORATION_ROLE_PUBLISHER = 2;
+  COLLABORATION_ROLE_ADMINISTRATOR = 3;
+}
+
+message CollaborationActor {
+  string actor_id = 1;
+  string display_name = 2;
+}
+
+message CollaborationMembership {
+  string actor_id = 1;
+  CollaborationRole role = 2;
+}
+
+message CollaborationScope {
+  string scope_id = 1;
+  Revision revision = 2;
+  CollaborationScopeKind kind = 3;
+  string name = 4;
+  repeated CollaborationMembership members = 5;
+}
+
+message CollaborationDirectory {
+  bool available = 1;
+  Revision revision = 2;
+  optional CollaborationActor actor = 3;
+  repeated CollaborationScope scopes = 4;
+  bool recovered_from_corruption = 5;
+  optional string unavailable_reason = 6;
+}
+
+message SkillAccessPublisher {
+  SkillPublicationPublisher kind = 1;
+  optional string actor_id = 2;
+  optional string scope_id = 3;
+  optional string source_id = 4;
+}
+
+message SkillAccessPolicy {
+  Revision revision = 1;
+  SkillAccessPublisher publisher = 2;
+  SkillPublicationVisibility visibility = 3;
+  repeated string audience_scope_ids = 4;
 }
 
 message SkillMarketLocalSource {
@@ -323,6 +382,8 @@ message SkillMarketEntry {
   optional string source_error = 17;
   repeated SkillMarketInstallStatus install_statuses = 18;
   optional string changelog = 19;
+  SkillAccessPolicy access = 20;
+  bool can_manage = 21;
 }
 
 message SkillMarketInstallStatus {
@@ -533,6 +594,9 @@ message SkillPublicationJob {
   optional google.protobuf.Timestamp completed_at = 18;
   optional string error = 19;
   bool cancellable = 20;
+  optional string publisher_scope_id = 21;
+  repeated string audience_scope_ids = 22;
+  Revision access_revision = 23;
 }
 
 message SkillPublicationPreview {
@@ -549,4 +613,5 @@ message SkillPublicationPreview {
   bool department_visibility_available = 11;
   bool private_visibility_available = 12;
   string collaboration_unavailable_reason = 13;
+  Revision collaboration_revision = 14;
 }

@@ -2095,6 +2095,80 @@ export interface SkillSessionView {
   readonly expiresAt: number;
 }
 
+export type ResourceUsageSourceView =
+  | "structuredResourceMention"
+  | "nativeSkillCommand"
+  | "runtimeConfirmedResourceLoad"
+  | "exactFileRead"
+  | "runtimeToolCall";
+
+export interface ResourceUsageMetricsView {
+  readonly samples: number;
+  readonly strongActive: number;
+  readonly semiActive: number;
+  readonly passiveExposures: number;
+  readonly reads: number;
+  readonly rereads: number;
+  readonly toolCalls: number;
+  readonly toolErrors: number;
+  readonly commands: number;
+  readonly commandFailures: number;
+  readonly latestUsedAt?: number;
+}
+
+export interface ResourceUsageVersionIdentityView {
+  readonly resourceRevision: bigint;
+  readonly contentRevision: string;
+  readonly version?: string;
+}
+
+export interface ResourceUsageVersionBreakdownView {
+  readonly identity: ResourceUsageVersionIdentityView;
+  readonly metrics: ResourceUsageMetricsView;
+  readonly firstUsedAt?: number;
+}
+
+export interface ResourceUsageReportView {
+  readonly resourceId: string;
+  readonly timeZone: string;
+  readonly fromDay: string;
+  readonly throughDay: string;
+  readonly days: readonly {
+    readonly localDay: string;
+    readonly metrics: ResourceUsageMetricsView;
+  }[];
+  readonly totals: ResourceUsageMetricsView;
+  readonly sources: readonly {
+    readonly source: ResourceUsageSourceView;
+    readonly metrics: ResourceUsageMetricsView;
+  }[];
+  readonly agents: readonly {
+    readonly backendId: string;
+    readonly metrics: ResourceUsageMetricsView;
+  }[];
+  readonly versions: readonly ResourceUsageVersionBreakdownView[];
+  readonly comparison: {
+    readonly available: boolean;
+    readonly minimumSamples: number;
+    readonly unavailableReason?: "noCurrentVersion" | "noPreviousVersion" | "currentSamples" | "previousSamples";
+    readonly current?: ResourceUsageVersionBreakdownView;
+    readonly previous?: ResourceUsageVersionBreakdownView;
+  };
+  readonly projection: {
+    readonly complete: boolean;
+    readonly streamCount: number;
+    readonly pendingStreamCount: number;
+    readonly lastProjectedAt?: number;
+    readonly failures: readonly {
+      readonly sessionId: string;
+      readonly source: ResourceUsageSourceView;
+      readonly attempts: number;
+      readonly retryAt: number;
+      readonly errorCode: string;
+    }[];
+  };
+}
+
 export interface SkillDraftView {
   readonly id: string;
   readonly sessionId: string;
@@ -2167,6 +2241,55 @@ export interface SkillMarketEntryIdentityView {
   readonly contentRevision: string;
 }
 
+export type CollaborationScopeKindView = "team" | "department";
+export type CollaborationRoleView = "viewer" | "publisher" | "administrator";
+
+export interface CollaborationActorView {
+  readonly id: string;
+  readonly displayName: string;
+}
+
+export interface CollaborationMembershipView {
+  readonly actorId: string;
+  readonly role: CollaborationRoleView;
+}
+
+export interface CollaborationScopeView {
+  readonly id: string;
+  readonly revision: bigint;
+  readonly kind: CollaborationScopeKindView;
+  readonly name: string;
+  readonly members: readonly CollaborationMembershipView[];
+}
+
+export interface CollaborationDirectoryView {
+  readonly available: boolean;
+  readonly revision: bigint;
+  readonly actor?: CollaborationActorView;
+  readonly scopes: readonly CollaborationScopeView[];
+  readonly recoveredFromCorruption: boolean;
+  readonly unavailableReason?: string;
+}
+
+export type SkillAccessPublisherView =
+  | { readonly kind: "personal"; readonly actorId: string }
+  | { readonly kind: "team"; readonly scopeId: string }
+  | { readonly kind: "external"; readonly sourceId: string };
+
+export interface SkillAccessPolicyView {
+  readonly revision: bigint;
+  readonly publisher: SkillAccessPublisherView;
+  readonly visibility: "public" | "department" | "private";
+  readonly audienceScopeIds: readonly string[];
+}
+
+export interface SkillPublicationAccessSelectionView {
+  readonly publisher: "personal" | "team";
+  readonly publisherScopeId?: string;
+  readonly visibility: "public" | "department" | "private";
+  readonly audienceScopeIds: readonly string[];
+}
+
 export interface SkillMarketEntryView {
   readonly identity: SkillMarketEntryIdentityView;
   readonly slug: string;
@@ -2187,6 +2310,8 @@ export interface SkillMarketEntryView {
   readonly sourceState: "ready" | "error";
   readonly sourceError?: string;
   readonly installStatuses: readonly SkillMarketInstallStatusView[];
+  readonly access: SkillAccessPolicyView;
+  readonly canManage: boolean;
 }
 
 export interface SkillMarketInstallStatusView {
@@ -2441,8 +2566,11 @@ export interface SkillPublicationJobView {
   readonly state: SkillPublicationStateView;
   readonly authority: SkillPublicationAuthorityView;
   readonly metadata: SkillPublicationMetadataView;
-  readonly publisher: "personal";
-  readonly visibility: "public";
+  readonly publisher: "personal" | "team";
+  readonly publisherScopeId?: string;
+  readonly visibility: "public" | "department" | "private";
+  readonly audienceScopeIds: readonly string[];
+  readonly accessRevision: bigint;
   readonly gates: readonly SkillPublicationGateView[];
   readonly verdict: "pending" | "passed" | "blocked";
   readonly files: number;
@@ -2466,12 +2594,13 @@ export interface SkillPublicationPreviewView {
   readonly suggestedVersion: string;
   readonly existingEntry?: SkillMarketEntryView;
   readonly dirty: boolean;
-  readonly personalPublisherAvailable: true;
-  readonly teamPublisherAvailable: false;
-  readonly publicVisibilityAvailable: true;
-  readonly departmentVisibilityAvailable: false;
-  readonly privateVisibilityAvailable: false;
-  readonly collaborationUnavailableReason: string;
+  readonly collaborationRevision: bigint;
+  readonly personalPublisherAvailable: boolean;
+  readonly teamPublisherAvailable: boolean;
+  readonly publicVisibilityAvailable: boolean;
+  readonly departmentVisibilityAvailable: boolean;
+  readonly privateVisibilityAvailable: boolean;
+  readonly collaborationUnavailableReason?: string;
 }
 
 /** Exact loaded resource identity owned by one live task runtime. */
@@ -4482,6 +4611,7 @@ export interface OperationApi {
     readonly scope?: SkillScopeView;
     readonly signal?: AbortSignal;
   }): Promise<SkillCatalogView>;
+  getSkillResourceUsageReport(resourceId: string, timeZone: string, signal?: AbortSignal): Promise<ResourceUsageReportView>;
   openSkill(skillId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<SkillSessionView>;
   listSkillFiles(sessionId: string, parentKey?: string, signal?: AbortSignal): Promise<readonly SkillFileEntryView[]>;
   readSkillFile(sessionId: string, key: string, signal?: AbortSignal): Promise<SkillFileContentView>;
@@ -4527,7 +4657,12 @@ export interface OperationApi {
   getSkillPublicationPreview(resourceId: string, expectedResourceRevision: bigint, sourceId: string, expectedSourceRevision: bigint, slug?: string, signal?: AbortSignal): Promise<SkillPublicationPreviewView>;
   listSkillPublicationJobs(resourceId?: string, signal?: AbortSignal): Promise<SkillMarketSyncCatalogView<SkillPublicationJobView>>;
   getSkillPublicationJob(jobId: string, signal?: AbortSignal): Promise<SkillPublicationJobView>;
-  startSkillPublication(preview: SkillPublicationPreviewView, metadata: SkillPublicationMetadataView, signal?: AbortSignal): Promise<void>;
+  getCollaborationDirectory(signal?: AbortSignal): Promise<CollaborationDirectoryView>;
+  createCollaborationScope(kind: CollaborationScopeKindView, name: string, expectedCatalogRevision: bigint, signal?: AbortSignal): Promise<void>;
+  updateCollaborationScope(scope: CollaborationScopeView, name: string, signal?: AbortSignal): Promise<void>;
+  deleteCollaborationScope(scope: CollaborationScopeView, signal?: AbortSignal): Promise<void>;
+  updateSkillMarketAccess(entry: SkillMarketEntryView, collaborationRevision: bigint, selection: SkillPublicationAccessSelectionView, signal?: AbortSignal): Promise<void>;
+  startSkillPublication(preview: SkillPublicationPreviewView, metadata: SkillPublicationMetadataView, access: SkillPublicationAccessSelectionView, signal?: AbortSignal): Promise<void>;
   cancelSkillPublication(job: SkillPublicationJobView, signal?: AbortSignal): Promise<void>;
   retrySkillPublication(job: SkillPublicationJobView, signal?: AbortSignal): Promise<void>;
   listCommands(sessionId: string): Promise<readonly RuntimeCommandView[]>;

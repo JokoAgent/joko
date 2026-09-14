@@ -276,6 +276,45 @@ describe("Skill market catalog", () => {
     expect(controller.closeSkill).toHaveBeenCalledWith("skill-session");
     expect(controller.closeSkillMarketInstallPlan).toHaveBeenCalledWith(installPlan().id);
   });
+
+  it("shows access provenance and submits a fenced visibility change only for a manageable entry", async () => {
+    const managed: SkillMarketEntryView = {
+      ...entry(),
+      access: { revision: 3n, publisher: { kind: "personal", actorId: "collaboration_actor_test" }, visibility: "public", audienceScopeIds: [] },
+      canManage: true
+    };
+    const updateSkillMarketAccess = vi.fn(async () => undefined);
+    const controller = marketController({
+      listSkillMarketCatalog: vi.fn(async () => ({ revision: 9n, entries: [managed], categories: [], sourceCount: 1, totalSize: 1 })),
+      getSkillMarketEntry: vi.fn(async () => managed),
+      getCollaborationDirectory: vi.fn(async () => ({
+        available: true,
+        revision: 7n,
+        actor: { id: "collaboration_actor_test", displayName: "Local owner" },
+        scopes: [],
+        recoveredFromCorruption: false
+      })),
+      updateSkillMarketAccess
+    });
+    const container = await render(<SkillMarketCatalogTools controller={controller} backends={backends} targets={targets} locale="en" t={t} onOpenSources={vi.fn()} />);
+    await settle(120);
+    await act(async () => buttonWithText(container, /Review helper/u).click());
+    await settle();
+    expect(container.textContent).toContain("Personal publisher · Public visibility");
+    await act(async () => buttonWithText(container, "Manage visibility").click());
+    await settle();
+    const dialog = required(document.body.querySelector<HTMLElement>('[role="dialog"]'));
+    const privateInput = required([...dialog.querySelectorAll<HTMLLabelElement>("label")]
+      .find((label) => label.textContent?.includes("Private"))?.querySelector<HTMLInputElement>('input[type="radio"]'));
+    await act(async () => privateInput.click());
+    await act(async () => buttonWithText(dialog, "Save").click());
+    await settle();
+    expect(updateSkillMarketAccess).toHaveBeenCalledWith(
+      managed,
+      7n,
+      { publisher: "personal", visibility: "private", audienceScopeIds: [] }
+    );
+  });
 });
 
 function marketController(overrides: Partial<AppController> = {}): AppController {
@@ -320,7 +359,9 @@ function entry(): SkillMarketEntryView {
     slug: "review-helper", name: "Review helper", author: "Joko Team", description: "Review a change safely.", category: "Productivity",
     tags: ["review", "safe"], version: "2.0.0", createdAt: Date.now() - 100_000, updatedAt: Date.now() - 50_000,
     downloads: 42, trendScore: 9.5, archiveBytes: 512, sourceName: "team-skills", sourceDisplayName: "Team Skills", sourceState: "ready",
-    installStatuses: []
+    installStatuses: [],
+    access: { revision: 1n, publisher: { kind: "external", sourceId: source().id }, visibility: "public", audienceScopeIds: [] },
+    canManage: false
   };
 }
 

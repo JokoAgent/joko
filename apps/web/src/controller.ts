@@ -2011,6 +2011,8 @@ export function useAppController(): AppController {
     setResourceEnabled: (resourceId, enabled) => gateway().setResourceEnabled(resourceId, enabled),
     removeResource: (resourceId) => gateway().removeResource(resourceId),
     listSkills: (options) => gateway().listSkills(options),
+    getSkillResourceUsageReport: (resourceId, timeZone, signal) =>
+      gateway().getSkillResourceUsageReport(resourceId, timeZone, signal),
     openSkill: (skillId, expectedRevision, signal) => gateway().openSkill(skillId, expectedRevision, signal),
     listSkillFiles: (sessionId, parentKey, signal) => gateway().listSkillFiles(sessionId, parentKey, signal),
     readSkillFile: (sessionId, key, signal) => gateway().readSkillFile(sessionId, key, signal),
@@ -2057,7 +2059,14 @@ export function useAppController(): AppController {
       gateway().getSkillPublicationPreview(resourceId, expectedResourceRevision, sourceId, expectedSourceRevision, slug, signal),
     listSkillPublicationJobs: (resourceId, signal) => gateway().listSkillPublicationJobs(resourceId, signal),
     getSkillPublicationJob: (jobId, signal) => gateway().getSkillPublicationJob(jobId, signal),
-    startSkillPublication: (preview, metadata, signal) => gateway().startSkillPublication(preview, metadata, signal),
+    getCollaborationDirectory: (signal) => gateway().getCollaborationDirectory(signal),
+    createCollaborationScope: (kind, name, expectedCatalogRevision, signal) =>
+      gateway().createCollaborationScope(kind, name, expectedCatalogRevision, signal),
+    updateCollaborationScope: (scope, name, signal) => gateway().updateCollaborationScope(scope, name, signal),
+    deleteCollaborationScope: (scope, signal) => gateway().deleteCollaborationScope(scope, signal),
+    updateSkillMarketAccess: (entry, collaborationRevision, selection, signal) =>
+      gateway().updateSkillMarketAccess(entry, collaborationRevision, selection, signal),
+    startSkillPublication: (preview, metadata, access, signal) => gateway().startSkillPublication(preview, metadata, access, signal),
     cancelSkillPublication: (job, signal) => gateway().cancelSkillPublication(job, signal),
     retrySkillPublication: (job, signal) => gateway().retrySkillPublication(job, signal),
     listCommands: (sessionId) => gateway().listCommands(sessionId),

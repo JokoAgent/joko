@@ -23,6 +23,7 @@ import {
 import type { AppController } from "../controller.js";
 import type {
   BackendView,
+  CollaborationDirectoryView,
   SkillDescriptorView,
   SkillMarketArchivePageView,
   SkillMarketCatalogPageView,
@@ -39,6 +40,7 @@ import type {
   SkillMarketSourceView,
   SkillMarketSyncJobView,
   SkillMarketSyncPolicyView,
+  SkillPublicationAccessSelectionView,
   TargetView
 } from "../model.js";
 import { resourceKindsForBackend } from "../resource-capabilities.js";
@@ -199,6 +201,7 @@ export function SkillMarketCatalogTools({ controller, backends, targets, locale,
   const [selectedFile, setSelectedFile] = useState<string>();
   const [file, setFile] = useState<LoadState<SkillMarketPreviewFileView> | undefined>();
   const [installEntry, setInstallEntry] = useState<SkillMarketEntryView>();
+  const [accessEntry, setAccessEntry] = useState<SkillMarketEntryView>();
   const [mobileDetail, setMobileDetail] = useState(initialSelection !== undefined);
   const [reload, setReload] = useState(0);
   const [detailReload, setDetailReload] = useState(0);
@@ -361,6 +364,7 @@ export function SkillMarketCatalogTools({ controller, backends, targets, locale,
           {readyDetail.entry.sourceError !== undefined && <InlineNotice tone="error" message={readyDetail.entry.sourceError} />}
           <dl className="skill-market-metadata"><div><dt>{t("skills.market.author")}</dt><dd>{readyDetail.entry.author ?? t("common.unknown")}</dd></div><div><dt>{t("skills.market.category")}</dt><dd>{readyDetail.entry.category ?? t("common.unknown")}</dd></div><div><dt>{t("skills.market.updated")}</dt><dd>{formatRelativeTime(readyDetail.entry.updatedAt, locale)}</dd></div><div><dt>{t("skills.market.size")}</dt><dd>{formatBytes(readyDetail.entry.archiveBytes)}</dd></div></dl>
           <div className="skill-market-tags">{readyDetail.entry.tags.map((tag) => <Pill key={tag}>{tag}</Pill>)}</div>
+          <section className="skill-market-access"><div><h3>{t("skills.market.access.title")}</h3><p>{t("skills.market.access.summary", { publisher: t(`skills.publish.publisher.${readyDetail.entry.access.publisher.kind}`), visibility: t(`skills.publish.visibility.${readyDetail.entry.access.visibility}`) })}</p></div>{readyDetail.entry.canManage && <Button onClick={() => setAccessEntry(readyDetail.entry)}>{t("skills.market.access.manage")}</Button>}</section>
           <MarketInstallStatusDetails entry={readyDetail.entry} backends={backends} targets={targets} t={t} />
           <div className="skill-market-detail__actions"><Button tone="primary" disabled={readyDetail.entry.sourceState !== "ready"} onClick={() => setInstallEntry(readyDetail.entry)}><Download aria-hidden="true" />{t("skills.market.install.open")}</Button><span>{t("skills.market.preview.summary", { files: readyDetail.preview.files, size: formatBytes(readyDetail.preview.bytes) })}</span></div>
           <section className="skill-market-files" aria-label={t("skills.market.preview.files") }><div className="skill-market-file-list">{readyDetail.files.files.map((entry) => <button type="button" disabled={entry.kind === "directory"} className={cx(selectedFile === entry.key && "is-active")} key={entry.key} onClick={() => setSelectedFile(entry.key)}>{entry.kind === "directory" ? <Folder aria-hidden="true" /> : <File aria-hidden="true" />}<span>{entry.key}</span><small>{entry.kind === "file" ? formatBytes(entry.size) : t("skills.market.preview.folder")}</small></button>)}{readyDetail.files.nextPageToken !== undefined && <Button tone="ghost" onClick={loadMoreFiles}>{t("skills.market.preview.more")}</Button>}</div><div className="skill-market-file-preview">{selectedFile === undefined && <EmptyState icon={<File />} title={t("skills.market.preview.selectFile")} body={t("skills.market.preview.selectFileBody")} />}{file?.kind === "loading" && <LoadingState message={t("skills.market.preview.loadingFile")} />}{file?.kind === "error" && <ErrorState message={file.message} retry={() => { const key = selectedFile; setSelectedFile(undefined); window.setTimeout(() => setSelectedFile(key), 0); }} t={t} />}{file?.kind === "ready" && (file.value.previewable ? <pre>{file.value.content}</pre> : <EmptyState icon={<File />} title={t("skills.market.preview.unavailable")} body={t(`skills.market.preview.reason.${file.value.unavailableReason ?? "binary"}`)} />)}</div></section>
@@ -368,6 +372,7 @@ export function SkillMarketCatalogTools({ controller, backends, targets, locale,
       </section>
     </section>
     {installEntry !== undefined && <SkillMarketInstallDialog controller={controller} entry={installEntry} backends={backends} targets={targets} locale={locale} t={t} onClose={() => setInstallEntry(undefined)} onChanged={() => { setDetailReload((value) => value + 1); setReload((value) => value + 1); }} />}
+    {accessEntry !== undefined && <SkillMarketAccessDialog controller={controller} entry={accessEntry} t={t} onClose={() => setAccessEntry(undefined)} onChanged={() => { setAccessEntry(undefined); setDetailReload((value) => value + 1); setReload((value) => value + 1); }} />}
   </>;
 }
 
@@ -402,6 +407,62 @@ function MarketInstallStatusDetails({ entry, backends, targets, t }: {
         : t("skills.market.status.placement.project", { backend, target: target ?? t("common.unknown"), parent: status.relativeParent ?? t("common.unknown") })}</strong><small>{status.installedVersion === undefined ? t("skills.market.status.versionUnknown") : t("skills.market.status.version", { version: status.installedVersion })}</small></span><Pill tone={status.state === "installed" ? "success" : status.state === "updateAvailable" ? "warning" : "danger"}>{t(`skills.market.status.${status.state}`)}</Pill></li>;
     })}</ul>}
   </section>;
+}
+
+function SkillMarketAccessDialog({ controller, entry, t, onClose, onChanged }: {
+  readonly controller: AppController;
+  readonly entry: SkillMarketEntryView;
+  readonly t: Translator;
+  readonly onClose: () => void;
+  readonly onChanged: () => void;
+}): JSX.Element {
+  const [directory, setDirectory] = useState<LoadState<CollaborationDirectoryView>>({ kind: "loading" });
+  const [visibility, setVisibility] = useState<SkillPublicationAccessSelectionView["visibility"]>(entry.access.visibility);
+  const [audienceScopeIds, setAudienceScopeIds] = useState<readonly string[]>(entry.access.audienceScopeIds);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string>();
+  useEffect(() => {
+    const abort = new AbortController();
+    void controller.getCollaborationDirectory(abort.signal).then((value) => {
+      if (!abort.signal.aborted) setDirectory({ kind: "ready", value });
+    }).catch((cause: unknown) => {
+      if (!abort.signal.aborted) setDirectory({ kind: "error", message: errorMessage(cause, t) });
+    });
+    return () => abort.abort();
+  }, [controller, t]);
+  const publisher = entry.access.publisher;
+  const available = directory.kind === "ready" && directory.value.available ? directory.value : undefined;
+  const departments = available?.scopes.filter((scope) => scope.kind === "department") ?? [];
+  const valid = publisher.kind === "personal"
+    ? visibility === "public" || visibility === "private"
+    : publisher.kind === "team" && (visibility === "public" && audienceScopeIds.length === 0
+      || visibility === "department" && audienceScopeIds.length > 0
+        && audienceScopeIds.every((id) => departments.some((scope) => scope.id === id)));
+  const save = (): void => {
+    if (busy || available === undefined || publisher.kind === "external" || !valid) return;
+    setBusy(true);
+    setError(undefined);
+    const selection: SkillPublicationAccessSelectionView = publisher.kind === "personal"
+      ? { publisher: "personal", visibility, audienceScopeIds: [] }
+      : { publisher: "team", publisherScopeId: publisher.scopeId, visibility, audienceScopeIds };
+    void controller.updateSkillMarketAccess(entry, available.revision, selection).then(onChanged)
+      .catch((cause: unknown) => setError(errorMessage(cause, t))).finally(() => setBusy(false));
+  };
+  return <Modal open title={t("skills.market.access.manageTitle", { name: entry.name })} description={t("skills.market.access.manageBody")} size="small" dismissOnBackdrop={!busy} onClose={() => { if (!busy) onClose(); }}>
+    <div className="skill-market-access-editor">
+      <p>{t("skills.market.access.owner", { publisher: t(`skills.publish.publisher.${publisher.kind}`) })}</p>
+      {directory.kind === "loading" && <LoadingState message={t("skills.collaboration.loading")} />}
+      {directory.kind === "error" && <InlineNotice tone="error" message={directory.message} />}
+      {available !== undefined && <fieldset><legend>{t("skills.publish.visibility")}</legend>
+        <label><input type="radio" name="market-visibility" checked={visibility === "public"} disabled={busy} onChange={() => { setVisibility("public"); setAudienceScopeIds([]); }} />{t("skills.publish.visibility.public")}</label>
+        {publisher.kind === "personal" && <label><input type="radio" name="market-visibility" checked={visibility === "private"} disabled={busy} onChange={() => { setVisibility("private"); setAudienceScopeIds([]); }} />{t("skills.publish.visibility.private")}</label>}
+        {publisher.kind === "team" && <label className={departments.length === 0 ? "is-disabled" : undefined}><input type="radio" name="market-visibility" checked={visibility === "department"} disabled={busy || departments.length === 0} onChange={() => { setVisibility("department"); setAudienceScopeIds((current) => current.length > 0 ? current : departments[0] === undefined ? [] : [departments[0].id]); }} />{t("skills.publish.visibility.department")}</label>}
+      </fieldset>}
+      {available !== undefined && publisher.kind === "team" && visibility === "department" && <fieldset><legend>{t("skills.publish.audiences")}</legend>{departments.map((scope) => <label key={scope.id}><input type="checkbox" checked={audienceScopeIds.includes(scope.id)} disabled={busy} onChange={(event) => setAudienceScopeIds((current) => event.target.checked ? [...current, scope.id] : current.filter((id) => id !== scope.id))} />{scope.name}</label>)}</fieldset>}
+      {error !== undefined && <InlineNotice tone="error" message={error} />}
+      <div className="modal__actions"><Button disabled={busy} onClick={onClose}>{t("common.cancel")}</Button><Button tone="primary" disabled={busy || available === undefined || !valid} onClick={save}>{busy ? t("common.working") : t("common.save")}</Button></div>
+    </div>
+  </Modal>;
 }
 
 function SkillMarketInstallDialog({ controller, entry, backends, targets, locale, t, onClose, onChanged }: {

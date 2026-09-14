@@ -36,7 +36,9 @@ import type {
 import type { Translator } from "./types.js";
 import { moveTablistSelection } from "./tablist-navigation.js";
 import { SkillMarketCatalogTools, SkillMarketSourcesTools } from "./SkillMarketTools.js";
+import { SkillCollaborationTools } from "./SkillCollaborationTools.js";
 import { SkillPublicationDialog } from "./SkillPublicationTools.js";
+import { SkillUsagePanel } from "./SkillUsagePanel.js";
 import { Button, EmptyState, IconButton, Modal, Pill, SelectControl, cx, formatRelativeTime } from "./ui.js";
 
 type LoadState<T> =
@@ -85,7 +87,7 @@ export function SkillTools({ controller, backends, targets, locale, t }: {
   readonly locale: string;
   readonly t: Translator;
 }): JSX.Element {
-  const [tab, setTab] = useState<"installed" | "market" | "sources">("installed");
+  const [tab, setTab] = useState<"installed" | "market" | "sources" | "sharing">("installed");
   const [marketHandoff, setMarketHandoff] = useState<SkillMarketEntryIdentityView>();
   const openPublishedEntry = (result: SkillPublicationResultView): void => {
     setMarketHandoff({
@@ -99,7 +101,7 @@ export function SkillTools({ controller, backends, targets, locale, t }: {
   };
   return <div className="skill-hub">
     <div className="skill-hub__tabs" role="tablist" aria-label={t("skills.sections.label")}>
-      {(["installed", "market", "sources"] as const).map((value) => <button
+      {(["installed", "market", "sources", "sharing"] as const).map((value) => <button
         key={value}
         type="button"
         role="tab"
@@ -113,6 +115,7 @@ export function SkillTools({ controller, backends, targets, locale, t }: {
     {tab === "installed" && <LocalSkillTools controller={controller} backends={backends} targets={targets} locale={locale} t={t} onOpenPublished={openPublishedEntry} />}
     {tab === "market" && <SkillMarketCatalogTools controller={controller} backends={backends} targets={targets} locale={locale} t={t} initialSelection={marketHandoff} onOpenSources={() => setTab("sources")} />}
     {tab === "sources" && <SkillMarketSourcesTools controller={controller} locale={locale} t={t} onOpenMarket={() => setTab("market")} />}
+    {tab === "sharing" && <SkillCollaborationTools controller={controller} t={t} />}
   </div>;
 }
 
@@ -423,6 +426,8 @@ function LocalSkillTools({ controller, backends, targets, locale, t, onOpenPubli
         {session !== undefined && <SkillDetail
           controller={controller}
           session={session}
+          backends={backends}
+          locale={locale}
           headingRef={detailHeading}
           selectedFileKey={selectedFileKey}
           fileState={fileState}
@@ -486,9 +491,11 @@ function LocalSkillTools({ controller, backends, targets, locale, t, onOpenPubli
   </>;
 }
 
-function SkillDetail({ controller, session, headingRef, selectedFileKey, fileState, editing, editorText, dirty, busy, actionError, t, onSelectFile, onEditorText, onEdit, onCancelEdit, onPrepareEdit, onRetryFile, onToggle, onRename, onPublish, onDelete }: {
+function SkillDetail({ controller, session, backends, locale, headingRef, selectedFileKey, fileState, editing, editorText, dirty, busy, actionError, t, onSelectFile, onEditorText, onEdit, onCancelEdit, onPrepareEdit, onRetryFile, onToggle, onRename, onPublish, onDelete }: {
   readonly controller: AppController;
   readonly session: SkillSessionView;
+  readonly backends: readonly BackendView[];
+  readonly locale: string;
   readonly headingRef: RefObject<HTMLHeadingElement | null>;
   readonly selectedFileKey?: string;
   readonly fileState?: LoadState<SkillFileContentView>;
@@ -530,6 +537,7 @@ function SkillDetail({ controller, session, headingRef, selectedFileKey, fileSta
     {session.metadata.parseError !== undefined && <div className="skill-callout skill-callout--danger" role="alert"><AlertTriangle aria-hidden="true" /><span><strong>{t("skills.frontmatterError")}</strong><small>{session.metadata.parseError}</small></span></div>}
     {session.dirty && <div className="skill-callout skill-callout--warning" role="status"><FileDiff aria-hidden="true" /><span><strong>{t("skills.dirtyTitle")}</strong><small>{session.diff.available ? t("skills.dirtyBody") : session.diff.reason ?? t("skills.diffUnavailable")}</small></span></div>}
     {actionError !== undefined && <InlineError message={actionError} />}
+    <SkillUsagePanel controller={controller} resourceId={skill.id} backends={backends} locale={locale} t={t} />
     <div className="skill-content-workbench">
       <aside className="skill-file-tree" aria-label={t("skills.files")}><h3>{t("skills.files")}</h3><div>{session.files.map((entry) => <SkillTreeRow key={entry.key} controller={controller} sessionId={session.id} entry={entry} depth={0} selectedKey={selectedFileKey} onSelect={onSelectFile} t={t} />)}</div></aside>
       <section className="skill-file-preview">

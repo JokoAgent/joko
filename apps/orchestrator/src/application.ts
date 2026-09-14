@@ -148,6 +148,7 @@ import { SkillMarketManager } from "./skill-market-manager.js";
 import { SkillMarketSyncManager } from "./skill-market-sync-manager.js";
 import { SkillMutationCoordinator } from "./skill-mutation-coordinator.js";
 import { SkillPublicationManager } from "./skill-publication-manager.js";
+import { CollaborationManager } from "./collaboration-manager.js";
 import { RemoteHostRegistry } from "./remote-host-registry.js";
 import {
   RemoteBackendRuntimeSetupManager,
@@ -324,6 +325,7 @@ export interface OrchestratorApplication {
   readonly skillMarket?: SkillMarketManager;
   readonly skillMarketSync?: SkillMarketSyncManager;
   readonly skillPublication?: SkillPublicationManager;
+  readonly collaboration?: CollaborationManager;
   readonly extensionCatalog?: ExtensionCatalogManager;
   readonly extensionLibraries?: ExtensionLibraryManager;
   readonly extensionMainViews?: ExtensionMainViewManager;
@@ -547,17 +549,21 @@ export async function createOrchestratorApplication(
   });
   await piResources.initialize();
   const skillMutations = new SkillMutationCoordinator();
+  const collaboration = new CollaborationManager({ store });
+  collaboration.initialize();
   const skillMarket = new SkillMarketManager({
     store,
     cacheRoot: join(config.dataDirectory, "skill-market"),
     resources: piResources,
-    mutationCoordinator: skillMutations
+    mutationCoordinator: skillMutations,
+    collaboration
   });
   await skillMarket.initialize();
   const skillPublication = new SkillPublicationManager({
     store,
     resources: piResources,
     market: skillMarket,
+    collaboration,
     rootDirectory: join(config.dataDirectory, "skill-publications")
   });
   await skillPublication.initialize();
@@ -1887,6 +1893,7 @@ export async function createOrchestratorApplication(
     skillMarket,
     skillMarketSync,
     skillPublication,
+    collaboration,
     extensionCatalog,
     extensionLibraries,
     extensionMainViews,

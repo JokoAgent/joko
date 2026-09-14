@@ -15,6 +15,7 @@ import "joko/v1/pi.proto";
 import "joko/v1/portable_session.proto";
 import "joko/v1/runtime.proto";
 import "joko/v1/review.proto";
+import "joko/v1/resource_usage.proto";
 import "joko/v1/settings.proto";
 import "joko/v1/skill.proto";
 import "joko/v1/snapshot.proto";
@@ -289,6 +290,8 @@ service SkillService {
   rpc GetSkillPublicationPreview(GetSkillPublicationPreviewRequest) returns (GetSkillPublicationPreviewResponse);
   rpc ListSkillPublicationJobs(ListSkillPublicationJobsRequest) returns (ListSkillPublicationJobsResponse);
   rpc GetSkillPublicationJob(GetSkillPublicationJobRequest) returns (GetSkillPublicationJobResponse);
+  rpc GetCollaborationDirectory(GetCollaborationDirectoryRequest) returns (GetCollaborationDirectoryResponse);
+  rpc GetSkillResourceUsageReport(GetSkillResourceUsageReportRequest) returns (GetSkillResourceUsageReportResponse);
 }
 
 service SubagentService {
@@ -2371,6 +2374,21 @@ message GetSkillPublicationJobRequest {
 message GetSkillPublicationJobResponse {
   SkillPublicationJob job = 1;
   bool recovered_from_corruption = 2;
+}
+
+message GetCollaborationDirectoryRequest {}
+
+message GetCollaborationDirectoryResponse {
+  CollaborationDirectory directory = 1;
+}
+
+message GetSkillResourceUsageReportRequest {
+  string resource_id = 1;
+  string time_zone = 2;
+}
+
+message GetSkillResourceUsageReportResponse {
+  ResourceUsageReport report = 1;
 }
 
 message GetPiSessionStateRequest {

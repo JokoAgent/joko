@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { ProviderApiCompatibility, ProviderConfigurationField } from "@joko/contracts";
-import { AuthenticationState, BackgroundTaskState, CompactionState, ContextRebuildReason, EventSchema, InlineTextRangeSchema, InputContentSchema, InputMentionRangeSchema, InstallationState, InteractionState, MessageInputDelivery, ModelPriceSource, QueueSourceKind, ReviewFreshnessState, RetryState, RunState, ScheduleExecutionMode, ScheduleFireSource, ScheduleRunPhase, ScheduleSessionMode, ToolCallOutputMode } from "@joko/contracts";
+import { AuthenticationState, BackgroundTaskState, CompactionState, ContextRebuildReason, EventSchema, InlineTextRangeSchema, InputContentSchema, InputMentionRangeSchema, InstallationState, InteractionState, MessageInputDelivery, ModelPriceSource, QueueSourceKind, ResourceUsageActivity, ReviewFreshnessState, RetryState, RunState, ScheduleExecutionMode, ScheduleFireSource, ScheduleRunPhase, ScheduleSessionMode, ToolCallOutputMode } from "@joko/contracts";
 import type { EventPayload, PiEventMetadata, PromptInput, ProviderModel, SubagentRunDetail, SubagentTranscriptEntry } from "@joko/core";
 import { OperationConflictError, type ArtifactRecord, type InteractionRecord, type PersistedEvent, type QueueItemRecord, type ScheduleRecord, type ScheduleRunRecord, type StoredAttempt, type StoredBackend, type StoredRun, type StoredSession } from "@joko/store";
 
@@ -1426,6 +1426,59 @@ describe("proto mapper", () => {
       proto.payload.kind.value.commands[0]!.sessionId = "other-session";
     }
     expect(() => fromProtoEvent(proto)).toThrow(/does not match the event identity/u);
+  });
+
+  it("round-trips path-free exact Resource usage evidence and rejects unspecified identity", () => {
+    const payload: EventPayload = {
+      type: "resource_usage",
+      occurrenceId: "run-1:resource-skill:command",
+      resourceId: "resource-skill",
+      entityRevision: "8",
+      contentRevision: `sha256:${"a".repeat(64)}`,
+      runtimeGeneration: 3,
+      version: "2.0.0",
+      market: {
+        sourceId: "skill_market_source_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        sourceRevision: "7",
+        entryId: "skill_market_entry_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        entryRevision: "9",
+        entryContentRevision: `sha256:${"a".repeat(64)}`,
+        installedContentRevision: `sha256:${"a".repeat(64)}`
+      },
+      source: "native_skill_command",
+      activity: "strong_active",
+      action: "command_succeeded"
+    };
+    const event: PersistedEvent = {
+      id: "event-resource-usage",
+      sequence: 3n,
+      globalCursor: 3n,
+      revision: 3n,
+      emittedAt: 3_000,
+      backendId: "pi",
+      targetId: "target-1",
+      sessionId: "session-1",
+      runId: "run-1",
+      operationId: "operation-1",
+      generation: 3,
+      traceId: "trace-resource-usage",
+      payload
+    };
+    const proto = fromBinary(EventSchema, toBinary(EventSchema, toProtoEvent(event)));
+    expect(proto.payload?.kind).toMatchObject({
+      case: "resourceUsageRecorded",
+      value: {
+        occurrenceId: payload.occurrenceId,
+        resourceId: payload.resourceId,
+        runtimeGeneration: 3n
+      }
+    });
+    expect(fromProtoEvent(proto).payload).toEqual(payload);
+    expect(JSON.stringify(proto, (_key, value) => typeof value === "bigint" ? value.toString() : value))
+      .not.toMatch(/path|prompt|parameter/iu);
+    if (proto.payload?.kind.case !== "resourceUsageRecorded") throw new Error("Expected ResourceUsageRecordedEvent");
+    proto.payload.kind.value.activity = ResourceUsageActivity.UNSPECIFIED;
+    expect(() => fromProtoEvent(proto)).toThrow(/activity is required/u);
   });
 
   it("round-trips typed message deletion events and fences their Session identity", () => {

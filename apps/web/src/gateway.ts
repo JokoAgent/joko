@@ -54,6 +54,8 @@ import {
   ComputerAutomationRuntimeState,
   ComputerAutomationUpdatePhase,
   CompactSessionOutcome,
+  CollaborationRole as ProtoCollaborationRole,
+  CollaborationScopeKind as ProtoCollaborationScopeKind,
   CompactionState,
   ContextRebuildReason,
   CompositeArgumentKind,
@@ -175,6 +177,8 @@ import {
   ResourceRuntimeRequirementStatus,
   ResourceScope,
   ResourceState,
+  ResourceUsageComparisonUnavailableReason as ProtoResourceUsageComparisonUnavailableReason,
+  ResourceUsageSource as ProtoResourceUsageSource,
   ResourceUiApi,
   RecoveryActionKind,
   ReviewAttachmentKind,
@@ -289,6 +293,7 @@ import {
   type BrowserProvider,
   type BrowserTransfer,
   type Connection,
+  type CollaborationDirectory as ProtoCollaborationDirectory,
   type ContextUsage as ProtoContextUsage,
   type CredentialDescriptor,
   type Device,
@@ -341,6 +346,9 @@ import {
   type QuestionAnswer,
   type QuestionChoice,
   type QuestionField,
+  type ResourceUsageMetrics as ProtoResourceUsageMetrics,
+  type ResourceUsageReport as ProtoResourceUsageReport,
+  type ResourceUsageVersionBreakdown as ProtoResourceUsageVersionBreakdown,
   type Schedule,
   type SchedulerRuntimeSnapshot as ProtoSchedulerRuntimeSnapshot,
   type ScheduleRunHistory,
@@ -357,6 +365,7 @@ import {
   type SkillFileContent as ProtoSkillFileContent,
   type SkillFileEntry as ProtoSkillFileEntry,
   type SkillMarketArchiveEntry as ProtoSkillMarketArchiveEntry,
+  type SkillAccessPolicy as ProtoSkillAccessPolicy,
   type SkillMarketEntry as ProtoSkillMarketEntry,
   type SkillMarketEntryIdentity as ProtoSkillMarketEntryIdentity,
   type SkillMarketInstallPlan as ProtoSkillMarketInstallPlan,
@@ -506,6 +515,10 @@ import type {
   ReviewRunView,
   ResourceView,
   ResourceDraft,
+  ResourceUsageMetricsView,
+  ResourceUsageReportView,
+  ResourceUsageSourceView,
+  ResourceUsageVersionBreakdownView,
   RuntimeCommandView,
   SessionResourceView,
   RuntimeProcessUsageSnapshotView,
@@ -536,6 +549,9 @@ import type {
   SessionWorktreeRemovalPreviewView,
   SessionWorktreeView,
   SkillCatalogView,
+  CollaborationDirectoryView,
+  CollaborationScopeKindView,
+  CollaborationScopeView,
   SkillDescriptorView,
   SkillDiffChangeView,
   SkillDiffView,
@@ -547,6 +563,7 @@ import type {
   SkillMarketCatalogPageView,
   SkillMarketEntryIdentityView,
   SkillMarketEntryView,
+  SkillAccessPolicyView,
   SkillMarketGitPreflightView,
   SkillMarketInstallPlanView,
   SkillMarketInstallPreviewView,
@@ -567,6 +584,7 @@ import type {
   SkillMarketSyncPolicyView,
   SkillMarketSyncTargetView,
   SkillPublicationAuthorityView,
+  SkillPublicationAccessSelectionView,
   SkillPublicationGateView,
   SkillPublicationJobView,
   SkillPublicationMetadataView,
@@ -2902,6 +2920,20 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     throw new GatewayError("Skills changed repeatedly while they were being loaded.");
   }
 
+  async getSkillResourceUsageReport(
+    resourceId: string,
+    timeZone: string,
+    signal?: AbortSignal
+  ): Promise<ResourceUsageReportView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).getSkillResourceUsageReport(
+      { resourceId, timeZone },
+      { signal: scope.signal }
+    );
+    if (response.report === undefined) throw new GatewayError("The service returned an empty Resource usage report.");
+    return mapResourceUsageReport(response.report, resourceId, timeZone);
+  }
+
   async openSkill(skillId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<SkillSessionView> {
     const scope = this.captureActionScope(signal);
     const response = await createClient(SkillService, scope.transport).openSkill({
@@ -3574,9 +3606,71 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return mapSkillPublicationJob(response.job);
   }
 
+  async getCollaborationDirectory(signal?: AbortSignal): Promise<CollaborationDirectoryView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).getCollaborationDirectory({}, { signal: scope.signal });
+    if (response.directory === undefined) throw new GatewayError("The service returned an empty collaboration directory.");
+    return mapCollaborationDirectory(response.directory);
+  }
+
+  async createCollaborationScope(
+    kind: CollaborationScopeKindView,
+    name: string,
+    expectedCatalogRevision: bigint,
+    signal?: AbortSignal
+  ): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    await this.submit({
+      case: "createCollaborationScope",
+      value: {
+        expectedCatalogRevision: { value: expectedCatalogRevision },
+        kind: protoCollaborationScopeKind(kind),
+        name
+      }
+    }, true, [], scope.signal);
+  }
+
+  async updateCollaborationScope(scopeValue: CollaborationScopeView, name: string, signal?: AbortSignal): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    await this.submit({
+      case: "updateCollaborationScope",
+      value: { scopeId: scopeValue.id, expectedRevision: { value: scopeValue.revision }, name }
+    }, true, [], scope.signal);
+  }
+
+  async deleteCollaborationScope(scopeValue: CollaborationScopeView, signal?: AbortSignal): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    await this.submit({
+      case: "deleteCollaborationScope",
+      value: { scopeId: scopeValue.id, expectedRevision: { value: scopeValue.revision } }
+    }, true, [], scope.signal);
+  }
+
+  async updateSkillMarketAccess(
+    entry: SkillMarketEntryView,
+    collaborationRevision: bigint,
+    selection: SkillPublicationAccessSelectionView,
+    signal?: AbortSignal
+  ): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    await this.submit({
+      case: "updateSkillMarketAccess",
+      value: {
+        identity: protoSkillMarketIdentity(entry.identity),
+        expectedAccessRevision: { value: entry.access.revision },
+        expectedCollaborationRevision: { value: collaborationRevision },
+        publisher: protoSkillPublicationPublisher(selection.publisher),
+        ...(selection.publisherScopeId === undefined ? {} : { publisherScopeId: selection.publisherScopeId }),
+        visibility: protoSkillPublicationVisibility(selection.visibility),
+        audienceScopeIds: [...selection.audienceScopeIds]
+      }
+    }, true, [], scope.signal);
+  }
+
   async startSkillPublication(
     preview: SkillPublicationPreviewView,
     metadata: SkillPublicationMetadataView,
+    access: SkillPublicationAccessSelectionView,
     signal?: AbortSignal
   ): Promise<void> {
     const scope = this.captureActionScope(signal);
@@ -3591,9 +3685,12 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         expectedSourceRevision: { value: authority.sourceRevision },
         expectedSourceContentRevision: authority.sourceContentRevision,
         ...(authority.existingEntryId === undefined ? {} : { expectedExistingEntryId: authority.existingEntryId }),
+        expectedCollaborationRevision: { value: preview.collaborationRevision },
         metadata: protoSkillPublicationMetadata(metadata),
-        publisher: ProtoSkillPublicationPublisher.PERSONAL,
-        visibility: ProtoSkillPublicationVisibility.PUBLIC
+        publisher: protoSkillPublicationPublisher(access.publisher),
+        ...(access.publisherScopeId === undefined ? {} : { publisherScopeId: access.publisherScopeId }),
+        visibility: protoSkillPublicationVisibility(access.visibility),
+        audienceScopeIds: [...access.audienceScopeIds]
       }
     }, true, [], scope.signal);
   }
@@ -11103,6 +11200,319 @@ function mapResource(resource: ManagedResource): ResourceView {
   };
 }
 
+const RESOURCE_USAGE_COUNT_KEYS = [
+  "samples",
+  "strongActive",
+  "semiActive",
+  "passiveExposures",
+  "reads",
+  "rereads",
+  "toolCalls",
+  "toolErrors",
+  "commands",
+  "commandFailures"
+] as const;
+
+function mapResourceUsageReport(
+  report: ProtoResourceUsageReport,
+  requestedResourceId: string,
+  requestedTimeZone: string
+): ResourceUsageReportView {
+  if (
+    requestedResourceId.trim() === "" || requestedResourceId.length > 4_096 ||
+    report.resourceId !== requestedResourceId || report.timeZone !== requestedTimeZone ||
+    !validResourceUsageTimeZone(report.timeZone) || !validResourceUsageDay(report.fromDay) ||
+    !validResourceUsageDay(report.throughDay) || report.days.length !== 30 ||
+    addResourceUsageDays(report.fromDay, 29) !== report.throughDay
+  ) throw new GatewayError("The service returned an invalid Resource usage report authority.");
+
+  const days = report.days.map((day, index) => {
+    const expectedDay = addResourceUsageDays(report.fromDay, index);
+    if (day.localDay !== expectedDay) throw new GatewayError("The service returned an invalid Resource usage day series.");
+    return { localDay: day.localDay, metrics: mapResourceUsageMetrics(day.metrics) };
+  });
+  const totals = mapResourceUsageMetrics(report.totals);
+
+  const sourceIdentities = new Set<ResourceUsageSourceView>();
+  const sources = report.sources.map((entry) => {
+    const source = mapResourceUsageSource(entry.source);
+    if (sourceIdentities.has(source)) throw new GatewayError("The service returned duplicate Resource usage sources.");
+    sourceIdentities.add(source);
+    return { source, metrics: mapResourceUsageMetrics(entry.metrics) };
+  });
+
+  const agentIdentities = new Set<string>();
+  const agents = report.agents.map((entry) => {
+    const backendId = entry.backendId;
+    if (
+      backendId.trim() === "" || backendId.length > 4_096 || privatePathLikeLabel(backendId) ||
+      agentIdentities.has(backendId)
+    ) throw new GatewayError("The service returned an invalid Resource usage Backend breakdown.");
+    agentIdentities.add(backendId);
+    return { backendId, metrics: mapResourceUsageMetrics(entry.metrics) };
+  });
+
+  const versionIdentities = new Set<string>();
+  const versions = report.versions.map((entry) => {
+    const mapped = mapResourceUsageVersion(entry);
+    const identity = resourceUsageVersionKey(mapped);
+    if (versionIdentities.has(identity)) throw new GatewayError("The service returned duplicate Resource usage versions.");
+    versionIdentities.add(identity);
+    return mapped;
+  });
+
+  if (
+    !resourceUsageCountsMatch(days, totals) ||
+    !resourceUsageCountsMatch(sources, totals) ||
+    !resourceUsageCountsMatch(agents, totals) ||
+    !resourceUsageCountsMatch(versions, totals)
+  ) throw new GatewayError("The service returned inconsistent Resource usage totals.");
+
+  const comparison = mapResourceUsageComparison(report, versions);
+  const projection = mapResourceUsageProjection(report);
+  return {
+    resourceId: report.resourceId,
+    timeZone: report.timeZone,
+    fromDay: report.fromDay,
+    throughDay: report.throughDay,
+    days,
+    totals,
+    sources,
+    agents,
+    versions,
+    comparison,
+    projection
+  };
+}
+
+function mapResourceUsageMetrics(value: ProtoResourceUsageMetrics | undefined): ResourceUsageMetricsView {
+  if (value === undefined) throw new GatewayError("The service returned incomplete Resource usage metrics.");
+  const metrics = {
+    samples: exactSafeUnsignedNumber(value.samples),
+    strongActive: exactSafeUnsignedNumber(value.strongActive),
+    semiActive: exactSafeUnsignedNumber(value.semiActive),
+    passiveExposures: exactSafeUnsignedNumber(value.passiveExposures),
+    reads: exactSafeUnsignedNumber(value.reads),
+    rereads: exactSafeUnsignedNumber(value.rereads),
+    toolCalls: exactSafeUnsignedNumber(value.toolCalls),
+    toolErrors: exactSafeUnsignedNumber(value.toolErrors),
+    commands: exactSafeUnsignedNumber(value.commands),
+    commandFailures: exactSafeUnsignedNumber(value.commandFailures)
+  };
+  if (Object.values(metrics).some((entry) => entry === undefined)) {
+    throw new GatewayError("The service returned unsafe Resource usage metrics.");
+  }
+  const safe = metrics as { readonly [K in typeof RESOURCE_USAGE_COUNT_KEYS[number]]: number };
+  if (
+    safe.strongActive + safe.semiActive + safe.passiveExposures !== safe.samples ||
+    safe.rereads > safe.reads || safe.reads > safe.samples ||
+    safe.toolErrors > safe.toolCalls || safe.toolCalls > safe.samples ||
+    safe.commandFailures > safe.commands || safe.commands > safe.samples ||
+    safe.reads + safe.toolCalls + safe.commands > safe.samples
+  ) throw new GatewayError("The service returned inconsistent Resource usage metrics.");
+  const latestUsedAt = optionalResourceUsageTimestamp(value.latestUsedAt);
+  return { ...safe, ...(latestUsedAt === undefined ? {} : { latestUsedAt }) };
+}
+
+function mapResourceUsageSource(value: ProtoResourceUsageSource): ResourceUsageSourceView {
+  switch (value) {
+    case ProtoResourceUsageSource.STRUCTURED_RESOURCE_MENTION: return "structuredResourceMention";
+    case ProtoResourceUsageSource.NATIVE_SKILL_COMMAND: return "nativeSkillCommand";
+    case ProtoResourceUsageSource.RUNTIME_CONFIRMED_RESOURCE_LOAD: return "runtimeConfirmedResourceLoad";
+    case ProtoResourceUsageSource.EXACT_FILE_READ: return "exactFileRead";
+    case ProtoResourceUsageSource.RUNTIME_TOOL_CALL: return "runtimeToolCall";
+    default: throw new GatewayError("The service returned an unknown Resource usage source.");
+  }
+}
+
+function mapResourceUsageVersion(value: ProtoResourceUsageVersionBreakdown): ResourceUsageVersionBreakdownView {
+  const revision = value.identity?.resourceRevision?.value;
+  const contentRevision = value.identity?.contentRevision ?? "";
+  const version = value.identity?.version;
+  if (
+    revision === undefined || revision < 1n ||
+    !/^sha256:[a-f0-9]{64}$/u.test(contentRevision) ||
+    (version !== undefined && (version.trim() === "" || version.length > 256))
+  ) throw new GatewayError("The service returned an invalid Resource usage version identity.");
+  const metrics = mapResourceUsageMetrics(value.metrics);
+  const firstUsedAt = optionalResourceUsageTimestamp(value.firstUsedAt);
+  if ((metrics.samples === 0) !== (firstUsedAt === undefined)) {
+    throw new GatewayError("The service returned inconsistent Resource usage version timing.");
+  }
+  return {
+    identity: {
+      resourceRevision: revision,
+      contentRevision,
+      ...(version === undefined ? {} : { version })
+    },
+    metrics,
+    ...(firstUsedAt === undefined ? {} : { firstUsedAt })
+  };
+}
+
+function mapResourceUsageComparison(
+  report: ProtoResourceUsageReport,
+  versions: readonly ResourceUsageVersionBreakdownView[]
+): ResourceUsageReportView["comparison"] {
+  const value = report.comparison;
+  if (value === undefined || !Number.isSafeInteger(value.minimumSamples) || value.minimumSamples < 1) {
+    throw new GatewayError("The service returned an invalid Resource usage comparison.");
+  }
+  const current = value.current === undefined ? undefined : mapResourceUsageVersion(value.current);
+  const previous = value.previous === undefined ? undefined : mapResourceUsageVersion(value.previous);
+  for (const compared of [current, previous]) {
+    if (compared === undefined) continue;
+    const canonical = versions.find((entry) => resourceUsageVersionKey(entry) === resourceUsageVersionKey(compared));
+    if (canonical === undefined || !resourceUsageMetricsEqual(canonical.metrics, compared.metrics)
+      || canonical.firstUsedAt !== compared.firstUsedAt) {
+      throw new GatewayError("The service returned an unanchored Resource usage comparison.");
+    }
+  }
+  const unavailableReason = value.unavailableReason === undefined
+    ? undefined
+    : mapResourceUsageComparisonReason(value.unavailableReason);
+  if (value.available) {
+    if (
+      unavailableReason !== undefined || current === undefined || previous === undefined ||
+      current.metrics.samples < value.minimumSamples || previous.metrics.samples < value.minimumSamples
+    ) throw new GatewayError("The service returned an inconsistent available Resource usage comparison.");
+  } else {
+    const validUnavailable = unavailableReason === "noCurrentVersion"
+      ? current === undefined && previous === undefined
+      : unavailableReason === "noPreviousVersion"
+        ? current !== undefined && previous === undefined
+        : unavailableReason === "currentSamples"
+          ? current !== undefined && previous !== undefined && current.metrics.samples < value.minimumSamples
+          : unavailableReason === "previousSamples"
+            ? current !== undefined && previous !== undefined
+              && current.metrics.samples >= value.minimumSamples
+              && previous.metrics.samples < value.minimumSamples
+            : false;
+    if (!validUnavailable) throw new GatewayError("The service returned an inconsistent unavailable Resource usage comparison.");
+  }
+  return {
+    available: value.available,
+    minimumSamples: value.minimumSamples,
+    ...(unavailableReason === undefined ? {} : { unavailableReason }),
+    ...(current === undefined ? {} : { current }),
+    ...(previous === undefined ? {} : { previous })
+  };
+}
+
+function mapResourceUsageComparisonReason(
+  value: ProtoResourceUsageComparisonUnavailableReason
+): NonNullable<ResourceUsageReportView["comparison"]["unavailableReason"]> {
+  switch (value) {
+    case ProtoResourceUsageComparisonUnavailableReason.NO_CURRENT_VERSION: return "noCurrentVersion";
+    case ProtoResourceUsageComparisonUnavailableReason.NO_PREVIOUS_VERSION: return "noPreviousVersion";
+    case ProtoResourceUsageComparisonUnavailableReason.CURRENT_SAMPLES: return "currentSamples";
+    case ProtoResourceUsageComparisonUnavailableReason.PREVIOUS_SAMPLES: return "previousSamples";
+    default: throw new GatewayError("The service returned an unknown Resource usage comparison reason.");
+  }
+}
+
+function mapResourceUsageProjection(report: ProtoResourceUsageReport): ResourceUsageReportView["projection"] {
+  const value = report.projection;
+  if (
+    value === undefined || !Number.isSafeInteger(value.streamCount) || value.streamCount < 0 ||
+    !Number.isSafeInteger(value.pendingStreamCount) || value.pendingStreamCount < 0 ||
+    value.pendingStreamCount > value.streamCount
+  ) throw new GatewayError("The service returned an invalid Resource usage projection status.");
+  const lastProjectedAt = optionalResourceUsageTimestamp(value.lastProjectedAt);
+  const failureIdentities = new Set<string>();
+  const failures = value.failures.map((failure) => {
+    const source = mapResourceUsageSource(failure.source);
+    const retryAt = requiredResourceUsageTimestamp(failure.retryAt);
+    const identity = `${failure.sessionId}\u0000${source}`;
+    if (
+      failure.sessionId.trim() === "" || failure.sessionId.length > 4_096 ||
+      !Number.isSafeInteger(failure.attempts) || failure.attempts < 1 ||
+      !/^[A-Z][A-Z0-9_]{0,127}$/u.test(failure.errorCode) || failureIdentities.has(identity)
+    ) throw new GatewayError("The service returned an invalid Resource usage projection failure.");
+    failureIdentities.add(identity);
+    return { sessionId: failure.sessionId, source, attempts: failure.attempts, retryAt, errorCode: failure.errorCode };
+  });
+  if (
+    failures.length > value.pendingStreamCount ||
+    value.complete !== (value.pendingStreamCount === 0 && failures.length === 0)
+  ) throw new GatewayError("The service returned an inconsistent Resource usage projection status.");
+  return {
+    complete: value.complete,
+    streamCount: value.streamCount,
+    pendingStreamCount: value.pendingStreamCount,
+    ...(lastProjectedAt === undefined ? {} : { lastProjectedAt }),
+    failures
+  };
+}
+
+function resourceUsageCountsMatch(
+  values: readonly { readonly metrics: ResourceUsageMetricsView }[],
+  totals: ResourceUsageMetricsView
+): boolean {
+  return RESOURCE_USAGE_COUNT_KEYS.every((key) => {
+    let sum = 0;
+    for (const value of values) {
+      sum += value.metrics[key];
+      if (!Number.isSafeInteger(sum)) return false;
+    }
+    return sum === totals[key];
+  });
+}
+
+function resourceUsageMetricsEqual(left: ResourceUsageMetricsView, right: ResourceUsageMetricsView): boolean {
+  return RESOURCE_USAGE_COUNT_KEYS.every((key) => left[key] === right[key])
+    && left.latestUsedAt === right.latestUsedAt;
+}
+
+function resourceUsageVersionKey(value: ResourceUsageVersionBreakdownView): string {
+  return `${value.identity.contentRevision}\u0000${value.identity.version ?? ""}`;
+}
+
+function validResourceUsageTimeZone(value: string): boolean {
+  if (value.trim() === "" || value.length > 128 || value !== value.trim() || /[\u0000\r\n]/u.test(value)) return false;
+  try {
+    new Intl.DateTimeFormat("en", { timeZone: value }).format(0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function validResourceUsageDay(value: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/u.test(value)) return false;
+  const timestamp = Date.parse(`${value}T00:00:00.000Z`);
+  return Number.isFinite(timestamp) && new Date(timestamp).toISOString().slice(0, 10) === value;
+}
+
+function addResourceUsageDays(value: string, amount: number): string {
+  if (!validResourceUsageDay(value)) throw new GatewayError("The service returned an invalid Resource usage calendar day.");
+  const date = new Date(`${value}T00:00:00.000Z`);
+  date.setUTCDate(date.getUTCDate() + amount);
+  return date.toISOString().slice(0, 10);
+}
+
+function optionalResourceUsageTimestamp(
+  value: { readonly seconds: bigint; readonly nanos: number } | undefined
+): number | undefined {
+  if (value === undefined) return undefined;
+  return requiredResourceUsageTimestamp(value);
+}
+
+function requiredResourceUsageTimestamp(
+  value: { readonly seconds: bigint; readonly nanos: number } | undefined
+): number {
+  if (
+    value === undefined || value.seconds < 0n || value.nanos < 0 || value.nanos >= 1_000_000_000 ||
+    !Number.isSafeInteger(value.nanos)
+  ) throw new GatewayError("The service returned an invalid Resource usage timestamp.");
+  const seconds = Number(value.seconds);
+  const result = seconds * 1_000 + Math.floor(value.nanos / 1_000_000);
+  if (!Number.isSafeInteger(seconds) || !Number.isSafeInteger(result)) {
+    throw new GatewayError("The service returned an unsafe Resource usage timestamp.");
+  }
+  return result;
+}
+
 function mapSkillDescriptor(skill: ProtoSkillDescriptor): SkillDescriptorView {
   const revision = skill.entityVersion?.revision?.value;
   const scope = skill.scope === ResourceScope.GLOBAL
@@ -11409,6 +11819,7 @@ function mapSkillMarketEntry(entry: ProtoSkillMarketEntry): SkillMarketEntryView
     throw new GatewayError("The service returned an invalid or path-bearing Skill market entry.");
   }
   const installStatuses = entry.installStatuses.map(mapSkillMarketInstallStatus);
+  const access = mapSkillAccessPolicy(entry.access);
   if (new Set(installStatuses.map((status) => status.resourceId)).size !== installStatuses.length) {
     throw new GatewayError("The service returned duplicate Skill market install statuses.");
   }
@@ -11431,7 +11842,109 @@ function mapSkillMarketEntry(entry: ProtoSkillMarketEntry): SkillMarketEntryView
     ...(entry.sourceDisplayName === undefined ? {} : { sourceDisplayName: entry.sourceDisplayName }),
     sourceState,
     ...(entry.sourceError === undefined ? {} : { sourceError: entry.sourceError }),
-    installStatuses
+    installStatuses,
+    access,
+    canManage: entry.canManage
+  };
+}
+
+function mapSkillAccessPolicy(policy: ProtoSkillAccessPolicy | undefined): SkillAccessPolicyView {
+  const revision = policy?.revision?.value;
+  const publisher = policy?.publisher;
+  const visibility = policy?.visibility === ProtoSkillPublicationVisibility.PUBLIC
+    ? "public" as const
+    : policy?.visibility === ProtoSkillPublicationVisibility.DEPARTMENT
+      ? "department" as const
+      : policy?.visibility === ProtoSkillPublicationVisibility.PRIVATE
+        ? "private" as const
+        : undefined;
+  const ids = policy?.audienceScopeIds ?? [];
+  if (policy === undefined || publisher === undefined || revision === undefined || revision < 1n || visibility === undefined
+    || ids.some((id) => !validCollaborationId(id)) || new Set(ids).size !== ids.length) {
+    throw new GatewayError("The service returned an invalid Skill access policy.");
+  }
+  if (publisher.kind === ProtoSkillPublicationPublisher.PERSONAL
+    && publisher.actorId !== undefined && publisher.scopeId === undefined && publisher.sourceId === undefined
+    && visibility !== "department" && ids.length === 0 && validCollaborationId(publisher.actorId)) {
+    return { revision, publisher: { kind: "personal", actorId: publisher.actorId }, visibility, audienceScopeIds: [] };
+  }
+  if (publisher.kind === ProtoSkillPublicationPublisher.TEAM
+    && publisher.scopeId !== undefined && publisher.actorId === undefined && publisher.sourceId === undefined
+    && validCollaborationId(publisher.scopeId)
+    && (visibility === "public" && ids.length === 0 || visibility === "department" && ids.length > 0)) {
+    return { revision, publisher: { kind: "team", scopeId: publisher.scopeId }, visibility, audienceScopeIds: [...ids] };
+  }
+  if (publisher.kind === ProtoSkillPublicationPublisher.EXTERNAL
+    && publisher.sourceId !== undefined && publisher.actorId === undefined && publisher.scopeId === undefined
+    && validCollaborationId(publisher.sourceId) && visibility === "public" && ids.length === 0) {
+    return { revision, publisher: { kind: "external", sourceId: publisher.sourceId }, visibility, audienceScopeIds: [] };
+  }
+  throw new GatewayError("The service returned an inconsistent Skill access policy.");
+}
+
+function mapCollaborationDirectory(directory: ProtoCollaborationDirectory): CollaborationDirectoryView {
+  const revision = directory.revision?.value;
+  const unavailableReason = directory.unavailableReason === undefined || directory.unavailableReason === ""
+    ? undefined
+    : directory.unavailableReason;
+  if (revision === undefined || revision < 0n
+    || (unavailableReason !== undefined && (!validPublicationText(unavailableReason, 512) || containsPrivatePath(unavailableReason)))) {
+    throw new GatewayError("The service returned an invalid collaboration directory.");
+  }
+  if (!directory.available) {
+    if (revision !== 0n || directory.actor !== undefined || directory.scopes.length !== 0 || unavailableReason === undefined) {
+      throw new GatewayError("The service returned an inconsistent unavailable collaboration directory.");
+    }
+    return {
+      available: false,
+      revision,
+      scopes: [],
+      recoveredFromCorruption: directory.recoveredFromCorruption,
+      unavailableReason
+    };
+  }
+  const actor = directory.actor;
+  if (revision < 1n || actor === undefined || !validCollaborationId(actor.actorId)
+    || !validPublicationText(actor.displayName, 128) || privatePathLikeLabel(actor.displayName)) {
+    throw new GatewayError("The service returned an invalid collaboration identity.");
+  }
+  const scopes = directory.scopes.map((scope) => {
+    const scopeRevision = scope.revision?.value;
+    const kind = scope.kind === ProtoCollaborationScopeKind.TEAM
+      ? "team" as const
+      : scope.kind === ProtoCollaborationScopeKind.DEPARTMENT
+        ? "department" as const
+        : undefined;
+    const members = scope.members.map((member) => {
+      const role = member.role === ProtoCollaborationRole.VIEWER
+        ? "viewer" as const
+        : member.role === ProtoCollaborationRole.PUBLISHER
+          ? "publisher" as const
+          : member.role === ProtoCollaborationRole.ADMINISTRATOR
+            ? "administrator" as const
+            : undefined;
+      if (!validCollaborationId(member.actorId) || role === undefined) {
+        throw new GatewayError("The service returned an invalid collaboration membership.");
+      }
+      return { actorId: member.actorId, role };
+    });
+    if (!validCollaborationId(scope.scopeId) || scopeRevision === undefined || scopeRevision < 1n || kind === undefined
+      || !validPublicationText(scope.name, 128) || privatePathLikeLabel(scope.name)
+      || members.length === 0 || new Set(members.map((member) => member.actorId)).size !== members.length
+      || !members.some((member) => member.actorId === actor.actorId)) {
+      throw new GatewayError("The service returned an invalid collaboration scope.");
+    }
+    return { id: scope.scopeId, revision: scopeRevision, kind, name: scope.name, members };
+  });
+  if (new Set(scopes.map((scope) => scope.id)).size !== scopes.length || unavailableReason !== undefined) {
+    throw new GatewayError("The service returned an inconsistent collaboration directory.");
+  }
+  return {
+    available: true,
+    revision,
+    actor: { id: actor.actorId, displayName: actor.displayName },
+    scopes,
+    recoveredFromCorruption: directory.recoveredFromCorruption
   };
 }
 
@@ -11925,12 +12438,35 @@ function mapSkillPublicationState(value: ProtoSkillPublicationState): SkillPubli
 
 function mapSkillPublicationJob(job: ProtoSkillPublicationJob): SkillPublicationJobView {
   const revision = job.revision?.value;
+  const accessRevision = job.accessRevision?.value;
   const files = exactSafeUnsignedNumber(job.files);
   const uncompressedBytes = exactSafeUnsignedNumber(job.uncompressedBytes);
   const archiveBytes = exactSafeUnsignedNumber(job.archiveBytes);
+  const publisher = job.publisher === ProtoSkillPublicationPublisher.PERSONAL
+    ? "personal" as const
+    : job.publisher === ProtoSkillPublicationPublisher.TEAM
+      ? "team" as const
+      : undefined;
+  const visibility = job.visibility === ProtoSkillPublicationVisibility.PUBLIC
+    ? "public" as const
+    : job.visibility === ProtoSkillPublicationVisibility.DEPARTMENT
+      ? "department" as const
+      : job.visibility === ProtoSkillPublicationVisibility.PRIVATE
+        ? "private" as const
+        : undefined;
+  const accessShapeValid = publisher === "personal"
+    ? job.publisherScopeId === undefined && visibility !== "department" && job.audienceScopeIds.length === 0
+    : publisher === "team"
+      ? job.publisherScopeId !== undefined && validCollaborationId(job.publisherScopeId)
+        && (visibility === "public" && job.audienceScopeIds.length === 0
+          || visibility === "department" && job.audienceScopeIds.length > 0)
+      : false;
   if (!/^skill_publication_[a-f0-9]{32}$/u.test(job.jobId) || revision === undefined || revision < 1n
-    || job.authority === undefined || job.metadata === undefined || job.publisher !== ProtoSkillPublicationPublisher.PERSONAL
-    || job.visibility !== ProtoSkillPublicationVisibility.PUBLIC || files === undefined || uncompressedBytes === undefined
+    || accessRevision === undefined || accessRevision < 1n || job.authority === undefined || job.metadata === undefined
+    || publisher === undefined || visibility === undefined || !accessShapeValid
+    || job.audienceScopeIds.some((id) => !validCollaborationId(id))
+    || new Set(job.audienceScopeIds).size !== job.audienceScopeIds.length
+    || files === undefined || uncompressedBytes === undefined
     || archiveBytes === undefined || !Number.isSafeInteger(job.attempt) || job.attempt < 1
     || job.gates.length !== 4 || job.createdAt === undefined || job.updatedAt === undefined) {
     throw new GatewayError("The service returned an invalid Skill publication job.");
@@ -11965,8 +12501,11 @@ function mapSkillPublicationJob(job: ProtoSkillPublicationJob): SkillPublication
     state,
     authority: mapSkillPublicationAuthority(job.authority),
     metadata: mapSkillPublicationMetadata(job.metadata),
-    publisher: "personal",
-    visibility: "public",
+    publisher,
+    ...(job.publisherScopeId === undefined ? {} : { publisherScopeId: job.publisherScopeId }),
+    visibility,
+    audienceScopeIds: [...job.audienceScopeIds],
+    accessRevision,
     gates,
     verdict,
     files,
@@ -11989,13 +12528,23 @@ function mapSkillPublicationPreview(preview: ProtoSkillPublicationPreview): Skil
     : preview.mode === ProtoSkillPublicationMode.VERSION
       ? "version" as const
       : undefined;
+  const collaborationRevision = preview.collaborationRevision?.value;
+  const collaborationUnavailableReason = preview.collaborationUnavailableReason === ""
+    ? undefined
+    : preview.collaborationUnavailableReason;
+  const collaborationAvailable = preview.personalPublisherAvailable;
   if (preview.authority === undefined || preview.source === undefined || mode === undefined
     || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(preview.suggestedSlug)
     || !/^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u.test(preview.suggestedVersion)
-    || !preview.personalPublisherAvailable || preview.teamPublisherAvailable
-    || !preview.publicVisibilityAvailable || preview.departmentVisibilityAvailable || preview.privateVisibilityAvailable
-    || !validPublicationText(preview.collaborationUnavailableReason, 512)
-    || containsPrivatePath(preview.collaborationUnavailableReason)) {
+    || collaborationRevision === undefined || collaborationRevision < 0n
+    || preview.departmentVisibilityAvailable && !preview.teamPublisherAvailable
+    || collaborationAvailable !== preview.publicVisibilityAvailable
+    || collaborationAvailable !== preview.privateVisibilityAvailable
+    || (!collaborationAvailable && (collaborationRevision !== 0n || preview.teamPublisherAvailable
+      || preview.departmentVisibilityAvailable || collaborationUnavailableReason === undefined))
+    || (collaborationAvailable && collaborationRevision < 1n)
+    || (collaborationUnavailableReason !== undefined
+      && (!validPublicationText(collaborationUnavailableReason, 512) || containsPrivatePath(collaborationUnavailableReason)))) {
     throw new GatewayError("The service returned an invalid Skill publication preview.");
   }
   const authority = mapSkillPublicationAuthority(preview.authority);
@@ -12017,17 +12566,36 @@ function mapSkillPublicationPreview(preview: ProtoSkillPublicationPreview): Skil
     suggestedVersion: preview.suggestedVersion,
     ...(existingEntry === undefined ? {} : { existingEntry }),
     dirty: preview.dirty,
-    personalPublisherAvailable: true,
-    teamPublisherAvailable: false,
-    publicVisibilityAvailable: true,
-    departmentVisibilityAvailable: false,
-    privateVisibilityAvailable: false,
-    collaborationUnavailableReason: preview.collaborationUnavailableReason
+    collaborationRevision,
+    personalPublisherAvailable: preview.personalPublisherAvailable,
+    teamPublisherAvailable: preview.teamPublisherAvailable,
+    publicVisibilityAvailable: preview.publicVisibilityAvailable,
+    departmentVisibilityAvailable: preview.departmentVisibilityAvailable,
+    privateVisibilityAvailable: preview.privateVisibilityAvailable,
+    ...(collaborationUnavailableReason === undefined ? {} : { collaborationUnavailableReason })
   };
 }
 
 function privatePathLikeLabel(value: string): boolean {
   return /^[A-Za-z]:[\\/]/u.test(value) || /^\\\\/u.test(value) || value.startsWith("/");
+}
+
+function validCollaborationId(value: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(value);
+}
+
+function protoCollaborationScopeKind(value: CollaborationScopeKindView): ProtoCollaborationScopeKind {
+  return value === "team" ? ProtoCollaborationScopeKind.TEAM : ProtoCollaborationScopeKind.DEPARTMENT;
+}
+
+function protoSkillPublicationPublisher(value: SkillPublicationAccessSelectionView["publisher"]): ProtoSkillPublicationPublisher {
+  return value === "personal" ? ProtoSkillPublicationPublisher.PERSONAL : ProtoSkillPublicationPublisher.TEAM;
+}
+
+function protoSkillPublicationVisibility(value: SkillPublicationAccessSelectionView["visibility"]): ProtoSkillPublicationVisibility {
+  if (value === "public") return ProtoSkillPublicationVisibility.PUBLIC;
+  if (value === "department") return ProtoSkillPublicationVisibility.DEPARTMENT;
+  return ProtoSkillPublicationVisibility.PRIVATE;
 }
 
 function validPublicationText(value: string, maximum: number, allowEmpty = false): boolean {

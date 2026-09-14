@@ -5,6 +5,8 @@ import { create } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
 import {
   AddSkillMarketSourceMutationSchema,
+  CollaborationScopeKind,
+  CreateCollaborationScopeMutationSchema,
   DeleteSkillMutationSchema,
   EnableSkillMarketSyncMutationSchema,
   EnqueueSkillMarketSyncMutationSchema,
@@ -14,6 +16,7 @@ import {
   RefreshSkillMarketSourceMutationSchema,
   RemoveSkillMarketSourceMutationSchema,
   ResourceScope,
+  ResourceUsageSource,
   SkillFileKind,
   SkillMarketInstallAction,
   SkillMarketInstallStatusState,
@@ -42,9 +45,12 @@ import { submit } from "./operations.js";
 import {
   MARKET_NAME,
   MARKET_SLUG,
+  seedSkillResourceUsage,
   SkillMarketSystemFixture,
   writeSkillMarketSource
 } from "./skill-market-system-fixture.js";
+
+const PUBLISHED_SLUG = "production-writer-team";
 
 describe("production Skill market chain", () => {
   let fixture: SkillMarketSystemFixture | undefined;
@@ -64,7 +70,31 @@ describe("production Skill market chain", () => {
     rootDirectory = fixture.rootDirectory;
     await expect(fixture.anonymous.skill.listSkillMarketSources({ page: { pageSize: 10 } }))
       .rejects.toMatchObject({ code: Code.Unauthenticated });
+    await expect(fixture.anonymous.skill.getSkillResourceUsageReport({ resourceId: "resource-missing", timeZone: "UTC" }))
+      .rejects.toMatchObject({ code: Code.Unauthenticated });
     let paired = await fixture.pair("Skill market HTTP owner");
+    let collaboration = required((await paired.clients.skill.getCollaborationDirectory({})).directory, "collaboration directory");
+    expect(collaboration).toMatchObject({ available: true, revision: { value: 1n }, scopes: [] });
+    await succeed(paired, {
+      case: "createCollaborationScope",
+      value: create(CreateCollaborationScopeMutationSchema, {
+        expectedCatalogRevision: collaboration.revision,
+        kind: CollaborationScopeKind.TEAM,
+        name: "Platform"
+      })
+    }, "create the publication team");
+    collaboration = required((await paired.clients.skill.getCollaborationDirectory({})).directory, "team collaboration directory");
+    await succeed(paired, {
+      case: "createCollaborationScope",
+      value: create(CreateCollaborationScopeMutationSchema, {
+        expectedCatalogRevision: collaboration.revision,
+        kind: CollaborationScopeKind.DEPARTMENT,
+        name: "Engineering"
+      })
+    }, "create the publication department");
+    collaboration = required((await paired.clients.skill.getCollaborationDirectory({})).directory, "complete collaboration directory");
+    const publicationTeam = required(collaboration.scopes.find((scope) => scope.kind === CollaborationScopeKind.TEAM), "publication team");
+    const publicationDepartment = required(collaboration.scopes.find((scope) => scope.kind === CollaborationScopeKind.DEPARTMENT), "publication department");
     const sourceRoot = await writeSkillMarketSource(fixture, "1.0.0", "# Version one");
 
     await succeed(paired, {
@@ -114,6 +144,7 @@ describe("production Skill market chain", () => {
 
     const globalTarget = createTarget({ backendId: "pi", scope: ResourceScope.GLOBAL });
     const globalSkill = await install(paired, entry, globalTarget, SkillMarketInstallAction.INSTALL);
+    const initialUsageResource = required(fixture.application.piResources?.get(globalSkill.skillId), "initial usage Resource");
     const targets = await paired.clients.target.listTargets({ backendId: "pi", state: TargetState.ACTIVE, page: { pageSize: 100 } });
     const project = required(targets.targets[0], "trusted project Target");
     await install(paired, entry, createTarget({ backendId: "pi", scope: ResourceScope.PROJECT, targetId: project.targetId }), SkillMarketInstallAction.INSTALL);
@@ -182,6 +213,55 @@ describe("production Skill market chain", () => {
     expect(catalog.entries[0]?.installStatuses.find((status) => status.resourceId === globalSkill.skillId))
       .toMatchObject({ state: SkillMarketInstallStatusState.INSTALLED, installedVersion: "1.1.0" });
 
+    const currentUsageResource = required(fixture.application.piResources?.get(globalSkill.skillId), "updated usage Resource");
+    seedSkillResourceUsage(fixture, {
+      targetId: project.targetId,
+      previous: initialUsageResource,
+      current: currentUsageResource
+    });
+    const usageReport = required((await paired.clients.skill.getSkillResourceUsageReport({
+      resourceId: globalSkill.skillId,
+      timeZone: "Asia/Shanghai"
+    })).report, "Resource usage report");
+    expect(usageReport).toMatchObject({
+      resourceId: globalSkill.skillId,
+      timeZone: "Asia/Shanghai",
+      totals: {
+        samples: 10n,
+        strongActive: 10n,
+        commands: 5n,
+        toolCalls: 5n,
+        toolErrors: 1n
+      },
+      sources: expect.arrayContaining([
+        expect.objectContaining({ source: ResourceUsageSource.NATIVE_SKILL_COMMAND, metrics: expect.objectContaining({ samples: 5n, commands: 5n }) }),
+        expect.objectContaining({ source: ResourceUsageSource.RUNTIME_TOOL_CALL, metrics: expect.objectContaining({ samples: 5n, toolCalls: 5n, toolErrors: 1n }) })
+      ]),
+      agents: [expect.objectContaining({ backendId: "pi", metrics: expect.objectContaining({ samples: 10n }) })],
+      comparison: {
+        available: true,
+        minimumSamples: 5,
+        current: expect.objectContaining({
+          identity: expect.objectContaining({
+            resourceRevision: expect.objectContaining({ value: currentUsageResource.versionNumber }),
+            version: "1.1.0"
+          }),
+          metrics: expect.objectContaining({ samples: 5n })
+        }),
+        previous: expect.objectContaining({
+          identity: expect.objectContaining({
+            resourceRevision: expect.objectContaining({ value: initialUsageResource.versionNumber }),
+            version: "1.0.0"
+          }),
+          metrics: expect.objectContaining({ samples: 5n })
+        })
+      },
+      projection: { complete: true, streamCount: 2, pendingStreamCount: 0, failures: [] }
+    });
+    expect(usageReport.days).toHaveLength(30);
+    expect(privateJson(usageReport)).not.toMatch(/prompt|parameter|credential|private text/iu);
+    expect(privateJson(usageReport)).not.toContain(fixture.rootDirectory);
+
     const publicationResource = required(
       (await paired.clients.skill.listSkills({ page: { pageSize: 500 } })).skills.find((skill) => skill.skillId === globalSkill.skillId),
       "publication Skill Resource"
@@ -192,17 +272,17 @@ describe("production Skill market chain", () => {
       expectedResourceRevision: publicationResource.entityVersion?.revision,
       sourceId: required(publicationEntry.identity, "publication destination identity").sourceId,
       expectedSourceRevision: publicationEntry.identity?.sourceRevision,
-      slug: MARKET_SLUG
+      slug: PUBLISHED_SLUG
     })).preview, "publication preview");
     expect(publicationPreview).toMatchObject({
-      mode: SkillPublicationMode.VERSION,
-      suggestedSlug: MARKET_SLUG,
-      suggestedVersion: "1.1.1",
+      mode: SkillPublicationMode.FIRST,
+      suggestedSlug: PUBLISHED_SLUG,
       personalPublisherAvailable: true,
-      teamPublisherAvailable: false,
+      teamPublisherAvailable: true,
       publicVisibilityAvailable: true,
-      departmentVisibilityAvailable: false,
-      privateVisibilityAvailable: false
+      departmentVisibilityAvailable: true,
+      privateVisibilityAvailable: true,
+      collaborationRevision: collaboration.revision
     });
     const publicationAuthority = required(publicationPreview.authority, "publication authority");
     await succeed(paired, {
@@ -214,9 +294,9 @@ describe("production Skill market chain", () => {
         sourceId: publicationAuthority.sourceId,
         expectedSourceRevision: publicationAuthority.sourceRevision,
         expectedSourceContentRevision: publicationAuthority.sourceContentRevision,
-        expectedExistingEntryId: publicationAuthority.existingEntryId,
+        expectedCollaborationRevision: collaboration.revision,
         metadata: {
-          slug: MARKET_SLUG,
+          slug: PUBLISHED_SLUG,
           name: MARKET_NAME,
           author: "Joko E2E",
           description: "Production Skill market fixture",
@@ -224,8 +304,10 @@ describe("production Skill market chain", () => {
           version: "1.2.0",
           changelog: "Publish through the production HTTP chain."
         },
-        publisher: SkillPublicationPublisher.PERSONAL,
-        visibility: SkillPublicationVisibility.PUBLIC
+        publisher: SkillPublicationPublisher.TEAM,
+        publisherScopeId: publicationTeam.scopeId,
+        visibility: SkillPublicationVisibility.DEPARTMENT,
+        audienceScopeIds: [publicationDepartment.scopeId]
       })
     }, "publish the exact Skill version");
     const publications = await waitFor(
@@ -237,7 +319,11 @@ describe("production Skill market chain", () => {
     const published = required(publications.jobs.find((job) => job.state === SkillPublicationState.PUBLISHED), "published Skill job");
     expect(published).toMatchObject({
       verdict: SkillPublicationVerdict.PASSED,
-      metadata: { slug: MARKET_SLUG, version: "1.2.0", changelog: "Publish through the production HTTP chain." },
+      metadata: { slug: PUBLISHED_SLUG, version: "1.2.0", changelog: "Publish through the production HTTP chain." },
+      publisher: SkillPublicationPublisher.TEAM,
+      publisherScopeId: publicationTeam.scopeId,
+      visibility: SkillPublicationVisibility.DEPARTMENT,
+      audienceScopeIds: [publicationDepartment.scopeId],
       cancellable: false
     });
     expect(published.gates).toHaveLength(4);
@@ -252,7 +338,16 @@ describe("production Skill market chain", () => {
         contentRevision: publicationResult.entryContentRevision
       }
     })).entry, "exact published entry");
-    expect(exactPublishedEntry).toMatchObject({ slug: MARKET_SLUG, version: "1.2.0" });
+    expect(exactPublishedEntry).toMatchObject({
+      slug: PUBLISHED_SLUG,
+      version: "1.2.0",
+      canManage: true,
+      access: {
+        publisher: { kind: SkillPublicationPublisher.TEAM, scopeId: publicationTeam.scopeId },
+        visibility: SkillPublicationVisibility.DEPARTMENT,
+        audienceScopeIds: [publicationDepartment.scopeId]
+      }
+    });
     const publishedPreview = required((await paired.clients.skill.openSkillMarketPreview({ identity: exactPublishedEntry.identity })).preview, "published preview");
     const publishedManifest = required((await paired.clients.skill.readSkillMarketPreviewFile({
       previewId: publishedPreview.previewId,
@@ -279,13 +374,46 @@ describe("production Skill market chain", () => {
     fixture = await SkillMarketSystemFixture.start({ rootDirectory, keepRoot: true });
     paired = await fixture.pair("Skill market restart owner");
     const restartedCatalog = await paired.clients.skill.listSkillMarketCatalog({ sort: SkillMarketSort.UPDATED, page: { pageSize: 100 } });
-    expect(restartedCatalog.entries[0]?.installStatuses.find((status) => status.resourceId === globalSkill.skillId))
-      .toMatchObject({ state: SkillMarketInstallStatusState.UPDATE_AVAILABLE, installedVersion: "1.1.0" });
-    expect(restartedCatalog.entries[0]).toMatchObject({ version: "1.2.0" });
+    const restartedInstalledEntry = required(restartedCatalog.entries.find((value) => value.slug === MARKET_SLUG), "restarted installed market entry");
+    expect(restartedInstalledEntry.installStatuses.find((status) => status.resourceId === globalSkill.skillId))
+      .toMatchObject({ state: SkillMarketInstallStatusState.INSTALLED, installedVersion: "1.1.0" });
+    expect(restartedInstalledEntry).toMatchObject({ version: "1.1.0" });
+    const restartedPublishedEntry = required(restartedCatalog.entries.find((value) => value.slug === PUBLISHED_SLUG), "restarted published market entry");
+    expect(restartedPublishedEntry).toMatchObject({
+      version: "1.2.0",
+      canManage: true,
+      access: {
+        publisher: { kind: SkillPublicationPublisher.TEAM, scopeId: publicationTeam.scopeId },
+        visibility: SkillPublicationVisibility.DEPARTMENT,
+        audienceScopeIds: [publicationDepartment.scopeId]
+      }
+    });
     expect((await paired.clients.skill.listSkillPublicationJobs({ resourceId: globalSkill.skillId, page: { pageSize: 100 } })).jobs)
       .toMatchObject([{ state: SkillPublicationState.PUBLISHED, result: { version: "1.2.0" } }]);
     expect((await paired.clients.skill.listSkillMarketSyncPolicies({ page: { pageSize: 100 } })).policies)
       .toMatchObject([{ resourceId: globalSkill.skillId, enabled: true }]);
+    const restartedCollaboration = required((await paired.clients.skill.getCollaborationDirectory({})).directory, "restarted collaboration directory");
+    expect(restartedCollaboration).toMatchObject({
+      available: true,
+      revision: collaboration.revision,
+      scopes: expect.arrayContaining([
+        expect.objectContaining({ scopeId: publicationTeam.scopeId, kind: CollaborationScopeKind.TEAM, name: "Platform" }),
+        expect.objectContaining({ scopeId: publicationDepartment.scopeId, kind: CollaborationScopeKind.DEPARTMENT, name: "Engineering" })
+      ])
+    });
+    const restartedUsageReport = required((await paired.clients.skill.getSkillResourceUsageReport({
+      resourceId: globalSkill.skillId,
+      timeZone: "Asia/Shanghai"
+    })).report, "restarted Resource usage report");
+    expect(restartedUsageReport).toMatchObject({
+      totals: { samples: 10n, commands: 5n, toolCalls: 5n, toolErrors: 1n },
+      comparison: {
+        available: true,
+        current: expect.objectContaining({ identity: expect.objectContaining({ version: "1.1.0" }), metrics: expect.objectContaining({ samples: 5n }) }),
+        previous: expect.objectContaining({ identity: expect.objectContaining({ version: "1.0.0" }), metrics: expect.objectContaining({ samples: 5n }) })
+      },
+      projection: { complete: true, streamCount: 2, pendingStreamCount: 0, failures: [] }
+    });
 
     const restartedSource = required((await paired.clients.skill.listSkillMarketSources({ page: { pageSize: 100 } })).sources[0], "restarted source");
     await succeed(paired, {
@@ -298,6 +426,14 @@ describe("production Skill market chain", () => {
     expect((await paired.clients.skill.listSkillMarketCatalog({ sort: SkillMarketSort.UPDATED, page: { pageSize: 100 } })).entries).toEqual([]);
     const remainingSkills = await paired.clients.skill.listSkills({ page: { pageSize: 500 } });
     const remainingGlobal = required(remainingSkills.skills.find((skill) => skill.skillId === globalSkill.skillId), "source-independent installed Skill");
+    expect(required((await paired.clients.skill.getSkillResourceUsageReport({
+      resourceId: globalSkill.skillId,
+      timeZone: "Asia/Shanghai"
+    })).report, "source-independent Resource usage report")).toMatchObject({
+      totals: { samples: 10n },
+      comparison: { available: true },
+      projection: { complete: true }
+    });
     const session = required((await paired.clients.skill.openSkill({
       skillId: remainingGlobal.skillId,
       expectedResourceRevision: remainingGlobal.entityVersion?.revision
@@ -308,6 +444,14 @@ describe("production Skill market chain", () => {
     }, "uninstall the exact global Skill");
     const terminated = required((await paired.clients.skill.listSkillMarketSyncPolicies({ page: { pageSize: 100 } })).policies[0], "terminated sync policy");
     expect(terminated).toMatchObject({ resourceId: globalSkill.skillId, enabled: false, disabledReason: "resource_removed" });
+    expect(required((await paired.clients.skill.getSkillResourceUsageReport({
+      resourceId: globalSkill.skillId,
+      timeZone: "Asia/Shanghai"
+    })).report, "uninstalled Resource usage history")).toMatchObject({
+      totals: { samples: 10n },
+      comparison: { available: true },
+      projection: { complete: true }
+    });
     expect(privateJson({ restartedCatalog, terminated })).not.toContain(fixture.rootDirectory);
   }, 120_000);
 });

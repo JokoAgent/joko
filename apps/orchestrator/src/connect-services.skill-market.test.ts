@@ -17,6 +17,7 @@ import { SkillMarketManager } from "./skill-market-manager.js";
 import { SkillMarketSyncManager } from "./skill-market-sync-manager.js";
 import { SkillMutationCoordinator } from "./skill-mutation-coordinator.js";
 import { SkillPublicationManager } from "./skill-publication-manager.js";
+import { CollaborationManager } from "./collaboration-manager.js";
 import { mkdtemp } from "./test-paths.js";
 
 const cleanups: Array<() => Promise<void> | void> = [];
@@ -249,6 +250,29 @@ describe("Connect Skill market boundary", () => {
     const resource = await fixture.resources.install(approved.id);
     const sourceRoot = await writeMarket(fixture.root, "publication-market", []);
     const source = await fixture.market.add({ kind: "local", path: sourceRoot }, 0n);
+    await submit(fixture, "create-publication-team", {
+      case: "createCollaborationScope",
+      value: create(contract.CreateCollaborationScopeMutationSchema, {
+        expectedCatalogRevision: { value: 1n },
+        kind: contract.CollaborationScopeKind.TEAM,
+        name: "Platform"
+      })
+    });
+    let directory = await invoke<contract.GetCollaborationDirectoryResponse>(
+      fixture.services.skill.getCollaborationDirectory,
+      {}
+    );
+    const team = directory.directory!.scopes[0]!;
+    await submit(fixture, "create-publication-department", {
+      case: "createCollaborationScope",
+      value: create(contract.CreateCollaborationScopeMutationSchema, {
+        expectedCatalogRevision: directory.directory!.revision,
+        kind: contract.CollaborationScopeKind.DEPARTMENT,
+        name: "Engineering"
+      })
+    });
+    directory = await invoke<contract.GetCollaborationDirectoryResponse>(fixture.services.skill.getCollaborationDirectory, {});
+    const department = directory.directory!.scopes.find((scope) => scope.kind === contract.CollaborationScopeKind.DEPARTMENT)!;
 
     const preview = await invoke<contract.GetSkillPublicationPreviewResponse>(
       fixture.services.skill.getSkillPublicationPreview,
@@ -264,10 +288,11 @@ describe("Connect Skill market boundary", () => {
       suggestedSlug: "release-notes",
       suggestedVersion: "1.0.0",
       personalPublisherAvailable: true,
-      teamPublisherAvailable: false,
+      teamPublisherAvailable: true,
       publicVisibilityAvailable: true,
-      departmentVisibilityAvailable: false,
-      privateVisibilityAvailable: false
+      departmentVisibilityAvailable: true,
+      privateVisibilityAvailable: true,
+      collaborationRevision: { value: 3n }
     });
     expectPathPrivate(preview, fixture.root);
 
@@ -281,6 +306,7 @@ describe("Connect Skill market boundary", () => {
         sourceId: authority.sourceId,
         expectedSourceRevision: authority.sourceRevision,
         expectedSourceContentRevision: authority.sourceContentRevision,
+        expectedCollaborationRevision: preview.preview!.collaborationRevision,
         metadata: {
           slug: "release-notes",
           name: "Release notes",
@@ -288,8 +314,10 @@ describe("Connect Skill market boundary", () => {
           tags: ["writing"],
           version: "1.0.0"
         },
-        publisher: contract.SkillPublicationPublisher.PERSONAL,
-        visibility: contract.SkillPublicationVisibility.PUBLIC
+        publisher: contract.SkillPublicationPublisher.TEAM,
+        publisherScopeId: team.scopeId,
+        visibility: contract.SkillPublicationVisibility.DEPARTMENT,
+        audienceScopeIds: [department.scopeId]
       })
     });
     expect(submitted.operation?.state).toBe(contract.OperationState.SUCCEEDED);
@@ -305,6 +333,10 @@ describe("Connect Skill market boundary", () => {
       state: contract.SkillPublicationState.PUBLISHED,
       verdict: contract.SkillPublicationVerdict.PASSED,
       metadata: { slug: "release-notes", version: "1.0.0" },
+      publisher: contract.SkillPublicationPublisher.TEAM,
+      publisherScopeId: team.scopeId,
+      visibility: contract.SkillPublicationVisibility.DEPARTMENT,
+      audienceScopeIds: [department.scopeId],
       result: { version: "1.0.0" },
       cancellable: false
     });
@@ -317,6 +349,38 @@ describe("Connect Skill market boundary", () => {
     );
     expect(exact.job?.result?.entryContentRevision).toMatch(/^sha256:/u);
     expectPathPrivate(exact, fixture.root);
+
+    const publishedCatalog = await invoke<contract.ListSkillMarketCatalogResponse>(
+      fixture.services.skill.listSkillMarketCatalog,
+      { sort: contract.SkillMarketSort.UPDATED, page: { pageSize: 10 } }
+    );
+    const publishedEntry = publishedCatalog.entries[0]!;
+    expect(publishedEntry).toMatchObject({
+      canManage: true,
+      access: { publisher: { kind: contract.SkillPublicationPublisher.TEAM, scopeId: team.scopeId }, visibility: contract.SkillPublicationVisibility.DEPARTMENT }
+    });
+    const blockedDelete = await submit(fixture, "delete-referenced-department", {
+      case: "deleteCollaborationScope",
+      value: create(contract.DeleteCollaborationScopeMutationSchema, { scopeId: department.scopeId, expectedRevision: department.revision })
+    });
+    expect(blockedDelete.operation?.state).toBe(contract.OperationState.FAILED);
+    const updated = await submit(fixture, "make-public", {
+      case: "updateSkillMarketAccess",
+      value: create(contract.UpdateSkillMarketAccessMutationSchema, {
+        identity: publishedEntry.identity,
+        expectedAccessRevision: publishedEntry.access!.revision,
+        expectedCollaborationRevision: directory.directory!.revision,
+        publisher: contract.SkillPublicationPublisher.TEAM,
+        publisherScopeId: team.scopeId,
+        visibility: contract.SkillPublicationVisibility.PUBLIC
+      })
+    });
+    expect(updated.operation?.state).toBe(contract.OperationState.SUCCEEDED);
+    const removedDepartment = await submit(fixture, "delete-unreferenced-department", {
+      case: "deleteCollaborationScope",
+      value: create(contract.DeleteCollaborationScopeMutationSchema, { scopeId: department.scopeId, expectedRevision: department.revision })
+    });
+    expect(removedDepartment.operation?.state).toBe(contract.OperationState.SUCCEEDED);
   });
 });
 
@@ -346,11 +410,17 @@ async function createFixture() {
   });
   const resources = new PiResourceManager({ store, managedRoot: join(root, "managed") });
   await resources.initialize();
+  const collaboration = new CollaborationManager({ store, idFactory: (() => {
+    let index = 0;
+    return () => `connect-collaboration-${index++}`;
+  })() });
+  collaboration.initialize();
   const mutations = new SkillMutationCoordinator();
   const market = new SkillMarketManager({
     store,
     cacheRoot: join(root, "market-cache"),
     resources,
+    collaboration,
     mutationCoordinator: mutations
   });
   await market.initialize();
@@ -358,6 +428,7 @@ async function createFixture() {
     store,
     resources,
     market,
+    collaboration,
     rootDirectory: join(root, "skill-publications")
   });
   await publication.initialize();
@@ -388,6 +459,7 @@ async function createFixture() {
     skillMarket: market,
     skillMarketSync: sync,
     skillPublication: publication,
+    collaboration,
     refreshPiGeneration,
     browserActivity: [],
     close: async () => undefined
@@ -401,7 +473,7 @@ async function createFixture() {
     store.close();
     await rm(root, { recursive: true, force: true });
   });
-  return Object.assign(state, { root, store, resources, market, sync, publication, services, refreshPiGeneration });
+  return Object.assign(state, { root, store, resources, market, sync, publication, collaboration, services, refreshPiGeneration });
 }
 
 async function writeMarket(

@@ -8,6 +8,7 @@ import type { AppController } from "../controller.js";
 import { translate } from "../i18n.js";
 import type {
   BackendView,
+  ResourceUsageReportView,
   SkillDescriptorView,
   SkillDraftView,
   SkillMarketEntryView,
@@ -297,6 +298,33 @@ describe("SkillTools", () => {
     expect(diffLineClass("-deleted")).toBe("skill-diff-line--deleted");
     expect(diffLineClass("@@ -1 +1 @@")).toBe("skill-diff-line--hunk");
   });
+
+  it("loads exact Resource usage, retries independently, and exposes degraded evidence honestly", async () => {
+    const getSkillResourceUsageReport = vi.fn()
+      .mockRejectedValueOnce(new Error("Usage projection unavailable."))
+      .mockResolvedValueOnce(resourceUsageFixture(false));
+    const controller = skillController({ getSkillResourceUsageReport });
+    const container = await renderSkills(controller);
+    await settle();
+
+    expect(container.textContent).toContain("Usage projection unavailable.");
+    await act(async () => buttonWithText(container, "Retry").click());
+    await settle();
+
+    expect(container.textContent).toContain("Usage and impact");
+    expect(container.textContent).toContain("Usage is still being reconciled");
+    expect(container.textContent).toContain("Runtime-confirmed loads");
+    expect(container.textContent).toContain("Runtime tool calls");
+    expect(container.textContent).toContain("Pi Runtime");
+    expect(container.textContent).toContain("v2.0.0");
+    expect(container.textContent).toContain("v1.0.0");
+    expect(getSkillResourceUsageReport).toHaveBeenNthCalledWith(
+      2,
+      "resource-global",
+      expect.any(String),
+      expect.any(AbortSignal)
+    );
+  });
 });
 
 function skillController(overrides: Partial<AppController> = {}): AppController {
@@ -305,6 +333,7 @@ function skillController(overrides: Partial<AppController> = {}): AppController 
   ));
   return {
     listSkills: vi.fn(async () => ({ revision: 1n, skills: [globalSkill(), projectSkill()] })),
+    getSkillResourceUsageReport: vi.fn(async () => resourceUsageFixture(true)),
     listSkillRecoveries: vi.fn(async () => []),
     openSkill,
     closeSkill: vi.fn(async () => true),
@@ -322,6 +351,13 @@ function skillController(overrides: Partial<AppController> = {}): AppController 
     applySkillDraft: vi.fn(async () => ({ skill: globalSkill() })),
     setSkillEnabled: vi.fn(async (skill: SkillDescriptorView, enabled: boolean) => ({ skill: { ...skill, enabled } })),
     deleteSkill: vi.fn(async () => ({ recoveryId: recoveryFixture().id })),
+    getCollaborationDirectory: vi.fn(async () => ({
+      available: true,
+      revision: 1n,
+      actor: { id: "collaboration_actor_test", displayName: "Local owner" },
+      scopes: [],
+      recoveredFromCorruption: false
+    })),
     ...overrides
   } as unknown as AppController;
 }
@@ -373,6 +409,73 @@ function sessionFor(skill: SkillDescriptorView): SkillSessionView {
     bytes: 128,
     diff: diffFixture(),
     expiresAt: 1_800_000_000_000
+  };
+}
+
+function resourceUsageFixture(complete: boolean): ResourceUsageReportView {
+  const previous = {
+    identity: { resourceRevision: 1n, contentRevision: HASH_A, version: "1.0.0" },
+    metrics: resourceUsageMetrics(5, { passiveExposures: 5 }),
+    firstUsedAt: 1_699_999_800_000
+  };
+  const current = {
+    identity: { resourceRevision: 2n, contentRevision: HASH_B, version: "2.0.0" },
+    metrics: resourceUsageMetrics(5, { strongActive: 5, toolCalls: 5, toolErrors: 1 }),
+    firstUsedAt: 1_700_000_000_000
+  };
+  const totals = resourceUsageMetrics(10, {
+    strongActive: 5,
+    passiveExposures: 5,
+    toolCalls: 5,
+    toolErrors: 1
+  });
+  return {
+    resourceId: "resource-global",
+    timeZone: "UTC",
+    fromDay: "2026-08-16",
+    throughDay: "2026-09-14",
+    days: Array.from({ length: 30 }, (_value, index) => ({
+      localDay: new Date(Date.UTC(2026, 7, 16 + index)).toISOString().slice(0, 10),
+      metrics: index === 29 ? totals : resourceUsageMetrics(0)
+    })),
+    totals: { ...totals, latestUsedAt: 1_700_000_100_000 },
+    sources: [
+      { source: "runtimeConfirmedResourceLoad", metrics: previous.metrics },
+      { source: "runtimeToolCall", metrics: current.metrics }
+    ],
+    agents: [{ backendId: "pi", metrics: totals }],
+    versions: [current, previous],
+    comparison: { available: true, minimumSamples: 5, current, previous },
+    projection: complete
+      ? { complete: true, streamCount: 2, pendingStreamCount: 0, failures: [] }
+      : {
+          complete: false,
+          streamCount: 2,
+          pendingStreamCount: 1,
+          failures: [{
+            sessionId: "session-usage",
+            source: "runtimeToolCall",
+            attempts: 1,
+            retryAt: 1_700_000_200_000,
+            errorCode: "RESOURCE_USAGE_PROJECTION_FAILED"
+          }]
+        }
+  };
+}
+
+function resourceUsageMetrics(samples: number, overrides: Partial<ResourceUsageReportView["totals"]> = {}): ResourceUsageReportView["totals"] {
+  return {
+    samples,
+    strongActive: 0,
+    semiActive: 0,
+    passiveExposures: 0,
+    reads: 0,
+    rereads: 0,
+    toolCalls: 0,
+    toolErrors: 0,
+    commands: 0,
+    commandFailures: 0,
+    ...overrides
   };
 }
 
@@ -467,11 +570,12 @@ function publicationPreviewFixture(): SkillPublicationPreviewView {
     suggestedSlug: "review-helper",
     suggestedVersion: "1.0.0",
     dirty: false,
+    collaborationRevision: 1n,
     personalPublisherAvailable: true,
     teamPublisherAvailable: false,
     publicVisibilityAvailable: true,
     departmentVisibilityAvailable: false,
-    privateVisibilityAvailable: false,
+    privateVisibilityAvailable: true,
     collaborationUnavailableReason: "Team and restricted visibility require a configured collaboration identity owner."
   };
 }
@@ -491,6 +595,8 @@ function publicationJobFixture(): SkillPublicationJobView {
     },
     publisher: "personal",
     visibility: "public",
+    audienceScopeIds: [],
+    accessRevision: 1n,
     gates: (["metadata", "package", "sensitive_content", "source_authority"] as const).map((id) => ({ id, label: id, status: "passed", issues: [] })),
     verdict: "passed",
     files: 1,
@@ -535,7 +641,9 @@ function marketEntryFixture(): SkillMarketEntryView {
     sourceName: "local-publishing",
     sourceDisplayName: "Local publishing",
     sourceState: "ready",
-    installStatuses: []
+    installStatuses: [],
+    access: { revision: 1n, publisher: { kind: "personal", actorId: "collaboration_actor_test" }, visibility: "public", audienceScopeIds: [] },
+    canManage: true
   };
 }
 

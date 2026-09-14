@@ -37,6 +37,7 @@ import {
   type PortableNativeSession,
   type PromptInput,
   type ProviderModel,
+  type ResourceUsageEventPayload,
   type RuntimeCommand,
   type RuntimeProcessUsageSnapshot,
   type RuntimeResource,
@@ -496,6 +497,9 @@ interface PiNativeLifecycleParticipant {
   readonly context: AdapterContext;
   readonly disposition: "prompt" | "steer" | "follow_up";
   readonly message: string;
+  /** Present only when the live command catalog resolved one exact managed
+   * Skill command to one immutable runtime Resource. */
+  readonly skillCommandResource?: RuntimeResource;
 }
 
 interface PiNativeLifecycle {
@@ -1247,7 +1251,19 @@ export class PiBackendAdapter implements BackendAdapter {
       }
       durableNativeDispatchFingerprint = nativeDispatchFingerprintForUserMessage(redactedMessage);
     }
-    const participant: PiNativeLifecycleParticipant = { context, disposition: input.disposition, message };
+    const skillCommandResource = composerCommand.skillResourceId === undefined
+      ? undefined
+      : exactRuntimeUsageResource(
+          runtime.resources,
+          composerCommand.skillResourceId,
+          runtime.transport.generation
+        );
+    const participant: PiNativeLifecycleParticipant = {
+      context,
+      disposition: input.disposition,
+      message,
+      ...(skillCommandResource === undefined ? {} : { skillCommandResource })
+    };
     let lifecycle: PiNativeLifecycle;
     if (input.disposition === "prompt") {
       if (runtime.lifecycle !== undefined) {
@@ -4508,6 +4524,15 @@ export class PiBackendAdapter implements BackendAdapter {
                 ? lifecycle.participants.map((participant) => participant.context)
                 : undefined
             );
+            if (event.type === "tool_execution_end") {
+              await emitExactRuntimeToolUsage(runtime, eventContext, rawEvent);
+            }
+            if (event.type === "agent_settled" && lifecycle !== undefined) {
+              const outcome = runtime.translator.terminalOutcome();
+              for (const participant of lifecycle.participants) {
+                await emitExactSkillCommandUsage(participant, outcome);
+              }
+            }
           }
         })
         .catch(async (error) => {
@@ -5598,6 +5623,8 @@ export function escapePiComposerSlashCommand(
 interface ResolvedPiComposerSlashCommand {
   readonly message: string;
   readonly extensionCommand?: string;
+  /** Exact managed Skill owner from the live runtime command catalog. */
+  readonly skillResourceId?: string;
 }
 
 export function resolvePiComposerSlashCommand(
@@ -5610,19 +5637,24 @@ export function resolvePiComposerSlashCommand(
   if (!match?.[1]) return { message: text };
   const requested = match[1].replace(/^\//u, "");
   if (managedInternalNames.has(requested)) return { message: ` ${text}` };
-  const command = commands.find((candidate) =>
+  const matchingCommands = commands.filter((candidate) =>
     candidate.loaded &&
     candidate.name.replace(/^\//u, "") === requested
   );
+  const command = matchingCommands[0];
   if (command?.source === "extension") {
     return { message: text, extensionCommand: requested };
   }
-  const executable = commands.some((candidate) =>
-    candidate.loaded &&
-    candidate.source !== "extension" &&
-    candidate.name.replace(/^\//u, "") === requested
-  );
-  return { message: executable ? text : ` ${text}` };
+  const executable = matchingCommands.some((candidate) => candidate.source !== "extension");
+  const skillResourceId = matchingCommands.length === 1
+    && command?.source === "skill"
+    && validResourceUsageIdentity(command.resourceId, 4_096)
+      ? command.resourceId
+      : undefined;
+  return {
+    message: executable ? text : ` ${text}`,
+    ...(skillResourceId === undefined ? {} : { skillResourceId })
+  };
 }
 
 function responseData(response: unknown): unknown {
@@ -6879,6 +6911,152 @@ function managedResourceForRuntimePath(
   const matches = resources.filter((resource) => resource.runtimePath !== undefined
     && isAbsolute(resource.runtimePath) && samePathOrContained(resource.runtimePath, path));
   return matches.length === 1 ? { resourceId: matches[0]!.id } : {};
+}
+
+async function emitExactRuntimeToolUsage(
+  runtime: PiRuntime,
+  context: AdapterContext,
+  event: Readonly<Record<string, unknown>>
+): Promise<void> {
+  const operationId = context.operationId;
+  const toolName = event["toolName"];
+  const toolCallId = event["toolCallId"];
+  const isError = event["isError"];
+  const catalog = runtime.toolCatalog;
+  if (
+    !validResourceUsageIdentity(operationId, 4_096)
+    || !validResourceUsageIdentity(toolName, 128)
+    || !validResourceUsageIdentity(toolCallId, 512)
+    || typeof isError !== "boolean"
+    || catalog === undefined
+    || catalog.runtimeGeneration !== runtime.transport.generation
+  ) return;
+  const matches = catalog.tools.filter((tool) => tool.active && tool.name === toolName);
+  if (matches.length !== 1) return;
+  const mapped = managedResourceForRuntimePath(runtime.resources, matches[0]!.sourceInfo.path);
+  if (mapped.resourceId === undefined) return;
+  const resource = exactRuntimeUsageResource(
+    runtime.resources,
+    mapped.resourceId,
+    runtime.transport.generation
+  );
+  if (resource === undefined) return;
+  const occurrenceId = resourceUsageOccurrence(
+    "runtime-tool",
+    operationId,
+    toolCallId,
+    resource.id,
+    String(runtime.transport.generation)
+  );
+  await context.emit(resourceUsagePayload(
+    resource,
+    occurrenceId,
+    "runtime_tool_call",
+    isError ? "tool_failed" : "tool_succeeded"
+  ));
+}
+
+async function emitExactSkillCommandUsage(
+  participant: PiNativeLifecycleParticipant,
+  outcome: "completed" | "aborted" | "failed"
+): Promise<void> {
+  const resource = participant.skillCommandResource;
+  const operationId = participant.context.operationId;
+  if (resource === undefined || !validResourceUsageIdentity(operationId, 4_096)) return;
+  const occurrenceId = resourceUsageOccurrence(
+    "native-skill-command",
+    operationId,
+    resource.id,
+    String(participant.context.generation)
+  );
+  await participant.context.emit(resourceUsagePayload(
+    resource,
+    occurrenceId,
+    "native_skill_command",
+    outcome === "completed" ? "command_succeeded" : "command_failed"
+  ));
+}
+
+function exactRuntimeUsageResource(
+  resources: readonly RuntimeResource[],
+  resourceId: string,
+  runtimeGeneration: number
+): RuntimeResource | undefined {
+  const matches = resources.filter((resource) => resource.id === resourceId);
+  if (matches.length !== 1) return undefined;
+  const resource = matches[0]!;
+  const maximumRevision = 18_446_744_073_709_551_615n;
+  if (
+    !Number.isSafeInteger(runtimeGeneration)
+    || runtimeGeneration < 1
+    || !validResourceUsageIdentity(resource.id, 4_096)
+    || !validResourceUsageIdentity(resource.revision, 4_096)
+    || typeof resource.resourceVersion !== "bigint"
+    || resource.resourceVersion < 1n
+    || resource.resourceVersion > maximumRevision
+    || resource.version !== undefined && !validResourceUsageIdentity(resource.version, 256)
+  ) return undefined;
+  const market = resource.market;
+  if (market !== undefined && (
+    !validResourceUsageIdentity(market.sourceId, 512)
+    || typeof market.sourceRevision !== "bigint"
+    || market.sourceRevision < 1n
+    || market.sourceRevision > maximumRevision
+    || !validResourceUsageIdentity(market.entryId, 512)
+    || typeof market.entryRevision !== "bigint"
+    || market.entryRevision < 1n
+    || market.entryRevision > maximumRevision
+    || !validResourceUsageIdentity(market.entryContentRevision, 4_096)
+    || !validResourceUsageIdentity(market.installedContentRevision, 4_096)
+  )) return undefined;
+  return { ...resource, runtimeGeneration };
+}
+
+function resourceUsagePayload(
+  resource: RuntimeResource,
+  occurrenceId: string,
+  source: "native_skill_command" | "runtime_tool_call",
+  action: "command_succeeded" | "command_failed" | "tool_succeeded" | "tool_failed"
+): ResourceUsageEventPayload {
+  const market = resource.market;
+  return {
+    type: "resource_usage",
+    occurrenceId,
+    resourceId: resource.id,
+    entityRevision: resource.resourceVersion!.toString(10),
+    contentRevision: resource.revision!,
+    runtimeGeneration: resource.runtimeGeneration!,
+    ...(resource.version === undefined ? {} : { version: resource.version }),
+    ...(market === undefined
+      ? {}
+      : {
+          market: {
+            sourceId: market.sourceId,
+            sourceRevision: market.sourceRevision.toString(10),
+            entryId: market.entryId,
+            entryRevision: market.entryRevision.toString(10),
+            entryContentRevision: market.entryContentRevision,
+            installedContentRevision: market.installedContentRevision
+          }
+        }),
+    source,
+    activity: "strong_active",
+    action
+  };
+}
+
+function resourceUsageOccurrence(prefix: string, ...parts: readonly string[]): string {
+  const hash = createHash("sha256").update(prefix);
+  for (const part of parts) hash.update("\0").update(part);
+  return `pi-${prefix}-${hash.digest("hex")}`;
+}
+
+function validResourceUsageIdentity(value: unknown, maximum: number): value is string {
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= maximum
+    && value === value.trim()
+    && !/[\u0000-\u001f\u007f\u2028\u2029]/u.test(value);
 }
 
 function samePathOrContained(root: string, candidate: string): boolean {

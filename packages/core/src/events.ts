@@ -37,6 +37,57 @@ export interface EventEnvelope {
   readonly pi?: PiEventMetadata;
 }
 
+export type ResourceUsageSource =
+  | "structured_resource_mention"
+  | "native_skill_command"
+  | "runtime_confirmed_resource_load"
+  | "exact_file_read"
+  | "runtime_tool_call";
+
+export type ResourceUsageActivity = "strong_active" | "semi_active" | "passive";
+
+export type ResourceUsageAction =
+  | "exposure"
+  | "read"
+  | "reread"
+  | "tool_succeeded"
+  | "tool_failed"
+  | "command_succeeded"
+  | "command_failed";
+
+/** Path-free market identity captured in the immutable runtime Resource snapshot. */
+export interface ResourceUsageMarketProvenance {
+  readonly sourceId: string;
+  /** Canonical positive decimal revision. */
+  readonly sourceRevision: string;
+  readonly entryId: string;
+  /** Canonical positive decimal revision. */
+  readonly entryRevision: string;
+  readonly entryContentRevision: string;
+  readonly installedContentRevision: string;
+}
+
+/**
+ * Exact, content-free evidence for one Resource observation or invocation.
+ * Session, run, Backend, event identity, occurrence time, and runtime
+ * generation remain authoritative on the enclosing Event envelope.
+ */
+export interface ResourceUsageEventPayload {
+  readonly type: "resource_usage";
+  /** Stable within one source/run action so uncertain native retries fold once. */
+  readonly occurrenceId: string;
+  readonly resourceId: string;
+  /** Canonical positive decimal Resource entity revision. */
+  readonly entityRevision: string;
+  readonly contentRevision: string;
+  readonly runtimeGeneration: number;
+  readonly version?: string;
+  readonly market?: ResourceUsageMarketProvenance;
+  readonly source: ResourceUsageSource;
+  readonly activity: ResourceUsageActivity;
+  readonly action: ResourceUsageAction;
+}
+
 export type EventPayload =
   | { readonly type: "run_state"; readonly state: RunState; readonly error?: PublicError }
   /** Content-free signal that the durable Session projection changed. */
@@ -195,6 +246,7 @@ export type EventPayload =
     }
   | { readonly type: "extension_status"; readonly key: string; readonly text?: string }
   | { readonly type: "runtime_commands_changed"; readonly commands: readonly RuntimeCommand[] }
+  | ResourceUsageEventPayload
   | { readonly type: "review_run_changed"; readonly reviewRun: ReviewRunProjection }
   | {
       readonly type: "session_attention";

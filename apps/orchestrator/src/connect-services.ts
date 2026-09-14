@@ -36,6 +36,8 @@ import {
   StoreError,
   UsageReportQueryError,
   UsageReportCapacityError,
+  ResourceUsageReportQueryError,
+  ResourceUsageReportCapacityError,
   MESSAGE_SEARCH_EMBEDDING_MODEL_ID,
   operationBodyHash
 } from "@joko/store";
@@ -322,6 +324,13 @@ import {
   type SkillPublicationResult as NativeSkillPublicationResult
 } from "./skill-publication-manager.js";
 import {
+  CollaborationError,
+  type CollaborationDirectory as NativeCollaborationDirectory,
+  type CollaborationManager,
+  type CollaborationScope as NativeCollaborationScope,
+  type SkillAccessPolicy as NativeSkillAccessPolicy
+} from "./collaboration-manager.js";
+import {
   normalizePiPackageSource,
   piPackageSourceIdentity,
   type PiPackageSource
@@ -456,6 +465,7 @@ interface ConnectServiceDependencies {
   readonly skillMarket?: SkillMarketManager;
   readonly skillMarketSync?: SkillMarketSyncManager;
   readonly skillPublication?: SkillPublicationManager;
+  readonly collaboration?: CollaborationManager;
   readonly extensionCatalog?: ExtensionCatalogManager;
   readonly extensionLibraries?: ExtensionLibraryManager;
   readonly extensionMainViews?: ExtensionMainViewManager;
@@ -676,6 +686,8 @@ function toConnectError(error: unknown): ConnectError {
   if (error instanceof InvalidStateTransitionError) return new ConnectError(error.message, Code.FailedPrecondition);
   if (error instanceof UsageReportQueryError) return new ConnectError(error.message, Code.InvalidArgument);
   if (error instanceof UsageReportCapacityError) return new ConnectError(error.message, Code.ResourceExhausted);
+  if (error instanceof ResourceUsageReportQueryError) return new ConnectError(error.message, Code.InvalidArgument);
+  if (error instanceof ResourceUsageReportCapacityError) return new ConnectError(error.message, Code.ResourceExhausted);
   if (error instanceof RevisionConflictError || error instanceof StaleGenerationError) {
     return new ConnectError(error.message, Code.Aborted);
   }
@@ -999,6 +1011,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
     ...(application.skillMarket === undefined ? {} : { skillMarket: application.skillMarket }),
     ...(application.skillMarketSync === undefined ? {} : { skillMarketSync: application.skillMarketSync }),
     ...(application.skillPublication === undefined ? {} : { skillPublication: application.skillPublication }),
+    ...(application.collaboration === undefined ? {} : { collaboration: application.collaboration }),
     ...(application.extensionCatalog === undefined ? {} : { extensionCatalog: application.extensionCatalog }),
     ...(application.extensionLibraries === undefined ? {} : { extensionLibraries: application.extensionLibraries }),
     ...(application.extensionMainViews === undefined ? {} : { extensionMainViews: application.extensionMainViews }),
@@ -4268,6 +4281,35 @@ export function createConnectServices(application: OrchestratorApplication): Con
         job: mapSkillPublicationJob(manager.get(nonBlankRequest(request.jobId, "job_id"))),
         recoveredFromCorruption: manager.recoveredFromCorruption
       }));
+    },
+    getCollaborationDirectory: (_request, context) => {
+      authenticate(context);
+      const directory = dependencies.collaboration?.snapshot() ?? {
+        available: false,
+        revision: 0n,
+        scopes: [],
+        recoveredFromCorruption: false,
+        unavailableReason: "Collaboration identity is unavailable."
+      };
+      return { directory: mapCollaborationDirectory(directory) };
+    },
+    getSkillResourceUsageReport: (request, context) => {
+      authenticate(context);
+      const resourceId = nonBlankRequest(request.resourceId, "resource_id");
+      const current = dependencies.piResources?.list({ kind: "skill" })
+        .find((resource) => resource.id === resourceId);
+      const report = dependencies.store.getResourceUsageReport({
+        resourceId,
+        timeZone: nonBlankRequest(request.timeZone, "time_zone"),
+        ...(current === undefined ? {} : {
+          current: {
+            entityRevision: current.versionNumber.toString(10),
+            contentRevision: current.discoveredRevision,
+            ...(current.version === undefined ? {} : { version: current.version })
+          }
+        })
+      });
+      return { report: mapResourceUsageReport(report) };
     }
   } satisfies ServiceImpl<typeof contract.SkillService>;
 
@@ -9909,6 +9951,24 @@ function skillMarketConnectError(error: unknown): ConnectError {
   return new ConnectError(message, code);
 }
 
+function collaborationEffectSync<T>(effect: () => T): T {
+  try {
+    return effect();
+  } catch (error) {
+    if (error instanceof ConnectError) throw error;
+    const message = redactSecrets(error instanceof Error ? error.message : "Collaboration operation failed.").slice(0, 512);
+    if (error instanceof CollaborationError) {
+      const code = error.code === "COLLABORATION_SCOPE_NOT_FOUND" ? Code.NotFound
+        : error.code === "COLLABORATION_CHANGED" ? Code.Aborted
+          : error.code === "COLLABORATION_PERMISSION_DENIED" ? Code.PermissionDenied
+            : error.code === "COLLABORATION_UNAVAILABLE" || error.code === "COLLABORATION_SCOPE_IN_USE" ? Code.FailedPrecondition
+              : Code.InvalidArgument;
+      throw new ConnectError(message, code);
+    }
+    throw new ConnectError(message, Code.FailedPrecondition);
+  }
+}
+
 function nativeSkillMarketSource(value: contract.SkillMarketSourceLocation | undefined): NativeSkillMarketSourceInput {
   if (value === undefined || value.kind.case === undefined) throw invalidArgument("source is required");
   if (value.kind.case === "local") {
@@ -10028,7 +10088,25 @@ function mapSkillMarketEntry(value: NativeSkillMarketCatalogItem): contract.Skil
           ? contract.SkillMarketInstallStatusState.UPDATE_AVAILABLE
           : contract.SkillMarketInstallStatusState.CONFLICT,
       ...(status.installedVersion === undefined ? {} : { installedVersion: status.installedVersion })
-    }))
+    })),
+    access: mapSkillAccessPolicy(value.access),
+    canManage: value.canManage
+  });
+}
+
+function mapSkillAccessPolicy(value: NativeSkillAccessPolicy): contract.SkillAccessPolicy {
+  return create(contract.SkillAccessPolicySchema, {
+    revision: toProtoRevision(value.revision),
+    publisher: create(contract.SkillAccessPublisherSchema, {
+      kind: value.publisher.kind === "personal" ? contract.SkillPublicationPublisher.PERSONAL
+        : value.publisher.kind === "team" ? contract.SkillPublicationPublisher.TEAM
+          : contract.SkillPublicationPublisher.EXTERNAL,
+      ...(value.publisher.kind === "personal" ? { actorId: value.publisher.actorId }
+        : value.publisher.kind === "team" ? { scopeId: value.publisher.scopeId }
+          : { sourceId: value.publisher.sourceId })
+    }),
+    visibility: protoSkillPublicationVisibility(value.visibility),
+    audienceScopeIds: [...value.audienceScopeIds]
   });
 }
 
@@ -10236,14 +10314,29 @@ function nativeSkillPublicationMetadata(value: contract.SkillPublicationMetadata
   };
 }
 
-function nativeSkillPublicationPublisher(value: contract.SkillPublicationPublisher): "personal" {
-  if (value !== contract.SkillPublicationPublisher.PERSONAL) throw invalidArgument("publisher must be PERSONAL");
-  return "personal";
+function nativeSkillPublicationPublisher(value: contract.SkillPublicationPublisher): "personal" | "team" {
+  if (value === contract.SkillPublicationPublisher.PERSONAL) return "personal";
+  if (value === contract.SkillPublicationPublisher.TEAM) return "team";
+  throw invalidArgument("publisher must be PERSONAL or TEAM");
 }
 
-function nativeSkillPublicationVisibility(value: contract.SkillPublicationVisibility): "public" {
-  if (value !== contract.SkillPublicationVisibility.PUBLIC) throw invalidArgument("visibility must be PUBLIC");
-  return "public";
+function nativeCollaborationScopeKind(value: contract.CollaborationScopeKind): "team" | "department" {
+  if (value === contract.CollaborationScopeKind.TEAM) return "team";
+  if (value === contract.CollaborationScopeKind.DEPARTMENT) return "department";
+  throw invalidArgument("collaboration scope kind is required");
+}
+
+function nativeSkillPublicationVisibility(value: contract.SkillPublicationVisibility): "public" | "department" | "private" {
+  if (value === contract.SkillPublicationVisibility.PUBLIC) return "public";
+  if (value === contract.SkillPublicationVisibility.DEPARTMENT) return "department";
+  if (value === contract.SkillPublicationVisibility.PRIVATE) return "private";
+  throw invalidArgument("visibility is required");
+}
+
+function protoSkillPublicationVisibility(value: "public" | "department" | "private"): contract.SkillPublicationVisibility {
+  return value === "public" ? contract.SkillPublicationVisibility.PUBLIC
+    : value === "department" ? contract.SkillPublicationVisibility.DEPARTMENT
+      : contract.SkillPublicationVisibility.PRIVATE;
 }
 
 function mapSkillPublicationMetadata(value: NativeSkillPublicationMetadata): contract.SkillPublicationMetadata {
@@ -10308,8 +10401,8 @@ function mapSkillPublicationJob(value: NativeSkillPublicationJob): contract.Skil
     state: protoSkillPublicationState(value.state),
     authority: mapSkillPublicationAuthority(value.authority),
     metadata: mapSkillPublicationMetadata(value.metadata),
-    publisher: contract.SkillPublicationPublisher.PERSONAL,
-    visibility: contract.SkillPublicationVisibility.PUBLIC,
+    publisher: value.publisher === "team" ? contract.SkillPublicationPublisher.TEAM : contract.SkillPublicationPublisher.PERSONAL,
+    visibility: protoSkillPublicationVisibility(value.visibility),
     gates: value.gates.map(mapSkillPublicationGate),
     verdict: value.verdict === "pending" ? contract.SkillPublicationVerdict.PENDING
       : value.verdict === "passed" ? contract.SkillPublicationVerdict.PASSED
@@ -10324,7 +10417,145 @@ function mapSkillPublicationJob(value: NativeSkillPublicationJob): contract.Skil
     updatedAt: toProtoTimestamp(value.updatedAt),
     ...(value.completedAt === undefined ? {} : { completedAt: toProtoTimestamp(value.completedAt) }),
     ...(value.error === undefined ? {} : { error: value.error }),
-    cancellable: value.cancellable
+    cancellable: value.cancellable,
+    ...(value.publisherScopeId === undefined ? {} : { publisherScopeId: value.publisherScopeId }),
+    audienceScopeIds: [...value.audienceScopeIds],
+    accessRevision: toProtoRevision(value.accessRevision)
+  });
+}
+
+function mapCollaborationScope(value: NativeCollaborationScope): contract.CollaborationScope {
+  return create(contract.CollaborationScopeSchema, {
+    scopeId: value.id,
+    revision: toProtoRevision(value.revision),
+    kind: value.kind === "team" ? contract.CollaborationScopeKind.TEAM : contract.CollaborationScopeKind.DEPARTMENT,
+    name: value.name,
+    members: value.members.map((member) => create(contract.CollaborationMembershipSchema, {
+      actorId: member.actorId,
+      role: member.role === "viewer" ? contract.CollaborationRole.VIEWER
+        : member.role === "publisher" ? contract.CollaborationRole.PUBLISHER
+          : contract.CollaborationRole.ADMINISTRATOR
+    }))
+  });
+}
+
+function mapCollaborationDirectory(value: NativeCollaborationDirectory): contract.CollaborationDirectory {
+  return create(contract.CollaborationDirectorySchema, {
+    available: value.available,
+    revision: toProtoRevision(value.revision),
+    ...(value.actor === undefined ? {} : {
+      actor: create(contract.CollaborationActorSchema, {
+        actorId: value.actor.id,
+        displayName: value.actor.displayName
+      })
+    }),
+    scopes: value.scopes.map(mapCollaborationScope),
+    recoveredFromCorruption: value.recoveredFromCorruption,
+    ...(value.unavailableReason === undefined ? {} : { unavailableReason: value.unavailableReason })
+  });
+}
+
+function mapResourceUsageSource(
+  value: import("@joko/core").ResourceUsageSource
+): contract.ResourceUsageSource {
+  switch (value) {
+    case "structured_resource_mention": return contract.ResourceUsageSource.STRUCTURED_RESOURCE_MENTION;
+    case "native_skill_command": return contract.ResourceUsageSource.NATIVE_SKILL_COMMAND;
+    case "runtime_confirmed_resource_load": return contract.ResourceUsageSource.RUNTIME_CONFIRMED_RESOURCE_LOAD;
+    case "exact_file_read": return contract.ResourceUsageSource.EXACT_FILE_READ;
+    case "runtime_tool_call": return contract.ResourceUsageSource.RUNTIME_TOOL_CALL;
+  }
+}
+
+function mapResourceUsageMetrics(
+  value: import("@joko/store").ResourceUsageMetrics
+): contract.ResourceUsageMetrics {
+  return create(contract.ResourceUsageMetricsSchema, {
+    samples: BigInt(value.samples),
+    strongActive: BigInt(value.strongActive),
+    semiActive: BigInt(value.semiActive),
+    passiveExposures: BigInt(value.passiveExposures),
+    reads: BigInt(value.reads),
+    rereads: BigInt(value.rereads),
+    toolCalls: BigInt(value.toolCalls),
+    toolErrors: BigInt(value.toolErrors),
+    commands: BigInt(value.commands),
+    commandFailures: BigInt(value.commandFailures),
+    ...(value.latestUsedAt === undefined ? {} : { latestUsedAt: toProtoTimestamp(value.latestUsedAt) })
+  });
+}
+
+function mapResourceUsageVersion(
+  value: import("@joko/store").ResourceUsageVersionBreakdown
+): contract.ResourceUsageVersionBreakdown {
+  return create(contract.ResourceUsageVersionBreakdownSchema, {
+    identity: create(contract.ResourceUsageVersionIdentitySchema, {
+      resourceRevision: toProtoRevision(BigInt(value.identity.entityRevision)),
+      contentRevision: value.identity.contentRevision,
+      version: value.identity.version
+    }),
+    metrics: mapResourceUsageMetrics(value.metrics),
+    ...(value.firstUsedAt === undefined ? {} : { firstUsedAt: toProtoTimestamp(value.firstUsedAt) })
+  });
+}
+
+function mapResourceUsageComparisonReason(
+  value: NonNullable<import("@joko/store").ResourceUsageVersionComparison["unavailableReason"]>
+): contract.ResourceUsageComparisonUnavailableReason {
+  switch (value) {
+    case "no_current_version": return contract.ResourceUsageComparisonUnavailableReason.NO_CURRENT_VERSION;
+    case "no_previous_version": return contract.ResourceUsageComparisonUnavailableReason.NO_PREVIOUS_VERSION;
+    case "current_samples": return contract.ResourceUsageComparisonUnavailableReason.CURRENT_SAMPLES;
+    case "previous_samples": return contract.ResourceUsageComparisonUnavailableReason.PREVIOUS_SAMPLES;
+  }
+}
+
+function mapResourceUsageReport(
+  value: import("@joko/store").ResourceUsageReport
+): contract.ResourceUsageReport {
+  return create(contract.ResourceUsageReportSchema, {
+    resourceId: value.resourceId,
+    timeZone: value.timeZone,
+    fromDay: value.fromDay,
+    throughDay: value.throughDay,
+    days: value.days.map((day) => create(contract.ResourceUsageDaySchema, {
+      localDay: day.localDay,
+      metrics: mapResourceUsageMetrics(day.metrics)
+    })),
+    totals: mapResourceUsageMetrics(value.totals),
+    sources: value.sources.map((source) => create(contract.ResourceUsageSourceBreakdownSchema, {
+      source: mapResourceUsageSource(source.source),
+      metrics: mapResourceUsageMetrics(source.metrics)
+    })),
+    agents: value.agents.map((agent) => create(contract.ResourceUsageAgentBreakdownSchema, {
+      backendId: agent.backendId,
+      metrics: mapResourceUsageMetrics(agent.metrics)
+    })),
+    versions: value.versions.map(mapResourceUsageVersion),
+    comparison: create(contract.ResourceUsageVersionComparisonSchema, {
+      available: value.comparison.available,
+      minimumSamples: value.comparison.minimumSamples,
+      ...(value.comparison.unavailableReason === undefined ? {} : {
+        unavailableReason: mapResourceUsageComparisonReason(value.comparison.unavailableReason)
+      }),
+      ...(value.comparison.current === undefined ? {} : { current: mapResourceUsageVersion(value.comparison.current) }),
+      ...(value.comparison.previous === undefined ? {} : { previous: mapResourceUsageVersion(value.comparison.previous) })
+    }),
+    projection: create(contract.ResourceUsageProjectionStatusSchema, {
+      complete: value.projection.complete,
+      streamCount: value.projection.streamCount,
+      pendingStreamCount: value.projection.pendingStreamCount,
+      ...(value.projection.lastProjectedAt === undefined ? {} : {
+        lastProjectedAt: toProtoTimestamp(value.projection.lastProjectedAt)
+      }),
+      failures: value.projection.failures.map((failure) => create(contract.ResourceUsageProjectionFailureSchema, {
+        sessionId: failure.sessionId,
+        source: mapResourceUsageSource(failure.source),
+        attempts: failure.attempts,
+        retryAt: toProtoTimestamp(failure.retryAt),
+        errorCode: failure.errorCode
+      }))
+    })
   });
 }
 
@@ -10358,7 +10589,8 @@ function mapSkillPublicationPreview(value: NativeSkillPublicationPreview): contr
     publicVisibilityAvailable: value.publicVisibilityAvailable,
     departmentVisibilityAvailable: value.departmentVisibilityAvailable,
     privateVisibilityAvailable: value.privateVisibilityAvailable,
-    collaborationUnavailableReason: value.collaborationUnavailableReason
+    collaborationUnavailableReason: value.collaborationUnavailableReason ?? "",
+    collaborationRevision: toProtoRevision(value.collaborationRevision)
   });
 }
 
@@ -18704,6 +18936,7 @@ async function dispatchMutation(
       }
       if (payload.value.expectedResourceRevision === undefined) throw invalidArgument("expected_resource_revision is required");
       if (payload.value.expectedSourceRevision === undefined) throw invalidArgument("expected_source_revision is required");
+      if (payload.value.expectedCollaborationRevision === undefined) throw invalidArgument("expected_collaboration_revision is required");
       const jobId = skillPublicationJobId(operationId);
       return ackOperation(
         dependencies,
@@ -18735,9 +18968,17 @@ async function dispatchMutation(
             ...(payload.value.expectedExistingEntryId === undefined
               ? {}
               : { expectedExistingEntryId: payload.value.expectedExistingEntryId }),
+            expectedCollaborationRevision: fromProtoRevision(
+              payload.value.expectedCollaborationRevision,
+              "start_skill_publication.expected_collaboration_revision"
+            ),
             metadata: nativeSkillPublicationMetadata(payload.value.metadata),
             publisher: nativeSkillPublicationPublisher(payload.value.publisher),
-            visibility: nativeSkillPublicationVisibility(payload.value.visibility)
+            ...(payload.value.publisherScopeId === undefined ? {} : {
+              publisherScopeId: nonBlankRequest(payload.value.publisherScopeId, "publisher_scope_id")
+            }),
+            visibility: nativeSkillPublicationVisibility(payload.value.visibility),
+            audienceScopeIds: payload.value.audienceScopeIds.map((scopeId) => nonBlankRequest(scopeId, "audience_scope_ids"))
           });
         }),
         undefined,
@@ -18788,6 +19029,109 @@ async function dispatchMutation(
         async (completed) => {
           if (!completed.replayed && resumedJobId !== undefined) dependencies.skillPublication!.begin(resumedJobId);
         }
+      );
+    }
+    case "updateSkillMarketAccess": {
+      if (dependencies.skillMarket === undefined || dependencies.collaboration === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Skill visibility management is unavailable.");
+      }
+      if (payload.value.expectedAccessRevision === undefined) throw invalidArgument("expected_access_revision is required");
+      if (payload.value.expectedCollaborationRevision === undefined) throw invalidArgument("expected_collaboration_revision is required");
+      const identity = nativeSkillMarketIdentity(payload.value.identity);
+      const expectedAccessRevision = fromProtoRevision(payload.value.expectedAccessRevision, "update_skill_market_access.expected_access_revision");
+      const publisher = nativeSkillPublicationPublisher(payload.value.publisher);
+      const visibility = nativeSkillPublicationVisibility(payload.value.visibility);
+      return ackOperation(
+        dependencies,
+        operationId,
+        connection,
+        mutation,
+        payload.case,
+        async () => skillMarketEffect(async () => {
+          await dependencies.skillMarket!.updateEntryAccess({
+            identity,
+            expectedAccessRevision,
+            expectedCollaborationRevision: fromProtoRevision(
+              payload.value.expectedCollaborationRevision!,
+              "update_skill_market_access.expected_collaboration_revision"
+            ),
+            selection: {
+              publisher,
+              ...(payload.value.publisherScopeId === undefined ? {} : {
+                publisherScopeId: nonBlankRequest(payload.value.publisherScopeId, "publisher_scope_id")
+              }),
+              visibility,
+              audienceScopeIds: payload.value.audienceScopeIds.map((scopeId) => nonBlankRequest(scopeId, "audience_scope_ids"))
+            }
+          });
+        })
+      );
+    }
+    case "createCollaborationScope": {
+      if (dependencies.collaboration === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Collaboration scope management is unavailable.");
+      }
+      if (payload.value.expectedCatalogRevision === undefined) throw invalidArgument("expected_catalog_revision is required");
+      return ackOperation(
+        dependencies,
+        operationId,
+        connection,
+        mutation,
+        payload.case,
+        async () => {
+          collaborationEffectSync(() => dependencies.collaboration!.createScope({
+            expectedCatalogRevision: fromProtoRevision(payload.value.expectedCatalogRevision!, "create_collaboration_scope.expected_catalog_revision"),
+            kind: nativeCollaborationScopeKind(payload.value.kind),
+            name: nonBlankRequest(payload.value.name, "name")
+          }));
+        }
+      );
+    }
+    case "updateCollaborationScope": {
+      if (dependencies.collaboration === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Collaboration scope management is unavailable.");
+      }
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      return ackOperation(
+        dependencies,
+        operationId,
+        connection,
+        mutation,
+        payload.case,
+        async () => {
+          collaborationEffectSync(() => dependencies.collaboration!.updateScope({
+            scopeId: nonBlankRequest(payload.value.scopeId, "scope_id"),
+            expectedRevision: fromProtoRevision(payload.value.expectedRevision!, "update_collaboration_scope.expected_revision"),
+            name: nonBlankRequest(payload.value.name, "name")
+          }));
+        }
+      );
+    }
+    case "deleteCollaborationScope": {
+      if (dependencies.collaboration === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Collaboration scope management is unavailable.");
+      }
+      if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
+      return ackOperation(
+        dependencies,
+        operationId,
+        connection,
+        mutation,
+        payload.case,
+        async () => collaborationEffectSync(() => {
+          const scopeId = nonBlankRequest(payload.value.scopeId, "scope_id");
+          if (dependencies.skillMarket?.usesCollaborationScope(scopeId) === true
+            || dependencies.skillPublication?.usesCollaborationScope(scopeId) === true) {
+            throw new CollaborationError(
+              "COLLABORATION_SCOPE_IN_USE",
+              "The collaboration scope is referenced by a Skill publication or access policy."
+            );
+          }
+          dependencies.collaboration!.removeScope({
+            scopeId,
+            expectedRevision: fromProtoRevision(payload.value.expectedRevision!, "delete_collaboration_scope.expected_revision")
+          });
+        })
       );
     }
     case "addExtensionSource": {

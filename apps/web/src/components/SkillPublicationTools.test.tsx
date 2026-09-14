@@ -75,7 +75,7 @@ describe("SkillPublicationDialog", () => {
       category: "Writing",
       tags: ["review"],
       changelog: "Describe the exact version delta."
-    }));
+    }), { publisher: "personal", visibility: "public", audienceScopeIds: [] });
     expect(dialog.textContent).toContain("Scanning");
     expect(dialog.textContent).toContain("Waiting");
 
@@ -124,6 +124,61 @@ describe("SkillPublicationDialog", () => {
     expect(retrySkillPublication).toHaveBeenCalledTimes(1);
     expect(dialog.textContent).toContain("Pending");
   });
+
+  it("publishes through an exact team and department selection", async () => {
+    const preview: SkillPublicationPreviewView = {
+      ...publicationPreview("first"),
+      collaborationRevision: 4n,
+      teamPublisherAvailable: true,
+      departmentVisibilityAvailable: true,
+      collaborationUnavailableReason: undefined
+    };
+    const startSkillPublication = vi.fn(async () => undefined);
+    const controller = publicationController({
+      getSkillPublicationPreview: vi.fn(async () => preview),
+      getCollaborationDirectory: vi.fn(async () => ({
+        available: true,
+        revision: 4n,
+        actor: { id: "collaboration_actor_test", displayName: "Local owner" },
+        scopes: [{
+          id: "collaboration_scope_team",
+          revision: 1n,
+          kind: "team" as const,
+          name: "Platform",
+          members: [{ actorId: "collaboration_actor_test", role: "administrator" as const }]
+        }, {
+          id: "collaboration_scope_department",
+          revision: 1n,
+          kind: "department" as const,
+          name: "Engineering",
+          members: [{ actorId: "collaboration_actor_test", role: "administrator" as const }]
+        }],
+        recoveredFromCorruption: false
+      })),
+      startSkillPublication
+    });
+    const dialog = await renderPublication(controller, vi.fn(), vi.fn());
+    await settle();
+    await act(async () => buttonWithText(dialog, "Review publication target").click());
+    await settle();
+    const radio = (label: string): HTMLInputElement => required([...dialog.querySelectorAll<HTMLLabelElement>("label")]
+      .find((candidate) => candidate.textContent?.trim() === label)?.querySelector<HTMLInputElement>('input[type="radio"]'));
+    await act(async () => radio("Team").click());
+    await act(async () => radio("Department").click());
+    expect(required(dialog.querySelector<HTMLInputElement>('input[type="checkbox"]')).checked).toBe(true);
+    await act(async () => buttonWithText(dialog, "Publish Skill").click());
+    await settle();
+    expect(startSkillPublication).toHaveBeenCalledWith(
+      preview,
+      expect.objectContaining({ slug: "review-helper", version: "1.0.0" }),
+      {
+        publisher: "team",
+        publisherScopeId: "collaboration_scope_team",
+        visibility: "department",
+        audienceScopeIds: ["collaboration_scope_department"]
+      }
+    );
+  });
 });
 
 function publicationController(overrides: Partial<AppController> = {}): AppController {
@@ -131,12 +186,23 @@ function publicationController(overrides: Partial<AppController> = {}): AppContr
     listSkillMarketSources: vi.fn(async () => ({ revision: 4n, sources: [source()], recoveredFromCorruption: false })),
     listSkillPublicationJobs: vi.fn(async () => ({ items: [], recoveredFromCorruption: false })),
     getSkillPublicationPreview: vi.fn(async () => publicationPreview("first")),
+    getCollaborationDirectory: vi.fn(async () => collaborationDirectory()),
     getSkillPublicationJob: vi.fn(async () => publicationJob("published", metadata("1.0.0"))),
     startSkillPublication: vi.fn(async () => undefined),
     cancelSkillPublication: vi.fn(async () => undefined),
     retrySkillPublication: vi.fn(async () => undefined),
     ...overrides
   } as unknown as AppController;
+}
+
+function collaborationDirectory() {
+  return {
+    available: true as const,
+    revision: 1n,
+    actor: { id: "collaboration_actor_test", displayName: "Local owner" },
+    scopes: [],
+    recoveredFromCorruption: false
+  };
 }
 
 function publicationPreview(mode: "first" | "version"): SkillPublicationPreviewView {
@@ -160,11 +226,12 @@ function publicationPreview(mode: "first" | "version"): SkillPublicationPreviewV
     suggestedVersion: mode === "version" ? "1.4.1" : "1.0.0",
     ...(existingEntry === undefined ? {} : { existingEntry }),
     dirty: false,
+    collaborationRevision: 1n,
     personalPublisherAvailable: true,
     teamPublisherAvailable: false,
     publicVisibilityAvailable: true,
     departmentVisibilityAvailable: false,
-    privateVisibilityAvailable: false,
+    privateVisibilityAvailable: true,
     collaborationUnavailableReason: "Team and restricted visibility require a configured collaboration identity owner."
   };
 }
@@ -210,7 +277,9 @@ function entry(): SkillMarketEntryView {
     sourceName: "local-publishing",
     sourceDisplayName: "Local publishing",
     sourceState: "ready",
-    installStatuses: []
+    installStatuses: [],
+    access: { revision: 1n, publisher: { kind: "personal", actorId: "collaboration_actor_test" }, visibility: "public", audienceScopeIds: [] },
+    canManage: true
   };
 }
 
@@ -241,6 +310,8 @@ function publicationJob(
     metadata: value,
     publisher: "personal",
     visibility: "public",
+    audienceScopeIds: [],
+    accessRevision: 1n,
     gates: (["metadata", "package", "sensitive_content", "source_authority"] as const).map((gateId) => ({
       id: gateId,
       label: gateId,

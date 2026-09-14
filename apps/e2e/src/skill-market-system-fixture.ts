@@ -1,7 +1,10 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
+
+import type { ResourceUsageEventPayload } from "@joko/core";
+import type { PiResourceDescriptor } from "@joko/orchestrator";
 
 import { ExtensionLibrarySystemFixture as SkillMarketSystemFixture } from "./extension-library-system-fixture.js";
 
@@ -9,6 +12,67 @@ export { SkillMarketSystemFixture };
 
 export const MARKET_SLUG = "production-writer";
 export const MARKET_NAME = "Production Writer";
+
+export function seedSkillResourceUsage(
+  fixture: SkillMarketSystemFixture,
+  input: {
+    readonly targetId: string;
+    readonly previous: PiResourceDescriptor;
+    readonly current: PiResourceDescriptor;
+  }
+): void {
+  if (input.previous.backendId !== input.current.backendId) {
+    throw new Error("Resource usage fixture versions must belong to the same Backend.");
+  }
+  const startedAt = Date.now() - 20_000;
+  const sessionId = `skill-usage-e2e-${randomUUID()}`;
+  const session = fixture.application.store.createSession({
+    id: sessionId,
+    backendId: input.current.backendId,
+    targetId: input.targetId,
+    title: "Resource usage evidence",
+    binding: { opaqueRef: `native/${sessionId}.jsonl`, generation: 1 },
+    pinned: false,
+    archived: false,
+    permissionMode: "ask",
+    planMode: false,
+    fastMode: false,
+    createdAt: startedAt - 2,
+    updatedAt: startedAt - 2
+  }).descriptor;
+  const runId = randomUUID();
+  fixture.application.store.createRun({
+    id: runId,
+    sessionId,
+    source: "user",
+    state: "running",
+    createdAt: startedAt - 1
+  });
+  for (let index = 0; index < 5; index += 1) {
+    appendResourceUsageEvidence(fixture, {
+      sessionId,
+      runId,
+      targetId: session.targetId,
+      generation: session.binding.generation,
+      resource: input.previous,
+      emittedAt: startedAt + index,
+      occurrenceId: `previous-command-${index}`,
+      source: "native_skill_command",
+      action: "command_succeeded"
+    });
+    appendResourceUsageEvidence(fixture, {
+      sessionId,
+      runId,
+      targetId: session.targetId,
+      generation: session.binding.generation,
+      resource: input.current,
+      emittedAt: startedAt + 10 + index,
+      occurrenceId: `current-tool-${index}`,
+      source: "runtime_tool_call",
+      action: index === 4 ? "tool_failed" : "tool_succeeded"
+    });
+  }
+}
 
 export async function writeSkillMarketSource(
   fixture: SkillMarketSystemFixture,
@@ -85,4 +149,54 @@ function makeTgz(entries: readonly { readonly path: string; readonly content: Bu
 function writeOctal(target: Buffer, value: number, offset: number, length: number): void {
   target.write(value.toString(8).padStart(length - 1, "0"), offset, length - 1, "ascii");
   target[offset + length - 1] = 0;
+}
+
+function appendResourceUsageEvidence(
+  fixture: SkillMarketSystemFixture,
+  input: {
+    readonly sessionId: string;
+    readonly runId: string;
+    readonly targetId: string;
+    readonly generation: number;
+    readonly resource: PiResourceDescriptor;
+    readonly emittedAt: number;
+    readonly occurrenceId: string;
+    readonly source: ResourceUsageEventPayload["source"];
+    readonly action: ResourceUsageEventPayload["action"];
+  }
+): void {
+  const market = input.resource.skillMarket;
+  const payload: ResourceUsageEventPayload = {
+    type: "resource_usage",
+    occurrenceId: input.occurrenceId,
+    resourceId: input.resource.id,
+    entityRevision: input.resource.versionNumber.toString(10),
+    contentRevision: input.resource.discoveredRevision,
+    runtimeGeneration: input.generation,
+    ...(input.resource.version === undefined ? {} : { version: input.resource.version }),
+    ...(market === undefined ? {} : {
+      market: {
+        sourceId: market.sourceId,
+        sourceRevision: market.sourceRevision.toString(10),
+        entryId: market.entryId,
+        entryRevision: market.entryRevision.toString(10),
+        entryContentRevision: market.entryContentRevision,
+        installedContentRevision: market.installedContentRevision
+      }
+    }),
+    source: input.source,
+    activity: "strong_active",
+    action: input.action
+  };
+  fixture.application.store.appendEvent({
+    id: `resource-usage-e2e-${input.occurrenceId}-${input.resource.versionNumber.toString(10)}`,
+    backendId: input.resource.backendId,
+    targetId: input.targetId,
+    sessionId: input.sessionId,
+    runId: input.runId,
+    generation: input.generation,
+    emittedAt: input.emittedAt,
+    traceId: `resource-usage:${input.occurrenceId}`,
+    payload
+  });
 }

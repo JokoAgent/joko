@@ -13,6 +13,7 @@ export * from "./gen/joko/v1/portable_session_pb.js";
 export * from "./gen/joko/v1/remote_host_pb.js";
 export * from "./gen/joko/v1/runtime_pb.js";
 export * from "./gen/joko/v1/review_pb.js";
+export * from "./gen/joko/v1/resource_usage_pb.js";
 export * from "./gen/joko/v1/service_pb.js";
 export * from "./gen/joko/v1/settings_pb.js";
 export * from "./gen/joko/v1/skill_pb.js";

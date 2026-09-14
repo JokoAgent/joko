@@ -2950,6 +2950,29 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
       return protoPayload("runtimeCommandsChanged", message<RuntimeCommandsChangedEvent>("joko.v1.RuntimeCommandsChangedEvent", {
         commands: payload.commands.map((command) => toProtoRuntimeCommand(command, event.sessionId))
       }));
+    case "resource_usage":
+      return protoPayload("resourceUsageRecorded", message<contract.ResourceUsageRecordedEvent>("joko.v1.ResourceUsageRecordedEvent", {
+        occurrenceId: payload.occurrenceId,
+        resourceId: payload.resourceId,
+        resourceRevision: toProtoRevision(BigInt(payload.entityRevision)),
+        contentRevision: payload.contentRevision,
+        runtimeGeneration: BigInt(payload.runtimeGeneration),
+        version: payload.version,
+        market: payload.market === undefined ? undefined : message<contract.ResourceUsageMarketProvenance>(
+          "joko.v1.ResourceUsageMarketProvenance",
+          {
+            sourceId: payload.market.sourceId,
+            sourceRevision: toProtoRevision(BigInt(payload.market.sourceRevision)),
+            entryId: payload.market.entryId,
+            entryRevision: toProtoRevision(BigInt(payload.market.entryRevision)),
+            entryContentRevision: payload.market.entryContentRevision,
+            installedContentRevision: payload.market.installedContentRevision
+          }
+        ),
+        source: toProtoResourceUsageSource(payload.source),
+        activity: toProtoResourceUsageActivity(payload.activity),
+        action: toProtoResourceUsageAction(payload.action)
+      }));
     case "review_run_changed":
       return protoPayload("reviewRunChanged", message<ReviewRunChangedEvent>("joko.v1.ReviewRunChangedEvent", {
         reviewRun: message<ProtoReviewRun>("joko.v1.ReviewRun", {
@@ -3451,6 +3474,60 @@ function fromProtoEventPayload(
           return fromProtoRuntimeCommand(command);
         })
       };
+    case "resourceUsageRecorded": {
+      const usage = payload.kind.value;
+      const resourceRevision = fromProtoRevision(
+        usage.resourceRevision,
+        "event.payload.resource_usage_recorded.resource_revision"
+      );
+      if (resourceRevision < 1n) {
+        throw new ProtoMappingError(
+          "out_of_range",
+          "event.payload.resource_usage_recorded.resource_revision",
+          "Resource usage revision must be positive."
+        );
+      }
+      const market = usage.market;
+      return {
+        type: "resource_usage",
+        occurrenceId: requireText(usage.occurrenceId, "event.payload.resource_usage_recorded.occurrence_id"),
+        resourceId: requireText(usage.resourceId, "event.payload.resource_usage_recorded.resource_id"),
+        entityRevision: resourceRevision.toString(10),
+        contentRevision: requireText(usage.contentRevision, "event.payload.resource_usage_recorded.content_revision"),
+        runtimeGeneration: positiveSafeNumber(
+          usage.runtimeGeneration,
+          "event.payload.resource_usage_recorded.runtime_generation"
+        ),
+        ...(usage.version === undefined ? {} : {
+          version: requireText(usage.version, "event.payload.resource_usage_recorded.version")
+        }),
+        ...(market === undefined ? {} : {
+          market: {
+            sourceId: requireText(market.sourceId, "event.payload.resource_usage_recorded.market.source_id"),
+            sourceRevision: positiveProtoRevision(
+              market.sourceRevision,
+              "event.payload.resource_usage_recorded.market.source_revision"
+            ),
+            entryId: requireText(market.entryId, "event.payload.resource_usage_recorded.market.entry_id"),
+            entryRevision: positiveProtoRevision(
+              market.entryRevision,
+              "event.payload.resource_usage_recorded.market.entry_revision"
+            ),
+            entryContentRevision: requireText(
+              market.entryContentRevision,
+              "event.payload.resource_usage_recorded.market.entry_content_revision"
+            ),
+            installedContentRevision: requireText(
+              market.installedContentRevision,
+              "event.payload.resource_usage_recorded.market.installed_content_revision"
+            )
+          }
+        }),
+        source: fromProtoResourceUsageSource(usage.source),
+        activity: fromProtoResourceUsageActivity(usage.activity),
+        action: fromProtoResourceUsageAction(usage.action)
+      };
+    }
     case "reviewRunChanged": {
       const review = payload.kind.value.reviewRun;
       if (review === undefined) throw missingPayload("review_run_changed.review_run");
@@ -5292,6 +5369,96 @@ function questionAnswer(value: unknown, fieldId: string): QuestionAnswer["value"
     };
   }
   throw invalidQuestionDecisionAnswer(fieldId);
+}
+
+function toProtoResourceUsageSource(
+  value: Extract<EventPayload, { readonly type: "resource_usage" }>["source"]
+): contract.ResourceUsageSource {
+  switch (value) {
+    case "structured_resource_mention": return contract.ResourceUsageSource.STRUCTURED_RESOURCE_MENTION;
+    case "native_skill_command": return contract.ResourceUsageSource.NATIVE_SKILL_COMMAND;
+    case "runtime_confirmed_resource_load": return contract.ResourceUsageSource.RUNTIME_CONFIRMED_RESOURCE_LOAD;
+    case "exact_file_read": return contract.ResourceUsageSource.EXACT_FILE_READ;
+    case "runtime_tool_call": return contract.ResourceUsageSource.RUNTIME_TOOL_CALL;
+  }
+}
+
+function fromProtoResourceUsageSource(
+  value: contract.ResourceUsageSource
+): Extract<EventPayload, { readonly type: "resource_usage" }>["source"] {
+  switch (value) {
+    case contract.ResourceUsageSource.STRUCTURED_RESOURCE_MENTION: return "structured_resource_mention";
+    case contract.ResourceUsageSource.NATIVE_SKILL_COMMAND: return "native_skill_command";
+    case contract.ResourceUsageSource.RUNTIME_CONFIRMED_RESOURCE_LOAD: return "runtime_confirmed_resource_load";
+    case contract.ResourceUsageSource.EXACT_FILE_READ: return "exact_file_read";
+    case contract.ResourceUsageSource.RUNTIME_TOOL_CALL: return "runtime_tool_call";
+    default:
+      throw new ProtoMappingError("invalid_argument", "resource_usage.source", "Resource usage source is required.");
+  }
+}
+
+function toProtoResourceUsageActivity(
+  value: Extract<EventPayload, { readonly type: "resource_usage" }>["activity"]
+): contract.ResourceUsageActivity {
+  return value === "strong_active"
+    ? contract.ResourceUsageActivity.STRONG_ACTIVE
+    : value === "semi_active"
+      ? contract.ResourceUsageActivity.SEMI_ACTIVE
+      : contract.ResourceUsageActivity.PASSIVE;
+}
+
+function fromProtoResourceUsageActivity(
+  value: contract.ResourceUsageActivity
+): Extract<EventPayload, { readonly type: "resource_usage" }>["activity"] {
+  switch (value) {
+    case contract.ResourceUsageActivity.STRONG_ACTIVE: return "strong_active";
+    case contract.ResourceUsageActivity.SEMI_ACTIVE: return "semi_active";
+    case contract.ResourceUsageActivity.PASSIVE: return "passive";
+    default:
+      throw new ProtoMappingError("invalid_argument", "resource_usage.activity", "Resource usage activity is required.");
+  }
+}
+
+function toProtoResourceUsageAction(
+  value: Extract<EventPayload, { readonly type: "resource_usage" }>["action"]
+): contract.ResourceUsageAction {
+  switch (value) {
+    case "exposure": return contract.ResourceUsageAction.EXPOSURE;
+    case "read": return contract.ResourceUsageAction.READ;
+    case "reread": return contract.ResourceUsageAction.REREAD;
+    case "tool_succeeded": return contract.ResourceUsageAction.TOOL_SUCCEEDED;
+    case "tool_failed": return contract.ResourceUsageAction.TOOL_FAILED;
+    case "command_succeeded": return contract.ResourceUsageAction.COMMAND_SUCCEEDED;
+    case "command_failed": return contract.ResourceUsageAction.COMMAND_FAILED;
+  }
+}
+
+function fromProtoResourceUsageAction(
+  value: contract.ResourceUsageAction
+): Extract<EventPayload, { readonly type: "resource_usage" }>["action"] {
+  switch (value) {
+    case contract.ResourceUsageAction.EXPOSURE: return "exposure";
+    case contract.ResourceUsageAction.READ: return "read";
+    case contract.ResourceUsageAction.REREAD: return "reread";
+    case contract.ResourceUsageAction.TOOL_SUCCEEDED: return "tool_succeeded";
+    case contract.ResourceUsageAction.TOOL_FAILED: return "tool_failed";
+    case contract.ResourceUsageAction.COMMAND_SUCCEEDED: return "command_succeeded";
+    case contract.ResourceUsageAction.COMMAND_FAILED: return "command_failed";
+    default:
+      throw new ProtoMappingError("invalid_argument", "resource_usage.action", "Resource usage action is required.");
+  }
+}
+
+function positiveProtoRevision(value: Revision | undefined, fieldPath: string): string {
+  const revision = fromProtoRevision(value, fieldPath);
+  if (revision < 1n) throw new ProtoMappingError("out_of_range", fieldPath, "Revision must be positive.");
+  return revision.toString(10);
+}
+
+function positiveSafeNumber(value: bigint, fieldPath: string): number {
+  const result = safeNumber(value, fieldPath);
+  if (result < 1) throw new ProtoMappingError("out_of_range", fieldPath, "Value must be positive.");
+  return result;
 }
 
 function invalidQuestionDecisionAnswer(fieldId: string): ProtoMappingError {

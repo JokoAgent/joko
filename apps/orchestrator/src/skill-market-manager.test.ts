@@ -15,9 +15,19 @@ import {
   type SkillMarketGitExecutor,
   type SkillMarketPublicationIntent
 } from "./skill-market-manager.js";
+import type { SkillAccessPolicy } from "./collaboration-manager.js";
 
 const roots: string[] = [];
 const stores: OperationalStore[] = [];
+
+function personalAccess(): SkillAccessPolicy {
+  return {
+    revision: 1n,
+    publisher: { kind: "personal", actorId: "collaboration_actor_test" },
+    visibility: "public",
+    audienceScopeIds: []
+  };
+}
 
 afterEach(async () => {
   for (const store of stores.splice(0)) {
@@ -283,6 +293,7 @@ describe("SkillMarketManager", () => {
         tags: [],
         version: "1.0.0"
       },
+      access: personalAccess(),
       ...firstArchive
     }, {
       beforeSwitch: (intent) => {
@@ -323,6 +334,7 @@ describe("SkillMarketManager", () => {
         version: "1.1.0",
         changelog: "Improve the writing guidance."
       },
+      access: personalAccess(),
       ...secondArchive
     }, {
       beforeSwitch: () => undefined,
@@ -369,6 +381,7 @@ describe("SkillMarketManager", () => {
       expectedSourceRevision: source.revision,
       expectedSourceContentRevision: source.contentRevision,
       metadata,
+      access: personalAccess(),
       ...archive
     }, {
       beforeSwitch: (value) => { intent = value; },
@@ -382,6 +395,7 @@ describe("SkillMarketManager", () => {
       sourceId: source.id,
       expectedSourceContentRevision: source.contentRevision,
       metadata,
+      access: personalAccess(),
       intent: intent!
     }, (store, result) => {
       store.setSetting("service", "test", "recovered_publication", { entryId: result.entry.id });
@@ -416,6 +430,7 @@ describe("SkillMarketManager", () => {
         tags: [],
         version: "1.0.0"
       },
+      access: personalAccess(),
       ...archive
     }, {
       beforeSwitch: async () => { await writeFile(conflict, "external recovery content", "utf8"); },

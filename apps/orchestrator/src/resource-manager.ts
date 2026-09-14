@@ -2240,7 +2240,21 @@ export class PiResourceManager {
         revision: record.discoveredRevision,
         resourceVersion: BigInt(record.versionNumber),
         runtimePath: path,
-        ...(record.version === undefined ? {} : { detail: `version ${record.version}` })
+        ...(record.version === undefined
+          ? {}
+          : { version: record.version, detail: `version ${record.version}` }),
+        ...(record.source.kind === "skill_market"
+          ? {
+              market: {
+                sourceId: record.source.sourceId,
+                sourceRevision: BigInt(record.source.sourceRevision),
+                entryId: record.source.entryId,
+                entryRevision: BigInt(record.source.entryRevision),
+                entryContentRevision: record.source.entryContentRevision,
+                installedContentRevision: record.source.installedContentRevision
+              }
+            }
+          : {})
       });
     }
     return {

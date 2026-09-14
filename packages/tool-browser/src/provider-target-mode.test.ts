@@ -37,6 +37,7 @@ class TargetPage extends EventEmitter {
     if (this.#focusError !== undefined) throw this.#focusError;
   }
   async route(): Promise<void> { this.routeCount += 1; }
+  async routeWebSocket(): Promise<void> { /* Network socket behavior is owned by html-preview tests. */ }
 
   async goto(url: string): Promise<null> {
     this.#url = url;

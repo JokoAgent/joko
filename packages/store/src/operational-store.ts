@@ -66,7 +66,14 @@ import {
   parseCurrentInteractionEventPayload,
   parseCurrentInteractionPayload
 } from "./interaction-shape.js";
+import { parseCurrentResourceUsageEventPayload } from "./resource-usage-shape.js";
 import { configureDatabase, initializeDatabase, SCHEMA_VERSION } from "./schema.js";
+import {
+  projectResourceUsageStream,
+  readResourceUsageReport,
+  type ResourceUsageReport,
+  type ResourceUsageReportQuery
+} from "./resource-usage-report.js";
 import { readUsageReport, type UsageReportQuery, type UsageReportPage } from "./usage-report.js";
 import {
   assertSafeSettingKey,
@@ -5110,7 +5117,14 @@ export class OperationalStore {
         }
       }
       if (input.operationId !== undefined) this.getOperation(input.operationId);
-      const payload = parseCurrentInteractionEventPayload(redactSubagentEventPayload(input.payload));
+      const payload = parseCurrentResourceUsageEventPayload(
+        parseCurrentInteractionEventPayload(redactSubagentEventPayload(input.payload))
+      );
+      if (payload.type === "resource_usage" && (
+        input.runId === undefined || payload.runtimeGeneration !== input.generation
+      )) {
+        throw new StoreError("Resource usage evidence requires the exact Event run and runtime generation.");
+      }
       this.validateSubagentEventInput({ ...input, payload });
       const counter = this.database.prepare(`
         UPDATE session_event_counters
@@ -5181,6 +5195,15 @@ export class OperationalStore {
       };
       this.indexNativeHistory(event);
       this.indexVisibleMessage(event);
+      if (event.payload.type === "resource_usage") {
+        projectResourceUsageStream(
+          this.database,
+          event.sessionId,
+          event.payload.source,
+          event.emittedAt,
+          { ignoreRetryAfter: true }
+        );
+      }
       this.currentFrame().events.push(event);
       if (event.payload.type === "error" && event.payload.terminal) {
         this.recordSessionAttention({
@@ -11600,6 +11623,11 @@ export class OperationalStore {
   getUsageReport(input: UsageReportQuery): UsageReportPage {
     this.assertOpen();
     return this.readConsistent(() => readUsageReport(this.database, this.readRevision(), input));
+  }
+
+  getResourceUsageReport(input: ResourceUsageReportQuery): ResourceUsageReport {
+    this.assertOpen();
+    return this.write(() => readResourceUsageReport(this.database, this.now(), input));
   }
 
   listUsageLedger(input: UsageLedgerQuery): UsageLedgerDailyRecord[] {

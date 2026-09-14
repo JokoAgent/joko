@@ -226,6 +226,10 @@ message OperationMutation {
     StartSkillPublicationMutation start_skill_publication = 208;
     CancelSkillPublicationMutation cancel_skill_publication = 209;
     RetrySkillPublicationMutation retry_skill_publication = 210;
+    UpdateSkillMarketAccessMutation update_skill_market_access = 211;
+    CreateCollaborationScopeMutation create_collaboration_scope = 212;
+    UpdateCollaborationScopeMutation update_collaboration_scope = 213;
+    DeleteCollaborationScopeMutation delete_collaboration_scope = 214;
   }
 }
 
@@ -302,6 +306,36 @@ message StartSkillPublicationMutation {
   SkillPublicationMetadata metadata = 8;
   SkillPublicationPublisher publisher = 9;
   SkillPublicationVisibility visibility = 10;
+  optional string publisher_scope_id = 11;
+  repeated string audience_scope_ids = 12;
+  Revision expected_collaboration_revision = 13;
+}
+
+message UpdateSkillMarketAccessMutation {
+  SkillMarketEntryIdentity identity = 1;
+  Revision expected_access_revision = 2;
+  SkillPublicationPublisher publisher = 3;
+  optional string publisher_scope_id = 4;
+  SkillPublicationVisibility visibility = 5;
+  repeated string audience_scope_ids = 6;
+  Revision expected_collaboration_revision = 7;
+}
+
+message CreateCollaborationScopeMutation {
+  Revision expected_catalog_revision = 1;
+  CollaborationScopeKind kind = 2;
+  string name = 3;
+}
+
+message UpdateCollaborationScopeMutation {
+  string scope_id = 1;
+  Revision expected_revision = 2;
+  string name = 3;
+}
+
+message DeleteCollaborationScopeMutation {
+  string scope_id = 1;
+  Revision expected_revision = 2;
 }
 
 message CancelSkillPublicationMutation {

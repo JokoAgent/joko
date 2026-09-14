@@ -805,7 +805,9 @@ describe("SessionHost", () => {
     const adapter = new FakeBackendAdapter({
       ...PI_LIKE_PROFILE,
       capabilities: [
-        ...PI_LIKE_PROFILE.capabilities.filter((capability) => capability.key !== "input.mention"),
+        ...PI_LIKE_PROFILE.capabilities.filter((capability) =>
+          capability.key !== "input.mention" && capability.key !== "runtime.resources"),
+        { key: "runtime.resources", supported: true, options: ["skill", "prompt"] },
         { key: "input.mention", supported: true, options: ["resource"] }
       ]
     });
@@ -861,6 +863,112 @@ describe("SessionHost", () => {
     await eventually(() => fixture.store.getQueueItem(queued.value.queueItemId).state === "failed");
     expect(getResources).toHaveBeenCalledTimes(2);
     expect(send).not.toHaveBeenCalled();
+  });
+
+  it("records accepted loaded exposure and an exact structured Resource mention without private content", async () => {
+    const adapter = new FakeBackendAdapter({
+      ...PI_LIKE_PROFILE,
+      capabilities: [
+        ...PI_LIKE_PROFILE.capabilities.filter((capability) =>
+          capability.key !== "input.mention" && capability.key !== "runtime.resources"),
+        { key: "runtime.resources", supported: true, options: ["skill", "prompt"] },
+        { key: "input.mention", supported: true, options: ["resource"] }
+      ]
+    });
+    const fixture = await createFixture(adapter);
+    vi.spyOn(adapter, "getResources").mockImplementation(async (context) => [{
+      id: "resource-usage-skill",
+      kind: "skill",
+      name: "Usage skill",
+      source: "market:team-skills",
+      state: "loaded",
+      revision: "sha256:installed-skill",
+      resourceVersion: 17n,
+      runtimeGeneration: context.generation,
+      version: "2.1.0",
+      runtimePath: join(fixture.directory, "private", "SKILL.md"),
+      market: {
+        sourceId: "team-skills",
+        sourceRevision: 4n,
+        entryId: "usage-skill-entry",
+        entryRevision: 9n,
+        entryContentRevision: "sha256:market-entry",
+        installedContentRevision: "sha256:installed-skill"
+      }
+    }]);
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-resource-usage-owner",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Resource usage evidence",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    await fixture.host.getResources(sessionId);
+    const generation = fixture.store.getSession(sessionId).descriptor.binding.generation;
+    const queued = fixture.host.enqueueInput({
+      operationId: "send-resource-usage-owner",
+      connection: fixture.connection,
+      sessionId,
+      prompt: {
+        text: "Use @Usage",
+        images: [],
+        files: [],
+        mentions: [{
+          kind: "resource",
+          label: "Usage",
+          reference: "resource-usage-skill",
+          discoveredRevision: "sha256:installed-skill",
+          resourceVersion: "17",
+          runtimeGeneration: generation
+        }],
+        mentionRanges: [{ start: 4, end: 10, mentionIndex: 0 }],
+        disposition: "prompt"
+      }
+    });
+
+    await eventually(() => fixture.store.getQueueItem(queued.value.queueItemId).state === "completed");
+    const usage = fixture.store.listEvents({ sessionId, limit: 1_000 })
+      .filter((event) => event.payload.type === "resource_usage");
+    expect(usage.map((event) => event.payload)).toEqual([
+      expect.objectContaining({
+        type: "resource_usage",
+        resourceId: "resource-usage-skill",
+        entityRevision: "17",
+        contentRevision: "sha256:installed-skill",
+        runtimeGeneration: generation,
+        version: "2.1.0",
+        source: "runtime_confirmed_resource_load",
+        activity: "passive",
+        action: "exposure",
+        market: expect.objectContaining({ sourceId: "team-skills", entryRevision: "9" })
+      }),
+      expect.objectContaining({
+        type: "resource_usage",
+        resourceId: "resource-usage-skill",
+        source: "structured_resource_mention",
+        activity: "passive",
+        action: "exposure"
+      })
+    ]);
+    const serialized = JSON.stringify(usage.map((event) => event.payload));
+    expect(serialized).not.toContain("private");
+    expect(serialized).not.toContain("Use @Usage");
+    const report = fixture.store.getResourceUsageReport({
+      resourceId: "resource-usage-skill",
+      timeZone: "UTC",
+      current: {
+        entityRevision: "17",
+        contentRevision: "sha256:installed-skill",
+        version: "2.1.0"
+      }
+    });
+    expect(report.totals).toMatchObject({ samples: 2, passiveExposures: 2, strongActive: 0 });
+    expect(report.sources.map((source) => source.source)).toEqual([
+      "structured_resource_mention",
+      "runtime_confirmed_resource_load"
+    ]);
   });
 
   it("fails an accepted reference before Backend dispatch when its exact capability is removed", async () => {

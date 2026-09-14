@@ -7,9 +7,13 @@ import { waitFor } from "./fixture.js";
 import {
   MARKET_NAME,
   MARKET_SLUG,
+  seedSkillResourceUsage,
   SkillMarketSystemFixture,
   writeSkillMarketSource
 } from "./skill-market-system-fixture.js";
+
+const PUBLISHED_SLUG = "production-writer-team";
+const PUBLISHED_NAME = "Team Writer";
 
 const MOUNTED_CHAIN_ENABLED = nonBlankEnvironment("JOKO_BROWSER_EXECUTABLE") !== undefined
   && nonBlankEnvironment("JOKO_MOUNTED_WEB_DIR") !== undefined;
@@ -51,6 +55,21 @@ describe("mounted Skill market surface", () => {
     browserErrors.splice(0);
     await skillsTab.click();
     const skillTabs = page.locator(".skill-hub__tabs");
+    await skillTabs.getByRole("tab", { name: "Sharing", exact: true }).click();
+    const sharing = page.locator(".skill-collaboration");
+    await sharing.getByText("Local owner", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
+    const scopeType = sharing.locator(".skill-collaboration__create [data-select-control='true']");
+    const scopeName = sharing.getByLabel("Scope name", { exact: true });
+    await scopeName.fill("Platform");
+    await sharing.getByRole("button", { name: "Create scope", exact: true }).click();
+    await sharing.locator(".skill-collaboration__list article", { hasText: "Platform" }).waitFor({ state: "visible", timeout: 20_000 });
+    await scopeType.click();
+    await page.getByRole("option", { name: "Department", exact: true }).click();
+    await scopeName.fill("Engineering");
+    await sharing.getByRole("button", { name: "Create scope", exact: true }).click();
+    await sharing.locator(".skill-collaboration__list article", { hasText: "Engineering" }).waitFor({ state: "visible", timeout: 20_000 });
+    expect(await overflow(page)).toBeLessThanOrEqual(1);
+
     await skillTabs.getByRole("tab", { name: "Sources", exact: true }).click();
     const sourceEditor = page.locator(".skill-market-source-editor");
     await sourceEditor.waitFor({ state: "visible", timeout: 20_000 });
@@ -77,6 +96,11 @@ describe("mounted Skill market surface", () => {
     await dialog.getByRole("button", { name: "Enable automatic updates", exact: true }).click();
     await dialog.getByText("Automatic updates enabled", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
     await closeDialog(dialog);
+    const initialUsageResource = required(
+      fixture.application.piResources?.list({ kind: "skill" }).find((resource) =>
+        resource.name === MARKET_SLUG && resource.scope === "global" && resource.version === "1.0.0"),
+      "initial mounted usage Resource"
+    );
 
     await writeSkillMarketSource(fixture, "1.1.0", "# Version two");
     await skillTabs.getByRole("tab", { name: "Sources", exact: true }).click();
@@ -97,6 +121,19 @@ describe("mounted Skill market surface", () => {
     await closeDialog(dialog);
     await page.locator(".skill-market-controls").getByRole("button", { name: "Refresh", exact: true }).click();
     await expectText(card, "Installed", "synchronized market install state");
+    await page.getByText("# Version two", { exact: false }).waitFor({ state: "visible", timeout: 20_000 });
+    const currentUsageResource = required(
+      fixture.application.piResources?.list({ kind: "skill" }).find((resource) =>
+        resource.id === initialUsageResource.id && resource.version === "1.1.0"),
+      "updated mounted usage Resource"
+    );
+    const usageTarget = required(fixture.application.store.listTargets(currentUsageResource.backendId)[0], "mounted usage Target");
+    const usageBackendName = fixture.application.store.getBackend(currentUsageResource.backendId).descriptor.displayName;
+    seedSkillResourceUsage(fixture, {
+      targetId: usageTarget.descriptor.id,
+      previous: initialUsageResource,
+      current: currentUsageResource
+    });
 
     await skillTabs.getByRole("tab", { name: "Installed", exact: true }).click();
     const globalGroup = page.locator(".skill-catalog__groups > section").filter({ hasText: "Global" });
@@ -104,20 +141,44 @@ describe("mounted Skill market surface", () => {
     await installedSkill.waitFor({ state: "visible", timeout: 20_000 });
     await installedSkill.click();
     await page.locator(".skill-detail h2", { hasText: MARKET_SLUG }).waitFor({ state: "visible", timeout: 20_000 });
+    const usage = page.locator(".skill-usage");
+    await usage.getByRole("heading", { name: "Usage and impact", exact: true }).waitFor({ state: "visible", timeout: 20_000 });
+    await usage.getByText("10 evidence events", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
+    await usage.getByText("Native Skill commands", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
+    await usage.getByText("Runtime tool calls", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
+    await usage.getByText(usageBackendName, { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
+    await usage.getByText("Comparable", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
+    await usage.getByText("v1.1.0", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
+    await usage.getByText("v1.0.0", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
+    expect(await overflow(page)).toBeLessThanOrEqual(1);
+    expect(browserErrors, "before mounted publication").toEqual([]);
     await page.getByRole("button", { name: "Publish", exact: true }).click();
 
     const publication = page.getByRole("dialog", { name: `Publish ${MARKET_SLUG}` });
     await publication.waitFor({ state: "visible", timeout: 20_000 });
     expect(await overflow(page)).toBeLessThanOrEqual(1);
+    await publication.getByLabel("Market slug", { exact: true }).fill(PUBLISHED_SLUG);
     await publication.getByRole("button", { name: "Review publication target", exact: true }).click();
-    await publication.getByText("New version", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
-    expect(await publication.locator('input[type="radio"]:disabled').count()).toBe(3);
-    expect(await publication.getByText("Team and restricted visibility require", { exact: false }).count()).toBeGreaterThan(0);
+    await publication.getByText("First publication", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
+    const teamPublisher = publication.getByRole("radio", { name: "Team", exact: true });
+    const departmentVisibility = publication.getByRole("radio", { name: "Department", exact: true });
+    const privateVisibility = publication.getByRole("radio", { name: "Private", exact: true });
+    expect(await teamPublisher.isEnabled()).toBe(true);
+    expect(await privateVisibility.isEnabled()).toBe(true);
+    expect(await departmentVisibility.isDisabled()).toBe(true);
+    await teamPublisher.check();
+    expect(await departmentVisibility.isEnabled()).toBe(true);
+    expect(await privateVisibility.isDisabled()).toBe(true);
+    await publication.locator(".skill-publication__scope [data-select-control='true']").click();
+    await page.getByRole("option", { name: "Platform", exact: true }).click();
+    await departmentVisibility.check();
+    const engineeringAudience = publication.getByRole("checkbox", { name: "Engineering", exact: true });
+    expect(await engineeringAudience.isChecked()).toBe(true);
     expect(await publicationFormColumns(page)).toBe(2);
-    const publishVersion = publication.getByRole("button", { name: "Publish new version", exact: true });
-    expect(await publishVersion.isDisabled()).toBe(true);
+    const publishVersion = publication.getByRole("button", { name: "Publish Skill", exact: true });
+    await publication.getByLabel("Display name", { exact: true }).fill(PUBLISHED_NAME);
     await publication.getByLabel("Version", { exact: true }).fill("1.2.0");
-    await publication.getByLabel("Changelog · required", { exact: true }).fill("Published through mounted production Chromium.");
+    await publication.getByLabel("Changelog", { exact: true }).fill("Published through mounted production Chromium.");
     expect(await publishVersion.isEnabled()).toBe(true);
 
     await page.setViewportSize({ width: 390, height: 844 });
@@ -133,10 +194,14 @@ describe("mounted Skill market surface", () => {
     const publicationGates = publication.locator(".skill-publication__gates > section");
     expect(await publicationGates.count()).toBe(4);
     for (let index = 0; index < 4; index += 1) await expectText(publicationGates.nth(index), "Passed", `publication gate ${index + 1}`);
+    await expectText(publication.locator(".skill-publication__job-access"), "Team publisher · Department visibility", "published restricted access");
     await publication.getByRole("button", { name: "Open in Skill market", exact: true }).click();
-    await page.locator(".skill-market-detail h2", { hasText: MARKET_NAME }).waitFor({ state: "visible", timeout: 20_000 });
+    await page.locator(".skill-market-detail h2", { hasText: PUBLISHED_NAME }).waitFor({ state: "visible", timeout: 20_000 });
     await page.getByText("version: 1.2.0", { exact: false }).waitFor({ state: "visible", timeout: 20_000 });
+    await page.getByText("Team publisher · Department visibility", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
+    await page.getByRole("button", { name: "Manage visibility", exact: true }).waitFor({ state: "visible", timeout: 20_000 });
     expect(await overflow(page)).toBeLessThanOrEqual(1);
+    expect(browserErrors, "after mounted publication handoff").toEqual([]);
 
     await page.setViewportSize({ width: 390, height: 844 });
     const closeNavigation = page.getByLabel("Task navigation").getByRole("button", { name: "Close navigation" });
@@ -144,8 +209,9 @@ describe("mounted Skill market surface", () => {
     const back = page.locator(".skill-market-detail__back");
     await back.waitFor({ state: "visible" });
     await back.click();
+    const publishedCard = page.locator("button.skill-market-card", { hasText: PUBLISHED_NAME });
     await waitFor(
-      () => card.evaluate((element) => ({
+      () => publishedCard.evaluate((element) => ({
         focused: element === document.activeElement,
         connected: element.isConnected,
         disabled: (element as HTMLButtonElement).disabled,
@@ -214,6 +280,9 @@ async function expectText(locator: ReturnType<Page["locator"]>, text: string, la
 function observeBrowserErrors(page: Page): string[] {
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(`pageerror:${error.message}`));
+  page.on("response", (response) => {
+    if (response.status() >= 400) errors.push(`response:${response.status()}:${response.request().method()}:${response.url()}`);
+  });
   page.on("console", (message) => {
     if (message.type() === "error") errors.push(`console:${message.text()}`);
   });
@@ -249,5 +318,10 @@ function nonBlankEnvironment(name: string): string | undefined {
 function requiredEnvironment(name: string): string {
   const value = nonBlankEnvironment(name);
   if (value === undefined) throw new Error(`${name} is required for the mounted Skill market E3.`);
+  return value;
+}
+
+function required<T>(value: T | null | undefined, label: string): T {
+  if (value === null || value === undefined || value === "") throw new Error(`${label} is missing.`);
   return value;
 }

@@ -24,3 +24,8 @@ export {
 export type * from "./types.js";
 export type * from "./usage-report.js";
 export { UsageReportQueryError, UsageReportCapacityError } from "./usage-report.js";
+export type * from "./resource-usage-report.js";
+export {
+  ResourceUsageReportQueryError,
+  ResourceUsageReportCapacityError
+} from "./resource-usage-report.js";

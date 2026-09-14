@@ -11,6 +11,12 @@ import type { OperationalStore } from "@joko/store";
 import { extract as extractTarArchive } from "tar";
 
 import {
+  externalPublicSkillAccess,
+  type CollaborationManager,
+  type SkillAccessPolicy,
+  type SkillPublicationSelection
+} from "./collaboration-manager.js";
+import {
   inspectPiSkillPackage,
   type PiMarketSkillPreview,
   type PiMarketSkillTargetInput,
@@ -57,6 +63,9 @@ export interface SkillMarketEntryDescriptor {
   readonly downloads: number;
   readonly trendScore: number;
   readonly archiveBytes: number;
+  /** Joko-owned access metadata. Package bytes and source labels are never identity authorities. */
+  readonly access: SkillAccessPolicy;
+  readonly canManage: boolean;
 }
 
 export interface SkillMarketSourceDescriptor {
@@ -206,6 +215,7 @@ export interface SkillMarketManagerOptions {
   readonly resources?: PiResourceManager;
   readonly mutationCoordinator?: SkillMutationCoordinator;
   readonly installPlanTtlMs?: number;
+  readonly collaboration?: CollaborationManager;
 }
 
 export interface SkillMarketPublicationMetadata {
@@ -247,6 +257,7 @@ export interface CommitSkillMarketPublicationInput {
   readonly archivePath: string;
   readonly archiveBytes: number;
   readonly archiveSha256: string;
+  readonly access: SkillAccessPolicy;
   readonly recoveredIntent?: SkillMarketPublicationIntent;
 }
 
@@ -255,6 +266,7 @@ export interface RecoverSkillMarketPublicationInput {
   readonly sourceId: string;
   readonly expectedSourceContentRevision: string;
   readonly metadata: SkillMarketPublicationMetadata;
+  readonly access: SkillAccessPolicy;
   readonly intent: SkillMarketPublicationIntent;
 }
 
@@ -326,8 +338,13 @@ export class SkillMarketError extends Error {
   }
 }
 
-interface StoredSkillMarketEntry extends Omit<SkillMarketEntryDescriptor, "revision"> {
+interface StoredSkillAccessPolicy extends Omit<SkillAccessPolicy, "revision"> {
   readonly revision: string;
+}
+
+interface StoredSkillMarketEntry extends Omit<SkillMarketEntryDescriptor, "revision" | "access" | "canManage"> {
+  readonly revision: string;
+  readonly access: StoredSkillAccessPolicy;
   readonly archiveRelativePath: string;
   readonly archiveSha256: string;
   readonly archiveEntries: readonly SkillMarketArchiveEntry[];
@@ -360,7 +377,7 @@ interface DiscoveredSkillMarket {
   readonly name: string;
   readonly displayName?: string;
   readonly contentRevision: string;
-  readonly entries: readonly Omit<StoredSkillMarketEntry, "revision">[];
+  readonly entries: readonly Omit<StoredSkillMarketEntry, "revision" | "access">[];
 }
 
 interface ArchiveFileIdentity {
@@ -426,6 +443,7 @@ const SOURCE_SETTING_KEY = "skill_market_sources";
 const MARKETPLACE_MANIFEST = join(".agents", "skills", "marketplace.json");
 const SOURCE_ID = /^skill_market_source_[a-f0-9]{32}$/u;
 const ENTRY_ID = /^skill_market_entry_[a-f0-9]{32}$/u;
+const ENTITY_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u;
 const PUBLICATION_JOB_ID = /^skill_publication_[a-f0-9]{32}$/u;
 const DECIMAL_REVISION = /^(?:0|[1-9][0-9]*)$/u;
 const CONTENT_REVISION = /^sha256:[a-f0-9]{64}$/u;
@@ -541,6 +559,7 @@ export class SkillMarketManager {
   readonly #resources?: PiResourceManager;
   readonly #mutationCoordinator: SkillMutationCoordinator;
   readonly #installPlanTtlMs: number;
+  readonly #collaboration?: CollaborationManager;
   readonly #records = new Map<string, StoredSkillMarketSource>();
   readonly #previews = new Map<string, PreviewSession>();
   readonly #installPlans = new Map<string, InstallPlanSession>();
@@ -568,6 +587,7 @@ export class SkillMarketManager {
     this.#resources = options.resources;
     this.#mutationCoordinator = options.mutationCoordinator ?? new SkillMutationCoordinator();
     this.#installPlanTtlMs = options.installPlanTtlMs ?? DEFAULT_INSTALL_PLAN_TTL_MS;
+    this.#collaboration = options.collaboration;
     if (!Number.isSafeInteger(this.#previewTtlMs) || this.#previewTtlMs < 1_000 || this.#previewTtlMs > 60 * 60_000) {
       throw new RangeError("Skill market preview lifetime is invalid.");
     }
@@ -646,9 +666,12 @@ export class SkillMarketManager {
     if (source.state !== "ready") throw marketError("PUBLICATION_UNAVAILABLE", "This local Skill market source is not ready for publication.");
     const normalizedSlug = slug === undefined || slug.trim() === "" ? undefined : publicationSlug(slug);
     const existing = normalizedSlug === undefined ? undefined : source.entries.find((entry) => entry.slug === normalizedSlug);
+    if (existing !== undefined && this.#collaboration?.canManage(publicAccess(existing.access)) !== true) {
+      throw marketError("PUBLICATION_UNAVAILABLE", "The current collaboration identity cannot publish a new version of this Skill entry.");
+    }
     return {
       source: publicSource(source),
-      ...(existing === undefined ? {} : { existingEntry: publicCatalogItem(source, existing, this.#resources) })
+      ...(existing === undefined ? {} : { existingEntry: publicCatalogItem(source, existing, this.#resources, this.#collaboration) })
     };
   }
 
@@ -687,7 +710,8 @@ export class SkillMarketManager {
   getEntry(identity: SkillMarketEntryIdentity): SkillMarketCatalogItem {
     this.#assertInitialized();
     const { source, entry } = this.#requireEntry(identity);
-    return publicCatalogItem(source, entry, this.#resources);
+    this.#assertVisible(entry);
+    return publicCatalogItem(source, entry, this.#resources, this.#collaboration);
   }
 
   /** Resolve a stable source/entry pair to its exact current catalog identity. */
@@ -697,7 +721,58 @@ export class SkillMarketManager {
     if (!ENTRY_ID.test(entryId)) throw marketError("SOURCE_INVALID", "Skill market entry ID is invalid.");
     const entry = source.entries.find((candidate) => candidate.id === entryId);
     if (entry === undefined) throw marketError("ENTRY_NOT_FOUND", "Skill market entry was not found.");
-    return publicCatalogItem(source, entry, this.#resources);
+    this.#assertVisible(entry);
+    return publicCatalogItem(source, entry, this.#resources, this.#collaboration);
+  }
+
+  async updateEntryAccess(input: {
+    readonly identity: SkillMarketEntryIdentity;
+    readonly expectedAccessRevision: bigint;
+    readonly expectedCollaborationRevision: bigint;
+    readonly selection: SkillPublicationSelection;
+  }): Promise<SkillMarketCatalogItem> {
+    return this.#mutate(async () => {
+      this.#assertInitialized();
+      const collaboration = this.#collaboration;
+      if (collaboration === undefined) throw marketError("PUBLICATION_UNAVAILABLE", "Collaboration identity is unavailable.");
+      const { source, entry } = this.#requireEntry(input.identity);
+      const currentAccess = publicAccess(entry.access);
+      if (currentAccess.revision !== input.expectedAccessRevision) {
+        throw marketError("SOURCE_CHANGED", "Skill visibility changed concurrently.");
+      }
+      collaboration.assertRevision(input.expectedCollaborationRevision);
+      const access = collaboration.authorizePublication(input.selection, currentAccess);
+      if (sameAccessPolicy(access, currentAccess)) {
+        return publicCatalogItem(source, entry, this.#resources, collaboration);
+      }
+      const nextEntry: StoredSkillMarketEntry = {
+        ...entry,
+        revision: increment(entry.revision),
+        access: storedAccess(access)
+      };
+      const nextSource: StoredSkillMarketSource = {
+        ...source,
+        revision: increment(source.revision),
+        entries: source.entries.map((candidate) => candidate.id === entry.id ? nextEntry : candidate),
+        refreshedAt: this.#now()
+      };
+      const next = new Map(this.#records).set(source.id, nextSource);
+      const catalogRevision = this.#catalogRevision + 1n;
+      this.#persist(next, catalogRevision);
+      this.#replaceState(next, catalogRevision);
+      return publicCatalogItem(nextSource, nextEntry, this.#resources, collaboration);
+    });
+  }
+
+  usesCollaborationScope(scopeId: string): boolean {
+    this.#assertInitialized();
+    const id = scopeId.trim();
+    if (id !== scopeId || !ENTITY_ID.test(id)) throw marketError("SOURCE_INVALID", "Collaboration scope ID is invalid.");
+    return [...this.#records.values()].some((source) => source.entries.some((entry) => {
+      const access = publicAccess(entry.access);
+      return access.publisher.kind === "team" && access.publisher.scopeId === id
+        || access.audienceScopeIds.includes(id);
+    }));
   }
 
   listCatalog(input: SkillMarketCatalogQuery): SkillMarketCatalogPage {
@@ -710,7 +785,9 @@ export class SkillMarketManager {
     if (!Number.isSafeInteger(input.pageSize) || input.pageSize < 1 || input.pageSize > MAXIMUM_CATALOG_PAGE) {
       throw marketError("SOURCE_INVALID", `Skill market page size must be between 1 and ${MAXIMUM_CATALOG_PAGE}.`);
     }
-    const all = [...this.#records.values()].flatMap((source) => source.entries.map((entry) => publicCatalogItem(source, entry, this.#resources)));
+    const all = [...this.#records.values()].flatMap((source) => source.entries
+      .filter((entry) => this.#visible(entry))
+      .map((entry) => publicCatalogItem(source, entry, this.#resources, this.#collaboration)));
     const categories = [...new Set(all.flatMap((entry) => entry.category === undefined ? [] : [entry.category]))]
       .sort((left, right) => left.localeCompare(right, "en"));
     const filtered = all
@@ -764,7 +841,11 @@ export class SkillMarketManager {
       try {
         const discovered = await discoverSkillMarket(acquired.root, id, acquired.revision, signal);
         const history = Object.fromEntries(discovered.entries.map((entry) => [entry.slug, "1"]));
-        const entries = discovered.entries.map((entry) => ({ ...entry, revision: "1" }));
+        const entries = discovered.entries.map((entry) => ({
+          ...entry,
+          revision: "1",
+          access: storedAccess(externalPublicSkillAccess(id))
+        }));
         const now = this.#now();
         const record: StoredSkillMarketSource = {
           id,
@@ -821,7 +902,11 @@ export class SkillMarketManager {
         if (Object.keys(history).length > MAXIMUM_ENTRY_REVISION_HISTORY) {
           throw marketError("SOURCE_MANIFEST_INVALID", "Skill market source has exceeded its stable entry identity limit.");
         }
-        const entries = discovered.entries.map((entry) => ({ ...entry, revision: history[entry.slug]! }));
+        const entries = discovered.entries.map((entry) => ({
+          ...entry,
+          revision: history[entry.slug]!,
+          access: previousBySlug.get(entry.slug)?.access ?? storedAccess(externalPublicSkillAccess(current.id))
+        }));
         const {
           displayName: _previousDisplayName,
           activeGeneration: _previousGeneration,
@@ -968,10 +1053,10 @@ export class SkillMarketManager {
           signal
         );
         const discovered = await discoverSkillMarket(root, current.id, undefined);
-        const nextRecord = adoptPublishedDiscovery(current, discovered, metadata, intent, this.#now());
+        const nextRecord = adoptPublishedDiscovery(current, discovered, metadata, intent, input.access, this.#now());
         const nextRevision = this.#catalogRevision + 1n;
         const next = new Map(this.#records).set(current.id, nextRecord);
-        const result = publicationResult(nextRecord, metadata.slug, this.#resources);
+        const result = publicationResult(nextRecord, metadata.slug, this.#resources, this.#collaboration);
         const value = this.#store.transaction((store) => {
           this.#persist(next, nextRevision, store);
           return callbacks.finalize(store, result);
@@ -1021,11 +1106,11 @@ export class SkillMarketManager {
       }
       const nextRecord = current.contentRevision === discovered.contentRevision
         ? current
-        : adoptPublishedDiscovery(current, discovered, metadata, intent, this.#now());
+        : adoptPublishedDiscovery(current, discovered, metadata, intent, input.access, this.#now());
       const changed = nextRecord !== current;
       const nextRevision = changed ? this.#catalogRevision + 1n : this.#catalogRevision;
       const next = changed ? new Map(this.#records).set(current.id, nextRecord) : new Map(this.#records);
-      const result = publicationResult(nextRecord, metadata.slug, this.#resources);
+      const result = publicationResult(nextRecord, metadata.slug, this.#resources, this.#collaboration);
       const value = this.#store.transaction((store) => {
         if (changed) this.#persist(next, nextRevision, store);
         return finalize(store, result);
@@ -1053,6 +1138,7 @@ export class SkillMarketManager {
     this.#assertInitialized();
     signal?.throwIfAborted();
     const { source, entry } = this.#requireEntry(identity);
+    this.#assertVisible(entry);
     const root = source.source.kind === "local"
       ? await canonicalDirectory(source.source.path, "Local Skill market source")
       : this.#currentGeneration(source);
@@ -1091,7 +1177,7 @@ export class SkillMarketManager {
     };
     return Object.freeze({
       source: publicSource(source),
-      entry: publicCatalogItem(source, entry, this.#resources),
+      entry: publicCatalogItem(source, entry, this.#resources, this.#collaboration),
       archiveEntries: entry.archiveEntries.map((item) => ({ ...item })),
       extractTo: async (privateParent: string, extractSignal?: AbortSignal) => {
         assertLeaseOpen();
@@ -1450,6 +1536,15 @@ export class SkillMarketManager {
       throw marketError("SOURCE_CHANGED", "Skill market entry changed concurrently.");
     }
     return { source, entry };
+  }
+
+  #visible(entry: StoredSkillMarketEntry): boolean {
+    const access = publicAccess(entry.access);
+    return access.visibility === "public" || this.#collaboration?.canView(access) === true;
+  }
+
+  #assertVisible(entry: StoredSkillMarketEntry): void {
+    if (!this.#visible(entry)) throw marketError("ENTRY_NOT_FOUND", "Skill market entry was not found.");
   }
 
   #persist(records: ReadonlyMap<string, StoredSkillMarketSource>, revision: bigint, store: OperationalStore = this.#store): void {
@@ -2125,6 +2220,7 @@ function adoptPublishedDiscovery(
   discovered: DiscoveredSkillMarket,
   metadata: SkillMarketPublicationMetadata,
   intent: SkillMarketPublicationIntent,
+  access: SkillAccessPolicy,
   now: number
 ): StoredSkillMarketSource {
   const published = discovered.entries.find((entry) => entry.slug === metadata.slug);
@@ -2154,7 +2250,13 @@ function adoptPublishedDiscovery(
   if (Object.keys(history).length > MAXIMUM_ENTRY_REVISION_HISTORY) {
     throw marketError("PUBLICATION_UNAVAILABLE", "The Skill market source has exceeded its stable entry identity limit.");
   }
-  const entries = discovered.entries.map((entry) => ({ ...entry, revision: history[entry.slug]! }));
+  const entries = discovered.entries.map((entry) => ({
+    ...entry,
+    revision: history[entry.slug]!,
+    access: entry.slug === metadata.slug
+      ? storedAccess(access)
+      : previousBySlug.get(entry.slug)?.access ?? storedAccess(externalPublicSkillAccess(current.id))
+  }));
   const { displayName: _displayName, error: _error, ...base } = current;
   return {
     ...base,
@@ -2172,11 +2274,12 @@ function adoptPublishedDiscovery(
 function publicationResult(
   source: StoredSkillMarketSource,
   slug: string,
-  resources?: PiResourceManager
+  resources?: PiResourceManager,
+  collaboration?: CollaborationManager
 ): SkillMarketPublicationResult {
   const entry = source.entries.find((candidate) => candidate.slug === slug);
   if (entry === undefined) throw marketError("PUBLICATION_CHANGED", "The published Skill entry is missing after source reconciliation.");
-  return { source: publicSource(source), entry: publicCatalogItem(source, entry, resources) };
+  return { source: publicSource(source), entry: publicCatalogItem(source, entry, resources, collaboration) };
 }
 
 async function discoverSkillMarket(
@@ -2212,7 +2315,7 @@ async function discoverSkillMarket(
   if (!Array.isArray(raw.entries) || raw.entries.length > MAXIMUM_ENTRIES) {
     throw marketError("SOURCE_MANIFEST_INVALID", `Skill market source manifest may contain at most ${MAXIMUM_ENTRIES} entries.`);
   }
-  const entries: Omit<StoredSkillMarketEntry, "revision">[] = [];
+  const entries: Omit<StoredSkillMarketEntry, "revision" | "access">[] = [];
   const slugs = new Set<string>();
   const archivePaths = new Set<string>();
   for (const rawEntry of raw.entries) {
@@ -2680,7 +2783,39 @@ function publicSource(source: StoredSkillMarketSource): SkillMarketSourceDescrip
   };
 }
 
-function publicEntry(entry: StoredSkillMarketEntry): SkillMarketEntryDescriptor {
+function storedAccess(value: SkillAccessPolicy): StoredSkillAccessPolicy {
+  return {
+    ...value,
+    revision: value.revision.toString(10),
+    publisher: { ...value.publisher },
+    audienceScopeIds: [...value.audienceScopeIds]
+  };
+}
+
+function publicAccess(value: StoredSkillAccessPolicy): SkillAccessPolicy {
+  return {
+    ...value,
+    revision: BigInt(value.revision),
+    publisher: { ...value.publisher },
+    audienceScopeIds: [...value.audienceScopeIds]
+  };
+}
+
+function sameAccessPolicy(left: SkillAccessPolicy, right: SkillAccessPolicy): boolean {
+  return left.revision === right.revision
+    && left.publisher.kind === right.publisher.kind
+    && (left.publisher.kind === "personal" && right.publisher.kind === "personal"
+      ? left.publisher.actorId === right.publisher.actorId
+      : left.publisher.kind === "team" && right.publisher.kind === "team"
+        ? left.publisher.scopeId === right.publisher.scopeId
+        : left.publisher.kind === "external" && right.publisher.kind === "external" && left.publisher.sourceId === right.publisher.sourceId)
+    && left.visibility === right.visibility
+    && left.audienceScopeIds.length === right.audienceScopeIds.length
+    && left.audienceScopeIds.every((value, index) => value === right.audienceScopeIds[index]);
+}
+
+function publicEntry(entry: StoredSkillMarketEntry, collaboration?: CollaborationManager): SkillMarketEntryDescriptor {
+  const access = publicAccess(entry.access);
   return {
     id: entry.id,
     sourceId: entry.sourceId,
@@ -2698,17 +2833,20 @@ function publicEntry(entry: StoredSkillMarketEntry): SkillMarketEntryDescriptor 
     updatedAt: entry.updatedAt,
     downloads: entry.downloads,
     trendScore: entry.trendScore,
-    archiveBytes: entry.archiveBytes
+    archiveBytes: entry.archiveBytes,
+    access,
+    canManage: collaboration?.canManage(access) === true
   };
 }
 
 function publicCatalogItem(
   source: StoredSkillMarketSource,
   entry: StoredSkillMarketEntry,
-  resources?: PiResourceManager
+  resources?: PiResourceManager,
+  collaboration?: CollaborationManager
 ): SkillMarketCatalogItem {
   return {
-    ...publicEntry(entry),
+    ...publicEntry(entry, collaboration),
     sourceRevision: BigInt(source.revision),
     sourceName: source.name,
     ...(source.displayName === undefined ? {} : { sourceDisplayName: source.displayName }),
@@ -3265,7 +3403,7 @@ function validateStoredSource(value: unknown): StoredSkillMarketSource {
 function validateStoredEntry(value: unknown, sourceId: string, history: Readonly<Record<string, string>>): StoredSkillMarketEntry {
   if (!plainObject(value) || !exactKeys(value, [
     "id", "sourceId", "revision", "contentRevision", "slug", "name", "author", "description", "category", "tags", "version", "changelog",
-    "createdAt", "updatedAt", "downloads", "trendScore", "archiveBytes", "archiveRelativePath", "archiveSha256", "archiveEntries"
+    "createdAt", "updatedAt", "downloads", "trendScore", "archiveBytes", "access", "archiveRelativePath", "archiveSha256", "archiveEntries"
   ])) throw new Error("Stored Skill market entry shape is invalid.");
   if (typeof value.slug !== "string" || !SLUG.test(value.slug)
     || typeof value.id !== "string" || value.id !== `skill_market_entry_${createHash("sha256").update(`${sourceId}\0${value.slug}`).digest("hex").slice(0, 32)}`
@@ -3294,6 +3432,7 @@ function validateStoredEntry(value: unknown, sourceId: string, history: Readonly
   });
   if (new Set(tags.map((tag) => tag.toLocaleLowerCase("en-US"))).size !== tags.length) throw new Error("Stored Skill market tags are duplicated.");
   const archiveEntries = validateStoredArchiveEntries(value.archiveEntries);
+  const access = validateStoredAccess(value.access, sourceId);
   const expectedContentRevision = digest({
     slug: value.slug,
     name: value.name,
@@ -3312,7 +3451,42 @@ function validateStoredEntry(value: unknown, sourceId: string, history: Readonly
     archiveEntries
   });
   if (value.contentRevision !== expectedContentRevision) throw new Error("Stored Skill market entry content revision is invalid.");
-  return { ...value, tags, archiveEntries } as unknown as StoredSkillMarketEntry;
+  return { ...value, tags, access, archiveEntries } as unknown as StoredSkillMarketEntry;
+}
+
+function validateStoredAccess(value: unknown, sourceId: string): StoredSkillAccessPolicy {
+  if (!plainObject(value) || !exactKeys(value, ["revision", "publisher", "visibility", "audienceScopeIds"])
+    || typeof value.revision !== "string" || !DECIMAL_REVISION.test(value.revision) || value.revision === "0"
+    || !plainObject(value.publisher) || !Array.isArray(value.audienceScopeIds) || value.audienceScopeIds.length > 256) {
+    throw new Error("Stored Skill access policy is invalid.");
+  }
+  let publisher: SkillAccessPolicy["publisher"];
+  if (value.publisher.kind === "personal" && exactKeys(value.publisher, ["kind", "actorId"]) && typeof value.publisher.actorId === "string" && ENTITY_ID.test(value.publisher.actorId)) {
+    publisher = { kind: "personal", actorId: value.publisher.actorId };
+  } else if (value.publisher.kind === "team" && exactKeys(value.publisher, ["kind", "scopeId"]) && typeof value.publisher.scopeId === "string" && ENTITY_ID.test(value.publisher.scopeId)) {
+    publisher = { kind: "team", scopeId: value.publisher.scopeId };
+  } else if (value.publisher.kind === "external" && exactKeys(value.publisher, ["kind", "sourceId"]) && value.publisher.sourceId === sourceId) {
+    publisher = { kind: "external", sourceId };
+  } else throw new Error("Stored Skill publisher identity is invalid.");
+  if (value.visibility !== "public" && value.visibility !== "department" && value.visibility !== "private") {
+    throw new Error("Stored Skill visibility is invalid.");
+  }
+  const audienceScopeIds = value.audienceScopeIds.map((scopeId) => {
+    if (typeof scopeId !== "string" || !ENTITY_ID.test(scopeId)) throw new Error("Stored Skill audience scope is invalid.");
+    return scopeId;
+  });
+  if (new Set(audienceScopeIds).size !== audienceScopeIds.length
+    || audienceScopeIds.some((value, index) => index > 0 && audienceScopeIds[index - 1]!.localeCompare(value, "en") >= 0)) {
+    throw new Error("Stored Skill audience scopes must be unique and ordered.");
+  }
+  if (publisher.kind === "external" && (value.visibility !== "public" || audienceScopeIds.length !== 0)
+    || publisher.kind === "personal" && (value.visibility === "department" || audienceScopeIds.length !== 0)
+    || publisher.kind === "team" && (value.visibility === "private"
+      || value.visibility === "public" && audienceScopeIds.length !== 0
+      || value.visibility === "department" && audienceScopeIds.length === 0)) {
+    throw new Error("Stored Skill access policy combination is invalid.");
+  }
+  return { revision: value.revision, publisher, visibility: value.visibility, audienceScopeIds };
 }
 
 function validateStoredArchiveEntries(value: readonly unknown[]): readonly SkillMarketArchiveEntry[] {

@@ -10,6 +10,7 @@ import "joko/v1/operation.proto";
 import "joko/v1/pi.proto";
 import "joko/v1/runtime.proto";
 import "joko/v1/review.proto";
+import "joko/v1/resource_usage.proto";
 import "joko/v1/settings.proto";
 import "joko/v1/subagent.proto";
 import "joko/v1/tool.proto";
@@ -86,6 +87,7 @@ message EventPayload {
     ExtensionUiEffectEvent extension_ui_effect = 70;
     RuntimeRecoveryChangedEvent runtime_recovery_changed = 71;
     HistoryPrunedEvent history_pruned = 72;
+    ResourceUsageRecordedEvent resource_usage_recorded = 73;
   }
 }
 

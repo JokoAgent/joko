@@ -13,6 +13,7 @@ import {
   type SkillPublicationManagerOptions
 } from "./skill-publication-manager.js";
 import { PiResourceManager } from "./resource-manager.js";
+import { CollaborationManager } from "./collaboration-manager.js";
 import { mkdtemp } from "./test-paths.js";
 
 const roots: string[] = [];
@@ -41,7 +42,7 @@ describe("SkillPublicationManager", () => {
       teamPublisherAvailable: false,
       publicVisibilityAvailable: true,
       departmentVisibilityAvailable: false,
-      privateVisibilityAvailable: false
+      privateVisibilityAvailable: true
     });
     expect(stringifyWithBigInts(preview)).not.toContain(f.root);
 
@@ -157,12 +158,15 @@ describe("SkillPublicationManager", () => {
     const store = new OperationalStore(f.databasePath);
     const resources = new PiResourceManager({ store, managedRoot: f.managedRoot });
     await resources.initialize();
-    const market = new SkillMarketManager({ store, cacheRoot: f.marketCache, resources });
+    const collaboration = new CollaborationManager({ store });
+    collaboration.initialize();
+    const market = new SkillMarketManager({ store, cacheRoot: f.marketCache, resources, collaboration });
     await market.initialize();
     const reopened = new SkillPublicationManager({
       store,
       resources,
       market,
+      collaboration,
       rootDirectory: f.publicationRoot
     });
     await reopened.initialize();
@@ -367,6 +371,7 @@ describe("SkillPublicationManager", () => {
       store: f.store,
       resources,
       market: f.market,
+      collaboration: f.collaboration,
       rootDirectory: join(f.root, "package-publications"),
       scopeId: "package-publication"
     });
@@ -446,9 +451,17 @@ describe("SkillPublicationManager", () => {
     const store = new OperationalStore(f.databasePath);
     const resources = new PiResourceManager({ store, managedRoot: f.managedRoot });
     await resources.initialize();
-    const market = new SkillMarketManager({ store, cacheRoot: f.marketCache, resources });
+    const collaboration = new CollaborationManager({ store });
+    collaboration.initialize();
+    const market = new SkillMarketManager({ store, cacheRoot: f.marketCache, resources, collaboration });
     await market.initialize();
-    const publisher = new SkillPublicationManager({ store, resources, market, rootDirectory: f.publicationRoot });
+    const publisher = new SkillPublicationManager({
+      store,
+      resources,
+      market,
+      collaboration,
+      rootDirectory: f.publicationRoot
+    });
     await publisher.initialize();
     closers.push(async () => {
       await publisher.close();
@@ -485,9 +498,17 @@ describe("SkillPublicationManager", () => {
     const store = new OperationalStore(f.databasePath);
     const resources = new PiResourceManager({ store, managedRoot: f.managedRoot });
     await resources.initialize();
-    const market = new SkillMarketManager({ store, cacheRoot: f.marketCache, resources });
+    const collaboration = new CollaborationManager({ store });
+    collaboration.initialize();
+    const market = new SkillMarketManager({ store, cacheRoot: f.marketCache, resources, collaboration });
     await market.initialize();
-    const publisher = new SkillPublicationManager({ store, resources, market, rootDirectory: f.publicationRoot });
+    const publisher = new SkillPublicationManager({
+      store,
+      resources,
+      market,
+      collaboration,
+      rootDirectory: f.publicationRoot
+    });
     await publisher.initialize();
     closers.push(async () => {
       await publisher.close();
@@ -562,13 +583,16 @@ async function fixture(options: {
     displayName: "Local publishing",
     entries: []
   }, undefined, 2)}\n`, "utf8");
-  const market = new SkillMarketManager({ store, cacheRoot: marketCache, resources });
+  const collaboration = new CollaborationManager({ store, idFactory: () => "publication-test-actor" });
+  collaboration.initialize();
+  const market = new SkillMarketManager({ store, cacheRoot: marketCache, resources, collaboration });
   await market.initialize();
   const source = await market.add({ kind: "local", path: marketRoot }, 0n);
   const publication = new SkillPublicationManager({
     store,
     resources,
     market,
+    collaboration,
     rootDirectory: publicationRoot,
     ...(options.afterStatePersisted === undefined ? {} : { afterStatePersisted: options.afterStatePersisted })
   });
@@ -590,6 +614,7 @@ async function fixture(options: {
     resources,
     skillSource,
     market,
+    collaboration,
     source,
     publisher: publication,
     resource,
@@ -612,9 +637,11 @@ async function startFromPreview(
     expectedSourceRevision: preview.authority.sourceRevision,
     expectedSourceContentRevision: preview.authority.sourceContentRevision,
     ...(preview.authority.existingEntryId === undefined ? {} : { expectedExistingEntryId: preview.authority.existingEntryId }),
+    expectedCollaborationRevision: preview.collaborationRevision,
     metadata,
     publisher: "personal",
-    visibility: "public"
+    visibility: "public",
+    audienceScopeIds: []
   });
 }
 

@@ -166,6 +166,17 @@ class ScriptedPiProcess extends EventEmitter {
     });
   }
 
+  emitToolResult(toolName: string, toolCallId: string, isError = false): void {
+    this.#send({ type: "tool_execution_start", toolCallId, toolName, args: { privateValue: "must-not-enter-usage" } });
+    this.#send({
+      type: "tool_execution_end",
+      toolCallId,
+      toolName,
+      isError,
+      result: { content: [{ type: "text", text: isError ? "failed" : "complete" }], details: {} }
+    });
+  }
+
   emitExtensionInput(id: string, title: string): void {
     this.#send({ type: "extension_ui_request", id, method: "input", title, placeholder: "" });
   }
@@ -2129,6 +2140,7 @@ describe("PiBackendAdapter", () => {
     const extension = join(resources, "lookup.ts");
     await writeFile(extension, "export default function lookup() {}\n");
     const events: EventPayload[] = [];
+    let process!: ScriptedPiProcess;
     const adapter = createPiAdapter({
       agentHome,
       sessionRoot: agentHome,
@@ -2151,6 +2163,9 @@ describe("PiBackendAdapter", () => {
           name: "lookup",
           source: "local:lookup",
           state: "approved",
+          revision: "sha256:lookup-extension",
+          resourceVersion: 6n,
+          version: "3.0.0",
           runtimePath: extension
         }]
       },
@@ -2181,13 +2196,15 @@ describe("PiBackendAdapter", () => {
             }
           }]
         };
-        return new ScriptedPiProcess(spec, {
+        process = new ScriptedPiProcess(spec, {
           commands: [],
+          holdAgentLifecycle: true,
           runtimeToolCatalogStatuses: [...chunkedRuntimeToolCatalog(
             document,
             Math.ceil(Buffer.byteLength(JSON.stringify(document), "utf8") / 2)
           )].reverse()
-        }) as unknown as PiProcessHandle;
+        });
+        return process as unknown as PiProcessHandle;
       }
     });
     const target: TargetDescriptor = {
@@ -2208,7 +2225,7 @@ describe("PiBackendAdapter", () => {
         fastMode: false,
         permissionMode: "ask"
       }, context);
-      const bound = { ...context, binding };
+      const bound = { ...context, binding, operationId: "runtime-tool-usage-operation" };
       await expect(adapter.getRuntimeTools(bound)).resolves.toMatchObject({
         runtimeGeneration: 1,
         observedAt: expect.any(Number),
@@ -2230,12 +2247,155 @@ describe("PiBackendAdapter", () => {
         expect.objectContaining({
           id: "tool-only-extension",
           state: "loaded",
+          revision: "sha256:lookup-extension",
+          resourceVersion: 6n,
           runtimeGeneration: 1
         })
       ]);
+      await adapter.send({
+        text: "Look up the exact record",
+        images: [],
+        files: [],
+        mentions: [],
+        disposition: "prompt"
+      }, bound);
+      process.emitToolResult("lookup_records", "lookup-call-1");
+      process.emitToolResult("lookup_records", "lookup-call-2", true);
+      process.settle();
+      await vi.waitFor(() => expect(events.some((event) =>
+        event.type === "resource_usage" && event.source === "runtime_tool_call"
+      )).toBe(true));
+      expect(events.filter((event) => event.type === "resource_usage")).toEqual([
+        expect.objectContaining({
+          type: "resource_usage",
+          resourceId: "tool-only-extension",
+          entityRevision: "6",
+          contentRevision: "sha256:lookup-extension",
+          runtimeGeneration: 1,
+          version: "3.0.0",
+          source: "runtime_tool_call",
+          activity: "strong_active",
+          action: "tool_succeeded"
+        }),
+        expect.objectContaining({
+          type: "resource_usage",
+          resourceId: "tool-only-extension",
+          source: "runtime_tool_call",
+          activity: "strong_active",
+          action: "tool_failed"
+        })
+      ]);
+      expect(JSON.stringify(events.filter((event) => event.type === "resource_usage")))
+        .not.toContain("must-not-enter-usage");
       expect(events.some((event) => event.type === "extension_status" && event.key === PI_RUNTIME_TOOL_CATALOG_STATUS_KEY)).toBe(false);
     } finally {
       await adapter.dispose();
+    }
+  });
+
+  it("records an exact native Skill command outcome without command text or runtime paths", async () => {
+    const agentHome = await mkdtemp(join(tmpdir(), "joko-pi-skill-usage-home-"));
+    const workspace = await mkdtemp(join(tmpdir(), "joko-pi-skill-usage-workspace-"));
+    const resources = await mkdtemp(join(tmpdir(), "joko-pi-skill-usage-resources-"));
+    const skill = join(resources, "review-skill");
+    await mkdir(skill);
+    await writeFile(join(skill, "SKILL.md"), "Review the selected change.\n");
+    const events: EventPayload[] = [];
+    const adapter = createPiAdapter({
+      agentHome,
+      sessionRoot: agentHome,
+      versionProbe: async () => "pi 99.99.99-skill-usage-test",
+      providers: [{
+        id: "local",
+        baseUrl: "http://127.0.0.1:11434/v1",
+        api: "openai-completions",
+        keyless: true,
+        models: [{ id: "test-model", contextWindow: 32_768, maxTokens: 4_096 }]
+      }],
+      managedResources: {
+        extensions: [],
+        skills: [skill],
+        prompts: [],
+        packages: [],
+        resources: [{
+          id: "native-review-skill",
+          kind: "skill",
+          name: "Review skill",
+          source: "market:review-skills",
+          state: "approved",
+          revision: "sha256:native-review-skill",
+          resourceVersion: 12n,
+          version: "1.4.0",
+          runtimePath: skill,
+          market: {
+            sourceId: "review-skills",
+            sourceRevision: 3n,
+            entryId: "review-entry",
+            entryRevision: 7n,
+            entryContentRevision: "sha256:review-entry",
+            installedContentRevision: "sha256:native-review-skill"
+          }
+        }]
+      },
+      processFactory: (spec) => {
+        const runtimeSkill = valuesForArgument(spec.args, "--skill")[0]!;
+        return new ScriptedPiProcess(spec, {
+          commands: [{
+            name: "review",
+            description: "Run the managed review Skill",
+            source: "skill",
+            sourceInfo: { path: join(runtimeSkill, "SKILL.md"), scope: "temporary" }
+          }]
+        }) as unknown as PiProcessHandle;
+      }
+    });
+    const target: TargetDescriptor = {
+      id: "skill-usage-target",
+      backendId: "pi",
+      displayName: "Skill usage",
+      workspaceRoot: workspace,
+      managed: true,
+      trusted: false
+    };
+    const context = { ...makeContext(target, events), operationId: "native-skill-command-operation" };
+    try {
+      const binding = await adapter.createSession({
+        target,
+        providerId: "local",
+        modelId: "test-model",
+        fastMode: false,
+        permissionMode: "ask"
+      }, context);
+      await adapter.send({
+        text: "/review private command detail",
+        images: [],
+        files: [],
+        mentions: [],
+        disposition: "prompt"
+      }, { ...context, binding });
+      await vi.waitFor(() => expect(events.some((event) =>
+        event.type === "resource_usage" && event.source === "native_skill_command"
+      )).toBe(true));
+      expect(events.filter((event) => event.type === "resource_usage")).toEqual([
+        expect.objectContaining({
+          type: "resource_usage",
+          resourceId: "native-review-skill",
+          entityRevision: "12",
+          contentRevision: "sha256:native-review-skill",
+          runtimeGeneration: 1,
+          version: "1.4.0",
+          source: "native_skill_command",
+          activity: "strong_active",
+          action: "command_succeeded",
+          market: expect.objectContaining({ sourceId: "review-skills", entryRevision: "7" })
+        })
+      ]);
+      const serialized = JSON.stringify(events.filter((event) => event.type === "resource_usage"));
+      expect(serialized).not.toContain("private command detail");
+      expect(serialized).not.toContain("SKILL.md");
+    } finally {
+      await adapter.dispose().catch(() => undefined);
+      await Promise.all([agentHome, workspace, resources].map((path) => rm(path, { recursive: true, force: true })));
     }
   });
 
@@ -4838,13 +4998,17 @@ describe("PiBackendAdapter", () => {
 
   it("allows only live catalogued commands through prompt Composer input", () => {
     const commands = [
-      { name: "skill:review", description: "", source: "skill" as const, loaded: true },
+      { name: "skill:review", description: "", source: "skill" as const, resourceId: "review-skill", loaded: true },
       { name: "release-notes", description: "", source: "prompt" as const, loaded: true },
       { name: "plan", description: "", source: "extension" as const, loaded: true },
       { name: "unsafe-extension", description: "", source: "extension" as const, loaded: true }
     ];
     const managedInternalNames = new Set(["plan", "joko-navigate-tree"]);
     expect(escapePiComposerSlashCommand("/skill:review now", commands)).toBe("/skill:review now");
+    expect(resolvePiComposerSlashCommand("/skill:review now", "prompt", commands)).toEqual({
+      message: "/skill:review now",
+      skillResourceId: "review-skill"
+    });
     expect(escapePiComposerSlashCommand("/release-notes v1", commands)).toBe("/release-notes v1");
     expect(escapePiComposerSlashCommand("/plan", commands)).toBe("/plan");
     expect(escapePiComposerSlashCommand("/plan", commands, managedInternalNames)).toBe(" /plan");
