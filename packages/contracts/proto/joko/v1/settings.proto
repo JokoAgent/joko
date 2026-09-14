@@ -948,6 +948,7 @@ message BackendMemorySettings {
   uint64 entry_count = 5;
   BackendMemoryKind kind = 6;
   bool resettable = 7;
+  bool updates_active_local_sessions = 8;
 }
 
 message MemorySettings {

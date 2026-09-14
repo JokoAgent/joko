@@ -113,6 +113,7 @@ interface FakeThread {
   status: JsonObject;
   readonly createdAt: number;
   updatedAt: number;
+  config: JsonObject;
 }
 
 export class FakeCodexAppServer {
@@ -142,7 +143,11 @@ export class FakeCodexAppServer {
   failNextAccountRead = false;
   failNextModelList = false;
   failNextThreadResumeCode: number | undefined;
+  failNextNativeMemoryEnablement = false;
+  malformedNextNativeMemoryEnablement = false;
+  nativeMemoryEnabled = false;
   userAgent = "joko/0.153.4 (Windows 10.0.26200; x86_64) unknown (joko; 0.1.0)";
+  codexHome = "/private";
   readonly reviewSkills: JsonObject[] = [];
   readonly reviewSkillErrors: JsonObject[] = [];
   reviewConfig: JsonObject = {};
@@ -163,6 +168,11 @@ export class FakeCodexAppServer {
     thread.historyMode = "paginated";
     thread.turns.push(...turns.map((turn) => structuredClone(turn)));
     return thread.id;
+  }
+
+  memoryEnabledForThread(threadId: string): boolean {
+    const value = this.#thread(threadId).config["features.memories"];
+    return typeof value === "boolean" ? value : this.nativeMemoryEnabled;
   }
 
   async completeTurn(threadId: string, text = "completed response"): Promise<void> {
@@ -267,7 +277,7 @@ export class FakeCodexAppServer {
     const record = isObject(params) ? params : {};
     switch (method) {
       case "initialize":
-        return { userAgent: this.userAgent, codexHome: "/private", platformFamily: "unix", platformOs: "linux" };
+        return { userAgent: this.userAgent, codexHome: this.codexHome, platformFamily: "unix", platformOs: "linux" };
       case "skills/list":
         return {
           data: [{
@@ -280,6 +290,20 @@ export class FakeCodexAppServer {
         };
       case "config/read":
         return { config: structuredClone(this.reviewConfig), origins: {}, layers: null };
+      case "experimentalFeature/enablement/set": {
+        if (this.failNextNativeMemoryEnablement) {
+          this.failNextNativeMemoryEnablement = false;
+          throw new RpcRemoteFault(-32001);
+        }
+        const enablement = isObject(record["enablement"]) ? record["enablement"] : {};
+        if (typeof enablement["memories"] !== "boolean") throw new RpcRemoteFault(-32602);
+        this.nativeMemoryEnabled = enablement["memories"];
+        if (this.malformedNextNativeMemoryEnablement) {
+          this.malformedNextNativeMemoryEnablement = false;
+          return { enablement: {} };
+        }
+        return { enablement: { memories: this.nativeMemoryEnabled } };
+      }
       case "mcpServerStatus/list":
         return { data: [...this.reviewMcpStatuses], nextCursor: null };
       case "account/read":
@@ -328,7 +352,11 @@ export class FakeCodexAppServer {
           nextCursor: this.modelNextCursor
         };
       case "thread/start": {
-        const thread = this.#newThread(String(record["cwd"] ?? "/workspace"), record["ephemeral"] === true);
+        const thread = this.#newThread(
+          String(record["cwd"] ?? "/workspace"),
+          record["ephemeral"] === true,
+          isObject(record["config"]) ? record["config"] : undefined
+        );
         thread.historyMode = record["historyMode"] === "paginated" ? "paginated" : "legacy";
         await transport.emitNotification("thread/started", { thread: nativeThread(thread) });
         if (this.emitNameBeforeStartResponse) {
@@ -343,6 +371,7 @@ export class FakeCodexAppServer {
           throw new RpcRemoteFault(code);
         }
         const thread = this.#thread(String(record["threadId"]));
+        if (isObject(record["config"])) thread.config = { ...thread.config, ...record["config"] };
         return sessionResponse(thread, record);
       }
       case "thread/read": {
@@ -413,7 +442,11 @@ export class FakeCodexAppServer {
         return {};
       case "thread/fork": {
         const source = this.#thread(String(record["threadId"]));
-        const thread = this.#newThread(String(record["cwd"] ?? source.cwd));
+        const thread = this.#newThread(
+          String(record["cwd"] ?? source.cwd),
+          false,
+          isObject(record["config"]) ? record["config"] : source.config
+        );
         thread.historyMode = source.historyMode;
         thread.turns.push(...source.turns.map((turn) => structuredClone(turn)));
         await transport.emitNotification("thread/started", { thread: nativeThread(thread) });
@@ -489,7 +522,7 @@ export class FakeCodexAppServer {
     }
   }
 
-  #newThread(cwd: string, ephemeral = false): FakeThread {
+  #newThread(cwd: string, ephemeral = false, config: JsonObject = {}): FakeThread {
     const now = Math.trunc(Date.now() / 1_000);
     const thread: FakeThread = {
       id: `thread-${this.#nextThread++}`,
@@ -500,7 +533,8 @@ export class FakeCodexAppServer {
       turns: [],
       status: { type: "idle" },
       createdAt: now,
-      updatedAt: now
+      updatedAt: now,
+      config: structuredClone(config)
     };
     this.threads.set(thread.id, thread);
     return thread;

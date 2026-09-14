@@ -29,7 +29,8 @@ describe("OrchestratorGateway Memory reset scopes", () => {
             enabled: true,
             support: CapabilitySupport.SUPPORTED,
             kind: BackendMemoryKind.NATIVE_AUTO_MEMORY,
-            resettable: false
+            resettable: false,
+            updatesActiveLocalSessions: true
           }]
         }
       }
@@ -42,7 +43,8 @@ describe("OrchestratorGateway Memory reset scopes", () => {
       reason: "",
       entryCount: 0,
       kind: "native_auto_memory",
-      resettable: false
+      resettable: false,
+      updatesActiveLocalSessions: true
     }]);
   });
 

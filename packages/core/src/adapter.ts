@@ -445,6 +445,8 @@ export interface BackendAdapter {
   compact(customInstructions: string | undefined, context: AdapterContext): Promise<"compacted" | "noop">;
   setAutoCompaction(enabled: boolean, context: AdapterContext): Promise<void>;
   setAutoRetry(enabled: boolean, context: AdapterContext): Promise<void>;
+  /** Reconcile the durable Backend-native memory preference with a live local runtime, if one exists. */
+  reconcileNativeMemory?(): Promise<"immediate" | "next_session">;
   /** Update the capability owner's default for runtimes created later. */
   configureSilentEncryptedRetry?(enabled: boolean): Promise<void>;
   /** Capability-gated transport recovery for Responses reasoning ciphertext. */

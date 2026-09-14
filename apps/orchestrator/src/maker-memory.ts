@@ -52,6 +52,7 @@ export interface MakerMemorySnapshot {
 export interface MakerMemoryBackendRole {
   readonly backendId: string;
   readonly role: "compaction_digest" | "native_auto_memory";
+  readonly defaultEnabled?: boolean;
 }
 
 export interface MakerMemorySettingsPatch {
@@ -122,7 +123,10 @@ export class MakerMemoryController {
   snapshot(backends: readonly MakerMemoryBackendRole[]): MakerMemorySnapshot {
     const settings = this.settings();
     const backendEnabled = Object.fromEntries(
-      backends.map(({ backendId }) => [backendId, settings.backendEnabled[backendId] ?? true])
+      backends.map(({ backendId, defaultEnabled }) => [
+        backendId,
+        settings.backendEnabled[backendId] ?? defaultEnabled ?? true
+      ])
     );
     const backendEntryCount = Object.fromEntries(
       backends.map(({ backendId, role }) => [
@@ -144,9 +148,9 @@ export class MakerMemoryController {
     return settings.makerEnabled && (settings.backendEnabled[backendId] ?? true);
   }
 
-  nativeEnabledForBackend(backendId: string): boolean {
+  nativeEnabledForBackend(backendId: string, defaultEnabled = true): boolean {
     const settings = this.settings();
-    return !settings.makerEnabled && (settings.backendEnabled[backendId] ?? true);
+    return !settings.makerEnabled && (settings.backendEnabled[backendId] ?? defaultEnabled);
   }
 
   async update(patch: MakerMemorySettingsPatch): Promise<MakerMemorySnapshot> {

@@ -32,11 +32,24 @@ describe("MakerMemoryController", () => {
       summary: "Remember the beta release discussion."
     })).toBe(true);
 
-    expect(memory.snapshot([
+    const snapshot = memory.snapshot([
       { backendId: "memory-capable", role: "compaction_digest" },
       { backendId: "another-memory", role: "compaction_digest" },
-      { backendId: "native-memory", role: "native_auto_memory" }
-    ]).backendEntryCount).toEqual({ "memory-capable": 1, "another-memory": 1, "native-memory": 0 });
+      { backendId: "native-memory", role: "native_auto_memory" },
+      { backendId: "native-memory-default-off", role: "native_auto_memory", defaultEnabled: false }
+    ]);
+    expect(snapshot.backendEntryCount).toEqual({
+      "memory-capable": 1,
+      "another-memory": 1,
+      "native-memory": 0,
+      "native-memory-default-off": 0
+    });
+    expect(snapshot.backendEnabled).toEqual({
+      "memory-capable": true,
+      "another-memory": true,
+      "native-memory": true,
+      "native-memory-default-off": false
+    });
     expect(memory.reset("backend", "memory-capable")).toEqual({ removedEntries: 1, removedTargets: 1 });
     expect(store.countMakerMemoryEntries("digest", "another-memory")).toBe(1);
   });
@@ -135,9 +148,12 @@ describe("MakerMemoryController", () => {
     expect(memory.available).toBe(false);
     expect(memory.enabledForBackend("another-memory")).toBe(false);
     expect(memory.nativeEnabledForBackend("native-memory")).toBe(true);
+    expect(memory.nativeEnabledForBackend("codex-memory", false)).toBe(false);
+    await memory.update({ backendId: "codex-memory", backendEnabled: true });
+    expect(memory.nativeEnabledForBackend("codex-memory", false)).toBe(true);
     await memory.update({ backendId: "native-memory", backendEnabled: false });
     expect(memory.nativeEnabledForBackend("native-memory")).toBe(false);
-    expect(refreshed).toHaveBeenCalledTimes(3);
+    expect(refreshed).toHaveBeenCalledTimes(4);
   });
 
   it("scopes bridge reads to the authenticated product Target", async () => {

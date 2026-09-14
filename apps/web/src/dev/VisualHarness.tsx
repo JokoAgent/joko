@@ -3371,7 +3371,8 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
             reason: "",
             entryCount: 2,
             kind: "compaction_digest" as const,
-            resettable: true
+            resettable: true,
+            updatesActiveLocalSessions: false
           }]
         },
         visionBridge: {

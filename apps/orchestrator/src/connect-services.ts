@@ -19,7 +19,7 @@ import {
   DEFAULT_COLLABORATION_SETTINGS,
   type ManagedProcessPriority
 } from "@joko/runtime-governance";
-import { JokoError, redactSecrets, type BackendAdapter, type BackendDescriptor, type BackendToolDescriptor, type BlobRef, type DynamicInputFieldType, type NativeSessionCandidate as CoreNativeSessionCandidate, type NativeSessionCatalogEntry as CoreNativeSessionCatalogEntry, type PermissionMode as CorePermissionMode, type PiNativeStateMetadata, type PromptInput, type ProviderModel, type RuntimeCommand, type RuntimeResource, type RuntimeToolCatalog, type SessionTree, type SessionTreeNode, type TurnExecutionOverrides } from "@joko/core";
+import { JokoError, MEMORY_NATIVE_DEFAULT_DISABLED_OPTION, MEMORY_NATIVE_LIVE_LOCAL_OPTION, redactSecrets, type BackendAdapter, type BackendDescriptor, type BackendToolDescriptor, type BlobRef, type DynamicInputFieldType, type NativeSessionCandidate as CoreNativeSessionCandidate, type NativeSessionCatalogEntry as CoreNativeSessionCatalogEntry, type PermissionMode as CorePermissionMode, type PiNativeStateMetadata, type PromptInput, type ProviderModel, type RuntimeCommand, type RuntimeResource, type RuntimeToolCatalog, type SessionTree, type SessionTreeNode, type TurnExecutionOverrides } from "@joko/core";
 import {
   AsyncTransactionError,
   AuthorizationError,
@@ -11956,6 +11956,46 @@ function backendMemoryRole(descriptor: BackendDescriptor): MakerMemoryBackendRol
   return undefined;
 }
 
+function updatesActiveLocalMemorySessions(descriptor: BackendDescriptor): boolean {
+  return descriptor.capabilities.get("memory.native")?.options?.includes(MEMORY_NATIVE_LIVE_LOCAL_OPTION) === true;
+}
+
+function backendMemoryDefaultEnabled(descriptor: BackendDescriptor): boolean {
+  return descriptor.capabilities.get("memory.native")?.options
+    ?.includes(MEMORY_NATIVE_DEFAULT_DISABLED_OPTION) !== true;
+}
+
+async function reconcileNativeMemorySettings(
+  dependencies: ConnectServiceDependencies
+): Promise<void> {
+  const backendIds = dependencies.store.listBackends()
+    .map((item) => item.descriptor)
+    .filter(updatesActiveLocalMemorySessions)
+    .map((descriptor) => descriptor.id);
+  const failures: string[] = [];
+  await Promise.all(backendIds.map(async (backendId) => {
+    try {
+      await dependencies.sessionHost.invokeBackendAdapter(backendId, async (adapter) => {
+        if (adapter.reconcileNativeMemory === undefined) {
+          throw new Error("The advertised native-memory live reconcile owner is unavailable.");
+        }
+        await adapter.reconcileNativeMemory();
+      });
+    } catch {
+      failures.push(backendId);
+    }
+  }));
+  if (failures.length > 0) {
+    dependencies.store.appendDiagnostic({
+      severity: "warning",
+      component: "memory",
+      code: "NATIVE_MEMORY_RECONCILIATION_FAILED",
+      message: "The durable native-memory preference was committed, but a live local Backend projection could not be refreshed.",
+      details: { backendIds: failures.sort() }
+    });
+  }
+}
+
 function settingsSnapshot(dependencies: ConnectServiceDependencies): contract.SettingsSnapshot {
   reserveAllProviderCredentialSurfaces(dependencies);
   const health = dependencies.store.health();
@@ -12006,7 +12046,8 @@ function settingsSnapshot(dependencies: ConnectServiceDependencies): contract.Se
   });
   const memoryBackendRoles: readonly MakerMemoryBackendRole[] = memoryBackendRecords.map(({ item, role }) => ({
     backendId: item.descriptor.id,
-    role
+    role,
+    defaultEnabled: backendMemoryDefaultEnabled(item.descriptor)
   }));
   const memoryState = dependencies.makerMemory?.snapshot(memoryBackendRoles);
   const makerRuntimeSupported = backendRecords.some((item) =>
@@ -12325,7 +12366,8 @@ function settingsSnapshot(dependencies: ConnectServiceDependencies): contract.Se
         kind: role === "native_auto_memory"
           ? contract.BackendMemoryKind.NATIVE_AUTO_MEMORY
           : contract.BackendMemoryKind.COMPACTION_DIGEST,
-        resettable: role === "compaction_digest"
+        resettable: role === "compaction_digest",
+        updatesActiveLocalSessions: updatesActiveLocalMemorySessions(item.descriptor)
       }))
     }),
     voiceInput: dependencies.voiceInputSettings?.snapshot(),
@@ -17132,6 +17174,7 @@ async function dispatchMutation(
         // Restoring the durable default remains available even while the
         // optional runtime owner is absent. Reconcile only when it exists.
         await memory?.reconcileSettingsChange();
+        if (memory !== undefined) await reconcileNativeMemorySettings(dependencies);
         return presented(execution);
       }
       if (memory === undefined) {
@@ -17192,9 +17235,8 @@ async function dispatchMutation(
           return { accepted: true, resultCase: "settings" } satisfies OperationOutcome;
         }
       });
-      // Settings affect only future runtimes. Active runtimes retain the
-      // immutable Memory/provider snapshot captured when they started.
       await memory.reconcileSettingsChange();
+      await reconcileNativeMemorySettings(dependencies);
       return presented(execution);
     }
     case "resetMemory": {

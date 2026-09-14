@@ -67,14 +67,22 @@ export function PersonalizationMemorySettings({ controller, snapshot, runAction,
       }
     });
   };
-  const toggleBackend = (backendId: string, backendName: string, next: boolean): void => {
+  const toggleBackend = (
+    backendId: string,
+    backendName: string,
+    next: boolean,
+    updatesActiveLocalSessions: boolean
+  ): void => {
     const previous = backendEnabled[backendId] ?? true;
     setBackendEnabled((current) => ({ ...current, [backendId]: next }));
     markPending(`backend:${backendId}`, true);
     runAction(`memory-backend-toggle:${backendId}`, async () => {
       try {
         await controller.updateMemorySettings({ backendId, backendEnabled: next });
-        onSuccess(t(next ? "settings.memory.toast.backendEnabled" : "settings.memory.toast.backendDisabled", { backend: backendName }));
+        const key = updatesActiveLocalSessions
+          ? next ? "settings.memory.toast.backendEnabledLive" : "settings.memory.toast.backendDisabledLive"
+          : next ? "settings.memory.toast.backendEnabled" : "settings.memory.toast.backendDisabled";
+        onSuccess(t(key, { backend: backendName }));
       } catch (error) {
         setBackendEnabled((current) => ({ ...current, [backendId]: previous }));
         throw error;
@@ -174,7 +182,14 @@ export function PersonalizationMemorySettings({ controller, snapshot, runAction,
             <span className="memory-settings__icon memory-settings__icon--backend" aria-hidden="true"><BackendMemoryMark native={native} /></span>
             <span className="memory-settings__copy">
               <strong>{t("settings.memory.backendLabel", { backend: backendName })}</strong>
-              <span>{t(native ? "settings.memory.nativeBackendDescription" : "settings.memory.backendDescription", { backend: backendName })}</span>
+              <span>{t(
+                native && backend.updatesActiveLocalSessions
+                  ? "settings.memory.nativeBackendLiveDescription"
+                  : native
+                    ? "settings.memory.nativeBackendDescription"
+                    : "settings.memory.backendDescription",
+                { backend: backendName }
+              )}</span>
               {native && makerEnabled && <small role="status">{t("settings.memory.nativeBlocked")}</small>}
               {!backend.supported && <small role="status">{backend.reason || t("common.unavailable")}</small>}
             </span>
@@ -183,7 +198,12 @@ export function PersonalizationMemorySettings({ controller, snapshot, runAction,
                   checked={backendEnabled[backend.backendId] ?? backend.enabled}
                   disabled={disabled || pending.has(`backend:${backend.backendId}`)}
                   aria-label={t("settings.memory.backendToggleAria", { backend: backendName })}
-                  onChange={(event) => toggleBackend(backend.backendId, backendName, event.target.checked)}
+                  onChange={(event) => toggleBackend(
+                    backend.backendId,
+                    backendName,
+                    event.target.checked,
+                    backend.updatesActiveLocalSessions
+                  )}
                 />
               {backend.resettable && <IconButton
                 className="memory-settings__reset"

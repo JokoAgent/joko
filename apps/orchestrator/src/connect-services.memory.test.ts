@@ -1,6 +1,11 @@
 import { create } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
+import {
+  MEMORY_NATIVE_DEFAULT_DISABLED_OPTION,
+  MEMORY_NATIVE_LIVE_LOCAL_OPTION,
+  type BackendAdapter
+} from "@joko/core";
 import { operationBodyHash, type OperationRecord } from "@joko/store";
 import { describe, expect, it, vi } from "vitest";
 
@@ -103,18 +108,26 @@ describe("Connect Maker Memory owner and reset scopes", () => {
         ? current.backendEnabled
         : { ...current.backendEnabled, [patch.backendId!]: patch.backendEnabled }
     }));
+    const descriptor = {
+      id: "native-memory",
+      capabilities: new Map([["memory.native", {
+        key: "memory.native",
+        supported: true,
+        options: [MEMORY_NATIVE_LIVE_LOCAL_OPTION, MEMORY_NATIVE_DEFAULT_DISABLED_OPTION]
+      }]])
+    };
     const store = {
       findOperation: () => undefined,
       setSetting,
-      getBackend: (backendId: string) => ({ descriptor: {
-        id: backendId,
-        capabilities: new Map([["memory.native", { key: "memory.native", supported: true }]])
-      } })
+      getBackend: () => ({ descriptor }),
+      listBackends: () => [{ descriptor }],
+      appendDiagnostic: vi.fn()
     };
+    const reconcileNativeMemory = vi.fn(async () => "immediate" as const);
     const services = createConnectServices(stubApplication({
       store,
       makerMemory: { patchedSettings, reconcileSettingsChange },
-      sessionHost: immediateHost(store)
+      sessionHost: immediateHost(store, { id: descriptor.id, reconcileNativeMemory } as unknown as BackendAdapter)
     }));
 
     await expect(submitMemoryUpdate(services.operation.submitOperation, {
@@ -139,6 +152,60 @@ describe("Connect Maker Memory owner and reset scopes", () => {
       backendEnabled: { "native-memory": false }
     });
     expect(reconcileSettingsChange).toHaveBeenCalledOnce();
+    expect(reconcileNativeMemory).toHaveBeenCalledOnce();
+    expect(store.appendDiagnostic).not.toHaveBeenCalled();
+  });
+
+  it("keeps the durable native-memory choice and records a content-free diagnostic when live reconcile fails", async () => {
+    const current = { format: 1 as const, makerEnabled: false, backendEnabled: {} as Readonly<Record<string, boolean>> };
+    const descriptor = {
+      id: "native-memory",
+      capabilities: new Map([["memory.native", {
+        key: "memory.native",
+        supported: true,
+        options: [MEMORY_NATIVE_LIVE_LOCAL_OPTION, MEMORY_NATIVE_DEFAULT_DISABLED_OPTION]
+      }]])
+    };
+    const setSetting = vi.fn();
+    const appendDiagnostic = vi.fn();
+    const store = {
+      findOperation: () => undefined,
+      setSetting,
+      getBackend: () => ({ descriptor }),
+      listBackends: () => [{ descriptor }],
+      appendDiagnostic
+    };
+    const services = createConnectServices(stubApplication({
+      store,
+      makerMemory: {
+        patchedSettings: (patch: { readonly backendId?: string; readonly backendEnabled?: boolean }) => ({
+          ...current,
+          backendEnabled: { [patch.backendId!]: patch.backendEnabled! }
+        }),
+        reconcileSettingsChange: vi.fn(async () => true)
+      },
+      sessionHost: immediateHost(store, {
+        id: descriptor.id,
+        reconcileNativeMemory: async () => { throw new Error("private runtime failure"); }
+      } as unknown as BackendAdapter)
+    }));
+
+    await expect(submitMemoryUpdate(services.operation.submitOperation, {
+      operationId: "memory-native-live-reconcile-failure",
+      connectionId: owner.id,
+      backendId: descriptor.id,
+      backendEnabled: true
+    })).resolves.toBeDefined();
+    expect(setSetting).toHaveBeenCalledWith("service", "orchestrator", "settings.memory", {
+      format: 1,
+      makerEnabled: false,
+      backendEnabled: { "native-memory": true }
+    });
+    expect(appendDiagnostic).toHaveBeenCalledWith(expect.objectContaining({
+      code: "NATIVE_MEMORY_RECONCILIATION_FAILED",
+      details: { backendIds: ["native-memory"] }
+    }));
+    expect(JSON.stringify(appendDiagnostic.mock.calls)).not.toContain("private runtime failure");
   });
 
   it("rejects ambiguous reset scopes before deleting anything", async () => {
@@ -188,7 +255,7 @@ function stubApplication(overrides: Record<string, unknown>): OrchestratorApplic
   } as unknown as OrchestratorApplication;
 }
 
-function immediateHost(store: object) {
+function immediateHost(store: object, adapter?: BackendAdapter) {
   return {
     mutate: async (input: {
       operationId: string;
@@ -211,6 +278,13 @@ function immediateHost(store: object) {
         revision: 1n
       };
       return { replayed: false, value, operation };
+    },
+    invokeBackendAdapter: async <T>(
+      backendId: string,
+      effect: (value: BackendAdapter, generation: number) => T | Promise<T>
+    ): Promise<T> => {
+      if (adapter === undefined || adapter.id !== backendId) throw new Error("Backend adapter unavailable");
+      return await effect(adapter, 1);
     }
   };
 }

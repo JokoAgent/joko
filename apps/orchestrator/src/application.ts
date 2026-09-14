@@ -941,6 +941,7 @@ export async function createOrchestratorApplication(
               toolPolicies.enabledForSession(sessionId, targetId, policyId)
           })
         }),
+        resolveNativeMemoryEnabled: () => makerMemory.nativeEnabledForBackend(instanceId, false),
         managedProviders: managedRuntime(instanceId, generation, CODEX_MANAGED_PROVIDER_SUPPORT),
         appServer: {
           transport: {

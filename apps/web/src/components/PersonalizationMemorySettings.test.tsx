@@ -94,6 +94,7 @@ describe("PersonalizationMemorySettings", () => {
   it("keeps Backend-native memory mutually exclusive with Maker Memory and hides an unimplemented reset", async () => {
     const update = vi.fn(async () => undefined);
     const controller = { updateMemorySettings: update } as unknown as AppController;
+    const onSuccess = vi.fn();
     const blocked = await render(controller, nativeSnapshot(true), () => undefined);
     expect(blocked.textContent).toContain("Uses Claude Code's private native memory across tasks.");
     expect(blocked.textContent).toContain("Turn off Maker Memory to configure Backend-native memory.");
@@ -105,6 +106,14 @@ describe("PersonalizationMemorySettings", () => {
     expect(toggle.disabled).toBe(false);
     await act(async () => toggle.click());
     expect(update).toHaveBeenCalledWith({ backendId: "claude-code", backendEnabled: false });
+
+    const live = await render(controller, nativeSnapshot(false, true), undefined, onSuccess);
+    expect(live.textContent).toContain("Active local sessions update immediately");
+    expect(live.textContent).toContain("Remote hosts keep their own setting.");
+    const liveToggle = live.querySelector<HTMLButtonElement>('button[aria-label="Toggle Codex Auto Memory"]')!;
+    await act(async () => liveToggle.click());
+    expect(update).toHaveBeenCalledWith({ backendId: "codex", backendEnabled: false });
+    expect(onSuccess).toHaveBeenLastCalledWith("Codex Auto Memory disabled");
   });
 });
 
@@ -154,30 +163,34 @@ function snapshot(makerEnabled: boolean): AppSnapshot {
           reason: "",
           entryCount: 2,
           kind: "compaction_digest",
-          resettable: true
+          resettable: true,
+          updatesActiveLocalSessions: false
         }]
       }
     }
   };
 }
 
-function nativeSnapshot(makerEnabled: boolean): AppSnapshot {
+function nativeSnapshot(makerEnabled: boolean, updatesActiveLocalSessions = false): AppSnapshot {
   const value = snapshot(makerEnabled);
+  const backendId = updatesActiveLocalSessions ? "codex" : "claude-code";
+  const name = updatesActiveLocalSessions ? "Codex" : "Claude Code";
   return {
     ...value,
-    backends: [{ ...value.backends[0]!, id: "claude-code", name: "Claude Code" }],
+    backends: [{ ...value.backends[0]!, id: backendId, name }],
     settings: {
       ...value.settings,
       memory: {
         ...value.settings.memory,
         backends: [{
-          backendId: "claude-code",
+          backendId,
           enabled: true,
           supported: true,
           reason: "",
           entryCount: 0,
           kind: "native_auto_memory",
-          resettable: false
+          resettable: false,
+          updatesActiveLocalSessions
         }]
       }
     }

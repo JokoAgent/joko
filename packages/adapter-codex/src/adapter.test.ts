@@ -484,7 +484,8 @@ describe("CodexBackendAdapter", () => {
       turns: [],
       status: { type: "idle" },
       createdAt: 1,
-      updatedAt: 1
+      updatedAt: 1,
+      config: {}
     });
     await expect(setup.fake.requestCommandApproval(threadId, "turn-unowned")).resolves.toEqual({ decision: "cancel" });
   });
@@ -501,7 +502,8 @@ describe("CodexBackendAdapter", () => {
       turns: [],
       status: { type: "idle" },
       createdAt: 1,
-      updatedAt: 1
+      updatedAt: 1,
+      config: {}
     });
     await expect(setup.fake.requestCommandApproval(threadId, "turn-unowned", ["accept"]))
       .rejects.toMatchObject({ rpcCode: -32602 });
@@ -951,7 +953,8 @@ describe("CodexBackendAdapter", () => {
       turns: [],
       status: { type: "idle" },
       createdAt: 1,
-      updatedAt: 1
+      updatedAt: 1,
+      config: {}
     });
     const discovered = await setup.adapter.listNativeSessions(setup.target);
     expect(discovered.map((candidate) => candidate.nativeSessionId)).toEqual([binding.nativeSessionId]);
@@ -1008,6 +1011,34 @@ describe("CodexBackendAdapter", () => {
     ]));
     expect(setup.localFake.transport).toBeUndefined();
     expect(setup.resolveRemote).toHaveBeenCalled();
+  });
+
+  it("leaves remote Codex native-memory policy owned by the remote host", async () => {
+    const resolveNativeMemoryEnabled = vi.fn(() => true);
+    const setup = await createRemoteSetup({ resolveNativeMemoryEnabled });
+    const nativeSessionId = setup.remoteFake.seedThread("/srv/joko-project");
+    const candidate = (await setup.adapter.listNativeSessions(setup.target))[0]!;
+    const binding = await setup.adapter.resolveNativeSessionReference(candidate.nativeReference, setup.target, 1);
+    await setup.adapter.resumeSession(binding, context(setup.target, [], {
+      binding,
+      backendInstanceGeneration: 7
+    }));
+    expect(resolveNativeMemoryEnabled).not.toHaveBeenCalled();
+    expect(setup.remoteFake.transport!.requests.some((request) =>
+      request.method === "experimentalFeature/enablement/set")).toBe(false);
+    expect(setup.remoteFake.memoryEnabledForThread(nativeSessionId)).toBe(false);
+    await setup.adapter.send(prompt("remote host memory"), context(setup.target, [], {
+      binding,
+      backendInstanceGeneration: 7,
+      operationId: "remote-host-memory"
+    }));
+    expect(setup.remoteFake.transport!.requests.findLast((request) => request.method === "turn/start")?.params)
+      .toMatchObject({
+        sandboxPolicy: {
+          type: "workspaceWrite",
+          writableRoots: ["/private/memories"]
+        }
+      });
   });
 
   it("isolates remote MCP config and fences calls to the active native thread without replacing a busy runtime", async () => {
@@ -2216,6 +2247,182 @@ describe("CodexBackendAdapter", () => {
     })).toThrow("Codex Host-composed capability is invalid");
   });
 
+  it("owns Codex native memory through durable local reconcile while keeping Review and remote policy isolated", async () => {
+    let enabled = false;
+    const resolveNativeMemoryEnabled = vi.fn(async () => enabled);
+    const setup = await createSetup(7, { resolveNativeMemoryEnabled });
+
+    await expect(setup.adapter.reconcileNativeMemory()).resolves.toBe("next_session");
+    expect(setup.fake.transport).toBeUndefined();
+    const descriptor = await setup.adapter.describe();
+    expect(descriptor.capabilities.get("memory.native")).toEqual({
+      key: "memory.native",
+      supported: true,
+      options: ["live_local", "default_disabled"]
+    });
+
+    const binding = await setup.adapter.createSession(
+      sessionInput(setup.target),
+      context(setup.target, [], { backendInstanceGeneration: 7 })
+    );
+    const transport = setup.fake.transport!;
+    const initialOverride = transport.requests.findIndex((request) =>
+      request.method === "experimentalFeature/enablement/set");
+    const initialStart = transport.requests.findIndex((request) => request.method === "thread/start");
+    expect(initialOverride).toBeGreaterThan(-1);
+    expect(initialOverride).toBeLessThan(initialStart);
+    expect(transport.requests[initialOverride]?.params).toEqual({ enablement: { memories: false } });
+    expect(setup.fake.memoryEnabledForThread(binding.nativeSessionId!)).toBe(false);
+    await setup.adapter.send(prompt("memory sandbox"), context(setup.target, [], {
+      binding,
+      backendInstanceGeneration: 7,
+      operationId: "memory-sandbox"
+    }));
+    expect(transport.requests.findLast((request) => request.method === "turn/start")?.params)
+      .toMatchObject({
+        sandboxPolicy: {
+          type: "workspaceWrite",
+          writableRoots: ["/private/memories"]
+        }
+      });
+    await setup.fake.completeTurn(binding.nativeSessionId!, "memory sandbox ready");
+
+    enabled = true;
+    await expect(setup.adapter.reconcileNativeMemory()).resolves.toBe("immediate");
+    expect(setup.fake.memoryEnabledForThread(binding.nativeSessionId!)).toBe(true);
+
+    const reviewContext: AdapterContext = {
+      ...context(setup.target, [], { backendInstanceGeneration: 7 }),
+      sessionId: "session-codex-review",
+      runtimePolicy: "review_read_only",
+      extraDirectories: []
+    };
+    const reviewBinding = await setup.adapter.createSession({
+      ...sessionInput(setup.target),
+      nativeStart: { kind: "new" },
+      runtimePolicy: "review_read_only"
+    }, reviewContext);
+    expect(setup.fake.memoryEnabledForThread(reviewBinding.nativeSessionId!)).toBe(false);
+
+    enabled = false;
+    await setup.adapter.reconcileNativeMemory();
+    expect(setup.fake.memoryEnabledForThread(binding.nativeSessionId!)).toBe(false);
+    expect(setup.fake.memoryEnabledForThread(reviewBinding.nativeSessionId!)).toBe(false);
+
+    let releaseFirst!: () => void;
+    let markFirstStarted!: () => void;
+    const firstStarted = new Promise<void>((resolve) => { markFirstStarted = resolve; });
+    const release = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const request = transport.request.bind(transport);
+    let blockNext = true;
+    vi.spyOn(transport, "request").mockImplementation(async (method, params, options) => {
+      if (method === "experimentalFeature/enablement/set" && blockNext) {
+        blockNext = false;
+        markFirstStarted();
+        await release;
+      }
+      return request(method, params, options);
+    });
+    enabled = true;
+    const older = setup.adapter.reconcileNativeMemory();
+    await firstStarted;
+    enabled = false;
+    const newer = setup.adapter.reconcileNativeMemory();
+    releaseFirst();
+    await Promise.all([older, newer]);
+    const reconciles = transport.requests
+      .filter((request) => request.method === "experimentalFeature/enablement/set")
+      .slice(-2)
+      .map((request) => request.params);
+    expect(reconciles).toEqual([
+      { enablement: { memories: true } },
+      { enablement: { memories: false } }
+    ]);
+    expect(setup.fake.nativeMemoryEnabled).toBe(false);
+
+    await setup.fake.transport!.exit(false);
+    enabled = true;
+    await expect(setup.adapter.reconcileNativeMemory()).resolves.toBe("next_session");
+    const restartedContext = {
+      ...context(setup.target, [], { backendInstanceGeneration: 7 }),
+      sessionId: "session-codex-after-memory-restart"
+    };
+    await setup.adapter.createSession(sessionInput(setup.target), restartedContext);
+    const restartedRequests = setup.fake.transport!.requests;
+    const restartedOverride = restartedRequests.findIndex((request) =>
+      request.method === "experimentalFeature/enablement/set");
+    const restartedStart = restartedRequests.findIndex((request) => request.method === "thread/start");
+    expect(restartedOverride).toBeGreaterThan(-1);
+    expect(restartedOverride).toBeLessThan(restartedStart);
+    expect(restartedRequests[restartedOverride]?.params).toEqual({ enablement: { memories: true } });
+  });
+
+  it("fails closed before native Session mutation when Codex memory authority or acknowledgement is unavailable", async () => {
+    const unavailable = await createSetup(7, {
+      resolveNativeMemoryEnabled: async () => { throw new Error("private setting failure"); }
+    });
+    await expect(unavailable.adapter.createSession(
+      sessionInput(unavailable.target),
+      context(unavailable.target, [], { backendInstanceGeneration: 7 })
+    )).rejects.toMatchObject({
+      publicError: {
+        code: "CODEX_NATIVE_MEMORY_SETTING_UNAVAILABLE",
+        stateMayHaveChanged: false
+      }
+    });
+    expect(unavailable.fake.transport?.requests.some((request) => request.method === "thread/start")).toBe(false);
+
+    const malformed = await createSetup(7, { resolveNativeMemoryEnabled: () => true });
+    malformed.fake.malformedNextNativeMemoryEnablement = true;
+    await expect(malformed.adapter.createSession(
+      sessionInput(malformed.target),
+      context(malformed.target, [], { backendInstanceGeneration: 7 })
+    )).rejects.toMatchObject({
+      publicError: {
+        code: "CODEX_NATIVE_MEMORY_ACK_INVALID",
+        stateMayHaveChanged: true
+      }
+    });
+    expect(malformed.fake.transport?.requests.some((request) => request.method === "thread/start")).toBe(false);
+  });
+
+  it.each([
+    {
+      boundary: "an unaudited app-server version",
+      configure: (fake: FakeCodexAppServer) => { fake.userAgent = "codex/0.153.5"; }
+    },
+    {
+      boundary: "a non-absolute codexHome",
+      configure: (fake: FakeCodexAppServer) => { fake.codexHome = "relative-private"; }
+    }
+  ])("keeps native memory unavailable without disturbing standard Codex for $boundary", async ({ configure }) => {
+    const resolveNativeMemoryEnabled = vi.fn(() => true);
+    const setup = await createSetup(7, { resolveNativeMemoryEnabled });
+    configure(setup.fake);
+
+    const descriptor = await setup.adapter.describe();
+    expect(descriptor.capabilities.get("memory.native")).toEqual({
+      key: "memory.native",
+      supported: false,
+      reason: "upstream_missing"
+    });
+    const binding = await setup.adapter.createSession(
+      sessionInput(setup.target),
+      context(setup.target, [], { backendInstanceGeneration: 7 })
+    );
+    await setup.adapter.send(prompt("standard Codex remains available"), context(setup.target, [], {
+      binding,
+      backendInstanceGeneration: 7,
+      operationId: "unsupported-native-memory"
+    }));
+
+    expect(resolveNativeMemoryEnabled).not.toHaveBeenCalled();
+    expect(setup.fake.transport?.requests.some((request) =>
+      request.method === "experimentalFeature/enablement/set")).toBe(false);
+    expect(setup.fake.transport?.requests.findLast((request) => request.method === "turn/start")?.params)
+      .not.toHaveProperty("sandboxPolicy");
+  });
+
   it("runs Review through a fresh native profile with only bounded Host-owned readers", async () => {
     const setup = await createSetup();
     const skillPath = join(setup.target.workspaceRoot, "review-skill.md");
@@ -3143,6 +3350,7 @@ async function createSetup(
 
 async function createRemoteSetup(options: {
   readonly openMcpBridge?: CodexRemoteRuntime["openMcpBridge"];
+  readonly resolveNativeMemoryEnabled?: CodexAdapterOptions["resolveNativeMemoryEnabled"];
 } = {}) {
   const serviceRoot = await realpath(await mkdtemp(join(tmpdir(), "joko-codex-remote-target-")));
   const localFake = new FakeCodexAppServer();
@@ -3167,7 +3375,10 @@ async function createRemoteSetup(options: {
       resolve: resolveRemote,
       shutdown: async () => remoteHost.shutdown(),
       forceShutdown: async () => remoteHost.forceShutdown()
-    }
+    },
+    ...(options.resolveNativeMemoryEnabled === undefined
+      ? {}
+      : { resolveNativeMemoryEnabled: options.resolveNativeMemoryEnabled })
   });
   const target: TargetDescriptor = {
     id: "target-codex",

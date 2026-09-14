@@ -8,6 +8,8 @@ import {
   CapabilityDrivenBackendAdapter,
   HOST_COMPOSED_CAPABILITIES,
   JokoError,
+  MEMORY_NATIVE_DEFAULT_DISABLED_OPTION,
+  MEMORY_NATIVE_LIVE_LOCAL_OPTION,
   type AdapterContext,
   type BackendDescriptor,
   type Capability,
@@ -108,6 +110,8 @@ export interface CodexAdapterOptions extends CodexInputResolvers {
   readonly catalogProfileDirectories?: readonly string[];
   /** Owner-private resolver for a Target-bound remote Codex runtime. */
   readonly remoteRuntimes?: CodexRemoteRuntimePort;
+  /** Durable service-owned effective preference for Codex native memory. */
+  readonly resolveNativeMemoryEnabled?: () => boolean | Promise<boolean>;
 }
 
 export interface CodexRemoteRuntime {
@@ -227,6 +231,7 @@ interface SessionRuntime {
   readonly nativeTasks: CodexNativeTaskProjection;
   readonly remoteMcp?: CodexRemoteMcpRuntimeLease;
   readonly nativeConfiguration?: JsonObject;
+  readonly nativeMemoryDirectory?: string;
   providerId?: string;
   modelId?: string;
   effort?: string;
@@ -418,7 +423,14 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   readonly #catalogSources = new Map<string, CodexCatalogSource>();
   readonly #catalogEntrySources = new WeakMap<NativeSessionCatalogEntry, CodexCatalogSource>();
   readonly #remoteRuntimes: CodexRemoteRuntimePort | undefined;
+  readonly #resolveNativeMemoryEnabled: CodexAdapterOptions["resolveNativeMemoryEnabled"];
   #catalogMaterializationTail: Promise<void> = Promise.resolve();
+  #nativeMemoryReconcileTail: Promise<void> = Promise.resolve();
+  #nativeMemoryOverride: {
+    readonly host: AppServerHost;
+    readonly hostGeneration: number;
+    readonly enabled: boolean;
+  } | undefined;
   readonly #sessions = new Map<string, SessionRuntime>();
   readonly #sessionMutations = new Map<string, { count: number; rewinding: boolean }>();
   #models: readonly ProviderModel[] = [];
@@ -476,6 +488,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       ? undefined
       : [...options.catalogProfileDirectories];
     this.#remoteRuntimes = options.remoteRuntimes;
+    this.#resolveNativeMemoryEnabled = options.resolveNativeMemoryEnabled;
     if (!Number.isSafeInteger(this.#instanceGeneration) || this.#instanceGeneration < 1) {
       throw new TypeError("Codex Backend instance generation must be a positive integer.");
     }
@@ -556,6 +569,26 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     });
   }
 
+  async reconcileNativeMemory(): Promise<"immediate" | "next_session"> {
+    if (this.#resolveNativeMemoryEnabled === undefined) return this.unsupported("memory.native");
+    return this.#withNativeMemoryReconcile(async () => {
+      this.#assertOpen();
+      const hostGeneration = this.#host.generation;
+      if (this.#host.initializeResult === undefined || !this.#host.isActiveGeneration(hostGeneration)) {
+        return "next_session";
+      }
+      if (!supportsNativeMemoryRuntime(this.#host)) return this.unsupported("memory.native");
+      const enabled = await this.#readNativeMemoryPreference();
+      this.#assertOpen();
+      return this.#applyNativeMemoryPreference(
+        this.#host,
+        enabled,
+        false,
+        () => this.#assertOpen()
+      );
+    });
+  }
+
   async validateTarget(target: TargetDescriptor): Promise<void> {
     await this.#readScope(target);
   }
@@ -600,6 +633,12 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       reviewThreadProfile = reviewWorkingDirectory === undefined
         ? undefined
         : await this.#buildReviewThreadProfile(cwd, reviewWorkingDirectory);
+    } catch (error) {
+      if (reviewWorkingDirectory !== undefined) await removeReviewWorkingDirectory(reviewWorkingDirectory);
+      throw error;
+    }
+    try {
+      await this.#prepareNativeMemory(scope, runtimePolicy, context.signal);
     } catch (error) {
       if (reviewWorkingDirectory !== undefined) await removeReviewWorkingDirectory(reviewWorkingDirectory);
       throw error;
@@ -743,6 +782,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       current.context = context;
       return stateFromRuntime(current);
     }
+    await this.#prepareNativeMemory(inspection.scope, "standard", context.signal);
     const managedRoute = inspection.scope.remote
       ? undefined
       : await this.#prepareManagedRoute(context.modelSelection?.providerId, context.modelSelection?.modelId, context);
@@ -1195,7 +1235,17 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
               runtimeWorkspaceRoots: [runtime.targetWorkspaceRoot],
               serviceTierForTurn: "default"
             }
-          : runtime.fastMode ? { serviceTier: "fast" } : {})
+          : {
+              ...(runtime.fastMode ? { serviceTier: "fast" } : {}),
+              ...(runtime.permissionMode === "bypassPermissions" || runtime.nativeMemoryDirectory === undefined
+                ? {}
+                : {
+                    sandboxPolicy: {
+                      type: "workspaceWrite",
+                      writableRoots: [runtime.nativeMemoryDirectory]
+                    }
+                  })
+            })
       }, { mutation: true, signal: dispatchSignal, beforeDispatch: assertNativeDispatchReady });
       this.#assertRuntimeFence(runtime, context, response.hostGeneration);
       acceptedResponseShapePending = true;
@@ -2803,6 +2853,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const seededDescendants = input.context.runtimePolicy === "review_read_only"
       ? []
       : nativeTasks.seed(input.thread);
+    const nativeMemoryDirectory = input.context.runtimePolicy === "review_read_only"
+      || !supportsNativeMemoryRuntime(input.scope.host)
+      ? undefined
+      : codexNativeMemoryDirectory(input.scope.host);
     const runtime: SessionRuntime = {
       host: input.scope.host,
       profileKey: input.scope.profileKey,
@@ -2827,6 +2881,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       nativeTasks,
       ...(input.remoteMcp === undefined ? {} : { remoteMcp: input.remoteMcp }),
       ...(input.nativeConfiguration === undefined ? {} : { nativeConfiguration: input.nativeConfiguration }),
+      ...(nativeMemoryDirectory === undefined ? {} : { nativeMemoryDirectory }),
       ...(input.providerId === undefined ? {} : { providerId: input.providerId }),
       ...(input.modelId === undefined ? {} : { modelId: input.modelId }),
       ...(input.effort === undefined ? {} : { effort: input.effort }),
@@ -3670,6 +3725,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       "interaction.question"
     ]);
     if (this.#managedProviders !== undefined) supported.add("provider.managed_catalog");
+    if (this.#resolveNativeMemoryEnabled !== undefined && supportsNativeMemoryRuntime(this.#host)) {
+      supported.add("memory.native");
+    }
     if (this.#models.some((model) => model.thinkingLevels.length > 0)) supported.add("model.effort");
     if (this.#models.some((model) => model.supportsFastMode)) supported.add("model.fast_mode");
     if (this.#account?.supportsLogin === true) supported.add("provider.login");
@@ -3697,6 +3755,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           ? { reason: "upstream_missing" as const }
           : key === "review.isolated" && !isolatedReviewSupported
             ? { reason: "upstream_missing" as const }
+          : key === "memory.native" && this.#resolveNativeMemoryEnabled !== undefined
+              && !supportsNativeMemoryRuntime(this.#host)
+            ? { reason: "upstream_missing" as const }
           : (key === "plan_mode"
               || key === "interaction.plan_review"
               || key === "background.tasks"
@@ -3714,6 +3775,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           : {}),
         ...(key === "provider.login" && this.#account?.supportsLogin === true
           ? { options: [...this.#account.loginMethods] }
+          : {}),
+        ...(key === "memory.native" && available && this.#resolveNativeMemoryEnabled !== undefined
+          && supportsNativeMemoryRuntime(this.#host)
+          ? { options: [MEMORY_NATIVE_LIVE_LOCAL_OPTION, MEMORY_NATIVE_DEFAULT_DISABLED_OPTION] }
           : {})
       }];
     }));
@@ -4003,6 +4068,128 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       });
     }
     return this.#requestFailure(error, "provision", "CODEX_NATIVE_SESSION_UNAVAILABLE", false);
+  }
+
+  async #prepareNativeMemory(
+    scope: CodexReadScope,
+    runtimePolicy: "standard" | "review_read_only",
+    signal?: AbortSignal
+  ): Promise<void> {
+    if (scope.remote || runtimePolicy === "review_read_only" || this.#resolveNativeMemoryEnabled === undefined) return;
+    await this.#withNativeMemoryReconcile(async () => {
+      scope.assertCurrent();
+      try {
+        await scope.host.ensureStarted();
+      } catch (error) {
+        throw this.#requestFailure(error, "provision", "CODEX_NATIVE_MEMORY_RECONCILE_FAILED", false);
+      }
+      scope.assertCurrent();
+      if (!supportsNativeMemoryRuntime(scope.host)) return;
+      const enabled = await this.#readNativeMemoryPreference();
+      scope.assertCurrent();
+      await this.#applyNativeMemoryPreference(scope.host, enabled, true, scope.assertCurrent, signal);
+    });
+  }
+
+  async #readNativeMemoryPreference(): Promise<boolean> {
+    const resolver = this.#resolveNativeMemoryEnabled;
+    if (resolver === undefined) return false;
+    let enabled: unknown;
+    try {
+      enabled = await resolver();
+    } catch (error) {
+      if (error instanceof Error && "publicError" in error) throw error;
+      throw adapterError({
+        code: "CODEX_NATIVE_MEMORY_SETTING_UNAVAILABLE",
+        message: "The durable Codex native-memory setting could not be resolved.",
+        phase: "provision",
+        retryable: true,
+        stateMayHaveChanged: false,
+        recovery: "Restore the Orchestrator settings owner before starting a Codex Session."
+      });
+    }
+    if (typeof enabled !== "boolean") {
+      throw adapterError({
+        code: "CODEX_NATIVE_MEMORY_SETTING_INVALID",
+        message: "The durable Codex native-memory setting is invalid.",
+        phase: "provision",
+        retryable: false,
+        stateMayHaveChanged: false,
+        recovery: "Repair the current v1 Memory setting before starting a Codex Session."
+      });
+    }
+    return enabled;
+  }
+
+  async #applyNativeMemoryPreference(
+    host: AppServerHost,
+    enabled: boolean,
+    startIfNeeded: boolean,
+    assertCurrent: () => void,
+    signal?: AbortSignal
+  ): Promise<"immediate" | "next_session"> {
+    assertCurrent();
+    const observedGeneration = host.generation;
+    const running = host.initializeResult !== undefined && host.isActiveGeneration(observedGeneration);
+    if (!running && !startIfNeeded) return "next_session";
+    if (running
+      && this.#nativeMemoryOverride?.host === host
+      && this.#nativeMemoryOverride.hostGeneration === observedGeneration
+      && this.#nativeMemoryOverride.enabled === enabled) return "immediate";
+    let response;
+    try {
+      response = await host.request("experimentalFeature/enablement/set", {
+        enablement: { memories: enabled }
+      }, {
+        mutation: true,
+        signal,
+        beforeDispatch: assertCurrent
+      });
+    } catch (error) {
+      throw this.#requestFailure(
+        error,
+        startIfNeeded ? "provision" : "dispatch",
+        "CODEX_NATIVE_MEMORY_RECONCILE_FAILED",
+        true
+      );
+    }
+    assertCurrent();
+    let acknowledged = false;
+    try {
+      const record = objectValue(response.value, "native memory response");
+      const enablement = objectValue(record["enablement"], "native memory enablement");
+      acknowledged = enablement["memories"] === enabled;
+    } catch {
+      acknowledged = false;
+    }
+    if (!acknowledged) {
+      throw adapterError({
+        code: "CODEX_NATIVE_MEMORY_ACK_INVALID",
+        message: "Codex did not confirm the requested native-memory state.",
+        phase: startIfNeeded ? "provision" : "dispatch",
+        retryable: false,
+        stateMayHaveChanged: true,
+        recovery: "Refresh the Backend and inspect native memory state before explicitly retrying."
+      });
+    }
+    this.#nativeMemoryOverride = {
+      host,
+      hostGeneration: response.hostGeneration,
+      enabled
+    };
+    return "immediate";
+  }
+
+  async #withNativeMemoryReconcile<T>(work: () => Promise<T>): Promise<T> {
+    const previous = this.#nativeMemoryReconcileTail;
+    let release!: () => void;
+    this.#nativeMemoryReconcileTail = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      return await work();
+    } finally {
+      release();
+    }
   }
 
   async #withCatalogMaterializationLock<T>(work: () => Promise<T>): Promise<T> {
@@ -4978,6 +5165,24 @@ function isNormalizedAbsolutePosixPath(value: string): boolean {
     && !/[\u0000-\u001f\u007f\\]/u.test(value)
     && posixPath.isAbsolute(value)
     && posixPath.normalize(value) === value;
+}
+
+function codexNativeMemoryDirectory(host: AppServerHost): string | undefined {
+  const codexHome = host.initializeResult?.codexHome;
+  if (codexHome === undefined
+    || codexHome.length > 16_384
+    || /[\u0000-\u001f\u007f]/u.test(codexHome)) return undefined;
+  if (codexHome.startsWith("/")) {
+    return isNormalizedAbsolutePosixPath(codexHome)
+      ? posixPath.join(codexHome, "memories")
+      : undefined;
+  }
+  return isAbsolute(codexHome) ? join(resolve(codexHome), "memories") : undefined;
+}
+
+function supportsNativeMemoryRuntime(host: AppServerHost): boolean {
+  return versionFromUserAgent(host.initializeResult?.userAgent) === AUDITED_APP_SERVER_VERSION
+    && codexNativeMemoryDirectory(host) !== undefined;
 }
 
 function validExecutionDomain(value: string): boolean {

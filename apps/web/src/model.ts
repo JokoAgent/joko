@@ -3700,6 +3700,7 @@ export interface SettingsView {
       readonly entryCount: number;
       readonly kind: "compaction_digest" | "native_auto_memory";
       readonly resettable: boolean;
+      readonly updatesActiveLocalSessions: boolean;
     }[];
   };
   readonly visionBridge: {

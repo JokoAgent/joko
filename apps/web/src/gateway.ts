@@ -14043,7 +14043,8 @@ function mapSettings(settings: SettingsSnapshot | undefined): SettingsView {
         reason: backend.reason,
         entryCount: numberValue(backend.entryCount),
         kind: backendMemoryKind(backend.kind),
-        resettable: backend.resettable
+        resettable: backend.resettable,
+        updatesActiveLocalSessions: backend.updatesActiveLocalSessions
       }))
     },
     visionBridge: {
