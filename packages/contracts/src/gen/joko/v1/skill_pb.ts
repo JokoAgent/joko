@@ -8,7 +8,7 @@ import type { Timestamp } from "@bufbuild/protobuf/wkt";
 import { file_google_protobuf_timestamp } from "@bufbuild/protobuf/wkt";
 import type { EntityVersion, Revision } from "./common_pb.js";
 import { file_joko_v1_common } from "./common_pb.js";
-import type { ResourceScope, ResourceState } from "./settings_pb.js";
+import type { ResourceAcquisitionKind, ResourceScope, ResourceState } from "./settings_pb.js";
 import { file_joko_v1_settings } from "./settings_pb.js";
 import type { Message } from "@bufbuild/protobuf";
 
@@ -16,7 +16,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file joko/v1/skill.proto.
  */
 export const file_joko_v1_skill: GenFile = /*@__PURE__*/
-  fileDesc("ChNqb2tvL3YxL3NraWxsLnByb3RvEgdqb2tvLnYxIp0DCg9Ta2lsbERlc2NyaXB0b3ISEAoIc2tpbGxfaWQYASABKAkSEgoKYmFja2VuZF9pZBgCIAEoCRIRCgl0YXJnZXRfaWQYAyABKAkSJQoFc2NvcGUYBCABKA4yFi5qb2tvLnYxLlJlc291cmNlU2NvcGUSDAoEbmFtZRgFIAEoCRIUCgxzb3VyY2VfbGFiZWwYBiABKAkSJQoFc3RhdGUYByABKA4yFi5qb2tvLnYxLlJlc291cmNlU3RhdGUSDwoHZW5hYmxlZBgIIAEoCBISCgpjYW5fdG9nZ2xlGAkgASgIEhkKEWNvbnRlbnRfYXZhaWxhYmxlGAogASgIEhAKCGNhbl9lZGl0GAsgASgIEhIKCmNhbl9kZWxldGUYDCABKAgSLgoOZW50aXR5X3ZlcnNpb24YDSABKAsyFi5qb2tvLnYxLkVudGl0eVZlcnNpb24SGQoRYXBwcm92ZWRfcmV2aXNpb24YDiABKAkSLgoKdXBkYXRlZF9hdBgPIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXAicgoNU2tpbGxNZXRhZGF0YRIMCgRuYW1lGAEgASgJEhMKC2Rlc2NyaXB0aW9uGAIgASgJEg8KB3ZlcnNpb24YAyABKAkSGAoQZnJvbnRtYXR0ZXJfanNvbhgEIAEoCRITCgtwYXJzZV9lcnJvchgFIAEoCSJxCg5Ta2lsbEZpbGVFbnRyeRILCgNrZXkYASABKAkSDAoEbmFtZRgCIAEoCRIkCgRraW5kGAMgASgOMhYuam9rby52MS5Ta2lsbEZpbGVLaW5kEgwKBHNpemUYBCABKAQSEAoIZWRpdGFibGUYBSABKAgiYgoQU2tpbGxGaWxlQ29udGVudBILCgNrZXkYASABKAkSDwoHY29udGVudBgCIAEoCRIQCghyZXZpc2lvbhgDIAEoCRIMCgRzaXplGAQgASgEEhAKCGVkaXRhYmxlGAUgASgIInAKD1NraWxsRGlmZkNoYW5nZRILCgNrZXkYASABKAkSKgoEa2luZBgCIAEoDjIcLmpva28udjEuU2tpbGxEaWZmQ2hhbmdlS2luZBIOCgZiaW5hcnkYAyABKAgSFAoMdW5pZmllZF9kaWZmGAQgASgJImwKCVNraWxsRGlmZhIRCglhdmFpbGFibGUYASABKAgSDgoGcmVhc29uGAIgASgJEikKB2NoYW5nZXMYAyADKAsyGC5qb2tvLnYxLlNraWxsRGlmZkNoYW5nZRIRCgl0cnVuY2F0ZWQYBCABKAgitgIKDFNraWxsU2Vzc2lvbhISCgpzZXNzaW9uX2lkGAEgASgJEicKBXNraWxsGAIgASgLMhguam9rby52MS5Ta2lsbERlc2NyaXB0b3ISGQoRb2JzZXJ2ZWRfcmV2aXNpb24YAyABKAkSDQoFZGlydHkYBCABKAgSGgoSYmFzZWxpbmVfYXZhaWxhYmxlGAUgASgIEigKCG1ldGFkYXRhGAYgASgLMhYuam9rby52MS5Ta2lsbE1ldGFkYXRhEhIKCmZpbGVfY291bnQYCCABKAQSDQoFYnl0ZXMYCSABKAQSIAoEZGlmZhgKIAEoCzISLmpva28udjEuU2tpbGxEaWZmEi4KCmV4cGlyZXNfYXQYCyABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wSgQIBxAIIp0CCgpTa2lsbERyYWZ0EhAKCGRyYWZ0X2lkGAEgASgJEhIKCnNlc3Npb25faWQYAiABKAkSEAoIc2tpbGxfaWQYAyABKAkSJQoEa2luZBgEIAEoDjIXLmpva28udjEuU2tpbGxEcmFmdEtpbmQSDAoEbmFtZRgFIAEoCRIsChFyZXNvdXJjZV9yZXZpc2lvbhgGIAEoCzIRLmpva28udjEuUmV2aXNpb24SGQoRb2JzZXJ2ZWRfcmV2aXNpb24YByABKAkSKQoHY2hhbmdlcxgIIAMoCzIYLmpva28udjEuU2tpbGxEaWZmQ2hhbmdlEi4KCmV4cGlyZXNfYXQYCSABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wIqACCg1Ta2lsbFJlY292ZXJ5EhMKC3JlY292ZXJ5X2lkGAEgASgJEhAKCHNraWxsX2lkGAIgASgJEhIKCmJhY2tlbmRfaWQYAyABKAkSEQoJdGFyZ2V0X2lkGAQgASgJEiUKBXNjb3BlGAUgASgOMhYuam9rby52MS5SZXNvdXJjZVNjb3BlEgwKBG5hbWUYBiABKAkSEAoIcmV2aXNpb24YByABKAkSDQoFZmlsZXMYCCABKAQSDQoFYnl0ZXMYCSABKAQSLgoKY3JlYXRlZF9hdBgKIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASLAoGc3RhdHVzGAsgASgOMhwuam9rby52MS5Ta2lsbFJlY292ZXJ5U3RhdHVzIm4KE1NraWxsTXV0YXRpb25SZXN1bHQSJwoFc2tpbGwYASABKAsyGC5qb2tvLnYxLlNraWxsRGVzY3JpcHRvchIZChFyZXBsYWNlZF9za2lsbF9pZBgCIAEoCRITCgtyZWNvdmVyeV9pZBgDIAEoCSppCg1Ta2lsbEZpbGVLaW5kEh8KG1NLSUxMX0ZJTEVfS0lORF9VTlNQRUNJRklFRBAAEh0KGVNLSUxMX0ZJTEVfS0lORF9ESVJFQ1RPUlkQARIYChRTS0lMTF9GSUxFX0tJTkRfRklMRRACKqgBChNTa2lsbERpZmZDaGFuZ2VLaW5kEiYKIlNLSUxMX0RJRkZfQ0hBTkdFX0tJTkRfVU5TUEVDSUZJRUQQABIgChxTS0lMTF9ESUZGX0NIQU5HRV9LSU5EX0FEREVEEAESIwofU0tJTExfRElGRl9DSEFOR0VfS0lORF9NT0RJRklFRBACEiIKHlNLSUxMX0RJRkZfQ0hBTkdFX0tJTkRfREVMRVRFRBADKmoKDlNraWxsRHJhZnRLaW5kEiAKHFNLSUxMX0RSQUZUX0tJTkRfVU5TUEVDSUZJRUQQABIZChVTS0lMTF9EUkFGVF9LSU5EX0VESVQQARIbChdTS0lMTF9EUkFGVF9LSU5EX1JFTkFNRRACKoABChNTa2lsbFJlY292ZXJ5U3RhdHVzEiUKIVNLSUxMX1JFQ09WRVJZX1NUQVRVU19VTlNQRUNJRklFRBAAEh8KG1NLSUxMX1JFQ09WRVJZX1NUQVRVU19SRUFEWRABEiEKHVNLSUxMX1JFQ09WRVJZX1NUQVRVU19NSVNTSU5HEAJiBnByb3RvMw", [file_google_protobuf_timestamp, file_joko_v1_common, file_joko_v1_settings]);
+  fileDesc("ChNqb2tvL3YxL3NraWxsLnByb3RvEgdqb2tvLnYxIp0DCg9Ta2lsbERlc2NyaXB0b3ISEAoIc2tpbGxfaWQYASABKAkSEgoKYmFja2VuZF9pZBgCIAEoCRIRCgl0YXJnZXRfaWQYAyABKAkSJQoFc2NvcGUYBCABKA4yFi5qb2tvLnYxLlJlc291cmNlU2NvcGUSDAoEbmFtZRgFIAEoCRIUCgxzb3VyY2VfbGFiZWwYBiABKAkSJQoFc3RhdGUYByABKA4yFi5qb2tvLnYxLlJlc291cmNlU3RhdGUSDwoHZW5hYmxlZBgIIAEoCBISCgpjYW5fdG9nZ2xlGAkgASgIEhkKEWNvbnRlbnRfYXZhaWxhYmxlGAogASgIEhAKCGNhbl9lZGl0GAsgASgIEhIKCmNhbl9kZWxldGUYDCABKAgSLgoOZW50aXR5X3ZlcnNpb24YDSABKAsyFi5qb2tvLnYxLkVudGl0eVZlcnNpb24SGQoRYXBwcm92ZWRfcmV2aXNpb24YDiABKAkSLgoKdXBkYXRlZF9hdBgPIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXAicgoNU2tpbGxNZXRhZGF0YRIMCgRuYW1lGAEgASgJEhMKC2Rlc2NyaXB0aW9uGAIgASgJEg8KB3ZlcnNpb24YAyABKAkSGAoQZnJvbnRtYXR0ZXJfanNvbhgEIAEoCRITCgtwYXJzZV9lcnJvchgFIAEoCSJxCg5Ta2lsbEZpbGVFbnRyeRILCgNrZXkYASABKAkSDAoEbmFtZRgCIAEoCRIkCgRraW5kGAMgASgOMhYuam9rby52MS5Ta2lsbEZpbGVLaW5kEgwKBHNpemUYBCABKAQSEAoIZWRpdGFibGUYBSABKAgiYgoQU2tpbGxGaWxlQ29udGVudBILCgNrZXkYASABKAkSDwoHY29udGVudBgCIAEoCRIQCghyZXZpc2lvbhgDIAEoCRIMCgRzaXplGAQgASgEEhAKCGVkaXRhYmxlGAUgASgIInAKD1NraWxsRGlmZkNoYW5nZRILCgNrZXkYASABKAkSKgoEa2luZBgCIAEoDjIcLmpva28udjEuU2tpbGxEaWZmQ2hhbmdlS2luZBIOCgZiaW5hcnkYAyABKAgSFAoMdW5pZmllZF9kaWZmGAQgASgJImwKCVNraWxsRGlmZhIRCglhdmFpbGFibGUYASABKAgSDgoGcmVhc29uGAIgASgJEikKB2NoYW5nZXMYAyADKAsyGC5qb2tvLnYxLlNraWxsRGlmZkNoYW5nZRIRCgl0cnVuY2F0ZWQYBCABKAgitgIKDFNraWxsU2Vzc2lvbhISCgpzZXNzaW9uX2lkGAEgASgJEicKBXNraWxsGAIgASgLMhguam9rby52MS5Ta2lsbERlc2NyaXB0b3ISGQoRb2JzZXJ2ZWRfcmV2aXNpb24YAyABKAkSDQoFZGlydHkYBCABKAgSGgoSYmFzZWxpbmVfYXZhaWxhYmxlGAUgASgIEigKCG1ldGFkYXRhGAYgASgLMhYuam9rby52MS5Ta2lsbE1ldGFkYXRhEhIKCmZpbGVfY291bnQYCCABKAQSDQoFYnl0ZXMYCSABKAQSIAoEZGlmZhgKIAEoCzISLmpva28udjEuU2tpbGxEaWZmEi4KCmV4cGlyZXNfYXQYCyABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wSgQIBxAIIp0CCgpTa2lsbERyYWZ0EhAKCGRyYWZ0X2lkGAEgASgJEhIKCnNlc3Npb25faWQYAiABKAkSEAoIc2tpbGxfaWQYAyABKAkSJQoEa2luZBgEIAEoDjIXLmpva28udjEuU2tpbGxEcmFmdEtpbmQSDAoEbmFtZRgFIAEoCRIsChFyZXNvdXJjZV9yZXZpc2lvbhgGIAEoCzIRLmpva28udjEuUmV2aXNpb24SGQoRb2JzZXJ2ZWRfcmV2aXNpb24YByABKAkSKQoHY2hhbmdlcxgIIAMoCzIYLmpva28udjEuU2tpbGxEaWZmQ2hhbmdlEi4KCmV4cGlyZXNfYXQYCSABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wIqACCg1Ta2lsbFJlY292ZXJ5EhMKC3JlY292ZXJ5X2lkGAEgASgJEhAKCHNraWxsX2lkGAIgASgJEhIKCmJhY2tlbmRfaWQYAyABKAkSEQoJdGFyZ2V0X2lkGAQgASgJEiUKBXNjb3BlGAUgASgOMhYuam9rby52MS5SZXNvdXJjZVNjb3BlEgwKBG5hbWUYBiABKAkSEAoIcmV2aXNpb24YByABKAkSDQoFZmlsZXMYCCABKAQSDQoFYnl0ZXMYCSABKAQSLgoKY3JlYXRlZF9hdBgKIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASLAoGc3RhdHVzGAsgASgOMhwuam9rby52MS5Ta2lsbFJlY292ZXJ5U3RhdHVzIm4KE1NraWxsTXV0YXRpb25SZXN1bHQSJwoFc2tpbGwYASABKAsyGC5qb2tvLnYxLlNraWxsRGVzY3JpcHRvchIZChFyZXBsYWNlZF9za2lsbF9pZBgCIAEoCRITCgtyZWNvdmVyeV9pZBgDIAEoCSItChZTa2lsbE1hcmtldExvY2FsU291cmNlEhMKC3NlcnZlcl9wYXRoGAEgASgJIl4KFFNraWxsTWFya2V0R2l0U291cmNlEhYKDnJlcG9zaXRvcnlfdXJsGAEgASgJEhAKA3JlZhgCIAEoCUgAiAEBEhQKDHNwYXJzZV9wYXRocxgDIAMoCUIGCgRfcmVmIoMBChlTa2lsbE1hcmtldFNvdXJjZUxvY2F0aW9uEjAKBWxvY2FsGAEgASgLMh8uam9rby52MS5Ta2lsbE1hcmtldExvY2FsU291cmNlSAASLAoDZ2l0GAIgASgLMh0uam9rby52MS5Ta2lsbE1hcmtldEdpdFNvdXJjZUgAQgYKBGtpbmQiwQMKG1NraWxsTWFya2V0U291cmNlRGVzY3JpcHRvchIRCglzb3VyY2VfaWQYASABKAkSIwoIcmV2aXNpb24YAiABKAsyES5qb2tvLnYxLlJldmlzaW9uEiwKBGtpbmQYAyABKA4yHi5qb2tvLnYxLlNraWxsTWFya2V0U291cmNlS2luZBIPCgdkaXNwbGF5GAQgASgJEgwKBG5hbWUYBSABKAkSGQoMZGlzcGxheV9uYW1lGAYgASgJSACIAQESLgoFc3RhdGUYByABKA4yHy5qb2tvLnYxLlNraWxsTWFya2V0U291cmNlU3RhdGUSGAoQY29udGVudF9yZXZpc2lvbhgIIAEoCRITCgtlbnRyeV9jb3VudBgJIAEoDRIsCghhZGRlZF9hdBgKIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASNQoMcmVmcmVzaGVkX2F0GAsgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcEgBiAEBEhIKBWVycm9yGAwgASgJSAKIAQFCDwoNX2Rpc3BsYXlfbmFtZUIPCg1fcmVmcmVzaGVkX2F0QggKBl9lcnJvciJnChdTa2lsbE1hcmtldEdpdFByZWZsaWdodBIRCglhdmFpbGFibGUYASABKAgSFAoHdmVyc2lvbhgCIAEoCUgAiAEBEhcKD21pbmltdW1fdmVyc2lvbhgDIAEoCUIKCghfdmVyc2lvbiKwAQoYU2tpbGxNYXJrZXRFbnRyeUlkZW50aXR5EhEKCXNvdXJjZV9pZBgBIAEoCRIqCg9zb3VyY2VfcmV2aXNpb24YAiABKAsyES5qb2tvLnYxLlJldmlzaW9uEhAKCGVudHJ5X2lkGAMgASgJEikKDmVudHJ5X3JldmlzaW9uGAQgASgLMhEuam9rby52MS5SZXZpc2lvbhIYChBjb250ZW50X3JldmlzaW9uGAUgASgJItcEChBTa2lsbE1hcmtldEVudHJ5EjMKCGlkZW50aXR5GAEgASgLMiEuam9rby52MS5Ta2lsbE1hcmtldEVudHJ5SWRlbnRpdHkSDAoEc2x1ZxgCIAEoCRIMCgRuYW1lGAMgASgJEhMKBmF1dGhvchgEIAEoCUgAiAEBEhMKC2Rlc2NyaXB0aW9uGAUgASgJEhAKCGNhdGVnb3J5GAYgASgJEgwKBHRhZ3MYByADKAkSDwoHdmVyc2lvbhgIIAEoCRIuCgpjcmVhdGVkX2F0GAkgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBIuCgp1cGRhdGVkX2F0GAogASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBIRCglkb3dubG9hZHMYCyABKAQSEwoLdHJlbmRfc2NvcmUYDCABKAESFQoNYXJjaGl2ZV9ieXRlcxgNIAEoBBITCgtzb3VyY2VfbmFtZRgOIAEoCRIgChNzb3VyY2VfZGlzcGxheV9uYW1lGA8gASgJSAGIAQESNQoMc291cmNlX3N0YXRlGBAgASgOMh8uam9rby52MS5Ta2lsbE1hcmtldFNvdXJjZVN0YXRlEhkKDHNvdXJjZV9lcnJvchgRIAEoCUgCiAEBEjsKEGluc3RhbGxfc3RhdHVzZXMYEiADKAsyIS5qb2tvLnYxLlNraWxsTWFya2V0SW5zdGFsbFN0YXR1c0IJCgdfYXV0aG9yQhYKFF9zb3VyY2VfZGlzcGxheV9uYW1lQg8KDV9zb3VyY2VfZXJyb3Ii3QIKGFNraWxsTWFya2V0SW5zdGFsbFN0YXR1cxITCgtyZXNvdXJjZV9pZBgBIAEoCRIsChFyZXNvdXJjZV9yZXZpc2lvbhgCIAEoCzIRLmpva28udjEuUmV2aXNpb24SEgoKYmFja2VuZF9pZBgDIAEoCRIWCgl0YXJnZXRfaWQYBCABKAlIAIgBARIlCgVzY29wZRgFIAEoDjIWLmpva28udjEuUmVzb3VyY2VTY29wZRI1CgVzdGF0ZRgGIAEoDjImLmpva28udjEuU2tpbGxNYXJrZXRJbnN0YWxsU3RhdHVzU3RhdGUSHgoRaW5zdGFsbGVkX3ZlcnNpb24YByABKAlIAYgBARIcCg9yZWxhdGl2ZV9wYXJlbnQYCCABKAlIAogBAUIMCgpfdGFyZ2V0X2lkQhQKEl9pbnN0YWxsZWRfdmVyc2lvbkISChBfcmVsYXRpdmVfcGFyZW50IloKF1NraWxsTWFya2V0QXJjaGl2ZUVudHJ5EgsKA2tleRgBIAEoCRIkCgRraW5kGAIgASgOMhYuam9rby52MS5Ta2lsbEZpbGVLaW5kEgwKBHNpemUYAyABKAQiuwEKElNraWxsTWFya2V0UHJldmlldxISCgpwcmV2aWV3X2lkGAEgASgJEigKBWVudHJ5GAIgASgLMhkuam9rby52MS5Ta2lsbE1hcmtldEVudHJ5EhkKEXNuYXBzaG90X3JldmlzaW9uGAMgASgJEg0KBWZpbGVzGAQgASgEEg0KBWJ5dGVzGAUgASgEEi4KCmV4cGlyZXNfYXQYBiABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wIv8BChZTa2lsbE1hcmtldFByZXZpZXdGaWxlEhIKCnByZXZpZXdfaWQYASABKAkSGQoRc25hcHNob3RfcmV2aXNpb24YAiABKAkSCwoDa2V5GAMgASgJEgwKBHNpemUYBCABKAQSEwoLcHJldmlld2FibGUYBSABKAgSFAoHY29udGVudBgGIAEoCUgAiAEBEk0KEnVuYXZhaWxhYmxlX3JlYXNvbhgHIAEoDjIsLmpva28udjEuU2tpbGxNYXJrZXRQcmV2aWV3VW5hdmFpbGFibGVSZWFzb25IAYgBAUIKCghfY29udGVudEIVChNfdW5hdmFpbGFibGVfcmVhc29uIq0BChhTa2lsbE1hcmtldEluc3RhbGxUYXJnZXQSEgoKYmFja2VuZF9pZBgBIAEoCRIlCgVzY29wZRgCIAEoDjIWLmpva28udjEuUmVzb3VyY2VTY29wZRIWCgl0YXJnZXRfaWQYAyABKAlIAIgBARIcCg9yZWxhdGl2ZV9wYXJlbnQYBCABKAlIAYgBAUIMCgpfdGFyZ2V0X2lkQhIKEF9yZWxhdGl2ZV9wYXJlbnQipQIKGlNraWxsTWFya2V0Q3VycmVudFJlc291cmNlEhMKC3Jlc291cmNlX2lkGAEgASgJEiwKEXJlc291cmNlX3JldmlzaW9uGAIgASgLMhEuam9rby52MS5SZXZpc2lvbhIMCgRuYW1lGAMgASgJEhQKB3ZlcnNpb24YBCABKAlIAIgBARI1Cgtzb3VyY2Vfa2luZBgFIAEoDjIgLmpva28udjEuUmVzb3VyY2VBY3F1aXNpdGlvbktpbmQSFgoOc291cmNlX2Rpc3BsYXkYBiABKAkSGwoTZGlzY292ZXJlZF9yZXZpc2lvbhgHIAEoCRIZChFvYnNlcnZlZF9yZXZpc2lvbhgIIAEoCRINCgVkaXJ0eRgJIAEoCEIKCghfdmVyc2lvbiKwBAoZU2tpbGxNYXJrZXRJbnN0YWxsUHJldmlldxIxCgZhY3Rpb24YASABKA4yIS5qb2tvLnYxLlNraWxsTWFya2V0SW5zdGFsbEFjdGlvbhITCgtyZXNvdXJjZV9pZBgCIAEoCRIxCgZ0YXJnZXQYAyABKAsyIS5qb2tvLnYxLlNraWxsTWFya2V0SW5zdGFsbFRhcmdldBIMCgRuYW1lGAQgASgJEhkKEWF2YWlsYWJsZV92ZXJzaW9uGAUgASgJEhoKEmNhbmRpZGF0ZV9yZXZpc2lvbhgGIAEoCRINCgVmaWxlcxgHIAEoBBINCgVieXRlcxgIIAEoBBJCChBjdXJyZW50X3Jlc291cmNlGAkgASgLMiMuam9rby52MS5Ta2lsbE1hcmtldEN1cnJlbnRSZXNvdXJjZUgAiAEBEiAKGHVucmVnaXN0ZXJlZF9kZXN0aW5hdGlvbhgKIAEoCBIaChJzb3VyY2VfcmVwbGFjZW1lbnQYCyABKAgSGQoRcHJlc2VydmVzX2VuYWJsZWQYDCABKAgSFgoOZGlmZl9hdmFpbGFibGUYDSABKAgSGAoLZGlmZl9yZWFzb24YDiABKAlIAYgBARIpCgdjaGFuZ2VzGA8gAygLMhguam9rby52MS5Ta2lsbERpZmZDaGFuZ2USFgoOZGlmZl90cnVuY2F0ZWQYECABKAhCEwoRX2N1cnJlbnRfcmVzb3VyY2VCDgoMX2RpZmZfcmVhc29uItcCChZTa2lsbE1hcmtldEluc3RhbGxQbGFuEg8KB3BsYW5faWQYASABKAkSKAoFZW50cnkYAiABKAsyGS5qb2tvLnYxLlNraWxsTWFya2V0RW50cnkSMQoGdGFyZ2V0GAMgASgLMiEuam9rby52MS5Ta2lsbE1hcmtldEluc3RhbGxUYXJnZXQSMwoHcHJldmlldxgEIAEoCzIiLmpva28udjEuU2tpbGxNYXJrZXRJbnN0YWxsUHJldmlldxJLChRjb25maXJtYXRpb25fcmVhc29ucxgFIAMoDjItLmpva28udjEuU2tpbGxNYXJrZXRJbnN0YWxsQ29uZmlybWF0aW9uUmVhc29uEh0KFXJlcXVpcmVzX2NvbmZpcm1hdGlvbhgGIAEoCBIuCgpleHBpcmVzX2F0GAcgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcCLvAQoVU2tpbGxNYXJrZXRTeW5jVGFyZ2V0EhIKCmJhY2tlbmRfaWQYASABKAkSJQoFc2NvcGUYAiABKA4yFi5qb2tvLnYxLlJlc291cmNlU2NvcGUSFgoJdGFyZ2V0X2lkGAMgASgJSACIAQESHAoPcmVsYXRpdmVfcGFyZW50GAQgASgJSAGIAQESLwoPdGFyZ2V0X3JldmlzaW9uGAUgASgLMhEuam9rby52MS5SZXZpc2lvbkgCiAEBQgwKCl90YXJnZXRfaWRCEgoQX3JlbGF0aXZlX3BhcmVudEISChBfdGFyZ2V0X3JldmlzaW9uIqACChdTa2lsbE1hcmtldFN5bmNCYXNlbGluZRIsChFyZXNvdXJjZV9yZXZpc2lvbhgBIAEoCzIRLmpva28udjEuUmV2aXNpb24SIQoZcmVzb3VyY2VfY29udGVudF9yZXZpc2lvbhgCIAEoCRIiChppbnN0YWxsZWRfY29udGVudF9yZXZpc2lvbhgDIAEoCRIZChFpbnN0YWxsZWRfdmVyc2lvbhgEIAEoCRIqCg9zb3VyY2VfcmV2aXNpb24YBSABKAsyES5qb2tvLnYxLlJldmlzaW9uEikKDmVudHJ5X3JldmlzaW9uGAYgASgLMhEuam9rby52MS5SZXZpc2lvbhIeChZlbnRyeV9jb250ZW50X3JldmlzaW9uGAcgASgJIv0CChVTa2lsbE1hcmtldFN5bmNQb2xpY3kSEwoLcmVzb3VyY2VfaWQYASABKAkSIwoIcmV2aXNpb24YAiABKAsyES5qb2tvLnYxLlJldmlzaW9uEg8KB2VuYWJsZWQYAyABKAgSEQoJc291cmNlX2lkGAQgASgJEhAKCGVudHJ5X2lkGAUgASgJEi4KBnRhcmdldBgGIAEoCzIeLmpva28udjEuU2tpbGxNYXJrZXRTeW5jVGFyZ2V0EjIKCGJhc2VsaW5lGAcgASgLMiAuam9rby52MS5Ta2lsbE1hcmtldFN5bmNCYXNlbGluZRIuCgpjcmVhdGVkX2F0GAggASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBIuCgp1cGRhdGVkX2F0GAkgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBIcCg9kaXNhYmxlZF9yZWFzb24YCiABKAlIAIgBAUISChBfZGlzYWJsZWRfcmVhc29uIqYBChtTa2lsbE1hcmtldFN5bmNKb2JBdXRob3JpdHkSEQoJc291cmNlX2lkGAEgASgJEhAKCGVudHJ5X2lkGAIgASgJEi4KBnRhcmdldBgDIAEoCzIeLmpva28udjEuU2tpbGxNYXJrZXRTeW5jVGFyZ2V0EjIKCGJhc2VsaW5lGAQgASgLMiAuam9rby52MS5Ta2lsbE1hcmtldFN5bmNCYXNlbGluZSL9BAoSU2tpbGxNYXJrZXRTeW5jSm9iEg4KBmpvYl9pZBgBIAEoCRIjCghyZXZpc2lvbhgCIAEoCzIRLmpva28udjEuUmV2aXNpb24SLwoFc3RhdGUYAyABKA4yIC5qb2tvLnYxLlNraWxsTWFya2V0U3luY0pvYlN0YXRlEhoKEnBvbGljeV9yZXNvdXJjZV9pZBgEIAEoCRIqCg9wb2xpY3lfcmV2aXNpb24YBSABKAsyES5qb2tvLnYxLlJldmlzaW9uEjcKCWF1dGhvcml0eRgGIAEoCzIkLmpva28udjEuU2tpbGxNYXJrZXRTeW5jSm9iQXV0aG9yaXR5Eg8KB2F0dGVtcHQYByABKA0SHAoPcmV0cnlfb2Zfam9iX2lkGAggASgJSACIAQESHgoRYXZhaWxhYmxlX3ZlcnNpb24YCSABKAlIAYgBARI1CgdvdXRjb21lGAogASgOMh8uam9rby52MS5Ta2lsbE1hcmtldFN5bmNPdXRjb21lSAKIAQESEgoFZXJyb3IYCyABKAlIA4gBARIuCgpjcmVhdGVkX2F0GAwgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBIuCgp1cGRhdGVkX2F0GA0gASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBI1Cgxjb21wbGV0ZWRfYXQYDiABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wSASIAQFCEgoQX3JldHJ5X29mX2pvYl9pZEIUChJfYXZhaWxhYmxlX3ZlcnNpb25CCgoIX291dGNvbWVCCAoGX2Vycm9yQg8KDV9jb21wbGV0ZWRfYXQqaQoNU2tpbGxGaWxlS2luZBIfChtTS0lMTF9GSUxFX0tJTkRfVU5TUEVDSUZJRUQQABIdChlTS0lMTF9GSUxFX0tJTkRfRElSRUNUT1JZEAESGAoUU0tJTExfRklMRV9LSU5EX0ZJTEUQAiqoAQoTU2tpbGxEaWZmQ2hhbmdlS2luZBImCiJTS0lMTF9ESUZGX0NIQU5HRV9LSU5EX1VOU1BFQ0lGSUVEEAASIAocU0tJTExfRElGRl9DSEFOR0VfS0lORF9BRERFRBABEiMKH1NLSUxMX0RJRkZfQ0hBTkdFX0tJTkRfTU9ESUZJRUQQAhIiCh5TS0lMTF9ESUZGX0NIQU5HRV9LSU5EX0RFTEVURUQQAypqCg5Ta2lsbERyYWZ0S2luZBIgChxTS0lMTF9EUkFGVF9LSU5EX1VOU1BFQ0lGSUVEEAASGQoVU0tJTExfRFJBRlRfS0lORF9FRElUEAESGwoXU0tJTExfRFJBRlRfS0lORF9SRU5BTUUQAiqAAQoTU2tpbGxSZWNvdmVyeVN0YXR1cxIlCiFTS0lMTF9SRUNPVkVSWV9TVEFUVVNfVU5TUEVDSUZJRUQQABIfChtTS0lMTF9SRUNPVkVSWV9TVEFUVVNfUkVBRFkQARIhCh1TS0lMTF9SRUNPVkVSWV9TVEFUVVNfTUlTU0lORxACKocBChVTa2lsbE1hcmtldFNvdXJjZUtpbmQSKAokU0tJTExfTUFSS0VUX1NPVVJDRV9LSU5EX1VOU1BFQ0lGSUVEEAASIgoeU0tJTExfTUFSS0VUX1NPVVJDRV9LSU5EX0xPQ0FMEAESIAocU0tJTExfTUFSS0VUX1NPVVJDRV9LSU5EX0dJVBACKo0BChZTa2lsbE1hcmtldFNvdXJjZVN0YXRlEikKJVNLSUxMX01BUktFVF9TT1VSQ0VfU1RBVEVfVU5TUEVDSUZJRUQQABIjCh9TS0lMTF9NQVJLRVRfU09VUkNFX1NUQVRFX1JFQURZEAESIwofU0tJTExfTUFSS0VUX1NPVVJDRV9TVEFURV9FUlJPUhACKrMBCg9Ta2lsbE1hcmtldFNvcnQSIQodU0tJTExfTUFSS0VUX1NPUlRfVU5TUEVDSUZJRUQQABIeChpTS0lMTF9NQVJLRVRfU09SVF9UUkVORElORxABEh8KG1NLSUxMX01BUktFVF9TT1JUX0RPV05MT0FEUxACEh0KGVNLSUxMX01BUktFVF9TT1JUX1VQREFURUQQAxIdChlTS0lMTF9NQVJLRVRfU09SVF9DUkVBVEVEEAQqyQEKI1NraWxsTWFya2V0UHJldmlld1VuYXZhaWxhYmxlUmVhc29uEjcKM1NLSUxMX01BUktFVF9QUkVWSUVXX1VOQVZBSUxBQkxFX1JFQVNPTl9VTlNQRUNJRklFRBAAEjIKLlNLSUxMX01BUktFVF9QUkVWSUVXX1VOQVZBSUxBQkxFX1JFQVNPTl9CSU5BUlkQARI1CjFTS0lMTF9NQVJLRVRfUFJFVklFV19VTkFWQUlMQUJMRV9SRUFTT05fVE9PX0xBUkdFEAIqwQEKGFNraWxsTWFya2V0SW5zdGFsbEFjdGlvbhIrCidTS0lMTF9NQVJLRVRfSU5TVEFMTF9BQ1RJT05fVU5TUEVDSUZJRUQQABInCiNTS0lMTF9NQVJLRVRfSU5TVEFMTF9BQ1RJT05fSU5TVEFMTBABEiYKIlNLSUxMX01BUktFVF9JTlNUQUxMX0FDVElPTl9VUERBVEUQAhInCiNTS0lMTF9NQVJLRVRfSU5TVEFMTF9BQ1RJT05fUkVQTEFDRRADKusBCh1Ta2lsbE1hcmtldEluc3RhbGxTdGF0dXNTdGF0ZRIxCi1TS0lMTF9NQVJLRVRfSU5TVEFMTF9TVEFUVVNfU1RBVEVfVU5TUEVDSUZJRUQQABIvCitTS0lMTF9NQVJLRVRfSU5TVEFMTF9TVEFUVVNfU1RBVEVfSU5TVEFMTEVEEAESNgoyU0tJTExfTUFSS0VUX0lOU1RBTExfU1RBVFVTX1NUQVRFX1VQREFURV9BVkFJTEFCTEUQAhIuCipTS0lMTF9NQVJLRVRfSU5TVEFMTF9TVEFUVVNfU1RBVEVfQ09ORkxJQ1QQAyqaAwokU2tpbGxNYXJrZXRJbnN0YWxsQ29uZmlybWF0aW9uUmVhc29uEjgKNFNLSUxMX01BUktFVF9JTlNUQUxMX0NPTkZJUk1BVElPTl9SRUFTT05fVU5TUEVDSUZJRUQQABI/CjtTS0lMTF9NQVJLRVRfSU5TVEFMTF9DT05GSVJNQVRJT05fUkVBU09OX1NPVVJDRV9SRVBMQUNFTUVOVBABEjwKOFNLSUxMX01BUktFVF9JTlNUQUxMX0NPTkZJUk1BVElPTl9SRUFTT05fTE9DQUxfT1dORVJTSElQEAISOgo2U0tJTExfTUFSS0VUX0lOU1RBTExfQ09ORklSTUFUSU9OX1JFQVNPTl9ESVJUWV9DT05URU5UEAMSRQpBU0tJTExfTUFSS0VUX0lOU1RBTExfQ09ORklSTUFUSU9OX1JFQVNPTl9VTlJFR0lTVEVSRURfREVTVElOQVRJT04QBBI2CjJTS0lMTF9NQVJLRVRfSU5TVEFMTF9DT05GSVJNQVRJT05fUkVBU09OX0RPV05HUkFERRAFKqQDChdTa2lsbE1hcmtldFN5bmNKb2JTdGF0ZRIrCidTS0lMTF9NQVJLRVRfU1lOQ19KT0JfU1RBVEVfVU5TUEVDSUZJRUQQABI0CjBTS0lMTF9NQVJLRVRfU1lOQ19KT0JfU1RBVEVfUEVORElOR19SRVZBTElEQVRJT04QARInCiNTS0lMTF9NQVJLRVRfU1lOQ19KT0JfU1RBVEVfUlVOTklORxACEioKJlNLSUxMX01BUktFVF9TWU5DX0pPQl9TVEFURV9DQU5DRUxMSU5HEAMSKQolU0tJTExfTUFSS0VUX1NZTkNfSk9CX1NUQVRFX1NVQ0NFRURFRBAEEioKJlNLSUxMX01BUktFVF9TWU5DX0pPQl9TVEFURV9VUF9UT19EQVRFEAUSJwojU0tJTExfTUFSS0VUX1NZTkNfSk9CX1NUQVRFX0JMT0NLRUQQBhImCiJTS0lMTF9NQVJLRVRfU1lOQ19KT0JfU1RBVEVfRkFJTEVEEAcSKQolU0tJTExfTUFSS0VUX1NZTkNfSk9CX1NUQVRFX0NBTkNFTExFRBAIKqsDChZTa2lsbE1hcmtldFN5bmNPdXRjb21lEikKJVNLSUxMX01BUktFVF9TWU5DX09VVENPTUVfVU5TUEVDSUZJRUQQABIlCiFTS0lMTF9NQVJLRVRfU1lOQ19PVVRDT01FX1VQREFURUQQARItCilTS0lMTF9NQVJLRVRfU1lOQ19PVVRDT01FX0FMUkVBRFlfQ1VSUkVOVBACEi8KK1NLSUxMX01BUktFVF9TWU5DX09VVENPTUVfRE9XTkdSQURFX0JMT0NLRUQQAxIrCidTS0lMTF9NQVJLRVRfU1lOQ19PVVRDT01FX0RJUlRZX0NPTlRFTlQQBBIrCidTS0lMTF9NQVJLRVRfU1lOQ19PVVRDT01FX09XTkVSX0NIQU5HRUQQBRIsCihTS0lMTF9NQVJLRVRfU1lOQ19PVVRDT01FX1RBUkdFVF9DSEFOR0VEEAYSLgoqU0tJTExfTUFSS0VUX1NZTkNfT1VUQ09NRV9SRVNPVVJDRV9SRU1PVkVEEAcSJwojU0tJTExfTUFSS0VUX1NZTkNfT1VUQ09NRV9DQU5DRUxMRUQQCGIGcHJvdG8z", [file_google_protobuf_timestamp, file_joko_v1_common, file_joko_v1_settings]);
 
 /**
  * @generated from message joko.v1.SkillDescriptor
@@ -502,6 +502,977 @@ export const SkillMutationResultSchema: GenMessage<SkillMutationResult> = /*@__P
   messageDesc(file_joko_v1_skill, 9);
 
 /**
+ * @generated from message joko.v1.SkillMarketLocalSource
+ */
+export type SkillMarketLocalSource = Message<"joko.v1.SkillMarketLocalSource"> & {
+  /**
+   * Write-only service-node directory explicitly selected by the user.
+   *
+   * @generated from field: string server_path = 1;
+   */
+  serverPath: string;
+};
+
+/**
+ * Describes the message joko.v1.SkillMarketLocalSource.
+ * Use `create(SkillMarketLocalSourceSchema)` to create a new message.
+ */
+export const SkillMarketLocalSourceSchema: GenMessage<SkillMarketLocalSource> = /*@__PURE__*/
+  messageDesc(file_joko_v1_skill, 10);
+
+/**
+ * @generated from message joko.v1.SkillMarketGitSource
+ */
+export type SkillMarketGitSource = Message<"joko.v1.SkillMarketGitSource"> & {
+  /**
+   * @generated from field: string repository_url = 1;
+   */
+  repositoryUrl: string;
+
+  /**
+   * @generated from field: optional string ref = 2;
+   */
+  ref?: string | undefined;
+
+  /**
+   * @generated from field: repeated string sparse_paths = 3;
+   */
+  sparsePaths: string[];
+};
+
+/**
+ * Describes the message joko.v1.SkillMarketGitSource.
+ * Use `create(SkillMarketGitSourceSchema)` to create a new message.
+ */
+export const SkillMarketGitSourceSchema: GenMessage<SkillMarketGitSource> = /*@__PURE__*/
+  messageDesc(file_joko_v1_skill, 11);
+
+/**
+ * @generated from message joko.v1.SkillMarketSourceLocation
+ */
+export type SkillMarketSourceLocation = Message<"joko.v1.SkillMarketSourceLocation"> & {
+  /**
+   * @generated from oneof joko.v1.SkillMarketSourceLocation.kind
+   */
+  kind: {
+    /**
+     * @generated from field: joko.v1.SkillMarketLocalSource local = 1;
+     */
+    value: SkillMarketLocalSource;
+    case: "local";
+  } | {
+    /**
+     * @generated from field: joko.v1.SkillMarketGitSource git = 2;
+     */
+    value: SkillMarketGitSource;
+    case: "git";
+  } | { case: undefined; value?: undefined };
+};
+
+/**
+ * Describes the message joko.v1.SkillMarketSourceLocation.
+ * Use `create(SkillMarketSourceLocationSchema)` to create a new message.
+ */
+export const SkillMarketSourceLocationSchema: GenMessage<SkillMarketSourceLocation> = /*@__PURE__*/
+  messageDesc(file_joko_v1_skill, 12);
+
+/**
+ * @generated from message joko.v1.SkillMarketSourceDescriptor
+ */
+export type SkillMarketSourceDescriptor = Message<"joko.v1.SkillMarketSourceDescriptor"> & {
+  /**
+   * @generated from field: string source_id = 1;
+   */
+  sourceId: string;
+
+  /**
+   * @generated from field: joko.v1.Revision revision = 2;
+   */
+  revision?: Revision | undefined;
+
+  /**
+   * @generated from field: joko.v1.SkillMarketSourceKind kind = 3;
+   */
+  kind: SkillMarketSourceKind;
+
+  /**
+   * Path-free basename, repository label, or manifest display name.
+   *
+   * @generated from field: string display = 4;
+   */
+  display: string;
+
+  /**
+   * @generated from field: string name = 5;
+   */
+  name: string;
+
+  /**
+   * @generated from field: optional string display_name = 6;
+   */
+  displayName?: string | undefined;
+
+  /**
+   * @generated from field: joko.v1.SkillMarketSourceState state = 7;
+   */
+  state: SkillMarketSourceState;
+
+  /**
+   * @generated from field: string content_revision = 8;
+   */
+  contentRevision: string;
+
+  /**
+   * @generated from field: uint32 entry_count = 9;
+   */
+  entryCount: number;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp added_at = 10;
+   */
+  addedAt?: Timestamp | undefined;
+
+  /**
+   * @generated from field: optional google.protobuf.Timestamp refreshed_at = 11;
+   */
+  refreshedAt?: Timestamp | undefined;
+
+  /**
+   * @generated from field: optional string error = 12;
+   */
+  error?: string | undefined;
+};
+
+/**
+ * Describes the message joko.v1.SkillMarketSourceDescriptor.
+ * Use `create(SkillMarketSourceDescriptorSchema)` to create a new message.
+ */
+export const SkillMarketSourceDescriptorSchema: GenMessage<SkillMarketSourceDescriptor> = /*@__PURE__*/
+  messageDesc(file_joko_v1_skill, 13);
+
+/**
+ * @generated from message joko.v1.SkillMarketGitPreflight
+ */
+export type SkillMarketGitPreflight = Message<"joko.v1.SkillMarketGitPreflight"> & {
+  /**
+   * @generated from field: bool available = 1;
+   */
+  available: boolean;
+
+  /**
+   * @generated from field: optional string version = 2;
+   */
+  version?: string | undefined;
+
+  /**
+   * @generated from field: string minimum_version = 3;
+   */
+  minimumVersion: string;
+};
+
+/**
+ * Describes the message joko.v1.SkillMarketGitPreflight.
+ * Use `create(SkillMarketGitPreflightSchema)` to create a new message.
+ */
+export const SkillMarketGitPreflightSchema: GenMessage<SkillMarketGitPreflight> = /*@__PURE__*/
+  messageDesc(file_joko_v1_skill, 14);
+
+/**
+ * @generated from message joko.v1.SkillMarketEntryIdentity
+ */
+export type SkillMarketEntryIdentity = Message<"joko.v1.SkillMarketEntryIdentity"> & {
+  /**
+   * @generated from field: string source_id = 1;
+   */
+  sourceId: string;
+
+  /**
+   * @generated from field: joko.v1.Revision source_revision = 2;
+   */
+  sourceRevision?: Revision | undefined;
+
+  /**
+   * @generated from field: string entry_id = 3;
+   */
+  entryId: string;
+
+  /**
+   * @generated from field: joko.v1.Revision entry_revision = 4;
+   */
+  entryRevision?: Revision | undefined;
+
+  /**
+   * @generated from field: string content_revision = 5;
+   */
+  contentRevision: string;
+};
+
+/**
+ * Describes the message joko.v1.SkillMarketEntryIdentity.
+ * Use `create(SkillMarketEntryIdentitySchema)` to create a new message.
+ */
+export const SkillMarketEntryIdentitySchema: GenMessage<SkillMarketEntryIdentity> = /*@__PURE__*/
+  messageDesc(file_joko_v1_skill, 15);
+
+/**
+ * @generated from message joko.v1.SkillMarketEntry
+ */
+export type SkillMarketEntry = Message<"joko.v1.SkillMarketEntry"> & {
+  /**
+   * @generated from field: joko.v1.SkillMarketEntryIdentity identity = 1;
+   */
+  identity?: SkillMarketEntryIdentity | undefined;
+
+  /**
+   * @generated from field: string slug = 2;
+   */
+  slug: string;
+
+  /**
+   * @generated from field: string name = 3;
+   */
+  name: string;
+
+  /**
+   * @generated from field: optional string author = 4;
+   */
+  author?: string | undefined;
+
+  /**
+   * @generated from field: string description = 5;
+   */
+  description: string;
+
+  /**
+   * @generated from field: string category = 6;
+   */
+  category: string;
+
+  /**
+   * @generated from field: repeated string tags = 7;
+   */
+  tags: string[];
+
+  /**
+   * @generated from field: string version = 8;
+   */
+  version: string;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp created_at = 9;
+   */
+  createdAt?: Timestamp | undefined;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp updated_at = 10;
+   */
+  updatedAt?: Timestamp | undefined;
+
+  /**
+   * @generated from field: uint64 downloads = 11;
+   */
+  downloads: bigint;
+
+  /**
+   * @generated from field: double trend_score = 12;
+   */
+  trendScore: number;
+
+  /**
+   * @generated from field: uint64 archive_bytes = 13;
+   */
+  archiveBytes: bigint;
+
+  /**
+   * @generated from field: string source_name = 14;
+   */
+  sourceName: string;
+
+  /**
+   * @generated from field: optional string source_display_name = 15;
+   */
+  sourceDisplayName?: string | undefined;
+
+  /**
+   * @generated from field: joko.v1.SkillMarketSourceState source_state = 16;
+   */
+  sourceState: SkillMarketSourceState;
+
+  /**
+   * @generated from field: optional string source_error = 17;
+   */
+  sourceError?: string | undefined;
+
+  /**
+   * @generated from field: repeated joko.v1.SkillMarketInstallStatus install_statuses = 18;
+   */
+  installStatuses: SkillMarketInstallStatus[];
+};
+
+/**
+ * Describes the message joko.v1.SkillMarketEntry.
+ * Use `create(SkillMarketEntrySchema)` to create a new message.
+ */
+export const SkillMarketEntrySchema: GenMessage<SkillMarketEntry> = /*@__PURE__*/
+  messageDesc(file_joko_v1_skill, 16);
+
+/**
+ * @generated from message joko.v1.SkillMarketInstallStatus
+ */
+export type SkillMarketInstallStatus = Message<"joko.v1.SkillMarketInstallStatus"> & {
+  /**
+   * @generated from field: string resource_id = 1;
+   */
+  resourceId: string;
+
+  /**
+   * @generated from field: joko.v1.Revision resource_revision = 2;
+   */
+  resourceRevision?: Revision | undefined;
+
+  /**
+   * @generated from field: string backend_id = 3;
+   */
+  backendId: string;
+
+  /**
+   * @generated from field: optional string target_id = 4;
+   */
+  targetId?: string | undefined;
+
+  /**
+   * @generated from field: joko.v1.ResourceScope scope = 5;
+   */
+  scope: ResourceScope;
+
+  /**
+   * @generated from field: joko.v1.SkillMarketInstallStatusState state = 6;
+   */
+  state: SkillMarketInstallStatusState;
+
+  /**
+   * @generated from field: optional string installed_version = 7;
+   */
+  installedVersion?: string | undefined;
+
+  /**
+   * @generated from field: optional string relative_parent = 8;
+   */
+  relativeParent?: string | undefined;
+};
+
+/**
+ * Describes the message joko.v1.SkillMarketInstallStatus.
+ * Use `create(SkillMarketInstallStatusSchema)` to create a new message.
+ */
+export const SkillMarketInstallStatusSchema: GenMessage<SkillMarketInstallStatus> = /*@__PURE__*/
+  messageDesc(file_joko_v1_skill, 17);
+
+/**
+ * @generated from message joko.v1.SkillMarketArchiveEntry
+ */
+export type SkillMarketArchiveEntry = Message<"joko.v1.SkillMarketArchiveEntry"> & {
+  /**
+   * @generated from field: string key = 1;
+   */
+  key: string;
+
+  /**
+   * @generated from field: joko.v1.SkillFileKind kind = 2;
+   */
+  kind: SkillFileKind;
+
+  /**
+   * @generated from field: uint64 size = 3;
+   */
+  size: bigint;
+};
+
+/**
+ * Describes the message joko.v1.SkillMarketArchiveEntry.
+ * Use `create(SkillMarketArchiveEntrySchema)` to create a new message.
+ */
+export const SkillMarketArchiveEntrySchema: GenMessage<SkillMarketArchiveEntry> = /*@__PURE__*/
+  messageDesc(file_joko_v1_skill, 18);
+
+/**
+ * @generated from message joko.v1.SkillMarketPreview
+ */
+export type SkillMarketPreview = Message<"joko.v1.SkillMarketPreview"> & {
+  /**
+   * @generated from field: string preview_id = 1;
+   */
+  previewId: string;
+
+  /**
+   * @generated from field: joko.v1.SkillMarketEntry entry = 2;
+   */
+  entry?: SkillMarketEntry | undefined;
+
+  /**
+   * @generated from field: string snapshot_revision = 3;
+   */
+  snapshotRevision: string;
+
+  /**
+   * @generated from field: uint64 files = 4;
+   */
+  files: bigint;
+
+  /**
+   * @generated from field: uint64 bytes = 5;
+   */
+  bytes: bigint;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp expires_at = 6;
+   */
+  expiresAt?: Timestamp | undefined;
+};
+
+/**
+ * Describes the message joko.v1.SkillMarketPreview.
+ * Use `create(SkillMarketPreviewSchema)` to create a new message.
+ */
+export const SkillMarketPreviewSchema: GenMessage<SkillMarketPreview> = /*@__PURE__*/
+  messageDesc(file_joko_v1_skill, 19);
+
+/**
+ * @generated from message joko.v1.SkillMarketPreviewFile
+ */
+export type SkillMarketPreviewFile = Message<"joko.v1.SkillMarketPreviewFile"> & {
+  /**
+   * @generated from field: string preview_id = 1;
+   */
+  previewId: string;
+
+  /**
+   * @generated from field: string snapshot_revision = 2;
+   */
+  snapshotRevision: string;
+
+  /**
+   * @generated from field: string key = 3;
+   */
+  key: string;
+
+  /**
+   * @generated from field: uint64 size = 4;
+   */
+  size: bigint;
+
+  /**
+   * @generated from field: bool previewable = 5;
+   */
+  previewable: boolean;
+
+  /**
+   * @generated from field: optional string content = 6;
+   */
+  content?: string | undefined;
+
+  /**
+   * @generated from field: optional joko.v1.SkillMarketPreviewUnavailableReason unavailable_reason = 7;
+   */
+  unavailableReason?: SkillMarketPreviewUnavailableReason | undefined;
+};
+
+/**
+ * Describes the message joko.v1.SkillMarketPreviewFile.
+ * Use `create(SkillMarketPreviewFileSchema)` to create a new message.
+ */
+export const SkillMarketPreviewFileSchema: GenMessage<SkillMarketPreviewFile> = /*@__PURE__*/
+  messageDesc(file_joko_v1_skill, 20);
+
+/**
+ * @generated from message joko.v1.SkillMarketInstallTarget
+ */
+export type SkillMarketInstallTarget = Message<"joko.v1.SkillMarketInstallTarget"> & {
+  /**
+   * @generated from field: string backend_id = 1;
+   */
+  backendId: string;
+
+  /**
+   * @generated from field: joko.v1.ResourceScope scope = 2;
+   */
+  scope: ResourceScope;
+
+  /**
+   * @generated from field: optional string target_id = 3;
+   */
+  targetId?: string | undefined;
+
+  /**
+   * @generated from field: optional string relative_parent = 4;
+   */
+  relativeParent?: string | undefined;
+};
+
+/**
+ * Describes the message joko.v1.SkillMarketInstallTarget.
+ * Use `create(SkillMarketInstallTargetSchema)` to create a new message.
+ */
+export const SkillMarketInstallTargetSchema: GenMessage<SkillMarketInstallTarget> = /*@__PURE__*/
+  messageDesc(file_joko_v1_skill, 21);
+
+/**
+ * @generated from message joko.v1.SkillMarketCurrentResource
+ */
+export type SkillMarketCurrentResource = Message<"joko.v1.SkillMarketCurrentResource"> & {
+  /**
+   * @generated from field: string resource_id = 1;
+   */
+  resourceId: string;
+
+  /**
+   * @generated from field: joko.v1.Revision resource_revision = 2;
+   */
+  resourceRevision?: Revision | undefined;
+
+  /**
+   * @generated from field: string name = 3;
+   */
+  name: string;
+
+  /**
+   * @generated from field: optional string version = 4;
+   */
+  version?: string | undefined;
+
+  /**
+   * @generated from field: joko.v1.ResourceAcquisitionKind source_kind = 5;
+   */
+  sourceKind: ResourceAcquisitionKind;
+
+  /**
+   * @generated from field: string source_display = 6;
+   */
+  sourceDisplay: string;
+
+  /**
+   * @generated from field: string discovered_revision = 7;
+   */
+  discoveredRevision: string;
+
+  /**
+   * @generated from field: string observed_revision = 8;
+   */
+  observedRevision: string;
+
+  /**
+   * @generated from field: bool dirty = 9;
+   */
+  dirty: boolean;
+};
+
+/**
+ * Describes the message joko.v1.SkillMarketCurrentResource.
+ * Use `create(SkillMarketCurrentResourceSchema)` to create a new message.
+ */
+export const SkillMarketCurrentResourceSchema: GenMessage<SkillMarketCurrentResource> = /*@__PURE__*/
+  messageDesc(file_joko_v1_skill, 22);
+
+/**
+ * @generated from message joko.v1.SkillMarketInstallPreview
+ */
+export type SkillMarketInstallPreview = Message<"joko.v1.SkillMarketInstallPreview"> & {
+  /**
+   * @generated from field: joko.v1.SkillMarketInstallAction action = 1;
+   */
+  action: SkillMarketInstallAction;
+
+  /**
+   * @generated from field: string resource_id = 2;
+   */
+  resourceId: string;
+
+  /**
+   * @generated from field: joko.v1.SkillMarketInstallTarget target = 3;
+   */
+  target?: SkillMarketInstallTarget | undefined;
+
+  /**
+   * @generated from field: string name = 4;
+   */
+  name: string;
+
+  /**
+   * @generated from field: string available_version = 5;
+   */
+  availableVersion: string;
+
+  /**
+   * @generated from field: string candidate_revision = 6;
+   */
+  candidateRevision: string;
+
+  /**
+   * @generated from field: uint64 files = 7;
+   */
+  files: bigint;
+
+  /**
+   * @generated from field: uint64 bytes = 8;
+   */
+  bytes: bigint;
+
+  /**
+   * @generated from field: optional joko.v1.SkillMarketCurrentResource current_resource = 9;
+   */
+  currentResource?: SkillMarketCurrentResource | undefined;
+
+  /**
+   * @generated from field: bool unregistered_destination = 10;
+   */
+  unregisteredDestination: boolean;
+
+  /**
+   * @generated from field: bool source_replacement = 11;
+   */
+  sourceReplacement: boolean;
+
+  /**
+   * @generated from field: bool preserves_enabled = 12;
+   */
+  preservesEnabled: boolean;
+
+  /**
+   * @generated from field: bool diff_available = 13;
+   */
+  diffAvailable: boolean;
+
+  /**
+   * @generated from field: optional string diff_reason = 14;
+   */
+  diffReason?: string | undefined;
+
+  /**
+   * @generated from field: repeated joko.v1.SkillDiffChange changes = 15;
+   */
+  changes: SkillDiffChange[];
+
+  /**
+   * @generated from field: bool diff_truncated = 16;
+   */
+  diffTruncated: boolean;
+};
+
+/**
+ * Describes the message joko.v1.SkillMarketInstallPreview.
+ * Use `create(SkillMarketInstallPreviewSchema)` to create a new message.
+ */
+export const SkillMarketInstallPreviewSchema: GenMessage<SkillMarketInstallPreview> = /*@__PURE__*/
+  messageDesc(file_joko_v1_skill, 23);
+
+/**
+ * @generated from message joko.v1.SkillMarketInstallPlan
+ */
+export type SkillMarketInstallPlan = Message<"joko.v1.SkillMarketInstallPlan"> & {
+  /**
+   * @generated from field: string plan_id = 1;
+   */
+  planId: string;
+
+  /**
+   * @generated from field: joko.v1.SkillMarketEntry entry = 2;
+   */
+  entry?: SkillMarketEntry | undefined;
+
+  /**
+   * @generated from field: joko.v1.SkillMarketInstallTarget target = 3;
+   */
+  target?: SkillMarketInstallTarget | undefined;
+
+  /**
+   * @generated from field: joko.v1.SkillMarketInstallPreview preview = 4;
+   */
+  preview?: SkillMarketInstallPreview | undefined;
+
+  /**
+   * @generated from field: repeated joko.v1.SkillMarketInstallConfirmationReason confirmation_reasons = 5;
+   */
+  confirmationReasons: SkillMarketInstallConfirmationReason[];
+
+  /**
+   * @generated from field: bool requires_confirmation = 6;
+   */
+  requiresConfirmation: boolean;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp expires_at = 7;
+   */
+  expiresAt?: Timestamp | undefined;
+};
+
+/**
+ * Describes the message joko.v1.SkillMarketInstallPlan.
+ * Use `create(SkillMarketInstallPlanSchema)` to create a new message.
+ */
+export const SkillMarketInstallPlanSchema: GenMessage<SkillMarketInstallPlan> = /*@__PURE__*/
+  messageDesc(file_joko_v1_skill, 24);
+
+/**
+ * @generated from message joko.v1.SkillMarketSyncTarget
+ */
+export type SkillMarketSyncTarget = Message<"joko.v1.SkillMarketSyncTarget"> & {
+  /**
+   * @generated from field: string backend_id = 1;
+   */
+  backendId: string;
+
+  /**
+   * @generated from field: joko.v1.ResourceScope scope = 2;
+   */
+  scope: ResourceScope;
+
+  /**
+   * @generated from field: optional string target_id = 3;
+   */
+  targetId?: string | undefined;
+
+  /**
+   * @generated from field: optional string relative_parent = 4;
+   */
+  relativeParent?: string | undefined;
+
+  /**
+   * @generated from field: optional joko.v1.Revision target_revision = 5;
+   */
+  targetRevision?: Revision | undefined;
+};
+
+/**
+ * Describes the message joko.v1.SkillMarketSyncTarget.
+ * Use `create(SkillMarketSyncTargetSchema)` to create a new message.
+ */
+export const SkillMarketSyncTargetSchema: GenMessage<SkillMarketSyncTarget> = /*@__PURE__*/
+  messageDesc(file_joko_v1_skill, 25);
+
+/**
+ * @generated from message joko.v1.SkillMarketSyncBaseline
+ */
+export type SkillMarketSyncBaseline = Message<"joko.v1.SkillMarketSyncBaseline"> & {
+  /**
+   * @generated from field: joko.v1.Revision resource_revision = 1;
+   */
+  resourceRevision?: Revision | undefined;
+
+  /**
+   * @generated from field: string resource_content_revision = 2;
+   */
+  resourceContentRevision: string;
+
+  /**
+   * @generated from field: string installed_content_revision = 3;
+   */
+  installedContentRevision: string;
+
+  /**
+   * @generated from field: string installed_version = 4;
+   */
+  installedVersion: string;
+
+  /**
+   * @generated from field: joko.v1.Revision source_revision = 5;
+   */
+  sourceRevision?: Revision | undefined;
+
+  /**
+   * @generated from field: joko.v1.Revision entry_revision = 6;
+   */
+  entryRevision?: Revision | undefined;
+
+  /**
+   * @generated from field: string entry_content_revision = 7;
+   */
+  entryContentRevision: string;
+};
+
+/**
+ * Describes the message joko.v1.SkillMarketSyncBaseline.
+ * Use `create(SkillMarketSyncBaselineSchema)` to create a new message.
+ */
+export const SkillMarketSyncBaselineSchema: GenMessage<SkillMarketSyncBaseline> = /*@__PURE__*/
+  messageDesc(file_joko_v1_skill, 26);
+
+/**
+ * @generated from message joko.v1.SkillMarketSyncPolicy
+ */
+export type SkillMarketSyncPolicy = Message<"joko.v1.SkillMarketSyncPolicy"> & {
+  /**
+   * @generated from field: string resource_id = 1;
+   */
+  resourceId: string;
+
+  /**
+   * @generated from field: joko.v1.Revision revision = 2;
+   */
+  revision?: Revision | undefined;
+
+  /**
+   * @generated from field: bool enabled = 3;
+   */
+  enabled: boolean;
+
+  /**
+   * @generated from field: string source_id = 4;
+   */
+  sourceId: string;
+
+  /**
+   * @generated from field: string entry_id = 5;
+   */
+  entryId: string;
+
+  /**
+   * @generated from field: joko.v1.SkillMarketSyncTarget target = 6;
+   */
+  target?: SkillMarketSyncTarget | undefined;
+
+  /**
+   * @generated from field: joko.v1.SkillMarketSyncBaseline baseline = 7;
+   */
+  baseline?: SkillMarketSyncBaseline | undefined;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp created_at = 8;
+   */
+  createdAt?: Timestamp | undefined;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp updated_at = 9;
+   */
+  updatedAt?: Timestamp | undefined;
+
+  /**
+   * @generated from field: optional string disabled_reason = 10;
+   */
+  disabledReason?: string | undefined;
+};
+
+/**
+ * Describes the message joko.v1.SkillMarketSyncPolicy.
+ * Use `create(SkillMarketSyncPolicySchema)` to create a new message.
+ */
+export const SkillMarketSyncPolicySchema: GenMessage<SkillMarketSyncPolicy> = /*@__PURE__*/
+  messageDesc(file_joko_v1_skill, 27);
+
+/**
+ * @generated from message joko.v1.SkillMarketSyncJobAuthority
+ */
+export type SkillMarketSyncJobAuthority = Message<"joko.v1.SkillMarketSyncJobAuthority"> & {
+  /**
+   * @generated from field: string source_id = 1;
+   */
+  sourceId: string;
+
+  /**
+   * @generated from field: string entry_id = 2;
+   */
+  entryId: string;
+
+  /**
+   * @generated from field: joko.v1.SkillMarketSyncTarget target = 3;
+   */
+  target?: SkillMarketSyncTarget | undefined;
+
+  /**
+   * @generated from field: joko.v1.SkillMarketSyncBaseline baseline = 4;
+   */
+  baseline?: SkillMarketSyncBaseline | undefined;
+};
+
+/**
+ * Describes the message joko.v1.SkillMarketSyncJobAuthority.
+ * Use `create(SkillMarketSyncJobAuthoritySchema)` to create a new message.
+ */
+export const SkillMarketSyncJobAuthoritySchema: GenMessage<SkillMarketSyncJobAuthority> = /*@__PURE__*/
+  messageDesc(file_joko_v1_skill, 28);
+
+/**
+ * @generated from message joko.v1.SkillMarketSyncJob
+ */
+export type SkillMarketSyncJob = Message<"joko.v1.SkillMarketSyncJob"> & {
+  /**
+   * @generated from field: string job_id = 1;
+   */
+  jobId: string;
+
+  /**
+   * @generated from field: joko.v1.Revision revision = 2;
+   */
+  revision?: Revision | undefined;
+
+  /**
+   * @generated from field: joko.v1.SkillMarketSyncJobState state = 3;
+   */
+  state: SkillMarketSyncJobState;
+
+  /**
+   * @generated from field: string policy_resource_id = 4;
+   */
+  policyResourceId: string;
+
+  /**
+   * @generated from field: joko.v1.Revision policy_revision = 5;
+   */
+  policyRevision?: Revision | undefined;
+
+  /**
+   * @generated from field: joko.v1.SkillMarketSyncJobAuthority authority = 6;
+   */
+  authority?: SkillMarketSyncJobAuthority | undefined;
+
+  /**
+   * @generated from field: uint32 attempt = 7;
+   */
+  attempt: number;
+
+  /**
+   * @generated from field: optional string retry_of_job_id = 8;
+   */
+  retryOfJobId?: string | undefined;
+
+  /**
+   * @generated from field: optional string available_version = 9;
+   */
+  availableVersion?: string | undefined;
+
+  /**
+   * @generated from field: optional joko.v1.SkillMarketSyncOutcome outcome = 10;
+   */
+  outcome?: SkillMarketSyncOutcome | undefined;
+
+  /**
+   * @generated from field: optional string error = 11;
+   */
+  error?: string | undefined;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp created_at = 12;
+   */
+  createdAt?: Timestamp | undefined;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp updated_at = 13;
+   */
+  updatedAt?: Timestamp | undefined;
+
+  /**
+   * @generated from field: optional google.protobuf.Timestamp completed_at = 14;
+   */
+  completedAt?: Timestamp | undefined;
+};
+
+/**
+ * Describes the message joko.v1.SkillMarketSyncJob.
+ * Use `create(SkillMarketSyncJobSchema)` to create a new message.
+ */
+export const SkillMarketSyncJobSchema: GenMessage<SkillMarketSyncJob> = /*@__PURE__*/
+  messageDesc(file_joko_v1_skill, 29);
+
+/**
  * @generated from enum joko.v1.SkillFileKind
  */
 export enum SkillFileKind {
@@ -609,4 +1580,333 @@ export enum SkillRecoveryStatus {
  */
 export const SkillRecoveryStatusSchema: GenEnum<SkillRecoveryStatus> = /*@__PURE__*/
   enumDesc(file_joko_v1_skill, 3);
+
+/**
+ * @generated from enum joko.v1.SkillMarketSourceKind
+ */
+export enum SkillMarketSourceKind {
+  /**
+   * @generated from enum value: SKILL_MARKET_SOURCE_KIND_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_SOURCE_KIND_LOCAL = 1;
+   */
+  LOCAL = 1,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_SOURCE_KIND_GIT = 2;
+   */
+  GIT = 2,
+}
+
+/**
+ * Describes the enum joko.v1.SkillMarketSourceKind.
+ */
+export const SkillMarketSourceKindSchema: GenEnum<SkillMarketSourceKind> = /*@__PURE__*/
+  enumDesc(file_joko_v1_skill, 4);
+
+/**
+ * @generated from enum joko.v1.SkillMarketSourceState
+ */
+export enum SkillMarketSourceState {
+  /**
+   * @generated from enum value: SKILL_MARKET_SOURCE_STATE_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_SOURCE_STATE_READY = 1;
+   */
+  READY = 1,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_SOURCE_STATE_ERROR = 2;
+   */
+  ERROR = 2,
+}
+
+/**
+ * Describes the enum joko.v1.SkillMarketSourceState.
+ */
+export const SkillMarketSourceStateSchema: GenEnum<SkillMarketSourceState> = /*@__PURE__*/
+  enumDesc(file_joko_v1_skill, 5);
+
+/**
+ * @generated from enum joko.v1.SkillMarketSort
+ */
+export enum SkillMarketSort {
+  /**
+   * @generated from enum value: SKILL_MARKET_SORT_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_SORT_TRENDING = 1;
+   */
+  TRENDING = 1,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_SORT_DOWNLOADS = 2;
+   */
+  DOWNLOADS = 2,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_SORT_UPDATED = 3;
+   */
+  UPDATED = 3,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_SORT_CREATED = 4;
+   */
+  CREATED = 4,
+}
+
+/**
+ * Describes the enum joko.v1.SkillMarketSort.
+ */
+export const SkillMarketSortSchema: GenEnum<SkillMarketSort> = /*@__PURE__*/
+  enumDesc(file_joko_v1_skill, 6);
+
+/**
+ * @generated from enum joko.v1.SkillMarketPreviewUnavailableReason
+ */
+export enum SkillMarketPreviewUnavailableReason {
+  /**
+   * @generated from enum value: SKILL_MARKET_PREVIEW_UNAVAILABLE_REASON_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_PREVIEW_UNAVAILABLE_REASON_BINARY = 1;
+   */
+  BINARY = 1,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_PREVIEW_UNAVAILABLE_REASON_TOO_LARGE = 2;
+   */
+  TOO_LARGE = 2,
+}
+
+/**
+ * Describes the enum joko.v1.SkillMarketPreviewUnavailableReason.
+ */
+export const SkillMarketPreviewUnavailableReasonSchema: GenEnum<SkillMarketPreviewUnavailableReason> = /*@__PURE__*/
+  enumDesc(file_joko_v1_skill, 7);
+
+/**
+ * @generated from enum joko.v1.SkillMarketInstallAction
+ */
+export enum SkillMarketInstallAction {
+  /**
+   * @generated from enum value: SKILL_MARKET_INSTALL_ACTION_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_INSTALL_ACTION_INSTALL = 1;
+   */
+  INSTALL = 1,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_INSTALL_ACTION_UPDATE = 2;
+   */
+  UPDATE = 2,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_INSTALL_ACTION_REPLACE = 3;
+   */
+  REPLACE = 3,
+}
+
+/**
+ * Describes the enum joko.v1.SkillMarketInstallAction.
+ */
+export const SkillMarketInstallActionSchema: GenEnum<SkillMarketInstallAction> = /*@__PURE__*/
+  enumDesc(file_joko_v1_skill, 8);
+
+/**
+ * @generated from enum joko.v1.SkillMarketInstallStatusState
+ */
+export enum SkillMarketInstallStatusState {
+  /**
+   * @generated from enum value: SKILL_MARKET_INSTALL_STATUS_STATE_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_INSTALL_STATUS_STATE_INSTALLED = 1;
+   */
+  INSTALLED = 1,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_INSTALL_STATUS_STATE_UPDATE_AVAILABLE = 2;
+   */
+  UPDATE_AVAILABLE = 2,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_INSTALL_STATUS_STATE_CONFLICT = 3;
+   */
+  CONFLICT = 3,
+}
+
+/**
+ * Describes the enum joko.v1.SkillMarketInstallStatusState.
+ */
+export const SkillMarketInstallStatusStateSchema: GenEnum<SkillMarketInstallStatusState> = /*@__PURE__*/
+  enumDesc(file_joko_v1_skill, 9);
+
+/**
+ * @generated from enum joko.v1.SkillMarketInstallConfirmationReason
+ */
+export enum SkillMarketInstallConfirmationReason {
+  /**
+   * @generated from enum value: SKILL_MARKET_INSTALL_CONFIRMATION_REASON_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_INSTALL_CONFIRMATION_REASON_SOURCE_REPLACEMENT = 1;
+   */
+  SOURCE_REPLACEMENT = 1,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_INSTALL_CONFIRMATION_REASON_LOCAL_OWNERSHIP = 2;
+   */
+  LOCAL_OWNERSHIP = 2,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_INSTALL_CONFIRMATION_REASON_DIRTY_CONTENT = 3;
+   */
+  DIRTY_CONTENT = 3,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_INSTALL_CONFIRMATION_REASON_UNREGISTERED_DESTINATION = 4;
+   */
+  UNREGISTERED_DESTINATION = 4,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_INSTALL_CONFIRMATION_REASON_DOWNGRADE = 5;
+   */
+  DOWNGRADE = 5,
+}
+
+/**
+ * Describes the enum joko.v1.SkillMarketInstallConfirmationReason.
+ */
+export const SkillMarketInstallConfirmationReasonSchema: GenEnum<SkillMarketInstallConfirmationReason> = /*@__PURE__*/
+  enumDesc(file_joko_v1_skill, 10);
+
+/**
+ * @generated from enum joko.v1.SkillMarketSyncJobState
+ */
+export enum SkillMarketSyncJobState {
+  /**
+   * @generated from enum value: SKILL_MARKET_SYNC_JOB_STATE_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_SYNC_JOB_STATE_PENDING_REVALIDATION = 1;
+   */
+  PENDING_REVALIDATION = 1,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_SYNC_JOB_STATE_RUNNING = 2;
+   */
+  RUNNING = 2,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_SYNC_JOB_STATE_CANCELLING = 3;
+   */
+  CANCELLING = 3,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_SYNC_JOB_STATE_SUCCEEDED = 4;
+   */
+  SUCCEEDED = 4,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_SYNC_JOB_STATE_UP_TO_DATE = 5;
+   */
+  UP_TO_DATE = 5,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_SYNC_JOB_STATE_BLOCKED = 6;
+   */
+  BLOCKED = 6,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_SYNC_JOB_STATE_FAILED = 7;
+   */
+  FAILED = 7,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_SYNC_JOB_STATE_CANCELLED = 8;
+   */
+  CANCELLED = 8,
+}
+
+/**
+ * Describes the enum joko.v1.SkillMarketSyncJobState.
+ */
+export const SkillMarketSyncJobStateSchema: GenEnum<SkillMarketSyncJobState> = /*@__PURE__*/
+  enumDesc(file_joko_v1_skill, 11);
+
+/**
+ * @generated from enum joko.v1.SkillMarketSyncOutcome
+ */
+export enum SkillMarketSyncOutcome {
+  /**
+   * @generated from enum value: SKILL_MARKET_SYNC_OUTCOME_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_SYNC_OUTCOME_UPDATED = 1;
+   */
+  UPDATED = 1,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_SYNC_OUTCOME_ALREADY_CURRENT = 2;
+   */
+  ALREADY_CURRENT = 2,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_SYNC_OUTCOME_DOWNGRADE_BLOCKED = 3;
+   */
+  DOWNGRADE_BLOCKED = 3,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_SYNC_OUTCOME_DIRTY_CONTENT = 4;
+   */
+  DIRTY_CONTENT = 4,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_SYNC_OUTCOME_OWNER_CHANGED = 5;
+   */
+  OWNER_CHANGED = 5,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_SYNC_OUTCOME_TARGET_CHANGED = 6;
+   */
+  TARGET_CHANGED = 6,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_SYNC_OUTCOME_RESOURCE_REMOVED = 7;
+   */
+  RESOURCE_REMOVED = 7,
+
+  /**
+   * @generated from enum value: SKILL_MARKET_SYNC_OUTCOME_CANCELLED = 8;
+   */
+  CANCELLED = 8,
+}
+
+/**
+ * Describes the enum joko.v1.SkillMarketSyncOutcome.
+ */
+export const SkillMarketSyncOutcomeSchema: GenEnum<SkillMarketSyncOutcome> = /*@__PURE__*/
+  enumDesc(file_joko_v1_skill, 12);
 

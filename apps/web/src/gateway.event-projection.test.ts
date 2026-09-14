@@ -113,6 +113,38 @@ describe("Backend instance projection", () => {
       error: "Install the runtime before use."
     })]);
   });
+
+  it("preserves runtime resource kinds used to gate resource tooling", () => {
+    const snapshot = mapSnapshot(create(SnapshotSchema, {
+      backends: [{
+        backendId: "backend-resources",
+        displayName: "Resource runtime",
+        version: "1.0.0",
+        health: BackendHealth.HEALTHY,
+        installationState: InstallationState.INSTALLED,
+        authenticationState: AuthenticationState.AUTHENTICATED,
+        capabilities: {
+          schemaVersion: "joko.core.v1",
+          capabilities: [{
+            name: "runtime.resources",
+            support: CapabilitySupport.SUPPORTED,
+            options: {
+              kind: {
+                case: "runtime",
+                value: {
+                  reportsResources: true,
+                  resourceKinds: ["extension", "skill", "prompt", "package"]
+                }
+              }
+            }
+          }]
+        }
+      }]
+    }));
+
+    expect(snapshot.backends[0]?.capabilities.get("runtime.resources")?.options)
+      .toEqual(["extension", "skill", "prompt", "package"]);
+  });
 });
 
 describe("durable extension graphical state", () => {

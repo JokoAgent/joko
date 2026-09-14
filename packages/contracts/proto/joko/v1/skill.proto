@@ -136,3 +136,284 @@ message SkillMutationResult {
   string replaced_skill_id = 2;
   string recovery_id = 3;
 }
+
+enum SkillMarketSourceKind {
+  SKILL_MARKET_SOURCE_KIND_UNSPECIFIED = 0;
+  SKILL_MARKET_SOURCE_KIND_LOCAL = 1;
+  SKILL_MARKET_SOURCE_KIND_GIT = 2;
+}
+
+enum SkillMarketSourceState {
+  SKILL_MARKET_SOURCE_STATE_UNSPECIFIED = 0;
+  SKILL_MARKET_SOURCE_STATE_READY = 1;
+  SKILL_MARKET_SOURCE_STATE_ERROR = 2;
+}
+
+enum SkillMarketSort {
+  SKILL_MARKET_SORT_UNSPECIFIED = 0;
+  SKILL_MARKET_SORT_TRENDING = 1;
+  SKILL_MARKET_SORT_DOWNLOADS = 2;
+  SKILL_MARKET_SORT_UPDATED = 3;
+  SKILL_MARKET_SORT_CREATED = 4;
+}
+
+enum SkillMarketPreviewUnavailableReason {
+  SKILL_MARKET_PREVIEW_UNAVAILABLE_REASON_UNSPECIFIED = 0;
+  SKILL_MARKET_PREVIEW_UNAVAILABLE_REASON_BINARY = 1;
+  SKILL_MARKET_PREVIEW_UNAVAILABLE_REASON_TOO_LARGE = 2;
+}
+
+enum SkillMarketInstallAction {
+  SKILL_MARKET_INSTALL_ACTION_UNSPECIFIED = 0;
+  SKILL_MARKET_INSTALL_ACTION_INSTALL = 1;
+  SKILL_MARKET_INSTALL_ACTION_UPDATE = 2;
+  SKILL_MARKET_INSTALL_ACTION_REPLACE = 3;
+}
+
+enum SkillMarketInstallStatusState {
+  SKILL_MARKET_INSTALL_STATUS_STATE_UNSPECIFIED = 0;
+  SKILL_MARKET_INSTALL_STATUS_STATE_INSTALLED = 1;
+  SKILL_MARKET_INSTALL_STATUS_STATE_UPDATE_AVAILABLE = 2;
+  SKILL_MARKET_INSTALL_STATUS_STATE_CONFLICT = 3;
+}
+
+enum SkillMarketInstallConfirmationReason {
+  SKILL_MARKET_INSTALL_CONFIRMATION_REASON_UNSPECIFIED = 0;
+  SKILL_MARKET_INSTALL_CONFIRMATION_REASON_SOURCE_REPLACEMENT = 1;
+  SKILL_MARKET_INSTALL_CONFIRMATION_REASON_LOCAL_OWNERSHIP = 2;
+  SKILL_MARKET_INSTALL_CONFIRMATION_REASON_DIRTY_CONTENT = 3;
+  SKILL_MARKET_INSTALL_CONFIRMATION_REASON_UNREGISTERED_DESTINATION = 4;
+  SKILL_MARKET_INSTALL_CONFIRMATION_REASON_DOWNGRADE = 5;
+}
+
+enum SkillMarketSyncJobState {
+  SKILL_MARKET_SYNC_JOB_STATE_UNSPECIFIED = 0;
+  SKILL_MARKET_SYNC_JOB_STATE_PENDING_REVALIDATION = 1;
+  SKILL_MARKET_SYNC_JOB_STATE_RUNNING = 2;
+  SKILL_MARKET_SYNC_JOB_STATE_CANCELLING = 3;
+  SKILL_MARKET_SYNC_JOB_STATE_SUCCEEDED = 4;
+  SKILL_MARKET_SYNC_JOB_STATE_UP_TO_DATE = 5;
+  SKILL_MARKET_SYNC_JOB_STATE_BLOCKED = 6;
+  SKILL_MARKET_SYNC_JOB_STATE_FAILED = 7;
+  SKILL_MARKET_SYNC_JOB_STATE_CANCELLED = 8;
+}
+
+enum SkillMarketSyncOutcome {
+  SKILL_MARKET_SYNC_OUTCOME_UNSPECIFIED = 0;
+  SKILL_MARKET_SYNC_OUTCOME_UPDATED = 1;
+  SKILL_MARKET_SYNC_OUTCOME_ALREADY_CURRENT = 2;
+  SKILL_MARKET_SYNC_OUTCOME_DOWNGRADE_BLOCKED = 3;
+  SKILL_MARKET_SYNC_OUTCOME_DIRTY_CONTENT = 4;
+  SKILL_MARKET_SYNC_OUTCOME_OWNER_CHANGED = 5;
+  SKILL_MARKET_SYNC_OUTCOME_TARGET_CHANGED = 6;
+  SKILL_MARKET_SYNC_OUTCOME_RESOURCE_REMOVED = 7;
+  SKILL_MARKET_SYNC_OUTCOME_CANCELLED = 8;
+}
+
+message SkillMarketLocalSource {
+  // Write-only service-node directory explicitly selected by the user.
+  string server_path = 1;
+}
+
+message SkillMarketGitSource {
+  string repository_url = 1;
+  optional string ref = 2;
+  repeated string sparse_paths = 3;
+}
+
+message SkillMarketSourceLocation {
+  oneof kind {
+    SkillMarketLocalSource local = 1;
+    SkillMarketGitSource git = 2;
+  }
+}
+
+message SkillMarketSourceDescriptor {
+  string source_id = 1;
+  Revision revision = 2;
+  SkillMarketSourceKind kind = 3;
+  // Path-free basename, repository label, or manifest display name.
+  string display = 4;
+  string name = 5;
+  optional string display_name = 6;
+  SkillMarketSourceState state = 7;
+  string content_revision = 8;
+  uint32 entry_count = 9;
+  google.protobuf.Timestamp added_at = 10;
+  optional google.protobuf.Timestamp refreshed_at = 11;
+  optional string error = 12;
+}
+
+message SkillMarketGitPreflight {
+  bool available = 1;
+  optional string version = 2;
+  string minimum_version = 3;
+}
+
+message SkillMarketEntryIdentity {
+  string source_id = 1;
+  Revision source_revision = 2;
+  string entry_id = 3;
+  Revision entry_revision = 4;
+  string content_revision = 5;
+}
+
+message SkillMarketEntry {
+  SkillMarketEntryIdentity identity = 1;
+  string slug = 2;
+  string name = 3;
+  optional string author = 4;
+  string description = 5;
+  string category = 6;
+  repeated string tags = 7;
+  string version = 8;
+  google.protobuf.Timestamp created_at = 9;
+  google.protobuf.Timestamp updated_at = 10;
+  uint64 downloads = 11;
+  double trend_score = 12;
+  uint64 archive_bytes = 13;
+  string source_name = 14;
+  optional string source_display_name = 15;
+  SkillMarketSourceState source_state = 16;
+  optional string source_error = 17;
+  repeated SkillMarketInstallStatus install_statuses = 18;
+}
+
+message SkillMarketInstallStatus {
+  string resource_id = 1;
+  Revision resource_revision = 2;
+  string backend_id = 3;
+  optional string target_id = 4;
+  ResourceScope scope = 5;
+  SkillMarketInstallStatusState state = 6;
+  optional string installed_version = 7;
+  optional string relative_parent = 8;
+}
+
+message SkillMarketArchiveEntry {
+  string key = 1;
+  SkillFileKind kind = 2;
+  uint64 size = 3;
+}
+
+message SkillMarketPreview {
+  string preview_id = 1;
+  SkillMarketEntry entry = 2;
+  string snapshot_revision = 3;
+  uint64 files = 4;
+  uint64 bytes = 5;
+  google.protobuf.Timestamp expires_at = 6;
+}
+
+message SkillMarketPreviewFile {
+  string preview_id = 1;
+  string snapshot_revision = 2;
+  string key = 3;
+  uint64 size = 4;
+  bool previewable = 5;
+  optional string content = 6;
+  optional SkillMarketPreviewUnavailableReason unavailable_reason = 7;
+}
+
+message SkillMarketInstallTarget {
+  string backend_id = 1;
+  ResourceScope scope = 2;
+  optional string target_id = 3;
+  optional string relative_parent = 4;
+}
+
+message SkillMarketCurrentResource {
+  string resource_id = 1;
+  Revision resource_revision = 2;
+  string name = 3;
+  optional string version = 4;
+  ResourceAcquisitionKind source_kind = 5;
+  string source_display = 6;
+  string discovered_revision = 7;
+  string observed_revision = 8;
+  bool dirty = 9;
+}
+
+message SkillMarketInstallPreview {
+  SkillMarketInstallAction action = 1;
+  string resource_id = 2;
+  SkillMarketInstallTarget target = 3;
+  string name = 4;
+  string available_version = 5;
+  string candidate_revision = 6;
+  uint64 files = 7;
+  uint64 bytes = 8;
+  optional SkillMarketCurrentResource current_resource = 9;
+  bool unregistered_destination = 10;
+  bool source_replacement = 11;
+  bool preserves_enabled = 12;
+  bool diff_available = 13;
+  optional string diff_reason = 14;
+  repeated SkillDiffChange changes = 15;
+  bool diff_truncated = 16;
+}
+
+message SkillMarketInstallPlan {
+  string plan_id = 1;
+  SkillMarketEntry entry = 2;
+  SkillMarketInstallTarget target = 3;
+  SkillMarketInstallPreview preview = 4;
+  repeated SkillMarketInstallConfirmationReason confirmation_reasons = 5;
+  bool requires_confirmation = 6;
+  google.protobuf.Timestamp expires_at = 7;
+}
+
+message SkillMarketSyncTarget {
+  string backend_id = 1;
+  ResourceScope scope = 2;
+  optional string target_id = 3;
+  optional string relative_parent = 4;
+  optional Revision target_revision = 5;
+}
+
+message SkillMarketSyncBaseline {
+  Revision resource_revision = 1;
+  string resource_content_revision = 2;
+  string installed_content_revision = 3;
+  string installed_version = 4;
+  Revision source_revision = 5;
+  Revision entry_revision = 6;
+  string entry_content_revision = 7;
+}
+
+message SkillMarketSyncPolicy {
+  string resource_id = 1;
+  Revision revision = 2;
+  bool enabled = 3;
+  string source_id = 4;
+  string entry_id = 5;
+  SkillMarketSyncTarget target = 6;
+  SkillMarketSyncBaseline baseline = 7;
+  google.protobuf.Timestamp created_at = 8;
+  google.protobuf.Timestamp updated_at = 9;
+  optional string disabled_reason = 10;
+}
+
+message SkillMarketSyncJobAuthority {
+  string source_id = 1;
+  string entry_id = 2;
+  SkillMarketSyncTarget target = 3;
+  SkillMarketSyncBaseline baseline = 4;
+}
+
+message SkillMarketSyncJob {
+  string job_id = 1;
+  Revision revision = 2;
+  SkillMarketSyncJobState state = 3;
+  string policy_resource_id = 4;
+  Revision policy_revision = 5;
+  SkillMarketSyncJobAuthority authority = 6;
+  uint32 attempt = 7;
+  optional string retry_of_job_id = 8;
+  optional string available_version = 9;
+  optional SkillMarketSyncOutcome outcome = 10;
+  optional string error = 11;
+  google.protobuf.Timestamp created_at = 12;
+  google.protobuf.Timestamp updated_at = 13;
+  optional google.protobuf.Timestamp completed_at = 14;
+}

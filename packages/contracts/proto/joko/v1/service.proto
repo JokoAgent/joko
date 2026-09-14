@@ -272,6 +272,20 @@ service SkillService {
   rpc PrepareSkillRename(PrepareSkillRenameRequest) returns (PrepareSkillRenameResponse);
   rpc ListSkillRecoveries(ListSkillRecoveriesRequest) returns (ListSkillRecoveriesResponse);
   rpc CloseSkill(CloseSkillRequest) returns (CloseSkillResponse);
+  rpc GetSkillMarketGitPreflight(GetSkillMarketGitPreflightRequest) returns (GetSkillMarketGitPreflightResponse);
+  rpc ListSkillMarketSources(ListSkillMarketSourcesRequest) returns (ListSkillMarketSourcesResponse);
+  rpc ListSkillMarketCatalog(ListSkillMarketCatalogRequest) returns (ListSkillMarketCatalogResponse);
+  rpc GetSkillMarketEntry(GetSkillMarketEntryRequest) returns (GetSkillMarketEntryResponse);
+  rpc OpenSkillMarketPreview(OpenSkillMarketPreviewRequest) returns (OpenSkillMarketPreviewResponse);
+  rpc ListSkillMarketPreviewFiles(ListSkillMarketPreviewFilesRequest) returns (ListSkillMarketPreviewFilesResponse);
+  rpc ReadSkillMarketPreviewFile(ReadSkillMarketPreviewFileRequest) returns (ReadSkillMarketPreviewFileResponse);
+  rpc CloseSkillMarketPreview(CloseSkillMarketPreviewRequest) returns (CloseSkillMarketPreviewResponse);
+  rpc CreateSkillMarketInstallPlan(CreateSkillMarketInstallPlanRequest) returns (CreateSkillMarketInstallPlanResponse);
+  rpc GetSkillMarketInstallPlan(GetSkillMarketInstallPlanRequest) returns (GetSkillMarketInstallPlanResponse);
+  rpc CloseSkillMarketInstallPlan(CloseSkillMarketInstallPlanRequest) returns (CloseSkillMarketInstallPlanResponse);
+  rpc ListSkillMarketSyncPolicies(ListSkillMarketSyncPoliciesRequest) returns (ListSkillMarketSyncPoliciesResponse);
+  rpc ListSkillMarketSyncJobs(ListSkillMarketSyncJobsRequest) returns (ListSkillMarketSyncJobsResponse);
+  rpc GetSkillMarketSyncJob(GetSkillMarketSyncJobRequest) returns (GetSkillMarketSyncJobResponse);
 }
 
 service SubagentService {
@@ -2188,6 +2202,140 @@ message CloseSkillRequest {
 
 message CloseSkillResponse {
   bool closed = 1;
+}
+
+message GetSkillMarketGitPreflightRequest {}
+
+message GetSkillMarketGitPreflightResponse {
+  SkillMarketGitPreflight preflight = 1;
+}
+
+message ListSkillMarketSourcesRequest {
+  PageRequest page = 1;
+}
+
+message ListSkillMarketSourcesResponse {
+  repeated SkillMarketSourceDescriptor sources = 1;
+  Revision catalog_revision = 2;
+  bool recovered_from_corruption = 3;
+  PageInfo page = 4;
+}
+
+message ListSkillMarketCatalogRequest {
+  optional Revision expected_catalog_revision = 1;
+  string query = 2;
+  string category = 3;
+  SkillMarketSort sort = 4;
+  PageRequest page = 5;
+}
+
+message ListSkillMarketCatalogResponse {
+  repeated SkillMarketEntry entries = 1;
+  Revision catalog_revision = 2;
+  repeated string categories = 3;
+  uint32 source_count = 4;
+  PageInfo page = 5;
+}
+
+message GetSkillMarketEntryRequest {
+  SkillMarketEntryIdentity identity = 1;
+}
+
+message GetSkillMarketEntryResponse {
+  SkillMarketEntry entry = 1;
+}
+
+message OpenSkillMarketPreviewRequest {
+  SkillMarketEntryIdentity identity = 1;
+}
+
+message OpenSkillMarketPreviewResponse {
+  SkillMarketPreview preview = 1;
+}
+
+message ListSkillMarketPreviewFilesRequest {
+  string preview_id = 1;
+  string expected_snapshot_revision = 2;
+  PageRequest page = 3;
+}
+
+message ListSkillMarketPreviewFilesResponse {
+  repeated SkillMarketArchiveEntry files = 1;
+  string snapshot_revision = 2;
+  PageInfo page = 3;
+}
+
+message ReadSkillMarketPreviewFileRequest {
+  string preview_id = 1;
+  string expected_snapshot_revision = 2;
+  string key = 3;
+}
+
+message ReadSkillMarketPreviewFileResponse {
+  SkillMarketPreviewFile file = 1;
+}
+
+message CloseSkillMarketPreviewRequest {
+  string preview_id = 1;
+}
+
+message CloseSkillMarketPreviewResponse {
+  bool closed = 1;
+}
+
+message CreateSkillMarketInstallPlanRequest {
+  SkillMarketEntryIdentity identity = 1;
+  SkillMarketInstallTarget target = 2;
+}
+
+message CreateSkillMarketInstallPlanResponse {
+  SkillMarketInstallPlan plan = 1;
+}
+
+message GetSkillMarketInstallPlanRequest {
+  string plan_id = 1;
+}
+
+message GetSkillMarketInstallPlanResponse {
+  SkillMarketInstallPlan plan = 1;
+}
+
+message CloseSkillMarketInstallPlanRequest {
+  string plan_id = 1;
+}
+
+message CloseSkillMarketInstallPlanResponse {
+  bool closed = 1;
+}
+
+message ListSkillMarketSyncPoliciesRequest {
+  PageRequest page = 1;
+}
+
+message ListSkillMarketSyncPoliciesResponse {
+  repeated SkillMarketSyncPolicy policies = 1;
+  bool recovered_from_corruption = 2;
+  PageInfo page = 3;
+}
+
+message ListSkillMarketSyncJobsRequest {
+  optional string resource_id = 1;
+  PageRequest page = 2;
+}
+
+message ListSkillMarketSyncJobsResponse {
+  repeated SkillMarketSyncJob jobs = 1;
+  bool recovered_from_corruption = 2;
+  PageInfo page = 3;
+}
+
+message GetSkillMarketSyncJobRequest {
+  string job_id = 1;
+}
+
+message GetSkillMarketSyncJobResponse {
+  SkillMarketSyncJob job = 1;
+  bool recovered_from_corruption = 2;
 }
 
 message GetPiSessionStateRequest {

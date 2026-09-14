@@ -214,6 +214,15 @@ message OperationMutation {
     ApplySkillDraftMutation apply_skill_draft = 196;
     SetSkillEnabledMutation set_skill_enabled = 197;
     DeleteSkillMutation delete_skill = 198;
+    AddSkillMarketSourceMutation add_skill_market_source = 199;
+    RefreshSkillMarketSourceMutation refresh_skill_market_source = 200;
+    RemoveSkillMarketSourceMutation remove_skill_market_source = 201;
+    InstallSkillMarketPlanMutation install_skill_market_plan = 202;
+    EnableSkillMarketSyncMutation enable_skill_market_sync = 203;
+    DisableSkillMarketSyncMutation disable_skill_market_sync = 204;
+    EnqueueSkillMarketSyncMutation enqueue_skill_market_sync = 205;
+    CancelSkillMarketSyncMutation cancel_skill_market_sync = 206;
+    RetrySkillMarketSyncMutation retry_skill_market_sync = 207;
   }
 }
 
@@ -230,6 +239,53 @@ message SetSkillEnabledMutation {
 message DeleteSkillMutation {
   string session_id = 1;
   string confirmation = 2;
+}
+
+message AddSkillMarketSourceMutation {
+  SkillMarketSourceLocation source = 1;
+  Revision expected_catalog_revision = 2;
+}
+
+message RefreshSkillMarketSourceMutation {
+  string source_id = 1;
+  Revision expected_revision = 2;
+}
+
+message RemoveSkillMarketSourceMutation {
+  string source_id = 1;
+  Revision expected_revision = 2;
+}
+
+message InstallSkillMarketPlanMutation {
+  string plan_id = 1;
+  string expected_candidate_revision = 2;
+  bool confirm_replacement = 3;
+}
+
+message EnableSkillMarketSyncMutation {
+  string resource_id = 1;
+  Revision expected_resource_revision = 2;
+  SkillMarketInstallTarget target = 3;
+}
+
+message DisableSkillMarketSyncMutation {
+  string resource_id = 1;
+  Revision expected_policy_revision = 2;
+}
+
+message EnqueueSkillMarketSyncMutation {
+  string resource_id = 1;
+  Revision expected_policy_revision = 2;
+}
+
+message CancelSkillMarketSyncMutation {
+  string job_id = 1;
+  Revision expected_revision = 2;
+}
+
+message RetrySkillMarketSyncMutation {
+  string job_id = 1;
+  Revision expected_revision = 2;
 }
 
 message SetExtensionEnabledMutation {

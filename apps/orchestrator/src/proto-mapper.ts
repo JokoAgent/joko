@@ -4211,6 +4211,18 @@ function toProtoCapabilityOptions(capability: Capability): CapabilityOptions | u
         supportsPlanMode: capability.options.includes("plan_mode")
       }
     };
+  } else if (capability.key === "runtime.resources") {
+    kind = {
+      case: "runtime",
+      value: {
+        $typeName: "joko.v1.RuntimeCapabilityOptions",
+        reportsCommands: false,
+        reportsResources: true,
+        backgroundTasks: false,
+        minimumPollInterval: undefined,
+        resourceKinds: [...capability.options]
+      }
+    };
   } else {
     return undefined;
   }
@@ -4223,6 +4235,7 @@ function fromProtoCapabilityOptions(options: CapabilityOptions | undefined): rea
     case "model": return options.kind.value.effortIds;
     case "input": return options.kind.value.mediaTypes;
     case "permission": return options.kind.value.modes.map(fromProtoPermissionMode);
+    case "runtime": return options.kind.value.resourceKinds;
     default: return [];
   }
 }

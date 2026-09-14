@@ -168,6 +168,7 @@ import {
   ResourceAcquisitionSourceSchema,
   ResourceCompatibility,
   ResourceCompatibilityIssue,
+  ResourceAcquisitionKind,
   ResourceKind,
   ResourcePackageWarning,
   ResourcePermissionAction,
@@ -229,6 +230,15 @@ import {
   SkillDiffChangeKind,
   SkillDraftKind,
   SkillFileKind,
+  SkillMarketInstallAction as ProtoSkillMarketInstallAction,
+  SkillMarketInstallConfirmationReason as ProtoSkillMarketInstallConfirmationReason,
+  SkillMarketInstallStatusState as ProtoSkillMarketInstallStatusState,
+  SkillMarketPreviewUnavailableReason as ProtoSkillMarketPreviewUnavailableReason,
+  SkillMarketSort,
+  SkillMarketSourceKind as ProtoSkillMarketSourceKind,
+  SkillMarketSourceState as ProtoSkillMarketSourceState,
+  SkillMarketSyncJobState as ProtoSkillMarketSyncJobState,
+  SkillMarketSyncOutcome as ProtoSkillMarketSyncOutcome,
   SkillRecoveryStatus,
   SkillService,
   SubagentActivityKind,
@@ -340,6 +350,21 @@ import {
   type SkillDraft as ProtoSkillDraft,
   type SkillFileContent as ProtoSkillFileContent,
   type SkillFileEntry as ProtoSkillFileEntry,
+  type SkillMarketArchiveEntry as ProtoSkillMarketArchiveEntry,
+  type SkillMarketEntry as ProtoSkillMarketEntry,
+  type SkillMarketEntryIdentity as ProtoSkillMarketEntryIdentity,
+  type SkillMarketInstallPlan as ProtoSkillMarketInstallPlan,
+  type SkillMarketInstallPreview as ProtoSkillMarketInstallPreview,
+  type SkillMarketInstallStatus as ProtoSkillMarketInstallStatus,
+  type SkillMarketInstallTarget as ProtoSkillMarketInstallTarget,
+  type SkillMarketPreview as ProtoSkillMarketPreview,
+  type SkillMarketPreviewFile as ProtoSkillMarketPreviewFile,
+  type SkillMarketSourceDescriptor as ProtoSkillMarketSourceDescriptor,
+  type SkillMarketSyncBaseline as ProtoSkillMarketSyncBaseline,
+  type SkillMarketSyncJob as ProtoSkillMarketSyncJob,
+  type SkillMarketSyncJobAuthority as ProtoSkillMarketSyncJobAuthority,
+  type SkillMarketSyncPolicy as ProtoSkillMarketSyncPolicy,
+  type SkillMarketSyncTarget as ProtoSkillMarketSyncTarget,
   type SkillRecovery as ProtoSkillRecovery,
   type SkillSession as ProtoSkillSession,
   type Snapshot,
@@ -505,6 +530,30 @@ import type {
   SkillDraftView,
   SkillFileContentView,
   SkillFileEntryView,
+  SkillMarketArchiveEntryView,
+  SkillMarketArchivePageView,
+  SkillMarketCatalogPageView,
+  SkillMarketEntryIdentityView,
+  SkillMarketEntryView,
+  SkillMarketGitPreflightView,
+  SkillMarketInstallPlanView,
+  SkillMarketInstallPreviewView,
+  SkillMarketInstallStatusView,
+  SkillMarketInstallTargetView,
+  SkillMarketPreviewFileView,
+  SkillMarketPreviewView,
+  SkillMarketSourceCatalogView,
+  SkillMarketSourceDraft,
+  SkillMarketSourceView,
+  SkillMarketSortView,
+  SkillMarketSyncBaselineView,
+  SkillMarketSyncCatalogView,
+  SkillMarketSyncJobAuthorityView,
+  SkillMarketSyncJobStateView,
+  SkillMarketSyncJobView,
+  SkillMarketSyncOutcomeView,
+  SkillMarketSyncPolicyView,
+  SkillMarketSyncTargetView,
   SkillMutationResultView,
   SkillRecoveryView,
   SkillSessionView,
@@ -3011,6 +3060,424 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const scope = this.captureActionScope(signal);
     const response = await createClient(SkillService, scope.transport).closeSkill({ sessionId }, { signal: scope.signal });
     return response.closed;
+  }
+
+  async getSkillMarketGitPreflight(signal?: AbortSignal): Promise<SkillMarketGitPreflightView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport)
+      .getSkillMarketGitPreflight({}, { signal: scope.signal });
+    const preflight = response.preflight;
+    if (preflight === undefined || preflight.minimumVersion.trim() === "") {
+      throw new GatewayError("The service returned an incomplete Skill market Git preflight result.");
+    }
+    return {
+      available: preflight.available,
+      ...(preflight.version === undefined ? {} : { version: preflight.version }),
+      minimumVersion: preflight.minimumVersion
+    };
+  }
+
+  async listSkillMarketSources(signal?: AbortSignal): Promise<SkillMarketSourceCatalogView> {
+    const scope = this.captureActionScope(signal);
+    const client = createClient(SkillService, scope.transport);
+    sourceCatalogAttempts:
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const sources: SkillMarketSourceView[] = [];
+      const ids = new Set<string>();
+      const consumedTokens = new Set<string>();
+      let pageToken = "";
+      let revision: bigint | undefined;
+      let recoveredFromCorruption = false;
+      let totalSize: number | undefined;
+      for (let pageIndex = 0; pageIndex < MAX_COMPLETE_MESSAGE_SEARCH_PAGES; pageIndex += 1) {
+        scope.signal.throwIfAborted();
+        const response = await client.listSkillMarketSources(
+          { page: { pageSize: 500, pageToken } },
+          { signal: scope.signal }
+        );
+        const pageRevision = response.catalogRevision?.value;
+        if (pageRevision === undefined) throw new GatewayError("The service returned Skill market sources without a catalog revision.");
+        if (revision === undefined) {
+          revision = pageRevision;
+          recoveredFromCorruption = response.recoveredFromCorruption;
+        } else if (revision !== pageRevision || recoveredFromCorruption !== response.recoveredFromCorruption) {
+          if (attempt === 0) continue sourceCatalogAttempts;
+          throw new GatewayError("Skill market sources changed repeatedly while they were being loaded.");
+        }
+        const pageTotal = response.page === undefined ? undefined : exactSafeUnsignedNumber(response.page.totalSize);
+        if (pageTotal === undefined || (totalSize !== undefined && totalSize !== pageTotal)) {
+          throw new GatewayError("The service returned an invalid Skill market source catalog size.");
+        }
+        totalSize = pageTotal;
+        if (response.sources.length > 500 || sources.length + response.sources.length > pageTotal) {
+          throw new GatewayError("The service returned an invalid Skill market source page.");
+        }
+        for (const value of response.sources) {
+          const mapped = mapSkillMarketSource(value);
+          if (ids.has(mapped.id)) throw new GatewayError("The service returned a duplicate Skill market source identity.");
+          ids.add(mapped.id);
+          sources.push(mapped);
+        }
+        const nextPageToken = response.page?.nextPageToken ?? "";
+        if (nextPageToken === "") {
+          if (sources.length !== pageTotal) throw new GatewayError("The service returned an incomplete Skill market source catalog.");
+          return { revision, sources, recoveredFromCorruption };
+        }
+        if (nextPageToken === pageToken || consumedTokens.has(nextPageToken)) {
+          throw new GatewayError("The service returned a cyclic Skill market source page token.");
+        }
+        consumedTokens.add(nextPageToken);
+        pageToken = nextPageToken;
+      }
+      throw new GatewayError("Skill market sources exceeded the safe pagination limit.");
+    }
+    throw new GatewayError("Skill market sources changed repeatedly while they were being loaded.");
+  }
+
+  async addSkillMarketSource(
+    source: SkillMarketSourceDraft,
+    expectedCatalogRevision: bigint,
+    signal?: AbortSignal
+  ): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    await this.submit({
+      case: "addSkillMarketSource",
+      value: {
+        source: protoSkillMarketSource(source),
+        expectedCatalogRevision: { value: expectedCatalogRevision }
+      }
+    }, true, [], scope.signal);
+  }
+
+  async refreshSkillMarketSource(sourceId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    await this.submit({
+      case: "refreshSkillMarketSource",
+      value: { sourceId, expectedRevision: { value: expectedRevision } }
+    }, true, [], scope.signal);
+  }
+
+  async removeSkillMarketSource(sourceId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    await this.submit({
+      case: "removeSkillMarketSource",
+      value: { sourceId, expectedRevision: { value: expectedRevision } }
+    }, true, [], scope.signal);
+  }
+
+  async listSkillMarketCatalog(options: {
+    readonly expectedRevision?: bigint;
+    readonly query?: string;
+    readonly category?: string;
+    readonly sort?: SkillMarketSortView;
+    readonly pageToken?: string;
+    readonly pageSize?: number;
+    readonly signal?: AbortSignal;
+  } = {}): Promise<SkillMarketCatalogPageView> {
+    const scope = this.captureActionScope(options.signal);
+    const pageSize = Math.min(Math.max(Math.trunc(options.pageSize ?? 24), 1), 100);
+    const response = await createClient(SkillService, scope.transport).listSkillMarketCatalog({
+      ...(options.expectedRevision === undefined ? {} : { expectedCatalogRevision: { value: options.expectedRevision } }),
+      query: options.query?.trim() ?? "",
+      category: options.category?.trim() ?? "",
+      sort: protoSkillMarketSort(options.sort ?? "trending"),
+      page: { pageSize, pageToken: options.pageToken ?? "" }
+    }, { signal: scope.signal });
+    const revision = response.catalogRevision?.value;
+    const totalSize = response.page === undefined ? undefined : exactSafeUnsignedNumber(response.page.totalSize);
+    if (revision === undefined || totalSize === undefined || response.sourceCount < 0 || !Number.isSafeInteger(response.sourceCount)
+      || response.entries.length > pageSize || response.entries.length > totalSize) {
+      throw new GatewayError("The service returned an invalid Skill market catalog page.");
+    }
+    const identities = new Set<string>();
+    const entries = response.entries.map((value) => {
+      const entry = mapSkillMarketEntry(value);
+      const key = `${entry.identity.sourceId}\0${entry.identity.entryId}`;
+      if (identities.has(key)) throw new GatewayError("The service returned a duplicate Skill market entry identity.");
+      identities.add(key);
+      return entry;
+    });
+    if (response.page?.nextPageToken === "" && entries.length > totalSize) {
+      throw new GatewayError("The service returned an inconsistent Skill market catalog page.");
+    }
+    const categories = response.categories.map((value) => value.trim());
+    if (categories.some((value) => value === "") || new Set(categories).size !== categories.length) {
+      throw new GatewayError("The service returned invalid Skill market categories.");
+    }
+    return {
+      revision,
+      entries,
+      categories,
+      sourceCount: response.sourceCount,
+      totalSize,
+      ...(response.page?.nextPageToken ? { nextPageToken: response.page.nextPageToken } : {})
+    };
+  }
+
+  async getSkillMarketEntry(identity: SkillMarketEntryIdentityView, signal?: AbortSignal): Promise<SkillMarketEntryView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).getSkillMarketEntry(
+      { identity: protoSkillMarketIdentity(identity) },
+      { signal: scope.signal }
+    );
+    if (response.entry === undefined) throw new GatewayError("The service returned an empty Skill market entry.");
+    return mapSkillMarketEntry(response.entry);
+  }
+
+  async openSkillMarketPreview(identity: SkillMarketEntryIdentityView, signal?: AbortSignal): Promise<SkillMarketPreviewView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).openSkillMarketPreview(
+      { identity: protoSkillMarketIdentity(identity) },
+      { signal: scope.signal }
+    );
+    if (response.preview === undefined) throw new GatewayError("The service returned an empty Skill market preview.");
+    return mapSkillMarketPreview(response.preview);
+  }
+
+  async listSkillMarketPreviewFiles(
+    preview: SkillMarketPreviewView,
+    pageToken = "",
+    pageSize = 100,
+    signal?: AbortSignal
+  ): Promise<SkillMarketArchivePageView> {
+    const scope = this.captureActionScope(signal);
+    const size = Math.min(Math.max(Math.trunc(pageSize), 1), 500);
+    const response = await createClient(SkillService, scope.transport).listSkillMarketPreviewFiles({
+      previewId: preview.id,
+      expectedSnapshotRevision: preview.snapshotRevision,
+      page: { pageSize: size, pageToken }
+    }, { signal: scope.signal });
+    const totalSize = response.page === undefined ? undefined : exactSafeUnsignedNumber(response.page.totalSize);
+    if (response.snapshotRevision !== preview.snapshotRevision || totalSize === undefined
+      || response.files.length > size || response.files.length > totalSize) {
+      throw new GatewayError("The service returned an invalid Skill market preview file page.");
+    }
+    const keys = new Set<string>();
+    const files = response.files.map((value) => {
+      const file = mapSkillMarketArchiveEntry(value);
+      if (keys.has(file.key)) throw new GatewayError("The service returned a duplicate Skill market preview file key.");
+      keys.add(file.key);
+      return file;
+    });
+    return {
+      snapshotRevision: response.snapshotRevision,
+      files,
+      totalSize,
+      ...(response.page?.nextPageToken ? { nextPageToken: response.page.nextPageToken } : {})
+    };
+  }
+
+  async readSkillMarketPreviewFile(
+    preview: SkillMarketPreviewView,
+    key: string,
+    signal?: AbortSignal
+  ): Promise<SkillMarketPreviewFileView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).readSkillMarketPreviewFile({
+      previewId: preview.id,
+      expectedSnapshotRevision: preview.snapshotRevision,
+      key
+    }, { signal: scope.signal });
+    if (response.file === undefined) throw new GatewayError("The service returned an empty Skill market preview file.");
+    return mapSkillMarketPreviewFile(response.file, preview);
+  }
+
+  async closeSkillMarketPreview(previewId: string, signal?: AbortSignal): Promise<boolean> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).closeSkillMarketPreview(
+      { previewId },
+      { signal: scope.signal }
+    );
+    return response.closed;
+  }
+
+  async createSkillMarketInstallPlan(
+    identity: SkillMarketEntryIdentityView,
+    target: SkillMarketInstallTargetView,
+    signal?: AbortSignal
+  ): Promise<SkillMarketInstallPlanView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).createSkillMarketInstallPlan({
+      identity: protoSkillMarketIdentity(identity),
+      target: protoSkillMarketInstallTarget(target)
+    }, { signal: scope.signal });
+    if (response.plan === undefined) throw new GatewayError("The service returned an empty Skill market install plan.");
+    return mapSkillMarketInstallPlan(response.plan);
+  }
+
+  async getSkillMarketInstallPlan(planId: string, signal?: AbortSignal): Promise<SkillMarketInstallPlanView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).getSkillMarketInstallPlan(
+      { planId },
+      { signal: scope.signal }
+    );
+    if (response.plan === undefined) throw new GatewayError("The service returned an empty Skill market install plan.");
+    return mapSkillMarketInstallPlan(response.plan);
+  }
+
+  async closeSkillMarketInstallPlan(planId: string, signal?: AbortSignal): Promise<boolean> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).closeSkillMarketInstallPlan(
+      { planId },
+      { signal: scope.signal }
+    );
+    return response.closed;
+  }
+
+  async installSkillMarketPlan(
+    plan: SkillMarketInstallPlanView,
+    confirmReplacement: boolean,
+    signal?: AbortSignal
+  ): Promise<SkillMutationResultView> {
+    const scope = this.captureActionScope(signal);
+    return skillMutationResult(await this.submit({
+      case: "installSkillMarketPlan",
+      value: {
+        planId: plan.id,
+        expectedCandidateRevision: plan.preview.candidateRevision,
+        confirmReplacement
+      }
+    }, true, [], scope.signal));
+  }
+
+  async listSkillMarketSyncPolicies(signal?: AbortSignal): Promise<SkillMarketSyncCatalogView<SkillMarketSyncPolicyView>> {
+    const scope = this.captureActionScope(signal);
+    const client = createClient(SkillService, scope.transport);
+    const items: SkillMarketSyncPolicyView[] = [];
+    const identities = new Set<string>();
+    const consumedTokens = new Set<string>();
+    let pageToken = "";
+    let totalSize: number | undefined;
+    let recoveredFromCorruption: boolean | undefined;
+    for (let pageIndex = 0; pageIndex < MAX_COMPLETE_MESSAGE_SEARCH_PAGES; pageIndex += 1) {
+      const response = await client.listSkillMarketSyncPolicies(
+        { page: { pageSize: 500, pageToken } },
+        { signal: scope.signal }
+      );
+      const pageTotal = response.page === undefined ? undefined : exactSafeUnsignedNumber(response.page.totalSize);
+      if (pageTotal === undefined || (totalSize !== undefined && totalSize !== pageTotal)
+        || (recoveredFromCorruption !== undefined && recoveredFromCorruption !== response.recoveredFromCorruption)) {
+        throw new GatewayError("The service returned an inconsistent Skill market sync policy page.");
+      }
+      totalSize = pageTotal;
+      recoveredFromCorruption = response.recoveredFromCorruption;
+      for (const value of response.policies) {
+        const mapped = mapSkillMarketSyncPolicy(value);
+        if (identities.has(mapped.resourceId)) throw new GatewayError("The service returned a duplicate Skill market sync policy.");
+        identities.add(mapped.resourceId);
+        items.push(mapped);
+      }
+      if (items.length > pageTotal) throw new GatewayError("The service returned too many Skill market sync policies.");
+      const next = response.page?.nextPageToken ?? "";
+      if (next === "") {
+        if (items.length !== pageTotal) throw new GatewayError("The service returned an incomplete Skill market sync policy catalog.");
+        return { items, recoveredFromCorruption: recoveredFromCorruption ?? false };
+      }
+      if (next === pageToken || consumedTokens.has(next)) throw new GatewayError("The service returned a cyclic Skill market sync policy page token.");
+      consumedTokens.add(next);
+      pageToken = next;
+    }
+    throw new GatewayError("Skill market sync policies exceeded the safe pagination limit.");
+  }
+
+  async listSkillMarketSyncJobs(
+    resourceId?: string,
+    signal?: AbortSignal
+  ): Promise<SkillMarketSyncCatalogView<SkillMarketSyncJobView>> {
+    const scope = this.captureActionScope(signal);
+    const client = createClient(SkillService, scope.transport);
+    const items: SkillMarketSyncJobView[] = [];
+    const identities = new Set<string>();
+    const consumedTokens = new Set<string>();
+    let pageToken = "";
+    let totalSize: number | undefined;
+    let recoveredFromCorruption: boolean | undefined;
+    for (let pageIndex = 0; pageIndex < MAX_COMPLETE_MESSAGE_SEARCH_PAGES; pageIndex += 1) {
+      const response = await client.listSkillMarketSyncJobs({
+        ...(resourceId === undefined ? {} : { resourceId }),
+        page: { pageSize: 500, pageToken }
+      }, { signal: scope.signal });
+      const pageTotal = response.page === undefined ? undefined : exactSafeUnsignedNumber(response.page.totalSize);
+      if (pageTotal === undefined || (totalSize !== undefined && totalSize !== pageTotal)
+        || (recoveredFromCorruption !== undefined && recoveredFromCorruption !== response.recoveredFromCorruption)) {
+        throw new GatewayError("The service returned an inconsistent Skill market sync job page.");
+      }
+      totalSize = pageTotal;
+      recoveredFromCorruption = response.recoveredFromCorruption;
+      for (const value of response.jobs) {
+        const mapped = mapSkillMarketSyncJob(value);
+        if ((resourceId !== undefined && mapped.policyResourceId !== resourceId) || identities.has(mapped.id)) {
+          throw new GatewayError("The service returned an invalid Skill market sync job identity.");
+        }
+        identities.add(mapped.id);
+        items.push(mapped);
+      }
+      if (items.length > pageTotal) throw new GatewayError("The service returned too many Skill market sync jobs.");
+      const next = response.page?.nextPageToken ?? "";
+      if (next === "") {
+        if (items.length !== pageTotal) throw new GatewayError("The service returned an incomplete Skill market sync job catalog.");
+        return { items, recoveredFromCorruption: recoveredFromCorruption ?? false };
+      }
+      if (next === pageToken || consumedTokens.has(next)) throw new GatewayError("The service returned a cyclic Skill market sync job page token.");
+      consumedTokens.add(next);
+      pageToken = next;
+    }
+    throw new GatewayError("Skill market sync jobs exceeded the safe pagination limit.");
+  }
+
+  async getSkillMarketSyncJob(jobId: string, signal?: AbortSignal): Promise<SkillMarketSyncJobView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).getSkillMarketSyncJob(
+      { jobId },
+      { signal: scope.signal }
+    );
+    if (response.job === undefined) throw new GatewayError("The service returned an empty Skill market sync job.");
+    return mapSkillMarketSyncJob(response.job);
+  }
+
+  async enableSkillMarketSync(
+    resourceId: string,
+    expectedResourceRevision: bigint,
+    target: SkillMarketInstallTargetView,
+    signal?: AbortSignal
+  ): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    await this.submit({
+      case: "enableSkillMarketSync",
+      value: { resourceId, expectedResourceRevision: { value: expectedResourceRevision }, target: protoSkillMarketInstallTarget(target) }
+    }, true, [], scope.signal);
+  }
+
+  async disableSkillMarketSync(policy: SkillMarketSyncPolicyView, signal?: AbortSignal): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    await this.submit({
+      case: "disableSkillMarketSync",
+      value: { resourceId: policy.resourceId, expectedPolicyRevision: { value: policy.revision } }
+    }, true, [], scope.signal);
+  }
+
+  async enqueueSkillMarketSync(policy: SkillMarketSyncPolicyView, signal?: AbortSignal): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    await this.submit({
+      case: "enqueueSkillMarketSync",
+      value: { resourceId: policy.resourceId, expectedPolicyRevision: { value: policy.revision } }
+    }, true, [], scope.signal);
+  }
+
+  async cancelSkillMarketSync(job: SkillMarketSyncJobView, signal?: AbortSignal): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    await this.submit({
+      case: "cancelSkillMarketSync",
+      value: { jobId: job.id, expectedRevision: { value: job.revision } }
+    }, true, [], scope.signal);
+  }
+
+  async retrySkillMarketSync(job: SkillMarketSyncJobView, signal?: AbortSignal): Promise<void> {
+    const scope = this.captureActionScope(signal);
+    await this.submit({
+      case: "retrySkillMarketSync",
+      value: { jobId: job.id, expectedRevision: { value: job.revision } }
+    }, true, [], scope.signal);
   }
 
   async listCommands(sessionId: string): Promise<readonly RuntimeCommandView[]> {
@@ -10686,6 +11153,503 @@ function skillMutationResult(operation: Operation): SkillMutationResultView {
   };
 }
 
+function protoSkillMarketSource(source: SkillMarketSourceDraft) {
+  return {
+    kind: source.kind === "local"
+      ? { case: "local" as const, value: { serverPath: source.serverPath } }
+      : {
+          case: "git" as const,
+          value: {
+            repositoryUrl: source.repositoryUrl,
+            ...(source.ref === undefined ? {} : { ref: source.ref }),
+            sparsePaths: [...source.sparsePaths]
+          }
+        }
+  };
+}
+
+function protoSkillMarketIdentity(identity: SkillMarketEntryIdentityView) {
+  return {
+    sourceId: identity.sourceId,
+    sourceRevision: { value: identity.sourceRevision },
+    entryId: identity.entryId,
+    entryRevision: { value: identity.entryRevision },
+    contentRevision: identity.contentRevision
+  };
+}
+
+function protoSkillMarketInstallTarget(target: SkillMarketInstallTargetView) {
+  return {
+    backendId: target.backendId,
+    scope: target.scope === "global" ? ResourceScope.GLOBAL : ResourceScope.PROJECT,
+    ...(target.targetId === undefined ? {} : { targetId: target.targetId }),
+    ...(target.relativeParent === undefined ? {} : { relativeParent: target.relativeParent })
+  };
+}
+
+function protoSkillMarketSort(sort: SkillMarketSortView): SkillMarketSort {
+  switch (sort) {
+    case "trending": return SkillMarketSort.TRENDING;
+    case "downloads": return SkillMarketSort.DOWNLOADS;
+    case "updated": return SkillMarketSort.UPDATED;
+    case "created": return SkillMarketSort.CREATED;
+  }
+}
+
+function mapSkillMarketSource(source: ProtoSkillMarketSourceDescriptor): SkillMarketSourceView {
+  const revision = source.revision?.value;
+  const state = source.state === ProtoSkillMarketSourceState.READY
+    ? "ready" as const
+    : source.state === ProtoSkillMarketSourceState.ERROR
+      ? "error" as const
+      : undefined;
+  const kind = source.kind === ProtoSkillMarketSourceKind.LOCAL
+    ? "local" as const
+    : source.kind === ProtoSkillMarketSourceKind.GIT
+      ? "git" as const
+      : undefined;
+  const addedAt = source.addedAt === undefined ? undefined : timestampMs(source.addedAt);
+  const refreshedAt = source.refreshedAt === undefined ? undefined : timestampMs(source.refreshedAt);
+  if (!/^skill_market_source_[a-f0-9]{32}$/u.test(source.sourceId) || revision === undefined || revision < 1n
+    || kind === undefined || state === undefined || source.display.trim() === "" || privatePathLikeLabel(source.display)
+    || source.name.trim() === "" || privatePathLikeLabel(source.name) || (source.displayName !== undefined && privatePathLikeLabel(source.displayName))
+    || !/^sha256:[a-f0-9]{64}$/u.test(source.contentRevision) || !Number.isSafeInteger(source.entryCount) || source.entryCount < 0
+    || addedAt === undefined || !Number.isSafeInteger(addedAt) || addedAt < 0
+    || (refreshedAt !== undefined && (!Number.isSafeInteger(refreshedAt) || refreshedAt < addedAt))
+    || (state === "error") !== (source.error !== undefined)) {
+    throw new GatewayError("The service returned an invalid or path-bearing Skill market source.");
+  }
+  return {
+    id: source.sourceId,
+    revision,
+    kind,
+    display: source.display,
+    name: source.name,
+    ...(source.displayName === undefined ? {} : { displayName: source.displayName }),
+    state,
+    contentRevision: source.contentRevision,
+    entryCount: source.entryCount,
+    addedAt,
+    ...(refreshedAt === undefined ? {} : { refreshedAt }),
+    ...(source.error === undefined ? {} : { error: source.error })
+  };
+}
+
+function mapSkillMarketIdentity(identity: ProtoSkillMarketEntryIdentity | undefined): SkillMarketEntryIdentityView {
+  const sourceRevision = identity?.sourceRevision?.value;
+  const entryRevision = identity?.entryRevision?.value;
+  if (identity === undefined || !/^skill_market_source_[a-f0-9]{32}$/u.test(identity.sourceId)
+    || !/^skill_market_entry_[a-f0-9]{32}$/u.test(identity.entryId)
+    || sourceRevision === undefined || sourceRevision < 1n || entryRevision === undefined || entryRevision < 1n
+    || !/^sha256:[a-f0-9]{64}$/u.test(identity.contentRevision)) {
+    throw new GatewayError("The service returned an invalid Skill market entry identity.");
+  }
+  return {
+    sourceId: identity.sourceId,
+    sourceRevision,
+    entryId: identity.entryId,
+    entryRevision,
+    contentRevision: identity.contentRevision
+  };
+}
+
+function mapSkillMarketEntry(entry: ProtoSkillMarketEntry): SkillMarketEntryView {
+  const downloads = exactSafeUnsignedNumber(entry.downloads);
+  const archiveBytes = exactSafeUnsignedNumber(entry.archiveBytes);
+  const sourceState = entry.sourceState === ProtoSkillMarketSourceState.READY
+    ? "ready" as const
+    : entry.sourceState === ProtoSkillMarketSourceState.ERROR
+      ? "error" as const
+      : undefined;
+  const createdAt = entry.createdAt === undefined ? undefined : timestampMs(entry.createdAt);
+  const updatedAt = entry.updatedAt === undefined ? undefined : timestampMs(entry.updatedAt);
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(entry.slug) || entry.name.trim() === "" || entry.category.trim() === ""
+    || entry.version.trim() === "" || entry.sourceName.trim() === "" || privatePathLikeLabel(entry.sourceName)
+    || (entry.sourceDisplayName !== undefined && privatePathLikeLabel(entry.sourceDisplayName))
+    || entry.tags.some((value) => value.trim() === "") || new Set(entry.tags).size !== entry.tags.length
+    || downloads === undefined || archiveBytes === undefined || !Number.isFinite(entry.trendScore) || entry.trendScore < 0
+    || sourceState === undefined || createdAt === undefined || updatedAt === undefined || createdAt < 0 || updatedAt < createdAt
+    || (sourceState === "error") !== (entry.sourceError !== undefined)) {
+    throw new GatewayError("The service returned an invalid or path-bearing Skill market entry.");
+  }
+  const installStatuses = entry.installStatuses.map(mapSkillMarketInstallStatus);
+  if (new Set(installStatuses.map((status) => status.resourceId)).size !== installStatuses.length) {
+    throw new GatewayError("The service returned duplicate Skill market install statuses.");
+  }
+  return {
+    identity: mapSkillMarketIdentity(entry.identity),
+    slug: entry.slug,
+    name: entry.name,
+    ...(entry.author === undefined ? {} : { author: entry.author }),
+    description: entry.description,
+    category: entry.category,
+    tags: [...entry.tags],
+    version: entry.version,
+    createdAt,
+    updatedAt,
+    downloads,
+    trendScore: entry.trendScore,
+    archiveBytes,
+    sourceName: entry.sourceName,
+    ...(entry.sourceDisplayName === undefined ? {} : { sourceDisplayName: entry.sourceDisplayName }),
+    sourceState,
+    ...(entry.sourceError === undefined ? {} : { sourceError: entry.sourceError }),
+    installStatuses
+  };
+}
+
+function mapSkillMarketInstallStatus(status: ProtoSkillMarketInstallStatus): SkillMarketInstallStatusView {
+  const resourceRevision = status.resourceRevision?.value;
+  const scope = status.scope === ResourceScope.GLOBAL
+    ? "global" as const
+    : status.scope === ResourceScope.PROJECT
+      ? "project" as const
+      : undefined;
+  const state = status.state === ProtoSkillMarketInstallStatusState.INSTALLED
+    ? "installed" as const
+    : status.state === ProtoSkillMarketInstallStatusState.UPDATE_AVAILABLE
+      ? "updateAvailable" as const
+      : status.state === ProtoSkillMarketInstallStatusState.CONFLICT
+        ? "conflict" as const
+        : undefined;
+  if (status.resourceId.trim() === "" || status.backendId.trim() === "" || resourceRevision === undefined
+    || resourceRevision < 1n || scope === undefined || state === undefined
+    || (scope === "global" && (status.targetId !== undefined || status.relativeParent !== undefined))
+    || (scope === "project" && (status.targetId === undefined || status.targetId.trim() === ""
+      || status.relativeParent === undefined || !portableSkillKey(status.relativeParent)))
+    || (status.installedVersion !== undefined && status.installedVersion.trim() === "")) {
+    throw new GatewayError("The service returned an invalid Skill market install status.");
+  }
+  return {
+    resourceId: status.resourceId,
+    resourceRevision,
+    backendId: status.backendId,
+    ...(status.targetId === undefined ? {} : { targetId: status.targetId }),
+    scope,
+    ...(status.relativeParent === undefined ? {} : { relativeParent: status.relativeParent }),
+    state,
+    ...(status.installedVersion === undefined ? {} : { installedVersion: status.installedVersion })
+  };
+}
+
+function mapSkillMarketArchiveEntry(file: ProtoSkillMarketArchiveEntry): SkillMarketArchiveEntryView {
+  const kind = file.kind === SkillFileKind.DIRECTORY
+    ? "directory" as const
+    : file.kind === SkillFileKind.FILE
+      ? "file" as const
+      : undefined;
+  const size = exactSafeUnsignedNumber(file.size);
+  if (kind === undefined || size === undefined || !portableSkillKey(file.key)) {
+    throw new GatewayError("The service returned an invalid Skill market archive entry.");
+  }
+  return { key: file.key, kind, size };
+}
+
+function mapSkillMarketPreview(preview: ProtoSkillMarketPreview): SkillMarketPreviewView {
+  const files = exactSafeUnsignedNumber(preview.files);
+  const bytes = exactSafeUnsignedNumber(preview.bytes);
+  if (!/^skill_market_preview_[a-f0-9]{32}$/u.test(preview.previewId)
+    || !/^sha256:[a-f0-9]{64}$/u.test(preview.snapshotRevision) || files === undefined || bytes === undefined
+    || preview.entry === undefined || preview.expiresAt === undefined) {
+    throw new GatewayError("The service returned an invalid Skill market preview.");
+  }
+  return {
+    id: preview.previewId,
+    entry: mapSkillMarketEntry(preview.entry),
+    snapshotRevision: preview.snapshotRevision,
+    files,
+    bytes,
+    expiresAt: timestampMs(preview.expiresAt)
+  };
+}
+
+function mapSkillMarketPreviewFile(
+  file: ProtoSkillMarketPreviewFile,
+  preview: SkillMarketPreviewView
+): SkillMarketPreviewFileView {
+  const size = exactSafeUnsignedNumber(file.size);
+  const unavailableReason = file.unavailableReason === undefined
+    ? undefined
+    : file.unavailableReason === ProtoSkillMarketPreviewUnavailableReason.BINARY
+      ? "binary" as const
+      : file.unavailableReason === ProtoSkillMarketPreviewUnavailableReason.TOO_LARGE
+        ? "tooLarge" as const
+        : null;
+  if (file.previewId !== preview.id || file.snapshotRevision !== preview.snapshotRevision
+    || !portableSkillKey(file.key) || size === undefined || unavailableReason === null
+    || file.previewable !== (file.content !== undefined) || file.previewable === (unavailableReason !== undefined)) {
+    throw new GatewayError("The service returned an invalid Skill market preview file.");
+  }
+  return {
+    previewId: file.previewId,
+    snapshotRevision: file.snapshotRevision,
+    key: file.key,
+    size,
+    previewable: file.previewable,
+    ...(file.content === undefined ? {} : { content: file.content }),
+    ...(unavailableReason === undefined ? {} : { unavailableReason })
+  };
+}
+
+function mapSkillMarketInstallTarget(target: {
+  readonly backendId: string;
+  readonly scope: ResourceScope;
+  readonly targetId?: string;
+  readonly relativeParent?: string;
+} | undefined): SkillMarketInstallTargetView {
+  const scope = target?.scope === ResourceScope.GLOBAL
+    ? "global" as const
+    : target?.scope === ResourceScope.PROJECT
+      ? "project" as const
+      : undefined;
+  if (target === undefined || target.backendId.trim() === "" || scope === undefined
+    || (scope === "global" && (target.targetId !== undefined || target.relativeParent !== undefined))
+    || (scope === "project" && (target.targetId?.trim() ?? "") === "")
+    || (target.relativeParent !== undefined && !portableSkillKey(target.relativeParent))) {
+    throw new GatewayError("The service returned an invalid Skill market install target.");
+  }
+  return {
+    backendId: target.backendId,
+    scope,
+    ...(target.targetId === undefined ? {} : { targetId: target.targetId }),
+    ...(target.relativeParent === undefined ? {} : { relativeParent: target.relativeParent })
+  };
+}
+
+function mapSkillMarketCurrentResource(value: NonNullable<ProtoSkillMarketInstallPreview["currentResource"]>) {
+  const resourceRevision = value.resourceRevision?.value;
+  const sourceKind = value.sourceKind === ResourceAcquisitionKind.LOCAL
+    ? "local" as const
+    : value.sourceKind === ResourceAcquisitionKind.NPM
+      ? "npm" as const
+      : value.sourceKind === ResourceAcquisitionKind.GIT
+        ? "git" as const
+        : value.sourceKind === ResourceAcquisitionKind.EXTENSION_SOURCE
+          ? "extensionSource" as const
+          : value.sourceKind === ResourceAcquisitionKind.SKILL_MARKET
+            ? "skillMarket" as const
+            : undefined;
+  if (value.resourceId.trim() === "" || resourceRevision === undefined || resourceRevision < 1n || value.name.trim() === ""
+    || sourceKind === undefined || value.sourceDisplay.trim() === "" || privatePathLikeLabel(value.sourceDisplay)
+    || value.discoveredRevision.trim() === "" || value.observedRevision.trim() === "") {
+    throw new GatewayError("The service returned an invalid or path-bearing current Skill resource.");
+  }
+  return {
+    resourceId: value.resourceId,
+    resourceRevision,
+    name: value.name,
+    ...(value.version === undefined ? {} : { version: value.version }),
+    sourceKind,
+    sourceDisplay: value.sourceDisplay,
+    discoveredRevision: value.discoveredRevision,
+    observedRevision: value.observedRevision,
+    dirty: value.dirty
+  };
+}
+
+function mapSkillMarketInstallPreview(preview: ProtoSkillMarketInstallPreview): SkillMarketInstallPreviewView {
+  const action = preview.action === ProtoSkillMarketInstallAction.INSTALL
+    ? "install" as const
+    : preview.action === ProtoSkillMarketInstallAction.UPDATE
+      ? "update" as const
+      : preview.action === ProtoSkillMarketInstallAction.REPLACE
+        ? "replace" as const
+        : undefined;
+  const files = exactSafeUnsignedNumber(preview.files);
+  const bytes = exactSafeUnsignedNumber(preview.bytes);
+  if (action === undefined || preview.resourceId.trim() === "" || preview.name.trim() === ""
+    || preview.availableVersion.trim() === "" || !/^sha256:[a-f0-9]{64}$/u.test(preview.candidateRevision)
+    || files === undefined || bytes === undefined || (preview.diffAvailable === false && preview.changes.length > 0)) {
+    throw new GatewayError("The service returned an invalid Skill market install preview.");
+  }
+  return {
+    action,
+    resourceId: preview.resourceId,
+    target: mapSkillMarketInstallTarget(preview.target),
+    name: preview.name,
+    availableVersion: preview.availableVersion,
+    candidateRevision: preview.candidateRevision,
+    files,
+    bytes,
+    ...(preview.currentResource === undefined ? {} : { currentResource: mapSkillMarketCurrentResource(preview.currentResource) }),
+    unregisteredDestination: preview.unregisteredDestination,
+    sourceReplacement: preview.sourceReplacement,
+    preservesEnabled: preview.preservesEnabled,
+    diffAvailable: preview.diffAvailable,
+    ...(preview.diffReason === undefined ? {} : { diffReason: preview.diffReason }),
+    changes: preview.changes.map(mapSkillDiffChange),
+    diffTruncated: preview.diffTruncated
+  };
+}
+
+function mapSkillMarketConfirmationReason(
+  value: ProtoSkillMarketInstallConfirmationReason
+): SkillMarketInstallPlanView["confirmationReasons"][number] {
+  switch (value) {
+    case ProtoSkillMarketInstallConfirmationReason.SOURCE_REPLACEMENT: return "sourceReplacement";
+    case ProtoSkillMarketInstallConfirmationReason.LOCAL_OWNERSHIP: return "localOwnership";
+    case ProtoSkillMarketInstallConfirmationReason.DIRTY_CONTENT: return "dirtyContent";
+    case ProtoSkillMarketInstallConfirmationReason.UNREGISTERED_DESTINATION: return "unregisteredDestination";
+    case ProtoSkillMarketInstallConfirmationReason.DOWNGRADE: return "downgrade";
+    default: throw new GatewayError("The service returned an invalid Skill market confirmation reason.");
+  }
+}
+
+function mapSkillMarketInstallPlan(plan: ProtoSkillMarketInstallPlan): SkillMarketInstallPlanView {
+  if (!/^skill_market_install_[a-f0-9]{32}$/u.test(plan.planId) || plan.entry === undefined || plan.target === undefined
+    || plan.preview === undefined || plan.expiresAt === undefined) {
+    throw new GatewayError("The service returned an invalid Skill market install plan.");
+  }
+  const target = mapSkillMarketInstallTarget(plan.target);
+  const preview = mapSkillMarketInstallPreview(plan.preview);
+  const confirmationReasons = plan.confirmationReasons.map(mapSkillMarketConfirmationReason);
+  if (new Set(confirmationReasons).size !== confirmationReasons.length
+    || plan.requiresConfirmation !== (confirmationReasons.length > 0)
+    || JSON.stringify(target) !== JSON.stringify(preview.target)) {
+    throw new GatewayError("The service returned an inconsistent Skill market install plan.");
+  }
+  return {
+    id: plan.planId,
+    entry: mapSkillMarketEntry(plan.entry),
+    target,
+    preview,
+    confirmationReasons,
+    requiresConfirmation: plan.requiresConfirmation,
+    expiresAt: timestampMs(plan.expiresAt)
+  };
+}
+
+function mapSkillMarketSyncTarget(target: ProtoSkillMarketSyncTarget | undefined): SkillMarketSyncTargetView {
+  const mapped = mapSkillMarketInstallTarget(target);
+  const targetRevision = target?.targetRevision?.value;
+  if (targetRevision !== undefined && targetRevision < 1n) {
+    throw new GatewayError("The service returned an invalid Skill market sync target revision.");
+  }
+  return { ...mapped, ...(targetRevision === undefined ? {} : { targetRevision }) };
+}
+
+function mapSkillMarketSyncBaseline(baseline: ProtoSkillMarketSyncBaseline | undefined): SkillMarketSyncBaselineView {
+  const resourceRevision = baseline?.resourceRevision?.value;
+  const sourceRevision = baseline?.sourceRevision?.value;
+  const entryRevision = baseline?.entryRevision?.value;
+  if (baseline === undefined || resourceRevision === undefined || resourceRevision < 1n
+    || sourceRevision === undefined || sourceRevision < 1n || entryRevision === undefined || entryRevision < 1n
+    || !/^sha256:[a-f0-9]{64}$/u.test(baseline.resourceContentRevision)
+    || !/^sha256:[a-f0-9]{64}$/u.test(baseline.installedContentRevision)
+    || !/^sha256:[a-f0-9]{64}$/u.test(baseline.entryContentRevision) || baseline.installedVersion.trim() === "") {
+    throw new GatewayError("The service returned an invalid Skill market sync baseline.");
+  }
+  return {
+    resourceRevision,
+    resourceContentRevision: baseline.resourceContentRevision,
+    installedContentRevision: baseline.installedContentRevision,
+    installedVersion: baseline.installedVersion,
+    sourceRevision,
+    entryRevision,
+    entryContentRevision: baseline.entryContentRevision
+  };
+}
+
+function mapSkillMarketSyncPolicy(policy: ProtoSkillMarketSyncPolicy): SkillMarketSyncPolicyView {
+  const revision = policy.revision?.value;
+  if (policy.resourceId.trim() === "" || revision === undefined || revision < 1n
+    || !/^skill_market_source_[a-f0-9]{32}$/u.test(policy.sourceId)
+    || !/^skill_market_entry_[a-f0-9]{32}$/u.test(policy.entryId)
+    || policy.target === undefined || policy.baseline === undefined || policy.createdAt === undefined || policy.updatedAt === undefined) {
+    throw new GatewayError("The service returned an invalid Skill market sync policy.");
+  }
+  const createdAt = timestampMs(policy.createdAt);
+  const updatedAt = timestampMs(policy.updatedAt);
+  if (updatedAt < createdAt) throw new GatewayError("The service returned invalid Skill market sync policy timestamps.");
+  return {
+    resourceId: policy.resourceId,
+    revision,
+    enabled: policy.enabled,
+    sourceId: policy.sourceId,
+    entryId: policy.entryId,
+    target: mapSkillMarketSyncTarget(policy.target),
+    baseline: mapSkillMarketSyncBaseline(policy.baseline),
+    createdAt,
+    updatedAt,
+    ...(policy.disabledReason === undefined ? {} : { disabledReason: policy.disabledReason })
+  };
+}
+
+function mapSkillMarketSyncAuthority(authority: ProtoSkillMarketSyncJobAuthority | undefined): SkillMarketSyncJobAuthorityView {
+  if (authority === undefined || !/^skill_market_source_[a-f0-9]{32}$/u.test(authority.sourceId)
+    || !/^skill_market_entry_[a-f0-9]{32}$/u.test(authority.entryId)
+    || authority.target === undefined || authority.baseline === undefined) {
+    throw new GatewayError("The service returned an invalid Skill market sync job authority.");
+  }
+  return {
+    sourceId: authority.sourceId,
+    entryId: authority.entryId,
+    target: mapSkillMarketSyncTarget(authority.target),
+    baseline: mapSkillMarketSyncBaseline(authority.baseline)
+  };
+}
+
+function mapSkillMarketSyncJobState(value: ProtoSkillMarketSyncJobState): SkillMarketSyncJobStateView {
+  switch (value) {
+    case ProtoSkillMarketSyncJobState.PENDING_REVALIDATION: return "pendingRevalidation";
+    case ProtoSkillMarketSyncJobState.RUNNING: return "running";
+    case ProtoSkillMarketSyncJobState.CANCELLING: return "cancelling";
+    case ProtoSkillMarketSyncJobState.SUCCEEDED: return "succeeded";
+    case ProtoSkillMarketSyncJobState.UP_TO_DATE: return "upToDate";
+    case ProtoSkillMarketSyncJobState.BLOCKED: return "blocked";
+    case ProtoSkillMarketSyncJobState.FAILED: return "failed";
+    case ProtoSkillMarketSyncJobState.CANCELLED: return "cancelled";
+    default: throw new GatewayError("The service returned an invalid Skill market sync job state.");
+  }
+}
+
+function mapSkillMarketSyncOutcome(value: ProtoSkillMarketSyncOutcome): SkillMarketSyncOutcomeView {
+  switch (value) {
+    case ProtoSkillMarketSyncOutcome.UPDATED: return "updated";
+    case ProtoSkillMarketSyncOutcome.ALREADY_CURRENT: return "alreadyCurrent";
+    case ProtoSkillMarketSyncOutcome.DOWNGRADE_BLOCKED: return "downgradeBlocked";
+    case ProtoSkillMarketSyncOutcome.DIRTY_CONTENT: return "dirtyContent";
+    case ProtoSkillMarketSyncOutcome.OWNER_CHANGED: return "ownerChanged";
+    case ProtoSkillMarketSyncOutcome.TARGET_CHANGED: return "targetChanged";
+    case ProtoSkillMarketSyncOutcome.RESOURCE_REMOVED: return "resourceRemoved";
+    case ProtoSkillMarketSyncOutcome.CANCELLED: return "cancelled";
+    default: throw new GatewayError("The service returned an invalid Skill market sync outcome.");
+  }
+}
+
+function mapSkillMarketSyncJob(job: ProtoSkillMarketSyncJob): SkillMarketSyncJobView {
+  const revision = job.revision?.value;
+  const policyRevision = job.policyRevision?.value;
+  if (!/^skill_sync_[a-f0-9]{32}$/u.test(job.jobId) || revision === undefined || revision < 1n
+    || job.policyResourceId.trim() === "" || policyRevision === undefined || policyRevision < 1n
+    || job.authority === undefined || !Number.isSafeInteger(job.attempt) || job.attempt < 1
+    || job.createdAt === undefined || job.updatedAt === undefined) {
+    throw new GatewayError("The service returned an invalid Skill market sync job.");
+  }
+  const createdAt = timestampMs(job.createdAt);
+  const updatedAt = timestampMs(job.updatedAt);
+  const completedAt = job.completedAt === undefined ? undefined : timestampMs(job.completedAt);
+  if (updatedAt < createdAt || (completedAt !== undefined && completedAt < createdAt)) {
+    throw new GatewayError("The service returned invalid Skill market sync job timestamps.");
+  }
+  return {
+    id: job.jobId,
+    revision,
+    state: mapSkillMarketSyncJobState(job.state),
+    policyResourceId: job.policyResourceId,
+    policyRevision,
+    authority: mapSkillMarketSyncAuthority(job.authority),
+    attempt: job.attempt,
+    ...(job.retryOfJobId === undefined ? {} : { retryOfJobId: job.retryOfJobId }),
+    ...(job.availableVersion === undefined ? {} : { availableVersion: job.availableVersion }),
+    ...(job.outcome === undefined ? {} : { outcome: mapSkillMarketSyncOutcome(job.outcome) }),
+    ...(job.error === undefined ? {} : { error: job.error }),
+    createdAt,
+    updatedAt,
+    ...(completedAt === undefined ? {} : { completedAt })
+  };
+}
+
 function privatePathLikeLabel(value: string): boolean {
   return /^[A-Za-z]:[\\/]/u.test(value) || /^\\\\/u.test(value) || value.startsWith("/");
 }
@@ -13717,6 +14681,7 @@ function capabilityOptions(options: any): readonly string[] {
     if (options.kind.value.supportsPlanMode === true) modes.push("planMode");
     return modes;
   }
+  if (options?.kind?.case === "runtime") return [...(options.kind.value.resourceKinds ?? [])];
   return [];
 }
 

@@ -222,6 +222,10 @@ describe("Orchestrator application composition", () => {
     ]));
     expect(application.mcpRouter?.list()).toEqual([]);
     expect(application.piResources?.list()).toEqual([]);
+    expect(application.skillMarket?.snapshot()).toEqual({ revision: 0n, sources: [], recoveredFromCorruption: false });
+    expect(application.skillMarketSync?.listPolicies()).toEqual([]);
+    expect(application.skillMarketSync?.listJobs()).toEqual([]);
+    expect((await stat(join(dataDirectory, "skill-market"))).isDirectory()).toBe(true);
     expect(application.extensionSources?.snapshot()).toEqual({ revision: 0n, sources: [], recoveredFromCorruption: false });
     expect((await stat(join(dataDirectory, "extension-sources"))).isDirectory()).toBe(true);
     expect(application.extensionPackagePublisher?.list()).toEqual([]);

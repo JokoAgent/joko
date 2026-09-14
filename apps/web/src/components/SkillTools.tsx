@@ -31,6 +31,8 @@ import type {
   TargetView
 } from "../model.js";
 import type { Translator } from "./types.js";
+import { moveTablistSelection } from "./tablist-navigation.js";
+import { SkillMarketCatalogTools, SkillMarketSourcesTools } from "./SkillMarketTools.js";
 import { Button, EmptyState, IconButton, Modal, Pill, SelectControl, cx, formatRelativeTime } from "./ui.js";
 
 type LoadState<T> =
@@ -73,6 +75,33 @@ export function groupSkillCatalog(
 }
 
 export function SkillTools({ controller, backends, targets, locale, t }: {
+  readonly controller: AppController;
+  readonly backends: readonly BackendView[];
+  readonly targets: readonly TargetView[];
+  readonly locale: string;
+  readonly t: Translator;
+}): JSX.Element {
+  const [tab, setTab] = useState<"installed" | "market" | "sources">("installed");
+  return <div className="skill-hub">
+    <div className="skill-hub__tabs" role="tablist" aria-label={t("skills.sections.label")}>
+      {(["installed", "market", "sources"] as const).map((value) => <button
+        key={value}
+        type="button"
+        role="tab"
+        aria-selected={tab === value}
+        tabIndex={tab === value ? 0 : -1}
+        className={cx(tab === value && "is-active")}
+        onKeyDown={(event) => moveTablistSelection(event, "horizontal")}
+        onClick={() => setTab(value)}
+      >{t(`skills.sections.${value}`)}</button>)}
+    </div>
+    {tab === "installed" && <LocalSkillTools controller={controller} backends={backends} targets={targets} locale={locale} t={t} />}
+    {tab === "market" && <SkillMarketCatalogTools controller={controller} backends={backends} targets={targets} locale={locale} t={t} onOpenSources={() => setTab("sources")} />}
+    {tab === "sources" && <SkillMarketSourcesTools controller={controller} locale={locale} t={t} onOpenMarket={() => setTab("market")} />}
+  </div>;
+}
+
+function LocalSkillTools({ controller, backends, targets, locale, t }: {
   readonly controller: AppController;
   readonly backends: readonly BackendView[];
   readonly targets: readonly TargetView[];

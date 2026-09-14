@@ -144,6 +144,9 @@ import { PiProviderAuthSupervisor } from "./pi-provider-auth-supervisor.js";
 import { ProviderAccountUsageProvider } from "./provider-account-usage.js";
 import { PiResourceManager } from "./resource-manager.js";
 import { SkillManager } from "./skill-manager.js";
+import { SkillMarketManager } from "./skill-market-manager.js";
+import { SkillMarketSyncManager } from "./skill-market-sync-manager.js";
+import { SkillMutationCoordinator } from "./skill-mutation-coordinator.js";
 import { RemoteHostRegistry } from "./remote-host-registry.js";
 import {
   RemoteBackendRuntimeSetupManager,
@@ -317,6 +320,8 @@ export interface OrchestratorApplication {
   readonly mcpRouter?: McpRouter;
   readonly piResources?: PiResourceManager;
   readonly skills?: SkillManager;
+  readonly skillMarket?: SkillMarketManager;
+  readonly skillMarketSync?: SkillMarketSyncManager;
   readonly extensionCatalog?: ExtensionCatalogManager;
   readonly extensionLibraries?: ExtensionLibraryManager;
   readonly extensionMainViews?: ExtensionMainViewManager;
@@ -539,10 +544,33 @@ export async function createOrchestratorApplication(
     managedRoot: join(config.piAgentHome, "managed-resources")
   });
   await piResources.initialize();
+  const skillMutations = new SkillMutationCoordinator();
+  const skillMarket = new SkillMarketManager({
+    store,
+    cacheRoot: join(config.dataDirectory, "skill-market"),
+    resources: piResources,
+    mutationCoordinator: skillMutations
+  });
+  await skillMarket.initialize();
+  let reconcileSkillMarketResourceRuntime: (resource: {
+    readonly resourceId: string;
+    readonly backendId: string;
+  }) => Promise<void> = async () => undefined;
+  const skillMarketSync = new SkillMarketSyncManager({
+    store,
+    resources: piResources,
+    market: skillMarket,
+    onResourceCommitted: (resource) => reconcileSkillMarketResourceRuntime(resource)
+  });
+  await skillMarketSync.initialize();
   const skills = new SkillManager({
     resources: piResources,
     store,
-    rootDirectory: join(config.dataDirectory, "skills")
+    rootDirectory: join(config.dataDirectory, "skills"),
+    mutations: skillMutations,
+    removalParticipant: {
+      prepare: (resource) => skillMarketSync.prepareResourceRemoval(resource)
+    }
   });
   await skills.initialize();
   const trustedManagedRunnerScriptSha256 = createHash("sha256")
@@ -1401,6 +1429,32 @@ export async function createOrchestratorApplication(
     }));
   };
   refreshPiGenerationImpl = refreshPiGeneration;
+  reconcileSkillMarketResourceRuntime = async ({ resourceId, backendId }) => {
+    const resourceCatalogFence = sessionHost.fenceBackendResourceCatalogs(backendId);
+    try {
+      const backend = store.getBackend(backendId).descriptor;
+      const activeRuntimesRetainPreviousSnapshot = backendId === piBackendId || backend.adapterKind === "pi";
+      if (activeRuntimesRetainPreviousSnapshot) await refreshPiGeneration();
+      else await restartBackend(backendId);
+      sessionHost.completeBackendResourceCatalogRefresh(
+        backendId,
+        resourceCatalogFence,
+        activeRuntimesRetainPreviousSnapshot
+      );
+    } catch {
+      try {
+        store.appendDiagnostic({
+          severity: "warning",
+          component: "resource-runtime",
+          code: "SKILL_MARKET_SYNC_RUNTIME_REFRESH_FAILED",
+          message: "A synchronized Skill Resource was saved, but its Backend runtime has not refreshed yet.",
+          details: { backendId, resourceId }
+        });
+      } catch {
+        // Store shutdown cannot invalidate an already committed synchronization result.
+      }
+    }
+  };
   if (imageGenerationBridge.available) {
     try {
       await refreshPiGeneration();
@@ -1717,6 +1771,7 @@ export async function createOrchestratorApplication(
         });
       }
     }
+    skillMarketSync.beginPending();
     messageSearch.start();
     sessionNavigation.start();
     scheduler.start();
@@ -1734,7 +1789,9 @@ export async function createOrchestratorApplication(
     closed = true;
     commandConcurrencyGate.close();
     stopExtensionLibraryAuthorityNotifications();
+    await skillMarketSync.close().catch(() => undefined);
     await skills.close().catch(() => undefined);
+    await skillMarket.close().catch(() => undefined);
     await extensionLibraries.close().catch(() => undefined);
     await extensionMainViews.close().catch(() => undefined);
     await extensionPackagePublisher.close().catch(() => undefined);
@@ -1817,6 +1874,8 @@ export async function createOrchestratorApplication(
     mcpRouter,
     piResources,
     skills,
+    skillMarket,
+    skillMarketSync,
     extensionCatalog,
     extensionLibraries,
     extensionMainViews,
@@ -1870,7 +1929,9 @@ export async function createOrchestratorApplication(
         for (const cleanup of cleanups) await attempt(cleanup);
         await attempt(() => commandConcurrencyGate.close());
         await attempt(() => stopExtensionLibraryAuthorityNotifications());
+        await attempt(() => skillMarketSync.close());
         await attempt(() => skills.close());
+        await attempt(() => skillMarket.close());
         await attempt(() => extensionLibraries.close());
         await attempt(() => extensionMainViews.close());
         await attempt(() => extensionPackagePublisher.close());

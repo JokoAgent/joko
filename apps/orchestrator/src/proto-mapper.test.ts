@@ -116,6 +116,41 @@ describe("proto mapper", () => {
     expect(toProtoBackend({ ...stored, descriptor: withoutProviderSupport }).providerRuntimeSupport).toBeUndefined();
   });
 
+  it("preserves exact runtime resource kinds in the public Backend capability manifest", () => {
+    const stored: StoredBackend = {
+      descriptor: {
+        id: "backend-resources",
+        adapterKind: "resource-runtime",
+        instanceGeneration: 1,
+        displayName: "Resource runtime",
+        version: "1.0.0",
+        health: "healthy",
+        installationState: "installed",
+        authenticationState: "authenticated",
+        capabilities: new Map([["runtime.resources", {
+          key: "runtime.resources",
+          supported: true,
+          options: ["extension", "skill", "prompt", "package"]
+        }]]),
+        models: [],
+        tools: [],
+        diagnostics: []
+      },
+      createdAt: 1,
+      updatedAt: 2,
+      revision: 3n
+    };
+
+    const capability = toProtoBackend(stored).capabilities?.capabilities[0];
+    expect(capability?.options?.kind).toMatchObject({
+      case: "runtime",
+      value: {
+        reportsResources: true,
+        resourceKinds: ["extension", "skill", "prompt", "package"]
+      }
+    });
+  });
+
   it("keeps product and Backend instance generations independent on Attempt and Queue projections", () => {
     const run: StoredRun = {
       descriptor: {

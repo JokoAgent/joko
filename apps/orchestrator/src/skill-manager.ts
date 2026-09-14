@@ -13,6 +13,11 @@ import type {
   PiSkillContentMutationResult,
   PreparedPiResourceMutation
 } from "./resource-manager.js";
+import {
+  SkillMutationCoordinator,
+  skillResourceMutationKey,
+  type SkillMutationLease
+} from "./skill-mutation-coordinator.js";
 
 export type SkillCatalogScope = "global" | "project";
 
@@ -116,6 +121,19 @@ export interface SkillRecoveryRecord {
   readonly status: "ready" | "missing";
 }
 
+export interface PreparedSkillRemovalParticipant {
+  /** Called synchronously from the same Store transaction as Resource removal. */
+  readonly finalize: (store: OperationalStore) => void;
+  /** Non-throwing notification after the Store transaction committed. */
+  readonly committed: () => void;
+  /** Restores any in-memory projection if the outer transaction failed. */
+  readonly rolledBack: () => void;
+}
+
+export interface SkillRemovalParticipant {
+  readonly prepare: (resource: PiResourceDescriptor) => PreparedSkillRemovalParticipant;
+}
+
 export interface SkillManagerOptions {
   readonly resources: PiResourceManager;
   readonly store: OperationalStore;
@@ -127,6 +145,8 @@ export interface SkillManagerOptions {
   readonly maximumDrafts?: number;
   readonly maximumPreviewBytes?: number;
   readonly maximumEditBytes?: number;
+  readonly mutations?: SkillMutationCoordinator;
+  readonly removalParticipant?: SkillRemovalParticipant;
 }
 
 const preparedSkillMutationBrand = Symbol("PreparedSkillMutation");
@@ -183,6 +203,8 @@ interface PreparedSkillMutationInternal<T> {
   readonly resourceMutation: PreparedPiResourceMutation<T>;
   readonly draft?: ActiveSkillDraft;
   readonly recovery?: StoredSkillRecoveryRecord;
+  readonly mutationLease?: SkillMutationLease;
+  readonly removalParticipant?: PreparedSkillRemovalParticipant;
   completed: boolean;
 }
 
@@ -228,10 +250,13 @@ export class SkillManager {
   readonly #maximumDrafts: number;
   readonly #maximumPreviewBytes: number;
   readonly #maximumEditBytes: number;
+  readonly #mutations: SkillMutationCoordinator;
+  readonly #removalParticipant?: SkillRemovalParticipant;
   readonly #sessions = new Map<string, ActiveSkillSession>();
   readonly #drafts = new Map<string, ActiveSkillDraft>();
   readonly #recoveries = new Map<string, StoredSkillRecoveryRecord>();
   readonly #prepared = new WeakMap<object, PreparedSkillMutationInternal<unknown>>();
+  readonly #preparedLeases = new Set<SkillMutationLease>();
   #catalogRevision = 0n;
   #catalogIdentity = "";
   #tail: Promise<void> = Promise.resolve();
@@ -253,6 +278,8 @@ export class SkillManager {
     this.#maximumDrafts = positiveInteger(options.maximumDrafts ?? DEFAULT_MAXIMUM_DRAFTS, "Skill draft limit");
     this.#maximumPreviewBytes = positiveInteger(options.maximumPreviewBytes ?? DEFAULT_MAXIMUM_PREVIEW_BYTES, "Skill preview byte limit");
     this.#maximumEditBytes = positiveInteger(options.maximumEditBytes ?? DEFAULT_MAXIMUM_EDIT_BYTES, "Skill edit byte limit");
+    this.#mutations = options.mutations ?? new SkillMutationCoordinator();
+    this.#removalParticipant = options.removalParticipant;
   }
 
   async initialize(): Promise<void> {
@@ -286,6 +313,8 @@ export class SkillManager {
     await this.#mutate(async () => {
       for (const session of [...this.#sessions.values()]) await this.#closeSession(session);
       for (const draft of [...this.#drafts.values()]) await this.#removeDraft(draft);
+      for (const lease of this.#preparedLeases) lease.release();
+      this.#preparedLeases.clear();
     });
   }
 
@@ -474,6 +503,8 @@ export class SkillManager {
         throw new Error("Skill draft authority no longer matches its detail session.");
       }
       await session.lease.assertCurrent();
+      const mutationLease = this.#mutations.acquire([skillResourceMutationKey(draft.resourceId)]);
+      if (mutationLease === undefined) throw new Error("This Skill is being changed by another operation.");
       draft.preparing = true;
       try {
         const resourceMutation = await this.#resources.prepareReplaceSkillContent({
@@ -484,9 +515,10 @@ export class SkillManager {
           changedByConnectionId: draft.connectionId,
           ...(draft.kind === "rename" ? { name: draft.name } : {})
         });
-        return this.#wrapPrepared(resourceMutation, { draft });
+        return this.#wrapPrepared(resourceMutation, { draft, mutationLease });
       } catch (error) {
         draft.preparing = false;
+        mutationLease.release();
         throw error;
       }
     });
@@ -515,11 +547,15 @@ export class SkillManager {
       const session = await this.#requireSession(input.connectionId, input.sessionId);
       await session.lease.assertCurrent();
       if (input.confirmation !== session.lease.resource.name) throw new Error("Skill deletion confirmation does not match its exact name.");
+      const mutationLease = this.#mutations.acquire([skillResourceMutationKey(session.resourceId)]);
+      if (mutationLease === undefined) throw new Error("This Skill is being changed by another operation.");
+      let removalParticipant: PreparedSkillRemovalParticipant | undefined;
       const id = `skill_recovery_${randomUUID().replaceAll("-", "")}`;
       const directoryName = id;
       const destination = join(this.#rootDirectory, "recoveries", directoryName);
-      await mkdir(destination, { recursive: false, mode: 0o700 });
       try {
+        removalParticipant = this.#removalParticipant?.prepare(session.lease.resource);
+        await mkdir(destination, { recursive: false, mode: 0o700 });
         const resourceMutation = await this.#resources.prepareRemoveSkillContent({
           resourceId: session.resourceId,
           expectedResourceVersion: session.resourceVersion,
@@ -540,9 +576,11 @@ export class SkillManager {
           createdAt: this.#now(),
           directoryName
         };
-        return this.#wrapPrepared(resourceMutation, { recovery });
+        return this.#wrapPrepared(resourceMutation, { recovery, mutationLease, removalParticipant });
       } catch (error) {
         await rm(destination, { recursive: true, force: true }).catch(() => undefined);
+        removalParticipant?.rolledBack();
+        mutationLease.release();
         throw error;
       }
     });
@@ -563,8 +601,10 @@ export class SkillManager {
           if (internal.recovery !== undefined) {
             this.#persistRecoveries(store, [...this.#recoveries.values(), internal.recovery]);
           }
+          internal.removalParticipant?.finalize(store);
         }));
         internal.completed = true;
+        internal.removalParticipant?.committed();
         if (internal.recovery !== undefined) this.#recoveries.set(internal.recovery.id, internal.recovery);
         if (internal.draft !== undefined) {
           internal.draft.preparing = false;
@@ -575,8 +615,12 @@ export class SkillManager {
         return result;
       } catch (error) {
         internal.completed = true;
+        internal.removalParticipant?.rolledBack();
         if (internal.draft !== undefined) internal.draft.preparing = false;
         throw error;
+      } finally {
+        internal.mutationLease?.release();
+        if (internal.mutationLease !== undefined) this.#preparedLeases.delete(internal.mutationLease);
       }
     });
   }
@@ -709,7 +753,12 @@ export class SkillManager {
 
   #wrapPrepared<T>(
     resourceMutation: PreparedPiResourceMutation<T>,
-    extra: { readonly draft?: ActiveSkillDraft; readonly recovery?: StoredSkillRecoveryRecord }
+    extra: {
+      readonly draft?: ActiveSkillDraft;
+      readonly recovery?: StoredSkillRecoveryRecord;
+      readonly mutationLease?: SkillMutationLease;
+      readonly removalParticipant?: PreparedSkillRemovalParticipant;
+    }
   ): PreparedSkillMutation<T> {
     const prepared = Object.freeze({
       value: resourceMutation.value,
@@ -718,6 +767,7 @@ export class SkillManager {
       [preparedSkillMutationBrand]: true as const
     });
     this.#prepared.set(prepared, { resourceMutation, ...extra, completed: false });
+    if (extra.mutationLease !== undefined) this.#preparedLeases.add(extra.mutationLease);
     return prepared;
   }
 
@@ -834,7 +884,7 @@ export function skillCatalogEntryFromResource(resource: PiResourceDescriptor): S
   const contentAvailable = resource.scope === "project"
     ? resource.state === "approved" || resource.state === "disabled" || resource.state === "loaded"
     : resource.state === "installed" || resource.state === "disabled" || resource.state === "loaded";
-  const standalone = resource.sourceKind === "local";
+  const standalone = resource.sourceKind === "local" || resource.sourceKind === "skill_market";
   return {
     id: resource.id,
     backendId: resource.backendId,

@@ -332,6 +332,15 @@ test("durable and cross-process field numbers remain stable", () => {
     [contract.OperationMutationSchema, "apply_skill_draft", 196],
     [contract.OperationMutationSchema, "set_skill_enabled", 197],
     [contract.OperationMutationSchema, "delete_skill", 198],
+    [contract.OperationMutationSchema, "add_skill_market_source", 199],
+    [contract.OperationMutationSchema, "refresh_skill_market_source", 200],
+    [contract.OperationMutationSchema, "remove_skill_market_source", 201],
+    [contract.OperationMutationSchema, "install_skill_market_plan", 202],
+    [contract.OperationMutationSchema, "enable_skill_market_sync", 203],
+    [contract.OperationMutationSchema, "disable_skill_market_sync", 204],
+    [contract.OperationMutationSchema, "enqueue_skill_market_sync", 205],
+    [contract.OperationMutationSchema, "cancel_skill_market_sync", 206],
+    [contract.OperationMutationSchema, "retry_skill_market_sync", 207],
     [contract.OperationResultSchema, "skill", 35],
     [contract.ListSkillFilesRequestSchema, "page", 3],
     [contract.ListSkillFilesResponseSchema, "page", 2],
@@ -525,6 +534,89 @@ test("Skill management is path-private and mutations retain exact revision autho
   assert.equal(remove.payload.value.confirmation, descriptor.name);
 });
 
+test("Skill market contracts preserve exact source, install, and durable sync authority without leaking service paths", () => {
+  const methods = methodNames(contract.SkillService);
+  for (const name of [
+    "getSkillMarketGitPreflight", "listSkillMarketSources", "listSkillMarketCatalog", "getSkillMarketEntry",
+    "openSkillMarketPreview", "listSkillMarketPreviewFiles", "readSkillMarketPreviewFile", "closeSkillMarketPreview",
+    "createSkillMarketInstallPlan", "getSkillMarketInstallPlan", "closeSkillMarketInstallPlan",
+    "listSkillMarketSyncPolicies", "listSkillMarketSyncJobs", "getSkillMarketSyncJob"
+  ]) assert.equal(methods.has(name), true, name);
+
+  assertNoFields([
+    contract.SkillMarketSourceDescriptorSchema,
+    contract.SkillMarketEntrySchema,
+    contract.SkillMarketPreviewSchema,
+    contract.SkillMarketPreviewFileSchema,
+    contract.SkillMarketInstallPlanSchema,
+    contract.SkillMarketInstallPreviewSchema,
+    contract.SkillMarketCurrentResourceSchema,
+    contract.SkillMarketSyncPolicySchema,
+    contract.SkillMarketSyncJobSchema,
+    contract.ListSkillMarketSourcesResponseSchema,
+    contract.ListSkillMarketCatalogResponseSchema,
+    contract.OpenSkillMarketPreviewResponseSchema,
+    contract.CreateSkillMarketInstallPlanResponseSchema
+  ], [
+    "path", "server_path", "absolute_path", "source_path", "archive_path", "cache_root",
+    "generation", "generation_path", "candidate_path", "workspace_root", "credential", "credential_value"
+  ]);
+
+  const identity = {
+    sourceId: "skill_market_source_0123456789abcdef0123456789abcdef",
+    sourceRevision: { value: 9007199254740993n },
+    entryId: "skill_market_entry_0123456789abcdef0123456789abcdef",
+    entryRevision: { value: 9007199254740995n },
+    contentRevision: `sha256:${"a".repeat(64)}`
+  };
+  const entry = roundTrip(contract.SkillMarketEntrySchema, {
+    identity,
+    slug: "writer",
+    name: "Writer",
+    description: "Writing helper",
+    category: "Writing",
+    tags: ["writing"],
+    version: "1.2.3",
+    downloads: 42n,
+    trendScore: 3.5,
+    archiveBytes: 1024n,
+    sourceName: "team-skills",
+    sourceState: contract.SkillMarketSourceState.READY
+  });
+  assert.equal(entry.identity.sourceRevision.value, 9007199254740993n);
+  assert.equal(entry.identity.entryRevision.value, 9007199254740995n);
+
+  const globalTarget = roundTrip(contract.SkillMarketInstallTargetSchema, {
+    backendId: "pi",
+    scope: contract.ResourceScope.GLOBAL
+  });
+  assert.equal(globalTarget.targetId, undefined);
+  assert.equal(globalTarget.relativeParent, undefined);
+  const customTarget = roundTrip(contract.SkillMarketInstallTargetSchema, {
+    backendId: "pi",
+    scope: contract.ResourceScope.PROJECT,
+    targetId: "target-a",
+    relativeParent: ".joko/skills"
+  });
+  assert.equal(customTarget.relativeParent, ".joko/skills");
+
+  const mutations = [
+    { case: "addSkillMarketSource", value: { source: { kind: { case: "local", value: { serverPath: "D:/selected/skills" } } }, expectedCatalogRevision: { value: 1n } } },
+    { case: "refreshSkillMarketSource", value: { sourceId: identity.sourceId, expectedRevision: identity.sourceRevision } },
+    { case: "removeSkillMarketSource", value: { sourceId: identity.sourceId, expectedRevision: identity.sourceRevision } },
+    { case: "installSkillMarketPlan", value: { planId: "skill_market_install_0123456789abcdef0123456789abcdef", expectedCandidateRevision: identity.contentRevision, confirmReplacement: true } },
+    { case: "enableSkillMarketSync", value: { resourceId: "resource-skill", expectedResourceRevision: { value: 7n }, target: customTarget } },
+    { case: "disableSkillMarketSync", value: { resourceId: "resource-skill", expectedPolicyRevision: { value: 8n } } },
+    { case: "enqueueSkillMarketSync", value: { resourceId: "resource-skill", expectedPolicyRevision: { value: 8n } } },
+    { case: "cancelSkillMarketSync", value: { jobId: "skill_sync_0123456789abcdef0123456789abcdef", expectedRevision: { value: 9n } } },
+    { case: "retrySkillMarketSync", value: { jobId: "skill_sync_0123456789abcdef0123456789abcdef", expectedRevision: { value: 10n } } }
+  ];
+  for (const payload of mutations) {
+    const decoded = roundTrip(contract.OperationMutationSchema, { payload });
+    assert.equal(decoded.payload.case, payload.case);
+  }
+});
+
 test("auxiliary routing preserves ordered exact routes and independent revisions", () => {
   const models = [
     { backendId: "backend-a", providerId: "provider", modelId: "model" },
@@ -594,7 +686,14 @@ test("public enum wire numbers remain stable", () => {
     [contract.EntityKind, { DEVICE_CONTROL_RELATION: 23 }],
     [contract.GitDiffSource, { UNSTAGED: 1, STAGED: 2, COMMIT: 3, BRANCH: 4, LAST_TURN: 5, TURN_SET: 6 }],
     [contract.WorkspaceDiffAction, { STAGE: 1, UNSTAGE: 2, REVERT: 3 }],
-    [contract.ResourceAcquisitionKind, { LOCAL: 1, NPM: 2, GIT: 3 }],
+    [contract.ResourceAcquisitionKind, { LOCAL: 1, NPM: 2, GIT: 3, EXTENSION_SOURCE: 4, SKILL_MARKET: 5 }],
+    [contract.SkillMarketSourceKind, { LOCAL: 1, GIT: 2 }],
+    [contract.SkillMarketSort, { TRENDING: 1, DOWNLOADS: 2, UPDATED: 3, CREATED: 4 }],
+    [contract.SkillMarketInstallAction, { INSTALL: 1, UPDATE: 2, REPLACE: 3 }],
+    [contract.SkillMarketSyncJobState, {
+      PENDING_REVALIDATION: 1, RUNNING: 2, CANCELLING: 3, SUCCEEDED: 4,
+      UP_TO_DATE: 5, BLOCKED: 6, FAILED: 7, CANCELLED: 8
+    }],
     [contract.ResourceKind, { THEME: 5 }],
     [contract.ResourceCompatibility, { SUPPORTED: 1, PARTIAL: 2, UNSUPPORTED: 3, UNKNOWN: 4 }],
     [contract.ResourcePackageWarning, { LIFECYCLE_SCRIPTS_DISABLED: 4 }],

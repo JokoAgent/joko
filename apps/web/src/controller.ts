@@ -2023,6 +2023,36 @@ export function useAppController(): AppController {
     deleteSkill: (session, confirmation, signal) => gateway().deleteSkill(session, confirmation, signal),
     listSkillRecoveries: (signal) => gateway().listSkillRecoveries(signal),
     closeSkill: (sessionId, signal) => gateway().closeSkill(sessionId, signal),
+    getSkillMarketGitPreflight: (signal) => gateway().getSkillMarketGitPreflight(signal),
+    listSkillMarketSources: (signal) => gateway().listSkillMarketSources(signal),
+    addSkillMarketSource: (source, expectedCatalogRevision, signal) =>
+      gateway().addSkillMarketSource(source, expectedCatalogRevision, signal),
+    refreshSkillMarketSource: (sourceId, expectedRevision, signal) =>
+      gateway().refreshSkillMarketSource(sourceId, expectedRevision, signal),
+    removeSkillMarketSource: (sourceId, expectedRevision, signal) =>
+      gateway().removeSkillMarketSource(sourceId, expectedRevision, signal),
+    listSkillMarketCatalog: (options) => gateway().listSkillMarketCatalog(options),
+    getSkillMarketEntry: (identity, signal) => gateway().getSkillMarketEntry(identity, signal),
+    openSkillMarketPreview: (identity, signal) => gateway().openSkillMarketPreview(identity, signal),
+    listSkillMarketPreviewFiles: (preview, pageToken, pageSize, signal) =>
+      gateway().listSkillMarketPreviewFiles(preview, pageToken, pageSize, signal),
+    readSkillMarketPreviewFile: (preview, key, signal) => gateway().readSkillMarketPreviewFile(preview, key, signal),
+    closeSkillMarketPreview: (previewId, signal) => gateway().closeSkillMarketPreview(previewId, signal),
+    createSkillMarketInstallPlan: (identity, target, signal) =>
+      gateway().createSkillMarketInstallPlan(identity, target, signal),
+    getSkillMarketInstallPlan: (planId, signal) => gateway().getSkillMarketInstallPlan(planId, signal),
+    closeSkillMarketInstallPlan: (planId, signal) => gateway().closeSkillMarketInstallPlan(planId, signal),
+    installSkillMarketPlan: (plan, confirmReplacement, signal) =>
+      gateway().installSkillMarketPlan(plan, confirmReplacement, signal),
+    listSkillMarketSyncPolicies: (signal) => gateway().listSkillMarketSyncPolicies(signal),
+    listSkillMarketSyncJobs: (resourceId, signal) => gateway().listSkillMarketSyncJobs(resourceId, signal),
+    getSkillMarketSyncJob: (jobId, signal) => gateway().getSkillMarketSyncJob(jobId, signal),
+    enableSkillMarketSync: (resourceId, expectedResourceRevision, target, signal) =>
+      gateway().enableSkillMarketSync(resourceId, expectedResourceRevision, target, signal),
+    disableSkillMarketSync: (policy, signal) => gateway().disableSkillMarketSync(policy, signal),
+    enqueueSkillMarketSync: (policy, signal) => gateway().enqueueSkillMarketSync(policy, signal),
+    cancelSkillMarketSync: (job, signal) => gateway().cancelSkillMarketSync(job, signal),
+    retrySkillMarketSync: (job, signal) => gateway().retrySkillMarketSync(job, signal),
     listCommands: (sessionId) => gateway().listCommands(sessionId),
     listSessionResources: (sessionId, signal) => gateway().listSessionResources(sessionId, signal),
     listRuntimeProcesses: (backendId, signal) => gateway().listRuntimeProcesses(backendId, signal),

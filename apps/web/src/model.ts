@@ -2127,6 +2127,253 @@ export interface SkillMutationResultView {
   readonly recoveryId?: string;
 }
 
+export type SkillMarketSourceDraft =
+  | { readonly kind: "local"; readonly serverPath: string }
+  | { readonly kind: "git"; readonly repositoryUrl: string; readonly ref?: string; readonly sparsePaths: readonly string[] };
+
+export interface SkillMarketGitPreflightView {
+  readonly available: boolean;
+  readonly version?: string;
+  readonly minimumVersion: string;
+}
+
+/** Path-free market source projection. Source locations are write-only. */
+export interface SkillMarketSourceView {
+  readonly id: string;
+  readonly revision: bigint;
+  readonly kind: "local" | "git";
+  readonly display: string;
+  readonly name: string;
+  readonly displayName?: string;
+  readonly state: "ready" | "error";
+  readonly contentRevision: string;
+  readonly entryCount: number;
+  readonly addedAt: number;
+  readonly refreshedAt?: number;
+  readonly error?: string;
+}
+
+export interface SkillMarketSourceCatalogView {
+  readonly revision: bigint;
+  readonly sources: readonly SkillMarketSourceView[];
+  readonly recoveredFromCorruption: boolean;
+}
+
+export interface SkillMarketEntryIdentityView {
+  readonly sourceId: string;
+  readonly sourceRevision: bigint;
+  readonly entryId: string;
+  readonly entryRevision: bigint;
+  readonly contentRevision: string;
+}
+
+export interface SkillMarketEntryView {
+  readonly identity: SkillMarketEntryIdentityView;
+  readonly slug: string;
+  readonly name: string;
+  readonly author?: string;
+  readonly description: string;
+  readonly category: string;
+  readonly tags: readonly string[];
+  readonly version: string;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly downloads: number;
+  readonly trendScore: number;
+  readonly archiveBytes: number;
+  readonly sourceName: string;
+  readonly sourceDisplayName?: string;
+  readonly sourceState: "ready" | "error";
+  readonly sourceError?: string;
+  readonly installStatuses: readonly SkillMarketInstallStatusView[];
+}
+
+export interface SkillMarketInstallStatusView {
+  readonly resourceId: string;
+  readonly resourceRevision: bigint;
+  readonly backendId: string;
+  readonly targetId?: string;
+  readonly scope: SkillScopeView;
+  readonly relativeParent?: string;
+  readonly state: "installed" | "updateAvailable" | "conflict";
+  readonly installedVersion?: string;
+}
+
+export type SkillMarketSortView = "trending" | "downloads" | "updated" | "created";
+
+export interface SkillMarketCatalogPageView {
+  readonly revision: bigint;
+  readonly entries: readonly SkillMarketEntryView[];
+  readonly categories: readonly string[];
+  readonly sourceCount: number;
+  readonly totalSize: number;
+  readonly nextPageToken?: string;
+}
+
+export interface SkillMarketArchiveEntryView {
+  readonly key: string;
+  readonly kind: "directory" | "file";
+  readonly size: number;
+}
+
+export interface SkillMarketArchivePageView {
+  readonly snapshotRevision: string;
+  readonly files: readonly SkillMarketArchiveEntryView[];
+  readonly totalSize: number;
+  readonly nextPageToken?: string;
+}
+
+export interface SkillMarketPreviewView {
+  readonly id: string;
+  readonly entry: SkillMarketEntryView;
+  readonly snapshotRevision: string;
+  readonly files: number;
+  readonly bytes: number;
+  readonly expiresAt: number;
+}
+
+export interface SkillMarketPreviewFileView {
+  readonly previewId: string;
+  readonly snapshotRevision: string;
+  readonly key: string;
+  readonly size: number;
+  readonly previewable: boolean;
+  readonly content?: string;
+  readonly unavailableReason?: "binary" | "tooLarge";
+}
+
+export interface SkillMarketInstallTargetView {
+  readonly backendId: string;
+  readonly scope: SkillScopeView;
+  readonly targetId?: string;
+  readonly relativeParent?: string;
+}
+
+export interface SkillMarketCurrentResourceView {
+  readonly resourceId: string;
+  readonly resourceRevision: bigint;
+  readonly name: string;
+  readonly version?: string;
+  readonly sourceKind: "local" | "npm" | "git" | "extensionSource" | "skillMarket";
+  readonly sourceDisplay: string;
+  readonly discoveredRevision: string;
+  readonly observedRevision: string;
+  readonly dirty: boolean;
+}
+
+export type SkillMarketInstallActionView = "install" | "update" | "replace";
+export type SkillMarketInstallConfirmationReasonView =
+  | "sourceReplacement"
+  | "localOwnership"
+  | "dirtyContent"
+  | "unregisteredDestination"
+  | "downgrade";
+
+export interface SkillMarketInstallPreviewView {
+  readonly action: SkillMarketInstallActionView;
+  readonly resourceId: string;
+  readonly target: SkillMarketInstallTargetView;
+  readonly name: string;
+  readonly availableVersion: string;
+  readonly candidateRevision: string;
+  readonly files: number;
+  readonly bytes: number;
+  readonly currentResource?: SkillMarketCurrentResourceView;
+  readonly unregisteredDestination: boolean;
+  readonly sourceReplacement: boolean;
+  readonly preservesEnabled: boolean;
+  readonly diffAvailable: boolean;
+  readonly diffReason?: string;
+  readonly changes: readonly SkillDiffChangeView[];
+  readonly diffTruncated: boolean;
+}
+
+export interface SkillMarketInstallPlanView {
+  readonly id: string;
+  readonly entry: SkillMarketEntryView;
+  readonly target: SkillMarketInstallTargetView;
+  readonly preview: SkillMarketInstallPreviewView;
+  readonly confirmationReasons: readonly SkillMarketInstallConfirmationReasonView[];
+  readonly requiresConfirmation: boolean;
+  readonly expiresAt: number;
+}
+
+export interface SkillMarketSyncTargetView extends SkillMarketInstallTargetView {
+  readonly targetRevision?: bigint;
+}
+
+export interface SkillMarketSyncBaselineView {
+  readonly resourceRevision: bigint;
+  readonly resourceContentRevision: string;
+  readonly installedContentRevision: string;
+  readonly installedVersion: string;
+  readonly sourceRevision: bigint;
+  readonly entryRevision: bigint;
+  readonly entryContentRevision: string;
+}
+
+export interface SkillMarketSyncPolicyView {
+  readonly resourceId: string;
+  readonly revision: bigint;
+  readonly enabled: boolean;
+  readonly sourceId: string;
+  readonly entryId: string;
+  readonly target: SkillMarketSyncTargetView;
+  readonly baseline: SkillMarketSyncBaselineView;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly disabledReason?: string;
+}
+
+export type SkillMarketSyncJobStateView =
+  | "pendingRevalidation"
+  | "running"
+  | "cancelling"
+  | "succeeded"
+  | "upToDate"
+  | "blocked"
+  | "failed"
+  | "cancelled";
+
+export type SkillMarketSyncOutcomeView =
+  | "updated"
+  | "alreadyCurrent"
+  | "downgradeBlocked"
+  | "dirtyContent"
+  | "ownerChanged"
+  | "targetChanged"
+  | "resourceRemoved"
+  | "cancelled";
+
+export interface SkillMarketSyncJobAuthorityView {
+  readonly sourceId: string;
+  readonly entryId: string;
+  readonly target: SkillMarketSyncTargetView;
+  readonly baseline: SkillMarketSyncBaselineView;
+}
+
+export interface SkillMarketSyncJobView {
+  readonly id: string;
+  readonly revision: bigint;
+  readonly state: SkillMarketSyncJobStateView;
+  readonly policyResourceId: string;
+  readonly policyRevision: bigint;
+  readonly authority: SkillMarketSyncJobAuthorityView;
+  readonly attempt: number;
+  readonly retryOfJobId?: string;
+  readonly availableVersion?: string;
+  readonly outcome?: SkillMarketSyncOutcomeView;
+  readonly error?: string;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly completedAt?: number;
+}
+
+export interface SkillMarketSyncCatalogView<T> {
+  readonly items: readonly T[];
+  readonly recoveredFromCorruption: boolean;
+}
+
 /** Exact loaded resource identity owned by one live task runtime. */
 export interface SessionResourceView {
   readonly sessionId: string;
@@ -4146,6 +4393,37 @@ export interface OperationApi {
   deleteSkill(session: SkillSessionView, confirmation: string, signal?: AbortSignal): Promise<SkillMutationResultView>;
   listSkillRecoveries(signal?: AbortSignal): Promise<readonly SkillRecoveryView[]>;
   closeSkill(sessionId: string, signal?: AbortSignal): Promise<boolean>;
+  getSkillMarketGitPreflight(signal?: AbortSignal): Promise<SkillMarketGitPreflightView>;
+  listSkillMarketSources(signal?: AbortSignal): Promise<SkillMarketSourceCatalogView>;
+  addSkillMarketSource(source: SkillMarketSourceDraft, expectedCatalogRevision: bigint, signal?: AbortSignal): Promise<void>;
+  refreshSkillMarketSource(sourceId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<void>;
+  removeSkillMarketSource(sourceId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<void>;
+  listSkillMarketCatalog(options?: {
+    readonly expectedRevision?: bigint;
+    readonly query?: string;
+    readonly category?: string;
+    readonly sort?: SkillMarketSortView;
+    readonly pageToken?: string;
+    readonly pageSize?: number;
+    readonly signal?: AbortSignal;
+  }): Promise<SkillMarketCatalogPageView>;
+  getSkillMarketEntry(identity: SkillMarketEntryIdentityView, signal?: AbortSignal): Promise<SkillMarketEntryView>;
+  openSkillMarketPreview(identity: SkillMarketEntryIdentityView, signal?: AbortSignal): Promise<SkillMarketPreviewView>;
+  listSkillMarketPreviewFiles(preview: SkillMarketPreviewView, pageToken?: string, pageSize?: number, signal?: AbortSignal): Promise<SkillMarketArchivePageView>;
+  readSkillMarketPreviewFile(preview: SkillMarketPreviewView, key: string, signal?: AbortSignal): Promise<SkillMarketPreviewFileView>;
+  closeSkillMarketPreview(previewId: string, signal?: AbortSignal): Promise<boolean>;
+  createSkillMarketInstallPlan(identity: SkillMarketEntryIdentityView, target: SkillMarketInstallTargetView, signal?: AbortSignal): Promise<SkillMarketInstallPlanView>;
+  getSkillMarketInstallPlan(planId: string, signal?: AbortSignal): Promise<SkillMarketInstallPlanView>;
+  closeSkillMarketInstallPlan(planId: string, signal?: AbortSignal): Promise<boolean>;
+  installSkillMarketPlan(plan: SkillMarketInstallPlanView, confirmReplacement: boolean, signal?: AbortSignal): Promise<SkillMutationResultView>;
+  listSkillMarketSyncPolicies(signal?: AbortSignal): Promise<SkillMarketSyncCatalogView<SkillMarketSyncPolicyView>>;
+  listSkillMarketSyncJobs(resourceId?: string, signal?: AbortSignal): Promise<SkillMarketSyncCatalogView<SkillMarketSyncJobView>>;
+  getSkillMarketSyncJob(jobId: string, signal?: AbortSignal): Promise<SkillMarketSyncJobView>;
+  enableSkillMarketSync(resourceId: string, expectedResourceRevision: bigint, target: SkillMarketInstallTargetView, signal?: AbortSignal): Promise<void>;
+  disableSkillMarketSync(policy: SkillMarketSyncPolicyView, signal?: AbortSignal): Promise<void>;
+  enqueueSkillMarketSync(policy: SkillMarketSyncPolicyView, signal?: AbortSignal): Promise<void>;
+  cancelSkillMarketSync(job: SkillMarketSyncJobView, signal?: AbortSignal): Promise<void>;
+  retrySkillMarketSync(job: SkillMarketSyncJobView, signal?: AbortSignal): Promise<void>;
   listCommands(sessionId: string): Promise<readonly RuntimeCommandView[]>;
   listSessionResources(sessionId: string, signal?: AbortSignal): Promise<readonly SessionResourceView[]>;
   listRuntimeProcesses(backendId: string, signal?: AbortSignal): Promise<RuntimeProcessUsageSnapshotView>;
