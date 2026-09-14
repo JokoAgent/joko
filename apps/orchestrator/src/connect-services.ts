@@ -11950,6 +11950,12 @@ function nativeDiagnosticLevel(value: contract.DiagnosticLevel): "minimal" | "st
   }
 }
 
+function backendMemoryRole(descriptor: BackendDescriptor): MakerMemoryBackendRole["role"] | undefined {
+  if (descriptor.capabilities.get("memory.native")?.supported === true) return "native_auto_memory";
+  if (descriptor.capabilities.get("memory.compaction_digest")?.supported === true) return "compaction_digest";
+  return undefined;
+}
+
 function settingsSnapshot(dependencies: ConnectServiceDependencies): contract.SettingsSnapshot {
   reserveAllProviderCredentialSurfaces(dependencies);
   const health = dependencies.store.health();
@@ -11994,11 +12000,13 @@ function settingsSnapshot(dependencies: ConnectServiceDependencies): contract.Se
     cleanupAvailable: false
   };
   const backendRecords = dependencies.store.listBackends();
-  const memoryBackendRecords = backendRecords.filter((item) =>
-    item.descriptor.capabilities.get("memory.compaction_digest")?.supported === true);
-  const memoryBackendRoles: readonly MakerMemoryBackendRole[] = memoryBackendRecords.map((item) => ({
+  const memoryBackendRecords = backendRecords.flatMap((item) => {
+    const role = backendMemoryRole(item.descriptor);
+    return role === undefined ? [] : [{ item, role }];
+  });
+  const memoryBackendRoles: readonly MakerMemoryBackendRole[] = memoryBackendRecords.map(({ item, role }) => ({
     backendId: item.descriptor.id,
-    role: "compaction_digest"
+    role
   }));
   const memoryState = dependencies.makerMemory?.snapshot(memoryBackendRoles);
   const makerRuntimeSupported = backendRecords.some((item) =>
@@ -12304,7 +12312,7 @@ function settingsSnapshot(dependencies: ConnectServiceDependencies): contract.Se
       makerReason,
       customized: memoryState?.customized ?? false,
       entryCount: BigInt(memoryState?.entryCount ?? 0),
-      backends: memoryBackendRecords.map((item) => create(contract.BackendMemorySettingsSchema, {
+      backends: memoryBackendRecords.map(({ item, role }) => create(contract.BackendMemorySettingsSchema, {
         backendId: item.descriptor.id,
         enabled: memoryState?.backendEnabled[item.descriptor.id] ?? false,
         support: dependencies.makerMemory === undefined
@@ -12313,7 +12321,11 @@ function settingsSnapshot(dependencies: ConnectServiceDependencies): contract.Se
         reason: dependencies.makerMemory === undefined
           ? "Memory storage is unavailable on this Orchestrator node."
           : "",
-        entryCount: BigInt(memoryState?.backendEntryCount[item.descriptor.id] ?? 0)
+        entryCount: BigInt(memoryState?.backendEntryCount[item.descriptor.id] ?? 0),
+        kind: role === "native_auto_memory"
+          ? contract.BackendMemoryKind.NATIVE_AUTO_MEMORY
+          : contract.BackendMemoryKind.COMPACTION_DIGEST,
+        resettable: role === "compaction_digest"
       }))
     }),
     voiceInput: dependencies.voiceInputSettings?.snapshot(),
@@ -17140,6 +17152,7 @@ async function dispatchMutation(
       if (patch.backendEnabled === undefined && patch.backendId.trim() !== "") {
         throw invalidArgument("patch.backend_id is valid only with patch.backend_enabled");
       }
+      let patchedBackendRole: MakerMemoryBackendRole["role"] | undefined;
       if (patch.backendEnabled !== undefined) {
         if (patch.backendId.trim() === "") throw invalidArgument("patch.backend_id is required");
         let backend;
@@ -17148,8 +17161,9 @@ async function dispatchMutation(
         } catch {
           throw new ConnectError("Memory Backend not found.", Code.NotFound);
         }
-        if (backend.capabilities.get("memory.compaction_digest")?.supported !== true) {
-          throw new ConnectError("Backend does not support memory.compaction_digest.", Code.FailedPrecondition);
+        patchedBackendRole = backendMemoryRole(backend);
+        if (patchedBackendRole === undefined) {
+          throw new ConnectError("Backend does not support automatic memory.", Code.FailedPrecondition);
         }
       }
       try {
@@ -17161,6 +17175,12 @@ async function dispatchMutation(
         });
       } catch (error) {
         throw invalidArgument(error instanceof Error ? error.message : "Memory settings patch is invalid.");
+      }
+      if (patchedBackendRole === "native_auto_memory" && nextSettings!.makerEnabled) {
+        throw new ConnectError(
+          "Disable Maker Memory before changing Backend-native auto-memory.",
+          Code.FailedPrecondition
+        );
       }
       const execution = await host.mutate({
         operationId,
@@ -17206,8 +17226,8 @@ async function dispatchMutation(
           } catch {
             throw new ConnectError("Memory Backend not found.", Code.NotFound);
           }
-          if (backend.capabilities.get("memory.compaction_digest")?.supported !== true) {
-            throw new ConnectError("Backend does not support memory.compaction_digest.", Code.FailedPrecondition);
+          if (backendMemoryRole(backend) !== "compaction_digest") {
+            throw new ConnectError("Backend does not support resettable compaction memory.", Code.FailedPrecondition);
           }
           reset = () => memory.reset("backend", backendId);
           break;

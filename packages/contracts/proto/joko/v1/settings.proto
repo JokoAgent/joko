@@ -934,12 +934,20 @@ message MessageSearchSettingsPatch {
   bool reset_semantic_index_enabled = 2;
 }
 
+enum BackendMemoryKind {
+  BACKEND_MEMORY_KIND_UNSPECIFIED = 0;
+  BACKEND_MEMORY_KIND_COMPACTION_DIGEST = 1;
+  BACKEND_MEMORY_KIND_NATIVE_AUTO_MEMORY = 2;
+}
+
 message BackendMemorySettings {
   string backend_id = 1;
   bool enabled = 2;
   CapabilitySupport support = 3;
   string reason = 4;
   uint64 entry_count = 5;
+  BackendMemoryKind kind = 6;
+  bool resettable = 7;
 }
 
 message MemorySettings {

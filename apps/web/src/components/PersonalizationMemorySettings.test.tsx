@@ -90,6 +90,22 @@ describe("PersonalizationMemorySettings", () => {
     expect(resetButtons[0]?.disabled).toBe(false);
     expect(resetButtons[1]?.disabled).toBe(true);
   });
+
+  it("keeps Backend-native memory mutually exclusive with Maker Memory and hides an unimplemented reset", async () => {
+    const update = vi.fn(async () => undefined);
+    const controller = { updateMemorySettings: update } as unknown as AppController;
+    const blocked = await render(controller, nativeSnapshot(true), () => undefined);
+    expect(blocked.textContent).toContain("Uses Claude Code's private native memory across tasks.");
+    expect(blocked.textContent).toContain("Turn off Maker Memory to configure Backend-native memory.");
+    expect(blocked.querySelector<HTMLButtonElement>('button[aria-label="Toggle Claude Code Auto Memory"]')?.disabled).toBe(true);
+    expect(blocked.querySelector<HTMLButtonElement>('button[aria-label="Reset Claude Code Auto Memory?"]')).toBeNull();
+
+    const available = await render(controller, nativeSnapshot(false));
+    const toggle = available.querySelector<HTMLButtonElement>('button[aria-label="Toggle Claude Code Auto Memory"]')!;
+    expect(toggle.disabled).toBe(false);
+    await act(async () => toggle.click());
+    expect(update).toHaveBeenCalledWith({ backendId: "claude-code", backendEnabled: false });
+  });
 });
 
 async function render(
@@ -136,7 +152,32 @@ function snapshot(makerEnabled: boolean): AppSnapshot {
           enabled: true,
           supported: true,
           reason: "",
-          entryCount: 2
+          entryCount: 2,
+          kind: "compaction_digest",
+          resettable: true
+        }]
+      }
+    }
+  };
+}
+
+function nativeSnapshot(makerEnabled: boolean): AppSnapshot {
+  const value = snapshot(makerEnabled);
+  return {
+    ...value,
+    backends: [{ ...value.backends[0]!, id: "claude-code", name: "Claude Code" }],
+    settings: {
+      ...value.settings,
+      memory: {
+        ...value.settings.memory,
+        backends: [{
+          backendId: "claude-code",
+          enabled: true,
+          supported: true,
+          reason: "",
+          entryCount: 0,
+          kind: "native_auto_memory",
+          resettable: false
         }]
       }
     }

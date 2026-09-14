@@ -339,6 +339,8 @@ export interface ClaudeCodeAdapterOptions extends ClaudeInputResolvers {
   readonly hostCapabilities?: readonly HostComposedCapability[];
   /** Reads the committed default for new native runtimes on this Provider. */
   readonly resolveSubagentModel?: (providerId: string) => string | undefined;
+  /** Reads the committed native auto-memory choice for each new standard Query. */
+  readonly resolveNativeMemoryEnabled?: () => boolean;
   /** Resolves approved text resources for one exact product Session runtime. */
   readonly resolveTextResources?: ClaudeTextResourceResolver;
 }
@@ -484,6 +486,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
   readonly #inputResolvers: ClaudeInputResolvers;
   readonly #resolveTextResources: ClaudeTextResourceResolver | undefined;
   readonly #resolveSubagentModel: ClaudeCodeAdapterOptions["resolveSubagentModel"];
+  readonly #resolveNativeMemoryEnabled: ClaudeCodeAdapterOptions["resolveNativeMemoryEnabled"];
   readonly #projection: SafeProjection;
   readonly #now: () => number;
   readonly #oauthAccount: ClaudeCodeOAuthAccount | undefined;
@@ -560,6 +563,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     );
     this.#hostCapabilities = validatedHostCapabilities(options.hostCapabilities);
     this.#resolveSubagentModel = options.resolveSubagentModel;
+    this.#resolveNativeMemoryEnabled = options.resolveNativeMemoryEnabled;
     this.#resolveTextResources = options.resolveTextResources;
     this.#inputResolvers = {
       ...(options.readBlob === undefined ? {} : { readBlob: options.readBlob }),
@@ -705,6 +709,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         supportsSteer(this.#lastCliVersion),
         supportsSubagentDefaultModel(this.#lastCliVersion),
         this.#resolveSubagentModel !== undefined,
+        this.#resolveNativeMemoryEnabled !== undefined,
         catalogModels,
         this.#managedModels().some((model) => model.thinkingLevels.length > 0),
         this.#hostCapabilities,
@@ -2229,6 +2234,28 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       this.#assertBackendInstance(context);
       context.signal.throwIfAborted();
     }
+    let nativeMemoryEnabled: boolean | undefined;
+    if (launch.runtimePolicy === "standard" && this.#resolveNativeMemoryEnabled !== undefined) {
+      try {
+        nativeMemoryEnabled = this.#resolveNativeMemoryEnabled();
+      } catch (error) {
+        if (error instanceof JokoError) throw error;
+        throw claudeCodeError(
+          "NATIVE_MEMORY_SETTING_READ_FAILED",
+          "The native auto-memory setting could not be read.",
+          "session_start",
+          { recovery: "Reload Memory settings and retry the native Session." }
+        );
+      }
+      if (typeof nativeMemoryEnabled !== "boolean") {
+        throw claudeCodeError(
+          "NATIVE_MEMORY_SETTING_INVALID",
+          "The native auto-memory setting is invalid.",
+          "session_start",
+          { recovery: "Restore the native auto-memory setting to its default and retry." }
+        );
+      }
+    }
     let runtimeAuthorization: Awaited<ReturnType<ClaudeCodeOAuthAccount["runtimeAuthorization"]>> = undefined;
     try {
       runtimeAuthorization = managedRoute === undefined ? await this.#oauthAccount?.runtimeAuthorization() : undefined;
@@ -2273,6 +2300,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
                 settings: {
                   allowedMcpServers: [],
                   autoMemoryEnabled: false,
+                  autoDreamEnabled: false,
                   disableAgentView: true,
                   disableAllHooks: true,
                   disableArtifact: true,
@@ -2297,6 +2325,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
                   // The fixed CLI additionally filters provider-related `env`
                   // keys when CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST is set.
                   apiKeyHelper: "",
+                  ...(nativeMemoryEnabled === undefined
+                    ? {}
+                    : { autoMemoryEnabled: nativeMemoryEnabled, autoDreamEnabled: nativeMemoryEnabled }),
                   ...(managedLimitEnvironment === undefined || Object.keys(managedLimitEnvironment).length === 0
                     ? {}
                     : { env: { ...managedLimitEnvironment } }),
@@ -4161,6 +4192,7 @@ function capabilityManifest(
   steerSupported: boolean,
   subagentDefaultModelSupported: boolean,
   subagentDefaultModelConfigured: boolean,
+  nativeMemoryConfigured: boolean,
   models: readonly ClaudeSdkModelInfo[],
   managedEffortSupported: boolean,
   hostCapabilities: ReadonlySet<HostComposedCapability>,
@@ -4213,6 +4245,7 @@ function capabilityManifest(
   if (supportsLogout) supported.add("provider.logout");
   if (steerSupported) supported.add("turn.steer");
   if (subagentDefaultModelSupported && subagentDefaultModelConfigured) supported.add("subagents.default_model");
+  if (nativeMemoryConfigured) supported.add("memory.native");
   if (managedEffortSupported || models.some((model) => model.supportsEffort === true)) supported.add("model.effort");
   if (models.some((model) => model.supportsFastMode === true)) supported.add("model.fast_mode");
   for (const capability of hostCapabilities) supported.add(capability);

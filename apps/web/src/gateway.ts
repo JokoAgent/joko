@@ -18,6 +18,7 @@ import {
   AuthenticationState,
   BackendService,
   BackendHealth,
+  BackendMemoryKind,
   BackgroundTaskState,
   BlobDisposition,
   BrowserAutomationTarget,
@@ -14040,7 +14041,9 @@ function mapSettings(settings: SettingsSnapshot | undefined): SettingsView {
         enabled: backend.enabled,
         supported: backend.support === CapabilitySupport.SUPPORTED,
         reason: backend.reason,
-        entryCount: numberValue(backend.entryCount)
+        entryCount: numberValue(backend.entryCount),
+        kind: backendMemoryKind(backend.kind),
+        resettable: backend.resettable
       }))
     },
     visionBridge: {
@@ -15910,6 +15913,15 @@ function providerKind(value: ProviderKind): SettingsView["providers"][number]["k
   if (value === ProviderKind.SUBSCRIPTION) return "subscription";
   if (value === ProviderKind.LOCAL_KEYLESS) return "localKeyless";
   return "customEndpoint";
+}
+
+function backendMemoryKind(value: BackendMemoryKind): "compaction_digest" | "native_auto_memory" {
+  switch (value) {
+    case BackendMemoryKind.COMPACTION_DIGEST: return "compaction_digest";
+    case BackendMemoryKind.NATIVE_AUTO_MEMORY: return "native_auto_memory";
+    case BackendMemoryKind.UNSPECIFIED: throw new Error("Backend memory kind is missing.");
+    default: throw new Error("Backend memory kind is unsupported.");
+  }
 }
 
 function providerCredentialSurfaceCapability(

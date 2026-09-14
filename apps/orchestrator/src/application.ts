@@ -985,6 +985,7 @@ export async function createOrchestratorApplication(
         managedProviders: managedRuntime(instanceId, generation, CLAUDE_MANAGED_PROVIDER_SUPPORT),
         credentialPort: claudeCodeCredentialPort,
         resolveSubagentModel: (providerId) => subagentModels.resolve(instanceId, providerId),
+        resolveNativeMemoryEnabled: () => makerMemory.nativeEnabledForBackend(instanceId),
         oauthFetch: claudeCodeOAuthFetch,
         readBlob: (blob) => artifacts.readBlob(blob),
         resolveFile: (blob) => artifacts.resolveBlobPath(blob),

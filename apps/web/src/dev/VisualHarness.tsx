@@ -3369,7 +3369,9 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
             enabled: true,
             supported: true,
             reason: "",
-            entryCount: 2
+            entryCount: 2,
+            kind: "compaction_digest" as const,
+            resettable: true
           }]
         },
         visionBridge: {

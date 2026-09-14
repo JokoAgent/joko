@@ -13,7 +13,8 @@ type ResetTarget =
   | { readonly kind: "curated" }
   | { readonly kind: "backend"; readonly backendId: string; readonly backendName: string };
 
-function PiMemoryMark(): JSX.Element {
+function BackendMemoryMark({ native }: { readonly native: boolean }): JSX.Element {
+  if (native) return <Sparkles />;
   return <svg viewBox="0 0 24 24" aria-hidden="true">
     <g fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
       <path d="M3.6 6.6h16.8" />
@@ -167,12 +168,14 @@ export function PersonalizationMemorySettings({ controller, snapshot, runAction,
 
         {settings.backends.map((backend) => {
           const backendName = backendNames.get(backend.backendId) ?? backend.backendId;
-          const disabled = !makerEnabled || !settings.makerSupported || !backend.supported;
+          const native = backend.kind === "native_auto_memory";
+          const disabled = (native ? makerEnabled : !makerEnabled) || !settings.makerSupported || !backend.supported;
           return <div className="memory-settings__row memory-settings__row--backend" data-disabled={disabled || undefined} key={backend.backendId}>
-            <span className="memory-settings__icon memory-settings__icon--backend" aria-hidden="true"><PiMemoryMark /></span>
+            <span className="memory-settings__icon memory-settings__icon--backend" aria-hidden="true"><BackendMemoryMark native={native} /></span>
             <span className="memory-settings__copy">
               <strong>{t("settings.memory.backendLabel", { backend: backendName })}</strong>
-              <span>{t("settings.memory.backendDescription", { backend: backendName })}</span>
+              <span>{t(native ? "settings.memory.nativeBackendDescription" : "settings.memory.backendDescription", { backend: backendName })}</span>
+              {native && makerEnabled && <small role="status">{t("settings.memory.nativeBlocked")}</small>}
               {!backend.supported && <small role="status">{backend.reason || t("common.unavailable")}</small>}
             </span>
             <span className="memory-settings__actions">
@@ -182,12 +185,12 @@ export function PersonalizationMemorySettings({ controller, snapshot, runAction,
                   aria-label={t("settings.memory.backendToggleAria", { backend: backendName })}
                   onChange={(event) => toggleBackend(backend.backendId, backendName, event.target.checked)}
                 />
-              <IconButton
+              {backend.resettable && <IconButton
                 className="memory-settings__reset"
                 label={t("settings.memory.resetBackendTitle", { backend: backendName })}
                 disabled={disabled || pending.has(`reset:${backend.backendId}`)}
                 onClick={() => setResetTarget({ kind: "backend", backendId: backend.backendId, backendName })}
-              ><RotateCcw aria-hidden="true" /></IconButton>
+              ><RotateCcw aria-hidden="true" /></IconButton>}
             </span>
           </div>;
         })}

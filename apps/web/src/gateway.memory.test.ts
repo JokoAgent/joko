@@ -1,6 +1,8 @@
 import { create } from "@bufbuild/protobuf";
 import type { Transport } from "@connectrpc/connect";
 import {
+  BackendMemoryKind,
+  CapabilitySupport,
   GetSnapshotResponseSchema,
   MemoryResetScope,
   OperationState,
@@ -9,9 +11,41 @@ import {
 } from "@joko/contracts";
 import { describe, expect, it, vi } from "vitest";
 
-import { createOrchestratorGateway } from "./gateway.js";
+import { createOrchestratorGateway, mapSnapshot } from "./gateway.js";
 
 describe("OrchestratorGateway Memory reset scopes", () => {
+  it("preserves the typed Backend memory role and reset authority", () => {
+    const projected = mapSnapshot(create(SnapshotSchema, {
+      settings: {
+        auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" },
+        agentResource: {},
+        collaboration: {},
+        gitSafety: {},
+        memory: {
+          makerEnabled: false,
+          makerSupport: CapabilitySupport.SUPPORTED,
+          backends: [{
+            backendId: "claude-code",
+            enabled: true,
+            support: CapabilitySupport.SUPPORTED,
+            kind: BackendMemoryKind.NATIVE_AUTO_MEMORY,
+            resettable: false
+          }]
+        }
+      }
+    }));
+
+    expect(projected.settings.memory.backends).toEqual([{
+      backendId: "claude-code",
+      enabled: true,
+      supported: true,
+      reason: "",
+      entryCount: 0,
+      kind: "native_auto_memory",
+      resettable: false
+    }]);
+  });
+
   it("sends distinct CURATED and capability-owned BACKEND mutations", async () => {
     const mutations: any[] = [];
     const gateway = createOrchestratorGateway(

@@ -24,13 +24,18 @@ describe("Connect Maker Memory owner and reset scopes", () => {
         : { removedEntries: backendId === "memory-capable" ? 2 : 0, removedTargets: 1 });
     const store = {
       findOperation: () => undefined,
-      getBackend: (backendId: string) => ({ descriptor: {
-        id: backendId,
-        capabilities: new Map([["memory.compaction_digest", {
-          key: "memory.compaction_digest",
-          supported: backendId === "memory-capable"
-        }]])
-      } })
+      getBackend: (backendId: string) => ({ descriptor: backendId === "native-memory"
+        ? {
+            id: backendId,
+            capabilities: new Map([["memory.native", { key: "memory.native", supported: true }]])
+          }
+        : {
+            id: backendId,
+            capabilities: new Map([["memory.compaction_digest", {
+              key: "memory.compaction_digest",
+              supported: backendId === "memory-capable"
+            }]])
+          } })
     };
     const services = createConnectServices(stubApplication({
       store,
@@ -74,7 +79,66 @@ describe("Connect Maker Memory owner and reset scopes", () => {
       scope: contract.MemoryResetScope.BACKEND,
       backendId: "pi"
     })).rejects.toMatchObject({ code: Code.FailedPrecondition });
+    await expect(submitReset(services.operation.submitOperation, {
+      operationId: "memory-reset-native-without-owner",
+      connectionId: owner.id,
+      scope: contract.MemoryResetScope.BACKEND,
+      backendId: "native-memory"
+    })).rejects.toMatchObject({ code: Code.FailedPrecondition });
     expect(reset).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects a stale native-memory toggle while Maker Memory is enabled and accepts an atomic switch", async () => {
+    let current = { format: 1 as const, makerEnabled: true, backendEnabled: {} as Readonly<Record<string, boolean>> };
+    const setSetting = vi.fn((_scope: string, _scopeId: string, _key: string, value: typeof current) => { current = value; });
+    const reconcileSettingsChange = vi.fn(async () => true);
+    const patchedSettings = vi.fn((patch: {
+      readonly makerEnabled?: boolean;
+      readonly backendId?: string;
+      readonly backendEnabled?: boolean;
+    }) => ({
+      format: 1 as const,
+      makerEnabled: patch.makerEnabled ?? current.makerEnabled,
+      backendEnabled: patch.backendEnabled === undefined
+        ? current.backendEnabled
+        : { ...current.backendEnabled, [patch.backendId!]: patch.backendEnabled }
+    }));
+    const store = {
+      findOperation: () => undefined,
+      setSetting,
+      getBackend: (backendId: string) => ({ descriptor: {
+        id: backendId,
+        capabilities: new Map([["memory.native", { key: "memory.native", supported: true }]])
+      } })
+    };
+    const services = createConnectServices(stubApplication({
+      store,
+      makerMemory: { patchedSettings, reconcileSettingsChange },
+      sessionHost: immediateHost(store)
+    }));
+
+    await expect(submitMemoryUpdate(services.operation.submitOperation, {
+      operationId: "memory-native-stale-toggle",
+      connectionId: owner.id,
+      backendId: "native-memory",
+      backendEnabled: false
+    })).rejects.toMatchObject({ code: Code.FailedPrecondition });
+    expect(setSetting).not.toHaveBeenCalled();
+    expect(reconcileSettingsChange).not.toHaveBeenCalled();
+
+    await submitMemoryUpdate(services.operation.submitOperation, {
+      operationId: "memory-native-atomic-switch",
+      connectionId: owner.id,
+      makerEnabled: false,
+      backendId: "native-memory",
+      backendEnabled: false
+    });
+    expect(setSetting).toHaveBeenCalledWith("service", "orchestrator", "settings.memory", {
+      format: 1,
+      makerEnabled: false,
+      backendEnabled: { "native-memory": false }
+    });
+    expect(reconcileSettingsChange).toHaveBeenCalledOnce();
   });
 
   it("rejects ambiguous reset scopes before deleting anything", async () => {
@@ -168,6 +232,33 @@ async function submitReset<T = unknown>(handler: unknown, input: {
         value: create(contract.ResetMemoryMutationSchema, {
           scope: input.scope,
           backendId: input.backendId ?? ""
+        })
+      }
+    })
+  }, context());
+}
+
+async function submitMemoryUpdate<T = unknown>(handler: unknown, input: {
+  readonly operationId: string;
+  readonly connectionId: string;
+  readonly makerEnabled?: boolean;
+  readonly backendId?: string;
+  readonly backendEnabled?: boolean;
+}): Promise<T> {
+  if (typeof handler !== "function") throw new Error("submitOperation handler is missing");
+  return await (handler as (request: unknown, value: unknown) => Promise<T>)({
+    operationId: input.operationId,
+    connectionId: input.connectionId,
+    mutation: create(contract.OperationMutationSchema, {
+      preconditions: [],
+      payload: {
+        case: "updateMemorySettings",
+        value: create(contract.UpdateMemorySettingsMutationSchema, {
+          patch: create(contract.MemorySettingsPatchSchema, {
+            ...(input.makerEnabled === undefined ? {} : { makerEnabled: input.makerEnabled }),
+            ...(input.backendId === undefined ? {} : { backendId: input.backendId }),
+            ...(input.backendEnabled === undefined ? {} : { backendEnabled: input.backendEnabled })
+          })
         })
       }
     })

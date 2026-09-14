@@ -51,7 +51,7 @@ export interface MakerMemorySnapshot {
 /** Capability-derived role assignment supplied by the service projection. */
 export interface MakerMemoryBackendRole {
   readonly backendId: string;
-  readonly role: "compaction_digest";
+  readonly role: "compaction_digest" | "native_auto_memory";
 }
 
 export interface MakerMemorySettingsPatch {
@@ -125,7 +125,10 @@ export class MakerMemoryController {
       backends.map(({ backendId }) => [backendId, settings.backendEnabled[backendId] ?? true])
     );
     const backendEntryCount = Object.fromEntries(
-      backends.map(({ backendId }) => [backendId, this.#store.countMakerMemoryEntries("digest", backendId)])
+      backends.map(({ backendId, role }) => [
+        backendId,
+        role === "compaction_digest" ? this.#store.countMakerMemoryEntries("digest", backendId) : 0
+      ])
     );
     return {
       makerEnabled: settings.makerEnabled,
@@ -139,6 +142,11 @@ export class MakerMemoryController {
   enabledForBackend(backendId: string): boolean {
     const settings = this.settings();
     return settings.makerEnabled && (settings.backendEnabled[backendId] ?? true);
+  }
+
+  nativeEnabledForBackend(backendId: string): boolean {
+    const settings = this.settings();
+    return !settings.makerEnabled && (settings.backendEnabled[backendId] ?? true);
   }
 
   async update(patch: MakerMemorySettingsPatch): Promise<MakerMemorySnapshot> {

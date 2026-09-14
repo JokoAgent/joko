@@ -77,6 +77,7 @@ export const CAPABILITIES = [
   "context.auto_retry",
   "memory.curated",
   "memory.compaction_digest",
+  "memory.native",
   "context.silent_encrypted_retry",
   "workspace.files",
   "workspace.files.watch",

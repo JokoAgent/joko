@@ -266,6 +266,7 @@ describe("Orchestrator application composition", () => {
       fields: expect.arrayContaining(["model_limits"])
     });
     const claudeCapabilities = application.store.getBackend("claude-code").descriptor.capabilities;
+    expect(claudeCapabilities.get("memory.native")?.supported).toBe(true);
     expect(claudeCapabilities.get("workspace.extra_dirs")?.supported).toBe(true);
     expect(claudeCapabilities.get("runtime.resources")).toMatchObject({
       supported: true,

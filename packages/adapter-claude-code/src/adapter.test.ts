@@ -148,6 +148,7 @@ describe("ClaudeCodeAdapter", () => {
     const close = vi.fn(async () => undefined);
     const adapter = adapterFor(new FakeSdkRuntime(), {
       managedProviders: managed.port,
+      resolveNativeMemoryEnabled: () => false,
       remoteRuntimes: {
         resolve: async () => ({
           runtime: remoteRuntime,
@@ -172,6 +173,8 @@ describe("ClaudeCodeAdapter", () => {
         CLAUDE_CODE_MAX_OUTPUT_TOKENS: "4000"
       },
       settings: {
+        autoDreamEnabled: false,
+        autoMemoryEnabled: false,
         env: {
           CLAUDE_CODE_MAX_CONTEXT_TOKENS: "64000",
           CLAUDE_CODE_AUTO_COMPACT_WINDOW: "64000",
@@ -1536,10 +1539,65 @@ describe("ClaudeCodeAdapter", () => {
     })).toThrow("Claude Code Host-composed capability is invalid");
   });
 
+  test("advertises native auto-memory and snapshots its effective value for each standard Query", async () => {
+    let enabled = true;
+    const resolveNativeMemoryEnabled = vi.fn(() => enabled);
+    const runtime = new FakeSdkRuntime();
+    const adapter = adapterFor(runtime, { resolveNativeMemoryEnabled });
+
+    expect((await adapter.describe()).capabilities.get("memory.native")).toEqual({
+      key: "memory.native",
+      supported: true
+    });
+    const binding = await adapter.createSession(createInput(), contextFor().context);
+    expect(runtime.queries[0]!.params.options.settings).toMatchObject({
+      autoMemoryEnabled: true,
+      autoDreamEnabled: true
+    });
+
+    enabled = false;
+    expect(runtime.queries[0]!.params.options.settings).toMatchObject({
+      autoMemoryEnabled: true,
+      autoDreamEnabled: true
+    });
+    await adapter.closeSession(binding, contextFor(binding).context);
+    const resumedBinding = { ...binding, generation: 2 };
+    await adapter.resumeSession(binding, contextFor(resumedBinding, { generation: 2 }).context);
+    expect(runtime.queries[1]!.params.options.settings).toMatchObject({
+      autoMemoryEnabled: false,
+      autoDreamEnabled: false
+    });
+    expect(resolveNativeMemoryEnabled).toHaveBeenCalledTimes(2);
+    await adapter.dispose();
+  });
+
+  test.each([
+    {
+      name: "a resolver failure",
+      resolveNativeMemoryEnabled: () => { throw new Error("private-setting-failure"); },
+      code: "NATIVE_MEMORY_SETTING_READ_FAILED"
+    },
+    {
+      name: "an invalid resolver value",
+      resolveNativeMemoryEnabled: () => "enabled" as never,
+      code: "NATIVE_MEMORY_SETTING_INVALID"
+    }
+  ])("rejects $name before starting a native Query", async ({ resolveNativeMemoryEnabled, code }) => {
+    const runtime = new FakeSdkRuntime();
+    const adapter = adapterFor(runtime, { resolveNativeMemoryEnabled });
+
+    await expect(adapter.createSession(createInput(), contextFor().context)).rejects.toMatchObject({
+      publicError: { code, stateMayHaveChanged: false }
+    });
+    expect(runtime.queries).toEqual([]);
+    await adapter.dispose();
+  });
+
   test("runs isolated review only through the immutable native safe profile", async () => {
     const runtime = new FakeSdkRuntime();
     const resolveSubagentModel = vi.fn(() => "model-b");
-    const adapter = adapterFor(runtime, { resolveSubagentModel });
+    const resolveNativeMemoryEnabled = vi.fn(() => { throw new Error("Review must not read mutable Memory settings."); });
+    const adapter = adapterFor(runtime, { resolveSubagentModel, resolveNativeMemoryEnabled });
     const descriptor = await adapter.describe();
     expect(descriptor.capabilities.get("review.isolated")).toEqual({
       key: "review.isolated",
@@ -1580,6 +1638,7 @@ describe("ClaudeCodeAdapter", () => {
     }), creation.context);
     const query = runtime.queries[0]!;
     expect(resolveSubagentModel).not.toHaveBeenCalled();
+    expect(resolveNativeMemoryEnabled).not.toHaveBeenCalled();
     expect(query.params.options.env["CLAUDE_CODE_SUBAGENT_MODEL"]).toBeUndefined();
     expect(query.params.options.env["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"]).toBeUndefined();
     expect(query.params.options).toMatchObject({
@@ -1598,6 +1657,7 @@ describe("ClaudeCodeAdapter", () => {
       settingSources: [],
       settings: {
         allowedMcpServers: [],
+        autoDreamEnabled: false,
         autoMemoryEnabled: false,
         disableAgentView: true,
         disableAllHooks: true,
