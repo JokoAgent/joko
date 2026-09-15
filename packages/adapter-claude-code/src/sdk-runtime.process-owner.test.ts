@@ -3,9 +3,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DurableProcessOwner, type ProcessIdentitySupervisor } from "@joko/runtime-governance";
-import { DefaultClaudeSdkRuntime, spawnOwnedClaudeCodeProcess, type ClaudeSdkQuery, type ClaudeSdkQueryParams } from "./sdk-runtime.js";
+import {
+  CLAUDE_AGENT_SDK_CLI_VERSION,
+  DefaultClaudeSdkRuntime,
+  spawnOwnedClaudeCodeProcess,
+  type ClaudeSdkQuery,
+  type ClaudeSdkQueryParams
+} from "./sdk-runtime.js";
 
-const sdk = vi.hoisted(() => ({ query: vi.fn(), startup: vi.fn() }));
+const sdk = vi.hoisted(() => ({
+  query: vi.fn(),
+  startup: vi.fn(),
+  createSdkMcpServer: vi.fn((options: unknown) => ({ type: "sdk", name: "fixture", instance: options }))
+}));
 vi.mock("@anthropic-ai/claude-agent-sdk", () => sdk);
 
 const roots: string[] = [];
@@ -15,6 +25,59 @@ afterEach(async () => {
 });
 
 describe("Claude SDK owned custom spawn", () => {
+  it("keeps filesystem settings enabled during discovery while forwarding the Host credential override", async () => {
+    sdk.startup.mockRejectedValueOnce(new Error("bounded fixture stop"));
+    const runtime = new DefaultClaudeSdkRuntime();
+
+    await expect(runtime.probe({
+      cwd: process.cwd(),
+      env: { CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: "1" },
+      settings: { apiKeyHelper: "" },
+      settingSources: ["user", "project", "local"],
+      initializationTimeoutMs: 500
+    })).resolves.toMatchObject({ installed: true });
+
+    expect(sdk.startup).toHaveBeenCalledWith({
+      initializeTimeoutMs: 500,
+      options: expect.objectContaining({
+        settings: { apiKeyHelper: "" },
+        settingSources: ["user", "project", "local"]
+      })
+    });
+  });
+
+  it("uses the fixed package's bundled CLI binding when an empty startup probe emits no turn init", async () => {
+    sdk.startup.mockResolvedValueOnce(probeWarmQuery());
+    const runtime = new DefaultClaudeSdkRuntime();
+
+    await expect(runtime.probe({
+      cwd: process.cwd(),
+      env: {},
+      settings: { apiKeyHelper: "" },
+      settingSources: [],
+      initializationTimeoutMs: 500
+    })).resolves.toMatchObject({
+      installed: true,
+      cliVersion: CLAUDE_AGENT_SDK_CLI_VERSION
+    });
+  });
+
+  it("does not apply the bundled CLI binding to an executable override", async () => {
+    sdk.startup.mockResolvedValueOnce(probeWarmQuery());
+    const runtime = new DefaultClaudeSdkRuntime();
+
+    const result = await runtime.probe({
+      cwd: process.cwd(),
+      env: {},
+      pathToClaudeCodeExecutable: "D:\\custom\\claude.exe",
+      settings: { apiKeyHelper: "" },
+      settingSources: [],
+      initializationTimeoutMs: 500
+    });
+    expect(result).toEqual(expect.objectContaining({ installed: true }));
+    expect(result.cliVersion).toBeUndefined();
+  });
+
   it("confirms only the selected Query's exact process lease and does not retire a concurrent Query", async () => {
     const root = await mkdtemp(join(tmpdir(), "joko-claude-query-owner-"));
     roots.push(root);
@@ -117,6 +180,15 @@ function queryParams(): ClaudeSdkQueryParams {
     cwd: process.cwd(), env: {}, includePartialMessages: true, permissionMode: "default", persistSession: false,
     settingSources: [], systemPrompt: { type: "preset", preset: "claude_code" }, tools: []
   } };
+}
+
+function probeWarmQuery() {
+  const query = {
+    initializationResult: async () => ({ models: [], account: {} }),
+    close: vi.fn(),
+    async *[Symbol.asyncIterator]() {}
+  };
+  return { query: () => query, close: vi.fn() };
 }
 
 async function expectOwnerRootEmpty(root: string): Promise<void> {

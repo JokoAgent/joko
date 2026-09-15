@@ -12,6 +12,7 @@ import {
   CapabilityDrivenBackendAdapter,
   HOST_COMPOSED_CAPABILITIES,
   JokoError,
+  MEMORY_NATIVE_RESET_LOCAL_OPTION,
   type AdapterContext,
   type AdapterEventMetadata,
   type ApprovedDirectory,
@@ -27,9 +28,12 @@ import {
   type ManagedProviderRuntimePort,
   type ManagedProviderRouteBinding,
   type ManagedProviderOperationLease,
+  type ManagedProviderSubtaskLease,
   type ProviderRuntimeSupport,
   type NativeHistoryProjectedEvent,
   type NativeHistoryProjection,
+  type NativeMemoryResetResult,
+  type NativeMemoryStatus,
   type NativeSessionBinding,
   type NativeSessionDerivation,
   type NativeSessionForkResult,
@@ -70,11 +74,14 @@ import {
 } from "./projection.js";
 import {
   CLAUDE_AGENT_SDK_VERSION,
+  CLAUDE_MANAGED_AGENT_TOOL_NAME,
   DefaultClaudeSdkRuntime,
   type ClaudeCanUseToolOptions,
   type ClaudePermissionResult,
   type ClaudePermissionUpdate,
   type ClaudeSdkAccountInfo,
+  type ClaudeSdkManagedAgentInput,
+  type ClaudeSdkManagedAgentResult,
   type ClaudeSdkProbe,
   type ClaudeSdkInitializationResult,
   type ClaudeSdkModelInfo,
@@ -102,6 +109,11 @@ import {
   isNativeTaskSystemSubtype,
   type NativeTaskEmission
 } from "./native-task-projection.js";
+import {
+  ClaudeNativeMemoryFilesystemError,
+  resetClaudeNativeMemory,
+  scanClaudeNativeMemory
+} from "./native-memory.js";
 
 const ADAPTER_ID = "claude-code";
 const PROVIDER_ID = "claude-code";
@@ -109,12 +121,15 @@ const OPAQUE_REFERENCE_PREFIX = "claude-code:session:";
 const DEFAULT_INITIALIZATION_TIMEOUT_MS = 20_000;
 const DEFAULT_ADMISSION_TIMEOUT_MS = 20_000;
 const DEFAULT_TEARDOWN_TIMEOUT_MS = 5_000;
+const DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT = 90;
+const NATIVE_AUTO_COMPACT_WINDOW_MINIMUM = 100_000;
 const DEFAULT_INTERRUPT_TIMEOUT_MS = 5_000;
 const DEFAULT_NATIVE_CONTINUATION_GRACE_MS = 60_000;
 const DEFAULT_MAXIMUM_DISCOVERED_SESSIONS = 200;
 const DEFAULT_MAXIMUM_CATALOG_SESSIONS = 1_000;
 const MAX_NATIVE_HISTORY_MESSAGES = 10_000;
 const MAX_PROMPT_BYTES = 1024 * 1024;
+const MAX_MANAGED_AGENT_RESULT_BYTES = 64 * 1024;
 const MAX_INTERACTION_CACHE = 256;
 const MAX_PENDING_INTERACTIONS = 256;
 const MAX_TURN_FRAMES = 100_000;
@@ -126,6 +141,7 @@ const MAX_DESCRIPTOR_ITEMS = 4_096;
 const MAX_PERMISSION_RULES = 256;
 const MAX_PERMISSION_RULE_CONTENT = 4_096;
 const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
+const PERSISTED_MODEL_EFFORT_LEVELS = ["low", "medium", "high", "xhigh"] as const;
 const DEFAULT_SETTING_SOURCES = ["user", "project", "local"] as const;
 const ISOLATED_REVIEW_CLI_VERSION = [2, 1, 259] as const;
 const NATIVE_TASK_CLI_VERSION = [2, 1, 259] as const;
@@ -337,6 +353,8 @@ export interface ClaudeCodeAdapterOptions extends ClaudeInputResolvers {
   readonly hostCapabilities?: readonly HostComposedCapability[];
   /** Reads the committed default for new native runtimes on this Provider. */
   readonly resolveSubagentModel?: (providerId: string) => string | undefined;
+  /** Reads the committed native auto-memory choice for each new standard Query. */
+  readonly resolveNativeMemoryEnabled?: () => boolean;
   /** Resolves approved text resources for one exact product Session runtime. */
   readonly resolveTextResources?: ClaudeTextResourceResolver;
 }
@@ -348,6 +366,12 @@ interface ActiveTurn {
   readonly backendInstanceGeneration: number;
   readonly queryGeneration: number;
   readonly operationId: string;
+  readonly subtaskRouteLeases: Map<string, ManagedSubtaskRouteGrant>;
+  readonly subtaskRouteAdmissions: Map<string, ManagedSubtaskRouteAdmission>;
+  readonly subtaskRouteDecisions: Map<string, ManagedSubtaskRouteDecision>;
+  readonly managedNotifications: Map<string, ManagedContinuationNotification>;
+  readonly managedContinuationUuids: Set<string>;
+  readonly managedNotificationCancellation: AbortController;
   readonly userMessageUuid: string;
   readonly admission: Deferred<void>;
   readonly eventsReady: Deferred<void>;
@@ -363,10 +387,14 @@ interface ActiveTurn {
   inputConsumed: boolean;
   nativeIdentityConfirmed: boolean;
   terminalClaimed: boolean;
+  managedAuthorityRevoked: boolean;
   awaitingNativeContinuation: boolean;
   nativeContinuationSegment: boolean;
+  managedNotificationDispatched: boolean;
   readonly continuationTaskIds: Set<string>;
+  readonly pendingContinuationTaskIds: Set<string>;
   continuationTimer?: ReturnType<typeof setTimeout>;
+  managedNotificationPump?: Promise<void>;
   frameCount: number;
   projectedCharacters: number;
   childOutputObserved: boolean;
@@ -377,6 +405,63 @@ interface ActiveTurn {
   parentStreamUsage: UsageSnapshot;
   parentStreamSegment?: ParentStreamSegment;
   assistantError?: string;
+}
+
+interface ManagedSubtaskRouteAdmission {
+  readonly modelId: string;
+  readonly cancellation: AbortController;
+  readonly result: Promise<ManagedSubtaskRouteGrant>;
+}
+
+interface ManagedSubtaskRouteDecision {
+  readonly modelId: string;
+  readonly fingerprint: string;
+  closed: boolean;
+}
+
+interface ManagedModelLimitSnapshot {
+  readonly contextWindow: number | undefined;
+  readonly maxOutputTokens: number | undefined;
+}
+
+interface ManagedSubtaskRouteGrant {
+  readonly modelId: string;
+  readonly limits: ManagedModelLimitSnapshot;
+  readonly nativeEffort: NativeEffort | undefined;
+  readonly cancellation: AbortController;
+  readonly lease: ManagedProviderOperationLease | undefined;
+}
+
+interface ManagedContinuationNotification {
+  readonly rawTaskId: string;
+  readonly uuid: string;
+  readonly status: "completed" | "failed";
+  readonly summary: string;
+  delivered: boolean;
+}
+
+interface ManagedChildTask {
+  readonly rawTaskId: string;
+  readonly toolUseId: string;
+  readonly parentRawTaskId?: string;
+  readonly turn: ActiveTurn;
+  readonly input: ClaudeSdkManagedAgentInput;
+  readonly grant: ManagedSubtaskRouteGrant;
+  readonly background: boolean;
+  readonly childSessionId: string;
+  readonly promptUuid: string;
+  readonly identity: Deferred<void>;
+  readonly result: Promise<ClaudeSdkManagedAgentResult>;
+  query?: ClaudeSdkQuery;
+  terminalSettlement?: Promise<ClaudeSdkManagedAgentResult>;
+  identityConfirmed: boolean;
+  terminal: boolean;
+  stopping: boolean;
+}
+
+interface ManagedChildNativeTaskOwner {
+  readonly query: ClaudeSdkQuery;
+  readonly rawTaskId: string;
 }
 
 interface SteerAdmission {
@@ -410,6 +495,7 @@ interface PendingPermission {
 
 interface NativeRuntime {
   readonly managedRoute?: ManagedProviderRouteBinding;
+  readonly managedEffortSnapshot?: ManagedQueryEffortSnapshot;
   readonly productSessionId: string;
   readonly target: TargetDescriptor;
   readonly binding: NativeSessionBinding;
@@ -426,8 +512,13 @@ interface NativeRuntime {
   readonly assertRuntimeCurrent: () => void;
   readonly baseContext: AdapterContext;
   readonly nativeTasks: ClaudeNativeTaskProjection;
+  readonly managedChildren: Map<string, ManagedChildTask>;
+  readonly managedChildByToolUseId: Map<string, ManagedChildTask>;
+  readonly childNativeTaskOwners: Map<string, ManagedChildNativeTaskOwner>;
   readonly runtimePolicy: "standard" | "review_read_only";
   readonly subagentModel: string | undefined;
+  readonly nativeMemoryEnabled: boolean | undefined;
+  readonly appendSystemPrompt: string | undefined;
   readonly textResources: readonly ClaudeRuntimeTextResource[] | undefined;
   readonly capabilities: Set<string>;
   readonly pendingPermissions: Map<string, PendingPermission>;
@@ -441,6 +532,7 @@ interface NativeRuntime {
   inputPreparation?: AbortController;
   pendingControl?: symbol;
   controlUncertain: boolean;
+  freshSessionCanRestart: boolean;
   activeTurn?: ActiveTurn;
   initialization?: ClaudeSdkInitializationResult;
   modelId?: string;
@@ -453,6 +545,19 @@ interface NativeRuntime {
   additionalDirectories: readonly ApprovedDirectory[];
   lastUsage?: UsageSnapshot;
   lastTotalCostUsd: number;
+}
+
+type NativeEffort = typeof EFFORT_LEVELS[number];
+type PersistedModelEffort = typeof PERSISTED_MODEL_EFFORT_LEVELS[number];
+
+interface ManagedQueryEffortSnapshot {
+  readonly productEffort: string | undefined;
+  readonly nativeByModel: ReadonlyMap<string, NativeEffort | undefined>;
+  readonly limitsByModel: ReadonlyMap<string, ManagedModelLimitSnapshot>;
+  readonly limitEnvironment: Readonly<Record<string, string>>;
+  readonly parentLimits: ManagedModelLimitSnapshot;
+  readonly modelSettings?: Readonly<Record<string, { readonly effortLevel: PersistedModelEffort }>>;
+  readonly globalEffort?: NativeEffort;
 }
 
 interface CatalogBindingSource {
@@ -482,6 +587,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
   readonly #inputResolvers: ClaudeInputResolvers;
   readonly #resolveTextResources: ClaudeTextResourceResolver | undefined;
   readonly #resolveSubagentModel: ClaudeCodeAdapterOptions["resolveSubagentModel"];
+  readonly #resolveNativeMemoryEnabled: ClaudeCodeAdapterOptions["resolveNativeMemoryEnabled"];
+  readonly #nativeMemoryConfigDirectory: string;
   readonly #projection: SafeProjection;
   readonly #now: () => number;
   readonly #oauthAccount: ClaudeCodeOAuthAccount | undefined;
@@ -495,6 +602,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
   #externalAccountDetected = false;
   #ownsCredential = false;
   #disposed = false;
+  #nativeMemoryOperationTail: Promise<void> = Promise.resolve();
 
   constructor(options: ClaudeCodeAdapterOptions) {
     super();
@@ -523,7 +631,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     const environmentHome = childEnvironment.environment[process.platform === "win32" ? "USERPROFILE" : "HOME"] ?? homedir();
     const configDirectory = childEnvironment.environment["CLAUDE_CONFIG_DIR"] ?? join(environmentHome, ".claude");
     if (!isAbsolute(configDirectory)) throw new TypeError("The native Session configuration directory must be absolute.");
-    this.#environment = Object.freeze({ ...childEnvironment.environment, CLAUDE_CONFIG_DIR: resolve(configDirectory).normalize("NFC") });
+    const nativeMemoryConfigDirectory = resolve(configDirectory).normalize("NFC");
+    this.#environment = Object.freeze({ ...childEnvironment.environment, CLAUDE_CONFIG_DIR: nativeMemoryConfigDirectory });
+    this.#nativeMemoryConfigDirectory = nativeMemoryConfigDirectory;
     this.#pathToExecutable = options.pathToClaudeCodeExecutable;
     if (options.probeCwd !== undefined && !isAbsolute(options.probeCwd)) {
       throw new TypeError("probeCwd must be an absolute path.");
@@ -558,6 +668,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     );
     this.#hostCapabilities = validatedHostCapabilities(options.hostCapabilities);
     this.#resolveSubagentModel = options.resolveSubagentModel;
+    this.#resolveNativeMemoryEnabled = options.resolveNativeMemoryEnabled;
     this.#resolveTextResources = options.resolveTextResources;
     this.#inputResolvers = {
       ...(options.readBlob === undefined ? {} : { readBlob: options.readBlob }),
@@ -608,6 +719,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         },
         ...(runtimeAuthorization === undefined ? {} : { getOAuthToken: runtimeAuthorization.getOAuthToken }),
         ...(this.#pathToExecutable === undefined ? {} : { pathToClaudeCodeExecutable: this.#pathToExecutable }),
+        settings: { apiKeyHelper: "" },
         settingSources: [...this.#settingSources],
         initializationTimeoutMs: this.#initializationTimeoutMs
       });
@@ -702,6 +814,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         supportsSteer(this.#lastCliVersion),
         supportsSubagentDefaultModel(this.#lastCliVersion),
         this.#resolveSubagentModel !== undefined,
+        this.#resolveNativeMemoryEnabled !== undefined,
         catalogModels,
         this.#managedModels().some((model) => model.thinkingLevels.length > 0),
         this.#hostCapabilities,
@@ -1282,7 +1395,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
           assertCurrent: () => {
             this.#assertCurrent(runtime, context, context.binding);
             if (runtime.inputPreparation === preparation && !preparationSignal.aborted) return;
-            if (runtime.activeTurn?.operationId !== operationId || runtime.activeTurn.terminalClaimed || runtime.activeTurn.stopping) {
+            if (runtime.activeTurn?.operationId !== operationId || runtime.activeTurn.terminalClaimed
+              || runtime.activeTurn.managedAuthorityRevoked) {
               throw new Error("The managed model operation is no longer active.");
             }
           }
@@ -1312,6 +1426,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       backendInstanceGeneration: this.#instanceGeneration,
       queryGeneration: runtime.queryGeneration,
       operationId,
+      subtaskRouteLeases: new Map(),
+      subtaskRouteAdmissions: new Map(),
+      subtaskRouteDecisions: new Map(),
+      managedNotifications: new Map(),
+      managedContinuationUuids: new Set(),
+      managedNotificationCancellation: new AbortController(),
       userMessageUuid: operationUuid(operationId),
       admission: deferred<void>(),
       eventsReady: deferred<void>(),
@@ -1326,9 +1446,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       inputConsumed: false,
       nativeIdentityConfirmed: false,
       terminalClaimed: false,
+      managedAuthorityRevoked: false,
       awaitingNativeContinuation: false,
       nativeContinuationSegment: false,
+      managedNotificationDispatched: false,
       continuationTaskIds: new Set(),
+      pendingContinuationTaskIds: new Set(),
       frameCount: 0,
       projectedCharacters: 0,
       childOutputObserved: false,
@@ -1353,6 +1476,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       await waitFor(
         runtime.gate.offer(nativeInput, () => {
           turn.inputConsumed = true;
+          runtime.freshSessionCanRestart = false;
         }, preparationSignal, () => {
           prepared.assertCurrent();
           this.#assertCurrent(runtime, context, context.binding);
@@ -1479,22 +1603,30 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     const turn = runtime.activeTurn;
     if (turn === undefined) return;
     turn.stopping = true;
-    turn.providerLease?.release();
     turn.interruptConfirmation ??= deferred<void>();
     void turn.interruptConfirmation.promise.catch(() => undefined);
     let wakeTaskIds: readonly string[] = [];
+    let nativeWakeTaskIds: readonly string[] = [];
     let wakeStopResults = Promise.resolve<PromiseSettledResult<void>[]>([]);
     if (runtime.nativeTaskProjectionEnabled) {
       wakeTaskIds = runtime.nativeTasks.activeWakeTaskIds();
+      nativeWakeTaskIds = wakeTaskIds.filter((taskId) => !runtime.managedChildren.has(taskId));
       wakeStopResults = Promise.allSettled(
-        wakeTaskIds.map((taskId) => waitFor(
-          runtime.query.stopTask(taskId),
+        nativeWakeTaskIds.map((taskId) => waitFor(
+          this.#stopOwnedNativeTask(runtime, taskId),
           this.#interruptTimeoutMs,
           context.signal,
           turnAbortUnknown("A native wake-task stop did not complete within its bounded deadline.")
         ))
       );
     }
+    const managedChildren = this.#revokeManagedTurnAuthority(runtime, turn, true);
+    const managedStopResults = Promise.allSettled(managedChildren.map((child) => waitFor(
+      this.#stopOwnedNativeTask(runtime, child.rawTaskId),
+      this.#interruptTimeoutMs,
+      context.signal,
+      turnAbortUnknown("A delegated Query stop did not complete within its bounded deadline.")
+    )));
     let receipt: { readonly still_queued?: readonly string[] } | undefined;
     try {
       receipt = await waitFor(
@@ -1521,12 +1653,15 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
           : "The native interrupt left queued work whose cancellation cannot be proven."
       )();
     }
-    const stopResults = await wakeStopResults;
-    if (stopResults.some((result) => result.status === "rejected")) {
+    const [stopResults, childStopResults] = await Promise.all([wakeStopResults, managedStopResults]);
+    if (stopResults.some((result) => result.status === "rejected")
+      || childStopResults.some((result) => result.status === "rejected")) {
       await this.#retireAfterUncertainStop(runtime);
-      throw turnAbortUnknown("One or more native wake tasks could not be stopped authoritatively.")();
+      throw turnAbortUnknown("One or more native delegated tasks could not be stopped authoritatively.")();
     }
-    for (const taskId of wakeTaskIds) {
+    const cleanup = this.#closeManagedTurnChildren(runtime, turn, managedChildren);
+    if (cleanup !== undefined) await cleanup;
+    for (const taskId of nativeWakeTaskIds) {
       await this.#publishNativeTaskEmissions(runtime, runtime.nativeTasks.confirmStopped(taskId));
     }
     turn.interruptConfirmation.resolve(undefined);
@@ -1718,7 +1853,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       );
     }
     if (target.terminal) return;
-    await this.#runControl(runtime, context, "background_task", () => runtime.query.stopTask(target.rawTaskId));
+    await this.#runControl(runtime, context, "background_task", () => this.#stopOwnedNativeTask(runtime, target.rawTaskId));
     await this.#publishNativeTaskEmissions(runtime, runtime.nativeTasks.confirmStopped(target.rawTaskId));
     if (runtime.activeTurn !== undefined) {
       await this.#reconcileNativeContinuation(runtime, runtime.activeTurn);
@@ -1759,7 +1894,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       );
     }
     if (target.terminal) return;
-    await this.#runControl(runtime, context, "subagent_control", () => runtime.query.stopTask(target.rawTaskId));
+    await this.#runControl(runtime, context, "subagent_control", () => this.#stopOwnedNativeTask(runtime, target.rawTaskId));
     await this.#publishNativeTaskEmissions(runtime, runtime.nativeTasks.confirmStopped(target.rawTaskId));
     if (runtime.activeTurn !== undefined) {
       await this.#reconcileNativeContinuation(runtime, runtime.activeTurn);
@@ -1802,13 +1937,25 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     return providerModel(model, this.#projection);
   }
 
-  async #replaceModelRoute(runtime: NativeRuntime, providerId: string, modelId: string, context: AdapterContext): Promise<ProviderModel> {
+  async #replaceModelRoute(
+    runtime: NativeRuntime,
+    providerId: string,
+    modelId: string,
+    context: AdapterContext,
+    replacementEffort?: string
+  ): Promise<ProviderModel> {
     const managed = providerId !== PROVIDER_ID;
     const model = managed ? this.#managedProviders?.listModels().find((entry) => entry.providerId === providerId && entry.modelId === modelId)
       : (() => { const native = findModel(runtime.initialization?.models ?? [], modelId); return native === undefined ? undefined : providerModel(native, this.#projection); })();
     if (model === undefined) throw managedRouteUnavailable();
-    if (managed) validateManagedThinkingMap(this.#managedProviders!.getThinkingLevelMap(providerId, modelId));
-    if (runtime.managedRoute?.providerId === providerId && runtime.managedRoute.model.modelId === modelId) {
+    if (managed) {
+      managedModelLimitEnvironment(model);
+      const mapping = this.#managedProviders!.getThinkingLevelMap(providerId, modelId);
+      validateManagedThinkingMap(mapping);
+      if (replacementEffort !== undefined) managedNativeEffort(model, mapping, replacementEffort);
+    }
+    if (replacementEffort === undefined
+      && runtime.managedRoute?.providerId === providerId && runtime.managedRoute.model.modelId === modelId) {
       try {
         runtime.managedRoute.assertCurrent();
         return managedProviderModel(runtime.managedRoute.model, runtime.managedRoute.thinkingLevelMap);
@@ -1824,16 +1971,40 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       const info = await waitFor(this.#sessionInfo(runtime.nativeSessionId, runtime.target, context.signal),
         this.#initializationTimeoutMs, context.signal, managedRouteUnavailable);
       this.#assertCurrent(runtime, context, context.binding);
-      if (info === undefined) throw continuityGap();
-      assertSessionInfo(info, runtime.nativeSessionId, runtime.runtimeWorkspaceRoot, runtime.remote);
+      let confirmFreshAfterRetirement = false;
+      if (info === undefined) {
+        if (!runtime.freshSessionCanRestart) throw continuityGap();
+        if (await this.#sessionHasHistory(runtime, context.signal)) throw continuityGap();
+        this.#assertCurrent(runtime, context, context.binding);
+        confirmFreshAfterRetirement = true;
+      } else {
+        assertSessionInfo(info, runtime.nativeSessionId, runtime.runtimeWorkspaceRoot, runtime.remote);
+      }
       retired = true;
       await this.#retireRuntime(runtime);
-      await waitFor(runtime.sdkRuntime.retireQuery(runtime.query, this.#teardownTimeoutMs), this.#teardownTimeoutMs,
-        context.signal, () => managedRouteUnavailable(true));
+      if (!runtime.remote) {
+        await waitFor(runtime.sdkRuntime.retireQuery(runtime.query, this.#teardownTimeoutMs), this.#teardownTimeoutMs,
+          context.signal, () => managedRouteUnavailable(true));
+      }
+      let restartFresh = false;
+      if (confirmFreshAfterRetirement) {
+        const confirmedInfo = await waitFor(this.#sessionInfo(
+          runtime.nativeSessionId,
+          runtime.target,
+          context.signal,
+          targetRuntimeOf(runtime)
+        ), this.#initializationTimeoutMs, context.signal, () => managedRouteUnavailable(true));
+        if (confirmedInfo === undefined) {
+          if (await this.#sessionHasHistory(runtime, context.signal)) throw continuityGap();
+          restartFresh = true;
+        } else {
+          assertSessionInfo(confirmedInfo, runtime.nativeSessionId, runtime.runtimeWorkspaceRoot, runtime.remote);
+        }
+      }
       context.signal.throwIfAborted();
-      const retainedEffort = normalizeProductEffort(runtime.effort);
+      const retainedEffort = replacementEffort ?? normalizeProductEffort(runtime.effort);
       const replacement = await this.#startRuntime(runtime.binding, context, {
-        resume: true, providerId, modelId,
+        resume: !restartFresh, providerId, modelId,
         permissionMode: runtime.permissionMode, fastMode: false,
         ...(retainedEffort !== undefined && model.thinkingLevels.includes(retainedEffort) ? { effort: retainedEffort } : {}),
         additionalDirectories: runtime.additionalDirectories,
@@ -1864,6 +2035,25 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     const runtime = this.#requireIdleRuntime(context);
     this.#assertStandardRuntime(runtime, "change reasoning effort");
     const nativeEffort = assertEffortSupported(runtime, effort);
+    if (runtime.managedRoute !== undefined) {
+      if (runtime.effort === effort) {
+        try {
+          runtime.managedRoute.assertCurrent();
+          return;
+        } catch {
+          // Rebuild the exact route below so the next request cannot use a
+          // stale per-model effort table.
+        }
+      }
+      await this.#replaceModelRoute(
+        runtime,
+        runtime.managedRoute.providerId,
+        runtime.managedRoute.model.modelId,
+        context,
+        effort
+      );
+      return;
+    }
     await this.#runIdleControl(runtime, context, "effort", async (acknowledge) => {
       await runtime.query.applyFlagSettings({ effortLevel: nativeEffort });
       acknowledge();
@@ -1944,6 +2134,33 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     throwCombinedFailures(failures, "Claude Code Adapter resources could not all retire.");
   }
 
+  async readNativeMemoryStatus(signal?: AbortSignal): Promise<NativeMemoryStatus> {
+    if (this.#resolveNativeMemoryEnabled === undefined) return this.unsupported("memory.native");
+    return this.#withNativeMemoryOperation(async () => {
+      this.#assertUsable();
+      try {
+        const status = await scanClaudeNativeMemory(this.#nativeMemoryConfigDirectory, signal);
+        this.#assertUsable();
+        return { entryCount: status.entryCount, sizeBytes: status.sizeBytes };
+      } catch (error) {
+        throw nativeMemoryFilesystemError(error, "status");
+      }
+    });
+  }
+
+  async resetNativeMemory(): Promise<NativeMemoryResetResult> {
+    if (this.#resolveNativeMemoryEnabled === undefined) return this.unsupported("memory.native");
+    return this.#withNativeMemoryOperation(async () => {
+      this.#assertUsable();
+      try {
+        const result = await resetClaudeNativeMemory(this.#nativeMemoryConfigDirectory);
+        return result;
+      } catch (error) {
+        throw nativeMemoryFilesystemError(error, "reset");
+      }
+    });
+  }
+
   async quiesceForReplacement(): Promise<void> {
     await this.#oauthAccount?.quiesceForReplacement();
   }
@@ -1964,6 +2181,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     try { await this.#closeSdkRuntimes(); }
     catch (error) { failures.push(error); }
     throwCombinedFailures(failures, "Claude Code Adapter resources could not all retire.");
+  }
+
+  #withNativeMemoryOperation<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.#nativeMemoryOperationTail.then(operation, operation);
+    this.#nativeMemoryOperationTail = result.then(() => undefined, () => undefined);
+    return result;
   }
 
   async #startRuntime(
@@ -2023,6 +2246,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
           || managedRoute.model.api !== "anthropic-messages") throw managedRouteUnavailable();
         managedRoute.assertCurrent();
         validateManagedThinkingMap(managedRoute.thinkingLevelMap);
+        managedModelLimitEnvironment(managedRoute.model);
         if (launch.effort !== undefined) managedNativeEffort(managedRoute.model, managedRoute.thinkingLevelMap, launch.effort);
       } catch (error) {
         managedRoute?.dispose();
@@ -2073,12 +2297,18 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         return Promise.resolve({ behavior: "deny", message: "The native Session is not ready." });
       }
       return this.#canUseTool(runtime, ...args);
+    }, async (input, options) => {
+      if (runtime === undefined) return managedAgentError("The native Session is not ready.");
+      return this.#runManagedAgent(runtime, undefined, input, options.toolUseId, options.signal);
     }).catch((error: unknown) => { abortController.abort(); managedRoute?.dispose(); throw error; });
     const query = startedQuery.query;
     try {
       runtime = {
         productSessionId: context.sessionId,
         ...(managedRoute === undefined ? {} : { managedRoute }),
+        ...(startedQuery.managedEffortSnapshot === undefined
+          ? {}
+          : { managedEffortSnapshot: startedQuery.managedEffortSnapshot }),
         target: context.target,
         binding,
         sessionGeneration: context.generation,
@@ -2098,8 +2328,13 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
           projection: this.#projection,
           now: this.#now
         }),
+        managedChildren: new Map(),
+        managedChildByToolUseId: new Map(),
+        childNativeTaskOwners: new Map(),
         runtimePolicy: launch.runtimePolicy,
         subagentModel: startedQuery.subagentModel,
+        nativeMemoryEnabled: startedQuery.nativeMemoryEnabled,
+        appendSystemPrompt: launch.appendSystemPrompt,
         textResources,
         capabilities: new Set(),
         pendingPermissions: new Map(),
@@ -2111,6 +2346,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         nativeTaskProjectionEnabled: false,
         steerEnabled: false,
         controlUncertain: false,
+        freshSessionCanRestart: !launch.resume,
         modelId: launch.modelId,
         effort: launch.effort,
         fastMode: false,
@@ -2201,8 +2437,18 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       toolName: string,
       input: Readonly<Record<string, unknown>>,
       options: ClaudeCanUseToolOptions
-    ) => Promise<ClaudePermissionResult>
-  ): Promise<{ readonly query: ClaudeSdkQuery; readonly subagentModel: string | undefined; releaseAuthorization(): void }> {
+    ) => Promise<ClaudePermissionResult>,
+    managedAgentTool: (
+      input: ClaudeSdkManagedAgentInput,
+      options: { readonly toolUseId: string; readonly signal: AbortSignal }
+    ) => Promise<ClaudeSdkManagedAgentResult>
+  ): Promise<{
+    readonly query: ClaudeSdkQuery;
+    readonly subagentModel: string | undefined;
+    readonly nativeMemoryEnabled: boolean | undefined;
+    readonly managedEffortSnapshot: ManagedQueryEffortSnapshot | undefined;
+    releaseAuthorization(): void;
+  }> {
     let subagentModel: string | undefined;
     try {
       subagentModel = launch.runtimePolicy === "standard" ? this.#resolveSubagentModel?.(managedRoute?.providerId ?? PROVIDER_ID) : undefined;
@@ -2212,18 +2458,55 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         recovery: "Reload the subtask model setting and retry."
       });
     }
+    if (subagentModel !== undefined && (typeof subagentModel !== "string" || subagentModel.length === 0 || subagentModel.length > 512
+      || /[\s\x00-\x1f\x7f]/u.test(subagentModel))) {
+      throw claudeCodeError("SUBAGENT_MODEL_INVALID", "The configured subtask model has an invalid identifier.", "session_start", {
+        recovery: "Choose an available subtask model in Settings, then retry."
+      });
+    }
+    const managedEffortSnapshot = launch.runtimePolicy === "standard" && managedRoute !== undefined
+      ? managedQueryEffortSnapshot(managedRoute, this.#managedProviders!, launch.effort)
+      : undefined;
+    // A stored default that this exact Query cannot represent is known to be
+    // inapplicable before native startup. Preserve the product setting and let
+    // the Query use its native default instead of spawning a request that the
+    // route hook would have to deny.
+    if (subagentModel !== undefined && managedEffortSnapshot !== undefined
+      && !managedEffortSnapshot.nativeByModel.has(subagentModel)) {
+      subagentModel = undefined;
+    }
     if (subagentModel !== undefined) {
-      if (typeof subagentModel !== "string" || subagentModel.length === 0 || subagentModel.length > 512
-        || /[\s\x00-\x1f\x7f]/u.test(subagentModel)) {
-        throw claudeCodeError("SUBAGENT_MODEL_INVALID", "The configured subtask model has an invalid identifier.", "session_start", {
-          recovery: "Choose an available subtask model in Settings, then retry."
-        });
+      if (this.#lastCliVersion === undefined && this.#pathToExecutable === undefined) {
+        const bundledCliVersion = this.#projection.text(scoped.runtime.bundledCliVersion, 128).trim();
+        if (bundledCliVersion.length > 0) this.#lastCliVersion = bundledCliVersion;
       }
       if (this.#lastCliVersion === undefined) await this.describe();
       if (!supportsSubagentDefaultModel(this.#lastCliVersion)) throw subagentDefaultModelUnavailable();
       this.#assertUsable();
       this.#assertBackendInstance(context);
       context.signal.throwIfAborted();
+    }
+    let nativeMemoryEnabled: boolean | undefined;
+    if (launch.runtimePolicy === "standard" && this.#resolveNativeMemoryEnabled !== undefined) {
+      try {
+        nativeMemoryEnabled = this.#resolveNativeMemoryEnabled();
+      } catch (error) {
+        if (error instanceof JokoError) throw error;
+        throw claudeCodeError(
+          "NATIVE_MEMORY_SETTING_READ_FAILED",
+          "The native auto-memory setting could not be read.",
+          "session_start",
+          { recovery: "Reload Memory settings and retry the native Session." }
+        );
+      }
+      if (typeof nativeMemoryEnabled !== "boolean") {
+        throw claudeCodeError(
+          "NATIVE_MEMORY_SETTING_INVALID",
+          "The native auto-memory setting is invalid.",
+          "session_start",
+          { recovery: "Restore the native auto-memory setting to its default and retry." }
+        );
+      }
     }
     let runtimeAuthorization: Awaited<ReturnType<ClaudeCodeOAuthAccount["runtimeAuthorization"]>> = undefined;
     try {
@@ -2235,6 +2518,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         throw new Error("The subscription authorization changed before native startup.");
       }
       scoped.assertCurrent();
+      const managedLimitEnvironment = managedRoute === undefined
+        ? undefined
+        : managedEffortSnapshot!.limitEnvironment;
       const query = await scoped.runtime.query({
         prompt: gate,
         options: {
@@ -2247,7 +2533,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
           env: {
             ...this.#environment,
             ...runtimeAuthorization?.environment,
-            ...(managedRoute === undefined ? {} : managedQueryEnvironment(managedRoute, this.#managedProviders!, this.#environment)),
+            ...(managedRoute === undefined ? {} : managedQueryEnvironment(
+              managedRoute,
+              this.#managedProviders!,
+              this.#environment,
+              managedLimitEnvironment!
+            )),
             CLAUDE_CODE_SUBAGENT_MODEL: subagentModel,
             CLAUDE_CODE_SUBAGENT_MODEL_FORCE: undefined
           },
@@ -2261,6 +2552,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
                 settings: {
                   allowedMcpServers: [],
                   autoMemoryEnabled: false,
+                  autoDreamEnabled: false,
                   disableAgentView: true,
                   disableAllHooks: true,
                   disableArtifact: true,
@@ -2278,11 +2570,40 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
                   }
                 }
               }
-            : launch.fastMode === undefined ? {} : { settings: { fastMode: launch.fastMode } }),
+            : {
+                settings: {
+                  // Filesystem settings remain available below, but a native
+                  // helper must never replace the Host-owned credential path.
+                  // The fixed CLI additionally filters provider-related `env`
+                  // keys when CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST is set.
+                  apiKeyHelper: "",
+                  ...(managedRoute === undefined ? {} : {
+                    // Model aliases are part of request authority for a managed
+                    // route, so lower-precedence settings cannot remap them.
+                    modelOverrides: {},
+                    ...(managedEffortSnapshot?.modelSettings === undefined
+                      ? {}
+                      : { modelSettings: managedEffortSnapshot.modelSettings })
+                  }),
+                  ...(nativeMemoryEnabled === undefined
+                    ? {}
+                    : { autoMemoryEnabled: nativeMemoryEnabled, autoDreamEnabled: nativeMemoryEnabled }),
+                  ...(managedLimitEnvironment === undefined || Object.keys(managedLimitEnvironment).length === 0
+                    ? {}
+                    : { env: { ...managedLimitEnvironment } }),
+                  ...(launch.fastMode === undefined ? {} : { fastMode: launch.fastMode })
+                }
+              }),
           ...(runtimeAuthorization === undefined ? {} : { getOAuthToken: runtimeAuthorization.getOAuthToken }),
-          ...(launch.effort === undefined ? {} : { effort: managedRoute === undefined ? requiredNativeEffort(launch.effort)
-            : managedNativeEffort(managedRoute.model, managedRoute.thinkingLevelMap, launch.effort) }),
+          ...(launch.effort === undefined ? {} : managedRoute === undefined
+            ? { effort: requiredNativeEffort(launch.effort) }
+            : managedEffortSnapshot?.globalEffort === undefined
+              ? {}
+              : { effort: managedEffortSnapshot.globalEffort }),
           ...(launch.runtimePolicy === "standard" ? { forwardSubagentText: true } : {}),
+          ...(launch.runtimePolicy === "standard" && managedRoute !== undefined
+            ? { managedAgentTool }
+            : {}),
           ...(launch.runtimePolicy === "standard" ? { extraArgs: { "replay-user-messages": null } } : {}),
           includePartialMessages: true,
           ...(launch.runtimePolicy === "review_read_only"
@@ -2298,7 +2619,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
           permissionMode: toSdkPermissionMode(launch.permissionMode),
           persistSession: launch.runtimePolicy !== "review_read_only",
           ...(launch.resume ? { resume: nativeSessionId } : { sessionId: nativeSessionId }),
-          settingSources: launch.runtimePolicy === "review_read_only" || managedRoute !== undefined ? [] : [...this.#settingSources],
+          settingSources: launch.runtimePolicy === "review_read_only" ? [] : [...this.#settingSources],
           systemPrompt: {
             type: "preset",
             preset: "claude_code",
@@ -2319,6 +2640,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       return {
         query,
         subagentModel,
+        nativeMemoryEnabled,
+        managedEffortSnapshot,
         releaseAuthorization: () => runtimeAuthorization?.release()
       };
     } catch (error) {
@@ -2480,10 +2803,16 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     } else if (type === "user") {
       if (envelope["isReplay"] === true) {
         const uuid = stringValue(envelope["uuid"]);
+        const originKind = stringValue(record(envelope["origin"])?.["kind"]);
         if (nativeSessionId !== runtime.nativeSessionId || uuid === undefined
-          || envelope["parent_tool_use_id"] !== null || record(envelope["origin"])?.["kind"] !== "human") {
+          || envelope["parent_tool_use_id"] !== null) {
           throw turnOwnershipGap();
         }
+        if (turn.managedContinuationUuids.has(uuid.toLowerCase())) {
+          if (originKind !== undefined && originKind !== "task-notification") throw turnOwnershipGap();
+          return;
+        }
+        if (originKind !== "human") throw turnOwnershipGap();
         const steer = turn.steers.get(uuid);
         if (steer !== undefined) {
           if (!steer.consumed) throw turnOwnershipGap();
@@ -2633,8 +2962,14 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     if (queuedCount !== undefined && (!Number.isSafeInteger(queuedCount) || (queuedCount as number) !== 0)) {
       throw steerOutcomeUnknown();
     }
+    const appliedContextWindow = runtime.managedRoute === undefined
+      ? undefined
+      : managedModelLimit(runtime.managedRoute.model.contextWindow, "context window");
+    const usage = appliedContextWindow === undefined
+      ? result.usage
+      : { ...result.usage, contextWindow: appliedContextWindow };
     runtime.lastTotalCostUsd = result.totalCostUsd;
-    runtime.lastUsage = result.usage;
+    runtime.lastUsage = usage;
     const hasText = turn.blocks.some((block) => block.kind === "text");
     if (!hasText && result.fallbackText !== undefined && result.fallbackText.length > 0) {
       appendTurnBlocks(turn, [{ kind: "text", text: result.fallbackText }]);
@@ -2653,7 +2988,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       });
       if (!this.#isTurnCurrent(runtime, turn) || turn.terminalClaimed) return;
     }
-    await this.#emit(runtime, turn, { type: "usage", usage: result.usage });
+    await this.#emit(runtime, turn, { type: "usage", usage });
     if (!this.#isTurnCurrent(runtime, turn) || turn.terminalClaimed) return;
     if (result.error !== undefined) {
       if (result.error.code === "CLAUDE_CODE_AUTHENTICATION_FAILED") {
@@ -2667,15 +3002,19 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     const wakeTaskIds = result.error === undefined
       && result.outcome === "completed"
       && runtime.nativeTaskProjectionEnabled
-      ? runtime.nativeTasks.activeWakeTaskIds()
+      ? [...new Set([
+          ...runtime.nativeTasks.activeWakeTaskIds(),
+          ...turn.pendingContinuationTaskIds
+        ])]
       : [];
     if (wakeTaskIds.length > 0) {
-      this.#awaitNativeContinuation(turn, wakeTaskIds);
+      this.#awaitNativeContinuation(runtime, turn, wakeTaskIds);
       return;
     }
     turn.terminalClaimed = true;
     await this.#settleSteers(runtime, turn, result.outcome, result.error);
-    turn.providerLease?.release();
+    const restoration = this.#releaseManagedTurnLeases(runtime, turn, true);
+    if (restoration !== undefined) await restoration;
     await this.#emit(runtime, turn, { type: "done", outcome: result.outcome });
     if (this.#isTurnCurrent(runtime, turn)) {
       this.#clearNativeContinuation(turn);
@@ -2683,20 +3022,31 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     }
   }
 
-  #awaitNativeContinuation(turn: ActiveTurn, rawTaskIds: readonly string[]): void {
+  #awaitNativeContinuation(runtime: NativeRuntime, turn: ActiveTurn, rawTaskIds: readonly string[]): void {
     this.#clearNativeContinuationTimer(turn);
     turn.awaitingNativeContinuation = true;
+    // The foreground result is only an intermediate provider boundary while
+    // an SDK wake task owns an automatic continuation. Keep both parent and
+    // delegated route leases current across that gap.
+    turn.stopping = false;
     turn.continuationTaskIds.clear();
     for (const rawTaskId of rawTaskIds) addBoundedIdentity(turn.continuationTaskIds, rawTaskId);
+    turn.pendingContinuationTaskIds.clear();
+    this.#pumpManagedNotifications(runtime, turn);
   }
 
   #beginNativeContinuationSegment(turn: ActiveTurn): void {
     this.#clearNativeContinuationTimer(turn);
     turn.awaitingNativeContinuation = false;
     turn.nativeContinuationSegment = true;
+    turn.managedNotificationDispatched = false;
     turn.stopping = false;
     turn.interruptConfirmation = undefined;
     turn.continuationTaskIds.clear();
+    turn.pendingContinuationTaskIds.clear();
+    for (const notification of turn.managedNotifications.values()) {
+      if (!notification.delivered) addBoundedIdentity(turn.pendingContinuationTaskIds, notification.rawTaskId);
+    }
     turn.blocks.splice(0);
     turn.stream.reset();
     turn.assistantError = undefined;
@@ -2757,7 +3107,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     if (!this.#isTurnCurrent(runtime, turn) || !turn.awaitingNativeContinuation || turn.terminalClaimed) return;
     turn.terminalClaimed = true;
     this.#clearNativeContinuation(turn);
-    turn.providerLease?.release();
+    const restoration = this.#releaseManagedTurnLeases(runtime, turn, true);
+    if (restoration !== undefined) await restoration;
     await this.#settleSteers(runtime, turn, outcome);
     await this.#emit(runtime, turn, { type: "done", outcome });
     if (this.#isTurnCurrent(runtime, turn)) runtime.activeTurn = undefined;
@@ -2773,6 +3124,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     this.#clearNativeContinuationTimer(turn);
     turn.awaitingNativeContinuation = false;
     turn.continuationTaskIds.clear();
+    turn.pendingContinuationTaskIds.clear();
     turn.stream.reset();
   }
 
@@ -2850,6 +3202,738 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     } finally {
       await this.#retireRuntime(runtime, false, publicError);
     }
+  }
+
+  async #releaseManagedSubtaskLease(
+    _runtime: NativeRuntime,
+    turn: ActiveTurn | undefined,
+    toolUseId: string
+  ): Promise<void> {
+    if (turn === undefined) return;
+    const decision = turn.subtaskRouteDecisions.get(toolUseId);
+    if (decision !== undefined) decision.closed = true;
+    const pending = turn.subtaskRouteAdmissions.get(toolUseId);
+    if (pending !== undefined) {
+      turn.subtaskRouteAdmissions.delete(toolUseId);
+      pending.cancellation.abort();
+    }
+    const granted = turn.subtaskRouteLeases.get(toolUseId);
+    if (granted !== undefined) {
+      turn.subtaskRouteLeases.delete(toolUseId);
+      granted.cancellation.abort();
+      granted.lease?.release();
+    }
+  }
+
+  #releaseManagedTurnLeases(
+    runtime: NativeRuntime,
+    turn: ActiveTurn,
+    _restoreParent: boolean
+  ): Promise<void> | undefined {
+    const activeChildren = this.#revokeManagedTurnAuthority(runtime, turn, false);
+    return this.#closeManagedTurnChildren(runtime, turn, activeChildren);
+  }
+
+  #revokeManagedTurnAuthority(
+    runtime: NativeRuntime,
+    turn: ActiveTurn,
+    preserveActiveChildren: boolean
+  ): readonly ManagedChildTask[] {
+    const turnChildren = [...runtime.managedChildren.values()].filter((child) => child.turn === turn);
+    const activeChildren = turnChildren.filter((child) => !child.terminal);
+    if (turn.managedAuthorityRevoked) return activeChildren;
+    turn.managedAuthorityRevoked = true;
+    turn.managedNotificationCancellation.abort();
+    for (const pending of turn.subtaskRouteAdmissions.values()) pending.cancellation.abort();
+    turn.subtaskRouteAdmissions.clear();
+    const preservedGrants = preserveActiveChildren
+      ? new Set(activeChildren.map((child) => child.grant))
+      : new Set<ManagedSubtaskRouteGrant>();
+    for (const granted of turn.subtaskRouteLeases.values()) {
+      granted.lease?.release();
+      if (!preservedGrants.has(granted)) granted.cancellation.abort();
+    }
+    turn.subtaskRouteLeases.clear();
+    turn.subtaskRouteDecisions.clear();
+    turn.managedNotifications.clear();
+    turn.managedContinuationUuids.clear();
+    turn.pendingContinuationTaskIds.clear();
+    turn.providerLease?.release();
+    return activeChildren;
+  }
+
+  #closeManagedTurnChildren(
+    runtime: NativeRuntime,
+    turn: ActiveTurn,
+    activeChildren: readonly ManagedChildTask[] = [...runtime.managedChildren.values()]
+      .filter((child) => child.turn === turn && !child.terminal)
+  ): Promise<void> | undefined {
+    const turnChildren = [...runtime.managedChildren.values()].filter((child) => child.turn === turn);
+    for (const child of activeChildren) {
+      child.stopping = true;
+      child.grant.cancellation.abort(new Error("The owning turn ended."));
+      child.query?.close();
+    }
+    const cleanup = (): void => {
+      for (const child of turnChildren) {
+        runtime.managedChildren.delete(child.rawTaskId);
+        runtime.managedChildByToolUseId.delete(child.toolUseId);
+      }
+      for (const [taskId, owner] of [...runtime.childNativeTaskOwners]) {
+        if (turnChildren.some((child) => child.query === owner.query)) runtime.childNativeTaskOwners.delete(taskId);
+      }
+    };
+    if (activeChildren.length === 0) {
+      cleanup();
+      return undefined;
+    }
+    return settleWithin(Promise.allSettled(activeChildren.map((child) => child.result)), this.#teardownTimeoutMs)
+      .then(() => cleanup());
+  }
+
+  async #runManagedAgent(
+    runtime: NativeRuntime,
+    parentRawTaskId: string | undefined,
+    input: ClaudeSdkManagedAgentInput,
+    callbackToolUseId: string,
+    callbackSignal: AbortSignal
+  ): Promise<ClaudeSdkManagedAgentResult> {
+    const turn = runtime.activeTurn;
+    const toolUseId = managedSubtaskToolUseId(callbackToolUseId, callbackToolUseId);
+    if (turn === undefined || toolUseId === undefined || !this.#isTurnCurrent(runtime, turn)
+      || turn.stopping || turn.terminalClaimed || turn.managedAuthorityRevoked || callbackSignal.aborted) {
+      return managedAgentError("The delegated model request no longer belongs to the active turn.");
+    }
+    if (parentRawTaskId !== undefined) {
+      const parent = runtime.managedChildren.get(parentRawTaskId);
+      if (parent === undefined || parent.turn !== turn || parent.terminal || parent.stopping) {
+        return managedAgentError("The delegated model parent is no longer active.");
+      }
+      if (input.run_in_background === true) {
+        return managedAgentError("A nested managed child cannot outlive its owning delegated Query.");
+      }
+    }
+    if (input.isolation !== undefined) {
+      return managedAgentError("Managed delegated isolation is unavailable for this exact Query route.");
+    }
+    const explicitModel = input.model;
+    if (explicitModel !== undefined && (explicitModel.length > 512 || explicitModel.trim() !== explicitModel
+      || (explicitModel !== "inherit" && /[\s\x00-\x1f\x7f]/u.test(explicitModel)))) {
+      return managedAgentError("The delegated model identity was invalid.");
+    }
+    const selectedModel = explicitModel === undefined ? runtime.subagentModel : explicitModel === "inherit" ? undefined : explicitModel;
+    const route = runtime.managedRoute;
+    if (route === undefined) return managedAgentError("The delegated model route is unavailable.");
+    const modelId = selectedModel ?? route.model.modelId;
+    let fingerprint: string;
+    try {
+      fingerprint = permissionFingerprint(CLAUDE_MANAGED_AGENT_TOOL_NAME, { ...input }, toolUseId);
+    } catch {
+      return managedAgentError("The delegated model request exceeded safe limits.");
+    }
+    const existingChild = runtime.managedChildByToolUseId.get(toolUseId);
+    if (existingChild !== undefined) {
+      const decision = turn.subtaskRouteDecisions.get(toolUseId);
+      if (decision?.fingerprint !== fingerprint || decision.modelId !== modelId || existingChild.turn !== turn) {
+        return managedAgentError("The repeated delegated model request changed identity.");
+      }
+      if (existingChild.background) {
+        try {
+          await waitFor(existingChild.identity.promise, this.#initializationTimeoutMs, callbackSignal,
+            () => new Error("The delegated model did not initialize in time."));
+          return managedAgentLaunchResult(existingChild.rawTaskId);
+        } catch {
+          return managedAgentError("The delegated model callback ended before native startup was confirmed.");
+        }
+      }
+      try {
+        return await raceAbort(existingChild.result, callbackSignal)
+          ?? managedAgentError("The delegated model callback ended before its Result was available.");
+      } catch {
+        return managedAgentError("The delegated model callback ended before its Result was available.");
+      }
+    }
+    const previousDecision = turn.subtaskRouteDecisions.get(toolUseId);
+    if (previousDecision !== undefined
+      && (previousDecision.fingerprint !== fingerprint || previousDecision.modelId !== modelId)) {
+      return managedAgentError("The repeated delegated model request changed identity.");
+    }
+    if (previousDecision?.closed === true) {
+      return managedAgentError("The repeated delegated model request is no longer active.");
+    }
+    if (previousDecision === undefined
+      && (turn.subtaskRouteDecisions.size >= MAX_SESSION_TOOL_NAMES
+        || runtime.managedChildren.size >= MAX_SESSION_TOOL_NAMES)) {
+      return managedAgentError("The delegated model request limit was reached.");
+    }
+    const decision: ManagedSubtaskRouteDecision = previousDecision
+      ?? { modelId, fingerprint, closed: false };
+    if (previousDecision === undefined) turn.subtaskRouteDecisions.set(toolUseId, decision);
+    let grant: ManagedSubtaskRouteGrant;
+    let cwd: string;
+    try {
+      [grant, cwd] = await Promise.all([
+        this.#authorizeManagedSubtask(runtime, turn, toolUseId, modelId, callbackSignal),
+        this.#managedChildCwd(runtime, input.cwd)
+      ]);
+    } catch {
+      decision.closed = true;
+      await this.#releaseManagedSubtaskLease(runtime, turn, toolUseId);
+      return managedAgentError("The delegated model route could not be authorized.");
+    }
+    const admittedChild = runtime.managedChildByToolUseId.get(toolUseId);
+    if (admittedChild !== undefined) {
+      if (admittedChild.turn !== turn || decision.fingerprint !== fingerprint
+        || admittedChild.grant.modelId !== modelId) {
+        return managedAgentError("The repeated delegated model request changed identity.");
+      }
+      if (admittedChild.background) {
+        try {
+          await waitFor(admittedChild.identity.promise, this.#initializationTimeoutMs, callbackSignal,
+            () => new Error("The delegated model did not initialize in time."));
+          return managedAgentLaunchResult(admittedChild.rawTaskId);
+        } catch {
+          return managedAgentError("The delegated model callback ended before native startup was confirmed.");
+        }
+      }
+      try {
+        return await raceAbort(admittedChild.result, callbackSignal)
+          ?? managedAgentError("The delegated model callback ended before its Result was available.");
+      } catch {
+        return managedAgentError("The delegated model callback ended before its Result was available.");
+      }
+    }
+    if (callbackSignal.aborted || !this.#isTurnCurrent(runtime, turn) || turn.stopping
+      || turn.terminalClaimed || turn.managedAuthorityRevoked) {
+      decision.closed = true;
+      await this.#releaseManagedSubtaskLease(runtime, turn, toolUseId);
+      return managedAgentError("The delegated model request expired before native startup.");
+    }
+    const rawTaskId = `managed-agent-${randomUUID()}`;
+    const childSessionId = randomUUID();
+    const promptUuid = randomUUID();
+    const identity = deferred<void>();
+    void identity.promise.catch(() => undefined);
+    let child!: ManagedChildTask;
+    const result = Promise.resolve().then(() => this.#executeManagedChild(runtime, child, cwd));
+    child = {
+      rawTaskId,
+      toolUseId,
+      ...(parentRawTaskId === undefined ? {} : { parentRawTaskId }),
+      turn,
+      input: Object.freeze({ ...input }),
+      grant,
+      background: input.run_in_background === true,
+      childSessionId,
+      promptUuid,
+      identity,
+      result,
+      identityConfirmed: false,
+      terminal: false,
+      stopping: false
+    };
+    runtime.managedChildren.set(rawTaskId, child);
+    runtime.managedChildByToolUseId.set(toolUseId, child);
+    const cancelBeforeCallbackSettlement = (reason: unknown): void => {
+      child.stopping = true;
+      child.grant.cancellation.abort(reason);
+      child.query?.close();
+    };
+    if (!child.background) {
+      const onAbort = (): void => {
+        cancelBeforeCallbackSettlement(callbackSignal.reason);
+      };
+      callbackSignal.addEventListener("abort", onAbort, { once: true });
+      try {
+        await waitFor(identity.promise, this.#initializationTimeoutMs, callbackSignal,
+          () => new Error("The delegated model did not initialize in time."));
+        return await result;
+      } catch (error) {
+        cancelBeforeCallbackSettlement(error);
+        return managedAgentError("The delegated model callback ended before native startup was confirmed.");
+      } finally {
+        callbackSignal.removeEventListener("abort", onAbort);
+      }
+    }
+    const onAbort = (): void => {
+      cancelBeforeCallbackSettlement(callbackSignal.reason);
+    };
+    callbackSignal.addEventListener("abort", onAbort, { once: true });
+    try {
+      await waitFor(identity.promise, this.#initializationTimeoutMs, callbackSignal,
+        () => new Error("The delegated model did not initialize in time."));
+      return managedAgentLaunchResult(rawTaskId);
+    } catch (error) {
+      cancelBeforeCallbackSettlement(error);
+      return managedAgentError("The delegated model callback ended before native startup was confirmed.");
+    } finally {
+      callbackSignal.removeEventListener("abort", onAbort);
+    }
+  }
+
+  async #authorizeManagedSubtask(
+    runtime: NativeRuntime,
+    turn: ActiveTurn,
+    toolUseId: string,
+    modelId: string,
+    callbackSignal: AbortSignal
+  ): Promise<ManagedSubtaskRouteGrant> {
+    const existing = turn.subtaskRouteLeases.get(toolUseId);
+    if (existing !== undefined) {
+      if (existing.modelId !== modelId) throw new Error("The repeated delegated model request changed identity.");
+      return existing;
+    }
+    const pending = turn.subtaskRouteAdmissions.get(toolUseId);
+    if (pending !== undefined) {
+      if (pending.modelId !== modelId) throw new Error("The repeated delegated model request changed identity.");
+      return waitFor(pending.result, this.#admissionTimeoutMs, callbackSignal,
+        () => new Error("The delegated model authorization timed out."));
+    }
+    const route = runtime.managedRoute;
+    const configuration = runtime.managedEffortSnapshot;
+    const limits = configuration?.limitsByModel.get(modelId);
+    if (route === undefined || configuration === undefined || limits === undefined) {
+      throw new Error("The delegated model is unavailable from this Query configuration.");
+    }
+    route.assertCurrent();
+    const requiresRouteLease = modelId !== route.model.modelId;
+    const authorize = requiresRouteLease ? route.authorizeSubtask : undefined;
+    if (requiresRouteLease && authorize === undefined) {
+      throw new Error("The delegated model is unavailable from the parent Provider route.");
+    }
+    const cancellation = linkedAbortController([turn.context.signal, runtime.abortController.signal]);
+    const callbackLifetime = AbortSignal.any([callbackSignal, cancellation.signal]);
+    let admission!: ManagedSubtaskRouteAdmission;
+    const result = Promise.resolve().then(async (): Promise<ManagedSubtaskRouteGrant> => {
+      let lease: ManagedProviderSubtaskLease | undefined;
+      try {
+        if (authorize !== undefined) {
+          let authorization: Promise<ManagedProviderSubtaskLease>;
+          try {
+            authorization = authorize({
+              operationId: turn.operationId,
+              requestId: toolUseId,
+              modelId,
+              signal: cancellation.signal,
+              assertCurrent: () => {
+                if (!this.#isTurnCurrent(runtime, turn) || turn.terminalClaimed || turn.managedAuthorityRevoked) {
+                  throw new Error("The delegated model turn is no longer current.");
+                }
+                const current = turn.subtaskRouteLeases.get(toolUseId);
+                if (current === undefined && turn.subtaskRouteAdmissions.get(toolUseId) !== admission) {
+                  throw new Error("The delegated model request is no longer authorized.");
+                }
+                if (current !== undefined && current.modelId !== modelId) {
+                  throw new Error("The delegated model request identity changed.");
+                }
+              }
+            }).then((authorized) => {
+              if (callbackLifetime.aborted || !this.#isTurnCurrent(runtime, turn) || turn.stopping || turn.terminalClaimed
+                || turn.subtaskRouteAdmissions.get(toolUseId) !== admission
+                || turn.subtaskRouteLeases.has(toolUseId)
+                || authorized.model.providerId !== route.providerId || authorized.model.modelId !== modelId
+                || authorized.model.api !== route.protocol || !managedSubtaskConfigurationCompatible(runtime, authorized)) {
+                authorized.release();
+                throw new Error("The delegated model authorization expired before admission.");
+              }
+              return authorized;
+            });
+          } catch {
+            throw new Error("The delegated model route could not be authorized.");
+          }
+          try {
+            lease = await waitFor(
+              authorization,
+              this.#admissionTimeoutMs,
+              callbackLifetime,
+              () => new Error("The delegated model authorization timed out.")
+            );
+          } catch (error) {
+            void authorization.then((late) => late.release()).catch(() => undefined);
+            throw error;
+          }
+        }
+        if (callbackLifetime.aborted || !this.#isTurnCurrent(runtime, turn) || turn.stopping || turn.terminalClaimed
+          || turn.subtaskRouteAdmissions.get(toolUseId) !== admission || turn.subtaskRouteLeases.has(toolUseId)) {
+          throw new Error("The delegated model request expired before native spawn.");
+        }
+        const grant: ManagedSubtaskRouteGrant = {
+          modelId,
+          limits,
+          nativeEffort: configuration.nativeByModel.get(modelId),
+          cancellation,
+          lease
+        };
+        turn.subtaskRouteLeases.set(toolUseId, grant);
+        turn.subtaskRouteAdmissions.delete(toolUseId);
+        return grant;
+      } catch {
+        cancellation.abort();
+        lease?.release();
+        throw new Error("The delegated model route could not be authorized.");
+      }
+    });
+    admission = { modelId, cancellation, result };
+    turn.subtaskRouteAdmissions.set(toolUseId, admission);
+    void result.finally(() => {
+      if (turn.subtaskRouteAdmissions.get(toolUseId) === admission) {
+        turn.subtaskRouteAdmissions.delete(toolUseId);
+      }
+    }).catch(() => undefined);
+    return result;
+  }
+
+  async #executeManagedChild(
+    runtime: NativeRuntime,
+    child: ManagedChildTask,
+    cwd: string
+  ): Promise<ClaudeSdkManagedAgentResult> {
+    const turn = child.turn;
+    try {
+      await this.#publishNativeTaskEmissions(runtime, runtime.nativeTasks.observeSystem({
+        type: "system",
+        subtype: "task_started",
+        task_id: child.rawTaskId,
+        tool_use_id: child.toolUseId,
+        task_type: child.background ? "managed_agent_background" : "managed_agent_foreground",
+        subagent_type: child.input.subagent_type,
+        description: child.input.description,
+        prompt: child.input.prompt,
+        is_backgrounded: child.background,
+        uuid: randomUUID(),
+        session_id: runtime.nativeSessionId
+      }, turn.context));
+      const route = runtime.managedRoute;
+      if (route === undefined || this.#managedProviders === undefined) throw new Error("The managed Provider route is unavailable.");
+      const limitEnvironment = managedQueryLimitEnvironment(child.grant.limits, [child.grant.limits]);
+      const permissionMode = managedChildPermissionMode(child.input.mode, runtime);
+      const gate = new AsyncInputGate<ClaudeSdkUserMessage>();
+      const prompt: ClaudeSdkUserMessage = {
+        type: "user",
+        message: { role: "user", content: child.input.prompt },
+        parent_tool_use_id: null,
+        origin: {
+          kind: "peer",
+          from: runtime.nativeSessionId,
+          fromMode: runtime.permissionMode === "bypassPermissions" ? "bypass" : "prompting",
+          ...(child.parentRawTaskId === undefined ? {} : { senderTaskId: child.parentRawTaskId }),
+          body: child.input.prompt
+        },
+        uuid: child.promptUuid
+      };
+      const query = await runtime.sdkRuntime.query({
+        prompt: gate,
+        options: {
+          abortController: child.grant.cancellation,
+          additionalDirectories: runtime.additionalDirectories.map((directory) => directory.path),
+          allowDangerouslySkipPermissions: true,
+          ...(child.input.subagent_type === undefined ? {} : { agent: child.input.subagent_type }),
+          canUseTool: (toolName, input, options) => this.#canUseTool(runtime, toolName, input, {
+            ...options,
+            toolUseID: managedChildNativeIdentity(child.rawTaskId, "tool", options.toolUseID),
+            requestId: managedChildNativeIdentity(child.rawTaskId, "permission", options.requestId),
+            agentID: options.agentID ?? child.rawTaskId
+          }),
+          cwd,
+          env: {
+            ...this.#environment,
+            ...managedQueryEnvironment(route, this.#managedProviders, this.#environment, limitEnvironment),
+            CLAUDE_CODE_SUBAGENT_MODEL: runtime.subagentModel,
+            CLAUDE_CODE_SUBAGENT_MODEL_FORCE: undefined
+          },
+          extraArgs: { "replay-user-messages": null },
+          ...(child.grant.nativeEffort === undefined ? {} : { effort: child.grant.nativeEffort }),
+          forwardSubagentText: true,
+          includePartialMessages: true,
+          managedAgentTool: (input, options) => this.#runManagedAgent(
+            runtime,
+            child.rawTaskId,
+            input,
+            managedChildNativeIdentity(child.rawTaskId, "tool", options.toolUseId),
+            options.signal
+          ),
+          model: child.grant.modelId,
+          ...(this.#pathToExecutable === undefined ? {} : { pathToClaudeCodeExecutable: this.#pathToExecutable }),
+          permissionMode,
+          persistSession: false,
+          sessionId: child.childSessionId,
+          settings: {
+            apiKeyHelper: "",
+            modelOverrides: {},
+            ...(runtime.managedEffortSnapshot?.modelSettings === undefined
+              ? {}
+              : { modelSettings: runtime.managedEffortSnapshot.modelSettings }),
+            ...(runtime.nativeMemoryEnabled === undefined
+              ? {}
+              : {
+                  autoMemoryEnabled: runtime.nativeMemoryEnabled,
+                  autoDreamEnabled: runtime.nativeMemoryEnabled
+                }),
+            fastMode: false,
+            ...(Object.keys(limitEnvironment).length === 0 ? {} : { env: { ...limitEnvironment } })
+          },
+          settingSources: [...this.#settingSources],
+          systemPrompt: {
+            type: "preset",
+            preset: "claude_code",
+            ...(runtime.appendSystemPrompt === undefined ? {} : { append: runtime.appendSystemPrompt })
+          },
+          title: child.input.description,
+          tools: { type: "preset", preset: "claude_code" }
+        }
+      });
+      child.query = query;
+      const consumption = this.#consumeManagedChild(runtime, child, cwd, permissionMode);
+      await waitFor(gate.offer(prompt, () => undefined, child.grant.cancellation.signal, () => {
+        if (!this.#isTurnCurrent(runtime, turn) || turn.managedAuthorityRevoked || child.stopping) {
+          throw new Error("The delegated Query lost ownership before prompt consumption.");
+        }
+        route.assertCurrent();
+      }), this.#admissionTimeoutMs, child.grant.cancellation.signal,
+      () => new Error("The delegated Query did not consume its prompt in time."));
+      return await consumption;
+    } catch (error) {
+      child.identity.reject(error);
+      const stopped = child.stopping || child.grant.cancellation.signal.aborted;
+      const message = stopped
+        ? "The delegated model request was stopped."
+        : "The delegated model Query did not reach an authoritative Result.";
+      try {
+        return await this.#finishManagedChild(runtime, child, stopped ? "stopped" : "failed", message);
+      } catch {
+        return managedAgentError(message);
+      }
+    } finally {
+      try { child.query?.close(); } catch { /* The child abort fence remains authoritative. */ }
+    }
+  }
+
+  async #consumeManagedChild(
+    runtime: NativeRuntime,
+    child: ManagedChildTask,
+    expectedCwd: string,
+    expectedPermissionMode: ClaudeSdkPermissionMode
+  ): Promise<ClaudeSdkManagedAgentResult> {
+    const query = child.query;
+    if (query === undefined) throw new Error("The delegated Query was not created.");
+    let identityConfirmed = false;
+    let assistantError: string | undefined;
+    const text: string[] = [];
+    let frameCount = 0;
+    let projectedCharacters = 0;
+    for await (const rawMessage of query) {
+      frameCount += 1;
+      if (frameCount > MAX_TURN_FRAMES) throw nativeEventLimit();
+      if (!this.#isTurnCurrent(runtime, child.turn) || child.stopping || child.grant.cancellation.signal.aborted) {
+        throw new Error("The delegated Query lost its active owner.");
+      }
+      const envelope = record(rawMessage);
+      if (envelope === undefined) continue;
+      const nativeSessionId = stringValue(envelope["session_id"]);
+      if (nativeSessionId !== undefined && nativeSessionId.toLowerCase() !== child.childSessionId.toLowerCase()) {
+        throw new Error("The delegated Query changed native Session identity.");
+      }
+      const type = stringValue(envelope["type"]);
+      const subtype = stringValue(envelope["subtype"]);
+      if (type === "system" && subtype === "init") {
+        if (nativeSessionId === undefined || stringValue(envelope["claude_code_version"]) !== this.#lastCliVersion) {
+          throw new Error("The delegated Query did not confirm its exact runtime identity.");
+        }
+        assertSessionTarget(stringValue(envelope["cwd"]), expectedCwd, runtime.remote);
+        if (stringValue(envelope["model"]) !== child.grant.modelId) {
+          throw new Error("The delegated Query initialized with a different model.");
+        }
+        const observedMode = stringValue(envelope["permissionMode"]);
+        if (observedMode !== expectedPermissionMode) {
+          throw new Error("The delegated Query initialized with a different permission mode.");
+        }
+        const observedEffort = stringValue(envelope["effort"]);
+        if (observedEffort !== undefined && child.grant.nativeEffort !== undefined
+          && observedEffort !== child.grant.nativeEffort) {
+          throw new Error("The delegated Query initialized with a different effort.");
+        }
+        child.identityConfirmed = true;
+        identityConfirmed = true;
+        child.identity.resolve(undefined);
+        continue;
+      }
+      if (!identityConfirmed && (type === "assistant" || type === "user" || type === "tool_progress" || type === "result"
+        || type === "system" && isNativeTaskSystemSubtype(subtype))) {
+        throw new Error("The delegated Query emitted work before initialization identity.");
+      }
+      if (type === "assistant") {
+        const forwarded = managedChildFrame(child, envelope);
+        const projected = this.#projection.assistant(forwarded);
+        for (const block of projected.blocks) {
+          if (block.kind !== "text" || block.text.length === 0) continue;
+          projectedCharacters += block.text.length;
+          if (projectedCharacters > MAX_TURN_PROJECTED_CHARACTERS) throw nativeEventLimit();
+          text.push(block.text);
+        }
+        assistantError = stringValue(envelope["error"]) ?? assistantError;
+        await this.#publishNativeTaskEmissions(runtime, runtime.nativeTasks.observeChildAssistant(forwarded));
+        continue;
+      }
+      if (type === "user") {
+        await this.#publishNativeTaskEmissions(runtime, runtime.nativeTasks.observeChildUser(managedChildFrame(child, envelope)));
+        continue;
+      }
+      if (type === "tool_progress") {
+        await this.#publishNativeTaskEmissions(runtime, runtime.nativeTasks.observeChildToolProgress(managedChildFrame(child, envelope)));
+        continue;
+      }
+      if (type === "system" && isNativeTaskSystemSubtype(subtype)) {
+        const childRawTaskId = stringValue(envelope["task_id"]);
+        const forwarded = managedChildTaskFrame(child, envelope);
+        const projectedRawTaskId = stringValue(forwarded["task_id"]);
+        if (childRawTaskId !== undefined && projectedRawTaskId !== undefined) {
+          runtime.childNativeTaskOwners.set(projectedRawTaskId, { query, rawTaskId: childRawTaskId });
+        }
+        await this.#publishNativeTaskEmissions(runtime, runtime.nativeTasks.observeSystem(forwarded, child.turn.context));
+        continue;
+      }
+      if (type !== "result") continue;
+      if (stringValue(envelope["user_message_uuid"])?.toLowerCase() !== child.promptUuid.toLowerCase()) {
+        throw new Error("The delegated Result does not belong to its exact prompt.");
+      }
+      const queuedCount = envelope["queued_turn_count"];
+      if (queuedCount !== undefined && (!Number.isSafeInteger(queuedCount) || queuedCount !== 0)) {
+        throw new Error("The delegated Result retained unowned queued input.");
+      }
+      const projected = this.#projection.result(envelope, 0, assistantError);
+      const fallback = projected.fallbackText?.trim();
+      const summary = fallback !== undefined && fallback.length > 0
+        ? fallback
+        : text.join("\n").trim() || projected.error?.message || "The delegated model completed without text.";
+      const status = projected.outcome === "completed" ? "completed" : projected.outcome === "aborted" ? "stopped" : "failed";
+      return await this.#finishManagedChild(runtime, child, status, summary, projected.usage, projected.durationMs);
+    }
+    throw new Error("The delegated Query stream ended before an authoritative Result.");
+  }
+
+  async #finishManagedChild(
+    runtime: NativeRuntime,
+    child: ManagedChildTask,
+    status: "completed" | "failed" | "stopped",
+    summary: string,
+    usage?: UsageSnapshot,
+    durationMs?: number
+  ): Promise<ClaudeSdkManagedAgentResult> {
+    if (child.terminalSettlement !== undefined) return child.terminalSettlement;
+    child.terminal = true;
+    if (!child.identityConfirmed) {
+      child.identity.reject(new Error("The delegated Query ended before startup identity was confirmed."));
+    }
+    const projectedSummary = this.#projection.text(summary, MAX_MANAGED_AGENT_RESULT_BYTES);
+    const safeSummary = utf8Prefix(projectedSummary, MAX_MANAGED_AGENT_RESULT_BYTES)
+      || (status === "completed" ? "Task completed." : "Task failed.");
+    const result = status === "completed" ? { text: safeSummary } : managedAgentError(safeSummary);
+    const settlement = Promise.resolve().then(async (): Promise<ClaudeSdkManagedAgentResult> => {
+      await this.#publishNativeTaskEmissions(runtime, runtime.nativeTasks.observeSystem({
+        type: "system",
+        subtype: "task_notification",
+        task_id: child.rawTaskId,
+        tool_use_id: child.toolUseId,
+        status,
+        summary: safeSummary,
+        usage: {
+          ...(usage === undefined ? {} : { total_tokens: usage.totalTokens }),
+          tool_uses: 0,
+          ...(durationMs === undefined ? {} : { duration_ms: durationMs })
+        },
+        uuid: randomUUID(),
+        session_id: runtime.nativeSessionId
+      }, child.turn.context));
+      if (child.background && child.identityConfirmed && status !== "stopped") {
+        this.#queueManagedNotification(runtime, child.turn, child.rawTaskId, status, safeSummary);
+      }
+      return result;
+    });
+    child.terminalSettlement = settlement;
+    return settlement;
+  }
+
+  #queueManagedNotification(
+    runtime: NativeRuntime,
+    turn: ActiveTurn,
+    rawTaskId: string,
+    status: "completed" | "failed",
+    summary: string
+  ): void {
+    if (!this.#isTurnCurrent(runtime, turn) || turn.terminalClaimed || turn.managedAuthorityRevoked) return;
+    if (!turn.managedNotifications.has(rawTaskId)) {
+      if (turn.managedNotifications.size >= MAX_SESSION_TOOL_NAMES) throw nativeEventLimit();
+      turn.managedNotifications.set(rawTaskId, {
+        rawTaskId,
+        uuid: randomUUID(),
+        status,
+        summary,
+        delivered: false
+      });
+    }
+    addManagedContinuationIdentity(turn, rawTaskId);
+    if (turn.awaitingNativeContinuation) this.#pumpManagedNotifications(runtime, turn);
+  }
+
+  #pumpManagedNotifications(runtime: NativeRuntime, turn: ActiveTurn): void {
+    if (turn.managedNotificationDispatched || turn.managedNotificationPump !== undefined
+      || !this.#isTurnCurrent(runtime, turn)
+      || !turn.awaitingNativeContinuation || turn.terminalClaimed || turn.managedAuthorityRevoked) return;
+    const pending = [...turn.managedNotifications.values()].filter((notification) => !notification.delivered);
+    if (pending.length === 0) return;
+    const uuid = pending[0]!.uuid.toLowerCase();
+    const content = pending.map((notification) => managedTaskNotificationText(notification)).join("\n");
+    const signal = AbortSignal.any([
+      turn.context.signal,
+      runtime.abortController.signal,
+      turn.managedNotificationCancellation.signal
+    ]);
+    turn.managedNotificationPump = waitFor(runtime.gate.offer({
+      type: "user",
+      message: { role: "user", content },
+      parent_tool_use_id: null,
+      origin: { kind: "task-notification" },
+      uuid
+    }, () => {
+      turn.managedNotificationDispatched = true;
+      addBoundedIdentity(turn.managedContinuationUuids, uuid);
+      for (const notification of pending) notification.delivered = true;
+    }, signal, () => {
+      if (!this.#isTurnCurrent(runtime, turn) || !turn.awaitingNativeContinuation
+        || turn.terminalClaimed || turn.managedAuthorityRevoked) {
+        throw new Error("The managed task notification no longer owns a continuation.");
+      }
+    }), this.#admissionTimeoutMs, signal,
+    () => new Error("The managed task notification was not consumed in time."))
+      .catch((error: unknown) => {
+        if (this.#isTurnCurrent(runtime, turn) && !turn.terminalClaimed && !turn.managedAuthorityRevoked) {
+          void this.#handleStreamFailure(runtime, error);
+        }
+      })
+      .finally(() => {
+        turn.managedNotificationPump = undefined;
+      });
+  }
+
+  async #managedChildCwd(runtime: NativeRuntime, requested: string | undefined): Promise<string> {
+    if (requested === undefined) return runtime.runtimeWorkspaceRoot;
+    if (requested.length === 0 || requested.length > 16_384 || requested.trim() !== requested || requested.includes("\0")) {
+      throw new Error("The delegated working directory is invalid.");
+    }
+    if (runtime.remote) {
+      const normalized = remotePath.normalize(requested);
+      if (!remotePath.isAbsolute(requested) || normalized !== requested
+        || !managedPathWithin(requested, [runtime.runtimeWorkspaceRoot], true)) {
+        throw new Error("The delegated working directory is outside the remote Target.");
+      }
+      return requested;
+    }
+    await validateCanonicalDirectory(requested, "Delegated working directory");
+    const roots = [runtime.runtimeWorkspaceRoot, ...runtime.additionalDirectories.map((directory) => directory.path)];
+    if (!managedPathWithin(requested, roots, false)) {
+      throw new Error("The delegated working directory is outside its approved roots.");
+    }
+    return normalize(requested);
   }
 
   async #canUseTool(
@@ -3176,17 +4260,35 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     runtime: NativeRuntime,
     emissions: readonly NativeTaskEmission[]
   ): Promise<void> {
-    for (const emission of emissions) {
-      if (!this.#matchesContext(runtime, emission.context)) return;
-      const fields: Record<string, string | number | boolean> = {
-        queryGeneration: runtime.queryGeneration,
-        sessionGeneration: runtime.sessionGeneration,
-        nativeTaskProjection: true
-      };
-      if (runtime.backendInstanceGeneration !== undefined) {
-        fields["backendInstanceGeneration"] = runtime.backendInstanceGeneration;
+    try {
+      for (const emission of emissions) {
+        if (!this.#matchesContext(runtime, emission.context)) return;
+        const fields: Record<string, string | number | boolean> = {
+          queryGeneration: runtime.queryGeneration,
+          sessionGeneration: runtime.sessionGeneration,
+          nativeTaskProjection: true
+        };
+        if (runtime.backendInstanceGeneration !== undefined) {
+          fields["backendInstanceGeneration"] = runtime.backendInstanceGeneration;
+        }
+        await emission.context.emit(emission.payload, { namespace: "claude-code.native_tasks", fields });
       }
-      await emission.context.emit(emission.payload, { namespace: "claude-code.native_tasks", fields });
+    } finally {
+      for (const notification of runtime.nativeTasks.takeWakeNotifications()) {
+        const turn = runtime.activeTurn;
+        if (turn?.context !== notification.context || turn.terminalClaimed) continue;
+        if (notification.state === "stopped") {
+          turn.pendingContinuationTaskIds.delete(notification.rawTaskId);
+          continue;
+        }
+        addManagedContinuationIdentity(turn, notification.rawTaskId);
+      }
+      for (const terminated of runtime.nativeTasks.takeTerminatedTools()) {
+        const turn = runtime.activeTurn;
+        if (turn?.context === terminated.context) {
+          await this.#releaseManagedSubtaskLease(runtime, turn, terminated.toolUseId);
+        }
+      }
     }
   }
 
@@ -3231,6 +4333,32 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       });
     }
     this.#assertCurrent(runtime, context);
+  }
+
+  async #stopOwnedNativeTask(runtime: NativeRuntime, rawTaskId: string): Promise<void> {
+    const managed = runtime.managedChildren.get(rawTaskId);
+    if (managed !== undefined) {
+      if (managed.terminal) return;
+      managed.stopping = true;
+      const query = managed.query;
+      if (query !== undefined) {
+        const receipt = await query.interrupt();
+        if (receipt === undefined || !Array.isArray(receipt.still_queued) || receipt.still_queued.length > 0) {
+          throw new Error("The delegated Query did not confirm interruption.");
+        }
+      }
+      managed.grant.cancellation.abort(new Error("The delegated task was stopped."));
+      try { query?.close(); } catch { /* The child cancellation fence remains authoritative. */ }
+      await this.#finishManagedChild(runtime, managed, "stopped", "The delegated model request was stopped.");
+      await managed.result;
+      return;
+    }
+    const childOwner = runtime.childNativeTaskOwners.get(rawTaskId);
+    if (childOwner !== undefined) {
+      await childOwner.query.stopTask(childOwner.rawTaskId);
+      return;
+    }
+    await runtime.query.stopTask(rawTaskId);
   }
 
   async #runIdleControl(
@@ -3294,11 +4422,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
   ): Promise<void> {
     if (runtime.retirementConfirmed) return;
     if (!runtime.closed) {
-      runtime.managedRoute?.dispose();
       const retiringTurn = runtime.activeTurn;
       if (retiringTurn !== undefined) {
         retiringTurn.stopping = true;
         retiringTurn.terminalClaimed = true;
+        const restoration = this.#releaseManagedTurnLeases(runtime, retiringTurn, false);
+        if (restoration !== undefined) await restoration;
         retiringTurn.interruptConfirmation?.reject(turnAbortUnknown("The runtime retired before interrupt confirmation.")());
         for (const steer of retiringTurn.steers.values()) {
           steer.admission.reject(dispatchError("The runtime retired before same-turn admission was confirmed.", steer.consumed));
@@ -3322,6 +4451,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
           // Runtime retirement remains authoritative when terminal task publication fails.
         }
       }
+      runtime.managedRoute?.dispose();
       runtime.closed = true;
       const reason = new Error("The native runtime was retired.");
       runtime.activeTurn?.admission.reject(reason);
@@ -3381,6 +4511,38 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       scoped.assertCurrent();
       return info;
     } catch {
+      throw claudeCodeError("NATIVE_SESSION_INSPECTION_FAILED", "The native Session could not be inspected.", "session_inspect", {
+        retryable: true,
+        stateMayHaveChanged: false,
+        recovery: "Verify the SDK installation and native Session store, then retry."
+      });
+    }
+  }
+
+  async #sessionHasHistory(runtime: NativeRuntime, signal: AbortSignal): Promise<boolean> {
+    try {
+      runtime.assertRuntimeCurrent();
+      const messages = await waitFor(runtime.sdkRuntime.getSessionMessages(runtime.nativeSessionId, {
+        dir: runtime.runtimeWorkspaceRoot,
+        limit: 1,
+        offset: 0,
+        includeSystemMessages: true,
+        signal
+      }), this.#initializationTimeoutMs, signal, () => claudeCodeError(
+        "NATIVE_SESSION_INSPECTION_FAILED",
+        "The native Session could not be inspected.",
+        "session_inspect",
+        {
+          retryable: true,
+          stateMayHaveChanged: false,
+          recovery: "Verify the SDK installation and native Session store, then retry."
+        }
+      ));
+      runtime.assertRuntimeCurrent();
+      if (!Array.isArray(messages) || messages.length > 1) throw new Error("Invalid native Session history inspection result.");
+      return messages.length > 0;
+    } catch (error) {
+      if (error instanceof JokoError) throw error;
       throw claudeCodeError("NATIVE_SESSION_INSPECTION_FAILED", "The native Session could not be inspected.", "session_inspect", {
         retryable: true,
         stateMayHaveChanged: false,
@@ -3703,6 +4865,207 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
 
 export function createClaudeCodeAdapter(options: ClaudeCodeAdapterOptions): ClaudeCodeAdapter {
   return new ClaudeCodeAdapter(options);
+}
+
+function managedAgentError(text: string): ClaudeSdkManagedAgentResult {
+  return { text, isError: true };
+}
+
+function utf8Prefix(value: string, maximumBytes: number): string {
+  if (Buffer.byteLength(value, "utf8") <= maximumBytes) return value;
+  let low = 0;
+  let high = Math.min(value.length, maximumBytes);
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (Buffer.byteLength(value.slice(0, middle), "utf8") <= maximumBytes) low = middle;
+    else high = middle - 1;
+  }
+  if (low > 0 && low < value.length) {
+    const last = value.charCodeAt(low - 1);
+    const next = value.charCodeAt(low);
+    if (last >= 0xd800 && last <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) low -= 1;
+  }
+  return value.slice(0, low);
+}
+
+function managedAgentLaunchResult(rawTaskId: string): ClaudeSdkManagedAgentResult {
+  return { text: `Managed child launched in the background as ${rawTaskId}.` };
+}
+
+function linkedAbortController(signals: readonly AbortSignal[]): AbortController {
+  const controller = new AbortController();
+  const subscriptions: { readonly signal: AbortSignal; readonly listener: () => void }[] = [];
+  controller.signal.addEventListener("abort", () => {
+    for (const subscription of subscriptions) {
+      subscription.signal.removeEventListener("abort", subscription.listener);
+    }
+  }, { once: true });
+  for (const signal of signals) {
+    if (signal.aborted) {
+      controller.abort(signal.reason);
+      break;
+    }
+    const listener = (): void => controller.abort(signal.reason);
+    subscriptions.push({ signal, listener });
+    signal.addEventListener("abort", listener, { once: true });
+  }
+  return controller;
+}
+
+function managedChildPermissionMode(
+  mode: string | undefined,
+  runtime: NativeRuntime
+): ClaudeSdkPermissionMode {
+  if (mode === undefined) return runtime.planMode ? "plan" : toSdkPermissionMode(runtime.permissionMode);
+  if (mode === "default" || mode === "acceptEdits" || mode === "dontAsk" || mode === "auto" || mode === "plan") {
+    return mode;
+  }
+  if (mode === "bypassPermissions") {
+    assertFullAccessTarget("bypassPermissions", runtime.target, "permission");
+    return mode;
+  }
+  throw new Error("The delegated permission mode is invalid.");
+}
+
+function managedChildNativeIdentity(parentTaskId: string, kind: string, value: string): string {
+  return `managed-${kind}-${createHash("sha256")
+    .update(parentTaskId)
+    .update("\0")
+    .update(value)
+    .digest("hex")
+    .slice(0, 32)}`;
+}
+
+function managedChildFrame(
+  child: ManagedChildTask,
+  envelope: Readonly<Record<string, unknown>>
+): Readonly<Record<string, unknown>> {
+  const nativeMessage = record(envelope["message"]);
+  const rawContent = Array.isArray(nativeMessage?.["content"]) ? nativeMessage["content"] : undefined;
+  const content = rawContent?.map((rawBlock) => {
+    const block = record(rawBlock);
+    if (block === undefined) return rawBlock;
+    const type = stringValue(block["type"]);
+    if (type === "tool_use") {
+      const id = stringValue(block["id"]);
+      return id === undefined ? { ...block } : {
+        ...block,
+        id: managedChildNativeIdentity(child.rawTaskId, "tool", id)
+      };
+    }
+    if (type === "tool_result") {
+      const id = stringValue(block["tool_use_id"]);
+      return id === undefined ? { ...block } : {
+        ...block,
+        tool_use_id: managedChildNativeIdentity(child.rawTaskId, "tool", id)
+      };
+    }
+    return { ...block };
+  });
+  const toolUseId = stringValue(envelope["tool_use_id"]);
+  return {
+    ...envelope,
+    session_id: child.turn.context.binding?.nativeSessionId,
+    parent_tool_use_id: child.toolUseId,
+    ...(toolUseId === undefined ? {} : {
+      tool_use_id: managedChildNativeIdentity(child.rawTaskId, "tool", toolUseId)
+    }),
+    ...(nativeMessage === undefined ? {} : {
+      message: {
+        ...nativeMessage,
+        ...(content === undefined ? {} : { content })
+      }
+    })
+  };
+}
+
+function managedChildTaskFrame(
+  child: ManagedChildTask,
+  envelope: Readonly<Record<string, unknown>>
+): Readonly<Record<string, unknown>> {
+  const taskId = stringValue(envelope["task_id"]);
+  const toolUseId = stringValue(envelope["tool_use_id"]);
+  return {
+    ...envelope,
+    session_id: child.turn.context.binding?.nativeSessionId,
+    ...(taskId === undefined ? {} : {
+      task_id: managedChildNativeIdentity(child.rawTaskId, "task", taskId)
+    }),
+    ...(toolUseId === undefined ? {} : {
+      tool_use_id: managedChildNativeIdentity(child.rawTaskId, "tool", toolUseId)
+    })
+  };
+}
+
+function managedPathWithin(candidate: string, roots: readonly string[], remote: boolean): boolean {
+  if (remote) {
+    return roots.some((root) => candidate === root || candidate.startsWith(root.endsWith("/") ? root : `${root}/`));
+  }
+  const candidateKey = canonicalPathKey(candidate);
+  return roots.some((root) => {
+    const rootKey = canonicalPathKey(root);
+    return candidateKey === rootKey || candidateKey.startsWith(rootKey.endsWith(sep) ? rootKey : `${rootKey}${sep}`);
+  });
+}
+
+function managedTaskNotificationText(notification: ManagedContinuationNotification): string {
+  return [
+    "<task-notification>",
+    `<task-id>${xmlText(notification.rawTaskId)}</task-id>`,
+    `<status>${notification.status}</status>`,
+    `<summary>${xmlText(notification.summary)}</summary>`,
+    "</task-notification>"
+  ].join("\n");
+}
+
+function xmlText(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+}
+
+function managedSubtaskToolUseId(
+  inputId: string | undefined,
+  callbackId: string | undefined
+): string | undefined {
+  if (typeof inputId !== "string" || inputId.length === 0 || inputId.length > 512
+    || /[\x00-\x1f\x7f]/u.test(inputId)
+    || (callbackId !== undefined && callbackId !== inputId)) return undefined;
+  return inputId;
+}
+
+function addManagedContinuationIdentity(turn: ActiveTurn | undefined, rawTaskId: string): void {
+  if (turn === undefined || turn.terminalClaimed || rawTaskId.length === 0 || rawTaskId.length > 512
+    || /[\x00-\x1f\x7f]/u.test(rawTaskId)) return;
+  const tasks = turn.awaitingNativeContinuation
+    ? turn.continuationTaskIds
+    : turn.pendingContinuationTaskIds;
+  addBoundedIdentity(tasks, rawTaskId);
+}
+
+function managedSubtaskConfigurationCompatible(
+  runtime: NativeRuntime,
+  child: ManagedProviderSubtaskLease
+): boolean {
+  const parent = runtime.managedRoute;
+  const effortSnapshot = runtime.managedEffortSnapshot;
+  if (parent === undefined || effortSnapshot === undefined) return false;
+  try {
+    const expectedLimits = effortSnapshot.limitsByModel.get(child.model.modelId);
+    if (expectedLimits === undefined
+      || !isDeepStrictEqual(expectedLimits, managedModelLimitSnapshot(child.model))) return false;
+    validateManagedThinkingMap(child.thinkingLevelMap);
+    if (!effortSnapshot.nativeByModel.has(child.model.modelId)) return false;
+    const expected = effortSnapshot.nativeByModel.get(child.model.modelId);
+    return effortSnapshot.productEffort === undefined
+      ? expected === undefined
+      : expected === managedNativeEffort(child.model, child.thinkingLevelMap, effortSnapshot.productEffort);
+  } catch {
+    return false;
+  }
 }
 
 function reviewRuntimePolicy(
@@ -4131,6 +5494,7 @@ function capabilityManifest(
   steerSupported: boolean,
   subagentDefaultModelSupported: boolean,
   subagentDefaultModelConfigured: boolean,
+  nativeMemoryConfigured: boolean,
   models: readonly ClaudeSdkModelInfo[],
   managedEffortSupported: boolean,
   hostCapabilities: ReadonlySet<HostComposedCapability>,
@@ -4183,6 +5547,7 @@ function capabilityManifest(
   if (supportsLogout) supported.add("provider.logout");
   if (steerSupported) supported.add("turn.steer");
   if (subagentDefaultModelSupported && subagentDefaultModelConfigured) supported.add("subagents.default_model");
+  if (nativeMemoryConfigured) supported.add("memory.native");
   if (managedEffortSupported || models.some((model) => model.supportsEffort === true)) supported.add("model.effort");
   if (models.some((model) => model.supportsFastMode === true)) supported.add("model.fast_mode");
   for (const capability of hostCapabilities) supported.add(capability);
@@ -4205,6 +5570,8 @@ function capabilityManifest(
             ]
           : key === "runtime.resources" && textResourcesSupported
             ? ["skill", "prompt"]
+          : key === "memory.native" && available && nativeMemoryConfigured
+            ? [MEMORY_NATIVE_RESET_LOCAL_OPTION]
         : undefined;
     return [key, {
       key,
@@ -4326,6 +5693,32 @@ function invalidForkBoundary(): JokoError {
   });
 }
 
+function nativeMemoryFilesystemError(error: unknown, operation: "status" | "reset"): JokoError {
+  if (error instanceof JokoError) return error;
+  const filesystem = error instanceof ClaudeNativeMemoryFilesystemError ? error : undefined;
+  const unsafe = filesystem?.failure === "unsafe_path" || filesystem?.failure === "changed";
+  return claudeCodeError(
+    unsafe ? "CLAUDE_NATIVE_MEMORY_PATH_UNSAFE" : operation === "status"
+      ? "CLAUDE_NATIVE_MEMORY_STATUS_FAILED"
+      : "CLAUDE_NATIVE_MEMORY_RESET_FAILED",
+    unsafe
+      ? "Claude native memory storage could not be proven to belong to the local profile."
+      : operation === "status"
+        ? "Claude native memory status could not be read."
+        : "Claude native memory could not be reset completely.",
+    operation === "status" ? "memory_status" : "memory_reset",
+    {
+      retryable: !unsafe && filesystem?.stateMayHaveChanged !== true,
+      stateMayHaveChanged: filesystem?.stateMayHaveChanged ?? false,
+      recovery: filesystem?.stateMayHaveChanged === true
+        ? "Inspect local native memory state before explicitly issuing another reset."
+        : unsafe
+          ? "Remove filesystem aliases from the local native profile before retrying."
+          : "Verify access to the local native profile and retry."
+    }
+  );
+}
+
 function containsManagedResourceExpansion(content: unknown): boolean {
   const hasFrame = (value: unknown): boolean => typeof value === "string"
     && /(?:^|\n)\[Joko approved (?:skill|prompt) resource\]\n/u.test(value);
@@ -4404,8 +5797,21 @@ function assertResultOwnership(
     && (userMessageUuid.toLowerCase() === turn.userMessageUuid
       || (turn.steers.get(userMessageUuid.toLowerCase())?.consumed === true && identities.has(turn.userMessageUuid)));
   if (turn.nativeContinuationSegment) {
-    if (originKind !== undefined && originKind !== "human") throw turnOwnershipGap();
-    if (userMessageUuid !== undefined && !belongsToTurn) throw turnOwnershipGap();
+    const normalized = userMessageUuid?.toLowerCase();
+    if (normalized !== undefined && turn.managedContinuationUuids.has(normalized)) {
+      // The fixed CLI omits `origin` from its Result for a host-supplied
+      // task-notification but preserves the exact UUID. That unguessable,
+      // Adapter-owned identity is the continuation receipt.
+      if ((originKind !== undefined && originKind !== "task-notification") || !identities.has(normalized)) {
+        throw turnOwnershipGap();
+      }
+      return;
+    }
+    // Native SDK wake continuations have no Host input UUID. Preserve their
+    // fixed task-notification provenance contract independently.
+    if (originKind !== "task-notification" || userMessageUuid !== undefined || identities.size !== 0) {
+      throw turnOwnershipGap();
+    }
     return;
   }
   if (originKind !== "human") throw turnOwnershipGap();
@@ -4428,7 +5834,9 @@ function resultInputIdentities(envelope: Readonly<Record<string, unknown>>, turn
   for (const id of rawIds) {
     if (typeof id !== "string" || !uuidPattern().test(id)) throw turnOwnershipGap();
     const normalized = id.toLowerCase();
-    if (ids.has(normalized) || (normalized !== turn.userMessageUuid && turn.steers.get(normalized)?.consumed !== true)) {
+    if (ids.has(normalized) || (normalized !== turn.userMessageUuid
+      && turn.steers.get(normalized)?.consumed !== true
+      && !turn.managedContinuationUuids.has(normalized))) {
       throw turnOwnershipGap();
     }
     ids.add(normalized);
@@ -4810,7 +6218,7 @@ export const CLAUDE_MANAGED_PROVIDER_SUPPORT: ProviderRuntimeSupport = Object.fr
   protocols: Object.freeze(["anthropic-messages"] as const),
   fields: Object.freeze([
     "request_path", "models_endpoint", "headers", "keyless", "auth_header",
-    "model_costs", "model_input_modalities", "model_thinking_levels"
+    "model_limits", "model_costs", "model_input_modalities", "model_thinking_levels"
   ] as const)
 });
 
@@ -4839,6 +6247,144 @@ function validateManagedThinkingMap(mapping: Readonly<Record<string, string | nu
   }
 }
 
+function managedQueryEffortSnapshot(
+  route: ManagedProviderRouteBinding,
+  providers: ManagedProviderRuntimePort,
+  productEffort: string | undefined
+): ManagedQueryEffortSnapshot {
+  try { route.assertCurrent(); }
+  catch { throw managedRouteUnavailable(); }
+  if (!validManagedModelIdentity(route.model.modelId)) throw managedRouteUnavailable();
+  validateManagedThinkingMap(route.thinkingLevelMap);
+  const parentLimits = managedModelLimitSnapshot(route.model);
+  const parentNative = productEffort === undefined
+    ? undefined
+    : managedNativeEffort(route.model, route.thinkingLevelMap, productEffort);
+  const listed = providers.listModels();
+  if (listed.length > MAX_DESCRIPTOR_ITEMS) throw managedRouteUnavailable();
+  const counts = new Map<string, number>();
+  for (const model of listed) {
+    if (model.providerId === route.providerId) {
+      counts.set(model.modelId, (counts.get(model.modelId) ?? 0) + 1);
+    }
+  }
+  const candidates: {
+    readonly modelId: string;
+    readonly nativeEffort: NativeEffort | undefined;
+    readonly settingsKey: string | undefined;
+    readonly limits: ManagedModelLimitSnapshot;
+  }[] = [{
+    modelId: route.model.modelId,
+    nativeEffort: parentNative,
+    settingsKey: productEffort === undefined ? undefined : fixedManagedModelSettingsKey(route.model.modelId),
+    limits: parentLimits
+  }];
+  for (const model of listed) {
+    if (model.providerId !== route.providerId || model.modelId === route.model.modelId
+      || counts.get(model.modelId) !== 1 || model.api !== route.protocol
+      || !validManagedModelIdentity(model.modelId)) continue;
+    try {
+      const limits = managedModelLimitSnapshot(model);
+      if (!managedModelLimitsCompatible(parentLimits, limits)) continue;
+      const mapping = providers.getThinkingLevelMap(route.providerId, model.modelId);
+      validateManagedThinkingMap(mapping);
+      const nativeEffort = productEffort === undefined
+        ? undefined
+        : managedNativeEffort(model, mapping, productEffort);
+      candidates.push({
+        modelId: model.modelId,
+        nativeEffort,
+        settingsKey: productEffort === undefined ? undefined : fixedManagedModelSettingsKey(model.modelId),
+        limits
+      });
+    } catch {
+      // One inapplicable catalog entry must not make the exact parent route
+      // unusable. It remains outside this Query's delegated-model snapshot.
+    }
+  }
+  try { route.assertCurrent(); }
+  catch { throw managedRouteUnavailable(); }
+  const finalize = (
+    nativeByModel: ReadonlyMap<string, NativeEffort | undefined>,
+    fields: {
+      readonly modelSettings?: Readonly<Record<string, { readonly effortLevel: PersistedModelEffort }>>;
+      readonly globalEffort?: NativeEffort;
+    } = {}
+  ): ManagedQueryEffortSnapshot => {
+    const accepted = candidates.filter((candidate) => nativeByModel.has(candidate.modelId));
+    const limitsByModel = new Map(accepted.map((candidate) => [candidate.modelId, candidate.limits]));
+    return {
+      productEffort,
+      nativeByModel,
+      limitsByModel,
+      parentLimits,
+      // Every delegated model now runs in its own Query, so the parent process
+      // must retain only its exact limits. The candidate map is authorization
+      // metadata, not permission to widen the parent engine configuration.
+      limitEnvironment: managedQueryLimitEnvironment(parentLimits, [parentLimits]),
+      ...fields
+    };
+  };
+  if (productEffort === undefined) {
+    return finalize(new Map(candidates.map((candidate) => [candidate.modelId, undefined])));
+  }
+  const parentKey = candidates[0]!.settingsKey;
+  if (parentNative === undefined) throw managedRouteUnavailable();
+  if (parentNative === "max" || parentKey === undefined) {
+    return finalize(new Map(candidates
+      .filter((candidate) => candidate.nativeEffort === parentNative)
+      .map((candidate) => [candidate.modelId, candidate.nativeEffort])), { globalEffort: parentNative });
+  }
+  const groups = new Map<string, typeof candidates>();
+  for (const candidate of candidates) {
+    if (candidate.nativeEffort === "max" || candidate.settingsKey === undefined) continue;
+    const group = groups.get(candidate.settingsKey) ?? [];
+    group.push(candidate);
+    groups.set(candidate.settingsKey, group);
+  }
+  const modelSettings: Record<string, { readonly effortLevel: PersistedModelEffort }> = Object.create(null);
+  const nativeByModel = new Map<string, NativeEffort | undefined>();
+  for (const [settingsKey, group] of groups) {
+    const parent = group.find((candidate) => candidate.modelId === route.model.modelId);
+    const selectedNative = parent?.nativeEffort
+      ?? (new Set(group.map((candidate) => candidate.nativeEffort)).size === 1 ? group[0]!.nativeEffort : undefined);
+    if (selectedNative === undefined || selectedNative === "max") continue;
+    modelSettings[settingsKey] = Object.freeze({ effortLevel: selectedNative });
+    for (const candidate of group) {
+      if (candidate.nativeEffort === selectedNative) nativeByModel.set(candidate.modelId, candidate.nativeEffort);
+    }
+  }
+  if (!nativeByModel.has(route.model.modelId)) throw managedRouteUnavailable();
+  return finalize(nativeByModel, { modelSettings: Object.freeze(modelSettings) });
+}
+
+function validManagedModelIdentity(value: string): boolean {
+  return value.length > 0 && value.length <= 512 && !/[\s\x00-\x1f\x7f]/u.test(value);
+}
+
+/** Mirrors the deterministic identity spelling used by the fixed CLI 2.1.259
+ * for settings keys. Native tier aliases depend on account configuration and
+ * therefore deliberately fall back to a Query-global effort. */
+function fixedManagedModelSettingsKey(value: string): string | undefined {
+  if (!validManagedModelIdentity(value)) return undefined;
+  let key = value.toLowerCase().replace(/\[1m\]$/iu, "");
+  if (["sonnet", "opus", "haiku", "fable", "best", "opusplan"].includes(key)
+    || Object.hasOwn(Object.prototype, key)) return undefined;
+  for (const identity of [
+    "claude-fable-5-1", "claude-fable-5", "claude-mythos-5-1", "claude-mythos-5",
+    "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
+    "claude-opus-4-5", "claude-opus-4-1", "claude-sonnet-5", "claude-sonnet-4-6",
+    "claude-sonnet-4-5", "claude-haiku-4-5", "claude-3-7-sonnet", "claude-3-5-sonnet",
+    "claude-3-5-haiku", "claude-3-opus", "claude-3-sonnet", "claude-3-haiku"
+  ]) {
+    if (key.includes(identity)) return identity;
+  }
+  if (/claude-opus-4(?!-\d(?!\d))/u.test(key)) return "claude-opus-4-0";
+  if (/claude-sonnet-4(?!-\d(?!\d))/u.test(key)) return "claude-sonnet-4-0";
+  key = key.replace(/-\d{8}$/u, "");
+  return Object.hasOwn(Object.prototype, key) ? undefined : key;
+}
+
 function managedNativeEffort(model: ProviderModel, mapping: Readonly<Record<string, string | null>>, level: string): typeof EFFORT_LEVELS[number] {
   validateManagedThinkingMap(mapping);
   if (!model.thinkingLevels.includes(level) || mapping[level] === null) throw managedRouteUnavailable();
@@ -4847,7 +6393,71 @@ function managedNativeEffort(model: ProviderModel, mapping: Readonly<Record<stri
 
 function managedProviderModel(model: ProviderModel, mapping: Readonly<Record<string, string | null>>): ProviderModel {
   validateManagedThinkingMap(mapping);
+  managedModelLimitEnvironment(model);
   return { ...model, supportsFastMode: false, thinkingLevels: model.thinkingLevels.filter((level) => mapping[level] !== null && normalizeEffort(mapping[level] ?? level) !== undefined) };
+}
+
+export function managedModelLimitEnvironment(model: ProviderModel): Readonly<Record<string, string>> {
+  const limits = managedModelLimitSnapshot(model);
+  return managedQueryLimitEnvironment(limits, [limits]);
+}
+
+function managedModelLimitSnapshot(model: ProviderModel): ManagedModelLimitSnapshot {
+  return Object.freeze({
+    contextWindow: managedModelLimit(model.contextWindow, "context window"),
+    maxOutputTokens: managedModelLimit(model.maxOutputTokens, "maximum output")
+  });
+}
+
+function managedModelLimitsCompatible(
+  parent: ManagedModelLimitSnapshot,
+  child: ManagedModelLimitSnapshot
+): boolean {
+  return (parent.contextWindow === child.contextWindow
+      || parent.contextWindow !== undefined && child.contextWindow !== undefined)
+    && (parent.maxOutputTokens === child.maxOutputTokens
+      || parent.maxOutputTokens !== undefined && child.maxOutputTokens !== undefined);
+}
+
+function managedQueryLimitEnvironment(
+  parent: ManagedModelLimitSnapshot,
+  candidates: readonly ManagedModelLimitSnapshot[]
+): Readonly<Record<string, string>> {
+  const contextWindows = candidates.flatMap((candidate) => candidate.contextWindow === undefined ? [] : [candidate.contextWindow]);
+  const outputLimits = candidates.flatMap((candidate) => candidate.maxOutputTokens === undefined ? [] : [candidate.maxOutputTokens]);
+  const contextWindow = contextWindows.length === 0 ? undefined : Math.max(...contextWindows);
+  const maxOutputTokens = outputLimits.length === 0 ? undefined : Math.max(...outputLimits);
+  const environment: Record<string, string> = {};
+  if (contextWindow !== undefined) {
+    environment["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = String(contextWindow);
+  }
+  if (parent.contextWindow !== undefined) {
+    // Claude 2.1.259 resolves known model capacity before MAX_CONTEXT_TOKENS.
+    // AUTO_COMPACT_WINDOW is the native working-window control. Its 100K floor
+    // is compensated with the native percentage override for smaller budgets.
+    environment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = String(parent.contextWindow);
+    environment["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = String(
+      DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT
+        * Math.min(1, parent.contextWindow / NATIVE_AUTO_COMPACT_WINDOW_MINIMUM)
+    );
+  }
+  if (maxOutputTokens !== undefined) {
+    environment["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = String(maxOutputTokens);
+  }
+  return Object.freeze(environment);
+}
+
+function managedModelLimit(value: number, label: string): number | undefined {
+  if (value === 0) return undefined;
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw claudeCodeError(
+      "MANAGED_PROVIDER_MODEL_LIMIT_INVALID",
+      `The configured model ${label} limit is invalid.`,
+      "model",
+      { recovery: "Set a positive whole-token limit or clear the optional model limit." }
+    );
+  }
+  return value;
 }
 
 function managedRouteUnavailable(stateMayHaveChanged = false): JokoError {
@@ -4858,7 +6468,8 @@ function managedRouteUnavailable(stateMayHaveChanged = false): JokoError {
 }
 
 function managedQueryEnvironment(route: ManagedProviderRouteBinding, port: ManagedProviderRuntimePort,
-  environment: Readonly<Record<string, string>>): Readonly<Record<string, string | undefined>> {
+  environment: Readonly<Record<string, string>>,
+  modelLimits: Readonly<Record<string, string>>): Readonly<Record<string, string | undefined>> {
   const token = port.environment[route.apiKeyEnvironment];
   const endpoint = new URL(route.baseUrl);
   if (route.protocol !== "anthropic-messages" || token === undefined || token.length === 0
@@ -4868,6 +6479,7 @@ function managedQueryEnvironment(route: ManagedProviderRouteBinding, port: Manag
   return {
     ...managedAuthEnvironmentOverrides(),
     ...Object.fromEntries(port.secretEnvironmentNames.map((key) => [key, undefined])),
+    ...modelLimits,
     CLAUDE_CONFIG_DIR: environment["CLAUDE_CONFIG_DIR"],
     CLAUDE_CODE_GIT_BASH_PATH: environment["CLAUDE_CODE_GIT_BASH_PATH"],
     CLAUDE_CODE_SHELL: environment["CLAUDE_CODE_SHELL"],

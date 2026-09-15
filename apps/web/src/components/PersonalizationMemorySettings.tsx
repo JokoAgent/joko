@@ -11,9 +11,10 @@ import "./PersonalizationMemorySettings.css";
 
 type ResetTarget =
   | { readonly kind: "curated" }
-  | { readonly kind: "backend"; readonly backendId: string; readonly backendName: string };
+  | { readonly kind: "backend"; readonly backendId: string; readonly backendName: string; readonly native: boolean };
 
-function PiMemoryMark(): JSX.Element {
+function BackendMemoryMark({ native }: { readonly native: boolean }): JSX.Element {
+  if (native) return <Sparkles />;
   return <svg viewBox="0 0 24 24" aria-hidden="true">
     <g fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
       <path d="M3.6 6.6h16.8" />
@@ -66,14 +67,22 @@ export function PersonalizationMemorySettings({ controller, snapshot, runAction,
       }
     });
   };
-  const toggleBackend = (backendId: string, backendName: string, next: boolean): void => {
+  const toggleBackend = (
+    backendId: string,
+    backendName: string,
+    next: boolean,
+    updatesActiveLocalSessions: boolean
+  ): void => {
     const previous = backendEnabled[backendId] ?? true;
     setBackendEnabled((current) => ({ ...current, [backendId]: next }));
     markPending(`backend:${backendId}`, true);
     runAction(`memory-backend-toggle:${backendId}`, async () => {
       try {
         await controller.updateMemorySettings({ backendId, backendEnabled: next });
-        onSuccess(t(next ? "settings.memory.toast.backendEnabled" : "settings.memory.toast.backendDisabled", { backend: backendName }));
+        const key = updatesActiveLocalSessions
+          ? next ? "settings.memory.toast.backendEnabledLive" : "settings.memory.toast.backendDisabledLive"
+          : next ? "settings.memory.toast.backendEnabled" : "settings.memory.toast.backendDisabled";
+        onSuccess(t(key, { backend: backendName }));
       } catch (error) {
         setBackendEnabled((current) => ({ ...current, [backendId]: previous }));
         throw error;
@@ -104,14 +113,19 @@ export function PersonalizationMemorySettings({ controller, snapshot, runAction,
         const result = target.kind === "curated"
           ? await controller.resetMemory("curated")
           : await controller.resetMemory("backend", target.backendId);
-        onSuccess(t(
-          target.kind === "curated"
-            ? result.removedEntries === 1 ? "settings.memory.toast.makerResetOne" : "settings.memory.toast.makerResetOther"
-            : result.removedEntries === 1 ? "settings.memory.toast.backendResetOne" : "settings.memory.toast.backendResetOther",
-          target.kind === "curated"
-            ? { count: result.removedEntries }
-            : { backend: target.backendName, count: result.removedEntries }
-        ));
+        const count = result.removedEntries;
+        if (target.kind === "backend" && count === undefined) {
+          onSuccess(t("settings.memory.toast.backendResetGeneric", { backend: target.backendName }));
+        } else {
+          onSuccess(t(
+            target.kind === "curated"
+              ? count === 1 ? "settings.memory.toast.makerResetOne" : "settings.memory.toast.makerResetOther"
+              : count === 1 ? "settings.memory.toast.backendResetOne" : "settings.memory.toast.backendResetOther",
+            target.kind === "curated"
+              ? { count: count ?? 0 }
+              : { backend: target.backendName, count: count ?? 0 }
+          ));
+        }
       } finally {
         markPending(key, false);
       }
@@ -121,7 +135,12 @@ export function PersonalizationMemorySettings({ controller, snapshot, runAction,
     ? t("settings.memory.resetBackendTitle", { backend: resetTarget.backendName })
     : t("settings.memory.resetMakerTitle");
   const resetDescription = resetTarget?.kind === "backend"
-    ? t("settings.memory.resetBackendDescription", { backend: resetTarget.backendName })
+    ? t(
+        resetTarget.native
+          ? "settings.memory.resetNativeBackendDescription"
+          : "settings.memory.resetBackendDescription",
+        { backend: resetTarget.backendName }
+      )
     : t("settings.memory.resetMakerDescription");
 
   return (
@@ -167,12 +186,21 @@ export function PersonalizationMemorySettings({ controller, snapshot, runAction,
 
         {settings.backends.map((backend) => {
           const backendName = backendNames.get(backend.backendId) ?? backend.backendId;
-          const disabled = !makerEnabled || !settings.makerSupported || !backend.supported;
+          const native = backend.kind === "native_auto_memory";
+          const disabled = (native ? makerEnabled : !makerEnabled) || !settings.makerSupported || !backend.supported;
           return <div className="memory-settings__row memory-settings__row--backend" data-disabled={disabled || undefined} key={backend.backendId}>
-            <span className="memory-settings__icon memory-settings__icon--backend" aria-hidden="true"><PiMemoryMark /></span>
+            <span className="memory-settings__icon memory-settings__icon--backend" aria-hidden="true"><BackendMemoryMark native={native} /></span>
             <span className="memory-settings__copy">
               <strong>{t("settings.memory.backendLabel", { backend: backendName })}</strong>
-              <span>{t("settings.memory.backendDescription", { backend: backendName })}</span>
+              <span>{t(
+                native && backend.updatesActiveLocalSessions
+                  ? "settings.memory.nativeBackendLiveDescription"
+                  : native
+                    ? "settings.memory.nativeBackendDescription"
+                    : "settings.memory.backendDescription",
+                { backend: backendName }
+              )}</span>
+              {native && makerEnabled && <small role="status">{t("settings.memory.nativeBlocked")}</small>}
               {!backend.supported && <small role="status">{backend.reason || t("common.unavailable")}</small>}
             </span>
             <span className="memory-settings__actions">
@@ -180,14 +208,19 @@ export function PersonalizationMemorySettings({ controller, snapshot, runAction,
                   checked={backendEnabled[backend.backendId] ?? backend.enabled}
                   disabled={disabled || pending.has(`backend:${backend.backendId}`)}
                   aria-label={t("settings.memory.backendToggleAria", { backend: backendName })}
-                  onChange={(event) => toggleBackend(backend.backendId, backendName, event.target.checked)}
+                  onChange={(event) => toggleBackend(
+                    backend.backendId,
+                    backendName,
+                    event.target.checked,
+                    backend.updatesActiveLocalSessions
+                  )}
                 />
-              <IconButton
+              {backend.resettable && <IconButton
                 className="memory-settings__reset"
                 label={t("settings.memory.resetBackendTitle", { backend: backendName })}
                 disabled={disabled || pending.has(`reset:${backend.backendId}`)}
-                onClick={() => setResetTarget({ kind: "backend", backendId: backend.backendId, backendName })}
-              ><RotateCcw aria-hidden="true" /></IconButton>
+                onClick={() => setResetTarget({ kind: "backend", backendId: backend.backendId, backendName, native })}
+              ><RotateCcw aria-hidden="true" /></IconButton>}
             </span>
           </div>;
         })}

@@ -2782,6 +2782,7 @@ export interface ProviderModelConfigurationView {
   readonly compatibilityOptions?: ProviderCompatibilityConfigurationView;
   readonly supportsFastMode: boolean;
   readonly defaultVisible?: boolean;
+  readonly supportsTools?: boolean;
 }
 
 export interface ProviderSamplingConfigurationView {
@@ -3542,8 +3543,17 @@ export interface AuxiliaryTextSettingsView {
 export interface SubagentModelSettingsView {
   readonly backendId: string;
   readonly model?: { readonly providerId: string; readonly modelId: string };
+  readonly defaultModelSupported: boolean;
   readonly available: boolean;
   readonly unavailableReason: string;
+  readonly smartRoutingSupported: boolean;
+  readonly smartRoutingEnabled: boolean;
+  readonly smartRoutingAvailable: boolean;
+  readonly smartRoutingUnavailableReason: string;
+  readonly smartRoutingApplied: boolean;
+  readonly smartRoutingRestartPending: boolean;
+  readonly runtimeGeneration?: bigint;
+  readonly runtimeRevision: string;
   readonly revision: bigint;
 }
 
@@ -3697,7 +3707,10 @@ export interface SettingsView {
       readonly enabled: boolean;
       readonly supported: boolean;
       readonly reason: string;
-      readonly entryCount: number;
+      readonly entryCount?: number;
+      readonly kind: "compaction_digest" | "native_auto_memory";
+      readonly resettable: boolean;
+      readonly updatesActiveLocalSessions: boolean;
     }[];
   };
   readonly visionBridge: {
@@ -4851,8 +4864,8 @@ export interface OperationApi {
   }): Promise<void>;
   restoreMemoryDefaults(): Promise<void>;
   resetMemory(scope: "curated" | "backend", backendId?: string): Promise<{
-    readonly removedEntries: number;
-    readonly removedTargets: number;
+    readonly removedEntries?: number;
+    readonly removedTargets?: number;
   }>;
   updateVisionBridgeSettings(patch: {
     readonly enabled?: boolean;
@@ -4865,6 +4878,7 @@ export interface OperationApi {
   updatePromptRecommendationSettings(enabled: boolean): Promise<void>;
   updateAuxiliaryTextSettings(models: readonly ModelRouteRefView[], expectedRevision: bigint): Promise<void>;
   updateSubagentModelSettings(backendId: string, model: SubagentModelSettingsView["model"], expectedRevision: bigint): Promise<void>;
+  updateSubagentSmartRouting(backendId: string, enabled: boolean, expectedRevision: bigint): Promise<void>;
   resetPromptRecommendationSettings(): Promise<void>;
   updateLanguageToolSettings(enabled: boolean): Promise<void>;
   updateToolPolicySettings(

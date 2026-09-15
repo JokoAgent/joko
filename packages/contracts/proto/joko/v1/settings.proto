@@ -168,6 +168,8 @@ message ProviderModelConfiguration {
   // Explicit BYOM declaration. False/absent is conservatively unsupported.
   bool supports_fast_mode = 15;
   optional bool default_visible = 16;
+  // Explicit false excludes the model from tool-dependent smart routing.
+  optional bool supports_tools = 17;
 }
 
 message ProviderThinkingLevelMapping {
@@ -715,6 +717,15 @@ message SubagentModelSettings {
   bool available = 3;
   string unavailable_reason = 4;
   Revision revision = 5;
+  bool default_model_supported = 6;
+  bool smart_routing_supported = 7;
+  bool smart_routing_enabled = 8;
+  bool smart_routing_available = 9;
+  string smart_routing_unavailable_reason = 10;
+  bool smart_routing_applied = 11;
+  bool smart_routing_restart_pending = 12;
+  optional uint64 runtime_generation = 13;
+  string runtime_revision = 14;
 }
 
 message VisionBridgeSettings {
@@ -934,12 +945,22 @@ message MessageSearchSettingsPatch {
   bool reset_semantic_index_enabled = 2;
 }
 
+enum BackendMemoryKind {
+  BACKEND_MEMORY_KIND_UNSPECIFIED = 0;
+  BACKEND_MEMORY_KIND_COMPACTION_DIGEST = 1;
+  BACKEND_MEMORY_KIND_NATIVE_AUTO_MEMORY = 2;
+}
+
 message BackendMemorySettings {
   string backend_id = 1;
   bool enabled = 2;
   CapabilitySupport support = 3;
   string reason = 4;
-  uint64 entry_count = 5;
+  // Absent when a Backend-native owner cannot produce a trustworthy local count.
+  optional uint64 entry_count = 5;
+  BackendMemoryKind kind = 6;
+  bool resettable = 7;
+  bool updates_active_local_sessions = 8;
 }
 
 message MemorySettings {

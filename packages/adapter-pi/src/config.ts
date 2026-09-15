@@ -19,6 +19,8 @@ export interface PiManagedModel {
   readonly reasoning?: boolean;
   /** Explicit BYOM declaration; never inferred from an arbitrary endpoint. */
   readonly supportsFastMode?: boolean;
+  /** Host-owned tool-call support metadata; stripped from Pi's models.json. */
+  readonly supportsTools?: boolean;
   /** Host-owned picker default; stripped from Pi's models.json. */
   readonly defaultVisible?: boolean;
   readonly thinkingLevelMap?: Readonly<Record<string, string | null>>;
@@ -516,6 +518,9 @@ function validateProvider(provider: PiManagedProvider): void {
     if (model.supportsFastMode !== undefined && typeof model.supportsFastMode !== "boolean") {
       throw piError("PI_MODEL_INVALID_FAST_MODE", `Model '${provider.id}/${model.id}' has invalid Fast Mode metadata`, "provision");
     }
+    if (model.supportsTools !== undefined && typeof model.supportsTools !== "boolean") {
+      throw piError("PI_MODEL_INVALID_TOOL_SUPPORT", `Model '${provider.id}/${model.id}' has invalid tool support metadata`, "provision");
+    }
     if (model.defaultVisible !== undefined && typeof model.defaultVisible !== "boolean") {
       throw piError("PI_MODEL_INVALID_VISIBILITY", `Model '${provider.id}/${model.id}' has invalid visibility metadata`, "provision");
     }
@@ -546,6 +551,7 @@ export function piProviderModel(provider: PiManagedProvider, model: PiManagedMod
     contextWindow,
     maxOutputTokens: piModelOutputTokenLimit(model.maxTokens, contextWindow),
     supportsImages: model.input?.includes("image") ?? false,
+    ...(model.supportsTools === undefined ? {} : { supportsTools: model.supportsTools }),
     defaultVisible: model.defaultVisible ?? true,
     supportsFastMode: model.supportsFastMode === true,
     thinkingLevels,
@@ -565,6 +571,7 @@ export function piProviderModel(provider: PiManagedProvider, model: PiManagedMod
 function managedPiModelConfiguration(model: PiManagedModel): Record<string, unknown> {
   const {
     supportsFastMode: _supportsFastMode,
+    supportsTools: _supportsTools,
     defaultVisible: _defaultVisible,
     logicalId: _logicalId,
     ...piModel

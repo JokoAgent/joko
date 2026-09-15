@@ -10,8 +10,12 @@ import {
   type ClaudeSdkAccountInfo,
   type ClaudeSdkForkOptions,
   type ClaudeSdkGetSessionMessagesOptions,
+  type ClaudeSdkHookEvent,
+  type ClaudeSdkHookInput,
+  type ClaudeSdkHookOutput,
   type ClaudeSdkInitializationResult,
   type ClaudeSdkListSessionsOptions,
+  type ClaudeSdkManagedAgentInput,
   type ClaudeSdkModelInfo,
   type ClaudeSdkPermissionMode,
   type ClaudeSdkProbe,
@@ -51,6 +55,9 @@ const RECONNECT_DELAYS_MS = [0, 100, 250, 500] as const;
 const MAXIMUM_QUEUED_EVENTS = 4_096;
 const MAXIMUM_QUEUED_EVENT_BYTES = 32 * 1024 * 1024;
 const MAXIMUM_CALLBACKS_PER_QUERY = 256;
+const MAXIMUM_HOOK_PAYLOAD_BYTES = 1024 * 1024;
+const MAXIMUM_MANAGED_AGENT_RESULT_BYTES = 64 * 1024;
+const REMOTE_HOOK_EVENTS = ["PreToolUse", "PermissionDenied", "PostToolUse", "PostToolUseFailure"] as const satisfies readonly ClaudeSdkHookEvent[];
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
 type ProcessAuthority = Awaited<ReturnType<RemoteHostRegistry["captureProcessAuthority"]>>;
@@ -507,6 +514,7 @@ class RemoteClaudeQuery implements ClaudeSdkQuery {
   readonly #sessionId: string;
   readonly #output = new AsyncValueQueue<unknown>();
   readonly #callbackControllers = new Map<string, AbortController>();
+  readonly #hookCallbackIds = new Set<string>();
   #channel: RemoteClaudeManagerChannel | undefined;
   #attachmentId: string | undefined;
   #lastSeq = 0;
@@ -552,6 +560,7 @@ class RemoteClaudeQuery implements ClaudeSdkQuery {
   async applyFlagSettings(settings: {
     readonly effortLevel?: "low" | "medium" | "high" | "xhigh" | "max" | null;
     readonly fastMode?: boolean | null;
+    readonly autoCompactWindow?: number | null;
     readonly permissions?: { readonly additionalDirectories?: readonly string[] } | null;
   }): Promise<void> {
     await this.#control("query.applyFlagSettings", { settings });
@@ -849,6 +858,7 @@ class RemoteClaudeQuery implements ClaudeSdkQuery {
     }
     const controller = new AbortController();
     this.#callbackControllers.set(callbackId, controller);
+    if (frame.callback === "hook") this.#hookCallbackIds.add(callbackId);
     try {
       if (frame.callback === "canUseTool") {
         const value = callbackRequest(frame.value);
@@ -864,19 +874,44 @@ class RemoteClaudeQuery implements ClaudeSdkQuery {
           onDecline: () => { declined = true; }
         });
         await channel.sendCallback(callbackId, true, { value, declined });
+      } else if (frame.callback === "hook") {
+        const request = hookCallbackRequest(frame.value, this.#options.params.options);
+        const result = await request.callback(request.input, request.toolUseId, { signal: controller.signal });
+        if (!isRecord(result) || encodedBytes(result) > MAXIMUM_HOOK_PAYLOAD_BYTES) {
+          throw runtimeFault("callback_invalid", false);
+        }
+        await channel.sendCallback(callbackId, true, result);
+      } else if (frame.callback === "managedAgentTool"
+        && this.#options.params.options.managedAgentTool !== undefined) {
+        const request = managedAgentCallbackRequest(frame.value);
+        const result = await this.#options.params.options.managedAgentTool(request.input, {
+          toolUseId: request.toolUseId,
+          signal: controller.signal
+        });
+        if (!isRecord(result) || typeof result["text"] !== "string"
+          || Buffer.byteLength(result["text"], "utf8") > MAXIMUM_MANAGED_AGENT_RESULT_BYTES
+          || (result["isError"] !== undefined && typeof result["isError"] !== "boolean")) {
+          throw runtimeFault("callback_invalid", false);
+        }
+        await channel.sendCallback(callbackId, true, result);
       } else {
         await channel.sendCallback(callbackId, false);
       }
     } catch {
+      controller.abort();
       await channel.sendCallback(callbackId, false).catch(() => undefined);
+      if (frame.callback === "hook" && !this.#ended) this.#failProtocol();
     } finally {
       this.#callbackControllers.delete(callbackId);
+      this.#hookCallbackIds.delete(callbackId);
     }
   }
 
   #cancelCallback(callbackId: string): void {
+    const hook = this.#hookCallbackIds.delete(callbackId);
     this.#callbackControllers.get(callbackId)?.abort();
     this.#callbackControllers.delete(callbackId);
+    if (hook && !this.#ended) this.#failProtocol();
   }
 
   #requireAttachment(): string {
@@ -894,6 +929,7 @@ class RemoteClaudeQuery implements ClaudeSdkQuery {
   #cancelCallbacks(): void {
     for (const controller of this.#callbackControllers.values()) controller.abort();
     this.#callbackControllers.clear();
+    this.#hookCallbackIds.clear();
   }
 }
 
@@ -1222,6 +1258,7 @@ function serializeQueryOptions(options: ClaudeSdkQueryOptions): Readonly<Record<
   return {
     additionalDirectories: [...options.additionalDirectories],
     allowDangerouslySkipPermissions: options.allowDangerouslySkipPermissions,
+    ...(options.agent === undefined ? {} : { agent: options.agent }),
     ...(options.agents === undefined ? {} : { agents: { ...options.agents } }),
     cwd: options.cwd,
     env: { ...options.env },
@@ -1229,6 +1266,8 @@ function serializeQueryOptions(options: ClaudeSdkQueryOptions): Readonly<Record<
     ...(options.getOAuthToken === undefined ? {} : { getOAuthToken: true }),
     ...(options.effort === undefined ? {} : { effort: options.effort }),
     ...(options.forwardSubagentText === undefined ? {} : { forwardSubagentText: options.forwardSubagentText }),
+    ...(options.hooks === undefined ? {} : { hooks: serializeHookManifest(options.hooks) }),
+    ...(options.managedAgentTool === undefined ? {} : { managedAgentTool: true }),
     includePartialMessages: true,
     ...(options.disallowedTools === undefined ? {} : { disallowedTools: [...options.disallowedTools] }),
     ...(options.mcpServers === undefined ? {} : { mcpServers: { ...options.mcpServers } }),
@@ -1247,6 +1286,89 @@ function serializeQueryOptions(options: ClaudeSdkQueryOptions): Readonly<Record<
   };
 }
 
+function managedAgentCallbackRequest(value: unknown): {
+  readonly input: ClaudeSdkManagedAgentInput;
+  readonly toolUseId: string;
+} {
+  if (!isRecord(value) || !isRecord(value["input"]) || typeof value["toolUseId"] !== "string"
+    || value["toolUseId"].length === 0 || value["toolUseId"].length > 512
+    || /[\x00-\x1f\x7f]/u.test(value["toolUseId"])
+    || !Object.keys(value).every((key) => key === "input" || key === "toolUseId")
+    || encodedBytes(value) > MAXIMUM_HOOK_PAYLOAD_BYTES) {
+    throw runtimeFault("callback_invalid", false);
+  }
+  const raw = value["input"];
+  const allowedKeys = new Set([
+    "description", "prompt", "subagent_type", "model", "run_in_background",
+    "name", "team_name", "mode", "isolation", "cwd"
+  ]);
+  if (!Object.keys(raw).every((key) => allowedKeys.has(key))
+    || !trimmedString(raw["description"], 1, 512)
+    || typeof raw["prompt"] !== "string" || raw["prompt"].length < 1 || raw["prompt"].length > 1024 * 1024
+    || !optionalTrimmedString(raw["subagent_type"], 1, 256)
+    || !optionalTrimmedString(raw["model"], 1, 512)
+    || (raw["run_in_background"] !== undefined && typeof raw["run_in_background"] !== "boolean")
+    || (raw["name"] !== undefined && (typeof raw["name"] !== "string"
+      || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/u.test(raw["name"])))
+    || !optionalStringWithin(raw["team_name"], 256)
+    || !optionalStringWithin(raw["mode"], 64)
+    || (raw["isolation"] !== undefined && raw["isolation"] !== "worktree" && raw["isolation"] !== "remote")
+    || !optionalStringWithin(raw["cwd"], 16_384)) {
+    throw runtimeFault("callback_invalid", false);
+  }
+  return {
+    input: Object.freeze({ ...raw }) as unknown as ClaudeSdkManagedAgentInput,
+    toolUseId: value["toolUseId"]
+  };
+}
+
+function trimmedString(value: unknown, minimum: number, maximum: number): value is string {
+  return typeof value === "string" && value.length >= minimum && value.length <= maximum && value.trim() === value;
+}
+
+function optionalTrimmedString(value: unknown, minimum: number, maximum: number): boolean {
+  return value === undefined || trimmedString(value, minimum, maximum);
+}
+
+function optionalStringWithin(value: unknown, maximum: number): boolean {
+  return value === undefined || (typeof value === "string" && value.length <= maximum);
+}
+
+function serializeHookManifest(hooks: NonNullable<ClaudeSdkQueryOptions["hooks"]>): Readonly<Record<string, unknown>> {
+  const manifest: Record<string, unknown> = {};
+  let callbacks = 0;
+  for (const [rawEvent, matchers] of Object.entries(hooks)) {
+    if (!REMOTE_HOOK_EVENTS.includes(rawEvent as typeof REMOTE_HOOK_EVENTS[number]) || !Array.isArray(matchers)
+      || matchers.length === 0 || matchers.length > MAXIMUM_CALLBACKS_PER_QUERY) {
+      throw runtimeFault("hook_manifest_invalid", false);
+    }
+    manifest[rawEvent] = matchers.map((matcher) => {
+      if (!isRecord(matcher) || !Array.isArray(matcher.hooks) || matcher.hooks.length === 0
+        || matcher.hooks.some((callback) => typeof callback !== "function")) {
+        throw runtimeFault("hook_manifest_invalid", false);
+      }
+      callbacks += matcher.hooks.length;
+      if (callbacks > MAXIMUM_CALLBACKS_PER_QUERY) throw runtimeFault("hook_manifest_invalid", false);
+      if (matcher.matcher !== undefined && (typeof matcher.matcher !== "string" || matcher.matcher.length === 0
+        || matcher.matcher.length > 512 || /[\x00-\x1f\x7f]/u.test(matcher.matcher))) {
+        throw runtimeFault("hook_manifest_invalid", false);
+      }
+      if (matcher.timeout !== undefined && (!Number.isSafeInteger(matcher.timeout) || matcher.timeout < 1 || matcher.timeout > 3_600)) {
+        throw runtimeFault("hook_manifest_invalid", false);
+      }
+      return {
+        ...(matcher.matcher === undefined ? {} : { matcher: matcher.matcher }),
+        hookCount: matcher.hooks.length,
+        ...(matcher.timeout === undefined ? {} : { timeout: matcher.timeout })
+      };
+    });
+  }
+  if (callbacks === 0 || encodedBytes(manifest) > MAXIMUM_HOOK_PAYLOAD_BYTES) {
+    throw runtimeFault("hook_manifest_invalid", false);
+  }
+  return manifest;
+}
+
 function callbackRequest(value: unknown): {
   readonly toolName: string;
   readonly input: Readonly<Record<string, unknown>>;
@@ -1262,6 +1384,44 @@ function callbackRequest(value: unknown): {
     input: value.input,
     options: options as unknown as Omit<ClaudeCanUseToolOptions, "signal">
   };
+}
+
+function hookCallbackRequest(
+  value: unknown,
+  options: ClaudeSdkQueryOptions
+): {
+  readonly callback: (
+    input: ClaudeSdkHookInput,
+    toolUseId: string | undefined,
+    options: { readonly signal: AbortSignal }
+  ) => Promise<ClaudeSdkHookOutput>;
+  readonly input: ClaudeSdkHookInput;
+  readonly toolUseId: string | undefined;
+} {
+  if (!isRecord(value) || typeof value.event !== "string"
+    || !REMOTE_HOOK_EVENTS.includes(value.event as typeof REMOTE_HOOK_EVENTS[number])
+    || !Number.isSafeInteger(value.matcherIndex) || !Number.isSafeInteger(value.hookIndex)
+    || (value.matcherIndex as number) < 0 || (value.hookIndex as number) < 0
+    || !isRecord(value.input) || value.input.hook_event_name !== value.event
+    || encodedBytes(value) > MAXIMUM_HOOK_PAYLOAD_BYTES
+    || (value.toolUseId !== undefined && (typeof value.toolUseId !== "string" || value.toolUseId.length === 0
+      || value.toolUseId.length > 512 || /[\x00-\x1f\x7f]/u.test(value.toolUseId)))) {
+    throw runtimeFault("callback_invalid", false);
+  }
+  const event = value.event as ClaudeSdkHookEvent;
+  const matcher = options.hooks?.[event]?.[value.matcherIndex as number];
+  const callback = matcher?.hooks[value.hookIndex as number];
+  if (callback === undefined) throw runtimeFault("callback_invalid", false);
+  return {
+    callback,
+    input: value.input as unknown as ClaudeSdkHookInput,
+    toolUseId: value.toolUseId as string | undefined
+  };
+}
+
+function encodedBytes(value: unknown): number {
+  try { return Buffer.byteLength(JSON.stringify(value), "utf8"); }
+  catch { return Number.POSITIVE_INFINITY; }
 }
 
 function sessionInfo(value: unknown): ClaudeSdkSessionInfo {

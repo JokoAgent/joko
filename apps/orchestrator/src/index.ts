@@ -1,6 +1,7 @@
 export * from "./application.js";
 export * from "./auxiliary-text-routing.js";
 export * from "./subagent-model-settings.js";
+export * from "./deferred-backend-restart.js";
 export * from "./personalization-inference.js";
 export * from "./session-navigation-coordinator.js";
 export * from "./backend-instance-registry.js";

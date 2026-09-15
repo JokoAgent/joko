@@ -1,7 +1,10 @@
 import { create } from "@bufbuild/protobuf";
 import type { Transport } from "@connectrpc/connect";
 import {
+  BackendMemoryKind,
+  CapabilitySupport,
   GetSnapshotResponseSchema,
+  MemoryResetResultSchema,
   MemoryResetScope,
   OperationState,
   SnapshotSchema,
@@ -9,9 +12,64 @@ import {
 } from "@joko/contracts";
 import { describe, expect, it, vi } from "vitest";
 
-import { createOrchestratorGateway } from "./gateway.js";
+import { createOrchestratorGateway, mapSnapshot } from "./gateway.js";
 
 describe("OrchestratorGateway Memory reset scopes", () => {
+  it("preserves the typed Backend memory role and reset authority", () => {
+    const projected = mapSnapshot(create(SnapshotSchema, {
+      settings: {
+        auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" },
+        agentResource: {},
+        collaboration: {},
+        gitSafety: {},
+        memory: {
+          makerEnabled: false,
+          makerSupport: CapabilitySupport.SUPPORTED,
+          backends: [{
+            backendId: "claude-code",
+            enabled: true,
+            support: CapabilitySupport.SUPPORTED,
+            kind: BackendMemoryKind.NATIVE_AUTO_MEMORY,
+            resettable: false,
+            updatesActiveLocalSessions: true
+          }]
+        }
+      }
+    }));
+
+    expect(projected.settings.memory.backends).toEqual([{
+      backendId: "claude-code",
+      enabled: true,
+      supported: true,
+      reason: "",
+      kind: "native_auto_memory",
+      resettable: false,
+      updatesActiveLocalSessions: true
+    }]);
+  });
+
+  it("preserves an explicit zero native-memory count without inventing one when status is absent", () => {
+    const settings = (entryCount?: bigint) => mapSnapshot(create(SnapshotSchema, {
+      settings: {
+        auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" },
+        agentResource: {},
+        collaboration: {},
+        gitSafety: {},
+        memory: {
+          backends: [{
+            backendId: "claude-code",
+            support: CapabilitySupport.SUPPORTED,
+            kind: BackendMemoryKind.NATIVE_AUTO_MEMORY,
+            ...(entryCount === undefined ? {} : { entryCount })
+          }]
+        }
+      }
+    })).settings.memory.backends[0];
+
+    expect(settings()).not.toHaveProperty("entryCount");
+    expect(settings(0n)).toHaveProperty("entryCount", 0);
+  });
+
   it("sends distinct CURATED and capability-owned BACKEND mutations", async () => {
     const mutations: any[] = [];
     const gateway = createOrchestratorGateway(
@@ -20,6 +78,7 @@ describe("OrchestratorGateway Memory reset scopes", () => {
       {},
       () => transport((method, input) => {
         mutations.push(input.mutation.payload.value);
+        const nativeReset = mutations.length === 3;
         return response(method, create(SubmitOperationResponseSchema, {
           operation: {
             operationId: input.operationId,
@@ -28,7 +87,9 @@ describe("OrchestratorGateway Memory reset scopes", () => {
             result: {
               payload: {
                 case: "memoryReset",
-                value: { removedEntries: 2n, removedTargets: 1n }
+                value: create(MemoryResetResultSchema, nativeReset
+                  ? {}
+                  : { removedEntries: 2n, removedTargets: 1n })
               }
             }
           }
@@ -39,9 +100,11 @@ describe("OrchestratorGateway Memory reset scopes", () => {
 
     await expect(gateway.resetMemory("curated")).resolves.toEqual({ removedEntries: 2, removedTargets: 1 });
     await expect(gateway.resetMemory("backend", "memory-capable")).resolves.toEqual({ removedEntries: 2, removedTargets: 1 });
+    await expect(gateway.resetMemory("backend", "codex")).resolves.toEqual({});
     expect(mutations).toMatchObject([
       { scope: MemoryResetScope.CURATED, backendId: "" },
-      { scope: MemoryResetScope.BACKEND, backendId: "memory-capable" }
+      { scope: MemoryResetScope.BACKEND, backendId: "memory-capable" },
+      { scope: MemoryResetScope.BACKEND, backendId: "codex" }
     ]);
     gateway.disconnect();
   });

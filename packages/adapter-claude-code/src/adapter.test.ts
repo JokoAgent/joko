@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -53,15 +53,135 @@ describe("ClaudeCodeAdapter", () => {
     const adapter = adapterFor(runtime, { managedProviders: managed.port });
     expect((await adapter.describe()).models.find((model) => model.providerId === "configured-provider")!.thinkingLevels).toEqual(["high"]);
     const binding = await adapter.createSession(createInput({ providerId: "configured-provider", modelId: "configured-model", effort: "high" }), contextFor().context);
-    expect(runtime.queries[0]!.params.options.effort).toBe("xhigh");
+    expect(runtime.queries[0]!.params.options.effort).toBeUndefined();
+    expect(runtime.queries[0]!.params.options.settings).toMatchObject({
+      modelOverrides: {},
+      modelSettings: {
+        "configured-model": { effortLevel: "xhigh" },
+        "compatible-model": { effortLevel: "xhigh" },
+        "second-model": { effortLevel: "xhigh" },
+        "incompatible-thinking": { effortLevel: "xhigh" }
+      }
+    });
     const source = contextFor(binding, { operationId: "mapped-effort" });
     const context = { ...source.context, modelSelection: { providerId: "configured-provider", modelId: "configured-model" } };
     await expect(adapter.setEffort("low", context)).rejects.toThrow();
     expect(runtime.queries[0]!.settingCalls).toEqual([]);
     await adapter.setEffort("high", context);
-    expect(runtime.queries[0]!.settingCalls).toEqual([{ effortLevel: "xhigh" }]);
+    expect(runtime.queries).toHaveLength(1);
+    expect(runtime.queries[0]!.settingCalls).toEqual([]);
     await adapter.send(textPrompt("mapped effort"), context);
     expect((await adapter.inspectSession(binding, context)).effort).toBe("high");
+    await adapter.dispose();
+  });
+
+  test.each([
+    { label: "persisted local", remote: false, fresh: false },
+    { label: "fresh remote", remote: true, fresh: true }
+  ])("restarts the exact $label managed Query when effort changes", async ({ remote, fresh }) => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime();
+    const selectedTarget: TargetDescriptor = remote
+      ? {
+          ...target,
+          id: "target-remote-managed-effort",
+          workspaceRoot: "D:\\service-owned-placeholder",
+          remoteWorkspace: { hostId: "host-effort", workspaceRoot: "/srv/effort" }
+        }
+      : target;
+    const adapter = adapterFor(remote ? new FakeSdkRuntime() : runtime, {
+      managedProviders: managed.port,
+      ...(remote
+        ? {
+            remoteRuntimes: {
+              resolve: async () => ({
+                runtime,
+                workspaceRoot: "/srv/effort",
+                remote: true,
+                assertCurrent: () => undefined
+              }),
+              close: async () => undefined
+            }
+          }
+        : {})
+    });
+    const binding = await adapter.createSession(createInput({
+      target: selectedTarget,
+      providerId: "configured-provider",
+      modelId: "configured-model",
+      effort: "low"
+    }), contextFor(undefined, { target: selectedTarget }).context);
+    if (fresh) runtime.sessions.clear();
+    const context = contextFor(binding, { target: selectedTarget }).context;
+    await adapter.setEffort("high", context);
+    expect(runtime.queries).toHaveLength(2);
+    expect(runtime.queries[0]!.closeCalls).toBe(1);
+    expect(runtime.queries[0]!.settingCalls).toEqual([]);
+    expect(runtime.retiredQueries).toEqual([runtime.queries[0]]);
+    expect(runtime.queries[1]!.params.options).toMatchObject({
+      model: "configured-model",
+      settings: {
+        modelOverrides: {},
+        modelSettings: {
+          "configured-model": { effortLevel: "high" },
+          "compatible-model": { effortLevel: "high" },
+          "incompatible-thinking": { effortLevel: "high" }
+        }
+      }
+    });
+    expect(runtime.queries[1]!.params.options.effort).toBeUndefined();
+    expect(runtime.queries[1]!.params.options[fresh ? "sessionId" : "resume"]).toBe(binding.nativeSessionId);
+    expect(runtime.queries[1]!.params.options[fresh ? "resume" : "sessionId"]).toBeUndefined();
+    expect((await adapter.inspectSession(binding, context)).effort).toBe("high");
+    await adapter.dispose();
+  });
+
+  test("falls back to the native subtask default and rejects an explicit model whose selected effort is disabled", async () => {
+    const managed = managedProviderFixture({}, { "compatible-model": { high: null } });
+    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "configured-model", effort: "high" } });
+    const adapter = adapterFor(runtime, {
+      managedProviders: managed.port,
+      resolveSubagentModel: () => "compatible-model"
+    });
+    const binding = await adapter.createSession(createInput({
+      providerId: "configured-provider",
+      modelId: "configured-model",
+      effort: "high"
+    }), contextFor().context);
+    expect(runtime.queries[0]!.params.options.env["CLAUDE_CODE_SUBAGENT_MODEL"]).toBeUndefined();
+    expect(runtime.queries[0]!.params.options.settings?.modelSettings).not.toHaveProperty("compatible-model");
+    const active = contextFor(binding, { operationId: "disabled-child-effort" });
+    await adapter.send(textPrompt("delegate only if exact"), {
+      ...active.context,
+      modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+    });
+    const delegate = runtime.queries[0]!.params.options.managedAgentTool;
+    if (delegate === undefined) throw new Error("Expected the managed Agent replacement.");
+    await expect(delegate({
+      description: "Disabled exact effort",
+      prompt: "Run only on the selected model.",
+      subagent_type: "general-purpose",
+      model: "compatible-model"
+    }, { toolUseId: "disabled-child", signal: new AbortController().signal }))
+      .resolves.toMatchObject({ isError: true });
+    expect(managed.subtaskActivations).toHaveLength(0);
+    expect(runtime.queries).toHaveLength(1);
+    await adapter.dispose();
+  });
+
+  test("uses the public Query-global effort only when per-model settings cannot express the parent mapping", async () => {
+    const managed = managedProviderFixture({ high: "max" });
+    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "configured-model", effort: "max" } });
+    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    const binding = await adapter.createSession(createInput({
+      providerId: "configured-provider",
+      modelId: "configured-model",
+      effort: "high"
+    }), contextFor().context);
+    expect(runtime.queries[0]!.params.options.effort).toBe("max");
+    expect(runtime.queries[0]!.params.options.settings?.modelSettings).toBeUndefined();
+    expect(runtime.queries[0]!.params.options.settings).toMatchObject({ modelOverrides: {} });
+    await adapter.closeSession(binding, contextFor(binding).context);
     await adapter.dispose();
   });
 
@@ -93,14 +213,29 @@ describe("ClaudeCodeAdapter", () => {
     const descriptor = await adapter.describe();
     expect(descriptor.models.find((model) => model.providerId === "configured-provider")).toMatchObject({ modelId: "configured-model", supportsImages: true,
       supportsFastMode: false, thinkingLevels: ["low", "high"] });
-    expect(descriptor.providerRuntimeSupport).toEqual({ protocols: ["anthropic-messages"], fields: ["headers", "model_input_modalities"] });
+    expect(descriptor.providerRuntimeSupport).toEqual({ protocols: ["anthropic-messages"], fields: ["headers", "model_input_modalities", "model_limits"] });
     const binding = await adapter.createSession(createInput({ providerId: "configured-provider", modelId: "configured-model" }), contextFor().context);
     const options = runtime.queries[0]!.params.options;
     expect(options.env["ANTHROPIC_API_KEY"]).toBe(managed.token);
     expect(options.env["JOKO_MODEL_PROXY_TOKEN"]).toBeUndefined();
     expect(options.env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"]).toBe("1");
+    expect(options.env["CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"]).toBe("1");
     expect(options.env["ANTHROPIC_BASE_URL"]).toBe("http://127.0.0.1:31415/routes/fixture");
-    expect(options.settingSources).toEqual([]);
+    expect(options.env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"]).toBe("64000");
+    expect(options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]).toBe("64000");
+    expect(options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"]).toBe("57.6");
+    expect(options.env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"]).toBe("4000");
+    expect(options.settingSources).toEqual(["user", "project", "local"]);
+    expect(options.settings).toMatchObject({
+      apiKeyHelper: "",
+      env: {
+        CLAUDE_CODE_MAX_CONTEXT_TOKENS: "64000",
+        CLAUDE_CODE_AUTO_COMPACT_WINDOW: "64000",
+        CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: "57.6",
+        CLAUDE_CODE_MAX_OUTPUT_TOKENS: "4000"
+      },
+      fastMode: false
+    });
     expect(JSON.stringify(options.settings)).not.toContain(managed.token);
     expect(managed.activations).toHaveLength(0);
     const source = contextFor(binding, { operationId: "managed-first-turn" });
@@ -111,12 +246,570 @@ describe("ClaudeCodeAdapter", () => {
     expect(() => managed.activations[0]!.input.assertCurrent()).not.toThrow();
     runtime.queries[0]!.push(resultMessage(binding.nativeSessionId!, { result: `Output ${managed.token}`, totalCostUsd: 0 }));
     await eventually(() => source.events.some((event) => event.type === "done"));
+    expect(source.events.filter((event): event is Extract<EventPayload, { type: "usage" }> => event.type === "usage").at(-1)?.usage.contextWindow)
+      .toBe(64_000);
     expect(managed.activations[0]!.release).toHaveBeenCalledOnce();
     expect(() => managed.activations[0]!.input.assertCurrent()).toThrow();
     expect(JSON.stringify(source.events)).not.toContain(managed.token);
     expect(JSON.stringify(descriptor)).not.toContain(managed.token);
     await adapter.dispose();
     expect(managed.port.dispose).toHaveBeenCalledOnce();
+  });
+
+  test("runs a foreground managed Agent in an independently configured exact child Query", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime({
+      initialPermissionMode: "bypassPermissions",
+      initialFrameOverrides: { model: "configured-model", effort: "low" }
+    });
+    const adapter = adapterFor(runtime, {
+      managedProviders: managed.port,
+      resolveSubagentModel: () => "compatible-model",
+      resolveNativeMemoryEnabled: () => false
+    });
+    try {
+      const binding = await adapter.createSession(createInput({
+        providerId: "configured-provider",
+        modelId: "configured-model",
+        effort: "low",
+        permissionMode: "bypassPermissions"
+      }), contextFor().context);
+      const active = contextFor(binding, { operationId: "managed-subtask-turn" });
+      await adapter.send(textPrompt("delegate exactly"), {
+        ...active.context,
+        modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+      });
+      const parent = runtime.queries[0]!;
+      const delegate = parent.params.options.managedAgentTool;
+      if (delegate === undefined) throw new Error("Expected the managed Agent replacement.");
+      const delegated = delegate({
+        description: "Inspect exact child route",
+        prompt: "Return the exact child result.",
+        subagent_type: "general-purpose"
+      }, { toolUseId: "agent-default", signal: new AbortController().signal });
+      await vi.waitFor(() => expect(runtime.queries).toHaveLength(2));
+      const child = runtime.queries[1]!;
+      expect(managed.subtaskActivations).toHaveLength(1);
+      expect(managed.subtaskActivations[0]!.input).toMatchObject({
+        operationId: "managed-subtask-turn",
+        requestId: "agent-default",
+        modelId: "compatible-model"
+      });
+      expect(child.params.options).toMatchObject({
+        agent: "general-purpose",
+        model: "compatible-model",
+        effort: "low",
+        cwd: target.workspaceRoot,
+        permissionMode: "bypassPermissions",
+        persistSession: false,
+        env: {
+          CLAUDE_CODE_MAX_CONTEXT_TOKENS: "64000",
+          CLAUDE_CODE_AUTO_COMPACT_WINDOW: "64000",
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: "4000"
+        },
+        settings: {
+          apiKeyHelper: "",
+          modelOverrides: {},
+          modelSettings: {
+            "configured-model": { effortLevel: "low" },
+            "compatible-model": { effortLevel: "low" },
+            "incompatible-thinking": { effortLevel: "medium" },
+            "second-model": { effortLevel: "low" }
+          },
+          autoMemoryEnabled: false,
+          autoDreamEnabled: false,
+          fastMode: false,
+          env: {
+            CLAUDE_CODE_MAX_CONTEXT_TOKENS: "64000",
+            CLAUDE_CODE_AUTO_COMPACT_WINDOW: "64000",
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: "4000"
+          }
+        }
+      });
+      expect(child.params.options.sessionId).not.toBe(binding.nativeSessionId);
+      expect(child.params.options.resume).toBeUndefined();
+      expect(child.receivedInputs).toEqual([expect.objectContaining({
+        message: { role: "user", content: "Return the exact child result." },
+        origin: expect.objectContaining({ kind: "peer", from: binding.nativeSessionId })
+      })]);
+      const childAnswer = assistantMessage(child.params.options.sessionId!, "child-answer", [{
+        type: "text",
+        text: "Exact child completed."
+      }]);
+      child.push({ ...childAnswer, message: { ...childAnswer.message, model: "compatible-model" } });
+      child.push(resultMessage(child.params.options.sessionId!, { result: "Exact child completed.", totalCostUsd: 0 }));
+      await expect(delegated).resolves.toEqual({ text: "Exact child completed." });
+      expect(managed.subtaskActivations[0]!.release).toHaveBeenCalledOnce();
+      expect(parent.settingCalls).toEqual([]);
+      expect(active.events).toContainEqual(expect.objectContaining({
+        type: "subagent_run",
+        run: expect.objectContaining({ state: "completed", route: { providerId: "claude-code", modelId: "compatible-model" } })
+      }));
+      parent.push(resultMessage(binding.nativeSessionId!, { result: "Parent completed.", totalCostUsd: 0 }));
+      await eventually(() => active.events.some((event) => event.type === "done"));
+      expect(managed.activations[0]!.release).toHaveBeenCalledOnce();
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
+  test("continues the parent from a host-owned background child notification with different exact limits", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "configured-model", effort: "low" } });
+    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    try {
+      const binding = await adapter.createSession(createInput({
+        providerId: "configured-provider",
+        modelId: "configured-model",
+        effort: "low"
+      }), contextFor().context);
+      const active = contextFor(binding, { operationId: "managed-context-turn" });
+      await adapter.send(textPrompt("delegate with different windows"), {
+        ...active.context,
+        modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+      });
+      const parent = runtime.queries[0]!;
+      const delegate = parent.params.options.managedAgentTool;
+      if (delegate === undefined) throw new Error("Expected the managed Agent replacement.");
+      const launched = delegate({
+        description: "Different limit background child",
+        prompt: "Finish in the background.",
+        subagent_type: "general-purpose",
+        model: "second-model",
+        run_in_background: true
+      }, { toolUseId: "large-background", signal: new AbortController().signal });
+      await vi.waitFor(() => expect(runtime.queries).toHaveLength(2));
+      const child = runtime.queries[1]!;
+      await expect(launched).resolves.toMatchObject({ text: expect.stringContaining("managed-agent-") });
+      expect(child.params.options).toMatchObject({
+        model: "second-model",
+        effort: "low",
+        persistSession: false,
+        env: {
+          CLAUDE_CODE_MAX_CONTEXT_TOKENS: "128000",
+          CLAUDE_CODE_AUTO_COMPACT_WINDOW: "128000",
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: "8000"
+        }
+      });
+      expect(parent.settingCalls).toEqual([]);
+      child.push(assistantMessage(child.params.options.sessionId!, "background-answer", [{
+        type: "text",
+        text: "Background exact child completed."
+      }]));
+      child.push(resultMessage(child.params.options.sessionId!, {
+        result: "Background exact child completed.",
+        totalCostUsd: 0
+      }));
+      await vi.waitFor(() => expect(managed.subtaskActivations[0]!.release).toHaveBeenCalledOnce());
+      parent.push(resultMessage(binding.nativeSessionId!, { result: "Background launch accepted.", totalCostUsd: 0 }));
+      await vi.waitFor(() => expect(parent.receivedInputs).toHaveLength(2));
+      expect(parent.receivedInputs[1]).toMatchObject({
+        origin: { kind: "task-notification" },
+        message: { role: "user", content: expect.stringContaining("Background exact child completed.") }
+      });
+      expect(active.events.some((event) => event.type === "done")).toBe(false);
+      parent.push(assistantMessage(binding.nativeSessionId!, "managed-continuation", [{
+        type: "text",
+        text: "Managed continuation completed."
+      }]));
+      parent.push({
+        ...resultMessage(binding.nativeSessionId!, { result: "Managed continuation completed.", totalCostUsd: 0 }),
+        origin: null
+      });
+      await eventually(() => active.events.some((event) => event.type === "done"));
+      expect(active.events.at(-1)).toEqual({ type: "done", outcome: "completed" });
+      expect(managed.activations[0]!.release).toHaveBeenCalledOnce();
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
+  test("serializes completed background child notifications across automatic continuation segments", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "configured-model", effort: "low" } });
+    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    try {
+      const binding = await adapter.createSession(createInput({
+        providerId: "configured-provider",
+        modelId: "configured-model",
+        effort: "low"
+      }), contextFor().context);
+      const active = contextFor(binding, { operationId: "serialized-managed-notifications" });
+      await adapter.send(textPrompt("delegate two background children"), {
+        ...active.context,
+        modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+      });
+      const parent = runtime.queries[0]!;
+      const delegate = parent.params.options.managedAgentTool;
+      if (delegate === undefined) throw new Error("Expected the managed Agent replacement.");
+      const firstLaunch = delegate({
+        description: "First background child",
+        prompt: "Finish first.",
+        subagent_type: "general-purpose",
+        model: "second-model",
+        run_in_background: true
+      }, { toolUseId: "first-background-child", signal: new AbortController().signal });
+      const secondLaunch = delegate({
+        description: "Second background child",
+        prompt: "Finish second.",
+        subagent_type: "general-purpose",
+        model: "second-model",
+        run_in_background: true
+      }, { toolUseId: "second-background-child", signal: new AbortController().signal });
+      await vi.waitFor(() => expect(runtime.queries).toHaveLength(3));
+      await expect(Promise.all([firstLaunch, secondLaunch])).resolves.toEqual([
+        expect.objectContaining({ text: expect.stringContaining("managed-agent-") }),
+        expect.objectContaining({ text: expect.stringContaining("managed-agent-") })
+      ]);
+      const firstChild = runtime.queries[1]!;
+      const secondChild = runtime.queries[2]!;
+
+      parent.push(resultMessage(binding.nativeSessionId!, {
+        result: "Both background launches accepted.",
+        totalCostUsd: 0
+      }));
+      firstChild.push(assistantMessage(firstChild.params.options.sessionId!, "first-background-answer", [{
+        type: "text",
+        text: "First background child completed."
+      }]));
+      firstChild.push(resultMessage(firstChild.params.options.sessionId!, {
+        result: "First background child completed.",
+        totalCostUsd: 0
+      }));
+      await vi.waitFor(() => expect(parent.receivedInputs).toHaveLength(2));
+
+      secondChild.push(assistantMessage(secondChild.params.options.sessionId!, "second-background-answer", [{
+        type: "text",
+        text: "Second background child completed."
+      }]));
+      secondChild.push(resultMessage(secondChild.params.options.sessionId!, {
+        result: "Second background child completed.",
+        totalCostUsd: 0
+      }));
+      await vi.waitFor(() => expect(managed.subtaskActivations.every((activation) =>
+        activation.release.mock.calls.length === 1)).toBe(true));
+      await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+      expect(parent.receivedInputs).toHaveLength(2);
+      expect(parent.receivedInputs[1]).toMatchObject({
+        origin: { kind: "task-notification" },
+        message: { role: "user", content: expect.stringContaining("First background child completed.") }
+      });
+
+      parent.push(assistantMessage(binding.nativeSessionId!, "first-managed-continuation", [{
+        type: "text",
+        text: "First managed continuation completed."
+      }]));
+      parent.push({
+        ...resultMessage(binding.nativeSessionId!, { result: "First managed continuation completed.", totalCostUsd: 0 }),
+        origin: null
+      });
+      await vi.waitFor(() => expect(parent.receivedInputs).toHaveLength(3));
+      expect(parent.receivedInputs[2]).toMatchObject({
+        origin: { kind: "task-notification" },
+        message: { role: "user", content: expect.stringContaining("Second background child completed.") }
+      });
+      expect(active.events.some((event) => event.type === "done")).toBe(false);
+
+      parent.push(assistantMessage(binding.nativeSessionId!, "second-managed-continuation", [{
+        type: "text",
+        text: "All managed continuations completed."
+      }]));
+      parent.push({
+        ...resultMessage(binding.nativeSessionId!, { result: "All managed continuations completed.", totalCostUsd: 0 }),
+        origin: null
+      });
+      await eventually(() => active.events.some((event) => event.type === "done"));
+      expect(active.events.at(-1)).toEqual({ type: "done", outcome: "completed" });
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
+  test("fails a child whose exact Query cannot start while keeping the parent Query authoritative", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "configured-model", effort: "low" } });
+    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    try {
+      const binding = await adapter.createSession(createInput({
+        providerId: "configured-provider", modelId: "configured-model", effort: "low"
+      }), contextFor().context);
+      const active = contextFor(binding, { operationId: "managed-child-start-failure" });
+      await adapter.send(textPrompt("delegate"), {
+        ...active.context,
+        modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+      });
+      const query = runtime.queries[0]!;
+      const delegate = query.params.options.managedAgentTool;
+      if (delegate === undefined) throw new Error("Expected the managed Agent replacement.");
+      runtime.queryFailure = new Error("child process did not start");
+      await expect(delegate({
+        description: "Child startup failure",
+        prompt: "Do not fall back.",
+        subagent_type: "general-purpose",
+        model: "second-model"
+      }, { toolUseId: "failed-child-start", signal: new AbortController().signal }))
+        .resolves.toMatchObject({ isError: true, text: expect.stringContaining("startup") });
+      expect(managed.subtaskActivations[0]!.release).toHaveBeenCalledOnce();
+      expect(query.closeCalls).toBe(0);
+      expect(active.events).toContainEqual(expect.objectContaining({
+        type: "subagent_run",
+        run: expect.objectContaining({ state: "failed" })
+      }));
+      runtime.queryFailure = undefined;
+      query.push(resultMessage(binding.nativeSessionId!, { result: "Parent recovered.", totalCostUsd: 0 }));
+      await eventually(() => active.events.some((event) => event.type === "done"));
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
+  test("rejects a managed child Result that retains unowned queued input", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "configured-model", effort: "low" } });
+    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    try {
+      const binding = await adapter.createSession(createInput({
+        providerId: "configured-provider", modelId: "configured-model", effort: "low"
+      }), contextFor().context);
+      const active = contextFor(binding, { operationId: "managed-child-queued-result" });
+      await adapter.send(textPrompt("delegate"), {
+        ...active.context,
+        modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+      });
+      const parent = runtime.queries[0]!;
+      const delegate = parent.params.options.managedAgentTool;
+      if (delegate === undefined) throw new Error("Expected the managed Agent replacement.");
+      const delegated = delegate({
+        description: "Queued child result",
+        prompt: "Return only for this prompt.",
+        subagent_type: "general-purpose",
+        model: "second-model"
+      }, { toolUseId: "queued-child-result", signal: new AbortController().signal });
+      await vi.waitFor(() => expect(runtime.queries).toHaveLength(2));
+      const child = runtime.queries[1]!;
+      child.push({
+        ...resultMessage(child.params.options.sessionId!, { result: "Unowned continuation.", totalCostUsd: 0 }),
+        queued_turn_count: 1
+      });
+      await expect(delegated).resolves.toMatchObject({
+        isError: true,
+        text: expect.stringContaining("authoritative Result")
+      });
+      expect(managed.subtaskActivations[0]!.release).toHaveBeenCalledOnce();
+      expect(parent.closeCalls).toBe(0);
+      expect(active.events).toContainEqual(expect.objectContaining({
+        type: "subagent_run",
+        run: expect.objectContaining({ state: "failed" })
+      }));
+      parent.push(resultMessage(binding.nativeSessionId!, { result: "Parent completed.", totalCostUsd: 0 }));
+      await eventually(() => active.events.some((event) => event.type === "done"));
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
+  test("bounds a managed child tool result by UTF-8 bytes without splitting text", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "configured-model", effort: "low" } });
+    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    try {
+      const binding = await adapter.createSession(createInput({
+        providerId: "configured-provider", modelId: "configured-model", effort: "low"
+      }), contextFor().context);
+      const active = contextFor(binding, { operationId: "managed-child-utf8-result" });
+      await adapter.send(textPrompt("delegate"), {
+        ...active.context,
+        modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+      });
+      const parent = runtime.queries[0]!;
+      const delegate = parent.params.options.managedAgentTool;
+      if (delegate === undefined) throw new Error("Expected the managed Agent replacement.");
+      const delegated = delegate({
+        description: "Bound UTF-8 result",
+        prompt: "Return bounded Unicode.",
+        model: "second-model"
+      }, { toolUseId: "bounded-unicode-child", signal: new AbortController().signal });
+      await vi.waitFor(() => expect(runtime.queries).toHaveLength(2));
+      const child = runtime.queries[1]!;
+      child.push(resultMessage(child.params.options.sessionId!, {
+        result: "🙂".repeat(20_000),
+        totalCostUsd: 0
+      }));
+      const result = await delegated;
+      expect(result.isError).toBeUndefined();
+      expect(Buffer.byteLength(result.text, "utf8")).toBeLessThanOrEqual(64 * 1024);
+      expect(result.text.endsWith("🙂")).toBe(true);
+      expect(result.text).not.toContain("�");
+      parent.push(resultMessage(binding.nativeSessionId!, { result: "Parent completed.", totalCostUsd: 0 }));
+      await eventually(() => active.events.some((event) => event.type === "done"));
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
+  test("cancels a background managed child whose independent Query never confirms startup", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime({
+      autoReplayInputs: false,
+      initialFrameOverrides: { model: "configured-model", effort: "low" }
+    });
+    const adapter = adapterFor(runtime, { managedProviders: managed.port, initializationTimeoutMs: 25 });
+    try {
+      const binding = await adapter.createSession(createInput({
+        providerId: "configured-provider", modelId: "configured-model", effort: "low"
+      }), contextFor().context);
+      const active = contextFor(binding, { operationId: "managed-child-start-timeout" });
+      await adapter.send(textPrompt("delegate"), {
+        ...active.context,
+        modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+      });
+      const parent = runtime.queries[0]!;
+      const delegate = parent.params.options.managedAgentTool;
+      if (delegate === undefined) throw new Error("Expected the managed Agent replacement.");
+      runtime.admitTurns = false;
+      await expect(delegate({
+        description: "Unconfirmed background child",
+        prompt: "Do not outlive startup acknowledgement.",
+        subagent_type: "general-purpose",
+        model: "second-model",
+        run_in_background: true
+      }, { toolUseId: "unconfirmed-background-child", signal: new AbortController().signal }))
+        .resolves.toMatchObject({ isError: true, text: expect.stringContaining("startup") });
+      await vi.waitFor(() => expect(managed.subtaskActivations[0]!.release).toHaveBeenCalledOnce());
+      expect(runtime.queries[1]!.closeCalls).toBeGreaterThanOrEqual(1);
+      expect(active.events).toContainEqual(expect.objectContaining({
+        type: "subagent_run",
+        run: expect.objectContaining({ state: "stopped" })
+      }));
+      parent.push(resultMessage(binding.nativeSessionId!, { result: "Parent completed.", totalCostUsd: 0 }));
+      await eventually(() => active.events.some((event) => event.type === "done"));
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
+  test("deduplicates a repeated managed tool identity and rejects payload or model substitution", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "configured-model", effort: "low" } });
+    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    try {
+      const binding = await adapter.createSession(createInput({
+        providerId: "configured-provider", modelId: "configured-model", effort: "low"
+      }), contextFor().context);
+      const active = contextFor(binding, { operationId: "managed-child-deduplication" });
+      await adapter.send(textPrompt("delegate"), {
+        ...active.context,
+        modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+      });
+      const query = runtime.queries[0]!;
+      const delegate = query.params.options.managedAgentTool;
+      if (delegate === undefined) throw new Error("Expected the managed Agent replacement.");
+      const input = {
+        description: "Stable delegated request",
+        prompt: "Return once.",
+        subagent_type: "general-purpose",
+        model: "second-model"
+      };
+      const first = delegate(input, { toolUseId: "stable-child", signal: new AbortController().signal });
+      const duplicate = delegate(input, { toolUseId: "stable-child", signal: new AbortController().signal });
+      const concurrentSubstitution = delegate({ ...input, prompt: "Changed during admission." }, {
+        toolUseId: "stable-child",
+        signal: new AbortController().signal
+      });
+      await vi.waitFor(() => expect(runtime.queries).toHaveLength(2));
+      await expect(concurrentSubstitution).resolves.toMatchObject({
+        isError: true,
+        text: expect.stringContaining("changed identity")
+      });
+      await expect(delegate({ ...input, model: "compatible-model" }, {
+        toolUseId: "stable-child",
+        signal: new AbortController().signal
+      })).resolves.toMatchObject({ isError: true, text: expect.stringContaining("changed identity") });
+      const child = runtime.queries[1]!;
+      child.push(resultMessage(child.params.options.sessionId!, { result: "Only once.", totalCostUsd: 0 }));
+      await expect(Promise.all([first, duplicate])).resolves.toEqual([{ text: "Only once." }, { text: "Only once." }]);
+      await expect(delegate(input, {
+        toolUseId: "stable-child",
+        signal: new AbortController().signal
+      })).resolves.toEqual({ text: "Only once." });
+      await expect(delegate({ ...input, prompt: "Changed after completion." }, {
+        toolUseId: "stable-child",
+        signal: new AbortController().signal
+      })).resolves.toMatchObject({ isError: true, text: expect.stringContaining("changed identity") });
+      expect(runtime.queries).toHaveLength(2);
+      expect(managed.subtaskActivations).toHaveLength(1);
+      expect(managed.subtaskActivations[0]!.release).toHaveBeenCalledOnce();
+      query.push(resultMessage(binding.nativeSessionId!, { result: "Parent completed.", totalCostUsd: 0 }));
+      await eventually(() => active.events.some((event) => event.type === "done"));
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
+  test("passes managed limits remotely and restarts an unpersisted Query on the same native identity", async () => {
+    const managed = managedProviderFixture();
+    const remoteTarget: TargetDescriptor = {
+      ...target,
+      id: "target-remote-managed-limits",
+      workspaceRoot: "D:\\service-owned-placeholder",
+      remoteWorkspace: { hostId: "host-a", workspaceRoot: "/srv/project" }
+    };
+    const remoteRuntime = new FakeSdkRuntime({ initialFrameOverrides: { cwd: "/srv/project", model: "configured-model" } });
+    const close = vi.fn(async () => undefined);
+    const adapter = adapterFor(new FakeSdkRuntime(), {
+      managedProviders: managed.port,
+      resolveNativeMemoryEnabled: () => false,
+      remoteRuntimes: {
+        resolve: async () => ({
+          runtime: remoteRuntime,
+          workspaceRoot: "/srv/project",
+          remote: true,
+          assertCurrent: () => undefined
+        }),
+        close
+      }
+    });
+    const binding = await adapter.createSession(
+      createInput({ target: remoteTarget, providerId: "configured-provider", modelId: "configured-model" }),
+      contextFor(undefined, { target: remoteTarget }).context
+    );
+    expect(remoteRuntime.queries).toHaveLength(1);
+    expect(remoteRuntime.queries[0]!.params.options).toMatchObject({
+      cwd: "/srv/project",
+      env: {
+        CLAUDE_CODE_MAX_CONTEXT_TOKENS: "64000",
+        CLAUDE_CODE_AUTO_COMPACT_WINDOW: "64000",
+        CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: "57.6",
+        CLAUDE_CODE_MAX_OUTPUT_TOKENS: "4000"
+      },
+      settings: {
+        autoDreamEnabled: false,
+        autoMemoryEnabled: false,
+        env: {
+          CLAUDE_CODE_MAX_CONTEXT_TOKENS: "64000",
+          CLAUDE_CODE_AUTO_COMPACT_WINDOW: "64000",
+          CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: "57.6",
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: "4000"
+        }
+      }
+    });
+    remoteRuntime.sessions.clear();
+    const selected = await adapter.setModel("configured-provider", "second-model", contextFor(binding, { target: remoteTarget }).context);
+    expect(selected.modelId).toBe("second-model");
+    expect(remoteRuntime.queries[0]!.closeCalls).toBe(1);
+    expect(remoteRuntime.retiredQueries).toEqual([remoteRuntime.queries[0]]);
+    expect(remoteRuntime.queries[1]!.params.options).toMatchObject({
+      sessionId: binding.nativeSessionId,
+      model: "second-model",
+      env: {
+        CLAUDE_CODE_MAX_CONTEXT_TOKENS: "128000",
+        CLAUDE_CODE_MAX_OUTPUT_TOKENS: "8000"
+      }
+    });
+    expect(remoteRuntime.queries[1]!.params.options.resume).toBeUndefined();
+    await adapter.closeSession(binding, contextFor(binding, { target: remoteTarget }).context);
+    await adapter.dispose();
+    expect(close).toHaveBeenCalledOnce();
   });
 
   test("revokes the managed HTTP lease as Stop starts while native cancellation confirmation is still pending", async () => {
@@ -133,6 +826,7 @@ describe("ClaudeCodeAdapter", () => {
     expect(managed.activations[0]!.release).toHaveBeenCalledOnce();
     expect(() => managed.activations[0]!.input.assertCurrent()).toThrow();
     expect(source.events.some((event) => event.type === "done")).toBe(false);
+    await vi.waitFor(() => expect(acknowledge).toBeTypeOf("function"));
     acknowledge();
     await stopping;
     runtime.queries[0]!.push(resultMessage(binding.nativeSessionId!, { result: "", totalCostUsd: 0, terminalReason: "aborted_tools" }));
@@ -150,10 +844,18 @@ describe("ClaudeCodeAdapter", () => {
     const restored = await adapter.resumeSession(binding, context);
     expect(restored).toMatchObject({ providerId: "configured-provider", modelId: "configured-model", binding: { generation: 2 } });
     expect(runtime.queries[1]!.params.options).toMatchObject({ resume: binding.nativeSessionId, model: "configured-model" });
+    expect(runtime.queries[1]!.params.options.env).toMatchObject({
+      CLAUDE_CODE_MAX_CONTEXT_TOKENS: "64000",
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: "4000"
+    });
     const selected = await adapter.setModel("configured-provider", "second-model", { ...context, binding: restored.binding });
     expect(selected.modelId).toBe("second-model");
     expect(runtime.queries[1]!.closeCalls).toBe(1);
     expect(runtime.queries[2]!.params.options).toMatchObject({ resume: binding.nativeSessionId, model: "second-model" });
+    expect(runtime.queries[2]!.params.options.env).toMatchObject({
+      CLAUDE_CODE_MAX_CONTEXT_TOKENS: "128000",
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: "8000"
+    });
     expect(managed.activations).toEqual([]);
     await adapter.dispose();
   });
@@ -187,7 +889,12 @@ describe("ClaudeCodeAdapter", () => {
     else await adapter.send(textPrompt("new revision input"), context);
     expect(runtime.queries).toHaveLength(2);
     expect(runtime.queries[0]!.closeCalls).toBe(1);
-    expect(runtime.queries[1]!.params.options).toMatchObject({ resume: binding.nativeSessionId, model: "configured-model", effort: "high" });
+    expect(runtime.queries[1]!.params.options).toMatchObject({
+      resume: binding.nativeSessionId,
+      model: "configured-model",
+      settings: { modelSettings: { "configured-model": { effortLevel: "high" } } }
+    });
+    expect(runtime.queries[1]!.params.options.effort).toBeUndefined();
     expect(runtime.retiredQueries).toEqual([runtime.queries[0]]);
     expect(managed.activations).toHaveLength(action === "selection" ? 0 : 1);
     expect(runtime.queries[0]!.receivedInputs).toEqual([]);
@@ -195,21 +902,305 @@ describe("ClaudeCodeAdapter", () => {
     await adapter.dispose();
   });
 
-  test.each(["missing history", "unknown close"])("does not dispatch a new prompt during route refresh with %s", async (failure) => {
+  test.each(["selection", "input"])("restarts the same fresh native identity before %s when no Session was persisted", async (action) => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "configured-model" } });
+    let nativeMemoryEnabled = false;
+    let subagentModel: string | undefined = "compatible-model";
+    const adapter = adapterFor(runtime, {
+      managedProviders: managed.port,
+      resolveNativeMemoryEnabled: () => nativeMemoryEnabled,
+      resolveSubagentModel: () => subagentModel
+    });
+    const binding = await adapter.createSession(createInput({
+      providerId: "configured-provider", modelId: "configured-model", effort: "high", permissionMode: "auto"
+    }), {
+      ...contextFor().context,
+      extraDirectories: [{ id: "workspace", path: process.cwd(), access: "read_write" }]
+    });
+    const source = contextFor(binding, { operationId: "fresh-route" });
+    const context = { ...source.context, modelSelection: { providerId: "configured-provider", modelId: "configured-model" } };
+    runtime.sessions.clear();
+    managed.revision = "revision-two";
+    nativeMemoryEnabled = true;
+    subagentModel = undefined;
+    if (action === "selection") await adapter.setModel("configured-provider", "configured-model", context);
+    else await adapter.send(textPrompt("first persisted input"), context);
+    expect(runtime.queries).toHaveLength(2);
+    expect(runtime.queries[0]!.closeCalls).toBe(1);
+    expect(runtime.queries[0]!.receivedInputs).toEqual([]);
+    expect(runtime.retiredQueries).toEqual([runtime.queries[0]]);
+    expect(runtime.queries[1]!.params.options).toMatchObject({
+      sessionId: binding.nativeSessionId,
+      model: "configured-model",
+      permissionMode: runtime.queries[0]!.params.options.permissionMode,
+      additionalDirectories: [process.cwd()],
+      settings: {
+        autoMemoryEnabled: true,
+        autoDreamEnabled: true,
+        modelSettings: { "configured-model": { effortLevel: "high" } }
+      }
+    });
+    expect(runtime.queries[1]!.params.options.effort).toBeUndefined();
+    expect(runtime.queries[1]!.params.options.resume).toBeUndefined();
+    expect(runtime.queries[0]!.params.options.env["CLAUDE_CODE_SUBAGENT_MODEL"]).toBe("compatible-model");
+    expect(runtime.queries[1]!.params.options.env["CLAUDE_CODE_SUBAGENT_MODEL"]).toBeUndefined();
+    expect(managed.activations).toHaveLength(action === "selection" ? 0 : 1);
+    if (action === "input") {
+      expect(runtime.queries[1]!.receivedInputs[0]!.message.content).toBe("first persisted input");
+    }
+    await adapter.dispose();
+  });
+
+  test("restarts an unpersisted managed Query on the native provider without changing its identity", async () => {
     const managed = managedProviderFixture();
     const runtime = new FakeSdkRuntime();
     const adapter = adapterFor(runtime, { managedProviders: managed.port });
-    const binding = await adapter.createSession(createInput({ providerId: "configured-provider", modelId: "configured-model" }), contextFor().context);
-    if (failure === "missing history") runtime.sessions.clear();
-    else runtime.retirementFailure = true;
+    const binding = await adapter.createSession(createInput({
+      providerId: "configured-provider", modelId: "configured-model"
+    }), contextFor().context);
+    runtime.sessions.clear();
+    const selected = await adapter.setModel("claude-code", "model-b", contextFor(binding).context);
+    expect(selected).toMatchObject({ providerId: "claude-code", modelId: "model-b" });
+    expect(runtime.queries).toHaveLength(2);
+    expect(runtime.queries[0]!.receivedInputs).toEqual([]);
+    expect(runtime.retiredQueries).toEqual([runtime.queries[0]]);
+    expect(runtime.queries[1]!.params.options).toMatchObject({
+      sessionId: binding.nativeSessionId,
+      model: "model-b"
+    });
+    expect(runtime.queries[1]!.params.options.resume).toBeUndefined();
+    expect(runtime.queries[1]!.params.options.env["CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"]).toBeUndefined();
+    expect(managed.activations).toEqual([]);
+    await adapter.dispose();
+  });
+
+  test("does not treat missing metadata as an empty Session after native input was consumed", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "configured-model" } });
+    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    const binding = await adapter.createSession(createInput({
+      providerId: "configured-provider", modelId: "configured-model"
+    }), contextFor().context);
+    const first = contextFor(binding, { operationId: "persist-before-missing" });
+    await adapter.send(textPrompt("persisted input"), {
+      ...first.context, modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+    });
+    runtime.queries[0]!.push(resultMessage(binding.nativeSessionId!, { result: "done", totalCostUsd: 0 }));
+    await eventually(() => first.events.some((event) => event.type === "done"));
+    await vi.waitFor(async () => {
+      await expect(adapter.inspectSession(binding, contextFor(binding).context))
+        .resolves.toMatchObject({ streaming: false });
+    });
+    runtime.sessions.clear();
     managed.revision = "revision-two";
-    await expect(adapter.send(textPrompt("not sent"), { ...contextFor(binding, { operationId: "failed-revision" }).context,
-      modelSelection: { providerId: "configured-provider", modelId: "configured-model" } }))
-      .rejects.toMatchObject({ publicError: { stateMayHaveChanged: failure === "unknown close" } });
+    await expect(adapter.send(textPrompt("not sent"), {
+      ...contextFor(binding, { operationId: "missing-after-input" }).context,
+      modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+    })).rejects.toMatchObject({ publicError: { stateMayHaveChanged: false } });
+    expect(runtime.queries).toHaveLength(1);
+    expect(runtime.queries[0]!.receivedInputs.map((input) => input.message.content)).toEqual(["persisted input"]);
+    expect(managed.activations).toHaveLength(1);
+    await adapter.dispose();
+  });
+
+  test("does not replace a fresh Query when public Session history is already present", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime();
+    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    const binding = await adapter.createSession(createInput({
+      providerId: "configured-provider", modelId: "configured-model"
+    }), contextFor().context);
+    runtime.sessions.clear();
+    runtime.messages.set(binding.nativeSessionId!, [historyMessage(
+      "user",
+      randomUUID(),
+      binding.nativeSessionId!,
+      { role: "user", content: "history owned by another writer" }
+    )]);
+    managed.revision = "revision-two";
+    await expect(adapter.setModel(
+      "configured-provider",
+      "configured-model",
+      contextFor(binding).context
+    )).rejects.toMatchObject({
+      publicError: { code: "NATIVE_SESSION_CONTINUITY_GAP", stateMayHaveChanged: false }
+    });
+    expect(runtime.queries).toHaveLength(1);
+    expect(runtime.queries[0]!.closeCalls).toBe(0);
+    expect(runtime.messageOptions).toEqual([{
+      sessionId: binding.nativeSessionId,
+      options: expect.objectContaining({ limit: 1, offset: 0, includeSystemMessages: true })
+    }]);
+    await adapter.dispose();
+  });
+
+  test("keeps the fresh Query when public Session history inspection is uncertain", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime();
+    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    const binding = await adapter.createSession(createInput({
+      providerId: "configured-provider", modelId: "configured-model"
+    }), contextFor().context);
+    runtime.sessions.clear();
+    vi.spyOn(runtime, "getSessionMessages").mockRejectedValue(new Error("Native history is unavailable."));
+    managed.revision = "revision-two";
+    await expect(adapter.setModel(
+      "configured-provider",
+      "configured-model",
+      contextFor(binding).context
+    )).rejects.toMatchObject({
+      publicError: { code: "NATIVE_SESSION_INSPECTION_FAILED", stateMayHaveChanged: false }
+    });
+    expect(runtime.queries).toHaveLength(1);
+    expect(runtime.queries[0]!.closeCalls).toBe(0);
+    await adapter.dispose();
+  });
+
+  test("does not treat a resumed Query with missing metadata as a fresh empty Session", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime();
+    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    const binding = await adapter.createSession(createInput({
+      providerId: "configured-provider", modelId: "configured-model"
+    }), contextFor().context);
+    await adapter.closeSession(binding, contextFor(binding).context);
+    const resumedBinding = { ...binding, generation: 2 };
+    const context = {
+      ...contextFor(resumedBinding, { generation: 2 }).context,
+      modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+    };
+    await adapter.resumeSession(binding, context);
+    runtime.sessions.clear();
+    managed.revision = "revision-two";
+    await expect(adapter.setModel("configured-provider", "configured-model", context))
+      .rejects.toMatchObject({
+        publicError: { code: "NATIVE_SESSION_CONTINUITY_GAP", stateMayHaveChanged: false }
+      });
+    expect(runtime.queries).toHaveLength(2);
+    expect(runtime.queries[1]!.closeCalls).toBe(0);
+    expect(runtime.queries[1]!.receivedInputs).toEqual([]);
+    await adapter.dispose();
+  });
+
+  test("does not dispatch a new prompt when fresh Query retirement is unknown", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime();
+    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    const binding = await adapter.createSession(createInput({
+      providerId: "configured-provider", modelId: "configured-model"
+    }), contextFor().context);
+    runtime.sessions.clear();
+    runtime.retirementFailure = true;
+    managed.revision = "revision-two";
+    await expect(adapter.send(textPrompt("not sent"), {
+      ...contextFor(binding, { operationId: "unknown-fresh-retirement" }).context,
+      modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+    })).rejects.toMatchObject({ publicError: { stateMayHaveChanged: true } });
     expect(runtime.queries).toHaveLength(1);
     expect(runtime.queries[0]!.receivedInputs).toEqual([]);
-    expect(runtime.retiredQueries).toHaveLength(failure === "unknown close" ? 1 : 0);
+    expect(runtime.retiredQueries).toEqual([runtime.queries[0]]);
     expect(managed.activations).toEqual([]);
+    await adapter.dispose();
+  });
+
+  test.each(["metadata", "history"] as const)(
+    "rechecks %s after exact retirement before choosing a fresh restart",
+    async (appears) => {
+      const managed = managedProviderFixture();
+      const runtime = new FakeSdkRuntime();
+      const adapter = adapterFor(runtime, { managedProviders: managed.port });
+      const binding = await adapter.createSession(createInput({
+        providerId: "configured-provider", modelId: "configured-model"
+      }), contextFor().context);
+      runtime.sessions.clear();
+      managed.revision = "revision-two";
+      vi.spyOn(runtime, "retireQuery").mockImplementation(async (query) => {
+        runtime.retiredQueries.push(query);
+        if (appears === "metadata") {
+          runtime.sessions.set(binding.nativeSessionId!, sessionInfo(binding.nativeSessionId!));
+        } else {
+          runtime.messages.set(binding.nativeSessionId!, [historyMessage(
+            "user",
+            randomUUID(),
+            binding.nativeSessionId!,
+            { role: "user", content: "persisted during retirement" }
+          )]);
+        }
+      });
+      const changing = adapter.setModel("configured-provider", "configured-model", contextFor(binding).context);
+      if (appears === "metadata") {
+        await expect(changing).resolves.toMatchObject({ modelId: "configured-model" });
+        expect(runtime.queries).toHaveLength(2);
+        expect(runtime.queries[1]!.params.options.resume).toBe(binding.nativeSessionId);
+        expect(runtime.queries[1]!.params.options.sessionId).toBeUndefined();
+      } else {
+        await expect(changing).rejects.toMatchObject({
+          publicError: { code: "MANAGED_PROVIDER_ROUTE_UNAVAILABLE", stateMayHaveChanged: true }
+        });
+        expect(runtime.queries).toHaveLength(1);
+      }
+      expect(runtime.queries[0]!.receivedInputs).toEqual([]);
+      await adapter.dispose();
+    }
+  );
+
+  test.each(["cancelled after retirement", "replacement startup failure"] as const)(
+    "does not reconstruct or dispatch an unpersisted Session after %s",
+    async (failure) => {
+      const managed = managedProviderFixture();
+      const runtime = new FakeSdkRuntime();
+      const adapter = adapterFor(runtime, { managedProviders: managed.port });
+      const binding = await adapter.createSession(createInput({
+        providerId: "configured-provider", modelId: "configured-model"
+      }), contextFor().context);
+      runtime.sessions.clear();
+      managed.revision = "revision-two";
+      const cancellation = new AbortController();
+      if (failure === "cancelled after retirement") {
+        vi.spyOn(runtime, "retireQuery").mockImplementation(async (query) => {
+          runtime.retiredQueries.push(query);
+          cancellation.abort();
+        });
+      } else {
+        runtime.queryFailure = new Error("The replacement Query could not start.");
+      }
+      await expect(adapter.setModel("configured-provider", "configured-model", {
+        ...contextFor(binding).context,
+        signal: cancellation.signal
+      })).rejects.toMatchObject({
+        publicError: { code: "MANAGED_PROVIDER_ROUTE_UNAVAILABLE", stateMayHaveChanged: true }
+      });
+      expect(runtime.queries).toHaveLength(1);
+      expect(runtime.queries[0]!.closeCalls).toBe(1);
+      expect(runtime.queries[0]!.receivedInputs).toEqual([]);
+      expect(runtime.retiredQueries).toEqual([runtime.queries[0]]);
+      expect(managed.activations).toEqual([]);
+      await adapter.dispose();
+    }
+  );
+
+  test("retires a fresh replacement whose first init frame does not confirm the selected route", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "another-model" } });
+    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    const binding = await adapter.createSession(createInput({
+      providerId: "configured-provider", modelId: "configured-model"
+    }), contextFor().context);
+    runtime.sessions.clear();
+    managed.revision = "revision-two";
+    await expect(adapter.send(textPrompt("must not continue on a mismatched route"), {
+      ...contextFor(binding, { operationId: "mismatched-fresh-route" }).context,
+      modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+    })).rejects.toMatchObject({
+      publicError: { code: "MANAGED_PROVIDER_ROUTE_UNAVAILABLE", stateMayHaveChanged: true }
+    });
+    expect(runtime.queries).toHaveLength(2);
+    expect(runtime.queries[0]!.receivedInputs).toEqual([]);
+    expect(runtime.queries[1]!.receivedInputs).toHaveLength(1);
+    expect(runtime.queries[1]!.closeCalls).toBe(1);
+    expect(managed.activations).toHaveLength(1);
+    expect(managed.activations[0]!.release).toHaveBeenCalledOnce();
     await adapter.dispose();
   });
 
@@ -225,6 +1216,30 @@ describe("ClaudeCodeAdapter", () => {
     await expect(adapter.createSession(createInput({ providerId: "configured-provider", modelId: "configured-model" }), contextFor().context))
       .rejects.toMatchObject({ publicError: { code: "MANAGED_PROVIDER_ROUTE_UNAVAILABLE", stateMayHaveChanged: false } });
     expect(dispose).toHaveBeenCalledOnce();
+    expect(runtime.queries).toEqual([]);
+    await adapter.dispose();
+  });
+
+  test("rejects invalid managed model limits before advertising the model or creating a Query", async () => {
+    const managed = managedProviderFixture();
+    const invalidModel = { ...managed.port.listModels()[0]!, contextWindow: -1 };
+    const port: ManagedProviderRuntimePort = {
+      ...managed.port,
+      listModels: () => [invalidModel],
+      prepare: async (owner) => {
+        const route = await managed.port.prepare(owner);
+        return { ...route, model: invalidModel };
+      }
+    };
+    const runtime = new FakeSdkRuntime();
+    const adapter = adapterFor(runtime, { managedProviders: port });
+    expect((await adapter.describe()).models.some((model) => model.providerId === "configured-provider")).toBe(false);
+    await expect(adapter.createSession(
+      createInput({ providerId: "configured-provider", modelId: "configured-model" }),
+      contextFor().context
+    )).rejects.toMatchObject({
+      publicError: { code: "MANAGED_PROVIDER_MODEL_LIMIT_INVALID", stateMayHaveChanged: false }
+    });
     expect(runtime.queries).toEqual([]);
     await adapter.dispose();
   });
@@ -552,7 +1567,7 @@ describe("ClaudeCodeAdapter", () => {
     expect(descriptor.capabilities.get("model.fast_mode")?.supported).toBe(true);
     expect(descriptor.models.map((model) => model.supportsFastMode)).toEqual([true, false]);
     const binding = await adapter.createSession(createInput({ modelId: "model-a-20260801", fastMode: true }), contextFor().context);
-    expect(runtime.queries[0]!.params.options.settings).toEqual({ fastMode: true });
+    expect(runtime.queries[0]!.params.options.settings).toEqual({ apiKeyHelper: "", fastMode: true });
     await expect(adapter.inspectSession(binding, contextFor(binding).context)).resolves.toMatchObject({ fastMode: true });
     await adapter.dispose();
     const unavailable = new FakeSdkRuntime();
@@ -595,6 +1610,39 @@ describe("ClaudeCodeAdapter", () => {
       expect(runtime.queries[2]!.params.options.env["CLAUDE_CODE_SUBAGENT_MODEL"]).toBeUndefined();
       expect(runtime.queries[2]!.params.options.env["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"]).toBeUndefined();
       expect(resolveSubagentModel).toHaveBeenCalledTimes(3);
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
+  test("uses an exact bundled CLI binding for the first configured subtask default", async () => {
+    const runtime = new FakeSdkRuntime();
+    runtime.probeCliVersion = undefined;
+    runtime.bundledCliVersion = "2.1.259";
+    const adapter = adapterFor(runtime, { resolveSubagentModel: () => "model-a" });
+    try {
+      await adapter.createSession(createInput(), contextFor().context);
+      expect(runtime.probeInputs).toEqual([]);
+      expect(runtime.queries[0]!.params.options.env["CLAUDE_CODE_SUBAGENT_MODEL"]).toBe("model-a");
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
+  test("does not trust a bundled CLI binding for an executable override", async () => {
+    const runtime = new FakeSdkRuntime();
+    runtime.probeCliVersion = undefined;
+    runtime.bundledCliVersion = "2.1.259";
+    const adapter = adapterFor(runtime, {
+      pathToClaudeCodeExecutable: "D:\\custom\\claude.exe",
+      resolveSubagentModel: () => "model-a"
+    });
+    try {
+      await expect(adapter.createSession(createInput(), contextFor().context)).rejects.toMatchObject({
+        publicError: { code: "SUBAGENT_MODEL_DEFAULT_UNAVAILABLE" }
+      });
+      expect(runtime.probeInputs).toHaveLength(1);
+      expect(runtime.queries).toEqual([]);
     } finally {
       await adapter.dispose();
     }
@@ -697,7 +1745,7 @@ describe("ClaudeCodeAdapter", () => {
     const binding = await adapter.createSession(createInput({ modelId: "model-a" }), contextFor().context);
     const context = contextFor(binding).context;
     const query = runtime.queries[0]!;
-    expect(query.params.options.settings).toEqual({ fastMode: false });
+    expect(query.params.options.settings).toEqual({ apiKeyHelper: "", fastMode: false });
     await expect(adapter.setFastMode(true, { ...context, signal: AbortSignal.abort() }))
       .rejects.toMatchObject({ publicError: { code: "NATIVE_CONTROL_ABORTED", stateMayHaveChanged: false } });
     expect(query.settingCalls).toEqual([]);
@@ -738,7 +1786,7 @@ describe("ClaudeCodeAdapter", () => {
     const context = contextFor(resumedBinding, { generation: 2 }).context;
     await adapter.resumeSession(binding, context);
     const resumedQuery = runtime.queries[1]!;
-    expect(resumedQuery.params.options.settings).toBeUndefined();
+    expect(resumedQuery.params.options.settings).toEqual({ apiKeyHelper: "" });
     await adapter.setModel("claude-code", "model-a", context);
     await adapter.setFastMode(true, context);
     expect(resumedQuery.settingCalls).toEqual([{ fastMode: true }]);
@@ -883,6 +1931,7 @@ describe("ClaudeCodeAdapter", () => {
     expect(runtime.queries).toEqual([]);
     expect(runtime.probeInputs).toEqual([expect.objectContaining({
       cwd: probeCwd,
+      settings: { apiKeyHelper: "" },
       settingSources: ["user", "project", "local"],
       initializationTimeoutMs: 500
     })]);
@@ -1437,10 +2486,187 @@ describe("ClaudeCodeAdapter", () => {
     })).toThrow("Claude Code Host-composed capability is invalid");
   });
 
+  test("advertises native auto-memory and snapshots its effective value for each standard Query", async () => {
+    let enabled = true;
+    const resolveNativeMemoryEnabled = vi.fn(() => enabled);
+    const runtime = new FakeSdkRuntime();
+    const adapter = adapterFor(runtime, { resolveNativeMemoryEnabled });
+
+    expect((await adapter.describe()).capabilities.get("memory.native")).toEqual({
+      key: "memory.native",
+      supported: true,
+      options: ["reset_local"]
+    });
+    const binding = await adapter.createSession(createInput(), contextFor().context);
+    expect(runtime.queries[0]!.params.options.settings).toMatchObject({
+      autoMemoryEnabled: true,
+      autoDreamEnabled: true
+    });
+
+    enabled = false;
+    expect(runtime.queries[0]!.params.options.settings).toMatchObject({
+      autoMemoryEnabled: true,
+      autoDreamEnabled: true
+    });
+    await adapter.closeSession(binding, contextFor(binding).context);
+    const resumedBinding = { ...binding, generation: 2 };
+    await adapter.resumeSession(binding, contextFor(resumedBinding, { generation: 2 }).context);
+    expect(runtime.queries[1]!.params.options.settings).toMatchObject({
+      autoMemoryEnabled: false,
+      autoDreamEnabled: false
+    });
+    expect(resolveNativeMemoryEnabled).toHaveBeenCalledTimes(2);
+    await adapter.dispose();
+  });
+
+  test("reports and resets only regular native memory beneath the exact local profile", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-claude-native-memory-"));
+    const configDirectory = join(root, "profile");
+    const firstMemory = join(configDirectory, "projects", "first", "memory");
+    const secondMemory = join(configDirectory, "projects", "second", "memory");
+    const remoteResolve = vi.fn();
+    const adapter = adapterFor(new FakeSdkRuntime(), {
+      environment: { CLAUDE_CONFIG_DIR: configDirectory },
+      resolveNativeMemoryEnabled: () => true,
+      remoteRuntimes: { resolve: remoteResolve, close: async () => undefined }
+    });
+    try {
+      await Promise.all([
+        mkdir(join(firstMemory, "nested"), { recursive: true }),
+        mkdir(secondMemory, { recursive: true })
+      ]);
+      await Promise.all([
+        writeFile(join(firstMemory, "MEMORY.md"), "first"),
+        writeFile(join(firstMemory, "notes.md"), "second"),
+        writeFile(join(firstMemory, "ignored.txt"), "ignored"),
+        writeFile(join(firstMemory, "nested", "ignored.md"), "nested"),
+        writeFile(join(secondMemory, "topic.md"), "third"),
+        writeFile(join(configDirectory, "projects", "first", "session.jsonl"), "history"),
+        writeFile(join(configDirectory, "settings.json"), "settings")
+      ]);
+
+      expect((await adapter.describe()).capabilities.get("memory.native")).toEqual({
+        key: "memory.native",
+        supported: true,
+        options: ["reset_local"]
+      });
+      await expect(adapter.readNativeMemoryStatus()).resolves.toEqual({
+        entryCount: 3,
+        sizeBytes: 16
+      });
+      await expect(adapter.resetNativeMemory()).resolves.toEqual({
+        removedEntries: 3,
+        removedTargets: 2
+      });
+      await expect(adapter.readNativeMemoryStatus()).resolves.toEqual({ entryCount: 0, sizeBytes: 0 });
+      await expect(readFile(join(configDirectory, "projects", "first", "session.jsonl"), "utf8"))
+        .resolves.toBe("history");
+      await expect(readFile(join(configDirectory, "settings.json"), "utf8")).resolves.toBe("settings");
+      expect(remoteResolve).not.toHaveBeenCalled();
+    } finally {
+      await adapter.dispose();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("treats a missing local profile as known empty memory", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-claude-native-memory-missing-"));
+    const adapter = adapterFor(new FakeSdkRuntime(), {
+      environment: { CLAUDE_CONFIG_DIR: join(root, "not-created") },
+      resolveNativeMemoryEnabled: () => true
+    });
+    try {
+      await expect(adapter.readNativeMemoryStatus()).resolves.toEqual({ entryCount: 0, sizeBytes: 0 });
+      await expect(adapter.resetNativeMemory()).resolves.toEqual({ removedEntries: 0, removedTargets: 0 });
+    } finally {
+      await adapter.dispose();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects an aliased native memory directory without following or deleting it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-claude-native-memory-alias-"));
+    const outside = await mkdtemp(join(tmpdir(), "joko-claude-native-memory-outside-"));
+    const configDirectory = join(root, "profile");
+    const projectDirectory = join(configDirectory, "projects", "project");
+    const adapter = adapterFor(new FakeSdkRuntime(), {
+      environment: { CLAUDE_CONFIG_DIR: configDirectory },
+      resolveNativeMemoryEnabled: () => true
+    });
+    try {
+      await mkdir(projectDirectory, { recursive: true });
+      await writeFile(join(outside, "MEMORY.md"), "must remain");
+      await symlink(outside, join(projectDirectory, "memory"), "junction");
+
+      await expect(adapter.readNativeMemoryStatus()).rejects.toMatchObject({
+        publicError: { code: "CLAUDE_NATIVE_MEMORY_PATH_UNSAFE", stateMayHaveChanged: false }
+      });
+      await expect(adapter.resetNativeMemory()).rejects.toMatchObject({
+        publicError: { code: "CLAUDE_NATIVE_MEMORY_PATH_UNSAFE", stateMayHaveChanged: false }
+      });
+      await expect(readFile(join(outside, "MEMORY.md"), "utf8")).resolves.toBe("must remain");
+    } finally {
+      await adapter.dispose();
+      await rm(root, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects an aliased native memory project without following or deleting it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-claude-native-project-alias-"));
+    const outside = await mkdtemp(join(tmpdir(), "joko-claude-native-project-outside-"));
+    const configDirectory = join(root, "profile");
+    const adapter = adapterFor(new FakeSdkRuntime(), {
+      environment: { CLAUDE_CONFIG_DIR: configDirectory },
+      resolveNativeMemoryEnabled: () => true
+    });
+    try {
+      await mkdir(join(configDirectory, "projects"), { recursive: true });
+      await mkdir(join(outside, "memory"), { recursive: true });
+      await writeFile(join(outside, "memory", "MEMORY.md"), "must remain");
+      await symlink(outside, join(configDirectory, "projects", "project"), "junction");
+
+      await expect(adapter.readNativeMemoryStatus()).rejects.toMatchObject({
+        publicError: { code: "CLAUDE_NATIVE_MEMORY_PATH_UNSAFE", stateMayHaveChanged: false }
+      });
+      await expect(adapter.resetNativeMemory()).rejects.toMatchObject({
+        publicError: { code: "CLAUDE_NATIVE_MEMORY_PATH_UNSAFE", stateMayHaveChanged: false }
+      });
+      await expect(readFile(join(outside, "memory", "MEMORY.md"), "utf8")).resolves.toBe("must remain");
+    } finally {
+      await adapter.dispose();
+      await rm(root, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  test.each([
+    {
+      name: "a resolver failure",
+      resolveNativeMemoryEnabled: () => { throw new Error("private-setting-failure"); },
+      code: "NATIVE_MEMORY_SETTING_READ_FAILED"
+    },
+    {
+      name: "an invalid resolver value",
+      resolveNativeMemoryEnabled: () => "enabled" as never,
+      code: "NATIVE_MEMORY_SETTING_INVALID"
+    }
+  ])("rejects $name before starting a native Query", async ({ resolveNativeMemoryEnabled, code }) => {
+    const runtime = new FakeSdkRuntime();
+    const adapter = adapterFor(runtime, { resolveNativeMemoryEnabled });
+
+    await expect(adapter.createSession(createInput(), contextFor().context)).rejects.toMatchObject({
+      publicError: { code, stateMayHaveChanged: false }
+    });
+    expect(runtime.queries).toEqual([]);
+    await adapter.dispose();
+  });
+
   test("runs isolated review only through the immutable native safe profile", async () => {
     const runtime = new FakeSdkRuntime();
     const resolveSubagentModel = vi.fn(() => "model-b");
-    const adapter = adapterFor(runtime, { resolveSubagentModel });
+    const resolveNativeMemoryEnabled = vi.fn(() => { throw new Error("Review must not read mutable Memory settings."); });
+    const adapter = adapterFor(runtime, { resolveSubagentModel, resolveNativeMemoryEnabled });
     const descriptor = await adapter.describe();
     expect(descriptor.capabilities.get("review.isolated")).toEqual({
       key: "review.isolated",
@@ -1481,6 +2707,7 @@ describe("ClaudeCodeAdapter", () => {
     }), creation.context);
     const query = runtime.queries[0]!;
     expect(resolveSubagentModel).not.toHaveBeenCalled();
+    expect(resolveNativeMemoryEnabled).not.toHaveBeenCalled();
     expect(query.params.options.env["CLAUDE_CODE_SUBAGENT_MODEL"]).toBeUndefined();
     expect(query.params.options.env["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"]).toBeUndefined();
     expect(query.params.options).toMatchObject({
@@ -1499,6 +2726,7 @@ describe("ClaudeCodeAdapter", () => {
       settingSources: [],
       settings: {
         allowedMcpServers: [],
+        autoDreamEnabled: false,
         autoMemoryEnabled: false,
         disableAgentView: true,
         disableAllHooks: true,
@@ -1860,6 +3088,7 @@ describe("ClaudeCodeAdapter", () => {
     expect(query.params.options.forwardSubagentText).toBe(true);
     expect(query.params.options.persistSession).toBe(true);
     expect(query.params.options.settingSources).toEqual(["user", "project", "local"]);
+    expect(query.params.options.settings).toMatchObject({ apiKeyHelper: "", fastMode: false });
     expect(query.params.options.additionalDirectories).toEqual([process.cwd()]);
     expect(query.params.options.systemPrompt.append).toBe("Use the product workflow.");
     expect(query.params.options.title).toBe("SDK session");
@@ -2027,7 +3256,7 @@ describe("ClaudeCodeAdapter", () => {
       type: "text",
       text: "continued parent answer"
     }]));
-    query.push(resultMessage(binding.nativeSessionId!, { result: "continued parent answer", totalCostUsd: 0.3 }));
+    query.push(automaticContinuationResult(binding.nativeSessionId!, "continued parent answer", 0.3));
     await eventually(() => active.events.some((event) => event.type === "done"));
 
     const transcript = active.events
@@ -2117,45 +3346,175 @@ describe("ClaudeCodeAdapter", () => {
     await adapter.closeSession(binding, contextFor(binding).context);
   });
 
-  test("confirms an explicit wake-task stop without waiting for a provider echo", async () => {
-    const runtime = new FakeSdkRuntime({ autoAdmitTurns: true });
-    const adapter = adapterFor(runtime);
-    const binding = await adapter.createSession(createInput(), contextFor().context);
+  test("confirms an async managed wake-task stop before its foreground Result without waiting for a provider echo", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime({
+      autoAdmitTurns: true,
+      initialFrameOverrides: { model: "configured-model", effort: "low" }
+    });
+    const adapter = adapterFor(runtime, {
+      managedProviders: managed.port,
+      resolveSubagentModel: () => "compatible-model"
+    });
+    const binding = await adapter.createSession(createInput({
+      providerId: "configured-provider",
+      modelId: "configured-model",
+      effort: "low"
+    }), contextFor().context);
     const active = contextFor(binding, { operationId: "stop-awaiting-native-task" });
-    await adapter.send(textPrompt("start delegated work"), active.context);
+    const managedContext = {
+      ...active.context,
+      modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+    };
+    await adapter.send(textPrompt("start delegated work"), managedContext);
     const query = runtime.queries[0]!;
-    const rawTaskId = "wake-task-without-stop-echo";
-    const toolUseId = "wake-tool-without-stop-echo";
-    query.push(assistantMessage(binding.nativeSessionId!, "wake-parent-tool", [{
-      type: "tool_use",
-      id: toolUseId,
-      name: "Agent",
-      input: { prompt: "inspect" }
-    }]));
-    query.push(taskStarted(binding.nativeSessionId!, rawTaskId, toolUseId, {
-      taskType: "local_agent",
-      description: "Inspector"
-    }));
+    const delegate = query.params.options.managedAgentTool;
+    if (delegate === undefined) throw new Error("Expected the managed Agent replacement.");
+    await expect(delegate({
+      description: "Inspector",
+      prompt: "Inspect until stopped.",
+      subagent_type: "general-purpose",
+      run_in_background: true
+    }, { toolUseId: "wake-tool-without-stop-echo", signal: new AbortController().signal }))
+      .resolves.toMatchObject({ text: expect.stringContaining("managed-agent-") });
+    expect(managed.subtaskActivations[0]!.release).not.toHaveBeenCalled();
     await eventually(() => active.events.some((event) => event.type === "background_task"));
     const publicTaskId = active.events.find((event): event is Extract<EventPayload, { type: "background_task" }> =>
       event.type === "background_task")!.taskId;
-    query.push(resultMessage(binding.nativeSessionId!, { result: "Waiting for delegated work", totalCostUsd: 0.1 }));
-    await eventually(() => active.events.some((event) => event.type === "usage"));
-    expect(active.events.some((event) => event.type === "done")).toBe(false);
 
     await adapter.controlSubagent({
       runId: publicTaskId,
       childId: `${publicTaskId}:child`,
       action: "stop"
-    }, active.context);
+    }, managedContext);
 
+    expect(managed.subtaskActivations[0]!.release).toHaveBeenCalledOnce();
+    query.push(resultMessage(binding.nativeSessionId!, { result: "Delegated work stopped", totalCostUsd: 0.1 }));
     await eventually(() => active.events.some((event) => event.type === "done"));
-    expect(query.stopTaskCalls).toEqual([rawTaskId]);
+    expect(runtime.queries[1]!.interruptCalls).toBe(1);
+    expect(query.stopTaskCalls).toEqual([]);
     expect(active.events.filter((event) => event.type === "done")).toEqual([{ type: "done", outcome: "completed" }]);
     expect(active.events.filter((event): event is Extract<EventPayload, { type: "background_task" }> =>
       event.type === "background_task" && event.taskId === publicTaskId).at(-1)).toMatchObject({ state: "aborted" });
     await adapter.cancelBackgroundTask(active.context, publicTaskId);
-    expect(query.stopTaskCalls).toEqual([rawTaskId]);
+    expect(runtime.queries[1]!.interruptCalls).toBe(1);
+    await adapter.closeSession(binding, contextFor(binding).context);
+  });
+
+  test("globally interrupts every managed child after synchronously revoking its exact HTTP leases", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime({
+      autoAdmitTurns: true,
+      initialFrameOverrides: { model: "configured-model", effort: "low" }
+    });
+    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    const binding = await adapter.createSession(createInput({
+      providerId: "configured-provider",
+      modelId: "configured-model",
+      effort: "low"
+    }), contextFor().context);
+    const active = contextFor(binding, { operationId: "abort-managed-child" });
+    const managedContext = {
+      ...active.context,
+      modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+    };
+    await adapter.send(textPrompt("delegate and stop everything"), managedContext);
+    const parent = runtime.queries[0]!;
+    const delegate = parent.params.options.managedAgentTool;
+    if (delegate === undefined) throw new Error("Expected the managed Agent replacement.");
+    await expect(delegate({
+      description: "Long child",
+      prompt: "Continue until globally stopped.",
+      model: "second-model",
+      run_in_background: true
+    }, { toolUseId: "global-managed-stop", signal: new AbortController().signal }))
+      .resolves.toMatchObject({ text: expect.stringContaining("managed-agent-") });
+    const child = runtime.queries[1]!;
+    let confirmChildStop!: () => void;
+    child.interruptHandler = () => new Promise((resolvePromise) => {
+      confirmChildStop = () => resolvePromise({ still_queued: [] });
+    });
+
+    const stopping = adapter.abort(managedContext);
+    expect(managed.activations[0]!.release).toHaveBeenCalledOnce();
+    expect(managed.subtaskActivations[0]!.release).toHaveBeenCalledOnce();
+    expect(() => managed.subtaskActivations[0]!.input.assertCurrent()).toThrow();
+    await vi.waitFor(() => expect(confirmChildStop).toBeTypeOf("function"));
+    confirmChildStop();
+    await stopping;
+
+    expect(child.interruptCalls).toBe(1);
+    expect(parent.stopTaskCalls).toEqual([]);
+    parent.push(resultMessage(binding.nativeSessionId!, {
+      result: "",
+      totalCostUsd: 0,
+      terminalReason: "aborted_tools"
+    }));
+    await eventually(() => active.events.some((event) => event.type === "done"));
+    expect(active.events.at(-1)).toEqual({ type: "done", outcome: "aborted" });
+    await adapter.closeSession(binding, contextFor(binding).context);
+  });
+
+  test("routes a projected nested native task stop back to its child's original SDK task identity", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime({
+      autoAdmitTurns: true,
+      initialFrameOverrides: { model: "configured-model", effort: "low" }
+    });
+    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    const binding = await adapter.createSession(createInput({
+      providerId: "configured-provider",
+      modelId: "configured-model",
+      effort: "low"
+    }), contextFor().context);
+    const active = contextFor(binding, { operationId: "nested-native-stop" });
+    const managedContext = {
+      ...active.context,
+      modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+    };
+    await adapter.send(textPrompt("delegate nested work"), managedContext);
+    const parent = runtime.queries[0]!;
+    const delegate = parent.params.options.managedAgentTool;
+    if (delegate === undefined) throw new Error("Expected the managed Agent replacement.");
+    const delegated = delegate({
+      description: "Nested task owner",
+      prompt: "Start nested native work.",
+      subagent_type: "general-purpose",
+      model: "second-model"
+    }, { toolUseId: "nested-native-owner", signal: new AbortController().signal });
+    await vi.waitFor(() => expect(runtime.queries).toHaveLength(2));
+    const child = runtime.queries[1]!;
+    const childAssistant = assistantMessage(child.params.options.sessionId!, "nested-native-assistant", [{
+      type: "tool_use",
+      id: "nested-native-tool",
+      name: "Agent",
+      input: { prompt: "nested" }
+    }]);
+    child.push({ ...childAssistant, message: { ...childAssistant.message, model: "second-model" } });
+    child.push(taskStarted(child.params.options.sessionId!, "child-native-raw", "nested-native-tool", {
+      taskType: "local_agent",
+      description: "Nested native task"
+    }));
+    await eventually(() => active.events.some((event) => event.type === "subagent_run"
+      && event.run.title === "Nested native task"));
+    const nested = active.events.find((event): event is Extract<EventPayload, { type: "subagent_run" }> =>
+      event.type === "subagent_run" && event.run.title === "Nested native task")!;
+
+    await adapter.controlSubagent({
+      runId: nested.run.id,
+      childId: `${nested.run.id}:child`,
+      action: "stop"
+    }, managedContext);
+
+    expect(child.stopTaskCalls).toEqual(["child-native-raw"]);
+    expect(parent.stopTaskCalls).toEqual([]);
+    child.push(resultMessage(child.params.options.sessionId!, {
+      result: "Nested child completed.",
+      totalCostUsd: 0
+    }));
+    await expect(delegated).resolves.toEqual({ text: "Nested child completed." });
+    parent.push(resultMessage(binding.nativeSessionId!, { result: "Parent completed.", totalCostUsd: 0 }));
+    await eventually(() => active.events.some((event) => event.type === "done"));
     await adapter.closeSession(binding, contextFor(binding).context);
   });
 
@@ -3415,14 +4774,30 @@ interface FakeRuntimeOptions {
   readonly probeInstalled?: boolean;
 }
 
-function managedProviderFixture(thinkingLevelMap: Readonly<Record<string, string | null>> = {}) {
+function managedProviderFixture(
+  thinkingLevelMap: Readonly<Record<string, string | null>> = {},
+  modelThinkingOverrides: Readonly<Record<string, Readonly<Record<string, string | null>>>> = {}
+) {
   const token = "private-model-proxy-fixture-token";
-  const models: ProviderModel[] = ["configured-model", "second-model"].map((modelId) => ({
+  const models: ProviderModel[] = ["configured-model", "compatible-model", "second-model", "incompatible-thinking"].map((modelId) => ({
     providerId: "configured-provider", modelId, displayName: modelId, api: "anthropic-messages",
-    contextWindow: 64_000, maxOutputTokens: 4_000, supportsImages: true, supportsFastMode: true, thinkingLevels: ["low", "high", "unavailable"],
+    contextWindow: modelId === "second-model" ? 128_000 : 64_000,
+    maxOutputTokens: modelId === "second-model" ? 8_000 : 4_000,
+    supportsImages: true, supportsFastMode: true, thinkingLevels: ["low", "high", "unavailable"],
     cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 }
   }));
+  const thinkingMapFor = (modelId: string) => Object.freeze(
+    {
+      ...thinkingLevelMap,
+      ...(modelId === "incompatible-thinking" ? { low: "medium" } : {}),
+      ...modelThinkingOverrides[modelId]
+    }
+  );
   const activations: { input: Parameters<ManagedProviderRouteBinding["activate"]>[0]; release: ReturnType<typeof vi.fn> }[] = [];
+  const subtaskActivations: {
+    input: Parameters<NonNullable<ManagedProviderRouteBinding["authorizeSubtask"]>>[0];
+    release: ReturnType<typeof vi.fn>;
+  }[] = [];
   let enabled = true;
   let revision = "revision-one";
   const port: ManagedProviderRuntimePort = {
@@ -3431,7 +4806,7 @@ function managedProviderFixture(thinkingLevelMap: Readonly<Record<string, string
     dispose: vi.fn(),
     hasProvider: (providerId) => providerId === "configured-provider",
     listModels: () => models,
-    getThinkingLevelMap: () => Object.freeze({ ...thinkingLevelMap }),
+    getThinkingLevelMap: (_providerId, modelId) => thinkingMapFor(modelId),
     listProviders: () => [{ providerId: "configured-provider", displayName: "Configured Provider", api: "anthropic-messages",
       authenticationState: "authenticated", loginMethods: [], supportsLogin: false, supportsLogout: false, supportsRefresh: true, supportsModelRefresh: true }],
     prepare: async (owner) => {
@@ -3439,14 +4814,23 @@ function managedProviderFixture(thinkingLevelMap: Readonly<Record<string, string
       let disposed = false;
       const preparedRevision = revision;
       const assertCurrent = () => { if (!enabled || disposed || preparedRevision !== revision) throw new Error("The managed route is stale."); };
-      return { providerId: owner.providerId, model: models.find((model) => model.modelId === owner.modelId)!, thinkingLevelMap: Object.freeze({ ...thinkingLevelMap }), protocol: "anthropic-messages",
+      const selected = models.find((model) => model.modelId === owner.modelId)!;
+      return { providerId: owner.providerId, model: selected, thinkingLevelMap: thinkingMapFor(selected.modelId), protocol: "anthropic-messages",
         revision: preparedRevision, baseUrl: "http://127.0.0.1:31415/routes/fixture", apiKeyEnvironment: "JOKO_MODEL_PROXY_TOKEN",
         assertCurrent, activate: async (input) => { assertCurrent(); input.assertCurrent(); const release = vi.fn(); activations.push({ input, release }); return { release }; },
+        authorizeSubtask: async (input) => {
+          assertCurrent(); input.assertCurrent();
+          const model = models.find((candidate) => candidate.modelId === input.modelId);
+          if (model === undefined) throw new Error("The delegated model route is unavailable.");
+          const release = vi.fn();
+          subtaskActivations.push({ input, release });
+          return { model, thinkingLevelMap: thinkingMapFor(model.modelId), release };
+        },
         dispose: () => { disposed = true; }
       };
     }
   };
-  return { port, token, activations, get enabled() { return enabled; }, set enabled(value: boolean) { enabled = value; },
+  return { port, token, activations, subtaskActivations, get enabled() { return enabled; }, set enabled(value: boolean) { enabled = value; },
     get revision() { return revision; }, set revision(value: string) { revision = value; } };
 }
 
@@ -3461,6 +4845,7 @@ function forkHistory(sessionId: string): ClaudeSdkSessionMessage[] {
 
 class FakeSdkRuntime implements ClaudeSdkRuntime {
   readonly packageVersion = CLAUDE_AGENT_SDK_VERSION;
+  bundledCliVersion: string | undefined;
   supportsWorkspaceDerivation = true;
   readonly queries: FakeQuery[] = [];
   retirementFailure = false;
@@ -3493,9 +4878,11 @@ class FakeSdkRuntime implements ClaudeSdkRuntime {
   probeCliVersion: string | undefined = "2.1.259";
   probeApiKeySource: string | undefined = "none";
   queryFailure: unknown = undefined;
+  admitTurns: boolean;
 
   constructor(options: FakeRuntimeOptions = {}) {
     this.options = options;
+    this.admitTurns = options.autoAdmitTurns !== false;
   }
 
   probe(input: ClaudeSdkProbeInput) {
@@ -3519,14 +4906,19 @@ class FakeSdkRuntime implements ClaudeSdkRuntime {
     this.queries.push(query);
     if (params.options.sessionId !== undefined) this.sessions.set(nativeSessionId, sessionInfo(nativeSessionId));
     void query.consumeInput((message) => {
-      if (this.options.autoAdmitTurns !== false) {
+      if (this.admitTurns) {
         query.push({
           ...systemInit(this.options.initialSessionIdOverride ?? nativeSessionId),
           ...(Array.isArray(params.options.tools) ? { tools: [...params.options.tools] } : {}),
           ...(this.options.initialPermissionMode === undefined
             ? {}
             : { permissionMode: this.options.initialPermissionMode }),
-          ...this.options.initialFrameOverrides
+          ...this.options.initialFrameOverrides,
+          ...(params.options.persistSession ? {} : {
+              cwd: params.options.cwd,
+              model: params.options.model,
+              permissionMode: params.options.permissionMode
+            })
         });
       }
       if (this.options.autoReplayInputs !== false && params.options.extraArgs?.["replay-user-messages"] === null) {
@@ -4103,6 +5495,16 @@ function resultMessage(
     terminal_reason: options.terminalReason ?? "completed",
     uuid: randomUUID(),
     session_id: sessionId
+  };
+}
+
+function automaticContinuationResult(sessionId: string, result: string, totalCostUsd: number) {
+  return {
+    ...resultMessage(sessionId, { result, totalCostUsd }),
+    origin: { kind: "task-notification" },
+    // Explicit null prevents the fake Query from filling the last human UUID;
+    // the projection normalizes it to the fixed SDK's absent meta-turn field.
+    user_message_uuid: null
   };
 }
 

@@ -4253,6 +4253,85 @@ describe("SessionHost", () => {
     expect(adapter.sendCalls).toBe(1);
   });
 
+  it("holds accepted input before claim while a Backend generation change is pending", async () => {
+    const adapter = new SendCountingFakeAdapter();
+    let blocked = true;
+    const onBackendMayBeIdle = vi.fn();
+    const fixture = await createFixture(adapter, {
+      backendDispatchBlocked: () => blocked,
+      onBackendMayBeIdle
+    });
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-generation-change-hold",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Generation change hold",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const claim = vi.spyOn(fixture.store, "claimNextQueueItem");
+
+    const queued = fixture.host.enqueueInput({
+      operationId: "enqueue-generation-change-hold",
+      connection: fixture.connection,
+      sessionId,
+      prompt: { text: "use the next generation", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    fixture.host.requestQueueDrain(sessionId);
+    await nextTurn();
+
+    expect(fixture.store.getQueueItem(queued.value.queueItemId).state).toBe("accepted");
+    expect(fixture.store.getRun(queued.value.runId).descriptor.state).toBe("queued");
+    expect(claim).not.toHaveBeenCalled();
+    expect(adapter.sendCalls).toBe(0);
+    expect(fixture.host.canReplaceBackendInstance(adapter.id)).toBe(true);
+    appendSessionEvent(fixture.store, sessionId, "generation-change-background-running", 10, {
+      type: "background_task",
+      taskId: "generation-change-background",
+      title: "Background",
+      state: "running"
+    });
+    expect(fixture.host.canReplaceBackendInstance(adapter.id)).toBe(false);
+    appendSessionEvent(fixture.store, sessionId, "generation-change-background-completed", 11, {
+      type: "background_task",
+      taskId: "generation-change-background",
+      title: "Background",
+      state: "completed"
+    });
+    expect(fixture.host.canReplaceBackendInstance(adapter.id)).toBe(true);
+
+    const current = fixture.store.getBackend(adapter.id).descriptor;
+    const reservation = fixture.store.reserveBackendInstanceGeneration({
+      backendId: adapter.id,
+      adapterKind: current.adapterKind
+    });
+    const replacement = new SendCountingFakeAdapter();
+    await fixture.host.replaceBackendInstance({
+      backendId: adapter.id,
+      expectedCurrentGeneration: current.instanceGeneration,
+      perform: async (hooks) => {
+        await hooks.preparePrevious(replacement, reservation.generation);
+        const publication = fixture.store.publishBackendInstanceDescriptor({
+          descriptor: { ...current, instanceGeneration: reservation.generation },
+          expectedCurrentGeneration: current.instanceGeneration
+        });
+        if (publication.status !== "published") throw new Error("Fixture replacement publication lost its fence.");
+        hooks.activateCurrent();
+      }
+    });
+    expect(fixture.host.currentAdapter(adapter.id)).toBe(replacement);
+    expect(fixture.store.getQueueItem(queued.value.queueItemId).state).toBe("accepted");
+
+    blocked = false;
+    fixture.host.wakeBackendQueues(adapter.id);
+    await eventually(() => fixture.store.getRun(queued.value.runId).descriptor.state === "completed");
+    expect(claim).toHaveBeenCalledTimes(1);
+    expect(adapter.sendCalls).toBe(0);
+    expect(replacement.sendCalls).toBe(1);
+    expect(onBackendMayBeIdle).toHaveBeenCalledWith(adapter.id);
+  });
+
   it("keeps an idle prompt durably accepted throughout manual compaction, then dispatches it exactly once", async () => {
     const adapter = new CompactionQueueFakeAdapter();
     const fixture = await createFixture(adapter);
@@ -7728,6 +7807,53 @@ describe("SessionHost", () => {
     });
     expect(replay).toMatchObject({ replayed: true, value: { archived: true } });
     expect(effects).toBe(1);
+  });
+
+  it("runs post-commit holds synchronously after durable mutation success and never after a failed commit", async () => {
+    const fixture = await createFixture();
+    const observations: Array<{ readonly replayed: boolean; readonly durable: unknown; readonly status: string }> = [];
+    const mutation = {
+      operationId: "post-commit-hold",
+      connection: fixture.connection,
+      kind: "post_commit_hold",
+      body: { enabled: true },
+      commit: (store: OperationalStore) => {
+        store.setSetting("service", "global", "post-commit-hold", { enabled: true });
+        return { enabled: true };
+      },
+      afterCommit: (execution: { readonly replayed: boolean; readonly operation: { readonly status: string } }) => {
+        observations.push({
+          replayed: execution.replayed,
+          durable: fixture.store.getSetting("service", "global", "post-commit-hold").value,
+          status: execution.operation.status
+        });
+      }
+    } as const;
+
+    expect(observations).toEqual([]);
+    await fixture.host.mutate(mutation);
+    expect(observations).toEqual([{
+      replayed: false,
+      durable: { enabled: true },
+      status: "completed"
+    }]);
+    await fixture.host.mutate(mutation);
+    expect(observations.at(-1)).toEqual({
+      replayed: true,
+      durable: { enabled: true },
+      status: "completed"
+    });
+
+    const afterFailure = vi.fn();
+    await expect(fixture.host.mutate({
+      operationId: "post-commit-failure",
+      connection: fixture.connection,
+      kind: "post_commit_failure",
+      body: {},
+      commit: () => { throw new Error("commit rejected"); },
+      afterCommit: afterFailure
+    })).rejects.toThrow("commit rejected");
+    expect(afterFailure).not.toHaveBeenCalled();
   });
 
   it("records a typed tombstone when an awaited mutation effect rejects", async () => {
@@ -11704,6 +11830,8 @@ async function createFixture(
       readonly explicitDefault?: { readonly providerId: string; readonly modelId: string };
     };
     readonly sessionRuntimeRecoveryDelayMs?: (attempt: number) => number;
+    readonly backendDispatchBlocked?: (backendId: string) => boolean;
+    readonly onBackendMayBeIdle?: (backendId: string) => void;
     readonly additionalAdapters?: readonly FakeBackendAdapter[];
   } = {}
 ) {

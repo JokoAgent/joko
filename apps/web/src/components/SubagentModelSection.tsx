@@ -15,6 +15,7 @@ interface Props {
 }
 type Selection = SubagentModelSettingsView["model"];
 interface Draft { readonly model: Selection; readonly revision: bigint; readonly awaiting?: boolean }
+interface SmartDraft { readonly enabled: boolean; readonly revision: bigint; readonly awaiting?: boolean }
 
 export function SubagentModelSection(props: Props): JSX.Element {
   const headingId = useId();
@@ -68,7 +69,9 @@ function SubagentModelControl({ controller, snapshot, setting: incoming, ownerDo
   const conflict = draft !== undefined && setting.revision > draft.revision && !sameModel(setting.model, draft.model);
   const awaiting = draft?.awaiting === true && setting.revision <= draft.revision;
   const backend = snapshot.backends.find((value) => value.id === setting.backendId);
-  const supports = backend?.capabilities.get("subagents.default_model")?.supported === true;
+  const supports = setting.defaultModelSupported
+    && backend?.capabilities.get("subagents.default_model")?.supported === true;
+  const showsDefault = supports || setting.model !== undefined || setting.unavailableReason !== "";
   const blocked = !loaded || pending || awaiting;
   useLayoutEffect(() => {
     const intent = resetFocusRef.current;
@@ -111,7 +114,7 @@ function SubagentModelControl({ controller, snapshot, setting: incoming, ownerDo
     finally { if (scope.active && scopeRef.current === scope && flightRef.current === request) { flightRef.current = undefined; setPending(false); } }
   };
   return <div ref={rowRef} className="personalization-section" aria-busy={pending}>
-    <div className="setting-row">
+    {showsDefault && <div className="setting-row">
       <div><strong>{backend?.name ?? setting.backendId}</strong><span>{t("settings.subagentModels.default")}</span></div>
       <div className="subagent-model-actions">
         <ModelPicker models={snapshot.models.filter((model) => model.backendId === setting.backendId)}
@@ -124,13 +127,122 @@ function SubagentModelControl({ controller, snapshot, setting: incoming, ownerDo
         }} />
         {(selected !== undefined || setting.model !== undefined || (!setting.available && setting.revision > 0n)) && <Button disabled={blocked} onClick={() => { void persist(undefined); }}>{t("settings.defaults.restore")}</Button>}
       </div>
-    </div>
-    {!setting.available && <p role="status">{setting.unavailableReason || t("settings.subagentModels.unavailable")}</p>}
-    {setting.model !== undefined && !setting.available && <p>{setting.model.modelId} · {setting.model.providerId}</p>}
+    </div>}
+    {showsDefault && !setting.available && <p role="status">{setting.unavailableReason || t("settings.subagentModels.unavailable")}</p>}
+    {showsDefault && setting.model !== undefined && !setting.available && <p>{setting.model.modelId} · {setting.model.providerId}</p>}
     {pending && <p role="status">{t("common.working")}</p>}
     {error && <p role="alert">{t("settings.subagentModels.saveFailed")}</p>}
     {conflict && <div role="alert"><p>{t("settings.subagentModels.conflict")}</p><Button disabled={pending} onClick={() => { setDraft(undefined); setError(false); }}>{t("settings.subagentModels.reload")}</Button><Button disabled={blocked} onClick={() => { void persist(selected); }}>{t("settings.subagentModels.retryLatest")}</Button></div>}
     {draft !== undefined && !conflict && !awaiting && !pending && <Button disabled={blocked} onClick={() => { void persist(selected); }}>{t("common.retry")}</Button>}
+    {awaiting && <div role="status"><p>{t("settings.subagentModels.confirming")}</p><Button disabled={pending || !loaded} onClick={() => { void refresh(); }}>{t("common.refresh")}</Button></div>}
+    {(setting.smartRoutingSupported || setting.smartRoutingEnabled || setting.smartRoutingUnavailableReason !== "") && <SmartRoutingControl
+      backendName={backend?.name ?? setting.backendId}
+      controller={controller}
+      setting={setting}
+      loaded={loaded}
+      ownerDocument={ownerDocument}
+      t={t}
+    />}
+  </div>;
+}
+
+function SmartRoutingControl({ backendName, controller, setting: incoming, loaded, ownerDocument, t }: {
+  readonly backendName: string;
+  readonly controller: AppController;
+  readonly setting: SubagentModelSettingsView;
+  readonly loaded: boolean;
+  readonly ownerDocument: Document;
+  readonly t: Translator;
+}): JSX.Element {
+  const settingRef = useRef(incoming);
+  if (loaded && incoming.revision >= settingRef.current.revision) settingRef.current = incoming;
+  const setting = settingRef.current;
+  const [draft, setDraft] = useState<SmartDraft>();
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState(false);
+  const flightRef = useRef<object | undefined>(undefined);
+  const scope = useMemo(() => ({ active: false }), [controller.state.activeProfile?.id, loaded, ownerDocument]);
+  useLayoutEffect(() => {
+    scope.active = true;
+    flightRef.current = undefined;
+    setPending(false);
+    return () => { scope.active = false; flightRef.current = undefined; };
+  }, [scope]);
+  useLayoutEffect(() => {
+    if (draft !== undefined && setting.revision > draft.revision && setting.smartRoutingEnabled === draft.enabled) {
+      setDraft(undefined);
+      setError(false);
+    }
+  }, [draft, setting.revision, setting.smartRoutingEnabled]);
+  const enabled = draft?.enabled ?? setting.smartRoutingEnabled;
+  const conflict = draft !== undefined && setting.revision > draft.revision
+    && setting.smartRoutingEnabled !== draft.enabled;
+  const awaiting = draft?.awaiting === true && setting.revision <= draft.revision;
+  const blocked = !loaded || pending || awaiting;
+  const persist = async (nextEnabled: boolean): Promise<void> => {
+    if (blocked || !scope.active || flightRef.current !== undefined) return;
+    const request = {};
+    const next: SmartDraft = { enabled: nextEnabled, revision: setting.revision };
+    flightRef.current = request;
+    setDraft(next);
+    setPending(true);
+    setError(false);
+    try {
+      await controller.updateSubagentSmartRouting(setting.backendId, nextEnabled, next.revision);
+      if (scope.active && flightRef.current === request) {
+        setDraft((value) => value === next ? { ...next, awaiting: true } : value);
+      }
+    } catch {
+      if (scope.active && flightRef.current === request
+        && !(settingRef.current.revision > next.revision
+          && settingRef.current.smartRoutingEnabled === next.enabled)) setError(true);
+    } finally {
+      if (scope.active && flightRef.current === request) {
+        flightRef.current = undefined;
+        setPending(false);
+      }
+    }
+  };
+  const refresh = async (): Promise<void> => {
+    if (!scope.active || flightRef.current !== undefined || pending) return;
+    const request = {};
+    flightRef.current = request;
+    setPending(true);
+    try { await controller.refresh(); }
+    catch {
+      if (scope.active && flightRef.current === request) setError(true);
+    } finally {
+      if (scope.active && flightRef.current === request) {
+        flightRef.current = undefined;
+        setPending(false);
+      }
+    }
+  };
+  return <div className="subagent-smart-routing">
+    <div className="setting-row">
+      <div><strong>{t("settings.subagentModels.smartRouting")}</strong><span>{t("settings.subagentModels.smartRoutingDescription", { backend: backendName })}</span></div>
+      <button
+        type="button"
+        role="switch"
+        className="model-visibility-toggle"
+        aria-label={`${backendName} ${t("settings.subagentModels.smartRouting")}`}
+        aria-checked={enabled}
+        aria-pressed={enabled}
+        disabled={blocked}
+        onClick={() => { void persist(!enabled); }}
+      ><span /></button>
+    </div>
+    {!setting.smartRoutingAvailable && <p role="status">{setting.smartRoutingUnavailableReason || t("settings.subagentModels.smartRoutingUnavailable")}</p>}
+    {setting.smartRoutingRestartPending && <p role="status">{t("settings.subagentModels.smartRoutingPending")}</p>}
+    {!setting.smartRoutingRestartPending && setting.smartRoutingApplied && <p role="status">{t("settings.subagentModels.smartRoutingApplied", {
+      generation: setting.runtimeGeneration?.toString() ?? t("common.unknown")
+    })}</p>}
+    {!setting.smartRoutingRestartPending && !setting.smartRoutingApplied && setting.smartRoutingEnabled && setting.smartRoutingAvailable
+      && <p role="status">{t("settings.subagentModels.smartRoutingNotApplied")}</p>}
+    {pending && <p role="status">{t("common.working")}</p>}
+    {error && <p role="alert">{t("settings.subagentModels.smartRoutingSaveFailed")}</p>}
+    {conflict && <div role="alert"><p>{t("settings.subagentModels.smartRoutingConflict")}</p><Button disabled={pending} onClick={() => { setDraft(undefined); setError(false); }}>{t("settings.subagentModels.reload")}</Button><Button disabled={blocked} onClick={() => { void persist(enabled); }}>{t("settings.subagentModels.retryLatest")}</Button></div>}
+    {draft !== undefined && !conflict && !awaiting && !pending && <Button disabled={blocked} onClick={() => { void persist(enabled); }}>{t("common.retry")}</Button>}
     {awaiting && <div role="status"><p>{t("settings.subagentModels.confirming")}</p><Button disabled={pending || !loaded} onClick={() => { void refresh(); }}>{t("common.refresh")}</Button></div>}
   </div>;
 }

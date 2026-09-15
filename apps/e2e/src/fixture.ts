@@ -331,6 +331,8 @@ export class OrchestratorE2eFixture {
       },
       restartBackend,
       refreshBackendDescriptor,
+      holdSubagentSmartRoutingDispatch: () => undefined,
+      refreshSubagentSmartRouting: restartBackend,
       browserActivity: [],
       ...(options.terminals === undefined ? {} : { terminals: options.terminals }),
       ...auxiliaryServices,
