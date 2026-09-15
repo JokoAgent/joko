@@ -109,7 +109,8 @@ export const ORCHESTRATOR_RUNTIME_CRITICAL_IMPORTS = [
   "playwright-core",
   "sharp",
   "sqlite-vec",
-  "undici"
+  "undici",
+  "zod"
 ] as const;
 
 export interface SqliteVecRuntimeTarget {

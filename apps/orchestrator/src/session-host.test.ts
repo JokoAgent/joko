@@ -206,6 +206,40 @@ afterEach(async () => {
 });
 
 describe("SessionHost", () => {
+  it("publishes a fresh Task projection in its creation transaction for already-connected owners", async () => {
+    const fixture = await createFixture();
+    const observed: Array<{ readonly event: PersistedEvent; readonly visibleRevision: bigint }> = [];
+    const unsubscribe = fixture.store.subscribe((event) => {
+      if (!event.traceId.startsWith("created-session:")) return;
+      observed.push({
+        event,
+        visibleRevision: fixture.store.getSession(event.sessionId).revision
+      });
+    });
+
+    const created = await fixture.host.createSession({
+      operationId: "create-visible-to-existing-owner",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Existing owner observes this Task",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    });
+    unsubscribe();
+
+    expect(observed).toHaveLength(1);
+    expect(observed[0]).toMatchObject({
+      event: {
+        sessionId: created.value.sessionId,
+        operationId: "create-visible-to-existing-owner",
+        generation: 1,
+        payload: { type: "session_changed" }
+      }
+    });
+    expect(observed[0]!.event.revision).toBe(observed[0]!.visibleRevision);
+  });
+
   it.each([undefined, [], ["workspace_file"], ["workspace_line_range"], ["resource"], ["artifact"], ["workspace_directory", "workspace_file", "workspace_line_range", "resource", "artifact"]])(
     "gates every reference kind on explicit native mention options: %j", async (options) => {
       const adapter = new FakeBackendAdapter({

@@ -183,6 +183,12 @@ import {
 import { createManagedExitFence } from "./managed-exit-fence.js";
 import { probeManagedRuntimeActivity } from "./managed-runtime-activity.js";
 import {
+  createPackagedSmokeTask,
+  verifyPackagedSmokeTask,
+  type PackagedSmokeTask,
+  type PackagedSmokeTaskOptions
+} from "./packaged-smoke-task.js";
+import {
   canRespawnManagedOrchestratorAfterProbe,
   commitVerifiedManagedOrchestratorAdoption,
   completeVerifiedManagedOrchestratorLogout,
@@ -271,6 +277,7 @@ import {
   isAllowedMainFrameNavigation,
   isAllowedPackagedBundleResource,
   isAllowedRendererNetworkUrl,
+  isAllowedSessionWindowNavigation,
   isSafeExternalUrl,
   isSecureStorageBackend,
   isTrustedIpcSenderIdentity,
@@ -292,6 +299,7 @@ const packagedSmoke = process.env["JOKO_DESKTOP_PACKAGED_SMOKE"] === "1";
 const githubActionsPackagedSmoke = packagedSmoke && process.env["GITHUB_ACTIONS"] === "true";
 const packagedSmokeConnectOrigin = process.env["JOKO_DESKTOP_SMOKE_CONNECT_ORIGIN"];
 const packagedSmokePublicHttpOrigin = process.env["JOKO_DESKTOP_SMOKE_PUBLIC_HTTP_ORIGIN"];
+const packagedSmokeProviderOrigin = process.env["JOKO_DESKTOP_SMOKE_PROVIDER_ORIGIN"];
 const packagedSmokeResultPath = process.env["JOKO_DESKTOP_SMOKE_RESULT"];
 const packagedSmokeUserData = process.env["JOKO_DESKTOP_SMOKE_USER_DATA"];
 const desktopUpdateReleaseFeedUrl = resolveDesktopUpdateFeedUrl(process.env["JOKO_DESKTOP_UPDATE_FEED_URL"]);
@@ -973,7 +981,7 @@ function createWindow(): void {
     const timeout = setTimeout(() => {
       process.stderr.write("JOKO_DESKTOP_SMOKE_TIMEOUT\n");
       finishPackagedSmoke("JOKO_DESKTOP_SMOKE_TIMEOUT", 1);
-    }, 45_000);
+    }, 90_000);
     timeout.unref();
     window.webContents.once("did-finish-load", () => {
       void window.webContents.executeJavaScript(
@@ -1010,6 +1018,8 @@ function createWindow(): void {
           "      typeof window.jokoDesktop.updates?.relaunch === 'function' &&",
           "      typeof window.jokoDesktop.updates?.onStatus === 'function' &&",
           "      typeof window.jokoDesktop.window?.minimize === 'function' &&",
+          "      typeof window.jokoDesktop.window?.close === 'function' &&",
+          "      typeof window.jokoDesktop.sessionWindows?.open === 'function' &&",
           "      typeof window.jokoDesktop.runtimeProcessMonitor?.open === 'function' &&",
           "      typeof window.jokoDesktop.credentials?.get === 'function'",
           "    );",
@@ -1092,13 +1102,13 @@ function createWindow(): void {
           "})()"
         ].join("\n"),
         true
-      ).then((rendered: unknown) => {
-        clearTimeout(timeout);
+      ).then(async (rendered: unknown) => {
         if (rendered !== true) {
-          process.stderr.write("JOKO_DESKTOP_SMOKE_EMPTY_ROOT\n");
-          finishPackagedSmoke("JOKO_DESKTOP_SMOKE_EMPTY_ROOT", 1);
-          return;
+          throw new Error("The packaged product renderer did not return its exact ready marker.");
         }
+        await verifyPackagedSmokeSessionWindow(window);
+      }).then(() => {
+        clearTimeout(timeout);
         process.stdout.write("JOKO_DESKTOP_SMOKE_OK\n");
         finishPackagedSmoke("JOKO_DESKTOP_SMOKE_OK", 0);
       }, (error: unknown) => {
@@ -1129,6 +1139,246 @@ function safeSmokeError(error: unknown): string {
   return (error instanceof Error ? error.message : String(error ?? "unknown error"))
     .replace(/[\r\n\t]+/gu, " ")
     .slice(0, 500);
+}
+
+async function verifyPackagedSmokeSessionWindow(owner: BrowserWindow): Promise<void> {
+  if (owner.isDestroyed() || owner.webContents.isDestroyed()) {
+    throw new Error("Packaged smoke owner window retired before Task-window verification.");
+  }
+  const runtime = managedOrchestratorRuntime;
+  if (managedOrchestratorStatus.state !== "ready" || runtime === undefined
+    || managedOrchestratorConnection === undefined
+    || !sameManagedOrchestratorConnection(managedOrchestratorStatus.connection, runtime.connection)
+    || !sameManagedOrchestratorConnection(managedOrchestratorConnection, runtime.connection)) {
+    throw new Error("Packaged smoke has no exact managed Orchestrator authority.");
+  }
+  const connection = runtime.connection;
+  const taskOptions = {
+    connection,
+    displayName: "Packaged application-window task",
+    providerOrigin: packagedSmokeProviderOrigin,
+    readAuthKey: readCredential,
+    isAuthorityCurrent: (candidate: DesktopManagedOrchestratorConnection) =>
+      managedOrchestratorStatus.state === "ready"
+      && managedOrchestratorRuntime === runtime
+      && !managedOrchestratorExitFence.shutdownStarted
+      && sameManagedOrchestratorConnection(managedOrchestratorStatus.connection, candidate)
+      && managedOrchestratorConnection !== undefined
+      && sameManagedOrchestratorConnection(managedOrchestratorConnection, candidate)
+      && sameManagedOrchestratorConnection(runtime.connection, candidate)
+  } satisfies PackagedSmokeTaskOptions;
+  const task = await createPackagedSmokeTask(taskOptions);
+  recordPackagedSmokeProgress("durable_task_created");
+  const opening = await requestPackagedSmokeTaskWindow(owner, task);
+  if (!opening.mainTaskReady || !opening.firstFresh || !opening.secondFocused) {
+    throw new Error("Packaged smoke did not open and refocus one Task window through the formal preload.");
+  }
+  recordPackagedSmokeProgress("task_window_open_requested");
+
+  const taskWindow = sessionWindows.get(task.sessionId);
+  const openTaskWindows = [...sessionWindows.values()].filter((window) => !window.isDestroyed());
+  if (taskWindow === undefined || taskWindow.isDestroyed() || openTaskWindows.length !== 1
+    || openTaskWindows[0] !== taskWindow) {
+    throw new Error("Packaged smoke duplicated or lost the Task-window owner.");
+  }
+  const taskContents = taskWindow.webContents;
+  if (sessionWindowIdsByContents.get(taskContents) !== task.sessionId) {
+    throw new Error("Packaged smoke Task window lost its main-process identity.");
+  }
+  await waitForPackagedSmokeTaskPresentation(taskWindow, task);
+  if (sessionWindows.get(task.sessionId) !== taskWindow) {
+    throw new Error("Packaged smoke Task-window owner changed while its UI was loading.");
+  }
+  recordPackagedSmokeProgress("task_window_product_ready");
+
+  if (nativeTaskStatusSupported) {
+    const visibilityDeadline = Date.now() + 5_000;
+    while (Date.now() < visibilityDeadline
+      && nativeTaskStatusVisibleSessionsByContents.get(taskContents)?.includes(task.sessionId) !== true) {
+      await waitForPackagedSmokePoll();
+    }
+    if (nativeTaskStatusVisibleSessionsByContents.get(taskContents)?.includes(task.sessionId) !== true) {
+      throw new Error("Packaged smoke Task window did not publish its visible Task state.");
+    }
+  }
+
+  try {
+    await taskContents.executeJavaScript("window.jokoDesktop.window.close()", true);
+  } catch (error) {
+    if (!taskWindow.isDestroyed()) throw error;
+  }
+  const closeDeadline = Date.now() + 10_000;
+  while (Date.now() < closeDeadline && (!taskWindow.isDestroyed() || sessionWindows.has(task.sessionId))) {
+    await waitForPackagedSmokePoll();
+  }
+  if (!taskWindow.isDestroyed() || sessionWindows.has(task.sessionId)
+    || sessionWindowIdsByContents.has(taskContents)
+    || sessionWindowStates.has(task.sessionId)
+    || nativeTaskStatusVisibleSessionsByContents.has(taskContents)) {
+    throw new Error("Packaged smoke Task-window retirement left owned or visible state behind.");
+  }
+  if (owner.isDestroyed() || owner.webContents.isDestroyed()) {
+    throw new Error("Closing the packaged Task window also retired the owner application window.");
+  }
+  recordPackagedSmokeProgress("task_window_closed_cleanly");
+
+  await verifyPackagedSmokeTask(taskOptions, task);
+  const ownerStillShowsTask = await packagedSmokeWindowShowsTask(owner, task);
+  if (!ownerStillShowsTask) {
+    throw new Error("Closing the packaged Task window removed the accepted Task from the owner product UI.");
+  }
+  recordPackagedSmokeProgress("durable_task_reverified");
+}
+
+async function requestPackagedSmokeTaskWindow(
+  owner: BrowserWindow,
+  task: PackagedSmokeTask
+): Promise<{ readonly mainTaskReady: boolean; readonly firstFresh: boolean; readonly secondFocused: boolean }> {
+  const value = await owner.webContents.executeJavaScript([
+    "(async () => {",
+    `  const sessionId = ${JSON.stringify(task.sessionId)};`,
+    `  const displayName = ${JSON.stringify(task.displayName)};`,
+    "  const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));",
+    "  const taskPane = () => {",
+    "    const timeline = [...document.querySelectorAll('[data-timeline-session-id]')].find((element) =>",
+    "      element.getAttribute('data-timeline-session-id') === sessionId);",
+    "    const pane = timeline?.closest('.session-pane');",
+    "    return pane instanceof HTMLElement && pane.getAttribute('aria-label') === displayName ? pane : undefined;",
+    "  };",
+    "  const taskHash = `#/tasks/${encodeURIComponent(sessionId)}`;",
+    "  location.hash = taskHash;",
+    "  const deadline = Date.now() + 20_000;",
+    "  while (taskPane() === undefined && Date.now() < deadline) {",
+    "    // The service accepts the Task before the owner's event stream must",
+    "    // project it. App routing correctly rejects an identity absent from",
+    "    // its current snapshot, so retry the requested route until that same",
+    "    // owner has observed the durable Task.",
+    "    if (location.hash !== taskHash) location.hash = taskHash;",
+    "    await sleep(100);",
+    "  }",
+    "  const mainTaskReady = Boolean(document.querySelector('.app')) &&",
+    "    !document.querySelector('.connection-screen') && taskPane() !== undefined;",
+    "  if (!mainTaskReady || typeof window.jokoDesktop?.sessionWindows?.open !== 'function') {",
+    "    const diagnostic = {",
+    "      hash: location.hash,",
+    "      app: Boolean(document.querySelector('.app')),",
+    "      connectionScreen: Boolean(document.querySelector('.connection-screen')),",
+    "      timelineSessionIds: [...document.querySelectorAll('[data-timeline-session-id]')]",
+    "        .map((element) => element.getAttribute('data-timeline-session-id')),",
+    "      paneLabels: [...document.querySelectorAll('.session-pane')]",
+    "        .map((element) => element.getAttribute('aria-label')),",
+    "      alerts: [...document.querySelectorAll('[role=\"alert\"]')]",
+    "        .map((element) => element.textContent?.trim().slice(0, 160) ?? '').filter(Boolean).slice(0, 4)",
+    "    };",
+    "    throw new Error(`The owner product UI did not observe the durable Task: ${JSON.stringify(diagnostic)}`);",
+    "  }",
+    "  const first = await window.jokoDesktop.sessionWindows.open(sessionId);",
+    "  const second = await window.jokoDesktop.sessionWindows.open(sessionId);",
+    "  return {",
+    "    mainTaskReady,",
+    "    firstFresh: first?.focusedExisting === false,",
+    "    secondFocused: second?.focusedExisting === true",
+    "  };",
+    "})()"
+  ].join("\n"), true) as unknown;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("Packaged smoke Task-window opening returned an invalid result.");
+  }
+  const result = value as Record<string, unknown>;
+  if (Object.keys(result).sort().join(",") !== "firstFresh,mainTaskReady,secondFocused"
+    || typeof result["mainTaskReady"] !== "boolean"
+    || typeof result["firstFresh"] !== "boolean"
+    || typeof result["secondFocused"] !== "boolean") {
+    throw new Error("Packaged smoke Task-window opening returned an invalid result.");
+  }
+  return {
+    mainTaskReady: result["mainTaskReady"],
+    firstFresh: result["firstFresh"],
+    secondFocused: result["secondFocused"]
+  };
+}
+
+async function waitForPackagedSmokeTaskPresentation(
+  window: BrowserWindow,
+  task: PackagedSmokeTask
+): Promise<void> {
+  const deadline = Date.now() + 20_000;
+  let lastLocation = "unloaded";
+  while (Date.now() < deadline) {
+    if (window.isDestroyed() || window.webContents.isDestroyed()) {
+      throw new Error("Packaged smoke Task window retired before its product UI loaded.");
+    }
+    try {
+      const value = await window.webContents.executeJavaScript([
+        "(() => {",
+        `  const sessionId = ${JSON.stringify(task.sessionId)};`,
+        "  const timelines = [...document.querySelectorAll('[data-timeline-session-id]')];",
+        "  const timeline = timelines.find((element) => element.getAttribute('data-timeline-session-id') === sessionId);",
+        "  const pane = timeline?.closest('.session-pane');",
+        "  return {",
+        "    href: location.href,",
+        "    origin: location.origin,",
+        "    hash: location.hash,",
+        "    product: Boolean(document.querySelector('.app')),",
+        "    connectionScreen: Boolean(document.querySelector('.connection-screen')),",
+        "    preload: typeof window.jokoDesktop?.window?.close === 'function' &&",
+        "      typeof window.jokoDesktop?.sessionWindows?.open === 'function',",
+        "    nodeGlobalsAbsent: typeof require === 'undefined' && typeof process === 'undefined',",
+        "    timelineCount: timelines.length,",
+        "    sessionId: timeline?.getAttribute('data-timeline-session-id') ?? '',",
+        "    displayName: pane instanceof HTMLElement ? pane.getAttribute('aria-label') ?? '' : ''",
+        "  };",
+        "})()"
+      ].join("\n"), true) as unknown;
+      if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+        const observation = value as Record<string, unknown>;
+        if (typeof observation["href"] === "string") lastLocation = observation["href"];
+        if (observation["product"] === true
+          && observation["connectionScreen"] === false
+          && observation["preload"] === true
+          && observation["nodeGlobalsAbsent"] === true
+          && observation["timelineCount"] === 1
+          && observation["sessionId"] === task.sessionId
+          && observation["displayName"] === task.displayName) {
+          const href = String(observation["href"]);
+          const url = new URL(href);
+          if (observation["origin"] !== "joko://app"
+            || url.protocol !== "joko:" || url.hostname !== "app" || url.port !== ""
+            || url.username !== "" || url.password !== ""
+            || [...url.searchParams.keys()].sort().join(",") !== "bootSession,sessionWindow"
+            || url.searchParams.get("sessionWindow") !== "1"
+            || url.searchParams.get("bootSession") !== task.sessionId
+            || url.hash !== `#/tasks/${encodeURIComponent(task.sessionId)}`) {
+            throw new Error("Packaged smoke Task window loaded an untrusted or inexact entry URL.");
+          }
+          return;
+        }
+      }
+    } catch (error) {
+      if (window.isDestroyed() || window.webContents.isDestroyed()) throw error;
+    }
+    await waitForPackagedSmokePoll();
+  }
+  throw new Error(`Packaged smoke Task product UI did not become ready (${lastLocation}).`);
+}
+
+async function packagedSmokeWindowShowsTask(window: BrowserWindow, task: PackagedSmokeTask): Promise<boolean> {
+  const value = await window.webContents.executeJavaScript([
+    "(() => {",
+    `  const sessionId = ${JSON.stringify(task.sessionId)};`,
+    `  const displayName = ${JSON.stringify(task.displayName)};`,
+    "  const timeline = [...document.querySelectorAll('[data-timeline-session-id]')].find((element) =>",
+    "    element.getAttribute('data-timeline-session-id') === sessionId);",
+    "  const pane = timeline?.closest('.session-pane');",
+    "  return Boolean(document.querySelector('.app')) && !document.querySelector('.connection-screen') &&",
+    "    pane instanceof HTMLElement && pane.getAttribute('aria-label') === displayName;",
+    "})()"
+  ].join("\n"), true) as unknown;
+  return value === true;
+}
+
+function waitForPackagedSmokePoll(): Promise<void> {
+  return new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
 }
 
 function finishPackagedSmoke(result: string, exitCode: number): void {
@@ -1921,13 +2171,13 @@ async function openSessionApplicationWindow(
     return { action: "deny" };
   });
   window.webContents.on("will-navigate", (event, url) => {
-    if (!isAllowedMainFrameNavigation(url, navigationPolicy)) {
+    if (!isAllowedSessionWindowNavigation(url, sessionId, navigationPolicy)) {
       event.preventDefault();
       if (isSafeExternalUrl(url)) void openExternalSafely(url).catch(() => undefined);
     }
   });
   window.webContents.on("will-redirect", (event, url) => {
-    if (!isAllowedMainFrameNavigation(url, navigationPolicy)) event.preventDefault();
+    if (!isAllowedSessionWindowNavigation(url, sessionId, navigationPolicy)) event.preventDefault();
   });
   window.webContents.on("will-attach-webview", (event) => event.preventDefault());
   window.webContents.on("select-bluetooth-device", (event, _devices, callback) => {
@@ -5247,7 +5497,8 @@ function trustedApplicationWindowForContents(contents: WebContents): BrowserWind
     return isRuntimeProcessMonitorNavigation(contents.getURL()) ? owner : undefined;
   }
   const sessionId = sessionWindowIdsByContents.get(contents);
-  if (sessionId !== undefined && sessionWindows.get(sessionId) === owner) return owner;
+  if (sessionId !== undefined && sessionWindows.get(sessionId) === owner
+    && isAllowedSessionWindowNavigation(contents.getURL(), sessionId, navigationPolicy)) return owner;
   const extensionId = extensionWindowIdsByContents.get(contents);
   return extensionId !== undefined && extensionWindows.get(extensionId) === owner
     && isAllowedExtensionWindowNavigation(contents.getURL(), extensionId, navigationPolicy) ? owner : undefined;

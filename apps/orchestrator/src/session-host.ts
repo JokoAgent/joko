@@ -8501,7 +8501,7 @@ export class SessionHost {
               createdAt: presentationCreatedAt,
               updatedAt: presentationAt
             };
-            store.createSession(descriptor, {
+            const created = store.createSession(descriptor, {
               nativeSessionBlank: nativeStart.kind === "new"
                 && nativeStart.parentNativeReference === undefined
             });
@@ -8514,6 +8514,22 @@ export class SessionHost {
                 sessionId,
                 expectedRevision: created.revision,
                 movedAt: presentationAt
+              });
+            } else {
+              // A creator refreshes its own Snapshot after the mutation, but
+              // every already-connected owner relies on the durable Event
+              // stream. Publish the complete newly created Task in this same
+              // transaction so independent windows cannot miss its identity.
+              store.appendEvent({
+                id: stableId("event", `${input.operationId}:created-session`),
+                backendId: created.descriptor.backendId,
+                targetId: created.descriptor.targetId,
+                sessionId,
+                operationId: input.operationId,
+                generation: created.descriptor.binding.generation,
+                emittedAt: now,
+                traceId: `created-session:${sessionId}:${created.descriptor.binding.generation}`,
+                payload: { type: "session_changed" }
               });
             }
             return { sessionId };

@@ -708,7 +708,7 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
   if (items.length === 0) {
     return (
       <div className="timeline-shell" style={{ "--timeline-bottom-inset": `${Math.max(0, bottomInset)}px` } as CSSProperties}>
-        <div ref={scrollRef} className="timeline timeline--empty" data-selection-quote-context="" aria-busy={historyLoading || undefined} aria-label={t("timeline.label")} tabIndex={0}>
+        <div ref={scrollRef} className="timeline timeline--empty" data-timeline-session-id={sessionId} data-selection-quote-context="" aria-busy={historyLoading || undefined} aria-label={t("timeline.label")} tabIndex={0}>
           {derivationOrigin !== undefined && <SessionDerivationMarker origin={derivationOrigin} onOpen={onOpenDerivationOrigin} t={t} />}
           <div className="timeline-welcome">
             <div className="timeline-welcome__mark">{historyError === undefined ? <Sparkles aria-hidden="true" /> : <AlertCircle aria-hidden="true" />}</div>

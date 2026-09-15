@@ -80,12 +80,20 @@ try {
   throw error;
 }
 const connectSmoke = await createConnectSmokeServer();
+let providerSmoke;
+try {
+  providerSmoke = await createProviderSmokeServer();
+} catch (error) {
+  await connectSmoke.close();
+  throw error;
+}
 const childEnvironment = {
   ...process.env,
   ELECTRON_ENABLE_LOGGING: "1",
   JOKO_DESKTOP_PACKAGED_SMOKE: "1",
   JOKO_DESKTOP_SMOKE_CONNECT_ORIGIN: connectSmoke.origin,
   JOKO_DESKTOP_SMOKE_PUBLIC_HTTP_ORIGIN: connectSmoke.publicOrigin,
+  JOKO_DESKTOP_SMOKE_PROVIDER_ORIGIN: providerSmoke.origin,
   JOKO_DESKTOP_SMOKE_RESULT: markerPath,
   JOKO_DESKTOP_SMOKE_USER_DATA: smokeUserDataPath
 };
@@ -135,23 +143,30 @@ try {
   });
 } finally {
   clearTimeout(timeout);
-  await connectSmoke.close();
+  await Promise.all([connectSmoke.close(), providerSmoke.close()]);
 }
 const marker = existsSync(markerPath) ? readFileSync(markerPath, "utf8").trim() : "";
 const progressPath = `${markerPath}.progress`;
 const progress = existsSync(progressPath) ? readFileSync(progressPath, "utf8").trim().replace(/\n/gu, " -> ") : "";
 const managedOrigin = readManagedOrigin(resolve(markerDirectory, "user-data", "managed-orchestrator-host", "connection.json"));
 const managedOrchestratorStopped = managedOrigin === undefined || await waitForManagedOrchestratorExit(managedOrigin, 5_000);
-rmSync(markerDirectory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
-if (
+const failed = (
   timedOut || marker !== "JOKO_DESKTOP_SMOKE_OK" || result.code !== 0 || result.signal !== null ||
   connectSmoke.observations.preflightOrigin !== "joko://app" ||
   connectSmoke.observations.requestOrigin !== "joko://app" ||
   connectSmoke.observations.requestBody !== "{}" ||
-  connectSmoke.observations.publicRequestSeen || !managedOrchestratorStopped
-) {
+  connectSmoke.observations.publicRequestSeen ||
+  providerSmoke.observations.unexpectedRequests.length > 0 ||
+  !managedOrchestratorStopped
+);
+if (!failed || process.env.JOKO_DESKTOP_SMOKE_KEEP_FAILED !== "1") {
+  rmSync(markerDirectory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+} else {
+  process.stderr.write(`JOKO_DESKTOP_SMOKE_RETAINED ${markerDirectory}\n`);
+}
+if (failed) {
   throw new Error(
-    `Packaged desktop smoke failed (platform=${process.platform}, timeoutMs=${timeoutMs}, code=${String(result.code)}, signal=${String(result.signal)}, marker=${marker}, progress=${progress}, sqliteVec=${sqliteVecSmoke.version}, extensionLibrary=${extensionLibrarySmoke.version}, connect=${JSON.stringify(connectSmoke.observations)}): ${stderr.slice(-1_000)}`
+    `Packaged desktop smoke failed (platform=${process.platform}, timeoutMs=${timeoutMs}, code=${String(result.code)}, signal=${String(result.signal)}, marker=${marker}, progress=${progress}, sqliteVec=${sqliteVecSmoke.version}, extensionLibrary=${extensionLibrarySmoke.version}, connect=${JSON.stringify(connectSmoke.observations)}, provider=${JSON.stringify(providerSmoke.observations)}): ${stderr.slice(-1_000)}`
   );
 }
 
@@ -345,9 +360,39 @@ async function createConnectSmokeServer() {
   };
 }
 
+async function createProviderSmokeServer() {
+  const observations = { requests: [], unexpectedRequests: [] };
+  const server = createServer((request, response) => {
+    const identity = `${request.method ?? "UNKNOWN"} ${request.url ?? ""}`;
+    observations.requests.push(identity);
+    if (request.method === "GET" && request.url === "/v1/models") {
+      response.writeHead(200, { "content-type": "application/json", connection: "close" });
+      response.end(JSON.stringify({
+        object: "list",
+        data: [{ id: "packaged-smoke-model", object: "model", created: 0, owned_by: "joko" }]
+      }));
+      return;
+    }
+    observations.unexpectedRequests.push(identity);
+    response.writeHead(404, { "content-type": "application/json", connection: "close" });
+    response.end('{"error":{"message":"No inference request is expected during Task creation."}}');
+  });
+  await new Promise((resolvePromise, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolvePromise);
+  });
+  const address = server.address();
+  if (address === null || typeof address === "string") throw new Error("Provider smoke server did not bind an IP port.");
+  return {
+    origin: `http://127.0.0.1:${address.port}`,
+    observations,
+    close: () => new Promise((resolvePromise) => server.close(() => resolvePromise()))
+  };
+}
+
 function boundedTimeout(value) {
   const parsed = value === undefined ? Number.NaN : Number(value);
-  return Number.isSafeInteger(parsed) && parsed >= 30_000 && parsed <= 120_000 ? parsed : 60_000;
+  return Number.isSafeInteger(parsed) && parsed >= 60_000 && parsed <= 180_000 ? parsed : 120_000;
 }
 
 function parseArguments(arguments_) {
