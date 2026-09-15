@@ -424,6 +424,11 @@ export function Sidebar(props: SidebarProps): JSX.Element {
   } | undefined>(undefined);
   const [listSettingsContextMenuRequest, setListSettingsContextMenuRequest] = useState<SidebarListContextMenuRequest>();
   const [selectedSessionIds, setSelectedSessionIds] = useState<ReadonlySet<string>>(() => new Set());
+  const sessionSelectionOwnerKey = JSON.stringify([
+    props.sidebarOwnerId,
+    props.machineControl?.activeProfile.id ?? ""
+  ]);
+  const sessionSelectionOwnerRef = useRef(sessionSelectionOwnerKey);
   const [deleteSchedule, setDeleteSchedule] = useState<DeleteScheduleRequest>();
   const [deleteScheduleDisposition, setDeleteScheduleDisposition] = useState<GeneratedSessionDisposition>("keep");
   const [deleteSchedulePending, setDeleteSchedulePending] = useState(false);
@@ -529,6 +534,11 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     recentlyViewedAtMs: priorityStateRef.current.recentlyViewedAtMs
   };
   const callbacks = sessionCallbacks(props, (session, modifiers) => {
+    const sameOwner = sessionSelectionOwnerRef.current === sessionSelectionOwnerKey;
+    if (!sameOwner) {
+      sessionSelectionOwnerRef.current = sessionSelectionOwnerKey;
+      selectionAnchorRef.current = undefined;
+    }
     if (modifiers !== undefined && (modifiers.metaKey || modifiers.ctrlKey || modifiers.shiftKey)) {
       const visibleIds = visibleSidebarSessionIds(sessionListRef.current);
       if (modifiers.shiftKey) {
@@ -541,7 +551,9 @@ export function Sidebar(props: SidebarProps): JSX.Element {
           ? [session.id]
           : visibleIds.slice(Math.min(anchorIndex, targetIndex), Math.max(anchorIndex, targetIndex) + 1);
         setSelectedSessionIds((current) => {
-          const next = modifiers.metaKey || modifiers.ctrlKey ? new Set(current) : new Set<string>();
+          const next = modifiers.metaKey || modifiers.ctrlKey
+            ? new Set(sameOwner ? current : EMPTY_SESSION_ID_SET)
+            : new Set<string>();
           for (const sessionId of range) next.add(sessionId);
           return next;
         });
@@ -549,7 +561,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
         return false;
       }
       setSelectedSessionIds((current) => {
-        const next = new Set(current);
+        const next = new Set(sameOwner ? current : EMPTY_SESSION_ID_SET);
         if (next.has(session.id)) next.delete(session.id);
         else next.add(session.id);
         return next;
@@ -557,11 +569,11 @@ export function Sidebar(props: SidebarProps): JSX.Element {
       selectionAnchorRef.current = session.id;
       return false;
     }
-    if (selectedSessionIds.size > 0) setSelectedSessionIds(new Set());
+    if (sameOwner && selectedSessionIds.size > 0) setSelectedSessionIds(new Set());
     selectionAnchorRef.current = session.id;
     holdSidebarViewedPriorityRank(priorityStateRef.current, session, priorityCaptureContext);
     return true;
-  }, selectedSessionIds);
+  }, sessionSelectionOwnerRef.current === sessionSelectionOwnerKey ? selectedSessionIds : EMPTY_SESSION_ID_SET);
   const browsableTargetIds = useMemo(() => new Set(snapshot.targets
     .filter((target) => snapshot.workspaces.some((workspace) => workspace.id === target.workspaceId)
       && snapshot.backends.find((backend) => backend.id === target.backendId)?.capabilities.get("workspace.files")?.supported === true)
@@ -836,10 +848,16 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     ? undefined
     : snapshot.targets.find((candidate) => candidate.id === activeSession.targetId);
   const searchPopupOpen = normalizedQuery !== "";
-  const selectedSessions = useMemo(
-    () => snapshot.sessions.filter((session) => selectedSessionIds.has(session.id)),
-    [selectedSessionIds, snapshot.sessions]
+  const ownerSelectedSessionIds = sessionSelectionOwnerRef.current === sessionSelectionOwnerKey
+    ? selectedSessionIds
+    : EMPTY_SESSION_ID_SET;
+  const sessionsById = useMemo(
+    () => new Map(snapshot.sessions.map((session) => [session.id, session])),
+    [snapshot.sessions]
   );
+  const selectedSessions = useMemo(() => [...ownerSelectedSessionIds]
+    .map((sessionId) => sessionsById.get(sessionId))
+    .filter((session): session is SessionView => session !== undefined), [ownerSelectedSessionIds, sessionsById]);
   const activeSearchDescendant = activeSearchOption >= 0 && allSearchOptions[activeSearchOption] !== undefined
     ? searchOptionId(activeSearchOption)
     : undefined;
@@ -1085,9 +1103,8 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     }
   }, [messageSearchBackendId, messageSearchTargetIds, snapshot.backends, visibleTargets]);
 
-  useLayoutEffect(() => {
+  const pruneSelectionToVisibleRows = useCallback((): void => {
     const visible = new Set(visibleSidebarSessionIds(sessionListRef.current));
-    if (searchPopupOpen) visible.clear();
     setSelectedSessionIds((current) => {
       const next = new Set([...current].filter((sessionId) => visible.has(sessionId)));
       return sameStringSet(current, next) ? current : next;
@@ -1095,7 +1112,46 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     if (selectionAnchorRef.current !== undefined && !visible.has(selectionAnchorRef.current)) {
       selectionAnchorRef.current = undefined;
     }
-  }, [searchPopupOpen, sessions, sidebarLayout.collapsedDialogue, sidebarLayout.collapsedProjectIds]);
+  }, []);
+
+  useLayoutEffect(() => {
+    if (sessionSelectionOwnerRef.current !== sessionSelectionOwnerKey) {
+      sessionSelectionOwnerRef.current = sessionSelectionOwnerKey;
+      selectionAnchorRef.current = undefined;
+      setSelectedSessionIds((current) => current.size === 0 ? current : new Set());
+      return;
+    }
+    if (selectedSessionIds.size > 0) pruneSelectionToVisibleRows();
+  });
+
+  useEffect(() => {
+    if (ownerSelectedSessionIds.size === 0) return;
+    const root = sessionListRef.current;
+    const OwnerMutationObserver = root?.ownerDocument.defaultView?.MutationObserver;
+    if (root === null || root === undefined || OwnerMutationObserver === undefined) return;
+    const observer = new OwnerMutationObserver(pruneSelectionToVisibleRows);
+    observer.observe(root, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["hidden", "aria-hidden", "inert", "data-sidebar-row-order"]
+    });
+    return () => observer.disconnect();
+  }, [ownerSelectedSessionIds.size, pruneSelectionToVisibleRows, sessionSelectionOwnerKey]);
+
+  const takeVisibleBulkSelection = (): readonly SessionView[] => {
+    if (sessionSelectionOwnerRef.current !== sessionSelectionOwnerKey) return [];
+    const visible = new Set(visibleSidebarSessionIds(sessionListRef.current));
+    return [...selectedSessionIds]
+      .filter((sessionId) => visible.has(sessionId))
+      .map((sessionId) => sessionsById.get(sessionId))
+      .filter((session): session is SessionView => session !== undefined);
+  };
+
+  const clearSessionSelection = (): void => {
+    setSelectedSessionIds(new Set());
+    selectionAnchorRef.current = undefined;
+  };
 
   const activateSearchOption = (option: SidebarSearchOption | undefined): void => {
     if (option === undefined) return;
@@ -1681,9 +1737,9 @@ export function Sidebar(props: SidebarProps): JSX.Element {
         }}>
         {!searchPopupOpen && selectedSessions.length > 0 && <div className="sidebar-bulk-actions" role="status">
           <span><strong>{selectedSessions.length}</strong> {t("projects.tasks")}</span>
-          <IconButton label={t("session.archive")} disabled={!selectedSessions.some((session) => !session.archived)} disabledReason={t("session.archive")} onClick={() => { const batch = selectedSessions; setSelectedSessionIds(new Set()); selectionAnchorRef.current = undefined; props.onBulkArchive?.(batch); }}><Archive aria-hidden="true" /></IconButton>
-          <IconButton label={t("session.delete")} onClick={() => { const batch = selectedSessions; setSelectedSessionIds(new Set()); selectionAnchorRef.current = undefined; props.onBulkDelete?.(batch); }}><Trash2 aria-hidden="true" /></IconButton>
-          <IconButton label={t("common.dismiss")} onClick={() => { setSelectedSessionIds(new Set()); selectionAnchorRef.current = undefined; }}><X aria-hidden="true" /></IconButton>
+          <IconButton label={t("session.archive")} disabled={!selectedSessions.some((session) => !session.archived)} disabledReason={t("session.archive")} onClick={() => { const batch = takeVisibleBulkSelection(); clearSessionSelection(); if (batch.length > 0) props.onBulkArchive?.(batch); }}><Archive aria-hidden="true" /></IconButton>
+          <IconButton label={t("session.delete")} onClick={() => { const batch = takeVisibleBulkSelection(); clearSessionSelection(); if (batch.length > 0) props.onBulkDelete?.(batch); }}><Trash2 aria-hidden="true" /></IconButton>
+          <IconButton label={t("common.dismiss")} onClick={clearSessionSelection}><X aria-hidden="true" /></IconButton>
         </div>}
         {!searchPopupOpen && <SidebarListSettings
           layout={sidebarLayout}
@@ -4966,7 +5022,7 @@ function sidebarRightStatusLabel(status: SidebarRightStatus, t: Translator): str
 
 export function visibleSidebarSessionIds(root: HTMLElement | null): readonly string[] {
   if (root === null) return [];
-  const rows = [...root.querySelectorAll<HTMLElement>(".session-row [data-session-id]")];
+  const rows = [...root.querySelectorAll<HTMLElement>(".session-row [data-session-id]:not([data-machine-profile])")];
   const cardGroups = new Map<HTMLElement, Array<{ readonly row: HTMLElement; readonly domIndex: number; readonly order: number }>>();
   rows.forEach((row, domIndex) => {
     const group = row.closest<HTMLElement>("[data-sidebar-card-order='row-major']");
@@ -4984,7 +5040,7 @@ export function visibleSidebarSessionIds(root: HTMLElement | null): readonly str
   const append = (row: HTMLElement): void => {
     const sessionId = row.dataset.sessionId;
     if (sessionId === undefined || sessionId === "" || seen.has(sessionId)) return;
-    if (row.closest("[aria-hidden='true'], [inert]") !== null) return;
+    if (!isRenderedSidebarSessionRow(row)) return;
     seen.add(sessionId);
     result.push(sessionId);
   };
@@ -5002,6 +5058,18 @@ export function visibleSidebarSessionIds(root: HTMLElement | null): readonly str
       .forEach(({ row: groupedRow }) => append(groupedRow));
   }
   return result;
+}
+
+function isRenderedSidebarSessionRow(row: HTMLElement): boolean {
+  const ownerWindow = row.ownerDocument.defaultView;
+  for (let current: HTMLElement | null = row; current !== null; current = current.parentElement) {
+    if (current.hidden || current.getAttribute("aria-hidden") === "true" || current.hasAttribute("inert")) return false;
+    const style = ownerWindow?.getComputedStyle(current);
+    if (style === undefined) continue;
+    if (style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse") return false;
+    if (style.opacity !== "" && Number(style.opacity) === 0) return false;
+  }
+  return true;
 }
 
 function sameStringSet(left: ReadonlySet<string>, right: ReadonlySet<string>): boolean {

@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { SessionView, TargetView } from "./model.js";
 import {
   DEFAULT_SIDEBAR_OWNER_LAYOUT,
+  SIDEBAR_DIALOGUE_FILTER_ID,
   advanceSidebarViewedPriority,
   createSidebarDoneAttentionVisibilityState,
   createSidebarViewedPriorityState,
@@ -134,6 +135,23 @@ describe("owner-scoped sidebar layout", () => {
     }, now).map((candidate) => candidate.id)).toEqual(["project"]);
     expect(toggleSidebarProjectFilter("all", "target-a")).toEqual(["target-a"]);
     expect(toggleSidebarProjectFilter(["target-a"], "target-a")).toBe("all");
+  });
+
+  it("filters hidden project membership as Dialogue without changing strict created order", () => {
+    const hidden = new Set(["target-hidden"]);
+    const olderDialogue = { ...session("dialogue", "idle", 90), createdAt: 10 };
+    const hiddenProject = { ...session("hidden-project", "idle", 10), projectId: "target-hidden", createdAt: 30 };
+    const visibleProject = { ...session("visible-project", "idle", 100), projectId: "target-visible", createdAt: 40 };
+    const filtered = filterSidebarSessions([olderDialogue, hiddenProject, visibleProject], {
+      backendId: "all",
+      lastActivity: "all",
+      projectFilter: [SIDEBAR_DIALOGUE_FILTER_ID]
+    }, 1_000, hidden);
+
+    expect(filtered.map((candidate) => candidate.id)).toEqual(["dialogue", "hidden-project"]);
+    expect(sortSidebarSessions(filtered, "created").map((candidate) => candidate.id))
+      .toEqual(["hidden-project", "dialogue"]);
+    expect(hiddenProject.projectId).toBe("target-hidden");
   });
 });
 
