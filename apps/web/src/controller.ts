@@ -1982,7 +1982,7 @@ export function useAppController(): AppController {
     deleteSession: (sessionId, deleteNative) => gateway().deleteSession(sessionId, deleteNative),
     probeTargetWorktree: (targetId, signal) => gateway().probeTargetWorktree(targetId, signal),
     listTargetWorktreeSources: (targetId, signal) => gateway().listTargetWorktreeSources(targetId, signal),
-    discoverNativeSessions: (targetId) => gateway().discoverNativeSessions(targetId),
+    discoverNativeSessions: (targetId, signal) => gateway().discoverNativeSessions(targetId, signal),
     scanNativeSessionCatalog: (backendId, options) => gateway().scanNativeSessionCatalog(backendId, options),
     archiveTarget: (targetId, archived) => gateway().archiveTarget(targetId, archived),
     deleteTarget: (targetId, deleteManagedWorkspace) => gateway().deleteTarget(targetId, deleteManagedWorkspace),

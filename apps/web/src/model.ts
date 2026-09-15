@@ -4514,7 +4514,7 @@ export interface OperationApi {
   createSession(draft: NewSessionDraft): Promise<{ readonly sessionId: string; readonly generation: bigint }>;
   probeTargetWorktree(targetId: string, signal?: AbortSignal): Promise<TargetWorktreeProbeView>;
   listTargetWorktreeSources(targetId: string, signal?: AbortSignal): Promise<readonly WorktreeSourceView[]>;
-  discoverNativeSessions(targetId: string): Promise<readonly NativeSessionCandidateView[]>;
+  discoverNativeSessions(targetId: string, signal?: AbortSignal): Promise<readonly NativeSessionCandidateView[]>;
   scanNativeSessionCatalog(
     backendId: string,
     options?: { readonly signal?: AbortSignal; readonly force?: boolean }

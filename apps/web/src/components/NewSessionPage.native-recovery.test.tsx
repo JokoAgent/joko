@@ -14,6 +14,7 @@ import {
   emptySnapshot,
   type AppSnapshot,
   type BrowserCommentDraftItem,
+  type ConnectionProfile,
   type ComposerDraft,
   type ComposerInlineMentionRange,
   type ComposerMentionDraft,
@@ -598,7 +599,7 @@ describe("new-task native draft recovery", () => {
     const { container } = await renderPage(controller({ discover }), vi.fn().mockResolvedValue(undefined), "target-2");
     await flush();
     expect(container.querySelector<HTMLSelectElement>(".new-task-context__control--target select")?.value).toBe("target:target-2");
-    expect(discover).toHaveBeenCalledWith("target-2");
+    expect(discover).toHaveBeenCalledWith("target-2", expect.any(AbortSignal));
   });
 
   it("lets the dialogue rail action override a saved project location", async () => {
@@ -614,6 +615,28 @@ describe("new-task native draft recovery", () => {
     await flush();
     expect(container.querySelector(".new-task-context__control--name")).toBeNull();
     expect(container.querySelector('input[aria-label="session.taskName"]')).toBeNull();
+  });
+
+  it("does not discover native sessions until the user enters attach mode", async () => {
+    const discovery = deferred<readonly NativeSessionCandidateView[]>();
+    const discover = vi.fn((_targetId: string, _signal: AbortSignal) => discovery.promise);
+    const draft = { ...restoredDraft(), nativeStart: { kind: "fresh" as const } };
+    const { container } = await renderPage(controller({ discover, draft }), vi.fn().mockResolvedValue(undefined));
+
+    await flush();
+    expect(discover).not.toHaveBeenCalled();
+    const startSelect = required(container.querySelector<HTMLSelectElement>(".new-task-context__control--native select"));
+    await act(async () => setSelect(startSelect, "attach"));
+    await flush();
+    expect(discover).toHaveBeenCalledWith("target-1", expect.any(AbortSignal));
+    const signal = discover.mock.calls[0]?.[1];
+    expect(signal?.aborted).toBe(false);
+
+    await act(async () => setSelect(startSelect, "fresh"));
+    expect(signal?.aborted).toBe(true);
+    await act(async () => discovery.resolve([candidate({ name: "Retired native task" })]));
+    await flush();
+    expect(container.textContent).not.toContain("Retired native task");
   });
 
   it("blocks a restored native reference while discovery is loading and submits only after authoritative validation", async () => {
@@ -694,6 +717,10 @@ describe("new-task native draft recovery", () => {
     await act(async () => buttonWithText(container, "session.nativeRetry").click());
     await flush();
     expect(discover).toHaveBeenCalledTimes(2);
+    expect(discover).toHaveBeenNthCalledWith(1, "target-1", expect.any(AbortSignal));
+    expect(discover).toHaveBeenNthCalledWith(2, "target-1", expect.any(AbortSignal));
+    expect(discover.mock.calls[0]?.[1].aborted).toBe(true);
+    expect(discover.mock.calls[1]?.[1]).not.toBe(discover.mock.calls[0]?.[1]);
     expect(sendButton(container).disabled).toBe(false);
   });
 
@@ -701,17 +728,108 @@ describe("new-task native draft recovery", () => {
     ["missing", []],
     ["bound", [candidate({ boundSessionId: "task-existing" })]],
     ["error", [candidate({ state: "error" })]]
-  ] as const)("clears a restored reference when the authoritative candidate is %s", async (_label, candidates) => {
+  ] as const)("clears a restored reference when the authoritative candidate is %s", async (label, candidates) => {
     const onSubmit = vi.fn().mockResolvedValue(undefined);
     const saveDraft = vi.fn().mockResolvedValue(undefined);
     const { container } = await renderPage(controller({ discover: async () => candidates, saveDraft }), onSubmit);
 
     await flush();
     expect(container.textContent).toContain("session.nativeSelectionUnavailable");
+    if (label === "missing") expect(container.textContent).toContain("session.noNativeSessions");
     expect(sendButton(container).disabled).toBe(true);
     expect(container.querySelector<HTMLInputElement>('input[name="new-task-native-session"]:checked')).toBeNull();
     await act(async () => sendButton(container).click());
     expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it.each(["profile", "Backend generation"] as const)("retires a pending discovery immediately when the %s owner changes", async (ownerKind) => {
+    const stale = deferred<readonly NativeSessionCandidateView[]>();
+    const current = deferred<readonly NativeSessionCandidateView[]>();
+    let discoveryCall = 0;
+    const discover = vi.fn((_targetId: string, _signal: AbortSignal) =>
+      discoveryCall++ === 0 ? stale.promise : current.promise);
+    const first = controller({
+      discover,
+      profile: connectionProfile("profile-1", "server-1"),
+      snapshotValue: snapshot(1)
+    });
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+    const { container, rerender } = await renderPage(first, onSubmit);
+    await flush();
+
+    const firstSignal = discover.mock.calls[0]?.[1];
+    expect(firstSignal).toBeInstanceOf(AbortSignal);
+    expect(firstSignal?.aborted).toBe(false);
+    const next = controller({
+      discover,
+      profile: ownerKind === "profile"
+        ? connectionProfile("profile-2", "server-2")
+        : connectionProfile("profile-1", "server-1"),
+      snapshotValue: snapshot(ownerKind === "Backend generation" ? 2 : 1)
+    });
+    await rerender(next);
+
+    expect(firstSignal?.aborted).toBe(true);
+    expect(discover).toHaveBeenCalledTimes(2);
+    expect(sendButton(container).disabled).toBe(true);
+    expect(container.textContent).not.toContain("Stale native task");
+
+    await act(async () => current.resolve([candidate({ name: "Current native task" })]));
+    await flush();
+    expect(container.textContent).toContain("Current native task");
+    expect(sendButton(container).disabled).toBe(false);
+
+    await act(async () => stale.resolve([candidate({ name: "Stale native task" })]));
+    await flush();
+    expect(container.textContent).not.toContain("Stale native task");
+    expect(container.textContent).toContain("Current native task");
+  });
+
+  it("retires the old Target result and requires an explicit selection after discovering the new Target", async () => {
+    const stale = deferred<readonly NativeSessionCandidateView[]>();
+    const current = deferred<readonly NativeSessionCandidateView[]>();
+    const discover = vi.fn((targetId: string, _signal: AbortSignal) =>
+      targetId === "target-1" ? stale.promise : current.promise);
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+    const { container } = await renderPage(controller({ discover }), onSubmit);
+    await flush();
+
+    const firstSignal = discover.mock.calls[0]?.[1];
+    await act(async () => setSelect(targetSelect(container), "target:target-2"));
+    await flush();
+    expect(firstSignal?.aborted).toBe(true);
+    expect(discover).toHaveBeenCalledTimes(1);
+    const startSelect = required(container.querySelector<HTMLSelectElement>(".new-task-context__control--native select"));
+    expect(startSelect.value).toBe("fresh");
+
+    await act(async () => setSelect(startSelect, "attach"));
+    await flush();
+    expect(discover).toHaveBeenLastCalledWith("target-2", expect.any(AbortSignal));
+    expect(sendButton(container).disabled).toBe(true);
+    await act(async () => current.resolve([candidate({
+      reference: "native://target-2",
+      name: "Target two native task",
+      workspaceRoot: "/workspace-2"
+    })]));
+    await flush();
+    expect(container.textContent).toContain("Target two native task");
+    expect(sendButton(container).disabled).toBe(true);
+
+    await act(async () => required(container.querySelector<HTMLInputElement>('input[name="new-task-native-session"]')).click());
+    expect(sendButton(container).disabled).toBe(false);
+    await act(async () => stale.resolve([candidate({ name: "Stale native task" })]));
+    await flush();
+    expect(container.textContent).not.toContain("Stale native task");
+
+    await act(async () => sendButton(container).click());
+    expect(onSubmit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        selection: { kind: "target", targetId: "target-2" },
+        nativeStart: { kind: "attach", reference: "native://target-2" }
+      }),
+      expect.anything(),
+      expect.anything()
+    );
   });
 });
 
@@ -1045,7 +1163,7 @@ async function unmountPage(root: Root): Promise<void> {
 }
 
 function controller(options: {
-  readonly discover: () => Promise<readonly NativeSessionCandidateView[]>;
+  readonly discover: (targetId: string, signal: AbortSignal) => Promise<readonly NativeSessionCandidateView[]>;
   readonly draft?: NewSessionLocalDraft;
   readonly saveDraft?: (draft: NewSessionLocalDraft) => Promise<void>;
   readonly listWorkspaceFiles?: () => Promise<{ readonly paths: readonly string[]; readonly truncated: boolean; readonly revision: string }>;
@@ -1054,11 +1172,13 @@ function controller(options: {
   readonly probe?: (targetId: string, signal: AbortSignal) => Promise<TargetWorktreeProbeView>;
   readonly listSources?: (targetId: string, signal: AbortSignal) => Promise<readonly WorktreeSourceView[]>;
   readonly setWorktreeEnabled?: (enabled: boolean) => Promise<void>;
+  readonly profile?: ConnectionProfile;
 }): AppController {
   return {
     state: {
       connectionState: "connected",
       snapshot: options.snapshotValue ?? snapshot(),
+      ...(options.profile === undefined ? {} : { activeProfile: options.profile }),
       preferences: {
         locale: "en",
         composerSendShortcut: "enter",
@@ -1079,7 +1199,7 @@ function controller(options: {
   } as unknown as AppController;
 }
 
-function snapshot(): AppSnapshot {
+function snapshot(backendGeneration = 1): AppSnapshot {
   const initial = emptySnapshot();
   return {
     ...initial,
@@ -1089,6 +1209,7 @@ function snapshot(): AppSnapshot {
       name: "Backend",
       version: "1",
       health: "healthy",
+      instanceGeneration: backendGeneration,
       capabilities: new Map([
         ["input.text", { name: "input.text", supported: true, options: [] }],
         ["input.mention", { name: "input.mention", supported: true, options: ["workspace_file", "resource"] }],
@@ -1138,6 +1259,16 @@ function snapshot(): AppSnapshot {
       revision: "workspace-2",
       entries: []
     }]
+  };
+}
+
+function connectionProfile(id: string, serverId: string): ConnectionProfile {
+  return {
+    id,
+    deviceId: `device-${id}`,
+    serverId,
+    name: id,
+    origin: `https://${id}.example`
   };
 }
 

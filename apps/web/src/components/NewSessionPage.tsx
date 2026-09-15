@@ -173,6 +173,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const [nativeLoading, setNativeLoading] = useState(false);
   const [nativeError, setNativeError] = useState<string>();
   const [nativeDiscoveryState, setNativeDiscoveryState] = useState<"idle" | "loading" | "ready" | "error">("idle");
+  const [nativeDiscoveryOwnerScope, setNativeDiscoveryOwnerScope] = useState<object>();
   const [nativeDiscoveryRevision, setNativeDiscoveryRevision] = useState(0);
   const [nativeSelectionWarning, setNativeSelectionWarning] = useState<string>();
   const [modelKey, setModelKey] = useState("");
@@ -210,6 +211,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const [workspaceMentionReload, setWorkspaceMentionReload] = useState(0);
   const [pastedTextTarget, setPastedTextTarget] = useState<ComposerPastedTextDialogTarget>();
   const [hydrated, setHydrated] = useState(false);
+  const [hydratedProfileScope, setHydratedProfileScope] = useState<string>();
   const [hydrationRevision, setHydrationRevision] = useState(0);
   const richEditorRef = useRef<ComposerRichTextEditorHandle>(null);
   const composerRootRef = useRef<HTMLDivElement>(null);
@@ -279,6 +281,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   };
 
   const selectionKey = selection === undefined ? "" : newSessionSelectionValue(selection);
+  const profileScope = `${controller.state.activeProfile?.serverId ?? ""}\u0000${controller.state.activeProfile?.id ?? ""}`;
   const selected = selection?.kind === "target" ? activeTargets.find((target) => target.id === selection.targetId) : undefined;
   const backend = selection?.kind === "dialogue"
     ? eligibleDialogueBackends.find((candidate) => candidate.id === selection.backendId)
@@ -288,8 +291,42 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const discoveryAvailability = nativeSessionDiscoveryAvailability(selected === undefined ? undefined : backend?.capabilities);
   const canDiscover = discoveryAvailability.visible;
   const canAttach = discoveryAvailability.attachEnabled;
-  const selectedNativeSession = nativeSessions.find((candidate) => candidate.reference === nativeReference);
-  const nativeSelectionReady = nativeDiscoveryState === "ready"
+  const nativeDiscoveryScope = useMemo<object | undefined>(() => {
+    if (!hydrated || hydratedProfileScope !== profileScope || startKind !== "attach"
+      || selected === undefined || backend === undefined || !canDiscover
+      || controller.state.connectionState !== "connected" || voiceRoot === undefined) return undefined;
+    return {
+      profileScope,
+      targetId: selected.id,
+      targetRevision: selected.revision,
+      backendId: backend.id,
+      backendInstanceGeneration: backend.instanceGeneration,
+      discoverySupported: canDiscover,
+      resumeSupported: canAttach,
+      ownerDocument: voiceRoot.ownerDocument
+    };
+  }, [
+    backend?.id,
+    backend?.instanceGeneration,
+    canAttach,
+    canDiscover,
+    controller.state.connectionState,
+    hydrated,
+    hydratedProfileScope,
+    profileScope,
+    selected?.id,
+    selected?.revision,
+    startKind,
+    voiceRoot?.ownerDocument
+  ]);
+  const nativeDiscoveryCurrent = nativeDiscoveryScope !== undefined && nativeDiscoveryOwnerScope === nativeDiscoveryScope;
+  const currentNativeSessions = nativeDiscoveryCurrent ? nativeSessions : [];
+  const currentNativeDiscoveryState = nativeDiscoveryCurrent ? nativeDiscoveryState : "idle";
+  const currentNativeLoading = nativeDiscoveryScope !== undefined && (!nativeDiscoveryCurrent || nativeLoading);
+  const currentNativeError = nativeDiscoveryCurrent ? nativeError : undefined;
+  const currentNativeSelectionWarning = nativeDiscoveryCurrent ? nativeSelectionWarning : undefined;
+  const selectedNativeSession = currentNativeSessions.find((candidate) => candidate.reference === nativeReference);
+  const nativeSelectionReady = currentNativeDiscoveryState === "ready"
     && canAttach
     && selectedNativeSession !== undefined
     && selectedNativeSession.state !== "error"
@@ -402,7 +439,6 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const worktreePreferenceRelevant = worktreeApplicable && !worktreeConfirmedIneligible;
   const showWorktreeControls = worktreePreferenceRelevant && (worktreeEnabled || worktreeEligible);
 
-  const profileScope = `${controller.state.activeProfile?.serverId ?? ""}\u0000${controller.state.activeProfile?.id ?? ""}`;
   useEffect(() => {
     if (worktreePreferenceSavingRef.current) return;
     setWorktreeEnabled(controller.state.preferences.newSessionWorktreeEnabled);
@@ -581,7 +617,9 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   useEffect(() => {
     let cancelled = false;
     const requestController = new AbortController();
+    const hydrationOwnerScope = profileScope;
     setHydrated(false);
+    setHydratedProfileScope(undefined);
     worktreeAuthorityTargetRef.current = undefined;
     setDraftError(undefined);
     setSelection(requestedSelection ?? defaultNewSessionSelection(activeTargets, eligibleDialogueBackends));
@@ -663,6 +701,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       setWorktreeSourceRef(draft?.worktree?.sourceRef);
       setRefreshWorktreeRemote(draft?.worktree?.refreshRemote ?? false);
       setDraftError(hydrationError);
+      setHydratedProfileScope(hydrationOwnerScope);
       setHydrationRevision((current) => current + 1);
     })().catch((error: unknown) => {
       if (!cancelled) setDraftError(messageOf(error));
@@ -687,6 +726,9 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       : parseNewSessionSelection(selectionKey, activeTargets, eligibleDialogueBackends);
     if (stillValid !== undefined) return;
     setSelection(defaultNewSessionSelection(activeTargets, eligibleDialogueBackends));
+    setStartKind("fresh");
+    setNativeReference("");
+    setNativeSelectionWarning(undefined);
   }, [selectionKey, snapshot.backends, snapshot.settings.backendSettings, snapshot.targets]);
 
   useEffect(() => {
@@ -758,39 +800,48 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   }, [backend?.id, hydrationRevision, selectionKey]);
 
   useEffect(() => {
-    if (selected === undefined || !canDiscover) {
+    if (nativeDiscoveryScope === undefined || selected === undefined) {
+      setNativeDiscoveryOwnerScope(undefined);
       setNativeSessions([]);
       setNativeError(undefined);
       setNativeLoading(false);
       setNativeDiscoveryState("idle");
       return;
     }
+    const ownerScope = nativeDiscoveryScope;
+    const targetId = selected.id;
+    const sourceController = controllerRef.current;
+    const requestController = new AbortController();
     let current = true;
+    setNativeDiscoveryOwnerScope(ownerScope);
     setNativeLoading(true);
     setNativeDiscoveryState("loading");
     setNativeError(undefined);
     setNativeSelectionWarning(undefined);
     setNativeSessions([]);
-    void controllerRef.current.discoverNativeSessions(selected.id).then((sessions) => {
+    void sourceController.discoverNativeSessions(targetId, requestController.signal).then((sessions) => {
       if (!current) return;
       setNativeSessions(sessions);
       setNativeDiscoveryState("ready");
     }).catch((cause: unknown) => {
       if (!current) return;
-      setNativeError(cause instanceof Error ? cause.message : t("session.nativeLoadFailed"));
+      setNativeError(cause instanceof Error ? cause.message : translatorRef.current("session.nativeLoadFailed"));
       setNativeDiscoveryState("error");
     }).finally(() => {
       if (current) setNativeLoading(false);
     });
-    return () => { current = false; };
-  }, [canDiscover, nativeDiscoveryRevision, selected?.id, t]);
+    return () => {
+      current = false;
+      requestController.abort();
+    };
+  }, [nativeDiscoveryRevision, nativeDiscoveryScope, selected?.id]);
 
   useEffect(() => {
-    if (!hydrated || startKind !== "attach" || nativeReference.length === 0 || nativeDiscoveryState !== "ready") return;
+    if (!hydrated || startKind !== "attach" || nativeReference.length === 0 || currentNativeDiscoveryState !== "ready") return;
     if (nativeSelectionReady) return;
     setNativeReference("");
     setNativeSelectionWarning(t("session.nativeSelectionUnavailable"));
-  }, [hydrated, nativeDiscoveryState, nativeReference, nativeSelectionReady, startKind, t]);
+  }, [currentNativeDiscoveryState, hydrated, nativeReference, nativeSelectionReady, startKind, t]);
 
   useEffect(() => {
     const sequence = ++worktreeProbeSequenceRef.current;
@@ -1507,7 +1558,12 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
           <span className="sr-only">{t("newTask.location")}</span>
           <SelectControl value={selectionKey} disabled={submitting || (activeTargets.length === 0 && eligibleDialogueBackends.length === 0)} onChange={(event) => {
             const next = parseNewSessionSelection(event.target.value, activeTargets, eligibleDialogueBackends);
-            if (next !== undefined) setSelection(next);
+            if (next !== undefined) {
+              setSelection(next);
+              setStartKind("fresh");
+              setNativeReference("");
+              setNativeSelectionWarning(undefined);
+            }
           }}>
             {activeTargets.length === 0 && eligibleDialogueBackends.length === 0 && <option value="">{t("session.noProjects")}</option>}
             {activeTargets.length > 0 && <optgroup label={t("nav.projects")}>{activeTargets.map((target) => <option value={newSessionSelectionValue({ kind: "target", targetId: target.id })} key={target.id}>{target.name} · {target.workspaceName}</option>)}</optgroup>}
@@ -1563,15 +1619,15 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
           </div>}
         </section>}
         {startKind === "attach" && selected !== undefined && <section className="native-session-picker new-task-native" aria-label={t("session.nativeSessions")}>
-          {nativeLoading && <p className="muted">{t("common.loading")}</p>}
-          {nativeError !== undefined && <div className="new-task-native__recovery" role="alert"><p className="inline-error">{nativeError}</p><button type="button" disabled={submitting || nativeLoading} onClick={() => setNativeDiscoveryRevision((value) => value + 1)}>{t("session.nativeRetry")}</button></div>}
-          {nativeSelectionWarning !== undefined && <div className="new-task-native__recovery" role="alert"><p className="inline-error">{nativeSelectionWarning}</p><button type="button" disabled={submitting || nativeLoading} onClick={() => setNativeDiscoveryRevision((value) => value + 1)}>{t("session.nativeRetry")}</button></div>}
-          {!nativeLoading && nativeError === undefined && nativeSessions.length === 0 && <p className="muted">{t("session.noNativeSessions")}</p>}
-          {nativeSessions.map((candidate) => {
+          {currentNativeLoading && <p className="muted">{t("common.loading")}</p>}
+          {currentNativeError !== undefined && <div className="new-task-native__recovery" role="alert"><p className="inline-error">{currentNativeError}</p><button type="button" disabled={submitting || currentNativeLoading} onClick={() => setNativeDiscoveryRevision((value) => value + 1)}>{t("session.nativeRetry")}</button></div>}
+          {currentNativeSelectionWarning !== undefined && <div className="new-task-native__recovery" role="alert"><p className="inline-error">{currentNativeSelectionWarning}</p><button type="button" disabled={submitting || currentNativeLoading} onClick={() => setNativeDiscoveryRevision((value) => value + 1)}>{t("session.nativeRetry")}</button></div>}
+          {!currentNativeLoading && currentNativeError === undefined && currentNativeDiscoveryState === "ready" && currentNativeSessions.length === 0 && <p className="muted">{t("session.noNativeSessions")}</p>}
+          {currentNativeSessions.map((candidate) => {
             const disabled = !canAttach || candidate.state === "error" || candidate.boundSessionId !== undefined;
-            return <label className={nativeReference === candidate.reference ? "is-active" : ""} key={candidate.id}>
+            return <label className={nativeReference === candidate.reference ? "is-active" : ""} key={candidate.reference}>
               <RadioControl name="new-task-native-session" value={candidate.reference} checked={nativeReference === candidate.reference} disabled={submitting || disabled} onChange={() => { setNativeReference(candidate.reference); setNativeSelectionWarning(undefined); }} />
-              <span><strong>{candidate.name || candidate.id}</strong><small>{t("session.nativeMeta", { count: candidate.messageCount, time: candidate.modifiedAt > 0 ? formatRelativeTime(candidate.modifiedAt, controller.state.preferences.locale) : t("common.unknown") })}</small><small>{candidate.workspaceRoot}</small>{candidate.boundSessionId !== undefined && <em>{t("session.nativeBound", { id: candidate.boundSessionId })}</em>}{candidate.state === "error" && <em>{t("session.nativeError")}</em>}</span>
+              <span><strong>{candidate.name || candidate.id || t("common.unknown")}</strong><small>{t("session.nativeMeta", { count: candidate.messageCount, time: candidate.modifiedAt > 0 ? formatRelativeTime(candidate.modifiedAt, controller.state.preferences.locale) : t("common.unknown") })}</small><small>{candidate.workspaceRoot}</small>{candidate.boundSessionId !== undefined && <em>{t("session.nativeBound", { id: candidate.boundSessionId })}</em>}{candidate.state === "error" && <em>{t("session.nativeError")}</em>}</span>
             </label>;
           })}
         </section>}

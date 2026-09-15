@@ -1833,16 +1833,19 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return { sessionId: payload.value.sessionId, generation };
   }
 
-  async discoverNativeSessions(targetId: string): Promise<readonly NativeSessionCandidateView[]> {
+  async discoverNativeSessions(targetId: string, signal?: AbortSignal): Promise<readonly NativeSessionCandidateView[]> {
     const client = createClient(SessionService, this.requireTransport());
+    const requestSignal = combinedAbortSignal(signal, this.#abort?.signal);
+    requestSignal?.throwIfAborted();
     const values: NativeSessionCandidateView[] = [];
     const consumedTokens = new Set<string>();
     let pageToken = "";
     for (let pageIndex = 0; pageIndex < MAX_COMPLETE_MESSAGE_SEARCH_PAGES; pageIndex += 1) {
       const response = await client.discoverNativeSessions(
         { targetId, page: { pageSize: 500, pageToken } },
-        this.#abort === undefined ? undefined : { signal: this.#abort.signal }
+        requestSignal === undefined ? undefined : { signal: requestSignal }
       );
+      requestSignal?.throwIfAborted();
       values.push(...response.sessions.map(mapNativeSessionCandidate));
       const nextPageToken = response.page?.nextPageToken ?? "";
       if (nextPageToken === "") return values;
