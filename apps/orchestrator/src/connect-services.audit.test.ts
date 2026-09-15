@@ -2718,6 +2718,255 @@ describe("Connect security and protocol audit", () => {
     expect(register).not.toHaveBeenCalled();
   });
 
+  it.each([
+    {
+      name: "service-node",
+      descriptor: {
+        id: "target-local",
+        backendId: "pi",
+        displayName: "Local project",
+        workspaceRoot: "D:\\project",
+        managed: false,
+        trusted: true
+      },
+      expected: {
+        id: "workspace-local",
+        root: "D:\\project",
+        displayName: "Local project",
+        trusted: true
+      }
+    },
+    {
+      name: "remote",
+      descriptor: {
+        id: "target-remote",
+        backendId: "pi",
+        displayName: "Remote project",
+        workspaceRoot: "D:\\service-copy",
+        managed: false,
+        trusted: false,
+        remoteWorkspace: { hostId: "build-host", workspaceRoot: "/srv/project" }
+      },
+      expected: {
+        id: "workspace-remote",
+        root: "/srv/project",
+        displayName: "Remote project",
+        trusted: false,
+        remote: { targetId: "target-remote", hostId: "build-host", workspaceRoot: "/srv/project" }
+      }
+    }
+  ])("prepares the exact durable $name Target workspace binding and revision", async ({ descriptor, expected }) => {
+    const target = { descriptor, metadata: { workspaceId: expected.id }, revision: 7n, createdAt: 1, updatedAt: 2 };
+    const register = vi.fn(async (registration) => registration);
+    const fence = vi.fn();
+    const services = createConnectServices(stubApplication({
+      store: { getTarget: () => target },
+      workspaces: { register },
+      connections: { authenticate: () => ({ id: "connection", authKeyDigest: "digest", state: "active" }), fence }
+    }));
+
+    const response = await invoke(services.target.prepareTargetWorkspace, {
+      targetId: descriptor.id,
+      expectedTargetRevision: { value: 7n }
+    }, context()) as contract.PrepareTargetWorkspaceResponse;
+
+    expect(register).toHaveBeenCalledExactlyOnceWith(expected);
+    expect(fence).toHaveBeenCalledOnce();
+    expect(response.workspace).toMatchObject({
+      workspaceId: expected.id,
+      targetId: descriptor.id,
+      version: { revision: { value: 7n } }
+    });
+  });
+
+  it("returns a retryable product reason for an unavailable directory and rejects a stale Target before registration", async () => {
+    const target = {
+      descriptor: { id: "target-missing", backendId: "pi", displayName: "Missing", workspaceRoot: "D:\\missing", managed: false, trusted: false },
+      metadata: { workspaceId: "workspace-missing" },
+      revision: 3n,
+      createdAt: 1,
+      updatedAt: 2
+    };
+    const register = vi.fn(async () => { throw new Error("ENOENT D:\\private\\missing"); });
+    const services = createConnectServices(stubApplication({
+      store: { getTarget: () => target },
+      workspaces: { register },
+      connections: { authenticate: () => ({ id: "connection", authKeyDigest: "digest", state: "active" }), fence: vi.fn() }
+    }));
+
+    await expect(invoke(services.target.prepareTargetWorkspace, {
+      targetId: target.descriptor.id,
+      expectedTargetRevision: { value: 3n }
+    }, context())).rejects.toMatchObject({
+      code: Code.FailedPrecondition,
+      rawMessage: expect.not.stringContaining("private")
+    });
+    await expect(invoke(services.target.prepareTargetWorkspace, {
+      targetId: target.descriptor.id,
+      expectedTargetRevision: { value: 2n }
+    }, context())).rejects.toThrow("changed concurrently");
+    expect(register).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not return workspace readiness after the owning connection is revoked during validation", async () => {
+    const target = {
+      descriptor: { id: "target-revoked", backendId: "pi", displayName: "Revoked", workspaceRoot: "D:\\revoked", managed: false, trusted: true },
+      metadata: { workspaceId: "workspace-revoked" },
+      revision: 4n,
+      createdAt: 1,
+      updatedAt: 2
+    };
+    const connections = revocableConnections();
+    const register = vi.fn(async (registration) => {
+      connections.revoke();
+      return registration;
+    });
+    const services = createConnectServices(stubApplication({
+      store: { getTarget: () => target },
+      workspaces: { register },
+      connections
+    }));
+
+    await expect(invoke(services.target.prepareTargetWorkspace, {
+      targetId: target.descriptor.id,
+      expectedTargetRevision: { value: target.revision }
+    }, context())).rejects.toMatchObject({ code: "AUTH_REVOKED" });
+    expect(register).toHaveBeenCalledOnce();
+    expect(connections.fence).toHaveBeenCalledOnce();
+  });
+
+  it("serializes workspace preparation with Target archival", async () => {
+    const target = {
+      descriptor: { id: "target-serial", backendId: "pi", displayName: "Serial", workspaceRoot: "D:\\serial", managed: false, trusted: false },
+      metadata: { workspaceId: "workspace-serial" },
+      revision: 1n,
+      createdAt: 1,
+      updatedAt: 2
+    };
+    let releaseRegistration!: () => void;
+    const registrationGate = new Promise<void>((resolve) => { releaseRegistration = resolve; });
+    const register = vi.fn(async (registration) => { await registrationGate; return registration; });
+    const upsertTarget = vi.fn();
+    const store = { findOperation: () => undefined, getTarget: () => target, upsertTarget };
+    const outcome = { accepted: true, resultCase: "target", entityId: target.descriptor.id } as const;
+    const record = {
+      id: "operation-archive-serial",
+      connectionId: "connection",
+      kind: "archiveTarget",
+      body: {},
+      bodyHash: "hash",
+      completionMode: "synchronous",
+      status: "completed",
+      response: outcome,
+      createdAt: 1,
+      updatedAt: 2,
+      revision: 1n
+    } as const;
+    const mutate = vi.fn(async (input: { commit: (value: typeof store) => unknown }) => ({
+      replayed: false,
+      value: input.commit(store),
+      operation: record
+    }));
+    const services = createConnectServices(stubApplication({
+      store,
+      workspaces: { register },
+      sessionHost: { mutate },
+      connections: { authenticate: () => ({ id: "connection", authKeyDigest: "digest", state: "active" }), fence: vi.fn() }
+    }));
+    const preparation = invoke(services.target.prepareTargetWorkspace, {
+      targetId: target.descriptor.id,
+      expectedTargetRevision: { value: 1n }
+    }, context());
+    await vi.waitFor(() => expect(register).toHaveBeenCalledOnce());
+    const mutation = create(contract.OperationMutationSchema, {
+      payload: { case: "archiveTarget", value: create(contract.ArchiveTargetMutationSchema, { targetId: target.descriptor.id, archived: true }) }
+    });
+    const archival = invoke(services.operation.submitOperation, {
+      operationId: record.id,
+      connectionId: "connection",
+      mutation
+    }, context());
+    await Promise.resolve();
+    expect(mutate).not.toHaveBeenCalled();
+
+    releaseRegistration();
+    await preparation;
+    await archival;
+    expect(mutate).toHaveBeenCalledOnce();
+    expect(upsertTarget).toHaveBeenCalledWith(target.descriptor, expect.objectContaining({ state: "archived" }));
+  });
+
+  it("holds Target mutation serialization through a revision-fenced task creation", async () => {
+    const target = {
+      descriptor: { id: "target-create-serial", backendId: "pi", displayName: "Serial", workspaceRoot: "D:\\serial", managed: false, trusted: true },
+      metadata: { workspaceId: "workspace-create-serial" },
+      revision: 5n,
+      createdAt: 1,
+      updatedAt: 2
+    };
+    const store = { findOperation: () => undefined, getTarget: () => target };
+    let markCreateStarted!: () => void;
+    let releaseCreate!: () => void;
+    const createStarted = new Promise<void>((resolve) => { markCreateStarted = resolve; });
+    const createGate = new Promise<void>((resolve) => { releaseCreate = resolve; });
+    const mutate = vi.fn(async (input: {
+      kind: string;
+      precondition?: (value: typeof store) => void;
+    }) => {
+      if (input.kind === "createSession") {
+        input.precondition?.(store);
+        markCreateStarted();
+        await createGate;
+        throw new Error("creation stopped after serialization audit");
+      }
+      throw new Error("archival reached serialization audit");
+    });
+    const services = createConnectServices(stubApplication({
+      store,
+      sessionHost: { mutate },
+      connections: { authenticate: () => ({ id: "connection", authKeyDigest: "digest", state: "active" }) }
+    }));
+    const creationMutation = create(contract.OperationMutationSchema, {
+      preconditions: [{
+        entity: { kind: contract.EntityKind.TARGET, id: target.descriptor.id },
+        expectedRevision: { value: target.revision }
+      }],
+      payload: {
+        case: "createSession",
+        value: create(contract.CreateSessionMutationSchema, {
+          backendId: target.descriptor.backendId,
+          targetId: target.descriptor.id,
+          displayName: "Task",
+          permissionMode: contract.PermissionMode.ASK,
+          initialPlacement: contract.NativeSessionPlacement.PROJECT
+        })
+      }
+    });
+    const creation = invoke(services.operation.submitOperation, {
+      operationId: "operation-create-serial",
+      connectionId: "connection",
+      mutation: creationMutation
+    }, context());
+    const creationResult = creation.then(() => undefined, (error: unknown) => error);
+    await createStarted;
+
+    const archival = invoke(services.operation.submitOperation, {
+      operationId: "operation-archive-after-create",
+      connectionId: "connection",
+      mutation: create(contract.OperationMutationSchema, {
+        payload: { case: "archiveTarget", value: { targetId: target.descriptor.id, archived: true } }
+      })
+    }, context());
+    const archivalResult = archival.then(() => undefined, (error: unknown) => error);
+    await Promise.resolve();
+    expect(mutate).toHaveBeenCalledTimes(1);
+
+    releaseCreate();
+    expect(await creationResult).toMatchObject({ message: expect.stringContaining("creation stopped") });
+    expect(await archivalResult).toMatchObject({ message: expect.stringContaining("archival reached") });
+    expect(mutate.mock.calls.map(([input]) => input.kind)).toEqual(["createSession", "archiveTarget"]);
+  });
+
   it("requires every product task to finish its own lifecycle deletion before deleting a Target", async () => {
     const existing = {
       descriptor: {

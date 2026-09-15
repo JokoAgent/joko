@@ -22,6 +22,31 @@ const input: ComposerDraft = {
 };
 
 describe("lazy new-session dispatch", () => {
+  it("carries only the prepared Target revision into project task creation", async () => {
+    const api = {
+      createTarget: vi.fn(async () => "unused"),
+      refresh: vi.fn(async () => undefined),
+      createSession: vi.fn(async () => ({ sessionId: "session-project", generation: 2n })),
+      send: vi.fn(async () => undefined),
+      restoreFirstInputDraft: vi.fn(async () => undefined)
+    };
+    await createDelayedSessionFromFirstInput(api, {
+      ...session,
+      selection: { kind: "target", targetId: session.targetId },
+      expectedTargetRevision: 7n
+    }, input, vi.fn());
+    expect(api.createSession).toHaveBeenCalledWith(expect.objectContaining({
+      targetId: session.targetId,
+      expectedTargetRevision: 7n
+    }));
+
+    await expect(createDelayedSessionFromFirstInput(api, {
+      ...session,
+      selection: { kind: "target", targetId: session.targetId }
+    }, input, vi.fn())).rejects.toThrow("prepared Target revision");
+    expect(api.createTarget).not.toHaveBeenCalled();
+  });
+
   it("creates only when invoked, reveals the durable task, then sends its first input", async () => {
     const order: string[] = [];
     const api = {

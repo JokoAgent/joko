@@ -98,6 +98,82 @@ afterEach(async () => {
 });
 
 describe("new-task native draft recovery", () => {
+  it("preserves an unavailable draft project and retries its exact workspace without losing input", async () => {
+    const prepareWorkspace = vi.fn()
+      .mockRejectedValueOnce(new Error("Directory missing"))
+      .mockResolvedValueOnce(undefined);
+    const api = controller({
+      discover: async () => [],
+      draft: freshWorktreeDraft(false),
+      prepareWorkspace
+    });
+    const onSubmit = vi.fn(async () => undefined);
+    const { container } = await renderPage(api, onSubmit);
+    await flush();
+
+    expect(targetSelect(container).value).toBe("target:target-1");
+    expect(composerDocumentPlainText(required(latestEditorProps?.document))).toBe("Continue this task");
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("Directory missing");
+    expect(sendButton(container).disabled).toBe(true);
+    expect(prepareWorkspace).toHaveBeenCalledExactlyOnceWith("target-1", 1n, expect.any(AbortSignal));
+
+    await act(async () => buttonWithText(container, "common.retry").click());
+    await flush();
+    expect(prepareWorkspace).toHaveBeenCalledTimes(2);
+    expect(sendButton(container).disabled).toBe(false);
+    expect(composerDocumentPlainText(required(latestEditorProps?.document))).toBe("Continue this task");
+    await act(async () => sendButton(container).click());
+    expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({
+      selection: { kind: "target", targetId: "target-1" },
+      expectedTargetRevision: 1n
+    }), expect.anything(), expect.anything());
+  });
+
+  it("keeps a missing explicit Target selected and retires an old workspace check when a distinct remote Target is chosen", async () => {
+    const oldPreparation = deferred<void>();
+    const preparationSignals = new Map<string, AbortSignal>();
+    const prepareWorkspace = vi.fn((targetId: string, _expectedRevision: bigint, signal: AbortSignal) => {
+      preparationSignals.set(targetId, signal);
+      return targetId === "target-1" ? oldPreparation.promise : Promise.resolve();
+    });
+    const base = snapshot();
+    const remoteTarget = {
+      ...base.targets[1]!,
+      name: "Project",
+      remoteWorkspace: { hostId: "build-host", workspaceRoot: "/srv/project" }
+    };
+    const remoteWorkspace = { ...base.workspaces[1]!, name: "Project", serverPath: "/srv/project" };
+    const snapshotValue = { ...base, targets: [base.targets[0]!, remoteTarget], workspaces: [base.workspaces[0]!, remoteWorkspace] };
+    const missingDraft = { ...freshWorktreeDraft(false), selection: { kind: "target" as const, targetId: "removed-target" } };
+    const missingApi = controller({ discover: async () => [], draft: missingDraft, prepareWorkspace, snapshotValue });
+    const onSubmit = vi.fn(async () => undefined);
+    const { container, rerender } = await renderPage(missingApi, onSubmit);
+    await flush();
+
+    expect(targetSelect(container).value).toBe("target:removed-target");
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("newTask.projectUnavailable");
+    expect(prepareWorkspace).not.toHaveBeenCalled();
+    expect(composerDocumentPlainText(required(latestEditorProps?.document))).toBe("Continue this task");
+
+    const liveApi = { ...missingApi, readNewSessionDraft: vi.fn(async () => freshWorktreeDraft(false)) } as unknown as AppController;
+    await rerender(liveApi);
+    await act(async () => setSelect(targetSelect(container), "target:target-1"));
+    await flush();
+    expect(container.querySelector('[role="status"]')?.textContent).toContain("newTask.workspaceChecking");
+    const options = [...targetSelect(container).querySelectorAll("option")].map((option) => option.textContent);
+    expect(options).toContain("Project · build-host · /srv/project");
+
+    await act(async () => setSelect(targetSelect(container), "target:target-2"));
+    await flush();
+    expect(targetSelect(container).value).toBe("target:target-2");
+    expect(sendButton(container).disabled).toBe(false);
+    expect(preparationSignals.get("target-1")?.aborted).toBe(true);
+    await act(async () => oldPreparation.resolve());
+    await flush();
+    expect(targetSelect(container).value).toBe("target:target-2");
+    expect(sendButton(container).disabled).toBe(false);
+  });
+
   it("flushes the newest draft when the route leaves before the debounce expires", async () => {
     vi.useFakeTimers();
     const saveDraft = vi.fn(async () => undefined);
@@ -1167,6 +1243,7 @@ function controller(options: {
   readonly draft?: NewSessionLocalDraft;
   readonly saveDraft?: (draft: NewSessionLocalDraft) => Promise<void>;
   readonly listWorkspaceFiles?: () => Promise<{ readonly paths: readonly string[]; readonly truncated: boolean; readonly revision: string }>;
+  readonly prepareWorkspace?: (targetId: string, expectedRevision: bigint, signal: AbortSignal) => Promise<void>;
   readonly snapshotValue?: AppSnapshot;
   readonly worktreeEnabled?: boolean;
   readonly probe?: (targetId: string, signal: AbortSignal) => Promise<TargetWorktreeProbeView>;
@@ -1187,6 +1264,7 @@ function controller(options: {
     },
     readNewSessionDraft: vi.fn(async () => options.draft ?? restoredDraft()),
     saveNewSessionDraft: vi.fn(options.saveDraft ?? (async () => undefined)),
+    prepareTargetWorkspace: vi.fn(options.prepareWorkspace ?? (async () => undefined)),
     discoverNativeSessions: vi.fn(options.discover),
     probeTargetWorktree: vi.fn(options.probe ?? (async () => ({
       targetId: "target-1",

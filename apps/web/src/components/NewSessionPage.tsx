@@ -156,12 +156,17 @@ const QUICK_STARTS = [
 
 /** Delayed-create route rendered within Joko's visual language. */
 export function NewSessionPage({ controller, snapshot, initialTargetId, initialDialogueBackendId, navigationOpen, t, onOpenNavigation, onClose, onSubmit }: NewSessionPageProps): JSX.Element {
-  const activeTargets = newSessionTargets(snapshot.targets, snapshot.settings.backendSettings);
+  const projectTargets = snapshot.targets.filter((target) => !target.archived);
+  const activeTargets = newSessionTargets(projectTargets, snapshot.settings.backendSettings).filter((target) => {
+    const candidate = snapshot.backends.find((backend) => backend.id === target.backendId);
+    return candidate !== undefined
+      && candidate.health !== "unavailable"
+      && candidate.capabilities.get("input.text")?.supported === true;
+  });
   const eligibleDialogueBackends = dialogueBackends(snapshot.backends, snapshot.settings.backendSettings);
-  const requestedTargetSelection: NewSessionDraftSelection | undefined = initialTargetId !== undefined
-    && activeTargets.some((target) => target.id === initialTargetId)
-    ? { kind: "target", targetId: initialTargetId }
-    : undefined;
+  const requestedTargetSelection: NewSessionDraftSelection | undefined = initialTargetId === undefined
+    ? undefined
+    : { kind: "target", targetId: initialTargetId };
   const requestedSelection: NewSessionDraftSelection | undefined = requestedTargetSelection ?? (initialDialogueBackendId !== undefined
     && eligibleDialogueBackends.some((backend) => backend.id === initialDialogueBackendId)
     ? { kind: "dialogue", backendId: initialDialogueBackendId }
@@ -213,6 +218,10 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const [hydrated, setHydrated] = useState(false);
   const [hydratedProfileScope, setHydratedProfileScope] = useState<string>();
   const [hydrationRevision, setHydrationRevision] = useState(0);
+  const [workspacePreparationOwnerScope, setWorkspacePreparationOwnerScope] = useState<object>();
+  const [workspacePreparationState, setWorkspacePreparationState] = useState<"idle" | "loading" | "ready" | "error">("idle");
+  const [workspacePreparationError, setWorkspacePreparationError] = useState<string>();
+  const [workspacePreparationRevision, setWorkspacePreparationRevision] = useState(0);
   const richEditorRef = useRef<ComposerRichTextEditorHandle>(null);
   const composerRootRef = useRef<HTMLDivElement>(null);
   const [voiceRoot, setVoiceRoot] = useState<HTMLDivElement>();
@@ -282,18 +291,72 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
 
   const selectionKey = selection === undefined ? "" : newSessionSelectionValue(selection);
   const profileScope = `${controller.state.activeProfile?.serverId ?? ""}\u0000${controller.state.activeProfile?.id ?? ""}`;
-  const selected = selection?.kind === "target" ? activeTargets.find((target) => target.id === selection.targetId) : undefined;
+  const selected = selection?.kind === "target" ? snapshot.targets.find((target) => target.id === selection.targetId) : undefined;
   const backend = selection?.kind === "dialogue"
     ? eligibleDialogueBackends.find((candidate) => candidate.id === selection.backendId)
     : snapshot.backends.find((candidate) => candidate.id === selected?.backendId);
   const workspace = selected === undefined ? undefined : snapshot.workspaces.find((candidate) => candidate.id === selected.workspaceId);
-  const workspaceIdRef = useRef(workspace?.id); workspaceIdRef.current = workspace?.id;
+  const targetStaticReady = selection?.kind === "target"
+    && selected !== undefined
+    && activeTargets.some((target) => target.id === selected.id)
+    && backend !== undefined
+    && workspace !== undefined
+    && selected.error === undefined;
+  const targetStaticUnavailableReason = selection?.kind !== "target"
+    ? undefined
+    : selected === undefined
+      ? t("newTask.projectUnavailable")
+      : selected.archived
+        ? t("newTask.projectArchived")
+        : selected.error
+        ?? (workspace === undefined
+          ? t("newTask.workspaceMetadataUnavailable")
+          : !activeTargets.some((target) => target.id === selected.id)
+            ? t("newTask.backendUnavailable")
+            : undefined);
+  const workspacePreparationScope = useMemo<object | undefined>(() => {
+    if (!hydrated || hydratedProfileScope !== profileScope || !targetStaticReady
+      || controller.state.connectionState !== "connected" || voiceRoot === undefined) return undefined;
+    return {
+      profileScope,
+      targetId: selected.id,
+      targetRevision: selected.revision,
+      backendId: backend.id,
+      backendInstanceGeneration: backend.instanceGeneration,
+      workspaceId: workspace.id,
+      workspaceRevision: workspace.revision,
+      ownerDocument: voiceRoot.ownerDocument
+    };
+  }, [
+    backend?.id,
+    backend?.instanceGeneration,
+    controller.state.connectionState,
+    hydrated,
+    hydratedProfileScope,
+    profileScope,
+    selected?.id,
+    selected?.revision,
+    targetStaticReady,
+    voiceRoot?.ownerDocument,
+    workspace?.id,
+    workspace?.revision
+  ]);
+  const workspacePreparationCurrent = workspacePreparationScope !== undefined
+    && workspacePreparationOwnerScope === workspacePreparationScope;
+  const workspacePreparationLoading = workspacePreparationScope !== undefined
+    && (!workspacePreparationCurrent || workspacePreparationState === "loading");
+  const targetWorkspaceReady = workspacePreparationCurrent && workspacePreparationState === "ready";
+  const currentWorkspacePreparationError = workspacePreparationCurrent && workspacePreparationState === "error"
+    ? workspacePreparationError
+    : undefined;
+  const usableWorkspace = targetWorkspaceReady ? workspace : undefined;
+  const workspaceIdRef = useRef(usableWorkspace?.id); workspaceIdRef.current = usableWorkspace?.id;
   const discoveryAvailability = nativeSessionDiscoveryAvailability(selected === undefined ? undefined : backend?.capabilities);
   const canDiscover = discoveryAvailability.visible;
   const canAttach = discoveryAvailability.attachEnabled;
   const nativeDiscoveryScope = useMemo<object | undefined>(() => {
     if (!hydrated || hydratedProfileScope !== profileScope || startKind !== "attach"
-      || selected === undefined || backend === undefined || !canDiscover
+      || selected === undefined || backend === undefined || !canDiscover || !targetWorkspaceReady
       || controller.state.connectionState !== "connected" || voiceRoot === undefined) return undefined;
     return {
       profileScope,
@@ -317,6 +380,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     selected?.id,
     selected?.revision,
     startKind,
+    targetWorkspaceReady,
     voiceRoot?.ownerDocument
   ]);
   const nativeDiscoveryCurrent = nativeDiscoveryScope !== undefined && nativeDiscoveryOwnerScope === nativeDiscoveryScope;
@@ -360,21 +424,21 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   // A new task has no live runtime resource or Artifact inventory, but it can quote an existing task.
   const canMention = mentionPolicy.files || mentionPolicy.directories || mentionPolicy.sessions;
   const workspaceMentionNavigation = mentionPolicy.files || mentionPolicy.directories;
-  const matchingWorkspaceMentionIndex = mentionPolicy.files && workspaceMentionIndex?.workspaceId === workspace?.id
+  const matchingWorkspaceMentionIndex = mentionPolicy.files && workspaceMentionIndex?.workspaceId === usableWorkspace?.id
     ? workspaceMentionIndex
     : undefined;
   const mentionItems = canMention
     ? composerMentionItems(
-        mentionPolicy.files ? workspace?.entries ?? [] : [],
-        workspace?.id,
+        mentionPolicy.files ? usableWorkspace?.entries ?? [] : [],
+        usableWorkspace?.id,
         matchingWorkspaceMentionIndex?.paths ?? [],
         mentionPolicy.sessions ? snapshot.sessions.filter((session): session is SessionView => session.state !== "closed") : []
       )
     : [];
   const inlineMentionCatalogItems = useMemo(
     () => composerMentionCatalog(
-      workspaceMentionNavigation ? workspace?.entries ?? [] : [],
-      workspace?.id,
+      workspaceMentionNavigation ? usableWorkspace?.entries ?? [] : [],
+      usableWorkspace?.id,
       [],
       matchingWorkspaceMentionIndex?.paths ?? [],
       [],
@@ -382,7 +446,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     ).filter((item) => item.kind === "directory"
       || item.kind === "file" && mentionPolicy.files
       || item.kind === "session" && mentionPolicy.sessions),
-    [matchingWorkspaceMentionIndex?.paths, mentionPolicy.files, mentionPolicy.sessions, snapshot.sessions, workspace?.entries, workspace?.id, workspaceMentionNavigation]
+    [matchingWorkspaceMentionIndex?.paths, mentionPolicy.files, mentionPolicy.sessions, snapshot.sessions, usableWorkspace?.entries, usableWorkspace?.id, workspaceMentionNavigation]
   );
   const inlineMentionProviderState = useMemo<ComposerMentionProviderState>(
     () => matchingWorkspaceMentionIndex?.status === "loading"
@@ -409,23 +473,23 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     if (current !== undefined && current.disabled !== true) return;
     setInlineMentionActiveIndex(firstEnabledComposerMentionIndex(inlineMentionResults.items));
   }, [inlineMentionActiveIndex, inlineMentionResults.items]);
-  const knownWorkspacePaths = useMemo(() => workspace === undefined
+  const knownWorkspacePaths = useMemo(() => usableWorkspace === undefined
     ? []
     : [...new Set([
-        ...workspaceEntryPaths(workspace.entries),
+        ...workspaceEntryPaths(usableWorkspace.entries),
         ...(matchingWorkspaceMentionIndex?.paths ?? [])
-      ])], [matchingWorkspaceMentionIndex?.paths, workspace]);
+      ])], [matchingWorkspaceMentionIndex?.paths, usableWorkspace]);
   const globalCommands = snapshot.commands.filter((command) => command.sessionId === undefined);
   const commandItems = composerCommandItems(
     backend?.capabilities.get("runtime.commands")?.supported === true ? globalCommands : []
   );
   const commandCatalogKey = commandItems.map((item) => `${item.id}\u0000${item.value}\u0000${item.meta}`).join("\u0001");
-  const selectableExtraDirectories = snapshot.extraDirectories.filter((directory) => directory.workspaceId === workspace?.id && directory.trusted);
-  const canSelectExtraDirectories = workspace !== undefined && backend?.capabilities.get("workspace.extra_dirs")?.supported === true;
+  const selectableExtraDirectories = snapshot.extraDirectories.filter((directory) => directory.workspaceId === usableWorkspace?.id && directory.trusted);
+  const canSelectExtraDirectories = usableWorkspace !== undefined && backend?.capabilities.get("workspace.extra_dirs")?.supported === true;
   const canUseAddMenu = attachmentPolicy.images || attachmentPolicy.files || canMention || commandItems.length > 0
     || canSelectExtraDirectories && selectableExtraDirectories.length > 0;
   const worktreeApplicable = selected !== undefined && startKind === "fresh"
-    && workspace?.kind === "userProject" && selected.remoteWorkspace === undefined;
+    && usableWorkspace?.kind === "userProject" && selected.remoteWorkspace === undefined;
   const currentWorktreeProbe = worktreeApplicable && worktreeProbe?.targetId === selected?.id
     ? worktreeProbe
     : undefined;
@@ -581,12 +645,42 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   }, []);
 
   useEffect(() => {
-    if (!mentionPolicy.files || workspace === undefined) {
+    if (workspacePreparationScope === undefined || selected === undefined) {
+      setWorkspacePreparationOwnerScope(undefined);
+      setWorkspacePreparationState("idle");
+      setWorkspacePreparationError(undefined);
+      return;
+    }
+    const ownerScope = workspacePreparationScope;
+    const targetId = selected.id;
+    const targetRevision = selected.revision;
+    const sourceController = controllerRef.current;
+    const requestController = new AbortController();
+    let current = true;
+    setWorkspacePreparationOwnerScope(ownerScope);
+    setWorkspacePreparationState("loading");
+    setWorkspacePreparationError(undefined);
+    void sourceController.prepareTargetWorkspace(targetId, targetRevision, requestController.signal).then(() => {
+      if (!current || requestController.signal.aborted) return;
+      setWorkspacePreparationState("ready");
+    }).catch((cause: unknown) => {
+      if (!current || requestController.signal.aborted) return;
+      setWorkspacePreparationError(messageOf(cause));
+      setWorkspacePreparationState("error");
+    });
+    return () => {
+      current = false;
+      requestController.abort();
+    };
+  }, [selected?.id, selected?.revision, workspacePreparationRevision, workspacePreparationScope]);
+
+  useEffect(() => {
+    if (!mentionPolicy.files || usableWorkspace === undefined) {
       setWorkspaceMentionIndex(undefined);
       return;
     }
     const requestController = new AbortController();
-    const workspaceId = workspace.id;
+    const workspaceId = usableWorkspace.id;
     setWorkspaceMentionIndex((current) => ({
       workspaceId,
       status: "loading",
@@ -612,7 +706,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       }));
     });
     return () => requestController.abort();
-  }, [mentionPolicy.files, t, workspace?.id, workspace?.revision, workspaceMentionReload]);
+  }, [mentionPolicy.files, t, usableWorkspace?.id, usableWorkspace?.revision, workspaceMentionReload]);
 
   useEffect(() => {
     let cancelled = false;
@@ -640,7 +734,9 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       const restoredSelection = draft === undefined
         ? requestedSelection ?? defaultNewSessionSelection(activeTargets, eligibleDialogueBackends)
         : requestedSelection
-          ?? parseNewSessionSelection(newSessionSelectionValue(draft.selection), activeTargets, eligibleDialogueBackends)
+          ?? (draft.selection.kind === "target"
+            ? draft.selection
+            : parseNewSessionSelection(newSessionSelectionValue(draft.selection), projectTargets, eligibleDialogueBackends))
           ?? defaultNewSessionSelection(activeTargets, eligibleDialogueBackends);
       const restored = draft === undefined || restoredSelection === undefined
         ? undefined
@@ -721,11 +817,14 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   }, [hydrated, profileScope]);
 
   useEffect(() => {
+    if (selection?.kind === "target") return;
     const stillValid = selection === undefined
       ? undefined
-      : parseNewSessionSelection(selectionKey, activeTargets, eligibleDialogueBackends);
+      : parseNewSessionSelection(selectionKey, projectTargets, eligibleDialogueBackends);
     if (stillValid !== undefined) return;
-    setSelection(defaultNewSessionSelection(activeTargets, eligibleDialogueBackends));
+    const fallback = defaultNewSessionSelection(activeTargets, eligibleDialogueBackends);
+    if (fallback === undefined && selection === undefined) return;
+    setSelection(fallback);
     setStartKind("fresh");
     setNativeReference("");
     setNativeSelectionWarning(undefined);
@@ -937,11 +1036,13 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const mentionsAllowed = newTaskMentionsAllowed(
     composerMentionsFromRanges(mentions, inlineMentionRanges),
     mentionPolicy,
-    workspace?.id
+    usableWorkspace?.id
   );
   const hasInput = !composerDocumentIsEmpty(editorDocument) || attachments.length > 0 || browserComments.length > 0;
-  const validContext = selection !== undefined && backend !== undefined
-    && (startKind === "fresh" || (selected !== undefined && nativeSelectionReady));
+  const validContext = selection?.kind === "dialogue"
+    ? backend !== undefined
+    : selection?.kind === "target" && selected !== undefined && backend !== undefined && targetWorkspaceReady
+      && (startKind === "fresh" || nativeSelectionReady);
   const modelRouteReady = modelSourceAccess(backend, modelSelection, selectedModel, snapshot.providers).available;
   const worktreeDecisionReady = !worktreePreferenceRelevant || (
     !worktreePreferenceSaving
@@ -1177,9 +1278,9 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       : undefined;
     const mention = selectedItem.mention;
     if (directoryToken === undefined) {
-      if (mention === undefined || !newTaskMentionsAllowed([mention], mentionPolicy, workspace?.id)) return;
+      if (mention === undefined || !newTaskMentionsAllowed([mention], mentionPolicy, usableWorkspace?.id)) return;
       if (mention.kind === "workspace"
-        && (mention.workspaceId !== workspace?.id || (selectedItem.kind === "directory") !== (mention.directory === true))) return;
+        && (mention.workspaceId !== usableWorkspace?.id || (selectedItem.kind === "directory") !== (mention.directory === true))) return;
     }
     const existingSeparator = /\s/u.test(textRef.current[activation.to] ?? "");
     const replacement = directoryToken ?? `${mention!.token}${existingSeparator ? "" : " "}`;
@@ -1231,7 +1332,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   };
 
   const insertPaletteItem = (item: ComposerPaletteItem): void => {
-    if (submitting || item.mention !== undefined && !newTaskMentionsAllowed([item.mention], mentionPolicy, workspace?.id)) return;
+    if (submitting || item.mention !== undefined && !newTaskMentionsAllowed([item.mention], mentionPolicy, usableWorkspace?.id)) return;
     voiceDictionaryLearning.clear();
     const activeCommand = commandActivationRef.current;
     if (palette === "commands" && activeCommand !== undefined) {
@@ -1366,7 +1467,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const consumeInternalDrop = (dataTransfer: DataTransfer): boolean => {
     if (!hasComposerInternalDrop(dataTransfer)) return false;
     if (submitting) return true;
-    const insertion = resolveComposerInternalDrop(dataTransfer, workspace?.id);
+    const insertion = resolveComposerInternalDrop(dataTransfer, usableWorkspace?.id);
     if (insertion !== undefined) richEditorRef.current?.insertRouteReference(insertion);
     return true;
   };
@@ -1403,7 +1504,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       && modelRouteReady
       && (!composerDocumentIsEmpty(sourceEditorDocument) || attachments.length > 0 || sourceBrowserComments.length > 0)
       && attachmentsAllowed
-      && newTaskMentionsAllowed(sourceMentions, mentionPolicy, workspace?.id)
+      && newTaskMentionsAllowed(sourceMentions, mentionPolicy, usableWorkspace?.id)
       && worktreeDecisionReady
       && !(worktreePreferenceRelevant && worktreePreferenceSavingRef.current)
       && fullAccessConfirmationRef.current === undefined
@@ -1443,6 +1544,9 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       if (!owner.isCurrent()) return;
       await onSubmit({
         selection,
+        ...(selection.kind === "target" && selected !== undefined
+          ? { expectedTargetRevision: selected.revision }
+          : {}),
         name: t("session.newName"),
         nativeStart: selected !== undefined && startKind === "attach" && nativeSelectionReady
           ? { kind: "attach", reference: selectedNativeSession!.reference }
@@ -1556,8 +1660,8 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
         <label className="new-task-context__control new-task-context__control--target">
           <FolderKanban aria-hidden="true" />
           <span className="sr-only">{t("newTask.location")}</span>
-          <SelectControl value={selectionKey} disabled={submitting || (activeTargets.length === 0 && eligibleDialogueBackends.length === 0)} onChange={(event) => {
-            const next = parseNewSessionSelection(event.target.value, activeTargets, eligibleDialogueBackends);
+          <SelectControl value={selectionKey} disabled={submitting || (projectTargets.length === 0 && eligibleDialogueBackends.length === 0)} onChange={(event) => {
+            const next = parseNewSessionSelection(event.target.value, projectTargets, eligibleDialogueBackends);
             if (next !== undefined) {
               setSelection(next);
               setStartKind("fresh");
@@ -1565,8 +1669,18 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
               setNativeSelectionWarning(undefined);
             }
           }}>
-            {activeTargets.length === 0 && eligibleDialogueBackends.length === 0 && <option value="">{t("session.noProjects")}</option>}
-            {activeTargets.length > 0 && <optgroup label={t("nav.projects")}>{activeTargets.map((target) => <option value={newSessionSelectionValue({ kind: "target", targetId: target.id })} key={target.id}>{target.name} · {target.workspaceName}</option>)}</optgroup>}
+            {projectTargets.length === 0 && selected === undefined && eligibleDialogueBackends.length === 0 && <option value="">{t("session.noProjects")}</option>}
+            {(projectTargets.length > 0 || selection?.kind === "target" && !projectTargets.some((target) => target.id === selection.targetId)) && <optgroup label={t("nav.projects")}>
+              {selection?.kind === "target" && !projectTargets.some((target) => target.id === selection.targetId) && <option value={selectionKey} disabled>{selected?.name ?? selection.targetId} · {t("newTask.unavailable")}</option>}
+              {projectTargets.map((target) => {
+                const targetWorkspace = snapshot.workspaces.find((candidate) => candidate.id === target.workspaceId);
+                const location = target.remoteWorkspace === undefined
+                  ? targetWorkspace?.serverPath || target.workspaceName
+                  : `${target.remoteWorkspace.hostId} · ${target.remoteWorkspace.workspaceRoot}`;
+                const available = activeTargets.some((candidate) => candidate.id === target.id) && target.error === undefined && targetWorkspace !== undefined;
+                return <option value={newSessionSelectionValue({ kind: "target", targetId: target.id })} disabled={!available} key={target.id}>{target.name} · {location}{available ? "" : ` · ${t("newTask.unavailable")}`}</option>;
+              })}
+            </optgroup>}
             {eligibleDialogueBackends.length > 0 && <optgroup label={t("newTask.dialogues")}>{eligibleDialogueBackends.map((candidate) => <option value={newSessionSelectionValue({ kind: "dialogue", backendId: candidate.id })} key={`dialogue:${candidate.id}`}>{t("newTask.dialogue")} · {candidate.name}</option>)}</optgroup>}
           </SelectControl>
         </label>
@@ -1588,7 +1702,9 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
           <div><strong>{t("app.name")}</strong><h1 id="new-task-title">{t("nav.newTask")}</h1></div>
         </div>
 
-        {selected !== undefined && !selected.trusted && <div className="new-task-warning" role="status"><AlertTriangle aria-hidden="true" /><span>{t("session.projectInert")}</span></div>}
+        {selection?.kind === "target" && workspacePreparationLoading && <div className="new-task-warning" role="status"><FolderKanban aria-hidden="true" /><span>{t("newTask.workspaceChecking")}</span></div>}
+        {selection?.kind === "target" && !workspacePreparationLoading && (targetStaticUnavailableReason ?? currentWorkspacePreparationError) !== undefined && <div className="new-task-warning" role="alert"><AlertTriangle aria-hidden="true" /><span>{targetStaticUnavailableReason ?? currentWorkspacePreparationError}</span>{targetStaticReady && currentWorkspacePreparationError !== undefined && <Button tone="ghost" disabled={submitting} onClick={() => setWorkspacePreparationRevision((value) => value + 1)}>{t("common.retry")}</Button>}</div>}
+        {selected !== undefined && targetWorkspaceReady && !selected.trusted && <div className="new-task-warning" role="status"><AlertTriangle aria-hidden="true" /><span>{t("session.projectInert")}</span></div>}
         {draftError !== undefined && <div className="new-task-warning" role="alert"><AlertTriangle aria-hidden="true" /><span>{draftError}</span></div>}
         {showWorktreeControls && <section className="new-task-worktree" aria-labelledby="new-task-worktree-title">
           <header>
@@ -1702,7 +1818,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
               onClipboardFiles={addFiles}
               pastedTextLabel={(lines) => t("composer.pastedTextChip", { lines })}
               onPastedTextOpen={setPastedTextTarget}
-              workingDirectory={workspace?.serverPath}
+              workingDirectory={usableWorkspace?.serverPath}
               knownWorkspacePaths={knownWorkspacePaths}
               resolveRouteReference={(target) => resolveComposerRouteReferenceFromRuntime(controller, target, t("session.unnamed"))}
             />

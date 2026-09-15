@@ -5,6 +5,7 @@ import {
   GetSessionWorktreeRemovalPreviewResponseSchema,
   ListTargetWorktreeSourcesResponseSchema,
   OperationState,
+  PrepareTargetWorkspaceResponseSchema,
   ProbeTargetWorktreeResponseSchema,
   SnapshotSchema,
   SubmitOperationResponseSchema,
@@ -15,6 +16,32 @@ import { describe, expect, it, vi } from "vitest";
 import { createOrchestratorGateway } from "./gateway.js";
 
 describe("isolated-workspace gateway", () => {
+  it("prepares only the requested Target workspace revision", async () => {
+    const requests: unknown[] = [];
+    let returnedTargetId = "target-1";
+    const transport = transportWithSnapshot(async (method, input) => {
+      if (method.localName !== "prepareTargetWorkspace") throw new Error(`Unexpected method: ${method.localName}`);
+      requests.push(input);
+      return response(method, create(PrepareTargetWorkspaceResponseSchema, {
+        workspace: {
+          workspaceId: "workspace-1",
+          targetId: returnedTargetId,
+          displayName: "Workspace",
+          serverPathDisplay: "D:\\workspace",
+          version: { revision: { value: 1n } }
+        }
+      }));
+    });
+    const gateway = createOrchestratorGateway(profile("workspace-prepare"), "secret", {}, () => transport);
+    await gateway.connect();
+
+    await expect(gateway.prepareTargetWorkspace("target-1", 1n)).resolves.toBeUndefined();
+    expect(requests).toEqual([{ targetId: "target-1", expectedTargetRevision: { value: 1n } }]);
+    returnedTargetId = "different-target";
+    await expect(gateway.prepareTargetWorkspace("target-1", 1n)).rejects.toThrow("different project workspace revision");
+    gateway.disconnect();
+  });
+
   it("keeps Git-not-found distinct from an unavailable worktree service", async () => {
     const transport = transportWithSnapshot(async (method) => response(method, create(ProbeTargetWorktreeResponseSchema, {
       targetId: "target-1",
@@ -126,7 +153,20 @@ describe("isolated-workspace gateway", () => {
 
   it("submits one fresh-task isolation intent and never silently attaches it to native history", async () => {
     const payloads: any[] = [];
+    const workspacePreparations: any[] = [];
     const transport = transportWithSnapshot(async (method, input) => {
+      if (method.localName === "prepareTargetWorkspace") {
+        workspacePreparations.push(input);
+        return response(method, create(PrepareTargetWorkspaceResponseSchema, {
+          workspace: {
+            workspaceId: "workspace-1",
+            targetId: input.targetId,
+            displayName: "Workspace",
+            serverPathDisplay: "D:\\workspace",
+            version: { revision: input.expectedTargetRevision }
+          }
+        }));
+      }
       if (method.localName !== "submitOperation") throw new Error(`Unexpected method: ${method.localName}`);
       payloads.push(input.mutation?.payload);
       return response(method, create(SubmitOperationResponseSchema, {
@@ -157,6 +197,10 @@ describe("isolated-workspace gateway", () => {
       planMode: false,
       worktree: { sourceRef: "refs/remotes/origin/release", refreshRemote: true }
     })).resolves.toEqual({ sessionId: "session-isolated", generation: 1n });
+    expect(workspacePreparations).toEqual([{
+      targetId: "target-1",
+      expectedTargetRevision: { value: 1n }
+    }]);
     expect(payloads[0]).toMatchObject({
       case: "createSession",
       value: {

@@ -134,6 +134,7 @@ function controller(snapshotValue: AppSnapshot): AppController {
     },
     readNewSessionDraft: vi.fn(async () => draft()),
     saveNewSessionDraft: vi.fn(async () => undefined),
+    prepareTargetWorkspace: vi.fn(async () => undefined),
     probeTargetWorktree: vi.fn(async (targetId: string) => ({ targetId, eligibility: "unavailable", canRefreshRemote: false })),
     listTargetWorktreeSources: vi.fn(async () => []),
     setNewSessionWorktreeEnabled: vi.fn(async () => undefined)

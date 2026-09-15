@@ -4015,6 +4015,8 @@ export interface NativeSessionCatalogView {
 
 export interface NewSessionDraft {
   readonly targetId: string;
+  /** Exact Target revision whose workspace was prepared for this creation. */
+  readonly expectedTargetRevision?: bigint;
   readonly name: string;
   readonly summary?: string;
   readonly nativeStart: { readonly kind: "fresh" } | { readonly kind: "attach"; readonly reference: string };
@@ -4520,6 +4522,7 @@ export interface OperationApi {
     options?: { readonly signal?: AbortSignal; readonly force?: boolean }
   ): Promise<NativeSessionCatalogView>;
   createTarget(draft: TargetDraft): Promise<string>;
+  prepareTargetWorkspace(targetId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<void>;
   updateTarget(targetId: string, patch: {
     readonly name?: string;
     readonly pinned?: boolean;

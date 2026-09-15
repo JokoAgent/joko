@@ -1715,6 +1715,7 @@ export function useAppController(): AppController {
       readSessionArtifact: async (...args: Parameters<OperationApi["readSessionArtifact"]>) => original().readSessionArtifact(...args),
       send: async (...args: Parameters<OperationApi["send"]>) => original().send(...args),
       createTarget: async (...args: Parameters<OperationApi["createTarget"]>) => original().createTarget(...args),
+      prepareTargetWorkspace: async (...args: Parameters<OperationApi["prepareTargetWorkspace"]>) => original().prepareTargetWorkspace(...args),
       createSession: async (draft: NewSessionDraft) => original().createSession(sessionDraftWithPersonalization(
         draft,
         personalizationPromptForOwner(preferencesRef.current.personalizationPrompts, inputOwnerId)

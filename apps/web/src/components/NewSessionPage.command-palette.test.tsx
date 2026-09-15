@@ -194,6 +194,7 @@ async function renderPage(
     readPendingExtensionUse: vi.fn(async () => options.pending),
     getExtension: options.getExtension ?? vi.fn(async () => ({ revision: 0n, extensions: [], recoveredFromCorruption: false })),
     clearPendingExtensionUse: options.clearPendingExtensionUse ?? vi.fn(async () => undefined),
+    prepareTargetWorkspace: vi.fn(async () => undefined),
     probeTargetWorktree: vi.fn(async (targetId: string) => ({ targetId, eligibility: "unavailable", canRefreshRemote: false })),
     listTargetWorktreeSources: vi.fn(async () => []),
     setNewSessionWorktreeEnabled: vi.fn(async () => undefined)

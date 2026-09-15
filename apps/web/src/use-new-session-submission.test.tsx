@@ -10,7 +10,7 @@ import { useNewSessionSubmission } from "./use-new-session-submission.js";
 let root: Root | undefined;
 beforeAll(() => { (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true; });
 afterEach(async () => { if (root !== undefined) await act(async () => root!.unmount()); root = undefined; document.body.replaceChildren(); vi.restoreAllMocks(); });
-const draft: DelayedNewSessionDraft = { selection: { kind: "target", targetId: "target" }, name: "Task", nativeStart: { kind: "fresh" }, providerId: "provider", modelId: "model", fastMode: false, permissionMode: "ask", planMode: false };
+const draft: DelayedNewSessionDraft = { selection: { kind: "target", targetId: "target" }, expectedTargetRevision: 1n, name: "Task", nativeStart: { kind: "fresh" }, providerId: "provider", modelId: "model", fastMode: false, permissionMode: "ask", planMode: false };
 const input: ComposerDraft = { text: "Final dictated text", attachments: [], mentions: [], deliveryMode: "prompt" };
 const describe = (error: unknown) => (error as Error).message;
 

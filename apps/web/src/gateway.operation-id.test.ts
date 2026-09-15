@@ -1,9 +1,11 @@
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError, type Transport } from "@connectrpc/connect";
 import {
+  EntityKind,
   GetSnapshotResponseSchema,
   ListManagedModelRuntimesResponseSchema,
   OperationState,
+  PrepareTargetWorkspaceResponseSchema,
   SnapshotSchema,
   SubmitOperationResponseSchema
 } from "@joko/contracts";
@@ -51,12 +53,14 @@ describe("operation ID lifecycle", () => {
 
   it("sends the personalization snapshot only for a fresh native task", async () => {
     const createMutations: any[] = [];
+    const createPreconditions: any[] = [];
     const gateway = createOrchestratorGateway(
       { id: "connection-1", deviceId: "device-test", name: "Desktop", origin: "https://orchestrator.example" , serverId: "server-test" },
       "secret",
       {},
       () => operationTransport(async (method, input) => {
         createMutations.push(input.mutation.payload.value);
+        createPreconditions.push(input.mutation.preconditions);
         return successfulSessionResponse(method, input, `session-${createMutations.length}`);
       })
     );
@@ -83,6 +87,10 @@ describe("operation ID lifecycle", () => {
       modifiedAt: { seconds: 123n, nanos: 456_000_000 },
       snapshotToken: "snapshot-token"
     });
+    expect(createPreconditions[0]).toMatchObject([{
+      entity: { kind: EntityKind.TARGET, id: "target-1" },
+      expectedRevision: { value: 1n }
+    }]);
     gateway.disconnect();
   });
 
@@ -428,6 +436,17 @@ function operationTransport(
       }
       if (method.localName === "listManagedModelRuntimes") {
         return response(method, create(ListManagedModelRuntimesResponseSchema, {}));
+      }
+      if (method.localName === "prepareTargetWorkspace") {
+        return response(method, create(PrepareTargetWorkspaceResponseSchema, {
+          workspace: {
+            workspaceId: "workspace-1",
+            targetId: input.targetId,
+            displayName: "Local workspace",
+            serverPathDisplay: "D:\\workspace",
+            version: { revision: input.expectedTargetRevision }
+          }
+        }));
       }
       if (method.localName === "submitOperation") return submit(method, input);
       throw new Error(`Unexpected method: ${method.localName}`);

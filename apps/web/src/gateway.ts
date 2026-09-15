@@ -202,6 +202,7 @@ import {
   TaskHistoryMaintenancePhase,
   TaskHistoryMaintenanceStatus,
   TaskHistoryRetention,
+  TargetService,
   RewindSafety,
   RunState,
   ScheduleExecutionMode,
@@ -1700,6 +1701,25 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return payload.value.targetId;
   }
 
+  async prepareTargetWorkspace(targetId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<void> {
+    if (targetId.trim() === "" || typeof expectedRevision !== "bigint" || expectedRevision < 1n) {
+      throw new GatewayError("A current Target identity and revision are required.");
+    }
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(TargetService, scope.transport).prepareTargetWorkspace({
+      targetId,
+      expectedTargetRevision: { value: expectedRevision }
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const workspace = response.workspace;
+    if (workspace === undefined
+      || workspace.targetId !== targetId
+      || workspace.workspaceId === ""
+      || workspace.version?.revision?.value !== expectedRevision) {
+      throw new GatewayError("Orchestrator prepared a different project workspace revision.");
+    }
+  }
+
   async updateTarget(
     targetId: string,
     patch: {
@@ -1768,6 +1788,10 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const targetId = draft.targetId;
     const target = this.#rawSnapshot?.targets.find((candidate) => candidate.targetId === targetId);
     if (target === undefined) throw new GatewayError("The selected target is no longer available.");
+    const expectedTargetRevision = draft.expectedTargetRevision ?? target.version?.revision?.value;
+    if (expectedTargetRevision === undefined || expectedTargetRevision < 1n) {
+      throw new GatewayError("The selected target has no current revision.");
+    }
     if ((draft.appendSystemPrompt?.length ?? 0) > 8_000) {
       throw new GatewayError("Personalization instructions cannot exceed 8,000 characters.");
     }
@@ -1786,6 +1810,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     if (draft.catalogImport !== undefined && !validCatalogSnapshotToken(draft.catalogImport.snapshotToken)) {
       throw new GatewayError("Catalog import presentation has an invalid snapshot token.");
     }
+    await this.prepareTargetWorkspace(targetId, expectedTargetRevision);
     const nativeStart = create(
       NativeSessionStartSchema,
       draft.nativeStart.kind === "attach"
@@ -1821,7 +1846,10 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           ? { appendSystemPrompt: draft.appendSystemPrompt }
           : {})
       }
-    }, true);
+    }, true, [{
+      entity: { kind: EntityKind.TARGET, id: targetId },
+      expectedRevision: { value: expectedTargetRevision }
+    }]);
     const payload = operation.result?.payload;
     if (payload?.case !== "session" || payload.value.sessionId.length === 0) {
       throw new GatewayError("Orchestrator completed task creation without a typed task result.");

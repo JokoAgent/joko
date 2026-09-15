@@ -71,6 +71,10 @@ service BackendService {
 service TargetService {
   rpc ListTargets(ListTargetsRequest) returns (ListTargetsResponse);
   rpc GetTarget(GetTargetRequest) returns (GetTargetResponse);
+  // Revalidates and registers the exact durable workspace binding for a
+  // Target. Clients use the returned revision-fenced result before creating a
+  // task; the service never substitutes another Target or workspace.
+  rpc PrepareTargetWorkspace(PrepareTargetWorkspaceRequest) returns (PrepareTargetWorkspaceResponse);
 }
 
 service SessionService {
@@ -2474,4 +2478,13 @@ message ListSessionResourcesRequest {
 
 message ListSessionResourcesResponse {
   repeated SessionResource resources = 1;
+}
+
+message PrepareTargetWorkspaceRequest {
+  string target_id = 1;
+  Revision expected_target_revision = 2;
+}
+
+message PrepareTargetWorkspaceResponse {
+  WorkspaceDescriptor workspace = 1;
 }

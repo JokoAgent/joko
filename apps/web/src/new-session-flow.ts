@@ -64,7 +64,14 @@ export async function createDelayedSessionFromFirstInput(
   onManagedTargetCreated?: (targetId: string) => void
 ): Promise<string> {
   if (draft.selection.kind === "target") {
-    return createSessionFromFirstInput(api, { ...sessionDraft(draft), targetId: draft.selection.targetId }, input, onCreated);
+    if (draft.expectedTargetRevision === undefined || draft.expectedTargetRevision < 1n) {
+      throw new Error("Project task creation requires the prepared Target revision.");
+    }
+    return createSessionFromFirstInput(api, {
+      ...sessionDraft(draft),
+      targetId: draft.selection.targetId,
+      expectedTargetRevision: draft.expectedTargetRevision
+    }, input, onCreated);
   }
   const targetId = await api.createTarget({
     backendId: draft.selection.backendId,
