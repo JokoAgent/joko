@@ -8,7 +8,9 @@ import {
   FolderKanban,
   GitBranch,
   Hammer,
+  Image as ImageIcon,
   Menu,
+  MessageSquarePlus,
   MessageSquareCode,
   Paperclip,
   SearchCode,
@@ -28,10 +30,12 @@ import {
 import { modelPreferenceOwnerId } from "../model-picker-preferences.js";
 import { remapComposerInlineMentionReplacement } from "../composer-mention-ranges.js";
 import { composerMentionsAllowed, resolveComposerMentionPolicy } from "../composer-mention-policy.js";
+import { browserCommentPreviewTag, removeBrowserCommentAndRepairChains } from "../browser-comment-draft.js";
 import { applyPendingExtensionUse, resolvePendingExtensionUse } from "../extension-use-handoff.js";
 import type {
   AppSnapshot,
   AttachmentDraft,
+  BrowserCommentDraftItem,
   ComposerDraft,
   ComposerInlineMentionRange,
   ComposerMentionDraft,
@@ -189,6 +193,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const [mentions, setMentions] = useState<readonly ComposerMentionDraft[]>([]);
   const [inlineMentionRanges, setInlineMentionRanges] = useState<readonly ComposerInlineMentionRange[]>([]);
   const [attachments, setAttachments] = useState<readonly AttachmentDraft[]>([]);
+  const [browserComments, setBrowserComments] = useState<readonly BrowserCommentDraftItem[]>([]);
   const [extraDirectoryIds, setExtraDirectoryIds] = useState<readonly string[]>([]);
   const [attachmentError, setAttachmentError] = useState<string>();
   const [draftError, setDraftError] = useState<string>();
@@ -217,7 +222,9 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const mentionsRef = useRef(mentions);
   const inlineMentionRangesRef = useRef(inlineMentionRanges);
   const attachmentsRef = useRef(attachments);
+  const browserCommentsRef = useRef(browserComments);
   const submissionRef = useRef<object | undefined>(undefined);
+  const submittingRef = useRef(submitting);
   const submissionAbortRef = useRef<AbortController | undefined>(undefined);
   const submissionOriginRef = useRef<NewSessionSubmissionOwner | undefined>(undefined);
   const fullAccessConfirmationRef = useRef<FullAccessConfirmation | undefined>(undefined);
@@ -225,6 +232,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const controllerRef = useRef(controller);
   const translatorRef = useRef(t);
   const draftSaveChainRef = useRef<Promise<void>>(Promise.resolve());
+  const latestDraftRef = useRef<{ readonly controller: AppController; readonly draft: NewSessionLocalDraft } | undefined>(undefined);
   const restoredExecutionRef = useRef<NewSessionLocalDraft | undefined>(undefined);
   const typedPaletteTriggerRef = useRef<"/" | "@" | undefined>(undefined);
   const inlineMentionActivationRef = useRef<NewTaskInlineMentionActivation | undefined>(undefined);
@@ -240,6 +248,8 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   mentionsRef.current = mentions;
   inlineMentionRangesRef.current = inlineMentionRanges;
   attachmentsRef.current = attachments;
+  browserCommentsRef.current = browserComments;
+  submittingRef.current = submitting;
   commandActivationRef.current = commandActivation;
 
   const replaceInlineMentionActivation = (next: NewTaskInlineMentionActivation | undefined): void => {
@@ -252,6 +262,11 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     inlineMentionRangesRef.current = nextRanges;
     setMentions(nextMentions);
     setInlineMentionRanges(nextRanges);
+  };
+
+  const replaceBrowserComments = (next: readonly BrowserCommentDraftItem[]): void => {
+    browserCommentsRef.current = next;
+    setBrowserComments(next);
   };
 
   const replaceCommandActivation = (next: ComposerCommandActivation | undefined): void => {
@@ -504,7 +519,12 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      const latest = latestDraftRef.current;
+      if (!submittingRef.current && latest !== undefined) {
+        void enqueueNewSessionDraftSave(draftSaveChainRef, { current: latest.controller }, latest.draft).catch(() => undefined);
+      }
       revokeAttachments(attachmentsRef.current);
+      revokeBrowserCommentPreviews(browserCommentsRef.current);
     };
   }, []);
 
@@ -612,6 +632,12 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       setAttachments((current) => {
         revokeAttachments(current);
         return (draft?.attachments ?? []).map(withAttachmentPreview);
+      });
+      setBrowserComments((current) => {
+        revokeBrowserCommentPreviews(current);
+        const next = (draft?.browserComments ?? []).map(withBrowserCommentPreview);
+        browserCommentsRef.current = next;
+        return next;
       });
       setStartKind(draft?.nativeStart.kind ?? "fresh");
       setNativeReference(draft?.nativeStart.kind === "attach" ? draft.nativeStart.reference : "");
@@ -815,23 +841,26 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       mentions: composerMentionsFromRanges(mentions, inlineMentionRanges),
       inlineMentionRanges,
       attachments,
+      browserComments,
       ...(canSelectExtraDirectories ? { extraDirectoryIds } : {})
     };
     const sourceControllerRef = { current: controllerRef.current };
+    latestDraftRef.current = { controller: sourceControllerRef.current, draft };
     let cancelled = false;
     const timer = window.setTimeout(() => {
       void enqueueNewSessionDraftSave(draftSaveChainRef, sourceControllerRef, draft).then(() => { if (!cancelled) setDraftError(undefined); }).catch((error: unknown) => { if (!cancelled) setDraftError(messageOf(error)); });
     }, 420);
     return () => { cancelled = true; window.clearTimeout(timer); };
-  }, [controller.saveNewSessionDraft, attachments, canSelectExtraDirectories, editorDocument, effort, execution.effortSupported, execution.fastModeSupported, execution.permissionModes, execution.planModeSupported, extraDirectoryIds, fastMode, hydrated, mentions, inlineMentionRanges, modelKey, nativeReference, permissionMode, planMode, refreshWorktreeRemote, selected?.id, selectedModel?.efforts, selectedModel?.supportsFast, selectionKey, startKind, submitting, text, worktreeEnabled, worktreeSourceRef]);
+  }, [controller.saveNewSessionDraft, attachments, browserComments, canSelectExtraDirectories, editorDocument, effort, execution.effortSupported, execution.fastModeSupported, execution.permissionModes, execution.planModeSupported, extraDirectoryIds, fastMode, hydrated, mentions, inlineMentionRanges, modelKey, nativeReference, permissionMode, planMode, refreshWorktreeRemote, selected?.id, selectedModel?.efforts, selectedModel?.supportsFast, selectionKey, startKind, submitting, text, worktreeEnabled, worktreeSourceRef]);
 
-  const attachmentsAllowed = attachments.every((attachment) => attachment.kind === "image" ? attachmentPolicy.images : attachmentPolicy.files);
+  const draftMedia = [...attachments, ...browserComments.map((item) => item.screenshot)];
+  const attachmentsAllowed = draftAttachmentsAllowed(draftMedia, attachmentPolicy);
   const mentionsAllowed = newTaskMentionsAllowed(
     composerMentionsFromRanges(mentions, inlineMentionRanges),
     mentionPolicy,
     workspace?.id
   );
-  const hasInput = !composerDocumentIsEmpty(editorDocument) || attachments.length > 0;
+  const hasInput = !composerDocumentIsEmpty(editorDocument) || attachments.length > 0 || browserComments.length > 0;
   const validContext = selection !== undefined && backend !== undefined
     && (startKind === "fresh" || (selected !== undefined && nativeSelectionReady));
   const modelRouteReady = modelSourceAccess(backend, modelSelection, selectedModel, snapshot.providers).available;
@@ -1236,7 +1265,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     const list = [...files];
     const maximumItems = attachmentPolicy.maximumItems;
     const maximumBytes = attachmentPolicy.maximumBytes;
-    const available = maximumItems === undefined ? list.length : Math.max(0, maximumItems - attachments.length);
+    const available = maximumItems === undefined ? list.length : Math.max(0, maximumItems - attachments.length - browserComments.length);
     const next: AttachmentDraft[] = [];
     for (const file of list.slice(0, available)) {
       const kind = file.type.startsWith("image/") ? "image" as const : "file" as const;
@@ -1278,9 +1307,10 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     const sourceText = composerDocumentPlainText(sourceEditorDocument);
     const sourceRanges = restoreComposerInlineMentionRanges(sourceText, mentionsRef.current, inlineMentionRangesRef.current);
     const sourceMentions = composerMentionsFromRanges(mentionsRef.current, sourceRanges);
+    const sourceBrowserComments = browserCommentsRef.current;
     const activeCanSend = validContext
       && modelRouteReady
-      && (!composerDocumentIsEmpty(sourceEditorDocument) || attachments.length > 0)
+      && (!composerDocumentIsEmpty(sourceEditorDocument) || attachments.length > 0 || sourceBrowserComments.length > 0)
       && attachmentsAllowed
       && newTaskMentionsAllowed(sourceMentions, mentionPolicy, workspace?.id)
       && worktreeDecisionReady
@@ -1302,10 +1332,11 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       signal: request.signal,
       isCurrent: () => submissionScopeRef.current === sourceScope && submissionEpochRef.current === sourceEpoch && submissionRef.current === attempt
         && !request.signal.aborted && submissionValidityRef.current && voiceRoot?.isConnected === true && voiceRoot.ownerDocument === ownerDocument && !ownerWindow.closed
-        && editorDocumentRef.current === sourceDraft && attachmentsRef.current === sourceAttachments
+        && editorDocumentRef.current === sourceDraft && attachmentsRef.current === sourceAttachments && browserCommentsRef.current === sourceBrowserComments
         && newTaskMentionsAllowed(sourceMentions, mentionPolicyRef.current, workspaceIdRef.current)
     };
     submissionOriginRef.current = owner;
+    submittingRef.current = true;
     setSubmitting(true);
     const allowedPermissions = execution.permissionModes;
     const resolvedPermission = allowedPermissions.includes(permissionMode) ? permissionMode : allowedPermissions[0] ?? "ask";
@@ -1334,7 +1365,8 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       }, {
         text: sourceText,
         editorDocument: sourceEditorDocument,
-        attachments,
+        attachments: sourceAttachments,
+        browserComments: sourceBrowserComments,
         mentions: sourceMentions,
         inlineMentionRanges: sourceRanges,
         deliveryMode: "prompt",
@@ -1346,7 +1378,10 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       if (submissionRef.current === attempt) {
         submissionRef.current = undefined;
         submissionOriginRef.current = undefined; submissionAbortRef.current = undefined; request.abort();
-        if (mountedRef.current) setSubmitting(false);
+        if (mountedRef.current) {
+          submittingRef.current = false;
+          setSubmitting(false);
+        }
       }
     }
   };
@@ -1522,6 +1557,29 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
             }}
           >
             {dragging && <div className="composer__drop"><Paperclip aria-hidden="true" /><span>{t("composer.drop")}</span></div>}
+            {browserComments.length > 0 && (
+              <details className="browser-comment-chip">
+                <summary><MessageSquarePlus aria-hidden="true" /><span>{t("composer.browserComments", { count: browserComments.length })}</span><small>{t("composer.browserCommentsPreview")}</small></summary>
+                <div className="browser-comment-chip__preview">
+                  {browserComments.map((item) => (
+                    <article key={item.id}>
+                      {item.screenshot.previewUrl === undefined ? <ImageIcon aria-hidden="true" /> : <img src={item.screenshot.previewUrl} alt="" />}
+                      <span><strong><b>{item.markerNumber}</b>{browserCommentPreviewTag(item)}</strong><small title={item.pageUrl}>{browserCommentPageLabel(item.pageUrl)}</small><p>{item.comment || t("composer.browserCommentNoText")}</p></span>
+                      <IconButton label={t("composer.removeBrowserComment", { number: item.markerNumber })} disabled={submitting} onClick={() => {
+                        if (submitting) return;
+                        revokeAttachments([item.screenshot]);
+                        replaceBrowserComments(removeBrowserCommentAndRepairChains(browserCommentsRef.current, item.id));
+                      }}><X aria-hidden="true" /></IconButton>
+                    </article>
+                  ))}
+                  <Button tone="ghost" disabled={submitting} onClick={() => {
+                    if (submitting) return;
+                    revokeBrowserCommentPreviews(browserCommentsRef.current);
+                    replaceBrowserComments([]);
+                  }}>{t("composer.clearBrowserComments")}</Button>
+                </div>
+              </details>
+            )}
             {attachments.length > 0 && <ComposerAttachmentTray
               ownerKey={voiceOwnerKey}
               attachments={attachments}
@@ -1905,13 +1963,39 @@ function withAttachmentPreview(attachment: AttachmentDraft): AttachmentDraft {
   return attachment.kind === "image" ? { ...attachment, previewUrl: URL.createObjectURL(attachment.file) } : attachment;
 }
 
+function withBrowserCommentPreview(item: BrowserCommentDraftItem): BrowserCommentDraftItem {
+  return { ...item, screenshot: withAttachmentPreview(item.screenshot) };
+}
+
+function revokeBrowserCommentPreviews(items: readonly BrowserCommentDraftItem[]): void {
+  revokeAttachments(items.map((item) => item.screenshot));
+}
+
+function browserCommentPageLabel(value: string): string {
+  try {
+    return new URL(value).host || value;
+  } catch {
+    return value;
+  }
+}
+
+function draftAttachmentsAllowed(
+  attachments: readonly AttachmentDraft[],
+  policy: { readonly images: boolean; readonly files: boolean; readonly maximumItems?: number; readonly maximumBytes?: number }
+): boolean {
+  if (policy.maximumItems !== undefined && attachments.length > policy.maximumItems) return false;
+  return attachments.every((attachment) => {
+    if (policy.maximumBytes !== undefined && attachment.file.size > policy.maximumBytes) return false;
+    return attachment.kind === "image" ? policy.images : policy.files;
+  });
+}
+
 function enqueueNewSessionDraftSave(
   chainRef: { current: Promise<void> },
   controllerRef: { current: AppController },
   draft: NewSessionLocalDraft
 ): Promise<void> {
-  const saveDraft = controllerRef.current.saveNewSessionDraft;
-  const operation = chainRef.current.then(() => saveDraft(draft));
+  const operation = controllerRef.current.saveNewSessionDraft(draft);
   chainRef.current = operation.catch(() => undefined);
   return operation;
 }

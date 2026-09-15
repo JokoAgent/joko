@@ -95,6 +95,7 @@ describe("browser takeover expiry", () => {
       },
       listBrowserActivity: vi.fn(async () => []),
       listBrowserTransfers: vi.fn(async () => []),
+      readNewSessionDraft: vi.fn(async () => undefined),
       updateBrowserCommentDesign: vi.fn(async () => []),
       releaseArtifactUrl: vi.fn()
     } as unknown as AppController;

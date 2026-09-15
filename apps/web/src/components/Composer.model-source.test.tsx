@@ -4,7 +4,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
-import { composerDocumentPlainText } from "../composer-quote-document.js";
+import { composerDocumentPlainText, plainTextToComposerDocument } from "../composer-quote-document.js";
 import { dispatchGamepadOwnedAction } from "../gamepad-actions.js";
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
 import { emptySnapshot, type BackendView, type ModelView, type ProviderRuntimeView, type SessionView } from "../model.js";
@@ -98,6 +98,23 @@ describe("Composer model authorization", () => {
     expect(view.api.send).not.toHaveBeenCalled();
   });
 
+  it("applies one rejected-first-input recovery after an older draft hydration without duplicating it", async () => {
+    const view = await mount();
+    const rejected = { text: "Rejected first input", editorDocument: plainTextToComposerDocument("Rejected first input"), attachments: [], mentions: [], deliveryMode: "prompt" as const };
+    const recovery = {
+      eventId: 1,
+      sessionId: session.id,
+      input: rejected,
+      draft: { ...rejected, text: "Rejected first input\n\nKeep this draft", editorDocument: plainTextToComposerDocument("Rejected first input\n\nKeep this draft") },
+      revision: 2
+    };
+
+    await view.render([provider], session, backend, false, recovery);
+    expect(view.draft()).toBe("Rejected first input\n\nKeep this draft");
+    await view.render([provider], session, backend, false, recovery);
+    expect(view.draft()).toBe("Rejected first input\n\nKeep this draft");
+  });
+
   it("uses only the selected route's authentication and keeps Stop reachable while that route needs recovery", async () => {
     const view = await mount();
     await view.render([{ ...provider, backendId: "other-backend", authenticationState: "expired" }, provider]);
@@ -138,14 +155,16 @@ describe("Composer model authorization", () => {
 async function mount() {
   const initial = emptySnapshot();
   const api = { state: { connectionState: "connected", snapshot: { ...initial, providers: [provider] }, preferences: DEFAULT_UI_PREFERENCES },
-    readDraft: vi.fn(async () => ({ text: "Keep this draft" })), saveDraft: vi.fn(async () => undefined), send: vi.fn(async () => undefined),
+    readDraft: vi.fn(async () => ({ text: "Keep this draft" })),
+    readDraftSnapshot: vi.fn(async () => ({ revision: 1, draft: { text: "Keep this draft", attachments: [], mentions: [], deliveryMode: "prompt" as const } })),
+    saveDraft: vi.fn(async () => undefined), send: vi.fn(async () => undefined),
     getVoiceInputCapabilities: vi.fn(async () => ({}))
   } as unknown as AppController;
   const host = document.body.appendChild(document.createElement("div"));
   const root = createRoot(host); roots.push(root);
   const actions: Promise<unknown>[] = []; const stop = vi.fn();
-  const render = async (providers: readonly ProviderRuntimeView[], currentSession = session, currentBackend = backend, readOnly = false) => act(async () => root.render(<Composer
-    controller={{ ...api, state: { ...api.state, snapshot: { ...api.state.snapshot, providers } } }} session={currentSession} backend={currentBackend}
+  const render = async (providers: readonly ProviderRuntimeView[], currentSession = session, currentBackend = backend, readOnly = false, rejectedFirstInputRecovery?: AppController["state"]["rejectedFirstInputRecovery"]) => act(async () => root.render(<Composer
+    controller={{ ...api, state: { ...api.state, snapshot: { ...api.state.snapshot, providers }, ...(rejectedFirstInputRecovery === undefined ? {} : { rejectedFirstInputRecovery }) } }} session={currentSession} backend={currentBackend}
     readOnly={readOnly}
     autoFocus={false} queue={[]} extraDirectories={[]} resources={[]} commands={[]} messageHistory={[]}
     t={(key) => key} runAction={(_key, action) => { actions.push(action().catch(() => undefined)); }} onLocalSend={() => undefined} onStop={stop} />));

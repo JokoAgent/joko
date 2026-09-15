@@ -23,6 +23,7 @@ import { remapComposerInlineMentionReplacement } from "../composer-mention-range
 import { ModelSourceNotice } from "./ModelSourceNotice.js";
 import type { ArtifactReferenceCatalogItemView, AttachmentDraft, BackendView, BrowserCommentDraftItem, ComposerDraft, ComposerMentionDraft, ComposerMessageMentionDraft, ComposerSelectionQuoteDraft, DeliveryMode, ExtraDirectoryView, QueueControlView, QueueItemView, RuntimeCommandView, SessionResourceView, SessionView, UsageTokensView, WorkspaceView } from "../model.js";
 import { browserCommentPreviewTag, removeBrowserCommentAndRepairChains } from "../browser-comment-draft.js";
+import { mergeRejectedComposerDraft } from "../composer-draft-recovery.js";
 import { appendQuoteToComposerDocument, appendTextToComposerDocument, composerDocumentIsEmpty, composerDocumentKeepingQuotes, composerDocumentPlainText, composerDocumentQuotes, emptyComposerDocument, joinComposerDocuments, normalizeComposerDocument, plainTextToComposerDocument } from "../composer-quote-document.js";
 import { advertisedQueueDeliveryModes } from "./backend-control-capabilities.js";
 import { upsertComposerMention } from "../message-reference.js";
@@ -163,6 +164,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   const editorDocumentRef = useRef(editorDocument);
   editorDocumentRef.current = editorDocument;
   const editorRevisionRef = useRef(0);
+  const hydratedDraftRevisionRef = useRef(0);
 
   const inlineMentionRangesRef = useRef(inlineMentionRanges);
   inlineMentionRangesRef.current = inlineMentionRanges;
@@ -181,11 +183,13 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   const appliedSelectionQuoteInsertionRef = useRef<number | undefined>(undefined);
   const appliedAttachmentInsertionRef = useRef<number | undefined>(undefined);
   const appliedDraftReplacementRef = useRef<number | undefined>(undefined);
+  const appliedRejectedFirstInputRecoveryRef = useRef<number | undefined>(undefined);
   const promptRecommendationRevision = useSyncExternalStore(
     promptRecommendationStore.subscribe,
     promptRecommendationStore.getRevision
   );
   const editorTextUpdate = controller.state.editorTextUpdate;
+  const rejectedFirstInputRecovery = controller.state.rejectedFirstInputRecovery;
   const selectionQuotes = useMemo(() => composerDocumentQuotes(editorDocument), [editorDocument]);
   const mentionCapability = backend?.capabilities.get("input.mention");
   const mentionPolicy = useMemo(() => resolveComposerMentionPolicy(mentionCapability), [mentionCapability]);
@@ -444,6 +448,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     editorRevisionRef.current += 1;
     clearVoiceDictionaryEdit();
     setHydratedSession(undefined);
+    hydratedDraftRevisionRef.current = 0;
     textRef.current = "";
     setText("");
     setEditorDocument(emptyComposerDocument());
@@ -469,8 +474,9 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     hydratedHistoryDraftRef.current = undefined;
     setAttachments((current) => { revokeAttachments(current); return []; });
     setBrowserComments((current) => { revokeBrowserCommentPreviews(current); return []; });
-    void controllerRef.current.readDraft(session.id).then((draft) => {
+    void controllerRef.current.readDraftSnapshot(session.id).then(({ draft, revision }) => {
       if (cancelled || !operationGuardRef.current.ownsActivation(owner)) return;
+      hydratedDraftRevisionRef.current = revision;
       if (operationGuardRef.current.draftUnchanged(owner)) {
         const restoredDocument = normalizeComposerDocument(draft?.editorDocument, draft?.text ?? "");
         const restoredText = composerDocumentPlainText(restoredDocument);
@@ -495,7 +501,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       }
     });
     return () => { cancelled = true; };
-  }, [controller.readDraft, session.id, session.generation]); // Delivery capability updates are reconciled without re-reading storage.
+  }, [controller.readDraftSnapshot, session.id, session.generation]); // Delivery capability updates are reconciled without re-reading storage.
 
   useEffect(() => {
     const container = composerStackRef.current;
@@ -537,6 +543,59 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     const frame = window.requestAnimationFrame(() => richEditorRef.current?.focus("end"));
     return () => window.cancelAnimationFrame(frame);
   }, [focusRequest, hydratedSession, readOnly, session.id]);
+
+  useEffect(() => {
+    if (readOnly
+      || hydratedSession !== session.id
+      || submissionKind !== undefined
+      || rejectedFirstInputRecovery === undefined
+      || rejectedFirstInputRecovery.sessionId !== session.id
+      || appliedRejectedFirstInputRecoveryRef.current === rejectedFirstInputRecovery.eventId) return;
+    appliedRejectedFirstInputRecoveryRef.current = rejectedFirstInputRecovery.eventId;
+    if (hydratedDraftRevisionRef.current >= rejectedFirstInputRecovery.revision) return;
+    const current: ComposerDraft = {
+      text: textRef.current,
+      editorDocument: editorDocumentRef.current,
+      deliveryMode,
+      mentions: mentionsRef.current,
+      inlineMentionRanges: inlineMentionRangesRef.current,
+      attachments: attachmentsRef.current,
+      browserComments: browserCommentsRef.current,
+      ...(extraDirectoryIds === undefined ? {} : { extraDirectoryIds })
+    };
+    const restored = mergeRejectedComposerDraft(rejectedFirstInputRecovery.input, current);
+    const restoredDocument = normalizeComposerDocument(restored.editorDocument, restored.text);
+    const restoredText = composerDocumentPlainText(restoredDocument);
+    markDraftEdited(session.id);
+    editorRevisionRef.current += 1;
+    hydratedDraftRevisionRef.current = rejectedFirstInputRecovery.revision;
+    resetHistoryNavigation();
+    closePalette();
+    setBashMode(false);
+    editorDocumentRef.current = restoredDocument;
+    textRef.current = restoredText;
+    mentionsRef.current = restored.mentions;
+    attachmentsRef.current = restored.attachments;
+    browserCommentsRef.current = restored.browserComments ?? [];
+    setEditorDocument(restoredDocument);
+    setText(restoredText);
+    setMentions(restored.mentions);
+    replaceInlineMentionRanges(restored.inlineMentionRanges ?? []);
+    setExtraDirectoryIds(restored.extraDirectoryIds === undefined
+      ? undefined
+      : restored.extraDirectoryIds.filter((id) => selectableExtraDirectories.some((directory) => directory.id === id)));
+    setDeliveryMode(supportedModes.includes(restored.deliveryMode) ? restored.deliveryMode : supportedModes[0] ?? "prompt");
+    setAttachmentError(undefined);
+    setAttachments((existing) => {
+      revokeAttachments(existing);
+      return restored.attachments.map(withAttachmentPreview);
+    });
+    setBrowserComments((existing) => {
+      revokeBrowserCommentPreviews(existing);
+      return (restored.browserComments ?? []).map(withBrowserCommentPreview);
+    });
+    requestAnimationFrame(() => richEditorRef.current?.focus("end"));
+  }, [hydratedSession, readOnly, rejectedFirstInputRecovery, session.id, submissionKind]);
 
   useEffect(() => {
     if (

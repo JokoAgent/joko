@@ -157,6 +157,7 @@ async function mount(initialText: string, advice: AppController["adviseVoiceInpu
       ...snapshot.settings.voiceInput, refinementEnabled: true
     } } }, preferences: DEFAULT_UI_PREFERENCES },
     readDraft: vi.fn(async () => ({ text: initialText })),
+    readDraftSnapshot: vi.fn(async () => ({ revision: 1, draft: { text: initialText, attachments: [], mentions: [], deliveryMode: "prompt" as const } })),
     saveDraft: vi.fn(async () => undefined),
     send: vi.fn(async () => undefined),
     getVoiceInputCapabilities: vi.fn(async () => ({})),

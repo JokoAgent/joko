@@ -136,6 +136,14 @@ describe("owner-scoped delayed-create drafts", () => {
         { id: "attachment-1", kind: "image", file: image, previewUrl: "blob:must-not-survive" },
         { secret: "must not survive" }
       ],
+      browserComments: [{
+        id: "comment-1",
+        markerNumber: 1,
+        pageUrl: "https://example.com/design",
+        target: { kind: "element", point: { x: 10, y: 20 }, viewport: { width: 800, height: 600 } },
+        comment: "  Align this  ",
+        screenshot: { id: "comment-image-1", kind: "image", file: image, previewUrl: "blob:must-not-survive" }
+      }],
       extraDirectoryIds: ["extra-approved-id", "extra-approved-id", "../server/path", "bad\u0000id"]
     });
 
@@ -153,6 +161,14 @@ describe("owner-scoped delayed-create drafts", () => {
       mentions: [{ id: "file-1", kind: "workspace", reference: "src/main.ts", label: "main.ts", token: "@src/main.ts", workspaceId: "workspace-1" }],
       inlineMentionRanges: [{ mentionId: "file-1", from: 7, to: 19 }],
       attachments: [{ id: "attachment-1", kind: "image", file: image }],
+      browserComments: [{
+        id: "comment-1",
+        markerNumber: 1,
+        pageUrl: "https://example.com/design",
+        target: { kind: "element", point: { x: 10, y: 20 }, viewport: { width: 800, height: 600 } },
+        comment: "Align this",
+        screenshot: { id: "comment-image-1", kind: "image", file: image }
+      }],
       extraDirectoryIds: ["extra-approved-id"]
     });
   });

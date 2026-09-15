@@ -98,6 +98,7 @@ import { InspectorTabErrorBoundary } from "./InspectorTabErrorBoundary.js";
 import { SortableList } from "./SortableList.js";
 import { BrowserCanvas } from "./ToolsPage.js";
 import { BrowserLostPageCard, BrowserPageRail } from "./BrowserPageRail.js";
+import { sessionBrowserCommentDraftTarget } from "../browser-comment-draft-target.js";
 import { resolveComposerAttachmentPolicy } from "./composer-behavior.js";
 import { WorkspaceTextEditor, type WorkspaceEditorSelection, type WorkspaceTextEditorHandle } from "./WorkspaceTextEditor.js";
 import { buildReviewDiffTree, buildReviewSplitRows, createReviewInlineDiff, filterReviewFileJumpResults, filterReviewFiles, flattenReviewDiffTree, inlineWordDiff, isPreviewableReviewImageDiff, isReviewMarkdownPath, isSafeReviewRef, moveReviewFileJumpSelection, reviewFileKey, type InlineWordSegment, type ReviewDiffTreeFlatNode, type ReviewDiffTreeNode, type ReviewSplitRow } from "./review-diff.js";
@@ -2764,7 +2765,7 @@ export function BrowserPanel({ controller, browsers, browserSettings, session, c
             page={selected}
             allowUploads={browserSettings.find((settings) => settings.browserProviderId === browser.id)?.allowUploads === true}
             screenshotBlobId={selected === undefined ? undefined : captured[browserPageKey(browser.id, selected.id)] ?? selected.screenshotBlobId}
-            sessions={commentSessions}
+            targets={commentSessions.map((candidate) => sessionBrowserCommentDraftTarget(candidate, candidate.name || t("session.unnamed")))}
             locale={locale}
             t={t}
             controller={controller}

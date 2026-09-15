@@ -64,8 +64,9 @@ interface PersistedComposerDraft extends Omit<ComposerDraft, "attachments" | "br
   readonly browserComments: readonly PersistedBrowserCommentDraftItem[];
 }
 
-interface PersistedNewSessionLocalDraft extends Omit<NewSessionLocalDraft, "attachments"> {
+interface PersistedNewSessionLocalDraft extends Omit<NewSessionLocalDraft, "attachments" | "browserComments"> {
   readonly attachments: readonly PersistedAttachment[];
+  readonly browserComments: readonly PersistedBrowserCommentDraftItem[];
 }
 
 interface EncryptedSecret {
@@ -562,7 +563,11 @@ export class LocalState {
     if (normalized === undefined) throw new Error("The new-task draft is invalid.");
     const persisted: PersistedNewSessionLocalDraft = {
       ...normalized,
-      attachments: normalized.attachments.map(persistAttachment)
+      attachments: normalized.attachments.map(persistAttachment),
+      browserComments: (normalized.browserComments ?? []).map((item) => ({
+        ...item,
+        screenshot: persistAttachment(item.screenshot)
+      }))
     };
     await this.put(DRAFT_STORE, newSessionDraftKey(scope), persisted);
   }
@@ -572,7 +577,8 @@ export class LocalState {
     if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
     const record = value as Record<string, unknown>;
     const attachments = restorePersistedAttachments(record["attachments"]);
-    return normalizeNewSessionLocalDraft({ ...record, attachments });
+    const browserComments = restorePersistedBrowserComments(record["browserComments"]);
+    return normalizeNewSessionLocalDraft({ ...record, attachments, browserComments });
   }
 
   async savePendingExtensionUse(scope: string, value: PendingExtensionUseView): Promise<void> {
@@ -726,6 +732,7 @@ export function normalizeNewSessionLocalDraft(value: unknown): NewSessionLocalDr
   const inlineMentionRanges = normalizeComposerInlineMentionRanges(record["inlineMentionRanges"], composerDocumentPlainText(editorDocument), mentions);
   if (inlineMentionRanges === undefined) return undefined;
   const attachments = normalizeLiveAttachments(record["attachments"]);
+  const browserComments = normalizeLiveBrowserComments(record["browserComments"]);
   const extraDirectoryIds = normalizeExtraDirectoryIds(record["extraDirectoryIds"]);
   const rawWorktree = record["worktree"];
   const worktree = normalizeNewSessionWorktreeDraft(rawWorktree);
@@ -745,6 +752,7 @@ export function normalizeNewSessionLocalDraft(value: unknown): NewSessionLocalDr
     mentions,
     ...(inlineMentionRanges.length === 0 ? {} : { inlineMentionRanges }),
     attachments,
+    browserComments,
     ...(extraDirectoryIds === undefined ? {} : { extraDirectoryIds })
   };
 }

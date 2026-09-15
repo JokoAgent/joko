@@ -183,7 +183,7 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   expect(current.navigateSessionBranch).toBe(firstController.navigateSessionBranch);
   expect(current.readDraft).toBe(firstController.readDraft);
   expect(current.saveDraft).toBe(firstController.saveDraft);
-  for (const method of ["readDraftSnapshot", "saveDraftIfRevision", ...newDraftMethods, ...workspaceMethods] as const) expect(current[method]).toBe(firstController[method]);
+  for (const method of ["readDraftSnapshot", "saveDraftIfRevision", "restoreFirstInputDraft", ...newDraftMethods, ...workspaceMethods] as const) expect(current[method]).toBe(firstController[method]);
   for (const method of ["send", "createSession", "createTarget", "refresh", "readSessionArtifact"] as const) {
     expect(current[method]).toBe(firstController[method]);
   }
@@ -294,9 +294,23 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   await firstController.saveDraftIfRevision("shared-session", capturedDraft, 0);
   expect(readDraftSnapshot).toHaveBeenLastCalledWith(first.serverId, "shared-session");
   expect(saveDraftIfRevision).toHaveBeenLastCalledWith(first.serverId, "shared-session", capturedDraft, 0);
-  await firstController.readNewSessionDraft();
+  await act(async () => firstController.restoreFirstInputDraft("shared-session", capturedDraft));
+  expect(readDraftSnapshot).toHaveBeenLastCalledWith(first.serverId, "shared-session");
+  expect(saveDraftIfRevision).toHaveBeenLastCalledWith(first.serverId, "shared-session", expect.objectContaining({
+    text: "Captured",
+    deliveryMode: "prompt"
+  }), 0);
   const newTaskDraft = { selection: { kind: "dialogue" as const, backendId: "backend" }, nativeStart: { kind: "fresh" as const }, providerId: "provider", modelId: "model", fastMode: false, permissionMode: "ask" as const, planMode: false, text: "New task", editorDocument: { type: "doc", content: [] }, mentions: [], attachments: [] };
-  await firstController.saveNewSessionDraft(newTaskDraft);
+  const supersededNewTaskDraft = { ...newTaskDraft, text: "Superseded new task" };
+  let releaseFirstNewTaskSave!: () => void;
+  newDraftCalls.saveNewSessionDraft.mockImplementationOnce(() => new Promise<void>((resolve) => { releaseFirstNewTaskSave = resolve; }));
+  const firstNewTaskSave = firstController.saveNewSessionDraft(supersededNewTaskDraft);
+  const latestNewTaskSave = firstController.saveNewSessionDraft(newTaskDraft);
+  const readAfterNewTaskSaves = firstController.readNewSessionDraft();
+  await vi.waitFor(() => expect(newDraftCalls.saveNewSessionDraft).toHaveBeenCalledExactlyOnceWith(`${first.serverId}\u0000${first.id}`, supersededNewTaskDraft));
+  expect(newDraftCalls.readNewSessionDraft).not.toHaveBeenCalled();
+  releaseFirstNewTaskSave();
+  await Promise.all([firstNewTaskSave, latestNewTaskSave, readAfterNewTaskSaves]);
   await firstController.clearNewSessionDraft();
   const pendingExtensionUse = {
     extensionId: "extension_0123456789abcdef0123456789abcdef",

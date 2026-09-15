@@ -4092,6 +4092,7 @@ export interface NewSessionLocalDraft {
   readonly mentions: readonly ComposerMentionDraft[];
   readonly inlineMentionRanges?: readonly ComposerInlineMentionRange[];
   readonly attachments: readonly AttachmentDraft[];
+  readonly browserComments?: readonly BrowserCommentDraftItem[];
   readonly extraDirectoryIds?: readonly string[];
 }
 

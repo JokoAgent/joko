@@ -266,6 +266,7 @@ async function mount(initialDraft: ComposerDraft) {
   const api = {
     state: { connectionState: "connected", snapshot: emptySnapshot(), preferences: DEFAULT_UI_PREFERENCES },
     readDraft: vi.fn(async (sessionId: string) => drafts.get(sessionId)),
+    readDraftSnapshot: vi.fn(async (sessionId: string) => ({ revision: 1, draft: drafts.get(sessionId) })),
     saveDraft: vi.fn(async () => undefined),
     send: vi.fn(async () => undefined),
     getVoiceInputCapabilities: vi.fn(async () => ({})),

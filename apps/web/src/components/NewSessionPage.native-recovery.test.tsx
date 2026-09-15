@@ -13,6 +13,7 @@ import { readVoiceInputPreferences } from "../voice-input-preferences.js";
 import {
   emptySnapshot,
   type AppSnapshot,
+  type BrowserCommentDraftItem,
   type ComposerDraft,
   type ComposerInlineMentionRange,
   type ComposerMentionDraft,
@@ -72,6 +73,10 @@ beforeEach(() => {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => window.setTimeout(() => callback(0), 0));
   vi.stubGlobal("cancelAnimationFrame", (id: number) => window.clearTimeout(id));
+  Object.defineProperties(URL, {
+    createObjectURL: { configurable: true, value: vi.fn((file: File) => `blob:${file.name}`) },
+    revokeObjectURL: { configurable: true, value: vi.fn() }
+  });
   latestEditorProps = undefined;
   renderVoiceSelection = false;
   voiceCaptures.length = 0;
@@ -90,6 +95,76 @@ afterEach(async () => {
 });
 
 describe("new-task native draft recovery", () => {
+  it("flushes the newest draft when the route leaves before the debounce expires", async () => {
+    vi.useFakeTimers();
+    const saveDraft = vi.fn(async () => undefined);
+    const api = controller({ discover: async () => [candidate()], saveDraft });
+    const { root } = await renderPage(api, vi.fn(async () => undefined));
+    await flush();
+
+    await act(async () => required(latestEditorProps?.onDocumentChange)(plainTextToComposerDocument("Newest unsaved input"), false));
+    expect(saveDraft).not.toHaveBeenCalled();
+    await unmountPage(root);
+
+    expect(saveDraft).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      text: "Newest unsaved input",
+      editorDocument: plainTextToComposerDocument("Newest unsaved input")
+    }));
+  });
+
+  it("does not resurrect the consumed draft when the route leaves during first submission", async () => {
+    vi.useFakeTimers();
+    const saveDraft = vi.fn(async () => undefined);
+    const submitted = deferred<void>();
+    const onSubmit = vi.fn(() => submitted.promise);
+    const api = controller({ discover: async () => [candidate()], saveDraft });
+    const { container, root } = await renderPage(api, onSubmit);
+    await flush();
+
+    await act(async () => sendButton(container).click());
+    expect(onSubmit).toHaveBeenCalledOnce();
+    await unmountPage(root);
+    expect(saveDraft).not.toHaveBeenCalled();
+
+    await act(async () => submitted.resolve());
+    expect(saveDraft).not.toHaveBeenCalled();
+  });
+
+  it("restores, removes, and submits Browser annotations as first-class new-task input", async () => {
+    const model: ModelView = {
+      backendId: "backend-1", providerId: "source-one", providerName: "Source one", modelId: "image-model", name: "Image model",
+      available: true, supportsImages: true, supportsFast: false, inputModalities: ["text", "image"], outputModalities: ["text"],
+      efforts: [], contextWindow: 8_192, maximumOutputTokens: 2_048, inputCostMicrosPerMillion: 0, outputCostMicrosPerMillion: 0, currencyCode: "USD"
+    };
+    const base = snapshot();
+    const comments = [browserComment("first", 1), browserComment("second", 2)];
+    const original = controller({ discover: async () => [] });
+    const api = { ...original, state: { ...original.state, snapshot: {
+      ...base,
+      backends: base.backends.map((backend) => ({ ...backend, capabilities: new Map([
+        ...backend.capabilities,
+        ["model.switch", { name: "model.switch", supported: true, options: [] }],
+        ["input.image", { name: "input.image", supported: true, options: [], maximumItems: 4 }]
+      ]) })),
+      models: [model]
+    } }, readNewSessionDraft: vi.fn(async () => ({
+      ...restoredDraft(), nativeStart: { kind: "fresh" }, providerId: model.providerId, modelId: model.modelId,
+      text: "", editorDocument: emptyComposerDocument(), browserComments: comments
+    })) } as unknown as AppController;
+    const onSubmit = vi.fn(async () => undefined);
+    const { container } = await renderPage(api, onSubmit);
+
+    expect(container.querySelectorAll(".browser-comment-chip article")).toHaveLength(2);
+    expect(sendButton(container).disabled).toBe(false);
+    await act(async () => required(container.querySelectorAll<HTMLButtonElement>('button[aria-label="composer.removeBrowserComment"]')[0]).click());
+    expect(container.querySelectorAll(".browser-comment-chip article")).toHaveLength(1);
+    await act(async () => sendButton(container).click());
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith(expect.anything(), expect.objectContaining({
+      text: "",
+      browserComments: [expect.objectContaining({ id: "second", markerNumber: 2 })]
+    }), expect.anything());
+  });
+
   it("blocks a retained workspace mention when its type disappears during pending draft persistence", async () => {
     vi.useFakeTimers();
     let release!: () => void;
@@ -663,6 +738,12 @@ async function renderPage(
   return { container, root, rerender };
 }
 
+async function unmountPage(root: Root): Promise<void> {
+  const index = roots.indexOf(root);
+  if (index >= 0) roots.splice(index, 1);
+  await act(async () => root.unmount());
+}
+
 function controller(options: {
   readonly discover: () => Promise<readonly NativeSessionCandidateView[]>;
   readonly saveDraft?: (draft: NewSessionLocalDraft) => Promise<void>;
@@ -817,6 +898,17 @@ function candidate(overrides: Partial<NativeSessionCandidateView> = {}): NativeS
     modifiedAt: 1,
     state: "ready",
     ...overrides
+  };
+}
+
+function browserComment(id: string, markerNumber: number): BrowserCommentDraftItem {
+  return {
+    id,
+    markerNumber,
+    pageUrl: `https://example.com/${id}`,
+    target: { kind: "element", point: { x: 12, y: 24 }, viewport: { width: 800, height: 600 } },
+    comment: id,
+    screenshot: { id: `${id}-screenshot`, kind: "image", file: new File([id], `${id}.png`, { type: "image/png" }) }
   };
 }
 

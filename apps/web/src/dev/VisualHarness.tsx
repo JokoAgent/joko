@@ -97,9 +97,25 @@ export function VisualHarness(): JSX.Element {
   const terminals = useMemo(() => new VisualTerminalFixture(), []);
   const usageHistory = useMemo(() => new VisualUsageHistoryFixture(scenario.usageState), []);
   const drafts = useRef(new Map<string, ComposerDraft>());
+  const draftRevisions = useRef(new Map<string, number>());
   const draftActions = useMemo(() => ({
     readDraft: async (sessionId: string): Promise<ComposerDraft | undefined> => drafts.current.get(sessionId),
-    saveDraft: async (sessionId: string, draft: ComposerDraft): Promise<void> => { drafts.current.set(sessionId, draft); }
+    saveDraft: async (sessionId: string, draft: ComposerDraft): Promise<void> => {
+      drafts.current.set(sessionId, draft);
+      draftRevisions.current.set(sessionId, (draftRevisions.current.get(sessionId) ?? 0) + 1);
+    },
+    readDraftSnapshot: async (sessionId: string) => ({
+      revision: draftRevisions.current.get(sessionId) ?? 0,
+      draft: drafts.current.get(sessionId)
+    }),
+    saveDraftIfRevision: async (sessionId: string, draft: ComposerDraft, expectedRevision: number): Promise<number | undefined> => {
+      const revision = draftRevisions.current.get(sessionId) ?? 0;
+      if (revision !== expectedRevision) return undefined;
+      const nextRevision = revision + 1;
+      drafts.current.set(sessionId, draft);
+      draftRevisions.current.set(sessionId, nextRevision);
+      return nextRevision;
+    }
   }), []);
   const providerLoginFlows = useRef(new Map<string, ProviderLoginFlowView>());
   const sequence = useRef(100);

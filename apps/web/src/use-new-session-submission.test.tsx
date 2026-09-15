@@ -26,6 +26,7 @@ function api() {
     state: { route: { kind: "newSession" }, connectionState: "connected", activeProfile: { id: "profile" }, navigationRevision: 0 },
     createSession: vi.fn(async () => ({ sessionId: "created", generation: 4n })),
     send: vi.fn(async () => undefined),
+    restoreFirstInputDraft: vi.fn(async () => undefined),
     clearNewSessionDraft: vi.fn(async () => undefined),
     navigate: vi.fn()
   } as unknown as AppController;
@@ -94,6 +95,7 @@ it("shows a send failure on the task it revealed, but a later route never adopts
   await act(async () => { send.reject(new Error("Upload failed")); await failure; });
   expect(probe.error()).toBe("Upload failed");
   expect(original.clearNewSessionDraft).toHaveBeenCalledTimes(1);
+  expect(original.restoreFirstInputDraft).toHaveBeenCalledExactlyOnceWith("created", input);
   expect(probe.busy()).toBeUndefined();
 });
 

@@ -124,7 +124,7 @@ it("sends only the retained exact Artifact after deleting the other same-named o
 
 async function mount(initialDraft = draft, catalog: Partial<Pick<Parameters<typeof Composer>[0], "workspace" | "resources" | "artifacts">> = {}) {
   const api = { state: { connectionState: "connected", snapshot: emptySnapshot(), preferences: DEFAULT_UI_PREFERENCES },
-    readDraft: vi.fn(async () => initialDraft), saveDraft: vi.fn(async () => undefined), send: vi.fn(async () => undefined),
+    readDraft: vi.fn(async () => initialDraft), readDraftSnapshot: vi.fn(async () => ({ revision: 1, draft: initialDraft })), saveDraft: vi.fn(async () => undefined), send: vi.fn(async () => undefined),
     getVoiceInputCapabilities: vi.fn(async () => ({})), listWorkspaceFiles: vi.fn(async () => ({ paths: ["indexed.ts"], truncated: false, revision: "1" }))
   } as unknown as AppController;
   const host = document.body.appendChild(document.createElement("div"));

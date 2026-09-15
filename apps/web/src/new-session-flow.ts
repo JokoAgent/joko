@@ -1,8 +1,8 @@
 import type { AppController } from "./controller.js";
 import type { ComposerDraft, NewSessionDraft, NewSessionDraftSelection } from "./model.js";
 
-type NewSessionFlowApi = Pick<AppController, "createSession" | "send">;
-type ManagedDialogueFlowApi = Pick<AppController, "createTarget" | "createSession" | "send" | "refresh">;
+type NewSessionFlowApi = Pick<AppController, "createSession" | "send" | "restoreFirstInputDraft">;
+type ManagedDialogueFlowApi = Pick<AppController, "createTarget" | "createSession" | "send" | "refresh" | "restoreFirstInputDraft">;
 
 export interface DelayedNewSessionDraft extends Omit<NewSessionDraft, "targetId"> {
   readonly selection: NewSessionDraftSelection;
@@ -33,7 +33,19 @@ export async function createSessionFromFirstInput(
   } catch (error) {
     presentationFailure = { error };
   }
-  await api.send(sessionId, input, { expectedGeneration: generation });
+  try {
+    await api.send(sessionId, input, { expectedGeneration: generation });
+  } catch (error) {
+    try {
+      await api.restoreFirstInputDraft(sessionId, input);
+    } catch (recoveryError) {
+      throw new AggregateError(
+        [error, recoveryError],
+        "The first input was not accepted and could not be restored to the created task draft."
+      );
+    }
+    throw error;
+  }
   if (presentationFailure !== undefined) throw presentationFailure.error;
   return sessionId;
 }

@@ -23,9 +23,11 @@ afterEach(async () => {
 });
 
 describe("ArtifactStorageSettingsCard", () => {
-  it("protects structured page-comment screenshots as active draft media", async () => {
+  it("protects task and new-task page-comment screenshots as active draft media", async () => {
     const screenshot = new File(["page evidence"], "browser-comment-1.png", { type: "image/png" });
+    const newTaskScreenshot = new File(["new-task evidence"], "browser-comment-new-task.png", { type: "image/png" });
     Object.defineProperty(screenshot, "arrayBuffer", { value: async () => new TextEncoder().encode("page evidence").buffer });
+    Object.defineProperty(newTaskScreenshot, "arrayBuffer", { value: async () => new TextEncoder().encode("new-task evidence").buffer });
     const controller = {
       readDraft: vi.fn(async () => ({
         text: "",
@@ -41,10 +43,33 @@ describe("ArtifactStorageSettingsCard", () => {
           screenshot: { id: "screen-1", kind: "image" as const, file: screenshot }
         }]
       })),
-      readNewSessionDraft: vi.fn(async () => undefined)
+      readNewSessionDraft: vi.fn(async () => ({
+        selection: { kind: "target" as const, targetId: "target-1" },
+        nativeStart: { kind: "fresh" as const },
+        providerId: "provider-1",
+        modelId: "model-1",
+        fastMode: false,
+        permissionMode: "ask" as const,
+        planMode: false,
+        text: "",
+        editorDocument: { type: "doc", content: [] },
+        attachments: [],
+        mentions: [],
+        browserComments: [{
+          id: "new-task-comment-1",
+          markerNumber: 1,
+          pageUrl: "https://example.test/new-task",
+          target: { kind: "page" as const, point: { x: 2, y: 3 }, viewport: { width: 10, height: 10 } },
+          comment: "",
+          screenshot: { id: "new-task-screen-1", kind: "image" as const, file: newTaskScreenshot }
+        }]
+      }))
     } as unknown as AppController;
     const snapshot = { ...emptySnapshot(), sessions: [{ id: "session-1" }] } as unknown as ReturnType<typeof emptySnapshot>;
-    await expect(activeDraftAttachmentSha256(controller, snapshot)).resolves.toEqual([await sha256Hex(await screenshot.arrayBuffer())]);
+    await expect(activeDraftAttachmentSha256(controller, snapshot)).resolves.toEqual([
+      await sha256Hex(await screenshot.arrayBuffer()),
+      await sha256Hex(await newTaskScreenshot.arrayBuffer())
+    ].sort());
   });
 
   it("fails closed before scanning when an active task draft cannot be read", async () => {
