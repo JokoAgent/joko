@@ -626,9 +626,11 @@ export function viewerAttentionCursorWhenHistoryReady(
     readonly initialized: boolean;
     readonly loading: boolean;
     readonly error?: string;
-  } | undefined
+  } | undefined,
+  documentForeground: boolean
 ): TimelineHistoryCursorView | undefined {
   if (
+    !documentForeground ||
     history?.sessionId !== session.id ||
     history.generation !== snapshotGeneration ||
     !history.initialized ||
@@ -636,6 +638,24 @@ export function viewerAttentionCursorWhenHistoryReady(
     history.error !== undefined
   ) return undefined;
   return viewerAttentionCursor(session);
+}
+
+export function sessionAttentionAcknowledgementKey(
+  serverId: string,
+  profileId: string,
+  sessionId: string,
+  snapshotGeneration: bigint,
+  cursor: TimelineHistoryCursorView
+): string {
+  return JSON.stringify([
+    serverId,
+    profileId,
+    sessionId,
+    snapshotGeneration.toString(),
+    cursor.generation.toString(),
+    cursor.sequence.toString(),
+    cursor.opaqueToken
+  ]);
 }
 
 export function visibleSidebarAttention(

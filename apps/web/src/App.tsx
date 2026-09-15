@@ -51,6 +51,7 @@ import { useGamepadInput } from "./gamepad-client.js";
 import { isStartupUpdateInteractionBlocked } from "./startup-update-interaction.js";
 import { promptRecommendationOwnerKey, promptRecommendationStore } from "./prompt-recommendation-store.js";
 import { visionBridgeToastStore } from "./vision-bridge-toast-store.js";
+import { useDocumentForeground } from "./document-foreground.js";
 import { deleteScheduleWithGeneratedSessions, prepareScheduleDeletion } from "./schedule-deletion.js";
 import { SessionNotificationTracker, shouldDispatchSessionNotifications } from "./session-notifications.js";
 import { ScheduleNotificationTracker } from "./schedule-notifications.js";
@@ -59,7 +60,9 @@ import {
   type SessionAttentionBadgeKey
 } from "./session-attention-badge.js";
 import {
+  retrySessionAttentionAcknowledgement,
   SessionAttentionAcknowledgementRetryTracker,
+  sessionAttentionAcknowledgementKey,
   sidebarOwnerLayoutFor,
   viewerAttentionCursorWhenHistoryReady
 } from "./sidebar-layout.js";
@@ -727,14 +730,23 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   } | undefined>(undefined);
   const attentionAckRetryTrackerRef = useRef(new SessionAttentionAcknowledgementRetryTracker());
   const [attentionAckRetryRevision, setAttentionAckRetryRevision] = useState(0);
+  const documentForeground = useDocumentForeground();
   const attentionThroughCursor = activeSession !== undefined
     && state.connectionState === "connected"
     && activeBackend?.capabilities.get("session.attention")?.supported === true
-    ? viewerAttentionCursorWhenHistoryReady(activeSession, state.snapshot.generation, timelineHistory)
+    ? viewerAttentionCursorWhenHistoryReady(activeSession, state.snapshot.generation, timelineHistory, documentForeground)
     : undefined;
-  const activeAttentionAckKey = activeSession === undefined || attentionThroughCursor === undefined
+  const activeAttentionAckKey = state.activeProfile === undefined
+    || activeSession === undefined
+    || attentionThroughCursor === undefined
     ? undefined
-    : `${activeSession.id}\u0000${attentionThroughCursor.opaqueToken}`;
+    : sessionAttentionAcknowledgementKey(
+        state.activeProfile.serverId,
+        state.activeProfile.id,
+        activeSession.id,
+        state.snapshot.generation,
+        attentionThroughCursor
+      );
   attentionAckRetryTrackerRef.current.activate(activeAttentionAckKey);
   useEffect(() => {
     const key = activeAttentionAckKey;
@@ -757,9 +769,12 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     ).then(() => {
       attentionAckRetryTrackerRef.current.succeeded(key);
     }).catch((error: unknown) => {
-      acknowledgedAttentionRef.current.delete(key);
       const delayMs = attentionAckRetryTrackerRef.current.failed(key, error);
-      if (delayMs === undefined) return;
+      if (delayMs === undefined) {
+        if (retrySessionAttentionAcknowledgement(error)) acknowledgedAttentionRef.current.delete(key);
+        return;
+      }
+      acknowledgedAttentionRef.current.delete(key);
       const timer = window.setTimeout(() => {
         if (!attentionAckRetryTrackerRef.current.release(key)) return;
         attentionAckRetryTimerRef.current = undefined;

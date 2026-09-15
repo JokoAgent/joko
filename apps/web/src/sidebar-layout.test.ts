@@ -17,6 +17,7 @@ import {
   reconcileSidebarDoneAttentionVisibility,
   retrySessionAttentionAcknowledgement,
   SessionAttentionAcknowledgementRetryTracker,
+  sessionAttentionAcknowledgementKey,
   sessionAttentionAcknowledgementRetryDelayMs,
   sidebarGroupIndicatorState,
   sidebarSessionIndicatorState,
@@ -316,12 +317,28 @@ describe("sidebar task sorting", () => {
       initialized: true,
       loading: false
     };
-    expect(viewerAttentionCursorWhenHistoryReady(done, 7n, ready)).toEqual(done.attention?.attentionCursor);
-    expect(viewerAttentionCursorWhenHistoryReady(done, 8n, ready)).toBeUndefined();
-    expect(viewerAttentionCursorWhenHistoryReady(done, 7n, { ...ready, sessionId: "other" })).toBeUndefined();
-    expect(viewerAttentionCursorWhenHistoryReady(done, 7n, { ...ready, initialized: false })).toBeUndefined();
-    expect(viewerAttentionCursorWhenHistoryReady(done, 7n, { ...ready, loading: true })).toBeUndefined();
-    expect(viewerAttentionCursorWhenHistoryReady(done, 7n, { ...ready, error: "failed" })).toBeUndefined();
+    expect(viewerAttentionCursorWhenHistoryReady(done, 7n, ready, true)).toEqual(done.attention?.attentionCursor);
+    expect(viewerAttentionCursorWhenHistoryReady(done, 7n, ready, false)).toBeUndefined();
+    expect(viewerAttentionCursorWhenHistoryReady(done, 8n, ready, true)).toBeUndefined();
+    expect(viewerAttentionCursorWhenHistoryReady(done, 7n, { ...ready, sessionId: "other" }, true)).toBeUndefined();
+    expect(viewerAttentionCursorWhenHistoryReady(done, 7n, { ...ready, initialized: false }, true)).toBeUndefined();
+    expect(viewerAttentionCursorWhenHistoryReady(done, 7n, { ...ready, loading: true }, true)).toBeUndefined();
+    expect(viewerAttentionCursorWhenHistoryReady(done, 7n, { ...ready, error: "failed" }, true)).toBeUndefined();
+
+    const cursor = done.attention?.attentionCursor;
+    if (cursor === undefined) throw new Error("Expected attention cursor");
+    const key = sessionAttentionAcknowledgementKey("server-a", "profile-a", done.id, 7n, cursor);
+    expect(sessionAttentionAcknowledgementKey("server-a", "profile-a", done.id, 7n, cursor)).toBe(key);
+    expect(new Set([
+      key,
+      sessionAttentionAcknowledgementKey("server-b", "profile-a", done.id, 7n, cursor),
+      sessionAttentionAcknowledgementKey("server-a", "profile-b", done.id, 7n, cursor),
+      sessionAttentionAcknowledgementKey("server-a", "profile-a", "other", 7n, cursor),
+      sessionAttentionAcknowledgementKey("server-a", "profile-a", done.id, 8n, cursor),
+      sessionAttentionAcknowledgementKey("server-a", "profile-a", done.id, 7n, { ...cursor, generation: cursor.generation + 1n }),
+      sessionAttentionAcknowledgementKey("server-a", "profile-a", done.id, 7n, { ...cursor, sequence: cursor.sequence + 1n }),
+      sessionAttentionAcknowledgementKey("server-a", "profile-a", done.id, 7n, { ...cursor, opaqueToken: `${cursor.opaqueToken}-next` })
+    ]).size).toBe(8);
 
     expect(retrySessionAttentionAcknowledgement(new Error("transport reset"))).toBe(true);
     expect(retrySessionAttentionAcknowledgement({ code: "revision_conflict" })).toBe(false);
