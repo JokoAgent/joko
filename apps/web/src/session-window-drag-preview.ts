@@ -17,6 +17,8 @@ interface ActiveSessionWindowDragPreview {
   readonly dragImage: HTMLCanvasElement;
   readonly onKeyDown: (event: globalThis.KeyboardEvent) => void;
   readonly onDragEnd: () => void;
+  readonly onPointerUp: () => void;
+  readonly rendererReleaseFallback: boolean;
   readonly timeout: number;
 }
 
@@ -59,6 +61,8 @@ export function startSessionWindowDragPreview(request: SessionWindowDragPreviewS
     cancelSessionWindowDragPreview(request.ownerWindow);
   };
   const onDragEnd = (): void => { finishSessionWindowDragPreview(request.ownerWindow); };
+  const onPointerUp = (): void => { finishSessionWindowDragPreview(request.ownerWindow); };
+  const rendererReleaseFallback = request.ownerWindow.jokoDesktop?.platform !== "darwin";
   const timeout = request.ownerWindow.setTimeout(
     () => cancelSessionWindowDragPreview(request.ownerWindow),
     SESSION_WINDOW_DRAG_PREVIEW_TIMEOUT_MS
@@ -71,12 +75,18 @@ export function startSessionWindowDragPreview(request: SessionWindowDragPreviewS
     dragImage,
     onKeyDown,
     onDragEnd,
+    onPointerUp,
+    rendererReleaseFallback,
     timeout
   };
   activePreview = active;
   request.row.classList.add("is-session-dragging");
   request.ownerWindow.addEventListener("keydown", onKeyDown, true);
   request.ownerWindow.addEventListener("dragend", onDragEnd, true);
+  if (rendererReleaseFallback) {
+    request.ownerWindow.addEventListener("pointerup", onPointerUp, true);
+    request.ownerWindow.addEventListener("mouseup", onPointerUp, true);
+  }
 
   const api = request.ownerWindow.jokoDesktop?.sessionWindows;
   try {
@@ -131,6 +141,10 @@ function cleanupActivePreview(active: ActiveSessionWindowDragPreview): void {
   active.ownerWindow.clearTimeout(active.timeout);
   active.ownerWindow.removeEventListener("keydown", active.onKeyDown, true);
   active.ownerWindow.removeEventListener("dragend", active.onDragEnd, true);
+  if (active.rendererReleaseFallback) {
+    active.ownerWindow.removeEventListener("pointerup", active.onPointerUp, true);
+    active.ownerWindow.removeEventListener("mouseup", active.onPointerUp, true);
+  }
   active.row.classList.remove("is-session-dragging");
   active.dragImage.remove();
 }

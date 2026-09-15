@@ -73,9 +73,61 @@ describe("task window drag preview lifecycle", () => {
     })).toBe(false);
     expect(bridge.beginDragPreview).toHaveBeenCalledOnce();
   });
+
+  it("finishes a non-macOS drag exactly once on the renderer mouse-release fallback", async () => {
+    installTokens();
+    const bridge = installBridge("win32");
+    const row = document.body.appendChild(document.createElement("li"));
+    expect(startSessionWindowDragPreview({
+      dataTransfer: { setDragImage: vi.fn() } as unknown as DataTransfer,
+      row,
+      sessionId: "task-one",
+      label: "Task one",
+      hint: "Open in new window",
+      ownerWindow: window
+    })).toBe(true);
+    await Promise.resolve();
+    const gestureId = bridge.beginDragPreview.mock.calls[0]?.[0]?.gestureId;
+
+    window.dispatchEvent(new MouseEvent("pointerup"));
+    window.dispatchEvent(new MouseEvent("mouseup"));
+    window.dispatchEvent(new Event("dragend"));
+    await Promise.resolve();
+
+    expect(bridge.openIfDroppedOutside).toHaveBeenCalledExactlyOnceWith(gestureId);
+    expect(bridge.endDragPreview).not.toHaveBeenCalled();
+    expect(row.classList.contains("is-session-dragging")).toBe(false);
+    expect(document.querySelector("canvas")).toBeNull();
+  });
+
+  it("leaves mouse release to the macOS native path and consumes renderer dragend once", async () => {
+    installTokens();
+    const bridge = installBridge("darwin");
+    const row = document.body.appendChild(document.createElement("li"));
+    expect(startSessionWindowDragPreview({
+      dataTransfer: { setDragImage: vi.fn() } as unknown as DataTransfer,
+      row,
+      sessionId: "task-one",
+      label: "Task one",
+      hint: "Open in new window",
+      ownerWindow: window
+    })).toBe(true);
+    await Promise.resolve();
+    const gestureId = bridge.beginDragPreview.mock.calls[0]?.[0]?.gestureId;
+
+    window.dispatchEvent(new MouseEvent("pointerup"));
+    window.dispatchEvent(new MouseEvent("mouseup"));
+    expect(bridge.openIfDroppedOutside).not.toHaveBeenCalled();
+    expect(document.querySelector("canvas")).not.toBeNull();
+
+    window.dispatchEvent(new Event("dragend"));
+    window.dispatchEvent(new Event("dragend"));
+    await Promise.resolve();
+    expect(bridge.openIfDroppedOutside).toHaveBeenCalledExactlyOnceWith(gestureId);
+  });
 });
 
-function installBridge(): {
+function installBridge(platform: NodeJS.Platform = "win32"): {
   beginDragPreview: ReturnType<typeof vi.fn>;
   endDragPreview: ReturnType<typeof vi.fn>;
   openIfDroppedOutside: ReturnType<typeof vi.fn>;
@@ -87,7 +139,7 @@ function installBridge(): {
   };
   Object.defineProperty(window, "jokoDesktop", {
     configurable: true,
-    value: { capabilities: ["session.windows"], sessionWindows: bridge }
+    value: { platform, capabilities: ["session.windows"], sessionWindows: bridge }
   });
   return bridge;
 }
