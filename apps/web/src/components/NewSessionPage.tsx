@@ -188,6 +188,8 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const [worktreeSources, setWorktreeSources] = useState<readonly WorktreeSourceView[]>([]);
   const [worktreeLoading, setWorktreeLoading] = useState(false);
   const [worktreeError, setWorktreeError] = useState<string>();
+  const [worktreeProbeRevision, setWorktreeProbeRevision] = useState(0);
+  const [worktreePreferenceSaving, setWorktreePreferenceSaving] = useState(false);
   const [text, setText] = useState("");
   const [editorDocument, setEditorDocument] = useState<JSONContent>(emptyComposerDocument);
   const [mentions, setMentions] = useState<readonly ComposerMentionDraft[]>([]);
@@ -241,6 +243,8 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const commandComposingRef = useRef(false);
   const suppressedCommandFromRef = useRef<number | undefined>(undefined);
   const worktreeProbeSequenceRef = useRef(0);
+  const worktreeAuthorityTargetRef = useRef<string | undefined>(undefined);
+  const worktreePreferenceSavingRef = useRef(false);
   controllerRef.current = controller;
   translatorRef.current = t;
   editorDocumentRef.current = editorDocument;
@@ -383,14 +387,26 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const canSelectExtraDirectories = workspace !== undefined && backend?.capabilities.get("workspace.extra_dirs")?.supported === true;
   const canUseAddMenu = attachmentPolicy.images || attachmentPolicy.files || canMention || commandItems.length > 0
     || canSelectExtraDirectories && selectableExtraDirectories.length > 0;
-  const worktreeEligible = worktreeProbe !== undefined
-    && selected !== undefined
-    && worktreeProbe.targetId === selected.id
-    && worktreeProbe.eligibility === "eligible";
-  const worktreeRequested = selected !== undefined && startKind === "fresh" && worktreeEnabled;
+  const worktreeApplicable = selected !== undefined && startKind === "fresh"
+    && workspace?.kind === "userProject" && selected.remoteWorkspace === undefined;
+  const currentWorktreeProbe = worktreeApplicable && worktreeProbe?.targetId === selected?.id
+    ? worktreeProbe
+    : undefined;
+  const worktreeEligible = currentWorktreeProbe?.eligibility === "eligible";
+  const worktreeConfirmedIneligible = currentWorktreeProbe !== undefined
+    && worktreeEligibilityConfirmsPlainTask(currentWorktreeProbe.eligibility);
+  const worktreeProbeNeedsRetry = currentWorktreeProbe?.eligibility === "unsafe"
+    || currentWorktreeProbe?.eligibility === "unavailable";
+  const worktreeRequested = worktreeApplicable && worktreeEnabled;
   const effectiveWorktreeEnabled = worktreeRequested && worktreeEligible;
+  const worktreePreferenceRelevant = worktreeApplicable && !worktreeConfirmedIneligible;
+  const showWorktreeControls = worktreePreferenceRelevant && (worktreeEnabled || worktreeEligible);
 
   const profileScope = `${controller.state.activeProfile?.serverId ?? ""}\u0000${controller.state.activeProfile?.id ?? ""}`;
+  useEffect(() => {
+    if (worktreePreferenceSavingRef.current) return;
+    setWorktreeEnabled(controller.state.preferences.newSessionWorktreeEnabled);
+  }, [controller.state.preferences.newSessionWorktreeEnabled, profileScope, worktreePreferenceSaving]);
   const inlineMentionPaletteScope = useMemo(() => ({}), [
     profileScope,
     selectionKey,
@@ -566,6 +582,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     let cancelled = false;
     const requestController = new AbortController();
     setHydrated(false);
+    worktreeAuthorityTargetRef.current = undefined;
     setDraftError(undefined);
     setSelection(requestedSelection ?? defaultNewSessionSelection(activeTargets, eligibleDialogueBackends));
     void (async () => {
@@ -642,7 +659,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       setStartKind(draft?.nativeStart.kind ?? "fresh");
       setNativeReference(draft?.nativeStart.kind === "attach" ? draft.nativeStart.reference : "");
       setNativeSelectionWarning(undefined);
-      setWorktreeEnabled(draft?.worktree?.enabled ?? controllerRef.current.state.preferences.newSessionWorktreeEnabled);
+      setWorktreeEnabled(controllerRef.current.state.preferences.newSessionWorktreeEnabled);
       setWorktreeSourceRef(draft?.worktree?.sourceRef);
       setRefreshWorktreeRemote(draft?.worktree?.refreshRemote ?? false);
       setDraftError(hydrationError);
@@ -692,7 +709,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
         ? restored.permissionMode
         : restoredOptions.permissionModes[0] ?? "ask");
       setPlanMode(restoredOptions.planModeSupported && restored.planMode);
-      setWorktreeEnabled(restored.worktree?.enabled ?? controllerRef.current.state.preferences.newSessionWorktreeEnabled);
+      setWorktreeEnabled(controllerRef.current.state.preferences.newSessionWorktreeEnabled);
       setWorktreeSourceRef(restored.worktree?.sourceRef);
       setRefreshWorktreeRemote(restored.worktree?.refreshRemote ?? false);
       setExtraDirectoryIds(canSelectExtraDirectories
@@ -777,7 +794,15 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
 
   useEffect(() => {
     const sequence = ++worktreeProbeSequenceRef.current;
-    if (selected === undefined || startKind !== "fresh") {
+    if (!hydrated) return;
+    const authorityTargetId = worktreeApplicable ? selected!.id : undefined;
+    const previousAuthorityTargetId = worktreeAuthorityTargetRef.current;
+    worktreeAuthorityTargetRef.current = authorityTargetId;
+    if (authorityTargetId === undefined || previousAuthorityTargetId !== undefined && previousAuthorityTargetId !== authorityTargetId) {
+      setWorktreeSourceRef(undefined);
+      setRefreshWorktreeRemote(false);
+    }
+    if (authorityTargetId === undefined) {
       setWorktreeProbe(undefined);
       setWorktreeSources([]);
       setWorktreeLoading(false);
@@ -789,15 +814,18 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     setWorktreeSources([]);
     setWorktreeLoading(true);
     setWorktreeError(undefined);
-    void controllerRef.current.probeTargetWorktree(selected.id, abort.signal).then(async (probe) => {
+    void controllerRef.current.probeTargetWorktree(authorityTargetId, abort.signal).then(async (probe) => {
       if (abort.signal.aborted || sequence !== worktreeProbeSequenceRef.current) return;
+      if (probe.targetId !== authorityTargetId) {
+        throw new Error(translatorRef.current("worktree.probeTargetMismatch"));
+      }
       setWorktreeProbe(probe);
       if (!probe.canRefreshRemote) setRefreshWorktreeRemote(false);
       if (probe.eligibility !== "eligible") {
         setWorktreeSourceRef(undefined);
         return;
       }
-      const sources = await controllerRef.current.listTargetWorktreeSources(selected.id, abort.signal);
+      const sources = await controllerRef.current.listTargetWorktreeSources(authorityTargetId, abort.signal);
       if (abort.signal.aborted || sequence !== worktreeProbeSequenceRef.current) return;
       setWorktreeSources(sources);
       setWorktreeSourceRef((current) => sources.some((source) => source.ref === current)
@@ -810,7 +838,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       if (!abort.signal.aborted && sequence === worktreeProbeSequenceRef.current) setWorktreeLoading(false);
     });
     return () => abort.abort();
-  }, [selected?.id, startKind]);
+  }, [hydrated, selected?.id, startKind, worktreeApplicable, worktreeProbeRevision]);
 
   useEffect(() => {
     if (selectedModel === undefined) return;
@@ -864,8 +892,9 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const validContext = selection !== undefined && backend !== undefined
     && (startKind === "fresh" || (selected !== undefined && nativeSelectionReady));
   const modelRouteReady = modelSourceAccess(backend, modelSelection, selectedModel, snapshot.providers).available;
-  const worktreeDecisionReady = !worktreeRequested || (
-    !worktreeLoading && worktreeError === undefined && worktreeProbe?.targetId === selected?.id
+  const worktreeDecisionReady = !worktreePreferenceRelevant || (
+    !worktreePreferenceSaving
+    && (!worktreeEnabled || (!worktreeLoading && worktreeError === undefined && worktreeEligible))
   );
   const canFinishVoiceSend = hydrated && controller.state.connectionState === "connected" && validContext && modelRouteReady && attachmentsAllowed && mentionsAllowed && worktreeDecisionReady && fullAccessConfirmation === undefined && !submitting;
   const canSend = canFinishVoiceSend && hasInput && !voice.active;
@@ -1292,10 +1321,21 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   };
 
   const updateWorktreeEnabled = (enabled: boolean): void => {
+    if (worktreePreferenceSavingRef.current || submittingRef.current) return;
     const previous = worktreeEnabled;
+    worktreePreferenceSavingRef.current = true;
+    setWorktreePreferenceSaving(true);
+    setDraftError(undefined);
     setWorktreeEnabled(enabled);
-    void controllerRef.current.setNewSessionWorktreeEnabled(enabled).catch((error: unknown) => {
+    void controllerRef.current.setNewSessionWorktreeEnabled(enabled).then(() => {
       if (mountedRef.current) {
+        worktreePreferenceSavingRef.current = false;
+        setWorktreePreferenceSaving(false);
+      }
+    }).catch((error: unknown) => {
+      if (mountedRef.current) {
+        worktreePreferenceSavingRef.current = false;
+        setWorktreePreferenceSaving(false);
         setWorktreeEnabled(previous);
         setDraftError(messageOf(error));
       }
@@ -1314,6 +1354,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       && attachmentsAllowed
       && newTaskMentionsAllowed(sourceMentions, mentionPolicy, workspace?.id)
       && worktreeDecisionReady
+      && !(worktreePreferenceRelevant && worktreePreferenceSavingRef.current)
       && fullAccessConfirmationRef.current === undefined
       && !submitting && !voice.isActive();
     if (!activeCanSend || selection === undefined || submissionRef.current) return;
@@ -1343,7 +1384,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     const worktree = effectiveWorktreeEnabled
       ? {
           ...(worktreeSourceRef === undefined ? {} : { sourceRef: worktreeSourceRef }),
-          refreshRemote: refreshWorktreeRemote && worktreeProbe?.canRefreshRemote === true
+          refreshRemote: refreshWorktreeRemote && currentWorktreeProbe?.canRefreshRemote === true
         }
       : undefined;
     try {
@@ -1493,21 +1534,23 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
 
         {selected !== undefined && !selected.trusted && <div className="new-task-warning" role="status"><AlertTriangle aria-hidden="true" /><span>{t("session.projectInert")}</span></div>}
         {draftError !== undefined && <div className="new-task-warning" role="alert"><AlertTriangle aria-hidden="true" /><span>{draftError}</span></div>}
-        {selected !== undefined && startKind === "fresh" && <section className="new-task-worktree" aria-labelledby="new-task-worktree-title">
+        {showWorktreeControls && <section className="new-task-worktree" aria-labelledby="new-task-worktree-title">
           <header>
             <span><GitBranch aria-hidden="true" /><strong id="new-task-worktree-title">{t("worktree.title")}</strong></span>
             <label className="new-task-worktree__toggle">
               <CheckboxControl
                 checked={worktreeEnabled}
-                disabled={submitting || worktreeLoading || (!worktreeEligible && !worktreeEnabled)}
+                disabled={submitting || worktreePreferenceSaving || (!worktreeEligible && !worktreeEnabled)}
                 onChange={(event) => updateWorktreeEnabled(event.target.checked)}
               />
               <span>{t("worktree.enable")}</span>
             </label>
           </header>
           {worktreeLoading && <p className="muted" role="status">{t("worktree.checking")}</p>}
-          {worktreeError !== undefined && <p className="inline-error" role="alert">{worktreeError}</p>}
-          {!worktreeLoading && worktreeError === undefined && worktreeProbe !== undefined && worktreeProbe.eligibility !== "eligible" && <p className="muted">{t(worktreeEligibilityMessage(worktreeProbe.eligibility))}</p>}
+          {worktreeError !== undefined && <div className="new-task-worktree__recovery" role={worktreeEnabled ? "alert" : "status"}><p className={worktreeEnabled ? "inline-error" : "muted"}>{worktreeError}</p><button type="button" disabled={submitting || worktreeLoading} onClick={() => setWorktreeProbeRevision((value) => value + 1)}>{t("worktree.retry")}</button></div>}
+          {!worktreeLoading && worktreeError === undefined && currentWorktreeProbe !== undefined && currentWorktreeProbe.eligibility !== "eligible" && (worktreeProbeNeedsRetry
+            ? <div className="new-task-worktree__recovery" role={worktreeEnabled ? "alert" : "status"}><p className={worktreeEnabled ? "inline-error" : "muted"}>{t(worktreeEligibilityMessage(currentWorktreeProbe.eligibility))}</p><button type="button" disabled={submitting} onClick={() => setWorktreeProbeRevision((value) => value + 1)}>{t("worktree.retry")}</button></div>
+            : <p className="muted">{t(worktreeEligibilityMessage(currentWorktreeProbe.eligibility))}</p>)}
           {worktreeEligible && <div className="new-task-worktree__options">
             <label>
               <span>{t("worktree.source")}</span>
@@ -1516,7 +1559,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
                 {worktreeSources.map((source) => <option value={source.ref} key={`${source.ref}\u0000${source.commit}`}>{source.name}{source.current ? ` · ${t("worktree.current")}` : ""}</option>)}
               </SelectControl>
             </label>
-            {worktreeProbe?.canRefreshRemote && <label className="new-task-worktree__refresh"><CheckboxControl checked={refreshWorktreeRemote} disabled={submitting} onChange={(event) => setRefreshWorktreeRemote(event.target.checked)} /><span>{t("worktree.refreshRemote")}</span></label>}
+            {currentWorktreeProbe?.canRefreshRemote && <label className="new-task-worktree__refresh"><CheckboxControl checked={refreshWorktreeRemote} disabled={submitting} onChange={(event) => setRefreshWorktreeRemote(event.target.checked)} /><span>{t("worktree.refreshRemote")}</span></label>}
           </div>}
         </section>}
         {startKind === "attach" && selected !== undefined && <section className="native-session-picker new-task-native" aria-label={t("session.nativeSessions")}>
@@ -1948,9 +1991,10 @@ function modelSelectionFor(backendId: string, modelKey: string): ModelSourceSele
 
 function worktreeEligibilityMessage(
   value: Exclude<WorktreeEligibilityView, "eligible">
-): "worktree.ineligible.notGitRepository" | "worktree.ineligible.alreadyLinked" | "worktree.ineligible.unsafe" | "worktree.ineligible.unavailable" {
+): "worktree.ineligible.notGitRepository" | "worktree.ineligible.alreadyLinked" | "worktree.ineligible.gitNotFound" | "worktree.ineligible.unsafe" | "worktree.ineligible.unavailable" {
   if (value === "notGitRepository") return "worktree.ineligible.notGitRepository";
   if (value === "alreadyLinked") return "worktree.ineligible.alreadyLinked";
+  if (value === "gitNotFound") return "worktree.ineligible.gitNotFound";
   if (value === "unsafe") return "worktree.ineligible.unsafe";
   return "worktree.ineligible.unavailable";
 }
@@ -1961,6 +2005,10 @@ function revokeAttachments(attachments: readonly AttachmentDraft[]): void {
 
 function withAttachmentPreview(attachment: AttachmentDraft): AttachmentDraft {
   return attachment.kind === "image" ? { ...attachment, previewUrl: URL.createObjectURL(attachment.file) } : attachment;
+}
+
+function worktreeEligibilityConfirmsPlainTask(value: WorktreeEligibilityView): boolean {
+  return value === "notGitRepository" || value === "alreadyLinked" || value === "gitNotFound";
 }
 
 function withBrowserCommentPreview(item: BrowserCommentDraftItem): BrowserCommentDraftItem {

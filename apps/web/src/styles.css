@@ -3787,10 +3787,10 @@ html[data-desktop-platform="darwin"] .runtime-process-window__titlebar { padding
 .new-task-worktree__options .select-control:focus-visible { border-color: var(--accent-edge); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-edge) 12%, transparent); }
 .new-task-worktree__refresh { min-height: 30px; }
 .new-task-native { max-height: 186px; margin-bottom: 10px; border: 1px solid var(--line); border-radius: 12px; padding: 8px; overflow-y: auto; background: var(--surface-raised); }
-.new-task-native__recovery { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 6px 8px; }
-.new-task-native__recovery p { margin: 0; }
-.new-task-native__recovery button { min-height: 28px; flex: none; border: 1px solid var(--line); border-radius: 8px; padding: 0 10px; background: var(--surface); color: var(--text); }
-.new-task-native__recovery button:hover:not(:disabled) { border-color: var(--line-strong); background: var(--surface-hover); }
+.new-task-native__recovery, .new-task-worktree__recovery { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 6px 8px; }
+.new-task-native__recovery p, .new-task-worktree__recovery p { margin: 0; }
+.new-task-native__recovery button, .new-task-worktree__recovery button { min-height: 28px; flex: none; border: 1px solid var(--line); border-radius: 8px; padding: 0 10px; background: var(--surface); color: var(--text); }
+.new-task-native__recovery button:hover:not(:disabled), .new-task-worktree__recovery button:hover:not(:disabled) { border-color: var(--line-strong); background: var(--surface-hover); }
 .new-task-composer-wrap { width: min(100%, 934px); margin: 0 auto; }
 .new-task-worktree__creating { width: 100%; height: 90px; display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; border: 1px solid var(--line); border-radius: 12px; padding: 0 16px; background: var(--surface); }
 .new-task-worktree__creating > svg { width: 32px; height: 32px; flex: 0 0 auto; border-radius: 999px; padding: 8px; background: var(--surface-hover); color: var(--text-soft); animation: spin 1.2s linear infinite; }

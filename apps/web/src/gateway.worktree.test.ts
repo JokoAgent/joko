@@ -15,6 +15,23 @@ import { describe, expect, it, vi } from "vitest";
 import { createOrchestratorGateway } from "./gateway.js";
 
 describe("isolated-workspace gateway", () => {
+  it("keeps Git-not-found distinct from an unavailable worktree service", async () => {
+    const transport = transportWithSnapshot(async (method) => response(method, create(ProbeTargetWorktreeResponseSchema, {
+      targetId: "target-1",
+      eligibility: WorktreeEligibility.GIT_NOT_FOUND,
+      canRefreshRemote: false
+    })));
+    const gateway = createOrchestratorGateway(profile("worktree-git-missing"), "secret", {}, () => transport);
+    await gateway.connect();
+
+    await expect(gateway.probeTargetWorktree("target-1")).resolves.toEqual({
+      targetId: "target-1",
+      eligibility: "gitNotFound",
+      canRefreshRemote: false
+    });
+    gateway.disconnect();
+  });
+
   it("maps an exact Session removal preview and rejects contradictory identities", async () => {
     let preview = create(GetSessionWorktreeRemovalPreviewResponseSchema, {
       sessionId: "session-1",

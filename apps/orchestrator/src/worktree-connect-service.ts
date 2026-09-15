@@ -93,6 +93,7 @@ function toProtoEligibility(value: TargetWorktreeEligibility): contract.Worktree
     case "eligible": return contract.WorktreeEligibility.ELIGIBLE;
     case "not_git_repository": return contract.WorktreeEligibility.NOT_GIT_REPOSITORY;
     case "already_linked": return contract.WorktreeEligibility.ALREADY_LINKED;
+    case "git_not_found": return contract.WorktreeEligibility.GIT_NOT_FOUND;
     case "unsafe": return contract.WorktreeEligibility.UNSAFE;
     case "unavailable": return contract.WorktreeEligibility.UNAVAILABLE;
   }

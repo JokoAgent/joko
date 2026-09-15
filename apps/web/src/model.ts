@@ -4040,7 +4040,7 @@ export interface NewSessionDraft {
   };
 }
 
-export type WorktreeEligibilityView = "eligible" | "notGitRepository" | "alreadyLinked" | "unsafe" | "unavailable";
+export type WorktreeEligibilityView = "eligible" | "notGitRepository" | "alreadyLinked" | "gitNotFound" | "unsafe" | "unavailable";
 
 export interface TargetWorktreeProbeView {
   readonly targetId: string;

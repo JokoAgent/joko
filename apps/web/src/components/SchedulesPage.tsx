@@ -1166,9 +1166,10 @@ function scheduleSessionModeLabel(mode: ScheduleView["sessionMode"], t: Translat
 
 function worktreeEligibilityMessage(
   value: Exclude<WorktreeEligibilityView, "eligible">
-): "worktree.ineligible.notGitRepository" | "worktree.ineligible.alreadyLinked" | "worktree.ineligible.unsafe" | "worktree.ineligible.unavailable" {
+): "worktree.ineligible.notGitRepository" | "worktree.ineligible.alreadyLinked" | "worktree.ineligible.gitNotFound" | "worktree.ineligible.unsafe" | "worktree.ineligible.unavailable" {
   if (value === "notGitRepository") return "worktree.ineligible.notGitRepository";
   if (value === "alreadyLinked") return "worktree.ineligible.alreadyLinked";
+  if (value === "gitNotFound") return "worktree.ineligible.gitNotFound";
   if (value === "unsafe") return "worktree.ineligible.unsafe";
   return "worktree.ineligible.unavailable";
 }

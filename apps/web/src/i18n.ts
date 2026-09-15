@@ -4271,8 +4271,11 @@ const en = {
   ,"worktree.checking": "Checking repository safety…"
   ,"worktree.ineligible.notGitRepository": "This project is not a Git repository, so an isolated worktree cannot be created."
   ,"worktree.ineligible.alreadyLinked": "This project is already a linked worktree. Open its primary repository to create another isolated worktree."
+  ,"worktree.ineligible.gitNotFound": "Git is not installed or is unavailable, so an isolated worktree cannot be created."
   ,"worktree.ineligible.unsafe": "This repository cannot create an isolated worktree safely."
   ,"worktree.ineligible.unavailable": "Worktree isolation is unavailable for this project."
+  ,"worktree.probeTargetMismatch": "The worktree check returned for a different project. Retry the current project."
+  ,"worktree.retry": "Retry worktree check"
   ,"worktree.source": "Start from"
   ,"worktree.defaultSource": "Current branch"
   ,"worktree.current": "current"
@@ -6328,8 +6331,11 @@ const zhBase: Record<MessageKey, string> = {
   "worktree.checking": "正在检查仓库安全性…",
   "worktree.ineligible.notGitRepository": "此项目不是 Git 仓库，无法创建隔离工作树。",
   "worktree.ineligible.alreadyLinked": "此项目本身已是链接工作树；请打开主仓库后再创建新的隔离工作树。",
+  "worktree.ineligible.gitNotFound": "Git 未安装或当前不可用，无法创建隔离工作树。",
   "worktree.ineligible.unsafe": "此仓库当前无法安全创建隔离工作树。",
   "worktree.ineligible.unavailable": "此项目无法使用工作树隔离。",
+  "worktree.probeTargetMismatch": "工作树检查返回了其他项目的结果，请重试当前项目。",
+  "worktree.retry": "重试工作树检查",
   "worktree.source": "起始来源",
   "worktree.defaultSource": "当前分支",
   "worktree.current": "当前",

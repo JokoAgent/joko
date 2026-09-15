@@ -22,6 +22,8 @@ import {
   type ModelView,
   type ProviderRuntimeView,
   type SessionView,
+  type TargetWorktreeProbeView,
+  type WorktreeSourceView,
   type VoiceInputDictionaryAdviceView
 } from "../model.js";
 import type { DelayedNewSessionDraft } from "../new-session-flow.js";
@@ -713,6 +715,304 @@ describe("new-task native draft recovery", () => {
   });
 });
 
+describe("new-task worktree authority", () => {
+  it.each([
+    [false, true],
+    [true, false]
+  ] as const)("uses the committed %s preference instead of a stale route draft value", async (committed, staleDraft) => {
+    const api = controller({
+      discover: async () => [],
+      draft: freshWorktreeDraft(staleDraft),
+      worktreeEnabled: committed,
+      probe: async (targetId) => ({ targetId, eligibility: "eligible", currentBranch: "main", canRefreshRemote: false }),
+      listSources: async () => [{ ref: "refs/heads/main", commit: "a".repeat(40), name: "main", remote: false, current: true }]
+    });
+    const { container } = await renderPage(api, vi.fn(async () => undefined));
+    await flush();
+
+    expect(worktreeCheckbox(container).checked).toBe(committed);
+  });
+
+  it.each(["notGitRepository", "alreadyLinked", "gitNotFound"] as const)("keeps the ON preference but creates a plain task after %s is confirmed", async (eligibility) => {
+    const probe = vi.fn(async (targetId: string): Promise<TargetWorktreeProbeView> => ({ targetId, eligibility, canRefreshRemote: false }));
+    const api = controller({
+      discover: async () => [],
+      draft: freshWorktreeDraft(true),
+      worktreeEnabled: true,
+      probe
+    });
+    const onSubmit = vi.fn<(session: DelayedNewSessionDraft, input: ComposerDraft) => Promise<void>>(async () => undefined);
+    const { container } = await renderPage(api, onSubmit);
+    await flush();
+
+    expect(container.querySelector(".new-task-worktree")).toBeNull();
+    expect(api.state.preferences.newSessionWorktreeEnabled).toBe(true);
+    expect(api.setNewSessionWorktreeEnabled).not.toHaveBeenCalled();
+    expect(sendButton(container).disabled).toBe(false);
+    await act(async () => sendButton(container).click());
+
+    expect(probe).toHaveBeenCalledWith("target-1", expect.any(AbortSignal));
+    expect(onSubmit).toHaveBeenCalledOnce();
+    expect(onSubmit.mock.calls[0]?.[0]).not.toHaveProperty("worktree");
+  });
+
+  it("does not run a local worktree probe for a Remote target or apply the retained preference", async () => {
+    const base = snapshot();
+    const remoteSnapshot: AppSnapshot = {
+      ...base,
+      targets: base.targets.map((target) => target.id === "target-1"
+        ? { ...target, remoteWorkspace: { hostId: "remote-1", workspaceRoot: "/srv/project" } }
+        : target)
+    };
+    const probe = vi.fn(async (): Promise<TargetWorktreeProbeView> => {
+      throw new Error("must not inspect a Remote path locally");
+    });
+    const api = controller({
+      discover: async () => [],
+      draft: freshWorktreeDraft(true),
+      snapshotValue: remoteSnapshot,
+      worktreeEnabled: true,
+      probe
+    });
+    const onSubmit = vi.fn<(session: DelayedNewSessionDraft, input: ComposerDraft) => Promise<void>>(async () => undefined);
+    const { container } = await renderPage(api, onSubmit);
+    await flush();
+
+    expect(probe).not.toHaveBeenCalled();
+    expect(container.querySelector(".new-task-worktree")).toBeNull();
+    expect(api.state.preferences.newSessionWorktreeEnabled).toBe(true);
+    expect(sendButton(container).disabled).toBe(false);
+    await act(async () => sendButton(container).click());
+    expect(onSubmit.mock.calls[0]?.[0]).not.toHaveProperty("worktree");
+  });
+
+  it.each(["unavailable", "unsafe"] as const)("fails closed on %s, retries the exact Target, and submits the calibrated source", async (eligibility) => {
+    const probe = vi.fn<(targetId: string) => Promise<TargetWorktreeProbeView>>()
+      .mockResolvedValueOnce({ targetId: "target-1", eligibility, canRefreshRemote: false })
+      .mockResolvedValueOnce({ targetId: "target-1", eligibility: "eligible", currentBranch: "main", canRefreshRemote: true });
+    const sources: readonly WorktreeSourceView[] = [
+      { ref: "refs/heads/main", commit: "a".repeat(40), name: "main", remote: false, current: true },
+      { ref: "refs/remotes/origin/topic", commit: "b".repeat(40), name: "origin/topic", remote: true, current: false }
+    ];
+    const listSources = vi.fn(async () => sources);
+    const api = controller({
+      discover: async () => [],
+      draft: freshWorktreeDraft(true, "refs/heads/stale", true),
+      worktreeEnabled: true,
+      probe,
+      listSources
+    });
+    const onSubmit = vi.fn<(session: DelayedNewSessionDraft, input: ComposerDraft) => Promise<void>>(async () => undefined);
+    const { container } = await renderPage(api, onSubmit);
+    await flush();
+
+    expect(sendButton(container).disabled).toBe(true);
+    expect(container.textContent).toContain(`worktree.ineligible.${eligibility}`);
+    await act(async () => buttonWithText(container, "worktree.retry").click());
+    await flush();
+
+    expect(probe).toHaveBeenCalledTimes(2);
+    expect(listSources).toHaveBeenCalledExactlyOnceWith("target-1", expect.any(AbortSignal));
+    expect(worktreeSourceSelect(container).value).toBe("refs/heads/main");
+    await act(async () => {
+      setSelect(worktreeSourceSelect(container), "refs/remotes/origin/topic");
+      worktreeRefreshCheckbox(container).click();
+    });
+    expect(sendButton(container).disabled).toBe(false);
+    await act(async () => sendButton(container).click());
+
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      worktree: { sourceRef: "refs/remotes/origin/topic", refreshRemote: true }
+    }), expect.anything(), expect.anything());
+  });
+
+  it("keeps probe failures and mismatched responses closed until an exact retry succeeds", async () => {
+    const probe = vi.fn<(targetId: string) => Promise<TargetWorktreeProbeView>>()
+      .mockRejectedValueOnce(new Error("probe transport failed"))
+      .mockResolvedValueOnce({ targetId: "target-2", eligibility: "eligible", canRefreshRemote: false })
+      .mockResolvedValueOnce({ targetId: "target-1", eligibility: "eligible", currentBranch: "main", canRefreshRemote: false });
+    const api = controller({
+      discover: async () => [],
+      draft: freshWorktreeDraft(true),
+      worktreeEnabled: true,
+      probe,
+      listSources: async () => [{ ref: "refs/heads/main", commit: "a".repeat(40), name: "main", remote: false, current: true }]
+    });
+    const { container } = await renderPage(api, vi.fn(async () => undefined));
+    await flush();
+
+    expect(sendButton(container).disabled).toBe(true);
+    expect(container.textContent).toContain("probe transport failed");
+    await act(async () => buttonWithText(container, "worktree.retry").click());
+    await flush();
+    expect(sendButton(container).disabled).toBe(true);
+    expect(container.textContent).toContain("worktree.probeTargetMismatch");
+    await act(async () => buttonWithText(container, "worktree.retry").click());
+    await flush();
+    expect(sendButton(container).disabled).toBe(false);
+    expect(probe).toHaveBeenCalledTimes(3);
+  });
+
+  it("blocks Send until an ON preference write commits", async () => {
+    const saving = deferred<void>();
+    let api!: AppController;
+    const setPreference = vi.fn(async (enabled: boolean) => {
+      await saving.promise;
+      (api.state.preferences as { newSessionWorktreeEnabled: boolean }).newSessionWorktreeEnabled = enabled;
+    });
+    api = controller({
+      discover: async () => [],
+      draft: freshWorktreeDraft(false),
+      probe: async (targetId) => ({ targetId, eligibility: "eligible", currentBranch: "main", canRefreshRemote: false }),
+      listSources: async () => [{ ref: "refs/heads/main", commit: "a".repeat(40), name: "main", remote: false, current: true }],
+      setWorktreeEnabled: setPreference
+    });
+    const onSubmit = vi.fn<(session: DelayedNewSessionDraft, input: ComposerDraft) => Promise<void>>(async () => undefined);
+    const { container } = await renderPage(api, onSubmit);
+    await flush();
+
+    await act(async () => worktreeCheckbox(container).click());
+    expect(setPreference).toHaveBeenCalledExactlyOnceWith(true);
+    expect(sendButton(container).disabled).toBe(true);
+    await act(async () => sendButton(container).click());
+    expect(onSubmit).not.toHaveBeenCalled();
+
+    await act(async () => saving.resolve());
+    expect(sendButton(container).disabled).toBe(false);
+    await act(async () => sendButton(container).click());
+    expect(onSubmit.mock.calls[0]?.[0]).toEqual(expect.objectContaining({
+      worktree: { sourceRef: "refs/heads/main", refreshRemote: false }
+    }));
+  });
+
+  it("keeps the plain draft sendable when an ON preference write fails", async () => {
+    const setPreference = vi.fn(async () => { throw new Error("preference write failed"); });
+    const api = controller({
+      discover: async () => [],
+      draft: freshWorktreeDraft(false),
+      probe: async (targetId) => ({ targetId, eligibility: "eligible", currentBranch: "main", canRefreshRemote: false }),
+      listSources: async () => [{ ref: "refs/heads/main", commit: "a".repeat(40), name: "main", remote: false, current: true }],
+      setWorktreeEnabled: setPreference
+    });
+    const onSubmit = vi.fn<(session: DelayedNewSessionDraft, input: ComposerDraft) => Promise<void>>(async () => undefined);
+    const { container } = await renderPage(api, onSubmit);
+    await flush();
+
+    await act(async () => worktreeCheckbox(container).click());
+    await flush();
+    expect(worktreeCheckbox(container).checked).toBe(false);
+    expect(container.textContent).toContain("preference write failed");
+    expect(sendButton(container).disabled).toBe(false);
+    await act(async () => sendButton(container).click());
+    expect(onSubmit.mock.calls[0]?.[0]).not.toHaveProperty("worktree");
+  });
+
+  it("keeps the explicit OFF escape available while probing and blocks plain Send until that write commits", async () => {
+    const saving = deferred<void>();
+    const probing = deferred<TargetWorktreeProbeView>();
+    let api!: AppController;
+    const setPreference = vi.fn(async (enabled: boolean) => {
+      await saving.promise;
+      (api.state.preferences as { newSessionWorktreeEnabled: boolean }).newSessionWorktreeEnabled = enabled;
+    });
+    api = controller({
+      discover: async () => [],
+      draft: freshWorktreeDraft(true),
+      worktreeEnabled: true,
+      probe: async () => probing.promise,
+      setWorktreeEnabled: setPreference
+    });
+    const onSubmit = vi.fn<(session: DelayedNewSessionDraft, input: ComposerDraft) => Promise<void>>(async () => undefined);
+    const { container } = await renderPage(api, onSubmit);
+    await flush();
+
+    expect(worktreeCheckbox(container).disabled).toBe(false);
+    await act(async () => worktreeCheckbox(container).click());
+    expect(setPreference).toHaveBeenCalledExactlyOnceWith(false);
+    expect(sendButton(container).disabled).toBe(true);
+    await act(async () => sendButton(container).click());
+    expect(onSubmit).not.toHaveBeenCalled();
+
+    await act(async () => saving.resolve());
+    expect(sendButton(container).disabled).toBe(false);
+    await act(async () => sendButton(container).click());
+    expect(onSubmit.mock.calls[0]?.[0]).not.toHaveProperty("worktree");
+
+    await act(async () => probing.resolve({ targetId: "target-1", eligibility: "eligible", currentBranch: "main", canRefreshRemote: false }));
+  });
+
+  it("does not let an unrelated pending preference write block a confirmed-ineligible Target", async () => {
+    const saving = deferred<void>();
+    let api!: AppController;
+    const setPreference = vi.fn(async (enabled: boolean) => {
+      await saving.promise;
+      (api.state.preferences as { newSessionWorktreeEnabled: boolean }).newSessionWorktreeEnabled = enabled;
+    });
+    api = controller({
+      discover: async () => [],
+      draft: freshWorktreeDraft(false),
+      probe: async (targetId) => targetId === "target-1"
+        ? { targetId, eligibility: "eligible", currentBranch: "main", canRefreshRemote: false }
+        : { targetId, eligibility: "notGitRepository", canRefreshRemote: false },
+      listSources: async () => [{ ref: "refs/heads/main", commit: "a".repeat(40), name: "main", remote: false, current: true }],
+      setWorktreeEnabled: setPreference
+    });
+    const onSubmit = vi.fn<(session: DelayedNewSessionDraft, input: ComposerDraft) => Promise<void>>(async () => undefined);
+    const { container } = await renderPage(api, onSubmit);
+    await flush();
+
+    await act(async () => worktreeCheckbox(container).click());
+    expect(sendButton(container).disabled).toBe(true);
+    await act(async () => setSelect(targetSelect(container), "target:target-2"));
+    await flush();
+
+    expect(container.querySelector(".new-task-worktree")).toBeNull();
+    expect(sendButton(container).disabled).toBe(false);
+    await act(async () => sendButton(container).click());
+    expect(onSubmit.mock.calls[0]?.[0]).not.toHaveProperty("worktree");
+
+    await act(async () => saving.resolve());
+  });
+
+  it("retires a late probe and source catalog when the Target changes", async () => {
+    const targetOne = deferred<TargetWorktreeProbeView>();
+    const probe = vi.fn((targetId: string) => targetId === "target-1"
+      ? targetOne.promise
+      : Promise.resolve({ targetId, eligibility: "eligible" as const, currentBranch: "develop", canRefreshRemote: false }));
+    const listSources = vi.fn(async (targetId: string): Promise<readonly WorktreeSourceView[]> => [{
+      ref: `refs/heads/${targetId === "target-1" ? "main" : "develop"}`,
+      commit: (targetId === "target-1" ? "a" : "b").repeat(40),
+      name: targetId === "target-1" ? "main" : "develop",
+      remote: false,
+      current: true
+    }]);
+    const api = controller({
+      discover: async () => [],
+      draft: freshWorktreeDraft(true, "refs/heads/main"),
+      worktreeEnabled: true,
+      probe,
+      listSources
+    });
+    const onSubmit = vi.fn(async () => undefined);
+    const { container } = await renderPage(api, onSubmit);
+    await flush();
+
+    await act(async () => setSelect(targetSelect(container), "target:target-2"));
+    await flush();
+    expect(worktreeSourceSelect(container).value).toBe("refs/heads/develop");
+    await act(async () => targetOne.resolve({ targetId: "target-1", eligibility: "eligible", currentBranch: "main", canRefreshRemote: false }));
+    await flush();
+    expect(listSources).toHaveBeenCalledTimes(1);
+    expect(worktreeSourceSelect(container).value).toBe("refs/heads/develop");
+
+    await act(async () => sendButton(container).click());
+    expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({
+      selection: { kind: "target", targetId: "target-2" },
+      worktree: { sourceRef: "refs/heads/develop", refreshRemote: false }
+    }), expect.anything(), expect.anything());
+  });
+});
+
 async function renderPage(
   controllerValue: AppController,
   onSubmit: (session: DelayedNewSessionDraft, input: ComposerDraft) => Promise<void>,
@@ -746,30 +1046,36 @@ async function unmountPage(root: Root): Promise<void> {
 
 function controller(options: {
   readonly discover: () => Promise<readonly NativeSessionCandidateView[]>;
+  readonly draft?: NewSessionLocalDraft;
   readonly saveDraft?: (draft: NewSessionLocalDraft) => Promise<void>;
   readonly listWorkspaceFiles?: () => Promise<{ readonly paths: readonly string[]; readonly truncated: boolean; readonly revision: string }>;
+  readonly snapshotValue?: AppSnapshot;
+  readonly worktreeEnabled?: boolean;
+  readonly probe?: (targetId: string, signal: AbortSignal) => Promise<TargetWorktreeProbeView>;
+  readonly listSources?: (targetId: string, signal: AbortSignal) => Promise<readonly WorktreeSourceView[]>;
+  readonly setWorktreeEnabled?: (enabled: boolean) => Promise<void>;
 }): AppController {
   return {
     state: {
       connectionState: "connected",
-      snapshot: snapshot(),
+      snapshot: options.snapshotValue ?? snapshot(),
       preferences: {
         locale: "en",
         composerSendShortcut: "enter",
-        newSessionWorktreeEnabled: false
+        newSessionWorktreeEnabled: options.worktreeEnabled ?? false
       }
     },
-    readNewSessionDraft: vi.fn(async () => restoredDraft()),
+    readNewSessionDraft: vi.fn(async () => options.draft ?? restoredDraft()),
     saveNewSessionDraft: vi.fn(options.saveDraft ?? (async () => undefined)),
     discoverNativeSessions: vi.fn(options.discover),
-    probeTargetWorktree: vi.fn(async () => ({
+    probeTargetWorktree: vi.fn(options.probe ?? (async () => ({
       targetId: "target-1",
       eligibility: "unavailable",
       canRefreshRemote: false
-    })),
-    listTargetWorktreeSources: vi.fn(async () => []),
+    }))),
+    listTargetWorktreeSources: vi.fn(options.listSources ?? (async () => [])),
     listWorkspaceFiles: vi.fn(options.listWorkspaceFiles ?? (async () => ({ paths: [], truncated: false, revision: "index-empty" }))),
-    setNewSessionWorktreeEnabled: vi.fn(async () => undefined)
+    setNewSessionWorktreeEnabled: vi.fn(options.setWorktreeEnabled ?? (async () => undefined))
   } as unknown as AppController;
 }
 
@@ -855,6 +1161,14 @@ function restoredDraft(): NewSessionLocalDraft {
   };
 }
 
+function freshWorktreeDraft(enabled: boolean, sourceRef?: string, refreshRemote = false): NewSessionLocalDraft {
+  return {
+    ...restoredDraft(),
+    nativeStart: { kind: "fresh" },
+    worktree: { enabled, ...(sourceRef === undefined ? {} : { sourceRef }), refreshRemote }
+  };
+}
+
 function repeatedMentionDraft(): NewSessionLocalDraft {
   const mentions: readonly ComposerMentionDraft[] = [
     { id: "workspace:second", kind: "workspace", reference: "second.ts", label: "same", token: "@same", workspaceId: "workspace-1" },
@@ -928,6 +1242,27 @@ function sendButton(container: ParentNode): HTMLButtonElement {
 function buttonWithText(container: ParentNode, text: string): HTMLButtonElement {
   return required([...container.querySelectorAll<HTMLButtonElement>("button")]
     .find((button) => button.textContent?.trim() === text));
+}
+
+function targetSelect(container: ParentNode): HTMLSelectElement {
+  return required(container.querySelector<HTMLSelectElement>(".new-task-context__control--target select"));
+}
+
+function worktreeCheckbox(container: ParentNode): HTMLInputElement {
+  return required(container.querySelector<HTMLInputElement>('.new-task-worktree__toggle input[type="checkbox"]'));
+}
+
+function worktreeSourceSelect(container: ParentNode): HTMLSelectElement {
+  return required(container.querySelector<HTMLSelectElement>(".new-task-worktree__options select"));
+}
+
+function worktreeRefreshCheckbox(container: ParentNode): HTMLInputElement {
+  return required(container.querySelector<HTMLInputElement>('.new-task-worktree__refresh input[type="checkbox"]'));
+}
+
+function setSelect(select: HTMLSelectElement, value: string): void {
+  Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")?.set?.call(select, value);
+  select.dispatchEvent(new Event("change", { bubbles: true }));
 }
 
 async function openMentionMenu(container: ParentNode): Promise<void> {

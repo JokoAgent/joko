@@ -8,6 +8,28 @@ import type { SessionWorktreeCoordinator } from "./session-worktree-coordinator.
 import { createWorktreeConnectService } from "./worktree-connect-service.js";
 
 describe("WorktreeService removal preview", () => {
+  it("preserves Git-not-found separately from transient service unavailability", async () => {
+    const probe = vi.fn(async () => ({
+      targetId: "target-one",
+      eligibility: "git_not_found" as const,
+      canRefreshRemote: false
+    }));
+    const service = createWorktreeConnectService(
+      { probe } as unknown as SessionWorktreeCoordinator,
+      { getTarget: () => ({ descriptor: { id: "target-one" } }) } as unknown as OperationalStore,
+      () => undefined
+    );
+
+    await expect(service.probeTargetWorktree(
+      create(contract.ProbeTargetWorktreeRequestSchema, { targetId: "target-one" }),
+      { signal: new AbortController().signal } as HandlerContext
+    )).resolves.toMatchObject({
+      targetId: "target-one",
+      eligibility: contract.WorktreeEligibility.GIT_NOT_FOUND,
+      canRefreshRemote: false
+    });
+  });
+
   it("authenticates and forwards the exact public task identity and cancellation scope", async () => {
     const signal = new AbortController().signal;
     const authenticate = vi.fn();

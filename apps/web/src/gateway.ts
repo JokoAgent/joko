@@ -9213,6 +9213,7 @@ function mapWorktreeEligibility(value: WorktreeEligibility): TargetWorktreeProbe
     case WorktreeEligibility.ELIGIBLE: return "eligible";
     case WorktreeEligibility.NOT_GIT_REPOSITORY: return "notGitRepository";
     case WorktreeEligibility.ALREADY_LINKED: return "alreadyLinked";
+    case WorktreeEligibility.GIT_NOT_FOUND: return "gitNotFound";
     case WorktreeEligibility.UNSAFE: return "unsafe";
     case WorktreeEligibility.UNAVAILABLE: return "unavailable";
     default: throw new GatewayError("Orchestrator returned an unspecified Worktree eligibility.");
