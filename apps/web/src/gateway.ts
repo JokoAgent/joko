@@ -5437,7 +5437,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       } }),
       ...(model.compatibilityOptions === undefined ? {} : { compatibility: { ...model.compatibilityOptions } }),
       supportsFastMode: model.supportsFastMode,
-      ...(model.defaultVisible === undefined ? {} : { defaultVisible: model.defaultVisible })
+      ...(model.defaultVisible === undefined ? {} : { defaultVisible: model.defaultVisible }),
+      ...(model.supportsTools === undefined ? {} : { supportsTools: model.supportsTools })
     }));
     if (models.some((model) => model.modelId.length === 0 || model.displayName.length === 0 || model.inputModalities.length === 0)) {
       throw new GatewayError("Every model needs an ID, name, and input modality.");
@@ -6364,7 +6365,18 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   async updateSubagentModelSettings(backendId: string, model: Parameters<OperationApi["updateSubagentModelSettings"]>[1], expectedRevision: bigint): Promise<void> {
     await this.submit({
       case: "updateSubagentModelSettings",
-      value: { backendId, ...(model === undefined ? {} : { model: { ...model } }), expectedRevision: { value: expectedRevision } }
+      value: {
+        backendId,
+        ...(model === undefined ? { clearDefaultModel: true } : { model: { ...model } }),
+        expectedRevision: { value: expectedRevision }
+      }
+    }, true);
+  }
+
+  async updateSubagentSmartRouting(backendId: string, enabled: boolean, expectedRevision: bigint): Promise<void> {
+    await this.submit({
+      case: "updateSubagentModelSettings",
+      value: { backendId, smartRoutingEnabled: enabled, expectedRevision: { value: expectedRevision } }
     }, true);
   }
 
@@ -14074,8 +14086,17 @@ function mapSettings(settings: SettingsSnapshot | undefined): SettingsView {
       return {
         backendId: setting.backendId,
         ...(setting.model === undefined ? {} : { model: { providerId: setting.model.providerId, modelId: setting.model.modelId } }),
+        defaultModelSupported: setting.defaultModelSupported,
         available: setting.available,
         unavailableReason: setting.unavailableReason,
+        smartRoutingSupported: setting.smartRoutingSupported,
+        smartRoutingEnabled: setting.smartRoutingEnabled,
+        smartRoutingAvailable: setting.smartRoutingAvailable,
+        smartRoutingUnavailableReason: setting.smartRoutingUnavailableReason,
+        smartRoutingApplied: setting.smartRoutingApplied,
+        smartRoutingRestartPending: setting.smartRoutingRestartPending,
+        ...(setting.runtimeGeneration === undefined ? {} : { runtimeGeneration: setting.runtimeGeneration }),
+        runtimeRevision: setting.runtimeRevision,
         revision: setting.revision.value
       };
     }),
@@ -14204,7 +14225,8 @@ function mapProviderRuntimeConfiguration(provider: ProviderRuntimeConfiguration)
         ...(model.compatibility.cacheControlFormat === undefined ? {} : { cacheControlFormat: model.compatibility.cacheControlFormat })
       } }),
       supportsFastMode: model.supportsFastMode,
-      ...(model.defaultVisible === undefined ? {} : { defaultVisible: model.defaultVisible })
+      ...(model.defaultVisible === undefined ? {} : { defaultVisible: model.defaultVisible }),
+      ...(model.supportsTools === undefined ? {} : { supportsTools: model.supportsTools })
     }))
   };
 }

@@ -114,16 +114,17 @@ describe("managed Pi catalog", () => {
       api: "openai-responses",
       keyless: true,
       models: [
-        { id: "bridge/priority", logicalId: "priority", supportsFastMode: true, defaultVisible: false },
+        { id: "bridge/priority", logicalId: "priority", supportsFastMode: true, supportsTools: false, defaultVisible: false },
         { id: "standard" }
       ]
     }]);
     expect(result.models).toEqual(expect.arrayContaining([
-      expect.objectContaining({ modelId: "bridge/priority", logicalId: "priority", supportsFastMode: true, defaultVisible: false }),
+      expect.objectContaining({ modelId: "bridge/priority", logicalId: "priority", supportsFastMode: true, supportsTools: false, defaultVisible: false }),
       expect.objectContaining({ modelId: "standard", supportsFastMode: false, defaultVisible: true })
     ]));
     const serialized = await readFile(join(home, "models.json"), "utf8");
     expect(serialized).not.toContain("supportsFastMode");
+    expect(serialized).not.toContain("supportsTools");
     expect(serialized).not.toContain("defaultVisible");
     expect(serialized).not.toContain("logicalId");
   });

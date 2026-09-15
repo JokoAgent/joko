@@ -794,6 +794,23 @@ export function VisualHarness(): JSX.Element {
         } }));
         record("subagent-model:saved");
       },
+      updateSubagentSmartRouting: async (backendId, enabled, expectedRevision): Promise<void> => {
+        updateSnapshot((snapshot) => ({ ...snapshot, settings: { ...snapshot.settings,
+          subagentModels: snapshot.settings.subagentModels.map((setting) => {
+            if (setting.backendId !== backendId) return setting;
+            if (setting.revision !== expectedRevision) throw new Error("Subagent model settings changed. Reload before saving.");
+            return {
+              ...setting,
+              smartRoutingEnabled: enabled,
+              smartRoutingApplied: enabled,
+              smartRoutingRestartPending: false,
+              runtimeGeneration: (setting.runtimeGeneration ?? 0n) + 1n,
+              revision: setting.revision + 1n
+            };
+          })
+        } }));
+        record(`subagent-smart-routing:${enabled ? "on" : "off"}`);
+      },
       resetPromptRecommendationSettings: async (): Promise<void> => {
         record("prompt-recommendation:reset");
         updateSnapshot((snapshot) => ({
@@ -2989,6 +3006,7 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
     ["background.tasks", capability("background.tasks")],
     ["subagents.list", capability("subagents.list")],
     ["subagents.default_model", capability("subagents.default_model")],
+    ["subagents.smart_routing", capability("subagents.smart_routing")],
     ["subagents.detail", capability("subagents.detail")],
     ["subagents.transcript", capability("subagents.transcript")],
     ["subagents.control", capability("subagents.control")],
@@ -3392,7 +3410,21 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
           })),
           available: true, unavailableReason: "", revision: 1n, runtimeRevision: "visual-auxiliary:1"
         },
-        subagentModels: [{ backendId: model.backendId, available: true, unavailableReason: "", revision: 1n }],
+        subagentModels: [{
+          backendId: model.backendId,
+          defaultModelSupported: true,
+          available: true,
+          unavailableReason: "",
+          smartRoutingSupported: true,
+          smartRoutingEnabled: false,
+          smartRoutingAvailable: true,
+          smartRoutingUnavailableReason: "",
+          smartRoutingApplied: false,
+          smartRoutingRestartPending: false,
+          runtimeGeneration: 1n,
+          runtimeRevision: "visual-smart-routing:1",
+          revision: 1n
+        }],
         promptRecommendation: {
           enabled: true,
           available: true,

@@ -84,6 +84,7 @@ function transferModels(source: ProviderRuntimeConfigurationView, target: Provid
       ...(allowed("modelInputModalities") ? { inputModalities: model.inputModalities } : {}),
       ...(allowed("modelThinkingLevels") ? { reasoning: model.reasoning, thinkingLevels: model.thinkingLevels } : {}),
       ...(allowed("modelFastMode") ? { supportsFastMode: model.supportsFastMode } : {}),
+      ...(model.supportsTools === undefined ? {} : { supportsTools: model.supportsTools }),
       ...(allowed("modelSampling") ? { sampling: model.sampling } : {}),
       ...(allowed("modelCompatibility") ? { compatibility: model.compatibility, compatibilityOptions: model.compatibilityOptions } : {})
     };

@@ -9,7 +9,12 @@ import {
   CLAUDE_MANAGED_PROVIDER_SUPPORT,
   type ClaudeCodeCredentialPort
 } from "@joko/adapter-claude-code";
-import { createCodexAdapter, CODEX_MANAGED_PROVIDER_SUPPORT } from "@joko/adapter-codex";
+import {
+  CodexBackendAdapter,
+  createCodexAdapter,
+  CODEX_MANAGED_PROVIDER_SUPPORT,
+  prepareCodexSmartRouting
+} from "@joko/adapter-codex";
 import {
   createPiAdapter,
   createDefaultPiManagedProcessSupervisor,
@@ -137,6 +142,7 @@ import {
 import { SessionNavigationCoordinator } from "./session-navigation-coordinator.js";
 import { AuxiliaryTextRouting } from "./auxiliary-text-routing.js";
 import { SubagentModelSettings } from "./subagent-model-settings.js";
+import { DeferredBackendRestartCoordinator } from "./deferred-backend-restart.js";
 import { VisionBridgeToolProvider } from "./vision-bridge-tool-provider.js";
 import { OperationalBrowserState } from "./operational-browser-state.js";
 import { OperationalWorkspaceSnapshotRepository } from "./operational-workspace-snapshots.js";
@@ -314,6 +320,10 @@ export interface OrchestratorApplication {
   readonly restartBackend: (backendId: string) => Promise<void>;
   /** Refresh volatile native account/model state for the current generation. */
   readonly refreshBackendDescriptor: (backendId: string) => Promise<void>;
+  /** Install a process-local queue hold synchronously after the desired revision commits. */
+  readonly holdSubagentSmartRoutingDispatch: (backendId: string) => void;
+  /** Apply the durable smart-routing preference through an idle process-generation replacement. */
+  readonly refreshSubagentSmartRouting: (backendId: string) => Promise<void>;
   /** Optional only so isolated test hosts can deliberately advertise no provisioning channel. */
   readonly credentials?: CredentialManager;
   readonly providers?: ProviderCatalogManager;
@@ -417,7 +427,24 @@ export async function createOrchestratorApplication(
   ]);
 
   const store = new OperationalStore(config.databasePath);
-  const subagentModels = new SubagentModelSettings({ store });
+  let backendInstances!: BackendInstanceRegistry;
+  let deferredBackendRestarts: DeferredBackendRestartCoordinator | undefined;
+  const subagentModels = new SubagentModelSettings({
+    store,
+    smartRoutingState: (backendId) => {
+      const adapter = backendInstances?.adapter(backendId);
+      if (!(adapter instanceof CodexBackendAdapter)) return undefined;
+      const runtime = adapter.subagentSmartRoutingState();
+      const deferred = deferredBackendRestarts?.state(backendId);
+      return {
+        applied: runtime.applied,
+        restartPending: deferred?.pending === true,
+        unavailableReason: deferred?.lastError || runtime.unavailableReason,
+        runtimeRevision: runtime.runtimeRevision,
+        instanceGeneration: runtime.instanceGeneration
+      };
+    }
+  });
   const codeHostProviders = composeCodeHostProviders(
     dependencies.codeHostProviders,
     new OperationalCodeHostSessionAuthorization(store)
@@ -753,7 +780,6 @@ export async function createOrchestratorApplication(
       ? ["tool.computer" as const, "tool.android" as const]
       : [])
   ] satisfies readonly Extract<KnownCapability, `tool.${string}`>[];
-  let backendInstances!: BackendInstanceRegistry;
   const createPiCandidate = async (
     { generation: backendInstanceGeneration }: { readonly instanceId: string; readonly generation: number }
   ): Promise<ReturnType<typeof createPiAdapter>> => {
@@ -929,48 +955,75 @@ export async function createOrchestratorApplication(
       instanceId: codexBackendId,
       adapterKind: "codex",
       displayName: "Codex",
-      create: ({ instanceId, generation }) => createCodexAdapter({
-        id: instanceId,
-        instanceGeneration: generation,
-        remoteRuntimes: new RemoteCodexRuntimeResolver({
-          store,
-          registry: remoteHosts,
-          mcpBridge: new RemoteCodexMcpBridgeManager({
-            router: mcpRouter,
-            includeToolPolicy: (sessionId, targetId, policyId) =>
-              toolPolicies.enabledForSession(sessionId, targetId, policyId)
-          })
-        }),
-        resolveNativeMemoryEnabled: () => makerMemory.nativeEnabledForBackend(instanceId, false),
-        managedProviders: managedRuntime(instanceId, generation, CODEX_MANAGED_PROVIDER_SUPPORT),
-        appServer: {
-          transport: {
-            ...(config.codexExecutable === undefined ? {} : { command: config.codexExecutable }),
-            processOwner: {
-              rootDirectory: join(config.dataDirectory, "backend-runtime", instanceId),
-              instanceId,
-              generation,
-              recoverStale: backendInstances.adapter(instanceId) === undefined,
-              supervisor: createDefaultPiManagedProcessSupervisor()
-            }
+      create: async ({ instanceId, generation }) => {
+        const managedProviders = managedRuntime(instanceId, generation, CODEX_MANAGED_PROVIDER_SUPPORT);
+        const codexHome = resolve(process.env["CODEX_HOME"] ?? join(userInfo().homedir, ".codex"));
+        let smartRouting: Awaited<ReturnType<typeof prepareCodexSmartRouting>> | undefined;
+        try {
+          smartRouting = await prepareCodexSmartRouting({
+            desired: subagentModels.smartRoutingEnabled(instanceId),
+            codexHome,
+            outputDirectory: join(config.dataDirectory, "backend-runtime", instanceId, "smart-subagents"),
+            instanceGeneration: generation,
+            nativeProviderId: "openai",
+            managedCandidates: managedProviders.listSmartRoutingCandidates?.() ?? []
+          });
+          return createCodexAdapter({
+            id: instanceId,
+            instanceGeneration: generation,
+            remoteRuntimes: new RemoteCodexRuntimeResolver({
+              store,
+              registry: remoteHosts,
+              mcpBridge: new RemoteCodexMcpBridgeManager({
+                router: mcpRouter,
+                includeToolPolicy: (sessionId, targetId, policyId) =>
+                  toolPolicies.enabledForSession(sessionId, targetId, policyId)
+              })
+            }),
+            resolveNativeMemoryEnabled: () => makerMemory.nativeEnabledForBackend(instanceId, false),
+            managedProviders,
+            smartRouting,
+            profileDirectory: codexHome,
+            appServer: {
+              transport: {
+                ...(config.codexExecutable === undefined ? {} : { command: config.codexExecutable }),
+                processOwner: {
+                  rootDirectory: join(config.dataDirectory, "backend-runtime", instanceId),
+                  instanceId,
+                  generation,
+                  recoverStale: backendInstances.adapter(instanceId) === undefined,
+                  supervisor: createDefaultPiManagedProcessSupervisor()
+                }
+              }
+            },
+            readBlob: (blob) => artifacts.readBlob(blob),
+            resolveFile: (blob) => artifacts.resolveBlobPath(blob),
+            maximumBlobBytes: artifacts.maximumBlobBytes,
+            resolveArtifactMention: createArtifactMentionResolver({
+              store, artifacts,
+              resolveTarget: (session) => sessionWorktrees.effectiveTarget(session),
+              assertBackendCurrent: (context) => {
+                const current = backendInstances.get(instanceId);
+                if (context.target.backendId !== instanceId || context.backendInstanceGeneration !== generation
+                  || current.state !== "available" || current.generation !== generation) {
+                  throw new Error("The Artifact input Backend instance is no longer current.");
+                }
+              }
+            }),
+            hostCapabilities: HOST_COMPOSED_CAPABILITIES
+          });
+        } catch (error) {
+          const cleanup = await Promise.allSettled([
+            smartRouting?.cleanup() ?? Promise.resolve(),
+            Promise.resolve().then(() => managedProviders.dispose())
+          ]);
+          const failures = cleanup.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+          if (failures.length > 0) {
+            throw new AggregateError([error, ...failures], "Codex Backend construction and candidate cleanup failed.");
           }
-        },
-        readBlob: (blob) => artifacts.readBlob(blob),
-        resolveFile: (blob) => artifacts.resolveBlobPath(blob),
-        maximumBlobBytes: artifacts.maximumBlobBytes,
-        resolveArtifactMention: createArtifactMentionResolver({
-          store, artifacts,
-          resolveTarget: (session) => sessionWorktrees.effectiveTarget(session),
-          assertBackendCurrent: (context) => {
-            const current = backendInstances.get(instanceId);
-            if (context.target.backendId !== instanceId || context.backendInstanceGeneration !== generation
-              || current.state !== "available" || current.generation !== generation) {
-              throw new Error("The Artifact input Backend instance is no longer current.");
-            }
-          }
-        }),
-        hostCapabilities: HOST_COMPOSED_CAPABILITIES
-      })
+          throw error;
+        }
+      }
     },
     {
       instanceId: claudeCodeBackendId,
@@ -1102,6 +1155,8 @@ export async function createOrchestratorApplication(
         && providers.list(backendId).some((provider) => !provider.enabled)
       ),
     sessionRuntimeFallbackEnabled: () => configuredSessionRuntimeFallback(store),
+    backendDispatchBlocked: (backendId) => deferredBackendRestarts?.blocksDispatch(backendId) === true,
+    onBackendMayBeIdle: (backendId) => deferredBackendRestarts?.onBackendMayBeIdle(backendId),
     sessionRuntimeFallbackContext: (backendId) => {
       const availableProviderIds = availableBackendProviderIds(
         store.getBackend(backendId).descriptor,
@@ -1248,10 +1303,81 @@ export async function createOrchestratorApplication(
       }
     });
   };
+  deferredBackendRestarts = new DeferredBackendRestartCoordinator({
+    restart: restartBackend,
+    canRestart: (backendId) => sessionHost.canReplaceBackendInstance(backendId),
+    wakeQueues: (backendId) => sessionHost.wakeBackendQueues(backendId)
+  });
+  const ensureSubagentSmartRoutingReplacement = async (backendId: string): Promise<void> => {
+    if (deferredBackendRestarts!.state(backendId).pending) {
+      await deferredBackendRestarts!.apply(backendId);
+    } else {
+      await deferredBackendRestarts!.schedule(backendId);
+    }
+  };
+  const applyDesiredSubagentSmartRouting = async (backendId: string): Promise<boolean> => {
+    const adapter = backendInstances.adapter(backendId);
+    if (!(adapter instanceof CodexBackendAdapter)) return false;
+    const desired = subagentModels.smartRoutingEnabled(backendId);
+    const current = adapter.subagentSmartRoutingState();
+    let inspected;
+    try {
+      inspected = await adapter.inspectDesiredSubagentSmartRouting(desired);
+    } catch {
+      // A bounded catalog read can race profile or managed-catalog replacement.
+      // Retain the durable desired revision behind the normal generation fence;
+      // the coordinator retries instead of making the committed mutation look
+      // unsuccessful to a client whose replay would skip this post-commit step.
+      await ensureSubagentSmartRoutingReplacement(backendId);
+      return true;
+    }
+    const expectedApplied = desired && inspected.unavailableReason === "" && inspected.candidateCount > 0;
+    if (current.desired === desired
+      && current.applied === expectedApplied
+      && current.runtimeRevision === inspected.revision) {
+      const deferred = deferredBackendRestarts!.state(backendId);
+      if (!deferred.pending) return false;
+      if (!deferred.applying) deferredBackendRestarts!.cancelIfWaiting(backendId);
+      return true;
+    }
+    await ensureSubagentSmartRoutingReplacement(backendId);
+    return true;
+  };
   const refreshBackendDescriptor = async (backendId: string): Promise<void> => {
+    if (await applyDesiredSubagentSmartRouting(backendId)) return;
     await runBackendLifecycle(async () => {
       await backendInstances.refresh(backendId);
     });
+    // External account changes are first observed by Adapter.describe() during
+    // the refresh above. Reinspect afterwards so a login/logout that changes
+    // the native Sol/Terra catalog cannot leave the current smart generation
+    // running with the catalog prepared for the previous account state.
+    await applyDesiredSubagentSmartRouting(backendId);
+  };
+  const refreshSubagentSmartRouting = async (backendId: string): Promise<void> => {
+    try {
+      const descriptor = store.getBackend(backendId).descriptor;
+      if (descriptor.adapterKind !== "codex"
+        || descriptor.capabilities.get("subagents.smart_routing")?.supported !== true) return;
+      if (await applyDesiredSubagentSmartRouting(backendId)) return;
+      if (backendInstances.adapter(backendId) instanceof CodexBackendAdapter) return;
+      // The durable descriptor and process-local pointer should change as one
+      // publication. If they do not, a fenced replacement is the recovery.
+      await ensureSubagentSmartRoutingReplacement(backendId);
+    } catch {
+      // The setting mutation is already durable. Replacement failures are
+      // normally retained by the coordinator; shutdown is the only expected
+      // path that can reject scheduling itself.
+      try {
+        store.appendDiagnostic({
+          severity: "warning",
+          component: "backend-instance",
+          code: "SUBAGENT_SMART_ROUTING_APPLICATION_DEFERRED",
+          message: "The saved smart subagent routing change could not be scheduled before shutdown.",
+          details: { backendId }
+        });
+      } catch { /* The Store may already be closed. */ }
+    }
   };
   const historyMaintenance = new HistoryMaintenance({
     store,
@@ -1804,6 +1930,7 @@ export async function createOrchestratorApplication(
     });
   } catch (error) {
     closed = true;
+    deferredBackendRestarts?.dispose();
     commandConcurrencyGate.close();
     stopExtensionLibraryAuthorityNotifications();
     await skillMarketSync.close().catch(() => undefined);
@@ -1886,6 +2013,8 @@ export async function createOrchestratorApplication(
     },
     restartBackend,
     refreshBackendDescriptor,
+    holdSubagentSmartRoutingDispatch: (backendId) => deferredBackendRestarts!.request(backendId),
+    refreshSubagentSmartRouting,
     credentials,
     providers,
     managedModelRuntime: managedModelRuntimeSystem.controller,
@@ -1946,6 +2075,7 @@ export async function createOrchestratorApplication(
         };
         const cleanups = [...serviceCleanups];
         serviceCleanups.clear();
+        deferredBackendRestarts?.dispose();
         for (const cleanup of cleanups) await attempt(cleanup);
         await attempt(() => commandConcurrencyGate.close());
         await attempt(() => stopExtensionLibraryAuthorityNotifications());

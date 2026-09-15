@@ -10,10 +10,24 @@ import { resetModelPickerPreferencesForTests } from "../model-picker-preferences
 import { SubagentModelSection } from "./SubagentModelSection.js";
 
 let root: Root;
-const t = (key: Parameters<typeof translate>[1]) => translate("en", key);
+const t = (key: Parameters<typeof translate>[1], values?: Parameters<typeof translate>[2]) => translate("en", key, values);
 const a = { providerId: "source", modelId: "small" };
 const b = { providerId: "source", modelId: "large" };
-const setting = (model?: typeof a, revision = 0n): SubagentModelSettingsView => ({ backendId: "worker", ...(model === undefined ? {} : { model }), revision, available: true, unavailableReason: "" });
+const setting = (model?: typeof a, revision = 0n): SubagentModelSettingsView => ({
+  backendId: "worker",
+  ...(model === undefined ? {} : { model }),
+  revision,
+  defaultModelSupported: true,
+  available: true,
+  unavailableReason: "",
+  smartRoutingSupported: false,
+  smartRoutingEnabled: false,
+  smartRoutingAvailable: false,
+  smartRoutingUnavailableReason: "",
+  smartRoutingApplied: false,
+  smartRoutingRestartPending: false,
+  runtimeRevision: ""
+});
 beforeEach(() => {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   resetModelPickerPreferencesForTests();
@@ -108,28 +122,113 @@ it("allows explicit reset of invalid stored settings and restores focus only whi
   expect(document.activeElement).toBe(other);
 });
 
-async function mount() {
+it("saves smart routing independently and presents pending and applied runtime generations", async () => {
+  const fixture = await mount({
+    ...setting(undefined, 0n),
+    smartRoutingSupported: true,
+    smartRoutingAvailable: true,
+    runtimeGeneration: 3n,
+    runtimeRevision: "catalog-a"
+  });
+  const toggle = document.querySelector<HTMLButtonElement>('[role="switch"]')!;
+  expect(toggle.ariaChecked).toBe("false");
+
+  await act(async () => toggle.click());
+  expect(fixture.saveSmart).toHaveBeenCalledExactlyOnceWith("worker", true, 0n);
+  expect(document.body.textContent).toContain("Waiting for the current settings");
+  expect([...document.querySelectorAll("button")].some((button) => button.textContent === "Refresh")).toBe(true);
+  await fixture.publish({
+    ...setting(undefined, 1n),
+    smartRoutingSupported: true,
+    smartRoutingEnabled: true,
+    smartRoutingAvailable: true,
+    smartRoutingRestartPending: true,
+    runtimeGeneration: 3n,
+    runtimeRevision: "catalog-a"
+  });
+  expect(document.body.textContent).toContain("Waiting for current work to finish");
+  await fixture.publish({
+    ...setting(undefined, 2n),
+    smartRoutingSupported: true,
+    smartRoutingEnabled: true,
+    smartRoutingAvailable: true,
+    smartRoutingApplied: true,
+    runtimeGeneration: 4n,
+    runtimeRevision: "catalog-b"
+  });
+  expect(document.body.textContent).toContain("Active on backend runtime generation 4");
+});
+
+it("keeps an unavailable smart route as a durable desired setting", async () => {
+  const fixture = await mount({
+    ...setting(undefined, 3n),
+    smartRoutingSupported: true,
+    smartRoutingAvailable: false,
+    smartRoutingUnavailableReason: "No compatible generation catalog is currently available."
+  });
+
+  const toggle = document.querySelector<HTMLButtonElement>('[role="switch"]')!;
+  expect(toggle.disabled).toBe(false);
+  await act(async () => toggle.click());
+  expect(fixture.saveSmart).toHaveBeenCalledExactlyOnceWith("worker", true, 3n);
+  expect(document.body.textContent).toContain("No compatible generation catalog is currently available.");
+});
+
+it("keeps saved model and smart choices recoverable after their Backend capabilities are withdrawn", async () => {
+  const fixture = await mount({
+    ...setting(a, 5n),
+    defaultModelSupported: false,
+    available: false,
+    unavailableReason: "Backend does not support a subagent default model.",
+    smartRoutingSupported: false,
+    smartRoutingEnabled: true,
+    smartRoutingAvailable: false,
+    smartRoutingUnavailableReason: "Backend does not support smart subagent routing."
+  });
+
+  expect(document.body.textContent).toContain("Backend does not support a subagent default model.");
+  await click("Restore default");
+  expect(fixture.save).toHaveBeenCalledExactlyOnceWith("worker", undefined, 5n);
+  const toggle = document.querySelector<HTMLButtonElement>('[role="switch"]')!;
+  expect(toggle).toBeDefined();
+  expect(toggle.disabled).toBe(false);
+  await act(async () => toggle.click());
+  expect(fixture.saveSmart).toHaveBeenCalledExactlyOnceWith("worker", false, 5n);
+});
+
+async function mount(initial = setting()) {
   const host = document.createElement("div"); document.body.append(host); root = createRoot(host);
   const save = vi.fn<AppController["updateSubagentModelSettings"]>().mockResolvedValue(undefined);
+  const saveSmart = vi.fn<AppController["updateSubagentSmartRouting"]>().mockResolvedValue(undefined);
   const gatewayIdentity = vi.fn();
-  let current = setting();
+  let current = initial;
   let profile = "first";
   let connected = true;
   const render = async (nextProfile = profile, nextConnected = connected) => {
     profile = nextProfile; connected = nextConnected;
     const snapshot = { ...emptySnapshot(), revision: 1n, generation: 1n,
       backends: [{ id: "worker", name: "Worker", version: "1", health: "healthy" as const,
-        capabilities: new Map([["subagents.default_model", { name: "subagents.default_model", supported: true, options: [] }]]) }],
+        capabilities: new Map([
+          ...(current.defaultModelSupported
+            ? [["subagents.default_model", { name: "subagents.default_model", supported: true, options: [] }] as const]
+            : []),
+          ...(current.smartRoutingSupported
+            ? [["subagents.smart_routing", { name: "subagents.smart_routing", supported: true, options: [] }] as const]
+            : [])
+        ]) }],
       models: [model(a, "Small"), model(b, "Large")],
       settings: { ...emptySnapshot().settings, subagentModels: [current] }
     };
     const controller = { state: { ready: true, connectionState: connected ? "connected" : "disconnected", activeProfile: { id: profile, serverId: "node" } },
-      updateSubagentModelSettings: save, getArtifactUrl: gatewayIdentity, refresh: vi.fn().mockResolvedValue(undefined)
+      updateSubagentModelSettings: save,
+      updateSubagentSmartRouting: saveSmart,
+      getArtifactUrl: gatewayIdentity,
+      refresh: vi.fn().mockResolvedValue(undefined)
     } as unknown as AppController;
     await act(async () => root.render(<StrictMode><SubagentModelSection controller={controller} snapshot={snapshot} t={t} /></StrictMode>));
   };
   await render();
-  return { save, render, publish: async (value: SubagentModelSettingsView) => { current = value; await render(); } };
+  return { save, saveSmart, render, publish: async (value: SubagentModelSettingsView) => { current = value; await render(); } };
 }
 function model(selection: typeof a, name: string): ModelView {
   return { backendId: "worker", ...selection, providerName: "Source", name, available: true, supportsImages: false,

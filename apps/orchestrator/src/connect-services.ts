@@ -481,6 +481,8 @@ interface ConnectServiceDependencies {
   readonly promptPrediction?: PromptPredictionService;
   readonly auxiliaryText?: AuxiliaryTextRouting;
   readonly subagentModels?: SubagentModelSettings;
+  readonly holdSubagentSmartRoutingDispatch?: (backendId: string) => void;
+  readonly refreshSubagentSmartRouting?: (backendId: string) => Promise<void>;
   readonly sessionNavigation?: SessionNavigationCoordinator;
   readonly reviewCoordinator?: ReviewCoordinator;
   readonly remoteHosts?: RemoteHostRegistry;
@@ -983,6 +985,8 @@ export function createConnectServices(application: OrchestratorApplication): Con
     adapters: () => application.adapters,
     restartBackend: application.restartBackend,
     refreshBackendDescriptor: application.refreshBackendDescriptor,
+    holdSubagentSmartRoutingDispatch: application.holdSubagentSmartRoutingDispatch,
+    refreshSubagentSmartRouting: application.refreshSubagentSmartRouting,
     runtimeProcesses: new RuntimeProcessControl(
       application.store,
       (backendId, effect) => application.sessionHost.invokeBackendAdapter(backendId, effect)
@@ -8561,6 +8565,7 @@ function mapProviderModelConfiguration(item: PiManagedModel): contract.ProviderM
     reasoning: item.reasoning ?? false,
     supportsFastMode: item.supportsFastMode === true,
     defaultVisible: item.defaultVisible,
+    supportsTools: item.supportsTools,
     inputModalities: (item.input ?? ["text"]).map((value) => value === "image" ? contract.ModelInputModality.IMAGE : contract.ModelInputModality.TEXT),
     contextWindowTokens: item.contextWindow === undefined ? 0n : BigInt(item.contextWindow),
     maximumOutputTokens: item.maxTokens === undefined ? 0n : BigInt(item.maxTokens),
@@ -8745,6 +8750,7 @@ function providerModelFromProto(input: contract.ProviderModelConfiguration): PiM
     reasoning: input.reasoning,
     supportsFastMode: input.supportsFastMode,
     ...(input.defaultVisible === undefined ? {} : { defaultVisible: input.defaultVisible }),
+    ...(input.supportsTools === undefined ? {} : { supportsTools: input.supportsTools }),
     ...(thinkingLevelMap === undefined ? {} : { thinkingLevelMap }),
     ...(modalities === undefined ? {} : { input: modalities }),
     ...(input.contextWindowTokens === 0n ? {} : { contextWindow: safeUnsignedNumber(input.contextWindowTokens, "provider.models.context_window_tokens") }),
@@ -12468,6 +12474,15 @@ function settingsSnapshot(dependencies: ConnectServiceDependencies): contract.Se
       ...(setting.model === undefined ? {} : { model: create(contract.ModelKeySchema, setting.model) }),
       available: setting.available,
       unavailableReason: setting.unavailableReason,
+      defaultModelSupported: setting.defaultModelSupported,
+      smartRoutingSupported: setting.smartRoutingSupported,
+      smartRoutingEnabled: setting.smartRoutingEnabled,
+      smartRoutingAvailable: setting.smartRoutingAvailable,
+      smartRoutingUnavailableReason: setting.smartRoutingUnavailableReason,
+      smartRoutingApplied: setting.smartRoutingApplied,
+      smartRoutingRestartPending: setting.smartRoutingRestartPending,
+      ...(setting.runtimeGeneration === undefined ? {} : { runtimeGeneration: BigInt(setting.runtimeGeneration) }),
+      runtimeRevision: setting.runtimeRevision,
       revision: toProtoRevision(setting.revision)
     })),
     promptRecommendation: create(contract.PromptRecommendationSettingsSchema, {
@@ -18078,15 +18093,28 @@ async function dispatchMutation(
         return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case,
           "Subagent model settings are not configured on this Orchestrator node.");
       }
-      const { backendId, model } = payload.value;
+      const { backendId, model, clearDefaultModel, smartRoutingEnabled } = payload.value;
+      const actionCount = Number(model !== undefined) + Number(clearDefaultModel) + Number(smartRoutingEnabled !== undefined);
+      if (actionCount !== 1) {
+        throw invalidArgument("Specify exactly one of model, clear_default_model, or smart_routing_enabled");
+      }
       const selection = model === undefined ? undefined : { providerId: model.providerId, modelId: model.modelId };
       const execution = await host.mutate({
         operationId, connection, kind: payload.case, body: mutation,
         commit: () => {
-          owner.replace(backendId, selection, expectedRevision);
+          if (smartRoutingEnabled !== undefined) owner.replaceSmartRouting(backendId, smartRoutingEnabled, expectedRevision);
+          else owner.replace(backendId, selection, expectedRevision);
           return { accepted: true, resultCase: "settings" } satisfies OperationOutcome;
+        },
+        afterCommit: (committed) => {
+          if (!committed.replayed && smartRoutingEnabled !== undefined) {
+            dependencies.holdSubagentSmartRoutingDispatch?.(backendId);
+          }
         }
       });
+      if (!execution.replayed && smartRoutingEnabled !== undefined) {
+        await dependencies.refreshSubagentSmartRouting?.(backendId);
+      }
       return presented(execution);
     }
     case "updatePromptRecommendationSettings": {

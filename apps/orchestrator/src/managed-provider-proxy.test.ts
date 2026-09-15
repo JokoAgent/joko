@@ -19,12 +19,23 @@ async function fixture(nativeResponses = false) {
   const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "native-owner" });
   providers.initialize();
   const received: { path: string; model: string; authorization: string | undefined }[] = [];
+  const forwardedProxyTokens: Array<string | undefined> = [];
+  const forwardedFedrampHeaders: Array<string | undefined> = [];
+  const nativeReceived: {
+    path: string;
+    model: string;
+    authorization: string | undefined;
+    accountId: string | undefined;
+    fedramp: string | undefined;
+  }[] = [];
   let hold = false; let reject = false; let pending: ServerResponse | undefined; let closed = false;
   let toolOutcome: "absent" | "present" | "denied" | undefined;
   const upstream = createServer(async (request, response) => {
     const bytes: Buffer[] = []; for await (const chunk of request) bytes.push(Buffer.from(chunk));
     const body = JSON.parse(Buffer.concat(bytes).toString());
     received.push({ path: request.url!, model: body.model, authorization: request.headers.authorization });
+    forwardedProxyTokens.push(request.headers["x-joko-provider-proxy-token"] as string | undefined);
+    forwardedFedrampHeaders.push(request.headers["x-openai-fedramp"] as string | undefined);
     if (reject) { response.writeHead(302, { location: "https://external.invalid/", "content-type": "text/plain" }); response.end("upstream-private-detail"); return; }
     response.writeHead(200, { "content-type": "text/event-stream" });
     if (nativeResponses) {
@@ -59,7 +70,25 @@ async function fixture(nativeResponses = false) {
   await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
   const endpoint = `http://127.0.0.1:${(upstream.address() as { port: number }).port}`;
   let ownerCurrent = true; let sessionPresent = true;
-  const proxy = new ManagedProviderProxy({ providers, assertOwner: () => { if (!ownerCurrent || !sessionPresent) throw new Error("Owner changed"); } });
+  const routedFetch: typeof fetch = async (input, init) => {
+    const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+    if (url.origin === endpoint) return await fetch(input, init);
+    const headers = new Headers(init?.headers);
+    const body = JSON.parse(typeof init?.body === "string" ? init.body : Buffer.from(init?.body as Uint8Array).toString("utf8"));
+    nativeReceived.push({
+      path: url.pathname,
+      model: body.model,
+      authorization: headers.get("authorization") ?? undefined,
+      accountId: headers.get("chatgpt-account-id") ?? undefined,
+      fedramp: headers.get("x-openai-fedramp") ?? undefined
+    });
+    return new Response("data: native fixture\n\n", { status: 200, headers: { "content-type": "text/event-stream" } });
+  };
+  const proxy = new ManagedProviderProxy({
+    providers,
+    fetch: routedFetch,
+    assertOwner: () => { if (!ownerCurrent || !sessionPresent) throw new Error("Owner changed"); }
+  });
   await proxy.start();
   const port = proxy.createRuntime({ backendId: "runtime", generation: 3, support: { protocols: ["openai-responses"], fields: [] }, assertCurrent: () => { if (!ownerCurrent) throw new Error("Runtime changed"); } });
   const owner = { backendId: "runtime", backendInstanceGeneration: 3, targetId: "target", sessionId: "session", sessionGeneration: 4, providerId: "provider", modelId: "model" };
@@ -68,11 +97,38 @@ async function fixture(nativeResponses = false) {
     const ticket = credentials.createUploadTicket(); credentials.upload(ticket.credentialUploadTicketId, secret);
     await credentials.commitUpload({ credentialUploadTicketId: ticket.credentialUploadTicketId, credentialReferenceId: reference, displayName: "Provider credential", kind: "api_key" });
     await providers.upsertConfiguration({ providerId: "provider", displayName: "Provider", kind: "custom_endpoint", enabled: true, expectedVersion: revision,
-      runtimes: [{ backendId: "runtime", provider: { id: "provider", api: "openai-responses", baseUrl: endpoint, apiKeyEnv: "PROVIDER_KEY", models: [{ id: "model", input: ["text"] }, { id: "child-model", input: ["text"] }] },
+      runtimes: [{ backendId: "runtime", provider: { id: "provider", api: "openai-responses", baseUrl: endpoint, apiKeyEnv: "PROVIDER_KEY",
+        headers: { "X-Joko-Provider-Proxy-Token": { env: "PROVIDER_KEY" } },
+        models: [{ id: "model", input: ["text"] }, { id: "child-model", input: ["text"] }] },
         credentialBindings: { PROVIDER_KEY: reference }, credentialOrigin: endpoint, requestPath: "/custom/responses" }] });
   };
   await write(0n, "first-private-provider-credential");
-  return { directory, store, providers, proxy, port, owner, received, write,
+  const markProviderUnavailable = async () => {
+    await providers.upsert({
+      backendId: "runtime",
+      credentialOrigin: endpoint,
+      provider: {
+        id: "provider",
+        api: "openai-responses",
+        baseUrl: endpoint,
+        apiKeyEnv: "PROVIDER_KEY",
+        headers: { "X-Joko-Provider-Proxy-Token": { env: "PROVIDER_KEY" } },
+        models: [{ id: "model", input: ["text"] }, { id: "child-model", input: ["text"] }]
+      },
+      requestPath: "/custom/responses",
+      displayName: "Provider",
+      kind: "custom_endpoint",
+      credentialBindings: { PROVIDER_KEY: "credential-0" },
+      enabled: true,
+      supportsLogin: false,
+      supportsLogout: true,
+      supportsRefresh: false,
+      error: "Provider catalog is unavailable.",
+      expectedVersion: 1n
+    });
+  };
+  return { directory, store, providers, proxy, port, owner, received, nativeReceived, forwardedProxyTokens, forwardedFedrampHeaders,
+    write, markProviderUnavailable,
     token: port.environment[port.secretEnvironmentNames[0]!]!, toolOutcome: () => toolOutcome,
     hold: () => { hold = true; }, reject: () => { reject = true; },
     retire: () => { ownerCurrent = false; }, closed: () => closed, sessionPresent: (present: boolean) => { sessionPresent = present; },
@@ -82,6 +138,16 @@ async function fixture(nativeResponses = false) {
 }
 
 describe("Managed Provider native proxy", () => {
+  it("advertises smart candidates only while their Provider is currently available", async () => {
+    const f = await fixture();
+    try {
+      expect(f.port.listSmartRoutingCandidates!().map((candidate) => candidate.model.modelId)).toEqual(["model", "child-model"]);
+      await f.markProviderUnavailable();
+      expect(f.providers.describeInferenceRoute("runtime", "provider", "child-model")).toBeDefined();
+      expect(f.port.listSmartRoutingCandidates!()).toEqual([]);
+    } finally { await f.dispose(); }
+  });
+
   it.skipIf(process.env.JOKO_CODEX_MANAGED_FIXTURE_COMMAND === undefined)("runs the installed native app-server through the production route on the original thread with an isolated profile", async () => {
     const f = await fixture(true);
     const profile = join(f.directory, "profile"); const workspaceRoot = join(f.directory, "workspace");
@@ -228,6 +294,216 @@ describe("Managed Provider native proxy", () => {
       parentLease.release();
       expect((await request("model")).status).toBe(409);
       binding.dispose();
+    } finally { await f.dispose(); }
+  });
+
+  it("authorizes smart descendants by exact lineage and model while separating native and managed credentials", async () => {
+    const f = await fixture();
+    try {
+      const child = f.port.listSmartRoutingCandidates!().find((candidate) => candidate.model.modelId === "child-model")!;
+      const binding = await f.port.prepareSmartRouting!({
+        backendId: "runtime",
+        backendInstanceGeneration: 3,
+        targetId: "target",
+        sessionId: "session",
+        sessionGeneration: 4,
+        nativeProviderId: "openai",
+        rootProviderId: "provider",
+        rootModelId: "model",
+        routes: [
+          { providerId: child.providerId, modelId: child.model.modelId, revision: child.revision, native: false },
+          { providerId: "openai", modelId: "native-worker", revision: "native-catalog-a", native: true }
+        ],
+        revision: "catalog-a"
+      });
+      binding.bindRoot({ threadId: "root-thread", providerId: "provider", modelId: "model" });
+      const lease = await binding.activate({
+        operationId: "smart-operation",
+        signal: new AbortController().signal,
+        assertCurrent: () => undefined
+      });
+      const request = (input: {
+        readonly threadId: string;
+        readonly modelId: string;
+        readonly parentThreadId?: string;
+        readonly subagent?: string;
+        readonly token?: string;
+        readonly authorization?: string;
+        readonly accountId?: string;
+        readonly fedramp?: string;
+      }) => fetch(`${binding.baseUrl}/responses`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-joko-provider-proxy-token": input.token ?? f.token,
+          "thread-id": input.threadId,
+          ...(input.parentThreadId === undefined ? {} : { "x-codex-parent-thread-id": input.parentThreadId }),
+          ...(input.subagent === undefined ? {} : { "x-openai-subagent": input.subagent }),
+          ...(input.authorization === undefined ? {} : { authorization: input.authorization }),
+          ...(input.accountId === undefined ? {} : { "chatgpt-account-id": input.accountId }),
+          ...(input.fedramp === undefined ? {} : { "x-openai-fedramp": input.fedramp })
+        },
+        body: JSON.stringify({ model: input.modelId, input: "fixture" })
+      });
+
+      expect((await request({ threadId: "root-thread", modelId: "model", token: "wrong" })).status).toBe(403);
+      expect((await request({
+        threadId: "root-thread",
+        parentThreadId: "forged-parent",
+        modelId: "model"
+      })).status).toBe(502);
+      expect(await (await request({
+        threadId: "root-thread",
+        modelId: "model",
+        authorization: "Bearer must-not-reach-managed",
+        fedramp: "true"
+      })).text()).toBe("data: fixture\n\n");
+      expect(await (await request({
+        threadId: "inherited-root-child",
+        parentThreadId: "root-thread",
+        subagent: "collab_spawn",
+        modelId: "model",
+        authorization: "Bearer must-not-reach-managed"
+      })).text()).toBe("data: fixture\n\n");
+      expect(await (await request({
+        threadId: "child-thread",
+        parentThreadId: "root-thread",
+        subagent: "collab_spawn",
+        modelId: "child-model",
+        authorization: "Bearer must-not-reach-managed"
+      })).text()).toBe("data: fixture\n\n");
+      expect(f.received.slice(-2)).toEqual([
+        { path: "/custom/responses", model: "model", authorization: "Bearer first-private-provider-credential" },
+        { path: "/custom/responses", model: "child-model", authorization: "Bearer first-private-provider-credential" }
+      ]);
+      expect(f.forwardedProxyTokens).toEqual([undefined, undefined, undefined]);
+      expect(f.forwardedFedrampHeaders).toEqual([undefined, undefined, undefined]);
+      expect((await request({
+        threadId: "child-thread",
+        parentThreadId: "root-thread",
+        subagent: "collab_spawn",
+        modelId: "native-worker",
+        authorization: "Bearer native-private-credential"
+      })).status).toBe(502);
+
+      expect(await (await request({
+        threadId: "guardian-child",
+        parentThreadId: "child-thread",
+        subagent: "guardian",
+        modelId: "model"
+      })).text()).toBe("data: fixture\n\n");
+      expect((await request({
+        threadId: "guardian-child",
+        parentThreadId: "child-thread",
+        subagent: "guardian",
+        modelId: "child-model"
+      })).status).toBe(502);
+      expect(f.forwardedProxyTokens.every((token) => token === undefined)).toBe(true);
+
+      expect(await (await request({
+        threadId: "native-child",
+        parentThreadId: "child-thread",
+        subagent: "collab_spawn",
+        modelId: "native-worker",
+        authorization: "Bearer native-private-credential",
+        accountId: "account-one",
+        fedramp: "true"
+      })).text()).toBe("data: native fixture\n\n");
+      expect(f.nativeReceived).toEqual([{
+        path: "/backend-api/codex/responses",
+        model: "native-worker",
+        authorization: "Bearer native-private-credential",
+        accountId: "account-one",
+        fedramp: "true"
+      }]);
+
+      expect((await request({
+        threadId: "invalid-fedramp-child",
+        parentThreadId: "child-thread",
+        subagent: "collab_spawn",
+        modelId: "native-worker",
+        authorization: "Bearer native-private-credential",
+        accountId: "account-one",
+        fedramp: "false"
+      })).status).toBe(502);
+
+      expect(await (await request({
+        threadId: "nested-child",
+        parentThreadId: "child-thread",
+        subagent: "collab_spawn",
+        modelId: "child-model"
+      })).text()).toBe("data: fixture\n\n");
+      binding.completeDescendant("child-thread");
+      expect(await (await request({
+        threadId: "nested-child",
+        parentThreadId: "child-thread",
+        subagent: "collab_spawn",
+        modelId: "child-model"
+      })).text()).toBe("data: fixture\n\n");
+      expect((await request({
+        threadId: "late-nested-child",
+        parentThreadId: "child-thread",
+        subagent: "collab_spawn",
+        modelId: "child-model"
+      })).status).toBe(502);
+
+      expect((await request({
+        threadId: "unknown-child",
+        parentThreadId: "unknown-parent",
+        subagent: "collab_spawn",
+        modelId: "child-model"
+      })).status).toBe(502);
+      expect((await request({ threadId: "child-thread", modelId: "child-model" })).status).toBe(502);
+      expect((await request({
+        threadId: "guardian-child",
+        parentThreadId: "root-thread",
+        subagent: "guardian",
+        modelId: "child-model"
+      })).status).toBe(502);
+      expect((await request({
+        threadId: "child-thread",
+        parentThreadId: "root-thread",
+        subagent: "collab_spawn",
+        modelId: "child-model"
+      })).status).toBe(502);
+      binding.registerDescendant("unfinished-child", "root-thread");
+
+      lease.release();
+      expect((await request({ threadId: "root-thread", modelId: "model" })).status).toBe(409);
+      const nextLease = await binding.activate({
+        operationId: "next-smart-operation",
+        signal: new AbortController().signal,
+        assertCurrent: () => undefined
+      });
+      expect((await request({
+        threadId: "child-thread",
+        parentThreadId: "root-thread",
+        subagent: "collab_spawn",
+        modelId: "child-model"
+      })).status).toBe(502);
+      expect((await request({
+        threadId: "nested-child",
+        parentThreadId: "child-thread",
+        subagent: "collab_spawn",
+        modelId: "child-model"
+      })).status).toBe(502);
+      expect((await request({
+        threadId: "unfinished-child",
+        parentThreadId: "root-thread",
+        subagent: "collab_spawn",
+        modelId: "child-model"
+      })).status).toBe(502);
+      expect(await (await request({ threadId: "root-thread", modelId: "model" })).text()).toBe("data: fixture\n\n");
+
+      await f.write(1n, "second-private-provider-credential");
+      expect(() => binding.assertCurrent()).toThrow("unavailable");
+      expect((await request({ threadId: "root-thread", modelId: "model" })).status).toBe(502);
+      nextLease.release();
+      expect((await request({ threadId: "root-thread", modelId: "model" })).status).toBe(409);
+      binding.dispose();
+      const durableSettings = JSON.stringify(f.store.listSettings().map((setting) => setting.value));
+      expect(durableSettings).not.toContain(f.token);
+      expect(durableSettings).not.toContain("native-private-credential");
     } finally { await f.dispose(); }
   });
 

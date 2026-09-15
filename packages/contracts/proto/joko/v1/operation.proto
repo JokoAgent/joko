@@ -1197,9 +1197,12 @@ message UpdateAuxiliaryTextSettingsMutation {
 
 message UpdateSubagentModelSettingsMutation {
   string backend_id = 1;
-  // Omitted restores the native default.
+  // Set one complete default-model choice.
   optional ModelKey model = 2;
   Revision expected_revision = 3;
+  // Explicitly distinguishes default reset from a smart-routing-only update.
+  bool clear_default_model = 4;
+  optional bool smart_routing_enabled = 5;
 }
 
 // Backend-neutral user shell surface.

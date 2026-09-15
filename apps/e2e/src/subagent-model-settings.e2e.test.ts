@@ -53,7 +53,11 @@ it("persists subagent defaults through authenticated clients, CAS, replay, reset
   const mutation = (model: { providerId: string; modelId: string } | undefined, revision: bigint) => create(OperationMutationSchema, {
     payload: {
       case: "updateSubagentModelSettings",
-      value: { backendId: profile.id, ...(model === undefined ? {} : { model }), expectedRevision: { value: revision } }
+      value: {
+        backendId: profile.id,
+        ...(model === undefined ? { clearDefaultModel: true } : { model }),
+        expectedRevision: { value: revision }
+      }
     }
   });
   expect(await read(first.clients)).toMatchObject({ available: true, revision: { value: 0n } });
@@ -85,4 +89,77 @@ it("persists subagent defaults through authenticated clients, CAS, replay, reset
     .rejects.toMatchObject({ code: Code.Aborted });
   await expect(submit(firstReconnected.operation, first.connectionId, mutation(model, 0n)))
     .rejects.toMatchObject({ code: Code.Aborted });
+});
+
+it("commits smart routing through the typed operation and replaces the idle Backend generation", async () => {
+  const profile = {
+    ...PI_LIKE_PROFILE,
+    capabilities: [...PI_LIKE_PROFILE.capabilities, { key: "subagents.smart_routing", supported: true }]
+  };
+  let owner: SubagentModelSettings;
+  const options: FixtureOptions = {
+    profiles: [profile],
+    createAdapter: (value) => new SubagentSettingsAdapter(value),
+    createAuxiliaryServices: async (store) => {
+      owner = new SubagentModelSettings({
+        store,
+        smartRoutingState: (backendId) => {
+          const generation = store.getBackend(backendId).descriptor.instanceGeneration;
+          return {
+            applied: owner.smartRoutingEnabled(backendId),
+            restartPending: false,
+            unavailableReason: "",
+            runtimeRevision: `fixture-${generation}`,
+            instanceGeneration: generation
+          };
+        }
+      });
+      return { subagentModels: owner };
+    }
+  };
+  fixture = await OrchestratorE2eFixture.start(options);
+  rootDirectory = fixture.rootDirectory;
+  const paired = await fixture.pair("Smart subagent settings window");
+  const read = async () => (await paired.clients.settings.getSettings({})).settings!.subagentModels
+    .find((setting) => setting.backendId === profile.id)!;
+  const mutate = (enabled: boolean, revision: bigint) => create(OperationMutationSchema, {
+    payload: {
+      case: "updateSubagentModelSettings",
+      value: { backendId: profile.id, smartRoutingEnabled: enabled, expectedRevision: { value: revision } }
+    }
+  });
+
+  const initialGeneration = fixture.application.store.getBackend(profile.id).descriptor.instanceGeneration;
+  expect(await read()).toMatchObject({
+    smartRoutingSupported: true,
+    smartRoutingEnabled: false,
+    smartRoutingApplied: false,
+    smartRoutingRestartPending: false,
+    runtimeGeneration: BigInt(initialGeneration),
+    revision: { value: 0n }
+  });
+
+  await submit(paired.clients.operation, paired.connectionId, mutate(true, 0n));
+  const enabled = await read();
+  const enabledGeneration = fixture.application.store.getBackend(profile.id).descriptor.instanceGeneration;
+  expect(enabledGeneration).toBeGreaterThan(initialGeneration);
+  expect(enabled).toMatchObject({
+    smartRoutingEnabled: true,
+    smartRoutingApplied: true,
+    smartRoutingRestartPending: false,
+    runtimeGeneration: BigInt(enabledGeneration)
+  });
+
+  const enabledRevision = enabled.revision!.value;
+  await fixture.close({ removeRoot: false });
+  fixture = await OrchestratorE2eFixture.start({ ...options, rootDirectory });
+  const reconnected = fixture.clients(paired.authKey);
+  const restored = (await reconnected.settings.getSettings({})).settings!.subagentModels
+    .find((setting) => setting.backendId === profile.id)!;
+  expect(restored).toMatchObject({
+    smartRoutingEnabled: true,
+    smartRoutingApplied: true,
+    smartRoutingRestartPending: false,
+    revision: { value: enabledRevision }
+  });
 });

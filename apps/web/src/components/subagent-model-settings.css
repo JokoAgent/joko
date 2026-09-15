@@ -3,5 +3,6 @@
 .subagent-model-card .setting-row { min-height: 52px; padding: 0; }
 .subagent-model-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; min-width: 0; }
 .subagent-model-actions .model-picker-trigger { max-width: 100%; }
+.subagent-smart-routing { display: grid; gap: 8px; border-top: 1px solid var(--border-soft); padding-top: 10px; }
 .subagent-model-section > p,
 .subagent-model-card p { margin: 0; color: var(--text-soft); font-size: var(--text-12); line-height: 1.5; overflow-wrap: anywhere; }

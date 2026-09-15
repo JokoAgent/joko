@@ -224,6 +224,96 @@ describe("operation ID lifecycle", () => {
     gateway.disconnect();
   });
 
+  it("keeps default-model set/reset and smart routing as three unambiguous typed mutations", async () => {
+    const payloads: any[] = [];
+    const gateway = createOrchestratorGateway(
+      { id: "connection-1", deviceId: "device-test", name: "Desktop", origin: "https://orchestrator.example", serverId: "server-test" },
+      "secret",
+      {},
+      () => operationTransport(async (method, input) => {
+        payloads.push(input.mutation.payload);
+        return response(method, create(SubmitOperationResponseSchema, {
+          operation: {
+            operationId: input.operationId,
+            connectionId: input.connectionId,
+            state: OperationState.SUCCEEDED,
+            result: { payload: { case: "settings", value: {} } }
+          }
+        }));
+      })
+    );
+    await gateway.connect();
+
+    await gateway.updateSubagentModelSettings("codex", { providerId: "openai", modelId: "gpt-test" }, 2n);
+    await gateway.updateSubagentModelSettings("codex", undefined, 3n);
+    await gateway.updateSubagentSmartRouting("codex", false, 4n);
+
+    expect(payloads).toHaveLength(3);
+    expect(payloads[0]).toMatchObject({
+      case: "updateSubagentModelSettings",
+      value: {
+        backendId: "codex",
+        model: { providerId: "openai", modelId: "gpt-test" },
+        clearDefaultModel: false,
+        expectedRevision: { value: 2n }
+      }
+    });
+    expect(payloads[0].value.smartRoutingEnabled).toBeUndefined();
+    expect(payloads[1]).toMatchObject({
+      case: "updateSubagentModelSettings",
+      value: { backendId: "codex", clearDefaultModel: true, expectedRevision: { value: 3n } }
+    });
+    expect(payloads[1].value.model).toBeUndefined();
+    expect(payloads[1].value.smartRoutingEnabled).toBeUndefined();
+    expect(payloads[2]).toMatchObject({
+      case: "updateSubagentModelSettings",
+      value: {
+        backendId: "codex",
+        clearDefaultModel: false,
+        smartRoutingEnabled: false,
+        expectedRevision: { value: 4n }
+      }
+    });
+    expect(payloads[2].value.model).toBeUndefined();
+    gateway.disconnect();
+  });
+
+  it("maps smart-routing desired, pending, applied, and generation state without backend inference", () => {
+    const snapshot = mapSnapshot(create(SnapshotSchema, {
+      settings: {
+        auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" },
+        agentResource: {}, collaboration: {}, gitSafety: {},
+        subagentModels: [{
+          backendId: "codex",
+          defaultModelSupported: false,
+          smartRoutingSupported: true,
+          smartRoutingEnabled: true,
+          smartRoutingAvailable: true,
+          smartRoutingApplied: true,
+          smartRoutingRestartPending: true,
+          runtimeGeneration: 9n,
+          runtimeRevision: "catalog-nine",
+          revision: { value: 5n }
+        }]
+      }
+    }));
+    expect(snapshot.settings.subagentModels).toEqual([{
+      backendId: "codex",
+      defaultModelSupported: false,
+      available: false,
+      unavailableReason: "",
+      smartRoutingSupported: true,
+      smartRoutingEnabled: true,
+      smartRoutingAvailable: true,
+      smartRoutingUnavailableReason: "",
+      smartRoutingApplied: true,
+      smartRoutingRestartPending: true,
+      runtimeGeneration: 9n,
+      runtimeRevision: "catalog-nine",
+      revision: 5n
+    }]);
+  });
+
   it("submits automatic and Provider-scoped model catalog refresh intent", async () => {
     const payloads: any[] = [];
     const gateway = createOrchestratorGateway(

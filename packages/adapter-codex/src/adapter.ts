@@ -19,6 +19,8 @@ import {
   type KnownCapability,
   type ManagedProviderRuntimePort,
   type ManagedProviderRouteBinding,
+  type ManagedProviderSmartRoutingBinding,
+  type ManagedProviderSmartRoutingRoute,
   type ManagedProviderOperationLease,
   type ProviderRuntimeSupport,
   type NativeSessionBinding,
@@ -85,9 +87,17 @@ import {
   type CodexInputResolvers,
   type TranslatorState
 } from "./translator.js";
+import {
+  inspectCodexSmartRouting,
+  type CodexSmartRoutingInspection,
+  type CodexSmartRoutingGeneration,
+  type CodexSmartRoutingPreparation
+} from "./smart-subagent-routing.js";
 
 export interface CodexAdapterOptions extends CodexInputResolvers {
   readonly managedProviders?: ManagedProviderRuntimePort;
+  /** Spawn-time catalog and runtime revision owned by this exact Backend instance. */
+  readonly smartRouting?: CodexSmartRoutingPreparation;
   readonly id?: string;
   readonly instanceGeneration: number;
   readonly providerId?: string;
@@ -214,6 +224,7 @@ interface SessionRuntime {
   readonly remote: boolean;
   readonly assertExecutionCurrent: () => void;
   managedRoute: ManagedProviderRouteBinding | undefined;
+  smartRoute: ManagedProviderSmartRoutingBinding | undefined;
   managedOperation: { readonly id: string; lease?: ManagedProviderOperationLease } | undefined;
   routeUnknown: boolean;
   readonly sessionId: string;
@@ -403,8 +414,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   readonly id: string;
   readonly #instanceGeneration: number;
   readonly #providerId: string;
-  readonly #host: AppServerHost;
+  #host: AppServerHost;
   readonly #ownsHost: boolean;
+  readonly #ownedHostOptions: AppServerHostOptions | undefined;
   readonly #resolvers: CodexInputResolvers;
   readonly #translator = new CodexEventTranslator();
   readonly #maximumModels: number;
@@ -438,6 +450,13 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   readonly #sessionMutations = new Map<string, { count: number; rewinding: boolean }>();
   #models: readonly ProviderModel[] = [];
   readonly #managedProviders: ManagedProviderRuntimePort | undefined;
+  readonly #smartRouting: CodexSmartRoutingPreparation | undefined;
+  #smartRoutingRoutes: readonly ManagedProviderSmartRoutingRoute[] = [];
+  #smartRoutingApplied = false;
+  #smartRoutingUnavailableReason: string;
+  #smartRoutingRuntimeRevision: string;
+  #smartRoutingHostReady = false;
+  #smartRoutingHostFlight: Promise<number> | undefined;
   #account: CodexAccountSnapshot | undefined;
   #disposed = false;
   #disposeFlight: Promise<void> | undefined;
@@ -449,14 +468,22 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     this.#instanceGeneration = options.instanceGeneration;
     this.#providerId = options.providerId ?? "openai";
     this.#managedProviders = options.managedProviders;
-    this.#host = options.host ?? new AppServerHost({
+    this.#smartRouting = options.smartRouting;
+    const transportArgs = options.appServer?.transport?.args ?? ["app-server", "--stdio"];
+    const ownedHostOptions: AppServerHostOptions = {
       ...options.appServer,
       transport: {
         ...options.appServer?.transport,
+        args: [...transportArgs],
         ...(options.managedProviders === undefined ? {} : { managedEnvironment: options.managedProviders.environment })
       }
-    });
+    };
+    this.#host = options.host ?? new AppServerHost(ownedHostOptions);
     this.#ownsHost = options.host === undefined;
+    this.#ownedHostOptions = options.host === undefined ? ownedHostOptions : undefined;
+    this.#smartRoutingUnavailableReason = options.smartRouting?.unavailableReason
+      ?? "Smart subagent routing is not configured on this Orchestrator node.";
+    this.#smartRoutingRuntimeRevision = options.smartRouting?.revision ?? "unconfigured";
     this.#resolvers = {
       ...(options.readBlob === undefined ? {} : { readBlob: options.readBlob }),
       ...(options.resolveFile === undefined ? {} : { resolveFile: options.resolveFile }),
@@ -523,7 +550,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   async describe(): Promise<BackendDescriptor> {
     this.#assertOpen();
     try {
-      await this.#host.ensureStarted();
+      await this.#ensureLocalHostStarted();
     } catch (error) {
       const notInstalled = error instanceof TransportFault && error.code === "spawn_failed";
       return this.#descriptor({
@@ -572,6 +599,159 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     });
   }
 
+  /**
+   * Smart-routing flags are process-wide. Probe the executable without them,
+   * then install them only after the exact audited app-server has identified
+   * itself. No product Session can receive the provisional host.
+   */
+  async #ensureLocalHostStarted(): Promise<number> {
+    this.#assertOpen();
+    if (this.#smartRoutingHostReady) return await this.#host.ensureStarted();
+    if (this.#smartRoutingHostFlight !== undefined) return await this.#smartRoutingHostFlight;
+    const flight = this.#configureSmartRoutingHost().then((generation) => {
+      this.#smartRoutingHostReady = true;
+      return generation;
+    });
+    this.#smartRoutingHostFlight = flight;
+    try {
+      return await flight;
+    } finally {
+      if (this.#smartRoutingHostFlight === flight) this.#smartRoutingHostFlight = undefined;
+    }
+  }
+
+  async #configureSmartRoutingHost(): Promise<number> {
+    const baseHost = this.#host;
+    const baseGeneration = await baseHost.ensureStarted();
+    this.#assertOpen();
+    const preparation = this.#smartRouting;
+    if (preparation?.applied !== true) {
+      this.#smartRoutingApplied = false;
+      this.#smartRoutingUnavailableReason = preparation?.unavailableReason
+        ?? "Smart subagent routing is not configured on this Orchestrator node.";
+      return baseGeneration;
+    }
+    if (!supportsNativeCollaboration(baseHost.initializeResult?.userAgent)) {
+      this.#smartRoutingApplied = false;
+      this.#smartRoutingUnavailableReason = unsupportedSmartRoutingRuntime(baseHost.initializeResult?.userAgent);
+      return baseGeneration;
+    }
+    let generation: Pick<CodexSmartRoutingGeneration, "revision" | "routes" | "nativeRoutes" | "launchArgs"> = preparation;
+    const nativeAccountAvailable = await this.#probeNativeAccountAvailability(baseHost);
+    if (!nativeAccountAvailable) {
+      if (preparation.managedOnly === undefined) {
+        this.#smartRoutingApplied = false;
+        this.#smartRoutingRoutes = [];
+        this.#smartRoutingRuntimeRevision = preparation.managedOnlyInspection?.revision ?? preparation.revision;
+        this.#smartRoutingUnavailableReason = "The current Codex native account is unavailable and no authorized managed smart-routing candidate remains.";
+        return baseGeneration;
+      }
+      generation = preparation.managedOnly;
+    }
+    this.#smartRoutingRoutes = [
+      ...generation.routes,
+      ...(nativeAccountAvailable ? generation.nativeRoutes : [])
+    ];
+    this.#smartRoutingRuntimeRevision = generation.revision;
+    if (!this.#ownsHost) {
+      // An injected host is caller-owned; the caller also owns its launch
+      // contract. The exact handshake is still required before route use.
+      this.#smartRoutingApplied = true;
+      this.#smartRoutingUnavailableReason = "";
+      return baseGeneration;
+    }
+
+    const ownedOptions = this.#ownedHostOptions;
+    if (ownedOptions === undefined) throw new TransportFault("closed", "The Codex app-server launch owner is unavailable.");
+    await baseHost.shutdown();
+    this.#assertOpen();
+    const smartHost = new AppServerHost({
+      ...ownedOptions,
+      transport: {
+        ...ownedOptions.transport,
+        args: [...(ownedOptions.transport?.args ?? ["app-server", "--stdio"]), ...generation.launchArgs]
+      }
+    });
+    this.#host = smartHost;
+    let smartFailureReason: string | undefined;
+    try {
+      const smartGeneration = await smartHost.ensureStarted();
+      this.#assertOpen();
+      if (supportsNativeCollaboration(smartHost.initializeResult?.userAgent)) {
+        this.#smartRoutingApplied = true;
+        this.#smartRoutingUnavailableReason = "";
+        return smartGeneration;
+      }
+      smartFailureReason = unsupportedSmartRoutingRuntime(smartHost.initializeResult?.userAgent);
+    } catch (error) {
+      if (this.#disposed) throw error;
+      smartFailureReason = "The audited Codex smart-routing process generation could not be started; native routing remains active.";
+    }
+
+    await smartHost.forceShutdown().catch(() => undefined);
+    this.#assertOpen();
+    const fallbackHost = new AppServerHost(ownedOptions);
+    this.#host = fallbackHost;
+    const fallbackGeneration = await fallbackHost.ensureStarted();
+    this.#assertOpen();
+    this.#smartRoutingApplied = false;
+    this.#smartRoutingUnavailableReason = smartFailureReason;
+    return fallbackGeneration;
+  }
+
+  async #probeNativeAccountAvailability(host: AppServerHost): Promise<boolean> {
+    try {
+      const response = await host.request("account/read", { refreshToken: false });
+      const record = objectValue(response.value, "account read result");
+      const snapshot = accountSnapshot(record["account"], record["requiresOpenaiAuth"] === true);
+      this.#account = snapshot;
+      if (!codexAccountModelsAvailable(snapshot.authenticationState)) this.#models = [];
+      return codexAccountModelsAvailable(snapshot.authenticationState);
+    } catch {
+      this.#account = undefined;
+      this.#models = [];
+      return false;
+    }
+  }
+
+  subagentSmartRoutingState(): {
+    readonly desired: boolean;
+    readonly applied: boolean;
+    readonly unavailableReason: string;
+    readonly runtimeRevision: string;
+    readonly instanceGeneration: number;
+  } {
+    return {
+      desired: this.#smartRouting?.desired === true,
+      applied: this.#smartRoutingApplied,
+      unavailableReason: this.#smartRoutingUnavailableReason,
+      runtimeRevision: this.#smartRoutingRuntimeRevision,
+      instanceGeneration: this.#instanceGeneration
+    };
+  }
+
+  /** Re-read only the bounded, credential-free inputs that determine the next process generation. */
+  async inspectDesiredSubagentSmartRouting(desired: boolean): Promise<CodexSmartRoutingInspection> {
+    this.#assertOpen();
+    const inspected = await inspectCodexSmartRouting({
+      desired,
+      codexHome: this.#profileDirectory,
+      nativeProviderId: this.#providerId,
+      managedCandidates: this.#managedProviders?.listSmartRoutingCandidates?.() ?? [],
+      includeNativeCandidates: this.#account !== undefined
+        && codexAccountModelsAvailable(this.#account.authenticationState)
+    });
+    if (desired && this.#smartRoutingHostReady && this.#host.initializeResult !== undefined
+      && !supportsNativeCollaboration(this.#host.initializeResult.userAgent)) {
+      return {
+        revision: this.#smartRoutingRuntimeRevision,
+        candidateCount: 0,
+        unavailableReason: unsupportedSmartRoutingRuntime(this.#host.initializeResult.userAgent)
+      };
+    }
+    return inspected;
+  }
+
   async reconcileNativeMemory(): Promise<"immediate" | "next_session"> {
     if (this.#resolveNativeMemoryEnabled === undefined) return this.unsupported("memory.native");
     return this.#withNativeMemoryReconcile(async () => {
@@ -606,7 +786,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       }
       let hostGeneration: number;
       try {
-        hostGeneration = await this.#host.ensureStarted();
+        hostGeneration = await this.#ensureLocalHostStarted();
       } catch (error) {
         throw this.#requestFailure(error, "probe", "CODEX_NATIVE_MEMORY_STATUS_FAILED", false);
       }
@@ -668,7 +848,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     return this.#withNativeMemoryReconcile(async () => {
       this.#assertOpen();
       try {
-        await this.#host.ensureStarted();
+        await this.#ensureLocalHostStarted();
       } catch (error) {
         throw this.#requestFailure(error, "dispatch", "CODEX_NATIVE_MEMORY_RESET_FAILED", false);
       }
@@ -701,7 +881,11 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   }
 
   async validateTarget(target: TargetDescriptor): Promise<void> {
-    await this.#readScope(target);
+    // Registering a local Target validates only its path authority. A missing
+    // optional Codex executable must not prevent the Orchestrator from
+    // starting; the first runtime-bearing operation performs the audited
+    // smart-generation handshake and can retry after installation.
+    await this.#readScope(target, undefined, false);
   }
 
   async createSession(input: CreateNativeSessionInput, context: AdapterContext): Promise<NativeSessionBinding> {
@@ -784,11 +968,18 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             ...(runtimePolicy === "review_read_only" ? {} : permissionParams(input.permissionMode))
           }
         };
-    const managedRoute = await this.#prepareManagedRoute(input.providerId, input.modelId, context).catch(async (error) => {
+    const smartRoute = await this.#prepareSmartRoute(input.providerId, input.modelId, context).catch(async (error) => {
       if (reviewWorkingDirectory !== undefined) await removeReviewWorkingDirectory(reviewWorkingDirectory);
       throw error;
     });
-    const nativeConfiguration = this.#nativeRouteConfiguration(managedRoute);
+    const managedRoute = smartRoute === undefined
+      ? await this.#prepareManagedRoute(input.providerId, input.modelId, context).catch(async (error) => {
+          if (reviewWorkingDirectory !== undefined) await removeReviewWorkingDirectory(reviewWorkingDirectory);
+          throw error;
+        })
+      : undefined;
+    if (smartRoute !== undefined) (request.params as JsonObject)["modelProvider"] = smartRoute.modelProviderId;
+    const nativeConfiguration = this.#nativeRouteConfiguration(managedRoute, smartRoute);
     if (nativeConfiguration !== undefined) {
       const previousConfig = (request.params as JsonObject)["config"];
       Object.assign(request.params, { config: { ...(isJsonObject(previousConfig) ? previousConfig : {}), ...nativeConfiguration } });
@@ -803,6 +994,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     } catch (error) {
       if (reviewWorkingDirectory !== undefined) await removeReviewWorkingDirectory(reviewWorkingDirectory);
       managedRoute?.dispose();
+      smartRoute?.dispose();
       throw this.#requestFailure(error, "provision", "CODEX_SESSION_CREATE_FAILED", true);
     }
     let thread: NativeThread;
@@ -822,6 +1014,15 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       }
       record = objectValue(response.value, "session response");
       this.#assertManagedRouteResponse(record, managedRoute);
+      const observedModelId = optionalString(record["model"]) ?? input.modelId;
+      if (smartRoute !== undefined) {
+        if (record["modelProvider"] !== smartRoute.modelProviderId || observedModelId === undefined) throw smartRouteUnavailable(true);
+        smartRoute.bindRoot({
+          threadId: thread.id,
+          providerId: input.providerId ?? this.#providerId,
+          modelId: observedModelId
+        });
+      }
       if (runtimePolicy === "review_read_only") {
         if (reviewWorkingDirectory === undefined) throw invalidReviewProfile();
         assertReviewThreadStarted(record, thread, cwd, reviewWorkingDirectory);
@@ -835,8 +1036,11 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         hostGeneration: response.hostGeneration,
         permissionMode: input.permissionMode,
         managedRoute,
-        providerId: optionalString(record["modelProvider"]) ?? input.providerId,
-        modelId: optionalString(record["model"]) ?? input.modelId,
+        smartRoute,
+        providerId: smartRoute === undefined
+          ? optionalString(record["modelProvider"]) ?? input.providerId
+          : input.providerId ?? this.#providerId,
+        modelId: observedModelId,
         effort: input.effort ?? optionalString(record["reasoningEffort"]) ?? optionalString(record["effort"]),
         fastMode: Object.hasOwn(record, "serviceTier")
           ? isFastServiceTier(record["serviceTier"])
@@ -847,6 +1051,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       });
     } catch (error) {
       managedRoute?.dispose();
+      smartRoute?.dispose();
       if (reviewWorkingDirectory !== undefined) await removeReviewWorkingDirectory(reviewWorkingDirectory);
       throw error;
     }
@@ -894,13 +1099,22 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       return stateFromRuntime(current);
     }
     await this.#prepareNativeMemory(inspection.scope, "standard", context.signal);
-    const managedRoute = inspection.scope.remote
+    const smartRoute = inspection.scope.remote
+      ? undefined
+      : await this.#prepareSmartRoute(context.modelSelection?.providerId, context.modelSelection?.modelId, context);
+    const managedRoute = inspection.scope.remote || smartRoute !== undefined
       ? undefined
       : await this.#prepareManagedRoute(context.modelSelection?.providerId, context.modelSelection?.modelId, context);
-    if (managedRoute !== undefined) {
-      if (inspection.thread.status?.["type"] === "active") { managedRoute.dispose(); throw managedRouteUnavailable(true); }
+    if (managedRoute !== undefined || smartRoute !== undefined) {
+      if (inspection.thread.status?.["type"] === "active") {
+        managedRoute?.dispose(); smartRoute?.dispose();
+        throw smartRoute === undefined ? managedRouteUnavailable(true) : smartRouteUnavailable(true);
+      }
       try { await inspection.scope.host.releaseUnboundThread(threadId, inspection.hostGeneration); }
-      catch { managedRoute.dispose(); throw managedRouteUnavailable(true); }
+      catch {
+        managedRoute?.dispose(); smartRoute?.dispose();
+        throw smartRoute === undefined ? managedRouteUnavailable(true) : smartRouteUnavailable(true);
+      }
     }
     let remoteMcp: CodexRemoteMcpRuntimeLease | undefined;
     let nativeConfiguration: JsonObject | undefined;
@@ -942,9 +1156,11 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       inspection.hostGeneration,
       inspection.scope.remote ? undefined : context.modelSelection,
       managedRoute,
-      nativeConfiguration
+      nativeConfiguration,
+      smartRoute
     ).catch(async (error) => {
       managedRoute?.dispose();
+      smartRoute?.dispose();
       await remoteMcp?.release().catch(() => undefined);
       throw this.#nativeThreadResumeFailure(error);
     });
@@ -970,6 +1186,15 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       }
       const normalized = bindingForThread(thread.id, context.generation, inspection.profileKey);
       const record = objectValue(response.value, "resume response");
+      const observedModelId = optionalString(record["model"]) ?? context.modelSelection?.modelId;
+      if (smartRoute !== undefined) {
+        if (record["modelProvider"] !== smartRoute.modelProviderId || observedModelId === undefined) throw smartRouteUnavailable(true);
+        smartRoute.bindRoot({
+          threadId: thread.id,
+          providerId: context.modelSelection?.providerId ?? this.#providerId,
+          modelId: observedModelId
+        });
+      }
       const runtime = await this.#installRuntime({
         scope: inspection.scope,
         thread,
@@ -978,10 +1203,13 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         hostGeneration: response.hostGeneration,
         permissionMode: permissionModeFromResponse(record),
         managedRoute,
+        smartRoute,
         remoteMcp,
         nativeConfiguration,
-        providerId: optionalString(record["modelProvider"]),
-        modelId: optionalString(record["model"]),
+        providerId: smartRoute === undefined
+          ? optionalString(record["modelProvider"])
+          : context.modelSelection?.providerId ?? this.#providerId,
+        modelId: observedModelId,
         effort: optionalString(record["reasoningEffort"]) ?? optionalString(record["effort"]),
         fastMode: isFastServiceTier(record["serviceTier"]),
         observedFastMode: observedFastServiceTier(record),
@@ -990,6 +1218,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       return stateFromRuntime(runtime);
     } catch (error) {
       managedRoute?.dispose();
+      smartRoute?.dispose();
       await remoteMcp?.release().catch(() => undefined);
       throw error;
     }
@@ -1256,7 +1485,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         recovery: "Keep the input and explicitly send it as a new prompt after refreshing the task."
       });
     }
-    if (input.disposition !== "steer" && runtime.managedRoute !== undefined) {
+    if (input.disposition !== "steer" && runtime.smartRoute !== undefined) {
+      try { runtime.smartRoute.assertCurrent(); }
+      catch { throw smartRouteUnavailable(); }
+    } else if (input.disposition !== "steer" && runtime.managedRoute !== undefined) {
       try { runtime.managedRoute.assertCurrent(); }
       catch {
         runtime = await this.#switchNativeRoute(runtime, runtime.managedRoute.providerId, runtime.managedRoute.model.modelId, context);
@@ -1733,7 +1965,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     }
     if (runtime.remote && providerId !== this.#providerId) throw managedRouteUnavailable();
     if (!runtime.remote
-      && (runtime.providerId !== providerId || runtime.managedRoute !== undefined || this.#managedProviders?.hasProvider(providerId))) {
+      && (runtime.providerId !== providerId || runtime.managedRoute !== undefined || runtime.smartRoute !== undefined
+        || this.#managedProviders?.hasProvider(providerId))) {
       runtime = await this.#switchNativeRoute(runtime, providerId, modelId, context);
     }
     const nextEffort = runtime.effort !== undefined && model.thinkingLevels.includes(runtime.effort)
@@ -1902,6 +2135,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
 
   async readAccount(refreshToken = false): Promise<CodexAccountSnapshot> {
     try {
+      await this.#ensureLocalHostStarted();
       const response = await this.#host.request("account/read", { refreshToken });
       const record = objectValue(response.value, "account read result");
       const account = record["account"];
@@ -1927,6 +2161,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         recovery: "Refresh the Backend Provider catalog before reading account usage."
       });
     }
+    await this.#ensureLocalHostStarted();
     const response = await this.#host.request("account/rateLimits/read", undefined, { signal });
     return {
       providerId: this.#providerId,
@@ -1935,6 +2170,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   }
 
   async beginLogin(input: CodexLoginInput): Promise<CodexLoginResult> {
+    await this.#ensureLocalHostStarted();
     const params: JsonObject = input.method === "api_key"
       ? { type: "apiKey", apiKey: input.apiKey }
       : input.method === "oauth_browser"
@@ -1980,11 +2216,13 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         recovery: "Start a new native login flow."
       });
     }
+    await this.#ensureLocalHostStarted();
     await this.#host.request("account/login/cancel", { loginId }, { mutation: true });
     await this.readAccount(true).catch(() => { this.#account = undefined; });
   }
 
   async logout(): Promise<void> {
+    await this.#ensureLocalHostStarted();
     await this.#host.request("account/logout", undefined, { mutation: true });
     this.#account = accountSnapshot(null, true);
     this.#models = [];
@@ -1992,6 +2230,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
 
   async listModels(): Promise<readonly ProviderModel[]> {
     this.#assertOpen();
+    await this.#ensureLocalHostStarted();
     const account = this.#account ?? await this.readAccount();
     if (!codexAccountModelsAvailable(account.authenticationState)) {
       this.#models = this.#withManagedModels([]);
@@ -2040,7 +2279,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     if (this.#disposed) return Promise.resolve();
     this.#disposed = true;
     this.#managedProviders?.dispose();
-    const flight = this.#disposeRuntimes();
+    const flight = this.#disposeRuntimes().finally(() => this.#smartRouting?.cleanup());
     this.#disposeFlight = flight;
     return flight;
   }
@@ -2049,7 +2288,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     if (this.#forceDisposeFlight !== undefined) return this.#forceDisposeFlight;
     this.#disposed = true;
     this.#managedProviders?.dispose();
-    const flight = this.#forceDisposeRuntimes();
+    const flight = this.#forceDisposeRuntimes().finally(() => this.#smartRouting?.cleanup());
     this.#forceDisposeFlight = flight;
     return flight;
   }
@@ -2123,10 +2362,11 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     expectedHostGeneration: number,
     selection?: { readonly providerId: string; readonly modelId: string },
     managedRoute?: ManagedProviderRouteBinding,
-    nativeConfiguration?: JsonObject
+    nativeConfiguration?: JsonObject,
+    smartRoute?: ManagedProviderSmartRoutingBinding
   ) {
     scope.assertCurrent();
-    const managedConfiguration = this.#nativeRouteConfiguration(managedRoute);
+    const managedConfiguration = this.#nativeRouteConfiguration(managedRoute, smartRoute);
     const configuration = managedConfiguration === undefined && nativeConfiguration === undefined
       ? undefined
       : { ...managedConfiguration, ...nativeConfiguration };
@@ -2134,7 +2374,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       threadId,
       cwd: workspaceRoot,
       excludeTurns: true,
-      ...(selection === undefined ? {} : { modelProvider: selection.providerId, model: selection.modelId }),
+      ...(selection === undefined
+        ? smartRoute === undefined ? {} : { modelProvider: smartRoute.modelProviderId }
+        : { modelProvider: smartRoute?.modelProviderId ?? selection.providerId, model: selection.modelId }),
       ...(configuration === undefined ? {} : { config: configuration })
     }, { mutation: false, beforeDispatch: scope.assertCurrent });
     scope.assertCurrent();
@@ -2154,7 +2396,11 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     return response;
   }
 
-  async #readScope(target: TargetDescriptor, signal?: AbortSignal): Promise<CodexReadScope> {
+  async #readScope(
+    target: TargetDescriptor,
+    signal?: AbortSignal,
+    startLocalHost = true
+  ): Promise<CodexReadScope> {
     this.#assertOpen();
     if (target.backendId !== this.id) {
       throw adapterError({
@@ -2183,6 +2429,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           recovery: "Restore the Target workspace and retry."
         });
       }
+      if (startLocalHost) await this.#ensureLocalHostStarted();
       return {
         host: this.#host,
         workspaceRoot: await realpath(target.workspaceRoot),
@@ -2361,6 +2608,54 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     return [...models.filter((model) => model.providerId === this.#providerId), ...managed];
   }
 
+  async #prepareSmartRoute(
+    providerId: string | undefined,
+    modelId: string | undefined,
+    context: AdapterContext
+  ): Promise<ManagedProviderSmartRoutingBinding | undefined> {
+    const smartRouting = this.#smartRouting;
+    if (!this.#smartRoutingApplied || smartRouting === undefined
+      || !supportsNativeCollaboration(this.#host.initializeResult?.userAgent)
+      || context.target.remoteWorkspace !== undefined
+      || context.runtimePolicy === "review_read_only") return undefined;
+    const prepare = this.#managedProviders?.prepareSmartRouting;
+    if (prepare === undefined || this.#smartRoutingRoutes.length === 0) throw smartRouteUnavailable();
+    if ((providerId === undefined) !== (modelId === undefined)) throw smartRouteUnavailable();
+    const route = await prepare({
+      backendId: this.id,
+      backendInstanceGeneration: this.#instanceGeneration,
+      targetId: context.target.id,
+      sessionId: context.sessionId,
+      sessionGeneration: context.generation,
+      nativeProviderId: this.#providerId,
+      ...(providerId === undefined ? {} : { rootProviderId: providerId }),
+      ...(modelId === undefined ? {} : { rootModelId: modelId }),
+      routes: this.#smartRoutingRoutes,
+      revision: this.#smartRoutingRuntimeRevision
+    });
+    try {
+      this.#assertBackendContext(context);
+      assertDispatchNotCancelled(context.signal);
+      if (route.revision !== this.#smartRoutingRuntimeRevision
+        || route.routes.length !== this.#smartRoutingRoutes.length
+        || route.routes.some((candidate, index) => {
+          const expected = this.#smartRoutingRoutes[index];
+          return expected === undefined
+            || candidate.providerId !== expected.providerId
+            || candidate.modelId !== expected.modelId
+            || candidate.revision !== expected.revision
+            || candidate.native !== expected.native;
+        })) {
+        throw smartRouteUnavailable();
+      }
+      route.assertCurrent();
+      return route;
+    } catch (error) {
+      route.dispose();
+      throw error;
+    }
+  }
+
   async #prepareManagedRoute(providerId: string | undefined, modelId: string | undefined, context: AdapterContext): Promise<ManagedProviderRouteBinding | undefined> {
     if (providerId === undefined) return undefined;
     if (!this.#managedProviders?.hasProvider(providerId)) {
@@ -2389,10 +2684,25 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     }
   }
 
-  #nativeRouteConfiguration(route?: ManagedProviderRouteBinding): JsonObject | undefined {
+  #nativeRouteConfiguration(
+    route?: ManagedProviderRouteBinding,
+    smartRoute?: ManagedProviderSmartRoutingBinding
+  ): JsonObject | undefined {
     if (this.#managedProviders === undefined) return undefined;
     return {
       "shell_environment_policy.exclude": [...this.#managedProviders.secretEnvironmentNames],
+      ...(smartRoute === undefined ? {} : {
+        model_providers: { [smartRoute.modelProviderId]: {
+          name: smartRoute.modelProviderId,
+          base_url: smartRoute.baseUrl,
+          wire_api: "responses",
+          requires_openai_auth: true,
+          env_http_headers: { "x-joko-provider-proxy-token": smartRoute.proxyTokenEnvironment },
+          supports_websockets: false,
+          request_max_retries: 0,
+          stream_max_retries: 0
+        } }
+      }),
       ...(route === undefined ? {} : {
         model_providers: { [route.providerId]: {
           name: route.providerId,
@@ -2570,23 +2880,24 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
 
   async #activateManagedOperation(runtime: SessionRuntime, context: AdapterContext): Promise<void> {
     if (runtime.routeUnknown) throw managedRouteUnavailable(true);
-    const route = runtime.managedRoute;
+    const route = runtime.smartRoute ?? runtime.managedRoute;
+    const unavailable = () => runtime.smartRoute === undefined ? managedRouteUnavailable() : smartRouteUnavailable();
     if (runtime.remote) {
-      if (route !== undefined) throw managedRouteUnavailable();
+      if (route !== undefined) throw unavailable();
       return;
     }
     if (route === undefined) {
       if (runtime.providerId !== undefined && this.#managedProviders?.hasProvider(runtime.providerId)) throw managedRouteUnavailable();
       return;
     }
-    if (runtime.managedOperation !== undefined || context.operationId === undefined) throw managedRouteUnavailable();
+    if (runtime.managedOperation !== undefined || context.operationId === undefined) throw unavailable();
     route.assertCurrent();
     const operation: NonNullable<SessionRuntime["managedOperation"]> = { id: context.operationId };
     runtime.managedOperation = operation;
     const signal = AbortSignal.any([context.signal, runtime.dispatchLifetime.signal]);
     const assertCurrent = () => {
       assertDispatchNotCancelled(signal);
-      if (runtime.managedOperation !== operation || !this.#isRuntimeCurrent(runtime, runtime.hostGeneration)) throw managedRouteUnavailable();
+      if (runtime.managedOperation !== operation || !this.#isRuntimeCurrent(runtime, runtime.hostGeneration)) throw unavailable();
     };
     try {
       const lease = await route.activate({ operationId: operation.id, signal, assertCurrent });
@@ -2604,9 +2915,16 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     operation?.lease?.release();
   }
 
+  #maybeReleaseManagedOperation(runtime: SessionRuntime): void {
+    if (runtime.smartRoute !== undefined
+      && (runtime.state.activeTurnId !== undefined || runtime.nativeTasks.hasActiveTasks())) return;
+    this.#releaseManagedOperation(runtime);
+  }
+
   async #switchNativeRoute(runtime: SessionRuntime, providerId: string, modelId: string, context: AdapterContext): Promise<SessionRuntime> {
     if (runtime.state.activeTurnId !== undefined || runtime.compaction !== undefined || runtime.nativeTasks.hasActiveTasks()) throw managedRouteUnavailable();
-    const route = await this.#prepareManagedRoute(providerId, modelId, context);
+    const smartRoute = await this.#prepareSmartRoute(providerId, modelId, context);
+    const route = smartRoute === undefined ? await this.#prepareManagedRoute(providerId, modelId, context) : undefined;
     const generation = runtime.hostGeneration;
     const assertCurrent = () => {
       assertDispatchNotCancelled(context.signal);
@@ -2625,15 +2943,22 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         runtime.targetWorkspaceRoot,
         generation,
         { providerId, modelId },
-        route
+        route,
+        undefined,
+        smartRoute
       );
       assertCurrent();
       const record = objectValue(response.value, "route resume response");
-      if (record["modelProvider"] !== providerId || record["model"] !== modelId) throw managedRouteUnavailable(true);
+      if (smartRoute === undefined) {
+        if (record["modelProvider"] !== providerId || record["model"] !== modelId) throw managedRouteUnavailable(true);
+      } else {
+        if (record["modelProvider"] !== smartRoute.modelProviderId || record["model"] !== modelId) throw smartRouteUnavailable(true);
+        smartRoute.bindRoot({ threadId: runtime.threadId, providerId, modelId });
+      }
       const next = await this.#installRuntime({
         scope: this.#scopeForRuntime(runtime),
         thread: parseThreadResult(response.value), binding: runtime.binding, context, hostGeneration: generation,
-        permissionMode: runtime.permissionMode, providerId, modelId, managedRoute: route,
+        permissionMode: runtime.permissionMode, providerId, modelId, managedRoute: route, smartRoute,
         effort: runtime.effort, fastMode: runtime.fastMode, name: runtime.name
       });
       next.planMode = runtime.planMode;
@@ -2642,8 +2967,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       return next;
     } catch (error) {
       route?.dispose();
+      smartRoute?.dispose();
       runtime.routeUnknown = true;
-      throw managedRouteUnavailable(true);
+      throw smartRoute === undefined ? managedRouteUnavailable(true) : smartRouteUnavailable(true);
     }
   }
 
@@ -2771,7 +3097,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   }
 
   async #buildReviewThreadProfile(cwd: string, reviewWorkingDirectory: string): Promise<JsonObject> {
-    await this.#host.ensureStarted();
+    await this.#ensureLocalHostStarted();
     if (!supportsIsolatedReview(this.#host.initializeResult?.userAgent)) {
       throw reviewRuntimeUnsupported(this.#host.initializeResult?.userAgent);
     }
@@ -2888,6 +3214,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   async #installRuntime(input: {
     readonly scope: CodexReadScope;
     readonly managedRoute?: ManagedProviderRouteBinding | undefined;
+    readonly smartRoute?: ManagedProviderSmartRoutingBinding | undefined;
     readonly remoteMcp?: CodexRemoteMcpRuntimeLease | undefined;
     readonly nativeConfiguration?: JsonObject | undefined;
     readonly thread: NativeThread;
@@ -2904,7 +3231,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     readonly reviewWorkingDirectory?: string;
   }): Promise<SessionRuntime> {
     input.scope.assertCurrent();
-    if (input.scope.remote && (input.managedRoute !== undefined || input.reviewWorkingDirectory !== undefined)) {
+    if (input.scope.remote && (input.managedRoute !== undefined || input.smartRoute !== undefined
+      || input.reviewWorkingDirectory !== undefined)) {
       throw remoteMutationUnsupported("apply a local Provider or Review runtime profile");
     }
     if (!input.scope.remote && (input.remoteMcp !== undefined || input.nativeConfiguration !== undefined)) {
@@ -2964,6 +3292,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const seededDescendants = input.context.runtimePolicy === "review_read_only"
       ? []
       : nativeTasks.seed(input.thread);
+    // Historical descendants populate the product projection only. Provider
+    // authority is registered from live notifications or the first exact
+    // collab_spawn request while an operation lease is active.
     const nativeMemoryDirectory = input.context.runtimePolicy === "review_read_only"
       || !supportsNativeMemoryRuntime(input.scope.host)
       ? undefined
@@ -2974,6 +3305,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       remote: input.scope.remote,
       assertExecutionCurrent: input.scope.assertAuthorityCurrent,
       managedRoute: input.managedRoute,
+      smartRoute: input.smartRoute,
       managedOperation: undefined,
       routeUnknown: false,
       sessionId: input.context.sessionId,
@@ -3022,45 +3354,56 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             return;
           }
           if (!this.#acceptTurnNotification(runtime, method, params)) return;
-          if (method === "turn/completed") this.#releaseManagedOperation(runtime);
-          const completedPlan = runtime.runtimePolicy === "standard"
-            ? observePlanReviewNotification(runtime, method, params)
-            : undefined;
-          const planTurnId = method === "item/plan/delta" ? turnIdFromParams(params) : undefined;
-          const events = planTurnId !== undefined && runtime.planTurnIds.has(planTurnId)
-            ? []
-            : this.#translator.translate(method, params, runtime.state);
-          for (const event of events) {
-            if (!this.#isRuntimeCurrent(runtime, input.hostGeneration)) return;
-            await runtime.context.emit(event, {
-              namespace: "codex.app_server",
-              fields: { method }
-            });
-          }
-          reconcileRuntimeSettings(runtime, method, params);
-          if (runtime.runtimePolicy === "standard") {
-            await this.#applyNativeTaskEffects(
-              runtime,
-              runtime.nativeTasks.observeRootNotification(method, params),
-              input.hostGeneration,
-              method,
-              false
-            );
-          }
-          const compaction = compactionTerminal(method, params);
-          if (compaction === "completed") this.#settleCompaction(runtime);
-          if (compaction === "failed") {
-            this.#settleCompaction(runtime, adapterError({
-              code: "CODEX_COMPACTION_FAILED",
-              message: "The Codex native compaction did not complete.",
-              phase: "stream",
-              stateMayHaveChanged: true,
-              recovery: "Inspect the native thread before retrying compaction."
-            }));
-          }
-          if (completedPlan !== undefined && events.some((event) =>
-            event.type === "done" && event.outcome === "completed")) {
-            this.#schedulePlanReview(runtime, completedPlan, completedPlan.context, input.hostGeneration);
+          if (method === "turn/completed" && runtime.smartRoute === undefined) this.#releaseManagedOperation(runtime);
+          try {
+            const nativeTaskEffects = runtime.runtimePolicy === "standard"
+              ? runtime.nativeTasks.observeRootNotification(method, params)
+              : undefined;
+            if (nativeTaskEffects !== undefined) {
+              await this.#registerNativeTaskLineages(runtime, nativeTaskEffects, input.hostGeneration);
+            }
+            const completedPlan = runtime.runtimePolicy === "standard"
+              ? observePlanReviewNotification(runtime, method, params)
+              : undefined;
+            const planTurnId = method === "item/plan/delta" ? turnIdFromParams(params) : undefined;
+            const events = planTurnId !== undefined && runtime.planTurnIds.has(planTurnId)
+              ? []
+              : this.#translator.translate(method, params, runtime.state);
+            for (const event of events) {
+              if (!this.#isRuntimeCurrent(runtime, input.hostGeneration)) return;
+              await runtime.context.emit(event, {
+                namespace: "codex.app_server",
+                fields: { method }
+              });
+            }
+            reconcileRuntimeSettings(runtime, method, params);
+            if (nativeTaskEffects !== undefined) {
+              await this.#emitNativeTaskPayloads(
+                runtime,
+                nativeTaskEffects.emissions,
+                input.hostGeneration,
+                method,
+                false,
+                true
+              );
+            }
+            const compaction = compactionTerminal(method, params);
+            if (compaction === "completed") this.#settleCompaction(runtime);
+            if (compaction === "failed") {
+              this.#settleCompaction(runtime, adapterError({
+                code: "CODEX_COMPACTION_FAILED",
+                message: "The Codex native compaction did not complete.",
+                phase: "stream",
+                stateMayHaveChanged: true,
+                recovery: "Inspect the native thread before retrying compaction."
+              }));
+            }
+            if (completedPlan !== undefined && events.some((event) =>
+              event.type === "done" && event.outcome === "completed")) {
+              this.#schedulePlanReview(runtime, completedPlan, completedPlan.context, input.hostGeneration);
+            }
+          } finally {
+            if (method === "turn/completed") this.#maybeReleaseManagedOperation(runtime);
           }
         },
         onDescendantThreadStarted: async (params) => {
@@ -3079,21 +3422,26 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             this.#resolvePendingServerRequest(runtime, params);
             return;
           }
-          const turnId = turnIdFromParams(params);
-          if (method === "turn/completed" && turnId !== undefined) {
-            this.#cancelPendingServerRequests(
+          try {
+            const turnId = turnIdFromParams(params);
+            if (method === "turn/completed" && turnId !== undefined) {
+              this.#cancelPendingServerRequests(
+                runtime,
+                (pending) => pending.threadId === threadId && pending.turnId === turnId
+              );
+              this.#cancelPendingRemoteMcpCalls(runtime, (pending) => pending.threadId === threadId);
+            }
+            await this.#applyNativeTaskEffects(
               runtime,
-              (pending) => pending.threadId === threadId && pending.turnId === turnId
+              runtime.nativeTasks.observeDescendantNotification(threadId, method, params),
+              input.hostGeneration,
+              method,
+              true
             );
-            this.#cancelPendingRemoteMcpCalls(runtime, (pending) => pending.threadId === threadId);
+          } finally {
+            if (method === "turn/completed") runtime.smartRoute?.completeDescendant(threadId);
+            this.#maybeReleaseManagedOperation(runtime);
           }
-          await this.#applyNativeTaskEffects(
-            runtime,
-            runtime.nativeTasks.observeDescendantNotification(threadId, method, params),
-            input.hostGeneration,
-            method,
-            true
-          );
         },
         onRequest: async (requestId, method, params) => {
           if (!this.#isRuntimeCurrent(runtime, input.hostGeneration)) return undefined;
@@ -3166,6 +3514,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           if (!this.#matchesCallbackFence(runtime, input.hostGeneration) || runtime.disconnectTerminalEmitted) return;
           runtime.dispatchLifetime.abort();
           runtime.managedRoute?.dispose();
+          runtime.managedRoute = undefined;
+          runtime.smartRoute?.dispose();
+          runtime.smartRoute = undefined;
           runtime.disconnectTerminalEmitted = true;
           this.#cancelPendingServerRequests(runtime);
           runtime.state.activeTurnId = undefined;
@@ -3317,6 +3668,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     method: string,
     descendant: boolean
   ): Promise<void> {
+    await this.#registerNativeTaskLineages(runtime, effects, hostGeneration);
     await this.#emitNativeTaskPayloads(
       runtime,
       effects.emissions,
@@ -3325,6 +3677,13 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       descendant,
       true
     );
+  }
+
+  async #registerNativeTaskLineages(
+    runtime: SessionRuntime,
+    effects: CodexNativeTaskEffects,
+    hostGeneration: number
+  ): Promise<void> {
     for (const lineage of effects.lineages) {
       if (!this.#isRuntimeCurrent(runtime, hostGeneration)) return;
       await runtime.host.registerDescendantThread(
@@ -3332,6 +3691,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         lineage.parentThreadId,
         hostGeneration
       );
+      runtime.smartRoute?.registerDescendant(lineage.childThreadId, lineage.parentThreadId);
     }
   }
 
@@ -3417,6 +3777,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   async #releaseRuntimeSubscription(runtime: SessionRuntime, unsubscribe: boolean): Promise<void> {
     this.#releaseManagedOperation(runtime);
     runtime.managedRoute?.dispose();
+    runtime.smartRoute?.dispose();
     this.#cancelPendingRemoteMcpCalls(runtime);
     await runtime.remoteMcp?.release().catch(() => undefined);
     runtime.planReview?.abort.abort();
@@ -3854,6 +4215,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       supported.add("subagents.list");
       supported.add("subagents.detail");
       supported.add("subagents.transcript");
+      if (this.#smartRouting !== undefined && this.#managedProviders?.prepareSmartRouting !== undefined) {
+        supported.add("subagents.smart_routing");
+      }
     }
     for (const capability of this.#hostCapabilities) supported.add(capability);
     return new Map(CAPABILITIES.map((key): [string, Capability] => {
@@ -3874,7 +4238,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
               || key === "background.tasks"
               || key === "subagents.list"
               || key === "subagents.detail"
-              || key === "subagents.transcript")
+              || key === "subagents.transcript"
+              || key === "subagents.smart_routing")
               && !nativeCollaborationSupported
             ? { reason: "upstream_missing" as const }
           : !available && !implemented
@@ -4434,6 +4799,11 @@ function supportsIsolatedReview(userAgent: string | undefined): boolean {
 
 function supportsNativeCollaboration(userAgent: string | undefined): boolean {
   return matchesExactAppServerVersion(userAgent);
+}
+
+function unsupportedSmartRoutingRuntime(userAgent: string | undefined): string {
+  return `Smart subagent routing requires the audited Codex app-server ${AUDITED_APP_SERVER_VERSION}; `
+    + `the active runtime is ${versionFromUserAgent(userAgent)}.`;
 }
 
 function matchesExactAppServerVersion(userAgent: string | undefined): boolean {
@@ -5265,6 +5635,19 @@ function equalNativePaths(left: string, right: string): boolean {
   return process.platform === "win32"
     ? normalizedLeft.toLocaleLowerCase("en-US") === normalizedRight.toLocaleLowerCase("en-US")
     : normalizedLeft === normalizedRight;
+}
+
+function smartRouteUnavailable(stateMayHaveChanged = false): JokoError {
+  return adapterError({
+    code: stateMayHaveChanged ? "CODEX_SMART_ROUTING_UNKNOWN" : "CODEX_SMART_ROUTING_UNAVAILABLE",
+    message: stateMayHaveChanged
+      ? "The Codex smart-subagent route could not be confirmed."
+      : "The exact Codex smart-subagent route is unavailable for this operation.",
+    phase: "dispatch",
+    retryable: false,
+    stateMayHaveChanged,
+    recovery: "Keep the input, refresh Backend settings, and retry only after the current runtime generation is available."
+  });
 }
 
 interface PendingRemoteMcpCall {

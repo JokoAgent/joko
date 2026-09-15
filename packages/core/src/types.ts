@@ -108,6 +108,7 @@ export const CAPABILITIES = [
   "background.tasks.cancel",
   "subagents.list",
   "subagents.default_model",
+  "subagents.smart_routing",
   "subagents.detail",
   "subagents.transcript",
   "subagents.stop",
@@ -394,6 +395,8 @@ export interface ProviderModel {
   readonly contextWindow: number;
   readonly maxOutputTokens: number;
   readonly supportsImages: boolean;
+  /** Explicit catalog denial used by tool-dependent routing; absence remains unknown. */
+  readonly supportsTools?: boolean;
   /** Catalog default only; clients may keep an owner-scoped visibility override. */
   readonly defaultVisible?: boolean;
   /** Explicit Backend support; absence is conservatively treated as false. */

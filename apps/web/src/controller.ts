@@ -2237,6 +2237,7 @@ export function useAppController(): AppController {
     updatePromptRecommendationSettings: (enabled) => gateway().updatePromptRecommendationSettings(enabled),
     updateAuxiliaryTextSettings,
     updateSubagentModelSettings: (backendId, model, expectedRevision) => gateway().updateSubagentModelSettings(backendId, model, expectedRevision),
+    updateSubagentSmartRouting: (backendId, enabled, expectedRevision) => gateway().updateSubagentSmartRouting(backendId, enabled, expectedRevision),
     resetPromptRecommendationSettings: () => gateway().resetPromptRecommendationSettings(),
     updateLanguageToolSettings: (enabled) => gateway().updateLanguageToolSettings(enabled),
     updateToolPolicySettings: (toolProviderId, targetId, patch) => gateway().updateToolPolicySettings(toolProviderId, targetId, patch),

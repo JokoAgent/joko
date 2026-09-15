@@ -25,6 +25,42 @@ export interface ManagedProviderSubtaskLease extends ManagedProviderOperationLea
   readonly thinkingLevelMap: Readonly<Record<string, string | null>>;
 }
 
+/** Credential-free exact candidate that may be exposed to a Codex v2 subagent catalog. */
+export interface ManagedProviderSmartRoutingCandidate {
+  readonly providerId: string;
+  readonly model: ProviderModel;
+  readonly protocol: ProviderRuntimeProtocol;
+  readonly revision: string;
+}
+
+export interface ManagedProviderSmartRoutingRoute {
+  readonly providerId: string;
+  readonly modelId: string;
+  readonly revision: string;
+  /** Native routes retain only the reviewed incoming Codex authentication headers at the proxy boundary. */
+  readonly native: boolean;
+}
+
+/** Per-product-Session route authority for Codex native multi-agent v2. */
+export interface ManagedProviderSmartRoutingBinding {
+  /** Private Codex Provider identity; never persisted as the product selection. */
+  readonly modelProviderId: string;
+  readonly baseUrl: string;
+  readonly proxyTokenEnvironment: string;
+  readonly revision: string;
+  readonly routes: readonly ManagedProviderSmartRoutingRoute[];
+  assertCurrent(): void;
+  bindRoot(input: { readonly threadId: string; readonly providerId: string; readonly modelId: string }): void;
+  registerDescendant(childThreadId: string, parentThreadId: string): void;
+  completeDescendant(threadId: string): void;
+  activate(input: {
+    readonly operationId: string;
+    readonly signal: AbortSignal;
+    readonly assertCurrent: () => void;
+  }): Promise<ManagedProviderOperationLease>;
+  dispose(): void;
+}
+
 /** A non-secret native configuration template; it cannot authorize HTTP requests. */
 export interface ManagedProviderRouteBinding {
   readonly providerId: string;
@@ -71,6 +107,8 @@ export interface ManagedProviderRuntimePort {
   dispose(): void;
   hasProvider(providerId: string): boolean;
   listModels(): readonly ProviderModel[];
+  /** Stable credential-free candidates; every revision is rechecked at request dispatch. */
+  readonly listSmartRoutingCandidates?: () => readonly ManagedProviderSmartRoutingCandidate[];
   /** Current catalog authority for one exact model; missing identities must fail. */
   getThinkingLevelMap(providerId: string, modelId: string): Readonly<Record<string, string | null>>;
   listProviders(): readonly BackendProviderDescriptor[];
@@ -79,4 +117,11 @@ export interface ManagedProviderRuntimePort {
     readonly providerId: string;
     readonly modelId: string;
   }): Promise<ManagedProviderRouteBinding>;
+  readonly prepareSmartRouting?: (input: ManagedProviderRouteOwner & {
+    readonly nativeProviderId: string;
+    readonly rootProviderId?: string;
+    readonly rootModelId?: string;
+    readonly routes: readonly ManagedProviderSmartRoutingRoute[];
+    readonly revision: string;
+  }) => Promise<ManagedProviderSmartRoutingBinding>;
 }

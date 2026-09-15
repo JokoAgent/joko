@@ -13,6 +13,7 @@ import type {
   NativeSessionBinding,
   ManagedProviderRuntimePort,
   ManagedProviderRouteBinding,
+  ManagedProviderSmartRoutingBinding,
   ProviderModel,
   TargetDescriptor
 } from "@joko/core";
@@ -25,6 +26,7 @@ import {
   type CodexRemoteMcpOpenInput,
   type CodexRemoteRuntime
 } from "./adapter.js";
+import type { CodexSmartRoutingPreparation } from "./smart-subagent-routing.js";
 import { AppServerHost } from "./host.js";
 import { TransportFault } from "./errors.js";
 import type { JsonObject } from "./protocol.js";
@@ -88,6 +90,304 @@ describe("CodexBackendAdapter", () => {
     expect(requests.filter((request) => request.method === "turn/start")).toHaveLength(2);
     await setup.adapter.dispose();
     expect(retired).toHaveBeenCalledOnce();
+  });
+
+  it("installs one smart route on the original thread and retains its operation through descendant completion", async () => {
+    const released = vi.fn();
+    const retired = vi.fn();
+    const routeDisposed = vi.fn();
+    const bindRoot = vi.fn<ManagedProviderSmartRoutingBinding["bindRoot"]>();
+    const registerDescendant = vi.fn<ManagedProviderSmartRoutingBinding["registerDescendant"]>();
+    const completeDescendant = vi.fn<ManagedProviderSmartRoutingBinding["completeDescendant"]>();
+    const operations: Parameters<ManagedProviderSmartRoutingBinding["activate"]>[0][] = [];
+    let routeCurrent = true;
+    const routes = [{ providerId: "custom", modelId: "worker-model", revision: "provider-a", native: false }] as const;
+    const nativeRoutes = [{ providerId: "openai", modelId: "gpt-5.6-sol", revision: "native-a", native: true }] as const;
+    const proxyRoutes = [...routes, ...nativeRoutes] as const;
+    let returnedRoutes: ManagedProviderSmartRoutingBinding["routes"] = proxyRoutes;
+    const prepareSmartRouting = vi.fn(async (
+      owner: Parameters<NonNullable<ManagedProviderRuntimePort["prepareSmartRouting"]>>[0]
+    ): Promise<ManagedProviderSmartRoutingBinding> => {
+      expect(owner).toMatchObject({
+        backendId: "codex-test",
+        backendInstanceGeneration: 7,
+        targetId: "target-codex",
+        sessionId: "session-codex",
+        sessionGeneration: 1,
+        nativeProviderId: "openai",
+        rootProviderId: "openai",
+        rootModelId: "gpt-test",
+        revision: "catalog-a",
+        routes: proxyRoutes
+      });
+      return {
+        modelProviderId: "joko-smart-fixture",
+        baseUrl: "http://127.0.0.1:1234/smart/fixture",
+        proxyTokenEnvironment: "JOKO_PROVIDER_PROXY_TOKEN",
+        revision: "catalog-a",
+        routes: returnedRoutes,
+        assertCurrent: () => { if (!routeCurrent) throw new Error("route changed"); },
+        bindRoot,
+        registerDescendant,
+        completeDescendant,
+        activate: async (operation) => {
+          operation.assertCurrent();
+          operations.push(operation);
+          return { release: released };
+        },
+        dispose: routeDisposed
+      };
+    });
+    const port: ManagedProviderRuntimePort = {
+      support: CODEX_MANAGED_PROVIDER_SUPPORT,
+      environment: { JOKO_PROVIDER_PROXY_TOKEN: "private-fixture-token" },
+      secretEnvironmentNames: ["JOKO_PROVIDER_PROXY_TOKEN"],
+      dispose: retired,
+      hasProvider: () => false,
+      listModels: () => [],
+      listProviders: () => [],
+      getThinkingLevelMap: () => ({}),
+      prepare: async () => { throw new Error("ordinary route must not be prepared"); },
+      prepareSmartRouting
+    };
+    const cleanup = vi.fn(async () => undefined);
+    const smartRouting: CodexSmartRoutingPreparation = {
+      desired: true,
+      applied: true,
+      revision: "catalog-a",
+      routes,
+      nativeRoutes,
+      launchArgs: ["-c", "fixture=true"],
+      catalogPath: "C:/private/catalog.json",
+      unavailableReason: "",
+      cleanup
+    };
+    const setup = await createSetup(7, { managedProviders: port, smartRouting });
+    const descriptor = await setup.adapter.describe();
+    expect(descriptor.capabilities.get("subagents.smart_routing")).toMatchObject({ supported: true });
+    returnedRoutes = [{ ...routes[0], modelId: "forged-worker-model" }];
+    await expect(setup.adapter.createSession(
+      sessionInput(setup.target),
+      context(setup.target, [], { backendInstanceGeneration: 7, operationId: "mismatched-smart-create" })
+    )).rejects.toMatchObject({ publicError: { code: "CODEX_SMART_ROUTING_UNAVAILABLE" } });
+    expect(setup.fake.transport!.requests.some((request) => request.method === "thread/start")).toBe(false);
+    returnedRoutes = proxyRoutes;
+    routeDisposed.mockClear();
+    const events: EventPayload[] = [];
+    let rejectProjection = false;
+    const emit: AdapterContext["emit"] = async (event) => {
+      events.push(event);
+      if (rejectProjection) throw new Error("fixture projection failure");
+    };
+    const createContext = {
+      ...context(setup.target, events, { backendInstanceGeneration: 7 }),
+      emit
+    };
+    const binding = await setup.adapter.createSession(
+      sessionInput(setup.target),
+      createContext
+    );
+    expect(bindRoot).toHaveBeenCalledExactlyOnceWith({
+      threadId: binding.nativeSessionId,
+      providerId: "openai",
+      modelId: "gpt-test"
+    });
+    const nativeStart = setup.fake.transport!.requests.find((request) => request.method === "thread/start")!;
+    expect(nativeStart.params).toMatchObject({
+      modelProvider: "joko-smart-fixture",
+      model: "gpt-test",
+      config: {
+        model_providers: {
+          "joko-smart-fixture": {
+            base_url: "http://127.0.0.1:1234/smart/fixture",
+            wire_api: "responses",
+            requires_openai_auth: true,
+            env_http_headers: { "x-joko-provider-proxy-token": "JOKO_PROVIDER_PROXY_TOKEN" },
+            supports_websockets: false,
+            request_max_retries: 0,
+            stream_max_retries: 0
+          }
+        },
+        "shell_environment_policy.exclude": ["JOKO_PROVIDER_PROXY_TOKEN"]
+      }
+    });
+    expect(JSON.stringify(nativeStart)).not.toContain("private-fixture-token");
+
+    const active = context(setup.target, events, {
+      binding,
+      backendInstanceGeneration: 7,
+      operationId: "smart-root-operation"
+    });
+    await setup.adapter.send(prompt("delegate"), { ...active, emit });
+    expect(operations).toHaveLength(1);
+    const rootThreadId = binding.nativeSessionId!;
+    const childThreadId = "smart-child-thread";
+    rejectProjection = true;
+    await expect(setup.fake.transport!.emitNotification("item/started", {
+      threadId: rootThreadId,
+      turnId: "turn-1",
+      item: {
+        type: "collabAgentToolCall",
+        id: "smart-spawn-call",
+        tool: "spawnAgent",
+        status: "inProgress",
+        senderThreadId: rootThreadId,
+        receiverThreadIds: [childThreadId],
+        agentsStates: { [childThreadId]: { status: "running", message: null } },
+        prompt: "Inspect independently",
+        model: "worker-model",
+        reasoningEffort: "low"
+      }
+    })).rejects.toThrow("fixture projection failure");
+    rejectProjection = false;
+    expect(registerDescendant).toHaveBeenCalledWith(childThreadId, rootThreadId);
+    await setup.fake.transport!.emitNotification("thread/started", {
+      thread: { id: childThreadId, parentThreadId: rootThreadId, agentRole: "worker", agentNickname: "Scout" }
+    });
+    await setup.fake.transport!.emitNotification("turn/started", {
+      threadId: childThreadId,
+      turn: { id: "smart-child-turn", status: "inProgress", items: [], error: null }
+    });
+    await setup.fake.completeTurn(rootThreadId);
+    expect(released).not.toHaveBeenCalled();
+
+    rejectProjection = true;
+    await expect(setup.fake.transport!.emitNotification("turn/completed", {
+      threadId: childThreadId,
+      turn: { id: "smart-child-turn", status: "completed", items: [], error: null }
+    })).rejects.toThrow("fixture projection failure");
+    rejectProjection = false;
+    expect(completeDescendant).toHaveBeenCalledWith(childThreadId);
+    expect(released).toHaveBeenCalledTimes(1);
+
+    routeCurrent = false;
+    await expect(setup.adapter.send(prompt("stale route"), {
+      ...active,
+      operationId: "stale-smart-operation"
+    })).rejects.toMatchObject({ publicError: { code: "CODEX_SMART_ROUTING_UNAVAILABLE" } });
+    expect(setup.fake.transport!.requests.filter((request) => request.method === "turn/start")).toHaveLength(1);
+    await setup.fake.transport!.exit();
+    expect(routeDisposed).toHaveBeenCalledOnce();
+    await setup.adapter.dispose();
+    expect(routeDisposed).toHaveBeenCalledOnce();
+    expect(retired).toHaveBeenCalledOnce();
+    expect(cleanup).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["codex/0.153.3", true, 1, false, false, "requires the audited Codex app-server"],
+    ["codex/0.153.4", true, 2, true, true, ""],
+    ["codex/0.153.4", false, 1, false, true, "native account is unavailable"]
+  ] as const)("probes runtime %s without smart flags before deciding its process generation", async (
+    userAgent,
+    nativeAccountAvailable,
+    expectedStarts,
+    expectedApplied,
+    expectedCapability,
+    unavailableReason
+  ) => {
+    const fake = new FakeCodexAppServer();
+    fake.userAgent = userAgent;
+    if (!nativeAccountAvailable) fake.account = null;
+    let starts = 0;
+    const route = { providerId: "openai", modelId: "native-worker", revision: "native-a", native: true } as const;
+    const managedProviders: ManagedProviderRuntimePort = {
+      support: CODEX_MANAGED_PROVIDER_SUPPORT,
+      environment: { JOKO_PROVIDER_PROXY_TOKEN: "private-fixture-token" },
+      secretEnvironmentNames: ["JOKO_PROVIDER_PROXY_TOKEN"],
+      dispose: () => undefined,
+      hasProvider: () => false,
+      listModels: () => [],
+      listProviders: () => [],
+      getThinkingLevelMap: () => ({}),
+      prepare: async () => { throw new Error("ordinary route must not be prepared"); },
+      prepareSmartRouting: async () => { throw new Error("smart route must not be prepared during probe"); }
+    };
+    const adapter = new CodexBackendAdapter({
+      id: "codex-probe",
+      instanceGeneration: 1,
+      managedProviders,
+      appServer: { transportFactory: () => { starts += 1; return fake.createTransport(); } },
+      smartRouting: {
+        desired: true,
+        applied: true,
+        revision: "catalog-a",
+        routes: [route],
+        nativeRoutes: [],
+        launchArgs: ["-c", "fixture=true"],
+        unavailableReason: "",
+        cleanup: async () => undefined
+      }
+    });
+    cleanups.push(() => adapter.dispose());
+
+    const descriptor = await adapter.describe();
+
+    expect(starts).toBe(expectedStarts);
+    expect(adapter.subagentSmartRoutingState()).toMatchObject({
+      desired: true,
+      applied: expectedApplied,
+      runtimeRevision: "catalog-a",
+      unavailableReason: expectedApplied ? "" : expect.stringContaining(unavailableReason)
+    });
+    expect(descriptor.capabilities.get("subagents.smart_routing")).toMatchObject({
+      supported: expectedCapability,
+      ...(expectedCapability ? {} : { reason: "upstream_missing" })
+    });
+  });
+
+  it("starts the managed-only smart generation when the exact runtime has no native account", async () => {
+    const fake = new FakeCodexAppServer();
+    fake.account = null;
+    let starts = 0;
+    const managedProviders: ManagedProviderRuntimePort = {
+      support: CODEX_MANAGED_PROVIDER_SUPPORT,
+      environment: { JOKO_PROVIDER_PROXY_TOKEN: "private-fixture-token" },
+      secretEnvironmentNames: ["JOKO_PROVIDER_PROXY_TOKEN"],
+      dispose: () => undefined,
+      hasProvider: () => true,
+      listModels: () => [],
+      listProviders: () => [],
+      getThinkingLevelMap: () => ({}),
+      prepare: async () => { throw new Error("ordinary route must not be prepared"); },
+      prepareSmartRouting: async () => { throw new Error("smart route must not be prepared during probe"); }
+    };
+    const adapter = new CodexBackendAdapter({
+      id: "codex-managed-only-probe",
+      instanceGeneration: 1,
+      managedProviders,
+      appServer: { transportFactory: () => { starts += 1; return fake.createTransport(); } },
+      smartRouting: {
+        desired: true,
+        applied: true,
+        revision: "native-catalog",
+        routes: [{ providerId: "openai", modelId: "native-worker", revision: "native-a", native: true }],
+        nativeRoutes: [{ providerId: "openai", modelId: "gpt-5.6-sol", revision: "native-a", native: true }],
+        launchArgs: ["-c", "catalog=native"],
+        managedOnly: {
+          revision: "managed-catalog",
+          routes: [{ providerId: "managed", modelId: "managed-worker", revision: "managed-a", native: false }],
+          nativeRoutes: [],
+          launchArgs: ["-c", "catalog=managed"],
+          catalogPath: "C:/private/managed-catalog.json"
+        },
+        managedOnlyInspection: { revision: "managed-catalog", candidateCount: 1, unavailableReason: "" },
+        unavailableReason: "",
+        cleanup: async () => undefined
+      }
+    });
+    cleanups.push(() => adapter.dispose());
+
+    const descriptor = await adapter.describe();
+
+    expect(starts).toBe(2);
+    expect(adapter.subagentSmartRoutingState()).toMatchObject({
+      desired: true,
+      applied: true,
+      runtimeRevision: "managed-catalog",
+      unavailableReason: ""
+    });
+    expect(descriptor.capabilities.get("subagents.smart_routing")).toMatchObject({ supported: true });
   });
 
   it("rejects every unsupported mention kind before native dispatch", async () => {
@@ -3159,6 +3459,7 @@ describe("CodexBackendAdapter", () => {
     expect(oldDescriptor.capabilities.get("plan_mode")).toMatchObject({ supported: false, reason: "upstream_missing" });
     expect(oldDescriptor.capabilities.get("background.tasks")).toMatchObject({ supported: false, reason: "upstream_missing" });
     expect(oldDescriptor.capabilities.get("subagents.list")).toMatchObject({ supported: false, reason: "upstream_missing" });
+    expect(oldDescriptor.capabilities.get("subagents.smart_routing")).toMatchObject({ supported: false, reason: "upstream_missing" });
     await expect(old.adapter.createSession({
       ...sessionInput(old.target),
       runtimePolicy: "review_read_only"

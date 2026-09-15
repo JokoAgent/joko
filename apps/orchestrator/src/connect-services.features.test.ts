@@ -93,10 +93,13 @@ function immediateHost(store: object, extra: Record<string, unknown> = {}) {
       body: unknown;
       effect?: () => Promise<void>;
       commit: (store: object) => unknown;
+      afterCommit?: (execution: { replayed: boolean; value: unknown; operation: OperationRecord<unknown> }) => void;
     }) => {
       await input.effect?.();
       const value = input.commit(store);
-      return { replayed: false, value, operation: completedRecord(input.operationId, input.kind, input.body, value) };
+      const execution = { replayed: false, value, operation: completedRecord(input.operationId, input.kind, input.body, value) };
+      input.afterCommit?.(execution);
+      return execution;
     },
     ...extra
   };
@@ -1684,6 +1687,7 @@ describe("Connect typed feature boundaries", () => {
           apiCompatibility: contract.ProviderApiCompatibility.GOOGLE_GENERATIVE_AI,
           reasoning: true,
           supportsFastMode: true,
+          supportsTools: false,
           inputModalities: [contract.ModelInputModality.TEXT, contract.ModelInputModality.IMAGE],
           contextWindowTokens: 200_000n,
           maximumOutputTokens: 16_000n,
@@ -1717,7 +1721,8 @@ describe("Connect typed feature boundaries", () => {
       id: "reasoner-1",
       contextWindow: 200_000,
       maxTokens: 16_000,
-      supportsFastMode: true
+      supportsFastMode: true,
+      supportsTools: false
     });
     expect(provider.runtimes[0].provider.models[0].samplingParams).toMatchObject({ temperature: 0.3, topP: 0.9, seed: 42 });
     expect(provider.runtimes[0].credentialBindings).toEqual({ CUSTOM_API_KEY: "credential-reference-1234", CUSTOM_TENANT: "credential-reference-tenant" });
@@ -2626,6 +2631,60 @@ describe("Connect typed feature boundaries", () => {
     });
 
     expect(setSetting).toHaveBeenCalledWith("service", "orchestrator", "settings.prompt_recommendation", {});
+  });
+
+  it("commits one subagent setting action and applies smart routing only after durable acceptance", async () => {
+    const order: string[] = [];
+    const store = { findOperation: () => undefined };
+    const replace = vi.fn(() => { order.push("default"); });
+    const replaceSmartRouting = vi.fn(() => { order.push("smart"); });
+    const holdSubagentSmartRoutingDispatch = vi.fn(() => { order.push("hold"); });
+    const refreshSubagentSmartRouting = vi.fn(async () => { order.push("apply"); });
+    const services = createConnectServices(stubApplication({
+      store,
+      sessionHost: immediateHost(store),
+      subagentModels: { replace, replaceSmartRouting },
+      holdSubagentSmartRoutingDispatch,
+      refreshSubagentSmartRouting
+    }));
+    const submit = async (operationId: string, value: contract.UpdateSubagentModelSettingsMutation) => {
+      await invoke(services.operation.submitOperation, {
+        operationId,
+        connectionId: connection.id,
+        mutation: create(contract.OperationMutationSchema, {
+          payload: { case: "updateSubagentModelSettings", value }
+        })
+      });
+    };
+
+    await submit("subagent-smart-enable", create(contract.UpdateSubagentModelSettingsMutationSchema, {
+      backendId: "codex",
+      smartRoutingEnabled: true,
+      expectedRevision: { value: 2n }
+    }));
+    expect(order).toEqual(["smart", "hold", "apply"]);
+    expect(holdSubagentSmartRoutingDispatch).toHaveBeenCalledExactlyOnceWith("codex");
+    expect(replaceSmartRouting).toHaveBeenCalledExactlyOnceWith("codex", true, 2n);
+    expect(replace).not.toHaveBeenCalled();
+
+    order.length = 0;
+    await submit("subagent-default-reset", create(contract.UpdateSubagentModelSettingsMutationSchema, {
+      backendId: "codex",
+      clearDefaultModel: true,
+      expectedRevision: { value: 3n }
+    }));
+    expect(order).toEqual(["default"]);
+    expect(replace).toHaveBeenCalledExactlyOnceWith("codex", undefined, 3n);
+    expect(refreshSubagentSmartRouting).toHaveBeenCalledTimes(1);
+
+    await expect(submit("subagent-ambiguous", create(contract.UpdateSubagentModelSettingsMutationSchema, {
+      backendId: "codex",
+      clearDefaultModel: true,
+      smartRoutingEnabled: false,
+      expectedRevision: { value: 4n }
+    }))).rejects.toMatchObject({ code: Code.InvalidArgument });
+    expect(replace).toHaveBeenCalledTimes(1);
+    expect(replaceSmartRouting).toHaveBeenCalledTimes(1);
   });
 
   it("restores optional personalization defaults while their runtime owners are absent", async () => {
