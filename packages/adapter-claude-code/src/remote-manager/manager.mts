@@ -8,6 +8,7 @@ import { pipeline } from "node:stream/promises";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import * as nativeSdk from "@anthropic-ai/claude-agent-sdk";
+import { z } from "zod";
 
 const PROTOCOL_VERSION = 1;
 const MANAGER_VERSION = "1.0.0";
@@ -22,6 +23,9 @@ const MAX_TERMINAL_QUERIES = 128;
 const MAX_CALLBACKS_PER_CONNECTION = 256;
 const CALLBACK_TIMEOUT_MS = 30 * 60_000;
 const MAX_HOOK_PAYLOAD_BYTES = 1024 * 1024;
+const MANAGED_AGENT_SERVER = "joko_managed_subagent";
+const MANAGED_AGENT_TOOL = "delegate";
+const MANAGED_AGENT_TOOL_NAME = `mcp__${MANAGED_AGENT_SERVER}__${MANAGED_AGENT_TOOL}`;
 const REMOTE_HOOK_EVENTS = new Set(["PreToolUse", "PermissionDenied", "PostToolUse", "PostToolUseFailure"]);
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const UTF8 = new TextDecoder("utf-8", { fatal: true });
@@ -565,10 +569,18 @@ function queryOptions(value, query) {
   const executable = absolutePath(process.env.JOKO_CLAUDE_EXECUTABLE);
   const env = remoteEnvironment(value.env, configRoot, tmpRoot);
   const hooks = hookOptions(value.hooks, query);
+  const managedAgentServer = value.managedAgentTool === undefined
+    ? undefined
+    : value.managedAgentTool === true
+      ? createManagedAgentServer(query)
+      : invalid();
+  const mcpServers = value.mcpServers === undefined ? {} : emptyRecord(value.mcpServers, "MCP servers");
+  if (managedAgentServer !== undefined) mcpServers[MANAGED_AGENT_SERVER] = managedAgentServer;
   const options = {
     abortController: query.abortController,
     additionalDirectories: stringArray(value.additionalDirectories, "additional directories", 64, 16_384).map(absolutePath),
     allowDangerouslySkipPermissions: value.allowDangerouslySkipPermissions === true,
+    ...(value.agent === undefined ? {} : { agent: boundedString(value.agent, "agent", 256) }),
     ...(value.agents === undefined ? {} : { agents: emptyRecord(value.agents, "agents") }),
     canUseTool: async (toolName, input, options) => {
       try {
@@ -598,7 +610,7 @@ function queryOptions(value, query) {
     ...(hooks === undefined ? {} : { hooks }),
     includePartialMessages: true,
     ...(value.disallowedTools === undefined ? {} : { disallowedTools: stringArray(value.disallowedTools, "disallowed tools", 256, 512) }),
-    ...(value.mcpServers === undefined ? {} : { mcpServers: emptyRecord(value.mcpServers, "MCP servers") }),
+    ...(Object.keys(mcpServers).length === 0 ? {} : { mcpServers }),
     ...(value.model === undefined ? {} : { model: boundedString(value.model, "model", 512) }),
     pathToClaudeCodeExecutable: executable,
     permissionMode: permissionMode(value.permissionMode),
@@ -613,10 +625,54 @@ function queryOptions(value, query) {
     ...(value.strictMcpConfig === true ? { strictMcpConfig: true } : {}),
     systemPrompt: systemPrompt(value.systemPrompt),
     ...(value.title === undefined ? {} : { title: boundedString(value.title, "title", 4096) }),
+    ...(managedAgentServer === undefined
+      ? {}
+      : { toolAliases: { Agent: MANAGED_AGENT_TOOL_NAME, Task: MANAGED_AGENT_TOOL_NAME } }),
     tools: tools(value.tools)
   };
   if (options.additionalDirectories.length > 0) throw fault("remote_extra_directories_unsupported", false);
   return options;
+}
+
+function createManagedAgentServer(query) {
+  return query.state.sdk.createSdkMcpServer({
+    name: MANAGED_AGENT_SERVER,
+    version: "1.0.0",
+    tools: [{
+      name: MANAGED_AGENT_TOOL,
+      description: "Run an exactly configured Joko-managed Claude subagent.",
+      inputSchema: {
+        description: z.string().trim().min(1).max(512),
+        prompt: z.string().min(1).max(1024 * 1024),
+        subagent_type: z.string().trim().min(1).max(256).optional(),
+        model: z.string().trim().min(1).max(512).optional(),
+        run_in_background: z.boolean().optional(),
+        name: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/u).optional(),
+        team_name: z.string().max(256).optional(),
+        mode: z.string().max(64).optional(),
+        isolation: z.enum(["worktree", "remote"]).optional(),
+        cwd: z.string().max(16_384).optional()
+      },
+      handler: async (input, extra) => {
+        if (!record(extra) || !record(extra._meta)
+          || typeof extra._meta["claudecode/toolUseId"] !== "string"
+          || !(extra.signal instanceof AbortSignal)) throw fault("callback_invalid", false);
+        const toolUseId = boundedString(extra._meta["claudecode/toolUseId"], "tool use id", 512);
+        const value = { input, toolUseId };
+        if (jsonBytes(value) > MAX_HOOK_PAYLOAD_BYTES) throw fault("callback_invalid", false);
+        const result = await query.connection?.callback(query, "managedAgentTool", value, extra.signal);
+        if (!record(result) || typeof result.text !== "string"
+          || Buffer.byteLength(result.text, "utf8") > 64 * 1024
+          || (result.isError !== undefined && typeof result.isError !== "boolean")) {
+          throw fault("callback_invalid", false);
+        }
+        return {
+          content: [{ type: "text", text: result.text }],
+          ...(result.isError === true ? { isError: true } : {})
+        };
+      }
+    }]
+  });
 }
 
 function hookOptions(value, query) {
@@ -1032,12 +1088,25 @@ function remoteEnvironment(value, configRoot, tmpRoot) {
 
 function userMessage(value, sessionId) {
   if (!record(value) || value.type !== "user" || !record(value.message) || value.message.role !== "user"
-    || value.parent_tool_use_id !== null || !record(value.origin) || value.origin.kind !== "human"
+    || value.parent_tool_use_id !== null || !validInputOrigin(value.origin)
     || !UUID.test(value.uuid)) throw fault("invalid_input", false);
   const content = value.message.content;
   if (typeof content !== "string" && !Array.isArray(content)) throw fault("invalid_input", false);
   if (Buffer.byteLength(JSON.stringify(content), "utf8") > 24 * 1024 * 1024) throw fault("invalid_input", false);
-  return { type: "user", message: { role: "user", content }, parent_tool_use_id: null, origin: { kind: "human" }, uuid: value.uuid };
+  return { type: "user", message: { role: "user", content }, parent_tool_use_id: null, origin: { ...value.origin }, uuid: value.uuid };
+}
+
+function validInputOrigin(value) {
+  if (!record(value)) return false;
+  if (value.kind === "human" || value.kind === "task-notification") return Object.keys(value).length === 1;
+  if (value.kind !== "peer" || typeof value.from !== "string" || value.from.length === 0
+    || Buffer.byteLength(value.from, "utf8") > 512 || /[\u0000-\u001f\u007f]/u.test(value.from)) return false;
+  if (value.fromMode !== undefined && value.fromMode !== "bypass" && value.fromMode !== "prompting") return false;
+  for (const key of ["senderTaskId", "body"]) {
+    if (value[key] !== undefined && (typeof value[key] !== "string"
+      || Buffer.byteLength(value[key], "utf8") > (key === "body" ? 1024 * 1024 : 512))) return false;
+  }
+  return Object.keys(value).every((key) => ["kind", "from", "fromMode", "senderTaskId", "body"].includes(key));
 }
 
 function callbackOptions(value) {
@@ -1083,6 +1152,11 @@ function flagSettings(value) {
   if (!record(value)) throw fault("invalid_request", false);
   const output = {};
   if (value.effortLevel !== undefined) output.effortLevel = value.effortLevel === null ? null : effort(value.effortLevel);
+  if (value.autoCompactWindow !== undefined) {
+    output.autoCompactWindow = value.autoCompactWindow === null
+      ? null
+      : boundedInteger(value.autoCompactWindow, "auto compact window", 1, Number.MAX_SAFE_INTEGER);
+  }
   if (value.fastMode !== undefined) {
     if (value.fastMode !== null && typeof value.fastMode !== "boolean") throw fault("invalid_request", false);
     output.fastMode = value.fastMode;

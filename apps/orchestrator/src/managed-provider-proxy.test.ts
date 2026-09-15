@@ -11,7 +11,10 @@ import { CredentialVault } from "./credential-vault.js";
 import { ManagedProviderProxy } from "./managed-provider-proxy.js";
 import { mkdtemp } from "./test-paths.js";
 
-async function fixture(nativeResponses = false) {
+async function fixture(
+  nativeResponses = false,
+  protocol: "openai-responses" | "anthropic-messages" = "openai-responses"
+) {
   const directory = await mkdtemp(join(tmpdir(), "joko-provider-proxy-"));
   const store = new OperationalStore(join(directory, "store.db"));
   const credentials = new CredentialManager({ vault: await CredentialVault.open(join(directory, "vault.key")), storagePath: join(directory, "credentials.json") });
@@ -19,6 +22,7 @@ async function fixture(nativeResponses = false) {
   const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "native-owner" });
   providers.initialize();
   const received: { path: string; model: string; authorization: string | undefined }[] = [];
+  const receivedBodies: Record<string, unknown>[] = [];
   const forwardedProxyTokens: Array<string | undefined> = [];
   const forwardedFedrampHeaders: Array<string | undefined> = [];
   const nativeReceived: {
@@ -33,6 +37,7 @@ async function fixture(nativeResponses = false) {
   const upstream = createServer(async (request, response) => {
     const bytes: Buffer[] = []; for await (const chunk of request) bytes.push(Buffer.from(chunk));
     const body = JSON.parse(Buffer.concat(bytes).toString());
+    receivedBodies.push(body);
     received.push({ path: request.url!, model: body.model, authorization: request.headers.authorization });
     forwardedProxyTokens.push(request.headers["x-joko-provider-proxy-token"] as string | undefined);
     forwardedFedrampHeaders.push(request.headers["x-openai-fedramp"] as string | undefined);
@@ -90,17 +95,22 @@ async function fixture(nativeResponses = false) {
     assertOwner: () => { if (!ownerCurrent || !sessionPresent) throw new Error("Owner changed"); }
   });
   await proxy.start();
-  const port = proxy.createRuntime({ backendId: "runtime", generation: 3, support: { protocols: ["openai-responses"], fields: [] }, assertCurrent: () => { if (!ownerCurrent) throw new Error("Runtime changed"); } });
+  const port = proxy.createRuntime({ backendId: "runtime", generation: 3, support: { protocols: [protocol], fields: [] }, assertCurrent: () => { if (!ownerCurrent) throw new Error("Runtime changed"); } });
   const owner = { backendId: "runtime", backendInstanceGeneration: 3, targetId: "target", sessionId: "session", sessionGeneration: 4, providerId: "provider", modelId: "model" };
+  const requestPath = protocol === "anthropic-messages" ? "/custom/messages" : "/custom/responses";
+  const catalogModels = [
+    { id: "model", input: ["text"] as const, contextWindow: 64_000, maxTokens: 4_000 },
+    { id: "child-model", input: ["text"] as const, contextWindow: 128_000, maxTokens: 8_000 }
+  ];
   const write = async (revision: bigint, secret: string) => {
     const reference = `credential-${revision}`;
     const ticket = credentials.createUploadTicket(); credentials.upload(ticket.credentialUploadTicketId, secret);
     await credentials.commitUpload({ credentialUploadTicketId: ticket.credentialUploadTicketId, credentialReferenceId: reference, displayName: "Provider credential", kind: "api_key" });
     await providers.upsertConfiguration({ providerId: "provider", displayName: "Provider", kind: "custom_endpoint", enabled: true, expectedVersion: revision,
-      runtimes: [{ backendId: "runtime", provider: { id: "provider", api: "openai-responses", baseUrl: endpoint, apiKeyEnv: "PROVIDER_KEY",
+      runtimes: [{ backendId: "runtime", provider: { id: "provider", api: protocol, baseUrl: endpoint, apiKeyEnv: "PROVIDER_KEY",
         headers: { "X-Joko-Provider-Proxy-Token": { env: "PROVIDER_KEY" } },
-        models: [{ id: "model", input: ["text"] }, { id: "child-model", input: ["text"] }] },
-        credentialBindings: { PROVIDER_KEY: reference }, credentialOrigin: endpoint, requestPath: "/custom/responses" }] });
+        models: catalogModels },
+        credentialBindings: { PROVIDER_KEY: reference }, credentialOrigin: endpoint, requestPath }] });
   };
   await write(0n, "first-private-provider-credential");
   const markProviderUnavailable = async () => {
@@ -109,13 +119,13 @@ async function fixture(nativeResponses = false) {
       credentialOrigin: endpoint,
       provider: {
         id: "provider",
-        api: "openai-responses",
+        api: protocol,
         baseUrl: endpoint,
         apiKeyEnv: "PROVIDER_KEY",
         headers: { "X-Joko-Provider-Proxy-Token": { env: "PROVIDER_KEY" } },
-        models: [{ id: "model", input: ["text"] }, { id: "child-model", input: ["text"] }]
+        models: catalogModels
       },
-      requestPath: "/custom/responses",
+      requestPath,
       displayName: "Provider",
       kind: "custom_endpoint",
       credentialBindings: { PROVIDER_KEY: "credential-0" },
@@ -127,7 +137,7 @@ async function fixture(nativeResponses = false) {
       expectedVersion: 1n
     });
   };
-  return { directory, store, providers, proxy, port, owner, received, nativeReceived, forwardedProxyTokens, forwardedFedrampHeaders,
+  return { directory, store, providers, proxy, port, owner, received, receivedBodies, nativeReceived, forwardedProxyTokens, forwardedFedrampHeaders,
     write, markProviderUnavailable,
     token: port.environment[port.secretEnvironmentNames[0]!]!, toolOutcome: () => toolOutcome,
     hold: () => { hold = true; }, reject: () => { reject = true; },
@@ -293,6 +303,69 @@ describe("Managed Provider native proxy", () => {
       await vi.waitFor(() => expect(f.closed()).toBe(true));
       parentLease.release();
       expect((await request("model")).status).toBe(409);
+      binding.dispose();
+    } finally { await f.dispose(); }
+  });
+
+  it("bounds Anthropic Messages max_tokens by each exact active parent or delegated route", async () => {
+    const f = await fixture(false, "anthropic-messages");
+    try {
+      const binding = await f.port.prepare(f.owner);
+      const parent = new AbortController();
+      const parentLease = await binding.activate({
+        operationId: "anthropic-limits",
+        signal: parent.signal,
+        assertCurrent: () => undefined
+      });
+      const request = (path: "/v1/messages" | "/v1/messages/count_tokens", model: string) => fetch(
+        `${binding.baseUrl}${path}`,
+        {
+          method: "POST",
+          headers: { authorization: `Bearer ${f.token}`, "content-type": "application/json" },
+          body: JSON.stringify({ model, max_tokens: 99_999, messages: [], vendor_field: { retain: true } })
+        }
+      );
+
+      expect((await request("/v1/messages", "child-model")).status).toBe(400);
+      expect(await (await request("/v1/messages", "model")).text()).toBe("data: fixture\n\n");
+      expect(f.received.at(-1)?.path).toBe("/custom/messages");
+      expect(f.receivedBodies.at(-1)).toMatchObject({
+        model: "model",
+        max_tokens: 4_000,
+        vendor_field: { retain: true }
+      });
+      const smaller = await fetch(`${binding.baseUrl}/v1/messages`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${f.token}`, "content-type": "application/json" },
+        body: JSON.stringify({ model: "model", max_tokens: 1_000, messages: [] })
+      });
+      expect(await smaller.text()).toBe("data: fixture\n\n");
+      expect(f.receivedBodies.at(-1)).toMatchObject({ model: "model", max_tokens: 1_000 });
+      const receivedBeforeInvalid = f.receivedBodies.length;
+      const invalid = await fetch(`${binding.baseUrl}/v1/messages`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${f.token}`, "content-type": "application/json" },
+        body: JSON.stringify({ model: "model", max_tokens: 0, messages: [] })
+      });
+      expect(invalid.status).toBe(400);
+      expect(f.receivedBodies).toHaveLength(receivedBeforeInvalid);
+
+      const child = await binding.authorizeSubtask!({
+        operationId: "anthropic-limits",
+        requestId: "large-child",
+        modelId: "child-model",
+        signal: parent.signal,
+        assertCurrent: () => undefined
+      });
+      expect(await (await request("/v1/messages", "child-model")).text()).toBe("data: fixture\n\n");
+      expect(f.received.at(-1)?.path).toBe("/custom/messages");
+      expect(f.receivedBodies.at(-1)).toMatchObject({ model: "child-model", max_tokens: 8_000 });
+
+      expect(await (await request("/v1/messages/count_tokens", "child-model")).text()).toBe("data: fixture\n\n");
+      expect(f.received.at(-1)?.path).toBe("/custom/messages/count_tokens");
+      expect(f.receivedBodies.at(-1)).toMatchObject({ model: "child-model", max_tokens: 99_999 });
+      child.release();
+      parentLease.release();
       binding.dispose();
     } finally { await f.dispose(); }
   });

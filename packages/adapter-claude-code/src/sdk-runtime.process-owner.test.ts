@@ -11,7 +11,11 @@ import {
   type ClaudeSdkQueryParams
 } from "./sdk-runtime.js";
 
-const sdk = vi.hoisted(() => ({ query: vi.fn(), startup: vi.fn() }));
+const sdk = vi.hoisted(() => ({
+  query: vi.fn(),
+  startup: vi.fn(),
+  createSdkMcpServer: vi.fn((options: unknown) => ({ type: "sdk", name: "fixture", instance: options }))
+}));
 vi.mock("@anthropic-ai/claude-agent-sdk", () => sdk);
 
 const roots: string[] = [];

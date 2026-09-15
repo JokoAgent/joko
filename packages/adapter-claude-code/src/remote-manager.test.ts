@@ -12,6 +12,8 @@ const SESSION_ID = "11111111-1111-4111-8111-111111111111";
 const QUERY_ID = "22222222-2222-4222-8222-222222222222";
 const INPUT_ID = "33333333-3333-4333-8333-333333333333";
 const FORK_ID = "44444444-4444-4444-8444-444444444444";
+const PEER_INPUT_ID = "55555555-5555-4555-8555-555555555555";
+const NOTIFICATION_INPUT_ID = "66666666-6666-4666-8666-666666666666";
 const CALLBACK_TOKEN = "manager-callback-token";
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -68,6 +70,15 @@ describe("remote Claude manager protocol", () => {
     expect(sdk.queryCalls).toBe(1);
     expect(replayedStart["attachmentId"]).not.toBe(firstAttachment);
     const attachment = String(replayedStart["attachmentId"]);
+    expect(sdk.managedServerCalls).toHaveLength(1);
+    expect(sdk.queries[0]?.options).toMatchObject({
+      agent: "general-purpose",
+      toolAliases: {
+        Agent: "mcp__joko_managed_subagent__delegate",
+        Task: "mcp__joko_managed_subagent__delegate"
+      },
+      mcpServers: { joko_managed_subagent: expect.any(Object) }
+    });
 
     const message = userMessage(INPUT_ID, "first input");
     await expect(first.request("query.input", {
@@ -84,7 +95,7 @@ describe("remote Claude manager protocol", () => {
       requestId: INPUT_ID,
       message
     }, INPUT_ID)).resolves.toEqual({ accepted: true });
-    await waitUntil(() => sdk.queries[0]?.inputs.length === 1);
+    await waitUntil(() => sdk.queries[0]?.managedResults.length === 1);
     expect(sdk.queries[0]?.permissionResults).toEqual([{
       behavior: "allow",
       updatedInput: { path: "/srv/project/a.ts" }
@@ -98,6 +109,43 @@ describe("remote Claude manager protocol", () => {
         permissionDecisionReason: "fixture denied"
       }
     }]);
+    expect(sdk.queries[0]?.managedResults).toEqual([{
+      content: [{ type: "text", text: "delegated from host" }]
+    }]);
+
+    await expect(first.request("query.input", {
+      queryId: QUERY_ID,
+      attachmentId: attachment,
+      requestId: PEER_INPUT_ID,
+      message: userMessage(PEER_INPUT_ID, "peer input", {
+        kind: "peer",
+        from: SESSION_ID,
+        fromMode: "prompting",
+        senderTaskId: "managed-agent-parent",
+        body: "peer input"
+      })
+    }, PEER_INPUT_ID)).resolves.toEqual({ accepted: true });
+    await expect(first.request("query.input", {
+      queryId: QUERY_ID,
+      attachmentId: attachment,
+      requestId: NOTIFICATION_INPUT_ID,
+      message: userMessage(NOTIFICATION_INPUT_ID, "<task-notification>done</task-notification>", {
+        kind: "task-notification"
+      })
+    }, NOTIFICATION_INPUT_ID)).resolves.toEqual({ accepted: true });
+    await waitUntil(() => sdk.queries[0]?.inputs.length === 3);
+    expect(sdk.queries[0]?.inputs.map((input) =>
+      (input as Record<string, unknown>)["origin"])).toEqual([
+      { kind: "human" },
+      {
+        kind: "peer",
+        from: SESSION_ID,
+        fromMode: "prompting",
+        senderTaskId: "managed-agent-parent",
+        body: "peer input"
+      },
+      { kind: "task-notification" }
+    ]);
 
     await Promise.all([
       first.request("query.setModel", { queryId: QUERY_ID, attachmentId: attachment, model: "claude-fixture" }),
@@ -105,14 +153,14 @@ describe("remote Claude manager protocol", () => {
       first.request("query.applyFlagSettings", {
         queryId: QUERY_ID,
         attachmentId: attachment,
-        settings: { effortLevel: "high", fastMode: true }
+        settings: { effortLevel: "high", fastMode: true, autoCompactWindow: 128_000 }
       }),
       first.request("query.interrupt", { queryId: QUERY_ID, attachmentId: attachment })
     ]);
     expect(sdk.queries[0]?.controls).toEqual([
       ["model", "claude-fixture"],
       ["permission", "plan"],
-      ["flags", { effortLevel: "high", fastMode: true }],
+      ["flags", { effortLevel: "high", fastMode: true, autoCompactWindow: 128_000 }],
       ["interrupt"]
     ]);
 
@@ -168,6 +216,7 @@ describe("remote Claude manager protocol", () => {
 class FakeSdk {
   queryCalls = 0;
   readonly queries: FakeQuery[] = [];
+  readonly managedServerCalls: Array<Record<string, unknown>> = [];
   readonly sessions = new Map<string, { sessionId: string; cwd: string }>([
     [SESSION_ID, { sessionId: SESSION_ID, cwd: "/srv/project" }]
   ]);
@@ -177,6 +226,11 @@ class FakeSdk {
     const query = new FakeQuery(params);
     this.queries.push(query);
     return query;
+  }
+
+  createSdkMcpServer(options: Record<string, unknown>): Record<string, unknown> {
+    this.managedServerCalls.push(options);
+    return { type: "sdk", name: options["name"], options };
   }
 
   async getSessionInfo(sessionId: string, options: { readonly dir: string }) {
@@ -213,6 +267,7 @@ class FakeQuery implements AsyncIterable<unknown> {
   readonly permissionResults: unknown[] = [];
   readonly oauthTokens: unknown[] = [];
   readonly hookResults: unknown[] = [];
+  readonly managedResults: unknown[] = [];
   readonly controls: unknown[][] = [];
   readonly #output = new AsyncQueue<unknown>();
   readonly #params: { readonly prompt: AsyncIterable<unknown>; readonly options: Record<string, unknown> };
@@ -224,6 +279,8 @@ class FakeQuery implements AsyncIterable<unknown> {
   }
 
   [Symbol.asyncIterator](): AsyncIterator<unknown> { return this.#output; }
+
+  get options(): Record<string, unknown> { return this.#params.options; }
 
   emit(value: unknown): void { this.#output.push(value); }
 
@@ -259,6 +316,26 @@ class FakeQuery implements AsyncIterable<unknown> {
         tool_input: { model: "child-model" },
         tool_use_id: "agent-one"
       }, "agent-one", { signal: new AbortController().signal }));
+      if (this.managedResults.length === 0) {
+        const mcpServers = this.#params.options["mcpServers"] as Record<string, {
+          readonly options: {
+            readonly tools: Array<{
+              readonly handler: (input: Record<string, unknown>, extra: Record<string, unknown>) => Promise<unknown>;
+            }>;
+          };
+        }>;
+        const managedTool = mcpServers["joko_managed_subagent"]?.options.tools[0];
+        if (managedTool === undefined) throw new Error("Managed Agent server was not installed.");
+        this.managedResults.push(await managedTool.handler({
+          description: "Remote inspector",
+          prompt: "Inspect the remote Target.",
+          subagent_type: "general-purpose",
+          model: "claude-child"
+        }, {
+          _meta: { "claudecode/toolUseId": "agent-two" },
+          signal: new AbortController().signal
+        }));
+      }
       this.emit({ type: "assistant", uuid: randomUUID() });
     }
     this.#output.close();
@@ -408,7 +485,9 @@ class FrameClient {
                   permissionDecisionReason: "fixture denied"
                 }
               }
-            : { value: CALLBACK_TOKEN, declined: false };
+            : frame["callback"] === "managedAgentTool"
+              ? { text: "delegated from host" }
+              : { value: CALLBACK_TOKEN, declined: false };
         this.#socket.write(`${JSON.stringify({
           v: 1,
           kind: "callback_result",
@@ -434,11 +513,13 @@ function queryOptions(): Record<string, unknown> {
   return {
     additionalDirectories: [],
     allowDangerouslySkipPermissions: true,
+    agent: "general-purpose",
     cwd: "/srv/project",
     env: { CLAUDE_CODE_OAUTH_TOKEN: "startup-token" },
     extraArgs: { "replay-user-messages": null },
     getOAuthToken: true,
     hooks: { PreToolUse: [{ matcher: "Agent", hookCount: 1 }] },
+    managedAgentTool: true,
     includePartialMessages: true,
     mcpServers: {},
     model: "claude-fixture",
@@ -453,12 +534,16 @@ function queryOptions(): Record<string, unknown> {
   };
 }
 
-function userMessage(uuid: string, content: string): Record<string, unknown> {
+function userMessage(
+  uuid: string,
+  content: string,
+  origin: Readonly<Record<string, unknown>> = { kind: "human" }
+): Record<string, unknown> {
   return {
     type: "user",
     message: { role: "user", content },
     parent_tool_use_id: null,
-    origin: { kind: "human" },
+    origin,
     uuid
   };
 }

@@ -59,10 +59,10 @@ describe("ClaudeCodeAdapter", () => {
       modelSettings: {
         "configured-model": { effortLevel: "xhigh" },
         "compatible-model": { effortLevel: "xhigh" },
+        "second-model": { effortLevel: "xhigh" },
         "incompatible-thinking": { effortLevel: "xhigh" }
       }
     });
-    expect(runtime.queries[0]!.params.options.settings?.modelSettings).not.toHaveProperty("second-model");
     const source = contextFor(binding, { operationId: "mapped-effort" });
     const context = { ...source.context, modelSelection: { providerId: "configured-provider", modelId: "configured-model" } };
     await expect(adapter.setEffort("low", context)).rejects.toThrow();
@@ -136,7 +136,7 @@ describe("ClaudeCodeAdapter", () => {
     await adapter.dispose();
   });
 
-  test("falls back to the native subtask default and denies an explicit model when its selected effort is disabled", async () => {
+  test("falls back to the native subtask default and rejects an explicit model whose selected effort is disabled", async () => {
     const managed = managedProviderFixture({}, { "compatible-model": { high: null } });
     const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "configured-model", effort: "high" } });
     const adapter = adapterFor(runtime, {
@@ -155,20 +155,17 @@ describe("ClaudeCodeAdapter", () => {
       ...active.context,
       modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
     });
-    const preToolUse = runtime.queries[0]!.params.options.hooks?.PreToolUse?.[0]?.hooks[0];
-    if (preToolUse === undefined) throw new Error("Expected managed subtask hooks.");
-    await expect(preToolUse({
-      hook_event_name: "PreToolUse",
-      session_id: binding.nativeSessionId!,
-      transcript_path: "D:\\private\\transcript.jsonl",
-      cwd: target.workspaceRoot,
-      tool_name: "Agent",
-      tool_input: { model: "compatible-model" },
-      tool_use_id: "disabled-child"
-    }, "disabled-child", { signal: new AbortController().signal }))
-      .resolves.toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
-    expect(managed.subtaskActivations).toHaveLength(1);
-    expect(managed.subtaskActivations[0]!.release).toHaveBeenCalledOnce();
+    const delegate = runtime.queries[0]!.params.options.managedAgentTool;
+    if (delegate === undefined) throw new Error("Expected the managed Agent replacement.");
+    await expect(delegate({
+      description: "Disabled exact effort",
+      prompt: "Run only on the selected model.",
+      subagent_type: "general-purpose",
+      model: "compatible-model"
+    }, { toolUseId: "disabled-child", signal: new AbortController().signal }))
+      .resolves.toMatchObject({ isError: true });
+    expect(managed.subtaskActivations).toHaveLength(0);
+    expect(runtime.queries).toHaveLength(1);
     await adapter.dispose();
   });
 
@@ -259,12 +256,16 @@ describe("ClaudeCodeAdapter", () => {
     expect(managed.port.dispose).toHaveBeenCalledOnce();
   });
 
-  test("leases exact same-limit managed subtask effort routes before Full access and revokes every native lifecycle boundary", async () => {
+  test("runs a foreground managed Agent in an independently configured exact child Query", async () => {
     const managed = managedProviderFixture();
-    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "configured-model", effort: "low" } });
+    const runtime = new FakeSdkRuntime({
+      initialPermissionMode: "bypassPermissions",
+      initialFrameOverrides: { model: "configured-model", effort: "low" }
+    });
     const adapter = adapterFor(runtime, {
       managedProviders: managed.port,
-      resolveSubagentModel: () => "compatible-model"
+      resolveSubagentModel: () => "compatible-model",
+      resolveNativeMemoryEnabled: () => false
     });
     try {
       const binding = await adapter.createSession(createInput({
@@ -278,126 +279,468 @@ describe("ClaudeCodeAdapter", () => {
         ...active.context,
         modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
       });
-      const query = runtime.queries[0]!;
-      const preToolUse = query.params.options.hooks?.PreToolUse?.[0]?.hooks[0];
-      const permissionDenied = query.params.options.hooks?.PermissionDenied?.[0]?.hooks[0];
-      const postToolUse = query.params.options.hooks?.PostToolUse?.[0]?.hooks[0];
-      if (preToolUse === undefined || permissionDenied === undefined || postToolUse === undefined) {
-        throw new Error("Expected managed subtask hooks.");
-      }
-      const hookSignal = new AbortController().signal;
-      const agentInput = (toolUseId: string, model?: string) => ({
-        hook_event_name: "PreToolUse" as const,
-        session_id: binding.nativeSessionId!, transcript_path: "D:\\private\\transcript.jsonl", cwd: target.workspaceRoot,
-        tool_name: "Agent", tool_input: model === undefined ? {} : { model }, tool_use_id: toolUseId
-      });
-
-      await expect(Promise.all([
-        preToolUse(agentInput("agent-default"), "agent-default", { signal: hookSignal }),
-        preToolUse(agentInput("agent-default"), "agent-default", { signal: hookSignal })
-      ])).resolves.toEqual([{ continue: true }, { continue: true }]);
+      const parent = runtime.queries[0]!;
+      const delegate = parent.params.options.managedAgentTool;
+      if (delegate === undefined) throw new Error("Expected the managed Agent replacement.");
+      const delegated = delegate({
+        description: "Inspect exact child route",
+        prompt: "Return the exact child result.",
+        subagent_type: "general-purpose"
+      }, { toolUseId: "agent-default", signal: new AbortController().signal });
+      await vi.waitFor(() => expect(runtime.queries).toHaveLength(2));
+      const child = runtime.queries[1]!;
       expect(managed.subtaskActivations).toHaveLength(1);
       expect(managed.subtaskActivations[0]!.input).toMatchObject({
-        operationId: "managed-subtask-turn", requestId: "agent-default", modelId: "compatible-model"
+        operationId: "managed-subtask-turn",
+        requestId: "agent-default",
+        modelId: "compatible-model"
       });
-      expect(() => managed.subtaskActivations[0]!.input.assertCurrent()).not.toThrow();
-      await preToolUse(agentInput("agent-default"), "agent-default", { signal: hookSignal });
-      expect(managed.subtaskActivations).toHaveLength(1);
-      await expect(preToolUse(agentInput("agent-default", "configured-model"), "agent-default", { signal: hookSignal }))
-        .resolves.toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
-
-      await expect(preToolUse(agentInput("agent-parent", "configured-model"), "agent-parent", { signal: hookSignal }))
-        .resolves.toEqual({ continue: true });
-      await expect(preToolUse(agentInput("agent-parent", "compatible-model"), "agent-parent", { signal: hookSignal }))
-        .resolves.toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
-      expect(managed.subtaskActivations).toHaveLength(1);
-      await expect(preToolUse(agentInput("agent-default", "second-model"), "agent-default", { signal: hookSignal }))
-        .resolves.toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
-      await expect(preToolUse(agentInput("agent-missing", "missing-model"), "agent-missing", { signal: hookSignal }))
-        .resolves.toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
-      expect(managed.subtaskActivations).toHaveLength(1);
-
-      await expect(preToolUse(agentInput("agent-incompatible-limits", "second-model"), "agent-incompatible-limits", { signal: hookSignal }))
-        .resolves.toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
-      await expect(preToolUse(agentInput("agent-incompatible-thinking", "incompatible-thinking"), "agent-incompatible-thinking", { signal: hookSignal }))
-        .resolves.toEqual({ continue: true });
-      expect(managed.subtaskActivations).toHaveLength(3);
-      expect(managed.subtaskActivations[1]!.release).toHaveBeenCalledOnce();
-      expect(managed.subtaskActivations[2]!.release).not.toHaveBeenCalled();
-      expect(query.params.options.effort).toBeUndefined();
-      expect(query.params.options.settings).toMatchObject({
-        modelSettings: {
-          "configured-model": { effortLevel: "low" },
-          "compatible-model": { effortLevel: "low" },
-          "incompatible-thinking": { effortLevel: "medium" }
+      expect(child.params.options).toMatchObject({
+        agent: "general-purpose",
+        model: "compatible-model",
+        effort: "low",
+        cwd: target.workspaceRoot,
+        permissionMode: "bypassPermissions",
+        persistSession: false,
+        env: {
+          CLAUDE_CODE_MAX_CONTEXT_TOKENS: "64000",
+          CLAUDE_CODE_AUTO_COMPACT_WINDOW: "64000",
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: "4000"
+        },
+        settings: {
+          apiKeyHelper: "",
+          modelOverrides: {},
+          modelSettings: {
+            "configured-model": { effortLevel: "low" },
+            "compatible-model": { effortLevel: "low" },
+            "incompatible-thinking": { effortLevel: "medium" },
+            "second-model": { effortLevel: "low" }
+          },
+          autoMemoryEnabled: false,
+          autoDreamEnabled: false,
+          fastMode: false,
+          env: {
+            CLAUDE_CODE_MAX_CONTEXT_TOKENS: "64000",
+            CLAUDE_CODE_AUTO_COMPACT_WINDOW: "64000",
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: "4000"
+          }
         }
       });
-      await postToolUse({
-        ...agentInput("agent-incompatible-thinking", "incompatible-thinking"),
-        hook_event_name: "PostToolUse",
-        tool_response: "completed"
-      }, "agent-incompatible-thinking", { signal: hookSignal });
-      expect(managed.subtaskActivations[2]!.release).toHaveBeenCalledOnce();
-      await expect(preToolUse(agentInput("agent-incompatible-limits", "second-model"), "agent-incompatible-limits", { signal: hookSignal }))
-        .resolves.toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
-      expect(managed.subtaskActivations).toHaveLength(3);
-
-      await permissionDenied({
-        ...agentInput("agent-default"), hook_event_name: "PermissionDenied", reason: "native spawn denied"
-      }, "agent-default", { signal: hookSignal });
+      expect(child.params.options.sessionId).not.toBe(binding.nativeSessionId);
+      expect(child.params.options.resume).toBeUndefined();
+      expect(child.receivedInputs).toEqual([expect.objectContaining({
+        message: { role: "user", content: "Return the exact child result." },
+        origin: expect.objectContaining({ kind: "peer", from: binding.nativeSessionId })
+      })]);
+      const childAnswer = assistantMessage(child.params.options.sessionId!, "child-answer", [{
+        type: "text",
+        text: "Exact child completed."
+      }]);
+      child.push({ ...childAnswer, message: { ...childAnswer.message, model: "compatible-model" } });
+      child.push(resultMessage(child.params.options.sessionId!, { result: "Exact child completed.", totalCostUsd: 0 }));
+      await expect(delegated).resolves.toEqual({ text: "Exact child completed." });
       expect(managed.subtaskActivations[0]!.release).toHaveBeenCalledOnce();
-      expect(() => managed.subtaskActivations[0]!.input.assertCurrent()).toThrow();
-
-      await preToolUse(agentInput("agent-success"), "agent-success", { signal: hookSignal });
-      await postToolUse({
-        ...agentInput("agent-success"), hook_event_name: "PostToolUse", tool_response: "completed"
-      }, "agent-success", { signal: hookSignal });
-      expect(managed.subtaskActivations[3]!.release).toHaveBeenCalledOnce();
-
-      await preToolUse(agentInput("agent-terminal"), "agent-terminal", { signal: hookSignal });
-      const terminal = taskNotification(binding.nativeSessionId!, "task-terminal", "agent-terminal", {
-        status: "completed", summary: "done", outputFile: "D:\\private\\task.output",
-        totalTokens: 1, toolUses: 1, durationMs: 1
-      });
-      const { tool_use_id: _lateToolUseId, ...terminalBeforeBinding } = terminal;
-      query.push(terminalBeforeBinding);
-      query.push(taskStarted(binding.nativeSessionId!, "task-terminal", "agent-terminal", {
-        taskType: "local_agent", description: "already terminal"
+      expect(parent.settingCalls).toEqual([]);
+      expect(active.events).toContainEqual(expect.objectContaining({
+        type: "subagent_run",
+        run: expect.objectContaining({ state: "completed", route: { providerId: "claude-code", modelId: "compatible-model" } })
       }));
-      await vi.waitFor(() => expect(managed.subtaskActivations[4]!.release).toHaveBeenCalledOnce());
-
-      await preToolUse(agentInput("agent-parent-terminal"), "agent-parent-terminal", { signal: hookSignal });
-      query.push(taskStarted(binding.nativeSessionId!, "task-parent-terminal", "agent-parent-terminal", {
-        taskType: "local_agent", description: "asynchronous managed child"
-      }));
-      await postToolUse({
-        ...agentInput("agent-parent-terminal"),
-        hook_event_name: "PostToolUse",
-        tool_response: {
-          status: "async_launched",
-          agentId: "task-parent-terminal",
-          description: "asynchronous managed child",
-          prompt: "finish later",
-          outputFile: "D:\\private\\task.output"
-        }
-      }, "agent-parent-terminal", { signal: hookSignal });
-      expect(managed.subtaskActivations[5]!.release).not.toHaveBeenCalled();
-      query.push(taskNotification(binding.nativeSessionId!, "task-parent-terminal", "agent-parent-terminal", {
-        status: "completed", summary: "done", outputFile: "D:\\private\\task.output",
-        totalTokens: 1, toolUses: 0, durationMs: 1
-      }));
-      await vi.waitFor(() => expect(managed.subtaskActivations[5]!.release).toHaveBeenCalledOnce());
-      expect(() => managed.activations[0]!.input.assertCurrent()).not.toThrow();
-      query.push(resultMessage(binding.nativeSessionId!, { result: "foreground done", totalCostUsd: 0 }));
-      await eventually(() => active.events.some((event) => event.type === "usage"));
-      expect(active.events.some((event) => event.type === "done")).toBe(false);
-      expect(managed.activations[0]!.release).not.toHaveBeenCalled();
-      query.push(assistantMessage(binding.nativeSessionId!, "managed-continuation", [{
-        type: "text", text: "continued done"
-      }]));
-      query.push(automaticContinuationResult(binding.nativeSessionId!, "continued done", 0));
+      parent.push(resultMessage(binding.nativeSessionId!, { result: "Parent completed.", totalCostUsd: 0 }));
       await eventually(() => active.events.some((event) => event.type === "done"));
       expect(managed.activations[0]!.release).toHaveBeenCalledOnce();
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
+  test("continues the parent from a host-owned background child notification with different exact limits", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "configured-model", effort: "low" } });
+    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    try {
+      const binding = await adapter.createSession(createInput({
+        providerId: "configured-provider",
+        modelId: "configured-model",
+        effort: "low"
+      }), contextFor().context);
+      const active = contextFor(binding, { operationId: "managed-context-turn" });
+      await adapter.send(textPrompt("delegate with different windows"), {
+        ...active.context,
+        modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+      });
+      const parent = runtime.queries[0]!;
+      const delegate = parent.params.options.managedAgentTool;
+      if (delegate === undefined) throw new Error("Expected the managed Agent replacement.");
+      const launched = delegate({
+        description: "Different limit background child",
+        prompt: "Finish in the background.",
+        subagent_type: "general-purpose",
+        model: "second-model",
+        run_in_background: true
+      }, { toolUseId: "large-background", signal: new AbortController().signal });
+      await vi.waitFor(() => expect(runtime.queries).toHaveLength(2));
+      const child = runtime.queries[1]!;
+      await expect(launched).resolves.toMatchObject({ text: expect.stringContaining("managed-agent-") });
+      expect(child.params.options).toMatchObject({
+        model: "second-model",
+        effort: "low",
+        persistSession: false,
+        env: {
+          CLAUDE_CODE_MAX_CONTEXT_TOKENS: "128000",
+          CLAUDE_CODE_AUTO_COMPACT_WINDOW: "128000",
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: "8000"
+        }
+      });
+      expect(parent.settingCalls).toEqual([]);
+      child.push(assistantMessage(child.params.options.sessionId!, "background-answer", [{
+        type: "text",
+        text: "Background exact child completed."
+      }]));
+      child.push(resultMessage(child.params.options.sessionId!, {
+        result: "Background exact child completed.",
+        totalCostUsd: 0
+      }));
+      await vi.waitFor(() => expect(managed.subtaskActivations[0]!.release).toHaveBeenCalledOnce());
+      parent.push(resultMessage(binding.nativeSessionId!, { result: "Background launch accepted.", totalCostUsd: 0 }));
+      await vi.waitFor(() => expect(parent.receivedInputs).toHaveLength(2));
+      expect(parent.receivedInputs[1]).toMatchObject({
+        origin: { kind: "task-notification" },
+        message: { role: "user", content: expect.stringContaining("Background exact child completed.") }
+      });
+      expect(active.events.some((event) => event.type === "done")).toBe(false);
+      parent.push(assistantMessage(binding.nativeSessionId!, "managed-continuation", [{
+        type: "text",
+        text: "Managed continuation completed."
+      }]));
+      parent.push({
+        ...resultMessage(binding.nativeSessionId!, { result: "Managed continuation completed.", totalCostUsd: 0 }),
+        origin: null
+      });
+      await eventually(() => active.events.some((event) => event.type === "done"));
+      expect(active.events.at(-1)).toEqual({ type: "done", outcome: "completed" });
+      expect(managed.activations[0]!.release).toHaveBeenCalledOnce();
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
+  test("serializes completed background child notifications across automatic continuation segments", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "configured-model", effort: "low" } });
+    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    try {
+      const binding = await adapter.createSession(createInput({
+        providerId: "configured-provider",
+        modelId: "configured-model",
+        effort: "low"
+      }), contextFor().context);
+      const active = contextFor(binding, { operationId: "serialized-managed-notifications" });
+      await adapter.send(textPrompt("delegate two background children"), {
+        ...active.context,
+        modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+      });
+      const parent = runtime.queries[0]!;
+      const delegate = parent.params.options.managedAgentTool;
+      if (delegate === undefined) throw new Error("Expected the managed Agent replacement.");
+      const firstLaunch = delegate({
+        description: "First background child",
+        prompt: "Finish first.",
+        subagent_type: "general-purpose",
+        model: "second-model",
+        run_in_background: true
+      }, { toolUseId: "first-background-child", signal: new AbortController().signal });
+      const secondLaunch = delegate({
+        description: "Second background child",
+        prompt: "Finish second.",
+        subagent_type: "general-purpose",
+        model: "second-model",
+        run_in_background: true
+      }, { toolUseId: "second-background-child", signal: new AbortController().signal });
+      await vi.waitFor(() => expect(runtime.queries).toHaveLength(3));
+      await expect(Promise.all([firstLaunch, secondLaunch])).resolves.toEqual([
+        expect.objectContaining({ text: expect.stringContaining("managed-agent-") }),
+        expect.objectContaining({ text: expect.stringContaining("managed-agent-") })
+      ]);
+      const firstChild = runtime.queries[1]!;
+      const secondChild = runtime.queries[2]!;
+
+      parent.push(resultMessage(binding.nativeSessionId!, {
+        result: "Both background launches accepted.",
+        totalCostUsd: 0
+      }));
+      firstChild.push(assistantMessage(firstChild.params.options.sessionId!, "first-background-answer", [{
+        type: "text",
+        text: "First background child completed."
+      }]));
+      firstChild.push(resultMessage(firstChild.params.options.sessionId!, {
+        result: "First background child completed.",
+        totalCostUsd: 0
+      }));
+      await vi.waitFor(() => expect(parent.receivedInputs).toHaveLength(2));
+
+      secondChild.push(assistantMessage(secondChild.params.options.sessionId!, "second-background-answer", [{
+        type: "text",
+        text: "Second background child completed."
+      }]));
+      secondChild.push(resultMessage(secondChild.params.options.sessionId!, {
+        result: "Second background child completed.",
+        totalCostUsd: 0
+      }));
+      await vi.waitFor(() => expect(managed.subtaskActivations.every((activation) =>
+        activation.release.mock.calls.length === 1)).toBe(true));
+      await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+      expect(parent.receivedInputs).toHaveLength(2);
+      expect(parent.receivedInputs[1]).toMatchObject({
+        origin: { kind: "task-notification" },
+        message: { role: "user", content: expect.stringContaining("First background child completed.") }
+      });
+
+      parent.push(assistantMessage(binding.nativeSessionId!, "first-managed-continuation", [{
+        type: "text",
+        text: "First managed continuation completed."
+      }]));
+      parent.push({
+        ...resultMessage(binding.nativeSessionId!, { result: "First managed continuation completed.", totalCostUsd: 0 }),
+        origin: null
+      });
+      await vi.waitFor(() => expect(parent.receivedInputs).toHaveLength(3));
+      expect(parent.receivedInputs[2]).toMatchObject({
+        origin: { kind: "task-notification" },
+        message: { role: "user", content: expect.stringContaining("Second background child completed.") }
+      });
+      expect(active.events.some((event) => event.type === "done")).toBe(false);
+
+      parent.push(assistantMessage(binding.nativeSessionId!, "second-managed-continuation", [{
+        type: "text",
+        text: "All managed continuations completed."
+      }]));
+      parent.push({
+        ...resultMessage(binding.nativeSessionId!, { result: "All managed continuations completed.", totalCostUsd: 0 }),
+        origin: null
+      });
+      await eventually(() => active.events.some((event) => event.type === "done"));
+      expect(active.events.at(-1)).toEqual({ type: "done", outcome: "completed" });
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
+  test("fails a child whose exact Query cannot start while keeping the parent Query authoritative", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "configured-model", effort: "low" } });
+    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    try {
+      const binding = await adapter.createSession(createInput({
+        providerId: "configured-provider", modelId: "configured-model", effort: "low"
+      }), contextFor().context);
+      const active = contextFor(binding, { operationId: "managed-child-start-failure" });
+      await adapter.send(textPrompt("delegate"), {
+        ...active.context,
+        modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+      });
+      const query = runtime.queries[0]!;
+      const delegate = query.params.options.managedAgentTool;
+      if (delegate === undefined) throw new Error("Expected the managed Agent replacement.");
+      runtime.queryFailure = new Error("child process did not start");
+      await expect(delegate({
+        description: "Child startup failure",
+        prompt: "Do not fall back.",
+        subagent_type: "general-purpose",
+        model: "second-model"
+      }, { toolUseId: "failed-child-start", signal: new AbortController().signal }))
+        .resolves.toMatchObject({ isError: true, text: expect.stringContaining("startup") });
+      expect(managed.subtaskActivations[0]!.release).toHaveBeenCalledOnce();
+      expect(query.closeCalls).toBe(0);
+      expect(active.events).toContainEqual(expect.objectContaining({
+        type: "subagent_run",
+        run: expect.objectContaining({ state: "failed" })
+      }));
+      runtime.queryFailure = undefined;
+      query.push(resultMessage(binding.nativeSessionId!, { result: "Parent recovered.", totalCostUsd: 0 }));
+      await eventually(() => active.events.some((event) => event.type === "done"));
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
+  test("rejects a managed child Result that retains unowned queued input", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "configured-model", effort: "low" } });
+    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    try {
+      const binding = await adapter.createSession(createInput({
+        providerId: "configured-provider", modelId: "configured-model", effort: "low"
+      }), contextFor().context);
+      const active = contextFor(binding, { operationId: "managed-child-queued-result" });
+      await adapter.send(textPrompt("delegate"), {
+        ...active.context,
+        modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+      });
+      const parent = runtime.queries[0]!;
+      const delegate = parent.params.options.managedAgentTool;
+      if (delegate === undefined) throw new Error("Expected the managed Agent replacement.");
+      const delegated = delegate({
+        description: "Queued child result",
+        prompt: "Return only for this prompt.",
+        subagent_type: "general-purpose",
+        model: "second-model"
+      }, { toolUseId: "queued-child-result", signal: new AbortController().signal });
+      await vi.waitFor(() => expect(runtime.queries).toHaveLength(2));
+      const child = runtime.queries[1]!;
+      child.push({
+        ...resultMessage(child.params.options.sessionId!, { result: "Unowned continuation.", totalCostUsd: 0 }),
+        queued_turn_count: 1
+      });
+      await expect(delegated).resolves.toMatchObject({
+        isError: true,
+        text: expect.stringContaining("authoritative Result")
+      });
+      expect(managed.subtaskActivations[0]!.release).toHaveBeenCalledOnce();
+      expect(parent.closeCalls).toBe(0);
+      expect(active.events).toContainEqual(expect.objectContaining({
+        type: "subagent_run",
+        run: expect.objectContaining({ state: "failed" })
+      }));
+      parent.push(resultMessage(binding.nativeSessionId!, { result: "Parent completed.", totalCostUsd: 0 }));
+      await eventually(() => active.events.some((event) => event.type === "done"));
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
+  test("bounds a managed child tool result by UTF-8 bytes without splitting text", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "configured-model", effort: "low" } });
+    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    try {
+      const binding = await adapter.createSession(createInput({
+        providerId: "configured-provider", modelId: "configured-model", effort: "low"
+      }), contextFor().context);
+      const active = contextFor(binding, { operationId: "managed-child-utf8-result" });
+      await adapter.send(textPrompt("delegate"), {
+        ...active.context,
+        modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+      });
+      const parent = runtime.queries[0]!;
+      const delegate = parent.params.options.managedAgentTool;
+      if (delegate === undefined) throw new Error("Expected the managed Agent replacement.");
+      const delegated = delegate({
+        description: "Bound UTF-8 result",
+        prompt: "Return bounded Unicode.",
+        model: "second-model"
+      }, { toolUseId: "bounded-unicode-child", signal: new AbortController().signal });
+      await vi.waitFor(() => expect(runtime.queries).toHaveLength(2));
+      const child = runtime.queries[1]!;
+      child.push(resultMessage(child.params.options.sessionId!, {
+        result: "🙂".repeat(20_000),
+        totalCostUsd: 0
+      }));
+      const result = await delegated;
+      expect(result.isError).toBeUndefined();
+      expect(Buffer.byteLength(result.text, "utf8")).toBeLessThanOrEqual(64 * 1024);
+      expect(result.text.endsWith("🙂")).toBe(true);
+      expect(result.text).not.toContain("�");
+      parent.push(resultMessage(binding.nativeSessionId!, { result: "Parent completed.", totalCostUsd: 0 }));
+      await eventually(() => active.events.some((event) => event.type === "done"));
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
+  test("cancels a background managed child whose independent Query never confirms startup", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime({
+      autoReplayInputs: false,
+      initialFrameOverrides: { model: "configured-model", effort: "low" }
+    });
+    const adapter = adapterFor(runtime, { managedProviders: managed.port, initializationTimeoutMs: 25 });
+    try {
+      const binding = await adapter.createSession(createInput({
+        providerId: "configured-provider", modelId: "configured-model", effort: "low"
+      }), contextFor().context);
+      const active = contextFor(binding, { operationId: "managed-child-start-timeout" });
+      await adapter.send(textPrompt("delegate"), {
+        ...active.context,
+        modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+      });
+      const parent = runtime.queries[0]!;
+      const delegate = parent.params.options.managedAgentTool;
+      if (delegate === undefined) throw new Error("Expected the managed Agent replacement.");
+      runtime.admitTurns = false;
+      await expect(delegate({
+        description: "Unconfirmed background child",
+        prompt: "Do not outlive startup acknowledgement.",
+        subagent_type: "general-purpose",
+        model: "second-model",
+        run_in_background: true
+      }, { toolUseId: "unconfirmed-background-child", signal: new AbortController().signal }))
+        .resolves.toMatchObject({ isError: true, text: expect.stringContaining("startup") });
+      await vi.waitFor(() => expect(managed.subtaskActivations[0]!.release).toHaveBeenCalledOnce());
+      expect(runtime.queries[1]!.closeCalls).toBeGreaterThanOrEqual(1);
+      expect(active.events).toContainEqual(expect.objectContaining({
+        type: "subagent_run",
+        run: expect.objectContaining({ state: "stopped" })
+      }));
+      parent.push(resultMessage(binding.nativeSessionId!, { result: "Parent completed.", totalCostUsd: 0 }));
+      await eventually(() => active.events.some((event) => event.type === "done"));
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
+  test("deduplicates a repeated managed tool identity and rejects payload or model substitution", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "configured-model", effort: "low" } });
+    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    try {
+      const binding = await adapter.createSession(createInput({
+        providerId: "configured-provider", modelId: "configured-model", effort: "low"
+      }), contextFor().context);
+      const active = contextFor(binding, { operationId: "managed-child-deduplication" });
+      await adapter.send(textPrompt("delegate"), {
+        ...active.context,
+        modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+      });
+      const query = runtime.queries[0]!;
+      const delegate = query.params.options.managedAgentTool;
+      if (delegate === undefined) throw new Error("Expected the managed Agent replacement.");
+      const input = {
+        description: "Stable delegated request",
+        prompt: "Return once.",
+        subagent_type: "general-purpose",
+        model: "second-model"
+      };
+      const first = delegate(input, { toolUseId: "stable-child", signal: new AbortController().signal });
+      const duplicate = delegate(input, { toolUseId: "stable-child", signal: new AbortController().signal });
+      const concurrentSubstitution = delegate({ ...input, prompt: "Changed during admission." }, {
+        toolUseId: "stable-child",
+        signal: new AbortController().signal
+      });
+      await vi.waitFor(() => expect(runtime.queries).toHaveLength(2));
+      await expect(concurrentSubstitution).resolves.toMatchObject({
+        isError: true,
+        text: expect.stringContaining("changed identity")
+      });
+      await expect(delegate({ ...input, model: "compatible-model" }, {
+        toolUseId: "stable-child",
+        signal: new AbortController().signal
+      })).resolves.toMatchObject({ isError: true, text: expect.stringContaining("changed identity") });
+      const child = runtime.queries[1]!;
+      child.push(resultMessage(child.params.options.sessionId!, { result: "Only once.", totalCostUsd: 0 }));
+      await expect(Promise.all([first, duplicate])).resolves.toEqual([{ text: "Only once." }, { text: "Only once." }]);
+      await expect(delegate(input, {
+        toolUseId: "stable-child",
+        signal: new AbortController().signal
+      })).resolves.toEqual({ text: "Only once." });
+      await expect(delegate({ ...input, prompt: "Changed after completion." }, {
+        toolUseId: "stable-child",
+        signal: new AbortController().signal
+      })).resolves.toMatchObject({ isError: true, text: expect.stringContaining("changed identity") });
+      expect(runtime.queries).toHaveLength(2);
+      expect(managed.subtaskActivations).toHaveLength(1);
+      expect(managed.subtaskActivations[0]!.release).toHaveBeenCalledOnce();
+      query.push(resultMessage(binding.nativeSessionId!, { result: "Parent completed.", totalCostUsd: 0 }));
+      await eventually(() => active.events.some((event) => event.type === "done"));
     } finally {
       await adapter.dispose();
     }
@@ -483,6 +826,7 @@ describe("ClaudeCodeAdapter", () => {
     expect(managed.activations[0]!.release).toHaveBeenCalledOnce();
     expect(() => managed.activations[0]!.input.assertCurrent()).toThrow();
     expect(source.events.some((event) => event.type === "done")).toBe(false);
+    await vi.waitFor(() => expect(acknowledge).toBeTypeOf("function"));
     acknowledge();
     await stopping;
     runtime.queries[0]!.push(resultMessage(binding.nativeSessionId!, { result: "", totalCostUsd: 0, terminalReason: "aborted_tools" }));
@@ -3024,37 +3368,15 @@ describe("ClaudeCodeAdapter", () => {
     };
     await adapter.send(textPrompt("start delegated work"), managedContext);
     const query = runtime.queries[0]!;
-    const rawTaskId = "wake-task-without-stop-echo";
-    const toolUseId = "wake-tool-without-stop-echo";
-    const preToolUse = query.params.options.hooks?.PreToolUse?.[0]?.hooks[0];
-    const postToolUse = query.params.options.hooks?.PostToolUse?.[0]?.hooks[0];
-    if (preToolUse === undefined || postToolUse === undefined) throw new Error("Expected managed subtask hooks.");
-    const hookInput = {
-      hook_event_name: "PreToolUse" as const,
-      session_id: binding.nativeSessionId!,
-      transcript_path: "D:\\private\\transcript.jsonl",
-      cwd: target.workspaceRoot,
-      tool_name: "Agent",
-      tool_input: {},
-      tool_use_id: toolUseId
-    };
-    await expect(preToolUse(hookInput, toolUseId, { signal: new AbortController().signal }))
-      .resolves.toEqual({ continue: true });
-    query.push(assistantMessage(binding.nativeSessionId!, "wake-parent-tool", [{
-      type: "tool_use",
-      id: toolUseId,
-      name: "Agent",
-      input: { prompt: "inspect" }
-    }]));
-    query.push(taskStarted(binding.nativeSessionId!, rawTaskId, toolUseId, {
-      taskType: "local_agent",
-      description: "Inspector"
-    }));
-    await postToolUse({
-      ...hookInput,
-      hook_event_name: "PostToolUse",
-      tool_response: { status: "async_launched", agentId: rawTaskId }
-    }, toolUseId, { signal: new AbortController().signal });
+    const delegate = query.params.options.managedAgentTool;
+    if (delegate === undefined) throw new Error("Expected the managed Agent replacement.");
+    await expect(delegate({
+      description: "Inspector",
+      prompt: "Inspect until stopped.",
+      subagent_type: "general-purpose",
+      run_in_background: true
+    }, { toolUseId: "wake-tool-without-stop-echo", signal: new AbortController().signal }))
+      .resolves.toMatchObject({ text: expect.stringContaining("managed-agent-") });
     expect(managed.subtaskActivations[0]!.release).not.toHaveBeenCalled();
     await eventually(() => active.events.some((event) => event.type === "background_task"));
     const publicTaskId = active.events.find((event): event is Extract<EventPayload, { type: "background_task" }> =>
@@ -3069,12 +3391,130 @@ describe("ClaudeCodeAdapter", () => {
     expect(managed.subtaskActivations[0]!.release).toHaveBeenCalledOnce();
     query.push(resultMessage(binding.nativeSessionId!, { result: "Delegated work stopped", totalCostUsd: 0.1 }));
     await eventually(() => active.events.some((event) => event.type === "done"));
-    expect(query.stopTaskCalls).toEqual([rawTaskId]);
+    expect(runtime.queries[1]!.interruptCalls).toBe(1);
+    expect(query.stopTaskCalls).toEqual([]);
     expect(active.events.filter((event) => event.type === "done")).toEqual([{ type: "done", outcome: "completed" }]);
     expect(active.events.filter((event): event is Extract<EventPayload, { type: "background_task" }> =>
       event.type === "background_task" && event.taskId === publicTaskId).at(-1)).toMatchObject({ state: "aborted" });
     await adapter.cancelBackgroundTask(active.context, publicTaskId);
-    expect(query.stopTaskCalls).toEqual([rawTaskId]);
+    expect(runtime.queries[1]!.interruptCalls).toBe(1);
+    await adapter.closeSession(binding, contextFor(binding).context);
+  });
+
+  test("globally interrupts every managed child after synchronously revoking its exact HTTP leases", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime({
+      autoAdmitTurns: true,
+      initialFrameOverrides: { model: "configured-model", effort: "low" }
+    });
+    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    const binding = await adapter.createSession(createInput({
+      providerId: "configured-provider",
+      modelId: "configured-model",
+      effort: "low"
+    }), contextFor().context);
+    const active = contextFor(binding, { operationId: "abort-managed-child" });
+    const managedContext = {
+      ...active.context,
+      modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+    };
+    await adapter.send(textPrompt("delegate and stop everything"), managedContext);
+    const parent = runtime.queries[0]!;
+    const delegate = parent.params.options.managedAgentTool;
+    if (delegate === undefined) throw new Error("Expected the managed Agent replacement.");
+    await expect(delegate({
+      description: "Long child",
+      prompt: "Continue until globally stopped.",
+      model: "second-model",
+      run_in_background: true
+    }, { toolUseId: "global-managed-stop", signal: new AbortController().signal }))
+      .resolves.toMatchObject({ text: expect.stringContaining("managed-agent-") });
+    const child = runtime.queries[1]!;
+    let confirmChildStop!: () => void;
+    child.interruptHandler = () => new Promise((resolvePromise) => {
+      confirmChildStop = () => resolvePromise({ still_queued: [] });
+    });
+
+    const stopping = adapter.abort(managedContext);
+    expect(managed.activations[0]!.release).toHaveBeenCalledOnce();
+    expect(managed.subtaskActivations[0]!.release).toHaveBeenCalledOnce();
+    expect(() => managed.subtaskActivations[0]!.input.assertCurrent()).toThrow();
+    await vi.waitFor(() => expect(confirmChildStop).toBeTypeOf("function"));
+    confirmChildStop();
+    await stopping;
+
+    expect(child.interruptCalls).toBe(1);
+    expect(parent.stopTaskCalls).toEqual([]);
+    parent.push(resultMessage(binding.nativeSessionId!, {
+      result: "",
+      totalCostUsd: 0,
+      terminalReason: "aborted_tools"
+    }));
+    await eventually(() => active.events.some((event) => event.type === "done"));
+    expect(active.events.at(-1)).toEqual({ type: "done", outcome: "aborted" });
+    await adapter.closeSession(binding, contextFor(binding).context);
+  });
+
+  test("routes a projected nested native task stop back to its child's original SDK task identity", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime({
+      autoAdmitTurns: true,
+      initialFrameOverrides: { model: "configured-model", effort: "low" }
+    });
+    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    const binding = await adapter.createSession(createInput({
+      providerId: "configured-provider",
+      modelId: "configured-model",
+      effort: "low"
+    }), contextFor().context);
+    const active = contextFor(binding, { operationId: "nested-native-stop" });
+    const managedContext = {
+      ...active.context,
+      modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+    };
+    await adapter.send(textPrompt("delegate nested work"), managedContext);
+    const parent = runtime.queries[0]!;
+    const delegate = parent.params.options.managedAgentTool;
+    if (delegate === undefined) throw new Error("Expected the managed Agent replacement.");
+    const delegated = delegate({
+      description: "Nested task owner",
+      prompt: "Start nested native work.",
+      subagent_type: "general-purpose",
+      model: "second-model"
+    }, { toolUseId: "nested-native-owner", signal: new AbortController().signal });
+    await vi.waitFor(() => expect(runtime.queries).toHaveLength(2));
+    const child = runtime.queries[1]!;
+    const childAssistant = assistantMessage(child.params.options.sessionId!, "nested-native-assistant", [{
+      type: "tool_use",
+      id: "nested-native-tool",
+      name: "Agent",
+      input: { prompt: "nested" }
+    }]);
+    child.push({ ...childAssistant, message: { ...childAssistant.message, model: "second-model" } });
+    child.push(taskStarted(child.params.options.sessionId!, "child-native-raw", "nested-native-tool", {
+      taskType: "local_agent",
+      description: "Nested native task"
+    }));
+    await eventually(() => active.events.some((event) => event.type === "subagent_run"
+      && event.run.title === "Nested native task"));
+    const nested = active.events.find((event): event is Extract<EventPayload, { type: "subagent_run" }> =>
+      event.type === "subagent_run" && event.run.title === "Nested native task")!;
+
+    await adapter.controlSubagent({
+      runId: nested.run.id,
+      childId: `${nested.run.id}:child`,
+      action: "stop"
+    }, managedContext);
+
+    expect(child.stopTaskCalls).toEqual(["child-native-raw"]);
+    expect(parent.stopTaskCalls).toEqual([]);
+    child.push(resultMessage(child.params.options.sessionId!, {
+      result: "Nested child completed.",
+      totalCostUsd: 0
+    }));
+    await expect(delegated).resolves.toEqual({ text: "Nested child completed." });
+    parent.push(resultMessage(binding.nativeSessionId!, { result: "Parent completed.", totalCostUsd: 0 }));
+    await eventually(() => active.events.some((event) => event.type === "done"));
     await adapter.closeSession(binding, contextFor(binding).context);
   });
 
@@ -4438,9 +4878,11 @@ class FakeSdkRuntime implements ClaudeSdkRuntime {
   probeCliVersion: string | undefined = "2.1.259";
   probeApiKeySource: string | undefined = "none";
   queryFailure: unknown = undefined;
+  admitTurns: boolean;
 
   constructor(options: FakeRuntimeOptions = {}) {
     this.options = options;
+    this.admitTurns = options.autoAdmitTurns !== false;
   }
 
   probe(input: ClaudeSdkProbeInput) {
@@ -4464,14 +4906,19 @@ class FakeSdkRuntime implements ClaudeSdkRuntime {
     this.queries.push(query);
     if (params.options.sessionId !== undefined) this.sessions.set(nativeSessionId, sessionInfo(nativeSessionId));
     void query.consumeInput((message) => {
-      if (this.options.autoAdmitTurns !== false) {
+      if (this.admitTurns) {
         query.push({
           ...systemInit(this.options.initialSessionIdOverride ?? nativeSessionId),
           ...(Array.isArray(params.options.tools) ? { tools: [...params.options.tools] } : {}),
           ...(this.options.initialPermissionMode === undefined
             ? {}
             : { permissionMode: this.options.initialPermissionMode }),
-          ...this.options.initialFrameOverrides
+          ...this.options.initialFrameOverrides,
+          ...(params.options.persistSession ? {} : {
+              cwd: params.options.cwd,
+              model: params.options.model,
+              permissionMode: params.options.permissionMode
+            })
         });
       }
       if (this.options.autoReplayInputs !== false && params.options.extraArgs?.["replay-user-messages"] === null) {

@@ -6,6 +6,7 @@ import {
   type DurableProcessLease,
   type DurableProcessOwnerOptions
 } from "@joko/runtime-governance";
+import { z } from "zod";
 
 export const CLAUDE_AGENT_SDK_PACKAGE = "@anthropic-ai/claude-agent-sdk";
 export const CLAUDE_AGENT_SDK_VERSION = "0.3.259";
@@ -13,6 +14,10 @@ export const CLAUDE_AGENT_SDK_VERSION = "0.3.259";
  * CLI version. This is authoritative only while no executable override is
  * supplied; an override must still prove its own version through a live init. */
 export const CLAUDE_AGENT_SDK_CLI_VERSION = "2.1.259";
+export const CLAUDE_MANAGED_AGENT_SERVER = "joko_managed_subagent";
+export const CLAUDE_MANAGED_AGENT_TOOL = "delegate";
+export const CLAUDE_MANAGED_AGENT_TOOL_NAME = `mcp__${CLAUDE_MANAGED_AGENT_SERVER}__${CLAUDE_MANAGED_AGENT_TOOL}`;
+const MAXIMUM_MANAGED_AGENT_RESULT_BYTES = 64 * 1024;
 
 export type ClaudeSdkPermissionMode =
   | "default"
@@ -73,6 +78,40 @@ export type ClaudeSdkHookInput = NativeHookInput;
 export type ClaudeSdkHookOutput = NativeHookJSONOutput;
 export type ClaudeSdkHooks = Partial<Record<NativeHookEvent, NativeHookCallbackMatcher[]>>;
 
+export interface ClaudeSdkAgentDefinition {
+  readonly description: string;
+  readonly prompt: string;
+  readonly tools?: readonly string[];
+  readonly disallowedTools?: readonly string[];
+  readonly model?: string;
+  readonly skills?: readonly string[];
+  readonly effort?: "low" | "medium" | "high" | "xhigh" | "max" | number;
+  readonly permissionMode?: ClaudeSdkPermissionMode;
+}
+
+export interface ClaudeSdkManagedAgentInput {
+  readonly description: string;
+  readonly prompt: string;
+  readonly subagent_type?: string;
+  readonly model?: string;
+  readonly run_in_background?: boolean;
+  readonly name?: string;
+  readonly team_name?: string;
+  readonly mode?: string;
+  readonly isolation?: "worktree" | "remote";
+  readonly cwd?: string;
+}
+
+export interface ClaudeSdkManagedAgentResult {
+  readonly text: string;
+  readonly isError?: boolean;
+}
+
+export type ClaudeSdkManagedAgentTool = (
+  input: ClaudeSdkManagedAgentInput,
+  options: { readonly toolUseId: string; readonly signal: AbortSignal }
+) => Promise<ClaudeSdkManagedAgentResult>;
+
 export interface ClaudeSdkOAuthTokenOptions {
   readonly signal: AbortSignal;
   readonly onDecline?: () => void;
@@ -89,7 +128,16 @@ export interface ClaudeSdkUserMessage {
     readonly content: string | readonly Readonly<Record<string, unknown>>[];
   };
   readonly parent_tool_use_id: null;
-  readonly origin: { readonly kind: "human" };
+  readonly origin:
+    | { readonly kind: "human" }
+    | {
+        readonly kind: "peer";
+        readonly from: string;
+        readonly fromMode?: "bypass" | "prompting";
+        readonly senderTaskId?: string;
+        readonly body?: string;
+      }
+    | { readonly kind: "task-notification" };
   readonly uuid: string;
 }
 
@@ -129,6 +177,7 @@ export interface ClaudeSdkQuery extends AsyncIterable<unknown> {
   applyFlagSettings(settings: {
     readonly effortLevel?: "low" | "medium" | "high" | "xhigh" | "max" | null;
     readonly fastMode?: boolean | null;
+    readonly autoCompactWindow?: number | null;
     readonly permissions?: {
       readonly additionalDirectories?: readonly string[];
     } | null;
@@ -143,7 +192,8 @@ export interface ClaudeSdkQueryOptions {
   readonly abortController: AbortController;
   readonly additionalDirectories: readonly string[];
   readonly allowDangerouslySkipPermissions: boolean;
-  readonly agents?: Readonly<Record<string, never>>;
+  readonly agent?: string;
+  readonly agents?: Readonly<Record<string, ClaudeSdkAgentDefinition>>;
   readonly canUseTool: (
     toolName: string,
     input: Readonly<Record<string, unknown>>,
@@ -156,6 +206,9 @@ export interface ClaudeSdkQueryOptions {
   readonly effort?: "low" | "medium" | "high" | "xhigh" | "max";
   readonly forwardSubagentText?: boolean;
   readonly hooks?: ClaudeSdkHooks;
+  /** Adapter-private Agent/Task replacement. SDK runtimes own the in-process
+   * MCP transport so local and remote Queries preserve the same callback. */
+  readonly managedAgentTool?: ClaudeSdkManagedAgentTool;
   readonly includePartialMessages: true;
   readonly disallowedTools?: readonly string[];
   readonly mcpServers?: Readonly<Record<string, never>>;
@@ -299,6 +352,19 @@ interface LoadedSdkModule {
     readonly options?: NativeOptionsWithOAuth;
     readonly initializeTimeoutMs?: number;
   }) => Promise<NativeWarmQuery>;
+  readonly createSdkMcpServer: (options: {
+    readonly name: string;
+    readonly version?: string;
+    readonly tools: readonly {
+      readonly name: string;
+      readonly description: string;
+      readonly inputSchema: Readonly<Record<string, unknown>>;
+      readonly handler: (args: ClaudeSdkManagedAgentInput, extra: unknown) => Promise<{
+        readonly content: readonly { readonly type: "text"; readonly text: string }[];
+        readonly isError?: boolean;
+      }>;
+    }[];
+  }) => NativeMcpSdkServerConfig;
 }
 
 export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
@@ -408,11 +474,16 @@ export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
   async query(params: ClaudeSdkQueryParams): Promise<ClaudeSdkQuery> {
     await this.#processOwner?.prepare(this.#retirementTimeoutMs);
     const leases: DurableProcessLease[] = [];
+    const loaded = await this.#load();
+    const managedAgentServer = params.options.managedAgentTool === undefined
+      ? undefined
+      : createManagedAgentServer(loaded, params.options.managedAgentTool);
     const options: NativeOptionsWithOAuth = {
       abortController: params.options.abortController,
       additionalDirectories: [...params.options.additionalDirectories],
       allowDangerouslySkipPermissions: params.options.allowDangerouslySkipPermissions,
-      ...(params.options.agents === undefined ? {} : { agents: { ...params.options.agents } }),
+      ...(params.options.agent === undefined ? {} : { agent: params.options.agent }),
+      ...(params.options.agents === undefined ? {} : { agents: cloneAgentDefinitions(params.options.agents) }),
       canUseTool: params.options.canUseTool,
       cwd: params.options.cwd,
       env: { ...params.options.env },
@@ -427,7 +498,16 @@ export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
       ...(params.options.disallowedTools === undefined
         ? {}
         : { disallowedTools: [...params.options.disallowedTools] }),
-      ...(params.options.mcpServers === undefined ? {} : { mcpServers: { ...params.options.mcpServers } }),
+      ...(managedAgentServer === undefined && params.options.mcpServers === undefined
+        ? {}
+        : {
+            mcpServers: {
+              ...(params.options.mcpServers ?? {}),
+              ...(managedAgentServer === undefined
+                ? {}
+                : { [CLAUDE_MANAGED_AGENT_SERVER]: managedAgentServer })
+            }
+          }),
       ...(params.options.model === undefined ? {} : { model: params.options.model }),
       ...(params.options.pathToClaudeCodeExecutable === undefined
         ? {}
@@ -445,11 +525,19 @@ export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
       ...(params.options.strictMcpConfig === undefined ? {} : { strictMcpConfig: params.options.strictMcpConfig }),
       systemPrompt: params.options.systemPrompt,
       ...(params.options.title === undefined ? {} : { title: params.options.title }),
+      ...(managedAgentServer === undefined
+        ? {}
+        : {
+            toolAliases: {
+              Agent: CLAUDE_MANAGED_AGENT_TOOL_NAME,
+              Task: CLAUDE_MANAGED_AGENT_TOOL_NAME
+            }
+          }),
       tools: Array.isArray(params.options.tools)
         ? [...params.options.tools]
         : { type: "preset", preset: "claude_code" }
     };
-    const query = (await this.#load()).query({
+    const query = loaded.query({
       prompt: params.prompt as AsyncIterable<NativeSdkUserMessage>,
       options
     }) as unknown as ClaudeSdkQuery;
@@ -532,10 +620,68 @@ async function loadSdkModule(): Promise<LoadedSdkModule> {
   const value: unknown = await import(moduleName);
   if (!isRecord(value)
     || typeof value["query"] !== "function"
-    || typeof value["startup"] !== "function") {
+    || typeof value["startup"] !== "function"
+    || typeof value["createSdkMcpServer"] !== "function") {
     throw new Error("The installed Claude Agent SDK has an incompatible module surface.");
   }
   return value as unknown as LoadedSdkModule;
+}
+
+function createManagedAgentServer(
+  loaded: LoadedSdkModule,
+  callback: ClaudeSdkManagedAgentTool
+): NativeMcpSdkServerConfig {
+  return loaded.createSdkMcpServer({
+    name: CLAUDE_MANAGED_AGENT_SERVER,
+    version: "1.0.0",
+    tools: [{
+      name: CLAUDE_MANAGED_AGENT_TOOL,
+      description: "Run an exactly configured Joko-managed Claude subagent.",
+      inputSchema: {
+        description: z.string().trim().min(1).max(512),
+        prompt: z.string().min(1).max(1024 * 1024),
+        subagent_type: z.string().trim().min(1).max(256).optional(),
+        model: z.string().trim().min(1).max(512).optional(),
+        run_in_background: z.boolean().optional(),
+        name: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/u).optional(),
+        team_name: z.string().max(256).optional(),
+        mode: z.string().max(64).optional(),
+        isolation: z.enum(["worktree", "remote"]).optional(),
+        cwd: z.string().max(16_384).optional()
+      },
+      handler: async (input, extra) => {
+        const details = isRecord(extra) ? extra : undefined;
+        const metadata = isRecord(details?.["_meta"]) ? details["_meta"] : undefined;
+        const toolUseId = metadata?.["claudecode/toolUseId"];
+        const signal = details?.["signal"];
+        if (typeof toolUseId !== "string" || toolUseId.length === 0 || toolUseId.length > 512
+          || /[\x00-\x1f\x7f]/u.test(toolUseId) || !(signal instanceof AbortSignal)) {
+          throw new Error("The managed Agent invocation lacks its SDK ownership metadata.");
+        }
+        const result = await callback(Object.freeze({ ...input }), { toolUseId, signal });
+        if (!isRecord(result) || typeof result["text"] !== "string"
+          || Buffer.byteLength(result["text"], "utf8") > MAXIMUM_MANAGED_AGENT_RESULT_BYTES
+          || (result["isError"] !== undefined && typeof result["isError"] !== "boolean")) {
+          throw new Error("The managed Agent callback returned an invalid result.");
+        }
+        return {
+          content: [{ type: "text", text: result["text"] }],
+          ...(result["isError"] === true ? { isError: true } : {})
+        };
+      }
+    }]
+  });
+}
+
+function cloneAgentDefinitions(
+  definitions: Readonly<Record<string, ClaudeSdkAgentDefinition>>
+): Record<string, NativeAgentDefinition> {
+  return Object.fromEntries(Object.entries(definitions).map(([name, definition]) => [name, {
+    ...definition,
+    ...(definition.tools === undefined ? {} : { tools: [...definition.tools] }),
+    ...(definition.disallowedTools === undefined ? {} : { disallowedTools: [...definition.disallowedTools] }),
+    ...(definition.skills === undefined ? {} : { skills: [...definition.skills] })
+  }])) as Record<string, NativeAgentDefinition>;
 }
 
 async function* emptySdkInput(): AsyncGenerator<NativeSdkUserMessage> {
@@ -666,10 +812,12 @@ function positiveTimeout(value: number | undefined, fallback: number): number {
   return resolved;
 }
 import type {
+  AgentDefinition as NativeAgentDefinition,
   HookCallbackMatcher as NativeHookCallbackMatcher,
   HookEvent as NativeHookEvent,
   HookInput as NativeHookInput,
   HookJSONOutput as NativeHookJSONOutput,
+  McpSdkServerConfigWithInstance as NativeMcpSdkServerConfig,
   Options as NativeOptions,
   Query as NativeQuery,
   SDKUserMessage as NativeSdkUserMessage,

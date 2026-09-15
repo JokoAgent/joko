@@ -15,6 +15,7 @@ import {
   type ClaudeSdkHookOutput,
   type ClaudeSdkInitializationResult,
   type ClaudeSdkListSessionsOptions,
+  type ClaudeSdkManagedAgentInput,
   type ClaudeSdkModelInfo,
   type ClaudeSdkPermissionMode,
   type ClaudeSdkProbe,
@@ -55,6 +56,7 @@ const MAXIMUM_QUEUED_EVENTS = 4_096;
 const MAXIMUM_QUEUED_EVENT_BYTES = 32 * 1024 * 1024;
 const MAXIMUM_CALLBACKS_PER_QUERY = 256;
 const MAXIMUM_HOOK_PAYLOAD_BYTES = 1024 * 1024;
+const MAXIMUM_MANAGED_AGENT_RESULT_BYTES = 64 * 1024;
 const REMOTE_HOOK_EVENTS = ["PreToolUse", "PermissionDenied", "PostToolUse", "PostToolUseFailure"] as const satisfies readonly ClaudeSdkHookEvent[];
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
@@ -558,6 +560,7 @@ class RemoteClaudeQuery implements ClaudeSdkQuery {
   async applyFlagSettings(settings: {
     readonly effortLevel?: "low" | "medium" | "high" | "xhigh" | "max" | null;
     readonly fastMode?: boolean | null;
+    readonly autoCompactWindow?: number | null;
     readonly permissions?: { readonly additionalDirectories?: readonly string[] } | null;
   }): Promise<void> {
     await this.#control("query.applyFlagSettings", { settings });
@@ -875,6 +878,19 @@ class RemoteClaudeQuery implements ClaudeSdkQuery {
         const request = hookCallbackRequest(frame.value, this.#options.params.options);
         const result = await request.callback(request.input, request.toolUseId, { signal: controller.signal });
         if (!isRecord(result) || encodedBytes(result) > MAXIMUM_HOOK_PAYLOAD_BYTES) {
+          throw runtimeFault("callback_invalid", false);
+        }
+        await channel.sendCallback(callbackId, true, result);
+      } else if (frame.callback === "managedAgentTool"
+        && this.#options.params.options.managedAgentTool !== undefined) {
+        const request = managedAgentCallbackRequest(frame.value);
+        const result = await this.#options.params.options.managedAgentTool(request.input, {
+          toolUseId: request.toolUseId,
+          signal: controller.signal
+        });
+        if (!isRecord(result) || typeof result["text"] !== "string"
+          || Buffer.byteLength(result["text"], "utf8") > MAXIMUM_MANAGED_AGENT_RESULT_BYTES
+          || (result["isError"] !== undefined && typeof result["isError"] !== "boolean")) {
           throw runtimeFault("callback_invalid", false);
         }
         await channel.sendCallback(callbackId, true, result);
@@ -1242,6 +1258,7 @@ function serializeQueryOptions(options: ClaudeSdkQueryOptions): Readonly<Record<
   return {
     additionalDirectories: [...options.additionalDirectories],
     allowDangerouslySkipPermissions: options.allowDangerouslySkipPermissions,
+    ...(options.agent === undefined ? {} : { agent: options.agent }),
     ...(options.agents === undefined ? {} : { agents: { ...options.agents } }),
     cwd: options.cwd,
     env: { ...options.env },
@@ -1250,6 +1267,7 @@ function serializeQueryOptions(options: ClaudeSdkQueryOptions): Readonly<Record<
     ...(options.effort === undefined ? {} : { effort: options.effort }),
     ...(options.forwardSubagentText === undefined ? {} : { forwardSubagentText: options.forwardSubagentText }),
     ...(options.hooks === undefined ? {} : { hooks: serializeHookManifest(options.hooks) }),
+    ...(options.managedAgentTool === undefined ? {} : { managedAgentTool: true }),
     includePartialMessages: true,
     ...(options.disallowedTools === undefined ? {} : { disallowedTools: [...options.disallowedTools] }),
     ...(options.mcpServers === undefined ? {} : { mcpServers: { ...options.mcpServers } }),
@@ -1266,6 +1284,54 @@ function serializeQueryOptions(options: ClaudeSdkQueryOptions): Readonly<Record<
     ...(options.title === undefined ? {} : { title: options.title }),
     tools: Array.isArray(options.tools) ? [...options.tools] : { ...options.tools }
   };
+}
+
+function managedAgentCallbackRequest(value: unknown): {
+  readonly input: ClaudeSdkManagedAgentInput;
+  readonly toolUseId: string;
+} {
+  if (!isRecord(value) || !isRecord(value["input"]) || typeof value["toolUseId"] !== "string"
+    || value["toolUseId"].length === 0 || value["toolUseId"].length > 512
+    || /[\x00-\x1f\x7f]/u.test(value["toolUseId"])
+    || !Object.keys(value).every((key) => key === "input" || key === "toolUseId")
+    || encodedBytes(value) > MAXIMUM_HOOK_PAYLOAD_BYTES) {
+    throw runtimeFault("callback_invalid", false);
+  }
+  const raw = value["input"];
+  const allowedKeys = new Set([
+    "description", "prompt", "subagent_type", "model", "run_in_background",
+    "name", "team_name", "mode", "isolation", "cwd"
+  ]);
+  if (!Object.keys(raw).every((key) => allowedKeys.has(key))
+    || !trimmedString(raw["description"], 1, 512)
+    || typeof raw["prompt"] !== "string" || raw["prompt"].length < 1 || raw["prompt"].length > 1024 * 1024
+    || !optionalTrimmedString(raw["subagent_type"], 1, 256)
+    || !optionalTrimmedString(raw["model"], 1, 512)
+    || (raw["run_in_background"] !== undefined && typeof raw["run_in_background"] !== "boolean")
+    || (raw["name"] !== undefined && (typeof raw["name"] !== "string"
+      || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/u.test(raw["name"])))
+    || !optionalStringWithin(raw["team_name"], 256)
+    || !optionalStringWithin(raw["mode"], 64)
+    || (raw["isolation"] !== undefined && raw["isolation"] !== "worktree" && raw["isolation"] !== "remote")
+    || !optionalStringWithin(raw["cwd"], 16_384)) {
+    throw runtimeFault("callback_invalid", false);
+  }
+  return {
+    input: Object.freeze({ ...raw }) as unknown as ClaudeSdkManagedAgentInput,
+    toolUseId: value["toolUseId"]
+  };
+}
+
+function trimmedString(value: unknown, minimum: number, maximum: number): value is string {
+  return typeof value === "string" && value.length >= minimum && value.length <= maximum && value.trim() === value;
+}
+
+function optionalTrimmedString(value: unknown, minimum: number, maximum: number): boolean {
+  return value === undefined || trimmedString(value, minimum, maximum);
+}
+
+function optionalStringWithin(value: unknown, maximum: number): boolean {
+  return value === undefined || (typeof value === "string" && value.length <= maximum);
 }
 
 function serializeHookManifest(hooks: NonNullable<ClaudeSdkQueryOptions["hooks"]>): Readonly<Record<string, unknown>> {

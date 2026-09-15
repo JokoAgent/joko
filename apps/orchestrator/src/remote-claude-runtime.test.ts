@@ -113,9 +113,10 @@ describe("RemoteClaudeRuntimeResolver", () => {
         permissionDecisionReason: "fixture denied"
       }
     }));
+    const managedAgent = vi.fn(async () => ({ text: "delegated remotely" }));
     const query = await binding.runtime.query(queryParams(permission, oauth, true, {
       PreToolUse: [{ matcher: "Agent", hooks: [managedHook] }]
-    }));
+    }, { agent: "general-purpose", managedAgentTool: managedAgent }));
 
     await waitUntil(() => fixture.processes.inputRequests.length === 2);
     expect(fixture.processes.startRequests).toHaveLength(2);
@@ -135,7 +136,11 @@ describe("RemoteClaudeRuntimeResolver", () => {
     await expect(query.interrupt()).resolves.toEqual({ still_queued: [] });
     await expect(query.setModel("claude-fixture")).resolves.toBeUndefined();
     await expect(query.setPermissionMode("acceptEdits")).resolves.toBeUndefined();
-    await expect(query.applyFlagSettings({ effortLevel: "high", fastMode: true })).resolves.toBeUndefined();
+    await expect(query.applyFlagSettings({
+      effortLevel: "high",
+      fastMode: true,
+      autoCompactWindow: 128_000
+    })).resolves.toBeUndefined();
 
     await expect(fixture.processes.invokeCallback("canUseTool", {
       toolName: "Read",
@@ -158,6 +163,28 @@ describe("RemoteClaudeRuntimeResolver", () => {
     expect(managedHook).toHaveBeenCalledWith(expect.objectContaining({ tool_name: "Agent" }), "agent-one", {
       signal: expect.any(AbortSignal)
     });
+    await expect(fixture.processes.invokeCallback("managedAgentTool", {
+      input: {
+        description: "Remote inspector",
+        prompt: "Inspect the exact remote Target.",
+        subagent_type: "general-purpose",
+        model: "claude-child",
+        run_in_background: true
+      },
+      toolUseId: "agent-two"
+    })).resolves.toEqual({ text: "delegated remotely" });
+    expect(managedAgent).toHaveBeenCalledWith({
+      description: "Remote inspector",
+      prompt: "Inspect the exact remote Target.",
+      subagent_type: "general-purpose",
+      model: "claude-child",
+      run_in_background: true
+    }, { toolUseId: "agent-two", signal: expect.any(AbortSignal) });
+    await expect(fixture.processes.invokeCallback("managedAgentTool", {
+      input: { description: "Missing prompt" },
+      toolUseId: "agent-invalid"
+    })).rejects.toThrow("Callback failed");
+    expect(managedAgent).toHaveBeenCalledOnce();
 
     const startOptions = fixture.processes.startRequests.at(-1)?.params.options as Record<string, unknown>;
     expect(startOptions.env).toMatchObject({
@@ -165,6 +192,7 @@ describe("RemoteClaudeRuntimeResolver", () => {
       ANTHROPIC_BASE_URL: "http://127.0.0.1:39001/v1"
     });
     expect(startOptions.hooks).toEqual({ PreToolUse: [{ matcher: "Agent", hookCount: 1 }] });
+    expect(startOptions).toMatchObject({ agent: "general-purpose", managedAgentTool: true });
     expect(fixture.forwarding.listen).toHaveBeenCalledWith(expect.objectContaining({
       localDestinationHost: "127.0.0.1",
       localDestinationPort: 4567,
@@ -175,6 +203,71 @@ describe("RemoteClaudeRuntimeResolver", () => {
     await expect(binding.runtime.retireQuery(query, 2_000)).resolves.toBeUndefined();
     expect(fixture.processes.retireEffects).toBe(1);
     expect(forwardClose).toHaveBeenCalledOnce();
+  });
+
+  it("preserves peer and task-notification origins across exact remote input receipts", async () => {
+    const fixture = createFixture();
+    cleanups.push(() => fixture.resolver.close());
+    const binding = await fixture.resolver.resolve(fixture.target);
+    const notificationId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const messages: ClaudeSdkUserMessage[] = [{
+      type: "user",
+      message: { role: "user", content: "peer work" },
+      parent_tool_use_id: null,
+      origin: {
+        kind: "peer",
+        from: SESSION_ID,
+        fromMode: "prompting",
+        senderTaskId: "managed-agent-one",
+        body: "peer work"
+      },
+      uuid: INPUT_ID
+    }, {
+      type: "user",
+      message: { role: "user", content: "<task-notification>done</task-notification>" },
+      parent_tool_use_id: null,
+      origin: { kind: "task-notification" },
+      uuid: notificationId
+    }];
+    const query = await binding.runtime.query(queryParams(undefined, undefined, false, undefined, {}, messages));
+
+    await waitUntil(() => fixture.processes.inputEffects === 2);
+    expect(fixture.processes.inputRequests.map((request) =>
+      (request.params["message"] as ClaudeSdkUserMessage).origin)).toEqual([
+      messages[0]!.origin,
+      messages[1]!.origin
+    ]);
+    await binding.runtime.retireQuery(query, 2_000);
+  });
+
+  it("propagates a remote manager cancellation into the exact managed Agent callback signal", async () => {
+    const fixture = createFixture();
+    cleanups.push(() => fixture.resolver.close());
+    const binding = await fixture.resolver.resolve(fixture.target);
+    let callbackSignal: AbortSignal | undefined;
+    const managedAgent = vi.fn(async (_input, options): Promise<{ text: string }> => {
+      callbackSignal = options.signal;
+      if (!options.signal.aborted) {
+        await new Promise<void>((resolvePromise) =>
+          options.signal.addEventListener("abort", () => resolvePromise(), { once: true }));
+      }
+      return { text: "cancelled" };
+    });
+    const query = await binding.runtime.query(queryParams(undefined, undefined, false, undefined, {
+      managedAgentTool: managedAgent
+    }));
+    const pending = fixture.processes.invokeCallback("managedAgentTool", {
+      input: { description: "Cancellable child", prompt: "Wait for cancellation." },
+      toolUseId: "agent-cancel"
+    });
+    await waitUntil(() => callbackSignal !== undefined);
+
+    fixture.processes.cancelCallback("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+
+    await waitUntil(() => callbackSignal?.aborted === true);
+    await expect(pending).resolves.toEqual({ text: "cancelled" });
+    expect(managedAgent).toHaveBeenCalledOnce();
+    await binding.runtime.retireQuery(query, 2_000);
   });
 
   it("does not replay a maybe-consumed Query start into a replacement manager generation", async () => {
@@ -377,16 +470,24 @@ class FakeClaudeManagerProcesses implements RemoteProcessTransportPort {
     query.process.finish(1);
   }
 
-  invokeCallback(callback: "canUseTool" | "oauth" | "hook", value: unknown): Promise<unknown> {
+  invokeCallback(callback: "canUseTool" | "oauth" | "hook" | "managedAgentTool", value: unknown): Promise<unknown> {
     const query = this.#query;
     if (query === undefined) return Promise.reject(new Error("No query is attached."));
     const callbackId = callback === "oauth"
       ? "55555555-5555-4555-8555-555555555555"
       : callback === "hook"
         ? "99999999-9999-4999-8999-999999999999"
+        : callback === "managedAgentTool"
+          ? "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         : "66666666-6666-4666-8666-666666666666";
     query.process.send({ v: 1, kind: "callback", callbackId, queryId: query.queryId, callback, value });
     return new Promise((resolve, reject) => this.#callbacks.set(callbackId, { resolve, reject }));
+  }
+
+  cancelCallback(callbackId: string): void {
+    const query = this.#query;
+    if (query === undefined) throw new Error("No query is attached.");
+    query.process.send({ v: 1, kind: "callback_cancel", callbackId });
   }
 
   #accept(frame: Record<string, unknown>, process: FixtureProcess): void {
@@ -609,16 +710,19 @@ function queryParams(
   canUseTool: ClaudeSdkQueryOptions["canUseTool"] = async (_tool, input) => ({ behavior: "allow", updatedInput: { ...input } }),
   getOAuthToken: ClaudeSdkQueryOptions["getOAuthToken"] = async () => null,
   includeProviderRoute = true,
-  hooks?: ClaudeSdkQueryOptions["hooks"]
+  hooks?: ClaudeSdkQueryOptions["hooks"],
+  optionOverrides: Partial<ClaudeSdkQueryOptions> = {},
+  messages?: readonly ClaudeSdkUserMessage[]
 ): ClaudeSdkQueryParams {
   const prompt = (async function* (): AsyncGenerator<ClaudeSdkUserMessage> {
-    yield {
+    const input = messages ?? [{
       type: "user",
       message: { role: "user", content: "hello" },
       parent_tool_use_id: null,
       origin: { kind: "human" },
       uuid: INPUT_ID
-    };
+    } satisfies ClaudeSdkUserMessage];
+    for (const message of input) yield message;
   })();
   return {
     prompt,
@@ -640,7 +744,8 @@ function queryParams(
       sessionId: SESSION_ID,
       settingSources: ["user", "project", "local"],
       systemPrompt: { type: "preset", preset: "claude_code" },
-      tools: { type: "preset", preset: "claude_code" }
+      tools: { type: "preset", preset: "claude_code" },
+      ...optionOverrides
     }
   };
 }

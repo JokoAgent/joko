@@ -2,15 +2,16 @@ import { mkdtemp, readFile, readdir, mkdir, rm, writeFile } from "node:fs/promis
 import { createServer, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { query, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import { createSdkMcpServer, query, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { AdapterContext, EventPayload, ManagedProviderRuntimePort, ManagedProviderRouteBinding, ProviderModel, TargetDescriptor } from "@joko/core";
 import { createChildRuntimeEnvironment } from "@joko/runtime-governance";
 import { expect, test, vi } from "vitest";
+import { z } from "zod";
 import { ClaudeCodeAdapter, managedModelLimitEnvironment } from "./adapter.js";
 
 const enabled = process.env["JOKO_CLAUDE_LOCAL_GATEWAY_PROBE"] === "1";
 
-test.skipIf(!enabled)("uses fixed-SDK per-model effort through a local gateway while preserving leases, settings, and child credential scrubbing", async () => {
+test.skipIf(!enabled)("uses fixed-SDK per-model effort and context leases through a local gateway while preserving credentials", async () => {
   const directory = await mkdtemp(join(tmpdir(), "joko-claude-local-gateway-"));
   const workspaceRoot = join(directory, "workspace");
   const configDirectory = join(directory, "profile");
@@ -48,7 +49,13 @@ test.skipIf(!enabled)("uses fixed-SDK per-model effort through a local gateway w
   const model: ProviderModel = { providerId: "local-gateway", modelId: "joko-local-model", displayName: "Local model",
     api: "anthropic-messages", contextWindow: 64_000, maxOutputTokens: 4_000, supportsImages: false, thinkingLevels: ["high"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
-  const childModel: ProviderModel = { ...model, modelId: "joko-local-child-model", displayName: "Local child model" };
+  const childModel: ProviderModel = {
+    ...model,
+    modelId: "joko-local-child-model",
+    displayName: "Local child model",
+    contextWindow: 128_000,
+    maxOutputTokens: 8_000
+  };
   const requests: { path: string; model: unknown; authenticated: boolean; messages: unknown; outputConfig: unknown;
     maxTokens: unknown; hasBashTool: boolean; parentLease: boolean; childLease: boolean }[] = [];
   const failures: string[] = [];
@@ -185,6 +192,8 @@ test.skipIf(!enabled)("uses fixed-SDK per-model effort through a local gateway w
     expect(turnRequests.length).toBeGreaterThanOrEqual(2);
     expect(turnRequests.every((request) => (request.outputConfig as { effort?: unknown } | undefined)?.effort === "xhigh"),
       JSON.stringify(turnRequests.map((request) => ({ path: request.path, outputConfig: request.outputConfig })))).toBe(true);
+    // Independent Queries keep the parent and child output envelopes exact;
+    // the production private proxy also clamps each route before dispatch.
     expect(turnRequests.every((request) => request.maxTokens === model.maxOutputTokens),
       JSON.stringify(turnRequests.map((request) => ({ path: request.path, maxTokens: request.maxTokens })))).toBe(true);
     const childRequests = requests.filter((request) => request.path.split("?")[0] === "/v1/messages"
@@ -198,6 +207,11 @@ test.skipIf(!enabled)("uses fixed-SDK per-model effort through a local gateway w
     expect(childRequests.every((request) => (request.outputConfig as { effort?: unknown } | undefined)?.effort === "medium"),
       JSON.stringify(childRequests.map((request) => ({ path: request.path, outputConfig: request.outputConfig })))).toBe(true);
     expect(childRequests.every((request) => request.maxTokens === childModel.maxOutputTokens)).toBe(true);
+    const childRequestIndex = requests.findIndex((request) => request.path.split("?")[0] === "/v1/messages"
+      && request.model === childModel.modelId);
+    expect(childRequestIndex).toBeGreaterThan(0);
+    expect(requests.slice(childRequestIndex + 1).some((request) => request.path.split("?")[0] === "/v1/messages"
+      && request.model === model.modelId)).toBe(true);
     expect(events.filter((event): event is Extract<EventPayload, { type: "usage" }> => event.type === "usage").at(-1)?.usage.contextWindow)
       .toBe(model.contextWindow);
     expect(released).toBe(true);
@@ -217,7 +231,7 @@ test.skipIf(!enabled)("uses fixed-SDK per-model effort through a local gateway w
   }
 }, 75_000);
 
-test.skipIf(!enabled)("applies managed context windows to the fixed SDK native working-window control", async () => {
+test.skipIf(!enabled)("pins each managed context window when the fixed SDK Query is constructed", async () => {
   const directory = await mkdtemp(join(tmpdir(), "joko-claude-context-policy-"));
   const server = createServer((request, response) => {
     request.resume();
@@ -274,7 +288,402 @@ test.skipIf(!enabled)("applies managed context windows to the fixed SDK native w
         releasePrompt();
       }
     }
+
+    const parent: ProviderModel = {
+      providerId: "local-gateway", modelId: "joko-context-switch-model", displayName: "Context switch model",
+      api: "anthropic-messages", contextWindow: 64_000, maxOutputTokens: 4_000, supportsImages: false, thinkingLevels: [],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+    };
+    const envelope = {
+      ...managedModelLimitEnvironment(parent),
+      CLAUDE_CODE_MAX_CONTEXT_TOKENS: "128000",
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: "8000"
+    };
+    let releaseSwitchPrompt!: () => void;
+    const pendingSwitchPrompt = new Promise<void>((resolvePromise) => { releaseSwitchPrompt = resolvePromise; });
+    async function* switchPrompt(): AsyncGenerator<SDKUserMessage> { await pendingSwitchPrompt; }
+    const switchEnvironment = createChildRuntimeEnvironment({
+      overrides: {
+        HOME: directory,
+        USERPROFILE: directory,
+        CLAUDE_CONFIG_DIR: directory,
+        ANTHROPIC_BASE_URL: `http://127.0.0.1:${address.port}`,
+        ANTHROPIC_API_KEY: "fake-context-switch-key",
+        CLAUDE_CODE_OAUTH_TOKEN: undefined,
+        ...envelope
+      }
+    }).environment;
+    const switchingQuery = query({
+      prompt: switchPrompt(),
+      options: {
+        cwd: directory,
+        model: parent.modelId,
+        tools: [],
+        mcpServers: {},
+        settingSources: [],
+        systemPrompt: "Context switching control test.",
+        env: switchEnvironment,
+        settings: { env: { ...envelope } }
+      }
+    });
+    try {
+      // The fixed CLI exposes its 100K native floor; the 57.6% process
+      // override preserves the parent's effective 64K working budget. A
+      // post-start flag update is queued for a future engine turn, so it is
+      // not a valid way to reconfigure an already-running delegated Query.
+      expect((await switchingQuery.getContextUsage({ detail: "summary" })).maxTokens).toBe(100_000);
+      await switchingQuery.applyFlagSettings({ autoCompactWindow: 128_000 });
+      expect((await switchingQuery.getContextUsage({ detail: "summary" })).maxTokens).toBe(100_000);
+      await switchingQuery.applyFlagSettings({ autoCompactWindow: 64_000 });
+      expect((await switchingQuery.getContextUsage({ detail: "summary" })).maxTokens).toBe(100_000);
+    } finally {
+      switchingQuery.close();
+      releaseSwitchPrompt();
+    }
   } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolvePromise) => server.close(() => resolvePromise()));
+    await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+}, 75_000);
+
+test.skipIf(!enabled)("keeps an explicit child Query model authoritative over its main-thread agent definition", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "joko-claude-agent-model-"));
+  const requestedModels: string[] = [];
+  const server = createServer((request, response) => {
+    void (async () => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { model?: unknown };
+      if (request.url?.split("?")[0] === "/v1/messages/count_tokens") {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ input_tokens: 10 }));
+        return;
+      }
+      if (typeof body.model === "string") requestedModels.push(body.model);
+      sendTextMessage(response, typeof body.model === "string" ? body.model : "missing-model", "Child finished.");
+    })().catch(() => {
+      response.writeHead(500, { "content-type": "application/json" });
+      response.end(JSON.stringify({ type: "error", error: { type: "api_error", message: "fixture failed" } }));
+    });
+  });
+  await new Promise<void>((resolvePromise) => server.listen(0, "127.0.0.1", resolvePromise));
+  const address = server.address();
+  if (address === null || typeof address === "string") throw new Error("The agent-model fixture did not bind.");
+  async function* prompt(): AsyncGenerator<SDKUserMessage> {
+    yield {
+      type: "user",
+      message: { role: "user", content: "Return a short completion." },
+      parent_tool_use_id: null,
+      origin: { kind: "peer", from: "managed-parent", body: "Return a short completion." },
+      uuid: "f04b1b5d-20f7-49b7-bd6d-183d37c1621f"
+    };
+  }
+  const environment = createChildRuntimeEnvironment({
+    overrides: {
+      HOME: directory,
+      USERPROFILE: directory,
+      CLAUDE_CONFIG_DIR: directory,
+      ANTHROPIC_BASE_URL: `http://127.0.0.1:${address.port}`,
+      ANTHROPIC_API_KEY: "fake-agent-model-key",
+      CLAUDE_CODE_OAUTH_TOKEN: undefined
+    }
+  }).environment;
+  const nativeQuery = query({
+    prompt: prompt(),
+    options: {
+      cwd: directory,
+      model: "exact-child-model",
+      agent: "joko-test-agent",
+      agents: {
+        "joko-test-agent": {
+          description: "Exercise main-thread agent precedence.",
+          prompt: "Return the requested completion.",
+          model: "definition-model",
+          tools: []
+        }
+      },
+      tools: [],
+      settingSources: [],
+      permissionMode: "bypassPermissions",
+      allowDangerouslySkipPermissions: true,
+      env: environment
+    }
+  });
+  const output: unknown[] = [];
+  try {
+    for await (const message of nativeQuery) {
+      output.push(message);
+      if ((message as { type?: unknown }).type === "result") break;
+    }
+    expect(requestedModels.length, JSON.stringify(output)).toBeGreaterThanOrEqual(1);
+    expect(requestedModels.every((model) => model === "exact-child-model"), JSON.stringify(requestedModels)).toBe(true);
+  } finally {
+    nativeQuery.close();
+    server.closeAllConnections();
+    await new Promise<void>((resolvePromise) => server.close(() => resolvePromise()));
+    await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+}, 75_000);
+
+test.skipIf(!enabled)("redirects the fixed SDK Agent tool through an in-process SDK MCP result", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "joko-claude-agent-alias-"));
+  const requests: unknown[] = [];
+  const handlerCalls: { args: unknown; extra: unknown }[] = [];
+  const hookCalls: { input: unknown; toolUseId: unknown }[] = [];
+  const server = createServer((request, response) => {
+    void (async () => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { messages?: unknown; model?: string };
+      requests.push(body);
+      if (request.url?.split("?")[0] === "/v1/messages/count_tokens") {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ input_tokens: 10 }));
+        return;
+      }
+      const completedTools = toolResultCount(body.messages);
+      if (completedTools === 0) sendParentMessage(response, body.model ?? "joko-alias-model", 1);
+      else sendTextMessage(response, body.model ?? "joko-alias-model", "Alias result accepted.");
+    })().catch(() => {
+      response.writeHead(500, { "content-type": "application/json" });
+      response.end(JSON.stringify({ type: "error", error: { type: "api_error", message: "fixture failed" } }));
+    });
+  });
+  await new Promise<void>((resolvePromise) => server.listen(0, "127.0.0.1", resolvePromise));
+  const address = server.address();
+  if (address === null || typeof address === "string") throw new Error("The alias fixture did not bind.");
+  let releasePrompt!: () => void;
+  const pendingPrompt = new Promise<void>((resolvePromise) => { releasePrompt = resolvePromise; });
+  async function* prompt(): AsyncGenerator<SDKUserMessage> {
+    yield {
+      type: "user",
+      message: { role: "user", content: "Delegate this check." },
+      parent_tool_use_id: null,
+      origin: { kind: "human" },
+      uuid: "8ac25d8e-35f5-4a76-bf42-ae3bb4145ea0"
+    };
+    await pendingPrompt;
+  }
+  const sdkServer = createSdkMcpServer({
+    name: "joko_managed_subagent",
+    version: "1.0.0",
+    tools: [{
+      name: "delegate",
+      description: "Run an exactly configured managed subtask.",
+      inputSchema: {
+        description: z.string(),
+        prompt: z.string(),
+        subagent_type: z.string().optional(),
+        model: z.string().optional(),
+        run_in_background: z.boolean().optional()
+      },
+      handler: async (args, extra) => {
+        handlerCalls.push({ args, extra });
+        return { content: [{ type: "text", text: "Managed child completed." }] };
+      }
+    }]
+  });
+  const environment = createChildRuntimeEnvironment({
+    overrides: {
+      HOME: directory,
+      USERPROFILE: directory,
+      CLAUDE_CONFIG_DIR: directory,
+      ANTHROPIC_BASE_URL: `http://127.0.0.1:${address.port}`,
+      ANTHROPIC_API_KEY: "fake-agent-alias-key",
+      CLAUDE_CODE_OAUTH_TOKEN: undefined
+    }
+  }).environment;
+  const nativeQuery = query({
+    prompt: prompt(),
+    options: {
+      cwd: directory,
+      model: "joko-alias-model",
+      tools: { type: "preset", preset: "claude_code" },
+      toolAliases: { Agent: "mcp__joko_managed_subagent__delegate" },
+      mcpServers: { joko_managed_subagent: sdkServer },
+      hooks: {
+        PreToolUse: [{
+          hooks: [async (input, toolUseId) => {
+            hookCalls.push({ input, toolUseId });
+            return { continue: true };
+          }]
+        }]
+      },
+      settingSources: [],
+      permissionMode: "bypassPermissions",
+      allowDangerouslySkipPermissions: true,
+      systemPrompt: "Use Agent exactly once, then report its result.",
+      env: environment
+    }
+  });
+  const output: unknown[] = [];
+  try {
+    for await (const message of nativeQuery) {
+      output.push(message);
+      if ((message as { type?: unknown }).type === "result") break;
+    }
+    expect(handlerCalls.length, JSON.stringify(output)).toBe(1);
+    expect(handlerCalls[0]!.args).toMatchObject({
+      description: "Check child effort",
+      prompt: "Return a short completion.",
+      subagent_type: "general-purpose"
+    });
+    expect((handlerCalls[0]!.extra as { _meta?: Readonly<Record<string, unknown>> })._meta?.["claudecode/toolUseId"])
+      .toBe("toolu_local_agent");
+    expect(hookCalls).toHaveLength(1);
+    expect(hookCalls[0]).toMatchObject({
+      input: { hook_event_name: "PreToolUse", tool_name: "mcp__joko_managed_subagent__delegate" },
+      toolUseId: "toolu_local_agent"
+    });
+    expect(JSON.stringify(requests)).toContain("Managed child completed.");
+    expect(JSON.stringify(output)).toContain("Alias result accepted.");
+  } finally {
+    nativeQuery.close();
+    releasePrompt();
+    server.closeAllConnections();
+    await new Promise<void>((resolvePromise) => server.close(() => resolvePromise()));
+    await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+}, 75_000);
+
+test.skipIf(!enabled)("accepts a host-owned task notification after a background Agent alias result", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "joko-claude-agent-task-"));
+  const requests: unknown[] = [];
+  const output: unknown[] = [];
+  const server = createServer((request, response) => {
+    void (async () => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { messages?: unknown; model?: string };
+      requests.push(body);
+      if (request.url?.split("?")[0] === "/v1/messages/count_tokens") {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ input_tokens: 10 }));
+        return;
+      }
+      if (toolResultCount(body.messages) === 0) {
+        sendAliasedAgentMessage(response, body.model ?? "joko-task-model", true);
+      } else {
+        sendTextMessage(response, body.model ?? "joko-task-model", JSON.stringify(body.messages).includes("task-notification")
+          ? "Background continuation accepted."
+          : "Background launch accepted.");
+      }
+    })().catch(() => {
+      response.writeHead(500, { "content-type": "application/json" });
+      response.end(JSON.stringify({ type: "error", error: { type: "api_error", message: "fixture failed" } }));
+    });
+  });
+  await new Promise<void>((resolvePromise) => server.listen(0, "127.0.0.1", resolvePromise));
+  const address = server.address();
+  if (address === null || typeof address === "string") throw new Error("The task fixture did not bind.");
+  let releasePrompt!: () => void;
+  const pendingPrompt = new Promise<void>((resolvePromise) => { releasePrompt = resolvePromise; });
+  let deliverNotification!: () => void;
+  const notificationReady = new Promise<void>((resolvePromise) => { deliverNotification = resolvePromise; });
+  async function* prompt(): AsyncGenerator<SDKUserMessage> {
+    yield {
+      type: "user",
+      message: { role: "user", content: "Launch the delegated check in the background." },
+      parent_tool_use_id: null,
+      origin: { kind: "human" },
+      uuid: "ad3d6973-193c-4f91-af55-542c85cc8d37"
+    };
+    await notificationReady;
+    yield {
+      type: "user",
+      message: {
+        role: "user",
+        content: "<task-notification>\n<task-id>managed-child-1</task-id>\n<status>completed</status>\n<summary>Managed background child completed.</summary>\n</task-notification>"
+      },
+      parent_tool_use_id: null,
+      origin: { kind: "task-notification" },
+      uuid: "3578ea56-d553-47cc-bb78-ae2b2ca3834c"
+    };
+    await pendingPrompt;
+  }
+  const sdkServer = createSdkMcpServer({
+    name: "joko_managed_task",
+    version: "1.0.0",
+    tools: [{
+      name: "delegate",
+      description: "Run an exactly configured managed subtask.",
+      inputSchema: {
+        description: z.string(),
+        prompt: z.string(),
+        subagent_type: z.string().optional(),
+        model: z.string().optional(),
+        run_in_background: z.boolean().optional()
+      },
+      handler: async (args, extra) => {
+        expect(args.run_in_background).toBe(true);
+        expect((extra as { _meta?: Readonly<Record<string, unknown>> })._meta?.["claudecode/toolUseId"])
+          .toBe("toolu_alias_background");
+        return { content: [{ type: "text", text: "Managed child launched in the background as managed-child-1." }] };
+      }
+    }]
+  });
+  const environment = createChildRuntimeEnvironment({
+    overrides: {
+      HOME: directory,
+      USERPROFILE: directory,
+      CLAUDE_CONFIG_DIR: directory,
+      ANTHROPIC_BASE_URL: `http://127.0.0.1:${address.port}`,
+      ANTHROPIC_API_KEY: "fake-agent-task-key",
+      CLAUDE_CODE_OAUTH_TOKEN: undefined
+    }
+  }).environment;
+  const nativeQuery = query({
+    prompt: prompt(),
+    options: {
+      cwd: directory,
+      model: "joko-task-model",
+      tools: { type: "preset", preset: "claude_code" },
+      toolAliases: { Agent: "mcp__joko_managed_task__delegate" },
+      mcpServers: { joko_managed_task: sdkServer },
+      settingSources: [],
+      permissionMode: "bypassPermissions",
+      allowDangerouslySkipPermissions: true,
+      systemPrompt: "Use Agent once in the background, then continue after its notification.",
+      env: environment
+    }
+  });
+  const iterator = nativeQuery[Symbol.asyncIterator]();
+  try {
+    let firstResult = false;
+    while (!firstResult) {
+      const next = await iterator.next();
+      if (next.done) break;
+      output.push(next.value);
+      if ((next.value as { type?: unknown }).type === "result") firstResult = true;
+    }
+    expect(firstResult, JSON.stringify(output)).toBe(true);
+    deliverNotification();
+    const continuationDeadline = Date.now() + 10_000;
+    let continuationResult = false;
+    while (!continuationResult && Date.now() < continuationDeadline) {
+      const remaining = Math.max(1, continuationDeadline - Date.now());
+      const pending = iterator.next();
+      const next = await Promise.race([
+        pending,
+        new Promise<undefined>((resolvePromise) => setTimeout(resolvePromise, remaining, undefined))
+      ]);
+      if (next === undefined) {
+        await pending.catch(() => undefined);
+        break;
+      }
+      if (next.done) break;
+      output.push(next.value);
+      if ((next.value as { type?: unknown }).type === "result") continuationResult = true;
+    }
+    expect(continuationResult, JSON.stringify(output)).toBe(true);
+    expect(output.filter((message): message is { type: "result"; user_message_uuid?: string } =>
+      (message as { type?: unknown }).type === "result").at(-1)?.user_message_uuid, JSON.stringify(output))
+      .toBe("3578ea56-d553-47cc-bb78-ae2b2ca3834c");
+    expect(JSON.stringify(requests)).toContain("Managed background child completed.");
+  } finally {
+    nativeQuery.close();
+    releasePrompt();
     server.closeAllConnections();
     await new Promise<void>((resolvePromise) => server.close(() => resolvePromise()));
     await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
@@ -321,6 +730,26 @@ function sendTextMessage(response: ServerResponse, model: string, text: string):
   send("content_block_delta", { index: 0, delta: { type: "text_delta", text } });
   send("content_block_stop", { index: 0 });
   send("message_delta", { delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 5 } });
+  send("message_stop", {});
+  response.end();
+}
+
+function sendAliasedAgentMessage(response: ServerResponse, model: string, runInBackground: boolean): void {
+  response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+  const send = (type: string, value: Record<string, unknown>) => response.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...value })}\n\n`);
+  send("message_start", { message: { id: "msg_alias_background", type: "message", role: "assistant",
+    model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 0 } } });
+  send("content_block_start", { index: 0, content_block: {
+    type: "tool_use", id: "toolu_alias_background", name: "Agent", input: {}
+  } });
+  send("content_block_delta", { index: 0, delta: { type: "input_json_delta", partial_json: JSON.stringify({
+    description: "Check managed background limits",
+    prompt: "Return the background completion.",
+    subagent_type: "general-purpose",
+    run_in_background: runInBackground
+  }) } });
+  send("content_block_stop", { index: 0 });
+  send("message_delta", { delta: { stop_reason: "tool_use", stop_sequence: null }, usage: { output_tokens: 10 } });
   send("message_stop", {});
   response.end();
 }

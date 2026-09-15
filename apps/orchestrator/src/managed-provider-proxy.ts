@@ -40,6 +40,7 @@ interface ActiveSubtaskRoute {
   readonly modelId: string;
   readonly revision: string;
   readonly route: ProviderInferenceRoute;
+  readonly maxOutputTokens: number | undefined;
   readonly abort: AbortController;
   readonly assertCurrent: () => void;
   readonly release: () => void;
@@ -51,6 +52,7 @@ interface BindingState {
   readonly owner: ManagedProviderRouteOwner;
   readonly providerId: string;
   readonly modelId: string;
+  readonly maxOutputTokens: number | undefined;
   readonly revision: string;
   readonly protocol: ProviderRuntimeProtocol;
   active?: ActiveOperation;
@@ -206,8 +208,9 @@ export class ManagedProviderProxy {
         if (this.#bindings.size + this.#smartBindings.size >= MAXIMUM_BINDINGS) {
           throw new Error("Managed Provider route capacity is exhausted.");
         }
+        const maxOutputTokens = managedOutputLimit(model.maxTokens);
         const state: BindingState = { id: randomUUID(), runtime, owner: { ...owner }, providerId: owner.providerId,
-          modelId: owner.modelId, revision: identity.generationId, protocol };
+          modelId: owner.modelId, maxOutputTokens, revision: identity.generationId, protocol };
         this.#bindings.set(state.id, state);
         const assertCurrent = () => {
           this.#assertBinding(state);
@@ -257,6 +260,7 @@ export class ManagedProviderProxy {
             const protocol = model?.api ?? entry.provider.api;
             const identity = this.#providers.describeInferenceRoute(state.owner.backendId, state.providerId, subtask.modelId);
             const route = this.#providers.resolveInferenceRoute(state.owner.backendId, state.providerId, subtask.modelId);
+            const maxOutputTokens = managedOutputLimit(model?.maxTokens);
             if (model === undefined || protocol !== state.protocol || identity === undefined || route === undefined
               || route.providerId !== state.providerId || route.modelId !== subtask.modelId
               || route.api !== state.protocol || route.generationId !== identity.generationId) throw unavailable();
@@ -274,6 +278,7 @@ export class ManagedProviderProxy {
               modelId: subtask.modelId,
               revision: identity.generationId,
               route,
+              maxOutputTokens,
               abort,
               assertCurrent: subtask.assertCurrent,
               release
@@ -716,12 +721,14 @@ export class ManagedProviderProxy {
         || typeof (parsed as { model?: unknown }).model !== "string") { fail(response, 400); return; }
       const requestedModel = (parsed as { model: string }).model;
       let route = operation.route;
+      let maxOutputTokens = state.maxOutputTokens;
       let subtask: ActiveSubtaskRoute | undefined;
       if (requestedModel !== state.modelId) {
         subtask = [...operation.subtasks.values()].find((candidate) => candidate.modelId === requestedModel && !candidate.abort.signal.aborted);
         if (subtask === undefined) { fail(response, 400); return; }
         this.#assertSubtask(state, operation, subtask);
         route = subtask.route;
+        maxOutputTokens = subtask.maxOutputTokens;
         signal = AbortSignal.any([operation.abort.signal, subtask.abort.signal, abort.signal]);
       }
       const base = new URL(route.baseUrl.endsWith("/") ? route.baseUrl : `${route.baseUrl}/`);
@@ -739,7 +746,19 @@ export class ManagedProviderProxy {
       if (route.authorization !== undefined) headers.set("authorization", route.authorization);
       if (subtask === undefined) this.#assertOperation(state, operation);
       else this.#assertSubtask(state, operation, subtask);
-      const upstream = await this.#fetch(endpoint, { method: "POST", headers, body, redirect: "manual", signal });
+      const requestedOutputTokens = (parsed as Record<string, unknown>)["max_tokens"];
+      const constrainOutput = state.protocol === "anthropic-messages" && suffix === "" && maxOutputTokens !== undefined;
+      if (constrainOutput && (!Number.isSafeInteger(requestedOutputTokens) || (requestedOutputTokens as number) < 1)) {
+        fail(response, 400);
+        return;
+      }
+      const appliedOutputTokens = constrainOutput
+        ? Math.min(requestedOutputTokens as number, maxOutputTokens as number)
+        : undefined;
+      const upstreamBody = appliedOutputTokens !== undefined
+        ? Buffer.from(JSON.stringify({ ...(parsed as Record<string, unknown>), max_tokens: appliedOutputTokens }))
+        : body;
+      const upstream = await this.#fetch(endpoint, { method: "POST", headers, body: upstreamBody, redirect: "manual", signal });
       if (subtask === undefined) this.#assertOperation(state, operation);
       else this.#assertSubtask(state, operation, subtask);
       if (!upstream.ok || upstream.body === null) {
@@ -825,6 +844,12 @@ function requestSuffix(protocol: ProviderRuntimeProtocol, path: string): string 
   if (protocol === "openai-responses") return path === "/responses" ? "" : path === "/responses/compact" ? "/compact" : undefined;
   if (protocol === "anthropic-messages") return path === "/v1/messages" ? "" : path === "/v1/messages/count_tokens" ? "/count_tokens" : undefined;
   return undefined;
+}
+
+function managedOutputLimit(value: number | undefined): number | undefined {
+  if (value === undefined || value === 0) return undefined;
+  if (!Number.isSafeInteger(value) || value < 1) throw unavailable();
+  return value;
 }
 
 function unavailable(): Error { return new Error("The exact managed Provider route is unavailable."); }

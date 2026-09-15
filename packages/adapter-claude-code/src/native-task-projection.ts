@@ -18,9 +18,14 @@ const MAX_SEEN_FRAMES = 16_384;
 const MAX_TOOL_SCOPES = 16_384;
 const MAX_TASK_TOOL_ENTRIES = 4_096;
 const MAX_RESULT_CHARACTERS = 64 * 1024;
-const NATIVE_AGENT_TASK_TYPES = new Set(["local_agent", "remote_agent"]);
+const NATIVE_AGENT_TASK_TYPES = new Set([
+  "local_agent",
+  "remote_agent",
+  "managed_agent_foreground",
+  "managed_agent_background"
+]);
 const NATIVE_NON_AGENT_TASK_TYPES = new Set(["local_bash", "local_workflow"]);
-const NATIVE_WAKE_TASK_TYPES = new Set(["local_agent", "local_workflow"]);
+const NATIVE_WAKE_TASK_TYPES = new Set(["local_agent", "local_workflow", "managed_agent_background"]);
 const NATIVE_AGENT_TOOL_NAMES = new Set(["Agent", "Task"]);
 
 type NativeTaskPayload = Extract<EventPayload, {
