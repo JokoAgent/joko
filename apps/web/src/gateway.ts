@@ -18,6 +18,7 @@ import {
   AuthenticationState,
   BackendService,
   BackendHealth,
+  BackendMemoryKind,
   BackgroundTaskState,
   BlobDisposition,
   BrowserAutomationTarget,
@@ -5436,7 +5437,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       } }),
       ...(model.compatibilityOptions === undefined ? {} : { compatibility: { ...model.compatibilityOptions } }),
       supportsFastMode: model.supportsFastMode,
-      ...(model.defaultVisible === undefined ? {} : { defaultVisible: model.defaultVisible })
+      ...(model.defaultVisible === undefined ? {} : { defaultVisible: model.defaultVisible }),
+      ...(model.supportsTools === undefined ? {} : { supportsTools: model.supportsTools })
     }));
     if (models.some((model) => model.modelId.length === 0 || model.displayName.length === 0 || model.inputModalities.length === 0)) {
       throw new GatewayError("Every model needs an ID, name, and input modality.");
@@ -6287,8 +6289,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   }
 
   async resetMemory(scope: "curated" | "backend", backendId?: string): Promise<{
-    readonly removedEntries: number;
-    readonly removedTargets: number;
+    readonly removedEntries?: number;
+    readonly removedTargets?: number;
   }> {
     const operation = await this.submit({
       case: "resetMemory",
@@ -6300,8 +6302,12 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const result = operation.result?.payload;
     if (result?.case !== "memoryReset") throw new GatewayError("Orchestrator returned no Memory reset result.");
     return {
-      removedEntries: numberValue(result.value.removedEntries),
-      removedTargets: numberValue(result.value.removedTargets)
+      ...(result.value.removedEntries === undefined
+        ? {}
+        : { removedEntries: numberValue(result.value.removedEntries) }),
+      ...(result.value.removedTargets === undefined
+        ? {}
+        : { removedTargets: numberValue(result.value.removedTargets) })
     };
   }
 
@@ -6359,7 +6365,18 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   async updateSubagentModelSettings(backendId: string, model: Parameters<OperationApi["updateSubagentModelSettings"]>[1], expectedRevision: bigint): Promise<void> {
     await this.submit({
       case: "updateSubagentModelSettings",
-      value: { backendId, ...(model === undefined ? {} : { model: { ...model } }), expectedRevision: { value: expectedRevision } }
+      value: {
+        backendId,
+        ...(model === undefined ? { clearDefaultModel: true } : { model: { ...model } }),
+        expectedRevision: { value: expectedRevision }
+      }
+    }, true);
+  }
+
+  async updateSubagentSmartRouting(backendId: string, enabled: boolean, expectedRevision: bigint): Promise<void> {
+    await this.submit({
+      case: "updateSubagentModelSettings",
+      value: { backendId, smartRoutingEnabled: enabled, expectedRevision: { value: expectedRevision } }
     }, true);
   }
 
@@ -14040,7 +14057,10 @@ function mapSettings(settings: SettingsSnapshot | undefined): SettingsView {
         enabled: backend.enabled,
         supported: backend.support === CapabilitySupport.SUPPORTED,
         reason: backend.reason,
-        entryCount: numberValue(backend.entryCount)
+        ...(backend.entryCount === undefined ? {} : { entryCount: numberValue(backend.entryCount) }),
+        kind: backendMemoryKind(backend.kind),
+        resettable: backend.resettable,
+        updatesActiveLocalSessions: backend.updatesActiveLocalSessions
       }))
     },
     visionBridge: {
@@ -14066,8 +14086,17 @@ function mapSettings(settings: SettingsSnapshot | undefined): SettingsView {
       return {
         backendId: setting.backendId,
         ...(setting.model === undefined ? {} : { model: { providerId: setting.model.providerId, modelId: setting.model.modelId } }),
+        defaultModelSupported: setting.defaultModelSupported,
         available: setting.available,
         unavailableReason: setting.unavailableReason,
+        smartRoutingSupported: setting.smartRoutingSupported,
+        smartRoutingEnabled: setting.smartRoutingEnabled,
+        smartRoutingAvailable: setting.smartRoutingAvailable,
+        smartRoutingUnavailableReason: setting.smartRoutingUnavailableReason,
+        smartRoutingApplied: setting.smartRoutingApplied,
+        smartRoutingRestartPending: setting.smartRoutingRestartPending,
+        ...(setting.runtimeGeneration === undefined ? {} : { runtimeGeneration: setting.runtimeGeneration }),
+        runtimeRevision: setting.runtimeRevision,
         revision: setting.revision.value
       };
     }),
@@ -14196,7 +14225,8 @@ function mapProviderRuntimeConfiguration(provider: ProviderRuntimeConfiguration)
         ...(model.compatibility.cacheControlFormat === undefined ? {} : { cacheControlFormat: model.compatibility.cacheControlFormat })
       } }),
       supportsFastMode: model.supportsFastMode,
-      ...(model.defaultVisible === undefined ? {} : { defaultVisible: model.defaultVisible })
+      ...(model.defaultVisible === undefined ? {} : { defaultVisible: model.defaultVisible }),
+      ...(model.supportsTools === undefined ? {} : { supportsTools: model.supportsTools })
     }))
   };
 }
@@ -15910,6 +15940,15 @@ function providerKind(value: ProviderKind): SettingsView["providers"][number]["k
   if (value === ProviderKind.SUBSCRIPTION) return "subscription";
   if (value === ProviderKind.LOCAL_KEYLESS) return "localKeyless";
   return "customEndpoint";
+}
+
+function backendMemoryKind(value: BackendMemoryKind): "compaction_digest" | "native_auto_memory" {
+  switch (value) {
+    case BackendMemoryKind.COMPACTION_DIGEST: return "compaction_digest";
+    case BackendMemoryKind.NATIVE_AUTO_MEMORY: return "native_auto_memory";
+    case BackendMemoryKind.UNSPECIFIED: throw new Error("Backend memory kind is missing.");
+    default: throw new Error("Backend memory kind is unsupported.");
+  }
 }
 
 function providerCredentialSurfaceCapability(

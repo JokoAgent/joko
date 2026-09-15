@@ -779,6 +779,8 @@ export class SessionHost {
     readonly explicitDefault?: { readonly providerId: string; readonly modelId: string };
   };
   readonly #sessionRuntimeRecoveryDelayMs: (attempt: number) => number;
+  readonly #backendDispatchBlocked: (backendId: string) => boolean;
+  readonly #onBackendMayBeIdle: ((backendId: string) => void) | undefined;
   readonly #monotonicNow: () => number;
   readonly #runSilenceTimeoutMs: number;
   readonly #backendRetirementTimeoutMs: number;
@@ -826,6 +828,10 @@ export class SessionHost {
         readonly explicitDefault?: { readonly providerId: string; readonly modelId: string };
       };
       readonly sessionRuntimeRecoveryDelayMs?: (attempt: number) => number;
+      /** Desired spawn-time changes hold accepted work before durable claim. */
+      readonly backendDispatchBlocked?: (backendId: string) => boolean;
+      /** Content-free settle signal for an external deferred replacement owner. */
+      readonly onBackendMayBeIdle?: (backendId: string) => void;
       /** Registry-probed descriptors, including unavailable instance shadows. */
       readonly backendDescriptors?: readonly BackendDescriptor[];
     } = {}
@@ -849,6 +855,8 @@ export class SessionHost {
       ?? (() => ({ availableProviderIds: new Set<string>() }));
     this.#sessionRuntimeRecoveryDelayMs = options.sessionRuntimeRecoveryDelayMs
       ?? sessionRuntimeRecoveryDelayMs;
+    this.#backendDispatchBlocked = options.backendDispatchBlocked ?? (() => false);
+    this.#onBackendMayBeIdle = options.onBackendMayBeIdle;
     this.#monotonicNow = options.monotonicNow ?? (() => performance.now());
     const runSilenceTimeoutMs = options.runSilenceTimeoutMs ?? DEFAULT_RUN_SILENCE_TIMEOUT_MS;
     if (!Number.isSafeInteger(runSilenceTimeoutMs) || runSilenceTimeoutMs < 0) {
@@ -2015,6 +2023,23 @@ export class SessionHost {
     return execution;
   }
 
+  canReplaceBackendInstance(backendId: string): boolean {
+    this.#assertOpen();
+    try {
+      this.#assertBackendReplacementIdle(backendId);
+      return !this.#backendReplacementFences.has(backendId);
+    } catch {
+      return false;
+    }
+  }
+
+  wakeBackendQueues(backendId: string): void {
+    this.#assertOpen();
+    for (const session of this.#store.listSessions({ includeArchived: false })) {
+      if (session.descriptor.backendId === backendId) void this.drain(session.descriptor.id);
+    }
+  }
+
   /** Called inside the caller's authorized Store transaction; no adapter effects run here. */
   commitQueuedInput(store: OperationalStore, input: QueuedInput): EnqueueResult {
     this.#assertOpen();
@@ -2294,6 +2319,8 @@ export class SessionHost {
     readonly kind: string;
     readonly body: unknown;
     readonly commit: (store: OperationalStore) => T;
+    /** Synchronous, content-free process hold installed only after commit succeeds. */
+    readonly afterCommit?: (execution: OperationExecution<T>) => void;
     /** Rechecked both when the effect is claimed and in the final commit transaction. */
     readonly precondition?: (store: OperationalStore) => void;
     readonly effect?: () => Promise<void>;
@@ -2312,12 +2339,14 @@ export class SessionHost {
   }): Promise<OperationExecution<T>> {
     this.#assertOpen();
     if (input.effect === undefined) {
-      return this.#store.runAuthorizedOperation(
+      const execution = this.#store.runAuthorizedOperation(
         input.connection.id,
         input.connection.authKeyDigest,
         { id: input.operationId, kind: input.kind, body: input.body },
         input.commit
       );
+      try { input.afterCommit?.(execution); } catch { /* Durable truth remains authoritative. */ }
+      return execution;
     }
     const claim = this.#store.claimAuthorizedDeferredEffectOperation<T>(
       input.connection.id,
@@ -2326,7 +2355,9 @@ export class SessionHost {
       input.precondition === undefined ? undefined : (store) => input.precondition!(store)
     );
     if (!claim.claimed) {
-      return { replayed: true, value: claim.value, operation: claim.operation };
+      const execution = { replayed: true, value: claim.value, operation: claim.operation };
+      try { input.afterCommit?.(execution); } catch { /* Durable truth remains authoritative. */ }
+      return execution;
     }
     let installedLifecycleFence = false;
     try {
@@ -2358,7 +2389,9 @@ export class SessionHost {
             return input.commit(store);
           }
         );
-      return input.complete === undefined ? commit() : await input.complete(commit);
+      const execution = input.complete === undefined ? commit() : await input.complete(commit);
+      try { input.afterCommit?.(execution); } catch { /* Durable truth remains authoritative. */ }
+      return execution;
     } catch (error) {
       if (input.preserveClaimOnEffectFailure?.(error) === true) throw error;
       return this.failClaimedEffect(input.kind, claim.operation.id, claim.operation.bodyHash, error);
@@ -6107,7 +6140,7 @@ export class SessionHost {
     }).length === 0;
   }
 
-  private canEnterSessionArchive(sessionId: string): boolean {
+  private canEnterSessionArchive(sessionId: string, allowHeldAcceptedQueue = false): boolean {
     if (
       this.#activating.has(sessionId)
       || this.#messageDeletionLocks.has(sessionId)
@@ -6133,17 +6166,17 @@ export class SessionHost {
     for (const lease of this.#turnOverrideLeases.values()) {
       if (lease.sessionId === sessionId) return false;
     }
-    if (listAllRuns(this.#store, { sessionId, activeOnly: true }).some((run) =>
-      run.descriptor.state === "queued"
-      || run.descriptor.state === "running"
-      || run.descriptor.state === "waiting"
-      || run.descriptor.state === "retrying"
-      || run.descriptor.state === "dispatch_unknown")) return false;
-    return this.#store.listQueueItems({
+    const activeRuns = listAllRuns(this.#store, { sessionId, activeOnly: true });
+    if (activeRuns.some((run) => !allowHeldAcceptedQueue || run.descriptor.state !== "queued")) return false;
+    const queueItems = this.#store.listQueueItems({
       sessionId,
       states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"],
-      limit: 1
-    }).length === 0;
+      limit: allowHeldAcceptedQueue ? undefined : 1
+    });
+    if (!allowHeldAcceptedQueue) return queueItems.length === 0;
+    if (queueItems.some((item) => item.state !== "accepted")) return false;
+    const acceptedRunIds = new Set(queueItems.map((item) => item.runId));
+    return activeRuns.every((run) => acceptedRunIds.has(run.descriptor.id));
   }
 
   #assertBackendReplacementIdle(backendId: string): void {
@@ -6176,7 +6209,21 @@ export class SessionHost {
         ) throw new StoreError("A Backend cannot be replaced while a reviewer runtime is active.");
         continue;
       }
-      this.assertRuntimeRestartIdle(sessionId);
+      if (this.#backendDispatchBlocked(backendId)) {
+        if (
+          this.#store.listActiveSessionBackgroundTaskEvents(sessionId).length > 0
+          || this.#store.listInteractions({ sessionId, status: "open", limit: 1 }).length > 0
+          || this.#store.listToolLeases({ sessionId, activeOnly: true }).length > 0
+          || this.#store.hasActiveSessionBackgroundTasks(sessionId)
+          || !this.canEnterSessionArchive(sessionId, true)
+        ) {
+          throw new StoreError(
+            "A Backend can be replaced only after every affected task has no active native work."
+          );
+        }
+      } else {
+        this.assertRuntimeRestartIdle(sessionId);
+      }
     }
   }
 
@@ -6326,6 +6373,7 @@ export class SessionHost {
         else this.#activeEffects.set(sessionId, remaining);
       }
       settle();
+      this.#onBackendMayBeIdle?.(backendId);
     };
   }
 
@@ -9594,6 +9642,8 @@ export class SessionHost {
       || this.#disposed
       || this.#store.findPendingScheduleDeletionCleanupForSession(sessionId) !== undefined
     ) return;
+    const initialBackendId = this.#store.getSession(sessionId).descriptor.backendId;
+    if (this.#backendDispatchBlocked(initialBackendId)) return;
     let settle!: () => void;
     const settlement = new Promise<void>((resolve) => { settle = resolve; });
     this.#drainSettlements.set(sessionId, settlement);
@@ -9604,6 +9654,7 @@ export class SessionHost {
           this.#runSilenceRecoveries.has(sessionId)
           || this.#runtimeRestartFences.has(sessionId)
           || this.#store.findPendingScheduleDeletionCleanupForSession(sessionId) !== undefined
+          || this.#backendDispatchBlocked(this.#store.getSession(sessionId).descriptor.backendId)
         ) return;
         // claimNextQueueItem intentionally returns undefined while paused. Exit
         // instead of polling a durable control state in a synchronous loop;
@@ -9656,6 +9707,7 @@ export class SessionHost {
         )) return;
         if (!bypassesCompaction && this.compactionBlocksDispatch(sessionId)) return;
         const claimSession = this.#store.getSession(sessionId);
+        if (this.#backendDispatchBlocked(claimSession.descriptor.backendId)) return;
         const claimBackendInstanceGeneration = this.#store
           .getBackend(claimSession.descriptor.backendId).descriptor.instanceGeneration;
         const claimedItem = this.#store.claimNextQueueItem({
@@ -9938,6 +9990,7 @@ export class SessionHost {
         this.#drainSettlements.delete(sessionId);
       }
       settle();
+      this.#onBackendMayBeIdle?.(initialBackendId);
     }
   }
 

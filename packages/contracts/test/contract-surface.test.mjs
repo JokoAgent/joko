@@ -226,7 +226,10 @@ test("proto3 optional scalars preserve absent values separately from explicit ze
     [contract.NativeSessionCatalogEntrySchema, "existingSessionId", "existing_session_id", ""],
     [contract.QuestionSingleChoiceInputSchema, "allowOther", "allow_other", false],
     [contract.QuestionMultipleChoiceInputSchema, "allowOther", "allow_other", false],
-    [contract.QuestionMultipleChoiceAnswerSchema, "otherText", "other_text", ""]
+    [contract.QuestionMultipleChoiceAnswerSchema, "otherText", "other_text", ""],
+    [contract.BackendMemorySettingsSchema, "entryCount", "entry_count", 0n],
+    [contract.MemoryResetResultSchema, "removedEntries", "removed_entries", 0n],
+    [contract.MemoryResetResultSchema, "removedTargets", "removed_targets", 0n]
   ];
   for (const [schema, property, wireName, explicitZero] of cases) {
     assert.equal(field(schema, wireName).proto.proto3Optional, true);

@@ -11,6 +11,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { writeBackendModelAccess } from "./backend-model-access.js";
 import {
   SUBAGENT_DEFAULT_MODEL_CAPABILITY,
+  SUBAGENT_SMART_ROUTING_CAPABILITY,
   SubagentModelSettings,
   subagentModelSettingKey,
   type SubagentModelSelection
@@ -28,7 +29,18 @@ describe("SubagentModelSettings", () => {
     const { store, settings } = setup();
     store.upsertBackend(backend({ id: "backend-other", capabilities: new Map() }));
     expect(settings.snapshot()).toEqual([{
-      backendId: "backend-a", available: true, unavailableReason: "", revision: 0n
+      backendId: "backend-a",
+      defaultModelSupported: true,
+      available: true,
+      unavailableReason: "",
+      smartRoutingSupported: false,
+      smartRoutingEnabled: false,
+      smartRoutingAvailable: false,
+      smartRoutingUnavailableReason: "",
+      smartRoutingApplied: false,
+      smartRoutingRestartPending: false,
+      runtimeRevision: "",
+      revision: 0n
     }]);
     expect(settings.resolve("backend-a", "provider-a")).toBeUndefined();
     expect(store.listSettings()).toEqual([]);
@@ -44,7 +56,7 @@ describe("SubagentModelSettings", () => {
     store.transaction(() => settings.replace("backend-a", selection(), 0n));
     const saved = settings.snapshot()[0]!;
     expect(store.getSetting("service", "orchestrator", subagentModelSettingKey("backend-a")).value)
-      .toEqual({ format: 1, model: selection() });
+      .toEqual({ format: 1, model: selection(), smartRoutingEnabled: false });
     expect(() => store.transaction(() => {
       settings.replace("backend-a", selection("model-b"), saved.revision);
       throw new Error("rollback");
@@ -55,7 +67,7 @@ describe("SubagentModelSettings", () => {
     expect(reset.model).toBeUndefined();
     expect(reset.revision).toBeGreaterThan(saved.revision);
     expect(store.getSetting("service", "orchestrator", subagentModelSettingKey("backend-a")).value)
-      .toEqual({ format: 1, model: null });
+      .toEqual({ format: 1, model: null, smartRoutingEnabled: false });
     store.close();
     const reopenedStore = new OperationalStore(path);
     stores.push(reopenedStore);
@@ -104,6 +116,7 @@ describe("SubagentModelSettings", () => {
       const revision = settings.snapshot()[0]!.revision;
       store.upsertBackend(backend(patch));
       expect(settings.snapshot()[0]).toMatchObject({ backendId: "backend-a", model: selection(), available: false, revision });
+      expect(settings.snapshot()[0]?.unavailableReason).not.toBe("");
       expect(settings.resolve("backend-a", "provider-a")).toBeUndefined();
       expect(() => settings.replace("backend-a", selection(), revision)).toThrow(RangeError);
       settings.replace("backend-a", undefined, revision);
@@ -124,6 +137,81 @@ describe("SubagentModelSettings", () => {
     settings.replace("backend-a", undefined, saved.revision);
   });
 
+  it("persists smart routing independently and projects exact runtime-generation state", () => {
+    const store = new OperationalStore(":memory:");
+    stores.push(store);
+    store.upsertBackend(backend({ capabilities: new Map([
+      [SUBAGENT_DEFAULT_MODEL_CAPABILITY, { key: SUBAGENT_DEFAULT_MODEL_CAPABILITY, supported: true }],
+      [SUBAGENT_SMART_ROUTING_CAPABILITY, { key: SUBAGENT_SMART_ROUTING_CAPABILITY, supported: true }]
+    ]) }));
+    let runtime = {
+      applied: false,
+      restartPending: false,
+      unavailableReason: "",
+      runtimeRevision: "catalog-a",
+      instanceGeneration: 3
+    };
+    const settings = new SubagentModelSettings({ store, smartRoutingState: () => runtime });
+    settings.replace("backend-a", selection(), 0n);
+    const modelRevision = settings.snapshot()[0]!.revision;
+    store.upsertBackend(backend({
+      authenticationState: "signed_out",
+      capabilities: new Map([
+        [SUBAGENT_DEFAULT_MODEL_CAPABILITY, { key: SUBAGENT_DEFAULT_MODEL_CAPABILITY, supported: true }],
+        [SUBAGENT_SMART_ROUTING_CAPABILITY, { key: SUBAGENT_SMART_ROUTING_CAPABILITY, supported: true }]
+      ])
+    }));
+    settings.replaceSmartRouting("backend-a", true, modelRevision);
+    expect(settings.snapshot()[0]).toMatchObject({ available: false, smartRoutingAvailable: true });
+    store.upsertBackend(backend({ capabilities: new Map([
+      [SUBAGENT_DEFAULT_MODEL_CAPABILITY, { key: SUBAGENT_DEFAULT_MODEL_CAPABILITY, supported: true }],
+      [SUBAGENT_SMART_ROUTING_CAPABILITY, { key: SUBAGENT_SMART_ROUTING_CAPABILITY, supported: true }]
+    ]) }));
+    expect(store.getSetting("service", "orchestrator", subagentModelSettingKey("backend-a")).value).toEqual({
+      format: 1,
+      model: selection(),
+      smartRoutingEnabled: true
+    });
+    const saved = settings.snapshot()[0]!;
+    expect(saved).toMatchObject({
+      smartRoutingSupported: true,
+      smartRoutingEnabled: true,
+      smartRoutingAvailable: true,
+      smartRoutingApplied: false,
+      smartRoutingRestartPending: false,
+      runtimeGeneration: 3,
+      runtimeRevision: "catalog-a"
+    });
+    expect(() => settings.replaceSmartRouting("backend-a", false, modelRevision)).toThrow(RevisionConflictError);
+    runtime = {
+      applied: true,
+      restartPending: true,
+      unavailableReason: "catalog changed",
+      runtimeRevision: "catalog-b",
+      instanceGeneration: 4
+    };
+    expect(settings.snapshot()[0]).toMatchObject({
+      smartRoutingAvailable: false,
+      smartRoutingUnavailableReason: "catalog changed",
+      smartRoutingApplied: true,
+      smartRoutingRestartPending: true,
+      runtimeGeneration: 4,
+      runtimeRevision: "catalog-b"
+    });
+    store.upsertBackend(backend({ capabilities: new Map([
+      [SUBAGENT_DEFAULT_MODEL_CAPABILITY, { key: SUBAGENT_DEFAULT_MODEL_CAPABILITY, supported: true }]
+    ]) }));
+    expect(settings.snapshot()[0]).toMatchObject({
+      smartRoutingSupported: false,
+      smartRoutingEnabled: true,
+      smartRoutingAvailable: false,
+      smartRoutingUnavailableReason: "Backend does not support smart subagent routing."
+    });
+    settings.replaceSmartRouting("backend-a", false, saved.revision);
+    expect(settings.smartRoutingEnabled("backend-a")).toBe(false);
+    expect(settings.resolve("backend-a", "provider-a")).toBe("model-a");
+  });
+
   it("rejects malformed choices and does not expose or route partial malformed stored values", () => {
     const { store, settings } = setup();
     for (const model of [null, {}, { ...selection(), extra: true }, selection(" leading-space"), { ...selection(), providerId: "" }]) {
@@ -131,9 +219,10 @@ describe("SubagentModelSettings", () => {
     }
     expect(() => settings.replace(" backend-a", selection(), 0n)).toThrow(RangeError);
     for (const invalid of [
-      { format: 1, model: { ...selection(), privateValue: "private-secret" } },
-      { format: 1, model: selection(), privateValue: "private-secret" },
-      { format: 1, model: { providerId: "provider-a" } },
+      { format: 1, model: { ...selection(), privateValue: "private-secret" }, smartRoutingEnabled: false },
+      { format: 1, model: selection(), smartRoutingEnabled: false, privateValue: "private-secret" },
+      { format: 1, model: { providerId: "provider-a" }, smartRoutingEnabled: false },
+      { format: 1, model: selection() },
       { format: 1 }
     ]) {
       store.setSetting("service", "orchestrator", subagentModelSettingKey("backend-a"), invalid);
@@ -144,6 +233,10 @@ describe("SubagentModelSettings", () => {
       expect(settings.resolve("backend-a", "provider-a")).toBeUndefined();
       expect(JSON.stringify(snapshot, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value))
         .not.toContain("private-secret");
+      expect(() => settings.replaceSmartRouting("backend-a", true, snapshot.revision))
+        .toThrow("Subagent model settings are invalid.");
+      expect(store.getSetting("service", "orchestrator", subagentModelSettingKey("backend-a")).value)
+        .toEqual(invalid);
       settings.replace("backend-a", undefined, snapshot.revision);
       expect(settings.snapshot()[0]).toMatchObject({ available: true });
     }
@@ -152,7 +245,7 @@ describe("SubagentModelSettings", () => {
   it("retains a saved unavailable backend row until it can be explicitly reset", () => {
     const { store, settings } = setup();
     const record = store.setSetting("service", "orchestrator", subagentModelSettingKey("backend-absent"), {
-      format: 1, model: selection()
+      format: 1, model: selection(), smartRoutingEnabled: false
     });
     expect(settings.snapshot().find((row) => row.backendId === "backend-absent"))
       .toMatchObject({ model: selection(), available: false, revision: record.revision });
