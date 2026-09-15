@@ -695,6 +695,12 @@ export class SessionHost {
   readonly #runtimeRestartFences = new Set<string>();
   readonly #backendReplacementFences = new Map<string, symbol>();
   readonly #backendAdmissionEffects = new Map<string, number>();
+  /** A managed Target deletion owns this fence from its durable claim until
+   * the workspace effect and final Target tombstone have both settled. */
+  readonly #targetSessionCreationFences = new Map<string, string>();
+  /** New product tasks hold admission across native/worktree effects and the
+   * final Store commit so Target deletion cannot move their workspace first. */
+  readonly #targetSessionCreationAdmissions = new Map<string, number>();
   /** Admission ownership held from an authenticated lifecycle claim through its final Store commit. */
   readonly #sessionLifecycleFences = new Map<string, string>();
   readonly #sessionLifecycleBackendAdmissions = new Map<string, {
@@ -2326,6 +2332,8 @@ export class SessionHost {
     readonly effect?: () => Promise<void>;
     /** Fence task admission while this claimed lifecycle effect reaches its final commit. */
     readonly sessionLifecycleFenceId?: string;
+    /** Fence new product-task creation while a claimed Target deletion effect reaches final commit. */
+    readonly targetSessionCreationFenceId?: string;
     /** Wrap the final synchronous Store completion in a serialized external commit protocol. */
     readonly complete?: (
       commit: (finalize?: (store: OperationalStore) => void) => OperationExecution<T>
@@ -2360,7 +2368,12 @@ export class SessionHost {
       return execution;
     }
     let installedLifecycleFence = false;
+    let installedTargetSessionCreationFence = false;
     try {
+      if (input.targetSessionCreationFenceId !== undefined) {
+        this.beginTargetSessionCreationFence(input.targetSessionCreationFenceId, claim.operation.id);
+        installedTargetSessionCreationFence = true;
+      }
       if (input.sessionLifecycleFenceId !== undefined) {
         const owner = this.#sessionLifecycleFences.get(input.sessionLifecycleFenceId);
         if (owner !== undefined && owner !== claim.operation.id) {
@@ -2396,6 +2409,13 @@ export class SessionHost {
       if (input.preserveClaimOnEffectFailure?.(error) === true) throw error;
       return this.failClaimedEffect(input.kind, claim.operation.id, claim.operation.bodyHash, error);
     } finally {
+      if (
+        installedTargetSessionCreationFence
+        && input.targetSessionCreationFenceId !== undefined
+        && this.#targetSessionCreationFences.get(input.targetSessionCreationFenceId) === claim.operation.id
+      ) {
+        this.#targetSessionCreationFences.delete(input.targetSessionCreationFenceId);
+      }
       if (
         installedLifecycleFence
         && input.sessionLifecycleFenceId !== undefined
@@ -6233,6 +6253,43 @@ export class SessionHost {
     }
   }
 
+  private assertTargetAcceptsSessionCreation(store: OperationalStore, targetId: string): StoredTarget {
+    const target = store.getTarget(targetId);
+    if (isRecord(target.metadata) && target.metadata["deletedAt"] !== undefined) {
+      throw new StoreError("Deleted Targets cannot create product tasks.");
+    }
+    return target;
+  }
+
+  private beginTargetSessionCreation(targetId: string): () => void {
+    if (this.#targetSessionCreationFences.has(targetId)) {
+      throw new StoreError("New product tasks are fenced while their Target is being deleted.");
+    }
+    this.#targetSessionCreationAdmissions.set(
+      targetId,
+      (this.#targetSessionCreationAdmissions.get(targetId) ?? 0) + 1
+    );
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const remaining = (this.#targetSessionCreationAdmissions.get(targetId) ?? 1) - 1;
+      if (remaining <= 0) this.#targetSessionCreationAdmissions.delete(targetId);
+      else this.#targetSessionCreationAdmissions.set(targetId, remaining);
+    };
+  }
+
+  private beginTargetSessionCreationFence(targetId: string, operationId: string): void {
+    const owner = this.#targetSessionCreationFences.get(targetId);
+    if (owner !== undefined && owner !== operationId) {
+      throw new StoreError("A Target deletion is already in progress.");
+    }
+    if ((this.#targetSessionCreationAdmissions.get(targetId) ?? 0) > 0) {
+      throw new StoreError("A Target cannot be deleted while a product task is being created.");
+    }
+    this.#targetSessionCreationFences.set(targetId, operationId);
+  }
+
   private beginBackendAdmissionEffect(backendId: string): () => void {
     this.assertBackendAdmissionOpen(backendId);
     const releaseFlight = this.registerBackendSideEffectFlight(backendId);
@@ -7626,6 +7683,8 @@ export class SessionHost {
     this.#draining.clear();
     this.#creationLocks.clear();
     this.#portableImportLocks.clear();
+    this.#targetSessionCreationFences.clear();
+    this.#targetSessionCreationAdmissions.clear();
     this.#portableReplacementFences.clear();
     this.#portableImportDrafts.clear();
     this.#nativeBindingLocks.clear();
@@ -7687,6 +7746,18 @@ export class SessionHost {
     preparedDraft?: PreparedPortableSessionImport
   ): Promise<OperationExecution<ImportPortableSessionResult>> {
     this.#store.authorizeConnection(input.connection.id, input.connection.authKeyDigest);
+    const releaseTargetAdmission = this.beginTargetSessionCreation(input.targetId);
+    try {
+      return await this.importPortableSessionOnceAdmitted(input, preparedDraft);
+    } finally {
+      releaseTargetAdmission();
+    }
+  }
+
+  private async importPortableSessionOnceAdmitted(
+    input: ImportPortableSessionInput,
+    preparedDraft?: PreparedPortableSessionImport
+  ): Promise<OperationExecution<ImportPortableSessionResult>> {
     const prepared = preparedDraft ?? preparePortableSessionImport(
       (await this.#artifactStore.readBlob(input.package)).data,
       {
@@ -7701,7 +7772,7 @@ export class SessionHost {
       input.connection.authKeyDigest,
       { id: input.operationId, kind: "import_portable_session", body: logicalBody },
       (store) => {
-        store.getTarget(input.targetId);
+        this.assertTargetAcceptsSessionCreation(store, input.targetId);
         const conflict = findPortableImportConflict(store, input.targetId, input.package.sha256);
         if (conflict !== undefined && !input.overwrite) throw portableImportConflict(conflict.descriptor.id);
       }
@@ -7727,7 +7798,7 @@ export class SessionHost {
     let releaseBackendAdmission: (() => void) | undefined;
     let releasePortableReplacementFence: (() => void) | undefined;
     try {
-      const target = this.#store.getTarget(input.targetId);
+      const target = this.assertTargetAcceptsSessionCreation(this.#store, input.targetId);
       let providerId = input.providerId;
       let modelId = input.modelId;
       if (prepared.nativeSession === undefined) {
@@ -7898,7 +7969,7 @@ export class SessionHost {
         claim.operation.id,
         claim.operation.bodyHash,
         (store) => {
-          const currentTarget = store.getTarget(input.targetId);
+          const currentTarget = this.assertTargetAcceptsSessionCreation(store, input.targetId);
           if (currentTarget.revision !== target.revision) {
             throw new RevisionConflictError("Target", input.targetId, target.revision, currentTarget.revision);
           }
@@ -8089,6 +8160,15 @@ export class SessionHost {
   }
 
   private async createSessionOnce(input: SessionCreationInput): Promise<OperationExecution<{ readonly sessionId: string }>> {
+    const releaseTargetAdmission = this.beginTargetSessionCreation(input.targetId);
+    try {
+      return await this.createSessionOnceAdmitted(input);
+    } finally {
+      releaseTargetAdmission();
+    }
+  }
+
+  private async createSessionOnceAdmitted(input: SessionCreationInput): Promise<OperationExecution<{ readonly sessionId: string }>> {
     const logicalBody = createSessionOperationBody(input);
     const authorized = "connection" in input;
     const operationKind = authorized
@@ -8101,11 +8181,11 @@ export class SessionHost {
         input.connection.id,
         input.connection.authKeyDigest,
         { id: input.operationId, kind: operationKind, body: logicalBody },
-        (store) => { store.getTarget(input.targetId); }
+        (store) => { this.assertTargetAcceptsSessionCreation(store, input.targetId); }
       )
       : this.#store.claimDeferredEffectOperation<{ readonly sessionId: string }>(
         { id: input.operationId, kind: operationKind, body: logicalBody },
-        (store) => { store.getTarget(input.targetId); }
+        (store) => { this.assertTargetAcceptsSessionCreation(store, input.targetId); }
       );
     if (!claim.claimed) {
       return { replayed: true, value: claim.value, operation: claim.operation };
@@ -8118,7 +8198,7 @@ export class SessionHost {
     let scheduledWorktreeSessionId: string | undefined;
     let releaseBackendAdmission: (() => void) | undefined;
     try {
-      const target = this.#store.getTarget(input.targetId);
+      const target = this.assertTargetAcceptsSessionCreation(this.#store, input.targetId);
       const adapter = this.requireAdapter(target.descriptor.backendId);
       const backendInstanceGeneration = this.requireAdapterGeneration(target.descriptor.backendId, adapter);
       const resourceCatalogEpoch = this.backendResourceCatalogEpoch(target.descriptor.backendId);
@@ -8354,7 +8434,7 @@ export class SessionHost {
           backendInstanceGeneration
         );
         const complete = (store: OperationalStore): { readonly sessionId: string } => {
-            const currentTarget = store.getTarget(input.targetId);
+            const currentTarget = this.assertTargetAcceptsSessionCreation(store, input.targetId);
             if (currentTarget.revision !== target.revision) {
               throw new RevisionConflictError("Target", input.targetId, target.revision, currentTarget.revision);
             }

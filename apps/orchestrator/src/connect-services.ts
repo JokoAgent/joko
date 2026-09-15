@@ -857,6 +857,7 @@ interface HostMutationInput<T> {
   readonly precondition?: (store: OperationalStore) => void;
   readonly effect?: () => Promise<void>;
   readonly sessionLifecycleFenceId?: string;
+  readonly targetSessionCreationFenceId?: string;
   readonly complete?: (
     commit: (finalize?: (store: OperationalStore) => void) => OperationExecution<T>
   ) => Promise<OperationExecution<T>>;
@@ -14831,6 +14832,7 @@ async function dispatchMutation(
         body: mutation,
         precondition: assertDeletionPrecondition,
         ...(payload.value.deleteManagedWorkspace ? {
+          targetSessionCreationFenceId: existing.descriptor.id,
           effect: async () => {
             const trashed = await moveManagedWorkspaceToTrash({
               managedRoot: resolve(dependencies.managedWorkspaceRoot!),

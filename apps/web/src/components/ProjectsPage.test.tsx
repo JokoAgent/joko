@@ -68,12 +68,18 @@ it.each(["empty", "next-card", "user-focus", "owner-change"] as const)("continue
 });
 
 it("deletes each selected project task through its lifecycle operation before deleting the empty project", async () => {
-  const first = projectTask("first-task");
+  const first = { ...projectTask("first-task"), targetId: "runtime-target" };
   const second = projectTask("second-task");
+  const executionOnly = { ...projectTask("execution-only"), projectId: "other-project" };
   const deleteSession = vi.fn(async () => undefined);
   const deleteTarget = vi.fn(async () => undefined);
-  const prepareSessionRemoval = vi.fn(async () => ({ clean: 0, dirty: 2, unknown: 0 }));
-  const view = await mountProjectDeletion({ sessions: [first, second], deleteSession, deleteTarget, prepareSessionRemoval });
+  const prepareSessionRemoval = vi.fn(async (_sessions: readonly SessionView[]) => ({ clean: 0, dirty: 2, unknown: 0 }));
+  const view = await mountProjectDeletion({
+    sessions: [first, executionOnly, second],
+    deleteSession,
+    deleteTarget,
+    prepareSessionRemoval
+  });
 
   await chooseProjectTaskDeletion(view.host, prepareSessionRemoval);
   await act(async () => {
@@ -82,6 +88,7 @@ it("deletes each selected project task through its lifecycle operation before de
   });
 
   expect(prepareSessionRemoval).toHaveBeenCalledTimes(2);
+  expect(prepareSessionRemoval).toHaveBeenLastCalledWith([first, second]);
   expect(deleteSession.mock.calls).toEqual([[first.id, false], [second.id, false]]);
   expect(deleteTarget).toHaveBeenCalledExactlyOnceWith("project", false);
   expect(deleteSession.mock.invocationCallOrder[1]).toBeLessThan(deleteTarget.mock.invocationCallOrder[0]!);
@@ -200,7 +207,7 @@ async function chooseProjectTaskDeletion(
 }
 
 function projectTask(id: string): SessionView {
-  return { id, backendId: "backend", targetId: "project", name: id, state: "idle", generation: 0n, pinned: false, archived: false, updatedAt: 1, permissionMode: "ask", planMode: false, fastMode: false };
+  return { id, backendId: "backend", targetId: "project", projectId: "project", name: id, state: "idle", generation: 0n, pinned: false, archived: false, updatedAt: 1, permissionMode: "ask", planMode: false, fastMode: false };
 }
 
 function setNativeValue(input: HTMLInputElement, value: string): void {

@@ -7971,6 +7971,105 @@ describe("SessionHost", () => {
     });
   });
 
+  it("rejects a Target deletion effect before workspace mutation while product-task creation is in flight", async () => {
+    const adapter = new GatedFakeAdapter();
+    const fixture = await createFixture(adapter);
+    const createGate = adapter.holdCreate();
+    const creating = fixture.host.createSession({
+      operationId: "create-before-target-delete",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Creation owns Target admission",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    });
+    await createGate.entered;
+    const workspaceEffect = vi.fn(async () => undefined);
+
+    const deletionFailure = await fixture.host.mutate({
+      operationId: "delete-target-during-create",
+      connection: fixture.connection,
+      kind: "deleteTarget",
+      body: { targetId: "target-one", deleteManagedWorkspace: true },
+      targetSessionCreationFenceId: "target-one",
+      precondition: (store) => {
+        if (store.listSessions({ targetId: "target-one", includeArchived: true, includeDeleted: true })
+          .some((session) => session.descriptor.deletedAt === undefined)) {
+          throw new InvalidStateTransitionError("Target session graph", "changed", "delete");
+        }
+      },
+      effect: workspaceEffect,
+      commit: () => ({ deleted: true })
+    }).then(() => undefined, (error: unknown) => error);
+
+    createGate.release();
+    await creating;
+    expect(deletionFailure).toBeInstanceOf(OperationPreviouslyFailedError);
+    expect(workspaceEffect).not.toHaveBeenCalled();
+    expect(fixture.store.listSessions({ targetId: "target-one" })).toHaveLength(1);
+  });
+
+  it("fences task creation through a Target deletion effect and rejects stale creation after tombstone", async () => {
+    const adapter = new GatedFakeAdapter();
+    const fixture = await createFixture(adapter);
+    const target = fixture.store.getTarget("target-one");
+    const effectGate = new AsyncGate();
+    const assertEmptyTarget = (store: OperationalStore): void => {
+      if (store.listSessions({ targetId: target.descriptor.id, includeArchived: true, includeDeleted: true })
+        .some((session) => session.descriptor.deletedAt === undefined)) {
+        throw new InvalidStateTransitionError("Target session graph", "changed", "delete");
+      }
+    };
+    const deleting = fixture.host.mutate({
+      operationId: "delete-target-fences-create",
+      connection: fixture.connection,
+      kind: "deleteTarget",
+      body: { targetId: target.descriptor.id, deleteManagedWorkspace: true },
+      targetSessionCreationFenceId: target.descriptor.id,
+      precondition: assertEmptyTarget,
+      effect: async () => {
+        effectGate.enter();
+        await effectGate.wait;
+      },
+      commit: (store) => {
+        store.upsertTarget(target.descriptor, { deletedAt: 123_456 });
+        return { deleted: true };
+      }
+    });
+    await effectGate.entered;
+
+    const concurrentFailure = await fixture.host.createSession({
+      operationId: "create-during-target-delete",
+      connection: fixture.connection,
+      targetId: target.descriptor.id,
+      title: "Must stay absent",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    }).then(() => undefined, (error: unknown) => error);
+    effectGate.release();
+    await deleting;
+
+    expect(concurrentFailure).toBeInstanceOf(StoreError);
+    expect(adapter.createCalls).toBe(0);
+    expect(fixture.store.findOperation("create-during-target-delete")).toBeUndefined();
+    await expect(fixture.host.createSession({
+      operationId: "create-after-target-delete",
+      connection: fixture.connection,
+      targetId: target.descriptor.id,
+      title: "Deleted target stays closed",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).rejects.toThrow("Deleted Targets cannot create product tasks");
+    expect(adapter.createCalls).toBe(0);
+    expect(fixture.store.findOperation("create-after-target-delete")).toMatchObject({
+      status: "failed",
+      error: { message: "Deleted Targets cannot create product tasks." }
+    });
+  });
+
   it("claims native creation before calling the adapter and never repeats a failed native effect", async () => {
     const adapter = new GatedFakeAdapter();
     const fixture = await createFixture(adapter);

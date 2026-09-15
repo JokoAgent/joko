@@ -2806,17 +2806,23 @@ describe("Connect security and protocol audit", () => {
       updatedAt: 2,
       revision: 2n
     } as const;
+    const mutate = vi.fn(async (input: {
+      targetSessionCreationFenceId?: string;
+      precondition?: (value: typeof store) => void;
+      effect?: () => Promise<void>;
+      commit: (value: typeof store) => unknown;
+    }) => {
+      input.precondition?.(store);
+      await input.effect?.();
+      return { replayed: false, value: input.commit(store), operation: record };
+    });
     const services = createConnectServices(stubApplication({
       config: { publicOrigin: "https://orchestrator.example.test", dataDirectory },
       store,
       workspaces: { unregister },
       sessionHost: {
         close: async () => undefined,
-        mutate: async (input: { precondition?: (value: typeof store) => void; effect?: () => Promise<void>; commit: (value: typeof store) => unknown }) => {
-          input.precondition?.(store);
-          await input.effect?.();
-          return { replayed: false, value: input.commit(store), operation: record };
-        }
+        mutate
       },
       connections: { authenticate: () => ({ id: "connection", authKeyDigest: "digest", state: "active" }) }
     }));
@@ -2829,6 +2835,9 @@ describe("Connect security and protocol audit", () => {
 
     expect(existsSync(workspaceRoot)).toBe(false);
     expect(readdirSync(join(managedRoot, ".trash"))).toHaveLength(1);
+    expect(mutate).toHaveBeenCalledWith(expect.objectContaining({
+      targetSessionCreationFenceId: existing.descriptor.id
+    }));
     expect(upsertTarget).toHaveBeenCalledWith(existing.descriptor, expect.objectContaining({
       state: "archived",
       deletionOperationId: record.id,

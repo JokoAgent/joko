@@ -160,7 +160,7 @@ export function ProjectsPage({ controller, snapshot, focusProjectId, t, runActio
     <DeleteProjectDialog
       target={deleteTarget}
       workspace={snapshot.workspaces.find((workspace) => workspace.id === deleteTarget?.workspaceId)}
-      sessions={snapshot.sessions.filter((session) => session.targetId === deleteTarget?.id)}
+      sessions={snapshot.sessions.filter((session) => session.projectId === deleteTarget?.id)}
       prepareSessionRemoval={prepareSessionRemoval}
       t={t}
       onClose={() => setDeleteTarget(undefined)}
@@ -168,7 +168,7 @@ export function ProjectsPage({ controller, snapshot, focusProjectId, t, runActio
         const target = deleteTarget;
         const targetSessions = target === undefined
           ? []
-          : snapshot.sessions.filter((session) => session.targetId === target.id);
+          : snapshot.sessions.filter((session) => session.projectId === target.id);
         setDeleteTarget(undefined);
         if (target !== undefined) runAction(
           `project-delete:${target.id}`,
