@@ -1269,7 +1269,7 @@ details[open] > summary .details-chevron { transform: rotate(180deg); }
 .tool-block__icon svg { width: 14px; height: 14px; }
 .tool-block__heading { min-width: 0; display: flex; flex: 1; flex-direction: row; align-items: baseline; gap: 6px; }
 .tool-block__heading strong { min-width: 0; overflow: hidden; color: var(--text-soft); font-size: var(--text-14); font-weight: 400; text-overflow: ellipsis; white-space: nowrap; }
-.tool-block__heading small { color: var(--text-faint); font-size: var(--text-11); }
+.tool-block__heading small { min-width: 0; overflow: hidden; color: var(--text-faint); font-size: var(--text-11); text-overflow: ellipsis; white-space: nowrap; }
 .tool-block > summary .pill { display: none; }
 .tool-block > summary time { margin-left: 4px; }
 .tool-block--running { border-color: color-mix(in srgb, var(--blue) 28%, var(--line)); }

@@ -1,3 +1,5 @@
+import { parseToolDisplayInput } from "./tool-presentation.js";
+
 export type ToolFileChangeAction = "created" | "deleted" | "updated" | "moved" | "unknown";
 
 export interface ToolFileChangeView {
@@ -18,13 +20,8 @@ const MAXIMUM_PATH_CHARS = 4_096;
 
 /** Strictly projects the capability-neutral file_change display payload. */
 export function parseToolFileChangeSet(toolName: string, input: string): ToolFileChangeSetView | undefined {
-  if (toolName !== "file_change" || input.length === 0 || input.length > MAXIMUM_PAYLOAD_CHARS) return undefined;
-  let root: unknown;
-  try {
-    root = JSON.parse(input) as unknown;
-  } catch {
-    return undefined;
-  }
+  if (toolName !== "file_change" || input.length === 0 || input.length > MAXIMUM_PAYLOAD_CHARS + 3) return undefined;
+  const root = parseToolDisplayInput(input, MAXIMUM_PAYLOAD_CHARS);
   if (!isRecord(root) || !Array.isArray(root["changes"]) || root["changes"].length === 0
     || root["changes"].length > MAXIMUM_CHANGES) return undefined;
   const changes: ToolFileChangeView[] = [];

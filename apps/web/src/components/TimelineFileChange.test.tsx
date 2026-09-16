@@ -31,6 +31,13 @@ describe("Timeline native file changes", () => {
     expect(host.querySelector(".tool-block__heading small")?.textContent).toBe("Renamed · Running");
   });
 
+  it("recognizes the current live root-argument envelope", async () => {
+    await renderTool([{ path: "src/live.ts", kind: { type: "update" }, diff: "-old\n+new" }], true);
+
+    expect(host.querySelector(".tool-block__heading strong")?.textContent).toBe("src/live.ts");
+    expect(host.querySelector(".tool-block__heading small")?.textContent).toBe("Updated · Running");
+  });
+
   it("opens the complete ordered multi-file diff payload", async () => {
     await renderTool([
       { path: "src/old.ts", kind: { type: "update", movePath: "src/new.ts" }, diff: "-old\n+new" },
@@ -50,7 +57,7 @@ describe("Timeline native file changes", () => {
   });
 });
 
-async function renderTool(changes: readonly unknown[]): Promise<void> {
+async function renderTool(changes: readonly unknown[], liveEnvelope = false): Promise<void> {
   const item: TimelineItemView = {
     id: "file-change",
     sequence: 1n,
@@ -60,7 +67,7 @@ async function renderTool(changes: readonly unknown[]): Promise<void> {
       id: "file-change",
       name: "file_change",
       state: "running",
-      input: JSON.stringify({ changes }),
+      input: `${liveEnvelope ? "$: " : ""}${JSON.stringify({ changes })}`,
       isError: false
     }
   };
@@ -77,6 +84,7 @@ const t: Translator = (key, values) => {
   if (key === "timeline.fileChangeFiles") return `${values?.["count"]} changed files`;
   const messages: Partial<Record<string, string>> = {
     "timeline.fileChange.moved": "Renamed",
+    "timeline.fileChange.updated": "Updated",
     "timeline.running": "Running",
     "timeline.toolPayloadOpen": "View payload",
     "timeline.toolPayloadChooseFile": "View file",
