@@ -1,4 +1,8 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { createHash } from "node:crypto";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { ListToolsRequestSchema, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv";
 import type { TargetDescriptor } from "@joko/core";
 import { SessionSdkOwner } from "./session-sdk-owner.js";
 import {
@@ -7,6 +11,7 @@ import {
   type DurableProcessOwnerOptions
 } from "@joko/runtime-governance";
 import { z } from "zod";
+import type { ClaudeMcpCallResult, ClaudeMcpTool } from "./mcp-bridge.js";
 
 export const CLAUDE_AGENT_SDK_PACKAGE = "@anthropic-ai/claude-agent-sdk";
 export const CLAUDE_AGENT_SDK_VERSION = "0.3.259";
@@ -112,6 +117,13 @@ export type ClaudeSdkManagedAgentTool = (
   options: { readonly toolUseId: string; readonly signal: AbortSignal }
 ) => Promise<ClaudeSdkManagedAgentResult>;
 
+export interface ClaudeSdkMcpTool extends ClaudeMcpTool {
+  readonly call: (
+    arguments_: Readonly<Record<string, unknown>>,
+    options: { readonly toolUseId: string; readonly signal: AbortSignal }
+  ) => Promise<ClaudeMcpCallResult>;
+}
+
 export interface ClaudeSdkOAuthTokenOptions {
   readonly signal: AbortSignal;
   readonly onDecline?: () => void;
@@ -209,6 +221,8 @@ export interface ClaudeSdkQueryOptions {
   /** Adapter-private Agent/Task replacement. SDK runtimes own the in-process
    * MCP transport so local and remote Queries preserve the same callback. */
   readonly managedAgentTool?: ClaudeSdkManagedAgentTool;
+  /** A Query-frozen, product-authorized catalog; never sourced from native settings. */
+  readonly mcpTools?: readonly ClaudeSdkMcpTool[];
   readonly includePartialMessages: true;
   readonly disallowedTools?: readonly string[];
   readonly mcpServers?: Readonly<Record<string, never>>;
@@ -478,6 +492,7 @@ export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
     const managedAgentServer = params.options.managedAgentTool === undefined
       ? undefined
       : createManagedAgentServer(loaded, params.options.managedAgentTool);
+    const productMcpServers = createProductMcpServers(params.options.mcpTools ?? []);
     const options: NativeOptionsWithOAuth = {
       abortController: params.options.abortController,
       additionalDirectories: [...params.options.additionalDirectories],
@@ -498,11 +513,12 @@ export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
       ...(params.options.disallowedTools === undefined
         ? {}
         : { disallowedTools: [...params.options.disallowedTools] }),
-      ...(managedAgentServer === undefined && params.options.mcpServers === undefined
+      ...(managedAgentServer === undefined && params.options.mcpServers === undefined && Object.keys(productMcpServers).length === 0
         ? {}
         : {
             mcpServers: {
               ...(params.options.mcpServers ?? {}),
+              ...productMcpServers,
               ...(managedAgentServer === undefined
                 ? {}
                 : { [CLAUDE_MANAGED_AGENT_SERVER]: managedAgentServer })
@@ -671,6 +687,77 @@ function createManagedAgentServer(
       }
     }]
   });
+}
+
+export function claudeMcpServerName(serverId: string): string {
+  return `joko_${createHash("sha256").update(serverId).digest("hex").slice(0, 24)}`;
+}
+
+export function createProductMcpServers(tools: readonly ClaudeSdkMcpTool[]): Record<string, NativeMcpSdkServerConfig> {
+  const groups = new Map<string, ClaudeSdkMcpTool[]>();
+  for (const tool of tools) {
+    const existing = groups.get(tool.serverId) ?? [];
+    existing.push(tool);
+    groups.set(tool.serverId, existing);
+  }
+  const servers: Record<string, NativeMcpSdkServerConfig> = Object.create(null);
+  const jsonSchema = new AjvJsonSchemaValidator();
+  for (const [serverId, entries] of groups) {
+    const name = claudeMcpServerName(serverId);
+    if (name === CLAUDE_MANAGED_AGENT_SERVER || Object.hasOwn(servers, name)) {
+      throw new Error("The product MCP server identity is ambiguous.");
+    }
+    const instance = new McpServer({ name, version: "1.0.0" });
+    for (const tool of entries) {
+      const validate = jsonSchema.getValidator<Readonly<Record<string, unknown>>>(
+        tool.inputSchema as Parameters<typeof jsonSchema.getValidator>[0]
+      );
+      const validateOutput = tool.outputSchema === undefined
+        ? undefined
+        : jsonSchema.getValidator<Readonly<Record<string, unknown>>>(
+            tool.outputSchema as Parameters<typeof jsonSchema.getValidator>[0]
+          );
+      instance.registerTool(tool.name, {
+        description: tool.description,
+        // SDK dispatch keeps arguments intact; the exact immutable JSON Schema
+        // is advertised below and validated before the Router effect.
+        inputSchema: z.object({}).passthrough(),
+        ...(validateOutput === undefined ? {} : { outputSchema: z.object({}).passthrough() })
+      }, async (args, extra): Promise<CallToolResult> => {
+        const metadata = isRecord(extra._meta) ? extra._meta : undefined;
+        const toolUseId = metadata?.["claudecode/toolUseId"];
+        if (typeof toolUseId !== "string" || toolUseId.length === 0 || toolUseId.length > 512
+          || /[\x00-\x1f\x7f]/u.test(toolUseId) || !(extra.signal instanceof AbortSignal)) {
+          throw new Error("The product MCP call lacks native ownership metadata.");
+        }
+        const checked = validate(args);
+        if (!checked.valid) throw new Error("The product MCP call does not satisfy its frozen input schema.");
+        const result = await tool.call(checked.data, { toolUseId, signal: extra.signal });
+        if (!result.isError && validateOutput !== undefined && !validateOutput(result.structuredContent).valid) {
+          throw new Error("The product MCP result does not satisfy its frozen output schema.");
+        }
+        return {
+          content: result.content as CallToolResult["content"],
+          isError: result.isError,
+          ...(result.structuredContent === undefined ? {} : { structuredContent: result.structuredContent }),
+          ...(result.bridgeMetadata === undefined ? {} : { _meta: { jokoMcpBridge: result.bridgeMetadata } })
+        };
+      });
+    }
+    // Keep the immutable Router schemas byte-for-byte at the protocol catalog boundary.
+    instance.server.setRequestHandler(ListToolsRequestSchema, async () => ({
+      tools: entries.map((tool) => ({
+        name: tool.name,
+        description: tool.description,
+        inputSchema: tool.inputSchema as { readonly type: "object"; readonly [key: string]: unknown },
+        ...(tool.outputSchema === undefined ? {} : {
+          outputSchema: tool.outputSchema as { readonly type: "object"; readonly [key: string]: unknown }
+        })
+      }))
+    }));
+    servers[name] = { type: "sdk", name, instance };
+  }
+  return servers;
 }
 
 function cloneAgentDefinitions(

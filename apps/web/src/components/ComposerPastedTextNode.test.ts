@@ -49,16 +49,32 @@ describe("composer pasted-text atom", () => {
     expect(applyComposerPastedTextEdit(instance, 1, "new", null)).toBe(true);
     expect(instance.getJSON().content?.[0]?.content).toBeUndefined();
     expect(instance.commands.undo()).toBe(true);
-    expect(instance.getJSON().content?.[0]?.content?.[0]?.type).toBe("composerPastedText");
+    expect(instance.getJSON().content?.[0]?.content?.[0]).toMatchObject({
+      type: "composerPastedText",
+      attrs: { text: "new", display: "new label" }
+    });
+    expect(instance.commands.undo()).toBe(true);
+    expect(instance.getJSON().content?.[0]?.content?.[0]).toMatchObject({
+      type: "composerPastedText",
+      attrs: { text: "old", display: "old label" }
+    });
   });
 
   it("downgrades an oversized edit to ordinary line-preserving text", () => {
     const instance = makeEditor();
     instance.commands.insertContent({ type: "composerPastedText", attrs: { text: "old", display: "old label" } });
+    expect(replaceComposerPastedTextWithPlainText(instance, 2, "old", "wrong")).toBe(false);
     expect(replaceComposerPastedTextWithPlainText(instance, 1, "old", "first\nsecond\n\nlast")).toBe(true);
     expect(instance.getJSON().content?.[0]?.content?.map((node) => node.type)).toEqual([
       "text", "hardBreak", "text", "hardBreak", "hardBreak", "text"
     ]);
+    expect(instance.commands.undo()).toBe(true);
+    expect(instance.getJSON().content?.[0]?.content?.[0]).toMatchObject({
+      type: "composerPastedText",
+      attrs: { text: "old", display: "old label" }
+    });
+    expect(instance.commands.redo()).toBe(true);
+    expect(instance.state.doc.textBetween(0, instance.state.doc.content.size, "\n", "\n")).toBe("first\nsecond\n\nlast");
   });
 
   it("is non-empty and serializes the full payload rather than its label", () => {

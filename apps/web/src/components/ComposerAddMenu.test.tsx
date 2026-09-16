@@ -94,6 +94,34 @@ describe("ComposerAddMenu", () => {
     expect(document.querySelector(".composer-add-menu__panel")).toBeNull();
     expect(required(container.querySelector<HTMLButtonElement>(".composer-add-menu__trigger")).getAttribute("aria-expanded")).toBe("false");
   });
+
+  it("uses the mounted document active element for cross-realm roving focus", async () => {
+    const frame = document.createElement("iframe");
+    document.body.append(frame);
+    const ownerDocument = required(frame.contentDocument);
+    const ownerWindow = required(frame.contentWindow);
+    Object.defineProperties(ownerWindow, {
+      matchMedia: { configurable: true, value: vi.fn(() => mediaQuery(true)) },
+      setTimeout: { configurable: true, value: window.setTimeout.bind(window) },
+      clearTimeout: { configurable: true, value: window.clearTimeout.bind(window) }
+    });
+    const container = ownerDocument.createElement("div");
+    ownerDocument.body.append(container);
+    const root = createRoot(container);
+    roots.push(root);
+    await act(async () => root.render(<Harness />));
+
+    const trigger = required(container.querySelector<HTMLButtonElement>(".composer-add-menu__trigger"));
+    await act(async () => trigger.click());
+    const panel = required(ownerDocument.body.querySelector<HTMLElement>(".composer-add-menu__panel"));
+    expect(panel.ownerDocument).toBe(ownerDocument);
+    expect(document.body.querySelector(".composer-add-menu__panel")).toBeNull();
+    await act(async () => { vi.advanceTimersByTime(0); });
+    const actions = [...panel.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')];
+    expect(ownerDocument.activeElement).toBe(actions[0]);
+    await act(async () => actions[0]?.dispatchEvent(new (ownerWindow as Window & typeof globalThis).KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true })));
+    expect(ownerDocument.activeElement).toBe(actions[1]);
+  });
 });
 
 function Harness(): React.ReactNode {
@@ -124,4 +152,17 @@ function SwitchHarness(): React.ReactNode {
 function required<T>(value: T | null | undefined): T {
   if (value === null || value === undefined) throw new Error("Expected test element");
   return value;
+}
+
+function mediaQuery(matches: boolean): MediaQueryList {
+  return {
+    matches,
+    media: "(prefers-reduced-motion: reduce)",
+    onchange: null,
+    addListener: () => undefined,
+    removeListener: () => undefined,
+    addEventListener: () => undefined,
+    removeEventListener: () => undefined,
+    dispatchEvent: () => true
+  };
 }

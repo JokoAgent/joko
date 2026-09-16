@@ -7,6 +7,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import type { ArtifactView, TimelineItemView } from "../model.js";
 import { ArtifactBlock, MessageAttachment } from "./Timeline.js";
 import { TimelineArtifactModel } from "./TimelineArtifactModel.js";
+import { NativeFileActionsContext } from "./NativeFileCopyMenu.js";
 import { useTimelineArtifactUrlCache } from "./timeline-artifact-url-cache.js";
 import type { Translator } from "./types.js";
 
@@ -39,6 +40,7 @@ beforeEach(() => {
     static override createObjectURL = createUrl;
     static override revokeObjectURL = revokeUrl;
   });
+  Reflect.deleteProperty(window, "jokoDesktop");
 });
 afterEach(async () => {
   await act(async () => { for (const root of roots.splice(0).reverse()) root.unmount(); });
@@ -48,6 +50,7 @@ afterEach(async () => {
   document.body.replaceChildren();
   document.body.className = "";
   Reflect.deleteProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT");
+  Reflect.deleteProperty(window, "jokoDesktop");
 });
 
 describe("Timeline model previews", () => {
@@ -116,6 +119,24 @@ describe("Timeline model previews", () => {
     await act(async () => root.render(null));
   });
 
+  it("offers the exact canonical model to the default app even when preview decoding fails", async () => {
+    Object.defineProperty(window, "jokoDesktop", { configurable: true, value: { capabilities: ["files.open"] } });
+    const openFile = vi.fn<import("../model.js").OperationApi["openArtifactFile"]>().mockResolvedValue({ status: "opened" });
+    const source = artifact("model", "scene.gltf", "model/gltf+json");
+    fetchSource.mockResolvedValue(new Response(JSON.stringify({ asset: { version: "2.0" }, buffers: [{ uri: "geometry.bin" }] })));
+    await mount(<NativeFileActionsContext.Provider value={{ openFile }}><TimelineArtifactModel artifact={source} ownerKey="one" loadUrl={async () => "blob:source"} onDownload={vi.fn()} t={t} /></NativeFileActionsContext.Provider>);
+    await act(async () => document.querySelector<HTMLButtonElement>('button[aria-label^="workspace.modelOpen:"]')!.click());
+    expect(document.querySelector('[role="dialog"] [role="alert"]')?.textContent).toBe("workspace.modelDependenciesUnavailable");
+    const menu = document.querySelector<HTMLDetailsElement>('[role="dialog"] details')!;
+    menu.open = true;
+    await act(async () => menu.querySelector<HTMLButtonElement>('[role="menuitem"]')!.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+    expect(menu.open).toBe(false);
+    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
+    await act(async () => menu.querySelector<HTMLButtonElement>('[role="menuitem"]')!.click());
+    expect(openFile).toHaveBeenCalledWith("model", "scene.gltf", 100, { ownerDocument: document, signal: expect.any(AbortSignal) });
+    expect(document.querySelector('[role="status"]')?.textContent).toBe("media.fileOpened");
+  });
+
   it("retires pending materialization and the open viewer on task changes without disturbing the next owner", async () => {
     const late = deferred<string>();
     const acquire = vi.fn(async () => `blob:lease-${acquire.mock.calls.length}`);
@@ -165,7 +186,7 @@ async function close(): Promise<void> {
 }
 
 function artifact(blobId: string, fileName: string, mediaType: string): ArtifactView {
-  return { id: blobId, blobId, title: fileName, fileName, mediaType, byteSize: 100, kind: "file" };
+  return { id: blobId, blobId, sourceRevealAvailable: false, title: fileName, fileName, mediaType, byteSize: 100, kind: "file" };
 }
 
 function item(artifact: ArtifactView): TimelineItemView {

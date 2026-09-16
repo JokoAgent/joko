@@ -905,6 +905,8 @@ export interface ToolCallView {
 export interface ArtifactView {
   readonly id: string;
   readonly blobId: string;
+  readonly sourceSessionId?: string;
+  readonly sourceRevealAvailable: boolean;
   readonly title: string;
   readonly description?: string;
   readonly kind: "file" | "image" | "export" | "tool" | "diff" | "diagnostics";
@@ -4015,6 +4017,8 @@ export interface NativeSessionCatalogView {
 
 export interface NewSessionDraft {
   readonly targetId: string;
+  /** Exact Target revision whose workspace was prepared for this creation. */
+  readonly expectedTargetRevision?: bigint;
   readonly name: string;
   readonly summary?: string;
   readonly nativeStart: { readonly kind: "fresh" } | { readonly kind: "attach"; readonly reference: string };
@@ -4040,7 +4044,7 @@ export interface NewSessionDraft {
   };
 }
 
-export type WorktreeEligibilityView = "eligible" | "notGitRepository" | "alreadyLinked" | "unsafe" | "unavailable";
+export type WorktreeEligibilityView = "eligible" | "notGitRepository" | "alreadyLinked" | "gitNotFound" | "unsafe" | "unavailable";
 
 export interface TargetWorktreeProbeView {
   readonly targetId: string;
@@ -4092,6 +4096,7 @@ export interface NewSessionLocalDraft {
   readonly mentions: readonly ComposerMentionDraft[];
   readonly inlineMentionRanges?: readonly ComposerInlineMentionRange[];
   readonly attachments: readonly AttachmentDraft[];
+  readonly browserComments?: readonly BrowserCommentDraftItem[];
   readonly extraDirectoryIds?: readonly string[];
 }
 
@@ -4513,12 +4518,13 @@ export interface OperationApi {
   createSession(draft: NewSessionDraft): Promise<{ readonly sessionId: string; readonly generation: bigint }>;
   probeTargetWorktree(targetId: string, signal?: AbortSignal): Promise<TargetWorktreeProbeView>;
   listTargetWorktreeSources(targetId: string, signal?: AbortSignal): Promise<readonly WorktreeSourceView[]>;
-  discoverNativeSessions(targetId: string): Promise<readonly NativeSessionCandidateView[]>;
+  discoverNativeSessions(targetId: string, signal?: AbortSignal): Promise<readonly NativeSessionCandidateView[]>;
   scanNativeSessionCatalog(
     backendId: string,
     options?: { readonly signal?: AbortSignal; readonly force?: boolean }
   ): Promise<NativeSessionCatalogView>;
   createTarget(draft: TargetDraft): Promise<string>;
+  prepareTargetWorkspace(targetId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<void>;
   updateTarget(targetId: string, patch: {
     readonly name?: string;
     readonly pinned?: boolean;
@@ -4526,7 +4532,8 @@ export interface OperationApi {
       | { readonly kind: "remote"; readonly hostId: string; readonly workspaceRoot: string }
       | { readonly kind: "serviceNode" };
   }, expectedRevision: bigint): Promise<void>;
-  archiveTarget(targetId: string, archived: boolean): Promise<void>;
+  /** Returns the same Target from the authoritative post-operation snapshot, or undefined if it no longer exists. */
+  archiveTarget(targetId: string, archived: boolean): Promise<TargetView | undefined>;
   deleteTarget(targetId: string, deleteManagedWorkspace: boolean): Promise<void>;
   setWorkspaceTrust(workspaceId: string, trusted: boolean): Promise<void>;
   addExtraDirectory(workspaceId: string, serverPath: string, access: ExtraDirectoryView["access"]): Promise<void>;
@@ -4905,6 +4912,8 @@ export interface OperationApi {
   releaseArtifactUrl(blobId: string): void;
   downloadArtifact(blobId: string, fileName: string, context: ArtifactDownloadContext): Promise<ArtifactDownloadOutcome>;
   copyArtifactFile(blobId: string, fileName: string, byteSize: number, context: ArtifactDownloadContext): Promise<import("./native-file-actions.js").NativeFileCopyOutcome>;
+  openArtifactFile(blobId: string, fileName: string, byteSize: number, context: ArtifactDownloadContext): Promise<import("./native-file-actions.js").NativeFileOpenOutcome>;
+  revealArtifactSource(sessionId: string, artifactId: string, context: ArtifactDownloadContext): Promise<import("./native-file-actions.js").NativeArtifactSourceRevealOutcome>;
 }
 
 export function emptySnapshot(): AppSnapshot {

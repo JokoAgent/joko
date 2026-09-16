@@ -20,6 +20,7 @@ export type TargetWorktreeEligibility =
   | "eligible"
   | "not_git_repository"
   | "already_linked"
+  | "git_not_found"
   | "unsafe"
   | "unavailable";
 
@@ -134,6 +135,9 @@ export class SessionWorktreeCoordinator {
   }
 
   async probe(target: TargetDescriptor): Promise<TargetWorktreeProbe> {
+    if (target.remoteWorkspace !== undefined) {
+      return { targetId: target.id, eligibility: "unavailable", canRefreshRemote: false };
+    }
     const result = await this.#service.detectCwd(target.workspaceRoot);
     if (!result.ok) {
       return {
@@ -409,6 +413,7 @@ function sameLease(
 function probeEligibility(code: WorktreeErrorCode): TargetWorktreeEligibility {
   if (code === "NOT_GIT_REPOSITORY") return "not_git_repository";
   if (code === "CWD_IS_WORKTREE") return "already_linked";
-  if (code === "GIT_NOT_FOUND" || code === "DISPOSED" || code === "NOT_INITIALIZED") return "unavailable";
+  if (code === "GIT_NOT_FOUND") return "git_not_found";
+  if (code === "DISPOSED" || code === "NOT_INITIALIZED") return "unavailable";
   return "unsafe";
 }

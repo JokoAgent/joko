@@ -1,8 +1,8 @@
 import type { AppController } from "./controller.js";
 import type { ComposerDraft, NewSessionDraft, NewSessionDraftSelection } from "./model.js";
 
-type NewSessionFlowApi = Pick<AppController, "createSession" | "send">;
-type ManagedDialogueFlowApi = Pick<AppController, "createTarget" | "createSession" | "send" | "refresh">;
+type NewSessionFlowApi = Pick<AppController, "createSession" | "send" | "restoreFirstInputDraft">;
+type ManagedDialogueFlowApi = Pick<AppController, "createTarget" | "createSession" | "send" | "refresh" | "restoreFirstInputDraft">;
 
 export interface DelayedNewSessionDraft extends Omit<NewSessionDraft, "targetId"> {
   readonly selection: NewSessionDraftSelection;
@@ -33,7 +33,19 @@ export async function createSessionFromFirstInput(
   } catch (error) {
     presentationFailure = { error };
   }
-  await api.send(sessionId, input, { expectedGeneration: generation });
+  try {
+    await api.send(sessionId, input, { expectedGeneration: generation });
+  } catch (error) {
+    try {
+      await api.restoreFirstInputDraft(sessionId, input);
+    } catch (recoveryError) {
+      throw new AggregateError(
+        [error, recoveryError],
+        "The first input was not accepted and could not be restored to the created task draft."
+      );
+    }
+    throw error;
+  }
   if (presentationFailure !== undefined) throw presentationFailure.error;
   return sessionId;
 }
@@ -52,7 +64,14 @@ export async function createDelayedSessionFromFirstInput(
   onManagedTargetCreated?: (targetId: string) => void
 ): Promise<string> {
   if (draft.selection.kind === "target") {
-    return createSessionFromFirstInput(api, { ...sessionDraft(draft), targetId: draft.selection.targetId }, input, onCreated);
+    if (draft.expectedTargetRevision === undefined || draft.expectedTargetRevision < 1n) {
+      throw new Error("Project task creation requires the prepared Target revision.");
+    }
+    return createSessionFromFirstInput(api, {
+      ...sessionDraft(draft),
+      targetId: draft.selection.targetId,
+      expectedTargetRevision: draft.expectedTargetRevision
+    }, input, onCreated);
   }
   const targetId = await api.createTarget({
     backendId: draft.selection.backendId,

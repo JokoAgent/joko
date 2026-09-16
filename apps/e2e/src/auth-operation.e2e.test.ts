@@ -1,15 +1,20 @@
 import { randomUUID } from "node:crypto";
+import { mkdir, rename } from "node:fs/promises";
+import { join } from "node:path";
 
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
 import {
+  CreateTargetMutationSchema,
   LogoutConnectionMutationSchema,
   EntityKind,
   EntityRefSchema,
   OperationMutationSchema,
   OperationPreconditionSchema,
   OperationState,
-  RevokeDeviceMutationSchema
+  RevokeDeviceMutationSchema,
+  TargetWorkspaceInputSchema,
+  WorkspaceKind
 } from "@joko/contracts";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -96,6 +101,95 @@ describe("remote connection auth and durable operations", () => {
     expect(fixture.application.store.getTarget(targetId)).toEqual(current);
     await submit(first.clients.operation, first.connectionId, edit({ displayName: "reviewed current edit" }, current.revision));
     expect(fixture.application.store.getTarget(targetId).descriptor.displayName).toBe("reviewed current edit");
+  });
+
+  it("revalidates an unavailable project directory through authenticated Connect and creates the task after retry", async () => {
+    fixture = await OrchestratorE2eFixture.start();
+    const paired = await fixture.pair("project recovery owner");
+    const backendId = fixture.adapter().id;
+    const projectDirectory = join(fixture.rootDirectory, "recoverable-project");
+    const unavailableDirectory = join(fixture.rootDirectory, "recoverable-project-unavailable");
+    await mkdir(projectDirectory);
+
+    const created = await submit(paired.clients.operation, paired.connectionId, create(OperationMutationSchema, {
+      payload: {
+        case: "createTarget",
+        value: create(CreateTargetMutationSchema, {
+          backendId,
+          displayName: "Recoverable project",
+          workspace: create(TargetWorkspaceInputSchema, {
+            kind: WorkspaceKind.USER_PROJECT,
+            serverPath: projectDirectory,
+            createIfMissing: false
+          })
+        })
+      }
+    }));
+    if (created.result?.payload.case !== "target") throw new Error("Target creation returned no Target.");
+    const target = created.result.payload.value;
+    const revision = target.version?.revision?.value;
+    if (revision === undefined) throw new Error("Created Target returned no revision.");
+
+    fixture.application.workspaces.unregister(target.workspaceId);
+    await rename(projectDirectory, unavailableDirectory);
+    await expect(paired.clients.target.prepareTargetWorkspace({
+      targetId: target.targetId,
+      expectedTargetRevision: { value: revision }
+    })).rejects.toMatchObject({
+      code: Code.FailedPrecondition,
+      rawMessage: "The project directory is unavailable on this service node. Restore the directory, then retry."
+    });
+
+    await rename(unavailableDirectory, projectDirectory);
+    const prepared = await paired.clients.target.prepareTargetWorkspace({
+      targetId: target.targetId,
+      expectedTargetRevision: { value: revision }
+    });
+    expect(prepared.workspace).toMatchObject({
+      workspaceId: target.workspaceId,
+      targetId: target.targetId,
+      serverPathDisplay: projectDirectory,
+      version: { revision: { value: revision } }
+    });
+
+    await submit(paired.clients.operation, paired.connectionId, create(OperationMutationSchema, {
+      preconditions: [create(OperationPreconditionSchema, {
+        entity: create(EntityRefSchema, { kind: EntityKind.TARGET, id: target.targetId }),
+        expectedRevision: { value: revision }
+      })],
+      payload: { case: "updateTarget", value: { targetId: target.targetId, displayName: "Recovered project" } }
+    }));
+    const updatedTarget = (await paired.clients.target.getTarget({ targetId: target.targetId })).target;
+    const updatedRevision = updatedTarget?.version?.revision?.value;
+    if (updatedRevision === undefined) throw new Error("Updated Target returned no revision.");
+    const creationAt = (expectedRevision: bigint) => {
+      const base = createSessionMutation({ backendId, targetId: target.targetId, displayName: "Recovered task" });
+      return create(OperationMutationSchema, {
+        preconditions: [create(OperationPreconditionSchema, {
+          entity: create(EntityRefSchema, { kind: EntityKind.TARGET, id: target.targetId }),
+          expectedRevision: { value: expectedRevision }
+        })],
+        payload: base.payload
+      });
+    };
+    await expect(submit(
+      paired.clients.operation,
+      paired.connectionId,
+      creationAt(revision)
+    )).rejects.toMatchObject({ code: Code.Aborted });
+    expect((await paired.clients.session.listSessions({ targetId: target.targetId })).sessions).toHaveLength(0);
+
+    await paired.clients.target.prepareTargetWorkspace({
+      targetId: target.targetId,
+      expectedTargetRevision: { value: updatedRevision }
+    });
+    const session = await submit(
+      paired.clients.operation,
+      paired.connectionId,
+      creationAt(updatedRevision)
+    );
+    expect(session.state).toBe(OperationState.SUCCEEDED);
+    expect(sessionIdFrom(session)).not.toBe("");
   });
 
   it("preflights every task before a Backend-wide restart changes any runtime generation", async () => {

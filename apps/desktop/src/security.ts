@@ -103,7 +103,7 @@ export function resolvePackagedAppResource(value: string, policy: DesktopNavigat
     const url = new URL(value);
     if (
       url.protocol !== `${DESKTOP_APP_SCHEME}:` || url.hostname !== DESKTOP_APP_HOST || url.port !== "" ||
-      url.username !== "" || url.password !== "" || url.hash !== "" ||
+      url.username !== "" || url.password !== "" || !isAllowedPackagedAppResourceHash(url) ||
       (url.search !== "" && (url.pathname !== "/index.html" || !isAllowedDesktopAppEntrySearch(url.search)))
     ) return undefined;
     const decodedPath = decodeURIComponent(url.pathname);
@@ -129,11 +129,22 @@ export function isAllowedDesktopAppEntrySearch(search: string): boolean {
     return query.get("extensionWindow") === "1" &&
       /^extension_[a-f0-9]{32}$/u.test(query.get("bootExtension") ?? "");
   }
-  if ([...query.keys()].sort().join(",") !== "bootSession,sessionWindow") return false;
-  const sessionId = query.get("bootSession");
-  return query.get("sessionWindow") === "1" && typeof sessionId === "string" &&
-    sessionId.length >= 1 && sessionId.length <= 256 && sessionId.trim() === sessionId &&
-    !/[\u0000-\u001f\u007f]/u.test(sessionId);
+  return sessionWindowIdentity(query) !== undefined;
+}
+
+export function isAllowedSessionWindowNavigation(
+  value: string,
+  sessionId: string,
+  policy: DesktopNavigationPolicy
+): boolean {
+  if (!validSessionWindowIdentity(sessionId) || !isAllowedMainFrameNavigation(value, policy)) return false;
+  try {
+    const url = new URL(value);
+    return sessionWindowIdentity(url.searchParams) === sessionId
+      && url.hash === `#/tasks/${encodeURIComponent(sessionId)}`;
+  } catch {
+    return false;
+  }
 }
 
 export function isAllowedExtensionWindowNavigation(
@@ -147,10 +158,44 @@ export function isAllowedExtensionWindowNavigation(
     const keys = [...url.searchParams.keys()].sort();
     return keys.join(",") === "bootExtension,extensionWindow"
       && url.searchParams.get("extensionWindow") === "1"
-      && url.searchParams.get("bootExtension") === extensionId;
+      && url.searchParams.get("bootExtension") === extensionId
+      && url.hash === `#/extensions/${encodeURIComponent(extensionId)}`;
   } catch {
     return false;
   }
+}
+
+function isAllowedPackagedAppResourceHash(url: URL): boolean {
+  if (url.hash === "") return true;
+  if (url.pathname !== "/index.html") return false;
+  const sessionId = sessionWindowIdentity(url.searchParams);
+  if (sessionId !== undefined) return url.hash === `#/tasks/${encodeURIComponent(sessionId)}`;
+  const extensionId = extensionWindowIdentity(url.searchParams);
+  return extensionId !== undefined && url.hash === `#/extensions/${encodeURIComponent(extensionId)}`;
+}
+
+function sessionWindowIdentity(query: URLSearchParams): string | undefined {
+  if ([...query.keys()].sort().join(",") !== "bootSession,sessionWindow"
+    || query.get("sessionWindow") !== "1") return undefined;
+  const sessionId = query.get("bootSession");
+  return validSessionWindowIdentity(sessionId) ? sessionId : undefined;
+}
+
+function validSessionWindowIdentity(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length >= 1
+    && value.length <= 256
+    && value.trim() === value
+    && !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
+function extensionWindowIdentity(query: URLSearchParams): string | undefined {
+  if ([...query.keys()].sort().join(",") !== "bootExtension,extensionWindow"
+    || query.get("extensionWindow") !== "1") return undefined;
+  const extensionId = query.get("bootExtension");
+  return extensionId !== null && /^extension_[a-f0-9]{32}$/u.test(extensionId)
+    ? extensionId
+    : undefined;
 }
 
 /** Preserve the surface service's stricter CSP instead of intersecting it with the app-frame policy. */

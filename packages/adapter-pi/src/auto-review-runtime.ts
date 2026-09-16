@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { createPiAutoReviewer } from "./auto-review.js";
 import { atomicWriteFile } from "./config.js";
+import { managedRuntimeFactorySource } from "./managed-runtime-factory-source.js";
 
 export const MANAGED_AUTO_REVIEW_FILE_NAME = "joko-managed-auto-review.mjs";
 
@@ -15,8 +16,7 @@ export const MANAGED_AUTO_REVIEW_RUNTIME_SOURCE = [
   " * Copyright 2026 XD Inc.",
   " * SPDX-License-Identifier: Apache-2.0",
   " */",
-  `export const createPiAutoReviewer = ${createPiAutoReviewer.toString()};`,
-  "",
+  managedRuntimeFactorySource("createPiAutoReviewer", createPiAutoReviewer),
 ].join("\n");
 
 export async function provisionManagedAutoReviewRuntime(agentHome: string): Promise<string> {

@@ -120,6 +120,14 @@ type JokoDesktopCopyFileResult =
   | { readonly status: "copied" | "cancelled" | "unknown" | "unavailable" | "blocked" }
   | { readonly status: "failed"; readonly reason: "capacity" | "storage" | "helper" };
 
+type JokoDesktopOpenFileResult =
+  | { readonly status: "opened" | "cancelled" | "unknown" | "unavailable" }
+  | { readonly status: "failed"; readonly reason: "capacity" | "storage" | "open" };
+
+type JokoDesktopRevealArtifactSourceResult =
+  | { readonly status: "revealed" | "cancelled" | "unknown" | "unavailable" }
+  | { readonly status: "failed"; readonly reason: "capacity" | "reveal" };
+
 interface JokoDesktopAutoRelaunchSettings {
   readonly autoRelaunchOnIdle: boolean;
   readonly isCustomized: boolean;
@@ -202,6 +210,8 @@ type JokoDesktopNativeTaskStatusAction =
 
 type JokoDesktopCapability =
   | "files.copy"
+  | "files.open"
+  | "files.revealSource"
   | "app.info"
   | "app.update"
   | "attention.badge"
@@ -252,6 +262,7 @@ type JokoDesktopDeepLinkNavigation =
 
 interface JokoDesktopSessionDragPreviewRequest {
   readonly gestureId: string;
+  readonly profileId: string;
   readonly sessionId: string;
   readonly label: string;
   readonly hint: string;
@@ -293,7 +304,8 @@ interface JokoDesktopApi {
     close(): Promise<void>;
   };
   readonly sessionWindows: {
-    open(sessionId: string): Promise<{ readonly focusedExisting: boolean }>;
+    open(owner: { readonly profileId: string; readonly sessionId: string }): Promise<{ readonly focusedExisting: boolean }>;
+    getOwner(): Promise<{ readonly profileId: string; readonly sessionId: string }>;
     beginDragPreview(request: JokoDesktopSessionDragPreviewRequest): Promise<boolean>;
     endDragPreview(gestureId: string): Promise<boolean>;
     openIfDroppedOutside(gestureId: string): Promise<
@@ -430,6 +442,16 @@ interface JokoDesktopApi {
   saveFile(file: JokoDesktopFile): Promise<boolean>;
   copyFile(request: { readonly requestId: string; readonly file: JokoDesktopFile }): Promise<JokoDesktopCopyFileResult>;
   cancelFileCopy(requestId: string): Promise<void>;
+  openFile(request: { readonly requestId: string; readonly file: JokoDesktopFile }): Promise<JokoDesktopOpenFileResult>;
+  cancelFileOpen(requestId: string): Promise<void>;
+  revealArtifactSource(request: {
+    readonly requestId: string;
+    readonly profileId: string;
+    readonly serverId: string;
+    readonly sessionId: string;
+    readonly artifactId: string;
+  }): Promise<JokoDesktopRevealArtifactSourceResult>;
+  cancelArtifactSourceReveal(requestId: string): Promise<void>;
   readonly discovery: {
     scan(): Promise<readonly JokoDesktopDiscoveredNode[]>;
   };

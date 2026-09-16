@@ -113,6 +113,7 @@ describe("managed local Orchestrator", () => {
     expect(() => validateProfileId(runtime.connection.profileId)).not.toThrow();
     expect(runtime.takeAuthKey()).toMatch(/^[A-Za-z0-9_-]{43}$/u);
     expect(() => runtime.takeAuthKey()).toThrow(/already consumed/u);
+    expect(() => runtime.readDesktopHostAuthKey()).toThrow(/unavailable/u);
     expect(spawnArgs).toEqual(["--import", pathToFileURL(entryPath).href, entryPath, "--desktop-hosted"]);
     expect(JSON.stringify(spawnArgs)).not.toContain(requestCapability);
     expect(spawnOptions?.env).not.toHaveProperty("OPENAI_API_KEY");
@@ -127,7 +128,10 @@ describe("managed local Orchestrator", () => {
     });
 
     await runtime.commit();
+    expect(runtime.readDesktopHostAuthKey()).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+    expect(runtime.readDesktopHostAuthKey()).not.toBe(requestCapability);
     await runtime.stop();
+    expect(() => runtime.readDesktopHostAuthKey()).toThrow(/unavailable/u);
     expect(fake.child.exitCode).toBe(0);
   });
 
@@ -539,6 +543,7 @@ describe("managed local Orchestrator", () => {
     const runtime = {
       connection: managed,
       takeAuthKey: () => { steps.push("take-key"); return "a".repeat(43); },
+      readDesktopHostAuthKey: () => "h".repeat(43),
       commit: async () => { steps.push("commit"); },
       release: () => undefined,
       stop: async () => { steps.push("stop-new"); }
@@ -583,6 +588,7 @@ describe("managed local Orchestrator", () => {
     const runtime = {
       connection: { ...candidate, profileId: "desktop-connection_rotated" },
       takeAuthKey: () => "b".repeat(43),
+      readDesktopHostAuthKey: () => "h".repeat(43),
       commit: async () => undefined,
       release: () => undefined,
       stop: async () => { steps.push("stop-new"); }
@@ -636,6 +642,7 @@ describe("managed local Orchestrator", () => {
     const runtime = {
       connection: { ...candidate, profileId: "desktop-connection_rotated" },
       takeAuthKey: () => "c".repeat(43),
+      readDesktopHostAuthKey: () => "h".repeat(43),
       commit: vi.fn(async () => undefined),
       release: () => undefined,
       stop: vi.fn(async () => undefined)
@@ -677,6 +684,7 @@ describe("managed local Orchestrator", () => {
     const runtime = {
       connection: managed,
       takeAuthKey: () => "d".repeat(43),
+      readDesktopHostAuthKey: () => "h".repeat(43),
       commit: vi.fn(async () => { throw new Error("commit acknowledgement failed"); }),
       release: () => undefined,
       stop: vi.fn(async () => undefined)

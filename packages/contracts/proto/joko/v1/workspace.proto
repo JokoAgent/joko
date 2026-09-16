@@ -364,6 +364,8 @@ message Artifact {
   google.protobuf.Timestamp created_at = 8;
   google.protobuf.Timestamp expires_at = 9;
   AudioArtifactMetadata audio_metadata = 10;
+  // Advisory visibility only. ResolveArtifactSource re-authorizes every click.
+  bool source_reveal_available = 11;
 }
 
 enum TransferDirection {

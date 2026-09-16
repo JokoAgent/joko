@@ -199,6 +199,7 @@ function artifact(id: string, mediaType: string): ArtifactView {
   return {
     id,
     blobId: `blob-${id}`,
+    sourceRevealAvailable: false,
     title: `clip.${extension}`,
     kind: "file",
     fileName: `clip.${extension}`,

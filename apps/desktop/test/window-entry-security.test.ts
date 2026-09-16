@@ -13,6 +13,7 @@ import {
   isAllowedExtensionWindowNavigation,
   isAllowedMainFrameNavigation,
   isAllowedPackagedBundleResource,
+  isAllowedSessionWindowNavigation,
   runtimeProcessMonitorEntryUrl
 } from "../src/security.js";
 
@@ -29,11 +30,36 @@ describe("trusted auxiliary window entries", () => {
     const id = "extension_0123456789abcdef0123456789abcdef";
     const entry = `joko://app/index.html?extensionWindow=1&bootExtension=${id}#/extensions/${id}`;
     expect(isAllowedExtensionWindowNavigation(entry, id, policy)).toBe(true);
+    expect(isAllowedPackagedBundleResource(entry, policy)).toBe(true);
     expect(isAllowedExtensionWindowNavigation(entry, "extension_11111111111111111111111111111111", policy)).toBe(false);
     expect(isAllowedExtensionWindowNavigation("joko://app/index.html", id, policy)).toBe(false);
+    const mismatchedRoute = `joko://app/index.html?extensionWindow=1&bootExtension=${id}#/extensions/extension_11111111111111111111111111111111`;
+    expect(isAllowedExtensionWindowNavigation(
+      mismatchedRoute,
+      id,
+      policy
+    )).toBe(false);
+    expect(isAllowedPackagedBundleResource(mismatchedRoute, policy)).toBe(false);
     expect(isAllowedExtensionWindowNavigation(
       `joko://app/index.html?extensionWindow=1&bootExtension=${id}&auth=secret#/extensions/${id}`,
       id,
+      policy
+    )).toBe(false);
+  });
+
+  it("binds a Task window query, route, and native owner to one exact identity", () => {
+    const policy = createNavigationPolicy(resolve("dist/web/index.html"));
+    const entry = "joko://app/index.html?sessionWindow=1&bootSession=task%2Fone#/tasks/task%2Fone";
+    expect(isAllowedSessionWindowNavigation(entry, "task/one", policy)).toBe(true);
+    expect(isAllowedPackagedBundleResource(entry, policy)).toBe(true);
+    expect(isAllowedSessionWindowNavigation(entry, "task/two", policy)).toBe(false);
+    expect(isAllowedSessionWindowNavigation(
+      "joko://app/index.html?sessionWindow=1&bootSession=task%2Fone#/tasks/task%2Ftwo",
+      "task/one",
+      policy
+    )).toBe(false);
+    expect(isAllowedPackagedBundleResource(
+      "joko://app/index.html?sessionWindow=1&bootSession=task%2Fone#/tasks/task%2Ftwo",
       policy
     )).toBe(false);
   });

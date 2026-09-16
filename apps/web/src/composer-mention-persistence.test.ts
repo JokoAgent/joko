@@ -89,10 +89,17 @@ describe("durable composer mention inventory", () => {
     expect((await state.readDraft("server", "session"))?.mentions).toEqual(draft.mentions);
     const newDraft: NewSessionLocalDraft = { ...draft, editorDocument: plainTextToComposerDocument(draft.text),
       selection: { kind: "dialogue", backendId: "backend" }, nativeStart: { kind: "fresh" }, providerId: "", modelId: "",
-      fastMode: false, planMode: false, permissionMode: "ask" };
+      fastMode: false, planMode: false, permissionMode: "ask", browserComments: [{
+        id: "comment-one", markerNumber: 1, pageUrl: "https://example.com/", comment: "Keep this",
+        target: { kind: "element", point: { x: 12, y: 24 }, viewport: { width: 800, height: 600 } },
+        screenshot: { id: "comment-screenshot", kind: "image", file: new File(["comment-bytes"], "comment.png", { type: "image/png" }) }
+      }] };
     await state.saveNewSessionDraft("owner", newDraft);
     expect((await state.readNewSessionDraft("owner"))?.inlineMentionRanges).toEqual(draft.inlineMentionRanges);
     expect((await state.readNewSessionDraft("owner"))?.mentions).toEqual(draft.mentions);
+    const restoredComment = (await state.readNewSessionDraft("owner"))?.browserComments?.[0];
+    expect(restoredComment?.comment).toBe("Keep this");
+    expect(await restoredComment?.screenshot.file.text()).toBe("comment-bytes");
   });
 
   it.each([

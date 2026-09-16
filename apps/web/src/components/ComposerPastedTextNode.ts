@@ -2,6 +2,7 @@ import { Node, mergeAttributes, type Editor } from "@tiptap/core";
 import { closeHistory } from "@tiptap/pm/history";
 import { Fragment, type Node as ProseMirrorNode } from "@tiptap/pm/model";
 import { COMPOSER_PASTED_TEXT_NODE_TYPE } from "./composer-paste-pipeline.js";
+import { skipComposerListNormalization } from "./composer-list-normalization.js";
 
 export { COMPOSER_PASTED_TEXT_NODE_TYPE } from "./composer-paste-pipeline.js";
 
@@ -21,7 +22,7 @@ export function applyComposerPastedTextEdit(
   const transaction = next === null
     ? editor.state.tr.delete(nodePosition, nodePosition + current.nodeSize)
     : editor.state.tr.setNodeMarkup(nodePosition, undefined, { ...current.attrs, ...next });
-  editor.view.dispatch(closeHistory(transaction));
+  editor.view.dispatch(closeHistory(skipComposerListNormalization(transaction)));
   return true;
 }
 
@@ -44,7 +45,7 @@ export function replaceComposerPastedTextWithPlainText(
     nodePosition + current.nodeSize,
     Fragment.from(nodes)
   );
-  editor.view.dispatch(closeHistory(transaction));
+  editor.view.dispatch(closeHistory(skipComposerListNormalization(transaction)));
   return true;
 }
 

@@ -10,20 +10,25 @@ import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
 import { emptySnapshot, type BackendView, type ComposerDraft, type ComposerInlineMentionRange, type RuntimeCommandView, type SessionView } from "../model.js";
 import { replaceComposerDocumentTextRange } from "./composer-inline-mention.js";
 import { Composer } from "./Composer.js";
+import { WORKSPACE_ENTRY_DRAG_MIME, encodeWorkspaceEntryDragPayload } from "./workspace-tree-state.js";
 
-const editorHarness = vi.hoisted(() => ({ caret: 0, restoredCaret: undefined as number | undefined }));
+const editorHarness = vi.hoisted(() => ({
+  caret: 0,
+  restoredCaret: undefined as number | undefined,
+  routeDropActions: [] as Array<Record<string, unknown>>
+}));
 
 vi.mock("./composer-inline-mention.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./composer-inline-mention.js")>();
   return {
     ...actual,
-    composerCaretTextOffset: () => document.activeElement?.getAttribute("data-mock-composer-editor") === "true"
+    composerCaretTextOffset: (root: HTMLElement | null) => root?.ownerDocument.activeElement?.getAttribute("data-mock-composer-editor") === "true"
       ? editorHarness.caret
       : undefined,
-    setComposerCaretTextOffset: (_root: HTMLElement | null, _selection: Selection | null, offset: number) => {
+    setComposerCaretTextOffset: (root: HTMLElement | null, _selection: Selection | null, offset: number) => {
       editorHarness.caret = offset;
       editorHarness.restoredCaret = offset;
-      const editor = document.querySelector<HTMLTextAreaElement>('[data-mock-composer-editor="true"]');
+      const editor = root?.ownerDocument.querySelector<HTMLTextAreaElement>('[data-mock-composer-editor="true"]') ?? null;
       editor?.setSelectionRange(Math.min(offset, editor.value.length), Math.min(offset, editor.value.length));
       return editor !== null;
     }
@@ -55,7 +60,11 @@ vi.mock("./ComposerRichTextEditor.js", () => ({
       },
       focusFromBlankSurface: () => textareaRef.current?.focus(),
       editPastedText: () => false,
-      insertRouteReference: () => false
+      insertRouteReference: () => false,
+      routeReferenceDrop: (action: Record<string, unknown>) => {
+        editorHarness.routeDropActions.push(action);
+        return true;
+      }
     }), []);
     return <textarea
       ref={textareaRef}
@@ -125,12 +134,14 @@ beforeEach(() => {
   vi.stubGlobal("cancelAnimationFrame", () => undefined);
   editorHarness.caret = 0;
   editorHarness.restoredCaret = undefined;
+  editorHarness.routeDropActions.splice(0);
 });
 
 afterEach(async () => {
   await act(async () => { for (const root of roots.splice(0)) root.unmount(); });
   document.body.replaceChildren();
   rafCallbacks.splice(0);
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
@@ -258,7 +269,102 @@ it("never opens the typed command palette for IME composition or shell mode and 
   expect(view.editor().value).toBe("second task");
 });
 
-async function mount(initialDraft: ComposerDraft) {
+it("keeps selection ownership, command navigation, focus, and caret restoration in a mounted owner document", async () => {
+  const frame = document.createElement("iframe");
+  document.body.append(frame);
+  const ownerDocument = required(frame.contentDocument);
+  const ownerWindow = required(frame.contentWindow);
+  installAnimationFrameRuntime(ownerWindow);
+  const ownerTimer = vi.spyOn(ownerWindow, "setTimeout").mockImplementation(() => 1);
+  const view = await mount(draft("/"), ownerDocument);
+  const editor = view.editor();
+  editorHarness.caret = 0;
+  await act(async () => {
+    editor.focus();
+    editor.setSelectionRange(0, 0);
+    await Promise.resolve();
+  });
+  expect(typedPalette(ownerDocument)).toBeNull();
+  expect(ownerDocument).not.toBe(document);
+  editorHarness.caret = 1;
+
+  await act(async () => ownerDocument.dispatchEvent(new (ownerWindow as Window & typeof globalThis).Event("selectionchange")));
+  expect(ownerDocument.activeElement).toBe(editor);
+  expect(document.activeElement).not.toBe(editor);
+  expect(optionLabels(required(typedPalette(ownerDocument)))).toEqual(["/help", "/jump-session", "/cmd", "/clear", "/review", "/deploy"]);
+  expect(ownerTimer).toHaveBeenCalledWith(expect.any(Function), 420);
+
+  expect(await press(editor, "End")).toBe(true);
+  expect(selectedOption(ownerDocument)?.textContent).toContain("/deploy");
+  expect(await press(editor, "Enter")).toBe(true);
+  await flushAnimationFrames();
+  expect(editor.value).toBe("/deploy");
+  expect(editorHarness.restoredCaret).toBe(editor.value.length);
+  expect(ownerDocument.activeElement).toBe(editor);
+  expect(typedPalette(ownerDocument)).toBeNull();
+});
+
+it("owns private drag position and cancellation in the mounted document without falling through to OS files", async () => {
+  const frame = document.createElement("iframe");
+  document.body.append(frame);
+  const ownerDocument = required(frame.contentDocument);
+  const ownerWindow = required(frame.contentWindow);
+  installAnimationFrameRuntime(ownerWindow);
+  const view = await mount(draft("anchor"), ownerDocument);
+  const composer = required(ownerDocument.querySelector<HTMLElement>(".composer"));
+  editorHarness.routeDropActions.splice(0);
+
+  const payload = encodeWorkspaceEntryDragPayload({
+    version: 1,
+    workspaceId: "workspace-one",
+    kind: "file",
+    path: "src/main.ts",
+    name: "main.ts"
+  });
+  let readable = false;
+  const privateTransfer = dragTransfer({
+    types: [WORKSPACE_ENTRY_DRAG_MIME],
+    getData: (type) => readable && type === WORKSPACE_ENTRY_DRAG_MIME ? payload : ""
+  });
+  await dispatchDrag(composer, "dragenter", privateTransfer, 31, 47);
+  await dispatchDrag(composer, "dragover", privateTransfer, 37, 53);
+  expect(composer.querySelector(".composer__drop")).toBeNull();
+  expect(editorHarness.routeDropActions.filter((action) => action["kind"] === "move").at(-1)).toEqual({ kind: "move", clientX: 37, clientY: 53 });
+
+  readable = true;
+  await dispatchDrag(composer, "drop", privateTransfer, 41, 59);
+  const commits = editorHarness.routeDropActions.filter((action) => action["kind"] === "commit");
+  expect(commits).toHaveLength(1);
+  expect(commits[0]).toMatchObject({
+    kind: "commit",
+    clientX: 41,
+    clientY: 59,
+    insertion: { source: "workspace", attrs: { reference: "src/main.ts" } }
+  });
+
+  const file = new File(["ordinary"], "ordinary.txt", { type: "text/plain" });
+  editorHarness.routeDropActions.splice(0);
+  const malformed = dragTransfer({
+    types: [WORKSPACE_ENTRY_DRAG_MIME, "Files"],
+    files: [file],
+    getData: (type) => type === WORKSPACE_ENTRY_DRAG_MIME ? "{bad" : ""
+  });
+  await dispatchDrag(composer, "drop", malformed, 1, 2);
+  expect(editorHarness.routeDropActions.some((action) => action["kind"] === "commit")).toBe(false);
+  expect(ownerDocument.querySelector(".attachment-list")).toBeNull();
+
+  const ordinary = dragTransfer({ types: ["Files"], files: [file] });
+  await dispatchDrag(composer, "drop", ordinary, 3, 4);
+  await vi.waitFor(() => expect(ownerDocument.querySelector(".attachment-list")?.textContent).toContain("ordinary.txt"));
+
+  editorHarness.routeDropActions.splice(0);
+  readable = false;
+  await dispatchDrag(composer, "dragenter", privateTransfer, 5, 6);
+  await act(async () => ownerDocument.dispatchEvent(new (ownerWindow as Window & typeof globalThis).Event("dragend", { bubbles: true })));
+  expect(editorHarness.routeDropActions.at(-1)).toEqual({ kind: "cancel" });
+});
+
+async function mount(initialDraft: ComposerDraft, ownerDocument: Document = document) {
   const drafts = new Map<string, ComposerDraft>([
     [baseSession.id, initialDraft],
     ["task-two", draft("second task")]
@@ -266,6 +372,7 @@ async function mount(initialDraft: ComposerDraft) {
   const api = {
     state: { connectionState: "connected", snapshot: emptySnapshot(), preferences: DEFAULT_UI_PREFERENCES },
     readDraft: vi.fn(async (sessionId: string) => drafts.get(sessionId)),
+    readDraftSnapshot: vi.fn(async (sessionId: string) => ({ revision: 1, draft: drafts.get(sessionId) })),
     saveDraft: vi.fn(async () => undefined),
     send: vi.fn(async () => undefined),
     getVoiceInputCapabilities: vi.fn(async () => ({})),
@@ -280,13 +387,14 @@ async function mount(initialDraft: ComposerDraft) {
     capabilities: new Map([
       ["input.text", { name: "input.text", supported: true, options: [] }],
       ["input.mention", { name: "input.mention", supported: true, options: ["workspace_file"] }],
+      ["input.file", { name: "input.file", supported: true, options: [], maximumItems: 5 }],
       ["runtime.user_shell", { name: "runtime.user_shell", supported: true, options: [] }],
       ["session.reset", { name: "session.reset", supported: true, options: [] }],
       ["review.isolated", { name: "review.isolated", supported: true, options: [] }]
     ])
   };
   const workspace = { id: "workspace-one", targetId: baseSession.targetId, name: "Workspace", kind: "userProject" as const, serverPath: "/workspace", trusted: true, dirty: false, entries: [] };
-  const host = document.body.appendChild(document.createElement("div"));
+  const host = ownerDocument.body.appendChild(ownerDocument.createElement("div"));
   const root = createRoot(host);
   roots.push(root);
   const actions: Promise<unknown>[] = [];
@@ -326,16 +434,18 @@ function draft(text: string): ComposerDraft {
 async function input(element: HTMLTextAreaElement | HTMLInputElement, value: string, caret: number, isComposing = false): Promise<void> {
   await act(async () => {
     element.focus();
-    const prototype = element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const prototype = Object.getPrototypeOf(element) as object;
     Object.getOwnPropertyDescriptor(prototype, "value")?.set?.call(element, value);
     element.setSelectionRange(caret, caret);
     editorHarness.caret = caret;
-    element.dispatchEvent(new InputEvent("input", { bubbles: true, cancelable: true, inputType: "insertText", isComposing }));
+    const ownerWindow = required(element.ownerDocument.defaultView) as Window & typeof globalThis;
+    element.dispatchEvent(new ownerWindow.InputEvent("input", { bubbles: true, cancelable: true, inputType: "insertText", isComposing }));
   });
 }
 
 async function press(element: HTMLElement, key: string): Promise<boolean> {
-  const event = new KeyboardEvent("keydown", { bubbles: true, cancelable: true, key });
+  const ownerWindow = required(element.ownerDocument.defaultView) as Window & typeof globalThis;
+  const event = new ownerWindow.KeyboardEvent("keydown", { bubbles: true, cancelable: true, key });
   await act(async () => element.dispatchEvent(event));
   return event.defaultPrevented;
 }
@@ -346,12 +456,25 @@ async function flushAnimationFrames(): Promise<void> {
   });
 }
 
-function typedPalette(): HTMLElement | null {
-  return document.body.querySelector<HTMLElement>('[data-composer-typed-command-palette="true"]');
+function typedPalette(ownerDocument: Document = document): HTMLElement | null {
+  return ownerDocument.body.querySelector<HTMLElement>('[data-composer-typed-command-palette="true"]');
 }
 
-function selectedOption(): HTMLElement | null {
-  return typedPalette()?.querySelector<HTMLElement>('[role="option"][aria-selected="true"]') ?? null;
+function selectedOption(ownerDocument: Document = document): HTMLElement | null {
+  return typedPalette(ownerDocument)?.querySelector<HTMLElement>('[role="option"][aria-selected="true"]') ?? null;
+}
+
+function installAnimationFrameRuntime(ownerWindow: Window): void {
+  Object.defineProperties(ownerWindow, {
+    requestAnimationFrame: {
+      configurable: true,
+      value: (callback: FrameRequestCallback) => {
+        rafCallbacks.push(callback);
+        return rafCallbacks.length;
+      }
+    },
+    cancelAnimationFrame: { configurable: true, value: () => undefined }
+  });
 }
 
 function optionLabels(root: Element): readonly string[] {
@@ -372,4 +495,41 @@ function singleTextSplice(previous: string, next: string): { readonly from: numb
     to: previous.length - suffix,
     replacement: next.slice(from, next.length - suffix)
   };
+}
+
+interface TestDragTransfer {
+  readonly types: readonly string[];
+  readonly files: readonly File[];
+  dropEffect: string;
+  getData(type: string): string;
+}
+
+function dragTransfer(options: {
+  readonly types: readonly string[];
+  readonly files?: readonly File[];
+  readonly getData?: (type: string) => string;
+}): TestDragTransfer {
+  return {
+    types: options.types,
+    files: options.files ?? [],
+    dropEffect: "none",
+    getData: options.getData ?? (() => "")
+  };
+}
+
+async function dispatchDrag(element: HTMLElement, type: string, transfer: TestDragTransfer, clientX: number, clientY: number): Promise<void> {
+  const ownerWindow = required(element.ownerDocument.defaultView) as Window & typeof globalThis;
+  const event = new ownerWindow.Event(type, { bubbles: true, cancelable: true });
+  Object.defineProperties(event, {
+    dataTransfer: { value: transfer },
+    clientX: { value: clientX },
+    clientY: { value: clientY },
+    relatedTarget: { value: null }
+  });
+  await act(async () => element.dispatchEvent(event));
+}
+
+function required<T>(value: T | null | undefined): T {
+  if (value === null || value === undefined) throw new Error("Expected test value");
+  return value;
 }

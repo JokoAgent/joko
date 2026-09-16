@@ -52,6 +52,32 @@ export function sessionWindowDropBounds(input: {
   };
 }
 
+/** Clamp Electron's realized outer bounds, which may include a native resize frame. */
+export function clampWindowBoundsToWorkArea(
+  bounds: DesktopRectangle,
+  workArea: DesktopRectangle
+): DesktopRectangle {
+  if (!validRectangle(bounds) || !validRectangle(workArea)) {
+    throw new TypeError("Task window geometry is invalid.");
+  }
+  const width = Math.min(Math.max(1, Math.round(bounds.width)), workArea.width);
+  const height = Math.min(Math.max(1, Math.round(bounds.height)), workArea.height);
+  return {
+    x: clamp(
+      Math.round(bounds.x),
+      workArea.x,
+      workArea.x + workArea.width - width
+    ),
+    y: clamp(
+      Math.round(bounds.y),
+      workArea.y,
+      workArea.y + workArea.height - height
+    ),
+    width,
+    height
+  };
+}
+
 /** Follow the pointer on its nearest display without crossing that display's work area. */
 export function sessionDragPreviewBounds(point: DesktopPoint, workArea: DesktopRectangle): DesktopRectangle {
   if (!Number.isFinite(point.x) || !Number.isFinite(point.y) || !validRectangle(workArea)) {

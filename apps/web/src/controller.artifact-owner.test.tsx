@@ -5,7 +5,7 @@ import { afterEach, beforeAll, expect, it, vi } from "vitest";
 
 import { useAppController, type AppController } from "./controller.js";
 import { createOrchestratorGateway, probeOrchestratorOrigin, type OrchestratorGateway } from "./gateway.js";
-import { DEFAULT_UI_PREFERENCES, LocalState } from "./local-state.js";
+import { DEFAULT_UI_PREFERENCES, LocalState, type UiPreferences, type UiPreferencesMutation } from "./local-state.js";
 import { emptySnapshot, type AppSnapshot, type BrowserSettingsView, type SessionView, type TimelineItemView, type ConnectionProfile } from "./model.js";
 import { registerWorkspaceHtmlPreviewSurface } from "./workspace-html-auto-reload.js";
 import { persistentWebSecretEncryptionAvailable } from "./web-crypto.js";
@@ -51,20 +51,22 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   const newDraftCalls = Object.fromEntries(newDraftMethods.map((method) => [method, vi.fn(async () => undefined)])) as Record<typeof newDraftMethods[number], ReturnType<typeof vi.fn>>;
   const workspaceMethods = ["listWorkspaceChangeSets", "previewWorkspaceRewind", "executeWorkspaceRewind"] as const;
   const workspaceCalls = new Map<string, Record<typeof workspaceMethods[number], ReturnType<typeof vi.fn>>>();
+  let storedPreferences = { ...DEFAULT_UI_PREFERENCES, machineSelection: ["unselected-profile"] } as UiPreferences;
   vi.spyOn(LocalState, "open").mockResolvedValue({
     readDraft, saveDraft, readDraftSnapshot, saveDraftIfRevision, ...newDraftCalls,
     listProfiles: async () => [], listMachineCaches: async () => [],
-    readPreferences: async () => ({ ...DEFAULT_UI_PREFERENCES, machineSelection: ["unselected-profile"] }),
+    readPreferences: async () => storedPreferences,
     readAuthKey: async () => "test-key", saveProfile: async () => undefined,
     saveMachineCache: async () => undefined,
-    savePreferences: async () => undefined
+    savePreferences: async (value: UiPreferences) => { storedPreferences = value; },
+    mutatePreferences: async (mutation: UiPreferencesMutation) => (storedPreferences = mutation(storedPreferences))
   } as unknown as LocalState);
   const first = profile("first");
   const second = profile("second");
   vi.mocked(probeOrchestratorOrigin).mockImplementation(async (origin) => ({ serverId: origin === first.origin ? first.serverId : second.serverId, displayName: "Test", version: "1", apiVersion: "1", pairingEnabled: false }));
   let finishFirst!: () => void;
   const pendingFirst = new Promise<void>((resolve) => { finishFirst = resolve; });
-  const inputCalls = new Map<string, Record<"send" | "createSession" | "createTarget" | "refresh" | "readSessionArtifact", ReturnType<typeof vi.fn>>>();
+  const inputCalls = new Map<string, Record<"send" | "createSession" | "createTarget" | "prepareTargetWorkspace" | "refresh" | "readSessionArtifact", ReturnType<typeof vi.fn>>>();
   const browserCalls = new Map<string, ReturnType<typeof vi.fn>>();
   const htmlCalls = new Map<string, ReturnType<typeof vi.fn>>();
   const reloadCalls = new Map<string, ReturnType<typeof vi.fn>>();
@@ -115,6 +117,7 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
       readSessionArtifact: vi.fn(async () => { if (disposed) throw new Error("Input owner disconnected"); return { id: "artifact", blobId: "blob" }; }),
       createSession: vi.fn(async () => { if (disposed) throw new Error("Input owner disconnected"); return { sessionId: "created", generation: 1n }; }),
       createTarget: vi.fn(async () => { if (disposed) throw new Error("Input owner disconnected"); return "target"; }),
+      prepareTargetWorkspace: vi.fn(async () => { if (disposed) throw new Error("Input owner disconnected"); }),
       refresh: vi.fn(async () => { if (disposed) throw new Error("Input owner disconnected"); })
     };
     inputCalls.set(owner!.id, inputOperations);
@@ -157,7 +160,7 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
       ...inputOperations, ...workspaceOperations, ...voiceOperations, ...queueOperations, ...remoteOperations, ...loginOperations, ...sshOperations,
       watchRemoteHosts: async function* () { if (disposed) throw new Error("Remote workspace owner disconnected"); yield []; },
       readWorkspaceFile: read, readWorkspaceHtmlSnapshot, performBrowserTakeoverAction, getArtifactUrl: get, releaseArtifactUrl: release,
-      navigateSessionBranch: navigate, copyArtifactFile: download, downloadArtifact: download, exportSession: download, exportPortableSession: download,
+      navigateSessionBranch: navigate, copyArtifactFile: download, openArtifactFile: download, downloadArtifact: download, exportSession: download, exportPortableSession: download,
       updateAuxiliaryTextSettings: save, predictNextPrompt: predict, openBrowserPage
     } as unknown as OrchestratorGateway;
   });
@@ -179,12 +182,13 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   expect(current.exportSession).toBe(firstController.exportSession);
   expect(current.exportPortableSession).toBe(firstController.exportPortableSession);
   expect(current.copyArtifactFile).toBe(firstController.copyArtifactFile);
+  expect(current.openArtifactFile).toBe(firstController.openArtifactFile);
   expect(current.openHttpLink).toBe(firstController.openHttpLink);
   expect(current.navigateSessionBranch).toBe(firstController.navigateSessionBranch);
   expect(current.readDraft).toBe(firstController.readDraft);
   expect(current.saveDraft).toBe(firstController.saveDraft);
-  for (const method of ["readDraftSnapshot", "saveDraftIfRevision", ...newDraftMethods, ...workspaceMethods] as const) expect(current[method]).toBe(firstController[method]);
-  for (const method of ["send", "createSession", "createTarget", "refresh", "readSessionArtifact"] as const) {
+  for (const method of ["readDraftSnapshot", "saveDraftIfRevision", "restoreFirstInputDraft", ...newDraftMethods, ...workspaceMethods] as const) expect(current[method]).toBe(firstController[method]);
+  for (const method of ["send", "createSession", "createTarget", "prepareTargetWorkspace", "refresh", "readSessionArtifact"] as const) {
     expect(current[method]).toBe(firstController[method]);
   }
   for (const method of voiceMethods) expect(current[method]).toBe(firstController[method]);
@@ -283,6 +287,7 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   await expect(firstController.navigateSessionBranch("shared-session", { kind: "session_start" }, { expectedGeneration: 1n })).rejects.toThrow("Navigation owner disconnected");
   expect(gateways.get(second.id)!.navigate).not.toHaveBeenCalled();
   await expect(firstController.copyArtifactFile("shared", "same.txt", 1, downloadContext)).rejects.toThrow("Download owner disconnected");
+  await expect(firstController.openArtifactFile("shared", "same.txt", 1, downloadContext)).rejects.toThrow("Download owner disconnected");
   const capturedDraft = { text: "Captured", attachments: [], mentions: [], deliveryMode: "prompt" as const };
   await firstController.readDraft("shared-session");
   await firstController.saveDraft("shared-session", capturedDraft);
@@ -294,9 +299,23 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   await firstController.saveDraftIfRevision("shared-session", capturedDraft, 0);
   expect(readDraftSnapshot).toHaveBeenLastCalledWith(first.serverId, "shared-session");
   expect(saveDraftIfRevision).toHaveBeenLastCalledWith(first.serverId, "shared-session", capturedDraft, 0);
-  await firstController.readNewSessionDraft();
+  await act(async () => firstController.restoreFirstInputDraft("shared-session", capturedDraft));
+  expect(readDraftSnapshot).toHaveBeenLastCalledWith(first.serverId, "shared-session");
+  expect(saveDraftIfRevision).toHaveBeenLastCalledWith(first.serverId, "shared-session", expect.objectContaining({
+    text: "Captured",
+    deliveryMode: "prompt"
+  }), 0);
   const newTaskDraft = { selection: { kind: "dialogue" as const, backendId: "backend" }, nativeStart: { kind: "fresh" as const }, providerId: "provider", modelId: "model", fastMode: false, permissionMode: "ask" as const, planMode: false, text: "New task", editorDocument: { type: "doc", content: [] }, mentions: [], attachments: [] };
-  await firstController.saveNewSessionDraft(newTaskDraft);
+  const supersededNewTaskDraft = { ...newTaskDraft, text: "Superseded new task" };
+  let releaseFirstNewTaskSave!: () => void;
+  newDraftCalls.saveNewSessionDraft.mockImplementationOnce(() => new Promise<void>((resolve) => { releaseFirstNewTaskSave = resolve; }));
+  const firstNewTaskSave = firstController.saveNewSessionDraft(supersededNewTaskDraft);
+  const latestNewTaskSave = firstController.saveNewSessionDraft(newTaskDraft);
+  const readAfterNewTaskSaves = firstController.readNewSessionDraft();
+  await vi.waitFor(() => expect(newDraftCalls.saveNewSessionDraft).toHaveBeenCalledExactlyOnceWith(`${first.serverId}\u0000${first.id}`, supersededNewTaskDraft));
+  expect(newDraftCalls.readNewSessionDraft).not.toHaveBeenCalled();
+  releaseFirstNewTaskSave();
+  await Promise.all([firstNewTaskSave, latestNewTaskSave, readAfterNewTaskSaves]);
   await firstController.clearNewSessionDraft();
   const pendingExtensionUse = {
     extensionId: "extension_0123456789abcdef0123456789abcdef",
@@ -325,7 +344,7 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
     await expect(call("workspace", "preview", "change", false)).rejects.toThrow("Workspace owner disconnected");
     expect(workspaceCalls.get(second.id)![method]).not.toHaveBeenCalled();
   }
-  for (const method of ["send", "createSession", "createTarget", "refresh", "readSessionArtifact"] as const) {
+  for (const method of ["send", "createSession", "createTarget", "prepareTargetWorkspace", "refresh", "readSessionArtifact"] as const) {
     expect(secondController[method]).not.toBe(firstController[method]);
   }
   for (const method of voiceMethods) expect(secondController[method]).not.toBe(firstController[method]);
@@ -342,6 +361,7 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   await expect(firstController.send("shared-session", inputDraft, { expectedGeneration: 1n })).rejects.toThrow("Input owner disconnected");
   await expect(firstController.createSession(taskDraft)).rejects.toThrow("Input owner disconnected");
   await expect(firstController.createTarget(targetDraft)).rejects.toThrow("Input owner disconnected");
+  await expect(firstController.prepareTargetWorkspace("target", 1n)).rejects.toThrow("Input owner disconnected");
   await expect(firstController.refresh()).rejects.toThrow("Input owner disconnected");
   await expect(firstController.readSessionArtifact("shared-session", "artifact", new AbortController().signal)).rejects.toThrow("Input owner disconnected");
   for (const call of Object.values(inputCalls.get(second.id)!)) expect(call).not.toHaveBeenCalled();

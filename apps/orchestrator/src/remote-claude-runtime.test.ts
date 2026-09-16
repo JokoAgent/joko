@@ -39,6 +39,74 @@ afterEach(async () => {
 });
 
 describe("RemoteClaudeRuntimeResolver", () => {
+  it("serializes only the frozen product Tool manifest and fences its callbacks to the exact Query", async () => {
+    const fixture = createFixture();
+    cleanups.push(() => fixture.resolver.close());
+    const binding = await fixture.resolver.resolve(fixture.target);
+    const call = vi.fn(async () => ({
+      content: [{ type: "text", text: "approved" }],
+      structuredContent: { echoed: "approved" }, isError: false
+    }));
+    const tool = {
+      serverId: "approved-tools", name: "echo", description: "Echo approved data",
+      inputSchema: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false },
+      outputSchema: { type: "object", properties: { echoed: { type: "string" } }, required: ["echoed"], additionalProperties: false },
+      call
+    } as const;
+    const query = await binding.runtime.query(queryParams(undefined, undefined, false, undefined, {
+      mcpTools: [tool], mcpServers: {}, strictMcpConfig: true
+    }));
+    const startOptions = fixture.processes.startRequests.at(-1)?.params.options as Record<string, unknown>;
+    expect(startOptions).toMatchObject({
+      mcpServers: {}, strictMcpConfig: true,
+      productMcpTools: [{
+        serverId: tool.serverId, name: tool.name, description: tool.description,
+        inputSchema: tool.inputSchema, outputSchema: tool.outputSchema
+      }]
+    });
+    expect(JSON.stringify(startOptions)).not.toContain('"call"');
+    await expect(fixture.processes.invokeCallback("productMcpTool", {
+      serverId: tool.serverId, name: tool.name, arguments: { value: "hello" }, toolUseId: "native-root-one"
+    })).resolves.toMatchObject({ structuredContent: { echoed: "approved" }, isError: false });
+    expect(call).toHaveBeenCalledWith({ value: "hello" }, {
+      toolUseId: "native-root-one", signal: expect.any(AbortSignal)
+    });
+    await expect(fixture.processes.invokeCallback("productMcpTool", {
+      serverId: "not-approved", name: tool.name, arguments: {}, toolUseId: "native-root-two"
+    })).rejects.toThrow("Callback failed");
+    await expect(fixture.processes.invokeCallback("productMcpTool", {
+      serverId: tool.serverId, name: tool.name, arguments: { value: "hello", unapproved: true }, toolUseId: "native-root-three"
+    })).rejects.toThrow("Callback failed");
+    expect(call).toHaveBeenCalledOnce();
+    await binding.runtime.retireQuery(query, 2_000);
+  });
+
+  it("cancels a remote product Tool callback on manager cancellation before reporting any effect", async () => {
+    const fixture = createFixture();
+    cleanups.push(() => fixture.resolver.close());
+    const binding = await fixture.resolver.resolve(fixture.target);
+    let effectSignal: AbortSignal | undefined;
+    const call: NonNullable<ClaudeSdkQueryOptions["mcpTools"]>[number]["call"] = vi.fn(async (_input, options) => {
+      effectSignal = options.signal;
+      await new Promise<void>((_resolve, reject) =>
+        options.signal.addEventListener("abort", () => reject(new Error("The effect was cancelled.")), { once: true }));
+      return { content: [], isError: false };
+    });
+    const query = await binding.runtime.query(queryParams(undefined, undefined, false, undefined, {
+      mcpTools: [{ serverId: "approved-tools", name: "wait", description: "Wait",
+        inputSchema: { type: "object" }, call }]
+    }));
+    const pending = fixture.processes.invokeCallback("productMcpTool", {
+      serverId: "approved-tools", name: "wait", arguments: {}, toolUseId: "native-root-wait"
+    });
+    await waitUntil(() => effectSignal !== undefined);
+    fixture.processes.cancelCallback("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+    await waitUntil(() => effectSignal?.aborted === true);
+    await expect(pending).rejects.toThrow("Callback failed");
+    expect(call).toHaveBeenCalledOnce();
+    await binding.runtime.retireQuery(query, 2_000);
+  });
+
   it("binds the fixed isolated runtime to exact Target/SSH authority and supports the public Session surface", async () => {
     const fixture = createFixture();
     cleanups.push(() => fixture.resolver.close());
@@ -470,7 +538,7 @@ class FakeClaudeManagerProcesses implements RemoteProcessTransportPort {
     query.process.finish(1);
   }
 
-  invokeCallback(callback: "canUseTool" | "oauth" | "hook" | "managedAgentTool", value: unknown): Promise<unknown> {
+  invokeCallback(callback: "canUseTool" | "oauth" | "hook" | "managedAgentTool" | "productMcpTool", value: unknown): Promise<unknown> {
     const query = this.#query;
     if (query === undefined) return Promise.reject(new Error("No query is attached."));
     const callbackId = callback === "oauth"
@@ -479,6 +547,8 @@ class FakeClaudeManagerProcesses implements RemoteProcessTransportPort {
         ? "99999999-9999-4999-8999-999999999999"
         : callback === "managedAgentTool"
           ? "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        : callback === "productMcpTool"
+          ? "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
         : "66666666-6666-4666-8666-666666666666";
     query.process.send({ v: 1, kind: "callback", callbackId, queryId: query.queryId, callback, value });
     return new Promise((resolve, reject) => this.#callbacks.set(callbackId, { resolve, reject }));

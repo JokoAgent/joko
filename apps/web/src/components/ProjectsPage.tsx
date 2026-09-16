@@ -101,7 +101,12 @@ export function ProjectsPage({ controller, snapshot, focusProjectId, t, runActio
     setArchivePendingIds(new Set(archivePendingRef.current));
     runAction(`project-archive:${target.id}`, async () => {
       try {
-        await controller.archiveTarget(target.id, !target.archived);
+        const desiredArchived = !target.archived;
+        const authoritativeTarget = await controller.archiveTarget(target.id, desiredArchived);
+        if (authoritativeTarget === undefined || authoritativeTarget.archived !== desiredArchived) {
+          request.cancel();
+          return;
+        }
         request.ready = true;
         const latestController = latestControllerRef.current;
         const latest = latestController.state;
@@ -160,7 +165,7 @@ export function ProjectsPage({ controller, snapshot, focusProjectId, t, runActio
     <DeleteProjectDialog
       target={deleteTarget}
       workspace={snapshot.workspaces.find((workspace) => workspace.id === deleteTarget?.workspaceId)}
-      sessions={snapshot.sessions.filter((session) => session.targetId === deleteTarget?.id)}
+      sessions={snapshot.sessions.filter((session) => session.projectId === deleteTarget?.id)}
       prepareSessionRemoval={prepareSessionRemoval}
       t={t}
       onClose={() => setDeleteTarget(undefined)}
@@ -168,7 +173,7 @@ export function ProjectsPage({ controller, snapshot, focusProjectId, t, runActio
         const target = deleteTarget;
         const targetSessions = target === undefined
           ? []
-          : snapshot.sessions.filter((session) => session.targetId === target.id);
+          : snapshot.sessions.filter((session) => session.projectId === target.id);
         setDeleteTarget(undefined);
         if (target !== undefined) runAction(
           `project-delete:${target.id}`,

@@ -23,6 +23,7 @@ import { remapComposerInlineMentionReplacement } from "../composer-mention-range
 import { ModelSourceNotice } from "./ModelSourceNotice.js";
 import type { ArtifactReferenceCatalogItemView, AttachmentDraft, BackendView, BrowserCommentDraftItem, ComposerDraft, ComposerMentionDraft, ComposerMessageMentionDraft, ComposerSelectionQuoteDraft, DeliveryMode, ExtraDirectoryView, QueueControlView, QueueItemView, RuntimeCommandView, SessionResourceView, SessionView, UsageTokensView, WorkspaceView } from "../model.js";
 import { browserCommentPreviewTag, removeBrowserCommentAndRepairChains } from "../browser-comment-draft.js";
+import { mergeRejectedComposerDraft } from "../composer-draft-recovery.js";
 import { appendQuoteToComposerDocument, appendTextToComposerDocument, composerDocumentIsEmpty, composerDocumentKeepingQuotes, composerDocumentPlainText, composerDocumentQuotes, emptyComposerDocument, joinComposerDocuments, normalizeComposerDocument, plainTextToComposerDocument } from "../composer-quote-document.js";
 import { advertisedQueueDeliveryModes } from "./backend-control-capabilities.js";
 import { upsertComposerMention } from "../message-reference.js";
@@ -43,7 +44,7 @@ import { ComposerRichTextEditor, type ComposerRichTextEditorHandle } from "./Com
 import { ComposerPastedTextDialog, type ComposerPastedTextDialogTarget } from "./ComposerPastedTextDialog.js";
 import { countComposerPasteLines } from "./composer-paste-pipeline.js";
 import { resolveComposerRouteReferenceFromRuntime } from "./composer-route-reference-runtime.js";
-import { hasComposerInternalDrop, resolveComposerInternalDrop } from "./composer-internal-drop.js";
+import { classifyComposerInternalDrop } from "./composer-internal-drop.js";
 import { isComposerBlankPointerTarget } from "./composer-blank-focus.js";
 import { shouldAutoFocusComposer } from "./composer-auto-focus.js";
 import { isPromptRecommendationAcceptKey, PromptRecommendationEditorFrame, shouldShowPromptRecommendation } from "./PromptRecommendationOverlay.js";
@@ -137,6 +138,10 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   const composerStackRef = useRef<HTMLDivElement>(null);
   const [voiceRoot, setVoiceRoot] = useState<HTMLDivElement>();
   const bindComposer = useCallback((node: HTMLDivElement | null) => { composerStackRef.current = node; setVoiceRoot(node ?? undefined); }, []);
+  const requestComposerFrame = useCallback((callback: FrameRequestCallback): number | undefined => {
+    const ownerWindow = composerStackRef.current?.ownerDocument.defaultView;
+    return ownerWindow?.requestAnimationFrame(callback);
+  }, []);
   const [voiceSendTarget, setVoiceSendTarget] = useState<HTMLButtonElement>();
   const bindVoiceSend = useCallback((node: HTMLButtonElement | null) => setVoiceSendTarget(node ?? undefined), []);
   const voiceCaretRef = useRef<number | undefined>(undefined);
@@ -163,6 +168,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   const editorDocumentRef = useRef(editorDocument);
   editorDocumentRef.current = editorDocument;
   const editorRevisionRef = useRef(0);
+  const hydratedDraftRevisionRef = useRef(0);
 
   const inlineMentionRangesRef = useRef(inlineMentionRanges);
   inlineMentionRangesRef.current = inlineMentionRanges;
@@ -181,11 +187,13 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   const appliedSelectionQuoteInsertionRef = useRef<number | undefined>(undefined);
   const appliedAttachmentInsertionRef = useRef<number | undefined>(undefined);
   const appliedDraftReplacementRef = useRef<number | undefined>(undefined);
+  const appliedRejectedFirstInputRecoveryRef = useRef<number | undefined>(undefined);
   const promptRecommendationRevision = useSyncExternalStore(
     promptRecommendationStore.subscribe,
     promptRecommendationStore.getRevision
   );
   const editorTextUpdate = controller.state.editorTextUpdate;
+  const rejectedFirstInputRecovery = controller.state.rejectedFirstInputRecovery;
   const selectionQuotes = useMemo(() => composerDocumentQuotes(editorDocument), [editorDocument]);
   const mentionCapability = backend?.capabilities.get("input.mention");
   const mentionPolicy = useMemo(() => resolveComposerMentionPolicy(mentionCapability), [mentionCapability]);
@@ -273,7 +281,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     commandActivationRef.current = undefined;
     setCommandActivation(undefined);
     setPalette(undefined);
-    if (restoreFocus) requestAnimationFrame(() => richEditorRef.current?.focus());
+    if (restoreFocus) requestComposerFrame(() => richEditorRef.current?.focus());
   };
 
   const replaceInlineMentionRanges = (next: readonly ComposerInlineMentionRange[]): void => {
@@ -439,11 +447,12 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
 
   useLayoutEffect(() => {
     let cancelled = false;
-    focusAnchorRef.current = document.activeElement;
+    focusAnchorRef.current = composerStackRef.current?.ownerDocument.activeElement ?? null;
     const owner = operationGuardRef.current.capture(session.id);
     editorRevisionRef.current += 1;
     clearVoiceDictionaryEdit();
     setHydratedSession(undefined);
+    hydratedDraftRevisionRef.current = 0;
     textRef.current = "";
     setText("");
     setEditorDocument(emptyComposerDocument());
@@ -469,8 +478,9 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     hydratedHistoryDraftRef.current = undefined;
     setAttachments((current) => { revokeAttachments(current); return []; });
     setBrowserComments((current) => { revokeBrowserCommentPreviews(current); return []; });
-    void controllerRef.current.readDraft(session.id).then((draft) => {
+    void controllerRef.current.readDraftSnapshot(session.id).then(({ draft, revision }) => {
       if (cancelled || !operationGuardRef.current.ownsActivation(owner)) return;
+      hydratedDraftRevisionRef.current = revision;
       if (operationGuardRef.current.draftUnchanged(owner)) {
         const restoredDocument = normalizeComposerDocument(draft?.editorDocument, draft?.text ?? "");
         const restoredText = composerDocumentPlainText(restoredDocument);
@@ -495,7 +505,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       }
     });
     return () => { cancelled = true; };
-  }, [controller.readDraft, session.id, session.generation]); // Delivery capability updates are reconciled without re-reading storage.
+  }, [controller.readDraftSnapshot, session.id, session.generation]); // Delivery capability updates are reconciled without re-reading storage.
 
   useEffect(() => {
     const container = composerStackRef.current;
@@ -512,7 +522,9 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       activeElementMatchesAnchor: activeElement !== null && activeElement === focusAnchorRef.current,
       activeElementInsideComposer: activeElement !== null && container?.contains(activeElement) === true
     })) return;
-    const frame = window.requestAnimationFrame(() => {
+    const ownerWindow = ownerDocument?.defaultView;
+    if (ownerWindow === null || ownerWindow === undefined) return;
+    const frame = ownerWindow.requestAnimationFrame(() => {
       const currentContainer = composerStackRef.current;
       const currentDocument = currentContainer?.ownerDocument;
       const currentActive = currentDocument?.activeElement ?? null;
@@ -529,14 +541,69 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       })) return;
       richEditorRef.current?.focus("end");
     });
-    return () => window.cancelAnimationFrame(frame);
+    return () => ownerWindow.cancelAnimationFrame(frame);
   }, [autoFocus, hydratedSession, readOnly, session.id]);
 
   useEffect(() => {
     if (focusRequest <= 0 || readOnly || hydratedSession !== session.id) return;
-    const frame = window.requestAnimationFrame(() => richEditorRef.current?.focus("end"));
-    return () => window.cancelAnimationFrame(frame);
+    const ownerWindow = composerStackRef.current?.ownerDocument.defaultView;
+    if (ownerWindow === null || ownerWindow === undefined) return;
+    const frame = ownerWindow.requestAnimationFrame(() => richEditorRef.current?.focus("end"));
+    return () => ownerWindow.cancelAnimationFrame(frame);
   }, [focusRequest, hydratedSession, readOnly, session.id]);
+
+  useEffect(() => {
+    if (readOnly
+      || hydratedSession !== session.id
+      || submissionKind !== undefined
+      || rejectedFirstInputRecovery === undefined
+      || rejectedFirstInputRecovery.sessionId !== session.id
+      || appliedRejectedFirstInputRecoveryRef.current === rejectedFirstInputRecovery.eventId) return;
+    appliedRejectedFirstInputRecoveryRef.current = rejectedFirstInputRecovery.eventId;
+    if (hydratedDraftRevisionRef.current >= rejectedFirstInputRecovery.revision) return;
+    const current: ComposerDraft = {
+      text: textRef.current,
+      editorDocument: editorDocumentRef.current,
+      deliveryMode,
+      mentions: mentionsRef.current,
+      inlineMentionRanges: inlineMentionRangesRef.current,
+      attachments: attachmentsRef.current,
+      browserComments: browserCommentsRef.current,
+      ...(extraDirectoryIds === undefined ? {} : { extraDirectoryIds })
+    };
+    const restored = mergeRejectedComposerDraft(rejectedFirstInputRecovery.input, current);
+    const restoredDocument = normalizeComposerDocument(restored.editorDocument, restored.text);
+    const restoredText = composerDocumentPlainText(restoredDocument);
+    markDraftEdited(session.id);
+    editorRevisionRef.current += 1;
+    hydratedDraftRevisionRef.current = rejectedFirstInputRecovery.revision;
+    resetHistoryNavigation();
+    closePalette();
+    setBashMode(false);
+    editorDocumentRef.current = restoredDocument;
+    textRef.current = restoredText;
+    mentionsRef.current = restored.mentions;
+    attachmentsRef.current = restored.attachments;
+    browserCommentsRef.current = restored.browserComments ?? [];
+    setEditorDocument(restoredDocument);
+    setText(restoredText);
+    setMentions(restored.mentions);
+    replaceInlineMentionRanges(restored.inlineMentionRanges ?? []);
+    setExtraDirectoryIds(restored.extraDirectoryIds === undefined
+      ? undefined
+      : restored.extraDirectoryIds.filter((id) => selectableExtraDirectories.some((directory) => directory.id === id)));
+    setDeliveryMode(supportedModes.includes(restored.deliveryMode) ? restored.deliveryMode : supportedModes[0] ?? "prompt");
+    setAttachmentError(undefined);
+    setAttachments((existing) => {
+      revokeAttachments(existing);
+      return restored.attachments.map(withAttachmentPreview);
+    });
+    setBrowserComments((existing) => {
+      revokeBrowserCommentPreviews(existing);
+      return (restored.browserComments ?? []).map(withBrowserCommentPreview);
+    });
+    requestComposerFrame(() => richEditorRef.current?.focus("end"));
+  }, [hydratedSession, readOnly, rejectedFirstInputRecovery, session.id, submissionKind]);
 
   useEffect(() => {
     if (
@@ -558,7 +625,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     setText(nextText);
     replaceInlineMentionRanges(nextRanges);
     setMentions((current) => composerMentionsFromRanges(current, nextRanges));
-    requestAnimationFrame(() => richEditorRef.current?.focus());
+    requestComposerFrame(() => richEditorRef.current?.focus());
   }, [editorTextUpdate, readOnly, session.id]);
 
   useEffect(() => {
@@ -575,7 +642,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     closePalette();
     setBashMode(false);
     setMentions((current) => upsertComposerMention(current, messageMentionInsertion.mention));
-    requestAnimationFrame(() => richEditorRef.current?.focus());
+    requestComposerFrame(() => richEditorRef.current?.focus());
   }, [messageMentionInsertion, readOnly, session.id]);
 
   useEffect(() => {
@@ -601,7 +668,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     setText(nextText);
     replaceInlineMentionRanges(nextRanges);
     setMentions((current) => composerMentionsFromRanges(current, nextRanges));
-    requestAnimationFrame(() => richEditorRef.current?.focus());
+    requestComposerFrame(() => richEditorRef.current?.focus());
   }, [selectionQuoteInsertion, readOnly, session.id]);
 
   useEffect(() => {
@@ -629,7 +696,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       revokeAttachments(current);
       return (draftReplacement.attachments ?? []).map(withAttachmentPreview);
     });
-    requestAnimationFrame(() => richEditorRef.current?.focus());
+    requestComposerFrame(() => richEditorRef.current?.focus());
   }, [draftReplacement, readOnly, session.id]);
 
   useEffect(() => {
@@ -638,6 +705,8 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
 
   useEffect(() => {
     if (readOnly || hydratedSession !== session.id || (submissionKind !== undefined && submissionKind !== "send")) return;
+    const ownerWindow = composerStackRef.current?.ownerDocument.defaultView;
+    if (ownerWindow === null || ownerWindow === undefined) return;
     const owner = operationGuardRef.current.capture(session.id);
     const draft = {
       text,
@@ -651,19 +720,24 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     } satisfies ComposerDraft;
     const sourceControllerRef = { current: controllerRef.current };
     let cancelled = false;
-    const timer = window.setTimeout(() => {
+    let savedTimer: number | undefined;
+    const timer = ownerWindow.setTimeout(() => {
       if (cancelled || !operationGuardRef.current.ownsActivation(owner) || !operationGuardRef.current.draftUnchanged(owner)) return;
       void enqueueDraftSave(draftSaveChainRef, sourceControllerRef, session.id, draft).then(() => {
         if (cancelled || !operationGuardRef.current.ownsActivation(owner) || !operationGuardRef.current.draftUnchanged(owner)) return;
         setSaved(true);
-        window.setTimeout(() => {
+        savedTimer = ownerWindow.setTimeout(() => {
           if (!cancelled && operationGuardRef.current.ownsActivation(owner)) setSaved(false);
         }, 1200);
       }).catch((error: unknown) => {
         if (!cancelled && operationGuardRef.current.ownsActivation(owner)) setAttachmentError(messageOf(error));
       });
     }, 420);
-    return () => { cancelled = true; window.clearTimeout(timer); };
+    return () => {
+      cancelled = true;
+      ownerWindow.clearTimeout(timer);
+      if (savedTimer !== undefined) ownerWindow.clearTimeout(savedTimer);
+    };
   }, [controller.saveDraft, attachments, browserComments, deliveryMode, editorDocument, extraDirectoriesSupported, extraDirectoryIds, hydratedSession, mentions, inlineMentionRanges, readOnly, session.id, submissionKind, text]);
 
   useEffect(() => () => {
@@ -685,7 +759,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     replaceInlineMentionRanges(nextRanges);
     setMentions((current) => composerMentionsFromRanges(current, nextRanges));
     const root = composerStackRef.current?.querySelector<HTMLElement>(".composer-rich-editor__content") ?? null;
-    const caret = composerCaretTextOffset(root, typeof window === "undefined" ? null : window.getSelection()) ?? next.length;
+    const caret = composerCaretTextOffset(root, root?.ownerDocument.getSelection() ?? null) ?? next.length;
     lastComposerCaretRef.current = caret;
     const mentionTrigger = canMention && !isComposing && !bashMode ? detectComposerInlineMention(next, caret, nextRanges) : null;
     if (mentionTrigger !== null) {
@@ -783,7 +857,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       replaceInlineMentionRanges([]);
       hydratedHistoryDraftRef.current = composerHistoryDraftSignature(nextEntry.editorDocument);
     }
-    requestAnimationFrame(() => richEditorRef.current?.focus("end"));
+    requestComposerFrame(() => richEditorRef.current?.focus("end"));
     return true;
   };
 
@@ -816,15 +890,59 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     }
   };
 
-  const consumeInternalDrop = (dataTransfer: DataTransfer): boolean => {
-    if (!hasComposerInternalDrop(dataTransfer)) return false;
-    const insertion = resolveComposerInternalDrop(dataTransfer, workspace?.id);
-    if (insertion === undefined || effectiveBashMode || composerLocked) return true;
-    if (richEditorRef.current?.insertRouteReference(insertion) !== true) return true;
+  const updateInternalDrop = (dataTransfer: DataTransfer, clientX: number, clientY: number): boolean => {
+    const state = classifyComposerInternalDrop(dataTransfer, workspace?.id);
+    if (state.kind === "none") {
+      richEditorRef.current?.routeReferenceDrop({ kind: "cancel" });
+      return false;
+    }
+    setDragging(false);
+    if (state.kind === "invalid" || effectiveBashMode || composerLocked) {
+      richEditorRef.current?.routeReferenceDrop({ kind: "cancel" });
+      return true;
+    }
+    if (richEditorRef.current?.routeReferenceDrop({ kind: "start" }) !== true) return true;
+    richEditorRef.current.routeReferenceDrop({ kind: "move", clientX, clientY });
+    return true;
+  };
+
+  const consumeInternalDrop = (dataTransfer: DataTransfer, clientX: number, clientY: number): boolean => {
+    const state = classifyComposerInternalDrop(dataTransfer, workspace?.id);
+    if (state.kind === "none") {
+      richEditorRef.current?.routeReferenceDrop({ kind: "cancel" });
+      return false;
+    }
+    setDragging(false);
+    if (state.kind !== "ready" || effectiveBashMode || composerLocked) {
+      richEditorRef.current?.routeReferenceDrop({ kind: "cancel" });
+      return true;
+    }
+    if (richEditorRef.current?.routeReferenceDrop({ kind: "start" }) !== true
+      || richEditorRef.current.routeReferenceDrop({ kind: "commit", clientX, clientY, insertion: state.insertion }) !== true) {
+      richEditorRef.current?.routeReferenceDrop({ kind: "cancel" });
+      return true;
+    }
     closePalette();
     setBashMode(false);
     return true;
   };
+
+  useLayoutEffect(() => {
+    setDragging(false);
+    richEditorRef.current?.routeReferenceDrop({ kind: "cancel" });
+    return () => { richEditorRef.current?.routeReferenceDrop({ kind: "cancel" }); };
+  }, [composerLocked, effectiveBashMode, session.generation, session.id, workspace?.id]);
+
+  useEffect(() => {
+    const ownerDocument = voiceRoot?.ownerDocument;
+    if (ownerDocument === undefined) return;
+    const cancelDrop = (): void => {
+      setDragging(false);
+      richEditorRef.current?.routeReferenceDrop({ kind: "cancel" });
+    };
+    ownerDocument.addEventListener("dragend", cancelDrop);
+    return () => ownerDocument.removeEventListener("dragend", cancelDrop);
+  }, [voiceRoot?.ownerDocument]);
 
   useEffect(() => {
     if (
@@ -835,7 +953,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     ) return;
     appliedAttachmentInsertionRef.current = attachmentInsertion.id;
     addFiles([attachmentInsertion.file]);
-    window.requestAnimationFrame(() => richEditorRef.current?.focus("end"));
+    requestComposerFrame(() => richEditorRef.current?.focus("end"));
   }, [attachmentInsertion, readOnly, session.id]);
 
   const finishSubmission = (sessionId: string, kind: ComposerSubmissionKind): void => {
@@ -922,7 +1040,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
             replaceInlineMentionRanges([]);
             setExtraDirectoryIds(undefined);
             setAttachmentError(undefined);
-            requestAnimationFrame(() => richEditorRef.current?.focus());
+            requestComposerFrame(() => richEditorRef.current?.focus());
           }
           await enqueueDraftSave(draftSaveChainRef, controllerRef, sourceSessionId, {
             text: "",
@@ -958,7 +1076,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
             setEditorDocument(retainedQuoteDocument);
             setMentions([]);
             replaceInlineMentionRanges([]);
-            requestAnimationFrame(() => richEditorRef.current?.focus());
+            requestComposerFrame(() => richEditorRef.current?.focus());
           }
           await enqueueDraftSave(draftSaveChainRef, controllerRef, sourceSessionId, {
             text: "",
@@ -1051,7 +1169,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
               return [];
             });
             setAttachmentError(undefined);
-            requestAnimationFrame(() => richEditorRef.current?.focus());
+            requestComposerFrame(() => richEditorRef.current?.focus());
           }
           revokeAttachments(sourceAttachments);
           await enqueueDraftSave(draftSaveChainRef, controllerRef, sourceSessionId, {
@@ -1091,7 +1209,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
             setExtraDirectoryIds(undefined);
             setAttachments([]);
             setAttachmentError(undefined);
-            requestAnimationFrame(() => richEditorRef.current?.focus());
+            requestComposerFrame(() => richEditorRef.current?.focus());
           }
           revokeAttachments(sourceAttachments);
           await enqueueDraftSave(draftSaveChainRef, controllerRef, sourceSessionId, {
@@ -1153,7 +1271,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     setAttachments([]);
     setBrowserComments([]);
     setAttachmentError(undefined);
-    requestAnimationFrame(() => richEditorRef.current?.focus());
+    requestComposerFrame(() => richEditorRef.current?.focus());
     const clearedDraft = {
       text: "",
       editorDocument: clearedDocument,
@@ -1217,7 +1335,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
         setExtraDirectoryIds(current.extraDirectoryIds ?? sourceExtraDirectoryIds);
         setAttachments(restoredAttachments);
         setBrowserComments(restoredBrowserComments);
-        requestAnimationFrame(() => richEditorRef.current?.focus("end"));
+        requestComposerFrame(() => richEditorRef.current?.focus("end"));
       }
       await enqueueDraftSave(draftSaveChainRef, sourceControllerRef, sourceSessionId, restoredDraft);
     };
@@ -1285,7 +1403,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       lastComposerCaretRef.current = caret;
       closePalette();
       if (replacement.caret > normalizedReplacementText.length) {
-        requestAnimationFrame(() => richEditorRef.current?.focus("end"));
+        requestComposerFrame(() => richEditorRef.current?.focus("end"));
       } else {
         focusComposerAt(caret);
       }
@@ -1309,7 +1427,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       setMentions((current) => [...current.filter((candidate) => candidate.id !== mention.id), mention]);
     }
     closePalette();
-    requestAnimationFrame(() => richEditorRef.current?.focus());
+    requestComposerFrame(() => richEditorRef.current?.focus());
   };
 
   const selectInlineMention = (item: ComposerMentionCatalogItem, reference = false): void => {
@@ -1366,10 +1484,10 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   };
 
   const focusComposerAt = (offset: number): void => {
-    requestAnimationFrame(() => {
+    requestComposerFrame(() => {
       richEditorRef.current?.focus();
       const root = composerStackRef.current?.querySelector<HTMLElement>(".composer-rich-editor__content") ?? null;
-      setComposerCaretTextOffset(root, typeof window === "undefined" ? null : window.getSelection(), offset);
+      setComposerCaretTextOffset(root, root?.ownerDocument.getSelection() ?? null, offset);
     });
   };
 
@@ -1380,7 +1498,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       return;
     }
     const root = composerStackRef.current?.querySelector<HTMLElement>(".composer-rich-editor__content") ?? null;
-    const selectedOffset = composerCaretTextOffset(root, typeof window === "undefined" ? null : window.getSelection());
+    const selectedOffset = composerCaretTextOffset(root, root?.ownerDocument.getSelection() ?? null);
     const from = Math.min(Math.max(selectedOffset ?? lastComposerCaretRef.current ?? text.length, 0), text.length);
     const activation = { from, to: from, query: "", quoted: false, source: "button" as const };
     retireTypedCommand();
@@ -1578,14 +1696,16 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
 
   useEffect(() => {
     if (!queueExpanded) return;
+    const root = composerStackRef.current;
+    const ownerDocument = root?.ownerDocument;
+    if (root === null || ownerDocument === undefined) return;
     const collapseOnOutsidePointer = (event: MouseEvent): void => {
-      const root = composerStackRef.current;
-      if (root?.contains(event.target as Node)) return;
+      if (event.composedPath().includes(root)) return;
       setQueueExpandedSessionId(undefined);
     };
-    document.addEventListener("mousedown", collapseOnOutsidePointer, true);
-    return () => document.removeEventListener("mousedown", collapseOnOutsidePointer, true);
-  }, [queueExpanded]);
+    ownerDocument.addEventListener("mousedown", collapseOnOutsidePointer, true);
+    return () => ownerDocument.removeEventListener("mousedown", collapseOnOutsidePointer, true);
+  }, [queueExpanded, voiceRoot?.ownerDocument]);
 
   const paletteInAddMenu = palette === "add"
     || (palette === "commands" && commandActivation === undefined)
@@ -1616,7 +1736,8 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
         ref={bindComposer}
         className={cx("composer-stack", showQueue && "composer-stack--with-queue")}
         onKeyDownCapture={(event) => {
-          if (event.key === "Escape" && event.target instanceof Element && event.target.closest(".queue-strip__editor") !== null) return;
+          const eventTarget = ownedEventElement(event.target, event.currentTarget.ownerDocument);
+          if (event.key === "Escape" && eventTarget !== null && eventTarget.closest(".queue-strip__editor") !== null) return;
           if (!event.defaultPrevented && !event.nativeEvent.isComposing && event.key === "Escape" && (voiceActive || voiceUpdate?.state === "error")) {
             event.preventDefault();
             event.stopPropagation();
@@ -1639,7 +1760,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
             key: event.key,
             repeat: event.repeat,
             isComposing: event.nativeEvent.isComposing,
-            paletteTarget: event.target instanceof Element && event.target.closest(".composer-palette") !== null
+            paletteTarget: eventTarget !== null && eventTarget.closest(".composer-palette") !== null
           }, {
             queueExpanded,
             canStopRun: canStop,
@@ -1679,13 +1800,28 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
           event.preventDefault();
           richEditorRef.current?.focusFromBlankSurface();
         }}
-        onDragEnter={(event) => { preventDrag(event); if (!composerLocked) setDragging(true); }}
-        onDragOver={preventDrag}
-        onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragging(false); }}
+        onDragEnter={(event) => {
+          preventDrag(event);
+          if (updateInternalDrop(event.dataTransfer, event.clientX, event.clientY)) event.dataTransfer.dropEffect = composerLocked || effectiveBashMode ? "none" : "copy";
+          else if (!composerLocked) setDragging(true);
+        }}
+        onDragOver={(event) => {
+          preventDrag(event);
+          if (updateInternalDrop(event.dataTransfer, event.clientX, event.clientY)) event.dataTransfer.dropEffect = composerLocked || effectiveBashMode ? "none" : "copy";
+        }}
+        onDragLeave={(event) => {
+          if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+          setDragging(false);
+          richEditorRef.current?.routeReferenceDrop({ kind: "cancel" });
+        }}
+        onDragEnd={() => {
+          setDragging(false);
+          richEditorRef.current?.routeReferenceDrop({ kind: "cancel" });
+        }}
         onDrop={(event) => {
           preventDrag(event);
           setDragging(false);
-          if (consumeInternalDrop(event.dataTransfer)) return;
+          if (consumeInternalDrop(event.dataTransfer, event.clientX, event.clientY)) return;
           if (!effectiveBashMode && !composerLocked) addFiles(event.dataTransfer.files);
         }}
       >
@@ -1758,7 +1894,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
             const acceptedText = composerDocumentPlainText(accepted);
             textRef.current = acceptedText;
             setText(acceptedText);
-            requestAnimationFrame(() => richEditorRef.current?.focus("end"));
+            requestComposerFrame(() => richEditorRef.current?.focus("end"));
           } })}
         >
           <ComposerRichTextEditor
@@ -1785,7 +1921,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
                 const acceptedText = composerDocumentPlainText(accepted);
                 textRef.current = acceptedText;
                 setText(acceptedText);
-                requestAnimationFrame(() => richEditorRef.current?.focus("end"));
+                requestComposerFrame(() => richEditorRef.current?.focus("end"));
                 return true;
               }
               if (handleHistoryNavigation(event, activeDocument)) return true;
@@ -1901,7 +2037,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
               />}
             </div>}
             {!effectiveBashMode && voice.supported && <VoiceInputButton phase={voice.phase} held={heldVoice.held} sendTargetActive={heldVoice.sendTargetActive} startedAt={voice.startedAt} ownerWindow={voice.ownerWindow} enabled={!readOnly && submissionKind === undefined && hydratedSession === session.id} buttonProps={heldVoice.buttonProps} t={t} />}
-            {bashCapable && <IconButton label={effectiveBashMode ? t("composer.shellExit") : t("composer.shellEnter")} disabled={composerLocked} aria-pressed={effectiveBashMode} onClick={() => { closePalette(); setBashMode((current) => !current); requestAnimationFrame(() => richEditorRef.current?.focus()); }}><Terminal aria-hidden="true" /></IconButton>}
+            {bashCapable && <IconButton label={effectiveBashMode ? t("composer.shellExit") : t("composer.shellEnter")} disabled={composerLocked} aria-pressed={effectiveBashMode} onClick={() => { closePalette(); setBashMode((current) => !current); requestComposerFrame(() => richEditorRef.current?.focus()); }}><Terminal aria-hidden="true" /></IconButton>}
             {effectiveBashMode && <label className="composer__bash-option"><CheckboxControl checked={shellDraft?.excludeFromContext ?? bashExcluded} disabled={composerLocked || shellDraft?.prefix === "exclude"} onChange={(event) => setBashExcluded(event.target.checked)} />{t("composer.shellExclude")}</label>}
             {saved && <span className="draft-saved" role="status"><CircleCheck aria-hidden="true" />{t("composer.saved")}</span>}
           </div>
@@ -1969,11 +2105,11 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
           t("composer.pastedTextChip", { lines: countComposerPasteLines(nextText) })
         );
         setPastedTextTarget(undefined);
-        requestAnimationFrame(() => richEditorRef.current?.focus());
+        requestComposerFrame(() => richEditorRef.current?.focus());
       }}
       onClose={() => {
         setPastedTextTarget(undefined);
-        requestAnimationFrame(() => richEditorRef.current?.focus());
+        requestComposerFrame(() => richEditorRef.current?.focus());
       }}
     />
     <Modal
@@ -2052,6 +2188,7 @@ function ComposerPalette({ title, items, empty, t, onSelect, onClose, embedded =
   const [query, setQuery] = useState("");
   const [activeIndex, setActiveIndex] = useState(0);
   const listId = useId();
+  const rootRef = useRef<HTMLDivElement>(null);
   const visible = items.filter((item) => `${item.label} ${item.meta}`.toLowerCase().includes(query.toLowerCase())).slice(0, 20);
   const selectedIndex = visible.length > 0 ? Math.min(activeIndex, visible.length - 1) : 0;
   const activeOptionId = visible.length > 0 ? `${listId}-option-${selectedIndex}` : undefined;
@@ -2066,11 +2203,11 @@ function ComposerPalette({ title, items, empty, t, onSelect, onClose, embedded =
 
   useEffect(() => {
     if (activeOptionId === undefined) return;
-    document.getElementById(activeOptionId)?.scrollIntoView?.({ block: "nearest" });
+    rootRef.current?.ownerDocument.getElementById(activeOptionId)?.scrollIntoView?.({ block: "nearest" });
   }, [activeOptionId]);
 
   return (
-    <div className={cx("composer-palette", embedded && "composer-palette--embedded")} role={embedded ? "group" : "dialog"} aria-label={title}>
+    <div ref={rootRef} className={cx("composer-palette", embedded && "composer-palette--embedded")} role={embedded ? "group" : "dialog"} aria-label={title}>
       {!embedded && <header><strong>{title}</strong><IconButton label={t("common.close")} onClick={onClose}><X aria-hidden="true" /></IconButton></header>}
       <input
         autoFocus
@@ -2182,6 +2319,14 @@ function enqueueDraftSave(
 function preventDrag(event: DragEvent): void {
   event.preventDefault();
   event.stopPropagation();
+}
+
+function ownedEventElement(target: EventTarget | null, ownerDocument: Document): Element | null {
+  if (target === null || typeof target !== "object") return null;
+  const candidate = target as Partial<Element>;
+  return candidate.ownerDocument === ownerDocument && typeof candidate.closest === "function"
+    ? target as Element
+    : null;
 }
 
 function revokeAttachments(attachments: readonly AttachmentDraft[]): void {

@@ -60,7 +60,8 @@ describe("isolated Orchestrator runtime staging", () => {
       "@xterm/headless",
       "node-pty",
       "sharp",
-      "undici"
+      "undici",
+      "zod"
     ]));
   });
 
@@ -402,6 +403,8 @@ async function claudeSessionRuntimeFixture() {
     )));
     await copyRegularTree(realpathSync(resolve(dirname(manifestPath), "dist")), resolve(packageRoot, "dist"));
   }
+  const zodRoot = dirname(adapterRequire.resolve("zod/package.json"));
+  await copyRegularTree(realpathSync(zodRoot), resolve(runtimeRoot, "node_modules/zod"));
   const sdkRoot = dirname(adapterRequire.resolve("@anthropic-ai/claude-agent-sdk"));
   mkdirSync(resolve(runtimeRoot, "node_modules/@anthropic-ai"));
   await copyRegularTree(realpathSync(sdkRoot), resolve(runtimeRoot, "node_modules/@anthropic-ai/claude-agent-sdk"));

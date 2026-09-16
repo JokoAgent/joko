@@ -202,6 +202,7 @@ import {
   TaskHistoryMaintenancePhase,
   TaskHistoryMaintenanceStatus,
   TaskHistoryRetention,
+  TargetService,
   RewindSafety,
   RunState,
   ScheduleExecutionMode,
@@ -422,7 +423,16 @@ import { presentJokoServiceTerminology } from "./i18n/service-terminology.js";
 import { projectTimelineGeneratedFiles } from "./generated-files.js";
 import { emptySnapshot } from "./model.js";
 import { saveArtifactBlob } from "./artifact-download.js";
-import { captureNativeFileCopy, copyNativeArtifactFile, NATIVE_FILE_COPY_MAXIMUM_BYTES } from "./native-file-actions.js";
+import {
+  captureNativeArtifactSourceReveal,
+  captureNativeFileCopy,
+  captureNativeFileOpen,
+  copyNativeArtifactFile,
+  NATIVE_FILE_COPY_MAXIMUM_BYTES,
+  NATIVE_FILE_OPEN_MAXIMUM_BYTES,
+  openNativeArtifactFile,
+  revealNativeArtifactSource
+} from "./native-file-actions.js";
 import type {
   AppSnapshot,
   ArtifactStorageCleanupView,
@@ -549,6 +559,7 @@ import type {
   SessionView,
   SessionWorktreeRemovalPreviewView,
   SessionWorktreeView,
+  TargetView,
   SkillCatalogView,
   CollaborationDirectoryView,
   CollaborationScopeKindView,
@@ -1700,6 +1711,25 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return payload.value.targetId;
   }
 
+  async prepareTargetWorkspace(targetId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<void> {
+    if (targetId.trim() === "" || typeof expectedRevision !== "bigint" || expectedRevision < 1n) {
+      throw new GatewayError("A current Target identity and revision are required.");
+    }
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(TargetService, scope.transport).prepareTargetWorkspace({
+      targetId,
+      expectedTargetRevision: { value: expectedRevision }
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const workspace = response.workspace;
+    if (workspace === undefined
+      || workspace.targetId !== targetId
+      || workspace.workspaceId === ""
+      || workspace.version?.revision?.value !== expectedRevision) {
+      throw new GatewayError("Orchestrator prepared a different project workspace revision.");
+    }
+  }
+
   async updateTarget(
     targetId: string,
     patch: {
@@ -1742,8 +1772,13 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     }, true, [{ entity: { kind: EntityKind.TARGET, id: targetId }, expectedRevision: { value: expectedRevision } }]);
   }
 
-  async archiveTarget(targetId: string, archived: boolean): Promise<void> {
+  async archiveTarget(targetId: string, archived: boolean): Promise<TargetView | undefined> {
     await this.submit({ case: "archiveTarget", value: { targetId, archived } }, true);
+    // submit() schedules a refresh, but restoration needs the current catalogue
+    // before a renderer may re-admit the project to its private filter. Joining
+    // the in-flight refresh also covers an event-stream update that won the race.
+    await this.refresh();
+    return this.#snapshot?.targets.find((target) => target.id === targetId);
   }
 
   async deleteTarget(targetId: string, deleteManagedWorkspace: boolean): Promise<void> {
@@ -1768,6 +1803,10 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const targetId = draft.targetId;
     const target = this.#rawSnapshot?.targets.find((candidate) => candidate.targetId === targetId);
     if (target === undefined) throw new GatewayError("The selected target is no longer available.");
+    const expectedTargetRevision = draft.expectedTargetRevision ?? target.version?.revision?.value;
+    if (expectedTargetRevision === undefined || expectedTargetRevision < 1n) {
+      throw new GatewayError("The selected target has no current revision.");
+    }
     if ((draft.appendSystemPrompt?.length ?? 0) > 8_000) {
       throw new GatewayError("Personalization instructions cannot exceed 8,000 characters.");
     }
@@ -1786,6 +1825,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     if (draft.catalogImport !== undefined && !validCatalogSnapshotToken(draft.catalogImport.snapshotToken)) {
       throw new GatewayError("Catalog import presentation has an invalid snapshot token.");
     }
+    await this.prepareTargetWorkspace(targetId, expectedTargetRevision);
     const nativeStart = create(
       NativeSessionStartSchema,
       draft.nativeStart.kind === "attach"
@@ -1821,7 +1861,10 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           ? { appendSystemPrompt: draft.appendSystemPrompt }
           : {})
       }
-    }, true);
+    }, true, [{
+      entity: { kind: EntityKind.TARGET, id: targetId },
+      expectedRevision: { value: expectedTargetRevision }
+    }]);
     const payload = operation.result?.payload;
     if (payload?.case !== "session" || payload.value.sessionId.length === 0) {
       throw new GatewayError("Orchestrator completed task creation without a typed task result.");
@@ -1833,16 +1876,19 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return { sessionId: payload.value.sessionId, generation };
   }
 
-  async discoverNativeSessions(targetId: string): Promise<readonly NativeSessionCandidateView[]> {
+  async discoverNativeSessions(targetId: string, signal?: AbortSignal): Promise<readonly NativeSessionCandidateView[]> {
     const client = createClient(SessionService, this.requireTransport());
+    const requestSignal = combinedAbortSignal(signal, this.#abort?.signal);
+    requestSignal?.throwIfAborted();
     const values: NativeSessionCandidateView[] = [];
     const consumedTokens = new Set<string>();
     let pageToken = "";
     for (let pageIndex = 0; pageIndex < MAX_COMPLETE_MESSAGE_SEARCH_PAGES; pageIndex += 1) {
       const response = await client.discoverNativeSessions(
         { targetId, page: { pageSize: 500, pageToken } },
-        this.#abort === undefined ? undefined : { signal: this.#abort.signal }
+        requestSignal === undefined ? undefined : { signal: requestSignal }
       );
+      requestSignal?.throwIfAborted();
       values.push(...response.sessions.map(mapNativeSessionCandidate));
       const nextPageToken = response.page?.nextPageToken ?? "";
       if (nextPageToken === "") return values;
@@ -6623,6 +6669,30 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return copyNativeArtifactFile(blob, fileName, ownedContext, host);
   }
 
+  async openArtifactFile(blobId: string, fileName: string, byteSize: number, context: ArtifactDownloadContext): Promise<import("./native-file-actions.js").NativeFileOpenOutcome> {
+    const ownedContext = this.artifactDownloadContext(context);
+    const host = captureNativeFileOpen();
+    if (host === undefined) return { status: "unavailable" };
+    if (!Number.isSafeInteger(byteSize) || byteSize < 0 || byteSize > NATIVE_FILE_OPEN_MAXIMUM_BYTES) return { status: "failed", reason: "capacity" };
+    const blob = await this.fetchArtifact(blobId, ownedContext.signal);
+    return openNativeArtifactFile(blob, fileName, ownedContext, host);
+  }
+
+  async revealArtifactSource(sessionId: string, artifactId: string, context: ArtifactDownloadContext): Promise<import("./native-file-actions.js").NativeArtifactSourceRevealOutcome> {
+    const ownedContext = this.artifactDownloadContext(context);
+    const host = captureNativeArtifactSourceReveal();
+    const profile = this.#profile;
+    if (host === undefined || profile === undefined) return { status: "unavailable" };
+    return revealNativeArtifactSource(
+      profile.id,
+      profile.serverId,
+      sessionId,
+      artifactId,
+      ownedContext,
+      host
+    );
+  }
+
   private async consumeEvents(signal: AbortSignal): Promise<void> {
     let delay = 350;
     while (!signal.aborted) {
@@ -7872,7 +7942,7 @@ function projectTimelineEvent(
         title: image?.altText || "Image",
         text: blob?.fileName ?? "",
         ...(blob?.blobId
-          ? { artifact: { id: blob.blobId, blobId: blob.blobId, title: image?.altText || blob.fileName || "Image", kind: "image", fileName: blob.fileName || "image", mediaType: blob.mediaType || "application/octet-stream", byteSize: numberValue(blob.byteSize) } satisfies ArtifactView }
+          ? { artifact: { id: blob.blobId, blobId: blob.blobId, sourceRevealAvailable: false, title: image?.altText || blob.fileName || "Image", kind: "image", fileName: blob.fileName || "image", mediaType: blob.mediaType || "application/octet-stream", byteSize: numberValue(blob.byteSize) } satisfies ArtifactView }
           : {})
       });
       break;
@@ -8324,6 +8394,7 @@ function completedMessageAttachments(blocks: readonly ProtoMessageBlock[]): read
     return [{
       id: blob.blobId,
       blobId: blob.blobId,
+      sourceRevealAvailable: false,
       title: artifact?.audioMetadata?.title.trim() || image?.altText || artifact?.label || fileName,
       ...(artifact?.audioMetadata === undefined ? {} : { audioMetadata: mapAudioMetadata(artifact.audioMetadata) }),
       kind,
@@ -9213,6 +9284,7 @@ function mapWorktreeEligibility(value: WorktreeEligibility): TargetWorktreeProbe
     case WorktreeEligibility.ELIGIBLE: return "eligible";
     case WorktreeEligibility.NOT_GIT_REPOSITORY: return "notGitRepository";
     case WorktreeEligibility.ALREADY_LINKED: return "alreadyLinked";
+    case WorktreeEligibility.GIT_NOT_FOUND: return "gitNotFound";
     case WorktreeEligibility.UNSAFE: return "unsafe";
     case WorktreeEligibility.UNAVAILABLE: return "unavailable";
     default: throw new GatewayError("Orchestrator returned an unspecified Worktree eligibility.");
@@ -14944,6 +15016,8 @@ function mapArtifact(artifact: Artifact): ArtifactView {
   return {
     id: artifact.artifactId,
     blobId: blob.blobId,
+    ...(artifact.sessionId === "" ? {} : { sourceSessionId: artifact.sessionId }),
+    sourceRevealAvailable: artifact.sourceRevealAvailable,
     title: artifact.title,
     ...(artifact.audioMetadata === undefined ? {} : { audioMetadata: mapAudioMetadata(artifact.audioMetadata) }),
     ...(artifact.description === "" ? {} : { description: artifact.description }),
@@ -15649,6 +15723,7 @@ function inputAttachments(input: any): readonly ArtifactView[] {
     return [{
       id: String(blob.blobId),
       blobId: String(blob.blobId),
+      sourceRevealAvailable: false,
       title: kind === "image" ? String(image.altText || fileName) : fileName,
       kind,
       fileName,
@@ -15698,6 +15773,7 @@ function toolResultAttachments(result: any): readonly ArtifactView[] {
       attachments.push({
         id: blob.blobId,
         blobId: blob.blobId,
+        sourceRevealAvailable: false,
         title: image.altText || blob.fileName || "Image",
         kind: "image",
         fileName: blob.fileName || "image",
@@ -15711,6 +15787,7 @@ function toolResultAttachments(result: any): readonly ArtifactView[] {
       attachments.push({
         id: artifact.artifactId || blob.blobId,
         blobId: blob.blobId,
+        sourceRevealAvailable: false,
         title: artifact.audioMetadata?.title.trim() || artifact.title || blob.fileName || "Artifact",
         ...(artifact.audioMetadata === undefined ? {} : { audioMetadata: mapAudioMetadata(artifact.audioMetadata) }),
         kind: artifactKind(artifact.kind),

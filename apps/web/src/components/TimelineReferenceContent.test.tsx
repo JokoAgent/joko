@@ -115,7 +115,7 @@ describe("timeline reference content", () => {
   });
 
   it("reads the exact Artifact and retires pending or open previews when the source owner changes", async () => {
-    const artifact: ArtifactView = { id: "artifact-two", blobId: "content-two", kind: "file", title: "report.txt", fileName: "report.txt", mediaType: "text/plain", byteSize: 3 };
+    const artifact: ArtifactView = { id: "artifact-two", blobId: "content-two", sourceRevealAvailable: false, kind: "file", title: "report.txt", fileName: "report.txt", mediaType: "text/plain", byteSize: 3 };
     let resolve!: (value: typeof artifact) => void;
     const read = vi.fn((_sessionId: string, _artifactId: string, _signal: AbortSignal) => new Promise<typeof artifact>((done) => { resolve = done; }));
     const preview = vi.fn((value: typeof artifact) => <span role="dialog">{value.blobId}</span>);

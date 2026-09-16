@@ -30,8 +30,15 @@ import {
 import type { AppController } from "../controller.js";
 import { useLiveBrowserTakeover, withLiveBrowserTakeover } from "../browser-takeover-expiry.js";
 import { browserPageKey } from "../browser-page-key.js";
-import type { AppSnapshot, BrowserActivityView, BrowserCommentDraftItem, BrowserCommentInspectionInputView, BrowserCommentPlacementView, BrowserCommentStyleChangeView, BrowserCommentTargetView, BrowserPageView, BrowserSettingsView, BrowserTakeoverActionView, BrowserTakeoverKeyModifierView, BrowserTakeoverKeyView, BrowserTransferView, BrowserView, ExtensionCatalogEntryView, McpServerView, ResourceView, SessionView, TimelineItemView } from "../model.js";
+import type { AppSnapshot, BrowserActivityView, BrowserCommentDraftItem, BrowserCommentInspectionInputView, BrowserCommentPlacementView, BrowserCommentStyleChangeView, BrowserCommentTargetView, BrowserPageView, BrowserSettingsView, BrowserTakeoverActionView, BrowserTakeoverKeyModifierView, BrowserTakeoverKeyView, BrowserTransferView, BrowserView, ExtensionCatalogEntryView, McpServerView, NewSessionLocalDraft, ResourceView, SessionView, TimelineItemView } from "../model.js";
 import { nextBrowserCommentMarker, sanitizeBrowserCommentPageUrl } from "../browser-comment-draft.js";
+import {
+  appendBrowserCommentDraftTarget,
+  newSessionBrowserCommentDraftTarget,
+  readBrowserCommentDraftTarget,
+  sessionBrowserCommentDraftTarget,
+  type BrowserCommentDraftTarget
+} from "../browser-comment-draft-target.js";
 import { resourceKindsForBackend } from "../resource-capabilities.js";
 import { randomUuid } from "../web-crypto.js";
 import { useAppShortcut } from "../use-app-shortcut.js";
@@ -71,6 +78,7 @@ export function ToolsPage({ controller, snapshot, runtimeSessionId, selectedExte
   const [tab, setTab] = useState<ToolsTab>(selectedExtensionId === undefined ? "browser" : "extensions");
   const [selectedExtension, setSelectedExtension] = useState(selectedExtensionId);
   const [removeResource, setRemoveResource] = useState<ResourceView>();
+  const [newSessionDraft, setNewSessionDraft] = useState<NewSessionLocalDraft>();
   useEffect(() => {
     if (selectedExtensionId === undefined) return;
     setTab("extensions");
@@ -98,6 +106,26 @@ export function ToolsPage({ controller, snapshot, runtimeSessionId, selectedExte
       return resolveComposerAttachmentPolicy(backend, session.model?.supportsImages === true || bridgeRouted).images;
     })
     .sort((left, right) => right.updatedAt - left.updatedAt), [snapshot.backends, snapshot.sessions, snapshot.settings.visionBridge]);
+  useEffect(() => {
+    if (tab !== "browser" || snapshot.browsers.length === 0) {
+      setNewSessionDraft(undefined);
+      return;
+    }
+    let current = true;
+    void controller.readNewSessionDraft().then((draft) => {
+      if (current) setNewSessionDraft(draft);
+    }).catch(() => {
+      if (current) setNewSessionDraft(undefined);
+    });
+    return () => { current = false; };
+  }, [controller.readNewSessionDraft, controller.state.activeProfile?.id, controller.state.activeProfile?.serverId, snapshot.browsers.length, tab]);
+  const browserCommentTargets = useMemo(() => {
+    const newTask = newSessionBrowserCommentDraftTarget(newSessionDraft, snapshot, t("browser.commentNewTaskDraft"));
+    return [
+      ...browserCommentSessions.map((session) => sessionBrowserCommentDraftTarget(session, session.name || t("session.unnamed"))),
+      ...(newTask === undefined ? [] : [newTask])
+    ];
+  }, [browserCommentSessions, newSessionDraft, snapshot, t]);
   return (
     <main className="route-page">
       <header className="route-header">
@@ -114,7 +142,7 @@ export function ToolsPage({ controller, snapshot, runtimeSessionId, selectedExte
         <TabButton id="activity" current={tab} onClick={selectTab}><Wrench />{t("tools.activity")}<span>{activity.length}</span></TabButton>
       </div>
       <div id="tools-tabpanel" className="route-page__content" role="tabpanel" aria-labelledby={`tools-tab-${tab}`}>
-        {tab === "browser" && <BrowserTools controller={controller} browsers={snapshot.browsers} browserSettings={snapshot.settings.browsers} sessions={browserSessions} commentSessions={browserCommentSessions} locale={locale} t={t} runAction={runAction} />}
+        {tab === "browser" && <BrowserTools controller={controller} browsers={snapshot.browsers} browserSettings={snapshot.settings.browsers} sessions={browserSessions} commentTargets={browserCommentTargets} locale={locale} t={t} runAction={runAction} />}
         {tab === "extensions" && <ExtensionTools controller={controller} snapshot={snapshot} runtimeSessionId={runtimeSessionId} selectedId={selectedExtension} locale={locale} t={t} runAction={runAction} onSelect={selectExtension} />}
         {tab === "skills" && <SkillTools controller={controller} backends={snapshot.backends} targets={snapshot.targets} locale={locale} t={t} />}
         {tab === "resources" && <ResourcesTools controller={controller} backends={snapshot.backends} resources={snapshot.resources} t={t} runAction={runAction} onRemove={setRemoveResource} />}
@@ -132,7 +160,7 @@ function TabButton({ id, current, onClick, children }: { readonly id: ToolsTab; 
   return <button type="button" role="tab" id={`tools-tab-${id}`} aria-controls="tools-tabpanel" aria-selected={current === id} tabIndex={current === id ? 0 : -1} className={current === id ? "is-active" : ""} onClick={() => onClick(id)} onKeyDown={(event) => moveTablistSelection(event, "horizontal")}>{children}</button>;
 }
 
-function BrowserTools({ controller, browsers, browserSettings, sessions, commentSessions, locale, t, runAction }: { readonly controller: AppController; readonly browsers: readonly BrowserView[]; readonly browserSettings: readonly BrowserSettingsView[]; readonly sessions: readonly SessionView[]; readonly commentSessions: readonly SessionView[]; readonly locale: string; readonly t: Translator; readonly runAction: RunAction }): JSX.Element {
+function BrowserTools({ controller, browsers, browserSettings, sessions, commentTargets, locale, t, runAction }: { readonly controller: AppController; readonly browsers: readonly BrowserView[]; readonly browserSettings: readonly BrowserSettingsView[]; readonly sessions: readonly SessionView[]; readonly commentTargets: readonly BrowserCommentDraftTarget[]; readonly locale: string; readonly t: Translator; readonly runAction: RunAction }): JSX.Element {
   const [selected, setSelected] = useState<BrowserPageSelection>();
   const [captured, setCaptured] = useState<Readonly<Record<string, string>>>({});
   const capturedRef = useRef(captured);
@@ -164,7 +192,7 @@ function BrowserTools({ controller, browsers, browserSettings, sessions, comment
     selected={selected}
     captured={captured}
     sessions={sessions}
-    commentSessions={commentSessions}
+    commentTargets={commentTargets}
     locale={locale}
     controller={controller}
     t={t}
@@ -175,13 +203,13 @@ function BrowserTools({ controller, browsers, browserSettings, sessions, comment
   />)}</div>;
 }
 
-function BrowserToolCard({ source, allowUploads, selected, captured, sessions, commentSessions, locale, controller, t, runAction, onSelect, onCapture, onStoreCapture }: {
+function BrowserToolCard({ source, allowUploads, selected, captured, sessions, commentTargets, locale, controller, t, runAction, onSelect, onCapture, onStoreCapture }: {
   readonly source: BrowserView;
   readonly allowUploads: boolean;
   readonly selected?: BrowserPageSelection;
   readonly captured: Readonly<Record<string, string>>;
   readonly sessions: readonly SessionView[];
-  readonly commentSessions: readonly SessionView[];
+  readonly commentTargets: readonly BrowserCommentDraftTarget[];
   readonly locale: string;
   readonly controller: AppController;
   readonly t: Translator;
@@ -198,7 +226,7 @@ function BrowserToolCard({ source, allowUploads, selected, captured, sessions, c
       <header><div><StatusDot state={browser.state} label={browser.state} /><span><h2>{browser.name}</h2><p>{t("browser.generation", { generation: browser.generation.toString() })}</p></span></div><div className="browser-provider__status"><Pill tone={browser.state === "ready" ? "success" : browser.state === "error" ? "danger" : "warning"}>{browser.state}</Pill>{browser.takeover !== undefined && <Pill tone={browser.takeover.state === "active" ? "accent" : "warning"}>{t("browser.takeoverState", { state: browser.takeover.state })}</Pill>}</div></header>
       <div className="browser-provider__layout">
         <BrowserPageRail browser={browser} selectedPageId={page?.id} sessions={sessions} controller={controller} t={t} runAction={runAction} onSelect={onSelect} />
-        {page?.recoverable === true ? <BrowserLostPageCard page={page} t={t} /> : <BrowserCanvas browser={browser} page={page} allowUploads={allowUploads} screenshotBlobId={page === undefined ? undefined : captured[browserPageKey(browser.id, page.id)] ?? page.screenshotBlobId} sessions={commentSessions} locale={locale} t={t} controller={controller} runAction={runAction} onCapture={onCapture} onStoreCapture={onStoreCapture} onUpload={(browserId, pageId, file) => {
+        {page?.recoverable === true ? <BrowserLostPageCard page={page} t={t} /> : <BrowserCanvas browser={browser} page={page} allowUploads={allowUploads} screenshotBlobId={page === undefined ? undefined : captured[browserPageKey(browser.id, page.id)] ?? page.screenshotBlobId} targets={commentTargets} locale={locale} t={t} controller={controller} runAction={runAction} onCapture={onCapture} onStoreCapture={onStoreCapture} onUpload={(browserId, pageId, file) => {
           runAction(`browser-upload:${browserPageKey(browserId, pageId)}`, () => controller.uploadBrowserFile(browserId, pageId, file));
         }} onAction={async (browserId, pageId, action) => {
           const blobId = await controller.performBrowserTakeoverAction(browserId, pageId, action);
@@ -211,7 +239,7 @@ function BrowserToolCard({ source, allowUploads, selected, captured, sessions, c
 }
 
 interface PreparedBrowserComment {
-  readonly sessionId: string;
+  readonly draftTarget: BrowserCommentDraftTarget;
   readonly markerNumber: number;
   readonly target: BrowserCommentTargetView;
   readonly targetToken?: string;
@@ -224,7 +252,7 @@ type BrowserCommentSelectionInputView =
   | Omit<Extract<BrowserCommentInspectionInputView, { readonly intent: "element" }>, "markerNumber">
   | Omit<Extract<BrowserCommentInspectionInputView, { readonly intent: "region" }>, "markerNumber">;
 
-export function BrowserCanvas({ browser, page, allowUploads, screenshotBlobId, sessions, locale, t, controller, runAction, onCapture, onStoreCapture, onUpload, onAction }: { readonly browser: BrowserView; readonly page?: BrowserPageView; readonly allowUploads: boolean; readonly screenshotBlobId?: string; readonly sessions: readonly SessionView[]; readonly locale: string; readonly t: Translator; readonly controller: AppController; readonly runAction: RunAction; readonly onCapture: (browserId: string, pageId: string) => void; readonly onStoreCapture: (browserId: string, pageId: string, blobId: string) => void; readonly onUpload: (browserId: string, pageId: string, file: File) => void; readonly onAction: (browserId: string, pageId: string, action: BrowserTakeoverActionView) => Promise<void> }): JSX.Element {
+export function BrowserCanvas({ browser, page, allowUploads, screenshotBlobId, targets, locale, t, controller, runAction, onCapture, onStoreCapture, onUpload, onAction }: { readonly browser: BrowserView; readonly page?: BrowserPageView; readonly allowUploads: boolean; readonly screenshotBlobId?: string; readonly targets: readonly BrowserCommentDraftTarget[]; readonly locale: string; readonly t: Translator; readonly controller: AppController; readonly runAction: RunAction; readonly onCapture: (browserId: string, pageId: string) => void; readonly onStoreCapture: (browserId: string, pageId: string, blobId: string) => void; readonly onUpload: (browserId: string, pageId: string, file: File) => void; readonly onAction: (browserId: string, pageId: string, action: BrowserTakeoverActionView) => Promise<void> }): JSX.Element {
   const rootRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (page === undefined || rootRef.current === null) return;
@@ -251,9 +279,10 @@ export function BrowserCanvas({ browser, page, allowUploads, screenshotBlobId, s
   commentPlacementsRef.current = commentPlacements;
   const preparedCommentRef = useRef(preparedComment);
   preparedCommentRef.current = preparedComment;
-  const [targetSessionId, setTargetSessionId] = useState<string | undefined>(sessions[0]?.id);
+  const [targetKey, setTargetKey] = useState<string | undefined>(targets[0]?.key);
+  const draftTarget = targets.find((target) => target.key === targetKey);
   useEffect(() => {
-    if (targetSessionId !== undefined && sessions.some((session) => session.id === targetSessionId)) return;
+    if (targetKey !== undefined && targets.some((target) => target.key === targetKey)) return;
     const pending = preparedCommentRef.current;
     if (pending?.targetToken !== undefined && page !== undefined) {
       void controller.updateBrowserCommentDesign(browser.id, page.id, {
@@ -261,14 +290,14 @@ export function BrowserCanvas({ browser, page, allowUploads, screenshotBlobId, s
         targetToken: pending.targetToken
       }).catch(() => undefined);
     }
-    setTargetSessionId(sessions[0]?.id);
+    setTargetKey(targets[0]?.key);
     setPreparedComment(undefined);
-    if (sessions.length === 0) {
+    if (targets.length === 0) {
       commentEpochRef.current += 1;
       setCommentMode(false);
       setCommentEditor(emptyBrowserCommentEditorDraft());
     }
-  }, [browser.id, controller, page, sessions, targetSessionId]);
+  }, [browser.id, controller, page, targetKey, targets]);
   useEffect(() => () => {
     if (copyResetRef.current !== undefined) window.clearTimeout(copyResetRef.current);
   }, []);
@@ -363,7 +392,7 @@ export function BrowserCanvas({ browser, page, allowUploads, screenshotBlobId, s
     expectedEpoch = commentEpochRef.current
   ): Promise<BrowserCommentSaveOutcome> => {
     if (page === undefined || commentEpochRef.current !== expectedEpoch) return "aborted";
-    const draft = await controller.readDraft(prepared.sessionId);
+    const draft = await readBrowserCommentDraftTarget(controller, prepared.draftTarget);
     if (commentEpochRef.current !== expectedEpoch) return "aborted";
     const markerNumber = prepared.markerNumber;
     const pageUrl = sanitizeBrowserCommentPageUrl(page.url);
@@ -395,15 +424,7 @@ export function BrowserCanvas({ browser, page, allowUploads, screenshotBlobId, s
       screenshot: { id: randomUuid(), kind: "image", file: screenshot },
       ...(styleChanges.length === 0 ? {} : { styleChanges })
     };
-    await controller.saveDraft(prepared.sessionId, {
-      text: draft?.text ?? "",
-      attachments: draft?.attachments ?? [],
-      mentions: draft?.mentions ?? [],
-      deliveryMode: draft?.deliveryMode ?? "prompt",
-      ...(draft?.editorDocument === undefined ? {} : { editorDocument: draft.editorDocument }),
-      ...(draft?.extraDirectoryIds === undefined ? {} : { extraDirectoryIds: draft.extraDirectoryIds }),
-      browserComments: [...(draft?.browserComments ?? []), item]
-    });
+    await appendBrowserCommentDraftTarget(controller, prepared.draftTarget, item);
     let continuation = commentEpochRef.current === expectedEpoch;
     if (prepared.targetToken !== undefined) {
       try {
@@ -432,8 +453,8 @@ export function BrowserCanvas({ browser, page, allowUploads, screenshotBlobId, s
     immediate: boolean,
     allowBeforeMode = false
   ): void => {
-    const sessionId = targetSessionId;
-    if ((!commentMode && !allowBeforeMode) || sessionId === undefined || page === undefined) return;
+    const target = draftTarget;
+    if ((!commentMode && !allowBeforeMode) || target === undefined || page === undefined) return;
     const epoch = ++commentEpochRef.current;
     const previous = preparedCommentRef.current;
     setCommentError(undefined);
@@ -444,7 +465,7 @@ export function BrowserCanvas({ browser, page, allowUploads, screenshotBlobId, s
         await controller.updateBrowserCommentDesign(browser.id, page.id, { action: "reset", targetToken: previous.targetToken });
         setCommentPlacements((current) => current.filter((placement) => !placement.pending));
       }
-      const draft = await controller.readDraft(sessionId);
+      const draft = await readBrowserCommentDraftTarget(controller, target);
       if (commentEpochRef.current !== epoch) return;
       const markerNumber = nextBrowserCommentMarker(draft?.browserComments);
       const inspection = await controller.inspectBrowserCommentTarget(browser.id, page.id, { ...input, markerNumber } as BrowserCommentInspectionInputView);
@@ -456,7 +477,7 @@ export function BrowserCanvas({ browser, page, allowUploads, screenshotBlobId, s
         return;
       }
       const prepared = {
-        sessionId,
+        draftTarget: target,
         markerNumber,
         target: inspection.target,
         ...(inspection.targetToken === undefined ? {} : { targetToken: inspection.targetToken })
@@ -572,7 +593,7 @@ export function BrowserCanvas({ browser, page, allowUploads, screenshotBlobId, s
     canGoForward={page.canGoForward}
     externalUrl={externalUrl}
     copied={copied}
-    commentSupported={ownsPageTakeover && sessions.length > 0 && screenshotBlobId !== undefined}
+    commentSupported={ownsPageTakeover && targets.length > 0 && screenshotBlobId !== undefined}
     commentActive={commentMode}
     t={t}
     onNavigate={(url) => runChromeAction({ kind: "navigate", url })}
@@ -613,10 +634,13 @@ export function BrowserCanvas({ browser, page, allowUploads, screenshotBlobId, s
   }} />}
   {commentMode && <section className="browser-comment-panel" aria-label={t("browser.comment")}>
     <header><MessageSquarePlus aria-hidden="true" /><span><strong>{t("browser.commentModeTitle")}</strong><small>{t("browser.commentModeHelp")}</small></span><IconButton label={t("browser.exitCommentMode")} onClick={exitBrowserCommentMode}><X aria-hidden="true" /></IconButton></header>
-    <label><span>{t("browser.commentTargetTask")}</span><SelectControl value={targetSessionId ?? ""} disabled={commentPreparing || commentSaving} onChange={(event) => { abandonPreparedBrowserComment(); setTargetSessionId(event.target.value || undefined); }}><option value="" disabled>{t("browser.commentChooseTask")}</option>{sessions.map((session) => <option key={session.id} value={session.id}>{session.name || t("session.unnamed")}</option>)}</SelectControl></label>
+    <label><span>{t("browser.commentTargetTask")}</span><SelectControl value={targetKey ?? ""} disabled={commentPreparing || commentSaving} onChange={(event) => { abandonPreparedBrowserComment(); setTargetKey(event.target.value || undefined); }}><option value="" disabled>{t("browser.commentChooseTask")}</option>{targets.map((target) => <option key={target.key} value={target.key}>{target.label}</option>)}</SelectControl></label>
     {preparedComment === undefined && <p>{commentPreparing ? t("browser.commentPreparing") : t("browser.commentSelectTarget")}</p>}
     {commentError !== undefined && <p role="alert"><AlertTriangle aria-hidden="true" />{commentError}</p>}
-    <Button tone="ghost" disabled={targetSessionId === undefined} onClick={() => { if (targetSessionId !== undefined) controller.navigate({ kind: "session", sessionId: targetSessionId }); }}>{t("browser.commentOpenTask")}</Button>
+    <Button tone="ghost" disabled={draftTarget === undefined} onClick={() => {
+      if (draftTarget?.kind === "session") controller.navigate({ kind: "session", sessionId: draftTarget.sessionId });
+      if (draftTarget?.kind === "newSession") controller.navigate({ kind: "newSession" });
+    }}>{t("browser.commentOpenTask")}</Button>
   </section>}
   <div className="browser-canvas__takeover"><Pill tone={commentMode ? "accent" : ownsPageTakeover ? "accent" : "neutral"}>{commentMode ? t("browser.commentModeTitle") : ownsPageTakeover ? t("browser.remoteControlActive") : browser.takeover?.state === "active" ? t("browser.remoteControlUnavailable") : t("browser.remoteControlInactive")}</Pill>{browser.takeover?.state === "active" && browser.takeover.pageId !== page.id && <span>{t("browser.takeoverOtherPage")}</span>}</div><div className="browser-canvas__footer"><span>{page.lastActivityAt === undefined ? t("browser.noActivity") : t("browser.activeAgo", { time: formatRelativeTime(page.lastActivityAt, locale) })}</span><input ref={uploadInput} className="sr-only" type="file" tabIndex={-1} aria-hidden="true" onChange={(event) => { const file = event.currentTarget.files?.[0]; event.currentTarget.value = ""; if (file !== undefined) onUpload(browser.id, page.id, file); }} /><Button disabled={!allowUploads} title={allowUploads ? t("browser.uploadHelp") : t("browser.uploadDisabled")} onClick={() => uploadInput.current?.click()}><Upload aria-hidden="true" />{t("browser.upload")}</Button>{!takeoverLive && <Button tone="primary" onClick={() => runAction(`browser-takeover:${browserPageKey(browser.id, page.id)}`, () => controller.beginBrowserTakeover(browser.id, page.id))}><Play aria-hidden="true" />{t("browser.takeover")}</Button>}</div></div>;
 }

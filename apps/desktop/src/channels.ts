@@ -4,6 +4,7 @@ export const DESKTOP_CHANNELS = {
   windowSetZoomFactor: "joko:window:set-zoom-factor",
   windowClose: "joko:window:close",
   sessionWindowOpen: "joko:session-window:open",
+  sessionWindowGetOwner: "joko:session-window:owner:get",
   extensionWindowOpen: "joko:extension-window:open",
   extensionLibraryPickLocation: "joko:extension-library:pick-location",
   extensionLibraryReveal: "joko:extension-library:reveal",
@@ -82,6 +83,10 @@ export const DESKTOP_CHANNELS = {
   saveFile: "joko:files:save",
   copyFile: "joko:files:copy",
   cancelFileCopy: "joko:files:copy-cancel",
+  openFile: "joko:files:open",
+  cancelFileOpen: "joko:files:open-cancel",
+  revealArtifactSource: "joko:files:reveal-artifact-source",
+  cancelArtifactSourceReveal: "joko:files:reveal-artifact-source-cancel",
   credentialGet: "joko:credential:get",
   credentialSet: "joko:credential:set",
   credentialDelete: "joko:credential:delete",
@@ -299,6 +304,17 @@ export interface DesktopSessionWindowOpenResult {
   readonly focusedExisting: boolean;
 }
 
+export interface DesktopSessionWindowOwner {
+  readonly profileId: string;
+  readonly sessionId: string;
+}
+
+export function isDesktopSessionWindowOwner(value: unknown): value is DesktopSessionWindowOwner {
+  return plainRecordWithKeys(value, ["profileId", "sessionId"])
+    && boundedDragText(value.profileId, 256)
+    && boundedDragText(value.sessionId, 256);
+}
+
 export interface DesktopExtensionWindowOpenResult {
   readonly focusedExisting: boolean;
 }
@@ -348,6 +364,7 @@ export interface DesktopSessionDragPreviewPalette {
 
 export interface DesktopSessionDragPreviewRequest {
   readonly gestureId: string;
+  readonly profileId: string;
   readonly sessionId: string;
   readonly label: string;
   readonly hint: string;
@@ -366,8 +383,9 @@ export function isDesktopSessionDragGestureId(value: unknown): value is string {
 }
 
 export function isDesktopSessionDragPreviewRequest(value: unknown): value is DesktopSessionDragPreviewRequest {
-  if (!plainRecordWithKeys(value, ["gestureId", "sessionId", "label", "hint", "palette"])) return false;
-  if (!isDesktopSessionDragGestureId(value.gestureId) || !boundedDragText(value.sessionId, 256) ||
+  if (!plainRecordWithKeys(value, ["gestureId", "profileId", "sessionId", "label", "hint", "palette"])) return false;
+  if (!isDesktopSessionDragGestureId(value.gestureId) || !boundedDragText(value.profileId, 256) ||
+    !boundedDragText(value.sessionId, 256) ||
     !boundedDragText(value.label, 160) || !boundedDragText(value.hint, 160) ||
     !plainRecordWithKeys(value.palette, ["surface", "border", "text", "muted", "accent"])) return false;
   return Object.values(value.palette).every((color) => typeof color === "string" && color.length <= 128 &&
@@ -592,6 +610,27 @@ export interface DesktopCopyFileRequest {
 export type DesktopCopyFileResult =
   | { readonly status: "copied" | "cancelled" | "unknown" | "unavailable" | "blocked" }
   | { readonly status: "failed"; readonly reason: "capacity" | "storage" | "helper" };
+
+export interface DesktopOpenFileRequest {
+  readonly requestId: string;
+  readonly file: DesktopFile;
+}
+
+export type DesktopOpenFileResult =
+  | { readonly status: "opened" | "cancelled" | "unknown" | "unavailable" }
+  | { readonly status: "failed"; readonly reason: "capacity" | "storage" | "open" };
+
+export interface DesktopRevealArtifactSourceRequest {
+  readonly requestId: string;
+  readonly profileId: string;
+  readonly serverId: string;
+  readonly sessionId: string;
+  readonly artifactId: string;
+}
+
+export type DesktopRevealArtifactSourceResult =
+  | { readonly status: "revealed" | "cancelled" | "unknown" | "unavailable" }
+  | { readonly status: "failed"; readonly reason: "capacity" | "reveal" };
 
 export type DesktopMainWindowCloseBehavior = "tray" | "minimize" | "quit";
 

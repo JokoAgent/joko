@@ -2,10 +2,42 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
-import { piModelOutputTokenLimit, provisionManagedCatalog, supportedPiThinkingLevels } from "./config.js";
+import {
+  piModelOutputTokenLimit,
+  provisionManagedCatalog,
+  supportedPiThinkingLevels,
+  writeMcpDescriptor
+} from "./config.js";
 import { mkdtemp } from "./test-paths.js";
 
 describe("managed Pi catalog", () => {
+  it("writes a current object output schema and rejects non-object roots", async () => {
+    const home = await mkdtemp(join(tmpdir(), "joko-pi-mcp-schema-"));
+    const path = join(home, "mcp.json");
+    const descriptor = {
+      endpoint: "http://127.0.0.1:4318/internal/mcp",
+      generation: 7,
+      sessionId: "session-7",
+      targetId: "target-7",
+      tools: [{
+        serverId: "fixture",
+        name: "structured",
+        description: "Structured output",
+        inputSchema: { type: "object" },
+        outputSchema: { type: "object", properties: { value: { type: "string" } } },
+        requiresPermission: false
+      }]
+    } as const;
+    await writeMcpDescriptor(path, descriptor);
+    expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({
+      tools: [{ outputSchema: { type: "object", properties: { value: { type: "string" } } } }]
+    });
+    await expect(writeMcpDescriptor(path, {
+      ...descriptor,
+      tools: [{ ...descriptor.tools[0], outputSchema: { type: "array" } }]
+    })).rejects.toMatchObject({ publicError: { code: "PI_MCP_INVALID_SCHEMA" } });
+  });
+
   it("writes environment references and fail-closed project trust without secret values", async () => {
     const home = await mkdtemp(join(tmpdir(), "joko-pi-catalog-"));
     const result = await provisionManagedCatalog(

@@ -172,16 +172,94 @@ describe("MorphPopover", () => {
     expect(resolvedLeft).toBe(8);
     expect(resolvedLeft + Number.parseFloat(panel.style.width)).toBeLessThanOrEqual(382);
   });
+
+  it("keeps its portal, geometry, listeners, timers, and focus in the mounted owner document", async () => {
+    const frame = document.createElement("iframe");
+    document.body.append(frame);
+    const ownerDocument = required(frame.contentDocument);
+    const ownerWindow = required(frame.contentWindow);
+    installOwnerWindowRuntime(ownerWindow, 390, 640, false);
+    const clipping = await renderHarness({ align: "end", ownerDocument });
+    const trigger = required(clipping.querySelector<HTMLButtonElement>("button"));
+    const root = required(clipping.querySelector<HTMLElement>(".morph-popover"));
+    vi.spyOn(root, "getBoundingClientRect").mockReturnValue({
+      ...triggerRect(),
+      x: 100,
+      left: 100,
+      right: 180
+    } as DOMRect);
+
+    await act(async () => { trigger.focus(); trigger.click(); });
+    const panel = required(ownerDocument.body.querySelector<HTMLElement>(".morph-popover__panel"));
+    expect(panel.ownerDocument).toBe(ownerDocument);
+    expect(document.body.querySelector(".morph-popover__panel")).toBeNull();
+    expect(panel.dataset.state).toBe("closed");
+    expect(ownerWindow.requestAnimationFrame).toHaveBeenCalled();
+    await act(async () => flushFrames());
+    expect(panel.dataset.state).toBe("open");
+    expect(panel.style.right).toBe("82px");
+    await act(async () => { vi.advanceTimersByTime(MORPH_POPOVER_DURATION_MS); });
+    expect(ownerWindow.setTimeout).toHaveBeenCalled();
+    expect(ownerDocument.activeElement).toBe(panel.querySelector("[data-morph-autofocus]"));
+
+    await act(async () => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+    expect(panel.dataset.state).toBe("open");
+    await act(async () => ownerDocument.dispatchEvent(new (ownerWindow as Window & typeof globalThis).KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+    expect(panel.dataset.state).toBe("closed");
+    await act(async () => { vi.advanceTimersByTime(MORPH_POPOVER_DURATION_MS + 20); });
+    expect(ownerDocument.body.querySelector(".morph-popover__panel")).toBeNull();
+    expect(ownerDocument.activeElement).toBe(trigger);
+  });
+
+  it("fails closed when the mounted document has no browsing context", async () => {
+    const ownerDocument = document.implementation.createHTMLDocument("Detached");
+    expect(ownerDocument.defaultView).toBeNull();
+    const clipping = await renderHarness({ ownerDocument });
+    const trigger = required(clipping.querySelector<HTMLButtonElement>("button"));
+
+    await act(async () => trigger.click());
+
+    expect(ownerDocument.body.querySelector(".morph-popover__panel")).toBeNull();
+  });
 });
 
-async function renderHarness(options: { readonly align?: "start" | "end" } = {}): Promise<HTMLDivElement> {
-  const clipping = document.createElement("div");
+async function renderHarness(options: { readonly align?: "start" | "end"; readonly ownerDocument?: Document } = {}): Promise<HTMLDivElement> {
+  const ownerDocument = options.ownerDocument ?? document;
+  const clipping = ownerDocument.createElement("div");
   clipping.style.overflow = "hidden";
-  document.body.append(clipping);
+  ownerDocument.body.append(clipping);
   const root = createRoot(clipping);
   roots.push(root);
   await act(async () => root.render(<Harness align={options.align} />));
   return clipping;
+}
+
+function installOwnerWindowRuntime(ownerWindow: Window, width: number, height: number, reducedMotion: boolean): void {
+  Object.defineProperties(ownerWindow, {
+    innerWidth: { configurable: true, value: width },
+    innerHeight: { configurable: true, value: height },
+    matchMedia: { configurable: true, value: vi.fn(() => mediaQuery(reducedMotion)) },
+    requestAnimationFrame: {
+      configurable: true,
+      value: vi.fn((callback: FrameRequestCallback) => {
+        const id = ++nextFrame;
+        frames.set(id, callback);
+        return id;
+      })
+    },
+    cancelAnimationFrame: { configurable: true, value: vi.fn((id: number) => { frames.delete(id); }) },
+    setTimeout: { configurable: true, value: vi.fn(window.setTimeout.bind(window)) },
+    clearTimeout: { configurable: true, value: vi.fn(window.clearTimeout.bind(window)) },
+    ResizeObserver: {
+      configurable: true,
+      value: class implements ResizeObserver {
+        constructor(callback: ResizeObserverCallback) { resizeCallback = callback; }
+        observe(): void {}
+        unobserve(): void {}
+        disconnect(): void {}
+      }
+    }
+  });
 }
 
 function Harness({ align = "start" }: { readonly align?: "start" | "end" }): React.ReactNode {

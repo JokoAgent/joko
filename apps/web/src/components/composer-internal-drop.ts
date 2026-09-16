@@ -17,6 +17,7 @@ export const SESSION_LINK_DRAG_MIME = "application/x-joko-session-link";
 const MAXIMUM_DROP_LINK_CHARACTERS = 8_192;
 
 export interface ComposerInternalDropDataTransfer {
+  readonly types?: readonly string[] | DOMStringList;
   getData(type: string): string;
 }
 
@@ -26,6 +27,12 @@ export interface ComposerInternalDropInsertion {
   readonly pending?: PendingComposerRouteReferenceResolution;
 }
 
+export type ComposerInternalDropState =
+  | { readonly kind: "none" }
+  | { readonly kind: "pending" }
+  | { readonly kind: "invalid" }
+  | { readonly kind: "ready"; readonly insertion: ComposerInternalDropInsertion };
+
 /**
  * Resolve private in-app drag payloads before the ordinary OS File path. A
  * workspace entry is accepted only by a composer for that exact workspace.
@@ -34,26 +41,49 @@ export function resolveComposerInternalDrop(
   dataTransfer: ComposerInternalDropDataTransfer,
   workspaceId: string | undefined
 ): ComposerInternalDropInsertion | undefined {
-  const workspace = decodeWorkspaceEntryDragPayload(readDropData(dataTransfer, WORKSPACE_ENTRY_DRAG_MIME));
-  if (workspace !== undefined && workspaceId !== undefined && workspace.workspaceId === workspaceId) {
+  const state = classifyComposerInternalDrop(dataTransfer, workspaceId);
+  return state.kind === "ready" ? state.insertion : undefined;
+}
+
+/**
+ * Classify a private drag without treating protected-mode DataTransfer reads as
+ * malformed. Browsers expose the MIME type during dragover but may reveal the
+ * payload only for drop.
+ */
+export function classifyComposerInternalDrop(
+  dataTransfer: ComposerInternalDropDataTransfer,
+  workspaceId: string | undefined
+): ComposerInternalDropState {
+  const workspaceRaw = readDropData(dataTransfer, WORKSPACE_ENTRY_DRAG_MIME);
+  const sessionRaw = readDropData(dataTransfer, SESSION_LINK_DRAG_MIME).trim();
+  const claimsWorkspace = workspaceRaw !== "" || hasDropType(dataTransfer, WORKSPACE_ENTRY_DRAG_MIME);
+  const claimsSession = sessionRaw !== "" || hasDropType(dataTransfer, SESSION_LINK_DRAG_MIME);
+  if (!claimsWorkspace && !claimsSession) return { kind: "none" };
+
+  if (workspaceRaw !== "") {
+    const workspace = decodeWorkspaceEntryDragPayload(workspaceRaw);
+    if (workspace === undefined || workspaceId === undefined || workspace.workspaceId !== workspaceId) return { kind: "invalid" };
     return {
-      source: "workspace",
-      attrs: {
-        kind: "path",
-        display: workspace.path,
-        serialized: `@${workspace.path}`,
-        reference: workspace.path
+      kind: "ready",
+      insertion: {
+        source: "workspace",
+        attrs: {
+          kind: "path",
+          display: workspace.path,
+          serialized: `@${workspace.path}`,
+          reference: workspace.path
+        }
       }
     };
   }
 
-  const href = readDropData(dataTransfer, SESSION_LINK_DRAG_MIME).trim();
-  if (href === "" || href.length > MAXIMUM_DROP_LINK_CHARACTERS) return undefined;
-  const reference = parseComposerRouteReference(href);
-  if (reference?.kind !== "session") return undefined;
+  if (sessionRaw === "") return { kind: "pending" };
+  if (sessionRaw.length > MAXIMUM_DROP_LINK_CHARACTERS) return { kind: "invalid" };
+  const reference = parseComposerRouteReference(sessionRaw);
+  if (reference?.kind !== "session") return { kind: "invalid" };
   const segment: Extract<ComposerPasteSegment, { readonly kind: "session" }> = {
     kind: "session",
-    href,
+    href: sessionRaw,
     label: null,
     sessionId: reference.sessionId,
     ...(reference.messageId === undefined ? {} : { messageId: reference.messageId }),
@@ -61,15 +91,25 @@ export function resolveComposerInternalDrop(
   };
   const seeded = seedComposerRouteReference(segment);
   return {
-    source: "session",
-    attrs: seeded.attrs,
-    ...(seeded.pending === undefined ? {} : { pending: seeded.pending })
+    kind: "ready",
+    insertion: {
+      source: "session",
+      attrs: seeded.attrs,
+      ...(seeded.pending === undefined ? {} : { pending: seeded.pending })
+    }
   };
 }
 
 export function hasComposerInternalDrop(dataTransfer: ComposerInternalDropDataTransfer): boolean {
-  return readDropData(dataTransfer, WORKSPACE_ENTRY_DRAG_MIME) !== ""
-    || readDropData(dataTransfer, SESSION_LINK_DRAG_MIME).trim() !== "";
+  return classifyComposerInternalDrop(dataTransfer, undefined).kind !== "none";
+}
+
+function hasDropType(dataTransfer: ComposerInternalDropDataTransfer, type: string): boolean {
+  try {
+    return dataTransfer.types !== undefined && Array.from(dataTransfer.types).includes(type);
+  } catch {
+    return false;
+  }
 }
 
 function readDropData(dataTransfer: ComposerInternalDropDataTransfer, type: string): string {
