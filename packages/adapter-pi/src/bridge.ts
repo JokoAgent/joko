@@ -59,7 +59,7 @@ type Control = { generation: number; policyGeneration: number; permissionMode: "
 type PolicySubjectKind = "file_read" | "file_write" | "command" | "network" | "mcp" | "browser" | "resource" | "extra_directory";
 type PolicyRisk = "read_only" | "low" | "medium" | "high" | "critical";
 type PolicyObservation = { subjectKind: PolicySubjectKind; risk: PolicyRisk; workspaceRelativePath?: string; toolProviderId?: string; toolName?: string };
-type McpTool = { serverId: string; name: string; runtimeName?: string; policySubject?: PolicySubjectKind; description: string; inputSchema: Record<string, unknown>; requiresPermission: boolean };
+type McpTool = { serverId: string; name: string; runtimeName?: string; policySubject?: PolicySubjectKind; description: string; inputSchema: Record<string, unknown>; outputSchema?: Record<string, unknown>; requiresPermission: boolean };
 type McpDescriptor = { endpoint: string; generation: number; sessionId: string; targetId: string; tools: McpTool[] };
 type McpBridgeErrorCode = "resource_exhausted" | "artifact_unavailable" | "invalid_result";
 const DEFAULT_BASH_TIMEOUT_SECONDS = 300;
@@ -412,7 +412,9 @@ function readMcpDescriptor(): McpDescriptor | undefined {
     (tool.runtimeName !== undefined && typeof tool.runtimeName !== "string") ||
     (tool.policySubject !== undefined && !["file_read", "file_write", "command", "network", "mcp", "browser", "resource", "extra_directory"].includes(tool.policySubject)) ||
     typeof tool.description !== "string" || !tool.inputSchema || typeof tool.inputSchema !== "object" ||
-    Array.isArray(tool.inputSchema) || typeof tool.requiresPermission !== "boolean")) {
+    Array.isArray(tool.inputSchema) || (tool.outputSchema !== undefined &&
+      (!tool.outputSchema || typeof tool.outputSchema !== "object" || Array.isArray(tool.outputSchema) || tool.outputSchema.type !== "object")) ||
+    typeof tool.requiresPermission !== "boolean")) {
     throw new Error("Joko MCP descriptor contains an invalid tool");
   }
   return descriptor;

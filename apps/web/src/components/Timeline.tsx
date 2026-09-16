@@ -84,6 +84,7 @@ import { TimelineTextAttachmentLightbox } from "./TimelineTextAttachmentLightbox
 import { timelineArtifactSupportsTextPreview } from "./timeline-text-attachment.js";
 import { TimelineArtifactMedia, timelineArtifactMediaKind } from "./TimelineArtifactMedia.js";
 import { TimelineArtifactModel, timelineArtifactModelKind } from "./TimelineArtifactModel.js";
+import { NativeFileActionsContext, NativeFileActionsMenu } from "./NativeFileCopyMenu.js";
 import { useTimelineArtifactUrlCache } from "./timeline-artifact-url-cache.js";
 import { AudioArtworkContext } from "./AudioArtwork.js";
 import { timelineErrorCopy } from "../timeline-error-copy.js";
@@ -97,6 +98,8 @@ import {
   shouldUnpinTimelineOnWheel
 } from "./timeline-follow-intent.js";
 import { ToolPayloadLightbox, ToolPayloadOpenButton } from "./ToolPayloadLightbox.js";
+import { parseToolFileChangeSet, type ToolFileChangeView } from "./tool-file-change.js";
+import { describeToolPresentation, type ToolPresentationAction } from "./tool-presentation.js";
 import { WorkspaceImageLightbox } from "./WorkspaceImageLightbox.js";
 import type { ToolPayloadSection } from "./tool-payload.js";
 import { SentMessageReferenceChips, SentMessageReferenceText, TimelineLinkSourceContext, TimelineMarkdownImage, TimelineMarkdownLink, type TimelineReferenceActions, type TimelineWorkspaceAsset } from "./TimelineReferenceContent.js";
@@ -708,7 +711,7 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
   if (items.length === 0) {
     return (
       <div className="timeline-shell" style={{ "--timeline-bottom-inset": `${Math.max(0, bottomInset)}px` } as CSSProperties}>
-        <div ref={scrollRef} className="timeline timeline--empty" data-selection-quote-context="" aria-busy={historyLoading || undefined} aria-label={t("timeline.label")} tabIndex={0}>
+        <div ref={scrollRef} className="timeline timeline--empty" data-timeline-session-id={sessionId} data-selection-quote-context="" aria-busy={historyLoading || undefined} aria-label={t("timeline.label")} tabIndex={0}>
           {derivationOrigin !== undefined && <SessionDerivationMarker origin={derivationOrigin} onOpen={onOpenDerivationOrigin} t={t} />}
           <div className="timeline-welcome">
             <div className="timeline-welcome__mark">{historyError === undefined ? <Sparkles aria-hidden="true" /> : <AlertCircle aria-hidden="true" />}</div>
@@ -1351,7 +1354,16 @@ function TimelineArtifactReferencePreview({ artifact, trigger, ownerKey, t, onAr
       copyFailed: t("timeline.blockCopyFailed"), download: t("workspace.downloadFile"), close: t("common.close") }}
   />;
   if (artifact.kind === "image") return <TimelineImageLightbox
-    images={[{ id: artifact.id, blobId: artifact.blobId, title: artifact.title, fileName: artifact.fileName, byteSize: artifact.byteSize }]}
+    images={[{
+      id: artifact.id,
+      artifactId: artifact.id,
+      blobId: artifact.blobId,
+      ...(artifact.sourceSessionId === undefined ? {} : { sourceSessionId: artifact.sourceSessionId }),
+      sourceRevealAvailable: artifact.sourceRevealAvailable,
+      title: artifact.title,
+      fileName: artifact.fileName,
+      byteSize: artifact.byteSize
+    }]}
     startImageId={artifact.id} returnFocus={trigger} t={t} loadUrl={onArtifactUrl} onDownload={onArtifactDownload} onClose={onClose}
   />;
   return <Modal open title={artifact.title || artifact.fileName} description={artifact.description} showClose closeLabel={t("common.close")}
@@ -1497,12 +1509,26 @@ function usePrefersReducedMotion(): boolean {
   return reduced;
 }
 
-function ToolBlock({ item, locale, t, onArtifactUrl, onArtifactDownload }: { readonly item: TimelineItemView; readonly locale: string; readonly t: Translator; readonly onArtifactUrl: (blobId: string) => Promise<string>; readonly onArtifactDownload: OperationApi["downloadArtifact"] }): JSX.Element {
+export function ToolBlock({ item, locale, t, onArtifactUrl, onArtifactDownload }: { readonly item: TimelineItemView; readonly locale: string; readonly t: Translator; readonly onArtifactUrl: (blobId: string) => Promise<string>; readonly onArtifactDownload: OperationApi["downloadArtifact"] }): JSX.Element {
   const { ownerKey } = useContext(TimelinePersonalizationContext);
   const [payloadPreview, setPayloadPreview] = useState<{ readonly sectionId: ToolPayloadSection["id"]; readonly trigger: HTMLButtonElement }>();
   const tool = item.tool;
   if (tool === undefined) return <NoticeBlock item={item} icon={<Wrench />} title={item.title ?? t("timeline.tool")} locale={locale} />;
   const open = tool.state === "running" || tool.state === "waiting" || tool.state === "failed";
+  const fileChanges = parseToolFileChangeSet(tool.name, tool.input)?.changes;
+  const presentation = fileChanges === undefined ? describeToolPresentation(tool.name, tool.input) : undefined;
+  const fileChangeHeading = fileChanges === undefined
+    ? undefined
+    : fileChanges.length === 1
+      ? toolFileChangePath(fileChanges[0]!)
+      : t("timeline.fileChangeFiles", { count: fileChanges.length });
+  const fileChangeDetail = fileChanges?.length === 1
+    ? `${t(`timeline.fileChange.${fileChanges[0]!.action}`)} · ${toolStateLabel(tool.state, t)}`
+    : undefined;
+  const presentationHeading = presentation === undefined ? undefined : t(toolPresentationKey(presentation.action));
+  const presentationDetail = presentation?.primary === undefined
+    ? undefined
+    : `${presentation.primary} · ${toolStateLabel(tool.state, t)}`;
   const payloadSections: readonly ToolPayloadSection[] = [
     ...(tool.input === "" ? [] : [{ id: "input" as const, label: t("common.input"), text: tool.input }]),
     ...(tool.output === undefined ? [] : [{ id: "output" as const, label: t("common.output"), text: tool.output }])
@@ -1511,7 +1537,7 @@ function ToolBlock({ item, locale, t, onArtifactUrl, onArtifactDownload }: { rea
     <details className={cx("tool-block", `tool-block--${tool.state}`)} open={open}>
       <summary>
         <span className="tool-block__icon"><ToolIcon name={tool.name} /></span>
-        <span className="tool-block__heading"><strong>{tool.name}</strong><small>{toolStateLabel(tool.state, t)}</small></span>
+        <span className="tool-block__heading"><strong>{fileChangeHeading ?? presentationHeading ?? tool.name}</strong><small>{fileChangeDetail ?? presentationDetail ?? toolStateLabel(tool.state, t)}</small></span>
         <Pill tone={tool.isError || tool.state === "failed" ? "danger" : tool.state === "succeeded" ? "success" : "neutral"}>{tool.state}</Pill>
         <time>{formatDateTime(item.createdAt, locale)}</time>
         <ChevronDown className="details-chevron" aria-hidden="true" />
@@ -1524,6 +1550,14 @@ function ToolBlock({ item, locale, t, onArtifactUrl, onArtifactDownload }: { rea
       {payloadPreview !== undefined && <ToolPayloadLightbox ownerKey={JSON.stringify([ownerKey, item.id, item.sourceEventId])} title={tool.name} sections={payloadSections} initialSectionId={payloadPreview.sectionId} returnFocus={payloadPreview.trigger} labels={{ close: t("common.close"), copy: t("timeline.toolPayloadCopy"), copyTitle: t("timeline.toolPayloadCopyTitle"), copied: t("timeline.toolPayloadCopied"), copyFailed: t("timeline.toolPayloadCopyFailed"), selectAll: t("timeline.toolPayloadSelectAll"), allFiles: t("timeline.toolPayloadAllFiles"), chooseFile: t("timeline.toolPayloadChooseFile") }} onClose={() => setPayloadPreview(undefined)} />}
     </details>
   );
+}
+
+function toolPresentationKey(action: ToolPresentationAction): MessageKey {
+  return `timeline.toolAction.${action}`;
+}
+
+function toolFileChangePath(change: ToolFileChangeView): string {
+  return change.movePath === undefined ? change.path : `${change.path} → ${change.movePath}`;
 }
 
 export function ArtifactBlock({ item, icon, locale, t, onArtifactUrl, onArtifactDownload }: { readonly item: TimelineItemView; readonly icon: JSX.Element; readonly locale: string; readonly t: Translator; readonly onArtifactUrl: (blobId: string) => Promise<string>; readonly onArtifactDownload: OperationApi["downloadArtifact"] }): JSX.Element {
@@ -1553,6 +1587,7 @@ export function ArtifactBlock({ item, icon, locale, t, onArtifactUrl, onArtifact
 
 function TimelineImageLightbox({ images, startImageId, returnFocus, t, loadUrl, onDownload, onSendToChat, onClose }: { readonly images: readonly TimelineGalleryImage[]; readonly startImageId: string; readonly returnFocus: HTMLElement; readonly t: Translator; readonly loadUrl: (blobId: string) => Promise<string>; readonly onDownload: OperationApi["downloadArtifact"]; readonly onSendToChat?: (file: File) => void | Promise<void>; readonly onClose: () => void }): JSX.Element {
   const { ownerKey } = useContext(TimelinePersonalizationContext);
+  const fileActions = useContext(NativeFileActionsContext);
   const startIndex = Math.max(0, images.findIndex((image) => image.id === startImageId));
   const [index, setIndex] = useState(startIndex);
   const current = images[index] ?? images[0];
@@ -1590,6 +1625,17 @@ function TimelineImageLightbox({ images, startImageId, returnFocus, t, loadUrl, 
     gallery={{ index, total: images.length, onPrevious: showPrevious, onNext: showNext }}
     showZoomControls
     returnFocus={returnFocus}
+    toolbarActions={<NativeFileActionsMenu
+      actions={fileActions}
+      artifactId={current.artifactId}
+      blobId={current.blobId}
+      name={current.fileName}
+      byteSize={current.byteSize}
+      {...(current.sourceSessionId === undefined ? {} : { sourceSessionId: current.sourceSessionId })}
+      sourceRevealAvailable={current.sourceRevealAvailable}
+      ownerKey={JSON.stringify([ownerKey, current.id, current.blobId, "native-file"])}
+      t={t}
+    />}
     onClose={onClose}
     onDownload={(context) => onDownload(current.blobId, current.fileName, context)}
     onImageError={markImageFailed}

@@ -37,7 +37,12 @@ interface ActiveSessionDrag<Owner extends object> {
 
 export type SessionDragPreviewCompletion =
   | { readonly kind: "inside" }
-  | { readonly kind: "outside"; readonly point: DesktopPoint; readonly sessionId: string };
+  | {
+      readonly kind: "outside";
+      readonly point: DesktopPoint;
+      readonly profileId: string;
+      readonly sessionId: string;
+    };
 
 export type TrustedSessionDragPreviewCompletion<Owner extends object> = SessionDragPreviewCompletion & {
   readonly owner: Owner;
@@ -210,9 +215,10 @@ export class SessionDragPreviewCoordinator<Owner extends object> {
   private finishActiveGesture(active: ActiveSessionDrag<Owner>): SessionDragPreviewCompletion {
     const point = this.environment.getCursorPoint();
     const inside = pointIsInsideAnyRectangle(point, this.environment.getVisibleApplicationBounds());
+    const profileId = active.request.profileId;
     const sessionId = active.request.sessionId;
     this.stopActive();
-    return inside ? { kind: "inside" } : { kind: "outside", point, sessionId };
+    return inside ? { kind: "inside" } : { kind: "outside", point, profileId, sessionId };
   }
 
   dispose(): void {

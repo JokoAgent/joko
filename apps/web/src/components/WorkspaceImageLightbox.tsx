@@ -69,6 +69,8 @@ export interface WorkspaceImageLightboxProps {
   readonly showZoomControls?: boolean;
   readonly startAnnotating?: boolean;
   readonly returnFocus?: HTMLElement | null;
+  /** Trusted-host Artifact actions. The element receives no filesystem path. */
+  readonly toolbarActions?: JSX.Element;
   readonly onClose: () => void;
   readonly onDownload: (context: ArtifactDownloadContext) => unknown | Promise<unknown>;
   readonly onImageError?: () => void;
@@ -127,6 +129,7 @@ export function WorkspaceImageLightbox({
   showZoomControls = false,
   startAnnotating = false,
   returnFocus,
+  toolbarActions,
   onClose,
   onDownload,
   onImageError,
@@ -738,6 +741,7 @@ export function WorkspaceImageLightbox({
           <LightboxButton label={labels.zoomIn ?? ""} disabled={busy || !ready || viewport.scale >= clampWorkspaceImageScale(Number.POSITIVE_INFINITY)} onClick={zoomIn}><ZoomIn /></LightboxButton>
           <span aria-hidden="true" />
         </>}
+        {toolbarActions}
         <LightboxButton label={labels.copy} disabled={busy || !ready} onClick={copy}><Copy /></LightboxButton>
         <LightboxButton label={labels.saveAs} disabled={busy || !ready} onClick={save}><Download /></LightboxButton>
         {hasSend && <><span aria-hidden="true" /><LightboxButton label={labels.annotate} disabled={busy || !ready} onClick={() => setAnnotating(true)}><Pen /></LightboxButton><LightboxButton label={labels.sendToChat} disabled={busy || !ready} onClick={send}><MessageSquarePlus /></LightboxButton></>}

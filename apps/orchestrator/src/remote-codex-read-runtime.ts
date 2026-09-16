@@ -5,7 +5,7 @@ import {
   AppServerHost,
   StdioJsonRpcTransport,
   TransportFault,
-  type CodexRemoteMcpOpenInput,
+  type CodexMcpOpenInput,
   type CodexRemoteRuntime,
   type CodexRemoteRuntimePort,
   type JsonRpcRecordChannel,
@@ -20,7 +20,7 @@ import type {
 import type { OperationalStore, RemoteHostRecord, StoredTarget } from "@joko/store";
 import { probeRemoteCodexInstallation } from "./remote-codex-installation.js";
 import type { RemoteHostRegistry } from "./remote-host-registry.js";
-import type { RemoteCodexMcpBridgeManager } from "./remote-codex-mcp-bridge.js";
+import type { CodexMcpBridgeManager } from "./remote-codex-mcp-bridge.js";
 
 const PROBE_TIMEOUT_MS = 10_000;
 const DAEMON_BOOTSTRAP_TIMEOUT_MS = 30_000;
@@ -45,7 +45,7 @@ interface ResolverEntry {
 export interface RemoteCodexRuntimeResolverOptions {
   readonly store: Pick<OperationalStore, "getTarget">;
   readonly registry: Pick<RemoteHostRegistry, "captureProcessAuthority">;
-  readonly mcpBridge?: Pick<RemoteCodexMcpBridgeManager, "open" | "shutdown">;
+  readonly mcpBridge?: Pick<CodexMcpBridgeManager, "open" | "shutdown">;
 }
 
 /** Target- and SSH-generation-bound owner for a remote Codex runtime. */
@@ -155,7 +155,7 @@ export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
       executionDomain,
       assertCurrent,
       ...(this.#mcpBridge === undefined ? {} : {
-        openMcpBridge: async (input: CodexRemoteMcpOpenInput) => {
+        openMcpBridge: async (input: CodexMcpOpenInput) => {
           assertCurrent();
           const bridge = await this.#mcpBridge!.open({
             forwarding: authority.lease.forwarding,

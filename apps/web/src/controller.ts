@@ -21,6 +21,7 @@ import {
   type LinkOpenKind,
   type MessageSearchSortPreference,
   type UiPreferences,
+  type UiPreferencesMutation,
   personalizationPromptForOwner,
   withPersonalizationPrompt
 } from "./local-state.js";
@@ -51,6 +52,7 @@ import type {
   Theme
 } from "./model.js";
 import { appendTextToComposerDocument, composerDocumentKeepingQuotes } from "./composer-quote-document.js";
+import { restoreRejectedComposerDraft } from "./composer-draft-recovery.js";
 import { emptySnapshot } from "./model.js";
 import { visionBridgeToastStore } from "./vision-bridge-toast-store.js";
 import {
@@ -126,6 +128,13 @@ export interface ControllerState {
   readonly statusMessage?: string;
   readonly error?: string;
   readonly editorTextUpdate?: { readonly eventId: string; readonly sessionId: string; readonly text: string };
+  readonly rejectedFirstInputRecovery?: {
+    readonly eventId: number;
+    readonly sessionId: string;
+    readonly input: ComposerDraft;
+    readonly draft: ComposerDraft;
+    readonly revision: number;
+  };
   readonly extensionNotifications: readonly {
     readonly eventId: string;
     readonly sessionId: string;
@@ -191,6 +200,7 @@ export interface AppController extends OperationApi {
   saveDraft(sessionId: string, draft: ComposerDraft): Promise<void>;
   readDraftSnapshot(sessionId: string): Promise<import("./local-state.js").ComposerDraftSnapshot>;
   saveDraftIfRevision(sessionId: string, draft: ComposerDraft, expectedRevision: number): Promise<number | undefined>;
+  restoreFirstInputDraft(sessionId: string, input: ComposerDraft): Promise<void>;
   readNewSessionDraft(): Promise<NewSessionLocalDraft | undefined>;
   saveNewSessionDraft(draft: NewSessionLocalDraft): Promise<void>;
   clearNewSessionDraft(): Promise<void>;
@@ -238,6 +248,7 @@ export function useAppController(): AppController {
   routeRef.current = state.route;
   const preferencesRef = useRef<UiPreferences>(DEFAULT_UI_PREFERENCES);
   preferencesRef.current = state.preferences;
+  const preferenceMutationTailRef = useRef<Promise<void>>(Promise.resolve());
   const gatewayRef = useRef<OrchestratorGateway | undefined>(undefined);
   const gatewayGenerationRef = useRef(0);
   const htmlPreviewsRef = useRef(new Map<string, {
@@ -290,8 +301,10 @@ export function useAppController(): AppController {
       let profiles = persistedProfiles;
       let effectivePreferences = preferences ?? DEFAULT_UI_PREFERENCES;
       if (effectivePreferences.automaticConnectionTarget !== undefined && !automaticConnectionAvailable && window.jokoDesktop === undefined) {
-        effectivePreferences = { ...effectivePreferences, automaticConnectionTarget: undefined };
-        await local.savePreferences(effectivePreferences);
+        effectivePreferences = await local.mutatePreferences((current) => ({
+          ...current,
+          automaticConnectionTarget: undefined
+        }));
         if (cancelled) return;
       }
       let managedProfile: ConnectionProfile | undefined;
@@ -421,17 +434,17 @@ export function useAppController(): AppController {
     document.documentElement.style.setProperty("zoom", String(windowZoom));
   }, [state.preferences.windowZoom]);
 
-  const updatePreferences = useCallback(async (patch: Partial<UiPreferences>): Promise<void> => {
+  const commitPreferenceMutation = useCallback(async (mutation: UiPreferencesMutation): Promise<void> => {
     const previous = preferencesRef.current;
-    const next = { ...previous, ...patch };
+    const next = mutation(previous);
     preferencesRef.current = next;
     setState((current) => ({ ...current, preferences: next }));
     try {
-      await requireLocal(localRef.current).savePreferences(next);
+      await requireLocal(localRef.current).mutatePreferences(mutation);
     } catch (error) {
-      // Do not roll a newer successful change back when concurrent preference
-      // writes settle out of order. The latest failed write restores both the
-      // ref used by actions and the state rendered by settings.
+      // The local queue prevents a newer mutation from starting before this
+      // rollback. The identity check still avoids replacing unrelated state
+      // if the controller itself was retired while persistence was pending.
       if (preferencesRef.current === next) {
         preferencesRef.current = previous;
         setState((current) => current.preferences === next ? { ...current, preferences: previous } : current);
@@ -439,6 +452,23 @@ export function useAppController(): AppController {
       throw error;
     }
   }, []);
+
+  const mutatePreferences = useCallback((mutation: UiPreferencesMutation): Promise<void> => {
+    // Renderer-local intent is serialized as well as the IndexedDB transaction.
+    // If an older write fails, its rollback therefore happens before a newer
+    // mutation samples local state; the newer success cannot retain a phantom
+    // value that never reached durable storage.
+    const scheduled = preferenceMutationTailRef.current.then(
+      () => commitPreferenceMutation(mutation),
+      () => commitPreferenceMutation(mutation)
+    );
+    preferenceMutationTailRef.current = scheduled.then(() => undefined, () => undefined);
+    return scheduled;
+  }, [commitPreferenceMutation]);
+
+  const updatePreferences = useCallback(async (patch: Partial<UiPreferences>): Promise<void> => {
+    await mutatePreferences((current) => ({ ...current, ...patch }));
+  }, [mutatePreferences]);
 
   const setMachineSelection = useCallback(async (selection: MachineSelection): Promise<void> => {
     await updatePreferences({ machineSelection: normalizeMachineSelection(selection) });
@@ -1576,15 +1606,38 @@ export function useAppController(): AppController {
   const draftStore = localRef.current;
   const draftServerId = state.activeProfile?.serverId;
   const newTaskDraftScope = state.activeProfile === undefined ? undefined : newSessionDraftScope(state.activeProfile);
+  const newTaskDraftOperationTailsRef = useRef(new Map<string, Promise<void>>());
   const newTaskDraftApi = useMemo(() => {
     const scope = (): string => {
       if (newTaskDraftScope === undefined) throw new Error("Connect to Joko before using a new-task draft.");
       return newTaskDraftScope;
     };
+    const enqueue = (selectedScope: string, write: () => Promise<void>): Promise<void> => {
+      const previous = newTaskDraftOperationTailsRef.current.get(selectedScope) ?? Promise.resolve();
+      const operation = previous.catch(() => undefined).then(write);
+      const tail = operation.catch(() => undefined);
+      newTaskDraftOperationTailsRef.current.set(selectedScope, tail);
+      void tail.then(() => {
+        if (newTaskDraftOperationTailsRef.current.get(selectedScope) === tail) {
+          newTaskDraftOperationTailsRef.current.delete(selectedScope);
+        }
+      });
+      return operation;
+    };
     return {
-      readNewSessionDraft: (): Promise<NewSessionLocalDraft | undefined> => requireLocal(draftStore).readNewSessionDraft(scope()),
-      saveNewSessionDraft: (draft: NewSessionLocalDraft): Promise<void> => requireLocal(draftStore).saveNewSessionDraft(scope(), draft),
-      clearNewSessionDraft: (): Promise<void> => requireLocal(draftStore).clearNewSessionDraft(scope()),
+      readNewSessionDraft: async (): Promise<NewSessionLocalDraft | undefined> => {
+        const selectedScope = scope();
+        await newTaskDraftOperationTailsRef.current.get(selectedScope);
+        return requireLocal(draftStore).readNewSessionDraft(selectedScope);
+      },
+      saveNewSessionDraft: (draft: NewSessionLocalDraft): Promise<void> => {
+        const selectedScope = scope();
+        return enqueue(selectedScope, () => requireLocal(draftStore).saveNewSessionDraft(selectedScope, draft));
+      },
+      clearNewSessionDraft: (): Promise<void> => {
+        const selectedScope = scope();
+        return enqueue(selectedScope, () => requireLocal(draftStore).clearNewSessionDraft(selectedScope));
+      },
       readPendingExtensionUse: (): Promise<PendingExtensionUseView | undefined> => requireLocal(draftStore).readPendingExtensionUse(scope()),
       savePendingExtensionUse: (value: PendingExtensionUseView): Promise<void> => requireLocal(draftStore).savePendingExtensionUse(scope(), value),
       clearPendingExtensionUse: (): Promise<void> => requireLocal(draftStore).clearPendingExtensionUse(scope())
@@ -1610,6 +1663,19 @@ export function useAppController(): AppController {
     if (draftServerId === undefined) return Promise.reject(new Error("Connect to Joko before saving a task draft."));
     return requireLocal(draftStore).saveDraftIfRevision(draftServerId, sessionId, draft, revision);
   }, [draftStore, draftServerId, artifactGateway]);
+  const rejectedFirstInputRecoverySequenceRef = useRef(0);
+  const restoreFirstInputDraft = useCallback<AppController["restoreFirstInputDraft"]>(async (sessionId, input) => {
+    if (draftServerId === undefined) throw new Error("Connect to Joko before restoring a task draft.");
+    const profileId = state.activeProfile?.id;
+    const recovered = await restoreRejectedComposerDraft({ readDraftSnapshot, saveDraftIfRevision }, sessionId, input);
+    const eventId = ++rejectedFirstInputRecoverySequenceRef.current;
+    setState((current) => current.activeProfile?.serverId === draftServerId
+      && current.activeProfile.id === profileId
+      && (current.route.kind === "session" || current.route.kind === "files")
+      && current.route.sessionId === sessionId
+      ? { ...current, rejectedFirstInputRecovery: { eventId, sessionId, input, ...recovered } }
+      : current);
+  }, [draftServerId, readDraftSnapshot, saveDraftIfRevision, state.activeProfile?.id]);
   const listWorkspaceChangeSets = useCallback<AppController["listWorkspaceChangeSets"]>((workspaceId, sessionId) => {
     if (artifactGateway === undefined) return Promise.reject(new Error("Connect to Joko before reading workspace changes."));
     return artifactGateway.listWorkspaceChangeSets(workspaceId, sessionId);
@@ -1670,6 +1736,7 @@ export function useAppController(): AppController {
       readSessionArtifact: async (...args: Parameters<OperationApi["readSessionArtifact"]>) => original().readSessionArtifact(...args),
       send: async (...args: Parameters<OperationApi["send"]>) => original().send(...args),
       createTarget: async (...args: Parameters<OperationApi["createTarget"]>) => original().createTarget(...args),
+      prepareTargetWorkspace: async (...args: Parameters<OperationApi["prepareTargetWorkspace"]>) => original().prepareTargetWorkspace(...args),
       createSession: async (draft: NewSessionDraft) => original().createSession(sessionDraftWithPersonalization(
         draft,
         personalizationPromptForOwner(preferencesRef.current.personalizationPrompts, inputOwnerId)
@@ -1765,6 +1832,16 @@ export function useAppController(): AppController {
     if (artifactGateway === undefined) throw new Error("Connect to Joko before copying an artifact file.");
     return artifactGateway.copyArtifactFile(blobId, fileName, byteSize, context);
   }, [artifactGateway]);
+  const openArtifactFile = useCallback<AppController["openArtifactFile"]>(async (blobId, fileName, byteSize, context) => {
+    context.signal.throwIfAborted();
+    if (artifactGateway === undefined) throw new Error("Connect to Joko before opening an artifact file.");
+    return artifactGateway.openArtifactFile(blobId, fileName, byteSize, context);
+  }, [artifactGateway]);
+  const revealArtifactSource = useCallback<AppController["revealArtifactSource"]>(async (sessionId, artifactId, context) => {
+    context.signal.throwIfAborted();
+    if (artifactGateway === undefined) throw new Error("Connect to Joko before revealing an Artifact source.");
+    return artifactGateway.revealArtifactSource(sessionId, artifactId, context);
+  }, [artifactGateway]);
   const exportSession = useCallback<AppController["exportSession"]>(async (sessionId, context) => {
     context.signal.throwIfAborted();
     if (artifactGateway === undefined) throw new Error("Connect to Joko before exporting a task.");
@@ -1826,16 +1903,18 @@ export function useAppController(): AppController {
     setPersonalizationPrompt: (value) => {
       const ownerId = state.activeProfile?.serverId;
       if (ownerId === undefined) return Promise.reject(new Error("Connect to a Joko node before changing personalization instructions."));
-      return updatePreferences({
-        personalizationPrompts: withPersonalizationPrompt(preferencesRef.current.personalizationPrompts, ownerId, value)
-      });
+      return mutatePreferences((current) => ({
+        ...current,
+        personalizationPrompts: withPersonalizationPrompt(current.personalizationPrompts, ownerId, value)
+      }));
     },
     resetPersonalizationPrompt: () => {
       const ownerId = state.activeProfile?.serverId;
       if (ownerId === undefined) return Promise.reject(new Error("Connect to a Joko node before changing personalization instructions."));
-      return updatePreferences({
-        personalizationPrompts: withPersonalizationPrompt(preferencesRef.current.personalizationPrompts, ownerId, "")
-      });
+      return mutatePreferences((current) => ({
+        ...current,
+        personalizationPrompts: withPersonalizationPrompt(current.personalizationPrompts, ownerId, "")
+      }));
     },
     setLinkOpenPreference: (kind, preference) => updatePreferences(kind === "web"
       ? { webLinkOpenPreference: preference } : { localLinkOpenPreference: preference }),
@@ -1847,19 +1926,22 @@ export function useAppController(): AppController {
     setNewSessionWorktreeEnabled: (newSessionWorktreeEnabled) => updatePreferences({ newSessionWorktreeEnabled }),
     openHttpLink,
     openWorkspaceHtml,
-    setSidebarDisplayPreferences: (patch) => updatePreferences({
-      sidebarDisplayPreferences: withSidebarDisplayPreferences(preferencesRef.current.sidebarDisplayPreferences, patch)
-    }),
+    setSidebarDisplayPreferences: (patch) => mutatePreferences((current) => ({
+      ...current,
+      sidebarDisplayPreferences: withSidebarDisplayPreferences(current.sidebarDisplayPreferences, patch)
+    })),
     setSidebarOwnerLayout: (patch) => {
       const ownerId = state.activeProfile?.serverId;
       if (ownerId === undefined) return Promise.reject(new Error("Connect to a Joko node before changing sidebar layout."));
-      return updatePreferences({
-        sidebarOwnerLayouts: withSidebarOwnerLayout(preferencesRef.current.sidebarOwnerLayouts, ownerId, patch)
-      });
+      return mutatePreferences((current) => ({
+        ...current,
+        sidebarOwnerLayouts: withSidebarOwnerLayout(current.sidebarOwnerLayouts, ownerId, patch)
+      }));
     },
-    setAppShortcutOverride: (id, value) => updatePreferences({
-      appShortcutOverrides: withAppShortcutOverride(preferencesRef.current.appShortcutOverrides, id, value)
-    }),
+    setAppShortcutOverride: (id, value) => mutatePreferences((current) => ({
+      ...current,
+      appShortcutOverrides: withAppShortcutOverride(current.appShortcutOverrides, id, value)
+    })),
     resetAppShortcutOverrides: () => updatePreferences({ appShortcutOverrides: {} }),
     setInspectorOpen: (inspectorOpen) => updatePreferences({ inspectorOpen }),
     setNavigationOpen: (navigationOpen) => {
@@ -1902,6 +1984,7 @@ export function useAppController(): AppController {
     saveDraft,
     readDraftSnapshot,
     saveDraftIfRevision,
+    restoreFirstInputDraft,
     ...newTaskDraftApi,
     ...inputApi,
     refreshProviderAccountUsage: (backendId, providerId) => gateway().refreshProviderAccountUsage(backendId, providerId),
@@ -1936,7 +2019,7 @@ export function useAppController(): AppController {
     deleteSession: (sessionId, deleteNative) => gateway().deleteSession(sessionId, deleteNative),
     probeTargetWorktree: (targetId, signal) => gateway().probeTargetWorktree(targetId, signal),
     listTargetWorktreeSources: (targetId, signal) => gateway().listTargetWorktreeSources(targetId, signal),
-    discoverNativeSessions: (targetId) => gateway().discoverNativeSessions(targetId),
+    discoverNativeSessions: (targetId, signal) => gateway().discoverNativeSessions(targetId, signal),
     scanNativeSessionCatalog: (backendId, options) => gateway().scanNativeSessionCatalog(backendId, options),
     archiveTarget: (targetId, archived) => gateway().archiveTarget(targetId, archived),
     deleteTarget: (targetId, deleteManagedWorkspace) => gateway().deleteTarget(targetId, deleteManagedWorkspace),
@@ -2257,8 +2340,10 @@ export function useAppController(): AppController {
     getArtifactUrl,
     releaseArtifactUrl,
     downloadArtifact,
-    copyArtifactFile
-  }), [saveProvider, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, readDraftSnapshot, saveDraftIfRevision, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, logoutConnection, logoutProfile, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setMachineSelection, state, switchMachine, updatePreferences]);
+    copyArtifactFile,
+    openArtifactFile,
+    revealArtifactSource
+  }), [saveProvider, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, readDraftSnapshot, saveDraftIfRevision, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setMachineSelection, state, switchMachine, updatePreferences]);
 }
 
 function upsertMachineCache(caches: readonly MachineCacheView[], cache: MachineCacheView): readonly MachineCacheView[] {
@@ -2768,6 +2853,7 @@ export function clearTransientExtensionUiState(current: ControllerState): Contro
   return {
     ...current,
     editorTextUpdate: undefined,
+    rejectedFirstInputRecovery: undefined,
     extensionNotifications: []
   };
 }

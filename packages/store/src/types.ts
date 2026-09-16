@@ -470,6 +470,13 @@ export interface QueueItemRecord extends QueueItemDescriptor {
   readonly revision: bigint;
 }
 
+export interface DesktopHostAuthorizationRecord {
+  readonly connectionId: ConnectionId;
+  readonly authKeyDigest: string;
+  readonly createdAt: UnixMillis;
+  readonly revision: bigint;
+}
+
 export interface QueueControlRecord {
   readonly sessionId: SessionId;
   readonly paused: boolean;
@@ -976,6 +983,31 @@ export interface ArtifactRecord {
   readonly createdAt: UnixMillis;
   readonly deletedAt?: UnixMillis;
   readonly revision: bigint;
+}
+
+/** Private provenance used only to re-authorize a same-machine source reveal. */
+export interface ArtifactSourceRecord {
+  readonly artifactId: ArtifactId;
+  readonly sessionId: SessionId;
+  readonly targetId: string;
+  readonly generation: number;
+  readonly authorityHash: string;
+  readonly workspaceRoot: string;
+  /** Canonical slash-separated path relative to workspaceRoot. */
+  readonly relativePath: string;
+  readonly createdAt: UnixMillis;
+  readonly revision: bigint;
+}
+
+export interface PutArtifactSourceInput {
+  readonly artifactId: ArtifactId;
+  readonly sessionId: SessionId;
+  readonly targetId: string;
+  readonly generation: number;
+  readonly authorityHash: string;
+  readonly workspaceRoot: string;
+  readonly relativePath: string;
+  readonly createdAt?: UnixMillis;
 }
 
 export interface PutArtifactInput {

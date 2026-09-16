@@ -11,6 +11,7 @@ import {
   DesktopBootstrapFrameDecoder,
   createDesktopBootstrapCommit,
   createDesktopBootstrapRequest,
+  deriveDesktopHostAuthorizationKey,
   decodeDesktopBootstrapCommittedPayload,
   decodeDesktopBootstrapResponsePayload,
   encodeDesktopBootstrapCommitFrame,
@@ -53,6 +54,8 @@ export interface ManagedOrchestratorRuntime {
   readonly connection: ManagedOrchestratorConnection;
   /** One-shot move into safeStorage or main-process volatile memory. */
   readonly takeAuthKey: () => string;
+  /** Main-process-only volatile authority; available only after bootstrap commit. */
+  readonly readDesktopHostAuthKey: () => string;
   readonly processId?: number;
   /** Complete only after safeStorage and managed profile metadata are durable. */
   readonly commit: () => Promise<void>;
@@ -240,6 +243,7 @@ export async function startManagedOrchestrator(options: StartManagedOrchestrator
     verifyDesktopBootstrapResponse(request, response, { now });
     if (response.origin !== origin) throw startupUnavailable();
     let pendingAuthKey: string | undefined = response.authKey;
+    let desktopHostAuthKey: string | undefined = deriveDesktopHostAuthorizationKey(request);
     let committed = false;
     let committing: Promise<void> | undefined;
     started = true;
@@ -258,6 +262,12 @@ export async function startManagedOrchestrator(options: StartManagedOrchestrator
         pendingAuthKey = undefined;
         return authKey;
       },
+      readDesktopHostAuthKey: () => {
+        if (!committed || desktopHostAuthKey === undefined) {
+          throw new Error("The managed Desktop host authorization is unavailable.");
+        }
+        return desktopHostAuthKey;
+      },
       commit: () => {
         committing ??= (async () => {
           const confirmationPromise = receiveCommitted(responsePipe, child, MANAGED_ORCHESTRATOR_START_TIMEOUT_MS);
@@ -274,7 +284,10 @@ export async function startManagedOrchestrator(options: StartManagedOrchestrator
         if (!committed) throw new Error("The managed Orchestrator bootstrap was not durably committed.");
         processControl.release();
       },
-      stop: processControl.stop
+      stop: async () => {
+        desktopHostAuthKey = undefined;
+        await processControl.stop();
+      }
     };
   } catch {
     throw startupUnavailable();

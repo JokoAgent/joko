@@ -14,6 +14,7 @@ import {
   type PiSupportedApi
 } from "@joko/adapter-pi";
 import * as contract from "@joko/contracts";
+import { DESKTOP_HOST_AUTHORIZATION_HEADER } from "@joko/contracts/desktop-bootstrap";
 import {
   DEFAULT_AGENT_RESOURCE_SETTINGS,
   DEFAULT_COLLABORATION_SETTINGS,
@@ -202,6 +203,7 @@ import {
   fromProtoTimestamp,
   mapErrorToProto,
   toProtoArtifact,
+  toProtoArtifactWithSourceAvailability,
   toProtoBackend,
   toProtoBlobRef,
   toProtoConnection,
@@ -439,6 +441,7 @@ interface ConnectServiceDependencies {
   readonly toolPolicies?: ToolPolicySettingsRepository;
   readonly gitSafety?: GitSafetyCoordinator;
   readonly workspaceService: NativeWorkspaceService;
+  readonly targetWorkspaceRuntime: TargetWorkspaceRuntimeCoordinator;
   readonly workspaceChanges: WorkspaceChangeSetService;
   readonly artifactStore: ArtifactStore;
   readonly artifactMaintenance?: ArtifactMaintenance;
@@ -517,6 +520,29 @@ interface ConnectServiceDependencies {
   readonly now?: () => number;
   /** Optional durable Browser activity projection supplied by the process composition root. */
   readonly browserActivities?: () => readonly NativeBrowserActivity[];
+}
+
+interface TargetWorkspaceRuntimeCoordinator {
+  run<T>(targetId: string, task: () => Promise<T>): Promise<T>;
+}
+
+class SerialTargetWorkspaceRuntime implements TargetWorkspaceRuntimeCoordinator {
+  readonly #tails = new Map<string, Promise<void>>();
+
+  async run<T>(targetId: string, task: () => Promise<T>): Promise<T> {
+    const predecessor = this.#tails.get(targetId) ?? Promise.resolve();
+    let release!: () => void;
+    const turn = new Promise<void>((resolve) => { release = resolve; });
+    const tail = predecessor.catch(() => undefined).then(() => turn);
+    this.#tails.set(targetId, tail);
+    await predecessor.catch(() => undefined);
+    try {
+      return await task();
+    } finally {
+      release();
+      if (this.#tails.get(targetId) === tail) this.#tails.delete(targetId);
+    }
+  }
 }
 
 interface NativeMemoryStatusObservation {
@@ -857,6 +883,7 @@ interface HostMutationInput<T> {
   readonly precondition?: (store: OperationalStore) => void;
   readonly effect?: () => Promise<void>;
   readonly sessionLifecycleFenceId?: string;
+  readonly targetSessionCreationFenceId?: string;
   readonly complete?: (
     commit: (finalize?: (store: OperationalStore) => void) => OperationExecution<T>
   ) => Promise<OperationExecution<T>>;
@@ -998,6 +1025,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
     ...(application.toolPolicies === undefined ? {} : { toolPolicies: application.toolPolicies }),
     ...(application.gitSafety === undefined ? {} : { gitSafety: application.gitSafety }),
     workspaceService: application.workspaces,
+    targetWorkspaceRuntime: new SerialTargetWorkspaceRuntime(),
     workspaceChanges: application.workspaceChanges,
     artifactStore: application.artifacts,
     ...(application.artifactMaintenance === undefined ? {} : { artifactMaintenance: application.artifactMaintenance }),
@@ -1910,6 +1938,29 @@ export function createConnectServices(application: OrchestratorApplication): Con
     getTarget: (request, context) => {
       authenticate(context);
       return { target: toProtoTarget(dependencies.store.getTarget(request.targetId)) };
+    },
+    prepareTargetWorkspace: async (request, context) => {
+      const connection = authenticate(context);
+      const targetId = request.targetId.trim();
+      if (targetId === "") throw invalidArgument("target_id is required");
+      if (request.expectedTargetRevision === undefined) {
+        throw invalidArgument("expected_target_revision is required");
+      }
+      const expectedRevision = fromProtoRevision(
+        request.expectedTargetRevision,
+        "prepare_target_workspace.expected_target_revision"
+      );
+      return dependencies.targetWorkspaceRuntime.run(targetId, async () => {
+        context.signal.throwIfAborted();
+        const target = dependencies.store.getTarget(targetId);
+        assertTargetWorkspacePreparationAuthority(target, expectedRevision);
+        await registerTargetWorkspace(dependencies, target);
+        context.signal.throwIfAborted();
+        dependencies.connections.fence(connection);
+        const current = dependencies.store.getTarget(targetId);
+        assertTargetWorkspacePreparationAuthority(current, expectedRevision);
+        return { workspace: toProtoWorkspace(current) };
+      });
     }
   } satisfies ServiceImpl<typeof contract.TargetService>;
 
@@ -2971,7 +3022,11 @@ export function createConnectServices(application: OrchestratorApplication): Con
         limit,
         offset
       };
-      const values = dependencies.store.listArtifacts(query).map(toProtoArtifact);
+      const values = dependencies.store.listArtifacts(query)
+        .map((record) => toProtoArtifactWithSourceAvailability(
+          record,
+          dependencies.store.hasArtifactSource(record.blob.id)
+        ));
       const totalSize = dependencies.store.countArtifacts(query);
       const afterRevision = dependencies.store.health().revision;
       if (afterRevision !== beforeRevision) {
@@ -3000,7 +3055,38 @@ export function createConnectServices(application: OrchestratorApplication): Con
     },
     getArtifact: (request, context) => {
       authenticate(context);
-      return { artifact: toProtoArtifact(dependencies.store.getArtifact(request.artifactId)) };
+      const record = dependencies.store.getArtifact(request.artifactId);
+      return { artifact: toProtoArtifactWithSourceAvailability(
+        record,
+        dependencies.store.hasArtifactSource(record.blob.id)
+      ) };
+    },
+    resolveArtifactSource: async (request, context) => {
+      const authenticated = authenticate(context);
+      if (request.sessionId.trim() === "" || request.artifactId.trim() === "") {
+        throw invalidArgument("session_id and artifact_id are required");
+      }
+      const hostAuthorization = context.requestHeader.get(DESKTOP_HOST_AUTHORIZATION_HEADER) ?? undefined;
+      requireDesktopHostAuthentication(dependencies, authenticated, hostAuthorization);
+      const revoked = new AbortController();
+      const stopRevocation = dependencies.connections.onRevoked(authenticated.id, () => revoked.abort());
+      const signal = AbortSignal.any([context.signal, revoked.signal]);
+      try {
+        const absolutePath = await dependencies.sessionHost.resolveArtifactSource(
+          request.sessionId,
+          request.artifactId,
+          signal
+        );
+        requireDesktopHostAuthentication(dependencies, authenticated, hostAuthorization);
+        if (!isAbsolute(absolutePath)) throw new ConnectError("Artifact source resolution failed.", Code.Internal);
+        return { absolutePath };
+      } catch (error) {
+        if (error instanceof ConnectError) throw error;
+        if (signal.aborted) throw new ConnectError("Artifact source resolution was cancelled.", Code.Canceled);
+        throw new ConnectError("Artifact source is unavailable or no longer authorized.", Code.FailedPrecondition);
+      } finally {
+        stopRevocation();
+      }
     },
     beginBlobUpload: async (request, context) => {
       authenticate(context);
@@ -4626,6 +4712,18 @@ function requireAuthentication(dependencies: ConnectServiceDependencies, context
     return dependencies.connections.authenticate(context.requestHeader.get("authorization") ?? undefined);
   } catch (error) {
     throw new ConnectError(error instanceof Error ? error.message : "Authentication failed.", Code.Unauthenticated);
+  }
+}
+
+function requireDesktopHostAuthentication(
+  dependencies: ConnectServiceDependencies,
+  connection: ConnectionRecord,
+  authorization: string | undefined
+): void {
+  try {
+    dependencies.connections.authenticateDesktopHost(connection, authorization);
+  } catch {
+    throw new ConnectError("Desktop host authentication is required.", Code.Unauthenticated);
   }
 }
 
@@ -6288,6 +6386,7 @@ function eventContext(
     try { queueControl = store.getQueueControl(item.sessionId); } catch { /* Historical tombstone. */ }
   }
   const artifact = item.payload.type === "artifact" ? store.findArtifact(item.payload.artifact.id) : undefined;
+  const artifactSourceRevealAvailable = artifact === undefined ? false : store.hasArtifactSource(artifact.blob.id);
   const sessionActiveRun = item.payload.type === "session_changed" && session !== undefined
     ? activeRun(store, session.descriptor.id)
     : undefined;
@@ -6307,6 +6406,7 @@ function eventContext(
     ...(queueControl === undefined ? {} : { queueControl }),
     ...(interaction === undefined ? {} : { interaction }),
     ...(artifact === undefined ? {} : { artifact }),
+    ...(artifact === undefined ? {} : { artifactSourceRevealAvailable }),
     ...(sessionContext === undefined ? {} : { sessionContext })
   };
 }
@@ -7690,6 +7790,57 @@ function backendProviderOperations(descriptor: BackendDescriptor): {
     modelRefresh: descriptor.capabilities.get("provider.model_refresh")?.supported === true,
     loginMethods: login?.options ?? []
   };
+}
+
+function targetWorkspaceRegistration(target: StoredTarget): WorkspaceRegistration {
+  const metadata = asRecord(target.metadata);
+  const workspaceId = stringValue(metadata["workspaceId"]) ?? target.descriptor.id;
+  const binding = target.descriptor.remoteWorkspace;
+  return {
+    id: workspaceId,
+    root: binding?.workspaceRoot ?? target.descriptor.workspaceRoot,
+    displayName: target.descriptor.displayName,
+    trusted: target.descriptor.trusted,
+    ...(binding === undefined ? {} : {
+      remote: {
+        targetId: target.descriptor.id,
+        hostId: binding.hostId,
+        workspaceRoot: binding.workspaceRoot
+      }
+    })
+  };
+}
+
+function assertTargetWorkspacePreparationAuthority(target: StoredTarget, expectedRevision: bigint): void {
+  if (target.revision !== expectedRevision) {
+    throw new RevisionConflictError("Target", target.descriptor.id, expectedRevision, target.revision);
+  }
+  const metadata = asRecord(target.metadata);
+  if (metadata["deletedAt"] !== undefined) {
+    throw new ConnectError("The selected project has been deleted.", Code.NotFound);
+  }
+  if (metadata["state"] === "deleting") {
+    throw new ConnectError("The selected project is being deleted.", Code.FailedPrecondition);
+  }
+  if (metadata["state"] === "archived") {
+    throw new ConnectError("Restore the archived project before creating a task.", Code.FailedPrecondition);
+  }
+}
+
+async function registerTargetWorkspace(
+  dependencies: ConnectServiceDependencies,
+  target: StoredTarget
+): Promise<WorkspaceRegistration> {
+  try {
+    return await dependencies.workspaceService.register(targetWorkspaceRegistration(target));
+  } catch {
+    throw new ConnectError(
+      target.descriptor.remoteWorkspace === undefined
+        ? "The project directory is unavailable on this service node. Restore the directory, then retry."
+        : "The remote project directory is unavailable. Reconnect its Remote Host or restore the directory, then retry.",
+      Code.FailedPrecondition
+    );
+  }
 }
 
 interface RevisionPageCursor {
@@ -14707,157 +14858,152 @@ async function dispatchMutation(
       return presented(execution);
     }
     case "updateTarget": {
-      requireEntityVersionPrecondition(mutation, contract.EntityKind.TARGET, payload.value.targetId, "update_target");
-      const existing = dependencies.store.getTarget(payload.value.targetId);
-      const metadata = asRecord(existing.metadata);
-      const { remoteWorkspace: _previousRemoteWorkspace, ...serviceNodeDescriptor } = existing.descriptor;
-      let descriptor: import("@joko/core").TargetDescriptor;
-      switch (payload.value.workspaceLocationUpdate.case) {
-        case "remoteWorkspace": {
-          if (dependencies.remoteHosts === undefined) {
-            throw new ConnectError("Remote workspace binding is unavailable.", Code.Unimplemented);
+      return dependencies.targetWorkspaceRuntime.run(payload.value.targetId, async () => {
+        requireEntityVersionPrecondition(mutation, contract.EntityKind.TARGET, payload.value.targetId, "update_target");
+        const existing = dependencies.store.getTarget(payload.value.targetId);
+        const metadata = asRecord(existing.metadata);
+        const { remoteWorkspace: _previousRemoteWorkspace, ...serviceNodeDescriptor } = existing.descriptor;
+        let descriptor: import("@joko/core").TargetDescriptor;
+        switch (payload.value.workspaceLocationUpdate.case) {
+          case "remoteWorkspace": {
+            if (dependencies.remoteHosts === undefined) {
+              throw new ConnectError("Remote workspace binding is unavailable.", Code.Unimplemented);
+            }
+            const remoteWorkspace = fromProtoRemoteWorkspace(payload.value.workspaceLocationUpdate.value);
+            const remoteHost = dependencies.remoteHosts.get(existing.descriptor.id, remoteWorkspace.hostId);
+            if (remoteHost.status.state !== "ready" || remoteHost.trust === undefined) {
+              throw new ConnectError(
+                "Test and trust the Remote Host before binding this target.",
+                Code.FailedPrecondition
+              );
+            }
+            descriptor = { ...serviceNodeDescriptor, remoteWorkspace };
+            break;
           }
-          const remoteWorkspace = fromProtoRemoteWorkspace(payload.value.workspaceLocationUpdate.value);
-          const host = dependencies.remoteHosts.get(existing.descriptor.id, remoteWorkspace.hostId);
-          if (host.status.state !== "ready" || host.trust === undefined) {
-            throw new ConnectError(
-              "Test and trust the Remote Host before binding this target.",
-              Code.FailedPrecondition
-            );
-          }
-          descriptor = { ...serviceNodeDescriptor, remoteWorkspace };
-          break;
+          case "serviceNodeWorkspace":
+            if (!payload.value.workspaceLocationUpdate.value) {
+              throw new ConnectError("service_node_workspace must be true.", Code.InvalidArgument);
+            }
+            descriptor = serviceNodeDescriptor;
+            break;
+          default:
+            descriptor = existing.descriptor;
         }
-        case "serviceNodeWorkspace":
-          if (!payload.value.workspaceLocationUpdate.value) {
-            throw new ConnectError("service_node_workspace must be true.", Code.InvalidArgument);
-          }
-          descriptor = serviceNodeDescriptor;
-          break;
-        default:
-          descriptor = existing.descriptor;
-      }
-      if (payload.value.displayName !== undefined) {
-        descriptor = { ...descriptor, displayName: payload.value.displayName };
-      }
-      const execution = await host.mutate({
-        operationId,
-        connection,
-        kind: payload.case,
-        body: mutation,
-        commit: (store) => {
-          store.upsertTarget(descriptor, { ...metadata, ...(payload.value.pinned === undefined ? {} : { pinned: payload.value.pinned }) });
-          return { accepted: true, resultCase: "target", entityId: descriptor.id } satisfies OperationOutcome;
+        if (payload.value.displayName !== undefined) {
+          descriptor = { ...descriptor, displayName: payload.value.displayName };
         }
-      });
-      const stored = dependencies.store.getTarget(descriptor.id);
-      const storedMetadata = asRecord(stored.metadata);
-      const workspaceId = stringValue(storedMetadata["workspaceId"]) ?? stored.descriptor.id;
-      const binding = stored.descriptor.remoteWorkspace;
-      await dependencies.workspaceService.register({
-        id: workspaceId,
-        root: binding?.workspaceRoot ?? stored.descriptor.workspaceRoot,
-        displayName: stored.descriptor.displayName,
-        trusted: stored.descriptor.trusted,
-        ...(binding === undefined ? {} : {
-          remote: {
-            targetId: stored.descriptor.id,
-            hostId: binding.hostId,
-            workspaceRoot: binding.workspaceRoot
+        const execution = await host.mutate({
+          operationId,
+          connection,
+          kind: payload.case,
+          body: mutation,
+          commit: (store) => {
+            store.upsertTarget(descriptor, {
+              ...metadata,
+              ...(payload.value.pinned === undefined ? {} : { pinned: payload.value.pinned })
+            });
+            return { accepted: true, resultCase: "target", entityId: descriptor.id } satisfies OperationOutcome;
           }
-        })
+        });
+        await registerTargetWorkspace(dependencies, dependencies.store.getTarget(descriptor.id));
+        return presented(execution);
       });
-      return presented(execution);
     }
     case "archiveTarget": {
-      const existing = dependencies.store.getTarget(payload.value.targetId);
-      const execution = await host.mutate({
-        operationId,
-        connection,
-        kind: payload.case,
-        body: mutation,
-        commit: (store) => {
-          store.upsertTarget(existing.descriptor, {
-            ...asRecord(existing.metadata),
-            state: payload.value.archived ? "archived" : "active",
-            archivedAt: payload.value.archived ? Date.now() : undefined
-          });
-          return { accepted: true, resultCase: "target", entityId: existing.descriptor.id } satisfies OperationOutcome;
-        }
+      return dependencies.targetWorkspaceRuntime.run(payload.value.targetId, async () => {
+        const existing = dependencies.store.getTarget(payload.value.targetId);
+        const execution = await host.mutate({
+          operationId,
+          connection,
+          kind: payload.case,
+          body: mutation,
+          commit: (store) => {
+            store.upsertTarget(existing.descriptor, {
+              ...asRecord(existing.metadata),
+              state: payload.value.archived ? "archived" : "active",
+              archivedAt: payload.value.archived ? Date.now() : undefined
+            });
+            return { accepted: true, resultCase: "target", entityId: existing.descriptor.id } satisfies OperationOutcome;
+          }
+        });
+        return presented(execution);
       });
-      return presented(execution);
     }
     case "deleteTarget": {
-      const existing = dependencies.store.getTarget(payload.value.targetId);
-      const metadata = asRecord(existing.metadata);
-      const workspaceId = stringValue(metadata["workspaceId"]) ?? existing.descriptor.id;
-      const sessions = dependencies.store.listSessions({
-        targetId: existing.descriptor.id,
-        includeArchived: true,
-        includeDeleted: true
-      }).filter((item) => item.descriptor.deletedAt === undefined);
-      if (sessions.length > 0) {
-        throw new ConnectError("Delete the Target's product sessions before deleting the Target.", Code.FailedPrecondition);
-      }
-      if (payload.value.deleteManagedWorkspace && !existing.descriptor.managed) {
-        throw new ConnectError("Only a service-created managed workspace can be moved to managed trash.", Code.FailedPrecondition);
-      }
-      if (payload.value.deleteManagedWorkspace && dependencies.managedWorkspaceRoot === undefined) {
-        throw new ConnectError("The managed workspace trash root is not configured.", Code.FailedPrecondition);
-      }
-      const deletedAt = Date.now();
-      let trashedPath: string | undefined;
-      const assertDeletionPrecondition = (store: OperationalStore): void => {
-        const current = store.getTarget(existing.descriptor.id);
-        if (current.revision !== existing.revision) {
-          throw new RevisionConflictError("Target", current.descriptor.id, existing.revision, current.revision);
-        }
-        const currentSessions = store.listSessions({
+      return dependencies.targetWorkspaceRuntime.run(payload.value.targetId, async () => {
+        const existing = dependencies.store.getTarget(payload.value.targetId);
+        const metadata = asRecord(existing.metadata);
+        const workspaceId = stringValue(metadata["workspaceId"]) ?? existing.descriptor.id;
+        const sessions = dependencies.store.listSessions({
           targetId: existing.descriptor.id,
           includeArchived: true,
           includeDeleted: true
         }).filter((item) => item.descriptor.deletedAt === undefined);
-        if (
-          currentSessions.length !== sessions.length ||
-          currentSessions.some((item, index) => item.descriptor.id !== sessions[index]?.descriptor.id)
-        ) {
-          throw new InvalidStateTransitionError("Target session graph", "changed", "delete");
+        if (sessions.length > 0) {
+          throw new ConnectError("Delete the Target's product sessions before deleting the Target.", Code.FailedPrecondition);
         }
-      };
-      const execution = await host.mutate({
-        operationId,
-        connection,
-        kind: payload.case,
-        body: mutation,
-        precondition: assertDeletionPrecondition,
-        ...(payload.value.deleteManagedWorkspace ? {
-          effect: async () => {
-            const trashed = await moveManagedWorkspaceToTrash({
-              managedRoot: resolve(dependencies.managedWorkspaceRoot!),
-              workspaceRoot: existing.descriptor.workspaceRoot,
-              targetId: existing.descriptor.id,
-              operationId
-            });
-            trashedPath = trashed.trashedPath;
-            dependencies.workspaceService.unregister(workspaceId);
+        if (payload.value.deleteManagedWorkspace && !existing.descriptor.managed) {
+          throw new ConnectError("Only a service-created managed workspace can be moved to managed trash.", Code.FailedPrecondition);
+        }
+        if (payload.value.deleteManagedWorkspace && dependencies.managedWorkspaceRoot === undefined) {
+          throw new ConnectError("The managed workspace trash root is not configured.", Code.FailedPrecondition);
+        }
+        const deletedAt = Date.now();
+        let trashedPath: string | undefined;
+        const assertDeletionPrecondition = (store: OperationalStore): void => {
+          const current = store.getTarget(existing.descriptor.id);
+          if (current.revision !== existing.revision) {
+            throw new RevisionConflictError("Target", current.descriptor.id, existing.revision, current.revision);
           }
-        } : {}),
-        commit: (store) => {
-          assertDeletionPrecondition(store);
-          store.upsertTarget(existing.descriptor, {
-            ...metadata,
-            state: "archived",
-            deletedAt,
-            deletionReason: payload.value.deleteManagedWorkspace ? "managed workspace moved to trash" : "target deleted",
-            ...(trashedPath === undefined ? {} : { managedWorkspaceTrashPath: trashedPath, deletionOperationId: operationId })
-          });
-          return { accepted: true, resultCase: "target", entityId: existing.descriptor.id } satisfies OperationOutcome;
-        }
+          const currentSessions = store.listSessions({
+            targetId: existing.descriptor.id,
+            includeArchived: true,
+            includeDeleted: true
+          }).filter((item) => item.descriptor.deletedAt === undefined);
+          if (
+            currentSessions.length !== sessions.length ||
+            currentSessions.some((item, index) => item.descriptor.id !== sessions[index]?.descriptor.id)
+          ) {
+            throw new InvalidStateTransitionError("Target session graph", "changed", "delete");
+          }
+        };
+        const execution = await host.mutate({
+          operationId,
+          connection,
+          kind: payload.case,
+          body: mutation,
+          precondition: assertDeletionPrecondition,
+          ...(payload.value.deleteManagedWorkspace ? {
+            targetSessionCreationFenceId: existing.descriptor.id,
+            effect: async () => {
+              const trashed = await moveManagedWorkspaceToTrash({
+                managedRoot: resolve(dependencies.managedWorkspaceRoot!),
+                workspaceRoot: existing.descriptor.workspaceRoot,
+                targetId: existing.descriptor.id,
+                operationId
+              });
+              trashedPath = trashed.trashedPath;
+              dependencies.workspaceService.unregister(workspaceId);
+            }
+          } : {}),
+          commit: (store) => {
+            assertDeletionPrecondition(store);
+            store.upsertTarget(existing.descriptor, {
+              ...metadata,
+              state: "archived",
+              deletedAt,
+              deletionReason: payload.value.deleteManagedWorkspace ? "managed workspace moved to trash" : "target deleted",
+              ...(trashedPath === undefined ? {} : { managedWorkspaceTrashPath: trashedPath, deletionOperationId: operationId })
+            });
+            return { accepted: true, resultCase: "target", entityId: existing.descriptor.id } satisfies OperationOutcome;
+          }
+        });
+        dependencies.workspaceService.unregister(workspaceId);
+        return presented(execution);
       });
-      dependencies.workspaceService.unregister(workspaceId);
-      return presented(execution);
     }
     case "createSession": {
+      return dependencies.targetWorkspaceRuntime.run(payload.value.targetId, async () => {
       const target = dependencies.store.getTarget(payload.value.targetId);
       if (payload.value.backendId === "" || payload.value.backendId !== target.descriptor.backendId) {
         throw invalidArgument("create_session.backend_id must match the selected Target backend");
@@ -15000,6 +15146,7 @@ async function dispatchMutation(
           connection,
           kind: payload.case,
           body: mutation,
+          precondition: (store) => validatePreconditions(store, mutation),
           commit: () => outcome,
           effect: async () => {
             const nested = await dependencies.sessionHost.deriveSession({
@@ -15021,6 +15168,7 @@ async function dispatchMutation(
         connection,
         kind: payload.case,
         body: mutation,
+        precondition: (store) => validatePreconditions(store, mutation),
         commit: () => outcome,
         effect: async () => {
           const nested = await dependencies.sessionHost.createSession({
@@ -15056,6 +15204,7 @@ async function dispatchMutation(
         }
       });
       return presented(execution);
+      });
     }
     case "resumeSession":
       return ackOperation(dependencies, operationId, connection, mutation, payload.case, () => host.resume(payload.value.sessionId).then(() => undefined));

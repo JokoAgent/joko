@@ -51,7 +51,7 @@ import { canEditVisibleUserMessage, changeSetForMessageRound, lastVisibleUserMes
 import { reconcileShareSelection, shareableTimelineMessages, toggleShareMessageSelection } from "./share-selection-behavior.js";
 import { ShareSelectionBar } from "./ShareSelectionBar.js";
 import { Timeline, type InlinePlanVisibility } from "./Timeline.js";
-import { NativeFileCopyContext } from "./NativeFileCopyMenu.js";
+import { NativeFileActionsContext } from "./NativeFileCopyMenu.js";
 import { useAppShortcut } from "../use-app-shortcut.js";
 import { useGamepadActions } from "../gamepad-actions.js";
 import { modelSourceAccess } from "../model-source-access.js";
@@ -73,6 +73,7 @@ import {
   permissionChangeSupported,
   planModeSupported
 } from "./backend-control-capabilities.js";
+import { sessionDerivationOriginRoute } from "./session-derivation-origin.js";
 
 // First-stage contracts do not expose a durable dismissal mutation. Keep this bounded and
 // client-local so route switches/remounts are stable without pretending to persist remotely.
@@ -441,15 +442,10 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
     [errorTailProjection, recoveryPresentationTimeline]
   );
   const derivationOrigin = session.derivationOrigin;
-  const derivationSourceSession = derivationOrigin === undefined
-    ? undefined
-    : controller.state.snapshot.sessions.find((candidate) => candidate.id === derivationOrigin.sourceSessionId);
-  const derivationSourceCanOpen = derivationOrigin !== undefined
-    && derivationOrigin.sourceSessionAvailable
-    && derivationSourceSession !== undefined
-    && !derivationSourceSession.archived
-    && derivationSourceSession.state !== "closed"
-    && (derivationOrigin.sourceMessageId === undefined || derivationOrigin.sourceMessageAvailable);
+  const derivationOriginNavigation = sessionDerivationOriginRoute(
+    derivationOrigin,
+    controller.state.snapshot.sessions
+  );
   const subagentTaskIds = useMemo(() => new Set(visibleTimeline.flatMap((item) => item.background === undefined ? [] : [item.background.id])), [visibleTimeline]);
   const subagentTaskKey = useMemo(() => visibleTimeline.flatMap((item) => item.background === undefined ? [] : [
     [
@@ -1675,7 +1671,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
       <ExtensionStatuses statuses={extensionStatuses} />
 
       {exportDownload.failed && <p className="danger-text" role="alert">{t("portable.exportFailed")}</p>}
-      <NativeFileCopyContext.Provider value={controller.state.ready && controller.state.connectionState === "connected" ? controller.copyArtifactFile : undefined}>
+      <NativeFileActionsContext.Provider value={controller.state.ready && controller.state.connectionState === "connected" ? { copyFile: controller.copyArtifactFile, openFile: controller.openArtifactFile, revealSource: controller.revealArtifactSource } : undefined}>
       <Timeline
         key={timelineResourceOwnerKey}
         ownerKey={`${timelineResourceOwnerKey}:${session.generation}:${controller.state.connectionState}`}
@@ -1687,12 +1683,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
         sessionActive={running}
         derivationOrigin={derivationOrigin}
         sessionCreatedAt={session.createdAt}
-        onOpenDerivationOrigin={!derivationSourceCanOpen || derivationOrigin === undefined ? undefined : () => controller.navigate({
-          kind: "session",
-          sessionId: derivationOrigin.sourceSessionId,
-          ...(derivationOrigin.sourceMessageId === undefined ? {} : { messageId: derivationOrigin.sourceMessageId }),
-          ...(derivationOrigin.sourceEventId === undefined ? {} : { messageEventId: derivationOrigin.sourceEventId })
-        })}
+        onOpenDerivationOrigin={derivationOriginNavigation === undefined ? undefined : () => controller.navigate(derivationOriginNavigation)}
         messageNavRailEnabled={controller.state.preferences.messageNavRailEnabled}
         streamFadeEnabled={controller.state.preferences.streamFadeEnabled}
         onOpenHttpLink={(url, options) => controller.openHttpLink(url, { ...options, sessionId: session.id })}
@@ -1789,7 +1780,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
           }
         }}
       />
-      </NativeFileCopyContext.Provider>
+      </NativeFileActionsContext.Provider>
       <div ref={bottomOverlayRef} className="session-bottom-overlay">
       {!reviewReadOnly && <SessionScheduleNotice
         ownerId={controller.state.activeProfile?.serverId ?? controller.state.activeProfile?.id ?? "local"}

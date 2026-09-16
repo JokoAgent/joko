@@ -76,6 +76,28 @@ CREATE TABLE backend_instance_generations (
         UNIQUE(backend_id, adapter_kind, current_generation)
       ) STRICT;
 
+CREATE TABLE artifact_sources (
+        artifact_id TEXT PRIMARY KEY REFERENCES artifacts(id) ON DELETE CASCADE,
+        session_id TEXT NOT NULL REFERENCES product_sessions(id) ON DELETE CASCADE,
+        target_id TEXT NOT NULL REFERENCES targets(id) ON DELETE RESTRICT,
+        generation INTEGER NOT NULL CHECK (generation >= 0),
+        authority_hash TEXT NOT NULL CHECK (
+          authority_hash GLOB 'sha256:*' AND length(authority_hash) = 71
+        ),
+        workspace_root TEXT NOT NULL CHECK (
+          length(workspace_root) BETWEEN 1 AND 32768
+          AND instr(workspace_root, char(0)) = 0
+        ),
+        relative_path TEXT NOT NULL CHECK (
+          length(relative_path) BETWEEN 1 AND 32768
+          AND instr(relative_path, char(0)) = 0
+          AND substr(relative_path, 1, 1) <> '/'
+          AND instr(relative_path, char(92)) = 0
+        ),
+        created_at INTEGER NOT NULL CHECK (created_at >= 0),
+        revision INTEGER NOT NULL CHECK (revision >= 1)
+      ) STRICT;
+
 CREATE TABLE backends (
         id TEXT PRIMARY KEY,
         adapter_kind TEXT NOT NULL,
@@ -188,6 +210,16 @@ CREATE TABLE events (
         namespace TEXT,
         metadata_json TEXT,
         UNIQUE(session_id, session_sequence)
+      ) STRICT;
+
+CREATE TABLE desktop_host_authorizations (
+        connection_id TEXT PRIMARY KEY REFERENCES connections(id) ON DELETE CASCADE,
+        auth_key_digest TEXT NOT NULL UNIQUE CHECK (
+          length(auth_key_digest) = 64
+          AND auth_key_digest NOT GLOB '*[^0-9a-f]*'
+        ),
+        created_at INTEGER NOT NULL CHECK (created_at >= 0),
+        revision INTEGER NOT NULL CHECK (revision >= 1)
       ) STRICT;
 
 CREATE TABLE resource_usage_evidence (

@@ -11,7 +11,7 @@ import { createPiAdapter, type PiProcessHandle, type PiProcessSpec } from "@joko
 import {
   AppServerHost as CodexAppServerHost,
   CodexBackendAdapter,
-  type CodexRemoteMcpOpenInput
+  type CodexMcpOpenInput
 } from "@joko/adapter-codex";
 import { FakeCodexAppServer } from "@joko/adapter-codex/testing";
 import * as contract from "@joko/contracts";
@@ -206,6 +206,40 @@ afterEach(async () => {
 });
 
 describe("SessionHost", () => {
+  it("publishes a fresh Task projection in its creation transaction for already-connected owners", async () => {
+    const fixture = await createFixture();
+    const observed: Array<{ readonly event: PersistedEvent; readonly visibleRevision: bigint }> = [];
+    const unsubscribe = fixture.store.subscribe((event) => {
+      if (!event.traceId.startsWith("created-session:")) return;
+      observed.push({
+        event,
+        visibleRevision: fixture.store.getSession(event.sessionId).revision
+      });
+    });
+
+    const created = await fixture.host.createSession({
+      operationId: "create-visible-to-existing-owner",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Existing owner observes this Task",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    });
+    unsubscribe();
+
+    expect(observed).toHaveLength(1);
+    expect(observed[0]).toMatchObject({
+      event: {
+        sessionId: created.value.sessionId,
+        operationId: "create-visible-to-existing-owner",
+        generation: 1,
+        payload: { type: "session_changed" }
+      }
+    });
+    expect(observed[0]!.event.revision).toBe(observed[0]!.visibleRevision);
+  });
+
   it.each([undefined, [], ["workspace_file"], ["workspace_line_range"], ["resource"], ["artifact"], ["workspace_directory", "workspace_file", "workspace_line_range", "resource", "artifact"]])(
     "gates every reference kind on explicit native mention options: %j", async (options) => {
       const adapter = new FakeBackendAdapter({
@@ -2654,6 +2688,42 @@ describe("SessionHost", () => {
 
     exportSession.mockResolvedValue({ ...artifact, id: "missing-export-artifact" });
     await expect(fixture.host.exportSession(sessionId)).rejects.toThrow("Artifact does not exist or has expired.");
+  });
+
+  it("captures only the first exact local Backend source and revalidates it on every reveal", async () => {
+    const fixture = await createFixture();
+    const createSession = fixture.adapter.createSession.bind(fixture.adapter);
+    let context!: AdapterContext;
+    vi.spyOn(fixture.adapter, "createSession").mockImplementation((input, candidate) => {
+      context = candidate;
+      return createSession(input, candidate);
+    });
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-source-reveal",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Source reveal",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const firstPath = join(fixture.directory, "first-output.txt");
+    const secondPath = join(fixture.directory, "second-output.txt");
+    writeFileSync(firstPath, "same canonical output");
+    writeFileSync(secondPath, "same canonical output");
+
+    const first = await context.storeArtifact(firstPath, { fileName: "output.txt", mimeType: "text/plain" });
+    const duplicate = await context.storeArtifact(secondPath, { fileName: "output.txt", mimeType: "text/plain" });
+    expect(duplicate.id).toBe(first.id);
+    expect(fixture.store.getArtifactSource(first.id).relativePath).toBe("first-output.txt");
+    await expect(fixture.host.resolveArtifactSource(sessionId, first.id)).resolves.toBe(firstPath);
+
+    const active = fixture.store.getSession(sessionId);
+    fixture.store.updateSession(sessionId, { archived: true }, active.revision);
+    await expect(fixture.host.resolveArtifactSource(sessionId, first.id)).resolves.toBe(firstPath);
+
+    writeFileSync(firstPath, "changed output");
+    await expect(fixture.host.resolveArtifactSource(sessionId, first.id)).rejects.toThrow(/unavailable/u);
   });
 
   it.each(["trust revoked", "trust restored", "worktree preserved"] as const)("releases staged Backend output when %s during ingestion retires its original workspace", async (change) => {
@@ -7971,6 +8041,105 @@ describe("SessionHost", () => {
     });
   });
 
+  it("rejects a Target deletion effect before workspace mutation while product-task creation is in flight", async () => {
+    const adapter = new GatedFakeAdapter();
+    const fixture = await createFixture(adapter);
+    const createGate = adapter.holdCreate();
+    const creating = fixture.host.createSession({
+      operationId: "create-before-target-delete",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Creation owns Target admission",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    });
+    await createGate.entered;
+    const workspaceEffect = vi.fn(async () => undefined);
+
+    const deletionFailure = await fixture.host.mutate({
+      operationId: "delete-target-during-create",
+      connection: fixture.connection,
+      kind: "deleteTarget",
+      body: { targetId: "target-one", deleteManagedWorkspace: true },
+      targetSessionCreationFenceId: "target-one",
+      precondition: (store) => {
+        if (store.listSessions({ targetId: "target-one", includeArchived: true, includeDeleted: true })
+          .some((session) => session.descriptor.deletedAt === undefined)) {
+          throw new InvalidStateTransitionError("Target session graph", "changed", "delete");
+        }
+      },
+      effect: workspaceEffect,
+      commit: () => ({ deleted: true })
+    }).then(() => undefined, (error: unknown) => error);
+
+    createGate.release();
+    await creating;
+    expect(deletionFailure).toBeInstanceOf(OperationPreviouslyFailedError);
+    expect(workspaceEffect).not.toHaveBeenCalled();
+    expect(fixture.store.listSessions({ targetId: "target-one" })).toHaveLength(1);
+  });
+
+  it("fences task creation through a Target deletion effect and rejects stale creation after tombstone", async () => {
+    const adapter = new GatedFakeAdapter();
+    const fixture = await createFixture(adapter);
+    const target = fixture.store.getTarget("target-one");
+    const effectGate = new AsyncGate();
+    const assertEmptyTarget = (store: OperationalStore): void => {
+      if (store.listSessions({ targetId: target.descriptor.id, includeArchived: true, includeDeleted: true })
+        .some((session) => session.descriptor.deletedAt === undefined)) {
+        throw new InvalidStateTransitionError("Target session graph", "changed", "delete");
+      }
+    };
+    const deleting = fixture.host.mutate({
+      operationId: "delete-target-fences-create",
+      connection: fixture.connection,
+      kind: "deleteTarget",
+      body: { targetId: target.descriptor.id, deleteManagedWorkspace: true },
+      targetSessionCreationFenceId: target.descriptor.id,
+      precondition: assertEmptyTarget,
+      effect: async () => {
+        effectGate.enter();
+        await effectGate.wait;
+      },
+      commit: (store) => {
+        store.upsertTarget(target.descriptor, { deletedAt: 123_456 });
+        return { deleted: true };
+      }
+    });
+    await effectGate.entered;
+
+    const concurrentFailure = await fixture.host.createSession({
+      operationId: "create-during-target-delete",
+      connection: fixture.connection,
+      targetId: target.descriptor.id,
+      title: "Must stay absent",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    }).then(() => undefined, (error: unknown) => error);
+    effectGate.release();
+    await deleting;
+
+    expect(concurrentFailure).toBeInstanceOf(StoreError);
+    expect(adapter.createCalls).toBe(0);
+    expect(fixture.store.findOperation("create-during-target-delete")).toBeUndefined();
+    await expect(fixture.host.createSession({
+      operationId: "create-after-target-delete",
+      connection: fixture.connection,
+      targetId: target.descriptor.id,
+      title: "Deleted target stays closed",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).rejects.toThrow("Deleted Targets cannot create product tasks");
+    expect(adapter.createCalls).toBe(0);
+    expect(fixture.store.findOperation("create-after-target-delete")).toMatchObject({
+      status: "failed",
+      error: { message: "Deleted Targets cannot create product tasks." }
+    });
+  });
+
   it("claims native creation before calling the adapter and never repeats a failed native effect", async () => {
     const adapter = new GatedFakeAdapter();
     const fixture = await createFixture(adapter);
@@ -10020,6 +10189,91 @@ describe("SessionHost", () => {
     await eventually(() => store.getRun(child!.descriptor.id).descriptor.state === "completed");
   });
 
+  it("commits a local Codex Session before binding its standard MCP route for the durable first turn", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "joko-local-codex-mcp-host-"));
+    const store = new OperationalStore(join(directory, "store.db"));
+    const repository = new OperationalArtifactRepository(store);
+    const artifacts = new ArtifactStore({ rootDirectory: join(directory, "artifacts"), repository, ingestRoots: [directory] });
+    await artifacts.initialize();
+    const fake = new FakeCodexAppServer();
+    fake.reviewConfig = { mcp_servers: { docs: { command: "private-docs-command" } } };
+    fake.reviewMcpStatuses.push({ name: "docs", authStatus: "unsupported", resourceTemplates: [], resources: [], tools: {} });
+    const nativeHost = new CodexAppServerHost({ transportFactory: () => fake.createTransport() });
+    const opened: CodexMcpOpenInput[] = [];
+    const adapter = new CodexBackendAdapter({
+      id: "codex-local-mounted", instanceGeneration: 7, host: nativeHost, profileDirectory: directory,
+      localMcpBridge: async (input) => {
+        expect(store.getSession(input.sessionId).descriptor.binding).toMatchObject({ generation: input.generation });
+        opened.push(input);
+        return {
+          routes: [{ serverId: "tools", name: "joko_local_product_tools", url: "http://127.0.0.1:4100/private-local" }],
+          assertCurrent: input.assertSessionCurrent,
+          release: async () => undefined
+        };
+      }
+    });
+    const descriptor = await adapter.describe();
+    const host = new SessionHost(store, artifacts, [adapter], { backendDescriptors: [descriptor] });
+    cleanups.push(async () => {
+      await host.dispose().catch(() => undefined);
+      await adapter.dispose().catch(() => undefined);
+      await nativeHost.shutdown().catch(() => undefined);
+      store.close();
+      rmSync(directory, { recursive: true, force: true });
+    });
+    await host.initialize();
+    await host.registerTarget({
+      id: "local-codex-target", backendId: adapter.id, displayName: "Local Codex",
+      workspaceRoot: directory, managed: false, trusted: true
+    });
+    const connection = store.createConnection({ id: "local-codex-connection", name: "Local device", authKeyDigest: "digest" });
+    const sessionId = (await host.createSession({
+      operationId: "create-local-codex-mcp", connection, targetId: "local-codex-target",
+      title: "Local Codex task", providerId: "openai", modelId: "gpt-test",
+      fastMode: false, permissionMode: "ask", planMode: false
+    })).value.sessionId;
+    expect(opened).toHaveLength(0);
+    expect(fake.transport!.requests.find((request) => request.method === "thread/start")?.params)
+      .toMatchObject({ config: { "mcp_servers.docs.enabled": false, "features.apps": false } });
+    const queued = host.enqueueInput({
+      operationId: "send-local-codex-mcp", connection, sessionId,
+      prompt: { text: "Use a local tool", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    await eventually(() => store.getQueueItem(queued.value.queueItemId).state === "backend_accepted");
+    expect(opened).toHaveLength(1);
+    expect(opened[0]).toMatchObject({ sessionId, targetId: "local-codex-target", generation: 1,
+      threadId: store.getSession(sessionId).descriptor.binding.nativeSessionId });
+    expect(fake.transport!.requests.findLast((request) => request.method === "thread/resume")?.params)
+      .toMatchObject({ config: {
+        "mcp_servers.docs.enabled": false,
+        "mcp_servers.joko_local_product_tools.enabled": true,
+        "mcp_servers.joko_local_product_tools.url": "http://127.0.0.1:4100/private-local"
+      } });
+    await fake.completeTurn(store.getSession(sessionId).descriptor.binding.nativeSessionId!);
+    await eventually(() => store.getRun(queued.value.runId).descriptor.state === "completed");
+
+    const importedNativeId = fake.seedThread(directory);
+    const nativeReference = (await adapter.listNativeSessions(store.getTarget("local-codex-target").descriptor))
+      .find((candidate) => candidate.nativeSessionId === importedNativeId)!.nativeReference;
+    const importedSessionId = (await host.createSession({
+      operationId: "attach-local-codex-mcp", connection, targetId: "local-codex-target",
+      title: "Imported local Codex task", fastMode: false, permissionMode: "ask", planMode: false,
+      nativeStart: { kind: "attach", nativeReference }
+    })).value.sessionId;
+    expect(opened).toHaveLength(1);
+    expect(fake.transport!.requests.findLast((request) => request.method === "thread/resume")?.params)
+      .toMatchObject({ threadId: importedNativeId, config: { "mcp_servers.docs.enabled": false } });
+    const importedQueued = host.enqueueInput({
+      operationId: "send-imported-local-codex-mcp", connection, sessionId: importedSessionId,
+      prompt: { text: "Use an imported tool", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    await eventually(() => store.getQueueItem(importedQueued.value.queueItemId).state === "backend_accepted");
+    expect(opened).toHaveLength(2);
+    expect(opened[1]).toMatchObject({ sessionId: importedSessionId, threadId: importedNativeId });
+    await fake.completeTurn(importedNativeId);
+    await eventually(() => store.getRun(importedQueued.value.runId).descriptor.state === "completed");
+  });
+
   it("reconciles remote Codex text acceptance and terminal receipts with the durable Queue, Run, Attempt, and Operation", async () => {
     const directory = mkdtempSync(join(tmpdir(), "joko-remote-codex-dispatch-host-"));
     const store = new OperationalStore(join(directory, "store.db"));
@@ -10035,7 +10289,7 @@ describe("SessionHost", () => {
     const localNativeHost = new CodexAppServerHost({ transportFactory: () => localFake.createTransport() });
     const remoteNativeHost = new CodexAppServerHost({ transportFactory: () => remoteFake.createTransport() });
     let authorityCurrent = true;
-    let remoteMcpInput: CodexRemoteMcpOpenInput | undefined;
+    let remoteMcpInput: CodexMcpOpenInput | undefined;
     let remoteMcpRetired = false;
     const releaseRemoteMcp = vi.fn(async () => { remoteMcpRetired = true; });
     const adapter = new CodexBackendAdapter({

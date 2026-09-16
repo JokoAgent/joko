@@ -8,6 +8,9 @@ import { pipeline } from "node:stream/promises";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import * as nativeSdk from "@anthropic-ai/claude-agent-sdk";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv";
 import { z } from "zod";
 
 const PROTOCOL_VERSION = 1;
@@ -23,6 +26,7 @@ const MAX_TERMINAL_QUERIES = 128;
 const MAX_CALLBACKS_PER_CONNECTION = 256;
 const CALLBACK_TIMEOUT_MS = 30 * 60_000;
 const MAX_HOOK_PAYLOAD_BYTES = 1024 * 1024;
+const MAX_MCP_PAYLOAD_BYTES = 24 * 1024 * 1024;
 const MANAGED_AGENT_SERVER = "joko_managed_subagent";
 const MANAGED_AGENT_TOOL = "delegate";
 const MANAGED_AGENT_TOOL_NAME = `mcp__${MANAGED_AGENT_SERVER}__${MANAGED_AGENT_TOOL}`;
@@ -575,6 +579,8 @@ function queryOptions(value, query) {
       ? createManagedAgentServer(query)
       : invalid();
   const mcpServers = value.mcpServers === undefined ? {} : emptyRecord(value.mcpServers, "MCP servers");
+  const productMcpServers = createProductMcpServers(value.productMcpTools, query);
+  for (const [name, server] of Object.entries(productMcpServers)) mcpServers[name] = server;
   if (managedAgentServer !== undefined) mcpServers[MANAGED_AGENT_SERVER] = managedAgentServer;
   const options = {
     abortController: query.abortController,
@@ -632,6 +638,90 @@ function queryOptions(value, query) {
   };
   if (options.additionalDirectories.length > 0) throw fault("remote_extra_directories_unsupported", false);
   return options;
+}
+
+function createProductMcpServers(value, query) {
+  if (value === undefined) return {};
+  if (!Array.isArray(value) || value.length > 10_000 || jsonBytes(value) > MAX_MCP_PAYLOAD_BYTES) {
+    throw fault("mcp_catalog_invalid", false);
+  }
+  const groups = new Map();
+  const identities = new Set();
+  for (const item of value) {
+    if (!record(item) || !Object.keys(item).every((key) =>
+      ["serverId", "name", "description", "inputSchema", "outputSchema"].includes(key))) {
+      throw fault("mcp_catalog_invalid", false);
+    }
+    const serverId = boundedString(item.serverId, "MCP server", 512);
+    const name = boundedString(item.name, "MCP tool", 512);
+    const description = item.description;
+    if (typeof description !== "string" || Buffer.byteLength(description, "utf8") > 16_384
+      || /[\x00-\x1f\x7f]/u.test(description)
+      || !record(item.inputSchema)
+      || jsonBytes(item.inputSchema) > 1024 * 1024
+      || (item.outputSchema !== undefined && (!record(item.outputSchema)
+        || item.outputSchema.type !== "object" || jsonBytes(item.outputSchema) > 1024 * 1024))) {
+      throw fault("mcp_catalog_invalid", false);
+    }
+    const identity = `${serverId}\0${name}`;
+    if (identities.has(identity)) throw fault("mcp_catalog_invalid", false);
+    identities.add(identity);
+    const group = groups.get(serverId) ?? [];
+    group.push({ serverId, name, description, inputSchema: item.inputSchema, outputSchema: item.outputSchema });
+    groups.set(serverId, group);
+  }
+  const servers = Object.create(null);
+  const validator = new AjvJsonSchemaValidator();
+  for (const [serverId, entries] of groups) {
+    const name = `joko_${createHash("sha256").update(serverId).digest("hex").slice(0, 24)}`;
+    if (name === MANAGED_AGENT_SERVER || Object.hasOwn(servers, name)) throw fault("mcp_catalog_invalid", false);
+    const instance = new McpServer({ name, version: "1.0.0" });
+    for (const tool of entries) {
+      let checkInput;
+      let checkOutput;
+      try {
+        checkInput = validator.getValidator(tool.inputSchema);
+        checkOutput = tool.outputSchema === undefined ? undefined : validator.getValidator(tool.outputSchema);
+      } catch { throw fault("mcp_catalog_invalid", false); }
+      instance.registerTool(tool.name, {
+        description: tool.description,
+        inputSchema: z.object({}).passthrough(),
+        ...(checkOutput === undefined ? {} : { outputSchema: z.object({}).passthrough() })
+      }, async (args, extra) => {
+        const toolUseId = record(extra?._meta) ? extra._meta["claudecode/toolUseId"] : undefined;
+        if (typeof toolUseId !== "string" || toolUseId.length === 0 || toolUseId.length > 512
+          || /[\x00-\x1f\x7f]/u.test(toolUseId) || !(extra.signal instanceof AbortSignal)
+          || !checkInput(args).valid || jsonBytes(args) > MAX_MCP_PAYLOAD_BYTES) {
+          throw fault("mcp_callback_invalid", false);
+        }
+        const result = await query.connection?.callback(query, "productMcpTool", {
+          serverId, name: tool.name, arguments: args, toolUseId
+        }, extra.signal);
+        if (!record(result) || !Array.isArray(result.content) || typeof result.isError !== "boolean"
+          || (result.structuredContent !== undefined && !record(result.structuredContent))
+          || jsonBytes(result) > MAX_MCP_PAYLOAD_BYTES
+          || (!result.isError && checkOutput !== undefined && !checkOutput(result.structuredContent).valid)) {
+          throw fault("mcp_callback_invalid", false);
+        }
+        return {
+          content: result.content,
+          isError: result.isError,
+          ...(result.structuredContent === undefined ? {} : { structuredContent: result.structuredContent }),
+          ...(result.bridgeMetadata === undefined ? {} : { _meta: { jokoMcpBridge: result.bridgeMetadata } })
+        };
+      });
+    }
+    instance.server.setRequestHandler(ListToolsRequestSchema, async () => ({
+      tools: entries.map((tool) => ({
+        name: tool.name,
+        description: tool.description,
+        inputSchema: tool.inputSchema,
+        ...(tool.outputSchema === undefined ? {} : { outputSchema: tool.outputSchema })
+      }))
+    }));
+    servers[name] = { type: "sdk", name, instance };
+  }
+  return servers;
 }
 
 function createManagedAgentServer(query) {

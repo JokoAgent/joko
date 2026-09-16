@@ -45,9 +45,14 @@ import type {
   DesktopSaveFileRequest,
   DesktopCopyFileRequest,
   DesktopCopyFileResult,
+  DesktopOpenFileRequest,
+  DesktopOpenFileResult,
+  DesktopRevealArtifactSourceRequest,
+  DesktopRevealArtifactSourceResult,
   DesktopRuntimeProcessMonitorOpenResult,
   DesktopSessionDragPreviewRequest,
   DesktopSessionWindowDropResult,
+  DesktopSessionWindowOwner,
   DesktopSessionWindowOpenResult,
   DesktopUpdateAutoRelaunchSettings,
   DesktopUpdateCheckResult,
@@ -71,6 +76,7 @@ const DESKTOP_CHANNELS = {
   windowSetZoomFactor: "joko:window:set-zoom-factor",
   windowClose: "joko:window:close",
   sessionWindowOpen: "joko:session-window:open",
+  sessionWindowGetOwner: "joko:session-window:owner:get",
   extensionWindowOpen: "joko:extension-window:open",
   extensionLibraryPickLocation: "joko:extension-library:pick-location",
   extensionLibraryReveal: "joko:extension-library:reveal",
@@ -149,6 +155,10 @@ const DESKTOP_CHANNELS = {
   saveFile: "joko:files:save",
   copyFile: "joko:files:copy",
   cancelFileCopy: "joko:files:copy-cancel",
+  openFile: "joko:files:open",
+  cancelFileOpen: "joko:files:open-cancel",
+  revealArtifactSource: "joko:files:reveal-artifact-source",
+  cancelArtifactSourceReveal: "joko:files:reveal-artifact-source-cancel",
   credentialGet: "joko:credential:get",
   credentialSet: "joko:credential:set",
   credentialDelete: "joko:credential:delete",
@@ -188,6 +198,8 @@ const desktopCapabilities = Object.freeze([
   "application.menu",
   "inspector.detach",
   ...((process.platform === "win32" || process.platform === "darwin") ? ["files.copy" as const] : []),
+  "files.open",
+  "files.revealSource",
   "layout.reset",
   ...((process.platform === "win32" || process.platform === "linux") ? ["window.mainCloseBehavior" as const] : []),
   "microphone.lifecycle",
@@ -220,10 +232,12 @@ const desktopApi = Object.freeze({
     close: (): Promise<void> => ipcRenderer.invoke(DESKTOP_CHANNELS.windowClose)
   }),
   sessionWindows: Object.freeze({
-    open: (sessionId: string): Promise<DesktopSessionWindowOpenResult> => {
-      if (!isDesktopNotificationSessionId(sessionId)) return Promise.reject(new TypeError("Task identity is invalid."));
-      return ipcRenderer.invoke(DESKTOP_CHANNELS.sessionWindowOpen, sessionId).then(parseDesktopSessionWindowOpenResult);
+    open: (owner: DesktopSessionWindowOwner): Promise<DesktopSessionWindowOpenResult> => {
+      if (!isDesktopSessionWindowOwner(owner)) return Promise.reject(new TypeError("Task window owner is invalid."));
+      return ipcRenderer.invoke(DESKTOP_CHANNELS.sessionWindowOpen, owner).then(parseDesktopSessionWindowOpenResult);
     },
+    getOwner: (): Promise<DesktopSessionWindowOwner> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.sessionWindowGetOwner).then(parseDesktopSessionWindowOwner),
     beginDragPreview: (request: DesktopSessionDragPreviewRequest): Promise<boolean> => {
       if (!isDesktopSessionDragPreviewRequest(request)) {
         return Promise.reject(new TypeError("Task drag preview request is invalid."));
@@ -614,12 +628,34 @@ const desktopApi = Object.freeze({
     return ipcRenderer.invoke(DESKTOP_CHANNELS.saveFile, request).then(parseDesktopBoolean);
   },
   copyFile: (request: DesktopCopyFileRequest): Promise<DesktopCopyFileResult> => {
-    if (typeof request !== "object" || request === null || Object.keys(request).sort().join(",") !== "file,requestId" || !isFileCopyId(request.requestId) || !isDesktopSaveFileRequest(request.file)) return Promise.reject(new TypeError("The file copy request is invalid."));
+    if (typeof request !== "object" || request === null || Object.keys(request).sort().join(",") !== "file,requestId" || !isNativeFileActionId(request.requestId) || !isDesktopSaveFileRequest(request.file)) return Promise.reject(new TypeError("The file copy request is invalid."));
     return ipcRenderer.invoke(DESKTOP_CHANNELS.copyFile, request).then(parseFileCopyResult);
   },
   cancelFileCopy: (requestId: string): Promise<void> => {
-    if (!isFileCopyId(requestId)) return Promise.reject(new TypeError("The file copy identity is invalid."));
+    if (!isNativeFileActionId(requestId)) return Promise.reject(new TypeError("The file copy identity is invalid."));
     return ipcRenderer.invoke(DESKTOP_CHANNELS.cancelFileCopy, requestId).then(() => undefined);
+  },
+  openFile: (request: DesktopOpenFileRequest): Promise<DesktopOpenFileResult> => {
+    if (typeof request !== "object" || request === null || Object.keys(request).sort().join(",") !== "file,requestId" || !isNativeFileActionId(request.requestId) || !isDesktopSaveFileRequest(request.file)) return Promise.reject(new TypeError("The file open request is invalid."));
+    return ipcRenderer.invoke(DESKTOP_CHANNELS.openFile, request).then(parseFileOpenResult);
+  },
+  cancelFileOpen: (requestId: string): Promise<void> => {
+    if (!isNativeFileActionId(requestId)) return Promise.reject(new TypeError("The file open identity is invalid."));
+    return ipcRenderer.invoke(DESKTOP_CHANNELS.cancelFileOpen, requestId).then(() => undefined);
+  },
+  revealArtifactSource: (
+    request: DesktopRevealArtifactSourceRequest
+  ): Promise<DesktopRevealArtifactSourceResult> => {
+    if (!isDesktopRevealArtifactSourceRequest(request)) {
+      return Promise.reject(new TypeError("The Artifact source reveal request is invalid."));
+    }
+    return ipcRenderer.invoke(DESKTOP_CHANNELS.revealArtifactSource, request).then(parseArtifactSourceRevealResult);
+  },
+  cancelArtifactSourceReveal: (requestId: string): Promise<void> => {
+    if (!isNativeFileActionId(requestId)) {
+      return Promise.reject(new TypeError("The Artifact source reveal identity is invalid."));
+    }
+    return ipcRenderer.invoke(DESKTOP_CHANNELS.cancelArtifactSourceReveal, requestId).then(() => undefined);
   },
   discovery: Object.freeze({
     scan: (): Promise<readonly DesktopDiscoveredNode[]> => ipcRenderer.invoke(DESKTOP_CHANNELS.discoveryScan)
@@ -712,6 +748,12 @@ function isDesktopNotificationSessionId(value: unknown): value is string {
     value.trim() === value && !/[\u0000-\u001f\u007f]/u.test(value);
 }
 
+function isDesktopSessionWindowOwner(value: unknown): value is DesktopSessionWindowOwner {
+  return nativeRecord(value) && nativeKeys(value) === "profileId,sessionId"
+    && isDesktopNotificationSessionId(value["profileId"])
+    && isDesktopNotificationSessionId(value["sessionId"]);
+}
+
 function isDesktopExtensionId(value: unknown): value is string {
   return typeof value === "string" && /^extension_[a-f0-9]{32}$/u.test(value);
 }
@@ -756,8 +798,9 @@ function isDesktopSessionDragGestureId(value: unknown): value is string {
 }
 
 function isDesktopSessionDragPreviewRequest(value: unknown): value is DesktopSessionDragPreviewRequest {
-  if (!nativeRecord(value) || nativeKeys(value) !== "gestureId,hint,label,palette,sessionId" ||
+  if (!nativeRecord(value) || nativeKeys(value) !== "gestureId,hint,label,palette,profileId,sessionId" ||
     !isDesktopSessionDragGestureId(value["gestureId"]) || !nativeDragText(value["sessionId"], 256) ||
+    !nativeDragText(value["profileId"], 256) ||
     !nativeDragText(value["label"], 160) || !nativeDragText(value["hint"], 160)) return false;
   const palette = value["palette"];
   return nativeRecord(palette) && nativeKeys(palette) === "accent,border,muted,surface,text" &&
@@ -1142,6 +1185,11 @@ function parseDesktopMainWindowCloseSettings(value: unknown): DesktopMainWindowC
   return Object.freeze({ behavior: entry["behavior"] as DesktopMainWindowCloseSettings["behavior"], revision: entry["revision"] as number });
 }
 
+function parseDesktopSessionWindowOwner(value: unknown): DesktopSessionWindowOwner {
+  if (!isDesktopSessionWindowOwner(value)) throw new TypeError("Task window owner result is invalid.");
+  return Object.freeze({ profileId: value.profileId, sessionId: value.sessionId });
+}
+
 function parseDesktopExtensionWindowOpenResult(value: unknown): DesktopExtensionWindowOpenResult {
   if (typeof value !== "object" || value === null || Array.isArray(value) ||
     Object.keys(value).join(",") !== "focusedExisting" ||
@@ -1283,7 +1331,7 @@ function parseDesktopBoolean(value: unknown): boolean {
   return value;
 }
 
-function isFileCopyId(value: unknown): value is string {
+function isNativeFileActionId(value: unknown): value is string {
   return typeof value === "string" && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/u.test(value);
 }
 
@@ -1293,6 +1341,47 @@ function parseFileCopyResult(value: unknown): DesktopCopyFileResult {
   if (result["status"] === "copied" || result["status"] === "cancelled" || result["status"] === "unknown" || result["status"] === "unavailable" || result["status"] === "blocked") return { status: result["status"] };
   if (result["status"] === "failed" && (result["reason"] === "capacity" || result["reason"] === "storage" || result["reason"] === "helper")) return { status: "failed", reason: result["reason"] };
   throw new TypeError("Invalid file copy result.");
+}
+
+function parseFileOpenResult(value: unknown): DesktopOpenFileResult {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new TypeError("Invalid file open result.");
+  const result = value as Record<string, unknown>;
+  const keys = Object.keys(result).sort().join(",");
+  if (keys === "status" && (result["status"] === "opened" || result["status"] === "cancelled" || result["status"] === "unknown" || result["status"] === "unavailable")) return { status: result["status"] };
+  if (keys === "reason,status" && result["status"] === "failed" && (result["reason"] === "capacity" || result["reason"] === "storage" || result["reason"] === "open")) return { status: "failed", reason: result["reason"] };
+  throw new TypeError("Invalid file open result.");
+}
+
+function isDesktopRevealArtifactSourceRequest(value: unknown): value is DesktopRevealArtifactSourceRequest {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const request = value as Record<string, unknown>;
+  return Object.keys(request).sort().join(",") === "artifactId,profileId,requestId,serverId,sessionId" &&
+    isNativeFileActionId(request["requestId"]) &&
+    isOpaqueFileActionIdentity(request["profileId"]) &&
+    isOpaqueFileActionIdentity(request["serverId"]) &&
+    isOpaqueFileActionIdentity(request["sessionId"]) &&
+    isOpaqueFileActionIdentity(request["artifactId"]);
+}
+
+function isOpaqueFileActionIdentity(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/u.test(value);
+}
+
+function parseArtifactSourceRevealResult(value: unknown): DesktopRevealArtifactSourceResult {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new TypeError("Invalid Artifact source reveal result.");
+  }
+  const result = value as Record<string, unknown>;
+  const keys = Object.keys(result).sort().join(",");
+  if (keys === "status" && (result["status"] === "revealed" || result["status"] === "cancelled" ||
+    result["status"] === "unknown" || result["status"] === "unavailable")) {
+    return { status: result["status"] };
+  }
+  if (keys === "reason,status" && result["status"] === "failed" &&
+    (result["reason"] === "capacity" || result["reason"] === "reveal")) {
+    return { status: "failed", reason: result["reason"] };
+  }
+  throw new TypeError("Invalid Artifact source reveal result.");
 }
 
 function isDesktopUpdateStatus(value: unknown): value is DesktopUpdateStatus {

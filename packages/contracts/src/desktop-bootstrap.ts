@@ -4,6 +4,7 @@ export const DESKTOP_BOOTSTRAP_PROTOCOL_VERSION = 1 as const;
 export const DESKTOP_BOOTSTRAP_MAX_TTL_MS = 30_000;
 export const DESKTOP_BOOTSTRAP_DEFAULT_TTL_MS = 15_000;
 export const DESKTOP_BOOTSTRAP_MAX_FRAME_BYTES = 16 * 1024;
+export const DESKTOP_HOST_AUTHORIZATION_HEADER = "x-joko-desktop-host-authorization";
 
 const REQUEST_KIND = "joko.desktop.bootstrap.request" as const;
 const RESPONSE_KIND = "joko.desktop.bootstrap.response" as const;
@@ -76,6 +77,8 @@ export interface TrustedDesktopConnectionInput {
   readonly appVersion: string;
   readonly previousConnectionId?: string;
   readonly previousAuthKey?: string;
+  /** Domain-separated authority delivered only over the private bootstrap. */
+  readonly desktopHostAuthKey?: string;
 }
 
 export interface TrustedDesktopConnectionResult {
@@ -212,12 +215,14 @@ export class DesktopBootstrapGrant {
       this.#previousAuthKey = undefined;
       let result: TrustedDesktopConnectionResult;
       try {
+        const desktopHostAuthKey = deriveDesktopHostAuthorizationKeyFromCapability(capability, this.request);
         result = input.issueConnection({
           desktopInstanceId: this.request.instanceId,
           desktopDeviceId: this.request.deviceId,
           deviceName: this.request.deviceName,
           platform: this.request.platform,
           appVersion: this.request.appVersion,
+          desktopHostAuthKey,
           ...(this.request.previousConnectionId === null || previousAuthKey === undefined ? {} : {
             previousConnectionId: this.request.previousConnectionId,
             previousAuthKey: previousAuthKey.toString("base64url")
@@ -330,6 +335,21 @@ export function verifyDesktopBootstrapResponse(
     capability.fill(0);
   }
   return response;
+}
+
+/**
+ * Derive the volatile Desktop-host authority shared by the two ends of the
+ * private bootstrap pipe. It is intentionally absent from all bootstrap
+ * frames, argv, environment variables, durable metadata, and renderer APIs.
+ */
+export function deriveDesktopHostAuthorizationKey(requestValue: unknown): string {
+  const request = parseDesktopBootstrapRequest(requestValue);
+  const capability = decodeCapability(request.capability);
+  try {
+    return deriveDesktopHostAuthorizationKeyFromCapability(capability, request);
+  } finally {
+    capability.fill(0);
+  }
 }
 
 /** Create the parent commit only after credential and metadata persistence. */
@@ -650,6 +670,20 @@ function deriveCommitKey(capability: Uint8Array, responseProof: string): Buffer 
     .update("joko.desktop.bootstrap.commit\0", "utf8")
     .update(responseProof, "utf8")
     .digest();
+}
+
+function deriveDesktopHostAuthorizationKeyFromCapability(
+  capability: Uint8Array,
+  request: Pick<DesktopBootstrapRequest, "instanceId" | "deviceId" | "parentPid">
+): string {
+  return createHmac("sha256", capability)
+    .update("joko.desktop.host.authorization\0", "utf8")
+    .update(request.instanceId, "utf8")
+    .update("\0", "utf8")
+    .update(request.deviceId, "utf8")
+    .update("\0", "utf8")
+    .update(String(request.parentPid), "utf8")
+    .digest("base64url");
 }
 
 function createCommitProof(

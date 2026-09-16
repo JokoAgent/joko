@@ -24,6 +24,7 @@ export interface TrustedDesktopConnectionInput {
   readonly appVersion: string;
   readonly previousConnectionId?: string;
   readonly previousAuthKey?: string;
+  readonly desktopHostAuthKey?: string;
 }
 
 interface DesktopBootstrapMarker {
@@ -232,6 +233,9 @@ export class ConnectionManager {
     const platform = boundedDesktopText(input.platform, 64, "Desktop platform");
     const appVersion = boundedDesktopText(input.appVersion, 64, "Desktop app version");
     const connectionId = `desktop-connection_${instanceId}`;
+    const desktopHostAuthKey = input.desktopHostAuthKey === undefined
+      ? undefined
+      : boundedDesktopHostAuthKey(input.desktopHostAuthKey);
     const hasPreviousId = input.previousConnectionId !== undefined;
     const hasPreviousKey = input.previousAuthKey !== undefined;
     if (hasPreviousId !== hasPreviousKey) {
@@ -326,6 +330,13 @@ export class ConnectionManager {
         authKeyDigest: digestAuthKey(authKey),
         pairedAt: this.#now()
       });
+      if (desktopHostAuthKey !== undefined) {
+        store.putDesktopHostAuthorization({
+          connectionId: created.id,
+          authKeyDigest: digestAuthKey(desktopHostAuthKey),
+          createdAt: this.#now()
+        });
+      }
       store.setSetting<DesktopBootstrapMarker>(
         "service",
         "orchestrator",
@@ -407,6 +418,36 @@ export class ConnectionManager {
       return this.#store.authorizeConnection(connection.id, connection.authKeyDigest);
     } catch {
       throw new ConnectionAuthenticationError("AUTH_REVOKED", "The connection credential is invalid or revoked.");
+    }
+  }
+
+  /**
+   * Authenticate a Main-process-only capability in addition to the normal
+   * revocable bearer. A committed managed Desktop marker and active Desktop
+   * Device are rechecked on every use.
+   */
+  authenticateDesktopHost(
+    connection: Pick<ConnectionRecord, "id" | "authKeyDigest">,
+    authorization: string | undefined
+  ): ConnectionRecord {
+    const token = parseBearer(authorization);
+    if (token === undefined) throw managedDesktopHostAuthorizationUnavailable();
+    try {
+      const current = this.fence(connection);
+      const device = this.#store.getDevice(current.deviceId);
+      const marker = readDesktopBootstrapMarker(this.#store.findSetting(
+        "service", "orchestrator", desktopBootstrapSettingKey(current.deviceId)
+      )?.value);
+      const host = this.#store.findDesktopHostAuthorization(current.id);
+      if (device.kind !== "desktop" || device.state !== "active" || marker?.state !== "committed" ||
+        marker.connectionId !== current.id || host === undefined ||
+        !safeEqual(host.authKeyDigest, digestAuthKey(token))) {
+        throw managedDesktopHostAuthorizationUnavailable();
+      }
+      return current;
+    } catch (error) {
+      if (error instanceof ConnectionAuthenticationError) throw error;
+      throw managedDesktopHostAuthorizationUnavailable();
     }
   }
 
@@ -544,6 +585,13 @@ function boundedDesktopText(value: string, maximumLength: number, label: string)
   return normalized;
 }
 
+function boundedDesktopHostAuthKey(value: string): string {
+  if (!/^[A-Za-z0-9_-]{43}$/u.test(value)) {
+    throw new Error("Desktop host authorization is invalid.");
+  }
+  return value;
+}
+
 function desktopBootstrapSettingKey(deviceId: string): string {
   return `${DESKTOP_BOOTSTRAP_SETTING_PREFIX}${deviceId}`;
 }
@@ -564,4 +612,8 @@ function readDesktopBootstrapMarker(value: unknown): DesktopBootstrapMarker | un
 
 function managedDesktopAuthorizationUnavailable(): ConnectionAuthenticationError {
   return new ConnectionAuthenticationError("AUTH_REVOKED", "Managed Desktop authorization is unavailable.");
+}
+
+function managedDesktopHostAuthorizationUnavailable(): ConnectionAuthenticationError {
+  return new ConnectionAuthenticationError("AUTH_REVOKED", "Desktop host authorization is unavailable.");
 }

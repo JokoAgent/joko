@@ -38,6 +38,7 @@ vi.mock("./ComposerRichTextEditor.js", () => ({
       focus: () => elementRef.current?.focus(),
       focusFromBlankSurface: () => elementRef.current?.focus(),
       insertRouteReference: vi.fn(),
+      routeReferenceDrop: vi.fn(() => true),
       editPastedText: vi.fn()
     }));
     return <div
@@ -136,6 +137,7 @@ async function renderPage(
     },
     readNewSessionDraft: vi.fn(async () => draft()),
     saveNewSessionDraft: vi.fn(async () => undefined),
+    prepareTargetWorkspace: vi.fn(async () => undefined),
     probeTargetWorktree: vi.fn(async (targetId: string) => ({ targetId, eligibility: "unavailable", canRefreshRemote: false })),
     listTargetWorktreeSources: vi.fn(async () => []),
     listWorkspaceFiles: vi.fn(listWorkspaceFiles),

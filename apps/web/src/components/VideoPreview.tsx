@@ -114,7 +114,7 @@ function VideoLightbox({ src, labels, trigger, onClose, onError, actions }: {
     const onKeyDown = (event: KeyboardEvent): void => {
       if (event.isComposing || event.defaultPrevented) return;
       if (event.key === "Escape") {
-        if (ownerDocument.querySelector(".native-file-copy details[open]") !== null) return;
+        if (dialog.querySelector(".native-file-actions details[open]") !== null) return;
         if (ownerDocument.fullscreenElement) return;
         event.preventDefault();
         event.stopImmediatePropagation();

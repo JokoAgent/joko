@@ -13,6 +13,8 @@ import { readVoiceInputPreferences } from "../voice-input-preferences.js";
 import {
   emptySnapshot,
   type AppSnapshot,
+  type BrowserCommentDraftItem,
+  type ConnectionProfile,
   type ComposerDraft,
   type ComposerInlineMentionRange,
   type ComposerMentionDraft,
@@ -21,6 +23,8 @@ import {
   type ModelView,
   type ProviderRuntimeView,
   type SessionView,
+  type TargetWorktreeProbeView,
+  type WorktreeSourceView,
   type VoiceInputDictionaryAdviceView
 } from "../model.js";
 import type { DelayedNewSessionDraft } from "../new-session-flow.js";
@@ -56,6 +60,7 @@ vi.mock("./ComposerRichTextEditor.js", () => ({
       focus: vi.fn(),
       focusFromBlankSurface: vi.fn(),
       insertRouteReference: vi.fn(),
+      routeReferenceDrop: vi.fn(() => true),
       insertText: vi.fn(),
       editPastedText: vi.fn()
     }));
@@ -72,6 +77,10 @@ beforeEach(() => {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => window.setTimeout(() => callback(0), 0));
   vi.stubGlobal("cancelAnimationFrame", (id: number) => window.clearTimeout(id));
+  Object.defineProperties(URL, {
+    createObjectURL: { configurable: true, value: vi.fn((file: File) => `blob:${file.name}`) },
+    revokeObjectURL: { configurable: true, value: vi.fn() }
+  });
   latestEditorProps = undefined;
   renderVoiceSelection = false;
   voiceCaptures.length = 0;
@@ -90,6 +99,152 @@ afterEach(async () => {
 });
 
 describe("new-task native draft recovery", () => {
+  it("preserves an unavailable draft project and retries its exact workspace without losing input", async () => {
+    const prepareWorkspace = vi.fn()
+      .mockRejectedValueOnce(new Error("Directory missing"))
+      .mockResolvedValueOnce(undefined);
+    const api = controller({
+      discover: async () => [],
+      draft: freshWorktreeDraft(false),
+      prepareWorkspace
+    });
+    const onSubmit = vi.fn(async () => undefined);
+    const { container } = await renderPage(api, onSubmit);
+    await flush();
+
+    expect(targetSelect(container).value).toBe("target:target-1");
+    expect(composerDocumentPlainText(required(latestEditorProps?.document))).toBe("Continue this task");
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("Directory missing");
+    expect(sendButton(container).disabled).toBe(true);
+    expect(prepareWorkspace).toHaveBeenCalledExactlyOnceWith("target-1", 1n, expect.any(AbortSignal));
+
+    await act(async () => buttonWithText(container, "common.retry").click());
+    await flush();
+    expect(prepareWorkspace).toHaveBeenCalledTimes(2);
+    expect(sendButton(container).disabled).toBe(false);
+    expect(composerDocumentPlainText(required(latestEditorProps?.document))).toBe("Continue this task");
+    await act(async () => sendButton(container).click());
+    expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({
+      selection: { kind: "target", targetId: "target-1" },
+      expectedTargetRevision: 1n
+    }), expect.anything(), expect.anything());
+  });
+
+  it("keeps a missing explicit Target selected and retires an old workspace check when a distinct remote Target is chosen", async () => {
+    const oldPreparation = deferred<void>();
+    const preparationSignals = new Map<string, AbortSignal>();
+    const prepareWorkspace = vi.fn((targetId: string, _expectedRevision: bigint, signal: AbortSignal) => {
+      preparationSignals.set(targetId, signal);
+      return targetId === "target-1" ? oldPreparation.promise : Promise.resolve();
+    });
+    const base = snapshot();
+    const remoteTarget = {
+      ...base.targets[1]!,
+      name: "Project",
+      remoteWorkspace: { hostId: "build-host", workspaceRoot: "/srv/project" }
+    };
+    const remoteWorkspace = { ...base.workspaces[1]!, name: "Project", serverPath: "/srv/project" };
+    const snapshotValue = { ...base, targets: [base.targets[0]!, remoteTarget], workspaces: [base.workspaces[0]!, remoteWorkspace] };
+    const missingDraft = { ...freshWorktreeDraft(false), selection: { kind: "target" as const, targetId: "removed-target" } };
+    const missingApi = controller({ discover: async () => [], draft: missingDraft, prepareWorkspace, snapshotValue });
+    const onSubmit = vi.fn(async () => undefined);
+    const { container, rerender } = await renderPage(missingApi, onSubmit);
+    await flush();
+
+    expect(targetSelect(container).value).toBe("target:removed-target");
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("newTask.projectUnavailable");
+    expect(prepareWorkspace).not.toHaveBeenCalled();
+    expect(composerDocumentPlainText(required(latestEditorProps?.document))).toBe("Continue this task");
+
+    const liveApi = { ...missingApi, readNewSessionDraft: vi.fn(async () => freshWorktreeDraft(false)) } as unknown as AppController;
+    await rerender(liveApi);
+    await act(async () => setSelect(targetSelect(container), "target:target-1"));
+    await flush();
+    expect(container.querySelector('[role="status"]')?.textContent).toContain("newTask.workspaceChecking");
+    const options = [...targetSelect(container).querySelectorAll("option")].map((option) => option.textContent);
+    expect(options).toContain("Project · build-host · /srv/project");
+
+    await act(async () => setSelect(targetSelect(container), "target:target-2"));
+    await flush();
+    expect(targetSelect(container).value).toBe("target:target-2");
+    expect(sendButton(container).disabled).toBe(false);
+    expect(preparationSignals.get("target-1")?.aborted).toBe(true);
+    await act(async () => oldPreparation.resolve());
+    await flush();
+    expect(targetSelect(container).value).toBe("target:target-2");
+    expect(sendButton(container).disabled).toBe(false);
+  });
+
+  it("flushes the newest draft when the route leaves before the debounce expires", async () => {
+    vi.useFakeTimers();
+    const saveDraft = vi.fn(async () => undefined);
+    const api = controller({ discover: async () => [candidate()], saveDraft });
+    const { root } = await renderPage(api, vi.fn(async () => undefined));
+    await flush();
+
+    await act(async () => required(latestEditorProps?.onDocumentChange)(plainTextToComposerDocument("Newest unsaved input"), false));
+    expect(saveDraft).not.toHaveBeenCalled();
+    await unmountPage(root);
+
+    expect(saveDraft).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      text: "Newest unsaved input",
+      editorDocument: plainTextToComposerDocument("Newest unsaved input")
+    }));
+  });
+
+  it("does not resurrect the consumed draft when the route leaves during first submission", async () => {
+    vi.useFakeTimers();
+    const saveDraft = vi.fn(async () => undefined);
+    const submitted = deferred<void>();
+    const onSubmit = vi.fn(() => submitted.promise);
+    const api = controller({ discover: async () => [candidate()], saveDraft });
+    const { container, root } = await renderPage(api, onSubmit);
+    await flush();
+
+    await act(async () => sendButton(container).click());
+    expect(onSubmit).toHaveBeenCalledOnce();
+    await unmountPage(root);
+    expect(saveDraft).not.toHaveBeenCalled();
+
+    await act(async () => submitted.resolve());
+    expect(saveDraft).not.toHaveBeenCalled();
+  });
+
+  it("restores, removes, and submits Browser annotations as first-class new-task input", async () => {
+    const model: ModelView = {
+      backendId: "backend-1", providerId: "source-one", providerName: "Source one", modelId: "image-model", name: "Image model",
+      available: true, supportsImages: true, supportsFast: false, inputModalities: ["text", "image"], outputModalities: ["text"],
+      efforts: [], contextWindow: 8_192, maximumOutputTokens: 2_048, inputCostMicrosPerMillion: 0, outputCostMicrosPerMillion: 0, currencyCode: "USD"
+    };
+    const base = snapshot();
+    const comments = [browserComment("first", 1), browserComment("second", 2)];
+    const original = controller({ discover: async () => [] });
+    const api = { ...original, state: { ...original.state, snapshot: {
+      ...base,
+      backends: base.backends.map((backend) => ({ ...backend, capabilities: new Map([
+        ...backend.capabilities,
+        ["model.switch", { name: "model.switch", supported: true, options: [] }],
+        ["input.image", { name: "input.image", supported: true, options: [], maximumItems: 4 }]
+      ]) })),
+      models: [model]
+    } }, readNewSessionDraft: vi.fn(async () => ({
+      ...restoredDraft(), nativeStart: { kind: "fresh" }, providerId: model.providerId, modelId: model.modelId,
+      text: "", editorDocument: emptyComposerDocument(), browserComments: comments
+    })) } as unknown as AppController;
+    const onSubmit = vi.fn(async () => undefined);
+    const { container } = await renderPage(api, onSubmit);
+
+    expect(container.querySelectorAll(".browser-comment-chip article")).toHaveLength(2);
+    expect(sendButton(container).disabled).toBe(false);
+    await act(async () => required(container.querySelectorAll<HTMLButtonElement>('button[aria-label="composer.removeBrowserComment"]')[0]).click());
+    expect(container.querySelectorAll(".browser-comment-chip article")).toHaveLength(1);
+    await act(async () => sendButton(container).click());
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith(expect.anything(), expect.objectContaining({
+      text: "",
+      browserComments: [expect.objectContaining({ id: "second", markerNumber: 2 })]
+    }), expect.anything());
+  });
+
   it("blocks a retained workspace mention when its type disappears during pending draft persistence", async () => {
     vi.useFakeTimers();
     let release!: () => void;
@@ -521,7 +676,7 @@ describe("new-task native draft recovery", () => {
     const { container } = await renderPage(controller({ discover }), vi.fn().mockResolvedValue(undefined), "target-2");
     await flush();
     expect(container.querySelector<HTMLSelectElement>(".new-task-context__control--target select")?.value).toBe("target:target-2");
-    expect(discover).toHaveBeenCalledWith("target-2");
+    expect(discover).toHaveBeenCalledWith("target-2", expect.any(AbortSignal));
   });
 
   it("lets the dialogue rail action override a saved project location", async () => {
@@ -537,6 +692,28 @@ describe("new-task native draft recovery", () => {
     await flush();
     expect(container.querySelector(".new-task-context__control--name")).toBeNull();
     expect(container.querySelector('input[aria-label="session.taskName"]')).toBeNull();
+  });
+
+  it("does not discover native sessions until the user enters attach mode", async () => {
+    const discovery = deferred<readonly NativeSessionCandidateView[]>();
+    const discover = vi.fn((_targetId: string, _signal: AbortSignal) => discovery.promise);
+    const draft = { ...restoredDraft(), nativeStart: { kind: "fresh" as const } };
+    const { container } = await renderPage(controller({ discover, draft }), vi.fn().mockResolvedValue(undefined));
+
+    await flush();
+    expect(discover).not.toHaveBeenCalled();
+    const startSelect = required(container.querySelector<HTMLSelectElement>(".new-task-context__control--native select"));
+    await act(async () => setSelect(startSelect, "attach"));
+    await flush();
+    expect(discover).toHaveBeenCalledWith("target-1", expect.any(AbortSignal));
+    const signal = discover.mock.calls[0]?.[1];
+    expect(signal?.aborted).toBe(false);
+
+    await act(async () => setSelect(startSelect, "fresh"));
+    expect(signal?.aborted).toBe(true);
+    await act(async () => discovery.resolve([candidate({ name: "Retired native task" })]));
+    await flush();
+    expect(container.textContent).not.toContain("Retired native task");
   });
 
   it("blocks a restored native reference while discovery is loading and submits only after authoritative validation", async () => {
@@ -617,6 +794,10 @@ describe("new-task native draft recovery", () => {
     await act(async () => buttonWithText(container, "session.nativeRetry").click());
     await flush();
     expect(discover).toHaveBeenCalledTimes(2);
+    expect(discover).toHaveBeenNthCalledWith(1, "target-1", expect.any(AbortSignal));
+    expect(discover).toHaveBeenNthCalledWith(2, "target-1", expect.any(AbortSignal));
+    expect(discover.mock.calls[0]?.[1].aborted).toBe(true);
+    expect(discover.mock.calls[1]?.[1]).not.toBe(discover.mock.calls[0]?.[1]);
     expect(sendButton(container).disabled).toBe(false);
   });
 
@@ -624,17 +805,406 @@ describe("new-task native draft recovery", () => {
     ["missing", []],
     ["bound", [candidate({ boundSessionId: "task-existing" })]],
     ["error", [candidate({ state: "error" })]]
-  ] as const)("clears a restored reference when the authoritative candidate is %s", async (_label, candidates) => {
+  ] as const)("clears a restored reference when the authoritative candidate is %s", async (label, candidates) => {
     const onSubmit = vi.fn().mockResolvedValue(undefined);
     const saveDraft = vi.fn().mockResolvedValue(undefined);
     const { container } = await renderPage(controller({ discover: async () => candidates, saveDraft }), onSubmit);
 
     await flush();
     expect(container.textContent).toContain("session.nativeSelectionUnavailable");
+    if (label === "missing") expect(container.textContent).toContain("session.noNativeSessions");
     expect(sendButton(container).disabled).toBe(true);
     expect(container.querySelector<HTMLInputElement>('input[name="new-task-native-session"]:checked')).toBeNull();
     await act(async () => sendButton(container).click());
     expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it.each(["profile", "Backend generation"] as const)("retires a pending discovery immediately when the %s owner changes", async (ownerKind) => {
+    const stale = deferred<readonly NativeSessionCandidateView[]>();
+    const current = deferred<readonly NativeSessionCandidateView[]>();
+    let discoveryCall = 0;
+    const discover = vi.fn((_targetId: string, _signal: AbortSignal) =>
+      discoveryCall++ === 0 ? stale.promise : current.promise);
+    const first = controller({
+      discover,
+      profile: connectionProfile("profile-1", "server-1"),
+      snapshotValue: snapshot(1)
+    });
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+    const { container, rerender } = await renderPage(first, onSubmit);
+    await flush();
+
+    const firstSignal = discover.mock.calls[0]?.[1];
+    expect(firstSignal).toBeInstanceOf(AbortSignal);
+    expect(firstSignal?.aborted).toBe(false);
+    const next = controller({
+      discover,
+      profile: ownerKind === "profile"
+        ? connectionProfile("profile-2", "server-2")
+        : connectionProfile("profile-1", "server-1"),
+      snapshotValue: snapshot(ownerKind === "Backend generation" ? 2 : 1)
+    });
+    await rerender(next);
+
+    expect(firstSignal?.aborted).toBe(true);
+    expect(discover).toHaveBeenCalledTimes(2);
+    expect(sendButton(container).disabled).toBe(true);
+    expect(container.textContent).not.toContain("Stale native task");
+
+    await act(async () => current.resolve([candidate({ name: "Current native task" })]));
+    await flush();
+    expect(container.textContent).toContain("Current native task");
+    expect(sendButton(container).disabled).toBe(false);
+
+    await act(async () => stale.resolve([candidate({ name: "Stale native task" })]));
+    await flush();
+    expect(container.textContent).not.toContain("Stale native task");
+    expect(container.textContent).toContain("Current native task");
+  });
+
+  it("retires the old Target result and requires an explicit selection after discovering the new Target", async () => {
+    const stale = deferred<readonly NativeSessionCandidateView[]>();
+    const current = deferred<readonly NativeSessionCandidateView[]>();
+    const discover = vi.fn((targetId: string, _signal: AbortSignal) =>
+      targetId === "target-1" ? stale.promise : current.promise);
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+    const { container } = await renderPage(controller({ discover }), onSubmit);
+    await flush();
+
+    const firstSignal = discover.mock.calls[0]?.[1];
+    await act(async () => setSelect(targetSelect(container), "target:target-2"));
+    await flush();
+    expect(firstSignal?.aborted).toBe(true);
+    expect(discover).toHaveBeenCalledTimes(1);
+    const startSelect = required(container.querySelector<HTMLSelectElement>(".new-task-context__control--native select"));
+    expect(startSelect.value).toBe("fresh");
+
+    await act(async () => setSelect(startSelect, "attach"));
+    await flush();
+    expect(discover).toHaveBeenLastCalledWith("target-2", expect.any(AbortSignal));
+    expect(sendButton(container).disabled).toBe(true);
+    await act(async () => current.resolve([candidate({
+      reference: "native://target-2",
+      name: "Target two native task",
+      workspaceRoot: "/workspace-2"
+    })]));
+    await flush();
+    expect(container.textContent).toContain("Target two native task");
+    expect(sendButton(container).disabled).toBe(true);
+
+    await act(async () => required(container.querySelector<HTMLInputElement>('input[name="new-task-native-session"]')).click());
+    expect(sendButton(container).disabled).toBe(false);
+    await act(async () => stale.resolve([candidate({ name: "Stale native task" })]));
+    await flush();
+    expect(container.textContent).not.toContain("Stale native task");
+
+    await act(async () => sendButton(container).click());
+    expect(onSubmit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        selection: { kind: "target", targetId: "target-2" },
+        nativeStart: { kind: "attach", reference: "native://target-2" }
+      }),
+      expect.anything(),
+      expect.anything()
+    );
+  });
+});
+
+describe("new-task worktree authority", () => {
+  it.each([
+    [false, true],
+    [true, false]
+  ] as const)("uses the committed %s preference instead of a stale route draft value", async (committed, staleDraft) => {
+    const api = controller({
+      discover: async () => [],
+      draft: freshWorktreeDraft(staleDraft),
+      worktreeEnabled: committed,
+      probe: async (targetId) => ({ targetId, eligibility: "eligible", currentBranch: "main", canRefreshRemote: false }),
+      listSources: async () => [{ ref: "refs/heads/main", commit: "a".repeat(40), name: "main", remote: false, current: true }]
+    });
+    const { container } = await renderPage(api, vi.fn(async () => undefined));
+    await flush();
+
+    expect(worktreeCheckbox(container).checked).toBe(committed);
+  });
+
+  it.each(["notGitRepository", "alreadyLinked", "gitNotFound"] as const)("keeps the ON preference but creates a plain task after %s is confirmed", async (eligibility) => {
+    const probe = vi.fn(async (targetId: string): Promise<TargetWorktreeProbeView> => ({ targetId, eligibility, canRefreshRemote: false }));
+    const api = controller({
+      discover: async () => [],
+      draft: freshWorktreeDraft(true),
+      worktreeEnabled: true,
+      probe
+    });
+    const onSubmit = vi.fn<(session: DelayedNewSessionDraft, input: ComposerDraft) => Promise<void>>(async () => undefined);
+    const { container } = await renderPage(api, onSubmit);
+    await flush();
+
+    expect(container.querySelector(".new-task-worktree")).toBeNull();
+    expect(api.state.preferences.newSessionWorktreeEnabled).toBe(true);
+    expect(api.setNewSessionWorktreeEnabled).not.toHaveBeenCalled();
+    expect(sendButton(container).disabled).toBe(false);
+    await act(async () => sendButton(container).click());
+
+    expect(probe).toHaveBeenCalledWith("target-1", expect.any(AbortSignal));
+    expect(onSubmit).toHaveBeenCalledOnce();
+    expect(onSubmit.mock.calls[0]?.[0]).not.toHaveProperty("worktree");
+  });
+
+  it("does not run a local worktree probe for a Remote target or apply the retained preference", async () => {
+    const base = snapshot();
+    const remoteSnapshot: AppSnapshot = {
+      ...base,
+      targets: base.targets.map((target) => target.id === "target-1"
+        ? { ...target, remoteWorkspace: { hostId: "remote-1", workspaceRoot: "/srv/project" } }
+        : target)
+    };
+    const probe = vi.fn(async (): Promise<TargetWorktreeProbeView> => {
+      throw new Error("must not inspect a Remote path locally");
+    });
+    const api = controller({
+      discover: async () => [],
+      draft: freshWorktreeDraft(true),
+      snapshotValue: remoteSnapshot,
+      worktreeEnabled: true,
+      probe
+    });
+    const onSubmit = vi.fn<(session: DelayedNewSessionDraft, input: ComposerDraft) => Promise<void>>(async () => undefined);
+    const { container } = await renderPage(api, onSubmit);
+    await flush();
+
+    expect(probe).not.toHaveBeenCalled();
+    expect(container.querySelector(".new-task-worktree")).toBeNull();
+    expect(api.state.preferences.newSessionWorktreeEnabled).toBe(true);
+    expect(sendButton(container).disabled).toBe(false);
+    await act(async () => sendButton(container).click());
+    expect(onSubmit.mock.calls[0]?.[0]).not.toHaveProperty("worktree");
+  });
+
+  it.each(["unavailable", "unsafe"] as const)("fails closed on %s, retries the exact Target, and submits the calibrated source", async (eligibility) => {
+    const probe = vi.fn<(targetId: string) => Promise<TargetWorktreeProbeView>>()
+      .mockResolvedValueOnce({ targetId: "target-1", eligibility, canRefreshRemote: false })
+      .mockResolvedValueOnce({ targetId: "target-1", eligibility: "eligible", currentBranch: "main", canRefreshRemote: true });
+    const sources: readonly WorktreeSourceView[] = [
+      { ref: "refs/heads/main", commit: "a".repeat(40), name: "main", remote: false, current: true },
+      { ref: "refs/remotes/origin/topic", commit: "b".repeat(40), name: "origin/topic", remote: true, current: false }
+    ];
+    const listSources = vi.fn(async () => sources);
+    const api = controller({
+      discover: async () => [],
+      draft: freshWorktreeDraft(true, "refs/heads/stale", true),
+      worktreeEnabled: true,
+      probe,
+      listSources
+    });
+    const onSubmit = vi.fn<(session: DelayedNewSessionDraft, input: ComposerDraft) => Promise<void>>(async () => undefined);
+    const { container } = await renderPage(api, onSubmit);
+    await flush();
+
+    expect(sendButton(container).disabled).toBe(true);
+    expect(container.textContent).toContain(`worktree.ineligible.${eligibility}`);
+    await act(async () => buttonWithText(container, "worktree.retry").click());
+    await flush();
+
+    expect(probe).toHaveBeenCalledTimes(2);
+    expect(listSources).toHaveBeenCalledExactlyOnceWith("target-1", expect.any(AbortSignal));
+    expect(worktreeSourceSelect(container).value).toBe("refs/heads/main");
+    await act(async () => {
+      setSelect(worktreeSourceSelect(container), "refs/remotes/origin/topic");
+      worktreeRefreshCheckbox(container).click();
+    });
+    expect(sendButton(container).disabled).toBe(false);
+    await act(async () => sendButton(container).click());
+
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      worktree: { sourceRef: "refs/remotes/origin/topic", refreshRemote: true }
+    }), expect.anything(), expect.anything());
+  });
+
+  it("keeps probe failures and mismatched responses closed until an exact retry succeeds", async () => {
+    const probe = vi.fn<(targetId: string) => Promise<TargetWorktreeProbeView>>()
+      .mockRejectedValueOnce(new Error("probe transport failed"))
+      .mockResolvedValueOnce({ targetId: "target-2", eligibility: "eligible", canRefreshRemote: false })
+      .mockResolvedValueOnce({ targetId: "target-1", eligibility: "eligible", currentBranch: "main", canRefreshRemote: false });
+    const api = controller({
+      discover: async () => [],
+      draft: freshWorktreeDraft(true),
+      worktreeEnabled: true,
+      probe,
+      listSources: async () => [{ ref: "refs/heads/main", commit: "a".repeat(40), name: "main", remote: false, current: true }]
+    });
+    const { container } = await renderPage(api, vi.fn(async () => undefined));
+    await flush();
+
+    expect(sendButton(container).disabled).toBe(true);
+    expect(container.textContent).toContain("probe transport failed");
+    await act(async () => buttonWithText(container, "worktree.retry").click());
+    await flush();
+    expect(sendButton(container).disabled).toBe(true);
+    expect(container.textContent).toContain("worktree.probeTargetMismatch");
+    await act(async () => buttonWithText(container, "worktree.retry").click());
+    await flush();
+    expect(sendButton(container).disabled).toBe(false);
+    expect(probe).toHaveBeenCalledTimes(3);
+  });
+
+  it("blocks Send until an ON preference write commits", async () => {
+    const saving = deferred<void>();
+    let api!: AppController;
+    const setPreference = vi.fn(async (enabled: boolean) => {
+      await saving.promise;
+      (api.state.preferences as { newSessionWorktreeEnabled: boolean }).newSessionWorktreeEnabled = enabled;
+    });
+    api = controller({
+      discover: async () => [],
+      draft: freshWorktreeDraft(false),
+      probe: async (targetId) => ({ targetId, eligibility: "eligible", currentBranch: "main", canRefreshRemote: false }),
+      listSources: async () => [{ ref: "refs/heads/main", commit: "a".repeat(40), name: "main", remote: false, current: true }],
+      setWorktreeEnabled: setPreference
+    });
+    const onSubmit = vi.fn<(session: DelayedNewSessionDraft, input: ComposerDraft) => Promise<void>>(async () => undefined);
+    const { container } = await renderPage(api, onSubmit);
+    await flush();
+
+    await act(async () => worktreeCheckbox(container).click());
+    expect(setPreference).toHaveBeenCalledExactlyOnceWith(true);
+    expect(sendButton(container).disabled).toBe(true);
+    await act(async () => sendButton(container).click());
+    expect(onSubmit).not.toHaveBeenCalled();
+
+    await act(async () => saving.resolve());
+    expect(sendButton(container).disabled).toBe(false);
+    await act(async () => sendButton(container).click());
+    expect(onSubmit.mock.calls[0]?.[0]).toEqual(expect.objectContaining({
+      worktree: { sourceRef: "refs/heads/main", refreshRemote: false }
+    }));
+  });
+
+  it("keeps the plain draft sendable when an ON preference write fails", async () => {
+    const setPreference = vi.fn(async () => { throw new Error("preference write failed"); });
+    const api = controller({
+      discover: async () => [],
+      draft: freshWorktreeDraft(false),
+      probe: async (targetId) => ({ targetId, eligibility: "eligible", currentBranch: "main", canRefreshRemote: false }),
+      listSources: async () => [{ ref: "refs/heads/main", commit: "a".repeat(40), name: "main", remote: false, current: true }],
+      setWorktreeEnabled: setPreference
+    });
+    const onSubmit = vi.fn<(session: DelayedNewSessionDraft, input: ComposerDraft) => Promise<void>>(async () => undefined);
+    const { container } = await renderPage(api, onSubmit);
+    await flush();
+
+    await act(async () => worktreeCheckbox(container).click());
+    await flush();
+    expect(worktreeCheckbox(container).checked).toBe(false);
+    expect(container.textContent).toContain("preference write failed");
+    expect(sendButton(container).disabled).toBe(false);
+    await act(async () => sendButton(container).click());
+    expect(onSubmit.mock.calls[0]?.[0]).not.toHaveProperty("worktree");
+  });
+
+  it("keeps the explicit OFF escape available while probing and blocks plain Send until that write commits", async () => {
+    const saving = deferred<void>();
+    const probing = deferred<TargetWorktreeProbeView>();
+    let api!: AppController;
+    const setPreference = vi.fn(async (enabled: boolean) => {
+      await saving.promise;
+      (api.state.preferences as { newSessionWorktreeEnabled: boolean }).newSessionWorktreeEnabled = enabled;
+    });
+    api = controller({
+      discover: async () => [],
+      draft: freshWorktreeDraft(true),
+      worktreeEnabled: true,
+      probe: async () => probing.promise,
+      setWorktreeEnabled: setPreference
+    });
+    const onSubmit = vi.fn<(session: DelayedNewSessionDraft, input: ComposerDraft) => Promise<void>>(async () => undefined);
+    const { container } = await renderPage(api, onSubmit);
+    await flush();
+
+    expect(worktreeCheckbox(container).disabled).toBe(false);
+    await act(async () => worktreeCheckbox(container).click());
+    expect(setPreference).toHaveBeenCalledExactlyOnceWith(false);
+    expect(sendButton(container).disabled).toBe(true);
+    await act(async () => sendButton(container).click());
+    expect(onSubmit).not.toHaveBeenCalled();
+
+    await act(async () => saving.resolve());
+    expect(sendButton(container).disabled).toBe(false);
+    await act(async () => sendButton(container).click());
+    expect(onSubmit.mock.calls[0]?.[0]).not.toHaveProperty("worktree");
+
+    await act(async () => probing.resolve({ targetId: "target-1", eligibility: "eligible", currentBranch: "main", canRefreshRemote: false }));
+  });
+
+  it("does not let an unrelated pending preference write block a confirmed-ineligible Target", async () => {
+    const saving = deferred<void>();
+    let api!: AppController;
+    const setPreference = vi.fn(async (enabled: boolean) => {
+      await saving.promise;
+      (api.state.preferences as { newSessionWorktreeEnabled: boolean }).newSessionWorktreeEnabled = enabled;
+    });
+    api = controller({
+      discover: async () => [],
+      draft: freshWorktreeDraft(false),
+      probe: async (targetId) => targetId === "target-1"
+        ? { targetId, eligibility: "eligible", currentBranch: "main", canRefreshRemote: false }
+        : { targetId, eligibility: "notGitRepository", canRefreshRemote: false },
+      listSources: async () => [{ ref: "refs/heads/main", commit: "a".repeat(40), name: "main", remote: false, current: true }],
+      setWorktreeEnabled: setPreference
+    });
+    const onSubmit = vi.fn<(session: DelayedNewSessionDraft, input: ComposerDraft) => Promise<void>>(async () => undefined);
+    const { container } = await renderPage(api, onSubmit);
+    await flush();
+
+    await act(async () => worktreeCheckbox(container).click());
+    expect(sendButton(container).disabled).toBe(true);
+    await act(async () => setSelect(targetSelect(container), "target:target-2"));
+    await flush();
+
+    expect(container.querySelector(".new-task-worktree")).toBeNull();
+    expect(sendButton(container).disabled).toBe(false);
+    await act(async () => sendButton(container).click());
+    expect(onSubmit.mock.calls[0]?.[0]).not.toHaveProperty("worktree");
+
+    await act(async () => saving.resolve());
+  });
+
+  it("retires a late probe and source catalog when the Target changes", async () => {
+    const targetOne = deferred<TargetWorktreeProbeView>();
+    const probe = vi.fn((targetId: string) => targetId === "target-1"
+      ? targetOne.promise
+      : Promise.resolve({ targetId, eligibility: "eligible" as const, currentBranch: "develop", canRefreshRemote: false }));
+    const listSources = vi.fn(async (targetId: string): Promise<readonly WorktreeSourceView[]> => [{
+      ref: `refs/heads/${targetId === "target-1" ? "main" : "develop"}`,
+      commit: (targetId === "target-1" ? "a" : "b").repeat(40),
+      name: targetId === "target-1" ? "main" : "develop",
+      remote: false,
+      current: true
+    }]);
+    const api = controller({
+      discover: async () => [],
+      draft: freshWorktreeDraft(true, "refs/heads/main"),
+      worktreeEnabled: true,
+      probe,
+      listSources
+    });
+    const onSubmit = vi.fn(async () => undefined);
+    const { container } = await renderPage(api, onSubmit);
+    await flush();
+
+    await act(async () => setSelect(targetSelect(container), "target:target-2"));
+    await flush();
+    expect(worktreeSourceSelect(container).value).toBe("refs/heads/develop");
+    await act(async () => targetOne.resolve({ targetId: "target-1", eligibility: "eligible", currentBranch: "main", canRefreshRemote: false }));
+    await flush();
+    expect(listSources).toHaveBeenCalledTimes(1);
+    expect(worktreeSourceSelect(container).value).toBe("refs/heads/develop");
+
+    await act(async () => sendButton(container).click());
+    expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({
+      selection: { kind: "target", targetId: "target-2" },
+      worktree: { sourceRef: "refs/heads/develop", refreshRemote: false }
+    }), expect.anything(), expect.anything());
   });
 });
 
@@ -663,36 +1233,52 @@ async function renderPage(
   return { container, root, rerender };
 }
 
+async function unmountPage(root: Root): Promise<void> {
+  const index = roots.indexOf(root);
+  if (index >= 0) roots.splice(index, 1);
+  await act(async () => root.unmount());
+}
+
 function controller(options: {
-  readonly discover: () => Promise<readonly NativeSessionCandidateView[]>;
+  readonly discover: (targetId: string, signal: AbortSignal) => Promise<readonly NativeSessionCandidateView[]>;
+  readonly draft?: NewSessionLocalDraft;
   readonly saveDraft?: (draft: NewSessionLocalDraft) => Promise<void>;
   readonly listWorkspaceFiles?: () => Promise<{ readonly paths: readonly string[]; readonly truncated: boolean; readonly revision: string }>;
+  readonly prepareWorkspace?: (targetId: string, expectedRevision: bigint, signal: AbortSignal) => Promise<void>;
+  readonly snapshotValue?: AppSnapshot;
+  readonly worktreeEnabled?: boolean;
+  readonly probe?: (targetId: string, signal: AbortSignal) => Promise<TargetWorktreeProbeView>;
+  readonly listSources?: (targetId: string, signal: AbortSignal) => Promise<readonly WorktreeSourceView[]>;
+  readonly setWorktreeEnabled?: (enabled: boolean) => Promise<void>;
+  readonly profile?: ConnectionProfile;
 }): AppController {
   return {
     state: {
       connectionState: "connected",
-      snapshot: snapshot(),
+      snapshot: options.snapshotValue ?? snapshot(),
+      ...(options.profile === undefined ? {} : { activeProfile: options.profile }),
       preferences: {
         locale: "en",
         composerSendShortcut: "enter",
-        newSessionWorktreeEnabled: false
+        newSessionWorktreeEnabled: options.worktreeEnabled ?? false
       }
     },
-    readNewSessionDraft: vi.fn(async () => restoredDraft()),
+    readNewSessionDraft: vi.fn(async () => options.draft ?? restoredDraft()),
     saveNewSessionDraft: vi.fn(options.saveDraft ?? (async () => undefined)),
+    prepareTargetWorkspace: vi.fn(options.prepareWorkspace ?? (async () => undefined)),
     discoverNativeSessions: vi.fn(options.discover),
-    probeTargetWorktree: vi.fn(async () => ({
+    probeTargetWorktree: vi.fn(options.probe ?? (async () => ({
       targetId: "target-1",
       eligibility: "unavailable",
       canRefreshRemote: false
-    })),
-    listTargetWorktreeSources: vi.fn(async () => []),
+    }))),
+    listTargetWorktreeSources: vi.fn(options.listSources ?? (async () => [])),
     listWorkspaceFiles: vi.fn(options.listWorkspaceFiles ?? (async () => ({ paths: [], truncated: false, revision: "index-empty" }))),
-    setNewSessionWorktreeEnabled: vi.fn(async () => undefined)
+    setNewSessionWorktreeEnabled: vi.fn(options.setWorktreeEnabled ?? (async () => undefined))
   } as unknown as AppController;
 }
 
-function snapshot(): AppSnapshot {
+function snapshot(backendGeneration = 1): AppSnapshot {
   const initial = emptySnapshot();
   return {
     ...initial,
@@ -702,6 +1288,7 @@ function snapshot(): AppSnapshot {
       name: "Backend",
       version: "1",
       health: "healthy",
+      instanceGeneration: backendGeneration,
       capabilities: new Map([
         ["input.text", { name: "input.text", supported: true, options: [] }],
         ["input.mention", { name: "input.mention", supported: true, options: ["workspace_file", "resource"] }],
@@ -754,6 +1341,16 @@ function snapshot(): AppSnapshot {
   };
 }
 
+function connectionProfile(id: string, serverId: string): ConnectionProfile {
+  return {
+    id,
+    deviceId: `device-${id}`,
+    serverId,
+    name: id,
+    origin: `https://${id}.example`
+  };
+}
+
 function restoredDraft(): NewSessionLocalDraft {
   return {
     selection: { kind: "target", targetId: "target-1" },
@@ -771,6 +1368,14 @@ function restoredDraft(): NewSessionLocalDraft {
     mentions: [],
     inlineMentionRanges: [],
     attachments: []
+  };
+}
+
+function freshWorktreeDraft(enabled: boolean, sourceRef?: string, refreshRemote = false): NewSessionLocalDraft {
+  return {
+    ...restoredDraft(),
+    nativeStart: { kind: "fresh" },
+    worktree: { enabled, ...(sourceRef === undefined ? {} : { sourceRef }), refreshRemote }
   };
 }
 
@@ -820,6 +1425,17 @@ function candidate(overrides: Partial<NativeSessionCandidateView> = {}): NativeS
   };
 }
 
+function browserComment(id: string, markerNumber: number): BrowserCommentDraftItem {
+  return {
+    id,
+    markerNumber,
+    pageUrl: `https://example.com/${id}`,
+    target: { kind: "element", point: { x: 12, y: 24 }, viewport: { width: 800, height: 600 } },
+    comment: id,
+    screenshot: { id: `${id}-screenshot`, kind: "image", file: new File([id], `${id}.png`, { type: "image/png" }) }
+  };
+}
+
 function voiceResult(text: string, rawTranscriptText?: string): VoiceMediaSessionUpdate {
   return { state: "done", session: {
     id: "voice-draft", state: "done", outcome: "success", nextChunkSequence: 1n,
@@ -836,6 +1452,27 @@ function sendButton(container: ParentNode): HTMLButtonElement {
 function buttonWithText(container: ParentNode, text: string): HTMLButtonElement {
   return required([...container.querySelectorAll<HTMLButtonElement>("button")]
     .find((button) => button.textContent?.trim() === text));
+}
+
+function targetSelect(container: ParentNode): HTMLSelectElement {
+  return required(container.querySelector<HTMLSelectElement>(".new-task-context__control--target select"));
+}
+
+function worktreeCheckbox(container: ParentNode): HTMLInputElement {
+  return required(container.querySelector<HTMLInputElement>('.new-task-worktree__toggle input[type="checkbox"]'));
+}
+
+function worktreeSourceSelect(container: ParentNode): HTMLSelectElement {
+  return required(container.querySelector<HTMLSelectElement>(".new-task-worktree__options select"));
+}
+
+function worktreeRefreshCheckbox(container: ParentNode): HTMLInputElement {
+  return required(container.querySelector<HTMLInputElement>('.new-task-worktree__refresh input[type="checkbox"]'));
+}
+
+function setSelect(select: HTMLSelectElement, value: string): void {
+  Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")?.set?.call(select, value);
+  select.dispatchEvent(new Event("change", { bubbles: true }));
 }
 
 async function openMentionMenu(container: ParentNode): Promise<void> {

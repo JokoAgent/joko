@@ -10,7 +10,7 @@ import { useNewSessionSubmission } from "./use-new-session-submission.js";
 let root: Root | undefined;
 beforeAll(() => { (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true; });
 afterEach(async () => { if (root !== undefined) await act(async () => root!.unmount()); root = undefined; document.body.replaceChildren(); vi.restoreAllMocks(); });
-const draft: DelayedNewSessionDraft = { selection: { kind: "target", targetId: "target" }, name: "Task", nativeStart: { kind: "fresh" }, providerId: "provider", modelId: "model", fastMode: false, permissionMode: "ask", planMode: false };
+const draft: DelayedNewSessionDraft = { selection: { kind: "target", targetId: "target" }, expectedTargetRevision: 1n, name: "Task", nativeStart: { kind: "fresh" }, providerId: "provider", modelId: "model", fastMode: false, permissionMode: "ask", planMode: false };
 const input: ComposerDraft = { text: "Final dictated text", attachments: [], mentions: [], deliveryMode: "prompt" };
 const describe = (error: unknown) => (error as Error).message;
 
@@ -26,6 +26,7 @@ function api() {
     state: { route: { kind: "newSession" }, connectionState: "connected", activeProfile: { id: "profile" }, navigationRevision: 0 },
     createSession: vi.fn(async () => ({ sessionId: "created", generation: 4n })),
     send: vi.fn(async () => undefined),
+    restoreFirstInputDraft: vi.fn(async () => undefined),
     clearNewSessionDraft: vi.fn(async () => undefined),
     navigate: vi.fn()
   } as unknown as AppController;
@@ -94,6 +95,7 @@ it("shows a send failure on the task it revealed, but a later route never adopts
   await act(async () => { send.reject(new Error("Upload failed")); await failure; });
   expect(probe.error()).toBe("Upload failed");
   expect(original.clearNewSessionDraft).toHaveBeenCalledTimes(1);
+  expect(original.restoreFirstInputDraft).toHaveBeenCalledExactlyOnceWith("created", input);
   expect(probe.busy()).toBeUndefined();
 });
 

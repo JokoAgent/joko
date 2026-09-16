@@ -58,6 +58,8 @@ import {
 } from "@joko/store";
 import type {
   ConnectionRecord,
+  ArtifactRecord,
+  ArtifactSourceRecord,
   InteractionRecord,
   NativeSessionDerivationRecord,
   OperationExecution,
@@ -71,6 +73,7 @@ import type {
 } from "@joko/store";
 import { operationBodyHash } from "@joko/store";
 import type { ArtifactStore } from "./artifact-store.js";
+import { resolveStoredArtifactSource, validateLocalArtifactSource } from "./artifact-source.js";
 import { ExtraDirectoryManager } from "./extra-directory-manager.js";
 import { TIMED_EXTENSION_INTERACTION_EXPIRED_REASON } from "./interaction-expiry.js";
 import {
@@ -695,6 +698,12 @@ export class SessionHost {
   readonly #runtimeRestartFences = new Set<string>();
   readonly #backendReplacementFences = new Map<string, symbol>();
   readonly #backendAdmissionEffects = new Map<string, number>();
+  /** A managed Target deletion owns this fence from its durable claim until
+   * the workspace effect and final Target tombstone have both settled. */
+  readonly #targetSessionCreationFences = new Map<string, string>();
+  /** New product tasks hold admission across native/worktree effects and the
+   * final Store commit so Target deletion cannot move their workspace first. */
+  readonly #targetSessionCreationAdmissions = new Map<string, number>();
   /** Admission ownership held from an authenticated lifecycle claim through its final Store commit. */
   readonly #sessionLifecycleFences = new Map<string, string>();
   readonly #sessionLifecycleBackendAdmissions = new Map<string, {
@@ -2326,6 +2335,8 @@ export class SessionHost {
     readonly effect?: () => Promise<void>;
     /** Fence task admission while this claimed lifecycle effect reaches its final commit. */
     readonly sessionLifecycleFenceId?: string;
+    /** Fence new product-task creation while a claimed Target deletion effect reaches final commit. */
+    readonly targetSessionCreationFenceId?: string;
     /** Wrap the final synchronous Store completion in a serialized external commit protocol. */
     readonly complete?: (
       commit: (finalize?: (store: OperationalStore) => void) => OperationExecution<T>
@@ -2360,7 +2371,12 @@ export class SessionHost {
       return execution;
     }
     let installedLifecycleFence = false;
+    let installedTargetSessionCreationFence = false;
     try {
+      if (input.targetSessionCreationFenceId !== undefined) {
+        this.beginTargetSessionCreationFence(input.targetSessionCreationFenceId, claim.operation.id);
+        installedTargetSessionCreationFence = true;
+      }
       if (input.sessionLifecycleFenceId !== undefined) {
         const owner = this.#sessionLifecycleFences.get(input.sessionLifecycleFenceId);
         if (owner !== undefined && owner !== claim.operation.id) {
@@ -2396,6 +2412,13 @@ export class SessionHost {
       if (input.preserveClaimOnEffectFailure?.(error) === true) throw error;
       return this.failClaimedEffect(input.kind, claim.operation.id, claim.operation.bodyHash, error);
     } finally {
+      if (
+        installedTargetSessionCreationFence
+        && input.targetSessionCreationFenceId !== undefined
+        && this.#targetSessionCreationFences.get(input.targetSessionCreationFenceId) === claim.operation.id
+      ) {
+        this.#targetSessionCreationFences.delete(input.targetSessionCreationFenceId);
+      }
       if (
         installedLifecycleFence
         && input.sessionLifecycleFenceId !== undefined
@@ -5556,6 +5579,45 @@ export class SessionHost {
     return this.importPortableSessionPrepared(input);
   }
 
+  /**
+   * Resolve a same-machine source only after revalidating every durable and
+   * filesystem authority. The returned path is for trusted Desktop Main only;
+   * public Artifact/Event projections never call this method directly.
+   */
+  async resolveArtifactSource(
+    sessionId: string,
+    artifactId: string,
+    signal?: AbortSignal
+  ): Promise<string> {
+    this.#assertOpen();
+    throwIfArtifactSourceAborted(signal);
+    const before = this.artifactSourceAuthority(sessionId, artifactId);
+    const currentRoot = await realpath(before.effectiveTarget.workspaceRoot)
+      .catch(() => { throw artifactSourceUnavailable(); });
+    if (currentRoot !== before.source.workspaceRoot) throw artifactSourceUnavailable();
+    let validated: Awaited<ReturnType<typeof validateLocalArtifactSource>>;
+    try {
+      validated = await validateLocalArtifactSource({
+        workspaceRoot: before.source.workspaceRoot,
+        sourcePath: resolveStoredArtifactSource(before.source.workspaceRoot, before.source.relativePath),
+        expectedSha256: before.artifact.blob.sha256,
+        expectedByteLength: before.artifact.blob.byteLength,
+        ...(signal === undefined ? {} : { signal })
+      });
+    } catch {
+      throwIfArtifactSourceAborted(signal);
+      throw artifactSourceUnavailable();
+    }
+    throwIfArtifactSourceAborted(signal);
+    const after = this.artifactSourceAuthority(sessionId, artifactId);
+    const afterRoot = await realpath(after.effectiveTarget.workspaceRoot).catch(() => { throw artifactSourceUnavailable(); });
+    if (before.fingerprint !== after.fingerprint || afterRoot !== after.source.workspaceRoot ||
+      validated.workspaceRoot !== after.source.workspaceRoot ||
+      validated.relativePath !== after.source.relativePath) throw artifactSourceUnavailable();
+    throwIfArtifactSourceAborted(signal);
+    return validated.sourcePath;
+  }
+
   isSessionTerminalMutationBlocked(sessionId: string): boolean {
     return this.#portableReplacementFences.has(sessionId);
   }
@@ -6231,6 +6293,43 @@ export class SessionHost {
     if (this.#backendReplacementFences.has(backendId)) {
       throw new StoreError("The selected Backend is fenced while its process instance is being replaced.");
     }
+  }
+
+  private assertTargetAcceptsSessionCreation(store: OperationalStore, targetId: string): StoredTarget {
+    const target = store.getTarget(targetId);
+    if (isRecord(target.metadata) && target.metadata["deletedAt"] !== undefined) {
+      throw new StoreError("Deleted Targets cannot create product tasks.");
+    }
+    return target;
+  }
+
+  private beginTargetSessionCreation(targetId: string): () => void {
+    if (this.#targetSessionCreationFences.has(targetId)) {
+      throw new StoreError("New product tasks are fenced while their Target is being deleted.");
+    }
+    this.#targetSessionCreationAdmissions.set(
+      targetId,
+      (this.#targetSessionCreationAdmissions.get(targetId) ?? 0) + 1
+    );
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const remaining = (this.#targetSessionCreationAdmissions.get(targetId) ?? 1) - 1;
+      if (remaining <= 0) this.#targetSessionCreationAdmissions.delete(targetId);
+      else this.#targetSessionCreationAdmissions.set(targetId, remaining);
+    };
+  }
+
+  private beginTargetSessionCreationFence(targetId: string, operationId: string): void {
+    const owner = this.#targetSessionCreationFences.get(targetId);
+    if (owner !== undefined && owner !== operationId) {
+      throw new StoreError("A Target deletion is already in progress.");
+    }
+    if ((this.#targetSessionCreationAdmissions.get(targetId) ?? 0) > 0) {
+      throw new StoreError("A Target cannot be deleted while a product task is being created.");
+    }
+    this.#targetSessionCreationFences.set(targetId, operationId);
   }
 
   private beginBackendAdmissionEffect(backendId: string): () => void {
@@ -7626,6 +7725,8 @@ export class SessionHost {
     this.#draining.clear();
     this.#creationLocks.clear();
     this.#portableImportLocks.clear();
+    this.#targetSessionCreationFences.clear();
+    this.#targetSessionCreationAdmissions.clear();
     this.#portableReplacementFences.clear();
     this.#portableImportDrafts.clear();
     this.#nativeBindingLocks.clear();
@@ -7687,6 +7788,18 @@ export class SessionHost {
     preparedDraft?: PreparedPortableSessionImport
   ): Promise<OperationExecution<ImportPortableSessionResult>> {
     this.#store.authorizeConnection(input.connection.id, input.connection.authKeyDigest);
+    const releaseTargetAdmission = this.beginTargetSessionCreation(input.targetId);
+    try {
+      return await this.importPortableSessionOnceAdmitted(input, preparedDraft);
+    } finally {
+      releaseTargetAdmission();
+    }
+  }
+
+  private async importPortableSessionOnceAdmitted(
+    input: ImportPortableSessionInput,
+    preparedDraft?: PreparedPortableSessionImport
+  ): Promise<OperationExecution<ImportPortableSessionResult>> {
     const prepared = preparedDraft ?? preparePortableSessionImport(
       (await this.#artifactStore.readBlob(input.package)).data,
       {
@@ -7701,7 +7814,7 @@ export class SessionHost {
       input.connection.authKeyDigest,
       { id: input.operationId, kind: "import_portable_session", body: logicalBody },
       (store) => {
-        store.getTarget(input.targetId);
+        this.assertTargetAcceptsSessionCreation(store, input.targetId);
         const conflict = findPortableImportConflict(store, input.targetId, input.package.sha256);
         if (conflict !== undefined && !input.overwrite) throw portableImportConflict(conflict.descriptor.id);
       }
@@ -7727,7 +7840,7 @@ export class SessionHost {
     let releaseBackendAdmission: (() => void) | undefined;
     let releasePortableReplacementFence: (() => void) | undefined;
     try {
-      const target = this.#store.getTarget(input.targetId);
+      const target = this.assertTargetAcceptsSessionCreation(this.#store, input.targetId);
       let providerId = input.providerId;
       let modelId = input.modelId;
       if (prepared.nativeSession === undefined) {
@@ -7898,7 +8011,7 @@ export class SessionHost {
         claim.operation.id,
         claim.operation.bodyHash,
         (store) => {
-          const currentTarget = store.getTarget(input.targetId);
+          const currentTarget = this.assertTargetAcceptsSessionCreation(store, input.targetId);
           if (currentTarget.revision !== target.revision) {
             throw new RevisionConflictError("Target", input.targetId, target.revision, currentTarget.revision);
           }
@@ -8089,6 +8202,15 @@ export class SessionHost {
   }
 
   private async createSessionOnce(input: SessionCreationInput): Promise<OperationExecution<{ readonly sessionId: string }>> {
+    const releaseTargetAdmission = this.beginTargetSessionCreation(input.targetId);
+    try {
+      return await this.createSessionOnceAdmitted(input);
+    } finally {
+      releaseTargetAdmission();
+    }
+  }
+
+  private async createSessionOnceAdmitted(input: SessionCreationInput): Promise<OperationExecution<{ readonly sessionId: string }>> {
     const logicalBody = createSessionOperationBody(input);
     const authorized = "connection" in input;
     const operationKind = authorized
@@ -8101,11 +8223,11 @@ export class SessionHost {
         input.connection.id,
         input.connection.authKeyDigest,
         { id: input.operationId, kind: operationKind, body: logicalBody },
-        (store) => { store.getTarget(input.targetId); }
+        (store) => { this.assertTargetAcceptsSessionCreation(store, input.targetId); }
       )
       : this.#store.claimDeferredEffectOperation<{ readonly sessionId: string }>(
         { id: input.operationId, kind: operationKind, body: logicalBody },
-        (store) => { store.getTarget(input.targetId); }
+        (store) => { this.assertTargetAcceptsSessionCreation(store, input.targetId); }
       );
     if (!claim.claimed) {
       return { replayed: true, value: claim.value, operation: claim.operation };
@@ -8118,7 +8240,7 @@ export class SessionHost {
     let scheduledWorktreeSessionId: string | undefined;
     let releaseBackendAdmission: (() => void) | undefined;
     try {
-      const target = this.#store.getTarget(input.targetId);
+      const target = this.assertTargetAcceptsSessionCreation(this.#store, input.targetId);
       const adapter = this.requireAdapter(target.descriptor.backendId);
       const backendInstanceGeneration = this.requireAdapterGeneration(target.descriptor.backendId, adapter);
       const resourceCatalogEpoch = this.backendResourceCatalogEpoch(target.descriptor.backendId);
@@ -8354,7 +8476,7 @@ export class SessionHost {
           backendInstanceGeneration
         );
         const complete = (store: OperationalStore): { readonly sessionId: string } => {
-            const currentTarget = store.getTarget(input.targetId);
+            const currentTarget = this.assertTargetAcceptsSessionCreation(store, input.targetId);
             if (currentTarget.revision !== target.revision) {
               throw new RevisionConflictError("Target", input.targetId, target.revision, currentTarget.revision);
             }
@@ -8421,7 +8543,7 @@ export class SessionHost {
               createdAt: presentationCreatedAt,
               updatedAt: presentationAt
             };
-            store.createSession(descriptor, {
+            const created = store.createSession(descriptor, {
               nativeSessionBlank: nativeStart.kind === "new"
                 && nativeStart.parentNativeReference === undefined
             });
@@ -8434,6 +8556,22 @@ export class SessionHost {
                 sessionId,
                 expectedRevision: created.revision,
                 movedAt: presentationAt
+              });
+            } else {
+              // A creator refreshes its own Snapshot after the mutation, but
+              // every already-connected owner relies on the durable Event
+              // stream. Publish the complete newly created Task in this same
+              // transaction so independent windows cannot miss its identity.
+              store.appendEvent({
+                id: stableId("event", `${input.operationId}:created-session`),
+                backendId: created.descriptor.backendId,
+                targetId: created.descriptor.targetId,
+                sessionId,
+                operationId: input.operationId,
+                generation: created.descriptor.binding.generation,
+                emittedAt: now,
+                traceId: `created-session:${sessionId}:${created.descriptor.binding.generation}`,
+                payload: { type: "session_changed" }
               });
             }
             return { sessionId };
@@ -10077,17 +10215,6 @@ export class SessionHost {
       this.#active.get(sessionId)?.backendInstanceGeneration ??
       backend.instanceGeneration;
     const extraDirectoriesSupported = backend.capabilities.get("workspace.extra_dirs")?.supported === true;
-    const artifactWorkspaceAuthority = (registered: TargetDescriptor, effective: TargetDescriptor, ownedWorktree: SessionDescriptor["worktree"]): string => operationBodyHash({
-      targetId: registered.id,
-      backendId: registered.backendId,
-      workspaceRoot: registered.workspaceRoot,
-      trusted: registered.trusted,
-      managed: registered.managed,
-      remoteWorkspace: registered.remoteWorkspace ?? null,
-      effectiveWorkspaceRoot: effective.workspaceRoot,
-      effectiveRemoteWorkspace: effective.remoteWorkspace ?? null,
-      worktree: ownedWorktree ?? null
-    });
     const originalArtifactAuthority = artifactWorkspaceAuthority(this.#store.getTarget(target.id).descriptor, target, worktree);
     return {
       sessionId,
@@ -10351,6 +10478,21 @@ export class SessionHost {
         };
         assertArtifactAuthority(this.#store);
         const artifact = await this.#artifactStore.ingestPath(sourcePath, { ...options, expiresAt: Date.now() + 10 * 60_000 });
+        let localSource: Awaited<ReturnType<typeof validateLocalArtifactSource>> | undefined;
+        if (target.remoteWorkspace === undefined) {
+          try {
+            const validated = await validateLocalArtifactSource({
+              workspaceRoot: target.workspaceRoot,
+              sourcePath,
+              expectedSha256: artifact.sha256,
+              expectedByteLength: artifact.byteLength
+            });
+            if (await realpath(target.workspaceRoot) === validated.workspaceRoot) localSource = validated;
+          } catch {
+            // A canonical Artifact remains valid without local source authority.
+            // Never leak or persist a path that failed exact provenance checks.
+          }
+        }
         try {
           const blob = this.#store.transaction((store) => {
             const current = assertArtifactAuthority(store);
@@ -10360,6 +10502,17 @@ export class SessionHost {
             });
             const selected = adopted.blob;
             if (existing !== undefined) store.releaseArtifactStaging([artifact.id]);
+            if (localSource !== undefined && !store.hasArtifactSource(selected.id)) {
+              store.putArtifactSource({
+                artifactId: selected.id,
+                sessionId,
+                targetId: current.descriptor.targetId,
+                generation,
+                authorityHash: originalArtifactAuthority,
+                workspaceRoot: localSource.workspaceRoot,
+                relativePath: localSource.relativePath
+              });
+            }
             const artifactEventId = `backend-artifact-${createHash("sha256")
               .update(sessionId).update("\0").update(selected.id).digest("hex")}`;
             store.appendEventIfAbsent({
@@ -11525,6 +11678,57 @@ export class SessionHost {
     };
   }
 
+  private artifactSourceAuthority(sessionId: string, artifactId: string): ArtifactSourceAuthoritySnapshot {
+    this.#assertOpen();
+    const artifact = this.#store.getArtifact(artifactId);
+    const source = this.#store.getArtifactSource(artifactId);
+    const session = this.#store.getSession(sessionId);
+    if (source.sessionId !== sessionId || artifact.sessionId !== sessionId ||
+      session.descriptor.deletedAt !== undefined || source.targetId !== session.descriptor.targetId ||
+      source.generation !== session.descriptor.binding.generation ||
+      session.descriptor.worktree !== undefined && session.descriptor.worktree.state !== "active") {
+      throw artifactSourceUnavailable();
+    }
+    const target = this.#store.getTarget(source.targetId);
+    const effectiveTarget = this.targetForSession(session);
+    const authorityHash = artifactWorkspaceAuthority(
+      target.descriptor,
+      effectiveTarget,
+      session.descriptor.worktree
+    );
+    if (target.descriptor.remoteWorkspace !== undefined || effectiveTarget.remoteWorkspace !== undefined ||
+      source.authorityHash !== authorityHash) throw artifactSourceUnavailable();
+    return {
+      artifact,
+      source,
+      session,
+      target,
+      effectiveTarget,
+      fingerprint: operationBodyHash({
+        artifact: { blob: artifact.blob, revision: artifact.revision.toString() },
+        source: {
+          artifactId: source.artifactId,
+          sessionId: source.sessionId,
+          targetId: source.targetId,
+          generation: source.generation,
+          authorityHash: source.authorityHash,
+          workspaceRoot: source.workspaceRoot,
+          relativePath: source.relativePath,
+          revision: source.revision.toString()
+        },
+        session: {
+          targetId: session.descriptor.targetId,
+          backendId: session.descriptor.backendId,
+          generation: session.descriptor.binding.generation,
+          deletedAt: session.descriptor.deletedAt ?? null,
+          remoteWorkspace: session.descriptor.remoteWorkspace ?? null,
+          worktree: session.descriptor.worktree ?? null
+        },
+        target: { revision: target.revision.toString(), authorityHash }
+      })
+    };
+  }
+
   private backendResourceCatalogEpoch(backendId: string): bigint {
     return this.#backendResourceCatalogEpochs.get(backendId) ?? 0n;
   }
@@ -11910,6 +12114,15 @@ export class SessionHost {
   #assertOpen(): void {
     if (this.#disposed) throw new Error("Session Host is closed.");
   }
+}
+
+interface ArtifactSourceAuthoritySnapshot {
+  readonly artifact: ArtifactRecord;
+  readonly source: ArtifactSourceRecord;
+  readonly session: StoredSession;
+  readonly target: StoredTarget;
+  readonly effectiveTarget: TargetDescriptor;
+  readonly fingerprint: string;
 }
 
 function promptInputMessageBlocks(input: PromptInput): readonly MessageBlock[] {
@@ -13632,6 +13845,35 @@ function storedBackendInstanceGeneration(store: OperationalStore, backendId: str
   } catch {
     return undefined;
   }
+}
+
+function artifactWorkspaceAuthority(
+  registered: TargetDescriptor,
+  effective: TargetDescriptor,
+  ownedWorktree: SessionDescriptor["worktree"]
+): string {
+  return operationBodyHash({
+    targetId: registered.id,
+    backendId: registered.backendId,
+    workspaceRoot: registered.workspaceRoot,
+    trusted: registered.trusted,
+    managed: registered.managed,
+    remoteWorkspace: registered.remoteWorkspace ?? null,
+    effectiveWorkspaceRoot: effective.workspaceRoot,
+    effectiveRemoteWorkspace: effective.remoteWorkspace ?? null,
+    worktree: ownedWorktree ?? null
+  });
+}
+
+function artifactSourceUnavailable(): StoreError {
+  return new StoreError("Artifact source is unavailable or no longer authorized.");
+}
+
+function throwIfArtifactSourceAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted !== true) return;
+  const error = new Error("Artifact source resolution was cancelled.");
+  error.name = "AbortError";
+  throw error;
 }
 
 function staleBackendInstanceContextError(): JokoError {

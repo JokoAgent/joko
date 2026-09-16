@@ -1,9 +1,11 @@
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError, type Transport } from "@connectrpc/connect";
 import {
+  EntityKind,
   GetSnapshotResponseSchema,
   ListManagedModelRuntimesResponseSchema,
   OperationState,
+  PrepareTargetWorkspaceResponseSchema,
   SnapshotSchema,
   SubmitOperationResponseSchema
 } from "@joko/contracts";
@@ -51,12 +53,14 @@ describe("operation ID lifecycle", () => {
 
   it("sends the personalization snapshot only for a fresh native task", async () => {
     const createMutations: any[] = [];
+    const createPreconditions: any[] = [];
     const gateway = createOrchestratorGateway(
       { id: "connection-1", deviceId: "device-test", name: "Desktop", origin: "https://orchestrator.example" , serverId: "server-test" },
       "secret",
       {},
       () => operationTransport(async (method, input) => {
         createMutations.push(input.mutation.payload.value);
+        createPreconditions.push(input.mutation.preconditions);
         return successfulSessionResponse(method, input, `session-${createMutations.length}`);
       })
     );
@@ -83,6 +87,10 @@ describe("operation ID lifecycle", () => {
       modifiedAt: { seconds: 123n, nanos: 456_000_000 },
       snapshotToken: "snapshot-token"
     });
+    expect(createPreconditions[0]).toMatchObject([{
+      entity: { kind: EntityKind.TARGET, id: "target-1" },
+      expectedRevision: { value: 1n }
+    }]);
     gateway.disconnect();
   });
 
@@ -402,11 +410,45 @@ describe("operation ID lifecycle", () => {
     });
     gateway.disconnect();
   });
+
+  it("returns the exact Target from the authoritative snapshot after an archive mutation", async () => {
+    let targets: any[] = [targetDescriptor(true)];
+    const payloads: any[] = [];
+    const gateway = createOrchestratorGateway(
+      { id: "connection-1", deviceId: "device-test", name: "Desktop", origin: "https://orchestrator.example", serverId: "server-test" },
+      "secret",
+      {},
+      () => operationTransport(async (method, input) => {
+        payloads.push(input.mutation.payload);
+        targets = [targetDescriptor(false, 2n)];
+        return response(method, create(SubmitOperationResponseSchema, {
+          operation: {
+            operationId: input.operationId,
+            connectionId: input.connectionId,
+            state: OperationState.SUCCEEDED
+          }
+        }));
+      }, [], () => targets)
+    );
+    await gateway.connect();
+
+    await expect(gateway.archiveTarget("target-1", false)).resolves.toMatchObject({
+      id: "target-1",
+      archived: false,
+      revision: 2n
+    });
+    expect(payloads).toEqual([expect.objectContaining({
+      case: "archiveTarget",
+      value: expect.objectContaining({ targetId: "target-1", archived: false })
+    })]);
+    gateway.disconnect();
+  });
 });
 
 function operationTransport(
   submit: (method: any, input: any) => Promise<any>,
-  sessions: any[] = []
+  sessions: any[] = [],
+  targets: readonly any[] | (() => readonly any[]) = [targetDescriptor(false)]
 ): Transport {
   return {
     unary: vi.fn(async (method: any, _signal: unknown, _timeout: unknown, _headers: unknown, input: any) => {
@@ -415,13 +457,7 @@ function operationTransport(
           snapshot: create(SnapshotSchema, {
             generation: 1n,
             resumeCursor: { generation: 1n, sequence: 0n },
-            targets: [{
-              targetId: "target-1",
-              backendId: "pi",
-              displayName: "Local workspace",
-              workspaceId: "workspace-1",
-              version: { revision: { value: 1n } }
-            }],
+            targets: typeof targets === "function" ? [...targets()] : [...targets],
             sessions
           })
         }));
@@ -429,11 +465,33 @@ function operationTransport(
       if (method.localName === "listManagedModelRuntimes") {
         return response(method, create(ListManagedModelRuntimesResponseSchema, {}));
       }
+      if (method.localName === "prepareTargetWorkspace") {
+        return response(method, create(PrepareTargetWorkspaceResponseSchema, {
+          workspace: {
+            workspaceId: "workspace-1",
+            targetId: input.targetId,
+            displayName: "Local workspace",
+            serverPathDisplay: "D:\\workspace",
+            version: { revision: input.expectedTargetRevision }
+          }
+        }));
+      }
       if (method.localName === "submitOperation") return submit(method, input);
       throw new Error(`Unexpected method: ${method.localName}`);
     }),
     stream: vi.fn(async (method: any) => response(method, idleStream(), true))
   } as unknown as Transport;
+}
+
+function targetDescriptor(archived: boolean, revision = 1n): any {
+  return {
+    targetId: "target-1",
+    backendId: "pi",
+    displayName: "Local workspace",
+    workspaceId: "workspace-1",
+    archived,
+    version: { revision: { value: revision } }
+  };
 }
 
 function successfulSessionResponse(method: any, input: any, sessionId: string): any {

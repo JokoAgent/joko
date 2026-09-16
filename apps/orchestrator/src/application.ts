@@ -59,7 +59,8 @@ import { BrowserProvider, type BrowserActivity } from "@joko/tool-browser";
 import { TerminalProvider } from "@joko/tool-terminal";
 import { RemoteTerminalRuntimeResolver } from "./remote-terminal-runtime.js";
 import { RemoteCodexRuntimeResolver } from "./remote-codex-read-runtime.js";
-import { RemoteCodexMcpBridgeManager } from "./remote-codex-mcp-bridge.js";
+import { CodexMcpBridgeManager } from "./remote-codex-mcp-bridge.js";
+import { createClaudeMcpBridge } from "./claude-mcp-bridge.js";
 import { RemoteClaudeRuntimeResolver } from "./remote-claude-runtime.js";
 import {
   ComputerRuntime,
@@ -959,6 +960,7 @@ export async function createOrchestratorApplication(
         const managedProviders = managedRuntime(instanceId, generation, CODEX_MANAGED_PROVIDER_SUPPORT);
         const codexHome = resolve(process.env["CODEX_HOME"] ?? join(userInfo().homedir, ".codex"));
         let smartRouting: Awaited<ReturnType<typeof prepareCodexSmartRouting>> | undefined;
+        let mcpBridge: CodexMcpBridgeManager | undefined;
         try {
           smartRouting = await prepareCodexSmartRouting({
             desired: subagentModels.smartRoutingEnabled(instanceId),
@@ -968,17 +970,19 @@ export async function createOrchestratorApplication(
             nativeProviderId: "openai",
             managedCandidates: managedProviders.listSmartRoutingCandidates?.() ?? []
           });
+          mcpBridge = new CodexMcpBridgeManager({
+            router: mcpRouter,
+            includeToolPolicy: (sessionId, targetId, policyId) =>
+              toolPolicies.enabledForSession(sessionId, targetId, policyId)
+          });
           return createCodexAdapter({
             id: instanceId,
             instanceGeneration: generation,
+            localMcpBridge: (input) => mcpBridge!.openLocal(input),
             remoteRuntimes: new RemoteCodexRuntimeResolver({
               store,
               registry: remoteHosts,
-              mcpBridge: new RemoteCodexMcpBridgeManager({
-                router: mcpRouter,
-                includeToolPolicy: (sessionId, targetId, policyId) =>
-                  toolPolicies.enabledForSession(sessionId, targetId, policyId)
-              })
+              mcpBridge
             }),
             resolveNativeMemoryEnabled: () => makerMemory.nativeEnabledForBackend(instanceId, false),
             managedProviders,
@@ -1014,6 +1018,7 @@ export async function createOrchestratorApplication(
           });
         } catch (error) {
           const cleanup = await Promise.allSettled([
+            mcpBridge?.shutdown() ?? Promise.resolve(),
             smartRouting?.cleanup() ?? Promise.resolve(),
             Promise.resolve().then(() => managedProviders.dispose())
           ]);
@@ -1032,6 +1037,21 @@ export async function createOrchestratorApplication(
       create: ({ instanceId, generation }) => createClaudeCodeAdapter({
         id: instanceId,
         instanceGeneration: generation,
+        mcpBridge: createClaudeMcpBridge({
+          router: mcpRouter,
+          assertSessionCurrent: (sessionId, targetId, sessionGeneration) => {
+            const session = store.getSession(sessionId).descriptor;
+            const target = store.getTarget(targetId).descriptor;
+            const backend = backendInstances.get(instanceId);
+            if (session.deletedAt !== undefined || session.archived || session.targetId !== targetId
+              || session.backendId !== instanceId || session.binding.generation !== sessionGeneration
+              || target.backendId !== instanceId || backend.state !== "available" || backend.generation !== generation) {
+              throw new Error("The Claude MCP product Session authority is stale.");
+            }
+          },
+          includeToolPolicy: (sessionId, targetId, policyId) =>
+            toolPolicies.enabledForSession(sessionId, targetId, policyId)
+        }),
         remoteRuntimes: new RemoteClaudeRuntimeResolver({
           store,
           registry: remoteHosts

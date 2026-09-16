@@ -6,7 +6,10 @@ import Paragraph from "@tiptap/extension-paragraph";
 import Text from "@tiptap/extension-text";
 import { EditorContent, useEditor } from "@tiptap/react";
 import { Fragment, Slice } from "@tiptap/pm/model";
-import { TextSelection, type Transaction } from "@tiptap/pm/state";
+import { isHistoryTransaction } from "@tiptap/pm/history";
+import { Selection, TextSelection, type EditorState, type Transaction } from "@tiptap/pm/state";
+import { insertPoint } from "@tiptap/pm/transform";
+import type { EditorView } from "@tiptap/pm/view";
 import { forwardRef, useEffect, useImperativeHandle, useRef, type JSX } from "react";
 import { composerDocumentIsEmpty, normalizeComposerDocument } from "../composer-quote-document.js";
 import { composerDocumentContainsList } from "../composer-list-document.js";
@@ -49,12 +52,36 @@ import {
 import { plainTextToComposerDocument } from "../composer-quote-document.js";
 import { ComposerCjkPunctuationDecoration } from "./composer-cjk-punctuation.js";
 import { createComposerMentionTransactionMapper, type ComposerMentionRangeMapper } from "../composer-mention-transaction.js";
+import {
+  clearComposerInternalDropCaret,
+  clearComposerInternalDropCaretOn,
+  ComposerInternalDropCaret,
+  composerInternalDropCaretPosition,
+  setComposerInternalDropCaret
+} from "./composer-internal-drop-caret.js";
+import {
+  composerListNormalizationIsSkipped,
+  skipComposerListNormalization
+} from "./composer-list-normalization.js";
+
+interface ComposerListNormalizationFence {
+  compositionRepairGeneration: number;
+  historyMicrotaskGeneration: number;
+  historySuppressed: boolean;
+}
+
+export type ComposerRouteReferenceDropAction =
+  | { readonly kind: "start" }
+  | { readonly kind: "move"; readonly clientX: number; readonly clientY: number }
+  | { readonly kind: "commit"; readonly clientX: number; readonly clientY: number; readonly insertion: ComposerInternalDropInsertion }
+  | { readonly kind: "cancel" };
 
 export interface ComposerRichTextEditorHandle {
   readonly focus: (position?: "start" | "end") => void;
   readonly focusFromBlankSurface: () => void;
   readonly editPastedText: (nodePosition: number, expectedText: string, nextText: string, display: string) => boolean;
   readonly insertRouteReference: (insertion: ComposerInternalDropInsertion) => boolean;
+  readonly routeReferenceDrop: (action: ComposerRouteReferenceDropAction) => boolean;
 }
 
 export const ComposerRichTextEditor = forwardRef<ComposerRichTextEditorHandle, {
@@ -73,13 +100,18 @@ export const ComposerRichTextEditor = forwardRef<ComposerRichTextEditorHandle, {
 }>(function ComposerRichTextEditor({ document, editable, disabled, placeholder, onDocumentChange, onKeyDown, onClipboardFiles, pastedTextLabel, onPastedTextOpen, workingDirectory, knownWorkspacePaths = [], resolveRouteReference }, forwardedRef): JSX.Element {
   const pasteRuntimeRef = useRef({ editable, disabled, onClipboardFiles, pastedTextLabel, workingDirectory, knownWorkspacePaths, resolveRouteReference });
   const pendingMentionTransactionsRef = useRef<readonly Transaction[]>([]);
+  const listNormalizationFenceRef = useRef<ComposerListNormalizationFence>({
+    compositionRepairGeneration: 0,
+    historyMicrotaskGeneration: 0,
+    historySuppressed: false
+  });
   pasteRuntimeRef.current = { editable, disabled, onClipboardFiles, pastedTextLabel, workingDirectory, knownWorkspacePaths, resolveRouteReference };
   const editor = useEditor({
     immediatelyRender: false,
     shouldRerenderOnTransaction: false,
     editable: editable && !disabled,
     content: normalizeComposerDocument(document),
-    extensions: [Document, Paragraph, Text, ComposerListItem, ComposerBulletList, ComposerOrderedList, HardBreak, History, ComposerQuoteNode, ComposerPastedTextNode, ComposerRouteReferenceNode, ComposerCjkPunctuationDecoration],
+    extensions: [Document, Paragraph, Text, ComposerListItem, ComposerBulletList, ComposerOrderedList, HardBreak, History, ComposerQuoteNode, ComposerPastedTextNode, ComposerRouteReferenceNode, ComposerCjkPunctuationDecoration, ComposerInternalDropCaret],
     editorProps: {
       attributes: {
         class: "composer-rich-editor__content",
@@ -113,8 +145,13 @@ export const ComposerRichTextEditor = forwardRef<ComposerRichTextEditorHandle, {
       },
       handleDOMEvents: {
         compositionend: (view) => {
-          window.setTimeout(() => {
-            if (!view.isDestroyed && !view.composing) promoteTrailingPlainListParagraph(view);
+          const repairGeneration = listNormalizationFenceRef.current.compositionRepairGeneration;
+          const normalizationSuppressedAtCompositionEnd = listNormalizationFenceRef.current.historySuppressed;
+          view.dom.ownerDocument.defaultView?.setTimeout(() => {
+            if (normalizationSuppressedAtCompositionEnd || view.isDestroyed || view.composing
+              || listNormalizationFenceRef.current.compositionRepairGeneration !== repairGeneration
+              || listNormalizationFenceRef.current.historySuppressed) return;
+            promoteTrailingPlainListParagraph(view);
           }, 0);
           return false;
         }
@@ -140,7 +177,7 @@ export const ComposerRichTextEditor = forwardRef<ComposerRichTextEditorHandle, {
             display: runtime.pastedTextLabel(countComposerPasteLines(text))
           });
           if (node === undefined) return false;
-          view.dispatch(view.state.tr.replaceSelectionWith(node).scrollIntoView());
+          view.dispatch(skipComposerListNormalization(view.state.tr.replaceSelectionWith(node)).scrollIntoView());
           return true;
         }
         const segments = segmentComposerPaste(text, { workingDirectory: runtime.workingDirectory });
@@ -148,7 +185,9 @@ export const ComposerRichTextEditor = forwardRef<ComposerRichTextEditorHandle, {
           const insertion = composerPasteNodes(view.state.schema, segments, runtime.workingDirectory, new Set(runtime.knownWorkspacePaths));
           if (insertion !== undefined) {
             event.preventDefault();
-            view.dispatch(view.state.tr.replaceSelection(new Slice(Fragment.from(insertion.nodes), 0, 0)).scrollIntoView());
+            view.dispatch(skipComposerListNormalization(
+              view.state.tr.replaceSelection(new Slice(Fragment.from(insertion.nodes), 0, 0))
+            ).scrollIntoView());
             resolveComposerRouteReferences(view, insertion.pending, runtime.resolveRouteReference);
             return true;
           }
@@ -171,11 +210,21 @@ export const ComposerRichTextEditor = forwardRef<ComposerRichTextEditorHandle, {
     },
     onCreate: ({ editor: activeEditor }) => setEditorEmptyAttribute(activeEditor.view.dom, activeEditor.getJSON()),
     onTransaction: ({ editor: activeEditor, transaction, appendedTransactions }) => {
-      if (transaction.getMeta("preventUpdate") || ![transaction, ...appendedTransactions].some((entry) => entry.docChanged)) return;
+      const documentTransactions = [transaction, ...appendedTransactions].filter((entry) => entry.docChanged);
+      if (documentTransactions.length === 0) return;
+      if (transaction.getMeta("preventUpdate")) {
+        listNormalizationFenceRef.current.compositionRepairGeneration += 1;
+        return;
+      }
       // List promotion dispatches another update synchronously. Its mapping
       // starts after this transaction, while the parent still owns the old ranges.
       pendingMentionTransactionsRef.current = [...pendingMentionTransactionsRef.current, transaction, ...appendedTransactions];
-      if (!activeEditor.view.composing && promoteTrailingPlainListParagraph(activeEditor.view)) return;
+      const historyChange = documentTransactions.some((entry) => isHistoryTransaction(entry));
+      if (historyChange) suppressComposerListNormalizationThroughOwnerMicrotask(activeEditor.view, listNormalizationFenceRef.current);
+      const normalizationSkipped = documentTransactions.some((entry) => composerListNormalizationIsSkipped(entry));
+      if (historyChange || normalizationSkipped) listNormalizationFenceRef.current.compositionRepairGeneration += 1;
+      if (!normalizationSkipped && !listNormalizationFenceRef.current.historySuppressed
+        && !historyChange && !activeEditor.view.composing && promoteTrailingPlainListParagraph(activeEditor.view)) return;
       const next = normalizeComposerDocument(activeEditor.getJSON());
       const rangeMapper = createComposerMentionTransactionMapper(pendingMentionTransactionsRef.current);
       pendingMentionTransactionsRef.current = [];
@@ -199,14 +248,36 @@ export const ComposerRichTextEditor = forwardRef<ComposerRichTextEditorHandle, {
     },
     insertRouteReference: (insertion) => {
       if (editor === null || editor.isDestroyed || !pasteRuntimeRef.current.editable || pasteRuntimeRef.current.disabled) return false;
-      const routeType = editor.state.schema.nodes[ComposerRouteReferenceNode.name];
-      if (routeType === undefined) return false;
-      editor.view.dispatch(editor.state.tr.replaceSelectionWith(routeType.create(insertion.attrs)).scrollIntoView());
-      if (insertion.pending !== undefined) {
-        resolveComposerRouteReferences(editor.view, [insertion.pending], pasteRuntimeRef.current.resolveRouteReference);
+      return insertComposerRouteReference(editor.view, insertion, editor.state.selection.from, pasteRuntimeRef.current.resolveRouteReference, true);
+    },
+    routeReferenceDrop: (action) => {
+      if (editor === null || editor.isDestroyed) return false;
+      if (action.kind === "cancel") {
+        clearComposerInternalDropCaret(editor.view);
+        return true;
       }
-      editor.commands.focus();
-      return true;
+      if (!pasteRuntimeRef.current.editable || pasteRuntimeRef.current.disabled || !editor.isEditable) {
+        clearComposerInternalDropCaret(editor.view);
+        return false;
+      }
+      if (action.kind === "start") {
+        if (composerInternalDropCaretPosition(editor.state) !== undefined) return true;
+        const position = composerRouteReferenceInsertionPosition(editor.state, editor.state.selection.from);
+        if (position === undefined) return false;
+        setComposerInternalDropCaret(editor.view, position);
+        return true;
+      }
+      const fallbackPosition = composerInternalDropCaretPosition(editor.state);
+      if (fallbackPosition === undefined) return false;
+      const coordinatePosition = composerRouteReferencePositionAtCoordinates(editor.view, action.clientX, action.clientY);
+      if (action.kind === "move") {
+        if (coordinatePosition !== undefined && coordinatePosition !== fallbackPosition) {
+          setComposerInternalDropCaret(editor.view, coordinatePosition);
+        }
+        return true;
+      }
+      const position = coordinatePosition ?? fallbackPosition;
+      return insertComposerRouteReference(editor.view, action.insertion, position, pasteRuntimeRef.current.resolveRouteReference);
     },
     editPastedText: (nodePosition, expectedText, nextText, display) => {
       if (editor === null) return false;
@@ -220,6 +291,7 @@ export const ComposerRichTextEditor = forwardRef<ComposerRichTextEditorHandle, {
   useEffect(() => {
     if (editor === null || editor.isDestroyed) return;
     editor.setEditable(editable && !disabled);
+    if (!editable || disabled) clearComposerInternalDropCaret(editor.view);
   }, [disabled, editable, editor]);
 
   useEffect(() => {
@@ -243,6 +315,81 @@ export const ComposerRichTextEditor = forwardRef<ComposerRichTextEditorHandle, {
     />
   );
 });
+
+function composerRouteReferenceInsertionPosition(state: EditorState, requestedPosition: number): number | undefined {
+  const routeType = state.schema.nodes[ComposerRouteReferenceNode.name];
+  if (routeType === undefined || !Number.isFinite(requestedPosition)) return undefined;
+  const boundedPosition = Math.max(0, Math.min(Math.trunc(requestedPosition), state.doc.content.size));
+  return insertPoint(state.doc, boundedPosition, routeType) ?? undefined;
+}
+
+function composerRouteReferencePositionAtCoordinates(view: EditorView, clientX: number, clientY: number): number | undefined {
+  if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) return undefined;
+  try {
+    const coordinates = view.posAtCoords({ left: clientX, top: clientY });
+    return coordinates === null
+      ? undefined
+      : composerRouteReferenceInsertionPosition(view.state, coordinates.pos);
+  } catch {
+    return undefined;
+  }
+}
+
+function insertComposerRouteReference(
+  view: EditorView,
+  insertion: ComposerInternalDropInsertion,
+  requestedPosition: number,
+  resolver: ComposerRouteReferenceResolver | undefined,
+  replaceSelection = false
+): boolean {
+  if (view.isDestroyed) return false;
+  const routeType = view.state.schema.nodes[ComposerRouteReferenceNode.name];
+  const position = replaceSelection
+    ? view.state.selection.from
+    : composerRouteReferenceInsertionPosition(view.state, requestedPosition);
+  if (routeType === undefined || position === undefined) {
+    clearComposerInternalDropCaret(view);
+    return false;
+  }
+  try {
+    const node = routeType.create(insertion.attrs);
+    const transaction = skipComposerListNormalization(view.state.tr);
+    if (replaceSelection) {
+      transaction.replaceSelectionWith(node);
+    } else {
+      transaction.insert(position, node);
+      transaction.setSelection(Selection.near(transaction.doc.resolve(position + node.nodeSize), 1));
+    }
+    clearComposerInternalDropCaretOn(transaction);
+    view.dispatch(transaction.scrollIntoView());
+  } catch {
+    clearComposerInternalDropCaret(view);
+    return false;
+  }
+  if (insertion.pending !== undefined) {
+    try {
+      resolveComposerRouteReferences(view, [insertion.pending], resolver);
+    } catch {
+      // Enrichment failure must not undo or duplicate the committed atom.
+    }
+  }
+  try { view.focus(); } catch { /* The committed document remains authoritative if its DOM retires. */ }
+  return true;
+}
+
+function suppressComposerListNormalizationThroughOwnerMicrotask(
+  view: EditorView,
+  fence: ComposerListNormalizationFence
+): void {
+  const ownerWindow = view.dom.ownerDocument.defaultView;
+  if (ownerWindow === null) return;
+  const generation = fence.historyMicrotaskGeneration + 1;
+  fence.historyMicrotaskGeneration = generation;
+  fence.historySuppressed = true;
+  ownerWindow.queueMicrotask(() => {
+    if (fence.historyMicrotaskGeneration === generation) fence.historySuppressed = false;
+  });
+}
 
 function setEditorEmptyAttribute(element: HTMLElement, document: JSONContent): void {
   element.dataset["empty"] = composerDocumentIsEmpty(document) ? "true" : "false";

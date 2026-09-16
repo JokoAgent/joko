@@ -17,6 +17,7 @@ import {
 } from "@joko/core";
 import { describe, expect, test, vi } from "vitest";
 import { ClaudeCodeAdapter, type ClaudeCodeAdapterOptions } from "./adapter.js";
+import type { ClaudeMcpBridgePort, ClaudeMcpRuntimeLease } from "./mcp-bridge.js";
 import { SessionSdkFailure } from "./session-sdk-owner.js";
 import {
   CLAUDE_AGENT_SDK_VERSION,
@@ -47,6 +48,190 @@ const target: TargetDescriptor = {
 };
 
 describe("ClaudeCodeAdapter", () => {
+  test("isolates precommit MCP and binds a committed local root turn to a frozen product catalog", async () => {
+    const sdk = new FakeSdkRuntime();
+    let committed = false;
+    let released = false;
+    const calls: Array<{ readonly requestId: string; readonly arguments: Readonly<Record<string, unknown>> }> = [];
+    const tool = {
+      serverId: "approved-tools", name: "echo", description: "Echo an approved value",
+      inputSchema: { type: "object", properties: { value: { type: "string" } }, required: ["value"] },
+      outputSchema: { type: "object", properties: { echoed: { type: "string" } }, required: ["echoed"] }
+    } as const;
+    const lease: ClaudeMcpRuntimeLease = {
+      tools: [tool],
+      assertCurrent: () => { if (released || !committed) throw new Error("Stale product Session"); },
+      call: async (input) => {
+        calls.push({ requestId: input.requestId, arguments: input.arguments });
+        return { content: [{ type: "text", text: "approved" }], structuredContent: { echoed: "approved" }, isError: false };
+      },
+      release: () => { released = true; }
+    };
+    const bridge: ClaudeMcpBridgePort = { open: vi.fn(() => { if (!committed) throw new Error("Not durable"); return lease; }) };
+    const adapter = adapterFor(sdk, { mcpBridge: bridge });
+    const binding = await adapter.createSession(createInput(), contextFor().context);
+    expect(bridge.open).not.toHaveBeenCalled();
+    expect(sdk.queries[0]!.params.options).toMatchObject({ strictMcpConfig: true, mcpServers: {}, settingSources: ["user", "project", "local"] });
+    expect(sdk.queries[0]!.params.options.mcpTools).toBeUndefined();
+    committed = true;
+    const source = contextFor(binding, { operationId: "approved-mcp-turn" });
+    await adapter.send(textPrompt("Use the approved tool"), source.context);
+    expect(sdk.queries).toHaveLength(2);
+    expect(sdk.retiredQueries).toEqual([sdk.queries[0]]);
+    expect(sdk.queries[1]!.params.options.resume).toBe(binding.nativeSessionId);
+    expect(sdk.queries[1]!.params.options.mcpTools).toMatchObject([tool]);
+    const call = sdk.queries[1]!.params.options.mcpTools![0]!;
+    const toolUseId = "native-approved-call";
+    const invoke = () => call.call({ value: "hello" }, { toolUseId, signal: new AbortController().signal });
+    const earlyCall = invoke();
+    sdk.queries[1]!.push(assistantMessage(binding.nativeSessionId!, randomUUID(), [{
+      type: "tool_use", id: toolUseId, name: `mcp__joko_${createHash("sha256").update(tool.serverId).digest("hex").slice(0, 24)}__echo`, input: { value: "hello" }
+    }]));
+    await eventually(() => source.events.some((event) => event.type === "tool_start"));
+    await expect(earlyCall).resolves.toMatchObject({ content: [{ type: "text", text: "approved" }], structuredContent: { echoed: "approved" } });
+    expect(calls).toHaveLength(1);
+    sdk.queries[1]!.push(resultMessage(binding.nativeSessionId!, { result: "done", totalCostUsd: 0 }));
+    await eventually(() => source.events.some((event) => event.type === "done"));
+    await expect(invoke()).rejects.toThrow("active root tool owner");
+    await adapter.dispose();
+    expect(released).toBe(true);
+  });
+
+  test("binds a remote standard Query after durable Session identity and fences its root callback", async () => {
+    const remoteTarget: TargetDescriptor = {
+      ...target, id: "remote-mcp-target", workspaceRoot: "D:\\service-owned-placeholder",
+      remoteWorkspace: { hostId: "host-a", workspaceRoot: "/srv/project" }
+    };
+    const sdk = new FakeSdkRuntime({ initialFrameOverrides: { cwd: "/srv/project" } });
+    const calls = vi.fn(async () => ({
+      content: [{ type: "text", text: "remote approved" }],
+      structuredContent: { echoed: "remote approved" }, isError: false
+    }));
+    let committed = false;
+    let released = false;
+    const tool = {
+      serverId: "remote-approved", name: "echo", description: "Echo approved remote data",
+      inputSchema: { type: "object", properties: { value: { type: "string" } }, required: ["value"] }
+    } as const;
+    const bridge: ClaudeMcpBridgePort = { open: vi.fn(() => {
+      if (!committed) throw new Error("Not durable");
+      return { tools: [tool], assertCurrent: () => {
+        if (released) throw new Error("Retired remote authority");
+      }, call: calls, release: () => { released = true; } };
+    }) };
+    const adapter = adapterFor(new FakeSdkRuntime(), {
+      mcpBridge: bridge,
+      remoteRuntimes: { resolve: async () => ({
+        runtime: sdk, workspaceRoot: "/srv/project", remote: true, assertCurrent: () => undefined
+      }), close: async () => undefined }
+    });
+    const binding = await adapter.createSession(createInput({ target: remoteTarget }),
+      contextFor(undefined, { target: remoteTarget }).context);
+    expect(bridge.open).not.toHaveBeenCalled();
+    expect(sdk.queries[0]!.params.options).toMatchObject({ mcpServers: {}, strictMcpConfig: true });
+    expect(sdk.queries[0]!.params.options.mcpTools).toBeUndefined();
+    sdk.sessions.set(binding.nativeSessionId!, { ...sessionInfo(binding.nativeSessionId!), cwd: "/srv/project" });
+    committed = true;
+    const source = contextFor(binding, { target: remoteTarget, operationId: "remote-root-tool" });
+    await adapter.send(textPrompt("Use the approved remote tool"), source.context);
+    expect(sdk.queries).toHaveLength(2);
+    expect(sdk.retiredQueries).toEqual([sdk.queries[0]]);
+    expect(sdk.queries[1]!.params.options.resume).toBe(binding.nativeSessionId);
+    expect(sdk.queries[1]!.params.options.mcpTools).toMatchObject([tool]);
+    const callback = sdk.queries[1]!.params.options.mcpTools![0]!.call;
+    const toolUseId = "remote-native-root";
+    const pending = callback({ value: "hello" }, { toolUseId, signal: new AbortController().signal });
+    sdk.queries[1]!.push(assistantMessage(binding.nativeSessionId!, randomUUID(), [{
+      type: "tool_use", id: toolUseId,
+      name: `mcp__joko_${createHash("sha256").update(tool.serverId).digest("hex").slice(0, 24)}__echo`,
+      input: { value: "hello" }
+    }]));
+    await expect(pending).resolves.toMatchObject({ structuredContent: { echoed: "remote approved" } });
+    expect(calls).toHaveBeenCalledOnce();
+    sdk.queries[1]!.push(resultMessage(binding.nativeSessionId!, { result: "done", totalCostUsd: 0 }));
+    await eventually(() => source.events.some((event) => event.type === "done"));
+    await expect(callback({}, { toolUseId, signal: new AbortController().signal }))
+      .rejects.toThrow("active root tool owner");
+    await adapter.dispose();
+    expect(released).toBe(true);
+  });
+
+  test.each(["local", "remote"] as const)("keeps a no-tool %s Query isolated, retries at idle, and fails closed on uncertain retirement", async (location) => {
+    const remote = location === "remote";
+    const selectedTarget: TargetDescriptor = remote ? {
+      ...target, id: "remote-no-tool", workspaceRoot: "D:\\service-owned-placeholder",
+      remoteWorkspace: { hostId: "host-a", workspaceRoot: "/srv/project" }
+    } : target;
+    const sdk = new FakeSdkRuntime(remote ? { initialFrameOverrides: { cwd: "/srv/project" } } : {});
+    let toolsAvailable = false;
+    const bridge: ClaudeMcpBridgePort = { open: vi.fn(() => ({
+      tools: toolsAvailable ? [{ serverId: "approved", name: "read", description: "Read", inputSchema: { type: "object" } }] : [],
+      assertCurrent: () => undefined,
+      call: async () => ({ content: [], isError: false }),
+      release: () => undefined
+    })) };
+    const adapter = adapterFor(remote ? new FakeSdkRuntime() : sdk, {
+      mcpBridge: bridge,
+      ...(remote ? { remoteRuntimes: { resolve: async () => ({
+        runtime: sdk, workspaceRoot: "/srv/project", remote: true, assertCurrent: () => undefined
+      }), close: async () => undefined } } : {})
+    });
+    const binding = await adapter.createSession(createInput({ target: selectedTarget }),
+      contextFor(undefined, { target: selectedTarget }).context);
+    if (remote) sdk.sessions.set(binding.nativeSessionId!, {
+      ...sessionInfo(binding.nativeSessionId!), cwd: "/srv/project"
+    });
+    const first = contextFor(binding, { operationId: "no-tools", target: selectedTarget });
+    await adapter.send(textPrompt("plain text"), first.context);
+    expect(sdk.queries).toHaveLength(1);
+    expect(sdk.queries[0]!.params.options).toMatchObject({ strictMcpConfig: true, mcpServers: {} });
+    sdk.queries[0]!.push(resultMessage(binding.nativeSessionId!, { result: "done", totalCostUsd: 0 }));
+    await eventually(() => first.events.some((event) => event.type === "done"));
+    toolsAvailable = true;
+    sdk.retirementFailure = true;
+    await expect(adapter.send(textPrompt("not dispatched"), contextFor(binding, {
+      operationId: "bind-unknown", target: selectedTarget
+    }).context))
+      .rejects.toMatchObject({ publicError: { code: "MCP_QUERY_BIND_UNKNOWN", stateMayHaveChanged: true } });
+    expect(sdk.queries).toHaveLength(1);
+    expect(sdk.queries[0]!.receivedInputs).toHaveLength(1);
+    sdk.retirementFailure = false;
+    await adapter.dispose();
+  });
+
+  test("aborts an in-flight product Tool call when its native root turn settles", async () => {
+    const sdk = new FakeSdkRuntime();
+    let finish!: (value: { readonly content: readonly unknown[]; readonly isError: boolean }) => void;
+    let toolSignal: AbortSignal | undefined;
+    const adapter = adapterFor(sdk, { mcpBridge: { open: () => ({
+      tools: [{ serverId: "approved", name: "wait", description: "Wait", inputSchema: { type: "object" } }],
+      assertCurrent: () => undefined,
+      call: (input) => {
+        toolSignal = input.signal;
+        return new Promise((resolve) => { finish = resolve; });
+      },
+      release: () => undefined
+    }) } });
+    const binding = await adapter.createSession(createInput(), contextFor().context);
+    const source = contextFor(binding, { operationId: "settling-mcp-root" });
+    await adapter.send(textPrompt("Use wait"), source.context);
+    const query = sdk.queries[1]!;
+    const toolUseId = "wait-call";
+    query.push(assistantMessage(binding.nativeSessionId!, randomUUID(), [{
+      type: "tool_use", id: toolUseId,
+      name: `mcp__joko_${createHash("sha256").update("approved").digest("hex").slice(0, 24)}__wait`, input: {}
+    }]));
+    await eventually(() => source.events.some((event) => event.type === "tool_start"));
+    const pending = query.params.options.mcpTools![0]!.call({}, { toolUseId, signal: new AbortController().signal });
+    await eventually(() => toolSignal !== undefined);
+    query.push(resultMessage(binding.nativeSessionId!, { result: "done", totalCostUsd: 0 }));
+    await eventually(() => source.events.some((event) => event.type === "done"));
+    expect(toolSignal!.aborted).toBe(true);
+    finish({ content: [{ type: "text", text: "late" }], isError: false });
+    await expect(pending).rejects.toThrow();
+    await adapter.dispose();
+  });
+
   test("applies an exact configured effort mapping while retaining the product effort and excluding disabled levels", async () => {
     const managed = managedProviderFixture({ high: "xhigh", low: null });
     const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "configured-model", effort: "xhigh" } });
@@ -302,6 +487,8 @@ describe("ClaudeCodeAdapter", () => {
         cwd: target.workspaceRoot,
         permissionMode: "bypassPermissions",
         persistSession: false,
+        mcpServers: {},
+        strictMcpConfig: true,
         env: {
           CLAUDE_CODE_MAX_CONTEXT_TOKENS: "64000",
           CLAUDE_CODE_AUTO_COMPACT_WINDOW: "64000",
@@ -309,6 +496,7 @@ describe("ClaudeCodeAdapter", () => {
         },
         settings: {
           apiKeyHelper: "",
+          disableClaudeAiConnectors: true,
           modelOverrides: {},
           modelSettings: {
             "configured-model": { effortLevel: "low" },
@@ -1567,7 +1755,7 @@ describe("ClaudeCodeAdapter", () => {
     expect(descriptor.capabilities.get("model.fast_mode")?.supported).toBe(true);
     expect(descriptor.models.map((model) => model.supportsFastMode)).toEqual([true, false]);
     const binding = await adapter.createSession(createInput({ modelId: "model-a-20260801", fastMode: true }), contextFor().context);
-    expect(runtime.queries[0]!.params.options.settings).toEqual({ apiKeyHelper: "", fastMode: true });
+    expect(runtime.queries[0]!.params.options.settings).toEqual({ apiKeyHelper: "", disableClaudeAiConnectors: true, fastMode: true });
     await expect(adapter.inspectSession(binding, contextFor(binding).context)).resolves.toMatchObject({ fastMode: true });
     await adapter.dispose();
     const unavailable = new FakeSdkRuntime();
@@ -1745,7 +1933,7 @@ describe("ClaudeCodeAdapter", () => {
     const binding = await adapter.createSession(createInput({ modelId: "model-a" }), contextFor().context);
     const context = contextFor(binding).context;
     const query = runtime.queries[0]!;
-    expect(query.params.options.settings).toEqual({ apiKeyHelper: "", fastMode: false });
+    expect(query.params.options.settings).toEqual({ apiKeyHelper: "", disableClaudeAiConnectors: true, fastMode: false });
     await expect(adapter.setFastMode(true, { ...context, signal: AbortSignal.abort() }))
       .rejects.toMatchObject({ publicError: { code: "NATIVE_CONTROL_ABORTED", stateMayHaveChanged: false } });
     expect(query.settingCalls).toEqual([]);
@@ -1786,7 +1974,7 @@ describe("ClaudeCodeAdapter", () => {
     const context = contextFor(resumedBinding, { generation: 2 }).context;
     await adapter.resumeSession(binding, context);
     const resumedQuery = runtime.queries[1]!;
-    expect(resumedQuery.params.options.settings).toEqual({ apiKeyHelper: "" });
+    expect(resumedQuery.params.options.settings).toEqual({ apiKeyHelper: "", disableClaudeAiConnectors: true });
     await adapter.setModel("claude-code", "model-a", context);
     await adapter.setFastMode(true, context);
     expect(resumedQuery.settingCalls).toEqual([{ fastMode: true }]);
@@ -2666,7 +2854,8 @@ describe("ClaudeCodeAdapter", () => {
     const runtime = new FakeSdkRuntime();
     const resolveSubagentModel = vi.fn(() => "model-b");
     const resolveNativeMemoryEnabled = vi.fn(() => { throw new Error("Review must not read mutable Memory settings."); });
-    const adapter = adapterFor(runtime, { resolveSubagentModel, resolveNativeMemoryEnabled });
+    const mcpOpen = vi.fn((): never => { throw new Error("Review must not open a product Tool grant."); });
+    const adapter = adapterFor(runtime, { resolveSubagentModel, resolveNativeMemoryEnabled, mcpBridge: { open: mcpOpen } });
     const descriptor = await adapter.describe();
     expect(descriptor.capabilities.get("review.isolated")).toEqual({
       key: "review.isolated",
@@ -2768,6 +2957,7 @@ describe("ClaudeCodeAdapter", () => {
     });
 
     await adapter.send(textPrompt("Review the supplied evidence."), boundReview);
+    expect(mcpOpen).not.toHaveBeenCalled();
     expect(query.receivedInputs).toHaveLength(1);
     await expect(query.params.options.canUseTool(
       "Read",

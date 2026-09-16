@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { pointIsInsideAnyRectangle, pointIsInsideRectangle, sessionWindowDropBounds } from "../src/session-window-drop.js";
+import {
+  clampWindowBoundsToWorkArea,
+  pointIsInsideAnyRectangle,
+  pointIsInsideRectangle,
+  sessionWindowDropBounds
+} from "../src/session-window-drop.js";
 
 describe("task window drop geometry", () => {
   const workArea = { x: -1920, y: 0, width: 1920, height: 1080 };
@@ -47,6 +52,17 @@ describe("task window drop geometry", () => {
       workArea: { x: -1440, y: 0, width: 1440, height: 900 },
       windowSize: { width: 1800, height: 1200 }
     })).toEqual({ x: -1440, y: 0, width: 1440, height: 900 });
+  });
+
+  it("re-clamps the realized native frame when Electron grows the requested bounds", () => {
+    expect(clampWindowBoundsToWorkArea(
+      { x: 266, y: 55, width: 1107, height: 767 },
+      { x: 0, y: 0, width: 1366, height: 815 }
+    )).toEqual({ x: 259, y: 48, width: 1107, height: 767 });
+    expect(clampWindowBoundsToWorkArea(
+      { x: -10, y: -20, width: 1500, height: 900 },
+      { x: 0, y: 0, width: 1366, height: 815 }
+    )).toEqual({ x: 0, y: 0, width: 1366, height: 815 });
   });
 
   it("fails closed on non-finite geometry", () => {

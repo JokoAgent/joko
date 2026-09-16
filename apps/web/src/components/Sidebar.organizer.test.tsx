@@ -7,7 +7,7 @@ import { afterEach, beforeAll, describe, expect, it, onTestFinished, vi } from "
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
 import { emptySnapshot, type ExtensionCatalogEntryView, type ScheduleView, type SessionView } from "../model.js";
 import { DEFAULT_SIDEBAR_OWNER_LAYOUT, SIDEBAR_DIALOGUE_FILTER_ID, type SidebarDisplayPreferences } from "../sidebar-layout.js";
-import { Sidebar, type SidebarProps } from "./Sidebar.js";
+import { Sidebar, type SidebarProps, visibleSidebarSessionIds } from "./Sidebar.js";
 import { SIDEBAR_HOVER_CARD_CLOSE_DELAY_MS, SIDEBAR_HOVER_CARD_OPEN_DELAY_MS } from "./SidebarHoverCard.js";
 import type { Translator } from "./types.js";
 
@@ -84,7 +84,9 @@ describe("Sidebar organizer display controls", () => {
         sessionWindows: { beginDragPreview, endDragPreview, openIfDroppedOutside }
       }
     });
-    const rendered = await renderSidebar(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, vi.fn());
+    const rendered = await renderSidebar(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, vi.fn(), {
+      machineControl: activeProfileMachineControl("profile-local")
+    });
     const button = rendered.container.querySelector<HTMLButtonElement>("[data-session-id='session']");
     const row = button?.closest<HTMLElement>(".session-row");
     if (button === null || row === null || button === undefined || row === undefined) {
@@ -102,6 +104,7 @@ describe("Sidebar organizer display controls", () => {
       await Promise.resolve();
     });
     const request = beginDragPreview.mock.calls[0]?.[0] as JokoDesktopSessionDragPreviewRequest | undefined;
+    expect(request?.profileId).toBe("profile-local");
     expect(request?.sessionId).toBe("session");
     expect(setDragImage).toHaveBeenCalledOnce();
     expect(clearData).toHaveBeenCalledOnce();
@@ -130,7 +133,9 @@ describe("Sidebar organizer display controls", () => {
         sessionWindows: { beginDragPreview, endDragPreview, openIfDroppedOutside }
       }
     });
-    const rendered = await renderSidebar(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, vi.fn());
+    const rendered = await renderSidebar(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, vi.fn(), {
+      machineControl: activeProfileMachineControl("profile-local")
+    });
     const button = rendered.container.querySelector<HTMLButtonElement>("[data-session-id='session']");
     const row = button?.closest<HTMLElement>(".session-row");
     if (button === null || row === null || button === undefined || row === undefined) {
@@ -696,6 +701,49 @@ describe("Sidebar organizer display controls", () => {
     expect([...rendered.container.querySelectorAll<HTMLElement>(".sidebar__sessions [data-session-id]")].map((element) => element.dataset.sessionId)).toEqual(["pinned", "visible"]);
   });
 
+  it("prunes a newly hidden project in every mounted renderer without toggling it back", async () => {
+    const firstChange = vi.fn();
+    const secondChange = vi.fn();
+    const firstTarget = { id: "target", backendId: "backend", name: "First", workspaceId: "workspace", revision: 1n, workspaceName: "First", trusted: true, pinned: false, archived: false };
+    const secondTarget = { ...firstTarget, id: "second-target", name: "Second", workspaceId: "second-workspace", workspaceName: "Second" };
+    const visibleSnapshot = {
+      ...emptySnapshot(),
+      revision: 1n,
+      server: { name: "Orchestrator", version: "test", health: "healthy" as const },
+      backends: [{ id: "backend", name: "Backend", version: "1", health: "healthy" as const, capabilities: new Map() }],
+      targets: [firstTarget, secondTarget],
+      sessions: [session(), { ...session(), id: "second-session", targetId: secondTarget.id, projectId: secondTarget.id }]
+    };
+    const first = await renderSidebar(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, vi.fn(), {
+      snapshot: visibleSnapshot,
+      sidebarOwnerLayouts: { owner: { ...DEFAULT_SIDEBAR_OWNER_LAYOUT, projectFilter: [firstTarget.id] } },
+      onSidebarOwnerLayoutChange: firstChange
+    });
+    const second = await renderSidebar(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, vi.fn(), {
+      snapshot: visibleSnapshot,
+      sidebarOwnerLayouts: { owner: { ...DEFAULT_SIDEBAR_OWNER_LAYOUT, projectFilter: [firstTarget.id, secondTarget.id] } },
+      onSidebarOwnerLayoutChange: secondChange
+    });
+    const hiddenSnapshot = {
+      ...visibleSnapshot,
+      targets: [{ ...firstTarget, archived: true }, secondTarget]
+    };
+
+    await first.rerenderSnapshot(hiddenSnapshot);
+    await second.rerenderSnapshot(hiddenSnapshot);
+    expect(firstChange).toHaveBeenCalledExactlyOnceWith({ projectFilter: "all" });
+    expect(secondChange).toHaveBeenCalledExactlyOnceWith({ projectFilter: [secondTarget.id] });
+
+    await first.rerenderOwnerLayouts({ owner: { ...DEFAULT_SIDEBAR_OWNER_LAYOUT, projectFilter: "all" } });
+    await second.rerenderOwnerLayouts({ owner: { ...DEFAULT_SIDEBAR_OWNER_LAYOUT, projectFilter: [secondTarget.id] } });
+    firstChange.mockClear();
+    secondChange.mockClear();
+    await first.rerenderSnapshot(hiddenSnapshot);
+    await second.rerenderSnapshot(hiddenSnapshot);
+    expect(firstChange).not.toHaveBeenCalled();
+    expect(secondChange).not.toHaveBeenCalled();
+  });
+
   it("keeps archived pinned tasks in the independent pinned section", async () => {
     const rendered = await renderSidebar({ ...DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, status: "archived" }, vi.fn(), {
       snapshot: {
@@ -932,6 +980,148 @@ describe("Sidebar organizer display controls", () => {
     if (quickArchive === null || quickArchive === undefined) throw new Error("Quick archive action was not rendered.");
     await act(async () => quickArchive.click());
     expect(onArchive).toHaveBeenCalledWith(sessions[0]);
+  });
+
+  it("retires hidden and foreign-owner selections before bulk actions", async () => {
+    const onBulkArchive = vi.fn();
+    const first = { ...session(), id: "session-a", name: "Alpha", backendId: "backend-a" };
+    const second = { ...session(), id: "session-b", name: "Beta", backendId: "backend-b" };
+    const snapshot = {
+      ...emptySnapshot(),
+      revision: 1n,
+      server: { name: "Orchestrator", version: "test", health: "healthy" as const },
+      backends: [
+        { id: "backend-a", name: "Backend A", version: "1", health: "healthy" as const, capabilities: new Map() },
+        { id: "backend-b", name: "Backend B", version: "1", health: "healthy" as const, capabilities: new Map() }
+      ],
+      targets: [{ id: "target", backendId: "backend-a", name: "Project", workspaceId: "workspace", revision: 1n, workspaceName: "Project", trusted: true, pinned: false, archived: false }],
+      sessions: [first, second]
+    };
+    const rendered = await renderSidebar(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, vi.fn(), {
+      snapshot,
+      onBulkArchive
+    });
+
+    await act(async () => {
+      required(rendered.container.querySelector<HTMLElement>("[data-session-id='session-a']"))
+        .dispatchEvent(new MouseEvent("click", { bubbles: true, ctrlKey: true, detail: 1 }));
+      required(rendered.container.querySelector<HTMLElement>("[data-session-id='session-b']"))
+        .dispatchEvent(new MouseEvent("click", { bubbles: true, ctrlKey: true, detail: 1 }));
+    });
+    expect(rendered.container.querySelectorAll(".session-row.is-selected")).toHaveLength(2);
+
+    await rendered.rerender({
+      ...DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences,
+      backendId: "backend-a"
+    });
+    expect(rendered.container.querySelectorAll(".session-row.is-selected")).toHaveLength(1);
+    await act(async () => required(rendered.container.querySelector<HTMLButtonElement>(".sidebar-bulk-actions button[aria-label='session.archive']")).click());
+    expect(onBulkArchive).toHaveBeenCalledExactlyOnceWith([first]);
+
+    await rendered.rerender(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences);
+    await act(async () => required(rendered.container.querySelector<HTMLElement>("[data-session-id='session-a']"))
+      .dispatchEvent(new MouseEvent("click", { bubbles: true, ctrlKey: true, detail: 1 })));
+    expect(rendered.container.querySelectorAll(".session-row.is-selected")).toHaveLength(1);
+
+    const search = required(rendered.container.querySelector<HTMLInputElement>("#conversation-search-input"));
+    await act(async () => setNativeValue(search, "Alpha"));
+    expect(rendered.container.querySelector(".sidebar-bulk-actions")).toBeNull();
+    await act(async () => setNativeValue(search, ""));
+    await act(async () => required(rendered.container.querySelector<HTMLElement>("[data-session-id='session-a']"))
+      .dispatchEvent(new MouseEvent("click", { bubbles: true, ctrlKey: true, detail: 1 })));
+    expect(rendered.container.querySelectorAll(".session-row.is-selected")).toHaveLength(1);
+
+    await rendered.rerenderOwnerId("other-server");
+    expect(rendered.container.querySelectorAll(".session-row.is-selected")).toHaveLength(0);
+    expect(rendered.container.querySelector(".sidebar-bulk-actions")).toBeNull();
+    expect(onBulkArchive).toHaveBeenCalledTimes(1);
+  });
+
+  it("submits a Shift range in the current filtered and sorted render order", async () => {
+    const onBulkArchive = vi.fn();
+    const oldest = { ...session(), id: "oldest", name: "Oldest", updatedAt: 10 };
+    const newest = { ...session(), id: "newest", name: "Newest", updatedAt: 30 };
+    const middle = { ...session(), id: "middle", name: "Middle", updatedAt: 20 };
+    const rendered = await renderSidebar(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, vi.fn(), {
+      snapshot: {
+        ...emptySnapshot(),
+        revision: 1n,
+        server: { name: "Orchestrator", version: "test", health: "healthy" },
+        backends: [{ id: "backend", name: "Backend", version: "1", health: "healthy", capabilities: new Map() }],
+        targets: [{ id: "target", backendId: "backend", name: "Project", workspaceId: "workspace", revision: 1n, workspaceName: "Project", trusted: true, pinned: false, archived: false }],
+        sessions: [oldest, newest, middle]
+      },
+      onBulkArchive
+    });
+    const renderedOrder = [...rendered.container.querySelectorAll<HTMLElement>(".sidebar-main-view [data-session-id]")]
+      .map((element) => element.dataset.sessionId);
+    expect(renderedOrder).toEqual(["newest", "middle", "oldest"]);
+
+    await act(async () => required(rendered.container.querySelector<HTMLElement>("[data-session-id='newest']"))
+      .dispatchEvent(new MouseEvent("click", { bubbles: true, ctrlKey: true, detail: 1 })));
+    await act(async () => required(rendered.container.querySelector<HTMLElement>("[data-session-id='oldest']"))
+      .dispatchEvent(new MouseEvent("click", { bubbles: true, shiftKey: true, detail: 1 })));
+    await act(async () => required(rendered.container.querySelector<HTMLButtonElement>(".sidebar-bulk-actions button[aria-label='session.archive']")).click());
+    expect(onBulkArchive).toHaveBeenCalledExactlyOnceWith([newest, middle, oldest]);
+  });
+
+  it("retires a selection when the active profile changes on the same server", async () => {
+    const firstProfile = { id: "profile-a", deviceId: "device-a", serverId: "server", name: "A", origin: "http://127.0.0.1:1" };
+    const secondProfile = { id: "profile-b", deviceId: "device-b", serverId: "server", name: "B", origin: "http://127.0.0.1:2" };
+    const machineControl = (activeProfile: typeof firstProfile): NonNullable<SidebarProps["machineControl"]> => ({
+      profiles: [firstProfile, secondProfile],
+      activeProfile,
+      presenceByProfile: { "profile-a": activeProfile.id === "profile-a" ? "current" : "online", "profile-b": activeProfile.id === "profile-b" ? "current" : "online" },
+      caches: [],
+      selection: "all",
+      onSelectionChange: vi.fn(),
+      onRefresh: vi.fn(),
+      onSwitch: vi.fn(),
+      onOpenCachedSession: vi.fn(),
+      onOpenMessageMatch: vi.fn()
+    });
+    const rendered = await renderSidebar(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, vi.fn(), {
+      machineControl: machineControl(firstProfile)
+    });
+    await act(async () => required(rendered.container.querySelector<HTMLElement>("[data-session-id='session']"))
+      .dispatchEvent(new MouseEvent("click", { bubbles: true, ctrlKey: true, detail: 1 })));
+    expect(rendered.container.querySelectorAll(".session-row.is-selected")).toHaveLength(1);
+
+    await rendered.rerenderMachineControl(machineControl(secondProfile));
+    expect(rendered.container.querySelectorAll(".session-row.is-selected")).toHaveLength(0);
+    expect(rendered.container.querySelector(".sidebar-bulk-actions")).toBeNull();
+  });
+
+  it("uses card row-major order and excludes hidden or remote-cache rows from range authority", () => {
+    const root = document.createElement("div");
+    const group = root.appendChild(document.createElement("div"));
+    group.dataset.sidebarCardOrder = "row-major";
+    for (const [id, order, hidden] of [
+      ["a", 0, false],
+      ["c", 2, false],
+      ["b", 1, false],
+      ["hidden", 3, true]
+    ] as const) {
+      const card = group.appendChild(document.createElement("div"));
+      card.dataset.sidebarRowOrder = String(order);
+      if (hidden) card.hidden = true;
+      const row = card.appendChild(document.createElement("div"));
+      row.className = "session-row";
+      const button = row.appendChild(document.createElement("button"));
+      button.dataset.sessionId = id;
+    }
+    const cssHidden = root.appendChild(document.createElement("div"));
+    cssHidden.style.display = "none";
+    const cssHiddenRow = cssHidden.appendChild(document.createElement("div"));
+    cssHiddenRow.className = "session-row";
+    const cssHiddenButton = cssHiddenRow.appendChild(document.createElement("button"));
+    cssHiddenButton.dataset.sessionId = "css-hidden";
+    const remoteRow = root.appendChild(document.createElement("div"));
+    remoteRow.className = "session-row";
+    const remoteButton = remoteRow.appendChild(document.createElement("button"));
+    remoteButton.dataset.sessionId = "hidden";
+    remoteButton.dataset.machineProfile = "remote-profile";
+    expect(visibleSidebarSessionIds(root)).toEqual(["a", "b", "c"]);
   });
 
   it("scrolls the active task row into the nearest visible position", async () => {
@@ -1222,6 +1412,28 @@ interface SidebarRenderOptions {
   readonly machineControl?: SidebarProps["machineControl"];
 }
 
+function activeProfileMachineControl(profileId: string): NonNullable<SidebarProps["machineControl"]> {
+  const activeProfile = {
+    id: profileId,
+    deviceId: `device-${profileId}`,
+    serverId: `server-${profileId}`,
+    name: "Local",
+    origin: "http://127.0.0.1:1"
+  };
+  return {
+    profiles: [activeProfile],
+    activeProfile,
+    presenceByProfile: { [profileId]: "current" },
+    caches: [],
+    selection: "all",
+    onSelectionChange: vi.fn(),
+    onRefresh: vi.fn(),
+    onSwitch: vi.fn(),
+    onOpenCachedSession: vi.fn(),
+    onOpenMessageMatch: vi.fn()
+  };
+}
+
 async function renderSidebar(
   preferences: SidebarDisplayPreferences,
   onPreferencesChange: SidebarProps["onSidebarDisplayPreferencesChange"],
@@ -1233,6 +1445,7 @@ async function renderSidebar(
   readonly rerenderActiveSessionId: (next: string | undefined) => Promise<void>;
   readonly rerenderSnapshot: (next: SidebarProps["snapshot"]) => Promise<void>;
   readonly rerenderOwnerId: (next: string) => Promise<void>;
+  readonly rerenderMachineControl: (next: SidebarProps["machineControl"]) => Promise<void>;
 }> {
   const container = document.createElement("div");
   document.body.append(container);
@@ -1261,6 +1474,7 @@ async function renderSidebar(
   let currentOwnerLayouts = options.sidebarOwnerLayouts ?? DEFAULT_UI_PREFERENCES.sidebarOwnerLayouts;
   let currentActiveSessionId = options.activeSessionId;
   let currentOwnerId = "owner";
+  let currentMachineControl = options.machineControl;
   const render = async (next: SidebarDisplayPreferences, ownerLayouts: SidebarProps["sidebarOwnerLayouts"], nextActiveSessionId: string | undefined): Promise<void> => {
     currentPreferences = next;
     currentOwnerLayouts = ownerLayouts;
@@ -1315,7 +1529,7 @@ async function renderSidebar(
       onResizeKeyDown={noop}
       onResetWidth={noop}
       onDisconnect={noop}
-      machineControl={options.machineControl}
+      machineControl={currentMachineControl}
     />));
   };
   await render(currentPreferences, currentOwnerLayouts, currentActiveSessionId);
@@ -1325,7 +1539,8 @@ async function renderSidebar(
     rerenderOwnerLayouts: (next) => render(currentPreferences, next, currentActiveSessionId),
     rerenderActiveSessionId: (next) => render(currentPreferences, currentOwnerLayouts, next),
     rerenderSnapshot: (next) => { snapshot = next; return render(currentPreferences, currentOwnerLayouts, currentActiveSessionId); },
-    rerenderOwnerId: (next) => { currentOwnerId = next; return render(currentPreferences, currentOwnerLayouts, currentActiveSessionId); }
+    rerenderOwnerId: (next) => { currentOwnerId = next; return render(currentPreferences, currentOwnerLayouts, currentActiveSessionId); },
+    rerenderMachineControl: (next) => { currentMachineControl = next; return render(currentPreferences, currentOwnerLayouts, currentActiveSessionId); }
   };
 }
 

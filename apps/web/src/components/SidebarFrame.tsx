@@ -1,7 +1,8 @@
 import {
-  useEffect,
+  useLayoutEffect,
   useRef,
   useState,
+  type FocusEvent as ReactFocusEvent,
   type JSX,
   type KeyboardEvent,
   type PointerEvent as ReactPointerEvent,
@@ -67,14 +68,15 @@ export function SidebarFrame(props: SidebarFrameProps): JSX.Element {
   drawerRestoreFocusRef.current = props.drawerRestoreFocus;
   const onCloseDrawerRef = useRef(props.onCloseDrawer);
   onCloseDrawerRef.current = props.onCloseDrawer;
-  const [compactDrawer, setCompactDrawer] = useState(() => browserMatchesSidebarDrawer());
+  const focusOwnedBySidebarRef = useRef(false);
+  const [compactDrawer, setCompactDrawer] = useState(false);
   const railPresentation = props.mode === "rail" && !compactDrawer;
   // Treat an initially-open compact shell as a drawer opening as well. The
   // The desktop window may launch at the 800px minimum with navigation
   // persisted open, and keyboard focus must not remain behind its scrim.
-  const previousDrawerRef = useRef({ open: false, compact: false });
+  const previousPresentationRef = useRef({ open: false, compact: false, mode: props.mode });
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const ownerWindow = rootRef.current?.ownerDocument.defaultView;
     if (ownerWindow?.matchMedia === undefined) return;
     const media = ownerWindow.matchMedia(SIDEBAR_DRAWER_MEDIA_QUERY);
@@ -84,31 +86,61 @@ export function SidebarFrame(props: SidebarFrameProps): JSX.Element {
     return () => media.removeEventListener("change", changed);
   }, []);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const root = rootRef.current;
     const ownerDocument = root?.ownerDocument;
     const ownerWindow = ownerDocument?.defaultView;
     if (root === null || ownerDocument === undefined || ownerWindow === null || ownerWindow === undefined) return;
 
-    const previous = previousDrawerRef.current;
-    previousDrawerRef.current = { open: props.open, compact: compactDrawer };
+    const previous = previousPresentationRef.current;
+    previousPresentationRef.current = { open: props.open, compact: compactDrawer, mode: props.mode };
     const opening = compactDrawer && props.open && (!previous.open || !previous.compact);
-    const closing = previous.compact && previous.open && !props.open;
+    const closing = previous.open && !props.open;
+    const leavingCompact = previous.compact && !compactDrawer && props.open;
+    const changingPersistentMode = previous.open
+      && props.open
+      && !compactDrawer
+      && previous.mode !== props.mode
+      && previous.mode !== "hidden"
+      && props.mode !== "hidden";
 
     if (opening) {
       const active = ownerDocument.activeElement;
-      if (active instanceof ownerWindow.HTMLElement && active !== ownerDocument.body && !root.contains(active)) {
-        returnFocusRef.current = active;
-      }
+      returnFocusRef.current = active instanceof ownerWindow.HTMLElement
+        && active !== ownerDocument.body
+        && !root.contains(active)
+        ? active
+        : null;
       root.querySelector<HTMLElement>(".sidebar__mobile-close")?.focus({ preventScroll: true });
     } else if (closing) {
+      const active = ownerDocument.activeElement;
+      const activeInsideSidebar = active instanceof ownerWindow.Node && root.contains(active);
+      const activeFellBackToDocument = active === null || active === ownerDocument.body;
+      const shouldRestoreFocus = activeInsideSidebar
+        || (focusOwnedBySidebarRef.current && activeFellBackToDocument);
       const previousFocus = returnFocusRef.current;
       returnFocusRef.current = null;
-      const safePrevious = previousFocus?.isConnected === true
-        && previousFocus.closest("[inert], [aria-hidden='true']") === null
-        ? previousFocus
-        : null;
-      (safePrevious ?? drawerRestoreFocusRef.current?.() ?? ownerDocument.getElementById("main-content"))?.focus({ preventScroll: true });
+      focusOwnedBySidebarRef.current = false;
+      if (shouldRestoreFocus) {
+        const candidates = [
+          previousFocus,
+          drawerRestoreFocusRef.current?.(),
+          ownerDocument.getElementById("main-content")
+        ];
+        candidates.find((candidate) => isSafeSidebarFocusTarget(candidate, ownerDocument, root))
+          ?.focus({ preventScroll: true });
+      }
+    } else if (leavingCompact || changingPersistentMode) {
+      const active = ownerDocument.activeElement;
+      const activeFellBackToDocument = active === null || active === ownerDocument.body;
+      const activeWillBeHidden = active instanceof ownerWindow.Element
+        && sidebarFocusTargetWillBeHidden(active, props.mode);
+      if (activeWillBeHidden || (focusOwnedBySidebarRef.current && activeFellBackToDocument)) {
+        const persistentTarget = props.mode === "rail"
+          ? root.querySelector<HTMLElement>(".sidebar__rail-actions button")
+          : root.querySelector<HTMLElement>(".sidebar__collapse");
+        persistentTarget?.focus({ preventScroll: true });
+      }
     }
 
     if (!compactDrawer || !props.open) return;
@@ -141,7 +173,22 @@ export function SidebarFrame(props: SidebarFrameProps): JSX.Element {
     return () => {
       ownerWindow.removeEventListener("keydown", handleKey);
     };
-  }, [compactDrawer, props.open]);
+  }, [compactDrawer, props.mode, props.open]);
+
+  const handleFocusCapture = (): void => {
+    focusOwnedBySidebarRef.current = true;
+  };
+  const handleBlurCapture = (event: ReactFocusEvent<HTMLElement>): void => {
+    const root = rootRef.current;
+    const ownerWindow = root?.ownerDocument.defaultView;
+    if (root === null || ownerWindow === null || ownerWindow === undefined) return;
+    const next = event.relatedTarget;
+    if (next instanceof ownerWindow.Node && root.contains(next)) return;
+    // A null relatedTarget is what Chromium reports when an ancestor becomes
+    // inert. Preserve ownership long enough for the close layout effect to
+    // move focus to a safe target in this same document.
+    if (next !== null) focusOwnedBySidebarRef.current = false;
+  };
 
   return <aside
     ref={rootRef}
@@ -150,6 +197,8 @@ export function SidebarFrame(props: SidebarFrameProps): JSX.Element {
     aria-hidden={!props.open}
     inert={!props.open}
     tabIndex={-1}
+    onFocusCapture={handleFocusCapture}
+    onBlurCapture={handleBlurCapture}
   >
     <header className="sidebar__header">
       <button className="brand-mark brand-mark--avatar sidebar-avatar" type="button" onClick={props.onHome} aria-label={props.t("a11y.appHome", { name: props.t("app.name") })} />
@@ -208,8 +257,30 @@ export function SidebarFrame(props: SidebarFrameProps): JSX.Element {
   </aside>;
 }
 
-function browserMatchesSidebarDrawer(): boolean {
-  return typeof window !== "undefined" && window.matchMedia?.(SIDEBAR_DRAWER_MEDIA_QUERY).matches === true;
+function isSafeSidebarFocusTarget(
+  candidate: HTMLElement | null | undefined,
+  ownerDocument: Document,
+  hiddenSidebar: HTMLElement
+): candidate is HTMLElement {
+  const ownerWindow = ownerDocument.defaultView;
+  return ownerWindow !== null
+    && candidate instanceof ownerWindow.HTMLElement
+    && candidate.ownerDocument === ownerDocument
+    && candidate.isConnected
+    && !hiddenSidebar.contains(candidate)
+    && candidate.closest("[inert], [aria-hidden='true']") === null
+    && (!(candidate instanceof ownerWindow.HTMLButtonElement) || !candidate.disabled);
+}
+
+function sidebarFocusTargetWillBeHidden(active: Element, mode: NavigationMode): boolean {
+  if (active.closest(".sidebar__mobile-close") !== null) return true;
+  if (mode === "rail") {
+    return active.closest(".sidebar__header-content, .sidebar__expanded-view, .sidebar__footer") !== null;
+  }
+  if (mode === "expanded") {
+    return active.closest(".sidebar__rail-view, .sidebar__rail-footer") !== null;
+  }
+  return false;
 }
 
 function sidebarDrawerHasHigherPrioritySurface(ownerDocument: Document): boolean {

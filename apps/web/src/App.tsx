@@ -51,6 +51,7 @@ import { useGamepadInput } from "./gamepad-client.js";
 import { isStartupUpdateInteractionBlocked } from "./startup-update-interaction.js";
 import { promptRecommendationOwnerKey, promptRecommendationStore } from "./prompt-recommendation-store.js";
 import { visionBridgeToastStore } from "./vision-bridge-toast-store.js";
+import { useDocumentForeground } from "./document-foreground.js";
 import { deleteScheduleWithGeneratedSessions, prepareScheduleDeletion } from "./schedule-deletion.js";
 import { SessionNotificationTracker, shouldDispatchSessionNotifications } from "./session-notifications.js";
 import { ScheduleNotificationTracker } from "./schedule-notifications.js";
@@ -59,7 +60,9 @@ import {
   type SessionAttentionBadgeKey
 } from "./session-attention-badge.js";
 import {
+  retrySessionAttentionAcknowledgement,
   SessionAttentionAcknowledgementRetryTracker,
+  sessionAttentionAcknowledgementKey,
   sidebarOwnerLayoutFor,
   viewerAttentionCursorWhenHistoryReady
 } from "./sidebar-layout.js";
@@ -182,6 +185,9 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const sessionApplicationWindow = typeof window !== "undefined" && isSessionApplicationWindow(window.location);
   const extensionApplicationWindow = typeof window !== "undefined" && isExtensionApplicationWindow(window.location);
   const auxiliaryApplicationWindow = sessionApplicationWindow || extensionApplicationWindow;
+  const bootSessionId = sessionApplicationWindow
+    ? new URLSearchParams(window.location.search).get("bootSession") ?? undefined
+    : undefined;
   const t = useCallback((key: Parameters<typeof translate>[1], values?: Parameters<typeof translate>[2]) => translate(state.preferences.locale, key, values), [state.preferences.locale]);
   const [renameSession, setRenameSession] = useState<SessionView>();
   const [archiveRemoval, setArchiveRemoval] = useState<SessionRemovalDialogRequest>();
@@ -360,15 +366,25 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     };
   }, [auxiliaryApplicationWindow]);
   useEffect(() => {
+    if (!sessionApplicationWindow || bootSessionId === undefined) return;
+    const readOwner = window.jokoDesktop?.sessionWindows.getOwner;
+    if (readOwner === undefined) return;
+    let retired = false;
+    void readOwner().then((owner) => {
+      if (!retired && owner.sessionId === bootSessionId) setBootConnectionProfileId(owner.profileId);
+    }).catch(() => undefined);
+    return () => { retired = true; };
+  }, [bootSessionId, sessionApplicationWindow]);
+  useEffect(() => {
     if (typeof BroadcastChannel === "undefined") return;
     const channel = new BroadcastChannel("joko:application-window-bootstrap");
-    const requestId = auxiliaryApplicationWindow
+    const requestId = extensionApplicationWindow
       ? `${Date.now().toString(36)}-${window.crypto.getRandomValues(new Uint32Array(2)).join("-")}`
       : undefined;
     channel.onmessage = (event: MessageEvent<unknown>): void => {
       if (typeof event.data !== "object" || event.data === null || Array.isArray(event.data)) return;
       const message = event.data as Record<string, unknown>;
-      if (message["kind"] === "request-profile" && typeof message["requestId"] === "string") {
+      if (!auxiliaryApplicationWindow && message["kind"] === "request-profile" && typeof message["requestId"] === "string") {
         const profileId = controllerRef.current.state.activeProfile?.id;
         if (profileId !== undefined) channel.postMessage({ kind: "profile", requestId: message["requestId"], profileId });
         return;
@@ -388,7 +404,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       window.clearTimeout(stop);
       channel.close();
     };
-  }, [auxiliaryApplicationWindow]);
+  }, [auxiliaryApplicationWindow, extensionApplicationWindow]);
   useEffect(() => {
     if (!auxiliaryApplicationWindow || !state.ready || state.activeProfile !== undefined ||
       state.connectionState !== "disconnected" || bootConnectionProfileId === undefined || bootConnectionAttemptedRef.current) return;
@@ -727,14 +743,23 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   } | undefined>(undefined);
   const attentionAckRetryTrackerRef = useRef(new SessionAttentionAcknowledgementRetryTracker());
   const [attentionAckRetryRevision, setAttentionAckRetryRevision] = useState(0);
+  const documentForeground = useDocumentForeground();
   const attentionThroughCursor = activeSession !== undefined
     && state.connectionState === "connected"
     && activeBackend?.capabilities.get("session.attention")?.supported === true
-    ? viewerAttentionCursorWhenHistoryReady(activeSession, state.snapshot.generation, timelineHistory)
+    ? viewerAttentionCursorWhenHistoryReady(activeSession, state.snapshot.generation, timelineHistory, documentForeground)
     : undefined;
-  const activeAttentionAckKey = activeSession === undefined || attentionThroughCursor === undefined
+  const activeAttentionAckKey = state.activeProfile === undefined
+    || activeSession === undefined
+    || attentionThroughCursor === undefined
     ? undefined
-    : `${activeSession.id}\u0000${attentionThroughCursor.opaqueToken}`;
+    : sessionAttentionAcknowledgementKey(
+        state.activeProfile.serverId,
+        state.activeProfile.id,
+        activeSession.id,
+        state.snapshot.generation,
+        attentionThroughCursor
+      );
   attentionAckRetryTrackerRef.current.activate(activeAttentionAckKey);
   useEffect(() => {
     const key = activeAttentionAckKey;
@@ -757,9 +782,12 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     ).then(() => {
       attentionAckRetryTrackerRef.current.succeeded(key);
     }).catch((error: unknown) => {
-      acknowledgedAttentionRef.current.delete(key);
       const delayMs = attentionAckRetryTrackerRef.current.failed(key, error);
-      if (delayMs === undefined) return;
+      if (delayMs === undefined) {
+        if (retrySessionAttentionAcknowledgement(error)) acknowledgedAttentionRef.current.delete(key);
+        return;
+      }
+      acknowledgedAttentionRef.current.delete(key);
       const timer = window.setTimeout(() => {
         if (!attentionAckRetryTrackerRef.current.release(key)) return;
         attentionAckRetryTimerRef.current = undefined;
@@ -1471,11 +1499,12 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   };
   const openTaskWindow = (session: SessionView): void => {
     const desktop = window.jokoDesktop;
-    if (desktop?.capabilities.includes("session.windows") === true) {
-      void desktop.sessionWindows.open(session.id).catch(() => setLayoutNotice(t("split.openFailed")));
+    const profileId = state.activeProfile?.id;
+    if (desktop?.capabilities.includes("session.windows") === true && profileId !== undefined) {
+      void desktop.sessionWindows.open({ profileId, sessionId: session.id }).catch(() => setLayoutNotice(t("split.openFailed")));
       return;
     }
-    if (openSessionWindowFallback(window.location, session.id, state.activeProfile?.id) === null) setLayoutNotice(t("split.openFailed"));
+    if (openSessionWindowFallback(window.location, session.id, profileId) === null) setLayoutNotice(t("split.openFailed"));
   };
   const moveTaskToProject = (session: SessionView, placement: SessionProjectNavigationPlacement): void => {
     const authoritative = state.snapshot.sessions.find((candidate) => candidate.id === session.id);
@@ -1650,7 +1679,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         onPin={(session) => runAction(`pin:${session.id}`, () => controller.pinSession(session.id, !session.pinned))}
         onPinTarget={(target) => runAction(`project-pin:${target.id}`, () => controller.updateTarget(target.id, { pinned: !target.pinned }, target.revision))}
         onRenameTarget={(target, name) => runAction(`project-rename:${target.id}`, () => controller.updateTarget(target.id, { name }, target.revision))}
-        onRemoveTarget={(target) => runAction(`project-archive:${target.id}`, () => controller.archiveTarget(target.id, true))}
+        onRemoveTarget={(target) => runAction(`project-archive:${target.id}`, async () => { await controller.archiveTarget(target.id, true); })}
         onSetTargetSessionsArchived={(target, sessions, archived) => {
           if (archived) {
             requestArchiveSessions(sessions);

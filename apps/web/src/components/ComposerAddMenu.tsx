@@ -32,13 +32,14 @@ export function ComposerAddMenu({
   }, [disabled, onOpenChange, open]);
   const handleBodyKeyDown = (event: KeyboardEvent<HTMLDivElement>): void => {
     if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
-    const target = event.target;
-    if (!(target instanceof Element)) return;
+    const ownerDocument = event.currentTarget.ownerDocument;
+    const target = ownedEventElement(event.target, ownerDocument);
+    if (target === null) return;
     const menu = target.closest<HTMLElement>('[role="menu"]');
     if (menu === null || !bodyRef.current?.contains(menu)) return;
     const items = [...menu.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not([disabled])')];
     if (items.length === 0) return;
-    const activeIndex = items.indexOf(document.activeElement as HTMLButtonElement);
+    const activeIndex = items.indexOf(ownerDocument.activeElement as HTMLButtonElement);
     const nextIndex = event.key === "Home"
       ? 0
       : event.key === "End"
@@ -70,4 +71,12 @@ export function ComposerAddMenu({
     <header className="composer-add-menu__header"><strong>{panelLabel ?? label}</strong><IconButton label={closeLabel} onClick={() => onOpenChange(false)}><X aria-hidden="true" /></IconButton></header>
     <div ref={bodyRef} className="composer-add-menu__body" onKeyDown={handleBodyKeyDown}>{children}</div>
   </MorphPopover>;
+}
+
+function ownedEventElement(target: EventTarget | null, ownerDocument: Document): Element | null {
+  if (target === null || typeof target !== "object") return null;
+  const candidate = target as Partial<Element>;
+  return candidate.ownerDocument === ownerDocument && typeof candidate.closest === "function"
+    ? target as Element
+    : null;
 }

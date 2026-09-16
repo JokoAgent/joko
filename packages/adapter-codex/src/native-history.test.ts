@@ -3,6 +3,32 @@ import { projectCodexNativeHistory } from "./native-history.js";
 import type { NativeThread } from "./protocol.js";
 
 describe("Codex native history projection", () => {
+  it("projects file-change history with the same ordered source, target, and diff identity as live events", () => {
+    const thread: NativeThread = { id: "file-changes", turns: [{ id: "turn", status: "completed", items: [{
+      id: "change-one",
+      type: "fileChange",
+      status: "completed",
+      changes: [
+        { path: "src/old.ts", kind: { type: "update", movePath: "src/new.ts" }, diff: "-old\n+new" },
+        { path: "src/gone.ts", kind: { type: "delete" }, diff: "-gone" }
+      ]
+    }] }] };
+
+    const result = projectCodexNativeHistory(thread, { maximumEvents: 10 });
+    expect(result.events.find((event) => event.projectionKind === "tool_start")?.payload).toMatchObject({
+      type: "tool_start",
+      name: "file_change",
+      input: JSON.stringify({ changes: [
+        { path: "src/old.ts", kind: { type: "update", movePath: "src/new.ts" }, diff: "-old\n+new" },
+        { path: "src/gone.ts", kind: { type: "delete" }, diff: "-gone" }
+      ] })
+    });
+    expect(result.events.find((event) => event.projectionKind === "tool_result")?.payload).toMatchObject({
+      type: "tool_result",
+      output: "move: src/old.ts -> src/new.ts\ndelete: src/gone.ts"
+    });
+  });
+
   it("publishes explicit pre-turn targets without treating a mid-turn user or an unavailable history as start", () => {
     const thread: NativeThread = { id: "turn-boundaries", historyMode: "paginated", turns: [
       { id: "first", status: "completed", items: [

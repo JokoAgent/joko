@@ -335,6 +335,7 @@ export interface EventMappingContext {
   readonly queueControl?: QueueControlRecord;
   readonly interaction?: InteractionRecord;
   readonly artifact?: ArtifactRecord;
+  readonly artifactSourceRevealAvailable?: boolean;
   readonly schedule?: ScheduleRecord;
   readonly run?: StoredRun;
   readonly attempts?: readonly StoredAttempt[];
@@ -2062,6 +2063,13 @@ export function fromProtoInteractionDecision(resolution: InteractionResolution):
 }
 
 export function toProtoArtifact(record: ArtifactRecord): Artifact {
+  return toProtoArtifactWithSourceAvailability(record, false);
+}
+
+export function toProtoArtifactWithSourceAvailability(
+  record: ArtifactRecord,
+  sourceRevealAvailable: boolean
+): Artifact {
   const metadata = objectValue(record.metadata);
   const audio = metadata?.["audio"];
   const expiresAt = metadata?.["expiresAt"];
@@ -2082,7 +2090,8 @@ export function toProtoArtifact(record: ArtifactRecord): Artifact {
       disposition: BlobDisposition.ARTIFACT
     },
     createdAt: toProtoTimestamp(record.createdAt),
-    expiresAt: expiresAt === undefined ? undefined : toProtoTimestamp(expiresAt)
+    expiresAt: expiresAt === undefined ? undefined : toProtoTimestamp(expiresAt),
+    sourceRevealAvailable
   });
 }
 
@@ -2808,7 +2817,7 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
     case "artifact": {
       const artifact = context.artifact === undefined
         ? artifactFromBlob(payload.artifact, event, payload.purpose, payload.audioMetadata)
-        : toProtoArtifact(context.artifact);
+        : toProtoArtifactWithSourceAvailability(context.artifact, context.artifactSourceRevealAvailable === true);
       return protoPayload("artifactProduced", message<ArtifactProducedEvent>("joko.v1.ArtifactProducedEvent", {
         artifact
       }));
@@ -5791,7 +5800,8 @@ function artifactFromBlob(blob: BlobRef, event: PersistedEvent, purpose: string,
     audioMetadata: toProtoAudioMetadata(audio),
     blob: { ...toProtoBlobRef(blob, event.emittedAt), disposition: BlobDisposition.ARTIFACT },
     createdAt: toProtoTimestamp(event.emittedAt),
-    expiresAt: undefined
+    expiresAt: undefined,
+    sourceRevealAvailable: false
   });
 }
 
