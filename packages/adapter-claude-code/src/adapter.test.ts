@@ -97,8 +97,72 @@ describe("ClaudeCodeAdapter", () => {
     expect(released).toBe(true);
   });
 
-  test("keeps a no-tool local Query isolated, retries the catalog at the next idle turn, and fails closed on uncertain retirement", async () => {
-    const sdk = new FakeSdkRuntime();
+  test("binds a remote standard Query after durable Session identity and fences its root callback", async () => {
+    const remoteTarget: TargetDescriptor = {
+      ...target, id: "remote-mcp-target", workspaceRoot: "D:\\service-owned-placeholder",
+      remoteWorkspace: { hostId: "host-a", workspaceRoot: "/srv/project" }
+    };
+    const sdk = new FakeSdkRuntime({ initialFrameOverrides: { cwd: "/srv/project" } });
+    const calls = vi.fn(async () => ({
+      content: [{ type: "text", text: "remote approved" }],
+      structuredContent: { echoed: "remote approved" }, isError: false
+    }));
+    let committed = false;
+    let released = false;
+    const tool = {
+      serverId: "remote-approved", name: "echo", description: "Echo approved remote data",
+      inputSchema: { type: "object", properties: { value: { type: "string" } }, required: ["value"] }
+    } as const;
+    const bridge: ClaudeMcpBridgePort = { open: vi.fn(() => {
+      if (!committed) throw new Error("Not durable");
+      return { tools: [tool], assertCurrent: () => {
+        if (released) throw new Error("Retired remote authority");
+      }, call: calls, release: () => { released = true; } };
+    }) };
+    const adapter = adapterFor(new FakeSdkRuntime(), {
+      mcpBridge: bridge,
+      remoteRuntimes: { resolve: async () => ({
+        runtime: sdk, workspaceRoot: "/srv/project", remote: true, assertCurrent: () => undefined
+      }), close: async () => undefined }
+    });
+    const binding = await adapter.createSession(createInput({ target: remoteTarget }),
+      contextFor(undefined, { target: remoteTarget }).context);
+    expect(bridge.open).not.toHaveBeenCalled();
+    expect(sdk.queries[0]!.params.options).toMatchObject({ mcpServers: {}, strictMcpConfig: true });
+    expect(sdk.queries[0]!.params.options.mcpTools).toBeUndefined();
+    sdk.sessions.set(binding.nativeSessionId!, { ...sessionInfo(binding.nativeSessionId!), cwd: "/srv/project" });
+    committed = true;
+    const source = contextFor(binding, { target: remoteTarget, operationId: "remote-root-tool" });
+    await adapter.send(textPrompt("Use the approved remote tool"), source.context);
+    expect(sdk.queries).toHaveLength(2);
+    expect(sdk.retiredQueries).toEqual([sdk.queries[0]]);
+    expect(sdk.queries[1]!.params.options.resume).toBe(binding.nativeSessionId);
+    expect(sdk.queries[1]!.params.options.mcpTools).toMatchObject([tool]);
+    const callback = sdk.queries[1]!.params.options.mcpTools![0]!.call;
+    const toolUseId = "remote-native-root";
+    const pending = callback({ value: "hello" }, { toolUseId, signal: new AbortController().signal });
+    sdk.queries[1]!.push(assistantMessage(binding.nativeSessionId!, randomUUID(), [{
+      type: "tool_use", id: toolUseId,
+      name: `mcp__joko_${createHash("sha256").update(tool.serverId).digest("hex").slice(0, 24)}__echo`,
+      input: { value: "hello" }
+    }]));
+    await expect(pending).resolves.toMatchObject({ structuredContent: { echoed: "remote approved" } });
+    expect(calls).toHaveBeenCalledOnce();
+    sdk.queries[1]!.push(resultMessage(binding.nativeSessionId!, { result: "done", totalCostUsd: 0 }));
+    await eventually(() => source.events.some((event) => event.type === "done"));
+    await expect(callback({}, { toolUseId, signal: new AbortController().signal }))
+      .rejects.toThrow("active root tool owner");
+    await adapter.dispose();
+    expect(released).toBe(true);
+  });
+
+  test.each(["local", "remote"] as const)("keeps a no-tool %s Query isolated, retries at idle, and fails closed on uncertain retirement", async (location) => {
+    const remote = location === "remote";
+    const selectedTarget: TargetDescriptor = remote ? {
+      ...target, id: "remote-no-tool", workspaceRoot: "D:\\service-owned-placeholder",
+      remoteWorkspace: { hostId: "host-a", workspaceRoot: "/srv/project" }
+    } : target;
+    const sdk = new FakeSdkRuntime(remote ? { initialFrameOverrides: { cwd: "/srv/project" } } : {});
     let toolsAvailable = false;
     const bridge: ClaudeMcpBridgePort = { open: vi.fn(() => ({
       tools: toolsAvailable ? [{ serverId: "approved", name: "read", description: "Read", inputSchema: { type: "object" } }] : [],
@@ -106,9 +170,18 @@ describe("ClaudeCodeAdapter", () => {
       call: async () => ({ content: [], isError: false }),
       release: () => undefined
     })) };
-    const adapter = adapterFor(sdk, { mcpBridge: bridge });
-    const binding = await adapter.createSession(createInput(), contextFor().context);
-    const first = contextFor(binding, { operationId: "no-tools" });
+    const adapter = adapterFor(remote ? new FakeSdkRuntime() : sdk, {
+      mcpBridge: bridge,
+      ...(remote ? { remoteRuntimes: { resolve: async () => ({
+        runtime: sdk, workspaceRoot: "/srv/project", remote: true, assertCurrent: () => undefined
+      }), close: async () => undefined } } : {})
+    });
+    const binding = await adapter.createSession(createInput({ target: selectedTarget }),
+      contextFor(undefined, { target: selectedTarget }).context);
+    if (remote) sdk.sessions.set(binding.nativeSessionId!, {
+      ...sessionInfo(binding.nativeSessionId!), cwd: "/srv/project"
+    });
+    const first = contextFor(binding, { operationId: "no-tools", target: selectedTarget });
     await adapter.send(textPrompt("plain text"), first.context);
     expect(sdk.queries).toHaveLength(1);
     expect(sdk.queries[0]!.params.options).toMatchObject({ strictMcpConfig: true, mcpServers: {} });
@@ -116,10 +189,13 @@ describe("ClaudeCodeAdapter", () => {
     await eventually(() => first.events.some((event) => event.type === "done"));
     toolsAvailable = true;
     sdk.retirementFailure = true;
-    await expect(adapter.send(textPrompt("not dispatched"), contextFor(binding, { operationId: "bind-unknown" }).context))
+    await expect(adapter.send(textPrompt("not dispatched"), contextFor(binding, {
+      operationId: "bind-unknown", target: selectedTarget
+    }).context))
       .rejects.toMatchObject({ publicError: { code: "MCP_QUERY_BIND_UNKNOWN", stateMayHaveChanged: true } });
     expect(sdk.queries).toHaveLength(1);
     expect(sdk.queries[0]!.receivedInputs).toHaveLength(1);
+    sdk.retirementFailure = false;
     await adapter.dispose();
   });
 

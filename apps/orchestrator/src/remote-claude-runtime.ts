@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { posix as remotePath } from "node:path";
 import { TextDecoder } from "node:util";
+import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv";
 
 import {
   CLAUDE_AGENT_SDK_VERSION,
@@ -57,6 +58,7 @@ const MAXIMUM_QUEUED_EVENT_BYTES = 32 * 1024 * 1024;
 const MAXIMUM_CALLBACKS_PER_QUERY = 256;
 const MAXIMUM_HOOK_PAYLOAD_BYTES = 1024 * 1024;
 const MAXIMUM_MANAGED_AGENT_RESULT_BYTES = 64 * 1024;
+const MAXIMUM_MCP_PAYLOAD_BYTES = 24 * 1024 * 1024;
 const REMOTE_HOOK_EVENTS = ["PreToolUse", "PermissionDenied", "PostToolUse", "PostToolUseFailure"] as const satisfies readonly ClaudeSdkHookEvent[];
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
@@ -515,6 +517,10 @@ class RemoteClaudeQuery implements ClaudeSdkQuery {
   readonly #output = new AsyncValueQueue<unknown>();
   readonly #callbackControllers = new Map<string, AbortController>();
   readonly #hookCallbackIds = new Set<string>();
+  readonly #productMcpValidators = new Map<string, {
+    readonly input: ReturnType<AjvJsonSchemaValidator["getValidator"]>;
+    readonly output?: ReturnType<AjvJsonSchemaValidator["getValidator"]>;
+  }>();
   #channel: RemoteClaudeManagerChannel | undefined;
   #attachmentId: string | undefined;
   #lastSeq = 0;
@@ -529,6 +535,19 @@ class RemoteClaudeQuery implements ClaudeSdkQuery {
     const sessionId = options.params.options.resume ?? options.params.options.sessionId;
     if (sessionId === undefined || !UUID.test(sessionId)) throw runtimeFault("session_invalid", false);
     this.#sessionId = sessionId.toLowerCase();
+    const validator = new AjvJsonSchemaValidator();
+    for (const tool of options.params.options.mcpTools ?? []) {
+      const identity = `${tool.serverId}\0${tool.name}`;
+      if (this.#productMcpValidators.has(identity)) throw runtimeFault("mcp_catalog_invalid", false);
+      try {
+        this.#productMcpValidators.set(identity, {
+          input: validator.getValidator(tool.inputSchema as Parameters<typeof validator.getValidator>[0]),
+          ...(tool.outputSchema === undefined ? {} : {
+            output: validator.getValidator(tool.outputSchema as Parameters<typeof validator.getValidator>[0])
+          })
+        });
+      } catch { throw runtimeFault("mcp_catalog_invalid", false); }
+    }
   }
 
   static async open(options: RemoteClaudeQueryOpenOptions): Promise<RemoteClaudeQuery> {
@@ -891,6 +910,23 @@ class RemoteClaudeQuery implements ClaudeSdkQuery {
         if (!isRecord(result) || typeof result["text"] !== "string"
           || Buffer.byteLength(result["text"], "utf8") > MAXIMUM_MANAGED_AGENT_RESULT_BYTES
           || (result["isError"] !== undefined && typeof result["isError"] !== "boolean")) {
+          throw runtimeFault("callback_invalid", false);
+        }
+        await channel.sendCallback(callbackId, true, result);
+      } else if (frame.callback === "productMcpTool"
+        && this.#options.params.options.mcpTools !== undefined) {
+        const request = productMcpCallbackRequest(frame.value, this.#options.params.options.mcpTools);
+        const validators = this.#productMcpValidators.get(`${request.tool.serverId}\0${request.tool.name}`);
+        const checked = validators?.input(request.arguments);
+        if (checked?.valid !== true) throw runtimeFault("callback_invalid", false);
+        const result = await request.tool.call(checked.data as Readonly<Record<string, unknown>>, {
+          toolUseId: request.toolUseId,
+          signal: controller.signal
+        });
+        if (!isRecord(result) || !Array.isArray(result.content) || typeof result.isError !== "boolean"
+          || (result.structuredContent !== undefined && !isRecord(result.structuredContent))
+          || encodedBytes(result) > MAXIMUM_MCP_PAYLOAD_BYTES
+          || (!result.isError && validators?.output !== undefined && !validators.output(result.structuredContent).valid)) {
           throw runtimeFault("callback_invalid", false);
         }
         await channel.sendCallback(callbackId, true, result);
@@ -1268,6 +1304,7 @@ function serializeQueryOptions(options: ClaudeSdkQueryOptions): Readonly<Record<
     ...(options.forwardSubagentText === undefined ? {} : { forwardSubagentText: options.forwardSubagentText }),
     ...(options.hooks === undefined ? {} : { hooks: serializeHookManifest(options.hooks) }),
     ...(options.managedAgentTool === undefined ? {} : { managedAgentTool: true }),
+    ...(options.mcpTools === undefined ? {} : { productMcpTools: serializeProductMcpTools(options.mcpTools) }),
     includePartialMessages: true,
     ...(options.disallowedTools === undefined ? {} : { disallowedTools: [...options.disallowedTools] }),
     ...(options.mcpServers === undefined ? {} : { mcpServers: { ...options.mcpServers } }),
@@ -1284,6 +1321,39 @@ function serializeQueryOptions(options: ClaudeSdkQueryOptions): Readonly<Record<
     ...(options.title === undefined ? {} : { title: options.title }),
     tools: Array.isArray(options.tools) ? [...options.tools] : { ...options.tools }
   };
+}
+
+function serializeProductMcpTools(tools: NonNullable<ClaudeSdkQueryOptions["mcpTools"]>): readonly Readonly<Record<string, unknown>>[] {
+  const catalog = tools.map((tool) => ({
+    serverId: tool.serverId,
+    name: tool.name,
+    description: tool.description,
+    inputSchema: tool.inputSchema,
+    ...(tool.outputSchema === undefined ? {} : { outputSchema: tool.outputSchema })
+  }));
+  if (catalog.length > 10_000 || encodedBytes(catalog) > MAXIMUM_MCP_PAYLOAD_BYTES) {
+    throw runtimeFault("mcp_catalog_invalid", false);
+  }
+  return catalog;
+}
+
+function productMcpCallbackRequest(
+  value: unknown,
+  tools: readonly NonNullable<ClaudeSdkQueryOptions["mcpTools"]>[number][]
+): {
+  readonly tool: NonNullable<ClaudeSdkQueryOptions["mcpTools"]>[number];
+  readonly arguments: Readonly<Record<string, unknown>>;
+  readonly toolUseId: string;
+} {
+  if (!isRecord(value) || !isRecord(value.arguments)
+    || typeof value.serverId !== "string" || typeof value.name !== "string"
+    || typeof value.toolUseId !== "string" || value.toolUseId.length === 0 || value.toolUseId.length > 512
+    || /[\x00-\x1f\x7f]/u.test(value.toolUseId)
+    || !Object.keys(value).every((key) => ["serverId", "name", "arguments", "toolUseId"].includes(key))
+    || encodedBytes(value) > MAXIMUM_MCP_PAYLOAD_BYTES) throw runtimeFault("callback_invalid", false);
+  const tool = tools.find((item) => item.serverId === value.serverId && item.name === value.name);
+  if (tool === undefined) throw runtimeFault("callback_invalid", false);
+  return { tool, arguments: value.arguments, toolUseId: value.toolUseId };
 }
 
 function managedAgentCallbackRequest(value: unknown): {

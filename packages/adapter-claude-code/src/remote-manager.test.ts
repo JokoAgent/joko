@@ -1,9 +1,11 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
 import * as net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createManagerState, ManagerConnection } from "./remote-manager/manager.mjs";
@@ -23,6 +25,78 @@ afterEach(async () => {
 });
 
 describe("remote Claude manager protocol", () => {
+  it("exposes only the frozen product catalog and returns structured calls through its exact Query callback", async () => {
+    const previousRoot = process.env["JOKO_CLAUDE_RUNTIME_ROOT"];
+    const previousExecutable = process.env["JOKO_CLAUDE_EXECUTABLE"];
+    process.env["JOKO_CLAUDE_RUNTIME_ROOT"] = "/srv/joko-runtime";
+    process.env["JOKO_CLAUDE_EXECUTABLE"] = "/srv/joko-runtime/current/claude";
+    cleanups.push(async () => {
+      restoreEnvironment("JOKO_CLAUDE_RUNTIME_ROOT", previousRoot);
+      restoreEnvironment("JOKO_CLAUDE_EXECUTABLE", previousExecutable);
+    });
+    const sdk = new FakeSdk();
+    const managerState = createManagerState(sdk as never);
+    const socketPath = managerSocketPath();
+    const server = net.createServer((socket) => new ManagerConnection(socket, managerState));
+    await listen(server, socketPath);
+    cleanups.push(async () => {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      if (process.platform !== "win32") await rm(socketPath, { force: true });
+    });
+    const connection = await FrameClient.connect(socketPath);
+    cleanups.push(() => connection.close());
+    const productTool = {
+      serverId: "approved-tools", name: "echo", description: "Echo approved data",
+      inputSchema: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false },
+      outputSchema: { type: "object", properties: { echoed: { type: "string" } }, required: ["echoed"], additionalProperties: false }
+    };
+    const params = {
+      requestId: QUERY_ID, queryId: QUERY_ID, sessionId: SESSION_ID,
+      ownerKey: "a".repeat(64), ownerGeneration: "target:host:ssh:one", afterSeq: 0,
+      options: { ...queryOptions(), managedAgentTool: undefined, productMcpTools: [productTool] }
+    };
+    await connection.request("query.start", params, QUERY_ID);
+    expect(sdk.queries).toHaveLength(1);
+    const name = `joko_${createHash("sha256").update(productTool.serverId).digest("hex").slice(0, 24)}`;
+    const mcpServers = sdk.queries[0]!.options["mcpServers"] as Record<string, { instance: {
+      connect(transport: unknown): Promise<void>; close(): Promise<void>;
+    } }>;
+    expect(Object.keys(mcpServers)).toEqual([name]);
+    expect(sdk.queries[0]!.options["strictMcpConfig"]).toBe(true);
+    const client = new Client({ name: "remote-fixture", version: "1.0.0" }, { capabilities: {} });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    try {
+      await Promise.all([client.connect(clientTransport), mcpServers[name]!.instance.connect(serverTransport)]);
+      expect((await client.listTools()).tools).toEqual([expect.objectContaining({
+        name: productTool.name, description: productTool.description,
+        inputSchema: productTool.inputSchema, outputSchema: productTool.outputSchema
+      })]);
+      expect(await client.callTool({
+        name: "echo", arguments: { value: "hello" }, _meta: { "claudecode/toolUseId": "remote-root-one" }
+      })).toMatchObject({
+        content: [{ type: "text", text: "approved" }], structuredContent: { echoed: "approved" }, isError: false
+      });
+      expect(connection.callbackFrames).toEqual([expect.objectContaining({
+        callback: "productMcpTool",
+        value: { serverId: "approved-tools", name: "echo", arguments: { value: "hello" }, toolUseId: "remote-root-one" }
+      })]);
+      expect(await client.callTool({
+        name: "echo", arguments: { value: "hello", extra: true }, _meta: { "claudecode/toolUseId": "remote-root-two" }
+      })).toMatchObject({ isError: true });
+      expect(connection.callbackFrames).toHaveLength(1);
+    } finally {
+      await Promise.allSettled([client.close(), mcpServers[name]!.instance.close()]);
+    }
+    await expect(connection.request("query.retire", {
+      queryId: QUERY_ID, attachmentId: managerState.queries.get(QUERY_ID)?.attachmentId,
+      ownerKey: "a".repeat(64), ownerGeneration: "target:host:ssh:one", timeoutMs: 1_000
+    })).resolves.toEqual({ retired: true });
+    await expect(connection.request("query.start", {
+      ...params, requestId: randomUUID(), queryId: randomUUID(),
+      options: { ...queryOptions(), mcpServers: { unapproved: { command: "secret" } } }
+    })).rejects.toThrow("invalid_request");
+  });
+
   it("owns one daemon generation across attach, replay, callbacks, controls, Session operations, and exact retirement", async () => {
     const previousRoot = process.env["JOKO_CLAUDE_RUNTIME_ROOT"];
     const previousExecutable = process.env["JOKO_CLAUDE_EXECUTABLE"];
@@ -384,6 +458,7 @@ class AsyncQueue<T> implements AsyncIterableIterator<T> {
 }
 
 class FrameClient {
+  readonly callbackFrames: Array<Record<string, unknown>> = [];
   readonly #socket: net.Socket;
   readonly #pending = new Map<string, { resolve(value: unknown): void; reject(error: unknown): void }>();
   readonly #events: Array<Record<string, unknown>> = [];
@@ -474,6 +549,7 @@ class FrameClient {
           waiter.resolve(frame);
         }
       } else if (frame["kind"] === "callback") {
+        if (frame["callback"] === "productMcpTool") this.callbackFrames.push(frame);
         const value = frame["callback"] === "canUseTool"
           ? { behavior: "allow", updatedInput: { path: "/srv/project/a.ts" } }
           : frame["callback"] === "hook"
@@ -487,6 +563,8 @@ class FrameClient {
               }
             : frame["callback"] === "managedAgentTool"
               ? { text: "delegated from host" }
+              : frame["callback"] === "productMcpTool"
+                ? { content: [{ type: "text", text: "approved" }], structuredContent: { echoed: "approved" }, isError: false }
               : { value: CALLBACK_TOKEN, declined: false };
         this.#socket.write(`${JSON.stringify({
           v: 1,

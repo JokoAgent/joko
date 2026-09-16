@@ -1379,7 +1379,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         runtime = this.#requireIdleRuntime(context);
       }
     }
-    if (!runtime.remote && runtime.runtimePolicy === "standard" && runtime.mcpLease === undefined
+    if (runtime.runtimePolicy === "standard" && runtime.mcpLease === undefined
       && this.#mcpBridge !== undefined) {
       runtime = await this.#bindProductMcp(runtime, context);
     }
@@ -2074,11 +2074,13 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         if (!runtime.freshSessionCanRestart || await this.#sessionHasHistory(runtime, context.signal)) throw continuityGap();
         this.#assertCurrent(runtime, context, runtime.binding);
         confirmFresh = true;
-      } else assertSessionInfo(info, runtime.nativeSessionId, runtime.runtimeWorkspaceRoot, false);
+      } else assertSessionInfo(info, runtime.nativeSessionId, runtime.runtimeWorkspaceRoot, runtime.remote);
       retired = true;
       await this.#retireRuntime(runtime);
-      await waitFor(runtime.sdkRuntime.retireQuery(runtime.query, this.#teardownTimeoutMs), this.#teardownTimeoutMs,
-        context.signal, () => mcpBindUnknown());
+      if (!runtime.remote) {
+        await waitFor(runtime.sdkRuntime.retireQuery(runtime.query, this.#teardownTimeoutMs), this.#teardownTimeoutMs,
+          context.signal, () => mcpBindUnknown());
+      }
       let fresh = false;
       if (confirmFresh) {
         const current = await waitFor(this.#sessionInfo(runtime.nativeSessionId, runtime.target, context.signal,
@@ -2086,7 +2088,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         if (current === undefined) {
           if (await this.#sessionHasHistory(runtime, context.signal)) throw continuityGap();
           fresh = true;
-        } else assertSessionInfo(current, runtime.nativeSessionId, runtime.runtimeWorkspaceRoot, false);
+        } else assertSessionInfo(current, runtime.nativeSessionId, runtime.runtimeWorkspaceRoot, runtime.remote);
       }
       context.signal.throwIfAborted();
       lease.assertCurrent();
@@ -2370,8 +2372,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     this.#assertBindingContext(binding, context);
     const scoped = await this.#targetRuntime(context.target, context.signal);
     scoped.assertCurrent();
-    if (launch.mcpLease !== undefined && (scoped.remote || launch.runtimePolicy !== "standard")) {
-      throw claudeCodeError("MCP_QUERY_BIND_UNAVAILABLE", "The MCP Query route does not belong to a local standard Session.", "session_start");
+    if (launch.mcpLease !== undefined && launch.runtimePolicy !== "standard") {
+      throw claudeCodeError("MCP_QUERY_BIND_UNAVAILABLE", "The MCP Query route does not belong to a standard Session.", "session_start");
     }
     const nativeSessionId = parseBinding(binding);
     if (launch.resume) {

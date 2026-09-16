@@ -26,7 +26,7 @@ const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { await Promise.allSettled(cleanups.splice(0).map((cleanup) => cleanup())); });
 
 describe("Claude MCP durable Session and Queue", () => {
-  it("creates an isolated native Query before Store commit and binds Router tools before the first queued input", async () => {
+  it.each(["local", "remote"] as const)("creates an isolated %s Query before Store commit and binds Router tools before queued input", async (location) => {
     const root = await mkdtemp(join(tmpdir(), "joko-claude-mcp-session-"));
     const store = new OperationalStore(join(root, "store.db"));
     const artifacts = new ArtifactStore({
@@ -38,7 +38,9 @@ describe("Claude MCP durable Session and Queue", () => {
     await credentials.initialize();
     const router = new McpRouter({ store, credentials });
     await router.initialize();
-    const sdk = new ControlledSdkRuntime(root);
+    const remote = location === "remote";
+    const nativeRoot = remote ? "/srv/project" : root;
+    const sdk = new ControlledSdkRuntime(nativeRoot);
     const calls: BridgeToolCallContext[] = [];
     router.registerBridgeToolProvider({
       id: "approved-tools", generation: 1, available: true,
@@ -55,7 +57,11 @@ describe("Claude MCP durable Session and Queue", () => {
       }
     });
     const adapter = new ClaudeCodeAdapter({
-      id: "claude-code", instanceGeneration: 1, runtime: sdk,
+      id: "claude-code", instanceGeneration: 1, runtime: remote ? new ControlledSdkRuntime(root) : sdk,
+      ...(remote ? { remoteRuntimes: {
+        resolve: async () => ({ runtime: sdk, workspaceRoot: nativeRoot, remote: true, assertCurrent: () => undefined }),
+        close: async () => undefined
+      } } : {}),
       initializationTimeoutMs: 1_000, admissionTimeoutMs: 1_000, teardownTimeoutMs: 500,
       mcpBridge: createClaudeMcpBridge({
         router,
@@ -79,13 +85,15 @@ describe("Claude MCP durable Session and Queue", () => {
       await rm(root, { recursive: true, force: true });
     });
     await host.initialize();
+    const targetId = remote ? "target-remote" : "target-local";
     await host.registerTarget({
-      id: "target-local", backendId: "claude-code", displayName: "Local", workspaceRoot: root,
-      managed: true, trusted: true
+      id: targetId, backendId: "claude-code", displayName: location, workspaceRoot: root,
+      managed: !remote, trusted: true,
+      ...(remote ? { remoteWorkspace: { hostId: "host-a", workspaceRoot: nativeRoot } } : {})
     });
     const connection = store.createConnection({ id: "connection-local", name: "Local", authKeyDigest: "digest" });
     const create = await host.createSession({
-      operationId: "create-claude-mcp", connection, targetId: "target-local", title: "Authorized tools",
+      operationId: "create-claude-mcp", connection, targetId, title: "Authorized tools",
       providerId: "claude-code", modelId: "model-a", fastMode: false, permissionMode: "ask", planMode: false
     });
     const sessionId = create.value.sessionId;
@@ -114,7 +122,7 @@ describe("Claude MCP durable Session and Queue", () => {
     const tool = query.params.options.mcpTools![0]!;
     expect(await tool.call({ value: "durable" }, { toolUseId, signal: new AbortController().signal }))
       .toMatchObject({ content: [{ type: "text", text: "durable" }], structuredContent: { echoed: "durable" } });
-    expect(calls).toMatchObject([{ sessionId, targetId: "target-local", generation: 1 }]);
+    expect(calls).toMatchObject([{ sessionId, targetId, generation: 1 }]);
     query.push({
       type: "result", subtype: "success", session_id: query.nativeSessionId, uuid: randomUUID(),
       origin: { kind: "human" }, user_message_uuid: query.received[0]!.uuid,
