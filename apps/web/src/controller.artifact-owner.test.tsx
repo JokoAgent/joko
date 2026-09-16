@@ -160,7 +160,7 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
       ...inputOperations, ...workspaceOperations, ...voiceOperations, ...queueOperations, ...remoteOperations, ...loginOperations, ...sshOperations,
       watchRemoteHosts: async function* () { if (disposed) throw new Error("Remote workspace owner disconnected"); yield []; },
       readWorkspaceFile: read, readWorkspaceHtmlSnapshot, performBrowserTakeoverAction, getArtifactUrl: get, releaseArtifactUrl: release,
-      navigateSessionBranch: navigate, copyArtifactFile: download, downloadArtifact: download, exportSession: download, exportPortableSession: download,
+      navigateSessionBranch: navigate, copyArtifactFile: download, openArtifactFile: download, downloadArtifact: download, exportSession: download, exportPortableSession: download,
       updateAuxiliaryTextSettings: save, predictNextPrompt: predict, openBrowserPage
     } as unknown as OrchestratorGateway;
   });
@@ -182,6 +182,7 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   expect(current.exportSession).toBe(firstController.exportSession);
   expect(current.exportPortableSession).toBe(firstController.exportPortableSession);
   expect(current.copyArtifactFile).toBe(firstController.copyArtifactFile);
+  expect(current.openArtifactFile).toBe(firstController.openArtifactFile);
   expect(current.openHttpLink).toBe(firstController.openHttpLink);
   expect(current.navigateSessionBranch).toBe(firstController.navigateSessionBranch);
   expect(current.readDraft).toBe(firstController.readDraft);
@@ -286,6 +287,7 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   await expect(firstController.navigateSessionBranch("shared-session", { kind: "session_start" }, { expectedGeneration: 1n })).rejects.toThrow("Navigation owner disconnected");
   expect(gateways.get(second.id)!.navigate).not.toHaveBeenCalled();
   await expect(firstController.copyArtifactFile("shared", "same.txt", 1, downloadContext)).rejects.toThrow("Download owner disconnected");
+  await expect(firstController.openArtifactFile("shared", "same.txt", 1, downloadContext)).rejects.toThrow("Download owner disconnected");
   const capturedDraft = { text: "Captured", attachments: [], mentions: [], deliveryMode: "prompt" as const };
   await firstController.readDraft("shared-session");
   await firstController.saveDraft("shared-session", capturedDraft);

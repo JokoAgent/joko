@@ -45,6 +45,8 @@ import type {
   DesktopSaveFileRequest,
   DesktopCopyFileRequest,
   DesktopCopyFileResult,
+  DesktopOpenFileRequest,
+  DesktopOpenFileResult,
   DesktopRuntimeProcessMonitorOpenResult,
   DesktopSessionDragPreviewRequest,
   DesktopSessionWindowDropResult,
@@ -151,6 +153,8 @@ const DESKTOP_CHANNELS = {
   saveFile: "joko:files:save",
   copyFile: "joko:files:copy",
   cancelFileCopy: "joko:files:copy-cancel",
+  openFile: "joko:files:open",
+  cancelFileOpen: "joko:files:open-cancel",
   credentialGet: "joko:credential:get",
   credentialSet: "joko:credential:set",
   credentialDelete: "joko:credential:delete",
@@ -190,6 +194,7 @@ const desktopCapabilities = Object.freeze([
   "application.menu",
   "inspector.detach",
   ...((process.platform === "win32" || process.platform === "darwin") ? ["files.copy" as const] : []),
+  "files.open",
   "layout.reset",
   ...((process.platform === "win32" || process.platform === "linux") ? ["window.mainCloseBehavior" as const] : []),
   "microphone.lifecycle",
@@ -618,12 +623,20 @@ const desktopApi = Object.freeze({
     return ipcRenderer.invoke(DESKTOP_CHANNELS.saveFile, request).then(parseDesktopBoolean);
   },
   copyFile: (request: DesktopCopyFileRequest): Promise<DesktopCopyFileResult> => {
-    if (typeof request !== "object" || request === null || Object.keys(request).sort().join(",") !== "file,requestId" || !isFileCopyId(request.requestId) || !isDesktopSaveFileRequest(request.file)) return Promise.reject(new TypeError("The file copy request is invalid."));
+    if (typeof request !== "object" || request === null || Object.keys(request).sort().join(",") !== "file,requestId" || !isNativeFileActionId(request.requestId) || !isDesktopSaveFileRequest(request.file)) return Promise.reject(new TypeError("The file copy request is invalid."));
     return ipcRenderer.invoke(DESKTOP_CHANNELS.copyFile, request).then(parseFileCopyResult);
   },
   cancelFileCopy: (requestId: string): Promise<void> => {
-    if (!isFileCopyId(requestId)) return Promise.reject(new TypeError("The file copy identity is invalid."));
+    if (!isNativeFileActionId(requestId)) return Promise.reject(new TypeError("The file copy identity is invalid."));
     return ipcRenderer.invoke(DESKTOP_CHANNELS.cancelFileCopy, requestId).then(() => undefined);
+  },
+  openFile: (request: DesktopOpenFileRequest): Promise<DesktopOpenFileResult> => {
+    if (typeof request !== "object" || request === null || Object.keys(request).sort().join(",") !== "file,requestId" || !isNativeFileActionId(request.requestId) || !isDesktopSaveFileRequest(request.file)) return Promise.reject(new TypeError("The file open request is invalid."));
+    return ipcRenderer.invoke(DESKTOP_CHANNELS.openFile, request).then(parseFileOpenResult);
+  },
+  cancelFileOpen: (requestId: string): Promise<void> => {
+    if (!isNativeFileActionId(requestId)) return Promise.reject(new TypeError("The file open identity is invalid."));
+    return ipcRenderer.invoke(DESKTOP_CHANNELS.cancelFileOpen, requestId).then(() => undefined);
   },
   discovery: Object.freeze({
     scan: (): Promise<readonly DesktopDiscoveredNode[]> => ipcRenderer.invoke(DESKTOP_CHANNELS.discoveryScan)
@@ -1299,7 +1312,7 @@ function parseDesktopBoolean(value: unknown): boolean {
   return value;
 }
 
-function isFileCopyId(value: unknown): value is string {
+function isNativeFileActionId(value: unknown): value is string {
   return typeof value === "string" && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/u.test(value);
 }
 
@@ -1309,6 +1322,15 @@ function parseFileCopyResult(value: unknown): DesktopCopyFileResult {
   if (result["status"] === "copied" || result["status"] === "cancelled" || result["status"] === "unknown" || result["status"] === "unavailable" || result["status"] === "blocked") return { status: result["status"] };
   if (result["status"] === "failed" && (result["reason"] === "capacity" || result["reason"] === "storage" || result["reason"] === "helper")) return { status: "failed", reason: result["reason"] };
   throw new TypeError("Invalid file copy result.");
+}
+
+function parseFileOpenResult(value: unknown): DesktopOpenFileResult {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new TypeError("Invalid file open result.");
+  const result = value as Record<string, unknown>;
+  const keys = Object.keys(result).sort().join(",");
+  if (keys === "status" && (result["status"] === "opened" || result["status"] === "cancelled" || result["status"] === "unknown" || result["status"] === "unavailable")) return { status: result["status"] };
+  if (keys === "reason,status" && result["status"] === "failed" && (result["reason"] === "capacity" || result["reason"] === "storage" || result["reason"] === "open")) return { status: "failed", reason: result["reason"] };
+  throw new TypeError("Invalid file open result.");
 }
 
 function isDesktopUpdateStatus(value: unknown): value is DesktopUpdateStatus {

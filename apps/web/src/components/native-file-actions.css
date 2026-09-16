@@ -1,0 +1,86 @@
+.native-file-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 6px 0;
+  color: var(--text-soft);
+  font-size: var(--text-12);
+}
+
+.native-file-actions > span {
+  max-width: min(420px, calc(100vw - 48px));
+  overflow-wrap: anywhere;
+}
+
+.native-file-actions [role="alert"] { color: var(--danger); }
+
+.native-file-actions .message-action-menu__panel {
+  min-width: 184px;
+  position: absolute;
+  z-index: 10002;
+  top: calc(100% + 4px);
+  right: 0;
+  display: grid;
+  gap: 2px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 4px;
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-lg);
+}
+
+.native-file-actions .message-action-menu__panel button {
+  width: 100%;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  border: 0;
+  border-radius: 8px;
+  padding: 0 8px;
+  background: transparent;
+  color: var(--text);
+  font-size: var(--text-12);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.native-file-actions .message-action-menu__panel button:hover:not(:disabled),
+.native-file-actions .message-action-menu__panel button:focus-visible {
+  background: var(--surface-hover);
+}
+
+.native-file-actions .message-action-menu__panel button:disabled {
+  cursor: not-allowed;
+  opacity: .55;
+}
+
+.native-file-actions .message-action-menu__panel button svg {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+}
+
+.video-lightbox__toolbar .native-file-actions .message-action-menu__panel,
+.workspace-model-lightbox__toolbar .native-file-actions .message-action-menu__panel {
+  top: auto;
+  bottom: calc(100% + 4px);
+}
+
+.workspace-model-lightbox__toolbar .native-file-actions {
+  padding: 0;
+}
+
+.workspace-model-lightbox__toolbar .native-file-actions > span {
+  position: fixed;
+  z-index: 10001;
+  top: 22px;
+  left: 50%;
+  border-radius: 999px;
+  padding: 7px 12px;
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-sm);
+  transform: translateX(-50%);
+}

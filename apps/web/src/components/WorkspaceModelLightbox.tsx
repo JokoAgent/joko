@@ -1,6 +1,6 @@
 import type { ArtifactDownloadContext } from "../model.js";
 import { Box, Download, RotateCcw, X, ZoomIn, ZoomOut } from "lucide-react";
-import { useCallback, useLayoutEffect, useRef, useState, type JSX } from "react";
+import { useCallback, useLayoutEffect, useRef, useState, type JSX, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { IconButton, Spinner } from "./ui.js";
 
@@ -29,6 +29,7 @@ export interface WorkspaceModelLightboxProps {
   readonly name: string;
   readonly labels: WorkspaceModelLightboxLabels;
   readonly returnFocus?: HTMLElement | null;
+  readonly actions?: ReactNode;
   readonly onClose: () => void;
   readonly onDownload: (context: ArtifactDownloadContext) => unknown | Promise<unknown>;
 }
@@ -44,6 +45,7 @@ function ModelLightboxContent({
   name,
   labels,
   returnFocus,
+  actions,
   onClose,
   onDownload
 }: WorkspaceModelLightboxProps): JSX.Element {
@@ -112,6 +114,7 @@ function ModelLightboxContent({
       }
       if (event.altKey || event.ctrlKey || event.metaKey) return;
       if (event.key === "Escape") {
+        if (overlayRef.current?.querySelector(".native-file-actions details[open]") !== null) return;
         event.preventDefault();
         event.stopImmediatePropagation();
         close();
@@ -214,6 +217,7 @@ function ModelLightboxContent({
       <ModelLightboxButton label={labels.reset} disabled={src === undefined || sourceError !== undefined} onClick={() => resetWorkspaceModelCamera(viewerRef.current)}><RotateCcw /></ModelLightboxButton>
       <ModelLightboxButton label={labels.zoomIn} disabled={src === undefined || sourceError !== undefined} onClick={() => zoomWorkspaceModelCamera(viewerRef.current, 0.8)}><ZoomIn /></ModelLightboxButton>
       <span aria-hidden="true" />
+      {actions}
       <ModelLightboxButton label={labels.download} disabled={busy} onClick={download}><Download /></ModelLightboxButton>
       <ModelLightboxButton label={labels.close} onClick={close}><X /></ModelLightboxButton>
     </div>

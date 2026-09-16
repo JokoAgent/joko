@@ -24,7 +24,7 @@ interface Entry {
   readonly pid?: number;
   readonly retainUntil?: number;
 }
-export interface FileCopyScope {
+export interface NativeFileActionScope {
   readonly id: string;
   readonly isCurrent: () => boolean;
 }
@@ -42,7 +42,7 @@ export interface NativeFileClipboardOptions {
   readonly timeoutMs?: number;
 }
 interface Request {
-  readonly scope: FileCopyScope;
+  readonly scope: NativeFileActionScope;
   readonly digest: string;
   readonly abort: AbortController;
   readonly result: Promise<DesktopCopyFileResult>;
@@ -69,7 +69,7 @@ export class NativeFileClipboard {
     this.#manifest = join(options.directory, "files.json");
   }
 
-  copy(value: unknown, scope: FileCopyScope): Promise<DesktopCopyFileResult> {
+  copy(value: unknown, scope: NativeFileActionScope): Promise<DesktopCopyFileResult> {
     const input = parseDesktopCopyFileRequest(value);
     const key = `${scope.id}\0${input.requestId}`;
     const digest = createHash("sha256").update(input.file.name).update("\0").update(input.file.mediaType).update("\0").update(input.file.bytes).digest("hex");

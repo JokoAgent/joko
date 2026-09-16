@@ -235,7 +235,8 @@ import {
   resolveVerifiedExtensionLibraryFile
 } from "./extension-library-gestures.js";
 import { installSelectionContextMenu, setSelectionContextMenuLocale } from "./selection-context-menu.js";
-import { NativeFileClipboard, type FileCopyScope } from "./native-file-clipboard.js";
+import { NativeFileClipboard, type NativeFileActionScope } from "./native-file-clipboard.js";
+import { NativeFileOpener } from "./native-file-opener.js";
 import { bundledElectronUpdater, createElectronUpdateDriver } from "./electron-update-driver.js";
 import {
   createDesktopUpdateAutoRelaunchPolicy,
@@ -506,7 +507,8 @@ const MAXIMUM_ATTACHMENT_BATCH_BYTES = 256 * 1024 * 1024;
 const MAXIMUM_ATTACHMENT_FILES = 32;
 const MAXIMUM_NATIVE_FILE_BYTES = 256 * 1024 * 1024;
 let nativeFileClipboard: NativeFileClipboard | undefined;
-const nativeFileCopyScopes = new WeakMap<WebContents, FileCopyScope>();
+let nativeFileOpener: NativeFileOpener | undefined;
+const nativeFileActionScopes = new WeakMap<WebContents, NativeFileActionScope>();
 const extensionLibraryGestures = new ExtensionLibraryGestureCoordinator<WebContents>();
 const extensionLibraryGestureScopes = new WeakSet<WebContents>();
 const TRAY_ICON_DATA_URL_PREFIX = "data:image/png;base64,";
@@ -579,6 +581,7 @@ if (!app.requestSingleInstanceLock()) {
   });
   app.on("before-quit", (event) => {
     nativeFileClipboard?.cancelPending();
+    nativeFileOpener?.cancelPending();
     mainWindowCloseController?.cancelPending();
     quitting = true;
     activeDiscoveryAbort?.abort();
@@ -625,6 +628,7 @@ if (!app.requestSingleInstanceLock()) {
   });
   app.on("will-quit", () => {
     nativeFileClipboard?.dispose();
+    nativeFileOpener?.dispose();
     globalVoiceShortcutRecovery.dispose();
     unregisterGlobalVoiceShortcut();
     stopGlobalVoiceShortcutCapture();
@@ -5161,13 +5165,28 @@ function registerIpc(): void {
     assertTrustedIpcSender(event);
     if (parameters.length !== 1) throw new TypeError("Native file copy requires one request object.");
     nativeFileClipboard ??= new NativeFileClipboard({ directory: join(app.getPath("userData"), "clipboard-files"), platform: process.platform });
-    return nativeFileClipboard.copy(parameters[0], fileCopyScope(event));
+    return nativeFileClipboard.copy(parameters[0], nativeFileActionScope(event));
   });
   ipcMain.handle(DESKTOP_CHANNELS.cancelFileCopy, (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);
     if (parameters.length !== 1 || typeof parameters[0] !== "string") throw new TypeError("Native file copy cancellation requires one identity.");
-    const scope = nativeFileCopyScopes.get(event.sender);
+    const scope = nativeFileActionScopes.get(event.sender);
     if (scope !== undefined) nativeFileClipboard?.cancel(parameters[0], scope.id);
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.openFile, (event, ...parameters: unknown[]) => {
+    assertTrustedIpcSender(event);
+    if (parameters.length !== 1) throw new TypeError("Native file open requires one request object.");
+    nativeFileOpener ??= new NativeFileOpener({
+      directory: join(app.getPath("userData"), "opened-files"),
+      openPath: (path) => shell.openPath(path)
+    });
+    return nativeFileOpener.open(parameters[0], nativeFileActionScope(event));
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.cancelFileOpen, (event, ...parameters: unknown[]) => {
+    assertTrustedIpcSender(event);
+    if (parameters.length !== 1 || typeof parameters[0] !== "string") throw new TypeError("Native file open cancellation requires one identity.");
+    const scope = nativeFileActionScopes.get(event.sender);
+    if (scope !== undefined) nativeFileOpener?.cancel(parameters[0], scope.id);
   });
   ipcMain.handle(DESKTOP_CHANNELS.discoveryScan, async (event) => {
     assertTrustedIpcSender(event);
@@ -5829,13 +5848,13 @@ function assertFocusedTrustedIpcSender(event: IpcMainInvokeEvent): BrowserWindow
   return owner;
 }
 
-function fileCopyScope(event: IpcMainInvokeEvent): FileCopyScope {
+function nativeFileActionScope(event: IpcMainInvokeEvent): NativeFileActionScope {
   const contents = event.sender;
-  const existing = nativeFileCopyScopes.get(contents);
+  const existing = nativeFileActionScopes.get(contents);
   if (existing !== undefined) return existing;
   const frame = event.senderFrame;
   let active = true;
-  const scope: FileCopyScope = {
+  const scope: NativeFileActionScope = {
     id: randomUUID(),
     isCurrent: () => active && !quitting && !contents.isDestroyed() && contents.mainFrame === frame && trustedApplicationWindowForContents(contents) !== undefined
   };
@@ -5843,14 +5862,15 @@ function fileCopyScope(event: IpcMainInvokeEvent): FileCopyScope {
     if (!active) return;
     active = false;
     nativeFileClipboard?.retireScope(scope.id);
-    if (nativeFileCopyScopes.get(contents) === scope) nativeFileCopyScopes.delete(contents);
+    nativeFileOpener?.retireScope(scope.id);
+    if (nativeFileActionScopes.get(contents) === scope) nativeFileActionScopes.delete(contents);
     contents.removeListener("did-start-navigation", navigate);
     contents.removeListener("destroyed", retire);
   };
   const navigate = (_event: unknown, _url: string, isInPlace: boolean, isMainFrame: boolean): void => { if (isMainFrame && !isInPlace) retire(); };
   contents.on("did-start-navigation", navigate);
   contents.once("destroyed", retire);
-  nativeFileCopyScopes.set(contents, scope);
+  nativeFileActionScopes.set(contents, scope);
   return scope;
 }
 

@@ -120,6 +120,10 @@ type JokoDesktopCopyFileResult =
   | { readonly status: "copied" | "cancelled" | "unknown" | "unavailable" | "blocked" }
   | { readonly status: "failed"; readonly reason: "capacity" | "storage" | "helper" };
 
+type JokoDesktopOpenFileResult =
+  | { readonly status: "opened" | "cancelled" | "unknown" | "unavailable" }
+  | { readonly status: "failed"; readonly reason: "capacity" | "storage" | "open" };
+
 interface JokoDesktopAutoRelaunchSettings {
   readonly autoRelaunchOnIdle: boolean;
   readonly isCustomized: boolean;
@@ -202,6 +206,7 @@ type JokoDesktopNativeTaskStatusAction =
 
 type JokoDesktopCapability =
   | "files.copy"
+  | "files.open"
   | "app.info"
   | "app.update"
   | "attention.badge"
@@ -432,6 +437,8 @@ interface JokoDesktopApi {
   saveFile(file: JokoDesktopFile): Promise<boolean>;
   copyFile(request: { readonly requestId: string; readonly file: JokoDesktopFile }): Promise<JokoDesktopCopyFileResult>;
   cancelFileCopy(requestId: string): Promise<void>;
+  openFile(request: { readonly requestId: string; readonly file: JokoDesktopFile }): Promise<JokoDesktopOpenFileResult>;
+  cancelFileOpen(requestId: string): Promise<void>;
   readonly discovery: {
     scan(): Promise<readonly JokoDesktopDiscoveredNode[]>;
   };

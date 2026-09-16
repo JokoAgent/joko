@@ -51,7 +51,7 @@ import { canEditVisibleUserMessage, changeSetForMessageRound, lastVisibleUserMes
 import { reconcileShareSelection, shareableTimelineMessages, toggleShareMessageSelection } from "./share-selection-behavior.js";
 import { ShareSelectionBar } from "./ShareSelectionBar.js";
 import { Timeline, type InlinePlanVisibility } from "./Timeline.js";
-import { NativeFileCopyContext } from "./NativeFileCopyMenu.js";
+import { NativeFileActionsContext } from "./NativeFileCopyMenu.js";
 import { useAppShortcut } from "../use-app-shortcut.js";
 import { useGamepadActions } from "../gamepad-actions.js";
 import { modelSourceAccess } from "../model-source-access.js";
@@ -1671,7 +1671,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
       <ExtensionStatuses statuses={extensionStatuses} />
 
       {exportDownload.failed && <p className="danger-text" role="alert">{t("portable.exportFailed")}</p>}
-      <NativeFileCopyContext.Provider value={controller.state.ready && controller.state.connectionState === "connected" ? controller.copyArtifactFile : undefined}>
+      <NativeFileActionsContext.Provider value={controller.state.ready && controller.state.connectionState === "connected" ? { copyFile: controller.copyArtifactFile, openFile: controller.openArtifactFile } : undefined}>
       <Timeline
         key={timelineResourceOwnerKey}
         ownerKey={`${timelineResourceOwnerKey}:${session.generation}:${controller.state.connectionState}`}
@@ -1780,7 +1780,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
           }
         }}
       />
-      </NativeFileCopyContext.Provider>
+      </NativeFileActionsContext.Provider>
       <div ref={bottomOverlayRef} className="session-bottom-overlay">
       {!reviewReadOnly && <SessionScheduleNotice
         ownerId={controller.state.activeProfile?.serverId ?? controller.state.activeProfile?.id ?? "local"}

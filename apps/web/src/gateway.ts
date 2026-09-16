@@ -423,7 +423,14 @@ import { presentJokoServiceTerminology } from "./i18n/service-terminology.js";
 import { projectTimelineGeneratedFiles } from "./generated-files.js";
 import { emptySnapshot } from "./model.js";
 import { saveArtifactBlob } from "./artifact-download.js";
-import { captureNativeFileCopy, copyNativeArtifactFile, NATIVE_FILE_COPY_MAXIMUM_BYTES } from "./native-file-actions.js";
+import {
+  captureNativeFileCopy,
+  captureNativeFileOpen,
+  copyNativeArtifactFile,
+  NATIVE_FILE_COPY_MAXIMUM_BYTES,
+  NATIVE_FILE_OPEN_MAXIMUM_BYTES,
+  openNativeArtifactFile
+} from "./native-file-actions.js";
 import type {
   AppSnapshot,
   ArtifactStorageCleanupView,
@@ -6658,6 +6665,15 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     if (!Number.isSafeInteger(byteSize) || byteSize < 0 || byteSize > NATIVE_FILE_COPY_MAXIMUM_BYTES) return { status: "failed", reason: "capacity" };
     const blob = await this.fetchArtifact(blobId, ownedContext.signal);
     return copyNativeArtifactFile(blob, fileName, ownedContext, host);
+  }
+
+  async openArtifactFile(blobId: string, fileName: string, byteSize: number, context: ArtifactDownloadContext): Promise<import("./native-file-actions.js").NativeFileOpenOutcome> {
+    const ownedContext = this.artifactDownloadContext(context);
+    const host = captureNativeFileOpen();
+    if (host === undefined) return { status: "unavailable" };
+    if (!Number.isSafeInteger(byteSize) || byteSize < 0 || byteSize > NATIVE_FILE_OPEN_MAXIMUM_BYTES) return { status: "failed", reason: "capacity" };
+    const blob = await this.fetchArtifact(blobId, ownedContext.signal);
+    return openNativeArtifactFile(blob, fileName, ownedContext, host);
   }
 
   private async consumeEvents(signal: AbortSignal): Promise<void> {

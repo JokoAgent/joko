@@ -1,10 +1,11 @@
 // @vitest-environment jsdom
 import { Blob as NodeBlob } from "node:buffer";
 import { afterEach, expect, it, vi } from "vitest";
-import { copyNativeArtifactFile, NATIVE_FILE_COPY_MAXIMUM_BYTES } from "./native-file-actions.js";
+import { copyNativeArtifactFile, NATIVE_FILE_COPY_MAXIMUM_BYTES, NATIVE_FILE_OPEN_MAXIMUM_BYTES, openNativeArtifactFile } from "./native-file-actions.js";
 
 afterEach(() => { document.body.replaceChildren(); vi.restoreAllMocks(); });
 const host = () => ({ copyFile: vi.fn().mockResolvedValue({ status: "copied" }), cancelFileCopy: vi.fn().mockResolvedValue(undefined) });
+const openHost = () => ({ openFile: vi.fn().mockResolvedValue({ status: "opened" }), cancelFileOpen: vi.fn().mockResolvedValue(undefined) });
 const context = () => ({ ownerDocument: document, signal: new AbortController().signal });
 const blob = () => new NodeBlob([new Uint8Array([1, 2])], { type: "video/mp4" }) as unknown as Blob;
 
@@ -23,6 +24,21 @@ it("passes only authorized bytes to the captured host and preserves post-dispatc
   expect(native.copyFile).toHaveBeenCalledTimes(2);
 });
 
+it("opens only authorized bytes through the captured host and never retries an unknown native dispatch", async () => {
+  const native = openHost(); const result = deferred<JokoDesktopOpenFileResult>();
+  native.openFile.mockImplementationOnce(() => result.promise).mockRejectedValueOnce(new Error("IPC acknowledgement lost"));
+  const request = new AbortController();
+  const pending = openNativeArtifactFile(blob(), "video.mp4", { ownerDocument: document, signal: request.signal }, native);
+  await vi.waitFor(() => expect(native.openFile).toHaveBeenCalledOnce());
+  const value = native.openFile.mock.calls[0]![0];
+  expect(value.file).toEqual({ name: "video.mp4", mediaType: "video/mp4", bytes: new Uint8Array([1, 2]) });
+  request.abort(); expect(native.cancelFileOpen).toHaveBeenCalledExactlyOnceWith(value.requestId);
+  result.resolve({ status: "opened" });
+  await expect(pending).resolves.toEqual({ status: "opened" });
+  await expect(openNativeArtifactFile(blob(), "video.mp4", context(), native)).resolves.toEqual({ status: "unknown" });
+  expect(native.openFile).toHaveBeenCalledTimes(2);
+});
+
 it.each(["signal", "document"] as const)("does not dispatch after byte encoding outlives its %s", async (retired) => {
   const native = host(); const request = new AbortController(); const bytes = deferred<ArrayBuffer>();
   const frame = document.createElement("iframe"); document.body.append(frame);
@@ -35,11 +51,27 @@ it.each(["signal", "document"] as const)("does not dispatch after byte encoding 
   await failed; expect(native.copyFile).not.toHaveBeenCalled();
 });
 
+it.each(["signal", "document"] as const)("does not open after byte encoding outlives its %s", async (retired) => {
+  const native = openHost(); const request = new AbortController(); const bytes = deferred<ArrayBuffer>();
+  const frame = document.createElement("iframe"); document.body.append(frame);
+  const doc = frame.contentDocument!;
+  const owner = retired === "document" ? doc : document;
+  const pending = openNativeArtifactFile({ size: 2, type: "video/mp4", arrayBuffer: () => bytes.promise } as Blob, "video.mp4", { ownerDocument: owner, signal: request.signal }, native);
+  const failed = expect(pending).rejects.toThrow();
+  if (retired === "signal") request.abort(); else Object.defineProperty(doc, "defaultView", { value: null });
+  bytes.resolve(new Uint8Array([1, 2]).buffer);
+  await failed; expect(native.openFile).not.toHaveBeenCalled();
+});
+
 it("does not prepare unsupported or oversized files", async () => {
   const native = host(); const arrayBuffer = vi.fn();
   await expect(copyNativeArtifactFile(blob(), "video.mp4", context(), undefined)).resolves.toEqual({ status: "unavailable" });
   await expect(copyNativeArtifactFile({ size: NATIVE_FILE_COPY_MAXIMUM_BYTES + 1, arrayBuffer } as unknown as Blob, "video.mp4", context(), native)).resolves.toEqual({ status: "failed", reason: "capacity" });
   expect(arrayBuffer).not.toHaveBeenCalled(); expect(native.copyFile).not.toHaveBeenCalled();
+  const opener = openHost();
+  await expect(openNativeArtifactFile(blob(), "video.mp4", context(), undefined)).resolves.toEqual({ status: "unavailable" });
+  await expect(openNativeArtifactFile({ size: NATIVE_FILE_OPEN_MAXIMUM_BYTES + 1, arrayBuffer } as unknown as Blob, "video.mp4", context(), opener)).resolves.toEqual({ status: "failed", reason: "capacity" });
+  expect(opener.openFile).not.toHaveBeenCalled();
 });
 
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>((accept) => { resolve = accept; }); return { promise, resolve }; }

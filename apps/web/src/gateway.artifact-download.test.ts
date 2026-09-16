@@ -38,6 +38,44 @@ describe("artifact download ownership", () => {
     await expect(gateway.copyArtifactFile("shared", "video.mp4", 256 * 1024 * 1024 + 1, context)).resolves.toEqual({ status: "failed", reason: "capacity" });
     expect(fetchBlob).not.toHaveBeenCalled(); gateway.disconnect();
   });
+  it("opens through the original authenticated connection and captured native host without exposing a path", async () => {
+    const openFile = vi.fn<(request: { readonly requestId: string; readonly file: JokoDesktopFile }) => Promise<JokoDesktopOpenFileResult>>(async () => ({ status: "opened" }));
+    const original = { capabilities: ["files.open"], openFile, cancelFileOpen: vi.fn(async () => undefined) };
+    const replacement = { ...original, openFile: vi.fn<typeof openFile>() };
+    vi.stubGlobal("window", { jokoDesktop: original });
+    const bytes = deferred<Blob>();
+    const fetchBlob = vi.fn(async () => ({ ok: true, blob: () => bytes.promise }) as Response);
+    vi.stubGlobal("fetch", fetchBlob);
+    const gateway = await connected();
+    const owner = downloadDocument();
+    Object.assign(owner.document.defaultView!, { document: owner.document, crypto: globalThis.crypto });
+    const pending = gateway.openArtifactFile("shared", "video.mp4", 11, { ownerDocument: owner.document, signal: new AbortController().signal });
+    await vi.waitFor(() => expect(fetchBlob).toHaveBeenCalledOnce());
+    vi.stubGlobal("window", { jokoDesktop: replacement });
+    bytes.resolve(new Blob(["video bytes"], { type: "video/mp4" }));
+    await expect(pending).resolves.toEqual({ status: "opened" });
+    expect(original.openFile).toHaveBeenCalledOnce();
+    expect(replacement.openFile).not.toHaveBeenCalled();
+    expect(original.openFile.mock.calls[0]?.[0]).toEqual({
+      requestId: expect.any(String),
+      file: { name: "video.mp4", mediaType: "video/mp4", bytes: expect.any(Uint8Array) }
+    });
+    expect(original.openFile.mock.calls[0]?.[0]).not.toHaveProperty("path");
+    gateway.disconnect();
+  });
+
+  it("does not retrieve bytes when native open is unavailable or the authoritative size exceeds its budget", async () => {
+    const gateway = await connected();
+    const owner = downloadDocument();
+    const context = { ownerDocument: owner.document, signal: new AbortController().signal };
+    const fetchBlob = vi.fn();
+    vi.stubGlobal("fetch", fetchBlob);
+    await expect(gateway.openArtifactFile("shared", "video.mp4", 11, context)).resolves.toEqual({ status: "unavailable" });
+    vi.stubGlobal("window", { jokoDesktop: { capabilities: ["files.open"], openFile: vi.fn(), cancelFileOpen: vi.fn() } });
+    await expect(gateway.openArtifactFile("shared", "video.mp4", 256 * 1024 * 1024 + 1, context)).resolves.toEqual({ status: "failed", reason: "capacity" });
+    expect(fetchBlob).not.toHaveBeenCalled();
+    gateway.disconnect();
+  });
   it("uses the triggering window for browser dispatch and releases its URL exactly once", async () => {
     vi.useFakeTimers();
     const owner = downloadDocument();

@@ -1,7 +1,4 @@
 .video-preview { width: 100%; height: 100%; min-width: 0; min-height: 0; }
-.native-file-copy { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 6px 0; color: var(--text-soft); font-size: var(--text-12); }
-.native-file-copy > span { overflow-wrap: anywhere; }
-.native-file-copy [role="alert"] { color: var(--danger); }
 .video-preview__open { display: grid; place-items: center; position: relative; width: 100%; height: 100%; min-height: 120px; border: 0; border-radius: 10px; padding: 0; overflow: hidden; background: var(--surface-sunken); cursor: pointer; }
 .video-preview__open > video { display: block; width: 100%; height: 100%; max-height: 420px; object-fit: contain; pointer-events: none; }
 .video-preview__play { position: absolute; display: grid; place-items: center; width: 52px; height: 52px; border: 1px solid var(--line-strong); border-radius: 50%; background: color-mix(in srgb, var(--surface-raised) 88%, transparent); color: var(--text); box-shadow: var(--shadow-sm); transition: background 150ms ease, transform 150ms ease; }

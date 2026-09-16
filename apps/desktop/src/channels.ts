@@ -83,6 +83,8 @@ export const DESKTOP_CHANNELS = {
   saveFile: "joko:files:save",
   copyFile: "joko:files:copy",
   cancelFileCopy: "joko:files:copy-cancel",
+  openFile: "joko:files:open",
+  cancelFileOpen: "joko:files:open-cancel",
   credentialGet: "joko:credential:get",
   credentialSet: "joko:credential:set",
   credentialDelete: "joko:credential:delete",
@@ -606,6 +608,15 @@ export interface DesktopCopyFileRequest {
 export type DesktopCopyFileResult =
   | { readonly status: "copied" | "cancelled" | "unknown" | "unavailable" | "blocked" }
   | { readonly status: "failed"; readonly reason: "capacity" | "storage" | "helper" };
+
+export interface DesktopOpenFileRequest {
+  readonly requestId: string;
+  readonly file: DesktopFile;
+}
+
+export type DesktopOpenFileResult =
+  | { readonly status: "opened" | "cancelled" | "unknown" | "unavailable" }
+  | { readonly status: "failed"; readonly reason: "capacity" | "storage" | "open" };
 
 export type DesktopMainWindowCloseBehavior = "tray" | "minimize" | "quit";
 

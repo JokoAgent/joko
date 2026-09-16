@@ -1,11 +1,12 @@
 import { Box } from "lucide-react";
-import { useEffect, useState, type JSX } from "react";
+import { useContext, useEffect, useState, type JSX } from "react";
 
 import type { ArtifactView, OperationApi } from "../model.js";
 import type { Translator } from "./types.js";
 import { IconButton } from "./ui.js";
 import { WorkspaceModelLightbox } from "./WorkspaceModelLightbox.js";
 import { materializeWorkspaceModelSource } from "./workspace-gltf-source.js";
+import { NativeFileActionsContext, NativeFileActionsMenu } from "./NativeFileCopyMenu.js";
 
 interface TimelineArtifactModelProps {
   readonly artifact: ArtifactView;
@@ -52,6 +53,7 @@ function ArtifactModelLightbox({ artifact, ownerKey, trigger, loadUrl, onDownloa
   readonly trigger: HTMLElement;
   readonly onClose: () => void;
 }): JSX.Element {
+  const fileActions = useContext(NativeFileActionsContext);
   const [source, setSource] = useState<ModelSourceState>({ kind: "loading" });
   useEffect(() => {
     const request = new AbortController();
@@ -100,6 +102,7 @@ function ArtifactModelLightbox({ artifact, ownerKey, trigger, loadUrl, onDownloa
       interactionHint: t("workspace.modelInteractionHint")
     }}
     returnFocus={trigger}
+    actions={<NativeFileActionsMenu actions={fileActions} blobId={artifact.blobId} name={artifact.fileName} byteSize={artifact.byteSize} ownerKey={JSON.stringify([ownerKey, artifact.blobId, "native-file"])} t={t} />}
     onDownload={(context) => onDownload(artifact.blobId, artifact.fileName, context)}
     onClose={onClose}
   />;
