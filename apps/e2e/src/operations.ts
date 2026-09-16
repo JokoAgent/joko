@@ -80,6 +80,9 @@ export function createSessionMutation(input: {
   readonly modelId?: string;
   readonly effortId?: string;
   readonly fastMode?: boolean;
+  readonly useWorktree?: boolean;
+  readonly worktreeSourceRef?: string;
+  readonly refreshWorktreeRemote?: boolean;
 }): OperationMutation {
   if ((input.providerId === undefined) !== (input.modelId === undefined)) {
     throw new Error("E2E model selection requires both providerId and modelId.");
@@ -93,6 +96,11 @@ export function createSessionMutation(input: {
         displayName: input.displayName ?? "E2E task",
         permissionMode: input.permissionMode ?? PermissionMode.ASK,
         planMode: input.planMode ?? false,
+        useWorktree: input.useWorktree ?? false,
+        ...(input.worktreeSourceRef === undefined
+          ? {}
+          : { worktreeSourceRef: input.worktreeSourceRef }),
+        refreshWorktreeRemote: input.refreshWorktreeRemote ?? false,
         ...(input.providerId === undefined || input.modelId === undefined
           ? {}
           : {
