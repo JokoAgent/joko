@@ -1665,7 +1665,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         onPin={(session) => runAction(`pin:${session.id}`, () => controller.pinSession(session.id, !session.pinned))}
         onPinTarget={(target) => runAction(`project-pin:${target.id}`, () => controller.updateTarget(target.id, { pinned: !target.pinned }, target.revision))}
         onRenameTarget={(target, name) => runAction(`project-rename:${target.id}`, () => controller.updateTarget(target.id, { name }, target.revision))}
-        onRemoveTarget={(target) => runAction(`project-archive:${target.id}`, () => controller.archiveTarget(target.id, true))}
+        onRemoveTarget={(target) => runAction(`project-archive:${target.id}`, async () => { await controller.archiveTarget(target.id, true); })}
         onSetTargetSessionsArchived={(target, sessions, archived) => {
           if (archived) {
             requestArchiveSessions(sessions);

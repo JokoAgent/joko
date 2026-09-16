@@ -550,6 +550,7 @@ import type {
   SessionView,
   SessionWorktreeRemovalPreviewView,
   SessionWorktreeView,
+  TargetView,
   SkillCatalogView,
   CollaborationDirectoryView,
   CollaborationScopeKindView,
@@ -1762,8 +1763,13 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     }, true, [{ entity: { kind: EntityKind.TARGET, id: targetId }, expectedRevision: { value: expectedRevision } }]);
   }
 
-  async archiveTarget(targetId: string, archived: boolean): Promise<void> {
+  async archiveTarget(targetId: string, archived: boolean): Promise<TargetView | undefined> {
     await this.submit({ case: "archiveTarget", value: { targetId, archived } }, true);
+    // submit() schedules a refresh, but restoration needs the current catalogue
+    // before a renderer may re-admit the project to its private filter. Joining
+    // the in-flight refresh also covers an event-stream update that won the race.
+    await this.refresh();
+    return this.#snapshot?.targets.find((target) => target.id === targetId);
   }
 
   async deleteTarget(targetId: string, deleteManagedWorkspace: boolean): Promise<void> {

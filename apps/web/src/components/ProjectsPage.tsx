@@ -101,7 +101,12 @@ export function ProjectsPage({ controller, snapshot, focusProjectId, t, runActio
     setArchivePendingIds(new Set(archivePendingRef.current));
     runAction(`project-archive:${target.id}`, async () => {
       try {
-        await controller.archiveTarget(target.id, !target.archived);
+        const desiredArchived = !target.archived;
+        const authoritativeTarget = await controller.archiveTarget(target.id, desiredArchived);
+        if (authoritativeTarget === undefined || authoritativeTarget.archived !== desiredArchived) {
+          request.cancel();
+          return;
+        }
         request.ready = true;
         const latestController = latestControllerRef.current;
         const latest = latestController.state;

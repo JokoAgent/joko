@@ -4530,7 +4530,8 @@ export interface OperationApi {
       | { readonly kind: "remote"; readonly hostId: string; readonly workspaceRoot: string }
       | { readonly kind: "serviceNode" };
   }, expectedRevision: bigint): Promise<void>;
-  archiveTarget(targetId: string, archived: boolean): Promise<void>;
+  /** Returns the same Target from the authoritative post-operation snapshot, or undefined if it no longer exists. */
+  archiveTarget(targetId: string, archived: boolean): Promise<TargetView | undefined>;
   deleteTarget(targetId: string, deleteManagedWorkspace: boolean): Promise<void>;
   setWorkspaceTrust(workspaceId: string, trusted: boolean): Promise<void>;
   addExtraDirectory(workspaceId: string, serverPath: string, access: ExtraDirectoryView["access"]): Promise<void>;

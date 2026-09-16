@@ -21,6 +21,7 @@ import {
   type LinkOpenKind,
   type MessageSearchSortPreference,
   type UiPreferences,
+  type UiPreferencesMutation,
   personalizationPromptForOwner,
   withPersonalizationPrompt
 } from "./local-state.js";
@@ -247,6 +248,7 @@ export function useAppController(): AppController {
   routeRef.current = state.route;
   const preferencesRef = useRef<UiPreferences>(DEFAULT_UI_PREFERENCES);
   preferencesRef.current = state.preferences;
+  const preferenceMutationTailRef = useRef<Promise<void>>(Promise.resolve());
   const gatewayRef = useRef<OrchestratorGateway | undefined>(undefined);
   const gatewayGenerationRef = useRef(0);
   const htmlPreviewsRef = useRef(new Map<string, {
@@ -299,8 +301,10 @@ export function useAppController(): AppController {
       let profiles = persistedProfiles;
       let effectivePreferences = preferences ?? DEFAULT_UI_PREFERENCES;
       if (effectivePreferences.automaticConnectionTarget !== undefined && !automaticConnectionAvailable && window.jokoDesktop === undefined) {
-        effectivePreferences = { ...effectivePreferences, automaticConnectionTarget: undefined };
-        await local.savePreferences(effectivePreferences);
+        effectivePreferences = await local.mutatePreferences((current) => ({
+          ...current,
+          automaticConnectionTarget: undefined
+        }));
         if (cancelled) return;
       }
       let managedProfile: ConnectionProfile | undefined;
@@ -430,17 +434,17 @@ export function useAppController(): AppController {
     document.documentElement.style.setProperty("zoom", String(windowZoom));
   }, [state.preferences.windowZoom]);
 
-  const updatePreferences = useCallback(async (patch: Partial<UiPreferences>): Promise<void> => {
+  const commitPreferenceMutation = useCallback(async (mutation: UiPreferencesMutation): Promise<void> => {
     const previous = preferencesRef.current;
-    const next = { ...previous, ...patch };
+    const next = mutation(previous);
     preferencesRef.current = next;
     setState((current) => ({ ...current, preferences: next }));
     try {
-      await requireLocal(localRef.current).savePreferences(next);
+      await requireLocal(localRef.current).mutatePreferences(mutation);
     } catch (error) {
-      // Do not roll a newer successful change back when concurrent preference
-      // writes settle out of order. The latest failed write restores both the
-      // ref used by actions and the state rendered by settings.
+      // The local queue prevents a newer mutation from starting before this
+      // rollback. The identity check still avoids replacing unrelated state
+      // if the controller itself was retired while persistence was pending.
       if (preferencesRef.current === next) {
         preferencesRef.current = previous;
         setState((current) => current.preferences === next ? { ...current, preferences: previous } : current);
@@ -448,6 +452,23 @@ export function useAppController(): AppController {
       throw error;
     }
   }, []);
+
+  const mutatePreferences = useCallback((mutation: UiPreferencesMutation): Promise<void> => {
+    // Renderer-local intent is serialized as well as the IndexedDB transaction.
+    // If an older write fails, its rollback therefore happens before a newer
+    // mutation samples local state; the newer success cannot retain a phantom
+    // value that never reached durable storage.
+    const scheduled = preferenceMutationTailRef.current.then(
+      () => commitPreferenceMutation(mutation),
+      () => commitPreferenceMutation(mutation)
+    );
+    preferenceMutationTailRef.current = scheduled.then(() => undefined, () => undefined);
+    return scheduled;
+  }, [commitPreferenceMutation]);
+
+  const updatePreferences = useCallback(async (patch: Partial<UiPreferences>): Promise<void> => {
+    await mutatePreferences((current) => ({ ...current, ...patch }));
+  }, [mutatePreferences]);
 
   const setMachineSelection = useCallback(async (selection: MachineSelection): Promise<void> => {
     await updatePreferences({ machineSelection: normalizeMachineSelection(selection) });
@@ -1872,16 +1893,18 @@ export function useAppController(): AppController {
     setPersonalizationPrompt: (value) => {
       const ownerId = state.activeProfile?.serverId;
       if (ownerId === undefined) return Promise.reject(new Error("Connect to a Joko node before changing personalization instructions."));
-      return updatePreferences({
-        personalizationPrompts: withPersonalizationPrompt(preferencesRef.current.personalizationPrompts, ownerId, value)
-      });
+      return mutatePreferences((current) => ({
+        ...current,
+        personalizationPrompts: withPersonalizationPrompt(current.personalizationPrompts, ownerId, value)
+      }));
     },
     resetPersonalizationPrompt: () => {
       const ownerId = state.activeProfile?.serverId;
       if (ownerId === undefined) return Promise.reject(new Error("Connect to a Joko node before changing personalization instructions."));
-      return updatePreferences({
-        personalizationPrompts: withPersonalizationPrompt(preferencesRef.current.personalizationPrompts, ownerId, "")
-      });
+      return mutatePreferences((current) => ({
+        ...current,
+        personalizationPrompts: withPersonalizationPrompt(current.personalizationPrompts, ownerId, "")
+      }));
     },
     setLinkOpenPreference: (kind, preference) => updatePreferences(kind === "web"
       ? { webLinkOpenPreference: preference } : { localLinkOpenPreference: preference }),
@@ -1893,19 +1916,22 @@ export function useAppController(): AppController {
     setNewSessionWorktreeEnabled: (newSessionWorktreeEnabled) => updatePreferences({ newSessionWorktreeEnabled }),
     openHttpLink,
     openWorkspaceHtml,
-    setSidebarDisplayPreferences: (patch) => updatePreferences({
-      sidebarDisplayPreferences: withSidebarDisplayPreferences(preferencesRef.current.sidebarDisplayPreferences, patch)
-    }),
+    setSidebarDisplayPreferences: (patch) => mutatePreferences((current) => ({
+      ...current,
+      sidebarDisplayPreferences: withSidebarDisplayPreferences(current.sidebarDisplayPreferences, patch)
+    })),
     setSidebarOwnerLayout: (patch) => {
       const ownerId = state.activeProfile?.serverId;
       if (ownerId === undefined) return Promise.reject(new Error("Connect to a Joko node before changing sidebar layout."));
-      return updatePreferences({
-        sidebarOwnerLayouts: withSidebarOwnerLayout(preferencesRef.current.sidebarOwnerLayouts, ownerId, patch)
-      });
+      return mutatePreferences((current) => ({
+        ...current,
+        sidebarOwnerLayouts: withSidebarOwnerLayout(current.sidebarOwnerLayouts, ownerId, patch)
+      }));
     },
-    setAppShortcutOverride: (id, value) => updatePreferences({
-      appShortcutOverrides: withAppShortcutOverride(preferencesRef.current.appShortcutOverrides, id, value)
-    }),
+    setAppShortcutOverride: (id, value) => mutatePreferences((current) => ({
+      ...current,
+      appShortcutOverrides: withAppShortcutOverride(current.appShortcutOverrides, id, value)
+    })),
     resetAppShortcutOverrides: () => updatePreferences({ appShortcutOverrides: {} }),
     setInspectorOpen: (inspectorOpen) => updatePreferences({ inspectorOpen }),
     setNavigationOpen: (navigationOpen) => {
@@ -2305,7 +2331,7 @@ export function useAppController(): AppController {
     releaseArtifactUrl,
     downloadArtifact,
     copyArtifactFile
-  }), [saveProvider, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, readDraftSnapshot, saveDraftIfRevision, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, logoutConnection, logoutProfile, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setMachineSelection, state, switchMachine, updatePreferences]);
+  }), [saveProvider, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, readDraftSnapshot, saveDraftIfRevision, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setMachineSelection, state, switchMachine, updatePreferences]);
 }
 
 function upsertMachineCache(caches: readonly MachineCacheView[], cache: MachineCacheView): readonly MachineCacheView[] {

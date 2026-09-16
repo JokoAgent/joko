@@ -696,6 +696,49 @@ describe("Sidebar organizer display controls", () => {
     expect([...rendered.container.querySelectorAll<HTMLElement>(".sidebar__sessions [data-session-id]")].map((element) => element.dataset.sessionId)).toEqual(["pinned", "visible"]);
   });
 
+  it("prunes a newly hidden project in every mounted renderer without toggling it back", async () => {
+    const firstChange = vi.fn();
+    const secondChange = vi.fn();
+    const firstTarget = { id: "target", backendId: "backend", name: "First", workspaceId: "workspace", revision: 1n, workspaceName: "First", trusted: true, pinned: false, archived: false };
+    const secondTarget = { ...firstTarget, id: "second-target", name: "Second", workspaceId: "second-workspace", workspaceName: "Second" };
+    const visibleSnapshot = {
+      ...emptySnapshot(),
+      revision: 1n,
+      server: { name: "Orchestrator", version: "test", health: "healthy" as const },
+      backends: [{ id: "backend", name: "Backend", version: "1", health: "healthy" as const, capabilities: new Map() }],
+      targets: [firstTarget, secondTarget],
+      sessions: [session(), { ...session(), id: "second-session", targetId: secondTarget.id, projectId: secondTarget.id }]
+    };
+    const first = await renderSidebar(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, vi.fn(), {
+      snapshot: visibleSnapshot,
+      sidebarOwnerLayouts: { owner: { ...DEFAULT_SIDEBAR_OWNER_LAYOUT, projectFilter: [firstTarget.id] } },
+      onSidebarOwnerLayoutChange: firstChange
+    });
+    const second = await renderSidebar(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, vi.fn(), {
+      snapshot: visibleSnapshot,
+      sidebarOwnerLayouts: { owner: { ...DEFAULT_SIDEBAR_OWNER_LAYOUT, projectFilter: [firstTarget.id, secondTarget.id] } },
+      onSidebarOwnerLayoutChange: secondChange
+    });
+    const hiddenSnapshot = {
+      ...visibleSnapshot,
+      targets: [{ ...firstTarget, archived: true }, secondTarget]
+    };
+
+    await first.rerenderSnapshot(hiddenSnapshot);
+    await second.rerenderSnapshot(hiddenSnapshot);
+    expect(firstChange).toHaveBeenCalledExactlyOnceWith({ projectFilter: "all" });
+    expect(secondChange).toHaveBeenCalledExactlyOnceWith({ projectFilter: [secondTarget.id] });
+
+    await first.rerenderOwnerLayouts({ owner: { ...DEFAULT_SIDEBAR_OWNER_LAYOUT, projectFilter: "all" } });
+    await second.rerenderOwnerLayouts({ owner: { ...DEFAULT_SIDEBAR_OWNER_LAYOUT, projectFilter: [secondTarget.id] } });
+    firstChange.mockClear();
+    secondChange.mockClear();
+    await first.rerenderSnapshot(hiddenSnapshot);
+    await second.rerenderSnapshot(hiddenSnapshot);
+    expect(firstChange).not.toHaveBeenCalled();
+    expect(secondChange).not.toHaveBeenCalled();
+  });
+
   it("keeps archived pinned tasks in the independent pinned section", async () => {
     const rendered = await renderSidebar({ ...DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, status: "archived" }, vi.fn(), {
       snapshot: {

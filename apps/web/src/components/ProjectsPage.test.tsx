@@ -49,6 +49,18 @@ it.each(["failure", "owner-change", "disconnect-reconnect", "unmount"] as const)
   }
 });
 
+it.each(["deleted", "re-archived"] as const)("does not admit a project whose authoritative post-restore state is %s", async (outcome) => {
+  const view = await mount();
+  await act(async () => button(view.host, "projects.restore").click());
+  await act(async () => {
+    view.resolve(outcome === "deleted" ? undefined : { ...view.target, archived: true });
+    await view.settled();
+  });
+  expect(view.setSidebarOwnerLayout).not.toHaveBeenCalled();
+  expect(view.errors).toEqual([]);
+  expect(button(view.host, "projects.restore").disabled).toBe(false);
+});
+
 it.each(["empty", "next-card", "user-focus", "owner-change"] as const)("continues restored-card focus only while its original input scope owns it: %s", async (outcome) => {
   const view = await mount(outcome === "next-card");
   const restore = button(view.host, "projects.restore");
@@ -119,11 +131,14 @@ it("keeps the project when one task lifecycle deletion fails", async () => {
 async function mount(secondProject = false) {
   const host = document.createElement("div"); document.body.append(host);
   const root = createRoot(host); roots.push(root);
-  let resolve!: () => void; let reject!: (error: Error) => void;
-  const pending = new Promise<void>((done, fail) => { resolve = done; reject = fail; });
+  const target: TargetView = { id: "project", backendId: "backend", name: "Project", workspaceId: "workspace", revision: 1n, workspaceName: "Workspace", trusted: false, pinned: true, archived: true };
+  let resolvePending!: (value: TargetView | undefined) => void; let reject!: (error: Error) => void;
+  const pending = new Promise<TargetView | undefined>((done, fail) => { resolvePending = done; reject = fail; });
+  const resolve = (...outcomes: [] | [TargetView | undefined]): void => resolvePending(
+    outcomes.length === 0 ? { ...target, archived: false } : outcomes[0]
+  );
   const archiveTarget = vi.fn(() => pending);
   const setSidebarOwnerLayout = vi.fn(async () => undefined);
-  const target: TargetView = { id: "project", backendId: "backend", name: "Project", workspaceId: "workspace", revision: 1n, workspaceName: "Workspace", trusted: false, pinned: true, archived: true };
   const task: SessionView = { id: "task", backendId: "backend", targetId: "other", projectId: target.id, name: "Moved task", state: "idle", generation: 0n, pinned: false, archived: false, updatedAt: 1, permissionMode: "ask", planMode: false, fastMode: false };
   let snapshot = { ...emptySnapshot(), targets: [target, ...(secondProject ? [{ ...target, id: "second-project", name: "Second project" }] : [])], sessions: [task, { ...task, id: "moved-out", targetId: target.id, projectId: "other" }] };
   let controller = {
@@ -139,7 +154,7 @@ async function mount(secondProject = false) {
     prepareSessionRemoval={async (sessions) => ({ clean: sessions.length, dirty: 0, unknown: 0 })} />));
   await render();
   await act(async () => button(host, "nav.archived").click());
-  return { host, archiveTarget, setSidebarOwnerLayout, errors, resolve, reject, settled: () => operation,
+  return { host, target, archiveTarget, setSidebarOwnerLayout, errors, resolve, reject, settled: () => operation,
     changeOwner: async () => {
       controller = { ...controller, state: { ...controller.state, activeProfile: { ...controller.state.activeProfile!, id: "new-profile", serverId: "new-owner" } } };
       await render();

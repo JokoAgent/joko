@@ -5,7 +5,7 @@ import { afterEach, beforeAll, expect, it, vi } from "vitest";
 
 import { useAppController, type AppController } from "./controller.js";
 import { createOrchestratorGateway, probeOrchestratorOrigin, type OrchestratorGateway } from "./gateway.js";
-import { DEFAULT_UI_PREFERENCES, LocalState } from "./local-state.js";
+import { DEFAULT_UI_PREFERENCES, LocalState, type UiPreferences, type UiPreferencesMutation } from "./local-state.js";
 import { emptySnapshot, type AppSnapshot, type BrowserSettingsView, type SessionView, type TimelineItemView, type ConnectionProfile } from "./model.js";
 import { registerWorkspaceHtmlPreviewSurface } from "./workspace-html-auto-reload.js";
 import { persistentWebSecretEncryptionAvailable } from "./web-crypto.js";
@@ -51,13 +51,15 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   const newDraftCalls = Object.fromEntries(newDraftMethods.map((method) => [method, vi.fn(async () => undefined)])) as Record<typeof newDraftMethods[number], ReturnType<typeof vi.fn>>;
   const workspaceMethods = ["listWorkspaceChangeSets", "previewWorkspaceRewind", "executeWorkspaceRewind"] as const;
   const workspaceCalls = new Map<string, Record<typeof workspaceMethods[number], ReturnType<typeof vi.fn>>>();
+  let storedPreferences = { ...DEFAULT_UI_PREFERENCES, machineSelection: ["unselected-profile"] } as UiPreferences;
   vi.spyOn(LocalState, "open").mockResolvedValue({
     readDraft, saveDraft, readDraftSnapshot, saveDraftIfRevision, ...newDraftCalls,
     listProfiles: async () => [], listMachineCaches: async () => [],
-    readPreferences: async () => ({ ...DEFAULT_UI_PREFERENCES, machineSelection: ["unselected-profile"] }),
+    readPreferences: async () => storedPreferences,
     readAuthKey: async () => "test-key", saveProfile: async () => undefined,
     saveMachineCache: async () => undefined,
-    savePreferences: async () => undefined
+    savePreferences: async (value: UiPreferences) => { storedPreferences = value; },
+    mutatePreferences: async (mutation: UiPreferencesMutation) => (storedPreferences = mutation(storedPreferences))
   } as unknown as LocalState);
   const first = profile("first");
   const second = profile("second");

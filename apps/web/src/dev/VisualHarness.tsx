@@ -266,13 +266,16 @@ export function VisualHarness(): JSX.Element {
       saveCredential: scenario.scenario === "providers" ? providerActions.saveCredential : remoteHosts.saveCredential,
       saveProvider: providerActions.saveProvider,
       updateTarget: remoteHosts.updateTarget,
-      archiveTarget: async (targetId: string, archived: boolean): Promise<void> => {
-        if (!state.snapshot.targets.some((target) => target.id === targetId)) throw new Error("The visual project does not exist.");
+      archiveTarget: async (targetId: string, archived: boolean) => {
+        const current = state.snapshot.targets.find((target) => target.id === targetId);
+        if (current === undefined) throw new Error("The visual project does not exist.");
+        const next = { ...current, archived, revision: current.revision + 1n };
         updateSnapshot((snapshot) => ({ ...snapshot, revision: snapshot.revision + 1n,
           targets: snapshot.targets.map((target) => target.id === targetId
-            ? { ...target, archived, revision: target.revision + 1n } : target)
+            ? next : target)
         }));
         record(`project-archive:${targetId}:${String(archived)}`);
+        return next;
       },
       getTerminalCapabilities: terminals.getTerminalCapabilities,
       getUsageReport: usageHistory.getUsageReport,

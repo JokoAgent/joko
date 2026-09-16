@@ -123,6 +123,7 @@ export const LINK_OPEN_DEFAULTS: Readonly<Record<LinkOpenKind, LinkOpenPreferenc
   local: "sidebar"
 };
 export type PersonalizationPrompts = Readonly<Record<string, string>>;
+export type UiPreferencesMutation = (current: UiPreferences) => UiPreferences;
 
 export const PERSONALIZATION_PROMPT_MAX_LENGTH = 8_000;
 export const PERSONALIZATION_PROMPT_MAX_OWNERS = 32;
@@ -341,6 +342,28 @@ function normalizeConnectionProfile(value: unknown): ConnectionProfile | undefin
 function validConnectionIdentity(value: unknown, maximumLength: number): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= maximumLength &&
     value.trim() === value && !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
+function persistedUiPreferences(value: UiPreferences): { -readonly [Key in keyof UiPreferences]?: UiPreferences[Key] } {
+  // Store only non-default overrides so untouched controls continue
+  // to follow future product defaults.
+  const persisted: { -readonly [Key in keyof UiPreferences]?: UiPreferences[Key] } = { ...value };
+  if (value.messageNavRailEnabled) delete persisted.messageNavRailEnabled;
+  if (value.webLinkOpenPreference === LINK_OPEN_DEFAULTS.web) delete persisted.webLinkOpenPreference;
+  if (value.localLinkOpenPreference === LINK_OPEN_DEFAULTS.local) delete persisted.localLinkOpenPreference;
+  if (value.streamFadeEnabled) delete persisted.streamFadeEnabled;
+  if (value.sessionNotificationsEnabled) delete persisted.sessionNotificationsEnabled;
+  if (!value.newSessionWorktreeEnabled) delete persisted.newSessionWorktreeEnabled;
+  if (Object.keys(value.personalizationPrompts).length === 0) delete persisted.personalizationPrompts;
+  if (value.automaticConnectionTarget === undefined) delete persisted.automaticConnectionTarget;
+  if (value.machineSelection === "all") delete persisted.machineSelection;
+  return persisted;
+}
+
+function canonicalUiPreferencesCandidate(value: UiPreferences): UiPreferences {
+  if (value.automaticConnectionTarget !== undefined || !Object.hasOwn(value, "automaticConnectionTarget")) return value;
+  const { automaticConnectionTarget: _automaticConnectionTarget, ...current } = value;
+  return current;
 }
 
 export interface ComposerDraftSnapshot {
@@ -605,19 +628,26 @@ export class LocalState {
   }
 
   async savePreferences(value: UiPreferences): Promise<void> {
-    // Store only non-default overrides so untouched controls continue
-    // to follow future product defaults.
-    const persisted: { -readonly [Key in keyof UiPreferences]?: UiPreferences[Key] } = { ...value };
-    if (value.messageNavRailEnabled) delete persisted.messageNavRailEnabled;
-    if (value.webLinkOpenPreference === LINK_OPEN_DEFAULTS.web) delete persisted.webLinkOpenPreference;
-    if (value.localLinkOpenPreference === LINK_OPEN_DEFAULTS.local) delete persisted.localLinkOpenPreference;
-    if (value.streamFadeEnabled) delete persisted.streamFadeEnabled;
-    if (value.sessionNotificationsEnabled) delete persisted.sessionNotificationsEnabled;
-    if (!value.newSessionWorktreeEnabled) delete persisted.newSessionWorktreeEnabled;
-    if (Object.keys(value.personalizationPrompts).length === 0) delete persisted.personalizationPrompts;
-    if (value.automaticConnectionTarget === undefined) delete persisted.automaticConnectionTarget;
-    if (value.machineSelection === "all") delete persisted.machineSelection;
-    await this.put(PREFERENCE_STORE, "ui", persisted);
+    await this.mutatePreferences(() => value);
+  }
+
+  /**
+   * A preference mutation is one IndexedDB readwrite transaction. Every
+   * renderer therefore applies its bounded patch to the latest durable value
+   * instead of replacing changes committed by another application window from
+   * a stale in-memory snapshot.
+   */
+  async mutatePreferences(mutation: UiPreferencesMutation): Promise<UiPreferences> {
+    const transaction = this.#database.transaction(PREFERENCE_STORE, "readwrite");
+    const store = transaction.objectStore(PREFERENCE_STORE);
+    const stored = await requestResult<unknown>(store.get("ui"));
+    const current = stored === undefined ? DEFAULT_UI_PREFERENCES : normalizeUiPreferences(stored);
+    const candidate = canonicalUiPreferencesCandidate(mutation(current));
+    const next = normalizeUiPreferences(candidate);
+    if (!samePersistedValue(candidate, next)) throw new Error("The UI preference mutation produced an invalid current shape.");
+    store.put(persistedUiPreferences(next), "ui");
+    await transactionDone(transaction);
+    return next;
   }
 
   async readPreferences(): Promise<UiPreferences | undefined> {
