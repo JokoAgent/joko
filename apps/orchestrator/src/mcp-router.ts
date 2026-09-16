@@ -916,6 +916,28 @@ export class McpRouter {
           guard();
         }
       } else {
+        const targetRevision = this.#store.getTarget(session.targetId).revision;
+        const context = {
+          sessionId: input.sessionId,
+          targetId: input.targetId,
+          generation: input.generation,
+          requestIdentity,
+          requestBodyHash
+        };
+        const guard = (): void => {
+          input.signal?.throwIfAborted();
+          const current = this.#store.getSession(context.sessionId).descriptor;
+          if (this.#findGrant(token) !== grant
+            || this.#bridgeToolProviders.get(input.serverId) !== bridgeProvider
+            || !bridgeProvider.available || bridgeProvider.generation !== serverGeneration
+            || current.targetId !== context.targetId || current.binding.generation !== context.generation
+            || current.archived || current.deletedAt !== undefined
+            || this.#store.findPendingSessionLifecycleCleanup(current.id) !== undefined
+            || this.#store.getTarget(context.targetId).revision !== targetRevision) {
+            throw new Error("Bridge Tool audio publication owner is no longer active.");
+          }
+        };
+        guard();
         const execution = await this.#callBridgeToolProvider(
             bridgeProvider,
             serverGeneration,
@@ -932,8 +954,23 @@ export class McpRouter {
               requestBodyHash
             }
           );
-        result = execution.result;
+        guard();
         hostImages = execution.hostImages;
+        const replay = this.#audioArtifacts?.replay(context);
+        result = replay ?? (this.#audioArtifacts === undefined ? execution.result : await this.#audioArtifacts.publish(
+          execution.result,
+          context,
+          guard,
+          (value) => this.#redactText(value),
+          (value) => this.#normalizeResult(value, "Bridge Tool audio result").value,
+          {
+            // A service-owned Provider has no MCP resources/read authority.
+            // It must return standard inline or embedded bytes instead of a link.
+            read: async () => { throw new Error("Bridge Tool resources/read is unavailable."); },
+            ...(input.signal === undefined ? {} : { signal: input.signal })
+          }
+        ));
+        guard();
       }
       return await this.#projectBridgeResult(result, input.serverId, input.toolName, hostImages);
     } catch (error) {

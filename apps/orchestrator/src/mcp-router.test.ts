@@ -421,6 +421,171 @@ describe("McpRouter", () => {
     } finally { await router.dispose(); store.close(); await rm(root, { recursive: true, force: true }); }
   });
 
+  it("publishes service-owned Bridge Tool inline audio once while preserving explicit metadata and host image output", async () => {
+    const { root, store, router, artifacts } = await fixture();
+    const wav = audioWave();
+    const cover = Buffer.from(AUDIO_ARTWORK_PNG, "base64");
+    let calls = 0;
+    const hostImage = await artifacts.ingestBytes(cover, { fileName: "provider-preview.png", mimeType: "image/png" });
+    const provider: BridgeToolProvider = {
+      id: "joko_audio_provider",
+      generation: 4,
+      available: true,
+      tools: [{
+        serverId: "joko_audio_provider",
+        name: "create_audio",
+        description: "Create standard embedded audio",
+        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+        requiresPermission: true
+      }, {
+        serverId: "joko_audio_provider",
+        name: "linked_audio",
+        description: "Return an unavailable resource link",
+        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+        requiresPermission: true
+      }],
+      async callTool(name) {
+        calls += 1;
+        if (name === "linked_audio") return {
+          content: [{ type: "resource_link", uri: "asset://provider-track", name: "track", mimeType: "audio/wav" }],
+          isError: false
+        };
+        return {
+          content: [
+            { type: "resource", resource: { uri: "asset://embedded-track", mimeType: "audio/wav", blob: wav.toString("base64") } },
+            { type: "image", data: cover.toString("base64"), mimeType: "image/png" },
+            { type: "text", text: "Created" }
+          ],
+          structuredContent: {
+            jokoAudioArtifacts: [{
+              audioContentIndex: 0,
+              kind: "music",
+              title: "Provider track",
+              description: "Embedded result",
+              durationSeconds: 1,
+              artwork: { imageContentIndex: 1, alt: "Provider cover" }
+            }],
+            status: "complete"
+          },
+          hostImages: [{ blob: hostImage, alt: "Provider preview" }],
+          isError: false
+        };
+      }
+    };
+    try {
+      router.registerBridgeToolProvider(provider);
+      const snapshot = router.createPiBridgeSnapshot({
+        endpoint: "http://127.0.0.1:4318/internal/mcp",
+        sessionId: "session-1",
+        targetId: "target-1",
+        expectedPiGeneration: 1
+      });
+      const request = {
+        ...bridgeScope(1),
+        authorization: `Bearer ${snapshot.mcpBridge.token}`,
+        generation: 1,
+        serverId: provider.id,
+        toolName: "create_audio"
+      };
+      const first = await router.executeBridgeCall(request);
+      expect(first).toMatchObject({
+        isError: false,
+        details: {
+          mcpStructuredContent: { status: "complete" },
+          jokoMcpBridge: { imageOutputs: [{ blob: { id: hostImage.id }, alt: "Provider preview" }] }
+        }
+      });
+      expect(JSON.stringify(first)).not.toContain("jokoAudioArtifacts");
+      const records = store.listArtifacts({ sessionId: "session-1" });
+      expect(records).toHaveLength(2);
+      const audio = records.find((entry) => (entry.metadata as { audio?: unknown }).audio !== undefined)!;
+      expect(audio.metadata).toMatchObject({ audio: {
+        kind: "music",
+        title: "Provider track",
+        description: "Embedded result",
+        durationSeconds: 1,
+        artwork: { alt: "Provider cover", width: 2, height: 2 }
+      } });
+      expect((await artifacts.readBlob(audio.blob)).data).toEqual(wav);
+      expect(store.listEvents({ sessionId: "session-1" }).filter((event) => event.payload.type === "artifact")).toHaveLength(1);
+
+      expect(await router.executeBridgeCall(request)).toEqual(first);
+      expect(calls).toBe(2);
+      expect(store.listArtifacts({ sessionId: "session-1" })).toHaveLength(2);
+      expect(store.listEvents({ sessionId: "session-1" }).filter((event) => event.payload.type === "artifact")).toHaveLength(1);
+
+      expect(await router.executeBridgeCall({ ...request, requestId: "provider-linked", toolName: "linked_audio" }))
+        .toMatchObject({ isError: true, errorCode: "invalid_result" });
+      expect(store.listArtifacts({ sessionId: "session-1" })).toHaveLength(2);
+      snapshot.revoke();
+    } finally { await router.dispose(); store.close(); await rm(root, { recursive: true, force: true }); }
+  });
+
+  it.each(["cancel", "revoke", "generation"] as const)("fences service-owned audio publication on Provider %s", async (boundary) => {
+    const { root, store, router, artifacts } = await fixture();
+    let generation = 7;
+    const staged = deferred<void>();
+    const release = deferred<void>();
+    const provider: BridgeToolProvider = {
+      id: "joko_audio_fence",
+      get generation() { return generation; },
+      available: true,
+      tools: [{
+        serverId: "joko_audio_fence",
+        name: "audio",
+        description: "Return standard inline audio",
+        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+        requiresPermission: false
+      }],
+      async callTool() {
+        return {
+          content: [{ type: "audio", data: audioWave().toString("base64"), mimeType: "audio/wav" }],
+          isError: false
+        };
+      }
+    };
+    const ingest = artifacts.ingestBytes.bind(artifacts);
+    const spy = vi.spyOn(artifacts, "ingestBytes").mockImplementation(async (...args) => {
+      const blob = await ingest(...args);
+      staged.resolve();
+      await release.promise;
+      return blob;
+    });
+    try {
+      router.registerBridgeToolProvider(provider);
+      const snapshot = router.createPiBridgeSnapshot({
+        endpoint: "http://127.0.0.1:4318/internal/mcp",
+        sessionId: "session-1",
+        targetId: "target-1",
+        expectedPiGeneration: 1
+      });
+      const controller = new AbortController();
+      const call = router.executeBridgeCall({
+        ...bridgeScope(1),
+        authorization: `Bearer ${snapshot.mcpBridge.token}`,
+        generation: 1,
+        serverId: provider.id,
+        toolName: "audio",
+        signal: controller.signal
+      });
+      await staged.promise;
+      if (boundary === "cancel") controller.abort();
+      else if (boundary === "revoke") snapshot.revoke();
+      else generation += 1;
+      release.resolve();
+      expect(await call).toMatchObject({ isError: true, content: [] });
+      expect(store.listArtifacts({ sessionId: "session-1" })).toHaveLength(0);
+      expect(store.listEvents({ sessionId: "session-1" }).filter((event) => event.payload.type === "artifact")).toHaveLength(0);
+      snapshot.revoke();
+    } finally {
+      release.resolve();
+      spy.mockRestore();
+      await router.dispose();
+      store.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("leases native auth only to the exact account generation and runner fence", async () => {
     let now = 10_000;
     let accountId = "vault-account-one";
