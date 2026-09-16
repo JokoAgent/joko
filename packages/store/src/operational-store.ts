@@ -13033,7 +13033,7 @@ function deviceFromRow(row: Row): DeviceRecord {
   return {
     id: stringValue(row["id"]),
     name: stringValue(row["name"]),
-    kind: enumValue(row["kind"], ["unspecified", "web", "desktop", "service"] as const),
+    kind: enumValue(row["kind"], ["unspecified", "web", "desktop", "service", "mobile"] as const),
     platform: stringValue(row["platform"]),
     appVersion: stringValue(row["app_version"]),
     state: enumValue(row["state"], ["active", "revoked"] as const),
@@ -13063,7 +13063,7 @@ function pairingFromRow(row: Row): PairingRecord {
       device: {
         id: deviceId,
         name: deviceName!,
-        kind: enumValue(deviceKind, ["unspecified", "web", "desktop", "service"] as const),
+        kind: enumValue(deviceKind, ["unspecified", "web", "desktop", "service", "mobile"] as const),
         platform: devicePlatform!,
         appVersion: deviceAppVersion!
       }

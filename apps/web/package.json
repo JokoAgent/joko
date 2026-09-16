@@ -40,6 +40,7 @@
     "@connectrpc/connect-web": "2.1.2",
     "@fontsource-variable/jetbrains-mono": "5.2.8",
     "@google/model-viewer": "4.3.1",
+    "@joko/brand-assets": "workspace:*",
     "@joko/contracts": "workspace:*",
     "@lezer/highlight": "1.2.3",
     "@replit/codemirror-lang-csharp": "6.2.0",

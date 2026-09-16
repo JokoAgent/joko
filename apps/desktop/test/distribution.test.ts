@@ -127,8 +127,8 @@ describe("Desktop distribution", () => {
   });
 
   it("uses the existing Joko-owned vector and emits installable plus unpackable platform targets", () => {
-    expect(config.directories).toEqual({ output: "release", buildResources: "../web/src" });
-    expect(existsSync(new URL("../../web/src/icon-light.svg", import.meta.url))).toBe(true);
+    expect(config.directories).toEqual({ output: "release", buildResources: "../../packages/brand-assets/src" });
+    expect(existsSync(new URL("../../../packages/brand-assets/src/icon-light.svg", import.meta.url))).toBe(true);
     expect(config.win).toMatchObject({ icon: "icon-light.svg", forceCodeSigning: false, target: ["nsis", "zip"] });
     expect(config.mac).toMatchObject({ icon: "icon-light.svg", identity: null, target: ["dmg", "zip"] });
     expect(config.linux).toMatchObject({ icon: "icon-light.svg", target: ["AppImage", "tar.gz"] });

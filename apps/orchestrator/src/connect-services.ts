@@ -1215,6 +1215,8 @@ export function createConnectServices(application: OrchestratorApplication): Con
             ? "desktop"
             : request.deviceKind === contract.DeviceKind.SERVICE
               ? "service"
+              : request.deviceKind === contract.DeviceKind.MOBILE
+                ? "mobile"
               : "unspecified",
         platform: request.platform,
         appVersion: request.appVersion
@@ -6153,6 +6155,8 @@ function deviceFromRecord(
         ? contract.DeviceKind.DESKTOP
         : record.kind === "service"
           ? contract.DeviceKind.SERVICE
+          : record.kind === "mobile"
+            ? contract.DeviceKind.MOBILE
           : contract.DeviceKind.UNSPECIFIED,
     platform: record.platform,
     appVersion: record.appVersion,

@@ -1,0 +1,26 @@
+{
+  "expo": {
+    "name": "Joko",
+    "slug": "joko",
+    "scheme": "joko",
+    "version": "0.1.0",
+    "orientation": "default",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "bundleIdentifier": "app.joko.mobile",
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSLocalNetworkUsageDescription": "Connect to a Joko node on your local network.",
+        "NSAppTransportSecurity": { "NSAllowsLocalNetworking": true }
+      }
+    },
+    "android": {
+      "package": "app.joko.mobile"
+    },
+    "plugins": [
+      "./with-joko-native-brand.cjs",
+      "expo-secure-store",
+      ["expo-build-properties", { "android": { "usesCleartextTraffic": true } }]
+    ]
+  }
+}

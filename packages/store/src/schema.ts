@@ -170,7 +170,7 @@ CREATE TABLE device_control_relations (
 CREATE TABLE devices (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
-        kind TEXT NOT NULL CHECK (kind IN ('unspecified', 'web', 'desktop', 'service')),
+        kind TEXT NOT NULL CHECK (kind IN ('unspecified', 'web', 'desktop', 'service', 'mobile')),
         platform TEXT NOT NULL,
         app_version TEXT NOT NULL,
         state TEXT NOT NULL CHECK (state IN ('active', 'revoked')),
@@ -637,7 +637,7 @@ CREATE TABLE pairings (
         label TEXT,
         device_id TEXT,
         device_name TEXT,
-        device_kind TEXT CHECK (device_kind IS NULL OR device_kind IN ('unspecified', 'web', 'desktop', 'service')),
+        device_kind TEXT CHECK (device_kind IS NULL OR device_kind IN ('unspecified', 'web', 'desktop', 'service', 'mobile')),
         device_platform TEXT,
         device_app_version TEXT,
         expires_at INTEGER NOT NULL,

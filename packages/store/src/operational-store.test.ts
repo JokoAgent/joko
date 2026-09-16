@@ -3158,6 +3158,19 @@ describe("OperationalStore", () => {
     expect(() => store.authorizeConnection(second.id, second.authKeyDigest)).toThrow(AuthorizationError);
   });
 
+  it("persists native mobile pairing identity and revokes its credential", () => {
+    const store = createStore();
+    const connection = store.createConnection({
+      id: "mobile-connection", deviceId: "mobile-device", name: "Joko phone",
+      device: { name: "Joko phone", kind: "mobile", platform: "android", appVersion: "0.1.0" },
+      authKeyDigest: "mobile-digest"
+    });
+    expect(store.getDevice(connection.deviceId)).toMatchObject({ kind: "mobile", platform: "android", state: "active" });
+    expect(store.authorizeConnection(connection.id, connection.authKeyDigest).deviceId).toBe("mobile-device");
+    store.revokeDevice(connection.deviceId);
+    expect(() => store.authorizeConnection(connection.id, connection.authKeyDigest)).toThrow(AuthorizationError);
+  });
+
   it("persists fenced bidirectional device-control consent independently of pairing", () => {
     const store = createStore();
     store.createConnection({

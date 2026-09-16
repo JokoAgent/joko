@@ -1,0 +1,73 @@
+import { MessageRole, type Event, type InputContent } from "@joko/contracts";
+
+export interface TimelineRow {
+  readonly id: string;
+  readonly label: string;
+  readonly text: string;
+  readonly sequence: bigint;
+  readonly eventId: string;
+}
+
+function inputText(input: InputContent | undefined): string {
+  return input?.parts.flatMap((part) => part.content.case === "text" ? [part.content.value] : ["[Attachment or reference]"]).join("\n") ?? "";
+}
+
+export function timelineRows(events: readonly Event[]): TimelineRow[] {
+  const byId = new Map<string, TimelineRow>();
+  const unique = new Map(events.map((event) => [event.eventId, event]));
+  const ordered = [...unique.values()].sort((a, b) => (a.cursor?.sequence ?? 0n) < (b.cursor?.sequence ?? 0n) ? -1
+    : (a.cursor?.sequence ?? 0n) > (b.cursor?.sequence ?? 0n) ? 1 : 0);
+  for (const event of ordered) {
+    const kind = event.payload?.kind;
+    const sequence = event.cursor?.sequence ?? 0n;
+    if (!kind?.case) continue;
+    switch (kind.case) {
+      case "messageStarted": {
+        const message = kind.value;
+        byId.set(message.messageId, { id: message.messageId, label: roleLabel(message.role),
+          text: inputText(message.userInput) || "…", sequence, eventId: event.eventId });
+        break;
+      }
+      case "textDelta": {
+        const previous = byId.get(kind.value.messageId);
+        if (previous) byId.set(previous.id, { ...previous, text: previous.text === "…" ? kind.value.delta : previous.text + kind.value.delta });
+        break;
+      }
+      case "messageCompleted": {
+        const message = kind.value;
+        const previous = byId.get(message.messageId);
+        const blocks = message.blocks.flatMap((block) => block.content.case === "text" ? [block.content.value]
+          : block.content.case === "image" ? ["[Image]"] : block.content.case === "artifact" ? ["[Artifact]"]
+            : block.content.case === "toolCall" ? ["[Tool call]"] : []);
+        byId.set(message.messageId, { id: message.messageId, label: previous?.label || roleLabel(message.role),
+          text: blocks.join("\n") || previous?.text || "Completed", sequence: previous?.sequence ?? sequence,
+          eventId: previous?.eventId ?? event.eventId });
+        break;
+      }
+      case "statusStream":
+        byId.set(event.eventId, { id: event.eventId, label: "Status", text: kind.value.label + (kind.value.detail ? ` · ${kind.value.detail}` : ""), sequence, eventId: event.eventId });
+        break;
+      case "recoverableError":
+      case "terminalError":
+        byId.set(event.eventId, { id: event.eventId, label: "Error", text: kind.value.error?.message || "The task reported an error.", sequence, eventId: event.eventId });
+        break;
+      case "toolCallStarted":
+        byId.set(event.eventId, { id: event.eventId, label: "Tool", text: "Tool call started", sequence, eventId: event.eventId });
+        break;
+      case "runDone":
+        byId.set(event.eventId, { id: event.eventId, label: "Run", text: "Run finished", sequence, eventId: event.eventId });
+        break;
+      default:
+        byId.set(event.eventId, { id: event.eventId, label: "Activity", text: kind.case.replace(/([A-Z])/g, " $1").trim(), sequence, eventId: event.eventId });
+    }
+  }
+  return [...byId.values()].sort((a, b) => a.sequence < b.sequence ? -1 : a.sequence > b.sequence ? 1 : a.id.localeCompare(b.id));
+}
+
+function roleLabel(role: MessageRole): string {
+  if (role === MessageRole.USER) return "You";
+  if (role === MessageRole.ASSISTANT) return "Assistant";
+  if (role === MessageRole.SYSTEM) return "System";
+  if (role === MessageRole.TOOL) return "Tool";
+  return "Message";
+}

@@ -13798,7 +13798,7 @@ function mapDevice(device: Device): DeviceView {
   return {
     id: device.deviceId,
     name: device.displayName,
-    kind: device.kind === DeviceKind.WEB ? "web" : device.kind === DeviceKind.DESKTOP ? "desktop" : device.kind === DeviceKind.SERVICE ? "service" : "unknown",
+    kind: device.kind === DeviceKind.WEB ? "web" : device.kind === DeviceKind.DESKTOP ? "desktop" : device.kind === DeviceKind.SERVICE ? "service" : device.kind === DeviceKind.MOBILE ? "mobile" : "unknown",
     platform: device.platform,
     appVersion: device.appVersion,
     revoked: device.revoked,

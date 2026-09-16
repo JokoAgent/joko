@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import darkAppIconUrl from "@joko/brand-assets/icon-dark.svg?url";
+import lightAppIconUrl from "@joko/brand-assets/icon-light.svg?url";
 import { assertBrowserActionCurrent, WorkspaceHtmlExternalUnavailableError, type HttpLinkOpenOptions } from "./browser-action.js";
 import { isWorkspaceHtmlPreviewVisible, WorkspaceHtmlAutoReload } from "./workspace-html-auto-reload.js";
 import {
@@ -82,8 +84,8 @@ import {
   type MachineSelection
 } from "./machine-federation.js";
 
-const LIGHT_APP_ICON_URL = new URL("./icon-light.svg", import.meta.url).href;
-const DARK_APP_ICON_URL = new URL("./icon-dark.svg", import.meta.url).href;
+const LIGHT_APP_ICON_URL = lightAppIconUrl;
+const DARK_APP_ICON_URL = darkAppIconUrl;
 const FAVICON_SIZE = 256;
 let faviconRequest = 0;
 

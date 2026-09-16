@@ -1,4 +1,10 @@
-export type ConnectionArtworkVariant = "base" | "alt";
+import {
+  CONNECTION_ARTWORK_GROUP_IDS,
+  nextConnectionArtworkGroupIndex as nextSharedConnectionArtworkGroupIndex,
+  type ConnectionArtworkVariant
+} from "@joko/brand-assets/connection-artwork";
+
+export type { ConnectionArtworkVariant } from "@joko/brand-assets/connection-artwork";
 
 export interface ConnectionArtworkFrame {
   readonly id: string;
@@ -24,10 +30,10 @@ interface MutableConnectionArtworkGroup {
   readonly alt: MutableThemePair;
 }
 
-const DEFAULT_CONNECTION_ARTWORK_GROUP = "jogging";
+const DEFAULT_CONNECTION_ARTWORK_GROUP = CONNECTION_ARTWORK_GROUP_IDS[0];
 const CONNECTION_ARTWORK_FILE = /^(?<group>[a-z0-9]+(?:-[a-z0-9]+)*)-(?<theme>light|dark)(?<alt>-alt)?\.svg$/u;
 
-const bundledConnectionArtwork = import.meta.glob("./landing-artwork/*.svg", {
+const bundledConnectionArtwork = import.meta.glob("../../../packages/brand-assets/src/landing-artwork/*.svg", {
   eager: true,
   import: "default",
   query: "?url"
@@ -87,6 +93,11 @@ export function buildConnectionArtworkGroups(
 
 export const CONNECTION_ARTWORK_GROUPS = buildConnectionArtworkGroups(bundledConnectionArtwork);
 
+if (CONNECTION_ARTWORK_GROUPS.length !== CONNECTION_ARTWORK_GROUP_IDS.length
+  || CONNECTION_ARTWORK_GROUPS.some((group, index) => group.id !== CONNECTION_ARTWORK_GROUP_IDS[index])) {
+  throw new Error("Bundled connection artwork does not match the canonical group manifest.");
+}
+
 export function connectionArtworkGroupAt(index: number): ConnectionArtworkGroup {
   const group = CONNECTION_ARTWORK_GROUPS[index];
   if (group === undefined) throw new RangeError(`Unknown connection artwork group index: ${index}`);
@@ -94,9 +105,7 @@ export function connectionArtworkGroupAt(index: number): ConnectionArtworkGroup 
 }
 
 export function nextConnectionArtworkGroupIndex(currentIndex: number, length = CONNECTION_ARTWORK_GROUPS.length): number {
-  if (!Number.isInteger(currentIndex) || currentIndex < 0) throw new RangeError("Connection artwork group index must be a non-negative integer.");
-  if (!Number.isInteger(length) || length < 1) throw new RangeError("Connection artwork groups must not be empty.");
-  return (currentIndex + 1) % length;
+  return nextSharedConnectionArtworkGroupIndex(currentIndex, length);
 }
 
 function completeFrame(groupId: string, variant: ConnectionArtworkVariant, pair: MutableThemePair): ConnectionArtworkFrame {

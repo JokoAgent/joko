@@ -10,18 +10,22 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
+      "react-native": "./dist/index.js",
       "import": "./dist/index.js"
     },
     "./gen/*": {
       "types": "./dist/gen/*.d.ts",
+      "react-native": "./dist/gen/*.js",
       "import": "./dist/gen/*.js"
     },
     "./desktop-bootstrap": {
       "types": "./dist/desktop-bootstrap.d.ts",
+      "react-native": "./dist/desktop-bootstrap.js",
       "import": "./dist/desktop-bootstrap.js"
     },
     "./managed-outbound-proxy": {
       "types": "./dist/managed-outbound-proxy.d.ts",
+      "react-native": "./dist/managed-outbound-proxy.js",
       "import": "./dist/managed-outbound-proxy.js"
     },
     "./proto/*": "./proto/*"

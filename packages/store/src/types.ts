@@ -67,7 +67,7 @@ export interface ConnectionRecord {
   readonly revision: bigint;
 }
 
-export type DeviceKind = "unspecified" | "web" | "desktop" | "service";
+export type DeviceKind = "unspecified" | "web" | "desktop" | "service" | "mobile";
 
 export interface DeviceRecord {
   readonly id: string;
