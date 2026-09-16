@@ -15,6 +15,7 @@ import {
   type NativeTurn
 } from "./protocol.js";
 import { safeIdentifier, safeJson, safePath, safeText, toolIdentity } from "./translator.js";
+import { CODEX_FILE_CHANGE_FALLBACK, projectCodexFileChanges } from "./file-change.js";
 
 export interface CodexNativeHistoryProjectionOptions {
   readonly maximumEvents: number;
@@ -286,7 +287,7 @@ function functionCallOutputProjection(item: NativeThreadItem): ItemProjection {
 }
 
 function fallbackToolIdentity(item: NativeThreadItem): { readonly name: string; readonly input: string } {
-  if (item.type === "fileChange") return { name: "file_change", input: fileChangeSummary(item) };
+  if (item.type === "fileChange") return toolIdentity(item) ?? { name: "file_change", input: fileChangeSummary(item) };
   if (item.type === "collabAgentToolCall") {
     const tool = typeof item["tool"] === "string" ? historyIdentifier(item["tool"]) : "collaboration";
     return { name: `collaboration/${tool}`, input: safeTextValue(item["prompt"], "Agent collaboration", 8_192) };
@@ -323,13 +324,9 @@ function toolFailed(item: NativeThreadItem, status: string): boolean {
 }
 
 function fileChangeSummary(item: NativeThreadItem): string {
-  const changes = Array.isArray(item["changes"]) ? item["changes"] : [];
-  const lines = changes.flatMap((change) => {
-    if (!isJsonObject(change) || typeof change["path"] !== "string") return [];
-    const kind = typeof change["kind"] === "string" ? historyIdentifier(change["kind"]) : "changed";
-    return [`${kind}: ${safePath(change["path"])}`];
-  });
-  return safeText(lines.join("\n") || "Workspace file change", 256 * 1024);
+  const projected = projectCodexFileChanges(item["changes"], safeText);
+  if (projected !== undefined) return projected.summary;
+  return CODEX_FILE_CHANGE_FALLBACK;
 }
 
 function safeMcpResult(value: JsonValue | undefined): string | undefined {

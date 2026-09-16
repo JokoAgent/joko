@@ -14,6 +14,7 @@ const STRUCTURED_SCAN_LIMIT = 1_048_576;
 export const TOOL_PAYLOAD_DIFF_SCAN_LIMIT = 4_194_304;
 const MAX_STRUCTURED_NODES = 4_096;
 const PATH_KEYS = ["path", "filePath", "file_path", "relativePath", "relative_path"] as const;
+const MOVE_PATH_KEYS = ["movePath", "move_path", "newPath", "new_path"] as const;
 const DIFF_KEYS = ["diff", "patch", "rawDiff", "raw_diff", "unifiedDiff", "unified_diff"] as const;
 const OLD_KEYS = ["oldString", "old_string", "oldText", "old_text"] as const;
 const NEW_KEYS = ["newString", "new_string", "newText", "new_text"] as const;
@@ -89,10 +90,12 @@ function parseStructuredDiff(text: string): readonly Omit<ToolPayloadDiffFile, "
 
     const path = firstString(value, PATH_KEYS);
     const directDiff = firstString(value, DIFF_KEYS);
+    const kind = isRecord(value["kind"]) ? value["kind"] : undefined;
+    const movePath = firstString(value, MOVE_PATH_KEYS) ?? (kind === undefined ? undefined : firstString(kind, MOVE_PATH_KEYS));
     const oldText = firstString(value, OLD_KEYS);
     const newText = firstString(value, NEW_KEYS);
     if (path !== undefined && directDiff !== undefined) {
-      files.push({ path, text: directDiff });
+      files.push({ path: movePath === undefined ? path : `${path} → ${movePath}`, text: directDiff });
     } else if (path !== undefined && oldText !== undefined && newText !== undefined) {
       files.push({ path, text: `--- old\n${oldText}\n+++ new\n${newText}` });
     }

@@ -34,6 +34,17 @@ describe("tool payload diff discovery", () => {
     expect(envelope.map((file) => file.path)).toEqual(["src/a.ts", "src/b.ts"]);
   });
 
+  it("keeps both sides of a structured file move as its display identity", () => {
+    expect(toolPayloadDiffFiles(JSON.stringify({ changes: [{
+      path: "src/old.ts",
+      kind: { type: "update", movePath: "src/new.ts" },
+      diff: "diff --git a/src/old.ts b/src/new.ts\n-old\n+new"
+    }] }))).toEqual([expect.objectContaining({
+      path: "src/old.ts → src/new.ts",
+      text: expect.stringContaining("diff --git")
+    })]);
+  });
+
   it("bounds structured discovery for very large opaque payloads", () => {
     const text = JSON.stringify({ path: "large.txt", patch: "x".repeat(1_048_576) });
     expect(text.length).toBeGreaterThan(1_048_576);

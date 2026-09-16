@@ -98,6 +98,7 @@ import {
   shouldUnpinTimelineOnWheel
 } from "./timeline-follow-intent.js";
 import { ToolPayloadLightbox, ToolPayloadOpenButton } from "./ToolPayloadLightbox.js";
+import { parseToolFileChangeSet, type ToolFileChangeView } from "./tool-file-change.js";
 import { WorkspaceImageLightbox } from "./WorkspaceImageLightbox.js";
 import type { ToolPayloadSection } from "./tool-payload.js";
 import { SentMessageReferenceChips, SentMessageReferenceText, TimelineLinkSourceContext, TimelineMarkdownImage, TimelineMarkdownLink, type TimelineReferenceActions, type TimelineWorkspaceAsset } from "./TimelineReferenceContent.js";
@@ -1507,12 +1508,21 @@ function usePrefersReducedMotion(): boolean {
   return reduced;
 }
 
-function ToolBlock({ item, locale, t, onArtifactUrl, onArtifactDownload }: { readonly item: TimelineItemView; readonly locale: string; readonly t: Translator; readonly onArtifactUrl: (blobId: string) => Promise<string>; readonly onArtifactDownload: OperationApi["downloadArtifact"] }): JSX.Element {
+export function ToolBlock({ item, locale, t, onArtifactUrl, onArtifactDownload }: { readonly item: TimelineItemView; readonly locale: string; readonly t: Translator; readonly onArtifactUrl: (blobId: string) => Promise<string>; readonly onArtifactDownload: OperationApi["downloadArtifact"] }): JSX.Element {
   const { ownerKey } = useContext(TimelinePersonalizationContext);
   const [payloadPreview, setPayloadPreview] = useState<{ readonly sectionId: ToolPayloadSection["id"]; readonly trigger: HTMLButtonElement }>();
   const tool = item.tool;
   if (tool === undefined) return <NoticeBlock item={item} icon={<Wrench />} title={item.title ?? t("timeline.tool")} locale={locale} />;
   const open = tool.state === "running" || tool.state === "waiting" || tool.state === "failed";
+  const fileChanges = parseToolFileChangeSet(tool.name, tool.input)?.changes;
+  const fileChangeHeading = fileChanges === undefined
+    ? undefined
+    : fileChanges.length === 1
+      ? toolFileChangePath(fileChanges[0]!)
+      : t("timeline.fileChangeFiles", { count: fileChanges.length });
+  const fileChangeDetail = fileChanges?.length === 1
+    ? `${t(`timeline.fileChange.${fileChanges[0]!.action}`)} · ${toolStateLabel(tool.state, t)}`
+    : undefined;
   const payloadSections: readonly ToolPayloadSection[] = [
     ...(tool.input === "" ? [] : [{ id: "input" as const, label: t("common.input"), text: tool.input }]),
     ...(tool.output === undefined ? [] : [{ id: "output" as const, label: t("common.output"), text: tool.output }])
@@ -1521,7 +1531,7 @@ function ToolBlock({ item, locale, t, onArtifactUrl, onArtifactDownload }: { rea
     <details className={cx("tool-block", `tool-block--${tool.state}`)} open={open}>
       <summary>
         <span className="tool-block__icon"><ToolIcon name={tool.name} /></span>
-        <span className="tool-block__heading"><strong>{tool.name}</strong><small>{toolStateLabel(tool.state, t)}</small></span>
+        <span className="tool-block__heading"><strong>{fileChangeHeading ?? tool.name}</strong><small>{fileChangeDetail ?? toolStateLabel(tool.state, t)}</small></span>
         <Pill tone={tool.isError || tool.state === "failed" ? "danger" : tool.state === "succeeded" ? "success" : "neutral"}>{tool.state}</Pill>
         <time>{formatDateTime(item.createdAt, locale)}</time>
         <ChevronDown className="details-chevron" aria-hidden="true" />
@@ -1534,6 +1544,10 @@ function ToolBlock({ item, locale, t, onArtifactUrl, onArtifactDownload }: { rea
       {payloadPreview !== undefined && <ToolPayloadLightbox ownerKey={JSON.stringify([ownerKey, item.id, item.sourceEventId])} title={tool.name} sections={payloadSections} initialSectionId={payloadPreview.sectionId} returnFocus={payloadPreview.trigger} labels={{ close: t("common.close"), copy: t("timeline.toolPayloadCopy"), copyTitle: t("timeline.toolPayloadCopyTitle"), copied: t("timeline.toolPayloadCopied"), copyFailed: t("timeline.toolPayloadCopyFailed"), selectAll: t("timeline.toolPayloadSelectAll"), allFiles: t("timeline.toolPayloadAllFiles"), chooseFile: t("timeline.toolPayloadChooseFile") }} onClose={() => setPayloadPreview(undefined)} />}
     </details>
   );
+}
+
+function toolFileChangePath(change: ToolFileChangeView): string {
+  return change.movePath === undefined ? change.path : `${change.path} → ${change.movePath}`;
 }
 
 export function ArtifactBlock({ item, icon, locale, t, onArtifactUrl, onArtifactDownload }: { readonly item: TimelineItemView; readonly icon: JSX.Element; readonly locale: string; readonly t: Translator; readonly onArtifactUrl: (blobId: string) => Promise<string>; readonly onArtifactDownload: OperationApi["downloadArtifact"] }): JSX.Element {

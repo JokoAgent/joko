@@ -31,6 +31,7 @@ import {
   type RpcId,
   type ScalarCommandApprovalDecision
 } from "./protocol.js";
+import { CODEX_FILE_CHANGE_FALLBACK, projectCodexFileChanges } from "./file-change.js";
 
 export interface ResolvedBlob {
   readonly data: Uint8Array;
@@ -452,13 +453,19 @@ export class CodexEventTranslator {
         return [toolResult(item, state, output, status !== "completed")];
       }
       case "fileChange": {
-        const changes = Array.isArray(item["changes"]) ? item["changes"] : [];
-        const output = changes.flatMap((change) => {
-          if (!isJsonObject(change) || typeof change["path"] !== "string") return [];
-          const kind = typeof change["kind"] === "string" ? change["kind"] : "changed";
-          return [`${kind}: ${safePath(change["path"])}`];
-        }).join("\n");
-        return [toolResult(item, state, output, item["status"] === "failed")];
+        const projected = projectCodexFileChanges(item["changes"], safeText);
+        const identity = toolIdentity(item)!;
+        const started = state.itemNames.has(item.id);
+        if (!started) rememberItemName(state.itemNames, item.id, identity.name);
+        const output = projected?.summary
+          ?? CODEX_FILE_CHANGE_FALLBACK;
+        const result = toolResult(item, state, output, item["status"] === "failed" || item["status"] === "declined");
+        return started ? [result] : [{
+          type: "tool_start",
+          callId: item.id,
+          name: identity.name,
+          input: identity.input
+        }, result];
       }
       case "mcpToolCall": {
         const output = item["result"] === null || item["result"] === undefined
@@ -616,9 +623,11 @@ export function toolIdentity(item: NativeThreadItem): { readonly name: string; r
     case "commandExecution":
       return { name: "command", input: safeText(typeof item["command"] === "string" ? item["command"] : "Command execution", 8_192) };
     case "fileChange": {
-      const changes = Array.isArray(item["changes"]) ? item["changes"] : [];
-      const paths = changes.flatMap((change) => isJsonObject(change) && typeof change["path"] === "string" ? [safePath(change["path"])] : []);
-      return { name: "file_change", input: paths.join("\n") || "Workspace file change" };
+      const projected = projectCodexFileChanges(item["changes"], safeText);
+      return {
+        name: "file_change",
+        input: projected?.input ?? CODEX_FILE_CHANGE_FALLBACK
+      };
     }
     case "mcpToolCall": {
       const server = typeof item["server"] === "string" ? safeIdentifier(safeText(item["server"], 128)) : "mcp";

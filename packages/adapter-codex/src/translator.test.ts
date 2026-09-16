@@ -63,6 +63,103 @@ describe("Codex interaction translation", () => {
     ]);
   });
 
+  it("keeps the complete file-change identity and diff from start through completion", () => {
+    const translator = new CodexEventTranslator();
+    const state = createTranslatorState();
+    const item: JsonValue = {
+      id: "change-one",
+      type: "fileChange",
+      status: "completed",
+      changes: [
+        { path: "src/old.ts", kind: { type: "update", move_path: "src/new.ts" }, diff: "-old\n+new" },
+        { path: "src/added.ts", kind: { type: "add" }, diff: "+added" }
+      ]
+    };
+    const started = translator.translate("item/started", { threadId: "thread-one", turnId: "turn-one", item }, state);
+    const completed = translator.translate("item/completed", { threadId: "thread-one", turnId: "turn-one", item }, state);
+
+    expect(started).toEqual([expect.objectContaining({
+      type: "tool_start",
+      callId: "change-one",
+      name: "file_change",
+      input: JSON.stringify({ changes: [
+        { path: "src/old.ts", kind: { type: "update", movePath: "src/new.ts" }, diff: "-old\n+new" },
+        { path: "src/added.ts", kind: { type: "add" }, diff: "+added" }
+      ] })
+    })]);
+    expect(completed).toEqual([expect.objectContaining({
+      type: "tool_result",
+      callId: "change-one",
+      output: "move: src/old.ts -> src/new.ts\nadd: src/added.ts",
+      isError: false
+    })]);
+  });
+
+  it("creates a complete file-change call from Codex v2's completion-only notification", () => {
+    const translator = new CodexEventTranslator();
+    const item: JsonValue = {
+      id: "change-completed",
+      type: "fileChange",
+      status: "completed",
+      changes: [
+        { path: "src/old.ts", kind: { type: "update", move_path: "src/new.ts" }, diff: "-old\n+new" },
+        { path: "src/added.ts", kind: { type: "add" }, diff: "+added" }
+      ]
+    };
+
+    expect(translator.translate("item/completed", {
+      threadId: "thread-one",
+      turnId: "turn-one",
+      item
+    }, createTranslatorState())).toEqual([
+      {
+        type: "tool_start",
+        callId: "change-completed",
+        name: "file_change",
+        input: JSON.stringify({ changes: [
+          { path: "src/old.ts", kind: { type: "update", movePath: "src/new.ts" }, diff: "-old\n+new" },
+          { path: "src/added.ts", kind: { type: "add" }, diff: "+added" }
+        ] })
+      },
+      {
+        type: "tool_result",
+        callId: "change-completed",
+        name: "file_change",
+        output: "move: src/old.ts -> src/new.ts\nadd: src/added.ts",
+        isError: false
+      }
+    ]);
+  });
+
+  it("fails the whole structured file-change payload closed and treats native decline as an error", () => {
+    const item: JsonValue = {
+      id: "change-declined",
+      type: "fileChange",
+      status: "declined",
+      changes: [
+        { path: "src/valid.ts", kind: { type: "update" }, diff: "+valid" },
+        { path: "", kind: { type: "update" }, diff: "+invalid" }
+      ]
+    };
+
+    expect(new CodexEventTranslator().translate("item/completed", {
+      threadId: "thread-one",
+      turnId: "turn-one",
+      item
+    }, createTranslatorState())).toEqual([
+      expect.objectContaining({
+        type: "tool_start",
+        name: "file_change",
+        input: "Workspace file change (structured payload unavailable)."
+      }),
+      expect.objectContaining({
+        type: "tool_result",
+        output: "Workspace file change (structured payload unavailable).",
+        isError: true
+      })
+    ]);
+  });
+
   it("projects terminal interaction activity without persisting terminal input", () => {
     const translator = new CodexEventTranslator();
     const state = createTranslatorState();
