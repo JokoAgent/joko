@@ -7,6 +7,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ComposerRichTextEditor, type ComposerRichTextEditorHandle } from "./ComposerRichTextEditor.js";
 import type { ComposerInlineMentionRange } from "../model.js";
 import { composerInternalDropCaretPosition } from "./composer-internal-drop-caret.js";
+import { skipComposerListNormalization } from "./composer-list-normalization.js";
+import { promoteTrailingPlainListParagraph } from "./composer-list-nodes.js";
 
 const roots: Root[] = [];
 
@@ -26,6 +28,7 @@ async function mount(overrides: Partial<Parameters<typeof ComposerRichTextEditor
   readonly changes: JSONContent[];
   readonly files: File[][];
   readonly handle: RefObject<ComposerRichTextEditorHandle | null>;
+  readonly render: (next?: Partial<Parameters<typeof ComposerRichTextEditor>[0]>) => Promise<void>;
 }> {
   const host = ownerDocument.body.appendChild(ownerDocument.createElement("div"));
   const root = createRoot(host);
@@ -33,27 +36,31 @@ async function mount(overrides: Partial<Parameters<typeof ComposerRichTextEditor
   const changes: JSONContent[] = [];
   const files: File[][] = [];
   const handle = createRef<ComposerRichTextEditorHandle>();
-  await act(async () => {
-    root.render(<ComposerRichTextEditor
-      ref={handle}
-      document={{ type: "doc", content: [{ type: "paragraph" }] }}
-      editable
-      disabled={false}
-      placeholder="Prompt"
-      onDocumentChange={(document) => changes.push(document)}
-      onKeyDown={() => false}
-      onClipboardFiles={(value) => files.push([...value])}
-      pastedTextLabel={(lines) => `Pasted text (${lines} lines)`}
-      onPastedTextOpen={() => undefined}
-      {...overrides}
-    />);
-  });
+  const render = async (next: Partial<Parameters<typeof ComposerRichTextEditor>[0]> = {}): Promise<void> => {
+    await act(async () => {
+      root.render(<ComposerRichTextEditor
+        ref={handle}
+        document={{ type: "doc", content: [{ type: "paragraph" }] }}
+        editable
+        disabled={false}
+        placeholder="Prompt"
+        onDocumentChange={(document) => changes.push(document)}
+        onKeyDown={() => false}
+        onClipboardFiles={(value) => files.push([...value])}
+        pastedTextLabel={(lines) => `Pasted text (${lines} lines)`}
+        onPastedTextOpen={() => undefined}
+        {...overrides}
+        {...next}
+      />);
+    });
+  };
+  await render();
   const editor = await vi.waitFor(() => {
     const element = host.querySelector<HTMLElement>(".ProseMirror");
     expect(element).not.toBeNull();
     return element!;
   });
-  return { editor, changes, files, handle };
+  return { editor, changes, files, handle, render };
 }
 
 function paste(editor: HTMLElement, text: string, options: { readonly html?: string; readonly files?: readonly File[] } = {}): void {
@@ -67,6 +74,29 @@ function paste(editor: HTMLElement, text: string, options: { readonly html?: str
     }
   });
   editor.dispatchEvent(event);
+}
+
+function installLiteralListMarker(editor: Editor): void {
+  const paragraph = required(editor.state.schema.nodes["paragraph"]).create(
+    null,
+    editor.state.schema.text("- ")
+  );
+  const transaction = skipComposerListNormalization(
+    editor.state.tr.replaceWith(0, editor.state.doc.content.size, paragraph)
+  ).setMeta("addToHistory", false);
+  transaction.setSelection(TextSelection.atEnd(transaction.doc));
+  editor.view.dispatch(transaction);
+}
+
+function scheduleCompositionRepair(editor: Editor, ownerWindow: Window): void {
+  const event = new (ownerWindow as Window & typeof globalThis).CompositionEvent("compositionend", { bubbles: true });
+  const scheduled = editor.view.someProp("handleDOMEvents", (handlers) => {
+    const handler = handlers.compositionend;
+    if (handler === undefined) return undefined;
+    handler(editor.view, event);
+    return true;
+  });
+  expect(scheduled).toBe(true);
 }
 
 describe("rich composer paste integration", () => {
@@ -110,6 +140,110 @@ describe("rich composer paste integration", () => {
     act(() => paste(mounted.editor, text));
     await vi.waitFor(() => expect(mounted.changes.at(-1)?.content?.[0]?.content?.[0]?.type).toBe("composerPastedText"));
     expect((mounted.changes.at(-1)?.content?.[0]?.content?.[0] as { readonly attrs?: Record<string, unknown> }).attrs).toMatchObject({ text, display: "Pasted text (24 lines)" });
+  });
+
+  it("keeps long-paste replacement as one exact undoable action across a controlled rerender", async () => {
+    const original = "keep remove tail";
+    const mounted = await mount({
+      document: { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: original }] }] }
+    });
+    const editor = (mounted.editor as HTMLElement & { editor: Editor }).editor;
+    const payload = Array.from({ length: 24 }, (_, index) => `line ${index + 1}`).join("\n");
+    act(() => editor.view.dispatch(editor.state.tr.setSelection(TextSelection.create(editor.state.doc, 6, 12))));
+    act(() => paste(mounted.editor, payload));
+    const pasted = required(mounted.changes.at(-1));
+    expect(pasted.content?.[0]?.content?.map((node) => node.type)).toEqual(["text", "composerPastedText", "text"]);
+    expect(pasted.content?.[0]?.content?.[1]?.attrs?.["text"]).toBe(payload);
+
+    await mounted.render({ document: pasted });
+    act(() => expect(editor.commands.undo()).toBe(true));
+    expect(editor.state.doc.textContent).toBe(original);
+    expect((editor.state.doc.toJSON() as JSONContent).content?.[0]?.content?.some(
+      (node) => node.type === "composerPastedText"
+    )).toBe(false);
+    act(() => expect(editor.commands.redo()).toBe(true));
+    expect((editor.state.doc.toJSON().content?.[0]?.content?.[1] as { readonly attrs?: Record<string, unknown> } | undefined)?.attrs?.["text"]).toBe(payload);
+  });
+
+  it("does not treat long-paste atom insertion or atom edits as newly typed list text", async () => {
+    const mounted = await mount();
+    const editor = (mounted.editor as HTMLElement & { editor: Editor }).editor;
+    act(() => installLiteralListMarker(editor));
+    const payload = Array.from({ length: 24 }, (_, index) => `line ${index + 1}`).join("\n");
+    act(() => paste(mounted.editor, payload));
+    expect(editor.state.doc.firstChild?.type.name).toBe("paragraph");
+    expect(editor.state.doc.firstChild?.content.content.map(
+      (node: import("@tiptap/pm/model").Node) => node.type.name
+    )).toEqual(["text", "composerPastedText"]);
+    const edited = `${payload}\nedited`;
+    act(() => expect(mounted.handle.current?.editPastedText(3, payload, edited, "Pasted text (25 lines)")).toBe(true));
+    expect(editor.state.doc.firstChild?.type.name).toBe("paragraph");
+    act(() => expect(mounted.handle.current?.editPastedText(3, edited, "", "Pasted text (0 lines)")).toBe(true));
+    expect(editor.state.doc.firstChild?.type.name).toBe("paragraph");
+    expect(editor.state.doc.textContent).toBe("- ");
+  });
+
+  it("does not reinterpret a route-segment paste that starts with a list marker", async () => {
+    const resolveRouteReference = vi.fn(async () => "Resolved task title");
+    const mounted = await mount({ resolveRouteReference });
+    const editor = (mounted.editor as HTMLElement & { editor: Editor }).editor;
+    act(() => paste(mounted.editor, "- #/tasks/task-1"));
+    await vi.waitFor(() => {
+      expect(resolveRouteReference).toHaveBeenCalledTimes(1);
+      expect(editor.state.doc.firstChild?.type.name).toBe("paragraph");
+      expect((editor.state.doc.firstChild?.lastChild?.attrs as Record<string, unknown>)?.["display"]).toBe("Resolved task title");
+    });
+    expect(editor.state.doc.firstChild?.content.content.map(
+      (node: import("@tiptap/pm/model").Node) => node.type.name
+    )).toEqual(["text", "composerRouteReference"]);
+  });
+
+  it("lets native history undo a list conversion without immediately promoting the restored marker", async () => {
+    const frame = document.createElement("iframe");
+    document.body.append(frame);
+    const ownerDocument = required(frame.contentDocument);
+    const ownerWindow = required(frame.contentWindow);
+    const ownerMicrotask = vi.spyOn(ownerWindow, "queueMicrotask");
+    const mounted = await mount({}, ownerDocument);
+    const editor = (mounted.editor as HTMLElement & { editor: Editor }).editor;
+    act(() => installLiteralListMarker(editor));
+    act(() => expect(promoteTrailingPlainListParagraph(editor.view)).toBe(true));
+    expect(editor.state.doc.firstChild?.type.name).toBe("bulletList");
+
+    const historyKey = async (shiftKey = false): Promise<void> => {
+      await act(async () => {
+        expect(mounted.editor.dispatchEvent(new (ownerWindow as Window & typeof globalThis).KeyboardEvent("keydown", {
+          bubbles: true,
+          cancelable: true,
+          key: "z",
+          ctrlKey: true,
+          shiftKey
+        }))).toBe(false);
+        await Promise.resolve();
+      });
+    };
+    await act(async () => {
+      expect(mounted.editor.dispatchEvent(new (ownerWindow as Window & typeof globalThis).KeyboardEvent("keydown", {
+        bubbles: true,
+        cancelable: true,
+        key: "z",
+        ctrlKey: true
+      }))).toBe(false);
+      scheduleCompositionRepair(editor, ownerWindow);
+      await new Promise<void>((resolve) => ownerWindow.setTimeout(resolve, 0));
+    });
+    expect(ownerMicrotask).toHaveBeenCalled();
+    expect(editor.state.doc.firstChild?.type.name).toBe("paragraph");
+    expect(editor.state.doc.textContent).toBe("- ");
+
+    await historyKey(true);
+    expect(editor.state.doc.firstChild?.type.name).toBe("bulletList");
+    await historyKey();
+    expect(editor.state.doc.firstChild?.type.name).toBe("paragraph");
+
+    act(() => editor.view.dispatch(editor.state.tr.insertText("x")));
+    expect(editor.state.doc.firstChild?.type.name).toBe("bulletList");
+    expect(editor.state.doc.textContent).toBe("x");
   });
 
   it("inserts structured lists instead of flattening their markers", async () => {
@@ -242,18 +376,32 @@ describe("rich composer paste integration", () => {
     expect(composerInternalDropCaretPosition(editor.state)).toBeUndefined();
   });
 
-  it("defers composition repair on the editor owner window", async () => {
+  it("defers composition repair on the owner window and retires it after structural change", async () => {
     const frame = document.createElement("iframe");
     document.body.append(frame);
     const ownerDocument = required(frame.contentDocument);
     const ownerWindow = required(frame.contentWindow);
     const mounted = await mount({}, ownerDocument);
-    const ownerTimer = vi.spyOn(ownerWindow, "setTimeout").mockImplementation(() => 1);
+    const editor = (mounted.editor as HTMLElement & { editor: Editor }).editor;
+    act(() => installLiteralListMarker(editor));
+    const ownerTimer = vi.spyOn(ownerWindow, "setTimeout");
 
-    act(() => mounted.editor.dispatchEvent(new (ownerWindow as Window & typeof globalThis).CompositionEvent("compositionend", { bubbles: true })));
-
-    expect(ownerTimer).toHaveBeenCalledTimes(1);
+    act(() => scheduleCompositionRepair(editor, ownerWindow));
     expect(ownerTimer).toHaveBeenCalledWith(expect.any(Function), 0);
+    await act(async () => { await new Promise<void>((resolve) => ownerWindow.setTimeout(resolve, 0)); });
+    expect(editor.state.doc.firstChild?.type.name).toBe("bulletList");
+
+    act(() => installLiteralListMarker(editor));
+    act(() => scheduleCompositionRepair(editor, ownerWindow));
+    act(() => expect(mounted.handle.current?.insertRouteReference({
+      source: "workspace",
+      attrs: { kind: "path", display: "src/main.ts", serialized: "@src/main.ts", reference: "src/main.ts" }
+    })).toBe(true));
+    await act(async () => { await new Promise<void>((resolve) => ownerWindow.setTimeout(resolve, 0)); });
+    expect(editor.state.doc.firstChild?.type.name).toBe("paragraph");
+    expect(editor.state.doc.firstChild?.content.content.map(
+      (node: import("@tiptap/pm/model").Node) => node.type.name
+    )).toEqual(["text", "composerRouteReference"]);
   });
 });
 

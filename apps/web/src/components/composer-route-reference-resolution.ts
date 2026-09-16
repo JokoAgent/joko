@@ -5,6 +5,7 @@ import {
   serializeComposerRouteReference,
   type ComposerPasteSegment
 } from "./composer-paste-pipeline.js";
+import { skipComposerListNormalization } from "./composer-list-normalization.js";
 
 export const COMPOSER_MESSAGE_REFERENCE_LABEL_LIMIT = 240;
 export const COMPOSER_MESSAGE_REFERENCE_TEXT_LIMIT = 12_000;
@@ -145,7 +146,7 @@ export function resolveComposerRouteReferences(
       });
       if (!changed || view.isDestroyed) return;
       transaction.setMeta("addToHistory", false);
-      view.dispatch(transaction);
+      view.dispatch(skipComposerListNormalization(transaction));
     }).catch(() => {
       // Resolution is enrichment only; the original deep link remains usable.
     });
