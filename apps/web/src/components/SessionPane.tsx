@@ -73,6 +73,7 @@ import {
   permissionChangeSupported,
   planModeSupported
 } from "./backend-control-capabilities.js";
+import { sessionDerivationOriginRoute } from "./session-derivation-origin.js";
 
 // First-stage contracts do not expose a durable dismissal mutation. Keep this bounded and
 // client-local so route switches/remounts are stable without pretending to persist remotely.
@@ -441,15 +442,10 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
     [errorTailProjection, recoveryPresentationTimeline]
   );
   const derivationOrigin = session.derivationOrigin;
-  const derivationSourceSession = derivationOrigin === undefined
-    ? undefined
-    : controller.state.snapshot.sessions.find((candidate) => candidate.id === derivationOrigin.sourceSessionId);
-  const derivationSourceCanOpen = derivationOrigin !== undefined
-    && derivationOrigin.sourceSessionAvailable
-    && derivationSourceSession !== undefined
-    && !derivationSourceSession.archived
-    && derivationSourceSession.state !== "closed"
-    && (derivationOrigin.sourceMessageId === undefined || derivationOrigin.sourceMessageAvailable);
+  const derivationOriginNavigation = sessionDerivationOriginRoute(
+    derivationOrigin,
+    controller.state.snapshot.sessions
+  );
   const subagentTaskIds = useMemo(() => new Set(visibleTimeline.flatMap((item) => item.background === undefined ? [] : [item.background.id])), [visibleTimeline]);
   const subagentTaskKey = useMemo(() => visibleTimeline.flatMap((item) => item.background === undefined ? [] : [
     [
@@ -1687,12 +1683,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
         sessionActive={running}
         derivationOrigin={derivationOrigin}
         sessionCreatedAt={session.createdAt}
-        onOpenDerivationOrigin={!derivationSourceCanOpen || derivationOrigin === undefined ? undefined : () => controller.navigate({
-          kind: "session",
-          sessionId: derivationOrigin.sourceSessionId,
-          ...(derivationOrigin.sourceMessageId === undefined ? {} : { messageId: derivationOrigin.sourceMessageId }),
-          ...(derivationOrigin.sourceEventId === undefined ? {} : { messageEventId: derivationOrigin.sourceEventId })
-        })}
+        onOpenDerivationOrigin={derivationOriginNavigation === undefined ? undefined : () => controller.navigate(derivationOriginNavigation)}
         messageNavRailEnabled={controller.state.preferences.messageNavRailEnabled}
         streamFadeEnabled={controller.state.preferences.streamFadeEnabled}
         onOpenHttpLink={(url, options) => controller.openHttpLink(url, { ...options, sessionId: session.id })}

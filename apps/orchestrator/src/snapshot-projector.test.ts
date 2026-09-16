@@ -139,7 +139,7 @@ describe("SnapshotProjector", () => {
     expect(snapshot.nativeSessionTree).toBeUndefined();
   });
 
-  it("projects durable derivation identity with availability that safely degrades when the source is hidden", () => {
+  it("projects durable derivation identity across source archive, tombstone, and deletion", () => {
     const fixture = createFixture();
     fixture.store.appendEvent({
       id: "derivation-source-event",
@@ -184,6 +184,50 @@ describe("SnapshotProjector", () => {
     fixture.store.updateSession("session-1", { archived: true }, currentSource.revision, 10_300);
     expect(createProjector(fixture.store).projectOwnerSnapshot().sessions
       .find((session) => session.sessionId === "session-derived")?.derivationOrigin).toMatchObject({
+        sourceSessionAvailable: false,
+        sourceMessageAvailable: false
+      });
+
+    const archivedSource = fixture.store.getSession("session-1");
+    fixture.store.updateSession("session-1", { archived: false }, archivedSource.revision, 10_400);
+    expect(createProjector(fixture.store).projectOwnerSnapshot().sessions
+      .find((session) => session.sessionId === "session-derived")?.derivationOrigin).toMatchObject({
+        sourceSessionAvailable: true,
+        sourceMessageAvailable: true
+      });
+
+    fixture.store.runOperation(
+      {
+        id: "delete-derivation-source-message",
+        kind: "delete_session_message",
+        body: { sessionId: "session-1", eventId: "derivation-source-event" }
+      },
+      (store) => store.commitMessageDeletion({
+        sessionId: "session-1",
+        requestedEventId: "derivation-source-event",
+        deletedEventIds: ["derivation-source-event"],
+        operationId: "delete-derivation-source-message",
+        traceId: "derivation-source-delete"
+      })
+    );
+    expect(createProjector(fixture.store).projectOwnerSnapshot().sessions
+      .find((session) => session.sessionId === "session-derived")?.derivationOrigin).toMatchObject({
+        sourceSessionAvailable: true,
+        sourceMessageAvailable: false
+      });
+
+    const visibleSource = fixture.store.getSession("session-1");
+    fixture.store.updateSession("session-1", {
+      archived: true,
+      deletedAt: 10_500
+    }, visibleSource.revision, 10_500);
+    const deletedSnapshot = createProjector(fixture.store).projectOwnerSnapshot();
+    expect(deletedSnapshot.sessions.some((session) => session.sessionId === "session-1")).toBe(false);
+    expect(deletedSnapshot.sessions
+      .find((session) => session.sessionId === "session-derived")?.derivationOrigin).toMatchObject({
+        sourceSessionId: "session-1",
+        sourceMessageId: "derivation-source-event",
+        sourceEventId: "derivation-source-event",
         sourceSessionAvailable: false,
         sourceMessageAvailable: false
       });
