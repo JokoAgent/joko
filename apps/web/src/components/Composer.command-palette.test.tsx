@@ -17,13 +17,13 @@ vi.mock("./composer-inline-mention.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./composer-inline-mention.js")>();
   return {
     ...actual,
-    composerCaretTextOffset: () => document.activeElement?.getAttribute("data-mock-composer-editor") === "true"
+    composerCaretTextOffset: (root: HTMLElement | null) => root?.ownerDocument.activeElement?.getAttribute("data-mock-composer-editor") === "true"
       ? editorHarness.caret
       : undefined,
-    setComposerCaretTextOffset: (_root: HTMLElement | null, _selection: Selection | null, offset: number) => {
+    setComposerCaretTextOffset: (root: HTMLElement | null, _selection: Selection | null, offset: number) => {
       editorHarness.caret = offset;
       editorHarness.restoredCaret = offset;
-      const editor = document.querySelector<HTMLTextAreaElement>('[data-mock-composer-editor="true"]');
+      const editor = root?.ownerDocument.querySelector<HTMLTextAreaElement>('[data-mock-composer-editor="true"]') ?? null;
       editor?.setSelectionRange(Math.min(offset, editor.value.length), Math.min(offset, editor.value.length));
       return editor !== null;
     }
@@ -131,6 +131,7 @@ afterEach(async () => {
   await act(async () => { for (const root of roots.splice(0)) root.unmount(); });
   document.body.replaceChildren();
   rafCallbacks.splice(0);
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
@@ -258,7 +259,42 @@ it("never opens the typed command palette for IME composition or shell mode and 
   expect(view.editor().value).toBe("second task");
 });
 
-async function mount(initialDraft: ComposerDraft) {
+it("keeps selection ownership, command navigation, focus, and caret restoration in a mounted owner document", async () => {
+  const frame = document.createElement("iframe");
+  document.body.append(frame);
+  const ownerDocument = required(frame.contentDocument);
+  const ownerWindow = required(frame.contentWindow);
+  installAnimationFrameRuntime(ownerWindow);
+  const ownerTimer = vi.spyOn(ownerWindow, "setTimeout").mockImplementation(() => 1);
+  const view = await mount(draft("/"), ownerDocument);
+  const editor = view.editor();
+  editorHarness.caret = 0;
+  await act(async () => {
+    editor.focus();
+    editor.setSelectionRange(0, 0);
+    await Promise.resolve();
+  });
+  expect(typedPalette(ownerDocument)).toBeNull();
+  expect(ownerDocument).not.toBe(document);
+  editorHarness.caret = 1;
+
+  await act(async () => ownerDocument.dispatchEvent(new (ownerWindow as Window & typeof globalThis).Event("selectionchange")));
+  expect(ownerDocument.activeElement).toBe(editor);
+  expect(document.activeElement).not.toBe(editor);
+  expect(optionLabels(required(typedPalette(ownerDocument)))).toEqual(["/help", "/jump-session", "/cmd", "/clear", "/review", "/deploy"]);
+  expect(ownerTimer).toHaveBeenCalledWith(expect.any(Function), 420);
+
+  expect(await press(editor, "End")).toBe(true);
+  expect(selectedOption(ownerDocument)?.textContent).toContain("/deploy");
+  expect(await press(editor, "Enter")).toBe(true);
+  await flushAnimationFrames();
+  expect(editor.value).toBe("/deploy");
+  expect(editorHarness.restoredCaret).toBe(editor.value.length);
+  expect(ownerDocument.activeElement).toBe(editor);
+  expect(typedPalette(ownerDocument)).toBeNull();
+});
+
+async function mount(initialDraft: ComposerDraft, ownerDocument: Document = document) {
   const drafts = new Map<string, ComposerDraft>([
     [baseSession.id, initialDraft],
     ["task-two", draft("second task")]
@@ -287,7 +323,7 @@ async function mount(initialDraft: ComposerDraft) {
     ])
   };
   const workspace = { id: "workspace-one", targetId: baseSession.targetId, name: "Workspace", kind: "userProject" as const, serverPath: "/workspace", trusted: true, dirty: false, entries: [] };
-  const host = document.body.appendChild(document.createElement("div"));
+  const host = ownerDocument.body.appendChild(ownerDocument.createElement("div"));
   const root = createRoot(host);
   roots.push(root);
   const actions: Promise<unknown>[] = [];
@@ -327,16 +363,18 @@ function draft(text: string): ComposerDraft {
 async function input(element: HTMLTextAreaElement | HTMLInputElement, value: string, caret: number, isComposing = false): Promise<void> {
   await act(async () => {
     element.focus();
-    const prototype = element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const prototype = Object.getPrototypeOf(element) as object;
     Object.getOwnPropertyDescriptor(prototype, "value")?.set?.call(element, value);
     element.setSelectionRange(caret, caret);
     editorHarness.caret = caret;
-    element.dispatchEvent(new InputEvent("input", { bubbles: true, cancelable: true, inputType: "insertText", isComposing }));
+    const ownerWindow = required(element.ownerDocument.defaultView) as Window & typeof globalThis;
+    element.dispatchEvent(new ownerWindow.InputEvent("input", { bubbles: true, cancelable: true, inputType: "insertText", isComposing }));
   });
 }
 
 async function press(element: HTMLElement, key: string): Promise<boolean> {
-  const event = new KeyboardEvent("keydown", { bubbles: true, cancelable: true, key });
+  const ownerWindow = required(element.ownerDocument.defaultView) as Window & typeof globalThis;
+  const event = new ownerWindow.KeyboardEvent("keydown", { bubbles: true, cancelable: true, key });
   await act(async () => element.dispatchEvent(event));
   return event.defaultPrevented;
 }
@@ -347,12 +385,25 @@ async function flushAnimationFrames(): Promise<void> {
   });
 }
 
-function typedPalette(): HTMLElement | null {
-  return document.body.querySelector<HTMLElement>('[data-composer-typed-command-palette="true"]');
+function typedPalette(ownerDocument: Document = document): HTMLElement | null {
+  return ownerDocument.body.querySelector<HTMLElement>('[data-composer-typed-command-palette="true"]');
 }
 
-function selectedOption(): HTMLElement | null {
-  return typedPalette()?.querySelector<HTMLElement>('[role="option"][aria-selected="true"]') ?? null;
+function selectedOption(ownerDocument: Document = document): HTMLElement | null {
+  return typedPalette(ownerDocument)?.querySelector<HTMLElement>('[role="option"][aria-selected="true"]') ?? null;
+}
+
+function installAnimationFrameRuntime(ownerWindow: Window): void {
+  Object.defineProperties(ownerWindow, {
+    requestAnimationFrame: {
+      configurable: true,
+      value: (callback: FrameRequestCallback) => {
+        rafCallbacks.push(callback);
+        return rafCallbacks.length;
+      }
+    },
+    cancelAnimationFrame: { configurable: true, value: () => undefined }
+  });
 }
 
 function optionLabels(root: Element): readonly string[] {
@@ -373,4 +424,9 @@ function singleTextSplice(previous: string, next: string): { readonly from: numb
     to: previous.length - suffix,
     replacement: next.slice(from, next.length - suffix)
   };
+}
+
+function required<T>(value: T | null | undefined): T {
+  if (value === null || value === undefined) throw new Error("Expected test value");
+  return value;
 }

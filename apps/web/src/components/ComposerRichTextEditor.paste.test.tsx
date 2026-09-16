@@ -16,16 +16,17 @@ beforeEach(() => {
 afterEach(async () => {
   await act(async () => { for (const root of roots.splice(0)) root.unmount(); });
   document.body.replaceChildren();
+  vi.restoreAllMocks();
   Reflect.deleteProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT");
 });
 
-async function mount(overrides: Partial<Parameters<typeof ComposerRichTextEditor>[0]> = {}): Promise<{
+async function mount(overrides: Partial<Parameters<typeof ComposerRichTextEditor>[0]> = {}, ownerDocument: Document = document): Promise<{
   readonly editor: HTMLElement;
   readonly changes: JSONContent[];
   readonly files: File[][];
   readonly handle: RefObject<ComposerRichTextEditorHandle | null>;
 }> {
-  const host = document.body.appendChild(document.createElement("div"));
+  const host = ownerDocument.body.appendChild(ownerDocument.createElement("div"));
   const root = createRoot(host);
   roots.push(root);
   const changes: JSONContent[] = [];
@@ -149,4 +150,23 @@ describe("rich composer paste integration", () => {
     }));
     expect(mounted.editor.textContent).not.toContain("application/x-");
   });
+
+  it("defers composition repair on the editor owner window", async () => {
+    const frame = document.createElement("iframe");
+    document.body.append(frame);
+    const ownerDocument = required(frame.contentDocument);
+    const ownerWindow = required(frame.contentWindow);
+    const mounted = await mount({}, ownerDocument);
+    const ownerTimer = vi.spyOn(ownerWindow, "setTimeout").mockImplementation(() => 1);
+
+    act(() => mounted.editor.dispatchEvent(new (ownerWindow as Window & typeof globalThis).CompositionEvent("compositionend", { bubbles: true })));
+
+    expect(ownerTimer).toHaveBeenCalledTimes(1);
+    expect(ownerTimer).toHaveBeenCalledWith(expect.any(Function), 0);
+  });
 });
+
+function required<T>(value: T | null | undefined): T {
+  if (value === null || value === undefined) throw new Error("Expected test value");
+  return value;
+}

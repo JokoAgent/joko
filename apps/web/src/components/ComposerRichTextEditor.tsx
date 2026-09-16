@@ -113,7 +113,7 @@ export const ComposerRichTextEditor = forwardRef<ComposerRichTextEditorHandle, {
       },
       handleDOMEvents: {
         compositionend: (view) => {
-          window.setTimeout(() => {
+          view.dom.ownerDocument.defaultView?.setTimeout(() => {
             if (!view.isDestroyed && !view.composing) promoteTrailingPlainListParagraph(view);
           }, 0);
           return false;
