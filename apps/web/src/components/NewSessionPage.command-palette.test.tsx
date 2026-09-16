@@ -18,6 +18,7 @@ import {
 } from "../model.js";
 import type { DelayedNewSessionDraft } from "../new-session-flow.js";
 import { NewSessionPage } from "./NewSessionPage.js";
+import { SESSION_LINK_DRAG_MIME } from "./composer-internal-drop.js";
 
 interface MockEditorProps {
   readonly document: JSONContent;
@@ -31,6 +32,7 @@ interface MockEditorProps {
 
 let editorProps: MockEditorProps | undefined;
 let editorElement: HTMLDivElement | null = null;
+const newSessionEditorHarness = vi.hoisted(() => ({ routeDropActions: [] as Array<Record<string, unknown>> }));
 
 vi.mock("./ComposerRichTextEditor.js", () => ({
   ComposerRichTextEditor: forwardRef(function Editor(props: MockEditorProps, ref) {
@@ -40,6 +42,10 @@ vi.mock("./ComposerRichTextEditor.js", () => ({
       focus: () => elementRef.current?.focus(),
       focusFromBlankSurface: () => elementRef.current?.focus(),
       insertRouteReference: vi.fn(),
+      routeReferenceDrop: vi.fn((action: Record<string, unknown>) => {
+        newSessionEditorHarness.routeDropActions.push(action);
+        return true;
+      }),
       editPastedText: vi.fn()
     }));
     return <div
@@ -66,6 +72,7 @@ beforeEach(() => {
   window.localStorage.clear();
   editorProps = undefined;
   editorElement = null;
+  newSessionEditorHarness.routeDropActions.splice(0);
 });
 
 afterEach(async () => {
@@ -171,6 +178,40 @@ describe("NewSessionPage typed slash commands", () => {
     expect(document.querySelector('[aria-label="composer.commands"]')).toBeNull();
     expect(editorElement?.textContent).toBe("/rev");
     expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("routes a private task drag through the positional editor contract", async () => {
+    await renderPage(vi.fn(async () => undefined));
+    const composer = required(document.querySelector<HTMLElement>(".new-task-composer"));
+    newSessionEditorHarness.routeDropActions.splice(0);
+    const href = "https://joko.test/app#/tasks/task-2";
+    let readable = false;
+    const transfer = {
+      types: [SESSION_LINK_DRAG_MIME],
+      files: [] as readonly File[],
+      dropEffect: "none",
+      getData: (type: string) => readable && type === SESSION_LINK_DRAG_MIME ? href : ""
+    };
+
+    await dispatchDrag(composer, "dragenter", transfer, 18, 24);
+    await dispatchDrag(composer, "dragover", transfer, 21, 27);
+    expect(composer.querySelector(".composer__drop")).toBeNull();
+    expect(newSessionEditorHarness.routeDropActions.filter((action) => action["kind"] === "move").at(-1)).toEqual({
+      kind: "move",
+      clientX: 21,
+      clientY: 27
+    });
+
+    readable = true;
+    await dispatchDrag(composer, "drop", transfer, 25, 31);
+    expect(newSessionEditorHarness.routeDropActions.filter((action) => action["kind"] === "commit")).toEqual([
+      expect.objectContaining({
+        kind: "commit",
+        clientX: 25,
+        clientY: 31,
+        insertion: expect.objectContaining({ source: "session", attrs: expect.objectContaining({ reference: "task-2" }) })
+      })
+    ]);
   });
 });
 
@@ -336,6 +377,26 @@ async function flush(): Promise<void> {
   await Promise.resolve();
   await Promise.resolve();
   await Promise.resolve();
+}
+
+async function dispatchDrag(
+  element: HTMLElement,
+  type: string,
+  transfer: { readonly types: readonly string[]; readonly files: readonly File[]; dropEffect: string; getData(type: string): string },
+  clientX: number,
+  clientY: number
+): Promise<void> {
+  const event = new Event(type, { bubbles: true, cancelable: true });
+  Object.defineProperties(event, {
+    dataTransfer: { value: transfer },
+    clientX: { value: clientX },
+    clientY: { value: clientY },
+    relatedTarget: { value: null }
+  });
+  await act(async () => {
+    element.dispatchEvent(event);
+    await flush();
+  });
 }
 
 function required<T>(value: T | null | undefined): T {

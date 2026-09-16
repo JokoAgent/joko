@@ -6,7 +6,9 @@ import Paragraph from "@tiptap/extension-paragraph";
 import Text from "@tiptap/extension-text";
 import { EditorContent, useEditor } from "@tiptap/react";
 import { Fragment, Slice } from "@tiptap/pm/model";
-import { TextSelection, type Transaction } from "@tiptap/pm/state";
+import { Selection, TextSelection, type EditorState, type Transaction } from "@tiptap/pm/state";
+import { insertPoint } from "@tiptap/pm/transform";
+import type { EditorView } from "@tiptap/pm/view";
 import { forwardRef, useEffect, useImperativeHandle, useRef, type JSX } from "react";
 import { composerDocumentIsEmpty, normalizeComposerDocument } from "../composer-quote-document.js";
 import { composerDocumentContainsList } from "../composer-list-document.js";
@@ -49,12 +51,26 @@ import {
 import { plainTextToComposerDocument } from "../composer-quote-document.js";
 import { ComposerCjkPunctuationDecoration } from "./composer-cjk-punctuation.js";
 import { createComposerMentionTransactionMapper, type ComposerMentionRangeMapper } from "../composer-mention-transaction.js";
+import {
+  clearComposerInternalDropCaret,
+  clearComposerInternalDropCaretOn,
+  ComposerInternalDropCaret,
+  composerInternalDropCaretPosition,
+  setComposerInternalDropCaret
+} from "./composer-internal-drop-caret.js";
+
+export type ComposerRouteReferenceDropAction =
+  | { readonly kind: "start" }
+  | { readonly kind: "move"; readonly clientX: number; readonly clientY: number }
+  | { readonly kind: "commit"; readonly clientX: number; readonly clientY: number; readonly insertion: ComposerInternalDropInsertion }
+  | { readonly kind: "cancel" };
 
 export interface ComposerRichTextEditorHandle {
   readonly focus: (position?: "start" | "end") => void;
   readonly focusFromBlankSurface: () => void;
   readonly editPastedText: (nodePosition: number, expectedText: string, nextText: string, display: string) => boolean;
   readonly insertRouteReference: (insertion: ComposerInternalDropInsertion) => boolean;
+  readonly routeReferenceDrop: (action: ComposerRouteReferenceDropAction) => boolean;
 }
 
 export const ComposerRichTextEditor = forwardRef<ComposerRichTextEditorHandle, {
@@ -79,7 +95,7 @@ export const ComposerRichTextEditor = forwardRef<ComposerRichTextEditorHandle, {
     shouldRerenderOnTransaction: false,
     editable: editable && !disabled,
     content: normalizeComposerDocument(document),
-    extensions: [Document, Paragraph, Text, ComposerListItem, ComposerBulletList, ComposerOrderedList, HardBreak, History, ComposerQuoteNode, ComposerPastedTextNode, ComposerRouteReferenceNode, ComposerCjkPunctuationDecoration],
+    extensions: [Document, Paragraph, Text, ComposerListItem, ComposerBulletList, ComposerOrderedList, HardBreak, History, ComposerQuoteNode, ComposerPastedTextNode, ComposerRouteReferenceNode, ComposerCjkPunctuationDecoration, ComposerInternalDropCaret],
     editorProps: {
       attributes: {
         class: "composer-rich-editor__content",
@@ -199,14 +215,36 @@ export const ComposerRichTextEditor = forwardRef<ComposerRichTextEditorHandle, {
     },
     insertRouteReference: (insertion) => {
       if (editor === null || editor.isDestroyed || !pasteRuntimeRef.current.editable || pasteRuntimeRef.current.disabled) return false;
-      const routeType = editor.state.schema.nodes[ComposerRouteReferenceNode.name];
-      if (routeType === undefined) return false;
-      editor.view.dispatch(editor.state.tr.replaceSelectionWith(routeType.create(insertion.attrs)).scrollIntoView());
-      if (insertion.pending !== undefined) {
-        resolveComposerRouteReferences(editor.view, [insertion.pending], pasteRuntimeRef.current.resolveRouteReference);
+      return insertComposerRouteReference(editor.view, insertion, editor.state.selection.from, pasteRuntimeRef.current.resolveRouteReference, true);
+    },
+    routeReferenceDrop: (action) => {
+      if (editor === null || editor.isDestroyed) return false;
+      if (action.kind === "cancel") {
+        clearComposerInternalDropCaret(editor.view);
+        return true;
       }
-      editor.commands.focus();
-      return true;
+      if (!pasteRuntimeRef.current.editable || pasteRuntimeRef.current.disabled || !editor.isEditable) {
+        clearComposerInternalDropCaret(editor.view);
+        return false;
+      }
+      if (action.kind === "start") {
+        if (composerInternalDropCaretPosition(editor.state) !== undefined) return true;
+        const position = composerRouteReferenceInsertionPosition(editor.state, editor.state.selection.from);
+        if (position === undefined) return false;
+        setComposerInternalDropCaret(editor.view, position);
+        return true;
+      }
+      const fallbackPosition = composerInternalDropCaretPosition(editor.state);
+      if (fallbackPosition === undefined) return false;
+      const coordinatePosition = composerRouteReferencePositionAtCoordinates(editor.view, action.clientX, action.clientY);
+      if (action.kind === "move") {
+        if (coordinatePosition !== undefined && coordinatePosition !== fallbackPosition) {
+          setComposerInternalDropCaret(editor.view, coordinatePosition);
+        }
+        return true;
+      }
+      const position = coordinatePosition ?? fallbackPosition;
+      return insertComposerRouteReference(editor.view, action.insertion, position, pasteRuntimeRef.current.resolveRouteReference);
     },
     editPastedText: (nodePosition, expectedText, nextText, display) => {
       if (editor === null) return false;
@@ -220,6 +258,7 @@ export const ComposerRichTextEditor = forwardRef<ComposerRichTextEditorHandle, {
   useEffect(() => {
     if (editor === null || editor.isDestroyed) return;
     editor.setEditable(editable && !disabled);
+    if (!editable || disabled) clearComposerInternalDropCaret(editor.view);
   }, [disabled, editable, editor]);
 
   useEffect(() => {
@@ -243,6 +282,67 @@ export const ComposerRichTextEditor = forwardRef<ComposerRichTextEditorHandle, {
     />
   );
 });
+
+function composerRouteReferenceInsertionPosition(state: EditorState, requestedPosition: number): number | undefined {
+  const routeType = state.schema.nodes[ComposerRouteReferenceNode.name];
+  if (routeType === undefined || !Number.isFinite(requestedPosition)) return undefined;
+  const boundedPosition = Math.max(0, Math.min(Math.trunc(requestedPosition), state.doc.content.size));
+  return insertPoint(state.doc, boundedPosition, routeType) ?? undefined;
+}
+
+function composerRouteReferencePositionAtCoordinates(view: EditorView, clientX: number, clientY: number): number | undefined {
+  if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) return undefined;
+  try {
+    const coordinates = view.posAtCoords({ left: clientX, top: clientY });
+    return coordinates === null
+      ? undefined
+      : composerRouteReferenceInsertionPosition(view.state, coordinates.pos);
+  } catch {
+    return undefined;
+  }
+}
+
+function insertComposerRouteReference(
+  view: EditorView,
+  insertion: ComposerInternalDropInsertion,
+  requestedPosition: number,
+  resolver: ComposerRouteReferenceResolver | undefined,
+  replaceSelection = false
+): boolean {
+  if (view.isDestroyed) return false;
+  const routeType = view.state.schema.nodes[ComposerRouteReferenceNode.name];
+  const position = replaceSelection
+    ? view.state.selection.from
+    : composerRouteReferenceInsertionPosition(view.state, requestedPosition);
+  if (routeType === undefined || position === undefined) {
+    clearComposerInternalDropCaret(view);
+    return false;
+  }
+  try {
+    const node = routeType.create(insertion.attrs);
+    const transaction = view.state.tr;
+    if (replaceSelection) {
+      transaction.replaceSelectionWith(node);
+    } else {
+      transaction.insert(position, node);
+      transaction.setSelection(Selection.near(transaction.doc.resolve(position + node.nodeSize), 1));
+    }
+    clearComposerInternalDropCaretOn(transaction);
+    view.dispatch(transaction.scrollIntoView());
+  } catch {
+    clearComposerInternalDropCaret(view);
+    return false;
+  }
+  if (insertion.pending !== undefined) {
+    try {
+      resolveComposerRouteReferences(view, [insertion.pending], resolver);
+    } catch {
+      // Enrichment failure must not undo or duplicate the committed atom.
+    }
+  }
+  try { view.focus(); } catch { /* The committed document remains authoritative if its DOM retires. */ }
+  return true;
+}
 
 function setEditorEmptyAttribute(element: HTMLElement, document: JSONContent): void {
   element.dataset["empty"] = composerDocumentIsEmpty(document) ? "true" : "false";

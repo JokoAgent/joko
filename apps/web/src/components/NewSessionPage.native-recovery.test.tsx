@@ -60,6 +60,7 @@ vi.mock("./ComposerRichTextEditor.js", () => ({
       focus: vi.fn(),
       focusFromBlankSurface: vi.fn(),
       insertRouteReference: vi.fn(),
+      routeReferenceDrop: vi.fn(() => true),
       insertText: vi.fn(),
       editPastedText: vi.fn()
     }));

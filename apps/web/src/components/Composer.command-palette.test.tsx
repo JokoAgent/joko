@@ -10,8 +10,13 @@ import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
 import { emptySnapshot, type BackendView, type ComposerDraft, type ComposerInlineMentionRange, type RuntimeCommandView, type SessionView } from "../model.js";
 import { replaceComposerDocumentTextRange } from "./composer-inline-mention.js";
 import { Composer } from "./Composer.js";
+import { WORKSPACE_ENTRY_DRAG_MIME, encodeWorkspaceEntryDragPayload } from "./workspace-tree-state.js";
 
-const editorHarness = vi.hoisted(() => ({ caret: 0, restoredCaret: undefined as number | undefined }));
+const editorHarness = vi.hoisted(() => ({
+  caret: 0,
+  restoredCaret: undefined as number | undefined,
+  routeDropActions: [] as Array<Record<string, unknown>>
+}));
 
 vi.mock("./composer-inline-mention.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./composer-inline-mention.js")>();
@@ -55,7 +60,11 @@ vi.mock("./ComposerRichTextEditor.js", () => ({
       },
       focusFromBlankSurface: () => textareaRef.current?.focus(),
       editPastedText: () => false,
-      insertRouteReference: () => false
+      insertRouteReference: () => false,
+      routeReferenceDrop: (action: Record<string, unknown>) => {
+        editorHarness.routeDropActions.push(action);
+        return true;
+      }
     }), []);
     return <textarea
       ref={textareaRef}
@@ -125,6 +134,7 @@ beforeEach(() => {
   vi.stubGlobal("cancelAnimationFrame", () => undefined);
   editorHarness.caret = 0;
   editorHarness.restoredCaret = undefined;
+  editorHarness.routeDropActions.splice(0);
 });
 
 afterEach(async () => {
@@ -294,6 +304,66 @@ it("keeps selection ownership, command navigation, focus, and caret restoration 
   expect(typedPalette(ownerDocument)).toBeNull();
 });
 
+it("owns private drag position and cancellation in the mounted document without falling through to OS files", async () => {
+  const frame = document.createElement("iframe");
+  document.body.append(frame);
+  const ownerDocument = required(frame.contentDocument);
+  const ownerWindow = required(frame.contentWindow);
+  installAnimationFrameRuntime(ownerWindow);
+  const view = await mount(draft("anchor"), ownerDocument);
+  const composer = required(ownerDocument.querySelector<HTMLElement>(".composer"));
+  editorHarness.routeDropActions.splice(0);
+
+  const payload = encodeWorkspaceEntryDragPayload({
+    version: 1,
+    workspaceId: "workspace-one",
+    kind: "file",
+    path: "src/main.ts",
+    name: "main.ts"
+  });
+  let readable = false;
+  const privateTransfer = dragTransfer({
+    types: [WORKSPACE_ENTRY_DRAG_MIME],
+    getData: (type) => readable && type === WORKSPACE_ENTRY_DRAG_MIME ? payload : ""
+  });
+  await dispatchDrag(composer, "dragenter", privateTransfer, 31, 47);
+  await dispatchDrag(composer, "dragover", privateTransfer, 37, 53);
+  expect(composer.querySelector(".composer__drop")).toBeNull();
+  expect(editorHarness.routeDropActions.filter((action) => action["kind"] === "move").at(-1)).toEqual({ kind: "move", clientX: 37, clientY: 53 });
+
+  readable = true;
+  await dispatchDrag(composer, "drop", privateTransfer, 41, 59);
+  const commits = editorHarness.routeDropActions.filter((action) => action["kind"] === "commit");
+  expect(commits).toHaveLength(1);
+  expect(commits[0]).toMatchObject({
+    kind: "commit",
+    clientX: 41,
+    clientY: 59,
+    insertion: { source: "workspace", attrs: { reference: "src/main.ts" } }
+  });
+
+  const file = new File(["ordinary"], "ordinary.txt", { type: "text/plain" });
+  editorHarness.routeDropActions.splice(0);
+  const malformed = dragTransfer({
+    types: [WORKSPACE_ENTRY_DRAG_MIME, "Files"],
+    files: [file],
+    getData: (type) => type === WORKSPACE_ENTRY_DRAG_MIME ? "{bad" : ""
+  });
+  await dispatchDrag(composer, "drop", malformed, 1, 2);
+  expect(editorHarness.routeDropActions.some((action) => action["kind"] === "commit")).toBe(false);
+  expect(ownerDocument.querySelector(".attachment-list")).toBeNull();
+
+  const ordinary = dragTransfer({ types: ["Files"], files: [file] });
+  await dispatchDrag(composer, "drop", ordinary, 3, 4);
+  await vi.waitFor(() => expect(ownerDocument.querySelector(".attachment-list")?.textContent).toContain("ordinary.txt"));
+
+  editorHarness.routeDropActions.splice(0);
+  readable = false;
+  await dispatchDrag(composer, "dragenter", privateTransfer, 5, 6);
+  await act(async () => ownerDocument.dispatchEvent(new (ownerWindow as Window & typeof globalThis).Event("dragend", { bubbles: true })));
+  expect(editorHarness.routeDropActions.at(-1)).toEqual({ kind: "cancel" });
+});
+
 async function mount(initialDraft: ComposerDraft, ownerDocument: Document = document) {
   const drafts = new Map<string, ComposerDraft>([
     [baseSession.id, initialDraft],
@@ -317,6 +387,7 @@ async function mount(initialDraft: ComposerDraft, ownerDocument: Document = docu
     capabilities: new Map([
       ["input.text", { name: "input.text", supported: true, options: [] }],
       ["input.mention", { name: "input.mention", supported: true, options: ["workspace_file"] }],
+      ["input.file", { name: "input.file", supported: true, options: [], maximumItems: 5 }],
       ["runtime.user_shell", { name: "runtime.user_shell", supported: true, options: [] }],
       ["session.reset", { name: "session.reset", supported: true, options: [] }],
       ["review.isolated", { name: "review.isolated", supported: true, options: [] }]
@@ -424,6 +495,38 @@ function singleTextSplice(previous: string, next: string): { readonly from: numb
     to: previous.length - suffix,
     replacement: next.slice(from, next.length - suffix)
   };
+}
+
+interface TestDragTransfer {
+  readonly types: readonly string[];
+  readonly files: readonly File[];
+  dropEffect: string;
+  getData(type: string): string;
+}
+
+function dragTransfer(options: {
+  readonly types: readonly string[];
+  readonly files?: readonly File[];
+  readonly getData?: (type: string) => string;
+}): TestDragTransfer {
+  return {
+    types: options.types,
+    files: options.files ?? [],
+    dropEffect: "none",
+    getData: options.getData ?? (() => "")
+  };
+}
+
+async function dispatchDrag(element: HTMLElement, type: string, transfer: TestDragTransfer, clientX: number, clientY: number): Promise<void> {
+  const ownerWindow = required(element.ownerDocument.defaultView) as Window & typeof globalThis;
+  const event = new ownerWindow.Event(type, { bubbles: true, cancelable: true });
+  Object.defineProperties(event, {
+    dataTransfer: { value: transfer },
+    clientX: { value: clientX },
+    clientY: { value: clientY },
+    relatedTarget: { value: null }
+  });
+  await act(async () => element.dispatchEvent(event));
 }
 
 function required<T>(value: T | null | undefined): T {

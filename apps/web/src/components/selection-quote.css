@@ -95,6 +95,18 @@
   font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", "Source Han Sans SC", "HarmonyOS Sans SC", sans-serif;
 }
 
+.composer-internal-drop-caret {
+  display: inline-block;
+  width: 2px;
+  height: 1.35em;
+  margin-inline: -1px;
+  border-radius: 999px;
+  background: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+  vertical-align: text-bottom;
+  pointer-events: none;
+}
+
 .composer-rich-editor__content > p {
   min-height: 1.5em;
   margin: 0;

@@ -44,7 +44,7 @@ import { ComposerRichTextEditor, type ComposerRichTextEditorHandle } from "./Com
 import { ComposerPastedTextDialog, type ComposerPastedTextDialogTarget } from "./ComposerPastedTextDialog.js";
 import { countComposerPasteLines } from "./composer-paste-pipeline.js";
 import { resolveComposerRouteReferenceFromRuntime } from "./composer-route-reference-runtime.js";
-import { hasComposerInternalDrop, resolveComposerInternalDrop } from "./composer-internal-drop.js";
+import { classifyComposerInternalDrop } from "./composer-internal-drop.js";
 import { isComposerBlankPointerTarget } from "./composer-blank-focus.js";
 import { shouldAutoFocusComposer } from "./composer-auto-focus.js";
 import { isPromptRecommendationAcceptKey, PromptRecommendationEditorFrame, shouldShowPromptRecommendation } from "./PromptRecommendationOverlay.js";
@@ -890,15 +890,59 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     }
   };
 
-  const consumeInternalDrop = (dataTransfer: DataTransfer): boolean => {
-    if (!hasComposerInternalDrop(dataTransfer)) return false;
-    const insertion = resolveComposerInternalDrop(dataTransfer, workspace?.id);
-    if (insertion === undefined || effectiveBashMode || composerLocked) return true;
-    if (richEditorRef.current?.insertRouteReference(insertion) !== true) return true;
+  const updateInternalDrop = (dataTransfer: DataTransfer, clientX: number, clientY: number): boolean => {
+    const state = classifyComposerInternalDrop(dataTransfer, workspace?.id);
+    if (state.kind === "none") {
+      richEditorRef.current?.routeReferenceDrop({ kind: "cancel" });
+      return false;
+    }
+    setDragging(false);
+    if (state.kind === "invalid" || effectiveBashMode || composerLocked) {
+      richEditorRef.current?.routeReferenceDrop({ kind: "cancel" });
+      return true;
+    }
+    if (richEditorRef.current?.routeReferenceDrop({ kind: "start" }) !== true) return true;
+    richEditorRef.current.routeReferenceDrop({ kind: "move", clientX, clientY });
+    return true;
+  };
+
+  const consumeInternalDrop = (dataTransfer: DataTransfer, clientX: number, clientY: number): boolean => {
+    const state = classifyComposerInternalDrop(dataTransfer, workspace?.id);
+    if (state.kind === "none") {
+      richEditorRef.current?.routeReferenceDrop({ kind: "cancel" });
+      return false;
+    }
+    setDragging(false);
+    if (state.kind !== "ready" || effectiveBashMode || composerLocked) {
+      richEditorRef.current?.routeReferenceDrop({ kind: "cancel" });
+      return true;
+    }
+    if (richEditorRef.current?.routeReferenceDrop({ kind: "start" }) !== true
+      || richEditorRef.current.routeReferenceDrop({ kind: "commit", clientX, clientY, insertion: state.insertion }) !== true) {
+      richEditorRef.current?.routeReferenceDrop({ kind: "cancel" });
+      return true;
+    }
     closePalette();
     setBashMode(false);
     return true;
   };
+
+  useLayoutEffect(() => {
+    setDragging(false);
+    richEditorRef.current?.routeReferenceDrop({ kind: "cancel" });
+    return () => { richEditorRef.current?.routeReferenceDrop({ kind: "cancel" }); };
+  }, [composerLocked, effectiveBashMode, session.generation, session.id, workspace?.id]);
+
+  useEffect(() => {
+    const ownerDocument = voiceRoot?.ownerDocument;
+    if (ownerDocument === undefined) return;
+    const cancelDrop = (): void => {
+      setDragging(false);
+      richEditorRef.current?.routeReferenceDrop({ kind: "cancel" });
+    };
+    ownerDocument.addEventListener("dragend", cancelDrop);
+    return () => ownerDocument.removeEventListener("dragend", cancelDrop);
+  }, [voiceRoot?.ownerDocument]);
 
   useEffect(() => {
     if (
@@ -1756,13 +1800,28 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
           event.preventDefault();
           richEditorRef.current?.focusFromBlankSurface();
         }}
-        onDragEnter={(event) => { preventDrag(event); if (!composerLocked) setDragging(true); }}
-        onDragOver={preventDrag}
-        onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragging(false); }}
+        onDragEnter={(event) => {
+          preventDrag(event);
+          if (updateInternalDrop(event.dataTransfer, event.clientX, event.clientY)) event.dataTransfer.dropEffect = composerLocked || effectiveBashMode ? "none" : "copy";
+          else if (!composerLocked) setDragging(true);
+        }}
+        onDragOver={(event) => {
+          preventDrag(event);
+          if (updateInternalDrop(event.dataTransfer, event.clientX, event.clientY)) event.dataTransfer.dropEffect = composerLocked || effectiveBashMode ? "none" : "copy";
+        }}
+        onDragLeave={(event) => {
+          if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+          setDragging(false);
+          richEditorRef.current?.routeReferenceDrop({ kind: "cancel" });
+        }}
+        onDragEnd={() => {
+          setDragging(false);
+          richEditorRef.current?.routeReferenceDrop({ kind: "cancel" });
+        }}
         onDrop={(event) => {
           preventDrag(event);
           setDragging(false);
-          if (consumeInternalDrop(event.dataTransfer)) return;
+          if (consumeInternalDrop(event.dataTransfer, event.clientX, event.clientY)) return;
           if (!effectiveBashMode && !composerLocked) addFiles(event.dataTransfer.files);
         }}
       >

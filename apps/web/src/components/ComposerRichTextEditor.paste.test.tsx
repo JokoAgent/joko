@@ -6,6 +6,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ComposerRichTextEditor, type ComposerRichTextEditorHandle } from "./ComposerRichTextEditor.js";
 import type { ComposerInlineMentionRange } from "../model.js";
+import { composerInternalDropCaretPosition } from "./composer-internal-drop-caret.js";
 
 const roots: Root[] = [];
 
@@ -149,6 +150,96 @@ describe("rich composer paste integration", () => {
       attrs: { kind: "path", serialized: "@src/main.ts", reference: "src/main.ts" }
     }));
     expect(mounted.editor.textContent).not.toContain("application/x-");
+  });
+
+  it("maps a private drop caret in the editor owner document and inserts at the last verified coordinate", async () => {
+    const frame = document.createElement("iframe");
+    document.body.append(frame);
+    const ownerDocument = required(frame.contentDocument);
+    const resolveRouteReference = vi.fn(async () => "Resolved task title");
+    const mounted = await mount({
+      document: { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: "left right" }] }] },
+      resolveRouteReference
+    }, ownerDocument);
+    const editor = (mounted.editor as HTMLElement & { editor: Editor }).editor;
+    const positionAtCoordinates = vi.spyOn(editor.view, "posAtCoords").mockReturnValue({ pos: 6, inside: 0 });
+
+    act(() => {
+      editor.view.dispatch(editor.state.tr.setSelection(TextSelection.atEnd(editor.state.doc)));
+      expect(mounted.handle.current?.routeReferenceDrop({ kind: "start" })).toBe(true);
+      expect(mounted.handle.current?.routeReferenceDrop({ kind: "move", clientX: 42, clientY: 19 })).toBe(true);
+    });
+    const caret = await vi.waitFor(() => required(ownerDocument.querySelector<HTMLElement>("[data-composer-internal-drop-caret='true']")));
+    expect(caret.ownerDocument).toBe(ownerDocument);
+    expect(document.querySelector("[data-composer-internal-drop-caret='true']")).toBeNull();
+    expect(composerInternalDropCaretPosition(editor.state)).toBe(6);
+
+    act(() => editor.view.dispatch(editor.state.tr.insertText("++", 1)));
+    expect(composerInternalDropCaretPosition(editor.state)).toBe(8);
+    positionAtCoordinates.mockReturnValue(null);
+    const href = "#/tasks/task-1";
+    act(() => {
+      expect(mounted.handle.current?.routeReferenceDrop({
+        kind: "commit",
+        clientX: 44,
+        clientY: 20,
+        insertion: {
+          source: "session",
+          attrs: { kind: "session", display: "task-1", serialized: href, reference: "task-1", href },
+          pending: { target: { kind: "session", href, sessionId: "task-1" }, expectedDisplay: "task-1" }
+        }
+      })).toBe(true);
+    });
+
+    await vi.waitFor(() => {
+      expect(resolveRouteReference).toHaveBeenCalledTimes(1);
+      expect(mounted.changes.at(-1)?.content?.[0]?.content?.[1]?.attrs?.["display"]).toBe("Resolved task title");
+    });
+    const content = mounted.changes.at(-1)?.content?.[0]?.content ?? [];
+    expect(content.map((node) => node.type)).toEqual(["text", "composerRouteReference", "text"]);
+    expect(content[0]?.text).toBe("++left ");
+    expect(content[1]?.attrs).toMatchObject({
+      reference: "task-1",
+      display: "Resolved task title",
+      serialized: "[Resolved task title](#/tasks/task-1)"
+    });
+    expect(content[2]?.text).toBe("right");
+    expect(composerInternalDropCaretPosition(editor.state)).toBeUndefined();
+    expect(ownerDocument.querySelector("[data-composer-internal-drop-caret='true']")).toBeNull();
+  });
+
+  it("uses the pre-drag selection when coordinates cannot be resolved", async () => {
+    const mounted = await mount({
+      document: { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: "abcd" }] }] }
+    });
+    const editor = (mounted.editor as HTMLElement & { editor: Editor }).editor;
+    vi.spyOn(editor.view, "posAtCoords").mockReturnValue(null);
+    act(() => {
+      editor.view.dispatch(editor.state.tr.setSelection(TextSelection.create(editor.state.doc, 3)));
+      expect(mounted.handle.current?.routeReferenceDrop({ kind: "start" })).toBe(true);
+      editor.view.dispatch(editor.state.tr.setSelection(TextSelection.atEnd(editor.state.doc)));
+      expect(mounted.handle.current?.routeReferenceDrop({ kind: "move", clientX: 1, clientY: 2 })).toBe(true);
+    });
+    expect(composerInternalDropCaretPosition(editor.state)).toBe(3);
+    act(() => expect(mounted.handle.current?.routeReferenceDrop({
+      kind: "commit",
+      clientX: 1,
+      clientY: 2,
+      insertion: {
+        source: "workspace",
+        attrs: { kind: "path", display: "fallback.ts", serialized: "@fallback.ts", reference: "fallback.ts" }
+      }
+    })).toBe(true));
+    await vi.waitFor(() => expect(mounted.changes.at(-1)?.content?.[0]?.content?.map((node) => node.type)).toEqual([
+      "text",
+      "composerRouteReference",
+      "text"
+    ]));
+    const content = mounted.changes.at(-1)?.content?.[0]?.content ?? [];
+    expect(content[0]?.text).toBe("ab");
+    expect(content[1]?.attrs?.["reference"]).toBe("fallback.ts");
+    expect(content[2]?.text).toBe("cd");
+    expect(composerInternalDropCaretPosition(editor.state)).toBeUndefined();
   });
 
   it("defers composition repair on the editor owner window", async () => {

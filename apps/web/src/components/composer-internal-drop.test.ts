@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   SESSION_LINK_DRAG_MIME,
+  classifyComposerInternalDrop,
   hasComposerInternalDrop,
   resolveComposerInternalDrop
 } from "./composer-internal-drop.js";
@@ -57,11 +58,30 @@ describe("composer private drag payloads", () => {
   it("consumes malformed private payloads without classifying them as OS files", () => {
     const malformed = dataTransfer({ [WORKSPACE_ENTRY_DRAG_MIME]: "{bad" });
     expect(hasComposerInternalDrop(malformed)).toBe(true);
+    expect(classifyComposerInternalDrop(malformed, "workspace-1")).toEqual({ kind: "invalid" });
     expect(resolveComposerInternalDrop(malformed, "workspace-1")).toBeUndefined();
     expect(resolveComposerInternalDrop(dataTransfer({ [SESSION_LINK_DRAG_MIME]: "https://example.test/ordinary" }), undefined)).toBeUndefined();
   });
+
+  it("distinguishes protected dragover MIME claims from invalid and ordinary drops", () => {
+    const protectedTransfer = dataTransfer({}, [WORKSPACE_ENTRY_DRAG_MIME]);
+    expect(hasComposerInternalDrop(protectedTransfer)).toBe(true);
+    expect(classifyComposerInternalDrop(protectedTransfer, "workspace-1")).toEqual({ kind: "pending" });
+
+    const foreignWorkspace = dataTransfer({
+      [WORKSPACE_ENTRY_DRAG_MIME]: encodeWorkspaceEntryDragPayload({
+        version: 1,
+        workspaceId: "workspace-2",
+        kind: "file",
+        path: "private.txt",
+        name: "private.txt"
+      })
+    }, [WORKSPACE_ENTRY_DRAG_MIME, "Files"]);
+    expect(classifyComposerInternalDrop(foreignWorkspace, "workspace-1")).toEqual({ kind: "invalid" });
+    expect(classifyComposerInternalDrop(dataTransfer({}, ["Files"]), "workspace-1")).toEqual({ kind: "none" });
+  });
 });
 
-function dataTransfer(values: Readonly<Record<string, string>>): { getData(type: string): string } {
-  return { getData: (type) => values[type] ?? "" };
+function dataTransfer(values: Readonly<Record<string, string>>, types: readonly string[] = Object.keys(values)): { readonly types: readonly string[]; getData(type: string): string } {
+  return { types, getData: (type) => values[type] ?? "" };
 }
