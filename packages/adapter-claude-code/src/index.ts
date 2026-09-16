@@ -35,6 +35,7 @@ export {
   type ClaudeSdkManagedAgentInput,
   type ClaudeSdkManagedAgentResult,
   type ClaudeSdkManagedAgentTool,
+  type ClaudeSdkMcpTool,
   type ClaudeSdkPermissionMode,
   type ClaudePermissionResult,
   type ClaudeCanUseToolOptions,
@@ -54,3 +55,9 @@ export {
   type ClaudeCodeRuntimeAuthorization
 } from "./oauth-account.js";
 export { loadClaudeRemoteManagerSource } from "./remote-manager-source.js";
+export {
+  type ClaudeMcpBridgePort,
+  type ClaudeMcpRuntimeLease,
+  type ClaudeMcpTool,
+  type ClaudeMcpCallResult
+} from "./mcp-bridge.js";

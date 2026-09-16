@@ -60,6 +60,7 @@ import { TerminalProvider } from "@joko/tool-terminal";
 import { RemoteTerminalRuntimeResolver } from "./remote-terminal-runtime.js";
 import { RemoteCodexRuntimeResolver } from "./remote-codex-read-runtime.js";
 import { CodexMcpBridgeManager } from "./remote-codex-mcp-bridge.js";
+import { createClaudeMcpBridge } from "./claude-mcp-bridge.js";
 import { RemoteClaudeRuntimeResolver } from "./remote-claude-runtime.js";
 import {
   ComputerRuntime,
@@ -1036,6 +1037,21 @@ export async function createOrchestratorApplication(
       create: ({ instanceId, generation }) => createClaudeCodeAdapter({
         id: instanceId,
         instanceGeneration: generation,
+        mcpBridge: createClaudeMcpBridge({
+          router: mcpRouter,
+          assertSessionCurrent: (sessionId, targetId, sessionGeneration) => {
+            const session = store.getSession(sessionId).descriptor;
+            const target = store.getTarget(targetId).descriptor;
+            const backend = backendInstances.get(instanceId);
+            if (session.deletedAt !== undefined || session.archived || session.targetId !== targetId
+              || session.backendId !== instanceId || session.binding.generation !== sessionGeneration
+              || target.backendId !== instanceId || backend.state !== "available" || backend.generation !== generation) {
+              throw new Error("The Claude MCP product Session authority is stale.");
+            }
+          },
+          includeToolPolicy: (sessionId, targetId, policyId) =>
+            toolPolicies.enabledForSession(sessionId, targetId, policyId)
+        }),
         remoteRuntimes: new RemoteClaudeRuntimeResolver({
           store,
           registry: remoteHosts

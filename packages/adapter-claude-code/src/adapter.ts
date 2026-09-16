@@ -55,6 +55,7 @@ import {
 } from "@joko/core";
 import { AsyncInputGate, deferred, type Deferred } from "./async-input-gate.js";
 import { claudeCodeError } from "./errors.js";
+import type { ClaudeMcpBridgePort, ClaudeMcpCallResult, ClaudeMcpRuntimeLease, ClaudeMcpTool } from "./mcp-bridge.js";
 import { SessionSdkFailure } from "./session-sdk-owner.js";
 import { prepareClaudePrompt, type ClaudeInputResolvers, type PreparedClaudePrompt } from "./prompt-input.js";
 import {
@@ -76,6 +77,7 @@ import {
   CLAUDE_AGENT_SDK_VERSION,
   CLAUDE_MANAGED_AGENT_TOOL_NAME,
   DefaultClaudeSdkRuntime,
+  claudeMcpServerName,
   type ClaudeCanUseToolOptions,
   type ClaudePermissionResult,
   type ClaudePermissionUpdate,
@@ -357,6 +359,8 @@ export interface ClaudeCodeAdapterOptions extends ClaudeInputResolvers {
   readonly resolveNativeMemoryEnabled?: () => boolean;
   /** Resolves approved text resources for one exact product Session runtime. */
   readonly resolveTextResources?: ClaudeTextResourceResolver;
+  /** Service-owned Router authority for a committed local standard Session. */
+  readonly mcpBridge?: ClaudeMcpBridgePort;
 }
 
 interface ActiveTurn {
@@ -366,6 +370,8 @@ interface ActiveTurn {
   readonly backendInstanceGeneration: number;
   readonly queryGeneration: number;
   readonly operationId: string;
+  mcpCallCancellation: AbortController;
+  readonly mcpRootToolWaiters: Map<string, Deferred<void>>;
   readonly subtaskRouteLeases: Map<string, ManagedSubtaskRouteGrant>;
   readonly subtaskRouteAdmissions: Map<string, ManagedSubtaskRouteAdmission>;
   readonly subtaskRouteDecisions: Map<string, ManagedSubtaskRouteDecision>;
@@ -494,6 +500,7 @@ interface PendingPermission {
 }
 
 interface NativeRuntime {
+  readonly mcpLease?: ClaudeMcpRuntimeLease;
   readonly managedRoute?: ManagedProviderRouteBinding;
   readonly managedEffortSnapshot?: ManagedQueryEffortSnapshot;
   readonly productSessionId: string;
@@ -586,6 +593,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
   readonly #hostCapabilities: ReadonlySet<HostComposedCapability>;
   readonly #inputResolvers: ClaudeInputResolvers;
   readonly #resolveTextResources: ClaudeTextResourceResolver | undefined;
+  readonly #mcpBridge: ClaudeMcpBridgePort | undefined;
   readonly #resolveSubagentModel: ClaudeCodeAdapterOptions["resolveSubagentModel"];
   readonly #resolveNativeMemoryEnabled: ClaudeCodeAdapterOptions["resolveNativeMemoryEnabled"];
   readonly #nativeMemoryConfigDirectory: string;
@@ -670,6 +678,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     this.#resolveSubagentModel = options.resolveSubagentModel;
     this.#resolveNativeMemoryEnabled = options.resolveNativeMemoryEnabled;
     this.#resolveTextResources = options.resolveTextResources;
+    this.#mcpBridge = options.mcpBridge;
     this.#inputResolvers = {
       ...(options.readBlob === undefined ? {} : { readBlob: options.readBlob }),
       ...(options.resolveFile === undefined ? {} : { resolveFile: options.resolveFile }),
@@ -1370,6 +1379,10 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         runtime = this.#requireIdleRuntime(context);
       }
     }
+    if (!runtime.remote && runtime.runtimePolicy === "standard" && runtime.mcpLease === undefined
+      && this.#mcpBridge !== undefined) {
+      runtime = await this.#bindProductMcp(runtime, context);
+    }
     const preparation = new AbortController();
     const preparationSignal = AbortSignal.any([context.signal, preparation.signal]);
     runtime.inputPreparation = preparation;
@@ -1426,6 +1439,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       backendInstanceGeneration: this.#instanceGeneration,
       queryGeneration: runtime.queryGeneration,
       operationId,
+      mcpCallCancellation: new AbortController(),
+      mcpRootToolWaiters: new Map(),
       subtaskRouteLeases: new Map(),
       subtaskRouteAdmissions: new Map(),
       subtaskRouteDecisions: new Map(),
@@ -1603,6 +1618,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     const turn = runtime.activeTurn;
     if (turn === undefined) return;
     turn.stopping = true;
+    turn.mcpCallCancellation.abort();
     turn.interruptConfirmation ??= deferred<void>();
     void turn.interruptConfirmation.promise.catch(() => undefined);
     let wakeTaskIds: readonly string[] = [];
@@ -2025,6 +2041,141 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     }
   }
 
+  async #bindProductMcp(runtime: NativeRuntime, context: AdapterContext): Promise<NativeRuntime> {
+    const bridge = this.#mcpBridge;
+    if (bridge === undefined) return runtime;
+    let lease: ClaudeMcpRuntimeLease | undefined;
+    try {
+      lease = bridge.open({
+        sessionId: context.sessionId,
+        targetId: context.target.id,
+        generation: context.generation,
+        signal: context.signal
+      });
+      lease.assertCurrent();
+    } catch {
+      lease?.release();
+      throw claudeCodeError("MCP_QUERY_BIND_UNAVAILABLE", "Approved tools could not be prepared for this Session.", "dispatch", {
+        retryable: true,
+        recovery: "Restore the Tool authority and retry the queued input."
+      });
+    }
+    if (lease.tools.length === 0) {
+      lease.release();
+      return runtime;
+    }
+    let retired = false;
+    try {
+      const info = await waitFor(this.#sessionInfo(runtime.nativeSessionId, runtime.target, context.signal),
+        this.#initializationTimeoutMs, context.signal, () => mcpBindUnknown());
+      this.#assertCurrent(runtime, context, runtime.binding);
+      let confirmFresh = false;
+      if (info === undefined) {
+        if (!runtime.freshSessionCanRestart || await this.#sessionHasHistory(runtime, context.signal)) throw continuityGap();
+        this.#assertCurrent(runtime, context, runtime.binding);
+        confirmFresh = true;
+      } else assertSessionInfo(info, runtime.nativeSessionId, runtime.runtimeWorkspaceRoot, false);
+      retired = true;
+      await this.#retireRuntime(runtime);
+      await waitFor(runtime.sdkRuntime.retireQuery(runtime.query, this.#teardownTimeoutMs), this.#teardownTimeoutMs,
+        context.signal, () => mcpBindUnknown());
+      let fresh = false;
+      if (confirmFresh) {
+        const current = await waitFor(this.#sessionInfo(runtime.nativeSessionId, runtime.target, context.signal,
+          targetRuntimeOf(runtime)), this.#initializationTimeoutMs, context.signal, () => mcpBindUnknown());
+        if (current === undefined) {
+          if (await this.#sessionHasHistory(runtime, context.signal)) throw continuityGap();
+          fresh = true;
+        } else assertSessionInfo(current, runtime.nativeSessionId, runtime.runtimeWorkspaceRoot, false);
+      }
+      context.signal.throwIfAborted();
+      lease.assertCurrent();
+      const replacement = await this.#startRuntime(runtime.binding, context, {
+        resume: !fresh,
+        ...(runtime.managedRoute === undefined ? {} : {
+          providerId: runtime.managedRoute.providerId,
+          modelId: runtime.managedRoute.model.modelId
+        }),
+        ...(runtime.modelId === undefined ? {} : { modelId: runtime.modelId }),
+        ...(runtime.effort === undefined ? {} : { effort: runtime.effort }),
+        permissionMode: runtime.permissionMode,
+        fastMode: runtime.fastMode,
+        additionalDirectories: runtime.additionalDirectories,
+        ...(runtime.appendSystemPrompt === undefined ? {} : { appendSystemPrompt: runtime.appendSystemPrompt }),
+        runtimePolicy: "standard",
+        mcpLease: lease
+      });
+      if (runtime.planMode) await this.setPlanMode(true, context);
+      return replacement;
+    } catch {
+      lease.release();
+      const replacement = this.#sessions.get(context.sessionId);
+      if (retired && replacement !== undefined && replacement !== runtime) await this.#retireRuntime(replacement);
+      throw retired ? mcpBindUnknown() : claudeCodeError(
+        "MCP_QUERY_BIND_UNAVAILABLE", "Approved tools could not be attached before native input.", "dispatch", {
+          retryable: true,
+          recovery: "Restore the Tool authority and retry the queued input."
+        }
+      );
+    }
+  }
+
+  async #callProductMcp(
+    runtime: NativeRuntime,
+    tool: ClaudeMcpTool,
+    arguments_: Readonly<Record<string, unknown>>,
+    options: { readonly toolUseId: string; readonly signal: AbortSignal }
+  ): Promise<ClaudeMcpCallResult> {
+    const turn = runtime.activeTurn;
+    const lease = runtime.mcpLease;
+    const name = `mcp__${claudeMcpServerName(tool.serverId)}__${tool.name}`;
+    if (turn !== undefined && lease !== undefined && this.#isTurnCurrent(runtime, turn)
+      && !turn.seenToolStarts.has(options.toolUseId)) {
+      let waiter = turn.mcpRootToolWaiters.get(options.toolUseId);
+      if (waiter === undefined) {
+        if (turn.mcpRootToolWaiters.size >= MAX_PENDING_INTERACTIONS) {
+          throw new Error("Too many native root tool owners are pending.");
+        }
+        waiter = deferred<void>();
+        turn.mcpRootToolWaiters.set(options.toolUseId, waiter);
+      }
+      const signal = AbortSignal.any([options.signal, runtime.abortController.signal, turn.mcpCallCancellation.signal]);
+      try {
+        await waitFor(waiter.promise, this.#admissionTimeoutMs, signal,
+          () => new Error("The native root tool owner was not observed."));
+      } finally {
+        if (turn.mcpRootToolWaiters.get(options.toolUseId) === waiter) turn.mcpRootToolWaiters.delete(options.toolUseId);
+      }
+    }
+    const assertCurrent = (): void => {
+      if (turn === undefined || lease === undefined || !this.#isTurnCurrent(runtime, turn)
+        || turn.terminalClaimed || turn.stopping || !turn.nativeIdentityConfirmed
+        || !turn.seenToolStarts.has(options.toolUseId)
+        || runtime.toolNames.get(options.toolUseId) !== name) {
+        throw new Error("The product MCP call lacks an active root tool owner.");
+      }
+      lease.assertCurrent();
+    };
+    assertCurrent();
+    const signal = AbortSignal.any([options.signal, runtime.abortController.signal, turn!.mcpCallCancellation.signal]);
+    signal.throwIfAborted();
+    const requestId = createHash("sha256")
+      .update(runtime.nativeSessionId).update("\0")
+      .update(String(runtime.queryGeneration)).update("\0")
+      .update(turn!.operationId).update("\0")
+      .update(options.toolUseId).digest("hex");
+    const result = await lease!.call({
+      serverId: tool.serverId,
+      toolName: tool.name,
+      requestId,
+      arguments: arguments_,
+      signal
+    });
+    signal.throwIfAborted();
+    assertCurrent();
+    return result;
+  }
+
   override async setEffort(level: string, context: AdapterContext): Promise<void> {
     const effort = normalizeProductEffort(level);
     if (effort === undefined) {
@@ -2203,6 +2354,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       readonly appendSystemPrompt?: string;
       readonly additionalDirectories: readonly ApprovedDirectory[];
       readonly runtimePolicy: "standard" | "review_read_only";
+      readonly mcpLease?: ClaudeMcpRuntimeLease;
     }
   ): Promise<NativeRuntime> {
     if (launch.runtimePolicy !== (context.runtimePolicy === "review_read_only" ? "review_read_only" : "standard")) {
@@ -2218,6 +2370,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     this.#assertBindingContext(binding, context);
     const scoped = await this.#targetRuntime(context.target, context.signal);
     scoped.assertCurrent();
+    if (launch.mcpLease !== undefined && (scoped.remote || launch.runtimePolicy !== "standard")) {
+      throw claudeCodeError("MCP_QUERY_BIND_UNAVAILABLE", "The MCP Query route does not belong to a local standard Session.", "session_start");
+    }
     const nativeSessionId = parseBinding(binding);
     if (launch.resume) {
       const info = await this.#sessionInfo(nativeSessionId, context.target, context.signal, scoped);
@@ -2300,10 +2455,14 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     }, async (input, options) => {
       if (runtime === undefined) return managedAgentError("The native Session is not ready.");
       return this.#runManagedAgent(runtime, undefined, input, options.toolUseId, options.signal);
-    }).catch((error: unknown) => { abortController.abort(); managedRoute?.dispose(); throw error; });
+    }, async (tool, arguments_, options) => {
+      if (runtime === undefined) throw new Error("The product MCP Query is not ready.");
+      return this.#callProductMcp(runtime, tool, arguments_, options);
+    }).catch((error: unknown) => { abortController.abort(); managedRoute?.dispose(); launch.mcpLease?.release(); throw error; });
     const query = startedQuery.query;
     try {
       runtime = {
+        ...(launch.mcpLease === undefined ? {} : { mcpLease: launch.mcpLease }),
         productSessionId: context.sessionId,
         ...(managedRoute === undefined ? {} : { managedRoute }),
         ...(startedQuery.managedEffortSnapshot === undefined
@@ -2431,6 +2590,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       readonly appendSystemPrompt?: string;
       readonly additionalDirectories: readonly ApprovedDirectory[];
       readonly runtimePolicy: "standard" | "review_read_only";
+      readonly mcpLease?: ClaudeMcpRuntimeLease;
     },
     managedRoute: ManagedProviderRouteBinding | undefined,
     canUseTool: (
@@ -2441,7 +2601,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     managedAgentTool: (
       input: ClaudeSdkManagedAgentInput,
       options: { readonly toolUseId: string; readonly signal: AbortSignal }
-    ) => Promise<ClaudeSdkManagedAgentResult>
+    ) => Promise<ClaudeSdkManagedAgentResult>,
+    productMcpCall: (
+      tool: ClaudeMcpTool,
+      arguments_: Readonly<Record<string, unknown>>,
+      options: { readonly toolUseId: string; readonly signal: AbortSignal }
+    ) => Promise<ClaudeMcpCallResult>
   ): Promise<{
     readonly query: ClaudeSdkQuery;
     readonly subagentModel: string | undefined;
@@ -2572,6 +2737,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
               }
             : {
                 settings: {
+                  disableClaudeAiConnectors: true,
                   // Filesystem settings remain available below, but a native
                   // helper must never replace the Host-owned credential path.
                   // The fixed CLI additionally filters provider-related `env`
@@ -2606,14 +2772,18 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
             : {}),
           ...(launch.runtimePolicy === "standard" ? { extraArgs: { "replay-user-messages": null } } : {}),
           includePartialMessages: true,
+          mcpTools: launch.mcpLease?.tools.map((tool) => ({
+            ...tool,
+            call: (arguments_, options) => productMcpCall(tool, arguments_, options)
+          })),
           ...(launch.runtimePolicy === "review_read_only"
             ? {
                 disallowedTools: [...REVIEW_DISALLOWED_TOOLS],
                 mcpServers: {},
-                skills: [],
-                strictMcpConfig: true as const
+                skills: []
               }
-            : {}),
+            : { mcpServers: {} }),
+          strictMcpConfig: true as const,
           ...(launch.modelId === undefined ? {} : { model: launch.modelId }),
           ...(this.#pathToExecutable === undefined ? {} : { pathToClaudeCodeExecutable: this.#pathToExecutable }),
           permissionMode: toSdkPermissionMode(launch.permissionMode),
@@ -2870,6 +3040,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       }
       if (turn.seenToolStarts.has(tool.callId)) continue;
       addBoundedIdentity(turn.seenToolStarts, tool.callId);
+      turn.mcpRootToolWaiters.get(tool.callId)?.resolve(undefined);
       await this.#emit(runtime, turn, {
         type: "tool_start",
         callId: tool.callId,
@@ -2941,6 +3112,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     }
     // Claim the foreground result before any awaited publication or preparation can enqueue a steer.
     turn.stopping = true;
+    turn.mcpCallCancellation.abort();
     for (const steer of turn.steers.values()) {
       if (!steer.consumed) steer.cancellation.abort(steerNotActive());
     }
@@ -3012,6 +3184,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       return;
     }
     turn.terminalClaimed = true;
+    turn.mcpCallCancellation.abort();
     await this.#settleSteers(runtime, turn, result.outcome, result.error);
     const restoration = this.#releaseManagedTurnLeases(runtime, turn, true);
     if (restoration !== undefined) await restoration;
@@ -3028,6 +3201,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
     // The foreground result is only an intermediate provider boundary while
     // an SDK wake task owns an automatic continuation. Keep both parent and
     // delegated route leases current across that gap.
+    turn.mcpCallCancellation = new AbortController();
     turn.stopping = false;
     turn.continuationTaskIds.clear();
     for (const rawTaskId of rawTaskIds) addBoundedIdentity(turn.continuationTaskIds, rawTaskId);
@@ -3106,6 +3280,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
   ): Promise<void> {
     if (!this.#isTurnCurrent(runtime, turn) || !turn.awaitingNativeContinuation || turn.terminalClaimed) return;
     turn.terminalClaimed = true;
+    turn.mcpCallCancellation.abort();
     this.#clearNativeContinuation(turn);
     const restoration = this.#releaseManagedTurnLeases(runtime, turn, true);
     if (restoration !== undefined) await restoration;
@@ -3645,6 +3820,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
           ...(child.grant.nativeEffort === undefined ? {} : { effort: child.grant.nativeEffort }),
           forwardSubagentText: true,
           includePartialMessages: true,
+          mcpServers: {},
+          strictMcpConfig: true,
           managedAgentTool: (input, options) => this.#runManagedAgent(
             runtime,
             child.rawTaskId,
@@ -3659,6 +3836,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
           sessionId: child.childSessionId,
           settings: {
             apiKeyHelper: "",
+            disableClaudeAiConnectors: true,
             modelOverrides: {},
             ...(runtime.managedEffortSnapshot?.modelSettings === undefined
               ? {}
@@ -4426,6 +4604,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       if (retiringTurn !== undefined) {
         retiringTurn.stopping = true;
         retiringTurn.terminalClaimed = true;
+        retiringTurn.mcpCallCancellation.abort();
         const restoration = this.#releaseManagedTurnLeases(runtime, retiringTurn, false);
         if (restoration !== undefined) await restoration;
         retiringTurn.interruptConfirmation?.reject(turnAbortUnknown("The runtime retired before interrupt confirmation.")());
@@ -4452,6 +4631,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
         }
       }
       runtime.managedRoute?.dispose();
+      runtime.mcpLease?.release();
       runtime.closed = true;
       const reason = new Error("The native runtime was retired.");
       runtime.activeTurn?.admission.reject(reason);
@@ -6464,6 +6644,14 @@ function managedRouteUnavailable(stateMayHaveChanged = false): JokoError {
   return claudeCodeError("MANAGED_PROVIDER_ROUTE_UNAVAILABLE", "The configured model route is unavailable or no longer owns this operation.", "model", {
     stateMayHaveChanged,
     recovery: "Refresh the exact Provider and model configuration before retrying. Native requests for other models require their own configured route."
+  });
+}
+
+function mcpBindUnknown(): JokoError {
+  return claudeCodeError("MCP_QUERY_BIND_UNKNOWN", "The native Query could not confirm exact Tool binding after retirement.", "dispatch", {
+    retryable: false,
+    stateMayHaveChanged: true,
+    recovery: "Inspect the exact native Session before retrying this queued input."
   });
 }
 
