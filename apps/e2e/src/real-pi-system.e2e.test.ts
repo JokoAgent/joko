@@ -8,7 +8,11 @@ import {
   OperationState,
   OwnerSnapshotScopeSchema,
   PiMessageRole,
+  ResourceUsageAction,
+  ResourceUsageActivity,
+  ResourceUsageSource,
   RunState,
+  RuntimeCommandSource,
   SessionSnapshotScopeSchema,
   SessionState,
   SnapshotScopeSchema
@@ -30,6 +34,7 @@ import {
   REAL_PI_RESPONSE_TEXT,
   RealPiSystemFixture
 } from "./real-pi-fixture.js";
+import { installLocalSkill } from "./skill-system-fixture.js";
 
 describe("latest npm Pi through production Orchestrator and binary Connect", () => {
   let fixture: RealPiSystemFixture | undefined;
@@ -236,6 +241,112 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
         totalTokens: 10n
       }
     });
+  });
+
+  it("executes an installed Skill through the live Pi command catalog and records exact durable usage", { timeout: 90_000 }, async () => {
+    fixture = await RealPiSystemFixture.start();
+    const paired = await fixture.pair("Real Pi native Skill command E2E");
+    const skillName = `runtime-proof-${randomUUID().slice(0, 8)}`;
+    const instructionMarker = `NATIVE_SKILL_INSTRUCTION_${randomUUID()}`;
+    const privateArgument = `private-argument-${randomUUID()}`;
+    const installed = await installLocalSkill(
+      fixture,
+      paired,
+      skillName,
+      `# Native runtime proof\n\nInclude the marker ${instructionMarker} while following this Skill.`
+    );
+    await fixture.application.refreshPiGeneration?.();
+
+    const created = await submit(
+      paired.clients.operation,
+      paired.connectionId,
+      createSessionMutation({
+        backendId: "pi",
+        targetId: "workspace-real-pi",
+        displayName: "Real Pi native Skill command",
+        providerId: REAL_PI_PROVIDER_ID,
+        modelId: REAL_PI_MODEL_ID,
+        effortId: "off"
+      })
+    );
+    expect(created.state).toBe(OperationState.SUCCEEDED);
+    const sessionId = sessionIdFrom(created);
+    const runtimeGeneration = BigInt(
+      fixture.application.store.getSession(sessionId).descriptor.binding.generation
+    );
+    const commands = await paired.clients.session.listRuntimeCommands({ sessionId });
+    const command = commands.commands.find((candidate) => candidate.resourceId === installed.skill.skillId);
+    expect(command).toMatchObject({
+      source: RuntimeCommandSource.SKILL,
+      resourceId: installed.skill.skillId,
+      loaded: true,
+      sessionId
+    });
+    if (command === undefined) throw new Error("The live Pi catalog did not expose the installed Skill command.");
+    expect(command.name).not.toBe("");
+
+    const queued = await submit(
+      paired.clients.operation,
+      paired.connectionId,
+      sendInputMutation(sessionId, runtimeGeneration, `/${command.name} ${privateArgument}`)
+    );
+    expect(queued.state).toBe(OperationState.SUCCEEDED);
+    const runId = queueRunIdFrom(queued);
+    await waitForRealSystem(
+      () => paired.clients.run.getRun({ runId }),
+      (response) => response.run?.state === RunState.SUCCEEDED,
+      "real Pi native Skill command Run",
+      30_000
+    );
+
+    expect(fixture.providerRequests).toHaveLength(1);
+    const providerBody = JSON.stringify(fixture.providerRequests[0]?.body);
+    expect(providerBody).toContain(instructionMarker);
+    expect(providerBody).toContain(privateArgument);
+
+    const sessionScope = create(SnapshotScopeSchema, {
+      kind: {
+        case: "session",
+        value: create(SessionSnapshotScopeSchema, { sessionId, recentTimelineItems: 500 })
+      }
+    });
+    const projected = await waitForRealSystem(
+      () => paired.clients.event.getSnapshot({ scope: sessionScope }),
+      (response) => response.snapshot?.timeline.some((event) =>
+        event.payload?.kind.case === "resourceUsageRecorded"
+          && event.payload.kind.value.resourceId === installed.skill.skillId
+          && event.payload.kind.value.source === ResourceUsageSource.NATIVE_SKILL_COMMAND
+          && event.payload.kind.value.action === ResourceUsageAction.COMMAND_SUCCEEDED
+      ) === true,
+      "durable native Skill usage event",
+      30_000
+    );
+    const resourceUsage = projected.snapshot?.timeline.flatMap((event) =>
+      event.payload?.kind.case === "resourceUsageRecorded"
+        ? [event.payload.kind.value]
+        : []
+    ).filter((event) => event.resourceId === installed.skill.skillId) ?? [];
+    const usage = resourceUsage.filter((event) =>
+      event.source === ResourceUsageSource.NATIVE_SKILL_COMMAND
+    );
+    expect(usage).toHaveLength(1);
+    expect(usage[0]).toMatchObject({
+      resourceId: installed.skill.skillId,
+      resourceRevision: installed.skill.entityVersion?.revision,
+      contentRevision: installed.skill.approvedRevision,
+      runtimeGeneration,
+      source: ResourceUsageSource.NATIVE_SKILL_COMMAND,
+      activity: ResourceUsageActivity.STRONG_ACTIVE,
+      action: ResourceUsageAction.COMMAND_SUCCEEDED
+    });
+    expect(usage[0]?.occurrenceId).not.toBe("");
+    const serializedUsage = JSON.stringify(resourceUsage, (_key, value: unknown) =>
+      typeof value === "bigint" ? value.toString() : value
+    );
+    expect(serializedUsage).not.toContain(privateArgument);
+    expect(serializedUsage).not.toContain("SKILL.md");
+    expect(serializedUsage).not.toContain(installed.sourceDirectory);
+    expect(serializedUsage).not.toContain(fixture.rootDirectory);
   });
 
   it("restarts the installed Pi runtime and resumes the same native Session context", { timeout: 90_000 }, async () => {

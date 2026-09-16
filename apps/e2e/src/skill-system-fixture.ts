@@ -29,9 +29,10 @@ export interface InstalledSkillFixture {
 }
 
 export async function installLocalSkill(
-  fixture: SkillSystemFixture,
+  fixture: Pick<SkillSystemFixture, "rootDirectory">,
   paired: PairedClient,
-  name = "managed-review"
+  name = "managed-review",
+  instructions = "# Original Skill"
 ): Promise<InstalledSkillFixture> {
   const sourceDirectory = join(fixture.rootDirectory, `skill-source-${randomUUID()}`);
   await mkdir(join(sourceDirectory, "references"), { recursive: true });
@@ -42,7 +43,7 @@ export async function installLocalSkill(
       "description: Production Skill management fixture",
       "version: 1.0.0",
       "---",
-      "# Original Skill",
+      instructions.trimEnd(),
       ""
     ].join("\n"), "utf8"),
     writeFile(join(sourceDirectory, "references", "guide.md"), "Production guide\n", "utf8")
