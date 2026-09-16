@@ -424,12 +424,14 @@ import { projectTimelineGeneratedFiles } from "./generated-files.js";
 import { emptySnapshot } from "./model.js";
 import { saveArtifactBlob } from "./artifact-download.js";
 import {
+  captureNativeArtifactSourceReveal,
   captureNativeFileCopy,
   captureNativeFileOpen,
   copyNativeArtifactFile,
   NATIVE_FILE_COPY_MAXIMUM_BYTES,
   NATIVE_FILE_OPEN_MAXIMUM_BYTES,
-  openNativeArtifactFile
+  openNativeArtifactFile,
+  revealNativeArtifactSource
 } from "./native-file-actions.js";
 import type {
   AppSnapshot,
@@ -6676,6 +6678,21 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return openNativeArtifactFile(blob, fileName, ownedContext, host);
   }
 
+  async revealArtifactSource(sessionId: string, artifactId: string, context: ArtifactDownloadContext): Promise<import("./native-file-actions.js").NativeArtifactSourceRevealOutcome> {
+    const ownedContext = this.artifactDownloadContext(context);
+    const host = captureNativeArtifactSourceReveal();
+    const profile = this.#profile;
+    if (host === undefined || profile === undefined) return { status: "unavailable" };
+    return revealNativeArtifactSource(
+      profile.id,
+      profile.serverId,
+      sessionId,
+      artifactId,
+      ownedContext,
+      host
+    );
+  }
+
   private async consumeEvents(signal: AbortSignal): Promise<void> {
     let delay = 350;
     while (!signal.aborted) {
@@ -7925,7 +7942,7 @@ function projectTimelineEvent(
         title: image?.altText || "Image",
         text: blob?.fileName ?? "",
         ...(blob?.blobId
-          ? { artifact: { id: blob.blobId, blobId: blob.blobId, title: image?.altText || blob.fileName || "Image", kind: "image", fileName: blob.fileName || "image", mediaType: blob.mediaType || "application/octet-stream", byteSize: numberValue(blob.byteSize) } satisfies ArtifactView }
+          ? { artifact: { id: blob.blobId, blobId: blob.blobId, sourceRevealAvailable: false, title: image?.altText || blob.fileName || "Image", kind: "image", fileName: blob.fileName || "image", mediaType: blob.mediaType || "application/octet-stream", byteSize: numberValue(blob.byteSize) } satisfies ArtifactView }
           : {})
       });
       break;
@@ -8377,6 +8394,7 @@ function completedMessageAttachments(blocks: readonly ProtoMessageBlock[]): read
     return [{
       id: blob.blobId,
       blobId: blob.blobId,
+      sourceRevealAvailable: false,
       title: artifact?.audioMetadata?.title.trim() || image?.altText || artifact?.label || fileName,
       ...(artifact?.audioMetadata === undefined ? {} : { audioMetadata: mapAudioMetadata(artifact.audioMetadata) }),
       kind,
@@ -14998,6 +15016,8 @@ function mapArtifact(artifact: Artifact): ArtifactView {
   return {
     id: artifact.artifactId,
     blobId: blob.blobId,
+    ...(artifact.sessionId === "" ? {} : { sourceSessionId: artifact.sessionId }),
+    sourceRevealAvailable: artifact.sourceRevealAvailable,
     title: artifact.title,
     ...(artifact.audioMetadata === undefined ? {} : { audioMetadata: mapAudioMetadata(artifact.audioMetadata) }),
     ...(artifact.description === "" ? {} : { description: artifact.description }),
@@ -15703,6 +15723,7 @@ function inputAttachments(input: any): readonly ArtifactView[] {
     return [{
       id: String(blob.blobId),
       blobId: String(blob.blobId),
+      sourceRevealAvailable: false,
       title: kind === "image" ? String(image.altText || fileName) : fileName,
       kind,
       fileName,
@@ -15752,6 +15773,7 @@ function toolResultAttachments(result: any): readonly ArtifactView[] {
       attachments.push({
         id: blob.blobId,
         blobId: blob.blobId,
+        sourceRevealAvailable: false,
         title: image.altText || blob.fileName || "Image",
         kind: "image",
         fileName: blob.fileName || "image",
@@ -15765,6 +15787,7 @@ function toolResultAttachments(result: any): readonly ArtifactView[] {
       attachments.push({
         id: artifact.artifactId || blob.blobId,
         blobId: blob.blobId,
+        sourceRevealAvailable: false,
         title: artifact.audioMetadata?.title.trim() || artifact.title || blob.fileName || "Artifact",
         ...(artifact.audioMetadata === undefined ? {} : { audioMetadata: mapAudioMetadata(artifact.audioMetadata) }),
         kind: artifactKind(artifact.kind),

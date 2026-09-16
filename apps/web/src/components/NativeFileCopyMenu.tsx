@@ -1,15 +1,16 @@
-import { Clipboard, Ellipsis, ExternalLink } from "lucide-react";
+import { Clipboard, Ellipsis, ExternalLink, FolderOpen } from "lucide-react";
 import { createContext, useLayoutEffect, useRef, useState, type JSX } from "react";
 
 import type { OperationApi } from "../model.js";
 import type { MessageKey } from "../i18n.js";
-import { nativeFileCopyAvailable, nativeFileOpenAvailable } from "../native-file-actions.js";
+import { nativeArtifactSourceRevealAvailable, nativeFileCopyAvailable, nativeFileOpenAvailable } from "../native-file-actions.js";
 import type { Translator } from "./types.js";
 import "./native-file-actions.css";
 
 export interface NativeArtifactFileActions {
   readonly copyFile?: OperationApi["copyArtifactFile"];
   readonly openFile?: OperationApi["openArtifactFile"];
+  readonly revealSource?: OperationApi["revealArtifactSource"];
 }
 
 export const NativeFileActionsContext = createContext<NativeArtifactFileActions | undefined>(undefined);
@@ -23,7 +24,11 @@ type Feedback =
   | "opened"
   | "open-failed"
   | "open-capacity"
-  | "open-unknown";
+  | "open-unknown"
+  | "revealed"
+  | "reveal-failed"
+  | "reveal-unknown"
+  | "source-unavailable";
 
 const FEEDBACK_KEYS: Record<Feedback, MessageKey> = {
   copied: "media.fileCopied",
@@ -34,14 +39,21 @@ const FEEDBACK_KEYS: Record<Feedback, MessageKey> = {
   opened: "media.fileOpened",
   "open-failed": "media.fileOpenFailed",
   "open-capacity": "media.fileOpenCapacity",
-  "open-unknown": "media.fileOpenUnknown"
+  "open-unknown": "media.fileOpenUnknown",
+  revealed: "media.sourceRevealed",
+  "reveal-failed": "media.sourceRevealFailed",
+  "reveal-unknown": "media.sourceRevealUnknown",
+  "source-unavailable": "media.sourceUnavailable"
 };
 
-export function NativeFileActionsMenu({ actions, blobId, name, byteSize, ownerKey, t }: {
+export function NativeFileActionsMenu({ actions, artifactId, blobId, name, byteSize, sourceSessionId, sourceRevealAvailable, ownerKey, t }: {
   readonly actions: NativeArtifactFileActions | undefined;
+  readonly artifactId: string;
   readonly blobId: string;
   readonly name: string;
   readonly byteSize: number;
+  readonly sourceSessionId?: string;
+  readonly sourceRevealAvailable: boolean;
   readonly ownerKey: string;
   readonly t: Translator;
 }): JSX.Element | null {
@@ -55,12 +67,15 @@ export function NativeFileActionsMenu({ actions, blobId, name, byteSize, ownerKe
     timer?: number;
   } | undefined>(undefined);
   const [feedback, setFeedback] = useState<Feedback>();
-  const [pending, setPending] = useState<"copy" | "open">();
+  const [pending, setPending] = useState<"copy" | "open" | "reveal">();
   const copyFile = actions?.copyFile;
   const openFile = actions?.openFile;
+  const revealSource = actions?.revealSource;
   const copyAvailable = copyFile !== undefined && nativeFileCopyAvailable();
   const openAvailable = openFile !== undefined && nativeFileOpenAvailable();
-  const available = copyAvailable || openAvailable;
+  const revealAvailable = revealSource !== undefined && sourceRevealAvailable && sourceSessionId !== undefined &&
+    sourceSessionId.length > 0 && artifactId.length > 0 && nativeArtifactSourceRevealAvailable();
+  const available = copyAvailable || openAvailable || revealAvailable;
   const ownerDocument = node?.ownerDocument;
 
   useLayoutEffect(() => {
@@ -103,14 +118,13 @@ export function NativeFileActionsMenu({ actions, blobId, name, byteSize, ownerKe
       ownerWindow?.removeEventListener("pageshow", restore);
       ownerDocument.removeEventListener("pointerdown", outside);
     };
-  }, [available, blobId, byteSize, copyFile, epoch, name, node, openFile, ownerDocument, ownerKey]);
+  }, [artifactId, available, blobId, byteSize, copyFile, epoch, name, node, openFile, ownerDocument, ownerKey, revealSource, sourceRevealAvailable, sourceSessionId]);
 
   if (!available) return null;
-  const start = (kind: "copy" | "open"): void => {
-    const action = kind === "copy" ? copyFile : openFile;
-    const actionAvailable = kind === "copy" ? copyAvailable : openAvailable;
+  const start = (kind: "copy" | "open" | "reveal"): void => {
+    const actionAvailable = kind === "copy" ? copyAvailable : kind === "open" ? openAvailable : revealAvailable;
     const current = owner.current;
-    if (!actionAvailable || action === undefined || current === undefined || current.request !== undefined ||
+    if (!actionAvailable || current === undefined || current.request !== undefined ||
       current.abort.signal.aborted || !current.node.isConnected || current.node.ownerDocument !== current.document ||
       current.document.defaultView?.document !== current.document) return;
     const request = new AbortController();
@@ -124,10 +138,16 @@ export function NativeFileActionsMenu({ actions, blobId, name, byteSize, ownerKe
     const isCurrent = (): boolean => owner.current === current && current.request === request &&
       !current.abort.signal.aborted && !request.signal.aborted && current.node.isConnected &&
       current.node.ownerDocument === current.document && current.document.defaultView?.document === current.document;
-    void action(blobId, name, byteSize, {
+    const context = {
       ownerDocument: current.document,
       signal: AbortSignal.any([request.signal, current.abort.signal])
-    }).then((result) => {
+    };
+    const operation = kind === "copy"
+      ? copyFile!(blobId, name, byteSize, context)
+      : kind === "open"
+        ? openFile!(blobId, name, byteSize, context)
+        : revealSource!(sourceSessionId!, artifactId, context);
+    void operation.then((result) => {
       if (!isCurrent()) return;
       if (kind === "copy") {
         const copyResult = result as Awaited<ReturnType<OperationApi["copyArtifactFile"]>>;
@@ -141,7 +161,7 @@ export function NativeFileActionsMenu({ actions, blobId, name, byteSize, ownerKe
         else if (copyResult.status === "failed") {
           setFeedback(copyResult.reason === "capacity" ? "copy-capacity" : "copy-failed");
         }
-      } else {
+      } else if (kind === "open") {
         const openResult = result as Awaited<ReturnType<OperationApi["openArtifactFile"]>>;
         if (openResult.status === "opened") {
           setFeedback("opened");
@@ -152,9 +172,19 @@ export function NativeFileActionsMenu({ actions, blobId, name, byteSize, ownerKe
         else if (openResult.status === "failed") {
           setFeedback(openResult.reason === "capacity" ? "open-capacity" : "open-failed");
         }
+      } else {
+        const revealResult = result as Awaited<ReturnType<OperationApi["revealArtifactSource"]>>;
+        if (revealResult.status === "revealed") {
+          setFeedback("revealed");
+          current.timer = current.document.defaultView?.setTimeout(() => {
+            if (owner.current === current && !current.abort.signal.aborted && current.request === undefined) setFeedback(undefined);
+          }, 3_000);
+        } else if (revealResult.status === "unknown") setFeedback("reveal-unknown");
+        else if (revealResult.status === "unavailable") setFeedback("source-unavailable");
+        else if (revealResult.status === "failed") setFeedback("reveal-failed");
       }
     }).catch(() => {
-      if (isCurrent()) setFeedback(kind === "copy" ? "copy-failed" : "open-failed");
+      if (isCurrent()) setFeedback(kind === "copy" ? "copy-failed" : kind === "open" ? "open-failed" : "reveal-failed");
     }).finally(() => {
       if (!isCurrent()) return;
       current.request = undefined;
@@ -162,7 +192,7 @@ export function NativeFileActionsMenu({ actions, blobId, name, byteSize, ownerKe
     });
   };
   const text = feedback === undefined ? undefined : t(FEEDBACK_KEYS[feedback]);
-  const pendingText = pending === "copy" ? t("media.copyingFile") : pending === "open" ? t("media.openingFile") : undefined;
+  const pendingText = pending === "copy" ? t("media.copyingFile") : pending === "open" ? t("media.openingFile") : pending === "reveal" ? t("media.revealingSource") : undefined;
   return <div ref={setNode} className="native-file-actions" aria-busy={pending !== undefined}>
     <details className="message-action-menu" onKeyDown={(event) => {
       if (event.nativeEvent.isComposing) return;
@@ -181,9 +211,10 @@ export function NativeFileActionsMenu({ actions, blobId, name, byteSize, ownerKe
       <div role="menu" aria-label={t("media.fileActions")} className="message-action-menu__panel">
         {openAvailable && <button role="menuitem" type="button" disabled={pending !== undefined} onClick={() => start("open")}><ExternalLink aria-hidden="true" />{t(pending === "open" ? "media.openingFile" : "media.openFile")}</button>}
         {copyAvailable && <button role="menuitem" type="button" disabled={pending !== undefined} onClick={() => start("copy")}><Clipboard aria-hidden="true" />{t(pending === "copy" ? "media.copyingFile" : "media.copyFile")}</button>}
+        {revealAvailable && <button role="menuitem" type="button" disabled={pending !== undefined} onClick={() => start("reveal")}><FolderOpen aria-hidden="true" />{t(pending === "reveal" ? "media.revealingSource" : "media.revealSource")}</button>}
       </div>
     </details>
     {pendingText !== undefined && <span role="status">{pendingText}</span>}
-    {feedback !== undefined && <span role={feedback === "copied" || feedback === "opened" ? "status" : "alert"}>{text}</span>}
+    {feedback !== undefined && <span role={feedback === "copied" || feedback === "opened" || feedback === "revealed" ? "status" : "alert"}>{text}</span>}
   </div>;
 }

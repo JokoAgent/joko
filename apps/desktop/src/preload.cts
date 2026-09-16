@@ -47,6 +47,8 @@ import type {
   DesktopCopyFileResult,
   DesktopOpenFileRequest,
   DesktopOpenFileResult,
+  DesktopRevealArtifactSourceRequest,
+  DesktopRevealArtifactSourceResult,
   DesktopRuntimeProcessMonitorOpenResult,
   DesktopSessionDragPreviewRequest,
   DesktopSessionWindowDropResult,
@@ -155,6 +157,8 @@ const DESKTOP_CHANNELS = {
   cancelFileCopy: "joko:files:copy-cancel",
   openFile: "joko:files:open",
   cancelFileOpen: "joko:files:open-cancel",
+  revealArtifactSource: "joko:files:reveal-artifact-source",
+  cancelArtifactSourceReveal: "joko:files:reveal-artifact-source-cancel",
   credentialGet: "joko:credential:get",
   credentialSet: "joko:credential:set",
   credentialDelete: "joko:credential:delete",
@@ -195,6 +199,7 @@ const desktopCapabilities = Object.freeze([
   "inspector.detach",
   ...((process.platform === "win32" || process.platform === "darwin") ? ["files.copy" as const] : []),
   "files.open",
+  "files.revealSource",
   "layout.reset",
   ...((process.platform === "win32" || process.platform === "linux") ? ["window.mainCloseBehavior" as const] : []),
   "microphone.lifecycle",
@@ -637,6 +642,20 @@ const desktopApi = Object.freeze({
   cancelFileOpen: (requestId: string): Promise<void> => {
     if (!isNativeFileActionId(requestId)) return Promise.reject(new TypeError("The file open identity is invalid."));
     return ipcRenderer.invoke(DESKTOP_CHANNELS.cancelFileOpen, requestId).then(() => undefined);
+  },
+  revealArtifactSource: (
+    request: DesktopRevealArtifactSourceRequest
+  ): Promise<DesktopRevealArtifactSourceResult> => {
+    if (!isDesktopRevealArtifactSourceRequest(request)) {
+      return Promise.reject(new TypeError("The Artifact source reveal request is invalid."));
+    }
+    return ipcRenderer.invoke(DESKTOP_CHANNELS.revealArtifactSource, request).then(parseArtifactSourceRevealResult);
+  },
+  cancelArtifactSourceReveal: (requestId: string): Promise<void> => {
+    if (!isNativeFileActionId(requestId)) {
+      return Promise.reject(new TypeError("The Artifact source reveal identity is invalid."));
+    }
+    return ipcRenderer.invoke(DESKTOP_CHANNELS.cancelArtifactSourceReveal, requestId).then(() => undefined);
   },
   discovery: Object.freeze({
     scan: (): Promise<readonly DesktopDiscoveredNode[]> => ipcRenderer.invoke(DESKTOP_CHANNELS.discoveryScan)
@@ -1331,6 +1350,38 @@ function parseFileOpenResult(value: unknown): DesktopOpenFileResult {
   if (keys === "status" && (result["status"] === "opened" || result["status"] === "cancelled" || result["status"] === "unknown" || result["status"] === "unavailable")) return { status: result["status"] };
   if (keys === "reason,status" && result["status"] === "failed" && (result["reason"] === "capacity" || result["reason"] === "storage" || result["reason"] === "open")) return { status: "failed", reason: result["reason"] };
   throw new TypeError("Invalid file open result.");
+}
+
+function isDesktopRevealArtifactSourceRequest(value: unknown): value is DesktopRevealArtifactSourceRequest {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const request = value as Record<string, unknown>;
+  return Object.keys(request).sort().join(",") === "artifactId,profileId,requestId,serverId,sessionId" &&
+    isNativeFileActionId(request["requestId"]) &&
+    isOpaqueFileActionIdentity(request["profileId"]) &&
+    isOpaqueFileActionIdentity(request["serverId"]) &&
+    isOpaqueFileActionIdentity(request["sessionId"]) &&
+    isOpaqueFileActionIdentity(request["artifactId"]);
+}
+
+function isOpaqueFileActionIdentity(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/u.test(value);
+}
+
+function parseArtifactSourceRevealResult(value: unknown): DesktopRevealArtifactSourceResult {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new TypeError("Invalid Artifact source reveal result.");
+  }
+  const result = value as Record<string, unknown>;
+  const keys = Object.keys(result).sort().join(",");
+  if (keys === "status" && (result["status"] === "revealed" || result["status"] === "cancelled" ||
+    result["status"] === "unknown" || result["status"] === "unavailable")) {
+    return { status: result["status"] };
+  }
+  if (keys === "reason,status" && result["status"] === "failed" &&
+    (result["reason"] === "capacity" || result["reason"] === "reveal")) {
+    return { status: "failed", reason: result["reason"] };
+  }
+  throw new TypeError("Invalid Artifact source reveal result.");
 }
 
 function isDesktopUpdateStatus(value: unknown): value is DesktopUpdateStatus {

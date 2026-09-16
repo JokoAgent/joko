@@ -2690,6 +2690,42 @@ describe("SessionHost", () => {
     await expect(fixture.host.exportSession(sessionId)).rejects.toThrow("Artifact does not exist or has expired.");
   });
 
+  it("captures only the first exact local Backend source and revalidates it on every reveal", async () => {
+    const fixture = await createFixture();
+    const createSession = fixture.adapter.createSession.bind(fixture.adapter);
+    let context!: AdapterContext;
+    vi.spyOn(fixture.adapter, "createSession").mockImplementation((input, candidate) => {
+      context = candidate;
+      return createSession(input, candidate);
+    });
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-source-reveal",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Source reveal",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const firstPath = join(fixture.directory, "first-output.txt");
+    const secondPath = join(fixture.directory, "second-output.txt");
+    writeFileSync(firstPath, "same canonical output");
+    writeFileSync(secondPath, "same canonical output");
+
+    const first = await context.storeArtifact(firstPath, { fileName: "output.txt", mimeType: "text/plain" });
+    const duplicate = await context.storeArtifact(secondPath, { fileName: "output.txt", mimeType: "text/plain" });
+    expect(duplicate.id).toBe(first.id);
+    expect(fixture.store.getArtifactSource(first.id).relativePath).toBe("first-output.txt");
+    await expect(fixture.host.resolveArtifactSource(sessionId, first.id)).resolves.toBe(firstPath);
+
+    const active = fixture.store.getSession(sessionId);
+    fixture.store.updateSession(sessionId, { archived: true }, active.revision);
+    await expect(fixture.host.resolveArtifactSource(sessionId, first.id)).resolves.toBe(firstPath);
+
+    writeFileSync(firstPath, "changed output");
+    await expect(fixture.host.resolveArtifactSource(sessionId, first.id)).rejects.toThrow(/unavailable/u);
+  });
+
   it.each(["trust revoked", "trust restored", "worktree preserved"] as const)("releases staged Backend output when %s during ingestion retires its original workspace", async (change) => {
     let fixture!: Awaited<ReturnType<typeof createFixture>>;
     const worktrees = {

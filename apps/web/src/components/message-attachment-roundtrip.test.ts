@@ -75,5 +75,5 @@ describe("message attachment draft round trip", () => {
 });
 
 function artifact(kind: "image" | "file", fileName: string, mediaType: string, byteSize: number): ArtifactView {
-  return { id: `${kind}-${fileName}`, blobId: `blob-${kind}-${fileName}`, title: fileName, kind, fileName, mediaType, byteSize };
+  return { id: `${kind}-${fileName}`, blobId: `blob-${kind}-${fileName}`, sourceRevealAvailable: false, title: fileName, kind, fileName, mediaType, byteSize };
 }

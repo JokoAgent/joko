@@ -14,6 +14,7 @@ import {
   type PiSupportedApi
 } from "@joko/adapter-pi";
 import * as contract from "@joko/contracts";
+import { DESKTOP_HOST_AUTHORIZATION_HEADER } from "@joko/contracts/desktop-bootstrap";
 import {
   DEFAULT_AGENT_RESOURCE_SETTINGS,
   DEFAULT_COLLABORATION_SETTINGS,
@@ -202,6 +203,7 @@ import {
   fromProtoTimestamp,
   mapErrorToProto,
   toProtoArtifact,
+  toProtoArtifactWithSourceAvailability,
   toProtoBackend,
   toProtoBlobRef,
   toProtoConnection,
@@ -3020,7 +3022,11 @@ export function createConnectServices(application: OrchestratorApplication): Con
         limit,
         offset
       };
-      const values = dependencies.store.listArtifacts(query).map(toProtoArtifact);
+      const values = dependencies.store.listArtifacts(query)
+        .map((record) => toProtoArtifactWithSourceAvailability(
+          record,
+          dependencies.store.hasArtifactSource(record.blob.id)
+        ));
       const totalSize = dependencies.store.countArtifacts(query);
       const afterRevision = dependencies.store.health().revision;
       if (afterRevision !== beforeRevision) {
@@ -3049,7 +3055,38 @@ export function createConnectServices(application: OrchestratorApplication): Con
     },
     getArtifact: (request, context) => {
       authenticate(context);
-      return { artifact: toProtoArtifact(dependencies.store.getArtifact(request.artifactId)) };
+      const record = dependencies.store.getArtifact(request.artifactId);
+      return { artifact: toProtoArtifactWithSourceAvailability(
+        record,
+        dependencies.store.hasArtifactSource(record.blob.id)
+      ) };
+    },
+    resolveArtifactSource: async (request, context) => {
+      const authenticated = authenticate(context);
+      if (request.sessionId.trim() === "" || request.artifactId.trim() === "") {
+        throw invalidArgument("session_id and artifact_id are required");
+      }
+      const hostAuthorization = context.requestHeader.get(DESKTOP_HOST_AUTHORIZATION_HEADER) ?? undefined;
+      requireDesktopHostAuthentication(dependencies, authenticated, hostAuthorization);
+      const revoked = new AbortController();
+      const stopRevocation = dependencies.connections.onRevoked(authenticated.id, () => revoked.abort());
+      const signal = AbortSignal.any([context.signal, revoked.signal]);
+      try {
+        const absolutePath = await dependencies.sessionHost.resolveArtifactSource(
+          request.sessionId,
+          request.artifactId,
+          signal
+        );
+        requireDesktopHostAuthentication(dependencies, authenticated, hostAuthorization);
+        if (!isAbsolute(absolutePath)) throw new ConnectError("Artifact source resolution failed.", Code.Internal);
+        return { absolutePath };
+      } catch (error) {
+        if (error instanceof ConnectError) throw error;
+        if (signal.aborted) throw new ConnectError("Artifact source resolution was cancelled.", Code.Canceled);
+        throw new ConnectError("Artifact source is unavailable or no longer authorized.", Code.FailedPrecondition);
+      } finally {
+        stopRevocation();
+      }
     },
     beginBlobUpload: async (request, context) => {
       authenticate(context);
@@ -4675,6 +4712,18 @@ function requireAuthentication(dependencies: ConnectServiceDependencies, context
     return dependencies.connections.authenticate(context.requestHeader.get("authorization") ?? undefined);
   } catch (error) {
     throw new ConnectError(error instanceof Error ? error.message : "Authentication failed.", Code.Unauthenticated);
+  }
+}
+
+function requireDesktopHostAuthentication(
+  dependencies: ConnectServiceDependencies,
+  connection: ConnectionRecord,
+  authorization: string | undefined
+): void {
+  try {
+    dependencies.connections.authenticateDesktopHost(connection, authorization);
+  } catch {
+    throw new ConnectError("Desktop host authentication is required.", Code.Unauthenticated);
   }
 }
 
@@ -6337,6 +6386,7 @@ function eventContext(
     try { queueControl = store.getQueueControl(item.sessionId); } catch { /* Historical tombstone. */ }
   }
   const artifact = item.payload.type === "artifact" ? store.findArtifact(item.payload.artifact.id) : undefined;
+  const artifactSourceRevealAvailable = artifact === undefined ? false : store.hasArtifactSource(artifact.blob.id);
   const sessionActiveRun = item.payload.type === "session_changed" && session !== undefined
     ? activeRun(store, session.descriptor.id)
     : undefined;
@@ -6356,6 +6406,7 @@ function eventContext(
     ...(queueControl === undefined ? {} : { queueControl }),
     ...(interaction === undefined ? {} : { interaction }),
     ...(artifact === undefined ? {} : { artifact }),
+    ...(artifact === undefined ? {} : { artifactSourceRevealAvailable }),
     ...(sessionContext === undefined ? {} : { sessionContext })
   };
 }

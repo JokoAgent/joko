@@ -5,6 +5,7 @@ import {
   DesktopBootstrapGrant,
   createDesktopBootstrapCommit,
   createDesktopBootstrapRequest,
+  deriveDesktopHostAuthorizationKey,
   decodeDesktopBootstrapCommittedPayload,
   decodeDesktopBootstrapResponsePayload,
   encodeDesktopBootstrapCommitFrame,
@@ -47,14 +48,20 @@ describe("Desktop bootstrap pipe", () => {
   it("keeps both pipes through a bounded persistence commit and then confirms it", async () => {
     const request = createRequest();
     const grant = DesktopBootstrapGrant.accept(request, { expectedParentPid: 321, now: () => 1_001 });
+    let hostAuthKey: string | undefined;
     const response = grant.exchange({
       serverId: "orchestrator-node",
       origin: "http://127.0.0.1:4318",
-      issueConnection: () => ({
-        connection: { id: `desktop-connection_${INSTANCE_ID}`, deviceId: DEVICE_ID },
-        authKey: Buffer.alloc(32, 9).toString("base64url")
-      })
+      issueConnection: (input) => {
+        hostAuthKey = input.desktopHostAuthKey;
+        return {
+          connection: { id: `desktop-connection_${INSTANCE_ID}`, deviceId: DEVICE_ID },
+          authKey: Buffer.alloc(32, 9).toString("base64url")
+        };
+      }
     });
+    expect(hostAuthKey).toBe(deriveDesktopHostAuthorizationKey(request));
+    expect(hostAuthKey).not.toBe(request.capability);
     const output = new PassThrough();
     const chunks: Buffer[] = [];
     output.on("data", (chunk: Buffer) => chunks.push(Buffer.from(chunk)));

@@ -124,6 +124,10 @@ type JokoDesktopOpenFileResult =
   | { readonly status: "opened" | "cancelled" | "unknown" | "unavailable" }
   | { readonly status: "failed"; readonly reason: "capacity" | "storage" | "open" };
 
+type JokoDesktopRevealArtifactSourceResult =
+  | { readonly status: "revealed" | "cancelled" | "unknown" | "unavailable" }
+  | { readonly status: "failed"; readonly reason: "capacity" | "reveal" };
+
 interface JokoDesktopAutoRelaunchSettings {
   readonly autoRelaunchOnIdle: boolean;
   readonly isCustomized: boolean;
@@ -207,6 +211,7 @@ type JokoDesktopNativeTaskStatusAction =
 type JokoDesktopCapability =
   | "files.copy"
   | "files.open"
+  | "files.revealSource"
   | "app.info"
   | "app.update"
   | "attention.badge"
@@ -439,6 +444,14 @@ interface JokoDesktopApi {
   cancelFileCopy(requestId: string): Promise<void>;
   openFile(request: { readonly requestId: string; readonly file: JokoDesktopFile }): Promise<JokoDesktopOpenFileResult>;
   cancelFileOpen(requestId: string): Promise<void>;
+  revealArtifactSource(request: {
+    readonly requestId: string;
+    readonly profileId: string;
+    readonly serverId: string;
+    readonly sessionId: string;
+    readonly artifactId: string;
+  }): Promise<JokoDesktopRevealArtifactSourceResult>;
+  cancelArtifactSourceReveal(requestId: string): Promise<void>;
   readonly discovery: {
     scan(): Promise<readonly JokoDesktopDiscoveredNode[]>;
   };

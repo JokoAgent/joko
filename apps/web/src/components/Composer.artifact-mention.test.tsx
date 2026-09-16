@@ -77,7 +77,7 @@ it("limits an Artifact-only palette to canonical Artifacts despite loaded worksp
       { path: "private.ts", name: "private.ts", kind: "file", generated: false }
     ] },
     resources: [{ sessionId: session.id, id: "resource", name: "Hidden resource", kind: "skill", discoveredRevision: "revision-one", resourceVersion: "1", runtimeGeneration: 1 }],
-    artifacts: ["one", "two"].map((id) => ({ id, sourceSessionId: session.id, blobId: id, title: `Export ${id}`, fileName: `${id}.txt`, kind: "file", mediaType: "text/plain", byteSize: 1 }))
+    artifacts: ["one", "two"].map((id) => ({ id, sourceSessionId: session.id, sourceRevealAvailable: false, blobId: id, title: `Export ${id}`, fileName: `${id}.txt`, kind: "file", mediaType: "text/plain", byteSize: 1 }))
   });
   await view.render({ supported: true, options: ["artifact"] });
   await act(async () => view.host.querySelector<HTMLButtonElement>('button[aria-label="common.add"]')!.click());

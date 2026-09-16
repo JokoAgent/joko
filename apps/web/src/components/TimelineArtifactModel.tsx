@@ -102,7 +102,7 @@ function ArtifactModelLightbox({ artifact, ownerKey, trigger, loadUrl, onDownloa
       interactionHint: t("workspace.modelInteractionHint")
     }}
     returnFocus={trigger}
-    actions={<NativeFileActionsMenu actions={fileActions} blobId={artifact.blobId} name={artifact.fileName} byteSize={artifact.byteSize} ownerKey={JSON.stringify([ownerKey, artifact.blobId, "native-file"])} t={t} />}
+    actions={<NativeFileActionsMenu actions={fileActions} artifactId={artifact.id} blobId={artifact.blobId} name={artifact.fileName} byteSize={artifact.byteSize} {...(artifact.sourceSessionId === undefined ? {} : { sourceSessionId: artifact.sourceSessionId })} sourceRevealAvailable={artifact.sourceRevealAvailable} ownerKey={JSON.stringify([ownerKey, artifact.blobId, "native-file"])} t={t} />}
     onDownload={(context) => onDownload(artifact.blobId, artifact.fileName, context)}
     onClose={onClose}
   />;

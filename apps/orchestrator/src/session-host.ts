@@ -58,6 +58,8 @@ import {
 } from "@joko/store";
 import type {
   ConnectionRecord,
+  ArtifactRecord,
+  ArtifactSourceRecord,
   InteractionRecord,
   NativeSessionDerivationRecord,
   OperationExecution,
@@ -71,6 +73,7 @@ import type {
 } from "@joko/store";
 import { operationBodyHash } from "@joko/store";
 import type { ArtifactStore } from "./artifact-store.js";
+import { resolveStoredArtifactSource, validateLocalArtifactSource } from "./artifact-source.js";
 import { ExtraDirectoryManager } from "./extra-directory-manager.js";
 import { TIMED_EXTENSION_INTERACTION_EXPIRED_REASON } from "./interaction-expiry.js";
 import {
@@ -5576,6 +5579,45 @@ export class SessionHost {
     return this.importPortableSessionPrepared(input);
   }
 
+  /**
+   * Resolve a same-machine source only after revalidating every durable and
+   * filesystem authority. The returned path is for trusted Desktop Main only;
+   * public Artifact/Event projections never call this method directly.
+   */
+  async resolveArtifactSource(
+    sessionId: string,
+    artifactId: string,
+    signal?: AbortSignal
+  ): Promise<string> {
+    this.#assertOpen();
+    throwIfArtifactSourceAborted(signal);
+    const before = this.artifactSourceAuthority(sessionId, artifactId);
+    const currentRoot = await realpath(before.effectiveTarget.workspaceRoot)
+      .catch(() => { throw artifactSourceUnavailable(); });
+    if (currentRoot !== before.source.workspaceRoot) throw artifactSourceUnavailable();
+    let validated: Awaited<ReturnType<typeof validateLocalArtifactSource>>;
+    try {
+      validated = await validateLocalArtifactSource({
+        workspaceRoot: before.source.workspaceRoot,
+        sourcePath: resolveStoredArtifactSource(before.source.workspaceRoot, before.source.relativePath),
+        expectedSha256: before.artifact.blob.sha256,
+        expectedByteLength: before.artifact.blob.byteLength,
+        ...(signal === undefined ? {} : { signal })
+      });
+    } catch {
+      throwIfArtifactSourceAborted(signal);
+      throw artifactSourceUnavailable();
+    }
+    throwIfArtifactSourceAborted(signal);
+    const after = this.artifactSourceAuthority(sessionId, artifactId);
+    const afterRoot = await realpath(after.effectiveTarget.workspaceRoot).catch(() => { throw artifactSourceUnavailable(); });
+    if (before.fingerprint !== after.fingerprint || afterRoot !== after.source.workspaceRoot ||
+      validated.workspaceRoot !== after.source.workspaceRoot ||
+      validated.relativePath !== after.source.relativePath) throw artifactSourceUnavailable();
+    throwIfArtifactSourceAborted(signal);
+    return validated.sourcePath;
+  }
+
   isSessionTerminalMutationBlocked(sessionId: string): boolean {
     return this.#portableReplacementFences.has(sessionId);
   }
@@ -10173,17 +10215,6 @@ export class SessionHost {
       this.#active.get(sessionId)?.backendInstanceGeneration ??
       backend.instanceGeneration;
     const extraDirectoriesSupported = backend.capabilities.get("workspace.extra_dirs")?.supported === true;
-    const artifactWorkspaceAuthority = (registered: TargetDescriptor, effective: TargetDescriptor, ownedWorktree: SessionDescriptor["worktree"]): string => operationBodyHash({
-      targetId: registered.id,
-      backendId: registered.backendId,
-      workspaceRoot: registered.workspaceRoot,
-      trusted: registered.trusted,
-      managed: registered.managed,
-      remoteWorkspace: registered.remoteWorkspace ?? null,
-      effectiveWorkspaceRoot: effective.workspaceRoot,
-      effectiveRemoteWorkspace: effective.remoteWorkspace ?? null,
-      worktree: ownedWorktree ?? null
-    });
     const originalArtifactAuthority = artifactWorkspaceAuthority(this.#store.getTarget(target.id).descriptor, target, worktree);
     return {
       sessionId,
@@ -10447,6 +10478,21 @@ export class SessionHost {
         };
         assertArtifactAuthority(this.#store);
         const artifact = await this.#artifactStore.ingestPath(sourcePath, { ...options, expiresAt: Date.now() + 10 * 60_000 });
+        let localSource: Awaited<ReturnType<typeof validateLocalArtifactSource>> | undefined;
+        if (target.remoteWorkspace === undefined) {
+          try {
+            const validated = await validateLocalArtifactSource({
+              workspaceRoot: target.workspaceRoot,
+              sourcePath,
+              expectedSha256: artifact.sha256,
+              expectedByteLength: artifact.byteLength
+            });
+            if (await realpath(target.workspaceRoot) === validated.workspaceRoot) localSource = validated;
+          } catch {
+            // A canonical Artifact remains valid without local source authority.
+            // Never leak or persist a path that failed exact provenance checks.
+          }
+        }
         try {
           const blob = this.#store.transaction((store) => {
             const current = assertArtifactAuthority(store);
@@ -10456,6 +10502,17 @@ export class SessionHost {
             });
             const selected = adopted.blob;
             if (existing !== undefined) store.releaseArtifactStaging([artifact.id]);
+            if (localSource !== undefined && !store.hasArtifactSource(selected.id)) {
+              store.putArtifactSource({
+                artifactId: selected.id,
+                sessionId,
+                targetId: current.descriptor.targetId,
+                generation,
+                authorityHash: originalArtifactAuthority,
+                workspaceRoot: localSource.workspaceRoot,
+                relativePath: localSource.relativePath
+              });
+            }
             const artifactEventId = `backend-artifact-${createHash("sha256")
               .update(sessionId).update("\0").update(selected.id).digest("hex")}`;
             store.appendEventIfAbsent({
@@ -11621,6 +11678,57 @@ export class SessionHost {
     };
   }
 
+  private artifactSourceAuthority(sessionId: string, artifactId: string): ArtifactSourceAuthoritySnapshot {
+    this.#assertOpen();
+    const artifact = this.#store.getArtifact(artifactId);
+    const source = this.#store.getArtifactSource(artifactId);
+    const session = this.#store.getSession(sessionId);
+    if (source.sessionId !== sessionId || artifact.sessionId !== sessionId ||
+      session.descriptor.deletedAt !== undefined || source.targetId !== session.descriptor.targetId ||
+      source.generation !== session.descriptor.binding.generation ||
+      session.descriptor.worktree !== undefined && session.descriptor.worktree.state !== "active") {
+      throw artifactSourceUnavailable();
+    }
+    const target = this.#store.getTarget(source.targetId);
+    const effectiveTarget = this.targetForSession(session);
+    const authorityHash = artifactWorkspaceAuthority(
+      target.descriptor,
+      effectiveTarget,
+      session.descriptor.worktree
+    );
+    if (target.descriptor.remoteWorkspace !== undefined || effectiveTarget.remoteWorkspace !== undefined ||
+      source.authorityHash !== authorityHash) throw artifactSourceUnavailable();
+    return {
+      artifact,
+      source,
+      session,
+      target,
+      effectiveTarget,
+      fingerprint: operationBodyHash({
+        artifact: { blob: artifact.blob, revision: artifact.revision.toString() },
+        source: {
+          artifactId: source.artifactId,
+          sessionId: source.sessionId,
+          targetId: source.targetId,
+          generation: source.generation,
+          authorityHash: source.authorityHash,
+          workspaceRoot: source.workspaceRoot,
+          relativePath: source.relativePath,
+          revision: source.revision.toString()
+        },
+        session: {
+          targetId: session.descriptor.targetId,
+          backendId: session.descriptor.backendId,
+          generation: session.descriptor.binding.generation,
+          deletedAt: session.descriptor.deletedAt ?? null,
+          remoteWorkspace: session.descriptor.remoteWorkspace ?? null,
+          worktree: session.descriptor.worktree ?? null
+        },
+        target: { revision: target.revision.toString(), authorityHash }
+      })
+    };
+  }
+
   private backendResourceCatalogEpoch(backendId: string): bigint {
     return this.#backendResourceCatalogEpochs.get(backendId) ?? 0n;
   }
@@ -12006,6 +12114,15 @@ export class SessionHost {
   #assertOpen(): void {
     if (this.#disposed) throw new Error("Session Host is closed.");
   }
+}
+
+interface ArtifactSourceAuthoritySnapshot {
+  readonly artifact: ArtifactRecord;
+  readonly source: ArtifactSourceRecord;
+  readonly session: StoredSession;
+  readonly target: StoredTarget;
+  readonly effectiveTarget: TargetDescriptor;
+  readonly fingerprint: string;
 }
 
 function promptInputMessageBlocks(input: PromptInput): readonly MessageBlock[] {
@@ -13728,6 +13845,35 @@ function storedBackendInstanceGeneration(store: OperationalStore, backendId: str
   } catch {
     return undefined;
   }
+}
+
+function artifactWorkspaceAuthority(
+  registered: TargetDescriptor,
+  effective: TargetDescriptor,
+  ownedWorktree: SessionDescriptor["worktree"]
+): string {
+  return operationBodyHash({
+    targetId: registered.id,
+    backendId: registered.backendId,
+    workspaceRoot: registered.workspaceRoot,
+    trusted: registered.trusted,
+    managed: registered.managed,
+    remoteWorkspace: registered.remoteWorkspace ?? null,
+    effectiveWorkspaceRoot: effective.workspaceRoot,
+    effectiveRemoteWorkspace: effective.remoteWorkspace ?? null,
+    worktree: ownedWorktree ?? null
+  });
+}
+
+function artifactSourceUnavailable(): StoreError {
+  return new StoreError("Artifact source is unavailable or no longer authorized.");
+}
+
+function throwIfArtifactSourceAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted !== true) return;
+  const error = new Error("Artifact source resolution was cancelled.");
+  error.name = "AbortError";
+  throw error;
 }
 
 function staleBackendInstanceContextError(): JokoError {

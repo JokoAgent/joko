@@ -64,15 +64,18 @@
 }
 
 .video-lightbox__toolbar .native-file-actions .message-action-menu__panel,
+.workspace-image-lightbox__toolbar .native-file-actions .message-action-menu__panel,
 .workspace-model-lightbox__toolbar .native-file-actions .message-action-menu__panel {
   top: auto;
   bottom: calc(100% + 4px);
 }
 
+.workspace-image-lightbox__toolbar .native-file-actions,
 .workspace-model-lightbox__toolbar .native-file-actions {
   padding: 0;
 }
 
+.workspace-image-lightbox__toolbar .native-file-actions > span,
 .workspace-model-lightbox__toolbar .native-file-actions > span {
   position: fixed;
   z-index: 10001;

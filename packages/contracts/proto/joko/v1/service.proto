@@ -154,6 +154,7 @@ service WorkspaceService {
 service ArtifactService {
   rpc ListArtifacts(ListArtifactsRequest) returns (ListArtifactsResponse);
   rpc GetArtifact(GetArtifactRequest) returns (GetArtifactResponse);
+  rpc ResolveArtifactSource(ResolveArtifactSourceRequest) returns (ResolveArtifactSourceResponse);
   rpc BeginBlobUpload(BeginBlobUploadRequest) returns (BeginBlobUploadResponse);
   rpc CompleteBlobUpload(CompleteBlobUploadRequest) returns (CompleteBlobUploadResponse);
   rpc GetBlobDownloadTicket(GetBlobDownloadTicketRequest) returns (GetBlobDownloadTicketResponse);
@@ -1362,6 +1363,15 @@ message GetArtifactRequest {
 
 message GetArtifactResponse {
   Artifact artifact = 1;
+}
+
+message ResolveArtifactSourceRequest {
+  string session_id = 1;
+  string artifact_id = 2;
+}
+
+message ResolveArtifactSourceResponse {
+  string absolute_path = 1;
 }
 
 message BeginBlobUploadRequest {

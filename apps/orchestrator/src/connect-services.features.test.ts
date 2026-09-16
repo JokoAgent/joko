@@ -9,6 +9,7 @@ import { DurationSchema } from "@bufbuild/protobuf/wkt";
 import { Code } from "@connectrpc/connect";
 import { PiBackendAdapter } from "@joko/adapter-pi";
 import * as contract from "@joko/contracts";
+import { DESKTOP_HOST_AUTHORIZATION_HEADER } from "@joko/contracts/desktop-bootstrap";
 import type { BackendAdapter, NativeSessionState, SessionTreeNode } from "@joko/core";
 import { OperationalStore, operationBodyHash, type OperationRecord, type PersistedEvent, type StoredSession } from "@joko/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -105,9 +106,9 @@ function immediateHost(store: object, extra: Record<string, unknown> = {}) {
   };
 }
 
-async function invoke<T>(handler: unknown, request: unknown): Promise<T> {
+async function invoke<T>(handler: unknown, request: unknown, handlerContext: unknown = context()): Promise<T> {
   if (typeof handler !== "function") throw new Error("RPC handler is missing.");
-  return await (handler as (request: unknown, handlerContext: unknown) => T | Promise<T>)(request, context());
+  return await (handler as (request: unknown, handlerContext: unknown) => T | Promise<T>)(request, handlerContext);
 }
 
 async function completedNavigation(...args: Parameters<SessionHost["navigateTree"]>) {
@@ -567,7 +568,8 @@ describe("Connect typed feature boundaries", () => {
     const store = {
       health: vi.fn(() => ({ revision })),
       listArtifacts,
-      countArtifacts: vi.fn(() => artifacts.length)
+      countArtifacts: vi.fn(() => artifacts.length),
+      hasArtifactSource: vi.fn((artifactId: string) => artifactId === "artifact-one")
     };
     const services = createConnectServices(stubApplication({ store }));
 
@@ -577,6 +579,7 @@ describe("Connect typed feature boundaries", () => {
     });
     expect(first.revision?.value).toBe(7n);
     expect(first.artifacts.map((artifact) => artifact.artifactId)).toEqual(["artifact-one"]);
+    expect(first.artifacts.map((artifact) => artifact.sourceRevealAvailable)).toEqual([true]);
     expect(first.page).toMatchObject({ totalSize: 2n });
     expect(first.page?.nextPageToken).not.toBe("");
 
@@ -585,6 +588,7 @@ describe("Connect typed feature boundaries", () => {
       page: { pageSize: 1, pageToken: first.page?.nextPageToken }
     });
     expect(second.artifacts.map((artifact) => artifact.artifactId)).toEqual(["artifact-two"]);
+    expect(second.artifacts.map((artifact) => artifact.sourceRevealAvailable)).toEqual([false]);
     expect(second.page?.nextPageToken).toBe("");
     expect(listArtifacts).toHaveBeenLastCalledWith(expect.objectContaining({ sessionId: "session-artifacts", offset: 1, limit: 1 }));
 
@@ -625,6 +629,7 @@ describe("Connect typed feature boundaries", () => {
       health: () => ({ revision }),
       listArtifacts,
       countArtifacts: () => artifacts.length,
+      hasArtifactSource: () => false,
       getSession: (id: string) => ({
         revision: 5n,
         descriptor: {
@@ -702,6 +707,72 @@ describe("Connect typed feature boundaries", () => {
     targetArchived = true;
     await expect(invoke(services.artifact.listArtifacts, request))
       .rejects.toMatchObject({ code: Code.FailedPrecondition });
+  });
+
+  it("resolves an Artifact source only for the exact authenticated Desktop host and rechecks it after resolution", async () => {
+    const absolutePath = resolve("source-task-output.txt");
+    const resolveArtifactSource = vi.fn(async () => absolutePath);
+    const authenticateDesktopHost = vi.fn((_connection, authorization: string | undefined) => {
+      if (authorization !== "Bearer desktop-host-key") throw new Error("invalid host");
+    });
+    const stopRevocation = vi.fn();
+    const onRevoked = vi.fn(() => stopRevocation);
+    const services = createConnectServices(stubApplication({
+      connections: { authenticate: () => connection, authenticateDesktopHost, onRevoked },
+      sessionHost: { resolveArtifactSource }
+    }));
+    const headers = new Headers({
+      authorization: "Bearer feature-test",
+      [DESKTOP_HOST_AUTHORIZATION_HEADER]: "Bearer desktop-host-key"
+    });
+    const signal = new AbortController().signal;
+
+    const response = await invoke<contract.ResolveArtifactSourceResponse>(services.artifact.resolveArtifactSource, {
+      sessionId: "source-task",
+      artifactId: "artifact-one"
+    }, { requestHeader: headers, signal });
+    expect(response.absolutePath).toBe(absolutePath);
+    expect(resolveArtifactSource).toHaveBeenCalledExactlyOnceWith("source-task", "artifact-one", expect.any(AbortSignal));
+    expect(authenticateDesktopHost).toHaveBeenCalledTimes(2);
+    expect(onRevoked).toHaveBeenCalledWith(connection.id, expect.any(Function));
+    expect(stopRevocation).toHaveBeenCalledOnce();
+
+    await expect(invoke(services.artifact.resolveArtifactSource, {
+      sessionId: "source-task",
+      artifactId: "artifact-one"
+    })).rejects.toMatchObject({ code: Code.Unauthenticated });
+    expect(resolveArtifactSource).toHaveBeenCalledOnce();
+  });
+
+  it("cancels a pending Artifact source resolution when its connection is revoked", async () => {
+    let revoke!: () => void;
+    let resolverSignal: AbortSignal | undefined;
+    const stopRevocation = vi.fn();
+    const resolveArtifactSource = vi.fn(async (_sessionId: string, _artifactId: string, signal: AbortSignal) => {
+      resolverSignal = signal;
+      await new Promise<void>((_resolve, reject) => signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true }));
+      return resolve("never-returned.txt");
+    });
+    const services = createConnectServices(stubApplication({
+      connections: {
+        authenticate: () => connection,
+        authenticateDesktopHost: () => undefined,
+        onRevoked: (_connectionId: string, callback: () => void) => { revoke = callback; return stopRevocation; }
+      },
+      sessionHost: { resolveArtifactSource }
+    }));
+    const pending = invoke(services.artifact.resolveArtifactSource, {
+      sessionId: "source-task",
+      artifactId: "artifact-one"
+    }, {
+      requestHeader: new Headers({ authorization: "Bearer feature-test", [DESKTOP_HOST_AUTHORIZATION_HEADER]: "Bearer desktop-host-key" }),
+      signal: new AbortController().signal
+    });
+    await vi.waitFor(() => expect(resolverSignal).toBeDefined());
+    revoke();
+    await expect(pending).rejects.toMatchObject({ code: Code.Canceled });
+    expect(resolverSignal!.aborted).toBe(true);
+    expect(stopRevocation).toHaveBeenCalledOnce();
   });
 
   it("moves only Session navigation placement through a durable operation", async () => {

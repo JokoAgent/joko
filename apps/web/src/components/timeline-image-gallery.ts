@@ -2,7 +2,10 @@ import type { TimelineItemView } from "../model.js";
 
 export interface TimelineGalleryImage {
   readonly id: string;
+  readonly artifactId: string;
   readonly blobId: string;
+  readonly sourceSessionId?: string;
+  readonly sourceRevealAvailable: boolean;
   readonly title: string;
   readonly fileName: string;
   readonly byteSize: number;
@@ -36,7 +39,10 @@ export function collectTimelineGalleryImages(items: readonly TimelineItemView[])
     if (item.kind === "image" && item.artifact !== undefined) {
       images.push({
         id: timelineArtifactGalleryId(item.id, item.artifact.id),
+        artifactId: item.artifact.id,
         blobId: item.artifact.blobId,
+        ...(item.artifact.sourceSessionId === undefined ? {} : { sourceSessionId: item.artifact.sourceSessionId }),
+        sourceRevealAvailable: item.artifact.sourceRevealAvailable,
         title: item.artifact.title,
         fileName: item.artifact.fileName,
         byteSize: item.artifact.byteSize
@@ -46,7 +52,10 @@ export function collectTimelineGalleryImages(items: readonly TimelineItemView[])
       if (attachment.kind !== "image") return;
       images.push({
         id: timelineMessageAttachmentGalleryId(item.id, attachment.id, index),
+        artifactId: attachment.id,
         blobId: attachment.blobId,
+        ...(attachment.sourceSessionId === undefined ? {} : { sourceSessionId: attachment.sourceSessionId }),
+        sourceRevealAvailable: attachment.sourceRevealAvailable,
         title: attachment.title,
         fileName: attachment.fileName,
         byteSize: attachment.byteSize

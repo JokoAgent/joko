@@ -90,6 +90,7 @@ import type {
   AcquireToolLeaseInput,
   AppendEventInput,
   ArtifactRecord,
+  ArtifactSourceRecord,
   ClearRemoteHostTrustInput,
   ConnectionRecord,
   ContextRebuildClaim,
@@ -99,6 +100,7 @@ import type {
   CreatePairingInput,
   DeviceControlRelationRecord,
   DeviceRecord,
+  DesktopHostAuthorizationRecord,
   DeleteRemoteHostInput,
   DiagnosticRecord,
   DeferredEffectOperationClaim,
@@ -143,6 +145,7 @@ import type {
   OperationalHistoryMaintenanceInspection,
   OperationalStoreOptions,
   PairingRecord,
+  PutArtifactSourceInput,
   PendingContextRebuild,
   PersistedEvent,
   PrunePairingsOptions,
@@ -1428,6 +1431,52 @@ export class OperationalStore {
     const row = this.database.prepare("SELECT * FROM connections WHERE id = ?").get(id) as Row | undefined;
     if (row === undefined) throw new NotFoundError("Connection", id);
     return connectionFromRow(row);
+  }
+
+  putDesktopHostAuthorization(input: {
+    readonly connectionId: string;
+    readonly authKeyDigest: string;
+    readonly createdAt?: number;
+  }): DesktopHostAuthorizationRecord {
+    return this.write(() => {
+      const connection = this.getConnection(input.connectionId);
+      const device = this.getDevice(connection.deviceId);
+      if (connection.state !== "active" || device.state !== "active" || device.kind !== "desktop") {
+        throw new AuthorizationError("Desktop host authorization requires an active Desktop connection.");
+      }
+      const digest = normalizedPrivateDigest(input.authKeyDigest, "Desktop host authorization digest");
+      const existing = this.findDesktopHostAuthorization(connection.id);
+      if (existing !== undefined) {
+        if (!constantTimeEqual(existing.authKeyDigest, digest)) {
+          throw new StoreError("Desktop host authorization is already bound to different authority.");
+        }
+        return existing;
+      }
+      this.database.prepare(`
+        INSERT INTO desktop_host_authorizations(connection_id, auth_key_digest, created_at, revision)
+        VALUES (?, ?, ?, ?)
+      `).run(
+        connection.id,
+        digest,
+        input.createdAt ?? this.now(),
+        asSqlInteger(this.requireActiveRevision())
+      );
+      return this.getDesktopHostAuthorization(connection.id);
+    });
+  }
+
+  findDesktopHostAuthorization(connectionId: string): DesktopHostAuthorizationRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(
+      "SELECT * FROM desktop_host_authorizations WHERE connection_id = ?"
+    ).get(nonBlank(connectionId, "Desktop host Connection ID")) as Row | undefined;
+    return row === undefined ? undefined : desktopHostAuthorizationFromRow(row);
+  }
+
+  getDesktopHostAuthorization(connectionId: string): DesktopHostAuthorizationRecord {
+    const record = this.findDesktopHostAuthorization(connectionId);
+    if (record === undefined) throw new NotFoundError("Desktop host authorization", connectionId);
+    return record;
   }
 
   listConnections(): ConnectionRecord[] {
@@ -10800,6 +10849,76 @@ export class OperationalStore {
     return artifact;
   }
 
+  /**
+   * Attach one private local-source proof. The first valid proof owns the
+   * Artifact permanently; later deduplication may observe it but never replace
+   * it with a different path.
+   */
+  putArtifactSource(input: PutArtifactSourceInput): ArtifactSourceRecord {
+    return this.write(() => {
+      const artifact = this.getArtifact(input.artifactId);
+      const session = this.getSession(input.sessionId).descriptor;
+      if (!Number.isSafeInteger(input.generation) || input.generation < 0) {
+        throw new StoreError("Artifact source generation is invalid.");
+      }
+      if (artifact.sessionId !== session.id || session.targetId !== input.targetId ||
+        session.binding.generation !== input.generation || session.deletedAt !== undefined || session.archived) {
+        throw new StoreError("Artifact source authority does not match its active Session.");
+      }
+      const target = this.getTarget(input.targetId).descriptor;
+      if (target.remoteWorkspace !== undefined || session.remoteWorkspace !== undefined) {
+        throw new StoreError("Remote Artifacts cannot receive local source authority.");
+      }
+      const authorityHash = normalizedAuthorityHash(input.authorityHash);
+      const workspaceRoot = boundedPrivatePath(input.workspaceRoot, "Artifact source workspace root");
+      if (!path.isAbsolute(workspaceRoot)) throw new StoreError("Artifact source workspace root must be absolute.");
+      const relativePath = normalizedPrivateRelativePath(input.relativePath);
+      const existing = this.findArtifactSource(artifact.blob.id);
+      if (existing !== undefined) return existing;
+      this.database.prepare(`
+        INSERT INTO artifact_sources(
+          artifact_id, session_id, target_id, generation, authority_hash,
+          workspace_root, relative_path, created_at, revision
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        artifact.blob.id,
+        session.id,
+        target.id,
+        input.generation,
+        authorityHash,
+        workspaceRoot,
+        relativePath,
+        input.createdAt ?? this.now(),
+        asSqlInteger(this.requireActiveRevision())
+      );
+      return this.getArtifactSource(artifact.blob.id);
+    });
+  }
+
+  findArtifactSource(artifactId: string): ArtifactSourceRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(
+      "SELECT * FROM artifact_sources WHERE artifact_id = ?"
+    ).get(nonBlank(artifactId, "Artifact ID")) as Row | undefined;
+    return row === undefined ? undefined : artifactSourceFromRow(row);
+  }
+
+  getArtifactSource(artifactId: string): ArtifactSourceRecord {
+    const source = this.findArtifactSource(artifactId);
+    if (source === undefined) throw new NotFoundError("Artifact source", artifactId);
+    return source;
+  }
+
+  hasArtifactSource(artifactId: string): boolean {
+    this.assertOpen();
+    return this.database.prepare(`
+      SELECT 1 FROM artifact_sources AS source
+      JOIN artifacts AS artifact ON artifact.id = source.artifact_id
+      WHERE source.artifact_id = ? AND artifact.deleted_at IS NULL
+      LIMIT 1
+    `).get(nonBlank(artifactId, "Artifact ID")) !== undefined;
+  }
+
   /** Reuse a plain committed output only within its original product Session. */
   findSessionArtifactByStorage(sessionId: string, storageKey: string, mimeType: string, fileName: string | undefined): ArtifactRecord | undefined {
     this.assertOpen();
@@ -13517,6 +13636,15 @@ function queueItemFromRow(row: Row, at: number): QueueItemRecord {
   };
 }
 
+function desktopHostAuthorizationFromRow(row: Row): DesktopHostAuthorizationRecord {
+  return {
+    connectionId: stringValue(row["connection_id"]),
+    authKeyDigest: stringValue(row["auth_key_digest"]),
+    createdAt: numberValue(row["created_at"]),
+    revision: toBigInt(row["revision"])
+  };
+}
+
 function sameNativeBinding(left: NativeSessionBinding, right: NativeSessionBinding): boolean {
   return left.opaqueRef === right.opaqueRef && left.nativeSessionId === right.nativeSessionId && left.generation === right.generation;
 }
@@ -14144,6 +14272,20 @@ function artifactFromRow(row: Row): ArtifactRecord {
     metadata: parseJson(stringValue(row["metadata_json"])),
     createdAt: numberValue(row["created_at"]),
     ...optionalNumber("deletedAt", row["deleted_at"]),
+    revision: toBigInt(row["revision"])
+  };
+}
+
+function artifactSourceFromRow(row: Row): ArtifactSourceRecord {
+  return {
+    artifactId: stringValue(row["artifact_id"]),
+    sessionId: stringValue(row["session_id"]),
+    targetId: stringValue(row["target_id"]),
+    generation: numberValue(row["generation"]),
+    authorityHash: stringValue(row["authority_hash"]),
+    workspaceRoot: stringValue(row["workspace_root"]),
+    relativePath: stringValue(row["relative_path"]),
+    createdAt: numberValue(row["created_at"]),
     revision: toBigInt(row["revision"])
   };
 }
@@ -14964,6 +15106,34 @@ function nonBlank(value: string, label: string): string {
   const normalized = value.trim();
   if (normalized === "") throw new StoreError(`${label} must not be blank.`);
   return normalized;
+}
+
+function normalizedPrivateDigest(value: string, label: string): string {
+  const digest = value.trim().toLowerCase();
+  if (!/^[a-f0-9]{64}$/u.test(digest)) throw new StoreError(`${label} is invalid.`);
+  return digest;
+}
+
+function normalizedAuthorityHash(value: string): string {
+  const match = /^sha256:([a-f0-9]{64})$/u.exec(value.trim().toLowerCase());
+  if (match === null) throw new StoreError("Artifact source authority hash is invalid.");
+  return `sha256:${match[1]}`;
+}
+
+function boundedPrivatePath(value: string, label: string): string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 32_768 || value.includes("\0")) {
+    throw new StoreError(`${label} is invalid.`);
+  }
+  return value;
+}
+
+function normalizedPrivateRelativePath(value: string): string {
+  const relativePath = boundedPrivatePath(value, "Artifact source relative path");
+  if (relativePath.startsWith("/") || relativePath.includes("\\") ||
+    relativePath.split("/").some((segment) => segment.length === 0 || segment === "." || segment === "..")) {
+    throw new StoreError("Artifact source relative path is invalid.");
+  }
+  return relativePath;
 }
 
 function queueLockToken(value: string): string {

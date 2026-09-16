@@ -2,6 +2,7 @@ import { assertBrowserActionCurrent, type BrowserActionContext } from "./browser
 
 export type NativeFileCopyOutcome = JokoDesktopCopyFileResult;
 export type NativeFileOpenOutcome = JokoDesktopOpenFileResult;
+export type NativeArtifactSourceRevealOutcome = JokoDesktopRevealArtifactSourceResult;
 export const NATIVE_FILE_COPY_MAXIMUM_BYTES = 256 * 1024 * 1024;
 export const NATIVE_FILE_OPEN_MAXIMUM_BYTES = 256 * 1024 * 1024;
 
@@ -11,6 +12,10 @@ export function nativeFileCopyAvailable(): boolean {
 
 export function nativeFileOpenAvailable(): boolean {
   return typeof window !== "undefined" && window.jokoDesktop?.capabilities.includes("files.open") === true;
+}
+
+export function nativeArtifactSourceRevealAvailable(): boolean {
+  return typeof window !== "undefined" && window.jokoDesktop?.capabilities.includes("files.revealSource") === true;
 }
 
 /** Capture the trusted host before asynchronous retrieval, independently of the view Document. */
@@ -25,6 +30,18 @@ export function captureNativeFileOpen(): Pick<NonNullable<Window["jokoDesktop"]>
   if (!nativeFileOpenAvailable()) return undefined;
   const desktop = window.jokoDesktop!;
   return { openFile: desktop.openFile.bind(desktop), cancelFileOpen: desktop.cancelFileOpen.bind(desktop) };
+}
+
+export function captureNativeArtifactSourceReveal(): Pick<
+  NonNullable<Window["jokoDesktop"]>,
+  "revealArtifactSource" | "cancelArtifactSourceReveal"
+> | undefined {
+  if (!nativeArtifactSourceRevealAvailable()) return undefined;
+  const desktop = window.jokoDesktop!;
+  return {
+    revealArtifactSource: desktop.revealArtifactSource.bind(desktop),
+    cancelArtifactSourceReveal: desktop.cancelArtifactSourceReveal.bind(desktop)
+  };
 }
 
 export async function copyNativeArtifactFile(
@@ -74,6 +91,31 @@ export async function openNativeArtifactFile(
     // rejected acknowledgement is therefore unknown and never falls back.
     try { return await host.openFile({ requestId, file: { name, mediaType: blob.type || "application/octet-stream", bytes } }); }
     catch { return { status: "unknown" }; }
+  } finally {
+    context.signal.removeEventListener("abort", cancel);
+  }
+}
+
+export async function revealNativeArtifactSource(
+  profileId: string,
+  serverId: string,
+  sessionId: string,
+  artifactId: string,
+  context: BrowserActionContext,
+  host: ReturnType<typeof captureNativeArtifactSourceReveal>
+): Promise<NativeArtifactSourceRevealOutcome> {
+  assertBrowserActionCurrent(context);
+  if (host === undefined) return { status: "unavailable" };
+  const requestId = context.ownerDocument.defaultView!.crypto.randomUUID();
+  const cancel = (): void => { void host.cancelArtifactSourceReveal(requestId).catch(() => undefined); };
+  context.signal.addEventListener("abort", cancel, { once: true });
+  try {
+    assertBrowserActionCurrent(context);
+    try {
+      return await host.revealArtifactSource({ requestId, profileId, serverId, sessionId, artifactId });
+    } catch {
+      return { status: "unknown" };
+    }
   } finally {
     context.signal.removeEventListener("abort", cancel);
   }

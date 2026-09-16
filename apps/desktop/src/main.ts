@@ -237,6 +237,8 @@ import {
 import { installSelectionContextMenu, setSelectionContextMenuLocale } from "./selection-context-menu.js";
 import { NativeFileClipboard, type NativeFileActionScope } from "./native-file-clipboard.js";
 import { NativeFileOpener } from "./native-file-opener.js";
+import { NativeArtifactSourceRevealer } from "./native-artifact-source-revealer.js";
+import { resolveManagedArtifactSource } from "./managed-artifact-source.js";
 import { bundledElectronUpdater, createElectronUpdateDriver } from "./electron-update-driver.js";
 import {
   createDesktopUpdateAutoRelaunchPolicy,
@@ -508,6 +510,7 @@ const MAXIMUM_ATTACHMENT_FILES = 32;
 const MAXIMUM_NATIVE_FILE_BYTES = 256 * 1024 * 1024;
 let nativeFileClipboard: NativeFileClipboard | undefined;
 let nativeFileOpener: NativeFileOpener | undefined;
+let nativeArtifactSourceRevealer: NativeArtifactSourceRevealer | undefined;
 const nativeFileActionScopes = new WeakMap<WebContents, NativeFileActionScope>();
 const extensionLibraryGestures = new ExtensionLibraryGestureCoordinator<WebContents>();
 const extensionLibraryGestureScopes = new WeakSet<WebContents>();
@@ -582,6 +585,7 @@ if (!app.requestSingleInstanceLock()) {
   app.on("before-quit", (event) => {
     nativeFileClipboard?.cancelPending();
     nativeFileOpener?.cancelPending();
+    nativeArtifactSourceRevealer?.cancelPending();
     mainWindowCloseController?.cancelPending();
     quitting = true;
     activeDiscoveryAbort?.abort();
@@ -629,6 +633,7 @@ if (!app.requestSingleInstanceLock()) {
   app.on("will-quit", () => {
     nativeFileClipboard?.dispose();
     nativeFileOpener?.dispose();
+    nativeArtifactSourceRevealer?.dispose();
     globalVoiceShortcutRecovery.dispose();
     unregisterGlobalVoiceShortcut();
     stopGlobalVoiceShortcutCapture();
@@ -5188,6 +5193,46 @@ function registerIpc(): void {
     const scope = nativeFileActionScopes.get(event.sender);
     if (scope !== undefined) nativeFileOpener?.cancel(parameters[0], scope.id);
   });
+  ipcMain.handle(DESKTOP_CHANNELS.revealArtifactSource, (event, ...parameters: unknown[]) => {
+    assertTrustedIpcSender(event);
+    if (parameters.length !== 1) throw new TypeError("Artifact source reveal requires one request object.");
+    nativeArtifactSourceRevealer ??= new NativeArtifactSourceRevealer({
+      resolvePath: async (request, signal) => {
+        const runtime = managedOrchestratorRuntime;
+        const connection = managedOrchestratorConnection;
+        if (runtime === undefined || connection === undefined || managedOrchestratorStatus.state !== "ready" ||
+          request.profileId !== connection.profileId || request.serverId !== connection.serverId ||
+          !sameManagedOrchestratorConnection(runtime.connection, connection) ||
+          managedOrchestratorExitFence.shutdownStarted) {
+          throw new Error("Managed Artifact source authority is unavailable.");
+        }
+        return resolveManagedArtifactSource({
+          connection,
+          sessionId: request.sessionId,
+          artifactId: request.artifactId,
+          signal,
+          readAuthKey: readCredential,
+          readDesktopHostAuthKey: runtime.readDesktopHostAuthKey,
+          isAuthorityCurrent: (candidate) => managedOrchestratorStatus.state === "ready" &&
+            managedOrchestratorRuntime === runtime && managedOrchestratorConnection === connection &&
+            !managedOrchestratorExitFence.shutdownStarted &&
+            sameManagedOrchestratorConnection(managedOrchestratorStatus.connection, candidate) &&
+            sameManagedOrchestratorConnection(connection, candidate) &&
+            sameManagedOrchestratorConnection(runtime.connection, candidate)
+        });
+      },
+      revealPath: (path) => shell.showItemInFolder(path)
+    });
+    return nativeArtifactSourceRevealer.reveal(parameters[0], nativeFileActionScope(event));
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.cancelArtifactSourceReveal, (event, ...parameters: unknown[]) => {
+    assertTrustedIpcSender(event);
+    if (parameters.length !== 1 || typeof parameters[0] !== "string") {
+      throw new TypeError("Artifact source reveal cancellation requires one identity.");
+    }
+    const scope = nativeFileActionScopes.get(event.sender);
+    if (scope !== undefined) nativeArtifactSourceRevealer?.cancel(parameters[0], scope.id);
+  });
   ipcMain.handle(DESKTOP_CHANNELS.discoveryScan, async (event) => {
     assertTrustedIpcSender(event);
     return runDiscoveryScan();
@@ -5863,6 +5908,7 @@ function nativeFileActionScope(event: IpcMainInvokeEvent): NativeFileActionScope
     active = false;
     nativeFileClipboard?.retireScope(scope.id);
     nativeFileOpener?.retireScope(scope.id);
+    nativeArtifactSourceRevealer?.retireScope(scope.id);
     if (nativeFileActionScopes.get(contents) === scope) nativeFileActionScopes.delete(contents);
     contents.removeListener("did-start-navigation", navigate);
     contents.removeListener("destroyed", retire);

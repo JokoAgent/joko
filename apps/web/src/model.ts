@@ -905,6 +905,8 @@ export interface ToolCallView {
 export interface ArtifactView {
   readonly id: string;
   readonly blobId: string;
+  readonly sourceSessionId?: string;
+  readonly sourceRevealAvailable: boolean;
   readonly title: string;
   readonly description?: string;
   readonly kind: "file" | "image" | "export" | "tool" | "diff" | "diagnostics";
@@ -4911,6 +4913,7 @@ export interface OperationApi {
   downloadArtifact(blobId: string, fileName: string, context: ArtifactDownloadContext): Promise<ArtifactDownloadOutcome>;
   copyArtifactFile(blobId: string, fileName: string, byteSize: number, context: ArtifactDownloadContext): Promise<import("./native-file-actions.js").NativeFileCopyOutcome>;
   openArtifactFile(blobId: string, fileName: string, byteSize: number, context: ArtifactDownloadContext): Promise<import("./native-file-actions.js").NativeFileOpenOutcome>;
+  revealArtifactSource(sessionId: string, artifactId: string, context: ArtifactDownloadContext): Promise<import("./native-file-actions.js").NativeArtifactSourceRevealOutcome>;
 }
 
 export function emptySnapshot(): AppSnapshot {

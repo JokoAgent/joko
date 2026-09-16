@@ -260,13 +260,15 @@ describe("ConnectionManager", () => {
     const instanceId = "4e56f4d8-c6ee-4a17-9a89-56e059b7e592";
     const nextInstanceId = "10f42a3c-9fa4-4941-a419-6fa47a128597";
     const deviceId = "d6a365ef-ef33-4fb7-a0f1-a02eb57fef75";
+    const desktopHostAuthKey = "h".repeat(43);
 
     const issued = manager.issueTrustedDesktopConnection({
       desktopInstanceId: instanceId,
       desktopDeviceId: deviceId,
       deviceName: "Joko Desktop",
       platform: "win32",
-      appVersion: "0.1.0"
+      appVersion: "0.1.0",
+      desktopHostAuthKey
     });
 
     expect(issued.connection.id).toBe(`desktop-connection_${instanceId}`);
@@ -278,7 +280,13 @@ describe("ConnectionManager", () => {
       appVersion: "0.1.0"
     });
     expect(store.listPairings()).toEqual([]);
+    expect(() => manager.authenticateDesktopHost(issued.connection, `Bearer ${desktopHostAuthKey}`))
+      .toThrowError(ConnectionAuthenticationError);
     expect(manager.confirmTrustedDesktopConnection(issued.connection.id, issued.authKey).id).toBe(issued.connection.id);
+    expect(manager.authenticateDesktopHost(issued.connection, `Bearer ${desktopHostAuthKey}`).id)
+      .toBe(issued.connection.id);
+    expect(() => manager.authenticateDesktopHost(issued.connection, `Bearer ${"x".repeat(43)}`))
+      .toThrowError(ConnectionAuthenticationError);
     expect(store.listConnections().every((connection) => connection.authKeyDigest !== issued.authKey)).toBe(true);
 
     expect(() => manager.issueTrustedDesktopConnection({
@@ -302,7 +310,8 @@ describe("ConnectionManager", () => {
       platform: "win32",
       appVersion: "0.1.0",
       previousConnectionId: issued.connection.id,
-      previousAuthKey: issued.authKey
+      previousAuthKey: issued.authKey,
+      desktopHostAuthKey: "j".repeat(43)
     })).toThrow(/injected create failure/u);
     createFailure.mockRestore();
     expect(manager.authenticate(`Bearer ${issued.authKey}`).id).toBe(issued.connection.id);
@@ -314,13 +323,18 @@ describe("ConnectionManager", () => {
       platform: "win32",
       appVersion: "0.1.0",
       previousConnectionId: issued.connection.id,
-      previousAuthKey: issued.authKey
+      previousAuthKey: issued.authKey,
+      desktopHostAuthKey: "j".repeat(43)
     });
     expect(store.getDevice(deviceId).state).toBe("active");
     expect(store.listDeviceConnections(deviceId)).toHaveLength(2);
     expect(() => manager.authenticate(`Bearer ${issued.authKey}`)).toThrowError(ConnectionAuthenticationError);
+    expect(() => manager.authenticateDesktopHost(issued.connection, `Bearer ${desktopHostAuthKey}`))
+      .toThrowError(ConnectionAuthenticationError);
     expect(manager.authenticate(`Bearer ${replacement.authKey}`).id).toBe(replacement.connection.id);
     expect(manager.confirmTrustedDesktopConnection(replacement.connection.id, replacement.authKey).id)
+      .toBe(replacement.connection.id);
+    expect(manager.authenticateDesktopHost(replacement.connection, `Bearer ${"j".repeat(43)}`).id)
       .toBe(replacement.connection.id);
     expect(() => manager.issueTrustedDesktopConnection({
       desktopInstanceId: nextInstanceId,

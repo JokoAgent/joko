@@ -4,7 +4,7 @@ import { collectTimelineGalleryImages, moveTimelineGalleryIndex, resolveImageLig
 
 describe("timeline image gallery", () => {
   it("collects image artifacts and attachments in source order without deduplicating blobs", () => {
-    const repeated = image("shared", "shared.png");
+    const repeated = { ...image("shared", "shared.png"), sourceSessionId: "source-task", sourceRevealAvailable: true };
     const items: TimelineItemView[] = [
       timelineItem("user", "user", { attachments: [repeated, file("notes"), image("second", "second.png")] }),
       timelineItem("image-row", "image", { artifact: { ...repeated, id: "rendered" } }),
@@ -16,6 +16,12 @@ describe("timeline image gallery", () => {
       ["attachment:user:second:2", "blob-second"],
       ["artifact:image-row:rendered", "blob-shared"],
       ["attachment:tool:tool-copy:0", "blob-shared"]
+    ]);
+    expect(collectTimelineGalleryImages(items).map(({ artifactId, sourceSessionId, sourceRevealAvailable }) => ({ artifactId, sourceSessionId, sourceRevealAvailable }))).toEqual([
+      { artifactId: "shared", sourceSessionId: "source-task", sourceRevealAvailable: true },
+      { artifactId: "second", sourceSessionId: undefined, sourceRevealAvailable: false },
+      { artifactId: "rendered", sourceSessionId: "source-task", sourceRevealAvailable: true },
+      { artifactId: "tool-copy", sourceSessionId: "source-task", sourceRevealAvailable: true }
     ]);
   });
 
@@ -43,9 +49,9 @@ function timelineItem(id: string, kind: TimelineItemView["kind"], fields: Pick<T
 }
 
 function image(id: string, fileName: string): ArtifactView {
-  return { id, blobId: `blob-${id}`, title: id, kind: "image", fileName, mediaType: "image/png", byteSize: 42 };
+  return { id, blobId: `blob-${id}`, sourceRevealAvailable: false, title: id, kind: "image", fileName, mediaType: "image/png", byteSize: 42 };
 }
 
 function file(id: string): ArtifactView {
-  return { id, blobId: `blob-${id}`, title: id, kind: "file", fileName: `${id}.txt`, mediaType: "text/plain", byteSize: 12 };
+  return { id, blobId: `blob-${id}`, sourceRevealAvailable: false, title: id, kind: "file", fileName: `${id}.txt`, mediaType: "text/plain", byteSize: 12 };
 }

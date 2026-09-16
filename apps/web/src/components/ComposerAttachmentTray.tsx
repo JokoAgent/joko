@@ -59,6 +59,7 @@ function ComposerAttachmentItem({ ownerKey, attachment, removeDisabled, t, onRem
   const textArtifact = useMemo<ArtifactView>(() => ({
     id: attachment.id,
     blobId: attachment.id,
+    sourceRevealAvailable: false,
     title: attachment.file.name,
     kind: "file",
     fileName: attachment.file.name,

@@ -1648,6 +1648,7 @@ export function VisualHarness(): JSX.Element {
         return VISUAL_ARTIFACT_OUTPUTS.map((output) => ({
           id: output.id,
           blobId: output.id,
+          sourceRevealAvailable: false,
           kind: "file",
           title: "report.txt",
           fileName: "report.txt",
@@ -1663,6 +1664,7 @@ export function VisualHarness(): JSX.Element {
         return VISUAL_ARTIFACT_OUTPUTS.map((output) => ({
           id: output.id,
           blobId: output.id,
+          sourceRevealAvailable: false,
           kind: "file" as const,
           title: "report.txt",
           fileName: "report.txt",
@@ -1682,6 +1684,7 @@ export function VisualHarness(): JSX.Element {
         return {
           id: output.id,
           blobId: output.id,
+          sourceRevealAvailable: false,
           kind: "file",
           title: "report.txt",
           fileName: "report.txt",
@@ -2728,7 +2731,7 @@ function visualAudioBytes(): Uint8Array {
 
 function visualAudioArtifact(): ArtifactView {
   return {
-    id: "audio-preview", blobId: "visual-blob:assets/tone.wav", kind: "file", title: "Gentle tone",
+    id: "audio-preview", blobId: "visual-blob:assets/tone.wav", sourceRevealAvailable: false, kind: "file", title: "Gentle tone",
     description: "An original eight-second tone for checking playback, seeking, and media ownership.",
     fileName: "tone.wav", mediaType: "audio/wav", byteSize: 44 + 22_050 * 8 * 2,
     audioMetadata: {
@@ -3213,7 +3216,7 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
     ].join("\n") : "The deterministic harness renders the real Joko components.\n\n- Keyboard behavior\n- Responsive geometry\n- Question wizard", streaming: parameters.running },
     ...(parameters.scenario === "files" ? [{
       id: "model-preview", sequence: 3n, kind: "artifact" as const, createdAt: FIXED_NOW - 1_000,
-      artifact: { id: "model-preview", blobId: "visual-blob:assets/pyramid.glb", kind: "file" as const, title: "Pyramid model", fileName: "pyramid.glb", mediaType: "model/gltf-binary", byteSize: visualModelBytes().byteLength }
+      artifact: { id: "model-preview", blobId: "visual-blob:assets/pyramid.glb", sourceRevealAvailable: false, kind: "file" as const, title: "Pyramid model", fileName: "pyramid.glb", mediaType: "model/gltf-binary", byteSize: visualModelBytes().byteLength }
     }, {
       id: "audio-preview", sequence: 4n, kind: "artifact" as const, createdAt: FIXED_NOW - 500,
       artifact: visualAudioArtifact()
@@ -3328,7 +3331,7 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
     ...(timelineBySession.get("session-1") ?? []),
     ...VISUAL_ARTIFACT_OUTPUTS.map((output, index) => ({
       id: `output-${output.id}`, sequence: BigInt(90 + index), kind: "artifact" as const, createdAt: FIXED_NOW - 1_000 + index,
-      artifact: { id: output.id, blobId: output.id, kind: "file" as const, title: "report.txt", fileName: "report.txt",
+      artifact: { id: output.id, blobId: output.id, sourceRevealAvailable: false, kind: "file" as const, title: "report.txt", fileName: "report.txt",
         description: output.description, mediaType: "text/plain", byteSize: utf8Length(output.text) }
     }))
   ]);

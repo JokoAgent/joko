@@ -84,6 +84,7 @@ import { TimelineTextAttachmentLightbox } from "./TimelineTextAttachmentLightbox
 import { timelineArtifactSupportsTextPreview } from "./timeline-text-attachment.js";
 import { TimelineArtifactMedia, timelineArtifactMediaKind } from "./TimelineArtifactMedia.js";
 import { TimelineArtifactModel, timelineArtifactModelKind } from "./TimelineArtifactModel.js";
+import { NativeFileActionsContext, NativeFileActionsMenu } from "./NativeFileCopyMenu.js";
 import { useTimelineArtifactUrlCache } from "./timeline-artifact-url-cache.js";
 import { AudioArtworkContext } from "./AudioArtwork.js";
 import { timelineErrorCopy } from "../timeline-error-copy.js";
@@ -1351,7 +1352,16 @@ function TimelineArtifactReferencePreview({ artifact, trigger, ownerKey, t, onAr
       copyFailed: t("timeline.blockCopyFailed"), download: t("workspace.downloadFile"), close: t("common.close") }}
   />;
   if (artifact.kind === "image") return <TimelineImageLightbox
-    images={[{ id: artifact.id, blobId: artifact.blobId, title: artifact.title, fileName: artifact.fileName, byteSize: artifact.byteSize }]}
+    images={[{
+      id: artifact.id,
+      artifactId: artifact.id,
+      blobId: artifact.blobId,
+      ...(artifact.sourceSessionId === undefined ? {} : { sourceSessionId: artifact.sourceSessionId }),
+      sourceRevealAvailable: artifact.sourceRevealAvailable,
+      title: artifact.title,
+      fileName: artifact.fileName,
+      byteSize: artifact.byteSize
+    }]}
     startImageId={artifact.id} returnFocus={trigger} t={t} loadUrl={onArtifactUrl} onDownload={onArtifactDownload} onClose={onClose}
   />;
   return <Modal open title={artifact.title || artifact.fileName} description={artifact.description} showClose closeLabel={t("common.close")}
@@ -1553,6 +1563,7 @@ export function ArtifactBlock({ item, icon, locale, t, onArtifactUrl, onArtifact
 
 function TimelineImageLightbox({ images, startImageId, returnFocus, t, loadUrl, onDownload, onSendToChat, onClose }: { readonly images: readonly TimelineGalleryImage[]; readonly startImageId: string; readonly returnFocus: HTMLElement; readonly t: Translator; readonly loadUrl: (blobId: string) => Promise<string>; readonly onDownload: OperationApi["downloadArtifact"]; readonly onSendToChat?: (file: File) => void | Promise<void>; readonly onClose: () => void }): JSX.Element {
   const { ownerKey } = useContext(TimelinePersonalizationContext);
+  const fileActions = useContext(NativeFileActionsContext);
   const startIndex = Math.max(0, images.findIndex((image) => image.id === startImageId));
   const [index, setIndex] = useState(startIndex);
   const current = images[index] ?? images[0];
@@ -1590,6 +1601,17 @@ function TimelineImageLightbox({ images, startImageId, returnFocus, t, loadUrl, 
     gallery={{ index, total: images.length, onPrevious: showPrevious, onNext: showNext }}
     showZoomControls
     returnFocus={returnFocus}
+    toolbarActions={<NativeFileActionsMenu
+      actions={fileActions}
+      artifactId={current.artifactId}
+      blobId={current.blobId}
+      name={current.fileName}
+      byteSize={current.byteSize}
+      {...(current.sourceSessionId === undefined ? {} : { sourceSessionId: current.sourceSessionId })}
+      sourceRevealAvailable={current.sourceRevealAvailable}
+      ownerKey={JSON.stringify([ownerKey, current.id, current.blobId, "native-file"])}
+      t={t}
+    />}
     onClose={onClose}
     onDownload={(context) => onDownload(current.blobId, current.fileName, context)}
     onImageError={markImageFailed}

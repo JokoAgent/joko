@@ -18,7 +18,7 @@ function item(id: string, kind: TimelineItemView["kind"], text = "", attachments
 
 describe("message navigation rail model", () => {
   it("derives real user turns, attachment fallbacks, and the first assistant excerpt", () => {
-    const attachment = { id: "a", blobId: "b", title: "capture", kind: "image" as const, fileName: "capture.png", mediaType: "image/png", byteSize: 4 };
+    const attachment = { id: "a", blobId: "b", sourceRevealAvailable: false, title: "capture", kind: "image" as const, fileName: "capture.png", mediaType: "image/png", byteSize: 4 };
     expect(deriveMessageNavEntries([
       { ...item("u1", "user", "> quoted\n\nFix the parser"), inputDelivery: "prompt" },
       item("a2", "assistant", "## Done\n**Parser** is fixed."),

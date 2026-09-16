@@ -86,7 +86,7 @@ describe("inline composer mention syntax", () => {
 describe("composer mention catalog and ranking", () => {
   it("keeps canonical artifacts with equal names distinct by opaque identity", () => {
     const artifacts = ["first", "second"].map((id) => ({
-      id, sourceSessionId: "task-one", blobId: `bytes-${id}`, title: "Report", kind: "file" as const, fileName: "report.txt", mediaType: "text/plain", byteSize: 4
+      id, sourceSessionId: "task-one", sourceRevealAvailable: false, blobId: `bytes-${id}`, title: "Report", kind: "file" as const, fileName: "report.txt", mediaType: "text/plain", byteSize: 4
     }));
     const items = composerMentionCatalog([], undefined, [], [], [...artifacts, artifacts[0]!]);
     expect(items.map((item) => item.mention?.reference)).toEqual(["first", "second"]);
@@ -99,6 +99,7 @@ describe("composer mention catalog and ranking", () => {
     const artifacts = sourceSessions.map((source) => ({
       id: "shared-artifact-id",
       sourceSessionId: source.id,
+      sourceRevealAvailable: false,
       blobId: `bytes-${source.id}`,
       title: "Report",
       kind: "file" as const,

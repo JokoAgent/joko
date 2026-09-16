@@ -27,6 +27,7 @@ const labels = {
 const artifact: ArtifactView = {
   id: "artifact-1",
   blobId: "blob-1",
+  sourceRevealAvailable: false,
   title: "Notes",
   kind: "file",
   fileName: "notes.md",

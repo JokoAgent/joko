@@ -186,7 +186,7 @@ async function close(): Promise<void> {
 }
 
 function artifact(blobId: string, fileName: string, mediaType: string): ArtifactView {
-  return { id: blobId, blobId, title: fileName, fileName, mediaType, byteSize: 100, kind: "file" };
+  return { id: blobId, blobId, sourceRevealAvailable: false, title: fileName, fileName, mediaType, byteSize: 100, kind: "file" };
 }
 
 function item(artifact: ArtifactView): TimelineItemView {

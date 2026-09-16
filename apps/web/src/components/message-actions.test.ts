@@ -23,12 +23,12 @@ describe("message action capability inputs", () => {
     expect(resolveMessageForkTarget(message("user", {
       nativeParentEntryId: "parent-entry",
       text: "Question",
-      attachments: [{ id: "file", blobId: "blob", title: "file", kind: "file", fileName: "file.txt", mediaType: "text/plain", byteSize: 1 }]
+      attachments: [{ id: "file", blobId: "blob", sourceRevealAvailable: false, title: "file", kind: "file", fileName: "file.txt", mediaType: "text/plain", byteSize: 1 }]
     }))).toEqual({ entryId: "parent-entry", composerText: "Question" });
     expect(resolveMessageForkTarget(message("user", {
       nativeParentEntryId: "parent-entry",
       text: "",
-      attachments: [{ id: "file", blobId: "blob", title: "file", kind: "file", fileName: "file.txt", mediaType: "text/plain", byteSize: 1 }]
+      attachments: [{ id: "file", blobId: "blob", sourceRevealAvailable: false, title: "file", kind: "file", fileName: "file.txt", mediaType: "text/plain", byteSize: 1 }]
     }))).toEqual({ entryId: "parent-entry" });
   });
 

@@ -205,6 +205,7 @@ function artifact(id: string): ArtifactView {
   return {
     id,
     blobId: `blob-${id}`,
+    sourceRevealAvailable: false,
     title: id,
     kind: "file",
     fileName: `${id}.txt`,

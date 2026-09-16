@@ -26,8 +26,8 @@ describe("message rewind boundaries", () => {
     expect(last?.id).toBe("user-2");
     expect(canEditVisibleUserMessage(last)).toBe(true);
     expect(messageDialogueRewindTarget(last!)).toEqual({ kind: "native_entry", entryId: "parent-2" });
-    expect(canEditVisibleUserMessage({ ...last!, attachments: [{ id: "a", blobId: "b", title: "x", kind: "file", fileName: "x", mediaType: "text/plain", byteSize: 1 }] })).toBe(true);
-    expect(canEditVisibleUserMessage({ ...last!, text: "", attachments: [{ id: "a", blobId: "b", title: "x", kind: "file", fileName: "x", mediaType: "text/plain", byteSize: 1 }] })).toBe(false);
+    expect(canEditVisibleUserMessage({ ...last!, attachments: [{ id: "a", blobId: "b", sourceRevealAvailable: false, title: "x", kind: "file", fileName: "x", mediaType: "text/plain", byteSize: 1 }] })).toBe(true);
+    expect(canEditVisibleUserMessage({ ...last!, text: "", attachments: [{ id: "a", blobId: "b", sourceRevealAvailable: false, title: "x", kind: "file", fileName: "x", mediaType: "text/plain", byteSize: 1 }] })).toBe(false);
   });
 
   it("maps the following round to its captured change set without crossing the next user", () => {

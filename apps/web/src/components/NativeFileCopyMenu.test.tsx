@@ -18,7 +18,7 @@ it("keeps pending synchronous, presents errors for explicit retry, and fences so
   capability("files.copy"); const first = deferred(); const second = deferred();
   const copy = vi.fn<OperationApi["copyArtifactFile"]>().mockImplementationOnce(() => first.promise).mockImplementationOnce(() => second.promise).mockResolvedValue({ status: "copied" });
   const node = document.createElement("div"); document.body.append(node); root = createRoot(node);
-  const render = async (ownerKey: string, action = copy) => act(async () => root!.render(<NativeFileActionsMenu actions={{ copyFile: action }} blobId="blob" name="video.mp4" byteSize={2} ownerKey={ownerKey} t={t} />));
+  const render = async (ownerKey: string, action = copy) => act(async () => root!.render(<NativeFileActionsMenu actions={{ copyFile: action }} artifactId="artifact" blobId="blob" name="video.mp4" byteSize={2} sourceRevealAvailable={false} ownerKey={ownerKey} t={t} />));
   const button = () => node.querySelector<HTMLButtonElement>('[role="menuitem"]')!;
   await render("a");
   await act(async () => { button().click(); button().click(); });
@@ -46,7 +46,7 @@ it("exposes the same authorized video action in the player and after decode fail
   capability("files.copy"); vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => undefined); vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => undefined); vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
   const copy = vi.fn<OperationApi["copyArtifactFile"]>().mockResolvedValue({ status: "unknown" });
   const node = document.createElement("div"); document.body.append(node); root = createRoot(node);
-  await act(async () => root!.render(<NativeFileActionsContext.Provider value={{ copyFile: copy }}><TimelineArtifactMedia artifact={{ id: "clip", blobId: "clip-blob", title: "Clip", kind: "file", fileName: "clip.mp4", mediaType: "video/mp4", byteSize: 2 }} playbackOwnerKey="profile:task" loadUrl={async () => "blob:clip"} t={t} /></NativeFileActionsContext.Provider>));
+  await act(async () => root!.render(<NativeFileActionsContext.Provider value={{ copyFile: copy }}><TimelineArtifactMedia artifact={{ id: "clip", blobId: "clip-blob", sourceRevealAvailable: false, title: "Clip", kind: "file", fileName: "clip.mp4", mediaType: "video/mp4", byteSize: 2 }} playbackOwnerKey="profile:task" loadUrl={async () => "blob:clip"} t={t} /></NativeFileActionsContext.Provider>));
   await act(async () => node.querySelector<HTMLButtonElement>(".video-preview__open")!.click());
   const dialog = document.querySelector<HTMLElement>('[role="dialog"]')!;
   const menu = dialog.querySelector<HTMLDetailsElement>("details")!;
@@ -67,7 +67,7 @@ it("opens the exact video artifact through the same mounted menu and keeps unkno
   vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
   const open = vi.fn<OperationApi["openArtifactFile"]>().mockResolvedValueOnce({ status: "unknown" }).mockResolvedValue({ status: "opened" });
   const node = document.createElement("div"); document.body.append(node); root = createRoot(node);
-  await act(async () => root!.render(<NativeFileActionsContext.Provider value={{ openFile: open }}><TimelineArtifactMedia artifact={{ id: "clip", blobId: "clip-blob", title: "Clip", kind: "file", fileName: "clip.mp4", mediaType: "video/mp4", byteSize: 2 }} playbackOwnerKey="profile:task" loadUrl={async () => "blob:clip"} t={t} /></NativeFileActionsContext.Provider>));
+  await act(async () => root!.render(<NativeFileActionsContext.Provider value={{ openFile: open }}><TimelineArtifactMedia artifact={{ id: "clip", blobId: "clip-blob", sourceRevealAvailable: false, title: "Clip", kind: "file", fileName: "clip.mp4", mediaType: "video/mp4", byteSize: 2 }} playbackOwnerKey="profile:task" loadUrl={async () => "blob:clip"} t={t} /></NativeFileActionsContext.Provider>));
   await act(async () => node.querySelector<HTMLButtonElement>(".video-preview__open")!.click());
   const dialog = document.querySelector<HTMLElement>('[role="dialog"]')!;
   const action = dialog.querySelector<HTMLButtonElement>('[role="menuitem"]')!;
@@ -80,8 +80,36 @@ it("opens the exact video artifact through the same mounted menu and keeps unkno
   expect(dialog.querySelector('[role="status"]')?.textContent).toBe("media.fileOpened");
 });
 
+it("reveals only an advertised canonical source and keeps the source task identity", async () => {
+  capability("files.revealSource");
+  const reveal = vi.fn<OperationApi["revealArtifactSource"]>()
+    .mockResolvedValueOnce({ status: "unavailable" })
+    .mockResolvedValue({ status: "revealed" });
+  const node = document.createElement("div"); document.body.append(node); root = createRoot(node);
+  await act(async () => root!.render(<NativeFileActionsMenu
+    actions={{ revealSource: reveal }}
+    artifactId="artifact-one"
+    blobId="bytes-one"
+    name="render.png"
+    byteSize={2}
+    sourceSessionId="source-task"
+    sourceRevealAvailable
+    ownerKey="view-one"
+    t={t}
+  />));
+  const action = node.querySelector<HTMLButtonElement>('[role="menuitem"]')!;
+  expect(action.textContent).toBe("media.revealSource");
+  await act(async () => action.click());
+  expect(reveal.mock.calls[0]?.slice(0, 2)).toEqual(["source-task", "artifact-one"]);
+  expect(node.querySelector('[role="alert"]')?.textContent).toBe("media.sourceUnavailable");
+  await act(async () => action.click());
+  expect(node.querySelector('[role="status"]')?.textContent).toBe("media.sourceRevealed");
+  await act(async () => root!.render(<NativeFileActionsMenu actions={{ revealSource: reveal }} artifactId="artifact-one" blobId="bytes-one" name="render.png" byteSize={2} sourceSessionId="source-task" sourceRevealAvailable={false} ownerKey="view-one" t={t} />));
+  expect(node.querySelector("button")).toBeNull();
+});
+
 it("omits the action when the host does not advertise file clipboard support", async () => {
   const node = document.createElement("div"); document.body.append(node); root = createRoot(node);
-  await act(async () => root!.render(<NativeFileActionsMenu actions={{ copyFile: vi.fn() }} blobId="blob" name="clip.mp4" byteSize={2} ownerKey="task" t={t} />));
+  await act(async () => root!.render(<NativeFileActionsMenu actions={{ copyFile: vi.fn() }} artifactId="artifact" blobId="blob" name="clip.mp4" byteSize={2} sourceRevealAvailable={false} ownerKey="task" t={t} />));
   expect(node.querySelector("button")).toBeNull();
 });

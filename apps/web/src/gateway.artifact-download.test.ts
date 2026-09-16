@@ -76,6 +76,33 @@ describe("artifact download ownership", () => {
     expect(fetchBlob).not.toHaveBeenCalled();
     gateway.disconnect();
   });
+  it("reveals an opaque Artifact identity through the captured native host without retrieving bytes or accepting a path", async () => {
+    const result = deferred<JokoDesktopRevealArtifactSourceResult>();
+    const revealArtifactSource = vi.fn<NonNullable<Window["jokoDesktop"]>["revealArtifactSource"]>(() => result.promise);
+    const original = { capabilities: ["files.revealSource"], revealArtifactSource, cancelArtifactSourceReveal: vi.fn(async () => undefined) };
+    const replacement = { ...original, revealArtifactSource: vi.fn() };
+    vi.stubGlobal("window", { jokoDesktop: original });
+    const fetchBlob = vi.fn(); vi.stubGlobal("fetch", fetchBlob);
+    const gateway = await connected();
+    const owner = downloadDocument();
+    Object.assign(owner.document.defaultView!, { document: owner.document, crypto: globalThis.crypto });
+    const pending = gateway.revealArtifactSource("source-task", "artifact-one", { ownerDocument: owner.document, signal: new AbortController().signal });
+    await vi.waitFor(() => expect(revealArtifactSource).toHaveBeenCalledOnce());
+    vi.stubGlobal("window", { jokoDesktop: replacement });
+    result.resolve({ status: "revealed" });
+    await expect(pending).resolves.toEqual({ status: "revealed" });
+    expect(revealArtifactSource.mock.calls[0]?.[0]).toEqual({
+      requestId: expect.any(String),
+      profileId: "owner",
+      serverId: "server",
+      sessionId: "source-task",
+      artifactId: "artifact-one"
+    });
+    expect(revealArtifactSource.mock.calls[0]?.[0]).not.toHaveProperty("path");
+    expect(replacement.revealArtifactSource).not.toHaveBeenCalled();
+    expect(fetchBlob).not.toHaveBeenCalled();
+    gateway.disconnect();
+  });
   it("uses the triggering window for browser dispatch and releases its URL exactly once", async () => {
     vi.useFakeTimers();
     const owner = downloadDocument();
