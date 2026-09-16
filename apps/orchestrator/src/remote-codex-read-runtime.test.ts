@@ -13,7 +13,7 @@ import type { RemoteHostRecord, StoredTarget } from "@joko/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RemoteCodexRuntimeResolver } from "./remote-codex-read-runtime.js";
 import type { RemoteHostRegistry } from "./remote-host-registry.js";
-import type { RemoteCodexMcpBridgeManager } from "./remote-codex-mcp-bridge.js";
+import type { CodexMcpBridgeManager } from "./remote-codex-mcp-bridge.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 
@@ -145,7 +145,7 @@ interface FixtureOptions {
   readonly probeVersion?: string;
   readonly stderr?: string;
   readonly disconnectOnMethod?: string;
-  readonly mcpBridge?: Pick<RemoteCodexMcpBridgeManager, "open" | "shutdown">;
+  readonly mcpBridge?: Pick<CodexMcpBridgeManager, "open" | "shutdown">;
 }
 
 function createFixture(options: FixtureOptions) {

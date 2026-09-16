@@ -3,14 +3,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import type { CodexRemoteMcpOpenInput } from "@joko/adapter-codex";
+import { AppServerHost, CodexBackendAdapter } from "@joko/adapter-codex";
+import { FakeCodexAppServer } from "@joko/adapter-codex/testing";
+import type { CodexMcpOpenInput } from "@joko/adapter-codex";
+import type { AdapterContext, NativeSessionBinding } from "@joko/core";
 import type { RemoteForwardingTransportPort } from "@joko/remote-ssh";
 import { OperationalStore } from "@joko/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CredentialManager } from "./credential-manager.js";
 import { CredentialVault } from "./credential-vault.js";
 import { McpRouter, type BridgeToolCallContext, type BridgeToolProvider } from "./mcp-router.js";
-import { RemoteCodexMcpBridgeManager } from "./remote-codex-mcp-bridge.js";
+import { CodexMcpBridgeManager } from "./remote-codex-mcp-bridge.js";
 import { mkdtemp } from "./test-paths.js";
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -19,7 +22,143 @@ afterEach(async () => {
   await Promise.allSettled(cleanups.splice(0).map((cleanup) => cleanup()));
 });
 
-describe("RemoteCodexMcpBridgeManager", () => {
+describe("CodexMcpBridgeManager", () => {
+  it("connects a durable local Codex Session through its native config to the standard Router facade", async () => {
+    const fixture = await createFixture();
+    const calls: BridgeToolCallContext[] = [];
+    fixture.router.registerBridgeToolProvider(provider(calls));
+    const fake = new FakeCodexAppServer();
+    const nativeHost = new AppServerHost({ transportFactory: () => fake.createTransport() });
+    const target = {
+      id: "target-local-product", backendId: "codex", displayName: "Product local",
+      workspaceRoot: fixture.root, managed: false, trusted: true
+    } as const;
+    fixture.store.upsertTarget(target);
+    let routeUrl: string | undefined;
+    const adapter = new CodexBackendAdapter({
+      id: "codex", instanceGeneration: 1, host: nativeHost, profileDirectory: fixture.root,
+      localMcpBridge: async (input) => {
+        expect(fixture.store.getSession(input.sessionId).descriptor.binding).toMatchObject({ generation: input.generation });
+        const lease = await fixture.manager.openLocal(input);
+        routeUrl = lease.routes[0]?.url;
+        return lease;
+      }
+    });
+    cleanups.push(async () => {
+      await adapter.dispose();
+      await nativeHost.shutdown();
+    });
+    const context = (binding?: NativeSessionBinding, operationId?: string): AdapterContext => ({
+      sessionId: "session-local-product", generation: 1, backendInstanceGeneration: 1,
+      target, ...(binding === undefined ? {} : { binding }),
+      ...(operationId === undefined ? {} : { operationId }),
+      signal: new AbortController().signal,
+      emit: async () => undefined,
+      requestInteraction: async () => ({ kind: "cancelled" }),
+      artifactCapacityBytes: 1_048_576,
+      storeArtifact: async () => ({ id: "artifact", sha256: "0".repeat(64), byteLength: 0, mimeType: "application/octet-stream" })
+    });
+    fake.reviewConfig = { mcp_servers: { docs: { command: "private-docs-command" } } };
+    fake.reviewMcpStatuses.push({ name: "docs", authStatus: "unsupported", resourceTemplates: [], resources: [], tools: {} });
+    const binding = await adapter.createSession({
+      target, providerId: "openai", modelId: "gpt-test", fastMode: false, permissionMode: "ask"
+    }, context());
+    expect(routeUrl).toBeUndefined();
+    expect(fake.transport!.requests.find((request) => request.method === "thread/start")?.params)
+      .toMatchObject({ config: { "mcp_servers.docs.enabled": false, "features.apps": false } });
+    fixture.store.createSession({
+      id: "session-local-product", backendId: "codex", targetId: target.id, title: "Local product",
+      binding, pinned: false, archived: false, permissionMode: "ask", planMode: false, fastMode: false,
+      createdAt: 3, updatedAt: 3
+    });
+    await adapter.send({ text: "Call the tool", images: [], files: [], mentions: [], disposition: "prompt" },
+      context(binding, "local-product-first-turn"));
+    expect(routeUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+\//u);
+    expect(fake.transport!.requests.findLast((request) => request.method === "thread/resume")?.params)
+      .toMatchObject({ threadId: binding.nativeSessionId, config: expect.objectContaining({
+        "mcp_servers.docs.enabled": false,
+        "features.apps": false
+      }) });
+    expect(JSON.stringify(fake.transport!.requests.findLast((request) => request.method === "thread/resume")?.params))
+      .toContain(routeUrl!);
+    const client = new Client({ name: "local-product-fixture", version: "1.0.0" }, { capabilities: {} });
+    cleanups.push(async () => client.close());
+    await client.connect(new StreamableHTTPClientTransport(new URL(routeUrl!)));
+    expect((await client.listTools()).tools).toMatchObject([{ name: "echo", outputSchema: { type: "object" } }]);
+    expect(await client.callTool({
+      name: "echo", arguments: { value: "product result" }, _meta: { threadId: binding.nativeSessionId! }
+    })).toMatchObject({
+      content: [{ type: "text", text: "product result" }],
+      structuredContent: { echoed: "product result" }, isError: false
+    });
+    expect(calls).toHaveLength(1);
+    await fake.completeTurn(binding.nativeSessionId!);
+    await expect(client.callTool({
+      name: "echo", arguments: { value: "late result" }, _meta: { threadId: binding.nativeSessionId! }
+    })).rejects.toThrow();
+    expect(calls).toHaveLength(1);
+  });
+
+  it("serves the same private standard facade directly on local loopback", async () => {
+    const fixture = await createFixture();
+    const calls: BridgeToolCallContext[] = [];
+    fixture.router.registerBridgeToolProvider(provider(calls));
+    let active = true;
+    const bridge = await fixture.manager.openLocal({
+      sessionId: "session-local",
+      targetId: "target-local",
+      generation: 1,
+      threadId: "native-local-root",
+      assertSessionCurrent: () => { if (!active) throw new Error("Local Session changed"); },
+      beginToolCall: (threadId) => {
+        if (!active || threadId !== "native-local-root") throw new Error("Local native turn is inactive");
+        return {
+          signal: new AbortController().signal,
+          assertCurrent: () => { if (!active) throw new Error("Local native turn changed"); },
+          release: () => undefined
+        };
+      }
+    });
+    expect(bridge.routes).toHaveLength(1);
+    expect(bridge.routes[0]!.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/[A-Za-z0-9_-]+\/fixture-tools$/u);
+
+    const client = new Client({ name: "local-codex-fixture", version: "1.0.0" }, { capabilities: {} });
+    cleanups.push(async () => client.close());
+    await client.connect(new StreamableHTTPClientTransport(new URL(bridge.routes[0]!.url)));
+    expect(await client.callTool({
+      name: "echo",
+      arguments: { value: "local result" },
+      _meta: { threadId: "native-local-root" }
+    })).toMatchObject({
+      content: [{ type: "text", text: "local result" }],
+      structuredContent: { echoed: "local result" },
+      isError: false
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ sessionId: "session-local", targetId: "target-local", generation: 1 });
+
+    active = false;
+    expect(() => bridge.assertCurrent()).toThrow();
+    await expect(client.listTools()).rejects.toThrow();
+    await bridge.release();
+  });
+
+  it("does not open a local listener when a Session has no authorized tools", async () => {
+    const fixture = await createFixture();
+    const bridge = await fixture.manager.openLocal({
+      sessionId: "session-local",
+      targetId: "target-local",
+      generation: 1,
+      threadId: "native-local-root",
+      assertSessionCurrent: () => undefined,
+      beginToolCall: () => { throw new Error("No tool calls are available"); }
+    });
+    expect(bridge.routes).toEqual([]);
+    expect(() => bridge.assertCurrent()).not.toThrow();
+    await bridge.release();
+    expect(() => bridge.assertCurrent()).toThrow();
+  });
+
   it("keeps remote text usable without SSH forwarding when the frozen tool snapshot is empty", async () => {
     const fixture = await createFixture();
     const assertForwardingCurrent = vi.fn(() => { throw new Error("No forwarding authority should be required."); });
@@ -58,7 +197,7 @@ describe("RemoteCodexMcpBridgeManager", () => {
     let authorityCurrent = true;
     let turnActive = true;
     const activeCalls = new Set<AbortController>();
-    const input: CodexRemoteMcpOpenInput = {
+    const input: CodexMcpOpenInput = {
       sessionId: "session-remote",
       targetId: "target-remote",
       generation: 1,
@@ -276,12 +415,22 @@ async function createFixture(options: { readonly now?: () => number; readonly gr
     managed: false, trusted: true,
     remoteWorkspace: { hostId: "remote-host", workspaceRoot: "/srv/workspace" }
   });
+  store.upsertTarget({
+    id: "target-local", backendId: "codex", displayName: "Local", workspaceRoot: "D:/workspace",
+    managed: false, trusted: true
+  });
   store.createSession({
     id: "session-remote", backendId: "codex", targetId: "target-remote", title: "Remote",
     binding: { opaqueRef: "native-root", generation: 1 },
     remoteWorkspace: { hostId: "remote-host", workspaceRoot: "/srv/workspace" },
     pinned: false, archived: false, permissionMode: "ask", planMode: false, fastMode: false,
     createdAt: 1, updatedAt: 1
+  });
+  store.createSession({
+    id: "session-local", backendId: "codex", targetId: "target-local", title: "Local",
+    binding: { opaqueRef: "native-local-root", generation: 1 },
+    pinned: false, archived: false, permissionMode: "ask", planMode: false, fastMode: false,
+    createdAt: 2, updatedAt: 2
   });
   const router = new McpRouter({
     store,
@@ -290,7 +439,7 @@ async function createFixture(options: { readonly now?: () => number; readonly gr
     ...(options.grantTtlMs === undefined ? {} : { bridgeGrantTtlMs: options.grantTtlMs })
   });
   await router.initialize();
-  const manager = new RemoteCodexMcpBridgeManager({
+  const manager = new CodexMcpBridgeManager({
     router,
     ...(options.grantTtlMs === undefined ? {} : { grantTtlMs: options.grantTtlMs })
   });

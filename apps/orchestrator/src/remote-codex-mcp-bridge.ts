@@ -2,8 +2,8 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import {
-  type CodexRemoteMcpOpenInput,
-  type CodexRemoteMcpRuntimeLease
+  type CodexMcpOpenInput,
+  type CodexMcpRuntimeLease
 } from "@joko/adapter-codex";
 import type { RemoteForwardingTransportPort, RemoteReverseForwardHandle } from "@joko/remote-ssh";
 import { Server as ProtocolServer } from "@modelcontextprotocol/sdk/server/index.js";
@@ -30,7 +30,7 @@ export interface RemoteCodexMcpForwardingAuthority {
   readonly assertForwardingCurrent: () => void;
 }
 
-export interface RemoteCodexMcpBridgeManagerOptions {
+export interface CodexMcpBridgeManagerOptions {
   readonly router: McpRouter;
   readonly includeToolPolicy?: (sessionId: string, targetId: string, policyId: string) => boolean;
   readonly grantTtlMs?: number;
@@ -43,39 +43,51 @@ interface ProtocolSession {
 }
 
 interface ActiveRoute {
-  readonly lease: CodexRemoteMcpRuntimeLease;
+  readonly lease: CodexMcpRuntimeLease;
   release(): Promise<void>;
 }
 
 /**
- * Session-scoped standard MCP facade for a remote Codex app-server. The
- * McpRouter bearer never crosses SSH: the remote process receives only an
- * unguessable route on remote loopback, backed by the exact captured forward.
+ * Session-scoped standard MCP facade for Codex app-server runtimes. The raw
+ * McpRouter bearer stays in this process; Codex receives only an unguessable
+ * loopback route, directly for local runtimes or through the captured reverse
+ * forward for remote runtimes.
  */
-export class RemoteCodexMcpBridgeManager {
+export class CodexMcpBridgeManager {
   readonly #router: McpRouter;
-  readonly #includeToolPolicy: RemoteCodexMcpBridgeManagerOptions["includeToolPolicy"];
+  readonly #includeToolPolicy: CodexMcpBridgeManagerOptions["includeToolPolicy"];
   readonly #grantTtlMs: number;
   readonly #routes = new Set<ActiveRoute>();
   #closed = false;
 
-  constructor(options: RemoteCodexMcpBridgeManagerOptions) {
+  constructor(options: CodexMcpBridgeManagerOptions) {
     this.#router = options.router;
     this.#includeToolPolicy = options.includeToolPolicy;
     this.#grantTtlMs = options.grantTtlMs ?? DEFAULT_GRANT_TTL_MS;
     if (!Number.isSafeInteger(this.#grantTtlMs) || this.#grantTtlMs < MINIMUM_GRANT_TTL_MS) {
-      throw new Error("Remote Codex MCP grant lifetime is invalid.");
+      throw new Error("Codex MCP grant lifetime is invalid.");
     }
   }
 
   async open(
     authority: RemoteCodexMcpForwardingAuthority,
-    input: CodexRemoteMcpOpenInput
-  ): Promise<CodexRemoteMcpRuntimeLease> {
+    input: CodexMcpOpenInput
+  ): Promise<CodexMcpRuntimeLease> {
+    return this.#open(authority, input);
+  }
+
+  async openLocal(input: CodexMcpOpenInput): Promise<CodexMcpRuntimeLease> {
+    return this.#open(undefined, input);
+  }
+
+  async #open(
+    authority: RemoteCodexMcpForwardingAuthority | undefined,
+    input: CodexMcpOpenInput
+  ): Promise<CodexMcpRuntimeLease> {
     this.#assertOpen();
     input.signal?.throwIfAborted();
     input.assertSessionCurrent();
-    authority.assertCurrent();
+    authority?.assertCurrent();
 
     const routeSecret = randomBytes(32).toString("base64url");
     const snapshot = this.#router.createPiBridgeSnapshot({
@@ -92,13 +104,13 @@ export class RemoteCodexMcpBridgeManager {
     if (toolsByServer.size === 0) {
       snapshot.revoke();
       let released = false;
-      const lease: CodexRemoteMcpRuntimeLease = Object.freeze({
+      const lease: CodexMcpRuntimeLease = Object.freeze({
         routes: [],
         assertCurrent: () => {
           this.#assertOpen();
-          if (released) throw new Error("Remote Codex MCP route is retired.");
+          if (released) throw new Error("Codex MCP route is retired.");
           input.assertSessionCurrent();
-          authority.assertCurrent();
+          authority?.assertCurrent();
         },
         release: async () => { released = true; }
       });
@@ -116,11 +128,11 @@ export class RemoteCodexMcpBridgeManager {
 
     const assertCurrent = (): void => {
       this.#assertOpen();
-      if (released || active === undefined || !this.#routes.has(active)) throw new Error("Remote Codex MCP route is retired.");
+      if (released || active === undefined || !this.#routes.has(active)) throw new Error("Codex MCP route is retired.");
       routeAbort.signal.throwIfAborted();
       input.assertSessionCurrent();
-      authority.assertCurrent();
-      authority.assertForwardingCurrent();
+      authority?.assertCurrent();
+      authority?.assertForwardingCurrent();
       snapshot.assertCurrent();
     };
 
@@ -156,23 +168,28 @@ export class RemoteCodexMcpBridgeManager {
       });
       await listenLoopback(http, input.signal);
       const address = http.address() as AddressInfo;
-      authority.assertForwardingCurrent();
-      if (authority.forwarding === undefined) throw new Error("Remote Codex MCP forwarding is unavailable.");
-      forward = await authority.forwarding.listen({
-        localDestinationHost: "127.0.0.1",
-        localDestinationPort: address.port,
-        remoteListenHost: "127.0.0.1",
-        ...(input.signal === undefined ? {} : { signal: input.signal })
-      });
-      authority.assertForwardingCurrent();
+      let routeHost = "127.0.0.1";
+      let routePort = address.port;
+      if (authority !== undefined) {
+        authority.assertForwardingCurrent();
+        if (authority.forwarding === undefined) throw new Error("Remote Codex MCP forwarding is unavailable.");
+        forward = await authority.forwarding.listen({
+          localDestinationHost: "127.0.0.1",
+          localDestinationPort: address.port,
+          remoteListenHost: "127.0.0.1",
+          ...(input.signal === undefined ? {} : { signal: input.signal })
+        });
+        authority.assertForwardingCurrent();
+        routeHost = forward.remoteHost === "::1" ? "[::1]" : forward.remoteHost;
+        routePort = forward.remotePort;
+      }
       input.assertSessionCurrent();
-      const remoteHost = forward.remoteHost === "::1" ? "[::1]" : forward.remoteHost;
       const routes = [...toolsByServer.keys()].sort().map((serverId) => Object.freeze({
         serverId,
         name: codexServerName(input, serverId, routeSecret),
-        url: `http://${remoteHost}:${forward!.remotePort}/${routeSecret}/${encodeURIComponent(serverId)}`
+        url: `http://${routeHost}:${routePort}/${routeSecret}/${encodeURIComponent(serverId)}`
       }));
-      const lease: CodexRemoteMcpRuntimeLease = Object.freeze({
+      const lease: CodexMcpRuntimeLease = Object.freeze({
         routes: Object.freeze(routes),
         assertCurrent,
         release
@@ -207,7 +224,7 @@ export class RemoteCodexMcpBridgeManager {
   async #handleRequest(input: {
     readonly request: IncomingMessage;
     readonly response: ServerResponse;
-    readonly input: CodexRemoteMcpOpenInput;
+    readonly input: CodexMcpOpenInput;
     readonly snapshot: PiMcpBridgeSnapshot;
     readonly pathServers: ReadonlyMap<string, { readonly serverId: string; readonly tools: readonly FrozenTool[] }>;
     readonly sessions: Map<string, ProtocolSession>;
@@ -248,14 +265,14 @@ export class RemoteCodexMcpBridgeManager {
 
   async #createProtocolSession(
     route: { readonly serverId: string; readonly tools: readonly FrozenTool[] },
-    input: CodexRemoteMcpOpenInput,
+    input: CodexMcpOpenInput,
     snapshot: PiMcpBridgeSnapshot,
     routeAbort: AbortSignal,
     assertCurrent: () => void,
     sessions: Map<string, ProtocolSession>
   ): Promise<ProtocolSession> {
     const server = new ProtocolServer(
-      { name: `joko-remote-${route.serverId}`, version: "1.0.0" },
+      { name: `joko-codex-${route.serverId}`, version: "1.0.0" },
       { capabilities: { tools: {} } }
     );
     let session: ProtocolSession;
@@ -284,7 +301,7 @@ export class RemoteCodexMcpBridgeManager {
     });
     server.setRequestHandler(CallToolRequestSchema, async (request, extra): Promise<CallToolResult> => {
       assertCurrent();
-      const threadId = remoteThreadId(request.params._meta);
+      const threadId = codexThreadId(request.params._meta);
       const call = input.beginToolCall(threadId);
       const signal = AbortSignal.any([extra.signal, call.signal, routeAbort]);
       const requestId = bridgeRequestId(extra.sessionId, extra.requestId, threadId);
@@ -320,7 +337,7 @@ export class RemoteCodexMcpBridgeManager {
   }
 
   #assertOpen(): void {
-    if (this.#closed) throw new Error("Remote Codex MCP bridge manager is closed.");
+    if (this.#closed) throw new Error("Codex MCP bridge manager is closed.");
   }
 }
 
@@ -334,7 +351,7 @@ function groupTools(tools: readonly FrozenTool[]): Map<string, readonly FrozenTo
   return new Map([...mutable].map(([serverId, group]) => [serverId, Object.freeze([...group])])) as Map<string, readonly FrozenTool[]>;
 }
 
-function codexServerName(input: CodexRemoteMcpOpenInput, serverId: string, routeSecret: string): string {
+function codexServerName(input: CodexMcpOpenInput, serverId: string, routeSecret: string): string {
   const slug = serverId.replace(/[^A-Za-z0-9_-]/gu, "_").replace(/^_+|_+$/gu, "").slice(0, 24) || "tools";
   const digest = createHash("sha256")
     .update(input.sessionId).update("\0")
@@ -351,11 +368,11 @@ function objectSchema(value: Readonly<Record<string, unknown>>): { readonly type
   return { ...value, type: "object" };
 }
 
-function remoteThreadId(meta: unknown): string {
-  if (meta === null || typeof meta !== "object" || Array.isArray(meta)) throw new Error("Remote Codex MCP call is missing native thread identity.");
+function codexThreadId(meta: unknown): string {
+  if (meta === null || typeof meta !== "object" || Array.isArray(meta)) throw new Error("Codex MCP call is missing native thread identity.");
   const threadId = (meta as Record<string, unknown>)["threadId"];
   if (typeof threadId !== "string" || threadId.length === 0 || threadId.length > 512 || /[\u0000-\u001f\u007f]/u.test(threadId)) {
-    throw new Error("Remote Codex MCP call has invalid native thread identity.");
+    throw new Error("Codex MCP call has invalid native thread identity.");
   }
   return threadId;
 }
@@ -388,7 +405,7 @@ async function listenLoopback(server: HttpServer, signal?: AbortSignal): Promise
   await new Promise<void>((resolve, reject) => {
     const onAbort = () => {
       server.close();
-      reject(signal?.reason ?? new Error("Remote Codex MCP route setup was cancelled."));
+      reject(signal?.reason ?? new Error("Codex MCP route setup was cancelled."));
     };
     const onError = (error: Error) => {
       signal?.removeEventListener("abort", onAbort);
@@ -421,7 +438,7 @@ async function readJsonBody(request: IncomingMessage): Promise<unknown> {
   for await (const chunk of request) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     bytes += buffer.byteLength;
-    if (bytes > MAXIMUM_REQUEST_BYTES) throw new Error("Remote Codex MCP request is too large.");
+    if (bytes > MAXIMUM_REQUEST_BYTES) throw new Error("Codex MCP request is too large.");
     chunks.push(buffer);
   }
   if (bytes === 0) return undefined;

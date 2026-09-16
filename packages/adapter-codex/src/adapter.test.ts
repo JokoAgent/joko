@@ -23,7 +23,7 @@ import {
   CodexBackendAdapter,
   CODEX_MANAGED_PROVIDER_SUPPORT,
   type CodexAdapterOptions,
-  type CodexRemoteMcpOpenInput,
+  type CodexMcpOpenInput,
   type CodexRemoteRuntime
 } from "./adapter.js";
 import type { CodexSmartRoutingPreparation } from "./smart-subagent-routing.js";
@@ -1338,12 +1338,344 @@ describe("CodexBackendAdapter", () => {
           type: "workspaceWrite",
           writableRoots: ["/private/memories"]
         }
-      });
+    });
+  });
+
+  it("isolates local MCP config and binds the frozen route to active native turns", async () => {
+    const opened: CodexMcpOpenInput[] = [];
+    const released = vi.fn(async () => undefined);
+    const setup = await createSetup(7, {
+      localMcpBridge: async (input) => {
+        opened.push(input);
+        let retired = false;
+        return {
+          routes: [{
+            serverId: "tools",
+            name: "joko_local_tools",
+            url: "http://127.0.0.1:4100/private-local"
+          }],
+          assertCurrent: () => {
+            if (retired) throw new Error("local MCP route retired");
+            input.assertSessionCurrent();
+          },
+          release: async () => {
+            if (retired) return;
+            retired = true;
+            await released();
+          }
+        };
+      }
+    });
+    setup.fake.reviewConfig = {
+      mcp_servers: { docs: { command: "docs-server" } },
+      plugins: { "plugin@local": { mcp_servers: { plugin_docs: { url: "https://example.invalid/mcp" } } } }
+    };
+    setup.fake.reviewMcpStatuses.push(
+      { name: "docs", authStatus: "unsupported", resourceTemplates: [], resources: [], tools: {} },
+      { name: "plugin_docs", authStatus: "unsupported", resourceTemplates: [], resources: [], tools: {} },
+      { name: "codex_apps", authStatus: "unsupported", resourceTemplates: [], resources: [], tools: {} }
+    );
+    const threadId = setup.fake.seedThread(setup.target.workspaceRoot);
+    const candidate = (await setup.adapter.listNativeSessions(setup.target))[0]!;
+    const binding = await setup.adapter.resolveNativeSessionReference(candidate.nativeReference, setup.target, 1);
+    const bound = context(setup.target, [], { binding, backendInstanceGeneration: 7 });
+    await setup.adapter.resumeSession(binding, bound);
+
+    const resume = setup.fake.transport!.requests.findLast((request) => request.method === "thread/resume")!;
+    expect(resume.params).toMatchObject({ config: {
+      "features.apps": false,
+      "features.enable_mcp_apps": false,
+      "features.remote_plugin": false,
+      "mcp_servers.docs.enabled": false,
+      "plugins.\"plugin@local\".mcp_servers.plugin_docs.enabled": false,
+      "mcp_servers.joko_local_tools.enabled": true,
+      "mcp_servers.joko_local_tools.url": "http://127.0.0.1:4100/private-local"
+    } });
+    expect(JSON.stringify(resume.params)).not.toContain("docs-server");
+    expect(JSON.stringify(resume.params)).not.toContain("example.invalid");
+
+    await setup.adapter.send(prompt("use a local tool"), context(setup.target, [], {
+      binding,
+      backendInstanceGeneration: 7,
+      operationId: "local-mcp-turn"
+    }));
+    const call = opened[0]!.beginToolCall(threadId);
+    expect(() => call.assertCurrent()).not.toThrow();
+    expect(() => opened[0]!.beginToolCall("foreign-thread")).toThrow();
+    await setup.fake.completeTurn(threadId);
+    expect(call.signal.aborted).toBe(true);
+    call.release();
+
+    await setup.adapter.setPermissionMode("auto", bound);
+    expect(setup.fake.transport!.requests.findLast((request) => request.method === "thread/resume")?.params)
+      .toMatchObject({ config: expect.objectContaining({
+        "mcp_servers.docs.enabled": false,
+        "mcp_servers.joko_local_tools.url": "http://127.0.0.1:4100/private-local"
+      }) });
+    expect(opened).toHaveLength(1);
+    expect(released).not.toHaveBeenCalled();
+  });
+
+  it("creates and forks local standard threads in isolation before the durable Session can authorize tools", async () => {
+    let durable = false;
+    const opened: CodexMcpOpenInput[] = [];
+    const setup = await createSetup(7, {
+      localMcpBridge: async (input) => {
+        if (!durable) throw new Error("MCP was opened before the Session commit");
+        opened.push(input);
+        return {
+          routes: [{ serverId: "tools", name: `joko_${input.sessionId.replace(/-/gu, "_")}_tools`, url: "http://127.0.0.1:4100/private" }],
+          assertCurrent: input.assertSessionCurrent,
+          release: async () => undefined
+        };
+      }
+    });
+    setup.fake.reviewConfig = {
+      mcp_servers: { docs: { command: "private-docs-command" } },
+      plugins: { "plugin@local": { mcp_servers: { plugin_docs: { url: "https://example.invalid/private" } } } }
+    };
+    setup.fake.reviewMcpStatuses.push(
+      { name: "docs", authStatus: "unsupported", resourceTemplates: [], resources: [], tools: {} },
+      { name: "plugin_docs", authStatus: "unsupported", resourceTemplates: [], resources: [], tools: {} },
+      { name: "codex_apps", authStatus: "unsupported", resourceTemplates: [], resources: [], tools: {} }
+    );
+
+    const source = await setup.adapter.createSession(sessionInput(setup.target),
+      context(setup.target, [], { backendInstanceGeneration: 7 }));
+    const start = setup.fake.transport!.requests.find((request) => request.method === "thread/start")!;
+    expect(start.params).toMatchObject({ config: {
+      "features.apps": false,
+      "features.enable_mcp_apps": false,
+      "features.remote_plugin": false,
+      "mcp_servers.docs.enabled": false,
+      "plugins.\"plugin@local\".mcp_servers.plugin_docs.enabled": false
+    } });
+    expect(JSON.stringify(start.params)).not.toContain("private-docs-command");
+    expect(JSON.stringify(start.params)).not.toContain("example.invalid");
+    expect(JSON.stringify(start.params)).not.toContain("joko_session_codex_tools");
+    expect(opened).toHaveLength(0);
+    durable = true;
+
+    await setup.adapter.send(prompt("source turn"), context(setup.target, [], {
+      binding: source, backendInstanceGeneration: 7, operationId: "local-source-turn"
+    }));
+    const sourceResume = setup.fake.transport!.requests.find((request) => request.method === "thread/resume")!;
+    expect(sourceResume.params).toMatchObject({ threadId: source.nativeSessionId, config: {
+      "mcp_servers.docs.enabled": false,
+      "mcp_servers.joko_session_codex_tools.enabled": true,
+      "mcp_servers.joko_session_codex_tools.url": "http://127.0.0.1:4100/private"
+    } });
+    expect(setup.fake.transport!.requests.findIndex((request) => request.method === "turn/start"))
+      .toBeGreaterThan(setup.fake.transport!.requests.findIndex((request) => request.method === "thread/resume"));
+    expect(opened[0]).toMatchObject({ sessionId: "session-codex", targetId: setup.target.id, generation: 1, threadId: source.nativeSessionId });
+    await setup.fake.completeTurn(source.nativeSessionId!);
+
+    const derivedContext = { ...context(setup.target, [], { backendInstanceGeneration: 7 }), sessionId: "derived-session" };
+    const derived = await setup.adapter.createSession({
+      ...sessionInput(setup.target), nativeStart: { kind: "new", parentNativeReference: source.opaqueRef }
+    }, derivedContext);
+    const fork = setup.fake.transport!.requests.find((request) => request.method === "thread/fork")!;
+    expect(fork.params).toMatchObject({ threadId: source.nativeSessionId, config: {
+      "features.apps": false,
+      "mcp_servers.docs.enabled": false,
+      "plugins.\"plugin@local\".mcp_servers.plugin_docs.enabled": false
+    } });
+    expect(JSON.stringify(fork.params)).not.toContain("joko_session_codex_tools");
+    expect(opened).toHaveLength(1);
+
+    await setup.adapter.send(prompt("derived turn"), {
+      ...derivedContext, binding: derived, operationId: "local-derived-turn"
+    });
+    expect(opened[1]).toMatchObject({ sessionId: "derived-session", threadId: derived.nativeSessionId });
+    expect(setup.fake.transport!.requests.findLast((request) => request.method === "thread/resume")?.params)
+      .toMatchObject({ threadId: derived.nativeSessionId, config: {
+        "mcp_servers.joko_derived_session_tools.enabled": true,
+        "mcp_servers.joko_derived_session_tools.url": "http://127.0.0.1:4100/private"
+      } });
+  });
+
+  it("keeps local no-tool sessions isolated without installing a route and fails before native work on MCP uncertainty", async () => {
+    const opened: CodexMcpOpenInput[] = [];
+    let toolsAvailable = false;
+    const setup = await createSetup(7, {
+      localMcpBridge: async (input) => {
+        opened.push(input);
+        return {
+          routes: toolsAvailable
+            ? [{ serverId: "tools", name: "joko_newly_available", url: "http://127.0.0.1:4100/newly-available" }]
+            : [],
+          assertCurrent: input.assertSessionCurrent,
+          release: async () => undefined
+        };
+      }
+    });
+    setup.fake.reviewConfig = { mcp_servers: { docs: { command: "private-command" } } };
+    setup.fake.reviewMcpStatuses.push({ name: "docs", authStatus: "unsupported", resourceTemplates: [], resources: [], tools: {} });
+    const binding = await setup.adapter.createSession(sessionInput(setup.target),
+      context(setup.target, [], { backendInstanceGeneration: 7 }));
+    expect(opened).toHaveLength(0);
+    expect(setup.fake.transport!.requests.find((request) => request.method === "thread/start")?.params)
+      .toMatchObject({ config: { "mcp_servers.docs.enabled": false, "features.apps": false } });
+    await setup.adapter.send(prompt("text-only"), context(setup.target, [], {
+      binding, backendInstanceGeneration: 7, operationId: "local-no-tools"
+    }));
+    expect(opened).toHaveLength(1);
+    const resumeConfig = setup.fake.transport!.requests.findLast((request) => request.method === "thread/resume")!.params as JsonObject;
+    expect(resumeConfig["config"]).toMatchObject({ "mcp_servers.docs.enabled": false, "features.apps": false });
+    expect(JSON.stringify(resumeConfig)).not.toContain("joko_");
+    expect(JSON.stringify(resumeConfig)).not.toContain("private-command");
+    await setup.fake.completeTurn(binding.nativeSessionId!);
+    toolsAvailable = true;
+    await setup.adapter.send(prompt("tool now available"), context(setup.target, [], {
+      binding, backendInstanceGeneration: 7, operationId: "local-new-tool"
+    }));
+    expect(opened).toHaveLength(2);
+    expect(setup.fake.transport!.requests.findLast((request) => request.method === "thread/resume")?.params)
+      .toMatchObject({ config: {
+        "mcp_servers.docs.enabled": false,
+        "mcp_servers.joko_newly_available.enabled": true
+      } });
+
+    const invalid = await createSetup(7, { localMcpBridge: async () => { throw new Error("must not open"); } });
+    invalid.fake.reviewConfig = { mcp_servers: { "invalid\nname": { command: "secret" } } };
+    await expect(invalid.adapter.createSession(sessionInput(invalid.target),
+      context(invalid.target, [], { backendInstanceGeneration: 7 }))).rejects.toMatchObject({
+      publicError: { code: "CODEX_LOCAL_MCP_UNAVAILABLE", stateMayHaveChanged: false }
+    });
+    expect(invalid.fake.transport!.requests.some((request) => request.method === "thread/start")).toBe(false);
+  });
+
+  it("does not dispatch a first local turn after a route bind failure", async () => {
+    const released = vi.fn(async () => undefined);
+    const setup = await createSetup(7, {
+      localMcpBridge: async (input) => ({
+        routes: [{ serverId: "tools", name: "joko_local_tools", url: "http://127.0.0.1:4100/private" }],
+        assertCurrent: input.assertSessionCurrent,
+        release: released
+      })
+    });
+    const binding = await setup.adapter.createSession(sessionInput(setup.target),
+      context(setup.target, [], { backendInstanceGeneration: 7 }));
+    setup.fake.failNextThreadResumeCode = -32001;
+    await expect(setup.adapter.send(prompt("must stay queued"), context(setup.target, [], {
+      binding, backendInstanceGeneration: 7, operationId: "local-bind-failure"
+    }))).rejects.toMatchObject({
+      publicError: { code: "CODEX_LOCAL_MCP_UNAVAILABLE", stateMayHaveChanged: true }
+    });
+    expect(released).toHaveBeenCalledOnce();
+    expect(setup.fake.transport!.requests.some((request) => request.method === "thread/unsubscribe"
+      && (request.params as JsonObject)["threadId"] === binding.nativeSessionId)).toBe(true);
+    expect(setup.fake.transport!.requests.some((request) => request.method === "turn/start")).toBe(false);
+  });
+
+  it("isolates an imported local thread before Session commit and binds its route only on later work", async () => {
+    let durable = false;
+    const opened: CodexMcpOpenInput[] = [];
+    const setup = await createSetup(7, {
+      localMcpBridge: async (input) => {
+        if (!durable) throw new Error("Imported Session is not durable");
+        opened.push(input);
+        return {
+          routes: [{ serverId: "tools", name: "joko_imported_tools", url: "http://127.0.0.1:4100/private" }],
+          assertCurrent: input.assertSessionCurrent,
+          release: async () => undefined
+        };
+      }
+    });
+    setup.fake.reviewConfig = { mcp_servers: { docs: { command: "private-command" } } };
+    setup.fake.reviewMcpStatuses.push({ name: "docs", authStatus: "unsupported", resourceTemplates: [], resources: [], tools: {} });
+    const threadId = setup.fake.seedThread(setup.target.workspaceRoot);
+    const reference = (await setup.adapter.listNativeSessions(setup.target))[0]!.nativeReference;
+    const binding = await setup.adapter.createSession({
+      ...sessionInput(setup.target), nativeStart: { kind: "attach", nativeReference: reference }
+    }, context(setup.target, [], { backendInstanceGeneration: 7 }));
+    expect(binding.nativeSessionId).toBe(threadId);
+    expect(opened).toHaveLength(0);
+    expect(setup.fake.transport!.requests.findLast((request) => request.method === "thread/resume")?.params)
+      .toMatchObject({ threadId, config: { "mcp_servers.docs.enabled": false, "features.apps": false } });
+    const bound = context(setup.target, [], { binding, backendInstanceGeneration: 7 });
+    await expect(setup.adapter.inspectSession(binding, bound)).resolves.toMatchObject({ binding });
+    await expect(setup.adapter.getNativeHistoryProjection(bound)).resolves.toBeDefined();
+    expect(opened).toHaveLength(0);
+    durable = true;
+    await setup.adapter.send(prompt("first imported turn"), { ...bound, operationId: "imported-first" });
+    expect(opened).toHaveLength(1);
+    expect(opened[0]).toMatchObject({ sessionId: "session-codex", threadId });
+    expect(setup.fake.transport!.requests.findLast((request) => request.method === "thread/resume")?.params)
+      .toMatchObject({ config: { "mcp_servers.joko_imported_tools.enabled": true } });
+
+    const active = await createSetup(7, { localMcpBridge: async () => { throw new Error("must not open"); } });
+    const activeId = active.fake.seedThread(active.target.workspaceRoot);
+    active.fake.threads.get(activeId)!.status = { type: "active", activeFlags: [] };
+    const activeReference = (await active.adapter.listNativeSessions(active.target))[0]!.nativeReference;
+    await expect(active.adapter.createSession({
+      ...sessionInput(active.target), nativeStart: { kind: "attach", nativeReference: activeReference }
+    }, context(active.target, [], { backendInstanceGeneration: 7 }))).rejects.toMatchObject({
+      publicError: { code: "CODEX_LOCAL_MCP_UNAVAILABLE", stateMayHaveChanged: false }
+    });
+    expect(active.fake.transport!.requests.some((request) => request.method === "thread/resume")).toBe(false);
+  });
+
+  it("rebinds local MCP isolation when a native model route changes", async () => {
+    const model: ProviderModel = {
+      providerId: "custom", modelId: "custom-model", displayName: "Custom", api: "openai-responses",
+      contextWindow: 0, maxOutputTokens: 0, supportsImages: false, supportsFastMode: false,
+      thinkingLevels: [], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+    };
+    const managedProviders: ManagedProviderRuntimePort = {
+      support: CODEX_MANAGED_PROVIDER_SUPPORT,
+      environment: { JOKO_PROVIDER_PROXY_TOKEN: "private-token" },
+      secretEnvironmentNames: ["JOKO_PROVIDER_PROXY_TOKEN"],
+      dispose: () => undefined, hasProvider: (id) => id === "custom",
+      listModels: () => [model], listProviders: () => [], getThinkingLevelMap: () => ({}),
+      prepare: async (): Promise<ManagedProviderRouteBinding> => ({
+        providerId: "custom", model, protocol: "openai-responses", revision: "one",
+        baseUrl: "http://127.0.0.1:4101/managed", apiKeyEnvironment: "JOKO_PROVIDER_PROXY_TOKEN",
+        thinkingLevelMap: {}, assertCurrent: () => undefined,
+        activate: async () => ({ release: () => undefined }), dispose: () => undefined
+      })
+    };
+    const opened: CodexMcpOpenInput[] = [];
+    const released: number[] = [];
+    const setup = await createSetup(7, {
+      managedProviders,
+      localMcpBridge: async (input) => {
+        const ordinal = opened.push(input);
+        let retired = false;
+        return {
+          routes: [{ serverId: "tools", name: `joko_local_${ordinal}`, url: `http://127.0.0.1:4100/${ordinal}` }],
+          assertCurrent: () => {
+            if (retired) throw new Error("retired");
+            input.assertSessionCurrent();
+          },
+          release: async () => { retired = true; released.push(ordinal); }
+        };
+      }
+    });
+    const binding = await setup.adapter.createSession(sessionInput(setup.target),
+      context(setup.target, [], { backendInstanceGeneration: 7 }));
+    const bound = context(setup.target, [], { binding, backendInstanceGeneration: 7 });
+    await setup.adapter.send(prompt("first"), { ...bound, operationId: "local-before-model-switch" });
+    await setup.fake.completeTurn(binding.nativeSessionId!);
+    await setup.adapter.setModel("custom", "custom-model", bound);
+    expect(released).toContain(1);
+    expect(opened).toHaveLength(2);
+    expect(setup.fake.transport!.requests.findLast((request) => request.method === "thread/resume")?.params)
+      .toMatchObject({ threadId: binding.nativeSessionId, modelProvider: "custom", config: {
+        "features.apps": false,
+        "mcp_servers.joko_local_2.enabled": true,
+        "mcp_servers.joko_local_2.url": "http://127.0.0.1:4100/2"
+      } });
+    await setup.adapter.send(prompt("second"), { ...bound, operationId: "local-after-model-switch" });
+    expect(() => opened[0]!.beginToolCall(binding.nativeSessionId!)).toThrow();
+    const call = opened[1]!.beginToolCall(binding.nativeSessionId!);
+    expect(() => call.assertCurrent()).not.toThrow();
+    call.release();
   });
 
   it("isolates remote MCP config and fences calls to the active native thread without replacing a busy runtime", async () => {
     let bridgeGeneration = 1;
-    const opened: CodexRemoteMcpOpenInput[] = [];
+    const opened: CodexMcpOpenInput[] = [];
     const released: number[] = [];
     const setup = await createRemoteSetup({
       openMcpBridge: async (input) => {
@@ -2868,7 +3200,8 @@ describe("CodexBackendAdapter", () => {
   });
 
   it("runs Review through a fresh native profile with only bounded Host-owned readers", async () => {
-    const setup = await createSetup();
+    const localMcpBridge = vi.fn(async (): Promise<never> => { throw new Error("Review must not open MCP"); });
+    const setup = await createSetup(7, { localMcpBridge });
     const skillPath = join(setup.target.workspaceRoot, "review-skill.md");
     await writeFile(skillPath, "skill", "utf8");
     setup.fake.reviewSkills.push({
@@ -2956,6 +3289,7 @@ describe("CodexBackendAdapter", () => {
       runtimePolicy: "review_read_only"
     }, reviewContext);
     const threadStart = setup.fake.transport?.requests.findLast((request) => request.method === "thread/start");
+    expect(localMcpBridge).not.toHaveBeenCalled();
     expect(threadStart?.params).toMatchObject({
       approvalPolicy: "never",
       environments: [],

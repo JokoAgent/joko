@@ -11,7 +11,7 @@ import { createPiAdapter, type PiProcessHandle, type PiProcessSpec } from "@joko
 import {
   AppServerHost as CodexAppServerHost,
   CodexBackendAdapter,
-  type CodexRemoteMcpOpenInput
+  type CodexMcpOpenInput
 } from "@joko/adapter-codex";
 import { FakeCodexAppServer } from "@joko/adapter-codex/testing";
 import * as contract from "@joko/contracts";
@@ -10189,6 +10189,91 @@ describe("SessionHost", () => {
     await eventually(() => store.getRun(child!.descriptor.id).descriptor.state === "completed");
   });
 
+  it("commits a local Codex Session before binding its standard MCP route for the durable first turn", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "joko-local-codex-mcp-host-"));
+    const store = new OperationalStore(join(directory, "store.db"));
+    const repository = new OperationalArtifactRepository(store);
+    const artifacts = new ArtifactStore({ rootDirectory: join(directory, "artifacts"), repository, ingestRoots: [directory] });
+    await artifacts.initialize();
+    const fake = new FakeCodexAppServer();
+    fake.reviewConfig = { mcp_servers: { docs: { command: "private-docs-command" } } };
+    fake.reviewMcpStatuses.push({ name: "docs", authStatus: "unsupported", resourceTemplates: [], resources: [], tools: {} });
+    const nativeHost = new CodexAppServerHost({ transportFactory: () => fake.createTransport() });
+    const opened: CodexMcpOpenInput[] = [];
+    const adapter = new CodexBackendAdapter({
+      id: "codex-local-mounted", instanceGeneration: 7, host: nativeHost, profileDirectory: directory,
+      localMcpBridge: async (input) => {
+        expect(store.getSession(input.sessionId).descriptor.binding).toMatchObject({ generation: input.generation });
+        opened.push(input);
+        return {
+          routes: [{ serverId: "tools", name: "joko_local_product_tools", url: "http://127.0.0.1:4100/private-local" }],
+          assertCurrent: input.assertSessionCurrent,
+          release: async () => undefined
+        };
+      }
+    });
+    const descriptor = await adapter.describe();
+    const host = new SessionHost(store, artifacts, [adapter], { backendDescriptors: [descriptor] });
+    cleanups.push(async () => {
+      await host.dispose().catch(() => undefined);
+      await adapter.dispose().catch(() => undefined);
+      await nativeHost.shutdown().catch(() => undefined);
+      store.close();
+      rmSync(directory, { recursive: true, force: true });
+    });
+    await host.initialize();
+    await host.registerTarget({
+      id: "local-codex-target", backendId: adapter.id, displayName: "Local Codex",
+      workspaceRoot: directory, managed: false, trusted: true
+    });
+    const connection = store.createConnection({ id: "local-codex-connection", name: "Local device", authKeyDigest: "digest" });
+    const sessionId = (await host.createSession({
+      operationId: "create-local-codex-mcp", connection, targetId: "local-codex-target",
+      title: "Local Codex task", providerId: "openai", modelId: "gpt-test",
+      fastMode: false, permissionMode: "ask", planMode: false
+    })).value.sessionId;
+    expect(opened).toHaveLength(0);
+    expect(fake.transport!.requests.find((request) => request.method === "thread/start")?.params)
+      .toMatchObject({ config: { "mcp_servers.docs.enabled": false, "features.apps": false } });
+    const queued = host.enqueueInput({
+      operationId: "send-local-codex-mcp", connection, sessionId,
+      prompt: { text: "Use a local tool", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    await eventually(() => store.getQueueItem(queued.value.queueItemId).state === "backend_accepted");
+    expect(opened).toHaveLength(1);
+    expect(opened[0]).toMatchObject({ sessionId, targetId: "local-codex-target", generation: 1,
+      threadId: store.getSession(sessionId).descriptor.binding.nativeSessionId });
+    expect(fake.transport!.requests.findLast((request) => request.method === "thread/resume")?.params)
+      .toMatchObject({ config: {
+        "mcp_servers.docs.enabled": false,
+        "mcp_servers.joko_local_product_tools.enabled": true,
+        "mcp_servers.joko_local_product_tools.url": "http://127.0.0.1:4100/private-local"
+      } });
+    await fake.completeTurn(store.getSession(sessionId).descriptor.binding.nativeSessionId!);
+    await eventually(() => store.getRun(queued.value.runId).descriptor.state === "completed");
+
+    const importedNativeId = fake.seedThread(directory);
+    const nativeReference = (await adapter.listNativeSessions(store.getTarget("local-codex-target").descriptor))
+      .find((candidate) => candidate.nativeSessionId === importedNativeId)!.nativeReference;
+    const importedSessionId = (await host.createSession({
+      operationId: "attach-local-codex-mcp", connection, targetId: "local-codex-target",
+      title: "Imported local Codex task", fastMode: false, permissionMode: "ask", planMode: false,
+      nativeStart: { kind: "attach", nativeReference }
+    })).value.sessionId;
+    expect(opened).toHaveLength(1);
+    expect(fake.transport!.requests.findLast((request) => request.method === "thread/resume")?.params)
+      .toMatchObject({ threadId: importedNativeId, config: { "mcp_servers.docs.enabled": false } });
+    const importedQueued = host.enqueueInput({
+      operationId: "send-imported-local-codex-mcp", connection, sessionId: importedSessionId,
+      prompt: { text: "Use an imported tool", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    await eventually(() => store.getQueueItem(importedQueued.value.queueItemId).state === "backend_accepted");
+    expect(opened).toHaveLength(2);
+    expect(opened[1]).toMatchObject({ sessionId: importedSessionId, threadId: importedNativeId });
+    await fake.completeTurn(importedNativeId);
+    await eventually(() => store.getRun(importedQueued.value.runId).descriptor.state === "completed");
+  });
+
   it("reconciles remote Codex text acceptance and terminal receipts with the durable Queue, Run, Attempt, and Operation", async () => {
     const directory = mkdtempSync(join(tmpdir(), "joko-remote-codex-dispatch-host-"));
     const store = new OperationalStore(join(directory, "store.db"));
@@ -10204,7 +10289,7 @@ describe("SessionHost", () => {
     const localNativeHost = new CodexAppServerHost({ transportFactory: () => localFake.createTransport() });
     const remoteNativeHost = new CodexAppServerHost({ transportFactory: () => remoteFake.createTransport() });
     let authorityCurrent = true;
-    let remoteMcpInput: CodexRemoteMcpOpenInput | undefined;
+    let remoteMcpInput: CodexMcpOpenInput | undefined;
     let remoteMcpRetired = false;
     const releaseRemoteMcp = vi.fn(async () => { remoteMcpRetired = true; });
     const adapter = new CodexBackendAdapter({
