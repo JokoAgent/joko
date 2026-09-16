@@ -56,6 +56,7 @@ import {
   type DesktopPageSearchResult,
   type DesktopSaveFileRequest,
   type DesktopSessionDragPreviewRequest,
+  type DesktopSessionWindowOwner,
   type DesktopWindowInteractionSettings,
   type DesktopUpdateRelaunchRequest,
   type DesktopUpdateRelaunchResult,
@@ -66,6 +67,7 @@ import {
   isDesktopExtensionId,
   isDesktopSessionDragGestureId,
   isDesktopSessionDragPreviewRequest,
+  isDesktopSessionWindowOwner,
   isInspectorWindowOpenRequest,
   isDesktopLocale,
   parseDesktopPageSearchRequest,
@@ -88,6 +90,11 @@ import {
   type DesktopPoint,
   type DesktopRectangle
 } from "./session-window-drop.js";
+import {
+  MAXIMUM_SESSION_WINDOWS,
+  sessionWindowOwnerKey,
+  sessionWindowOwnerMayRequest
+} from "./session-window-owner.js";
 import {
   sessionDragPreviewDataUrl,
   SessionDragPreviewCoordinator,
@@ -402,7 +409,8 @@ let managedMainWindowState: windowStateKeeper.State | undefined;
 let managedInspectorWindowState: windowStateKeeper.State | undefined;
 let managedRuntimeProcessMonitorWindowState: windowStateKeeper.State | undefined;
 const sessionWindows = new Map<string, BrowserWindow>();
-const sessionWindowIdsByContents = new Map<WebContents, string>();
+const sessionWindowOwners = new Map<string, DesktopSessionWindowOwner>();
+const sessionWindowOwnersByContents = new Map<WebContents, DesktopSessionWindowOwner>();
 const extensionWindows = new Map<string, BrowserWindow>();
 const extensionWindowIdsByContents = new Map<WebContents, string>();
 const pageSearchTokensByContents = new WeakMap<WebContents, Map<number, number>>();
@@ -1178,28 +1186,36 @@ async function verifyPackagedSmokeSessionWindow(owner: BrowserWindow): Promise<v
       && sameManagedOrchestratorConnection(runtime.connection, candidate)
   } satisfies PackagedSmokeTaskOptions;
   const task = await createPackagedSmokeTask(taskOptions);
+  const taskOwner = { profileId: connection.profileId, sessionId: task.sessionId } as const;
+  const taskOwnerKey = sessionWindowOwnerKey(taskOwner);
   recordPackagedSmokeProgress("durable_task_created");
   if (!await preparePackagedSmokeTaskOwner(owner, task)) {
     throw new Error("Packaged smoke owner did not present the durable Task before drag verification.");
   }
-  await verifyPackagedSmokeTaskWindowDrag(owner, task);
+  await verifyPackagedSmokeTaskWindowDrag(owner, task, connection.profileId);
   recordPackagedSmokeProgress("task_window_drag_open_requested");
 
-  const taskWindow = sessionWindows.get(task.sessionId);
+  const taskWindow = sessionWindows.get(taskOwnerKey);
   const openTaskWindows = [...sessionWindows.values()].filter((window) => !window.isDestroyed());
   if (taskWindow === undefined || taskWindow.isDestroyed() || openTaskWindows.length !== 1
     || openTaskWindows[0] !== taskWindow) {
     throw new Error("Packaged smoke duplicated or lost the Task-window owner.");
   }
   const taskContents = taskWindow.webContents;
-  if (sessionWindowIdsByContents.get(taskContents) !== task.sessionId) {
+  const mappedTaskOwner = sessionWindowOwnersByContents.get(taskContents);
+  if (mappedTaskOwner?.profileId !== taskOwner.profileId || mappedTaskOwner.sessionId !== taskOwner.sessionId) {
     throw new Error("Packaged smoke Task window lost its main-process identity.");
   }
-  await waitForPackagedSmokeTaskPresentation(taskWindow, task);
-  if (sessionWindows.get(task.sessionId) !== taskWindow) {
+  await waitForPackagedSmokeTaskPresentation(taskWindow, task, taskOwner);
+  if (sessionWindows.get(taskOwnerKey) !== taskWindow) {
     throw new Error("Packaged smoke Task-window owner changed while its UI was loading.");
   }
   recordPackagedSmokeProgress("task_window_product_ready");
+  await assertPackagedSmokeTaskWindowProfileFence(taskWindow, taskOwner);
+  if ([...sessionWindows.values()].filter((candidate) => !candidate.isDestroyed()).length !== 1) {
+    throw new Error("Packaged smoke cross-profile request changed the Task-window set.");
+  }
+  recordPackagedSmokeProgress("task_window_cross_profile_fenced");
 
   if (nativeTaskStatusSupported) {
     const visibilityDeadline = Date.now() + 5_000;
@@ -1212,32 +1228,170 @@ async function verifyPackagedSmokeSessionWindow(owner: BrowserWindow): Promise<v
     }
   }
 
+  taskContents.reload();
+  await waitForPackagedSmokeTaskPresentation(taskWindow, task, taskOwner);
+  assertPackagedSmokeTaskWindowOwner(taskWindow, taskOwner);
+  recordPackagedSmokeProgress("task_window_reloaded_exact_owner");
+
+  const concurrentTaskOptions = {
+    ...taskOptions,
+    displayName: "Packaged concurrent application-window task",
+    reuseConfiguredProvider: true
+  } satisfies PackagedSmokeTaskOptions;
+  const concurrentTask = await createPackagedSmokeTask(concurrentTaskOptions);
+  const concurrentOwner = { profileId: connection.profileId, sessionId: concurrentTask.sessionId } as const;
+  const concurrentOwnerKey = sessionWindowOwnerKey(concurrentOwner);
+  if (!await preparePackagedSmokeTaskOwner(owner, concurrentTask)) {
+    throw new Error("Packaged smoke owner did not present the concurrent durable Task.");
+  }
+  if (await focusPackagedSmokeTaskWindow(taskWindow, concurrentTask, connection.profileId)) {
+    throw new Error("Packaged smoke concurrent Task unexpectedly reused an existing window.");
+  }
+  const concurrentWindow = sessionWindows.get(concurrentOwnerKey);
+  if (concurrentWindow === undefined || concurrentWindow.isDestroyed() || concurrentWindow === taskWindow) {
+    throw new Error("Packaged smoke did not create an independent concurrent Task window.");
+  }
+  await Promise.all([
+    waitForPackagedSmokeTaskPresentation(taskWindow, task, taskOwner),
+    waitForPackagedSmokeTaskPresentation(concurrentWindow, concurrentTask, concurrentOwner)
+  ]);
+  assertPackagedSmokeTaskWindowOwner(taskWindow, taskOwner);
+  assertPackagedSmokeTaskWindowOwner(concurrentWindow, concurrentOwner);
+  if ([...sessionWindows.values()].filter((candidate) => !candidate.isDestroyed()).length !== 2
+    || !await focusPackagedSmokeTaskWindow(owner, concurrentTask, connection.profileId)) {
+    throw new Error("Packaged smoke concurrent Task singleton state was inconsistent.");
+  }
+  recordPackagedSmokeProgress("task_windows_concurrent_exact_owners");
+
+  const rendererLost = new Promise<void>((resolveLoss) => taskContents.once("render-process-gone", () => resolveLoss()));
+  const rendererReloaded = new Promise<void>((resolveLoad) => taskContents.once("did-finish-load", () => resolveLoad()));
+  taskContents.forcefullyCrashRenderer();
+  await waitForPackagedSmokeDeadline(rendererLost, 10_000, "Task renderer crash");
+  await waitForPackagedSmokeDeadline(rendererReloaded, 20_000, "Task renderer recovery load");
+  await Promise.all([
+    waitForPackagedSmokeTaskPresentation(taskWindow, task, taskOwner),
+    waitForPackagedSmokeTaskPresentation(concurrentWindow, concurrentTask, concurrentOwner)
+  ]);
+  assertPackagedSmokeTaskWindowOwner(taskWindow, taskOwner);
+  assertPackagedSmokeTaskWindowOwner(concurrentWindow, concurrentOwner);
+  recordPackagedSmokeProgress("task_window_crash_recovered_exact_owner");
+
+  await closePackagedSmokeTaskWindow(taskWindow, taskOwner);
+  await waitForPackagedSmokeTaskPresentation(concurrentWindow, concurrentTask, concurrentOwner);
+  assertPackagedSmokeTaskWindowOwner(concurrentWindow, concurrentOwner);
+  if (owner.isDestroyed() || owner.webContents.isDestroyed()) {
+    throw new Error("Closing one packaged Task window retired another application window.");
+  }
+  recordPackagedSmokeProgress("task_window_closed_without_peer_loss");
+
+  await Promise.all([
+    verifyPackagedSmokeTask(taskOptions, task),
+    verifyPackagedSmokeTask(concurrentTaskOptions, concurrentTask)
+  ]);
+  if (!await preparePackagedSmokeTaskOwner(owner, task)
+    || !await preparePackagedSmokeTaskOwner(owner, concurrentTask)) {
+    throw new Error("Closing a packaged Task window removed accepted durable Tasks from the owner product UI.");
+  }
+  await closePackagedSmokeTaskWindow(concurrentWindow, concurrentOwner);
+  if ([...sessionWindows.values()].some((candidate) => !candidate.isDestroyed())) {
+    throw new Error("Packaged smoke retained a Task window after isolated cleanup.");
+  }
+  recordPackagedSmokeProgress("task_windows_closed_cleanly");
+  recordPackagedSmokeProgress("durable_task_reverified");
+}
+
+function assertPackagedSmokeTaskWindowOwner(
+  window: BrowserWindow,
+  owner: DesktopSessionWindowOwner
+): void {
+  const ownerKey = sessionWindowOwnerKey(owner);
+  const mapped = sessionWindowOwnersByContents.get(window.webContents);
+  if (window.isDestroyed() || sessionWindows.get(ownerKey) !== window
+    || sessionWindowOwners.get(ownerKey)?.profileId !== owner.profileId
+    || sessionWindowOwners.get(ownerKey)?.sessionId !== owner.sessionId
+    || mapped?.profileId !== owner.profileId || mapped?.sessionId !== owner.sessionId) {
+    throw new Error("Packaged smoke Task window changed its exact main-process owner.");
+  }
+}
+
+async function assertPackagedSmokeTaskWindowProfileFence(
+  window: BrowserWindow,
+  owner: DesktopSessionWindowOwner
+): Promise<void> {
+  const forbiddenProfileId = owner.profileId === "packaged-smoke-other-profile"
+    ? "packaged-smoke-other-profile-2"
+    : "packaged-smoke-other-profile";
+  const value = await window.webContents.executeJavaScript([
+    "(async () => {",
+    "  const bridge = window.jokoDesktop?.sessionWindows;",
+    "  if (!bridge) throw new Error('Task-window preload bridge is unavailable.');",
+    `  const forbiddenProfileId = ${JSON.stringify(forbiddenProfileId)};`,
+    `  const sessionId = ${JSON.stringify(owner.sessionId)};`,
+    "  const openBlocked = await bridge.open({ profileId: forbiddenProfileId, sessionId }).then(() => false, () => true);",
+    "  const gestureId = 'smoke_profile_fence_0004';",
+    "  let dragBlocked = false;",
+    "  let dragStarted = false;",
+    "  try {",
+    "    dragStarted = await bridge.beginDragPreview({",
+    "      gestureId, profileId: forbiddenProfileId, sessionId,",
+    "      label: 'Forbidden profile task', hint: 'Must remain bound',",
+    "      palette: { surface: '#ffffff', border: '#d8d8d8', text: '#0d0d0d', muted: '#5f5f5f', accent: '#ff9800' }",
+    "    });",
+    "    if (dragStarted) await bridge.endDragPreview(gestureId);",
+    "  } catch {",
+    "    dragBlocked = true;",
+    "  }",
+    "  return { openBlocked, dragBlocked, dragStarted };",
+    "})()"
+  ].join("\n"), true) as unknown;
+  if (typeof value !== "object" || value === null || Array.isArray(value)
+    || (value as Record<string, unknown>)["openBlocked"] !== true
+    || (value as Record<string, unknown>)["dragBlocked"] !== true
+    || (value as Record<string, unknown>)["dragStarted"] !== false) {
+    throw new Error("Packaged smoke Task window escaped its bound profile.");
+  }
+}
+
+async function closePackagedSmokeTaskWindow(
+  window: BrowserWindow,
+  owner: DesktopSessionWindowOwner
+): Promise<void> {
+  const ownerKey = sessionWindowOwnerKey(owner);
+  const contents = window.webContents;
   try {
-    await taskContents.executeJavaScript("window.jokoDesktop.window.close()", true);
+    await contents.executeJavaScript("window.jokoDesktop.window.close()", true);
   } catch (error) {
-    if (!taskWindow.isDestroyed()) throw error;
+    if (!window.isDestroyed()) throw error;
   }
   const closeDeadline = Date.now() + 10_000;
-  while (Date.now() < closeDeadline && (!taskWindow.isDestroyed() || sessionWindows.has(task.sessionId))) {
+  while (Date.now() < closeDeadline && (!window.isDestroyed() || sessionWindows.has(ownerKey))) {
     await waitForPackagedSmokePoll();
   }
-  if (!taskWindow.isDestroyed() || sessionWindows.has(task.sessionId)
-    || sessionWindowIdsByContents.has(taskContents)
-    || sessionWindowStates.has(task.sessionId)
-    || nativeTaskStatusVisibleSessionsByContents.has(taskContents)) {
+  if (!window.isDestroyed() || sessionWindows.has(ownerKey)
+    || sessionWindowOwners.has(ownerKey)
+    || sessionWindowOwnersByContents.has(contents)
+    || sessionWindowStates.has(ownerKey)
+    || nativeTaskStatusVisibleSessionsByContents.has(contents)) {
     throw new Error("Packaged smoke Task-window retirement left owned or visible state behind.");
   }
-  if (owner.isDestroyed() || owner.webContents.isDestroyed()) {
-    throw new Error("Closing the packaged Task window also retired the owner application window.");
-  }
-  recordPackagedSmokeProgress("task_window_closed_cleanly");
+}
 
-  await verifyPackagedSmokeTask(taskOptions, task);
-  const ownerStillShowsTask = await packagedSmokeWindowShowsTask(owner, task);
-  if (!ownerStillShowsTask) {
-    throw new Error("Closing the packaged Task window removed the accepted Task from the owner product UI.");
+async function waitForPackagedSmokeDeadline<T>(
+  operation: Promise<T>,
+  timeoutMs: number,
+  label: string
+): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error(`${label} timed out.`)), timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
   }
-  recordPackagedSmokeProgress("durable_task_reverified");
 }
 
 async function preparePackagedSmokeTaskOwner(
@@ -1296,13 +1450,16 @@ async function preparePackagedSmokeTaskOwner(
 
 async function verifyPackagedSmokeTaskWindowDrag(
   owner: BrowserWindow,
-  task: PackagedSmokeTask
+  task: PackagedSmokeTask,
+  profileId: string
 ): Promise<void> {
-  if (sessionWindows.has(task.sessionId)) {
+  const taskOwner = { profileId, sessionId: task.sessionId } as const;
+  const taskOwnerKey = sessionWindowOwnerKey(taskOwner);
+  if (sessionWindows.has(taskOwnerKey)) {
     throw new Error("Packaged smoke Task window existed before the drag gesture.");
   }
-  const cancelled = await invokePackagedSmokeTaskDrag(owner, task, "smoke_cancel_0001", true);
-  if (!cancelled.started || !cancelled.ended || cancelled.opened || sessionWindows.has(task.sessionId)) {
+  const cancelled = await invokePackagedSmokeTaskDrag(owner, task, profileId, "smoke_cancel_0001", true);
+  if (!cancelled.started || !cancelled.ended || cancelled.opened || sessionWindows.has(taskOwnerKey)) {
     throw new Error("Packaged smoke cancelled drag retained a preview or opened a Task window.");
   }
   recordPackagedSmokeProgress("task_drag_cancelled");
@@ -1318,8 +1475,8 @@ async function verifyPackagedSmokeTaskWindowDrag(
     if (!owner.isVisible() || owner.isMinimized() || !pointIsInsideRectangle(cursor, owner.getBounds())) {
       throw new Error("Packaged smoke could not place a visible owner around the system cursor.");
     }
-    const inside = await invokePackagedSmokeTaskDrag(owner, task, "smoke_inside_0002", false);
-    if (!inside.started || inside.ended || inside.opened || sessionWindows.has(task.sessionId)) {
+    const inside = await invokePackagedSmokeTaskDrag(owner, task, profileId, "smoke_inside_0002", false);
+    if (!inside.started || inside.ended || inside.opened || sessionWindows.has(taskOwnerKey)) {
       throw new Error("Packaged smoke inside-window drag opened a Task window.");
     }
     recordPackagedSmokeProgress("task_drag_inside_rejected");
@@ -1330,17 +1487,17 @@ async function verifyPackagedSmokeTaskWindowDrag(
     if (visibleSessionDragTargetBounds().length !== 0) {
       throw new Error("Packaged smoke could not establish an outside-all-application-windows release.");
     }
-    const outside = await invokePackagedSmokeTaskDrag(owner, task, "smoke_outside_0003", false);
+    const outside = await invokePackagedSmokeTaskDrag(owner, task, profileId, "smoke_outside_0003", false);
     if (!outside.started || outside.ended || !outside.opened || outside.focusedExisting !== false) {
       throw new Error("Packaged smoke outside-window drag did not open the exact Task singleton.");
     }
-    const taskWindow = sessionWindows.get(task.sessionId);
+    const taskWindow = sessionWindows.get(taskOwnerKey);
     if (taskWindow === undefined || taskWindow.isDestroyed()) {
       throw new Error("Packaged smoke outside-window drag lost the opened Task window.");
     }
-    await waitForPackagedSmokeTaskPresentation(taskWindow, task);
-    if (!await focusPackagedSmokeTaskWindow(owner, task)
-      || sessionWindows.get(task.sessionId) !== taskWindow
+    await waitForPackagedSmokeTaskPresentation(taskWindow, task, taskOwner);
+    if (!await focusPackagedSmokeTaskWindow(owner, task, profileId)
+      || sessionWindows.get(taskOwnerKey) !== taskWindow
       || [...sessionWindows.values()].filter((candidate) => !candidate.isDestroyed()).length !== 1) {
       throw new Error("Packaged smoke outside-window drag did not refocus the exact Task singleton.");
     }
@@ -1366,6 +1523,7 @@ async function verifyPackagedSmokeTaskWindowDrag(
 async function invokePackagedSmokeTaskDrag(
   owner: BrowserWindow,
   task: PackagedSmokeTask,
+  profileId: string,
   gestureId: string,
   cancel: boolean
 ): Promise<{
@@ -1377,12 +1535,13 @@ async function invokePackagedSmokeTaskDrag(
   const value = await owner.webContents.executeJavaScript([
     "(async () => {",
     `  const sessionId = ${JSON.stringify(task.sessionId)};`,
+    `  const profileId = ${JSON.stringify(profileId)};`,
     `  const gestureId = ${JSON.stringify(gestureId)};`,
     `  const cancel = ${JSON.stringify(cancel)};`,
     "  const bridge = window.jokoDesktop?.sessionWindows;",
     "  if (!bridge) throw new Error('Task-window preload bridge is unavailable.');",
     "  const started = await bridge.beginDragPreview({",
-    "    gestureId, sessionId, label: 'Packaged drag task', hint: 'Open in new window',",
+    "    gestureId, profileId, sessionId, label: 'Packaged drag task', hint: 'Open in new window',",
     "    palette: { surface: '#ffffff', border: '#d8d8d8', text: '#0d0d0d', muted: '#5f5f5f', accent: '#ff9800' }",
     "  });",
     "  const ended = cancel ? await bridge.endDragPreview(gestureId) : false;",
@@ -1413,13 +1572,14 @@ async function invokePackagedSmokeTaskDrag(
 
 async function focusPackagedSmokeTaskWindow(
   owner: BrowserWindow,
-  task: PackagedSmokeTask
+  task: PackagedSmokeTask,
+  profileId: string
 ): Promise<boolean> {
   const value = await owner.webContents.executeJavaScript([
     "(async () => {",
     "  const bridge = window.jokoDesktop?.sessionWindows;",
     "  if (!bridge) throw new Error('Task-window preload bridge is unavailable.');",
-    `  const result = await bridge.open(${JSON.stringify(task.sessionId)});`,
+    `  const result = await bridge.open({ profileId: ${JSON.stringify(profileId)}, sessionId: ${JSON.stringify(task.sessionId)} });`,
     "  return result?.focusedExisting === true;",
     "})()"
   ].join("\n"), true) as unknown;
@@ -1431,7 +1591,8 @@ async function focusPackagedSmokeTaskWindow(
 
 async function waitForPackagedSmokeTaskPresentation(
   window: BrowserWindow,
-  task: PackagedSmokeTask
+  task: PackagedSmokeTask,
+  owner: DesktopSessionWindowOwner
 ): Promise<void> {
   const deadline = Date.now() + 20_000;
   let lastLocation = "unloaded";
@@ -1440,9 +1601,10 @@ async function waitForPackagedSmokeTaskPresentation(
       throw new Error("Packaged smoke Task window retired before its product UI loaded.");
     }
     try {
-      const value = await window.webContents.executeJavaScript([
-        "(() => {",
+      const value = await waitForPackagedSmokeDeadline(window.webContents.executeJavaScript([
+        "(async () => {",
         `  const sessionId = ${JSON.stringify(task.sessionId)};`,
+        "  const taskOwner = await window.jokoDesktop?.sessionWindows?.getOwner?.();",
         "  const timelines = [...document.querySelectorAll('[data-timeline-session-id]')];",
         "  const timeline = timelines.find((element) => element.getAttribute('data-timeline-session-id') === sessionId);",
         "  const pane = timeline?.closest('.session-pane');",
@@ -1453,14 +1615,17 @@ async function waitForPackagedSmokeTaskPresentation(
         "    product: Boolean(document.querySelector('.app')),",
         "    connectionScreen: Boolean(document.querySelector('.connection-screen')),",
         "    preload: typeof window.jokoDesktop?.window?.close === 'function' &&",
-        "      typeof window.jokoDesktop?.sessionWindows?.open === 'function',",
+        "      typeof window.jokoDesktop?.sessionWindows?.open === 'function' &&",
+        "      typeof window.jokoDesktop?.sessionWindows?.getOwner === 'function',",
+        "    ownerProfileId: taskOwner?.profileId ?? '',",
+        "    ownerSessionId: taskOwner?.sessionId ?? '',",
         "    nodeGlobalsAbsent: typeof require === 'undefined' && typeof process === 'undefined',",
         "    timelineCount: timelines.length,",
         "    sessionId: timeline?.getAttribute('data-timeline-session-id') ?? '',",
         "    displayName: pane instanceof HTMLElement ? pane.getAttribute('aria-label') ?? '' : ''",
         "  };",
         "})()"
-      ].join("\n"), true) as unknown;
+      ].join("\n"), true) as Promise<unknown>, 2_000, "Task product presentation probe");
       if (typeof value === "object" && value !== null && !Array.isArray(value)) {
         const observation = value as Record<string, unknown>;
         if (typeof observation["href"] === "string") lastLocation = observation["href"];
@@ -1468,6 +1633,8 @@ async function waitForPackagedSmokeTaskPresentation(
           && observation["connectionScreen"] === false
           && observation["preload"] === true
           && observation["nodeGlobalsAbsent"] === true
+          && observation["ownerProfileId"] === owner.profileId
+          && observation["ownerSessionId"] === owner.sessionId
           && observation["timelineCount"] === 1
           && observation["sessionId"] === task.sessionId
           && observation["displayName"] === task.displayName) {
@@ -1491,21 +1658,6 @@ async function waitForPackagedSmokeTaskPresentation(
     await waitForPackagedSmokePoll();
   }
   throw new Error(`Packaged smoke Task product UI did not become ready (${lastLocation}).`);
-}
-
-async function packagedSmokeWindowShowsTask(window: BrowserWindow, task: PackagedSmokeTask): Promise<boolean> {
-  const value = await window.webContents.executeJavaScript([
-    "(() => {",
-    `  const sessionId = ${JSON.stringify(task.sessionId)};`,
-    `  const displayName = ${JSON.stringify(task.displayName)};`,
-    "  const timeline = [...document.querySelectorAll('[data-timeline-session-id]')].find((element) =>",
-    "    element.getAttribute('data-timeline-session-id') === sessionId);",
-    "  const pane = timeline?.closest('.session-pane');",
-    "  return Boolean(document.querySelector('.app')) && !document.querySelector('.connection-screen') &&",
-    "    pane instanceof HTMLElement && pane.getAttribute('aria-label') === displayName;",
-    "})()"
-  ].join("\n"), true) as unknown;
-  return value === true;
 }
 
 function waitForPackagedSmokePoll(): Promise<void> {
@@ -2155,7 +2307,10 @@ function handleNativeSessionDragMouseUp(): void {
   if (owner.isDestroyed() || owner.webContents.isDestroyed()) return;
   const releaseOwnerCleanup = registerNativeSessionDragResultOwnerCleanup(owner);
   const open = (): Promise<{ readonly focusedExisting: boolean }> =>
-    openSessionApplicationWindow(completion.sessionId, completion.point);
+    openSessionApplicationWindow({
+      profileId: completion.profileId,
+      sessionId: completion.sessionId
+    }, completion.point);
   sessionDragNativeResultFence.start({
     owner,
     gestureId: completion.gestureId,
@@ -2185,14 +2340,29 @@ function registerNativeSessionDragResultOwnerCleanup(owner: BrowserWindow): () =
 }
 
 async function openSessionApplicationWindow(
-  sessionId: string,
+  owner: DesktopSessionWindowOwner,
   dropPoint?: DesktopPoint
 ): Promise<{ readonly focusedExisting: boolean }> {
-  if (!isDesktopNotificationSessionId(sessionId)) throw new TypeError("Task identity is invalid.");
-  const existing = sessionWindows.get(sessionId);
+  if (!isDesktopSessionWindowOwner(owner)) throw new TypeError("Task window owner is invalid.");
+  const { sessionId } = owner;
+  const ownerKey = sessionWindowOwnerKey(owner);
+  const existing = sessionWindows.get(ownerKey);
   if (existing !== undefined && !existing.isDestroyed()) {
     showWindowFromTray(existing);
     return { focusedExisting: true };
+  }
+  if (existing !== undefined) {
+    sessionWindows.delete(ownerKey);
+    sessionWindowOwners.delete(ownerKey);
+    sessionWindowStates.delete(ownerKey);
+    for (const [contents, candidate] of sessionWindowOwnersByContents) {
+      if (sessionWindowOwnerKey(candidate) !== ownerKey) continue;
+      sessionWindowOwnersByContents.delete(contents);
+      clearDesktopNativeTaskStatusVisibility(contents);
+    }
+  }
+  if ([...sessionWindows.values()].filter((candidate) => !candidate.isDestroyed()).length >= MAXIMUM_SESSION_WINDOWS) {
+    throw new Error("Task window capacity reached.");
   }
   if (!canShowDesktopWindow({
     quitting,
@@ -2207,7 +2377,7 @@ async function openSessionApplicationWindow(
   const state = windowStateKeeper({
     defaultWidth: SESSION_WINDOW_DEFAULT_GEOMETRY.width,
     defaultHeight: SESSION_WINDOW_DEFAULT_GEOMETRY.height,
-    file: sessionWindowStateFile(sessionId)
+    file: sessionWindowStateFile(owner)
   });
   const dropWorkArea = dropPoint === undefined ? undefined : screen.getDisplayNearestPoint(dropPoint).workArea;
   const dropBounds = dropPoint === undefined || dropWorkArea === undefined ? undefined : sessionWindowDropBounds({
@@ -2281,9 +2451,11 @@ async function openSessionApplicationWindow(
   };
   containDroppedWindow();
   if (dropWorkArea !== undefined) window.on("resize", containDroppedWindow);
-  sessionWindows.set(sessionId, window);
-  sessionWindowIdsByContents.set(windowContents, sessionId);
-  sessionWindowStates.set(sessionId, state);
+  const retainedOwner = Object.freeze({ ...owner });
+  sessionWindows.set(ownerKey, window);
+  sessionWindowOwners.set(ownerKey, retainedOwner);
+  sessionWindowOwnersByContents.set(windowContents, retainedOwner);
+  sessionWindowStates.set(ownerKey, state);
   installDesktopNativeTaskStatusVisibilityLifecycle(window);
   state.manage(window);
   window.webContents.setZoomFactor(currentWindowZoomFactor);
@@ -2293,8 +2465,9 @@ async function openSessionApplicationWindow(
     const options = {
       unavailable: () => window.isDestroyed() || quitting,
       load: () => loadUi(window, { kind: "session", id: sessionId }),
-      presentFailure: (error: unknown, attempt: number) =>
-        presentDesktopWindowLoadFailure("session", error, attempt),
+      presentFailure: (error: unknown, attempt: number) => packagedSmoke
+        ? Promise.resolve(attempt <= 2 ? "retry" as const : "close" as const)
+        : presentDesktopWindowLoadFailure("session", error, attempt),
       close: () => {
         if (!window.isDestroyed()) window.destroy();
       }
@@ -2368,9 +2541,12 @@ async function openSessionApplicationWindow(
     releaseDesktopAttentionSource(attentionSourceId);
     stopGlobalVoiceShortcutCapture(windowContents);
     releaseApplicationMenuShortcutRecording(attentionSourceId);
-    if (sessionWindows.get(sessionId) === window) sessionWindows.delete(sessionId);
-    sessionWindowIdsByContents.delete(windowContents);
-    sessionWindowStates.delete(sessionId);
+    if (sessionWindows.get(ownerKey) === window) {
+      sessionWindows.delete(ownerKey);
+      sessionWindowOwners.delete(ownerKey);
+      sessionWindowStates.delete(ownerKey);
+    }
+    sessionWindowOwnersByContents.delete(windowContents);
     clearDesktopNativeTaskStatusVisibility(windowContents);
   });
   beginSessionUiLoadRecovery();
@@ -2803,8 +2979,8 @@ async function resetDesktopApplicationLayout(initiatingContents: WebContents): P
       resetDormantManagedWindowState(managedMainWindowState);
     }
   }
-  for (const [sessionId, window] of sessionWindows) {
-    const state = sessionWindowStates.get(sessionId);
+  for (const [ownerKey, window] of sessionWindows) {
+    const state = sessionWindowStates.get(ownerKey);
     if (state === undefined) continue;
     if (window.isDestroyed()) resetDormantManagedWindowState(state);
     else targets.push({ window, state, defaults: SESSION_WINDOW_DEFAULT_GEOMETRY });
@@ -2837,7 +3013,10 @@ async function resetDesktopApplicationLayout(initiatingContents: WebContents): P
 
   const openSessionStateFiles = new Set([...sessionWindows]
     .filter(([, window]) => !window.isDestroyed())
-    .map(([sessionId]) => sessionWindowStateFile(sessionId)));
+    .flatMap(([ownerKey]) => {
+      const owner = sessionWindowOwners.get(ownerKey);
+      return owner === undefined ? [] : [sessionWindowStateFile(owner)];
+    }));
   const openExtensionStateFiles = new Set([...extensionWindows]
     .filter(([, window]) => !window.isDestroyed())
     .map(([extensionId]) => extensionWindowStateFile(extensionId)));
@@ -2868,8 +3047,8 @@ async function resetDesktopApplicationLayout(initiatingContents: WebContents): P
   ], initiatingContents);
 }
 
-function sessionWindowStateFile(sessionId: string): string {
-  return `${SESSION_WINDOW_STATE_PREFIX}${createHash("sha256").update(sessionId).digest("hex").slice(0, 24)}.json`;
+function sessionWindowStateFile(owner: DesktopSessionWindowOwner): string {
+  return `${SESSION_WINDOW_STATE_PREFIX}${createHash("sha256").update(sessionWindowOwnerKey(owner)).digest("hex").slice(0, 24)}.json`;
 }
 
 function extensionWindowStateFile(extensionId: string): string {
@@ -2879,7 +3058,8 @@ function extensionWindowStateFile(extensionId: string): string {
 function destroySessionWindows(): void {
   const windows = [...sessionWindows.values()];
   sessionWindows.clear();
-  sessionWindowIdsByContents.clear();
+  sessionWindowOwners.clear();
+  sessionWindowOwnersByContents.clear();
   sessionWindowStates.clear();
   for (const window of windows) {
     if (!window.isDestroyed()) window.destroy();
@@ -4145,7 +4325,9 @@ function showDesktopNotification(value: DesktopNotification): void {
 }
 
 function dispatchDesktopNotificationSessionFocus(sessionId: string): void {
-  const window = sessionWindows.get(sessionId) ?? mainWindow;
+  // The public notification carries no profile owner. Let the primary
+  // renderer resolve it instead of guessing among profile-bound Task windows.
+  const window = mainWindow;
   if (window === undefined || window.isDestroyed()) return;
   showWindowFromTray(window);
   const send = (): void => {
@@ -4393,10 +4575,24 @@ function registerIpc(): void {
   });
   ipcMain.handle(DESKTOP_CHANNELS.sessionWindowOpen, async (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);
-    if (parameters.length !== 1 || !isDesktopNotificationSessionId(parameters[0])) {
-      throw new TypeError("Task window open requires one bounded task identity.");
+    if (parameters.length !== 1 || !isDesktopSessionWindowOwner(parameters[0])) {
+      throw new TypeError("Task window open requires one bounded owner identity.");
+    }
+    const senderOwner = sessionWindowOwnersByContents.get(event.sender);
+    if (!sessionWindowOwnerMayRequest(senderOwner, parameters[0])) {
+      throw new Error("Task windows cannot cross their bound profile.");
     }
     return openSessionApplicationWindow(parameters[0]);
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.sessionWindowGetOwner, (event, ...parameters: unknown[]) => {
+    assertTrustedIpcSender(event);
+    if (parameters.length !== 0) throw new TypeError("Task window owner does not accept parameters.");
+    const owner = sessionWindowOwnersByContents.get(event.sender);
+    const window = BrowserWindow.fromWebContents(event.sender);
+    if (owner === undefined || window === null || sessionWindows.get(sessionWindowOwnerKey(owner)) !== window) {
+      throw new Error("Task window owner is unavailable outside its exact application window.");
+    }
+    return owner;
   });
   ipcMain.handle(DESKTOP_CHANNELS.extensionWindowOpen, async (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);
@@ -4480,13 +4676,19 @@ function registerIpc(): void {
   });
   ipcMain.handle(DESKTOP_CHANNELS.sessionDragPreviewBegin, (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);
-    if (parameters.length !== 1 || !isDesktopSessionDragPreviewRequest(parameters[0]) ||
-      !isDesktopNotificationSessionId(parameters[0].sessionId)) {
+    if (parameters.length !== 1 || !isDesktopSessionDragPreviewRequest(parameters[0])) {
       throw new TypeError("Task drag preview requires one exact bounded request.");
     }
     const source = trustedApplicationWindowForContents(event.sender);
     if (source === undefined || source === runtimeProcessMonitorWindow) {
       throw new Error("Task drag preview requires a primary task application window.");
+    }
+    const senderOwner = sessionWindowOwnersByContents.get(event.sender);
+    if (!sessionWindowOwnerMayRequest(senderOwner, {
+      profileId: parameters[0].profileId,
+      sessionId: parameters[0].sessionId
+    })) {
+      throw new Error("Task drag preview cannot cross its bound profile.");
     }
     const preview = createNativeSessionDragPreview(source, parameters[0]);
     const started = sessionDragPreviewCoordinator.begin(source, parameters[0], preview);
@@ -4522,7 +4724,10 @@ function registerIpc(): void {
     }
     const completion = sessionDragPreviewCoordinator.finish(source, parameters[0]);
     if (completion === undefined || completion.kind === "inside") return { opened: false } as const;
-    const opened = await openSessionApplicationWindow(completion.sessionId, completion.point);
+    const opened = await openSessionApplicationWindow({
+      profileId: completion.profileId,
+      sessionId: completion.sessionId
+    }, completion.point);
     return { opened: true, focusedExisting: opened.focusedExisting } as const;
   });
   ipcMain.handle(DESKTOP_CHANNELS.runtimeProcessMonitorOpen, async (event, ...parameters: unknown[]) => {
@@ -4616,8 +4821,8 @@ function registerIpc(): void {
       window.close();
       return;
     }
-    const sessionId = sessionWindowIdsByContents.get(event.sender);
-    if (sessionId !== undefined && sessionWindows.get(sessionId) === window) {
+    const sessionOwner = sessionWindowOwnersByContents.get(event.sender);
+    if (sessionOwner !== undefined && sessionWindows.get(sessionWindowOwnerKey(sessionOwner)) === window) {
       window.close();
       return;
     }
@@ -4744,7 +4949,7 @@ function registerIpc(): void {
   });
   ipcMain.handle(DESKTOP_CHANNELS.nativeTaskStatusSetVisibleSessions, (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);
-    if (event.sender !== mainWindow?.webContents && !sessionWindowIdsByContents.has(event.sender)) {
+    if (event.sender !== mainWindow?.webContents && !sessionWindowOwnersByContents.has(event.sender)) {
       throw new Error("Native task-status visibility is restricted to application task windows.");
     }
     if (parameters.length !== 1) {
@@ -5672,9 +5877,9 @@ function trustedApplicationWindowForContents(contents: WebContents): BrowserWind
   if (owner === runtimeProcessMonitorWindow) {
     return isRuntimeProcessMonitorNavigation(contents.getURL()) ? owner : undefined;
   }
-  const sessionId = sessionWindowIdsByContents.get(contents);
-  if (sessionId !== undefined && sessionWindows.get(sessionId) === owner
-    && isAllowedSessionWindowNavigation(contents.getURL(), sessionId, navigationPolicy)) return owner;
+  const sessionOwner = sessionWindowOwnersByContents.get(contents);
+  if (sessionOwner !== undefined && sessionWindows.get(sessionWindowOwnerKey(sessionOwner)) === owner
+    && isAllowedSessionWindowNavigation(contents.getURL(), sessionOwner.sessionId, navigationPolicy)) return owner;
   const extensionId = extensionWindowIdsByContents.get(contents);
   return extensionId !== undefined && extensionWindows.get(extensionId) === owner
     && isAllowedExtensionWindowNavigation(contents.getURL(), extensionId, navigationPolicy) ? owner : undefined;
@@ -5694,7 +5899,7 @@ function assertGlobalVoiceOwnerSender(event: IpcMainInvokeEvent): void {
 
 function assertGlobalVoiceSettingsSender(event: IpcMainInvokeEvent): void {
   assertTrustedIpcSender(event);
-  if (event.sender === mainWindow?.webContents || sessionWindowIdsByContents.has(event.sender)) return;
+  if (event.sender === mainWindow?.webContents || sessionWindowOwnersByContents.has(event.sender)) return;
   throw new Error("Global voice settings are restricted to a trusted application window.");
 }
 

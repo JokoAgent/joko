@@ -185,6 +185,9 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const sessionApplicationWindow = typeof window !== "undefined" && isSessionApplicationWindow(window.location);
   const extensionApplicationWindow = typeof window !== "undefined" && isExtensionApplicationWindow(window.location);
   const auxiliaryApplicationWindow = sessionApplicationWindow || extensionApplicationWindow;
+  const bootSessionId = sessionApplicationWindow
+    ? new URLSearchParams(window.location.search).get("bootSession") ?? undefined
+    : undefined;
   const t = useCallback((key: Parameters<typeof translate>[1], values?: Parameters<typeof translate>[2]) => translate(state.preferences.locale, key, values), [state.preferences.locale]);
   const [renameSession, setRenameSession] = useState<SessionView>();
   const [archiveRemoval, setArchiveRemoval] = useState<SessionRemovalDialogRequest>();
@@ -363,15 +366,25 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     };
   }, [auxiliaryApplicationWindow]);
   useEffect(() => {
+    if (!sessionApplicationWindow || bootSessionId === undefined) return;
+    const readOwner = window.jokoDesktop?.sessionWindows.getOwner;
+    if (readOwner === undefined) return;
+    let retired = false;
+    void readOwner().then((owner) => {
+      if (!retired && owner.sessionId === bootSessionId) setBootConnectionProfileId(owner.profileId);
+    }).catch(() => undefined);
+    return () => { retired = true; };
+  }, [bootSessionId, sessionApplicationWindow]);
+  useEffect(() => {
     if (typeof BroadcastChannel === "undefined") return;
     const channel = new BroadcastChannel("joko:application-window-bootstrap");
-    const requestId = auxiliaryApplicationWindow
+    const requestId = extensionApplicationWindow
       ? `${Date.now().toString(36)}-${window.crypto.getRandomValues(new Uint32Array(2)).join("-")}`
       : undefined;
     channel.onmessage = (event: MessageEvent<unknown>): void => {
       if (typeof event.data !== "object" || event.data === null || Array.isArray(event.data)) return;
       const message = event.data as Record<string, unknown>;
-      if (message["kind"] === "request-profile" && typeof message["requestId"] === "string") {
+      if (!auxiliaryApplicationWindow && message["kind"] === "request-profile" && typeof message["requestId"] === "string") {
         const profileId = controllerRef.current.state.activeProfile?.id;
         if (profileId !== undefined) channel.postMessage({ kind: "profile", requestId: message["requestId"], profileId });
         return;
@@ -391,7 +404,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       window.clearTimeout(stop);
       channel.close();
     };
-  }, [auxiliaryApplicationWindow]);
+  }, [auxiliaryApplicationWindow, extensionApplicationWindow]);
   useEffect(() => {
     if (!auxiliaryApplicationWindow || !state.ready || state.activeProfile !== undefined ||
       state.connectionState !== "disconnected" || bootConnectionProfileId === undefined || bootConnectionAttemptedRef.current) return;
@@ -1486,11 +1499,12 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   };
   const openTaskWindow = (session: SessionView): void => {
     const desktop = window.jokoDesktop;
-    if (desktop?.capabilities.includes("session.windows") === true) {
-      void desktop.sessionWindows.open(session.id).catch(() => setLayoutNotice(t("split.openFailed")));
+    const profileId = state.activeProfile?.id;
+    if (desktop?.capabilities.includes("session.windows") === true && profileId !== undefined) {
+      void desktop.sessionWindows.open({ profileId, sessionId: session.id }).catch(() => setLayoutNotice(t("split.openFailed")));
       return;
     }
-    if (openSessionWindowFallback(window.location, session.id, state.activeProfile?.id) === null) setLayoutNotice(t("split.openFailed"));
+    if (openSessionWindowFallback(window.location, session.id, profileId) === null) setLayoutNotice(t("split.openFailed"));
   };
   const moveTaskToProject = (session: SessionView, placement: SessionProjectNavigationPlacement): void => {
     const authoritative = state.snapshot.sessions.find((candidate) => candidate.id === session.id);

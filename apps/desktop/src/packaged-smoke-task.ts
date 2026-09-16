@@ -47,6 +47,7 @@ export interface PackagedSmokeTaskOptions {
   readonly isAuthorityCurrent: (connection: DesktopManagedOrchestratorConnection) => boolean | Promise<boolean>;
   readonly displayName: string;
   readonly providerOrigin?: string;
+  readonly reuseConfiguredProvider?: boolean;
   readonly timeoutMs?: number;
   readonly operationId?: () => string;
   readonly transportFactory?: (origin: string, authKey: string | undefined, timeoutMs: number) => Transport;
@@ -65,13 +66,15 @@ export async function createPackagedSmokeTask(options: PackagedSmokeTaskOptions)
     const initial = await ownerSnapshot(eventClient, signal);
     const candidate = selectTaskTarget(initial);
     const providerProtocol = selectPackagedSmokeProviderProtocol(candidate.backend);
-    await configurePackagedSmokeProvider(
-      options,
-      operationClient,
-      candidate.backend.backendId,
-      providerProtocol,
-      signal
-    );
+    if (options.reuseConfiguredProvider !== true) {
+      await configurePackagedSmokeProvider(
+        options,
+        operationClient,
+        candidate.backend.backendId,
+        providerProtocol,
+        signal
+      );
+    }
     const selected = await waitForConfiguredTaskTarget(
       eventClient,
       candidate,

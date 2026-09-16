@@ -252,6 +252,7 @@ type JokoDesktopDeepLinkNavigation =
 
 interface JokoDesktopSessionDragPreviewRequest {
   readonly gestureId: string;
+  readonly profileId: string;
   readonly sessionId: string;
   readonly label: string;
   readonly hint: string;
@@ -293,7 +294,8 @@ interface JokoDesktopApi {
     close(): Promise<void>;
   };
   readonly sessionWindows: {
-    open(sessionId: string): Promise<{ readonly focusedExisting: boolean }>;
+    open(owner: { readonly profileId: string; readonly sessionId: string }): Promise<{ readonly focusedExisting: boolean }>;
+    getOwner(): Promise<{ readonly profileId: string; readonly sessionId: string }>;
     beginDragPreview(request: JokoDesktopSessionDragPreviewRequest): Promise<boolean>;
     endDragPreview(gestureId: string): Promise<boolean>;
     openIfDroppedOutside(gestureId: string): Promise<

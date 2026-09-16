@@ -48,6 +48,7 @@ import type {
   DesktopRuntimeProcessMonitorOpenResult,
   DesktopSessionDragPreviewRequest,
   DesktopSessionWindowDropResult,
+  DesktopSessionWindowOwner,
   DesktopSessionWindowOpenResult,
   DesktopUpdateAutoRelaunchSettings,
   DesktopUpdateCheckResult,
@@ -71,6 +72,7 @@ const DESKTOP_CHANNELS = {
   windowSetZoomFactor: "joko:window:set-zoom-factor",
   windowClose: "joko:window:close",
   sessionWindowOpen: "joko:session-window:open",
+  sessionWindowGetOwner: "joko:session-window:owner:get",
   extensionWindowOpen: "joko:extension-window:open",
   extensionLibraryPickLocation: "joko:extension-library:pick-location",
   extensionLibraryReveal: "joko:extension-library:reveal",
@@ -220,10 +222,12 @@ const desktopApi = Object.freeze({
     close: (): Promise<void> => ipcRenderer.invoke(DESKTOP_CHANNELS.windowClose)
   }),
   sessionWindows: Object.freeze({
-    open: (sessionId: string): Promise<DesktopSessionWindowOpenResult> => {
-      if (!isDesktopNotificationSessionId(sessionId)) return Promise.reject(new TypeError("Task identity is invalid."));
-      return ipcRenderer.invoke(DESKTOP_CHANNELS.sessionWindowOpen, sessionId).then(parseDesktopSessionWindowOpenResult);
+    open: (owner: DesktopSessionWindowOwner): Promise<DesktopSessionWindowOpenResult> => {
+      if (!isDesktopSessionWindowOwner(owner)) return Promise.reject(new TypeError("Task window owner is invalid."));
+      return ipcRenderer.invoke(DESKTOP_CHANNELS.sessionWindowOpen, owner).then(parseDesktopSessionWindowOpenResult);
     },
+    getOwner: (): Promise<DesktopSessionWindowOwner> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.sessionWindowGetOwner).then(parseDesktopSessionWindowOwner),
     beginDragPreview: (request: DesktopSessionDragPreviewRequest): Promise<boolean> => {
       if (!isDesktopSessionDragPreviewRequest(request)) {
         return Promise.reject(new TypeError("Task drag preview request is invalid."));
@@ -712,6 +716,12 @@ function isDesktopNotificationSessionId(value: unknown): value is string {
     value.trim() === value && !/[\u0000-\u001f\u007f]/u.test(value);
 }
 
+function isDesktopSessionWindowOwner(value: unknown): value is DesktopSessionWindowOwner {
+  return nativeRecord(value) && nativeKeys(value) === "profileId,sessionId"
+    && isDesktopNotificationSessionId(value["profileId"])
+    && isDesktopNotificationSessionId(value["sessionId"]);
+}
+
 function isDesktopExtensionId(value: unknown): value is string {
   return typeof value === "string" && /^extension_[a-f0-9]{32}$/u.test(value);
 }
@@ -756,8 +766,9 @@ function isDesktopSessionDragGestureId(value: unknown): value is string {
 }
 
 function isDesktopSessionDragPreviewRequest(value: unknown): value is DesktopSessionDragPreviewRequest {
-  if (!nativeRecord(value) || nativeKeys(value) !== "gestureId,hint,label,palette,sessionId" ||
+  if (!nativeRecord(value) || nativeKeys(value) !== "gestureId,hint,label,palette,profileId,sessionId" ||
     !isDesktopSessionDragGestureId(value["gestureId"]) || !nativeDragText(value["sessionId"], 256) ||
+    !nativeDragText(value["profileId"], 256) ||
     !nativeDragText(value["label"], 160) || !nativeDragText(value["hint"], 160)) return false;
   const palette = value["palette"];
   return nativeRecord(palette) && nativeKeys(palette) === "accent,border,muted,surface,text" &&
@@ -1140,6 +1151,11 @@ function parseDesktopMainWindowCloseSettings(value: unknown): DesktopMainWindowC
     throw new TypeError("Main-window close settings are invalid.");
   }
   return Object.freeze({ behavior: entry["behavior"] as DesktopMainWindowCloseSettings["behavior"], revision: entry["revision"] as number });
+}
+
+function parseDesktopSessionWindowOwner(value: unknown): DesktopSessionWindowOwner {
+  if (!isDesktopSessionWindowOwner(value)) throw new TypeError("Task window owner result is invalid.");
+  return Object.freeze({ profileId: value.profileId, sessionId: value.sessionId });
 }
 
 function parseDesktopExtensionWindowOpenResult(value: unknown): DesktopExtensionWindowOpenResult {

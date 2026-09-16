@@ -4390,9 +4390,10 @@ function SessionRow({ session, active, locale, targetName, match, t, priorityCon
           }
           const row = event.currentTarget.closest<HTMLElement>(".session-row");
           const ownerWindow = event.currentTarget.ownerDocument.defaultView;
-          const nativePreviewStarted = row !== null && ownerWindow !== null && startSessionWindowDragPreview({
+          const nativePreviewStarted = row !== null && ownerWindow !== null && sessionProfileId !== undefined && startSessionWindowDragPreview({
             dataTransfer: event.dataTransfer,
             row,
+            profileId: sessionProfileId,
             sessionId: session.id,
             label: session.name,
             hint: t("session.openNewWindow"),

@@ -3,6 +3,7 @@ export const SESSION_WINDOW_DRAG_PREVIEW_TIMEOUT_MS = 30_000;
 interface SessionWindowDragPreviewStart {
   readonly dataTransfer: DataTransfer;
   readonly row: HTMLElement;
+  readonly profileId: string;
   readonly sessionId: string;
   readonly label: string;
   readonly hint: string;
@@ -90,7 +91,14 @@ export function startSessionWindowDragPreview(request: SessionWindowDragPreviewS
 
   const api = request.ownerWindow.jokoDesktop?.sessionWindows;
   try {
-    void api?.beginDragPreview({ gestureId, sessionId: request.sessionId, label, hint, palette })
+    void api?.beginDragPreview({
+      gestureId,
+      profileId: request.profileId,
+      sessionId: request.sessionId,
+      label,
+      hint,
+      palette
+    })
       .then((started) => {
         if (!started && activePreview === active) cancelSessionWindowDragPreview(request.ownerWindow);
       })

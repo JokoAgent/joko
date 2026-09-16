@@ -4,6 +4,7 @@ export const DESKTOP_CHANNELS = {
   windowSetZoomFactor: "joko:window:set-zoom-factor",
   windowClose: "joko:window:close",
   sessionWindowOpen: "joko:session-window:open",
+  sessionWindowGetOwner: "joko:session-window:owner:get",
   extensionWindowOpen: "joko:extension-window:open",
   extensionLibraryPickLocation: "joko:extension-library:pick-location",
   extensionLibraryReveal: "joko:extension-library:reveal",
@@ -299,6 +300,17 @@ export interface DesktopSessionWindowOpenResult {
   readonly focusedExisting: boolean;
 }
 
+export interface DesktopSessionWindowOwner {
+  readonly profileId: string;
+  readonly sessionId: string;
+}
+
+export function isDesktopSessionWindowOwner(value: unknown): value is DesktopSessionWindowOwner {
+  return plainRecordWithKeys(value, ["profileId", "sessionId"])
+    && boundedDragText(value.profileId, 256)
+    && boundedDragText(value.sessionId, 256);
+}
+
 export interface DesktopExtensionWindowOpenResult {
   readonly focusedExisting: boolean;
 }
@@ -348,6 +360,7 @@ export interface DesktopSessionDragPreviewPalette {
 
 export interface DesktopSessionDragPreviewRequest {
   readonly gestureId: string;
+  readonly profileId: string;
   readonly sessionId: string;
   readonly label: string;
   readonly hint: string;
@@ -366,8 +379,9 @@ export function isDesktopSessionDragGestureId(value: unknown): value is string {
 }
 
 export function isDesktopSessionDragPreviewRequest(value: unknown): value is DesktopSessionDragPreviewRequest {
-  if (!plainRecordWithKeys(value, ["gestureId", "sessionId", "label", "hint", "palette"])) return false;
-  if (!isDesktopSessionDragGestureId(value.gestureId) || !boundedDragText(value.sessionId, 256) ||
+  if (!plainRecordWithKeys(value, ["gestureId", "profileId", "sessionId", "label", "hint", "palette"])) return false;
+  if (!isDesktopSessionDragGestureId(value.gestureId) || !boundedDragText(value.profileId, 256) ||
+    !boundedDragText(value.sessionId, 256) ||
     !boundedDragText(value.label, 160) || !boundedDragText(value.hint, 160) ||
     !plainRecordWithKeys(value.palette, ["surface", "border", "text", "muted", "accent"])) return false;
   return Object.values(value.palette).every((color) => typeof color === "string" && color.length <= 128 &&

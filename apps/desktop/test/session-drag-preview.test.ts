@@ -54,6 +54,7 @@ describe("native task drag preview", () => {
     expect(coordinator.finish(firstOwner, "gesture_owner_0001")).toEqual({
       kind: "outside",
       point: { x: -800, y: 500 },
+      profileId: "profile-one",
       sessionId: "task-one"
     });
     expect(first.destroyCalls).toBe(1);
@@ -73,6 +74,7 @@ describe("native task drag preview", () => {
     expect(coordinator.finishNativeRelease()).toEqual({
       kind: "outside",
       point: { x: -500, y: 400 },
+      profileId: "profile-one",
       sessionId: "task-one",
       owner,
       gestureId: "gesture_owner_0001"
@@ -248,6 +250,7 @@ function previewEnvironment(): {
 function request(overrides: Partial<DesktopSessionDragPreviewRequest> = {}): DesktopSessionDragPreviewRequest {
   return {
     gestureId: "gesture_owner_0001",
+    profileId: "profile-one",
     sessionId: "task-one",
     label: "Task one",
     hint: "Open in new window",

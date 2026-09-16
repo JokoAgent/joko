@@ -28,6 +28,7 @@ describe("task window drag preview lifecycle", () => {
     expect(startSessionWindowDragPreview({
       dataTransfer: { setDragImage } as unknown as DataTransfer,
       row,
+      profileId: "profile-one",
       sessionId: "task-one",
       label: "Task one",
       hint: "Open in new window",
@@ -52,6 +53,7 @@ describe("task window drag preview lifecycle", () => {
     expect(startSessionWindowDragPreview({
       dataTransfer: transfer,
       row,
+      profileId: "profile-one",
       sessionId: "task-one",
       label: "Task one",
       hint: "Open in new window",
@@ -66,6 +68,7 @@ describe("task window drag preview lifecycle", () => {
     expect(startSessionWindowDragPreview({
       dataTransfer: transfer,
       row,
+      profileId: "profile-one",
       sessionId: "task-two",
       label: "Task two",
       hint: "Open in new window",
@@ -81,6 +84,7 @@ describe("task window drag preview lifecycle", () => {
     expect(startSessionWindowDragPreview({
       dataTransfer: { setDragImage: vi.fn() } as unknown as DataTransfer,
       row,
+      profileId: "profile-one",
       sessionId: "task-one",
       label: "Task one",
       hint: "Open in new window",
@@ -107,6 +111,7 @@ describe("task window drag preview lifecycle", () => {
     expect(startSessionWindowDragPreview({
       dataTransfer: { setDragImage: vi.fn() } as unknown as DataTransfer,
       row,
+      profileId: "profile-one",
       sessionId: "task-one",
       label: "Task one",
       hint: "Open in new window",

@@ -192,6 +192,59 @@ describe("packaged Desktop durable Task acceptance fixture", () => {
     expect(readAuthKey).not.toHaveBeenCalled();
   });
 
+  it("reuses an already accepted Provider while still validating its projected runtime", async () => {
+    const calls: Array<{ readonly method: string; readonly input: any }> = [];
+    let snapshots = 0;
+    const transport = fakeTransport(async (method, input) => {
+      calls.push({ method, input });
+      if (method === "getServerInfo") return serverInfo("managed-server");
+      if (method === "getSnapshot") {
+        snapshots += 1;
+        return { snapshot: snapshot(snapshots >= 3 ? [taskSession()] : [], true, true) };
+      }
+      if (method === "prepareTargetWorkspace") {
+        return {
+          workspace: {
+            workspaceId: "workspace-managed",
+            targetId: "target-managed",
+            version: { revision: { value: 7n } }
+          }
+        };
+      }
+      if (method === "submitOperation" && input.mutation.payload.case === "createSession") {
+        return {
+          operation: {
+            operationId: input.operationId,
+            connectionId: input.connectionId,
+            state: OperationState.SUCCEEDED,
+            result: { payload: { case: "session", value: taskSession() } }
+          }
+        };
+      }
+      throw new Error(`Unexpected method: ${method}`);
+    });
+
+    await expect(createPackagedSmokeTask({
+      connection: CONNECTION,
+      displayName: DISPLAY_NAME,
+      providerOrigin: PROVIDER_ORIGIN,
+      reuseConfiguredProvider: true,
+      readAuthKey: async () => AUTH_KEY,
+      isAuthorityCurrent: async () => true,
+      transportFactory: () => transport
+    })).resolves.toEqual(TASK);
+
+    expect(calls.map((call) => call.method)).toEqual([
+      "getServerInfo",
+      "getSnapshot",
+      "getSnapshot",
+      "prepareTargetWorkspace",
+      "submitOperation",
+      "getSnapshot"
+    ]);
+    expect(calls.some((call) => call.input?.mutation?.payload?.case === "upsertProvider")).toBe(false);
+  });
+
   it("does not replace a missing managed-runtime Target with an unrelated installed Backend", async () => {
     const calls: string[] = [];
     const transport = fakeTransport(async (method) => {

@@ -84,7 +84,9 @@ describe("Sidebar organizer display controls", () => {
         sessionWindows: { beginDragPreview, endDragPreview, openIfDroppedOutside }
       }
     });
-    const rendered = await renderSidebar(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, vi.fn());
+    const rendered = await renderSidebar(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, vi.fn(), {
+      machineControl: activeProfileMachineControl("profile-local")
+    });
     const button = rendered.container.querySelector<HTMLButtonElement>("[data-session-id='session']");
     const row = button?.closest<HTMLElement>(".session-row");
     if (button === null || row === null || button === undefined || row === undefined) {
@@ -102,6 +104,7 @@ describe("Sidebar organizer display controls", () => {
       await Promise.resolve();
     });
     const request = beginDragPreview.mock.calls[0]?.[0] as JokoDesktopSessionDragPreviewRequest | undefined;
+    expect(request?.profileId).toBe("profile-local");
     expect(request?.sessionId).toBe("session");
     expect(setDragImage).toHaveBeenCalledOnce();
     expect(clearData).toHaveBeenCalledOnce();
@@ -130,7 +133,9 @@ describe("Sidebar organizer display controls", () => {
         sessionWindows: { beginDragPreview, endDragPreview, openIfDroppedOutside }
       }
     });
-    const rendered = await renderSidebar(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, vi.fn());
+    const rendered = await renderSidebar(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, vi.fn(), {
+      machineControl: activeProfileMachineControl("profile-local")
+    });
     const button = rendered.container.querySelector<HTMLButtonElement>("[data-session-id='session']");
     const row = button?.closest<HTMLElement>(".session-row");
     if (button === null || row === null || button === undefined || row === undefined) {
@@ -1405,6 +1410,28 @@ interface SidebarRenderOptions {
   readonly onPreviewScheduleDeletion?: SidebarProps["onPreviewScheduleDeletion"];
   readonly onDeleteSchedule?: SidebarProps["onDeleteSchedule"];
   readonly machineControl?: SidebarProps["machineControl"];
+}
+
+function activeProfileMachineControl(profileId: string): NonNullable<SidebarProps["machineControl"]> {
+  const activeProfile = {
+    id: profileId,
+    deviceId: `device-${profileId}`,
+    serverId: `server-${profileId}`,
+    name: "Local",
+    origin: "http://127.0.0.1:1"
+  };
+  return {
+    profiles: [activeProfile],
+    activeProfile,
+    presenceByProfile: { [profileId]: "current" },
+    caches: [],
+    selection: "all",
+    onSelectionChange: vi.fn(),
+    onRefresh: vi.fn(),
+    onSwitch: vi.fn(),
+    onOpenCachedSession: vi.fn(),
+    onOpenMessageMatch: vi.fn()
+  };
 }
 
 async function renderSidebar(
