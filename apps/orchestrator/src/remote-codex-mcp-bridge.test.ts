@@ -92,12 +92,25 @@ describe("RemoteCodexMcpBridgeManager", () => {
     const client = new Client({ name: "remote-codex-fixture", version: "1.0.0" }, { capabilities: {} });
     cleanups.push(async () => client.close());
     await client.connect(new StreamableHTTPClientTransport(new URL(bridge.routes[0]!.url)));
-    expect(await client.listTools()).toMatchObject({ tools: [{ name: "echo", description: "Echo one value" }] });
+    expect(await client.listTools()).toMatchObject({ tools: [{
+      name: "echo",
+      description: "Echo one value",
+      outputSchema: {
+        type: "object",
+        properties: { echoed: { type: "string" } },
+        required: ["echoed"],
+        additionalProperties: false
+      }
+    }] });
     expect(await client.callTool({
       name: "echo",
       arguments: { value: "remote result" },
       _meta: { threadId: "native-root" }
-    })).toMatchObject({ content: [{ type: "text", text: "remote result" }], isError: false });
+    })).toMatchObject({
+      content: [{ type: "text", text: "remote result" }],
+      structuredContent: { echoed: "remote result" },
+      isError: false
+    });
     expect(calls).toHaveLength(1);
     expect(calls[0]).toMatchObject({ sessionId: "session-remote", targetId: "target-remote", generation: 1 });
     expect(calls[0]!.requestIdentity).toMatch(/^[a-f0-9]{64}$/u);
@@ -226,12 +239,23 @@ function provider(calls: BridgeToolCallContext[]): BridgeToolProvider {
       name: "echo",
       description: "Echo one value",
       inputSchema: { type: "object", properties: { value: { type: "string" } } },
+      outputSchema: {
+        type: "object",
+        properties: { echoed: { type: "string" } },
+        required: ["echoed"],
+        additionalProperties: false
+      },
       requiresPermission: false
     }],
     callTool: async (_name, arguments_, signal, context) => {
       signal?.throwIfAborted();
       calls.push(context);
-      return { content: [{ type: "text", text: String(arguments_["value"] ?? "") }], isError: false };
+      const echoed = String(arguments_["value"] ?? "");
+      return {
+        content: [{ type: "text", text: echoed }],
+        structuredContent: { echoed },
+        isError: false
+      };
     }
   };
 }

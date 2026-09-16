@@ -120,6 +120,9 @@ export interface PiMcpToolDescriptor {
   readonly policySubject?: PolicySubjectKind;
   readonly description: string;
   readonly inputSchema: Readonly<Record<string, unknown>>;
+  /** Exact provider declaration retained for standard MCP facades. The Pi
+   * runtime never interprets this schema as result or Artifact authority. */
+  readonly outputSchema?: Readonly<Record<string, unknown>>;
   /** Service-owned policy hint. Only an explicit false is treated as read-only. */
   readonly requiresPermission: boolean;
 }
@@ -367,6 +370,11 @@ export async function writeMcpDescriptor(path: string, descriptor: PiMcpBridgeDe
     if (seen.has(fullName)) throw piError("PI_MCP_DUPLICATE_TOOL", `Duplicate MCP tool '${fullName}'`, "provision");
     seen.add(fullName);
     if (!isPlainObject(tool.inputSchema)) throw piError("PI_MCP_INVALID_SCHEMA", `MCP tool '${fullName}' has an invalid input schema`, "provision");
+    if (tool.outputSchema !== undefined && (
+      !isPlainObject(tool.outputSchema) || tool.outputSchema["type"] !== "object"
+    )) {
+      throw piError("PI_MCP_INVALID_SCHEMA", `MCP tool '${fullName}' has an invalid output schema`, "provision");
+    }
     if (typeof tool.requiresPermission !== "boolean") {
       throw piError("PI_MCP_INVALID_PERMISSION_HINT", `MCP tool '${fullName}' has an invalid permission hint`, "provision");
     }

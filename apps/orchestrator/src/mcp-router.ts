@@ -523,6 +523,16 @@ export class McpRouter {
     if (provider.tools.some((tool) => tool.serverId !== provider.id)) {
       throw new Error("Bridge Tool descriptor uses a different provider ID.");
     }
+    for (const tool of provider.tools) {
+      if (!isPlainObject(tool.inputSchema)) throw new Error("Bridge Tool input schema is invalid.");
+      assertBoundedJson(tool.inputSchema, 1024 * 1024, "Bridge Tool input schema");
+      if (tool.outputSchema !== undefined) {
+        if (!isPlainObject(tool.outputSchema) || tool.outputSchema["type"] !== "object") {
+          throw new Error("Bridge Tool output schema is invalid.");
+        }
+        assertBoundedJson(tool.outputSchema, 1024 * 1024, "Bridge Tool output schema");
+      }
+    }
     const duplicate = duplicateToolName(provider.tools);
     if (duplicate !== undefined) throw new Error(`Bridge Tool Provider advertised duplicate tool '${duplicate}'.`);
     if (provider.configurablePolicy !== undefined) {
@@ -731,6 +741,7 @@ export class McpRouter {
         policySubject: "mcp",
         description: tool.description,
         inputSchema: tool.inputSchema,
+        ...(tool.outputSchema === undefined ? {} : { outputSchema: tool.outputSchema }),
         requiresPermission: tool.requiresPermission
       });
     }
@@ -754,6 +765,7 @@ export class McpRouter {
         policySubject: provider.policySubject ?? "mcp",
         description: tool.description,
         inputSchema: tool.inputSchema,
+        ...(tool.outputSchema === undefined ? {} : { outputSchema: tool.outputSchema }),
         requiresPermission: tool.requiresPermission
       });
     }
@@ -2201,7 +2213,9 @@ function normalizeTool(serverId: string, tool: McpListedTool): McpToolDescriptor
   if (!isPlainObject(tool.inputSchema)) throw new Error("MCP tool input schema is invalid.");
   assertBoundedJson(tool.inputSchema, 1024 * 1024, "MCP tool schema");
   if (tool.outputSchema !== undefined) {
-    if (!isPlainObject(tool.outputSchema)) throw new Error("MCP tool output schema is invalid.");
+    if (!isPlainObject(tool.outputSchema) || tool.outputSchema["type"] !== "object") {
+      throw new Error("MCP tool output schema is invalid.");
+    }
     assertBoundedJson(tool.outputSchema, 1024 * 1024, "MCP tool output schema");
   }
   return {
@@ -2374,6 +2388,7 @@ function bridgeGrantAuthorityDigest(input: {
       policySubject: tool.policySubject,
       description: tool.description,
       inputSchema: tool.inputSchema,
+      ...(tool.outputSchema === undefined ? {} : { outputSchema: tool.outputSchema }),
       requiresPermission: tool.requiresPermission
     })),
     ...(input.nativeAuth === undefined ? {} : {

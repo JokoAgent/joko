@@ -277,7 +277,8 @@ export class RemoteCodexMcpBridgeManager {
         tools: route.tools.map((tool) => ({
           name: tool.name,
           description: tool.description,
-          inputSchema: objectSchema(tool.inputSchema)
+          inputSchema: objectSchema(tool.inputSchema),
+          ...(tool.outputSchema === undefined ? {} : { outputSchema: objectSchema(tool.outputSchema) })
         }))
       };
     });

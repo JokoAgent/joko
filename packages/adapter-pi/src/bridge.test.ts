@@ -33,6 +33,33 @@ describe("managed Pi bridge boundaries", () => {
     expect(MAXIMUM_MANAGED_MCP_BRIDGE_RESPONSE_BYTES).toBe(2 * 1024 * 1024);
   });
 
+  it("accepts only a current object output schema in the frozen MCP descriptor", () => {
+    const read = managedMcpDescriptorReader();
+    const base = {
+      endpoint: "http://127.0.0.1:4318/internal/mcp",
+      generation: 7,
+      sessionId: "session-7",
+      targetId: "target-7",
+      tools: [{
+        serverId: "fixture",
+        name: "structured",
+        description: "Structured output",
+        inputSchema: { type: "object" },
+        outputSchema: { type: "object", properties: { value: { type: "string" } } },
+        requiresPermission: false
+      }]
+    };
+    expect(read(base)?.tools[0]).toMatchObject({ outputSchema: { type: "object" } });
+    expect(() => read({
+      ...base,
+      tools: [{ ...base.tools[0], outputSchema: [] }]
+    })).toThrow(/invalid tool/u);
+    expect(() => read({
+      ...base,
+      tools: [{ ...base.tools[0], outputSchema: { type: "array" } }]
+    })).toThrow(/invalid tool/u);
+  });
+
   it("removes credentialed proxy names from model and direct-user Bash environments", () => {
     const sanitizeEnvironment = managedEnvironmentSanitizer(["HTTP_PROXY"]);
     expect(sanitizeEnvironment({
@@ -100,6 +127,38 @@ function managedQuestionResponseParser(): (
   return Function(`${output.outputText}\nreturn questionResponse;`)() as (
     value: string | undefined
   ) => Readonly<Record<string, unknown>> | undefined;
+}
+
+function managedMcpDescriptorReader(): (
+  value: unknown
+) => { readonly tools: readonly Readonly<Record<string, unknown>>[] } | undefined {
+  const start = MANAGED_BRIDGE_SOURCE.indexOf("function readMcpDescriptor(");
+  const end = MANAGED_BRIDGE_SOURCE.indexOf("\n\n// Read once for the process generation", start);
+  if (start < 0 || end < 0) throw new Error("Managed MCP descriptor reader source is unavailable");
+  const output = ts.transpileModule(MANAGED_BRIDGE_SOURCE.slice(start, end), {
+    compilerOptions: { module: ts.ModuleKind.None, target: ts.ScriptTarget.ES2022 },
+    reportDiagnostics: true
+  });
+  const syntaxErrors = output.diagnostics?.filter((diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error) ?? [];
+  if (syntaxErrors.length > 0) throw new Error("Managed MCP descriptor reader is invalid TypeScript");
+  const factory = Function(
+    "readFileSync",
+    "mcpDescriptorPath",
+    "mcpToken",
+    "runtimeGeneration",
+    `${output.outputText}\nreturn readMcpDescriptor;`
+  ) as (
+    read: () => string,
+    path: string,
+    token: string,
+    generation: number
+  ) => () => { readonly tools: readonly Readonly<Record<string, unknown>>[] } | undefined;
+  return (value) => factory(
+    () => JSON.stringify(value),
+    "mcp.json",
+    "private-token",
+    7
+  )();
 }
 
 function managedEnvironmentSanitizer(

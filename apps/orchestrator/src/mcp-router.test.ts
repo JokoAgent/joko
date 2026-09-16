@@ -62,6 +62,7 @@ class FakeMcpFactory implements McpClientFactory {
   readonly resourceReads: { uri: string; generation: number; signal: AbortSignal }[] = [];
   readResourceHandler: ((uri: string, signal: AbortSignal) => Promise<{ readonly contents: readonly unknown[] }>) | undefined;
   toolDescription = "Return the fenced generation";
+  toolOutputSchema: Readonly<Record<string, unknown>> | undefined;
   listToolsHandler: ((cursor: string | undefined, signal: AbortSignal) => Promise<McpToolListPage>) | undefined;
 
   async connect(input: McpClientFactoryInput): Promise<McpClientConnection> {
@@ -78,6 +79,7 @@ class FakeMcpFactory implements McpClientFactory {
           name: "echo",
           description: owner.toolDescription,
           inputSchema: { type: "object", properties: { value: { type: "string" } } },
+          ...(owner.toolOutputSchema === undefined ? {} : { outputSchema: owner.toolOutputSchema }),
           annotations: { readOnlyHint: true }
         }] };
       },
@@ -1881,6 +1883,80 @@ describe("McpRouter", () => {
       serverId: "joko_browser",
       toolName: "list_tools"
     })).rejects.toThrow(/credential/u);
+    await router.dispose();
+    store.close();
+  });
+
+  it("retains the discovered output schema in the frozen runtime grant without inventing one", async () => {
+    const { store, factory, router } = await fixture();
+    const outputSchema = {
+      type: "object",
+      properties: { tracks: { type: "array", items: { type: "object" } } },
+      required: ["tracks"],
+      additionalProperties: false
+    } as const;
+    factory.toolOutputSchema = outputSchema;
+    await router.upsert({
+      id: "structured",
+      displayName: "Structured MCP",
+      transport: "streamable_http",
+      endpoint: "https://mcp.example.test/rpc",
+      enabled: true,
+      credentialBindings: []
+    });
+
+    const declared = router.createPiBridgeSnapshot({ endpoint: "http://127.0.0.1:4318/internal/mcp" });
+    expect(declared.mcpBridge.tools.find((tool) => tool.serverId === "structured")?.outputSchema)
+      .toEqual(outputSchema);
+    declared.revoke();
+
+    factory.toolOutputSchema = undefined;
+    const withoutSchema = await router.upsert({
+      id: "plain",
+      displayName: "Plain MCP",
+      transport: "streamable_http",
+      endpoint: "https://plain.example.test/rpc",
+      enabled: true,
+      credentialBindings: []
+    });
+    const plain = router.createPiBridgeSnapshot({ endpoint: "http://127.0.0.1:4318/internal/mcp" });
+    expect(withoutSchema.tools[0]?.outputSchema).toBeUndefined();
+    expect(plain.mcpBridge.tools.find((tool) => tool.serverId === "plain"))
+      .not.toHaveProperty("outputSchema");
+    plain.revoke();
+    await router.dispose();
+    store.close();
+  });
+
+  it("rejects non-object output schemas before they enter a runtime grant", async () => {
+    const { store, factory, router } = await fixture();
+    factory.toolOutputSchema = { type: "array", items: { type: "string" } };
+    const descriptor = await router.upsert({
+      id: "invalid-output",
+      displayName: "Invalid output MCP",
+      transport: "streamable_http",
+      endpoint: "https://invalid-output.example.test/rpc",
+      enabled: true,
+      credentialBindings: []
+    });
+    expect(descriptor).toMatchObject({ state: "error", tools: [] });
+    expect(router.createPiBridgeSnapshot({ endpoint: "http://127.0.0.1:4318/internal/mcp" })
+      .mcpBridge.tools.some((tool) => tool.serverId === "invalid-output")).toBe(false);
+
+    expect(() => router.registerBridgeToolProvider({
+      id: "invalid-provider-output",
+      generation: 1,
+      available: true,
+      tools: [{
+        serverId: "invalid-provider-output",
+        name: "invalid",
+        description: "Invalid output",
+        inputSchema: { type: "object" },
+        outputSchema: { type: "array" },
+        requiresPermission: false
+      }],
+      callTool: async () => ({ content: [], isError: false })
+    })).toThrow(/output schema/u);
     await router.dispose();
     store.close();
   });
