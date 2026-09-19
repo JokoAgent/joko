@@ -1,6 +1,7 @@
 import { create, toBinary } from "@bufbuild/protobuf";
 import {
-  CapabilitySupport, ConnectionSchema, ConnectionState, DeviceKind, DevicePresenceState, DeviceSchema, EntityKind,
+  ArtifactKind, ArtifactSchema, BackendDescriptorSchema, CapabilityManifestSchema, CapabilitySchema, CapabilitySupport, ConnectionSchema, ConnectionState, DeviceKind, DevicePresenceState, DeviceSchema, EntityKind,
+  FileKind, FilePreviewSchema, FileRevisionSchema, TargetSchema, WorkspaceEntrySchema, WorkspaceFileChangeKind, WorkspaceFileChangeSchema,
   JOKO_API_VERSION, OperationSchema,
   EventCursorSchema, EventSchema, MessageRole, OperationMutationSchema, OperationState, SessionMessageSearchMatchSchema,
   SessionMessageSearchSessionStatus, SessionState, SnapshotSchema, TargetState, WorkspaceKind, capabilityNames
@@ -10,7 +11,7 @@ import { MobileClient, type MobileStorage, type PendingOperation } from "./mobil
 import { MobileCredentialStorageError, profileFromCredential } from "./connection-storage";
 import type { MobileDiscovery } from "./connection-discovery";
 import { normalizeNodeOrigin, parseNodeIdentity, type MobileNetwork, type NodeIdentity, type PairedCredential } from "./network";
-import type { Event, SessionMessageSearchMatch } from "@joko/contracts";
+import type { Event, SessionMessageSearchMatch, WorkspaceEntry, WorkspaceFileChange } from "@joko/contracts";
 import { timelineRows } from "./timeline";
 
 const credential: PairedCredential = {
@@ -64,6 +65,19 @@ const extendedSnapshot = create(SnapshotSchema, {
   ...snapshot,
   connections: [connection, otherConnection],
   devices: [device, otherDevice]
+});
+const filesSnapshot = create(SnapshotSchema, {
+  ...snapshot,
+  snapshotId: "files-snapshot",
+  backends: [create(BackendDescriptorSchema, {
+    ...snapshot.backends[0]!,
+    capabilities: create(CapabilityManifestSchema, { capabilities: [
+      create(CapabilitySchema, { name: capabilityNames.inputText, support: CapabilitySupport.SUPPORTED }),
+      create(CapabilitySchema, { name: capabilityNames.workspaceFiles, support: CapabilitySupport.SUPPORTED }),
+      create(CapabilitySchema, { name: capabilityNames.workspaceFilesWatch, support: CapabilitySupport.SUPPORTED })
+    ] })
+  })],
+  targets: [create(TargetSchema, { ...snapshot.targets[0]!, workspaceId: "workspace" })]
 });
 
 function memoryStorage(saved?: PairedCredential | readonly PairedCredential[], automatic: boolean | string = saved !== undefined) {
@@ -124,6 +138,18 @@ function fakeNetwork(): MobileNetwork {
         else signal.addEventListener("abort", () => resolve(), { once: true });
       });
     }),
+    listWorkspaceDirectory: vi.fn(async () => ({ entries: [], revision: "directory-1" })),
+    listWorkspaceFileIndex: vi.fn(async () => ({ paths: [], revision: "index-1", truncated: false })),
+    searchWorkspace: vi.fn(async () => ({ matches: [], revision: "search-1", truncated: false, totalFiles: 0 })),
+    watchWorkspace: vi.fn(async function* (_credential, _workspaceId, signal) {
+      await new Promise<void>((resolve) => {
+        if (signal.aborted) resolve();
+        else signal.addEventListener("abort", () => resolve(), { once: true });
+      });
+    }),
+    readWorkspaceFile: vi.fn(async () => { throw new Error("No Workspace file fixture was configured."); }),
+    listSessionArtifacts: vi.fn(async () => ({ artifacts: [], revision: "artifacts-1" })),
+    downloadBlob: vi.fn(async () => { throw new Error("No Blob fixture was configured."); }),
     prepareTarget: vi.fn(async () => undefined),
     submit: vi.fn(async (_credential, operationId, mutation) => {
       toBinary(OperationMutationSchema, mutation);
@@ -1082,5 +1108,187 @@ describe("mobile Home search and task mutations", () => {
     expect(app.state.error).toBe("The task changed on another client.");
     expect(saved.pending()).toEqual([]);
     expect(network.readOwner).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("native current-task Files ownership", () => {
+  const revision = create(FileRevisionSchema, {
+    opaqueRevision: "readme-1", sha256Hex: "a".repeat(64), byteSize: 6n,
+    modifiedAt: { seconds: 10n, nanos: 2 }
+  });
+  const readme = create(WorkspaceEntrySchema, {
+    workspaceId: "workspace", relativePath: "README.md", displayName: "README.md",
+    kind: FileKind.REGULAR, mediaType: "text/markdown", revision
+  });
+  const sourceDirectory = create(WorkspaceEntrySchema, {
+    workspaceId: "workspace", relativePath: "src", displayName: "src", kind: FileKind.DIRECTORY
+  });
+  const artifact = create(ArtifactSchema, {
+    artifactId: "artifact-1", sessionId: "session", kind: ArtifactKind.FILE, title: "Report",
+    blob: { blobId: "blob-1", fileName: "report.txt", mediaType: "text/plain", byteSize: 6n,
+      sha256Hex: "b".repeat(64) }
+  });
+
+  function configureFiles(network: MobileNetwork): void {
+    vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: filesSnapshot });
+    vi.mocked(network.readSession).mockResolvedValue(filesSnapshot);
+    vi.mocked(network.listWorkspaceDirectory).mockImplementation(async (_credential, _workspaceId, parentPath) => ({
+      entries: parentPath === "" ? [sourceDirectory, readme] : [], revision: `directory:${parentPath || "root"}`
+    }));
+    vi.mocked(network.listWorkspaceFileIndex).mockResolvedValue({
+      paths: ["README.md", "src/App.tsx"], revision: "index-1", truncated: false
+    });
+    vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [artifact], revision: "artifacts-1" });
+    vi.mocked(network.readWorkspaceFile).mockResolvedValue(create(FilePreviewSchema, {
+      entry: readme,
+      content: { case: "text", value: {
+        utf8Text: "# Joko", languageId: "markdown", startByte: 0n, endByte: 6n, totalLines: 1
+      } },
+      truncated: false
+    }));
+  }
+
+  it("opens only for an exact capable Session Workspace and carries the observed revision into preview", async () => {
+    const network = fakeNetwork();
+    configureFiles(network);
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+
+    expect(app.canOpenFiles()).toBe(true);
+    await app.openFiles();
+    expect(app.state.files).toMatchObject({
+      open: true,
+      status: "ready",
+      sessionId: "session",
+      location: { kind: "workspace", path: "" },
+      entries: [{ relativePath: "src" }, { relativePath: "README.md" }],
+      fileIndex: ["README.md", "src/App.tsx"],
+      artifacts: [{ artifactId: "artifact-1", sessionId: "session" }],
+      watchStatus: "watching"
+    });
+
+    await app.searchFiles("report", "name", false);
+    expect(app.state.files.searchResults).toMatchObject([{ kind: "artifact", artifact: { artifactId: "artifact-1" } }]);
+    await app.searchFiles("readme", "name", false);
+    expect(app.state.files.searchResults).toEqual([{ kind: "workspace-name", relativePath: "README.md" }]);
+    await app.previewFileSearchResult(app.state.files.searchResults[0]!);
+
+    expect(network.readWorkspaceFile).toHaveBeenCalledWith(
+      credential, "workspace", "README.md", revision, expect.any(AbortSignal)
+    );
+    expect(app.state.files.preview).toMatchObject({
+      kind: "text", text: "# Joko", languageId: "markdown", startByte: 0n, endByte: 6n,
+      totalLines: 1, truncated: false
+    });
+  });
+
+  it("retires late directory and content-search results after foreground or Session ownership changes", async () => {
+    const directoryNetwork = fakeNetwork();
+    configureFiles(directoryNetwork);
+    const directoryApp = client(directoryNetwork, memoryStorage(credential).storage);
+    await directoryApp.start();
+    await directoryApp.openFiles();
+    let resolveDirectory!: (value: { entries: readonly WorkspaceEntry[]; revision: string }) => void;
+    let directorySignal: AbortSignal | undefined;
+    vi.mocked(directoryNetwork.listWorkspaceDirectory).mockImplementationOnce((_credential, _workspaceId, _path, signal) => {
+      directorySignal = signal;
+      return new Promise((resolve) => { resolveDirectory = resolve; });
+    });
+    const directoryRead = directoryApp.openFilesDirectory("src");
+    await vi.waitFor(() => expect(directorySignal).toBeDefined());
+    directoryApp.setForeground(false);
+    expect(directorySignal?.aborted).toBe(true);
+    resolveDirectory({ entries: [create(WorkspaceEntrySchema, {
+      workspaceId: "workspace", relativePath: "src/late.ts", kind: FileKind.REGULAR,
+      revision: { opaqueRevision: "late" }
+    })], revision: "late-directory" });
+    await directoryRead;
+    expect(directoryApp.state.files.status).toBe("offline");
+    expect(directoryApp.state.files.entries).toEqual([]);
+
+    const searchNetwork = fakeNetwork();
+    configureFiles(searchNetwork);
+    const searchApp = client(searchNetwork, memoryStorage(credential).storage);
+    await searchApp.start();
+    await searchApp.openFiles();
+    let resolveSearch!: (value: Awaited<ReturnType<MobileNetwork["searchWorkspace"]>>) => void;
+    let searchSignal: AbortSignal | undefined;
+    vi.mocked(searchNetwork.searchWorkspace).mockImplementationOnce((_credential, _workspaceId, _query, _caseSensitive, signal) => {
+      searchSignal = signal;
+      return new Promise((resolve) => { resolveSearch = resolve; });
+    });
+    const search = searchApp.searchFiles("late", "content", false);
+    await vi.waitFor(() => expect(searchSignal).toBeDefined());
+    await searchApp.select(undefined);
+    expect(searchSignal?.aborted).toBe(true);
+    resolveSearch({ matches: [], revision: "late-search", truncated: false, totalFiles: 0 });
+    await search;
+    expect(searchApp.state.files.authorityKey).toBeUndefined();
+    expect(searchApp.state.files.searchResults).toEqual([]);
+  });
+
+  it("cancels Blob bytes on close and never adopts them into a later Files owner", async () => {
+    const network = fakeNetwork();
+    configureFiles(network);
+    const imageArtifact = create(ArtifactSchema, {
+      ...artifact,
+      artifactId: "image-1",
+      title: "Image",
+      blob: { ...artifact.blob!, blobId: "image-blob", fileName: "image.png", mediaType: "image/png" }
+    });
+    vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [imageArtifact], revision: "artifacts-image" });
+    let resolveBlob!: (value: Awaited<ReturnType<MobileNetwork["downloadBlob"]>>) => void;
+    let blobSignal: AbortSignal | undefined;
+    vi.mocked(network.downloadBlob).mockImplementationOnce((_credential, _blob, signal) => {
+      blobSignal = signal;
+      return new Promise((resolve) => { resolveBlob = resolve; });
+    });
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    await app.openFiles();
+
+    const preview = app.previewArtifact(app.state.files.artifacts[0]!);
+    await vi.waitFor(() => expect(blobSignal).toBeDefined());
+    app.closeFiles();
+    expect(blobSignal?.aborted).toBe(true);
+    resolveBlob({ bytes: new Uint8Array([1, 2, 3, 4, 5, 6]), mediaType: "image/png" });
+    await preview;
+    expect(app.state.files.open).toBe(false);
+    expect(app.state.files.preview).toBeUndefined();
+  });
+
+  it("invalidates preview and refreshes current directory, index and Artifacts after a Workspace watch event", async () => {
+    const network = fakeNetwork();
+    configureFiles(network);
+    const queued: WorkspaceFileChange[] = [];
+    let wake: (() => void) | undefined;
+    network.watchWorkspace = vi.fn(async function* (_credential, _workspaceId, signal) {
+      while (!signal.aborted) {
+        if (queued.length === 0) await new Promise<void>((resolve) => {
+          wake = resolve;
+          signal.addEventListener("abort", resolve, { once: true });
+        });
+        if (signal.aborted) return;
+        const change = queued.shift();
+        if (change) yield change;
+      }
+    });
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    await app.openFiles();
+    await app.previewWorkspaceEntry(app.state.files.entries.find((entry) => entry.relativePath === "README.md")!);
+    expect(app.state.files.preview?.kind).toBe("text");
+
+    queued.push(create(WorkspaceFileChangeSchema, {
+      workspaceId: "workspace", kind: WorkspaceFileChangeKind.MODIFIED, relativePath: "README.md",
+      sequence: 1n, streamRevision: "watch-1"
+    }));
+    wake?.();
+    wake = undefined;
+
+    await vi.waitFor(() => expect(app.state.files.preview).toBeUndefined());
+    await vi.waitFor(() => expect(network.listWorkspaceDirectory).toHaveBeenCalledTimes(2));
+    expect(network.listWorkspaceFileIndex).toHaveBeenCalledTimes(2);
+    expect(network.listSessionArtifacts).toHaveBeenCalledTimes(2);
   });
 });

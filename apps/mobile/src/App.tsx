@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type RefObject } from "react";
 import {
   AccessibilityInfo, ActivityIndicator, Alert, AppState, FlatList, KeyboardAvoidingView, Modal, Platform,
-  Pressable, ScrollView, SectionList, StyleSheet, Text, TextInput, findNodeHandle, useColorScheme,
+  Image, Pressable, ScrollView, SectionList, StyleSheet, Text, TextInput, findNodeHandle, useColorScheme,
   useWindowDimensions, View
 } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
@@ -9,7 +9,7 @@ import { SvgXml } from "react-native-svg";
 import { StatusBar } from "expo-status-bar";
 import { randomUUID } from "expo-crypto";
 import {
-  CapabilitySupport, ConnectionState, DeviceKind, DevicePresenceState, QueueItemState, TargetState, capabilityNames,
+  CapabilitySupport, ConnectionState, DeviceKind, DevicePresenceState, FileKind, QueueItemState, TargetState, capabilityNames,
   type Session
 } from "@joko/contracts";
 import { MobileConnectionStage } from "./MobileConnectionStage";
@@ -31,9 +31,16 @@ import {
   buildMobileHomeSections, buildWideSessionNavLayout, createSwipeRowRegistry,
   type MobileHomeStatusFilter
 } from "./home-navigation";
+import {
+  artifactTitle,
+  workspaceBasename,
+  workspaceParentPath,
+  type MobileFileSearchResult,
+  type MobileFilesSearchMode
+} from "./workspace-files";
 
 const client = new MobileClient(mobileNetwork, mobileStorage, mobileDiscovery, randomUUID, Platform.OS);
-type Page = "home" | "connection" | "new" | "task" | "connections" | "devices" | "device";
+type Page = "home" | "connection" | "new" | "task" | "files" | "connections" | "devices" | "device";
 
 export function App() {
   const state = useSyncExternalStore((listener) => client.subscribe(listener), () => client.state);
@@ -65,7 +72,11 @@ export function App() {
       setMenuOpen(false);
       if (page !== "connection") setPage("home");
     }
-    if (page === "task" && !state.selectedId) setPage("home");
+    if ((page === "task" || page === "files") && !state.selectedId) setPage("home");
+    if (page === "files" && state.status === "connected" && !client.canOpenFiles()) {
+      client.closeFiles();
+      setPage(state.selectedId ? "task" : "home");
+    }
     if (page === "device" && !state.owner?.devices.some((device) => device.deviceId === deviceId)) setPage("devices");
   }, [state.status, state.activeProfileId, state.selectedId, state.owner?.devices, deviceId, page]);
 
@@ -90,7 +101,9 @@ export function App() {
               onConnected={() => setPage("home")} /> :
             <SafeAreaView style={styles.fill} edges={["top", "left", "right", "bottom"]}>
               {page === "new" ? <NewTaskScreen {...common} onBack={() => setPage("home")} onCreated={() => setPage("task")} /> :
-                page === "task" ? <TaskScreen {...common} onBack={() => setPage("home")} onHome={() => setPage("home")} onNew={() => setPage("new")} /> :
+                page === "task" ? <TaskScreen {...common} onBack={() => setPage("home")} onHome={() => setPage("home")} onNew={() => setPage("new")}
+                  onFiles={() => setPage("files")} /> :
+                page === "files" ? <FilesScreen {...common} onBack={() => setPage("task")} /> :
                 page === "connections" ? <ConnectionsScreen {...common} onBack={() => setPage("home")}
                   onSwitch={() => setPage("connection")} /> :
                 page === "devices" ? <DevicesScreen {...common} onBack={() => setPage("home")}
@@ -675,8 +688,8 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
   </ScrollView>;
 }
 
-function TaskScreen({ colors, state, onBack, onHome, onNew }: ScreenProps & {
-  onBack: () => void; onHome: () => void; onNew: () => void;
+function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenProps & {
+  onBack: () => void; onHome: () => void; onNew: () => void; onFiles: () => void;
 }) {
   const [draft, setDraft] = useState("");
   const [localError, setLocalError] = useState("");
@@ -714,7 +727,10 @@ function TaskScreen({ colors, state, onBack, onHome, onNew }: ScreenProps & {
         <Text style={[styles.title, { color: colors.ink }]} numberOfLines={1}>{session?.displayName || "Task"}</Text>
         <Text style={[styles.caption, { color: colors.muted }]}>{session ? sessionState(session.state) : "Loading…"}</Text>
       </View>
-      <Action label="Refresh" onPress={() => void client.refresh()} colors={colors} compact />
+      <View style={styles.headerActions}>
+        {client.canOpenFiles() && <Action label="Files" onPress={onFiles} colors={colors} compact />}
+        <Action label="Refresh" onPress={() => void client.refresh()} colors={colors} compact />
+      </View>
     </View>
     <Text accessibilityLiveRegion="polite" style={[styles.caption, styles.queue, { color: colors.muted }]}>
       {state.liveStatus === "streaming" ? "Live events" : state.liveStatus === "verifying" ? "Checking live updates…"
@@ -776,6 +792,215 @@ function TaskScreen({ colors, state, onBack, onHome, onNew }: ScreenProps & {
         onNew={() => queueDrawerAction(onNew)} onHome={() => queueDrawerAction(onHome)} />
     </MobileDrawer>
   </View>;
+}
+
+function FilesScreen({ colors, state, onBack }: ScreenProps & { onBack: () => void }) {
+  const [query, setQuery] = useState("");
+  const [mode, setMode] = useState<MobileFilesSearchMode>("name");
+  const [caseSensitive, setCaseSensitive] = useState(false);
+  const [localError, setLocalError] = useState("");
+  const authorityKey = client.filesAuthorityKey();
+  const connected = state.status === "connected" && authorityKey !== undefined;
+  const files = state.files;
+  const searching = query.trim().length > 0;
+
+  useEffect(() => {
+    if (!connected || !authorityKey) return;
+    if (!files.open || files.authorityKey !== authorityKey || files.status === "offline" || files.status === "idle") {
+      setLocalError("");
+      void client.openFiles().catch((error) => setLocalError(errorText(error)));
+    }
+  }, [authorityKey, connected, files.authorityKey, files.open, files.status]);
+
+  useEffect(() => () => client.closeFiles(), []);
+
+  useEffect(() => {
+    if (!files.open) return;
+    const timer = setTimeout(() => {
+      void client.searchFiles(query, mode, caseSensitive).catch((error) => setLocalError(errorText(error)));
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [caseSensitive, files.artifactsRevision, files.authorityKey, files.fileIndexRevision, files.open, mode, query]);
+
+  const run = (action: () => Promise<void>): void => {
+    setLocalError("");
+    void action().catch((error) => setLocalError(errorText(error)));
+  };
+  const leave = (): void => { client.closeFiles(); onBack(); };
+  const openResult = (result: MobileFileSearchResult): void => run(() => client.previewFileSearchResult(result));
+  const locationTitle = files.location.kind === "generated"
+    ? "Generated"
+    : files.location.path || files.workspace?.displayName || "Workspace";
+
+  return <View style={styles.fill}>
+    <View style={[styles.header, { borderBottomColor: colors.border }]}>
+      <Back onPress={leave} colors={colors} label="Task" />
+      <View style={styles.fill}>
+        <Text style={[styles.title, { color: colors.ink }]} numberOfLines={1}>Files</Text>
+        <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>{locationTitle}</Text>
+      </View>
+      <Action label={files.status === "loading" ? "Refreshing…" : "Refresh"} compact colors={colors}
+        disabled={!connected || files.status === "loading"} onPress={() => run(() => client.refreshFiles())} />
+    </View>
+
+    {files.status === "offline" && <View style={[styles.connectionNotice, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+      <View style={[styles.statusDot, { backgroundColor: colors.negative }]} />
+      <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>Offline · showing only the in-memory view already loaded for this task. New reads are paused.</Text>
+    </View>}
+    {(localError || files.error) && <Banner text={localError || files.error || ""} colors={colors} />}
+    {files.watchStatus === "error" && files.watchError && <Banner text={`Live file refresh unavailable: ${files.watchError}`} colors={colors} />}
+
+    <View accessibilityRole="tablist" style={styles.filesTabs}>
+      <ModeTab label="Workspace" selected={files.location.kind === "workspace"}
+        onPress={() => run(() => client.openFilesDirectory(""))} colors={colors} />
+      <ModeTab label={`Generated${files.artifacts.length ? ` (${files.artifacts.length})` : ""}`}
+        selected={files.location.kind === "generated"} onPress={() => {
+          setLocalError("");
+          try { client.openGeneratedFiles(); } catch (error) { setLocalError(errorText(error)); }
+        }} colors={colors} />
+    </View>
+
+    <View style={styles.filesSearchControls}>
+      <TextInput accessibilityLabel="Search files" placeholder={mode === "name" ? "Search file names" : "Search file contents"}
+        placeholderTextColor={colors.muted} value={query} onChangeText={setQuery} autoCapitalize="none" autoCorrect={false}
+        style={[styles.input, styles.searchInput, { color: colors.ink, backgroundColor: colors.surface, borderColor: colors.border }]} />
+      {files.searchStatus === "searching" && <ActivityIndicator color={colors.accent} />}
+    </View>
+    <View style={styles.filesSearchOptions}>
+      <View accessibilityRole="tablist" style={styles.filesSearchModes}>
+        <ModeTab label="Name" selected={mode === "name"} onPress={() => setMode("name")} colors={colors} />
+        <ModeTab label="Content" selected={mode === "content"} onPress={() => setMode("content")} colors={colors} />
+      </View>
+      <Pressable accessibilityRole="checkbox" accessibilityState={{ checked: caseSensitive }} accessibilityLabel="Case-sensitive file search"
+        onPress={() => setCaseSensitive((value) => !value)} style={styles.caseChoice}>
+        <View style={[styles.choiceBox, { borderColor: caseSensitive ? colors.accent : colors.border,
+          backgroundColor: caseSensitive ? colors.accent : colors.surface }]}>
+          {caseSensitive && <Text style={styles.choiceCheck}>✓</Text>}
+        </View>
+        <Text style={[styles.caption, { color: colors.ink }]}>Match case</Text>
+      </Pressable>
+    </View>
+    {files.searchError && searching && <Banner text={files.searchError} colors={colors} />}
+    {files.searchTruncated && searching && <Text accessibilityRole="alert" style={[styles.warning, { color: colors.negative }]}>
+      Results are truncated by the node. Refine the literal query to inspect the complete result set.
+    </Text>}
+
+    {files.status === "loading" && files.entries.length === 0 && files.artifacts.length === 0
+      ? <Centered label="Loading the current Workspace and Generated files…" colors={colors} />
+      : <ScrollView style={styles.fill} contentContainerStyle={styles.filesList} keyboardShouldPersistTaps="handled">
+        {searching ? <>
+          <Text style={[styles.section, { color: colors.muted }]}>Search results</Text>
+          {files.searchStatus === "ready" && files.searchResults.length === 0
+            && <Text style={[styles.description, { color: colors.muted }]}>No matching files</Text>}
+          {files.searchResults.map((result, index) => <FileSearchResultRow key={fileSearchResultKey(result, index)}
+            result={result} colors={colors} disabled={!connected} onPress={() => openResult(result)} />)}
+          {files.searchStatus === "ready" && <Text style={[styles.caption, { color: colors.muted }]}>
+            {files.searchResults.length} result{files.searchResults.length === 1 ? "" : "s"}
+            {mode === "content" ? ` across ${files.searchTotalFiles} file${files.searchTotalFiles === 1 ? "" : "s"}` : ""}
+          </Text>}
+        </> : files.location.kind === "generated" ? <>
+          <Text style={[styles.section, { color: colors.muted }]}>Generated by this task</Text>
+          {files.artifacts.length === 0 && <Text style={[styles.description, { color: colors.muted }]}>No canonical Generated files are available for this task.</Text>}
+          {files.artifacts.map((artifact) => <Pressable key={artifact.artifactId} accessibilityRole="button"
+            accessibilityLabel={`Preview Generated file ${artifactTitle(artifact)}`} disabled={!connected}
+            onPress={() => run(() => client.previewArtifact(artifact))}
+            style={[styles.fileRow, { backgroundColor: colors.surface, borderColor: colors.border }, !connected && styles.disabled]}>
+            <Text style={styles.fileGlyph}>◆</Text>
+            <View style={styles.fill}><Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{artifactTitle(artifact)}</Text>
+              <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>
+                {artifact.blob ? `${artifact.blob.mediaType || "application/octet-stream"} · ${formatByteSize(artifact.blob.byteSize)}` : "Blob unavailable"}
+              </Text></View>
+            <Text style={[styles.chevron, { color: colors.muted }]}>›</Text>
+          </Pressable>)}
+        </> : <>
+          <View style={styles.sectionHeader}>
+            <Text style={[styles.section, { color: colors.muted }]}>{files.location.path || "Workspace root"}</Text>
+            {files.location.path && <Action label="Up" compact colors={colors} disabled={!connected}
+              onPress={() => run(() => client.openFilesDirectory(workspaceParentPath(files.location.kind === "workspace" ? files.location.path : "")))} />}
+          </View>
+          {files.entries.length === 0 && <Text style={[styles.description, { color: colors.muted }]}>This directory is empty.</Text>}
+          {files.entries.map((entry) => <Pressable key={entry.relativePath} accessibilityRole="button"
+            accessibilityLabel={`${entry.kind === FileKind.DIRECTORY ? "Open directory" : "Preview file"} ${entry.displayName || workspaceBasename(entry.relativePath)}`}
+            disabled={!connected} onPress={() => run(() => client.previewWorkspaceEntry(entry))}
+            style={[styles.fileRow, { backgroundColor: colors.surface, borderColor: colors.border }, !connected && styles.disabled]}>
+            <Text style={styles.fileGlyph}>{entry.kind === FileKind.DIRECTORY ? "▰" : "◇"}</Text>
+            <View style={styles.fill}>
+              <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{entry.displayName || workspaceBasename(entry.relativePath)}</Text>
+              <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>
+                {entry.kind === FileKind.DIRECTORY ? "Directory" : `${entry.mediaType || "application/octet-stream"} · ${formatByteSize(entry.revision?.byteSize ?? 0n)}`}
+                {entry.hidden ? " · hidden" : ""}{entry.ignored ? " · ignored" : ""}
+              </Text>
+            </View>
+            <Text style={[styles.chevron, { color: colors.muted }]}>›</Text>
+          </Pressable>)}
+        </>}
+      </ScrollView>}
+    <FilePreviewModal colors={colors} preview={files.preview} onClose={() => client.closeFilesPreview()} />
+  </View>;
+}
+
+function FileSearchResultRow({ result, colors, disabled, onPress }: {
+  result: MobileFileSearchResult; colors: Colors; disabled: boolean; onPress: () => void;
+}) {
+  const path = result.kind === "artifact" ? artifactTitle(result.artifact)
+    : result.kind === "workspace-content" ? result.match.relativePath : result.relativePath;
+  const detail = result.kind === "artifact"
+    ? `Generated · ${result.artifact.blob?.mediaType || "application/octet-stream"}`
+    : result.kind === "workspace-content"
+      ? result.match.linePreview || "Content match"
+      : "Workspace file";
+  return <Pressable accessibilityRole="button" accessibilityLabel={`Preview ${path}`} disabled={disabled} onPress={onPress}
+    style={[styles.fileRow, { backgroundColor: colors.surface, borderColor: colors.border }, disabled && styles.disabled]}>
+    <Text style={styles.fileGlyph}>{result.kind === "artifact" ? "◆" : "◇"}</Text>
+    <View style={styles.fill}><Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{path}</Text>
+      <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={2}>{detail}</Text></View>
+    <Text style={[styles.chevron, { color: colors.muted }]}>›</Text>
+  </Pressable>;
+}
+
+function FilePreviewModal({ colors, preview, onClose }: {
+  colors: Colors; preview: MobileClient["state"]["files"]["preview"]; onClose: () => void;
+}) {
+  return <Modal visible={preview !== undefined} animationType="slide" onRequestClose={onClose}>
+    <SafeAreaView style={[styles.fill, { backgroundColor: colors.background }]} edges={["top", "bottom", "left", "right"]}>
+      {preview && <>
+        <View style={[styles.header, { borderBottomColor: colors.border }]}>
+          <Back onPress={onClose} colors={colors} label="Files" />
+          <View style={styles.fill}><Text style={[styles.title, { color: colors.ink }]} numberOfLines={1}>{preview.title}</Text>
+            <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>{preview.sourceLabel}</Text></View>
+        </View>
+        <View style={[styles.previewMetadata, { borderColor: colors.border, backgroundColor: colors.surface }]}>
+          <Text selectable style={[styles.caption, { color: colors.muted }]}>{preview.mediaType} · {formatByteSize(preview.byteSize)}</Text>
+          {preview.kind === "text" && <Text style={[styles.caption, { color: colors.muted }]}>
+            {preview.languageId || "plain text"} · lines {preview.totalLines} · bytes {preview.startByte.toString(10)}–{preview.endByte.toString(10)}
+          </Text>}
+        </View>
+        {preview.kind === "loading" ? <Centered label="Loading the exact observed file revision…" colors={colors} />
+          : preview.kind === "image" ? <ScrollView style={styles.fill} contentContainerStyle={styles.imagePreviewContainer}>
+            <Image source={{ uri: preview.dataUri }} accessibilityLabel={preview.altText} resizeMode="contain" style={styles.imagePreview} />
+            {(preview.widthPixels > 0 || preview.heightPixels > 0) && <Text style={[styles.caption, { color: colors.muted }]}>
+              {preview.widthPixels} × {preview.heightPixels} pixels
+            </Text>}
+          </ScrollView>
+          : preview.kind === "text" ? <ScrollView style={styles.fill} contentContainerStyle={styles.textPreviewContainer}>
+            {preview.truncated && <Text accessibilityRole="alert" style={[styles.warning, { color: colors.negative }]}>Preview is truncated to the authenticated byte window shown above.</Text>}
+            <Text selectable style={[styles.textPreview, { color: colors.ink }]}>{preview.text || "(empty file)"}</Text>
+          </ScrollView>
+          : <View style={styles.previewMessage}>
+            <Text accessibilityRole="alert" style={[styles.label, { color: preview.kind === "error" ? colors.negative : colors.ink }]}>
+              {preview.kind === "error" ? "Preview unavailable" : "No in-app preview"}
+            </Text>
+            <Text selectable style={[styles.description, { color: colors.muted }]}>{preview.reason}</Text>
+          </View>}
+      </>}
+    </SafeAreaView>
+  </Modal>;
+}
+
+function fileSearchResultKey(result: MobileFileSearchResult, index: number): string {
+  if (result.kind === "artifact") return `artifact:${result.artifact.artifactId}`;
+  if (result.kind === "workspace-name") return `name:${result.relativePath}`;
+  return `content:${result.match.relativePath}:${result.match.range?.startByte.toString(10) ?? index}:${index}`;
 }
 
 function TaskListDrawer({ colors, state, closeButtonRef, onClose, onSelect, onNew, onHome }: ScreenProps & {
@@ -966,6 +1191,15 @@ function timestampLabel(value: { readonly seconds: bigint; readonly nanos: numbe
   if (!Number.isFinite(milliseconds)) return "Unknown";
   return new Date(milliseconds).toLocaleString();
 }
+function formatByteSize(value: bigint): string {
+  if (value < 0n) return "unknown size";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let size = Number(value);
+  if (!Number.isFinite(size)) return `${value.toString(10)} B`;
+  let unit = 0;
+  while (size >= 1024 && unit < units.length - 1) { size /= 1024; unit += 1; }
+  return `${unit === 0 ? Math.trunc(size) : size.toFixed(size >= 10 ? 1 : 2)} ${units[unit]}`;
+}
 function sessionState(value: number): string { return ["Unknown", "Creating", "Idle", "Running", "Waiting", "Detached", "Recovering", "Archived", "Closing", "Closed", "Error"][value] || "Unknown"; }
 function queueState(value: QueueItemState): string {
   switch (value) {
@@ -1054,5 +1288,20 @@ const styles = StyleSheet.create({
   drawerList: { paddingHorizontal: 2, paddingBottom: 12, flexGrow: 1 },
   drawerTaskRow: { minHeight: 62, borderWidth: 1, borderRadius: 12, paddingHorizontal: 12, paddingVertical: 10, gap: 2, marginBottom: 7 },
   drawerEmpty: { padding: 20, textAlign: "center" },
-  drawerHome: { minHeight: 50, borderTopWidth: 1, alignItems: "center", justifyContent: "center" }
+  drawerHome: { minHeight: 50, borderTopWidth: 1, alignItems: "center", justifyContent: "center" },
+  filesTabs: { paddingHorizontal: 16, paddingVertical: 8, flexDirection: "row", gap: 8 },
+  filesSearchControls: { minHeight: 52, paddingHorizontal: 16, paddingTop: 4, flexDirection: "row", alignItems: "center", gap: 10 },
+  filesSearchOptions: { paddingHorizontal: 16, paddingVertical: 8, flexDirection: "row", alignItems: "center", gap: 12 },
+  filesSearchModes: { flex: 1, flexDirection: "row", gap: 6 },
+  caseChoice: { minHeight: 44, flexDirection: "row", alignItems: "center", gap: 7 },
+  filesList: { paddingHorizontal: 16, paddingBottom: 36, gap: 8, flexGrow: 1 },
+  fileRow: { borderWidth: 1, borderRadius: 14, minHeight: 68, paddingHorizontal: 14, paddingVertical: 10,
+    flexDirection: "row", alignItems: "center", gap: 10 },
+  fileGlyph: { width: 22, textAlign: "center", fontSize: 18 },
+  previewMetadata: { marginHorizontal: 16, marginBottom: 8, borderWidth: 1, borderRadius: 12, padding: 12, gap: 3 },
+  previewMessage: { flex: 1, alignItems: "center", justifyContent: "center", gap: 10, padding: 28 },
+  imagePreviewContainer: { flexGrow: 1, alignItems: "center", justifyContent: "center", gap: 12, padding: 16 },
+  imagePreview: { width: "100%", minHeight: 320, flex: 1 },
+  textPreviewContainer: { paddingHorizontal: 16, paddingBottom: 36 },
+  textPreview: { fontSize: 13, lineHeight: 20, fontFamily: Platform.select({ ios: "Menlo", android: "monospace" }) }
 });

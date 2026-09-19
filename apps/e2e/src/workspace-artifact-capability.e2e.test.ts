@@ -17,6 +17,7 @@ import {
   QueueDeliveryMode,
   RestartBrowserMutationSchema,
   RevokeDeviceMutationSchema,
+  WorkspaceEntryListingPolicy,
   WorkspaceFileChangeKind
 } from "@joko/contracts";
 import {
@@ -32,6 +33,7 @@ import { OrchestratorE2eFixture, sha256, waitFor } from "./fixture.js";
 import {
   createSessionMutation,
   archiveMutation,
+  exportMutation,
   sendInputMutation,
   sessionIdFrom,
   submit
@@ -102,6 +104,137 @@ describe("workspace, artifact, and capability boundaries", () => {
       source: GitDiffSource.UNSTAGED
     });
     expect(diff.diff?.files.some((file) => file.relativePath === "README.md" && file.hunks.length > 0)).toBe(true);
+  });
+
+  it("serves the mobile Session Workspace and same-task Generated catalog through the formal HTTP, Host, Blob, and SQLite chain", async () => {
+    fixture = await OrchestratorE2eFixture.start();
+    const paired = await fixture.pair("Mobile Files owner");
+    const workspaceId = "workspace-main";
+    const marker = "mobile-files-literal+a+b";
+    const imageBytes = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Zl1sAAAAASUVORK5CYII=",
+      "base64"
+    );
+    await Promise.all([
+      writeFile(join(fixture.workspaceDirectory, ".mobile-hidden.txt"), "hidden mobile file\n", "utf8"),
+      writeFile(join(fixture.workspaceDirectory, "mobile-search.txt"), `${marker}\n`, "utf8"),
+      writeFile(join(fixture.workspaceDirectory, "mobile-preview.png"), imageBytes)
+    ]);
+
+    const sessionId = sessionIdFrom(await submit(
+      paired.clients.operation,
+      paired.connectionId,
+      createSessionMutation({
+        backendId: PI_LIKE_PROFILE.id,
+        targetId: fixture.targetId(),
+        displayName: "Mobile Files task"
+      })
+    ));
+    const owner = (await paired.clients.event.getSnapshot({ scope: { kind: { case: "owner", value: {} } } })).snapshot!;
+    const session = owner.sessions.find((item) => item.sessionId === sessionId)!;
+    const target = owner.targets.find((item) => item.targetId === session.targetId)!;
+    expect(target.workspaceId).toBe(workspaceId);
+    expect(owner.workspaces.find((item) => item.workspaceId === target.workspaceId)?.targetId).toBe(target.targetId);
+
+    const entries = [];
+    let pageToken = "";
+    let directoryRevision = "";
+    do {
+      const page = await paired.clients.workspace.listWorkspaceEntries({
+        workspaceId,
+        parentRelativePath: "",
+        includeHidden: true,
+        listingPolicy: WorkspaceEntryListingPolicy.DOCUMENT_TREE,
+        page: { pageSize: 1, pageToken }
+      });
+      const revision = page.revision?.etag || page.revision?.value.toString(10) || "";
+      expect(revision).not.toBe("");
+      if (directoryRevision) expect(revision).toBe(directoryRevision);
+      else directoryRevision = revision;
+      entries.push(...page.entries);
+      pageToken = page.page?.nextPageToken ?? "";
+    } while (pageToken);
+    expect(entries.map((entry) => entry.relativePath)).toEqual(expect.arrayContaining([
+      ".mobile-hidden.txt", "mobile-preview.png", "mobile-search.txt", "README.md"
+    ]));
+    expect(entries.find((entry) => entry.relativePath === ".mobile-hidden.txt")?.hidden).toBe(true);
+
+    const index = await paired.clients.workspace.listWorkspaceFiles({ workspaceId });
+    expect(index.relativePaths).toEqual(expect.arrayContaining([".mobile-hidden.txt", "mobile-preview.png", "mobile-search.txt"]));
+    expect(index.revision).toBeDefined();
+    const searched = await paired.clients.workspace.searchWorkspace({
+      workspaceId,
+      query: "literal+a+b",
+      caseSensitive: true,
+      regularExpression: false,
+      page: { pageSize: 1, pageToken: "" }
+    });
+    const textMatch = searched.matches.find((match) => match.relativePath === "mobile-search.txt");
+    expect(textMatch?.linePreview).toContain(marker);
+    expect(textMatch?.revision?.opaqueRevision).not.toBe("");
+
+    const imageEntry = entries.find((entry) => entry.relativePath === "mobile-preview.png")!;
+    expect(imageEntry.revision?.opaqueRevision).not.toBe("");
+    const preview = await paired.clients.workspace.readWorkspaceFile({
+      workspaceId,
+      relativePath: imageEntry.relativePath,
+      expectedRevision: imageEntry.revision,
+      maximumBytes: 2_097_152n
+    });
+    expect(preview.preview?.entry?.revision).toMatchObject({
+      byteSize: imageEntry.revision?.byteSize,
+      modifiedAt: imageEntry.revision?.modifiedAt,
+      sha256Hex: sha256(imageBytes)
+    });
+    expect(preview.preview?.entry?.revision?.opaqueRevision).toMatch(/^sha256:/u);
+    expect(preview.preview?.content.case).toBe("image");
+    if (preview.preview?.content.case !== "image" || !preview.preview.content.value.blob) {
+      throw new Error("Formal Workspace image preview returned no canonical BlobRef.");
+    }
+    const imageBlob = preview.preview.content.value.blob;
+    expect(imageBlob).toMatchObject({
+      mediaType: "image/png",
+      byteSize: BigInt(imageBytes.byteLength),
+      sha256Hex: sha256(imageBytes)
+    });
+    const imageTicket = await paired.clients.artifact.getBlobDownloadTicket({ blobId: imageBlob.blobId });
+    expect(imageTicket.ticket).toMatchObject({
+      blobId: imageBlob.blobId,
+      maximumBytes: imageBlob.byteSize,
+      requiredMediaType: imageBlob.mediaType
+    });
+    const imageDownload = await fetch(`${fixture.baseUrl}${imageTicket.ticket!.relativeEndpoint}`, {
+      headers: { authorization: `Bearer ${paired.authKey}` }
+    });
+    expect(imageDownload.status).toBe(200);
+    expect(imageDownload.headers.get("content-type")).toBe("image/png");
+    expect(imageDownload.headers.get("content-length")).toBe(String(imageBytes.byteLength));
+    expect(Buffer.from(await imageDownload.arrayBuffer())).toEqual(imageBytes);
+
+    const exported = await submit(paired.clients.operation, paired.connectionId, exportMutation(sessionId));
+    expect(exported.state).toBe(OperationState.SUCCEEDED);
+    if (exported.result?.payload.case !== "artifact") throw new Error("Session export returned no canonical Artifact.");
+    const exportedArtifact = exported.result.payload.value;
+    const catalog = await paired.clients.artifact.listArtifacts({
+      sessionId,
+      page: { pageSize: 1, pageToken: "" }
+    });
+    expect(catalog.artifacts).toEqual([expect.objectContaining({
+      artifactId: exportedArtifact.artifactId,
+      sessionId,
+      blob: expect.objectContaining({ blobId: exportedArtifact.blob?.blobId })
+    })]);
+    expect(catalog.revision).toBeDefined();
+    expect(fixture.application.store.listArtifacts({ sessionId }).map((record) => record.blob.id))
+      .toContain(exportedArtifact.blob!.blobId);
+    const artifactTicket = await paired.clients.artifact.getBlobDownloadTicket({ blobId: exportedArtifact.blob!.blobId });
+    const artifactDownload = await fetch(`${fixture.baseUrl}${artifactTicket.ticket!.relativeEndpoint}`, {
+      headers: { authorization: `Bearer ${paired.authKey}` }
+    });
+    expect(artifactDownload.status).toBe(200);
+    expect(await artifactDownload.text()).toContain(`<main>${sessionId}</main>`);
+    const archived = await submit(paired.clients.operation, paired.connectionId, archiveMutation(sessionId, true));
+    expect(archived.state).toBe(OperationState.SUCCEEDED);
   });
 
   it("transfers authenticated workspace HTML through durable Browser admission without retaining bytes or completing a retired owner's read", async () => {

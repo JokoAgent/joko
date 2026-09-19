@@ -36,6 +36,7 @@ describe("WorkspaceService media previews", () => {
       expect(preview).toMatchObject({
         mediaType: fixture.mediaType,
         truncated: false,
+        observedRevision: expect.stringMatching(/^meta:/u),
         entry: {
           path: fixture.name,
           size: fixture.bytes.byteLength,
@@ -45,6 +46,7 @@ describe("WorkspaceService media previews", () => {
       expect(preview.text).toBeUndefined();
       expect(preview.bytes).toEqual(fixture.bytes);
       expect(preview.entry.revision).not.toContain(root);
+      expect(preview.observedRevision).not.toContain(root);
     }
 
     const originalPng = rasterAndPdfFixtures[0];

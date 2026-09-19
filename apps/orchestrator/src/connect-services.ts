@@ -2664,7 +2664,9 @@ export function createConnectServices(application: OrchestratorApplication): Con
       const maximum = safeByteCount(request.maximumBytes, 2 * 1024 * 1024);
       const start = safeByteCount(request.startByte, 0);
       const preview = await dependencies.workspaceService.preview(request.workspaceId, request.relativePath, start + maximum);
-      if (request.expectedRevision !== undefined && request.expectedRevision.opaqueRevision !== "" && request.expectedRevision.opaqueRevision !== preview.entry.revision) {
+      if (request.expectedRevision !== undefined && request.expectedRevision.opaqueRevision !== ""
+        && request.expectedRevision.opaqueRevision !== preview.entry.revision
+        && request.expectedRevision.opaqueRevision !== preview.observedRevision) {
         throw new ConnectError("Workspace file revision changed.", Code.Aborted);
       }
       let materialized: ArtifactRecord | undefined;
@@ -7097,8 +7099,10 @@ function mapWorkspaceEntry(workspaceId: string, item: WorkspaceEntryRecord, medi
 }
 
 function fileRevision(item: WorkspaceEntryRecord): contract.FileRevision {
+  const content = /^sha256:([0-9a-f]{64}):([0-9]+)$/u.exec(item.revision);
+  const contentSize = content === null ? undefined : BigInt(content[2]!);
   return create(contract.FileRevisionSchema, {
-    sha256Hex: "",
+    sha256Hex: content !== null && contentSize === BigInt(item.size) ? content[1]! : "",
     byteSize: BigInt(item.size),
     modifiedAt: toProtoTimestamp(Math.trunc(item.modifiedAt)),
     opaqueRevision: item.revision

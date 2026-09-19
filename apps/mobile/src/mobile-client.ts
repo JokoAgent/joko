@@ -8,7 +8,9 @@ import {
   LogoutConnectionMutationSchema, OperationPreconditionSchema, OperationState, OperationMutationSchema,
   PermissionMode, PinSessionMutationSchema, QueueDeliveryMode, RenameSessionMutationSchema,
   RevokeDeviceMutationSchema, SendInputMutationSchema, SessionMessageSearchSessionStatus, TargetState, capabilityNames,
-  type DiscoveredNodeRecord, type Event, type EventCursor, type Operation, type OperationMutation, type Session, type Snapshot
+  FileKind,
+  type Artifact, type DiscoveredNodeRecord, type Event, type EventCursor, type FilePreview, type FileRevision,
+  type Operation, type OperationMutation, type Session, type Snapshot, type WorkspaceEntry, type WorkspaceSearchMatch
 } from "@joko/contracts";
 import {
   MobileCredentialStorageError, profileFromCredential,
@@ -16,7 +18,31 @@ import {
 } from "./connection-storage";
 import type { MobileDiscovery } from "./connection-discovery";
 import type { MobileHomeStatusFilter } from "./home-navigation";
-import { normalizeNodeOrigin, type MobileNetwork, type NodeIdentity, type PairedCredential } from "./network";
+import {
+  MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES,
+  normalizeNodeOrigin,
+  type MobileNetwork, type NodeIdentity, type PairedCredential
+} from "./network";
+import {
+  artifactTitle,
+  bytesToDataUri,
+  canonicalWorkspacePath,
+  emptyMobileFilesState,
+  filterWorkspaceFileNames,
+  isTextMediaType,
+  normalizeMediaType,
+  resolveMobileWorkspaceAuthority,
+  sortArtifacts,
+  sortWorkspaceEntries,
+  workspaceBasename,
+  workspaceEntryRevisionKey,
+  workspaceParentPath,
+  type MobileFileSearchResult,
+  type MobileFilePreview,
+  type MobileFilesSearchMode,
+  type MobileFilesState,
+  type MobileWorkspaceAuthority
+} from "./workspace-files";
 
 export type { MobileStorage, PendingOperation } from "./connection-storage";
 
@@ -64,7 +90,14 @@ export interface MobileState {
   readonly homeSearchStatus: "idle" | "searching" | "ready" | "error";
   readonly homeSearchSessionIds: readonly string[];
   readonly homeSearchError?: string;
+  readonly files: MobileFilesState;
   readonly error?: string;
+}
+
+interface MobileFilesContext {
+  readonly credential: PairedCredential;
+  readonly authority: MobileWorkspaceAuthority;
+  readonly key: string;
 }
 
 const isTerminal = (state: OperationState): boolean => [
@@ -75,7 +108,7 @@ export class MobileClient {
   #state: MobileState = { status: "starting", busy: false, saved: [], connectionMode: "nearby",
     discoveryState: "idle", nearby: [], older: [], live: [], liveStatus: "paused",
     historyBusy: false, historyEnd: false, pending: [], homeSearchQuery: "", homeSearchFilter: "active",
-    homeSearchStatus: "idle", homeSearchSessionIds: [] };
+    homeSearchStatus: "idle", homeSearchSessionIds: [], files: emptyMobileFilesState() };
   #credential?: PairedCredential;
   #profiles: MobileConnectionProfile[] = [];
   #automaticProfileId?: string;
@@ -104,6 +137,12 @@ export class MobileClient {
   #discoveryExpiryTimer?: ReturnType<typeof setTimeout>;
   #homeSearchEpoch = 0;
   #homeSearchAbort?: AbortController;
+  #filesEpoch = 0;
+  #filesListAbort?: AbortController;
+  #filesSearchAbort?: AbortController;
+  #filesPreviewAbort?: AbortController;
+  #filesWatchAbort?: AbortController;
+  #filesRefreshTimer?: ReturnType<typeof setTimeout>;
 
   constructor(
     private readonly network: MobileNetwork,
@@ -124,7 +163,23 @@ export class MobileClient {
 
   #set(patch: Partial<MobileState>): void {
     if (this.#disposed) return;
-    this.#state = { ...this.#state, ...patch };
+    const previousAuthority = this.filesAuthorityKey();
+    let next = { ...this.#state, ...patch };
+    const nextAuthority = this.#filesAuthorityKey(next);
+    if (next.files.open && previousAuthority !== nextAuthority) {
+      this.#cancelFilesRequests();
+      next = {
+        ...next,
+        files: {
+          ...emptyMobileFilesState(),
+          open: true,
+          status: next.status === "connected" ? "idle" : "offline",
+        }
+      };
+    } else if (next.files.open && next.status !== "connected" && next.files.status !== "offline") {
+      next = { ...next, files: { ...next.files, status: "offline" } };
+    }
+    this.#state = next;
     for (const listener of this.#listeners) listener(this.#state);
   }
 
@@ -135,6 +190,7 @@ export class MobileClient {
     this.#homeSearchAbort?.abort();
     this.#homeSearchAbort = undefined;
     this.#homeSearchEpoch += 1;
+    this.#cancelFilesRequests();
     if (this.#timer !== undefined) clearTimeout(this.#timer);
     if (this.#proofTimer !== undefined) clearTimeout(this.#proofTimer);
     if (this.#projectionTimer !== undefined) clearTimeout(this.#projectionTimer);
@@ -754,7 +810,10 @@ export class MobileClient {
         older: [],
         window: undefined,
         before: undefined,
-        historyEnd: false
+        historyEnd: false,
+        ...(this.#state.files.open
+          ? { files: { ...this.#state.files, status: "offline" as const } }
+          : {})
       });
     }
     if (active) {
@@ -1109,6 +1168,279 @@ export class MobileClient {
     }
   }
 
+  canOpenFiles(): boolean { return this.filesAuthorityKey() !== undefined; }
+
+  filesAuthorityKey(): string | undefined { return this.#filesAuthorityKey(this.#state); }
+
+  async openFiles(): Promise<void> {
+    const context = this.#filesContext();
+    this.#cancelFilesRequests();
+    const epoch = this.#filesEpoch;
+    const location = { kind: "workspace" as const, path: "" };
+    this.#set({
+      files: {
+        ...emptyMobileFilesState(),
+        open: true,
+        status: "loading",
+        authorityKey: context.key,
+        sessionId: context.authority.sessionId,
+        workspace: context.authority.workspace,
+        location,
+        watchStatus: context.authority.watchSupported ? "idle" : "unavailable"
+      }
+    });
+    const loaded = await this.#loadFiles(context, location, epoch);
+    if (loaded && context.authority.watchSupported && this.#currentFiles(epoch, context.key)) {
+      void this.#watchFiles(context, epoch);
+    }
+  }
+
+  closeFiles(): void {
+    this.#cancelFilesRequests();
+    this.#set({ files: emptyMobileFilesState() });
+  }
+
+  async refreshFiles(): Promise<void> {
+    if (!this.#state.files.open) return;
+    let context: MobileFilesContext;
+    try { context = this.#filesContext(); }
+    catch {
+      this.#set({ files: { ...this.#state.files, status: "offline" } });
+      return;
+    }
+    if (context.key !== this.#state.files.authorityKey) return;
+    this.#filesListAbort?.abort();
+    this.#filesSearchAbort?.abort();
+    this.#filesPreviewAbort?.abort();
+    if (this.#filesRefreshTimer !== undefined) clearTimeout(this.#filesRefreshTimer);
+    this.#filesRefreshTimer = undefined;
+    const epoch = this.#filesEpoch;
+    const location = this.#state.files.location;
+    const search = {
+      query: this.#state.files.searchQuery,
+      mode: this.#state.files.searchMode,
+      caseSensitive: this.#state.files.searchCaseSensitive
+    };
+    this.#set({ files: { ...this.#state.files, status: "loading", preview: undefined, error: undefined } });
+    if (!await this.#loadFiles(context, location, epoch)) return;
+    if (search.query && this.#currentFiles(epoch, context.key)) {
+      await this.searchFiles(search.query, search.mode, search.caseSensitive);
+    }
+  }
+
+  async openFilesDirectory(relativePath: string): Promise<void> {
+    const path = canonicalWorkspacePath(relativePath, true);
+    const context = this.#filesContext();
+    if (!this.#state.files.open || context.key !== this.#state.files.authorityKey) {
+      throw new Error("Open Files for the current task before browsing its Workspace.");
+    }
+    this.#filesListAbort?.abort();
+    this.#filesSearchAbort?.abort();
+    this.#filesPreviewAbort?.abort();
+    const epoch = this.#filesEpoch;
+    const location = { kind: "workspace" as const, path };
+    this.#set({ files: {
+      ...this.#state.files,
+      status: "loading",
+      location,
+      entries: [],
+      searchQuery: "",
+      searchStatus: "idle",
+      searchResults: [],
+      searchTruncated: false,
+      searchTotalFiles: 0,
+      searchError: undefined,
+      preview: undefined,
+      error: undefined
+    } });
+    await this.#loadFiles(context, location, epoch);
+  }
+
+  openGeneratedFiles(): void {
+    const context = this.#filesContext();
+    if (!this.#state.files.open || context.key !== this.#state.files.authorityKey) {
+      throw new Error("Open Files for the current task before browsing Generated files.");
+    }
+    this.#filesSearchAbort?.abort();
+    this.#filesPreviewAbort?.abort();
+    this.#set({ files: {
+      ...this.#state.files,
+      location: { kind: "generated" },
+      searchQuery: "",
+      searchStatus: "idle",
+      searchResults: [],
+      searchTruncated: false,
+      searchTotalFiles: 0,
+      searchError: undefined,
+      preview: undefined
+    } });
+  }
+
+  async searchFiles(query: string, mode: MobileFilesSearchMode, caseSensitive: boolean): Promise<void> {
+    const normalized = query.trim();
+    this.#filesSearchAbort?.abort();
+    this.#filesSearchAbort = undefined;
+    const epoch = this.#filesEpoch;
+    let context: MobileFilesContext;
+    try { context = this.#filesContext(); }
+    catch {
+      if (this.#state.files.open) {
+        this.#set({ files: { ...this.#state.files, status: "offline", searchQuery: normalized,
+          searchMode: mode, searchCaseSensitive: caseSensitive, searchStatus: "error",
+          searchResults: [], searchError: "Reconnect to search the current Workspace." } });
+      }
+      return;
+    }
+    if (!this.#state.files.open || context.key !== this.#state.files.authorityKey) return;
+    if (!normalized) {
+      this.#set({ files: { ...this.#state.files, searchQuery: "", searchMode: mode,
+        searchCaseSensitive: caseSensitive, searchStatus: "idle", searchResults: [],
+        searchTruncated: false, searchTotalFiles: 0, searchError: undefined } });
+      return;
+    }
+    if (mode === "name") {
+      const results = filterWorkspaceFileNames(
+        this.#state.files.fileIndex,
+        this.#state.files.artifacts,
+        normalized,
+        caseSensitive
+      );
+      this.#set({ files: { ...this.#state.files, searchQuery: normalized, searchMode: mode,
+        searchCaseSensitive: caseSensitive, searchStatus: "ready", searchResults: results,
+        searchTruncated: this.#state.files.fileIndexTruncated,
+        searchTotalFiles: results.length, searchError: undefined } });
+      return;
+    }
+    const controller = new AbortController();
+    this.#filesSearchAbort = controller;
+    this.#set({ files: { ...this.#state.files, searchQuery: normalized, searchMode: mode,
+      searchCaseSensitive: caseSensitive, searchStatus: "searching", searchResults: [],
+      searchTruncated: false, searchTotalFiles: 0, searchError: undefined } });
+    try {
+      const result = await this.network.searchWorkspace(
+        context.credential,
+        context.authority.workspace.workspaceId,
+        normalized,
+        caseSensitive,
+        controller.signal
+      );
+      if (controller.signal.aborted || this.#filesSearchAbort !== controller
+        || !this.#currentFiles(epoch, context.key)
+        || this.#state.files.searchQuery !== normalized
+        || this.#state.files.searchMode !== mode
+        || this.#state.files.searchCaseSensitive !== caseSensitive) return;
+      this.#set({ files: { ...this.#state.files, searchStatus: "ready",
+        searchResults: result.matches.map((match) => ({ kind: "workspace-content" as const, match })),
+        searchTruncated: result.truncated, searchTotalFiles: result.totalFiles,
+        searchError: undefined } });
+    } catch (error) {
+      if (controller.signal.aborted || !this.#currentFiles(epoch, context.key)) return;
+      this.#set({ files: { ...this.#state.files, searchStatus: "error", searchResults: [],
+        searchTruncated: false, searchTotalFiles: 0, searchError: message(error) } });
+    } finally {
+      if (this.#filesSearchAbort === controller) this.#filesSearchAbort = undefined;
+    }
+  }
+
+  async previewWorkspaceEntry(entry: WorkspaceEntry): Promise<void> {
+    if (entry.kind === FileKind.DIRECTORY) {
+      await this.openFilesDirectory(entry.relativePath);
+      return;
+    }
+    const revision = entry.revision;
+    const current = this.#state.files.entries.find((candidate) => candidate.relativePath === entry.relativePath);
+    if (!revision || !current?.revision || current.workspaceId !== entry.workspaceId
+      || workspaceEntryRevisionKey(current.revision) !== workspaceEntryRevisionKey(revision)) {
+      throw new Error("Select a file from the current Workspace directory.");
+    }
+    await this.#previewWorkspaceFile(entry.relativePath, revision, entry.displayName || workspaceBasename(entry.relativePath));
+  }
+
+  async previewFileSearchResult(result: MobileFileSearchResult): Promise<void> {
+    if (!this.#state.files.searchResults.includes(result)) {
+      throw new Error("Select a result from the current file search.");
+    }
+    if (result.kind === "artifact") {
+      await this.previewArtifact(result.artifact);
+      return;
+    }
+    if (result.kind === "workspace-content") {
+      if (!result.match.revision) throw new Error("The search result is missing its observed file revision.");
+      await this.#previewWorkspaceFile(
+        result.match.relativePath,
+        result.match.revision,
+        workspaceBasename(result.match.relativePath)
+      );
+      return;
+    }
+    await this.#previewIndexedWorkspaceFile(result.relativePath);
+  }
+
+  async previewArtifact(artifact: Artifact): Promise<void> {
+    const current = this.#state.files.artifacts.find((candidate) => candidate.artifactId === artifact.artifactId);
+    if (!current || current !== artifact || current.sessionId !== this.#state.files.sessionId) {
+      throw new Error("Select a Generated file from the current task.");
+    }
+    const context = this.#filesContext();
+    if (!this.#state.files.open || context.key !== this.#state.files.authorityKey) return;
+    this.#filesPreviewAbort?.abort();
+    const controller = new AbortController();
+    this.#filesPreviewAbort = controller;
+    const epoch = this.#filesEpoch;
+    const blob = current.blob;
+    const mediaType = normalizeMediaType(blob?.mediaType ?? "application/octet-stream") || "application/octet-stream";
+    const byteSize = blob?.byteSize ?? 0n;
+    const base = {
+      title: artifactTitle(current),
+      sourceLabel: "Generated",
+      mediaType,
+      byteSize,
+      revisionKey: [current.artifactId, blob?.blobId ?? "", blob?.sha256Hex ?? "", byteSize.toString(10)].join(":")
+    };
+    this.#set({ files: { ...this.#state.files, preview: { ...base, kind: "loading" } } });
+    try {
+      let preview: MobileFilePreview;
+      if (!blob) {
+        preview = { ...base, kind: "unsupported", reason: "This Generated file has no canonical Blob payload." };
+      } else if (blob.byteSize > BigInt(MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES)) {
+        preview = { ...base, kind: "unsupported",
+          reason: `This ${mediaType} file is ${blob.byteSize.toString(10)} bytes and exceeds the mobile preview limit.` };
+      } else if (mediaType.startsWith("image/")) {
+        const download = await this.network.downloadBlob(context.credential, blob, controller.signal);
+        preview = { ...base, kind: "image", dataUri: bytesToDataUri(download.bytes, download.mediaType),
+          altText: current.description.trim() || artifactTitle(current), widthPixels: 0, heightPixels: 0 };
+      } else if (isTextMediaType(mediaType)) {
+        if (blob.byteSize > 2_097_152n) {
+          preview = { ...base, kind: "unsupported",
+            reason: `This text file is ${blob.byteSize.toString(10)} bytes and exceeds the 2097152-byte text preview window.` };
+        } else {
+          const download = await this.network.downloadBlob(context.credential, blob, controller.signal);
+          const text = new TextDecoder("utf-8", { fatal: true }).decode(download.bytes);
+          preview = { ...base, kind: "text", text, languageId: "", startByte: 0n,
+            endByte: blob.byteSize, totalLines: text === "" ? 0 : text.split(/\r?\n/gu).length, truncated: false };
+        }
+      } else {
+        preview = { ...base, kind: "unsupported",
+          reason: `No safe in-app preview is available for ${mediaType} (${blob.byteSize.toString(10)} bytes).` };
+      }
+      if (controller.signal.aborted || this.#filesPreviewAbort !== controller
+        || !this.#currentFiles(epoch, context.key)) return;
+      this.#set({ files: { ...this.#state.files, preview } });
+    } catch (error) {
+      if (controller.signal.aborted || !this.#currentFiles(epoch, context.key)) return;
+      this.#set({ files: { ...this.#state.files,
+        preview: { ...base, kind: "error", reason: message(error) } } });
+    } finally {
+      if (this.#filesPreviewAbort === controller) this.#filesPreviewAbort = undefined;
+    }
+  }
+
+  closeFilesPreview(): void {
+    this.#filesPreviewAbort?.abort();
+    this.#filesPreviewAbort = undefined;
+    if (this.#state.files.open) this.#set({ files: { ...this.#state.files, preview: undefined } });
+  }
+
   async older(): Promise<void> {
     const credential = this.#credential;
     const sessionId = this.#state.selectedId;
@@ -1337,6 +1669,295 @@ export class MobileClient {
     if (this.#mutationOwner !== action) return;
     this.#mutationOwner = undefined;
     this.#set({ busy: false });
+  }
+
+  #filesAuthorityKey(state: MobileState): string | undefined {
+    const credential = this.#credential;
+    if (!this.#foreground || !credential || state.activeProfileId !== credential.profileId
+      || state.origin !== credential.origin || state.node?.serverId !== credential.serverId) return undefined;
+    const authority = resolveMobileWorkspaceAuthority(state.owner, state.detail, state.selectedId);
+    if (!authority) return undefined;
+    return [credential.profileId, credential.connectionId, credential.deviceId, credential.serverId, authority.key].join("\u001f");
+  }
+
+  #filesContext(): MobileFilesContext {
+    const credential = this.#credential;
+    const authority = resolveMobileWorkspaceAuthority(this.#state.owner, this.#state.detail, this.#state.selectedId);
+    const key = this.#filesAuthorityKey(this.#state);
+    if (!credential || !authority || !key || this.#state.status !== "connected" || !this.#foreground) {
+      throw new Error("Reconnect to the current task before reading its Files.");
+    }
+    return { credential, authority, key };
+  }
+
+  #currentFiles(epoch: number, key: string): boolean {
+    return !this.#disposed && this.#foreground && this.#state.status === "connected"
+      && this.#filesEpoch === epoch && this.#state.files.open
+      && this.#state.files.authorityKey === key && this.#filesAuthorityKey(this.#state) === key;
+  }
+
+  #cancelFilesRequests(): void {
+    this.#filesEpoch += 1;
+    this.#filesListAbort?.abort();
+    this.#filesSearchAbort?.abort();
+    this.#filesPreviewAbort?.abort();
+    this.#filesWatchAbort?.abort();
+    this.#filesListAbort = undefined;
+    this.#filesSearchAbort = undefined;
+    this.#filesPreviewAbort = undefined;
+    this.#filesWatchAbort = undefined;
+    if (this.#filesRefreshTimer !== undefined) clearTimeout(this.#filesRefreshTimer);
+    this.#filesRefreshTimer = undefined;
+  }
+
+  async #loadFiles(
+    context: MobileFilesContext,
+    location: MobileFilesState["location"],
+    epoch: number
+  ): Promise<boolean> {
+    this.#filesListAbort?.abort();
+    const controller = new AbortController();
+    this.#filesListAbort = controller;
+    const parentPath = location.kind === "workspace" ? location.path : "";
+    try {
+      const [directory, index, artifacts] = await Promise.all([
+        this.network.listWorkspaceDirectory(
+          context.credential,
+          context.authority.workspace.workspaceId,
+          parentPath,
+          controller.signal
+        ),
+        this.network.listWorkspaceFileIndex(
+          context.credential,
+          context.authority.workspace.workspaceId,
+          controller.signal
+        ),
+        this.network.listSessionArtifacts(
+          context.credential,
+          context.authority.sessionId,
+          controller.signal
+        )
+      ]);
+      if (controller.signal.aborted || this.#filesListAbort !== controller
+        || !this.#currentFiles(epoch, context.key)) return false;
+      this.#set({ files: {
+        ...this.#state.files,
+        status: "ready",
+        authorityKey: context.key,
+        sessionId: context.authority.sessionId,
+        workspace: context.authority.workspace,
+        location: this.#state.files.location.kind === "generated" ? this.#state.files.location : location,
+        entries: sortWorkspaceEntries(directory.entries),
+        directoryRevision: directory.revision,
+        fileIndex: [...index.paths].sort((left, right) => left.localeCompare(right, "en", { numeric: true })),
+        fileIndexRevision: index.revision,
+        fileIndexTruncated: index.truncated,
+        artifacts: sortArtifacts(artifacts.artifacts),
+        artifactsRevision: artifacts.revision,
+        error: undefined
+      } });
+      return true;
+    } catch (error) {
+      if (controller.signal.aborted || !this.#currentFiles(epoch, context.key)) return false;
+      this.#set({ files: { ...this.#state.files, status: "error", error: message(error) } });
+      return false;
+    } finally {
+      if (this.#filesListAbort === controller) this.#filesListAbort = undefined;
+    }
+  }
+
+  async #watchFiles(context: MobileFilesContext, epoch: number): Promise<void> {
+    this.#filesWatchAbort?.abort();
+    const controller = new AbortController();
+    this.#filesWatchAbort = controller;
+    if (!this.#currentFiles(epoch, context.key)) return;
+    this.#set({ files: { ...this.#state.files, watchStatus: "watching", watchError: undefined } });
+    try {
+      for await (const _change of this.network.watchWorkspace(
+        context.credential,
+        context.authority.workspace.workspaceId,
+        controller.signal
+      )) {
+        if (controller.signal.aborted || this.#filesWatchAbort !== controller
+          || !this.#currentFiles(epoch, context.key)) return;
+        this.#scheduleFilesRefresh(context, epoch);
+      }
+      if (!controller.signal.aborted && this.#currentFiles(epoch, context.key)) {
+        this.#set({ files: { ...this.#state.files, watchStatus: "error",
+          watchError: "Workspace change monitoring ended before Files was closed." } });
+      }
+    } catch (error) {
+      if (controller.signal.aborted || !this.#currentFiles(epoch, context.key)) return;
+      this.#set({ files: { ...this.#state.files, watchStatus: "error", watchError: message(error) } });
+    } finally {
+      if (this.#filesWatchAbort === controller) this.#filesWatchAbort = undefined;
+    }
+  }
+
+  #scheduleFilesRefresh(context: MobileFilesContext, epoch: number): void {
+    this.#filesPreviewAbort?.abort();
+    this.#filesPreviewAbort = undefined;
+    if (this.#state.files.preview) {
+      this.#set({ files: { ...this.#state.files, preview: undefined } });
+    }
+    if (this.#filesRefreshTimer !== undefined) clearTimeout(this.#filesRefreshTimer);
+    this.#filesRefreshTimer = setTimeout(() => {
+      this.#filesRefreshTimer = undefined;
+      if (this.#currentFiles(epoch, context.key)) void this.refreshFiles();
+    }, 180);
+  }
+
+  async #previewIndexedWorkspaceFile(relativePath: string): Promise<void> {
+    const path = canonicalWorkspacePath(relativePath);
+    const context = this.#filesContext();
+    if (!this.#state.files.open || context.key !== this.#state.files.authorityKey
+      || !this.#state.files.fileIndex.includes(path)) {
+      throw new Error("Select a file from the current Workspace index.");
+    }
+    this.#filesPreviewAbort?.abort();
+    const controller = new AbortController();
+    this.#filesPreviewAbort = controller;
+    const epoch = this.#filesEpoch;
+    const provisional = {
+      title: workspaceBasename(path), sourceLabel: path, mediaType: "application/octet-stream",
+      byteSize: 0n, revisionKey: `resolving:${path}`
+    };
+    this.#set({ files: { ...this.#state.files, preview: { ...provisional, kind: "loading" } } });
+    try {
+      const directory = await this.network.listWorkspaceDirectory(
+        context.credential,
+        context.authority.workspace.workspaceId,
+        workspaceParentPath(path),
+        controller.signal
+      );
+      if (controller.signal.aborted || this.#filesPreviewAbort !== controller
+        || !this.#currentFiles(epoch, context.key)) return;
+      const entry = directory.entries.find((candidate) => candidate.relativePath === path);
+      if (!entry?.revision || entry.kind === FileKind.DIRECTORY) {
+        throw new Error("The indexed file is no longer available at its observed path.");
+      }
+      await this.#finishWorkspacePreview(context, path, entry.revision, workspaceBasename(path), controller, epoch);
+    } catch (error) {
+      if (controller.signal.aborted || !this.#currentFiles(epoch, context.key)) return;
+      this.#set({ files: { ...this.#state.files,
+        preview: { ...provisional, kind: "error", reason: message(error) } } });
+    } finally {
+      if (this.#filesPreviewAbort === controller) this.#filesPreviewAbort = undefined;
+    }
+  }
+
+  async #previewWorkspaceFile(relativePath: string, revision: FileRevision, title: string): Promise<void> {
+    const path = canonicalWorkspacePath(relativePath);
+    workspaceEntryRevisionKey(revision);
+    const context = this.#filesContext();
+    if (!this.#state.files.open || context.key !== this.#state.files.authorityKey) return;
+    this.#filesPreviewAbort?.abort();
+    const controller = new AbortController();
+    this.#filesPreviewAbort = controller;
+    const epoch = this.#filesEpoch;
+    const provisional = {
+      title, sourceLabel: path, mediaType: "application/octet-stream",
+      byteSize: revision.byteSize, revisionKey: workspaceEntryRevisionKey(revision)
+    };
+    this.#set({ files: { ...this.#state.files, preview: { ...provisional, kind: "loading" } } });
+    try {
+      await this.#finishWorkspacePreview(context, path, revision, title, controller, epoch);
+    } catch (error) {
+      if (controller.signal.aborted || !this.#currentFiles(epoch, context.key)) return;
+      this.#set({ files: { ...this.#state.files,
+        preview: { ...provisional, kind: "error", reason: message(error) } } });
+    } finally {
+      if (this.#filesPreviewAbort === controller) this.#filesPreviewAbort = undefined;
+    }
+  }
+
+  async #finishWorkspacePreview(
+    context: MobileFilesContext,
+    relativePath: string,
+    revision: FileRevision,
+    title: string,
+    controller: AbortController,
+    epoch: number
+  ): Promise<void> {
+    const result = await this.network.readWorkspaceFile(
+      context.credential,
+      context.authority.workspace.workspaceId,
+      relativePath,
+      revision,
+      controller.signal
+    );
+    if (controller.signal.aborted || this.#filesPreviewAbort !== controller
+      || !this.#currentFiles(epoch, context.key)) return;
+    const preview = await this.#workspacePreview(context, result, title, controller.signal);
+    if (controller.signal.aborted || this.#filesPreviewAbort !== controller
+      || !this.#currentFiles(epoch, context.key)) return;
+    this.#set({ files: { ...this.#state.files, preview } });
+  }
+
+  async #workspacePreview(
+    context: MobileFilesContext,
+    preview: FilePreview,
+    title: string,
+    signal: AbortSignal
+  ): Promise<MobileFilePreview> {
+    const entry = preview.entry;
+    const revision = entry?.revision;
+    if (!entry || !revision || entry.kind === FileKind.DIRECTORY
+      || entry.workspaceId !== context.authority.workspace.workspaceId) {
+      throw new Error("The Joko node returned an invalid Workspace preview identity.");
+    }
+    const mediaType = normalizeMediaType(entry.mediaType) || "application/octet-stream";
+    const base = {
+      title,
+      sourceLabel: entry.relativePath,
+      mediaType,
+      byteSize: revision.byteSize,
+      revisionKey: workspaceEntryRevisionKey(revision)
+    };
+    if (preview.content.case === "text") {
+      const text = preview.content.value;
+      const visibleBytes = BigInt(new TextEncoder().encode(text.utf8Text).byteLength);
+      if (!isTextMediaType(mediaType) || text.startByte !== 0n || text.endByte < text.startByte
+        || text.endByte > revision.byteSize || !Number.isSafeInteger(text.totalLines) || text.totalLines < 0) {
+        throw new Error("The Joko node returned invalid text preview metadata.");
+      }
+      if (visibleBytes !== text.endByte - text.startByte) {
+        throw new Error("The Joko node returned a text preview with a mismatched byte window.");
+      }
+      return { ...base, kind: "text", text: text.utf8Text, languageId: text.languageId,
+        startByte: text.startByte, endByte: text.endByte, totalLines: text.totalLines,
+        truncated: preview.truncated };
+    }
+    if (preview.content.case === "image") {
+      const image = preview.content.value;
+      const blob = image.blob;
+      if (!blob || !normalizeMediaType(blob.mediaType).startsWith("image/")
+        || normalizeMediaType(blob.mediaType) !== mediaType
+        || blob.byteSize !== revision.byteSize || blob.sha256Hex !== revision.sha256Hex) {
+        throw new Error("The Joko node returned mismatched image preview metadata.");
+      }
+      const download = await this.network.downloadBlob(context.credential, blob, signal);
+      return { ...base, kind: "image", dataUri: bytesToDataUri(download.bytes, download.mediaType),
+        altText: image.altText || title, widthPixels: image.widthPixels, heightPixels: image.heightPixels };
+    }
+    if (preview.content.case === "blob") {
+      const blob = preview.content.value;
+      const blobType = normalizeMediaType(blob.mediaType) || "application/octet-stream";
+      if (blob.byteSize !== revision.byteSize || blob.sha256Hex !== revision.sha256Hex || blobType !== mediaType) {
+        throw new Error("The Joko node returned mismatched binary Blob metadata.");
+      }
+      return { ...base, kind: "unsupported",
+        reason: `No safe in-app preview is available for ${blobType} (${blob.byteSize.toString(10)} bytes).` };
+    }
+    if (preview.content.case === "binary") {
+      const binaryType = normalizeMediaType(preview.content.value.mediaType) || mediaType;
+      if (binaryType !== mediaType) throw new Error("The Joko node returned a mismatched binary media type.");
+      return { ...base, kind: "unsupported",
+        reason: preview.content.value.summary.trim()
+          || `No safe in-app preview is available for ${binaryType} (${revision.byteSize.toString(10)} bytes).` };
+    }
+    return { ...base, kind: "unsupported",
+      reason: `No safe in-app preview is available for ${mediaType} (${revision.byteSize.toString(10)} bytes).` };
   }
 
   #ready(): PairedCredential {

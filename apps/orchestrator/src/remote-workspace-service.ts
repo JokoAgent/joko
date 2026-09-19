@@ -237,6 +237,7 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
       }
       return {
         entry: remoteEntry(canonicalRelative(relativePath), after),
+        observedRevision: remoteRevision(after),
         mediaType,
         truncated: false
       };
@@ -260,9 +261,9 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
         try { new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
         catch { throw new WorkspaceFilePreviewError("Remote file is not complete UTF-8 text.", "unsupported"); }
       }
-      return { entry, mediaType, text: bytes.toString("utf8"), truncated: before.size > bytes.byteLength };
+      return { entry, observedRevision: remoteRevision(after), mediaType, text: bytes.toString("utf8"), truncated: before.size > bytes.byteLength };
     }
-    return { entry, mediaType, bytes, truncated: before.size > bytes.byteLength };
+    return { entry, observedRevision: remoteRevision(after), mediaType, bytes, truncated: before.size > bytes.byteLength };
   }
 
   async #materialize(

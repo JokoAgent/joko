@@ -252,6 +252,46 @@ describe("Connect formal Workspace Files contracts", () => {
     expect(response.preview?.content).toMatchObject({ case: "text", value: { languageId } });
   });
 
+  it("accepts a stable listed metadata fence while returning the stronger content revision", async () => {
+    const digest = "a".repeat(64);
+    const preview = vi.fn(async () => ({
+      entry: {
+        path: "README.md",
+        name: "README.md",
+        kind: "file" as const,
+        size: 7,
+        modifiedAt: 1,
+        revision: `sha256:${digest}:7`,
+        generated: false
+      },
+      observedRevision: "meta:listed-file",
+      mediaType: "text/markdown",
+      text: "fixture",
+      truncated: false
+    }));
+    const services = createConnectServices(application({ workspaces: { preview } }));
+    const response = await services.workspace.readWorkspaceFile(create(contract.ReadWorkspaceFileRequestSchema, {
+      workspaceId: "workspace-files",
+      relativePath: "README.md",
+      expectedRevision: create(contract.FileRevisionSchema, {
+        opaqueRevision: "meta:listed-file",
+        byteSize: 7n,
+        modifiedAt: { seconds: 0n, nanos: 1_000_000 }
+      })
+    }), context());
+
+    expect(response.preview?.entry?.revision).toMatchObject({
+      opaqueRevision: `sha256:${digest}:7`,
+      sha256Hex: digest,
+      byteSize: 7n
+    });
+    await expect(services.workspace.readWorkspaceFile(create(contract.ReadWorkspaceFileRequestSchema, {
+      workspaceId: "workspace-files",
+      relativePath: "README.md",
+      expectedRevision: create(contract.FileRevisionSchema, { opaqueRevision: "meta:stale-file" })
+    }), context())).rejects.toMatchObject({ code: Code.Aborted });
+  });
+
   it("returns typed Artifact refs for raster, PDF, video, and arbitrary binary files", async () => {
     const imageBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
     const pdfBytes = Buffer.from("%PDF-1.7\n", "utf8");

@@ -1,7 +1,27 @@
 import { create } from "@bufbuild/protobuf";
-import { SessionMessageSearchMatchSchema } from "@joko/contracts";
+import {
+  ArtifactKind,
+  ArtifactSchema,
+  BlobRefSchema,
+  BlobTransferTicketSchema,
+  FileKind,
+  FilePreviewSchema,
+  FileRevisionSchema,
+  SessionMessageSearchMatchSchema,
+  TransferDirection,
+  WorkspaceEntrySchema,
+  WorkspaceSearchMatchSchema
+} from "@joko/contracts";
 import { describe, expect, it, vi } from "vitest";
-import { collectSessionMessageSearchPages } from "./network";
+import {
+  MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES,
+  assertWorkspaceFilePreview,
+  collectArtifactPages,
+  collectSessionMessageSearchPages,
+  collectWorkspaceDirectoryPages,
+  collectWorkspaceSearchPages,
+  downloadVerifiedBlob
+} from "./network";
 
 function matches(count: number, offset = 0) {
   return Array.from({ length: count }, (_, index) => create(SessionMessageSearchMatchSchema, {
@@ -32,5 +52,171 @@ describe("mobile message-search paging", () => {
 
     await expect(collectSessionMessageSearchPages(readPage)).rejects.toThrow("invalid message-search page sequence");
     expect(readPage).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("mobile Workspace and Artifact paging", () => {
+  it("collects a complete stable hidden-inclusive document directory", async () => {
+    const first = create(WorkspaceEntrySchema, {
+      workspaceId: "workspace", relativePath: ".hidden", displayName: ".hidden",
+      kind: FileKind.REGULAR, hidden: true, revision: { opaqueRevision: "file-1", byteSize: 1n }
+    });
+    const second = create(WorkspaceEntrySchema, {
+      workspaceId: "workspace", relativePath: "folder", displayName: "folder", kind: FileKind.DIRECTORY
+    });
+    const readPage = vi.fn(async (token: string) => token === ""
+      ? { entries: [first], nextPageToken: "second", totalSize: 2n, revision: "directory-4" }
+      : { entries: [second], nextPageToken: "", totalSize: 2n, revision: "directory-4" });
+
+    await expect(collectWorkspaceDirectoryPages("workspace", "", readPage)).resolves.toEqual({
+      entries: [first, second], revision: "directory-4"
+    });
+    expect(readPage.mock.calls).toEqual([[""], ["second"]]);
+  });
+
+  it("rejects directory revision drift, duplicate paths and incomplete pagination", async () => {
+    const entry = create(WorkspaceEntrySchema, {
+      workspaceId: "workspace", relativePath: "file.txt", kind: FileKind.REGULAR,
+      revision: { opaqueRevision: "file-1" }
+    });
+    await expect(collectWorkspaceDirectoryPages("workspace", "", async (token) => token === ""
+      ? { entries: [entry], nextPageToken: "next", totalSize: 2n, revision: "one" }
+      : { entries: [entry], nextPageToken: "", totalSize: 2n, revision: "two" }))
+      .rejects.toThrow(/changed while paging/);
+    await expect(collectWorkspaceDirectoryPages("workspace", "", async () => ({
+      entries: [entry], nextPageToken: "", totalSize: 2n, revision: "one"
+    }))).rejects.toThrow(/incomplete workspace directory/);
+    await expect(collectWorkspaceDirectoryPages("workspace", "", async () => ({
+      entries: [entry, entry], nextPageToken: "", totalSize: 2n, revision: "one"
+    }))).rejects.toThrow(/invalid workspace directory/);
+  });
+
+  it("collects literal content matches only under one stable revision and cursor sequence", async () => {
+    const revision = create(FileRevisionSchema, { opaqueRevision: "file-7", byteSize: 12n });
+    const match = create(WorkspaceSearchMatchSchema, { relativePath: "src/a+b.ts", revision, linePreview: "a+b" });
+    const result = await collectWorkspaceSearchPages("workspace", async () => ({
+      matches: [match], nextPageToken: "", totalSize: 1n, revision: "search-8", truncated: true, totalFiles: 1n
+    }));
+    expect(result).toEqual({ matches: [match], revision: "search-8", truncated: true, totalFiles: 1 });
+
+    await expect(collectWorkspaceSearchPages("workspace", async () => ({
+      matches: [match], nextPageToken: "same", totalSize: 2n, revision: "search-8", truncated: false, totalFiles: 2n
+    }))).rejects.toThrow(/cyclic workspace-search page token/);
+  });
+
+  it("accepts only canonical Artifacts owned by the requested task", async () => {
+    const artifact = create(ArtifactSchema, {
+      artifactId: "artifact-1", sessionId: "session", kind: ArtifactKind.FILE, title: "Export"
+    });
+    await expect(collectArtifactPages("session", async () => ({
+      artifacts: [artifact], nextPageToken: "", totalSize: 1n, revision: "artifacts-1"
+    }))).resolves.toEqual({ artifacts: [artifact], revision: "artifacts-1" });
+    await expect(collectArtifactPages("other", async () => ({
+      artifacts: [artifact], nextPageToken: "", totalSize: 1n, revision: "artifacts-1"
+    }))).rejects.toThrow(/invalid Artifact catalog/);
+  });
+
+  it("requires the response to match every field of the observed FileRevision", () => {
+    const revision = create(FileRevisionSchema, {
+      opaqueRevision: "file-9", sha256Hex: "a".repeat(64), byteSize: 4n,
+      modifiedAt: { seconds: 10n, nanos: 12 }
+    });
+    const preview = create(FilePreviewSchema, {
+      entry: { workspaceId: "workspace", relativePath: "src/file.txt", kind: FileKind.REGULAR,
+        mediaType: "text/plain", revision },
+      content: { case: "text", value: { utf8Text: "test", startByte: 0n, endByte: 4n, totalLines: 1 } }
+    });
+    expect(assertWorkspaceFilePreview("workspace", "src/file.txt", revision, preview)).toBe(preview);
+    expect(() => assertWorkspaceFilePreview("workspace", "src/file.txt", create(FileRevisionSchema, {
+      ...revision, byteSize: 5n
+    }), preview)).toThrow(/mismatched workspace file preview/);
+
+    const listed = create(FileRevisionSchema, {
+      opaqueRevision: "meta:listed", byteSize: 4n, modifiedAt: revision.modifiedAt
+    });
+    const digest = "b".repeat(64);
+    const contentRevision = create(FileRevisionSchema, {
+      opaqueRevision: `sha256:${digest}:4`, sha256Hex: digest, byteSize: 4n,
+      modifiedAt: revision.modifiedAt
+    });
+    const upgraded = create(FilePreviewSchema, {
+      entry: create(WorkspaceEntrySchema, { ...preview.entry!, revision: contentRevision }),
+      content: preview.content
+    });
+    expect(assertWorkspaceFilePreview("workspace", "src/file.txt", listed, upgraded)).toBe(upgraded);
+    expect(() => assertWorkspaceFilePreview("workspace", "src/file.txt", listed, create(FilePreviewSchema, {
+      entry: create(WorkspaceEntrySchema, {
+        ...preview.entry!,
+        revision: create(FileRevisionSchema, {
+          ...contentRevision,
+          opaqueRevision: `sha256:${"d".repeat(64)}:4`
+        })
+      }),
+      content: preview.content
+    }))).toThrow(/mismatched workspace file preview/);
+    expect(() => assertWorkspaceFilePreview("workspace", "src/file.txt", create(FileRevisionSchema, {
+      ...listed, sha256Hex: "c".repeat(64)
+    }), upgraded)).toThrow(/mismatched workspace file preview/);
+  });
+});
+
+describe("authenticated mobile Blob downloads", () => {
+  const hash = "b".repeat(64);
+  const blob = create(BlobRefSchema, {
+    blobId: "blob-1", fileName: "image.png", mediaType: "image/png", byteSize: 4n, sha256Hex: hash
+  });
+  const ticket = create(BlobTransferTicketSchema, {
+    ticketId: "ticket-1", blobId: blob.blobId, direction: TransferDirection.DOWNLOAD,
+    relativeEndpoint: "/v1/blobs/ticket-1", maximumBytes: blob.byteSize, requiredMediaType: blob.mediaType,
+    expiresAt: { seconds: 4_102_444_800n }
+  });
+  const response = (body = new Uint8Array([1, 2, 3, 4]), mediaType = "image/png", length = "4") => new Response(body, {
+    status: 200, headers: { "content-type": mediaType, "content-length": length }
+  });
+
+  it("uses an authenticated same-origin one-time endpoint and verifies length, MIME and SHA-256", async () => {
+    const fetcher = vi.fn(async () => response());
+    const result = await downloadVerifiedBlob(
+      { origin: "https://node.example", authKey: "secret" },
+      blob,
+      ticket,
+      undefined,
+      fetcher as unknown as typeof fetch,
+      async () => hash
+    );
+
+    expect(result).toEqual({ bytes: new Uint8Array([1, 2, 3, 4]), mediaType: "image/png" });
+    expect(fetcher).toHaveBeenCalledWith("https://node.example/v1/blobs/ticket-1", expect.objectContaining({
+      headers: { authorization: "Bearer secret" }, cache: "no-store"
+    }));
+  });
+
+  it("fails closed before display for ticket, endpoint, response and digest mismatches", async () => {
+    const fetcher = vi.fn(async () => response());
+    await expect(downloadVerifiedBlob({ origin: "https://node.example", authKey: "secret" }, blob,
+      create(BlobTransferTicketSchema, { ...ticket, blobId: "other" }), undefined,
+      fetcher as unknown as typeof fetch, async () => hash)).rejects.toThrow(/mismatched Blob download ticket/);
+    await expect(downloadVerifiedBlob({ origin: "https://node.example", authKey: "secret" }, blob,
+      create(BlobTransferTicketSchema, { ...ticket, relativeEndpoint: "//evil.example/blob" }), undefined,
+      fetcher as unknown as typeof fetch, async () => hash)).rejects.toThrow(/non-root-relative Blob endpoint/);
+    await expect(downloadVerifiedBlob({ origin: "https://node.example", authKey: "secret" }, blob, ticket, undefined,
+      vi.fn(async () => response(undefined, "text/plain")) as unknown as typeof fetch, async () => hash))
+      .rejects.toThrow(/media type/);
+    await expect(downloadVerifiedBlob({ origin: "https://node.example", authKey: "secret" }, blob, ticket, undefined,
+      vi.fn(async () => response(undefined, "image/png", "5")) as unknown as typeof fetch, async () => hash))
+      .rejects.toThrow(/response length/);
+    await expect(downloadVerifiedBlob({ origin: "https://node.example", authKey: "secret" }, blob, ticket, undefined,
+      fetcher as unknown as typeof fetch, async () => "c".repeat(64))).rejects.toThrow(/SHA-256/);
+  });
+
+  it("rejects oversized Blob metadata without issuing a request", async () => {
+    const fetcher = vi.fn(async () => response());
+    const oversized = create(BlobRefSchema, {
+      ...blob, byteSize: BigInt(MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES) + 1n
+    });
+    await expect(downloadVerifiedBlob({ origin: "https://node.example", authKey: "secret" }, oversized,
+      create(BlobTransferTicketSchema, { ...ticket, maximumBytes: oversized.byteSize }), undefined,
+      fetcher as unknown as typeof fetch, async () => hash)).rejects.toThrow(/bounded download metadata/);
+    expect(fetcher).not.toHaveBeenCalled();
   });
 });
