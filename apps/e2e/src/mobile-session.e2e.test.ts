@@ -1,7 +1,7 @@
 import { create } from "@bufbuild/protobuf";
 import {
   ConnectionState, DeviceKind, EntityKind, EntityRefSchema, EventCursorSchema, OperationMutationSchema,
-  OperationPreconditionSchema, QueueItemState, SessionState
+  LogoutConnectionMutationSchema, OperationPreconditionSchema, OperationState, QueueItemState, RevokeDeviceMutationSchema, SessionState
 } from "@joko/contracts";
 import { afterEach, describe, expect, it } from "vitest";
 import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
@@ -94,11 +94,47 @@ describe("native mobile device through the durable product chain", () => {
       [Symbol.asyncIterator]().next()).rejects.toBeDefined();
 
     const ownerClient = await fixture.pair("Device owner");
+    const ownerBeforeRevoke = (await ownerClient.clients.event.getSnapshot({
+      scope: { kind: { case: "owner", value: {} } }
+    })).snapshot;
+    const deviceRevision = ownerBeforeRevoke?.devices.find((device) => device.deviceId === deviceId)?.version?.revision;
+    expect(deviceRevision?.value).toBeGreaterThan(0n);
     await submit(ownerClient.clients.operation, ownerClient.connectionId, create(OperationMutationSchema, {
-      payload: { case: "revokeDevice", value: { deviceId } }
+      preconditions: [create(OperationPreconditionSchema, {
+        entity: create(EntityRefSchema, { kind: EntityKind.DEVICE, id: deviceId }),
+        expectedRevision: deviceRevision
+      })],
+      payload: { case: "revokeDevice", value: create(RevokeDeviceMutationSchema, { deviceId, reason: "Retired from mobile" }) }
     }));
     expect(fixture.application.store.getDevice(deviceId).state).toBe("revoked");
     await expect(clients.event.getSnapshot({ scope: { kind: { case: "owner", value: {} } } })).rejects.toBeDefined();
     expect((await ownerClient.clients.connection.getConnection({ connectionId })).connection?.state).toBe(ConnectionState.REVOKED);
+
+    const logoutMobile = await fixture.anonymous.connection.beginPairing({
+      deviceDisplayName: "Joko tablet", deviceKind: DeviceKind.MOBILE, platform: "ios", appVersion: "0.1.0"
+    });
+    const logoutChallengeId = logoutMobile.challenge!.challengeId;
+    const logoutResult = (await fixture.anonymous.connection.completePairing({
+      challengeId: logoutChallengeId,
+      humanCode: fixture.pairingCode(logoutChallengeId),
+      deviceDisplayName: "Joko tablet",
+      deviceKind: DeviceKind.MOBILE,
+      platform: "ios",
+      appVersion: "0.1.0"
+    })).result!;
+    const logoutConnectionId = logoutResult.connection!.connectionId;
+    const logoutClients = fixture.clients(logoutResult.authKey);
+    const logoutOwner = (await logoutClients.event.getSnapshot({ scope: { kind: { case: "owner", value: {} } } })).snapshot!;
+    const connectionRevision = logoutOwner.connections.find((item) => item.connectionId === logoutConnectionId)?.version?.revision;
+    expect(connectionRevision?.value).toBeGreaterThan(0n);
+    const loggedOut = await submit(logoutClients.operation, logoutConnectionId, create(OperationMutationSchema, {
+      preconditions: [create(OperationPreconditionSchema, {
+        entity: create(EntityRefSchema, { kind: EntityKind.CONNECTION, id: logoutConnectionId }),
+        expectedRevision: connectionRevision
+      })],
+      payload: { case: "logoutConnection", value: create(LogoutConnectionMutationSchema, { connectionId: logoutConnectionId }) }
+    }));
+    expect(loggedOut.state).toBe(OperationState.SUCCEEDED);
+    await expect(logoutClients.event.getSnapshot({ scope: { kind: { case: "owner", value: {} } } })).rejects.toBeDefined();
   });
 });

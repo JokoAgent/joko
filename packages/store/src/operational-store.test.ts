@@ -3225,13 +3225,15 @@ describe("OperationalStore", () => {
     expect(renamed.name).toBe("Renamed workstation");
   });
 
-  it("validates active device and digest before touching connection activity", () => {
+  it("tracks authorized activity without advancing mutation authority", () => {
     const store = createStore();
     const connection = store.createConnection({
       id: "connection-no-touch",
       name: "No touch",
       authKeyDigest: "correct-digest"
     });
+    const device = store.getDevice(connection.deviceId);
+    const storeRevision = store.getSnapshot().revision;
 
     expect(() => store.authorizeConnection(connection.id, "wrong-digest", { touch: true, seenAt: 123 }))
       .toThrow(AuthorizationError);
@@ -3241,9 +3243,21 @@ describe("OperationalStore", () => {
     const touched = store.authorizeConnection(connection.id, connection.authKeyDigest, { touch: true, seenAt: 456 });
     expect(touched.lastSeenAt).toBe(456);
     expect(store.getDevice(connection.deviceId).lastSeenAt).toBe(456);
-    const revision = touched.revision;
+    expect(touched.revision).toBe(connection.revision);
+    expect(store.getDevice(connection.deviceId).revision).toBe(device.revision);
+    expect(store.getSnapshot().revision).toBe(storeRevision);
+
+    const directlyTouched = store.touchConnection(connection.id, 789);
+    expect(directlyTouched.lastSeenAt).toBe(789);
+    expect(directlyTouched.revision).toBe(connection.revision);
+    expect(store.getDevice(connection.deviceId)).toMatchObject({
+      lastSeenAt: 789,
+      revision: device.revision
+    });
+    expect(store.getSnapshot().revision).toBe(storeRevision);
+
     store.authorizeConnection(connection.id, connection.authKeyDigest);
-    expect(store.getConnection(connection.id).revision).toBe(revision);
+    expect(store.getConnection(connection.id).revision).toBe(connection.revision);
   });
 
   it("consumes pairing codes once and binds the resulting connection atomically", () => {

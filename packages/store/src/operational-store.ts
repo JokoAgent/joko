@@ -1526,18 +1526,22 @@ export class OperationalStore {
       this.assertOpen();
       return verify();
     }
-    return this.transaction(() => {
+    // Presence is runtime observation, not mutation authority. Updating it
+    // must not advance the Connection/Device CAS revision (or the global
+    // content revision), otherwise authenticating the very mutation that
+    // carries an exact Connection/Device precondition makes that precondition
+    // stale before it can be checked.
+    return this.runtimeMetadataWrite(() => {
       const connection = verify();
       const seenAt = options.seenAt ?? this.now();
-      const revision = asSqlInteger(this.requireActiveRevision());
       const connectionUpdate = this.database.prepare(`
-        UPDATE connections SET last_seen_at = ?, revision = ?
+        UPDATE connections SET last_seen_at = ?
         WHERE id = ? AND state = 'active' AND auth_key_digest = ?
-      `).run(seenAt, revision, connection.id, authKeyDigest);
+      `).run(seenAt, connection.id, authKeyDigest);
       const deviceUpdate = this.database.prepare(`
-        UPDATE devices SET last_seen_at = ?, revision = ?
+        UPDATE devices SET last_seen_at = ?
         WHERE id = ? AND state = 'active'
-      `).run(seenAt, revision, connection.deviceId);
+      `).run(seenAt, connection.deviceId);
       if (connectionUpdate.changes !== 1 || deviceUpdate.changes !== 1) {
         throw new AuthorizationError("The connection credential is invalid or revoked.");
       }
@@ -1546,20 +1550,20 @@ export class OperationalStore {
   }
 
   touchConnection(id: string, seenAt = this.now()): ConnectionRecord {
-    return this.write(() => {
+    return this.runtimeMetadataWrite(() => {
       const current = this.getConnection(id);
       const result = this.database.prepare(`
-        UPDATE connections SET last_seen_at = ?, revision = ?
+        UPDATE connections SET last_seen_at = ?
         WHERE id = ? AND state = 'active'
-      `).run(seenAt, asSqlInteger(this.requireActiveRevision()), id);
+      `).run(seenAt, id);
       if (result.changes !== 1) {
         const connection = this.getConnection(id);
         if (connection.state !== "active") throw new AuthorizationError("The connection has been revoked.");
       }
       const deviceResult = this.database.prepare(`
-        UPDATE devices SET last_seen_at = ?, revision = ?
+        UPDATE devices SET last_seen_at = ?
         WHERE id = ? AND state = 'active'
-      `).run(seenAt, asSqlInteger(this.requireActiveRevision()), current.deviceId);
+      `).run(seenAt, current.deviceId);
       if (deviceResult.changes !== 1) throw new AuthorizationError("The device has been revoked.");
       return this.getConnection(id);
     });
@@ -10133,7 +10137,7 @@ export class OperationalStore {
     const startedAt = schedulerRuntimeTimestamp(input.startedAt ?? this.now(), "Scheduler runtime start");
     const leaseExpiresAt = schedulerRuntimeTimestamp(input.leaseExpiresAt, "Scheduler runtime lease expiry");
     if (leaseExpiresAt <= startedAt) throw new StoreError("Scheduler runtime lease must expire in the future.");
-    return this.schedulerRuntimeWrite(() => {
+    return this.runtimeMetadataWrite(() => {
       const currentRow = this.database.prepare(
         "SELECT * FROM scheduler_runtime_owner WHERE singleton = 1"
       ).get() as Row | undefined;
@@ -10186,7 +10190,7 @@ export class OperationalStore {
     const heartbeatAt = schedulerRuntimeTimestamp(input.heartbeatAt ?? this.now(), "Scheduler runtime heartbeat");
     const leaseExpiresAt = schedulerRuntimeTimestamp(input.leaseExpiresAt, "Scheduler runtime lease expiry");
     if (leaseExpiresAt <= heartbeatAt) throw new StoreError("Scheduler runtime lease must expire after its heartbeat.");
-    return this.schedulerRuntimeWrite(() => {
+    return this.runtimeMetadataWrite(() => {
       const result = this.database.prepare(`
         UPDATE scheduler_runtime_owner
         SET heartbeat_at = ?, lease_expires_at = ?, updated_at = ?, revision = revision + 1
@@ -10217,7 +10221,7 @@ export class OperationalStore {
     const leaseExpiresAt = schedulerRuntimeTimestamp(input.leaseExpiresAt, "Schedule runtime lease expiry");
     if (leaseExpiresAt <= startedAt) throw new StoreError("Schedule runtime lease must expire in the future.");
     const phase = schedulerRuntimePhase(input.phase ?? "loading");
-    return this.schedulerRuntimeWrite(() => {
+    return this.runtimeMetadataWrite(() => {
       this.getSchedule(scheduleId);
       const owner = this.getSchedulerRuntimeOwner();
       if (owner?.ownerId !== ownerId || owner.generation !== ownerGeneration) {
@@ -10307,7 +10311,7 @@ export class OperationalStore {
       ? undefined
       : schedulerRuntimeTimestamp(input.progressAt, "Schedule runtime progress");
     const requestedPhase = input.phase === undefined ? undefined : schedulerRuntimePhase(input.phase);
-    return this.schedulerRuntimeWrite(() => {
+    return this.runtimeMetadataWrite(() => {
       const current = this.findScheduleRuntimeOccurrence(input.runId);
       if (
         current === undefined ||
@@ -10364,7 +10368,7 @@ export class OperationalStore {
     const heartbeatAt = schedulerRuntimeTimestamp(input.heartbeatAt ?? this.now(), "Schedule runtime heartbeat");
     const leaseExpiresAt = schedulerRuntimeTimestamp(input.leaseExpiresAt, "Schedule runtime lease expiry");
     if (leaseExpiresAt <= heartbeatAt) throw new StoreError("Schedule runtime lease must expire after its heartbeat.");
-    return this.schedulerRuntimeWrite(() => {
+    return this.runtimeMetadataWrite(() => {
       const current = this.findScheduleRuntimeOccurrence(input.runId);
       if (
         current === undefined ||
@@ -10424,7 +10428,7 @@ export class OperationalStore {
     const stalledAt = schedulerRuntimeTimestamp(input.stalledAt ?? this.now(), "Schedule runtime stall time");
     const leaseExpiresAt = schedulerRuntimeTimestamp(input.leaseExpiresAt, "Schedule runtime lease expiry");
     if (leaseExpiresAt <= stalledAt) throw new StoreError("Stalled Schedule runtime lease must remain active during abort.");
-    return this.schedulerRuntimeWrite(() => {
+    return this.runtimeMetadataWrite(() => {
       const current = this.findScheduleRuntimeOccurrence(input.runId);
       if (
         current === undefined ||
@@ -10472,7 +10476,7 @@ export class OperationalStore {
     const claimedAt = schedulerRuntimeTimestamp(input.claimedAt ?? this.now(), "Schedule recovery claim time");
     const leaseExpiresAt = schedulerRuntimeTimestamp(input.leaseExpiresAt, "Schedule recovery lease expiry");
     if (leaseExpiresAt <= claimedAt) throw new StoreError("Schedule recovery lease must expire in the future.");
-    return this.schedulerRuntimeWrite(() => {
+    return this.runtimeMetadataWrite(() => {
       const current = this.findScheduleRuntimeOccurrence(input.runId);
       if (
         current === undefined ||
@@ -10520,7 +10524,7 @@ export class OperationalStore {
     const leaseExpiresAt = schedulerRuntimeTimestamp(input.leaseExpiresAt, "Schedule recovery lease expiry");
     if (leaseExpiresAt <= claimedAt) throw new StoreError("Schedule recovery lease must expire in the future.");
     const limit = normalizeLimit(input.limit, 100);
-    return this.schedulerRuntimeWrite(() => {
+    return this.runtimeMetadataWrite(() => {
       const candidates = (this.database.prepare(`
         SELECT * FROM schedule_runtime_occurrences
         WHERE lease_expires_at <= ?
@@ -10564,7 +10568,7 @@ export class OperationalStore {
     readonly ownerId: string;
     readonly ownerGeneration: number;
   }): boolean {
-    return this.schedulerRuntimeWrite(() => {
+    return this.runtimeMetadataWrite(() => {
       const result = this.database.prepare(`
         DELETE FROM schedule_runtime_occurrences
         WHERE run_id = ? AND owner_id = ? AND owner_generation = ?
@@ -12281,10 +12285,11 @@ export class OperationalStore {
     }
   }
 
-  /** Scheduler heartbeats are fencing metadata, not public logical state. They
-   * need an atomic commit without advancing the global content revision on
-   * every 15-second touch (which would invalidate unrelated read cursors). */
-  private schedulerRuntimeWrite<T>(callback: () => T): T {
+  /** Runtime observations and heartbeats are fencing/presence metadata, not
+   * public logical mutations. They need an atomic commit without advancing
+   * the global content revision (which would invalidate unrelated cursors and
+   * exact mutation preconditions). */
+  private runtimeMetadataWrite<T>(callback: () => T): T {
     this.assertOpen();
     if (this.transactionFrames.length !== 0) return callback();
     this.database.exec("BEGIN IMMEDIATE");

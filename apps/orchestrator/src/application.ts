@@ -43,6 +43,7 @@ import {
   type KnownCapability,
   type TargetDescriptor
 } from "@joko/core";
+import { JOKO_API_VERSION } from "@joko/contracts";
 import {
   FileSshConfigPort,
   Ssh2ResolvedAgentAuthConnector,
@@ -477,7 +478,7 @@ export async function createOrchestratorApplication(
       displayName: "Joko",
       origin: config.publicOrigin,
       version: "0.1.0",
-      apiVersion: "joko.v1",
+      apiVersion: JOKO_API_VERSION,
       pairingEnabled: connections.pairingEnabled,
       lastSeen: Date.now()
     }),

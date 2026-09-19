@@ -9,13 +9,22 @@
     "ios": {
       "bundleIdentifier": "app.joko.mobile",
       "supportsTablet": true,
+      "entitlements": {
+        "com.apple.developer.networking.multicast": true
+      },
       "infoPlist": {
         "NSLocalNetworkUsageDescription": "Connect to a Joko node on your local network.",
         "NSAppTransportSecurity": { "NSAllowsLocalNetworking": true }
       }
     },
     "android": {
-      "package": "app.joko.mobile"
+      "package": "app.joko.mobile",
+      "permissions": [
+        "android.permission.ACCESS_NETWORK_STATE",
+        "android.permission.ACCESS_WIFI_STATE",
+        "android.permission.CHANGE_WIFI_MULTICAST_STATE",
+        "android.permission.INTERNET"
+      ]
     },
     "plugins": [
       "./with-joko-native-brand.cjs",

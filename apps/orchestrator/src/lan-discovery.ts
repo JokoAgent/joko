@@ -5,6 +5,7 @@ import {
   LAN_DISCOVERY_GROUP,
   LAN_DISCOVERY_MAX_DATAGRAM_BYTES,
   LAN_DISCOVERY_NONCE_BYTES,
+  LAN_DISCOVERY_PEER_TTL_MS,
   LAN_DISCOVERY_PORT,
   decodeLanDiscoveryDatagram,
   encodeLanDiscoveryAnnouncement,
@@ -18,6 +19,7 @@ export {
   LAN_DISCOVERY_MAGIC,
   LAN_DISCOVERY_MAX_DATAGRAM_BYTES,
   LAN_DISCOVERY_NONCE_BYTES,
+  LAN_DISCOVERY_PEER_TTL_MS,
   LAN_DISCOVERY_PORT,
   LAN_DISCOVERY_PROTOCOL_VERSION,
   decodeLanDiscoveryDatagram,
@@ -29,7 +31,6 @@ export {
   type DiscoveredNodeRecord
 } from "@joko/contracts";
 
-export const LAN_DISCOVERY_PEER_TTL_MS = 90_000;
 export const LAN_DISCOVERY_ANNOUNCE_INTERVAL_MS = 30_000;
 
 const MAX_PEERS = 256;

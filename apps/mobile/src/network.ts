@@ -2,11 +2,13 @@ import { Code, ConnectError, createClient, type Interceptor, type Transport } fr
 import { createConnectTransport } from "@connectrpc/connect-web";
 import {
   ConnectionService, DeviceKind, EventService, OperationService, SessionService, TargetService,
-  type Connection, type Device, type Event, type EventCursor, type Operation,
+  JOKO_API_VERSION, isPrivateLanDiscoveryHost, validateDiscoveredNode,
+  type Connection, type Device, type DiscoveredNodeRecord, type Event, type EventCursor, type Operation,
   type OperationMutation, type Snapshot, type Target
 } from "@joko/contracts";
 
 export interface PairedCredential {
+  readonly profileId: string;
   readonly origin: string;
   readonly serverId: string;
   readonly connectionId: string;
@@ -18,11 +20,15 @@ export interface PairedCredential {
 export interface NodeIdentity {
   readonly serverId: string;
   readonly displayName: string;
+  readonly version: string;
+  readonly apiVersion: string;
+  readonly health: number;
   readonly pairingEnabled: boolean;
 }
 
 export interface MobileNetwork {
   inspect(origin: string, signal?: AbortSignal): Promise<NodeIdentity>;
+  discover(origin: string, signal?: AbortSignal): Promise<readonly DiscoveredNodeRecord[]>;
   requestPairing(origin: string, deviceName: string, platform: string, signal?: AbortSignal): Promise<{ identity: NodeIdentity; challengeId: string }>;
   completePairing(origin: string, challengeId: string, code: string, deviceName: string, platform: string, signal?: AbortSignal): Promise<{ credential: PairedCredential; identity: NodeIdentity }>;
   readOwner(credential: PairedCredential, signal?: AbortSignal): Promise<{ connection: Connection; device: Device; snapshot: Snapshot }>;
@@ -41,18 +47,10 @@ export function normalizeNodeOrigin(value: string): string {
   if (parsed.username || parsed.password || parsed.search || parsed.hash || (parsed.pathname !== "/" && parsed.pathname !== "")) {
     throw new Error("Use only the Joko node origin, without credentials, path, query or fragment.");
   }
-  if (parsed.protocol === "http:" && !isPrivateLanHost(parsed.hostname)) {
+  if (parsed.protocol === "http:" && !isPrivateLanDiscoveryHost(parsed.hostname)) {
     throw new Error("Unencrypted HTTP is allowed only for a local/private-network Joko node. Use HTTPS elsewhere.");
   }
   return parsed.origin;
-}
-
-function isPrivateLanHost(host: string): boolean {
-  if (host === "localhost" || host === "127.0.0.1" || host === "[::1]" || host.endsWith(".local")) return true;
-  const octets = host.split(".").map(Number);
-  if (octets.length !== 4 || octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)) return false;
-  return octets[0] === 10 || octets[0] === 127 || (octets[0] === 192 && octets[1] === 168)
-    || (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31);
 }
 
 function transport(origin: string, authKey?: string): Transport {
@@ -66,9 +64,26 @@ function transport(origin: string, authKey?: string): Transport {
   return createConnectTransport({ baseUrl: origin, useBinaryFormat: true, interceptors });
 }
 
-function identity(server: { serverId: string; displayName: string; apiVersion: string; pairingEnabled: boolean } | undefined): NodeIdentity {
+export function parseNodeIdentity(server: {
+  serverId: string;
+  displayName: string;
+  version: string;
+  apiVersion: string;
+  health: number;
+  pairingEnabled: boolean;
+} | undefined): NodeIdentity {
   if (!server?.serverId.trim() || !server.apiVersion.trim()) throw new Error("This address did not return a valid Joko node identity.");
-  return { serverId: server.serverId, displayName: server.displayName || "Joko node", pairingEnabled: server.pairingEnabled };
+  if (server.apiVersion !== JOKO_API_VERSION) {
+    throw new Error(`This Joko app supports API ${JOKO_API_VERSION}, but the node reports ${server.apiVersion}.`);
+  }
+  return {
+    serverId: server.serverId,
+    displayName: server.displayName || "Joko node",
+    version: server.version,
+    apiVersion: server.apiVersion,
+    health: server.health,
+    pairingEnabled: server.pairingEnabled
+  };
 }
 
 function options(signal?: AbortSignal): { signal: AbortSignal } | undefined { return signal === undefined ? undefined : { signal }; }
@@ -76,12 +91,30 @@ function options(signal?: AbortSignal): { signal: AbortSignal } | undefined { re
 export const mobileNetwork: MobileNetwork = {
   async inspect(origin, signal) {
     const response = await createClient(ConnectionService, transport(normalizeNodeOrigin(origin))).getServerInfo({}, options(signal));
-    return identity(response.server);
+    return parseNodeIdentity(response.server);
+  },
+  async discover(rawOrigin, signal) {
+    const origin = normalizeNodeOrigin(rawOrigin);
+    const response = await createClient(ConnectionService, transport(origin)).listDiscoveredNodes({}, options(signal));
+    const receivedAt = Date.now();
+    return response.nodes.map((node) => {
+      const value: DiscoveredNodeRecord = {
+        serverId: node.serverId,
+        displayName: node.displayName,
+        origin: node.origin,
+        version: node.version,
+        apiVersion: node.apiVersion,
+        pairingEnabled: node.pairingEnabled,
+        lastSeen: receivedAt
+      };
+      validateDiscoveredNode(value);
+      return value;
+    });
   },
   async requestPairing(rawOrigin, deviceName, platform, signal) {
     const origin = normalizeNodeOrigin(rawOrigin);
     const client = createClient(ConnectionService, transport(origin));
-    const node = identity((await client.getServerInfo({}, options(signal))).server);
+    const node = parseNodeIdentity((await client.getServerInfo({}, options(signal))).server);
     if (!node.pairingEnabled) throw new Error("Pairing is closed on this Joko node. Ask the node owner to open pairing.");
     const args = { deviceDisplayName: deviceName.trim(), deviceKind: DeviceKind.MOBILE, platform, appVersion: "0.1.0" };
     const challenge = (await client.beginPairing(args, options(signal))).challenge;
@@ -91,15 +124,17 @@ export const mobileNetwork: MobileNetwork = {
   async completePairing(rawOrigin, challengeId, code, deviceName, platform, signal) {
     const origin = normalizeNodeOrigin(rawOrigin);
     const client = createClient(ConnectionService, transport(origin));
-    const node = identity((await client.getServerInfo({}, options(signal))).server);
+    const node = parseNodeIdentity((await client.getServerInfo({}, options(signal))).server);
     const args = { deviceDisplayName: deviceName.trim(), deviceKind: DeviceKind.MOBILE, platform, appVersion: "0.1.0" };
     const result = (await client.completePairing({ ...args, challengeId, humanCode: code.trim() }, options(signal))).result;
-    if (!result?.connection?.connectionId || !result.device?.deviceId || result.connection.deviceId !== result.device.deviceId || !result.authKey) {
+    if (!result?.connection?.connectionId || !result.connection.connectionProfileId || !result.device?.deviceId
+      || result.connection.deviceId !== result.device.deviceId || !result.authKey) {
       throw new Error("Pairing completed without a matching device and connection credential.");
     }
     return {
       identity: node,
       credential: {
+        profileId: result.connection.connectionProfileId,
         origin, serverId: node.serverId, connectionId: result.connection.connectionId,
         deviceId: result.device.deviceId, displayName: result.connection.displayName || deviceName.trim(), authKey: result.authKey
       }
