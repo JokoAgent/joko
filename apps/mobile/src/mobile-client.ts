@@ -1,11 +1,13 @@
 import { create } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
 import {
-  CapabilitySupport, ConnectionState, CreateSessionMutationSchema, DeviceKind, EntityKind, EntityRefSchema,
+  ArchiveSessionMutationSchema, CapabilitySupport, ConnectionState, CreateSessionMutationSchema,
+  DeleteSessionMutationSchema, DeviceKind, EntityKind, EntityRefSchema,
   LAN_DISCOVERY_PEER_TTL_MS,
   InputContentSchema, InputPartSchema, NativeSessionPlacement, NativeSessionStartSchema, NewNativeSessionSchema,
   LogoutConnectionMutationSchema, OperationPreconditionSchema, OperationState, OperationMutationSchema,
-  PermissionMode, QueueDeliveryMode, RevokeDeviceMutationSchema, SendInputMutationSchema, TargetState, capabilityNames,
+  PermissionMode, PinSessionMutationSchema, QueueDeliveryMode, RenameSessionMutationSchema,
+  RevokeDeviceMutationSchema, SendInputMutationSchema, SessionMessageSearchSessionStatus, TargetState, capabilityNames,
   type DiscoveredNodeRecord, type Event, type EventCursor, type Operation, type OperationMutation, type Session, type Snapshot
 } from "@joko/contracts";
 import {
@@ -13,6 +15,7 @@ import {
   type MobileConnectionProfile, type MobileStorage, type PendingOperation
 } from "./connection-storage";
 import type { MobileDiscovery } from "./connection-discovery";
+import type { MobileHomeStatusFilter } from "./home-navigation";
 import { normalizeNodeOrigin, type MobileNetwork, type NodeIdentity, type PairedCredential } from "./network";
 
 export type { MobileStorage, PendingOperation } from "./connection-storage";
@@ -56,6 +59,11 @@ export interface MobileState {
   readonly historyEnd: boolean;
   readonly before?: EventCursor;
   readonly pending: readonly PendingOperation[];
+  readonly homeSearchQuery: string;
+  readonly homeSearchFilter: MobileHomeStatusFilter;
+  readonly homeSearchStatus: "idle" | "searching" | "ready" | "error";
+  readonly homeSearchSessionIds: readonly string[];
+  readonly homeSearchError?: string;
   readonly error?: string;
 }
 
@@ -66,7 +74,8 @@ const isTerminal = (state: OperationState): boolean => [
 export class MobileClient {
   #state: MobileState = { status: "starting", busy: false, saved: [], connectionMode: "nearby",
     discoveryState: "idle", nearby: [], older: [], live: [], liveStatus: "paused",
-    historyBusy: false, historyEnd: false, pending: [] };
+    historyBusy: false, historyEnd: false, pending: [], homeSearchQuery: "", homeSearchFilter: "active",
+    homeSearchStatus: "idle", homeSearchSessionIds: [] };
   #credential?: PairedCredential;
   #profiles: MobileConnectionProfile[] = [];
   #automaticProfileId?: string;
@@ -93,6 +102,8 @@ export class MobileClient {
   #connectionAttemptEpoch = 0;
   #connectionAttemptAbort?: AbortController;
   #discoveryExpiryTimer?: ReturnType<typeof setTimeout>;
+  #homeSearchEpoch = 0;
+  #homeSearchAbort?: AbortController;
 
   constructor(
     private readonly network: MobileNetwork,
@@ -121,6 +132,9 @@ export class MobileClient {
     this.#abort?.abort();
     this.#streamAbort?.abort();
     this.#streamAbort = undefined;
+    this.#homeSearchAbort?.abort();
+    this.#homeSearchAbort = undefined;
+    this.#homeSearchEpoch += 1;
     if (this.#timer !== undefined) clearTimeout(this.#timer);
     if (this.#proofTimer !== undefined) clearTimeout(this.#proofTimer);
     if (this.#projectionTimer !== undefined) clearTimeout(this.#projectionTimer);
@@ -132,6 +146,7 @@ export class MobileClient {
     this.#projectionMisses = 0;
     this.#streamSequence = undefined;
     this.#streamGeneration = undefined;
+    this.#state = { ...this.#state, homeSearchStatus: "idle", homeSearchSessionIds: [], homeSearchError: undefined };
     this.#abort = new AbortController();
     return ++this.#epoch;
   }
@@ -1048,6 +1063,52 @@ export class MobileClient {
     await this.refresh();
   }
 
+  async searchHome(query: string, statusFilter: MobileHomeStatusFilter): Promise<void> {
+    const normalized = query.trim();
+    this.#homeSearchAbort?.abort();
+    this.#homeSearchAbort = undefined;
+    const generation = ++this.#homeSearchEpoch;
+    if (!normalized) {
+      this.#set({ homeSearchQuery: "", homeSearchFilter: statusFilter, homeSearchStatus: "idle",
+        homeSearchSessionIds: [], homeSearchError: undefined });
+      return;
+    }
+    const credential = this.#credential;
+    const owner = this.#state.owner;
+    const profileId = this.#activeProfileId;
+    if (!credential || !owner || !profileId || this.#state.status !== "connected" || !this.#foreground) {
+      this.#set({ homeSearchQuery: normalized, homeSearchFilter: statusFilter, homeSearchStatus: "error",
+        homeSearchSessionIds: [], homeSearchError: "Reconnect to search task messages." });
+      return;
+    }
+    const controller = new AbortController();
+    this.#homeSearchAbort = controller;
+    this.#set({ homeSearchQuery: normalized, homeSearchFilter: statusFilter, homeSearchStatus: "searching",
+      homeSearchSessionIds: [], homeSearchError: undefined });
+    try {
+      const matches = await this.network.searchSessionMessages(
+        credential,
+        normalized,
+        statusFilter === "active" ? SessionMessageSearchSessionStatus.ACTIVE
+          : statusFilter === "archived" ? SessionMessageSearchSessionStatus.ARCHIVED
+            : SessionMessageSearchSessionStatus.UNSPECIFIED,
+        controller.signal
+      );
+      if (controller.signal.aborted || generation !== this.#homeSearchEpoch || owner !== this.#state.owner
+        || profileId !== this.#activeProfileId || this.#state.homeSearchQuery !== normalized
+        || this.#state.homeSearchFilter !== statusFilter) return;
+      const visible = new Set(this.#state.owner?.sessions.map((session) => session.sessionId) ?? []);
+      const sessionIds = [...new Set(matches.map((match) => match.sessionId).filter((sessionId) => visible.has(sessionId)))];
+      this.#set({ homeSearchStatus: "ready", homeSearchSessionIds: sessionIds, homeSearchError: undefined });
+    } catch (error) {
+      if (controller.signal.aborted || generation !== this.#homeSearchEpoch || owner !== this.#state.owner
+        || profileId !== this.#activeProfileId) return;
+      this.#set({ homeSearchStatus: "error", homeSearchSessionIds: [], homeSearchError: message(error) });
+    } finally {
+      if (this.#homeSearchAbort === controller) this.#homeSearchAbort = undefined;
+    }
+  }
+
   async older(): Promise<void> {
     const credential = this.#credential;
     const sessionId = this.#state.selectedId;
@@ -1206,6 +1267,61 @@ export class MobileClient {
     } finally { this.#releaseMutation(action); }
   }
 
+  async renameSession(sessionId: string, displayName: string): Promise<boolean> {
+    const value = displayName.trim();
+    if (!value || value.length > 256) throw new Error("Use a task name between 1 and 256 characters.");
+    return this.#mutateSession(sessionId, "rename", {
+      case: "renameSession",
+      value: create(RenameSessionMutationSchema, { sessionId, displayName: value })
+    });
+  }
+
+  async setSessionPinned(sessionId: string, pinned: boolean): Promise<boolean> {
+    return this.#mutateSession(sessionId, "pin", {
+      case: "pinSession",
+      value: create(PinSessionMutationSchema, { sessionId, pinned })
+    });
+  }
+
+  async setSessionArchived(sessionId: string, archived: boolean): Promise<boolean> {
+    return this.#mutateSession(sessionId, "archive", {
+      case: "archiveSession",
+      value: create(ArchiveSessionMutationSchema, { sessionId, archived })
+    });
+  }
+
+  async deleteSession(sessionId: string): Promise<boolean> {
+    return this.#mutateSession(sessionId, "delete", {
+      case: "deleteSession",
+      value: create(DeleteSessionMutationSchema, { sessionId, deleteNativeSession: false, deleteArtifacts: false })
+    });
+  }
+
+  async #mutateSession(
+    sessionId: string,
+    kind: Extract<PendingOperation["kind"], "rename" | "pin" | "archive" | "delete">,
+    payload: OperationMutation["payload"]
+  ): Promise<boolean> {
+    const session = this.#state.owner?.sessions.find((candidate) => candidate.sessionId === sessionId);
+    const revision = session?.version?.revision;
+    if (!session || !revision || revision.value < 1n) throw new Error("A current task revision is required.");
+    if (this.#state.pending.some((item) => item.sessionId === sessionId
+      && ["rename", "pin", "archive", "delete"].includes(item.kind))) {
+      throw new Error("A previous change to this task is still pending. Check its operation before changing it again.");
+    }
+    this.#ready();
+    const action = this.#claimMutation();
+    try {
+      return await this.#submit(create(OperationMutationSchema, {
+        preconditions: [create(OperationPreconditionSchema, {
+          entity: create(EntityRefSchema, { kind: EntityKind.SESSION, id: sessionId }),
+          expectedRevision: revision
+        })],
+        payload
+      }), { kind, sessionId });
+    } finally { this.#releaseMutation(action); }
+  }
+
   #claimMutation(): symbol {
     if (this.#mutationOwner || this.#connectionAttemptAbort || this.#state.busy) {
       throw new Error("Another task or connection operation is already in progress.");
@@ -1314,12 +1430,18 @@ export class MobileClient {
     }
     if (!this.#current(epoch)) return false;
     await this.#receipt(operation, pending, epoch);
-    const accepted = operation.state !== OperationState.FAILED && operation.state !== OperationState.CONFLICT && operation.state !== OperationState.CANCELLED;
+    const rejected = operation.state === OperationState.FAILED
+      || operation.state === OperationState.CONFLICT
+      || operation.state === OperationState.CANCELLED;
+    const rejectionMessage = rejected ? operation.error?.message || "The operation was rejected." : undefined;
     if (this.#current(epoch)) {
       this.#set({ busy: false });
       await this.refresh();
+      if (rejectionMessage && this.#credential?.connectionId === pending.connectionId && this.#state.status === "connected") {
+        this.#set({ error: rejectionMessage });
+      }
     }
-    return accepted;
+    return !rejected;
   }
 
   async #receipt(operation: Operation, pending: PendingOperation, epoch: number): Promise<void> {
@@ -1363,8 +1485,15 @@ export class MobileClient {
       try {
         const operation = await this.network.getOperation(credential, pending.operationId, this.#abort?.signal);
         if (!this.#current(epoch)) return;
-        if (operation) await this.#receipt(operation, pending, epoch);
-        else this.#set({ error: `Operation ${pending.operationId} is not yet confirmed. No input will be resent automatically.` });
+        if (operation) {
+          await this.#receipt(operation, pending, epoch);
+          if (operation.state === OperationState.SUCCEEDED
+            && ["rename", "pin", "archive", "delete"].includes(pending.kind)
+            && this.#current(epoch)) {
+            await this.refresh();
+            return;
+          }
+        } else this.#set({ error: `Operation ${pending.operationId} is not yet confirmed. No input will be resent automatically.` });
       } catch (error) {
         if (!this.#current(epoch)) return;
         if (isRevoked(error)) {

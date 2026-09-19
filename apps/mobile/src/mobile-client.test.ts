@@ -2,14 +2,15 @@ import { create, toBinary } from "@bufbuild/protobuf";
 import {
   CapabilitySupport, ConnectionSchema, ConnectionState, DeviceKind, DevicePresenceState, DeviceSchema, EntityKind,
   JOKO_API_VERSION, OperationSchema,
-  EventCursorSchema, EventSchema, MessageRole, OperationMutationSchema, OperationState, SessionState, SnapshotSchema, TargetState, capabilityNames
+  EventCursorSchema, EventSchema, MessageRole, OperationMutationSchema, OperationState, SessionMessageSearchMatchSchema,
+  SessionMessageSearchSessionStatus, SessionState, SnapshotSchema, TargetState, WorkspaceKind, capabilityNames
 } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MobileClient, type MobileStorage, type PendingOperation } from "./mobile-client";
 import { MobileCredentialStorageError, profileFromCredential } from "./connection-storage";
 import type { MobileDiscovery } from "./connection-discovery";
 import { normalizeNodeOrigin, parseNodeIdentity, type MobileNetwork, type NodeIdentity, type PairedCredential } from "./network";
-import type { Event } from "@joko/contracts";
+import type { Event, SessionMessageSearchMatch } from "@joko/contracts";
 import { timelineRows } from "./timeline";
 
 const credential: PairedCredential = {
@@ -55,8 +56,9 @@ const snapshot = create(SnapshotSchema, {
   } }],
   targets: [{ targetId: "target", backendId: "backend", displayName: "Project", state: TargetState.ACTIVE,
     version: { revision: { value: 3n } } }],
+  workspaces: [{ workspaceId: "workspace", targetId: "target", displayName: "Project", kind: WorkspaceKind.USER_PROJECT }],
   sessions: [{ sessionId: "session", backendId: "backend", targetId: "target", displayName: "Task", state: SessionState.IDLE,
-    nativeBinding: { runtimeGeneration: 8n } }]
+    nativeBinding: { runtimeGeneration: 8n }, version: { revision: { value: 9n } } }]
 });
 const extendedSnapshot = create(SnapshotSchema, {
   ...snapshot,
@@ -115,6 +117,7 @@ function fakeNetwork(): MobileNetwork {
     readSession: vi.fn(async () => snapshot),
     readHistory: vi.fn(async () => ({ events: [], before: undefined })),
     readAround: vi.fn(async () => []),
+    searchSessionMessages: vi.fn(async () => []),
     streamOwner: vi.fn(async function* (_credential, _after, signal) {
       await new Promise<void>((resolve) => {
         if (signal.aborted) resolve();
@@ -967,5 +970,117 @@ describe("native mobile connection and operation ownership", () => {
     await vi.waitFor(() => expect(app.state.liveStatus).toBe("polling"));
     expect(app.state.status).toBe("connected");
     expect(app.state.live).toHaveLength(0);
+  });
+});
+
+describe("mobile Home search and task mutations", () => {
+  it("retires late message-search results when query or owner changes", async () => {
+    const network = fakeNetwork();
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    let resolveOld!: (value: readonly SessionMessageSearchMatch[]) => void;
+    vi.mocked(network.searchSessionMessages)
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveOld = resolve; }))
+      .mockResolvedValueOnce([create(SessionMessageSearchMatchSchema, { sessionId: "session", eventId: "event-new" })]);
+
+    const oldSearch = app.searchHome("old words", "active");
+    await vi.waitFor(() => expect(app.state.homeSearchStatus).toBe("searching"));
+    await app.searchHome("new words", "all");
+    expect(network.searchSessionMessages).toHaveBeenLastCalledWith(
+      credential, "new words", SessionMessageSearchSessionStatus.UNSPECIFIED, expect.any(AbortSignal)
+    );
+    expect(app.state).toMatchObject({
+      homeSearchQuery: "new words",
+      homeSearchFilter: "all",
+      homeSearchStatus: "ready",
+      homeSearchSessionIds: ["session"]
+    });
+    resolveOld([create(SessionMessageSearchMatchSchema, { sessionId: "session", eventId: "event-old" })]);
+    await oldSearch;
+    expect(app.state.homeSearchQuery).toBe("new words");
+
+    let resolveOwnerSearch!: (value: readonly SessionMessageSearchMatch[]) => void;
+    vi.mocked(network.searchSessionMessages).mockImplementationOnce(() => new Promise((resolve) => { resolveOwnerSearch = resolve; }));
+    const ownerSearch = app.searchHome("owner", "active");
+    await vi.waitFor(() => expect(app.state.homeSearchStatus).toBe("searching"));
+    await app.refresh();
+    resolveOwnerSearch([create(SessionMessageSearchMatchSchema, { sessionId: "session", eventId: "late" })]);
+    await ownerSearch;
+    expect(app.state.homeSearchSessionIds).toEqual([]);
+    expect(app.state.homeSearchStatus).toBe("idle");
+
+    let resolveClearedSearch!: (value: readonly SessionMessageSearchMatch[]) => void;
+    vi.mocked(network.searchSessionMessages).mockImplementationOnce(() => new Promise((resolve) => { resolveClearedSearch = resolve; }));
+    const clearedSearch = app.searchHome("clear me", "archived");
+    await vi.waitFor(() => expect(app.state.homeSearchStatus).toBe("searching"));
+    const clearedSignal = vi.mocked(network.searchSessionMessages).mock.calls.at(-1)?.[3];
+    await app.searchHome("", "archived");
+    expect(clearedSignal?.aborted).toBe(true);
+    expect(app.state).toMatchObject({
+      homeSearchQuery: "",
+      homeSearchFilter: "archived",
+      homeSearchStatus: "idle",
+      homeSearchSessionIds: []
+    });
+    resolveClearedSearch([create(SessionMessageSearchMatchSchema, { sessionId: "session", eventId: "cleared" })]);
+    await clearedSearch;
+    expect(app.state.homeSearchSessionIds).toEqual([]);
+  });
+
+  it("submits every task action with the exact current Session revision", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    const app = client(network, saved.storage);
+    await app.start();
+
+    await expect(app.renameSession("session", "Renamed")).resolves.toBe(true);
+    await expect(app.setSessionPinned("session", true)).resolves.toBe(true);
+    await expect(app.setSessionArchived("session", true)).resolves.toBe(true);
+    await expect(app.deleteSession("session")).resolves.toBe(true);
+
+    const mutations = vi.mocked(network.submit).mock.calls.map((call) => call[2]);
+    expect(mutations.map((mutation) => mutation.payload.case)).toEqual([
+      "renameSession", "pinSession", "archiveSession", "deleteSession"
+    ]);
+    for (const mutation of mutations) {
+      expect(mutation.preconditions).toHaveLength(1);
+      expect(mutation.preconditions[0]?.entity).toMatchObject({ kind: EntityKind.SESSION, id: "session" });
+      expect(mutation.preconditions[0]?.expectedRevision?.value).toBe(9n);
+    }
+    expect(saved.pending()).toEqual([]);
+  });
+
+  it("persists an unknown task action before dispatch and never resends it", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    const app = client(network, saved.storage);
+    await app.start();
+    vi.mocked(network.submit).mockRejectedValueOnce(new Error("reply lost"));
+
+    await expect(app.setSessionPinned("session", true)).resolves.toBe(false);
+    expect(saved.storage.savePending).toHaveBeenCalledBefore(network.submit as ReturnType<typeof vi.fn>);
+    expect(app.state.pending).toMatchObject([{ kind: "pin", sessionId: "session", state: "unknown" }]);
+    await expect(app.setSessionPinned("session", true)).rejects.toThrow(/still pending/);
+    expect(network.submit).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the authoritative task unchanged and exposes a conflict", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    const app = client(network, saved.storage);
+    await app.start();
+    vi.mocked(network.submit).mockResolvedValueOnce(create(OperationSchema, {
+      operationId: "operation-1",
+      connectionId: credential.connectionId,
+      state: OperationState.CONFLICT,
+      error: { code: "REVISION_CONFLICT", message: "The task changed on another client." }
+    }));
+
+    await expect(app.renameSession("session", "Rejected name")).resolves.toBe(false);
+
+    expect(app.state.owner?.sessions.find((item) => item.sessionId === "session")?.displayName).toBe("Task");
+    expect(app.state.error).toBe("The task changed on another client.");
+    expect(saved.pending()).toEqual([]);
+    expect(network.readOwner).toHaveBeenCalledTimes(2);
   });
 });

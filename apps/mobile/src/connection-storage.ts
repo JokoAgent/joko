@@ -17,7 +17,7 @@ export interface MobileConnectionIndex {
 export interface PendingOperation {
   readonly operationId: string;
   readonly connectionId: string;
-  readonly kind: "create" | "send" | "logout" | "revoke";
+  readonly kind: "create" | "send" | "logout" | "revoke" | "rename" | "pin" | "archive" | "delete";
   readonly sessionId?: string;
   readonly targetConnectionId?: string;
   readonly targetDeviceId?: string;
@@ -372,13 +372,14 @@ function isPending(value: unknown): value is PendingOperation {
   if (!value || typeof value !== "object") return false;
   const record = value as Record<string, unknown>;
   if (typeof record.operationId !== "string" || typeof record.connectionId !== "string"
-    || !["create", "send", "logout", "revoke"].includes(String(record.kind))
+    || !["create", "send", "logout", "revoke", "rename", "pin", "archive", "delete"].includes(String(record.kind))
     || (record.state !== "unknown" && record.state !== "accepted")) return false;
   if (record.sessionId !== undefined && typeof record.sessionId !== "string") return false;
   if (record.targetConnectionId !== undefined && typeof record.targetConnectionId !== "string") return false;
   if (record.targetDeviceId !== undefined && typeof record.targetDeviceId !== "string") return false;
   if (record.kind === "logout" && typeof record.targetConnectionId !== "string") return false;
   if (record.kind === "revoke" && typeof record.targetDeviceId !== "string") return false;
+  if (["rename", "pin", "archive", "delete"].includes(String(record.kind)) && typeof record.sessionId !== "string") return false;
   return true;
 }
 

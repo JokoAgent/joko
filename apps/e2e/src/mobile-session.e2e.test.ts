@@ -1,11 +1,15 @@
 import { create } from "@bufbuild/protobuf";
 import {
   ConnectionState, DeviceKind, EntityKind, EntityRefSchema, EventCursorSchema, OperationMutationSchema,
-  LogoutConnectionMutationSchema, OperationPreconditionSchema, OperationState, QueueItemState, RevokeDeviceMutationSchema, SessionState
+  LogoutConnectionMutationSchema, OperationPreconditionSchema, OperationState, QueueItemState, RevokeDeviceMutationSchema,
+  SessionMessageSearchSemanticMode, SessionMessageSearchSessionStatus, SessionState,
+  type OperationMutation
 } from "@joko/contracts";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
-import { createSessionMutation, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
+import {
+  archiveMutation, createSessionMutation, deleteMutation, pinMutation, renameMutation, sendInputMutation, sessionIdFrom, submit
+} from "./operations.js";
 
 describe("native mobile device through the durable product chain", () => {
   let fixture: OrchestratorE2eFixture | undefined;
@@ -92,6 +96,46 @@ describe("native mobile device through the durable product chain", () => {
     const badCursor = create(EventCursorSchema, { ...resume, generation: resume.generation + 1n });
     await expect(clients.event.streamEvents({ scope: { kind: { case: "owner", value: {} } }, afterCursor: badCursor })
       [Symbol.asyncIterator]().next()).rejects.toBeDefined();
+
+    const search = async (status: SessionMessageSearchSessionStatus) => clients.session.searchSessionMessages({
+      scope: { case: "owner", value: {} },
+      query: "from the phone",
+      filters: { sessionStatus: status },
+      semanticMode: SessionMessageSearchSemanticMode.KEYWORD,
+      page: { pageSize: 100, pageToken: "" }
+    });
+    expect((await search(SessionMessageSearchSessionStatus.ACTIVE)).matches.some((match) => match.sessionId === sessionId)).toBe(true);
+
+    const mutateSession = async (mutation: OperationMutation) => {
+      const before = (await clients.event.getSnapshot({ scope: { kind: { case: "owner", value: {} } } })).snapshot!;
+      const current = before.sessions.find((item) => item.sessionId === sessionId);
+      expect(current?.version?.revision?.value).toBeGreaterThan(0n);
+      const operation = await submit(clients.operation, connectionId, create(OperationMutationSchema, {
+        ...mutation,
+        preconditions: [create(OperationPreconditionSchema, {
+          entity: create(EntityRefSchema, { kind: EntityKind.SESSION, id: sessionId }),
+          expectedRevision: current!.version!.revision
+        })]
+      }));
+      expect(operation.state).toBe(OperationState.SUCCEEDED);
+      return (await clients.event.getSnapshot({ scope: { kind: { case: "owner", value: {} } } })).snapshot!;
+    };
+
+    let changed = await mutateSession(renameMutation(sessionId, "Renamed on mobile"));
+    expect(changed.sessions.find((item) => item.sessionId === sessionId)?.displayName).toBe("Renamed on mobile");
+    changed = await mutateSession(pinMutation(sessionId, true));
+    expect(changed.sessions.find((item) => item.sessionId === sessionId)?.pinned).toBe(true);
+    changed = await mutateSession(archiveMutation(sessionId, true));
+    expect(changed.sessions.find((item) => item.sessionId === sessionId)?.archived).toBe(true);
+    expect((await search(SessionMessageSearchSessionStatus.ACTIVE)).matches.some((match) => match.sessionId === sessionId)).toBe(false);
+    expect((await search(SessionMessageSearchSessionStatus.ARCHIVED)).matches.some((match) => match.sessionId === sessionId)).toBe(true);
+    changed = await mutateSession(archiveMutation(sessionId, false));
+    expect(changed.sessions.find((item) => item.sessionId === sessionId)?.archived).toBe(false);
+
+    const deleteNative = vi.spyOn(fixture.adapter(), "deleteSession");
+    changed = await mutateSession(deleteMutation(sessionId));
+    expect(changed.sessions.some((item) => item.sessionId === sessionId)).toBe(false);
+    expect(deleteNative).not.toHaveBeenCalled();
 
     const ownerClient = await fixture.pair("Device owner");
     const ownerBeforeRevoke = (await ownerClient.clients.event.getSnapshot({

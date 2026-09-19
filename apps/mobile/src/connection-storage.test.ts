@@ -185,4 +185,25 @@ describe("current-v1 mobile connection storage", () => {
     await expect(storage.saveAutomaticProfile("missing-profile")).rejects.toThrow(/not saved/);
     await expect(storage.loadConnectionIndex()).resolves.toEqual({ profiles: [] });
   });
+
+  it("round-trips task-action receipts only when they retain the exact task identity", async () => {
+    const memory = drivers();
+    const storage = createMobileStorage(memory.plain, memory.secure);
+    const receipts = (["rename", "pin", "archive", "delete"] as const).map((kind, index) => ({
+      operationId: `operation-${index}`,
+      connectionId: first.connectionId,
+      kind,
+      sessionId: "session-one",
+      state: index === 0 ? "accepted" as const : "unknown" as const
+    }));
+
+    await storage.savePending(receipts);
+    await expect(storage.loadPending()).resolves.toEqual(receipts);
+
+    memory.plainValues.set("joko.mobile.pending.v1", JSON.stringify([
+      ...receipts,
+      { operationId: "missing-task", connectionId: first.connectionId, kind: "delete", state: "unknown" }
+    ]));
+    await expect(storage.loadPending()).resolves.toEqual(receipts);
+  });
 });

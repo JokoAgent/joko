@@ -9,6 +9,7 @@ import {
   CompactSessionMutationSchema,
   CreateScheduleMutationSchema,
   CreateSessionMutationSchema,
+  DeleteSessionMutationSchema,
   EditQueueItemMutationSchema,
   EventService,
   EntityKind,
@@ -355,6 +356,15 @@ export function pinMutation(sessionId: string, pinned: boolean): OperationMutati
 export function archiveMutation(sessionId: string, archived: boolean): OperationMutation {
   return create(OperationMutationSchema, {
     payload: { case: "archiveSession", value: create(ArchiveSessionMutationSchema, { sessionId, archived }) }
+  });
+}
+
+export function deleteMutation(sessionId: string, deleteNativeSession = false, deleteArtifacts = false): OperationMutation {
+  return create(OperationMutationSchema, {
+    payload: {
+      case: "deleteSession",
+      value: create(DeleteSessionMutationSchema, { sessionId, deleteNativeSession, deleteArtifacts })
+    }
   });
 }
 

@@ -2,9 +2,10 @@ import { Code, ConnectError, createClient, type Interceptor, type Transport } fr
 import { createConnectTransport } from "@connectrpc/connect-web";
 import {
   ConnectionService, DeviceKind, EventService, OperationService, SessionService, TargetService,
-  JOKO_API_VERSION, isPrivateLanDiscoveryHost, validateDiscoveredNode,
+  JOKO_API_VERSION, SessionMessageSearchSemanticMode, SessionMessageSearchSessionStatus,
+  isPrivateLanDiscoveryHost, validateDiscoveredNode,
   type Connection, type Device, type DiscoveredNodeRecord, type Event, type EventCursor, type Operation,
-  type OperationMutation, type Snapshot, type Target
+  type OperationMutation, type SessionMessageSearchMatch, type Snapshot, type Target
 } from "@joko/contracts";
 
 export interface PairedCredential {
@@ -35,10 +36,49 @@ export interface MobileNetwork {
   readSession(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<Snapshot>;
   readHistory(credential: PairedCredential, sessionId: string, before?: EventCursor, signal?: AbortSignal): Promise<{ events: Event[]; before?: EventCursor }>;
   readAround(credential: PairedCredential, sessionId: string, eventId: string, signal?: AbortSignal): Promise<Event[]>;
+  searchSessionMessages(credential: PairedCredential, query: string, status: SessionMessageSearchSessionStatus, signal?: AbortSignal): Promise<readonly SessionMessageSearchMatch[]>;
   streamOwner(credential: PairedCredential, after: EventCursor, signal: AbortSignal): AsyncIterable<Event>;
   prepareTarget(credential: PairedCredential, target: Target, signal?: AbortSignal): Promise<void>;
   submit(credential: PairedCredential, operationId: string, mutation: OperationMutation, signal?: AbortSignal): Promise<Operation>;
   getOperation(credential: PairedCredential, operationId: string, signal?: AbortSignal): Promise<Operation | undefined>;
+}
+
+interface SessionMessageSearchPage {
+  readonly matches: readonly SessionMessageSearchMatch[];
+  readonly nextPageToken: string;
+  readonly totalSize: bigint;
+}
+
+const MESSAGE_SEARCH_PAGE_SIZE = 100;
+
+export async function collectSessionMessageSearchPages(
+  readPage: (pageToken: string) => Promise<SessionMessageSearchPage>
+): Promise<readonly SessionMessageSearchMatch[]> {
+  const matches: SessionMessageSearchMatch[] = [];
+  const pageTokens = new Set<string>();
+  let pageToken = "";
+  let totalSize: bigint | undefined;
+  let pageCount = 0n;
+  while (true) {
+    const page = await readPage(pageToken);
+    pageCount += 1n;
+    if (page.totalSize < 0n) throw new Error("The Joko node returned an invalid message-search result count.");
+    if (totalSize === undefined) totalSize = page.totalSize;
+    else if (page.totalSize !== totalSize) throw new Error("The Joko message-search result count changed while paging.");
+    matches.push(...page.matches);
+    if (!page.nextPageToken) {
+      if (BigInt(matches.length) !== totalSize) {
+        throw new Error("The Joko node returned an incomplete message-search result set.");
+      }
+      return matches;
+    }
+    const expectedPages = (totalSize + BigInt(MESSAGE_SEARCH_PAGE_SIZE) - 1n) / BigInt(MESSAGE_SEARCH_PAGE_SIZE);
+    if (pageCount >= expectedPages || pageTokens.has(page.nextPageToken)) {
+      throw new Error("The Joko node returned an invalid message-search page sequence.");
+    }
+    pageTokens.add(page.nextPageToken);
+    pageToken = page.nextPageToken;
+  }
 }
 
 export function normalizeNodeOrigin(value: string): string {
@@ -170,6 +210,24 @@ export const mobileNetwork: MobileNetwork = {
       sessionId, aroundEventId: eventId, limit: 120
     }, options(signal));
     return response.events;
+  },
+  async searchSessionMessages(credential, query, status, signal) {
+    const client = createClient(SessionService, transport(credential.origin, credential.authKey));
+    return collectSessionMessageSearchPages(async (pageToken) => {
+      const response = await client.searchSessionMessages({
+        scope: { case: "owner", value: {} },
+        query,
+        page: { pageSize: MESSAGE_SEARCH_PAGE_SIZE, pageToken },
+        semanticMode: SessionMessageSearchSemanticMode.UNSPECIFIED,
+        filters: { sessionStatus: status }
+      }, options(signal));
+      if (!response.page) throw new Error("The Joko node did not return message-search page metadata.");
+      return {
+        matches: response.matches,
+        nextPageToken: response.page.nextPageToken,
+        totalSize: response.page.totalSize
+      };
+    });
   },
   async *streamOwner(credential, after, signal) {
     const client = createClient(EventService, transport(credential.origin, credential.authKey));

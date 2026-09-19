@@ -1,14 +1,16 @@
-import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type RefObject } from "react";
 import {
-  ActivityIndicator, Alert, AppState, FlatList, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView,
-  StyleSheet, Text, TextInput, useColorScheme, View
+  AccessibilityInfo, ActivityIndicator, Alert, AppState, FlatList, KeyboardAvoidingView, Modal, Platform,
+  Pressable, ScrollView, SectionList, StyleSheet, Text, TextInput, findNodeHandle, useColorScheme,
+  useWindowDimensions, View
 } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { SvgXml } from "react-native-svg";
 import { StatusBar } from "expo-status-bar";
 import { randomUUID } from "expo-crypto";
 import {
-  CapabilitySupport, ConnectionState, DeviceKind, DevicePresenceState, QueueItemState, TargetState, capabilityNames
+  CapabilitySupport, ConnectionState, DeviceKind, DevicePresenceState, QueueItemState, TargetState, capabilityNames,
+  type Session
 } from "@joko/contracts";
 import { MobileConnectionStage } from "./MobileConnectionStage";
 import { MobileClient, type NearbyMobileNode, type SavedMobileConnection } from "./mobile-client";
@@ -23,6 +25,12 @@ import { mobileNetwork } from "./network";
 import { mobileDiscovery } from "./native-lan-discovery";
 import { mobileStorage } from "./storage";
 import { timelineRows } from "./timeline";
+import { MobileDrawer } from "./MobileDrawer";
+import { SwipeableSessionRow } from "./SwipeableSessionRow";
+import {
+  buildMobileHomeSections, buildWideSessionNavLayout, createSwipeRowRegistry,
+  type MobileHomeStatusFilter
+} from "./home-navigation";
 
 const client = new MobileClient(mobileNetwork, mobileStorage, mobileDiscovery, randomUUID, Platform.OS);
 type Page = "home" | "connection" | "new" | "task" | "connections" | "devices" | "device";
@@ -31,7 +39,11 @@ export function App() {
   const state = useSyncExternalStore((listener) => client.subscribe(listener), () => client.state);
   const [page, setPage] = useState<Page>("home");
   const [menuOpen, setMenuOpen] = useState(false);
+  const [homeDrawerMounted, setHomeDrawerMounted] = useState(false);
+  const [homeSearchFocusRequest, setHomeSearchFocusRequest] = useState(0);
   const [deviceId, setDeviceId] = useState<string>();
+  const homeMenuButtonRef = useRef<View>(null);
+  const pendingHomeMenuActionRef = useRef<(() => void) | undefined>(undefined);
   const scheme = useColorScheme();
   const dark = scheme === "dark";
   const colors = useMemo(() => ({
@@ -59,32 +71,48 @@ export function App() {
 
   const common = { colors, state };
   const connectionRequired = !state.activeProfileId;
+  const queueHomeMenuAction = (action: () => void): void => {
+    if (pendingHomeMenuActionRef.current) return;
+    pendingHomeMenuActionRef.current = action;
+    setMenuOpen(false);
+  };
   return (
     <SafeAreaProvider>
       <View style={[styles.root, { backgroundColor: colors.background }]}>
         <StatusBar style={dark ? "light" : "dark"} />
-        {state.status === "starting" ? <SafeAreaView style={styles.fill} edges={["top", "left", "right", "bottom"]}>
-          <StartupLoading colors={colors} dark={dark} />
-        </SafeAreaView> :
-          connectionRequired || page === "connection" ? <ConnectionScreen {...common} dark={dark}
-            onBack={connectionRequired ? undefined : () => { client.cancel(); setPage("home"); }}
-            onConnected={() => setPage("home")} /> :
-          <SafeAreaView style={styles.fill} edges={["top", "left", "right", "bottom"]}>
-            {page === "new" ? <NewTaskScreen {...common} onBack={() => setPage("home")} onCreated={() => setPage("task")} /> :
-              page === "task" ? <TaskScreen {...common} onBack={() => setPage("home")} /> :
-              page === "connections" ? <ConnectionsScreen {...common} onBack={() => setPage("home")}
-                onSwitch={() => setPage("connection")} /> :
-              page === "devices" ? <DevicesScreen {...common} onBack={() => setPage("home")}
-                onDevice={(id) => { setDeviceId(id); setPage("device"); }} /> :
-              page === "device" && deviceId ? <DeviceScreen {...common} deviceId={deviceId} onBack={() => setPage("devices")} /> :
-              <SessionsScreen {...common} onNew={() => setPage("new")} onSelect={() => setPage("task")}
-                onMenu={() => setMenuOpen(true)} />}
-          </SafeAreaView>}
+        <View style={styles.fill} accessibilityElementsHidden={homeDrawerMounted}
+          importantForAccessibility={homeDrawerMounted ? "no-hide-descendants" : "auto"}>
+          {state.status === "starting" ? <SafeAreaView style={styles.fill} edges={["top", "left", "right", "bottom"]}>
+            <StartupLoading colors={colors} dark={dark} />
+          </SafeAreaView> :
+            connectionRequired || page === "connection" ? <ConnectionScreen {...common} dark={dark}
+              onBack={connectionRequired ? undefined : () => { client.cancel(); setPage("home"); }}
+              onConnected={() => setPage("home")} /> :
+            <SafeAreaView style={styles.fill} edges={["top", "left", "right", "bottom"]}>
+              {page === "new" ? <NewTaskScreen {...common} onBack={() => setPage("home")} onCreated={() => setPage("task")} /> :
+                page === "task" ? <TaskScreen {...common} onBack={() => setPage("home")} onHome={() => setPage("home")} onNew={() => setPage("new")} /> :
+                page === "connections" ? <ConnectionsScreen {...common} onBack={() => setPage("home")}
+                  onSwitch={() => setPage("connection")} /> :
+                page === "devices" ? <DevicesScreen {...common} onBack={() => setPage("home")}
+                  onDevice={(id) => { setDeviceId(id); setPage("device"); }} /> :
+                page === "device" && deviceId ? <DeviceScreen {...common} deviceId={deviceId} onBack={() => setPage("devices")} /> :
+                <SessionsScreen {...common} onNew={() => setPage("new")} onSelect={() => setPage("task")}
+                  menuButtonRef={homeMenuButtonRef} searchFocusRequest={homeSearchFocusRequest}
+                  onMenu={() => { pendingHomeMenuActionRef.current = undefined; setMenuOpen(true); }} />}
+            </SafeAreaView>}
+        </View>
         <HomeMenu visible={!connectionRequired && menuOpen} colors={colors} state={state}
           onClose={() => setMenuOpen(false)}
-          onSwitch={() => { setMenuOpen(false); client.setConnectionMode("saved"); setPage("connection"); }}
-          onConnections={() => { setMenuOpen(false); setPage("connections"); }}
-          onDevices={() => { setMenuOpen(false); setPage("devices"); }} />
+          onMountedChange={setHomeDrawerMounted}
+          onClosed={() => {
+            const action = pendingHomeMenuActionRef.current;
+            pendingHomeMenuActionRef.current = undefined;
+            if (action) action(); else focusNative(homeMenuButtonRef);
+          }}
+          onSearch={() => queueHomeMenuAction(() => setHomeSearchFocusRequest((value) => value + 1))}
+          onSwitch={() => queueHomeMenuAction(() => { client.setConnectionMode("saved"); setPage("connection"); })}
+          onConnections={() => queueHomeMenuAction(() => setPage("connections"))}
+          onDevices={() => queueHomeMenuAction(() => setPage("devices"))} />
       </View>
     </SafeAreaProvider>
   );
@@ -237,16 +265,87 @@ function ConnectionScreen({ colors, state, dark, onBack, onConnected }: ScreenPr
   </MobileConnectionStage>;
 }
 
-function SessionsScreen({ colors, state, onNew, onSelect, onMenu }: ScreenProps & {
+function SessionsScreen({ colors, state, onNew, onSelect, onMenu, menuButtonRef, searchFocusRequest }: ScreenProps & {
   onNew: () => void; onSelect: () => void; onMenu: () => void;
+  menuButtonRef: RefObject<View | null>; searchFocusRequest: number;
 }) {
   const [search, setSearch] = useState("");
-  const sessions = state.owner?.sessions.filter((session) =>
-    !session.archived && (session.displayName.toLocaleLowerCase().includes(search.toLocaleLowerCase())
-      || state.owner?.targets.find((target) => target.targetId === session.targetId)?.displayName.toLocaleLowerCase().includes(search.toLocaleLowerCase()))) ?? [];
+  const [statusFilter, setStatusFilter] = useState<MobileHomeStatusFilter>("active");
+  const [localError, setLocalError] = useState("");
+  const [optionsSession, setOptionsSession] = useState<Session>();
+  const optionsSessionRef = useRef<Session | undefined>(undefined);
+  const optionsGenerationRef = useRef(0);
+  const [renameSession, setRenameSession] = useState<Session>();
+  const [renameDraft, setRenameDraft] = useState("");
+  const searchRef = useRef<TextInput>(null);
+  const swipeRegistry = useMemo(() => createSwipeRowRegistry(), []);
+  const normalizedSearch = search.trim();
+  const currentMessageIds = useMemo(() => (
+    state.homeSearchQuery === normalizedSearch && state.homeSearchFilter === statusFilter
+      ? new Set(state.homeSearchSessionIds) : new Set<string>()
+  ), [normalizedSearch, state.homeSearchFilter, state.homeSearchQuery, state.homeSearchSessionIds, statusFilter]);
+  const sections = useMemo(() => buildMobileHomeSections({
+    snapshot: state.owner,
+    statusFilter,
+    query: search,
+    messageSessionIds: currentMessageIds
+  }), [currentMessageIds, search, state.owner, statusFilter]);
+  const listSections = useMemo(() => sections.map((section) => ({ ...section, data: section.items })), [sections]);
+
+  useEffect(() => {
+    if (searchFocusRequest > 0) searchRef.current?.focus();
+  }, [searchFocusRequest]);
+  useEffect(() => {
+    if (!normalizedSearch) {
+      void client.searchHome("", statusFilter);
+      return;
+    }
+    const timer = setTimeout(() => { void client.searchHome(normalizedSearch, statusFilter); }, 180);
+    return () => clearTimeout(timer);
+  }, [normalizedSearch, state.activeProfileId, state.owner?.snapshotId, state.owner?.revision?.value, statusFilter]);
+
+  const runMutation = (action: () => Promise<boolean>): void => {
+    setLocalError("");
+    void action().catch((error) => setLocalError(errorText(error)));
+  };
+  const togglePin = (session: Session): void => runMutation(() => client.setSessionPinned(session.sessionId, !session.pinned));
+  const toggleArchive = (session: Session): void => runMutation(() => client.setSessionArchived(session.sessionId, !session.archived));
+  const openOptions = (session: Session): void => {
+    optionsGenerationRef.current += 1;
+    optionsSessionRef.current = session;
+    setOptionsSession(session);
+  };
+  const closeOptions = (): void => {
+    optionsGenerationRef.current += 1;
+    optionsSessionRef.current = undefined;
+    setOptionsSession(undefined);
+  };
+  const applyOption = (session: Session, action: SessionOption): void => {
+    if (action === "rename") {
+      setRenameDraft(session.displayName);
+      setRenameSession(session);
+    } else if (action === "pin") togglePin(session);
+    else if (action === "archive") toggleArchive(session);
+    else Alert.alert(
+      `Delete ${session.displayName || "this task"}?`,
+      "This removes the Joko task. Its native Backend session and artifacts are kept.",
+      [{ text: "Cancel", style: "cancel" }, { text: "Delete task", style: "destructive", onPress: () => runMutation(() => client.deleteSession(session.sessionId)) }]
+    );
+  };
+  const scheduleOption = (action: SessionOption): void => {
+    const session = optionsSessionRef.current;
+    if (!session) return;
+    const generation = ++optionsGenerationRef.current;
+    optionsSessionRef.current = undefined;
+    setOptionsSession(undefined);
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      if (optionsGenerationRef.current === generation && optionsSessionRef.current === undefined) applyOption(session, action);
+    }));
+  };
+
   return <View style={styles.fill}>
     <View style={styles.homeHeader}>
-      <Pressable accessibilityRole="button" accessibilityLabel="Open menu" onPress={onMenu}
+      <Pressable ref={menuButtonRef} accessibilityRole="button" accessibilityLabel="Open menu" onPress={onMenu}
         style={[styles.headerIconButton, { borderColor: colors.border, backgroundColor: colors.surface }]}>
         <Text style={[styles.headerIcon, { color: colors.ink }]}>☰</Text>
       </Pressable>
@@ -268,43 +367,113 @@ function SessionsScreen({ colors, state, onNew, onSelect, onMenu }: ScreenProps 
       {state.status === "offline" && <Action label="Retry" onPress={() => void client.refresh()} colors={colors} compact />}
     </View>}
     {state.status === "connected" && state.error && <Banner text={state.error} colors={colors} />}
-    <TextInput accessibilityLabel="Search tasks" placeholder="Search tasks" placeholderTextColor={colors.muted} value={search} onChangeText={setSearch}
-      style={[styles.input, styles.search, { color: colors.ink, backgroundColor: colors.surface, borderColor: colors.border }]} />
-    <FlatList data={sessions} keyExtractor={(item) => item.sessionId}
-      ListEmptyComponent={<Centered label={state.status !== "connected" ? "Reconnect to load tasks" : search ? "No matching tasks" : "No tasks yet"} colors={colors} />}
-      renderItem={({ item }) => <Pressable accessibilityRole="button" accessibilityLabel={`Open task ${item.displayName || "Untitled"}`}
-        onPress={() => { void client.select(item.sessionId).then(onSelect).catch(() => undefined); }}
-        style={[styles.row, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-        <View style={styles.fill}><Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{item.displayName || "Untitled task"}</Text>
-          <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>{state.owner?.targets.find((target) => target.targetId === item.targetId)?.displayName || "Dialogue"} · {sessionState(item.state)}</Text></View>
-        <Text style={[styles.chevron, { color: colors.muted }]}>›</Text>
-      </Pressable>}
+    <View style={styles.searchRow}>
+      <TextInput ref={searchRef} accessibilityLabel="Search tasks and messages" placeholder="Search tasks and messages"
+        placeholderTextColor={colors.muted} value={search} onChangeText={setSearch}
+        style={[styles.input, styles.searchInput, { color: colors.ink, backgroundColor: colors.surface, borderColor: colors.border }]} />
+      {state.homeSearchStatus === "searching" && normalizedSearch && <ActivityIndicator color={colors.accent} />}
+    </View>
+    <View accessibilityRole="tablist" style={styles.filterRow}>
+      {(["active", "archived", "all"] as const).map((filter) => <Pressable key={filter} accessibilityRole="tab"
+        accessibilityState={{ selected: filter === statusFilter }} onPress={() => setStatusFilter(filter)}
+        style={[styles.filterChip, { borderColor: filter === statusFilter ? colors.accent : colors.border,
+          backgroundColor: filter === statusFilter ? colors.brandBackground : colors.surface }]}>
+        <Text style={[styles.caption, { color: colors.ink }]}>{filter[0]!.toUpperCase() + filter.slice(1)}</Text>
+      </Pressable>)}
+    </View>
+    {state.homeSearchError && normalizedSearch && <Banner text={state.homeSearchError} colors={colors} />}
+    {localError && <Banner text={localError} colors={colors} />}
+    <PendingReceipts items={state.pending.filter((item) => ["rename", "pin", "archive", "delete"].includes(item.kind))}
+      colors={colors} onError={setLocalError} />
+    <SectionList sections={listSections} keyExtractor={(item) => item.session.sessionId}
+      renderSectionHeader={({ section }) => <Text style={[styles.listSectionTitle, { color: colors.muted }]}>{section.title}</Text>}
+      ListEmptyComponent={<Centered label={state.status !== "connected" ? "Reconnect to load tasks" : normalizedSearch ? "No matching tasks or messages" : statusFilter === "archived" ? "No archived tasks" : "No tasks yet"} colors={colors} />}
+      renderItem={({ item }) => <SwipeableSessionRow session={item.session} registry={swipeRegistry} colors={colors}
+        onTogglePin={togglePin} onArchive={toggleArchive} onShowOptions={openOptions}>
+        <View style={[styles.row, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+          <Pressable disabled={state.busy} accessibilityRole="button" accessibilityLabel={`Open task ${item.session.displayName || "Untitled"}`}
+            onPress={() => {
+              if (swipeRegistry.closeOpenRow()) return;
+              setLocalError("");
+              void client.select(item.session.sessionId).then(onSelect).catch((error) => setLocalError(errorText(error)));
+            }} style={styles.sessionRowBody}>
+            <View style={styles.fill}><View style={styles.statusTitle}>
+              <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{item.session.displayName || "Untitled task"}</Text>
+              {item.session.pinned && <Text style={[styles.badge, { color: colors.ink, backgroundColor: colors.brandBackground }]}>Pinned</Text>}
+            </View>
+              <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>{item.targetName} · {sessionState(item.session.state)}</Text></View>
+          </Pressable>
+          <Pressable accessibilityRole="button" accessibilityLabel={`Options for ${item.session.displayName || "task"}`}
+            onPress={() => { swipeRegistry.closeOpenRow(); openOptions(item.session); }} style={styles.rowOptions}>
+            <Text style={[styles.rowOptionsText, { color: colors.muted }]}>•••</Text>
+          </Pressable>
+        </View>
+      </SwipeableSessionRow>}
       refreshing={state.status === "connecting"} onRefresh={() => void client.refresh()}
+      onScrollBeginDrag={() => { swipeRegistry.closeOpenRow(); }}
       contentContainerStyle={styles.list} />
+    <Modal visible={optionsSession !== undefined} transparent animationType="none" onRequestClose={closeOptions} statusBarTranslucent>
+      <View style={styles.sheetRoot}>
+        <Pressable accessibilityRole="button" accessibilityLabel="Close task options" onPress={closeOptions} style={styles.modalBackdrop} />
+        <SafeAreaView accessibilityViewIsModal style={[styles.optionSheet, { backgroundColor: colors.surface, borderColor: colors.border }]} edges={["bottom", "left", "right"]}>
+          <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{optionsSession?.displayName || "Task options"}</Text>
+          <MenuRow label="Rename" onPress={() => scheduleOption("rename")} colors={colors} />
+          <MenuRow label={optionsSession?.pinned ? "Unpin" : "Pin"} onPress={() => scheduleOption("pin")} colors={colors} />
+          <MenuRow label={optionsSession?.archived ? "Restore" : "Archive"} onPress={() => scheduleOption("archive")} colors={colors} />
+          <MenuRow label="Delete task" onPress={() => scheduleOption("delete")} colors={colors} />
+          <Action label="Cancel" onPress={closeOptions} colors={colors} />
+        </SafeAreaView>
+      </View>
+    </Modal>
+    <Modal visible={renameSession !== undefined} transparent animationType="fade" onRequestClose={() => setRenameSession(undefined)} statusBarTranslucent>
+      <View style={styles.dialogRoot}>
+        <View accessibilityViewIsModal style={[styles.renameDialog, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+          <Text style={[styles.title, { color: colors.ink }]}>Rename task</Text>
+          <Field label="Task name" value={renameDraft} onChange={setRenameDraft} placeholder="Task name" colors={colors} />
+          <View style={styles.actionRow}>
+            <Action label="Cancel" onPress={() => setRenameSession(undefined)} colors={colors} />
+            <Action label="Rename" disabled={!renameDraft.trim() || state.busy} onPress={() => {
+              const target = renameSession;
+              if (!target) return;
+              setRenameSession(undefined);
+              runMutation(() => client.renameSession(target.sessionId, renameDraft));
+            }} colors={colors} />
+          </View>
+        </View>
+      </View>
+    </Modal>
   </View>;
 }
 
-function HomeMenu({ visible, colors, state, onClose, onSwitch, onConnections, onDevices }: ScreenProps & {
-  visible: boolean; onClose: () => void; onSwitch: () => void; onConnections: () => void; onDevices: () => void;
+type SessionOption = "rename" | "pin" | "archive" | "delete";
+
+function HomeMenu({ visible, colors, state, onClose, onClosed, onMountedChange, onSearch, onSwitch, onConnections, onDevices }: ScreenProps & {
+  visible: boolean; onClose: () => void; onClosed: () => void; onMountedChange: (mounted: boolean) => void;
+  onSearch: () => void; onSwitch: () => void; onConnections: () => void; onDevices: () => void;
 }) {
-  return <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose} statusBarTranslucent>
-    <View style={styles.modalRoot}>
-      <Pressable accessibilityRole="button" accessibilityLabel="Close menu" style={styles.modalBackdrop} onPress={onClose} />
-      <SafeAreaView style={[styles.homeDrawer, { backgroundColor: colors.surface, borderColor: colors.border }]} edges={["top", "bottom", "left"]}>
+  const { width } = useWindowDimensions();
+  const closeRef = useRef<View>(null);
+  return <MobileDrawer visible={visible} width={Math.min(380, width * 0.84)} backgroundColor={colors.surface}
+    borderColor={colors.border} onClose={onClose} onClosed={onClosed} onMountedChange={onMountedChange}
+    initialFocusRef={closeRef} testID="home.drawer">
+      <SafeAreaView style={styles.homeDrawer} edges={["top", "bottom", "left"]}>
         <View style={styles.drawerHeading}>
-          <Text style={[styles.title, { color: colors.ink }]}>Joko</Text>
-          <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={2}>
-            {state.node?.displayName || "Joko node"}{state.origin ? `\n${state.origin}` : ""}
-          </Text>
+          <View style={styles.drawerTitleRow}><View style={styles.fill}><Text style={[styles.title, { color: colors.ink }]}>Joko</Text>
+            <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={2}>
+              {state.node?.displayName || "Joko node"}{state.origin ? `\n${state.origin}` : ""}
+            </Text></View>
+            <Pressable ref={closeRef} accessibilityRole="button" accessibilityLabel="Close menu" onPress={onClose} style={styles.drawerClose}>
+              <Text style={[styles.headerIcon, { color: colors.ink }]}>×</Text>
+            </Pressable>
+          </View>
         </View>
+        <MenuRow label="Search" description="Find tasks and message text" onPress={onSearch} colors={colors} />
         <MenuRow label="Switch or add Joko node" description="Nearby, saved, and manual connections" onPress={onSwitch} colors={colors} />
         <MenuRow label="Devices" description="Devices authorized by this Joko node" onPress={onDevices} colors={colors} />
         <MenuRow label="Connection settings" description="Automatic entry and exact server connections" onPress={onConnections} colors={colors} />
         <View style={styles.drawerSpacer} />
-        <MenuRow label="Close" onPress={onClose} colors={colors} />
       </SafeAreaView>
-    </View>
-  </Modal>;
+  </MobileDrawer>;
 }
 
 function MenuRow({ label, description, onPress, colors }: {
@@ -506,17 +675,45 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
   </ScrollView>;
 }
 
-function TaskScreen({ colors, state, onBack }: ScreenProps & { onBack: () => void }) {
+function TaskScreen({ colors, state, onBack, onHome, onNew }: ScreenProps & {
+  onBack: () => void; onHome: () => void; onNew: () => void;
+}) {
   const [draft, setDraft] = useState("");
   const [localError, setLocalError] = useState("");
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [drawerMounted, setDrawerMounted] = useState(false);
+  const { width } = useWindowDimensions();
+  const wideNavigation = buildWideSessionNavLayout({ platform: Platform.OS, iosPad: Platform.OS === "ios" && Platform.isPad, windowWidth: width });
+  const drawerWidthRef = useRef(wideNavigation.drawerWidth || 300);
+  if (wideNavigation.enabled) drawerWidthRef.current = wideNavigation.drawerWidth;
+  const drawerMenuRef = useRef<View>(null);
+  const drawerCloseRef = useRef<View>(null);
+  const pendingDrawerActionRef = useRef<(() => void) | undefined>(undefined);
   const session = state.detail?.sessions.find((item) => item.sessionId === state.selectedId)
     || state.owner?.sessions.find((item) => item.sessionId === state.selectedId);
   const rows = timelineRows(state.window ?? [...state.older, ...(state.detail?.timeline ?? []), ...state.live]);
   const unknown = state.pending.some((item) => item.kind === "send" && item.sessionId === state.selectedId && item.state === "unknown");
-  return <KeyboardAvoidingView style={styles.fill} behavior={Platform.OS === "ios" ? "padding" : undefined}>
-    <View style={styles.header}><View style={styles.fill}><Back onPress={onBack} colors={colors} />
-      <Text style={[styles.title, { color: colors.ink }]} numberOfLines={1}>{session?.displayName || "Task"}</Text>
-      <Text style={[styles.caption, { color: colors.muted }]}>{session ? sessionState(session.state) : "Loading…"}</Text></View>
+  useEffect(() => {
+    if (!wideNavigation.enabled && drawerOpen) setDrawerOpen(false);
+  }, [drawerOpen, wideNavigation.enabled]);
+  const queueDrawerAction = (action: () => void): void => {
+    if (pendingDrawerActionRef.current) return;
+    pendingDrawerActionRef.current = action;
+    setDrawerOpen(false);
+  };
+  return <View style={styles.fill}>
+    <KeyboardAvoidingView style={styles.fill} behavior={Platform.OS === "ios" ? "padding" : undefined}
+      accessibilityElementsHidden={drawerMounted} importantForAccessibility={drawerMounted ? "no-hide-descendants" : "auto"}>
+    <View style={styles.header}>
+      {wideNavigation.enabled ? <Pressable ref={drawerMenuRef} accessibilityRole="button" accessibilityLabel="Open task list"
+        onPress={() => { pendingDrawerActionRef.current = undefined; setDrawerOpen(true); }}
+        style={[styles.headerIconButton, { borderColor: colors.border, backgroundColor: colors.surface }]}>
+        <Text style={[styles.headerIcon, { color: colors.ink }]}>☰</Text>
+      </Pressable> : <Back onPress={onBack} colors={colors} />}
+      <View style={styles.fill}>
+        <Text style={[styles.title, { color: colors.ink }]} numberOfLines={1}>{session?.displayName || "Task"}</Text>
+        <Text style={[styles.caption, { color: colors.muted }]}>{session ? sessionState(session.state) : "Loading…"}</Text>
+      </View>
       <Action label="Refresh" onPress={() => void client.refresh()} colors={colors} compact />
     </View>
     <Text accessibilityLiveRegion="polite" style={[styles.caption, styles.queue, { color: colors.muted }]}>
@@ -560,7 +757,93 @@ function TaskScreen({ colors, state, onBack }: ScreenProps & { onBack: () => voi
       <Action label={state.busy ? "Sending…" : "Send"} colors={colors} compact disabled={!draft.trim() || unknown || state.busy || state.status !== "connected"}
         onPress={() => { setLocalError(""); void client.send(draft).then((accepted) => { if (accepted) setDraft(""); }).catch((error) => setLocalError(errorText(error))); }} />
     </View>
-  </KeyboardAvoidingView>;
+    </KeyboardAvoidingView>
+    <MobileDrawer visible={drawerOpen} width={drawerWidthRef.current} backgroundColor={colors.surface} borderColor={colors.border}
+      onClose={() => setDrawerOpen(false)} onMountedChange={setDrawerMounted} initialFocusRef={drawerCloseRef}
+      onClosed={() => {
+        const action = pendingDrawerActionRef.current;
+        pendingDrawerActionRef.current = undefined;
+        if (action) action(); else focusNative(drawerMenuRef);
+      }} testID="task.drawer">
+      <TaskListDrawer colors={colors} state={state} closeButtonRef={drawerCloseRef} onClose={() => setDrawerOpen(false)}
+        onSelect={(sessionId) => {
+          if (sessionId === state.selectedId) { setDrawerOpen(false); return; }
+          queueDrawerAction(() => {
+            setLocalError("");
+            void client.select(sessionId).catch((error) => setLocalError(errorText(error)));
+          });
+        }}
+        onNew={() => queueDrawerAction(onNew)} onHome={() => queueDrawerAction(onHome)} />
+    </MobileDrawer>
+  </View>;
+}
+
+function TaskListDrawer({ colors, state, closeButtonRef, onClose, onSelect, onNew, onHome }: ScreenProps & {
+  closeButtonRef: RefObject<View | null>; onClose: () => void; onSelect: (sessionId: string) => void;
+  onNew: () => void; onHome: () => void;
+}) {
+  const [search, setSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState<MobileHomeStatusFilter>("active");
+  const normalizedSearch = search.trim();
+  const currentMessageIds = useMemo(() => (
+    state.homeSearchQuery === normalizedSearch && state.homeSearchFilter === statusFilter
+      ? new Set(state.homeSearchSessionIds) : new Set<string>()
+  ), [normalizedSearch, state.homeSearchFilter, state.homeSearchQuery, state.homeSearchSessionIds, statusFilter]);
+  const sections = useMemo(() => buildMobileHomeSections({
+    snapshot: state.owner,
+    statusFilter,
+    query: search,
+    messageSessionIds: currentMessageIds
+  }).map((section) => ({ ...section, data: section.items })), [currentMessageIds, search, state.owner, statusFilter]);
+  useEffect(() => {
+    if (!normalizedSearch) {
+      void client.searchHome("", statusFilter);
+      return;
+    }
+    const timer = setTimeout(() => { void client.searchHome(normalizedSearch, statusFilter); }, 180);
+    return () => clearTimeout(timer);
+  }, [normalizedSearch, state.activeProfileId, state.owner?.snapshotId, state.owner?.revision?.value, statusFilter]);
+  return <SafeAreaView style={styles.taskDrawer} edges={["top", "bottom", "left"]}>
+    <View style={styles.drawerTitleRow}>
+      <View style={styles.fill}><Text style={[styles.title, { color: colors.ink }]}>Tasks</Text>
+        <Text style={[styles.caption, { color: colors.muted }]}>Switch without leaving this task screen</Text></View>
+      <Pressable ref={closeButtonRef} accessibilityRole="button" accessibilityLabel="Close task list" onPress={onClose} style={styles.drawerClose}>
+        <Text style={[styles.headerIcon, { color: colors.ink }]}>×</Text>
+      </Pressable>
+    </View>
+    <Action label="New task" onPress={onNew} colors={colors} disabled={state.status !== "connected"} />
+    <View style={styles.searchRow}>
+      <TextInput accessibilityLabel="Search tasks and messages" placeholder="Search tasks and messages" placeholderTextColor={colors.muted}
+        value={search} onChangeText={setSearch} style={[styles.input, styles.searchInput,
+          { color: colors.ink, backgroundColor: colors.background, borderColor: colors.border }]} />
+      {state.homeSearchStatus === "searching" && normalizedSearch && <ActivityIndicator color={colors.accent} />}
+    </View>
+    <View accessibilityRole="tablist" style={styles.filterRow}>
+      {(["active", "archived", "all"] as const).map((filter) => <Pressable key={filter} accessibilityRole="tab"
+        accessibilityState={{ selected: filter === statusFilter }} onPress={() => setStatusFilter(filter)}
+        style={[styles.filterChip, { borderColor: filter === statusFilter ? colors.accent : colors.border,
+          backgroundColor: filter === statusFilter ? colors.brandBackground : colors.background }]}>
+        <Text style={[styles.caption, { color: colors.ink }]}>{filter[0]!.toUpperCase() + filter.slice(1)}</Text>
+      </Pressable>)}
+    </View>
+    {state.homeSearchError && normalizedSearch && <Banner text={state.homeSearchError} colors={colors} />}
+    <SectionList sections={sections} keyExtractor={(item) => item.session.sessionId} style={styles.fill}
+      renderSectionHeader={({ section }) => <Text style={[styles.listSectionTitle, { color: colors.muted }]}>{section.title}</Text>}
+      ListEmptyComponent={<Text style={[styles.description, styles.drawerEmpty, { color: colors.muted }]}>No matching tasks</Text>}
+      renderItem={({ item }) => <Pressable accessibilityRole="button"
+        accessibilityState={{ selected: item.session.sessionId === state.selectedId }}
+        accessibilityLabel={`Open task ${item.session.displayName || "Untitled"}`} onPress={() => onSelect(item.session.sessionId)}
+        style={[styles.drawerTaskRow, { borderColor: item.session.sessionId === state.selectedId ? colors.accent : colors.border,
+          backgroundColor: colors.background }]}>
+        <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{item.session.displayName || "Untitled task"}</Text>
+        <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>{item.targetName} · {sessionState(item.session.state)}</Text>
+      </Pressable>}
+      contentContainerStyle={styles.drawerList} />
+    <Pressable accessibilityRole="button" accessibilityLabel="Go to Home" onPress={onHome}
+      style={[styles.drawerHome, { borderColor: colors.border }]}>
+      <Text style={[styles.label, { color: colors.accent }]}>Home</Text>
+    </Pressable>
+  </SafeAreaView>;
 }
 
 function ModeTab({ label, selected, onPress, colors }: {
@@ -635,6 +918,10 @@ function StartupLoading({ colors, dark }: { colors: Colors; dark: boolean }) {
     <Text style={[styles.description, { color: colors.muted }]}>Loading Joko…</Text>
   </View>;
 }
+function focusNative(ref: RefObject<View | null>): void {
+  const node = ref.current ? findNodeHandle(ref.current) : null;
+  if (node !== null) setTimeout(() => AccessibilityInfo.setAccessibilityFocus(node), 0);
+}
 function errorText(error: unknown): string { return error instanceof Error ? error.message : "The Joko node is unavailable."; }
 function savedStatus(profile: SavedMobileConnection): string {
   switch (profile.credentialState) {
@@ -703,7 +990,12 @@ const styles = StyleSheet.create({
   choice: { minHeight: 48, flexDirection: "row", alignItems: "flex-start", gap: 12 },
   choiceBox: { width: 24, height: 24, borderWidth: 1, borderRadius: 7, alignItems: "center", justifyContent: "center", marginTop: 1 },
   choiceCheck: { color: "#2b2316", fontSize: 16, fontWeight: "800", lineHeight: 18 }, disabled: { opacity: 0.55 },
-  search: { marginHorizontal: 16, marginVertical: 10 }, warning: { paddingHorizontal: 16, paddingVertical: 8, fontSize: 14, lineHeight: 20 },
+  search: { marginHorizontal: 16, marginVertical: 10 },
+  searchRow: { minHeight: 50, marginHorizontal: 16, marginTop: 6, flexDirection: "row", alignItems: "center", gap: 10 },
+  searchInput: { flex: 1 },
+  filterRow: { minHeight: 44, paddingHorizontal: 16, paddingVertical: 4, flexDirection: "row", alignItems: "center", gap: 8 },
+  filterChip: { minHeight: 36, minWidth: 72, borderWidth: 1, borderRadius: 18, paddingHorizontal: 14, alignItems: "center", justifyContent: "center" },
+  warning: { paddingHorizontal: 16, paddingVertical: 8, fontSize: 14, lineHeight: 20 },
   card: { borderWidth: 1, borderRadius: 14, padding: 16, gap: 6 },
   notice: { borderWidth: 1, borderRadius: 14, padding: 14, flexDirection: "row", alignItems: "center", gap: 12 },
   modeTabs: { borderWidth: 1, borderRadius: 14, padding: 4, flexDirection: "row", gap: 4 },
@@ -726,15 +1018,20 @@ const styles = StyleSheet.create({
   connectionNotice: { marginHorizontal: 16, marginBottom: 8, borderWidth: 1, borderRadius: 14, padding: 12, flexDirection: "row", alignItems: "center", gap: 10 },
   statusDot: { width: 9, height: 9, borderRadius: 5 },
   stackHeader: { paddingHorizontal: 16, paddingTop: 8, gap: 6 },
-  modalRoot: { flex: 1, flexDirection: "row" },
   modalBackdrop: { position: "absolute", inset: 0, backgroundColor: "rgba(0,0,0,0.38)" },
-  homeDrawer: { width: "84%", maxWidth: 380, borderRightWidth: 1, paddingHorizontal: 16, paddingBottom: 12, gap: 4 },
+  homeDrawer: { flex: 1, paddingHorizontal: 16, paddingBottom: 12, gap: 4 },
   drawerHeading: { paddingHorizontal: 8, paddingTop: 18, paddingBottom: 20, gap: 5 },
+  drawerTitleRow: { flexDirection: "row", alignItems: "flex-start", gap: 12, paddingHorizontal: 8, paddingTop: 12 },
+  drawerClose: { width: 44, height: 44, borderRadius: 22, alignItems: "center", justifyContent: "center" },
   drawerSpacer: { flex: 1 },
   menuRow: { minHeight: 58, borderBottomWidth: 1, paddingHorizontal: 8, paddingVertical: 10, flexDirection: "row", alignItems: "center", gap: 10 },
   back: { minHeight: 44, justifyContent: "center" },
   backText: { fontSize: 16, fontWeight: "600" }, list: { padding: 16, gap: 8, flexGrow: 1 },
-  row: { borderWidth: 1, borderRadius: 14, minHeight: 68, padding: 14, flexDirection: "row", alignItems: "center", gap: 12, marginBottom: 8 },
+  row: { borderWidth: 1, borderRadius: 14, minHeight: 68, paddingLeft: 14, flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 8 },
+  sessionRowBody: { flex: 1, minHeight: 66, flexDirection: "row", alignItems: "center", paddingVertical: 12 },
+  rowOptions: { width: 52, minHeight: 66, alignItems: "center", justifyContent: "center" },
+  rowOptionsText: { fontSize: 16, letterSpacing: -1 },
+  listSectionTitle: { paddingHorizontal: 4, paddingTop: 10, paddingBottom: 8, fontSize: 13, fontWeight: "700", textTransform: "uppercase" },
   chevron: { fontSize: 28 }, center: { flex: 1, alignItems: "center", justifyContent: "center", gap: 10, padding: 24 },
   startupLoading: { flex: 1, alignItems: "center", justifyContent: "center", gap: 16, padding: 24 },
   loadingArtwork: { width: "82%", maxWidth: 420, height: 360 },
@@ -748,5 +1045,14 @@ const styles = StyleSheet.create({
   queue: { paddingHorizontal: 18, paddingVertical: 6 }, pending: { paddingHorizontal: 12, flexWrap: "wrap", flexDirection: "row", alignItems: "center" },
   pendingReceipt: { gap: 4, paddingVertical: 4 },
   composer: { flexDirection: "row", borderTopWidth: 1, paddingHorizontal: 12, paddingVertical: 8, alignItems: "flex-end", gap: 10 },
-  composerInput: { flex: 1, minHeight: 44, maxHeight: 144, fontSize: 16, paddingVertical: 8 }
+  composerInput: { flex: 1, minHeight: 44, maxHeight: 144, fontSize: 16, paddingVertical: 8 },
+  sheetRoot: { flex: 1, justifyContent: "flex-end" },
+  optionSheet: { borderTopWidth: 1, borderTopLeftRadius: 22, borderTopRightRadius: 22, padding: 18, gap: 4 },
+  dialogRoot: { flex: 1, justifyContent: "center", padding: 24, backgroundColor: "rgba(0,0,0,0.38)" },
+  renameDialog: { borderWidth: 1, borderRadius: 18, padding: 20, gap: 16 },
+  taskDrawer: { flex: 1, paddingHorizontal: 14, paddingBottom: 12, gap: 10 },
+  drawerList: { paddingHorizontal: 2, paddingBottom: 12, flexGrow: 1 },
+  drawerTaskRow: { minHeight: 62, borderWidth: 1, borderRadius: 12, paddingHorizontal: 12, paddingVertical: 10, gap: 2, marginBottom: 7 },
+  drawerEmpty: { padding: 20, textAlign: "center" },
+  drawerHome: { minHeight: 50, borderTopWidth: 1, alignItems: "center", justifyContent: "center" }
 });
