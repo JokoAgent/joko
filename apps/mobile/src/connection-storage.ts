@@ -20,7 +20,7 @@ export interface PendingOperation {
   readonly kind: "create" | "send" | "logout" | "revoke" | "rename" | "pin" | "archive" | "delete"
     | "message-delete" | "queue-cancel" | "queue-edit-lock" | "queue-edit"
     | "queue-interaction-lock" | "queue-reorder" | "interaction-resolve" | "interaction-dismiss"
-    | "session-model" | "session-permission" | "session-plan";
+    | "session-model" | "session-permission" | "session-plan" | "session-compact";
   readonly sessionId?: string;
   readonly eventId?: string;
   readonly queueItemId?: string;
@@ -383,7 +383,7 @@ function isPending(value: unknown): value is PendingOperation {
   if (typeof record.operationId !== "string" || typeof record.connectionId !== "string"
     || !["create", "send", "logout", "revoke", "rename", "pin", "archive", "delete", "message-delete",
       "queue-cancel", "queue-edit-lock", "queue-edit", "queue-interaction-lock", "queue-reorder",
-      "interaction-resolve", "interaction-dismiss", "session-model", "session-permission", "session-plan"].includes(String(record.kind))
+      "interaction-resolve", "interaction-dismiss", "session-model", "session-permission", "session-plan", "session-compact"].includes(String(record.kind))
     || (record.state !== "unknown" && record.state !== "accepted")) return false;
   if (record.sessionId !== undefined && typeof record.sessionId !== "string") return false;
   if (record.eventId !== undefined && typeof record.eventId !== "string") return false;
@@ -404,7 +404,7 @@ function isPending(value: unknown): value is PendingOperation {
   if (["interaction-resolve", "interaction-dismiss"].includes(String(record.kind))
     && (typeof record.sessionId !== "string" || typeof record.interactionId !== "string"
       || typeof record.interactionGeneration !== "string" || typeof record.interactionRevision !== "string")) return false;
-  if (["session-model", "session-permission", "session-plan"].includes(String(record.kind))
+  if (["session-model", "session-permission", "session-plan", "session-compact"].includes(String(record.kind))
     && typeof record.sessionId !== "string") return false;
   if (!["interaction-resolve", "interaction-dismiss"].includes(String(record.kind))
     && (record.interactionId !== undefined || record.interactionGeneration !== undefined

@@ -358,11 +358,11 @@ export function cloneMutation(sessionId: string, displayName = "Cloned task"): O
   });
 }
 
-export function compactMutation(sessionId: string): OperationMutation {
+export function compactMutation(sessionId: string, customInstructions = "Preserve decisions."): OperationMutation {
   return create(OperationMutationSchema, {
     payload: {
       case: "compactSession",
-      value: create(CompactSessionMutationSchema, { sessionId, customInstructions: "Preserve decisions." })
+      value: create(CompactSessionMutationSchema, { sessionId, customInstructions })
     }
   });
 }

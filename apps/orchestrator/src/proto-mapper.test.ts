@@ -186,7 +186,7 @@ describe("proto mapper", () => {
     });
   });
 
-  it("projects typed model and permission control options without requiring unrelated string options", () => {
+  it("projects typed model, permission, and context control options without requiring unrelated string options", () => {
     const stored: StoredBackend = {
       descriptor: {
         id: "backend-runtime-controls",
@@ -207,7 +207,9 @@ describe("proto mapper", () => {
             supported: true,
             options: ["ask", "auto", "bypassPermissions"]
           }],
-          [capabilityNames.permissionChange, { key: capabilityNames.permissionChange, supported: true }]
+          [capabilityNames.permissionChange, { key: capabilityNames.permissionChange, supported: true }],
+          [capabilityNames.contextUsage, { key: capabilityNames.contextUsage, supported: true }],
+          [capabilityNames.contextCompact, { key: capabilityNames.contextCompact, supported: true }]
         ]),
         models: [],
         tools: [],
@@ -244,6 +246,14 @@ describe("proto mapper", () => {
     expect(capabilities.get(capabilityNames.permissionChange)?.options?.kind).toMatchObject({
       case: "permission",
       value: { modes: [], mutableDuringSession: true }
+    });
+    expect(capabilities.get(capabilityNames.contextUsage)?.options?.kind).toMatchObject({
+      case: "context",
+      value: { reportsBoundary: true, manual: false, automatic: false }
+    });
+    expect(capabilities.get(capabilityNames.contextCompact)?.options?.kind).toMatchObject({
+      case: "context",
+      value: { reportsBoundary: false, manual: true, customInstructions: false }
     });
   });
 

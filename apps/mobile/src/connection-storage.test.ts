@@ -279,7 +279,9 @@ describe("current-v1 mobile connection storage", () => {
       { operationId: "permission", connectionId: first.connectionId, kind: "session-permission" as const,
         sessionId: "session-one", state: "accepted" as const },
       { operationId: "plan", connectionId: first.connectionId, kind: "session-plan" as const,
-        sessionId: "session-one", state: "unknown" as const }
+        sessionId: "session-one", state: "unknown" as const },
+      { operationId: "compact", connectionId: first.connectionId, kind: "session-compact" as const,
+        sessionId: "session-one", state: "accepted" as const }
     ];
 
     await storage.savePending(receipts);
@@ -288,6 +290,7 @@ describe("current-v1 mobile connection storage", () => {
     expect(persisted).not.toContain("providerId");
     expect(persisted).not.toContain("permissionMode");
     expect(persisted).not.toContain("fastMode");
+    expect(persisted).not.toContain("customInstructions");
 
     memory.plainValues.set("joko.mobile.pending.v1", JSON.stringify([
       ...receipts,

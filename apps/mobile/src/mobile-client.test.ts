@@ -1,16 +1,18 @@
 import { create, toBinary } from "@bufbuild/protobuf";
 import {
   ArtifactKind, ArtifactSchema, BackendDescriptorSchema, BackendModelAccessSettingsSchema, BackendSettingsSchema,
-  CapabilityManifestSchema, CapabilitySchema, CapabilitySupport, ConnectionSchema, ConnectionState, DeviceKind, DevicePresenceState, DeviceSchema, EntityKind, EntityVersionSchema,
+  CapabilityManifestSchema, CapabilitySchema, CapabilitySupport, CompactSessionOutcome, ConnectionSchema, ConnectionState,
+  ContextUsageSchema, DeviceKind, DevicePresenceState, DeviceSchema, EntityKind, EntityVersionSchema,
   FileKind, FilePreviewSchema, FileRevisionSchema, TargetSchema, WorkspaceEntrySchema, WorkspaceFileChangeKind, WorkspaceFileChangeSchema,
   JOKO_API_VERSION, NativeSessionBindingSchema, OperationSchema,
   InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk, PlanReviewDecisionKind,
   EventCursorSchema, EventSchema, MessageRole, ModelDescriptorSchema, ModelKeySchema, ModelOutputModality, ModelSelectionSchema,
   OperationMutationSchema, OperationState, OwnerSnapshotScopeSchema, PermissionMode,
   ProviderDescriptorSchema, ProviderKind, RevisionSchema, SessionMessageSearchMatchSchema, SessionSnapshotScopeSchema,
-  SettingsSnapshotSchema, SnapshotScopeSchema,
+  SettingsSnapshotSchema, SnapshotScopeSchema, UsageSchema,
   QueueControlSchema, QueueDeliveryMode, QueueDispatchState, QueueItemSchema, QueueItemState, QueueSourceKind,
-  SessionMessageSearchSessionStatus, SessionSchema, SessionState, SnapshotSchema, TargetState, WorkspaceKind, capabilityNames
+  SessionContextStateSchema, SessionMessageSearchSessionStatus, SessionSchema, SessionState, SnapshotSchema,
+  TargetState, WorkspaceKind, capabilityNames
 } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MobileClient, type MobileStorage, type PendingOperation } from "./mobile-client";
@@ -202,6 +204,21 @@ const runtimeSession = create(SessionSchema, {
   }),
   permissionMode: PermissionMode.ASK,
   planMode: false,
+  context: create(ContextUsageSchema, {
+    usedTokens: 50_000n,
+    contextWindowTokens: 100_000n,
+    reservedTokens: 50_000n,
+    utilizationRatio: 0.5,
+    cumulativeUsage: create(UsageSchema, {
+      inputTokens: 40_000n,
+      outputTokens: 5_000n,
+      cacheReadTokens: 4_000n,
+      cacheWriteTokens: 1_000n,
+      totalTokens: 50_000n
+    }),
+    measuredAt: { seconds: 123n }
+  }),
+  contextState: create(SessionContextStateSchema, { compacting: false, autoCompaction: true }),
   version: create(EntityVersionSchema, { revision: create(RevisionSchema, { value: 9n, etag: "session-r9" }), generation: 8n })
 });
 const runtimeBackend = create(BackendDescriptorSchema, {
@@ -227,7 +244,11 @@ const runtimeBackend = create(BackendDescriptorSchema, {
         } } } }),
       create(CapabilitySchema, { name: capabilityNames.permissionChange, support: CapabilitySupport.SUPPORTED,
         options: { kind: { case: "permission", value: { mutableDuringSession: true } } } }),
-      create(CapabilitySchema, { name: capabilityNames.planMode, support: CapabilitySupport.SUPPORTED })
+      create(CapabilitySchema, { name: capabilityNames.planMode, support: CapabilitySupport.SUPPORTED }),
+      create(CapabilitySchema, { name: capabilityNames.contextUsage, support: CapabilitySupport.SUPPORTED,
+        options: { kind: { case: "context", value: { reportsBoundary: true } } } }),
+      create(CapabilitySchema, { name: capabilityNames.contextCompact, support: CapabilitySupport.SUPPORTED,
+        options: { kind: { case: "context", value: { manual: true } } } })
     ]
   })
 });
@@ -1997,6 +2018,182 @@ describe("native current-task runtime controls", () => {
     await app.refresh();
     await expect(app.setTaskPermission(staleKey, PermissionMode.AUTO)).rejects.toThrow(/controls changed/u);
     expect(network.submit).not.toHaveBeenCalled();
+  });
+});
+
+describe("native current-task context usage and compaction", () => {
+  const ids = () => {
+    let value = 0;
+    return () => `context-compact-${++value}`;
+  };
+
+  it("projects measured usage and compacts with an exact Session precondition and typed outcome", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    let current = runtimeSession;
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: runtimeControlProjection(current, false) }));
+    network.readSession = vi.fn(async () => runtimeControlProjection(current, true));
+    vi.mocked(network.submit).mockImplementation(async (_credential, operationId) => {
+      current = create(SessionSchema, {
+        ...current,
+        context: undefined,
+        version: create(EntityVersionSchema, {
+          revision: create(RevisionSchema, { value: 10n, etag: "session-r10" }), generation: 8n
+        })
+      });
+      return create(OperationSchema, {
+        operationId,
+        connectionId: credential.connectionId,
+        state: OperationState.SUCCEEDED,
+        result: { payload: { case: "compactSession", value: { outcome: CompactSessionOutcome.COMPACTED } } }
+      });
+    });
+    const app = client(network, saved.storage, undefined, undefined, ids());
+    await app.start();
+
+    const controls = app.taskContextControls();
+    expect(controls).toMatchObject({
+      usageSupported: true,
+      compactSupported: true,
+      canCompact: true,
+      usage: {
+        usedTokens: 50_000n,
+        contextWindowTokens: 100_000n,
+        reservedTokens: 50_000n,
+        percent: 50,
+        measuredAtMs: 123_000,
+        cumulative: {
+          inputTokens: 40_000n,
+          outputTokens: 5_000n,
+          cacheReadTokens: 4_000n,
+          cacheWriteTokens: 1_000n,
+          totalTokens: 50_000n
+        }
+      }
+    });
+    await expect(app.compactTaskContext(controls!.authorityKey)).resolves.toBe("compacted");
+
+    expect(saved.storage.savePending).toHaveBeenCalledBefore(network.submit as ReturnType<typeof vi.fn>);
+    expect(vi.mocked(network.submit).mock.calls[0]?.[2]).toMatchObject({
+      preconditions: [{
+        entity: { kind: EntityKind.SESSION, id: "session" },
+        expectedRevision: { value: 9n, etag: "session-r9" },
+        expectedGeneration: 8n
+      }],
+      payload: { case: "compactSession", value: { sessionId: "session", customInstructions: "" } }
+    });
+    expect(saved.pending()).toEqual([]);
+    expect(app.taskContextControls()).toMatchObject({
+      usageSupported: true,
+      compactSupported: true,
+      canCompact: false,
+      compactUnavailableReason: "Current context usage is unavailable."
+    });
+  });
+
+  it("retains an unknown compaction receipt and never replays the mutation", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: runtimeControlProjection(runtimeSession, false) }));
+    network.readSession = vi.fn(async () => runtimeControlProjection(runtimeSession, true));
+    vi.mocked(network.submit).mockResolvedValueOnce(create(OperationSchema, {
+      operationId: "context-compact-1",
+      connectionId: credential.connectionId,
+      state: OperationState.RUNNING
+    }));
+    vi.mocked(network.waitOperation).mockRejectedValueOnce(new Error("operation watch disconnected"));
+    const app = client(network, saved.storage, undefined, undefined, ids());
+    await app.start();
+    const authorityKey = app.taskContextControls()!.authorityKey;
+
+    await expect(app.compactTaskContext(authorityKey)).resolves.toBeUndefined();
+    expect(saved.pending()).toMatchObject([{
+      kind: "session-compact", sessionId: "session", state: "accepted"
+    }]);
+    await expect(app.compactTaskContext(authorityKey)).rejects.toThrow(/still pending/u);
+    expect(network.submit).toHaveBeenCalledTimes(1);
+    expect(network.waitOperation).toHaveBeenCalledTimes(1);
+  });
+
+  it("reconciles a saved compaction receipt after restart without dispatching it again", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    await saved.storage.savePending([{
+      operationId: "context-before-restart",
+      connectionId: credential.connectionId,
+      kind: "session-compact",
+      sessionId: "session",
+      state: "accepted"
+    }]);
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: runtimeControlProjection(runtimeSession, false) }));
+    network.readSession = vi.fn(async () => runtimeControlProjection(runtimeSession, true));
+    vi.mocked(network.getOperation).mockResolvedValue(create(OperationSchema, {
+      operationId: "context-before-restart",
+      connectionId: credential.connectionId,
+      state: OperationState.SUCCEEDED,
+      result: { payload: { case: "compactSession", value: { outcome: CompactSessionOutcome.NOOP } } }
+    }));
+    const app = client(network, saved.storage, undefined, undefined, ids());
+
+    await app.start();
+
+    expect(saved.pending()).toEqual([]);
+    expect(network.getOperation).toHaveBeenCalledWith(credential, "context-before-restart", expect.any(AbortSignal));
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("rejects retired context authority and fails closed on a missing typed outcome", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    let detailRevision = 31n;
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: runtimeControlProjection(runtimeSession, false) }));
+    network.readSession = vi.fn(async () => create(SnapshotSchema, {
+      ...runtimeControlProjection(runtimeSession, true),
+      revision: create(RevisionSchema, { value: detailRevision, etag: `detail-r${detailRevision}` })
+    }));
+    vi.mocked(network.submit).mockImplementation(async (_credential, operationId) => create(OperationSchema, {
+      operationId,
+      connectionId: credential.connectionId,
+      state: OperationState.SUCCEEDED
+    }));
+    const app = client(network, saved.storage, undefined, undefined, ids());
+    await app.start();
+    const staleKey = app.taskContextControls()!.authorityKey;
+
+    detailRevision = 32n;
+    await app.refresh();
+    await expect(app.compactTaskContext(staleKey)).rejects.toThrow(/context changed/u);
+    expect(network.submit).not.toHaveBeenCalled();
+
+    await expect(app.compactTaskContext(app.taskContextControls()!.authorityKey))
+      .rejects.toThrow(/without a typed outcome/u);
+    expect(network.submit).toHaveBeenCalledTimes(1);
+    expect(saved.pending()).toEqual([]);
+  });
+
+  it("keeps the measured projection when the node rejects compaction", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: runtimeControlProjection(runtimeSession, false) }));
+    network.readSession = vi.fn(async () => runtimeControlProjection(runtimeSession, true));
+    vi.mocked(network.submit).mockImplementation(async (_credential, operationId) => create(OperationSchema, {
+      operationId,
+      connectionId: credential.connectionId,
+      state: OperationState.FAILED,
+      error: { code: "CONFLICT", message: "Context changed before compaction." }
+    }));
+    const app = client(network, saved.storage, undefined, undefined, ids());
+    await app.start();
+
+    await expect(app.compactTaskContext(app.taskContextControls()!.authorityKey))
+      .rejects.toThrow("Context changed before compaction.");
+
+    expect(saved.pending()).toEqual([]);
+    expect(app.taskContextControls()).toMatchObject({
+      canCompact: true,
+      usage: { usedTokens: 50_000n, contextWindowTokens: 100_000n, percent: 50 }
+    });
+    expect(app.state.error).toBe("Context changed before compaction.");
   });
 });
 

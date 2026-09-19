@@ -4298,6 +4298,18 @@ function toProtoCapabilityOptions(capability: Capability): CapabilityOptions | u
         supportsPlanMode: capability.options?.includes("plan_mode") === true
       }
     };
+  } else if (capability.key === "context.usage" || capability.key === "context.compact") {
+    kind = {
+      case: "context",
+      value: {
+        $typeName: "joko.v1.ContextCapabilityOptions",
+        automatic: capability.options?.includes("automatic") === true,
+        manual: capability.key === "context.compact",
+        customInstructions: capability.options?.includes("custom_instructions") === true,
+        reportsBoundary: capability.key === "context.usage",
+        reportsCost: false
+      }
+    };
   } else if (capability.options === undefined || capability.options.length === 0) {
     return undefined;
   } else if (capability.key.startsWith("input.")) {

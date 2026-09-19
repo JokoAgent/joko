@@ -1,7 +1,8 @@
 import { create } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
 import {
-  ArchiveSessionMutationSchema, CancelQueueItemMutationSchema, CapabilitySupport, ConnectionState, CreateSessionMutationSchema,
+  ArchiveSessionMutationSchema, CancelQueueItemMutationSchema, CapabilitySupport, CompactSessionMutationSchema, CompactSessionOutcome,
+  ConnectionState, CreateSessionMutationSchema,
   DeleteSessionMessageMutationSchema, DeleteSessionMutationSchema, DeviceKind, DismissInteractionMutationSchema,
   EditQueueItemMutationSchema, EntityKind, EntityRefSchema,
   LAN_DISCOVERY_PEER_TTL_MS,
@@ -69,6 +70,12 @@ import {
   type MobileModelControlSelection,
   type MobileRuntimeControls
 } from "./mobile-runtime-controls";
+import {
+  assertMobileContextCompact,
+  resolveMobileContextControls,
+  type MobileCompactOutcome,
+  type MobileContextControls
+} from "./mobile-context-controls";
 
 export type { MobileStorage, PendingOperation } from "./connection-storage";
 
@@ -143,8 +150,8 @@ interface MobileQueueInteractionLease {
 }
 
 type TrackedMutationResult =
-  | { readonly accepted: true; readonly definitive: boolean }
-  | { readonly accepted: false; readonly definitive: boolean };
+  | { readonly accepted: true; readonly definitive: boolean; readonly operation?: Operation }
+  | { readonly accepted: false; readonly definitive: boolean; readonly operation?: Operation };
 
 const isTerminal = (state: OperationState): boolean => [
   OperationState.SUCCEEDED, OperationState.FAILED, OperationState.CANCELLED, OperationState.CONFLICT
@@ -1775,6 +1782,44 @@ export class MobileClient {
     } finally { this.#releaseMutation(action); }
   }
 
+  taskContextControls(): MobileContextControls | undefined {
+    const credential = this.#credential;
+    if (!credential || !this.#taskAuthorityKey()) return undefined;
+    return resolveMobileContextControls({
+      profileId: credential.profileId,
+      connectionId: credential.connectionId,
+      deviceId: credential.deviceId,
+      serverId: credential.serverId
+    }, this.#state.owner, this.#state.detail, this.#state.selectedId);
+  }
+
+  async compactTaskContext(authorityKey: string): Promise<MobileCompactOutcome | undefined> {
+    const controls = this.#contextControlContext(authorityKey);
+    const session = assertMobileContextCompact(controls);
+    this.#assertNoPendingRuntimeControl(session.sessionId);
+    const action = this.#claimMutation();
+    try {
+      const result = await this.#submitTerminal(create(OperationMutationSchema, {
+        preconditions: [this.#sessionRuntimePrecondition(session)],
+        payload: { case: "compactSession", value: create(CompactSessionMutationSchema, {
+          sessionId: session.sessionId,
+          customInstructions: ""
+        }) }
+      }), { kind: "session-compact", sessionId: session.sessionId });
+      if (!result.definitive) return undefined;
+      if (!result.accepted) {
+        throw new Error(result.operation?.error?.message || "Context compaction was rejected by the Joko node.");
+      }
+      const payload = result.operation?.result?.payload;
+      if (result.operation?.state !== OperationState.SUCCEEDED || payload?.case !== "compactSession") {
+        throw new Error("The Joko node completed context compaction without a typed outcome.");
+      }
+      if (payload.value.outcome === CompactSessionOutcome.COMPACTED) return "compacted";
+      if (payload.value.outcome === CompactSessionOutcome.NOOP) return "noop";
+      throw new Error("The Joko node returned an unknown context compaction outcome.");
+    } finally { this.#releaseMutation(action); }
+  }
+
   taskInteractions(): readonly Interaction[] {
     return pendingMobileInteractions(this.#state.detail, this.#state.selectedId);
   }
@@ -2095,6 +2140,15 @@ export class MobileClient {
     return controls;
   }
 
+  #contextControlContext(expectedAuthorityKey: string): MobileContextControls {
+    this.#ready();
+    const controls = this.taskContextControls();
+    if (!controls || !expectedAuthorityKey || controls.authorityKey !== expectedAuthorityKey) {
+      throw new Error("The task context changed. Reopen it from the current task.");
+    }
+    return controls;
+  }
+
   #sessionRuntimePrecondition(session: Session) {
     const revision = session.version?.revision;
     const generation = session.nativeBinding?.runtimeGeneration;
@@ -2111,7 +2165,7 @@ export class MobileClient {
 
   #assertNoPendingRuntimeControl(sessionId: string): void {
     if (this.#state.pending.some((item) => item.sessionId === sessionId
-      && ["session-model", "session-permission", "session-plan"].includes(item.kind))) {
+      && ["session-model", "session-permission", "session-plan", "session-compact"].includes(item.kind))) {
       throw new Error("A previous task control change is still pending. Check its operation before changing another setting.");
     }
   }
@@ -2835,7 +2889,7 @@ export class MobileClient {
         this.#set({ error: rejectionMessage });
       }
     }
-    return { accepted: !rejected, definitive: isTerminal(operation.state) };
+    return { accepted: !rejected, definitive: isTerminal(operation.state), operation };
   }
 
   async #receipt(operation: Operation, pending: PendingOperation, epoch: number): Promise<void> {
@@ -2902,7 +2956,7 @@ export class MobileClient {
           if (operation.state === OperationState.SUCCEEDED
             && ["rename", "pin", "archive", "delete", "message-delete", "queue-cancel", "queue-edit-lock",
               "queue-edit", "queue-interaction-lock", "queue-reorder", "interaction-resolve", "interaction-dismiss",
-              "session-model", "session-permission", "session-plan"].includes(pending.kind)
+              "session-model", "session-permission", "session-plan", "session-compact"].includes(pending.kind)
             && this.#current(epoch)) {
             await this.refresh();
             if (pending.kind === "message-delete" && this.#foreground

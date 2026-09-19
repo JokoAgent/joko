@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 
 import { create } from "@bufbuild/protobuf";
 import {
-  CapabilitySupport, ConnectionState, DeviceKind, DismissInteractionMutationSchema, EntityKind, EntityRefSchema,
+  CapabilitySupport, CompactSessionOutcome, CompactionState, ConnectionState, DeviceKind,
+  DismissInteractionMutationSchema, EntityKind, EntityRefSchema,
   EventCursorSchema, InteractionResolutionSchema, InteractionState, OperationMutationSchema,
   LogoutConnectionMutationSchema, OperationPreconditionSchema, OperationState, PlanReviewDecisionKind,
   PermissionMode,
@@ -17,7 +18,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { InstrumentedFakeAdapter, OrchestratorE2eFixture, waitFor } from "./fixture.js";
 import {
   archiveMutation, cancelQueuedInputMutation, createSessionMutation, deleteMutation, deleteSessionMessageMutation,
-  editQueuedInputMutation, pauseQueueMutation, pinMutation, queueItemFrom, queueRunIdFrom, renameMutation,
+  compactMutation, editQueuedInputMutation, pauseQueueMutation, pinMutation, queueItemFrom, queueRunIdFrom, renameMutation,
   modelMutation, permissionMutation, planModeMutation, reorderQueuedInputBeforeMutation, resumeQueueMutation, sendInputMutation, sessionIdFrom,
   setQueueInteractionLockMutation, setQueueItemEditLockMutation, submit
 } from "./operations.js";
@@ -649,5 +650,102 @@ describe("native mobile device through the durable product chain", () => {
     expect(setFastMode).toHaveBeenCalledWith(true, expect.anything());
     expect(setPermissionMode).toHaveBeenCalledWith("auto", expect.anything());
     expect(setPlanMode).toHaveBeenCalledWith(true, expect.anything());
+  });
+
+  it("projects mobile context usage and compacts through HTTP, SQLite, and the Session Host", async () => {
+    const contextProfile = {
+      ...PI_LIKE_PROFILE,
+      id: "mobile-context-controls",
+      displayName: "Mobile context controls",
+      capabilities: [
+        ...PI_LIKE_PROFILE.capabilities.filter((capability) => !new Set<string>([
+          capabilityNames.contextUsage,
+          capabilityNames.contextCompact
+        ]).has(capability.key)),
+        { key: capabilityNames.contextUsage, supported: true as const },
+        { key: capabilityNames.contextCompact, supported: true as const }
+      ]
+    };
+    fixture = await OrchestratorE2eFixture.start({ profiles: [contextProfile] });
+    const paired = await fixture.pair("Joko context phone");
+    const adapter = fixture.adapter();
+    const sessionId = sessionIdFrom(await submit(
+      paired.clients.operation,
+      paired.connectionId,
+      createSessionMutation({ backendId: adapter.id, targetId: fixture.targetId(), displayName: "Mobile context" })
+    ));
+    const scope = { kind: { case: "session" as const, value: { sessionId, recentTimelineItems: 120 } } };
+    const initial = await waitFor(
+      async () => (await paired.clients.event.getSnapshot({ scope })).snapshot,
+      (snapshot) => {
+        const current = snapshot?.sessions.find((session) => session.sessionId === sessionId);
+        return current?.state === SessionState.IDLE && current.context?.usedTokens === 20n;
+      },
+      "measured mobile context usage"
+    );
+    if (!initial) throw new Error("The mobile context task has no Session Snapshot.");
+    const current = initial.sessions.find((session) => session.sessionId === sessionId);
+    const revision = current?.version?.revision;
+    const generation = current?.nativeBinding?.runtimeGeneration;
+    if (!revision || !generation) throw new Error("The mobile context task has no exact Session authority.");
+    expect(current?.version?.generation).toBe(generation);
+    expect(current?.context).toMatchObject({
+      usedTokens: 20n,
+      contextWindowTokens: 32_000n,
+      reservedTokens: 31_980n,
+      cumulativeUsage: {
+        inputTokens: 12n,
+        outputTokens: 8n,
+        cacheReadTokens: 0n,
+        cacheWriteTokens: 0n,
+        totalTokens: 20n
+      }
+    });
+    expect(current!.context!.utilizationRatio).toBeCloseTo(20 / 32_000, 8);
+    expect(current?.context?.measuredAt).toBeDefined();
+
+    const capabilities = initial.backends.find((backend) => backend.backendId === adapter.id)
+      ?.capabilities?.capabilities ?? [];
+    const capabilityByName = new Map(capabilities.map((capability) => [capability.name, capability]));
+    expect(capabilityByName.get(capabilityNames.contextUsage)).toMatchObject({
+      support: CapabilitySupport.SUPPORTED,
+      options: { kind: { case: "context", value: { reportsBoundary: true, manual: false } } }
+    });
+    expect(capabilityByName.get(capabilityNames.contextCompact)).toMatchObject({
+      support: CapabilitySupport.SUPPORTED,
+      options: { kind: { case: "context", value: { reportsBoundary: false, manual: true, customInstructions: false } } }
+    });
+
+    const operation = await submit(paired.clients.operation, paired.connectionId, create(OperationMutationSchema, {
+      ...compactMutation(sessionId, ""),
+      preconditions: [create(OperationPreconditionSchema, {
+        entity: create(EntityRefSchema, { kind: EntityKind.SESSION, id: sessionId }),
+        expectedRevision: revision,
+        expectedGeneration: generation
+      })]
+    }));
+    expect(operation.state).toBe(OperationState.SUCCEEDED);
+    expect(operation.result?.payload.case).toBe("compactSession");
+    if (operation.result?.payload.case !== "compactSession") {
+      throw new Error("The mobile context operation has no typed result.");
+    }
+    expect(operation.result.payload.value.outcome).toBe(CompactSessionOutcome.COMPACTED);
+    expect(fixture.application.store.getOperation(operation.operationId).status).toBe("completed");
+    expect(adapter.compactCalls).toBe(1);
+
+    const after = (await paired.clients.event.getSnapshot({ scope })).snapshot;
+    const compactEvents = after?.timeline.filter((event) => event.payload?.kind.case === "compactionChanged") ?? [];
+    expect(compactEvents.map((event) => event.payload?.kind.case === "compactionChanged"
+      ? event.payload.kind.value.state : CompactionState.UNSPECIFIED)).toEqual([
+      CompactionState.STARTED,
+      CompactionState.COMPLETED
+    ]);
+    expect(compactEvents.every((event) => event.identity?.sessionId === sessionId
+      && event.identity.generation === generation)).toBe(true);
+    const storedCompactions = fixture.application.store.listEvents({ sessionId })
+      .filter((event) => event.payload.type === "compaction");
+    expect(storedCompactions.map((event) => event.payload.type === "compaction" ? event.payload.state : undefined))
+      .toEqual(["started", "completed"]);
+    expect(after?.sessions.find((session) => session.sessionId === sessionId)?.contextState?.compacting).toBe(false);
   });
 });
