@@ -102,9 +102,17 @@ export function acceptedQueueItems(
 
 export function queueItemText(input: InputContent | undefined): string | undefined {
   if (!input) return undefined;
+  if (input.parts.some((part) => part.content.case === "image" || part.content.case === "file")) return undefined;
   const text = input.parts.filter((part) => part.content.case === "text");
   if (text.length !== 1) return undefined;
   return text[0]!.content.case === "text" ? text[0]!.content.value : undefined;
+}
+
+export function queueItemHasStructuredInput(input: InputContent | undefined): boolean {
+  return input !== undefined && (input.quotesEncoded
+    || input.pastedTextRanges.length > 0
+    || input.mentionRanges.length > 0
+    || input.parts.some((part) => part.content.case !== "text"));
 }
 
 export function editQueueItemText(
@@ -113,14 +121,10 @@ export function editQueueItemText(
 ): { readonly input: InputContent; readonly textSplices: readonly QueueTextEditSplice[] } | undefined {
   const originalText = queueItemText(input);
   if (input === undefined || originalText === undefined || !replacementText.trim()) return undefined;
-  let replaced = false;
-  const parts = input.parts.map((part) => {
-    if (replaced || part.content.case !== "text") return part;
-    replaced = true;
-    return create(InputPartSchema, { ...part, content: { case: "text", value: replacementText } });
-  });
+  if (replacementText === originalText) return undefined;
+  const parts = [create(InputPartSchema, { content: { case: "text", value: replacementText } })];
   return {
-    input: create(InputContentSchema, { ...input, parts }),
+    input: create(InputContentSchema, { parts }),
     textSplices: [create(QueueTextEditSpliceSchema, {
       start: 0,
       end: originalText.length,

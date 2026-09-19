@@ -1,30 +1,40 @@
+import {
+  appendPlainTextToMobileComposer,
+  plainTextMobileComposerDraft,
+  reconcileMobileComposerText,
+  type MobileComposerDraft
+} from "./mobile-composer-document";
+
 export interface MobileComposerTextChange {
-  readonly visibleText: string;
-  readonly normalDraftToPersist: string | null;
+  readonly visibleDraft: MobileComposerDraft;
+  readonly normalDraftToPersist: MobileComposerDraft | null;
 }
 
-export function changeMobileComposerText(queueEditing: boolean, nextText: string): MobileComposerTextChange {
+export function changeMobileComposerText(
+  queueEditing: boolean,
+  current: MobileComposerDraft,
+  nextText: string
+): MobileComposerTextChange {
+  const visibleDraft = queueEditing
+    ? plainTextMobileComposerDraft(nextText)
+    : reconcileMobileComposerText(current, nextText).draft;
   return {
-    visibleText: nextText,
-    normalDraftToPersist: queueEditing ? null : nextText
+    visibleDraft,
+    normalDraftToPersist: queueEditing ? null : visibleDraft
   };
 }
 
-export function appendMobileComposerDraft(current: string, addition: string): string {
-  return current.length > 0 ? `${current}\n\n${addition}` : addition;
-}
-
 export function addToMobileComposer(input: {
-  readonly visibleText: string;
-  readonly queueStashedDraft?: string;
+  readonly visibleDraft: MobileComposerDraft;
+  readonly queueStashedDraft?: MobileComposerDraft;
   readonly addition: string;
 }): {
-  readonly visibleText: string;
-  readonly normalDraft: string;
-  readonly queueStashedDraft?: string;
+  readonly visibleDraft: MobileComposerDraft;
+  readonly normalDraft: MobileComposerDraft;
+  readonly queueStashedDraft?: MobileComposerDraft;
 } {
-  const normalDraft = appendMobileComposerDraft(input.queueStashedDraft ?? input.visibleText, input.addition);
+  const normalDraft = appendPlainTextToMobileComposer(input.queueStashedDraft ?? input.visibleDraft, input.addition);
   return input.queueStashedDraft === undefined
-    ? { visibleText: normalDraft, normalDraft }
-    : { visibleText: input.visibleText, normalDraft, queueStashedDraft: normalDraft };
+    ? { visibleDraft: normalDraft, normalDraft }
+    : { visibleDraft: input.visibleDraft, normalDraft, queueStashedDraft: normalDraft };
 }

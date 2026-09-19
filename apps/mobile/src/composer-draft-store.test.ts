@@ -5,6 +5,7 @@ import {
   type MobileComposerDraftIdentity
 } from "./composer-draft-store";
 import type { MobilePlainStorageDriver } from "./connection-storage";
+import { insertMobileSessionMention, plainTextMobileComposerDraft } from "./mobile-composer-document";
 
 const first = { profileId: "profile-one", sessionId: "session-one" } satisfies MobileComposerDraftIdentity;
 const second = { profileId: "profile-one", sessionId: "session-two" } satisfies MobileComposerDraftIdentity;
@@ -24,19 +25,19 @@ describe("mobile composer draft store", () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
 
-  it("debounces the latest text independently for each exact profile and task", async () => {
+  it("debounces the latest structured draft independently for each exact profile and task", async () => {
     const memory = memoryDriver();
     const store = new MobileComposerDraftStore(memory.driver);
-    store.save(first, "one");
-    store.save(first, "one latest");
-    store.save(second, "two");
+    store.save(first, plainTextMobileComposerDraft("one"));
+    store.save(first, plainTextMobileComposerDraft("one latest"));
+    store.save(second, plainTextMobileComposerDraft("two"));
 
     await vi.advanceTimersByTimeAsync(mobileComposerDraftTesting.persistDebounceMilliseconds);
     await store.flush();
 
-    expect(memory.values.get(mobileComposerDraftTesting.storageKey(first))).toBe("one latest");
-    expect(memory.values.get(mobileComposerDraftTesting.storageKey(second))).toBe("two");
-    expect(memory.writes.filter((write) => write.value === "one")).toHaveLength(0);
+    expect(memory.values.get(mobileComposerDraftTesting.storageKey(first))).toContain('"text":"one latest"');
+    expect(memory.values.get(mobileComposerDraftTesting.storageKey(second))).toContain('"text":"two"');
+    expect(memory.writes.filter((write) => write.value?.includes('"text":"one"'))).toHaveLength(0);
   });
 
   it("lets a newer in-memory edit win over a late storage read", async () => {
@@ -48,11 +49,15 @@ describe("mobile composer draft store", () => {
     };
     const store = new MobileComposerDraftStore(driver);
     const reading = store.read(first);
-    store.save(first, "typed while loading");
-    resolveRead("older stored text");
+    store.save(first, plainTextMobileComposerDraft("typed while loading"));
+    resolveRead(JSON.stringify({
+      version: 2,
+      identity: first,
+      draft: plainTextMobileComposerDraft("older stored text")
+    }));
 
-    await expect(reading).resolves.toBe("typed while loading");
-    expect(store.readSync(first)).toBe("typed while loading");
+    await expect(reading).resolves.toEqual(plainTextMobileComposerDraft("typed while loading"));
+    expect(store.readSync(first)).toEqual(plainTextMobileComposerDraft("typed while loading"));
   });
 
   it("does not revive a cleared draft when an older read completes", async () => {
@@ -65,25 +70,70 @@ describe("mobile composer draft store", () => {
     const store = new MobileComposerDraftStore(driver);
     const reading = store.read(first);
     const clearing = store.clear(first);
-    resolveRead("stale text");
+    resolveRead(JSON.stringify({ version: 2, identity: first, draft: plainTextMobileComposerDraft("stale text") }));
 
     await clearing;
     await expect(reading).resolves.toBeNull();
     expect(store.readSync(first)).toBeNull();
   });
 
-  it("flushes pending text immediately and empty text removes only the exact draft", async () => {
+  it("flushes pending content immediately and an empty document removes only the exact draft", async () => {
     const memory = memoryDriver();
     const store = new MobileComposerDraftStore(memory.driver);
-    store.save(first, "one");
-    store.save(second, "two");
+    store.save(first, plainTextMobileComposerDraft("one"));
+    store.save(second, plainTextMobileComposerDraft("two"));
     await store.flush();
-    store.save(first, "");
+    store.save(first, plainTextMobileComposerDraft(""));
     await store.flush(first);
 
     expect(memory.values.has(mobileComposerDraftTesting.storageKey(first))).toBe(false);
-    expect(memory.values.get(mobileComposerDraftTesting.storageKey(second))).toBe("two");
-    expect(store.readSync(second)).toBe("two");
+    expect(memory.values.get(mobileComposerDraftTesting.storageKey(second))).toContain('"text":"two"');
+    expect(store.readSync(second)).toEqual(plainTextMobileComposerDraft("two"));
+  });
+
+  it("round-trips structured occurrences and clears only the exact submitted version", async () => {
+    const memory = memoryDriver();
+    const store = new MobileComposerDraftStore(memory.driver);
+    const submitted = insertMobileSessionMention(
+      plainTextMobileComposerDraft("Use "),
+      { start: 4, end: 4 },
+      { sessionId: "source", displayText: "Task" },
+      "mention-one"
+    ).draft;
+    store.save(first, submitted);
+    await store.flush(first);
+    await expect(new MobileComposerDraftStore(memory.driver).read(first)).resolves.toEqual(submitted);
+
+    const newer = { ...submitted, text: `${submitted.text} later` };
+    store.save(first, newer);
+    await expect(store.clearIfEqual(first, submitted)).resolves.toBe(false);
+    expect(store.readSync(first)).toEqual(newer);
+    await expect(store.clearIfEqual(first, newer)).resolves.toBe(true);
+    expect(store.readSync(first)).toBeNull();
+  });
+
+  it("rejects the previous plain-text shape, damaged mention ranges, and cross-owner records", async () => {
+    const memory = memoryDriver();
+    const key = mobileComposerDraftTesting.storageKey(first);
+    memory.values.set(key, "legacy plain text");
+    await expect(new MobileComposerDraftStore(memory.driver).read(first)).rejects.toThrow(/could not be read/);
+
+    memory.values.set(key, JSON.stringify({
+      version: 2,
+      identity: first,
+      draft: {
+        text: "@Task",
+        mentions: [{ kind: "session", mentionId: "mention", sessionId: "source", displayText: "Task", start: 1, end: 5 }]
+      }
+    }));
+    await expect(new MobileComposerDraftStore(memory.driver).read(first)).rejects.toThrow(/could not be read/);
+
+    memory.values.set(key, JSON.stringify({
+      version: 2,
+      identity: second,
+      draft: plainTextMobileComposerDraft("cross owner")
+    }));
+    await expect(new MobileComposerDraftStore(memory.driver).read(first)).rejects.toThrow(/could not be read/);
   });
 
   it("reports storage failures without discarding the current in-memory text", async () => {
@@ -106,15 +156,15 @@ describe("mobile composer draft store", () => {
     store.subscribeErrors((_identity, error) => errors.push(error));
 
     await expect(store.read(first)).rejects.toThrow("could not be read");
-    store.save(first, "kept");
+    store.save(first, plainTextMobileComposerDraft("kept"));
     await vi.advanceTimersByTimeAsync(mobileComposerDraftTesting.persistDebounceMilliseconds);
     await expect(store.flush(first)).rejects.toThrow("could not be written");
 
-    expect(store.readSync(first)).toBe("kept");
+    expect(store.readSync(first)).toEqual(plainTextMobileComposerDraft("kept"));
     expect(errors[0]?.message).toContain("could not be read");
     expect(errors.slice(1).every((error) => error.message.includes("could not be written"))).toBe(true);
     writable = true;
     await store.flush(first);
-    expect(values.get(mobileComposerDraftTesting.storageKey(first))).toBe("kept");
+    expect(values.get(mobileComposerDraftTesting.storageKey(first))).toContain('"text":"kept"');
   });
 });

@@ -4,7 +4,7 @@ import { create } from "@bufbuild/protobuf";
 import {
   CapabilitySupport, CompactSessionOutcome, CompactionState, ConnectionState, DeviceKind,
   DismissInteractionMutationSchema, EntityKind, EntityRefSchema,
-  EventCursorSchema, InteractionResolutionSchema, InteractionState, NativeNavigationTargetSchema,
+  EventCursorSchema, InputMentionRangeSchema, InputPartSchema, InteractionResolutionSchema, InteractionState, NativeNavigationTargetSchema,
   NavigateSessionBranchMutationSchema, OperationMutationSchema,
   LogoutConnectionMutationSchema, OperationPreconditionSchema, OperationState, PlanReviewDecisionKind,
   PermissionMode,
@@ -250,6 +250,125 @@ describe("native mobile device through the durable product chain", () => {
     }));
     expect(loggedOut.state).toBe(OperationState.SUCCEEDED);
     await expect(logoutClients.event.getSnapshot({ scope: { kind: { case: "owner", value: {} } } })).rejects.toBeDefined();
+  });
+
+  it("admits a mobile typed Session reference and preserves its public input ranges through dispatch", async () => {
+    const mentionProfile = {
+      ...PI_LIKE_PROFILE,
+      id: "mobile-session-reference",
+      displayName: "Mobile Session reference",
+      capabilities: [
+        ...PI_LIKE_PROFILE.capabilities.filter((capability) => capability.key !== capabilityNames.inputMention),
+        { key: capabilityNames.inputMention, supported: true as const, options: ["session"] }
+      ]
+    };
+    fixture = await OrchestratorE2eFixture.start({
+      profiles: [mentionProfile],
+      createAdapter: (profile) => new MobileMessageFixtureAdapter(profile)
+    });
+    const begun = await fixture.anonymous.connection.beginPairing({
+      deviceDisplayName: "Joko reference phone",
+      deviceKind: DeviceKind.MOBILE,
+      platform: "android",
+      appVersion: "0.1.0"
+    });
+    const challengeId = begun.challenge?.challengeId;
+    if (!challengeId) throw new Error("The mobile reference fixture did not return a pairing challenge.");
+    const paired = (await fixture.anonymous.connection.completePairing({
+      challengeId,
+      humanCode: fixture.pairingCode(challengeId),
+      deviceDisplayName: "Joko reference phone",
+      deviceKind: DeviceKind.MOBILE,
+      platform: "android",
+      appVersion: "0.1.0"
+    })).result;
+    if (!paired?.authKey || !paired.connection?.connectionId) throw new Error("The mobile reference fixture did not pair.");
+    const clients = fixture.clients(paired.authKey);
+    const connectionId = paired.connection.connectionId;
+    const adapter = fixture.adapter(mentionProfile.id);
+    const owner = (await clients.event.getSnapshot({ scope: { kind: { case: "owner", value: {} } } })).snapshot;
+    const mentionCapability = owner?.backends.find((backend) => backend.backendId === mentionProfile.id)
+      ?.capabilities?.capabilities.find((capability) => capability.name === capabilityNames.inputMention);
+    expect(mentionCapability).toMatchObject({
+      support: CapabilitySupport.SUPPORTED,
+      options: { kind: { case: "input", value: { mediaTypes: ["session"] } } }
+    });
+    const createTask = async (displayName: string) => sessionIdFrom(await submit(
+      clients.operation,
+      connectionId,
+      createSessionMutation({
+        backendId: mentionProfile.id,
+        targetId: fixture!.targetId(mentionProfile.id),
+        displayName
+      })
+    ));
+    const sourceSessionId = await createTask("Earlier mobile task");
+    const destinationSessionId = await createTask("Current mobile task");
+    const generation = (sessionId: string) => BigInt(
+      fixture!.application.store.getSession(sessionId).descriptor.binding.generation
+    );
+    const sourceOperation = await submit(
+      clients.operation,
+      connectionId,
+      sendInputMutation(sourceSessionId, generation(sourceSessionId), "MOBILE SOURCE HISTORY")
+    );
+    await waitFor(
+      () => clients.run.getRun({ runId: queueRunIdFrom(sourceOperation) }),
+      (value) => value.run?.state === RunState.SUCCEEDED,
+      "mobile reference source history"
+    );
+
+    const text = "Compare 👋 @Earlier mobile task";
+    const mentionStart = "Compare 👋 ".length;
+    const mutation = sendInputMutation(destinationSessionId, generation(destinationSessionId), text);
+    if (mutation.payload.case !== "sendInput" || mutation.payload.value.input === undefined) {
+      throw new Error("The mobile reference mutation has no InputContent.");
+    }
+    mutation.payload.value.input.parts.push(create(InputPartSchema, {
+      content: { case: "sessionMention", value: {
+        sessionId: sourceSessionId,
+        displayText: "Earlier mobile task"
+      } }
+    }));
+    mutation.payload.value.input.mentionRanges.push(create(InputMentionRangeSchema, {
+      start: mentionStart,
+      end: text.length,
+      mentionIndex: 0
+    }));
+    const sent = await submit(clients.operation, connectionId, mutation);
+    const queued = queueItemFrom(sent);
+    expect(queued.input).toMatchObject({
+      parts: [
+        { content: { case: "text", value: text } },
+        { content: { case: "sessionMention", value: {
+          sessionId: sourceSessionId,
+          displayText: "Earlier mobile task"
+        } } }
+      ],
+      mentionRanges: [{ start: mentionStart, end: text.length, mentionIndex: 0 }]
+    });
+    await waitFor(
+      () => clients.run.getRun({ runId: queueRunIdFrom(sent) }),
+      (value) => value.run?.state === RunState.SUCCEEDED,
+      "mobile Session reference dispatch"
+    );
+    const timeline = await waitFor(
+      () => clients.session.listSessionTimeline({ sessionId: destinationSessionId, limit: 120 }),
+      (value) => value.events.some((event) => event.payload?.kind.case === "messageStarted"
+        && event.payload.kind.value.role === MessageRole.USER),
+      "accepted mobile Session-reference input"
+    );
+    const accepted = timeline.events.find((event) => event.identity?.runId === queued.runId
+      && event.payload?.kind.case === "messageStarted" && event.payload.kind.value.role === MessageRole.USER);
+    expect(accepted?.payload?.kind.case).toBe("messageStarted");
+    if (accepted?.payload?.kind.case !== "messageStarted") throw new Error("The accepted mobile input was not projected.");
+    expect(accepted.payload.kind.value.userInputAccepted).toBe(true);
+    expect(accepted.payload.kind.value.userInput).toMatchObject(queued.input!);
+    const dispatched = adapter.sendCalls.at(-1);
+    expect(dispatched?.text).toContain(text);
+    expect(dispatched?.text).toContain("MOBILE SOURCE HISTORY");
+    expect(dispatched?.mentions).toEqual([]);
+    expect(dispatched?.mentionRanges).toEqual([]);
   });
 
   it("executes mobile message deletion and touch Queue controls through HTTP, SQLite, and the Session Host", async () => {

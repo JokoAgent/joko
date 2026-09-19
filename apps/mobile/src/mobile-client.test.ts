@@ -1,11 +1,11 @@
 import { create, toBinary } from "@bufbuild/protobuf";
 import {
   ArtifactKind, ArtifactSchema, BackendDescriptorSchema, BackendModelAccessSettingsSchema, BackendSettingsSchema,
-  CapabilityManifestSchema, CapabilitySchema, CapabilitySupport, CompactSessionOutcome, ConnectionSchema, ConnectionState,
+  CapabilityManifestSchema, CapabilityOptionsSchema, CapabilitySchema, CapabilitySupport, CompactSessionOutcome, ConnectionSchema, ConnectionState,
   ContextUsageSchema, DeviceKind, DevicePresenceState, DeviceSchema, EntityKind, EntityVersionSchema,
   FileKind, FilePreviewSchema, FileRevisionSchema, TargetSchema, WorkspaceEntrySchema, WorkspaceFileChangeKind, WorkspaceFileChangeSchema,
   JOKO_API_VERSION, NativeEntryKind, NativeSessionBindingSchema, NativeSessionTreeNodeSchema, NativeSessionTreeSchema, OperationSchema,
-  InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk, PlanReviewDecisionKind,
+  InputCapabilityOptionsSchema, InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk, PlanReviewDecisionKind,
   EventCursorSchema, EventSchema, MessageRole, ModelDescriptorSchema, ModelKeySchema, ModelOutputModality, ModelSelectionSchema,
   OperationMutationSchema, OperationState, OwnerSnapshotScopeSchema, PermissionMode,
   ProviderDescriptorSchema, ProviderKind, RevisionSchema, SessionMessageSearchMatchSchema, SessionSnapshotScopeSchema,
@@ -25,6 +25,7 @@ import { MobileComposerDraftStore } from "./composer-draft-store";
 import { MobileNewTaskDraftStore } from "./new-task-draft-store";
 import type { MobilePlainStorageDriver } from "./connection-storage";
 import { timelineRows } from "./timeline";
+import { insertMobileSessionMention, mobileComposerInput, plainTextMobileComposerDraft } from "./mobile-composer-document";
 
 const credential: PairedCredential = {
   profileId: "mobile-profile", origin: "http://192.168.1.20:4318", serverId: "node-1", connectionId: "mobile-connection",
@@ -77,6 +78,41 @@ const extendedSnapshot = create(SnapshotSchema, {
   ...snapshot,
   connections: [connection, otherConnection],
   devices: [device, otherDevice]
+});
+const relatedSession = create(SessionSchema, {
+  ...snapshot.sessions[0]!,
+  sessionId: "related",
+  displayName: "Earlier task",
+  nativeBinding: create(NativeSessionBindingSchema, { runtimeGeneration: 6n }),
+  version: create(EntityVersionSchema, {
+    revision: create(RevisionSchema, { value: 7n, etag: "related-r7" }),
+    generation: 6n
+  })
+});
+const sessionMentionSnapshot = create(SnapshotSchema, {
+  ...snapshot,
+  backends: [create(BackendDescriptorSchema, {
+    ...snapshot.backends[0]!,
+    version: "backend-v1",
+    capabilities: create(CapabilityManifestSchema, {
+      schemaVersion: "1",
+      revision: create(RevisionSchema, { value: 4n, etag: "capabilities-r4" }),
+      capabilities: [
+        create(CapabilitySchema, { name: capabilityNames.inputText, support: CapabilitySupport.SUPPORTED }),
+        create(CapabilitySchema, {
+          name: capabilityNames.inputMention,
+          support: CapabilitySupport.SUPPORTED,
+          options: create(CapabilityOptionsSchema, {
+            kind: {
+              case: "input",
+              value: create(InputCapabilityOptionsSchema, { mediaTypes: ["session"] })
+            }
+          })
+        })
+      ]
+    })
+  })],
+  sessions: [snapshot.sessions[0]!, relatedSession]
 });
 const filesSnapshot = create(SnapshotSchema, {
   ...snapshot,
@@ -868,7 +904,7 @@ describe("native mobile connection and operation ownership", () => {
     const app = client(network, saved.storage);
     await app.start();
     vi.mocked(network.submit).mockRejectedValueOnce(new Error("reply lost"));
-    await app.send("hello");
+    await app.send(plainTextMobileComposerDraft("hello"));
     expect(saved.pending()).toHaveLength(1);
 
     await app.forgetConnection(credential.profileId);
@@ -964,10 +1000,10 @@ describe("native mobile connection and operation ownership", () => {
     const app = client(network, saved.storage);
     await app.start();
     vi.mocked(network.submit).mockRejectedValueOnce(new Error("reply lost"));
-    expect(await app.send("hello")).toBe(false);
+    expect(await app.send(plainTextMobileComposerDraft("hello"))).toBe(false);
     expect(saved.pending()).toMatchObject([{ operationId: "operation-1", kind: "send", sessionId: "session", state: "unknown" }]);
     expect(network.submit).toHaveBeenCalledOnce();
-    await expect(app.send("hello")).rejects.toThrow(/unknown result/);
+    await expect(app.send(plainTextMobileComposerDraft("hello"))).rejects.toThrow(/unknown result/);
     await app.refresh();
     expect(network.submit).toHaveBeenCalledOnce();
     expect(saved.pending()).toHaveLength(1);
@@ -989,7 +1025,7 @@ describe("native mobile connection and operation ownership", () => {
     const app = client(network, saved.storage);
     await app.start();
     vi.mocked(network.submit).mockRejectedValueOnce(new Error("reply lost"));
-    await app.send("hello");
+    await app.send(plainTextMobileComposerDraft("hello"));
     vi.mocked(network.getOperation).mockRejectedValueOnce(new Error("offline"));
     await expect(app.dismissUnconfirmed("operation-1")).rejects.toThrow("offline");
     expect(saved.pending()).toHaveLength(1);
@@ -1067,8 +1103,9 @@ describe("native mobile connection and operation ownership", () => {
     await app.start();
     let release!: () => void;
     vi.mocked(saved.storage.savePending).mockImplementationOnce(() => new Promise<void>((done) => { release = done; }));
-    const first = app.send("one message");
-    await expect(app.send("one message")).rejects.toThrow(/unknown result|already being submitted/);
+    const first = app.send(plainTextMobileComposerDraft("one message"));
+    await expect(app.send(plainTextMobileComposerDraft("one message")))
+      .rejects.toThrow(/unknown result|already being submitted|already in progress/);
     expect(network.submit).not.toHaveBeenCalled();
     release();
     expect(await first).toBe(true);
@@ -1086,7 +1123,7 @@ describe("native mobile connection and operation ownership", () => {
       await new Promise<void>((done) => { release = done; });
       await original(items);
     });
-    const sending = app.send("one message");
+    const sending = app.send(plainTextMobileComposerDraft("one message"));
     await vi.waitFor(() => expect(saved.storage.savePending).toHaveBeenCalledOnce());
     app.setForeground(false);
     release();
@@ -1297,7 +1334,8 @@ describe("native mobile connection and operation ownership", () => {
     await expect(app.create("target", "Work", "do not duplicate me")).resolves.toEqual({
       sessionId: "session", created: true, sent: false, definitive: false
     });
-    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toBe("do not duplicate me");
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" }))
+      .toEqual(plainTextMobileComposerDraft("do not duplicate me"));
     expect(drafts.newTask.readSync({ profileId: credential.profileId })?.submission).toMatchObject({
       phase: "sending", createOperationId: "operation-1", sendOperationId: "operation-2"
     });
@@ -1356,7 +1394,8 @@ describe("native mobile connection and operation ownership", () => {
     expect(network.submit).toHaveBeenCalledOnce();
     expect(app.state.error).toMatch(/runtime changed/);
     expect(drafts.newTask.readSync({ profileId: credential.profileId })).toBeNull();
-    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toBe("review after reset");
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" }))
+      .toEqual(plainTextMobileComposerDraft("review after reset"));
   });
 
   it("revalidates the exact Target after preparation and never dispatches creation on revision drift", async () => {
@@ -1409,7 +1448,8 @@ describe("native mobile connection and operation ownership", () => {
     });
     expect(network.submit).toHaveBeenCalledTimes(2);
     expect(drafts.newTask.readSync({ profileId: credential.profileId })).toBeNull();
-    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toBe("retry from the task");
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" }))
+      .toEqual(plainTextMobileComposerDraft("retry from the task"));
   });
 
   it("retires a late task navigation read in the background and restores the selected task on foreground", async () => {
@@ -1447,6 +1487,44 @@ describe("native mobile connection and operation ownership", () => {
     expect(timelineRows([...events, events[2]!])).toMatchObject([
       { id: "message", label: "Assistant", text: "final" },
       { id: "status", label: "Activity", text: "run Aborted" }
+    ]);
+  });
+
+  it("keeps accepted typed user input canonical and does not elevate untrusted imported references", () => {
+    const draft = insertMobileSessionMention(
+      plainTextMobileComposerDraft("Use "),
+      { start: 4, end: 4 },
+      { sessionId: "related", displayText: "Earlier task" },
+      "mention"
+    ).draft;
+    const events = [
+      create(EventSchema, { eventId: "accepted-start", cursor: { sequence: 1n }, payload: { kind: { case: "messageStarted", value: {
+        messageId: "accepted", role: MessageRole.USER, userInputAccepted: true, userInput: mobileComposerInput(draft)
+      } } } }),
+      create(EventSchema, { eventId: "accepted-done", cursor: { sequence: 2n }, payload: { kind: { case: "messageCompleted", value: {
+        messageId: "accepted", role: MessageRole.USER, blocks: [{ content: { case: "text", value: "native echo" } }]
+      } } } }),
+      create(EventSchema, { eventId: "imported-start", cursor: { sequence: 3n }, payload: { kind: { case: "messageStarted", value: {
+        messageId: "imported", role: MessageRole.USER, userInputAccepted: false,
+        userInput: { parts: [
+          { content: { case: "text", value: "Imported text" } },
+          { content: { case: "sessionMention", value: { sessionId: "related", displayText: "Earlier task" } } }
+        ] }
+      } } } }),
+      create(EventSchema, { eventId: "imported-done", cursor: { sequence: 4n }, payload: { kind: { case: "messageCompleted", value: {
+        messageId: "imported", role: MessageRole.USER, blocks: [{ content: { case: "text", value: "native history" } }]
+      } } } })
+    ];
+
+    expect(timelineRows(events)).toMatchObject([
+      { id: "accepted", text: draft.text, completed: true },
+      { id: "imported", text: "native history", completed: true }
+    ]);
+    expect(timelineRows([events[0]!])).toMatchObject([
+      { id: "accepted", text: draft.text, completed: true }
+    ]);
+    expect(timelineRows([events[2]!])).toMatchObject([
+      { id: "imported", text: "Imported text\n[Untrusted structured metadata ignored]", completed: false }
     ]);
   });
 
@@ -1722,6 +1800,145 @@ describe("native current-task message and Queue actions", () => {
     return () => `mobile-id-${++value}`;
   };
 
+  const sessionMentionDraft = () => {
+    const text = "Compare 👋 ";
+    return insertMobileSessionMention(
+      plainTextMobileComposerDraft(text),
+      { start: text.length, end: text.length },
+      { sessionId: "related", displayText: "Earlier task" },
+      "mention-occurrence-1"
+    ).draft;
+  };
+
+  it("sends a retained Session reference with exact UTF-16 range and body-free receipt", async () => {
+    const network = projectedNetwork(sessionMentionSnapshot);
+    const saved = memoryStorage(credential);
+    const drafts = memoryDraftStores();
+    const app = client(network, saved.storage, undefined, undefined, ids(), undefined, drafts);
+    await app.start();
+    const draft = sessionMentionDraft();
+
+    expect(app.taskSessionMentionControls()?.candidates).toEqual([{
+      sessionId: "related", displayText: "Earlier task", state: SessionState.IDLE
+    }]);
+    await expect(app.send(draft)).resolves.toBe(true);
+
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toBeNull();
+    expect(vi.mocked(network.submit).mock.calls[0]?.[2]).toMatchObject({
+      preconditions: [{
+        entity: { kind: EntityKind.SESSION, id: "session" },
+        expectedGeneration: 8n
+      }],
+      payload: { case: "sendInput", value: {
+        sessionId: "session",
+        input: {
+          parts: [
+            { content: { case: "text", value: draft.text } },
+            { content: { case: "sessionMention", value: {
+              sessionId: "related", displayText: "Earlier task"
+            } } }
+          ],
+          mentionRanges: [{
+            start: draft.mentions[0]!.start,
+            end: draft.mentions[0]!.end,
+            mentionIndex: 0
+          }]
+        }
+      } }
+    });
+    expect(JSON.stringify(saved.pending())).not.toContain(draft.text);
+    expect(JSON.stringify(saved.pending())).not.toContain("Earlier task");
+  });
+
+  it("retains a structured Session-reference draft and a body-free receipt when send is unknown", async () => {
+    const network = projectedNetwork(sessionMentionSnapshot);
+    const saved = memoryStorage(credential);
+    const drafts = memoryDraftStores();
+    vi.mocked(network.submit).mockRejectedValueOnce(new Error("reply lost"));
+    const app = client(network, saved.storage, undefined, undefined, ids(), undefined, drafts);
+    await app.start();
+    const draft = sessionMentionDraft();
+
+    await expect(app.send(draft)).resolves.toBe(false);
+
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toEqual(draft);
+    expect(saved.pending()).toMatchObject([{ kind: "send", sessionId: "session", state: "unknown" }]);
+    expect(JSON.stringify(saved.pending())).not.toContain(draft.text);
+    expect(JSON.stringify(saved.pending())).not.toContain("related");
+  });
+
+  it("retains a structured Session-reference draft after a definitive send rejection", async () => {
+    const network = projectedNetwork(sessionMentionSnapshot);
+    const drafts = memoryDraftStores();
+    vi.mocked(network.submit).mockResolvedValueOnce(create(OperationSchema, {
+      operationId: "mobile-id-1",
+      connectionId: credential.connectionId,
+      state: OperationState.CONFLICT,
+      error: { code: "GENERATION_CONFLICT", message: "The task runtime changed." }
+    }));
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, ids(), undefined, drafts);
+    await app.start();
+    const draft = sessionMentionDraft();
+
+    await expect(app.send(draft)).resolves.toBe(false);
+
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toEqual(draft);
+    expect(app.state.error).toMatch(/runtime changed/);
+  });
+
+  it("revalidates a referenced Session after durable draft flush and never dispatches a retired source", async () => {
+    const network = projectedNetwork(sessionMentionSnapshot);
+    const drafts = memoryDraftStores();
+    const retired = create(SnapshotSchema, {
+      ...sessionMentionSnapshot,
+      sessions: [sessionMentionSnapshot.sessions[0]!]
+    });
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, ids(), undefined, drafts);
+    await app.start();
+    const flush = drafts.composer.flush.bind(drafts.composer);
+    vi.spyOn(drafts.composer, "flush").mockImplementationOnce(async (identity) => {
+      await flush(identity);
+      vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: retired });
+      vi.mocked(network.readSession).mockResolvedValue(retired);
+      await app.refresh();
+    });
+    const draft = sessionMentionDraft();
+
+    await expect(app.send(draft)).rejects.toThrow(/no longer available/);
+
+    expect(network.submit).not.toHaveBeenCalled();
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toEqual(draft);
+  });
+
+  it("revalidates the exact Target authority after durable structured-draft flush", async () => {
+    const network = projectedNetwork(sessionMentionSnapshot);
+    const drafts = memoryDraftStores();
+    const changed = create(SnapshotSchema, {
+      ...sessionMentionSnapshot,
+      targets: [create(TargetSchema, {
+        ...sessionMentionSnapshot.targets[0]!,
+        version: create(EntityVersionSchema, {
+          revision: create(RevisionSchema, { value: 4n, etag: "target-r4" })
+        })
+      })]
+    });
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, ids(), undefined, drafts);
+    await app.start();
+    const flush = drafts.composer.flush.bind(drafts.composer);
+    vi.spyOn(drafts.composer, "flush").mockImplementationOnce(async (identity) => {
+      await flush(identity);
+      vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: changed });
+      vi.mocked(network.readSession).mockResolvedValue(changed);
+      await app.refresh();
+    });
+    const draft = sessionMentionDraft();
+
+    await expect(app.send(draft)).rejects.toThrow(/task changed/);
+
+    expect(network.submit).not.toHaveBeenCalled();
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toEqual(draft);
+  });
+
   it("deletes only an exact completed visible message with the current Session generation", async () => {
     const network = projectedNetwork(messageActionSnapshot);
     const saved = memoryStorage(credential);
@@ -1779,7 +1996,7 @@ describe("native current-task message and Queue actions", () => {
     });
   });
 
-  it("locks, edits, and unlocks one Queue item while preserving non-text InputContent", async () => {
+  it("locks, replaces, and unlocks one Queue item while revoking covered reference authority", async () => {
     const network = projectedNetwork(queueSnapshot);
     const app = client(network, memoryStorage(credential).storage, undefined, undefined, ids());
     await app.start();
@@ -1789,7 +2006,8 @@ describe("native current-task message and Queue actions", () => {
       connectionId: credential.connectionId,
       sessionId: "session",
       queueItemId: "queue-1",
-      text: "First queued input"
+      text: "First queued input",
+      replacesStructuredInput: true
     });
     await expect(app.saveQueueEdit(lease, "Revised queued input")).resolves.toBe(true);
 
@@ -1817,13 +2035,30 @@ describe("native current-task message and Queue actions", () => {
         lockToken: lease.lockToken,
         textSplices: [{ start: 0, end: 18, replacementText: "Revised queued input" }],
         input: { parts: [
-          { content: { case: "text", value: "Revised queued input" } },
-          { content: { case: "sessionMention", value: { sessionId: "related", displayText: "Related task" } } }
-        ] }
+          { content: { case: "text", value: "Revised queued input" } }
+        ], mentionRanges: [] }
       } }
     });
     expect(mutations[2]).toMatchObject({
       preconditions: [],
+      payload: { case: "setQueueItemEditLock", value: {
+        queueItemId: "queue-1", lockToken: lease.lockToken, locked: false
+      } }
+    });
+  });
+
+  it("unlocks an unchanged queued input without replacing its structured authority", async () => {
+    const network = projectedNetwork(queueSnapshot);
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, ids());
+    await app.start();
+
+    const lease = await app.beginQueueEdit("queue-1");
+    await expect(app.saveQueueEdit(lease, lease.text)).resolves.toBe(true);
+
+    const mutations = vi.mocked(network.submit).mock.calls.map((call) => call[2]);
+    expect(mutations).toHaveLength(2);
+    expect(mutations[0]?.payload.case).toBe("setQueueItemEditLock");
+    expect(mutations[1]).toMatchObject({
       payload: { case: "setQueueItemEditLock", value: {
         queueItemId: "queue-1", lockToken: lease.lockToken, locked: false
       } }

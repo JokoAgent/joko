@@ -1,4 +1,5 @@
-import { MessageRole, type Event, type InputContent } from "@joko/contracts";
+import { MessageRole, type Event } from "@joko/contracts";
+import { mobileInputSummary } from "./mobile-composer-document";
 
 export interface TimelineRow {
   readonly id: string;
@@ -10,12 +11,9 @@ export interface TimelineRow {
   readonly completed: boolean;
 }
 
-function inputText(input: InputContent | undefined): string {
-  return input?.parts.flatMap((part) => part.content.case === "text" ? [part.content.value] : ["[Attachment or reference]"]).join("\n") ?? "";
-}
-
 export function timelineRows(events: readonly Event[]): TimelineRow[] {
   const byId = new Map<string, TimelineRow>();
+  const acceptedUserInputs = new Set<string>();
   const unique = new Map(events.map((event) => [event.eventId, event]));
   const ordered = [...unique.values()].sort((a, b) => (a.cursor?.sequence ?? 0n) < (b.cursor?.sequence ?? 0n) ? -1
     : (a.cursor?.sequence ?? 0n) > (b.cursor?.sequence ?? 0n) ? 1 : 0);
@@ -26,9 +24,10 @@ export function timelineRows(events: readonly Event[]): TimelineRow[] {
     switch (kind.case) {
       case "messageStarted": {
         const message = kind.value;
+        if (message.role === MessageRole.USER && message.userInputAccepted) acceptedUserInputs.add(message.messageId);
         byId.set(message.messageId, { id: message.messageId, label: roleLabel(message.role),
-          text: inputText(message.userInput) || "…", sequence, eventId: event.eventId,
-          kind: roleKind(message.role), completed: false });
+          text: mobileInputSummary(message.userInput, message.userInputAccepted) || "…", sequence, eventId: event.eventId,
+          kind: roleKind(message.role), completed: message.role === MessageRole.USER && message.userInputAccepted });
         break;
       }
       case "textDelta": {
@@ -42,8 +41,11 @@ export function timelineRows(events: readonly Event[]): TimelineRow[] {
         const blocks = message.blocks.flatMap((block) => block.content.case === "text" ? [block.content.value]
           : block.content.case === "image" ? ["[Image]"] : block.content.case === "artifact" ? ["[Artifact]"]
             : block.content.case === "toolCall" ? ["[Tool call]"] : []);
+        const acceptedInput = message.role === MessageRole.USER && acceptedUserInputs.has(message.messageId)
+          ? previous?.text
+          : undefined;
         byId.set(message.messageId, { id: message.messageId, label: previous?.label || roleLabel(message.role),
-          text: blocks.join("\n") || previous?.text || "Completed", sequence: previous?.sequence ?? sequence,
+          text: acceptedInput || blocks.join("\n") || previous?.text || "Completed", sequence: previous?.sequence ?? sequence,
           eventId: event.eventId, kind: roleKind(message.role), completed: true });
         break;
       }

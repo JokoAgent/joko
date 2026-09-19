@@ -13,7 +13,7 @@ import {
   SessionState, SetQueueInteractionLockMutationSchema, SetQueueItemEditLockMutationSchema, SetSessionModelMutationSchema,
   SetSessionPermissionMutationSchema, SetSessionPlanModeMutationSchema, TargetState, capabilityNames,
   FileKind,
-  type Artifact, type DiscoveredNodeRecord, type Event, type EventCursor, type FilePreview, type FileRevision, type Interaction,
+  type Artifact, type BackendDescriptor, type DiscoveredNodeRecord, type Event, type EventCursor, type FilePreview, type FileRevision, type Interaction,
   type Operation, type OperationMutation, type QueueControl, type QueueItem, type Session, type Snapshot,
   type WorkspaceEntry, type WorkspaceSearchMatch
 } from "@joko/contracts";
@@ -53,6 +53,7 @@ import {
   backendSupports,
   editQueueItemText,
   mobileQueueCapabilities,
+  queueItemHasStructuredInput,
   queueItemText,
   queueMove
 } from "./task-actions";
@@ -63,6 +64,17 @@ import {
 } from "./mobile-interactions";
 import type { MobileInteractionDraftIdentity } from "./interaction-draft-store";
 import type { MobileComposerDraftStore } from "./composer-draft-store";
+import {
+  mobileComposerInput,
+  normalizeMobileComposerDraft,
+  plainTextMobileComposerDraft,
+  type MobileComposerDraft
+} from "./mobile-composer-document";
+import {
+  assertMobileSessionMentionDraft,
+  createMobileSessionMentionControls,
+  type MobileSessionMentionControls
+} from "./mobile-session-mentions";
 import {
   type MobileNewTaskCreateSubmission,
   type MobileNewTaskDraftIdentity,
@@ -155,6 +167,7 @@ export interface MobileQueueEditLease {
   readonly lockToken: string;
   readonly authorityKey: string;
   readonly text: string;
+  readonly replacesStructuredInput: boolean;
 }
 
 interface MobileQueueInteractionLease {
@@ -186,6 +199,28 @@ function trackedOperation(operation: Operation): TrackedMutationResult {
   return rejected
     ? { accepted: false, definitive: true, operation }
     : { accepted: true, definitive: isTerminal(operation.state), operation };
+}
+
+function entityVersionKey(version: {
+  readonly generation: bigint;
+  readonly revision?: { readonly value: bigint; readonly etag: string };
+} | undefined): string {
+  return [
+    version?.generation.toString(10) ?? "",
+    version?.revision?.value.toString(10) ?? "",
+    version?.revision?.etag ?? ""
+  ].join("\u001e");
+}
+
+function backendAuthorityKey(backend: BackendDescriptor): string {
+  return [
+    backend.backendId,
+    backend.version,
+    entityVersionKey(backend.entityVersion),
+    backend.capabilities?.schemaVersion ?? "",
+    backend.capabilities?.revision?.value.toString(10) ?? "",
+    backend.capabilities?.revision?.etag ?? ""
+  ].join("\u001e");
 }
 
 export class MobileClient {
@@ -1788,7 +1823,7 @@ export class MobileClient {
   ): Promise<void> {
     if (!this.composerDrafts) throw new Error("The task composer draft store is unavailable.");
     const composerIdentity = { profileId: identity.profileId, sessionId };
-    this.composerDrafts.save(composerIdentity, text);
+    this.composerDrafts.save(composerIdentity, plainTextMobileComposerDraft(text));
     await this.composerDrafts.flush(composerIdentity);
   }
 
@@ -1895,30 +1930,53 @@ export class MobileClient {
     return { sessionId: submission.sessionId, created: true, sent: true, definitive: true };
   }
 
-  async send(text: string): Promise<boolean> {
-    const value = text.trim();
+  async send(draft: MobileComposerDraft): Promise<boolean> {
+    const exactDraft = normalizeMobileComposerDraft(draft);
     const sessionId = this.#state.selectedId;
     const session = this.#state.detail?.sessions.find((item) => item.sessionId === sessionId);
     const backend = this.#state.owner?.backends.find((item) => item.backendId === session?.backendId);
     const generation = session?.nativeBinding?.runtimeGeneration;
-    if (!value || !sessionId || !session || !backend || !supportsText(backend) || !generation || generation < 1n) {
+    if (!exactDraft.text.trim() || !sessionId || !session || !backend || !supportsText(backend) || !generation || generation < 1n) {
       throw new Error("A current task generation and non-empty text are required.");
     }
     if (this.#state.pending.some((item) => item.kind === "send" && item.sessionId === sessionId && item.state === "unknown")) {
       throw new Error("The previous input has an unknown result. Check its operation before sending another message.");
     }
-    this.#ready();
+    const credential = this.#ready();
+    const authorityKey = this.#taskAuthorityKey();
+    if (!authorityKey) throw new Error("The current task authority is unavailable.");
+    const mentionControls = this.taskSessionMentionControls();
+    const sendDraft = assertMobileSessionMentionDraft(mentionControls, exactDraft);
+    if (!this.composerDrafts) throw new Error("Retained task drafts are unavailable on this mobile client.");
+    const draftIdentity = { profileId: credential.profileId, sessionId };
+    this.composerDrafts.save(draftIdentity, sendDraft);
+    await this.composerDrafts.flush(draftIdentity);
+    const currentSession = this.#selectedSession();
+    if (this.#taskAuthorityKey() !== authorityKey || currentSession?.sessionId !== sessionId
+      || currentSession.nativeBinding?.runtimeGeneration !== generation
+      || this.#credential?.profileId !== credential.profileId || this.#credential.connectionId !== credential.connectionId) {
+      throw new Error("The task changed while its structured draft was being saved. Review the retained draft before sending.");
+    }
+    assertMobileSessionMentionDraft(this.taskSessionMentionControls(), sendDraft);
     const action = this.#claimMutation();
     try {
-      return await this.#submit(create(OperationMutationSchema, {
-      preconditions: [create(OperationPreconditionSchema, {
-        entity: create(EntityRefSchema, { kind: EntityKind.SESSION, id: sessionId }), expectedGeneration: generation
-      })],
-      payload: { case: "sendInput", value: create(SendInputMutationSchema, { sessionId,
-        input: create(InputContentSchema, { parts: [create(InputPartSchema, { content: { case: "text", value } })] }),
-        deliveryMode: QueueDeliveryMode.PROMPT
-      }) }
+      const accepted = await this.#submit(create(OperationMutationSchema, {
+        preconditions: [create(OperationPreconditionSchema, {
+          entity: create(EntityRefSchema, { kind: EntityKind.SESSION, id: sessionId }), expectedGeneration: generation
+        })],
+        payload: { case: "sendInput", value: create(SendInputMutationSchema, {
+          sessionId,
+          input: mobileComposerInput(sendDraft),
+          deliveryMode: QueueDeliveryMode.PROMPT
+        }) }
       }), { kind: "send", sessionId });
+      if (accepted) {
+        try { await this.composerDrafts.clearIfEqual(draftIdentity, sendDraft); }
+        catch (error) {
+          this.#set({ error: `${message(error)} The accepted message will not be sent again automatically.` });
+        }
+      }
+      return accepted;
     } finally { this.#releaseMutation(action); }
   }
 
@@ -1981,6 +2039,13 @@ export class MobileClient {
       deviceId: credential.deviceId,
       serverId: credential.serverId
     }, this.#state.owner, this.#state.detail, this.#state.selectedId);
+  }
+
+  taskSessionMentionControls(): MobileSessionMentionControls | undefined {
+    const authorityKey = this.#taskAuthorityKey();
+    const session = this.#selectedSession();
+    const backend = this.#selectedBackend(session);
+    return createMobileSessionMentionControls(authorityKey, this.#state.owner, session, backend);
   }
 
   async setTaskModel(authorityKey: string, selection: MobileModelControlSelection): Promise<boolean> {
@@ -2201,7 +2266,15 @@ export class MobileClient {
     const connectionId = this.#ready().connectionId;
     const lockToken = this.newId();
     const action = this.#claimMutation();
-    const lease = { connectionId, sessionId: session.sessionId, queueItemId, lockToken, authorityKey, text };
+    const lease = {
+      connectionId,
+      sessionId: session.sessionId,
+      queueItemId,
+      lockToken,
+      authorityKey,
+      text,
+      replacesStructuredInput: queueItemHasStructuredInput(item.input)
+    };
     this.#queueEditLease = lease;
     try {
       let result: TrackedMutationResult;
@@ -2250,12 +2323,12 @@ export class MobileClient {
     this.#assertQueueEditLease(lease);
     const { item, capabilities } = this.#queueItemContext(lease.queueItemId);
     if (!capabilities.edit) throw new Error("This Backend no longer supports editing queued input.");
-    const edit = editQueueItemText(item.input, text);
-    if (!edit) throw new Error("Use non-empty text that the current queued-input editor can represent.");
     if (queueItemText(item.input) === text) {
       await this.cancelQueueEdit(lease);
       return true;
     }
+    const edit = editQueueItemText(item.input, text);
+    if (!edit) throw new Error("Use non-empty text that the current queued-input editor can represent.");
     const action = this.#claimMutation();
     let result: TrackedMutationResult | undefined;
     try {
@@ -2495,14 +2568,47 @@ export class MobileClient {
 
   #taskAuthorityKey(): string | undefined {
     const credential = this.#credential;
-    const session = this.#selectedSession();
     const owner = this.#state.owner;
     const detail = this.#state.detail;
-    const generation = session?.nativeBinding?.runtimeGeneration;
-    if (!credential || !owner || !detail || !session || !generation || generation < 1n
+    const sessionId = this.#state.selectedId;
+    if (!credential || !owner || !detail || !sessionId
       || !this.#foreground || this.#state.status !== "connected"
       || detail.generation !== owner.generation || this.#state.activeProfileId !== credential.profileId
-      || this.#state.node?.serverId !== credential.serverId) return undefined;
+      || this.#state.node?.serverId !== credential.serverId
+      || owner.server?.serverId !== credential.serverId || detail.server?.serverId !== credential.serverId) return undefined;
+    const ownerSessions = owner.sessions.filter((candidate) => candidate.sessionId === sessionId);
+    const detailSessions = detail.sessions.filter((candidate) => candidate.sessionId === sessionId);
+    const connections = owner.connections.filter((candidate) => candidate.connectionId === credential.connectionId);
+    const devices = owner.devices.filter((candidate) => candidate.deviceId === credential.deviceId);
+    if (ownerSessions.length !== 1 || detailSessions.length !== 1 || connections.length !== 1 || devices.length !== 1) {
+      return undefined;
+    }
+    const session = detailSessions[0]!;
+    const ownerSession = ownerSessions[0]!;
+    const connection = connections[0]!;
+    const device = devices[0]!;
+    const generation = session.nativeBinding?.runtimeGeneration;
+    if (!generation || generation < 1n || ownerSession.nativeBinding?.runtimeGeneration !== generation
+      || ownerSession.backendId !== session.backendId || ownerSession.targetId !== session.targetId
+      || entityVersionKey(ownerSession.version) !== entityVersionKey(session.version)
+      || connection.connectionProfileId !== credential.profileId || connection.deviceId !== credential.deviceId
+      || connection.state !== ConnectionState.CONNECTED || device.kind !== DeviceKind.MOBILE || device.revoked
+      || !device.connectionIds.includes(credential.connectionId)) return undefined;
+    const ownerBackends = owner.backends.filter((candidate) => candidate.backendId === session.backendId);
+    const detailBackends = detail.backends.filter((candidate) => candidate.backendId === session.backendId);
+    const ownerTargets = owner.targets.filter((candidate) => candidate.targetId === session.targetId);
+    const detailTargets = detail.targets.filter((candidate) => candidate.targetId === session.targetId);
+    if (ownerBackends.length !== 1 || detailBackends.length !== 1 || ownerTargets.length !== 1 || detailTargets.length !== 1) {
+      return undefined;
+    }
+    const backend = ownerBackends[0]!;
+    const detailBackend = detailBackends[0]!;
+    const target = ownerTargets[0]!;
+    const detailTarget = detailTargets[0]!;
+    if (target.backendId !== session.backendId || detailTarget.backendId !== session.backendId
+      || target.state !== TargetState.ACTIVE || detailTarget.state !== TargetState.ACTIVE
+      || entityVersionKey(target.version) !== entityVersionKey(detailTarget.version)
+      || backendAuthorityKey(backend) !== backendAuthorityKey(detailBackend)) return undefined;
     return [
       credential.profileId,
       credential.connectionId,
@@ -2513,8 +2619,9 @@ export class MobileClient {
       session.backendId,
       session.targetId,
       generation.toString(10),
-      session.version?.revision?.etag ?? "",
-      session.version?.revision?.value.toString(10) ?? ""
+      entityVersionKey(session.version),
+      entityVersionKey(target.version),
+      backendAuthorityKey(backend)
     ].join("\u001f");
   }
 
@@ -2527,8 +2634,11 @@ export class MobileClient {
     return events.find((event) => {
       const payload = event.payload?.kind;
       return event.eventId === eventId && event.identity?.sessionId === sessionId
-        && event.cursor?.generation === generation && payload?.case === "messageCompleted"
-        && (payload.value.role === MessageRole.USER || payload.value.role === MessageRole.ASSISTANT);
+        && event.cursor?.generation === generation
+        && ((payload?.case === "messageStarted" && payload.value.role === MessageRole.USER
+          && payload.value.userInputAccepted)
+          || (payload?.case === "messageCompleted"
+            && (payload.value.role === MessageRole.USER || payload.value.role === MessageRole.ASSISTANT)));
     });
   }
 

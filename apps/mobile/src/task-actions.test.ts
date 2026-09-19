@@ -15,6 +15,7 @@ import {
   buildMobileMessageActions,
   editQueueItemText,
   mobileQueueCapabilities,
+  queueItemHasStructuredInput,
   queueItemText,
   queueMove
 } from "./task-actions";
@@ -77,14 +78,19 @@ describe("mobile accepted Queue actions", () => {
     expect(queueMove(items, "b", "down")).toBeUndefined();
   });
 
-  it("preserves non-text input and emits UTF-16 replacement coordinates", () => {
+  it("treats full-body replacement as authority revocation and emits UTF-16 coordinates", () => {
     const original = item("a", 1n).input;
     expect(queueItemText(original)).toBe("text-a");
+    expect(queueItemHasStructuredInput(original)).toBe(true);
     const edited = editQueueItemText(original, "Hello 👋");
     expect(edited?.input.parts[0]?.content).toEqual({ case: "text", value: "Hello 👋" });
-    expect(edited?.input.parts[1]).toBe(original?.parts[1]);
+    expect(edited?.input.parts).toHaveLength(1);
+    expect(edited?.input.mentionRanges).toEqual([]);
     expect(edited?.textSplices).toMatchObject([{ start: 0, end: 6, replacementText: "Hello 👋" }]);
     expect(editQueueItemText(original, "   ")).toBeUndefined();
+    expect(queueItemHasStructuredInput(create(InputContentSchema, {
+      parts: [create(InputPartSchema, { content: { case: "text", value: "plain" } })]
+    }))).toBe(false);
   });
 
   it("branches only on public capabilities", () => {
