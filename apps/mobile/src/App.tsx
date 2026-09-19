@@ -28,7 +28,7 @@ import {
 } from "./connection-artwork";
 import { mobileNetwork } from "./network";
 import { mobileDiscovery } from "./native-lan-discovery";
-import { mobileComposerDrafts, mobileStorage } from "./storage";
+import { mobileComposerDrafts, mobileInteractionDrafts, mobileStorage } from "./storage";
 import {
   mobileComposerDraftIdentityKey,
   type MobileComposerDraftIdentity
@@ -49,6 +49,13 @@ import { MobileKeyboardAvoidingView, useMobileKeyboardState } from "./MobileKeyb
 import { timelineRows, type TimelineRow } from "./timeline";
 import { MobileDrawer } from "./MobileDrawer";
 import { MobileActionSheet } from "./MobileActionSheet";
+import { MobileInteractionSheet } from "./MobileInteractionSheet";
+import {
+  mobileInteractionDraftIdentity,
+  mobileInteractionDraftIdentityKey,
+  type MobileInteractionDraftIdentity
+} from "./interaction-draft-store";
+import { mobileInteractionTitle } from "./mobile-interactions";
 import { SwipeableSessionRow } from "./SwipeableSessionRow";
 import {
   buildMobileHomeSections, buildWideSessionNavLayout, createSwipeRowRegistry,
@@ -63,7 +70,15 @@ import {
 } from "./workspace-files";
 import { buildMobileMessageActions, queueItemText, type MobileMessageActionId } from "./task-actions";
 
-const client = new MobileClient(mobileNetwork, mobileStorage, mobileDiscovery, randomUUID, Platform.OS);
+const client = new MobileClient(
+  mobileNetwork,
+  mobileStorage,
+  mobileDiscovery,
+  randomUUID,
+  Platform.OS,
+  Date.now,
+  (identity) => mobileInteractionDrafts.clear(identity)
+);
 type Page = "home" | "connection" | "new" | "task" | "files" | "connections" | "devices" | "device";
 
 export function App() {
@@ -90,12 +105,16 @@ export function App() {
     const subscription = AppState.addEventListener("change", (status) => {
       const foreground = status === "active";
       client.setForeground(foreground);
-      if (!foreground) void mobileComposerDrafts.flush().catch(() => undefined);
+      if (!foreground) {
+        void mobileComposerDrafts.flush().catch(() => undefined);
+        void mobileInteractionDrafts.flush().catch(() => undefined);
+      }
     });
     return () => {
       subscription.remove();
       client.setForeground(false);
       void mobileComposerDrafts.flush().catch(() => undefined);
+      void mobileInteractionDrafts.flush().catch(() => undefined);
     };
   }, []);
 
@@ -746,6 +765,15 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
   }>();
   const [composerContentHeight, setComposerContentHeight] = useState(composerMinimumInputHeight);
   const [composerManualHeight, setComposerManualHeight] = useState<number | null>(null);
+  const initialInteractions = client.taskInteractions();
+  const [selectedInteractionId, setSelectedInteractionId] = useState<string | undefined>(initialInteractions[0]?.interactionId);
+  const [interactionVisible, setInteractionVisible] = useState(initialInteractions.length > 0);
+  const interactionSurfaceOwnerRef = useRef<string | undefined>(
+    state.activeProfileId && state.selectedId ? `${state.activeProfileId}\u001f${state.selectedId}` : undefined
+  );
+  const interactionDraftsRef = useRef<{ readonly ownerKey?: string; readonly values: ReadonlyMap<string, MobileInteractionDraftIdentity> }>({
+    values: new Map()
+  });
   const queueEditRef = useRef(queueEdit);
   const draftIdentityRef = useRef<MobileComposerDraftIdentity | undefined>(initialDraftIdentity);
   const taskMountedRef = useRef(true);
@@ -821,6 +849,26 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
   const unknown = state.pending.some((item) => item.kind === "send" && item.sessionId === state.selectedId && item.state === "unknown");
   const queueItems = client.taskQueueItems();
   const queueCapabilities = client.taskQueueCapabilities();
+  const interactions = client.taskInteractions();
+  const interactionOwnerKey = state.activeProfileId && state.selectedId
+    ? `${state.activeProfileId}\u001f${state.selectedId}`
+    : undefined;
+  const interactionIdsKey = JSON.stringify(interactions.map((interaction) => [
+    interaction.interactionId,
+    interaction.backendId,
+    interaction.targetId,
+    interaction.kind.toString(10),
+    interaction.request.case,
+    interaction.generation.toString(10),
+    interaction.version?.revision?.value.toString(10) ?? "0"
+  ]));
+  const activeInteractionId = interactions.some((interaction) => interaction.interactionId === selectedInteractionId)
+    ? selectedInteractionId
+    : interactions[0]?.interactionId;
+  const activeInteraction = interactions.find((interaction) => interaction.interactionId === activeInteractionId);
+  const interactionMutationPending = state.pending.some((item) => item.sessionId === state.selectedId
+    && item.interactionId === activeInteractionId
+    && (item.kind === "interaction-resolve" || item.kind === "interaction-dismiss"));
   const queueMutationPending = state.pending.some((item) => item.sessionId === state.selectedId
     && ["queue-cancel", "queue-edit-lock", "queue-edit", "queue-interaction-lock", "queue-reorder"].includes(item.kind));
   const messageActionItems = messageAction
@@ -830,6 +878,41 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
     if (!taskMountedRef.current || mobileComposerDraftIdentityKey(identity) !== draftIdentityKey) return;
     setLocalError(error.message);
   }), [draftIdentityKey]);
+  useEffect(() => {
+    const ownerChanged = interactionSurfaceOwnerRef.current !== interactionOwnerKey;
+    interactionSurfaceOwnerRef.current = interactionOwnerKey;
+    if (interactions.length === 0) {
+      setSelectedInteractionId(undefined);
+      setInteractionVisible(false);
+      return;
+    }
+    if (ownerChanged) {
+      setSelectedInteractionId(interactions[0]!.interactionId);
+      setInteractionVisible(true);
+      return;
+    }
+    if (selectedInteractionId !== undefined
+      && interactions.some((interaction) => interaction.interactionId === selectedInteractionId)) return;
+    setSelectedInteractionId(interactions[0]!.interactionId);
+    setInteractionVisible(true);
+  }, [interactionIdsKey, interactionOwnerKey, selectedInteractionId]);
+  useEffect(() => {
+    const next = new Map<string, MobileInteractionDraftIdentity>();
+    if (state.activeProfileId) {
+      for (const interaction of interactions) {
+        const identity = mobileInteractionDraftIdentity(state.activeProfileId, interaction);
+        if (identity) next.set(mobileInteractionDraftIdentityKey(identity), identity);
+      }
+    }
+    const previous = interactionDraftsRef.current;
+    interactionDraftsRef.current = { ownerKey: interactionOwnerKey, values: next };
+    if (interactionOwnerKey === undefined || previous.ownerKey !== interactionOwnerKey) return;
+    for (const [key, identity] of previous.values) {
+      if (!next.has(key)) void mobileInteractionDrafts.clear(identity).catch((error) => {
+        if (taskMountedRef.current) setLocalError(errorText(error));
+      });
+    }
+  }, [interactionIdsKey, interactionOwnerKey, state.activeProfileId]);
   useEffect(() => {
     const identity = draftIdentity;
     draftIdentityRef.current = identity;
@@ -962,7 +1045,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
   };
   const beginQueueEdit = async (item: QueueItem): Promise<void> => {
     const profileId = state.activeProfileId;
-    if (!profileId || !composerOwnerReady) return;
+    if (!profileId || !composerOwnerReady || interactions.length > 0) return;
     const stashedDraft = draft;
     setLocalError("");
     try {
@@ -993,6 +1076,20 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
       if (taskMountedRef.current) setLocalError(errorText(error));
     });
   };
+  useEffect(() => {
+    const active = queueEditRef.current;
+    if (!active || interactions.length === 0) return;
+    void client.cancelQueueEdit(active.lease).then(() => {
+      if (!taskMountedRef.current || queueEditRef.current !== active) return;
+      queueEditRef.current = undefined;
+      setQueueEdit(undefined);
+      if (client.state.activeProfileId === active.profileId && client.state.selectedId === active.lease.sessionId) {
+        setDraft(active.stashedDraft);
+      }
+    }).catch((error) => {
+      if (taskMountedRef.current) setLocalError(errorText(error));
+    });
+  }, [interactionIdsKey, state.activeProfileId, state.selectedId]);
   const submitComposer = async (): Promise<void> => {
     setLocalError("");
     const active = queueEditRef.current;
@@ -1086,7 +1183,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
         keyboardShouldPersistTaps="handled">
       {queueItems.map((item, index) => {
         const editing = queueEdit?.lease.queueItemId === item.queueItemId;
-        const disabled = state.busy || state.status !== "connected" || queueMutationPending || (!!queueEdit && !editing);
+        const disabled = state.busy || state.status !== "connected" || queueMutationPending || interactions.length > 0 || (!!queueEdit && !editing);
         const editableText = queueItemText(item.input);
         return <View key={item.queueItemId} style={[styles.queueCard, { backgroundColor: colors.surface, borderColor: editing ? colors.accent : colors.border }]}>
           <Text style={[styles.caption, { color: colors.muted }]}>Queued {index + 1} · {queueState(item.state)}{item.editLocked && !editing ? " · Editing elsewhere" : ""}</Text>
@@ -1110,10 +1207,10 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
       </ScrollView>
     </View>}
     {state.pending.filter((item) => item.sessionId === state.selectedId).map((item) => <View key={item.operationId} style={styles.pending}>
-      <Text style={[styles.warning, { color: colors.negative }]}>{item.state === "unknown" ? "Delivery unknown" : "Awaiting durable result"} · {item.operationId}</Text>
+      <Text style={[styles.warning, { color: colors.negative }]}>{item.state === "unknown" ? "Operation result unknown" : "Awaiting durable result"} · {item.operationId}</Text>
       <Action label="Check status" onPress={() => void client.reconcile()} colors={colors} compact />
       {item.state === "unknown" && <Action label="Clear unconfirmed receipt" onPress={() => Alert.alert(
-        "Clear this receipt?", "Only continue if you have checked the task. Joko will verify the operation is absent before clearing this local warning; it will not send the message again.",
+        "Clear this receipt?", "Only continue if you have checked the task. Joko will verify the operation is absent before clearing this local warning; it will not repeat the operation.",
         [{ text: "Keep checking", style: "cancel" }, { text: "Verify and clear", onPress: () => {
           void client.dismissUnconfirmed(item.operationId).catch((error) => setLocalError(errorText(error)));
         } }]
@@ -1124,7 +1221,14 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
       <Text style={[styles.caption, styles.fill, { color: colors.ink }]} numberOfLines={1}>Editing queued input</Text>
       <Action label="Cancel edit" colors={colors} compact disabled={state.busy} onPress={cancelQueueEdit} />
     </View>}
-    <View style={[styles.composer, { borderColor: colors.border, backgroundColor: colors.surface }]}>
+    {interactions.length > 0 ? <View style={[styles.interactionAwaiting, { borderColor: colors.border, backgroundColor: colors.brandBackground }]}>
+      <View style={styles.fill}>
+        <Text style={[styles.caption, { color: colors.muted }]}>{interactions.length === 1 ? "Task needs a response" : `${interactions.length} task requests need responses`}</Text>
+        <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{activeInteraction ? mobileInteractionTitle(activeInteraction) : "Open request"}</Text>
+      </View>
+      <Action label="Open request" colors={colors} compact disabled={interactionMutationPending}
+        onPress={() => setInteractionVisible(true)} />
+    </View> : <View style={[styles.composer, { borderColor: colors.border, backgroundColor: colors.surface }]}>
       <View accessible accessibilityRole="adjustable" accessibilityLabel="Message input height"
         accessibilityHint="Swipe up or down to resize. Accessibility actions resize or return to automatic height."
         accessibilityActions={[{ name: "increment", label: "Increase height" }, { name: "decrement", label: "Decrease height" }, { name: "activate", label: "Use automatic height" }]}
@@ -1164,10 +1268,25 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
           disabled={!composerOwnerReady || !draft.trim() || (!queueEdit && unknown) || state.busy || state.status !== "connected"}
           onPress={() => void submitComposer()} />
       </View>
-    </View>
+    </View>}
     </MobileKeyboardAvoidingView>
     <MobileActionSheet visible={messageActionsVisible} items={messageActionItems} colors={colors}
       onClose={() => setMessageActionsVisible(false)} onAction={runMessageAction} />
+    <MobileInteractionSheet visible={interactionVisible && interactions.length > 0}
+      profileId={state.activeProfileId} interactions={interactions} selectedId={activeInteractionId}
+      busy={state.busy || interactionMutationPending} colors={colors}
+      onSelect={setSelectedInteractionId} onMinimize={() => setInteractionVisible(false)}
+      onResolve={async (interaction, submission) => {
+        const completed = await client.resolveInteraction(interaction.interactionId, submission);
+        if (completed) setInteractionVisible(true);
+        return completed;
+      }}
+      onDismiss={async (interaction) => {
+        const completed = await client.dismissInteraction(interaction.interactionId);
+        if (completed) setInteractionVisible(true);
+        return completed;
+      }}
+      onError={setLocalError} />
     <MobileDrawer visible={drawerOpen} width={drawerWidthRef.current} backgroundColor={colors.surface} borderColor={colors.border}
       onClose={() => setDrawerOpen(false)} onMountedChange={setDrawerMounted} initialFocusRef={drawerCloseRef}
       onClosed={() => {
@@ -1688,6 +1807,7 @@ const styles = StyleSheet.create({
   queueCard: { borderWidth: 1, borderRadius: 12, paddingHorizontal: 12, paddingVertical: 9, gap: 4 },
   queueActions: { flexDirection: "row", flexWrap: "wrap", gap: 7, paddingTop: 3 },
   queueEditBanner: { minHeight: 52, borderTopWidth: 1, paddingHorizontal: 12, paddingVertical: 4, flexDirection: "row", alignItems: "center", gap: 10 },
+  interactionAwaiting: { minHeight: 68, borderTopWidth: 1, paddingHorizontal: 14, paddingVertical: 9, flexDirection: "row", alignItems: "center", gap: 12 },
   pendingReceipt: { gap: 4, paddingVertical: 4 },
   composer: { borderTopWidth: 1, paddingHorizontal: 12, paddingBottom: 8 },
   composerResizeHandle: { minHeight: 44, alignItems: "center", justifyContent: "center" },

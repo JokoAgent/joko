@@ -2,10 +2,13 @@ import { randomUUID } from "node:crypto";
 
 import { create } from "@bufbuild/protobuf";
 import {
-  CapabilitySupport, ConnectionState, DeviceKind, EntityKind, EntityRefSchema, EventCursorSchema, OperationMutationSchema,
-  LogoutConnectionMutationSchema, OperationPreconditionSchema, OperationState, QueueItemState, RevokeDeviceMutationSchema,
+  CapabilitySupport, ConnectionState, DeviceKind, DismissInteractionMutationSchema, EntityKind, EntityRefSchema,
+  EventCursorSchema, InteractionResolutionSchema, InteractionState, OperationMutationSchema,
+  LogoutConnectionMutationSchema, OperationPreconditionSchema, OperationState, PlanReviewDecisionKind,
+  PlanReviewResolutionSchema, QueueItemState, QuestionAnswerSchema, QuestionMultipleChoiceAnswerSchema,
+  QuestionResolutionSchema, QuestionSingleChoiceAnswerSchema, ResolveInteractionMutationSchema, RevokeDeviceMutationSchema,
   MessageRole, QueueDeliveryMode, RunState, SessionMessageSearchSemanticMode, SessionMessageSearchSessionStatus, SessionState,
-  capabilityNames, type OperationMutation
+  capabilityNames, type Interaction, type OperationMutation
 } from "@joko/contracts";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
 import type { AdapterContext, PromptInput } from "@joko/core";
@@ -13,7 +16,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { InstrumentedFakeAdapter, OrchestratorE2eFixture, waitFor } from "./fixture.js";
 import {
   archiveMutation, cancelQueuedInputMutation, createSessionMutation, deleteMutation, deleteSessionMessageMutation,
-  editQueuedInputMutation, pauseQueueMutation, pinMutation, queueItemFrom, renameMutation,
+  editQueuedInputMutation, pauseQueueMutation, pinMutation, queueItemFrom, queueRunIdFrom, renameMutation,
   reorderQueuedInputBeforeMutation, resumeQueueMutation, sendInputMutation, sessionIdFrom,
   setQueueInteractionLockMutation, setQueueItemEditLockMutation, submit
 } from "./operations.js";
@@ -25,6 +28,43 @@ class MobileMessageFixtureAdapter extends InstrumentedFakeAdapter {
       role: "user",
       blocks: [{ kind: "text", text: input.text }]
     });
+    await super.send(input, context);
+  }
+}
+
+class MobileInteractionFixtureAdapter extends InstrumentedFakeAdapter {
+  override async send(input: PromptInput, context: AdapterContext): Promise<void> {
+    if (input.text === "[mobile-question]") {
+      const decision = await context.requestInteraction({
+        id: `mobile-question-${context.sessionId}-${randomUUID()}`,
+        kind: "question",
+        title: "Mobile release choices",
+        prompt: "Complete every current field.",
+        fields: [
+          { id: "summary", kind: "text", label: "Summary", required: true, multiline: true },
+          { id: "release", kind: "single", label: "Release", required: true,
+            choices: [{ id: "stable", label: "Stable" }, { id: "preview", label: "Preview" }], allowOther: true },
+          { id: "targets", kind: "multiple", label: "Targets", required: true,
+            choices: [{ id: "web", label: "Web" }, { id: "mobile", label: "Mobile" }],
+            defaultChoiceIds: [], minimumSelections: 2, maximumSelections: 2, allowOther: true },
+          { id: "publish", kind: "boolean", label: "Publish", required: true, defaultValue: false }
+        ]
+      });
+      this.interactionDecisions.push(decision.kind === "question"
+        ? `question:${decision.answers.summary?.kind}:${decision.answers.release?.kind}:${decision.answers.targets?.kind}:${decision.answers.publish?.kind}`
+        : "question:cancelled");
+    } else if (input.text === "[mobile-plan]") {
+      const decision = await context.requestInteraction({
+        id: `mobile-plan-${context.sessionId}-${randomUUID()}`,
+        kind: "plan_review",
+        title: "Review mobile plan",
+        markdown: "# Mobile plan\n\n1. Preserve authority.\n2. Verify the result.",
+        choices: ["execute", "stay", "refine"]
+      });
+      this.interactionDecisions.push(decision.kind === "plan_review"
+        ? `plan:${decision.decision}:${decision.feedback}`
+        : "plan:cancelled");
+    }
     await super.send(input, context);
   }
 }
@@ -349,5 +389,132 @@ describe("native mobile device through the durable product chain", () => {
     expect(afterDelete.events.some((event) => event.eventId === selected.eventId)).toBe(false);
     expect(afterDelete.events.some((event) => event.payload?.kind.case === "messageDeleted"
       && event.payload.kind.value.requestedEventId === selected.eventId)).toBe(true);
+  });
+
+  it("resolves and dismisses mobile permission, question, and plan requests through HTTP, SQLite, and the Session Host", async () => {
+    fixture = await OrchestratorE2eFixture.start({
+      createAdapter: (profile) => new MobileInteractionFixtureAdapter(profile)
+    });
+    const begun = await fixture.anonymous.connection.beginPairing({
+      deviceDisplayName: "Joko interaction phone",
+      deviceKind: DeviceKind.MOBILE,
+      platform: "android",
+      appVersion: "0.1.0"
+    });
+    const challengeId = begun.challenge?.challengeId;
+    if (!challengeId) throw new Error("The mobile interaction fixture did not return a pairing challenge.");
+    const paired = (await fixture.anonymous.connection.completePairing({
+      challengeId,
+      humanCode: fixture.pairingCode(challengeId),
+      deviceDisplayName: "Joko interaction phone",
+      deviceKind: DeviceKind.MOBILE,
+      platform: "android",
+      appVersion: "0.1.0"
+    })).result;
+    if (!paired?.authKey || !paired.connection?.connectionId) throw new Error("The mobile interaction fixture did not pair.");
+    const clients = fixture.clients(paired.authKey);
+    const connectionId = paired.connection.connectionId;
+    const adapter = fixture.adapter() as MobileInteractionFixtureAdapter;
+    const sessionId = sessionIdFrom(await submit(
+      clients.operation,
+      connectionId,
+      createSessionMutation({ backendId: adapter.id, targetId: fixture.targetId(), displayName: "Mobile interactions" })
+    ));
+    const generation = () => BigInt(fixture!.application.store.getSession(sessionId).descriptor.binding.generation);
+
+    const open = async (text: string) => {
+      const sent = await submit(clients.operation, connectionId, sendInputMutation(sessionId, generation(), text));
+      const runId = queueRunIdFrom(sent);
+      const listed = await waitFor(
+        () => clients.interaction.listInteractions({ sessionId, runId }),
+        (value) => value.interactions.some((interaction) => interaction.state === InteractionState.PENDING),
+        `${text} mobile interaction`
+      );
+      const interaction = listed.interactions.find((candidate) => candidate.state === InteractionState.PENDING);
+      if (!interaction?.version?.revision) throw new Error("The pending mobile Interaction has no exact version.");
+      const snapshot = (await clients.event.getSnapshot({
+        scope: { kind: { case: "session", value: { sessionId, recentTimelineItems: 120 } } }
+      })).snapshot;
+      expect(snapshot?.interactions.find((candidate) => candidate.interactionId === interaction.interactionId))
+        .toMatchObject({ state: InteractionState.PENDING, generation: interaction.generation });
+      return { interaction, runId };
+    };
+    const settle = async (interaction: Interaction, mutation: OperationMutation, expected: InteractionState) => {
+      const operation = await submit(clients.operation, connectionId, create(OperationMutationSchema, {
+        ...mutation,
+        preconditions: [create(OperationPreconditionSchema, {
+          entity: create(EntityRefSchema, { kind: EntityKind.INTERACTION, id: interaction.interactionId }),
+          expectedRevision: interaction.version!.revision,
+          expectedGeneration: interaction.generation
+        })]
+      }));
+      expect(operation.state).toBe(OperationState.SUCCEEDED);
+      await waitFor(
+        () => clients.interaction.getInteraction({ interactionId: interaction.interactionId }),
+        (value) => value.interaction?.state === expected,
+        `${interaction.interactionId} terminal state`
+      );
+    };
+    const waitRun = async (runId: string) => waitFor(
+      () => clients.run.getRun({ runId }),
+      (value) => value.run?.state === RunState.SUCCEEDED,
+      `${runId} terminal Run`
+    );
+
+    const question = await open("[mobile-question]");
+    await settle(question.interaction, create(OperationMutationSchema, {
+      payload: { case: "resolveInteraction", value: create(ResolveInteractionMutationSchema, {
+        interactionId: question.interaction.interactionId,
+        interactionGeneration: question.interaction.generation,
+        resolution: create(InteractionResolutionSchema, {
+          connectionId,
+          decision: { case: "question", value: create(QuestionResolutionSchema, { answers: [
+            create(QuestionAnswerSchema, { fieldId: "summary", value: { case: "text", value: "Ready" } }),
+            create(QuestionAnswerSchema, { fieldId: "release", value: { case: "singleChoice", value: create(QuestionSingleChoiceAnswerSchema, {
+              selection: { case: "otherText", value: "candidate" }
+            }) } }),
+            create(QuestionAnswerSchema, { fieldId: "targets", value: { case: "multipleChoice", value: create(QuestionMultipleChoiceAnswerSchema, {
+              choiceIds: ["web"], otherText: "desktop"
+            }) } }),
+            create(QuestionAnswerSchema, { fieldId: "publish", value: { case: "boolean", value: false } })
+          ] }) }
+        })
+      }) }
+    }), InteractionState.RESOLVED);
+    await waitRun(question.runId);
+
+    const plan = await open("[mobile-plan]");
+    await settle(plan.interaction, create(OperationMutationSchema, {
+      payload: { case: "resolveInteraction", value: create(ResolveInteractionMutationSchema, {
+        interactionId: plan.interaction.interactionId,
+        interactionGeneration: plan.interaction.generation,
+        resolution: create(InteractionResolutionSchema, {
+          connectionId,
+          decision: { case: "planReview", value: create(PlanReviewResolutionSchema, {
+            decision: PlanReviewDecisionKind.REFINE,
+            feedback: "Tighten the evidence step"
+          }) }
+        })
+      }) }
+    }), InteractionState.RESOLVED);
+    await waitRun(plan.runId);
+
+    const permission = await open("[permission]");
+    await settle(permission.interaction, create(OperationMutationSchema, {
+      payload: { case: "dismissInteraction", value: create(DismissInteractionMutationSchema, {
+        interactionId: permission.interaction.interactionId,
+        interactionGeneration: permission.interaction.generation,
+        reason: "Dismissed by user on mobile"
+      }) }
+    }), InteractionState.DISMISSED);
+    await waitRun(permission.runId);
+
+    expect(adapter.interactionDecisions).toEqual([
+      "question:text:single:multiple:boolean",
+      "plan:refine:Tighten the evidence step",
+      "cancelled"
+    ]);
+    const persisted = fixture.application.store.listInteractions({ sessionId });
+    expect(persisted.map((interaction) => interaction.status).sort()).toEqual(["dismissed", "resolved", "resolved"]);
   });
 });

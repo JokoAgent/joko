@@ -239,4 +239,34 @@ describe("current-v1 mobile connection storage", () => {
     ]));
     await expect(storage.loadPending()).resolves.toEqual(receipts);
   });
+
+  it("round-trips Interaction receipts only with exact non-body authority metadata", async () => {
+    const memory = drivers();
+    const storage = createMobileStorage(memory.plain, memory.secure);
+    const receipts = [
+      { operationId: "interaction-question", connectionId: first.connectionId, kind: "interaction-resolve" as const,
+        sessionId: "session-one", interactionId: "interaction-one", interactionGeneration: "8",
+        interactionRevision: "44", interactionDraftKind: "question" as const, state: "unknown" as const },
+      { operationId: "interaction-permission", connectionId: first.connectionId, kind: "interaction-dismiss" as const,
+        sessionId: "session-one", interactionId: "interaction-two", interactionGeneration: "8",
+        interactionRevision: "45", state: "accepted" as const }
+    ];
+
+    await storage.savePending(receipts);
+    await expect(storage.loadPending()).resolves.toEqual(receipts);
+    expect(memory.plainValues.get("joko.mobile.pending.v1")).not.toContain("answer text");
+
+    memory.plainValues.set("joko.mobile.pending.v1", JSON.stringify([
+      ...receipts,
+      { operationId: "missing-version", connectionId: first.connectionId, kind: "interaction-resolve",
+        sessionId: "session-one", interactionId: "interaction-three", state: "unknown" },
+      { operationId: "invalid-version", connectionId: first.connectionId, kind: "interaction-dismiss",
+        sessionId: "session-one", interactionId: "interaction-four", interactionGeneration: "0",
+        interactionRevision: "x", state: "unknown" },
+      { operationId: "metadata-on-send", connectionId: first.connectionId, kind: "send",
+        sessionId: "session-one", interactionId: "interaction-five", interactionGeneration: "8",
+        interactionRevision: "46", state: "unknown" }
+    ]));
+    await expect(storage.loadPending()).resolves.toEqual(receipts);
+  });
 });

@@ -19,10 +19,14 @@ export interface PendingOperation {
   readonly connectionId: string;
   readonly kind: "create" | "send" | "logout" | "revoke" | "rename" | "pin" | "archive" | "delete"
     | "message-delete" | "queue-cancel" | "queue-edit-lock" | "queue-edit"
-    | "queue-interaction-lock" | "queue-reorder";
+    | "queue-interaction-lock" | "queue-reorder" | "interaction-resolve" | "interaction-dismiss";
   readonly sessionId?: string;
   readonly eventId?: string;
   readonly queueItemId?: string;
+  readonly interactionId?: string;
+  readonly interactionGeneration?: string;
+  readonly interactionRevision?: string;
+  readonly interactionDraftKind?: "question" | "plan";
   readonly targetConnectionId?: string;
   readonly targetDeviceId?: string;
   readonly state: "unknown" | "accepted";
@@ -377,11 +381,16 @@ function isPending(value: unknown): value is PendingOperation {
   const record = value as Record<string, unknown>;
   if (typeof record.operationId !== "string" || typeof record.connectionId !== "string"
     || !["create", "send", "logout", "revoke", "rename", "pin", "archive", "delete", "message-delete",
-      "queue-cancel", "queue-edit-lock", "queue-edit", "queue-interaction-lock", "queue-reorder"].includes(String(record.kind))
+      "queue-cancel", "queue-edit-lock", "queue-edit", "queue-interaction-lock", "queue-reorder",
+      "interaction-resolve", "interaction-dismiss"].includes(String(record.kind))
     || (record.state !== "unknown" && record.state !== "accepted")) return false;
   if (record.sessionId !== undefined && typeof record.sessionId !== "string") return false;
   if (record.eventId !== undefined && typeof record.eventId !== "string") return false;
   if (record.queueItemId !== undefined && typeof record.queueItemId !== "string") return false;
+  if (record.interactionId !== undefined && typeof record.interactionId !== "string") return false;
+  if (record.interactionGeneration !== undefined && (typeof record.interactionGeneration !== "string" || !/^[1-9][0-9]*$/u.test(record.interactionGeneration))) return false;
+  if (record.interactionRevision !== undefined && (typeof record.interactionRevision !== "string" || !/^[1-9][0-9]*$/u.test(record.interactionRevision))) return false;
+  if (record.interactionDraftKind !== undefined && record.interactionDraftKind !== "question" && record.interactionDraftKind !== "plan") return false;
   if (record.targetConnectionId !== undefined && typeof record.targetConnectionId !== "string") return false;
   if (record.targetDeviceId !== undefined && typeof record.targetDeviceId !== "string") return false;
   if (record.kind === "logout" && typeof record.targetConnectionId !== "string") return false;
@@ -391,6 +400,12 @@ function isPending(value: unknown): value is PendingOperation {
   if (["queue-cancel", "queue-edit-lock", "queue-edit", "queue-reorder"].includes(String(record.kind))
     && (typeof record.sessionId !== "string" || typeof record.queueItemId !== "string")) return false;
   if (record.kind === "queue-interaction-lock" && typeof record.sessionId !== "string") return false;
+  if (["interaction-resolve", "interaction-dismiss"].includes(String(record.kind))
+    && (typeof record.sessionId !== "string" || typeof record.interactionId !== "string"
+      || typeof record.interactionGeneration !== "string" || typeof record.interactionRevision !== "string")) return false;
+  if (!["interaction-resolve", "interaction-dismiss"].includes(String(record.kind))
+    && (record.interactionId !== undefined || record.interactionGeneration !== undefined
+      || record.interactionRevision !== undefined || record.interactionDraftKind !== undefined)) return false;
   return true;
 }
 

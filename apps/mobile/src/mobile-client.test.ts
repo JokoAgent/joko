@@ -2,10 +2,11 @@ import { create, toBinary } from "@bufbuild/protobuf";
 import {
   ArtifactKind, ArtifactSchema, BackendDescriptorSchema, CapabilityManifestSchema, CapabilitySchema, CapabilitySupport, ConnectionSchema, ConnectionState, DeviceKind, DevicePresenceState, DeviceSchema, EntityKind,
   FileKind, FilePreviewSchema, FileRevisionSchema, TargetSchema, WorkspaceEntrySchema, WorkspaceFileChangeKind, WorkspaceFileChangeSchema,
-  JOKO_API_VERSION, OperationSchema,
+  JOKO_API_VERSION, NativeSessionBindingSchema, OperationSchema,
+  InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk, PlanReviewDecisionKind,
   EventCursorSchema, EventSchema, MessageRole, OperationMutationSchema, OperationState, SessionMessageSearchMatchSchema,
   QueueControlSchema, QueueDeliveryMode, QueueDispatchState, QueueItemSchema, QueueItemState, QueueSourceKind,
-  SessionMessageSearchSessionStatus, SessionState, SnapshotSchema, TargetState, WorkspaceKind, capabilityNames
+  SessionMessageSearchSessionStatus, SessionSchema, SessionState, SnapshotSchema, TargetState, WorkspaceKind, capabilityNames
 } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MobileClient, type MobileStorage, type PendingOperation } from "./mobile-client";
@@ -13,6 +14,7 @@ import { MobileCredentialStorageError, profileFromCredential } from "./connectio
 import type { MobileDiscovery } from "./connection-discovery";
 import { normalizeNodeOrigin, parseNodeIdentity, type MobileNetwork, type NodeIdentity, type PairedCredential } from "./network";
 import type { Event, Operation, SessionMessageSearchMatch, Snapshot, WorkspaceEntry, WorkspaceFileChange } from "@joko/contracts";
+import type { MobileInteractionDraftIdentity } from "./interaction-draft-store";
 import { timelineRows } from "./timeline";
 
 const credential: PairedCredential = {
@@ -137,6 +139,58 @@ const queueSnapshot = create(SnapshotSchema, {
   queueItems: [queueTwo, queueOne],
   queueControls: [queueControl]
 });
+const permissionInteraction = create(InteractionSchema, {
+  interactionId: "interaction-permission",
+  kind: InteractionKind.PERMISSION,
+  state: InteractionState.PENDING,
+  backendId: "backend",
+  targetId: "target",
+  sessionId: "session",
+  generation: 8n,
+  createdAt: { seconds: 20n },
+  request: { case: "permission", value: {
+    risk: PermissionRisk.HIGH,
+    title: "Run command",
+    allowedDecisions: [PermissionDecisionKind.ALLOW_ONCE, PermissionDecisionKind.DENY_ONCE]
+  } },
+  version: { revision: { value: 44n, etag: "interaction-r44" }, generation: 8n }
+});
+const questionInteraction = create(InteractionSchema, {
+  interactionId: "interaction-question",
+  kind: InteractionKind.QUESTION,
+  state: InteractionState.PENDING,
+  backendId: "backend",
+  targetId: "target",
+  sessionId: "session",
+  generation: 8n,
+  createdAt: { seconds: 10n },
+  request: { case: "question", value: {
+    title: "Choose",
+    fields: [{ fieldId: "answer", label: "Answer", required: true, input: { case: "text", value: {} } }]
+  } },
+  version: { revision: { value: 45n, etag: "interaction-r45" }, generation: 8n }
+});
+const planInteraction = create(InteractionSchema, {
+  interactionId: "interaction-plan",
+  kind: InteractionKind.PLAN_REVIEW,
+  state: InteractionState.PENDING,
+  backendId: "backend",
+  targetId: "target",
+  sessionId: "session",
+  generation: 8n,
+  createdAt: { seconds: 30n },
+  request: { case: "planReview", value: {
+    title: "Plan",
+    markdown: "# Plan",
+    steps: [{ stepId: "step-one", title: "First" }],
+    allowedDecisions: [PlanReviewDecisionKind.EXECUTE]
+  } },
+  version: { revision: { value: 46n, etag: "interaction-r46" }, generation: 8n }
+});
+const interactionSnapshot = create(SnapshotSchema, {
+  ...snapshot,
+  interactions: [questionInteraction, permissionInteraction, planInteraction]
+});
 
 function memoryStorage(saved?: PairedCredential | readonly PairedCredential[], automatic: boolean | string = saved !== undefined) {
   const initial = saved === undefined ? [] : Array.isArray(saved) ? [...saved] : [saved];
@@ -258,9 +312,10 @@ function client(
   storage: MobileStorage,
   discovery?: MobileDiscovery,
   now: () => number = () => 2_000,
-  newId: () => string = () => "operation-1"
+  newId: () => string = () => "operation-1",
+  clearInteractionDraft?: (identity: MobileInteractionDraftIdentity) => Promise<void>
 ) {
-  const instance = new MobileClient(network, storage, discovery ?? { scan: vi.fn(async () => []) }, newId, "android", now);
+  const instance = new MobileClient(network, storage, discovery ?? { scan: vi.fn(async () => []) }, newId, "android", now, clearInteractionDraft);
   clients.push(instance);
   return instance;
 }
@@ -1525,6 +1580,189 @@ describe("native current-task message and Queue actions", () => {
     await vi.waitFor(() => expect(saved.pending()).toMatchObject([{
       operationId: "mobile-id-2", kind: "queue-edit-lock", queueItemId: "queue-1", state: "unknown"
     }]));
+  });
+});
+
+describe("native current-task Interaction ownership", () => {
+  const ids = () => {
+    let value = 0;
+    return () => `interaction-operation-${++value}`;
+  };
+
+  it("sorts exact current requests and resolves an advertised decision at revision and generation", async () => {
+    const network = projectedNetwork(interactionSnapshot);
+    const saved = memoryStorage(credential);
+    let settled = false;
+    const current = () => settled
+      ? create(SnapshotSchema, { ...interactionSnapshot, interactions: [questionInteraction, planInteraction] })
+      : interactionSnapshot;
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: current() }));
+    network.readSession = vi.fn(async () => current());
+    vi.mocked(network.submit).mockImplementation(async (_credential, operationId, mutation) => {
+      if (mutation.payload.case === "resolveInteraction") settled = true;
+      return create(OperationSchema, { operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED });
+    });
+    const app = client(network, saved.storage, undefined, undefined, ids());
+    await app.start();
+
+    expect(app.taskInteractions().map((interaction) => interaction.interactionId))
+      .toEqual(["interaction-plan", "interaction-permission", "interaction-question"]);
+    await expect(app.resolveInteraction(permissionInteraction.interactionId, {
+      kind: "permission",
+      decision: PermissionDecisionKind.ALLOW_ONCE
+    })).resolves.toBe(true);
+
+    expect(saved.storage.savePending).toHaveBeenCalledBefore(network.submit as ReturnType<typeof vi.fn>);
+    expect(vi.mocked(network.submit).mock.calls[0]?.[2]).toMatchObject({
+      preconditions: [{
+        entity: { kind: EntityKind.INTERACTION, id: permissionInteraction.interactionId },
+        expectedRevision: { value: 44n, etag: "interaction-r44" },
+        expectedGeneration: 8n
+      }],
+      payload: { case: "resolveInteraction", value: {
+        interactionId: permissionInteraction.interactionId,
+        interactionGeneration: 8n,
+        resolution: {
+          connectionId: credential.connectionId,
+          decision: { case: "permission", value: { decision: PermissionDecisionKind.ALLOW_ONCE } }
+        }
+      } }
+    });
+    expect(saved.pending()).toEqual([]);
+    expect(app.taskInteractions().map((interaction) => interaction.interactionId))
+      .toEqual(["interaction-plan", "interaction-question"]);
+  });
+
+  it("dismisses only the exact current request and refreshes its authoritative projection", async () => {
+    const network = projectedNetwork(interactionSnapshot);
+    let dismissed = false;
+    const current = () => dismissed
+      ? create(SnapshotSchema, { ...interactionSnapshot, interactions: [permissionInteraction, planInteraction] })
+      : interactionSnapshot;
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: current() }));
+    network.readSession = vi.fn(async () => current());
+    vi.mocked(network.submit).mockImplementation(async (_credential, operationId, mutation) => {
+      if (mutation.payload.case === "dismissInteraction") dismissed = true;
+      return create(OperationSchema, { operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED });
+    });
+    const clearInteractionDraft = vi.fn(async (_identity: MobileInteractionDraftIdentity) => undefined);
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, ids(), clearInteractionDraft);
+    await app.start();
+
+    await expect(app.dismissInteraction(questionInteraction.interactionId)).resolves.toBe(true);
+    expect(vi.mocked(network.submit).mock.calls[0]?.[2]).toMatchObject({
+      preconditions: [{
+        entity: { kind: EntityKind.INTERACTION, id: questionInteraction.interactionId },
+        expectedRevision: { value: 45n },
+        expectedGeneration: 8n
+      }],
+      payload: { case: "dismissInteraction", value: {
+        interactionId: questionInteraction.interactionId,
+        interactionGeneration: 8n,
+        reason: "Dismissed by user on mobile"
+      } }
+    });
+    expect(app.taskInteractions().some((interaction) => interaction.interactionId === questionInteraction.interactionId)).toBe(false);
+    expect(clearInteractionDraft).toHaveBeenCalledWith({
+      profileId: credential.profileId,
+      sessionId: "session",
+      interactionId: questionInteraction.interactionId,
+      kind: "question",
+      generation: 8n,
+      revision: 45n
+    });
+  });
+
+  it("clears the exact saved draft when a succeeded response is reconciled after restart", async () => {
+    const network = projectedNetwork(interactionSnapshot);
+    const saved = memoryStorage(credential);
+    await saved.storage.savePending([{
+      operationId: "interaction-operation-before-restart",
+      connectionId: credential.connectionId,
+      kind: "interaction-resolve",
+      sessionId: "session",
+      interactionId: planInteraction.interactionId,
+      interactionGeneration: "8",
+      interactionRevision: "46",
+      interactionDraftKind: "plan",
+      state: "accepted"
+    }]);
+    vi.mocked(network.getOperation).mockResolvedValue(create(OperationSchema, {
+      operationId: "interaction-operation-before-restart",
+      connectionId: credential.connectionId,
+      state: OperationState.SUCCEEDED
+    }));
+    const clearInteractionDraft = vi.fn(async (_identity: MobileInteractionDraftIdentity) => undefined);
+    const app = client(network, saved.storage, undefined, undefined, ids(), clearInteractionDraft);
+
+    await app.start();
+
+    expect(clearInteractionDraft).toHaveBeenCalledWith({
+      profileId: credential.profileId,
+      sessionId: "session",
+      interactionId: planInteraction.interactionId,
+      kind: "plan",
+      generation: 8n,
+      revision: 46n
+    });
+    expect(saved.pending()).toEqual([]);
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("retains one unknown response receipt and never replays that decision", async () => {
+    const network = projectedNetwork(interactionSnapshot);
+    const saved = memoryStorage(credential);
+    vi.mocked(network.submit).mockResolvedValueOnce(create(OperationSchema, {
+      operationId: "interaction-operation-1",
+      connectionId: credential.connectionId,
+      state: OperationState.RUNNING
+    }));
+    vi.mocked(network.waitOperation).mockRejectedValueOnce(new Error("operation watch disconnected"));
+    const app = client(network, saved.storage, undefined, undefined, ids());
+    await app.start();
+
+    await expect(app.resolveInteraction(questionInteraction.interactionId, {
+      kind: "question",
+      answers: { answer: { kind: "text", value: "Keep this draft" } }
+    })).resolves.toBe(false);
+    expect(saved.pending()).toMatchObject([{
+      kind: "interaction-resolve",
+      sessionId: "session",
+      interactionId: questionInteraction.interactionId,
+      state: "accepted"
+    }]);
+    await expect(app.resolveInteraction(questionInteraction.interactionId, {
+      kind: "question",
+      answers: { answer: { kind: "text", value: "Do not resend" } }
+    })).rejects.toThrow(/still pending/u);
+    expect(network.submit).toHaveBeenCalledTimes(1);
+    expect(network.waitOperation).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects stale, unadvertised, and cross-generation responses before dispatch", async () => {
+    const network = projectedNetwork(interactionSnapshot);
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, ids());
+    await app.start();
+
+    await expect(app.resolveInteraction(permissionInteraction.interactionId, {
+      kind: "permission",
+      decision: PermissionDecisionKind.ALLOW_FOR_SESSION
+    })).rejects.toThrow(/not currently available/u);
+    await expect(app.resolveInteraction("missing", {
+      kind: "permission",
+      decision: PermissionDecisionKind.ALLOW_ONCE
+    })).rejects.toThrow(/no longer pending/u);
+    expect(network.submit).not.toHaveBeenCalled();
+
+    network.readSession = vi.fn(async () => create(SnapshotSchema, {
+      ...interactionSnapshot,
+      sessions: [create(SessionSchema, { ...interactionSnapshot.sessions[0]!,
+        nativeBinding: create(NativeSessionBindingSchema, { runtimeGeneration: 9n }) })]
+    }));
+    await app.refresh();
+    expect(app.taskInteractions()).toEqual([]);
+    await expect(app.dismissInteraction(permissionInteraction.interactionId)).rejects.toThrow(/no longer pending/u);
+    expect(network.submit).not.toHaveBeenCalled();
   });
 });
 

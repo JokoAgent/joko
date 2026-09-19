@@ -2,6 +2,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as SecureStore from "expo-secure-store";
 import { createMobileStorage } from "./connection-storage";
 import { MobileComposerDraftStore } from "./composer-draft-store";
+import { MobileInteractionDraftStore } from "./interaction-draft-store";
 
 const plainStorage = {
   getItem: (key: string) => AsyncStorage.getItem(key),
@@ -10,6 +11,7 @@ const plainStorage = {
 };
 
 export const mobileComposerDrafts = new MobileComposerDraftStore(plainStorage);
+export const mobileInteractionDrafts = new MobileInteractionDraftStore(plainStorage);
 
 export const mobileStorage = createMobileStorage(
   plainStorage,

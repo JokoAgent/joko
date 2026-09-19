@@ -2,15 +2,16 @@ import { create } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
 import {
   ArchiveSessionMutationSchema, CancelQueueItemMutationSchema, CapabilitySupport, ConnectionState, CreateSessionMutationSchema,
-  DeleteSessionMessageMutationSchema, DeleteSessionMutationSchema, DeviceKind, EditQueueItemMutationSchema, EntityKind, EntityRefSchema,
+  DeleteSessionMessageMutationSchema, DeleteSessionMutationSchema, DeviceKind, DismissInteractionMutationSchema,
+  EditQueueItemMutationSchema, EntityKind, EntityRefSchema,
   LAN_DISCOVERY_PEER_TTL_MS,
   InputContentSchema, InputPartSchema, NativeSessionPlacement, NativeSessionStartSchema, NewNativeSessionSchema,
   LogoutConnectionMutationSchema, OperationPreconditionSchema, OperationState, OperationMutationSchema,
   MessageRole, PermissionMode, PinSessionMutationSchema, QueueDeliveryMode, QueueItemState, RenameSessionMutationSchema,
-  ReorderQueueItemMutationSchema, RevokeDeviceMutationSchema, SendInputMutationSchema, SessionMessageSearchSessionStatus,
+  ReorderQueueItemMutationSchema, ResolveInteractionMutationSchema, RevokeDeviceMutationSchema, SendInputMutationSchema, SessionMessageSearchSessionStatus,
   SessionState, SetQueueInteractionLockMutationSchema, SetQueueItemEditLockMutationSchema, TargetState, capabilityNames,
   FileKind,
-  type Artifact, type DiscoveredNodeRecord, type Event, type EventCursor, type FilePreview, type FileRevision,
+  type Artifact, type DiscoveredNodeRecord, type Event, type EventCursor, type FilePreview, type FileRevision, type Interaction,
   type Operation, type OperationMutation, type QueueControl, type QueueItem, type Session, type Snapshot,
   type WorkspaceEntry, type WorkspaceSearchMatch
 } from "@joko/contracts";
@@ -53,6 +54,12 @@ import {
   queueItemText,
   queueMove
 } from "./task-actions";
+import {
+  createMobileInteractionResolution,
+  pendingMobileInteractions,
+  type MobileInteractionSubmission
+} from "./mobile-interactions";
+import type { MobileInteractionDraftIdentity } from "./interaction-draft-store";
 
 export type { MobileStorage, PendingOperation } from "./connection-storage";
 
@@ -182,7 +189,8 @@ export class MobileClient {
     private readonly discovery: MobileDiscovery,
     private readonly newId: () => string,
     private readonly platform: string,
-    private readonly now: () => number = Date.now
+    private readonly now: () => number = Date.now,
+    private readonly clearInteractionDraft?: (identity: MobileInteractionDraftIdentity) => Promise<void>
   ) {}
 
   get state(): MobileState { return this.#state; }
@@ -1692,6 +1700,49 @@ export class MobileClient {
     return mobileQueueCapabilities(this.#selectedBackend(this.#selectedSession()));
   }
 
+  taskInteractions(): readonly Interaction[] {
+    return pendingMobileInteractions(this.#state.detail, this.#state.selectedId);
+  }
+
+  async resolveInteraction(interactionId: string, submission: MobileInteractionSubmission): Promise<boolean> {
+    const interaction = this.#interactionContext(interactionId);
+    this.#assertNoPendingInteractionMutation(interaction.sessionId, interaction.interactionId);
+    const credential = this.#ready();
+    const resolution = createMobileInteractionResolution(interaction, submission, credential.connectionId);
+    const action = this.#claimMutation();
+    try {
+      const result = await this.#submitTerminal(create(OperationMutationSchema, {
+        preconditions: [this.#interactionPrecondition(interaction)],
+        payload: { case: "resolveInteraction", value: create(ResolveInteractionMutationSchema, {
+          interactionId: interaction.interactionId,
+          interactionGeneration: interaction.generation,
+          resolution
+        }) }
+      }), { kind: "interaction-resolve", sessionId: interaction.sessionId, interactionId: interaction.interactionId,
+        ...this.#interactionReceiptIdentity(interaction) });
+      return result.accepted && result.definitive;
+    } finally { this.#releaseMutation(action); }
+  }
+
+  async dismissInteraction(interactionId: string): Promise<boolean> {
+    const interaction = this.#interactionContext(interactionId);
+    this.#assertNoPendingInteractionMutation(interaction.sessionId, interaction.interactionId);
+    this.#ready();
+    const action = this.#claimMutation();
+    try {
+      const result = await this.#submitTerminal(create(OperationMutationSchema, {
+        preconditions: [this.#interactionPrecondition(interaction)],
+        payload: { case: "dismissInteraction", value: create(DismissInteractionMutationSchema, {
+          interactionId: interaction.interactionId,
+          interactionGeneration: interaction.generation,
+          reason: "Dismissed by user on mobile"
+        }) }
+      }), { kind: "interaction-dismiss", sessionId: interaction.sessionId, interactionId: interaction.interactionId,
+        ...this.#interactionReceiptIdentity(interaction) });
+      return result.accepted && result.definitive;
+    } finally { this.#releaseMutation(action); }
+  }
+
   async cancelQueueItem(queueItemId: string): Promise<boolean> {
     const { session, item, capabilities } = this.#queueItemContext(queueItemId);
     if (!capabilities.cancel) throw new Error("This Backend does not support cancelling queued input.");
@@ -2053,6 +2104,44 @@ export class MobileClient {
       expectedRevision: revision,
       expectedGeneration: control.version.generation
     });
+  }
+
+  #interactionContext(interactionId: string): Interaction {
+    const interaction = this.taskInteractions().find((candidate) => candidate.interactionId === interactionId);
+    if (!interaction) throw new Error("This request is no longer pending in the current task.");
+    return interaction;
+  }
+
+  #interactionPrecondition(interaction: Interaction) {
+    const revision = interaction.version?.revision;
+    if (!revision || revision.value < 1n || !interaction.version || interaction.version.generation !== interaction.generation
+      || interaction.generation < 1n) {
+      throw new Error("A current request version is required.");
+    }
+    return create(OperationPreconditionSchema, {
+      entity: create(EntityRefSchema, { kind: EntityKind.INTERACTION, id: interaction.interactionId }),
+      expectedRevision: revision,
+      expectedGeneration: interaction.generation
+    });
+  }
+
+  #interactionReceiptIdentity(interaction: Interaction): Pick<PendingOperation,
+    "interactionGeneration" | "interactionRevision" | "interactionDraftKind"> {
+    const revision = interaction.version?.revision?.value;
+    if (!revision || revision < 1n || interaction.generation < 1n) throw new Error("A current request receipt identity is required.");
+    return {
+      interactionGeneration: interaction.generation.toString(10),
+      interactionRevision: revision.toString(10),
+      ...(interaction.request.case === "question" ? { interactionDraftKind: "question" as const }
+        : interaction.request.case === "planReview" ? { interactionDraftKind: "plan" as const } : {})
+    };
+  }
+
+  #assertNoPendingInteractionMutation(sessionId: string, interactionId: string): void {
+    if (this.#state.pending.some((item) => item.sessionId === sessionId && item.interactionId === interactionId
+      && (item.kind === "interaction-resolve" || item.kind === "interaction-dismiss"))) {
+      throw new Error("A previous response to this request is still pending. Check its operation before retrying.");
+    }
   }
 
   #assertNoPendingQueueMutation(sessionId: string, queueItemId: string): void {
@@ -2579,21 +2668,21 @@ export class MobileClient {
 
   async #submit(
     mutation: OperationMutation,
-    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "targetConnectionId" | "targetDeviceId">
+    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId">
   ): Promise<boolean> {
     return (await this.#submitTracked(mutation, identity, false)).accepted;
   }
 
   async #submitTerminal(
     mutation: OperationMutation,
-    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "targetConnectionId" | "targetDeviceId">
+    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId">
   ): Promise<TrackedMutationResult> {
     return this.#submitTracked(mutation, identity, true);
   }
 
   async #submitTracked(
     mutation: OperationMutation,
-    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "targetConnectionId" | "targetDeviceId">,
+    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId">,
     waitForTerminal: boolean
   ): Promise<TrackedMutationResult> {
     const credential = this.#ready();
@@ -2664,6 +2753,24 @@ export class MobileClient {
       : this.#state.pending.map((item) => item.operationId === pending.operationId ? { ...item, state: "accepted" as const } : item);
     if (!await this.#persistPending(next, epoch)) return;
     this.#set({ pending: next });
+    if (operation.state === OperationState.SUCCEEDED
+      && (pending.kind === "interaction-resolve" || pending.kind === "interaction-dismiss")
+      && pending.interactionDraftKind !== undefined && pending.sessionId !== undefined && pending.interactionId !== undefined
+      && pending.interactionGeneration !== undefined && pending.interactionRevision !== undefined
+      && this.#activeProfileId !== undefined && this.clearInteractionDraft !== undefined) {
+      try {
+        await this.clearInteractionDraft({
+          profileId: this.#activeProfileId,
+          sessionId: pending.sessionId,
+          interactionId: pending.interactionId,
+          kind: pending.interactionDraftKind,
+          generation: BigInt(pending.interactionGeneration),
+          revision: BigInt(pending.interactionRevision)
+        });
+      } catch (error) {
+        if (this.#current(epoch)) this.#set({ error: message(error) });
+      }
+    }
     if (operation.state === OperationState.SUCCEEDED && pending.kind === "logout" && pending.targetConnectionId) {
       await this.#completeServerRemoval(
         (profile) => profile.connectionId === pending.targetConnectionId,
@@ -2689,7 +2796,7 @@ export class MobileClient {
           await this.#receipt(operation, pending, epoch);
           if (operation.state === OperationState.SUCCEEDED
             && ["rename", "pin", "archive", "delete", "message-delete", "queue-cancel", "queue-edit-lock",
-              "queue-edit", "queue-interaction-lock", "queue-reorder"].includes(pending.kind)
+              "queue-edit", "queue-interaction-lock", "queue-reorder", "interaction-resolve", "interaction-dismiss"].includes(pending.kind)
             && this.#current(epoch)) {
             await this.refresh();
             if (pending.kind === "message-delete" && this.#foreground
