@@ -207,6 +207,27 @@ describe("current-v1 mobile connection storage", () => {
     await expect(storage.loadPending()).resolves.toEqual(receipts);
   });
 
+  it("round-trips body-free new-task creation and exact first-send receipts", async () => {
+    const memory = drivers();
+    const storage = createMobileStorage(memory.plain, memory.secure);
+    const receipts = [
+      { operationId: "create-first", connectionId: first.connectionId, kind: "create" as const, state: "unknown" as const },
+      { operationId: "send-first", connectionId: first.connectionId, kind: "send" as const,
+        sessionId: "session-one", state: "accepted" as const }
+    ];
+
+    await storage.savePending(receipts);
+    await expect(storage.loadPending()).resolves.toEqual(receipts);
+    const persisted = memory.plainValues.get("joko.mobile.pending.v1") ?? "";
+    expect(persisted).not.toContain("first message body");
+
+    memory.plainValues.set("joko.mobile.pending.v1", JSON.stringify([
+      ...receipts,
+      { operationId: "send-without-session", connectionId: first.connectionId, kind: "send", state: "unknown" }
+    ]));
+    await expect(storage.loadPending()).resolves.toEqual(receipts);
+  });
+
   it("round-trips message and Queue receipts only with their exact durable entity identity", async () => {
     const memory = drivers();
     const storage = createMobileStorage(memory.plain, memory.secure);

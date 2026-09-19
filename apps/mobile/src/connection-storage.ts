@@ -397,6 +397,7 @@ function isPending(value: unknown): value is PendingOperation {
   if (record.targetDeviceId !== undefined && typeof record.targetDeviceId !== "string") return false;
   if (record.kind === "logout" && typeof record.targetConnectionId !== "string") return false;
   if (record.kind === "revoke" && typeof record.targetDeviceId !== "string") return false;
+  if (record.kind === "send" && typeof record.sessionId !== "string") return false;
   if (["rename", "pin", "archive", "delete"].includes(String(record.kind)) && typeof record.sessionId !== "string") return false;
   if (record.kind === "message-delete" && (typeof record.sessionId !== "string" || typeof record.eventId !== "string")) return false;
   if (["queue-cancel", "queue-edit-lock", "queue-edit", "queue-reorder"].includes(String(record.kind))

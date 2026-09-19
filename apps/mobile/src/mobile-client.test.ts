@@ -21,6 +21,9 @@ import type { MobileDiscovery } from "./connection-discovery";
 import { normalizeNodeOrigin, parseNodeIdentity, type MobileNetwork, type NodeIdentity, type PairedCredential } from "./network";
 import type { Event, Operation, SessionMessageSearchMatch, Snapshot, WorkspaceEntry, WorkspaceFileChange } from "@joko/contracts";
 import type { MobileInteractionDraftIdentity } from "./interaction-draft-store";
+import { MobileComposerDraftStore } from "./composer-draft-store";
+import { MobileNewTaskDraftStore } from "./new-task-draft-store";
+import type { MobilePlainStorageDriver } from "./connection-storage";
 import { timelineRows } from "./timeline";
 
 const credential: PairedCredential = {
@@ -466,6 +469,20 @@ function eventFeed(network: MobileNetwork) {
   return (item: Event) => { queued.push(item); wake?.(); wake = undefined; };
 }
 
+function memoryDraftStores() {
+  const values = new Map<string, string>();
+  const driver: MobilePlainStorageDriver = {
+    async getItem(key) { return values.get(key) ?? null; },
+    async setItem(key, value) { values.set(key, value); },
+    async removeItem(key) { values.delete(key); }
+  };
+  return {
+    values,
+    newTask: new MobileNewTaskDraftStore(driver),
+    composer: new MobileComposerDraftStore(driver)
+  };
+}
+
 const clients: MobileClient[] = [];
 function client(
   network: MobileNetwork,
@@ -473,9 +490,11 @@ function client(
   discovery?: MobileDiscovery,
   now: () => number = () => 2_000,
   newId: () => string = () => "operation-1",
-  clearInteractionDraft?: (identity: MobileInteractionDraftIdentity) => Promise<void>
+  clearInteractionDraft?: (identity: MobileInteractionDraftIdentity) => Promise<void>,
+  drafts = memoryDraftStores()
 ) {
-  const instance = new MobileClient(network, storage, discovery ?? { scan: vi.fn(async () => []) }, newId, "android", now, clearInteractionDraft);
+  const instance = new MobileClient(network, storage, discovery ?? { scan: vi.fn(async () => []) }, newId, "android", now,
+    clearInteractionDraft, drafts.newTask, drafts.composer);
   clients.push(instance);
   return instance;
 }
@@ -1079,21 +1098,318 @@ describe("native mobile connection and operation ownership", () => {
     expect(network.getOperation).toHaveBeenCalledWith(credential, "operation-1", expect.any(AbortSignal));
   });
 
-  it("prepares the exact target revision and fences a new task and text input to durable generations", async () => {
+  it("retains a first message, creates with the exact Target revision, and sends with the creation result generation", async () => {
     const network = fakeNetwork();
-    const app = client(network, memoryStorage(credential).storage);
+    const drafts = memoryDraftStores();
+    let operation = 0;
+    vi.mocked(network.submit).mockImplementation(async (_credential, operationId, mutation) => {
+      toBinary(OperationMutationSchema, mutation);
+      if (mutation.payload.case === "createSession") {
+        return create(OperationSchema, {
+          operationId,
+          connectionId: credential.connectionId,
+          state: OperationState.SUCCEEDED,
+          result: { payload: { case: "session", value: snapshot.sessions[0]! } }
+        });
+      }
+      return create(OperationSchema, {
+        operationId,
+        connectionId: credential.connectionId,
+        state: OperationState.SUCCEEDED,
+        result: { payload: { case: "queueItem", value: create(QueueItemSchema, {
+          queueItemId: "first-message",
+          backendId: "backend",
+          targetId: "target",
+          sessionId: "session",
+          state: QueueItemState.ACCEPTED
+        }) } }
+      });
+    });
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      () => `operation-${++operation}`, undefined, drafts);
     await app.start();
-    await app.create("target", "Work");
+    await expect(app.create("target", "Work", "hello")).resolves.toEqual({
+      sessionId: "session", created: true, sent: true, definitive: true
+    });
     expect(network.prepareTarget).toHaveBeenCalledWith(credential, snapshot.targets[0], expect.any(AbortSignal));
     expect(vi.mocked(network.submit).mock.calls[0]?.[2]).toMatchObject({
       preconditions: [{ entity: { id: "target" }, expectedRevision: { value: 3n } }],
       payload: { case: "createSession", value: { backendId: "backend", targetId: "target", displayName: "Work" } }
     });
-    expect(await app.send("hello")).toBe(true);
     expect(vi.mocked(network.submit).mock.calls[1]?.[2]).toMatchObject({
       preconditions: [{ entity: { id: "session" }, expectedGeneration: 8n }],
       payload: { case: "sendInput", value: { sessionId: "session", input: { parts: [{ content: { case: "text", value: "hello" } }] } } }
     });
+    expect(drafts.newTask.readSync({ profileId: credential.profileId })).toBeNull();
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toBeNull();
+  });
+
+  it("retains an editable new-task draft after a definitive creation failure", async () => {
+    const network = fakeNetwork();
+    const drafts = memoryDraftStores();
+    vi.mocked(network.submit).mockResolvedValueOnce(create(OperationSchema, {
+      operationId: "operation-create",
+      connectionId: credential.connectionId,
+      state: OperationState.FAILED,
+      error: { code: "CREATE_REJECTED", message: "The project rejected creation." }
+    }));
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      () => "operation-create", undefined, drafts);
+    await app.start();
+
+    await expect(app.create("target", "Work", "keep this first message")).resolves.toEqual({
+      created: false, sent: false, definitive: true
+    });
+    expect(network.submit).toHaveBeenCalledOnce();
+    expect(drafts.newTask.readSync({ profileId: credential.profileId })).toEqual({
+      targetId: "target", name: "Work", text: "keep this first message"
+    });
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toBeNull();
+  });
+
+  it("keeps the exact creation receipt and never sends when the server returns a different operation identity", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    const drafts = memoryDraftStores();
+    vi.mocked(network.submit).mockResolvedValueOnce(create(OperationSchema, {
+      operationId: "operation-from-another-request",
+      connectionId: credential.connectionId,
+      state: OperationState.SUCCEEDED,
+      result: { payload: { case: "session", value: snapshot.sessions[0]! } }
+    }));
+    const app = client(network, saved.storage, undefined, undefined,
+      () => "operation-create", undefined, drafts);
+    await app.start();
+
+    await expect(app.create("target", "Identity", "do not send this twice")).resolves.toEqual({
+      created: false, sent: false, definitive: false
+    });
+    expect(network.submit).toHaveBeenCalledOnce();
+    expect(saved.pending()).toMatchObject([{
+      operationId: "operation-create", connectionId: credential.connectionId, kind: "create", state: "unknown"
+    }]);
+    expect(drafts.newTask.readSync({ profileId: credential.profileId })?.submission).toMatchObject({
+      phase: "creating", createOperationId: "operation-create", inputText: "do not send this twice"
+    });
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toBeNull();
+    expect(app.state.error).toMatch(/wrong durable identity/);
+  });
+
+  it("reconciles an unknown creation after restart and sends the retained text only once", async () => {
+    const saved = memoryStorage(credential);
+    const drafts = memoryDraftStores();
+    let operation = 0;
+    const nextId = () => `operation-${++operation}`;
+    const firstNetwork = fakeNetwork();
+    vi.mocked(firstNetwork.submit).mockRejectedValueOnce(new Error("creation reply lost"));
+    const first = client(firstNetwork, saved.storage, undefined, undefined, nextId, undefined, drafts);
+    await first.start();
+
+    await expect(first.create("target", "Recovered", "resume this exact input")).resolves.toEqual({
+      created: false, sent: false, definitive: false
+    });
+    expect(saved.pending()).toMatchObject([{ operationId: "operation-1", kind: "create", state: "unknown" }]);
+    expect(drafts.newTask.readSync({ profileId: credential.profileId })?.submission).toMatchObject({
+      phase: "creating", createOperationId: "operation-1", inputText: "resume this exact input"
+    });
+    first.dispose();
+
+    const recoveredNetwork = fakeNetwork();
+    vi.mocked(recoveredNetwork.getOperation).mockImplementation(async (_credential, operationId) => create(OperationSchema, {
+      operationId,
+      connectionId: credential.connectionId,
+      state: OperationState.SUCCEEDED,
+      result: { payload: { case: "session", value: snapshot.sessions[0]! } }
+    }));
+    vi.mocked(recoveredNetwork.submit).mockImplementation(async (_credential, operationId, mutation) => {
+      expect(mutation.payload.case).toBe("sendInput");
+      return create(OperationSchema, {
+        operationId,
+        connectionId: credential.connectionId,
+        state: OperationState.SUCCEEDED,
+        result: { payload: { case: "queueItem", value: create(QueueItemSchema, {
+          queueItemId: "recovered-first-message",
+          backendId: "backend",
+          targetId: "target",
+          sessionId: "session",
+          state: QueueItemState.ACCEPTED
+        }) } }
+      });
+    });
+    const recovered = client(recoveredNetwork, saved.storage, undefined, undefined, nextId, undefined, drafts);
+    await recovered.start();
+
+    expect(recoveredNetwork.submit).toHaveBeenCalledOnce();
+    expect(vi.mocked(recoveredNetwork.submit).mock.calls[0]?.[2]).toMatchObject({
+      preconditions: [{ entity: { id: "session" }, expectedGeneration: 8n }],
+      payload: { case: "sendInput", value: { input: { parts: [{ content: { case: "text", value: "resume this exact input" } }] } } }
+    });
+    expect(saved.pending()).toEqual([]);
+    expect(drafts.newTask.readSync({ profileId: credential.profileId })).toBeNull();
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toBeNull();
+  });
+
+  it("releases a retained creation that could not have been dispatched because no receipt exists", async () => {
+    const network = fakeNetwork();
+    const drafts = memoryDraftStores();
+    await drafts.newTask.beginSubmission({ profileId: credential.profileId }, {
+      targetId: "target", name: "Prepared", text: "still editable"
+    }, {
+      connectionId: credential.connectionId,
+      serverId: credential.serverId,
+      backendId: "backend",
+      targetRevision: "3",
+      createOperationId: "operation-never-dispatched"
+    });
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      () => "unused-operation", undefined, drafts);
+
+    await app.start();
+
+    expect(network.getOperation).toHaveBeenCalledWith(credential, "operation-never-dispatched", expect.any(AbortSignal));
+    expect(network.submit).not.toHaveBeenCalled();
+    expect(drafts.newTask.readSync({ profileId: credential.profileId })).toEqual({
+      targetId: "target", name: "Prepared", text: "still editable"
+    });
+    expect(app.state.error).toMatch(/not dispatched/);
+  });
+
+  it("keeps the created task composer draft while an unknown first send is reconciled", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    const drafts = memoryDraftStores();
+    let operation = 0;
+    vi.mocked(network.submit).mockImplementation(async (_credential, operationId, mutation) => {
+      if (mutation.payload.case === "createSession") {
+        return create(OperationSchema, {
+          operationId,
+          connectionId: credential.connectionId,
+          state: OperationState.SUCCEEDED,
+          result: { payload: { case: "session", value: snapshot.sessions[0]! } }
+        });
+      }
+      throw new Error("first-message reply lost");
+    });
+    const app = client(network, saved.storage, undefined, undefined,
+      () => `operation-${++operation}`, undefined, drafts);
+    await app.start();
+
+    await expect(app.create("target", "Work", "do not duplicate me")).resolves.toEqual({
+      sessionId: "session", created: true, sent: false, definitive: false
+    });
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toBe("do not duplicate me");
+    expect(drafts.newTask.readSync({ profileId: credential.profileId })?.submission).toMatchObject({
+      phase: "sending", createOperationId: "operation-1", sendOperationId: "operation-2"
+    });
+    expect(saved.pending()).toMatchObject([{ operationId: "operation-2", kind: "send", sessionId: "session", state: "unknown" }]);
+    expect(JSON.stringify(saved.pending())).not.toContain("do not duplicate me");
+
+    vi.mocked(network.getOperation).mockImplementation(async (_credential, operationId) => create(OperationSchema, {
+      operationId,
+      connectionId: credential.connectionId,
+      state: OperationState.SUCCEEDED,
+      result: { payload: { case: "queueItem", value: create(QueueItemSchema, {
+        queueItemId: "confirmed-first-message",
+        backendId: "backend",
+        targetId: "target",
+        sessionId: "session",
+        state: QueueItemState.ACCEPTED
+      }) } }
+    }));
+    await app.reconcile();
+
+    expect(network.submit).toHaveBeenCalledTimes(2);
+    expect(saved.pending()).toEqual([]);
+    expect(drafts.newTask.readSync({ profileId: credential.profileId })).toBeNull();
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toBeNull();
+  });
+
+  it("never sends the retained first input after the created runtime generation changes", async () => {
+    const network = fakeNetwork();
+    const drafts = memoryDraftStores();
+    const reboundSession = create(SessionSchema, {
+      ...snapshot.sessions[0]!,
+      nativeBinding: create(NativeSessionBindingSchema, { runtimeGeneration: 9n }),
+      version: create(EntityVersionSchema, { revision: create(RevisionSchema, { value: 10n }), generation: 9n })
+    });
+    const rebound = create(SnapshotSchema, { ...snapshot, sessions: [reboundSession] });
+    vi.mocked(network.readOwner)
+      .mockResolvedValueOnce({ connection, device, snapshot })
+      .mockResolvedValue({ connection, device, snapshot: rebound });
+    vi.mocked(network.readSession).mockResolvedValue(rebound);
+    vi.mocked(network.submit).mockImplementation(async (_credential, operationId, mutation) => {
+      expect(mutation.payload.case).toBe("createSession");
+      return create(OperationSchema, {
+        operationId,
+        connectionId: credential.connectionId,
+        state: OperationState.SUCCEEDED,
+        result: { payload: { case: "session", value: snapshot.sessions[0]! } }
+      });
+    });
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      () => "operation-create", undefined, drafts);
+    await app.start();
+
+    await expect(app.create("target", "Rebound", "review after reset")).resolves.toEqual({
+      sessionId: "session", created: true, sent: false, definitive: true
+    });
+    expect(network.submit).toHaveBeenCalledOnce();
+    expect(app.state.error).toMatch(/runtime changed/);
+    expect(drafts.newTask.readSync({ profileId: credential.profileId })).toBeNull();
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toBe("review after reset");
+  });
+
+  it("revalidates the exact Target after preparation and never dispatches creation on revision drift", async () => {
+    const network = fakeNetwork();
+    const drafts = memoryDraftStores();
+    const changedTarget = create(TargetSchema, {
+      ...snapshot.targets[0]!,
+      version: create(EntityVersionSchema, { revision: create(RevisionSchema, { value: 4n, etag: "target-r4" }) })
+    });
+    const changed = create(SnapshotSchema, { ...snapshot, targets: [changedTarget] });
+    let app!: MobileClient;
+    network.prepareTarget = vi.fn(async () => {
+      vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: changed });
+      await app.refresh();
+    });
+    app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      () => "operation-create", undefined, drafts);
+    await app.start();
+
+    await expect(app.create("target", "Changed", "retain after drift")).rejects.toThrow(/changed while.*prepared/i);
+    expect(network.submit).not.toHaveBeenCalled();
+    expect(drafts.newTask.readSync({ profileId: credential.profileId })).toEqual({
+      targetId: "target", name: "Changed", text: "retain after drift"
+    });
+  });
+
+  it("moves a definitively rejected first message into the created task composer without creating again", async () => {
+    const network = fakeNetwork();
+    const drafts = memoryDraftStores();
+    let operation = 0;
+    vi.mocked(network.submit).mockImplementation(async (_credential, operationId, mutation) => mutation.payload.case === "createSession"
+      ? create(OperationSchema, {
+          operationId,
+          connectionId: credential.connectionId,
+          state: OperationState.SUCCEEDED,
+          result: { payload: { case: "session", value: snapshot.sessions[0]! } }
+        })
+      : create(OperationSchema, {
+          operationId,
+          connectionId: credential.connectionId,
+          state: OperationState.CONFLICT,
+          error: { code: "GENERATION_CONFLICT", message: "The task runtime changed." }
+        }));
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      () => `operation-${++operation}`, undefined, drafts);
+    await app.start();
+
+    await expect(app.create("target", "Created", "retry from the task")).resolves.toEqual({
+      sessionId: "session", created: true, sent: false, definitive: true
+    });
+    expect(network.submit).toHaveBeenCalledTimes(2);
+    expect(drafts.newTask.readSync({ profileId: credential.profileId })).toBeNull();
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toBe("retry from the task");
   });
 
   it("retires a late task navigation read in the background and restores the selected task on foreground", async () => {

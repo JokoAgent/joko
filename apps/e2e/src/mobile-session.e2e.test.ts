@@ -114,16 +114,25 @@ describe("native mobile device through the durable product chain", () => {
       })]
     }));
     const sessionId = sessionIdFrom(created);
+    expect(created.result?.payload.case).toBe("session");
+    if (created.result?.payload.case !== "session") throw new Error("Mobile creation did not return a Session result.");
+    const createdSession = created.result.payload.value;
+    expect(createdSession).toMatchObject({
+      sessionId,
+      backendId: target!.backendId,
+      targetId: target!.targetId
+    });
+    const creationGeneration = createdSession.nativeBinding?.runtimeGeneration;
+    expect(creationGeneration).toBeGreaterThan(0n);
     const session = (await clients.event.getSnapshot({
       scope: { kind: { case: "session", value: { sessionId, recentTimelineItems: 120 } } }
     })).snapshot;
     expect(session?.sessions[0]).toMatchObject({ sessionId, state: SessionState.IDLE });
-    const generation = session!.sessions[0]!.nativeBinding!.runtimeGeneration;
-    expect(generation).toBeGreaterThan(0n);
+    expect(session!.sessions[0]!.nativeBinding!.runtimeGeneration).toBe(creationGeneration);
 
     const resume = (await clients.event.getSnapshot({ scope: { kind: { case: "owner", value: {} } } })).snapshot!.resumeCursor!;
 
-    const sent = await submit(clients.operation, connectionId, sendInputMutation(sessionId, generation, "from the phone"));
+    const sent = await submit(clients.operation, connectionId, sendInputMutation(sessionId, creationGeneration!, "from the phone"));
     const queueId = sent.result?.payload.case === "queueItem" ? sent.result.payload.value.queueItemId : undefined;
     expect(queueId).toBeTruthy();
     await waitFor(async () => (await clients.session.listSessionTimeline({ sessionId, limit: 120 })).events,

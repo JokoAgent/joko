@@ -1,0 +1,452 @@
+import type { MobilePlainStorageDriver } from "./connection-storage";
+
+export interface MobileNewTaskDraftIdentity {
+  readonly profileId: string;
+}
+
+export interface MobileNewTaskEditableDraft {
+  readonly targetId: string;
+  readonly name: string;
+  readonly text: string;
+}
+
+interface MobileNewTaskSubmissionBase {
+  readonly connectionId: string;
+  readonly serverId: string;
+  readonly backendId: string;
+  readonly targetId: string;
+  readonly targetRevision: string;
+  readonly targetRevisionEtag?: string;
+  readonly createOperationId: string;
+  readonly displayName: string;
+  readonly inputText: string;
+}
+
+export interface MobileNewTaskCreateSubmission extends MobileNewTaskSubmissionBase {
+  readonly phase: "creating";
+}
+
+export interface MobileNewTaskSendSubmission extends MobileNewTaskSubmissionBase {
+  readonly phase: "sending";
+  readonly sessionId: string;
+  readonly runtimeGeneration: string;
+  readonly sendOperationId?: string;
+}
+
+export type MobileNewTaskSubmission = MobileNewTaskCreateSubmission | MobileNewTaskSendSubmission;
+
+export interface MobileNewTaskDraft extends MobileNewTaskEditableDraft {
+  readonly submission?: MobileNewTaskSubmission;
+}
+
+export type MobileNewTaskDraftErrorListener = (
+  identity: MobileNewTaskDraftIdentity,
+  error: Error
+) => void;
+
+const storagePrefix = "joko.mobile.new-task-draft.v1";
+const persistDebounceMilliseconds = 400;
+const maximumStoredCharacters = 1_000_000;
+
+export class MobileNewTaskDraftStore {
+  readonly #memory = new Map<string, MobileNewTaskDraft>();
+  readonly #cleared = new Set<string>();
+  readonly #dirty = new Set<string>();
+  readonly #identities = new Map<string, MobileNewTaskDraftIdentity>();
+  readonly #timers = new Map<string, ReturnType<typeof setTimeout>>();
+  readonly #operations = new Map<string, Promise<void>>();
+  readonly #listeners = new Set<MobileNewTaskDraftErrorListener>();
+
+  constructor(readonly driver: MobilePlainStorageDriver) {}
+
+  subscribeErrors(listener: MobileNewTaskDraftErrorListener): () => void {
+    this.#listeners.add(listener);
+    return () => this.#listeners.delete(listener);
+  }
+
+  readSync(identity: MobileNewTaskDraftIdentity): MobileNewTaskDraft | null {
+    const key = identityKey(identity);
+    if (this.#cleared.has(key)) return null;
+    const draft = this.#memory.get(key);
+    return draft === undefined ? null : cloneDraft(draft);
+  }
+
+  async read(identity: MobileNewTaskDraftIdentity): Promise<MobileNewTaskDraft | null> {
+    const exact = normalizeIdentity(identity);
+    const key = identityKey(exact);
+    const current = this.#memory.get(key);
+    if (current !== undefined) return cloneDraft(current);
+    if (this.#cleared.has(key)) return null;
+    let stored: string | null;
+    try {
+      stored = await this.driver.getItem(storageKey(exact));
+    } catch (cause) {
+      const error = storageError("read", cause);
+      this.#notify(exact, error);
+      throw error;
+    }
+    const newer = this.#memory.get(key);
+    if (newer !== undefined) return cloneDraft(newer);
+    if (this.#cleared.has(key) || stored === null) return null;
+    try {
+      const draft = readRecord(stored, exact);
+      this.#memory.set(key, draft);
+      this.#identities.set(key, exact);
+      return cloneDraft(draft);
+    } catch (cause) {
+      const error = storageError("read", cause);
+      this.#notify(exact, error);
+      throw error;
+    }
+  }
+
+  save(identity: MobileNewTaskDraftIdentity, draft: MobileNewTaskEditableDraft): void {
+    const exact = normalizeIdentity(identity);
+    const key = identityKey(exact);
+    if (this.#memory.get(key)?.submission !== undefined) return;
+    const value = normalizeEditableDraft(draft);
+    const serialized = serializeRecord(exact, value);
+    this.#cancelTimer(key);
+    this.#memory.set(key, value);
+    this.#cleared.delete(key);
+    this.#dirty.add(key);
+    this.#identities.set(key, exact);
+    const timer = setTimeout(() => {
+      this.#timers.delete(key);
+      void this.#persistIfCurrent(exact, value, serialized).catch(() => undefined);
+    }, persistDebounceMilliseconds);
+    this.#timers.set(key, timer);
+  }
+
+  async beginSubmission(
+    identity: MobileNewTaskDraftIdentity,
+    draft: MobileNewTaskEditableDraft,
+    authority: Omit<MobileNewTaskSubmissionBase, "targetId" | "displayName" | "inputText">
+  ): Promise<MobileNewTaskCreateSubmission> {
+    const exact = normalizeIdentity(identity);
+    const key = identityKey(exact);
+    const existing = this.#memory.get(key) ?? await this.read(exact) ?? undefined;
+    if (existing?.submission !== undefined) {
+      throw new Error("A retained new-task submission is already in progress.");
+    }
+    const editable = normalizeEditableDraft(draft);
+    const displayName = editable.name.trim() || "New task";
+    const inputText = editable.text.trim();
+    if (!editable.targetId || !inputText) throw new Error("Choose a project and enter the first message.");
+    const submission = normalizeSubmission({
+      phase: "creating",
+      ...authority,
+      targetId: editable.targetId,
+      displayName,
+      inputText
+    });
+    await this.#replace(exact, { ...editable, submission });
+    return cloneSubmission(submission) as MobileNewTaskCreateSubmission;
+  }
+
+  async advanceToSending(
+    identity: MobileNewTaskDraftIdentity,
+    createOperationId: string,
+    sessionId: string,
+    runtimeGeneration: bigint
+  ): Promise<MobileNewTaskSendSubmission> {
+    const exact = normalizeIdentity(identity);
+    const current = this.#required(exact);
+    const submission = current.submission;
+    if (submission?.phase !== "creating" || submission.createOperationId !== createOperationId) {
+      throw new Error("The retained new-task creation changed before its first message was prepared.");
+    }
+    assertIdentity(sessionId, "task");
+    if (runtimeGeneration < 1n) throw new Error("The created task runtime generation is invalid.");
+    const next = normalizeSubmission({
+      ...submission,
+      phase: "sending",
+      sessionId,
+      runtimeGeneration: runtimeGeneration.toString(10)
+    }) as MobileNewTaskSendSubmission;
+    await this.#replace(exact, { ...current, submission: next });
+    return cloneSubmission(next) as MobileNewTaskSendSubmission;
+  }
+
+  async setSendOperation(
+    identity: MobileNewTaskDraftIdentity,
+    createOperationId: string,
+    sendOperationId: string
+  ): Promise<MobileNewTaskSendSubmission> {
+    const exact = normalizeIdentity(identity);
+    const current = this.#required(exact);
+    const submission = current.submission;
+    if (submission?.phase !== "sending" || submission.createOperationId !== createOperationId) {
+      throw new Error("The retained new-task first-message owner changed.");
+    }
+    assertIdentity(sendOperationId, "first-message operation");
+    if (submission.sendOperationId !== undefined && submission.sendOperationId !== sendOperationId) {
+      throw new Error("The retained new-task first message already has a different operation.");
+    }
+    const next = normalizeSubmission({ ...submission, sendOperationId }) as MobileNewTaskSendSubmission;
+    await this.#replace(exact, { ...current, submission: next });
+    return cloneSubmission(next) as MobileNewTaskSendSubmission;
+  }
+
+  async clearSubmission(
+    identity: MobileNewTaskDraftIdentity,
+    operationId: string
+  ): Promise<MobileNewTaskEditableDraft> {
+    const exact = normalizeIdentity(identity);
+    const current = this.#required(exact);
+    const submission = current.submission;
+    const activeOperationId = submission?.phase === "sending" && submission.sendOperationId
+      ? submission.sendOperationId
+      : submission?.createOperationId;
+    if (submission === undefined || activeOperationId !== operationId) {
+      throw new Error("The retained new-task operation changed before it could be released.");
+    }
+    const editable = normalizeEditableDraft(current);
+    await this.#replace(exact, editable);
+    return { ...editable };
+  }
+
+  async clear(identity: MobileNewTaskDraftIdentity): Promise<void> {
+    const exact = normalizeIdentity(identity);
+    const key = identityKey(exact);
+    this.#cancelTimer(key);
+    this.#memory.delete(key);
+    this.#cleared.add(key);
+    this.#dirty.add(key);
+    this.#identities.set(key, exact);
+    await this.#removeIfCurrent(exact);
+  }
+
+  async flush(identity?: MobileNewTaskDraftIdentity): Promise<void> {
+    const selectedKey = identity === undefined ? undefined : identityKey(identity);
+    const pending = [...this.#timers.entries()].filter(([key]) => selectedKey === undefined || key === selectedKey);
+    for (const [key, timer] of pending) {
+      clearTimeout(timer);
+      this.#timers.delete(key);
+    }
+    const keys = new Set([
+      ...pending.map(([key]) => key),
+      ...[...this.#dirty].filter((key) => selectedKey === undefined || key === selectedKey)
+    ]);
+    await Promise.all([...keys].map(async (key) => {
+      const exact = this.#identities.get(key);
+      const draft = this.#memory.get(key);
+      if (!exact) return;
+      if (draft !== undefined) await this.#persistIfCurrent(exact, draft, serializeRecord(exact, draft));
+      else if (this.#cleared.has(key)) await this.#removeIfCurrent(exact);
+    }));
+    await Promise.all([...this.#operations.entries()]
+      .filter(([key]) => selectedKey === undefined || key === selectedKey)
+      .map(([, operation]) => operation));
+  }
+
+  async #replace(identity: MobileNewTaskDraftIdentity, draft: MobileNewTaskDraft): Promise<void> {
+    const value = normalizeDraft(draft);
+    const serialized = serializeRecord(identity, value);
+    const key = identityKey(identity);
+    this.#cancelTimer(key);
+    this.#memory.set(key, value);
+    this.#cleared.delete(key);
+    this.#dirty.add(key);
+    this.#identities.set(key, identity);
+    await this.#persistIfCurrent(identity, value, serialized);
+  }
+
+  #required(identity: MobileNewTaskDraftIdentity): MobileNewTaskDraft {
+    const draft = this.#memory.get(identityKey(identity));
+    if (draft === undefined || this.#cleared.has(identityKey(identity))) {
+      throw new Error("The retained new-task draft is unavailable.");
+    }
+    return cloneDraft(draft);
+  }
+
+  async #persistIfCurrent(
+    identity: MobileNewTaskDraftIdentity,
+    draft: MobileNewTaskDraft,
+    serialized: string
+  ): Promise<void> {
+    const key = identityKey(identity);
+    const current = this.#memory.get(key);
+    if (this.#cleared.has(key) || current === undefined || !sameDraft(current, draft)) return;
+    await this.#enqueue(identity, () => this.driver.setItem(storageKey(identity), serialized));
+    const latest = this.#memory.get(key);
+    if (!this.#cleared.has(key) && latest !== undefined && sameDraft(latest, draft)) this.#dirty.delete(key);
+  }
+
+  async #removeIfCurrent(identity: MobileNewTaskDraftIdentity): Promise<void> {
+    const key = identityKey(identity);
+    if (!this.#cleared.has(key) || this.#memory.has(key)) return;
+    await this.#enqueue(identity, () => this.driver.removeItem(storageKey(identity)));
+    if (this.#cleared.has(key) && !this.#memory.has(key)) this.#dirty.delete(key);
+  }
+
+  #enqueue(identity: MobileNewTaskDraftIdentity, effect: () => Promise<void>): Promise<void> {
+    const key = identityKey(identity);
+    const previous = this.#operations.get(key) ?? Promise.resolve();
+    const operation = previous.catch(() => undefined).then(effect).catch((cause) => {
+      const error = storageError("write", cause);
+      this.#notify(identity, error);
+      throw error;
+    });
+    this.#operations.set(key, operation);
+    void operation.finally(() => {
+      if (this.#operations.get(key) === operation) this.#operations.delete(key);
+    }).catch(() => undefined);
+    return operation;
+  }
+
+  #cancelTimer(key: string): void {
+    const timer = this.#timers.get(key);
+    if (timer === undefined) return;
+    clearTimeout(timer);
+    this.#timers.delete(key);
+  }
+
+  #notify(identity: MobileNewTaskDraftIdentity, error: Error): void {
+    for (const listener of this.#listeners) listener(identity, error);
+  }
+}
+
+export function mobileNewTaskDraftIdentityKey(identity: MobileNewTaskDraftIdentity): string {
+  return identityKey(identity);
+}
+
+function normalizeIdentity(identity: MobileNewTaskDraftIdentity): MobileNewTaskDraftIdentity {
+  assertIdentity(identity.profileId, "connection profile");
+  return { profileId: identity.profileId };
+}
+
+function identityKey(identity: MobileNewTaskDraftIdentity): string {
+  return normalizeIdentity(identity).profileId;
+}
+
+function storageKey(identity: MobileNewTaskDraftIdentity): string {
+  return `${storagePrefix}.${encodeURIComponent(normalizeIdentity(identity).profileId)}`;
+}
+
+function normalizeDraft(value: MobileNewTaskDraft): MobileNewTaskDraft {
+  const editable = normalizeEditableDraft(value);
+  return value.submission === undefined
+    ? editable
+    : { ...editable, submission: normalizeSubmission(value.submission) };
+}
+
+function normalizeEditableDraft(value: MobileNewTaskEditableDraft): MobileNewTaskEditableDraft {
+  if (!value || typeof value !== "object") throw new Error("The local Joko new-task draft is invalid.");
+  if (typeof value.targetId !== "string" || typeof value.name !== "string" || typeof value.text !== "string") {
+    throw new Error("The local Joko new-task draft is invalid.");
+  }
+  if (value.targetId !== "") assertIdentity(value.targetId, "project");
+  if (value.name.length > 256) throw new Error("The local Joko task name is too long.");
+  if (value.text.length > maximumStoredCharacters) throw new Error("The local Joko first-message draft is too large.");
+  return { targetId: value.targetId, name: value.name, text: value.text };
+}
+
+function normalizeSubmission(value: MobileNewTaskSubmission): MobileNewTaskSubmission {
+  if (!value || typeof value !== "object" || (value.phase !== "creating" && value.phase !== "sending")) {
+    throw new Error("The retained new-task submission is invalid.");
+  }
+  assertIdentity(value.connectionId, "connection");
+  assertIdentity(value.serverId, "server");
+  assertIdentity(value.backendId, "Backend");
+  assertIdentity(value.targetId, "project");
+  positiveDecimal(value.targetRevision, "project revision");
+  if (value.targetRevisionEtag !== undefined
+    && (typeof value.targetRevisionEtag !== "string" || value.targetRevisionEtag.length > 512
+      || /[\u0000-\u001f\u007f]/u.test(value.targetRevisionEtag))) {
+    throw new Error("The retained Joko project revision tag is invalid.");
+  }
+  assertIdentity(value.createOperationId, "creation operation");
+  if (!value.displayName.trim() || value.displayName.length > 256) throw new Error("The retained Joko task name is invalid.");
+  if (!value.inputText.trim() || value.inputText.length > maximumStoredCharacters) {
+    throw new Error("The retained Joko first message is invalid.");
+  }
+  const base: MobileNewTaskSubmissionBase = {
+    connectionId: value.connectionId,
+    serverId: value.serverId,
+    backendId: value.backendId,
+    targetId: value.targetId,
+    targetRevision: value.targetRevision,
+    ...(value.targetRevisionEtag === undefined ? {} : { targetRevisionEtag: value.targetRevisionEtag }),
+    createOperationId: value.createOperationId,
+    displayName: value.displayName,
+    inputText: value.inputText
+  };
+  if (value.phase === "creating") return { phase: "creating", ...base };
+  assertIdentity(value.sessionId, "task");
+  positiveDecimal(value.runtimeGeneration, "task runtime generation");
+  if (value.sendOperationId !== undefined) assertIdentity(value.sendOperationId, "first-message operation");
+  return {
+    phase: "sending",
+    ...base,
+    sessionId: value.sessionId,
+    runtimeGeneration: value.runtimeGeneration,
+    ...(value.sendOperationId === undefined ? {} : { sendOperationId: value.sendOperationId })
+  };
+}
+
+function serializeRecord(identity: MobileNewTaskDraftIdentity, draft: MobileNewTaskDraft): string {
+  const serialized = JSON.stringify({ version: 1, identity: normalizeIdentity(identity), draft });
+  if (serialized.length > maximumStoredCharacters + 4_096) throw new Error("The local Joko new-task draft is too large.");
+  return serialized;
+}
+
+function readRecord(serialized: string, identity: MobileNewTaskDraftIdentity): MobileNewTaskDraft {
+  if (serialized.length > maximumStoredCharacters + 4_096) throw new Error("saved new-task draft is too large");
+  const value: unknown = JSON.parse(serialized);
+  if (!isRecord(value) || value["version"] !== 1 || !isRecord(value["identity"])
+    || value["identity"]["profileId"] !== identity.profileId) {
+    throw new Error("new-task draft identity mismatch");
+  }
+  const draft = value["draft"];
+  if (!isRecord(draft) || typeof draft["targetId"] !== "string" || typeof draft["name"] !== "string"
+    || typeof draft["text"] !== "string") throw new Error("invalid new-task draft envelope");
+  const editable = normalizeEditableDraft({ targetId: draft["targetId"], name: draft["name"], text: draft["text"] });
+  if (draft["submission"] === undefined) return editable;
+  if (!isRecord(draft["submission"])) throw new Error("invalid new-task submission envelope");
+  const submission = draft["submission"] as unknown as MobileNewTaskSubmission;
+  return { ...editable, submission: normalizeSubmission(submission) };
+}
+
+function cloneDraft(draft: MobileNewTaskDraft): MobileNewTaskDraft {
+  return {
+    targetId: draft.targetId,
+    name: draft.name,
+    text: draft.text,
+    ...(draft.submission === undefined ? {} : { submission: cloneSubmission(draft.submission) })
+  };
+}
+
+function cloneSubmission(submission: MobileNewTaskSubmission): MobileNewTaskSubmission {
+  return { ...submission };
+}
+
+function sameDraft(left: MobileNewTaskDraft, right: MobileNewTaskDraft): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function assertIdentity(value: string, label: string): void {
+  if (typeof value !== "string" || value.trim() === "" || value.length > 512 || /[\u0000-\u001f\u007f]/u.test(value)) {
+    throw new Error(`The local Joko ${label} identity is invalid.`);
+  }
+}
+
+function positiveDecimal(value: string, label: string): void {
+  if (!/^[1-9][0-9]*$/u.test(value)) throw new Error(`The retained Joko ${label} is invalid.`);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function storageError(action: "read" | "write", cause: unknown): Error {
+  const error = new Error(`The saved new-task draft could not be ${action === "read" ? "read" : "written"}. Your current text was kept in memory.`);
+  error.name = "MobileNewTaskDraftStorageError";
+  if (cause instanceof Error) (error as Error & { cause?: unknown }).cause = cause;
+  return error;
+}
+
+export const mobileNewTaskDraftTesting = {
+  persistDebounceMilliseconds,
+  storageKey
+};

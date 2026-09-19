@@ -9,7 +9,7 @@ import {
   InputContentSchema, InputPartSchema, ModelKeySchema, ModelSelectionSchema, NativeSessionPlacement, NativeSessionStartSchema, NewNativeSessionSchema,
   LogoutConnectionMutationSchema, NavigateSessionBranchMutationSchema, OperationPreconditionSchema, OperationState, OperationMutationSchema,
   MessageRole, PermissionMode, PinSessionMutationSchema, QueueDeliveryMode, QueueItemState, RenameSessionMutationSchema,
-  ReorderQueueItemMutationSchema, ResolveInteractionMutationSchema, RevokeDeviceMutationSchema, SendInputMutationSchema, SessionMessageSearchSessionStatus,
+  ReorderQueueItemMutationSchema, ResolveInteractionMutationSchema, RevisionSchema, RevokeDeviceMutationSchema, SendInputMutationSchema, SessionMessageSearchSessionStatus,
   SessionState, SetQueueInteractionLockMutationSchema, SetQueueItemEditLockMutationSchema, SetSessionModelMutationSchema,
   SetSessionPermissionMutationSchema, SetSessionPlanModeMutationSchema, TargetState, capabilityNames,
   FileKind,
@@ -62,6 +62,14 @@ import {
   type MobileInteractionSubmission
 } from "./mobile-interactions";
 import type { MobileInteractionDraftIdentity } from "./interaction-draft-store";
+import type { MobileComposerDraftStore } from "./composer-draft-store";
+import {
+  type MobileNewTaskCreateSubmission,
+  type MobileNewTaskDraftIdentity,
+  type MobileNewTaskDraftStore,
+  type MobileNewTaskSendSubmission,
+  type MobileNewTaskSubmission
+} from "./new-task-draft-store";
 import {
   assertMobileModelSelection,
   assertMobilePermissionMode,
@@ -160,9 +168,25 @@ type TrackedMutationResult =
   | { readonly accepted: true; readonly definitive: boolean; readonly operation?: Operation }
   | { readonly accepted: false; readonly definitive: boolean; readonly operation?: Operation };
 
+export interface MobileNewTaskResult {
+  readonly sessionId?: string;
+  readonly created: boolean;
+  readonly sent: boolean;
+  readonly definitive: boolean;
+}
+
 const isTerminal = (state: OperationState): boolean => [
   OperationState.SUCCEEDED, OperationState.FAILED, OperationState.CANCELLED, OperationState.CONFLICT
 ].includes(state);
+
+function trackedOperation(operation: Operation): TrackedMutationResult {
+  const rejected = operation.state === OperationState.FAILED
+    || operation.state === OperationState.CONFLICT
+    || operation.state === OperationState.CANCELLED;
+  return rejected
+    ? { accepted: false, definitive: true, operation }
+    : { accepted: true, definitive: isTerminal(operation.state), operation };
+}
 
 export class MobileClient {
   #state: MobileState = { status: "starting", busy: false, saved: [], connectionMode: "nearby",
@@ -205,6 +229,7 @@ export class MobileClient {
   #filesRefreshTimer?: ReturnType<typeof setTimeout>;
   #queueEditLease?: MobileQueueEditLease;
   #queueInteractionLease?: MobileQueueInteractionLease;
+  #newTaskSubmissionActive = false;
 
   constructor(
     private readonly network: MobileNetwork,
@@ -213,7 +238,9 @@ export class MobileClient {
     private readonly newId: () => string,
     private readonly platform: string,
     private readonly now: () => number = Date.now,
-    private readonly clearInteractionDraft?: (identity: MobileInteractionDraftIdentity) => Promise<void>
+    private readonly clearInteractionDraft?: (identity: MobileInteractionDraftIdentity) => Promise<void>,
+    private readonly newTaskDrafts?: MobileNewTaskDraftStore,
+    private readonly composerDrafts?: MobileComposerDraftStore
   ) {}
 
   get state(): MobileState { return this.#state; }
@@ -803,6 +830,10 @@ export class MobileClient {
     catch (error) { cleanupFailures.push(`task selection: ${message(error)}`); }
     try { await this.#dropPendingConnections([profile.connectionId]); }
     catch (error) { cleanupFailures.push(`operation receipts: ${message(error)}`); }
+    if (this.newTaskDrafts) {
+      try { await this.newTaskDrafts.clear({ profileId }); }
+      catch (error) { cleanupFailures.push(`new-task draft: ${message(error)}`); }
+    }
     const cleanupError = cleanupFailures.length === 0
       ? undefined
       : `The connection was forgotten, but Joko could not clear ${cleanupFailures.join("; ")}.`;
@@ -1614,36 +1645,254 @@ export class MobileClient {
     } finally { this.#releaseMutation(action); }
   }
 
-  async create(targetId: string, name: string): Promise<void> {
+  async create(targetId: string, name: string, firstInput: string): Promise<MobileNewTaskResult> {
+    const inputText = firstInput.trim();
+    if (!inputText) throw new Error("Enter the first message for this task.");
+    if (name.length > 256) throw new Error("Use a task name no longer than 256 characters.");
+    if (!this.newTaskDrafts || !this.composerDrafts) {
+      throw new Error("Retained new-task drafts are unavailable on this mobile client.");
+    }
     if (this.#state.pending.some((item) => item.kind === "create")) {
       throw new Error("A previous task creation is still pending. Check its operation before creating another task.");
     }
     const owner = this.#state.owner;
     const target = owner?.targets.find((candidate) => candidate.targetId === targetId);
     const backend = owner?.backends.find((candidate) => candidate.backendId === target?.backendId);
-    if (!target || !backend || target.state !== TargetState.ACTIVE || !supportsText(backend)) {
+    const targetRevision = target?.version?.revision;
+    if (!target || !backend || target.state !== TargetState.ACTIVE || !supportsText(backend)
+      || !targetRevision || targetRevision.value < 1n) {
       throw new Error("Select an active target with text input support.");
     }
     const credential = this.#ready();
+    const node = this.#state.node;
+    if (!node || node.serverId !== credential.serverId || this.#activeProfileId !== credential.profileId) {
+      throw new Error("Reconnect to the exact saved Joko node before creating a task.");
+    }
+    const identity = { profileId: credential.profileId } satisfies MobileNewTaskDraftIdentity;
+    const createOperationId = this.newId();
     const action = this.#claimMutation();
+    this.#newTaskSubmissionActive = true;
     try {
-      const epoch = this.#epoch;
-      await this.network.prepareTarget(credential, target, this.#abort?.signal);
-      if (!this.#current(epoch)) return;
-      await this.#submit(create(OperationMutationSchema, {
-        preconditions: [create(OperationPreconditionSchema, {
-          entity: create(EntityRefSchema, { kind: EntityKind.TARGET, id: targetId }),
-          expectedRevision: target.version?.revision
-        })],
-        payload: { case: "createSession", value: create(CreateSessionMutationSchema, {
-          backendId: target.backendId, targetId, displayName: name.trim() || "New task",
-          nativeStart: create(NativeSessionStartSchema, {
-            kind: { case: "newSession", value: create(NewNativeSessionSchema, { parentNativeReference: "" }) }
-          }),
-          permissionMode: PermissionMode.ASK, initialPlacement: NativeSessionPlacement.PROJECT
-        }) }
-      }), { kind: "create" });
-    } finally { this.#releaseMutation(action); }
+      const submission = await this.newTaskDrafts.beginSubmission(identity, { targetId, name, text: firstInput }, {
+        connectionId: credential.connectionId,
+        serverId: credential.serverId,
+        backendId: target.backendId,
+        targetRevision: targetRevision.value.toString(10),
+        ...(targetRevision.etag === "" ? {} : { targetRevisionEtag: targetRevision.etag }),
+        createOperationId
+      });
+      try {
+        await this.network.prepareTarget(credential, target, this.#abort?.signal);
+        this.#assertNewTaskCreateAuthority(submission);
+      } catch (error) {
+        await this.newTaskDrafts.clearSubmission(identity, createOperationId).catch(() => undefined);
+        throw error;
+      }
+      const result = await this.#submitTerminal(
+        this.#newTaskCreateMutation(submission),
+        { kind: "create" },
+        createOperationId
+      );
+      if (this.#mutationOwner === action) this.#set({ busy: true });
+      return await this.#continueNewTaskCreation(identity, submission, result, false);
+    } finally {
+      this.#newTaskSubmissionActive = false;
+      this.#releaseMutation(action);
+    }
+  }
+
+  #newTaskCreateMutation(submission: MobileNewTaskCreateSubmission): OperationMutation {
+    return create(OperationMutationSchema, {
+      preconditions: [create(OperationPreconditionSchema, {
+        entity: create(EntityRefSchema, { kind: EntityKind.TARGET, id: submission.targetId }),
+        expectedRevision: create(RevisionSchema, {
+          value: BigInt(submission.targetRevision),
+          ...(submission.targetRevisionEtag === undefined ? {} : { etag: submission.targetRevisionEtag })
+        })
+      })],
+      payload: { case: "createSession", value: create(CreateSessionMutationSchema, {
+        backendId: submission.backendId,
+        targetId: submission.targetId,
+        displayName: submission.displayName,
+        nativeStart: create(NativeSessionStartSchema, {
+          kind: { case: "newSession", value: create(NewNativeSessionSchema, { parentNativeReference: "" }) }
+        }),
+        permissionMode: PermissionMode.ASK,
+        initialPlacement: NativeSessionPlacement.PROJECT
+      }) }
+    });
+  }
+
+  #assertNewTaskCreateAuthority(submission: MobileNewTaskCreateSubmission): void {
+    const credential = this.#ready();
+    const target = this.#state.owner?.targets.find((candidate) => candidate.targetId === submission.targetId);
+    const backend = this.#state.owner?.backends.find((candidate) => candidate.backendId === submission.backendId);
+    const revision = target?.version?.revision;
+    if (credential.connectionId !== submission.connectionId || credential.serverId !== submission.serverId
+      || this.#activeProfileId !== credential.profileId || this.#state.node?.serverId !== submission.serverId
+      || !target || target.backendId !== submission.backendId || target.state !== TargetState.ACTIVE
+      || !revision || revision.value.toString(10) !== submission.targetRevision
+      || (revision.etag || undefined) !== submission.targetRevisionEtag
+      || !backend || !supportsText(backend)) {
+      throw new Error("The project or Backend changed while this task was being prepared. Review the retained draft and try again.");
+    }
+  }
+
+  async #continueNewTaskCreation(
+    identity: MobileNewTaskDraftIdentity,
+    submission: MobileNewTaskCreateSubmission,
+    result: TrackedMutationResult,
+    refreshBeforeSend: boolean
+  ): Promise<MobileNewTaskResult> {
+    if (!this.newTaskDrafts || !this.composerDrafts) throw new Error("Retained new-task drafts are unavailable.");
+    if (!result.definitive) return { created: false, sent: false, definitive: false };
+    const operation = result.operation;
+    if (!result.accepted || operation?.state !== OperationState.SUCCEEDED) {
+      await this.newTaskDrafts.clearSubmission(identity, submission.createOperationId);
+      return { created: false, sent: false, definitive: true };
+    }
+    const session = this.#createdNewTaskSession(operation, submission);
+    if (!session) {
+      await this.newTaskDrafts.clearSubmission(identity, submission.createOperationId);
+      this.#set({ error: "The task creation succeeded without an exact Joko Session result. The first message was not sent; the draft was retained." });
+      return { created: false, sent: false, definitive: true };
+    }
+    const generation = session.nativeBinding!.runtimeGeneration;
+    await this.#stageNewTaskComposerDraft(identity, session.sessionId, submission.inputText);
+    const sending = await this.newTaskDrafts.advanceToSending(
+      identity,
+      submission.createOperationId,
+      session.sessionId,
+      generation
+    );
+    if (refreshBeforeSend && this.#credential?.connectionId === submission.connectionId && this.#foreground) {
+      await this.refresh();
+      if (this.#mutationOwner !== undefined) this.#set({ busy: true });
+    }
+    return this.#sendNewTaskFirstInput(identity, sending);
+  }
+
+  #createdNewTaskSession(operation: Operation, submission: MobileNewTaskCreateSubmission): Session | undefined {
+    const session = operation.result?.payload.case === "session" ? operation.result.payload.value : undefined;
+    const generation = session?.nativeBinding?.runtimeGeneration;
+    if (operation.operationId !== submission.createOperationId || operation.connectionId !== submission.connectionId
+      || !session || !session.sessionId || session.backendId !== submission.backendId || session.targetId !== submission.targetId
+      || !generation || generation < 1n) return undefined;
+    return session;
+  }
+
+  async #stageNewTaskComposerDraft(
+    identity: MobileNewTaskDraftIdentity,
+    sessionId: string,
+    text: string
+  ): Promise<void> {
+    if (!this.composerDrafts) throw new Error("The task composer draft store is unavailable.");
+    const composerIdentity = { profileId: identity.profileId, sessionId };
+    this.composerDrafts.save(composerIdentity, text);
+    await this.composerDrafts.flush(composerIdentity);
+  }
+
+  #newTaskSendAuthority(submission: MobileNewTaskSendSubmission):
+    | { readonly status: "ready"; readonly session: Session }
+    | { readonly status: "deferred" | "blocked"; readonly message: string } {
+    const credential = this.#credential;
+    if (!credential || this.#activeProfileId !== credential.profileId
+      || credential.connectionId !== submission.connectionId || credential.serverId !== submission.serverId) {
+      return { status: "blocked", message: "The saved Joko connection changed before the first message could be sent." };
+    }
+    if (!this.#foreground || this.#state.status !== "connected" || !this.#state.owner) {
+      return { status: "deferred", message: "The task was created. Its first message is retained until this Joko node reconnects." };
+    }
+    if (this.#state.node?.serverId !== submission.serverId) {
+      return { status: "blocked", message: "The Joko node identity changed before the first message could be sent." };
+    }
+    const session = this.#state.owner.sessions.find((candidate) => candidate.sessionId === submission.sessionId);
+    if (!session) {
+      return { status: "deferred", message: "The task was created. Its first message is retained until the new task appears in the authoritative snapshot." };
+    }
+    const detail = this.#state.detail;
+    const detailSession = detail?.sessions.find((candidate) => candidate.sessionId === submission.sessionId);
+    if (!detail || detail.generation !== this.#state.owner.generation || !detailSession) {
+      return { status: "deferred", message: "The task was created. Its first message is retained until the authoritative task detail is synchronized." };
+    }
+    const target = this.#state.owner.targets.find((candidate) => candidate.targetId === submission.targetId);
+    const backend = this.#state.owner.backends.find((candidate) => candidate.backendId === submission.backendId);
+    const generation = session.nativeBinding?.runtimeGeneration;
+    const detailGeneration = detailSession.nativeBinding?.runtimeGeneration;
+    if (session.backendId !== submission.backendId || session.targetId !== submission.targetId
+      || detailSession.backendId !== submission.backendId || detailSession.targetId !== submission.targetId
+      || !target
+      || target.backendId !== submission.backendId || !backend || !supportsText(backend)
+      || !generation || !detailGeneration || generation !== detailGeneration
+      || generation.toString(10) !== submission.runtimeGeneration) {
+      return { status: "blocked", message: "The created task runtime changed before its first message could be sent. The text remains in the task composer for review." };
+    }
+    return { status: "ready", session };
+  }
+
+  async #sendNewTaskFirstInput(
+    identity: MobileNewTaskDraftIdentity,
+    initial: MobileNewTaskSendSubmission
+  ): Promise<MobileNewTaskResult> {
+    if (!this.newTaskDrafts || !this.composerDrafts) throw new Error("Retained new-task drafts are unavailable.");
+    const authority = this.#newTaskSendAuthority(initial);
+    if (authority.status === "deferred") {
+      this.#set({ error: authority.message });
+      return { sessionId: initial.sessionId, created: true, sent: false, definitive: false };
+    }
+    if (authority.status === "blocked") {
+      await this.newTaskDrafts.clear(identity);
+      this.#set({ error: authority.message });
+      return { sessionId: initial.sessionId, created: true, sent: false, definitive: true };
+    }
+    const sendOperationId = initial.sendOperationId ?? this.newId();
+    const submission = initial.sendOperationId === undefined
+      ? await this.newTaskDrafts.setSendOperation(identity, initial.createOperationId, sendOperationId)
+      : initial;
+    const result = await this.#submitTerminal(create(OperationMutationSchema, {
+      preconditions: [create(OperationPreconditionSchema, {
+        entity: create(EntityRefSchema, { kind: EntityKind.SESSION, id: submission.sessionId }),
+        expectedGeneration: BigInt(submission.runtimeGeneration)
+      })],
+      payload: { case: "sendInput", value: create(SendInputMutationSchema, {
+        sessionId: submission.sessionId,
+        input: create(InputContentSchema, {
+          parts: [create(InputPartSchema, { content: { case: "text", value: submission.inputText } })]
+        }),
+        deliveryMode: QueueDeliveryMode.PROMPT
+      }) }
+    }), { kind: "send", sessionId: submission.sessionId }, sendOperationId);
+    return this.#finishNewTaskFirstInput(identity, submission, result);
+  }
+
+  async #finishNewTaskFirstInput(
+    identity: MobileNewTaskDraftIdentity,
+    submission: MobileNewTaskSendSubmission,
+    result: TrackedMutationResult
+  ): Promise<MobileNewTaskResult> {
+    if (!this.newTaskDrafts || !this.composerDrafts) throw new Error("Retained new-task drafts are unavailable.");
+    if (!result.definitive) {
+      return { sessionId: submission.sessionId, created: true, sent: false, definitive: false };
+    }
+    if (!result.accepted || result.operation?.state !== OperationState.SUCCEEDED) {
+      await this.newTaskDrafts.clear(identity);
+      return { sessionId: submission.sessionId, created: true, sent: false, definitive: true };
+    }
+    const exactOperation = submission.sendOperationId !== undefined
+      && result.operation.operationId === submission.sendOperationId
+      && result.operation.connectionId === submission.connectionId;
+    const queued = exactOperation && result.operation.result?.payload.case === "queueItem"
+      ? result.operation.result.payload.value
+      : undefined;
+    if (!queued || queued.sessionId !== submission.sessionId || queued.backendId !== submission.backendId
+      || queued.targetId !== submission.targetId) {
+      await this.newTaskDrafts.clear(identity);
+      this.#set({ error: "The first-message operation returned an invalid queue result. The text remains in the task composer; verify the task before sending again." });
+      return { sessionId: submission.sessionId, created: true, sent: false, definitive: true };
+    }
+    await this.composerDrafts.clear({ profileId: identity.profileId, sessionId: submission.sessionId });
+    await this.newTaskDrafts.clear(identity);
+    return { sessionId: submission.sessionId, created: true, sent: true, definitive: true };
   }
 
   async send(text: string): Promise<boolean> {
@@ -2861,6 +3110,7 @@ export class MobileClient {
         await this.storage.deleteConnection(profile.profileId);
         if (wasAutomatic) this.#automaticProfileId = undefined;
         await this.storage.saveSelection(profile.profileId).catch(() => undefined);
+        await this.newTaskDrafts?.clear({ profileId: profile.profileId }).catch(() => undefined);
         removed.add(profile.profileId);
       } catch (error) {
         failed.set(profile.profileId, [message(error), automaticFailure].filter(Boolean).join(" "));
@@ -2908,19 +3158,21 @@ export class MobileClient {
 
   async #submitTerminal(
     mutation: OperationMutation,
-    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId">
+    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId">,
+    operationId?: string
   ): Promise<TrackedMutationResult> {
-    return this.#submitTracked(mutation, identity, true);
+    return this.#submitTracked(mutation, identity, true, operationId);
   }
 
   async #submitTracked(
     mutation: OperationMutation,
     identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId">,
-    waitForTerminal: boolean
+    waitForTerminal: boolean,
+    operationId = this.newId()
   ): Promise<TrackedMutationResult> {
     const credential = this.#ready();
     const epoch = this.#epoch;
-    const pending: PendingOperation = { ...identity, connectionId: credential.connectionId, operationId: this.newId(), state: "unknown" };
+    const pending: PendingOperation = { ...identity, connectionId: credential.connectionId, operationId, state: "unknown" };
     const before = this.#state.pending;
     const next = [...before, pending];
     this.#set({ pending: next, busy: true, error: undefined });
@@ -2938,6 +3190,10 @@ export class MobileClient {
       return { accepted: false, definitive: false };
     }
     if (!this.#current(epoch)) return { accepted: false, definitive: false };
+    if (operation.operationId !== pending.operationId || operation.connectionId !== pending.connectionId) {
+      this.#set({ busy: false, error: `Operation ${pending.operationId} returned with the wrong durable identity. Its receipt was retained and no input was resent.` });
+      return { accepted: false, definitive: false };
+    }
     await this.#receipt(operation, pending, epoch);
     if (waitForTerminal && !isTerminal(operation.state)) {
       try {
@@ -2950,6 +3206,10 @@ export class MobileClient {
         return { accepted: false, definitive: false };
       }
       if (!this.#current(epoch)) return { accepted: false, definitive: false };
+      if (operation.operationId !== pending.operationId || operation.connectionId !== pending.connectionId) {
+        this.#set({ busy: false, error: `Operation ${pending.operationId} completed with the wrong durable identity. Its receipt was retained and no input was resent.` });
+        return { accepted: false, definitive: false };
+      }
       await this.#receipt(operation, pending, epoch);
     }
     const rejected = operation.state === OperationState.FAILED
@@ -2968,6 +3228,12 @@ export class MobileClient {
 
   async #receipt(operation: Operation, pending: PendingOperation, epoch: number): Promise<void> {
     if (!this.#current(epoch) || this.#credential?.connectionId !== pending.connectionId) return;
+    if (operation.operationId !== pending.operationId || operation.connectionId !== pending.connectionId) {
+      this.#set({
+        error: `Operation ${pending.operationId} returned with the wrong durable identity and was ignored. Its local receipt was retained.`
+      });
+      return;
+    }
     if (operation.state === OperationState.FAILED || operation.state === OperationState.CONFLICT || operation.state === OperationState.CANCELLED) {
       const next = this.#state.pending.filter((item) => item.operationId !== pending.operationId);
       if (await this.#persistPending(next, epoch)) this.#set({ pending: next, error: operation.error?.message || "The operation was rejected." });
@@ -2976,9 +3242,26 @@ export class MobileClient {
     if (pending.kind === "create" && operation.result?.payload.case === "session") {
       const sessionId = operation.result.payload.value.sessionId;
       if (sessionId && this.#activeProfileId) {
-        await this.storage.saveSelection(this.#activeProfileId, sessionId);
-        if (!this.#current(epoch)) return;
-        this.#set({ selectedId: sessionId });
+        let maySelect = this.newTaskDrafts === undefined || this.composerDrafts === undefined;
+        if (this.newTaskDrafts && this.composerDrafts) {
+          try {
+            const identity = { profileId: this.#activeProfileId };
+            const draft = await this.newTaskDrafts.read(identity);
+            if (draft?.submission?.phase === "creating"
+              && draft.submission.createOperationId === pending.operationId
+              && this.#createdNewTaskSession(operation, draft.submission)) {
+              await this.#stageNewTaskComposerDraft(identity, sessionId, draft.submission.inputText);
+              maySelect = true;
+            }
+          } catch (error) {
+            if (this.#current(epoch)) this.#set({ error: message(error) });
+          }
+        }
+        if (maySelect) {
+          await this.storage.saveSelection(this.#activeProfileId, sessionId);
+          if (!this.#current(epoch)) return;
+          this.#set({ selectedId: sessionId });
+        }
       }
     }
     const next = isTerminal(operation.state)
@@ -3051,6 +3334,119 @@ export class MobileClient {
         this.#set({ error: `Could not confirm operation ${pending.operationId}: ${message(error)}` });
       }
     }
+    await this.#resumeNewTaskSubmission(epoch);
+  }
+
+  async #resumeNewTaskSubmission(epoch: number): Promise<void> {
+    if (!this.newTaskDrafts || !this.composerDrafts || this.#newTaskSubmissionActive
+      || this.#mutationOwner || this.#state.busy || !this.#current(epoch)) return;
+    const credential = this.#credential;
+    const profileId = this.#activeProfileId;
+    if (!credential || !profileId) return;
+    const identity = { profileId } satisfies MobileNewTaskDraftIdentity;
+    let submission: MobileNewTaskSubmission | undefined;
+    try { submission = (await this.newTaskDrafts.read(identity))?.submission; }
+    catch (error) {
+      if (this.#current(epoch)) this.#set({ error: message(error) });
+      return;
+    }
+    if (!submission || !this.#current(epoch)) return;
+    if (submission.connectionId !== credential.connectionId || submission.serverId !== credential.serverId) {
+      this.#set({ error: "A retained new-task submission belongs to a different saved Joko connection and was not replayed." });
+      return;
+    }
+    const action = this.#claimMutation();
+    this.#newTaskSubmissionActive = true;
+    try {
+      if (submission.phase === "creating") {
+        const observed = await this.#observeRetainedNewTaskOperation(submission, epoch);
+        if (observed === "not-dispatched") {
+          await this.newTaskDrafts.clearSubmission(identity, submission.createOperationId);
+          this.#set({ error: "The retained creation had no durable operation receipt and was not dispatched. Its draft is ready to review and retry." });
+          return;
+        }
+        if (!observed) return;
+        if (this.#mutationOwner === action) this.#set({ busy: true });
+        await this.#continueNewTaskCreation(identity, submission, trackedOperation(observed), true);
+        return;
+      }
+      await this.#stageNewTaskComposerDraft(identity, submission.sessionId, submission.inputText);
+      if (submission.sendOperationId === undefined) {
+        await this.#sendNewTaskFirstInput(identity, submission);
+        return;
+      }
+      const observed = await this.#observeRetainedNewTaskOperation(submission, epoch);
+      if (observed === "not-dispatched") {
+        await this.newTaskDrafts.clear(identity);
+        this.#set({ error: "The retained first message had no durable operation receipt and was not dispatched. Its text remains in the created task composer." });
+        return;
+      }
+      if (!observed) return;
+      if (this.#mutationOwner === action) this.#set({ busy: true });
+      await this.#finishNewTaskFirstInput(identity, submission, trackedOperation(observed));
+    } catch (error) {
+      if (this.#foreground && this.#credential?.connectionId === credential.connectionId) {
+        this.#set({ error: message(error) });
+      }
+    } finally {
+      this.#newTaskSubmissionActive = false;
+      this.#releaseMutation(action);
+    }
+  }
+
+  async #observeRetainedNewTaskOperation(
+    submission: MobileNewTaskSubmission,
+    epoch: number
+  ): Promise<Operation | "not-dispatched" | undefined> {
+    const credential = this.#credential;
+    const operationId = submission.phase === "sending" && submission.sendOperationId
+      ? submission.sendOperationId
+      : submission.createOperationId;
+    if (!credential || credential.connectionId !== submission.connectionId || !this.#current(epoch)) return undefined;
+    let operation: Operation | undefined;
+    try {
+      operation = await this.network.getOperation(credential, operationId, this.#abort?.signal);
+    } catch (error) {
+      if (this.#current(epoch)) this.#set({ error: `Could not confirm operation ${operationId}: ${message(error)}` });
+      return undefined;
+    }
+    if (!this.#current(epoch)) return undefined;
+    if (!operation) {
+      if (!this.#state.pending.some((item) => item.operationId === operationId)) return "not-dispatched";
+      this.#set({ error: `Operation ${operationId} is not yet confirmed. Its retained new-task input was not resent automatically.` });
+      return undefined;
+    }
+    if (operation.operationId !== operationId || operation.connectionId !== submission.connectionId) {
+      this.#set({ error: `Operation ${operationId} returned with the wrong Joko connection identity and was ignored.` });
+      return undefined;
+    }
+    const pending = this.#state.pending.find((item) => item.operationId === operationId)
+      ?? (submission.phase === "creating"
+        ? { operationId, connectionId: submission.connectionId, kind: "create" as const, state: "accepted" as const }
+        : { operationId, connectionId: submission.connectionId, kind: "send" as const,
+            sessionId: submission.sessionId, state: "accepted" as const });
+    if (!isTerminal(operation.state) && !this.#state.pending.some((item) => item.operationId === operationId)) {
+      const next = [...this.#state.pending, pending];
+      if (!await this.#persistPending(next, epoch)) return undefined;
+      this.#set({ pending: next });
+    }
+    await this.#receipt(operation, pending, epoch);
+    if (!this.#current(epoch) || isTerminal(operation.state)) return operation;
+    try {
+      operation = await this.network.waitOperation(credential, operationId, this.#abort?.signal);
+    } catch (error) {
+      if (this.#current(epoch)) this.#set({
+        error: `Operation ${operationId}: ${message(error)}. Its durable result is unknown; the retained input was not resent.`
+      });
+      return undefined;
+    }
+    if (!this.#current(epoch)) return undefined;
+    if (operation.operationId !== operationId || operation.connectionId !== submission.connectionId) {
+      this.#set({ error: `Operation ${operationId} completed with the wrong Joko connection identity and was ignored.` });
+      return undefined;
+    }
+    await this.#receipt(operation, pending, epoch);
+    return operation;
   }
 
   async dismissUnconfirmed(operationId: string): Promise<void> {
@@ -3065,7 +3461,21 @@ export class MobileClient {
       throw new Error("The Joko node has this operation; its durable result was refreshed instead of discarding it.");
     }
     const next = this.#state.pending.filter((item) => item.operationId !== operationId);
-    if (await this.#persistPending(next, epoch)) this.#set({ pending: next, error: undefined });
+    if (await this.#persistPending(next, epoch)) {
+      this.#set({ pending: next, error: undefined });
+      if (this.newTaskDrafts && this.#activeProfileId) {
+        const identity = { profileId: this.#activeProfileId };
+        const draft = await this.newTaskDrafts.read(identity);
+        const submission = draft?.submission;
+        const retainedOperationId = submission?.phase === "sending" && submission.sendOperationId
+          ? submission.sendOperationId
+          : submission?.createOperationId;
+        if (submission && retainedOperationId === operationId) {
+          if (submission.phase === "creating") await this.newTaskDrafts.clearSubmission(identity, operationId);
+          else await this.newTaskDrafts.clear(identity);
+        }
+      }
+    }
   }
 
   #savedViews(

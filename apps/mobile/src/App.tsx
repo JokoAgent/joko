@@ -28,7 +28,7 @@ import {
 } from "./connection-artwork";
 import { mobileNetwork } from "./network";
 import { mobileDiscovery } from "./native-lan-discovery";
-import { mobileComposerDrafts, mobileInteractionDrafts, mobileStorage } from "./storage";
+import { mobileComposerDrafts, mobileInteractionDrafts, mobileNewTaskDrafts, mobileStorage } from "./storage";
 import {
   mobileComposerDraftIdentityKey,
   type MobileComposerDraftIdentity
@@ -80,7 +80,9 @@ const client = new MobileClient(
   randomUUID,
   Platform.OS,
   Date.now,
-  (identity) => mobileInteractionDrafts.clear(identity)
+  (identity) => mobileInteractionDrafts.clear(identity),
+  mobileNewTaskDrafts,
+  mobileComposerDrafts
 );
 type Page = "home" | "connection" | "new" | "task" | "files" | "connections" | "devices" | "device";
 
@@ -111,6 +113,7 @@ export function App() {
       if (!foreground) {
         void mobileComposerDrafts.flush().catch(() => undefined);
         void mobileInteractionDrafts.flush().catch(() => undefined);
+        void mobileNewTaskDrafts.flush().catch(() => undefined);
       }
     });
     return () => {
@@ -118,6 +121,7 @@ export function App() {
       client.setForeground(false);
       void mobileComposerDrafts.flush().catch(() => undefined);
       void mobileInteractionDrafts.flush().catch(() => undefined);
+      void mobileNewTaskDrafts.flush().catch(() => undefined);
     };
   }, []);
 
@@ -714,31 +718,119 @@ function SavedPendingOperations({ profile, colors }: { profile: SavedMobileConne
 }
 
 function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onBack: () => void; onCreated: () => void }) {
-  const [targetId, setTargetId] = useState("");
-  const [name, setName] = useState("");
+  const initialIdentity = state.activeProfileId ? { profileId: state.activeProfileId } : undefined;
+  const initialDraft = initialIdentity ? mobileNewTaskDrafts.readSync(initialIdentity) : null;
+  const [draft, setDraft] = useState(() => ({
+    targetId: initialDraft?.targetId ?? "",
+    name: initialDraft?.name ?? "",
+    text: initialDraft?.text ?? ""
+  }));
+  const [loadedProfileId, setLoadedProfileId] = useState<string | undefined>();
+  const [draftReady, setDraftReady] = useState(false);
   const [error, setError] = useState("");
+  const mountedRef = useRef(true);
+  const profileId = state.activeProfileId;
+  const identity = profileId ? { profileId } : undefined;
+  const retained = identity ? mobileNewTaskDrafts.readSync(identity)?.submission : undefined;
+  const pendingCreate = state.pending.some((item) => item.kind === "create");
   const targets = state.owner?.targets.filter((target) => target.state === TargetState.ACTIVE &&
     state.owner?.backends.some((backend) => backend.backendId === target.backendId
       && backend.capabilities?.capabilities.some((capability) => capability.name === capabilityNames.inputText && capability.support === CapabilitySupport.SUPPORTED))) ?? [];
+  const targetAvailable = targets.some((target) => target.targetId === draft.targetId);
+  const patchDraft = (patch: Partial<typeof draft>): void => {
+    setDraft((current) => {
+      const next = { ...current, ...patch };
+      if (identity) mobileNewTaskDrafts.save(identity, next);
+      return next;
+    });
+  };
+  useEffect(() => mobileNewTaskDrafts.subscribeErrors((failedIdentity, failure) => {
+    if (mountedRef.current && failedIdentity.profileId === profileId) setError(failure.message);
+  }), [profileId]);
+  useEffect(() => {
+    mountedRef.current = true;
+    if (!identity) {
+      setDraft({ targetId: "", name: "", text: "" });
+      setLoadedProfileId(undefined);
+      setDraftReady(true);
+      return () => { mountedRef.current = false; };
+    }
+    let current = true;
+    const cached = mobileNewTaskDrafts.readSync(identity);
+    setDraft({ targetId: cached?.targetId ?? "", name: cached?.name ?? "", text: cached?.text ?? "" });
+    setLoadedProfileId(profileId);
+    setDraftReady(false);
+    void mobileNewTaskDrafts.read(identity).then((stored) => {
+      if (!current || !mountedRef.current || state.activeProfileId !== identity.profileId) return;
+      setDraft({ targetId: stored?.targetId ?? "", name: stored?.name ?? "", text: stored?.text ?? "" });
+      setLoadedProfileId(identity.profileId);
+      setDraftReady(true);
+    }).catch((failure) => {
+      if (!current || !mountedRef.current) return;
+      setDraftReady(true);
+      setError(errorText(failure));
+    });
+    return () => {
+      current = false;
+      mountedRef.current = false;
+      void mobileNewTaskDrafts.flush(identity).catch(() => undefined);
+    };
+  }, [profileId]);
+  const ownerReady = identity !== undefined && loadedProfileId === profileId && draftReady;
+  const submit = (): void => {
+    if (!identity) return;
+    setError("");
+    mobileNewTaskDrafts.save(identity, draft);
+    void mobileNewTaskDrafts.flush(identity).then(() => client.create(draft.targetId, draft.name, draft.text)).then((result) => {
+      if (result.sessionId) onCreated();
+    }).catch((failure) => setError(errorText(failure)));
+  };
   return <ScrollView contentContainerStyle={styles.screen} keyboardShouldPersistTaps="handled">
-    <Back onPress={onBack} colors={colors} />
+    <Back onPress={() => { if (identity) void mobileNewTaskDrafts.flush(identity).catch(() => undefined); onBack(); }} colors={colors} />
     <Text style={[styles.title, { color: colors.ink }]}>New task</Text>
-    <Text style={[styles.description, { color: colors.muted }]}>Choose an active project on this Joko node. The task uses its current workspace and Backend.</Text>
+    <Text style={[styles.description, { color: colors.muted }]}>Choose an active project and enter the first message. Joko retains this draft on this device until the first message is durably accepted.</Text>
     <Text style={[styles.section, { color: colors.muted }]}>Project</Text>
     {targets.length === 0 && <Text style={[styles.description, { color: colors.muted }]}>No project currently supports text tasks. Create one on a connected Joko client, then refresh.</Text>}
-    {targets.map((target) => <Pressable key={target.targetId} accessibilityRole="radio" accessibilityState={{ selected: targetId === target.targetId }}
-      accessibilityLabel={`Project ${target.displayName}`} onPress={() => setTargetId(target.targetId)}
-      style={[styles.row, { backgroundColor: colors.surface, borderColor: targetId === target.targetId ? colors.accent : colors.border }]}>
+    {targets.map((target) => <Pressable key={target.targetId} accessibilityRole="radio" accessibilityState={{ selected: draft.targetId === target.targetId }}
+      accessibilityLabel={`Project ${target.displayName}`} disabled={!ownerReady || state.busy || retained !== undefined}
+      onPress={() => patchDraft({ targetId: target.targetId })}
+      style={[styles.row, !ownerReady || state.busy || retained !== undefined ? styles.disabled : undefined,
+        { backgroundColor: colors.surface, borderColor: draft.targetId === target.targetId ? colors.accent : colors.border }]}>
       <Text style={[styles.label, { color: colors.ink }]}>{target.displayName}</Text>
       <Text style={[styles.caption, { color: colors.muted }]}>{state.owner?.backends.find((backend) => backend.backendId === target.backendId)?.displayName}</Text>
     </Pressable>)}
-    <Field label="Task name" value={name} onChange={setName} placeholder="New task" colors={colors} />
-    <Action label={state.busy ? "Creating…" : "Create task"} disabled={!targetId || state.busy || state.status !== "connected"}
-      colors={colors} onPress={() => { setError(""); void client.create(targetId, name).then(() => {
-        if (client.state.selectedId) onCreated();
-      }).catch((failure) => setError(errorText(failure))); }} />
+    {draft.targetId && !targetAvailable && <Banner text="The retained project is no longer an active text target. Choose a current project; your name and first message were kept." colors={colors} />}
+    <Field label="Task name" value={draft.name} onChange={(name) => patchDraft({ name })} placeholder="New task" colors={colors}
+      editable={ownerReady && !state.busy && retained === undefined} maxLength={256} />
+    <View style={styles.field}>
+      <Text style={[styles.caption, { color: colors.muted }]}>First message</Text>
+      <TextInput accessibilityLabel="First message" accessibilityHint="This message is sent after the task is created"
+        multiline textAlignVertical="top" maxLength={1_000_000} editable={ownerReady && !state.busy && retained === undefined}
+        placeholder="What should Joko do?" placeholderTextColor={colors.muted} value={draft.text}
+        onChangeText={(text) => patchDraft({ text })}
+        style={[styles.input, styles.newTaskMessageInput, { color: colors.ink, backgroundColor: colors.surface, borderColor: colors.border }]} />
+    </View>
+    {retained && <View accessibilityLiveRegion="polite" style={[styles.card, { backgroundColor: colors.brandBackground, borderColor: colors.border }]}>
+      <Text style={[styles.label, { color: colors.ink }]}>{retained.phase === "creating" ? "Task creation retained" : "First message retained"}</Text>
+      <Text style={[styles.caption, { color: colors.muted }]}>{retained.phase === "creating"
+        ? "Joko will only reconcile this exact creation operation; it will not create a second task automatically."
+        : "The task exists and the same text is saved in its composer while delivery is confirmed."}</Text>
+    </View>}
+    <Action label={state.busy ? "Creating and sending…" : "Create and send"}
+      disabled={!ownerReady || !draft.targetId || !targetAvailable || !draft.text.trim() || state.busy
+        || state.status !== "connected" || retained !== undefined || pendingCreate}
+      colors={colors} onPress={submit} />
+    {retained?.phase === "sending" && state.selectedId === retained.sessionId
+      && <Action label="Open created task" onPress={onCreated} colors={colors} />}
     {(error || state.error) && <Banner text={error || state.error || ""} colors={colors} />}
-    {state.pending.some((item) => item.kind === "create") && <Action label="Check creation status" onPress={() => void client.reconcile()} colors={colors} />}
+    <PendingReceipts items={state.pending.filter((item) => item.kind === "create")} colors={colors} onError={setError} />
+    {(pendingCreate || retained !== undefined) && <Action label="Check retained status" onPress={() => {
+      setError("");
+      void client.reconcile().then(() => {
+        const current = identity ? mobileNewTaskDrafts.readSync(identity)?.submission : undefined;
+        if (current?.phase === "sending" && client.state.selectedId === current.sessionId) onCreated();
+      }).catch((failure) => setError(errorText(failure)));
+    }} colors={colors} disabled={state.busy || state.status !== "connected"} />}
   </ScrollView>;
 }
 
@@ -1689,13 +1781,15 @@ function InformationRow({ label, value, colors, selectable }: {
   </View>;
 }
 
-function Field({ label, value, onChange, placeholder, colors, autoCapitalize, keyboardType }: {
+function Field({ label, value, onChange, placeholder, colors, autoCapitalize, keyboardType, editable, maxLength }: {
   label: string; value: string; onChange: (text: string) => void; placeholder: string; colors: Colors;
-  autoCapitalize?: "none"; keyboardType?: "url" | "number-pad";
+  autoCapitalize?: "none"; keyboardType?: "url" | "number-pad"; editable?: boolean; maxLength?: number;
 }) {
   return <View style={styles.field}><Text style={[styles.caption, { color: colors.muted }]}>{label}</Text>
     <TextInput accessibilityLabel={label} value={value} onChangeText={onChange} placeholder={placeholder} placeholderTextColor={colors.muted}
-      autoCapitalize={autoCapitalize} keyboardType={keyboardType} style={[styles.input, { color: colors.ink, backgroundColor: colors.surface, borderColor: colors.border }]} />
+      autoCapitalize={autoCapitalize} keyboardType={keyboardType} editable={editable} maxLength={maxLength}
+      style={[styles.input, editable === false && styles.disabled,
+        { color: colors.ink, backgroundColor: colors.surface, borderColor: colors.border }]} />
   </View>;
 }
 function AutomaticEntryChoice({ checked, disabled, onPress, colors }: {
@@ -1815,6 +1909,7 @@ const styles = StyleSheet.create({
   label: { fontSize: 16, fontWeight: "600" }, body: { fontSize: 15, lineHeight: 22 },
   section: { fontSize: 13, fontWeight: "700", marginTop: 12, textTransform: "uppercase" },
   field: { gap: 7 }, input: { borderWidth: 1, borderRadius: 12, minHeight: 48, paddingHorizontal: 14, fontSize: 16 },
+  newTaskMessageInput: { minHeight: 132, maxHeight: 260, paddingTop: 12, paddingBottom: 12, lineHeight: 22 },
   choice: { minHeight: 48, flexDirection: "row", alignItems: "flex-start", gap: 12 },
   choiceBox: { width: 24, height: 24, borderWidth: 1, borderRadius: 7, alignItems: "center", justifyContent: "center", marginTop: 1 },
   choiceCheck: { color: "#2b2316", fontSize: 16, fontWeight: "800", lineHeight: 18 }, disabled: { opacity: 0.55 },
